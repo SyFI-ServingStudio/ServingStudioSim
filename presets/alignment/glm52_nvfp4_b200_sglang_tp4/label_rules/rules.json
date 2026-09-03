@@ -204,32 +204,6 @@
       "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment"
     },
     {
-      "operation": "attention.indexer.decode_pack",
-      "name": "deep_gemm::sched::sm100_paged_mqa_logits_metadata",
-      "type": "model",
-      "role": "indexer scheduling metadata for the paged scorer",
-      "cross_rank": "independent",
-      "slot_suffixes": [
-        "body.dense_full_index.attention.indexer.decode_pack",
-        "body.sparse_cycle_full_index.attention.indexer.decode_pack"
-      ],
-      "note": "SGLang names this kernel after attention.indexer.decode_pack.",
-      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment"
-    },
-    {
-      "operation": "attention.indexer.decode_unpack",
-      "name": "_fused_dsa_decode_metadata_kernel",
-      "type": "model",
-      "role": "DSA decode metadata",
-      "cross_rank": "independent",
-      "slot_suffixes": [
-        "body.dense_full_index.attention.indexer.decode_unpack",
-        "body.sparse_cycle_full_index.attention.indexer.decode_unpack"
-      ],
-      "note": "SGLang names this kernel after attention.indexer.decode_unpack.",
-      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment"
-    },
-    {
       "operation": "attention.indexer.prefill_topk",
       "name": "topk_transform_prefill_kernel",
       "type": "model",
@@ -295,16 +269,16 @@
       "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment"
     },
     {
-      "operation": "attention.indexer.weight_scale",
+      "operation": "attention.indexer.rope",
       "name": "_get_k_and_s_triton_kernel",
       "type": "model",
-      "role": "indexer key/scale gather",
+      "role": "indexer key/scale gather folded into the fused query RoPE graph",
       "cross_rank": "independent",
       "slot_suffixes": [
-        "body.dense_full_index.attention.indexer.weight_scale",
-        "body.sparse_cycle_full_index.attention.indexer.weight_scale"
+        "body.dense_full_index.attention.indexer.rope",
+        "body.sparse_cycle_full_index.attention.indexer.rope"
       ],
-      "note": "SGLang names this kernel after attention.indexer.weight_scale.",
+      "note": "The clean SGLang launch graph has no standalone weight_scale leaf: fused_q_indexer_rope_hadamard_quant produces both the FP8 query and scaled weights, so measured companion launches are attributed to that fused rope boundary.",
       "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment"
     },
     {
@@ -1043,16 +1017,16 @@
       "before_name": "nvjet_sm100_tst_"
     },
     {
-      "operation": "attention.indexer.weight_scale",
+      "operation": "attention.indexer.rope",
       "name": "at::native::vectorized_elementwise_kernel",
       "type": "model",
-      "role": "indexer key/scale gather",
+      "role": "indexer key/scale gather folded into the fused query RoPE graph",
       "cross_rank": "independent",
       "slot_suffixes": [
-        "body.dense_full_index.attention.indexer.weight_scale",
-        "body.sparse_cycle_full_index.attention.indexer.weight_scale"
+        "body.dense_full_index.attention.indexer.rope",
+        "body.sparse_cycle_full_index.attention.indexer.rope"
       ],
-      "note": "Same step on the decode side, where it lands after the scorer.",
+      "note": "Same fused query-RoPE/weight-scale boundary on the decode side, where the companion launch lands after the scorer.",
       "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment",
       "after": "attention.indexer.decode_logits"
     },
@@ -1066,9 +1040,9 @@
         "body.dense_full_index.attention.indexer.wk_weights_proj",
         "body.sparse_cycle_full_index.attention.indexer.wk_weights_proj"
       ],
-      "note": "Wide-batch counterpart of the `after: attention.kv_a_rms_norm` rule: same pair, reached from the weight scaling instead.",
+      "note": "Wide-batch counterpart of the `after: attention.kv_a_rms_norm` rule: same pair, reached from the fused query-RoPE/weight-scale boundary instead.",
       "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment",
-      "after": "attention.indexer.weight_scale",
+      "after": "attention.indexer.rope",
       "before_name": "cublasLt::splitKreduce_kernel"
     },
     {
@@ -1281,16 +1255,16 @@
       "after": "attention.tp_allreduce_residual_norm"
     },
     {
-      "operation": "attention.indexer.weight_scale",
+      "operation": "attention.indexer.rope",
       "name": "at::native::vectorized_elementwise_kernel",
       "type": "model",
-      "role": "indexer key/scale gather",
+      "role": "indexer key/scale gather folded into the fused query RoPE graph",
       "cross_rank": "independent",
       "slot_suffixes": [
-        "body.dense_full_index.attention.indexer.weight_scale",
-        "body.sparse_cycle_full_index.attention.indexer.weight_scale"
+        "body.dense_full_index.attention.indexer.rope",
+        "body.sparse_cycle_full_index.attention.indexer.rope"
       ],
-      "note": "The indexer block opens right after the Q up-projection, and this gather is its first launch. Only the index-recompute families declare the slot, so the 57 layers that reuse the previous top-k cannot claim it.",
+      "note": "The indexer block opens right after the Q up-projection. In the clean SGLang graph this companion launch belongs to the fused query-RoPE/weight-scale boundary; only index-recompute families declare that slot.",
       "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment",
       "after": "attention.q_b_proj"
     }

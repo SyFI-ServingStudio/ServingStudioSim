@@ -56,7 +56,7 @@ tolerances:
       rationale: >-
         At concurrency 256, SGLang's prefill-priority scheduler and the bounded-
         future simulator form different short-request iteration populations
-        (10.87-14.42%). Kernel error is 2.75%, E2E is -2.54%, and TPS is +3.07%,
+        (10.87-14.42%). Kernel error is 2.74%, E2E is -2.54%, and TPS is +3.07%,
         so this exception keeps the scheduler-shape gap visible without relaxing
         timing acceptance.
     02_graph_boundaries_c128:
@@ -67,7 +67,7 @@ tolerances:
       rationale: >-
         The CUDA-graph boundary ladder produces 1.59-4.44% iteration-population
         divergence under SGLang's prefill-priority scheduling. Kernel error is
-        1.92%, and both E2E and TPS remain within their shared default bounds.
+        2.00%, and both E2E and TPS remain within their shared default bounds.
     03_balanced_anchor_c32:
       iterations_pct: 1.5
       prefill_tokens_mean_pct: 1.5
@@ -82,12 +82,12 @@ tolerances:
       rationale: >-
         Crossing SGLang's 2048-token chunk boundary changes which prefill-only
         iteration receives each request, producing 3.13-5.17% workload-shape
-        divergence while kernel error stays at 2.67% and E2E at -2.20%.
+        divergence while kernel error stays at 2.70% and E2E at -2.20%.
     05_decode_spectrum_c64:
       kernel_abs_pct: 5.5
       rationale: >-
         The decode-length spectrum is the sole kernel result just outside the
-        shared 5% bound: 5.32% absolute and -4.74% signed error with 99.16%
+        shared 5% bound: 5.40% absolute and -4.83% signed error with 99.14%
         measured-duration mapping coverage. The narrow bound preserves it as a
         monitored decode-cost edge rather than widening the matrix default.
     09_rate_knee:
@@ -104,20 +104,20 @@ tolerances:
       server_ttft_mean_pct: 13.0
       rationale: >-
         Server TTFT is -12.31%, narrowly beyond the shared 12% default at full
-        saturation; E2E (-5.64%), TPS (+6.46%), and kernel error (3.08%) remain
+        saturation; E2E (-5.64%), TPS (+6.46%), and kernel error (3.09%) remain
         within their normal bounds.
     11_long_prefill_ladder_c1:
       decode_batch_mean_pct: 6.0
       server_tpot_mean_pct: 15.0
       rationale: >-
         The single-request long-prefill ladder exposes a 5.53% decode-batch mean
-        difference and -14.94% server TPOT. Kernel error is 3.27% and full E2E
+        difference and -14.94% server TPOT. Kernel error is 3.31% and full E2E
         remains inside 7%, so both deviations stay isolated to this corner.
     15_kv_overcommit_mixed_churn_c14:
       server_ttft_mean_pct: 28.0
       rationale: >-
         The KV-overcommit admission cohort has +27.26% server TTFT while its
-        full-run E2E is -1.00%, TPS is +1.19%, and kernel error is 3.47%. This
+        full-run E2E is -1.00%, TPS is +1.19%, and kernel error is 3.36%. This
         case-specific bound keeps the admission-tail deviation explicit.
 
 drift:

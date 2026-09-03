@@ -51,7 +51,7 @@ def _load_vllm_runtime() -> tuple[Any, Any, Any]:
 def _load_sglang_runtime() -> tuple[Any, Any, Any]:
     try:
         import torch
-        from flashinfer import SfLayout, nvfp4_quantize
+        from flashinfer import fp4_quantize
         from sglang.srt.layers.quantization.utils import (
             prepare_static_weights_for_trtllm_fp4_moe,
         )
@@ -59,13 +59,7 @@ def _load_sglang_runtime() -> tuple[Any, Any, Any]:
         raise ProfilerNotImplemented("the SGLang environment is required") from exc
 
     def quantize(source: Any, input_scale: Any) -> tuple[Any, Any, Any]:
-        return _quantize_sglang_hidden(
-            torch,
-            nvfp4_quantize,
-            SfLayout.layout_linear,
-            source,
-            input_scale,
-        )
+        return _quantize_sglang_hidden(torch, fp4_quantize, source, input_scale)
 
     def prepare(w1: Any, w2: Any, s1: Any, s2: Any, **dims: Any) -> tuple[Any, ...]:
         return prepare_static_weights_for_trtllm_fp4_moe(w1, w2, s1, s2, **dims, is_gated=True)
@@ -75,23 +69,20 @@ def _load_sglang_runtime() -> tuple[Any, Any, Any]:
 
 def _quantize_sglang_hidden(
     torch: Any,
-    nvfp4_quantize: Any,
-    linear_layout: Any,
+    fp4_quantize: Any,
     source: Any,
     input_scale: Any,
 ) -> tuple[Any, Any, Any]:
-    packed, scales, per_token_scale = nvfp4_quantize(
-        source,
-        input_scale,
-        sfLayout=linear_layout,
-        per_token_activation=True,
-        backend="cute-dsl",
-    )
+    # The compressed-tensors W4A4 scheme used by this checkpoint sets
+    # `use_per_token_activation=False`. Match SGLang's
+    # `quantize_hidden_states_fp4` branch rather than its optional per-token
+    # activation path.
+    packed, scales = fp4_quantize(source, input_scale, GROUP_SIZE, False, False)
     tokens, hidden = source.shape
     return (
         packed.reshape(tokens, hidden // 2),
         scales.view(torch.float8_e4m3fn).reshape(tokens, hidden // GROUP_SIZE),
-        per_token_scale,
+        None,
     )
 
 
@@ -150,16 +141,11 @@ def _prepared_weights(
 def _quantized_hidden(
     torch: Any,
     quantize: Any,
-    stack: str,
     num_tokens: int,
     hidden_size: int,
 ) -> tuple[Any, Any, Any]:
     source = torch.randn((num_tokens, hidden_size), dtype=torch.bfloat16, device="cuda")
-    input_scale = (
-        torch.full((1,), 1.0 / (448.0 * 6.0), dtype=torch.float32, device="cuda")
-        if stack == "sglang"
-        else torch.ones((), dtype=torch.float32, device="cuda")
-    )
+    input_scale = torch.ones((), dtype=torch.float32, device="cuda")
     return quantize(source, input_scale)
 
 
@@ -172,8 +158,6 @@ def _call_trtllm_fp4_moe(
 ) -> None:
     call_kwargs = dict(kwargs)
     if stack == "sglang":
-        if per_token_scale is None:
-            raise ValueError("SGLang per-token NVFP4 quantization must return per_token_scale")
         call_kwargs["per_token_scale"] = per_token_scale
     fn(**call_kwargs)
 
@@ -293,7 +277,7 @@ def _profile_nvfp4_fused_moe_sm100(
         routing_logits.scatter_(1, selected, (16.0 - priorities).expand_as(selected).contiguous())
         routing_bias = torch.zeros(args["num_experts"], dtype=torch.bfloat16, device="cuda")
         hidden, hidden_scale, per_token_scale = _quantized_hidden(
-            torch, quantize, stack, args["num_tokens"], args["hidden_size"]
+            torch, quantize, args["num_tokens"], args["hidden_size"]
         )
         w1, s1, w2, s2 = _prepared_weights(
             torch,
@@ -377,7 +361,7 @@ def _profile_nvfp4_fused_moe_sm100(
     except Exception as exc:
         if exc.__class__.__name__ == "OutOfMemoryError":
             raise OOMError("SM100 NVFP4 fused MoE ran out of memory") from exc
-        raise KernelLaunchFailed("SM100 NVFP4 fused MoE failed") from exc
+        raise KernelLaunchFailed(f"SM100 NVFP4 fused MoE failed: {exc}") from exc
 
     local_rows = sum(args["per_expert_batches"][: args["num_local_experts"]])
     h, i = args["hidden_size"], args["intermediate_size"]

@@ -93,11 +93,10 @@ class _FakeTensor:
         return _FakeTensor(self.shape, dtype)
 
 
-def test_sglang_quantization_forwards_per_token_scale_and_vllm_omits_it() -> None:
+def test_sglang_compressed_tensors_quantization_uses_non_per_token_path() -> None:
     torch = type("Torch", (), {"float8_e4m3fn": "float8_e4m3fn"})
     source = _FakeTensor((2, 32), "bf16")
     global_scale = _FakeTensor((1,), "float32")
-    per_token_scale = _FakeTensor((2, 1), "float32")
     quant_calls = []
 
     def fake_quantize(*args, **kwargs):
@@ -105,32 +104,19 @@ def test_sglang_quantization_forwards_per_token_scale_and_vllm_omits_it() -> Non
         return (
             _FakeTensor((2, 16), "uint8"),
             _FakeTensor((2, 2), "uint8"),
-            per_token_scale,
         )
 
     hidden, hidden_scale, forwarded_scale = nvfp4_fused_moe._quantize_sglang_hidden(
         torch,
         fake_quantize,
-        "linear",
         source,
         global_scale,
     )
-    assert quant_calls == [
-        (
-            (source, global_scale),
-            {
-                "sfLayout": "linear",
-                "per_token_activation": True,
-                "backend": "cute-dsl",
-            },
-        )
-    ]
+    assert quant_calls == [((source, global_scale, 16, False, False), {})]
     assert hidden.shape == (2, 16)
     assert hidden_scale.shape == (2, 2)
     assert hidden_scale.dtype == "float8_e4m3fn"
-    assert forwarded_scale is per_token_scale
-    assert forwarded_scale.shape == (2, 1)
-    assert forwarded_scale.dtype == "float32"
+    assert forwarded_scale is None
 
     moe_calls = []
     nvfp4_fused_moe._call_trtllm_fp4_moe(
@@ -145,7 +131,7 @@ def test_sglang_quantization_forwards_per_token_scale_and_vllm_omits_it() -> Non
         per_token_scale=None,
         kwargs={"hidden_states": hidden},
     )
-    assert moe_calls[0]["per_token_scale"] is per_token_scale
+    assert moe_calls[0]["per_token_scale"] is None
     assert "per_token_scale" not in moe_calls[1]
 
 
