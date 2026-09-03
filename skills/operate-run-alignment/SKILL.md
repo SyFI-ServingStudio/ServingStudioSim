@@ -56,7 +56,7 @@ Each phase is an explicit checkpoint with a disjoint artifact root; no phase
 launches the next. The duty-cycle `gpu_time_multiplier` is no longer hand-derived
 before the simulation — the analyzer's **kernel-align** pass emits
 `recommended_gpu_time_multiplier`
-(`Σ measured_gpu_cycle_ms / Σ measured_busy_union_ms`),
+(`Σ measured_gpu_cycle_ms / Σ measured_ms`),
 and the simulation phase injects it automatically. So `analyze` splits into two
 semantic passes and runs on both sides of the simulation. Dry-run profile and sim
 before the real launch.

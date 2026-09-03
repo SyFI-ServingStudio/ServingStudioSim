@@ -130,13 +130,13 @@ the selected device, so they add up to the headline `measured_ms`.
 The dropped arrival wait is not attributed to any kernel; it surfaces only in the
 wall-clock `measured_gpu_cycle_ms`. The kernel-align pass's derived duty-cycle
 multiplier `recommended_gpu_time_multiplier = Σ measured_gpu_cycle_ms / Σ
-measured_busy_union_ms` uses the physical per-iteration GPU busy union,
-independently of the selected-device `measured_ms` path. The pool excludes iterations whose duty-cycle
+measured_ms` uses the selected-device reduced kernel path that timing-predict
+models. The pool excludes iterations whose duty-cycle
 factor is both above 2.0 and an MAD outlier within its own stage — one host stall
 would otherwise reach every simulated iteration through this single constant —
 and reports them in `meta.multiplier_excluded_iterations`; see
 `alignment/README.md` for why both halves of that test are needed. GPU durations from different ranks are never
-summed. `measured_busy_union_ms` is both physical audit evidence and the
+summed. `measured_busy_union_ms` remains physical audit evidence and is not the
 duty-cycle denominator. The analyzer keeps per-device
 populations so rank skew is auditable, and distinguishes raw `rank_launches` from
 `replica_calls` (symmetric launches divided by the captured device count). A shared
