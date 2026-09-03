@@ -2,9 +2,9 @@
 //!
 //! This is one self-completing, single-GPU sync section: fused residual-add
 //! RMSNorm → fused gate/up projection → SiLU-and-multiply → down projection.
-//! It has no TP partition or collective. The residual addition after the down
-//! projection is owned by the following layer's fused residual RMSNorm, matching
-//! the accepted GLM-5.2 attention-worklet convention.
+//! The intermediate width may be tensor-parallel; the architecture owns the
+//! following collective. The residual addition after the down projection is
+//! owned by the following layer's fused residual RMSNorm.
 
 use std::sync::Arc;
 
@@ -31,13 +31,13 @@ const SOURCE_ORDER: [&str; 4] = [
     "down_proj",
 ];
 
-/// Raw GLM-5.2 dense-FFN identity. This local worklet deliberately carries no
-/// parallelism or collective configuration.
+/// Raw GLM-5.2 dense-FFN identity for one rank-local compute section.
 #[derive(Clone, Debug)]
 pub struct Glm52DenseFfnLocalWorkletConfig {
     pub residual_norm_backends: Vec<&'static str>,
     pub gemm_backends: Vec<&'static str>,
     pub elementwise_backends: Vec<&'static str>,
+    pub tp_size: u16,
     pub gpu_name: String,
     pub hidden_dim: Dim,
     pub intermediate_dim: Dim,
@@ -79,17 +79,19 @@ impl Glm52DenseFfnLocalWorklet {
         validate_config(cfg)
             .unwrap_or_else(|reason| panic!("invalid Glm52DenseFfnLocalWorkletConfig: {reason}"));
 
+        let intermediate_per_rank =
+            cfg.intermediate_dim.clone() / Dim::param("ffn_tp", u32::from(cfg.tp_size));
         let dtype_bytes = cfg.dtype.size_bytes();
-        let gate_up_n = checked_product("gate_up_proj.n", &[2, cfg.intermediate_dim.get()])
+        let gate_up_n = checked_product("gate_up_proj.n", &[2, intermediate_per_rank.get()])
             .expect("validated GLM-5.2 gate/up dimensions must fit u32");
         let silu_input_bytes = checked_product(
             "silu_and_mul.input_bytes_per_token",
-            &[2, cfg.intermediate_dim.get(), dtype_bytes],
+            &[2, intermediate_per_rank.get(), dtype_bytes],
         )
         .expect("validated GLM-5.2 SiLU input byte rate must fit u32");
         let silu_output_bytes = checked_product(
             "silu_and_mul.output_bytes_per_token",
-            &[cfg.intermediate_dim.get(), dtype_bytes],
+            &[intermediate_per_rank.get(), dtype_bytes],
         )
         .expect("validated GLM-5.2 SiLU output byte rate must fit u32");
 
@@ -117,7 +119,7 @@ impl Glm52DenseFfnLocalWorklet {
                 backends: cfg.gemm_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
                 n: cfg.hidden_dim.clone(),
-                k: cfg.intermediate_dim.clone(),
+                k: intermediate_per_rank,
                 dtype: cfg.gemm_dtype,
             },
             raw_cfg: cfg.clone(),
@@ -181,13 +183,24 @@ impl Glm52DenseFfnLocalWorklet {
     }
 
     pub fn eval(&self, input: &Glm52DenseFfnLocalWorkletInput, ev: &mut Evaluator) {
+        self.eval_with_post_attn_norm(input, true, ev);
+    }
+
+    /// Keep the fixed leading norm slot while allowing L4 to zero it when the
+    /// preceding collective owns the fused residual-RMSNorm boundary.
+    pub fn eval_with_post_attn_norm(
+        &self,
+        input: &Glm52DenseFfnLocalWorkletInput,
+        include_post_attn_norm: bool,
+        ev: &mut Evaluator,
+    ) {
         let work = work_inputs(input.batch_tokens);
         let zero = input.batch_tokens == 0;
 
         eval_atomic_or_zero(
             &self.post_attn_add_rms_norm,
             work.post_attn_add_rms_norm,
-            zero,
+            zero || !include_post_attn_norm,
             ev,
         );
         eval_atomic_or_zero(&self.gate_up_proj, work.gate_up_proj, zero, ev);
@@ -231,6 +244,12 @@ fn validate_config(cfg: &Glm52DenseFfnLocalWorkletConfig) -> Result<(), String> 
             cfg.gemm_dtype.as_str()
         ));
     }
+    if cfg.tp_size == 0 || cfg.intermediate_dim.get() % u32::from(cfg.tp_size) != 0 {
+        return Err(format!(
+            "intermediate_dim {} must be divisible by positive tp_size {}",
+            cfg.intermediate_dim, cfg.tp_size
+        ));
+    }
     Ok(())
 }
 
@@ -255,8 +274,10 @@ fn work_inputs(batch_tokens: u32) -> WorkInputs {
 
 fn worklet_label(name: &str, cfg: &Glm52DenseFfnLocalWorkletConfig) -> String {
     format!(
-        "{name} (Glm52DenseFfnLocalWorklet) [local (1 GPU); hidden={}; intermediate={}]",
-        cfg.hidden_dim, cfg.intermediate_dim
+        "{name} (Glm52DenseFfnLocalWorklet) [rank-local; tp={}; hidden={}; intermediate/rank={}]",
+        cfg.tp_size,
+        cfg.hidden_dim,
+        cfg.intermediate_dim.get() / u32::from(cfg.tp_size)
     )
 }
 
@@ -300,6 +321,7 @@ mod tests {
             residual_norm_backends: vec!["vllm_cuda"],
             gemm_backends: vec!["torch"],
             elementwise_backends: vec!["triton"],
+            tp_size: 1,
             gpu_name: "NVIDIA H200".to_string(),
             hidden_dim: Dim::param("hidden_dim", HIDDEN_DIM),
             intermediate_dim: Dim::param("intermediate_dim", INTERMEDIATE_DIM),
@@ -357,6 +379,21 @@ mod tests {
     }
 
     #[test]
+    fn tp4_partitions_only_the_intermediate_dimension() {
+        let mut config = cfg();
+        config.tp_size = 4;
+        let r = Glm52DenseFfnLocalWorklet::resolve_config(&config);
+
+        assert_eq!(r.post_attn_add_rms_norm.hidden, 6144);
+        assert_eq!(r.gate_up_proj.n, 6144);
+        assert_eq!(r.gate_up_proj.k, 6144);
+        assert_eq!(r.silu_and_mul.input_bytes_per_token, 12288);
+        assert_eq!(r.silu_and_mul.output_bytes_per_token, 6144);
+        assert_eq!(r.down_proj.n, 6144);
+        assert_eq!(r.down_proj.k, 3072);
+    }
+
+    #[test]
     fn input_shape_and_zero_case_feed_all_four_leaves_faithfully() {
         let input = Glm52DenseFfnLocalWorkletInput { batch_tokens: 73 };
         let work = work_inputs(input.batch_tokens);
@@ -405,13 +442,14 @@ mod tests {
     }
 
     #[test]
-    fn label_documents_self_completing_local_boundary() {
+    fn label_documents_rank_local_tp_partition() {
         let label = worklet_label("layer.dense_ffn", &cfg());
         assert!(label.contains("Glm52DenseFfnLocalWorklet"));
-        assert!(label.contains("local (1 GPU)"));
+        assert!(label.contains("rank-local"));
+        assert!(label.contains("tp=1"));
         assert!(label.contains("hidden=hidden_dim"));
-        assert!(label.contains("intermediate=intermediate_dim"));
-        for forbidden in ["tp=", "allreduce", "collective"] {
+        assert!(label.contains("intermediate/rank=12288"));
+        for forbidden in ["allreduce", "collective"] {
             assert!(!label.contains(forbidden));
         }
     }

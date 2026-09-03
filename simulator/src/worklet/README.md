@@ -97,12 +97,15 @@ Each module re-exports its `{Worklet, Config, Input, Resolved}` quartet through
 | AFD `qwen3_fp8_ffn_moe_layerwise` | `fp8_pre_attn_proj_tp`, `fp8_post_attn_router_tp`, `native_fp8_moe_router_local`, `native_moe_expert_compute_local` |
 | `glm52_dsa_moe` | `glm52_dsa_attn_local`, `glm52_dense_ffn_local`, `glm52_moe_router_local`, `glm52_shared_expert_local`, `moe_expert_compute_local`, `glm52_mtp_prelude_local`, `glm52_mtp_head_local` |
 | `glm52_vllm_dsa_moe` | `vllm_glm52_dsa_attn_local`, `vllm_glm52_dense_ffn_local`, `vllm_glm52_shared_expert_local`, plus the four GLM sections it shares unchanged with the native arch |
-| `glm52_vllm_nvfp4_dsa_moe` | `vllm_glm52_dsa_attn_local`, `vllm_glm52_dense_ffn_local`, `vllm_glm52_shared_expert_local`, `vllm_nvfp4_moe_local`, plus the unchanged GLM router and MTP sections |
+| `glm52_vllm_nvfp4_dsa_moe` | `vllm_glm52_dsa_attn_local`, neutral `glm52_dense_ffn_local`, `glm52_shared_expert_local`, `nvfp4_moe_local`, plus the unchanged GLM router and MTP sections |
+| `glm52_sglang_nvfp4_tp_dsa_moe` | `sglang_glm52_dsa_attn_local`, `sglang_glm52_moe_router_local`, `sglang_moe_finalize_local`, neutral `glm52_dense_ffn_local`, `glm52_shared_expert_local`, `nvfp4_moe_local`, plus the unchanged GLM MTP sections |
 
-A `vllm_*` module is the **same sync section** as its sibling, cut into the leaves
-vLLM actually launches (quantize split out from its GEMM, dispatch/combine split
-into exchange and index/fill), so a measured nsys timeline can be reconciled leaf
-by leaf. It is a second granularity, not a second model.
+When a provider-prefixed module has a neutral sibling, it is the **same sync
+section** cut into the leaves that provider actually launches (for example,
+quantize split out from a vLLM GEMM). A provider may also own an extra sync
+section, such as SGLang's deferred-MoE finalize. Provider-neutral worklets remain
+shared when the launch boundary is identical; provider-specific modules describe
+measured graph differences, not a second model.
 
 ## Authoring
 

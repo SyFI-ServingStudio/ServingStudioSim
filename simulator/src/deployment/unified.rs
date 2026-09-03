@@ -7,10 +7,10 @@
 //! `llama3_dense` + `barebone`, `llama3_dense_tp` + `barebone`,
 //! `llama3_dp_attn_tp_ffn` + `hp_unified`, and `qwen3_moe_dp_attn_ep_ffn` +
 //! `hp_unified`, `glm52_dsa_moe` + `hp_unified`, and
-//! `glm52_vllm_nvfp4_dsa_moe` + either `hp_unified` or the existing dedicated
-//! `chunked_prefill` worker. GLM's TP1 local attention uses one independent
-//! KV/input partition per EP rank; the worker shells and mutable request/KV
-//! lifecycle are unchanged. Each wired arm
+//! `glm52_vllm_nvfp4_dsa_moe` + either `hp_unified` or `chunked_prefill`, and
+//! `glm52_sglang_nvfp4_tp_dsa_moe` + `chunked_prefill`. GLM's TP1 local
+//! attention uses one independent KV/input partition per EP rank; the worker
+//! shells and mutable request/KV lifecycle are unchanged. Each wired arm
 //! monomorphizes its concrete model/worker pair and
 //! erases to `Box<dyn Flow>` — the single `dyn` point (the cost path is
 //! `dyn`-free, L4 §4.1).
@@ -34,7 +34,8 @@ use crate::timing::PerfApiBridge;
 use crate::worker::{
     build_barebone_worker, build_chunked_prefill_worker, build_hp_worker,
     build_qwen36_hybrid_worker, resolve_prefix_cache_config, BatchPolicy, IterWorker,
-    IterWorkerSel, PendingOrderKind, PrefixCacheMode, PrefixCachePolicy, WorkerConfig,
+    IterWorkerSel, KvAdmissionConfig, PendingOrderKind, PrefixCacheMode, PrefixCachePolicy,
+    WorkerConfig,
 };
 
 use super::Deployment;
@@ -76,6 +77,8 @@ impl Deployment for UnifiedDeployment {
             prefix_cache_mode,
             prefix_cache_policy,
             prefix_cache_max_gpu_memory_gb,
+            batch_policy,
+            kv_admission,
         ) = match &g.worker {
             IterWorkerSel::Barebone {
                 attn_gpu_memory_gb,
@@ -105,16 +108,22 @@ impl Deployment for UnifiedDeployment {
                 *prefix_cache_mode,
                 *prefix_cache_policy,
                 *prefix_cache_max_gpu_memory_gb,
+                BatchPolicy::Mix,
+                KvAdmissionConfig::FullFootprint,
             ),
             IterWorkerSel::ChunkedPrefill {
                 attn_gpu_memory_gb,
                 max_batch_tokens,
                 batch_policy,
+                kv_admission,
                 gpu_time_multiplier,
             } => {
+                let kv_admission = kv_admission.resolve()?;
                 ensure!(
-                    *batch_policy == BatchPolicy::Mix,
-                    "unified: chunked_prefill currently supports batch_policy=mix"
+                    !matches!(kv_admission, KvAdmissionConfig::BoundedFuture(_))
+                        || *batch_policy == BatchPolicy::SeparatePrefillPriority,
+                    "bounded-future KV admission currently requires \
+                     batch_policy=separate-prefill-priority"
                 );
                 (
                     *attn_gpu_memory_gb,
@@ -124,6 +133,8 @@ impl Deployment for UnifiedDeployment {
                     PrefixCacheMode::Opportunistic,
                     PrefixCachePolicy::Lru,
                     None,
+                    *batch_policy,
+                    kv_admission,
                 )
             }
             IterWorkerSel::PdPrefill { .. } | IterWorkerSel::PdDecode { .. } => {
@@ -145,6 +156,8 @@ impl Deployment for UnifiedDeployment {
             gpu_time_multiplier,
             max_batch_tokens,
             pending_order,
+            batch_policy,
+            kv_admission,
             prefix_cache,
             ssm_checkpoint_interval_tokens: ssm_checkpoint_interval_tokens(&g.worker),
             ..WorkerConfig::default()
@@ -461,6 +474,39 @@ impl Deployment for UnifiedDeployment {
                     &g.worker,
                 )
             }
+            IterArchSel::Glm52SglangNvfp4TpDsaMoe {
+                tp_size,
+                max_model_len,
+                routing,
+                routing_seed,
+                mtp_mode,
+                expert_popularity_file,
+                ..
+            } => {
+                ensure_hp_or_chunked_worker("GLM-5.2 SGLang NVFP4 pure TP", &g.worker)?;
+                let model = Arc::new(arch_build::glm52_sglang_nvfp4_tp_dsa_moe(
+                    model_spec,
+                    *tp_size,
+                    *max_model_len,
+                    *routing,
+                    *routing_seed,
+                    *mtp_mode,
+                    expert_popularity_file.as_deref(),
+                    &gpu_name,
+                    MODEL_NAME,
+                    bridge,
+                )?);
+                assemble_hp_or_chunked_flow(
+                    "GLM-5.2 SGLang NVFP4 pure TP",
+                    model,
+                    store,
+                    worker_config,
+                    log_dir,
+                    gpu_name,
+                    dp_cfg,
+                    &g.worker,
+                )
+            }
             IterArchSel::Glm52DsaMoe {
                 ep_size,
                 nvl_num_gpu,
@@ -650,6 +696,7 @@ mod tests {
             attn_gpu_memory_gb: 120.0,
             max_batch_tokens: 2048,
             batch_policy: BatchPolicy::Mix,
+            kv_admission: crate::worker::config::KvAdmissionSpec::default(),
             gpu_time_multiplier: 1.0,
         }
     }

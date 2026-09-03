@@ -301,7 +301,23 @@ def test_unknown_engine_has_no_implicit_context_limit_spelling(pack):
 def test_cross_phase_check_uses_the_same_sglang_context_limit_flag(pack, tmp_path):
     case = pack.cases[0]
     original = pack.variant_of(case)
-    variant = dataclasses.replace(original, engine="sglang")
+    python_runtime = {
+        "packages": [
+            {
+                "name": "flashinfer-jit-cache",
+                "version": "0.6.15.post1",
+                "local_version": "cu130",
+                "index_url": "https://flashinfer.ai/whl/cu130",
+                "required_files": ["flashinfer_jit_cache/jit_cache/module/module.so"],
+            }
+        ],
+        "environment": {"FLASHINFER_DISABLE_JIT": "1"},
+    }
+    variant = dataclasses.replace(
+        original,
+        engine="sglang",
+        python_runtime=python_runtime,
+    )
     patched = dataclasses.replace(
         pack,
         variants={**pack.variants, variant.name: variant},
@@ -311,6 +327,7 @@ def test_cross_phase_check_uses_the_same_sglang_context_limit_flag(pack, tmp_pat
 
     assert not check_module._check_cross_phase(patched, case, documents)
     profile = documents[f"{variant.profile_passes[0].name}.yaml"]
+    assert profile["python_runtime"] == python_runtime
     profile["server"]["extra_args"][-2] = "--max-model-len"
     findings = check_module._check_cross_phase(patched, case, documents)
     assert any("--context-length does not match" in item.message for item in findings)

@@ -34,15 +34,21 @@ const NO_FIXED_CHARGE: u64 = 0;
 /// Any prefix length is resumable, so retained KV is reusable token by token.
 const TOKEN_QUANTUM: u32 = 1;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReservationBasis {
+    FullFootprint,
+    BoundedFuture,
+}
+
 pub struct FullAttentionKvFootprint {
-    post_prefill_context_tokens: u32,
-    remaining_output_tokens: u32,
+    reserved_tokens: u64,
+    basis: ReservationBasis,
 }
 
 impl FullAttentionKvFootprint {
     #[inline]
     fn reserved_tokens(&self) -> u64 {
-        u64::from(self.post_prefill_context_tokens) + u64::from(self.remaining_output_tokens)
+        self.reserved_tokens
     }
 }
 
@@ -176,6 +182,88 @@ impl HandoffKv for FullAttnKv {
 }
 
 impl ChunkedPrefillKv for FullAttnKv {
+    fn bounded_future_footprint(
+        &self,
+        _request: RequestId,
+        post_prefill_context_tokens: u32,
+        remaining_output_tokens: u32,
+        max_future_tokens: u32,
+        page_size: u32,
+    ) -> Self::Footprint {
+        let reserved_tokens = u64::from(post_prefill_context_tokens)
+            .checked_add(u64::from(remaining_output_tokens.min(max_future_tokens)))
+            .and_then(|tokens| tokens.checked_add(u64::from(page_size)))
+            .expect("bounded-future KV footprint overflow");
+        FullAttentionKvFootprint {
+            reserved_tokens,
+            basis: ReservationBasis::BoundedFuture,
+        }
+    }
+
+    fn fits_bounded_future(
+        &self,
+        partition: PartitionId,
+        footprint: &Self::Footprint,
+        max_future_tokens: u32,
+        new_token_ratio: f64,
+    ) -> bool {
+        debug_assert_eq!(footprint.basis, ReservationBasis::BoundedFuture);
+        let partition_state = &self.partitions[partition as usize];
+        let protected_tokens = partition_state.resident_tokens()
+            + self.ledger.partition_promised(partition)
+            + self.ledger.partition_held(partition)
+            + footprint.reserved_tokens();
+        let running_future =
+            partition_state.bounded_future_decode_tokens(max_future_tokens, new_token_ratio);
+        protected_tokens as f64 + running_future < partition_state.capacity_tokens() as f64
+    }
+
+    fn prepare_next_decode(&mut self, partition: PartitionId, page_size: u32, now: Time) -> u64 {
+        assert!(page_size > 0, "decode page size must be positive");
+        let partition_state = &self.partitions[partition as usize];
+        let required = partition_state.next_decode_allocation_tokens(page_size);
+        if required == 0 {
+            return 0;
+        }
+        let trigger = partition_state
+            .first_decode_request()
+            .expect("positive decode allocation requires a live request");
+        let protected = partition_state.resident_tokens()
+            + self.ledger.partition_promised(partition)
+            + self.ledger.partition_held(partition);
+        let cache_limit = partition_state
+            .capacity_tokens()
+            .saturating_sub(protected.saturating_add(required));
+        let evictions = self.prefix_caches[partition as usize].shrink_to(cache_limit);
+        for eviction in evictions {
+            self.journal.record_mutation(
+                trigger,
+                partition,
+                now,
+                eviction,
+                PrefixCacheEventKind::Evict(PrefixCacheEvictionReason::ActiveKvPressure),
+                0,
+            );
+        }
+        let cache_tokens = self.prefix_caches[partition as usize].used_charge();
+        let available = partition_state
+            .capacity_tokens()
+            .saturating_sub(protected.saturating_add(cache_tokens));
+        required.saturating_sub(available)
+    }
+
+    fn visit_decode_states(
+        &self,
+        partition: PartitionId,
+        mut visitor: impl FnMut(RequestId, u64, u32),
+    ) {
+        for (request, current_kv, remaining_decode) in
+            self.partitions[partition as usize].decode_states()
+        {
+            visitor(request, current_kv, remaining_decode);
+        }
+    }
+
     fn reserve_chunked_prefill_context(
         &mut self,
         request: RequestId,
@@ -404,8 +492,9 @@ impl FullAttnKv {
         remaining_output_tokens: u32,
     ) -> FullAttentionKvFootprint {
         FullAttentionKvFootprint {
-            post_prefill_context_tokens,
-            remaining_output_tokens,
+            reserved_tokens: u64::from(post_prefill_context_tokens)
+                + u64::from(remaining_output_tokens),
+            basis: ReservationBasis::FullFootprint,
         }
     }
 
@@ -433,7 +522,10 @@ impl FullAttnKv {
     ) {
         self.ledger
             .promise(request, partition, footprint.reserved_tokens());
-        let evictions = self.trim_prefix_cache_to_physical_slack(partition);
+        let evictions = match footprint.basis {
+            ReservationBasis::FullFootprint => self.trim_prefix_cache_to_physical_slack(partition),
+            ReservationBasis::BoundedFuture => self.trim_prefix_cache_to_bounded_slack(partition),
+        };
         for eviction in evictions {
             self.journal.record_mutation(
                 request,
@@ -672,6 +764,18 @@ impl FullAttnKv {
         partition: PartitionId,
     ) -> Vec<PrefixCacheMutation> {
         let physical_limit = self.prefix_cache_physical_limit(partition);
+        self.prefix_caches[partition as usize].shrink_to(physical_limit)
+    }
+
+    fn trim_prefix_cache_to_bounded_slack(
+        &mut self,
+        partition: PartitionId,
+    ) -> Vec<PrefixCacheMutation> {
+        let partition_state = &self.partitions[partition as usize];
+        let protected = partition_state.resident_tokens()
+            + self.ledger.partition_promised(partition)
+            + self.ledger.partition_held(partition);
+        let physical_limit = partition_state.capacity_tokens().saturating_sub(protected);
         self.prefix_caches[partition as usize].shrink_to(physical_limit)
     }
 

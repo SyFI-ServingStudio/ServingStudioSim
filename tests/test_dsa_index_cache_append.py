@@ -26,6 +26,7 @@ from profiling.runners.exceptions import ProfilerNotImplemented
 
 _BACKEND = "torch"
 _VLLM_BACKEND = "vllm_cuda"
+_SGLANG_BACKEND = "sglang_fused_norm_rope_store"
 _CACHE_FORMAT = "page_planar_fp8_fp32_scale"
 
 
@@ -69,7 +70,7 @@ def test_kind_table_backend_runner_and_support_contract():
     spec = find_kernel_profiler_spec(KIND, _BACKEND)
 
     assert KIND == "dsa_index_cache_append"
-    assert known_backends(KIND) == [_BACKEND, _VLLM_BACKEND]
+    assert known_backends(KIND) == [_BACKEND, _VLLM_BACKEND, _SGLANG_BACKEND]
     assert spec.kernel_kind == KIND
     assert spec.table_name == KIND
     assert spec.args_schema is DsaIndexCacheAppendArgs

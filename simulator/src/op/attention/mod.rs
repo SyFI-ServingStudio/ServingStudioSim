@@ -4,9 +4,11 @@ pub mod dsa_indexer;
 pub mod dsa_sparse_mla;
 pub mod flashinfer;
 
-pub use dsa_indexer::{DsaIndexerConfig, DsaIndexerDecodeInput, DsaIndexerInput, DsaIndexerOp};
+pub use dsa_indexer::{
+    DsaIndexerConfig, DsaIndexerDecodeInput, DsaIndexerInput, DsaIndexerLaunchGraph, DsaIndexerOp,
+};
 pub use dsa_sparse_mla::{
     DsaSparseMlaAttentionConfig, DsaSparseMlaAttentionInput, DsaSparseMlaAttentionOp,
-    DsaSparseMlaExactVarlenConfig,
+    DsaSparseMlaExactVarlenConfig, DsaSparseMlaLaunchGraph,
 };
 pub use flashinfer::{FlashInferAttentionConfig, FlashInferAttentionInput, FlashInferAttentionOp};

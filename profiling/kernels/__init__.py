@@ -30,6 +30,7 @@ from profiling.kernels import (
     deepseek_v4_sparse_mla_prefill,  # noqa: F401
     deepseek_v4_terminal_mhc_head,  # noqa: F401
     dsa_index_cache_append,  # noqa: F401
+    dsa_indexer_q_rope_quant,  # noqa: F401
     dsa_mqa_logits_prefill,  # noqa: F401
     dsa_paged_mqa_logits_decode,  # noqa: F401
     dsa_persistent_topk_decode,  # noqa: F401
@@ -62,11 +63,13 @@ from profiling.kernels import (
     mhc_fused_post_pre_rms_norm,  # noqa: F401
     mhc_pre_rms_norm,  # noqa: F401
     mla_cache_append,  # noqa: F401
+    mla_rope_quantize_fp8,  # noqa: F401
     moe_align_block_size,  # noqa: F401
     moe_alltoall,  # noqa: F401
     moe_alltoall_prepare,  # noqa: F401
     moe_ep_all_gather,  # noqa: F401
     moe_ep_reduce_scatter,  # noqa: F401
+    moe_finalize_fuse_shared,  # noqa: F401
     moe_finalize_routing,  # noqa: F401
     moe_fused_topk,  # noqa: F401
     moe_sum,  # noqa: F401

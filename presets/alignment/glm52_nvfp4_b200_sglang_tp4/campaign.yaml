@@ -1,0 +1,857 @@
+schema_version: 1
+pack: glm52_nvfp4_b200_sglang_tp4
+description: GLM-5.2 NVFP4 on B200, pure TP4/DP1/EP1 under SGLang. The 15-case matrix of
+  presets/alignment/glm52_nvfp4_b200 (vLLM, EP4) ported to SGLang; every case keeps its name, purpose,
+  coverage, concurrency, capture window, context limit and shape ladder, so the two packs measure the
+  same fifteen operating points and differ only in the engine. The engine specifics were copied from
+  the four accepted single-case configs in logs/20260828_0_glm52_nvfp4_pure_tp_sglang_alignment
+  (profile_nsys.yaml, profile_workload.yaml, profile_popularity.yaml, simulation.yaml).
+
+# The machine that produced these captures, as facts rather than as a runnable
+# config. A host profile is a local file because its contents are absolute paths
+# to an HF cache and a 1 GB corpus.
+recorded_on:
+  host: b200_raid
+  gpu: NVIDIA B200
+  # Relative to the host's hf_hub_root. The same snapshot the accepted SGLang
+  # single case ran; a different snapshot is a different model.
+  checkpoint_snapshots:
+    glm52_nvfp4: models--nvidia--GLM-5.2-NVFP4/snapshots/aec724e8c7b8ee9db3b48c01c320f63f9cdaf8aa
+  # The profiler version is an input to every measured duration.
+  nsys_version: 2025.5.2
+  # One role only. The vLLM matrix split its cases across two device roles and
+  # ran cases 01-08 on GPUs 4-7; those devices are held by an unrelated user's
+  # job, so `secondary` has no counterpart here and every case runs on 0,1,2,3.
+  # `device_role` is therefore a constant in this pack, not an axis.
+  device_roles:
+    primary: '0,1,2,3'
+
+variants:
+  # One variant: pure tensor parallelism. Not a second entry beside the vLLM
+  # pack's `ep4_tp4_dp1` because the arch tag, the engine and the backend all
+  # differ -- a variant is a topology within one engine's vocabulary.
+  tp4_dp1_sglang:
+    deployment: unified
+    gpu: NVIDIA B200
+    replicas: 1
+    checkpoint: glm52_nvfp4
+    engine: sglang
+    # `openai`, NOT `vllm_tokens`. `alignment/runner.py:96-101` appends
+    # `--tokens-only` for the `vllm_tokens` backend regardless of engine, and
+    # `sglang.launch_server` has no such flag; the Python backend registry has no
+    # `sglang_tokens` entry to select instead.
+    backend: openai
+    # Keep profiling on the exact prebuilt CUDA-13 runtime used by the accepted
+    # captures. The launcher verifies these artifacts before starting SGLang,
+    # so a missing wheel cannot silently turn into startup-time JIT work.
+    python_runtime:
+      lock_timeout_seconds: 3600.0
+      install_timeout_seconds: 1800.0
+      packages:
+      - name: nvtx
+        version: 0.2.16
+        index_url: https://pypi.org/simple
+      - name: flashinfer-python
+        version: 0.6.15.post1
+        index_url: https://pypi.org/simple
+      - name: flashinfer-cubin
+        version: 0.6.15.post1
+        index_url: https://flashinfer.ai/whl
+      - name: flashinfer-jit-cache
+        version: 0.6.15.post1
+        local_version: cu130
+        index_url: https://flashinfer.ai/whl/cu130
+        required_files:
+        - flashinfer_jit_cache/jit_cache/fp4_quantization_100/fp4_quantization_100.so
+        - flashinfer_jit_cache/jit_cache/trtllm_comm/trtllm_comm.so
+        - flashinfer_jit_cache/jit_cache/rope/rope.so
+        - flashinfer_jit_cache/jit_cache/fmha_gen/fmha_gen.so
+        - flashinfer_jit_cache/jit_cache/fused_moe_trtllm_sm100/fused_moe_trtllm_sm100.so
+      environment:
+        FLASHINFER_DISABLE_JIT: '1'
+    run_name_prefix: glm52_b200_tp4_sglang
+    server:
+      tp_size: 4
+      dp_size: 1
+      # Pure tensor parallelism. SGLang's `--ep-size` defaults to 1, so this
+      # config passes no expert-parallel flag at all; what it must state is the
+      # resulting EP degree, because `alignment/runner.py` derives
+      # `expert_parallel_size = tp_size * dp_size` when it is left unset and
+      # `arch/build.rs:398 validate_expert_popularity` hard-checks that number
+      # against the arch's EP degree. Under EP1 every rank holds all 256 experts
+      # with moe_intermediate sharded 2048 -> 512, which is exactly what
+      # `glm52_sglang_nvfp4_tp_dsa_moe` models.
+      expert_parallel_size: 1
+      # One SGLang scheduler event is repeated across the four TP workers; the
+      # popularity recorder reduces those four copies into one logical record.
+      expert_count_reduction_group_size: 4
+      # --chunked-prefill-size; must match the worker's max_batch_tokens.
+      chunk_size: 2048
+      # No `max_cudagraph_capture_size`. It is a vLLM TOKEN ceiling and the vLLM
+      # pack sets it to the chunk budget; SGLang's nearest flag,
+      # `--cuda-graph-max-bs-decode`, is a REQUEST count, so forwarding 2048
+      # would ask for decode graphs covering 2,048 concurrent requests and stall
+      # startup indefinitely. `alignment/profiler/sglang_server.py:150-169`
+      # refuses the field for engine: sglang rather than move the number between
+      # units. SGLang's own decode-graph default covers this matrix.
+      #
+      # No `enable_server_load_tracking` either: the SGLang driver never reads
+      # it, and its `/v1/loads` idle endpoint needs no launch flag.
+      extra_args:
+      # VibeSim models FlashInfer's TRTLLM fused all-reduce -- that is what the
+      # `all_reduce_fusion` / `all_reduce_residual_rms_norm` leaves were profiled
+      # against, and what vLLM runs. SGLang's `auto` resolves to `mnnvl` on
+      # Blackwell, a different kernel family, so pinning `trtllm` is a modeling
+      # requirement rather than a workaround: aligning against mnnvl would
+      # compare two different collectives.
+      - --flashinfer-allreduce-fusion-backend
+      - trtllm
+      - --kv-cache-dtype
+      - fp8_e4m3
+      # `--context-length <case.max_model_len>` is appended by the renderer, not
+      # authored here, exactly as `--max-model-len` is for the vLLM pack: it is
+      # the same decision as `arch.max_model_len` and `workload.max_model_len`
+      # and must not be able to disagree with them.
+    arch:
+      type: glm52_sglang_nvfp4_tp_dsa_moe
+      model_config: model/config/glm52_nvfp4.json
+      fp8: false
+      tp_size: 4
+      # No `ep_size` and no `nvl_num_gpu`: the vLLM pack's EP4 arch splits the
+      # expert axis over four ranks and costs the NVLink all-to-all that split
+      # implies. Under pure TP there is no expert axis to split and no expert
+      # all-to-all, so both parameters are absent from this arch tag rather than
+      # set to a neutral value.
+      #
+      # `routing: uniform` is required alongside a popularity profile, not an
+      # alternative to it: `arch/build.rs:568` rejects the pair unless the kind
+      # is uniform, and then the measured profile replaces the distribution.
+      routing: uniform
+      # Pack-relative. `render.simulation_document` rewrites it to the
+      # repo-relative `presets/alignment/glm52_nvfp4_b200_sglang_tp4/expert_popularity.json`
+      # that the rendered simulation preset carries.
+      expert_popularity_file: expert_popularity.json
+      mtp_mode: 'off'
+    worker:
+      type: chunked_prefill
+      # `chunked_prefill_size=2048` in the captured server's own argument dump.
+      max_batch_tokens: 2048
+      # SGLang runs an extend batch or a decode batch, never both: its
+      # `get_next_batch_to_run` takes `get_new_batch_prefill`'s result if there
+      # is one and only otherwise falls through to the running decode batch.
+      # The captured server reports `enable_mixed_chunk=False`, the default, so
+      # the mixing path is off. `mix` is the vLLM V1 scheduler, which is why the
+      # vLLM pack keeps it.
+      batch_policy: separate-prefill-priority
+      # SGLang's scheduler admits against a bounded estimate of future decode
+      # growth and retracts resident decodes if physical KV allocation can no
+      # longer be satisfied. Keep the source defaults in the campaign so a
+      # replay uses the same scheduler contract as the recorded baseline.
+      kv_admission_policy: bounded-future
+      kv_page_size: 1
+      kv_max_future_tokens: 4096
+      kv_initial_new_token_ratio: 0.7
+      kv_minimum_new_token_ratio: 0.098
+      kv_new_token_ratio_decay_steps: 600
+      kv_retract_decode_steps: 20
+      decode_retraction_policy: length
+    # Three passes, not the vLLM pack's two, and they are not interchangeable:
+    #   profile_popularity  routing counts. Required for any MoE arch, and the
+    #                       only way to get one under pure TP -- SGLang's EPLB,
+    #                       which normally carries the record, asserts ep_size>1.
+    #                       Kept a separate pass because the recorder buffers a
+    #                       per-forward histogram and all-reduces it at dump,
+    #                       which has no business inside a timing measurement.
+    #   profile_workload    the complete, undisturbed scheduler timeline. The
+    #                       E2E authority, and where each case's real KV
+    #                       capacity is read back from.
+    #   profile_nsys        bounded per-kernel truth. A slice of the run that
+    #                       carries capture/flush pauses, so it is never the E2E
+    #                       authority.
+    profile_passes:
+    - kind: expert_popularity
+      name: profile_popularity
+      trace: workload
+    - kind: workload_metrics
+      name: profile_workload
+      trace: workload
+    - kind: nsys
+      name: profile_nsys
+      trace: kernel
+    input_builder:
+      # `engine_text`, not `vllm_text` and not `sglang_text`:
+      # `launcher/alignment_config.py:191-195` accepts only the first two, and
+      # `vllm_text` is the pre-SGLang alias of this same builder kept for
+      # configs written against the single-engine pipeline.
+      type: engine_text
+      measured_phase: forward
+      group_assignment: per_dp_rank
+    label_rules: label_rules/manifest.json
+cases:
+- index: 1
+  name: micro_throughput_c256
+  variant: tp4_dp1_sglang
+  purpose: Maximum request batching and scheduler pressure.
+  coverage:
+  - batching
+  - scheduler_pressure
+  max_model_len: 8192
+  max_concurrency: 256
+  profile_arrival_mode: saturated
+  simulation_arrival_mode: saturated
+  gpu_memory_utilization: 0.75
+  capture_seconds: 15.0
+  device_role: primary
+  workload_trace:
+    file: traces/01_micro_throughput_c256.csv
+    shapes:
+    - [16, 16]
+    - [32, 32]
+    - [64, 64]
+    - [128, 64]
+    repeats: 256
+  attn_gpu_memory_gb:
+    # C = 485120.
+    value: 26.79026688
+    status: measured
+    derived_from: '`max_total_num_tokens=C` in the workload-only SGLang server log; C * 220896 / 4 / 1e9.
+      SGLang''s --mem-fraction-static accounts differently from vLLM''s --gpu-memory-utilization, so the
+      vLLM pack''s value does not transfer and has to be read back per case: this case reads 26.79 GB
+      where the vLLM matrix recorded 120.0 GB at the same 0.75 utilization.'
+    evidence: logs/20260829_0_glm52_sglang_tp4_matrix/cases/01_micro_throughput_c256/profile_workload
+  provenance:
+    ported_from: presets/alignment/glm52_nvfp4_b200/campaign.yaml case 1
+    engine_reference: logs/20260828_0_glm52_nvfp4_pure_tp_sglang_alignment
+    capture_run: logs/20260829_0_glm52_sglang_tp4_matrix/cases/01_micro_throughput_c256
+- index: 2
+  name: graph_boundaries_c128
+  variant: tp4_dp1_sglang
+  purpose: CUDA graph and small-batch kernel boundaries.
+  coverage:
+  - cuda_graph_boundaries
+  - small_batch
+  max_model_len: 8192
+  max_concurrency: 128
+  profile_arrival_mode: saturated
+  simulation_arrival_mode: saturated
+  gpu_memory_utilization: 0.75
+  capture_seconds: 15.0
+  device_role: primary
+  # This case's subject IS the small-batch and CUDA-graph boundary region, which
+  # the profiler's default 24-48 analysis window starts after. The vLLM pack
+  # widened it to the whole capture for the same reason; keeping the same window
+  # is what makes the two packs' case 02 the same measurement.
+  analyze_iterations: [0, 239]
+  workload_trace:
+    file: traces/02_graph_boundaries_c128.csv
+    shapes:
+    - [1, 32]
+    - [15, 32]
+    - [16, 32]
+    - [31, 32]
+    - [32, 32]
+    - [63, 64]
+    - [64, 64]
+    - [127, 64]
+    - [128, 64]
+    - [255, 64]
+    - [256, 64]
+    repeats: 48
+  attn_gpu_memory_gb:
+    # C = 474624.
+    value: 26.210635776
+    status: measured
+    derived_from: '`max_total_num_tokens=C` in the workload-only SGLang server log; C * 220896 / 4 / 1e9.'
+    evidence: logs/20260829_0_glm52_sglang_tp4_matrix/cases/02_graph_boundaries_c128/profile_workload
+  provenance:
+    ported_from: presets/alignment/glm52_nvfp4_b200/campaign.yaml case 2
+    engine_reference: logs/20260828_0_glm52_nvfp4_pure_tp_sglang_alignment
+    capture_run: logs/20260829_0_glm52_sglang_tp4_matrix/cases/02_graph_boundaries_c128
+- index: 3
+  name: balanced_anchor_c32
+  variant: tp4_dp1_sglang
+  purpose: Comparable extension of the existing c32 anchor.
+  coverage:
+  - balanced_anchor
+  max_model_len: 8192
+  max_concurrency: 32
+  profile_arrival_mode: saturated
+  simulation_arrival_mode: saturated
+  gpu_memory_utilization: 0.75
+  capture_seconds: 15.0
+  device_role: primary
+  workload_trace:
+    file: traces/03_balanced_anchor_c32.csv
+    shapes:
+    - [256, 128]
+    - [256, 256]
+    - [1024, 128]
+    - [1024, 256]
+    - [2048, 128]
+    - [2048, 256]
+    - [4096, 128]
+    - [4096, 256]
+    repeats: 16
+  attn_gpu_memory_gb:
+    # C = 474624.
+    value: 26.210635776
+    status: measured
+    derived_from: '`max_total_num_tokens=C` in the workload-only SGLang server log; C * 220896 / 4 / 1e9.'
+    evidence: logs/20260829_0_glm52_sglang_tp4_matrix/cases/03_balanced_anchor_c32/profile_workload
+  provenance:
+    ported_from: presets/alignment/glm52_nvfp4_b200/campaign.yaml case 3
+    engine_reference: logs/20260828_0_glm52_nvfp4_pure_tp_sglang_alignment
+    capture_run: logs/20260829_0_glm52_sglang_tp4_matrix/cases/03_balanced_anchor_c32
+- index: 4
+  name: prefill_spectrum_c32
+  variant: tp4_dp1_sglang
+  purpose: Prefill scaling and the 2048-token chunk boundary.
+  coverage:
+  - prefill_scaling
+  - chunk_boundary
+  max_model_len: 8192
+  max_concurrency: 32
+  profile_arrival_mode: saturated
+  simulation_arrival_mode: saturated
+  gpu_memory_utilization: 0.75
+  capture_seconds: 15.0
+  device_role: primary
+  workload_trace:
+    file: traces/04_prefill_spectrum_c32.csv
+    shapes:
+    - [128, 64]
+    - [512, 64]
+    - [1984, 64]
+    - [2048, 64]
+    - [2112, 64]
+    - [4096, 64]
+    - [6144, 64]
+    - [7168, 64]
+    repeats: 16
+  attn_gpu_memory_gb:
+    # C = 474624.
+    value: 26.210635776
+    status: measured
+    derived_from: '`max_total_num_tokens=C` in the workload-only SGLang server log; C * 220896 / 4 / 1e9.'
+    evidence: logs/20260829_0_glm52_sglang_tp4_matrix/cases/04_prefill_spectrum_c32/profile_workload
+  provenance:
+    ported_from: presets/alignment/glm52_nvfp4_b200/campaign.yaml case 4
+    engine_reference: logs/20260828_0_glm52_nvfp4_pure_tp_sglang_alignment
+    capture_run: logs/20260829_0_glm52_sglang_tp4_matrix/cases/04_prefill_spectrum_c32
+- index: 5
+  name: decode_spectrum_c64
+  variant: tp4_dp1_sglang
+  purpose: Decode residence, KV growth, and batch contraction.
+  coverage:
+  - decode_residence
+  - kv_growth
+  max_model_len: 8192
+  max_concurrency: 64
+  profile_arrival_mode: saturated
+  simulation_arrival_mode: saturated
+  gpu_memory_utilization: 0.75
+  capture_seconds: 15.0
+  device_role: primary
+  workload_trace:
+    file: traces/05_decode_spectrum_c64.csv
+    shapes:
+    - [128, 16]
+    - [128, 128]
+    - [128, 512]
+    - [128, 1024]
+    - [128, 2048]
+    - [128, 4096]
+    - [512, 2048]
+    - [1024, 4096]
+    repeats: 16
+  attn_gpu_memory_gb:
+    # C = 474624. Read from the RE-CAPTURED workload pass: the first attempt
+    # overlapped orphaned compile jobs on the host and reported 478976 (26.451
+    # GB) with a 20% inflated wall clock. Its artifacts are kept beside the
+    # clean ones as `profile_workload.contended-1344` rather than deleted, so
+    # the two are comparable; the clean pass agrees exactly with cases 02-04.
+    value: 26.210635776
+    status: measured
+    derived_from: '`max_total_num_tokens=C` in the workload-only SGLang server log; C * 220896 / 4 / 1e9.'
+    evidence: logs/20260829_0_glm52_sglang_tp4_matrix/cases/05_decode_spectrum_c64/profile_workload
+  provenance:
+    ported_from: presets/alignment/glm52_nvfp4_b200/campaign.yaml case 5
+    engine_reference: logs/20260828_0_glm52_nvfp4_pure_tp_sglang_alignment
+    capture_run: logs/20260829_0_glm52_sglang_tp4_matrix/cases/05_decode_spectrum_c64
+- index: 6
+  name: long_long_c8
+  variant: tp4_dp1_sglang
+  purpose: Long-prefill plus long-decode interaction near context capacity.
+  coverage:
+  - long_prefill
+  - long_decode
+  max_model_len: 8192
+  max_concurrency: 8
+  profile_arrival_mode: saturated
+  simulation_arrival_mode: saturated
+  gpu_memory_utilization: 0.75
+  capture_seconds: 15.0
+  device_role: primary
+  workload_trace:
+    file: traces/06_long_long_c8.csv
+    shapes:
+    - [2048, 4096]
+    - [3072, 3072]
+    - [4096, 3968]
+    - [5120, 2944]
+    - [6144, 1920]
+    repeats: 7
+  attn_gpu_memory_gb:
+    # C = 474624.
+    value: 26.210635776
+    status: measured
+    derived_from: '`max_total_num_tokens=C` in the workload-only SGLang server log; C * 220896 / 4 / 1e9.'
+    evidence: logs/20260829_0_glm52_sglang_tp4_matrix/cases/06_long_long_c8/profile_workload
+  provenance:
+    ported_from: presets/alignment/glm52_nvfp4_b200/campaign.yaml case 6
+    engine_reference: logs/20260828_0_glm52_nvfp4_pure_tp_sglang_alignment
+    capture_run: logs/20260829_0_glm52_sglang_tp4_matrix/cases/06_long_long_c8
+- index: 7
+  name: quadrant_interference_c48
+  variant: tp4_dp1_sglang
+  purpose: All four IO quadrants sharing continuous batches.
+  coverage:
+  - io_quadrants
+  - continuous_batching
+  max_model_len: 8192
+  max_concurrency: 48
+  profile_arrival_mode: saturated
+  simulation_arrival_mode: saturated
+  gpu_memory_utilization: 0.75
+  capture_seconds: 15.0
+  device_role: primary
+  workload_trace:
+    file: traces/07_quadrant_interference_c48.csv
+    shapes:
+    - [128, 128]
+    - [128, 4096]
+    - [4096, 128]
+    - [3072, 3072]
+    repeats: 24
+  attn_gpu_memory_gb:
+    # C = 474624.
+    value: 26.210635776
+    status: measured
+    derived_from: '`max_total_num_tokens=C` in the workload-only SGLang server log; C * 220896 / 4 / 1e9.'
+    evidence: logs/20260829_0_glm52_sglang_tp4_matrix/cases/07_quadrant_interference_c48/profile_workload
+  provenance:
+    ported_from: presets/alignment/glm52_nvfp4_b200/campaign.yaml case 7
+    engine_reference: logs/20260828_0_glm52_nvfp4_pure_tp_sglang_alignment
+    capture_run: logs/20260829_0_glm52_sglang_tp4_matrix/cases/07_quadrant_interference_c48
+- index: 8
+  name: completion_churn_c96
+  variant: tp4_dp1_sglang
+  purpose: Rapid completions, shrinking batches, and request replacement.
+  coverage:
+  - completion_churn
+  - admission
+  max_model_len: 8192
+  max_concurrency: 96
+  profile_arrival_mode: saturated
+  simulation_arrival_mode: saturated
+  gpu_memory_utilization: 0.75
+  capture_seconds: 15.0
+  device_role: primary
+  workload_trace:
+    file: traces/08_completion_churn_c96.csv
+    shapes:
+    - [512, 1]
+    - [512, 16]
+    - [512, 64]
+    - [512, 256]
+    - [512, 1024]
+    - [512, 4096]
+    repeats: 32
+  attn_gpu_memory_gb:
+    # C = 474624. Last case at 0.75 mem-fraction; cases 09-15 run 0.85.
+    value: 26.210635776
+    status: measured
+    derived_from: '`max_total_num_tokens=C` in the workload-only SGLang server log; C * 220896 / 4 / 1e9.'
+    evidence: logs/20260829_0_glm52_sglang_tp4_matrix/cases/08_completion_churn_c96/profile_workload
+  provenance:
+    ported_from: presets/alignment/glm52_nvfp4_b200/campaign.yaml case 8
+    engine_reference: logs/20260828_0_glm52_nvfp4_pure_tp_sglang_alignment
+    capture_run: logs/20260829_0_glm52_sglang_tp4_matrix/cases/08_completion_churn_c96
+- index: 9
+  name: rate_knee
+  variant: tp4_dp1_sglang
+  purpose: Maximum sustainable open-loop request rate.
+  coverage:
+  - arrival_rate_knee
+  max_model_len: 8192
+  max_concurrency: null
+  profile_arrival_mode: trace-timed
+  simulation_arrival_mode: trace_timed
+  gpu_memory_utilization: 0.85
+  capture_seconds: 20.0
+  device_role: primary
+  workload_trace:
+    file: traces/09_rate_knee.csv
+    shapes:
+    - [128, 128]
+    - [128, 4096]
+    - [4096, 128]
+    - [3072, 3072]
+    - [512, 256]
+    - [2048, 1024]
+    - [6144, 512]
+    - [1024, 4096]
+    repeats: 64
+  rate:
+    value: 1.0
+    status: provisional
+    derived_from: 'Inherited from the vLLM pack, which derived it from the queueing knee of its own
+      case-10 saturation sweep (DESIGN.md step 2). It has NOT been re-derived against SGLang, whose
+      knee is a property of its scheduler and admission policy rather than of the trace, so this is
+      the vLLM operating point replayed here, not the SGLang one.'
+    evidence: ''
+  attn_gpu_memory_gb:
+    # C = 817408. First case at 0.85, and a cross-check on the whole method: the
+    # accepted single-case SGLang run in
+    # logs/20260828_0_glm52_nvfp4_pure_tp_sglang_alignment measured the same
+    # 817408 at 0.85 with max_model_len 131072, where this case runs 8192. The
+    # KV pool is what is left after weights and activations, so it does not move
+    # with the context limit -- two independent runs landing on the same integer
+    # is what says the read-back is a measurement and not a coincidence.
+    value: 45.140539392
+    status: measured
+    derived_from: '`max_total_num_tokens=C` in the workload-only SGLang server log; C * 220896 / 4 / 1e9.'
+    evidence: logs/20260829_0_glm52_sglang_tp4_matrix/cases/09_rate_knee/profile_workload
+  provenance:
+    ported_from: presets/alignment/glm52_nvfp4_b200/campaign.yaml case 9
+    engine_reference: logs/20260828_0_glm52_nvfp4_pure_tp_sglang_alignment
+    capture_run: logs/20260829_0_glm52_sglang_tp4_matrix/cases/09_rate_knee
+- index: 10
+  name: full_saturation_rate
+  variant: tp4_dp1_sglang
+  purpose: Peak-throughput open-loop load beyond the sustainable knee.
+  coverage:
+  - saturation
+  - peak_throughput
+  max_model_len: 8192
+  max_concurrency: 256
+  profile_arrival_mode: saturated
+  simulation_arrival_mode: saturated
+  gpu_memory_utilization: 0.85
+  capture_seconds: 20.0
+  device_role: primary
+  workload_trace:
+    file: traces/10_full_saturation_rate.csv
+    shapes:
+    - [128, 128]
+    - [128, 4096]
+    - [4096, 128]
+    - [3072, 3072]
+    - [512, 256]
+    - [2048, 1024]
+    - [6144, 512]
+    - [1024, 4096]
+    repeats: 64
+  attn_gpu_memory_gb:
+    # C = 817408.
+    value: 45.140539392
+    status: measured
+    derived_from: '`max_total_num_tokens=C` in the workload-only SGLang server log; C * 220896 / 4 / 1e9.'
+    evidence: logs/20260829_0_glm52_sglang_tp4_matrix/cases/10_full_saturation_rate/profile_workload
+  provenance:
+    ported_from: presets/alignment/glm52_nvfp4_b200/campaign.yaml case 10
+    engine_reference: logs/20260828_0_glm52_nvfp4_pure_tp_sglang_alignment
+    capture_run: logs/20260829_0_glm52_sglang_tp4_matrix/cases/10_full_saturation_rate
+- index: 11
+  name: long_prefill_ladder_c1
+  variant: tp4_dp1_sglang
+  purpose: '16K-491K prompts: long-prefill ladder at concurrency 1.'
+  coverage:
+  - long_prefill
+  - bounded_kernel_trace
+  max_model_len: 524288
+  max_concurrency: 1
+  profile_arrival_mode: saturated
+  simulation_arrival_mode: saturated
+  gpu_memory_utilization: 0.85
+  capture_seconds: 120.0
+  device_role: primary
+  workload_trace:
+    file: traces/11_long_prefill_ladder_c1.csv
+    shapes:
+    - [16384, 16]
+    - [32768, 64]
+    - [65536, 16]
+    - [98304, 64]
+    - [131072, 16]
+    - [196608, 64]
+    - [262144, 16]
+    - [393216, 64]
+    - [458752, 16]
+    - [491520, 64]
+    repeats: 2
+    id_suffix: full
+  kernel_trace:
+    file: traces/11_long_prefill_ladder_c1.nsys.csv
+    shapes:
+    - [16384, 16]
+    - [32768, 64]
+    - [65536, 16]
+    - [98304, 64]
+    - [131072, 16]
+    - [196608, 64]
+    - [262144, 16]
+    repeats: 1
+    id_suffix: nsys
+  attn_gpu_memory_gb:
+    # C = 817408 -- the same pool cases 09 and 10 measured at 0.85 with
+    # max_model_len 8192, here with 524288. SGLang sizes the KV pool from what is
+    # left after weights and activations, so the context limit does not enter it;
+    # that is why 0.75 and 0.85 are the only two numbers this matrix produces
+    # rather than fifteen.
+    value: 45.140539392
+    status: measured
+    derived_from: '`max_total_num_tokens=C` in the workload-only SGLang server log; C * 220896 / 4 / 1e9.'
+    evidence: logs/20260829_0_glm52_sglang_tp4_matrix/cases/11_long_prefill_ladder_c1/profile_workload
+  provenance:
+    ported_from: presets/alignment/glm52_nvfp4_b200/campaign.yaml case 11
+    engine_reference: logs/20260828_0_glm52_nvfp4_pure_tp_sglang_alignment
+    capture_run: logs/20260829_0_glm52_sglang_tp4_matrix/cases/11_long_prefill_ladder_c1
+- index: 12
+  name: ultra_context_decode_c1
+  variant: tp4_dp1_sglang
+  purpose: 'Long context plus long output: ultra-context decode at concurrency 1.'
+  coverage:
+  - ultra_context
+  - long_decode
+  max_model_len: 524288
+  max_concurrency: 1
+  profile_arrival_mode: saturated
+  simulation_arrival_mode: saturated
+  gpu_memory_utilization: 0.85
+  capture_seconds: 120.0
+  device_role: primary
+  workload_trace:
+    file: traces/12_ultra_context_decode_c1.csv
+    shapes:
+    - [458752, 256]
+    - [458752, 1024]
+    - [458752, 4096]
+    - [262144, 256]
+    - [262144, 1024]
+    - [262144, 4096]
+    - [131072, 256]
+    - [131072, 1024]
+    - [131072, 4096]
+    - [32768, 256]
+    - [32768, 1024]
+    - [32768, 4096]
+    - [8192, 256]
+    - [8192, 1024]
+    - [8192, 4096]
+    repeats: 1
+    id_suffix: full
+  kernel_trace:
+    file: traces/12_ultra_context_decode_c1.nsys.csv
+    shapes:
+    - [458752, 64]
+    - [8192, 256]
+    - [12288, 64]
+    repeats: 1
+    id_suffix: nsys
+  attn_gpu_memory_gb:
+    # C = 817408.
+    value: 45.140539392
+    status: measured
+    derived_from: '`max_total_num_tokens=C` in the workload-only SGLang server log; C * 220896 / 4 / 1e9.'
+    evidence: logs/20260829_0_glm52_sglang_tp4_matrix/cases/12_ultra_context_decode_c1/profile_workload
+  provenance:
+    ported_from: presets/alignment/glm52_nvfp4_b200/campaign.yaml case 12
+    engine_reference: logs/20260828_0_glm52_nvfp4_pure_tp_sglang_alignment
+    capture_run: logs/20260829_0_glm52_sglang_tp4_matrix/cases/12_ultra_context_decode_c1
+- index: 13
+  name: generation_length_matrix_c8
+  variant: tp4_dp1_sglang
+  purpose: Mixed prompt and output lengths across a generation-length matrix.
+  coverage:
+  - generation_length_matrix
+  max_model_len: 131072
+  max_concurrency: 8
+  profile_arrival_mode: saturated
+  simulation_arrival_mode: saturated
+  gpu_memory_utilization: 0.85
+  capture_seconds: 60.0
+  device_role: primary
+  workload_trace:
+    file: traces/13_generation_length_matrix_c8.csv
+    shapes:
+    - [128, 4096]
+    - [128, 8192]
+    - [128, 16384]
+    - [128, 32768]
+    - [512, 4096]
+    - [512, 8192]
+    - [512, 16384]
+    - [512, 32768]
+    - [2048, 4096]
+    - [2048, 8192]
+    - [2048, 16384]
+    - [2048, 32768]
+    - [8192, 4096]
+    - [8192, 8192]
+    - [8192, 16384]
+    - [8192, 32768]
+    - [16384, 4096]
+    - [16384, 8192]
+    - [16384, 16384]
+    - [16384, 32768]
+    - [32768, 4096]
+    - [32768, 8192]
+    - [32768, 16384]
+    - [32768, 32768]
+    repeats: 1
+    id_suffix: full
+  kernel_trace:
+    file: traces/13_generation_length_matrix_c8.nsys.csv
+    shapes:
+    - [128, 256]
+    - [512, 256]
+    - [2048, 256]
+    - [8192, 256]
+    - [16384, 256]
+    - [32768, 256]
+    - [4096, 256]
+    - [24576, 256]
+    repeats: 1
+    id_suffix: nsys
+  attn_gpu_memory_gb:
+    # C = 817408.
+    value: 45.140539392
+    status: measured
+    derived_from: '`max_total_num_tokens=C` in the workload-only SGLang server log; C * 220896 / 4 / 1e9.'
+    evidence: logs/20260829_0_glm52_sglang_tp4_matrix/cases/13_generation_length_matrix_c8/profile_workload
+  provenance:
+    ported_from: presets/alignment/glm52_nvfp4_b200/campaign.yaml case 13
+    engine_reference: logs/20260828_0_glm52_nvfp4_pure_tp_sglang_alignment
+    capture_run: logs/20260829_0_glm52_sglang_tp4_matrix/cases/13_generation_length_matrix_c8
+- index: 14
+  name: near_full_long_decode_c21
+  variant: tp4_dp1_sglang
+  purpose: 'About 91.4% terminal KV demand: near-full long decode.'
+  coverage:
+  - kv_near_full
+  max_model_len: 65536
+  max_concurrency: 21
+  profile_arrival_mode: saturated
+  simulation_arrival_mode: saturated
+  gpu_memory_utilization: 0.85
+  capture_seconds: 90.0
+  device_role: primary
+  # The "91.4% terminal KV demand" in `purpose` is the vLLM pack's arithmetic
+  # against ITS measured KV capacity. SGLang's --mem-fraction-static yields a
+  # different capacity, so the percentage is carried over as the case's identity
+  # (same trace, same concurrency) and not as a claim about this engine's fill.
+  workload_trace:
+    file: traces/14_near_full_long_decode_c21.csv
+    shapes:
+    - [8192, 8192]
+    - [12288, 8192]
+    - [16384, 8192]
+    - [24576, 4096]
+    - [32768, 4096]
+    - [49152, 2048]
+    repeats: 10
+    id_suffix: full
+  kernel_trace:
+    file: traces/14_near_full_long_decode_c21.nsys.csv
+    shapes:
+    - [50944, 256]
+    - [16128, 256]
+    - [20224, 256]
+    - [24320, 256]
+    - [28416, 256]
+    - [36608, 256]
+    - [50944, 256]
+    - [16128, 256]
+    - [20224, 256]
+    - [24320, 256]
+    - [28416, 256]
+    - [36608, 256]
+    - [50944, 256]
+    - [16128, 256]
+    - [20224, 256]
+    - [24320, 256]
+    - [28416, 256]
+    - [36608, 256]
+    - [50944, 256]
+    - [16128, 256]
+    - [20224, 256]
+    repeats: 1
+    id_suffix: nsys
+  attn_gpu_memory_gb:
+    # C = 817408.
+    value: 45.140539392
+    status: measured
+    derived_from: '`max_total_num_tokens=C` in the workload-only SGLang server log; C * 220896 / 4 / 1e9.'
+    evidence: logs/20260829_0_glm52_sglang_tp4_matrix/cases/14_near_full_long_decode_c21/profile_workload
+  provenance:
+    ported_from: presets/alignment/glm52_nvfp4_b200/campaign.yaml case 14
+    engine_reference: logs/20260828_0_glm52_nvfp4_pure_tp_sglang_alignment
+    capture_run: logs/20260829_0_glm52_sglang_tp4_matrix/cases/14_near_full_long_decode_c21
+- index: 15
+  name: kv_overcommit_mixed_churn_c14
+  variant: tp4_dp1_sglang
+  purpose: About 122.6% average terminal KV demand, admission-controlled churn.
+  coverage:
+  - kv_overcommit
+  - admission
+  max_model_len: 262144
+  max_concurrency: 14
+  profile_arrival_mode: saturated
+  simulation_arrival_mode: saturated
+  gpu_memory_utilization: 0.85
+  capture_seconds: 120.0
+  device_role: primary
+  # As with case 14, "122.6%" is the vLLM pack's ratio against its own measured
+  # KV capacity. Whether this trace overcommits SGLang's pool is a question this
+  # capture answers, not one it assumes.
+  workload_trace:
+    file: traces/15_kv_overcommit_mixed_churn_c14.csv
+    shapes:
+    - [65536, 4096]
+    - [16384, 32768]
+    - [98304, 2048]
+    - [32768, 16384]
+    - [8192, 8192]
+    - [49152, 8192]
+    repeats: 12
+    id_suffix: full
+  kernel_trace:
+    file: traces/15_kv_overcommit_mixed_churn_c14.nsys.csv
+    shapes:
+    - [69376, 256]
+    - [48896, 256]
+    - [100096, 256]
+    - [48896, 256]
+    - [16128, 256]
+    - [57088, 256]
+    - [69376, 256]
+    - [48896, 256]
+    - [100096, 256]
+    - [48896, 256]
+    - [16128, 256]
+    - [57088, 256]
+    - [69376, 256]
+    - [48896, 256]
+    repeats: 1
+    id_suffix: nsys
+  attn_gpu_memory_gb:
+    # C = 817408.
+    value: 45.140539392
+    status: measured
+    derived_from: '`max_total_num_tokens=C` in the workload-only SGLang server log; C * 220896 / 4 / 1e9.'
+    evidence: logs/20260829_0_glm52_sglang_tp4_matrix/cases/15_kv_overcommit_mixed_churn_c14/profile_workload
+  provenance:
+    ported_from: presets/alignment/glm52_nvfp4_b200/campaign.yaml case 15
+    engine_reference: logs/20260828_0_glm52_nvfp4_pure_tp_sglang_alignment
+    capture_run: logs/20260829_0_glm52_sglang_tp4_matrix/cases/15_kv_overcommit_mixed_churn_c14

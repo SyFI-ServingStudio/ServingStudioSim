@@ -6,7 +6,7 @@ use crate::worker::admission::{
 };
 use crate::worker::kv::{HandoffKv, PrefixKv, ResolvedPrefillContext};
 use crate::worker::shared::context::WorkerContext;
-use crate::worker::types::{PdPrefillEvent, PdPrefillMsg};
+use crate::worker::types::{IterBatchPlan, PdPrefillEvent, PdPrefillMsg};
 
 pub struct PrefillHandoffAdmission<P: PendingOrderPolicy> {
     policy: P,
@@ -103,7 +103,14 @@ where
         }
     }
 
-    fn form_batch(&mut self, kv_store: &mut K, context: &WorkerContext, now: Time) -> bool {
+    fn form_batch(
+        &mut self,
+        kv_store: &mut K,
+        context: &WorkerContext,
+        batch_plan: &mut IterBatchPlan,
+        now: Time,
+    ) -> bool {
+        batch_plan.reset_decode_participation(kv_store.num_partitions(), false);
         let partition = 0;
         if let Some(candidate) = self.policy.peek() {
             let resolved_prefill = kv_store.preview_prefill_context(
@@ -137,6 +144,7 @@ where
         &mut self,
         kv_store: &mut K,
         context: &WorkerContext,
+        _batch_plan: &IterBatchPlan,
         events: &mut Vec<Self::Event>,
         now: Time,
     ) {

@@ -3,6 +3,7 @@
 use crate::common::{SharedRequests, Time};
 use crate::worker::kv::{IterWorkerKv, PrefixKv, SlotPipelineKv};
 use crate::worker::shared::advance_scope::AdvanceScope;
+use crate::worker::types::IterBatchPlan;
 
 mod attention_layer_execution;
 mod ffn_task_execution;
@@ -23,7 +24,13 @@ pub trait IterModelExecution<K: IterWorkerKv> {
     type Input: Default;
 
     fn model_kv_layout(&self) -> ModelKvLayout;
-    fn build_iteration_input(&self, kv_store: &K, requests: &SharedRequests, out: &mut Self::Input);
+    fn build_iteration_input(
+        &self,
+        kv_store: &K,
+        requests: &SharedRequests,
+        batch_plan: &IterBatchPlan,
+        out: &mut Self::Input,
+    );
     fn evaluate_iteration(&mut self, input: &Self::Input, iteration: u64, now: Time) -> Time;
 }
 

@@ -156,6 +156,9 @@ pub struct AdmissionCandidate {
     /// enqueued), so it stays an upper bound, which is what lets
     /// [`PendingOrderPolicy::refresh_head`] reconcile just the head.
     pub resident_prefix_tokens: u32,
+    /// True when this queue entry came from decode retraction and must
+    /// re-prefill its emitted-output context without resetting TTFT.
+    pub retracted: bool,
 }
 
 impl AdmissionCandidate {
@@ -196,7 +199,30 @@ impl EnqueueSequence {
             session_input,
             conversation_start_time,
             resident_prefix_tokens,
+            retracted: false,
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn freeze_retracted(
+        &mut self,
+        request_id: RequestId,
+        fresh_prompt_tokens: u32,
+        remaining_output_tokens: u32,
+        session_input: SessionInput,
+        conversation_start_time: Time,
+        resident_prefix_tokens: u32,
+    ) -> AdmissionCandidate {
+        let mut candidate = self.freeze(
+            request_id,
+            fresh_prompt_tokens,
+            remaining_output_tokens,
+            session_input,
+            conversation_start_time,
+            resident_prefix_tokens,
+        );
+        candidate.retracted = true;
+        candidate
     }
 }
 

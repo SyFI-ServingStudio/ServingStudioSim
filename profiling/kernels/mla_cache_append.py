@@ -73,3 +73,24 @@ register(
         subprocess_env="vllm_env",
     )
 )
+
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="sglang_cuda",
+        supports=BackendSupport(
+            compute=frozenset({DType.FP8_E4M3}),
+            kv=frozenset({DType.FP8_E4M3}),
+            gpus=frozenset({"NVIDIA B200"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.attention.mla_cache_append",
+            function_name="profile_mla_cache_append_sglang_cuda",
+        ),
+        table_name=KIND,
+        args_schema=MlaCacheAppendArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="sglang_env",
+    )
+)

@@ -41,7 +41,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, ensure, Context, Result};
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::arch::build::{build_attn_model, build_ffn_model, build_iter_model};
 use crate::arch::contract::{
@@ -76,12 +76,12 @@ struct PredictionProvenance<'a> {
     gpu_count: u16,
 }
 
-/// Which arch to predict. Externally tagged so the config selects exactly one of
-/// the three families by key: `{ iter: {...} } | { attn: {...} } | { ffn: {...} }`.
-/// Each inner selector is the run-side one (internally tagged on `type`), so a
-/// predict config reuses the same arch grammar a real run uses.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
+/// Which arch to predict. The wire representation is the same single-key map in
+/// JSON and YAML: `{ iter: {...} } | { attn: {...} } | { ffn: {...} }`.
+/// `serde_yaml` otherwise encodes an externally tagged enum as `!iter`, which
+/// Python's safe YAML loader deliberately rejects. The explicit map adapter
+/// keeps the launcher and simulator on one portable, tag-free document shape.
+#[derive(Debug)]
 enum PredictArchSel {
     /// A whole-iteration arch — costed as one fused `eval_iter`.
     Iter(IterArchSel),
@@ -89,6 +89,45 @@ enum PredictArchSel {
     Attn(AttnArchSel),
     /// The AFD ffn side — costed as the per-section building blocks of one iteration.
     Ffn(FfnArchSel),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IterPredictArch {
+    iter: IterArchSel,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AttnPredictArch {
+    attn: AttnArchSel,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FfnPredictArch {
+    ffn: FfnArchSel,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum PredictArchWire {
+    Iter(IterPredictArch),
+    Attn(AttnPredictArch),
+    Ffn(FfnPredictArch),
+}
+
+impl<'de> Deserialize<'de> for PredictArchSel {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(match PredictArchWire::deserialize(deserializer)? {
+            PredictArchWire::Iter(value) => Self::Iter(value.iter),
+            PredictArchWire::Attn(value) => Self::Attn(value.attn),
+            PredictArchWire::Ffn(value) => Self::Ffn(value.ffn),
+        })
+    }
 }
 
 /// Minimal offline config for `timing-predict`. `arch` is the generalized
@@ -661,6 +700,20 @@ mod tests {
         // An unknown kind is rejected (lists iter/attn/ffn).
         let bad: Result<PredictArchSel, _> = serde_json::from_str(r#"{"bogus": {"type": "x"}}"#);
         assert!(bad.is_err());
+    }
+
+    #[test]
+    fn predict_arch_sel_uses_the_same_plain_map_in_yaml() {
+        let iter: PredictArchSel = serde_yaml::from_str(
+            r#"
+iter:
+  type: llama3_dense
+  model_config: model/config/llama3_8b.json
+  fp8: false
+"#,
+        )
+        .expect("tag-free YAML iter selector parses");
+        assert!(matches!(iter, PredictArchSel::Iter(_)));
     }
 
     #[test]

@@ -262,5 +262,9 @@ composition refactor does not create a second deployment layer.
 `chunked_prefill` is a generic whole-iteration recipe, not a model-specific
 scheduler. It uses the ordinary pending-order and partition-placement
 contracts, reserves the complete request KV footprint once, and exposes prompt
-chunks bounded by `max_batch_tokens`. It does not replay an observed DP rank or
-rewrite request shapes.
+chunks bounded by `max_batch_tokens`. Its shell-owned iteration plan expresses
+whether resident decode shares that iteration (`mix`) or waits behind a
+runnable prefill (`separate-prefill-priority`); KV membership is unchanged in
+both cases. It does not replay an observed DP rank or rewrite request shapes,
+and the batch policy does not imply SGLang's separate optimistic-reservation or
+decode-retraction mechanisms.

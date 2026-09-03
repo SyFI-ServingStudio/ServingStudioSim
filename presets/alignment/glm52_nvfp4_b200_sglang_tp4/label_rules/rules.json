@@ -1,0 +1,1272 @@
+{
+  "rules": [
+    {
+      "operation": "main.embedding",
+      "name": "_vocab_parallel_embedding_kernel",
+      "type": "model",
+      "role": "token embedding lookup",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "main.embedding"
+      ],
+      "note": "SGLang's own embedding kernel; one launch per forward.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment"
+    },
+    {
+      "operation": "attention.fused_qkv_a_proj",
+      "name": "sglang::fused_a_gemm_kernel<(int)1, (int)2624, (int)6144",
+      "type": "model",
+      "role": "fused Q and latent KV projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.fused_qkv_a_proj",
+        "body.sparse_cycle_full_index.attention.fused_qkv_a_proj",
+        "body.sparse_cycle_index_share.attention.fused_qkv_a_proj",
+        "body.sparse_initial_index_share.attention.fused_qkv_a_proj"
+      ],
+      "note": "6144 -> 2624 = q_lora 2048 + kv_lora 512 + qk_rope 64. ReplicatedLinear under TP (deepseek_v2.py), so all four ranks run the identical shape.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment"
+    },
+    {
+      "operation": "attention.q_a_rms_norm",
+      "name": "rmsnormRMSNormKernel_object_at__tensorptrbf16gmemalign16oi642048i64div8",
+      "type": "model",
+      "role": "RMSNorm over the Q low-rank latent",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.q_a_rms_norm",
+        "body.sparse_cycle_full_index.attention.q_a_rms_norm",
+        "body.sparse_cycle_index_share.attention.q_a_rms_norm",
+        "body.sparse_initial_index_share.attention.q_a_rms_norm"
+      ],
+      "note": "The 2048 in the mangled name is q_lora_rank.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment"
+    },
+    {
+      "operation": "attention.kv_a_rms_norm",
+      "name": "rmsnormRMSNormKernel_object_at__tensorptrbf16gmemalign16oi64512i64div8",
+      "type": "model",
+      "role": "RMSNorm over the KV low-rank latent",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.kv_a_rms_norm",
+        "body.sparse_cycle_full_index.attention.kv_a_rms_norm",
+        "body.sparse_cycle_index_share.attention.kv_a_rms_norm",
+        "body.sparse_initial_index_share.attention.kv_a_rms_norm"
+      ],
+      "note": "The 512 in the mangled name is kv_lora_rank.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment"
+    },
+    {
+      "operation": "attention.q_a_rms_norm",
+      "name": "rmsnormRMSNormKernel_object_at__tensorptrbf16gmemalign128oi64204820481",
+      "type": "model",
+      "role": "RMSNorm over the Q low-rank latent, 128B-aligned instantiation",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.q_a_rms_norm",
+        "body.sparse_cycle_full_index.attention.q_a_rms_norm",
+        "body.sparse_cycle_index_share.attention.q_a_rms_norm",
+        "body.sparse_initial_index_share.attention.q_a_rms_norm"
+      ],
+      "note": "Same 2048 = q_lora_rank as the align16 spelling above.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment"
+    },
+    {
+      "operation": "attention.kv_a_rms_norm",
+      "name": "rmsnormRMSNormKernel_object_at__tensorptrbf16gmemalign128oi645125121",
+      "type": "model",
+      "role": "RMSNorm over the KV low-rank latent, 128B-aligned instantiation",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.kv_a_rms_norm",
+        "body.sparse_cycle_full_index.attention.kv_a_rms_norm",
+        "body.sparse_cycle_index_share.attention.kv_a_rms_norm",
+        "body.sparse_initial_index_share.attention.kv_a_rms_norm"
+      ],
+      "note": "Same 512 = kv_lora_rank as the align16 spelling above.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment"
+    },
+    {
+      "operation": "attention.main_rope",
+      "name": "flashinfer::RopeQuantizeKernel",
+      "type": "model",
+      "role": "RoPE on the main query/key, fused with the FP8 KV quantization",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.main_rope",
+        "body.sparse_cycle_full_index.attention.main_rope",
+        "body.sparse_cycle_index_share.attention.main_rope",
+        "body.sparse_initial_index_share.attention.main_rope"
+      ],
+      "note": "One launch per layer; the KV-cache dtype is fp8_e4m3, so the quantize half of this kernel is the cache write path, not a separate op.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment"
+    },
+    {
+      "operation": "attention.sparse_mla.mla_cache_append",
+      "name": "set_mla_kv_buffer_kernel",
+      "type": "model",
+      "role": "write the latent KV entry into the paged cache",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.sparse_mla.mla_cache_append",
+        "body.sparse_cycle_full_index.attention.sparse_mla.mla_cache_append",
+        "body.sparse_cycle_index_share.attention.sparse_mla.mla_cache_append",
+        "body.sparse_initial_index_share.attention.sparse_mla.mla_cache_append"
+      ],
+      "note": "Both the plain and the templated sglang:: spelling appear; the fragment matches both.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment"
+    },
+    {
+      "operation": "attention.sparse_mla.decode",
+      "name": "fmhaSm100fKernel_QkvE4m3OBfloat16HQk576HV512",
+      "type": "model",
+      "role": "DSA sparse MLA",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.sparse_mla.decode",
+        "body.dense_full_index.attention.sparse_mla.prefill",
+        "body.sparse_cycle_full_index.attention.sparse_mla.decode",
+        "body.sparse_cycle_full_index.attention.sparse_mla.prefill",
+        "body.sparse_cycle_index_share.attention.sparse_mla.decode",
+        "body.sparse_cycle_index_share.attention.sparse_mla.prefill",
+        "body.sparse_initial_index_share.attention.sparse_mla.decode",
+        "body.sparse_initial_index_share.attention.sparse_mla.prefill"
+      ],
+      "note": "HQk576/HV512 is the MLA head geometry and TokenSparse is the DSA mask. SGLang runs ONE kernel for prefill and decode (M1) and picks the variant by seq_lens, so this claims the decode slot and the prefill slot stays empty rather than splitting one measurement across two model ops.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment"
+    },
+    {
+      "operation": "attention.sparse_mla.prefill",
+      "name": "fmhaSm100fKernel_QkvBfloat16OBfloat16H256SeparateQkvCausalVarSeq",
+      "type": "model",
+      "role": "dense ragged MHA prefill",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.sparse_mla.prefill",
+        "body.sparse_cycle_full_index.attention.sparse_mla.prefill",
+        "body.sparse_cycle_index_share.attention.sparse_mla.prefill",
+        "body.sparse_initial_index_share.attention.sparse_mla.prefill"
+      ],
+      "note": "M6's step function: below the dense-attn threshold SGLang abandons the sparse path entirely (dsa_backend.py). Bf16 QKV and H256, not the FP8 MLA geometry -- a different kernel family, so a different slot.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment"
+    },
+    {
+      "operation": "attention.indexer.rope",
+      "name": "sglang::fused_q_indexer_rope_hadamard_quant",
+      "type": "model",
+      "role": "indexer query RoPE, Hadamard transform and FP8 quantization",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.indexer.rope",
+        "body.sparse_cycle_full_index.attention.indexer.rope"
+      ],
+      "note": "One fused launch. The arch knows it, so it emits no q_quant slot for this kernel to claim (`fused: Glm52DsaFusedLaunches`).",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment"
+    },
+    {
+      "operation": "attention.indexer.index_cache_append",
+      "name": "sglang::fused_k_indexer_norm_rope_store",
+      "type": "model",
+      "role": "indexer key norm + RoPE + quantize + cache store",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.indexer.index_cache_append",
+        "body.sparse_cycle_full_index.attention.indexer.index_cache_append"
+      ],
+      "note": "Four modelled steps in one kernel (dsa_indexer.py); charged to the cache append because that is the step whose cost scales with the write.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment"
+    },
+    {
+      "operation": "attention.indexer.decode_logits",
+      "name": "deep_gemm::sm100_paged_mqa_logits<",
+      "type": "model",
+      "role": "indexer MQA scoring against the paged cache",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.indexer.decode_logits",
+        "body.sparse_cycle_full_index.attention.indexer.decode_logits"
+      ],
+      "note": "The decode-side scorer; `paged` distinguishes it from the ragged prefill scorer below.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment"
+    },
+    {
+      "operation": "attention.indexer.prefill_logits",
+      "name": "deep_gemm::sm100_mqa_logits<",
+      "type": "model",
+      "role": "indexer MQA scoring over the ragged prefill batch",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.indexer.prefill_logits",
+        "body.sparse_cycle_full_index.attention.indexer.prefill_logits"
+      ],
+      "note": "SGLang names this kernel after attention.indexer.prefill_logits.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment"
+    },
+    {
+      "operation": "attention.indexer.prefill_topk",
+      "name": "topk_transform_prefill_kernel",
+      "type": "model",
+      "role": "indexer prefill top-k",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.indexer.prefill_topk",
+        "body.sparse_cycle_full_index.attention.indexer.prefill_topk"
+      ],
+      "note": "SGLang names this kernel after attention.indexer.prefill_topk.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment"
+    },
+    {
+      "operation": "attention.indexer.decode_topk",
+      "name": "sglang::topk_persistent_cluster_kernel",
+      "type": "model",
+      "role": "indexer decode top-k (persistent cluster variant)",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.indexer.decode_topk",
+        "body.sparse_cycle_full_index.attention.indexer.decode_topk"
+      ],
+      "note": "SGLang names this kernel after attention.indexer.decode_topk.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment"
+    },
+    {
+      "operation": "attention.indexer.decode_topk",
+      "name": "sglang::topk_main_kernel",
+      "type": "model",
+      "role": "indexer decode top-k (main variant)",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.indexer.decode_topk",
+        "body.sparse_cycle_full_index.attention.indexer.decode_topk"
+      ],
+      "note": "SGLang names this kernel after attention.indexer.decode_topk.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment"
+    },
+    {
+      "operation": "attention.indexer.decode_topk",
+      "name": "sglang::topk_small_batch_kernel",
+      "type": "model",
+      "role": "indexer decode top-k (small-batch variant)",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.indexer.decode_topk",
+        "body.sparse_cycle_full_index.attention.indexer.decode_topk"
+      ],
+      "note": "SGLang names this kernel after attention.indexer.decode_topk.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment"
+    },
+    {
+      "operation": "attention.indexer.topk_buffer_fill",
+      "name": "sglang::topk_plan",
+      "type": "model",
+      "role": "indexer top-k plan buffer",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.indexer.topk_buffer_fill",
+        "body.sparse_cycle_full_index.attention.indexer.topk_buffer_fill"
+      ],
+      "note": "SGLang names this kernel after attention.indexer.topk_buffer_fill.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment"
+    },
+    {
+      "operation": "attention.indexer.rope",
+      "name": "_get_k_and_s_triton_kernel",
+      "type": "model",
+      "role": "indexer key/scale gather folded into the fused query RoPE graph",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.indexer.rope",
+        "body.sparse_cycle_full_index.attention.indexer.rope"
+      ],
+      "note": "The clean SGLang launch graph has no standalone weight_scale leaf: fused_q_indexer_rope_hadamard_quant produces both the FP8 query and scaled weights, so measured companion launches are attributed to that fused rope boundary.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment"
+    },
+    {
+      "operation": "moe.router.router_gemm_bf16_proxy",
+      "name": "sglang::router_gemm_kernel",
+      "type": "model",
+      "role": "MoE router logits GEMM",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.sparse_cycle_full_index.moe.router.router_gemm_bf16_proxy",
+        "body.sparse_cycle_index_share.moe.router.router_gemm_bf16_proxy",
+        "body.sparse_initial_index_share.moe.router.router_gemm_bf16_proxy"
+      ],
+      "note": "hidden 6144 -> 256 experts, bf16. The proxy slot name is VibeSim's; the kernel is the router itself.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment"
+    },
+    {
+      "operation": "moe.routed_experts.input_quant",
+      "name": "nvfp4_quantizeNVFP4QuantizeLinearKernel_object_at__tensorptrbf16gmemalign16o61446144",
+      "type": "model",
+      "role": "NVFP4 quantization of the MoE input activations",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.sparse_cycle_full_index.moe.routed_experts.input_quant",
+        "body.sparse_cycle_index_share.moe.routed_experts.input_quant",
+        "body.sparse_initial_index_share.moe.routed_experts.input_quant"
+      ],
+      "note": "The 6144 in the mangled name is the hidden size, which is what distinguishes this from any other nvfp4_quantize launch.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment"
+    },
+    {
+      "operation": "moe.routed_experts.fused_moe",
+      "name": "moe::dev::routing::",
+      "type": "model",
+      "role": "on-device expert routing inside the fused NVFP4 MoE",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.sparse_cycle_full_index.moe.routed_experts.fused_moe",
+        "body.sparse_cycle_index_share.moe.routed_experts.fused_moe",
+        "body.sparse_initial_index_share.moe.routed_experts.fused_moe"
+      ],
+      "note": "Part of trtllm_fp4_block_scale_moe, not a separate model op: this is where the top-k happens under moe_runner_backend=flashinfer_trtllm, which is why the Python-side expert recorder sees nothing (F16). All routingIndices* variants share this rule.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment"
+    },
+    {
+      "operation": "moe.routed_experts.fused_moe",
+      "name": "bmm_E2m1_E2m1E2m1_",
+      "type": "model",
+      "role": "fused NVFP4 MoE grouped GEMM 1 (SwiGLU in the epilogue)",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.sparse_cycle_full_index.moe.routed_experts.fused_moe",
+        "body.sparse_cycle_index_share.moe.routed_experts.fused_moe",
+        "body.sparse_initial_index_share.moe.routed_experts.fused_moe"
+      ],
+      "note": "trtllm-gen picks a tile per shape, so several t*x*x512 spellings map here; the operation is the same GEMM.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment"
+    },
+    {
+      "operation": "moe.routed_experts.fused_moe",
+      "name": "bmm_Bfloat16_E2m1E2m1_",
+      "type": "model",
+      "role": "fused NVFP4 MoE grouped GEMM 2",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.sparse_cycle_full_index.moe.routed_experts.fused_moe",
+        "body.sparse_cycle_index_share.moe.routed_experts.fused_moe",
+        "body.sparse_initial_index_share.moe.routed_experts.fused_moe"
+      ],
+      "note": "SGLang names this kernel after moe.routed_experts.fused_moe.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment"
+    },
+    {
+      "operation": "moe.routed_experts.finalize",
+      "name": "sglang::moeFinalize",
+      "type": "model",
+      "role": "weighted top-k expert combine with the shared-expert add folded in",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.sparse_cycle_full_index.moe.routed_experts.finalize",
+        "body.sparse_cycle_index_share.moe.routed_experts.finalize",
+        "body.sparse_initial_index_share.moe.routed_experts.finalize"
+      ],
+      "note": "`moe_finalize_fuse_shared`, run after the TRT-LLM callable returns unreduced rows (`do_finalize=False`). Its own launch, so its own slot.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment"
+    },
+    {
+      "operation": "moe.routed_experts.fused_moe",
+      "name": "moe::dev::finalize::finalizeKernel",
+      "type": "model",
+      "role": "fused NVFP4 MoE finalize (TRT-LLM variant)",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.sparse_cycle_full_index.moe.routed_experts.fused_moe",
+        "body.sparse_cycle_index_share.moe.routed_experts.fused_moe",
+        "body.sparse_initial_index_share.moe.routed_experts.fused_moe"
+      ],
+      "note": "TRT-LLM's own finalize, inside the callable. It barely runs here -- SGLang defers -- but the few launches that do belong to the callable.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment"
+    },
+    {
+      "operation": "moe.shared_expert.silu_and_mul",
+      "name": "sglang::act_and_mul_kernel",
+      "type": "model",
+      "role": "SwiGLU activation of the shared expert and of the dense FFN",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.ffn.silu_and_mul",
+        "body.sparse_cycle_full_index.moe.shared_expert.silu_and_mul",
+        "body.sparse_cycle_index_share.moe.shared_expert.silu_and_mul",
+        "body.sparse_initial_index_share.moe.shared_expert.silu_and_mul"
+      ],
+      "note": "GLM-5.2 has 3 dense layers and 75 sparse ones; one kernel serves both.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment"
+    },
+    {
+      "operation": "moe.tp_allreduce",
+      "name": "trtllm_allreduce_fusion::allreduce_fusion_kernel",
+      "type": "model",
+      "role": "fused all-reduce + residual + RMSNorm after the MoE",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": [
+        "body.dense_full_index.ffn.post_attn_add_rms_norm",
+        "body.dense_full_index.ffn.tp_allreduce",
+        "body.sparse_cycle_full_index.moe.router.post_attn_add_rms_norm",
+        "body.sparse_cycle_full_index.moe.tp_allreduce",
+        "body.sparse_cycle_index_share.moe.router.post_attn_add_rms_norm",
+        "body.sparse_cycle_index_share.moe.tp_allreduce",
+        "body.sparse_initial_index_share.moe.router.post_attn_add_rms_norm",
+        "body.sparse_initial_index_share.moe.tp_allreduce"
+      ],
+      "note": "The MoE-side collective, identified by following moeFinalize. M4: SGLang executes it in the NEXT layer's prepare_attn, so its layer attribution is shifted by one -- irrelevant to a per-op total, which is what this comparison is.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment",
+      "after": "moe.routed_experts.finalize"
+    },
+    {
+      "operation": "main.embedding.tp_allreduce_fallback",
+      "name": "sglang::all_reduce_kernel",
+      "type": "model",
+      "role": "vocabulary-parallel embedding all-reduce",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": [
+        "main.embedding.tp_allreduce",
+        "main.embedding.tp_allreduce_fallback"
+      ],
+      "note": "Immediately after the embedding lookup.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment",
+      "after": "main.embedding"
+    },
+    {
+      "operation": "main.embedding.tp_allreduce_fallback",
+      "name": "ncclDevKernel_AllReduce",
+      "type": "model",
+      "role": "vocabulary-parallel embedding all-reduce, NCCL path",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": [
+        "main.embedding.tp_allreduce",
+        "main.embedding.tp_allreduce_fallback"
+      ],
+      "note": "Same position; SGLang picks between its own kernel and NCCL by message size.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment",
+      "after": "main.embedding"
+    },
+    {
+      "operation": "moe.tp_allreduce_fallback",
+      "name": "sglang::all_reduce_kernel",
+      "type": "model",
+      "role": "non-fused all-reduce after the MoE (the >2048-token fallback)",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": [
+        "body.dense_full_index.ffn.tp_allreduce_fallback",
+        "body.sparse_cycle_full_index.moe.tp_allreduce_fallback",
+        "body.sparse_cycle_index_share.moe.tp_allreduce_fallback",
+        "body.sparse_initial_index_share.moe.tp_allreduce_fallback"
+      ],
+      "note": "M3's step function: above FUSE_ALLREDUCE_MAX_BATCH_SIZE=2048 the fusion is dropped, and the residual/norm it used to absorb becomes its own FusedAddRMSNorm launch right after.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment",
+      "after": "moe.routed_experts.finalize"
+    },
+    {
+      "operation": "moe.tp_allreduce_fallback",
+      "name": "ncclDevKernel_AllReduce",
+      "type": "model",
+      "role": "non-fused all-reduce after the MoE, NCCL path",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": [
+        "body.dense_full_index.ffn.tp_allreduce_fallback",
+        "body.sparse_cycle_full_index.moe.tp_allreduce_fallback",
+        "body.sparse_cycle_index_share.moe.tp_allreduce_fallback",
+        "body.sparse_initial_index_share.moe.tp_allreduce_fallback"
+      ],
+      "note": "Same position, NCCL path.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment",
+      "after": "moe.routed_experts.finalize"
+    },
+    {
+      "operation": "moe.tp_allreduce_fallback",
+      "name": "sglang::all_reduce_kernel",
+      "type": "model",
+      "role": "non-fused all-reduce after the MoE (the >2048-token fallback)",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": [
+        "body.dense_full_index.ffn.tp_allreduce_fallback",
+        "body.sparse_cycle_full_index.moe.tp_allreduce_fallback",
+        "body.sparse_cycle_index_share.moe.tp_allreduce_fallback",
+        "body.sparse_initial_index_share.moe.tp_allreduce_fallback"
+      ],
+      "note": "Folded-body boundaries, read forward: the standalone FusedAddRMSNorm that follows only exists on the non-fused MoE path, so it identifies the collective without the predecessor.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment",
+      "after_name": "<none>",
+      "before_name": "flashinfernormkernelsfused_add_rmsnorm"
+    },
+    {
+      "operation": "moe.tp_allreduce_fallback",
+      "name": "ncclDevKernel_AllReduce",
+      "type": "model",
+      "role": "non-fused all-reduce after the MoE, NCCL path",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": [
+        "body.dense_full_index.ffn.tp_allreduce_fallback",
+        "body.sparse_cycle_full_index.moe.tp_allreduce_fallback",
+        "body.sparse_cycle_index_share.moe.tp_allreduce_fallback",
+        "body.sparse_initial_index_share.moe.tp_allreduce_fallback"
+      ],
+      "note": "Same position, NCCL path.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment",
+      "after_name": "<none>",
+      "before_name": "flashinfernormkernelsfused_add_rmsnorm"
+    },
+    {
+      "operation": "moe.shared_expert.down_proj",
+      "name": "nvjet_sm100_",
+      "type": "model",
+      "role": "shared-expert (or dense FFN) down projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.ffn.down_proj",
+        "body.sparse_cycle_full_index.moe.shared_expert.down_proj",
+        "body.sparse_cycle_index_share.moe.shared_expert.down_proj",
+        "body.sparse_initial_index_share.moe.shared_expert.down_proj"
+      ],
+      "note": "The launch immediately after the SwiGLU consumes its output; in this model that is the down projection and nothing else.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment",
+      "after_name": "sglang::act_and_mul_kernel"
+    },
+    {
+      "operation": "moe.shared_expert.down_proj",
+      "name": "kernel_cutlass_kernel_TgvGemmCuteExtKernel_",
+      "type": "model",
+      "role": "shared-expert (or dense FFN) down projection, CUTLASS tile",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.ffn.down_proj",
+        "body.sparse_cycle_full_index.moe.shared_expert.down_proj",
+        "body.sparse_cycle_index_share.moe.shared_expert.down_proj",
+        "body.sparse_initial_index_share.moe.shared_expert.down_proj"
+      ],
+      "note": "Same position, different backend picked for the shape.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment",
+      "after_name": "sglang::act_and_mul_kernel"
+    },
+    {
+      "operation": "moe.shared_expert.gate_up_proj",
+      "name": "nvjet_sm100_",
+      "type": "model",
+      "role": "shared-expert (or dense FFN) fused gate+up projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.ffn.gate_up_proj",
+        "body.sparse_cycle_full_index.moe.shared_expert.gate_up_proj",
+        "body.sparse_cycle_index_share.moe.shared_expert.gate_up_proj",
+        "body.sparse_initial_index_share.moe.shared_expert.gate_up_proj"
+      ],
+      "note": "The launch feeding the SwiGLU is the gate/up projection.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment",
+      "before_name": "sglang::act_and_mul_kernel"
+    },
+    {
+      "operation": "moe.shared_expert.gate_up_proj",
+      "name": "kernel_cutlass_kernel_TgvGemmCuteExtKernel_",
+      "type": "model",
+      "role": "shared-expert (or dense FFN) fused gate+up projection, CUTLASS tile",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.ffn.gate_up_proj",
+        "body.sparse_cycle_full_index.moe.shared_expert.gate_up_proj",
+        "body.sparse_cycle_index_share.moe.shared_expert.gate_up_proj",
+        "body.sparse_initial_index_share.moe.shared_expert.gate_up_proj"
+      ],
+      "note": "Same position, different backend picked for the shape.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment",
+      "before_name": "sglang::act_and_mul_kernel"
+    },
+    {
+      "operation": "attention.v_up",
+      "name": "nvjet_sm100_",
+      "type": "model",
+      "role": "MLA value up-projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.v_up",
+        "body.sparse_cycle_full_index.attention.v_up",
+        "body.sparse_cycle_index_share.attention.v_up",
+        "body.sparse_initial_index_share.attention.v_up"
+      ],
+      "note": "The first GEMM consuming the MLA output is the v up-projection; the o projection follows it and is caught by the next rule.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment",
+      "after_name": "fmhaSm100fKernel_QkvE4m3"
+    },
+    {
+      "operation": "attention.o_proj",
+      "name": "kernel_cutlass_kernel_TgvGemmCuteExtKernel_",
+      "type": "model",
+      "role": "attention output projection, dense-prefill layer",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.o_proj",
+        "body.sparse_cycle_full_index.attention.o_proj",
+        "body.sparse_cycle_index_share.attention.o_proj",
+        "body.sparse_initial_index_share.attention.o_proj"
+      ],
+      "note": "The only GEMM after the dense MHA kernel. Charging it to v_up (as the sparse-path rule does) left o_proj unmapped in exactly the iterations the window was chosen to contain.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment",
+      "after_name": "fmhaSm100fKernel_QkvBfloat16"
+    },
+    {
+      "operation": "attention.v_up",
+      "name": "nvjet_sm100_",
+      "type": "model",
+      "role": "MLA value projection (kv_b_proj), dense-prefill layer",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.v_up",
+        "body.sparse_cycle_full_index.attention.v_up",
+        "body.sparse_cycle_index_share.attention.v_up",
+        "body.sparse_initial_index_share.attention.v_up"
+      ],
+      "note": "The GEMM between the latent-cache write and the dense MHA is `kv_b_proj`, which applies the same `w_vc` the model calls v_up; on this path it runs before the attention instead of after it.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment",
+      "after": "attention.sparse_mla.mla_cache_append",
+      "before_name": "at::native::elementwise_kernel"
+    },
+    {
+      "operation": "attention.tp_allreduce_residual_norm",
+      "name": "trtllm_allreduce_fusion::allreduce_fusion_kernel",
+      "type": "model",
+      "role": "fused all-reduce + residual + RMSNorm after attention",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.input_add_rms_norm",
+        "body.dense_full_index.attention.tp_allreduce",
+        "body.dense_full_index.attention.tp_allreduce_residual_norm",
+        "body.sparse_cycle_full_index.attention.input_add_rms_norm",
+        "body.sparse_cycle_full_index.attention.tp_allreduce",
+        "body.sparse_cycle_full_index.attention.tp_allreduce_residual_norm",
+        "body.sparse_cycle_index_share.attention.input_add_rms_norm",
+        "body.sparse_cycle_index_share.attention.tp_allreduce",
+        "body.sparse_cycle_index_share.attention.tp_allreduce_residual_norm",
+        "body.sparse_initial_index_share.attention.input_add_rms_norm",
+        "body.sparse_initial_index_share.attention.tp_allreduce",
+        "body.sparse_initial_index_share.attention.tp_allreduce_residual_norm"
+      ],
+      "note": "Read forward instead of back: the collective immediately before the MoE router is the attention-side one. `after` cannot express this -- it compares against the IMMEDIATELY preceding kernel, which in these layers is a tile no rule names yet.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment",
+      "before_name": "sglang::router_gemm_kernel"
+    },
+    {
+      "operation": "moe.tp_allreduce",
+      "name": "trtllm_allreduce_fusion::allreduce_fusion_kernel",
+      "type": "model",
+      "role": "fused all-reduce + residual + RMSNorm after the MoE",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": [
+        "body.dense_full_index.ffn.post_attn_add_rms_norm",
+        "body.dense_full_index.ffn.tp_allreduce",
+        "body.sparse_cycle_full_index.moe.router.post_attn_add_rms_norm",
+        "body.sparse_cycle_full_index.moe.tp_allreduce",
+        "body.sparse_cycle_index_share.moe.router.post_attn_add_rms_norm",
+        "body.sparse_cycle_index_share.moe.tp_allreduce",
+        "body.sparse_initial_index_share.moe.router.post_attn_add_rms_norm",
+        "body.sparse_initial_index_share.moe.tp_allreduce"
+      ],
+      "note": "The collective immediately before the next layer's fused QKV-A projection is the MoE-side one -- M4's shifted attribution stated as a position rather than worked around.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment",
+      "before_name": "sglang::fused_a_gemm_kernel"
+    },
+    {
+      "operation": "attention.tp_allreduce_residual_norm",
+      "name": "trtllm_allreduce_fusion::allreduce_fusion_kernel",
+      "type": "model",
+      "role": "fused all-reduce + residual + RMSNorm after attention",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.input_add_rms_norm",
+        "body.dense_full_index.attention.tp_allreduce",
+        "body.dense_full_index.attention.tp_allreduce_residual_norm",
+        "body.sparse_cycle_full_index.attention.input_add_rms_norm",
+        "body.sparse_cycle_full_index.attention.tp_allreduce",
+        "body.sparse_cycle_full_index.attention.tp_allreduce_residual_norm",
+        "body.sparse_cycle_index_share.attention.input_add_rms_norm",
+        "body.sparse_cycle_index_share.attention.tp_allreduce",
+        "body.sparse_cycle_index_share.attention.tp_allreduce_residual_norm",
+        "body.sparse_initial_index_share.attention.input_add_rms_norm",
+        "body.sparse_initial_index_share.attention.tp_allreduce",
+        "body.sparse_initial_index_share.attention.tp_allreduce_residual_norm"
+      ],
+      "note": "Layers where the router GEMM took the cuBLASLt split-K path instead of SGLang's own router kernel: the collective still sits between the attention output and the router.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment",
+      "before_name": "nvjet_sm100_tss_"
+    },
+    {
+      "operation": "moe.shared_expert.gate_up_proj",
+      "name": "cublasLt::splitKreduce_kernel",
+      "type": "model",
+      "role": "shared-expert (or dense FFN) gate+up projection, split-K reduction",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.ffn.gate_up_proj",
+        "body.sparse_cycle_full_index.moe.shared_expert.gate_up_proj",
+        "body.sparse_cycle_index_share.moe.shared_expert.gate_up_proj",
+        "body.sparse_initial_index_share.moe.shared_expert.gate_up_proj"
+      ],
+      "note": "Same position as the gate/up rules above: the launch feeding the SwiGLU. This is the reduction half of its split-K form.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment",
+      "before_name": "sglang::act_and_mul_kernel"
+    },
+    {
+      "operation": "moe.shared_expert.gate_up_proj",
+      "name": "nvjet_sm100_",
+      "type": "model",
+      "role": "shared-expert (or dense FFN) gate+up projection, split-K GEMM",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.ffn.gate_up_proj",
+        "body.sparse_cycle_full_index.moe.shared_expert.gate_up_proj",
+        "body.sparse_cycle_index_share.moe.shared_expert.gate_up_proj",
+        "body.sparse_initial_index_share.moe.shared_expert.gate_up_proj"
+      ],
+      "note": "The GEMM half of the pair the previous rule reduces.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment",
+      "after_name": "kernel_cutlass_kernel_TgvGemmCuteExtKernel_",
+      "before_name": "cublasLt::splitKreduce_kernel"
+    },
+    {
+      "operation": "moe.shared_expert.gate_up_proj",
+      "name": "nvjet_sm100_",
+      "type": "model",
+      "role": "shared-expert (or dense FFN) gate+up projection, split-K GEMM",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.ffn.gate_up_proj",
+        "body.sparse_cycle_full_index.moe.shared_expert.gate_up_proj",
+        "body.sparse_cycle_index_share.moe.shared_expert.gate_up_proj",
+        "body.sparse_initial_index_share.moe.shared_expert.gate_up_proj"
+      ],
+      "note": "Same pair, at a repeat-body boundary where there is no preceding kernel to key on (NO_NEIGHBOUR sentinel).",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment",
+      "after_name": "<none>",
+      "before_name": "cublasLt::splitKreduce_kernel"
+    },
+    {
+      "operation": "main.lm_head",
+      "name": "cublasLt::splitKreduce_kernel",
+      "type": "model",
+      "role": "LM head projection split-K reduction",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "main.lm_head"
+      ],
+      "note": "The vocabulary projection is the only GEMM whose result is all-gathered across the TP group.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment",
+      "before_name": "_all_gather_kernel_inner"
+    },
+    {
+      "operation": "main.final_residual_rms_norm",
+      "name": "flashinfernormkernelsfused_add_rmsnormFusedAddRMSNorm",
+      "type": "model",
+      "role": "final residual add + RMSNorm before the LM head",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "main.final_residual_rms_norm"
+      ],
+      "note": "The last layer's collective is unfused (its residual and norm are not absorbed), so this norm is a launch of its own; the sampler's gather of the last token per request follows it.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment",
+      "before_name": "at::native::unrolled_elementwise_kernel"
+    },
+    {
+      "operation": "attention.indexer.wk_weights_proj",
+      "name": "nvjet_sm100_",
+      "type": "model",
+      "role": "indexer key weight projection, split-K GEMM",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.indexer.wk_weights_proj",
+        "body.sparse_cycle_full_index.attention.indexer.wk_weights_proj"
+      ],
+      "note": "The GEMM half of the pair whose reduction the `before_name: sglang::fused_k_indexer_norm_rope` rule already claims -- the two launches are adjacent.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment",
+      "after": "attention.kv_a_rms_norm",
+      "before_name": "cublasLt::splitKreduce_kernel"
+    },
+    {
+      "operation": "main.lm_head",
+      "name": "nvjet_sm100_",
+      "type": "model",
+      "role": "LM head projection split-K GEMM",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "main.lm_head"
+      ],
+      "note": "The vocabulary projection sits after the sampler's own gather of the last token per request, which is what separates it from every other split-K GEMM in the forward. Keyed on the RMSNorm before it instead, this rule fired on the indexer key projection in EVERY layer and never on the head at all.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment",
+      "after_name": "at::native::index_elementwise_kernel",
+      "before_name": "cublasLt::splitKreduce_kernel"
+    },
+    {
+      "operation": "attention.q_b_proj",
+      "name": "kernel_cutlass_kernel_TgvGemmCuteExtKernel_",
+      "type": "model",
+      "role": "Q up-projection from the latent, CUTLASS tile",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.q_b_proj",
+        "body.sparse_cycle_full_index.attention.q_b_proj",
+        "body.sparse_cycle_index_share.attention.q_b_proj",
+        "body.sparse_initial_index_share.attention.q_b_proj"
+      ],
+      "note": "The launch immediately after the q_a RMSNorm, in every layer. The indexer's own wq_b is NOT a candidate here: it sits inside the indexer block, after the key store, and its rule keys on the fused indexer RoPE that follows it.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment",
+      "after": "attention.q_a_rms_norm"
+    },
+    {
+      "operation": "attention.q_absorb",
+      "name": "nvjet_sm100_",
+      "type": "model",
+      "role": "MLA absorb BMM (q_nope @ w_kc)",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.q_absorb",
+        "body.sparse_cycle_full_index.attention.q_absorb",
+        "body.sparse_cycle_index_share.attention.q_absorb",
+        "body.sparse_initial_index_share.attention.q_absorb"
+      ],
+      "note": "Stated forward instead of back, for the indexer layers where the launch before it is the fused indexer key store rather than the kv_a RMSNorm the other rule keys on.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment",
+      "before_name": "flashinfer::RopeQuantizeKernel"
+    },
+    {
+      "operation": "main.embedding.tp_allreduce_fallback",
+      "name": "sglang::all_reduce_kernel",
+      "type": "model",
+      "role": "vocabulary-parallel embedding all-reduce",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": [
+        "main.embedding.tp_allreduce",
+        "main.embedding.tp_allreduce_fallback"
+      ],
+      "note": "Ordered before the decoder-layer rule for the same kernel name: the embedding's collective is not an attention collective, and without this it would be charged to one.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment",
+      "after": "main.embedding"
+    },
+    {
+      "operation": "attention.v_up",
+      "name": "nvjet_sm100_",
+      "type": "model",
+      "role": "MLA value up-projection, wide-batch layer",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.v_up",
+        "body.sparse_cycle_full_index.attention.v_up",
+        "body.sparse_cycle_index_share.attention.v_up",
+        "body.sparse_initial_index_share.attention.v_up"
+      ],
+      "note": "First of the GEMM pair between the MLA output and the collective.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment",
+      "after_name": "at::native::vectorized_elementwise_kernel",
+      "before_name": "nvjet_sm100_"
+    },
+    {
+      "operation": "attention.o_proj",
+      "name": "nvjet_sm100_",
+      "type": "model",
+      "role": "attention output projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.o_proj",
+        "body.sparse_cycle_full_index.attention.o_proj",
+        "body.sparse_cycle_index_share.attention.o_proj",
+        "body.sparse_initial_index_share.attention.o_proj"
+      ],
+      "note": "The layers where the value up-projection took a tile no rule names, so the MLA kernel is the operation immediately before.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment",
+      "after": "attention.sparse_mla.decode",
+      "before_name": "flashinfer::trtllm_allreduce_fusion"
+    },
+    {
+      "operation": "attention.q_b_proj",
+      "name": "nvjet_sm100_",
+      "type": "model",
+      "role": "Q up-projection from the latent",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.q_b_proj",
+        "body.sparse_cycle_full_index.attention.q_b_proj",
+        "body.sparse_cycle_index_share.attention.q_b_proj",
+        "body.sparse_initial_index_share.attention.q_b_proj"
+      ],
+      "note": "Same position as the CUTLASS-tile rule for this projection.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment",
+      "after": "attention.q_a_rms_norm"
+    },
+    {
+      "operation": "attention.q_b_proj",
+      "name": "sglang::fused_a_gemm_kernel<(int)1, (int)4096, (int)2048",
+      "type": "model",
+      "role": "Q up-projection from the latent, min-latency kernel",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.q_b_proj",
+        "body.sparse_cycle_full_index.attention.q_b_proj",
+        "body.sparse_cycle_index_share.attention.q_b_proj",
+        "body.sparse_initial_index_share.attention.q_b_proj"
+      ],
+      "note": "Same position as the two tile rules above. `q_b_proj` is one of the two projections `linear_with_fused_a_gemm` diverts at one to sixteen tokens (`deepseek_v2.py:2236`), so at decode batch this kernel replaces the tile rather than joining it -- 78 launches per decode iteration, one per layer. The indexer's own wq_b has the same (4096, 2048) shape but never reaches that dispatch, which is why this rule must be positional.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment",
+      "after": "attention.q_a_rms_norm"
+    },
+    {
+      "operation": "attention.q_absorb",
+      "name": "nvjet_sm100_",
+      "type": "model",
+      "role": "MLA absorb BMM (q_nope @ w_kc)",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.q_absorb",
+        "body.sparse_cycle_full_index.attention.q_absorb",
+        "body.sparse_cycle_index_share.attention.q_absorb",
+        "body.sparse_initial_index_share.attention.q_absorb"
+      ],
+      "note": "The last GEMM before the main RoPE. The folded layer body shows TWO GEMMs between the q_a RMSNorm and that RoPE in every layer, not one: the up-projection right after the norm, then this.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment",
+      "after": "attention.kv_a_rms_norm",
+      "before_name": "flashinfer::RopeQuantizeKernel"
+    },
+    {
+      "operation": "moe.router.router_gemm_bf16_proxy",
+      "name": "cublasLt::splitKreduce_kernel",
+      "type": "model",
+      "role": "MoE router logits GEMM split-K reduction",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.sparse_cycle_full_index.moe.router.router_gemm_bf16_proxy",
+        "body.sparse_cycle_index_share.moe.router.router_gemm_bf16_proxy",
+        "body.sparse_initial_index_share.moe.router.router_gemm_bf16_proxy"
+      ],
+      "note": "The reduction half of the split-K router GEMM above.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment",
+      "after": "moe.router.router_gemm_bf16_proxy",
+      "after_name": "nvjet_sm100_tss_"
+    },
+    {
+      "operation": "attention.indexer.q_proj",
+      "name": "kernel_cutlass_kernel_TgvGemmCuteExtKernel_",
+      "type": "model",
+      "role": "indexer query projection, CUTLASS tile",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.indexer.q_proj",
+        "body.sparse_cycle_full_index.attention.indexer.q_proj"
+      ],
+      "note": "Keyed on the fused RoPE/quant that consumes it, which is what separates this projection from `q_b_proj` -- the two have the same (4096, 2048) shape and share every tile.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment",
+      "before_name": "sglang::fused_q_indexer_rope"
+    },
+    {
+      "operation": "attention.indexer.q_proj",
+      "name": "nvjet_sm100_",
+      "type": "model",
+      "role": "indexer query projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.indexer.q_proj",
+        "body.sparse_cycle_full_index.attention.indexer.q_proj"
+      ],
+      "note": "Same position, different backend picked for the shape.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment",
+      "before_name": "sglang::fused_q_indexer_rope"
+    },
+    {
+      "operation": "attention.indexer.wk_weights_proj",
+      "name": "nvjet_sm100_",
+      "type": "model",
+      "role": "indexer key weight projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.indexer.wk_weights_proj",
+        "body.sparse_cycle_full_index.attention.indexer.wk_weights_proj"
+      ],
+      "note": "The GEMM feeding the fused indexer key norm/RoPE/store.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment",
+      "before_name": "sglang::fused_k_indexer_norm_rope"
+    },
+    {
+      "operation": "attention.indexer.wk_weights_proj",
+      "name": "cublasLt::splitKreduce_kernel",
+      "type": "model",
+      "role": "indexer key weight projection split-K reduction",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.indexer.wk_weights_proj",
+        "body.sparse_cycle_full_index.attention.indexer.wk_weights_proj"
+      ],
+      "note": "The reduction half of the split-K projection above.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment",
+      "before_name": "sglang::fused_k_indexer_norm_rope"
+    },
+    {
+      "operation": "moe.tp_allreduce",
+      "name": "trtllm_allreduce_fusion::allreduce_fusion_kernel",
+      "type": "model",
+      "role": "fused all-reduce + residual + RMSNorm after the MoE",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": [
+        "body.dense_full_index.ffn.post_attn_add_rms_norm",
+        "body.dense_full_index.ffn.tp_allreduce",
+        "body.sparse_cycle_full_index.moe.router.post_attn_add_rms_norm",
+        "body.sparse_cycle_full_index.moe.tp_allreduce",
+        "body.sparse_cycle_index_share.moe.router.post_attn_add_rms_norm",
+        "body.sparse_cycle_index_share.moe.tp_allreduce",
+        "body.sparse_initial_index_share.moe.router.post_attn_add_rms_norm",
+        "body.sparse_initial_index_share.moe.tp_allreduce"
+      ],
+      "note": "The repeat-body boundary, where there is no preceding kernel to key on. The successor separates the two collectives: the MoE-side one opens the next layer with the QKV-A projection (a `tst` tile), the attention-side one is followed by the router GEMM (`tss`).",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment",
+      "after_name": "<none>",
+      "before_name": "nvjet_sm100_tst_"
+    },
+    {
+      "operation": "attention.indexer.rope",
+      "name": "at::native::vectorized_elementwise_kernel",
+      "type": "model",
+      "role": "indexer key/scale gather folded into the fused query RoPE graph",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.indexer.rope",
+        "body.sparse_cycle_full_index.attention.indexer.rope"
+      ],
+      "note": "Same fused query-RoPE/weight-scale boundary on the decode side, where the companion launch lands after the scorer.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment",
+      "after": "attention.indexer.decode_logits"
+    },
+    {
+      "operation": "attention.indexer.wk_weights_proj",
+      "name": "nvjet_sm100_",
+      "type": "model",
+      "role": "indexer key weight projection, split-K GEMM",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.indexer.wk_weights_proj",
+        "body.sparse_cycle_full_index.attention.indexer.wk_weights_proj"
+      ],
+      "note": "Wide-batch counterpart of the `after: attention.kv_a_rms_norm` rule: same pair, reached from the fused query-RoPE/weight-scale boundary instead.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment",
+      "after": "attention.indexer.rope",
+      "before_name": "cublasLt::splitKreduce_kernel"
+    },
+    {
+      "operation": "attention.indexer.prefill_cache_gather",
+      "name": "at::native::vectorized_elementwise_kernel",
+      "type": "model",
+      "role": "indexer key-cache gather for the ragged prefill scorer",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.indexer.prefill_cache_gather",
+        "body.sparse_cycle_full_index.attention.indexer.prefill_cache_gather"
+      ],
+      "note": "Between the indexer cache store and the prefill top-k, which is where the ragged scorer's gather has to be.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment",
+      "after": "attention.indexer.index_cache_append"
+    },
+    {
+      "operation": "attention.fused_qkv_a_proj",
+      "name": "nvjet_sm100_",
+      "type": "model",
+      "role": "fused Q and latent KV projection, first layer",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.fused_qkv_a_proj",
+        "body.sparse_cycle_full_index.attention.fused_qkv_a_proj",
+        "body.sparse_cycle_index_share.attention.fused_qkv_a_proj",
+        "body.sparse_initial_index_share.attention.fused_qkv_a_proj"
+      ],
+      "note": "Layer 0 has no preceding collective to key on -- its input norm is a standalone RMSNorm -- so it is bracketed by the two norms instead: the input norm before it and the q_a norm after.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment",
+      "after_name": "kernel_cutlass_kernel_flashinfernormkernelsrmsnorm",
+      "before_name": "kernel_cutlass_kernel_flashinfernormkernelsrmsnorm"
+    },
+    {
+      "operation": "attention.tp_allreduce_residual_norm",
+      "name": "trtllm_allreduce_fusion::allreduce_fusion_kernel",
+      "type": "model",
+      "role": "fused all-reduce + residual + RMSNorm after attention",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.input_add_rms_norm",
+        "body.dense_full_index.attention.tp_allreduce",
+        "body.dense_full_index.attention.tp_allreduce_residual_norm",
+        "body.sparse_cycle_full_index.attention.input_add_rms_norm",
+        "body.sparse_cycle_full_index.attention.tp_allreduce",
+        "body.sparse_cycle_full_index.attention.tp_allreduce_residual_norm",
+        "body.sparse_cycle_index_share.attention.input_add_rms_norm",
+        "body.sparse_cycle_index_share.attention.tp_allreduce",
+        "body.sparse_cycle_index_share.attention.tp_allreduce_residual_norm",
+        "body.sparse_initial_index_share.attention.input_add_rms_norm",
+        "body.sparse_initial_index_share.attention.tp_allreduce",
+        "body.sparse_initial_index_share.attention.tp_allreduce_residual_norm"
+      ],
+      "note": "The attention-side collective: the fused AR is the first one after the sparse MLA in every layer. Pattern kARResidualRMSNorm, so the residual add and the norm are inside this launch and the model's separate add_rms_norm slots have no kernel of their own.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment",
+      "after": "attention.o_proj"
+    },
+    {
+      "operation": "attention.o_proj",
+      "name": "nvjet_sm100_",
+      "type": "model",
+      "role": "attention output projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.o_proj",
+        "body.sparse_cycle_full_index.attention.o_proj",
+        "body.sparse_cycle_index_share.attention.o_proj",
+        "body.sparse_initial_index_share.attention.o_proj"
+      ],
+      "note": "The last GEMM before the attention-side collective: TP splits o_proj by input, so the all-reduce immediately follows it.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment",
+      "after": "attention.v_up",
+      "before_name": "flashinfer::trtllm_allreduce_fusion"
+    },
+    {
+      "operation": "attention.o_proj",
+      "name": "kernel_cutlass_kernel_TgvGemmCuteExtKernel_",
+      "type": "model",
+      "role": "attention output projection, CUTLASS tile",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.o_proj",
+        "body.sparse_cycle_full_index.attention.o_proj",
+        "body.sparse_cycle_index_share.attention.o_proj",
+        "body.sparse_initial_index_share.attention.o_proj"
+      ],
+      "note": "Same position, different backend picked for the shape.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment",
+      "after": "attention.v_up",
+      "before_name": "flashinfer::trtllm_allreduce_fusion"
+    },
+    {
+      "operation": "moe.tp_allreduce",
+      "name": "trtllm_allreduce_fusion::allreduce_fusion_kernel",
+      "type": "model",
+      "role": "fused all-reduce + residual + RMSNorm after the MoE",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": [
+        "body.dense_full_index.ffn.post_attn_add_rms_norm",
+        "body.dense_full_index.ffn.tp_allreduce",
+        "body.sparse_cycle_full_index.moe.router.post_attn_add_rms_norm",
+        "body.sparse_cycle_full_index.moe.tp_allreduce",
+        "body.sparse_cycle_index_share.moe.router.post_attn_add_rms_norm",
+        "body.sparse_cycle_index_share.moe.tp_allreduce",
+        "body.sparse_initial_index_share.moe.router.post_attn_add_rms_norm",
+        "body.sparse_initial_index_share.moe.tp_allreduce"
+      ],
+      "note": "The shared expert and the routed experts join before the collective; either can be the launch immediately before it.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment",
+      "after": "moe.shared_expert.down_proj"
+    },
+    {
+      "operation": "attention.tp_allreduce_residual_norm",
+      "name": "trtllm_allreduce_fusion::allreduce_fusion_kernel",
+      "type": "model",
+      "role": "fused all-reduce + residual + RMSNorm after attention",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.input_add_rms_norm",
+        "body.dense_full_index.attention.tp_allreduce",
+        "body.dense_full_index.attention.tp_allreduce_residual_norm",
+        "body.sparse_cycle_full_index.attention.input_add_rms_norm",
+        "body.sparse_cycle_full_index.attention.tp_allreduce",
+        "body.sparse_cycle_full_index.attention.tp_allreduce_residual_norm",
+        "body.sparse_cycle_index_share.attention.input_add_rms_norm",
+        "body.sparse_cycle_index_share.attention.tp_allreduce",
+        "body.sparse_cycle_index_share.attention.tp_allreduce_residual_norm",
+        "body.sparse_initial_index_share.attention.input_add_rms_norm",
+        "body.sparse_initial_index_share.attention.tp_allreduce",
+        "body.sparse_initial_index_share.attention.tp_allreduce_residual_norm"
+      ],
+      "note": "Layers where the o projection used a tile no rule names yet, so the value up-projection is the operation immediately before.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment",
+      "after": "attention.v_up"
+    },
+    {
+      "operation": "attention.fused_qkv_a_proj",
+      "name": "kernel_cutlass_kernel_TgvGemmCuteExtKernel_",
+      "type": "model",
+      "role": "fused Q and latent KV projection, CUTLASS tile",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.fused_qkv_a_proj",
+        "body.sparse_cycle_full_index.attention.fused_qkv_a_proj",
+        "body.sparse_cycle_index_share.attention.fused_qkv_a_proj",
+        "body.sparse_initial_index_share.attention.fused_qkv_a_proj"
+      ],
+      "note": "The first GEMM after the MoE-side collective opens the next layer, and it is followed by the q_a RMSNorm -- the two neighbours together leave only the fused QKV-A projection.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment",
+      "after": "moe.tp_allreduce"
+    },
+    {
+      "operation": "attention.fused_qkv_a_proj",
+      "name": "nvjet_sm100_",
+      "type": "model",
+      "role": "fused Q and latent KV projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.fused_qkv_a_proj",
+        "body.sparse_cycle_full_index.attention.fused_qkv_a_proj",
+        "body.sparse_cycle_index_share.attention.fused_qkv_a_proj",
+        "body.sparse_initial_index_share.attention.fused_qkv_a_proj"
+      ],
+      "note": "Same position as the CUTLASS-tile rule above, different backend.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment",
+      "after": "moe.tp_allreduce"
+    },
+    {
+      "operation": "main.lm_head",
+      "name": "_all_gather_kernel_inner",
+      "type": "model",
+      "role": "LM head output all-gather",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "main.lm_head"
+      ],
+      "note": "The column-parallel head's output gather. The model has no separate slot for it, so it is charged to the head it belongs to rather than left as unattributed time.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment",
+      "after": "main.lm_head"
+    },
+    {
+      "operation": "moe.router.router_gemm_bf16_proxy",
+      "name": "nvjet_sm100_tss_",
+      "type": "model",
+      "role": "MoE router logits GEMM (cuBLASLt split-K path)",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.sparse_cycle_full_index.moe.router.router_gemm_bf16_proxy",
+        "body.sparse_cycle_index_share.moe.router.router_gemm_bf16_proxy",
+        "body.sparse_initial_index_share.moe.router.router_gemm_bf16_proxy"
+      ],
+      "note": "SGLang's own router_gemm_kernel only covers small batches; wider ones fall to cuBLASLt split-K. Identified by sitting between the attention collective and the MoE input quantization.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment",
+      "after": "attention.tp_allreduce_residual_norm",
+      "before_name": "cublasLt::splitKreduce_kernel"
+    },
+    {
+      "operation": "moe.router.router_gemm_bf16_proxy",
+      "name": "nvjet_sm100_tss_",
+      "type": "model",
+      "role": "MoE router logits GEMM, wide-batch tile",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.sparse_cycle_full_index.moe.router.router_gemm_bf16_proxy",
+        "body.sparse_cycle_index_share.moe.router.router_gemm_bf16_proxy",
+        "body.sparse_initial_index_share.moe.router.router_gemm_bf16_proxy"
+      ],
+      "note": "The GEMM between the attention collective and the MoE input quantization, in the batches wide enough that cuBLASLt picks a single-pass tile instead of the split-K pair.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment",
+      "after": "attention.tp_allreduce_residual_norm"
+    },
+    {
+      "operation": "attention.indexer.rope",
+      "name": "at::native::vectorized_elementwise_kernel",
+      "type": "model",
+      "role": "indexer key/scale gather folded into the fused query RoPE graph",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.indexer.rope",
+        "body.sparse_cycle_full_index.attention.indexer.rope"
+      ],
+      "note": "The indexer block opens right after the Q up-projection. In the clean SGLang graph this companion launch belongs to the fused query-RoPE/weight-scale boundary; only index-recompute families declare that slot.",
+      "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment",
+      "after": "attention.q_b_proj"
+    }
+  ]
+}

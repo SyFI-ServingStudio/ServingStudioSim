@@ -99,6 +99,46 @@ register(
     )
 )
 
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="sglang_bf16_auto",
+        supports=BackendSupport(
+            compute=frozenset({DType.BF16}),
+            gpus=frozenset({"NVIDIA B200"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.gemm.sglang",
+            function_name="profile_single_gemm_sglang_bf16",
+        ),
+        table_name=KIND,
+        args_schema=SingleGemmArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="sglang_env",
+    )
+)
+
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="sglang_fused_a_auto",
+        supports=BackendSupport(
+            compute=frozenset({DType.BF16}),
+            gpus=frozenset({"NVIDIA B200"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.gemm.sglang",
+            function_name="profile_single_gemm_sglang_fused_a",
+        ),
+        table_name=KIND,
+        args_schema=SingleGemmArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="sglang_env",
+    )
+)
+
 # DeepGEMM FP8 dense kernel — same wire schema / table, FP8 compute
 # (dtype = fp8_e4m3, fp8 in / bf16 out). subprocess_env=None (default env;
 # deep_gemm is a pinned project dep, see CLAUDE.md / `just sync`).

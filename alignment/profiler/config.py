@@ -19,6 +19,33 @@ from dataclasses import dataclass, field
 from ..load_generator.config import LoadGeneratorConfig
 
 
+@dataclass(frozen=True)
+class PythonPackageArtifact:
+    """One wheel-backed runtime artifact required before model loading.
+
+    ``version`` is the upstream release version passed to the installer.
+    CUDA-specific wheels may append a local version such as ``+cu130``;
+    ``local_version`` makes that suffix part of the validation contract without
+    changing the upstream installation spelling.
+    """
+
+    name: str
+    version: str
+    index_url: str
+    local_version: str | None = None
+    required_files: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class PythonRuntimeConfig:
+    """Idempotent package preparation and immutable server-runtime policy."""
+
+    packages: list[PythonPackageArtifact]
+    environment: dict[str, str] = field(default_factory=dict)
+    lock_timeout_seconds: float = 900.0
+    install_timeout_seconds: float = 1800.0
+
+
 @dataclass
 class ServerConfig:
     """How to launch one server for one TP x DP replica group."""
@@ -161,6 +188,11 @@ class ProfileConfig:
     # driver is already new enough. Recorded in launch metadata because it
     # changes which user-mode driver produced the measurement.
     driver_compat_lib_dir: str = ""
+    # Declarative, automatically enforced binary dependencies for the fork
+    # interpreter. Preparation installs only missing exact-version packages
+    # under a per-venv lock; serving receives ``environment`` only after every
+    # package and required file has been verified.
+    python_runtime: PythonRuntimeConfig | None = None
     server: ServerConfig = None  # type: ignore[assignment]
     idle: IdleWaitConfig = field(default_factory=IdleWaitConfig)
     nsys: NsysConfig = field(default_factory=NsysConfig)

@@ -15,19 +15,22 @@
 //!
 //! For one context-ready request, let `fresh` be its new suffix, `declared` its
 //! reusable-prefix requirement, `hit` the resident prefix found at admission,
-//! `p` the prefill tokens actually computed, and `d` the emitted output tokens.
+//! `p` the initial-prefill tokens actually computed, `rp` the tokens from any
+//! decode-retraction re-prefill episodes, `r` the number of completed episodes,
+//! and `d` the emitted output tokens.
 //! Prefix-aware requests must conserve `hit + p = fresh + declared`; the common
 //! logical context after prefill is therefore `context = hit + p` regardless of
 //! the dynamic cache result.
 //!
 //! Checks for iter-wise deployments:
-//!   1. `prefill_tokens`        Σ prefill_tokens            vs Σ p
+//!   1. `prefill_tokens`        Σ prefill_tokens            vs Σ (p + rp)
 //!   2. prefix telemetry presence, `hit <= declared`, and both aggregate and
 //!      per-request forms of `hit + p = fresh + declared`
-//!   3. `decode_passes`         Σ decode_request_count      vs Σ max(d-1, 0)
+//!   3. `decode_passes`         Σ decode_request_count      vs Σ max(d-1-r, 0)
 //!      (the first output token is produced by the prefill pass, not a decode
-//!      pass, so a request incurs `d-1` decode forward passes)
-//!   4. `ffn_token_pass`        Σ batch_tokens              vs Σ [p + max(d-1,0)]
+//!      pass, and every completed re-prefill likewise produces one output)
+//!   4. `ffn_token_pass`        Σ batch_tokens
+//!         vs Σ [p + rp + max(d-1-r,0)]
 //!   5. `prefill_causal_attn_work`
 //!         Σ_chunks [a·prefix + a(a+1)/2]
 //!             vs Σ [p·hit + p(p+1)/2]
@@ -42,8 +45,10 @@
 //!      `context(context+1)/2` baseline. `context = fresh + declared` for a
 //!      context-ready request; a sim-end partial prefill uses only its observed
 //!      `hit + p` context so unfinished future work is not invented.
-//!   7. `decode_kv_sum`         Σ decode_kv_total
-//!         vs Σ [m·context + m(m-1)/2], m = max(d-1, 0)
+//!   7. `decode_kv_sum` starts from the no-retraction baseline
+//!         Σ [m·context + m(m-1)/2], m = max(d-1, 0),
+//!      then subtracts the ordinary decode KV read replaced by each completed
+//!      re-prefill.
 //!      (decode reads the full post-prefill context, independent of how much of
 //!      that context was a cache hit.)
 //!   8. `cost_log_batch_self_consistency`  Σ batch_tokens vs Σ(prefill_tokens +
@@ -53,7 +58,7 @@
 //! `deployment=afd`, attention checks therefore use only
 //! `(pool_tag=attn, section=attn)` and multiply request-side expected work by
 //! the observed layer count; FFN checks use `pool_tag=ffn` and expect
-//! `Σ[p + max(d-1,0)] × (layers + 3)` section-token passes.
+//! `Σ[p + rp + max(d-1-r,0)] × (layers + 3)` section-token passes.
 //!
 //! When EP/HP multi-group lands, the per-group reduction needs the same revisit
 //! as `batch::composition` (sum for partition-style, pick-one for replicate-style
@@ -63,7 +68,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 use std::path::Path;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, ensure, Result};
 use arrow_array::{
     Array, BooleanArray, ListArray, StringArray, StructArray, UInt16Array, UInt32Array,
 };
@@ -148,6 +153,8 @@ struct Expected {
     missing_prefix_resolution_requests: usize,
     prefix_hit_bound_violations: usize,
     prefix_token_balance_violations: usize,
+    reprocessed_token_balance_violations: usize,
+    reprocessed_prefill_episodes: usize,
     requests: usize,
     context_ready_requests: usize,
     incomplete_requests: usize,
@@ -195,6 +202,7 @@ pub async fn run_workload(ctx: &SessionContext, log_dir: &Path) -> Result<(Value
             "num_context_ready_requests": expected.context_ready_requests,
             "num_incomplete_requests": expected.incomplete_requests,
             "num_boundary_decode_requests": expected.boundary_decode_requests,
+            "num_reprocessed_prefill_episodes": expected.reprocessed_prefill_episodes,
             "max_context_len": expected.max_context_len,
         },
         "available": true,
@@ -283,13 +291,20 @@ fn checks_for_mode(mode: WorkloadMode, actual: &Actual, expected: &Expected) -> 
             0.0,
         ),
         (
+            "reprocessed_prefill_token_balance_violations",
+            "completed reprocessed-prefill episodes violating hit + processed = initial context + prior outputs vs 0",
+            expected.reprocessed_token_balance_violations as f64,
+            0.0,
+            0.0,
+        ),
+        (
             "decode_passes",
             match mode {
                 WorkloadMode::Iterwise => {
-                    "decode forward passes: Σ cost_log decode_request_count vs Σ max(d-1,0)"
+                    "decode forward passes: Σ cost_log decode_request_count vs Σ max(d-1-r,0), r=completed re-prefills"
                 }
                 WorkloadMode::Afd => {
-                    "AFD attention-layer decode passes: Σ attn cost_log decode_request_count vs Σ max(d-1,0) × layers"
+                    "AFD attention-layer decode passes: Σ attn cost_log decode_request_count vs Σ max(d-1-r,0) × layers"
                 }
             },
             actual.decode_passes,
@@ -300,10 +315,10 @@ fn checks_for_mode(mode: WorkloadMode, actual: &Actual, expected: &Expected) -> 
             "ffn_token_pass",
             match mode {
                 WorkloadMode::Iterwise => {
-                    "tokens through FFN: Σ cost_log batch_tokens vs Σ [p + max(d-1,0)]"
+                    "tokens through FFN: Σ cost_log batch_tokens vs Σ [p + rp + max(d-1-r,0)]"
                 }
                 WorkloadMode::Afd => {
-                    "AFD FFN section token pass: Σ ffn cost_log batch_tokens vs Σ[p + max(d-1,0)] × (layers+3)"
+                    "AFD FFN section token pass: Σ ffn cost_log batch_tokens vs Σ[p + rp + max(d-1-r,0)] × (layers+3)"
                 }
             },
             actual.batch_tokens,
@@ -342,7 +357,7 @@ fn checks_for_mode(mode: WorkloadMode, actual: &Actual, expected: &Expected) -> 
             "decode_kv_sum",
             match mode {
                 WorkloadMode::Iterwise => {
-                    "decode KV read: Σ cost_log decode_kv_total vs Σ [m·(hit+p) + m(m-1)/2], m=max(d-1,0)"
+                    "decode KV read: no-retraction baseline minus the ordinary decode read replaced by each completed re-prefill"
                 }
                 WorkloadMode::Afd => {
                     "AFD attention-layer decode KV read: Σ attn cost_log decode_kv_total vs Σ [m·(hit+p) + m(m-1)/2] × layers"
@@ -1066,7 +1081,15 @@ fn u32_values<'a>(arr: &'a arrow_array::ArrayRef, field: &str) -> Result<&'a UIn
         .ok_or_else(|| anyhow!("`{field}` items are not UInt32"))
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
+struct ReprocessedPrefillWorkInput {
+    output_tokens_before: f64,
+    prefix_cache_hit_tokens: f64,
+    prefill_tokens_processed: f64,
+    completed: bool,
+}
+
+#[derive(Clone, Debug, Default)]
 struct RequestSloWorkInput {
     completed: bool,
     fresh_prompt_tokens: f64,
@@ -1074,6 +1097,7 @@ struct RequestSloWorkInput {
     prefix_cache_hit_tokens: Option<f64>,
     prefill_tokens_processed: f64,
     num_output_tokens: f64,
+    reprocessed_prefills: Vec<ReprocessedPrefillWorkInput>,
 }
 
 impl Expected {
@@ -1117,17 +1141,37 @@ impl Expected {
             WorkloadMode::Iterwise => 1.0,
             WorkloadMode::Afd => num_layers as f64 + 3.0,
         };
-        let decode_forward_passes = (input.num_output_tokens - 1.0).max(0.0);
+        let completed_reprocessed = input
+            .reprocessed_prefills
+            .iter()
+            .filter(|episode| episode.completed)
+            .count() as f64;
+        let decode_forward_passes =
+            (input.num_output_tokens - 1.0 - completed_reprocessed).max(0.0);
+        let reprocessed_prefill_tokens: f64 = input
+            .reprocessed_prefills
+            .iter()
+            .map(|episode| episode.prefill_tokens_processed)
+            .sum();
+        self.reprocessed_prefill_episodes += input.reprocessed_prefills.len();
         self.max_context_len = self
             .max_context_len
             .max(logical_context_tokens + input.num_output_tokens);
-        self.prefill_tokens += input.prefill_tokens_processed * layer_multiplier;
+        self.prefill_tokens +=
+            (input.prefill_tokens_processed + reprocessed_prefill_tokens) * layer_multiplier;
         self.decode_passes += decode_forward_passes * layer_multiplier;
         self.batch_tokens +=
-            (input.prefill_tokens_processed + decode_forward_passes) * ffn_multiplier;
-        self.decode_kv += (decode_forward_passes * logical_context_tokens
-            + decode_forward_passes * (decode_forward_passes - 1.0) / 2.0)
-            * layer_multiplier;
+            (input.prefill_tokens_processed + reprocessed_prefill_tokens + decode_forward_passes)
+                * ffn_multiplier;
+        let base_decode_passes = (input.num_output_tokens - 1.0).max(0.0);
+        let mut decode_kv = base_decode_passes * logical_context_tokens
+            + base_decode_passes * (base_decode_passes - 1.0) / 2.0;
+        for episode in &input.reprocessed_prefills {
+            if episode.completed {
+                decode_kv -= (logical_context_tokens + episode.output_tokens_before - 1.0).max(0.0);
+            }
+        }
+        self.decode_kv += decode_kv * layer_multiplier;
         self.causal += (input.prefill_tokens_processed * prefix_cache_hit_tokens
             + triangular(input.prefill_tokens_processed))
             * layer_multiplier;
@@ -1139,6 +1183,24 @@ impl Expected {
             logical_context_tokens
         };
         self.cold_causal += triangular(cold_equivalent_context_tokens) * layer_multiplier;
+
+        for episode in &input.reprocessed_prefills {
+            let episode_context =
+                episode.prefix_cache_hit_tokens + episode.prefill_tokens_processed;
+            let expected_context = logical_context_tokens + episode.output_tokens_before;
+            if episode.completed && episode_context != expected_context {
+                self.reprocessed_token_balance_violations += 1;
+            }
+            self.causal += (episode.prefill_tokens_processed * episode.prefix_cache_hit_tokens
+                + triangular(episode.prefill_tokens_processed))
+                * layer_multiplier;
+            self.saved_causal += triangular(episode.prefix_cache_hit_tokens) * layer_multiplier;
+            self.cold_causal += triangular(if episode.completed {
+                expected_context
+            } else {
+                episode_context
+            }) * layer_multiplier;
+        }
     }
 }
 
@@ -1152,12 +1214,20 @@ async fn collect_expected(
     mode: WorkloadMode,
     num_layers: usize,
 ) -> Result<Expected> {
-    let batches = collect(
-        ctx,
+    let has_reprocessed =
+        has_column(ctx, "slo", "reprocessed_prefill_output_tokens_before").await?;
+    let select = if has_reprocessed {
         "SELECT completed, fresh_prompt_tokens, declared_prefix_tokens, \
-         prefix_cache_hit_tokens, prefill_processed, num_output_tokens FROM slo",
-    )
-    .await?;
+         prefix_cache_hit_tokens, prefill_processed, num_output_tokens, \
+         reprocessed_prefill_output_tokens_before, \
+         reprocessed_prefill_prefix_hit_tokens, \
+         reprocessed_prefill_processed_tokens, \
+         reprocessed_prefill_completed FROM slo"
+    } else {
+        "SELECT completed, fresh_prompt_tokens, declared_prefix_tokens, \
+         prefix_cache_hit_tokens, prefill_processed, num_output_tokens FROM slo"
+    };
+    let batches = collect(ctx, select).await?;
     let mut expected = Expected::default();
     for batch in &batches {
         let completed = col(batch, "completed")?
@@ -1177,6 +1247,11 @@ async fn collect_expected(
         let prefill_tokens_processed = col(batch, "prefill_processed")?;
         let num_output_tokens = col(batch, "num_output_tokens")?;
         for row in 0..batch.num_rows() {
+            let reprocessed_prefills = if has_reprocessed {
+                reprocessed_prefills_at(batch, row)?
+            } else {
+                Vec::new()
+            };
             expected.add_request(
                 mode,
                 num_layers,
@@ -1188,11 +1263,64 @@ async fn collect_expected(
                         .then(|| prefix_cache_hit_tokens.value(row) as f64),
                     prefill_tokens_processed: value_f64(prefill_tokens_processed, row)?,
                     num_output_tokens: value_f64(num_output_tokens, row)?,
+                    reprocessed_prefills,
                 },
             );
         }
     }
     Ok(expected)
+}
+
+async fn has_column(ctx: &SessionContext, table: &str, column: &str) -> Result<bool> {
+    let data_frame = ctx.table(table).await?;
+    Ok(data_frame.schema().field_with_name(None, column).is_ok())
+}
+
+fn reprocessed_prefills_at(
+    batch: &arrow_array::RecordBatch,
+    row: usize,
+) -> Result<Vec<ReprocessedPrefillWorkInput>> {
+    let output = col(batch, "reprocessed_prefill_output_tokens_before")?
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .ok_or_else(|| anyhow!("reprocessed output tokens are not a List array"))?;
+    let hit = col(batch, "reprocessed_prefill_prefix_hit_tokens")?
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .ok_or_else(|| anyhow!("reprocessed prefix hits are not a List array"))?;
+    let processed = col(batch, "reprocessed_prefill_processed_tokens")?
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .ok_or_else(|| anyhow!("reprocessed tokens are not a List array"))?;
+    let completed = col(batch, "reprocessed_prefill_completed")?
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .ok_or_else(|| anyhow!("reprocessed completion is not a List array"))?;
+    let output_values = output.value(row);
+    let hit_values = hit.value(row);
+    let processed_values = processed.value(row);
+    let completed_values = completed.value(row);
+    let output_values = u32_values(&output_values, "reprocessed output tokens")?;
+    let hit_values = u32_values(&hit_values, "reprocessed prefix hits")?;
+    let processed_values = u32_values(&processed_values, "reprocessed tokens")?;
+    let completed_values = completed_values
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .ok_or_else(|| anyhow!("reprocessed completion items are not Boolean"))?;
+    ensure!(
+        output_values.len() == hit_values.len()
+            && output_values.len() == processed_values.len()
+            && output_values.len() == completed_values.len(),
+        "request_slo row {row} has unequal reprocessed-prefill episode columns"
+    );
+    Ok((0..output_values.len())
+        .map(|index| ReprocessedPrefillWorkInput {
+            output_tokens_before: output_values.value(index) as f64,
+            prefix_cache_hit_tokens: hit_values.value(index) as f64,
+            prefill_tokens_processed: processed_values.value(index) as f64,
+            completed: completed_values.value(index),
+        })
+        .collect())
 }
 
 fn contributes_boundary_allowance(completed: bool, num_output_tokens: f64) -> bool {
@@ -1207,6 +1335,7 @@ fn definitions() -> Value {
         "hit": "request_slo.prefix_cache_hit_tokens (nullable admission-time resident-prefix observation)",
         "p": "request_slo.prefill_processed (tokens actually computed by prefill)",
         "d": "request_slo.num_output_tokens (terminal decode length)",
+        "rp": "request_slo reprocessed-prefill episode lists after decode retraction",
         "context": "hit + p = fresh + declared after prefill completes",
         "status": "OK |unexplained Δ%| <= tolerance_pct; WARN <= warn_pct; FAIL otherwise",
         "prefix_scope_note": "a request with d > 0 has completed prefill and must have a non-null hit observation plus exact hit+p=fresh+declared balance; never-admitted and sim-end prefill-only rows are partial observations and are excluded from that full-context equation",
@@ -1218,8 +1347,8 @@ fn definitions() -> Value {
         "afd_note": "for deployment=afd, attention actuals are summed from pool_tag=attn, \
                      section=attn and multiplied by observed layer count; FFN actuals are \
                      summed from pool_tag=ffn section rows and expected as Σ[p+m]×(layers+3)",
-        "causal_note": "cache-aware prefill work is p*hit+p(p+1)/2 and remains chunk-invariant; adding the saved hit(hit+1)/2 triangle recovers the cold baseline. For context-ready rows that baseline is the immutable (fresh+declared)(fresh+declared+1)/2; sim-end partial-prefill rows use only their observed hit+p context so unfinished work is not invented. This is causal work, not dense a*kv_len",
-        "decode_kv_note": "each decode pass reads the full logical post-prefill context hit+p, so m passes consume m(hit+p)+m(m-1)/2 KV-token reads where m=max(d-1,0)",
+        "causal_note": "cache-aware prefill work is p*hit+p(p+1)/2 and remains chunk-invariant; each reprocessed-prefill episode contributes the same form over its own hit/processed pair. Adding each saved hit triangle recovers the corresponding cold context.",
+        "decode_kv_note": "the no-retraction baseline is m*(hit+p)+m(m-1)/2. A completed reprocessed-prefill produces one output itself, so its would-be decode KV read is subtracted using output_tokens_before.",
         "decode_boundary_note": "a positive Δ on decode_passes / decode_kv_sum can be the \
                                  sim-end truncation boundary: an in-flight request's final \
                                  decode iteration is counted in cost_log but its token \
@@ -1293,6 +1422,7 @@ mod tests {
                 prefix_cache_hit_tokens: Some(64.0),
                 prefill_tokens_processed: 32.0,
                 num_output_tokens: 4.0,
+                reprocessed_prefills: Vec::new(),
             },
         );
 
@@ -1325,7 +1455,7 @@ mod tests {
             ..Actual::default()
         };
         let checks = checks_for_mode(WorkloadMode::Iterwise, &actual, &expected);
-        assert_eq!(checks.len(), 11);
+        assert_eq!(checks.len(), 12);
         assert!(checks.iter().all(|check| check["status"] == "OK"));
     }
 
@@ -1342,6 +1472,7 @@ mod tests {
                 prefix_cache_hit_tokens: Some(65.0),
                 prefill_tokens_processed: 32.0,
                 num_output_tokens: 1.0,
+                reprocessed_prefills: Vec::new(),
             },
         );
         expected.add_request(
@@ -1354,6 +1485,7 @@ mod tests {
                 prefix_cache_hit_tokens: None,
                 prefill_tokens_processed: 16.0,
                 num_output_tokens: 1.0,
+                reprocessed_prefills: Vec::new(),
             },
         );
 
@@ -1361,6 +1493,37 @@ mod tests {
         assert_eq!(expected.prefix_hit_bound_violations, 1);
         assert_eq!(expected.missing_prefix_resolution_requests, 1);
         assert_eq!(expected.prefix_token_balance_violations, 1);
+    }
+
+    #[test]
+    fn reprocessed_prefill_replaces_one_decode_pass_and_conserves_extra_work() {
+        let mut expected = Expected::default();
+        expected.add_request(
+            WorkloadMode::Iterwise,
+            0,
+            RequestSloWorkInput {
+                completed: true,
+                fresh_prompt_tokens: 10.0,
+                declared_prefix_tokens: 0.0,
+                prefix_cache_hit_tokens: Some(0.0),
+                prefill_tokens_processed: 10.0,
+                num_output_tokens: 5.0,
+                reprocessed_prefills: vec![ReprocessedPrefillWorkInput {
+                    output_tokens_before: 2.0,
+                    prefix_cache_hit_tokens: 0.0,
+                    prefill_tokens_processed: 12.0,
+                    completed: true,
+                }],
+            },
+        );
+
+        assert_eq!(expected.reprocessed_prefill_episodes, 1);
+        assert_eq!(expected.reprocessed_token_balance_violations, 0);
+        assert_eq!(expected.prefill_tokens, 22.0);
+        assert_eq!(expected.decode_passes, 3.0);
+        assert_eq!(expected.batch_tokens, 25.0);
+        assert_eq!(expected.causal, 133.0);
+        assert_eq!(expected.decode_kv, 35.0);
     }
 
     #[test]
@@ -1376,6 +1539,7 @@ mod tests {
                 prefix_cache_hit_tokens: Some(64.0),
                 prefill_tokens_processed: 8.0,
                 num_output_tokens: 0.0,
+                reprocessed_prefills: Vec::new(),
             },
         );
 

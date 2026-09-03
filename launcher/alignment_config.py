@@ -8,13 +8,22 @@ modules receive typed values and never parse YAML or JSON themselves.
 
 from __future__ import annotations
 
+import math
 import os
+import re
 from dataclasses import dataclass, replace
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from alignment.load_generator.config import LoadGeneratorConfig
-from alignment.profiler.config import IdleWaitConfig, NsysConfig, ProfileConfig, ServerConfig
+from alignment.profiler.config import (
+    IdleWaitConfig,
+    NsysConfig,
+    ProfileConfig,
+    PythonPackageArtifact,
+    PythonRuntimeConfig,
+    ServerConfig,
+)
 from alignment.timing_predict_input import EngineTextInputSpec
 
 from .schema.loader import PresetError, _load_preset
@@ -96,8 +105,13 @@ class AnalyzePhaseConfig:
         return selected
 
 
-def load_profile_config(path: Path) -> ProfileConfig:
-    """Load the profile-only schema and normalize its filesystem inputs."""
+def load_profile_config(path: Path, *, require_python_runtime: bool = True) -> ProfileConfig:
+    """Load the profile-only schema and normalize its filesystem inputs.
+
+    ``require_python_runtime=False`` exists only for ``profile --resume``:
+    post-processing an existing capture must not require or mutate the engine
+    interpreter that originally produced it.
+    """
     raw = _phase_document(path, "profile")
     base = path.resolve().parent
     try:
@@ -105,6 +119,7 @@ def load_profile_config(path: Path) -> ProfileConfig:
         workload_raw = _pop_mapping(raw, "workload", "profile")
         idle_raw = _pop_optional_mapping(raw, "idle", "profile")
         nsys_raw = _pop_optional_mapping(raw, "nsys", "profile")
+        python_runtime_raw = _pop_optional_mapping(raw, "python_runtime", "profile")
         server = ServerConfig(**server_raw)
         workload = LoadGeneratorConfig.from_mapping(workload_raw)
         workload = replace(
@@ -118,6 +133,20 @@ def load_profile_config(path: Path) -> ProfileConfig:
         idle = IdleWaitConfig(**idle_raw)
         nsys = NsysConfig(**nsys_raw)
         nsys.validate()
+        python_runtime = None
+        if python_runtime_raw:
+            packages_raw = python_runtime_raw.pop("packages", None)
+            if not isinstance(packages_raw, list) or not packages_raw:
+                raise ValueError("python_runtime.packages must be a non-empty list")
+            packages = []
+            for index, package_raw in enumerate(packages_raw):
+                if not isinstance(package_raw, dict):
+                    raise ValueError(f"python_runtime.packages[{index}] must be a mapping")
+                packages.append(PythonPackageArtifact(**package_raw))
+            python_runtime = PythonRuntimeConfig(
+                packages=packages,
+                **python_runtime_raw,
+            )
         log_dir = _config_path(base, raw.pop("log_dir"), "log_dir")
         fork_python = raw.pop("fork_python", "")
         if fork_python:
@@ -135,6 +164,7 @@ def load_profile_config(path: Path) -> ProfileConfig:
             nsys=nsys,
             fork_python=fork_python,
             driver_compat_lib_dir=driver_compat_lib_dir,
+            python_runtime=python_runtime,
             **raw,
         )
     except (KeyError, TypeError, ValueError) as exc:
@@ -148,6 +178,26 @@ def load_profile_config(path: Path) -> ProfileConfig:
     if config.engine not in {"vllm", "sglang"}:
         raise ValueError(
             f"invalid profile config: engine must be 'vllm' or 'sglang', got {config.engine!r}"
+        )
+    if require_python_runtime and config.engine == "sglang" and config.python_runtime is None:
+        raise ValueError(
+            "invalid profile config: engine sglang requires an explicit "
+            "python_runtime prebuilt-artifact contract"
+        )
+    if config.python_runtime is not None:
+        _validate_python_runtime(config.python_runtime)
+    if (
+        require_python_runtime
+        and config.engine == "sglang"
+        and (
+            config.python_runtime is None
+            or config.python_runtime.environment.get("FLASHINFER_DISABLE_JIT") != "1"
+        )
+    ):
+        raise ValueError(
+            "invalid profile config: SGLang alignment requires "
+            "python_runtime.environment.FLASHINFER_DISABLE_JIT: '1' so a missing "
+            "prebuilt module fails before runtime compilation"
         )
     if config.profile_kind not in {"nsys", "expert_popularity", "workload_metrics"}:
         raise ValueError(
@@ -201,6 +251,87 @@ def load_profile_config(path: Path) -> ProfileConfig:
                 f"{config.driver_compat_lib_dir}"
             )
     return config
+
+
+def _validate_python_runtime(config: PythonRuntimeConfig) -> None:
+    """Reject ambiguous package contracts before touching an interpreter."""
+    for field_name, timeout in (
+        ("lock_timeout_seconds", config.lock_timeout_seconds),
+        ("install_timeout_seconds", config.install_timeout_seconds),
+    ):
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or not math.isfinite(timeout)
+            or timeout <= 0
+        ):
+            raise ValueError(
+                f"invalid profile config: python_runtime.{field_name} must be a "
+                "finite number > 0"
+            )
+    names: set[str] = set()
+    for index, package in enumerate(config.packages):
+        prefix = f"python_runtime.packages[{index}]"
+        for field_name in ("name", "version", "index_url"):
+            value = getattr(package, field_name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"invalid profile config: {prefix}.{field_name} must be non-empty")
+        canonical_name = re.sub(r"[-_.]+", "-", package.name).lower()
+        if canonical_name in names:
+            raise ValueError(
+                f"invalid profile config: duplicate python runtime package {package.name!r}"
+            )
+        names.add(canonical_name)
+        if package.local_version is not None and (
+            not isinstance(package.local_version, str) or not package.local_version.strip()
+        ):
+            raise ValueError(f"invalid profile config: {prefix}.local_version must be non-empty")
+        if not isinstance(package.required_files, list) or any(
+            not isinstance(path, str) or not path.strip() for path in package.required_files
+        ):
+            raise ValueError(
+                f"invalid profile config: {prefix}.required_files must be a list of "
+                "non-empty names"
+            )
+        if len(set(package.required_files)) != len(package.required_files):
+            raise ValueError(f"invalid profile config: {prefix}.required_files contains duplicates")
+        for required_file in package.required_files:
+            artifact_path = PurePosixPath(required_file)
+            if (
+                artifact_path.is_absolute()
+                or len(artifact_path.parts) < 2
+                or any(part in {"", ".", ".."} for part in artifact_path.parts)
+            ):
+                raise ValueError(
+                    f"invalid profile config: {prefix}.required_files entry "
+                    f"{required_file!r} must be an exact wheel-relative path"
+                )
+    if not isinstance(config.environment, dict) or any(
+        not isinstance(key, str) or not key or not isinstance(value, str)
+        for key, value in config.environment.items()
+    ):
+        raise ValueError(
+            "invalid profile config: python_runtime.environment must map non-empty "
+            "variable names to strings"
+        )
+    launcher_owned = {
+        "CUDA_VISIBLE_DEVICES",
+        "LD_LIBRARY_PATH",
+        "PATH",
+        "PYTHONHOME",
+        "PYTHONPATH",
+        "SGLANG_ENABLE_NVTX_SCHEDULER",
+        "SGLANG_ENABLE_VIBESIM_ALIGNMENT",
+        "UV_PROJECT_ENVIRONMENT",
+        "VIRTUAL_ENV",
+        "VLLM_NVTX_SCOPES_FOR_PROFILING",
+    }
+    conflicts = sorted(launcher_owned.intersection(config.environment))
+    if conflicts:
+        raise ValueError(
+            "invalid profile config: python_runtime.environment cannot override "
+            f"launcher-owned variables {conflicts}"
+        )
 
 
 def load_timing_predict_config(path: Path) -> TimingPredictPhaseConfig:

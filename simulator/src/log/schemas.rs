@@ -346,6 +346,29 @@ pub fn request_slo_schema() -> Arc<Schema> {
         Field::new("declared_ttft_slo_ms", DataType::Float32, true),
         Field::new("declared_tpot_slo_ms", DataType::Float32, true),
         Field::new("declared_e2e_slo_ms", DataType::Float32, true),
+        // Decode retraction and the resulting reprocessed-prefill episodes.
+        // The four list columns are parallel and preserve episode order.
+        Field::new("retraction_count", DataType::UInt32, false),
+        Field::new(
+            "reprocessed_prefill_output_tokens_before",
+            DataType::List(Arc::new(Field::new("item", DataType::UInt32, false))),
+            false,
+        ),
+        Field::new(
+            "reprocessed_prefill_prefix_hit_tokens",
+            DataType::List(Arc::new(Field::new("item", DataType::UInt32, false))),
+            false,
+        ),
+        Field::new(
+            "reprocessed_prefill_processed_tokens",
+            DataType::List(Arc::new(Field::new("item", DataType::UInt32, false))),
+            false,
+        ),
+        Field::new(
+            "reprocessed_prefill_completed",
+            DataType::List(Arc::new(Field::new("item", DataType::Boolean, false))),
+            false,
+        ),
     ]))
 }
 

@@ -240,6 +240,8 @@ def profile_document(
     }
     if host.fork_python:
         document["fork_python"] = _absolute(host.fork_python, repo_root)
+    if variant.python_runtime is not None:
+        document["python_runtime"] = dict(variant.python_runtime)
     document["server"] = _server_block(pack, variant, case, host)
     if profile_pass.kind == "nsys":
         nsys: dict[str, Any] = {

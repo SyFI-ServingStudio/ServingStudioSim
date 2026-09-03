@@ -11,6 +11,7 @@ use crate::common::{SharedRequests, Time};
 use crate::worker::cost_buffers::CostBuffers;
 use crate::worker::execution::{IterModelExecution, ModelKvLayout};
 use crate::worker::kv::{IterWorkerKv, PrefixKv};
+use crate::worker::types::IterBatchPlan;
 
 pub struct UnifiedIterExecution<M: IterwiseUnifiedModel> {
     model: Arc<M>,
@@ -26,6 +27,7 @@ impl<M: IterwiseUnifiedModel> UnifiedIterExecution<M> {
         &self,
         kv_store: &K,
         _requests: &SharedRequests,
+        batch_plan: &IterBatchPlan,
         out: &mut UnifiedArchInput,
     ) {
         let num_partitions = kv_store.num_partitions();
@@ -44,10 +46,12 @@ impl<M: IterwiseUnifiedModel> UnifiedIterExecution<M> {
                     .push((prefix_tokens, chunk_tokens));
                 group.prefill_tokens += chunk_tokens;
             });
-            kv_store.visit_decode_members(partition, |_, current_kv| {
-                group.decode_kv_lens.push(current_kv as u32);
-                group.total_kv_len += current_kv as u32;
-            });
+            if batch_plan.partition_runs_decode(partition) {
+                kv_store.visit_decode_members(partition, |_, current_kv| {
+                    group.decode_kv_lens.push(current_kv as u32);
+                    group.total_kv_len += current_kv as u32;
+                });
+            }
             group.decode_tokens = group.decode_kv_lens.len() as u32;
             group.batch_tokens = group.prefill_tokens + group.decode_tokens;
         }
@@ -89,9 +93,10 @@ where
         &self,
         kv_store: &K,
         requests: &SharedRequests,
+        batch_plan: &IterBatchPlan,
         out: &mut Self::Input,
     ) {
-        self.build_input(kv_store, requests, out);
+        self.build_input(kv_store, requests, batch_plan, out);
     }
 
     fn evaluate_iteration(&mut self, input: &Self::Input, iteration: u64, now: Time) -> Time {

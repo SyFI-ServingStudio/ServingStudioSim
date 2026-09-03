@@ -27,7 +27,7 @@ from profiling.runners.attention.dsa_paged_mqa_logits_decode_reference import (
 from profiling.runners.exceptions import KernelLaunchFailed, ProfilerNotImplemented
 
 _BACKEND = "torch"
-_DEEPGEMM_BACKEND = "vllm_deepgemm_fp8"
+_DEEPGEMM_BACKEND = "deepgemm_fp8"
 _BASE_SPEC = {
     "batch_size": 2,
     "context_len": 65,
@@ -145,7 +145,7 @@ def test_deepgemm_registration_reuses_kind_table_args_family_and_facades():
         "profiling.runners.attention.dsa_paged_mqa_logits_decode"
     )
     assert deepgemm_spec.runner_ref.function_name == (
-        "profile_dsa_paged_mqa_logits_decode_vllm_deepgemm_fp8"
+        "profile_dsa_paged_mqa_logits_decode_deepgemm_fp8"
     )
     assert deepgemm_spec.supports.allows(
         DType.FP8_E4M3,
@@ -159,6 +159,21 @@ def test_deepgemm_registration_reuses_kind_table_args_family_and_facades():
     )
     assert hasattr(perf_api, "get_dsa_paged_mqa_logits_decode_times")
     assert hasattr(perf_api, "count_missing_dsa_paged_mqa_logits_decode")
+
+
+def test_neutral_deepgemm_entry_routes_through_the_pinned_loader(monkeypatch):
+    from profiling.runners.attention import dsa_paged_mqa_logits_decode as runner
+
+    seen = {}
+
+    def common(load_backend, **kwargs):
+        seen["loader"] = load_backend
+        seen["kwargs"] = kwargs
+        return "metrics"
+
+    monkeypatch.setattr(runner, "_profile_dsa_paged_mqa_logits_decode_deepgemm_fp8", common)
+    assert runner.profile_dsa_paged_mqa_logits_decode_deepgemm_fp8(**_BASE_SPEC) == "metrics"
+    assert seen == {"loader": runner._load_deepgemm_backend, "kwargs": _BASE_SPEC}
 
 
 def test_registry_barrel_import_is_lazy():
@@ -195,7 +210,7 @@ def test_runner_refs_resolve_without_importing_frameworks_or_running_jit():
                 "runner = find_kernel_profiler_spec("
                 "'dsa_paged_mqa_logits_decode', 'torch').runner_ref.load(); "
                 "deepgemm_runner = find_kernel_profiler_spec("
-                "'dsa_paged_mqa_logits_decode', 'vllm_deepgemm_fp8'"
+                "'dsa_paged_mqa_logits_decode', 'deepgemm_fp8'"
                 ").runner_ref.load(); "
                 "print(runner.__module__); "
                 "print(runner.__name__); "
@@ -214,7 +229,7 @@ def test_runner_refs_resolve_without_importing_frameworks_or_running_jit():
         "profiling.runners.attention.dsa_paged_mqa_logits_decode",
         "profile_dsa_paged_mqa_logits_decode_torch",
         "profiling.runners.attention.dsa_paged_mqa_logits_decode",
-        "profile_dsa_paged_mqa_logits_decode_vllm_deepgemm_fp8",
+        "profile_dsa_paged_mqa_logits_decode_deepgemm_fp8",
         "False",
         "False",
         "False",
@@ -229,9 +244,9 @@ def test_runner_refs_resolve_without_importing_frameworks_or_running_jit():
         ({"max_model_len": 0}, "must be > 0"),
         ({"context_len": 129}, "must be <= max_model_len"),
         ({"next_n": 2}, "next_n=1"),
-        ({"num_heads": 32}, r"== \(64, 128, 64\)"),
-        ({"head_dim": 64}, r"== \(64, 128, 64\)"),
-        ({"block_size": 32}, r"== \(64, 128, 64\)"),
+        ({"num_heads": 16}, r"num_heads in \[32, 64\]"),
+        ({"head_dim": 64}, r"head_dim == 128"),
+        ({"block_size": 32}, r"block_size == 64"),
         ({"q_dtype": DType.BF16}, "q_dtype=cache_dtype=fp8_e4m3"),
         ({"cache_dtype": DType.BF16}, "q_dtype=cache_dtype=fp8_e4m3"),
         ({"scale_dtype": DType.BF16}, "scale_dtype=weight_dtype"),
@@ -248,6 +263,14 @@ def test_rejects_unsupported_args_before_allocation(overrides, match):
 
     with pytest.raises(ValueError, match=match):
         _validate_args(**(_BASE_SPEC | overrides))
+
+
+def test_accepts_sglang_native_32_head_instantiation():
+    from profiling.runners.attention.dsa_paged_mqa_logits_decode import _validate_args
+
+    validated = _validate_args(**(_BASE_SPEC | {"num_heads": 32}))
+
+    assert validated[4] == 32
 
 
 def test_rejects_nonboolean_clean_logits():
@@ -379,9 +402,9 @@ def test_deepgemm_entry_rejects_invalid_args_before_framework_loading(monkeypatc
         ({"max_model_len": 0}, "must be > 0"),
         ({"context_len": 129}, "must be <= max_model_len"),
         ({"next_n": 2}, "next_n=1"),
-        ({"num_heads": 32}, r"== \(64, 128, 64\)"),
-        ({"head_dim": 64}, r"== \(64, 128, 64\)"),
-        ({"block_size": 32}, r"== \(64, 128, 64\)"),
+        ({"num_heads": 16}, r"num_heads in \[32, 64\]"),
+        ({"head_dim": 64}, r"head_dim == 128"),
+        ({"block_size": 32}, r"block_size == 64"),
         ({"q_dtype": DType.BF16}, "q_dtype=cache_dtype=fp8_e4m3"),
         ({"cache_dtype": DType.BF16}, "q_dtype=cache_dtype=fp8_e4m3"),
         ({"scale_dtype": DType.BF16}, "scale_dtype=weight_dtype"),
@@ -394,7 +417,7 @@ def test_deepgemm_entry_rejects_invalid_args_before_framework_loading(monkeypatc
     ]
     for overrides, match in invalid_cases:
         with pytest.raises(ValueError, match=match):
-            runner.profile_dsa_paged_mqa_logits_decode_vllm_deepgemm_fp8(**(_BASE_SPEC | overrides))
+            runner.profile_dsa_paged_mqa_logits_decode_deepgemm_fp8(**(_BASE_SPEC | overrides))
     assert not loaded
 
 
@@ -586,7 +609,7 @@ def test_deepgemm_launch_failure_is_typed(monkeypatch):
         lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("synthetic launch failure")),
     )
     with pytest.raises(KernelLaunchFailed, match="synthetic launch failure"):
-        runner.profile_dsa_paged_mqa_logits_decode_vllm_deepgemm_fp8(**_BASE_SPEC)
+        runner.profile_dsa_paged_mqa_logits_decode_deepgemm_fp8(**_BASE_SPEC)
 
 
 def test_launch_failure_is_typed(monkeypatch):

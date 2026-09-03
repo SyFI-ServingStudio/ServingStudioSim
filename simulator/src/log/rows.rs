@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use anyhow::{ensure, Result};
 use arrow_array::builder::{
-    Float32Builder, ListBuilder, StringBuilder, StructBuilder, UInt16Builder, UInt32Builder,
-    UInt8Builder,
+    BooleanBuilder, Float32Builder, ListBuilder, StringBuilder, StructBuilder, UInt16Builder,
+    UInt32Builder, UInt8Builder,
 };
 use arrow_array::{
     BooleanArray, Float32Array, Float64Array, Int16Array, ListArray, RecordBatch, StringArray,
@@ -91,6 +91,11 @@ pub struct RequestSloEntry {
     /// independently from runtime prefill work so conservation can verify
     /// `hit + computed = fresh + declared` instead of deriving its own input.
     pub fresh_prompt_tokens: u32,
+    pub retraction_count: u32,
+    pub reprocessed_prefill_output_tokens_before: Vec<u32>,
+    pub reprocessed_prefill_prefix_hit_tokens: Vec<u32>,
+    pub reprocessed_prefill_processed_tokens: Vec<u32>,
+    pub reprocessed_prefill_completed: Vec<bool>,
     // Multi-round identity/grouping columns are deliberately NOT carried here
     // today. The prefix fields above are per-request requirement/observation
     // facts and do not imply a multi-round lifecycle.
@@ -661,6 +666,7 @@ pub(crate) fn slo_to_record_batch(
     let prefix_cache_hit_tokens: Vec<Option<u32>> =
         entries.iter().map(|e| e.prefix_cache_hit_tokens).collect();
     let fresh_prompt_tokens: Vec<u32> = entries.iter().map(|e| e.fresh_prompt_tokens).collect();
+    let retraction_count: Vec<u32> = entries.iter().map(|e| e.retraction_count).collect();
     let ttft: Vec<Option<f32>> = entries.iter().map(|e| e.ttft_ms).collect();
     let finish_decode: Vec<Option<f32>> = entries.iter().map(|e| e.finish_decode_time_ms).collect();
     let tpot_mean: Vec<Option<f32>> = entries.iter().map(|e| e.tpot_mean_ms).collect();
@@ -734,6 +740,41 @@ pub(crate) fn slo_to_record_batch(
     let stage_pool_ids = stage_pool_b.finish();
     let stage_worker_ids = stage_worker_b.finish();
 
+    let mut reprocessed_output_b = ListBuilder::new(UInt32Builder::new())
+        .with_field(Arc::new(Field::new("item", DataType::UInt32, false)));
+    let mut reprocessed_hit_b = ListBuilder::new(UInt32Builder::new())
+        .with_field(Arc::new(Field::new("item", DataType::UInt32, false)));
+    let mut reprocessed_tokens_b = ListBuilder::new(UInt32Builder::new())
+        .with_field(Arc::new(Field::new("item", DataType::UInt32, false)));
+    let mut reprocessed_completed_b = ListBuilder::new(BooleanBuilder::new())
+        .with_field(Arc::new(Field::new("item", DataType::Boolean, false)));
+    for entry in entries {
+        let episode_count = entry.reprocessed_prefill_output_tokens_before.len();
+        ensure!(
+            entry.reprocessed_prefill_prefix_hit_tokens.len() == episode_count
+                && entry.reprocessed_prefill_processed_tokens.len() == episode_count
+                && entry.reprocessed_prefill_completed.len() == episode_count,
+            "request {} has unequal reprocessed-prefill episode columns",
+            entry.request_id,
+        );
+        for &value in &entry.reprocessed_prefill_output_tokens_before {
+            reprocessed_output_b.values().append_value(value);
+        }
+        for &value in &entry.reprocessed_prefill_prefix_hit_tokens {
+            reprocessed_hit_b.values().append_value(value);
+        }
+        for &value in &entry.reprocessed_prefill_processed_tokens {
+            reprocessed_tokens_b.values().append_value(value);
+        }
+        for &value in &entry.reprocessed_prefill_completed {
+            reprocessed_completed_b.values().append_value(value);
+        }
+        reprocessed_output_b.append(true);
+        reprocessed_hit_b.append(true);
+        reprocessed_tokens_b.append(true);
+        reprocessed_completed_b.append(true);
+    }
+
     Ok(RecordBatch::try_new(
         request_slo_schema(),
         vec![
@@ -760,6 +801,11 @@ pub(crate) fn slo_to_record_batch(
             Arc::new(Float32Array::from(declared_ttft_slo)),
             Arc::new(Float32Array::from(declared_tpot_slo)),
             Arc::new(Float32Array::from(declared_e2e_slo)),
+            Arc::new(UInt32Array::from(retraction_count)),
+            Arc::new(reprocessed_output_b.finish()),
+            Arc::new(reprocessed_hit_b.finish()),
+            Arc::new(reprocessed_tokens_b.finish()),
+            Arc::new(reprocessed_completed_b.finish()),
         ],
     )?)
 }
@@ -873,6 +919,11 @@ mod tests {
             declared_prefix_tokens: 0,
             prefix_cache_hit_tokens: Some(0),
             fresh_prompt_tokens: 0,
+            retraction_count: 0,
+            reprocessed_prefill_output_tokens_before: Vec::new(),
+            reprocessed_prefill_prefix_hit_tokens: Vec::new(),
+            reprocessed_prefill_processed_tokens: Vec::new(),
+            reprocessed_prefill_completed: Vec::new(),
         }
     }
 
@@ -1143,6 +1194,72 @@ mod tests {
         assert!(hit.is_null(0), "never-resolved admission must remain null");
         assert_eq!(hit.value(1), 0, "a resolved cold cache is a real miss");
         assert_eq!(hit.value(2), 60, "partial hits preserve the token count");
+    }
+
+    #[test]
+    fn slo_reprocessed_prefill_episodes_round_trip_as_parallel_lists() {
+        let mut entry = slo_entry(0, vec![1.0, 2.0, 3.0]);
+        entry.retraction_count = 2;
+        entry.reprocessed_prefill_output_tokens_before = vec![3, 9];
+        entry.reprocessed_prefill_prefix_hit_tokens = vec![0, 4];
+        entry.reprocessed_prefill_processed_tokens = vec![35, 40];
+        entry.reprocessed_prefill_completed = vec![true, false];
+
+        let batch = slo_to_record_batch(&[entry], false, false).unwrap();
+        let count = batch
+            .column_by_name("retraction_count")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
+        assert_eq!(count.value(0), 2);
+
+        let u32_list = |name: &str| {
+            batch
+                .column_by_name(name)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .unwrap()
+                .value(0)
+        };
+        let values = u32_list("reprocessed_prefill_output_tokens_before");
+        assert_eq!(
+            values
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .unwrap()
+                .values(),
+            &[3, 9]
+        );
+        let values = u32_list("reprocessed_prefill_prefix_hit_tokens");
+        assert_eq!(
+            values
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .unwrap()
+                .values(),
+            &[0, 4]
+        );
+        let values = u32_list("reprocessed_prefill_processed_tokens");
+        assert_eq!(
+            values
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .unwrap()
+                .values(),
+            &[35, 40]
+        );
+        let completed = batch
+            .column_by_name("reprocessed_prefill_completed")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap()
+            .value(0);
+        let completed = completed.as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert!(completed.value(0));
+        assert!(!completed.value(1));
     }
 
     #[test]

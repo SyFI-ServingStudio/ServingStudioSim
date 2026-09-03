@@ -23,6 +23,7 @@ from profiling.runners.exceptions import ProfilerNotImplemented
 
 _TORCH_BACKEND = "torch"
 _VLLM_BACKEND = "vllm_cuda"
+_SGLANG_BACKEND = "sglang_cuda"
 
 
 def test_args_field_order_and_dtype_coercion():
@@ -62,7 +63,7 @@ def test_kind_table_backend_runner_and_support_contract():
     spec = find_kernel_profiler_spec(KIND, _TORCH_BACKEND)
 
     assert KIND == "mla_cache_append"
-    assert known_backends(KIND) == [_TORCH_BACKEND, _VLLM_BACKEND]
+    assert known_backends(KIND) == [_TORCH_BACKEND, _VLLM_BACKEND, _SGLANG_BACKEND]
     assert spec.kernel_kind == KIND
     assert spec.table_name == KIND
     assert spec.args_schema is MlaCacheAppendArgs

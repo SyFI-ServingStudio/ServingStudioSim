@@ -12,7 +12,9 @@ use crate::worker::execution::{IterModelExecution, UnifiedIterExecution};
 use crate::worker::iter_worker::IterWorker;
 use crate::worker::kv::{FullAttnKv, HybridGdnKv, IterWorkerKv};
 use crate::worker::shared::context::WorkerContext;
-use crate::worker::types::{BatchFsmState, IterCursor, WorkerFsmState, WorkerStatus};
+use crate::worker::types::{
+    BatchFsmState, IterBatchPlan, IterCursor, WorkerFsmState, WorkerStatus,
+};
 
 struct IterationFsm {
     worker_state: WorkerFsmState,
@@ -44,6 +46,7 @@ where
     admission: A,
     execution: E,
     input: E::Input,
+    batch_plan: IterBatchPlan,
     iteration_fsm: IterationFsm,
 }
 
@@ -87,6 +90,7 @@ where
             admission,
             execution,
             input: Default::default(),
+            batch_plan: IterBatchPlan::default(),
             iteration_fsm: IterationFsm::new(),
         }
     }
@@ -125,6 +129,7 @@ where
                         self.admission.complete_iteration(
                             &mut self.kv_store,
                             &self.context,
+                            &self.batch_plan,
                             events,
                             now,
                         );
@@ -140,7 +145,7 @@ where
     fn form_batch(&mut self, now: Time) -> bool {
         if !self
             .admission
-            .form_batch(&mut self.kv_store, &self.context, now)
+            .form_batch(&mut self.kv_store, &self.context, &mut self.batch_plan, now)
         {
             return false;
         }
@@ -152,6 +157,7 @@ where
         self.execution.build_iteration_input(
             &self.kv_store,
             &self.context.requests,
+            &self.batch_plan,
             &mut self.input,
         );
         let cost = self.execution.evaluate_iteration(
@@ -230,14 +236,16 @@ mod tests {
 
     use super::*;
     use crate::arch::contract::IterwiseUnifiedModel;
-    use crate::common::{PoolId, SessionInput, SharedRequests};
+    use crate::common::{PoolId, SessionInput, SharedRequests, UnifiedStage};
     use crate::test_helpers::{shared_with, test_cluster, FakeModel};
     use crate::worker::admission::{FifoOrder, ShortestJobFirst};
+    use crate::worker::config::BoundedFutureKvAdmissionConfig;
     use crate::worker::kv::{PrefixCacheConfig, PrefixKv};
     use crate::worker::types::{WorkerConfig, WorkerEventCommon, WorkerMsgCommon};
     use crate::worker::workers::iter::{
         build_barebone_worker, build_chunked_prefill_worker, build_hp_worker,
     };
+    use crate::worker::{BatchPolicy, DecodeRetractionPolicy, KvAdmissionConfig};
 
     fn assert_iter_worker<W: IterWorker>() {}
 
@@ -574,12 +582,14 @@ mod tests {
         worker.execution.build_iteration_input(
             &worker.kv_store,
             &worker.context.requests,
+            &worker.batch_plan,
             &mut first_input,
         );
         assert_eq!(first_input.groups[0].prefill_chunk_pairs, [(0, 8_192)]);
         worker.admission.complete_iteration(
             &mut worker.kv_store,
             &worker.context,
+            &worker.batch_plan,
             &mut Vec::new(),
             Time::from_ms(1.0),
         );
@@ -599,12 +609,14 @@ mod tests {
         worker.execution.build_iteration_input(
             &worker.kv_store,
             &worker.context.requests,
+            &worker.batch_plan,
             &mut second_input,
         );
         assert_eq!(second_input.groups[0].prefill_chunk_pairs, [(8_192, 8_192)]);
         worker.admission.complete_iteration(
             &mut worker.kv_store,
             &worker.context,
+            &worker.batch_plan,
             &mut Vec::new(),
             Time::from_ms(2.0),
         );
@@ -618,6 +630,264 @@ mod tests {
             .telemetry
             .first_output_time
             .is_some());
+    }
+
+    fn chunked_worker(
+        store: SharedRequests,
+        batch_policy: BatchPolicy,
+        max_batch_tokens: u32,
+    ) -> ChunkedPrefillWorker<FakeModel> {
+        build_chunked_prefill_worker(
+            WorkerId(0),
+            "main",
+            Arc::new(FakeModel::for_ms(1.0)),
+            store,
+            WorkerConfig {
+                max_batch_tokens: Some(max_batch_tokens),
+                batch_policy,
+                ..WorkerConfig::default()
+            },
+            None,
+            PoolId(0),
+            "test-gpu",
+            test_cluster(),
+        )
+    }
+
+    fn bounded_future_config(max_batch_tokens: u32, attn_kv_tokens: u64) -> WorkerConfig {
+        WorkerConfig {
+            attn_kv_bytes: attn_kv_tokens,
+            max_batch_tokens: Some(max_batch_tokens),
+            batch_policy: BatchPolicy::SeparatePrefillPriority,
+            kv_admission: KvAdmissionConfig::BoundedFuture(BoundedFutureKvAdmissionConfig {
+                page_size: 1,
+                max_future_tokens: 4,
+                initial_new_token_ratio: 0.7,
+                minimum_new_token_ratio: 0.098,
+                new_token_ratio_decay_steps: 600,
+                retract_decode_steps: 2,
+                retraction_policy: DecodeRetractionPolicy::Length,
+            }),
+            ..WorkerConfig::default()
+        }
+    }
+
+    fn form_chunked_input(
+        worker: &mut ChunkedPrefillWorker<FakeModel>,
+        now: Time,
+    ) -> crate::arch::UnifiedArchInput {
+        assert!(worker.form_batch(now));
+        let mut input = Default::default();
+        worker.execution.build_iteration_input(
+            &worker.kv_store,
+            &worker.context.requests,
+            &worker.batch_plan,
+            &mut input,
+        );
+        input
+    }
+
+    fn complete_chunked_iteration(worker: &mut ChunkedPrefillWorker<FakeModel>, now: Time) {
+        worker.admission.complete_iteration(
+            &mut worker.kv_store,
+            &worker.context,
+            &worker.batch_plan,
+            &mut Vec::new(),
+            now,
+        );
+    }
+
+    #[test]
+    fn separate_prefill_priority_suspends_and_then_resumes_resident_decode() {
+        let store = shared_with(&[(0, 4, 5), (1, 16, 1)]);
+        let mut worker = chunked_worker(Rc::clone(&store), BatchPolicy::SeparatePrefillPriority, 8);
+
+        // Establish request 0 as a resident decode before request 1 arrives.
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(0)));
+        let first = form_chunked_input(&mut worker, Time::ZERO);
+        assert_eq!(first.groups[0].prefill_chunk_pairs, [(0, 4)]);
+        assert_eq!(first.groups[0].decode_tokens, 0);
+        complete_chunked_iteration(&mut worker, Time::from_ms(1.0));
+        let output_before_prefill = store.borrow()[RequestId(0)].progress.output_tokens_emitted;
+        assert_eq!(output_before_prefill, 1);
+
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(1)));
+        for (step, prefix) in [(2, 0), (3, 8)] {
+            let input = form_chunked_input(&mut worker, Time::from_ms(step as f64));
+            assert_eq!(input.groups[0].prefill_chunk_pairs, [(prefix, 8)]);
+            assert_eq!(
+                input.groups[0].decode_tokens, 0,
+                "a SGLang-style prefill iteration excludes resident decode"
+            );
+            complete_chunked_iteration(&mut worker, Time::from_ms((step + 1) as f64));
+            assert_eq!(
+                store.borrow()[RequestId(0)].progress.output_tokens_emitted,
+                output_before_prefill,
+                "excluded decode emits no token while retaining its lifecycle state"
+            );
+        }
+
+        let decode = form_chunked_input(&mut worker, Time::from_ms(4.0));
+        assert!(decode.groups[0].prefill_chunk_pairs.is_empty());
+        assert_eq!(decode.groups[0].decode_tokens, 1);
+        complete_chunked_iteration(&mut worker, Time::from_ms(5.0));
+        assert_eq!(
+            store.borrow()[RequestId(0)].progress.output_tokens_emitted,
+            output_before_prefill + 1,
+            "resident decode resumes when no prefill batch can run"
+        );
+    }
+
+    #[test]
+    fn mix_preserves_shared_prefill_decode_budget_and_progress() {
+        let store = shared_with(&[(0, 4, 5), (1, 16, 1)]);
+        let mut worker = chunked_worker(Rc::clone(&store), BatchPolicy::Mix, 8);
+
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(0)));
+        let _ = form_chunked_input(&mut worker, Time::ZERO);
+        complete_chunked_iteration(&mut worker, Time::from_ms(1.0));
+        let output_before_mix = store.borrow()[RequestId(0)].progress.output_tokens_emitted;
+
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(1)));
+        let mixed = form_chunked_input(&mut worker, Time::from_ms(2.0));
+        assert_eq!(mixed.groups[0].prefill_chunk_pairs, [(0, 7)]);
+        assert_eq!(mixed.groups[0].decode_tokens, 1);
+        assert_eq!(mixed.groups[0].batch_tokens, 8);
+        complete_chunked_iteration(&mut worker, Time::from_ms(3.0));
+        assert_eq!(
+            store.borrow()[RequestId(0)].progress.output_tokens_emitted,
+            output_before_mix + 1
+        );
+    }
+
+    #[test]
+    fn bounded_future_retraction_requeues_reprefills_and_preserves_ttft() {
+        // Each request needs 23 KV tokens by completion and therefore fits by
+        // itself in 24 tokens. The source-style bounded estimate admits both,
+        // then physical decode growth forces the later equal-length request to
+        // retract. This exercises the real worker FSM rather than a KV helper.
+        let store = shared_with(&[(0, 4, 20), (1, 4, 20)]);
+        let mut worker = build_chunked_prefill_worker(
+            WorkerId(0),
+            "main",
+            Arc::new(FakeModel::for_ms(1.0)),
+            Rc::clone(&store),
+            bounded_future_config(64, 24),
+            None,
+            PoolId(0),
+            "test-gpu",
+            test_cluster(),
+        );
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(0)));
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(1)));
+
+        let mut events = Vec::new();
+        for step in 0..100 {
+            worker.tick(Time::from_ms(step as f64), &mut events);
+            if events.len() == 2 && worker.status().active_requests == 0 {
+                break;
+            }
+        }
+
+        assert_eq!(events.len(), 2, "both requests must drain after requeue");
+        let requests = store.borrow();
+        let kept = &requests[RequestId(0)];
+        let retracted = &requests[RequestId(1)];
+        assert!(kept.lifecycle.completed && retracted.lifecycle.completed);
+        assert_eq!(kept.progress.output_tokens_emitted, 20);
+        assert_eq!(retracted.progress.output_tokens_emitted, 20);
+        assert_eq!(kept.telemetry.retraction_count, 0);
+        assert_eq!(retracted.telemetry.retraction_count, 1);
+        assert_eq!(
+            retracted.telemetry.first_output_time,
+            Some(Time::from_ms(1.0))
+        );
+        assert_eq!(retracted.telemetry.reprocessed_prefills.len(), 1);
+        let episode = retracted.telemetry.reprocessed_prefills[0];
+        assert_eq!(episode.output_tokens_before, 9);
+        assert_eq!(episode.prefix_cache_hit_tokens, 0);
+        assert_eq!(episode.prefill_tokens_processed, 13);
+        assert!(episode.completed);
+        assert_eq!(
+            retracted
+                .lifecycle
+                .stage_log
+                .iter()
+                .map(|event| event.code)
+                .collect::<Vec<_>>(),
+            vec![
+                UnifiedStage::Pending as u16,
+                UnifiedStage::Prefill as u16,
+                UnifiedStage::Decode as u16,
+                UnifiedStage::Pending as u16,
+                UnifiedStage::Prefill as u16,
+                UnifiedStage::Decode as u16,
+                UnifiedStage::Done as u16,
+            ],
+            "retraction must be an observable decode→queue→prefill→decode episode"
+        );
+    }
+
+    #[test]
+    fn bounded_future_ratio_resets_after_the_worker_becomes_fully_idle() {
+        let store = shared_with(&[(0, 4, 3)]);
+        let mut config = bounded_future_config(64, 24);
+        config.kv_admission = KvAdmissionConfig::BoundedFuture(BoundedFutureKvAdmissionConfig {
+            new_token_ratio_decay_steps: 2,
+            ..match config.kv_admission {
+                KvAdmissionConfig::BoundedFuture(config) => config,
+                KvAdmissionConfig::FullFootprint => unreachable!(),
+            }
+        });
+        let mut worker = build_chunked_prefill_worker(
+            WorkerId(0),
+            "main",
+            Arc::new(FakeModel::for_ms(1.0)),
+            Rc::clone(&store),
+            config,
+            None,
+            PoolId(0),
+            "test-gpu",
+            test_cluster(),
+        );
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(0)));
+
+        let mut events = Vec::new();
+        worker.tick(Time::ZERO, &mut events);
+        worker.tick(Time::from_ms(1.0), &mut events);
+        assert!(
+            worker.admission.current_new_token_ratio() < 0.7,
+            "the first successful decode-capacity check must decay the ratio"
+        );
+        for step in 2..10 {
+            worker.tick(Time::from_ms(step as f64), &mut events);
+        }
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(worker.status().active_requests, 0);
+        assert_eq!(worker.status().queued_requests, 0);
+        assert_eq!(worker.admission.current_new_token_ratio(), 0.7);
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "bounded-future KV admission is validated only for one attention partition"
+    )]
+    fn bounded_future_rejects_unaudited_multi_partition_composition() {
+        let _ = build_chunked_prefill_worker(
+            WorkerId(0),
+            "main",
+            Arc::new(FakeModel {
+                ms: 1.0,
+                dp_groups: 2,
+            }),
+            shared_with(&[]),
+            bounded_future_config(64, 24),
+            None,
+            PoolId(0),
+            "test-gpu",
+            test_cluster(),
+        );
     }
 
     #[test]
@@ -686,10 +956,13 @@ mod tests {
     #[test]
     fn hp_input_has_one_group_per_partition() {
         let worker = hp_worker(shared_with(&[]), 3, WorkerConfig::default());
+        let mut batch_plan = IterBatchPlan::default();
+        batch_plan.reset_decode_participation(3, true);
         let mut input = Default::default();
         worker.execution.build_iteration_input(
             &worker.kv_store,
             &worker.context.requests,
+            &batch_plan,
             &mut input,
         );
         assert_eq!(input.groups.len(), 3);

@@ -193,6 +193,7 @@ def write_launch_metadata(
     cfg: ProfileConfig,
     fork_python: str,
     profiler_provenance: dict[str, str] | None,
+    runtime_provenance: dict | None,
 ) -> None:
     """Persist argv + selected env + fork git state next to the server log.
 
@@ -206,15 +207,17 @@ def write_launch_metadata(
         "PATH",
         "LD_LIBRARY_PATH",
     )
+    runtime_env = cfg.python_runtime.environment if cfg.python_runtime is not None else {}
     metadata = {
         "schema_version": 1,
         "name": cfg.name,
         "argv": launch_argv,
         "server_argv": server_argv,
-        "env": {k: env[k] for k in keep if k in env},
+        "env": {key: env[key] for key in (*keep, *runtime_env) if key in env},
         "server_config": cfg.server.__dict__,
         "nsys_config": cfg.nsys.__dict__,
         "nsys_profiler": profiler_provenance,
+        "python_runtime": runtime_provenance,
         "fork_python": fork_python,
         "fork_git": _git_info(VLLM_SOURCE_ROOT),
     }

@@ -476,6 +476,31 @@ fn slo_entry(id: RequestId, now: Time, rec: &RequestRecord) -> RequestSloEntry {
         declared_prefix_tokens: rec.request.definition.session.declared_prefix_tokens(),
         prefix_cache_hit_tokens: rec.telemetry.prefix_cache_hit_tokens,
         fresh_prompt_tokens: rec.request.definition.prompt_tokens,
+        retraction_count: rec.telemetry.retraction_count,
+        reprocessed_prefill_output_tokens_before: rec
+            .telemetry
+            .reprocessed_prefills
+            .iter()
+            .map(|episode| episode.output_tokens_before)
+            .collect(),
+        reprocessed_prefill_prefix_hit_tokens: rec
+            .telemetry
+            .reprocessed_prefills
+            .iter()
+            .map(|episode| episode.prefix_cache_hit_tokens)
+            .collect(),
+        reprocessed_prefill_processed_tokens: rec
+            .telemetry
+            .reprocessed_prefills
+            .iter()
+            .map(|episode| episode.prefill_tokens_processed)
+            .collect(),
+        reprocessed_prefill_completed: rec
+            .telemetry
+            .reprocessed_prefills
+            .iter()
+            .map(|episode| episode.completed)
+            .collect(),
     }
 }
 

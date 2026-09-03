@@ -15,7 +15,7 @@ from typing import Any
 from profiling.db.args import DType
 from profiling.profilers.energy import Energy
 from profiling.profilers.timer import Timer
-from profiling.runners.exceptions import KernelLaunchFailed, ProfilerNotImplemented
+from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
 
 _NUM_SEQUENCES = 1
@@ -26,6 +26,8 @@ _SPAN_MODE = "single_causal_tail"
 _REQUIRED_GPU = "NVIDIA H200"
 _VLLM_SUPPORTED_GPUS = ("NVIDIA H200", "NVIDIA B200")
 _VLLM_KERNEL_NAME = "topKPerRowPrefill"
+_SGLANG_SUPPORTED_GPUS = ("NVIDIA B200",)
+_SGLANG_KERNEL_NAME = "topk_transform_prefill_kernel"
 
 
 @dataclass(frozen=True)
@@ -251,6 +253,73 @@ def _topk_indices(scores: Any, top_k: int, index_dtype: Any) -> Any:
     return scores.topk(top_k, dim=1, largest=True, sorted=True).indices.to(dtype=index_dtype)
 
 
+def _load_sglang_cuda_backend() -> tuple[Any, Any]:
+    try:
+        import torch
+        from sgl_kernel import fast_topk_transform_fused
+    except (ImportError, OSError, RuntimeError) as exc:
+        raise ProfilerNotImplemented(
+            "dsa_topk_prefill:sglang_cuda requires the SGLang environment"
+        ) from exc
+    if not callable(fast_topk_transform_fused):
+        raise ProfilerNotImplemented("sgl_kernel.fast_topk_transform_fused is not callable")
+    return torch, fast_topk_transform_fused
+
+
+def _validate_sglang_cuda_device(torch: Any) -> None:
+    if not torch.cuda.is_available():
+        raise ProfilerNotImplemented("CUDA is required for dsa_topk_prefill:sglang_cuda")
+    gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
+    if gpu_name not in _SGLANG_SUPPORTED_GPUS:
+        raise ProfilerNotImplemented(
+            "dsa_topk_prefill:sglang_cuda is verified only on "
+            f"{' or '.join(_SGLANG_SUPPORTED_GPUS)}, got {gpu_name}"
+        )
+
+
+@dataclass(frozen=True)
+class _SglangPagedExtras:
+    lengths: Any
+    src_page_table: Any
+    cu_seqlens_q: Any
+
+
+def _build_sglang_paged_extras(
+    torch: Any,
+    operands: _DsaTopkPrefillOperands,
+    *,
+    num_queries: int,
+    num_keys: int,
+    device: str,
+) -> _SglangPagedExtras:
+    lengths = operands.row_ends - operands.row_starts
+    src_page_table = torch.arange(num_keys, dtype=torch.int32, device=device).unsqueeze(0)
+    cu_seqlens_q = torch.tensor([0, num_queries], dtype=torch.int32, device=device)
+    return _SglangPagedExtras(
+        lengths=lengths.contiguous(),
+        src_page_table=src_page_table,
+        cu_seqlens_q=cu_seqlens_q,
+    )
+
+
+def _launch_sglang_topk(
+    callable_: Any,
+    operands: _DsaTopkPrefillOperands,
+    extras: _SglangPagedExtras,
+    *,
+    top_k: int,
+) -> Any:
+    """Forward the exact public SGLang wrapper arguments used by serving."""
+    return callable_(
+        score=operands.logits,
+        lengths=extras.lengths,
+        page_table_size_1=extras.src_page_table,
+        cu_seqlens_q=extras.cu_seqlens_q,
+        topk=top_k,
+        row_starts=operands.row_starts,
+    )
+
+
 def _logical_bytes(
     *,
     num_queries: int,
@@ -420,3 +489,86 @@ def profile_dsa_topk_prefill_vllm_cuda(
         )
     except (RuntimeError, OSError) as exc:
         raise KernelLaunchFailed(str(exc)) from exc
+
+
+def profile_dsa_topk_prefill_sglang_cuda(
+    num_queries: int,
+    num_keys: int,
+    num_sequences: int,
+    top_k: int,
+    logits_row_stride: int,
+    logits_dtype: DType | str,
+    index_dtype: str,
+    span_mode: str,
+) -> ComputeMetrics:
+    """Profile SGLang's fused prefill top-k and page-table transform."""
+    (
+        num_queries,
+        num_keys,
+        _num_sequences,
+        top_k,
+        logits_row_stride,
+        _logits_dtype,
+        _index_dtype,
+        _span_mode,
+    ) = _validate_args(
+        num_queries,
+        num_keys,
+        num_sequences,
+        top_k,
+        logits_row_stride,
+        logits_dtype,
+        index_dtype,
+        span_mode,
+    )
+    torch, fast_topk_transform_fused = _load_sglang_cuda_backend()
+    _validate_sglang_cuda_device(torch)
+    try:
+        operands = _build_operands(
+            torch,
+            num_queries=num_queries,
+            num_keys=num_keys,
+            top_k=top_k,
+            logits_row_stride=logits_row_stride,
+            device="cuda",
+        )
+        extras = _build_sglang_paged_extras(
+            torch,
+            operands,
+            num_queries=num_queries,
+            num_keys=num_keys,
+            device="cuda",
+        )
+
+        def kernel() -> Any:
+            return _launch_sglang_topk(
+                fast_topk_transform_fused,
+                operands,
+                extras,
+                top_k=top_k,
+            )
+
+        kernel()
+        torch.cuda.synchronize()
+        time_ms = Timer.cupti(kernel, kernel_name=_SGLANG_KERNEL_NAME)
+        energy_j = Energy.perf(kernel, warmup=5, per_iter_time_ms=time_ms)
+    except torch.OutOfMemoryError as exc:
+        raise OOMError("dsa_topk_prefill:sglang_cuda ran out of CUDA memory") from exc
+    except (RuntimeError, OSError) as exc:
+        raise KernelLaunchFailed(str(exc)) from exc
+
+    logical_bytes = (
+        _logical_bytes(
+            num_queries=num_queries,
+            num_keys=num_keys,
+            top_k=top_k,
+        )
+        + 4 * num_queries * top_k
+    )
+    bandwidth_gbps = logical_bytes / (time_ms / 1000.0) / 1e9 if time_ms > 0 else 0.0
+    return ComputeMetrics(
+        time_ms=float(time_ms),
+        tflops=0.0,
+        memory_bandwidth_gbps=float(bandwidth_gbps),
+        energy_j=float(energy_j),
+    )

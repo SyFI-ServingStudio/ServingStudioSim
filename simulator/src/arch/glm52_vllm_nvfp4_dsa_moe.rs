@@ -43,19 +43,18 @@ use crate::timing::{
     LeafMetrics, PerfApiBridge, Probe, SlotInput,
 };
 use crate::worklet::{
-    Glm52MoeRouterLocalWorklet, Glm52MoeRouterLocalWorkletConfig, Glm52MoeRouterLocalWorkletInput,
+    Glm52DenseFfnLocalWorklet, Glm52DenseFfnLocalWorkletConfig, Glm52DenseFfnLocalWorkletInput,
+    Glm52DenseFfnLocalWorkletResolved, Glm52MoeRouterLocalWorklet,
+    Glm52MoeRouterLocalWorkletConfig, Glm52MoeRouterLocalWorkletInput,
     Glm52MoeRouterLocalWorkletResolved, Glm52MtpHeadLocalWorklet, Glm52MtpHeadLocalWorkletConfig,
     Glm52MtpHeadLocalWorkletInput, Glm52MtpHeadLocalWorkletResolved, Glm52MtpPreludeLocalWorklet,
     Glm52MtpPreludeLocalWorkletConfig, Glm52MtpPreludeLocalWorkletInput,
-    Glm52MtpPreludeLocalWorkletResolved, VllmGlm52DenseFfnLocalWorklet,
-    VllmGlm52DenseFfnLocalWorkletConfig, VllmGlm52DenseFfnLocalWorkletInput,
-    VllmGlm52DenseFfnLocalWorkletResolved, VllmGlm52DsaAttnLocalDecodeInput,
+    Glm52MtpPreludeLocalWorkletResolved, Glm52SharedExpertLocalWorklet,
+    Glm52SharedExpertLocalWorkletConfig, Glm52SharedExpertLocalWorkletInput,
+    Glm52SharedExpertLocalWorkletResolved, Nvfp4MoeLocalWorklet, Nvfp4MoeLocalWorkletConfig,
+    Nvfp4MoeLocalWorkletInput, Nvfp4MoeLocalWorkletResolved, VllmGlm52DsaAttnLocalDecodeInput,
     VllmGlm52DsaAttnLocalWorklet, VllmGlm52DsaAttnLocalWorkletConfig,
     VllmGlm52DsaAttnLocalWorkletInput, VllmGlm52DsaAttnLocalWorkletResolved,
-    VllmGlm52SharedExpertLocalWorklet, VllmGlm52SharedExpertLocalWorkletConfig,
-    VllmGlm52SharedExpertLocalWorkletInput, VllmGlm52SharedExpertLocalWorkletResolved,
-    VllmNvfp4MoeLocalWorklet, VllmNvfp4MoeLocalWorkletConfig, VllmNvfp4MoeLocalWorkletInput,
-    VllmNvfp4MoeLocalWorkletResolved,
 };
 
 const ARCH_KIND: &str = "glm52_vllm_nvfp4_dsa_moe";
@@ -112,7 +111,7 @@ const DENSE_FP8_QUANT_BACKENDS: &[&str] = &["vllm_cuda"];
 const Q_ABSORB_BACKENDS: &[&str] = &["torch_mla_q_absorb_glm52"];
 const V_UP_BACKENDS: &[&str] = &["torch_mla_v_up_glm52"];
 const INDEX_CACHE_AND_TOPK_BACKENDS: &[&str] = &["vllm_cuda"];
-const INDEX_LOGITS_BACKENDS: &[&str] = &["vllm_deepgemm_fp8"];
+const INDEX_LOGITS_BACKENDS: &[&str] = &["deepgemm_fp8"];
 const SPARSE_ATTN_BACKENDS: &[&str] = &["flashinfer_trtllm_fp8"];
 const MLA_APPEND_BACKENDS: &[&str] = &["vllm_cuda"];
 const NVFP4_QUANT_BACKENDS: &[&str] = &["vllm_cuda"];
@@ -159,15 +158,15 @@ pub struct Glm52VllmNvfp4DsaMoeConfigs {
     pub parallel: Glm52VllmNvfp4DsaMoeParallel,
     pub mtp_mode: Glm52MtpMode,
     pub dense_full_index_attention: VllmGlm52DsaAttnLocalWorkletConfig,
-    pub dense_ffn: VllmGlm52DenseFfnLocalWorkletConfig,
+    pub dense_ffn: Glm52DenseFfnLocalWorkletConfig,
     pub initial_shared_attention: VllmGlm52DsaAttnLocalWorkletConfig,
     pub cycle_full_attention: VllmGlm52DsaAttnLocalWorkletConfig,
     pub cycle_shared_attention: VllmGlm52DsaAttnLocalWorkletConfig,
     pub sparse_router: Glm52MoeRouterLocalWorkletConfig,
-    pub shared_expert: VllmGlm52SharedExpertLocalWorkletConfig,
+    pub shared_expert: Glm52SharedExpertLocalWorkletConfig,
     /// One identity-free active-count-ranked workload per TP/EP rank. Each
     /// worklet owns the entire physical TRTLLM NVFP4 fused-MoE callable.
-    pub nvfp4_moe: Vec<VllmNvfp4MoeLocalWorkletConfig>,
+    pub nvfp4_moe: Vec<Nvfp4MoeLocalWorkletConfig>,
     pub tp_allreduce: AllReduceKernelConfig,
     pub tp_allreduce_fusion: AllReduceFusionKernelConfig,
     pub tp_allreduce_fused: AllReduceResidualRmsNormKernelConfig,
@@ -183,13 +182,13 @@ pub struct Glm52VllmNvfp4DsaMoeConfigs {
 pub struct Glm52VllmNvfp4DsaMoeResolved {
     pub raw_cfg: Glm52VllmNvfp4DsaMoeConfigs,
     pub dense_full_index_attention: VllmGlm52DsaAttnLocalWorkletResolved,
-    pub dense_ffn: VllmGlm52DenseFfnLocalWorkletResolved,
+    pub dense_ffn: Glm52DenseFfnLocalWorkletResolved,
     pub initial_shared_attention: VllmGlm52DsaAttnLocalWorkletResolved,
     pub cycle_full_attention: VllmGlm52DsaAttnLocalWorkletResolved,
     pub cycle_shared_attention: VllmGlm52DsaAttnLocalWorkletResolved,
     pub sparse_router: Glm52MoeRouterLocalWorkletResolved,
-    pub shared_expert: VllmGlm52SharedExpertLocalWorkletResolved,
-    pub nvfp4_moe: Vec<VllmNvfp4MoeLocalWorkletResolved>,
+    pub shared_expert: Glm52SharedExpertLocalWorkletResolved,
+    pub nvfp4_moe: Vec<Nvfp4MoeLocalWorkletResolved>,
     pub tp_allreduce: AllReduceKernelConfig,
     pub tp_allreduce_fusion: AllReduceFusionKernelConfig,
     pub tp_allreduce_fused: AllReduceResidualRmsNormKernelConfig,
@@ -239,6 +238,7 @@ fn attention_config(
         sparse_attention_backends: SPARSE_ATTN_BACKENDS.to_vec(),
         sparse_mla_cache_append_backends: MLA_APPEND_BACKENDS.to_vec(),
         sparse_elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
+        sparse_index_remap_backends: vec!["vllm_triton"],
         gpu_name: parallel.gpu_name.clone(),
         hidden_dim: model.hidden_dim.clone(),
         num_attention_heads: model.num_attention_heads.clone(),
@@ -282,10 +282,10 @@ fn attention_config(
         sparse_attention_cache_dtype: DType::Fp8E4m3,
         sparse_attention_output_dtype: DType::Bf16,
         sparse_exact_varlen: Some(DsaSparseMlaExactVarlenConfig {
-            index_remap_backends: vec!["vllm_triton"],
             prefill_backends: vec!["flashinfer_trtllm_fp8"],
             max_model_len: parallel.max_model_len,
-            page_table_mapping: "request_contiguous".to_string(),
+            prefill_index_distribution: "recent_contiguous".to_string(),
+            page_table_mapping: Some("request_contiguous".to_string()),
         }),
         decode_next_n: 1,
     }
@@ -378,8 +378,8 @@ pub fn build_configs(
         gemm_dtype,
     });
 
-    let nvfp4_moe = VllmNvfp4MoeLocalWorkletConfig::split_for_ep(
-        VllmNvfp4MoeLocalWorkletConfig {
+    let nvfp4_moe = Nvfp4MoeLocalWorkletConfig::split_for_ep(
+        Nvfp4MoeLocalWorkletConfig {
             hidden: model.hidden_dim.clone(),
             moe_intermediate: model.moe_intermediate_dim.clone(),
             num_experts: model.num_experts.clone(),
@@ -411,8 +411,7 @@ pub fn build_configs(
         parallel: parallel.clone(),
         mtp_mode,
         dense_full_index_attention,
-        dense_ffn: VllmGlm52DenseFfnLocalWorkletConfig {
-            fp8_quant_backends: DENSE_FP8_QUANT_BACKENDS.to_vec(),
+        dense_ffn: Glm52DenseFfnLocalWorkletConfig {
             residual_norm_backends: RESIDUAL_NORM_BACKENDS.to_vec(),
             gemm_backends: gemm_backends.to_vec(),
             elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
@@ -450,11 +449,10 @@ pub fn build_configs(
             include_router_input_cast: false,
             include_router_select: false,
         },
-        shared_expert: VllmGlm52SharedExpertLocalWorkletConfig {
+        shared_expert: Glm52SharedExpertLocalWorkletConfig {
             // These unquantized projections are F.linear calls inside vLLM's
             // pinned Torch/CUDA environment, like the router above.
             gemm_backends: VLLM_BF16_LINEAR_BACKENDS.to_vec(),
-            fp8_quant_backends: DENSE_FP8_QUANT_BACKENDS.to_vec(),
             elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
             tp_size: parallel.ep_size,
             gpu_name: gpu.clone(),
@@ -629,7 +627,7 @@ pub fn resolve_configs(cfgs: &Glm52VllmNvfp4DsaMoeConfigs) -> Glm52VllmNvfp4DsaM
         dense_full_index_attention: VllmGlm52DsaAttnLocalWorklet::resolve_config(
             &cfgs.dense_full_index_attention,
         ),
-        dense_ffn: VllmGlm52DenseFfnLocalWorklet::resolve_config(&cfgs.dense_ffn),
+        dense_ffn: Glm52DenseFfnLocalWorklet::resolve_config(&cfgs.dense_ffn),
         initial_shared_attention: VllmGlm52DsaAttnLocalWorklet::resolve_config(
             &cfgs.initial_shared_attention,
         ),
@@ -640,11 +638,11 @@ pub fn resolve_configs(cfgs: &Glm52VllmNvfp4DsaMoeConfigs) -> Glm52VllmNvfp4DsaM
             &cfgs.cycle_shared_attention,
         ),
         sparse_router: Glm52MoeRouterLocalWorklet::resolve_config(&cfgs.sparse_router),
-        shared_expert: VllmGlm52SharedExpertLocalWorklet::resolve_config(&cfgs.shared_expert),
+        shared_expert: Glm52SharedExpertLocalWorklet::resolve_config(&cfgs.shared_expert),
         nvfp4_moe: cfgs
             .nvfp4_moe
             .iter()
-            .map(VllmNvfp4MoeLocalWorklet::resolve_config)
+            .map(Nvfp4MoeLocalWorklet::resolve_config)
             .collect(),
         tp_allreduce: cfgs.tp_allreduce.clone(),
         tp_allreduce_fusion: cfgs.tp_allreduce_fusion.clone(),
@@ -673,8 +671,8 @@ struct Glm52SparseBody {
     attention: VllmGlm52DsaAttnLocalWorklet,
     router: Glm52MoeRouterLocalWorklet,
     /// One per EP child, ordered by identity-free active-expert workload.
-    expert_compute: Vec<VllmNvfp4MoeLocalWorklet>,
-    shared_expert: VllmGlm52SharedExpertLocalWorklet,
+    expert_compute: Vec<Nvfp4MoeLocalWorklet>,
+    shared_expert: Glm52SharedExpertLocalWorklet,
     attention_allreduce: Op<AllReduceKernel>,
     attention_allreduce_fused: Op<AllReduceResidualRmsNormKernel>,
     attention_allreduce_max_fused_tokens: u32,
@@ -706,14 +704,14 @@ impl Glm52SparseBody {
             .nvfp4_moe
             .iter()
             .map(|rank_resolved| {
-                VllmNvfp4MoeLocalWorklet::build(
+                Nvfp4MoeLocalWorklet::build(
                     format!("{name}.moe.routed_experts"),
                     rank_resolved.clone(),
                     bridge,
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let shared_expert = VllmGlm52SharedExpertLocalWorklet::build(
+        let shared_expert = Glm52SharedExpertLocalWorklet::build(
             format!("{name}.moe.shared_expert"),
             common.shared_expert.clone(),
             bridge,
@@ -854,13 +852,13 @@ impl Glm52SparseBody {
         }
         for rank_expert in &self.expert_compute {
             self.shared_expert.eval(
-                &VllmGlm52SharedExpertLocalWorkletInput {
+                &Glm52SharedExpertLocalWorkletInput {
                     batch_tokens: group.batch_tokens,
                 },
                 ev,
             );
             rank_expert.eval(
-                &VllmNvfp4MoeLocalWorkletInput {
+                &Nvfp4MoeLocalWorkletInput {
                     num_tokens: group.batch_tokens,
                 },
                 ev,
@@ -907,7 +905,7 @@ pub struct Glm52VllmNvfp4DsaMoeModel {
     pub embedding_allreduce_fusion: Op<AllReduceFusionKernel>,
     pub embedding_allreduce_max_fused_tokens: u32,
     pub dense_full_index_attention: VllmGlm52DsaAttnLocalWorklet,
-    pub dense_ffn: VllmGlm52DenseFfnLocalWorklet,
+    pub dense_ffn: Glm52DenseFfnLocalWorklet,
     pub dense_attention_allreduce: Op<AllReduceKernel>,
     pub dense_attention_allreduce_fused: Op<AllReduceResidualRmsNormKernel>,
     pub dense_attention_allreduce_max_fused_tokens: u32,
@@ -958,7 +956,7 @@ pub fn build(
         resolved.dense_full_index_attention.clone(),
         bridge,
     )?;
-    let dense_ffn = VllmGlm52DenseFfnLocalWorklet::build(
+    let dense_ffn = Glm52DenseFfnLocalWorklet::build(
         format!("{name}.body.dense_full_index.ffn"),
         resolved.dense_ffn.clone(),
         bridge,
@@ -1266,7 +1264,7 @@ impl Glm52VllmNvfp4DsaMoeModel {
         );
         for _ in 0..self.ep_size {
             self.dense_ffn.eval_with_post_attn_norm(
-                &VllmGlm52DenseFfnLocalWorkletInput {
+                &Glm52DenseFfnLocalWorkletInput {
                     batch_tokens: group.batch_tokens,
                 },
                 !use_dense_fused,
@@ -1740,10 +1738,13 @@ mod tests {
             assert_eq!(attention.sparse_attention_cache_dtype, DType::Fp8E4m3);
             assert_eq!(attention.sparse_attention_output_dtype, DType::Bf16);
             let exact = attention.sparse_exact_varlen.as_ref().unwrap();
-            assert_eq!(exact.index_remap_backends, vec!["vllm_triton"]);
+            assert_eq!(attention.sparse_index_remap_backends, vec!["vllm_triton"]);
             assert_eq!(exact.prefill_backends, vec!["flashinfer_trtllm_fp8"]);
             assert_eq!(exact.max_model_len, 8_192);
-            assert_eq!(exact.page_table_mapping, "request_contiguous");
+            assert_eq!(
+                exact.page_table_mapping.as_deref(),
+                Some("request_contiguous")
+            );
         }
         assert!(cfg.dense_full_index_attention.include_indexer);
         assert!(!cfg.initial_shared_attention.include_indexer);

@@ -184,6 +184,7 @@ mod tests {
             },
             conversation_start_time: Time::ZERO,
             resident_prefix_tokens,
+            retracted: false,
         }
     }
 

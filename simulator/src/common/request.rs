@@ -93,6 +93,16 @@ pub struct RequestLifecycle {
     pub stage_log: Vec<StageEvent>,
 }
 
+/// One recomputation episode after decode retraction. The request keeps its
+/// emitted output and TTFT; these fields describe only the extra prefill work.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReprocessedPrefillEpisode {
+    pub output_tokens_before: u32,
+    pub prefix_cache_hit_tokens: u32,
+    pub prefill_tokens_processed: u32,
+    pub completed: bool,
+}
+
 /// Observations collected without changing request-family semantics.
 #[derive(Clone, Debug, Default)]
 pub struct RequestTelemetry {
@@ -103,6 +113,11 @@ pub struct RequestTelemetry {
     /// means admission never resolved a prefix context; `Some(0)` is a real
     /// cold/disabled-cache result rather than missing telemetry.
     pub prefix_cache_hit_tokens: Option<u32>,
+    /// Number of times active decode KV was released and the request returned
+    /// to the waiting queue.
+    pub retraction_count: u32,
+    /// Extra prefill episodes caused by those retractions.
+    pub reprocessed_prefills: Vec<ReprocessedPrefillEpisode>,
 }
 
 /// One live request: immutable definition + progress + lifecycle + telemetry.
@@ -184,6 +199,59 @@ impl ActiveRequest<TextGenerationDefinition> {
             self.request.core.id.0,
         );
         self.telemetry.prefix_cache_hit_tokens = Some(prefix_cache_hit_tokens);
+    }
+
+    pub fn record_retraction(&mut self) {
+        self.telemetry.retraction_count = self
+            .telemetry
+            .retraction_count
+            .checked_add(1)
+            .expect("request retraction count overflow");
+    }
+
+    pub fn begin_reprocessed_prefill(&mut self, prefix_cache_hit_tokens: u32) {
+        assert!(
+            self.telemetry
+                .reprocessed_prefills
+                .last()
+                .is_none_or(|episode| episode.completed),
+            "request {} began overlapping reprocessed-prefill episodes",
+            self.request.core.id.0,
+        );
+        self.telemetry
+            .reprocessed_prefills
+            .push(ReprocessedPrefillEpisode {
+                output_tokens_before: self.progress.output_tokens_emitted,
+                prefix_cache_hit_tokens,
+                prefill_tokens_processed: 0,
+                completed: false,
+            });
+    }
+
+    pub fn record_reprocessed_prefill_tokens(&mut self, tokens: u32) {
+        let episode = self
+            .telemetry
+            .reprocessed_prefills
+            .last_mut()
+            .expect("reprocessed prefill tokens require an active episode");
+        assert!(
+            !episode.completed,
+            "reprocessed prefill episode already completed"
+        );
+        episode.prefill_tokens_processed = episode
+            .prefill_tokens_processed
+            .checked_add(tokens)
+            .expect("reprocessed prefill token count overflow");
+    }
+
+    pub fn complete_reprocessed_prefill(&mut self) {
+        let episode = self
+            .telemetry
+            .reprocessed_prefills
+            .last_mut()
+            .expect("reprocessed prefill completion requires an active episode");
+        assert!(!episode.completed, "reprocessed prefill completed twice");
+        episode.completed = true;
     }
 }
 

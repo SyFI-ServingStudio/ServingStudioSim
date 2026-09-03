@@ -17,7 +17,7 @@ from profiling.runners.exceptions import KernelLaunchFailed, ProfilerNotImplemen
 from profiling.runners.metrics import ComputeMetrics
 
 _NUM_SEQUENCES = 1
-_NUM_HEADS = 64
+_SUPPORTED_NUM_HEADS = (32, 64)
 _HEAD_DIM = 128
 _Q_DTYPE = DType.FP8_E4M3
 _K_DTYPE = DType.FP8_E4M3
@@ -75,10 +75,10 @@ def _validate_args(
         raise ValueError(f"num_queries must be <= num_keys, got {num_queries} and {num_keys}")
     if num_sequences != _NUM_SEQUENCES:
         raise ValueError(f"dsa_mqa_logits_prefill requires num_sequences=1, got {num_sequences}")
-    if (num_heads, head_dim) != (_NUM_HEADS, _HEAD_DIM):
+    if num_heads not in _SUPPORTED_NUM_HEADS or head_dim != _HEAD_DIM:
         raise ValueError(
             "dsa_mqa_logits_prefill requires "
-            "(num_heads, head_dim) == (64, 128), "
+            f"num_heads in {list(_SUPPORTED_NUM_HEADS)} and head_dim == {_HEAD_DIM}, "
             f"got ({num_heads}, {head_dim})"
         )
     if q_dtype is not _Q_DTYPE or k_dtype is not _K_DTYPE:
@@ -138,36 +138,36 @@ def _validate_cuda_device(torch: Any) -> None:
 def _validate_deepgemm_cuda_device(torch: Any) -> None:
     if not torch.cuda.is_available():
         raise ProfilerNotImplemented(
-            "CUDA is required for the dsa_mqa_logits_prefill vllm_deepgemm_fp8 backend"
+            "CUDA is required for the dsa_mqa_logits_prefill deepgemm_fp8 backend"
         )
     gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
     if gpu_name not in _DEEPGEMM_SUPPORTED_GPUS:
         raise ProfilerNotImplemented(
-            "dsa_mqa_logits_prefill vllm_deepgemm_fp8 is verified only on "
+            "dsa_mqa_logits_prefill deepgemm_fp8 is verified only on "
             f"{' or '.join(_DEEPGEMM_SUPPORTED_GPUS)}, got {gpu_name}"
         )
 
 
 def _load_deepgemm_backend() -> tuple[Any, Any]:
-    """Load the serving wrapper only in the selected worker process."""
+    """Load the pinned DeepGEMM measurement provider in the worker process."""
     try:
         import torch
         from vllm.utils import deep_gemm
     except (ImportError, OSError) as exc:
         raise ProfilerNotImplemented(
             "the instrumented vLLM/DeepGEMM environment is required for "
-            "dsa_mqa_logits_prefill:vllm_deepgemm_fp8"
+            "dsa_mqa_logits_prefill:deepgemm_fp8"
         ) from exc
 
     try:
         supported = deep_gemm.is_deep_gemm_supported()
     except (RuntimeError, OSError) as exc:
         raise ProfilerNotImplemented(
-            "DeepGEMM support could not be initialized for dsa_mqa_logits_prefill:vllm_deepgemm_fp8"
+            "DeepGEMM support could not be initialized for dsa_mqa_logits_prefill:deepgemm_fp8"
         ) from exc
     if not supported:
         raise ProfilerNotImplemented(
-            "DeepGEMM is unavailable or unsupported for dsa_mqa_logits_prefill:vllm_deepgemm_fp8"
+            "DeepGEMM is unavailable or unsupported for dsa_mqa_logits_prefill:deepgemm_fp8"
         )
     if _mqa_logits_entry_point(deep_gemm) is None:
         raise ProfilerNotImplemented(
@@ -250,6 +250,25 @@ def _build_operands(
         k_end=k_end,
         valid_mask=valid_mask,
     )
+
+
+def _prepare_deepgemm_call(deep_gemm: Any, operands: _DsaMqaLogitsPrefillOperands) -> Any:
+    """Adapt legacy/unified query forms and return the exact timed callable."""
+    entry_point = _mqa_logits_entry_point(deep_gemm)
+    unified = getattr(entry_point, "__name__", "") == "fp8_fp4_mqa_logits"
+    query = (operands.q, None) if unified else operands.q
+
+    def kernel() -> Any:
+        return entry_point(
+            query,
+            (operands.k, operands.k_scale),
+            operands.weights,
+            operands.k_start,
+            operands.k_end,
+            clean_logits=False,
+        )
+
+    return kernel
 
 
 def _torch_composite(
@@ -412,7 +431,8 @@ def profile_dsa_mqa_logits_prefill_torch(
         raise KernelLaunchFailed(str(exc)) from exc
 
 
-def profile_dsa_mqa_logits_prefill_vllm_deepgemm_fp8(
+def _profile_dsa_mqa_logits_prefill_deepgemm_fp8(
+    load_backend: Any,
     num_queries: int,
     num_keys: int,
     num_sequences: int,
@@ -426,7 +446,7 @@ def profile_dsa_mqa_logits_prefill_vllm_deepgemm_fp8(
     span_mode: str,
     clean_logits: bool,
 ) -> ComputeMetrics:
-    """Profile vLLM's production-aligned fused DeepGEMM prefill kernel."""
+    """Shared profiling implementation for the fused DeepGEMM prefill callable."""
     (
         num_queries,
         num_keys,
@@ -454,7 +474,7 @@ def profile_dsa_mqa_logits_prefill_vllm_deepgemm_fp8(
         span_mode,
         clean_logits,
     )
-    torch, deep_gemm = _load_deepgemm_backend()
+    torch, deep_gemm = load_backend()
     _validate_deepgemm_cuda_device(torch)
 
     try:
@@ -467,21 +487,7 @@ def profile_dsa_mqa_logits_prefill_vllm_deepgemm_fp8(
             device="cuda",
         )
 
-        entry_point = _mqa_logits_entry_point(deep_gemm)
-        # The unified entry point takes `q = (values, scales_or_None)`; on the
-        # FP8 path the per-token scale is already folded into `weights`.
-        unified = getattr(entry_point, "__name__", "") == "fp8_fp4_mqa_logits"
-        query = (operands.q, None) if unified else operands.q
-
-        def kernel() -> Any:
-            return entry_point(
-                query,
-                (operands.k, operands.k_scale),
-                operands.weights,
-                operands.k_start,
-                operands.k_end,
-                clean_logits=False,
-            )
+        kernel = _prepare_deepgemm_call(deep_gemm, operands)
 
         # Compile and initialize the exact shape before formal CUPTI timing.
         kernel()
@@ -518,3 +524,11 @@ def profile_dsa_mqa_logits_prefill_vllm_deepgemm_fp8(
         )
     except (RuntimeError, OSError) as exc:
         raise KernelLaunchFailed(str(exc)) from exc
+
+
+def profile_dsa_mqa_logits_prefill_deepgemm_fp8(**kwargs: Any) -> ComputeMetrics:
+    """Profile the fused DeepGEMM FP8 prefill callable."""
+    return _profile_dsa_mqa_logits_prefill_deepgemm_fp8(
+        _load_deepgemm_backend,
+        **kwargs,
+    )

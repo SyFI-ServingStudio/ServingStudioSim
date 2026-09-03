@@ -130,11 +130,13 @@ def test_deepgemm_backend_registered_sharing_table_and_args():
     assert spec.runner_ref.function_name == "profile_single_gemm"
 
 
-def test_single_gemm_known_backends_include_both_torch_layouts_and_deepgemm():
+def test_single_gemm_known_backends_include_framework_dispatches():
     assert set(known_backends("single_gemm")) == {
         "torch",
         "torch_linear",
         "torch_linear_vllm",
+        "sglang_bf16_auto",
+        "sglang_fused_a_auto",
         "deepgemm",
     }
 
@@ -1470,6 +1472,7 @@ def test_documented_profile_env_registry_complete():
         "default_env",
         "flashinfer_pip_env",
         "flashinfer_local",
+        "sglang_env",
         "vllm_env",
     }
     assert set(ENV_REGISTRY) == expected_envs

@@ -458,7 +458,10 @@ def _run_sim(args: argparse.Namespace) -> int:
 
 
 def _run_profile(args: argparse.Namespace) -> int:
-    config = load_profile_config(args.config)
+    config = load_profile_config(
+        args.config,
+        require_python_runtime=not args.resume,
+    )
     if args.dry_run:
         print(f"[alignment] profile validated: {args.config} (log_dir={config.log_dir})")
         return 0

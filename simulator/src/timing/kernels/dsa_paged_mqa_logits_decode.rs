@@ -135,7 +135,7 @@ mod tests {
     use serde_json::Value;
 
     const TORCH_BACKEND: &str = "torch";
-    const DEEPGEMM_BACKEND: &str = "vllm_deepgemm_fp8";
+    const DEEPGEMM_BACKEND: &str = "deepgemm_fp8";
     const BATCH_AXIS: &[f64] = &[
         1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 127.0, 128.0, 129.0, 130.0, 131.0, 132.0, 133.0,
         185.0, 256.0, 384.0, 512.0,

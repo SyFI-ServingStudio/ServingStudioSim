@@ -19,7 +19,7 @@ from profiling.runners.exceptions import KernelLaunchFailed, ProfilerNotImplemen
 from profiling.runners.metrics import ComputeMetrics
 
 _NEXT_N = 1
-_NUM_HEADS = 64
+_SUPPORTED_NUM_HEADS = (32, 64)
 _HEAD_DIM = 128
 _BLOCK_SIZE = 64
 _Q_DTYPE = DType.FP8_E4M3
@@ -110,10 +110,11 @@ def _validate_args(
         )
     if next_n != _NEXT_N:
         raise ValueError(f"dsa_paged_mqa_logits_decode requires next_n=1, got {next_n}")
-    if (num_heads, head_dim, block_size) != (_NUM_HEADS, _HEAD_DIM, _BLOCK_SIZE):
+    if num_heads not in _SUPPORTED_NUM_HEADS or head_dim != _HEAD_DIM or block_size != _BLOCK_SIZE:
         raise ValueError(
             "dsa_paged_mqa_logits_decode requires "
-            "(num_heads, head_dim, block_size) == (64, 128, 64), "
+            f"num_heads in {list(_SUPPORTED_NUM_HEADS)}, head_dim == {_HEAD_DIM}, "
+            f"and block_size == {_BLOCK_SIZE}, "
             f"got ({num_heads}, {head_dim}, {block_size})"
         )
     if q_dtype is not _Q_DTYPE or cache_dtype is not _CACHE_DTYPE:
@@ -188,34 +189,34 @@ def _validate_deepgemm_cuda_device(torch: Any) -> int:
     """Validate a profiled deployment identity and return its SM schedule."""
     if not torch.cuda.is_available():
         raise ProfilerNotImplemented(
-            "CUDA is required for the dsa_paged_mqa_logits_decode vllm_deepgemm_fp8 backend"
+            "CUDA is required for the dsa_paged_mqa_logits_decode deepgemm_fp8 backend"
         )
     device = torch.cuda.current_device()
     gpu_name = str(torch.cuda.get_device_name(device))
     if gpu_name not in _DEEPGEMM_EXPECTED_SMS:
         raise ProfilerNotImplemented(
-            "dsa_paged_mqa_logits_decode vllm_deepgemm_fp8 is verified only on "
+            "dsa_paged_mqa_logits_decode deepgemm_fp8 is verified only on "
             f"{' or '.join(_DEEPGEMM_EXPECTED_SMS)}, got {gpu_name}"
         )
     num_sms = int(torch.cuda.get_device_properties(device).multi_processor_count)
     expected_sms = _DEEPGEMM_EXPECTED_SMS[gpu_name]
     if num_sms != expected_sms:
         raise ProfilerNotImplemented(
-            "dsa_paged_mqa_logits_decode vllm_deepgemm_fp8 requires the verified "
+            "dsa_paged_mqa_logits_decode deepgemm_fp8 requires the verified "
             f"{expected_sms}-SM {gpu_name} schedule, got {num_sms} SMs"
         )
     return num_sms
 
 
 def _load_deepgemm_backend() -> tuple[Any, Any]:
-    """Load vLLM's serving wrapper only inside the selected worker process."""
+    """Load the pinned DeepGEMM measurement provider in the worker process."""
     try:
         import torch
         from vllm.utils import deep_gemm
     except (ImportError, OSError) as exc:
         raise ProfilerNotImplemented(
             "the instrumented vLLM/DeepGEMM environment is required for "
-            "dsa_paged_mqa_logits_decode:vllm_deepgemm_fp8"
+            "dsa_paged_mqa_logits_decode:deepgemm_fp8"
         ) from exc
 
     support_api = getattr(deep_gemm, "is_deep_gemm_supported", None)
@@ -226,12 +227,12 @@ def _load_deepgemm_backend() -> tuple[Any, Any]:
     except (RuntimeError, OSError) as exc:
         raise ProfilerNotImplemented(
             "DeepGEMM support could not be initialized for "
-            "dsa_paged_mqa_logits_decode:vllm_deepgemm_fp8"
+            "dsa_paged_mqa_logits_decode:deepgemm_fp8"
         ) from exc
     if not supported:
         raise ProfilerNotImplemented(
             "DeepGEMM is unavailable or unsupported for "
-            "dsa_paged_mqa_logits_decode:vllm_deepgemm_fp8"
+            "dsa_paged_mqa_logits_decode:deepgemm_fp8"
         )
     if not callable(getattr(deep_gemm, "get_paged_mqa_logits_metadata", None)):
         raise ProfilerNotImplemented(
@@ -646,7 +647,8 @@ def profile_dsa_paged_mqa_logits_decode_torch(
         raise KernelLaunchFailed(str(exc)) from exc
 
 
-def profile_dsa_paged_mqa_logits_decode_vllm_deepgemm_fp8(
+def _profile_dsa_paged_mqa_logits_decode_deepgemm_fp8(
+    load_backend: Any,
     batch_size: int,
     context_len: int,
     next_n: int,
@@ -664,7 +666,7 @@ def profile_dsa_paged_mqa_logits_decode_vllm_deepgemm_fp8(
     cache_format: str,
     clean_logits: bool,
 ) -> ComputeMetrics:
-    """Profile vLLM's production-aligned fused DeepGEMM decode kernel."""
+    """Shared profiling implementation for the fused DeepGEMM decode callable."""
     (
         batch_size,
         context_len,
@@ -700,7 +702,7 @@ def profile_dsa_paged_mqa_logits_decode_vllm_deepgemm_fp8(
         cache_format,
         clean_logits,
     )
-    torch, deep_gemm = _load_deepgemm_backend()
+    torch, deep_gemm = load_backend()
     num_sms = _validate_deepgemm_cuda_device(torch)
 
     try:
@@ -764,3 +766,11 @@ def profile_dsa_paged_mqa_logits_decode_vllm_deepgemm_fp8(
         )
     except (RuntimeError, OSError) as exc:
         raise KernelLaunchFailed(str(exc)) from exc
+
+
+def profile_dsa_paged_mqa_logits_decode_deepgemm_fp8(**kwargs: Any) -> ComputeMetrics:
+    """Profile the fused DeepGEMM FP8 decode callable."""
+    return _profile_dsa_paged_mqa_logits_decode_deepgemm_fp8(
+        _load_deepgemm_backend,
+        **kwargs,
+    )

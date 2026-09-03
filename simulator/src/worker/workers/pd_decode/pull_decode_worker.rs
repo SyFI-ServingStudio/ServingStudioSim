@@ -22,8 +22,8 @@ use crate::worker::kv::{FullAttnKv, IterWorkerKv};
 use crate::worker::shared::advance_scope::AdvanceScope;
 use crate::worker::shared::context::WorkerContext;
 use crate::worker::types::{
-    BatchFsmState, IterCursor, PdDecodeEvent, PdDecodeMsg, TransferPlan, WorkerFsmState,
-    WorkerStatus,
+    BatchFsmState, IterBatchPlan, IterCursor, PdDecodeEvent, PdDecodeMsg, TransferPlan,
+    WorkerFsmState, WorkerStatus,
 };
 
 /// Pull backlog ceiling as a fraction of one attention partition's token capacity.
@@ -67,6 +67,7 @@ where
     kv_store: K,
     execution: E,
     input: E::Input,
+    batch_plan: IterBatchPlan,
     balance: LoadBalance,
     pull_pipeline: PullPipeline,
     decode_fsm: DecodeIterationFsm,
@@ -96,6 +97,7 @@ where
             kv_store,
             execution,
             input: Default::default(),
+            batch_plan: IterBatchPlan::default(),
             balance,
             pull_pipeline: PullPipeline {
                 pending_decodes: VecDeque::new(),
@@ -313,6 +315,8 @@ where
     /// Admit at most one landed request directly into its chosen decode partition.
     fn form_batch(&mut self, now: Time) -> bool {
         let num_partitions = self.kv_store.num_partitions();
+        self.batch_plan
+            .reset_decode_participation(num_partitions, true);
         let had_decode =
             (0..num_partitions as u16).any(|partition| self.kv_store.has_live_decode(partition));
 
@@ -368,6 +372,7 @@ where
         self.execution.build_iteration_input(
             &self.kv_store,
             &self.context.requests,
+            &self.batch_plan,
             &mut self.input,
         );
         let cost =

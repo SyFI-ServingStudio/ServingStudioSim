@@ -138,6 +138,52 @@ uv run --python .venv-sglang/bin/python python -c \
   "import sglang; print(sglang.__version__, sglang.__file__)"
 ```
 
+Every SGLang alignment profile must also declare its binary runtime contract.
+The launcher owns this step; there is no separate warm-up command to remember.
+It locks the selected venv, installs only missing exact-version wheels, rejects
+an already-installed version conflict rather than replacing it, and verifies
+the named files from wheel metadata without importing FlashInfer. The lock is
+released before the server starts, so concurrent profiles serialize preparation
+only and still run independently afterward. A satisfied environment performs no
+package-index request and no refresh.
+
+For the pinned CUDA 13 GLM-5.2 stack the campaign contract is:
+
+```yaml
+python_runtime:
+  lock_timeout_seconds: 3600.0
+  install_timeout_seconds: 1800.0
+  packages:
+    - name: nvtx
+      version: 0.2.16
+      index_url: https://pypi.org/simple
+    - name: flashinfer-python
+      version: 0.6.15.post1
+      index_url: https://pypi.org/simple
+    - name: flashinfer-cubin
+      version: 0.6.15.post1
+      index_url: https://flashinfer.ai/whl
+    - name: flashinfer-jit-cache
+      version: 0.6.15.post1
+      local_version: cu130
+      index_url: https://flashinfer.ai/whl/cu130
+      required_files:
+        - flashinfer_jit_cache/jit_cache/fp4_quantization_100/fp4_quantization_100.so
+        - flashinfer_jit_cache/jit_cache/trtllm_comm/trtllm_comm.so
+        - flashinfer_jit_cache/jit_cache/rope/rope.so
+        - flashinfer_jit_cache/jit_cache/fmha_gen/fmha_gen.so
+        - flashinfer_jit_cache/jit_cache/fused_moe_trtllm_sm100/fused_moe_trtllm_sm100.so
+  environment:
+    FLASHINFER_DISABLE_JIT: "1"
+```
+
+The three FlashInfer entries mirror SGLang's pinned cu130 Dockerfile package
+trio; `nvtx` satisfies the separate NSYS iteration-range preflight. The
+prebuilt cache wheel, rather than a worktree-specific Ninja directory under
+`~/.cache`, owns the shared objects. If the declared wheel does not contain a
+required module, the profile fails before loading model weights instead of
+compiling it during server startup.
+
 The pinned SGLang version currently uses a CUDA 13 user-space stack. On a host
 whose driver needs NVIDIA forward compatibility, set `driver_compat_lib_dir`
 in `profile.yaml` to an unpacked matching `cuda-compat` library directory. The

@@ -313,6 +313,29 @@ pub enum IterArchSel {
         #[param(cache_key)]
         expert_popularity_file: Option<String>,
     },
+    /// SGLang's B200 NVFP4 launch graph under pure tensor parallelism. Every
+    /// rank owns all experts (EP1) and shards the routed intermediate axis by
+    /// TP, so there is no expert-parallel or NVLink-domain selector.
+    Glm52SglangNvfp4TpDsaMoe {
+        #[serde(flatten)]
+        model: ModelSpec,
+        #[param(cache_key)]
+        tp_size: u16,
+        /// Configured context cap and padded DSA-logits row stride.
+        #[param(cache_key)]
+        max_model_len: u32,
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS)]
+        routing: RoutingKind,
+        #[serde(default)]
+        routing_seed: Option<u64>,
+        #[serde(default)]
+        #[param(string, default = "off", choices = GLM52_MTP_MODES, cache_key)]
+        mtp_mode: Glm52MtpMode,
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+    },
     /// GLM-5.2's exact heterogeneous 78-layer DSA/MoE schedule. Attention is
     /// local (TP1) on every EP rank and pairs with `hp_unified`, whose KV/input
     /// partitions correspond one-for-one with the EP ranks.
@@ -362,7 +385,8 @@ impl IterArchSel {
             | Self::DeepseekV4VllmSerialStreams { model, .. }
             | Self::Glm52DsaMoe { model, .. }
             | Self::Glm52VllmDsaMoe { model, .. }
-            | Self::Glm52VllmNvfp4DsaMoe { model, .. } => model,
+            | Self::Glm52VllmNvfp4DsaMoe { model, .. }
+            | Self::Glm52SglangNvfp4TpDsaMoe { model, .. } => model,
         }
     }
 }
@@ -600,6 +624,52 @@ mod iter_tests {
         assert!(IterArchSel::SCHEMA
             .iter()
             .any(|(tag, _)| *tag == "glm52_vllm_nvfp4_dsa_moe"));
+    }
+
+    #[test]
+    fn glm52_sglang_nvfp4_selector_requires_explicit_tp_and_context_without_ep_knobs() {
+        let parsed: IterArchSel = serde_json::from_str(
+            r#"{"type":"glm52_sglang_nvfp4_tp_dsa_moe","model_config":"model/config/glm52_nvfp4.json","fp8":false,"tp_size":4,"max_model_len":8192}"#,
+        )
+        .expect("SGLang NVFP4 pure-TP selector parses");
+        let IterArchSel::Glm52SglangNvfp4TpDsaMoe {
+            model,
+            tp_size,
+            max_model_len,
+            routing,
+            routing_seed,
+            mtp_mode,
+            expert_popularity_file,
+        } = &parsed
+        else {
+            panic!("expected glm52_sglang_nvfp4_tp_dsa_moe")
+        };
+        assert_eq!(model.model_config, "model/config/glm52_nvfp4.json");
+        assert!(!model.fp8);
+        assert_eq!(*tp_size, 4);
+        assert_eq!(*max_model_len, 8_192);
+        assert_eq!(*routing, RoutingKind::Uniform);
+        assert_eq!(*routing_seed, None);
+        assert_eq!(*mtp_mode, Glm52MtpMode::Off);
+        assert_eq!(*expert_popularity_file, None);
+        assert!(std::ptr::eq(parsed.model(), model));
+
+        let params = IterArchSel::SCHEMA
+            .iter()
+            .find(|(tag, _)| *tag == "glm52_sglang_nvfp4_tp_dsa_moe")
+            .expect("SGLang pure-TP tag is published")
+            .1;
+        let names = params.iter().map(|param| param.name).collect::<Vec<_>>();
+        assert!(names.contains(&"tp_size"));
+        assert!(!names.contains(&"ep_size"));
+        assert!(!names.contains(&"nvl_num_gpu"));
+
+        for incomplete in [
+            r#"{"type":"glm52_sglang_nvfp4_tp_dsa_moe","model_config":"model/config/glm52_nvfp4.json","fp8":false,"max_model_len":8192}"#,
+            r#"{"type":"glm52_sglang_nvfp4_tp_dsa_moe","model_config":"model/config/glm52_nvfp4.json","fp8":false,"tp_size":4}"#,
+        ] {
+            assert!(serde_json::from_str::<IterArchSel>(incomplete).is_err());
+        }
     }
 
     #[test]
