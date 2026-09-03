@@ -115,26 +115,10 @@ impl Deployment for UnifiedDeployment {
                 attn_gpu_memory_gb,
                 max_batch_tokens,
                 batch_policy,
-                kv_admission_policy,
-                kv_page_size,
-                kv_max_future_tokens,
-                kv_initial_new_token_ratio,
-                kv_minimum_new_token_ratio,
-                kv_new_token_ratio_decay_steps,
-                kv_retract_decode_steps,
-                decode_retraction_policy,
+                kv_admission,
                 gpu_time_multiplier,
             } => {
-                let kv_admission = KvAdmissionConfig::resolve(
-                    *kv_admission_policy,
-                    *kv_page_size,
-                    *kv_max_future_tokens,
-                    *kv_initial_new_token_ratio,
-                    *kv_minimum_new_token_ratio,
-                    *kv_new_token_ratio_decay_steps,
-                    *kv_retract_decode_steps,
-                    *decode_retraction_policy,
-                )?;
+                let kv_admission = kv_admission.resolve()?;
                 ensure!(
                     !matches!(kv_admission, KvAdmissionConfig::BoundedFuture(_))
                         || *batch_policy == BatchPolicy::SeparatePrefillPriority,
@@ -712,14 +696,7 @@ mod tests {
             attn_gpu_memory_gb: 120.0,
             max_batch_tokens: 2048,
             batch_policy: BatchPolicy::Mix,
-            kv_admission_policy: crate::worker::KvAdmissionPolicy::FullFootprint,
-            kv_page_size: None,
-            kv_max_future_tokens: None,
-            kv_initial_new_token_ratio: None,
-            kv_minimum_new_token_ratio: None,
-            kv_new_token_ratio_decay_steps: None,
-            kv_retract_decode_steps: None,
-            decode_retraction_policy: None,
+            kv_admission: crate::worker::config::KvAdmissionSpec::default(),
             gpu_time_multiplier: 1.0,
         }
     }

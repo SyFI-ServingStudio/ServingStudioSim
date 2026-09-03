@@ -25,7 +25,7 @@ use crate::arch::config::{AttnArchSel, FfnArchSel, IterArchSel, ModelSpec};
 use crate::deployment::config::{IoSpec, WorkloadSpec};
 use crate::orchestrator::config::{GroupSpec, PoolSpec};
 use crate::schema::ParamDef;
-use crate::worker::config::{AttnWorkerSel, FfnWorkerSel, IterWorkerSel};
+use crate::worker::config::{AttnWorkerSel, FfnWorkerSel, IterWorkerSel, KvAdmissionSpec};
 
 /// Serialize a `const PARAMS` slice to a JSON array of ParamDef objects.
 fn params(p: &[ParamDef]) -> Value {
@@ -34,9 +34,24 @@ fn params(p: &[ParamDef]) -> Value {
 
 /// Turn a layer's `(tag, params)` schema slice into `{ tag: { "params": [...] } }`.
 fn providers(schema: &[(&str, &[ParamDef])]) -> Value {
+    providers_with_flattened(schema, &[])
+}
+
+/// Add params from selector components flattened into only one provider tag.
+fn providers_with_flattened(
+    schema: &[(&str, &[ParamDef])],
+    flattened: &[(&str, &[ParamDef])],
+) -> Value {
     let mut m = Map::new();
     for (tag, p) in schema {
-        m.insert(tag.to_string(), json!({ "params": params(p) }));
+        let mut provider_params = p.to_vec();
+        if let Some((_, extra)) = flattened.iter().find(|(owner, _)| owner == tag) {
+            provider_params.extend_from_slice(extra);
+        }
+        m.insert(
+            tag.to_string(),
+            json!({ "params": params(&provider_params) }),
+        );
     }
     Value::Object(m)
 }
@@ -56,7 +71,10 @@ pub fn list_params() -> Value {
                 "layer_wise_ffn":  providers(FfnArchSel::SCHEMA),
             },
             "worker": {
-                "iter_wise":       providers(IterWorkerSel::SCHEMA),
+                "iter_wise":       providers_with_flattened(
+                    IterWorkerSel::SCHEMA,
+                    &[("chunked_prefill", KvAdmissionSpec::PARAMS)],
+                ),
                 "layer_wise_attn": providers(AttnWorkerSel::SCHEMA),
                 "layer_wise_ffn":  providers(FfnWorkerSel::SCHEMA),
             },
@@ -214,5 +232,37 @@ mod tests {
             .as_str()
             .unwrap_or_default()
             .starts_with("prefix_cache_")));
+    }
+
+    #[test]
+    fn chunked_prefill_schema_includes_flattened_kv_admission_spec() {
+        let schema = list_params();
+        let params = schema["providers"]["worker"]["iter_wise"]["chunked_prefill"]["params"]
+            .as_array()
+            .expect("chunked-prefill params are an array");
+        let policy = params
+            .iter()
+            .find(|param| param["name"] == "kv_admission_policy")
+            .expect("flattened KV admission policy is exposed");
+        assert_eq!(policy["default"], "full-footprint");
+        assert_eq!(
+            policy["choices"],
+            json!(["full-footprint", "bounded-future"])
+        );
+        for name in [
+            "kv_page_size",
+            "kv_max_future_tokens",
+            "kv_initial_new_token_ratio",
+            "kv_minimum_new_token_ratio",
+            "kv_new_token_ratio_decay_steps",
+            "kv_retract_decode_steps",
+            "decode_retraction_policy",
+        ] {
+            assert_eq!(
+                params.iter().filter(|param| param["name"] == name).count(),
+                1,
+                "flattened parameter {name} must appear exactly once"
+            );
+        }
     }
 }
