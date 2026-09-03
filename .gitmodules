@@ -9,4 +9,4 @@
 [submodule "alignment/load_generator/req-frontend"]
 	path = alignment/load_generator/req-frontend
 	url = https://github.com/uw-syfi/request-factory.git
-	branch = main
+	branch = glm52-tp4-streaming-fix
