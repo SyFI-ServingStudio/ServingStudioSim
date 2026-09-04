@@ -602,11 +602,8 @@ fn validate_config(cfg: &Glm52DsaAttnLocalWorkletConfig) -> Result<(), String> {
             return Err(format!("{name} must be {required}, got {actual}"));
         }
     }
-    if !matches!(cfg.decode_next_n, 1 | 2) {
-        return Err(format!(
-            "decode_next_n must be 1 or 2, got {}",
-            cfg.decode_next_n
-        ));
+    if cfg.decode_next_n == 0 {
+        return Err("decode_next_n must be positive".to_string());
     }
     for (name, actual, required) in [
         ("base_dtype", cfg.base_dtype, DType::Bf16),
@@ -696,8 +693,10 @@ fn normalize_input(
     decode_next_n: u32,
     max_model_len: u32,
 ) -> Result<NormalizedInput, String> {
-    if !matches!(decode_next_n, 1 | 2) {
-        return Err(format!("decode_next_n must be 1 or 2, got {decode_next_n}"));
+    // Same rule as `glm52_dsa_attn_common::normalize_glm52_dsa_attn_input`: the
+    // width only scales the decode row count, so any positive value is billable.
+    if decode_next_n == 0 {
+        return Err("decode_next_n must be positive".to_string());
     }
 
     let mut active_rows = 0_u32;
@@ -967,11 +966,15 @@ mod tests {
     }
 
     #[test]
-    fn next_n_one_and_two_reach_both_compound_ops() {
-        for next_n in [1, 2] {
+    fn any_positive_next_n_reaches_both_compound_ops() {
+        // A k=5 draft verifies six rows per request. The width is forwarded to
+        // both compound ops unchanged; neither this worklet nor they treat six
+        // differently from two.
+        for next_n in [1, 2, 3, 6] {
             let r = Glm52DsaAttnLocalWorklet::resolve_config(&cfg(true, next_n));
             assert_eq!(r.indexer.as_ref().unwrap().next_n, next_n);
             assert_eq!(r.sparse_mla.decode_next_n, next_n);
+            assert!(validate_config(&cfg(true, next_n)).is_ok());
         }
     }
 
@@ -1075,6 +1078,6 @@ mod tests {
             mutate(&mut config);
             assert!(validate_config(&config).is_err());
         }
-        assert!(validate_config(&cfg(true, 3)).is_err());
+        assert!(validate_config(&cfg(true, 0)).is_err());
     }
 }

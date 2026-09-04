@@ -71,8 +71,11 @@ pub(crate) fn normalize_glm52_dsa_attn_input(
     decode_next_n: u32,
     max_model_len: u32,
 ) -> Result<Glm52DsaAttnNormalizedInput, String> {
-    if !matches!(decode_next_n, 1 | 2) {
-        return Err(format!("decode_next_n must be 1 or 2, got {decode_next_n}"));
+    // The width only scales the decode row count below. It selects a measured
+    // sparse-MLA cache identity, not a code path here, so any positive value is
+    // a shape this section can bill.
+    if decode_next_n == 0 {
+        return Err("decode_next_n must be positive".to_string());
     }
 
     let mut active_rows = 0_u32;
@@ -157,4 +160,55 @@ pub(crate) fn normalize_glm52_dsa_attn_input(
         sparse_decode,
         sparse_decode_context_lens,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MAX_MODEL_LEN: u32 = 1_048_576;
+
+    fn decode_input(batch_size: u32, decode_next_n: u32) -> Glm52DsaAttnLocalInput {
+        Glm52DsaAttnLocalInput {
+            num_new_tokens: batch_size * decode_next_n,
+            prefill_query_cache_pairs: Vec::new(),
+            decode: Some(Glm52DsaAttnLocalDecodeInput {
+                batch_size,
+                context_len: 4096,
+                context_lens: None,
+                requires_padding: false,
+            }),
+        }
+    }
+
+    #[test]
+    fn decode_rows_scale_with_the_verify_width() {
+        // A verify step submits one group of `decode_next_n` rows per request.
+        // The width is a multiplier on the sparse-MLA query coordinate and
+        // nothing else: the indexer still sees one entry per request, because
+        // index selection is per request, not per verified row.
+        for decode_next_n in [1, 2, 3, 6] {
+            let normalized = normalize_glm52_dsa_attn_input(
+                &decode_input(8, decode_next_n),
+                decode_next_n,
+                MAX_MODEL_LEN,
+            )
+            .expect("any positive width is a billable shape");
+
+            assert_eq!(normalized.active_rows, 8 * decode_next_n);
+            assert_eq!(normalized.sparse_decode, Some((8 * decode_next_n, 4096)));
+            assert_eq!(
+                normalized.indexer_decode.as_ref().map(|d| d.batch_size),
+                Some(8)
+            );
+        }
+    }
+
+    #[test]
+    fn zero_width_is_the_only_rejected_width() {
+        assert_eq!(
+            normalize_glm52_dsa_attn_input(&decode_input(8, 1), 0, MAX_MODEL_LEN).unwrap_err(),
+            "decode_next_n must be positive"
+        );
+    }
 }
