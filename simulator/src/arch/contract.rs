@@ -205,6 +205,198 @@ pub trait IterwiseUnifiedModel: Send + Sync + 'static {
     }
 }
 
+// ── speculative iter-wise contract ───────────────────────────────────────────
+//
+// A speculative iteration is not an ordinary iteration with more tokens. One
+// decode request presents `k + 1` query rows to the target verify pass and one
+// row to each of the `k` draft passes, so "decode rows" and "decode requests"
+// stop being the same number and the lm-head row count stops following either.
+//
+// `ArchGroupInput::request_count` documents the rule this obeys: an input mode
+// with different logits semantics gets its own ArchInput type rather than an
+// optional axis on the ordinary one. The same rule is applied one level up —
+// the capability is a separate trait, so an ordinary recipe fails its type
+// bound instead of selecting logits semantics through a runtime role branch,
+// and a speculative model compiles its own CostTree instead of reusing the
+// ordinary one with dead slots.
+
+/// One decode request in a speculative verify batch.
+///
+/// Unlike [`ArchGroupInput::decode_kv_lens`], `query_len` is explicit because a
+/// verify step may present more than one query row for one request. Keeping the
+/// pair together prevents callers from recovering request count from the
+/// query-row count.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SpeculativeDecodeInput {
+    /// Timing context visible to the final query row of this request's verify
+    /// group. A full-width verify at the model-length boundary clamps this to
+    /// the model limit; durable KV advancement still follows accepted tokens.
+    pub kv_len: u32,
+    /// Query rows emitted for this request in the current verify group.
+    pub query_len: u32,
+}
+
+/// One attention/FFN group view for a speculative iter-wise batch.
+#[derive(Clone, Debug, Default)]
+pub struct SpeculativeArchGroupInput {
+    /// Tokens this group processes this forward pass.
+    pub batch_tokens: u32,
+    /// Of those, the prefill portion (token count).
+    pub prefill_tokens: u32,
+    /// Of those, speculative decode query rows — **not** decode request count.
+    pub decode_tokens: u32,
+    /// Per prefill/chunked request: `(prefix_len, append_len)`.
+    pub prefill_chunk_pairs: Vec<(u32, u32)>,
+    /// Per speculative decode request: final KV length plus verify query rows.
+    pub decode_requests: Vec<SpeculativeDecodeInput>,
+    /// Cumulative resident KV before this verify pass (KV-cache pressure).
+    /// `decode_requests[*].kv_len` is the final verify-row length instead.
+    pub total_kv_len: u32,
+}
+
+impl SpeculativeArchGroupInput {
+    /// Requests represented by this group, counting each decode request once
+    /// however many verify rows it presents.
+    pub fn request_count(&self) -> u32 {
+        u32::try_from(self.prefill_chunk_pairs.len() + self.decode_requests.len())
+            .expect("SpeculativeArchGroupInput request count must fit u32")
+    }
+
+    /// Reset to an empty group, retaining `Vec` capacity, so a worker can refill
+    /// a held input in place each iteration.
+    pub fn clear(&mut self) {
+        self.batch_tokens = 0;
+        self.prefill_tokens = 0;
+        self.decode_tokens = 0;
+        self.total_kv_len = 0;
+        self.prefill_chunk_pairs.clear();
+        self.decode_requests.clear();
+    }
+}
+
+/// Speculative worker's per-iteration input. Deliberately separate from
+/// [`UnifiedArchInput`]: decode query rows and decode request cardinality are
+/// different quantities under draft/verify execution.
+#[derive(Clone, Debug, Default)]
+pub struct SpeculativeArchInput {
+    /// Candidate positions drafted per request this iteration.
+    ///
+    /// This is **not** the number of draft forward passes, and the pass count is
+    /// not derivable from it: a recurrent drafter (MTP, EAGLE) runs one pass per
+    /// candidate, while a block-parallel drafter produces a whole block in one
+    /// pass. The pass count belongs to whatever the model composes as its draft
+    /// stage; this is only the candidate budget the verify pass must cover.
+    ///
+    /// It is also not the verify width. For a chain the width is `k + 1`, but a
+    /// tree submits one row per tree node while advancing at most its depth, so
+    /// per-request rows live in [`SpeculativeDecodeInput::query_len`] instead.
+    /// Models validate this against the width they were built for; it selects a
+    /// profiled kernel shape and therefore cannot vary per iteration.
+    pub draft_tokens: u32,
+    pub groups: Vec<SpeculativeArchGroupInput>,
+    pub tokens_per_source_rank: Vec<u32>,
+}
+
+/// Iter-wise query face for a speculative co-located worker.
+///
+/// Mirrors [`IterwiseUnifiedModel`]'s reusable-buffer protocol but accepts only
+/// [`SpeculativeArchInput`]. A model implements this **instead of**, not in
+/// addition to, the ordinary trait: the two walk different compiled trees, so a
+/// type that offered both would be two models wearing one name.
+pub trait SpeculativeUnifiedModel: Send + Sync + 'static {
+    /// Per-iter cost of one whole speculative iteration: the target verify pass
+    /// over `k + 1` rows per decode request, then the `k` draft passes. Same
+    /// `(slots, scratch) -> LeafMetrics` protocol as
+    /// [`IterwiseUnifiedModel::eval_iter`].
+    fn eval_speculative_iter(
+        &self,
+        batch: &SpeculativeArchInput,
+        slots: &mut Vec<LeafMetrics>,
+        scratch: &mut Vec<LeafMetrics>,
+    ) -> LeafMetrics;
+
+    /// Like [`Self::eval_speculative_iter`], but also captures each leaf's typed
+    /// kernel input for the `cost_log` `slot_input` column.
+    fn eval_speculative_iter_with_inputs(
+        &self,
+        batch: &SpeculativeArchInput,
+        slots: &mut Vec<LeafMetrics>,
+        scratch: &mut Vec<LeafMetrics>,
+        inputs: &mut Vec<SlotInput>,
+    ) -> LeafMetrics {
+        inputs.clear();
+        self.eval_speculative_iter(batch, slots, scratch)
+    }
+
+    /// The `cost_log` manifest for this model's own compiled tree. A speculative
+    /// model's manifest is not the ordinary model's: the draft passes are real
+    /// slots, so the two are structurally distinguishable in a cost-log row.
+    fn cost_log_manifest(&self) -> CostManifest {
+        CostManifest {
+            slots: Vec::new(),
+            nodes: Vec::new(),
+            node_labels: Vec::new(),
+        }
+    }
+
+    /// See [`IterwiseUnifiedModel::total_kv_bytes_per_token`].
+    fn total_kv_bytes_per_token(&self) -> u64;
+
+    /// Maximum context accepted by the model's timing kernels. A verify group
+    /// reaching this bound clamps its final row rather than widening the shape.
+    fn max_model_len(&self) -> u32;
+
+    /// See [`IterwiseUnifiedModel::gpus_per_replica`].
+    fn gpus_per_replica(&self) -> u16;
+
+    /// See [`IterwiseUnifiedModel::num_attn_dp_groups`].
+    fn num_attn_dp_groups(&self) -> u16 {
+        1
+    }
+
+    /// See [`IterwiseUnifiedModel::num_attn_shards`].
+    fn num_attn_shards(&self) -> u16 {
+        (self.gpus_per_replica() / self.num_attn_dp_groups().max(1)).max(1)
+    }
+}
+
+#[cfg(test)]
+mod speculative_arch_input_tests {
+    use super::{SpeculativeArchGroupInput, SpeculativeDecodeInput};
+
+    #[test]
+    fn request_count_counts_requests_not_verify_rows() {
+        // The defect this catches: recovering request count from `decode_tokens`
+        // or from a flat KV-length vector. Two decode requests present twelve
+        // query rows at k=5, and the group holds three requests, not thirteen.
+        let mut group = SpeculativeArchGroupInput {
+            batch_tokens: 15,
+            prefill_tokens: 3,
+            decode_tokens: 12,
+            prefill_chunk_pairs: vec![(0, 3)],
+            decode_requests: vec![
+                SpeculativeDecodeInput {
+                    kv_len: 64,
+                    query_len: 6,
+                },
+                SpeculativeDecodeInput {
+                    kv_len: 91,
+                    query_len: 6,
+                },
+            ],
+            total_kv_len: 155,
+        };
+
+        assert_eq!(group.request_count(), 3);
+
+        group.clear();
+        assert_eq!(group.request_count(), 0);
+        assert_eq!(group.batch_tokens, 0);
+        assert_eq!(group.decode_tokens, 0);
+        assert!(group.decode_requests.capacity() >= 2);
+    }
+}
+
 // ── layer-wise contract (AFD) ────────────────────────────────────────────────
 //
 // AFD (attention-FFN disaggregation) splits a model at the per-layer attn/ffn

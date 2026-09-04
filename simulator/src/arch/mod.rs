@@ -28,7 +28,8 @@ pub mod qwen3_vllm_moe_dp_attn_ep_ffn;
 pub use config::{AttnArchSel, FfnArchSel, IterArchSel, ModelSpec, RoutingKind};
 pub use contract::{
     ArchGroupInput, AttnArchInput, AttnLayerwiseModel, FfnArchInput, FfnLayerwiseModel,
-    IterwiseUnifiedModel, UnifiedArchInput,
+    IterwiseUnifiedModel, SpeculativeArchGroupInput, SpeculativeArchInput, SpeculativeDecodeInput,
+    SpeculativeUnifiedModel, UnifiedArchInput,
 };
 pub use deepseek_v4_vllm::{
     DeepseekV4ModelCfg, DeepseekV4VllmConfigs, DeepseekV4VllmModel, DeepseekV4VllmParallel,
