@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import math
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -549,12 +550,21 @@ def test_glm52_schedule_and_attention_holdouts():
     model = load_model(GLM52)
     assert model.num_layers == 78
     stacks = {stack.tag: stack for stack in model.layers}
-    assert [(stack.tag, stack.count) for stack in model.layers] == [
-        ("dense_full_index", 3),
-        ("sparse_initial_index_share", 3),
-        ("sparse_cycle_full_index", 18),
-        ("sparse_cycle_index_share", 54),
+    assert [(stack.tag, stack.count, stack.stage) for stack in model.layers] == [
+        ("dense_full_index", 3, None),
+        ("sparse_initial_index_share", 3, None),
+        ("sparse_cycle_full_index", 18, None),
+        ("sparse_cycle_index_share", 54, None),
+        # The one MTP layer, entered under two index regimes. Staged, so it is
+        # outside `num_layers` and outside any non-speculative label.
+        ("mtp_first_index", 1, "mtp_first"),
+        ("mtp_recurrent", 1, "mtp_recurrent"),
     ]
+    assert stacks["mtp_first_index"].attn.full_index is True
+    assert stacks["mtp_recurrent"].attn.full_index is False
+    # Both passes read the layer's weights; only the first owns them.
+    assert stacks["mtp_first_index"].distinct_instances == 1
+    assert stacks["mtp_recurrent"].distinct_instances == 0
     assert stacks["dense_full_index"].ffn.__class__.__name__ == "DenseSwiGLU"
     assert stacks["sparse_initial_index_share"].ffn.__class__.__name__ == "MoE"
     assert stacks["dense_full_index"].attn.full_index is True
@@ -1535,7 +1545,10 @@ def test_glm52_fp8_weight_bytes_are_half_the_bf16_checkpoint():
     741.35e9 converted weights at one byte + their FP32 block scales + the 2.03e9
     parameters the checkpoint declines to convert at two bytes. Cross-checked
     against the published `total_size` of 755,617,140,416 bytes minus the MTP
-    layer model.work does not build (~9.96e9) = 745.7e9.
+    layer this non-speculative workload does not run (~9.96e9) = 745.7e9.
+
+    `FULL_LOAD` carries no draft stage, so the prediction walks the body stacks
+    only — the same stacks `label` charged.
     """
     fp8 = load_model(GLM52_FP8)
     bf16 = load_model(GLM52)
@@ -1544,13 +1557,15 @@ def test_glm52_fp8_weight_bytes_are_half_the_bf16_checkpoint():
 
     converted = not_converted = 0
     for stack in fp8.layers:
+        if stack.stage is not None:
+            continue
         for group in (*stack.attn.matmul_groups(), *stack.ffn.matmul_groups()):
             params = group.total_params * stack.count
             if fp8.quant.is_converted(group.module):
                 converted += params
             else:
                 not_converted += params
-    norm_params = sum(norm.elements * norm.count for norm in fp8.norm_weights)
+    norm_params = sum(norm.elements * norm.count for norm in fp8.norm_weights if norm.stage is None)
     embed_and_head = 2 * GLM_VOCAB * GLM_HIDDEN
     predicted = (
         converted
@@ -1663,6 +1678,140 @@ def test_glm52_nvfp4_location_map_consumes_every_semantic_once():
             f"{tag}.expert_gate_up",
             f"{tag}.expert_down",
         ]
+
+
+#: One MTP layer: a full-index DSA block, a sparse MoE, the embedding/hidden
+#: fusion projection, and its own norms. Its output projection is `shared_head`,
+#: tied to `lm_head`, so it adds no head parameters.
+GLM_MTP_PARAMS = (
+    GLM_ATTN_PARAMS
+    + GLM_INDEX_PARAMS
+    + GLM_ROUTER_PARAMS
+    + GLM_EXPERT_PARAMS
+    + GLM_SHARED_PARAMS
+    + GLM_HIDDEN * 2 * GLM_HIDDEN  # eh_proj
+    # input_norm, q_a_norm, kv_a_norm, post_norm, indexer_k_norm, enorm, hnorm,
+    # shared_head norm
+    + (GLM_HIDDEN + GLM_Q_LORA + GLM_KV_LORA + GLM_HIDDEN)
+    + GLM_INDEX_DIM
+    + 3 * GLM_HIDDEN
+)
+
+
+def _speculative_workload(requests: int, kv_len: int, draft_tokens: int) -> Workload:
+    """A verify step for ``requests`` decoders plus the draft passes that fed it.
+
+    The target scores ``draft_tokens + 1`` rows per request. The proposer's first
+    pass forwards that same batch (it is the pass that builds the MTP layer's
+    index) but samples only one row per request; each of the remaining
+    ``draft_tokens - 1`` passes forwards one row per request, one token further
+    along, and samples it.
+    """
+    verify_rows = requests * (draft_tokens + 1)
+    verify = Workload.causal_lm(decode=[kv_len] * verify_rows, sampled=verify_rows)
+    first = Workload.causal_lm(decode=[kv_len] * verify_rows, sampled=requests)
+    recurrent = Workload.causal_lm(
+        decode=[kv_len + step for step in range(1, draft_tokens) for _ in range(requests)],
+        sampled=requests * (draft_tokens - 1),
+    )
+    return replace(verify, stages={"mtp_first": first, "mtp_recurrent": recurrent})
+
+
+def test_glm52_draft_stages_add_the_mtp_layer_and_nothing_else():
+    """A speculative label is the ordinary one plus MTP rows — never a changed one.
+
+    The proposer must not perturb what the target was already charged, or every
+    recorded floor would move the day speculation is switched on.
+    """
+    model = load_model(GLM52)
+    requests, kv_len, draft_tokens = 4, 4096, 5
+    speculative = _speculative_workload(requests, kv_len, draft_tokens)
+    ordinary = Workload.causal_lm(
+        decode=[kv_len] * (requests * (draft_tokens + 1)),
+        sampled=requests * (draft_tokens + 1),
+    )
+
+    plain = {segment.name: segment for segment in model.label(ordinary).segments}
+    spec = {segment.name: segment for segment in model.label(speculative).segments}
+
+    assert set(plain) < set(spec)
+    for name, segment in plain.items():
+        assert (spec[name].flops_total, spec[name].bytes_total) == (
+            segment.flops_total,
+            segment.bytes_total,
+        ), name
+    added = set(spec) - set(plain)
+    assert all(name.startswith(("mtp_first", "mtp_recurrent")) for name in added), added
+
+    # Two passes over one physical layer: its parameters are counted once.
+    assert (
+        model.label(speculative).params["total"] - model.label(ordinary).params["total"]
+        == GLM_MTP_PARAMS
+    )
+
+
+def test_glm52_draft_stage_rows_drive_the_mtp_projections():
+    """Hand-derived: eh_proj scales with a stage's rows, its head with its samples."""
+    model = load_model(GLM52)
+    requests, kv_len, draft_tokens = 4, 4096, 5
+    segments = {
+        segment.name: segment
+        for segment in model.label(_speculative_workload(requests, kv_len, draft_tokens)).segments
+    }
+
+    first_rows = requests * (draft_tokens + 1)
+    recurrent_rows = requests * (draft_tokens - 1)
+    eh_proj_weights = GLM_HIDDEN * 2 * GLM_HIDDEN * GLM_BF16_BYTES
+    for tag, rows in (("mtp_first_index", first_rows), ("mtp_recurrent", recurrent_rows)):
+        eh_proj = segments[f"{tag}.eh_proj"]
+        assert eh_proj.flops_total == 2.0 * rows * GLM_HIDDEN * (2 * GLM_HIDDEN)
+        # Both passes re-read the one layer's weights: the draft steps are
+        # serially dependent, so nothing can fuse the reads away.
+        assert eh_proj.bytes_total == eh_proj_weights
+
+    # `shared_head` is tied to lm_head, so the draft head is FLOPs without bytes.
+    assert segments["mtp_first.lm_head"].flops_total == 2.0 * requests * GLM_HIDDEN * GLM_VOCAB
+    assert segments["mtp_recurrent.lm_head"].flops_total == (
+        2.0 * recurrent_rows * GLM_HIDDEN * GLM_VOCAB
+    )
+    assert segments["mtp_first.lm_head"].bytes_total == 0.0
+    assert segments["mtp_recurrent.lm_head"].bytes_total == 0.0
+
+    # Only the first pass builds the DSA index; the rest reuse it.
+    assert "mtp_first_index.indexer.decode" in segments
+    assert not any(name.startswith("mtp_recurrent.indexer") for name in segments)
+
+
+def test_glm52_nvfp4_leaves_the_mtp_layer_experts_in_bf16():
+    """`routed_experts_only` is layer-relative, and the MTP layer is not converted.
+
+    A layer-relative rule cannot say "every `mlp.experts` except layer 78", so the
+    MTP stack names its modules under `nextn` to stay out of it. Billing those
+    experts at FP4 would put the floor below the BF16 weights the layer holds.
+    """
+    model = load_model(GLM52_NVFP4)
+    converted = {
+        (stack.tag, group.name)
+        for stack in model.layers
+        for group in stack.ffn.matmul_groups()
+        if model.quant.is_converted(group.module)
+    }
+    assert {tag for tag, _ in converted} == {
+        "sparse_initial_index_share",
+        "sparse_cycle_full_index",
+        "sparse_cycle_index_share",
+    }
+
+    mtp = next(stack for stack in model.layers if stack.tag == "mtp_first_index")
+    gate_up = next(group for group in mtp.ffn.matmul_groups() if group.name == "expert_gate_up")
+    assert model.weight_bytes_per_instance(gate_up) == gate_up.n * gate_up.k * GLM_BF16_BYTES
+    assert model.matmul_compute_dtype(gate_up) == "bf16"
+
+
+def test_glm52_rejects_a_workload_naming_an_unknown_stage():
+    model = load_model(GLM52)
+    with pytest.raises(ValueError, match="no layer stack runs"):
+        model.label(Workload(matmul_tokens=8, head_positions=1, stages={"typo": FULL_LOAD}))
 
 
 def test_glm52_fp8_compute_floor_is_mixed_not_globally_fp8():
