@@ -374,6 +374,9 @@ pub fn build_configs(
         gpu_name: gpu.clone(),
         hidden_dim: model.hidden_dim.clone(),
         vocab_size: model.vocab_size.clone(),
+        // Same divisor the main lm_head below uses: this arch runs the EP group
+        // as its TP group, and the MTP head is that same `ParallelLMHead`.
+        tp_size: parallel.ep_size,
         dtype: DType::Bf16,
         gemm_dtype,
     });
@@ -1808,6 +1811,30 @@ mod tests {
             .all(|rank| rank.experts_per_device == 64));
         assert!(resolved.sparse_router.router_fp32_cast.is_none());
         assert!(resolved.sparse_router.router_select.is_none());
+    }
+
+    #[test]
+    fn both_lm_heads_shard_the_vocabulary_by_the_same_degree() {
+        // This arch runs the EP group as its TP group, so both heads divide by
+        // `ep_size`. The MTP output head is the same `ParallelLMHead` as the
+        // main head, one layer later; billing one sharded and the other whole
+        // charges this rank for every other rank's logits.
+        let cfg = build_configs(
+            &model(),
+            &parallel(4),
+            &RoutingDistribution::uniform(NUM_EXPERTS),
+            false,
+            Glm52MtpMode::FullIndex,
+        )
+        .unwrap();
+        let resolved = resolve_configs(&cfg);
+        let mtp_head = resolved.mtp_head.as_ref().unwrap();
+
+        assert_eq!(resolved.lm_head.n, mtp_head.lm_head.n);
+        assert_eq!(mtp_head.lm_head.n, VOCAB_SIZE / 4);
+        assert_eq!(mtp_head.vocab_size_per_rank, VOCAB_SIZE / 4);
+        // Hidden is never sharded, on either head.
+        assert_eq!(resolved.lm_head.k, mtp_head.lm_head.k);
     }
 
     #[test]

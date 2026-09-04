@@ -457,6 +457,11 @@ pub fn build_configs(
         gpu_name: gpu.clone(),
         hidden_dim: model.hidden_dim.clone(),
         vocab_size: model.vocab_size.clone(),
+        // This arch has no tensor parallelism: attention is TP1 and
+        // independently replicated over the EP ranks, so every rank holds the
+        // whole `ParallelLMHead` and runs it on its own token slice. That is
+        // why the main lm_head below is unsharded too.
+        tp_size: 1,
         dtype: DType::Bf16,
         gemm_dtype,
     });
