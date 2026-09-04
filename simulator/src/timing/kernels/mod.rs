@@ -4,6 +4,7 @@ pub mod all_reduce;
 pub mod all_reduce_fusion;
 pub mod all_reduce_residual_rms_norm;
 pub mod batched_gemm;
+pub mod bf16_fused_moe;
 pub mod clamped_swiglu;
 pub mod deepseek_v4_fused_inv_rope_fp8_quant;
 pub mod deepseek_v4_fused_q_kv_rmsnorm;
@@ -86,6 +87,9 @@ pub use all_reduce_residual_rms_norm::{
 };
 pub use batched_gemm::{
     BatchedGemmKernel, BatchedGemmKernelConfig, BatchedGemmKernelInput, BatchedGemmSpec,
+};
+pub use bf16_fused_moe::{
+    Bf16FusedMoeKernel, Bf16FusedMoeKernelConfig, Bf16FusedMoeKernelInput, Bf16FusedMoeSpec,
 };
 pub use clamped_swiglu::{
     ClampedSwigluKernel, ClampedSwigluKernelConfig, ClampedSwigluKernelInput, ClampedSwigluSpec,
