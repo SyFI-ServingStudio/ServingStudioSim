@@ -48,7 +48,7 @@ pub use glm52_vllm_dsa_moe::{
 };
 pub use glm52_vllm_nvfp4_dsa_moe::{
     Glm52VllmNvfp4DsaMoeConfigs, Glm52VllmNvfp4DsaMoeModel, Glm52VllmNvfp4DsaMoeParallel,
-    Glm52VllmNvfp4DsaMoeResolved,
+    Glm52VllmNvfp4DsaMoeResolved, Glm52VllmNvfp4DsaMoeSpeculativeModel,
 };
 pub use llama3_dense::{DenseParallel, Llama3DenseModel};
 pub use llama3_dense_tp::{DenseTpParallel, Llama3DenseTpModel};
