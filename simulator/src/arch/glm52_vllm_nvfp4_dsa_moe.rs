@@ -894,32 +894,44 @@ struct Glm52MtpSection {
     head: Glm52MtpHeadLocalWorklet,
 }
 
+/// Layers 0..77 plus the output head: the forward pass every GLM-5.2 NVFP4
+/// deployment runs, speculating or not.
+///
+/// It is its own struct so that the two models can share it by composition
+/// rather than one wrapping the other. The ordinary model appends a decode-only
+/// MTP pass to this section; the speculative model appends a draft stage that
+/// runs a different number of times and bills different shapes. Neither is a
+/// special case of the other, so neither owns the other -- they own this.
+struct Glm52TargetForward {
+    name: String,
+    ep_size: u16,
+    embedding: Op<ElementwiseKernel>,
+    embedding_allreduce_fallback: Op<AllReduceKernel>,
+    embedding_allreduce_fusion: Op<AllReduceFusionKernel>,
+    embedding_allreduce_max_fused_tokens: u32,
+    dense_full_index_attention: VllmGlm52DsaAttnLocalWorklet,
+    dense_ffn: Glm52DenseFfnLocalWorklet,
+    dense_attention_allreduce: Op<AllReduceKernel>,
+    dense_attention_allreduce_fused: Op<AllReduceResidualRmsNormKernel>,
+    dense_attention_allreduce_max_fused_tokens: u32,
+    dense_ffn_allreduce_fallback: Op<AllReduceKernel>,
+    dense_ffn_allreduce_fusion: Op<AllReduceFusionKernel>,
+    dense_ffn_allreduce_max_fused_tokens: u32,
+    initial_shared_sparse: Glm52SparseBody,
+    cycle_full_sparse: Glm52SparseBody,
+    cycle_shared_sparse: Glm52SparseBody,
+    final_norm: Op<ResidualRmsNormKernel>,
+    lm_head: Op<SingleGemmKernel>,
+}
+
 pub struct Glm52VllmNvfp4DsaMoeModel {
-    pub name: String,
+    target: Glm52TargetForward,
     pub mtp_mode: Glm52MtpMode,
-    pub ep_size: u16,
     pub nvl_num_gpu: u16,
     pub max_model_len: u32,
     pub num_attn_dp_groups: u16,
     pub num_attn_shards: u16,
     pub total_state_bytes_per_token: u64,
-    pub embedding: Op<ElementwiseKernel>,
-    pub embedding_allreduce_fallback: Op<AllReduceKernel>,
-    pub embedding_allreduce_fusion: Op<AllReduceFusionKernel>,
-    pub embedding_allreduce_max_fused_tokens: u32,
-    pub dense_full_index_attention: VllmGlm52DsaAttnLocalWorklet,
-    pub dense_ffn: Glm52DenseFfnLocalWorklet,
-    pub dense_attention_allreduce: Op<AllReduceKernel>,
-    pub dense_attention_allreduce_fused: Op<AllReduceResidualRmsNormKernel>,
-    pub dense_attention_allreduce_max_fused_tokens: u32,
-    pub dense_ffn_allreduce_fallback: Op<AllReduceKernel>,
-    pub dense_ffn_allreduce_fusion: Op<AllReduceFusionKernel>,
-    pub dense_ffn_allreduce_max_fused_tokens: u32,
-    initial_shared_sparse: Glm52SparseBody,
-    cycle_full_sparse: Glm52SparseBody,
-    cycle_shared_sparse: Glm52SparseBody,
-    pub final_norm: Op<ResidualRmsNormKernel>,
-    pub lm_head: Op<SingleGemmKernel>,
     mtp: Option<Glm52MtpSection>,
     cost_flat: Vec<FlatCostNode>,
     n_slots: usize,
@@ -1051,31 +1063,33 @@ pub fn build(
 
     let total_state_bytes_per_token = state_bytes_per_token(ep_size, mtp_mode)?;
     let mut model = Glm52VllmNvfp4DsaMoeModel {
-        name,
+        target: Glm52TargetForward {
+            name,
+            ep_size,
+            embedding,
+            embedding_allreduce_fallback,
+            embedding_allreduce_fusion,
+            embedding_allreduce_max_fused_tokens,
+            dense_full_index_attention,
+            dense_ffn,
+            dense_attention_allreduce,
+            dense_attention_allreduce_fused,
+            dense_attention_allreduce_max_fused_tokens,
+            dense_ffn_allreduce_fallback,
+            dense_ffn_allreduce_fusion,
+            dense_ffn_allreduce_max_fused_tokens,
+            initial_shared_sparse,
+            cycle_full_sparse,
+            cycle_shared_sparse,
+            final_norm,
+            lm_head,
+        },
         mtp_mode,
-        ep_size,
         nvl_num_gpu,
         max_model_len,
         num_attn_dp_groups: 1,
         num_attn_shards: ep_size,
         total_state_bytes_per_token,
-        embedding,
-        embedding_allreduce_fallback,
-        embedding_allreduce_fusion,
-        embedding_allreduce_max_fused_tokens,
-        dense_full_index_attention,
-        dense_ffn,
-        dense_attention_allreduce,
-        dense_attention_allreduce_fused,
-        dense_attention_allreduce_max_fused_tokens,
-        dense_ffn_allreduce_fallback,
-        dense_ffn_allreduce_fusion,
-        dense_ffn_allreduce_max_fused_tokens,
-        initial_shared_sparse,
-        cycle_full_sparse,
-        cycle_shared_sparse,
-        final_norm,
-        lm_head,
         mtp,
         cost_flat: Vec::new(),
         n_slots: 0,
@@ -1086,40 +1100,44 @@ pub fn build(
     Ok(model)
 }
 
-impl Glm52VllmNvfp4DsaMoeModel {
-    pub fn cost_tree(&self) -> CostTree {
-        let mut builder = CostTreeBuilder::new();
+impl Glm52TargetForward {
+    /// The target forward's cost-tree children, in evaluation order.
+    ///
+    /// Returned rather than wrapped in a root so that each model can append its
+    /// own tail -- the MTP pass or the draft stage -- into the same builder and
+    /// label the root for itself. The slot order is the order of this vector,
+    /// so it is also the shared prefix of both models' cost logs.
+    fn compile_children(&self, builder: &mut CostTreeBuilder) -> Vec<CostNode> {
         let embedding = labeled_max(
             format!("{}.main.embedding [Max over TP ranks]", self.name),
             (0..self.ep_size)
-                .map(|_| self.embedding.compile(&mut builder))
+                .map(|_| self.embedding.compile(builder))
                 .collect(),
         );
-        let embedding_allreduce_fallback = self.embedding_allreduce_fallback.compile(&mut builder);
-        let embedding_allreduce_fusion = self.embedding_allreduce_fusion.compile(&mut builder);
+        let embedding_allreduce_fallback = self.embedding_allreduce_fallback.compile(builder);
+        let embedding_allreduce_fusion = self.embedding_allreduce_fusion.compile(builder);
         let dense_attention = labeled_max(
             format!(
                 "{}.body.dense_full_index.attention [Max over TP ranks]",
                 self.name
             ),
             (0..self.ep_size)
-                .map(|_| self.dense_full_index_attention.compile(&mut builder))
+                .map(|_| self.dense_full_index_attention.compile(builder))
                 .collect(),
         );
-        let dense_attention_allreduce = self.dense_attention_allreduce.compile(&mut builder);
-        let dense_attention_allreduce_fused =
-            self.dense_attention_allreduce_fused.compile(&mut builder);
+        let dense_attention_allreduce = self.dense_attention_allreduce.compile(builder);
+        let dense_attention_allreduce_fused = self.dense_attention_allreduce_fused.compile(builder);
         let dense_ffn = labeled_max(
             format!(
                 "{}.body.dense_full_index.ffn [Max over TP ranks]",
                 self.name
             ),
             (0..self.ep_size)
-                .map(|_| self.dense_ffn.compile(&mut builder))
+                .map(|_| self.dense_ffn.compile(builder))
                 .collect(),
         );
-        let dense_ffn_allreduce_fallback = self.dense_ffn_allreduce_fallback.compile(&mut builder);
-        let dense_ffn_allreduce_fusion = self.dense_ffn_allreduce_fusion.compile(&mut builder);
+        let dense_ffn_allreduce_fallback = self.dense_ffn_allreduce_fallback.compile(builder);
+        let dense_ffn_allreduce_fusion = self.dense_ffn_allreduce_fusion.compile(builder);
         let dense = CostNode::Labeled {
             label: "layers 0..2: dense + full index (3 layers)".to_string(),
             child: Box::new(CostNode::Scale {
@@ -1138,7 +1156,7 @@ impl Glm52VllmNvfp4DsaMoeModel {
             label: "layers 3..5: sparse + IndexShare (3 layers)".to_string(),
             child: Box::new(CostNode::Scale {
                 n: NUM_INITIAL_SHARED_LAYERS,
-                child: Box::new(self.initial_shared_sparse.compile(&mut builder)),
+                child: Box::new(self.initial_shared_sparse.compile(builder)),
             }),
         };
         let cycle = CostNode::Labeled {
@@ -1146,10 +1164,10 @@ impl Glm52VllmNvfp4DsaMoeModel {
             child: Box::new(CostNode::Scale {
                 n: NUM_SPARSE_CYCLES,
                 child: Box::new(CostNode::Sum(vec![
-                    self.cycle_full_sparse.compile(&mut builder),
+                    self.cycle_full_sparse.compile(builder),
                     CostNode::Scale {
                         n: NUM_SHARED_PER_CYCLE,
-                        child: Box::new(self.cycle_shared_sparse.compile(&mut builder)),
+                        child: Box::new(self.cycle_shared_sparse.compile(builder)),
                     },
                 ])),
             }),
@@ -1160,16 +1178,16 @@ impl Glm52VllmNvfp4DsaMoeModel {
                 self.name
             ),
             (0..self.ep_size)
-                .map(|_| self.final_norm.compile(&mut builder))
+                .map(|_| self.final_norm.compile(builder))
                 .collect(),
         );
         let lm_head = labeled_max(
             format!("{}.main.lm_head [Max over TP ranks]", self.name),
             (0..self.ep_size)
-                .map(|_| self.lm_head.compile(&mut builder))
+                .map(|_| self.lm_head.compile(builder))
                 .collect(),
         );
-        let mut children = vec![
+        vec![
             embedding,
             embedding_allreduce_fallback,
             embedding_allreduce_fusion,
@@ -1178,41 +1196,14 @@ impl Glm52VllmNvfp4DsaMoeModel {
             cycle,
             final_norm,
             lm_head,
-        ];
-        if let Some(mtp) = &self.mtp {
-            let prelude = labeled_max(
-                format!("{}.mtp.prelude [Max over TP ranks]", self.name),
-                (0..self.ep_size)
-                    .map(|_| mtp.prelude.compile(&mut builder))
-                    .collect(),
-            );
-            let decoder = mtp.decoder.compile(&mut builder);
-            let head = labeled_max(
-                format!("{}.mtp.head [Max over TP ranks]", self.name),
-                (0..self.ep_size)
-                    .map(|_| mtp.head.compile(&mut builder))
-                    .collect(),
-            );
-            children.push(CostNode::Labeled {
-                label: format!("MTP layer 78 [{:?}; decode-only]", self.mtp_mode),
-                child: Box::new(CostNode::Sum(vec![prelude, decoder, head])),
-            });
-        }
-        let root = CostNode::Labeled {
-            label: format!(
-                "{} (Glm52VllmNvfp4DsaMoeModel) [TP=EP{}; attention DP groups={}; MTP={:?}; \
-                 timing_context<={}]",
-                self.name, self.ep_size, self.num_attn_dp_groups, self.mtp_mode, self.max_model_len
-            ),
-            child: Box::new(CostNode::Sum(children)),
-        };
-        builder.finish(root)
+        ]
     }
 
-    fn eval_into(&self, input: &UnifiedArchInput, ev: &mut Evaluator) {
-        let batch = normalize_input(input, self.ep_size, self.max_model_len)
-            .unwrap_or_else(|reason| panic!("invalid Glm52VllmNvfp4DsaMoeModel input: {reason}"));
-
+    /// Evaluates layers 0..77 and the output head into the shared slot prefix.
+    ///
+    /// The slot order matches `compile_children`, so a model that appends its
+    /// own tail after calling this fills the same prefix either way.
+    fn eval(&self, batch: &NormalizedBatch, ev: &mut Evaluator) {
         let group = &batch.groups[0];
         for _ in 0..self.ep_size {
             eval_atomic_or_zero(
@@ -1292,9 +1283,9 @@ impl Glm52VllmNvfp4DsaMoeModel {
             !use_dense_ffn_fusion,
             ev,
         );
-        self.initial_shared_sparse.eval(&batch, ev);
-        self.cycle_full_sparse.eval(&batch, ev);
-        self.cycle_shared_sparse.eval(&batch, ev);
+        self.initial_shared_sparse.eval(batch, ev);
+        self.cycle_full_sparse.eval(batch, ev);
+        self.cycle_shared_sparse.eval(batch, ev);
         for _ in 0..self.ep_size {
             eval_atomic_or_zero(
                 &self.final_norm,
@@ -1315,9 +1306,55 @@ impl Glm52VllmNvfp4DsaMoeModel {
                 ev,
             );
         }
+    }
+}
+
+impl Glm52VllmNvfp4DsaMoeModel {
+    pub fn cost_tree(&self) -> CostTree {
+        let mut builder = CostTreeBuilder::new();
+        let mut children = self.target.compile_children(&mut builder);
+        if let Some(mtp) = &self.mtp {
+            let prelude = labeled_max(
+                format!("{}.mtp.prelude [Max over TP ranks]", self.target.name),
+                (0..self.target.ep_size)
+                    .map(|_| mtp.prelude.compile(&mut builder))
+                    .collect(),
+            );
+            let decoder = mtp.decoder.compile(&mut builder);
+            let head = labeled_max(
+                format!("{}.mtp.head [Max over TP ranks]", self.target.name),
+                (0..self.target.ep_size)
+                    .map(|_| mtp.head.compile(&mut builder))
+                    .collect(),
+            );
+            children.push(CostNode::Labeled {
+                label: format!("MTP layer 78 [{:?}; decode-only]", self.mtp_mode),
+                child: Box::new(CostNode::Sum(vec![prelude, decoder, head])),
+            });
+        }
+        let root = CostNode::Labeled {
+            label: format!(
+                "{} (Glm52VllmNvfp4DsaMoeModel) [TP=EP{}; attention DP groups={}; MTP={:?}; \
+                 timing_context<={}]",
+                self.target.name,
+                self.target.ep_size,
+                self.num_attn_dp_groups,
+                self.mtp_mode,
+                self.max_model_len
+            ),
+            child: Box::new(CostNode::Sum(children)),
+        };
+        builder.finish(root)
+    }
+
+    fn eval_into(&self, input: &UnifiedArchInput, ev: &mut Evaluator) {
+        let batch = normalize_input(input, self.target.ep_size, self.max_model_len)
+            .unwrap_or_else(|reason| panic!("invalid Glm52VllmNvfp4DsaMoeModel input: {reason}"));
+        self.target.eval(&batch, ev);
 
         if let Some(mtp) = &self.mtp {
-            for _ in 0..self.ep_size {
+            let group = &batch.groups[0];
+            for _ in 0..self.target.ep_size {
                 mtp.prelude.eval(
                     &Glm52MtpPreludeLocalWorkletInput {
                         batch_tokens: group.decode_tokens,
@@ -1327,7 +1364,7 @@ impl Glm52VllmNvfp4DsaMoeModel {
             }
             let mtp_batch = batch.decode_only();
             mtp.decoder.eval(&mtp_batch, ev);
-            for _ in 0..self.ep_size {
+            for _ in 0..self.target.ep_size {
                 mtp.head.eval(
                     &Glm52MtpHeadLocalWorkletInput {
                         batch_tokens: group.decode_tokens,
@@ -1345,7 +1382,7 @@ impl IterwiseUnifiedModel for Glm52VllmNvfp4DsaMoeModel {
     }
 
     fn gpus_per_replica(&self) -> u16 {
-        self.ep_size
+        self.target.ep_size
     }
 
     fn num_attn_dp_groups(&self) -> u16 {
