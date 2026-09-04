@@ -183,8 +183,16 @@ pub struct Glm52VllmNvfp4DsaMoeConfigs {
     pub final_norm: ResidualRmsNormKernelConfig,
     pub lm_head: SingleGemmKernelConfig,
     pub mtp_prelude: Option<Glm52MtpPreludeLocalWorkletConfig>,
+    /// The proposer's first call, which forwards the whole scheduled batch.
     pub mtp_attention: Option<VllmGlm52DsaAttnLocalWorkletConfig>,
+    /// The proposer's later calls, one query row per request. Present only when
+    /// the recipe asks for a draft deeper than one.
+    pub mtp_recurrent_attention: Option<VllmGlm52DsaAttnLocalWorkletConfig>,
     pub mtp_head: Option<Glm52MtpHeadLocalWorkletConfig>,
+    /// Candidate positions the recipe asks the proposer to draft per request.
+    /// `None` is an ordinary recipe, and only `Some` may build a speculative
+    /// model -- the two are checked against each other at build time.
+    pub speculative_draft_tokens: Option<u32>,
 }
 
 #[derive(Clone, Debug)]
@@ -207,6 +215,7 @@ pub struct Glm52VllmNvfp4DsaMoeResolved {
     pub lm_head: SingleGemmKernelConfig,
     pub mtp_prelude: Option<Glm52MtpPreludeLocalWorkletResolved>,
     pub mtp_attention: Option<VllmGlm52DsaAttnLocalWorkletResolved>,
+    pub mtp_recurrent_attention: Option<VllmGlm52DsaAttnLocalWorkletResolved>,
     pub mtp_head: Option<Glm52MtpHeadLocalWorkletResolved>,
 }
 
@@ -222,6 +231,7 @@ fn attention_config(
     parallel: &Glm52VllmNvfp4DsaMoeParallel,
     include_indexer: bool,
     fp8: bool,
+    decode_next_n: u32,
 ) -> VllmGlm52DsaAttnLocalWorkletConfig {
     let (gemm_dtype, gemm_backends) = if fp8 {
         (DType::Fp8E4m3, FP8_SINGLE_GEMM_BACKENDS)
@@ -297,7 +307,7 @@ fn attention_config(
             prefill_index_distribution: "recent_contiguous".to_string(),
             page_table_mapping: Some("request_contiguous".to_string()),
         }),
-        decode_next_n: 1,
+        decode_next_n,
     }
 }
 
@@ -307,6 +317,60 @@ pub fn build_configs(
     routing: &RoutingDistribution,
     fp8: bool,
     mtp_mode: Glm52MtpMode,
+) -> Result<Glm52VllmNvfp4DsaMoeConfigs, BuildError> {
+    // Every decode request submits one query row, so the sparse-MLA leaves
+    // sweep the width-1 identity and there is no recurrent draft pass.
+    build_configs_for_decode(model, parallel, routing, routing, fp8, mtp_mode, 1, None)
+}
+
+/// The same recipe with a `draft_tokens`-deep MTP proposer in front of it.
+///
+/// `draft_routing` is the MTP layer's own expert-routing evidence: it is one
+/// layer with its own load distribution, not a slice of the body's.
+pub fn build_speculative_configs(
+    model: &Glm52ModelCfg,
+    parallel: &Glm52VllmNvfp4DsaMoeParallel,
+    target_routing: &RoutingDistribution,
+    draft_routing: &RoutingDistribution,
+    fp8: bool,
+    mtp_mode: Glm52MtpMode,
+    draft_tokens: u32,
+) -> Result<Glm52VllmNvfp4DsaMoeConfigs, BuildError> {
+    if draft_tokens == 0 {
+        return Err(fit_failed("speculative draft_tokens must be positive"));
+    }
+    if mtp_mode == Glm52MtpMode::Off {
+        return Err(fit_failed(
+            "speculative GLM-5.2 build requires mtp_mode != off",
+        ));
+    }
+    // The target verifies the drafted positions and the token they extend, so
+    // one decode request submits `draft_tokens + 1` query rows per iteration.
+    let decode_next_n = draft_tokens
+        .checked_add(1)
+        .ok_or_else(|| fit_failed("speculative draft_tokens + 1 overflows u32"))?;
+    build_configs_for_decode(
+        model,
+        parallel,
+        target_routing,
+        draft_routing,
+        fp8,
+        mtp_mode,
+        decode_next_n,
+        Some(draft_tokens),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_configs_for_decode(
+    model: &Glm52ModelCfg,
+    parallel: &Glm52VllmNvfp4DsaMoeParallel,
+    routing: &RoutingDistribution,
+    mtp_routing: &RoutingDistribution,
+    fp8: bool,
+    mtp_mode: Glm52MtpMode,
+    decode_next_n: u32,
+    speculative_draft_tokens: Option<u32>,
 ) -> Result<Glm52VllmNvfp4DsaMoeConfigs, BuildError> {
     validate_model_cfg(model).map_err(fit_failed)?;
     if parallel.ep_size == 0 {
@@ -350,20 +414,41 @@ pub fn build_configs(
         (DType::Bf16, SINGLE_GEMM_BACKENDS)
     };
     let gpu = parallel.gpu_name.clone();
-    let dense_full_index_attention = attention_config(model, parallel, true, fp8);
-    let initial_shared_attention = attention_config(model, parallel, false, fp8);
-    let cycle_full_attention = attention_config(model, parallel, true, fp8);
-    let cycle_shared_attention = attention_config(model, parallel, false, fp8);
+    let dense_full_index_attention = attention_config(model, parallel, true, fp8, decode_next_n);
+    let initial_shared_attention = attention_config(model, parallel, false, fp8, decode_next_n);
+    let cycle_full_attention = attention_config(model, parallel, true, fp8, decode_next_n);
+    let cycle_shared_attention = attention_config(model, parallel, false, fp8, decode_next_n);
     let hidden_bytes = HIDDEN_DIM
         .checked_mul(DType::Bf16.size_bytes())
         .ok_or_else(|| fit_failed("hidden byte width overflows u32"))?;
     let embedding_input = hidden_bytes
         .checked_add(8)
         .ok_or_else(|| fit_failed("embedding input byte rate overflows u32"))?;
+    // The proposer's first call is not a one-row decode. It forwards the
+    // target's complete scheduled-token batch so the MTP layer can fill its own
+    // attention state, then samples only request endpoints; later calls are one
+    // row per request. `IndexShare` reuses a previous layer's top-k, which the
+    // first call cannot do because it is the call that builds the state -- so
+    // when speculating, the first pass always computes the indexer and only the
+    // recurrent passes may share it.
     let mtp_attention = match mtp_mode {
         Glm52MtpMode::Off => None,
-        Glm52MtpMode::FullIndex => Some(attention_config(model, parallel, true, fp8)),
-        Glm52MtpMode::IndexShare => Some(attention_config(model, parallel, false, fp8)),
+        Glm52MtpMode::FullIndex | Glm52MtpMode::IndexShare => Some(attention_config(
+            model,
+            parallel,
+            mtp_mode == Glm52MtpMode::FullIndex || speculative_draft_tokens.is_some(),
+            fp8,
+            decode_next_n,
+        )),
+    };
+    // A one-deep draft has no pass after its first, so it has no recurrent
+    // config to build.
+    let mtp_recurrent_attention = match (mtp_mode, speculative_draft_tokens) {
+        (Glm52MtpMode::Off, _) | (_, None | Some(1)) => None,
+        (Glm52MtpMode::FullIndex, Some(_)) => Some(attention_config(model, parallel, true, fp8, 1)),
+        (Glm52MtpMode::IndexShare, Some(_)) => {
+            Some(attention_config(model, parallel, false, fp8, 1))
+        }
     };
     let mtp_prelude = (mtp_mode != Glm52MtpMode::Off).then(|| Glm52MtpPreludeLocalWorkletConfig {
         elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
@@ -440,7 +525,7 @@ pub fn build_configs(
                 layerwise_global_ppm: Vec::new(),
                 folded_rank_position: 0,
             },
-            routing,
+            mtp_routing,
             1,
         )
     });
@@ -561,7 +646,9 @@ pub fn build_configs(
         },
         mtp_prelude,
         mtp_attention,
+        mtp_recurrent_attention,
         mtp_head,
+        speculative_draft_tokens,
     })
 }
 
@@ -702,6 +789,10 @@ pub fn resolve_configs(cfgs: &Glm52VllmNvfp4DsaMoeConfigs) -> Glm52VllmNvfp4DsaM
             .map(Glm52MtpPreludeLocalWorklet::resolve_config),
         mtp_attention: cfgs
             .mtp_attention
+            .as_ref()
+            .map(VllmGlm52DsaAttnLocalWorklet::resolve_config),
+        mtp_recurrent_attention: cfgs
+            .mtp_recurrent_attention
             .as_ref()
             .map(VllmGlm52DsaAttnLocalWorklet::resolve_config),
         mtp_head: cfgs
@@ -2104,6 +2195,100 @@ mod tests {
             Glm52MtpMode::Off,
         )
         .is_err());
+    }
+
+    #[test]
+    fn a_speculative_recipe_widens_the_target_and_keeps_the_proposer_narrow() {
+        let cfg = build_speculative_configs(
+            &model(),
+            &parallel(4),
+            &RoutingDistribution::uniform(NUM_EXPERTS),
+            &RoutingDistribution::uniform(NUM_EXPERTS),
+            false,
+            Glm52MtpMode::IndexShare,
+            5,
+        )
+        .unwrap();
+
+        // The target verifies the five drafted positions plus the token they
+        // extend, so every one of its attention sections sweeps width 6.
+        for attention in [
+            &cfg.dense_full_index_attention,
+            &cfg.initial_shared_attention,
+            &cfg.cycle_full_attention,
+            &cfg.cycle_shared_attention,
+        ] {
+            assert_eq!(attention.decode_next_n, 6);
+        }
+        assert_eq!(cfg.speculative_draft_tokens, Some(5));
+
+        // The proposer's first call forwards the target's whole batch, so it
+        // shares the target's width -- and it builds the index state the
+        // recurrent calls reuse, so it computes the indexer even under
+        // `IndexShare`.
+        let first = cfg.mtp_attention.as_ref().unwrap();
+        assert_eq!(first.decode_next_n, 6);
+        assert!(first.include_indexer);
+
+        // The recurrent calls are one row per request and may share the index.
+        let recurrent = cfg.mtp_recurrent_attention.as_ref().unwrap();
+        assert_eq!(recurrent.decode_next_n, 1);
+        assert!(!recurrent.include_indexer);
+    }
+
+    #[test]
+    fn a_one_deep_draft_has_no_recurrent_pass_to_configure() {
+        let cfg = build_speculative_configs(
+            &model(),
+            &parallel(4),
+            &RoutingDistribution::uniform(NUM_EXPERTS),
+            &RoutingDistribution::uniform(NUM_EXPERTS),
+            false,
+            Glm52MtpMode::IndexShare,
+            1,
+        )
+        .unwrap();
+        assert_eq!(cfg.dense_full_index_attention.decode_next_n, 2);
+        assert!(cfg.mtp_recurrent_attention.is_none());
+    }
+
+    #[test]
+    fn a_speculative_recipe_needs_a_proposer_and_a_positive_depth() {
+        let routing = RoutingDistribution::uniform(NUM_EXPERTS);
+        assert!(build_speculative_configs(
+            &model(),
+            &parallel(4),
+            &routing,
+            &routing,
+            false,
+            Glm52MtpMode::Off,
+            5,
+        )
+        .is_err());
+        assert!(build_speculative_configs(
+            &model(),
+            &parallel(4),
+            &routing,
+            &routing,
+            false,
+            Glm52MtpMode::IndexShare,
+            0,
+        )
+        .is_err());
+
+        // An ordinary recipe is width 1 everywhere and records no depth.
+        let ordinary = build_configs(
+            &model(),
+            &parallel(4),
+            &routing,
+            false,
+            Glm52MtpMode::IndexShare,
+        )
+        .unwrap();
+        assert_eq!(ordinary.dense_full_index_attention.decode_next_n, 1);
+        assert_eq!(ordinary.mtp_attention.as_ref().unwrap().decode_next_n, 1);
+        assert!(ordinary.mtp_recurrent_attention.is_none());
+        assert!(ordinary.speculative_draft_tokens.is_none());
     }
 
     #[test]
