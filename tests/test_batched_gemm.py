@@ -160,11 +160,11 @@ def test_runner_rejects_nonpositive_dimensions_before_cuda(
         _validate_args(num_batches, m, n, k, DType.BF16)
 
 
-@pytest.mark.parametrize("num_batches", [1, 8, 63, 128])
+@pytest.mark.parametrize("num_batches", [1, 63, 128])
 def test_runner_rejects_unsupported_head_counts(num_batches):
     from profiling.runners.gemm.batched_gemm import _validate_args
 
-    with pytest.raises(ValueError, match=r"num_batches in \{16, 32, 64\}"):
+    with pytest.raises(ValueError, match=r"num_batches in \[8, 16, 32, 64\]"):
         _validate_args(num_batches, 1, 512, 192, DType.BF16)
 
 
@@ -226,11 +226,11 @@ def test_v_up_rejects_nonpositive_dimensions_before_cuda(
         _validate_v_up_args(num_batches, m, n, k, DType.BF16)
 
 
-@pytest.mark.parametrize("num_batches", [1, 8, 63, 128])
+@pytest.mark.parametrize("num_batches", [1, 63, 128])
 def test_v_up_rejects_unsupported_head_counts(num_batches):
     from profiling.runners.gemm.batched_gemm import _validate_v_up_args
 
-    with pytest.raises(ValueError, match=r"num_batches in \{16, 32, 64\}"):
+    with pytest.raises(ValueError, match=r"num_batches in \[8, 16, 32, 64\]"):
         _validate_v_up_args(num_batches, 1, 256, 512, DType.BF16)
 
 
@@ -271,7 +271,7 @@ def test_v_up_rejects_missing_cuda_and_unverified_gpu():
         _validate_v_up_cuda_device(h100)
 
 
-@pytest.mark.parametrize("num_batches", [64, 32, 16])
+@pytest.mark.parametrize("num_batches", [64, 32, 16, 8])
 def test_q_absorb_operand_constructor_matches_vllm_layout(num_batches):
     from profiling.runners.gemm.batched_gemm import _build_q_absorb_operands
 
@@ -310,7 +310,7 @@ def test_q_absorb_operand_constructor_matches_vllm_layout(num_batches):
     assert operands.out.is_contiguous()
 
 
-@pytest.mark.parametrize("num_batches", [64, 32, 16])
+@pytest.mark.parametrize("num_batches", [64, 32, 16, 8])
 def test_v_up_operand_constructor_matches_vllm_layout(num_batches):
     from profiling.runners.gemm.batched_gemm import _build_v_up_operands
 

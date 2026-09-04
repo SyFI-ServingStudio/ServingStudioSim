@@ -96,6 +96,7 @@ def test_operand_builder_keeps_requests_in_disjoint_physical_page_ranges(
     monkeypatch.setattr(runner, "_SELECTED_K", 4)
     monkeypatch.setattr(runner, "_TRTLLM_WORKSPACE_BYTES", 16)
     shape = runner._Shape(
+        num_heads=16,
         pairs=((2, 3), (1, 65)),
         valid_counts=(2, 3, 4),
         request_page_offsets=(0, 1),
