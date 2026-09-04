@@ -43,8 +43,9 @@ use crate::timing::{
     LeafMetrics, PerfApiBridge, Probe, SlotInput,
 };
 use crate::worklet::{
-    Glm52DenseFfnLocalWorklet, Glm52DenseFfnLocalWorkletConfig, Glm52DenseFfnLocalWorkletInput,
-    Glm52DenseFfnLocalWorkletResolved, Glm52MoeRouterLocalWorklet,
+    Bf16MoeLocalWorklet, Bf16MoeLocalWorkletConfig, Bf16MoeLocalWorkletInput,
+    Bf16MoeLocalWorkletResolved, Glm52DenseFfnLocalWorklet, Glm52DenseFfnLocalWorkletConfig,
+    Glm52DenseFfnLocalWorkletInput, Glm52DenseFfnLocalWorkletResolved, Glm52MoeRouterLocalWorklet,
     Glm52MoeRouterLocalWorkletConfig, Glm52MoeRouterLocalWorkletInput,
     Glm52MoeRouterLocalWorkletResolved, Glm52MtpHeadLocalWorklet, Glm52MtpHeadLocalWorkletConfig,
     Glm52MtpHeadLocalWorkletInput, Glm52MtpHeadLocalWorkletResolved, Glm52MtpPreludeLocalWorklet,
@@ -116,6 +117,7 @@ const SPARSE_ATTN_BACKENDS: &[&str] = &["flashinfer_trtllm_fp8"];
 const MLA_APPEND_BACKENDS: &[&str] = &["vllm_cuda"];
 const NVFP4_QUANT_BACKENDS: &[&str] = &["vllm_cuda"];
 const NVFP4_FUSED_MOE_BACKENDS: &[&str] = &["flashinfer_trtllm_sm100"];
+const BF16_FUSED_MOE_BACKENDS: &[&str] = &["flashinfer_trtllm_sm100"];
 // Generic collective fallbacks remain available above FlashInfer's workspace
 // limit. Both FlashInfer attention-boundary fusion and standalone FFN
 // all-reduce use shape-aware leaves because vLLM's selection and PDL behavior
@@ -136,7 +138,10 @@ const DENSE_FFN_SLOTS: usize = 4;
 const ROUTER_SLOTS: usize = 2;
 #[cfg(test)]
 /// Input quantization plus one overlap-aware whole fused-MoE leaf.
-const EXPERT_SLOTS: usize = 2;
+const NVFP4_EXPERT_SLOTS: usize = 2;
+#[cfg(test)]
+/// The BF16 path quantizes nothing, so it is the fused-MoE leaf alone.
+const BF16_EXPERT_SLOTS: usize = 1;
 #[cfg(test)]
 const SHARED_EXPERT_SLOTS: usize = 3;
 #[cfg(test)]
@@ -167,6 +172,10 @@ pub struct Glm52VllmNvfp4DsaMoeConfigs {
     /// One identity-free active-count-ranked workload per TP/EP rank. Each
     /// worklet owns the entire physical TRTLLM NVFP4 fused-MoE callable.
     pub nvfp4_moe: Vec<Nvfp4MoeLocalWorkletConfig>,
+    /// The MTP layer's routed experts. The checkpoint quantizes the 78 body
+    /// layers and leaves this one in BF16, so it is a different L1 callable
+    /// with different args -- not `nvfp4_moe` at another shape.
+    pub mtp_bf16_moe: Option<Vec<Bf16MoeLocalWorkletConfig>>,
     pub tp_allreduce: AllReduceKernelConfig,
     pub tp_allreduce_fusion: AllReduceFusionKernelConfig,
     pub tp_allreduce_fused: AllReduceResidualRmsNormKernelConfig,
@@ -189,6 +198,7 @@ pub struct Glm52VllmNvfp4DsaMoeResolved {
     pub sparse_router: Glm52MoeRouterLocalWorkletResolved,
     pub shared_expert: Glm52SharedExpertLocalWorkletResolved,
     pub nvfp4_moe: Vec<Nvfp4MoeLocalWorkletResolved>,
+    pub mtp_bf16_moe: Option<Vec<Bf16MoeLocalWorkletResolved>>,
     pub tp_allreduce: AllReduceKernelConfig,
     pub tp_allreduce_fusion: AllReduceFusionKernelConfig,
     pub tp_allreduce_fused: AllReduceResidualRmsNormKernelConfig,
@@ -408,6 +418,32 @@ pub fn build_configs(
         routing,
         NUM_LAYERS - NUM_DENSE_LAYERS,
     );
+    // The MTP layer is one layer, so its EP workload fold sees a single layer
+    // of routing evidence rather than the 75 the body folds over.
+    let mtp_bf16_moe = (mtp_mode != Glm52MtpMode::Off).then(|| {
+        Bf16MoeLocalWorkletConfig::split_for_ep(
+            Bf16MoeLocalWorkletConfig {
+                hidden: model.hidden_dim.clone(),
+                moe_intermediate: model.moe_intermediate_dim.clone(),
+                num_experts: model.num_experts.clone(),
+                ep_size: parallel.ep_size,
+                tp_size: 1,
+                top_k: model.router_top_k,
+                dtype: DType::Bf16,
+                gpu_name: gpu.clone(),
+                moe_backends: BF16_FUSED_MOE_BACKENDS.to_vec(),
+                routing_method: "minimax2".to_string(),
+                n_group: 1,
+                topk_group: 1,
+                routed_scaling_numerator: 5,
+                routed_scaling_denominator: 2,
+                layerwise_global_ppm: Vec::new(),
+                folded_rank_position: 0,
+            },
+            routing,
+            1,
+        )
+    });
 
     Ok(Glm52VllmNvfp4DsaMoeConfigs {
         model: model.clone(),
@@ -466,6 +502,7 @@ pub fn build_configs(
             gemm_dtype,
         },
         nvfp4_moe,
+        mtp_bf16_moe,
         tp_allreduce: AllReduceKernelConfig {
             backends: ALLREDUCE_BACKENDS.to_vec(),
             gpu_name: parallel.gpu_name.clone(),
@@ -647,6 +684,12 @@ pub fn resolve_configs(cfgs: &Glm52VllmNvfp4DsaMoeConfigs) -> Glm52VllmNvfp4DsaM
             .iter()
             .map(Nvfp4MoeLocalWorklet::resolve_config)
             .collect(),
+        mtp_bf16_moe: cfgs.mtp_bf16_moe.as_ref().map(|configs| {
+            configs
+                .iter()
+                .map(Bf16MoeLocalWorklet::resolve_config)
+                .collect()
+        }),
         tp_allreduce: cfgs.tp_allreduce.clone(),
         tp_allreduce_fusion: cfgs.tp_allreduce_fusion.clone(),
         tp_allreduce_fused: cfgs.tp_allreduce_fused.clone(),
@@ -669,12 +712,97 @@ pub fn resolve_configs(cfgs: &Glm52VllmNvfp4DsaMoeConfigs) -> Glm52VllmNvfp4DsaM
     }
 }
 
+/// The routed-expert compute of one sparse layer, at the precision that layer's
+/// experts are actually stored in.
+///
+/// GLM-5.2's 78 body layers are quantized to NVFP4, but the MTP layer's experts
+/// are not -- the checkpoint ships them in BF16. The two go through different
+/// L1 callables with different args, so the precision has to be a variant here
+/// rather than a flag: there is no shared kernel identity to parameterize.
+enum Glm52RoutedExperts {
+    /// One per EP child, ordered by identity-free active-expert workload.
+    Nvfp4(Vec<Nvfp4MoeLocalWorklet>),
+    Bf16(Vec<Bf16MoeLocalWorklet>),
+}
+
+impl Glm52RoutedExperts {
+    fn precision_label(&self) -> &'static str {
+        match self {
+            Self::Nvfp4(_) => "NVFP4",
+            Self::Bf16(_) => "BF16",
+        }
+    }
+
+    /// One node per EP child: that child's shared expert plus its routed slice.
+    ///
+    /// The shared expert is compiled inside each child because it runs on every
+    /// rank, so the `Max` above this bills one rank's whole FFN, not a shared
+    /// expert added to the busiest rank's routed slice.
+    fn compile_with_shared(
+        &self,
+        shared_expert: &Glm52SharedExpertLocalWorklet,
+        builder: &mut CostTreeBuilder,
+    ) -> Vec<CostNode> {
+        match self {
+            Self::Nvfp4(experts) => experts
+                .iter()
+                .map(|expert| {
+                    CostNode::Sum(vec![
+                        shared_expert.compile(builder),
+                        expert.compile(builder),
+                    ])
+                })
+                .collect(),
+            Self::Bf16(experts) => experts
+                .iter()
+                .map(|expert| {
+                    CostNode::Sum(vec![
+                        shared_expert.compile(builder),
+                        expert.compile(builder),
+                    ])
+                })
+                .collect(),
+        }
+    }
+
+    fn eval_with_shared(
+        &self,
+        shared_expert: &Glm52SharedExpertLocalWorklet,
+        batch_tokens: u32,
+        ev: &mut Evaluator,
+    ) {
+        match self {
+            Self::Nvfp4(experts) => {
+                for expert in experts {
+                    shared_expert.eval(&Glm52SharedExpertLocalWorkletInput { batch_tokens }, ev);
+                    expert.eval(
+                        &Nvfp4MoeLocalWorkletInput {
+                            num_tokens: batch_tokens,
+                        },
+                        ev,
+                    );
+                }
+            }
+            Self::Bf16(experts) => {
+                for expert in experts {
+                    shared_expert.eval(&Glm52SharedExpertLocalWorkletInput { batch_tokens }, ev);
+                    expert.eval(
+                        &Bf16MoeLocalWorkletInput {
+                            num_tokens: batch_tokens,
+                        },
+                        ev,
+                    );
+                }
+            }
+        }
+    }
+}
+
 struct Glm52SparseBody {
     name: String,
     attention: VllmGlm52DsaAttnLocalWorklet,
     router: Glm52MoeRouterLocalWorklet,
-    /// One per EP child, ordered by identity-free active-expert workload.
-    expert_compute: Vec<Nvfp4MoeLocalWorklet>,
+    routed_experts: Glm52RoutedExperts,
     shared_expert: Glm52SharedExpertLocalWorklet,
     attention_allreduce: Op<AllReduceKernel>,
     attention_allreduce_fused: Op<AllReduceResidualRmsNormKernel>,
@@ -687,10 +815,60 @@ struct Glm52SparseBody {
 }
 
 impl Glm52SparseBody {
+    /// The NVFP4 body layer: layers 0..77.
     fn build(
         name: String,
         attention: VllmGlm52DsaAttnLocalWorkletResolved,
         common: &Glm52VllmNvfp4DsaMoeResolved,
+        bridge: &PerfApiBridge,
+    ) -> Result<Self, BuildError> {
+        // Every rank keeps the same slot name: the rank axis already shows up
+        // as the `Max` node's children, and a rank suffix would rename the
+        // slots a labeled kernel inventory refers to.
+        let routed_experts = Glm52RoutedExperts::Nvfp4(
+            common
+                .nvfp4_moe
+                .iter()
+                .map(|rank_resolved| {
+                    Nvfp4MoeLocalWorklet::build(
+                        format!("{name}.moe.routed_experts"),
+                        rank_resolved.clone(),
+                        bridge,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+        Self::build_with_experts(name, attention, common, routed_experts, bridge)
+    }
+
+    /// The BF16 MTP layer, whose experts the checkpoint does not quantize.
+    fn build_bf16(
+        name: String,
+        attention: VllmGlm52DsaAttnLocalWorkletResolved,
+        common: &Glm52VllmNvfp4DsaMoeResolved,
+        experts: &[Bf16MoeLocalWorkletResolved],
+        bridge: &PerfApiBridge,
+    ) -> Result<Self, BuildError> {
+        let routed_experts = Glm52RoutedExperts::Bf16(
+            experts
+                .iter()
+                .map(|rank_resolved| {
+                    Bf16MoeLocalWorklet::build(
+                        format!("{name}.moe.routed_experts"),
+                        rank_resolved.clone(),
+                        bridge,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+        Self::build_with_experts(name, attention, common, routed_experts, bridge)
+    }
+
+    fn build_with_experts(
+        name: String,
+        attention: VllmGlm52DsaAttnLocalWorkletResolved,
+        common: &Glm52VllmNvfp4DsaMoeResolved,
+        routed_experts: Glm52RoutedExperts,
         bridge: &PerfApiBridge,
     ) -> Result<Self, BuildError> {
         let attention =
@@ -700,20 +878,6 @@ impl Glm52SparseBody {
             common.sparse_router.clone(),
             bridge,
         )?;
-        // Every rank keeps the same slot name: the rank axis already shows up
-        // as the `Max` node's children, and a rank suffix would rename the
-        // slots a labeled kernel inventory refers to.
-        let expert_compute = common
-            .nvfp4_moe
-            .iter()
-            .map(|rank_resolved| {
-                Nvfp4MoeLocalWorklet::build(
-                    format!("{name}.moe.routed_experts"),
-                    rank_resolved.clone(),
-                    bridge,
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
         let shared_expert = Glm52SharedExpertLocalWorklet::build(
             format!("{name}.moe.shared_expert"),
             common.shared_expert.clone(),
@@ -751,7 +915,7 @@ impl Glm52SparseBody {
             name,
             attention,
             router,
-            expert_compute,
+            routed_experts,
             shared_expert,
             attention_allreduce,
             attention_allreduce_fused,
@@ -784,22 +948,18 @@ impl Glm52SparseBody {
         );
         let experts_and_shared = labeled_max(
             format!("{}.moe.local_experts [Max over TP/EP ranks]", self.name),
-            self.expert_compute
-                .iter()
-                .map(|rank_expert| {
-                    CostNode::Sum(vec![
-                        self.shared_expert.compile(builder),
-                        rank_expert.compile(builder),
-                    ])
-                })
-                .collect(),
+            self.routed_experts
+                .compile_with_shared(&self.shared_expert, builder),
         );
         let ffn_allreduce_fallback = self.ffn_allreduce_fallback.compile(builder);
         let ffn_allreduce_fusion = self.ffn_allreduce_fusion.compile(builder);
         CostNode::Labeled {
             label: format!(
-                "{} [sparse layer; TP=EP={}; top-{} NVFP4 routed experts]",
-                self.name, self.ep_size, self.top_k
+                "{} [sparse layer; TP=EP={}; top-{} {} routed experts]",
+                self.name,
+                self.ep_size,
+                self.top_k,
+                self.routed_experts.precision_label()
             ),
             child: Box::new(CostNode::Sum(vec![
                 attention,
@@ -807,8 +967,9 @@ impl Glm52SparseBody {
                 attention_allreduce_fused,
                 CostNode::Labeled {
                     label: format!(
-                        "{}.moe [router -> local shared+NVFP4 experts -> TP allreduce]",
-                        self.name
+                        "{}.moe [router -> local shared+{} experts -> TP allreduce]",
+                        self.name,
+                        self.routed_experts.precision_label()
                     ),
                     child: Box::new(CostNode::Sum(vec![
                         router,
@@ -853,20 +1014,8 @@ impl Glm52SparseBody {
                 ev,
             );
         }
-        for rank_expert in &self.expert_compute {
-            self.shared_expert.eval(
-                &Glm52SharedExpertLocalWorkletInput {
-                    batch_tokens: group.batch_tokens,
-                },
-                ev,
-            );
-            rank_expert.eval(
-                &Nvfp4MoeLocalWorkletInput {
-                    num_tokens: group.batch_tokens,
-                },
-                ev,
-            );
-        }
+        self.routed_experts
+            .eval_with_shared(&self.shared_expert, group.batch_tokens, ev);
         let use_ffn_fusion =
             batch.total_tokens > 0 && batch.total_tokens <= self.ffn_allreduce_max_fused_tokens;
         eval_atomic_or_zero(
@@ -1046,10 +1195,14 @@ pub fn build(
                 prelude,
                 bridge,
             )?,
-            decoder: Glm52SparseBody::build(
+            decoder: Glm52SparseBody::build_bf16(
                 format!("{name}.mtp.decoder_sparse"),
                 attention,
                 &resolved,
+                resolved
+                    .mtp_bf16_moe
+                    .as_deref()
+                    .ok_or_else(|| fit_failed("MTP expert configs are missing"))?,
                 bridge,
             )?,
             head: Glm52MtpHeadLocalWorklet::build(format!("{name}.mtp.head"), head, bridge)?,
@@ -1635,16 +1788,21 @@ fn expected_slot_count(ep_size: u16, mtp_mode: Glm52MtpMode) -> usize {
     // once, while rank-local work is represented by Max over TP/EP children.
     let dense = ep * (ATTN_FULL_SLOTS + DENSE_FFN_SLOTS) + 4;
     let sparse_shared =
-        ep * (ATTN_SHARED_SLOTS + ROUTER_SLOTS + SHARED_EXPERT_SLOTS + EXPERT_SLOTS) + 4;
+        ep * (ATTN_SHARED_SLOTS + ROUTER_SLOTS + SHARED_EXPERT_SLOTS + NVFP4_EXPERT_SLOTS) + 4;
     let sparse_full = sparse_shared + ep * (ATTN_FULL_SLOTS - ATTN_SHARED_SLOTS);
     let main = (ep + 2) + dense + sparse_shared + sparse_full + sparse_shared + ep + ep;
+    // The MTP layer's experts are BF16, which quantizes nothing and so mints
+    // one leaf per rank where the body's NVFP4 experts mint two.
+    let mtp_sparse_shared =
+        ep * (ATTN_SHARED_SLOTS + ROUTER_SLOTS + SHARED_EXPERT_SLOTS + BF16_EXPERT_SLOTS) + 4;
+    let mtp_sparse_full = mtp_sparse_shared + ep * (ATTN_FULL_SLOTS - ATTN_SHARED_SLOTS);
     match mtp_mode {
         Glm52MtpMode::Off => main,
         Glm52MtpMode::FullIndex => {
-            main + ep * MTP_PRELUDE_SLOTS + sparse_full + ep * MTP_HEAD_SLOTS
+            main + ep * MTP_PRELUDE_SLOTS + mtp_sparse_full + ep * MTP_HEAD_SLOTS
         }
         Glm52MtpMode::IndexShare => {
-            main + ep * MTP_PRELUDE_SLOTS + sparse_shared + ep * MTP_HEAD_SLOTS
+            main + ep * MTP_PRELUDE_SLOTS + mtp_sparse_shared + ep * MTP_HEAD_SLOTS
         }
     }
 }
@@ -1905,6 +2063,64 @@ mod tests {
             Glm52MtpMode::Off,
         )
         .is_err());
+    }
+
+    #[test]
+    fn the_mtp_layer_bills_its_experts_through_the_bf16_fused_moe_leaf() {
+        // The checkpoint quantizes the 78 body layers' routed experts and
+        // leaves the MTP layer's in BF16. Billing that layer through the NVFP4
+        // path charges it an activation-quantization launch it never makes and
+        // a fused-MoE kernel it never calls -- a measured identity belonging to
+        // different weights.
+        let cfg = build_configs(
+            &model(),
+            &parallel(4),
+            &RoutingDistribution::uniform(NUM_EXPERTS),
+            false,
+            Glm52MtpMode::FullIndex,
+        )
+        .unwrap();
+        let mtp_experts = cfg.mtp_bf16_moe.as_ref().expect("MTP layer has experts");
+        assert_eq!(mtp_experts.len(), 4, "one ranked workload per EP rank");
+        assert!(mtp_experts.iter().all(|rank| rank.dtype == DType::Bf16));
+
+        let bridge = PerfApiBridge::new_uninit_for_test();
+        bridge.enable_enumerate();
+        let built = build("unified".to_string(), resolve_configs(&cfg), &bridge).unwrap();
+        let slots = built.cost_tree().slots;
+        let mtp_expert_slots: Vec<_> = slots
+            .iter()
+            .filter(|slot| {
+                slot.name
+                    .starts_with("unified.mtp.decoder_sparse.moe.routed_experts")
+            })
+            .collect();
+        assert_eq!(
+            mtp_expert_slots.len(),
+            4,
+            "BF16 experts are one whole-callable leaf per rank, with no quantization leaf"
+        );
+
+        // The body layers next door are unaffected: they keep both leaves.
+        let body_expert_slots = slots
+            .iter()
+            .filter(|slot| {
+                slot.name
+                    .starts_with("unified.body.sparse_cycle_full_index.moe.routed_experts")
+            })
+            .count();
+        assert_eq!(body_expert_slots, 8, "NVFP4 experts quantize then fuse");
+
+        // MTP=Off never reaches the BF16 path, so it must not carry the config.
+        let off = build_configs(
+            &model(),
+            &parallel(4),
+            &RoutingDistribution::uniform(NUM_EXPERTS),
+            false,
+            Glm52MtpMode::Off,
+        )
+        .unwrap();
+        assert!(off.mtp_bf16_moe.is_none());
     }
 
     #[test]
