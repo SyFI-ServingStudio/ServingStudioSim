@@ -111,6 +111,7 @@ pub(crate) fn normalize_glm52_dsa_attn_input(
                     decode.context_len
                 ));
             }
+            let mut context_len_sum: u64 = 0;
             if let Some(context_lens) = &decode.context_lens {
                 if context_lens.len() != decode.batch_size as usize {
                     return Err(format!(
@@ -125,6 +126,7 @@ pub(crate) fn normalize_glm52_dsa_attn_input(
                             "decode request {request} context {context} must be in 1..={max_model_len}"
                         ));
                     }
+                    context_len_sum += u64::from(context);
                 }
             }
             let decode_rows = decode
@@ -137,7 +139,7 @@ pub(crate) fn normalize_glm52_dsa_attn_input(
             (
                 Some(DsaIndexerDecodeInput {
                     batch_size: decode.batch_size,
-                    context_len: decode.context_len,
+                    context_len: indexer_decode_context_len(decode, context_len_sum),
                     requires_padding: decode.requires_padding,
                 }),
                 Some((decode_rows, decode.context_len)),
@@ -160,6 +162,35 @@ pub(crate) fn normalize_glm52_dsa_attn_input(
         sparse_decode,
         sparse_decode_context_lens,
     })
+}
+
+/// The uniform context the indexer's decode leaves are billed against.
+///
+/// Both leaves are profiled with `context_mode: uniform` -- one length for the
+/// whole batch -- so a mixed batch has to be collapsed onto that axis. The
+/// collapse that preserves the work is the one that preserves the KV the batch
+/// reads, `ceil(sum / batch)`, not the longest request: a serving batch mixes a
+/// request on its first output token with one near the context limit, and
+/// charging every request the longest one's context bills the kernel for KV no
+/// request holds.
+///
+/// The sparse-MLA attention next door does not need this -- it is handed the
+/// per-request lengths themselves and evaluates each one.
+///
+/// Without the per-request lengths there is nothing to average, so the caller's
+/// own scalar stands. `context_lens` is validated non-empty and positive above,
+/// so the sum is positive whenever it is present and the batch is non-empty.
+fn indexer_decode_context_len(decode: &Glm52DsaAttnLocalDecodeInput, context_len_sum: u64) -> u32 {
+    if decode.context_lens.is_none() || decode.batch_size == 0 {
+        return decode.context_len;
+    }
+    let batch_size = u64::from(decode.batch_size);
+    let mean = context_len_sum.div_ceil(batch_size);
+    // Bounded by the caller's own scalar, so it inherits the `max_model_len`
+    // check that scalar already passed and can never widen the shape.
+    u32::try_from(mean)
+        .unwrap_or(decode.context_len)
+        .min(decode.context_len)
 }
 
 #[cfg(test)]
@@ -202,6 +233,46 @@ mod tests {
                 Some(8)
             );
         }
+    }
+
+    #[test]
+    fn indexer_decode_is_billed_the_kv_the_batch_holds_not_the_longest_request() {
+        // The indexer's decode leaves are profiled at one context for the whole
+        // batch, so a mixed batch has to collapse onto that axis. Charging every
+        // request the longest one's context bills KV no request holds: here the
+        // four requests hold 404 tokens between them, not 4 x 190.
+        let input = Glm52DsaAttnLocalInput {
+            num_new_tokens: 4,
+            prefill_query_cache_pairs: Vec::new(),
+            decode: Some(Glm52DsaAttnLocalDecodeInput {
+                batch_size: 4,
+                context_len: 190,
+                context_lens: Some(vec![12, 190, 12, 190]),
+                requires_padding: false,
+            }),
+        };
+        let normalized = normalize_glm52_dsa_attn_input(&input, 1, MAX_MODEL_LEN).unwrap();
+
+        let decode = normalized.indexer_decode.unwrap();
+        assert_eq!(decode.batch_size, 4);
+        // ceil(404 / 4) == 101.
+        assert_eq!(decode.context_len, 101);
+        // The sparse-MLA path is unaffected: it keeps the caller's scalar as
+        // its cache coordinate and receives the exact lengths besides.
+        assert_eq!(normalized.sparse_decode, Some((4, 190)));
+        assert_eq!(
+            normalized.sparse_decode_context_lens,
+            Some(vec![12, 190, 12, 190])
+        );
+    }
+
+    #[test]
+    fn indexer_decode_keeps_the_caller_scalar_without_per_request_lengths() {
+        let decode = normalize_glm52_dsa_attn_input(&decode_input(4, 1), 1, MAX_MODEL_LEN)
+            .unwrap()
+            .indexer_decode
+            .unwrap();
+        assert_eq!(decode.context_len, 4096);
     }
 
     #[test]
