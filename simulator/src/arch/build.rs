@@ -28,12 +28,13 @@ use crate::arch::{
     DenseParallel, DenseTpParallel, DpAttnTpFfnParallel, FfnLayerwiseModel, Glm52DsaMoeModel,
     Glm52DsaMoeParallel, Glm52ModelCfg, Glm52MtpMode, Glm52SglangNvfp4TpDsaMoeModel,
     Glm52SglangNvfp4TpDsaMoeParallel, Glm52VllmDsaMoeModel, Glm52VllmDsaMoeParallel,
-    Glm52VllmNvfp4DsaMoeModel, Glm52VllmNvfp4DsaMoeParallel, IterwiseUnifiedModel,
-    Llama3DenseModel, Llama3DenseTpModel, Llama3DpAttnTpFfnModel, Qwen36LocalModel,
-    Qwen36LocalParallel, Qwen36ModelCfg, Qwen3AttnLayerwiseModel, Qwen3AttnParallel,
-    Qwen3FfnMoeLayerwiseModel, Qwen3FfnMoeParallel, Qwen3Fp8FfnMoeLayerwiseModel,
-    Qwen3Fp8FfnMoeParallel, Qwen3MoeDpAttnEpFfnModel, Qwen3MoeFp8DpAttnEpFfnModel,
-    Qwen3MoeFp8Parallel, Qwen3MoeParallel, Qwen3VllmMoeDpAttnEpFfnModel, Qwen3VllmMoeParallel,
+    Glm52VllmNvfp4DsaMoeModel, Glm52VllmNvfp4DsaMoeParallel, Glm52VllmNvfp4DsaMoeSpeculativeModel,
+    IterwiseUnifiedModel, Llama3DenseModel, Llama3DenseTpModel, Llama3DpAttnTpFfnModel,
+    Qwen36LocalModel, Qwen36LocalParallel, Qwen36ModelCfg, Qwen3AttnLayerwiseModel,
+    Qwen3AttnParallel, Qwen3FfnMoeLayerwiseModel, Qwen3FfnMoeParallel,
+    Qwen3Fp8FfnMoeLayerwiseModel, Qwen3Fp8FfnMoeParallel, Qwen3MoeDpAttnEpFfnModel,
+    Qwen3MoeFp8DpAttnEpFfnModel, Qwen3MoeFp8Parallel, Qwen3MoeParallel,
+    Qwen3VllmMoeDpAttnEpFfnModel, Qwen3VllmMoeParallel,
 };
 use crate::timing::routing::RoutingDistribution;
 use crate::timing::PerfApiBridge;
@@ -967,6 +968,62 @@ pub fn glm52_vllm_nvfp4_dsa_moe(
         .context("building B200 GLM-5.2 NVFP4 model (often a missing profile.db row)")
 }
 
+/// Build the B200 GLM-5.2 NVFP4 target-verify graph with its MTP proposer.
+///
+/// The result is a different type from [`glm52_vllm_nvfp4_dsa_moe`]'s, not the
+/// same one with speculation switched on, so a deployment that binds it has
+/// committed to speculating.
+#[allow(clippy::too_many_arguments)]
+pub fn glm52_vllm_nvfp4_dsa_moe_speculative(
+    model_spec: &ModelSpec,
+    ep_size: u16,
+    nvl_num_gpu: u16,
+    max_model_len: u32,
+    routing_kind: RoutingKind,
+    routing_seed: Option<u64>,
+    mtp_mode: Glm52MtpMode,
+    expert_popularity_file: Option<&str>,
+    draft_tokens: u32,
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<Glm52VllmNvfp4DsaMoeSpeculativeModel> {
+    let model_cfg = glm52_model_cfg(model_spec).context("loading exact GLM-5.2 NVFP4 config")?;
+    let routing = resolve_routing_source(
+        routing_kind,
+        routing_seed,
+        model_cfg.num_experts.get(),
+        ep_size,
+        num_sparse_layers(&model_cfg),
+        model_cfg.router_top_k,
+        expert_popularity_file,
+    )?;
+    let parallel = Glm52VllmNvfp4DsaMoeParallel {
+        ep_size,
+        nvl_num_gpu,
+        max_model_len,
+        gpu_name: gpu.to_string(),
+    };
+    // The MTP layer routes independently of the body, but the popularity
+    // profile does not yet say which model a capture came from, so the only
+    // evidence available for the draft layer is the body's. The two still fold
+    // differently -- over one layer here against 75 there -- which is why the
+    // recipe takes them separately.
+    let configs = glm52_vllm_nvfp4_dsa_moe::build_speculative_configs(
+        &model_cfg,
+        &parallel,
+        &routing,
+        &routing,
+        model_spec.fp8,
+        mtp_mode,
+        draft_tokens,
+    )
+    .context("expanding speculative B200 GLM-5.2 NVFP4 architecture configs")?;
+    let resolved = glm52_vllm_nvfp4_dsa_moe::resolve_configs(&configs);
+    glm52_vllm_nvfp4_dsa_moe::build_speculative(name.to_string(), resolved, bridge)
+        .context("building speculative B200 GLM-5.2 NVFP4 model (often a missing profile.db row)")
+}
+
 /// Build SGLang's B200 GLM-5.2 NVFP4 graph under pure tensor parallelism.
 /// Routing is resolved at EP1 because every TP rank owns all experts.
 #[allow(clippy::too_many_arguments)]
@@ -1397,6 +1454,7 @@ mod tests {
     use std::io::Write;
 
     use super::*;
+    use crate::arch::SpeculativeUnifiedModel;
 
     #[test]
     fn qwen36_local_uniform_builder_loads_the_pinned_nested_config() {
@@ -1654,6 +1712,35 @@ mod tests {
         assert_eq!(built.num_attn_dp_groups(), 1);
         assert_eq!(built.num_attn_shards(), 4);
         assert_eq!(built.cost_log_manifest().slots.len(), 474);
+    }
+
+    #[test]
+    fn the_speculative_glm52_selector_builds_a_model_the_iter_dispatch_cannot() {
+        let bridge = PerfApiBridge::new_uninit_for_test();
+        bridge.enable_enumerate();
+        let built = glm52_vllm_nvfp4_dsa_moe_speculative(
+            &glm52_model_spec(),
+            4,
+            4,
+            8_192,
+            RoutingKind::Uniform,
+            None,
+            Glm52MtpMode::IndexShare,
+            None,
+            5,
+            "NVIDIA B200",
+            "test",
+            &bridge,
+        )
+        .expect("build the speculative NVFP4 GLM");
+
+        assert_eq!(built.gpus_per_replica(), 4);
+        assert_eq!(built.max_model_len(), 8_192);
+        // The target alone is 474 slots. A speculative iteration bills those
+        // plus five draft passes, so its cost log is a different shape and no
+        // consumer can read one as the other.
+        assert!(built.cost_log_manifest().slots.len() > 474);
+        assert_eq!(built.num_attn_shards(), 4);
     }
 
     #[test]
