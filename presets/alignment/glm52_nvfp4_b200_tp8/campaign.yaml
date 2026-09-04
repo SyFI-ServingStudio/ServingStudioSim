@@ -1,0 +1,865 @@
+schema_version: 1
+pack: glm52_nvfp4_b200_tp8
+description: GLM-5.2 NVFP4 on B200, EP8/TP8/DP1 under vLLM (whole 8-GPU NVLink
+  domain) -- Coral Bricks production topology. Derived from the accepted TP4/EP4
+  pack `glm52_nvfp4_b200` with only the topology changed; see make_tp8_pack.py.
+
+# The machine that produced the accepted numbers, as facts rather than as a
+# runnable config. A host profile is a local file (only hosts/example.yaml is
+# tracked) because its contents are absolute paths to an HF cache and a 1 GB
+# corpus -- uncommittable, and named after whoever's directory they sit in.
+# These four things are what a reader actually needs to judge the numbers, and
+# none of them is a path.
+recorded_on:
+  host: coral_b200
+  gpu: NVIDIA B200
+  # Relative to the host's hf_hub_root. A different snapshot is a different
+  # model, so the hash is part of the result, not part of the machine.
+  checkpoint_snapshots:
+    glm52_nvfp4: models--nvidia--GLM-5.2-NVFP4/snapshots/aec724e8c7b8ee9db3b48c01c320f63f9cdaf8aa
+  # The profiler version is an input to every measured duration.
+  nsys_version: 2025.5.2
+  # What `cases[].device_role` meant on that box. GPU 4 was approved but held by
+  # an unrelated service, which is why the two halves are not interchangeable.
+  device_roles:
+    primary: '0,1,2,3,4,5,6,7'
+
+variants:
+  tp8_ep8_dp1:
+    deployment: unified
+    gpu: NVIDIA B200
+    replicas: 1
+    checkpoint: glm52_nvfp4
+    engine: vllm
+    backend: vllm_tokens
+    run_name_prefix: glm52_b200_tp8_ep8
+    server:
+      tp_size: 8
+      dp_size: 1
+      chunk_size: 2048
+      max_cudagraph_capture_size: 2048
+      enable_server_load_tracking: true
+      extra_args:
+      - --enable-expert-parallel
+      - --kv-cache-dtype
+      - fp8_e4m3
+    arch:
+      type: glm52_vllm_nvfp4_dsa_moe
+      model_config: model/config/glm52_nvfp4.json
+      fp8: false
+      ep_size: 8
+      nvl_num_gpu: 8
+      routing: uniform
+      expert_popularity_file: expert_popularity.json
+      mtp_mode: 'off'
+    worker:
+      type: chunked_prefill
+      max_batch_tokens: 2048
+      batch_policy: mix
+    profile_passes:
+    - kind: nsys
+      name: profile_nsys
+      trace: kernel
+    - kind: workload_metrics
+      name: profile_workload
+      trace: workload
+    input_builder:
+      type: vllm_text
+      measured_phase: forward
+      group_assignment: per_dp_rank
+    label_rules: label_rules/manifest.json
+cases:
+- index: 1
+  name: micro_throughput_c256
+  variant: tp8_ep8_dp1
+  purpose: Maximum request batching and scheduler pressure.
+  coverage:
+  - batching
+  - scheduler_pressure
+  max_model_len: 8192
+  max_concurrency: 256
+  profile_arrival_mode: saturated
+  simulation_arrival_mode: saturated
+  gpu_memory_utilization: 0.75
+  capture_seconds: 15.0
+  device_role: primary
+  workload_trace:
+    file: traces/01_micro_throughput_c256.csv
+    shapes:
+    - - 16
+      - 16
+    - - 32
+      - 32
+    - - 64
+      - 64
+    - - 128
+      - 64
+    repeats: 256
+  attn_gpu_memory_gb:
+    value: 75.9917583
+    status: measured
+    derived_from: '`GPU KV cache size: C tokens` in the workload-only server log; C * 55_224 / 1e9'
+    evidence: tp8_20260901/01_micro_throughput_c256/profile_workload/vllm/glm52_b200_tp8_ep8_01_micro_throughput_c256_workload_server.log
+  provenance:
+    accepted_run: logs/20260827_0_glm52_nvfp4_l1_clean_alignment/cases/01_micro_throughput_c256
+    capture_source: logs/20260826_0_glm52_b200_ep4_workload_matrix_realign/cases/01_micro_throughput_c256
+- index: 2
+  name: graph_boundaries_c128
+  variant: tp8_ep8_dp1
+  purpose: CUDA graph and small-batch kernel boundaries.
+  coverage:
+  - cuda_graph_boundaries
+  - small_batch
+  max_model_len: 8192
+  max_concurrency: 128
+  profile_arrival_mode: saturated
+  simulation_arrival_mode: saturated
+  gpu_memory_utilization: 0.75
+  capture_seconds: 15.0
+  device_role: primary
+  # This case's subject IS the small-batch and CUDA-graph boundary region, which
+  # the profiler's default 24-48 analysis window starts after. Widened to the
+  # whole capture in the accepted run; without this the pack would re-run it
+  # against a different iteration population than the recorded numbers.
+  analyze_iterations: [0, 239]
+  workload_trace:
+    file: traces/02_graph_boundaries_c128.csv
+    shapes:
+    - - 1
+      - 32
+    - - 15
+      - 32
+    - - 16
+      - 32
+    - - 31
+      - 32
+    - - 32
+      - 32
+    - - 63
+      - 64
+    - - 64
+      - 64
+    - - 127
+      - 64
+    - - 128
+      - 64
+    - - 255
+      - 64
+    - - 256
+      - 64
+    repeats: 48
+  attn_gpu_memory_gb:
+    value: 75.9917583
+    status: measured
+    derived_from: '`GPU KV cache size: C tokens` in the workload-only server log; C * 55_224 / 1e9'
+    evidence: tp8_20260901/02_graph_boundaries_c128/profile_workload/vllm/glm52_b200_tp8_ep8_02_graph_boundaries_c128_workload_server.log
+  provenance:
+    accepted_run: logs/20260827_0_glm52_nvfp4_l1_clean_alignment/cases/02_graph_boundaries_c128
+    capture_source: logs/20260826_0_glm52_b200_ep4_workload_matrix_realign/cases/02_graph_boundaries_c128
+- index: 3
+  name: balanced_anchor_c32
+  variant: tp8_ep8_dp1
+  purpose: Comparable extension of the existing c32 anchor.
+  coverage:
+  - balanced_anchor
+  max_model_len: 8192
+  max_concurrency: 32
+  profile_arrival_mode: saturated
+  simulation_arrival_mode: saturated
+  gpu_memory_utilization: 0.75
+  capture_seconds: 15.0
+  device_role: primary
+  workload_trace:
+    file: traces/03_balanced_anchor_c32.csv
+    shapes:
+    - - 256
+      - 128
+    - - 256
+      - 256
+    - - 1024
+      - 128
+    - - 1024
+      - 256
+    - - 2048
+      - 128
+    - - 2048
+      - 256
+    - - 4096
+      - 128
+    - - 4096
+      - 256
+    repeats: 16
+  attn_gpu_memory_gb:
+    value: 75.9917583
+    status: measured
+    derived_from: '`GPU KV cache size: C tokens` in the workload-only server log; C * 55_224 / 1e9'
+    evidence: tp8_20260901/03_balanced_anchor_c32/profile_workload/vllm/glm52_b200_tp8_ep8_03_balanced_anchor_c32_workload_server.log
+  provenance:
+    accepted_run: logs/20260827_0_glm52_nvfp4_l1_clean_alignment/cases/03_balanced_anchor_c32
+    capture_source: logs/20260826_0_glm52_b200_ep4_workload_matrix_realign/cases/03_balanced_anchor_c32
+- index: 4
+  name: prefill_spectrum_c32
+  variant: tp8_ep8_dp1
+  purpose: Prefill scaling and the 2048-token chunk boundary.
+  coverage:
+  - prefill_scaling
+  - chunk_boundary
+  max_model_len: 8192
+  max_concurrency: 32
+  profile_arrival_mode: saturated
+  simulation_arrival_mode: saturated
+  gpu_memory_utilization: 0.75
+  capture_seconds: 15.0
+  device_role: primary
+  workload_trace:
+    file: traces/04_prefill_spectrum_c32.csv
+    shapes:
+    - - 128
+      - 64
+    - - 512
+      - 64
+    - - 1984
+      - 64
+    - - 2048
+      - 64
+    - - 2112
+      - 64
+    - - 4096
+      - 64
+    - - 6144
+      - 64
+    - - 7168
+      - 64
+    repeats: 16
+  attn_gpu_memory_gb:
+    value: 75.9917583
+    status: measured
+    derived_from: '`GPU KV cache size: C tokens` in the workload-only server log; C * 55_224 / 1e9'
+    evidence: tp8_20260901/04_prefill_spectrum_c32/profile_workload/vllm/glm52_b200_tp8_ep8_04_prefill_spectrum_c32_workload_server.log
+  provenance:
+    accepted_run: logs/20260827_0_glm52_nvfp4_l1_clean_alignment/cases/04_prefill_spectrum_c32
+    capture_source: logs/20260826_0_glm52_b200_ep4_workload_matrix_realign/cases/04_prefill_spectrum_c32
+- index: 5
+  name: decode_spectrum_c64
+  variant: tp8_ep8_dp1
+  purpose: Decode residence, KV growth, and batch contraction.
+  coverage:
+  - decode_residence
+  - kv_growth
+  max_model_len: 8192
+  max_concurrency: 64
+  profile_arrival_mode: saturated
+  simulation_arrival_mode: saturated
+  gpu_memory_utilization: 0.75
+  capture_seconds: 15.0
+  device_role: primary
+  workload_trace:
+    file: traces/05_decode_spectrum_c64.csv
+    shapes:
+    - - 128
+      - 16
+    - - 128
+      - 128
+    - - 128
+      - 512
+    - - 128
+      - 1024
+    - - 128
+      - 2048
+    - - 128
+      - 4096
+    - - 512
+      - 2048
+    - - 1024
+      - 4096
+    repeats: 16
+  attn_gpu_memory_gb:
+    value: 75.9917583
+    status: measured
+    derived_from: '`GPU KV cache size: C tokens` in the workload-only server log; C * 55_224 / 1e9'
+    evidence: tp8_20260901/05_decode_spectrum_c64/profile_workload/vllm/glm52_b200_tp8_ep8_05_decode_spectrum_c64_workload_server.log
+  provenance:
+    accepted_run: logs/20260827_0_glm52_nvfp4_l1_clean_alignment/cases/05_decode_spectrum_c64
+    capture_source: logs/20260826_0_glm52_b200_ep4_workload_matrix_realign/cases/05_decode_spectrum_c64
+- index: 6
+  name: long_long_c8
+  variant: tp8_ep8_dp1
+  purpose: Long-prefill plus long-decode interaction near context capacity.
+  coverage:
+  - long_prefill
+  - long_decode
+  max_model_len: 8192
+  max_concurrency: 8
+  profile_arrival_mode: saturated
+  simulation_arrival_mode: saturated
+  gpu_memory_utilization: 0.75
+  capture_seconds: 15.0
+  device_role: primary
+  workload_trace:
+    file: traces/06_long_long_c8.csv
+    shapes:
+    - - 2048
+      - 4096
+    - - 3072
+      - 3072
+    - - 4096
+      - 3968
+    - - 5120
+      - 2944
+    - - 6144
+      - 1920
+    repeats: 7
+  attn_gpu_memory_gb:
+    value: 75.9917583
+    status: measured
+    derived_from: '`GPU KV cache size: C tokens` in the workload-only server log; C * 55_224 / 1e9'
+    evidence: tp8_20260901/06_long_long_c8/profile_workload/vllm/glm52_b200_tp8_ep8_06_long_long_c8_workload_server.log
+  provenance:
+    accepted_run: logs/20260827_0_glm52_nvfp4_l1_clean_alignment/cases/06_long_long_c8
+    capture_source: logs/20260826_0_glm52_b200_ep4_workload_matrix_realign/cases/06_long_long_c8
+- index: 7
+  name: quadrant_interference_c48
+  variant: tp8_ep8_dp1
+  purpose: All four IO quadrants sharing continuous batches.
+  coverage:
+  - io_quadrants
+  - continuous_batching
+  max_model_len: 8192
+  max_concurrency: 48
+  profile_arrival_mode: saturated
+  simulation_arrival_mode: saturated
+  gpu_memory_utilization: 0.75
+  capture_seconds: 15.0
+  device_role: primary
+  workload_trace:
+    file: traces/07_quadrant_interference_c48.csv
+    shapes:
+    - - 128
+      - 128
+    - - 128
+      - 4096
+    - - 4096
+      - 128
+    - - 3072
+      - 3072
+    repeats: 24
+  attn_gpu_memory_gb:
+    value: 75.9917583
+    status: measured
+    derived_from: '`GPU KV cache size: C tokens` in the workload-only server log; C * 55_224 / 1e9'
+    evidence: tp8_20260901/07_quadrant_interference_c48/profile_workload/vllm/glm52_b200_tp8_ep8_07_quadrant_interference_c48_workload_server.log
+  provenance:
+    accepted_run: logs/20260827_0_glm52_nvfp4_l1_clean_alignment/cases/07_quadrant_interference_c48
+    capture_source: logs/20260826_0_glm52_b200_ep4_workload_matrix_realign/cases/07_quadrant_interference_c48
+- index: 8
+  name: completion_churn_c96
+  variant: tp8_ep8_dp1
+  purpose: Rapid completions, shrinking batches, and request replacement.
+  coverage:
+  - completion_churn
+  - admission
+  max_model_len: 8192
+  max_concurrency: 96
+  profile_arrival_mode: saturated
+  simulation_arrival_mode: saturated
+  gpu_memory_utilization: 0.75
+  capture_seconds: 15.0
+  device_role: primary
+  workload_trace:
+    file: traces/08_completion_churn_c96.csv
+    shapes:
+    - - 512
+      - 1
+    - - 512
+      - 16
+    - - 512
+      - 64
+    - - 512
+      - 256
+    - - 512
+      - 1024
+    - - 512
+      - 4096
+    repeats: 32
+  attn_gpu_memory_gb:
+    value: 75.9917583
+    status: measured
+    derived_from: '`GPU KV cache size: C tokens` in the workload-only server log; C * 55_224 / 1e9'
+    evidence: tp8_20260901/08_completion_churn_c96/profile_workload/vllm/glm52_b200_tp8_ep8_08_completion_churn_c96_workload_server.log
+  provenance:
+    accepted_run: logs/20260827_0_glm52_nvfp4_l1_clean_alignment/cases/08_completion_churn_c96
+    capture_source: logs/20260826_0_glm52_b200_ep4_workload_matrix_realign/cases/08_completion_churn_c96
+- index: 9
+  name: rate_knee
+  variant: tp8_ep8_dp1
+  purpose: Maximum sustainable open-loop request rate.
+  coverage:
+  - arrival_rate_knee
+  max_model_len: 8192
+  max_concurrency: null
+  profile_arrival_mode: trace-timed
+  simulation_arrival_mode: trace_timed
+  gpu_memory_utilization: 0.85
+  capture_seconds: 20.0
+  device_role: primary
+  workload_trace:
+    file: traces/09_rate_knee.csv
+    shapes:
+    - - 128
+      - 128
+    - - 128
+      - 4096
+    - - 4096
+      - 128
+    - - 3072
+      - 3072
+    - - 512
+      - 256
+    - - 2048
+      - 1024
+    - - 6144
+      - 512
+    - - 1024
+      - 4096
+    repeats: 64
+  rate:
+    value: 1.0
+    status: provisional
+    derived_from: queueing knee of the case-10 saturation sweep; DESIGN.md step 2
+    evidence: ''
+  attn_gpu_memory_gb:
+    value: 95.1407908
+    status: measured
+    derived_from: '`GPU KV cache size: C tokens` in the workload-only server log; C * 55_224 / 1e9'
+    evidence: tp8_20260901/09_rate_knee/profile_workload/vllm/glm52_b200_tp8_ep8_09_rate_knee_workload_server.log
+  provenance:
+    accepted_run: logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/09_rate_knee
+    capture_source: logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/09_rate_knee
+- index: 10
+  name: full_saturation_rate
+  variant: tp8_ep8_dp1
+  purpose: Peak-throughput open-loop load beyond the sustainable knee.
+  coverage:
+  - saturation
+  - peak_throughput
+  max_model_len: 8192
+  max_concurrency: 256
+  profile_arrival_mode: saturated
+  simulation_arrival_mode: saturated
+  gpu_memory_utilization: 0.85
+  capture_seconds: 20.0
+  device_role: primary
+  workload_trace:
+    file: traces/10_full_saturation_rate.csv
+    shapes:
+    - - 128
+      - 128
+    - - 128
+      - 4096
+    - - 4096
+      - 128
+    - - 3072
+      - 3072
+    - - 512
+      - 256
+    - - 2048
+      - 1024
+    - - 6144
+      - 512
+    - - 1024
+      - 4096
+    repeats: 64
+  attn_gpu_memory_gb:
+    value: 95.1407908
+    status: measured
+    derived_from: '`GPU KV cache size: C tokens` in the workload-only server log; C * 55_224 / 1e9'
+    evidence: tp8_20260901/10_full_saturation_rate/profile_workload/vllm/glm52_b200_tp8_ep8_10_full_saturation_rate_workload_server.log
+  provenance:
+    accepted_run: logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/10_full_saturation_rate
+    capture_source: logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/10_full_saturation_rate
+- index: 11
+  name: long_prefill_ladder_c1
+  variant: tp8_ep8_dp1
+  purpose: '16K-491K prompts: long-prefill ladder at concurrency 1.'
+  coverage:
+  - long_prefill
+  - bounded_kernel_trace
+  max_model_len: 524288
+  max_concurrency: 1
+  profile_arrival_mode: saturated
+  simulation_arrival_mode: saturated
+  gpu_memory_utilization: 0.85
+  capture_seconds: 120.0
+  device_role: primary
+  workload_trace:
+    file: traces/11_long_prefill_ladder_c1.csv
+    shapes:
+    - - 16384
+      - 16
+    - - 32768
+      - 64
+    - - 65536
+      - 16
+    - - 98304
+      - 64
+    - - 131072
+      - 16
+    - - 196608
+      - 64
+    - - 262144
+      - 16
+    - - 393216
+      - 64
+    - - 458752
+      - 16
+    - - 491520
+      - 64
+    repeats: 2
+    id_suffix: full
+  kernel_trace:
+    file: traces/11_long_prefill_ladder_c1.nsys.csv
+    shapes:
+    - - 16384
+      - 16
+    - - 32768
+      - 64
+    - - 65536
+      - 16
+    - - 98304
+      - 64
+    - - 131072
+      - 16
+    - - 196608
+      - 64
+    - - 262144
+      - 16
+    repeats: 1
+    id_suffix: nsys
+  attn_gpu_memory_gb:
+    value: 88.0014321
+    status: measured
+    derived_from: '`GPU KV cache size: C tokens` in the workload-only server log; C * 55_224 / 1e9'
+    evidence: tp8_20260901/11_long_prefill_ladder_c1/profile_workload/vllm/glm52_b200_tp8_ep8_11_long_prefill_ladder_c1_workload_server.log
+  provenance:
+    accepted_run: logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/11_long_prefill_ladder_c1
+    capture_source: logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/11_long_prefill_ladder_c1
+- index: 12
+  name: ultra_context_decode_c1
+  variant: tp8_ep8_dp1
+  purpose: 'Long context plus long output: ultra-context decode at concurrency 1.'
+  coverage:
+  - ultra_context
+  - long_decode
+  max_model_len: 524288
+  max_concurrency: 1
+  profile_arrival_mode: saturated
+  simulation_arrival_mode: saturated
+  gpu_memory_utilization: 0.85
+  capture_seconds: 120.0
+  device_role: primary
+  workload_trace:
+    file: traces/12_ultra_context_decode_c1.csv
+    shapes:
+    - - 458752
+      - 256
+    - - 458752
+      - 1024
+    - - 458752
+      - 4096
+    - - 262144
+      - 256
+    - - 262144
+      - 1024
+    - - 262144
+      - 4096
+    - - 131072
+      - 256
+    - - 131072
+      - 1024
+    - - 131072
+      - 4096
+    - - 32768
+      - 256
+    - - 32768
+      - 1024
+    - - 32768
+      - 4096
+    - - 8192
+      - 256
+    - - 8192
+      - 1024
+    - - 8192
+      - 4096
+    repeats: 1
+    id_suffix: full
+  kernel_trace:
+    file: traces/12_ultra_context_decode_c1.nsys.csv
+    shapes:
+    - - 458752
+      - 64
+    - - 8192
+      - 256
+    - - 12288
+      - 64
+    repeats: 1
+    id_suffix: nsys
+  attn_gpu_memory_gb:
+    value: 88.0014321
+    status: measured
+    derived_from: '`GPU KV cache size: C tokens` in the workload-only server log; C * 55_224 / 1e9'
+    evidence: tp8_20260901/12_ultra_context_decode_c1/profile_workload/vllm/glm52_b200_tp8_ep8_12_ultra_context_decode_c1_workload_server.log
+  provenance:
+    accepted_run: logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/12_ultra_context_decode_c1
+    capture_source: logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/12_ultra_context_decode_c1
+- index: 13
+  name: generation_length_matrix_c8
+  variant: tp8_ep8_dp1
+  purpose: Mixed prompt and output lengths across a generation-length matrix.
+  coverage:
+  - generation_length_matrix
+  max_model_len: 131072
+  max_concurrency: 8
+  profile_arrival_mode: saturated
+  simulation_arrival_mode: saturated
+  gpu_memory_utilization: 0.85
+  capture_seconds: 60.0
+  device_role: primary
+  workload_trace:
+    file: traces/13_generation_length_matrix_c8.csv
+    shapes:
+    - - 128
+      - 4096
+    - - 128
+      - 8192
+    - - 128
+      - 16384
+    - - 128
+      - 32768
+    - - 512
+      - 4096
+    - - 512
+      - 8192
+    - - 512
+      - 16384
+    - - 512
+      - 32768
+    - - 2048
+      - 4096
+    - - 2048
+      - 8192
+    - - 2048
+      - 16384
+    - - 2048
+      - 32768
+    - - 8192
+      - 4096
+    - - 8192
+      - 8192
+    - - 8192
+      - 16384
+    - - 8192
+      - 32768
+    - - 16384
+      - 4096
+    - - 16384
+      - 8192
+    - - 16384
+      - 16384
+    - - 16384
+      - 32768
+    - - 32768
+      - 4096
+    - - 32768
+      - 8192
+    - - 32768
+      - 16384
+    - - 32768
+      - 32768
+    repeats: 1
+    id_suffix: full
+  kernel_trace:
+    file: traces/13_generation_length_matrix_c8.nsys.csv
+    shapes:
+    - - 128
+      - 256
+    - - 512
+      - 256
+    - - 2048
+      - 256
+    - - 8192
+      - 256
+    - - 16384
+      - 256
+    - - 32768
+      - 256
+    - - 4096
+      - 256
+    - - 24576
+      - 256
+    repeats: 1
+    id_suffix: nsys
+  attn_gpu_memory_gb:
+    value: 93.4584468
+    status: measured
+    derived_from: '`GPU KV cache size: C tokens` in the workload-only server log; C * 55_224 / 1e9'
+    evidence: tp8_20260901/13_generation_length_matrix_c8/profile_workload/vllm/glm52_b200_tp8_ep8_13_generation_length_matrix_c8_workload_server.log
+  provenance:
+    accepted_run: logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/13_generation_length_matrix_c8
+    capture_source: logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/13_generation_length_matrix_c8
+- index: 14
+  name: near_full_long_decode_c21
+  variant: tp8_ep8_dp1
+  purpose: 'About 91.4% terminal KV demand: near-full long decode.'
+  coverage:
+  - kv_near_full
+  max_model_len: 65536
+  max_concurrency: 21
+  profile_arrival_mode: saturated
+  simulation_arrival_mode: saturated
+  gpu_memory_utilization: 0.85
+  capture_seconds: 90.0
+  device_role: primary
+  workload_trace:
+    file: traces/14_near_full_long_decode_c21.csv
+    shapes:
+    - - 8192
+      - 8192
+    - - 12288
+      - 8192
+    - - 16384
+      - 8192
+    - - 24576
+      - 4096
+    - - 32768
+      - 4096
+    - - 49152
+      - 2048
+    repeats: 10
+    id_suffix: full
+  kernel_trace:
+    file: traces/14_near_full_long_decode_c21.nsys.csv
+    shapes:
+    - - 50944
+      - 256
+    - - 16128
+      - 256
+    - - 20224
+      - 256
+    - - 24320
+      - 256
+    - - 28416
+      - 256
+    - - 36608
+      - 256
+    - - 50944
+      - 256
+    - - 16128
+      - 256
+    - - 20224
+      - 256
+    - - 24320
+      - 256
+    - - 28416
+      - 256
+    - - 36608
+      - 256
+    - - 50944
+      - 256
+    - - 16128
+      - 256
+    - - 20224
+      - 256
+    - - 24320
+      - 256
+    - - 28416
+      - 256
+    - - 36608
+      - 256
+    - - 50944
+      - 256
+    - - 16128
+      - 256
+    - - 20224
+      - 256
+    repeats: 1
+    id_suffix: nsys
+  attn_gpu_memory_gb:
+    value: 93.8048118
+    status: measured
+    derived_from: '`GPU KV cache size: C tokens` in the workload-only server log; C * 55_224 / 1e9'
+    evidence: tp8_20260901/14_near_full_long_decode_c21/profile_workload/vllm/glm52_b200_tp8_ep8_14_near_full_long_decode_c21_workload_server.log
+  provenance:
+    accepted_run: logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/14_near_full_long_decode_c21
+    capture_source: logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/14_near_full_long_decode_c21
+- index: 15
+  name: kv_overcommit_mixed_churn_c14
+  variant: tp8_ep8_dp1
+  purpose: About 122.6% average terminal KV demand, admission-controlled churn.
+  coverage:
+  - kv_overcommit
+  - admission
+  max_model_len: 262144
+  max_concurrency: 14
+  profile_arrival_mode: saturated
+  simulation_arrival_mode: saturated
+  gpu_memory_utilization: 0.85
+  capture_seconds: 120.0
+  device_role: primary
+  workload_trace:
+    file: traces/15_kv_overcommit_mixed_churn_c14.csv
+    shapes:
+    - - 65536
+      - 4096
+    - - 16384
+      - 32768
+    - - 98304
+      - 2048
+    - - 32768
+      - 16384
+    - - 8192
+      - 8192
+    - - 49152
+      - 8192
+    repeats: 12
+    id_suffix: full
+  kernel_trace:
+    file: traces/15_kv_overcommit_mixed_churn_c14.nsys.csv
+    shapes:
+    - - 69376
+      - 256
+    - - 48896
+      - 256
+    - - 100096
+      - 256
+    - - 48896
+      - 256
+    - - 16128
+      - 256
+    - - 57088
+      - 256
+    - - 69376
+      - 256
+    - - 48896
+      - 256
+    - - 100096
+      - 256
+    - - 48896
+      - 256
+    - - 16128
+      - 256
+    - - 57088
+      - 256
+    - - 69376
+      - 256
+    - - 48896
+      - 256
+    repeats: 1
+    id_suffix: nsys
+  attn_gpu_memory_gb:
+    value: 91.5357681
+    status: measured
+    derived_from: '`GPU KV cache size: C tokens` in the workload-only server log; C * 55_224 / 1e9'
+    evidence: tp8_20260901/15_kv_overcommit_mixed_churn_c14/profile_workload/vllm/glm52_b200_tp8_ep8_15_kv_overcommit_mixed_churn_c14_workload_server.log
+  provenance:
+    accepted_run: logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/15_kv_overcommit_mixed_churn_c14
+    capture_source: logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/15_kv_overcommit_mixed_churn_c14

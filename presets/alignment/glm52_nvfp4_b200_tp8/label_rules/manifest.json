@@ -1,0 +1,217 @@
+{
+ "schema_version": 2,
+ "rule_files": [
+  "rules.json"
+ ],
+ "note": "One order-independent rule set. It was seven files applied in a fixed order, where a later file's wider matchers were survived rather than corrected -- eight of those ninety rules are unsound on their own, and would mislabel 8077 positions if the file boundaries were removed. One of them, `attention.q_b_proj <- 'cublasLt::splitKreduce_kernel'`, never once claims a position that carries its operation: it was only ever right because an earlier file had already taken the ones it would have got wrong. So the labels were a property of how the filenames sorted, and nothing checked it. Matchers here were narrowed until no position is claimed by two rules with different operations. Two checks hold the property: `subsumptions` proves order-dependence from the rule file alone and runs in `alignment-campaign check`; `disagreements` observes it against a real capture at the fixpoint and runs in `alignment-campaign label`. Both are in `alignment/labeling/rules.py`.",
+ "merged_from_note": "These seven files no longer exist in the pack; they are named because `merged_sources` records where each came from. The chain as applied is kept at logs/20260826_0_glm52_b200_ep4_workload_matrix_realign/labeling_rules/.",
+ "merged_from": [
+  "00_base_without_retired_split_fused_moe.json",
+  "01_labeling_rules.serial_shared.json",
+  "02_labeling_rules.fused_moe_slot_migration.json",
+  "03_label_rules_assemblies.json",
+  "04_label_rules_delta.json",
+  "05_embedding_allreduce_label_rules.json",
+  "06_label_rules_workload_matrix.json"
+ ],
+ "merged_sources": [
+  "logs/20260823_2_glm52_nvfp4_b200_ep4_c32_long_enwik9/labeling_rules.tp_pairing_full_v4.json",
+  "logs/20260824_1_glm52_nvfp4_b200_ep4_c32_serial_shared/labeling_rules.serial_shared.json",
+  "logs/20260825_2_glm52_nvfp4_b200_ep4_serial_shared_alignment/labeling_rules.fused_moe_slot_migration.json",
+  "logs/20260825_8_glm52_nvfp4_b200_ep4_serial_shared_fused_alignment/analysis_kernel_complete_labels/label_rules_assemblies.json",
+  "logs/20260825_8_glm52_nvfp4_b200_ep4_serial_shared_fused_alignment/analysis_kernel_complete_labels/label_rules_delta.json",
+  "logs/20260825_33_glm52_b200_ep4_embedding_allreduce_alignment/embedding_allreduce_label_rules.json",
+  "logs/20260825_34_glm52_b200_ep4_workload_matrix/label_rules_workload_matrix.json"
+ ],
+ "removed_operation": "moe.routed_experts.fused_moe",
+ "reason": "retired split routing/gate_up/down/finalize slots; replaced by aggregate fused_moe rule",
+ "provenance": "Derived from the layered chain at logs/20260826_0_glm52_b200_ep4_workload_matrix_realign/labeling_rules/, which produced the accepted cases 01-08. Every rule keeps its `source_experiment`, which is what the seven filenames used to carry. The other candidate, the single-file chain in logs/20260827_1_.../labeling_rules.json, reproduces cases 09-15 exactly but leaves 18% of batch-0 kernel positions unmapped.",
+ "reproduction": {
+  "note": "Measured by applying this rule set to a fresh parse of each accepted case's kernel_sequences.json and comparing against that case's accepted kernel_sequences_labeled.json, position by position in walk order. Written by the migration, not by hand.",
+  "measured_on": "2026-08-28",
+  "rules": 135,
+  "total_positions": 197838,
+  "order_dependent_positions": 0,
+  "order_dependence_note": "The rule list is shuffled and re-applied to a fixpoint; this counts the positions whose (status, operation) moved. Zero means the labels are a property of the rules rather than of their order in the file.",
+  "ledger_note": "Three unlike things the old single `positions_differing_from_accepted` added together. `wrong` is the only defect: a position both label and the accepted document map, to different operations. `lost` is narrower coverage, `gained` is wider -- the accepted document leaves those positions unmapped. The 1058 this field used to record was entirely `gained`, so it never counted a mistake.",
+  "positions": {
+   "wrong": 0,
+   "lost": 294,
+   "gained": 1538
+  },
+  "measured_duration_ms": {
+   "lost": 223.425,
+   "gained": 811.202,
+   "total": 412916.5,
+   "net_coverage_pct": 0.1423
+  },
+  "duration_note": "Position counts are the wrong currency for the coverage trade: the lost positions are GEMMs and their split-K reduces, the gained ones are mostly elementwise. `mapping.coverage.measured_duration_fraction` is what the acceptance gate reads, so the same ledger is given in the milliseconds the analyzer's kernel inventory records for those launches.",
+  "per_case": {
+   "01_micro_throughput_c256": {
+    "positions": 75419,
+    "sweeps_to_fixpoint": 5,
+    "order_dependent_positions": 0,
+    "wrong": 0,
+    "lost": 168,
+    "gained": 215,
+    "lost_ms": 145.792,
+    "gained_ms": 172.985,
+    "measured_ms": 33612.3
+   },
+   "02_graph_boundaries_c128": {
+    "positions": 47999,
+    "sweeps_to_fixpoint": 5,
+    "order_dependent_positions": 0,
+    "wrong": 0,
+    "lost": 126,
+    "gained": 180,
+    "lost_ms": 77.633,
+    "gained_ms": 41.825,
+    "measured_ms": 28414.0
+   },
+   "03_balanced_anchor_c32": {
+    "positions": 17413,
+    "sweeps_to_fixpoint": 5,
+    "order_dependent_positions": 0,
+    "wrong": 0,
+    "lost": 0,
+    "gained": 85,
+    "lost_ms": 0.0,
+    "gained_ms": 64.9,
+    "measured_ms": 50509.3
+   },
+   "04_prefill_spectrum_c32": {
+    "positions": 14337,
+    "sweeps_to_fixpoint": 5,
+    "order_dependent_positions": 0,
+    "wrong": 0,
+    "lost": 0,
+    "gained": 59,
+    "lost_ms": 0.0,
+    "gained_ms": 10.963,
+    "measured_ms": 39527.4
+   },
+   "05_decode_spectrum_c64": {
+    "positions": 9600,
+    "sweeps_to_fixpoint": 5,
+    "order_dependent_positions": 0,
+    "wrong": 0,
+    "lost": 0,
+    "gained": 14,
+    "lost_ms": 0.0,
+    "gained_ms": 96.148,
+    "measured_ms": 53220.0
+   },
+   "06_long_long_c8": {
+    "positions": 2955,
+    "sweeps_to_fixpoint": 5,
+    "order_dependent_positions": 0,
+    "wrong": 0,
+    "lost": 0,
+    "gained": 8,
+    "lost_ms": 0.0,
+    "gained_ms": 134.52,
+    "measured_ms": 60692.9
+   },
+   "07_quadrant_interference_c48": {
+    "positions": 12471,
+    "sweeps_to_fixpoint": 5,
+    "order_dependent_positions": 0,
+    "wrong": 0,
+    "lost": 0,
+    "gained": 42,
+    "lost_ms": 0.0,
+    "gained_ms": 4.255,
+    "measured_ms": 50329.8
+   },
+   "08_completion_churn_c96": {
+    "positions": 8537,
+    "sweeps_to_fixpoint": 5,
+    "order_dependent_positions": 0,
+    "wrong": 0,
+    "lost": 0,
+    "gained": 26,
+    "lost_ms": 0.0,
+    "gained_ms": 32.516,
+    "measured_ms": 48059.0
+   },
+   "09_rate_knee": {
+    "positions": 587,
+    "sweeps_to_fixpoint": 5,
+    "order_dependent_positions": 0,
+    "wrong": 0,
+    "lost": 0,
+    "gained": 6,
+    "lost_ms": 0.0,
+    "gained_ms": 4.795,
+    "measured_ms": 1276.5
+   },
+   "10_full_saturation_rate": {
+    "positions": 1052,
+    "sweeps_to_fixpoint": 5,
+    "order_dependent_positions": 0,
+    "wrong": 0,
+    "lost": 0,
+    "gained": 0,
+    "lost_ms": 0.0,
+    "gained_ms": 0.0,
+    "measured_ms": 4908.5
+   },
+   "11_long_prefill_ladder_c1": {
+    "positions": 1284,
+    "sweeps_to_fixpoint": 5,
+    "order_dependent_positions": 0,
+    "wrong": 0,
+    "lost": 0,
+    "gained": 102,
+    "lost_ms": 0.0,
+    "gained_ms": 115.04,
+    "measured_ms": 5465.3
+   },
+   "12_ultra_context_decode_c1": {
+    "positions": 1884,
+    "sweeps_to_fixpoint": 5,
+    "order_dependent_positions": 0,
+    "wrong": 0,
+    "lost": 0,
+    "gained": 0,
+    "lost_ms": 0.0,
+    "gained_ms": 0.0,
+    "measured_ms": 12254.4
+   },
+   "13_generation_length_matrix_c8": {
+    "positions": 2804,
+    "sweeps_to_fixpoint": 5,
+    "order_dependent_positions": 0,
+    "wrong": 0,
+    "lost": 0,
+    "gained": 801,
+    "lost_ms": 0.0,
+    "gained_ms": 133.254,
+    "measured_ms": 8809.9
+   },
+   "14_near_full_long_decode_c21": {
+    "positions": 756,
+    "sweeps_to_fixpoint": 5,
+    "order_dependent_positions": 0,
+    "wrong": 0,
+    "lost": 0,
+    "gained": 0,
+    "lost_ms": 0.0,
+    "gained_ms": 0.0,
+    "measured_ms": 7743.2
+   },
+   "15_kv_overcommit_mixed_churn_c14": {
+    "positions": 740,
+    "sweeps_to_fixpoint": 5,
+    "order_dependent_positions": 0,
+    "wrong": 0,
+    "lost": 0,
+    "gained": 0,
+    "lost_ms": 0.0,
+    "gained_ms": 0.0,
+    "measured_ms": 8094.1
+   }
+  }
+ }
+}

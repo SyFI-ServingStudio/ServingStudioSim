@@ -39,7 +39,9 @@ _FLASHMLA_COSINE_LIMIT = 7e-6
 _TRTLLM_FP8_BACKEND = "dsa_sparse_mla_attention:flashinfer_trtllm_fp8"
 _TRTLLM_FP8_CACHE_LAYOUT = "hnd_paged_mqa_fp8_latent_rope"
 _TRTLLM_KERNEL_NAME = "fmhaSm100"
-_TRTLLM_NUM_HEADS = 16
+# Per-rank q-head counts of GLM's 64 heads at validated TP degrees (TP8, TP4);
+# operands, output check and metrics are parametric in num_heads.
+_TRTLLM_SUPPORTED_NUM_HEADS = frozenset({8, 16})
 _TRTLLM_WORKSPACE_BYTES = 128 * 1024 * 1024
 _TRTLLM_PAGE_SIZE = 64
 
@@ -832,6 +834,11 @@ def profile_dsa_sparse_mla_attention_flashinfer_trtllm_fp8(
     cache_layout: str,
 ) -> ComputeMetrics:
     """Profile vLLM's one-launch B200 FlashInfer sparse-MLA callable."""
+    if num_heads not in _TRTLLM_SUPPORTED_NUM_HEADS:
+        raise ProfilerNotImplemented(
+            f"{_TRTLLM_FP8_BACKEND} supports num_heads in "
+            f"{sorted(_TRTLLM_SUPPORTED_NUM_HEADS)}, got {num_heads}"
+        )
     validated = _validate_args(
         num_queries=num_queries,
         num_cache_tokens=num_cache_tokens,
@@ -849,7 +856,7 @@ def profile_dsa_sparse_mla_attention_flashinfer_trtllm_fp8(
         valid_counts=valid_counts,
         index_distribution=index_distribution,
         cache_layout=cache_layout,
-        expected_num_heads=_TRTLLM_NUM_HEADS,
+        expected_num_heads=num_heads,
         expected_q_dtype=DType.FP8_E4M3,
         expected_cache_dtype=DType.FP8_E4M3,
         expected_cache_layout=_TRTLLM_FP8_CACHE_LAYOUT,

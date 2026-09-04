@@ -31,13 +31,16 @@ from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerN
 from profiling.runners.metrics import ComputeMetrics
 
 _BACKEND = "dsa_sparse_mla_prefill:flashinfer_trtllm_fp8"
-_NUM_HEADS = 16
+# Per-rank q-head counts of GLM's 64 heads at validated TP degrees (TP8, TP4).
+# The kernel launch, output check and metrics are parametric in num_heads.
+_SUPPORTED_NUM_HEADS = frozenset({8, 16})
 _NUM_KV_HEADS = 1
 _SOFTMAX_SCALE = 0.0625
 
 
 @dataclass(frozen=True)
 class _Shape:
+    num_heads: int
     pairs: tuple[tuple[int, int], ...]
     valid_counts: tuple[int, ...]
     request_page_offsets: tuple[int, ...]
@@ -99,14 +102,14 @@ def _validate_args(
         value_dim,
     )
     expected_model_identity = (
-        _NUM_HEADS,
+        sorted(_SUPPORTED_NUM_HEADS),
         _NUM_KV_HEADS,
         _SELECTED_K,
         _LATENT_DIM,
         _ROPE_DIM,
         _VALUE_DIM,
     )
-    if model_identity != expected_model_identity:
+    if num_heads not in _SUPPORTED_NUM_HEADS or model_identity[1:] != expected_model_identity[1:]:
         raise ProfilerNotImplemented(
             f"{_BACKEND} requires model identity {expected_model_identity}, got {model_identity}"
         )
@@ -141,6 +144,7 @@ def _validate_args(
         )
 
     return _Shape(
+        num_heads=num_heads,
         pairs=tuple(pairs),
         valid_counts=tuple(valid_counts),
         request_page_offsets=tuple(request_page_offsets),
@@ -152,7 +156,7 @@ def _validate_args(
 def _build_operands(torch: Any, shape: _Shape, *, device: Any) -> _TrtllmFp8Operands:
     fp8 = torch.float8_e4m3fn
     query = torch.empty(
-        (shape.num_queries, 1, _NUM_HEADS, _SCORE_DIM),
+        (shape.num_queries, 1, shape.num_heads, _SCORE_DIM),
         dtype=fp8,
         device=device,
     )
@@ -253,7 +257,7 @@ def profile_dsa_sparse_mla_prefill_flashinfer_trtllm_fp8(
 
         output = kernel()
         torch.cuda.synchronize(device)
-        expected_shape = (shape.num_queries, 1, _NUM_HEADS, _VALUE_DIM)
+        expected_shape = (shape.num_queries, 1, shape.num_heads, _VALUE_DIM)
         if output.dtype is not torch.bfloat16 or tuple(output.shape) != expected_shape:
             raise KernelLaunchFailed(
                 f"{_BACKEND} returned {output.dtype} {tuple(output.shape)}, "
@@ -273,12 +277,12 @@ def profile_dsa_sparse_mla_prefill_flashinfer_trtllm_fp8(
 
     flops = _logical_flops(
         num_queries=shape.num_queries,
-        num_heads=_NUM_HEADS,
+        num_heads=shape.num_heads,
         selected_k=_SELECTED_K,
     )
     logical_bytes = _logical_bytes(
         num_queries=shape.num_queries,
-        num_heads=_NUM_HEADS,
+        num_heads=shape.num_heads,
         selected_k=_SELECTED_K,
         valid_counts=shape.valid_counts,
         q_bytes=1,

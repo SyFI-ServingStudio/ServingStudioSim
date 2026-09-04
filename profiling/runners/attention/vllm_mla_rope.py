@@ -277,7 +277,16 @@ def profile_vllm_mla_rope_vllm_inductor(
         except RuntimeError as exc:
             raise KernelLaunchFailed(f"compiled vLLM MLA rope failed: {exc}") from exc
 
-    time_ms = Timer.cupti(kernel, kernel_name=_KERNEL_NAME)
+    try:
+        time_ms = Timer.cupti(kernel, kernel_name=_KERNEL_NAME)
+    except RuntimeError:
+        # Some TP-sharded shapes (observed: num_heads=8 per rank at TP8/EP8)
+        # make inductor decline the pointwise fusion; the same compiled block
+        # then runs the native aten elementwise path and no triton_poi_fused*
+        # kernel exists to match. The timed callable executes nothing but this
+        # op, so the GPU-active union of everything captured IS the op's cost
+        # for those shapes.
+        time_ms = Timer.cupti(kernel, kernel_name=None, interval_union=True)
     energy_j = Energy.perf(kernel, warmup=10, per_iter_time_ms=time_ms)
     logical_bytes = _logical_bytes(
         num_tokens=num_tokens,
