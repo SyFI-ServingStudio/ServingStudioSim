@@ -1311,15 +1311,19 @@ impl Glm52MtpDraftStage {
     }
 }
 
+/// The architecture as an ordinary deployment runs it: layers 0..77 and the
+/// output head, once per iteration.
+///
+/// There is no MTP layer here. The checkpoint has one, but a deployment that
+/// does not speculate never runs it and never allocates its KV --
+/// [`Glm52VllmNvfp4DsaMoeSpeculativeModel`] is the model that does.
 pub struct Glm52VllmNvfp4DsaMoeModel {
     target: Glm52TargetForward,
-    pub mtp_mode: Glm52MtpMode,
     pub nvl_num_gpu: u16,
     pub max_model_len: u32,
     pub num_attn_dp_groups: u16,
     pub num_attn_shards: u16,
     pub total_state_bytes_per_token: u64,
-    mtp: Option<Glm52MtpPass>,
     cost_flat: Vec<FlatCostNode>,
     n_slots: usize,
 }
@@ -1477,42 +1481,23 @@ pub fn build(
             "a speculative recipe must build through build_speculative",
         ));
     }
+    if resolved.raw_cfg.mtp_mode != Glm52MtpMode::Off {
+        return Err(fit_failed(
+            "an ordinary GLM-5.2 NVFP4 deployment does not run the MTP layer; \
+             use build_speculative to run it as a proposer",
+        ));
+    }
     let ep_size = resolved.raw_cfg.parallel.ep_size;
     let nvl_num_gpu = resolved.raw_cfg.parallel.nvl_num_gpu;
     let max_model_len = resolved.raw_cfg.parallel.max_model_len;
-    let mtp_mode = resolved.raw_cfg.mtp_mode;
     let target = Glm52TargetForward::build(name.clone(), &resolved, bridge)?;
-    let mtp = match (
-        resolved.mtp_prelude.clone(),
-        resolved.mtp_attention.clone(),
-        resolved.mtp_head.clone(),
-    ) {
-        (None, None, None) => None,
-        (Some(prelude), Some(attention), Some(head)) => Some(Glm52MtpPass::build(
-            &format!("{name}.mtp"),
-            prelude,
-            attention,
-            head,
-            &resolved,
-            bridge,
-        )?),
-        _ => {
-            return Err(fit_failed(
-                "MTP prelude/attention/head must be all present or all absent",
-            ))
-        }
-    };
-
-    let total_state_bytes_per_token = state_bytes_per_token(ep_size, mtp_mode)?;
     let mut model = Glm52VllmNvfp4DsaMoeModel {
         target,
-        mtp_mode,
         nvl_num_gpu,
         max_model_len,
         num_attn_dp_groups: 1,
         num_attn_shards: ep_size,
-        total_state_bytes_per_token,
-        mtp,
+        total_state_bytes_per_token: state_bytes_per_token(ep_size, Glm52MtpMode::Off)?,
         cost_flat: Vec::new(),
         n_slots: 0,
     };
@@ -1807,23 +1792,12 @@ impl Glm52TargetForward {
 impl Glm52VllmNvfp4DsaMoeModel {
     pub fn cost_tree(&self) -> CostTree {
         let mut builder = CostTreeBuilder::new();
-        let mut children = self.target.compile_children(&mut builder);
-        if let Some(mtp) = &self.mtp {
-            let prefix = format!("{}.mtp", self.target.name);
-            children.push(CostNode::Labeled {
-                label: format!("MTP layer 78 [{:?}; decode-only]", self.mtp_mode),
-                child: Box::new(mtp.compile(&mut builder, self.target.ep_size, &prefix)),
-            });
-        }
+        let children = self.target.compile_children(&mut builder);
         let root = CostNode::Labeled {
             label: format!(
-                "{} (Glm52VllmNvfp4DsaMoeModel) [TP=EP{}; attention DP groups={}; MTP={:?}; \
+                "{} (Glm52VllmNvfp4DsaMoeModel) [TP=EP{}; attention DP groups={}; \
                  timing_context<={}]",
-                self.target.name,
-                self.target.ep_size,
-                self.num_attn_dp_groups,
-                self.mtp_mode,
-                self.max_model_len
+                self.target.name, self.target.ep_size, self.num_attn_dp_groups, self.max_model_len
             ),
             child: Box::new(CostNode::Sum(children)),
         };
@@ -1834,13 +1808,6 @@ impl Glm52VllmNvfp4DsaMoeModel {
         let batch = normalize_input(input, self.target.ep_size, self.max_model_len)
             .unwrap_or_else(|reason| panic!("invalid Glm52VllmNvfp4DsaMoeModel input: {reason}"));
         self.target.eval(&batch, ev);
-
-        if let Some(mtp) = &self.mtp {
-            // Without speculation the MTP layer runs once, on the decode slice
-            // only, and proposes from every row it forwards.
-            let decode_tokens = batch.groups[0].decode_tokens;
-            mtp.eval(&batch.decode_only(), self.target.ep_size, decode_tokens, ev);
-        }
     }
 }
 
@@ -2024,17 +1991,14 @@ impl SpeculativeUnifiedModel for Glm52VllmNvfp4DsaMoeSpeculativeModel {
 #[derive(Clone, Debug)]
 struct NormalizedGroup {
     batch_tokens: u32,
-    /// Query rows the decode requests submit between them. This is the request
-    /// count only when each submits one row; a verify step submits several.
-    decode_tokens: u32,
-    decode_request_count: u32,
+    /// Requests in this group, prefilling and decoding alike. A draft pass
+    /// forwards exactly this many rows, one endpoint per request.
     request_count: u32,
     /// Rows the sampler needs logits for: one per prefill request, and every
-    /// decode query row, because a verify step scores all of them.
+    /// decode query row, because a verify step scores all of them. This exceeds
+    /// `request_count` by the drafted positions.
     logits_rows: u32,
-    decode_context: Option<u32>,
-    /// One entry per request in this group, at that request's own KV length.
-    /// A draft pass forwards exactly these rows, one per request.
+    /// One entry per request, at that request's own KV length.
     endpoint_context_lens: Vec<u32>,
     attention_input: VllmGlm52DsaAttnLocalWorkletInput,
 }
@@ -2046,46 +2010,6 @@ struct NormalizedBatch {
 }
 
 impl NormalizedBatch {
-    fn decode_only(&self) -> Self {
-        let groups: Vec<NormalizedGroup> = self
-            .groups
-            .iter()
-            .map(|group| {
-                let context_lens = group
-                    .attention_input
-                    .decode
-                    .as_ref()
-                    .and_then(|decode| decode.context_lens.clone());
-                NormalizedGroup {
-                    batch_tokens: group.decode_tokens,
-                    decode_tokens: group.decode_tokens,
-                    decode_request_count: group.decode_request_count,
-                    request_count: group.decode_request_count,
-                    logits_rows: group.decode_tokens,
-                    decode_context: group.decode_context,
-                    endpoint_context_lens: context_lens.clone().unwrap_or_default(),
-                    attention_input: VllmGlm52DsaAttnLocalWorkletInput {
-                        num_new_tokens: group.decode_tokens,
-                        prefill_query_cache_pairs: Vec::new(),
-                        decode: group.decode_context.map(|context_len| {
-                            VllmGlm52DsaAttnLocalDecodeInput {
-                                batch_size: group.decode_request_count,
-                                context_len,
-                                context_lens,
-                                requires_padding: false,
-                            }
-                        }),
-                    },
-                }
-            })
-            .collect();
-        let total_tokens: u32 = groups.iter().map(|group| group.batch_tokens).sum();
-        Self {
-            groups,
-            total_tokens,
-        }
-    }
-
     /// One query row per request, at that request's KV length advanced by
     /// `context_advance`.
     ///
@@ -2106,11 +2030,8 @@ impl NormalizedBatch {
                 let decode_context = context_lens.iter().copied().max();
                 NormalizedGroup {
                     batch_tokens: group.request_count,
-                    decode_tokens: group.request_count,
-                    decode_request_count: group.request_count,
                     request_count: group.request_count,
                     logits_rows: group.request_count,
-                    decode_context,
                     endpoint_context_lens: context_lens.clone(),
                     attention_input: VllmGlm52DsaAttnLocalWorkletInput {
                         num_new_tokens: group.request_count,
@@ -2215,13 +2136,10 @@ fn normalize_input(
             .ok_or_else(|| "pooled token count overflows u32".to_string())?;
         groups.push(NormalizedGroup {
             batch_tokens,
-            decode_tokens,
-            // Without speculation every decode request submits one query row,
-            // so the two counts coincide here.
-            decode_request_count: decode_tokens,
             request_count,
+            // Without speculation every decode request submits one query row,
+            // so the sampler scores exactly one row per request.
             logits_rows: request_count,
-            decode_context,
             endpoint_context_lens,
             attention_input: VllmGlm52DsaAttnLocalWorkletInput {
                 num_new_tokens: batch_tokens,
@@ -2359,11 +2277,8 @@ fn normalize_speculative_input(
             .ok_or_else(|| "pooled token count overflows u32".to_string())?;
         groups.push(NormalizedGroup {
             batch_tokens,
-            decode_tokens,
-            decode_request_count,
             request_count,
             logits_rows,
-            decode_context,
             endpoint_context_lens,
             attention_input: VllmGlm52DsaAttnLocalWorkletInput {
                 num_new_tokens: batch_tokens,
@@ -2422,8 +2337,10 @@ where
     ev.push(metrics, || input.clone().into());
 }
 
+/// Layers 0..77 plus the output head -- the whole ordinary model, and the
+/// shared prefix of the speculative one.
 #[cfg(test)]
-fn expected_slot_count(ep_size: u16, mtp_mode: Glm52MtpMode) -> usize {
+fn expected_slot_count(ep_size: u16) -> usize {
     let ep = usize::from(ep_size);
     // Scale nodes do not mint additional slots. Each static section is built
     // once, while rank-local work is represented by Max over TP/EP children.
@@ -2431,26 +2348,25 @@ fn expected_slot_count(ep_size: u16, mtp_mode: Glm52MtpMode) -> usize {
     let sparse_shared =
         ep * (ATTN_SHARED_SLOTS + ROUTER_SLOTS + SHARED_EXPERT_SLOTS + NVFP4_EXPERT_SLOTS) + 4;
     let sparse_full = sparse_shared + ep * (ATTN_FULL_SLOTS - ATTN_SHARED_SLOTS);
-    let main = (ep + 2) + dense + sparse_shared + sparse_full + sparse_shared + ep + ep;
-    // The MTP layer's experts are BF16, which quantizes nothing and so mints
-    // one leaf per rank where the body's NVFP4 experts mint two.
-    let mtp_sparse_shared =
+    (ep + 2) + dense + sparse_shared + sparse_full + sparse_shared + ep + ep
+}
+
+/// One MTP pass. `shares_index` is what `IndexShare` buys: reusing a previous
+/// layer's top-k instead of computing the indexer.
+///
+/// The MTP layer's experts are BF16, which quantizes nothing, so it mints one
+/// expert leaf per rank where a body layer's NVFP4 experts mint two.
+#[cfg(test)]
+fn expected_mtp_pass_slots(ep_size: u16, shares_index: bool) -> usize {
+    let ep = usize::from(ep_size);
+    let sparse_shared =
         ep * (ATTN_SHARED_SLOTS + ROUTER_SLOTS + SHARED_EXPERT_SLOTS + BF16_EXPERT_SLOTS) + 4;
-    let mtp_sparse_full = mtp_sparse_shared + ep * (ATTN_FULL_SLOTS - ATTN_SHARED_SLOTS);
-    let mtp_pass = |shared: bool| {
-        ep * MTP_PRELUDE_SLOTS
-            + if shared {
-                mtp_sparse_shared
-            } else {
-                mtp_sparse_full
-            }
-            + ep * MTP_HEAD_SLOTS
+    let decoder = if shares_index {
+        sparse_shared
+    } else {
+        sparse_shared + ep * (ATTN_FULL_SLOTS - ATTN_SHARED_SLOTS)
     };
-    match mtp_mode {
-        Glm52MtpMode::Off => main,
-        Glm52MtpMode::FullIndex => main + mtp_pass(false),
-        Glm52MtpMode::IndexShare => main + mtp_pass(true),
-    }
+    ep * MTP_PRELUDE_SLOTS + decoder + ep * MTP_HEAD_SLOTS
 }
 
 /// A draft stage compiles one whole-batch pass and, when the draft is deeper
@@ -2462,10 +2378,13 @@ fn expected_speculative_slot_count(
     mtp_mode: Glm52MtpMode,
     draft_tokens: u32,
 ) -> usize {
-    let target = expected_slot_count(ep_size, Glm52MtpMode::Off);
-    let first_pass = expected_slot_count(ep_size, Glm52MtpMode::FullIndex) - target;
-    let recurrent_pass = expected_slot_count(ep_size, mtp_mode) - target;
-    target + first_pass + if draft_tokens > 1 { recurrent_pass } else { 0 }
+    let shares_index = mtp_mode == Glm52MtpMode::IndexShare;
+    let recurrent = if draft_tokens > 1 {
+        expected_mtp_pass_slots(ep_size, shares_index)
+    } else {
+        0
+    };
+    expected_slot_count(ep_size) + expected_mtp_pass_slots(ep_size, false) + recurrent
 }
 
 fn state_bytes_per_token(
@@ -2829,12 +2748,15 @@ mod tests {
         // path charges it an activation-quantization launch it never makes and
         // a fused-MoE kernel it never calls -- a measured identity belonging to
         // different weights.
-        let cfg = build_configs(
+        let routing = RoutingDistribution::uniform(NUM_EXPERTS);
+        let cfg = build_speculative_configs(
             &model(),
             &parallel(4),
-            &RoutingDistribution::uniform(NUM_EXPERTS),
+            &routing,
+            &routing,
             false,
             Glm52MtpMode::FullIndex,
+            1,
         )
         .unwrap();
         let mtp_experts = cfg.mtp_bf16_moe.as_ref().expect("MTP layer has experts");
@@ -2843,18 +2765,18 @@ mod tests {
 
         let bridge = PerfApiBridge::new_uninit_for_test();
         bridge.enable_enumerate();
-        let built = build("unified".to_string(), resolve_configs(&cfg), &bridge).unwrap();
+        let built =
+            build_speculative("unified".to_string(), resolve_configs(&cfg), &bridge).unwrap();
         let slots = built.cost_tree().slots;
-        let mtp_expert_slots: Vec<_> = slots
+        let mtp_expert_slots = slots
             .iter()
             .filter(|slot| {
                 slot.name
-                    .starts_with("unified.mtp.decoder_sparse.moe.routed_experts")
+                    .starts_with("unified.mtp.step_0.decoder_sparse.moe.routed_experts")
             })
-            .collect();
+            .count();
         assert_eq!(
-            mtp_expert_slots.len(),
-            4,
+            mtp_expert_slots, 4,
             "BF16 experts are one whole-callable leaf per rank, with no quantization leaf"
         );
 
@@ -2868,8 +2790,16 @@ mod tests {
             .count();
         assert_eq!(body_expert_slots, 8, "NVFP4 experts quantize then fuse");
 
-        // MTP=Off never reaches the BF16 path, so it must not carry the config.
-        let off = build_configs(
+        // An ordinary deployment never runs the layer, so it carries no config
+        // for its experts at all.
+        let ordinary =
+            build_configs(&model(), &parallel(4), &routing, false, Glm52MtpMode::Off).unwrap();
+        assert!(ordinary.mtp_bf16_moe.is_none());
+    }
+
+    #[test]
+    fn compiled_tree_matches_the_tp4_schedule_and_collective_boundaries() {
+        let cfg = build_configs(
             &model(),
             &parallel(4),
             &RoutingDistribution::uniform(NUM_EXPERTS),
@@ -2877,23 +2807,20 @@ mod tests {
             Glm52MtpMode::Off,
         )
         .unwrap();
-        assert!(off.mtp_bf16_moe.is_none());
-    }
-
-    #[test]
-    fn compiled_tree_matches_the_tp4_schedule_and_collective_boundaries() {
-        for (mode, expected) in [
-            (Glm52MtpMode::Off, expected_slot_count(4, Glm52MtpMode::Off)),
-            (
-                Glm52MtpMode::FullIndex,
-                expected_slot_count(4, Glm52MtpMode::FullIndex),
-            ),
-            (
-                Glm52MtpMode::IndexShare,
-                expected_slot_count(4, Glm52MtpMode::IndexShare),
-            ),
-        ] {
-            let cfg = build_configs(
+        let bridge = PerfApiBridge::new_uninit_for_test();
+        bridge.enable_enumerate();
+        let built = build("unified".to_string(), resolve_configs(&cfg), &bridge).unwrap();
+        assert_eq!(built.n_slots, expected_slot_count(4));
+        assert_eq!(built.num_attn_dp_groups(), 1);
+        assert_eq!(built.num_attn_shards(), 4);
+        let description = built.cost_tree().describe();
+        assert!(description.contains("TP=EP4; attention DP groups=1"));
+        assert!(!description.contains("attention TP1"));
+        // An ordinary deployment never runs the MTP layer, so it has no slot
+        // for it -- and a recipe that asks for one does not build.
+        assert!(!description.contains("MTP layer 78"));
+        for mode in [Glm52MtpMode::FullIndex, Glm52MtpMode::IndexShare] {
+            let asked_for_mtp = build_configs(
                 &model(),
                 &parallel(4),
                 &RoutingDistribution::uniform(NUM_EXPERTS),
@@ -2901,15 +2828,12 @@ mod tests {
                 mode,
             )
             .unwrap();
-            let bridge = PerfApiBridge::new_uninit_for_test();
-            bridge.enable_enumerate();
-            let built = build("unified".to_string(), resolve_configs(&cfg), &bridge).unwrap();
-            assert_eq!(built.n_slots, expected, "slot count for {mode:?}");
-            assert_eq!(built.num_attn_dp_groups(), 1);
-            assert_eq!(built.num_attn_shards(), 4);
-            let description = built.cost_tree().describe();
-            assert!(description.contains("TP=EP4; attention DP groups=1"));
-            assert!(!description.contains("attention TP1"));
+            assert!(build(
+                "unified".to_string(),
+                resolve_configs(&asked_for_mtp),
+                &bridge
+            )
+            .is_err());
         }
 
         let cfg = build_configs(
@@ -3068,20 +2992,11 @@ mod tests {
         assert_eq!(decode.context_lens.as_deref(), Some(&[64, 91][..]));
         assert!(!decode.requires_padding);
         assert_eq!(normalized.groups[0].request_count, 4);
-
-        let mtp = normalized.decode_only();
-        assert_eq!(mtp.total_tokens, 2);
-        assert!(mtp.groups[0]
-            .attention_input
-            .prefill_query_cache_pairs
-            .is_empty());
+        // Without speculation the sampler scores one row per request.
+        assert_eq!(normalized.groups[0].logits_rows, 4);
         assert_eq!(
-            mtp.groups[0]
-                .attention_input
-                .decode
-                .as_ref()
-                .and_then(|decode| decode.context_lens.as_deref()),
-            Some(&[64, 91][..])
+            normalized.groups[0].endpoint_context_lens,
+            vec![5, 3, 64, 91]
         );
     }
 
@@ -3123,8 +3038,6 @@ mod tests {
         let group = &normalized.groups[0];
 
         assert_eq!(group.batch_tokens, 5 + 12);
-        assert_eq!(group.decode_tokens, 12);
-        assert_eq!(group.decode_request_count, 2);
         assert_eq!(group.request_count, 4);
         assert_eq!(group.logits_rows, 2 + 12);
 
@@ -3202,14 +3115,8 @@ mod tests {
             expected_speculative_slot_count(4, Glm52MtpMode::IndexShare, 5)
         );
 
-        let ordinary_cfg = build_configs(
-            &model(),
-            &parallel(4),
-            &routing,
-            false,
-            Glm52MtpMode::IndexShare,
-        )
-        .unwrap();
+        let ordinary_cfg =
+            build_configs(&model(), &parallel(4), &routing, false, Glm52MtpMode::Off).unwrap();
         let ordinary = build(
             "unified".to_string(),
             resolve_configs(&ordinary_cfg),
@@ -3221,6 +3128,7 @@ mod tests {
         // target's own leaves are billed at a different verify width, and the
         // five draft passes are slots of their own. A consumer reading a cost
         // log therefore cannot mistake one iteration for the other.
+        assert_eq!(ordinary.n_slots, expected_slot_count(4));
         assert!(speculative.n_slots > ordinary.n_slots);
         let description = speculative.cost_tree().describe();
         assert!(description.contains("Glm52VllmNvfp4DsaMoeSpeculativeModel"));
@@ -3262,14 +3170,8 @@ mod tests {
         .unwrap();
         assert!(build("unified".to_string(), resolve_configs(&spec_cfg), &bridge).is_err());
 
-        let ordinary_cfg = build_configs(
-            &model(),
-            &parallel(4),
-            &routing,
-            false,
-            Glm52MtpMode::IndexShare,
-        )
-        .unwrap();
+        let ordinary_cfg =
+            build_configs(&model(), &parallel(4), &routing, false, Glm52MtpMode::Off).unwrap();
         assert!(build_speculative(
             "unified".to_string(),
             resolve_configs(&ordinary_cfg),
