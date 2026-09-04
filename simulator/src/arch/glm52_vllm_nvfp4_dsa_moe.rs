@@ -1037,10 +1037,88 @@ impl Glm52SparseBody {
     }
 }
 
-struct Glm52MtpSection {
+/// One forward pass through the MTP layer: the prelude that assembles its
+/// input, the BF16 sparse decoder layer, and the head that samples from it.
+///
+/// A pass is parameterized by the batch it forwards and how many rows it
+/// samples, because those are the only things that differ between the single
+/// decode-only pass an ordinary iteration runs and the passes a draft stage
+/// chains. The three sections themselves are the same weights either way.
+struct Glm52MtpPass {
     prelude: Glm52MtpPreludeLocalWorklet,
     decoder: Glm52SparseBody,
     head: Glm52MtpHeadLocalWorklet,
+}
+
+impl Glm52MtpPass {
+    fn build(
+        name: &str,
+        prelude: Glm52MtpPreludeLocalWorkletResolved,
+        attention: VllmGlm52DsaAttnLocalWorkletResolved,
+        head: Glm52MtpHeadLocalWorkletResolved,
+        common: &Glm52VllmNvfp4DsaMoeResolved,
+        bridge: &PerfApiBridge,
+    ) -> Result<Self, BuildError> {
+        Ok(Self {
+            prelude: Glm52MtpPreludeLocalWorklet::build(
+                format!("{name}.prelude"),
+                prelude,
+                bridge,
+            )?,
+            decoder: Glm52SparseBody::build_bf16(
+                format!("{name}.decoder_sparse"),
+                attention,
+                common,
+                common
+                    .mtp_bf16_moe
+                    .as_deref()
+                    .ok_or_else(|| fit_failed("MTP expert configs are missing"))?,
+                bridge,
+            )?,
+            head: Glm52MtpHeadLocalWorklet::build(format!("{name}.head"), head, bridge)?,
+        })
+    }
+
+    /// `label_prefix` is the pass's own name, so chained passes stay distinct
+    /// in the cost log without renaming the leaves inside them.
+    fn compile(&self, builder: &mut CostTreeBuilder, ep_size: u16, label_prefix: &str) -> CostNode {
+        let prelude = labeled_max(
+            format!("{label_prefix}.prelude [Max over TP ranks]"),
+            (0..ep_size)
+                .map(|_| self.prelude.compile(builder))
+                .collect(),
+        );
+        let decoder = self.decoder.compile(builder);
+        let head = labeled_max(
+            format!("{label_prefix}.head [Max over TP ranks]"),
+            (0..ep_size).map(|_| self.head.compile(builder)).collect(),
+        );
+        CostNode::Sum(vec![prelude, decoder, head])
+    }
+
+    /// The prelude forwards every token in `batch`; the head samples only
+    /// `sample_rows` of them. The two differ whenever a pass forwards a wider
+    /// batch than it proposes from, which is what the first draft pass does.
+    fn eval(&self, batch: &NormalizedBatch, ep_size: u16, sample_rows: u32, ev: &mut Evaluator) {
+        let group = &batch.groups[0];
+        for _ in 0..ep_size {
+            self.prelude.eval(
+                &Glm52MtpPreludeLocalWorkletInput {
+                    batch_tokens: group.batch_tokens,
+                },
+                ev,
+            );
+        }
+        self.decoder.eval(batch, ev);
+        for _ in 0..ep_size {
+            self.head.eval(
+                &Glm52MtpHeadLocalWorkletInput {
+                    batch_tokens: sample_rows,
+                },
+                ev,
+            );
+        }
+    }
 }
 
 /// Layers 0..77 plus the output head: the forward pass every GLM-5.2 NVFP4
@@ -1081,7 +1159,7 @@ pub struct Glm52VllmNvfp4DsaMoeModel {
     pub num_attn_dp_groups: u16,
     pub num_attn_shards: u16,
     pub total_state_bytes_per_token: u64,
-    mtp: Option<Glm52MtpSection>,
+    mtp: Option<Glm52MtpPass>,
     cost_flat: Vec<FlatCostNode>,
     n_slots: usize,
 }
@@ -1189,24 +1267,14 @@ pub fn build(
         resolved.mtp_head.clone(),
     ) {
         (None, None, None) => None,
-        (Some(prelude), Some(attention), Some(head)) => Some(Glm52MtpSection {
-            prelude: Glm52MtpPreludeLocalWorklet::build(
-                format!("{name}.mtp.prelude"),
-                prelude,
-                bridge,
-            )?,
-            decoder: Glm52SparseBody::build_bf16(
-                format!("{name}.mtp.decoder_sparse"),
-                attention,
-                &resolved,
-                resolved
-                    .mtp_bf16_moe
-                    .as_deref()
-                    .ok_or_else(|| fit_failed("MTP expert configs are missing"))?,
-                bridge,
-            )?,
-            head: Glm52MtpHeadLocalWorklet::build(format!("{name}.mtp.head"), head, bridge)?,
-        }),
+        (Some(prelude), Some(attention), Some(head)) => Some(Glm52MtpPass::build(
+            &format!("{name}.mtp"),
+            prelude,
+            attention,
+            head,
+            &resolved,
+            bridge,
+        )?),
         _ => {
             return Err(fit_failed(
                 "MTP prelude/attention/head must be all present or all absent",
@@ -1467,22 +1535,10 @@ impl Glm52VllmNvfp4DsaMoeModel {
         let mut builder = CostTreeBuilder::new();
         let mut children = self.target.compile_children(&mut builder);
         if let Some(mtp) = &self.mtp {
-            let prelude = labeled_max(
-                format!("{}.mtp.prelude [Max over TP ranks]", self.target.name),
-                (0..self.target.ep_size)
-                    .map(|_| mtp.prelude.compile(&mut builder))
-                    .collect(),
-            );
-            let decoder = mtp.decoder.compile(&mut builder);
-            let head = labeled_max(
-                format!("{}.mtp.head [Max over TP ranks]", self.target.name),
-                (0..self.target.ep_size)
-                    .map(|_| mtp.head.compile(&mut builder))
-                    .collect(),
-            );
+            let prefix = format!("{}.mtp", self.target.name);
             children.push(CostNode::Labeled {
                 label: format!("MTP layer 78 [{:?}; decode-only]", self.mtp_mode),
-                child: Box::new(CostNode::Sum(vec![prelude, decoder, head])),
+                child: Box::new(mtp.compile(&mut builder, self.target.ep_size, &prefix)),
             });
         }
         let root = CostNode::Labeled {
@@ -1506,25 +1562,10 @@ impl Glm52VllmNvfp4DsaMoeModel {
         self.target.eval(&batch, ev);
 
         if let Some(mtp) = &self.mtp {
-            let group = &batch.groups[0];
-            for _ in 0..self.target.ep_size {
-                mtp.prelude.eval(
-                    &Glm52MtpPreludeLocalWorkletInput {
-                        batch_tokens: group.decode_tokens,
-                    },
-                    ev,
-                );
-            }
-            let mtp_batch = batch.decode_only();
-            mtp.decoder.eval(&mtp_batch, ev);
-            for _ in 0..self.target.ep_size {
-                mtp.head.eval(
-                    &Glm52MtpHeadLocalWorkletInput {
-                        batch_tokens: group.decode_tokens,
-                    },
-                    ev,
-                );
-            }
+            // Without speculation the MTP layer runs once, on the decode slice
+            // only, and proposes from every row it forwards.
+            let decode_tokens = batch.groups[0].decode_tokens;
+            mtp.eval(&batch.decode_only(), self.target.ep_size, decode_tokens, ev);
         }
     }
 }
