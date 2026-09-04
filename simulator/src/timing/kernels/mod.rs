@@ -168,7 +168,7 @@ pub use dsa_sparse_index_remap::{
 };
 pub use dsa_sparse_mla_attention::{
     DsaSparseMlaAttentionKernel, DsaSparseMlaAttentionKernelConfig,
-    DsaSparseMlaAttentionKernelInput, DsaSparseMlaAttentionSpec,
+    DsaSparseMlaAttentionKernelInput, DsaSparseMlaAttentionSpec, ValidCountsPattern,
 };
 pub use dsa_sparse_mla_prefill::{
     DsaSparseMlaPrefillKernel, DsaSparseMlaPrefillKernelConfig, DsaSparseMlaPrefillKernelInput,

@@ -20,7 +20,7 @@ use crate::timing::kernels::{
     DsaSparseMlaAttentionKernelInput, DsaSparseMlaPrefillKernel, DsaSparseMlaPrefillKernelConfig,
     DsaSparseMlaPrefillKernelInput, ElementwiseKernel, ElementwiseKernelConfig,
     ElementwiseKernelInput, MlaCacheAppendKernel, MlaCacheAppendKernelConfig,
-    MlaCacheAppendKernelInput,
+    MlaCacheAppendKernelInput, ValidCountsPattern,
 };
 use crate::timing::slot_input::{DsaSparseMlaDecodeLog, DsaSparseMlaPrefillLog};
 use crate::timing::{
@@ -407,8 +407,8 @@ fn fit_failed(reason: impl Into<String>) -> BuildError {
 
 fn subkernel_configs(cfg: &DsaSparseMlaAttentionConfig) -> Result<SubkernelConfigs, BuildError> {
     let decode_pattern = match cfg.decode_next_n {
-        1 => "uniform_full",
-        2 => "speculative_pairs",
+        1 => ValidCountsPattern::UniformFull,
+        2 => ValidCountsPattern::SpeculativeGroups { group_size: 2 },
         value => {
             return Err(fit_failed(format!(
                 "decode_next_n must be 1 or 2, got {value}"
@@ -422,7 +422,7 @@ fn subkernel_configs(cfg: &DsaSparseMlaAttentionConfig) -> Result<SubkernelConfi
     let (max_blocks_per_request, prefill) = match &cfg.exact_varlen {
         None => (
             None,
-            PrefillConfig::Legacy(sparse_attention_config(cfg, "causal_tail")),
+            PrefillConfig::Legacy(sparse_attention_config(cfg, ValidCountsPattern::CausalTail)),
         ),
         Some(exact) => {
             if exact.max_model_len == 0 {
@@ -645,7 +645,7 @@ fn production_prefill_config(
 
 fn sparse_attention_config(
     cfg: &DsaSparseMlaAttentionConfig,
-    valid_counts_pattern: &str,
+    valid_counts_pattern: ValidCountsPattern,
 ) -> DsaSparseMlaAttentionKernelConfig {
     DsaSparseMlaAttentionKernelConfig {
         backends: cfg.sparse_attention_backends.clone(),
@@ -661,7 +661,7 @@ fn sparse_attention_config(
         cache_dtype: cfg.attention_cache_dtype,
         index_dtype: cfg.index_dtype.clone(),
         output_dtype: cfg.attention_output_dtype,
-        valid_counts_pattern: valid_counts_pattern.to_string(),
+        valid_counts_pattern,
         index_distribution: cfg.index_distribution.clone(),
         cache_layout: cfg.sparse_cache_layout.clone(),
     }
@@ -860,6 +860,7 @@ mod tests {
         IndexRemapConfig, PrefillConfig, SLOT_SUFFIXES,
     };
     use crate::timing::bridge::DType;
+    use crate::timing::kernels::ValidCountsPattern;
     use crate::timing::slot_input::DsaSparseMlaPrefillLog;
     use crate::timing::{BuildError, Dim, SlotInput};
 
@@ -944,8 +945,11 @@ mod tests {
             panic!("legacy config must retain per-request sparse attention")
         };
         assert_eq!(prefill.backends, vec!["vllm_flashmla_bf16"]);
-        assert_eq!(prefill.valid_counts_pattern, "causal_tail");
-        assert_eq!(configs.decode.valid_counts_pattern, "uniform_full");
+        assert_eq!(prefill.valid_counts_pattern, ValidCountsPattern::CausalTail);
+        assert_eq!(
+            configs.decode.valid_counts_pattern,
+            ValidCountsPattern::UniformFull
+        );
         for sparse in [prefill, &configs.decode] {
             assert_eq!(sparse.gpu_name, "NVIDIA H200");
             assert_eq!(sparse.num_heads, 64);
@@ -970,8 +974,11 @@ mod tests {
         let PrefillConfig::Legacy(prefill) = &configs.prefill else {
             panic!("legacy config must retain per-request sparse attention")
         };
-        assert_eq!(prefill.valid_counts_pattern, "causal_tail");
-        assert_eq!(configs.decode.valid_counts_pattern, "speculative_pairs");
+        assert_eq!(prefill.valid_counts_pattern, ValidCountsPattern::CausalTail);
+        assert_eq!(
+            configs.decode.valid_counts_pattern,
+            ValidCountsPattern::SpeculativeGroups { group_size: 2 }
+        );
     }
 
     #[test]
@@ -1002,7 +1009,10 @@ mod tests {
 
         assert_eq!(configs.mla_cache_append.kv_dtype, DType::Fp8E4m3);
         assert_eq!(configs.decode.backends, vec!["flashinfer_trtllm_fp8"]);
-        assert_eq!(configs.decode.valid_counts_pattern, "uniform_full");
+        assert_eq!(
+            configs.decode.valid_counts_pattern,
+            ValidCountsPattern::UniformFull
+        );
         assert_eq!(configs.decode.q_dtype, DType::Fp8E4m3);
         assert_eq!(configs.decode.cache_dtype, DType::Fp8E4m3);
         assert_eq!(configs.decode.output_dtype, DType::Bf16);

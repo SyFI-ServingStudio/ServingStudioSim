@@ -5,6 +5,11 @@
 //! speculative interpolation while retaining all prior next_n=1 and production-
 //! boundary samples. This changes neither the cache algorithm nor the public
 //! physical query contract.
+//!
+//! `next_n` is a config identity valid at every positive verify width, not a
+//! sweep axis: it raises the minimum measurable context to the group's first row
+//! and scales the padded logits allocation, and the physical coordinates stay
+//! batch/context.
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::{CacheKind, Extrapolation};
@@ -309,6 +314,34 @@ mod tests {
             assert!(!masked(batch_size, 1.0));
             assert!(!masked(batch_size, 131072.0));
         }
+    }
+
+    /// A wider verify group is a config identity, not a new axis: it lifts the
+    /// context floor to the group's first row and scales the padded logits
+    /// allocation, and nothing else. A defect in either guard would mask the
+    /// whole grid or hand the profiler an allocation no card can serve.
+    #[test]
+    fn wider_verify_groups_only_move_the_context_floor_and_allocation() {
+        let cfg = config(6);
+        let grid = DsaPersistentTopkDecodeSpec::sweep_grid(&cfg);
+        assert_eq!(grid.axes()[0].len() * grid.axes()[1].len(), 918);
+
+        let mask = DsaPersistentTopkDecodeSpec::infeasible_mask(&cfg, &grid);
+        // Contexts 0, 1 and 2 sit below the group's first row; nothing else goes.
+        assert_eq!(mask.iter().filter(|&&masked| masked).count(), 102);
+        assert_eq!(mask.iter().filter(|&&masked| !masked).count(), 816);
+        for (index, &context_len) in CONTEXT_AXIS.iter().enumerate() {
+            assert_eq!(mask[index], context_len < 5.0, "context {context_len}");
+        }
+        // A 1M stride of fp32 over six rows is 24 MiB per sequence, so even the
+        // largest batch and context on this axis stay inside the budget.
+        assert!(!mask[mask.len() - 1]);
+
+        let payloads = DsaPersistentTopkDecodeSpec::enumerate(&cfg, &grid, VLLM_BACKEND);
+        assert_eq!(payloads.len(), 918);
+        assert_payload(&payloads[0], 1, 0, 6);
+        assert_payload(payload_for(&payloads, &grid, 16, 8192), 16, 8192, 6);
+        assert_payload(payloads.last().unwrap(), 256, 1_048_576, 6);
     }
 
     #[test]
