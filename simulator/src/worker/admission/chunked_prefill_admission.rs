@@ -22,13 +22,15 @@ use crate::worker::config::{
     BatchPolicy, BoundedFutureKvAdmissionConfig, DecodeRetractionPolicy, KvAdmissionConfig,
 };
 use crate::worker::kv::ChunkedPrefillKv;
-use crate::worker::shared::advance_scope::AdvanceScope;
 use crate::worker::shared::context::WorkerContext;
 use crate::worker::types::{IterBatchPlan, WorkerEventCommon, WorkerMsgCommon};
 
-use super::{AdmissionCandidate, EnqueueSequence, IterAdmission, LoadBalance, PendingOrderPolicy};
+use super::{
+    AdmissionCandidate, DecodeCompletion, EnqueueSequence, IterAdmission, LoadBalance,
+    PendingOrderPolicy, SingleTokenDecodeCompletion,
+};
 
-pub struct ChunkedPrefillAdmission<P: PendingOrderPolicy> {
+pub struct ChunkedPrefillAdmission<P: PendingOrderPolicy, D = SingleTokenDecodeCompletion> {
     partition_policies: Vec<(P, P::Context)>,
     enqueue_sequence: EnqueueSequence,
     max_batch_tokens: u32,
@@ -38,15 +40,38 @@ pub struct ChunkedPrefillAdmission<P: PendingOrderPolicy> {
     balance: LoadBalance,
     active_chunks: Vec<Option<AdmissionCandidate>>,
     prefill_episodes: HashMap<RequestId, bool>,
+    /// How far one resident decode moves per iteration. Ordinary decode retires
+    /// one token; speculative decode retires up to the verify width.
+    decode_completion: D,
 }
 
-impl<P: PendingOrderPolicy> ChunkedPrefillAdmission<P> {
+impl<P: PendingOrderPolicy> ChunkedPrefillAdmission<P, SingleTokenDecodeCompletion> {
     pub(crate) fn new(
         partition_policies: Vec<(P, P::Context)>,
         max_batch_tokens: u32,
         batch_policy: BatchPolicy,
         kv_admission: KvAdmissionConfig,
         balance: LoadBalance,
+    ) -> Self {
+        Self::with_decode_completion(
+            partition_policies,
+            max_batch_tokens,
+            batch_policy,
+            kv_admission,
+            balance,
+            SingleTokenDecodeCompletion,
+        )
+    }
+}
+
+impl<P: PendingOrderPolicy, D> ChunkedPrefillAdmission<P, D> {
+    pub(crate) fn with_decode_completion(
+        partition_policies: Vec<(P, P::Context)>,
+        max_batch_tokens: u32,
+        batch_policy: BatchPolicy,
+        kv_admission: KvAdmissionConfig,
+        balance: LoadBalance,
+        decode_completion: D,
     ) -> Self {
         assert!(max_batch_tokens > 0, "chunked prefill cap must be positive");
         assert!(
@@ -79,6 +104,7 @@ impl<P: PendingOrderPolicy> ChunkedPrefillAdmission<P> {
             balance,
             active_chunks: Vec::new(),
             prefill_episodes: HashMap::new(),
+            decode_completion,
         }
     }
 
@@ -253,9 +279,10 @@ impl<P: PendingOrderPolicy> ChunkedPrefillAdmission<P> {
     }
 }
 
-impl<P, K> IterAdmission<K> for ChunkedPrefillAdmission<P>
+impl<P, D, K> IterAdmission<K> for ChunkedPrefillAdmission<P, D>
 where
     P: PendingOrderPolicy,
+    D: DecodeCompletion<K>,
     K: ChunkedPrefillKv,
 {
     type Msg = WorkerMsgCommon;
@@ -316,8 +343,15 @@ where
         let mut remaining_budgets: Vec<u32> = (0..num_partitions as u16)
             .map(|partition| {
                 if mixes_prefill_with_decode {
-                    self.max_batch_tokens
-                        .saturating_sub(kv_store.live_decode_count(partition))
+                    // Decode spends the shared cap in query rows, not requests:
+                    // a speculating engine submits a whole verify window per
+                    // resident request, so a mixed iteration must leave room
+                    // for all of it.
+                    self.max_batch_tokens.saturating_sub(
+                        kv_store
+                            .live_decode_count(partition)
+                            .saturating_mul(self.decode_completion.query_tokens_per_request()),
+                    )
                 } else {
                     self.max_batch_tokens
                 }
@@ -479,18 +513,13 @@ where
         for partition in 0..kv_store.num_partitions() as u16 {
             let mut completed = Vec::new();
             if batch_plan.partition_runs_decode(partition) {
-                {
-                    let mut store = context.requests.borrow_mut();
-                    kv_store.visit_decode_members(partition, |request, _| {
-                        let record = &mut store[request];
-                        record.record_token(now, context.log_tokens());
-                        if record.is_complete() {
-                            context.stamp_stage(record, now, UnifiedStage::Done as u16);
-                            completed.push(request);
-                        }
-                    });
-                }
-                kv_store.advance(AdvanceScope::WholePartition(partition), 1);
+                self.decode_completion.complete_decodes(
+                    kv_store,
+                    partition,
+                    context,
+                    &mut completed,
+                    now,
+                );
             }
 
             let mut prefills = Vec::new();

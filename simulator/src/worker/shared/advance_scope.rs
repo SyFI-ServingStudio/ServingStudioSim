@@ -14,9 +14,9 @@ pub type PartitionId = u16;
 #[derive(Clone, Copy)]
 pub enum AdvanceScope<'a> {
     WholePartition(PartitionId),
-    /// Used by slot/speculative families once their production workers migrate;
-    /// declared now so M2 does not have to reshape the KV seam.
-    #[allow(dead_code)]
+    /// A partition where only some resident requests move, or move by different
+    /// distances: the AFD slot pipeline advances one slot's group, and
+    /// speculative decode advances each acceptance-length bucket separately.
     RequestSubset {
         partition: PartitionId,
         request_ids: &'a [RequestId],

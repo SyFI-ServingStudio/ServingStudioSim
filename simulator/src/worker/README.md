@@ -164,6 +164,21 @@ one stable head through `peek`/`pop`:
 - `FreshRequestSlotAdmission<P>` implements AFD's two-level admission: enqueue
   into `P` first, then reserve fitting heads and hand them to the slot shell.
 
+`DecodeCompletion` is a sub-axis of the chunked-prefill lifecycle, not a second
+lifecycle: it owns only how far one resident decode moves per iteration.
+`SingleTokenDecodeCompletion` is the ordinary one-row-in/one-token-out engine.
+`SpeculativeDecodeCompletion` submits a fixed `draft_tokens + 1` verify window
+per resident request and retires the target's own token plus the leading run of
+accepted drafts, so its requests advance by different distances in the same
+iteration. Membership, capacity, and batch composition stay with the lifecycle;
+the query width it publishes is what sizes the mixed-iteration token budget and
+what the execution adapter lowers into the L4 input.
+
+Its acceptance draw is keyed by `(seed, request, tokens already emitted, draft
+position)` rather than drawn from one stream, so a request accepts the same
+chain no matter which requests it was batched with. Comparing two schedulers on
+one trace therefore measures the schedulers, not a reshuffled random stream.
+
 The lifecycle freezes `AdmissionCandidate` facts once at enqueue. Its
 `conversation_start_time` is a session's first trace-declared arrival, or the
 standalone request's own release. Production builders choose `SessionStartOrder`,
