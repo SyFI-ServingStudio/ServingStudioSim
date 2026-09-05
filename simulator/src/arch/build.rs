@@ -1367,6 +1367,14 @@ pub fn build_iter_model(
             name,
             bridge,
         )?),
+        // Not a gap to fill later: a speculative model implements
+        // `SpeculativeUnifiedModel` *instead of* `IterwiseUnifiedModel`, so it
+        // cannot be returned through this box at all. Predicting one needs its
+        // own seam carrying a verify width, which no caller asks for yet.
+        IterArchSel::Glm52VllmNvfp4DsaMoeSpeculative { .. } => bail!(
+            "timing-predict iter: the speculative GLM arch evaluates a verify \
+             batch, not an ordinary iteration, so it has no iter-wise predict path"
+        ),
     })
 }
 

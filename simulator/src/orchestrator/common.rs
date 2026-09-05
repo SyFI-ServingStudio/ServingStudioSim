@@ -6,7 +6,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::arch::contract::IterwiseUnifiedModel;
 use crate::common::{PoolId, RequestId, SharedRequests, WorkerId};
 use crate::worker::{IterWorker, SharedGpuCluster, WorkerConfig};
 
@@ -63,7 +62,12 @@ pub trait WorkerFactory<W: IterWorker> {
 /// KV partition capacity from `worker_config.attn_kv_bytes`. Specialized
 /// constructors use their own factory structs and implement [`WorkerFactory`]
 /// directly.
-pub struct UnifiedWorkerFactory<M: IterwiseUnifiedModel, W: IterWorker> {
+///
+/// `M` carries no L4 trait bound. The factory only clones the handle and hands
+/// it to `build_fn`, which already states the model contract it needs, and
+/// naming one contract here would exclude the others: the speculative recipe's
+/// model implements `SpeculativeUnifiedModel` instead of `IterwiseUnifiedModel`.
+pub struct UnifiedWorkerFactory<M, W: IterWorker> {
     pub model: Arc<M>,
     pub requests: SharedRequests,
     pub worker_config: WorkerConfig,
@@ -83,7 +87,7 @@ pub struct UnifiedWorkerFactory<M: IterwiseUnifiedModel, W: IterWorker> {
     build_fn: WorkerBuildFn<M, W>,
 }
 
-impl<M: IterwiseUnifiedModel, W: IterWorker> UnifiedWorkerFactory<M, W> {
+impl<M, W: IterWorker> UnifiedWorkerFactory<M, W> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         model: Arc<M>,
@@ -123,7 +127,7 @@ impl<M: IterwiseUnifiedModel, W: IterWorker> UnifiedWorkerFactory<M, W> {
     }
 }
 
-impl<M: IterwiseUnifiedModel, W: IterWorker> WorkerFactory<W> for UnifiedWorkerFactory<M, W> {
+impl<M, W: IterWorker> WorkerFactory<W> for UnifiedWorkerFactory<M, W> {
     fn requests(&self) -> &SharedRequests {
         &self.requests
     }

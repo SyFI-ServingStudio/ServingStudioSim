@@ -486,6 +486,16 @@ pub struct WorkerConfig {
     /// `recurrent_checkpoint_interval_tokens`. Only the hybrid KV recipe reads
     /// it.
     pub ssm_checkpoint_interval_tokens: Option<u32>,
+    /// Candidate positions the drafter proposes per request per iteration (from
+    /// the worker selector). The verify width is one more than this. Only the
+    /// speculative recipe reads it, and it must match the width the model was
+    /// built for — it selects a profiled kernel shape, so the two cannot drift.
+    /// `0` means the worker does not speculate.
+    pub speculative_draft_tokens: u32,
+    /// Seed for the per-iteration draft-acceptance draws. `None` uses `0`: the
+    /// draw must be reproducible run-to-run like every other modeled quantity,
+    /// so this selects *which* deterministic stream, never whether there is one.
+    pub speculative_acceptance_seed: Option<u64>,
 }
 
 impl Default for WorkerConfig {
@@ -503,6 +513,8 @@ impl Default for WorkerConfig {
             kv_admission: crate::worker::config::KvAdmissionConfig::FullFootprint,
             prefix_cache: crate::worker::kv::PrefixCacheConfig::default(),
             ssm_checkpoint_interval_tokens: None,
+            speculative_draft_tokens: 0,
+            speculative_acceptance_seed: None,
         }
     }
 }
