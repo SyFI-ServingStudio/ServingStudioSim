@@ -13,13 +13,14 @@ use crate::arch::contract::IterwiseUnifiedModel;
 use crate::common::{PoolId, SharedRequests, WorkerId};
 use crate::log::PrefixCacheLogger;
 use crate::worker::admission::{LocalPrefillDecodeAdmission, PendingOrder};
+use crate::worker::execution::UnifiedIterExecution;
 use crate::worker::gpu_cluster::SharedGpuCluster;
 use crate::worker::kv::HybridGdnKv;
 use crate::worker::types::WorkerConfig;
 
 use super::iter_batch_worker::{IterBatchWorker, Qwen36HybridWorker};
-use crate::worker::workers::unified_iter_build_essentials::{
-    full_attention_token_capacity, prepare_unified_iter_build_essentials,
+use crate::worker::workers::iter_build_essentials::{
+    full_attention_token_capacity, prepare_iter_build_essentials,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -35,7 +36,11 @@ pub(crate) fn build_qwen36_hybrid_worker<M: IterwiseUnifiedModel>(
     cluster: SharedGpuCluster,
 ) -> Qwen36HybridWorker<M> {
     let prefix_cache_logger = PrefixCacheLogger::open_opt(cost_log_dir.as_deref(), pool_tag, id);
-    let kv_capacity = full_attention_token_capacity(model.as_ref(), &config);
+    let kv_capacity = full_attention_token_capacity(
+        model.num_attn_shards(),
+        model.total_kv_bytes_per_token(),
+        &config,
+    );
     let kv_bytes_per_token = model.total_kv_bytes_per_token().max(1);
     // Both quantities are whole-model (all attention ranks summed), matching the
     // unit `full_attention_token_capacity` produced, so one token-space capacity
@@ -67,16 +72,17 @@ pub(crate) fn build_qwen36_hybrid_worker<M: IterwiseUnifiedModel>(
         model.total_kv_bytes_per_token(),
         model.num_attn_shards(),
     );
-    let essentials = prepare_unified_iter_build_essentials(
+    let essentials = prepare_iter_build_essentials(
         id,
         pool_tag,
-        model,
         requests,
         &config,
         cost_log_dir,
         pool,
         gpu_name,
         &cluster,
+        model.gpus_per_replica(),
+        model.cost_log_manifest(),
         kv_capacity,
         1,
     );
@@ -100,6 +106,6 @@ pub(crate) fn build_qwen36_hybrid_worker<M: IterwiseUnifiedModel>(
         essentials.context,
         kv_store,
         admission,
-        essentials.execution,
+        UnifiedIterExecution::new(model, essentials.cost),
     )
 }

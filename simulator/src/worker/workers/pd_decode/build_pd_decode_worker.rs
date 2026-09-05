@@ -6,11 +6,12 @@ use std::sync::Arc;
 use crate::arch::contract::IterwiseUnifiedModel;
 use crate::common::{PoolId, SharedRequests, WorkerId};
 use crate::worker::admission::LoadBalance;
+use crate::worker::execution::UnifiedIterExecution;
 use crate::worker::gpu_cluster::SharedGpuCluster;
 use crate::worker::kv::FullAttnKv;
 use crate::worker::types::WorkerConfig;
-use crate::worker::workers::unified_iter_build_essentials::{
-    full_attention_token_capacity, prepare_unified_iter_build_essentials,
+use crate::worker::workers::iter_build_essentials::{
+    full_attention_token_capacity, prepare_iter_build_essentials,
 };
 
 use super::pull_decode_worker::{PdDecodeWorker, PullDecodeWorker, PULL_BUDGET_FRACTION};
@@ -30,22 +31,27 @@ pub(crate) fn build_pd_decode_worker<M: IterwiseUnifiedModel>(
     let num_partitions = model.num_attn_dp_groups().max(1) as usize;
     let num_attn_shards = model.num_attn_shards().max(1);
     let kv_bytes_per_token = model.total_kv_bytes_per_token();
-    let total_partition_tokens = full_attention_token_capacity(model.as_ref(), &config);
+    let total_partition_tokens = full_attention_token_capacity(
+        model.num_attn_shards(),
+        model.total_kv_bytes_per_token(),
+        &config,
+    );
     let pull_budget_tokens = ((total_partition_tokens as f64 * PULL_BUDGET_FRACTION) as u64).max(1);
     let active_kv_capacity = total_partition_tokens
         .saturating_sub(pull_budget_tokens)
         .max(1);
 
-    let essentials = prepare_unified_iter_build_essentials(
+    let essentials = prepare_iter_build_essentials(
         id,
         pool_tag,
-        model,
         requests,
         &config,
         cost_log_dir,
         pool,
         gpu_name,
         &cluster,
+        model.gpus_per_replica(),
+        model.cost_log_manifest(),
         active_kv_capacity,
         num_partitions,
     );
@@ -68,7 +74,7 @@ pub(crate) fn build_pd_decode_worker<M: IterwiseUnifiedModel>(
     PullDecodeWorker::from_components(
         essentials.context,
         kv_store,
-        essentials.execution,
+        UnifiedIterExecution::new(model, essentials.cost),
         balance,
         cluster,
         receive_group_id,

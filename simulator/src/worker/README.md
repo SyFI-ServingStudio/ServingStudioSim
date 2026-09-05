@@ -246,7 +246,11 @@ worker as the request's recorded location.
 Every concrete recipe is isolated in a `build_*_worker.rs` file. Repeated
 allocation/capacity/sampler/cost setup lives in a family-neutral or
 family-private essentials helper, while the recipe visibly selects its concrete
-KV, admission, execution, and shell.
+KV, admission, execution, and shell. The whole-iteration helper
+(`workers/iter_build_essentials.rs`) takes plain model facts — GPUs per replica,
+attention shard count, KV bytes per token, cost manifest — instead of a model
+handle, so it names no L4 model trait and cannot select an execution adapter. It
+returns the `CostBuffers`; the recipe wraps them.
 
 Deployments and pool controllers only call those recipes:
 

@@ -1,61 +1,68 @@
-//! Shared infrastructure construction for `UnifiedIterExecution` recipes.
+//! Shared infrastructure construction for whole-iteration worker recipes.
 //!
-//! Concrete `build_*_worker` files still choose the semantic composition. This
-//! helper only owns the repeated allocation → KV-capacity registration → sampler
-//! → cost-buffer choreography.
+//! Concrete `build_*_worker` files choose the semantic composition — KV,
+//! admission lifecycle, selection policy, execution adapter, shell. This helper
+//! only owns the repeated allocation → KV-capacity registration → sampler →
+//! cost-buffer choreography, and it takes plain model *facts* rather than a
+//! model handle so it stays free of any L4 trait bound. That is what lets an
+//! `IterwiseUnifiedModel` recipe and a `SpeculativeUnifiedModel` recipe share
+//! it: neither trait is named here, and the caller — not this file — decides
+//! which execution adapter wraps the returned `CostBuffers`.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
-use crate::arch::contract::IterwiseUnifiedModel;
 use crate::common::{PoolId, SharedRequests, WorkerId};
 use crate::log::KvSampler;
+use crate::timing::{CostManifest, CostManifestDoc};
 use crate::worker::cost_buffers::CostBuffers;
-use crate::worker::execution::UnifiedIterExecution;
 use crate::worker::gpu_cluster::SharedGpuCluster;
 use crate::worker::shared::context::WorkerContext;
 use crate::worker::types::WorkerConfig;
 
-pub(super) struct UnifiedIterBuildEssentials<M: IterwiseUnifiedModel> {
+pub(super) struct IterBuildEssentials {
     pub(super) context: WorkerContext,
     pub(super) allocation_base: u16,
     pub(super) kv_capacity: u64,
     pub(super) sampler: Option<KvSampler>,
-    pub(super) execution: UnifiedIterExecution<M>,
+    /// Reusable cost/slot buffers, already wired to this worker's cost log. The
+    /// recipe hands them to whichever execution adapter it selected.
+    pub(super) cost: CostBuffers,
 }
 
 /// Full-attention token capacity before a family reserves any slice for its
 /// own cadence, such as PD decode's pull backlog.
-pub(super) fn full_attention_token_capacity<M: IterwiseUnifiedModel>(
-    model: &M,
+pub(super) fn full_attention_token_capacity(
+    num_attn_shards: u16,
+    total_kv_bytes_per_token: u64,
     config: &WorkerConfig,
 ) -> u64 {
     let partition_kv_bytes = config
         .attn_kv_bytes
-        .saturating_mul(model.num_attn_shards().max(1) as u64);
-    (partition_kv_bytes / model.total_kv_bytes_per_token().max(1)).max(1)
+        .saturating_mul(num_attn_shards.max(1) as u64);
+    (partition_kv_bytes / total_kv_bytes_per_token.max(1)).max(1)
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn prepare_unified_iter_build_essentials<M: IterwiseUnifiedModel>(
+pub(super) fn prepare_iter_build_essentials(
     id: WorkerId,
     pool_tag: &'static str,
-    model: Arc<M>,
     requests: SharedRequests,
     config: &WorkerConfig,
     cost_log_dir: Option<PathBuf>,
     pool: PoolId,
     gpu_name: &str,
     cluster: &SharedGpuCluster,
+    gpus_per_replica: u16,
+    cost_manifest: CostManifest,
     kv_capacity: u64,
     num_partitions: usize,
-) -> UnifiedIterBuildEssentials<M> {
+) -> IterBuildEssentials {
     let num_partitions = num_partitions.max(1);
 
     let allocation_base =
         cluster
             .borrow_mut()
-            .allocate(pool.0, id.0, model.gpus_per_replica(), gpu_name, pool_tag);
+            .allocate(pool.0, id.0, gpus_per_replica, gpu_name, pool_tag);
 
     {
         let mut cluster = cluster.borrow_mut();
@@ -71,11 +78,13 @@ pub(super) fn prepare_unified_iter_build_essentials<M: IterwiseUnifiedModel>(
         num_partitions,
         config.kv_log_stride,
     );
-    let cost = CostBuffers::new_iter(
+    // Every iter-family worker evaluates one whole iteration, so its manifest is
+    // the degenerate single-`iter` document.
+    let cost = CostBuffers::new(
         cost_log_dir,
         pool_tag,
         id,
-        model.as_ref(),
+        &CostManifestDoc::single("iter", cost_manifest),
         config.gpu_time_multiplier,
     );
     let context = WorkerContext {
@@ -86,11 +95,11 @@ pub(super) fn prepare_unified_iter_build_essentials<M: IterwiseUnifiedModel>(
         log_stage_transitions: config.log_stage_transitions,
     };
 
-    UnifiedIterBuildEssentials {
+    IterBuildEssentials {
         context,
         allocation_base,
         kv_capacity,
         sampler,
-        execution: UnifiedIterExecution::new(model, cost),
+        cost,
     }
 }
