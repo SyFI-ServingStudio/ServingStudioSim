@@ -1,0 +1,45 @@
+# GLM-5.2 NVFP4 on one four-GPU B200 NVLink domain, driving its MTP layer as a
+# real drafter. Same rank group and context cap as `glm52_nvfp4_b200_ep4.yaml`,
+# so the two are directly comparable; the difference is that an iteration here
+# is one target verify over `draft_tokens + 1` rows per resident decode plus
+# `draft_tokens` draft passes, and a request advances by its accepted chain.
+#
+# Per-request acceptance comes from the trace's `accept_rate` column. A request
+# without one decodes one token per iteration, so a trace with no speculative
+# column runs correctly and simply models no speedup.
+deployment: unified
+
+workload:
+  trace_files:
+    - trace/smoke.csv
+  input_file_format: text-generation-independent
+  arrival_mode: trace_timed
+  session_dependency: independent
+  run_to_end: true
+
+io:
+  log_dir: logs/glm52_nvfp4_b200_ep4_speculative
+
+pools:
+  main:
+    groups:
+      - gpu: "NVIDIA B200"
+        replicas: 1
+        arch:
+          type: glm52_vllm_nvfp4_dsa_moe_speculative
+          model_config: model/config/glm52_nvfp4.json
+          fp8: false
+          ep_size: 4
+          nvl_num_gpu: 4
+          max_model_len: 8192
+          routing: uniform
+          mtp_mode: index_share
+          draft_tokens: 3
+        worker:
+          type: speculative
+          attn_gpu_memory_gb: 120.0
+          # Decode spends this cap in query rows, so a resident decode costs the
+          # whole verify width here, not one row.
+          max_batch_tokens: 8192
+          # Must match the arch's: the width selects a profiled kernel shape.
+          draft_tokens: 3
