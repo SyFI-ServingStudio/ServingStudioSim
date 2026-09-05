@@ -60,8 +60,10 @@ impl SessionInput {
 /// Decode behaviour requested by an autoregressive request.
 ///
 /// Defined in the shared trace crate: it is what the `accept_rate` column means,
-/// and the file says it rather than this simulator deciding it.
-pub use req_frontend::schema::DecodingStrategy;
+/// and the file says it rather than this simulator deciding it. The same column
+/// accepts either one legacy geometric probability or a JSON list of
+/// per-position conditional probabilities.
+pub use req_frontend::schema::{AcceptanceProfile, DecodingStrategy};
 
 /// Mutable progress shared by autoregressive token-output families.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
