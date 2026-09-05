@@ -7,10 +7,12 @@ use crate::worker::types::IterBatchPlan;
 
 mod attention_layer_execution;
 mod ffn_task_execution;
+mod speculative_iter_execution;
 mod unified_iter_execution;
 
 pub use attention_layer_execution::AttentionLayerExecutionAdapter;
 pub use ffn_task_execution::FfnSectionExecutionAdapter;
+pub use speculative_iter_execution::SpeculativeIterExecution;
 pub use unified_iter_execution::UnifiedIterExecution;
 
 /// Model-owned facts used to size a worker's KV store and transfer payloads.

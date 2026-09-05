@@ -23,7 +23,10 @@ use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::path::PathBuf;
 
-use crate::arch::contract::{ArchGroupInput, IterwiseUnifiedModel, UnifiedArchInput};
+use crate::arch::contract::{
+    ArchGroupInput, IterwiseUnifiedModel, SpeculativeArchGroupInput, SpeculativeArchInput,
+    SpeculativeUnifiedModel, UnifiedArchInput,
+};
 use crate::common::{Time, WorkerId};
 use crate::log::{CostLogEntry, CostLogger, GroupInputLog};
 use crate::timing::{CostManifestDoc, LeafMetrics, SlotInput};
@@ -355,6 +358,34 @@ impl CostBuffers {
             },
         )
     }
+
+    /// [`run_iter`](Self::run_iter) for a speculating model. Same one fused
+    /// `iter` section, evaluated through the speculative face and logged through
+    /// [`SpeculativeGroupLog`] so the row separates decode query rows from
+    /// decode request count.
+    pub fn run_speculative_iter<M: SpeculativeUnifiedModel + ?Sized>(
+        &mut self,
+        model: &M,
+        arch_input: &SpeculativeArchInput,
+        iter_id: u64,
+        now: Time,
+    ) -> Time {
+        self.run_section(
+            "iter",
+            -1,
+            iter_id,
+            0,
+            &SpeculativeGroupLog {
+                groups: &arch_input.groups,
+            },
+            None, // one fused eval per iteration — nothing to memoize
+            now,
+            |slots, scratch, inputs| match inputs {
+                Some(i) => model.eval_speculative_iter_with_inputs(arch_input, slots, scratch, i),
+                None => model.eval_speculative_iter(arch_input, slots, scratch),
+            },
+        )
+    }
 }
 
 /// The per-row `input_section` source for [`CostBuffers::run_section`]. Different
@@ -379,6 +410,9 @@ impl GroupLogSource for Vec<ArchGroupInput> {
                 decode_request_count: g.decode_tokens,
                 decode_kv_total: g.total_kv_len,
                 prefill_chunk_pairs: g.prefill_chunk_pairs.clone(),
+                // An ordinary decode request is exactly one query row, so the
+                // two columns coincide here and diverge only under speculation.
+                decode_query_rows: g.decode_tokens,
             });
         }
     }
@@ -396,6 +430,36 @@ impl GroupLogSource for Vec<u32> {
                 decode_request_count: 0,
                 decode_kv_total: 0,
                 prefill_chunk_pairs: Vec::new(),
+                decode_query_rows: 0,
+            });
+        }
+    }
+}
+
+/// Borrowed [`GroupLogSource`] over a speculative iteration's groups.
+///
+/// A wrapper rather than an impl on `Vec<SpeculativeArchGroupInput>` because the
+/// two decode columns are distinct quantities here: `decode_request_count` counts
+/// requests, `decode_query_rows` counts the verify rows those requests submit.
+/// Borrowing keeps the held [`SpeculativeArchInput`] buffer intact — the log row
+/// is written from it, not from a copy of it.
+struct SpeculativeGroupLog<'a> {
+    groups: &'a [SpeculativeArchGroupInput],
+}
+
+impl GroupLogSource for SpeculativeGroupLog<'_> {
+    fn fill_group_log(&self, dst: &mut Vec<GroupInputLog>) {
+        dst.clear();
+        for g in self.groups {
+            dst.push(GroupInputLog {
+                batch_tokens: g.batch_tokens,
+                prefill_tokens: g.prefill_tokens,
+                decode_request_count: g.decode_requests.len() as u32,
+                decode_kv_total: g.total_kv_len,
+                prefill_chunk_pairs: g.prefill_chunk_pairs.clone(),
+                // The verify width makes these diverge: one request submits
+                // `draft_tokens + 1` rows.
+                decode_query_rows: g.decode_tokens,
             });
         }
     }

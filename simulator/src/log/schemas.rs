@@ -41,7 +41,9 @@ pub fn cost_log_envelope_schema() -> Arc<Schema> {
 /// decode is aggregated to two scalars (`decode_request_count` / `decode_kv_total`)
 /// — the per-decode-request KV-length list is the size driver (re-logged every
 /// step) and is intentionally dropped. `prefill_request_count` is the list length,
-/// so it is not a separate field.
+/// so it is not a separate field. `decode_query_rows` is the query-row count,
+/// which equals `decode_request_count` for an ordinary engine and exceeds it by
+/// the verify width under speculative decoding.
 pub(crate) fn group_input_fields() -> Fields {
     let u32_item = || Arc::new(Field::new("item", DataType::UInt32, false));
     Fields::from(vec![
@@ -51,6 +53,9 @@ pub(crate) fn group_input_fields() -> Fields {
         Field::new("decode_kv_total", DataType::UInt32, false),
         Field::new("prefill_prefix_lens", DataType::List(u32_item()), false),
         Field::new("prefill_append_lens", DataType::List(u32_item()), false),
+        // Appended, never inserted: `analyzer/rust/src/session.rs` reads the
+        // first five fields by position.
+        Field::new("decode_query_rows", DataType::UInt32, false),
     ])
 }
 

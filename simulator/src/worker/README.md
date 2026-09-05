@@ -199,6 +199,15 @@ Execution owns the model, reusable input buffer shape, and `CostBuffers`:
   Multi-partition workers also retain the exact per-partition token vector for
   ragged EP communication; the execution adapter derives it from those same
   groups without changing placement.
+- `SpeculativeIterExecution` is its sibling for a model that implements
+  `SpeculativeUnifiedModel` instead of `IterwiseUnifiedModel`. It builds a
+  `SpeculativeArchInput`, whose decode side carries a `(kv_len, query_len)` pair
+  per request rather than one KV length: a verify pass submits `draft_tokens + 1`
+  rows per resident decode, so `decode_tokens` counts query rows and request
+  cardinality is no longer recoverable from it. The width is a worker-lifetime
+  constant because it selects a profiled kernel shape; how far a request actually
+  advances after the verify belongs to the lifecycle's `DecodeCompletion`, not
+  here.
 - `AttentionLayerExecutionAdapter` builds one slot's `AttnArchInput` and costs
   one attention layer.
 - `FfnSectionExecutionAdapter` splits token counts across FFN DP groups and

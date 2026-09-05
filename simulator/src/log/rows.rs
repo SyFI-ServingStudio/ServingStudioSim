@@ -156,6 +156,11 @@ pub struct GroupInputLog {
     /// Per prefill request `(prefix_len, append_len)`, moved from the
     /// `ArchGroupInput`; split into two parallel list columns at serialization.
     pub prefill_chunk_pairs: Vec<(u32, u32)>,
+    /// Decode query rows the model actually forwarded. Equal to
+    /// `decode_request_count` for an ordinary engine; a speculating engine
+    /// submits a whole verify window per request, so the two diverge and only
+    /// this one reconstructs `batch_tokens`.
+    pub decode_query_rows: u32,
 }
 
 /// One `cost_log` row — a whole-iteration cost query via the compiled CostTree.
@@ -280,6 +285,7 @@ fn build_groups_column(entries: &[CostLogEntry], group_logs: &[GroupInputLog]) -
                 Box::new(UInt32Builder::new()),
                 Box::new(ListBuilder::new(UInt32Builder::new()).with_field(u32_item())),
                 Box::new(ListBuilder::new(UInt32Builder::new()).with_field(u32_item())),
+                Box::new(UInt32Builder::new()),
             ],
         )
     };
@@ -316,6 +322,9 @@ fn build_groups_column(entries: &[CostLogEntry], group_logs: &[GroupInputLog]) -
                 }
                 append_b.append(true);
             }
+            sb.field_builder::<UInt32Builder>(6)
+                .unwrap()
+                .append_value(g.decode_query_rows);
             sb.append(true);
         }
         group_cursor = group_end;
@@ -967,6 +976,7 @@ mod tests {
                 decode_request_count: 2,
                 decode_kv_total: 100,
                 prefill_chunk_pairs: vec![(0, 8), (4, 10)],
+                decode_query_rows: 2,
             },
             // row 0, group 1: pure decode (no prefill pairs).
             GroupInputLog {
@@ -975,6 +985,7 @@ mod tests {
                 decode_request_count: 3,
                 decode_kv_total: 60,
                 prefill_chunk_pairs: vec![],
+                decode_query_rows: 3,
             },
             // row 1, group 0.
             GroupInputLog {
@@ -983,6 +994,7 @@ mod tests {
                 decode_request_count: 0,
                 decode_kv_total: 0,
                 prefill_chunk_pairs: vec![(0, 5)],
+                decode_query_rows: 0,
             },
         ];
         let batch = cost_to_record_batch(&CostLogChunk {
