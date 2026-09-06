@@ -5,7 +5,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from scripts.summarize_matrix_alignment import audit_request_population
+from alignment.request_population import audit_request_population
+from launcher.alignment_campaign.metrics import REPORT_LOCATIONS, measure_case
 
 
 @pytest.mark.parametrize("mutation", [None, "output", "id"])
@@ -44,7 +45,10 @@ def test_dense_ids_are_resolved_before_population_comparison(tmp_path, mutation)
     raw = tmp_path / "simulation/raw"
     raw.mkdir(parents=True)
     pq.write_table(pa.Table.from_pylist(list(reversed(simulated))), raw / "request_slo.parquet")
-    result = audit_request_population(tmp_path, {"workload_profile": str(tmp_path)})
+    result = audit_request_population(
+        trace_path=reuse / "trace_observed.csv", replay_path=replay_path,
+        slo_path=raw / "request_slo.parquet",
+    )
     assert result["all_ok"] == (mutation is None)
     assert result["identities"] == [
         {"request_id": 0, "source_id": "opaque-b"},
@@ -52,3 +56,28 @@ def test_dense_ids_are_resolved_before_population_comparison(tmp_path, mutation)
     ]
     if mutation is not None:
         assert "opaque-b" in result["mismatched_source_ids"]
+
+    analysis = tmp_path / "analysis_e2e"
+    analysis.mkdir()
+    (analysis / "alignment_manifest.json").write_text(json.dumps({
+        "simulation_log_dir": str(raw.parent), "replay_result": str(replay_path),
+    }))
+    (raw / "params.json").write_text(json.dumps({"workload": {
+        "session_dependency": "independent",
+        "trace_files": [str(reuse / "trace_observed.csv")],
+    }}))
+    report = tmp_path / REPORT_LOCATIONS["e2e"]
+    report.parent.mkdir(exist_ok=True)
+    report.write_text(json.dumps({"schema_version": 1, "meta": {
+        "measured_successful_requests": 2, "simulated_completed_requests": 2,
+    }}))
+    measurement = measure_case(tmp_path)
+    assert measurement.provenance["request_population_audit"]["all_ok"] == (mutation is None)
+    assert ("request identity/length/completion audit failed" in measurement.issues) == (
+        mutation is not None
+    )
+    if mutation is None:
+        sidecar = reuse / "trace_observed.csv.manifest.json"
+        sidecar.write_text(json.dumps({"output_trace_sha256": "stale"}))
+        stale = measure_case(tmp_path)
+        assert any("manifest does not match" in issue for issue in stale.issues)

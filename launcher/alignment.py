@@ -46,6 +46,16 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     commands = parser.add_subparsers(dest="command", required=True)
 
+    prepare = commands.add_parser(
+        "prepare-workload", help="Build an explicitly observed-conditioned acceptance trace."
+    )
+    prepare.add_argument("--source-trace", type=Path, required=True)
+    prepare.add_argument("--profile-dir", type=Path, required=True)
+    prepare.add_argument("--output-trace", type=Path, required=True)
+    prepare.add_argument("--draft-tokens", type=int, required=True)
+    prepare.add_argument("--missing-acceptance", choices=["error", "run-aggregate"], required=True)
+    prepare.add_argument("--request-id-prefix", default="")
+
     sim = commands.add_parser("sim", help="Run the ordinary VibeSim simulation.")
     sim.add_argument("config", type=Path, help="Simulation preset YAML/JSON")
     sim.add_argument("--dry-run", action="store_true", help="Validate and expand only.")
@@ -502,6 +512,13 @@ def _run_compare(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     try:
+        if args.command == "prepare-workload":
+            from alignment.workload_input import prepare_workload
+
+            options = vars(args).copy()
+            options.pop("command")
+            print(json.dumps(prepare_workload(**options), indent=2))
+            return 0
         if args.command == "sim":
             return _run_sim(args)
         if args.command == "profile":

@@ -335,6 +335,20 @@ def measure_case(directory: Path, *, expected_requests: int | None = None) -> Ca
         values[spec.name] = value
 
     provenance = _provenance(documents)
+    if "e2e" in documents:
+        from alignment.request_population import audit_alignment_population
+
+        try:
+            audit = audit_alignment_population(
+                directory / "analysis_e2e/alignment_manifest.json",
+                repo_root=Path(__file__).resolve().parents[2],
+            )
+            provenance["request_population_audit"] = audit
+            if audit.get("available") and not audit["all_ok"]:
+                issues.append("request identity/length/completion audit failed")
+        except (OSError, ValueError, KeyError) as error:
+            provenance["request_population_audit"] = {"available": False, "reason": str(error)}
+            issues.append(f"request population evidence invalid: {error}")
     issues += _eligibility(documents, expected_requests)
     available = not issues and len(documents) == len(REPORT_LOCATIONS)
     return CaseMeasurement(
@@ -374,12 +388,9 @@ def _eligibility(
 ) -> list[str]:
     """The mechanizable half of `operate-run-alignment`'s completion checklist.
 
-    Deliberately *not* checked: `request_id_audit.shared_ids`. Every accepted
-    case in this pipeline reports 0 shared ids because the client and the
-    simulator label requests in different id spaces; gating on it would fail all
-    fifteen accepted runs. What is checkable is that the two sides ran the same
-    number of requests, and that the number matches the trace when a pack says
-    how many there should be.
+    Raw shared IDs use different namespaces. `measure_case` separately checks
+    identity through independent trace row order when that evidence is available.
+    These aggregate checks also apply to legacy reports and other workload kinds.
     """
     issues: list[str] = []
     e2e = documents.get("e2e")

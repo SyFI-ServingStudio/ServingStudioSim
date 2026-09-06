@@ -84,6 +84,13 @@ a prerequisite for simulation. To adopt a reported multiplier, set it explicitly
 in the experiment preset and record the source and approximation in experiment
 notes. The campaign does not read calibration reports or inject worker overrides.
 
+`extract` also includes `provenance.request_population_audit` for E2E results.
+Independent CSV traces resolve simulator IDs by input row order, then validate
+the measured and simulated request contracts. Audit failures block comparison
+eligibility. Missing legacy identity evidence is reported explicitly; it is not
+presented as a successful identity check. Observed-conditioned trace manifests
+are included in provenance when their output hash matches the selected trace.
+
 ### `label`
 
 `initialize`, then apply the manifest's rules repeatedly until the label

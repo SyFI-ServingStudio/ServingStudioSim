@@ -22,6 +22,43 @@ analyze_e2e.yaml ─── alignment analyze (e2e-align) ──→ analysis_e2e/
 
 No phase implicitly launches the next one. YAML and JSON are both accepted.
 
+## Observed-Conditioned Workload Inputs
+
+For an independent CSV workload, explicitly prepare per-request acceptance
+probabilities from its complete `workload_metrics` pass:
+
+```bash
+uv run python -m launcher alignment prepare-workload \
+  --source-trace logs/<experiment>/trace.csv \
+  --profile-dir logs/<experiment>/profile_workload \
+  --output-trace logs/<experiment>/trace_observed.csv \
+  --draft-tokens 5 --missing-acceptance run-aggregate \
+  --request-id-prefix independent_
+```
+
+Depth and missing-sample policy are required. `error` rejects any unobserved
+conditional probability; `run-aggregate` uses observed counts pooled across
+this same request population, and still rejects positions with no evidence.
+The ID prefix is explicit (default empty), not inferred from model names.
+The command validates request IDs, declared arrivals, lengths and successful
+completion before writing a new trace and `.manifest.json`. Other CSV columns
+are preserved; existing output files are refused. The manifest records source
+hashes, fallback positions and `predictive_alignment: false`. These inputs
+condition on observations; they do not replay scheduling or individual random
+outcomes and are not independent predictions.
+
+Select the generated trace explicitly in the simulation preset. This command
+never edits worker settings, KV capacity, timing multipliers or analysis paths.
+Historical reuse, startup diagnostics and the duplicate RNG implementation are
+preserved on `spec5-alignment-experiments`, outside the feature's merge scope.
+
+Campaign `extract`/`compare` uses the E2E analysis manifest to audit independent
+CSV request identities, lengths and completion against `request_slo.parquet`.
+Failed identity checks make a case unavailable. Legacy reports without a manifest
+and other workload formats retain count checks and explicitly report identity
+audit unavailability. Timing statistics continue to come from Analyzer reports;
+the audit does not pair latency samples or recompute TTFT/TPOT.
+
 Set `workload.warmup: true` to warm all input shapes before measurement.
 Independent warmup requests cap output at 32 tokens and use saturated arrivals;
 the measured workload retains its original output lengths and arrival policy.
