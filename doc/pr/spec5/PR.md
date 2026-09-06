@@ -24,7 +24,7 @@ work remains on `spec5-logits-wip`; experimental scripts remain on
 ## Test Plan
 
 - `uv run pytest -q tests/test_alignment_campaign.py`: 240 passed after the measured calibration update.
-- `uv run python -m launcher alignment-campaign check --pack glm52_nvfp4_b200_spec5`: 0 errors; 15 provisional warnings at this checkpoint.
+- `uv run python -m launcher alignment-campaign check --pack glm52_nvfp4_b200_spec5`: 0 errors; 13 provisional warnings at this checkpoint.
 - `uv run --no-sync cargo test -p simulator --lib` (via the CPU recipe with libpython configured): 1062 passed, 6 ignored.
 - `uv run --no-sync cargo test --manifest-path analyzer/rust/Cargo.toml --bin analyze`: 255 passed.
 - `uv run --no-sync pytest -m 'not gpu and not agent and not bench' -n 8`: 3414 passed, 4 skipped.
@@ -36,13 +36,13 @@ See [the generated matrix](alignment_matrix.md) and [evidence definitions](READM
 The [17-case kernel evidence table](kernel_evidence.md) contains 15 available
 reports: eight warm captures and seven historical captures with their original
 2048/4096/8192 chunk settings. Historical rows are not matched warm E2E evidence.
-Eight cases currently have complete kernel/workload/E2E report sets. Cases09/10 E2E
-are complete; five warm workload measurements and remaining report work are pending.
+Eight cases currently have complete kernel/workload/E2E report sets. Cases09/10/13 E2E
+are complete; four warm workload measurements and remaining report work are pending.
 Cases11/12 retain framework capacity failures. Missing cases and tolerance failures
 remain visible; no alignment golden has been recorded yet.
 
 The [server latency table](server_latency.md) includes Analyzer P50/P90/P99 for
-ten completed cases, backed by raw values and report hashes in its JSON sidecar.
+eleven completed cases, backed by raw values and report hashes in its JSON sidecar.
 Raw mapping coverage remains distinct from critical-path and simulator coverage.
 Observed per-request acceptance and borrowed time multipliers are calibration,
 not independent prediction; use each result's recorded parameters for reproduction.
