@@ -14,6 +14,7 @@ The generated matrix is a partial evidence snapshot, not an accepted baseline.
 | Pack `traces/invariants.json` | Reproducible workload digests |
 | Pack `acceptance.yaml` | Acceptance tolerances and explained exceptions, independent of golden drift |
 | `alignment_matrix.md` | Generated report values and tolerance failures |
+| `server_latency.md` / `.json` | Analyzer server-side P50/P90/P99, raw values and report hashes; partial snapshot |
 | `tests/golden/alignment_glm52_nvfp4_b200_spec5/NVIDIA_B200.json` | Future recorded baseline; not yet created |
 | Golden `.provenance.json` | Formula/report versions, evidence paths and provisional inputs, written by the recorder |
 | `profiling/profile.db` and `profiling/spec5_db_manifest.json` | Committed kernel timing data and import provenance |
@@ -36,8 +37,8 @@ Extraction SHA-256:
 | Cases | Evidence at snapshot |
 |---|---|
 | 01-08 | Full report sets available; failures remain in the generated comparison |
-| 09 | Warm workload, simulation and E2E available; kernel report pending |
-| 10, 13-17 | Warm workload pending |
+| 09, 10 | Warm workload, simulation and E2E available; matching warm kernel reports absent |
+| 13-17 | Warm workload pending |
 | 11, 12 | Previously observed framework KV-capacity failures; no successful warm result |
 
 The current renderer lists cases with report values only. Absence from that table
@@ -71,6 +72,18 @@ cases01-03/05-08 used the earlier 55224 bytes/token conversion instead of 55932.
 Case04/09 use the corrected conversion. Do not claim those historical simulations
 were generated with the refreshed campaign. Case09 borrows warm case02's explicit
 time multiplier; its experiment `CALIBRATION.md` documents the approximation.
+
+Case10 also uses the corrected conversion and the same explicitly borrowed warm
+case02 multiplier. Its 512-request workload and E2E analysis completed after the
+standard matrix snapshot; `server_latency.md` already includes that result.
+Historical case09/10 NSYS uses 2048 chunks and remains separate from warm 2052 E2E.
+
+The server latency sidecar selects only the `server_ttft` and `server_tpot` fields
+from each completed warm bundle's `/api/v1/alignments/{id}/subjects/e2e/report`.
+It preserves each metric's sample count, measured/simulated percentiles in ms,
+resource ID and SHA-256 of the HTTP response. Refresh these exact resources as
+new reports complete; derive displayed errors as `(simulated/measured - 1)*100`.
+Keep unavailable cases visible and never substitute client fields or means.
 
 ## Regeneration
 

@@ -601,17 +601,17 @@ cases:
   max_model_len: 8192
   max_concurrency: 256
   chunk_size: 2052
-  speculative_acceptance: &id001
+  speculative_acceptance:
     value:
-    - 0.9039741219963031
-    - 0.7245935998364176
-    - 0.47782990581678364
-    - 0.495570648161819
-    - 0.6302696260986146
-    status: provisional
-    derived_from: clean diverse-100 spec5 workload; replace with this case's profile_workload
-      per-position counters
-    evidence: logs/20260830_1_glm52_diverse100_spec5/profile_workload/spec_decode_metrics.json
+    - 0.8847526683265718
+    - 0.6709174636911087
+    - 0.4695588407837616
+    - 0.48031633787683814
+    - 0.5678761867603069
+    status: measured
+    derived_from: Conditional accepted-token count ratios from this warm workload pass; position 0 / num_drafts,
+      then position i / position i-1. Per-request E2E inputs retain separate manifests.
+    evidence: logs/20260906_1_spec5_warm_matrix/10_full_saturation_rate/profile_workload/spec_decode_metrics.json
   profile_arrival_mode: saturated
   simulation_arrival_mode: saturated
   gpu_memory_utilization: 0.85
@@ -638,11 +638,11 @@ cases:
       - 4096
     repeats: 64
   attn_gpu_memory_gb:
-    value: 37.990577664
-    status: provisional
-    derived_from: '`GPU KV cache size: C tokens` in the workload-only server log;
-      C * 55_224 / 1e9'
-    evidence: logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/10_full_saturation_rate/profile_workload
+    value: 30.172852992
+    status: measured
+    derived_from: Warm workload KV capacity 539456 tokens; FullIndex uses 55932 bytes/token/rank,
+      so the per-rank worker budget is C * 55932 / 1e9 GB.
+    evidence: logs/20260906_1_spec5_warm_matrix/10_full_saturation_rate/profile_workload/vllm/glm52_b200_ep4_10_full_saturation_rate_workload_server.log
   provenance:
     accepted_run: logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/10_full_saturation_rate
     capture_source: logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/10_full_saturation_rate
@@ -656,7 +656,17 @@ cases:
   max_model_len: 524288
   max_concurrency: 1
   chunk_size: 8196
-  speculative_acceptance: *id001
+  speculative_acceptance: &id001
+    value:
+    - 0.9039741219963031
+    - 0.7245935998364176
+    - 0.47782990581678364
+    - 0.495570648161819
+    - 0.6302696260986146
+    status: provisional
+    derived_from: clean diverse-100 spec5 workload; replace with this case's profile_workload
+      per-position counters
+    evidence: logs/20260830_1_glm52_diverse100_spec5/profile_workload/spec_decode_metrics.json
   profile_arrival_mode: saturated
   simulation_arrival_mode: saturated
   gpu_memory_utilization: 0.85
