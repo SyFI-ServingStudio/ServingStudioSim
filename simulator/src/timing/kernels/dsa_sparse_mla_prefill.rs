@@ -15,7 +15,7 @@ use crate::timing::kernels::engine::{register_kernel, KernelSpec};
 use crate::timing::sweep::{Axis, Coords, SweepGrid};
 use crate::timing::{Dim, KernelConfig, SweepCoords};
 
-const MAX_BATCHED_QUERY_ROWS: u32 = 8192;
+const MAX_BATCHED_QUERY_ROWS: u32 = 16384;
 const MAX_REQUESTS: usize = 64;
 
 #[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -209,6 +209,14 @@ mod tests {
             query_context_pairs: vec![(2048, 8192)],
         };
         assert_eq!(&*input.coords(), &[2048.0, 1.0, 8192.0]);
+    }
+
+    #[test]
+    fn rounded_spec5_prefill_keeps_every_query_row() {
+        let input = DsaSparseMlaPrefillKernelInput {
+            query_context_pairs: vec![(8196, 16384)],
+        };
+        assert_eq!(&*input.coords(), &[8196.0, 1.0, 16384.0]);
     }
 
     #[test]
