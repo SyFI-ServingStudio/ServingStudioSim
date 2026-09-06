@@ -7,16 +7,16 @@ evidence; their comparison policies remain separate.
 
 The framework-to-simulator path is an explicit phased workflow; each phase has
 one config and one disjoint artifact root. The
-GPU-cycle duty-cycle correction (`gpu_time_multiplier`) is a pure measured
-quantity: the analyzer's **kernel-align** pass derives it before the simulation,
-and the simulation phase injects it automatically. So `analyze` splits into two
-semantic passes that bracket the simulation:
+GPU-cycle duty-cycle correction (`gpu_time_multiplier`) is an explicit worker
+setting. The analyzer's **kernel-align** pass can recommend a measured value;
+simulation runs independently using its preset. `analyze` has separate kernel
+and request E2E passes:
 
 ```text
 profile.yaml ─────── alignment profile ──────────────→ profile/
 timing_predict.yaml ─ alignment timing-predict ──────→ timing_predict/   (reads simulation.yaml preset)
 analyze_kernel.yaml ─ alignment analyze (kernel-align)→ analysis_kernel/  (emits recommended_gpu_time_multiplier)
-simulation.yaml ──── alignment sim ──────────────────→ simulation/        (auto-injects the multiplier)
+simulation.yaml ──── alignment sim ──────────────────→ simulation/        (uses explicit worker settings)
 analyze_e2e.yaml ─── alignment analyze (e2e-align) ──→ analysis_e2e/      (consumes the completed sim)
 ```
 
@@ -301,8 +301,7 @@ ordinary `engine_text` and its legacy `vllm_text` alias remain unchanged.
 
 Timing prediction is kernel-only, so it reads the simulation **preset**
 (`simulation_preset`), not a completed run — it takes the gpu, arch, and backend
-policy straight from `simulation.yaml`. This lets it run before the simulation,
-so kernel-align can derive the multiplier the simulation later bakes in. The
+policy straight from `simulation.yaml`. This lets it run independently of the simulation. The
 builder writes `timing_predict_cases.json`, `timing_predict_case_map.json`,
 `timing_predict_config.json`, and `timing_predict_input_manifest.json`, then the
 launcher invokes the generic timing-predict command. The generated predictor
@@ -462,8 +461,7 @@ data is never reconstructed or substituted from client measurements.
 uv run python -m launcher alignment profile logs/<experiment>/profile.yaml
 uv run python -m launcher alignment timing-predict logs/<experiment>/timing_predict.yaml
 uv run python -m launcher alignment analyze logs/<experiment>/analyze_kernel.yaml
-uv run python -m launcher alignment sim logs/<experiment>/simulation.yaml \
-  --gpu-time-multiplier-from logs/<experiment>/analysis_kernel
+uv run python -m launcher alignment sim logs/<experiment>/simulation.yaml
 uv run python -m launcher alignment analyze logs/<experiment>/analyze_e2e.yaml
 ```
 
@@ -501,11 +499,11 @@ index rather than scanning the detail shard:
 That resource contains the iteration total, measured kernels, simulated slots,
 and semantic-operation summary.
 
-`--gpu-time-multiplier-from <kernel-align-dir>` makes the simulation read that
-pass's `recommended_gpu_time_multiplier` and inject it as
-`--override pools.main.groups.0.worker.gpu_time_multiplier=<v>` — no manual copy.
-Omit the flag to run the simulation with whatever `gpu_time_multiplier` the
-preset's worker already carries (defaults to 1.0).
+Simulation uses the preset's explicit `worker.gpu_time_multiplier` (default 1.0).
+Kernel alignment reports a recommendation, but is not a simulation prerequisite
+and cannot override the preset. When adopting a recommendation, record its source
+and any cross-workload approximation in the experiment notes and set the value
+in the preset before running. Previously used report-source CLI flags are removed.
 
 Standalone NSYS normalization remains available as:
 
@@ -608,7 +606,7 @@ model needing one pass, or three, adds no enum anywhere:
 | *(per profile pass)* | `<name>.yaml` | `<name>/` | `alignment profile` |
 | `timing_predict` | `timing_predict.yaml` | `timing_predict/` | `alignment timing-predict` |
 | `analysis_kernel` | `analyze_kernel.yaml` | `analysis_kernel/` | `alignment analyze` |
-| `simulation` | `simulation.yaml` | `simulation/` | `alignment sim --gpu-time-multiplier-from …/analysis_kernel` |
+| `simulation` | `simulation.yaml` | `simulation/` | `alignment sim` |
 | `analysis_e2e` | `analyze_e2e.yaml` | `analysis_e2e/` | `alignment analyze` |
 
 A **pack** is the matrix as data: `campaign.yaml` (cases and topology variants),

@@ -341,7 +341,7 @@ def test_alignment_sim_runs_only_existing_simulation(tmp_path, monkeypatch):
 
     assert alignment_launcher.main(["sim", str(paths["simulation"])]) == 0
     assert calls[0][0] == paths["simulation"]
-    assert calls[0][1]["overrides"] == []
+    assert "overrides" not in calls[0][1]
     assert json.loads((tmp_path / "artifact.meta.json").read_text()) == {
         "schema_version": 1,
         "artifact_kind": "alignment_bundle",
@@ -356,8 +356,12 @@ def test_alignment_sim_dry_run_does_not_publish_bundle_marker(tmp_path, monkeypa
     assert not (tmp_path / "artifact.meta.json").exists()
 
 
-def test_alignment_sim_auto_injects_kernel_align_multiplier(tmp_path, monkeypatch):
+def test_alignment_sim_preserves_explicit_worker_multiplier(tmp_path, monkeypatch):
     paths = _phase_configs(tmp_path)
+    preset = yaml.safe_load(paths["simulation"].read_text())
+    preset["pools"]["main"]["groups"][0]["worker"]["gpu_time_multiplier"] = 1.17
+    _write_config(paths["simulation"], preset)
+    before = paths["simulation"].read_bytes()
     kernel_align = tmp_path / "kernel_align_run"
     report = kernel_align / "reports" / "alignment_iteration_report.json"
     report.parent.mkdir(parents=True)
@@ -369,30 +373,19 @@ def test_alignment_sim_auto_injects_kernel_align_multiplier(tmp_path, monkeypatc
         lambda path, **kwargs: calls.append((path, kwargs)) or 0,
     )
 
-    assert (
-        alignment_launcher.main(
-            ["sim", str(paths["simulation"]), "--gpu-time-multiplier-from", str(kernel_align)]
-        )
-        == 0
-    )
-    assert calls[0][1]["overrides"] == ["pools.main.groups.0.worker.gpu_time_multiplier=1.329"]
+    assert alignment_launcher.main(["sim", str(paths["simulation"])]) == 0
+    assert calls[0][0] == paths["simulation"]
+    assert "overrides" not in calls[0][1]
+    assert paths["simulation"].read_bytes() == before
 
 
-def test_alignment_sim_rejects_below_unity_multiplier(tmp_path, monkeypatch, capsys):
+def test_alignment_sim_rejects_removed_calibration_flag(tmp_path):
     paths = _phase_configs(tmp_path)
-    kernel_align = tmp_path / "kernel_align_run"
-    report = kernel_align / "reports" / "alignment_iteration_report.json"
-    report.parent.mkdir(parents=True)
-    report.write_text(json.dumps({"meta": {"recommended_gpu_time_multiplier": 0.5}}))
-    monkeypatch.setattr(alignment_launcher, "_launch_simulation", lambda *args, **kwargs: 0)
-
-    assert (
+    with pytest.raises(SystemExit) as error:
         alignment_launcher.main(
-            ["sim", str(paths["simulation"]), "--gpu-time-multiplier-from", str(kernel_align)]
+            ["sim", str(paths["simulation"]), "--gpu-time-multiplier-from", str(tmp_path)]
         )
-        == 2
-    )
-    assert "recommended_gpu_time_multiplier" in capsys.readouterr().err
+    assert error.value.code == 2
 
 
 def test_profile_config_is_profile_only_and_config_relative(tmp_path, monkeypatch):

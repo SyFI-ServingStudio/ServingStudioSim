@@ -148,7 +148,6 @@ def _run(args) -> int:
             cases=cases,
             refresh=args.refresh,
             resume=args.resume,
-            gpu_time_multiplier_from=args.gpu_time_multiplier_from,
         )
         print(execute.describe_plan(args.phase, plans))
         _print_calibration_prerequisites(pack)
@@ -161,7 +160,6 @@ def _run(args) -> int:
         refresh=args.refresh,
         resume=args.resume,
         parallelism=args.parallelism,
-        gpu_time_multiplier_from=args.gpu_time_multiplier_from,
     )
     for result in report.results:
         status = "ok" if result.returncode == 0 else f"exit {result.returncode}"
@@ -306,11 +304,6 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--case", action="append")
     run.add_argument("--dry-run", action="store_true", help="print the plan and stop")
     run.add_argument("--refresh", action="store_true", help="ignore .complete markers")
-    run.add_argument(
-        "--gpu-time-multiplier-from",
-        type=Path,
-        help="simulation only: explicitly reuse an existing kernel-align calibration directory",
-    )
     run.add_argument(
         "--resume",
         action="store_true",

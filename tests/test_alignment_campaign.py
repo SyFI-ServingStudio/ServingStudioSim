@@ -358,15 +358,23 @@ def test_speculative_case_keeps_replay_trace_and_calibrates_simulation(pack, tmp
     )
     variant = dataclasses.replace(
         original_variant,
-        arch={**original_variant.arch, "type": "glm52_vllm_nvfp4_dsa_moe_speculative", "draft_tokens": 5},
+        arch={
+            **original_variant.arch,
+            "type": "glm52_vllm_nvfp4_dsa_moe_speculative",
+            "draft_tokens": 5,
+        },
         worker={**original_variant.worker, "type": "speculative", "draft_tokens": 5},
     )
     patched = dataclasses.replace(pack, variants={**pack.variants, variant.name: variant})
-    documents = case_documents(patched, case, check_module.host_for(patched, None), tmp_path, REPO_ROOT)
+    documents = case_documents(
+        patched, case, check_module.host_for(patched, None), tmp_path, REPO_ROOT
+    )
     traces = case_traces(patched, case)
     replay = list(csv.DictReader(io.StringIO(traces["trace.csv"])))
     simulation = list(csv.DictReader(io.StringIO(traces["trace_speculative.csv"])))
-    assert replay == [{key: value for key, value in row.items() if key != "accept_rate"} for row in simulation]
+    assert replay == [
+        {key: value for key, value in row.items() if key != "accept_rate"} for row in simulation
+    ]
     assert all(json.loads(row["accept_rate"]) == rates for row in simulation)
     sim = documents[f"{PHASE_CONFIG_STEMS[SIMULATION_PHASE]}.yaml"]
     assert sim["workload"]["input_file_tags"] == ["speculative"]
@@ -376,8 +384,14 @@ def test_speculative_case_keeps_replay_trace_and_calibrates_simulation(pack, tmp
     profile = documents[f"{variant.profile_passes[0].name}.yaml"]
     assert profile["server"]["chunk_size"] == 4096
     profile["server"]["chunk_size"] = 2048
-    assert any("token ceiling" in finding.message for finding in check_module._check_cross_phase(patched, case, documents))
-    bad_case = dataclasses.replace(case, speculative_acceptance=dataclasses.replace(case.speculative_acceptance, value=rates[:2]))
+    assert any(
+        "token ceiling" in finding.message
+        for finding in check_module._check_cross_phase(patched, case, documents)
+    )
+    bad_case = dataclasses.replace(
+        case,
+        speculative_acceptance=dataclasses.replace(case.speculative_acceptance, value=rates[:2]),
+    )
     with pytest.raises(PackError, match="draft_tokens must agree"):
         case_documents(patched, bad_case, check_module.host_for(patched, None), tmp_path, REPO_ROOT)
 
@@ -453,43 +467,26 @@ def test_a_plan_never_schedules_another_phase(pack, tmp_path):
                 assert str(tmp_path / case.slug) in " ".join(plan.command)
 
 
-def test_simulation_reads_the_kernel_align_multiplier(pack, tmp_path):
+def test_simulation_command_only_uses_preset(pack, tmp_path):
     case = pack.cases[0]
     variant = pack.variant_of(case)
     command = execute.phase_command(
         tmp_path / case.slug, variant, SIMULATION_PHASE, resume=False, refresh=False
     )
-    assert "--gpu-time-multiplier-from" in command
-    assert command[command.index("--gpu-time-multiplier-from") + 1].endswith(
-        ANALYSIS_KERNEL_PHASE
-    )
+    assert command[-2:] == ("sim", str(tmp_path / case.slug / "simulation.yaml"))
 
 
-def test_simulation_can_explicitly_reuse_existing_calibration(pack, tmp_path):
+def test_simulation_is_ready_without_kernel_analysis(pack, tmp_path):
     case = pack.cases[0]
     render_case(pack, case, check_module.host_for(pack, None), tmp_path, REPO_ROOT)
-    source = tmp_path / "existing_calibration"
-    report = source / "reports" / "alignment_iteration_report.json"
-    report.parent.mkdir(parents=True)
-    report.write_text(json.dumps({"meta": {"recommended_gpu_time_multiplier": 1.05}}))
     (original,) = execute.plan_phase(pack, tmp_path, SIMULATION_PHASE, cases=[case])
-    assert original.state == "blocked"
-    (reused,) = execute.plan_phase(
-        pack, tmp_path, SIMULATION_PHASE, cases=[case], gpu_time_multiplier_from=source
-    )
-    assert reused.state == "ready"
-    assert reused.command[reused.command.index("--gpu-time-multiplier-from") + 1] == str(source)
+    assert original.state == "ready"
     assert not (tmp_path / case.slug / ANALYSIS_KERNEL_PHASE).exists()
     (tmp_path / case.slug / "simulation.yaml").unlink()
     (missing,) = execute.plan_phase(
-        pack, tmp_path, SIMULATION_PHASE, cases=[case], gpu_time_multiplier_from=source
+        pack, tmp_path, SIMULATION_PHASE, cases=[case]
     )
     assert missing.state in {"missing", "blocked"}
-    with pytest.raises(ValueError, match="only valid for simulation"):
-        execute.plan_phase(pack, tmp_path, ANALYSIS_KERNEL_PHASE, gpu_time_multiplier_from=source)
-    report.write_text(json.dumps({"meta": {"recommended_gpu_time_multiplier": 0.9}}))
-    with pytest.raises(ValueError, match="no valid recommended"):
-        execute.plan_phase(pack, tmp_path, SIMULATION_PHASE, gpu_time_multiplier_from=source)
 
 
 def test_unknown_phase_is_rejected_with_the_available_list(pack, tmp_path):

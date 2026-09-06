@@ -10,10 +10,7 @@ exit codes separately; do not serialize the campaign for attribution's sake").
 
 So there is a `--phase` and there is no `--all`. Every arrow between phases stays
 a human checkpoint; what gets automated is typing the same command fifteen times.
-The one apparent exception, `simulation` passing
-`--gpu-time-multiplier-from .../analysis_kernel`, reads a *completed artifact*
-that a person had to run first — the same thing the existing `alignment sim`
-flag already does.
+Simulation reads its worker settings directly from the rendered preset.
 
 ## Readiness before spend
 
@@ -147,9 +144,7 @@ def phase_complete(case_dir: Path, variant: Variant, phase: str) -> bool:
     return has_marker(directory) or bool(artifacts)
 
 
-def phase_requirements(
-    case_dir: Path, variant: Variant, phase: str, *, external_calibration: bool = False
-) -> list[str]:
+def phase_requirements(case_dir: Path, variant: Variant, phase: str) -> list[str]:
     """What this phase still needs. Empty means ready.
 
     Deliberately expressed as *inputs of P*, never as "run the previous phase":
@@ -184,14 +179,6 @@ def phase_requirements(
             missing.append(
                 f"{LABELED_SEQUENCES_NAME} absent — run `alignment-campaign label` first"
             )
-    elif phase == SIMULATION_PHASE:
-        if not external_calibration and not phase_complete(
-            case_dir, variant, ANALYSIS_KERNEL_PHASE
-        ):
-            missing.append(
-                f"{ANALYSIS_KERNEL_PHASE} not complete — the simulation reads its "
-                "recommended_gpu_time_multiplier"
-            )
     elif phase == ANALYSIS_E2E_PHASE:
         if not phase_complete(case_dir, variant, SIMULATION_PHASE):
             missing.append(f"{SIMULATION_PHASE} not complete")
@@ -209,7 +196,6 @@ def phase_command(
     *,
     resume: bool,
     refresh: bool,
-    gpu_time_multiplier_from: Path | None = None,
 ) -> tuple[str, ...]:
     """The `python -m launcher alignment ...` invocation for one case's phase."""
     config = case_dir / f"{config_stem(variant, phase)}.yaml"
@@ -221,16 +207,7 @@ def phase_command(
     if phase in (ANALYSIS_KERNEL_PHASE, ANALYSIS_E2E_PHASE):
         return base + ("analyze", str(config))
     if phase == SIMULATION_PHASE:
-        return (
-            base
-            + (
-                "sim",
-                str(config),
-                "--gpu-time-multiplier-from",
-                str(gpu_time_multiplier_from or case_dir / ANALYSIS_KERNEL_PHASE),
-            )
-            + (("--refresh",) if refresh else ())
-        )
+        return base + ("sim", str(config)) + (("--refresh",) if refresh else ())
     raise ValueError(f"unknown phase {phase!r}")
 
 
@@ -242,18 +219,10 @@ def plan_phase(
     cases: list[Case] | None = None,
     refresh: bool = False,
     resume: bool = False,
-    gpu_time_multiplier_from: Path | None = None,
 ) -> tuple[PhasePlan, ...]:
     """Decide each case's disposition. Pure: no process is started, nothing is
     written, so the CPU tier tests this directly against a faked artifact tree."""
     out_root = Path(out_root).resolve()
-    if gpu_time_multiplier_from is not None:
-        if phase != SIMULATION_PHASE:
-            raise ValueError("--gpu-time-multiplier-from is only valid for simulation")
-        from ..alignment import _read_recommended_multiplier
-
-        gpu_time_multiplier_from = Path(gpu_time_multiplier_from).resolve()
-        _read_recommended_multiplier(gpu_time_multiplier_from)
     plans: list[PhasePlan] = []
     for case in cases if cases is not None else pack.cases:
         variant = pack.variant_of(case)
@@ -282,12 +251,7 @@ def plan_phase(
         if not refresh and phase_complete(case_dir, variant, phase):
             plans.append(PhasePlan(case.slug, phase, case_dir, "complete"))
             continue
-        blockers = phase_requirements(
-            case_dir,
-            variant,
-            phase,
-            external_calibration=gpu_time_multiplier_from is not None,
-        )
+        blockers = phase_requirements(case_dir, variant, phase)
         if blockers:
             plans.append(PhasePlan(case.slug, phase, case_dir, "blocked", tuple(blockers)))
             continue
@@ -304,7 +268,6 @@ def plan_phase(
                     phase,
                     resume=resume,
                     refresh=refresh,
-                    gpu_time_multiplier_from=gpu_time_multiplier_from,
                 ),
             )
         )
@@ -441,7 +404,6 @@ def run_phase(
     refresh: bool = False,
     resume: bool = False,
     parallelism: int = 1,
-    gpu_time_multiplier_from: Path | None = None,
 ) -> RunReport:
     """Fan one phase across every ready case and collect exit codes separately.
 
@@ -456,7 +418,6 @@ def run_phase(
         cases=cases,
         refresh=refresh,
         resume=resume,
-        gpu_time_multiplier_from=gpu_time_multiplier_from,
     )
     report = RunReport(phase=phase, plans=plans)
     report.results = asyncio.run(_run_all(pack, plans, parallelism=parallelism, refresh=refresh))
