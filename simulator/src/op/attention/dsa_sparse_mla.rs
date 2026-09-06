@@ -824,9 +824,10 @@ fn production_index_remap_input(
             request_row_counts.len()
         ));
     }
-    if local_span_lengths.len() > 8192 {
+    let max_queries = crate::timing::kernels::dsa_sparse_index_remap::MAX_QUERIES;
+    if local_span_lengths.len() > max_queries as usize {
         return Err(format!(
-            "production index remap supports at most 8192 query rows, got {}",
+            "production index remap supports at most {max_queries} query rows, got {}",
             local_span_lengths.len()
         ));
     }
@@ -1149,7 +1150,7 @@ mod tests {
             .contains("at most 256 requests"));
 
         let supported_max_rows = DsaSparseMlaAttentionInput {
-            prefill_query_cache_pairs: vec![(8192, 8192)],
+            prefill_query_cache_pairs: vec![(16384, 16384)],
             ..Default::default()
         };
         assert!(production_index_remap_input(&supported_max_rows, 1, 2048)
@@ -1157,12 +1158,22 @@ mod tests {
             .is_some());
 
         let too_many_rows = DsaSparseMlaAttentionInput {
-            prefill_query_cache_pairs: vec![(8192, 8192), (1, 1)],
+            prefill_query_cache_pairs: vec![(16384, 16384), (1, 1)],
             ..Default::default()
         };
         assert!(production_index_remap_input(&too_many_rows, 1, 2048)
             .unwrap_err()
-            .contains("at most 8192 query rows"));
+            .contains("at most 16384 query rows"));
+
+        let rounded_spec5_prefill = DsaSparseMlaAttentionInput {
+            prefill_query_cache_pairs: vec![(8196, 8196)],
+            ..Default::default()
+        };
+        let remap = production_index_remap_input(&rounded_spec5_prefill, 6, 2048)
+            .unwrap()
+            .unwrap();
+        assert_eq!(remap.request_row_counts, vec![8196]);
+        assert_eq!(remap.local_span_lengths.len(), 8196);
     }
 
     #[test]

@@ -186,11 +186,9 @@ fn indexer_decode_context_len(decode: &Glm52DsaAttnLocalDecodeInput, context_len
     }
     let batch_size = u64::from(decode.batch_size);
     let mean = context_len_sum.div_ceil(batch_size);
-    // Bounded by the caller's own scalar, so it inherits the `max_model_len`
-    // check that scalar already passed and can never widen the shape.
-    u32::try_from(mean)
-        .unwrap_or(decode.context_len)
-        .min(decode.context_len)
+    // Every exact length already passed the max_model_len check. Their mean
+    // is bounded by the same limit, independently of the scalar cache axis.
+    mean as u32
 }
 
 #[cfg(test)]
@@ -216,8 +214,8 @@ mod tests {
     fn decode_rows_scale_with_the_verify_width() {
         // A verify step submits one group of `decode_next_n` rows per request.
         // The width is a multiplier on the sparse-MLA query coordinate and
-        // nothing else: the indexer still sees one entry per request, because
-        // index selection is per request, not per verified row.
+        // nothing else here: the indexer sees request count and obtains the
+        // per-request query width from its own resolved configuration.
         for decode_next_n in [1, 2, 3, 6] {
             let normalized = normalize_glm52_dsa_attn_input(
                 &decode_input(8, decode_next_n),
@@ -273,6 +271,17 @@ mod tests {
             .indexer_decode
             .unwrap();
         assert_eq!(decode.context_len, 4096);
+    }
+
+    #[test]
+    fn exact_contexts_are_not_clipped_by_the_scalar_cache_axis() {
+        let mut input = decode_input(2, 6);
+        let decode = input.decode.as_mut().unwrap();
+        decode.context_len = 12;
+        decode.context_lens = Some(vec![190, 191]);
+        let normalized = normalize_glm52_dsa_attn_input(&input, 6, MAX_MODEL_LEN).unwrap();
+        assert_eq!(normalized.indexer_decode.unwrap().context_len, 191);
+        assert_eq!(normalized.sparse_decode_context_lens, Some(vec![190, 191]));
     }
 
     #[test]

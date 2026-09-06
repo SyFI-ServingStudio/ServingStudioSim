@@ -14,9 +14,9 @@
 //! a fixed two. `ValidCountsPattern::SpeculativeGroups` carries it, and derives
 //! its axes from the group-of-two anchors by request count.
 
-use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
+use crate::timing::bridge::{ArgsPayload, DType, KernelKind, de_backends};
 use crate::timing::cache::{CacheKind, Extrapolation};
-use crate::timing::kernels::engine::{register_kernel, KernelSpec};
+use crate::timing::kernels::engine::{KernelSpec, register_kernel};
 use crate::timing::sweep::{Axis, SweepGrid};
 use crate::timing::{Dim, KernelConfig, SweepCoords};
 
@@ -263,13 +263,16 @@ fn speculative_query_axis(group_size: u32) -> Vec<u32> {
 ///
 /// The RLE form changes shape where the group first fits in the context
 /// (`num_cache_tokens` near `group_size`) and where it straddles the `selected_k`
-/// clip (`selected_k - (group_size - 1) ..= selected_k + 1`). Without samples at
+/// clip (`selected_k ..= selected_k + group_size - 1`). Without samples at
 /// those boundaries the cache interpolates across a discontinuity it never
 /// measured. The frozen group-of-two axis is returned untouched.
 fn speculative_cache_axis(group_size: u32, selected_k: u32) -> Vec<u32> {
     if group_size == 2 {
         return SPECULATIVE_CACHE_AXIS.to_vec();
     }
+    let saturated_context = selected_k
+        .checked_add(group_size - 1)
+        .expect("speculative saturation boundary overflows u32");
     let mut axis = SPECULATIVE_CACHE_AXIS.to_vec();
     axis.extend(
         [
@@ -279,6 +282,11 @@ fn speculative_cache_axis(group_size: u32, selected_k: u32) -> Vec<u32> {
             selected_k.saturating_sub(group_size - 1),
             selected_k,
             selected_k + 1,
+            saturated_context.saturating_sub(1),
+            saturated_context,
+            saturated_context
+                .checked_add(1)
+                .expect("speculative saturation guard overflows u32"),
         ]
         .into_iter()
         .filter(|value| *value > 0),
@@ -351,10 +359,10 @@ register_kernel!(DsaSparseMlaAttentionKernel, DsaSparseMlaAttentionSpec);
 mod tests {
     use super::ValidCountsPattern;
     use super::{
-        canonical_valid_counts, speculative_cache_axis, speculative_query_axis,
-        DsaSparseMlaAttentionKernelConfig, DsaSparseMlaAttentionKernelInput,
-        DsaSparseMlaAttentionSpec, CAUSAL_CACHE_AXIS, CAUSAL_QUERY_AXIS, SPECULATIVE_CACHE_AXIS,
-        SPECULATIVE_QUERY_AXIS, UNIFORM_CACHE_AXIS, UNIFORM_QUERY_AXIS,
+        CAUSAL_CACHE_AXIS, CAUSAL_QUERY_AXIS, DsaSparseMlaAttentionKernelConfig,
+        DsaSparseMlaAttentionKernelInput, DsaSparseMlaAttentionSpec, SPECULATIVE_CACHE_AXIS,
+        SPECULATIVE_QUERY_AXIS, UNIFORM_CACHE_AXIS, UNIFORM_QUERY_AXIS, canonical_valid_counts,
+        speculative_cache_axis, speculative_query_axis,
     };
     use crate::timing::bridge::{ArgsPayload, DType};
     use crate::timing::cache::{CacheKind, Extrapolation};
@@ -508,9 +516,11 @@ mod tests {
             DsaSparseMlaAttentionSpec::sweep_grid(&config(ValidCountsPattern::SpeculativeGroups {
                 group_size: 2,
             }));
-        assert!(speculative.axes()[0]
-            .iter()
-            .all(|query| *query as u32 % 2 == 0));
+        assert!(
+            speculative.axes()[0]
+                .iter()
+                .all(|query| *query as u32 % 2 == 0)
+        );
         assert_contiguous(&speculative.axes()[0], &[128, 132, 134]);
         assert_contiguous(&speculative.axes()[0], &[256, 264, 266]);
         assert_contiguous(&speculative.axes()[1], &[16, 23, 32, 45, 63]);
@@ -794,21 +804,33 @@ mod tests {
             assert_eq!(grid.axes()[0][index], f64::from(num_queries / 2 * 6));
         }
 
-        // Exactly four points join the frozen cache axis: the group boundary and
-        // the first row that clips at `selected_k`.
-        assert_eq!(grid.axes()[1].len(), SPECULATIVE_CACHE_AXIS.len() + 4);
+        // Retain existing points and add both sides of the all-rows-saturated boundary.
+        assert_eq!(grid.axes()[1].len(), SPECULATIVE_CACHE_AXIS.len() + 7);
         assert_contiguous(&grid.axes()[1], &[4, 5, 6, 7, 8]);
         assert_contiguous(&grid.axes()[1], &[1024, 2043, 2047, 2048, 2049]);
+        assert_contiguous(&grid.axes()[1], &[2049, 2052, 2053, 2054, 4096]);
         assert_eq!(grid.axes()[1].last(), Some(&1_048_576.0));
 
         let mask = mask_for(
             ValidCountsPattern::SpeculativeGroups { group_size: 6 },
             &grid,
         );
-        assert_mask_split(&mask, 700, 0);
+        assert_mask_split(&mask, 760, 0);
 
         let payloads = DsaSparseMlaAttentionSpec::enumerate(&cfg, &grid, FLASHMLA_BACKEND);
-        assert_eq!(payloads.len(), 700);
+        assert_eq!(payloads.len(), 760);
+        assert_payload(
+            payload_for(&payloads, &grid, 12, 2052),
+            12,
+            2052,
+            "g:(2047,2048,2048,2048,2048,2048)x2".to_string(),
+        );
+        assert_payload(
+            payload_for(&payloads, &grid, 12, 2053),
+            12,
+            2053,
+            "u:2048x12".to_string(),
+        );
         assert_payload(
             payload_for(&payloads, &grid, 6, 2049),
             6,
