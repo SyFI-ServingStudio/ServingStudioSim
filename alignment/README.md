@@ -60,6 +60,13 @@ predictor. It receives resolved artifacts from the launcher and writes only
 timing-predict inputs. The analyze launcher alone creates
 `analysis/alignment_manifest.json`.
 
+For Spec5, a decode-lifecycle request may recompute context after preemption.
+Schema-v4 rows with matching per-request geometry, no drafted/accepted candidates,
+and query width above the backend's `1 + draft_tokens` decode threshold lower to
+prefill chunk pairs. The original observation stays intact and all query tokens
+remain in the predicted workload. Missing evidence or unsupported short verification
+widths still fail validation.
+
 `alignment/nsys/evidence.py` owns framework-neutral process attribution, NVTX
 ranges, CUDA runtime correlation, kernel classification, and interval arithmetic.
 The serving-specific `alignment/nsys/parse.py` builds iteration semantics on top

@@ -83,10 +83,13 @@ def build_inputs(request: BuildRequest) -> BuildResult:
     parsed = json.loads(request.parsed_nsys.read_text())
     if not isinstance(parsed, dict):
         raise ValueError(f"parsed NSYS root must be a JSON object: {request.parsed_nsys}")
+    speculative = request.arch.get("type") == "glm52_vllm_nvfp4_dsa_moe_speculative"
+    draft_tokens = request.arch.get("draft_tokens", 5) if speculative else None
     cases, case_map, excluded = build_cases(
         parsed,
         request.input_spec.measured_phase,
         request.input_spec.group_assignment,
+        draft_tokens=draft_tokens,
     )
 
     output_dir = request.output_dir.resolve()
@@ -112,7 +115,7 @@ def build_inputs(request: BuildRequest) -> BuildResult:
     predict_config_path.write_text(
         json.dumps(
             {
-                "arch": {"iter": request.arch},
+                "arch": {"speculative_iter" if speculative else "iter": request.arch},
                 "gpu": request.gpu,
                 "backends": request.backends,
                 "log_dir": str(output_dir),

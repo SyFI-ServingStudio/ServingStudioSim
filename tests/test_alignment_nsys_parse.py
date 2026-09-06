@@ -137,6 +137,71 @@ def test_load_ranges_resolves_indexed_marker_from_string_ids():
     ]
 
 
+def _indexed_phase_capture():
+    con = sqlite3.connect(":memory:")
+    con.executescript(
+        """
+        CREATE TABLE StringIds (id INTEGER PRIMARY KEY, value TEXT);
+        CREATE TABLE NVTX_EVENTS (
+            start INTEGER, end INTEGER, globalTid INTEGER, text TEXT, textId INTEGER
+        );
+        INSERT INTO StringIds VALUES (1, 'gpu_model_runner: draft');
+        """
+    )
+    return con
+
+
+@pytest.mark.parametrize("mode", ["phases", "forward", "envelope"])
+def test_draft_scope_has_one_same_thread_indexed_owner(mode):
+    con = _indexed_phase_capture()
+    con.executemany(
+        "INSERT INTO NVTX_EVENTS VALUES (?, ?, ?, ?, ?)",
+        [
+            (100, 200, 30, "vllm_iteration(34): forward", None),
+            (210, 220, 30, "vllm_iteration(34): sample", None),
+            (270, 280, 30, "vllm_iteration(34): bookkeep", None),
+            (230, 260, 30, None, 1),
+            (240, 250, 30, None, 1),  # Nested draft is already owned by the outer scope.
+            (120, 180, 30, None, 1),  # Already inside an indexed phase.
+            (215, 235, 30, None, 1),  # Partially overlaps sample.
+            (230, 260, 31, None, 1),  # No indexed owner on this thread.
+            (285, 295, 30, None, 1),  # Beyond the last indexed phase.
+        ],
+    )
+    worker = Worker(global_pid=10, pid=20, name="VLLM::Worker", device_id=0)
+    rows = load_ranges(con, {30: worker}, {}, 34, 34, mode)
+    if mode == "phases":
+        assert [(row.phase, row.start, row.end) for row in rows] == [
+            ("forward", 100, 200), ("sample", 210, 220),
+            ("bookkeep", 270, 280), ("draft", 230, 260),
+        ]
+    elif mode == "forward":
+        assert [(row.phase, row.start, row.end) for row in rows] == [("forward", 100, 200)]
+    else:
+        assert [(row.phase, row.start, row.end) for row in rows] == [
+            ("iteration_envelope", 100, 280)
+        ]
+
+
+@pytest.mark.parametrize("shared", [False, True])
+@pytest.mark.parametrize("bounds", [(34, 34), (None, None)])
+def test_shared_tp_index_keeps_peers_outside_the_reference_cpu_envelope(shared, bounds):
+    con = _indexed_phase_capture()
+    con.executemany(
+        "INSERT INTO NVTX_EVENTS VALUES (?, ?, ?, ?, NULL)",
+        [
+            (100, 200, 30, "vllm_iteration(34): forward"),
+            (250, 280, 31, "vllm_iteration(34): forward"),
+        ],
+    )
+    workers = {
+        thread: Worker(global_pid=thread, pid=thread, name="VLLM::Worker", device_id=device)
+        for device, thread in enumerate([30, 31])
+    }
+    rows = load_ranges(con, workers, {}, *bounds, "forward", shared_iteration_index=shared)
+    assert [row.worker.device_id for row in rows] == ([0, 1] if shared else [0])
+
+
 def test_iteration_details_preserve_complete_kernel_launch_record():
     worker = Worker(global_pid=10, pid=20, name="VLLM::Worker", device_id=0)
     event = KernelEvent(
