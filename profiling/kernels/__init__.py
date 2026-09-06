@@ -61,8 +61,6 @@ from profiling.kernels import (
     gemm_fp32_output,  # noqa: F401
     grouped_gemm,  # noqa: F401
     kv_cache_append,  # noqa: F401
-    logits_argmax,  # noqa: F401
-    logits_copy,  # noqa: F401
     mhc_fused_post_pre_rms_norm,  # noqa: F401
     mhc_pre_rms_norm,  # noqa: F401
     mla_cache_append,  # noqa: F401
@@ -87,5 +85,4 @@ from profiling.kernels import (
     single_gemm,  # noqa: F401
     vllm_fused_moe,  # noqa: F401
     vllm_mla_rope,  # noqa: F401
-    vocab_parallel_all_gather,  # noqa: F401
 )
