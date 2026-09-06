@@ -3155,22 +3155,38 @@ mod tests {
         }
         // Campaign rules must resolve against the compiled tree, including the
         // shared recurrent subtree introduced by the clean implementation.
+        // The shared rule set also contains full-index-only draft indexer slots.
+        let full_index_cfg = build_speculative_configs(
+            &model(),
+            &parallel(4),
+            &routing,
+            &routing,
+            false,
+            Glm52MtpMode::FullIndex,
+            5,
+        )
+        .unwrap();
+        let full_index = build_speculative(
+            "unified".into(), resolve_configs(&full_index_cfg), &bridge,
+        )
+        .unwrap();
+        let full_index_slots = full_index.cost_tree().slots;
+        let mut slot_names = slot_names;
+        slot_names.extend(full_index_slots.iter().map(|slot| slot.name.as_str()));
         let mut unresolved = std::collections::BTreeSet::new();
-        for encoded in [
-            include_str!(
-                "../../../presets/alignment/glm52_nvfp4_b200_spec5/label_rules/rules.json"
-            ),
-            include_str!(
-                "../../../presets/alignment/glm52_nvfp4_b200_spec5/label_rules/mtp_rules.json"
-            ),
-        ] {
-            let document: serde_json::Value = serde_json::from_str(encoded).unwrap();
-            for rule in document["rules"].as_array().unwrap() {
-                for suffix in rule["slot_suffixes"].as_array().unwrap() {
-                    let suffix = suffix.as_str().unwrap();
-                    if !slot_names.iter().any(|name| name.ends_with(suffix)) {
-                        unresolved.insert(suffix.to_string());
-                    }
+        let encoded = include_str!(
+            "../../../presets/alignment/glm52_nvfp4_b200_spec5/label_rules/rules.json"
+        );
+        let document: serde_json::Value = serde_json::from_str(encoded).unwrap();
+        for rule in document["rules"].as_array().unwrap() {
+            if rule["status"] == "unmapped" {
+                assert!(rule.get("slot_suffixes").is_none());
+                continue;
+            }
+            for suffix in rule["slot_suffixes"].as_array().unwrap() {
+                let suffix = suffix.as_str().unwrap();
+                if !slot_names.iter().any(|name| name.ends_with(suffix)) {
+                    unresolved.insert(suffix.to_string());
                 }
             }
         }
