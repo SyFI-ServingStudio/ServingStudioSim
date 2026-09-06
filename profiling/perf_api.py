@@ -14,6 +14,7 @@ Agent note:
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from profiling.db.metadata import (
@@ -29,7 +30,7 @@ from profiling.db.metadata import (
 from profiling.facade import build_kind_facades
 from profiling.facade import get_current_gpu_name as _get_current_gpu_name
 
-DB_PATH = Path(__file__).resolve().parent / "profile.db"
+DB_PATH = Path(os.environ.get("VIBESIM_PROFILE_DB", Path(__file__).resolve().parent / "profile.db"))
 
 _jit_enabled = False
 

@@ -17,6 +17,17 @@ import pytest
 from launcher.process.leases import LauncherLeases, launcher_lock_root
 
 
+def test_profile_database_override_has_its_own_lease(tmp_path, monkeypatch):
+    leases = LauncherLeases(repository_root=tmp_path / "checkout")
+    monkeypatch.delenv("VIBESIM_PROFILE_DB", raising=False)
+    default = leases.profile_database(write=True)
+    monkeypatch.setenv("VIBESIM_PROFILE_DB", str(tmp_path / "snapshot.db"))
+    snapshot = leases.profile_database(write=True)
+    assert snapshot.lock_path != default.lock_path
+    assert snapshot.resource == f"profile-db:{tmp_path / 'snapshot.db'}"
+    assert leases.profile_database(write=False).lock_path == snapshot.lock_path
+
+
 def test_two_users_share_no_lock_directory(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("TMPDIR", str(tmp_path))
     checkout = tmp_path / "checkout"
