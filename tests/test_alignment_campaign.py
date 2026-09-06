@@ -416,6 +416,33 @@ def test_simulation_reads_the_kernel_align_multiplier(pack, tmp_path):
     )
 
 
+def test_simulation_can_explicitly_reuse_existing_calibration(pack, tmp_path):
+    case = pack.cases[0]
+    render_case(pack, case, check_module.host_for(pack, None), tmp_path, REPO_ROOT)
+    source = tmp_path / "existing_calibration"
+    report = source / "reports" / "alignment_iteration_report.json"
+    report.parent.mkdir(parents=True)
+    report.write_text(json.dumps({"meta": {"recommended_gpu_time_multiplier": 1.05}}))
+    (original,) = execute.plan_phase(pack, tmp_path, SIMULATION_PHASE, cases=[case])
+    assert original.state == "blocked"
+    (reused,) = execute.plan_phase(
+        pack, tmp_path, SIMULATION_PHASE, cases=[case], gpu_time_multiplier_from=source
+    )
+    assert reused.state == "ready"
+    assert reused.command[reused.command.index("--gpu-time-multiplier-from") + 1] == str(source)
+    assert not (tmp_path / case.slug / ANALYSIS_KERNEL_PHASE).exists()
+    (tmp_path / case.slug / "simulation.yaml").unlink()
+    (missing,) = execute.plan_phase(
+        pack, tmp_path, SIMULATION_PHASE, cases=[case], gpu_time_multiplier_from=source
+    )
+    assert missing.state in {"missing", "blocked"}
+    with pytest.raises(ValueError, match="only valid for simulation"):
+        execute.plan_phase(pack, tmp_path, ANALYSIS_KERNEL_PHASE, gpu_time_multiplier_from=source)
+    report.write_text(json.dumps({"meta": {"recommended_gpu_time_multiplier": 0.9}}))
+    with pytest.raises(ValueError, match="no valid recommended"):
+        execute.plan_phase(pack, tmp_path, SIMULATION_PHASE, gpu_time_multiplier_from=source)
+
+
 def test_unknown_phase_is_rejected_with_the_available_list(pack, tmp_path):
     case = pack.cases[0]
     host = check_module.host_for(pack, None)

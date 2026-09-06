@@ -78,6 +78,14 @@ commands plus, for every excluded case, *why* — already complete, or missing a
 named input. Planning is a pure function (`execute.plan_phase`), which is what
 makes it testable on CPU.
 
+For `--phase simulation`, `--gpu-time-multiplier-from <analysis_dir>` explicitly
+reuses an existing kernel-align report. The report must contain a valid multiplier;
+the selected source is passed to the ordinary alignment simulator and recorded
+there. This replaces only the local kernel-report prerequisite, allowing E2E
+measurement without another NSYS capture. It does not mark local kernel alignment
+complete. Reusing another workload's calibration is an approximation that must
+remain visible in the resulting comparison.
+
 ### `label`
 
 `initialize`, then apply the manifest's rules repeatedly until the label
