@@ -43,6 +43,7 @@ analyze = [
 # binary is handed). Mirrors the Rust side's `serde_yaml`.
 launcher = [
     "asteval>=1.0.0",
+    "prometheus-client>=0.20.0",
     "pyyaml>=6.0",
 ]
 profiling = [
