@@ -4,6 +4,18 @@ This package owns conversion semantics only. The launcher owns phase config
 parsing, artifact discovery, validation order, and invoking timing-predict.
 """
 
-from .builder import BuildRequest, BuildResult, EngineTextInputSpec, build_inputs
+from .builder import (
+    BuildRequest,
+    BuildResult,
+    EngineTextInputSpec,
+    SpeculativeEngineTextInputSpec,
+    build_inputs,
+)
 
-__all__ = ["BuildRequest", "BuildResult", "EngineTextInputSpec", "build_inputs"]
+__all__ = [
+    "BuildRequest",
+    "BuildResult",
+    "EngineTextInputSpec",
+    "SpeculativeEngineTextInputSpec",
+    "build_inputs",
+]

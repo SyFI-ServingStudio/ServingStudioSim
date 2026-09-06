@@ -61,7 +61,8 @@ variants:
       trace: kernel
       warmup: true
     input_builder:
-      type: engine_text
+      type: speculative_engine_text
+      draft_tokens: 5
       measured_phase: forward
       group_assignment: per_dp_rank
     label_rules: label_rules/manifest.json

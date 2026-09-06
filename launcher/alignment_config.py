@@ -24,7 +24,7 @@ from alignment.profiler.config import (
     PythonRuntimeConfig,
     ServerConfig,
 )
-from alignment.timing_predict_input import EngineTextInputSpec
+from alignment.timing_predict_input import EngineTextInputSpec, SpeculativeEngineTextInputSpec
 
 from .schema.loader import PresetError, _load_preset
 
@@ -343,12 +343,16 @@ def load_timing_predict_config(path: Path) -> TimingPredictPhaseConfig:
         builder_type = builder_raw.pop("type", None)
         # `vllm_text` is the pre-SGLang spelling of the same builder, kept so
         # configs written against the single-engine pipeline still load.
-        if builder_type not in {"engine_text", "vllm_text"}:
+        if builder_type in {"engine_text", "vllm_text"}:
+            builder = EngineTextInputSpec(**builder_raw)
+        elif builder_type == "speculative_engine_text":
+            builder = SpeculativeEngineTextInputSpec(**builder_raw)
+        else:
             raise ValueError(
                 f"unsupported input_builder.type {builder_type!r}; "
-                "available: ['engine_text'] (legacy alias: 'vllm_text')"
+                "available: ['engine_text', 'speculative_engine_text'] "
+                "(legacy alias: 'vllm_text')"
             )
-        builder = EngineTextInputSpec(**builder_raw)
         builder.validate()
         config = TimingPredictPhaseConfig(
             simulation_preset=_config_path(base, raw.pop("simulation_preset"), "simulation_preset"),

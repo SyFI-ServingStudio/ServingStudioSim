@@ -43,6 +43,25 @@ class EngineTextInputSpec:
         }
 
 
+@dataclass(frozen=True, kw_only=True)
+class SpeculativeEngineTextInputSpec(EngineTextInputSpec):
+    """Measured chain verification with an explicitly declared draft depth."""
+
+    draft_tokens: int
+
+    def validate(self) -> None:
+        super().validate()
+        if type(self.draft_tokens) is not int or self.draft_tokens <= 0:
+            raise ValueError("input_builder.draft_tokens must be a positive integer")
+
+    def to_mapping(self) -> dict[str, Any]:
+        return {
+            **super().to_mapping(),
+            "type": "speculative_engine_text",
+            "draft_tokens": self.draft_tokens,
+        }
+
+
 @dataclass(frozen=True)
 class BuildRequest:
     """Resolved cross-stage artifacts supplied by the launcher.
@@ -80,11 +99,16 @@ def build_inputs(request: BuildRequest) -> BuildResult:
     has no analysis directory and cannot create an analyzer manifest.
     """
     request.input_spec.validate()
+    speculative = isinstance(request.input_spec, SpeculativeEngineTextInputSpec)
+    draft_tokens = request.input_spec.draft_tokens if speculative else None
+    if speculative and (
+        type(request.arch.get("draft_tokens")) is not int
+        or request.arch["draft_tokens"] != draft_tokens
+    ):
+        raise ValueError("input_builder.draft_tokens must match explicit arch.draft_tokens")
     parsed = json.loads(request.parsed_nsys.read_text())
     if not isinstance(parsed, dict):
         raise ValueError(f"parsed NSYS root must be a JSON object: {request.parsed_nsys}")
-    speculative = request.arch.get("type") == "glm52_vllm_nvfp4_dsa_moe_speculative"
-    draft_tokens = request.arch.get("draft_tokens", 5) if speculative else None
     cases, case_map, excluded = build_cases(
         parsed,
         request.input_spec.measured_phase,

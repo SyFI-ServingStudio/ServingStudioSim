@@ -13,7 +13,7 @@ import pytest
 from alignment.nsys.parse import fold_rank_metrics
 from alignment.profiler.record_extraction import extract_metrics_jsonl
 from alignment.timing_predict_input import BuildRequest, build_inputs
-from alignment.timing_predict_input.builder import EngineTextInputSpec
+from alignment.timing_predict_input.builder import SpeculativeEngineTextInputSpec
 
 
 @pytest.fixture
@@ -154,6 +154,29 @@ def test_invalid_progress_is_rejected(request_details, tmp_path, field, value):
         extract(tmp_path, row)
 
 
+@pytest.mark.parametrize("draft_tokens", [None, 0, -1, True, 1.5])
+def test_speculative_input_requires_positive_explicit_depth(draft_tokens):
+    with pytest.raises(ValueError, match="positive integer"):
+        SpeculativeEngineTextInputSpec(draft_tokens=draft_tokens).validate()
+
+
+@pytest.mark.parametrize("arch_depth", [None, 1, True])
+def test_speculative_input_rejects_missing_or_mismatched_arch_depth_before_io(tmp_path, arch_depth):
+    request = BuildRequest(
+        simulation_preset=tmp_path / "unused.yaml",
+        profile_log_dir=tmp_path,
+        parsed_nsys=tmp_path / "absent.json",
+        output_dir=tmp_path / "must-not-exist",
+        gpu="NVIDIA B200",
+        arch={"type": "any_chain_model", "draft_tokens": arch_depth},
+        backends={},
+        input_spec=SpeculativeEngineTextInputSpec(draft_tokens=5),
+    )
+    with pytest.raises(ValueError, match="match explicit arch.draft_tokens"):
+        build_inputs(request)
+    assert not request.output_dir.exists()
+
+
 def test_producer_rejects_missing_or_impossible_output(request_details):
     with pytest.raises(ValueError, match="requires model output"):
         request_details(scheduled_batch(), None)
@@ -164,7 +187,10 @@ def test_producer_rejects_missing_or_impossible_output(request_details):
         request_details(scheduled_batch(), output)
 
 
-def test_request_records_reach_speculative_predict_cases(request_details, tmp_path):
+@pytest.mark.parametrize(
+    "arch_type", ["glm52_vllm_nvfp4_dsa_moe_speculative", "another_chain_model"]
+)
+def test_request_records_reach_speculative_predict_cases(request_details, tmp_path, arch_type):
     output = SimpleNamespace(
         req_id_to_index={"decode-a": 0, "decode-b": 1}, sampled_token_ids=[[1], [2]]
     )
@@ -186,7 +212,7 @@ def test_request_records_reach_speculative_predict_cases(request_details, tmp_pa
         )
     )
     arch = {
-        "type": "glm52_vllm_nvfp4_dsa_moe_speculative",
+        "type": arch_type,
         "draft_tokens": 5,
         "model_config": "model/config/glm52_nvfp4.json",
     }
@@ -199,11 +225,14 @@ def test_request_records_reach_speculative_predict_cases(request_details, tmp_pa
             gpu="NVIDIA B200",
             arch=arch,
             backends={},
-            input_spec=EngineTextInputSpec(),
+            input_spec=SpeculativeEngineTextInputSpec(draft_tokens=5),
         )
     )
     config = json.loads(result.predict_config.read_text())
     assert config["arch"] == {"speculative_iter": arch}
+    manifest = json.loads(result.input_manifest.read_text())
+    assert manifest["input_builder"]["type"] == "speculative_engine_text"
+    assert manifest["input_builder"]["draft_tokens"] == 5
     assert json.loads(result.cases.read_text()) == [
         {
             "groups": [

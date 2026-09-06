@@ -308,6 +308,28 @@ def _write_timing_artifacts(tmp_path: Path) -> Path:
     return result.input_manifest
 
 
+@pytest.mark.parametrize("depth", [1, 3, 5])
+def test_explicit_speculative_input_config_round_trip(tmp_path, depth):
+    paths = _phase_configs(tmp_path)
+    raw = yaml.safe_load(paths["timing"].read_text())
+    raw["input_builder"] = {"type": "speculative_engine_text", "draft_tokens": depth}
+    _write_config(paths["timing"], raw)
+    spec = alignment_launcher.load_timing_predict_config(paths["timing"]).input_builder
+    assert spec.to_mapping() == {
+        "type": "speculative_engine_text", "draft_tokens": depth,
+        "measured_phase": "forward", "group_assignment": "single",
+    }
+
+
+def test_speculative_input_config_has_no_implicit_depth(tmp_path):
+    paths = _phase_configs(tmp_path)
+    raw = yaml.safe_load(paths["timing"].read_text())
+    raw["input_builder"] = {"type": "speculative_engine_text"}
+    _write_config(paths["timing"], raw)
+    with pytest.raises(ValueError, match="draft_tokens"):
+        alignment_launcher.load_timing_predict_config(paths["timing"])
+
+
 def test_alignment_sim_runs_only_existing_simulation(tmp_path, monkeypatch):
     paths = _phase_configs(tmp_path)
     calls = []

@@ -69,7 +69,8 @@
         }
       ],
       "input_builder": {
-        "type": "engine_text",
+        "type": "speculative_engine_text",
+        "draft_tokens": 5,
         "measured_phase": "forward",
         "group_assignment": "per_dp_rank"
       },
@@ -129,7 +130,8 @@
         }
       ],
       "input_builder": {
-        "type": "engine_text",
+        "type": "speculative_engine_text",
+        "draft_tokens": 5,
         "measured_phase": "forward",
         "group_assignment": "per_dp_rank"
       },
@@ -189,7 +191,8 @@
         }
       ],
       "input_builder": {
-        "type": "engine_text",
+        "type": "speculative_engine_text",
+        "draft_tokens": 5,
         "measured_phase": "forward",
         "group_assignment": "per_dp_rank"
       },

@@ -283,6 +283,22 @@ input_builder:
   group_assignment: single
 ```
 
+For chain speculative verification, select the input contract explicitly:
+
+```yaml
+input_builder:
+  type: speculative_engine_text
+  draft_tokens: 5
+  measured_phase: forward
+  group_assignment: single
+```
+
+`draft_tokens` is required and must match the preset's explicit
+`arch.draft_tokens`. The builder never infers speculative semantics from an
+architecture name or assumes a draft depth. Existing speculative configs using
+`engine_text` must select `speculative_engine_text` before rebuilding inputs;
+ordinary `engine_text` and its legacy `vllm_text` alias remain unchanged.
+
 Timing prediction is kernel-only, so it reads the simulation **preset**
 (`simulation_preset`), not a completed run — it takes the gpu, arch, and backend
 policy straight from `simulation.yaml`. This lets it run before the simulation,
