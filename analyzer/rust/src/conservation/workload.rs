@@ -164,25 +164,28 @@ struct Expected {
     max_context_len: f64,
 }
 
+// Conservation follows the worker's execution contract, independent of model family.
+fn uses_speculative_worker(params: &Value) -> bool {
+    params
+        .get("pools")
+        .and_then(Value::as_object)
+        .is_some_and(|pools| {
+            pools.values().any(|pool| {
+                pool.get("groups")
+                    .and_then(Value::as_array)
+                    .is_some_and(|groups| {
+                        groups.iter().any(|group| group["worker"]["type"] == "speculative")
+                    })
+            })
+        })
+}
+
 pub async fn run_workload(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)> {
     let params_path = resolve_artifact_path(log_dir, "params.json");
     let mut speculative = false;
     if params_path.is_file() {
         let params: Value = serde_json::from_reader(std::fs::File::open(params_path)?)?;
-        speculative = params
-            .get("pools")
-            .and_then(Value::as_object)
-            .is_some_and(|pools| {
-                pools.values().any(|pool| {
-                    pool.get("groups")
-                        .and_then(Value::as_array)
-                        .is_some_and(|groups| {
-                            groups.iter().any(|group| {
-                                group["arch"]["type"] == "glm52_vllm_nvfp4_dsa_moe_speculative"
-                            })
-                        })
-                })
-            });
+        speculative = uses_speculative_worker(&params);
     }
     if !register_cost_log(ctx, log_dir).await? {
         let reason = "cost_log/ dir not found";
@@ -1468,6 +1471,31 @@ fn unavailable_payload(log_dir: &Path, reason: &str) -> Value {
 mod tests {
     use super::*;
 
+    #[test]
+    fn conservation_mode_follows_explicit_worker_not_model_name() {
+        for arch in ["glm52_vllm_nvfp4_dsa_moe_speculative", "another_model"] {
+            for worker in ["speculative", "chunked_prefill"] {
+                let params = json!({"pools": {"main": {"groups": [{
+                    "arch": {"type": arch}, "worker": {"type": worker}
+                }]}}});
+                assert_eq!(uses_speculative_worker(&params), worker == "speculative");
+            }
+        }
+        assert!(!uses_speculative_worker(&json!({})));
+        assert!(!uses_speculative_worker(&json!({"pools": {"main": {"groups": [{
+            "arch": {"type": "glm52_vllm_nvfp4_dsa_moe_speculative"}
+        }]}}})));
+    }
+
+    #[test]
+    fn conservation_mode_scans_all_pools_and_groups() {
+        let params = json!({"pools": {
+            "first": {"groups": [{"worker": {"type": "chunked_prefill"}}]},
+            "second": {"groups": [{}, {"worker": {"type": "speculative"}}]}
+        }});
+        assert!(uses_speculative_worker(&params));
+    }
+
     #[tokio::test]
     async fn speculative_run_requires_observed_work() {
         let directory = tempfile::tempdir().unwrap();
@@ -1475,9 +1503,10 @@ mod tests {
         std::fs::write(
             directory.path().join("raw/params.json"),
             json!({
-                "pools": {"main": {"groups": [{"arch": {
-                    "type": "glm52_vllm_nvfp4_dsa_moe_speculative"
-                }}]}}
+                "pools": {"main": {"groups": [{
+                    "arch": {"type": "another_model"},
+                    "worker": {"type": "speculative", "draft_tokens": 5}
+                }]}}
             })
             .to_string(),
         )
