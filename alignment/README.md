@@ -336,6 +336,17 @@ resolves the per-iteration owner from the operations present. One *operation*
 still keeps a single consistent `type`/`role`/`simulated_slots`.
 The labeled JSON is the only mapping source; there is no separate mapping YAML.
 
+An unmapped collective can declare `cross_rank: synchronizing` and a non-empty
+`collective` identity. This reviewed identity joins occurrences across rank
+sequences before arrival-wait subtraction; it does not claim any simulated slot
+or contribute to mapped coverage. Rules express this with `status: unmapped`,
+`operation` as the collective identity, and no slot/type/role fields. Match by
+phase and source-backed neighbors as for mapped operations. Unidentified
+unmapped rows remain separate; names alone never imply a cross-rank join.
+The report preserves raw residency mapping coverage and separately exposes
+`measured_critical_path_fraction`, whose denominator removes overlap and
+collective arrival wait on the same selected device as the timing comparison.
+
 ```json
 {
   "label": {

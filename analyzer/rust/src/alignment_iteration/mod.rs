@@ -270,6 +270,9 @@ struct EmbeddedLabel {
     /// this from a category or name; it only consumes what the labeler emits.
     #[serde(default)]
     cross_rank: Option<String>,
+    /// Reviewed collective identity without a simulated owner.
+    #[serde(default)]
+    collective: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -439,6 +442,7 @@ struct ExpandedRow {
     name: String,
     suggested_category: String,
     operation: Option<String>,
+    collective: Option<String>,
     synchronizing: bool,
 }
 
@@ -499,6 +503,7 @@ struct IterationKernelAggregate {
     source_row_ids: BTreeSet<String>,
     category: String,
     operation: Option<String>,
+    collective: Option<String>,
     operation_ordinal: Option<usize>,
     synchronizing: bool,
     launches: Vec<KernelLaunch>,
@@ -684,6 +689,7 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
     let mut unmapped_simulated: BTreeMap<String, f64> = BTreeMap::new();
     let mut measured_workload_ms = 0.0;
     let mut measured_mapped_ms = 0.0;
+    let mut measured_mapped_critical_ms = 0.0;
     let mut simulated_workload_ms = 0.0;
     let mut simulated_mapped_ms = 0.0;
 
@@ -813,6 +819,7 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
             // interval-union contributions after collective arrival-wait removal.
             measured_workload_ms += output.measured_kernel_sum_ms;
             measured_mapped_ms += output.measured_mapped_kernel_sum_ms;
+            measured_mapped_critical_ms += output.measured_mapped_critical_ms;
             let measured_critical_path_ms = output.measured_critical_path_ms;
             let simulated_ms = output.simulated_total_ms;
             let delta_ms = simulated_ms - measured_critical_path_ms;
@@ -1045,6 +1052,9 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
             "operations": mapping_operations,
             "coverage": {
                 "measured_duration_fraction": fraction(measured_mapped_ms, measured_workload_ms),
+                "measured_critical_path_fraction": fraction(measured_mapped_critical_ms, cumulative_measured),
+                "measured_mapped_critical_path_ms": measured_mapped_critical_ms,
+                "measured_total_critical_path_ms": cumulative_measured,
                 "simulated_workload_fraction": fraction(simulated_mapped_ms, simulated_workload_ms),
                 "measured_mapped_ms": measured_mapped_ms,
                 "measured_total_kernel_ms": measured_workload_ms,
@@ -1234,6 +1244,7 @@ struct BreakdownOutput {
     operation_stat_inputs: Vec<(String, Option<f64>, Option<f64>)>,
     measured_kernel_sum_ms: f64,
     measured_mapped_kernel_sum_ms: f64,
+    measured_mapped_critical_ms: f64,
     measured_critical_path_ms: f64,
     measured_physical_path_ms: f64,
     measured_concurrent_hidden_ms: f64,
@@ -1323,6 +1334,7 @@ fn build_breakdown(
             "operation_ordinal": item.operation_ordinal,
             "physical_kernels": physical_kernel_rows(item),
             "synchronizing": item.synchronizing,
+            "collective": item.collective,
             "calls": item.launches.len(),
             "rank_launches": item.launches.len(),
             "replica_calls": item.launches.len() as f64 / device_count as f64,
@@ -1477,6 +1489,7 @@ fn build_breakdown(
         operation_stat_inputs,
         measured_kernel_sum_ms,
         measured_mapped_kernel_sum_ms: measured_reduction.mapped_kernel_sum_ms,
+        measured_mapped_critical_ms: measured_reduction.mapped_ms,
         measured_critical_path_ms,
         measured_physical_path_ms,
         measured_concurrent_hidden_ms,
@@ -1756,6 +1769,7 @@ fn measure_iteration(
             item.source_row_ids.insert(sequence_row.row_id.clone());
             item.category = kernel.category.clone();
             item.synchronizing = sequence_row.synchronizing;
+            item.collective = sequence_row.collective.clone();
             item.launches.push(KernelLaunch {
                 device_id,
                 start_ns: kernel.start_ns,
@@ -1802,8 +1816,8 @@ fn measure_iteration(
 /// ordinal identifies the logical occurrence shared by other rank sequences.
 /// The category boundary prevents a rank that skips an auxiliary kernel from
 /// shifting every later position onto a different kind of physical work.
-/// Unmapped rows remain raw because they have no semantic identity that can
-/// justify a join.
+/// An explicitly identified unmapped collective is joined too, but retains no
+/// simulated owner. Other unmapped rows have no justified cross-rank identity.
 fn join_mapped_occurrences(
     inventory_kernels: &[(String, IterationKernelAggregate)],
 ) -> Result<Vec<(String, IterationKernelAggregate)>> {
@@ -1812,7 +1826,10 @@ fn join_mapped_occurrences(
     let mut joined = Vec::with_capacity(inventory_kernels.len());
 
     for (aggregate_key, item) in inventory_kernels {
-        let Some(operation) = item.operation.as_ref() else {
+        let identity = item.operation.clone().or_else(|| {
+            item.collective.as_ref().map(|name| format!("unmapped-collective/{name}"))
+        });
+        let Some(operation) = identity.as_ref() else {
             joined.push((aggregate_key.clone(), item.clone()));
             continue;
         };
@@ -2347,6 +2364,7 @@ fn compile_inventory(doc: FoldedSequenceDoc) -> Result<CompiledInventory> {
                         name: kernel.name,
                         suggested_category: kernel.suggested_category,
                         operation,
+                        collective: kernel.label.collective.clone(),
                         synchronizing,
                     });
                 }
@@ -2487,6 +2505,14 @@ fn compile_label(
     operations: &mut BTreeMap<String, OperationRule>,
     simulated_slots: &mut BTreeMap<String, BTreeSet<String>>,
 ) -> Result<Option<String>> {
+    if let Some(collective) = &label.collective {
+        ensure!(
+            label.status == "unmapped"
+                && label_is_synchronizing(label)?
+                && !collective.trim().is_empty(),
+            "collective identity requires an unmapped synchronizing label"
+        );
+    }
     if label.status == "unmapped" {
         ensure!(
             label.operation.is_none()
@@ -3219,6 +3245,7 @@ fn definitions() -> Value {
         "simulated_kernel_context": "present only when a slot name is not unique, and then it is the shallowest CostTree label that separates this occurrence from its namesakes (for Qwen3.6, `GDN layer` vs `gated-GQA layer`). One worklet built once and compiled into several tree positions gives its slots identical names by design -- ownership resolves by name, so both nodes get the same operation -- and this is what a reader needs to tell two identical rows apart. It is display context, never a join key",
         "simulated_kernel_critical_path_ms": "the leaf's contribution to timing-predict total_time_ms after exact CostTree Sum/Scale/Max/overlap attribution; an exact Max tie selects the first child",
         "mapping_coverage": "duration/workload fraction assigned by embedded labels; unmatched entries stay explicit and are never filled with zero. Measured coverage is scored against measured_kernel_sum_ms, NOT the concurrency-deducted critical path, so a fully-labeled concurrent capture reports 100% rather than more",
+        "measured_critical_path_fraction": "mapped contribution divided by the complete selected-device critical path, after overlap and collective arrival-wait removal; reported separately from raw residency coverage",
         "sequences": "the labelled kernel programs as the labeler wrote them, still folded: a `repeat{n}` band is one layer repeated, not n rows. Joined to a breakdown by row_id, which is `sequence_id:expanded_ordinal`",
         "breakdown_detail.byte_ranges": "iteration_id -> [byte offset, byte length] into the sibling .jsonl holding that iteration's measured and simulated kernel rows. Read that range and parse it as one JSON object; the whole file is never needed at once",
     })
@@ -3802,6 +3829,29 @@ mod tests {
     }
 
     #[test]
+    fn unmapped_collective_removes_arrival_wait_without_claiming_simulated_work() {
+        let mut rows = vec![
+            mapped_row("early/0", &[(1, 0, 3_000_010)], true),
+            mapped_row("late/0", &[(0, 3_000_000, 3_000_011)], true),
+        ];
+        for (_, row) in &mut rows {
+            row.operation = None;
+            row.collective = Some("draft.embedding".into());
+        }
+        let joined = join_mapped_occurrences(&rows).unwrap();
+        assert_eq!(joined.len(), 1);
+        assert!(joined[0].1.operation.is_none());
+        assert_eq!(occurrence_ns(&joined[0].1.launches, true), 11);
+        assert_eq!(joined[0].1.source_row_ids.len(), 2);
+
+        rows[1].1.collective = Some("draft.other".into());
+        assert_eq!(join_mapped_occurrences(&rows).unwrap().len(), 2);
+        rows[0].1.collective = None;
+        rows[1].1.collective = None;
+        assert_eq!(join_mapped_occurrences(&rows).unwrap().len(), 2);
+    }
+
+    #[test]
     fn occurrence_keeps_source_identity_and_adds_semantic_ordinal() {
         let joined = join_mapped_occurrences(&[mapped_row(
             "sequence-a/0",
@@ -3990,6 +4040,7 @@ mod tests {
                 kernel_type: None,
                 role: None,
                 cross_rank: None,
+                collective: None,
             },
         };
         let expanded = expand_nodes(&[ProgramNode::Repeat {
@@ -4016,6 +4067,7 @@ mod tests {
             kernel_type: Some("attention".into()),
             role: Some("attention main and combine".into()),
             cross_rank: None,
+            collective: None,
         };
         let mut operations = BTreeMap::new();
         let mut slots = BTreeMap::new();

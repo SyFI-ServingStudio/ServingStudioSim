@@ -734,7 +734,14 @@ def _validate_labeled_kernel(
     cross_rank = label.get("cross_rank")
     if cross_rank is not None and cross_rank not in {"synchronizing", "independent"}:
         raise ValueError(f"{context}.label.cross_rank must be synchronizing or independent")
-    mapping_keys = set(label) - {"cross_rank"}
+    collective = label.get("collective")
+    if "collective" in label:
+        _require_nonempty(collective, f"{context}.label.collective")
+        if label["status"] != "unmapped" or cross_rank != "synchronizing":
+            raise ValueError(
+                f"{context} collective identity requires an unmapped synchronizing label"
+            )
+    mapping_keys = set(label) - {"cross_rank", "collective"}
     if label["status"] == "unmapped":
         if mapping_keys != {"status"}:
             raise ValueError(f"{context} unmapped label cannot contain mapping fields")

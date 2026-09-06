@@ -76,6 +76,7 @@ class Rule:
     role: str
     slot_suffixes: tuple[str, ...]
     """Suffixes of the simulated slots this operation is compared against."""
+    excluded_slot_prefixes: tuple[str, ...] = ()
     after: str | None = None
     after_name: str | None = None
     before: str | None = None
@@ -83,6 +84,7 @@ class Rule:
     phase: str | None = None
     stream_role: str | None = None
     cross_rank: str = "independent"
+    status: str = "mapped"
     overwrite: bool = False
     """Replace an already-mapped label. Off by default: a pass that silently
     overrode earlier decisions would make the order of the rule file matter."""
@@ -103,6 +105,7 @@ class Rule:
             "type",
             "role",
             "slot_suffixes",
+            "excluded_slot_prefixes",
             "after",
             "after_name",
             "before",
@@ -110,19 +113,41 @@ class Rule:
             "phase",
             "stream_role",
             "cross_rank",
+            "status",
             "overwrite",
             "note",
             "source_experiment",
         }
         if unknown:
             raise ValueError(f"rule has unknown keys: {sorted(unknown)}")
-        for required in ("name", "operation", "type", "role", "slot_suffixes"):
+        status = record.get("status", "mapped")
+        if status not in {"mapped", "unmapped"}:
+            raise ValueError("rule status must be mapped or unmapped")
+        required_fields = ("name", "operation") if status == "unmapped" else (
+            "name", "operation", "type", "role", "slot_suffixes"
+        )
+        for required in required_fields:
             if not record.get(required):
                 raise ValueError(f"rule for {record.get('name')!r} has no {required}")
         cross_rank = record.get("cross_rank", "independent")
         if cross_rank not in CROSS_RANK_VALUES:
             raise ValueError(f"cross_rank must be one of {CROSS_RANK_VALUES}, got {cross_rank!r}")
+        if status == "unmapped" and (
+            cross_rank != "synchronizing"
+            or any(
+                key in record
+                for key in ("type", "role", "slot_suffixes", "excluded_slot_prefixes")
+            )
+        ):
+            raise ValueError(
+                "unmapped collective rules require synchronizing and no mapping fields"
+            )
         stream_role = record.get("stream_role")
+        excluded = record.get("excluded_slot_prefixes", [])
+        if not isinstance(excluded, list) or any(
+            not isinstance(prefix, str) or not prefix for prefix in excluded
+        ):
+            raise ValueError("excluded_slot_prefixes must be a list of non-empty strings")
         if stream_role is not None and stream_role not in STREAM_ROLE_VALUES:
             raise ValueError(
                 f"stream_role must be one of {STREAM_ROLE_VALUES}, got {stream_role!r}"
@@ -130,9 +155,10 @@ class Rule:
         return Rule(
             name=record["name"],
             operation=record["operation"],
-            type=record["type"],
-            role=record["role"],
-            slot_suffixes=tuple(record["slot_suffixes"]),
+            type=record.get("type", ""),
+            role=record.get("role", ""),
+            slot_suffixes=tuple(record.get("slot_suffixes", ())),
+            excluded_slot_prefixes=tuple(excluded),
             after=record.get("after"),
             after_name=record.get("after_name"),
             before=record.get("before"),
@@ -140,6 +166,7 @@ class Rule:
             phase=record.get("phase"),
             stream_role=stream_role,
             cross_rank=cross_rank,
+            status=status,
             overwrite=bool(record.get("overwrite", False)),
             note=record.get("note", ""),
             source_experiment=record.get("source_experiment", ""),
@@ -245,8 +272,16 @@ def label_body(rule: Rule, slots: list[tuple[str, str]]) -> dict:
     inventory loader rejects an operation whose kernels disagree, and it reports
     only the operation name, never which two labels differed.
     """
+    if rule.status == "unmapped":
+        return {
+            "status": "unmapped",
+            "cross_rank": "synchronizing",
+            "collective": rule.operation,
+        }
     resolved: list[str] = []
     for slot in slots_ending(slots, *rule.slot_suffixes):
+        if slot.startswith(rule.excluded_slot_prefixes):
+            continue
         if slot not in resolved:
             resolved.append(slot)
     return {
@@ -279,6 +314,9 @@ def apply_rules(document: dict, rules: list[Rule], slots: list[tuple[str, str]])
                 else None
             )
             fired.add(index)
+            if position.label == bodies[rule.operation]:
+                report.confirmed[rule.operation] += 1
+                break
             if mapped_operation is not None and not rule.overwrite:
                 if mapped_operation == rule.operation:
                     report.confirmed[rule.operation] += 1

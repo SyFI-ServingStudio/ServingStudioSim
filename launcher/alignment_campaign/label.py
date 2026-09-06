@@ -104,12 +104,16 @@ class LabelReport:
 def _label_state(document: dict) -> tuple:
     """The labeling decision, independent of how many times it was rewritten.
 
-    Only `status` and `operation` are compared: the rest of a label body is
-    derived from the rule that wrote it, so two rules producing the same
-    operation produce the same body.
+    Include synchronization identity even when there is no simulated owner.
     """
     return tuple(
-        (position.coordinate, position.label.get("status"), position.label.get("operation"))
+        (
+            position.coordinate,
+            position.label.get("status"),
+            position.label.get("operation"),
+            position.label.get("collective"),
+            position.label.get("cross_rank"),
+        )
         for position in walk_kernels(document)
     )
 
