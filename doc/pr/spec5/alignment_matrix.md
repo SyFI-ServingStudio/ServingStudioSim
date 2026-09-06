@@ -13,10 +13,12 @@ Every number is read from a completed Analyzer report by the formula table in
 | ep4_tp4_dp1/01_micro_throughput_c256 | +3.63% | -2.44% | 94.13% | -4.96% | +5.83% | -2.02% | +15.34% |
 | ep4_tp4_dp1/02_graph_boundaries_c128 | +6.42% | -5.25% | 88.33% | -7.75% | +8.00% | -3.90% | +2.40% |
 | ep4_tp4_dp1/03_balanced_anchor_c32 | +4.16% | -3.44% | 97.76% | -2.33% | +1.77% | -1.00% | -1.61% |
-| ep4_tp4_dp1/04_prefill_spectrum_c32 | +5.10% | -3.43% | 95.89% | — | — | — | — |
+| ep4_tp4_dp1/04_prefill_spectrum_c32 | +5.10% | -3.43% | 95.89% | -3.80% | +3.77% | +1.16% | -4.46% |
 | ep4_tp4_dp1/05_decode_spectrum_c64 | +6.71% | -5.64% | 73.80% | +1.33% | -3.15% | -18.79% | +55.82% |
 | ep4_tp4_dp1/06_long_long_c8 | +9.84% | +7.82% | 96.26% | +10.18% | -9.28% | +10.40% | -1.08% |
-| ep4_tp4_dp1/07_quadrant_interference_c48 | — | — | — | +1.78% | -3.45% | -6.12% | +7.86% |
+| ep4_tp4_dp1/07_quadrant_interference_c48 | +4.18% | -3.74% | 97.84% | +1.78% | -3.45% | -6.12% | +7.86% |
+| ep4_tp4_dp1/08_completion_churn_c96 | +6.35% | -5.28% | 93.54% | -3.00% | +0.46% | -6.06% | +8.19% |
+| ep4_tp4_dp1/09_rate_knee | — | — | — | +4.92% | -0.36% | +5.35% | -8.63% |
 
 ## Declared exceptions
 
@@ -28,8 +30,16 @@ Every number is read from a completed Analyzer report by the formula table in
 - `ep4_tp4_dp1/02_graph_boundaries_c128` **iterations_pct** -5.00% (tolerance 3.2): Historical concurrency 128: measured 2.92-3.00% iteration-population divergence, the same scheduler-contention effect as case 01.
 - `ep4_tp4_dp1/02_graph_boundaries_c128` **prefill_tokens_mean_pct** +5.26% (tolerance 3.2): Historical concurrency 128: measured 2.92-3.00% iteration-population divergence, the same scheduler-contention effect as case 01.
 - `ep4_tp4_dp1/02_graph_boundaries_c128` **scheduled_kv_mean_pct** +0.09% (tolerance 3.2): Historical concurrency 128: measured 2.92-3.00% iteration-population divergence, the same scheduler-contention effect as case 01.
+- `ep4_tp4_dp1/04_prefill_spectrum_c32` **decode_batch_mean_pct** +1.62% (tolerance 1.4): Historical concurrency 32 across the 2048-token chunk boundary: measured 1.25-1.29%. The chunk boundary makes admission decisions differ by one chunk more often than the neighbouring c32 case 03, which stays under 0.55%.
+- `ep4_tp4_dp1/04_prefill_spectrum_c32` **iterations_pct** -3.28% (tolerance 1.4): Historical concurrency 32 across the 2048-token chunk boundary: measured 1.25-1.29%. The chunk boundary makes admission decisions differ by one chunk more often than the neighbouring c32 case 03, which stays under 0.55%.
+- `ep4_tp4_dp1/04_prefill_spectrum_c32` **prefill_tokens_mean_pct** +3.39% (tolerance 1.4): Historical concurrency 32 across the 2048-token chunk boundary: measured 1.25-1.29%. The chunk boundary makes admission decisions differ by one chunk more often than the neighbouring c32 case 03, which stays under 0.55%.
+- `ep4_tp4_dp1/04_prefill_spectrum_c32` **scheduled_kv_mean_pct** +0.91% (tolerance 1.4): Historical concurrency 32 across the 2048-token chunk boundary: measured 1.25-1.29%. The chunk boundary makes admission decisions differ by one chunk more often than the neighbouring c32 case 03, which stays under 0.55%.
 - `ep4_tp4_dp1/06_long_long_c8` **kernel_abs_pct** +9.84% (tolerance 13.5): Historical long-prefill-plus-long-decode allowance, 12.94% in the original matrix. The inherited bound does not certify Spec5; inspect current per-operation errors and the campaign alignment review.
 - `ep4_tp4_dp1/06_long_long_c8` **kernel_signed_pct** +7.82% (tolerance 13.5): Historical long-prefill-plus-long-decode allowance, 12.94% in the original matrix. The inherited bound does not certify Spec5; inspect current per-operation errors and the campaign alignment review.
+- `ep4_tp4_dp1/09_rate_knee` **decode_batch_mean_pct** +4.61% (tolerance 3.7): Historical open-loop arrival at the queueing knee: measured 3.38-3.49%. This case also still runs on a provisional rate (see campaign.yaml), so the exact operating point is not yet the calibrated knee.
+- `ep4_tp4_dp1/09_rate_knee` **iterations_pct** -4.45% (tolerance 3.7): Historical open-loop arrival at the queueing knee: measured 3.38-3.49%. This case also still runs on a provisional rate (see campaign.yaml), so the exact operating point is not yet the calibrated knee.
+- `ep4_tp4_dp1/09_rate_knee` **prefill_tokens_mean_pct** +4.65% (tolerance 3.7): Historical open-loop arrival at the queueing knee: measured 3.38-3.49%. This case also still runs on a provisional rate (see campaign.yaml), so the exact operating point is not yet the calibrated knee.
+- `ep4_tp4_dp1/09_rate_knee` **scheduled_kv_mean_pct** +8.09% (tolerance 3.7): Historical open-loop arrival at the queueing knee: measured 3.38-3.49%. This case also still runs on a provisional rate (see campaign.yaml), so the exact operating point is not yet the calibrated knee.
 
 ## Out of tolerance
 
@@ -46,6 +56,9 @@ Every number is read from a completed Analyzer report by the formula table in
 - `ep4_tp4_dp1/02_graph_boundaries_c128` **e2e_mean_pct** -7.75% exceeds 7
 - `ep4_tp4_dp1/04_prefill_spectrum_c32` **kernel_abs_pct** +5.10% exceeds 5
 - `ep4_tp4_dp1/04_prefill_spectrum_c32` **map_coverage_pct** 95.89% exceeds 97
+- `ep4_tp4_dp1/04_prefill_spectrum_c32` **decode_batch_mean_pct** +1.62% exceeds 1.4
+- `ep4_tp4_dp1/04_prefill_spectrum_c32` **iterations_pct** -3.28% exceeds 1.4
+- `ep4_tp4_dp1/04_prefill_spectrum_c32` **prefill_tokens_mean_pct** +3.39% exceeds 1.4
 - `ep4_tp4_dp1/05_decode_spectrum_c64` **kernel_abs_pct** +6.71% exceeds 5
 - `ep4_tp4_dp1/05_decode_spectrum_c64` **kernel_signed_pct** -5.64% exceeds 5
 - `ep4_tp4_dp1/05_decode_spectrum_c64` **map_coverage_pct** 73.80% exceeds 97
@@ -64,3 +77,13 @@ Every number is read from a completed Analyzer report by the formula table in
 - `ep4_tp4_dp1/07_quadrant_interference_c48` **iterations_pct** +6.27% exceeds 1
 - `ep4_tp4_dp1/07_quadrant_interference_c48` **prefill_tokens_mean_pct** -5.90% exceeds 1
 - `ep4_tp4_dp1/07_quadrant_interference_c48` **scheduled_kv_mean_pct** -4.60% exceeds 1
+- `ep4_tp4_dp1/08_completion_churn_c96` **kernel_abs_pct** +6.35% exceeds 5
+- `ep4_tp4_dp1/08_completion_churn_c96` **kernel_signed_pct** -5.28% exceeds 5
+- `ep4_tp4_dp1/08_completion_churn_c96` **map_coverage_pct** 93.54% exceeds 97
+- `ep4_tp4_dp1/08_completion_churn_c96` **decode_batch_mean_pct** -2.65% exceeds 1
+- `ep4_tp4_dp1/08_completion_churn_c96` **iterations_pct** +2.42% exceeds 1
+- `ep4_tp4_dp1/08_completion_churn_c96` **prefill_tokens_mean_pct** -2.70% exceeds 1
+- `ep4_tp4_dp1/09_rate_knee` **decode_batch_mean_pct** +4.61% exceeds 3.7
+- `ep4_tp4_dp1/09_rate_knee` **iterations_pct** -4.45% exceeds 3.7
+- `ep4_tp4_dp1/09_rate_knee` **prefill_tokens_mean_pct** +4.65% exceeds 3.7
+- `ep4_tp4_dp1/09_rate_knee` **scheduled_kv_mean_pct** +8.09% exceeds 3.7

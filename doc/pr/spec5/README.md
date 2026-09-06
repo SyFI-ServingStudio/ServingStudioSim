@@ -25,20 +25,18 @@ a golden merely to remove a regression warning.
 
 ## Current Evidence
 
-Source: `logs/20260906_1_spec5_warm_matrix/extracted_current.json`, extracted with
-clean implementation `d47bcd4`. This snapshot predates the remaining workload retry.
+Source: `logs/20260906_1_spec5_warm_matrix/extracted_progress.json`, extracted with
+clean implementation `0eef224`; calibrated campaign inputs are committed in `f9ef858`.
+The snapshot includes completed case04/09 E2E and case07/08 kernel analysis.
 It is limited to the TP4/EP4 matrix; TP8 reproduction is separate evidence.
 
 Extraction SHA-256:
-`5ef457379450940bb31b7b099e556cae1e569beb926480aa666356c42e4f9c99`.
+`5f7dc7eabc6884b7c3d713a69c2bf9fc84082f3d0d06fb02eababbc69c0c587f`.
 
 | Cases | Evidence at snapshot |
 |---|---|
-| 01, 02, 03, 05, 06 | Full report sets available; failures remain in the generated comparison |
-| 04 | Kernel report available; warm workload retry pending |
-| 07 | Warm workload and E2E report available; kernel report pending |
-| 08 | Warm workload and simulation complete; E2E analysis pending |
-| 09 | Warm workload complete; simulation and analysis pending |
+| 01-08 | Full report sets available; failures remain in the generated comparison |
+| 09 | Warm workload, simulation and E2E available; kernel report pending |
 | 10, 13-17 | Warm workload pending |
 | 11, 12 | Previously observed framework KV-capacity failures; no successful warm result |
 
@@ -66,6 +64,13 @@ Per-request acceptance conditioned on observed outcomes is calibration, not an
 independent prediction. Keep the prepared trace manifest and request-population
 audit beside the simulation, and record explicit GPU-time multiplier sources and
 approximations. A successful audit does not certify timing accuracy.
+
+The refreshed campaign uses measured capacity with the FullIndex KV footprint.
+Previously completed simulations retain their snapshotted `raw/params.json`;
+cases01-03/05-08 used the earlier 55224 bytes/token conversion instead of 55932.
+Case04/09 use the corrected conversion. Do not claim those historical simulations
+were generated with the refreshed campaign. Case09 borrows warm case02's explicit
+time multiplier; its experiment `CALIBRATION.md` documents the approximation.
 
 ## Regeneration
 
