@@ -38,8 +38,8 @@ Extraction SHA-256:
 | Cases | Evidence at snapshot |
 |---|---|
 | 01-08 | Full report sets available; failures remain in the generated comparison |
-| 09, 10, 13 | Warm workload, simulation and E2E available; matching warm kernel reports absent |
-| 14-17 | Warm workload pending |
+| 09, 10, 13, 14 | Warm workload, simulation and E2E available; matching warm kernel reports absent |
+| 15-17 | Warm workload pending |
 | 11, 12 | Previously observed framework KV-capacity failures; no successful warm result |
 
 The current renderer lists cases with report values only. Absence from that table
@@ -80,6 +80,9 @@ standard matrix snapshot; `server_latency.md` already includes that result.
 Case13 also completed, with 48 requests and no missing acceptance samples. It uses
 the measured 474560-token KV capacity and explicitly borrows warm case06's time
 multiplier (same concurrency8/chunk4098, shorter context); see its `CALIBRATION.md`.
+Case14 completed 60 requests with no missing acceptance samples. It uses the
+measured 499776-token KV capacity and explicitly borrows warm case03's multiplier
+(same chunk4098, different concurrency/context), recorded in its `CALIBRATION.md`.
 Historical case09/10 NSYS uses 2048 chunks and remains separate from warm 2052 E2E.
 
 `kernel_evidence.md` likewise retains historical 4096/8192 captures for cases13-17,

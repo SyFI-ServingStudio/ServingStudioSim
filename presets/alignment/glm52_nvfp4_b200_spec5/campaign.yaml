@@ -913,7 +913,17 @@ cases:
   max_model_len: 65536
   max_concurrency: 21
   chunk_size: 4098
-  speculative_acceptance: *id001
+  speculative_acceptance:
+    value:
+    - 0.9226391212370659
+    - 0.7228719168817215
+    - 0.4497412076974121
+    - 0.4259619924457035
+    - 0.5067544163491514
+    status: measured
+    derived_from: Conditional accepted-token count ratios from the completed warm workload pass;
+      request-level rates are separately preserved in the prepared trace manifest.
+    evidence: logs/20260906_1_spec5_warm_matrix/14_near_full_long_decode_c21/trace_observed.csv.manifest.json
   profile_arrival_mode: saturated
   simulation_arrival_mode: saturated
   gpu_memory_utilization: 0.85
@@ -984,11 +994,11 @@ cases:
     repeats: 1
     id_suffix: nsys
   attn_gpu_memory_gb:
-    value: 37.686624768
-    status: provisional
-    derived_from: '`GPU KV cache size: C tokens` in the workload-only server log;
-      C * 55_224 / 1e9'
-    evidence: logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/14_near_full_long_decode_c21/profile_workload
+    value: 27.953471232
+    status: measured
+    derived_from: Warm workload KV capacity 499776 tokens; FullIndex uses 55932 bytes/token/rank,
+      so the per-rank worker budget is C * 55932 / 1e9 GB.
+    evidence: logs/20260906_1_spec5_warm_matrix/14_near_full_long_decode_c21/profile_workload/vllm/glm52_b200_ep4_14_near_full_long_decode_c21_workload_server.log
   provenance:
     accepted_run: logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/14_near_full_long_decode_c21
     capture_source: logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/14_near_full_long_decode_c21
