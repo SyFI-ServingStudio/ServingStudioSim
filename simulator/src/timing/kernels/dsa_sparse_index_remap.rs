@@ -15,7 +15,7 @@ use crate::timing::{KernelConfig, SweepCoords};
 const REQUIRED_SELECTED_K: u32 = 2048;
 const REQUIRED_BLOCK_SIZE: u32 = 64;
 const MAX_BLOCKS_PER_REQUEST: u32 = 16384;
-const MAX_QUERIES: u32 = 8192;
+pub(crate) const MAX_QUERIES: u32 = 16384;
 const MAX_REQUESTS: usize = 256;
 const MAX_LOCAL_SPAN: u32 = REQUIRED_BLOCK_SIZE * MAX_BLOCKS_PER_REQUEST;
 

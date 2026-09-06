@@ -434,8 +434,8 @@ def test_native_corrected_cache_builds_once_and_reuses_marker(monkeypatch, tmp_p
     [
         ({"batch_size": 0}, "1 <= batch_size <= 256"),
         ({"batch_size": 257}, "1 <= batch_size <= 256"),
-        ({"next_n": 0}, "next_n in \\[1, 2\\]"),
-        ({"next_n": 3}, "next_n in \\[1, 2\\]"),
+        ({"next_n": 0}, "next_n > 0"),
+        ({"next_n": -1}, "next_n > 0"),
         ({"context_len": -1}, "context_len must be >= 0"),
         (
             {"context_len": 0, "next_n": 2},
@@ -473,7 +473,7 @@ def test_rejects_unsupported_args_before_allocation(monkeypatch, overrides, matc
     ("overrides", "match"),
     [
         ({"batch_size": 0}, "1 <= batch_size <= 256"),
-        ({"next_n": 3}, "next_n in \\[1, 2\\]"),
+        ({"next_n": 0}, "next_n > 0"),
         ({"context_len": -1}, "context_len must be >= 0"),
         ({"max_model_len": 0}, "max_model_len must be > 0"),
         ({"top_k": 1024}, "top_k=2048"),
@@ -923,14 +923,15 @@ def test_native_loader_failures_translate_to_typed_profiler_errors(
         runner._load_native_op(torch)
 
 
-def test_native_profile_times_only_complete_op_and_returns_metrics(monkeypatch) -> None:
+@pytest.mark.parametrize("next_n", [1, 6])
+def test_native_profile_times_only_complete_op_and_returns_metrics(monkeypatch, next_n) -> None:
     from profiling.runners.attention import dsa_persistent_topk_decode as runner
 
     operands = runner._build_native_operands(
         torch,
         batch_size=1,
-        context_len=3,
-        next_n=1,
+        context_len=7,
+        next_n=next_n,
         max_model_len=8,
         top_k=4,
         logits_row_stride=8,
@@ -961,7 +962,7 @@ def test_native_profile_times_only_complete_op_and_returns_metrics(monkeypatch) 
     monkeypatch.setattr(runner.Timer, "cuda_event", fake_cuda_event)
     monkeypatch.setattr(runner.Energy, "perf", fake_energy)
     metrics = runner.profile_dsa_persistent_topk_decode_vllm_cuda(
-        **(_BASE_SPEC | {"batch_size": 1, "context_len": 3, "next_n": 1})
+        **(_BASE_SPEC | {"batch_size": 1, "context_len": 7, "next_n": next_n})
     )
 
     assert [event[0] for event in events] == ["sync", "timer", "op", "energy", "op"]

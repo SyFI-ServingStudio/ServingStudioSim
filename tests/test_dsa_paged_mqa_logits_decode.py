@@ -243,7 +243,7 @@ def test_runner_refs_resolve_without_importing_frameworks_or_running_jit():
         ({"context_len": 0}, "must be > 0"),
         ({"max_model_len": 0}, "must be > 0"),
         ({"context_len": 129}, "must be <= max_model_len"),
-        ({"next_n": 2}, "next_n=1"),
+        ({"next_n": 0}, "next_n > 0"),
         ({"num_heads": 16}, r"num_heads in \[32, 64\]"),
         ({"head_dim": 64}, r"head_dim == 128"),
         ({"block_size": 32}, r"block_size == 64"),
@@ -401,7 +401,7 @@ def test_deepgemm_entry_rejects_invalid_args_before_framework_loading(monkeypatc
         ({"context_len": 0}, "must be > 0"),
         ({"max_model_len": 0}, "must be > 0"),
         ({"context_len": 129}, "must be <= max_model_len"),
-        ({"next_n": 2}, "next_n=1"),
+        ({"next_n": -1}, "next_n > 0"),
         ({"num_heads": 16}, r"num_heads in \[32, 64\]"),
         ({"head_dim": 64}, r"head_dim == 128"),
         ({"block_size": 32}, r"block_size == 64"),
@@ -521,7 +521,8 @@ def test_deepgemm_loader_rejects_both_paged_entry_points_missing(monkeypatch):
         runner._load_deepgemm_backend()
 
 
-def test_deepgemm_adapter_and_callable_forwarding():
+@pytest.mark.parametrize("next_n", [1, 6])
+def test_deepgemm_adapter_and_callable_forwarding(next_n):
     from profiling.runners.attention.dsa_paged_mqa_logits_decode import (
         _build_operands,
         _prepare_deepgemm_call,
@@ -531,7 +532,7 @@ def test_deepgemm_adapter_and_callable_forwarding():
         torch,
         batch_size=2,
         context_len=65,
-        next_n=1,
+        next_n=next_n,
         max_model_len=128,
         num_heads=64,
         head_dim=128,
@@ -567,6 +568,7 @@ def test_deepgemm_adapter_and_callable_forwarding():
     assert runnable_context_lens.is_contiguous()
     assert torch.equal(runnable_context_lens, operands.context_lens[:, 0])
     assert actual_metadata is metadata
+    assert operands.q.shape == (2, next_n, 64, 128)
     assert torch.equal(operands.context_lens, original_contexts)
 
     assert kernel() == "output"
@@ -582,6 +584,17 @@ def test_deepgemm_adapter_and_callable_forwarding():
         128,
     )
     assert kwargs == {"clean_logits": False}
+
+
+def test_spec5_public_runner_reaches_backend_loading(monkeypatch):
+    from profiling.runners.attention import dsa_paged_mqa_logits_decode as runner
+
+    def backend_unavailable():
+        raise ProfilerNotImplemented("test backend unavailable")
+
+    monkeypatch.setattr(runner, "_load_deepgemm_backend", backend_unavailable)
+    with pytest.raises(ProfilerNotImplemented, match="test backend unavailable"):
+        runner.profile_dsa_paged_mqa_logits_decode_deepgemm_fp8(**(_BASE_SPEC | {"next_n": 6}))
 
 
 def test_deepgemm_launch_failure_is_typed(monkeypatch):

@@ -21,7 +21,6 @@ from profiling.runners.metrics import ComputeMetrics
 
 _MIN_BATCH_SIZE = 1
 _MAX_BATCH_SIZE = 256
-_SUPPORTED_NEXT_N = frozenset({1, 2})
 _TOP_K = 2048
 _LOGITS_DTYPE = DType.FP32
 _INDEX_DTYPE = "int32"
@@ -78,8 +77,8 @@ def _validate_args(
         raise ValueError(
             f"dsa_persistent_topk_decode requires 1 <= batch_size <= 256, got {batch_size}"
         )
-    if next_n not in _SUPPORTED_NEXT_N:
-        raise ValueError(f"dsa_persistent_topk_decode requires next_n in [1, 2], got {next_n}")
+    if next_n <= 0:
+        raise ValueError(f"dsa_persistent_topk_decode requires next_n > 0, got {next_n}")
     if context_len < 0:
         raise ValueError(f"context_len must be >= 0, got {context_len}")
     if context_len < next_n - 1:
