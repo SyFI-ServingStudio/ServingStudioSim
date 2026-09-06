@@ -29,6 +29,23 @@ must be separate from the timing pass because the reduction and D2H conversion
 are deliberate measurement overhead. Each request-timing record contains both
 first-token and decode-span timing.
 
+Raw expert-load schema v3 adds model role, maximum forwards per engine step and
+a monotonic observation timestamp. The extractor writes separate target/draft
+schema-v4 popularity summaries within the replay window. Iteration schema v4
+also records per-request query width, pre-forward KV, output progress and
+drafted/accepted/emitted counts. Explicit external IDs preserve client identity;
+an apparent random suffix alone is not sufficient reason to strip client text.
+These observations support alignment and acceptance diagnostics, not simulator
+placement policy.
+
+`output_tokens_before` is the scheduler's committed output count immediately
+before consuming this batch's sampled output. Async scheduler cache counts can
+include unconfirmed placeholders and must not supply this field. Queued work for
+a retired request remains in the record with `request_finished_before: true`;
+its committed count is `null` if the scheduler has already removed the request.
+Such work contributes to raw verification totals, but cannot advance effective
+client output when deriving per-request acceptance rates.
+
 Only its `.venv` is missing — build it once. `runner.py` defaults `fork_python`
 to `alignment/profiler/vllm/.venv/bin/python`; override `fork_python` in
 the align config to point elsewhere.

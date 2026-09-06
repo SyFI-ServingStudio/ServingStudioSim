@@ -21,6 +21,19 @@ analyze_e2e.yaml ─── alignment analyze (e2e-align) ──→ analysis_e2e/
 ```
 
 No phase implicitly launches the next one. YAML and JSON are both accepted.
+
+Set `workload.warmup: true` to warm all input shapes before measurement.
+Independent warmup requests cap output at 32 tokens and use saturated arrivals;
+the measured workload retains its original output lengths and arrival policy.
+This requires vLLM with `server.enable_server_load_tracking: true`; NSYS passes
+must use `cuda_profiler_api`. The launcher enables `VLLM_SERVER_DEV_MODE=1` for
+the cache management endpoint. Req-frontend drains the warmup and resets prefix
+caching, then hands control to the launcher before submitting measured requests.
+Warmup records stay in separate frontend files. The complete server log remains
+raw evidence; its persisted measurement byte offset produces a separate
+measurement log for iteration, request and popularity extraction, including resume.
+Acceptance counter snapshots and the capture timer start at this same boundary.
+
 `simulation.yaml` remains an ordinary VibeSim preset. Paths in the other configs
 are resolved relative to the declaring config file.
 
@@ -200,7 +213,10 @@ has timing-predict or analysis fields.
 
 ### Expert-popularity artifact contract
 
-New captures write schema v3, formally described by
+Role-selected vLLM captures write schema v4, including separate target and draft
+artifacts, described by
+[`expert_popularity_v4.schema.json`](schema/expert_popularity_v4.schema.json).
+Other captures retain schema v3, formally described by
 [`alignment/schema/expert_popularity_v3.schema.json`](schema/expert_popularity_v3.schema.json).
 The authoritative tensor is `counts_by_layer[layer][logical_expert]`; each value
 is a nonnegative count of routed token-expert assignments, so one input token
@@ -230,10 +246,16 @@ its TP group. These are examples, not engine defaults. The summary records the
 raw, accepted, and discarded record counts and the discarded EPLB steps, so
 this filtering is auditable rather than implicit.
 
-The Rust consumer treats v2 and v3 as closed contracts and rejects unknown
-fields or cross-field inconsistencies. Schemas v1 and v2 remain read-only
-compatibility for existing run directories; the profiler generates v3.
-The instrumented vLLM raw record is also version 2 and supplies
+For schema v4, aggregation first selects the model role and exact monotonic
+replay window. The ceiling additionally multiplies by `max_forwards_per_step`
+so repeated draft forwards are retained. Target and draft are written to
+`expert_popularity.json` and `draft_expert_popularity.json`; replay counter
+deltas are recorded separately in `spec_decode_metrics.json`.
+
+The Rust consumer treats v2-v4 as closed contracts and rejects unknown fields,
+role mismatches or cross-field inconsistencies. Historical schemas remain
+readable. Instrumented vLLM raw schema v3 adds `model_role`,
+`max_forwards_per_step` and `observed_monotonic_ns` alongside
 `expert_parallel_size` and `experts_per_token` from the running EPLB state;
 the summary extractor verifies the recorded expert degree against YAML and
 checks that these values remain constant across the capture. The count-reduction

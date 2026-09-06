@@ -90,6 +90,7 @@ class LoadGeneratorConfig:
     tokenizer: str
     backend: BackendConfig = field(default_factory=OpenAIBackendConfig)
     max_items: int | None = None
+    warmup: bool = False
     rate: float | None = None
     # Where release times come from. Orthogonal to `max_concurrency`, which caps
     # how many units run at once rather than when they may start.
@@ -107,6 +108,8 @@ class LoadGeneratorConfig:
     ARRIVAL_MODES: ClassVar[tuple[str, ...]] = ("trace-timed", "saturated")
 
     def __post_init__(self) -> None:
+        if not isinstance(self.warmup, bool):
+            raise ValueError("warmup must be a boolean")
         if self.context_limit_skip_enabled and self.max_model_len is None:
             raise ValueError(
                 "skip_when_reaching_limit requires max_model_len"

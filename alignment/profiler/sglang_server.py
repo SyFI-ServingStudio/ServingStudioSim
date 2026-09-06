@@ -195,9 +195,7 @@ def build_server_env(
         library_paths.append(str(torch_lib))
         break
     if library_paths:
-        env["LD_LIBRARY_PATH"] = os.pathsep.join(
-            [*library_paths, env.get("LD_LIBRARY_PATH", "")]
-        )
+        env["LD_LIBRARY_PATH"] = os.pathsep.join([*library_paths, env.get("LD_LIBRARY_PATH", "")])
     return env
 
 
@@ -259,6 +257,11 @@ def write_launch_metadata(
     Path(path).write_text(json.dumps(metadata, indent=2))
 
 
+def speculative_decode_enabled(cfg: ServerConfig) -> bool:
+    # No speculative alignment capture contract is implemented for this driver.
+    return False
+
+
 def _get(url: str, timeout: float = 5.0):
     try:
         with urllib.request.urlopen(url, timeout=timeout) as response:
@@ -267,9 +270,7 @@ def _get(url: str, timeout: float = 5.0):
         return None, None
 
 
-def set_cuda_profile(
-    base_url: str, *, active: bool, timeout: float | None = None
-) -> None:
+def set_cuda_profile(base_url: str, *, active: bool, timeout: float | None = None) -> None:
     """Arm or disarm the worker-owned CUDA profiler through SGLang's HTTP API.
 
     `activities=["CUDA_PROFILER"]` selects the `cudaProfilerStart/Stop` profiler
