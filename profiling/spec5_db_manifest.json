@@ -1,0 +1,2059 @@
+{
+  "purpose": "Preserve the exact warm-matrix prediction cache; not a claim that every historical row was revalidated.",
+  "snapshot_sha256": "b0fc741fec9a1faf31438b8a4b4167fe74c755ca6b5598fd8001848294f04779",
+  "integrity_check": "ok",
+  "source_code_commit": "c668abd",
+  "row_comparison": {
+    "conflicts": [],
+    "left": {
+      "metadata": {
+        "created_at": "2026-05-22 11:48:48",
+        "last_migrated_at": "2026-08-28 11:42:39",
+        "schema_hash": "l1-python-metric-family-v2",
+        "schema_version": "2"
+      },
+      "path": "/raid/kanzhu/VibeSimWorkspace/wt-glm52-spec5-clean/profiling/profile.db",
+      "sha256": "d9f059f3e1160bc3294f85f9f25c1883d5ddad18823dbbd41d761c9e05ea8af9"
+    },
+    "output": {
+      "path": "/raid/tmp/kanzhu/spec5-clean-equivalence/review-union.db",
+      "published": true,
+      "sha256": "a3c7adbb46fc8421daa2382b9d3a9545be0651a03a0cdb3718d53cdee6f9eb04"
+    },
+    "report_schema_version": 1,
+    "right": {
+      "metadata": {
+        "created_at": "2026-05-22 11:48:48",
+        "last_migrated_at": "2026-09-06 11:36:48",
+        "schema_hash": "l1-python-metric-family-v2",
+        "schema_version": "2"
+      },
+      "path": "/raid/tmp/kanzhu/spec5-clean-equivalence/warm-matrix.db",
+      "sha256": "f7152017c43ded4e8fc8e5870c2bb81e636dd3ecc722ede6272d3bc483e32345"
+    },
+    "summary": {
+      "conflict_rows": 0,
+      "duplicate_rows": 66174,
+      "inserted_rows": 21680,
+      "left_rows": 66174,
+      "right_rows": 87854,
+      "table_count": 76
+    },
+    "tables": [
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 171,
+        "inserted_rows": 0,
+        "left_rows": 171,
+        "right_rows": 171,
+        "table": "all_reduce"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 39,
+        "inserted_rows": 0,
+        "left_rows": 39,
+        "right_rows": 39,
+        "table": "all_reduce_fusion"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 47,
+        "inserted_rows": 0,
+        "left_rows": 47,
+        "right_rows": 47,
+        "table": "all_reduce_residual_rms_norm"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 544,
+        "inserted_rows": 0,
+        "left_rows": 544,
+        "right_rows": 544,
+        "table": "batched_gemm"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 0,
+        "inserted_rows": 828,
+        "left_rows": 0,
+        "right_rows": 828,
+        "table": "bf16_fused_moe"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 68,
+        "inserted_rows": 0,
+        "left_rows": 68,
+        "right_rows": 68,
+        "table": "clamped_swiglu"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 57,
+        "inserted_rows": 0,
+        "left_rows": 57,
+        "right_rows": 57,
+        "table": "deepseek_v4_fused_inv_rope_fp8_quant"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 68,
+        "inserted_rows": 0,
+        "left_rows": 68,
+        "right_rows": 68,
+        "table": "deepseek_v4_fused_q_kv_rmsnorm"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 374,
+        "inserted_rows": 0,
+        "left_rows": 374,
+        "right_rows": 374,
+        "table": "deepseek_v4_indexer_mqa_logits_decode"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 311,
+        "inserted_rows": 0,
+        "left_rows": 311,
+        "right_rows": 311,
+        "table": "deepseek_v4_indexer_mqa_logits_prefill"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 22,
+        "inserted_rows": 0,
+        "left_rows": 22,
+        "right_rows": 22,
+        "table": "deepseek_v4_indexer_q_rope_quant"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 189,
+        "inserted_rows": 0,
+        "left_rows": 189,
+        "right_rows": 189,
+        "table": "deepseek_v4_indexer_topk_decode"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 311,
+        "inserted_rows": 0,
+        "left_rows": 311,
+        "right_rows": 311,
+        "table": "deepseek_v4_indexer_topk_prefill"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 2,
+        "inserted_rows": 0,
+        "left_rows": 2,
+        "right_rows": 2,
+        "table": "deepseek_v4_packed_cache_gather"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 339,
+        "inserted_rows": 0,
+        "left_rows": 339,
+        "right_rows": 339,
+        "table": "deepseek_v4_qnorm_rope_kv_insert"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 361,
+        "inserted_rows": 0,
+        "left_rows": 361,
+        "right_rows": 361,
+        "table": "deepseek_v4_sparse_attn_compress_store"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 386,
+        "inserted_rows": 0,
+        "left_rows": 386,
+        "right_rows": 386,
+        "table": "deepseek_v4_sparse_mla_decode"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 1131,
+        "inserted_rows": 0,
+        "left_rows": 1131,
+        "right_rows": 1131,
+        "table": "deepseek_v4_sparse_mla_prefill"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 68,
+        "inserted_rows": 0,
+        "left_rows": 68,
+        "right_rows": 68,
+        "table": "deepseek_v4_terminal_mhc_head"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 279,
+        "inserted_rows": 0,
+        "left_rows": 279,
+        "right_rows": 279,
+        "table": "dsa_index_cache_append"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 68,
+        "inserted_rows": 0,
+        "left_rows": 68,
+        "right_rows": 68,
+        "table": "dsa_indexer_q_rope_quant"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 1053,
+        "inserted_rows": 717,
+        "left_rows": 1053,
+        "right_rows": 1770,
+        "table": "dsa_mqa_logits_prefill"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 4262,
+        "inserted_rows": 7683,
+        "left_rows": 4262,
+        "right_rows": 11945,
+        "table": "dsa_paged_mqa_logits_decode"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 7462,
+        "inserted_rows": 7480,
+        "left_rows": 7462,
+        "right_rows": 14942,
+        "table": "dsa_persistent_topk_decode"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 1622,
+        "inserted_rows": 270,
+        "left_rows": 1622,
+        "right_rows": 1892,
+        "table": "dsa_sparse_index_remap"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 9127,
+        "inserted_rows": 3170,
+        "left_rows": 9127,
+        "right_rows": 12297,
+        "table": "dsa_sparse_mla_attention"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 972,
+        "inserted_rows": 0,
+        "left_rows": 972,
+        "right_rows": 972,
+        "table": "dsa_sparse_mla_prefill"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 1291,
+        "inserted_rows": 0,
+        "left_rows": 1291,
+        "right_rows": 1291,
+        "table": "dsa_topk_prefill"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 3304,
+        "inserted_rows": 41,
+        "left_rows": 3304,
+        "right_rows": 3345,
+        "table": "elementwise"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 3240,
+        "inserted_rows": 0,
+        "left_rows": 3240,
+        "right_rows": 3240,
+        "table": "flashinfer_attn_decode"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 2295,
+        "inserted_rows": 0,
+        "left_rows": 2295,
+        "right_rows": 2295,
+        "table": "flashinfer_attn_prefill"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 748,
+        "inserted_rows": 0,
+        "left_rows": 748,
+        "right_rows": 748,
+        "table": "fp8_block_quant"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 3378,
+        "inserted_rows": 0,
+        "left_rows": 3378,
+        "right_rows": 3378,
+        "table": "fp8_blockscale_grouped_gemm"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 544,
+        "inserted_rows": 0,
+        "left_rows": 544,
+        "right_rows": 544,
+        "table": "fp8_per_token_group_quant"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 18,
+        "inserted_rows": 0,
+        "left_rows": 18,
+        "right_rows": 18,
+        "table": "gdn_causal_conv_decode"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 208,
+        "inserted_rows": 0,
+        "left_rows": 208,
+        "right_rows": 208,
+        "table": "gdn_causal_conv_prefill"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 42,
+        "inserted_rows": 0,
+        "left_rows": 42,
+        "right_rows": 42,
+        "table": "gdn_chunk_delta_rule"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 196,
+        "inserted_rows": 0,
+        "left_rows": 196,
+        "right_rows": 196,
+        "table": "gdn_chunk_local_cumsum"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 31,
+        "inserted_rows": 0,
+        "left_rows": 31,
+        "right_rows": 31,
+        "table": "gdn_chunk_output"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 196,
+        "inserted_rows": 0,
+        "left_rows": 196,
+        "right_rows": 196,
+        "table": "gdn_chunk_recompute_w_u"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 203,
+        "inserted_rows": 0,
+        "left_rows": 203,
+        "right_rows": 203,
+        "table": "gdn_chunk_scaled_dot_kkt"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 178,
+        "inserted_rows": 0,
+        "left_rows": 178,
+        "right_rows": 178,
+        "table": "gdn_chunk_solve_tril"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 103,
+        "inserted_rows": 0,
+        "left_rows": 103,
+        "right_rows": 103,
+        "table": "gdn_chunk_state_update"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 29,
+        "inserted_rows": 0,
+        "left_rows": 29,
+        "right_rows": 29,
+        "table": "gdn_gated_rms_norm"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 51,
+        "inserted_rows": 0,
+        "left_rows": 51,
+        "right_rows": 51,
+        "table": "gdn_prefill_post_conv"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 18,
+        "inserted_rows": 0,
+        "left_rows": 18,
+        "right_rows": 18,
+        "table": "gdn_recurrent_decode"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 340,
+        "inserted_rows": 0,
+        "left_rows": 340,
+        "right_rows": 340,
+        "table": "gemm_fp32_output"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 2858,
+        "inserted_rows": 0,
+        "left_rows": 2858,
+        "right_rows": 2858,
+        "table": "grouped_gemm"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 571,
+        "inserted_rows": 0,
+        "left_rows": 571,
+        "right_rows": 571,
+        "table": "kv_cache_append"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 68,
+        "inserted_rows": 0,
+        "left_rows": 68,
+        "right_rows": 68,
+        "table": "mhc_fused_post_pre_rms_norm"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 68,
+        "inserted_rows": 0,
+        "left_rows": 68,
+        "right_rows": 68,
+        "table": "mhc_pre_rms_norm"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 349,
+        "inserted_rows": 0,
+        "left_rows": 349,
+        "right_rows": 349,
+        "table": "mla_cache_append"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 69,
+        "inserted_rows": 0,
+        "left_rows": 69,
+        "right_rows": 69,
+        "table": "mla_rope_quantize_fp8"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 126,
+        "inserted_rows": 0,
+        "left_rows": 126,
+        "right_rows": 126,
+        "table": "moe_align_block_size"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 470,
+        "inserted_rows": 0,
+        "left_rows": 470,
+        "right_rows": 470,
+        "table": "moe_alltoall"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 68,
+        "inserted_rows": 0,
+        "left_rows": 68,
+        "right_rows": 68,
+        "table": "moe_alltoall_prepare"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 15,
+        "inserted_rows": 0,
+        "left_rows": 15,
+        "right_rows": 15,
+        "table": "moe_ep_all_gather"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 15,
+        "inserted_rows": 0,
+        "left_rows": 15,
+        "right_rows": 15,
+        "table": "moe_ep_reduce_scatter"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 68,
+        "inserted_rows": 0,
+        "left_rows": 68,
+        "right_rows": 68,
+        "table": "moe_finalize_fuse_shared"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 2087,
+        "inserted_rows": 0,
+        "left_rows": 2087,
+        "right_rows": 2087,
+        "table": "moe_finalize_routing"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 42,
+        "inserted_rows": 0,
+        "left_rows": 42,
+        "right_rows": 42,
+        "table": "moe_fused_topk"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 68,
+        "inserted_rows": 0,
+        "left_rows": 68,
+        "right_rows": 68,
+        "table": "moe_sum"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 136,
+        "inserted_rows": 0,
+        "left_rows": 136,
+        "right_rows": 136,
+        "table": "moe_topk_softplus_sqrt"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 157,
+        "inserted_rows": 0,
+        "left_rows": 157,
+        "right_rows": 157,
+        "table": "mxfp4_marlin_moe_gemm"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 1971,
+        "inserted_rows": 1360,
+        "left_rows": 1971,
+        "right_rows": 3331,
+        "table": "nvfp4_fused_moe"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 272,
+        "inserted_rows": 0,
+        "left_rows": 272,
+        "right_rows": 272,
+        "table": "nvfp4_moe"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 1212,
+        "inserted_rows": 0,
+        "left_rows": 1212,
+        "right_rows": 1212,
+        "table": "nvfp4_moe_bmm"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 68,
+        "inserted_rows": 0,
+        "left_rows": 68,
+        "right_rows": 68,
+        "table": "nvfp4_moe_routing"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 204,
+        "inserted_rows": 0,
+        "left_rows": 204,
+        "right_rows": 204,
+        "table": "nvfp4_quant"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 38,
+        "inserted_rows": 0,
+        "left_rows": 38,
+        "right_rows": 38,
+        "table": "p2p_inter"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 38,
+        "inserted_rows": 0,
+        "left_rows": 38,
+        "right_rows": 38,
+        "table": "p2p_intra"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 272,
+        "inserted_rows": 0,
+        "left_rows": 272,
+        "right_rows": 272,
+        "table": "residual_rms_norm"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 441,
+        "inserted_rows": 63,
+        "left_rows": 441,
+        "right_rows": 504,
+        "table": "rms_norm"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 8279,
+        "inserted_rows": 68,
+        "left_rows": 8279,
+        "right_rows": 8347,
+        "table": "single_gemm"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 194,
+        "inserted_rows": 0,
+        "left_rows": 194,
+        "right_rows": 194,
+        "table": "vllm_fused_moe"
+      },
+      {
+        "conflict_rows": 0,
+        "duplicate_rows": 204,
+        "inserted_rows": 0,
+        "left_rows": 204,
+        "right_rows": 204,
+        "table": "vllm_mla_rope"
+      }
+    ]
+  },
+  "provenance_audit": {
+    "total_rows": 87854,
+    "candidate_rows": 6268,
+    "unverifiable_rows": 38669,
+    "findings": [
+      {
+        "table": "dsa_sparse_mla_attention",
+        "backend": "vllm_flashmla_bf16",
+        "profiler_git_hash": "83add7009950edfdca18329f160cde6b218b3a7b",
+        "rows": 4592,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "dsa_sparse_mla_attention",
+        "backend": "vllm_flashmla_bf16",
+        "profiler_git_hash": "dd188435d7a4f72c3e4b0a8af63b36243de309c7",
+        "rows": 2144,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "dsa_paged_mqa_logits_decode",
+        "backend": "deepgemm_fp8",
+        "profiler_git_hash": "3cf621bbed55499a5386bd67a4bf73d19bf9003a",
+        "rows": 1331,
+        "verdict": "backend_not_directly_registered"
+      },
+      {
+        "table": "dsa_paged_mqa_logits_decode",
+        "backend": "deepgemm_fp8",
+        "profiler_git_hash": "223c9e08ebfe0e8c6676116738c3785d25007d0e",
+        "rows": 1296,
+        "verdict": "backend_not_directly_registered"
+      },
+      {
+        "table": "fp8_blockscale_grouped_gemm",
+        "backend": "flashinfer_trtllm",
+        "profiler_git_hash": "32308b4a15b7c0a046880496012fb9cb19d04d49",
+        "rows": 1184,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "deepseek_v4_sparse_mla_prefill",
+        "backend": "vllm_flashmla_bf16",
+        "profiler_git_hash": "44964939c0e6ec60b376bfd53dca7ec4e874f2f1",
+        "rows": 1131,
+        "verdict": "module_absent"
+      },
+      {
+        "table": "fp8_blockscale_grouped_gemm",
+        "backend": "flashinfer_trtllm",
+        "profiler_git_hash": "22e3e0ee34d45b902997278fced849368f28535b",
+        "rows": 1068,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "dsa_persistent_topk_decode",
+        "backend": "vllm_cuda",
+        "profiler_git_hash": "f9527804d9ab5532357f5aa7f5dc525be3c35f3c",
+        "rows": 995,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "elementwise",
+        "backend": "triton",
+        "profiler_git_hash": "48864532c291e5cd48d01efb515d63733496e420",
+        "rows": 837,
+        "verdict": "module_unreadable"
+      },
+      {
+        "table": "nvfp4_fused_moe",
+        "backend": "flashinfer_trtllm_sm100",
+        "profiler_git_hash": "a6d3e397df47735eb013c04c9caec1fb21efe955",
+        "rows": 810,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "nvfp4_moe_bmm",
+        "backend": "flashinfer_trtllm_sm100",
+        "profiler_git_hash": "a6d3e397df47735eb013c04c9caec1fb21efe955",
+        "rows": 670,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "single_gemm",
+        "backend": "deepgemm",
+        "profiler_git_hash": "abb0d647c24f3b38adde678ca972a7342d1dbeda",
+        "rows": 617,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "dsa_persistent_topk_decode",
+        "backend": "vllm_cuda",
+        "profiler_git_hash": "6aaf9f73b95827251be81708691969a435e997da",
+        "rows": 578,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "nvfp4_moe_bmm",
+        "backend": "flashinfer_trtllm_sm100",
+        "profiler_git_hash": "ca35feef1bf909d6c0bb650cc2a0fe3a3c9b9c1e",
+        "rows": 542,
+        "verdict": "module_absent"
+      },
+      {
+        "table": "fp8_blockscale_grouped_gemm",
+        "backend": "flashinfer_trtllm",
+        "profiler_git_hash": "31b8a241a807bd646dd8633c16b2fe13234b9c2e",
+        "rows": 536,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "elementwise",
+        "backend": "triton",
+        "profiler_git_hash": "f98cf69e9666726d90f402afcbdea23c89a488d8",
+        "rows": 529,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "moe_finalize_routing",
+        "backend": "flashinfer_trtllm",
+        "profiler_git_hash": "22e3e0ee34d45b902997278fced849368f28535b",
+        "rows": 510,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "single_gemm",
+        "backend": "deepgemm",
+        "profiler_git_hash": "48b9e83e5f5550972cc21989d9f7b529f71113ab",
+        "rows": 504,
+        "verdict": "backend_not_directly_registered"
+      },
+      {
+        "table": "single_gemm",
+        "backend": "torch_linear",
+        "profiler_git_hash": "392e9b6a9b02e824a13ae3ab181c141baa0ca996",
+        "rows": 476,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "moe_alltoall",
+        "backend": "flashinfer_mnnvl",
+        "profiler_git_hash": "2656c7b1e51084eb976e483bb3b6108f4a103c5f",
+        "rows": 470,
+        "verdict": "module_absent"
+      },
+      {
+        "table": "dsa_sparse_mla_prefill",
+        "backend": "flashinfer_trtllm_fp8",
+        "profiler_git_hash": "5cb3ed35a7aa6bebe14755ad1f9ac4a986d9fcc4",
+        "rows": 430,
+        "verdict": "module_absent"
+      },
+      {
+        "table": "deepseek_v4_sparse_mla_decode",
+        "backend": "vllm_flashmla_fp8_cudagraph",
+        "profiler_git_hash": "44964939c0e6ec60b376bfd53dca7ec4e874f2f1",
+        "rows": 386,
+        "verdict": "module_absent"
+      },
+      {
+        "table": "deepseek_v4_indexer_mqa_logits_decode",
+        "backend": "vllm_deepgemm_fp8",
+        "profiler_git_hash": "44964939c0e6ec60b376bfd53dca7ec4e874f2f1",
+        "rows": 374,
+        "verdict": "module_absent"
+      },
+      {
+        "table": "dsa_paged_mqa_logits_decode",
+        "backend": "deepgemm_fp8",
+        "profiler_git_hash": "17efbdb2ca93291afe313fde5b667109c4925dd4",
+        "rows": 374,
+        "verdict": "backend_not_directly_registered"
+      },
+      {
+        "table": "dsa_paged_mqa_logits_decode",
+        "backend": "deepgemm_fp8",
+        "profiler_git_hash": "48864532c291e5cd48d01efb515d63733496e420",
+        "rows": 374,
+        "verdict": "backend_not_directly_registered"
+      },
+      {
+        "table": "dsa_persistent_topk_decode",
+        "backend": "vllm_cuda",
+        "profiler_git_hash": "ed673a7bf43e3ae1ef83215996af04dc05ce26be",
+        "rows": 362,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "dsa_persistent_topk_decode",
+        "backend": "vllm_cuda",
+        "profiler_git_hash": "a5bb0aeed7f9cbde9d62a81df7a115b921b685dd",
+        "rows": 359,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "fp8_block_quant",
+        "backend": "flashinfer_trtllm",
+        "profiler_git_hash": "abb0d647c24f3b38adde678ca972a7342d1dbeda",
+        "rows": 340,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "single_gemm",
+        "backend": "deepgemm",
+        "profiler_git_hash": "c3bd620d8ea4759fb28c5c372aca40f6242c1447",
+        "rows": 340,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "deepseek_v4_qnorm_rope_kv_insert",
+        "backend": "vllm_cuda",
+        "profiler_git_hash": "44964939c0e6ec60b376bfd53dca7ec4e874f2f1",
+        "rows": 339,
+        "verdict": "module_absent"
+      },
+      {
+        "table": "dsa_mqa_logits_prefill",
+        "backend": "deepgemm_fp8",
+        "profiler_git_hash": "48864532c291e5cd48d01efb515d63733496e420",
+        "rows": 335,
+        "verdict": "backend_not_directly_registered"
+      },
+      {
+        "table": "dsa_mqa_logits_prefill",
+        "backend": "deepgemm_fp8",
+        "profiler_git_hash": "f554be2fe8e1bf20ef0610238296afff147f3382",
+        "rows": 335,
+        "verdict": "backend_not_directly_registered"
+      },
+      {
+        "table": "dsa_topk_prefill",
+        "backend": "vllm_cuda",
+        "profiler_git_hash": "9113b42f5b07614e92664e1f83e6fc2974ea2bb6",
+        "rows": 333,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "dsa_paged_mqa_logits_decode",
+        "backend": "deepgemm_fp8",
+        "profiler_git_hash": "b0243fc369d3c805898d8759ec464b421e89d9bc",
+        "rows": 324,
+        "verdict": "backend_not_directly_registered"
+      },
+      {
+        "table": "dsa_paged_mqa_logits_decode",
+        "backend": "deepgemm_fp8",
+        "profiler_git_hash": "f554be2fe8e1bf20ef0610238296afff147f3382",
+        "rows": 324,
+        "verdict": "backend_not_directly_registered"
+      },
+      {
+        "table": "flashinfer_attn_decode",
+        "backend": "fa2",
+        "profiler_git_hash": "0402ecd929fe5204b67cdcf4c738158bec5065fe",
+        "rows": 324,
+        "verdict": "module_unreadable"
+      },
+      {
+        "table": "flashinfer_attn_decode",
+        "backend": "fa2",
+        "profiler_git_hash": "48b9e83e5f5550972cc21989d9f7b529f71113ab",
+        "rows": 324,
+        "verdict": "module_unreadable"
+      },
+      {
+        "table": "flashinfer_attn_decode",
+        "backend": "fa2",
+        "profiler_git_hash": "dee39df50d9e507fb7d707bd3af2abe40027791a",
+        "rows": 324,
+        "verdict": "module_unreadable"
+      },
+      {
+        "table": "flashinfer_attn_decode",
+        "backend": "fa2_cudagraph",
+        "profiler_git_hash": "5df422f7ccbdfd1ca7eb69ab9152c47b92fe3260",
+        "rows": 324,
+        "verdict": "module_unreadable"
+      },
+      {
+        "table": "flashinfer_attn_decode",
+        "backend": "fa3",
+        "profiler_git_hash": "0402ecd929fe5204b67cdcf4c738158bec5065fe",
+        "rows": 324,
+        "verdict": "module_unreadable"
+      },
+      {
+        "table": "flashinfer_attn_decode",
+        "backend": "fa3",
+        "profiler_git_hash": "dee39df50d9e507fb7d707bd3af2abe40027791a",
+        "rows": 324,
+        "verdict": "module_unreadable"
+      },
+      {
+        "table": "moe_finalize_routing",
+        "backend": "flashinfer_trtllm_sm100",
+        "profiler_git_hash": "a6d3e397df47735eb013c04c9caec1fb21efe955",
+        "rows": 321,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "elementwise",
+        "backend": "triton",
+        "profiler_git_hash": "c3bd620d8ea4759fb28c5c372aca40f6242c1447",
+        "rows": 315,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "elementwise",
+        "backend": "triton",
+        "profiler_git_hash": "392e9b6a9b02e824a13ae3ab181c141baa0ca996",
+        "rows": 312,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "deepseek_v4_indexer_mqa_logits_prefill",
+        "backend": "vllm_deepgemm_fp8",
+        "profiler_git_hash": "44964939c0e6ec60b376bfd53dca7ec4e874f2f1",
+        "rows": 311,
+        "verdict": "module_absent"
+      },
+      {
+        "table": "deepseek_v4_indexer_topk_prefill",
+        "backend": "vllm_cuda",
+        "profiler_git_hash": "44964939c0e6ec60b376bfd53dca7ec4e874f2f1",
+        "rows": 311,
+        "verdict": "module_absent"
+      },
+      {
+        "table": "dsa_sparse_index_remap",
+        "backend": "vllm_triton",
+        "profiler_git_hash": "5cb3ed35a7aa6bebe14755ad1f9ac4a986d9fcc4",
+        "rows": 272,
+        "verdict": "backend_not_directly_registered"
+      },
+      {
+        "table": "fp8_block_quant",
+        "backend": "flashinfer_trtllm",
+        "profiler_git_hash": "32308b4a15b7c0a046880496012fb9cb19d04d49",
+        "rows": 272,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "gemm_fp32_output",
+        "backend": "torch_cublas",
+        "profiler_git_hash": "44964939c0e6ec60b376bfd53dca7ec4e874f2f1",
+        "rows": 272,
+        "verdict": "module_absent"
+      },
+      {
+        "table": "nvfp4_moe",
+        "backend": "flashinfer_trtllm",
+        "profiler_git_hash": "48864532c291e5cd48d01efb515d63733496e420",
+        "rows": 272,
+        "verdict": "module_absent"
+      },
+      {
+        "table": "dsa_mqa_logits_prefill",
+        "backend": "deepgemm_fp8",
+        "profiler_git_hash": "d914520bf12985fe28692effd345dd00bbbfa9cb",
+        "rows": 271,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "dsa_mqa_logits_prefill",
+        "backend": "vllm_deepgemm_fp8",
+        "profiler_git_hash": "d914520bf12985fe28692effd345dd00bbbfa9cb",
+        "rows": 271,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "flashinfer_attn_prefill",
+        "backend": "fa2",
+        "profiler_git_hash": "0402ecd929fe5204b67cdcf4c738158bec5065fe",
+        "rows": 270,
+        "verdict": "module_unreadable"
+      },
+      {
+        "table": "flashinfer_attn_prefill",
+        "backend": "fa2",
+        "profiler_git_hash": "dee39df50d9e507fb7d707bd3af2abe40027791a",
+        "rows": 270,
+        "verdict": "module_unreadable"
+      },
+      {
+        "table": "flashinfer_attn_prefill",
+        "backend": "fa3",
+        "profiler_git_hash": "0402ecd929fe5204b67cdcf4c738158bec5065fe",
+        "rows": 270,
+        "verdict": "module_unreadable"
+      },
+      {
+        "table": "flashinfer_attn_prefill",
+        "backend": "fa3",
+        "profiler_git_hash": "48b9e83e5f5550972cc21989d9f7b529f71113ab",
+        "rows": 270,
+        "verdict": "module_unreadable"
+      },
+      {
+        "table": "flashinfer_attn_prefill",
+        "backend": "fa3",
+        "profiler_git_hash": "dee39df50d9e507fb7d707bd3af2abe40027791a",
+        "rows": 270,
+        "verdict": "module_unreadable"
+      },
+      {
+        "table": "nvfp4_fused_moe",
+        "backend": "flashinfer_trtllm_sm100",
+        "profiler_git_hash": "2c12e3a38ca03b40bbe9df7e6a3fb7ea76f8e429",
+        "rows": 268,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "moe_finalize_routing",
+        "backend": "flashinfer_trtllm_sm100",
+        "profiler_git_hash": "ca35feef1bf909d6c0bb650cc2a0fe3a3c9b9c1e",
+        "rows": 262,
+        "verdict": "backend_not_directly_registered"
+      },
+      {
+        "table": "dsa_paged_mqa_logits_decode",
+        "backend": "deepgemm_fp8",
+        "profiler_git_hash": "6aaf9f73b95827251be81708691969a435e997da",
+        "rows": 252,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "dsa_paged_mqa_logits_decode",
+        "backend": "deepgemm_fp8",
+        "profiler_git_hash": "bf360177b1a248ac3329d0dbac840d8e63467815",
+        "rows": 252,
+        "verdict": "backend_not_directly_registered"
+      },
+      {
+        "table": "dsa_paged_mqa_logits_decode",
+        "backend": "vllm_deepgemm_fp8",
+        "profiler_git_hash": "6aaf9f73b95827251be81708691969a435e997da",
+        "rows": 252,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "deepseek_v4_sparse_attn_compress_store",
+        "backend": "vllm_deepseek_v4_cutedsl",
+        "profiler_git_hash": "44964939c0e6ec60b376bfd53dca7ec4e874f2f1",
+        "rows": 242,
+        "verdict": "module_absent"
+      },
+      {
+        "table": "dsa_paged_mqa_logits_decode",
+        "backend": "deepgemm_fp8",
+        "profiler_git_hash": "4dfb53463f9d849dfe21d00f9d101939870507da",
+        "rows": 241,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "dsa_paged_mqa_logits_decode",
+        "backend": "vllm_deepgemm_fp8",
+        "profiler_git_hash": "4dfb53463f9d849dfe21d00f9d101939870507da",
+        "rows": 241,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "moe_finalize_routing",
+        "backend": "flashinfer_trtllm",
+        "profiler_git_hash": "31b8a241a807bd646dd8633c16b2fe13234b9c2e",
+        "rows": 212,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "single_gemm",
+        "backend": "deepgemm",
+        "profiler_git_hash": "781ff4134b397bcabe2e766a9970570faf29543f",
+        "rows": 204,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "single_gemm",
+        "backend": "torch_linear",
+        "profiler_git_hash": "f98cf69e9666726d90f402afcbdea23c89a488d8",
+        "rows": 204,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "single_gemm",
+        "backend": "torch_linear_vllm",
+        "profiler_git_hash": "6aaf9f73b95827251be81708691969a435e997da",
+        "rows": 204,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "gdn_causal_conv_prefill",
+        "backend": "vllm_triton",
+        "profiler_git_hash": "61cfd2773aa7d9fdf16b63b7af193c986f970c25",
+        "rows": 199,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "gdn_chunk_local_cumsum",
+        "backend": "vllm_triton",
+        "profiler_git_hash": "154580526605f11d28b981f8dba11211a5f69210",
+        "rows": 196,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "gdn_chunk_recompute_w_u",
+        "backend": "vllm_triton",
+        "profiler_git_hash": "35fb84a9be93f05251513a8b25236a45d02a3f34",
+        "rows": 196,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "gdn_chunk_scaled_dot_kkt",
+        "backend": "vllm_triton",
+        "profiler_git_hash": "c6acdd9a5a0347b40717ab77c59a8f28d9471718",
+        "rows": 196,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "vllm_fused_moe",
+        "backend": "vllm_triton",
+        "profiler_git_hash": "f89b9e697e7afd948532ef05d009d5bf7314ff03",
+        "rows": 194,
+        "verdict": "module_absent"
+      },
+      {
+        "table": "deepseek_v4_indexer_topk_decode",
+        "backend": "vllm_cuda",
+        "profiler_git_hash": "44964939c0e6ec60b376bfd53dca7ec4e874f2f1",
+        "rows": 189,
+        "verdict": "module_absent"
+      },
+      {
+        "table": "flashinfer_attn_decode",
+        "backend": "fa2",
+        "profiler_git_hash": "0e91178651da9f275b90dc91d5d6e83d4f1f2f72",
+        "rows": 162,
+        "verdict": "module_unreadable"
+      },
+      {
+        "table": "flashinfer_attn_decode",
+        "backend": "fa2",
+        "profiler_git_hash": "153c31b3070f06a1344b8c204a0fbd5cb4a7517f",
+        "rows": 162,
+        "verdict": "module_unreadable"
+      },
+      {
+        "table": "flashinfer_attn_decode",
+        "backend": "fa2",
+        "profiler_git_hash": "1e07b484cb003327ffe06d0e97c1e1aa9307e846",
+        "rows": 162,
+        "verdict": "module_unreadable"
+      },
+      {
+        "table": "flashinfer_attn_decode",
+        "backend": "fa2",
+        "profiler_git_hash": "a1341218f756fead24bcd9d953ca06201aff23c0",
+        "rows": 162,
+        "verdict": "module_unreadable"
+      },
+      {
+        "table": "flashinfer_attn_decode",
+        "backend": "fa2_cudagraph",
+        "profiler_git_hash": "6ebea1d112e7c2fd95259eaa713453ec2910478f",
+        "rows": 162,
+        "verdict": "module_unreadable"
+      },
+      {
+        "table": "flashinfer_attn_decode",
+        "backend": "fa3",
+        "profiler_git_hash": "0e91178651da9f275b90dc91d5d6e83d4f1f2f72",
+        "rows": 162,
+        "verdict": "module_unreadable"
+      },
+      {
+        "table": "flashinfer_attn_decode",
+        "backend": "fa3",
+        "profiler_git_hash": "1e07b484cb003327ffe06d0e97c1e1aa9307e846",
+        "rows": 162,
+        "verdict": "module_unreadable"
+      },
+      {
+        "table": "flashinfer_attn_decode",
+        "backend": "fa3",
+        "profiler_git_hash": "953a39b2c6e4a2f7777236f8b2632b1b1db18a63",
+        "rows": 161,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "mxfp4_marlin_moe_gemm",
+        "backend": "vllm_marlin",
+        "profiler_git_hash": "44964939c0e6ec60b376bfd53dca7ec4e874f2f1",
+        "rows": 157,
+        "verdict": "module_absent"
+      },
+      {
+        "table": "kv_cache_append",
+        "backend": "vllm_cuda",
+        "profiler_git_hash": "51de9f778ea875b26da63662d004a90289fc68e0",
+        "rows": 151,
+        "verdict": "module_absent"
+      },
+      {
+        "table": "elementwise",
+        "backend": "triton",
+        "profiler_git_hash": "851f81cb7f0f6cc3bd02c55733a15faa315cbc05",
+        "rows": 150,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "dsa_index_cache_append",
+        "backend": "vllm_cuda",
+        "profiler_git_hash": "62a48e012811f7a375c5aba630441dc6dbd3517a",
+        "rows": 139,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "mla_cache_append",
+        "backend": "vllm_cuda",
+        "profiler_git_hash": "46c75aadee0f14d3904b60d63c0995fff8492f5c",
+        "rows": 139,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "batched_gemm",
+        "backend": "torch_mla_q_absorb_glm52",
+        "profiler_git_hash": "289de47c73d09cb37cc34e0399e6b2a88d6525c0",
+        "rows": 136,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "batched_gemm",
+        "backend": "torch_mla_v_up_glm52",
+        "profiler_git_hash": "289de47c73d09cb37cc34e0399e6b2a88d6525c0",
+        "rows": 136,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "fp8_block_quant",
+        "backend": "flashinfer_trtllm",
+        "profiler_git_hash": "781ff4134b397bcabe2e766a9970570faf29543f",
+        "rows": 136,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "fp8_blockscale_grouped_gemm",
+        "backend": "flashinfer_trtllm",
+        "profiler_git_hash": "781ff4134b397bcabe2e766a9970570faf29543f",
+        "rows": 136,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "fp8_per_token_group_quant",
+        "backend": "vllm_cuda",
+        "profiler_git_hash": "abb0d647c24f3b38adde678ca972a7342d1dbeda",
+        "rows": 136,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "moe_topk_softplus_sqrt",
+        "backend": "vllm_cuda",
+        "profiler_git_hash": "44964939c0e6ec60b376bfd53dca7ec4e874f2f1",
+        "rows": 136,
+        "verdict": "module_absent"
+      },
+      {
+        "table": "nvfp4_quant",
+        "backend": "vllm_cuda",
+        "profiler_git_hash": "48864532c291e5cd48d01efb515d63733496e420",
+        "rows": 136,
+        "verdict": "module_absent"
+      },
+      {
+        "table": "residual_rms_norm",
+        "backend": "vllm_cuda",
+        "profiler_git_hash": "ddd857ace85deb05b6b396b8fc5878c78ca96401",
+        "rows": 136,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "single_gemm",
+        "backend": "deepgemm",
+        "profiler_git_hash": "5f21b10b8b62b73a0fcad306c3cb459fbe1fb6ce",
+        "rows": 136,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "single_gemm",
+        "backend": "torch_linear",
+        "profiler_git_hash": "781ff4134b397bcabe2e766a9970570faf29543f",
+        "rows": 136,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "flashinfer_attn_prefill",
+        "backend": "fa2",
+        "profiler_git_hash": "0e91178651da9f275b90dc91d5d6e83d4f1f2f72",
+        "rows": 135,
+        "verdict": "module_unreadable"
+      },
+      {
+        "table": "flashinfer_attn_prefill",
+        "backend": "fa2",
+        "profiler_git_hash": "153c31b3070f06a1344b8c204a0fbd5cb4a7517f",
+        "rows": 135,
+        "verdict": "module_unreadable"
+      },
+      {
+        "table": "flashinfer_attn_prefill",
+        "backend": "fa2",
+        "profiler_git_hash": "1e07b484cb003327ffe06d0e97c1e1aa9307e846",
+        "rows": 135,
+        "verdict": "module_unreadable"
+      },
+      {
+        "table": "flashinfer_attn_prefill",
+        "backend": "fa3",
+        "profiler_git_hash": "0e91178651da9f275b90dc91d5d6e83d4f1f2f72",
+        "rows": 135,
+        "verdict": "module_unreadable"
+      },
+      {
+        "table": "flashinfer_attn_prefill",
+        "backend": "fa3",
+        "profiler_git_hash": "1e07b484cb003327ffe06d0e97c1e1aa9307e846",
+        "rows": 135,
+        "verdict": "module_unreadable"
+      },
+      {
+        "table": "flashinfer_attn_prefill",
+        "backend": "fa3",
+        "profiler_git_hash": "a1341218f756fead24bcd9d953ca06201aff23c0",
+        "rows": 135,
+        "verdict": "module_unreadable"
+      },
+      {
+        "table": "flashinfer_attn_prefill",
+        "backend": "fa3",
+        "profiler_git_hash": "adf6a392a7b380c0528c2557cbbad31bacb75881",
+        "rows": 134,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "grouped_gemm",
+        "backend": "torch",
+        "profiler_git_hash": "392e9b6a9b02e824a13ae3ab181c141baa0ca996",
+        "rows": 132,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "elementwise",
+        "backend": "torch",
+        "profiler_git_hash": "44964939c0e6ec60b376bfd53dca7ec4e874f2f1",
+        "rows": 126,
+        "verdict": "module_unreadable"
+      },
+      {
+        "table": "elementwise",
+        "backend": "torch",
+        "profiler_git_hash": "f89b9e697e7afd948532ef05d009d5bf7314ff03",
+        "rows": 126,
+        "verdict": "backend_not_directly_registered"
+      },
+      {
+        "table": "gdn_chunk_solve_tril",
+        "backend": "vllm_triton",
+        "profiler_git_hash": "cb2daa1d2f4b3fb54bcdc3dfb6790730cf0163f6",
+        "rows": 126,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "deepseek_v4_sparse_attn_compress_store",
+        "backend": "vllm_deepseek_v4_triton",
+        "profiler_git_hash": "44964939c0e6ec60b376bfd53dca7ec4e874f2f1",
+        "rows": 119,
+        "verdict": "module_absent"
+      },
+      {
+        "table": "dsa_mqa_logits_prefill",
+        "backend": "deepgemm_fp8",
+        "profiler_git_hash": "17efbdb2ca93291afe313fde5b667109c4925dd4",
+        "rows": 90,
+        "verdict": "backend_not_directly_registered"
+      },
+      {
+        "table": "elementwise",
+        "backend": "triton",
+        "profiler_git_hash": "781ff4134b397bcabe2e766a9970570faf29543f",
+        "rows": 79,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "dsa_paged_mqa_logits_decode",
+        "backend": "deepgemm_fp8",
+        "profiler_git_hash": "7a50004b4f8639f9ab81f9d59b898b0f15bd6398",
+        "rows": 73,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "dsa_paged_mqa_logits_decode",
+        "backend": "vllm_deepgemm_fp8",
+        "profiler_git_hash": "7a50004b4f8639f9ab81f9d59b898b0f15bd6398",
+        "rows": 73,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "kv_cache_append",
+        "backend": "vllm_cuda",
+        "profiler_git_hash": "abb0d647c24f3b38adde678ca972a7342d1dbeda",
+        "rows": 70,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "kv_cache_append",
+        "backend": "vllm_cuda",
+        "profiler_git_hash": "adf6a392a7b380c0528c2557cbbad31bacb75881",
+        "rows": 70,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "clamped_swiglu",
+        "backend": "vllm_inductor",
+        "profiler_git_hash": "44964939c0e6ec60b376bfd53dca7ec4e874f2f1",
+        "rows": 68,
+        "verdict": "module_absent"
+      },
+      {
+        "table": "deepseek_v4_fused_q_kv_rmsnorm",
+        "backend": "vllm_triton",
+        "profiler_git_hash": "44964939c0e6ec60b376bfd53dca7ec4e874f2f1",
+        "rows": 68,
+        "verdict": "module_absent"
+      },
+      {
+        "table": "deepseek_v4_terminal_mhc_head",
+        "backend": "vllm_tilelang",
+        "profiler_git_hash": "44964939c0e6ec60b376bfd53dca7ec4e874f2f1",
+        "rows": 68,
+        "verdict": "module_absent"
+      },
+      {
+        "table": "fp8_per_token_group_quant",
+        "backend": "vllm_cuda",
+        "profiler_git_hash": "5f21b10b8b62b73a0fcad306c3cb459fbe1fb6ce",
+        "rows": 68,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "fp8_per_token_group_quant",
+        "backend": "vllm_cuda",
+        "profiler_git_hash": "781ff4134b397bcabe2e766a9970570faf29543f",
+        "rows": 68,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "fp8_per_token_group_quant",
+        "backend": "vllm_cuda",
+        "profiler_git_hash": "c3bd620d8ea4759fb28c5c372aca40f6242c1447",
+        "rows": 68,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "mhc_fused_post_pre_rms_norm",
+        "backend": "vllm_tilelang",
+        "profiler_git_hash": "44964939c0e6ec60b376bfd53dca7ec4e874f2f1",
+        "rows": 68,
+        "verdict": "module_absent"
+      },
+      {
+        "table": "mhc_pre_rms_norm",
+        "backend": "vllm_tilelang",
+        "profiler_git_hash": "44964939c0e6ec60b376bfd53dca7ec4e874f2f1",
+        "rows": 68,
+        "verdict": "module_absent"
+      },
+      {
+        "table": "moe_alltoall_prepare",
+        "backend": "flashinfer_mnnvl",
+        "profiler_git_hash": "2656c7b1e51084eb976e483bb3b6108f4a103c5f",
+        "rows": 68,
+        "verdict": "module_absent"
+      },
+      {
+        "table": "moe_sum",
+        "backend": "vllm_cuda",
+        "profiler_git_hash": "44964939c0e6ec60b376bfd53dca7ec4e874f2f1",
+        "rows": 68,
+        "verdict": "module_absent"
+      },
+      {
+        "table": "nvfp4_moe_routing",
+        "backend": "flashinfer_trtllm_sm100",
+        "profiler_git_hash": "ca35feef1bf909d6c0bb650cc2a0fe3a3c9b9c1e",
+        "rows": 68,
+        "verdict": "module_absent"
+      },
+      {
+        "table": "nvfp4_quant",
+        "backend": "flashinfer_cutedsl",
+        "profiler_git_hash": "d40fda4868bf9073965d937a333d0803a88d0ba4",
+        "rows": 68,
+        "verdict": "backend_not_directly_registered"
+      },
+      {
+        "table": "residual_rms_norm",
+        "backend": "vllm_cuda",
+        "profiler_git_hash": "851f81cb7f0f6cc3bd02c55733a15faa315cbc05",
+        "rows": 68,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "single_gemm",
+        "backend": "deepgemm",
+        "profiler_git_hash": "851f81cb7f0f6cc3bd02c55733a15faa315cbc05",
+        "rows": 68,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "single_gemm",
+        "backend": "deepgemm",
+        "profiler_git_hash": "adf6a392a7b380c0528c2557cbbad31bacb75881",
+        "rows": 68,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "single_gemm",
+        "backend": "torch_linear",
+        "profiler_git_hash": "29b3fe02a7ba799bc1bb9eba9e0310e85d93488f",
+        "rows": 68,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "single_gemm",
+        "backend": "torch_linear",
+        "profiler_git_hash": "851f81cb7f0f6cc3bd02c55733a15faa315cbc05",
+        "rows": 68,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "single_gemm",
+        "backend": "torch_linear",
+        "profiler_git_hash": "a6d3e397df47735eb013c04c9caec1fb21efe955",
+        "rows": 68,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "single_gemm",
+        "backend": "torch_linear",
+        "profiler_git_hash": "f610bed60379ea54dc6d4018ac4570868f120a3a",
+        "rows": 68,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "vllm_mla_rope",
+        "backend": "vllm_inductor",
+        "profiler_git_hash": "2656c7b1e51084eb976e483bb3b6108f4a103c5f",
+        "rows": 68,
+        "verdict": "module_absent"
+      },
+      {
+        "table": "moe_finalize_routing",
+        "backend": "flashinfer_trtllm",
+        "profiler_git_hash": "781ff4134b397bcabe2e766a9970570faf29543f",
+        "rows": 66,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "elementwise",
+        "backend": "triton",
+        "profiler_git_hash": "5f21b10b8b62b73a0fcad306c3cb459fbe1fb6ce",
+        "rows": 63,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "rms_norm",
+        "backend": "flashinfer",
+        "profiler_git_hash": "adf6a392a7b380c0528c2557cbbad31bacb75881",
+        "rows": 63,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "rms_norm",
+        "backend": "flashinfer",
+        "profiler_git_hash": "f98cf69e9666726d90f402afcbdea23c89a488d8",
+        "rows": 63,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "deepseek_v4_fused_inv_rope_fp8_quant",
+        "backend": "vllm_triton",
+        "profiler_git_hash": "44964939c0e6ec60b376bfd53dca7ec4e874f2f1",
+        "rows": 57,
+        "verdict": "module_absent"
+      },
+      {
+        "table": "gdn_chunk_state_update",
+        "backend": "vllm_triton",
+        "profiler_git_hash": "02e7f07182044bb0058bba9453b8032b447132b1",
+        "rows": 57,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "bf16_fused_moe",
+        "backend": "flashinfer_trtllm_sm100",
+        "profiler_git_hash": "b0243fc369d3c805898d8759ec464b421e89d9bc",
+        "rows": 55,
+        "verdict": "module_absent"
+      },
+      {
+        "table": "dsa_topk_prefill",
+        "backend": "vllm_cuda",
+        "profiler_git_hash": "ab69d389a82b7fb669c3a9d45ae6bdc6c21d0e0f",
+        "rows": 52,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "gdn_prefill_post_conv",
+        "backend": "vllm_triton",
+        "profiler_git_hash": "8c8b4aae65f11f3f67a670beca86aa8bc920d291",
+        "rows": 51,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "gdn_chunk_solve_tril",
+        "backend": "vllm_triton",
+        "profiler_git_hash": "331d7d1e7e404d05f066983af6bacc1331093aad",
+        "rows": 47,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "gdn_chunk_delta_rule",
+        "backend": "flashinfer",
+        "profiler_git_hash": "f89b9e697e7afd948532ef05d009d5bf7314ff03",
+        "rows": 42,
+        "verdict": "module_absent"
+      },
+      {
+        "table": "elementwise",
+        "backend": "triton",
+        "profiler_git_hash": "b0243fc369d3c805898d8759ec464b421e89d9bc",
+        "rows": 41,
+        "verdict": "module_unreadable"
+      },
+      {
+        "table": "moe_fused_topk",
+        "backend": "vllm_cuda",
+        "profiler_git_hash": "420efe4a023a2c05e5597f7496f2f34a9c9e2911",
+        "rows": 40,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "all_reduce",
+        "backend": "nccl",
+        "profiler_git_hash": "0402ecd929fe5204b67cdcf4c738158bec5065fe",
+        "rows": 38,
+        "verdict": "module_unreadable"
+      },
+      {
+        "table": "elementwise",
+        "backend": "triton",
+        "profiler_git_hash": "adf6a392a7b380c0528c2557cbbad31bacb75881",
+        "rows": 34,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "moe_align_block_size",
+        "backend": "vllm_cuda",
+        "profiler_git_hash": "627580c606c22e8c509f19e1f2e4a8480de7a128",
+        "rows": 34,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "dsa_paged_mqa_logits_decode",
+        "backend": "deepgemm_fp8",
+        "profiler_git_hash": "e549bd3f79fb1ab67102280a8d0bab201307fe59",
+        "rows": 32,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "dsa_paged_mqa_logits_decode",
+        "backend": "vllm_deepgemm_fp8",
+        "profiler_git_hash": "e549bd3f79fb1ab67102280a8d0bab201307fe59",
+        "rows": 32,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "all_reduce_fusion",
+        "backend": "flashinfer_trtllm",
+        "profiler_git_hash": "6aaf9f73b95827251be81708691969a435e997da",
+        "rows": 30,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "all_reduce_residual_rms_norm",
+        "backend": "flashinfer_trtllm",
+        "profiler_git_hash": "a6d3e397df47735eb013c04c9caec1fb21efe955",
+        "rows": 30,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "gdn_chunk_state_update",
+        "backend": "vllm_triton",
+        "profiler_git_hash": "ee68b032e0165dad76280a4bc986000c06e5fd7e",
+        "rows": 29,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "gdn_gated_rms_norm",
+        "backend": "vllm_triton",
+        "profiler_git_hash": "6694b07bb6e7c597b65c07de1c83136ec7639781",
+        "rows": 29,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "elementwise",
+        "backend": "triton",
+        "profiler_git_hash": "509bf5dbd5fe04509d13130255dfb840de2def4a",
+        "rows": 27,
+        "verdict": "module_unreadable"
+      },
+      {
+        "table": "gdn_chunk_output",
+        "backend": "vllm_triton",
+        "profiler_git_hash": "1e923dc0e9116ec07d67718d3eaa360b21572272",
+        "rows": 27,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "deepseek_v4_indexer_q_rope_quant",
+        "backend": "vllm_cutedsl_fp8",
+        "profiler_git_hash": "44964939c0e6ec60b376bfd53dca7ec4e874f2f1",
+        "rows": 22,
+        "verdict": "module_absent"
+      },
+      {
+        "table": "dsa_mqa_logits_prefill",
+        "backend": "deepgemm_fp8",
+        "profiler_git_hash": "aac6ba16f1b27516ff7426de7f51d568623761ce",
+        "rows": 21,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "dsa_mqa_logits_prefill",
+        "backend": "vllm_deepgemm_fp8",
+        "profiler_git_hash": "aac6ba16f1b27516ff7426de7f51d568623761ce",
+        "rows": 21,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "all_reduce",
+        "backend": "nccl",
+        "profiler_git_hash": "106021503c8fdbbaa038510720ce7ef4d6239ab5",
+        "rows": 19,
+        "verdict": "module_unreadable"
+      },
+      {
+        "table": "all_reduce",
+        "backend": "nccl",
+        "profiler_git_hash": "1e07b484cb003327ffe06d0e97c1e1aa9307e846",
+        "rows": 19,
+        "verdict": "module_unreadable"
+      },
+      {
+        "table": "all_reduce",
+        "backend": "nccl",
+        "profiler_git_hash": "48864532c291e5cd48d01efb515d63733496e420",
+        "rows": 19,
+        "verdict": "module_unreadable"
+      },
+      {
+        "table": "all_reduce",
+        "backend": "nvshmem",
+        "profiler_git_hash": "106021503c8fdbbaa038510720ce7ef4d6239ab5",
+        "rows": 19,
+        "verdict": "module_unreadable"
+      },
+      {
+        "table": "all_reduce",
+        "backend": "nvshmem",
+        "profiler_git_hash": "3058528ba6261baeeec8f2627f77cf884b99b87d",
+        "rows": 19,
+        "verdict": "module_unreadable"
+      },
+      {
+        "table": "all_reduce",
+        "backend": "nvshmem",
+        "profiler_git_hash": "5df422f7ccbdfd1ca7eb69ab9152c47b92fe3260",
+        "rows": 19,
+        "verdict": "module_unreadable"
+      },
+      {
+        "table": "all_reduce",
+        "backend": "nvshmem",
+        "profiler_git_hash": "ca35feef1bf909d6c0bb650cc2a0fe3a3c9b9c1e",
+        "rows": 19,
+        "verdict": "module_unreadable"
+      },
+      {
+        "table": "p2p_inter",
+        "backend": "nccl",
+        "profiler_git_hash": "dee39df50d9e507fb7d707bd3af2abe40027791a",
+        "rows": 19,
+        "verdict": "module_unreadable"
+      },
+      {
+        "table": "p2p_inter",
+        "backend": "nvshmem",
+        "profiler_git_hash": "3058528ba6261baeeec8f2627f77cf884b99b87d",
+        "rows": 19,
+        "verdict": "module_unreadable"
+      },
+      {
+        "table": "p2p_intra",
+        "backend": "nccl",
+        "profiler_git_hash": "dee39df50d9e507fb7d707bd3af2abe40027791a",
+        "rows": 19,
+        "verdict": "module_unreadable"
+      },
+      {
+        "table": "p2p_intra",
+        "backend": "nvshmem",
+        "profiler_git_hash": "3058528ba6261baeeec8f2627f77cf884b99b87d",
+        "rows": 19,
+        "verdict": "module_unreadable"
+      },
+      {
+        "table": "gdn_causal_conv_decode",
+        "backend": "vllm_triton",
+        "profiler_git_hash": "1419ae2195dec7092cb59d37a0aafee4ce4132e0",
+        "rows": 18,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "gdn_recurrent_decode",
+        "backend": "vllm_triton",
+        "profiler_git_hash": "7b7a2f2795630249e8b2ae3edf473aa926c8077d",
+        "rows": 18,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "gdn_chunk_state_update",
+        "backend": "vllm_triton",
+        "profiler_git_hash": "91d78eb1268b413e74705af213434d51f6f03925",
+        "rows": 17,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "elementwise",
+        "backend": "triton",
+        "profiler_git_hash": "68a6254ea1203b72124903597a0e0295136cecb3",
+        "rows": 16,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "moe_ep_all_gather",
+        "backend": "vllm_pynccl",
+        "profiler_git_hash": "44964939c0e6ec60b376bfd53dca7ec4e874f2f1",
+        "rows": 15,
+        "verdict": "module_absent"
+      },
+      {
+        "table": "moe_ep_reduce_scatter",
+        "backend": "vllm_pynccl",
+        "profiler_git_hash": "44964939c0e6ec60b376bfd53dca7ec4e874f2f1",
+        "rows": 15,
+        "verdict": "module_absent"
+      },
+      {
+        "table": "elementwise",
+        "backend": "triton",
+        "profiler_git_hash": "b1f7dd177228a88227a6df0a61cd611ce5fc4956",
+        "rows": 14,
+        "verdict": "module_unreadable"
+      },
+      {
+        "table": "elementwise",
+        "backend": "triton",
+        "profiler_git_hash": "91332881ca94d8e594b543e3d8eadaba08568749",
+        "rows": 13,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "elementwise",
+        "backend": "triton",
+        "profiler_git_hash": "abb0d647c24f3b38adde678ca972a7342d1dbeda",
+        "rows": 11,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "all_reduce_residual_rms_norm",
+        "backend": "flashinfer_trtllm",
+        "profiler_git_hash": "31b8a241a807bd646dd8633c16b2fe13234b9c2e",
+        "rows": 9,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "gdn_causal_conv_prefill",
+        "backend": "vllm_triton",
+        "profiler_git_hash": "30aa4e81b6f584935dc84b6984bc044fd32803a0",
+        "rows": 9,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "elementwise",
+        "backend": "triton",
+        "profiler_git_hash": "504bada6226b0288ae051944661cbb457523833f",
+        "rows": 8,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "elementwise",
+        "backend": "triton",
+        "profiler_git_hash": "c0c985dbd5642c60f7c630e1ab574f0df6dfb27c",
+        "rows": 7,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "gdn_chunk_scaled_dot_kkt",
+        "backend": "vllm_triton",
+        "profiler_git_hash": "0c659538b42dceb537973d6030e00f017155c4d4",
+        "rows": 7,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "gdn_chunk_output",
+        "backend": "vllm_triton",
+        "profiler_git_hash": "d0b93290e96dc279f5bd1833b44fb45ca0864419",
+        "rows": 4,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "gdn_chunk_solve_tril",
+        "backend": "vllm_triton",
+        "profiler_git_hash": "91039d451631b768c7a71b726c20d6db039abf6c",
+        "rows": 3,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "deepseek_v4_packed_cache_gather",
+        "backend": "vllm_deepseek_v4_cutedsl",
+        "profiler_git_hash": "44964939c0e6ec60b376bfd53dca7ec4e874f2f1",
+        "rows": 2,
+        "verdict": "module_absent"
+      },
+      {
+        "table": "dsa_paged_mqa_logits_decode",
+        "backend": "deepgemm_fp8",
+        "profiler_git_hash": "409d898703fbdcd93419b3833253ac0800daa644",
+        "rows": 2,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "dsa_paged_mqa_logits_decode",
+        "backend": "vllm_deepgemm_fp8",
+        "profiler_git_hash": "409d898703fbdcd93419b3833253ac0800daa644",
+        "rows": 2,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "gdn_chunk_solve_tril",
+        "backend": "vllm_triton",
+        "profiler_git_hash": "fc3e8fee098e35460de53ad7c3f6f75c57d9fcc8",
+        "rows": 2,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "moe_align_block_size",
+        "backend": "vllm_cuda",
+        "profiler_git_hash": "a5b2da869ab613971a334da730ca96cdb8fa0803",
+        "rows": 2,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "moe_fused_topk",
+        "backend": "vllm_cuda",
+        "profiler_git_hash": "c53c4caf6c95928d03fca09cdfa3e205718005bc",
+        "rows": 2,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "dsa_mqa_logits_prefill",
+        "backend": "deepgemm_fp8",
+        "profiler_git_hash": "90553f37a1de2e6c9b3f47bd361deb2651c257d7",
+        "rows": 1,
+        "verdict": "backend_not_directly_registered"
+      },
+      {
+        "table": "flashinfer_attn_decode",
+        "backend": "fa3",
+        "profiler_git_hash": "781ff4134b397bcabe2e766a9970570faf29543f",
+        "rows": 1,
+        "verdict": "commit_unknown"
+      },
+      {
+        "table": "flashinfer_attn_prefill",
+        "backend": "fa3",
+        "profiler_git_hash": "953a39b2c6e4a2f7777236f8b2632b1b1db18a63",
+        "rows": 1,
+        "verdict": "commit_unknown"
+      }
+    ]
+  },
+  "known_limitations": [
+    "Historical diagnostic union aliases logits backend vllm_deepgemm_fp8 to deepgemm_fp8; original source hashes are retained.",
+    "Unverifiable historical commits and static backend-registration warnings are preserved, not rewritten.",
+    "Fresh equivalence-only gpu-reprofile.db measurements are intentionally excluded.",
+    "The new logits gather/copy/argmax registrations have no GPU measurements or Rust timing wiring."
+  ]
+}
