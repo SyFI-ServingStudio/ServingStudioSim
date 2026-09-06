@@ -33,6 +33,9 @@ work remains on `spec5-logits-wip`; experimental scripts remain on
 ## Test Result
 
 See [the generated matrix](alignment_matrix.md) and [evidence definitions](README.md).
+The [17-case kernel evidence table](kernel_evidence.md) contains 15 available
+reports: eight warm captures and seven historical captures with their original
+2048/4096/8192 chunk settings. Historical rows are not matched warm E2E evidence.
 Eight cases currently have complete kernel/workload/E2E report sets. Cases09/10 E2E
 are complete; five warm workload measurements and remaining report work are pending.
 Cases11/12 retain framework capacity failures. Missing cases and tolerance failures

@@ -15,6 +15,7 @@ The generated matrix is a partial evidence snapshot, not an accepted baseline.
 | Pack `acceptance.yaml` | Acceptance tolerances and explained exceptions, independent of golden drift |
 | `alignment_matrix.md` | Generated report values and tolerance failures |
 | `server_latency.md` / `.json` | Analyzer server-side P50/P90/P99, raw values and report hashes; partial snapshot |
+| `kernel_evidence.md` / `.json` | All 17 cases, 15 available kernel reports, explicit warm/historical sources and chunk sizes |
 | `tests/golden/alignment_glm52_nvfp4_b200_spec5/NVIDIA_B200.json` | Future recorded baseline; not yet created |
 | Golden `.provenance.json` | Formula/report versions, evidence paths and provisional inputs, written by the recorder |
 | `profiling/profile.db` and `profiling/spec5_db_manifest.json` | Committed kernel timing data and import provenance |
@@ -77,6 +78,11 @@ Case10 also uses the corrected conversion and the same explicitly borrowed warm
 case02 multiplier. Its 512-request workload and E2E analysis completed after the
 standard matrix snapshot; `server_latency.md` already includes that result.
 Historical case09/10 NSYS uses 2048 chunks and remains separate from warm 2052 E2E.
+
+`kernel_evidence.md` likewise retains historical 4096/8192 captures for cases13-17,
+alongside the eight available warm captures. It does not imply matching warm
+kernel evidence for all E2E cases. Both coverage denominators and each report's
+original prediction/label provenance remain explicit.
 
 The server latency sidecar selects only the `server_ttft` and `server_tpot` fields
 from each completed warm bundle's `/api/v1/alignments/{id}/subjects/e2e/report`.
