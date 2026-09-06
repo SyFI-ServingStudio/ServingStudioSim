@@ -1,0 +1,9 @@
+{
+  "schema_version": 2,
+  "rule_files": [
+    "rules.json",
+    "mtp_rules.json",
+    "coverage_rules.json"
+  ],
+  "provenance": "Measured-name predicates preserved from glm52-spec5 at 223c9e0. Defaults expanded per rule; recurrent step_1..step_4 slot suffixes translated to the clean folded mtp.recurrent namespace. Obsolete router_fp32_cast candidates removed because the router GEMM includes the conversion. Every remaining suffix resolves against the compiled Spec5 tree in a CPU regression. This is not a new GPU validation result."
+}

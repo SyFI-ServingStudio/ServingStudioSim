@@ -4,15 +4,15 @@
 # is one target verify over `draft_tokens + 1` rows per resident decode plus
 # `draft_tokens` draft passes, and a request advances by its accepted chain.
 #
-# Per-request acceptance comes from the trace's `accept_rate` column. A request
-# without one decodes one token per iteration, so a trace with no speculative
-# column runs correctly and simply models no speedup.
+# Per-request acceptance comes from the tagged trace's `accept_rate` column.
+# This smoke uses a synthetic 0.65 conditional acceptance at every position.
 deployment: unified
 
 workload:
   trace_files:
-    - trace/smoke.csv
+    - presets/glm52_spec5_smoke.csv
   input_file_format: text-generation-independent
+  input_file_tags: [speculative]
   arrival_mode: trace_timed
   session_dependency: independent
   run_to_end: true
@@ -34,7 +34,7 @@ pools:
           max_model_len: 8192
           routing: uniform
           mtp_mode: index_share
-          draft_tokens: 3
+          draft_tokens: 5
         worker:
           type: speculative
           attn_gpu_memory_gb: 120.0
@@ -42,4 +42,4 @@ pools:
           # whole verify width here, not one row.
           max_batch_tokens: 8192
           # Must match the arch's: the width selects a profiled kernel shape.
-          draft_tokens: 3
+          draft_tokens: 5

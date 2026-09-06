@@ -1,0 +1,4 @@
+id,input_len,output_len,arrival_time,accept_rate
+0,16,4,0.0,0.65
+1,16,4,0.0,0.65
+2,32,8,1.0,0.65

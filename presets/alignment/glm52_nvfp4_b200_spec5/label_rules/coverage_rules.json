@@ -1,0 +1,912 @@
+{
+  "schema_version": 1,
+  "note": "Reviewed additive mapping candidates. No sequence, iteration, device or experiment identifier participates in a matcher. Existing numbered-Triton rules require a separate audit before claiming complete semantic validation.",
+  "rules": [
+    {
+      "operation": "attention.fused_qkv_a_proj",
+      "name": "nvjet_sm100_tst_128x256_64x6_2x1_2cta_v_bz_TNT",
+      "phase": "forward",
+      "stream_role": "primary",
+      "after": "attention.input_norm_fallback",
+      "before_name": "nvjet_sm100_tst_80x128_64x10_2x2_2cta_h_bz_TNN",
+      "type": "model",
+      "role": "fused Q and latent KV projection",
+      "slot_suffixes": ["body.dense_full_index.attention.fused_qkv_a_proj", "body.sparse_cycle_full_index.attention.fused_qkv_a_proj", "body.sparse_cycle_index_share.attention.fused_qkv_a_proj", "body.sparse_initial_index_share.attention.fused_qkv_a_proj"],
+      "excluded_slot_prefixes": ["unified.mtp."],
+      "note": "Run-linked 420377e79d range2731_8196 subgraph6 executes QKV K6144/N2624 before WK K6144/N160, followed by combined normalization. The adjacent WK tile distinguishes this QKV tile from the identically named query projections."
+    },
+    {
+      "operation": "attention.fused_qkv_a_proj",
+      "name": "nvjet_sm100_tst_128x256_64x6_2x1_2cta_v_bz_TNT",
+      "phase": "forward",
+      "stream_role": "primary",
+      "after_name": "nvjet_sm100_tst_80x128_64x10_2x2_2cta_h_bz_TNN",
+      "before_name": "triton_red_fused_",
+      "type": "model",
+      "role": "fused Q and latent KV projection",
+      "slot_suffixes": ["body.dense_full_index.attention.fused_qkv_a_proj", "body.sparse_cycle_full_index.attention.fused_qkv_a_proj", "body.sparse_cycle_index_share.attention.fused_qkv_a_proj", "body.sparse_initial_index_share.attention.fused_qkv_a_proj"],
+      "excluded_slot_prefixes": ["unified.mtp."],
+      "note": "Run-linked 420377e79d range2731_8196 subgraph1 reverses WK and QKV. Both outputs feed the immediately following combined normalization."
+    },
+    {
+      "operation": "attention.indexer.wk_weights_proj",
+      "name": "nvjet_sm100_tst_80x128_64x10_2x2_2cta_h_bz_TNN",
+      "phase": "forward",
+      "stream_role": "primary",
+      "after": "attention.fused_qkv_a_proj",
+      "before_name": "triton_red_fused_",
+      "type": "model",
+      "role": "DSA indexer key-weight projection",
+      "slot_suffixes": ["body.dense_full_index.attention.indexer.wk_weights_proj", "body.sparse_cycle_full_index.attention.indexer.wk_weights_proj"],
+      "excluded_slot_prefixes": ["unified.mtp."],
+      "note": "K6144/N160 WK in the compiled QKV-then-WK pair, verified in run-linked 420377e79d subgraph6."
+    },
+    {
+      "operation": "attention.indexer.wk_weights_proj",
+      "name": "nvjet_sm100_tst_80x128_64x10_2x2_2cta_h_bz_TNN",
+      "phase": "forward",
+      "stream_role": "primary",
+      "after": "attention.input_norm_fallback",
+      "before_name": "nvjet_sm100_tst_128x256_64x6_2x1_2cta_v_bz_TNT",
+      "type": "model",
+      "role": "DSA indexer key-weight projection",
+      "slot_suffixes": ["body.dense_full_index.attention.indexer.wk_weights_proj", "body.sparse_cycle_full_index.attention.indexer.wk_weights_proj"],
+      "excluded_slot_prefixes": ["unified.mtp."],
+      "note": "K6144/N160 WK in the compiled WK-then-QKV pair, verified in run-linked 420377e79d subgraph1."
+    },
+    {
+      "operation": "attention.indexer.q_proj",
+      "name": "nvjet_sm100_tst_256x224_64x4_2x1_2cta_v_bz_TNT",
+      "phase": "forward",
+      "stream_role": "primary",
+      "after": "attention.normalization_and_rope",
+      "before_name": "nvjet_sm100_tst_256x224_64x4_2x1_2cta_v_bz_TNT",
+      "type": "model",
+      "role": "DSA indexer query projection",
+      "slot_suffixes": ["body.dense_full_index.attention.indexer.q_proj", "body.sparse_cycle_full_index.attention.indexer.q_proj"],
+      "excluded_slot_prefixes": ["unified.mtp."],
+      "note": "Run-linked 420377e79d range2731_8196 subgraphs1/6 execute indexer wq_b before main q_b, both K2048/N4096. Combined normalization precedes the pair and combined rotary consumes both outputs."
+    },
+    {
+      "operation": "attention.q_b_proj",
+      "name": "nvjet_sm100_tst_256x224_64x4_2x1_2cta_v_bz_TNT",
+      "phase": "forward",
+      "stream_role": "primary",
+      "after": "attention.indexer.q_proj",
+      "before_name": "triton_poi_fused_add_cat_copy_index_select_mul_slice_split_split_with_sizes_stack_sub_unsqueeze_view_",
+      "type": "model",
+      "role": "query up projection",
+      "slot_suffixes": ["body.dense_full_index.attention.q_b_proj", "body.sparse_cycle_full_index.attention.q_b_proj", "body.sparse_cycle_index_share.attention.q_b_proj", "body.sparse_initial_index_share.attention.q_b_proj"],
+      "excluded_slot_prefixes": ["unified.mtp."],
+      "note": "Second K2048/N4096 GEMM of the compiled indexer-query/main-query pair; run-linked 420377e79d subgraphs1/6 identify the main q_b weight and the following combined rotary consumer."
+    },
+    {
+      "operation": "mtp.decoder.attention.indexer.wk_weights_proj",
+      "name": "nvjet_sm100_tst_64x8_",
+      "phase": "draft",
+      "stream_role": "primary",
+      "after": "mtp.decoder.input_add_rms_norm",
+      "before_name": "cublasLt::splitKreduce_kernel",
+      "type": "model",
+      "role": "MTP indexer key-weight projection",
+      "slot_suffixes": ["mtp.step_0.decoder_sparse.attention.indexer.wk_weights_proj", "mtp.recurrent.decoder_sparse.attention.indexer.wk_weights_proj"],
+      "note": "Run-linked f0c72dfb65 eagle_head subgraph0 executes K6144/N160 WK before K6144/N2624 QKV after input RMSNorm. This small split-K tile and its completion belong to WK, not QKV."
+    },
+    {
+      "operation": "mtp.decoder.attention.indexer.wk_weights_proj",
+      "name": "cublasLt::splitKreduce_kernel",
+      "phase": "draft",
+      "stream_role": "primary",
+      "after": "mtp.decoder.attention.indexer.wk_weights_proj",
+      "before_name": "nvjet_sm100_tst_",
+      "type": "model",
+      "role": "MTP indexer key-weight projection",
+      "slot_suffixes": ["mtp.step_0.decoder_sparse.attention.indexer.wk_weights_proj", "mtp.recurrent.decoder_sparse.attention.indexer.wk_weights_proj"],
+      "note": "Split-K completion of the preceding WK projection before the compiled QKV GEMM."
+    },
+    {
+      "operation": "mtp.decoder.attention.fused_qkv_a_proj",
+      "name": "nvjet_sm100_tst_",
+      "phase": "draft",
+      "stream_role": "primary",
+      "after": "mtp.decoder.attention.indexer.wk_weights_proj",
+      "before_name": "triton_red_fused_4",
+      "type": "model",
+      "role": "MTP fused Q and latent KV projection",
+      "slot_suffixes": ["mtp.step_0.decoder_sparse.attention.fused_qkv_a_proj", "mtp.recurrent.decoder_sparse.attention.fused_qkv_a_proj"],
+      "note": "K6144/N2624 projection after WK in the run-linked compiled MTP prelude. Their outputs feed combined Q/KV/indexer-key normalization."
+    },
+    {
+      "operation": "mtp.decoder.attention.indexer.q_proj",
+      "name": "nvjet_sm100_tst_",
+      "phase": "draft",
+      "stream_role": "primary",
+      "after_name": "triton_poi_fused_5",
+      "before_name": "nvjet_sm100_tst_",
+      "type": "model",
+      "role": "MTP indexer query projection",
+      "slot_suffixes": ["mtp.step_0.decoder_sparse.attention.indexer.q_proj", "mtp.recurrent.decoder_sparse.attention.indexer.q_proj"],
+      "note": "f0c72dfb65 eagle_head subgraph0: first K2048/N4096 GEMM reads indexer wq_b (arg15), followed by main q_b (arg11); their outputs enter the combined rotary kernel."
+    },
+    {
+      "operation": "mtp.decoder.attention.q_b_proj",
+      "name": "nvjet_sm100_tst_",
+      "phase": "draft",
+      "stream_role": "primary",
+      "after": "mtp.decoder.attention.indexer.q_proj",
+      "before_name": "triton_poi_fused_add_cat_copy_index_select_mul_slice_split_split_with_sizes_stack_sub_unsqueeze_view_6",
+      "type": "model",
+      "role": "MTP query up projection",
+      "slot_suffixes": ["mtp.step_0.decoder_sparse.attention.q_b_proj", "mtp.recurrent.decoder_sparse.attention.q_b_proj"],
+      "note": "Second K2048/N4096 GEMM of the compiled MTP query pair, using main q_b weights before combined main/indexer RoPE."
+    },
+    {
+      "operation": "attention.fused_qkv_a_proj",
+      "name": "nvjet_sm100_tst_128x256_",
+      "phase": "forward",
+      "stream_role": "primary",
+      "after": "attention.input_norm_fallback",
+      "before_name": "nvjet_sm100_tst_96x64_64x15_2x2_2cta_h_bz_TNN",
+      "type": "model",
+      "role": "fused Q and latent KV projection",
+      "slot_suffixes": ["body.dense_full_index.attention.fused_qkv_a_proj", "body.sparse_cycle_full_index.attention.fused_qkv_a_proj", "body.sparse_cycle_index_share.attention.fused_qkv_a_proj", "body.sparse_initial_index_share.attention.fused_qkv_a_proj"],
+      "excluded_slot_prefixes": ["unified.mtp."],
+      "note": "Run-linked dadff0e06b large-range subgraph6 executes K6144/N2624 QKV then K6144/N160 indexer WK before their combined normalization. Exact adjacent tiles plus the input-normalization predecessor identify this order."
+    },
+    {
+      "operation": "attention.fused_qkv_a_proj",
+      "name": "nvjet_sm100_tst_128x256_",
+      "phase": "forward",
+      "stream_role": "primary",
+      "after_name": "nvjet_sm100_tst_96x64_64x15_2x2_2cta_h_bz_TNN",
+      "before_name": "triton_red_fused_",
+      "type": "model",
+      "role": "fused Q and latent KV projection",
+      "slot_suffixes": ["body.dense_full_index.attention.fused_qkv_a_proj", "body.sparse_cycle_full_index.attention.fused_qkv_a_proj", "body.sparse_cycle_index_share.attention.fused_qkv_a_proj", "body.sparse_initial_index_share.attention.fused_qkv_a_proj"],
+      "excluded_slot_prefixes": ["unified.mtp."],
+      "note": "Large-range subgraph1 reorders the independent K6144/N160 WK before K6144/N2624 QKV. The same combined normalization consumes both; the tile pair identifies the reversed order."
+    },
+    {
+      "operation": "attention.indexer.wk_weights_proj",
+      "name": "nvjet_sm100_tst_96x64_64x15_2x2_2cta_h_bz_TNN",
+      "phase": "forward",
+      "stream_role": "primary",
+      "after": "attention.fused_qkv_a_proj",
+      "before_name": "triton_red_fused_",
+      "type": "model",
+      "role": "DSA indexer key-weight projection",
+      "slot_suffixes": ["body.dense_full_index.attention.indexer.wk_weights_proj", "body.sparse_cycle_full_index.attention.indexer.wk_weights_proj"],
+      "excluded_slot_prefixes": ["unified.mtp."],
+      "note": "K6144/N160 projection in the compiled QKV-then-WK pair; both outputs enter the following combined normalization."
+    },
+    {
+      "operation": "attention.indexer.wk_weights_proj",
+      "name": "nvjet_sm100_tst_96x64_64x15_2x2_2cta_h_bz_TNN",
+      "phase": "forward",
+      "stream_role": "primary",
+      "after": "attention.input_norm_fallback",
+      "before_name": "nvjet_sm100_tst_128x256_",
+      "type": "model",
+      "role": "DSA indexer key-weight projection",
+      "slot_suffixes": ["body.dense_full_index.attention.indexer.wk_weights_proj", "body.sparse_cycle_full_index.attention.indexer.wk_weights_proj"],
+      "excluded_slot_prefixes": ["unified.mtp."],
+      "note": "K6144/N160 projection in the compiled WK-then-QKV pair. The input norm and following QKV tile distinguish it from query-up projections."
+    },
+    {
+      "operation": "attention.indexer.q_proj",
+      "name": "nvjet_sm100_tst_128x256_64x6_2x1_2cta_v_bz_TNT",
+      "phase": "forward",
+      "stream_role": "primary",
+      "after": "attention.normalization_and_rope",
+      "before_name": "nvjet_sm100_tst_128x256_64x6_2x1_2cta_v_bz_TNT",
+      "type": "model",
+      "role": "DSA indexer query projection",
+      "slot_suffixes": ["body.dense_full_index.attention.indexer.q_proj", "body.sparse_cycle_full_index.attention.indexer.q_proj"],
+      "excluded_slot_prefixes": ["unified.mtp."],
+      "note": "Case03 run-linked Inductor cache dadff0e06b, range2731_4098 subgraphs1/6: normalized q feeds indexer wq_b K2048/N4096 first, then main q_b K2048/N4096, then a combined rotary kernel. Both GEMMs use this tile. The semantic predecessor and identical following tile constrain the first launch."
+    },
+    {
+      "operation": "attention.q_b_proj",
+      "name": "nvjet_sm100_tst_128x256_64x6_2x1_2cta_v_bz_TNT",
+      "phase": "forward",
+      "stream_role": "primary",
+      "after": "attention.indexer.q_proj",
+      "before_name": "triton_poi_fused_add_cat_copy_index_select_mul_slice_split_split_with_sizes_stack_sub_unsqueeze_view_",
+      "type": "model",
+      "role": "query up projection",
+      "slot_suffixes": ["body.dense_full_index.attention.q_b_proj", "body.sparse_cycle_full_index.attention.q_b_proj", "body.sparse_cycle_index_share.attention.q_b_proj", "body.sparse_initial_index_share.attention.q_b_proj"],
+      "excluded_slot_prefixes": ["unified.mtp."],
+      "note": "Second of the two K2048/N4096 GEMMs in run-linked compiled subgraphs1/6. Its output and the preceding indexer query are consumed together by the combined main/indexer rotary kernel. This is main q_b, not the small K6144/N160 key-weight projection."
+    },
+    {
+      "status": "unmapped",
+      "operation": "logits.tp_allgather",
+      "cross_rank": "synchronizing",
+      "name": "ncclDevKernel_AllGather_RING_LL",
+      "phase": "postprocess",
+      "stream_role": "primary",
+      "note": "LogitsProcessor gathers vocabulary shards or local argmax value/index pairs across TP ranks. It is a collective barrier even without a corresponding simulated slot; remove arrival wait while preserving the unmapped work."
+    },
+    {
+      "status": "unmapped",
+      "operation": "mtp.logits.tp_allgather",
+      "cross_rank": "synchronizing",
+      "name": "ncclDevKernel_AllGather_RING_LL",
+      "phase": "draft",
+      "stream_role": "primary",
+      "note": "The MTP shared head uses LogitsProcessor's TP gather on every draft round. The collective has no simulated gather slot; synchronization classification must not depend on mapping coverage."
+    },
+    {
+      "operation": "attention.fused_qkv_a_proj",
+      "type": "model",
+      "role": "fused Q and latent KV projection",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.fused_qkv_a_proj",
+        "body.sparse_cycle_full_index.attention.fused_qkv_a_proj",
+        "body.sparse_cycle_index_share.attention.fused_qkv_a_proj",
+        "body.sparse_initial_index_share.attention.fused_qkv_a_proj"
+      ],
+      "cross_rank": "independent",
+      "excluded_slot_prefixes": ["unified.mtp."],
+      "name": "nvjet_sm100_tst_",
+      "phase": "forward",
+      "stream_role": "primary",
+      "after_name": "triton_red_fused_fused_add_rms_norm_2",
+      "before_name": "triton_poi_fused_3",
+      "note": "MLAAttention fused Q/KV projection between decoder residual input norm and Q/KV normalization/RoPE. Matrix prefill selects different TNN/TNT tiles with batch size; both reviewed neighbors constrain ownership."
+    },
+    {
+      "operation": "mtp.prelude.eh_proj",
+      "name": "nvjet_sm100_tst_",
+      "phase": "draft",
+      "stream_role": "primary",
+      "after_name": "triton_red_fused_eq_rms_norm_scalar_tensor_unsqueeze_where_2",
+      "before_name": "cublasLt::splitKreduce_kernel",
+      "type": "model",
+      "role": "MTP embedding-hidden projection",
+      "cross_rank": "independent",
+      "slot_suffixes": ["mtp.step_0.prelude.eh_proj", "mtp.recurrent.prelude.eh_proj"],
+      "note": "Predictor position mask and embedding/hidden norms feed concatenation and eh_proj; the split-K GEMM precedes decoder input norm. The same model operation includes its reduction tail."
+    },
+    {
+      "operation": "mtp.prelude.eh_proj",
+      "name": "nvjet_sm100_tst_",
+      "phase": "draft",
+      "stream_role": "primary",
+      "after_name": "triton_red_fused_eq_rms_norm_scalar_tensor_unsqueeze_where_2",
+      "before_name": "triton_red_fused_rms_norm_3",
+      "type": "model",
+      "role": "MTP embedding-hidden projection",
+      "cross_rank": "independent",
+      "slot_suffixes": ["mtp.step_0.prelude.eh_proj", "mtp.recurrent.prelude.eh_proj"],
+      "note": "glm4_moe_mtp.py forward applies eh_proj after masked embedding/hidden normalization and before decoder input norm. Non-split-K tiles complete the same projection in one launch; both neighbors constrain ownership."
+    },
+    {
+      "operation": "mtp.prelude.eh_proj",
+      "name": "cublasLt::splitKreduce_kernel",
+      "phase": "draft",
+      "stream_role": "primary",
+      "after": "mtp.prelude.eh_proj",
+      "before_name": "triton_red_fused_rms_norm_3",
+      "type": "model",
+      "role": "MTP embedding-hidden projection",
+      "cross_rank": "independent",
+      "slot_suffixes": ["mtp.step_0.prelude.eh_proj", "mtp.recurrent.prelude.eh_proj"],
+      "note": "Split-K completion of the mapped eh_proj immediately before MTP decoder input norm."
+    },
+    {
+      "operation": "mtp.head.lm_head",
+      "name": "nvjet_sm100_tst_",
+      "phase": "draft",
+      "stream_role": "primary",
+      "after": "mtp.head.shared_head_rms_norm",
+      "before_name": "cublasLt::splitKreduce_kernel",
+      "type": "model",
+      "role": "MTP shared language-model head",
+      "cross_rank": "independent",
+      "slot_suffixes": ["mtp.step_0.head.lm_head", "mtp.recurrent.head.lm_head"],
+      "note": "SharedHead normalization feeds the vocabulary projection; its split-K tail precedes vocabulary all-gather. Only the projection is owned here."
+    },
+    {
+      "operation": "mtp.head.shared_head_rms_norm",
+      "name": "unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda",
+      "phase": "draft",
+      "stream_role": "primary",
+      "after_name": "vectorized_gather_kernel",
+      "before_name": "pow_tensor_scalar_kernel_impl<float, float>",
+      "type": "model",
+      "role": "MTP shared-head RMSNorm",
+      "slot_suffixes": ["mtp.step_0.head.shared_head_rms_norm", "mtp.recurrent.head.shared_head_rms_norm"],
+      "note": "SharedHead.forward calls RMSNorm on gathered selected hidden states. Its FP32 cast immediately precedes square/mean/epsilon/rsqrt/normalize/weight, then the vocabulary projection. This is the normalization cast, not the preceding indexing copies."
+    },
+    {
+      "operation": "mtp.head.lm_head",
+      "name": "nvjet_sm100_tst_",
+      "phase": "draft",
+      "stream_role": "primary",
+      "after": "mtp.head.shared_head_rms_norm",
+      "before_name": "ncclDevKernel_AllGather",
+      "type": "model",
+      "role": "MTP shared language-model head",
+      "slot_suffixes": ["mtp.step_0.head.lm_head", "mtp.recurrent.head.lm_head"],
+      "note": "LogitsProcessor applies the shared vocabulary projection between SharedHead RMSNorm and TP logits gathering. Direct GEMM tile choice varies with batch; both semantic neighbors bound ownership."
+    },
+    {
+      "operation": "mtp.head.lm_head",
+      "name": "cublasLt::splitKreduce_kernel",
+      "phase": "draft",
+      "stream_role": "primary",
+      "after": "mtp.head.lm_head",
+      "before_name": "ncclDevKernel_AllGather",
+      "type": "model",
+      "role": "MTP shared language-model head",
+      "cross_rank": "independent",
+      "slot_suffixes": ["mtp.step_0.head.lm_head", "mtp.recurrent.head.lm_head"],
+      "note": "Completion of the mapped vocabulary projection before logits gathering. All-gather remains a separate measured operation."
+    },
+    {
+      "operation": "mtp.decoder.moe.tp_allreduce",
+      "name": "ncclDevKernel_AllReduce_Sum_bf16_RING_LL",
+      "phase": "draft",
+      "stream_role": "primary",
+      "type": "collective",
+      "role": "MTP decoder MoE TP all-reduce",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": [
+        "mtp.step_0.decoder_sparse.moe.tp_allreduce_fallback",
+        "mtp.recurrent.decoder_sparse.moe.tp_allreduce_fallback",
+        "mtp.step_0.decoder_sparse.moe.tp_allreduce",
+        "mtp.recurrent.decoder_sparse.moe.tp_allreduce"
+      ],
+      "after_name": "triton_poi_fused_add_mul_1",
+      "before_name": "triton_poi_fused_add_fused_add_rms_norm_2",
+      "note": "NCCL variant of the reviewed MTP MoE reduction: shared/routed output addition feeds the sum, followed by the predictor's residual addition and shared-head norm. Same semantic slots and neighbors as the multimem variant."
+    },
+    {
+      "operation": "mtp.decoder.moe.tp_allreduce",
+      "name": "cross_device_reduce_2stage<__nv_bfloat16",
+      "phase": "draft",
+      "stream_role": "primary",
+      "after_name": "triton_poi_fused_add_mul_0",
+      "before_name": "triton_poi_fused_add_1",
+      "type": "collective",
+      "role": "MTP decoder MoE TP all-reduce",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": [
+        "mtp.step_0.decoder_sparse.moe.tp_allreduce_fallback",
+        "mtp.recurrent.decoder_sparse.moe.tp_allreduce_fallback",
+        "mtp.step_0.decoder_sparse.moe.tp_allreduce",
+        "mtp.recurrent.decoder_sparse.moe.tp_allreduce"
+      ],
+      "note": "Two-stage custom TP reduction of the shared+routed MoE output, followed by predictor residual addition. The embedding reduction uses different neighbors and remains separately unmapped."
+    },
+    {
+      "status": "unmapped",
+      "operation": "mtp.embedding.tp_allreduce",
+      "cross_rank": "synchronizing",
+      "name": "cross_device_reduce_",
+      "phase": "draft",
+      "stream_role": "primary",
+      "after_name": "triton_red_fused_1",
+      "before_name": "triton_red_fused_eq_rms_norm_scalar_tensor_unsqueeze_where_2",
+      "note": "Glm4MoeMultiTokenPredictor embeds through VocabParallelEmbedding.forward, whose masked vocabulary lookup ends in a TP sum before the position-zero mask and RMSNorm. Both neighbors constrain this custom-allreduce occurrence. No simulated embedding reduction exists yet; preserve it as unmapped while joining its ranks to remove arrival wait."
+    },
+    {
+      "status": "unmapped",
+      "operation": "mtp.embedding.tp_allreduce",
+      "cross_rank": "synchronizing",
+      "name": "ncclDevKernel_AllReduce_Sum_bf16_RING_LL",
+      "phase": "draft",
+      "stream_role": "primary",
+      "after_name": "triton_red_fused_1",
+      "before_name": "triton_red_fused_eq_rms_norm_scalar_tensor_unsqueeze_where_2",
+      "note": "NCCL implementation of the same source-backed vocabulary embedding sum, constrained by the masked lookup and position-mask/RMSNorm neighbors. Unmapped is independent of collective synchronization."
+    },
+    {
+      "operation": "attention.fused_qkv_a_proj",
+      "type": "model",
+      "role": "fused Q and latent KV projection",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.fused_qkv_a_proj",
+        "body.sparse_cycle_full_index.attention.fused_qkv_a_proj",
+        "body.sparse_cycle_index_share.attention.fused_qkv_a_proj",
+        "body.sparse_initial_index_share.attention.fused_qkv_a_proj"
+      ],
+      "cross_rank": "independent",
+      "excluded_slot_prefixes": ["unified.mtp."],
+      "name": "nvjet_sm100_tst_128x256_64x6_2x1_2cta_v_bz_TNT",
+      "phase": "forward",
+      "stream_role": "primary",
+      "after": "attention.input_norm_fallback",
+      "before_name": "triton_poi_fused_3",
+      "note": "MLAAttention.forward (layers/mla.py) starts with fused_qkv_a_proj after decoder input_layernorm. This prefill tile has the same reviewed input-norm and fused Q/KV-processing neighbors as the existing 192x208 tile. Tile name alone cannot distinguish other projections."
+    },
+    {
+      "operation": "main.embedding.allreduce_fallback",
+      "name": "ncclDevKernel_AllReduce_Sum_bf16_RING_LL",
+      "phase": "forward",
+      "stream_role": "primary",
+      "type": "collective",
+      "role": "main.embedding.allreduce_fallback",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": ["main.embedding.tp_allreduce_fallback"],
+      "after_name": "embedding_ge_lt_masked_fill",
+      "before_name": "triton_red_fused_rms_norm_1",
+      "note": "NCCL variant of the reviewed vocabulary embedding sum: masked embedding producer and first input norm constrain ownership. This is the main model, not the unmodeled draft embedding reduction."
+    },
+    {
+      "operation": "ffn.allreduce_fallback",
+      "name": "ncclDevKernel_AllReduce_Sum_bf16_RING_LL",
+      "phase": "forward",
+      "stream_role": "primary",
+      "type": "collective",
+      "role": "ffn.allreduce_fallback",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": ["body.dense_full_index.ffn.tp_allreduce_fallback"],
+      "after_name": "nvjet_sm100_tst_",
+      "before_name": "triton_red_fused_fused_add_rms_norm_2",
+      "note": "NCCL variant of the reviewed dense FFN down-projection reduction. Its following next-layer input norm distinguishes it from attention output reduction. Positions without that successor remain unmapped."
+    },
+    {
+      "operation": "moe.allreduce_fallback",
+      "name": "ncclDevKernel_AllReduce_Sum_bf16_RING_LL",
+      "phase": "forward",
+      "stream_role": "primary",
+      "type": "collective",
+      "role": "moe.allreduce_fallback",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": [
+        "body.sparse_initial_index_share.moe.tp_allreduce_fallback",
+        "body.sparse_cycle_full_index.moe.tp_allreduce_fallback",
+        "body.sparse_cycle_index_share.moe.tp_allreduce_fallback"
+      ],
+      "after_name": "triton_poi_fused_add_mul_1",
+      "before_name": "triton_red_fused_fused_add_rms_norm_2",
+      "note": "NCCL variant of the reviewed MoE sum following shared/routed output combination and preceding the next decoder input norm. Does not absorb the neighboring pointwise work."
+    },
+    {
+      "operation": "attention.input_norm_fallback",
+      "name": "triton_red_fused_fused_add_rms_norm_2",
+      "phase": "forward",
+      "stream_role": "primary",
+      "type": "model",
+      "role": "attention.input_norm_fallback",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.input_add_rms_norm",
+        "body.sparse_initial_index_share.attention.input_add_rms_norm",
+        "body.sparse_cycle_full_index.attention.input_add_rms_norm",
+        "body.sparse_cycle_index_share.attention.input_add_rms_norm"
+      ],
+      "after_name": "ncclDevKernel_AllReduce_Sum_bf16_RING_LL",
+      "before_name": "nvjet_sm100_tst_",
+      "note": "Next-layer input residual norm after the unfused NCCL reduction, with a following projection. Same boundary as the reviewed multimem rule; a terminal norm without a successor remains unmapped."
+    },
+    {
+      "operation": "attention.allreduce_fallback",
+      "name": "ncclDevKernel_AllReduce_Sum_bf16_RING_LL",
+      "phase": "forward",
+      "stream_role": "primary",
+      "type": "collective",
+      "role": "attention.allreduce_fallback",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.tp_allreduce",
+        "body.sparse_initial_index_share.attention.tp_allreduce",
+        "body.sparse_cycle_full_index.attention.tp_allreduce",
+        "body.sparse_cycle_index_share.attention.tp_allreduce"
+      ],
+      "after": "attention.o_proj",
+      "before_name": "triton_red_fused_fused_add_rms_norm",
+      "note": "The BF16 NCCL sum follows the mapped attention output projection and precedes residual RMSNorm. This is the unfused attention TP reduction; the following norm remains a separate operation. Same ownership as the multimem fallback, with a distinct measured implementation."
+    },
+    {
+      "operation": "mtp.decoder.attention.allreduce_fallback",
+      "name": "ncclDevKernel_AllReduce_Sum_bf16_RING_LL",
+      "phase": "draft",
+      "stream_role": "primary",
+      "type": "collective",
+      "role": "mtp.decoder.attention.allreduce_fallback",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": [
+        "mtp.step_0.decoder_sparse.attention.tp_allreduce",
+        "mtp.recurrent.decoder_sparse.attention.tp_allreduce"
+      ],
+      "after": "mtp.decoder.attention.o_proj",
+      "before_name": "triton_red_fused_fused_add_rms_norm_moe_forward_shared_0",
+      "note": "Draft attention output projection feeds this BF16 NCCL sum and then the decoder post-attention residual RMSNorm. This does not label the distinct MTP vocabulary embedding collective."
+    },
+    {
+      "operation": "main.embedding.allreduce_fallback",
+      "name": "multimem_all_reduce_kernel",
+      "phase": "forward",
+      "stream_role": "primary",
+      "type": "collective",
+      "role": "main.embedding.allreduce_fallback",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": [
+        "main.embedding.tp_allreduce_fallback"
+      ],
+      "after_name": "embedding_ge_lt_masked_fill",
+      "before_name": "triton_red_fused_rms_norm_1",
+      "note": "SymmMemCommunicator.all_reduce invokes multimem_all_reduce_ with sum. Same-stream producer and following norm distinguish embedding, attention, dense FFN and MoE ownership. This is the unfused collective only; independent residual RMSNorm is not charged to it. CostTree fallback slots are separate from fusion slots. Synchronizing reduction must be recomputed by Analyzer."
+    },
+    {
+      "operation": "attention.allreduce_fallback",
+      "name": "multimem_all_reduce_kernel",
+      "phase": "forward",
+      "stream_role": "primary",
+      "type": "collective",
+      "role": "attention.allreduce_fallback",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.tp_allreduce",
+        "body.sparse_initial_index_share.attention.tp_allreduce",
+        "body.sparse_cycle_full_index.attention.tp_allreduce",
+        "body.sparse_cycle_index_share.attention.tp_allreduce"
+      ],
+      "after": "attention.o_proj",
+      "before_name": "triton_red_fused_fused_add_rms_norm",
+      "note": "SymmMemCommunicator.all_reduce invokes multimem_all_reduce_ with sum. Same-stream producer and following norm distinguish embedding, attention, dense FFN and MoE ownership. This is the unfused collective only; independent residual RMSNorm is not charged to it. CostTree fallback slots are separate from fusion slots. Synchronizing reduction must be recomputed by Analyzer."
+    },
+    {
+      "operation": "moe.allreduce_fallback",
+      "name": "multimem_all_reduce_kernel",
+      "phase": "forward",
+      "stream_role": "primary",
+      "type": "collective",
+      "role": "moe.allreduce_fallback",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": [
+        "body.sparse_initial_index_share.moe.tp_allreduce_fallback",
+        "body.sparse_cycle_full_index.moe.tp_allreduce_fallback",
+        "body.sparse_cycle_index_share.moe.tp_allreduce_fallback"
+      ],
+      "after_name": "triton_poi_fused_add_mul_1",
+      "before_name": "triton_red_fused_fused_add_rms_norm_2",
+      "note": "SymmMemCommunicator.all_reduce invokes multimem_all_reduce_ with sum. Same-stream producer and following norm distinguish embedding, attention, dense FFN and MoE ownership. This is the unfused collective only; independent residual RMSNorm is not charged to it. CostTree fallback slots are separate from fusion slots. Synchronizing reduction must be recomputed by Analyzer."
+    },
+    {
+      "operation": "ffn.allreduce_fallback",
+      "name": "multimem_all_reduce_kernel",
+      "phase": "forward",
+      "stream_role": "primary",
+      "type": "collective",
+      "role": "ffn.allreduce_fallback",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": [
+        "body.dense_full_index.ffn.tp_allreduce_fallback"
+      ],
+      "after_name": "nvjet_sm100_tst_",
+      "before_name": "triton_red_fused_fused_add_rms_norm_2",
+      "note": "SymmMemCommunicator.all_reduce invokes multimem_all_reduce_ with sum. Same-stream producer and following norm distinguish embedding, attention, dense FFN and MoE ownership. This is the unfused collective only; independent residual RMSNorm is not charged to it. CostTree fallback slots are separate from fusion slots. Synchronizing reduction must be recomputed by Analyzer."
+    },
+    {
+      "operation": "ffn.post_attention_norm_fallback",
+      "name": "triton_red_fused_fused_add_rms_norm_0",
+      "phase": "forward",
+      "stream_role": "primary",
+      "type": "model",
+      "role": "ffn.post_attention_norm_fallback",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.ffn.post_attn_add_rms_norm"
+      ],
+      "after": "attention.allreduce_fallback",
+      "note": "The decoder executes input_layernorm before attention and post_attention_layernorm between attention and MLP. Same-stream fallback collective plus projection/router distinguishes these boundaries. A terminal norm without a successor remains unmapped because folded-body end can be either a model boundary or a repeat boundary."
+    },
+    {
+      "operation": "moe.post_attention_norm_fallback",
+      "name": "triton_red_fused_fused_add_rms_norm_moe_forward_shared_0",
+      "phase": "forward",
+      "stream_role": "primary",
+      "type": "model",
+      "role": "moe.post_attention_norm_fallback",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.sparse_initial_index_share.moe.router.post_attn_add_rms_norm",
+        "body.sparse_cycle_full_index.moe.router.post_attn_add_rms_norm",
+        "body.sparse_cycle_index_share.moe.router.post_attn_add_rms_norm"
+      ],
+      "after": "attention.allreduce_fallback",
+      "before": "moe.router",
+      "note": "The decoder executes input_layernorm before attention and post_attention_layernorm between attention and MLP. Same-stream fallback collective plus projection/router distinguishes these boundaries. A terminal norm without a successor remains unmapped because folded-body end can be either a model boundary or a repeat boundary."
+    },
+    {
+      "operation": "mtp.decoder.attention.allreduce_fallback",
+      "name": "multimem_all_reduce_kernel",
+      "phase": "draft",
+      "stream_role": "primary",
+      "type": "collective",
+      "role": "mtp.decoder.attention.allreduce_fallback",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": [
+        "mtp.step_0.decoder_sparse.attention.tp_allreduce",
+        "mtp.recurrent.decoder_sparse.attention.tp_allreduce"
+      ],
+      "after": "mtp.decoder.attention.o_proj",
+      "before_name": "triton_red_fused_fused_add_rms_norm_moe_forward_shared_0",
+      "note": "SymmMemCommunicator.all_reduce invokes multimem_all_reduce_ with sum. Same-stream producer and following norm distinguish embedding, attention, dense FFN and MoE ownership. This is the unfused collective only; independent residual RMSNorm is not charged to it. CostTree fallback slots are separate from fusion slots. Synchronizing reduction must be recomputed by Analyzer."
+    },
+    {
+      "operation": "mtp.decoder.moe.post_attention_norm_fallback",
+      "name": "triton_red_fused_fused_add_rms_norm_moe_forward_shared_0",
+      "phase": "draft",
+      "stream_role": "primary",
+      "type": "model",
+      "role": "mtp.decoder.moe.post_attention_norm_fallback",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "mtp.step_0.decoder_sparse.moe.router.post_attn_add_rms_norm",
+        "mtp.recurrent.decoder_sparse.moe.router.post_attn_add_rms_norm"
+      ],
+      "after": "mtp.decoder.attention.allreduce_fallback",
+      "before_name": "nvjet_sm100_tst_",
+      "note": "The decoder executes input_layernorm before attention and post_attention_layernorm between attention and MLP. Same-stream fallback collective plus projection/router distinguishes these boundaries. A terminal norm without a successor remains unmapped because folded-body end can be either a model boundary or a repeat boundary."
+    },
+    {
+      "operation": "mtp.decoder.moe.tp_allreduce",
+      "name": "multimem_all_reduce_kernel",
+      "phase": "draft",
+      "stream_role": "primary",
+      "type": "collective",
+      "role": "MTP decoder MoE TP all-reduce",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": [
+        "mtp.step_0.decoder_sparse.moe.tp_allreduce_fallback",
+        "mtp.recurrent.decoder_sparse.moe.tp_allreduce_fallback",
+        "mtp.step_0.decoder_sparse.moe.tp_allreduce",
+        "mtp.recurrent.decoder_sparse.moe.tp_allreduce"
+      ],
+      "after_name": "triton_poi_fused_add_mul_1",
+      "before_name": "triton_poi_fused_add_fused_add_rms_norm_2",
+      "note": "SymmMemCommunicator.all_reduce invokes multimem_all_reduce_ with sum. Same-stream producer and following norm distinguish embedding, attention, dense FFN and MoE ownership. This is the unfused collective only; independent residual RMSNorm is not charged to it. CostTree fallback slots are separate from fusion slots. Synchronizing reduction must be recomputed by Analyzer."
+    },
+    {
+      "operation": "mtp.decoder.indexer.q_quant",
+      "name": "per_token_group_quant_8bit_kernel",
+      "phase": "draft",
+      "stream_role": "primary",
+      "type": "model",
+      "role": "mtp.decoder.indexer.q_quant",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "mtp.step_0.decoder_sparse.attention.indexer.q_quant",
+        "mtp.recurrent.decoder_sparse.attention.indexer.q_quant"
+      ],
+      "before_name": "triton_poi_fused_mul_slice_unsqueeze_view_7",
+      "note": "MTP calls the shared DeepseekV2Indexer.forward: FP8 query quantization, weight scaling, cache insertion, then prefill/decode logits and top-k. The rule requires draft phase and the captured same-stream producer or consumer; target slots are excluded by the explicit MTP suffixes. Source: vllm/model_executor/models/deepseek_v2.py DeepseekV2Indexer.forward and the DSA attention backend."
+    },
+    {
+      "operation": "mtp.decoder.indexer.weight_scale",
+      "name": "triton_poi_fused_mul_slice_unsqueeze_view_7",
+      "phase": "draft",
+      "stream_role": "primary",
+      "type": "model",
+      "role": "mtp.decoder.indexer.weight_scale",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "mtp.step_0.decoder_sparse.attention.indexer.weight_scale",
+        "mtp.recurrent.decoder_sparse.attention.indexer.weight_scale"
+      ],
+      "after_name": "per_token_group_quant_8bit_kernel",
+      "before_name": "indexer_k_quant_and_cache_kernel",
+      "note": "MTP calls the shared DeepseekV2Indexer.forward: FP8 query quantization, weight scaling, cache insertion, then prefill/decode logits and top-k. The rule requires draft phase and the captured same-stream producer or consumer; target slots are excluded by the explicit MTP suffixes. Source: vllm/model_executor/models/deepseek_v2.py DeepseekV2Indexer.forward and the DSA attention backend."
+    },
+    {
+      "operation": "mtp.decoder.indexer.index_cache_append",
+      "name": "indexer_k_quant_and_cache_kernel",
+      "phase": "draft",
+      "stream_role": "primary",
+      "type": "model",
+      "role": "mtp.decoder.indexer.index_cache_append",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "mtp.step_0.decoder_sparse.attention.indexer.index_cache_append",
+        "mtp.recurrent.decoder_sparse.attention.indexer.index_cache_append"
+      ],
+      "after_name": "triton_poi_fused_mul_slice_unsqueeze_view_7",
+      "note": "MTP calls the shared DeepseekV2Indexer.forward: FP8 query quantization, weight scaling, cache insertion, then prefill/decode logits and top-k. The rule requires draft phase and the captured same-stream producer or consumer; target slots are excluded by the explicit MTP suffixes. Source: vllm/model_executor/models/deepseek_v2.py DeepseekV2Indexer.forward and the DSA attention backend."
+    },
+    {
+      "operation": "mtp.decoder.indexer.topk_buffer_fill",
+      "name": "FillFunctor<int>",
+      "phase": "draft",
+      "stream_role": "primary",
+      "type": "model",
+      "role": "mtp.decoder.indexer.topk_buffer_fill",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "mtp.step_0.decoder_sparse.attention.indexer.topk_buffer_fill",
+        "mtp.recurrent.decoder_sparse.attention.indexer.topk_buffer_fill"
+      ],
+      "after": "mtp.decoder.indexer.index_cache_append",
+      "note": "MTP calls the shared DeepseekV2Indexer.forward: FP8 query quantization, weight scaling, cache insertion, then prefill/decode logits and top-k. The rule requires draft phase and the captured same-stream producer or consumer; target slots are excluded by the explicit MTP suffixes. Source: vllm/model_executor/models/deepseek_v2.py DeepseekV2Indexer.forward and the DSA attention backend."
+    },
+    {
+      "operation": "mtp.decoder.indexer.prefill_cache_gather",
+      "name": "cp_gather_indexer_k_quant_cache_kernel",
+      "phase": "draft",
+      "stream_role": "primary",
+      "type": "model",
+      "role": "mtp.decoder.indexer.prefill_cache_gather",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "mtp.step_0.decoder_sparse.attention.indexer.prefill_cache_gather",
+        "mtp.recurrent.decoder_sparse.attention.indexer.prefill_cache_gather"
+      ],
+      "before_name": "sm100_fp8_mqa_logits<",
+      "note": "MTP calls the shared DeepseekV2Indexer.forward: FP8 query quantization, weight scaling, cache insertion, then prefill/decode logits and top-k. The rule requires draft phase and the captured same-stream producer or consumer; target slots are excluded by the explicit MTP suffixes. Source: vllm/model_executor/models/deepseek_v2.py DeepseekV2Indexer.forward and the DSA attention backend."
+    },
+    {
+      "operation": "mtp.decoder.indexer.prefill_logits",
+      "name": "sm100_fp8_mqa_logits<",
+      "phase": "draft",
+      "stream_role": "primary",
+      "type": "model",
+      "role": "mtp.decoder.indexer.prefill_logits",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "mtp.step_0.decoder_sparse.attention.indexer.prefill_logits",
+        "mtp.recurrent.decoder_sparse.attention.indexer.prefill_logits"
+      ],
+      "after_name": "cp_gather_indexer_k_quant_cache_kernel",
+      "before_name": "topKPerRowPrefill",
+      "note": "MTP calls the shared DeepseekV2Indexer.forward: FP8 query quantization, weight scaling, cache insertion, then prefill/decode logits and top-k. The rule requires draft phase and the captured same-stream producer or consumer; target slots are excluded by the explicit MTP suffixes. Source: vllm/model_executor/models/deepseek_v2.py DeepseekV2Indexer.forward and the DSA attention backend."
+    },
+    {
+      "operation": "mtp.decoder.indexer.prefill_topk",
+      "name": "topKPerRowPrefill",
+      "phase": "draft",
+      "stream_role": "primary",
+      "type": "model",
+      "role": "mtp.decoder.indexer.prefill_topk",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "mtp.step_0.decoder_sparse.attention.indexer.prefill_topk",
+        "mtp.recurrent.decoder_sparse.attention.indexer.prefill_topk"
+      ],
+      "after_name": "sm100_fp8_mqa_logits<",
+      "note": "MTP calls the shared DeepseekV2Indexer.forward: FP8 query quantization, weight scaling, cache insertion, then prefill/decode logits and top-k. The rule requires draft phase and the captured same-stream producer or consumer; target slots are excluded by the explicit MTP suffixes. Source: vllm/model_executor/models/deepseek_v2.py DeepseekV2Indexer.forward and the DSA attention backend."
+    },
+    {
+      "operation": "mtp.decoder.indexer.decode_logits",
+      "name": "sm100_fp8_paged_mqa_logits<",
+      "phase": "draft",
+      "stream_role": "primary",
+      "type": "model",
+      "role": "mtp.decoder.indexer.decode_logits",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "mtp.step_0.decoder_sparse.attention.indexer.decode_logits",
+        "mtp.recurrent.decoder_sparse.attention.indexer.decode_logits"
+      ],
+      "before_name": "persistent_topk_kernel",
+      "note": "MTP calls the shared DeepseekV2Indexer.forward: FP8 query quantization, weight scaling, cache insertion, then prefill/decode logits and top-k. The rule requires draft phase and the captured same-stream producer or consumer; target slots are excluded by the explicit MTP suffixes. Source: vllm/model_executor/models/deepseek_v2.py DeepseekV2Indexer.forward and the DSA attention backend."
+    },
+    {
+      "operation": "mtp.decoder.indexer.decode_topk",
+      "name": "persistent_topk_kernel",
+      "phase": "draft",
+      "stream_role": "primary",
+      "type": "model",
+      "role": "mtp.decoder.indexer.decode_topk",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "mtp.step_0.decoder_sparse.attention.indexer.decode_topk",
+        "mtp.recurrent.decoder_sparse.attention.indexer.decode_topk"
+      ],
+      "after_name": "sm100_fp8_paged_mqa_logits<",
+      "before_name": "concat_and_cache_mla_kernel",
+      "note": "MTP calls the shared DeepseekV2Indexer.forward: FP8 query quantization, weight scaling, cache insertion, then prefill/decode logits and top-k. The rule requires draft phase and the captured same-stream producer or consumer; target slots are excluded by the explicit MTP suffixes. Source: vllm/model_executor/models/deepseek_v2.py DeepseekV2Indexer.forward and the DSA attention backend."
+    },
+    {
+      "operation": "attention.input_norm_fallback",
+      "name": "triton_red_fused_fused_add_rms_norm_2",
+      "phase": "forward",
+      "stream_role": "primary",
+      "type": "model",
+      "role": "attention.input_norm_fallback",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.input_add_rms_norm",
+        "body.sparse_initial_index_share.attention.input_add_rms_norm",
+        "body.sparse_cycle_full_index.attention.input_add_rms_norm",
+        "body.sparse_cycle_index_share.attention.input_add_rms_norm"
+      ],
+      "after_name": "multimem_all_reduce_kernel",
+      "before_name": "nvjet_sm100_tst_",
+      "note": "The decoder executes input_layernorm before attention and post_attention_layernorm between attention and MLP. Same-stream fallback collective plus projection/router distinguishes these boundaries. A terminal norm without a successor remains unmapped because folded-body end can be either a model boundary or a repeat boundary."
+    },
+    {
+      "operation": "attention.input_norm_fallback",
+      "name": "triton_red_fused_rms_norm_1",
+      "phase": "forward",
+      "stream_role": "primary",
+      "type": "model",
+      "role": "attention.input_norm_fallback",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.input_add_rms_norm",
+        "body.sparse_initial_index_share.attention.input_add_rms_norm",
+        "body.sparse_cycle_full_index.attention.input_add_rms_norm",
+        "body.sparse_cycle_index_share.attention.input_add_rms_norm"
+      ],
+      "after": "main.embedding.allreduce_fallback",
+      "before_name": "nvjet_sm100_tst_",
+      "note": "The decoder executes input_layernorm before attention and post_attention_layernorm between attention and MLP. Same-stream fallback collective plus projection/router distinguishes these boundaries. A terminal norm without a successor remains unmapped because folded-body end can be either a model boundary or a repeat boundary."
+    },
+    {
+      "operation": "attention.fused_qkv_a_proj",
+      "type": "model",
+      "role": "fused Q and latent KV projection",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.fused_qkv_a_proj",
+        "body.sparse_cycle_full_index.attention.fused_qkv_a_proj",
+        "body.sparse_cycle_index_share.attention.fused_qkv_a_proj",
+        "body.sparse_initial_index_share.attention.fused_qkv_a_proj"
+      ],
+      "cross_rank": "independent",
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ],
+      "name": "nvjet_sm100_tst_192x208_64x5_2x1_2cta_v_bz_TNT",
+      "phase": "forward",
+      "stream_role": "primary",
+      "after": "attention.input_norm_fallback",
+      "before_name": "triton_poi_fused_3",
+      "note": "Projection/activation owner is constrained by phase and same-stream neighboring model operation. QKV candidate additionally fixes the observed tile and immediate successor. Ambiguous reordered projections and numbered Triton norm kernels are not generalized by name."
+    },
+    {
+      "operation": "ffn.down_proj",
+      "type": "model",
+      "role": "dense FFN down projection",
+      "slot_suffixes": [
+        "body.dense_full_index.ffn.down_proj"
+      ],
+      "cross_rank": "independent",
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ],
+      "name": "nvjet_sm100_tst_",
+      "phase": "forward",
+      "stream_role": "primary",
+      "before": "ffn.allreduce_fallback",
+      "note": "Projection/activation owner is constrained by phase and same-stream neighboring model operation. QKV candidate additionally fixes the observed tile and immediate successor. Ambiguous reordered projections and numbered Triton norm kernels are not generalized by name."
+    },
+    {
+      "operation": "ffn.gate_up_proj",
+      "type": "model",
+      "role": "dense FFN gate and up projection",
+      "slot_suffixes": [
+        "ffn.gate_up_proj"
+      ],
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ],
+      "name": "nvjet_sm100_tst_",
+      "phase": "forward",
+      "stream_role": "primary",
+      "after": "ffn.post_attention_norm_fallback",
+      "before_name": "triton_poi_fused_mul_silu_slice_1",
+      "note": "Projection/activation owner is constrained by phase and same-stream neighboring model operation. QKV candidate additionally fixes the observed tile and immediate successor. Ambiguous reordered projections and numbered Triton norm kernels are not generalized by name."
+    },
+    {
+      "operation": "ffn.silu_and_mul",
+      "type": "model",
+      "role": "dense FFN SiLU and multiply",
+      "slot_suffixes": [
+        "body.dense_full_index.ffn.silu_and_mul"
+      ],
+      "cross_rank": "independent",
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ],
+      "name": "triton_poi_fused_mul_silu_slice_1",
+      "phase": "forward",
+      "stream_role": "primary",
+      "after": "ffn.gate_up_proj",
+      "note": "Projection/activation owner is constrained by phase and same-stream neighboring model operation. QKV candidate additionally fixes the observed tile and immediate successor. Ambiguous reordered projections and numbered Triton norm kernels are not generalized by name."
+    }
+  ]
+}

@@ -3022,7 +3022,10 @@ mod tests {
                         query_len: verify_width,
                     })
                     .collect(),
-                total_kv_len: decode_kv_lens.iter().sum(),
+                total_kv_len: decode_kv_lens
+                    .iter()
+                    .map(|length| length.saturating_sub(verify_width))
+                    .sum(),
             }],
             tokens_per_source_rank: Vec::new(),
         }
@@ -3150,6 +3153,31 @@ mod tests {
                 "{prefix} has slots of its own"
             );
         }
+        // Campaign rules must resolve against the compiled tree, including the
+        // shared recurrent subtree introduced by the clean implementation.
+        let mut unresolved = std::collections::BTreeSet::new();
+        for encoded in [
+            include_str!(
+                "../../../presets/alignment/glm52_nvfp4_b200_spec5/label_rules/rules.json"
+            ),
+            include_str!(
+                "../../../presets/alignment/glm52_nvfp4_b200_spec5/label_rules/mtp_rules.json"
+            ),
+        ] {
+            let document: serde_json::Value = serde_json::from_str(encoded).unwrap();
+            for rule in document["rules"].as_array().unwrap() {
+                for suffix in rule["slot_suffixes"].as_array().unwrap() {
+                    let suffix = suffix.as_str().unwrap();
+                    if !slot_names.iter().any(|name| name.ends_with(suffix)) {
+                        unresolved.insert(suffix.to_string());
+                    }
+                }
+            }
+        }
+        assert!(
+            unresolved.is_empty(),
+            "unresolved campaign slot suffixes: {unresolved:#?}"
+        );
     }
 
     #[test]
@@ -3178,6 +3206,72 @@ mod tests {
             &bridge
         )
         .is_err());
+    }
+
+    #[test]
+    fn speculative_necessary_work_maps_cover_the_compiled_locations() {
+        use std::collections::BTreeSet;
+        let routing = RoutingDistribution::uniform(NUM_EXPERTS);
+        let bridge = PerfApiBridge::new_uninit_for_test();
+        bridge.enable_enumerate();
+        for ep in [4, 8] {
+            for (mode, depth, encoded) in [
+                (
+                    Glm52MtpMode::IndexShare,
+                    5,
+                    include_str!(
+                        "../../../model/work/location_maps/glm52_speculative_index_share.json"
+                    ),
+                ),
+                (
+                    Glm52MtpMode::FullIndex,
+                    5,
+                    include_str!(
+                        "../../../model/work/location_maps/glm52_speculative_full_index.json"
+                    ),
+                ),
+                (
+                    Glm52MtpMode::IndexShare,
+                    1,
+                    include_str!(
+                        "../../../model/work/location_maps/glm52_speculative_single_draft.json"
+                    ),
+                ),
+            ] {
+                let cfg = build_speculative_configs(
+                    &model(),
+                    &parallel(ep),
+                    &routing,
+                    &routing,
+                    false,
+                    mode,
+                    depth,
+                )
+                .unwrap();
+                let built =
+                    build_speculative("unified".into(), resolve_configs(&cfg), &bridge).unwrap();
+                let manifest = built.cost_tree();
+                let actual: BTreeSet<_> = manifest
+                    .slots
+                    .iter()
+                    .filter(|slot| {
+                        !matches!(
+                            slot.kind.as_str(),
+                            "all_reduce" | "all_reduce_fusion" | "all_reduce_residual_rms_norm"
+                        )
+                    })
+                    .map(|slot| slot.name.as_str())
+                    .collect();
+                let map: serde_json::Value = serde_json::from_str(encoded).unwrap();
+                let mapped: BTreeSet<_> = map["locations"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|row| row["location"].as_str().unwrap())
+                    .collect();
+                assert_eq!(actual, mapped, "EP={ep}, depth={depth}, mode={mode:?}");
+            }
+        }
     }
 
     #[test]
