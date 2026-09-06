@@ -97,9 +97,9 @@ const fn default_glm52_speculative_mtp_mode() -> Glm52MtpMode {
     Glm52MtpMode::IndexShare
 }
 
-/// GLM-5.2's published MTP proposer drafts three candidates per step.
+/// Default to the measured Spec5 workload; depth remains an execution choice.
 const fn default_glm52_draft_tokens() -> u32 {
-    3
+    5
 }
 
 /// Iteration-wise arch provider. Sharding parameters live only on the variants
@@ -360,11 +360,15 @@ pub enum IterArchSel {
         /// verify width at `draft_tokens + 1`, which selects a profiled kernel
         /// shape and so cannot vary per iteration.
         #[serde(default = "default_glm52_draft_tokens")]
-        #[param(default = 3, cache_key)]
+        #[param(default = 5, cache_key)]
         draft_tokens: u32,
         #[serde(default)]
         #[param(cache_key)]
         expert_popularity_file: Option<String>,
+        /// Role-tagged MTP routing from the same replay as the target profile.
+        #[serde(default)]
+        #[param(cache_key)]
+        draft_expert_popularity_file: Option<String>,
     },
     /// SGLang's B200 NVFP4 launch graph under pure tensor parallelism. Every
     /// rank owns all experts (EP1) and shards the routed intermediate axis by

@@ -111,13 +111,22 @@ impl<M: SpeculativeUnifiedModel> SpeculativeIterExecution<M> {
                         "completed request {} remained in speculative decode membership",
                         request.0
                     );
+                    // A capped endpoint would silently discard resident keys
+                    // while still billing every query. Variable-width boundary
+                    // batches need their own model input/profile support.
+                    let final_context = current_kv.checked_add(u64::from(verify_width));
+                    assert!(
+                        final_context.is_some_and(|end| end <= u64::from(max_model_len)),
+                        "fixed-width speculative verify exceeds max_model_len for request {}: \
+                         resident_kv={current_kv}, query_width={verify_width}, \
+                         max_model_len={max_model_len}; variable-width boundary batches are unsupported",
+                        request.0
+                    );
                     let current_kv = current_kv as u32;
                     group.decode_requests.push(SpeculativeDecodeInput {
-                        // The last verify row attends over the resident KV plus
-                        // every drafted position ahead of it, clamped at the
-                        // model limit — the width stays fixed, only the context
-                        // stops growing.
-                        kv_len: (current_kv + self.draft_tokens).min(max_model_len),
+                        // Resident KV excludes the pending target input token.
+                        // Every query, including that token, extends context.
+                        kv_len: current_kv + verify_width,
                         query_len: verify_width,
                     });
                     group.total_kv_len += current_kv;
@@ -189,7 +198,7 @@ mod tests {
     const PROMPT_TOKENS: u32 = 8;
 
     /// Answers only what the adapter reads: layout facts and the model length
-    /// that clamps a verify group's final row.
+    /// that bounds a complete verify window.
     struct FakeSpeculativeModel;
 
     impl SpeculativeUnifiedModel for FakeSpeculativeModel {
@@ -311,15 +320,13 @@ mod tests {
         assert!(group
             .decode_requests
             .iter()
-            .all(|d| d.kv_len == PROMPT_TOKENS + DRAFT_TOKENS));
+            .all(|d| d.kv_len == PROMPT_TOKENS + DRAFT_TOKENS + 1));
     }
 
     #[test]
-    fn a_verify_group_at_the_model_limit_clamps_its_context_not_its_width() {
-        // Widening past the profiled shape would select a kernel the model was
-        // never compiled for; the contract says clamp `kv_len` instead.
+    fn a_complete_verify_window_can_end_at_the_model_limit() {
         let execution = execution();
-        let (kv_store, requests) = resident_decodes(1, MAX_MODEL_LEN - 1);
+        let (kv_store, requests) = resident_decodes(1, MAX_MODEL_LEN - DRAFT_TOKENS - 1);
         let mut input = SpeculativeArchInput::default();
 
         execution.build_input(&kv_store, &requests, &plan_running_decode(true), &mut input);
@@ -327,6 +334,19 @@ mod tests {
         let decode = input.groups[0].decode_requests[0];
         assert_eq!(decode.kv_len, MAX_MODEL_LEN);
         assert_eq!(decode.query_len, DRAFT_TOKENS + 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "fixed-width speculative verify exceeds max_model_len")]
+    fn a_partial_verify_window_cannot_discard_resident_context() {
+        let execution = execution();
+        let (kv_store, requests) = resident_decodes(1, MAX_MODEL_LEN - DRAFT_TOKENS);
+        execution.build_input(
+            &kv_store,
+            &requests,
+            &plan_running_decode(true),
+            &mut SpeculativeArchInput::default(),
+        );
     }
 
     #[test]

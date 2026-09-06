@@ -331,16 +331,16 @@ pub enum IterWorkerSel {
         max_batch_tokens: u32,
         /// Candidate positions drafted per request per iteration. Must equal the
         /// arch selector's `draft_tokens`: it picks the profiled verify shape.
-        #[param(default = 3, cache_key)]
+        #[param(default = 5, cache_key)]
         draft_tokens: u32,
         /// Seed for the per-iteration acceptance draws. None uses `0`; this
         /// selects which deterministic stream, not whether there is one.
         #[serde(default)]
         acceptance_seed: Option<u64>,
         /// How resident decode shares an iteration with chunked prefill. See
-        /// [`IterWorkerSel::ChunkedPrefill`], which requires the field; here it
-        /// defaults, because a speculative preset's whole point is the decode
-        /// side and `mix` is the only composition that lets it run.
+        /// [`IterWorkerSel::ChunkedPrefill`]. Defaults to mixed batches;
+        /// separate-prefill-priority also works and defers resident decode
+        /// while a prefill batch runs.
         #[serde(default = "default_batch_policy")]
         #[param(string, default = "mix", choices = BATCH_POLICY_CHOICES)]
         batch_policy: BatchPolicy,

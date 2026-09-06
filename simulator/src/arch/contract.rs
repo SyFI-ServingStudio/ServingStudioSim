@@ -208,8 +208,9 @@ pub trait IterwiseUnifiedModel: Send + Sync + 'static {
 // ── speculative iter-wise contract ───────────────────────────────────────────
 //
 // A speculative iteration is not an ordinary iteration with more tokens. One
-// decode request presents `k + 1` query rows to the target verify pass and one
-// row to each of the `k` draft passes, so "decode rows" and "decode requests"
+// decode request presents `k + 1` query rows to the target verify pass. The MTP
+// first pass consumes those rows and recurrent passes consume endpoints, so
+// "decode rows" and "decode requests"
 // stop being the same number and the lm-head row count stops following either.
 //
 // `ArchGroupInput::request_count` documents the rule this obeys: an input mode
@@ -229,8 +230,8 @@ pub trait IterwiseUnifiedModel: Send + Sync + 'static {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SpeculativeDecodeInput {
     /// Timing context visible to the final query row of this request's verify
-    /// group. A full-width verify at the model-length boundary clamps this to
-    /// the model limit; durable KV advancement still follows accepted tokens.
+    /// group. It includes all resident keys and every query row; a full-width
+    /// window must fit the model limit. Durable KV advances by accepted tokens.
     pub kv_len: u32,
     /// Query rows emitted for this request in the current verify group.
     pub query_len: u32,
@@ -342,8 +343,8 @@ pub trait SpeculativeUnifiedModel: Send + Sync + 'static {
     /// See [`IterwiseUnifiedModel::total_kv_bytes_per_token`].
     fn total_kv_bytes_per_token(&self) -> u64;
 
-    /// Maximum context accepted by the model's timing kernels. A verify group
-    /// reaching this bound clamps its final row rather than widening the shape.
+    /// Maximum context accepted by the model's timing kernels. A complete
+    /// fixed-width verify window must fit within this bound.
     fn max_model_len(&self) -> u32;
 
     /// See [`IterwiseUnifiedModel::gpus_per_replica`].

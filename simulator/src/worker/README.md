@@ -210,6 +210,11 @@ Execution owns the model, reusable input buffer shape, and `CostBuffers`:
   constant because it selects a profiled kernel shape; how far a request actually
   advances after the verify belongs to the lifecycle's `DecodeCompletion`, not
   here.
+  The complete verify window must fit within `max_model_len`. A boundary batch
+  that requires fewer query rows fails explicitly; clipping only the context
+  would discard resident keys and invalidate necessary-work conservation.
+  vLLM can shorten these boundary batches, which this fixed-width model does
+  not yet represent.
 - `AttentionLayerExecutionAdapter` builds one slot's `AttnArchInput` and costs
   one attention layer.
 - `FfnSectionExecutionAdapter` splits token counts across FFN DP groups and

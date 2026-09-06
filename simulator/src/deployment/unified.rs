@@ -512,6 +512,7 @@ impl Deployment for UnifiedDeployment {
                 mtp_mode,
                 draft_tokens,
                 expert_popularity_file,
+                draft_expert_popularity_file,
                 ..
             } => {
                 ensure_speculative(&g.worker, *draft_tokens)?;
@@ -529,6 +530,7 @@ impl Deployment for UnifiedDeployment {
                     *routing_seed,
                     *mtp_mode,
                     expert_popularity_file.as_deref(),
+                    draft_expert_popularity_file.as_deref(),
                     *draft_tokens,
                     &gpu_name,
                     MODEL_NAME,
@@ -636,7 +638,7 @@ fn ssm_checkpoint_interval_tokens(worker: &IterWorkerSel) -> Option<u32> {
     }
 }
 
-/// The verify width, carried by the `speculative` selector only. Every other
+/// Draft candidate count, carried by the `speculative` selector only. Every other
 /// worker leaves it at `0`, which is what marks it as not speculating.
 fn speculative_draft_tokens(worker: &IterWorkerSel) -> u32 {
     match worker {
