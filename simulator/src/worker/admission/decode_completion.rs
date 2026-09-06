@@ -162,7 +162,7 @@ impl<K: IterWorkerKv> DecodeCompletion<K> for SpeculativeDecodeCompletion {
         }
         {
             let mut store = context.requests.borrow_mut();
-            kv_store.visit_decode_members(partition, |request, _| {
+            kv_store.visit_decode_members(partition, |request, resident_kv| {
                 let record = &mut store[request];
                 let accept_rate = match &record.request.definition.decoding {
                     DecodingStrategy::Speculative { accept_rate } => accept_rate,
@@ -193,6 +193,15 @@ impl<K: IterWorkerKv> DecodeCompletion<K> for SpeculativeDecodeCompletion {
                     accept_rate,
                     remaining,
                 );
+                let observation = record
+                    .telemetry
+                    .speculative
+                    .get_or_insert_with(Default::default);
+                observation.query_width = self.draft_tokens + 1;
+                observation.decode_rounds += 1;
+                observation.resident_kv_sum += resident_kv as u64;
+                observation.emitted_tokens += u64::from(accepted);
+                observation.pending_decode = None;
                 for _ in 0..accepted {
                     record.record_token(now, context.log_tokens());
                 }
@@ -267,6 +276,39 @@ mod tests {
     use crate::worker::kv::{FullAttnKv, KvStore};
 
     const DRAFT_TOKENS: u32 = 3;
+
+    #[test]
+    fn multi_round_acceptance_matches_python_diagnostic_fixture() {
+        #[derive(serde::Deserialize)]
+        struct Chain {
+            seed: u64,
+            request_id: u32,
+            output_len: u32,
+            rates: Vec<f32>,
+            emitted: Vec<u32>,
+        }
+        let chains: Vec<Chain> = serde_json::from_str(include_str!(
+            "../../../../tests/fixtures/speculative_acceptance_chains.json"
+        ))
+        .unwrap();
+        for chain in chains {
+            let policy = SpeculativeDecodeCompletion::new(chain.rates.len() as u32, chain.seed);
+            let acceptance = AcceptanceProfile::ByPosition(chain.rates);
+            let mut emitted = 1;
+            let mut observed = Vec::new();
+            while emitted < chain.output_len {
+                let count = policy.accepted_length(
+                    RequestId(chain.request_id),
+                    emitted,
+                    &acceptance,
+                    chain.output_len - emitted,
+                );
+                observed.push(count);
+                emitted += count;
+            }
+            assert_eq!(observed, chain.emitted);
+        }
+    }
 
     fn uniform(rate: f32) -> DecodingStrategy {
         DecodingStrategy::Speculative {

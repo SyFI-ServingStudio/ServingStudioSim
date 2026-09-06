@@ -48,6 +48,12 @@ pub(crate) fn build_speculative_worker<M: SpeculativeUnifiedModel>(
         "speculative worker requires speculative_draft_tokens > 0; \
          zero drafts is the chunked-prefill worker"
     );
+    assert!(
+        draft_tokens
+            .checked_add(1)
+            .is_some_and(|width| width <= max_batch_tokens),
+        "speculative verify width must fit max_batch_tokens"
+    );
     // Bounded-future admission predicts the next allocation from
     // `current_kv % page_size == 0`, which only holds while a decode advances
     // one token at a time. An accepted chain skips page boundaries, so the
@@ -131,7 +137,7 @@ mod tests {
     use crate::worker::types::{WorkerEventCommon, WorkerMsgCommon};
     use crate::worker::DecodeRetractionPolicy;
 
-    const DRAFT_TOKENS: u32 = 3;
+    const DRAFT_TOKENS: u32 = 5;
     const PROMPT_TOKENS: u32 = 8;
     const OUTPUT_TOKENS: u32 = 12;
 
@@ -148,6 +154,17 @@ mod tests {
         ) -> LeafMetrics {
             slots.clear();
             assert_eq!(batch.draft_tokens, DRAFT_TOKENS);
+            for group in &batch.groups {
+                assert_eq!(
+                    group.total_kv_len,
+                    group
+                        .decode_requests
+                        .iter()
+                        .map(|request| request.kv_len - request.query_len)
+                        .sum::<u32>(),
+                    "real KV admission stores computed context, excluding pending queries",
+                );
+            }
             lm(1.0)
         }
 
@@ -258,6 +275,19 @@ mod tests {
             let store = store.borrow();
             let record = &store[RequestId(0)];
             assert!(record.lifecycle.completed, "accept_rate={accept_rate}");
+            let observation = record.telemetry.speculative.as_ref().unwrap();
+            assert_eq!(observation.query_width, 6);
+            assert_eq!(observation.prefill_chunks, 1);
+            assert_eq!(observation.emitted_tokens, 11);
+            assert_eq!(observation.pending_decode, None);
+            assert_eq!(observation.pending_prefill, None);
+            if accept_rate == 0.0 {
+                assert_eq!(observation.decode_rounds, 11);
+                assert_eq!(observation.resident_kv_sum, 143);
+            } else if accept_rate == 1.0 {
+                assert_eq!(observation.decode_rounds, 2);
+                assert_eq!(observation.resident_kv_sum, 22);
+            }
             assert_eq!(
                 record.progress.output_tokens_emitted, OUTPUT_TOKENS,
                 "accept_rate={accept_rate}"
@@ -294,5 +324,86 @@ mod tests {
         let mut config = config(KvAdmissionConfig::FullFootprint);
         config.speculative_draft_tokens = 0;
         build(config, shared_with(&[]));
+    }
+
+    #[test]
+    #[should_panic(expected = "verify width must fit max_batch_tokens")]
+    fn a_batch_must_fit_at_least_one_verify_window() {
+        let mut config = config(KvAdmissionConfig::FullFootprint);
+        config.max_batch_tokens = Some(DRAFT_TOKENS);
+        build(config, shared_with(&[]));
+    }
+
+    #[test]
+    fn short_prefills_cannot_overfill_the_following_verify_batch() {
+        struct BoundedBatchModel;
+        impl SpeculativeUnifiedModel for BoundedBatchModel {
+            fn eval_speculative_iter(
+                &self,
+                batch: &SpeculativeArchInput,
+                slots: &mut Vec<LeafMetrics>,
+                scratch: &mut Vec<LeafMetrics>,
+            ) -> LeafMetrics {
+                assert!(batch.groups.iter().all(|group| group.batch_tokens <= 8));
+                FakeSpeculativeModel.eval_speculative_iter(batch, slots, scratch)
+            }
+            fn total_kv_bytes_per_token(&self) -> u64 {
+                1024
+            }
+            fn max_model_len(&self) -> u32 {
+                8192
+            }
+            fn gpus_per_replica(&self) -> u16 {
+                1
+            }
+        }
+        for (batch_policy, prompt_tokens) in [
+            (crate::worker::config::BatchPolicy::Mix, 1),
+            (crate::worker::config::BatchPolicy::Mix, 9),
+            (
+                crate::worker::config::BatchPolicy::SeparatePrefillPriority,
+                1,
+            ),
+            (
+                crate::worker::config::BatchPolicy::SeparatePrefillPriority,
+                9,
+            ),
+        ] {
+            let rows: Vec<_> = (0..8)
+                .map(|id| (id, prompt_tokens, if id % 3 == 0 { 1 } else { 8 }))
+                .collect();
+            let requests = shared_with(&rows);
+            for id in 0..8 {
+                requests.borrow_mut()[RequestId(id)]
+                    .request
+                    .definition
+                    .decoding = DecodingStrategy::Speculative {
+                    accept_rate: AcceptanceProfile::Uniform(0.0),
+                };
+            }
+            let mut config = config(KvAdmissionConfig::FullFootprint);
+            config.max_batch_tokens = Some(8);
+            config.batch_policy = batch_policy;
+            let mut worker = build_speculative_worker(
+                WorkerId(0),
+                "test",
+                Arc::new(BoundedBatchModel),
+                requests.clone(),
+                config,
+                None,
+                PoolId(0),
+                "test-gpu",
+                test_cluster(),
+            );
+            for id in 0..8 {
+                worker.enqueue(WorkerMsgCommon::Request(RequestId(id)));
+            }
+            for tick in 0..100 {
+                worker.tick(Time::from_ms(tick as f64), &mut Vec::new());
+            }
+            for id in 0..8 {
+                assert!(requests.borrow()[RequestId(id)].lifecycle.completed);
+            }
+        }
     }
 }

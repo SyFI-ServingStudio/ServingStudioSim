@@ -15,6 +15,8 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field};
 
+use crate::common::request::SpeculativeProgress;
+
 use crate::log::schemas::{
     cost_log_schema, gpu_cluster_schema, group_input_fields, kv_snapshot_schema,
     prefix_cache_event_schema, request_slo_schema, request_state_schema,
@@ -96,6 +98,7 @@ pub struct RequestSloEntry {
     pub reprocessed_prefill_prefix_hit_tokens: Vec<u32>,
     pub reprocessed_prefill_processed_tokens: Vec<u32>,
     pub reprocessed_prefill_completed: Vec<bool>,
+    pub speculative_progress: Option<SpeculativeProgress>,
     // Multi-round identity/grouping columns are deliberately NOT carried here
     // today. The prefix fields above are per-request requirement/observation
     // facts and do not imply a multi-round lifecycle.
@@ -161,6 +164,16 @@ pub struct GroupInputLog {
     /// submits a whole verify window per request, so the two diverge and only
     /// this one reconstructs `batch_tokens`.
     pub decode_query_rows: u32,
+    /// Raw speculative request geometry, absent for ordinary execution.
+    pub speculative_geometry: Option<SpeculativeGeometryLog>,
+}
+
+/// Keep serialization on the writer thread, like the surrounding Arrow fields.
+#[derive(Clone, Debug)]
+pub struct SpeculativeGeometryLog {
+    pub draft_tokens: u32,
+    pub max_model_len: u32,
+    pub decode: Vec<(u32, u32)>,
 }
 
 /// One `cost_log` row — a whole-iteration cost query via the compiled CostTree.
@@ -286,6 +299,7 @@ fn build_groups_column(entries: &[CostLogEntry], group_logs: &[GroupInputLog]) -
                 Box::new(ListBuilder::new(UInt32Builder::new()).with_field(u32_item())),
                 Box::new(ListBuilder::new(UInt32Builder::new()).with_field(u32_item())),
                 Box::new(UInt32Builder::new()),
+                Box::new(StringBuilder::new()),
             ],
         )
     };
@@ -325,6 +339,18 @@ fn build_groups_column(entries: &[CostLogEntry], group_logs: &[GroupInputLog]) -
             sb.field_builder::<UInt32Builder>(6)
                 .unwrap()
                 .append_value(g.decode_query_rows);
+            let geometry = g.speculative_geometry.as_ref().map(|geometry| {
+                serde_json::json!({
+                    "draft_tokens": geometry.draft_tokens,
+                    "max_model_len": geometry.max_model_len,
+                    "prefill": g.prefill_chunk_pairs,
+                    "decode": geometry.decode,
+                })
+                .to_string()
+            });
+            sb.field_builder::<StringBuilder>(7)
+                .unwrap()
+                .append_option(geometry.as_deref());
             sb.append(true);
         }
         group_cursor = group_end;
@@ -815,6 +841,16 @@ pub(crate) fn slo_to_record_batch(
             Arc::new(reprocessed_hit_b.finish()),
             Arc::new(reprocessed_tokens_b.finish()),
             Arc::new(reprocessed_completed_b.finish()),
+            Arc::new(StringArray::from(
+                entries
+                    .iter()
+                    .map(|entry| {
+                        entry.speculative_progress.as_ref().map(|progress| {
+                            serde_json::to_string(progress).expect("serialize speculative progress")
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            )),
         ],
     )?)
 }
@@ -933,6 +969,7 @@ mod tests {
             reprocessed_prefill_prefix_hit_tokens: Vec::new(),
             reprocessed_prefill_processed_tokens: Vec::new(),
             reprocessed_prefill_completed: Vec::new(),
+            speculative_progress: None,
         }
     }
 
@@ -977,6 +1014,11 @@ mod tests {
                 decode_kv_total: 100,
                 prefill_chunk_pairs: vec![(0, 8), (4, 10)],
                 decode_query_rows: 2,
+                speculative_geometry: Some(SpeculativeGeometryLog {
+                    draft_tokens: 5,
+                    max_model_len: 8192,
+                    decode: vec![(106, 6)],
+                }),
             },
             // row 0, group 1: pure decode (no prefill pairs).
             GroupInputLog {
@@ -986,6 +1028,7 @@ mod tests {
                 decode_kv_total: 60,
                 prefill_chunk_pairs: vec![],
                 decode_query_rows: 3,
+                speculative_geometry: None,
             },
             // row 1, group 0.
             GroupInputLog {
@@ -995,6 +1038,7 @@ mod tests {
                 decode_kv_total: 0,
                 prefill_chunk_pairs: vec![(0, 5)],
                 decode_query_rows: 0,
+                speculative_geometry: None,
             },
         ];
         let batch = cost_to_record_batch(&CostLogChunk {
@@ -1070,6 +1114,16 @@ mod tests {
         let row0 = groups_col.value(0);
         let g0 = row0.as_any().downcast_ref::<StructArray>().unwrap();
         assert_eq!(g0.len(), 2);
+        let geometry = g0
+            .column_by_name("speculative_geometry")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let geometry_value: serde_json::Value = serde_json::from_str(geometry.value(0)).unwrap();
+        assert_eq!(geometry_value["draft_tokens"], 5);
+        assert_eq!(geometry_value["decode"], serde_json::json!([[106, 6]]));
+        assert!(geometry.is_null(1));
         let batch_tokens = g0.column(0).as_any().downcast_ref::<UInt32Array>().unwrap();
         assert_eq!(batch_tokens.value(0), 20);
         assert_eq!(batch_tokens.value(1), 3);
@@ -1092,6 +1146,26 @@ mod tests {
         let row1 = groups_col.value(1);
         let g1 = row1.as_any().downcast_ref::<StructArray>().unwrap();
         assert_eq!(g1.len(), 1);
+    }
+
+    #[test]
+    fn speculative_progress_survives_disabled_optional_timing_logs() {
+        let mut entry = slo_entry(0, vec![1.0, 2.0]);
+        entry.speculative_progress = Some(SpeculativeProgress {
+            query_width: 6,
+            decode_rounds: 1,
+            emitted_tokens: 1,
+            ..Default::default()
+        });
+        let expected = serde_json::to_string(entry.speculative_progress.as_ref().unwrap()).unwrap();
+        let batch = slo_to_record_batch(&[entry], false, false).unwrap();
+        let column = batch
+            .column_by_name("speculative_progress")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(column.value(0), expected);
     }
 
     #[test]

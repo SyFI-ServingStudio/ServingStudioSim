@@ -225,6 +225,7 @@ mod tests {
             reprocessed_prefill_prefix_hit_tokens: Vec::new(),
             reprocessed_prefill_processed_tokens: Vec::new(),
             reprocessed_prefill_completed: Vec::new(),
+            speculative_progress: None,
         }
     }
 

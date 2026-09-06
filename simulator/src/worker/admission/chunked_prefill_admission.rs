@@ -340,6 +340,21 @@ where
         let mixes_prefill_with_decode = self.batch_policy == BatchPolicy::Mix;
         let bounded_config = self.bounded_config();
         let current_new_token_ratio = self.current_new_token_ratio;
+        let query_width = self.decode_completion.query_tokens_per_request();
+        // One short prompt can create a whole verify window next iteration.
+        // Reserve those future query slots before admitting its prefill; an
+        // unfinished active chunk keeps its reservation across iterations.
+        let mut future_decode_slots = (query_width > 1).then(|| {
+            (0..num_partitions)
+                .map(|partition| {
+                    let active = self.active_chunks[partition]
+                        .is_some_and(|candidate| candidate.remaining_output_tokens > 1);
+                    (self.max_batch_tokens / query_width)
+                        .saturating_sub(kv_store.live_decode_count(partition as u16))
+                        .saturating_sub(u32::from(active))
+                })
+                .collect::<Vec<_>>()
+        });
         let mut remaining_budgets: Vec<u32> = (0..num_partitions as u16)
             .map(|partition| {
                 if mixes_prefill_with_decode {
@@ -350,7 +365,7 @@ where
                     self.max_batch_tokens.saturating_sub(
                         kv_store
                             .live_decode_count(partition)
-                            .saturating_mul(self.decode_completion.query_tokens_per_request()),
+                            .saturating_mul(query_width),
                     )
                 } else {
                     self.max_batch_tokens
@@ -397,6 +412,13 @@ where
                 let Some(candidate) = policy.peek() else {
                     break;
                 };
+                if candidate.remaining_output_tokens > 1
+                    && future_decode_slots
+                        .as_ref()
+                        .is_some_and(|slots| slots[partition_index] == 0)
+                {
+                    break;
+                }
                 let resolved_prefill = kv_store.preview_prefill_context(
                     partition,
                     candidate.fresh_prompt_tokens,
@@ -430,6 +452,11 @@ where
                 }
                 let popped = policy.pop(policy_context);
                 debug_assert_eq!(popped, Some(candidate));
+                if candidate.remaining_output_tokens > 1 {
+                    if let Some(slots) = future_decode_slots.as_mut() {
+                        slots[partition_index] -= 1;
+                    }
+                }
                 kv_store.reserve_chunked_prefill_context(
                     candidate.request_id,
                     partition,
@@ -499,6 +526,30 @@ where
                 self.current_new_token_ratio = config.initial_new_token_ratio;
             }
         }
+        if has_batch && query_width > 1 {
+            let mut store = context.requests.borrow_mut();
+            for partition in 0..kv_store.num_partitions() as u16 {
+                kv_store.visit_prefill_admits(partition, |request| {
+                    let observation = store[request]
+                        .telemetry
+                        .speculative
+                        .get_or_insert_with(Default::default);
+                    observation.query_width = query_width;
+                    observation.pending_prefill =
+                        Some(kv_store.resolved_prefill_context(request).active_chunk());
+                });
+                if batch_plan.partition_runs_decode(partition) {
+                    kv_store.visit_decode_members(partition, |request, resident| {
+                        let observation = store[request]
+                            .telemetry
+                            .speculative
+                            .get_or_insert_with(Default::default);
+                        observation.query_width = query_width;
+                        observation.pending_decode = Some(resident as u64);
+                    });
+                }
+            }
+        }
         has_batch
     }
 
@@ -546,6 +597,16 @@ where
                             .prefill_tokens_processed
                             .checked_add(chunk_tokens)
                             .expect("prefill progress overflows u32");
+                    }
+                    let query_width = self.decode_completion.query_tokens_per_request();
+                    if query_width > 1 {
+                        let observation = record
+                            .telemetry
+                            .speculative
+                            .get_or_insert_with(Default::default);
+                        observation.query_width = query_width;
+                        observation.prefill_chunks += 1;
+                        observation.pending_prefill = None;
                     }
                     if finished {
                         if reprocessed {

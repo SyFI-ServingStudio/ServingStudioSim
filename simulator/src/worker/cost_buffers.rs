@@ -377,6 +377,8 @@ impl CostBuffers {
             0,
             &SpeculativeGroupLog {
                 groups: &arch_input.groups,
+                draft_tokens: arch_input.draft_tokens,
+                max_model_len: model.max_model_len(),
             },
             None, // one fused eval per iteration — nothing to memoize
             now,
@@ -413,6 +415,7 @@ impl GroupLogSource for Vec<ArchGroupInput> {
                 // An ordinary decode request is exactly one query row, so the
                 // two columns coincide here and diverge only under speculation.
                 decode_query_rows: g.decode_tokens,
+                speculative_geometry: None,
             });
         }
     }
@@ -431,6 +434,7 @@ impl GroupLogSource for Vec<u32> {
                 decode_kv_total: 0,
                 prefill_chunk_pairs: Vec::new(),
                 decode_query_rows: 0,
+                speculative_geometry: None,
             });
         }
     }
@@ -445,6 +449,8 @@ impl GroupLogSource for Vec<u32> {
 /// is written from it, not from a copy of it.
 struct SpeculativeGroupLog<'a> {
     groups: &'a [SpeculativeArchGroupInput],
+    draft_tokens: u32,
+    max_model_len: u32,
 }
 
 impl GroupLogSource for SpeculativeGroupLog<'_> {
@@ -460,6 +466,15 @@ impl GroupLogSource for SpeculativeGroupLog<'_> {
                 // The verify width makes these diverge: one request submits
                 // `draft_tokens + 1` rows.
                 decode_query_rows: g.decode_tokens,
+                speculative_geometry: Some(crate::log::rows::SpeculativeGeometryLog {
+                    draft_tokens: self.draft_tokens,
+                    max_model_len: self.max_model_len,
+                    decode: g
+                        .decode_requests
+                        .iter()
+                        .map(|r| (r.kv_len, r.query_len))
+                        .collect(),
+                }),
             });
         }
     }

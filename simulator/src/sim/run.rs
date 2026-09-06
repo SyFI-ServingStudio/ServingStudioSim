@@ -466,6 +466,7 @@ fn slo_entry(id: RequestId, now: Time, rec: &RequestRecord) -> RequestSloEntry {
         output_token_times_ms: times_ms,
         ttft_ms,
         num_output_tokens: rec.progress.output_tokens_emitted,
+        speculative_progress: rec.telemetry.speculative.as_deref().cloned(),
         tpot_mean_ms,
         finish_decode_time_ms,
         prefill_processed: rec.progress.prefill_tokens_processed,

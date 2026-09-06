@@ -56,6 +56,7 @@ pub(crate) fn group_input_fields() -> Fields {
         // Appended, never inserted: `analyzer/rust/src/session.rs` reads the
         // first five fields by position.
         Field::new("decode_query_rows", DataType::UInt32, false),
+        Field::new("speculative_geometry", DataType::Utf8, true),
     ])
 }
 
@@ -374,6 +375,7 @@ pub fn request_slo_schema() -> Arc<Schema> {
             DataType::List(Arc::new(Field::new("item", DataType::Boolean, false))),
             false,
         ),
+        Field::new("speculative_progress", DataType::Utf8, true),
     ]))
 }
 
