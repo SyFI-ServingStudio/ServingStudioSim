@@ -423,8 +423,7 @@ def _launch_alignment_analysis(log_dir: Path, *, build_type: str, subjects: list
     if not analyzer_binary_path(build_type).is_file():
         print("[alignment] analyzer build failed", file=sys.stderr)
         return False
-    run_alignment_analysis(log_dir, build_type, subjects)
-    return True
+    return run_alignment_analysis(log_dir, build_type, subjects)
 
 
 def _run_sim(args: argparse.Namespace) -> int:

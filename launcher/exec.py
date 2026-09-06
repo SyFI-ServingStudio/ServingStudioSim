@@ -23,6 +23,7 @@ from pathlib import Path
 from .process import ProcessResult, ProcessSpec, ProcessSupervisor
 from .process.artifacts import (
     ArtifactValidationError,
+    validate_alignment_analysis_artifacts,
     validate_json_outputs,
     validate_render_artifacts,
     validate_trace_artifacts,
@@ -422,7 +423,7 @@ def run_alignment_analysis(
     log_dir: Path,
     build_type: str = "debug",
     subjects: list[str] | None = None,
-) -> None:
+) -> bool:
     """Synchronously compute and render selected alignment subjects.
 
     This explicit alignment command has no sweep-level parallelism to preserve;
@@ -431,7 +432,7 @@ def run_alignment_analysis(
     analyzer = analyzer_binary_path(build_type)
     if not analyzer.exists():
         print(f"[analyze] {analyzer} not built; skipping alignment analysis for {log_dir}")
-        return
+        return False
 
     stdout_log = log_dir / "stdout.log"
 
@@ -452,13 +453,25 @@ def run_alignment_analysis(
         "alignment-workload",
         "alignment-e2e",
     ]
+    # The analyzer records subject failures even when the process exits zero.
+    # Remove the prior outcome so a crashed recomputation cannot reuse it.
+    (log_dir / "reports" / "analyzer_timing.json").unlink(missing_ok=True)
     rc = run_step(
         "analyze alignment compute",
         [str(analyzer), "alignment", str(log_dir), *selected],
     )
     if rc != 0:
         print(f"[analyze] alignment compute failed for {log_dir}")
-        return
+        return False
+    try:
+        validate_alignment_analysis_artifacts(log_dir, selected)
+    except ArtifactValidationError as error:
+        print(f"[analyze] alignment compute failed for {log_dir}: {error}")
+        return False
+    # Timeline is an interactive payload served by the UI, with no PNG renderer.
+    render_subjects = [subject for subject in selected if subject != "alignment-timeline"]
+    if not render_subjects:
+        return True
     if (
         run_step(
             "analyze alignment render",
@@ -467,12 +480,14 @@ def run_alignment_analysis(
                 str(REPO_ROOT / "analyzer" / "python"),
                 "render",
                 str(log_dir),
-                *selected,
+                *render_subjects,
             ],
         )
         != 0
     ):
         print(f"[analyze] alignment render failed for {log_dir}")
+        return False
+    return True
 
 
 def run_sweep_analysis(experiment_dir: Path, build_type: str = "debug") -> None:

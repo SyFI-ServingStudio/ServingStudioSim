@@ -76,6 +76,22 @@ def validate_json_outputs(directory: Path) -> ArtifactValidation:
     return ArtifactValidation(paths=paths)
 
 
+def validate_alignment_analysis_artifacts(
+    log_dir: Path, subjects: list[str]
+) -> ArtifactValidation:
+    """Require every requested subject to finish, including task-level failures."""
+    timing_path = log_dir / "reports" / "analyzer_timing.json"
+    timing = _read_json_object(timing_path)
+    runs = timing.get("subjects")
+    if not isinstance(runs, list):
+        raise ArtifactValidationError(f"{timing_path} must record subject outcomes")
+    for subject in subjects:
+        outcomes = [row for row in runs if isinstance(row, dict) and row.get("name") == subject]
+        if len(outcomes) != 1 or outcomes[0].get("status") != "ok":
+            raise ArtifactValidationError(f"alignment subject {subject!r} did not succeed")
+    return ArtifactValidation(paths=(timing_path,))
+
+
 def validate_render_artifacts(log_dir: Path) -> ArtifactValidation:
     payloads = tuple(sorted((log_dir / "payloads").glob("*.json")))
     plots = tuple(sorted((log_dir / "plots").glob("*.png")))

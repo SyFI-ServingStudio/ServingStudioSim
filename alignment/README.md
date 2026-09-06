@@ -640,3 +640,9 @@ its critical child, and the optimality ladder's R2 rung folds `Max → mean` and
 labels the gap "imbalance". Two different computations sharing one GPU are none
 of those things — same-device overlap makes wall time ≥ max(children), not ≤ —
 so modelling it would need a new node kind, not a reused one.
+## Alignment execution status
+
+The launcher checks each selected subject in the current `analyzer_timing.json`
+after computation. A zero Analyzer process exit code is insufficient: a failed
+or missing subject makes the alignment phase fail, and rendering does not run.
+The interactive `alignment-timeline` payload has no separate PNG renderer.

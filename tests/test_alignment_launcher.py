@@ -1738,14 +1738,45 @@ def test_alignment_analysis_calls_only_selected_subjects(tmp_path, monkeypatch):
 
     def fake_capture(argv):
         invocations.append(argv)
+        if argv[1] == "alignment":
+            (log_dir / "reports").mkdir(exist_ok=True)
+            (log_dir / "reports" / "analyzer_timing.json").write_text(
+                json.dumps({"subjects": [{"name": "alignment-e2e", "status": "ok"}]})
+            )
         return 0, "alignment accepted\n"
 
     monkeypatch.setattr(launcher_exec, "analyzer_binary_path", lambda build_type: analyzer)
     monkeypatch.setattr(launcher_exec, "_run_capture_sync", fake_capture)
 
-    launcher_exec.run_alignment_analysis(log_dir, "release", ["alignment-e2e"])
+    assert launcher_exec.run_alignment_analysis(log_dir, "release", ["alignment-e2e"])
     assert invocations[0] == [str(analyzer), "alignment", str(log_dir), "alignment-e2e"]
     assert invocations[1][-1:] == ["alignment-e2e"]
+
+
+@pytest.mark.parametrize("outcome", ["failed", "missing", "stale"])
+def test_alignment_analysis_does_not_publish_failed_compute(tmp_path, monkeypatch, outcome):
+    analyzer = tmp_path / "analyze"
+    analyzer.touch()
+    log_dir = tmp_path / "analysis"
+    reports = log_dir / "reports"
+    reports.mkdir(parents=True)
+    timing = reports / "analyzer_timing.json"
+    timing.write_text(json.dumps({"subjects": [{"name": "alignment-iteration", "status": "ok"}]}))
+    invocations = []
+
+    def fake_capture(argv):
+        invocations.append(argv)
+        if outcome != "stale":
+            rows = [] if outcome == "missing" else [
+                {"name": "alignment-iteration", "status": "failed"}
+            ]
+            timing.write_text(json.dumps({"subjects": rows}))
+        return 0, "compute process exited zero\n"
+
+    monkeypatch.setattr(launcher_exec, "analyzer_binary_path", lambda build_type: analyzer)
+    monkeypatch.setattr(launcher_exec, "_run_capture_sync", fake_capture)
+    assert not launcher_exec.run_alignment_analysis(log_dir, "release", ["alignment-iteration"])
+    assert len(invocations) == 1
 
 
 def test_req_frontend_invocation_keeps_independent_as_a_typed_frontend(tmp_path, monkeypatch):
