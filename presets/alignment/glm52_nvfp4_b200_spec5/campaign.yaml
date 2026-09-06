@@ -1163,7 +1163,17 @@ cases:
   max_model_len: 262144
   max_concurrency: 16
   chunk_size: 4098
-  speculative_acceptance: *id001
+  speculative_acceptance:
+    value:
+    - 0.86892177589852
+    - 0.6082725060827251
+    - 0.642
+    - 0.8535825545171339
+    - 0.9306569343065694
+    status: measured
+    derived_from: full warm workload conditional acceptance; per-request simulation trace
+      records 14 request-position fallbacks to this run's aggregate rates
+    evidence: logs/20260906_1_spec5_warm_matrix/17_concurrent_long_prefill_c16/trace_observed.csv.manifest.json
   profile_arrival_mode: saturated
   simulation_arrival_mode: saturated
   gpu_memory_utilization: 0.85
@@ -1191,10 +1201,9 @@ cases:
     repeats: 4
     id_suffix: full
   attn_gpu_memory_gb:
-    value: 35.933594112
-    status: provisional
-    derived_from: bootstrap from case 15 at gpu_memory_utilization 0.85; replace from
-      this case's profile_workload KV-cache log
-    evidence: logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/15_kv_overcommit_mixed_churn_c14/profile_workload
+    value: 24.660195072
+    status: measured
+    derived_from: workload GPU KV cache size 440896 tokens times FullIndex 55932 bytes/token/rank
+    evidence: logs/20260906_1_spec5_warm_matrix/17_concurrent_long_prefill_c16/profile_workload/vllm/glm52_b200_ep4_17_concurrent_long_prefill_c16_workload_server.log
   provenance:
     design_source: coverage audit of the spec5 15-case extension

@@ -4,7 +4,8 @@ This directory follows the campaign workflow used by
 [PR 25](https://github.com/SyFI-VibeSim/VibeSim/pull/25),
 [PR 27](https://github.com/SyFI-VibeSim/VibeSim/pull/27), and
 [PR 28](https://github.com/SyFI-VibeSim/VibeSim/pull/28).
-The generated matrix is a partial evidence snapshot, not an accepted baseline.
+The workload queue is finished. This is retained review evidence, not an accepted
+baseline: missing pairs and tolerance failures remain explicit.
 
 ## Maintained Artifacts
 
@@ -13,8 +14,9 @@ The generated matrix is a partial evidence snapshot, not an accepted baseline.
 | `presets/alignment/glm52_nvfp4_b200_spec5/campaign.yaml` | Workload matrix, framework settings, calibration values and their evidence/status |
 | Pack `traces/invariants.json` | Reproducible workload digests |
 | Pack `acceptance.yaml` | Acceptance tolerances and explained exceptions, independent of golden drift |
+| `campaign_metrics.json` | Compact public extraction: all 17 cases, formulas, values, report hashes and audit status |
 | `alignment_matrix.md` | Generated report values and tolerance failures |
-| `server_latency.md` / `.json` | Analyzer server-side P50/P90/P99, raw values and report hashes; partial snapshot |
+| `server_latency.md` / `.json` | Analyzer server-side P50/P90/P99, raw values and report hashes; 15 completed cases |
 | `kernel_evidence.md` / `.json` | All 17 cases, 15 available kernel reports, explicit warm/historical sources and chunk sizes |
 | `tests/golden/alignment_glm52_nvfp4_b200_spec5/NVIDIA_B200.json` | Future recorded baseline; not yet created |
 | Golden `.provenance.json` | Formula/report versions, evidence paths and provisional inputs, written by the recorder |
@@ -27,25 +29,46 @@ a golden merely to remove a regression warning.
 
 ## Current Evidence
 
-Source: `logs/20260906_1_spec5_warm_matrix/extracted_progress.json`, extracted with
-clean implementation `0eef224`; calibrated campaign inputs are committed in `f9ef858`.
-The snapshot includes completed case04/09 E2E and case07/08 kernel analysis.
-It is limited to the TP4/EP4 matrix; TP8 reproduction is separate evidence.
+Source: `logs/20260906_1_spec5_warm_matrix/extracted_final.json`.
+Extraction SHA-256: `aa1392be0fdd640318e495f4a878ea85b36913f0476f004a489172f227f029a6`.
 
-Extraction SHA-256:
-`5f7dc7eabc6884b7c3d713a69c2bf9fc84082f3d0d06fb02eababbc69c0c587f`.
+All 15 valid cases completed warm, no-NSYS workload measurement, simulation and
+E2E analysis. All 15 request-population audits pass. The queue's final seven cases
+returned `ok`, and its process exited. Case11/12 retain their original framework
+capacity failures: max length524288 needed27.31GiB KV with17.88GiB available
+(the historical server logs are under `logs/20260905_2_spec5_matrix/<case>/profile_nsys/vllm/`).
+There is no remaining measurement queue or requested GPU profiling.
 
-| Cases | Evidence at snapshot |
-|---|---|
-| 01-08 | Full report sets available; failures remain in the generated comparison |
-| 09, 10, 13, 14, 15, 16 | Warm workload, simulation and E2E available; matching warm kernel reports absent |
-| 17 | Warm workload pending |
-| 11, 12 | Previously observed framework KV-capacity failures; no successful warm result |
+The following table is derived from the two Analyzer JSON sidecars. Kernel source
+includes its actual chunk size; historical kernel rows are not paired warm
+captures. All displayed TTFT/TPOT values below are server-side P50 relative errors.
+Full P90/P99 and raw milliseconds remain in `server_latency.json`.
 
-The current renderer lists cases with report values only. Absence from that table
-does not mean a case passed or has no raw measurement. All 17 declarations remain
-in extraction, including unavailable cases. Completed workload measurements are
-reused; remaining measurements use warmup, corrected chunk sizes and no NSYS.
+| Case | Kernel source | Kernel signed error | Critical coverage | Sim coverage | Server TTFT P50 | Server TPOT P50 |
+|---|---|---:|---:|---:|---:|---:|
+| 01 | warm / 2052 | -2.44% | 94.05% | 99.27% | +3.94% | -2.77% |
+| 02 | warm / 2052 | -5.25% | 94.60% | 99.15% | -3.50% | -4.71% |
+| 03 | warm / 4098 | -3.44% | 96.95% | 99.42% | -0.72% | -1.39% |
+| 04 | warm / 8196 | -3.43% | 97.60% | 99.42% | -6.37% | +7.28% |
+| 05 | warm / 4098 | -5.64% | 96.48% | 99.25% | +241.60% | -17.37% |
+| 06 | warm / 4098 | +7.82% | 95.97% | 98.58% | -3.07% | +10.60% |
+| 07 | warm / 8196 | -3.74% | 97.84% | 99.64% | +3.34% | -4.22% |
+| 08 | warm / 2052 | -5.28% | 93.38% | 99.68% | +4.53% | -3.40% |
+| 09 | historical / 2048 | +7.22% | 93.86% | 97.62% | -5.39% | +4.27% |
+| 10 | historical / 2048 | -4.28% | 94.10% | 97.44% | +2.94% | -6.92% |
+| 11 | KV-capacity failure | N/A | N/A | N/A | N/A | N/A |
+| 12 | KV-capacity failure | N/A | N/A | N/A | N/A | N/A |
+| 13 | historical / 4096 | +2.91% | 94.87% | 98.11% | -36.46% | +9.99% |
+| 14 | historical / 4096 | -1.13% | 95.28% | 98.54% | +5.18% | +0.33% |
+| 15 | historical / 8192 | -2.31% | 94.99% | 98.20% | +23.30% | -5.37% |
+| 16 | historical / 8192 | -3.53% | 94.67% | 97.85% | +2.24% | +2.32% |
+| 17 | historical / 4096 | +2.99% | 95.38% | 98.17% | +3.40% | +16.03% |
+
+Only cases01-08 have full matching warm kernel/workload/E2E sets. Cases09/10/13-17
+have warm E2E and explicitly separate historical kernel evidence. The public
+comparison exits1 because missing pairs and real tolerance failures remain.
+No acceptance limit has been widened and no golden has been recorded.
+This is the TP4/EP4 matrix; TP8 reproduction is separate evidence.
 
 ## Metric Boundaries
 
@@ -58,7 +81,7 @@ simulator coverage must remain separately named when comparing reports.
 `server_ttft_mean_pct` and `server_tpot_mean_pct` are server-side means.
 They are not P50. The standard `e2e_mean_pct` is the request E2E metric, not a
 server-only TTFT metric. This legacy comparison table is retained for regression
-compatibility; the final user-facing latency table also needs Analyzer server-side
+compatibility; the user-facing latency table uses Analyzer server-side
 P50/P90/P99, with explicit statistic names. Never substitute client TTFT for server
 TTFT or change an existing metric key's meaning.
 
@@ -90,6 +113,10 @@ Case16 completed 96 requests and its request-population audit passed. Its measur
 KV capacity is 472448 tokens, and it explicitly borrows warm case07's multiplier.
 The prepared manifest lists 24 request-position fallbacks to this run's aggregate
 acceptance; these are retained approximations, not additional measured samples.
+Case17 completed 32 requests in 193.25 seconds of formal measurement, with measured
+KV capacity440896 tokens and an explicit warm case03 multiplier. Its manifest
+retains 14 request-position fallbacks to the run aggregate. All original requests
+remain present; no context was shortened to avoid cache work.
 Historical case09/10 NSYS uses 2048 chunks and remains separate from warm 2052 E2E.
 
 `kernel_evidence.md` likewise retains historical 4096/8192 captures for cases13-17,
@@ -100,8 +127,7 @@ original prediction/label provenance remain explicit.
 The server latency sidecar selects only the `server_ttft` and `server_tpot` fields
 from each completed warm bundle's `/api/v1/alignments/{id}/subjects/e2e/report`.
 It preserves each metric's sample count, measured/simulated percentiles in ms,
-resource ID and SHA-256 of the HTTP response. Refresh these exact resources as
-new reports complete; derive displayed errors as `(simulated/measured - 1)*100`.
+resource ID and SHA-256 of the HTTP response. Refresh these exact resources when reports change; derive displayed errors as `(simulated/measured - 1)*100`.
 Keep unavailable cases visible and never substitute client fields or means.
 
 ## Regeneration

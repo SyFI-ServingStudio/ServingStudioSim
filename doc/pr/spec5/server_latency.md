@@ -1,9 +1,9 @@
-# Server Latency: Partial Warm Matrix
+# Server Latency: Warm Matrix
 
 Generated from the Analyzer HTTP E2E reports retained in `server_latency.json`.
 Error is `(simulated / measured - 1) * 100` for the named distribution percentile.
 These are server-side TTFT/TPOT, not client TTFT, request E2E, or means.
-Snapshot: completed cases01-10 and13-16; all17 cases remain visible below.
+Snapshot: completed cases01-10 and13-17; cases11/12 retain capacity failures; all17 cases remain visible below.
 
 | Case | TTFT P50 | TTFT P90 | TTFT P99 | TPOT P50 | TPOT P90 | TPOT P99 |
 |---|---:|---:|---:|---:|---:|---:|
@@ -23,7 +23,7 @@ Snapshot: completed cases01-10 and13-16; all17 cases remain visible below.
 | 14_near_full_long_decode_c21 | +5.18% | +37.95% | +40.36% | +0.33% | +1.48% | +4.82% |
 | 15_kv_overcommit_mixed_churn_c14 | +23.30% | +8.85% | +8.98% | -5.37% | -5.40% | -32.56% |
 | 16_chunk8k_mixed_pressure_c64 | +2.24% | -2.57% | -3.61% | +2.32% | -11.51% | -0.32% |
-| 17 | pending | pending | pending | pending | pending | pending |
+| 17_concurrent_long_prefill_c16 | +3.40% | -7.02% | -6.49% | +16.03% | -11.25% | -9.46% |
 
 Raw measured and simulated values (milliseconds), sample counts and per-report
 SHA-256 are in the JSON sidecar. Case08 has fewer TPOT samples because some requests
