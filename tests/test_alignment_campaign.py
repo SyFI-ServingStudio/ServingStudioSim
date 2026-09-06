@@ -19,7 +19,9 @@ Two tiers:
 from __future__ import annotations
 
 import asyncio
+import csv
 import dataclasses
+import io
 import json
 import re
 import shutil
@@ -48,6 +50,7 @@ from launcher.alignment_campaign.render import (
     TIMING_PREDICT_PHASE,
     _extra_args,
     case_documents,
+    case_traces,
     phase_names,
     render_case,
 )
@@ -331,6 +334,52 @@ def test_cross_phase_check_uses_the_same_sglang_context_limit_flag(pack, tmp_pat
     profile["server"]["extra_args"][-2] = "--max-model-len"
     findings = check_module._check_cross_phase(patched, case, documents)
     assert any("--context-length does not match" in item.message for item in findings)
+
+
+def test_profile_pass_warmup_reaches_frontend_config(pack, tmp_path):
+    case = pack.cases[0]
+    original = pack.variant_of(case)
+    passes = tuple(dataclasses.replace(item, warmup=True) for item in original.profile_passes)
+    variant = dataclasses.replace(original, profile_passes=passes)
+    patched = dataclasses.replace(pack, variants={**pack.variants, variant.name: variant})
+    host = check_module.host_for(patched, None)
+    documents = case_documents(patched, case, host, tmp_path, REPO_ROOT)
+    for item in passes:
+        assert documents[f"{item.name}.yaml"]["workload"]["warmup"] is True
+
+
+def test_speculative_case_keeps_replay_trace_and_calibrates_simulation(pack, tmp_path):
+    original_case = pack.cases[0]
+    original_variant = pack.variant_of(original_case)
+    rates = [0.8, 0.5, 0.25, 0.5, 0.0]
+    case = dataclasses.replace(
+        original_case, chunk_size=4096,
+        speculative_acceptance=dataclasses.replace(original_case.attn_gpu_memory_gb, value=rates),
+    )
+    variant = dataclasses.replace(
+        original_variant,
+        arch={**original_variant.arch, "type": "glm52_vllm_nvfp4_dsa_moe_speculative", "draft_tokens": 5},
+        worker={**original_variant.worker, "type": "speculative", "draft_tokens": 5},
+    )
+    patched = dataclasses.replace(pack, variants={**pack.variants, variant.name: variant})
+    documents = case_documents(patched, case, check_module.host_for(patched, None), tmp_path, REPO_ROOT)
+    traces = case_traces(patched, case)
+    replay = list(csv.DictReader(io.StringIO(traces["trace.csv"])))
+    simulation = list(csv.DictReader(io.StringIO(traces["trace_speculative.csv"])))
+    assert replay == [{key: value for key, value in row.items() if key != "accept_rate"} for row in simulation]
+    assert all(json.loads(row["accept_rate"]) == rates for row in simulation)
+    sim = documents[f"{PHASE_CONFIG_STEMS[SIMULATION_PHASE]}.yaml"]
+    assert sim["workload"]["input_file_tags"] == ["speculative"]
+    assert sim["workload"]["trace_files"][0].endswith("trace_speculative.csv")
+    assert sim["pools"]["main"]["groups"][0]["worker"]["max_batch_tokens"] == 4096
+    assert not check_module._check_cross_phase(patched, case, documents)
+    profile = documents[f"{variant.profile_passes[0].name}.yaml"]
+    assert profile["server"]["chunk_size"] == 4096
+    profile["server"]["chunk_size"] = 2048
+    assert any("token ceiling" in finding.message for finding in check_module._check_cross_phase(patched, case, documents))
+    bad_case = dataclasses.replace(case, speculative_acceptance=dataclasses.replace(case.speculative_acceptance, value=rates[:2]))
+    with pytest.raises(PackError, match="draft_tokens must agree"):
+        case_documents(patched, bad_case, check_module.host_for(patched, None), tmp_path, REPO_ROOT)
 
 
 # ── readiness and planning (pure; no subprocess) ─────────────────────────────

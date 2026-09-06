@@ -146,10 +146,23 @@ GLM-5.2 runs two (`nsys` + `workload_metrics`); the archived Llama3-8B alignment
 ran one. `name` is simultaneously the config stem, the artifact directory, and
 the `--phase` argument, so adding a pass touches no enum.
 
+Each pass can also set `warmup: true` (default false). This renders
+`workload.warmup: true` for that pass, using req-frontend's bounded warmup,
+drain, prefix-cache reset and measurement boundary. vLLM variants must enable
+server load tracking. Warmup does not alter either materialized trace.
+
 A **case** is one operating point: `max_model_len`, `max_concurrency`, the two
 arrival modes, `gpu_memory_utilization`, `capture_seconds`, `device_role`, its
 `workload_trace` (and `kernel_trace` where the NSYS capture is bounded
 separately), plus `purpose` and `coverage` so the matrix explains itself.
+
+Optional per-case `chunk_size` sets both server `max_num_batched_tokens` and
+worker `max_batch_tokens`. CUDA graph capture size remains a separate variant
+setting. Optional calibrated `speculative_acceptance` supplies one conditional
+probability per draft position. Rendering preserves the real-engine trace and
+writes a separate `trace_speculative.csv` for the simulator with its required
+`speculative` input tag. Architecture depth, worker depth and vector length must
+agree; borrowed calibration remains marked `provisional`.
 
 Two case fields carry more weight than their size suggests:
 
