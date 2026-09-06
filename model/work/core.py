@@ -105,6 +105,9 @@ class AttnInteraction:
     # Optional semantic phase used only for independent per-location accounting.
     # It never affects attention math.
     phase: str | None = None
+    # Equal independent interactions can be counted without expanding a run's
+    # histogram into one Python object per request and iteration.
+    multiplicity: float = 1
 
     def pairs(self) -> float:
         """(query, key) pairs actually computed. Causal uses the exact triangle."""
@@ -112,9 +115,9 @@ class AttnInteraction:
         if self.mask == "causal":
             # queries sit at the end of the sequence: query i attends to
             # (num_cached_key + i + 1) keys, summed over i in [0, q) -> q*(k - (q-1)/2).
-            return q * (k - (q - 1) / 2.0)
+            return self.multiplicity * q * (k - (q - 1) / 2.0)
         if self.mask in ("full", "cross"):
-            return float(q * k)
+            return self.multiplicity * float(q * k)
         raise ValueError(f"unknown attention mask {self.mask!r}")
 
 
@@ -156,7 +159,11 @@ class Workload:
 
     @property
     def num_attention_steps(self) -> int:
-        return len(self.attn) if self.attention_step_count is None else self.attention_step_count
+        return (
+            sum(i.multiplicity for i in self.attn)
+            if self.attention_step_count is None
+            else self.attention_step_count
+        )
 
     @classmethod
     def causal_lm(
@@ -243,12 +250,15 @@ class Workload:
                 phase_tokens = (
                     self.attention_tokens_by_phase.get(phase, 0)
                     if self.attention_tokens_by_phase is not None
-                    else sum(interaction.num_query for interaction in interactions)
+                    else sum(
+                        interaction.num_query * interaction.multiplicity
+                        for interaction in interactions
+                    )
                 )
                 phase_steps = (
                     self.attention_step_count_by_phase.get(phase, 0)
                     if self.attention_step_count_by_phase is not None
-                    else len(interactions)
+                    else sum(interaction.multiplicity for interaction in interactions)
                 )
             partitions.append(
                 (

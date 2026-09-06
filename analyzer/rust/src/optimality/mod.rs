@@ -200,6 +200,9 @@ pub(crate) fn ratio(num: f64, den: f64) -> f64 {
 }
 
 #[cfg(test)]
+mod speculative_tests;
+
+#[cfg(test)]
 mod tests {
     use super::under_accounted_difference;
 

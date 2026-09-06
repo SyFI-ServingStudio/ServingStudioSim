@@ -106,6 +106,36 @@ def test_floor_batch_isolates_one_heterogeneous_level(monkeypatch, model):
     assert result["main"]["segmented"] >= result["main"]["necessary"]
 
 
+def test_speculative_floors_refuse_incomplete_stage_geometry(tmp_path):
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    (raw / "params.json").write_text(
+        json.dumps(
+            {
+                "pools": {
+                    "main": {
+                        "groups": [
+                            {
+                                "gpu": "NVIDIA B200",
+                                "arch": {
+                                    "type": "glm52_vllm_nvfp4_dsa_moe_speculative",
+                                    "model_config": str(GLM52_NVFP4),
+                                    "fp8": False,
+                                    "draft_tokens": 5,
+                                },
+                            }
+                        ]
+                    }
+                },
+            }
+        )
+    )
+    unlocked = work_floors.compute_floors(tmp_path, {"main": {}})
+    locked = work_floors.compute_locked_compositions(tmp_path, {"main/0": []})
+    assert "per-stage workload geometry" in unlocked["main"]["error"]
+    assert "per-stage workload geometry" in locked["main/0"]["error"]
+
+
 @pytest.mark.parametrize("force_direct_fallback", [False, True])
 def test_locked_composition_evaluates_each_shape_before_addition(
     monkeypatch, model, force_direct_fallback

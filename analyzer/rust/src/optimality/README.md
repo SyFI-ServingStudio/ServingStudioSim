@@ -26,6 +26,16 @@ exactly R5. Unlocked mode may compose work into a saturated batch. Locked mode
 preserves every observed iteration boundary: equal shapes are deduplicated only as
 an evaluation optimization, then restored by occurrence weighting before rollup.
 
+Speculative GLM-5.2 uses the executed draft/verify trajectory as its workload:
+rejected candidates remain necessary work. Raw request geometry in `groups`
+preserves query width, per-request sparse saturation and the MTP stages before
+Python derives work from the model config. Speculative shapes bypass the ordinary
+scalar affine approximation. Location maps cover index-share/full-index recurrent
+passes and the single-draft layout, for TP4 and TP8. FP4 target experts, BF16 MTP
+experts and FP8 index logits retain distinct hardware peaks through attribution.
+Historical logs without the required geometry remain unavailable rather than
+being interpreted as single-token decode workloads.
+
 The payload also carries per-worker kernel rung ladders. Its R0/R1 bars reuse
 the additive R2 kernel baseline and append two explicit aggregate chunks
 (`imbalance = R1-R2`, `idle = R0-R1`); R2..R5 carry each location's attributable

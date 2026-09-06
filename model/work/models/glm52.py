@@ -110,10 +110,9 @@ def _mtp_stacks(raw_config: dict, hidden: int) -> list[LayerStack]:
     would put the floor above the work a sharing implementation actually does.
 
     Only the first stack owns the layer's parameters (``param_count=0`` on the
-    second). Both still read its weights, because the draft steps are serially
-    dependent — step j+1 consumes step j's output — so no fusion can collapse the
-    reads the way :meth:`Model.label`'s read-once convention collapses a single
-    fused pass.
+    second). Each stage uses the accountant's read-once weight convention;
+    recurrent query multiplicity scales FLOPs and state traffic, not parameter
+    ownership. Serial dependence alone does not require an HBM weight reload.
     """
     if not raw_config.get("num_nextn_predict_layers"):
         return []

@@ -525,7 +525,7 @@ fn run_labeler_request(log_dir: &Path, request: Value) -> Result<Value> {
 fn build_request(levels: &HashMap<String, WorkloadTotals>) -> Value {
     let mut level_json = Map::new();
     for (key, totals) in levels {
-        level_json.insert(key.clone(), workload_json(*totals));
+        level_json.insert(key.clone(), workload_json(totals));
     }
     json!({ "levels": Value::Object(level_json) })
 }
@@ -541,7 +541,7 @@ fn build_locked_request(shapes_by_worker: &HashMap<(String, u16), Vec<WeightedWo
                     .map(|shape| {
                         json!({
                             "occurrences": shape.occurrences,
-                            "totals": workload_json(shape.totals),
+                            "totals": workload_json(&shape.totals),
                         })
                     })
                     .collect(),
@@ -551,7 +551,7 @@ fn build_locked_request(shapes_by_worker: &HashMap<(String, u16), Vec<WeightedWo
     json!({"locked_compositions": Value::Object(compositions)})
 }
 
-fn workload_json(totals: WorkloadTotals) -> Value {
+fn workload_json(totals: &WorkloadTotals) -> Value {
     json!({
         "matmul_tokens": totals.matmul_tokens,
         "prefill_tokens": totals.prefill_tokens,
@@ -561,6 +561,7 @@ fn workload_json(totals: WorkloadTotals) -> Value {
         "decode_kv": totals.decode_kv,
         "prefill_requests": totals.prefill_requests,
         "prefill_stateful_requests": totals.prefill_stateful_requests,
+        "speculative_geometry": totals.speculative_geometry,
     })
 }
 
@@ -578,7 +579,7 @@ mod tests {
             prefill_stateful_requests: 1.0,
             ..WorkloadTotals::default()
         };
-        let payload = super::workload_json(totals);
+        let payload = super::workload_json(&totals);
         assert_eq!(payload["prefill_requests"], 2.0);
         assert_eq!(payload["prefill_stateful_requests"], 1.0);
     }
