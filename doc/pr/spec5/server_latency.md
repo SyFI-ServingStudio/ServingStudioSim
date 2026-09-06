@@ -3,7 +3,7 @@
 Generated from the Analyzer HTTP E2E reports retained in `server_latency.json`.
 Error is `(simulated / measured - 1) * 100` for the named distribution percentile.
 These are server-side TTFT/TPOT, not client TTFT, request E2E, or means.
-Snapshot: completed cases01-10 and13-14; all17 cases remain visible below.
+Snapshot: completed cases01-10 and13-15; all17 cases remain visible below.
 
 | Case | TTFT P50 | TTFT P90 | TTFT P99 | TPOT P50 | TPOT P90 | TPOT P99 |
 |---|---:|---:|---:|---:|---:|---:|
@@ -21,7 +21,7 @@ Snapshot: completed cases01-10 and13-14; all17 cases remain visible below.
 | 12 | capacity failure | capacity failure | capacity failure | capacity failure | capacity failure | capacity failure |
 | 13_generation_length_matrix_c8 | -36.46% | +1.22% | +1.12% | +9.99% | +10.16% | +10.67% |
 | 14_near_full_long_decode_c21 | +5.18% | +37.95% | +40.36% | +0.33% | +1.48% | +4.82% |
-| 15 | pending | pending | pending | pending | pending | pending |
+| 15_kv_overcommit_mixed_churn_c14 | +23.30% | +8.85% | +8.98% | -5.37% | -5.40% | -32.56% |
 | 16 | pending | pending | pending | pending | pending | pending |
 | 17 | pending | pending | pending | pending | pending | pending |
 
