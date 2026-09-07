@@ -7,13 +7,14 @@ use crate::arch::contract::IterwiseUnifiedModel;
 use crate::common::{PoolId, SharedRequests, WorkerId};
 use crate::log::PrefixCacheLogger;
 use crate::worker::admission::{PendingOrder, PrefillHandoffAdmission};
+use crate::worker::execution::UnifiedIterExecution;
 use crate::worker::gpu_cluster::SharedGpuCluster;
 use crate::worker::kv::FullAttnKv;
 use crate::worker::types::WorkerConfig;
 
 use super::iter_batch_worker::{IterBatchWorker, PdPrefillWorker};
-use crate::worker::workers::unified_iter_build_essentials::{
-    full_attention_token_capacity, prepare_unified_iter_build_essentials,
+use crate::worker::workers::iter_build_essentials::{
+    full_attention_token_capacity, prepare_iter_build_essentials,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -30,22 +31,27 @@ pub(crate) fn build_pd_prefill_worker<M: IterwiseUnifiedModel>(
 ) -> PdPrefillWorker<M> {
     let prefix_cache_logger = PrefixCacheLogger::open_opt(cost_log_dir.as_deref(), pool_tag, id);
     let num_attn_shards = model.num_attn_shards().max(1);
-    let kv_capacity = full_attention_token_capacity(model.as_ref(), &config);
+    let kv_capacity = full_attention_token_capacity(
+        model.num_attn_shards(),
+        model.total_kv_bytes_per_token(),
+        &config,
+    );
     let prefix_cache = config.prefix_cache.resolve_tokens(
         kv_capacity,
         model.total_kv_bytes_per_token(),
         model.num_attn_shards(),
     );
-    let essentials = prepare_unified_iter_build_essentials(
+    let essentials = prepare_iter_build_essentials(
         id,
         pool_tag,
-        model,
         requests,
         &config,
         cost_log_dir,
         pool,
         gpu_name,
         &cluster,
+        model.gpus_per_replica(),
+        model.cost_log_manifest(),
         kv_capacity,
         1,
     );
@@ -69,7 +75,7 @@ pub(crate) fn build_pd_prefill_worker<M: IterwiseUnifiedModel>(
         essentials.context,
         kv_store,
         admission,
-        essentials.execution,
+        UnifiedIterExecution::new(model, essentials.cost),
     )
 }
 

@@ -80,7 +80,10 @@ def _describe_layers(model) -> str:
     parts = []
     for stack in model.layers:
         tag = stack.tag or type(stack.attn).__name__
-        parts.append(f"{stack.count}x[{tag}: {_describe_attn(stack.attn)}]")
+        # A staged stack only runs when the workload carries its stage, so say so
+        # rather than letting it read as part of the body's layer schedule.
+        stage = f" stage={stack.stage}" if stack.stage is not None else ""
+        parts.append(f"{stack.count}x[{tag}{stage}: {_describe_attn(stack.attn)}]")
     return "  ".join(parts)
 
 

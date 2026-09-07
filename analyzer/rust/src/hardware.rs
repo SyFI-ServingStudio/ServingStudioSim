@@ -31,6 +31,7 @@ pub struct ResolvedGpu {
     pub fp16_tflops: Option<f64>,
     pub bf16_tflops: Option<f64>,
     pub fp8_tflops: Option<f64>,
+    pub fp4_tflops: Option<f64>,
     pub fp32_tflops: Option<f64>,
     pub int8_tops: Option<f64>,
     pub interconnect: Option<String>,
@@ -42,7 +43,11 @@ impl ResolvedGpu {
     /// a GPU lacking that dtype (callers must not draw a line).
     pub fn dense_tflops(&self, dtype: &str) -> Option<f64> {
         let normalized = dtype.trim().to_ascii_lowercase();
-        if normalized.contains("fp8") || normalized.contains("e4m3") || normalized.contains("e5m2")
+        if normalized.contains("fp4") || normalized.contains("e2m1") {
+            self.fp4_tflops
+        } else if normalized.contains("fp8")
+            || normalized.contains("e4m3")
+            || normalized.contains("e5m2")
         {
             self.fp8_tflops
         } else if normalized == "int8" {
@@ -108,6 +113,7 @@ fn match_gpu(gpu: &Value, target: &str) -> Option<ResolvedGpu> {
         fp16_tflops: num("fp16_tflops"),
         bf16_tflops: num("bf16_tflops"),
         fp8_tflops: num("fp8_tflops"),
+        fp4_tflops: num("fp4_tflops"),
         fp32_tflops: num("fp32_tflops"),
         int8_tops: num("int8_tops"),
         interconnect: gpu

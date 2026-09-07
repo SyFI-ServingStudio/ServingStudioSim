@@ -219,12 +219,12 @@ def extract_metrics_jsonl(
                     f"emitted by {records.rank_prefix_label} rank {dp_rank}"
                 )
             row["dp_rank"] = dp_rank
-            if row["schema_version"] not in {1, 2} or row["input_adapter"] != records.adapter:
+            if row["schema_version"] not in {1, 2, 3, 4} or row["input_adapter"] != records.adapter:
                 raise ValueError(
                     "unsupported alignment iteration record "
                     f"schema={row['schema_version']!r} adapter={row['input_adapter']!r}"
                 )
-            if row["schema_version"] == 2:
+            if row["schema_version"] >= 2:
                 timing_fields = {
                     "observed_start_monotonic_ns",
                     "observed_end_monotonic_ns",
@@ -238,9 +238,83 @@ def extract_metrics_jsonl(
                     )
                 if row["observed_end_monotonic_ns"] < row["observed_start_monotonic_ns"]:
                     raise ValueError("alignment iteration observation ends before it starts")
+            if row["schema_version"] >= 3:
+                _validate_decode_queries(row)
+            if row["schema_version"] >= 4:
+                _validate_decode_request_progress(row, records)
             out.write(json.dumps(row) + "\n")
             n += 1
     return n
+
+
+def _validate_decode_queries(row: dict) -> None:
+    queries = row.get("decode_query_lens")
+    if not isinstance(queries, list) or len(queries) != row["decode_requests"]:
+        raise ValueError("decode_query_lens must contain one query length per decode request")
+    if any(type(value) is not int or value <= 0 for value in queries):
+        raise ValueError("decode_query_lens entries must be positive integers")
+    if sum(queries) != row["decode_tokens_scheduled"]:
+        raise ValueError("decode_query_lens disagrees with decode_tokens_scheduled")
+    if len(row["decode_kv_lens"]) != len(queries):
+        raise ValueError("decode_kv_lens disagrees with decode_query_lens")
+
+
+def _validate_decode_request_progress(row: dict, records: EngineRecords) -> None:
+    progress = row.get("decode_request_progress")
+    if not isinstance(progress, list) or len(progress) != row["decode_requests"]:
+        raise ValueError("decode_request_progress must contain one entry per decode request")
+    counts = {
+        "kv_len",
+        "query_len",
+        "output_tokens_before",
+        "drafted_tokens",
+        "accepted_draft_tokens",
+        "emitted_tokens",
+    }
+    seen: set[str] = set()
+    for index, request in enumerate(progress):
+        if not isinstance(request, dict):
+            raise ValueError("decode_request_progress entries must be objects")
+        engine_id = request.get("engine_request_id")
+        if not isinstance(engine_id, str) or not engine_id:
+            raise ValueError("decode request engine_request_id must be non-empty")
+        external_id = request.get("external_request_id")
+        if external_id is None:
+            # Early v4 producers exposed only the randomized internal id.
+            external_id = engine_id
+            if records.adapter == "vllm_text":
+                external_id = re.sub(r"-[0-9a-f]{8}$", "", external_id)
+        if not isinstance(external_id, str) or not external_id:
+            raise ValueError("decode request external_request_id must be non-empty")
+        if engine_id != external_id and re.fullmatch(re.escape(external_id) + r"-[0-9a-f]{8}", engine_id) is None:
+            raise ValueError("decode request external_request_id does not match its engine id")
+        request_id = records.unwrap_request_id(external_id)
+        if request_id in seen:
+            raise ValueError(f"duplicate canonical decode request id {request_id!r}")
+        seen.add(request_id)
+        finished = request.get("request_finished_before", False)
+        if type(finished) is not bool:
+            raise ValueError("decode request request_finished_before must be boolean")
+        for field in counts:
+            value = request.get(field)
+            if field == "output_tokens_before" and value is None and finished:
+                continue
+            if type(value) is not int or value < 0:
+                raise ValueError(f"decode request {field} must be a nonnegative integer")
+        if request["kv_len"] != row["decode_kv_lens"][index]:
+            raise ValueError("decode request kv_len disagrees with decode_kv_lens")
+        if request["query_len"] != row["decode_query_lens"][index]:
+            raise ValueError("decode request query_len disagrees with decode_query_lens")
+        drafted = request["drafted_tokens"]
+        accepted = request["accepted_draft_tokens"]
+        emitted = request["emitted_tokens"]
+        # A scheduler may suppress this request's sampled output (e.g. async
+        # bookkeeping). Zero output is an observation, not a bonus token.
+        if accepted > drafted or accepted != (max(emitted - 1, 0) if drafted else 0):
+            raise ValueError("decode request accepted drafts disagree with sampled output")
+        if not drafted and emitted > 1:
+            raise ValueError("non-spec decode cannot emit multiple sampled tokens")
+        request["request_id"] = request_id
 
 
 def extract_request_timings_jsonl(
@@ -565,6 +639,9 @@ def extract_expert_popularity(
     expert_parallel_size: int,
     reduction_group_size: int,
     experts_per_token: int | None = None,
+    model_role: str | None = None,
+    replay_start_monotonic_ns: int | None = None,
+    replay_end_monotonic_ns: int | None = None,
     dp_size: int = 1,
     records: EngineRecords = VLLM_RECORDS,
 ) -> int:
@@ -594,16 +671,31 @@ def extract_expert_popularity(
         raise ValueError("reduction_group_size must be a positive integer")
     if max_tokens_per_step <= 0:
         raise ValueError("max_tokens_per_step must be positive")
+    if model_role is not None and model_role not in {"target", "draft"}:
+        raise ValueError("model_role must be target or draft")
+    window = (replay_start_monotonic_ns, replay_end_monotonic_ns)
+    if model_role is not None:
+        if any(type(value) is not int or value <= 0 for value in window):
+            raise ValueError("role-specific expert popularity requires an exact replay window")
+        if replay_end_monotonic_ns < replay_start_monotonic_ns:
+            raise ValueError("replay monotonic window ends before it starts")
+    elif any(value is not None for value in window):
+        raise ValueError("replay window requires an explicit model_role")
 
     raw_records: list[dict] = []
     accepted_records: list[dict] = []
     discarded_oversized_steps: list[int] = []
     expected_shape: tuple[int, int] | None = None
     expected_model: str | None = None
+    expected_forwards: int | None = None
+    discarded_outside_window = 0
     aggregate_counts: list[list[int]] | None = None
     seen_owner_steps: set[tuple[int, int]] = set()
-    with Path(out_jsonl).open("w") as output_file:
-        for line in Path(server_log).read_text(errors="replace").splitlines():
+    with (
+        Path(server_log).open(errors="replace") as source,
+        Path(out_jsonl).open("w") as output_file,
+    ):
+        for line in source:
             match = _ALIGNMENT_EXPERT_LOAD_RE.search(line)
             if match is None:
                 continue
@@ -619,11 +711,34 @@ def extract_expert_popularity(
             missing = required - set(record)
             if missing:
                 raise ValueError(f"alignment expert-load record missing {sorted(missing)}")
-            if record["schema_version"] not in {1, 2}:
+            if record["schema_version"] not in {1, 2, 3}:
                 raise ValueError(
                     f"unsupported alignment expert-load schema {record['schema_version']!r}"
                 )
-            if record["schema_version"] == 2:
+            if model_role is not None and record["schema_version"] < 3:
+                raise ValueError("role-specific expert popularity requires schema-v3 raw records")
+            if record["schema_version"] >= 3:
+                role = record.get("model_role")
+                if role not in {"target", "draft"}:
+                    raise ValueError("expert-load model_role must be target or draft")
+                if model_role is None and role == "draft":
+                    raise ValueError(
+                        "draft expert-load records require explicit model_role selection"
+                    )
+                if model_role is not None and role != model_role:
+                    continue
+                forwards = record.get("max_forwards_per_step")
+                observed = record.get("observed_monotonic_ns")
+                if type(forwards) is not int or forwards <= 0:
+                    raise ValueError("max_forwards_per_step must be a positive integer")
+                if type(observed) is not int or observed <= 0:
+                    raise ValueError("observed_monotonic_ns must be a positive integer")
+                if role == "target" and forwards != 1:
+                    raise ValueError("target expert-load must have one forward per step")
+                if expected_forwards is not None and expected_forwards != forwards:
+                    raise ValueError("expert-load max_forwards_per_step changed")
+                expected_forwards = forwards
+            if record["schema_version"] >= 2:
                 for field_name in ("expert_parallel_size", "experts_per_token"):
                     value = record.get(field_name)
                     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
@@ -706,8 +821,20 @@ def extract_expert_popularity(
             output_file.write(json.dumps(record, separators=(",", ":")) + "\n")
             raw_records.append(record)
 
+            if model_role is not None and not (
+                replay_start_monotonic_ns
+                <= record["observed_monotonic_ns"]
+                <= replay_end_monotonic_ns
+            ):
+                discarded_outside_window += 1
+                continue
             assert experts_per_token is not None
-            assignment_ceiling = max_tokens_per_step * reduction_group_size * experts_per_token
+            assignment_ceiling = (
+                max_tokens_per_step
+                * reduction_group_size
+                * experts_per_token
+                * (expected_forwards or 1)
+            )
             if any(total > assignment_ceiling for total in layer_totals):
                 discarded_oversized_steps.append(eplb_step)
                 continue
@@ -732,7 +859,7 @@ def extract_expert_popularity(
         sum(layer[expert] for layer in aggregate_counts) for expert in range(expected_shape[1])
     ]
     summary = {
-        "schema_version": 3,
+        "schema_version": 4 if model_role is not None else 3,
         # The raw JSONL retains the engine's exact path. The portable summary
         # records checkpoint identity rather than one capture host's location.
         "model": normalize_model_id(expected_model),
@@ -765,6 +892,17 @@ def extract_expert_popularity(
         "counts_all_layers": all_layer_counts,
         "probabilities_all_layers": normalize(all_layer_counts),
     }
+    if model_role is not None:
+        summary["model_role"] = model_role
+        summary["aggregation"].update(
+            scope="replay_window_within_role_specific_token_ceiling",
+            replay_start_monotonic_ns=replay_start_monotonic_ns,
+            replay_end_monotonic_ns=replay_end_monotonic_ns,
+            observed_monotonic_ns_min=min(r["observed_monotonic_ns"] for r in accepted_records),
+            observed_monotonic_ns_max=max(r["observed_monotonic_ns"] for r in accepted_records),
+            discarded_outside_replay_window_record_count=discarded_outside_window,
+            max_forwards_per_step=expected_forwards,
+        )
     Path(out_json).write_text(json.dumps(summary, indent=2))
     return len(accepted_records)
 

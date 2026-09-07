@@ -18,7 +18,6 @@ from profiling.profilers.timer import Timer
 from profiling.runners.exceptions import KernelLaunchFailed, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
 
-_NEXT_N = 1
 _SUPPORTED_NUM_HEADS = (32, 64)
 _HEAD_DIM = 128
 _BLOCK_SIZE = 64
@@ -108,8 +107,8 @@ def _validate_args(
         raise ValueError(
             f"context_len must be <= max_model_len, got {context_len} and {max_model_len}"
         )
-    if next_n != _NEXT_N:
-        raise ValueError(f"dsa_paged_mqa_logits_decode requires next_n=1, got {next_n}")
+    if next_n <= 0:
+        raise ValueError(f"dsa_paged_mqa_logits_decode requires next_n > 0, got {next_n}")
     if num_heads not in _SUPPORTED_NUM_HEADS or head_dim != _HEAD_DIM or block_size != _BLOCK_SIZE:
         raise ValueError(
             "dsa_paged_mqa_logits_decode requires "

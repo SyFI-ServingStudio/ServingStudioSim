@@ -219,6 +219,8 @@ mod tests {
             decode_request_count: 1,
             decode_kv_total: 10,
             prefill_chunk_pairs: vec![(0, 4)],
+            decode_query_rows: 1,
+            speculative_geometry: None,
         };
         chunk.group_logs.push(g);
         for s in 0..slot_count {

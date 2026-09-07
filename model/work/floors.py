@@ -77,6 +77,54 @@ def _model(config_path: str):
     return load_model(config_path)
 
 
+def _model_for_spec(spec: dict):
+    model = _model(spec["config"])
+    if spec.get("arch_type") != "glm52_vllm_nvfp4_dsa_moe_speculative":
+        return model
+    mode = spec.get("mtp_mode", "index_share")
+    if mode not in ("index_share", "full_index"):
+        raise ValueError(f"unsupported speculative MTP mode {mode!r}")
+    if mode == "full_index":
+        from dataclasses import replace
+
+        from .core import NormWeightGroup
+
+        layers = [
+            replace(stack, attn=replace(stack.attn, full_index=True))
+            if stack.stage == "mtp_recurrent"
+            else stack
+            for stack in model.layers
+        ]
+        recurrent = next(stack for stack in layers if stack.stage == "mtp_recurrent")
+        model = replace(
+            model,
+            layers=layers,
+            norm_weights=[
+                *model.norm_weights,
+                NormWeightGroup(
+                    "mtp_recurrent.indexer_k_norm",
+                    recurrent.attn.index_head_dim,
+                    1,
+                    stage="mtp_recurrent",
+                    param_count=0,
+                ),
+            ],
+        )
+    return model
+
+
+def _validate_speculative_totals(spec: dict, totals: dict) -> None:
+    if spec.get("arch_type") != "glm52_vllm_nvfp4_dsa_moe_speculative":
+        if totals.get("speculative_geometry"):
+            raise ValueError("speculative geometry requires a speculative architecture")
+        return
+    if not totals.get("speculative_geometry"):
+        raise ValueError("speculative floors require per-stage workload geometry")
+    for encoded in totals["speculative_geometry"]:
+        if json.loads(encoded)["draft_tokens"] != spec["draft_tokens"]:
+            raise ValueError("logged draft depth disagrees with params.json")
+
+
 def _pool_specs(log_dir: Path) -> dict[str, dict]:
     """Map pool_tag -> {config, gpu, dtype} from the run's params.json.
 
@@ -93,10 +141,17 @@ def _pool_specs(log_dir: Path) -> dict[str, dict]:
         group = pool["groups"][0]
         arch = group["arch"]
         arch_type = arch.get("type", "")
-        arch_quant_dtype = "fp4" if arch_type == "glm52_vllm_nvfp4_dsa_moe" else None
+        arch_quant_dtype = (
+            "fp4"
+            if arch_type in ("glm52_vllm_nvfp4_dsa_moe", "glm52_vllm_nvfp4_dsa_moe_speculative")
+            else None
+        )
         if arch.get("fp8"):
             arch_quant_dtype = "fp8"
         specs[pool_tag] = {
+            "arch_type": arch_type,
+            "mtp_mode": arch.get("mtp_mode", "index_share"),
+            "draft_tokens": arch.get("draft_tokens", 5),
             "config": arch["model_config"],
             # `gpu` is a group-level field (the arch block carries model/tp/fp8).
             "gpu": group["gpu"],
@@ -148,13 +203,25 @@ def _spec_for_level(level_key: str, pool_specs: dict[str, dict]) -> dict:
     -model runs) — otherwise a per-pool-summed cluster floor is needed (deferred).
     """
     if level_key == "cluster":
-        distinct = {(s["config"], s["gpu"], s["dtype"]) for s in pool_specs.values()}
+        distinct = {
+            (
+                s["config"],
+                s["gpu"],
+                s["dtype"],
+                s.get("arch_type"),
+                s.get("mtp_mode"),
+                s.get("draft_tokens"),
+            )
+            for s in pool_specs.values()
+        }
         if len(distinct) != 1:
             raise ValueError(f"cluster floor needs one shared model across pools, saw {distinct}")
-        return next(iter(pool_specs.values()))
-    # Pool level is the bare tag; worker level is "<pool_tag>/<worker_id>".
-    pool_tag = level_key.split("/", 1)[0]
-    return pool_specs[pool_tag]
+        spec = next(iter(pool_specs.values()))
+    else:
+        # Pool level is the bare tag; worker level is "<pool_tag>/<worker_id>".
+        pool_tag = level_key.split("/", 1)[0]
+        spec = pool_specs[pool_tag]
+    return spec
 
 
 def _aggregate_workload(totals: dict) -> Workload:
@@ -166,6 +233,10 @@ def _aggregate_workload(totals: dict) -> Workload:
     keys from cache each step, so cached == pairs == ``decode_kv``; the self-key
     ``+1`` per step is negligible and omitted.
     """
+    if totals.get("speculative_geometry"):
+        from .speculative import aggregate_workload
+
+        return aggregate_workload(totals)
     matmul_tokens = int(totals["matmul_tokens"])
     sampled = int(totals["decode_passes"]) + int(totals["prefill_requests"])
     attn: list[AttnInteraction] = []
@@ -515,7 +586,7 @@ def _validated_basis(
     """Build and independently validate one basis before any batch reduction."""
     totals = weighted_shapes[0]["totals"]
     basis_key = _basis_key(model, totals, has_routed_matmul)
-    if len(weighted_shapes) < _MIN_BASIS_GROUP:
+    if totals.get("speculative_geometry") or len(weighted_shapes) < _MIN_BASIS_GROUP:
         # Counted with the validation failures: both mean "this group was reduced
         # one shape at a time".
         basis_cache[basis_key] = None
@@ -696,8 +767,9 @@ def compute_floors(log_dir: Path, levels: dict[str, dict]) -> dict[str, dict]:
     for level_key, totals in levels.items():
         try:
             spec = _spec_for_level(level_key, pool_specs)
-            model = _model(spec["config"])
+            model = _model_for_spec(spec)
             _check_precision(model, spec)
+            _validate_speculative_totals(spec, totals)
             out[level_key] = _label_payload(model, totals, spec)
         except Exception as error:  # noqa: BLE001 - isolate independent batch rows
             # One heterogeneous or unsupported scope must not discard valid
@@ -719,8 +791,10 @@ def compute_locked_compositions(log_dir: Path, compositions: dict[str, list[dict
     for level_key, weighted_shapes in compositions.items():
         try:
             spec = _spec_for_level(level_key, pool_specs)
-            model = _model(spec["config"])
+            model = _model_for_spec(spec)
             _check_precision(model, spec)
+            if not weighted_shapes:
+                _validate_speculative_totals(spec, {})
             fused_seconds = 0.0
             segmented_seconds = 0.0
             segments_by_name: dict[str, dict] = {}
@@ -729,6 +803,7 @@ def compute_locked_compositions(log_dir: Path, compositions: dict[str, list[dict
             basis_cache: dict[_BasisKey, dict | None] = {}
             shapes_by_basis: dict[_BasisKey, list[dict]] = defaultdict(list)
             for weighted_shape in weighted_shapes:
+                _validate_speculative_totals(spec, weighted_shape["totals"])
                 occurrences = int(weighted_shape["occurrences"])
                 if occurrences <= 0:
                     raise ValueError(f"occurrences must be positive, got {occurrences}")

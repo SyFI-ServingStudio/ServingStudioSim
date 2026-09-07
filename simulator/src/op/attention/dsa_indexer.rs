@@ -630,11 +630,10 @@ fn validate_config(cfg: &DsaIndexerConfig) -> Result<(), BuildError> {
             "logits_row_stride {logits_row_stride} must be at least max_model_len {max_model_len}"
         )));
     }
-    if !matches!(cfg.next_n, 1 | 2) {
-        return Err(fit_failed(format!(
-            "next_n must be 1 or 2, got {}",
-            cfg.next_n
-        )));
+    // `next_n` is a decode-kernel config identity at every positive verify width;
+    // it selects a measured surface rather than a code path here.
+    if cfg.next_n == 0 {
+        return Err(fit_failed("next_n must be positive"));
     }
     for (name, actual, required) in [
         ("input_dtype", cfg.input_dtype, DType::Bf16),
@@ -777,8 +776,8 @@ fn normalize_input(
     next_n: u32,
     max_model_len: u32,
 ) -> Result<NormalizedInput, String> {
-    if !matches!(next_n, 1 | 2) {
-        return Err(format!("next_n must be 1 or 2, got {next_n}"));
+    if next_n == 0 {
+        return Err("next_n must be positive".to_string());
     }
 
     let mut active_query_rows = 0_u32;
@@ -1109,9 +1108,14 @@ mod tests {
             ));
         }
         assert!(matches!(
-            validate_config(&cfg(3)),
-            Err(BuildError::FitFailed { reason, .. }) if reason.contains("next_n")
+            validate_config(&cfg(0)),
+            Err(BuildError::FitFailed { reason, .. }) if reason.contains("next_n must be positive")
         ));
+        // A wider verify group is a decode-kernel config identity, not an
+        // unsupported shape; the indexer must not gate on it.
+        for next_n in [1, 2, 3, 6] {
+            assert!(validate_config(&cfg(next_n)).is_ok(), "next_n {next_n}");
+        }
 
         for mutate in [
             |cfg: &mut DsaIndexerConfig| cfg.input_dtype = DType::Fp32,

@@ -6,9 +6,11 @@
 use crate::common::{RequestId, Time, WorkerId};
 use crate::worker::admission::{
     ChunkedPrefillAdmission, IterAdmission, LocalPrefillDecodeAdmission, PendingOrder,
-    PrefillHandoffAdmission,
+    PrefillHandoffAdmission, SpeculativeDecodeCompletion,
 };
-use crate::worker::execution::{IterModelExecution, UnifiedIterExecution};
+use crate::worker::execution::{
+    IterModelExecution, SpeculativeIterExecution, UnifiedIterExecution,
+};
 use crate::worker::iter_worker::IterWorker;
 use crate::worker::kv::{FullAttnKv, HybridGdnKv, IterWorkerKv};
 use crate::worker::shared::context::WorkerContext;
@@ -62,6 +64,16 @@ pub type BareboneWorker<M> =
 pub type HpUnifiedWorker<M> = BareboneWorker<M>;
 pub type ChunkedPrefillWorker<M> =
     IterBatchWorker<FullAttnKv, ChunkedPrefillAdmission<PendingOrder>, UnifiedIterExecution<M>>;
+/// `ChunkedPrefillWorker` with a speculating decode engine. Two axes change
+/// together because they are two halves of one fact: the lifecycle's decode
+/// completion retires an accepted chain instead of one token, and the execution
+/// adapter submits the matching verify width to the model. KV, policy, and shell
+/// are unchanged — speculation is not a cadence.
+pub type SpeculativeWorker<M> = IterBatchWorker<
+    FullAttnKv,
+    ChunkedPrefillAdmission<PendingOrder, SpeculativeDecodeCompletion>,
+    SpeculativeIterExecution<M>,
+>;
 /// Barebone on every axis but KV: a hybrid arch's per-request recurrent state
 /// shares the attention capacity with its per-token KV. Only the store differs.
 pub type Qwen36HybridWorker<M> = IterBatchWorker<

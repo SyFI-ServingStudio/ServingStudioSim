@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -58,6 +59,7 @@ from .pack import Case, HostProfile, Pack, PackError, TraceSpec, Variant
 #: Trace file names inside a rendered case directory. Fixed rather than derived
 #: from the pack's file names so a run directory reads the same for every pack.
 WORKLOAD_TRACE_NAME = "trace.csv"
+SPECULATIVE_TRACE_NAME = "trace_speculative.csv"
 KERNEL_TRACE_NAME = "trace_nsys.csv"
 
 #: The four phases that follow the variant's profile passes. `--phase` values are
@@ -126,7 +128,7 @@ def config_stem(variant: Variant, phase: str) -> str:
 
 # ── traces ───────────────────────────────────────────────────────────────────
 
-def trace_text(case: Case, spec: TraceSpec) -> str:
+def trace_text(case: Case, spec: TraceSpec, *, speculative_acceptance: list[float] | None = None) -> str:
     """Regenerate one trace from its shapes.
 
     Request ids carry the case slug so two cases replayed into one server are
@@ -135,7 +137,10 @@ def trace_text(case: Case, spec: TraceSpec) -> str:
     """
     buffer = io.StringIO()
     writer = csv.writer(buffer, lineterminator="\n")
-    writer.writerow(("id", "input_len", "output_len", "arrival_time"))
+    columns = ["id", "input_len", "output_len", "arrival_time"]
+    if speculative_acceptance is not None:
+        columns.append("accept_rate")
+    writer.writerow(columns)
     rows = [shape for _ in range(spec.repeats) for shape in spec.shapes]
     prefix = case.slug if spec.id_suffix is None else f"{case.slug}-{spec.id_suffix}"
     for index, (input_len, output_len) in enumerate(rows):
@@ -144,7 +149,10 @@ def trace_text(case: Case, spec: TraceSpec) -> str:
                 f"{case.slug} trace row {index} reaches max_model_len: "
                 f"{input_len}+{output_len} >= {case.max_model_len}"
             )
-        writer.writerow((f"{prefix}-{index:04d}", input_len, output_len, float(index * 1000)))
+        row = [f"{prefix}-{index:04d}", input_len, output_len, float(index * 1000)]
+        if speculative_acceptance is not None:
+            row.append(json.dumps(speculative_acceptance, separators=(",", ":")))
+        writer.writerow(row)
     return buffer.getvalue()
 
 
@@ -186,6 +194,8 @@ def _server_block(pack: Pack, variant: Variant, case: Case, host: HostProfile) -
             continue
         body[key] = value
     body["gpu_memory_utilization"] = case.gpu_memory_utilization
+    if case.chunk_size is not None:
+        body["chunk_size"] = case.chunk_size
     body["startup_timeout"] = host.startup_timeout
     body["extra_args"] = _extra_args(variant, case)
     return body
@@ -259,6 +269,8 @@ def profile_document(
             nsys["analyze_iteration_end"] = end
         document["nsys"] = nsys
     document["workload"] = _workload_block(variant, case, host, trace_name)
+    if profile_pass.warmup:
+        document["workload"]["warmup"] = True
     return document
 
 
@@ -308,11 +320,21 @@ def simulation_document(
     cannot be written once and moved. Paths are emitted repo-relative when the
     run directory is inside the repository and absolute otherwise.
     """
+    speculative = variant.arch.get("type") == "glm52_vllm_nvfp4_dsa_moe_speculative"
+    if speculative != (case.speculative_acceptance is not None):
+        raise PackError(f"{case.slug}: speculative architecture and acceptance must be configured together")
+    if speculative:
+        depth = variant.arch.get("draft_tokens", 5)
+        if len(case.speculative_acceptance.value) != depth or variant.worker.get("draft_tokens", 5) != depth:
+            raise PackError(f"{case.slug}: acceptance length, worker and architecture draft_tokens must agree")
+    trace_name = SPECULATIVE_TRACE_NAME if speculative else WORKLOAD_TRACE_NAME
     workload: dict[str, Any] = {
-        "trace_files": [_preset_path(case_dir / WORKLOAD_TRACE_NAME, repo_root)],
+        "trace_files": [_preset_path(case_dir / trace_name, repo_root)],
         "input_file_format": IndependentFrontendConfig.input_file_format,
         "arrival_mode": case.simulation_arrival_mode,
     }
+    if speculative:
+        workload["input_file_tags"] = ["speculative"]
     if case.max_concurrency is not None:
         workload["max_concurrency"] = case.max_concurrency
     if case.rate is not None:
@@ -326,9 +348,10 @@ def simulation_document(
             f"variants.{variant.name}.arch must not set max_model_len; it is per-case"
         )
     arch["max_model_len"] = case.max_model_len
-    popularity = arch.get("expert_popularity_file")
-    if isinstance(popularity, str) and popularity:
-        arch["expert_popularity_file"] = _preset_path(pack.root / popularity, repo_root)
+    for key in ("expert_popularity_file", "draft_expert_popularity_file"):
+        popularity = arch.get(key)
+        if isinstance(popularity, str) and popularity:
+            arch[key] = _preset_path(pack.root / popularity, repo_root)
 
     worker = dict(variant.worker)
     for derived in ("attn_gpu_memory_gb", "gpu_time_multiplier"):
@@ -339,6 +362,8 @@ def simulation_document(
                 "is injected by the simulation phase from the kernel-align result"
             )
     worker["attn_gpu_memory_gb"] = case.attn_gpu_memory_gb.value
+    if case.chunk_size is not None:
+        worker["max_batch_tokens"] = case.chunk_size
     # Rendered as the neutral 1.0 on purpose: `alignment sim` overrides it with
     # the multiplier read out of the completed kernel-align artifact, so a preset
     # that already carried one would make the source of the number ambiguous.
@@ -431,6 +456,10 @@ def case_documents(
 def case_traces(pack: Pack, case: Case) -> dict[str, str]:
     """Trace file name → contents for one rendered case directory."""
     traces = {WORKLOAD_TRACE_NAME: trace_text(case, case.workload_trace)}
+    if case.speculative_acceptance is not None:
+        traces[SPECULATIVE_TRACE_NAME] = trace_text(
+            case, case.workload_trace, speculative_acceptance=case.speculative_acceptance.value
+        )
     if case.kernel_trace is not None:
         traces[KERNEL_TRACE_NAME] = trace_text(case, case.kernel_trace)
     return traces

@@ -64,13 +64,15 @@ embeds the run-global specs and fixes which **pool roles** exist:
    `sim_num_layers` / `num_layers` truncation **before** config build.
 3. Build a `WorkerConfig` (`attn_kv_bytes` from the worker tag's
    `attn_gpu_memory_gb`, plus hot-path logging controls from `io`). The worker is
-   itself a tagged enum (`IterWorkerSel`): `Barebone` and `HpUnified` are wired
-   for `unified`; `ChunkedPrefill` parses but bails (`not wired yet`), and the PD
-   worker tags are rejected here because they belong to the `pd` deployment.
+   itself a tagged enum (`IterWorkerSel`): ordinary recipes include `Barebone`,
+   `HpUnified`, and `ChunkedPrefill`. `Speculative` selects the separate
+   draft/verify execution contract. PD worker tags belong to the `pd` deployment.
 4. **Select the arch by its explicit tag** — the wired unified arms are
    `Llama3Dense`, `Llama3DenseTp`, `Llama3DpAttnTpFfn`, `Qwen3MoeDpAttnEpFfn`,
    `Qwen3MoeFp8DpAttnEpFfn`, `Qwen3VllmMoeDpAttnEpFfn`, `Glm52DsaMoe`, and
-   `Glm52VllmDsaMoe`. Dispatch is provider-first, *not* a
+   `Glm52VllmDsaMoe`, plus the explicit NVFP4 provider variants.
+   `Glm52VllmNvfp4DsaMoeSpeculative` requires the `Speculative` worker with the
+   same draft depth; it has its own L4 identity. Dispatch is provider-first, *not* a
    `tp_size` dispatch. Each arm runs the L4 cascade
    `build_configs → resolve_configs → build` with its resolved parallel layout,
    producing a concrete model type `M`.

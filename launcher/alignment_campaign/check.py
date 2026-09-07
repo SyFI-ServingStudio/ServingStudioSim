@@ -388,25 +388,30 @@ def _check_label_rules(pack: Pack) -> list[Finding]:
 def _check_expert_popularity(pack: Pack) -> list[Finding]:
     findings: list[Finding] = []
     for name, variant in pack.variants.items():
-        reference = variant.arch.get("expert_popularity_file")
-        if not isinstance(reference, str) or not reference:
-            continue
-        where = f"variants.{name}.arch.expert_popularity_file"
-        path = pack.root / reference
-        if not path.is_file():
-            findings.append(Finding("error", where, f"missing: {reference}"))
-            continue
-        try:
-            document = json.loads(path.read_text())
-        except json.JSONDecodeError as exc:
-            findings.append(Finding("error", where, f"unreadable: {exc}"))
-            continue
-        version = document.get("schema_version")
-        if version not in (2, 3):
-            findings.append(
-                Finding("error", where,
-                        f"schema_version must be 2 or 3, got {version!r}")
-            )
+        speculative = variant.arch.get("type") == "glm52_vllm_nvfp4_dsa_moe_speculative"
+        paths = {"target": "expert_popularity_file", "draft": "draft_expert_popularity_file"}
+        references = [variant.arch.get(key) for key in paths.values()]
+        if speculative and any(references) and not all(references):
+            findings.append(Finding("error", f"variants.{name}.arch", "target and draft popularity files must be provided together"))
+        for role, key in paths.items():
+            reference = variant.arch.get(key)
+            if not isinstance(reference, str) or not reference:
+                continue
+            where = f"variants.{name}.arch.{key}"
+            path = pack.root / reference
+            if not path.is_file():
+                findings.append(Finding("error", where, f"missing: {reference}"))
+                continue
+            try:
+                document = json.loads(path.read_text())
+            except json.JSONDecodeError as exc:
+                findings.append(Finding("error", where, f"unreadable: {exc}"))
+                continue
+            version = document.get("schema_version")
+            if version not in (2, 3, 4):
+                findings.append(Finding("error", where, f"schema_version must be 2, 3 or 4, got {version!r}"))
+            if speculative and (version != 4 or document.get("model_role") != role):
+                findings.append(Finding("error", where, f"speculative popularity requires schema v4 and model_role={role}"))
     return findings
 
 
@@ -565,6 +570,8 @@ def _check_cross_phase(pack: Pack, case: Case, documents: dict[str, Any]) -> lis
     variant = pack.variant_of(case)
     simulation = documents[f"{PHASE_CONFIG_STEMS[SIMULATION_PHASE]}.yaml"]
     group = simulation["pools"]["main"]["groups"][0]
+    if case.chunk_size is not None and group["worker"].get("max_batch_tokens") != case.chunk_size:
+        findings.append(Finding("error", f"{where}.simulation", "worker token ceiling differs from case.chunk_size"))
 
     if group["arch"]["max_model_len"] != case.max_model_len:
         findings.append(Finding("error", f"{where}.simulation", "arch.max_model_len drifted"))
@@ -579,6 +586,8 @@ def _check_cross_phase(pack: Pack, case: Case, documents: dict[str, Any]) -> lis
         )
     for profile_pass in variant.profile_passes:
         document = documents[f"{profile_pass.name}.yaml"]
+        if case.chunk_size is not None and document["server"].get("chunk_size") != case.chunk_size:
+            findings.append(Finding("error", f"{where}.{profile_pass.name}", "server token ceiling differs from case.chunk_size"))
         workload = document["workload"]
         if workload["max_model_len"] != case.max_model_len:
             findings.append(

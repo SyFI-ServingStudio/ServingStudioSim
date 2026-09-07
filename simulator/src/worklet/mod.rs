@@ -11,6 +11,7 @@
 
 pub mod attn_block_tp;
 pub mod attn_local;
+pub mod bf16_moe_local;
 pub mod deepseek_v4_attention_local;
 pub mod deepseek_v4_moe_expert_compute_local;
 pub mod deepseek_v4_moe_router_local;
@@ -57,6 +58,10 @@ pub use attn_block_tp::{
 };
 pub use attn_local::{
     AttnLocalWorklet, AttnLocalWorkletConfig, AttnLocalWorkletInput, AttnLocalWorkletResolved,
+};
+pub use bf16_moe_local::{
+    Bf16MoeLocalWorklet, Bf16MoeLocalWorkletConfig, Bf16MoeLocalWorkletInput,
+    Bf16MoeLocalWorkletResolved,
 };
 pub use deepseek_v4_attention_local::{
     DeepseekV4AttentionEntry, DeepseekV4AttentionLocalWorklet,

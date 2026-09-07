@@ -9,4 +9,4 @@
 # Measured expert routing demand: one number per (layer, expert) pair, 19,200
 # of them for GLM-5.2 at 75 layers x 256 experts. Produced by the profiler and
 # consumed by the simulator; a human never reads a row of it.
-presets/alignment/*/expert_popularity.json -diff linguist-generated=true
+presets/alignment/*/*popularity.json -diff linguist-generated=true

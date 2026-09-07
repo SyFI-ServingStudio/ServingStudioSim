@@ -16,9 +16,9 @@ pub use request::{
     RequestTelemetry, SchedulingContract, SharedRequests, SloContract,
 };
 pub use request_family::{
-    AudioExtent, AudioTextGenerationDefinition, AudioTextGenerationRequest, AudioToTextDefinition,
-    AudioToTextRequest, DecodingStrategy, GeneratedMediaProgress, ImageExtent,
-    ImageGenerationDefinition, ImageGenerationRequest, ImageTextGenerationDefinition,
+    AcceptanceProfile, AudioExtent, AudioTextGenerationDefinition, AudioTextGenerationRequest,
+    AudioToTextDefinition, AudioToTextRequest, DecodingStrategy, GeneratedMediaProgress,
+    ImageExtent, ImageGenerationDefinition, ImageGenerationRequest, ImageTextGenerationDefinition,
     ImageTextGenerationRequest, ImageToTextDefinition, ImageToTextRequest, ImageToVideoDefinition,
     ImageToVideoRequest, OmniGenerationDefinition, OmniGenerationProgress, OmniGenerationRequest,
     OmniInputSegment, OmniOutputSpec, RequestDefinition, SessionInput, SpeechGenerationDefinition,

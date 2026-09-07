@@ -362,7 +362,10 @@ fn validate_metadata(metadata: &PredictionMetadata) -> Result<()> {
     if !valid_prediction_id(&metadata.prediction_id) {
         bail!("invalid prediction id: {:?}", metadata.prediction_id);
     }
-    if !matches!(metadata.selector.as_str(), "iter" | "attn" | "ffn") {
+    if !matches!(
+        metadata.selector.as_str(),
+        "iter" | "speculative_iter" | "attn" | "ffn"
+    ) {
         bail!("invalid prediction selector: {:?}", metadata.selector);
     }
     if metadata.arch_type.is_empty() || metadata.gpu.is_empty() || metadata.gpu_count == 0 {

@@ -468,11 +468,27 @@ def test_workspace_ids_and_starts_follow_suffix_chunks_and_request_maxima() -> N
     )
 
 
+def test_spec5_rounded_8k_prefill_is_supported() -> None:
+    from profiling.runners.attention import dsa_sparse_index_remap as runner
+
+    args = runner._validate_args(**(_BASE_SPEC | {
+        "num_queries": 8196,
+        "num_requests": 1,
+        "request_row_counts": "u:8196x1",
+        "local_span_lengths": "r:1..8196",
+        "valid_counts": "c:1..8196@2048",
+    }))
+    assert args.request_row_counts == (8196,)
+    assert len(args.request_ids) == 8196
+    assert args.local_span_lengths[-1] == 8196
+    assert args.valid_counts[-1] == 2048
+
+
 @pytest.mark.parametrize(
     ("overrides", "match"),
     [
-        ({"num_queries": 0}, "1..8192"),
-        ({"num_queries": 8193}, "1..8192"),
+        ({"num_queries": 0}, "1..16384"),
+        ({"num_queries": 16385}, "1..16384"),
         ({"num_requests": 0}, "1..min"),
         ({"num_requests": 5}, "1..min"),
         ({"num_requests": 257}, "1..min"),

@@ -71,8 +71,11 @@ pub(crate) fn normalize_glm52_dsa_attn_input(
     decode_next_n: u32,
     max_model_len: u32,
 ) -> Result<Glm52DsaAttnNormalizedInput, String> {
-    if !matches!(decode_next_n, 1 | 2) {
-        return Err(format!("decode_next_n must be 1 or 2, got {decode_next_n}"));
+    // The width only scales the decode row count below. It selects a measured
+    // sparse-MLA cache identity, not a code path here, so any positive value is
+    // a shape this section can bill.
+    if decode_next_n == 0 {
+        return Err("decode_next_n must be positive".to_string());
     }
 
     let mut active_rows = 0_u32;
@@ -108,6 +111,7 @@ pub(crate) fn normalize_glm52_dsa_attn_input(
                     decode.context_len
                 ));
             }
+            let mut context_len_sum: u64 = 0;
             if let Some(context_lens) = &decode.context_lens {
                 if context_lens.len() != decode.batch_size as usize {
                     return Err(format!(
@@ -122,6 +126,7 @@ pub(crate) fn normalize_glm52_dsa_attn_input(
                             "decode request {request} context {context} must be in 1..={max_model_len}"
                         ));
                     }
+                    context_len_sum += u64::from(context);
                 }
             }
             let decode_rows = decode
@@ -134,7 +139,7 @@ pub(crate) fn normalize_glm52_dsa_attn_input(
             (
                 Some(DsaIndexerDecodeInput {
                     batch_size: decode.batch_size,
-                    context_len: decode.context_len,
+                    context_len: indexer_decode_context_len(decode, context_len_sum),
                     requires_padding: decode.requires_padding,
                 }),
                 Some((decode_rows, decode.context_len)),
@@ -157,4 +162,133 @@ pub(crate) fn normalize_glm52_dsa_attn_input(
         sparse_decode,
         sparse_decode_context_lens,
     })
+}
+
+/// The uniform context the indexer's decode leaves are billed against.
+///
+/// Both leaves are profiled with `context_mode: uniform` -- one length for the
+/// whole batch -- so a mixed batch has to be collapsed onto that axis. The
+/// collapse that preserves the work is the one that preserves the KV the batch
+/// reads, `ceil(sum / batch)`, not the longest request: a serving batch mixes a
+/// request on its first output token with one near the context limit, and
+/// charging every request the longest one's context bills the kernel for KV no
+/// request holds.
+///
+/// The sparse-MLA attention next door does not need this -- it is handed the
+/// per-request lengths themselves and evaluates each one.
+///
+/// Without the per-request lengths there is nothing to average, so the caller's
+/// own scalar stands. `context_lens` is validated non-empty and positive above,
+/// so the sum is positive whenever it is present and the batch is non-empty.
+fn indexer_decode_context_len(decode: &Glm52DsaAttnLocalDecodeInput, context_len_sum: u64) -> u32 {
+    if decode.context_lens.is_none() || decode.batch_size == 0 {
+        return decode.context_len;
+    }
+    let batch_size = u64::from(decode.batch_size);
+    let mean = context_len_sum.div_ceil(batch_size);
+    // Every exact length already passed the max_model_len check. Their mean
+    // is bounded by the same limit, independently of the scalar cache axis.
+    mean as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MAX_MODEL_LEN: u32 = 1_048_576;
+
+    fn decode_input(batch_size: u32, decode_next_n: u32) -> Glm52DsaAttnLocalInput {
+        Glm52DsaAttnLocalInput {
+            num_new_tokens: batch_size * decode_next_n,
+            prefill_query_cache_pairs: Vec::new(),
+            decode: Some(Glm52DsaAttnLocalDecodeInput {
+                batch_size,
+                context_len: 4096,
+                context_lens: None,
+                requires_padding: false,
+            }),
+        }
+    }
+
+    #[test]
+    fn decode_rows_scale_with_the_verify_width() {
+        // A verify step submits one group of `decode_next_n` rows per request.
+        // The width is a multiplier on the sparse-MLA query coordinate and
+        // nothing else here: the indexer sees request count and obtains the
+        // per-request query width from its own resolved configuration.
+        for decode_next_n in [1, 2, 3, 6] {
+            let normalized = normalize_glm52_dsa_attn_input(
+                &decode_input(8, decode_next_n),
+                decode_next_n,
+                MAX_MODEL_LEN,
+            )
+            .expect("any positive width is a billable shape");
+
+            assert_eq!(normalized.active_rows, 8 * decode_next_n);
+            assert_eq!(normalized.sparse_decode, Some((8 * decode_next_n, 4096)));
+            assert_eq!(
+                normalized.indexer_decode.as_ref().map(|d| d.batch_size),
+                Some(8)
+            );
+        }
+    }
+
+    #[test]
+    fn indexer_decode_is_billed_the_kv_the_batch_holds_not_the_longest_request() {
+        // The indexer's decode leaves are profiled at one context for the whole
+        // batch, so a mixed batch has to collapse onto that axis. Charging every
+        // request the longest one's context bills KV no request holds: here the
+        // four requests hold 404 tokens between them, not 4 x 190.
+        let input = Glm52DsaAttnLocalInput {
+            num_new_tokens: 4,
+            prefill_query_cache_pairs: Vec::new(),
+            decode: Some(Glm52DsaAttnLocalDecodeInput {
+                batch_size: 4,
+                context_len: 190,
+                context_lens: Some(vec![12, 190, 12, 190]),
+                requires_padding: false,
+            }),
+        };
+        let normalized = normalize_glm52_dsa_attn_input(&input, 1, MAX_MODEL_LEN).unwrap();
+
+        let decode = normalized.indexer_decode.unwrap();
+        assert_eq!(decode.batch_size, 4);
+        // ceil(404 / 4) == 101.
+        assert_eq!(decode.context_len, 101);
+        // The sparse-MLA path is unaffected: it keeps the caller's scalar as
+        // its cache coordinate and receives the exact lengths besides.
+        assert_eq!(normalized.sparse_decode, Some((4, 190)));
+        assert_eq!(
+            normalized.sparse_decode_context_lens,
+            Some(vec![12, 190, 12, 190])
+        );
+    }
+
+    #[test]
+    fn indexer_decode_keeps_the_caller_scalar_without_per_request_lengths() {
+        let decode = normalize_glm52_dsa_attn_input(&decode_input(4, 1), 1, MAX_MODEL_LEN)
+            .unwrap()
+            .indexer_decode
+            .unwrap();
+        assert_eq!(decode.context_len, 4096);
+    }
+
+    #[test]
+    fn exact_contexts_are_not_clipped_by_the_scalar_cache_axis() {
+        let mut input = decode_input(2, 6);
+        let decode = input.decode.as_mut().unwrap();
+        decode.context_len = 12;
+        decode.context_lens = Some(vec![190, 191]);
+        let normalized = normalize_glm52_dsa_attn_input(&input, 6, MAX_MODEL_LEN).unwrap();
+        assert_eq!(normalized.indexer_decode.unwrap().context_len, 191);
+        assert_eq!(normalized.sparse_decode_context_lens, Some(vec![190, 191]));
+    }
+
+    #[test]
+    fn zero_width_is_the_only_rejected_width() {
+        assert_eq!(
+            normalize_glm52_dsa_attn_input(&decode_input(8, 1), 0, MAX_MODEL_LEN).unwrap_err(),
+            "decode_next_n must be positive"
+        );
+    }
 }

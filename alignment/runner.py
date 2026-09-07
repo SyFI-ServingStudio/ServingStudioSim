@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import subprocess
 import threading
@@ -32,6 +33,7 @@ from .profiler import (
     record_extraction,
     runtime_artifacts,
     sglang_server,
+    spec_decode,
     vllm_server,
 )
 from .profiler.config import ProfileConfig
@@ -143,9 +145,23 @@ def run_profile(cfg: ProfileConfig, *, resume: bool = False) -> dict:
     pipeline; a failure in extraction or parsing must never cost a re-capture.
     """
     driver, _, _ = _engine(cfg)
-    if not resume and cfg.engine == "sglang" and (
-        cfg.python_runtime is None
-        or cfg.python_runtime.environment.get("FLASHINFER_DISABLE_JIT") != "1"
+    if cfg.workload is not None and cfg.workload.warmup and (
+        cfg.engine != "vllm"
+        or (cfg.profile_kind == "nsys" and cfg.nsys.capture_mode != "cuda_profiler_api")
+    ):
+        raise ValueError("warmup requires vLLM and cuda_profiler_api for NSYS captures")
+    if (
+        cfg.workload is not None and cfg.workload.warmup
+        and not cfg.server.enable_server_load_tracking
+    ):
+        raise ValueError("warmup requires server.enable_server_load_tracking")
+    if (
+        not resume
+        and cfg.engine == "sglang"
+        and (
+            cfg.python_runtime is None
+            or cfg.python_runtime.environment.get("FLASHINFER_DISABLE_JIT") != "1"
+        )
     ):
         raise ValueError(
             "a new SGLang profile requires an explicit python_runtime "
@@ -200,6 +216,9 @@ def run_profile(cfg: ProfileConfig, *, resume: bool = False) -> dict:
     )
     if not resume and cfg.python_runtime is not None:
         env.update(cfg.python_runtime.environment)
+    if not resume and cfg.workload.warmup:
+        # vLLM exposes reset_prefix_cache through its development router.
+        env["VLLM_SERVER_DEV_MODE"] = "1"
     if is_expert_popularity and not resume:
         # This pass measures routing counts, not phase timing.  NVTX construction
         # and NSYS are disabled so its deliberate EPLB all-reduce/D2H logging
@@ -221,6 +240,7 @@ def run_profile(cfg: ProfileConfig, *, resume: bool = False) -> dict:
         else None
     )
     server_log = engine_dir / f"{cfg.name}_server.log"
+    drive_summary_path = engine_dir / f"{cfg.name}_drive_summary.json"
 
     if resume:
         if not server_log.is_file():
@@ -238,6 +258,11 @@ def run_profile(cfg: ProfileConfig, *, resume: bool = False) -> dict:
             "summary_path": str(prepared_replay.summary_path),
             "resumed_from_existing_capture": True,
         }
+        if drive_summary_path.is_file():
+            drive_summary = {
+                **json.loads(drive_summary_path.read_text()),
+                "resumed_from_existing_capture": True,
+            }
         print(f"[profile] resuming from existing capture (log: {server_log})")
         return _finalize_profile(
             cfg,
@@ -292,10 +317,21 @@ def run_profile(cfg: ProfileConfig, *, resume: bool = False) -> dict:
         capture_timer_errors: list[BaseException] = []
         try:
             driver.wait_for_ready(base_url, proc, cfg.server.startup_timeout)
-            if is_nsys and cfg.nsys.capture_mode == "cuda_profiler_api":
-                driver.set_cuda_profile(base_url, active=True)
-                cuda_profile_active = True
-                if cfg.nsys.capture_duration_seconds is not None:
+            speculative = driver.speculative_decode_enabled(cfg.server)
+            counters_before = None
+            replay_start_monotonic_ns = None
+            measurement_log_offset = None
+
+            def measurement_ready() -> None:
+                nonlocal cuda_profile_active, capture_timer, counters_before
+                nonlocal replay_start_monotonic_ns, measurement_log_offset
+                if not driver.wait_for_idle(base_url, cfg.idle):
+                    raise RuntimeError("server did not drain before measurement")
+                measurement_log_offset = server_log.stat().st_size
+                if is_nsys and cfg.nsys.capture_mode == "cuda_profiler_api":
+                    driver.set_cuda_profile(base_url, active=True)
+                    cuda_profile_active = True
+                if cuda_profile_active and cfg.nsys.capture_duration_seconds is not None:
 
                     def stop_bounded_capture() -> None:
                         nonlocal cuda_profile_active
@@ -313,10 +349,16 @@ def run_profile(cfg: ProfileConfig, *, resume: bool = False) -> dict:
                         name="alignment-nsys-capture-timer",
                     )
                     capture_timer.start()
+                counters_before = (
+                    driver.fetch_spec_decode_metrics(base_url) if speculative else None
+                )
+                replay_start_monotonic_ns = time.monotonic_ns()
+                print("[profile] frontend ready; measurement begins", flush=True)
+
             print("[profile] server ready; driving workload")
-            replay_start_monotonic_ns = time.monotonic_ns()
             drive_summary = load_generator.run_replay(
-                cfg.workload, prepared_replay, base_url=base_url, model=model
+                cfg.workload, prepared_replay, base_url=base_url, model=model,
+                measurement_ready=measurement_ready,
             )
             replay_end_monotonic_ns = time.monotonic_ns()
             # EngineCore metrics use the same host CLOCK_MONOTONIC domain. The
@@ -324,12 +366,23 @@ def run_profile(cfg: ProfileConfig, *, resume: bool = False) -> dict:
             # and prefix-cache preflight iterations without consulting NSYS.
             drive_summary["replay_start_monotonic_ns"] = replay_start_monotonic_ns
             drive_summary["replay_end_monotonic_ns"] = replay_end_monotonic_ns
+            drive_summary["measurement_log_offset"] = measurement_log_offset
             capture_timer_cancelled.set()
             if capture_timer is not None:
                 capture_timer.join()
             if capture_timer_errors:
                 raise RuntimeError("bounded NSYS capture stop failed") from capture_timer_errors[0]
             drive_summary["reached_idle"] = driver.wait_for_idle(base_url, cfg.idle)
+            if speculative:
+                if not drive_summary["reached_idle"]:
+                    raise RuntimeError(
+                        "spec-decode replay did not reach idle; counters are incomplete"
+                    )
+                drive_summary["spec_decode_metrics_before"] = counters_before
+                drive_summary["spec_decode_metrics_after"] = driver.fetch_spec_decode_metrics(
+                    base_url
+                )
+            drive_summary_path.write_text(json.dumps(drive_summary, indent=2))
             print(f"[profile] workload done: {drive_summary}")
             if cuda_profile_active:
                 driver.set_cuda_profile(base_url, active=False)
@@ -381,9 +434,31 @@ def _finalize_profile(
     is_workload_metrics = cfg.profile_kind == "workload_metrics"
     driver, records, _ = _engine(cfg)
 
+    speculative = driver.speculative_decode_enabled(cfg.server)
+    spec_artifacts = {}
+    if speculative:
+        before = drive_summary.get("spec_decode_metrics_before")
+        after = drive_summary.get("spec_decode_metrics_after")
+        if before is None or after is None:
+            raise ValueError("spec-decode capture requires persisted replay counter snapshots")
+        spec_metrics_path = log_dir / "spec_decode_metrics.json"
+        spec_metrics_path.write_text(json.dumps(spec_decode.replay_delta(before, after), indent=2))
+        spec_artifacts["spec_decode_metrics_json"] = str(spec_metrics_path)
+
+    measurement_log = server_log
+    offset = drive_summary.get("measurement_log_offset")
+    if cfg.workload.warmup and offset is None:
+        raise ValueError("warmup capture is missing its persisted measurement log boundary")
+    if offset is not None:
+        if not isinstance(offset, int) or not 0 <= offset <= server_log.stat().st_size:
+            raise ValueError("invalid measurement log offset")
+        measurement_log = engine_dir / f"{cfg.name}_measurement.log"
+        with server_log.open("rb") as source, measurement_log.open("wb") as target:
+            source.seek(offset)
+            shutil.copyfileobj(source, target)
     metrics_jsonl = engine_dir / f"{cfg.name}_metrics.jsonl"
     n_metrics = record_extraction.extract_metrics_jsonl(
-        server_log, metrics_jsonl, dp_size=cfg.server.dp_size, records=records
+        measurement_log, metrics_jsonl, dp_size=cfg.server.dp_size, records=records
     )
 
     if is_expert_popularity:
@@ -393,8 +468,14 @@ def _finalize_profile(
         expert_load_jsonl = engine_dir / f"{cfg.name}_expert_load.jsonl"
         expert_popularity_json = log_dir / "expert_popularity.json"
         expert_parallel_size, reduction_group_size = _expert_popularity_group_sizes(cfg)
+        window = {}
+        if speculative:
+            window = {
+                "replay_start_monotonic_ns": drive_summary.get("replay_start_monotonic_ns"),
+                "replay_end_monotonic_ns": drive_summary.get("replay_end_monotonic_ns"),
+            }
         expert_record_count = record_extraction.extract_expert_popularity(
-            server_log,
+            measurement_log,
             expert_load_jsonl,
             expert_popularity_json,
             expert_parallel_size=expert_parallel_size,
@@ -405,8 +486,33 @@ def _finalize_profile(
             ),
             dp_size=cfg.server.dp_size,
             records=records,
+            model_role="target" if speculative else None,
+            **window,
         )
+        if speculative:
+            draft_load_path = engine_dir / f"{cfg.name}_draft_expert_load.jsonl"
+            draft_popularity_path = log_dir / "draft_expert_popularity.json"
+            draft_count = record_extraction.extract_expert_popularity(
+                measurement_log,
+                draft_load_path,
+                draft_popularity_path,
+                expert_parallel_size=expert_parallel_size,
+                reduction_group_size=reduction_group_size,
+                max_tokens_per_step=max(
+                    cfg.server.chunk_size, cfg.server.max_cudagraph_capture_size or 0
+                ),
+                dp_size=cfg.server.dp_size,
+                records=records,
+                model_role="draft",
+                **window,
+            )
+            spec_artifacts.update(
+                draft_expert_load_jsonl=str(draft_load_path),
+                draft_expert_popularity_json=str(draft_popularity_path),
+                draft_expert_record_count=draft_count,
+            )
         result = {
+            **spec_artifacts,
             "profile_kind": cfg.profile_kind,
             "engine": cfg.engine,
             "log_dir": str(log_dir),
@@ -432,7 +538,7 @@ def _finalize_profile(
     request_timings_jsonl = engine_dir / f"{cfg.name}_request_timings.jsonl"
     successful_request_ids = _successful_replay_request_ids(prepared_replay.log_path)
     n_request_timings = record_extraction.extract_request_timings_jsonl(
-        server_log,
+        measurement_log,
         request_timings_jsonl,
         expected_request_ids=successful_request_ids,
         records=records,
@@ -440,6 +546,7 @@ def _finalize_profile(
 
     if is_workload_metrics:
         result = {
+            **spec_artifacts,
             "profile_kind": cfg.profile_kind,
             "engine": cfg.engine,
             "log_dir": str(log_dir),
@@ -535,6 +642,7 @@ def _finalize_profile(
     )
 
     result = {
+        **spec_artifacts,
         "profile_kind": cfg.profile_kind,
         "engine": cfg.engine,
         # Resolved artifact root is the launcher→analyzer handoff. Keep it in the

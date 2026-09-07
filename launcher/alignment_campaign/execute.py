@@ -10,10 +10,7 @@ exit codes separately; do not serialize the campaign for attribution's sake").
 
 So there is a `--phase` and there is no `--all`. Every arrow between phases stays
 a human checkpoint; what gets automated is typing the same command fifteen times.
-The one apparent exception, `simulation` passing
-`--gpu-time-multiplier-from .../analysis_kernel`, reads a *completed artifact*
-that a person had to run first — the same thing the existing `alignment sim`
-flag already does.
+Simulation reads its worker settings directly from the rendered preset.
 
 ## Readiness before spend
 
@@ -125,6 +122,7 @@ class RunReport:
 
 # ── completion + readiness ───────────────────────────────────────────────────
 
+
 def _artifacts_for(variant: Variant, phase: str) -> tuple[str, ...]:
     profile_pass = variant.pass_named(phase)
     if profile_pass is not None:
@@ -181,12 +179,6 @@ def phase_requirements(case_dir: Path, variant: Variant, phase: str) -> list[str
             missing.append(
                 f"{LABELED_SEQUENCES_NAME} absent — run `alignment-campaign label` first"
             )
-    elif phase == SIMULATION_PHASE:
-        if not phase_complete(case_dir, variant, ANALYSIS_KERNEL_PHASE):
-            missing.append(
-                f"{ANALYSIS_KERNEL_PHASE} not complete — the simulation reads its "
-                "recommended_gpu_time_multiplier"
-            )
     elif phase == ANALYSIS_E2E_PHASE:
         if not phase_complete(case_dir, variant, SIMULATION_PHASE):
             missing.append(f"{SIMULATION_PHASE} not complete")
@@ -198,7 +190,12 @@ def phase_requirements(case_dir: Path, variant: Variant, phase: str) -> list[str
 
 
 def phase_command(
-    case_dir: Path, variant: Variant, phase: str, *, resume: bool, refresh: bool
+    case_dir: Path,
+    variant: Variant,
+    phase: str,
+    *,
+    resume: bool,
+    refresh: bool,
 ) -> tuple[str, ...]:
     """The `python -m launcher alignment ...` invocation for one case's phase."""
     config = case_dir / f"{config_stem(variant, phase)}.yaml"
@@ -210,12 +207,7 @@ def phase_command(
     if phase in (ANALYSIS_KERNEL_PHASE, ANALYSIS_E2E_PHASE):
         return base + ("analyze", str(config))
     if phase == SIMULATION_PHASE:
-        return base + (
-            "sim",
-            str(config),
-            "--gpu-time-multiplier-from",
-            str(case_dir / ANALYSIS_KERNEL_PHASE),
-        ) + (("--refresh",) if refresh else ())
+        return base + ("sim", str(config)) + (("--refresh",) if refresh else ())
     raise ValueError(f"unknown phase {phase!r}")
 
 
@@ -237,17 +229,23 @@ def plan_phase(
         if phase not in phase_names(variant):
             plans.append(
                 PhasePlan(
-                    case.slug, phase, out_root / case.slug, "missing",
-                    (f"variant {variant.name} has no phase {phase!r}; "
-                     f"it offers {list(phase_names(variant))}",),
+                    case.slug,
+                    phase,
+                    out_root / case.slug,
+                    "missing",
+                    (
+                        f"variant {variant.name} has no phase {phase!r}; "
+                        f"it offers {list(phase_names(variant))}",
+                    ),
                 )
             )
             continue
         case_dir = out_root / case.slug
         if not case_dir.is_dir():
             plans.append(
-                PhasePlan(case.slug, phase, case_dir, "missing",
-                          ("no run directory — render first",))
+                PhasePlan(
+                    case.slug, phase, case_dir, "missing", ("no run directory — render first",)
+                )
             )
             continue
         if not refresh and phase_complete(case_dir, variant, phase):
@@ -259,8 +257,18 @@ def plan_phase(
             continue
         plans.append(
             PhasePlan(
-                case.slug, phase, case_dir, "ready", (),
-                phase_command(case_dir, variant, phase, resume=resume, refresh=refresh),
+                case.slug,
+                phase,
+                case_dir,
+                "ready",
+                (),
+                phase_command(
+                    case_dir,
+                    variant,
+                    phase,
+                    resume=resume,
+                    refresh=refresh,
+                ),
             )
         )
     return tuple(plans)
@@ -284,6 +292,7 @@ def describe_plan(phase: str, plans: tuple[PhasePlan, ...]) -> str:
 
 # ── execution ────────────────────────────────────────────────────────────────
 
+
 async def _run_one(
     plan: PhasePlan,
     variant: Variant,
@@ -292,9 +301,7 @@ async def _run_one(
     refresh: bool,
 ) -> PhaseResult:
     directory = plan.directory / plan.phase
-    uses_simulation_slot = (
-        plan.phase in GPU_PHASES or variant.pass_named(plan.phase) is not None
-    )
+    uses_simulation_slot = plan.phase in GPU_PHASES or variant.pass_named(plan.phase) is not None
     spec = ProcessSpec(
         argv=plan.command,
         cwd=REPO_ROOT,
@@ -313,11 +320,7 @@ async def _run_one(
     )
     result: ProcessResult | None = None
     try:
-        slot = (
-            scheduler.simulation_slot()
-            if uses_simulation_slot
-            else scheduler.analysis_slot()
-        )
+        slot = scheduler.simulation_slot() if uses_simulation_slot else scheduler.analysis_slot()
         async with slot:
             async with leases.run_directory(plan.directory):
                 if refresh and directory.is_dir():
@@ -408,9 +411,14 @@ def run_phase(
     cases contend for the same devices, and the point of the budget is to let the
     resource manager schedule that rather than to promise concurrency.
     """
-    plans = plan_phase(pack, out_root, phase, cases=cases, refresh=refresh, resume=resume)
-    report = RunReport(phase=phase, plans=plans)
-    report.results = asyncio.run(
-        _run_all(pack, plans, parallelism=parallelism, refresh=refresh)
+    plans = plan_phase(
+        pack,
+        out_root,
+        phase,
+        cases=cases,
+        refresh=refresh,
+        resume=resume,
     )
+    report = RunReport(phase=phase, plans=plans)
+    report.results = asyncio.run(_run_all(pack, plans, parallelism=parallelism, refresh=refresh))
     return report

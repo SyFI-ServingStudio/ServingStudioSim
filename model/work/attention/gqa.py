@@ -74,7 +74,9 @@ class GQA:
     def kv_bytes(self, wl: Workload) -> float:
         # Only cached keys are HBM reads; K and V both -> factor 2.
         per_cached_token = 2.0 * self.num_kv_heads * self.head_dim * self.kv_dtype_bytes
-        return per_cached_token * sum(interaction.num_cached_key for interaction in wl.attn)
+        return per_cached_token * sum(
+            interaction.num_cached_key * interaction.multiplicity for interaction in wl.attn
+        )
 
     def cache_write_bytes(self, wl: Workload) -> float:
         """Compulsory persistent K/V writes for every newly processed token."""

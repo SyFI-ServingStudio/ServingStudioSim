@@ -6,6 +6,7 @@ use crate::worker::shared::context::WorkerContext;
 use crate::worker::types::IterBatchPlan;
 
 mod chunked_prefill_admission;
+mod decode_completion;
 mod fresh_request_slot_admission;
 mod local_prefill_decode_admission;
 mod placement;
@@ -13,6 +14,9 @@ mod policy;
 mod prefill_handoff_admission;
 mod token_budget;
 
+pub use decode_completion::{
+    DecodeCompletion, SingleTokenDecodeCompletion, SpeculativeDecodeCompletion,
+};
 pub use fresh_request_slot_admission::FreshRequestSlotAdmission;
 pub use local_prefill_decode_admission::LocalPrefillDecodeAdmission;
 pub use placement::LoadBalance;

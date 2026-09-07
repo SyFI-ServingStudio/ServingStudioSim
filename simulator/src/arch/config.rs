@@ -91,6 +91,17 @@ const fn default_glm52_nvfp4_max_model_len() -> u32 {
     1_048_576
 }
 
+/// A speculative GLM must actually run its MTP layer, so unlike the ordinary
+/// selector it cannot default to `off`.
+const fn default_glm52_speculative_mtp_mode() -> Glm52MtpMode {
+    Glm52MtpMode::IndexShare
+}
+
+/// Default to the measured Spec5 workload; depth remains an execution choice.
+const fn default_glm52_draft_tokens() -> u32 {
+    5
+}
+
 /// Iteration-wise arch provider. Sharding parameters live only on the variants
 /// that consume them (provider-first: select the arch, then it exposes its own
 /// params).
@@ -313,6 +324,52 @@ pub enum IterArchSel {
         #[param(cache_key)]
         expert_popularity_file: Option<String>,
     },
+    /// [`Self::Glm52VllmNvfp4DsaMoe`] driving its MTP layer as a real drafter:
+    /// one target verify pass over `draft_tokens + 1` rows per decode request,
+    /// then `draft_tokens` draft passes.
+    ///
+    /// A separate selector because it builds a different model type, not the
+    /// same one with speculation switched on — the two compile different cost
+    /// trees, so nothing can read one's cost log as the other's. It pairs only
+    /// with the `speculative` worker.
+    Glm52VllmNvfp4DsaMoeSpeculative {
+        #[serde(flatten)]
+        model: ModelSpec,
+        /// Shared tensor/expert-parallel rank count.
+        #[serde(default = "default_glm52_nvfp4_parallel_size")]
+        #[param(default = 4, cache_key)]
+        ep_size: u16,
+        #[serde(default = "default_glm52_nvfp4_parallel_size")]
+        #[param(default = 4, cache_key)]
+        nvl_num_gpu: u16,
+        /// Configured context cap and padded DSA-logits row stride.
+        #[serde(default = "default_glm52_nvfp4_max_model_len")]
+        #[param(default = 1048576, cache_key)]
+        max_model_len: u32,
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS)]
+        routing: RoutingKind,
+        #[serde(default)]
+        routing_seed: Option<u64>,
+        /// The draft layer's own execution mode. `off` is rejected here: a
+        /// speculative arch with no MTP layer has nothing to draft with.
+        #[serde(default = "default_glm52_speculative_mtp_mode")]
+        #[param(string, default = "index_share", choices = GLM52_MTP_MODES, cache_key)]
+        mtp_mode: Glm52MtpMode,
+        /// Candidate positions drafted per request per iteration. Fixes the
+        /// verify width at `draft_tokens + 1`, which selects a profiled kernel
+        /// shape and so cannot vary per iteration.
+        #[serde(default = "default_glm52_draft_tokens")]
+        #[param(default = 5, cache_key)]
+        draft_tokens: u32,
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+        /// Role-tagged MTP routing from the same replay as the target profile.
+        #[serde(default)]
+        #[param(cache_key)]
+        draft_expert_popularity_file: Option<String>,
+    },
     /// SGLang's B200 NVFP4 launch graph under pure tensor parallelism. Every
     /// rank owns all experts (EP1) and shards the routed intermediate axis by
     /// TP, so there is no expert-parallel or NVLink-domain selector.
@@ -386,6 +443,7 @@ impl IterArchSel {
             | Self::Glm52DsaMoe { model, .. }
             | Self::Glm52VllmDsaMoe { model, .. }
             | Self::Glm52VllmNvfp4DsaMoe { model, .. }
+            | Self::Glm52VllmNvfp4DsaMoeSpeculative { model, .. }
             | Self::Glm52SglangNvfp4TpDsaMoe { model, .. } => model,
         }
     }

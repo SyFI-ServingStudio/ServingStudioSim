@@ -392,8 +392,8 @@ fn validate_arrival_order<Definition: RequestDefinition>(
 mod tests {
     use super::*;
     use crate::common::{
-        AudioExtent, DecodingStrategy, ImageExtent, OmniInputSegment, OmniOutputSpec, RequestId,
-        SessionInput, SloContract, VideoExtent,
+        AcceptanceProfile, AudioExtent, DecodingStrategy, ImageExtent, OmniInputSegment,
+        OmniOutputSpec, RequestId, SessionInput, SloContract, VideoExtent,
     };
     use std::io::Write;
     use std::path::Path;
@@ -1278,7 +1278,9 @@ mod tests {
         );
         assert_eq!(
             scheduled_request.definition.decoding,
-            DecodingStrategy::Speculative { accept_rate: 0.75 }
+            DecodingStrategy::Speculative {
+                accept_rate: AcceptanceProfile::Uniform(0.75)
+            }
         );
         let realized_request = scheduled_request.realize_at(Time::from_ms(10.0));
         assert_eq!(realized_request.core.slo, scheduled_request.slo);

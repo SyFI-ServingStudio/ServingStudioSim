@@ -39,19 +39,22 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{Context, Result, bail, ensure};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::arch::build::{build_attn_model, build_ffn_model, build_iter_model};
+use crate::arch::build::{
+    build_attn_model, build_ffn_model, build_iter_model, build_speculative_iter_model,
+};
 use crate::arch::contract::{
     ArchGroupInput, AttnArchInput, AttnLayerwiseModel, FfnArchInput, FfnLayerwiseModel,
-    IterwiseUnifiedModel, UnifiedArchInput,
+    IterwiseUnifiedModel, SpeculativeArchGroupInput, SpeculativeArchInput, SpeculativeDecodeInput,
+    SpeculativeUnifiedModel, UnifiedArchInput,
 };
 use crate::arch::{AttnArchSel, FfnArchSel, IterArchSel};
 use crate::common::{Time, WorkerId};
 use crate::deployment::BackendOverrides;
-use crate::timing::PerfApiBridge;
+use crate::timing::{CostManifestDoc, PerfApiBridge};
 use crate::worker::CostBuffers;
 
 /// The AFD deployment's dotted-leaf prefix (see `deployment/afd.rs`). Predicting
@@ -85,6 +88,8 @@ struct PredictionProvenance<'a> {
 enum PredictArchSel {
     /// A whole-iteration arch — costed as one fused `eval_iter`.
     Iter(IterArchSel),
+    /// A draft/verify iteration with explicit per-request query widths.
+    SpeculativeIter(IterArchSel),
     /// The AFD attn side — costed as one `attn_cost` per case.
     Attn(AttnArchSel),
     /// The AFD ffn side — costed as the per-section building blocks of one iteration.
@@ -95,6 +100,12 @@ enum PredictArchSel {
 #[serde(deny_unknown_fields)]
 struct IterPredictArch {
     iter: IterArchSel,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SpeculativePredictArch {
+    speculative_iter: IterArchSel,
 }
 
 #[derive(Deserialize)]
@@ -113,6 +124,7 @@ struct FfnPredictArch {
 #[serde(untagged)]
 enum PredictArchWire {
     Iter(IterPredictArch),
+    SpeculativeIter(SpeculativePredictArch),
     Attn(AttnPredictArch),
     Ffn(FfnPredictArch),
 }
@@ -124,6 +136,9 @@ impl<'de> Deserialize<'de> for PredictArchSel {
     {
         Ok(match PredictArchWire::deserialize(deserializer)? {
             PredictArchWire::Iter(value) => Self::Iter(value.iter),
+            PredictArchWire::SpeculativeIter(value) => {
+                Self::SpeculativeIter(value.speculative_iter)
+            }
             PredictArchWire::Attn(value) => Self::Attn(value.attn),
             PredictArchWire::Ffn(value) => Self::Ffn(value.ffn),
         })
@@ -240,6 +255,73 @@ impl PredictCase {
     }
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SpeculativePredictCase {
+    groups: Vec<SpeculativePredictGroup>,
+}
+
+/// Decode pairs are [final verify-row KV length, query width]. Ordinary decode
+/// shorthand is deliberately absent: it loses request/query cardinality.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SpeculativePredictGroup {
+    #[serde(default)]
+    prefill_chunk_pairs: Vec<[u32; 2]>,
+    #[serde(default)]
+    decode_requests: Vec<[u32; 2]>,
+}
+
+impl SpeculativePredictGroup {
+    fn into_arch_group(
+        self,
+        query_width: u32,
+        max_model_len: u32,
+    ) -> Result<SpeculativeArchGroupInput> {
+        let mut group = SpeculativeArchGroupInput::default();
+        for [prefix, append] in self.prefill_chunk_pairs {
+            ensure!(append > 0, "prefill append must be positive");
+            ensure!(
+                prefix
+                    .checked_add(append)
+                    .is_some_and(|length| length <= max_model_len),
+                "prefill context exceeds max_model_len"
+            );
+            group.prefill_tokens = group
+                .prefill_tokens
+                .checked_add(append)
+                .context("prefill token sum overflows u32")?;
+            group.prefill_chunk_pairs.push((prefix, append));
+        }
+        for [kv_len, query_len] in self.decode_requests {
+            ensure!(
+                query_len == query_width,
+                "query_len must equal draft_tokens + 1 ({query_width})"
+            );
+            ensure!(
+                (query_width..=max_model_len).contains(&kv_len),
+                "final verify KV length must be within query width..=max_model_len"
+            );
+            group.decode_tokens = group
+                .decode_tokens
+                .checked_add(query_len)
+                .context("decode query sum overflows u32")?;
+            group.total_kv_len = group
+                .total_kv_len
+                .checked_add(kv_len - query_len)
+                .context("decode KV sum overflows u32")?;
+            group
+                .decode_requests
+                .push(SpeculativeDecodeInput { kv_len, query_len });
+        }
+        group.batch_tokens = group
+            .prefill_tokens
+            .checked_add(group.decode_tokens)
+            .context("batch token sum overflows u32")?;
+        Ok(group)
+    }
+}
+
 /// Entry point for `simulator timing-predict <config>` — the generalized tool.
 /// Dispatches on the arch kind: `iter` drives [`CostBuffers::run_iter`];
 /// `attn` / `ffn` build the AFD layer-wise model and drive the per-section evals
@@ -260,6 +342,16 @@ pub fn run_timing_predict(config_path: &Path) -> Result<()> {
             let cases: Vec<PredictCase> = load_cases(&cfg.cases_file, config_path)?;
             let n = cases.len();
             run_iter_cases(&*model, cases, &cfg.log_dir)?;
+            (n, model.gpus_per_replica())
+        }
+        PredictArchSel::SpeculativeIter(sel) => {
+            let _scope = bridge.with_backend_overrides("main", cfg.backends.get("main"));
+            let (model, draft_tokens) =
+                build_speculative_iter_model(sel, &cfg.gpu, UNIFIED_MODEL_NAME, &bridge)
+                    .context("building the speculative iter-wise model")?;
+            let cases: Vec<SpeculativePredictCase> = load_cases(&cfg.cases_file, config_path)?;
+            let n = cases.len();
+            run_speculative_iter_cases(&*model, draft_tokens, cases, &cfg.log_dir)?;
             (n, model.gpus_per_replica())
         }
         PredictArchSel::Attn(sel) => {
@@ -312,7 +404,7 @@ mod provenance_tests {
     use serde_json::Value;
     use tempfile::tempdir;
 
-    use super::{write_prediction_provenance, PREDICTION_PROVENANCE_FILE};
+    use super::{PREDICTION_PROVENANCE_FILE, write_prediction_provenance};
 
     #[test]
     fn prediction_provenance_preserves_l4_gpu_extent() {
@@ -387,6 +479,50 @@ fn run_iter_cases(
     }
     // Flush the writer's tail + join on drop (`CostLogger`'s `Drop`), same as a
     // worker at sim end; force it before reporting success.
+    drop(cost);
+    Ok(())
+}
+
+fn run_speculative_iter_cases(
+    model: &dyn SpeculativeUnifiedModel,
+    draft_tokens: u32,
+    cases: Vec<SpeculativePredictCase>,
+    log_dir: &Path,
+) -> Result<()> {
+    let query_width = draft_tokens
+        .checked_add(1)
+        .context("verify width overflows u32")?;
+    let mut cost = CostBuffers::new(
+        Some(log_dir.to_path_buf()),
+        PREDICT_POOL_TAG,
+        WorkerId(0),
+        &CostManifestDoc::single("iter", model.cost_log_manifest()),
+        1.0,
+    );
+    let mut now = Time::from_ms(0.0);
+    for (index, case) in cases.into_iter().enumerate() {
+        ensure!(
+            case.groups.len() == usize::from(model.num_attn_dp_groups()),
+            "case {index}: group count does not match speculative model"
+        );
+        let groups: Vec<_> = case
+            .groups
+            .into_iter()
+            .map(|group| group.into_arch_group(query_width, model.max_model_len()))
+            .collect::<Result<_>>()
+            .with_context(|| format!("case {index}"))?;
+        let tokens_per_source_rank = if groups.len() > 1 {
+            groups.iter().map(|group| group.batch_tokens).collect()
+        } else {
+            Vec::new()
+        };
+        let input = SpeculativeArchInput {
+            draft_tokens,
+            groups,
+            tokens_per_source_rank,
+        };
+        now += cost.run_speculative_iter(model, &input, index as u64, now);
+    }
     drop(cost);
     Ok(())
 }
@@ -612,6 +748,46 @@ mod tests {
     }
 
     #[test]
+    fn speculative_prediction_keeps_requests_separate_from_query_rows() {
+        let group: SpeculativePredictGroup = serde_json::from_str(
+            r#"{"prefill_chunk_pairs": [[32, 8]], "decode_requests": [[106, 6], [206, 6]]}"#,
+        )
+        .unwrap();
+        let lowered = group.into_arch_group(6, 8192).unwrap();
+        assert_eq!(lowered.request_count(), 3);
+        assert_eq!(lowered.decode_tokens, 12);
+        assert_eq!(lowered.batch_tokens, 20);
+        assert_eq!(lowered.total_kv_len, 300);
+        assert_eq!(
+            lowered.decode_requests[1],
+            SpeculativeDecodeInput {
+                kv_len: 206,
+                query_len: 6
+            }
+        );
+        assert!(
+            serde_json::from_str::<PredictGroup>(r#"{"decode_requests": [[105, 6]]}"#).is_err()
+        );
+        assert!(serde_json::from_str::<SpeculativePredictGroup>(r#"{"decode_count": 2}"#).is_err());
+    }
+
+    #[test]
+    fn speculative_prediction_rejects_partial_or_out_of_range_verification() {
+        for pair in [[105, 2], [5, 6], [8193, 6]] {
+            let group = SpeculativePredictGroup {
+                prefill_chunk_pairs: vec![],
+                decode_requests: vec![pair],
+            };
+            assert!(group.into_arch_group(6, 8192).is_err());
+        }
+        let group = SpeculativePredictGroup {
+            prefill_chunk_pairs: vec![[u32::MAX, 1]],
+            decode_requests: vec![],
+        };
+        assert!(group.into_arch_group(6, 8192).is_err());
+    }
+
+    #[test]
     fn exact_decode_list_is_used_verbatim() {
         let g = group(
             r#"{"prefill_chunk_pairs": [[0, 1025], [1024, 8]], "decode_kv_lens": [100, 200, 300]}"#,
@@ -696,6 +872,11 @@ mod tests {
         )
         .expect("attn variant parses");
         assert!(matches!(attn, PredictArchSel::Attn(_)));
+
+        let spec: PredictArchSel = serde_json::from_str(
+            r#"{"speculative_iter": {"type": "glm52_vllm_nvfp4_dsa_moe_speculative", "model_config": "model/config/glm52_nvfp4.json", "ep_size": 4, "nvl_num_gpu": 4, "max_model_len": 8192, "fp8": false, "draft_tokens": 5}}"#,
+        ).unwrap();
+        assert!(matches!(spec, PredictArchSel::SpeculativeIter(_)));
 
         // An unknown kind is rejected (lists iter/attn/ffn).
         let bad: Result<PredictArchSel, _> = serde_json::from_str(r#"{"bogus": {"type": "x"}}"#);

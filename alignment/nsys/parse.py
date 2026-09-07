@@ -259,6 +259,10 @@ def fold_rank_metrics(rows: list[dict], iteration_index: int) -> dict:
             pair for row in rows for pair in row.get("prefill_chunk_pairs", [])
         ],
         "decode_kv_lens": [kv_len for row in rows for kv_len in row.get("decode_kv_lens", [])],
+        "decode_query_lens": [query for row in rows for query in row.get("decode_query_lens", [])],
+        "decode_request_progress": [
+            request for row in rows for request in row.get("decode_request_progress", [])
+        ],
     }
 
 
@@ -427,18 +431,22 @@ def load_ranges(
     iteration_end: int | None,
     range_mode: str,
     default_stage: str = "all",
+    *,
+    shared_iteration_index: bool = False,
 ) -> list[RangeStats]:
     """Extract the NVTX iteration ranges of the requested iteration window.
 
     Either bound may be open; both are open by default to analyze the complete
     capture.
 
-    Only inline, indexed `vllm_iteration(N): <phase>` and
-    `sglang_iteration(N): <phase>` markers are valid inputs. A trace without
-    this contract is rejected naturally by producing no ranges.
+    Indexed `vllm_iteration(N): <phase>` and `sglang_iteration(N): <phase>`
+    markers establish ownership. An unindexed vLLM draft may fill a same-thread
+    gap between phases of one indexed iteration; it cannot establish one.
 
     The window is an interval of the REFERENCE rank's iteration numbers, and the
-    other ranks join it by measured time. Applying the same numeric interval to
+    independent DP ranks join it by measured time. TP peers with an explicitly
+    shared index use that index directly, including peers outside the reference
+    rank's CPU envelope. Applying the same numeric interval to independent DP
     every rank looks equivalent and is not: a rank numbers its own scheduled
     steps, and in the GLM-5.2 DP8 capture the ranks that step together at
     t=15.67 s call it iteration 11, 7 and 6. Filtering each rank on its own
@@ -470,13 +478,21 @@ def load_ranges(
             continue
         parsed_rows.append([iteration, phase, worker, int(start), int(end), int(global_tid)])
 
-    if range_mode == "forward":
-        parsed_rows = [r for r in parsed_rows if r[1] == "forward"]
-
     def resolve_stage(iteration: int) -> str:
         return iteration_kind(metrics.get(iteration), default_stage)
 
-    windowed = window_rows_by_reference_rank(parsed_rows, iteration_start, iteration_end)
+    if shared_iteration_index:
+        windowed = [
+            row for row in parsed_rows
+            if (iteration_start is None or row[0] >= iteration_start)
+            and (iteration_end is None or row[0] <= iteration_end)
+        ]
+    else:
+        windowed = window_rows_by_reference_rank(parsed_rows, iteration_start, iteration_end)
+    if range_mode == "forward":
+        windowed = [row for row in windowed if row[1] == "forward"]
+    elif range_mode == "phases":
+        windowed.extend(_draft_gap_rows(con, windowed))
 
     if range_mode in ("forward", "phases"):
         return [
@@ -511,6 +527,52 @@ def load_ranges(
             )
         )
     return ranges
+
+
+def _draft_gap_rows(con: sqlite3.Connection, indexed_rows: list[list]) -> list[list]:
+    """Attribute unindexed proposer scopes only inside unoccupied phase gaps."""
+    by_thread: dict[int, list[list]] = defaultdict(list)
+    for row in indexed_rows:
+        by_thread[row[5]].append(row)
+    gaps_by_thread = {}
+    for thread, rows in by_thread.items():
+        gaps = []
+        previous = None
+        for row in sorted(rows, key=lambda item: (item[3], item[4])):
+            if previous is not None and previous[4] < row[3] and previous[0] == row[0]:
+                gaps.append((previous[4], row[3], row[0], row[2]))
+            # Nested indexed phases cannot expose a gap inside their outer scope.
+            if previous is None or row[4] > previous[4]:
+                previous = row
+        gaps_by_thread[thread] = ([gap[0] for gap in gaps], gaps)
+
+    result = []
+    for start, end, thread in con.execute(
+        """
+        SELECT n.start, n.end, n.globalTid
+        FROM NVTX_EVENTS n LEFT JOIN StringIds s ON n.textId = s.id
+        WHERE COALESCE(n.text, s.value) = 'gpu_model_runner: draft'
+          AND n.end IS NOT NULL
+        """
+    ):
+        starts, gaps = gaps_by_thread.get(thread, ([], []))
+        index = bisect.bisect_right(starts, start) - 1
+        if index < 0 or end <= start:
+            continue
+        _, gap_end, iteration, worker = gaps[index]
+        if end <= gap_end:
+            result.append([iteration, "draft", worker, int(start), int(end), int(thread)])
+    owned = []
+    last_end_by_thread = {}
+    for row in sorted(result, key=lambda item: (item[5], item[3], -item[4])):
+        previous_end = last_end_by_thread.get(row[5], -1)
+        if row[3] < previous_end:
+            if row[4] <= previous_end:
+                continue
+            raise ValueError("overlapping unindexed draft scopes have ambiguous ownership")
+        owned.append(row)
+        last_end_by_thread[row[5]] = row[4]
+    return owned
 
 
 def attach_kernels_by_correlation(
@@ -1408,6 +1470,18 @@ def parse_trace(
         metrics = aggregate_metrics_by_iteration(rank_metrics)
         string_ids = load_string_ids(con)
         workers = load_workers(con)
+        if dp_rank_by_device is None:
+            dp_rank_by_device = resolve_dp_rank_by_device(workers, worker_ranks or {}, tp_size)
+        else:
+            captured_devices = {
+                worker.device_id for worker in workers.values() if worker.device_id is not None
+            }
+            unstated = sorted(captured_devices - set(dp_rank_by_device))
+            if unstated:
+                raise ValueError(
+                    f"the capture ran kernels on device(s) {unstated}, which no worker record "
+                    f"claims; stated devices are {sorted(dp_rank_by_device)}"
+                )
         ranges = load_ranges(
             con,
             workers,
@@ -1416,24 +1490,12 @@ def parse_trace(
             iteration_end,
             range_mode,
             default_stage,
+            shared_iteration_index=_uses_shared_iteration_index(dp_rank_by_device),
         )
         kernel_rows = attach_kernels_by_correlation(con, string_ids, ranges)
         jit_module_loads = attribute_jit_stalls(con, string_ids, ranges)
     finally:
         con.close()
-
-    if dp_rank_by_device is None:
-        dp_rank_by_device = resolve_dp_rank_by_device(workers, worker_ranks or {}, tp_size)
-    else:
-        captured_devices = {
-            worker.device_id for worker in workers.values() if worker.device_id is not None
-        }
-        unstated = sorted(captured_devices - set(dp_rank_by_device))
-        if unstated:
-            raise ValueError(
-                f"the capture ran kernels on device(s) {unstated}, which no worker record "
-                f"claims; stated devices are {sorted(dp_rank_by_device)}"
-            )
 
     stages = sorted({r.stage for r in ranges})
     kernel_name_ids, kernel_names = build_kernel_name_index(ranges)

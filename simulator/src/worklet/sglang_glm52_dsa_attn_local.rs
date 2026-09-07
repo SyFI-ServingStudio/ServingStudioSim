@@ -573,8 +573,8 @@ fn validate_config(cfg: &SglangGlm52DsaAttnLocalWorkletConfig) -> Result<(), Str
             "sparse exact-varlen max_model_len must equal worklet max_model_len".to_string(),
         );
     }
-    if !matches!(cfg.decode_next_n, 1 | 2) {
-        return Err("decode_next_n must be 1 or 2".to_string());
+    if cfg.decode_next_n == 0 {
+        return Err("decode_next_n must be positive".to_string());
     }
     if cfg.base_dtype != DType::Bf16
         || cfg.index_cache_dtype != DType::Fp8E4m3
@@ -740,6 +740,26 @@ mod tests {
         assert!(r.indexer.is_none());
         assert_eq!(r.main_rope.backends, vec!["flashinfer"]);
         assert_eq!(r.sparse_mla.mla_cache_append_backends, vec!["sglang_cuda"]);
+    }
+
+    #[test]
+    fn any_positive_next_n_reaches_both_compound_ops() {
+        // This worklet had the only untested copy of the width guard, which is
+        // why its message had drifted from the other two. A k=5 draft verifies
+        // six rows per request; the width is forwarded to both compound ops
+        // unchanged.
+        for next_n in [1, 2, 3, 6] {
+            let mut config = cfg(true);
+            config.decode_next_n = next_n;
+            assert!(validate_config(&config).is_ok());
+            let r = SglangGlm52DsaAttnLocalWorklet::resolve_config(&config);
+            assert_eq!(r.indexer.as_ref().unwrap().next_n, next_n);
+            assert_eq!(r.sparse_mla.decode_next_n, next_n);
+        }
+
+        let mut config = cfg(true);
+        config.decode_next_n = 0;
+        assert!(validate_config(&config).is_err());
     }
 
     #[test]

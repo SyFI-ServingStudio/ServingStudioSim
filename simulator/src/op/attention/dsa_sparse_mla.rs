@@ -20,7 +20,7 @@ use crate::timing::kernels::{
     DsaSparseMlaAttentionKernelInput, DsaSparseMlaPrefillKernel, DsaSparseMlaPrefillKernelConfig,
     DsaSparseMlaPrefillKernelInput, ElementwiseKernel, ElementwiseKernelConfig,
     ElementwiseKernelInput, MlaCacheAppendKernel, MlaCacheAppendKernelConfig,
-    MlaCacheAppendKernelInput,
+    MlaCacheAppendKernelInput, ValidCountsPattern,
 };
 use crate::timing::slot_input::{DsaSparseMlaDecodeLog, DsaSparseMlaPrefillLog};
 use crate::timing::{
@@ -406,15 +406,8 @@ fn fit_failed(reason: impl Into<String>) -> BuildError {
 }
 
 fn subkernel_configs(cfg: &DsaSparseMlaAttentionConfig) -> Result<SubkernelConfigs, BuildError> {
-    let decode_pattern = match cfg.decode_next_n {
-        1 => "uniform_full",
-        2 => "speculative_pairs",
-        value => {
-            return Err(fit_failed(format!(
-                "decode_next_n must be 1 or 2, got {value}"
-            )))
-        }
-    };
+    let decode_pattern = ValidCountsPattern::for_decode(cfg.decode_next_n)
+        .ok_or_else(|| fit_failed("decode_next_n must be positive"))?;
     if cfg.softmax_scale_denominator == 0 {
         return Err(fit_failed("softmax_scale_denominator must be positive"));
     }
@@ -422,7 +415,7 @@ fn subkernel_configs(cfg: &DsaSparseMlaAttentionConfig) -> Result<SubkernelConfi
     let (max_blocks_per_request, prefill) = match &cfg.exact_varlen {
         None => (
             None,
-            PrefillConfig::Legacy(sparse_attention_config(cfg, "causal_tail")),
+            PrefillConfig::Legacy(sparse_attention_config(cfg, ValidCountsPattern::CausalTail)),
         ),
         Some(exact) => {
             if exact.max_model_len == 0 {
@@ -645,7 +638,7 @@ fn production_prefill_config(
 
 fn sparse_attention_config(
     cfg: &DsaSparseMlaAttentionConfig,
-    valid_counts_pattern: &str,
+    valid_counts_pattern: ValidCountsPattern,
 ) -> DsaSparseMlaAttentionKernelConfig {
     DsaSparseMlaAttentionKernelConfig {
         backends: cfg.sparse_attention_backends.clone(),
@@ -661,7 +654,7 @@ fn sparse_attention_config(
         cache_dtype: cfg.attention_cache_dtype,
         index_dtype: cfg.index_dtype.clone(),
         output_dtype: cfg.attention_output_dtype,
-        valid_counts_pattern: valid_counts_pattern.to_string(),
+        valid_counts_pattern,
         index_distribution: cfg.index_distribution.clone(),
         cache_layout: cfg.sparse_cache_layout.clone(),
     }
@@ -671,8 +664,8 @@ fn normalize_input(
     input: &DsaSparseMlaAttentionInput,
     decode_next_n: u32,
 ) -> Result<NormalizedInput, String> {
-    if !matches!(decode_next_n, 1 | 2) {
-        return Err(format!("decode_next_n must be 1 or 2, got {decode_next_n}"));
+    if decode_next_n == 0 {
+        return Err("decode_next_n must be positive".to_string());
     }
 
     let mut query_rows = 0_u32;
@@ -702,9 +695,12 @@ fn normalize_input(
                     "decode cell must have nonzero Q and S, got ({num_queries}, {num_cache_tokens})"
                 ));
             }
-            if decode_next_n == 2 && num_queries % 2 != 0 {
+            // Same rule, same words, as `production_index_remap_input`. The two
+            // normalization paths bill the same physical rows, so a batch either
+            // path rejects must be rejected by both.
+            if num_queries % decode_next_n != 0 {
                 return Err(format!(
-                    "speculative decode requires even Q, got {num_queries}"
+                    "decode query rows {num_queries} must be divisible by decode_next_n {decode_next_n}"
                 ));
             }
             let projected_context = if let Some(context_lens) = &input.decode_context_lens {
@@ -828,9 +824,10 @@ fn production_index_remap_input(
             request_row_counts.len()
         ));
     }
-    if local_span_lengths.len() > 8192 {
+    let max_queries = crate::timing::kernels::dsa_sparse_index_remap::MAX_QUERIES;
+    if local_span_lengths.len() > max_queries as usize {
         return Err(format!(
-            "production index remap supports at most 8192 query rows, got {}",
+            "production index remap supports at most {max_queries} query rows, got {}",
             local_span_lengths.len()
         ));
     }
@@ -860,6 +857,8 @@ mod tests {
         IndexRemapConfig, PrefillConfig, SLOT_SUFFIXES,
     };
     use crate::timing::bridge::DType;
+    use crate::timing::kernels::engine::KernelSpec;
+    use crate::timing::kernels::{DsaSparseMlaAttentionSpec, ValidCountsPattern};
     use crate::timing::slot_input::DsaSparseMlaPrefillLog;
     use crate::timing::{BuildError, Dim, SlotInput};
 
@@ -944,8 +943,11 @@ mod tests {
             panic!("legacy config must retain per-request sparse attention")
         };
         assert_eq!(prefill.backends, vec!["vllm_flashmla_bf16"]);
-        assert_eq!(prefill.valid_counts_pattern, "causal_tail");
-        assert_eq!(configs.decode.valid_counts_pattern, "uniform_full");
+        assert_eq!(prefill.valid_counts_pattern, ValidCountsPattern::CausalTail);
+        assert_eq!(
+            configs.decode.valid_counts_pattern,
+            ValidCountsPattern::UniformFull
+        );
         for sparse in [prefill, &configs.decode] {
             assert_eq!(sparse.gpu_name, "NVIDIA H200");
             assert_eq!(sparse.num_heads, 64);
@@ -965,13 +967,16 @@ mod tests {
     }
 
     #[test]
-    fn decode_next_n_two_selects_speculative_pairs() {
+    fn decode_next_n_two_keeps_prefill_causal_and_makes_decode_a_verify_group() {
         let configs = subkernel_configs(&cfg(2)).unwrap();
         let PrefillConfig::Legacy(prefill) = &configs.prefill else {
             panic!("legacy config must retain per-request sparse attention")
         };
-        assert_eq!(prefill.valid_counts_pattern, "causal_tail");
-        assert_eq!(configs.decode.valid_counts_pattern, "speculative_pairs");
+        assert_eq!(prefill.valid_counts_pattern, ValidCountsPattern::CausalTail);
+        assert_eq!(
+            configs.decode.valid_counts_pattern,
+            ValidCountsPattern::SpeculativeGroups { group_size: 2 }
+        );
     }
 
     #[test]
@@ -1002,7 +1007,10 @@ mod tests {
 
         assert_eq!(configs.mla_cache_append.kv_dtype, DType::Fp8E4m3);
         assert_eq!(configs.decode.backends, vec!["flashinfer_trtllm_fp8"]);
-        assert_eq!(configs.decode.valid_counts_pattern, "uniform_full");
+        assert_eq!(
+            configs.decode.valid_counts_pattern,
+            ValidCountsPattern::UniformFull
+        );
         assert_eq!(configs.decode.q_dtype, DType::Fp8E4m3);
         assert_eq!(configs.decode.cache_dtype, DType::Fp8E4m3);
         assert_eq!(configs.decode.output_dtype, DType::Bf16);
@@ -1043,15 +1051,33 @@ mod tests {
 
     #[test]
     fn invalid_decode_next_n_and_scale_fail_at_config_expansion() {
-        for decode_next_n in [0, 3] {
-            let error = subkernel_configs(&cfg(decode_next_n))
-                .err()
-                .expect("invalid decode_next_n must fail");
-            assert!(matches!(
-                error,
-                BuildError::FitFailed { reason, .. }
-                    if reason.contains("decode_next_n must be 1 or 2")
-            ));
+        let error = subkernel_configs(&cfg(0))
+            .err()
+            .expect("a zero-row decode step must fail");
+        assert!(matches!(
+            error,
+            BuildError::FitFailed { reason, .. }
+                if reason.contains("decode_next_n must be positive")
+        ));
+
+        // Every positive width resolves to a pattern L1 can profile, and the
+        // grid it selects anchors on request count, so its query axis is always
+        // a whole number of verify groups.
+        for (decode_next_n, expected) in [
+            (1, ValidCountsPattern::UniformFull),
+            (2, ValidCountsPattern::SpeculativeGroups { group_size: 2 }),
+            (3, ValidCountsPattern::SpeculativeGroups { group_size: 3 }),
+            (6, ValidCountsPattern::SpeculativeGroups { group_size: 6 }),
+        ] {
+            let configs = subkernel_configs(&cfg(decode_next_n)).expect("width must expand");
+            assert_eq!(configs.decode.valid_counts_pattern, expected);
+            let grid = DsaSparseMlaAttentionSpec::sweep_grid(&configs.decode);
+            assert!(
+                grid.axes()[0]
+                    .iter()
+                    .all(|rows| *rows as u32 % decode_next_n == 0),
+                "every query anchor must be a whole number of {decode_next_n}-row groups"
+            );
         }
 
         let mut config = cfg(1);
@@ -1124,7 +1150,7 @@ mod tests {
             .contains("at most 256 requests"));
 
         let supported_max_rows = DsaSparseMlaAttentionInput {
-            prefill_query_cache_pairs: vec![(8192, 8192)],
+            prefill_query_cache_pairs: vec![(16384, 16384)],
             ..Default::default()
         };
         assert!(production_index_remap_input(&supported_max_rows, 1, 2048)
@@ -1132,12 +1158,22 @@ mod tests {
             .is_some());
 
         let too_many_rows = DsaSparseMlaAttentionInput {
-            prefill_query_cache_pairs: vec![(8192, 8192), (1, 1)],
+            prefill_query_cache_pairs: vec![(16384, 16384), (1, 1)],
             ..Default::default()
         };
         assert!(production_index_remap_input(&too_many_rows, 1, 2048)
             .unwrap_err()
-            .contains("at most 8192 query rows"));
+            .contains("at most 16384 query rows"));
+
+        let rounded_spec5_prefill = DsaSparseMlaAttentionInput {
+            prefill_query_cache_pairs: vec![(8196, 8196)],
+            ..Default::default()
+        };
+        let remap = production_index_remap_input(&rounded_spec5_prefill, 6, 2048)
+            .unwrap()
+            .unwrap();
+        assert_eq!(remap.request_row_counts, vec![8196]);
+        assert_eq!(remap.local_span_lengths.len(), 8196);
     }
 
     #[test]
@@ -1198,14 +1234,26 @@ mod tests {
         };
         assert!(normalize_input(&zero_decode, 1).is_err());
 
-        let odd_speculative = DsaSparseMlaAttentionInput {
-            decode_query_cache: Some((3, 2048)),
-            ..Default::default()
-        };
-        assert!(normalize_input(&odd_speculative, 2)
-            .err()
-            .expect("odd speculative Q must fail")
-            .contains("even Q"));
+        // Query rows must be a whole number of verify groups at every width, and
+        // both normalization paths must say so in the same words.
+        for (num_queries, decode_next_n) in [(3, 2), (7, 6), (13, 6)] {
+            let ragged = DsaSparseMlaAttentionInput {
+                decode_query_cache: Some((num_queries, 2048)),
+                ..Default::default()
+            };
+            let message = normalize_input(&ragged, decode_next_n)
+                .err()
+                .expect("query rows that do not fill whole verify groups must fail");
+            assert!(
+                message.contains("must be divisible by decode_next_n"),
+                "unexpected message for ({num_queries}, {decode_next_n}): {message}"
+            );
+            assert_eq!(
+                message,
+                production_index_remap_input(&ragged, decode_next_n, 2048).unwrap_err(),
+                "the two normalization paths must reject identically"
+            );
+        }
 
         let overflowing = DsaSparseMlaAttentionInput {
             prefill_query_cache_pairs: vec![(u32::MAX, u32::MAX), (1, 1)],

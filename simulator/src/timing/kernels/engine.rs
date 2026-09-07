@@ -230,6 +230,8 @@ impl<S: KernelSpec> Kernel<S> {
             let mut total = 0;
             for &backend in backends {
                 let specs = drop_infeasible(S::enumerate(&config, &sweep_grid, backend));
+                let specs =
+                    bridge.unique_dry_run_specs(S::profile_kind(), config.gpu_name(), specs);
                 total += specs.len();
                 missing += bridge
                     .count_missing(specs, S::profile_kind(), backend, config.gpu_name())
@@ -522,7 +524,7 @@ fn ensure_has_backends(
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_has_backends, KernelConfig, KernelSpec};
+    use super::{KernelConfig, KernelSpec, ensure_has_backends};
     use crate::timing::bridge::{ArgsPayload, KernelKind};
     use crate::timing::cache::{CacheKind, Extrapolation};
     use crate::timing::{BuildError, Coords, SweepCoords, SweepGrid};

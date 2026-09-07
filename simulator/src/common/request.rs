@@ -118,6 +118,21 @@ pub struct RequestTelemetry {
     pub retraction_count: u32,
     /// Extra prefill episodes caused by those retractions.
     pub reprocessed_prefills: Vec<ReprocessedPrefillEpisode>,
+    /// Allocate only for speculative requests; ordinary traces keep one pointer.
+    pub speculative: Option<Box<SpeculativeProgress>>,
+}
+
+/// Completion-side observations, independent of the model input/cost logger.
+/// Bounded per request even when per-token timestamp logging is disabled.
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct SpeculativeProgress {
+    pub query_width: u32,
+    pub prefill_chunks: u64,
+    pub decode_rounds: u64,
+    pub resident_kv_sum: u64,
+    pub emitted_tokens: u64,
+    pub pending_prefill: Option<(u32, u32)>,
+    pub pending_decode: Option<u64>,
 }
 
 /// One live request: immutable definition + progress + lifecycle + telemetry.

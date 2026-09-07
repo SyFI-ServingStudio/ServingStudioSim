@@ -1,0 +1,2845 @@
+{
+  "schema_version": 1,
+  "pack": "glm52_nvfp4_b200_spec5_reproduction",
+  "description": "Reproduce preserved Spec5 evidence: 17 TP4 workload cases and diverse_100 TP4/TP8 NSYS. Borrowed captures retain original request identities and arrivals; generated traces are recipes, not replacement replay evidence.",
+  "recorded_on": {
+    "host": "b200_raid",
+    "gpu": "NVIDIA B200",
+    "checkpoint_snapshots": {
+      "glm52_nvfp4": "models--nvidia--GLM-5.2-NVFP4/snapshots/aec724e8c7b8ee9db3b48c01c320f63f9cdaf8aa"
+    },
+    "nsys_version": "2025.5.2",
+    "device_roles": {
+      "primary": "0,1,2,3",
+      "all": "0,1,2,3,4,5,6,7"
+    }
+  },
+  "variants": {
+    "ep4_tp4_dp1": {
+      "deployment": "unified",
+      "gpu": "NVIDIA B200",
+      "replicas": 1,
+      "checkpoint": "glm52_nvfp4",
+      "engine": "vllm",
+      "backend": "vllm_tokens",
+      "run_name_prefix": "glm52_b200_ep4",
+      "server": {
+        "tp_size": 4,
+        "dp_size": 1,
+        "chunk_size": 2048,
+        "max_cudagraph_capture_size": 2048,
+        "enable_server_load_tracking": true,
+        "extra_args": [
+          "--enable-expert-parallel",
+          "--kv-cache-dtype",
+          "fp8_e4m3",
+          "--speculative-config",
+          "{\"method\":\"mtp\",\"num_speculative_tokens\":5}"
+        ]
+      },
+      "arch": {
+        "type": "glm52_vllm_nvfp4_dsa_moe_speculative",
+        "model_config": "model/config/glm52_nvfp4.json",
+        "fp8": false,
+        "ep_size": 4,
+        "nvl_num_gpu": 4,
+        "routing": "uniform",
+        "expert_popularity_file": "../glm52_nvfp4_b200_spec5/expert_popularity.json",
+        "draft_expert_popularity_file": "../glm52_nvfp4_b200_spec5/draft_expert_popularity.json",
+        "mtp_mode": "full_index",
+        "draft_tokens": 5
+      },
+      "worker": {
+        "type": "speculative",
+        "max_batch_tokens": 2048,
+        "batch_policy": "mix",
+        "draft_tokens": 5,
+        "acceptance_seed": 73
+      },
+      "profile_passes": [
+        {
+          "kind": "workload_metrics",
+          "name": "profile_workload",
+          "trace": "workload"
+        },
+        {
+          "kind": "nsys",
+          "name": "profile_nsys",
+          "trace": "kernel"
+        }
+      ],
+      "input_builder": {
+        "type": "speculative_engine_text",
+        "draft_tokens": 5,
+        "measured_phase": "forward",
+        "group_assignment": "per_dp_rank"
+      },
+      "label_rules": "../glm52_nvfp4_b200_spec5/label_rules/manifest.json"
+    },
+    "diverse_tp4": {
+      "deployment": "unified",
+      "gpu": "NVIDIA B200",
+      "replicas": 1,
+      "checkpoint": "glm52_nvfp4",
+      "engine": "vllm",
+      "backend": "vllm_tokens",
+      "run_name_prefix": "glm52_b200_tp4_diverse",
+      "server": {
+        "tp_size": 4,
+        "dp_size": 1,
+        "chunk_size": 2052,
+        "max_cudagraph_capture_size": 2052,
+        "enable_server_load_tracking": true,
+        "extra_args": [
+          "--enable-expert-parallel",
+          "--kv-cache-dtype",
+          "fp8_e4m3",
+          "--speculative-config",
+          "{\"method\":\"mtp\",\"num_speculative_tokens\":5}"
+        ]
+      },
+      "arch": {
+        "type": "glm52_vllm_nvfp4_dsa_moe_speculative",
+        "model_config": "model/config/glm52_nvfp4.json",
+        "fp8": false,
+        "ep_size": 4,
+        "nvl_num_gpu": 4,
+        "routing": "uniform",
+        "expert_popularity_file": "../glm52_nvfp4_b200_spec5/expert_popularity.json",
+        "draft_expert_popularity_file": "../glm52_nvfp4_b200_spec5/draft_expert_popularity.json",
+        "mtp_mode": "full_index",
+        "draft_tokens": 5
+      },
+      "worker": {
+        "type": "speculative",
+        "max_batch_tokens": 2052,
+        "batch_policy": "mix",
+        "draft_tokens": 5,
+        "acceptance_seed": 73
+      },
+      "profile_passes": [
+        {
+          "kind": "workload_metrics",
+          "name": "profile_workload",
+          "trace": "workload"
+        },
+        {
+          "kind": "nsys",
+          "name": "profile_nsys",
+          "trace": "kernel"
+        }
+      ],
+      "input_builder": {
+        "type": "speculative_engine_text",
+        "draft_tokens": 5,
+        "measured_phase": "forward",
+        "group_assignment": "per_dp_rank"
+      },
+      "label_rules": "../glm52_nvfp4_b200_spec5/label_rules/manifest.json"
+    },
+    "diverse_tp8": {
+      "deployment": "unified",
+      "gpu": "NVIDIA B200",
+      "replicas": 1,
+      "checkpoint": "glm52_nvfp4",
+      "engine": "vllm",
+      "backend": "vllm_tokens",
+      "run_name_prefix": "glm52_b200_tp8_diverse",
+      "server": {
+        "tp_size": 8,
+        "dp_size": 1,
+        "chunk_size": 2052,
+        "max_cudagraph_capture_size": 2052,
+        "enable_server_load_tracking": true,
+        "extra_args": [
+          "--enable-expert-parallel",
+          "--kv-cache-dtype",
+          "fp8_e4m3",
+          "--speculative-config",
+          "{\"method\":\"mtp\",\"num_speculative_tokens\":5}"
+        ]
+      },
+      "arch": {
+        "type": "glm52_vllm_nvfp4_dsa_moe_speculative",
+        "model_config": "model/config/glm52_nvfp4.json",
+        "fp8": false,
+        "ep_size": 8,
+        "nvl_num_gpu": 8,
+        "routing": "uniform",
+        "expert_popularity_file": "tp8_target_popularity.json",
+        "draft_expert_popularity_file": "tp8_draft_popularity.json",
+        "mtp_mode": "full_index",
+        "draft_tokens": 5
+      },
+      "worker": {
+        "type": "speculative",
+        "max_batch_tokens": 2052,
+        "batch_policy": "mix",
+        "draft_tokens": 5,
+        "acceptance_seed": 73
+      },
+      "profile_passes": [
+        {
+          "kind": "workload_metrics",
+          "name": "profile_workload",
+          "trace": "workload"
+        },
+        {
+          "kind": "nsys",
+          "name": "profile_nsys",
+          "trace": "kernel"
+        }
+      ],
+      "input_builder": {
+        "type": "speculative_engine_text",
+        "draft_tokens": 5,
+        "measured_phase": "forward",
+        "group_assignment": "per_dp_rank"
+      },
+      "label_rules": "../glm52_nvfp4_b200_spec5/label_rules/manifest.json"
+    }
+  },
+  "cases": [
+    {
+      "index": 1,
+      "name": "micro_throughput_c256",
+      "variant": "ep4_tp4_dp1",
+      "purpose": "Maximum request batching and scheduler pressure.",
+      "coverage": [
+        "batching",
+        "scheduler_pressure"
+      ],
+      "max_model_len": 8192,
+      "max_concurrency": 256,
+      "chunk_size": 2048,
+      "speculative_acceptance": {
+        "value": [
+          0.7879803161972568,
+          0.4936885463725751,
+          0.317723052079128,
+          0.3231681490893689,
+          0.3735255570117955
+        ],
+        "status": "measured",
+        "derived_from": "consecutive accepted-token count ratios from this case's clean Prometheus replay delta",
+        "evidence": "logs/20260831_0_glm52_nvfp4_b200_spec5_matrix/01_micro_throughput_c256/profile_workload/spec_decode_metrics.json"
+      },
+      "profile_arrival_mode": "saturated",
+      "simulation_arrival_mode": "saturated",
+      "gpu_memory_utilization": 0.75,
+      "capture_seconds": 15,
+      "device_role": "primary",
+      "workload_trace": {
+        "file": "traces/01_micro_throughput_c256.csv",
+        "shapes": [
+          [
+            16,
+            16
+          ],
+          [
+            32,
+            32
+          ],
+          [
+            64,
+            64
+          ],
+          [
+            128,
+            64
+          ]
+        ],
+        "repeats": 256
+      },
+      "attn_gpu_memory_gb": {
+        "value": 9.440211456,
+        "status": "measured",
+        "derived_from": "`GPU KV cache size: C tokens` in the workload-only server log; C * 55_224 / 1e9",
+        "evidence": "logs/20260831_0_glm52_nvfp4_b200_spec5_matrix/01_micro_throughput_c256/profile_workload/vllm/glm52_b200_ep4_01_micro_throughput_c256_workload_server.log"
+      },
+      "provenance": {
+        "accepted_run": "logs/20260827_0_glm52_nvfp4_l1_clean_alignment/cases/01_micro_throughput_c256",
+        "capture_source": "logs/20260826_0_glm52_b200_ep4_workload_matrix_realign/cases/01_micro_throughput_c256"
+      }
+    },
+    {
+      "index": 2,
+      "name": "graph_boundaries_c128",
+      "variant": "ep4_tp4_dp1",
+      "purpose": "CUDA graph and small-batch kernel boundaries.",
+      "coverage": [
+        "cuda_graph_boundaries",
+        "small_batch"
+      ],
+      "max_model_len": 8192,
+      "max_concurrency": 128,
+      "chunk_size": 2048,
+      "speculative_acceptance": {
+        "value": [
+          0.7852805220701532,
+          0.4937673130193906,
+          0.33613838242169236,
+          0.34840055632823363,
+          0.38922155688622756
+        ],
+        "status": "measured",
+        "derived_from": "consecutive accepted-token count ratios from this case's clean Prometheus replay delta",
+        "evidence": "logs/20260831_0_glm52_nvfp4_b200_spec5_matrix/02_graph_boundaries_c128/profile_workload/spec_decode_metrics.json"
+      },
+      "profile_arrival_mode": "saturated",
+      "simulation_arrival_mode": "saturated",
+      "gpu_memory_utilization": 0.75,
+      "capture_seconds": 15,
+      "device_role": "primary",
+      "analyze_iterations": [
+        0,
+        239
+      ],
+      "workload_trace": {
+        "file": "traces/02_graph_boundaries_c128.csv",
+        "shapes": [
+          [
+            1,
+            32
+          ],
+          [
+            15,
+            32
+          ],
+          [
+            16,
+            32
+          ],
+          [
+            31,
+            32
+          ],
+          [
+            32,
+            32
+          ],
+          [
+            63,
+            64
+          ],
+          [
+            64,
+            64
+          ],
+          [
+            127,
+            64
+          ],
+          [
+            128,
+            64
+          ],
+          [
+            255,
+            64
+          ],
+          [
+            256,
+            64
+          ]
+        ],
+        "repeats": 48
+      },
+      "attn_gpu_memory_gb": {
+        "value": 9.440211456,
+        "status": "measured",
+        "derived_from": "`GPU KV cache size: C tokens` in the workload-only server log; C * 55_224 / 1e9",
+        "evidence": "logs/20260831_0_glm52_nvfp4_b200_spec5_matrix/02_graph_boundaries_c128/profile_workload/vllm/glm52_b200_ep4_02_graph_boundaries_c128_workload_server.log"
+      },
+      "provenance": {
+        "accepted_run": "logs/20260827_0_glm52_nvfp4_l1_clean_alignment/cases/02_graph_boundaries_c128",
+        "capture_source": "logs/20260826_0_glm52_b200_ep4_workload_matrix_realign/cases/02_graph_boundaries_c128"
+      }
+    },
+    {
+      "index": 3,
+      "name": "balanced_anchor_c32",
+      "variant": "ep4_tp4_dp1",
+      "purpose": "Comparable extension of the existing c32 anchor.",
+      "coverage": [
+        "balanced_anchor"
+      ],
+      "max_model_len": 8192,
+      "max_concurrency": 32,
+      "chunk_size": 4096,
+      "speculative_acceptance": {
+        "value": [
+          0.9039741219963031,
+          0.7245935998364176,
+          0.47782990581678364,
+          0.495570648161819,
+          0.6302696260986146
+        ],
+        "status": "provisional",
+        "derived_from": "clean diverse-100 spec5 workload; replace with this case's profile_workload per-position counters",
+        "evidence": "logs/20260830_1_glm52_diverse100_spec5/profile_workload/spec_decode_metrics.json"
+      },
+      "profile_arrival_mode": "saturated",
+      "simulation_arrival_mode": "saturated",
+      "gpu_memory_utilization": 0.75,
+      "capture_seconds": 15,
+      "device_role": "primary",
+      "workload_trace": {
+        "file": "traces/03_balanced_anchor_c32.csv",
+        "shapes": [
+          [
+            256,
+            128
+          ],
+          [
+            256,
+            256
+          ],
+          [
+            1024,
+            128
+          ],
+          [
+            1024,
+            256
+          ],
+          [
+            2048,
+            128
+          ],
+          [
+            2048,
+            256
+          ],
+          [
+            3072,
+            128
+          ],
+          [
+            3968,
+            256
+          ],
+          [
+            4096,
+            128
+          ],
+          [
+            4096,
+            256
+          ]
+        ],
+        "repeats": 24
+      },
+      "attn_gpu_memory_gb": {
+        "value": 120,
+        "status": "provisional",
+        "derived_from": "`GPU KV cache size: C tokens` in the workload-only server log; C * 55_224 / 1e9",
+        "evidence": "logs/20260827_0_glm52_nvfp4_l1_clean_alignment/cases/03_balanced_anchor_c32/profile_workload"
+      },
+      "provenance": {
+        "accepted_run": "logs/20260827_0_glm52_nvfp4_l1_clean_alignment/cases/03_balanced_anchor_c32",
+        "capture_source": "logs/20260826_0_glm52_b200_ep4_workload_matrix_realign/cases/03_balanced_anchor_c32"
+      }
+    },
+    {
+      "index": 4,
+      "name": "prefill_spectrum_c32",
+      "variant": "ep4_tp4_dp1",
+      "purpose": "Prefill scaling across the old 2K boundary and the active 8K chunk boundary.",
+      "coverage": [
+        "prefill_scaling",
+        "chunk_boundary"
+      ],
+      "max_model_len": 131072,
+      "max_concurrency": 32,
+      "chunk_size": 8192,
+      "speculative_acceptance": {
+        "value": [
+          0.9039741219963031,
+          0.7245935998364176,
+          0.47782990581678364,
+          0.495570648161819,
+          0.6302696260986146
+        ],
+        "status": "provisional",
+        "derived_from": "clean diverse-100 spec5 workload; replace with this case's profile_workload per-position counters",
+        "evidence": "logs/20260830_1_glm52_diverse100_spec5/profile_workload/spec_decode_metrics.json"
+      },
+      "profile_arrival_mode": "saturated",
+      "simulation_arrival_mode": "saturated",
+      "gpu_memory_utilization": 0.75,
+      "capture_seconds": 15,
+      "device_role": "primary",
+      "workload_trace": {
+        "file": "traces/04_prefill_spectrum_c32.csv",
+        "shapes": [
+          [
+            128,
+            64
+          ],
+          [
+            512,
+            64
+          ],
+          [
+            1984,
+            64
+          ],
+          [
+            2048,
+            64
+          ],
+          [
+            2112,
+            64
+          ],
+          [
+            4096,
+            64
+          ],
+          [
+            6144,
+            64
+          ],
+          [
+            7936,
+            64
+          ],
+          [
+            8192,
+            64
+          ],
+          [
+            8256,
+            64
+          ],
+          [
+            16384,
+            64
+          ],
+          [
+            32768,
+            64
+          ],
+          [
+            65536,
+            64
+          ]
+        ],
+        "repeats": 12
+      },
+      "attn_gpu_memory_gb": {
+        "value": 120,
+        "status": "provisional",
+        "derived_from": "`GPU KV cache size: C tokens` in the workload-only server log; C * 55_224 / 1e9",
+        "evidence": "logs/20260827_0_glm52_nvfp4_l1_clean_alignment/cases/04_prefill_spectrum_c32/profile_workload"
+      },
+      "provenance": {
+        "accepted_run": "logs/20260827_0_glm52_nvfp4_l1_clean_alignment/cases/04_prefill_spectrum_c32",
+        "capture_source": "logs/20260826_0_glm52_b200_ep4_workload_matrix_realign/cases/04_prefill_spectrum_c32"
+      }
+    },
+    {
+      "index": 5,
+      "name": "decode_spectrum_c64",
+      "variant": "ep4_tp4_dp1",
+      "purpose": "Decode residence, KV growth, and batch contraction.",
+      "coverage": [
+        "decode_residence",
+        "kv_growth"
+      ],
+      "max_model_len": 16384,
+      "max_concurrency": 64,
+      "chunk_size": 4096,
+      "speculative_acceptance": {
+        "value": [
+          0.9039741219963031,
+          0.7245935998364176,
+          0.47782990581678364,
+          0.495570648161819,
+          0.6302696260986146
+        ],
+        "status": "provisional",
+        "derived_from": "clean diverse-100 spec5 workload; replace with this case's profile_workload per-position counters",
+        "evidence": "logs/20260830_1_glm52_diverse100_spec5/profile_workload/spec_decode_metrics.json"
+      },
+      "profile_arrival_mode": "saturated",
+      "simulation_arrival_mode": "saturated",
+      "gpu_memory_utilization": 0.75,
+      "capture_seconds": 15,
+      "device_role": "primary",
+      "workload_trace": {
+        "file": "traces/05_decode_spectrum_c64.csv",
+        "shapes": [
+          [
+            128,
+            16
+          ],
+          [
+            128,
+            128
+          ],
+          [
+            128,
+            512
+          ],
+          [
+            128,
+            1024
+          ],
+          [
+            128,
+            2048
+          ],
+          [
+            128,
+            4096
+          ],
+          [
+            512,
+            2048
+          ],
+          [
+            1024,
+            4096
+          ],
+          [
+            2048,
+            8192
+          ],
+          [
+            4096,
+            4096
+          ],
+          [
+            8192,
+            4096
+          ]
+        ],
+        "repeats": 16
+      },
+      "attn_gpu_memory_gb": {
+        "value": 120,
+        "status": "provisional",
+        "derived_from": "`GPU KV cache size: C tokens` in the workload-only server log; C * 55_224 / 1e9",
+        "evidence": "logs/20260827_0_glm52_nvfp4_l1_clean_alignment/cases/05_decode_spectrum_c64/profile_workload"
+      },
+      "provenance": {
+        "accepted_run": "logs/20260827_0_glm52_nvfp4_l1_clean_alignment/cases/05_decode_spectrum_c64",
+        "capture_source": "logs/20260826_0_glm52_b200_ep4_workload_matrix_realign/cases/05_decode_spectrum_c64"
+      }
+    },
+    {
+      "index": 6,
+      "name": "long_long_c8",
+      "variant": "ep4_tp4_dp1",
+      "purpose": "Long-prefill plus long-decode interaction near context capacity.",
+      "coverage": [
+        "long_prefill",
+        "long_decode"
+      ],
+      "max_model_len": 16384,
+      "max_concurrency": 8,
+      "chunk_size": 4096,
+      "speculative_acceptance": {
+        "value": [
+          0.9039741219963031,
+          0.7245935998364176,
+          0.47782990581678364,
+          0.495570648161819,
+          0.6302696260986146
+        ],
+        "status": "provisional",
+        "derived_from": "clean diverse-100 spec5 workload; replace with this case's profile_workload per-position counters",
+        "evidence": "logs/20260830_1_glm52_diverse100_spec5/profile_workload/spec_decode_metrics.json"
+      },
+      "profile_arrival_mode": "saturated",
+      "simulation_arrival_mode": "saturated",
+      "gpu_memory_utilization": 0.75,
+      "capture_seconds": 15,
+      "device_role": "primary",
+      "workload_trace": {
+        "file": "traces/06_long_long_c8.csv",
+        "shapes": [
+          [
+            2048,
+            4096
+          ],
+          [
+            3072,
+            3072
+          ],
+          [
+            4096,
+            3968
+          ],
+          [
+            5120,
+            2944
+          ],
+          [
+            6144,
+            1920
+          ],
+          [
+            7168,
+            4096
+          ],
+          [
+            8192,
+            4096
+          ],
+          [
+            10240,
+            2048
+          ]
+        ],
+        "repeats": 8
+      },
+      "attn_gpu_memory_gb": {
+        "value": 120,
+        "status": "provisional",
+        "derived_from": "`GPU KV cache size: C tokens` in the workload-only server log; C * 55_224 / 1e9",
+        "evidence": "logs/20260827_0_glm52_nvfp4_l1_clean_alignment/cases/06_long_long_c8/profile_workload"
+      },
+      "provenance": {
+        "accepted_run": "logs/20260827_0_glm52_nvfp4_l1_clean_alignment/cases/06_long_long_c8",
+        "capture_source": "logs/20260826_0_glm52_b200_ep4_workload_matrix_realign/cases/06_long_long_c8"
+      }
+    },
+    {
+      "index": 7,
+      "name": "quadrant_interference_c48",
+      "variant": "ep4_tp4_dp1",
+      "purpose": "All four IO quadrants sharing continuous batches.",
+      "coverage": [
+        "io_quadrants",
+        "continuous_batching"
+      ],
+      "max_model_len": 16384,
+      "max_concurrency": 48,
+      "chunk_size": 8192,
+      "speculative_acceptance": {
+        "value": [
+          0.9039741219963031,
+          0.7245935998364176,
+          0.47782990581678364,
+          0.495570648161819,
+          0.6302696260986146
+        ],
+        "status": "provisional",
+        "derived_from": "clean diverse-100 spec5 workload; replace with this case's profile_workload per-position counters",
+        "evidence": "logs/20260830_1_glm52_diverse100_spec5/profile_workload/spec_decode_metrics.json"
+      },
+      "profile_arrival_mode": "saturated",
+      "simulation_arrival_mode": "saturated",
+      "gpu_memory_utilization": 0.75,
+      "capture_seconds": 15,
+      "device_role": "primary",
+      "workload_trace": {
+        "file": "traces/07_quadrant_interference_c48.csv",
+        "shapes": [
+          [
+            128,
+            128
+          ],
+          [
+            128,
+            4096
+          ],
+          [
+            4096,
+            128
+          ],
+          [
+            3072,
+            3072
+          ],
+          [
+            7936,
+            128
+          ],
+          [
+            8192,
+            4096
+          ],
+          [
+            8256,
+            128
+          ],
+          [
+            12288,
+            1024
+          ]
+        ],
+        "repeats": 24
+      },
+      "attn_gpu_memory_gb": {
+        "value": 120,
+        "status": "provisional",
+        "derived_from": "`GPU KV cache size: C tokens` in the workload-only server log; C * 55_224 / 1e9",
+        "evidence": "logs/20260827_0_glm52_nvfp4_l1_clean_alignment/cases/07_quadrant_interference_c48/profile_workload"
+      },
+      "provenance": {
+        "accepted_run": "logs/20260827_0_glm52_nvfp4_l1_clean_alignment/cases/07_quadrant_interference_c48",
+        "capture_source": "logs/20260826_0_glm52_b200_ep4_workload_matrix_realign/cases/07_quadrant_interference_c48"
+      }
+    },
+    {
+      "index": 8,
+      "name": "completion_churn_c96",
+      "variant": "ep4_tp4_dp1",
+      "purpose": "Rapid completions, shrinking batches, and request replacement.",
+      "coverage": [
+        "completion_churn",
+        "admission"
+      ],
+      "max_model_len": 8192,
+      "max_concurrency": 96,
+      "chunk_size": 2048,
+      "speculative_acceptance": {
+        "value": [
+          0.9039741219963031,
+          0.7245935998364176,
+          0.47782990581678364,
+          0.495570648161819,
+          0.6302696260986146
+        ],
+        "status": "provisional",
+        "derived_from": "clean diverse-100 spec5 workload; replace with this case's profile_workload per-position counters",
+        "evidence": "logs/20260830_1_glm52_diverse100_spec5/profile_workload/spec_decode_metrics.json"
+      },
+      "profile_arrival_mode": "saturated",
+      "simulation_arrival_mode": "saturated",
+      "gpu_memory_utilization": 0.75,
+      "capture_seconds": 15,
+      "device_role": "primary",
+      "workload_trace": {
+        "file": "traces/08_completion_churn_c96.csv",
+        "shapes": [
+          [
+            128,
+            1
+          ],
+          [
+            128,
+            16
+          ],
+          [
+            512,
+            64
+          ],
+          [
+            512,
+            256
+          ],
+          [
+            512,
+            1024
+          ],
+          [
+            512,
+            4096
+          ],
+          [
+            2048,
+            1
+          ],
+          [
+            2048,
+            16
+          ],
+          [
+            2048,
+            64
+          ],
+          [
+            2048,
+            256
+          ],
+          [
+            4096,
+            1024
+          ],
+          [
+            4096,
+            2048
+          ]
+        ],
+        "repeats": 24
+      },
+      "attn_gpu_memory_gb": {
+        "value": 120,
+        "status": "provisional",
+        "derived_from": "`GPU KV cache size: C tokens` in the workload-only server log; C * 55_224 / 1e9",
+        "evidence": "logs/20260827_0_glm52_nvfp4_l1_clean_alignment/cases/08_completion_churn_c96/profile_workload"
+      },
+      "provenance": {
+        "accepted_run": "logs/20260827_0_glm52_nvfp4_l1_clean_alignment/cases/08_completion_churn_c96",
+        "capture_source": "logs/20260826_0_glm52_b200_ep4_workload_matrix_realign/cases/08_completion_churn_c96"
+      }
+    },
+    {
+      "index": 9,
+      "name": "rate_knee",
+      "variant": "ep4_tp4_dp1",
+      "purpose": "Maximum sustainable open-loop request rate.",
+      "coverage": [
+        "arrival_rate_knee"
+      ],
+      "max_model_len": 8192,
+      "max_concurrency": null,
+      "chunk_size": 2048,
+      "speculative_acceptance": {
+        "value": [
+          0.9039741219963031,
+          0.7245935998364176,
+          0.47782990581678364,
+          0.495570648161819,
+          0.6302696260986146
+        ],
+        "status": "provisional",
+        "derived_from": "clean diverse-100 spec5 workload; replace with this case's profile_workload per-position counters",
+        "evidence": "logs/20260830_1_glm52_diverse100_spec5/profile_workload/spec_decode_metrics.json"
+      },
+      "profile_arrival_mode": "trace-timed",
+      "simulation_arrival_mode": "trace_timed",
+      "gpu_memory_utilization": 0.85,
+      "capture_seconds": 20,
+      "device_role": "primary",
+      "workload_trace": {
+        "file": "traces/09_rate_knee.csv",
+        "shapes": [
+          [
+            128,
+            128
+          ],
+          [
+            128,
+            4096
+          ],
+          [
+            4096,
+            128
+          ],
+          [
+            3072,
+            3072
+          ],
+          [
+            512,
+            256
+          ],
+          [
+            2048,
+            1024
+          ],
+          [
+            6144,
+            512
+          ],
+          [
+            1024,
+            4096
+          ]
+        ],
+        "repeats": 64
+      },
+      "rate": {
+        "value": 1,
+        "status": "provisional",
+        "derived_from": "queueing knee of the case-10 saturation sweep; DESIGN.md step 2",
+        "evidence": ""
+      },
+      "attn_gpu_memory_gb": {
+        "value": 37.990577664,
+        "status": "provisional",
+        "derived_from": "`GPU KV cache size: C tokens` in the workload-only server log; C * 55_224 / 1e9",
+        "evidence": "logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/09_rate_knee/profile_workload"
+      },
+      "provenance": {
+        "accepted_run": "logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/09_rate_knee",
+        "capture_source": "logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/09_rate_knee"
+      }
+    },
+    {
+      "index": 10,
+      "name": "full_saturation_rate",
+      "variant": "ep4_tp4_dp1",
+      "purpose": "Peak-throughput open-loop load beyond the sustainable knee.",
+      "coverage": [
+        "saturation",
+        "peak_throughput"
+      ],
+      "max_model_len": 8192,
+      "max_concurrency": 256,
+      "chunk_size": 2048,
+      "speculative_acceptance": {
+        "value": [
+          0.9039741219963031,
+          0.7245935998364176,
+          0.47782990581678364,
+          0.495570648161819,
+          0.6302696260986146
+        ],
+        "status": "provisional",
+        "derived_from": "clean diverse-100 spec5 workload; replace with this case's profile_workload per-position counters",
+        "evidence": "logs/20260830_1_glm52_diverse100_spec5/profile_workload/spec_decode_metrics.json"
+      },
+      "profile_arrival_mode": "saturated",
+      "simulation_arrival_mode": "saturated",
+      "gpu_memory_utilization": 0.85,
+      "capture_seconds": 20,
+      "device_role": "primary",
+      "workload_trace": {
+        "file": "traces/10_full_saturation_rate.csv",
+        "shapes": [
+          [
+            128,
+            128
+          ],
+          [
+            128,
+            4096
+          ],
+          [
+            4096,
+            128
+          ],
+          [
+            3072,
+            3072
+          ],
+          [
+            512,
+            256
+          ],
+          [
+            2048,
+            1024
+          ],
+          [
+            6144,
+            512
+          ],
+          [
+            1024,
+            4096
+          ]
+        ],
+        "repeats": 64
+      },
+      "attn_gpu_memory_gb": {
+        "value": 37.990577664,
+        "status": "provisional",
+        "derived_from": "`GPU KV cache size: C tokens` in the workload-only server log; C * 55_224 / 1e9",
+        "evidence": "logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/10_full_saturation_rate/profile_workload"
+      },
+      "provenance": {
+        "accepted_run": "logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/10_full_saturation_rate",
+        "capture_source": "logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/10_full_saturation_rate"
+      }
+    },
+    {
+      "index": 11,
+      "name": "long_prefill_ladder_c1",
+      "variant": "ep4_tp4_dp1",
+      "purpose": "16K-491K prompts: long-prefill ladder at concurrency 1.",
+      "coverage": [
+        "long_prefill",
+        "bounded_kernel_trace"
+      ],
+      "max_model_len": 524288,
+      "max_concurrency": 1,
+      "chunk_size": 8192,
+      "speculative_acceptance": {
+        "value": [
+          0.9039741219963031,
+          0.7245935998364176,
+          0.47782990581678364,
+          0.495570648161819,
+          0.6302696260986146
+        ],
+        "status": "provisional",
+        "derived_from": "clean diverse-100 spec5 workload; replace with this case's profile_workload per-position counters",
+        "evidence": "logs/20260830_1_glm52_diverse100_spec5/profile_workload/spec_decode_metrics.json"
+      },
+      "profile_arrival_mode": "saturated",
+      "simulation_arrival_mode": "saturated",
+      "gpu_memory_utilization": 0.85,
+      "capture_seconds": 120,
+      "device_role": "primary",
+      "workload_trace": {
+        "file": "traces/11_long_prefill_ladder_c1.csv",
+        "shapes": [
+          [
+            16384,
+            16
+          ],
+          [
+            32768,
+            64
+          ],
+          [
+            65536,
+            16
+          ],
+          [
+            98304,
+            64
+          ],
+          [
+            131072,
+            16
+          ],
+          [
+            196608,
+            64
+          ],
+          [
+            262144,
+            16
+          ],
+          [
+            393216,
+            64
+          ],
+          [
+            458752,
+            16
+          ],
+          [
+            491520,
+            64
+          ]
+        ],
+        "repeats": 2,
+        "id_suffix": "full"
+      },
+      "kernel_trace": {
+        "file": "traces/11_long_prefill_ladder_c1.nsys.csv",
+        "shapes": [
+          [
+            16384,
+            16
+          ],
+          [
+            32768,
+            64
+          ],
+          [
+            65536,
+            16
+          ],
+          [
+            98304,
+            64
+          ],
+          [
+            131072,
+            16
+          ],
+          [
+            196608,
+            64
+          ],
+          [
+            262144,
+            16
+          ]
+        ],
+        "repeats": 1,
+        "id_suffix": "nsys"
+      },
+      "attn_gpu_memory_gb": {
+        "value": 32.402792448,
+        "status": "provisional",
+        "derived_from": "`GPU KV cache size: C tokens` in the workload-only server log; C * 55_224 / 1e9",
+        "evidence": "logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/11_long_prefill_ladder_c1/profile_workload"
+      },
+      "provenance": {
+        "accepted_run": "logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/11_long_prefill_ladder_c1",
+        "capture_source": "logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/11_long_prefill_ladder_c1"
+      }
+    },
+    {
+      "index": 12,
+      "name": "ultra_context_decode_c1",
+      "variant": "ep4_tp4_dp1",
+      "purpose": "Long context plus long output: ultra-context decode at concurrency 1.",
+      "coverage": [
+        "ultra_context",
+        "long_decode"
+      ],
+      "max_model_len": 524288,
+      "max_concurrency": 1,
+      "chunk_size": 8192,
+      "speculative_acceptance": {
+        "value": [
+          0.9039741219963031,
+          0.7245935998364176,
+          0.47782990581678364,
+          0.495570648161819,
+          0.6302696260986146
+        ],
+        "status": "provisional",
+        "derived_from": "clean diverse-100 spec5 workload; replace with this case's profile_workload per-position counters",
+        "evidence": "logs/20260830_1_glm52_diverse100_spec5/profile_workload/spec_decode_metrics.json"
+      },
+      "profile_arrival_mode": "saturated",
+      "simulation_arrival_mode": "saturated",
+      "gpu_memory_utilization": 0.85,
+      "capture_seconds": 120,
+      "device_role": "primary",
+      "workload_trace": {
+        "file": "traces/12_ultra_context_decode_c1.csv",
+        "shapes": [
+          [
+            458752,
+            256
+          ],
+          [
+            458752,
+            1024
+          ],
+          [
+            458752,
+            4096
+          ],
+          [
+            262144,
+            256
+          ],
+          [
+            262144,
+            1024
+          ],
+          [
+            262144,
+            4096
+          ],
+          [
+            131072,
+            256
+          ],
+          [
+            131072,
+            1024
+          ],
+          [
+            131072,
+            4096
+          ],
+          [
+            32768,
+            256
+          ],
+          [
+            32768,
+            1024
+          ],
+          [
+            32768,
+            4096
+          ],
+          [
+            8192,
+            256
+          ],
+          [
+            8192,
+            1024
+          ],
+          [
+            8192,
+            4096
+          ]
+        ],
+        "repeats": 1,
+        "id_suffix": "full"
+      },
+      "kernel_trace": {
+        "file": "traces/12_ultra_context_decode_c1.nsys.csv",
+        "shapes": [
+          [
+            458752,
+            64
+          ],
+          [
+            8192,
+            256
+          ],
+          [
+            12288,
+            64
+          ]
+        ],
+        "repeats": 1,
+        "id_suffix": "nsys"
+      },
+      "attn_gpu_memory_gb": {
+        "value": 32.402792448,
+        "status": "provisional",
+        "derived_from": "`GPU KV cache size: C tokens` in the workload-only server log; C * 55_224 / 1e9",
+        "evidence": "logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/12_ultra_context_decode_c1/profile_workload"
+      },
+      "provenance": {
+        "accepted_run": "logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/12_ultra_context_decode_c1",
+        "capture_source": "logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/12_ultra_context_decode_c1"
+      }
+    },
+    {
+      "index": 13,
+      "name": "generation_length_matrix_c8",
+      "variant": "ep4_tp4_dp1",
+      "purpose": "Mixed prompt and output lengths across a generation-length matrix.",
+      "coverage": [
+        "generation_length_matrix"
+      ],
+      "max_model_len": 131072,
+      "max_concurrency": 8,
+      "chunk_size": 4096,
+      "speculative_acceptance": {
+        "value": [
+          0.9039741219963031,
+          0.7245935998364176,
+          0.47782990581678364,
+          0.495570648161819,
+          0.6302696260986146
+        ],
+        "status": "provisional",
+        "derived_from": "clean diverse-100 spec5 workload; replace with this case's profile_workload per-position counters",
+        "evidence": "logs/20260830_1_glm52_diverse100_spec5/profile_workload/spec_decode_metrics.json"
+      },
+      "profile_arrival_mode": "saturated",
+      "simulation_arrival_mode": "saturated",
+      "gpu_memory_utilization": 0.85,
+      "capture_seconds": 60,
+      "device_role": "primary",
+      "workload_trace": {
+        "file": "traces/13_generation_length_matrix_c8.csv",
+        "shapes": [
+          [
+            128,
+            4096
+          ],
+          [
+            128,
+            8192
+          ],
+          [
+            128,
+            16384
+          ],
+          [
+            128,
+            32768
+          ],
+          [
+            512,
+            4096
+          ],
+          [
+            512,
+            8192
+          ],
+          [
+            512,
+            16384
+          ],
+          [
+            512,
+            32768
+          ],
+          [
+            2048,
+            4096
+          ],
+          [
+            2048,
+            8192
+          ],
+          [
+            2048,
+            16384
+          ],
+          [
+            2048,
+            32768
+          ],
+          [
+            8192,
+            4096
+          ],
+          [
+            8192,
+            8192
+          ],
+          [
+            8192,
+            16384
+          ],
+          [
+            8192,
+            32768
+          ],
+          [
+            16384,
+            4096
+          ],
+          [
+            16384,
+            8192
+          ],
+          [
+            16384,
+            16384
+          ],
+          [
+            16384,
+            32768
+          ],
+          [
+            32768,
+            4096
+          ],
+          [
+            32768,
+            8192
+          ],
+          [
+            32768,
+            16384
+          ],
+          [
+            32768,
+            32768
+          ]
+        ],
+        "repeats": 2,
+        "id_suffix": "full"
+      },
+      "kernel_trace": {
+        "file": "traces/13_generation_length_matrix_c8.nsys.csv",
+        "shapes": [
+          [
+            128,
+            256
+          ],
+          [
+            512,
+            256
+          ],
+          [
+            2048,
+            256
+          ],
+          [
+            8192,
+            256
+          ],
+          [
+            16384,
+            256
+          ],
+          [
+            32768,
+            256
+          ],
+          [
+            4096,
+            256
+          ],
+          [
+            24576,
+            256
+          ]
+        ],
+        "repeats": 1,
+        "id_suffix": "nsys"
+      },
+      "attn_gpu_memory_gb": {
+        "value": 37.34025984,
+        "status": "provisional",
+        "derived_from": "`GPU KV cache size: C tokens` in the workload-only server log; C * 55_224 / 1e9",
+        "evidence": "logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/13_generation_length_matrix_c8/profile_workload"
+      },
+      "provenance": {
+        "accepted_run": "logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/13_generation_length_matrix_c8",
+        "capture_source": "logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/13_generation_length_matrix_c8"
+      }
+    },
+    {
+      "index": 14,
+      "name": "near_full_long_decode_c21",
+      "variant": "ep4_tp4_dp1",
+      "purpose": "About 91.4% terminal KV demand: near-full long decode.",
+      "coverage": [
+        "kv_near_full"
+      ],
+      "max_model_len": 65536,
+      "max_concurrency": 21,
+      "chunk_size": 4096,
+      "speculative_acceptance": {
+        "value": [
+          0.9039741219963031,
+          0.7245935998364176,
+          0.47782990581678364,
+          0.495570648161819,
+          0.6302696260986146
+        ],
+        "status": "provisional",
+        "derived_from": "clean diverse-100 spec5 workload; replace with this case's profile_workload per-position counters",
+        "evidence": "logs/20260830_1_glm52_diverse100_spec5/profile_workload/spec_decode_metrics.json"
+      },
+      "profile_arrival_mode": "saturated",
+      "simulation_arrival_mode": "saturated",
+      "gpu_memory_utilization": 0.85,
+      "capture_seconds": 90,
+      "device_role": "primary",
+      "workload_trace": {
+        "file": "traces/14_near_full_long_decode_c21.csv",
+        "shapes": [
+          [
+            8192,
+            8192
+          ],
+          [
+            12288,
+            8192
+          ],
+          [
+            16384,
+            8192
+          ],
+          [
+            24576,
+            4096
+          ],
+          [
+            32768,
+            4096
+          ],
+          [
+            49152,
+            2048
+          ]
+        ],
+        "repeats": 10,
+        "id_suffix": "full"
+      },
+      "kernel_trace": {
+        "file": "traces/14_near_full_long_decode_c21.nsys.csv",
+        "shapes": [
+          [
+            50944,
+            256
+          ],
+          [
+            16128,
+            256
+          ],
+          [
+            20224,
+            256
+          ],
+          [
+            24320,
+            256
+          ],
+          [
+            28416,
+            256
+          ],
+          [
+            36608,
+            256
+          ],
+          [
+            50944,
+            256
+          ],
+          [
+            16128,
+            256
+          ],
+          [
+            20224,
+            256
+          ],
+          [
+            24320,
+            256
+          ],
+          [
+            28416,
+            256
+          ],
+          [
+            36608,
+            256
+          ],
+          [
+            50944,
+            256
+          ],
+          [
+            16128,
+            256
+          ],
+          [
+            20224,
+            256
+          ],
+          [
+            24320,
+            256
+          ],
+          [
+            28416,
+            256
+          ],
+          [
+            36608,
+            256
+          ],
+          [
+            50944,
+            256
+          ],
+          [
+            16128,
+            256
+          ],
+          [
+            20224,
+            256
+          ]
+        ],
+        "repeats": 1,
+        "id_suffix": "nsys"
+      },
+      "attn_gpu_memory_gb": {
+        "value": 37.686624768,
+        "status": "provisional",
+        "derived_from": "`GPU KV cache size: C tokens` in the workload-only server log; C * 55_224 / 1e9",
+        "evidence": "logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/14_near_full_long_decode_c21/profile_workload"
+      },
+      "provenance": {
+        "accepted_run": "logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/14_near_full_long_decode_c21",
+        "capture_source": "logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/14_near_full_long_decode_c21"
+      }
+    },
+    {
+      "index": 15,
+      "name": "kv_overcommit_mixed_churn_c14",
+      "variant": "ep4_tp4_dp1",
+      "purpose": "About 122.6% average terminal KV demand, admission-controlled churn.",
+      "coverage": [
+        "kv_overcommit",
+        "admission"
+      ],
+      "max_model_len": 262144,
+      "max_concurrency": 14,
+      "chunk_size": 8192,
+      "speculative_acceptance": {
+        "value": [
+          0.9039741219963031,
+          0.7245935998364176,
+          0.47782990581678364,
+          0.495570648161819,
+          0.6302696260986146
+        ],
+        "status": "provisional",
+        "derived_from": "clean diverse-100 spec5 workload; replace with this case's profile_workload per-position counters",
+        "evidence": "logs/20260830_1_glm52_diverse100_spec5/profile_workload/spec_decode_metrics.json"
+      },
+      "profile_arrival_mode": "saturated",
+      "simulation_arrival_mode": "saturated",
+      "gpu_memory_utilization": 0.85,
+      "capture_seconds": 120,
+      "device_role": "primary",
+      "workload_trace": {
+        "file": "traces/15_kv_overcommit_mixed_churn_c14.csv",
+        "shapes": [
+          [
+            65536,
+            4096
+          ],
+          [
+            16384,
+            32768
+          ],
+          [
+            98304,
+            2048
+          ],
+          [
+            32768,
+            16384
+          ],
+          [
+            8192,
+            8192
+          ],
+          [
+            49152,
+            8192
+          ]
+        ],
+        "repeats": 12,
+        "id_suffix": "full"
+      },
+      "kernel_trace": {
+        "file": "traces/15_kv_overcommit_mixed_churn_c14.nsys.csv",
+        "shapes": [
+          [
+            69376,
+            256
+          ],
+          [
+            48896,
+            256
+          ],
+          [
+            100096,
+            256
+          ],
+          [
+            48896,
+            256
+          ],
+          [
+            16128,
+            256
+          ],
+          [
+            57088,
+            256
+          ],
+          [
+            69376,
+            256
+          ],
+          [
+            48896,
+            256
+          ],
+          [
+            100096,
+            256
+          ],
+          [
+            48896,
+            256
+          ],
+          [
+            16128,
+            256
+          ],
+          [
+            57088,
+            256
+          ],
+          [
+            69376,
+            256
+          ],
+          [
+            48896,
+            256
+          ]
+        ],
+        "repeats": 1,
+        "id_suffix": "nsys"
+      },
+      "attn_gpu_memory_gb": {
+        "value": 35.933594112,
+        "status": "provisional",
+        "derived_from": "`GPU KV cache size: C tokens` in the workload-only server log; C * 55_224 / 1e9",
+        "evidence": "logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/15_kv_overcommit_mixed_churn_c14/profile_workload"
+      },
+      "provenance": {
+        "accepted_run": "logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/15_kv_overcommit_mixed_churn_c14",
+        "capture_source": "logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/15_kv_overcommit_mixed_churn_c14"
+      }
+    },
+    {
+      "index": 16,
+      "name": "chunk8k_mixed_pressure_c64",
+      "variant": "ep4_tp4_dp1",
+      "purpose": "High-concurrency mixed prefill/decode pressure around the active 8K chunk boundary.",
+      "coverage": [
+        "chunk_boundary_8k",
+        "high_concurrency",
+        "length_diversity",
+        "mixed_prefill_decode"
+      ],
+      "max_model_len": 131072,
+      "max_concurrency": 64,
+      "chunk_size": 8192,
+      "speculative_acceptance": {
+        "value": [
+          0.9039741219963031,
+          0.7245935998364176,
+          0.47782990581678364,
+          0.495570648161819,
+          0.6302696260986146
+        ],
+        "status": "provisional",
+        "derived_from": "clean diverse-100 spec5 workload; replace with this case's profile_workload per-position counters",
+        "evidence": "logs/20260830_1_glm52_diverse100_spec5/profile_workload/spec_decode_metrics.json"
+      },
+      "profile_arrival_mode": "saturated",
+      "simulation_arrival_mode": "saturated",
+      "gpu_memory_utilization": 0.85,
+      "capture_seconds": 45,
+      "device_role": "primary",
+      "workload_trace": {
+        "file": "traces/16_chunk8k_mixed_pressure_c64.csv",
+        "shapes": [
+          [
+            512,
+            64
+          ],
+          [
+            1984,
+            512
+          ],
+          [
+            2048,
+            4096
+          ],
+          [
+            2112,
+            64
+          ],
+          [
+            4096,
+            512
+          ],
+          [
+            7936,
+            4096
+          ],
+          [
+            8192,
+            64
+          ],
+          [
+            8256,
+            512
+          ],
+          [
+            16384,
+            4096
+          ],
+          [
+            32768,
+            64
+          ],
+          [
+            49152,
+            512
+          ],
+          [
+            65536,
+            4096
+          ]
+        ],
+        "repeats": 8,
+        "id_suffix": "full"
+      },
+      "attn_gpu_memory_gb": {
+        "value": 37.34025984,
+        "status": "provisional",
+        "derived_from": "bootstrap from case 13 at gpu_memory_utilization 0.85; replace from this case's profile_workload KV-cache log",
+        "evidence": "logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/13_generation_length_matrix_c8/profile_workload"
+      },
+      "provenance": {
+        "design_source": "coverage audit of the spec5 15-case extension"
+      }
+    },
+    {
+      "index": 17,
+      "name": "concurrent_long_prefill_c16",
+      "variant": "ep4_tp4_dp1",
+      "purpose": "Concurrent 8K-229K prompt ladder under a 4K scheduler cap.",
+      "coverage": [
+        "concurrent_long_prefill",
+        "chunk_size_4k",
+        "long_context"
+      ],
+      "max_model_len": 262144,
+      "max_concurrency": 16,
+      "chunk_size": 4096,
+      "speculative_acceptance": {
+        "value": [
+          0.9039741219963031,
+          0.7245935998364176,
+          0.47782990581678364,
+          0.495570648161819,
+          0.6302696260986146
+        ],
+        "status": "provisional",
+        "derived_from": "clean diverse-100 spec5 workload; replace with this case's profile_workload per-position counters",
+        "evidence": "logs/20260830_1_glm52_diverse100_spec5/profile_workload/spec_decode_metrics.json"
+      },
+      "profile_arrival_mode": "saturated",
+      "simulation_arrival_mode": "saturated",
+      "gpu_memory_utilization": 0.85,
+      "capture_seconds": 90,
+      "device_role": "primary",
+      "workload_trace": {
+        "file": "traces/17_concurrent_long_prefill_c16.csv",
+        "shapes": [
+          [
+            8192,
+            64
+          ],
+          [
+            16384,
+            128
+          ],
+          [
+            32768,
+            64
+          ],
+          [
+            65536,
+            128
+          ],
+          [
+            98304,
+            64
+          ],
+          [
+            131072,
+            128
+          ],
+          [
+            196608,
+            64
+          ],
+          [
+            229376,
+            128
+          ]
+        ],
+        "repeats": 4,
+        "id_suffix": "full"
+      },
+      "attn_gpu_memory_gb": {
+        "value": 35.933594112,
+        "status": "provisional",
+        "derived_from": "bootstrap from case 15 at gpu_memory_utilization 0.85; replace from this case's profile_workload KV-cache log",
+        "evidence": "logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/15_kv_overcommit_mixed_churn_c14/profile_workload"
+      },
+      "provenance": {
+        "design_source": "coverage audit of the spec5 15-case extension"
+      }
+    },
+    {
+      "index": 18,
+      "name": "diverse100_tp4",
+      "variant": "diverse_tp4",
+      "purpose": "Replay preserved diverse_100 NSYS with clean prediction and analysis.",
+      "coverage": [
+        "mixed",
+        "decode",
+        "speculative"
+      ],
+      "max_model_len": 131072,
+      "max_concurrency": null,
+      "chunk_size": 2052,
+      "profile_arrival_mode": "trace-timed",
+      "simulation_arrival_mode": "trace_timed",
+      "gpu_memory_utilization": 0.9,
+      "capture_seconds": 120,
+      "device_role": "primary",
+      "workload_trace": {
+        "file": "traces/18_diverse100_tp4.csv",
+        "shapes": [
+          [
+            364,
+            15
+          ],
+          [
+            20232,
+            2615
+          ],
+          [
+            7448,
+            2184
+          ],
+          [
+            441,
+            607
+          ],
+          [
+            17025,
+            11
+          ],
+          [
+            1919,
+            3
+          ],
+          [
+            45281,
+            66
+          ],
+          [
+            31799,
+            3311
+          ],
+          [
+            1133,
+            3
+          ],
+          [
+            82796,
+            7159
+          ],
+          [
+            88613,
+            478
+          ],
+          [
+            629,
+            28
+          ],
+          [
+            85646,
+            7
+          ],
+          [
+            24162,
+            4355
+          ],
+          [
+            11420,
+            1237
+          ],
+          [
+            1801,
+            252
+          ],
+          [
+            3625,
+            177
+          ],
+          [
+            472,
+            26
+          ],
+          [
+            24634,
+            3
+          ],
+          [
+            4881,
+            321
+          ],
+          [
+            409,
+            9
+          ],
+          [
+            394,
+            4501
+          ],
+          [
+            762,
+            3
+          ],
+          [
+            505,
+            4403
+          ],
+          [
+            64498,
+            7534
+          ],
+          [
+            17146,
+            4052
+          ],
+          [
+            35830,
+            9
+          ],
+          [
+            559,
+            1542
+          ],
+          [
+            2227,
+            163
+          ],
+          [
+            11635,
+            9
+          ],
+          [
+            2461,
+            2162
+          ],
+          [
+            29959,
+            400
+          ],
+          [
+            124539,
+            78
+          ],
+          [
+            9434,
+            3
+          ],
+          [
+            122879,
+            8192
+          ],
+          [
+            2386,
+            92
+          ],
+          [
+            576,
+            2045
+          ],
+          [
+            1219,
+            606
+          ],
+          [
+            22582,
+            123
+          ],
+          [
+            1901,
+            905
+          ],
+          [
+            1774,
+            5826
+          ],
+          [
+            131070,
+            1
+          ],
+          [
+            2074,
+            446
+          ],
+          [
+            18366,
+            556
+          ],
+          [
+            31748,
+            167
+          ],
+          [
+            96349,
+            30
+          ],
+          [
+            27483,
+            9
+          ],
+          [
+            6852,
+            12
+          ],
+          [
+            20834,
+            1034
+          ],
+          [
+            311,
+            11
+          ],
+          [
+            306,
+            4255
+          ],
+          [
+            8011,
+            1701
+          ],
+          [
+            121871,
+            4022
+          ],
+          [
+            921,
+            222
+          ],
+          [
+            1374,
+            4181
+          ],
+          [
+            43058,
+            7
+          ],
+          [
+            1707,
+            370
+          ],
+          [
+            1258,
+            7
+          ],
+          [
+            2069,
+            6870
+          ],
+          [
+            2614,
+            3413
+          ],
+          [
+            38537,
+            7816
+          ],
+          [
+            382,
+            477
+          ],
+          [
+            966,
+            3
+          ],
+          [
+            14046,
+            370
+          ],
+          [
+            308,
+            248
+          ],
+          [
+            96062,
+            261
+          ],
+          [
+            107539,
+            59
+          ],
+          [
+            4474,
+            480
+          ],
+          [
+            256,
+            8192
+          ],
+          [
+            5810,
+            5
+          ],
+          [
+            9088,
+            1417
+          ],
+          [
+            1422,
+            62
+          ],
+          [
+            7880,
+            203
+          ],
+          [
+            35613,
+            299
+          ],
+          [
+            2526,
+            1557
+          ],
+          [
+            8161,
+            3
+          ],
+          [
+            1346,
+            41
+          ],
+          [
+            596,
+            11
+          ],
+          [
+            921,
+            94
+          ],
+          [
+            59267,
+            325
+          ],
+          [
+            290,
+            33
+          ],
+          [
+            6634,
+            28
+          ],
+          [
+            29345,
+            1897
+          ],
+          [
+            530,
+            292
+          ],
+          [
+            10364,
+            101
+          ],
+          [
+            293,
+            2673
+          ],
+          [
+            30807,
+            285
+          ],
+          [
+            4511,
+            9
+          ],
+          [
+            2556,
+            3
+          ],
+          [
+            1608,
+            1760
+          ],
+          [
+            1395,
+            29
+          ],
+          [
+            256,
+            1
+          ],
+          [
+            9044,
+            55
+          ],
+          [
+            7205,
+            15
+          ],
+          [
+            33624,
+            2957
+          ],
+          [
+            4605,
+            3
+          ],
+          [
+            8790,
+            3938
+          ],
+          [
+            77587,
+            20
+          ],
+          [
+            8699,
+            6274
+          ],
+          [
+            2103,
+            119
+          ]
+        ],
+        "repeats": 1
+      },
+      "attn_gpu_memory_gb": {
+        "value": 37.34025984,
+        "status": "measured",
+        "derived_from": "Preserved alignment simulation preset",
+        "evidence": "20260831_5_glm52_diverse100_spec5_cg2052"
+      },
+      "rate": {
+        "value": 1,
+        "status": "provisional",
+        "derived_from": "Generated recipe only; accepted captures retain original arrivals."
+      },
+      "speculative_acceptance": {
+        "value": [
+          0.89726625,
+          0.72333414,
+          0.55519044,
+          0.59261501,
+          0.7402111
+        ],
+        "status": "provisional",
+        "derived_from": "Rendering prerequisite only; simulation must use preserved tagged trace."
+      },
+      "provenance": {
+        "mode": "borrowed_capture",
+        "preserve_original_trace": true
+      }
+    },
+    {
+      "index": 19,
+      "name": "diverse100_tp8",
+      "variant": "diverse_tp8",
+      "purpose": "Replay preserved diverse_100 NSYS with clean prediction and analysis.",
+      "coverage": [
+        "mixed",
+        "decode",
+        "speculative"
+      ],
+      "max_model_len": 131072,
+      "max_concurrency": null,
+      "chunk_size": 2052,
+      "profile_arrival_mode": "trace-timed",
+      "simulation_arrival_mode": "trace_timed",
+      "gpu_memory_utilization": 0.9,
+      "capture_seconds": 120,
+      "device_role": "all",
+      "workload_trace": {
+        "file": "traces/19_diverse100_tp8.csv",
+        "shapes": [
+          [
+            364,
+            15
+          ],
+          [
+            20232,
+            2615
+          ],
+          [
+            7448,
+            2184
+          ],
+          [
+            441,
+            607
+          ],
+          [
+            17025,
+            11
+          ],
+          [
+            1919,
+            3
+          ],
+          [
+            45281,
+            66
+          ],
+          [
+            31799,
+            3311
+          ],
+          [
+            1133,
+            3
+          ],
+          [
+            82796,
+            7159
+          ],
+          [
+            88613,
+            478
+          ],
+          [
+            629,
+            28
+          ],
+          [
+            85646,
+            7
+          ],
+          [
+            24162,
+            4355
+          ],
+          [
+            11420,
+            1237
+          ],
+          [
+            1801,
+            252
+          ],
+          [
+            3625,
+            177
+          ],
+          [
+            472,
+            26
+          ],
+          [
+            24634,
+            3
+          ],
+          [
+            4881,
+            321
+          ],
+          [
+            409,
+            9
+          ],
+          [
+            394,
+            4501
+          ],
+          [
+            762,
+            3
+          ],
+          [
+            505,
+            4403
+          ],
+          [
+            64498,
+            7534
+          ],
+          [
+            17146,
+            4052
+          ],
+          [
+            35830,
+            9
+          ],
+          [
+            559,
+            1542
+          ],
+          [
+            2227,
+            163
+          ],
+          [
+            11635,
+            9
+          ],
+          [
+            2461,
+            2162
+          ],
+          [
+            29959,
+            400
+          ],
+          [
+            124539,
+            78
+          ],
+          [
+            9434,
+            3
+          ],
+          [
+            122879,
+            8192
+          ],
+          [
+            2386,
+            92
+          ],
+          [
+            576,
+            2045
+          ],
+          [
+            1219,
+            606
+          ],
+          [
+            22582,
+            123
+          ],
+          [
+            1901,
+            905
+          ],
+          [
+            1774,
+            5826
+          ],
+          [
+            131070,
+            1
+          ],
+          [
+            2074,
+            446
+          ],
+          [
+            18366,
+            556
+          ],
+          [
+            31748,
+            167
+          ],
+          [
+            96349,
+            30
+          ],
+          [
+            27483,
+            9
+          ],
+          [
+            6852,
+            12
+          ],
+          [
+            20834,
+            1034
+          ],
+          [
+            311,
+            11
+          ],
+          [
+            306,
+            4255
+          ],
+          [
+            8011,
+            1701
+          ],
+          [
+            121871,
+            4022
+          ],
+          [
+            921,
+            222
+          ],
+          [
+            1374,
+            4181
+          ],
+          [
+            43058,
+            7
+          ],
+          [
+            1707,
+            370
+          ],
+          [
+            1258,
+            7
+          ],
+          [
+            2069,
+            6870
+          ],
+          [
+            2614,
+            3413
+          ],
+          [
+            38537,
+            7816
+          ],
+          [
+            382,
+            477
+          ],
+          [
+            966,
+            3
+          ],
+          [
+            14046,
+            370
+          ],
+          [
+            308,
+            248
+          ],
+          [
+            96062,
+            261
+          ],
+          [
+            107539,
+            59
+          ],
+          [
+            4474,
+            480
+          ],
+          [
+            256,
+            8192
+          ],
+          [
+            5810,
+            5
+          ],
+          [
+            9088,
+            1417
+          ],
+          [
+            1422,
+            62
+          ],
+          [
+            7880,
+            203
+          ],
+          [
+            35613,
+            299
+          ],
+          [
+            2526,
+            1557
+          ],
+          [
+            8161,
+            3
+          ],
+          [
+            1346,
+            41
+          ],
+          [
+            596,
+            11
+          ],
+          [
+            921,
+            94
+          ],
+          [
+            59267,
+            325
+          ],
+          [
+            290,
+            33
+          ],
+          [
+            6634,
+            28
+          ],
+          [
+            29345,
+            1897
+          ],
+          [
+            530,
+            292
+          ],
+          [
+            10364,
+            101
+          ],
+          [
+            293,
+            2673
+          ],
+          [
+            30807,
+            285
+          ],
+          [
+            4511,
+            9
+          ],
+          [
+            2556,
+            3
+          ],
+          [
+            1608,
+            1760
+          ],
+          [
+            1395,
+            29
+          ],
+          [
+            256,
+            1
+          ],
+          [
+            9044,
+            55
+          ],
+          [
+            7205,
+            15
+          ],
+          [
+            33624,
+            2957
+          ],
+          [
+            4605,
+            3
+          ],
+          [
+            8790,
+            3938
+          ],
+          [
+            77587,
+            20
+          ],
+          [
+            8699,
+            6274
+          ],
+          [
+            2103,
+            119
+          ]
+        ],
+        "repeats": 1
+      },
+      "attn_gpu_memory_gb": {
+        "value": 94.34909952,
+        "status": "measured",
+        "derived_from": "Preserved alignment simulation preset",
+        "evidence": "20260902_0_glm52_diverse100_spec5_tp8_alignment"
+      },
+      "rate": {
+        "value": 1,
+        "status": "provisional",
+        "derived_from": "Generated recipe only; accepted captures retain original arrivals."
+      },
+      "speculative_acceptance": {
+        "value": [
+          0.89726625,
+          0.72333414,
+          0.55519044,
+          0.59261501,
+          0.7402111
+        ],
+        "status": "provisional",
+        "derived_from": "Rendering prerequisite only; simulation must use preserved tagged trace."
+      },
+      "provenance": {
+        "mode": "borrowed_capture",
+        "preserve_original_trace": true
+      }
+    }
+  ]
+}

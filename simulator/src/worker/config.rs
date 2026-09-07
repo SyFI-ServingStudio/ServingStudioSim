@@ -5,7 +5,8 @@
 //! sibling of the arch selector. `barebone` / `hp_unified` are wired for
 //! `unified`; `pd_prefill` / `pd_decode` are wired for `pd`; the AFD selectors
 //! are wired for `afd`. `chunked_prefill` is the hard-capped whole-iteration
-//! lifecycle used when long prompts must be split across iterations.
+//! lifecycle used when long prompts must be split across iterations, and
+//! `speculative` is that same lifecycle driving a target-verify decode engine.
 //!
 //! `#[derive(ProviderSchema)]` emits each selector's `SCHEMA` of `(tag, params)`
 //! rows for the launcher; `schema::dump::list_params` aggregates them.
@@ -200,6 +201,11 @@ fn default_gpu_time_multiplier() -> f64 {
     1.0
 }
 
+/// serde fallback for the speculative selector's `batch_policy`.
+const fn default_batch_policy() -> BatchPolicy {
+    BatchPolicy::Mix
+}
+
 /// Iteration-wise worker provider.
 #[derive(Debug, Clone, Deserialize, ProviderSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -303,6 +309,41 @@ pub enum IterWorkerSel {
         /// compatibility but kept as one typed selector component.
         #[serde(flatten)]
         kv_admission: KvAdmissionSpec,
+        /// GPU wall/kernel time multiplier (≥ 1.0); models inter-kernel overhead
+        /// (see [`default_gpu_time_multiplier`]). cost_log stays pre-scale.
+        #[serde(default = "default_gpu_time_multiplier")]
+        #[param(default = 1.0)]
+        gpu_time_multiplier: f64,
+    },
+    /// Chunked prefill with a speculating decode engine: one verify pass per
+    /// iteration submits `draft_tokens + 1` rows per resident decode and retires
+    /// the target's own token plus the leading run of accepted drafts.
+    ///
+    /// A separate selector from `chunked_prefill` rather than a flag on it: the
+    /// arch must also be the speculative one (a different model type, not the
+    /// ordinary one with a switch), and the pair is validated together.
+    Speculative {
+        /// GPU memory for the worker (GB; primarily KV cache budget).
+        #[param(default = 80.0)]
+        attn_gpu_memory_gb: f64,
+        /// Chunked-prefill cap: max tokens per batch. Decode spends it in query
+        /// rows, so a resident decode costs the whole verify width here.
+        max_batch_tokens: u32,
+        /// Candidate positions drafted per request per iteration. Must equal the
+        /// arch selector's `draft_tokens`: it picks the profiled verify shape.
+        #[param(default = 5, cache_key)]
+        draft_tokens: u32,
+        /// Seed for the per-iteration acceptance draws. None uses `0`; this
+        /// selects which deterministic stream, not whether there is one.
+        #[serde(default)]
+        acceptance_seed: Option<u64>,
+        /// How resident decode shares an iteration with chunked prefill. See
+        /// [`IterWorkerSel::ChunkedPrefill`]. Defaults to mixed batches;
+        /// separate-prefill-priority also works and defers resident decode
+        /// while a prefill batch runs.
+        #[serde(default = "default_batch_policy")]
+        #[param(string, default = "mix", choices = BATCH_POLICY_CHOICES)]
+        batch_policy: BatchPolicy,
         /// GPU wall/kernel time multiplier (≥ 1.0); models inter-kernel overhead
         /// (see [`default_gpu_time_multiplier`]). cost_log stays pre-scale.
         #[serde(default = "default_gpu_time_multiplier")]

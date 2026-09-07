@@ -32,6 +32,19 @@ stream that never produces a row leaves no file behind.
 
 ## Directory map
 
+Speculative iterations append nullable `groups.speculative_geometry` JSON with
+`draft_tokens`, `max_model_len`, prefill `(prefix, query)` pairs and decode
+`(final_context, query)` pairs. Ordinary rows leave it null. These are raw request
+shapes, not kernel FLOPs or bytes; the independent model accountant owns those
+formulas. Geometry is encoded on the writer thread.
+
+`request_slo.speculative_progress` independently persists admission/completion
+observations: verify width, completed prefill chunks and decode rounds, resident
+KV sum, emitted tokens, and an optional pending prefill/decode. This bounded
+per-request record survives optional timing logs being disabled. Pending work
+lets conservation account exactly for a sim-end stop before completion. Rejected
+candidates remain part of executed work; only committed output advances KV.
+
 ```
 schemas.rs        Arrow schemas for the streams + ALL_STREAMS. The cost_log
                   envelope (universal columns) vs. the full cost_log schema

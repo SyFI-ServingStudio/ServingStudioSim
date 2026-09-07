@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import heapq
 from typing import Any
 
 from profiling.db.args import DType
@@ -10,6 +9,7 @@ from profiling.profilers.energy import Energy
 from profiling.profilers.timer import Timer
 from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
+from profiling.runners.moe.exact_topk import exact_topk_ids
 
 WEIGHT_FORMAT = "nvfp4_e2m1"
 GROUP_SIZE = 16
@@ -162,37 +162,6 @@ def _call_trtllm_fp4_moe(
     fn(**call_kwargs)
 
 
-def _exact_topk_ids(
-    *, num_tokens: int, top_k: int, per_expert_batches: tuple[int, ...]
-) -> list[list[int]]:
-    """Realize expert degrees as distinct top-k ids for every token."""
-
-    if len(per_expert_batches) < top_k:
-        raise ValueError("num_experts must be at least top_k")
-    if any(batch < 0 for batch in per_expert_batches):
-        raise ValueError("per_expert_batches cannot contain negative counts")
-    if any(batch > num_tokens for batch in per_expert_batches):
-        raise ValueError("one expert cannot receive more than one row per token")
-    expected = num_tokens * top_k
-    if sum(per_expert_batches) != expected:
-        raise ValueError(f"per_expert_batches must sum to num_tokens*top_k ({expected})")
-
-    heap = [(-batch, expert) for expert, batch in enumerate(per_expert_batches) if batch]
-    heapq.heapify(heap)
-    rows: list[list[int]] = []
-    for _ in range(num_tokens):
-        if len(heap) < top_k:
-            raise ValueError("expert counts cannot form distinct top-k rows")
-        selected = [heapq.heappop(heap) for _ in range(top_k)]
-        rows.append([expert for _negative_count, expert in selected])
-        for negative_count, expert in selected:
-            if negative_count + 1 < 0:
-                heapq.heappush(heap, (negative_count + 1, expert))
-    if heap:
-        raise ValueError("expert counts were not exhausted by top-k construction")
-    return rows
-
-
 def _validate_args(**kwargs: Any) -> dict[str, Any]:
     args = dict(kwargs)
     for name in (
@@ -224,12 +193,55 @@ def _validate_args(**kwargs: Any) -> dict[str, Any]:
         raise ValueError("per_expert_batches must contain one count per global expert")
     if args["num_experts"] % args["num_local_experts"]:
         raise ValueError("num_local_experts must divide num_experts")
-    _exact_topk_ids(
+    exact_topk_ids(
         num_tokens=args["num_tokens"],
         top_k=args["top_k"],
         per_expert_batches=args["per_expert_batches"],
     )
     return args
+
+
+def _logical_bytes(args: dict[str, Any], *, do_finalize: bool) -> int:
+    """Return useful algorithmic traffic for this rank's fused MoE call.
+
+    Routed activations are counted once per local expert assignment and expert
+    weights/scales only for experts with at least one local row. This matches the
+    logical-work convention used by the other grouped-MoE profilers; it is
+    deliberately not a claim about physical HBM transactions or cache reuse.
+
+    The output term follows the finalize mode, because the two production
+    dispatches do not produce the same thing. A finalized call writes one row per
+    input token; a deferred call writes one unfinalized row per local expert
+    assignment and leaves the combine to `moe_finalize_fuse_shared`. Its small
+    `expert_weights` / `expanded_idx_to_permuted_idx` side outputs are excluded:
+    FlashInfer does not document their layout, and at production shapes they are
+    three orders of magnitude below the activation rows.
+    """
+
+    local_batches = args["per_expert_batches"][: args["num_local_experts"]]
+    local_rows = sum(local_batches)
+    active_experts = sum(batch > 0 for batch in local_batches)
+    tokens = args["num_tokens"]
+    hidden = args["hidden_size"]
+    intermediate = args["intermediate_size"]
+    experts = args["num_experts"]
+
+    # BF16 router logits + bias.
+    routing = 2 * tokens * experts + 2 * experts
+    # Packed FP4 routed activations + one FP8 scale per group of GROUP_SIZE.
+    activations = local_rows * (hidden // 2 + hidden // GROUP_SIZE)
+    # W13 and W2 packed FP4 weights and their FP8 group scales. W13 is the fused
+    # gate/up weight, so its packed size is 2 * intermediate * hidden / 2.
+    weights = active_experts * (
+        intermediate * hidden
+        + intermediate * hidden // 8
+        + hidden * intermediate // 2
+        + hidden * intermediate // GROUP_SIZE
+    )
+    # Three FP32 per-expert scaling vectors consumed by the production call.
+    expert_scales = 3 * active_experts * 4
+    output = 2 * hidden * (tokens if do_finalize else local_rows)
+    return routing + activations + weights + expert_scales + output
 
 
 def _profile_nvfp4_fused_moe_sm100(
@@ -261,7 +273,7 @@ def _profile_nvfp4_fused_moe_sm100(
         from flashinfer.autotuner import autotune
 
         torch, quantize, prepare = _load_runtime(stack)
-        ids = _exact_topk_ids(
+        ids = exact_topk_ids(
             num_tokens=args["num_tokens"],
             top_k=args["top_k"],
             per_expert_batches=args["per_expert_batches"],
@@ -370,7 +382,7 @@ def _profile_nvfp4_fused_moe_sm100(
     return ComputeMetrics(
         time_ms=time_ms,
         tflops=flops / elapsed_s / 1e12,
-        memory_bandwidth_gbps=0.0,
+        memory_bandwidth_gbps=_logical_bytes(args, do_finalize=do_finalize) / elapsed_s / 1e9,
         energy_j=energy_j,
     )
 

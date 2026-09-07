@@ -128,12 +128,19 @@ class Glm52DsaAttention:
         total = 0.0
         for interaction in workload.attn:
             if interaction.mask == "causal":
-                total += sum(
-                    min(selected, interaction.num_cached_key + query + 1)
-                    for query in range(interaction.num_query)
-                )
+                # Exact capped causal triangle, constant time even for long
+                # prefill chunks and a whole-run geometry histogram.
+                q, cached = interaction.num_query, interaction.num_cached_key
+                uncapped = min(q, max(0, selected - cached))
+                pairs = uncapped * cached + uncapped * (uncapped + 1) / 2
+                pairs += (q - uncapped) * selected
+                total += interaction.multiplicity * pairs
             elif interaction.mask in ("full", "cross"):
-                total += interaction.num_query * min(selected, interaction.num_key)
+                total += (
+                    interaction.multiplicity
+                    * interaction.num_query
+                    * min(selected, interaction.num_key)
+                )
             else:
                 raise ValueError(f"unknown attention mask {interaction.mask!r}")
         return float(total)
@@ -144,27 +151,13 @@ class Glm52DsaAttention:
         per_token += (
             (self.index_head_dim + self.quant_block_size - 1) // self.quant_block_size
         ) * self.index_scale_dtype_bytes
-        return per_token * sum(interaction.num_cached_key for interaction in workload.attn)
+        return per_token * sum(
+            interaction.num_cached_key * interaction.multiplicity for interaction in workload.attn
+        )
 
     def _mla_cache_read_bytes(self, workload: Workload) -> float:
         per_selected = (self.kv_lora_rank + self.qk_rope_head_dim) * self.mla_cache_dtype_bytes
-        total = 0.0
-        for interaction in workload.attn:
-            if interaction.mask == "causal":
-                total += (
-                    sum(
-                        min(self.index_topk, interaction.num_cached_key + query + 1)
-                        for query in range(interaction.num_query)
-                    )
-                    * per_selected
-                )
-            elif interaction.mask in ("full", "cross"):
-                total += (
-                    interaction.num_query * min(self.index_topk, interaction.num_key) * per_selected
-                )
-            else:
-                raise ValueError(f"unknown attention mask {interaction.mask!r}")
-        return float(total)
+        return self._selected_pairs(workload) * per_selected
 
     def semantic_segments(self, wl: Workload) -> list[AttentionSemantic]:
         """Return indexer, sparse-attention, and persistent-cache semantic rows.

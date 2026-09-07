@@ -22,6 +22,7 @@ use crate::hardware::resolve_gpu;
 /// The peak rates the R5 ceiling needs for one GPU model.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct GpuSpec {
+    fp4_tflops: f64,
     fp8_tflops: f64,
     bf16_tflops: f64,
     fp16_tflops: f64,
@@ -37,7 +38,9 @@ impl GpuSpec {
     /// matched spec entry lacks that field (e.g. an fp8 kernel on a pre-fp8 GPU).
     pub fn peak_tflops(&self, dtype: &str) -> f64 {
         let d = dtype.to_ascii_lowercase();
-        if d.contains("fp8") || d.contains("e4m3") || d.contains("e5m2") {
+        if d.contains("fp4") || d.contains("e2m1") {
+            self.fp4_tflops
+        } else if d.contains("fp8") || d.contains("e4m3") || d.contains("e5m2") {
             self.fp8_tflops
         } else if d.contains("int8") {
             self.int8_tops
@@ -73,6 +76,7 @@ impl GpuSpec {
 pub(crate) fn load_gpu_spec(repo_root: &Path, gpu_name: &str) -> Option<(String, GpuSpec)> {
     let resolved = resolve_gpu(repo_root, gpu_name)?;
     let spec = GpuSpec {
+        fp4_tflops: resolved.fp4_tflops.unwrap_or(0.0),
         fp8_tflops: resolved.fp8_tflops.unwrap_or(0.0),
         bf16_tflops: resolved.bf16_tflops.unwrap_or(0.0),
         fp16_tflops: resolved.fp16_tflops.unwrap_or(0.0),
@@ -110,12 +114,14 @@ mod tests {
     #[test]
     fn dtype_maps_to_the_right_peak() {
         let s = GpuSpec {
+            fp4_tflops: 9000.0,
             fp8_tflops: 1979.0,
             bf16_tflops: 990.0,
             int8_tops: 1979.0,
             ..Default::default()
         };
         assert_eq!(s.peak_tflops("fp8_e4m3"), 1979.0);
+        assert_eq!(s.peak_tflops("nvfp4"), 9000.0);
         assert_eq!(s.peak_tflops("bf16"), 990.0);
         assert_eq!(s.peak_tflops("unknown"), 990.0);
         assert_eq!(s.peak_tflops("int8"), 1979.0);

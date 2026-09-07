@@ -206,6 +206,33 @@ semantic segmented lower bound.
    weights/state that cannot be fused away, so their bytes remain in the denominator.
    Keeping optional elementwise math out keeps `F_min` exact and oracle-checkable.
 
+## Speculative execution
+
+For speculative GLM-5.2, R6/R7 are conditioned on the **executed algorithmic
+workload**. Rejected draft/verify candidates remain necessary work. Acceptance
+changes subsequent rounds, contexts, and batches; it does not remove queries
+from a round that already ran. This is not a useful-output-only autoregressive
+baseline.
+
+The speculative cost logger preserves raw prefill `(prefix, query)` and decode
+`(final_context, query)` geometry plus draft depth and the context limit.
+`speculative.py` reconstructs causal target verification, the first MTP pass
+with one sampled endpoint per request, and every later MTP endpoint separately.
+Sparse top-k saturation is applied per interaction, before aggregation. Geometry
+histograms preserve multiplicity without expanding whole-run request lists.
+The ordinary scalar affine shortcut is not applied to these staged workloads.
+
+The index-share, full-index, and single-draft location maps cover TP4 and TP8.
+Weights follow the accountant's existing read-once lower-bound convention;
+serial dependence alone does not prove that a shared weight must leave cache
+and be fetched again. Kernel timing and CostTree approximations never determine
+the necessary FLOP formulas.
+
+Request-side admission/completion telemetry separately records completed rounds,
+emitted outputs, resident KV, and pending work. Conservation uses those facts,
+not an average acceptance-rate estimate, including at a mid-iteration stop.
+Historical logs without these new observations remain explicitly unsupported.
+
 ## Parameter counts
 
 `MatmulGroup` carries both `activated_mult` (per-token instances, `top_k` for experts) and

@@ -78,6 +78,19 @@ commands plus, for every excluded case, *why* — already complete, or missing a
 named input. Planning is a pure function (`execute.plan_phase`), which is what
 makes it testable on CPU.
 
+For `--phase simulation`, worker settings come from `simulation.yaml`, including
+`gpu_time_multiplier` (default 1.0). Kernel analysis is an independent phase, not
+a prerequisite for simulation. To adopt a reported multiplier, set it explicitly
+in the experiment preset and record the source and approximation in experiment
+notes. The campaign does not read calibration reports or inject worker overrides.
+
+`extract` also includes `provenance.request_population_audit` for E2E results.
+Independent CSV traces resolve simulator IDs by input row order, then validate
+the measured and simulated request contracts. Audit failures block comparison
+eligibility. Missing legacy identity evidence is reported explicitly; it is not
+presented as a successful identity check. Observed-conditioned trace manifests
+are included in provenance when their output hash matches the selected trace.
+
 ### `label`
 
 `initialize`, then apply the manifest's rules repeatedly until the label
@@ -138,10 +151,23 @@ GLM-5.2 runs two (`nsys` + `workload_metrics`); the archived Llama3-8B alignment
 ran one. `name` is simultaneously the config stem, the artifact directory, and
 the `--phase` argument, so adding a pass touches no enum.
 
+Each pass can also set `warmup: true` (default false). This renders
+`workload.warmup: true` for that pass, using req-frontend's bounded warmup,
+drain, prefix-cache reset and measurement boundary. vLLM variants must enable
+server load tracking. Warmup does not alter either materialized trace.
+
 A **case** is one operating point: `max_model_len`, `max_concurrency`, the two
 arrival modes, `gpu_memory_utilization`, `capture_seconds`, `device_role`, its
 `workload_trace` (and `kernel_trace` where the NSYS capture is bounded
 separately), plus `purpose` and `coverage` so the matrix explains itself.
+
+Optional per-case `chunk_size` sets both server `max_num_batched_tokens` and
+worker `max_batch_tokens`. CUDA graph capture size remains a separate variant
+setting. Optional calibrated `speculative_acceptance` supplies one conditional
+probability per draft position. Rendering preserves the real-engine trace and
+writes a separate `trace_speculative.csv` for the simulator with its required
+`speculative` input tag. Architecture depth, worker depth and vector length must
+agree; borrowed calibration remains marked `provisional`.
 
 Two case fields carry more weight than their size suggests:
 

@@ -83,6 +83,7 @@ def _acceptance_schemas(pack: Pack | None) -> dict[str, int] | None:
 
 # ── verbs ────────────────────────────────────────────────────────────────────
 
+
 def _check(args) -> int:
     packs = _discover_packs(args.pack)
     worst = 0
@@ -141,7 +142,12 @@ def _run(args) -> int:
     out_root = Path(args.out_root)
     if args.dry_run:
         plans = execute.plan_phase(
-            pack, out_root, args.phase, cases=cases, refresh=args.refresh, resume=args.resume
+            pack,
+            out_root,
+            args.phase,
+            cases=cases,
+            refresh=args.refresh,
+            resume=args.resume,
         )
         print(execute.describe_plan(args.phase, plans))
         _print_calibration_prerequisites(pack)
@@ -194,9 +200,7 @@ def _label(args) -> int:
     failed = 0
     for case in _selected_cases(pack, args.case):
         variant = pack.variant_of(case)
-        kernel_pass = next(
-            (item for item in variant.profile_passes if item.kind == "nsys"), None
-        )
+        kernel_pass = next((item for item in variant.profile_passes if item.kind == "nsys"), None)
         if kernel_pass is None:
             print(f"[label] {case.slug}: variant has no nsys pass; skipped")
             continue
@@ -239,11 +243,7 @@ def _compare(args) -> int:
     if args.json:
         print(json.dumps(compare_module.as_json(comparison), indent=2, sort_keys=True))
     elif args.markdown:
-        print(
-            compare_module.render_markdown(
-                comparison, metric_specs(_acceptance_schemas(pack))
-            )
-        )
+        print(compare_module.render_markdown(comparison, metric_specs(_acceptance_schemas(pack))))
     else:
         print(compare_module.render_text(comparison), end="")
 
@@ -266,6 +266,7 @@ def _compare(args) -> int:
 
 # ── parser ───────────────────────────────────────────────────────────────────
 
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m launcher alignment-campaign",
@@ -281,7 +282,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--update-invariants",
         action="store_true",
         help="record a newly added trace in traces/invariants.json; never rewrites an "
-             "existing entry, so re-baselining stays a deliberate edit",
+        "existing entry, so re-baselining stays a deliberate edit",
     )
     check_command.set_defaults(handler=_check)
 

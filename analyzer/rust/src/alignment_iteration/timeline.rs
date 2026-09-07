@@ -37,22 +37,22 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use anyhow::{ensure, Context, Result};
+use anyhow::{Context, Result, ensure};
 use datafusion::prelude::SessionContext;
 use rayon::prelude::*;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::Path;
 
 use super::host::{self, HostWindow};
 use super::{
-    duty_cycle_recommendation, interval_union_ns, kernel_name_index, leaf_scales, load_inventory,
-    load_sim_cases, measure_iteration, measured_critical_path, measured_gpu_cycles_ms,
-    occurrence_ns, parsed_trace, physical_kernel_rows, pooled_gpu_time_multiplier, read_json,
-    screen_duty_cycle_outliers, single_iter_manifest, CaseMapDoc, CompiledInventory,
-    DutyCycleSample, IterationMeasurement, JsonlShardWriter, MeasuredIteration, SimCase,
+    CaseMapDoc, CompiledInventory, DutyCycleSample, IterationMeasurement, JsonlShardWriter,
+    MeasuredIteration, SimCase, duty_cycle_recommendation, interval_union_ns, kernel_name_index,
+    leaf_scales, load_inventory, load_sim_cases, measure_iteration, measured_critical_path,
+    measured_gpu_cycles_ms, occurrence_ns, parsed_trace, physical_kernel_rows,
+    pooled_gpu_time_multiplier, read_json, screen_duty_cycle_outliers, single_iter_manifest,
 };
 use crate::alignment_input;
-use crate::io::{read_cost_manifests, resolve_artifact_path, SCHEMA_VERSION};
+use crate::io::{SCHEMA_VERSION, read_cost_manifests, resolve_artifact_path};
 
 /// How many representatives the default selection names. Not a payload-size
 /// bound — the detail is sharded — but a curation one: a picker listing two
@@ -132,6 +132,59 @@ impl Selection {
     }
 }
 
+/// Freeze logical display-name ids before parallel iteration serialization.
+/// Physical capture ids remain unchanged; the no-physical-id sentinel must
+/// never reach a browser as an imprecise JavaScript number.
+struct TimelineNames {
+    dictionary: BTreeMap<u64, String>,
+    physical_ids: BTreeSet<u64>,
+    logical_ids: BTreeMap<String, u64>,
+}
+
+impl TimelineNames {
+    fn new(physical: &BTreeMap<u64, &str>, logical: BTreeSet<String>) -> Result<Self> {
+        const MAX_JSON_INTEGER: u64 = (1_u64 << 53) - 1;
+        ensure!(
+            physical.keys().all(|id| *id <= MAX_JSON_INTEGER),
+            "physical kernel name id exceeds JavaScript's exact integer range"
+        );
+        let mut dictionary: BTreeMap<_, _> = physical
+            .iter()
+            .map(|(id, name)| (*id, (*name).to_string()))
+            .collect();
+        let mut logical_ids = BTreeMap::new();
+        let mut candidate = 0;
+        for name in logical {
+            while dictionary.contains_key(&candidate) {
+                candidate += 1;
+            }
+            ensure!(candidate <= MAX_JSON_INTEGER, "timeline name ids exhausted");
+            dictionary.insert(candidate, name.clone());
+            logical_ids.insert(name, candidate);
+        }
+        Ok(Self {
+            dictionary,
+            logical_ids,
+            physical_ids: physical.keys().copied().collect(),
+        })
+    }
+
+    fn resolve(&self, source_id: u64, name: &str) -> Result<u64> {
+        if source_id == u64::MAX {
+            return self
+                .logical_ids
+                .get(name)
+                .copied()
+                .with_context(|| format!("unregistered logical kernel name {name:?}"));
+        }
+        ensure!(
+            self.physical_ids.contains(&source_id),
+            "unknown physical kernel name id {source_id}"
+        );
+        Ok(source_id)
+    }
+}
+
 pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)> {
     let input = alignment_input::read_kernel_align(log_dir)?;
     let measured = parsed_trace(&input.parsed_nsys)?;
@@ -182,7 +235,7 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
     // in case-map order, which is what `screen_duty_cycle_outliers` sums over,
     // so the pooled multiplier is bit-identical to the serial version. On a
     // 10,707-iteration capture this is the whole subject's cost.
-    let pass_one: Vec<(DutyCycleSample, IterationSummary)> = case_map
+    let pass_one: Vec<((DutyCycleSample, IterationSummary), BTreeSet<String>)> = case_map
         .cases
         .par_iter()
         .map(|joined| {
@@ -230,12 +283,22 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
                     measured_reduction.critical_path_ms,
                 ),
             };
-            Ok((sample, summary))
+            let logical_names = measurement
+                .kernels
+                .iter()
+                .filter(|(_, item)| item.name_id == u64::MAX)
+                .map(|(_, item)| item.name.clone())
+                .collect();
+            Ok(((sample, summary), logical_names))
         })
         .collect::<Vec<_>>()
         .into_iter()
         .collect::<Result<Vec<_>>>()?;
-    let (duty_cycle_samples, summaries): (Vec<_>, Vec<_>) = pass_one.into_iter().unzip();
+    let (samples_and_summaries, logical_names): (Vec<_>, Vec<_>) = pass_one.into_iter().unzip();
+    let (duty_cycle_samples, summaries): (Vec<_>, Vec<_>) =
+        samples_and_summaries.into_iter().unzip();
+    let timeline_names =
+        TimelineNames::new(&kernel_names, logical_names.into_iter().flatten().collect())?;
     ensure!(!summaries.is_empty(), "alignment case map is empty");
 
     // The pooled duty-cycle correction, over EVERY iteration — not just the ones
@@ -346,6 +409,7 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
                                 .as_ref()
                                 .and_then(|timeline| timeline.iteration(summary.iteration_id)),
                         }),
+                    &timeline_names,
                 )?;
                 Ok(TimelineOutput {
                     iteration_id: summary.iteration_id,
@@ -383,7 +447,12 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
         .collect();
     let kernel_name_dictionary: BTreeMap<String, &str> = used_name_ids
         .iter()
-        .filter_map(|id| kernel_names.get(id).map(|name| (id.to_string(), *name)))
+        .filter_map(|id| {
+            timeline_names
+                .dictionary
+                .get(id)
+                .map(|name| (id.to_string(), name.as_str()))
+        })
         .collect();
 
     // The cost manifest verbatim, so the renderer rebuilds the nested tree with
@@ -570,7 +639,7 @@ fn select_iterations(
     let mut priority = Vec::new();
     let mut rest = Vec::new();
     for entry in ordered {
-        if seen_types.insert(entry.0 .0) {
+        if seen_types.insert(entry.0.0) {
             priority.push(entry);
         } else {
             rest.push(entry);
@@ -678,6 +747,7 @@ fn build_iteration(
     measured_gpu_cycle_ms: Option<f64>,
     gpu_time_multiplier: Option<f64>,
     host_context: Option<HostContext<'_>>,
+    timeline_names: &TimelineNames,
 ) -> Result<BuiltIteration> {
     let mut used_name_ids: BTreeSet<u64> = BTreeSet::new();
     let simulated_gpu_cycle_ms = gpu_time_multiplier.map(|multiplier| sim.total_ms * multiplier);
@@ -702,12 +772,14 @@ fn build_iteration(
                 .keys()
                 .map(|identity| identity.name_id),
         );
+        let name_id = timeline_names.resolve(item.name_id, &item.name)?;
+        used_name_ids.insert(name_id);
         let mut launches: Vec<_> = item.launches.clone();
         launches.sort_by_key(|launch| (launch.device_id, launch.start_ns));
         kernel_rows.push(json!({
             "ph": item.phase,
             "row": item.row_id,
-            "name_id": item.name_id,
+            "name_id": name_id,
             "cat": item.category,
             "op": item.operation,
             "operation_ordinal": item.operation_ordinal,
@@ -1161,6 +1233,21 @@ fn definitions() -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn logical_timeline_names_are_exact_and_do_not_replace_physical_ids() {
+        let physical = std::collections::BTreeMap::from([(0, "a"), (2, "b")]);
+        let names = super::TimelineNames::new(
+            &physical,
+            std::collections::BTreeSet::from(["joined-ranks".to_string()]),
+        )
+        .unwrap();
+        assert_eq!(names.resolve(2, "b").unwrap(), 2);
+        let logical = names.resolve(u64::MAX, "joined-ranks").unwrap();
+        assert_eq!(logical, 1);
+        assert_eq!(names.dictionary[&logical], "joined-ranks");
+        assert!(names.resolve(logical, "missing physical id").is_err());
+        assert!(names.resolve(u64::MAX, "unregistered").is_err());
+    }
     use super::*;
 
     fn summary(iteration_id: u64, kind: &str, sequence: &str, relative: f64) -> IterationSummary {

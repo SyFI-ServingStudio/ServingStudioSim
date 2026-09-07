@@ -64,7 +64,7 @@
 //! as `batch::composition` (sum for partition-style, pick-one for replicate-style
 //! HP) — one group today (unified dense asserts a single HP group).
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 use std::path::Path;
 
@@ -80,6 +80,8 @@ use crate::session::{
     col, collect, column_f64, register_cost_log, register_if_exists, require_columns, value_f64,
     COST_LOG_TABLE,
 };
+
+mod speculative;
 
 /// cost_log columns this subject depends on (drift guard).
 const COST_COLS: &[&str] = &["pool_tag", "section", "layer", "groups"];
@@ -162,7 +164,29 @@ struct Expected {
     max_context_len: f64,
 }
 
+// Conservation follows the worker's execution contract, independent of model family.
+fn uses_speculative_worker(params: &Value) -> bool {
+    params
+        .get("pools")
+        .and_then(Value::as_object)
+        .is_some_and(|pools| {
+            pools.values().any(|pool| {
+                pool.get("groups")
+                    .and_then(Value::as_array)
+                    .is_some_and(|groups| {
+                        groups.iter().any(|group| group["worker"]["type"] == "speculative")
+                    })
+            })
+        })
+}
+
 pub async fn run_workload(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)> {
+    let params_path = resolve_artifact_path(log_dir, "params.json");
+    let mut speculative = false;
+    if params_path.is_file() {
+        let params: Value = serde_json::from_reader(std::fs::File::open(params_path)?)?;
+        speculative = uses_speculative_worker(&params);
+    }
     if !register_cost_log(ctx, log_dir).await? {
         let reason = "cost_log/ dir not found";
         return Ok((
@@ -185,9 +209,22 @@ pub async fn run_workload(ctx: &SessionContext, log_dir: &Path) -> Result<(Value
     let deployment = read_deployment(log_dir);
     let mode = WorkloadMode::from_deployment(deployment.as_deref());
     let actual = collect_actual(ctx, mode).await?;
-    let expected = collect_expected(ctx, mode, actual.num_layers).await?;
+    let mut expected = collect_expected(ctx, mode, actual.num_layers).await?;
 
-    let checks = checks_for_mode(mode, &actual, &expected);
+    let checks = if speculative {
+        match speculative::checks(ctx, &actual, &mut expected).await {
+            Ok(checks) => checks,
+            Err(error) => {
+                let reason = format!("speculative conservation unavailable: {error:#}");
+                return Ok((
+                    unavailable(log_dir, &reason),
+                    unavailable_payload(log_dir, &reason),
+                ));
+            }
+        }
+    } else {
+        checks_for_mode(mode, &actual, &expected)
+    };
     let all_ok = checks.iter().all(|c| c["status"] == "OK");
 
     let report = json!({
@@ -195,7 +232,7 @@ pub async fn run_workload(ctx: &SessionContext, log_dir: &Path) -> Result<(Value
         "meta": {
             "log_dir": log_dir.display().to_string(),
             "deployment": deployment.as_deref().unwrap_or("unknown"),
-            "mode": mode.label(),
+            "mode": if speculative { "speculative" } else { mode.label() },
             "num_iterations": actual.iters,
             "num_layers": actual.num_layers,
             "num_requests": expected.requests,
@@ -220,7 +257,7 @@ pub async fn run_workload(ctx: &SessionContext, log_dir: &Path) -> Result<(Value
             "log_dir": log_dir.display().to_string(),
             "available": true,
             "deployment": deployment.as_deref().unwrap_or("unknown"),
-            "mode": mode.label(),
+            "mode": if speculative { "speculative" } else { mode.label() },
             "tolerance_pct": TOLERANCE_PCT,
             "warn_pct": WARN_PCT,
             "all_ok": all_ok,
@@ -514,7 +551,7 @@ async fn collect_actual(ctx: &SessionContext, mode: WorkloadMode) -> Result<Actu
 /// labeler roofline needs (prefill KV read + request count). All fields are additive,
 /// so pool / cluster levels are plain rollups of this map. A rollup of every worker
 /// reproduces the run-wide conservation `actual`, which is the cross-check.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct WorkloadTotals {
     pub(crate) matmul_tokens: f64,             // Σ batch_tokens
     pub(crate) prefill_tokens: f64,            // Σ prefill_tokens
@@ -524,19 +561,21 @@ pub(crate) struct WorkloadTotals {
     pub(crate) decode_kv: f64, // Σ decode_kv_total               (= labeler decode pairs / cached)
     pub(crate) prefill_requests: f64, // Σ prefill chunk count (lm_head sampled positions)
     pub(crate) prefill_stateful_requests: f64, // Σ chunks with prefix > 0 (state read)
+    /// Raw group geometries and multiplicities; no model-specific work formulas.
+    pub(crate) speculative_geometry: BTreeMap<String, f64>,
 }
 
 /// One exact fixed-batch workload and the number of iterations with that shape.
 /// The labeler evaluates each distinct shape once; callers multiply its roofline
 /// result by `occurrences`, preserving batch boundaries without one subprocess row
 /// per iteration.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct WeightedWorkload {
     pub(crate) totals: WorkloadTotals,
     pub(crate) occurrences: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct WorkloadShape {
     matmul_tokens: u64,
     prefill_tokens: u64,
@@ -546,6 +585,7 @@ struct WorkloadShape {
     decode_kv: u64,
     prefill_requests: u64,
     prefill_stateful_requests: u64,
+    speculative_geometry: BTreeMap<String, u64>,
 }
 
 impl WorkloadShape {
@@ -562,6 +602,11 @@ impl WorkloadShape {
                 totals.prefill_stateful_requests,
                 "prefill_stateful_requests",
             )?,
+            speculative_geometry: totals
+                .speculative_geometry
+                .into_iter()
+                .map(|(geometry, count)| Ok((geometry, exact_count(count, "geometry count")?)))
+                .collect::<Result<_>>()?,
         })
     }
 
@@ -575,6 +620,11 @@ impl WorkloadShape {
             decode_kv: self.decode_kv as f64,
             prefill_requests: self.prefill_requests as f64,
             prefill_stateful_requests: self.prefill_stateful_requests as f64,
+            speculative_geometry: self
+                .speculative_geometry
+                .into_iter()
+                .map(|(geometry, count)| (geometry, count as f64))
+                .collect(),
         }
     }
 }
@@ -598,6 +648,12 @@ impl WorkloadTotals {
         self.decode_kv += other.decode_kv;
         self.prefill_requests += other.prefill_requests;
         self.prefill_stateful_requests += other.prefill_stateful_requests;
+        for (geometry, count) in &other.speculative_geometry {
+            *self
+                .speculative_geometry
+                .entry(geometry.clone())
+                .or_default() += count;
+        }
     }
 
     /// Replicate independent copies of one workload without changing sequence
@@ -612,6 +668,9 @@ impl WorkloadTotals {
         self.decode_kv *= factor;
         self.prefill_requests *= factor;
         self.prefill_stateful_requests *= factor;
+        for count in self.speculative_geometry.values_mut() {
+            *count *= factor;
+        }
     }
 }
 
@@ -814,7 +873,7 @@ pub(crate) async fn collect_workload_shapes_by_worker(
         }
         let shape = WorkloadShape::from_totals(totals)?;
         if prefill {
-            prefill_shapes.insert((worker_key, shape));
+            prefill_shapes.insert((worker_key, shape.clone()));
         }
         *occurrence_by_shape.entry((worker_key, shape)).or_default() += 1;
     }
@@ -822,7 +881,7 @@ pub(crate) async fn collect_workload_shapes_by_worker(
     let mut shapes_by_worker: HashMap<(u16, u16), Vec<WeightedWorkload>> = HashMap::new();
     let mut prefill_flags_by_worker: HashMap<(u16, u16), Vec<bool>> = HashMap::new();
     for ((worker_key, shape), occurrences) in occurrence_by_shape {
-        let prefill = prefill_shapes.contains(&(worker_key, shape));
+        let prefill = prefill_shapes.contains(&(worker_key, shape.clone()));
         prefill_flags_by_worker
             .entry(worker_key)
             .or_default()
@@ -885,8 +944,7 @@ fn carries_prefill(totals: &WorkloadTotals) -> bool {
 /// shape's prefill flag along so the two stay index-aligned.
 fn sort_shapes_with_flags(shapes: &mut [WeightedWorkload], prefill_flags: &mut [bool]) {
     let mut order: Vec<usize> = (0..shapes.len()).collect();
-    order.sort_by_key(|&index| {
-        let totals = shapes[index].totals;
+    let scalar_key = |totals: &WorkloadTotals| {
         (
             totals.matmul_tokens as u64,
             totals.prefill_tokens as u64,
@@ -897,10 +955,26 @@ fn sort_shapes_with_flags(shapes: &mut [WeightedWorkload], prefill_flags: &mut [
             totals.prefill_requests as u64,
             totals.prefill_stateful_requests as u64,
         )
+    };
+    order.sort_by(|&left, &right| {
+        let left = &shapes[left].totals;
+        let right = &shapes[right].totals;
+        scalar_key(left).cmp(&scalar_key(right)).then_with(|| {
+            left.speculative_geometry
+                .iter()
+                .map(|(key, count)| (key, count.to_bits()))
+                .cmp(
+                    right
+                        .speculative_geometry
+                        .iter()
+                        .map(|(key, count)| (key, count.to_bits())),
+                )
+        })
     });
-    let sorted_shapes: Vec<WeightedWorkload> = order.iter().map(|&index| shapes[index]).collect();
+    let sorted_shapes: Vec<WeightedWorkload> =
+        order.iter().map(|&index| shapes[index].clone()).collect();
     let sorted_flags: Vec<bool> = order.iter().map(|&index| prefill_flags[index]).collect();
-    shapes.copy_from_slice(&sorted_shapes);
+    shapes.clone_from_slice(&sorted_shapes);
     prefill_flags.copy_from_slice(&sorted_flags);
 }
 
@@ -951,6 +1025,7 @@ struct WorkloadGroupColumns<'a> {
     decode_kv: Vec<f64>,
     prefill_prefix_lists: &'a ListArray,
     prefill_append_lists: &'a ListArray,
+    speculative_geometry: Option<&'a StringArray>,
 }
 
 impl<'a> WorkloadGroupColumns<'a> {
@@ -962,11 +1037,28 @@ impl<'a> WorkloadGroupColumns<'a> {
             decode_kv: column_f64(field(groups, "decode_kv_total")?)?,
             prefill_prefix_lists: list_field(groups, "prefill_prefix_lens")?,
             prefill_append_lists: list_field(groups, "prefill_append_lens")?,
+            speculative_geometry: groups
+                .column_by_name("speculative_geometry")
+                .map(|column| {
+                    column
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .ok_or_else(|| anyhow!("speculative_geometry must be Utf8"))
+                })
+                .transpose()?,
         })
     }
 
     fn add_range(&self, elements: Range<usize>, totals: &mut WorkloadTotals) -> Result<()> {
         for element in elements {
+            if let Some(geometry) = self.speculative_geometry {
+                if !geometry.is_null(element) {
+                    *totals
+                        .speculative_geometry
+                        .entry(geometry.value(element).to_owned())
+                        .or_default() += 1.0;
+                }
+            }
             totals.matmul_tokens += self.batch_tokens[element];
             totals.prefill_tokens += self.prefill_tokens[element];
             totals.decode_passes += self.decode_requests[element];
@@ -1380,6 +1472,53 @@ mod tests {
     use super::*;
 
     #[test]
+    fn conservation_mode_follows_explicit_worker_not_model_name() {
+        for arch in ["glm52_vllm_nvfp4_dsa_moe_speculative", "another_model"] {
+            for worker in ["speculative", "chunked_prefill"] {
+                let params = json!({"pools": {"main": {"groups": [{
+                    "arch": {"type": arch}, "worker": {"type": worker}
+                }]}}});
+                assert_eq!(uses_speculative_worker(&params), worker == "speculative");
+            }
+        }
+        assert!(!uses_speculative_worker(&json!({})));
+        assert!(!uses_speculative_worker(&json!({"pools": {"main": {"groups": [{
+            "arch": {"type": "glm52_vllm_nvfp4_dsa_moe_speculative"}
+        }]}}})));
+    }
+
+    #[test]
+    fn conservation_mode_scans_all_pools_and_groups() {
+        let params = json!({"pools": {
+            "first": {"groups": [{"worker": {"type": "chunked_prefill"}}]},
+            "second": {"groups": [{}, {"worker": {"type": "speculative"}}]}
+        }});
+        assert!(uses_speculative_worker(&params));
+    }
+
+    #[tokio::test]
+    async fn speculative_run_requires_observed_work() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join("raw")).unwrap();
+        std::fs::write(
+            directory.path().join("raw/params.json"),
+            json!({
+                "pools": {"main": {"groups": [{
+                    "arch": {"type": "another_model"},
+                    "worker": {"type": "speculative", "draft_tokens": 5}
+                }]}}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let (report, _) = run_workload(&SessionContext::new(), directory.path())
+            .await
+            .unwrap();
+        assert_eq!(report["available"], false);
+        assert!(report.to_string().contains("cost_log/ dir not found"));
+    }
+
+    #[test]
     fn boundary_allowance_excludes_pending_and_completed_requests() {
         assert!(!contributes_boundary_allowance(false, 0.0));
         assert!(contributes_boundary_allowance(false, 1.0));
@@ -1581,6 +1720,7 @@ mod tests {
             decode_kv: 16.0,
             prefill_requests: 1.0,
             prefill_stateful_requests: 1.0,
+            ..WorkloadTotals::default()
         };
         totals.scale(1_000.0);
         assert_eq!(totals.matmul_tokens, 3_000.0);

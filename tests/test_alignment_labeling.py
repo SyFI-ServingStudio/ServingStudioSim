@@ -24,8 +24,41 @@ from alignment.labeling import (
     walk_kernels,
 )
 from alignment.labeling import cli as labeling_cli
-from alignment.labeling.rules import NO_NEIGHBOUR
+from alignment.labeling.rules import NO_NEIGHBOUR, label_body
 from launcher.alignment_config import load_labeled_kernel_sequences
+
+
+def test_unmapped_collective_rule_preserves_missing_simulator_owner():
+    from launcher.alignment_config import _validate_labeled_kernel
+
+    rule = Rule.from_mapping({
+        "name": "allreduce", "operation": "draft.embedding",
+        "status": "unmapped", "cross_rank": "synchronizing",
+        "phase": "draft", "after_name": "embedding", "before_name": "norm",
+    })
+    label = label_body(rule, [])
+    assert label == {
+        "status": "unmapped", "cross_rank": "synchronizing",
+        "collective": "draft.embedding",
+    }
+    operations, slots = {}, {}
+    kernel = {"name": "allreduce", "suggested_category": "all_reduce", "label": label}
+    _validate_labeled_kernel(kernel, "test", operations, slots)
+    assert operations == slots == {}
+    label["cross_rank"] = "independent"
+    with pytest.raises(ValueError, match="collective identity requires"):
+        _validate_labeled_kernel(kernel, "test", {}, {})
+
+
+@pytest.mark.parametrize("extra", [
+    {"slot_suffixes": ["embedding"]}, {"cross_rank": "independent"},
+])
+def test_unmapped_collective_rule_rejects_invented_mapping(extra):
+    with pytest.raises(ValueError, match="unmapped collective rules require"):
+        Rule.from_mapping({
+            "name": "allreduce", "operation": "draft.embedding",
+            "status": "unmapped", "cross_rank": "synchronizing", **extra,
+        })
 
 
 def _tracks(*programs: list[dict]) -> list[dict]:
@@ -360,6 +393,15 @@ def test_slots_ending_collects_every_layer_variant_and_rejects_a_stale_suffix():
     ]
     with pytest.raises(ValueError, match="no simulated slot"):
         slots_ending(SLOTS, "attention.renamed_away")
+
+
+def test_target_rule_does_not_absorb_matching_mtp_slots():
+    rule = Rule.from_mapping({
+        "name": "gemm", "operation": "target.head", "type": "model", "role": "target head",
+        "slot_suffixes": ["lm_head"], "excluded_slot_prefixes": ["unified.mtp."],
+    })
+    slots = [("unified.lm_head", "gemm"), ("unified.mtp.step_0.lm_head", "gemm")]
+    assert label_body(rule, slots)["simulated_slots"] == ["unified.lm_head"]
 
 
 def test_a_rule_chain_labels_the_reduce_that_follows_the_gemm_it_reduces(document):

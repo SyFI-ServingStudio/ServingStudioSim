@@ -7,13 +7,19 @@
 //! `llama3_dense` + `barebone`, `llama3_dense_tp` + `barebone`,
 //! `llama3_dp_attn_tp_ffn` + `hp_unified`, and `qwen3_moe_dp_attn_ep_ffn` +
 //! `hp_unified`, `glm52_dsa_moe` + `hp_unified`, and
-//! `glm52_vllm_nvfp4_dsa_moe` + either `hp_unified` or `chunked_prefill`, and
+//! `glm52_vllm_nvfp4_dsa_moe` + either `hp_unified` or `chunked_prefill`,
+//! `glm52_vllm_nvfp4_dsa_moe_speculative` + `speculative`, and
 //! `glm52_sglang_nvfp4_tp_dsa_moe` + `chunked_prefill`. GLM's TP1 local
 //! attention uses one independent KV/input partition per EP rank; the worker
 //! shells and mutable request/KV lifecycle are unchanged. Each wired arm
 //! monomorphizes its concrete model/worker pair and
 //! erases to `Box<dyn Flow>` — the single `dyn` point (the cost path is
 //! `dyn`-free, L4 §4.1).
+//!
+//! The speculative pair is the one arm whose model does not implement
+//! `IterwiseUnifiedModel` at all — it implements `SpeculativeUnifiedModel`
+//! instead — which is why neither `assemble_flow` nor `UnifiedWorkerFactory`
+//! names an L4 contract on `M`. The recipe each arm passes already does.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -22,7 +28,7 @@ use anyhow::{bail, ensure};
 
 use crate::arch::build as arch_build;
 use crate::arch::contract::IterwiseUnifiedModel;
-use crate::arch::IterArchSel;
+use crate::arch::{Glm52MtpMode, IterArchSel};
 use crate::common::{PoolId, SharedRequests};
 use crate::deployment::UnifiedConfig;
 use crate::orchestrator::common::WorkerBuildFn;
@@ -33,9 +39,9 @@ use crate::orchestrator::{
 use crate::timing::PerfApiBridge;
 use crate::worker::{
     build_barebone_worker, build_chunked_prefill_worker, build_hp_worker,
-    build_qwen36_hybrid_worker, resolve_prefix_cache_config, BatchPolicy, IterWorker,
-    IterWorkerSel, KvAdmissionConfig, PendingOrderKind, PrefixCacheMode, PrefixCachePolicy,
-    WorkerConfig,
+    build_qwen36_hybrid_worker, build_speculative_worker, resolve_prefix_cache_config, BatchPolicy,
+    IterWorker, IterWorkerSel, KvAdmissionConfig, PendingOrderKind, PrefixCacheMode,
+    PrefixCachePolicy, WorkerConfig,
 };
 
 use super::Deployment;
@@ -137,6 +143,27 @@ impl Deployment for UnifiedDeployment {
                     kv_admission,
                 )
             }
+            IterWorkerSel::Speculative {
+                attn_gpu_memory_gb,
+                max_batch_tokens,
+                batch_policy,
+                gpu_time_multiplier,
+                // Read by the two helpers below so this arm keeps the same
+                // bindings as its siblings. See `ssm_checkpoint_interval_tokens`.
+                ..
+            } => (
+                *attn_gpu_memory_gb,
+                *gpu_time_multiplier,
+                Some(*max_batch_tokens),
+                PendingOrderKind::Fifo,
+                PrefixCacheMode::Opportunistic,
+                PrefixCachePolicy::Lru,
+                None,
+                *batch_policy,
+                // Not a selector field: bounded-future predicts page crossings
+                // from single-token advance, which an accepted chain skips.
+                KvAdmissionConfig::FullFootprint,
+            ),
             IterWorkerSel::PdPrefill { .. } | IterWorkerSel::PdDecode { .. } => {
                 bail!("unified: pd_prefill / pd_decode workers belong to the `pd` deployment")
             }
@@ -160,6 +187,8 @@ impl Deployment for UnifiedDeployment {
             kv_admission,
             prefix_cache,
             ssm_checkpoint_interval_tokens: ssm_checkpoint_interval_tokens(&g.worker),
+            speculative_draft_tokens: speculative_draft_tokens(&g.worker),
+            speculative_acceptance_seed: speculative_acceptance_seed(&g.worker),
             ..WorkerConfig::default()
         };
 
@@ -474,6 +503,49 @@ impl Deployment for UnifiedDeployment {
                     &g.worker,
                 )
             }
+            IterArchSel::Glm52VllmNvfp4DsaMoeSpeculative {
+                ep_size,
+                nvl_num_gpu,
+                max_model_len,
+                routing,
+                routing_seed,
+                mtp_mode,
+                draft_tokens,
+                expert_popularity_file,
+                draft_expert_popularity_file,
+                ..
+            } => {
+                ensure_speculative(&g.worker, *draft_tokens)?;
+                ensure!(
+                    *mtp_mode != Glm52MtpMode::Off,
+                    "unified: a speculative GLM must run its MTP layer; mtp_mode=off \
+                     leaves it with nothing to draft with"
+                );
+                let model = Arc::new(arch_build::glm52_vllm_nvfp4_dsa_moe_speculative(
+                    model_spec,
+                    *ep_size,
+                    *nvl_num_gpu,
+                    *max_model_len,
+                    *routing,
+                    *routing_seed,
+                    *mtp_mode,
+                    expert_popularity_file.as_deref(),
+                    draft_expert_popularity_file.as_deref(),
+                    *draft_tokens,
+                    &gpu_name,
+                    MODEL_NAME,
+                    bridge,
+                )?);
+                Ok(assemble_flow(
+                    model,
+                    store,
+                    worker_config,
+                    log_dir,
+                    gpu_name,
+                    dp_cfg,
+                    build_speculative_worker,
+                ))
+            }
             IterArchSel::Glm52SglangNvfp4TpDsaMoe {
                 tp_size,
                 max_model_len,
@@ -566,6 +638,44 @@ fn ssm_checkpoint_interval_tokens(worker: &IterWorkerSel) -> Option<u32> {
     }
 }
 
+/// Draft candidate count, carried by the `speculative` selector only. Every other
+/// worker leaves it at `0`, which is what marks it as not speculating.
+fn speculative_draft_tokens(worker: &IterWorkerSel) -> u32 {
+    match worker {
+        IterWorkerSel::Speculative { draft_tokens, .. } => *draft_tokens,
+        _ => 0,
+    }
+}
+
+/// Which deterministic acceptance stream the speculative worker draws from.
+fn speculative_acceptance_seed(worker: &IterWorkerSel) -> Option<u64> {
+    match worker {
+        IterWorkerSel::Speculative {
+            acceptance_seed, ..
+        } => *acceptance_seed,
+        _ => None,
+    }
+}
+
+/// The speculative GLM arch pairs only with the speculative worker: it builds a
+/// different model type, so no other recipe can even name it.
+fn ensure_speculative(worker: &IterWorkerSel, arch_draft_tokens: u32) -> anyhow::Result<()> {
+    match worker {
+        IterWorkerSel::Speculative { draft_tokens, .. } => {
+            ensure!(
+                *draft_tokens == arch_draft_tokens,
+                "unified: worker draft_tokens={draft_tokens} must match the arch's \
+                 draft_tokens={arch_draft_tokens} — the width selects a profiled \
+                 kernel shape, so the two cannot differ"
+            );
+            Ok(())
+        }
+        other => {
+            bail!("unified: this speculative arch requires worker `speculative`, got {other:?}")
+        }
+    }
+}
+
 /// DP-attention and MoE archs run on the multi-group hp_unified worker.
 fn ensure_hp_unified(worker: &IterWorkerSel) -> anyhow::Result<()> {
     match worker {
@@ -636,7 +746,9 @@ fn assemble_flow<M, W>(
     build_fn: WorkerBuildFn<M, W>,
 ) -> Box<dyn Flow>
 where
-    M: IterwiseUnifiedModel,
+    // No L4 bound on `M`: `build_fn` already states the model contract its
+    // recipe needs, and the speculative recipe's model implements
+    // `SpeculativeUnifiedModel` rather than `IterwiseUnifiedModel`.
     W: IterWorker<Event = crate::worker::WorkerEventCommon> + 'static,
     W::Msg: From<crate::common::RequestId>,
 {
@@ -662,7 +774,10 @@ fn placement_into(p: PlacementPolicy) -> DpPlacementPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arch::{Glm52DsaMoeModel, Glm52VllmNvfp4DsaMoeModel, Qwen36LocalModel};
+    use crate::arch::{
+        Glm52DsaMoeModel, Glm52VllmNvfp4DsaMoeModel, Glm52VllmNvfp4DsaMoeSpeculativeModel,
+        Qwen36LocalModel,
+    };
     use crate::common::RequestId;
     use crate::worker::{ChunkedPrefillWorker, HpUnifiedWorker, WorkerEventCommon};
 
@@ -825,5 +940,106 @@ pools:
         assert_eq!((*ep_size, *nvl_num_gpu), (8, 8));
         assert_eq!(*mtp_mode, crate::arch::Glm52MtpMode::Off);
         ensure_hp_unified(&group.worker).expect("GLM hp_unified pairing is accepted");
+    }
+
+    fn speculative_worker(draft_tokens: u32) -> IterWorkerSel {
+        IterWorkerSel::Speculative {
+            attn_gpu_memory_gb: 180.0,
+            max_batch_tokens: 8192,
+            draft_tokens,
+            acceptance_seed: Some(7),
+            batch_policy: BatchPolicy::Mix,
+            gpu_time_multiplier: 1.0,
+        }
+    }
+
+    #[test]
+    fn the_speculative_pair_satisfies_the_iter_worker_contract() {
+        assert_iter_worker_contract::<
+            crate::worker::SpeculativeWorker<Glm52VllmNvfp4DsaMoeSpeculativeModel>,
+        >();
+        ensure_speculative(&speculative_worker(3), 3).expect("matching widths pair");
+    }
+
+    #[test]
+    fn a_verify_width_that_disagrees_with_the_arch_is_rejected_before_anything_is_built() {
+        // The defect this catches: the arch compiles a tree for k=3 while the
+        // worker submits k=5 rows. The model would reject the batch at runtime,
+        // deep inside an iteration, instead of at configuration time.
+        let error = ensure_speculative(&speculative_worker(5), 3)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("draft_tokens=5"));
+        assert!(error.contains("draft_tokens=3"));
+
+        let error = ensure_speculative(&chunked_prefill_worker(), 3)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("requires worker `speculative`"));
+    }
+
+    #[test]
+    fn a_speculative_preset_parses_into_the_paired_arch_and_worker() {
+        // Both selectors are new serde surfaces. This is the shape a preset
+        // author actually writes, so a rename or a missing `serde(default)`
+        // shows up here rather than at run time.
+        let yaml = r#"
+deployment: unified
+workload: { trace_files: ["trace/smoke.csv"], input_file_format: text-generation-independent, arrival_mode: trace_timed, session_dependency: independent, duration_ms: 1000.0, run_to_end: true, request_rate: 1.0 }
+io: { log_dir: "logs/test", log_level: info, quiet: true, force_cache_build: false, log_output_token_times: false }
+pools:
+  main:
+    placement: least-queued
+    groups:
+      - gpu: "NVIDIA B200"
+        replicas: 1
+        arch:
+          type: glm52_vllm_nvfp4_dsa_moe_speculative
+          model_config: model/config/glm52.json
+          fp8: false
+          ep_size: 4
+          nvl_num_gpu: 4
+          max_model_len: 8192
+          draft_tokens: 3
+        worker:
+          type: speculative
+          attn_gpu_memory_gb: 180.0
+          max_batch_tokens: 8192
+          draft_tokens: 3
+"#;
+        let cfg: crate::deployment::RunConfig =
+            serde_yaml::from_str(yaml).expect("speculative config parses");
+        let crate::deployment::RunConfig::Unified(cfg) = cfg else {
+            panic!("expected unified config")
+        };
+        let group = &cfg.pools.main.groups[0];
+        let IterArchSel::Glm52VllmNvfp4DsaMoeSpeculative {
+            draft_tokens,
+            mtp_mode,
+            max_model_len,
+            ..
+        } = &group.arch
+        else {
+            panic!("expected the speculative GLM arch")
+        };
+        assert_eq!((*draft_tokens, *max_model_len), (3, 8192));
+        // A speculative arch has to run its drafter, so unlike the ordinary
+        // selector it does not default `mtp_mode` to `off`.
+        assert_eq!(*mtp_mode, Glm52MtpMode::IndexShare);
+        ensure_speculative(&group.worker, *draft_tokens).expect("the pair is accepted");
+        assert_eq!(speculative_draft_tokens(&group.worker), 3);
+        assert_eq!(speculative_acceptance_seed(&group.worker), None);
+    }
+
+    #[test]
+    fn only_the_speculative_selector_carries_a_verify_width_or_an_acceptance_seed() {
+        // Every other worker must read as "not speculating"; a nonzero default
+        // would silently turn an ordinary recipe's assertion into a live width.
+        assert_eq!(speculative_draft_tokens(&speculative_worker(5)), 5);
+        assert_eq!(speculative_acceptance_seed(&speculative_worker(5)), Some(7));
+        for worker in [barebone_worker(), hp_worker(), chunked_prefill_worker()] {
+            assert_eq!(speculative_draft_tokens(&worker), 0);
+            assert_eq!(speculative_acceptance_seed(&worker), None);
+        }
     }
 }

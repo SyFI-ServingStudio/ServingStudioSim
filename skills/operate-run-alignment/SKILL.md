@@ -183,17 +183,17 @@ single-config path below when there is one workload and no matrix.
    against the CostTree, and writes `recommended_gpu_time_multiplier` into
    `reports/alignment_iteration_report.json`. This pass needs no DES simulation;
    fix the labeled source on failure, never the analyzer output.
-4. **Simulation** — ordinary VibeSim preset with the kernel-align multiplier
-   auto-injected:
+4. **Simulation** — ordinary VibeSim preset with explicit worker settings:
 
    ```bash
-   uv run python -m launcher alignment sim logs/<experiment>/simulation.yaml \
-     --gpu-time-multiplier-from logs/<experiment>/<kernel-align-analysis-dir>
+   uv run python -m launcher alignment sim logs/<experiment>/simulation.yaml
    ```
 
-   The launcher reads `recommended_gpu_time_multiplier` and overrides
-   `pools.main.groups.0.worker.gpu_time_multiplier`; confirm the printed override
-   and the value baked into the run's `params.json`. The longer wall time can
+   Kernel alignment is not a prerequisite. If adopting a reported recommendation,
+   set `worker.gpu_time_multiplier` in the preset explicitly and record its source
+   and any cross-workload reuse in experiment notes. Confirm the value baked into
+   the run's `params.json`; the launcher never reads a report to override it.
+   The longer wall time can
    change batching, TTFT, TPOT, E2E, and throughput. Require a complete artifact
    set before continuing.
 5. **e2e-align, render** — run `analyze` again with `workload`/`e2e` enabled (the

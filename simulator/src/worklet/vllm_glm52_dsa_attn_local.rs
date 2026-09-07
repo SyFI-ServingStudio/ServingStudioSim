@@ -813,11 +813,8 @@ fn validate_config(cfg: &VllmGlm52DsaAttnLocalWorkletConfig) -> Result<(), Strin
             "logits_row_stride {logits_row_stride} must be at least max_model_len {max_model_len}"
         ));
     }
-    if !matches!(cfg.decode_next_n, 1 | 2) {
-        return Err(format!(
-            "decode_next_n must be 1 or 2, got {}",
-            cfg.decode_next_n
-        ));
+    if cfg.decode_next_n == 0 {
+        return Err("decode_next_n must be positive".to_string());
     }
     for (name, actual, required) in [
         ("base_dtype", cfg.base_dtype, DType::Bf16),
@@ -1230,11 +1227,15 @@ mod tests {
     }
 
     #[test]
-    fn next_n_one_and_two_reach_both_compound_ops() {
-        for next_n in [1, 2] {
+    fn any_positive_next_n_reaches_both_compound_ops() {
+        // A k=5 draft verifies six rows per request. The width is forwarded to
+        // both compound ops unchanged; neither this worklet nor they treat six
+        // differently from two.
+        for next_n in [1, 2, 3, 6] {
             let r = VllmGlm52DsaAttnLocalWorklet::resolve_config(&cfg(true, next_n));
             assert_eq!(r.indexer.as_ref().unwrap().next_n, next_n);
             assert_eq!(r.sparse_mla.decode_next_n, next_n);
+            assert!(validate_config(&cfg(true, next_n)).is_ok());
         }
     }
 
@@ -1365,6 +1366,6 @@ mod tests {
             mutate(&mut config);
             assert!(validate_config(&config).is_err());
         }
-        assert!(validate_config(&cfg(true, 3)).is_err());
+        assert!(validate_config(&cfg(true, 0)).is_err());
     }
 }

@@ -46,6 +46,16 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     commands = parser.add_subparsers(dest="command", required=True)
 
+    prepare = commands.add_parser(
+        "prepare-workload", help="Build an explicitly observed-conditioned acceptance trace."
+    )
+    prepare.add_argument("--source-trace", type=Path, required=True)
+    prepare.add_argument("--profile-dir", type=Path, required=True)
+    prepare.add_argument("--output-trace", type=Path, required=True)
+    prepare.add_argument("--draft-tokens", type=int, required=True)
+    prepare.add_argument("--missing-acceptance", choices=["error", "run-aggregate"], required=True)
+    prepare.add_argument("--request-id-prefix", default="")
+
     sim = commands.add_parser("sim", help="Run the ordinary VibeSim simulation.")
     sim.add_argument("config", type=Path, help="Simulation preset YAML/JSON")
     sim.add_argument("--dry-run", action="store_true", help="Validate and expand only.")
@@ -55,16 +65,6 @@ def _build_parser() -> argparse.ArgumentParser:
         "--no-analyze",
         action="store_true",
         help="Skip the simulation's ordinary post-run analyzer.",
-    )
-    sim.add_argument(
-        "--gpu-time-multiplier-from",
-        type=Path,
-        default=None,
-        metavar="KERNEL_ALIGN_DIR",
-        help=(
-            "Kernel-align analysis dir; auto-injects its derived "
-            "recommended_gpu_time_multiplier into the worker as an override."
-        ),
     )
 
     profile = commands.add_parser(
@@ -173,24 +173,6 @@ def _preset_backends(preset: dict[str, Any]) -> dict[str, dict[str, list[str]]]:
             )
         nested.setdefault(pool, {})[role] = list(candidates)
     return nested
-
-
-def _read_recommended_multiplier(analysis_log_dir: Path) -> float:
-    """Read the duty-cycle multiplier the kernel-align pass derived from the
-    measured side (Σ measured_gpu_cycle_ms / Σ measured_ms)."""
-    report_path = analysis_log_dir / "reports" / "alignment_iteration_report.json"
-    if not report_path.is_file():
-        raise ValueError(
-            f"kernel-align report not found: {report_path}; run the kernel-align analyze first"
-        )
-    report = json.loads(report_path.read_text())
-    meta = report.get("meta") if isinstance(report, dict) else None
-    multiplier = meta.get("recommended_gpu_time_multiplier") if isinstance(meta, dict) else None
-    if not isinstance(multiplier, (int, float)) or isinstance(multiplier, bool) or multiplier < 1.0:
-        raise ValueError(
-            f"kernel-align report has no valid recommended_gpu_time_multiplier: {report_path}"
-        )
-    return float(multiplier)
 
 
 def _load_profile_result(profile_log_dir: Path) -> dict[str, Any]:
@@ -384,13 +366,10 @@ def _launch_simulation(
     build_type: str,
     refresh: bool,
     no_analyze: bool,
-    overrides: list[str] | None = None,
 ) -> int:
     from .__main__ import main as launcher_main
 
     argv = [str(path), "--build-type", build_type]
-    for override in overrides or []:
-        argv.extend(["--override", override])
     if dry_run:
         argv.append("--dry-run")
     if refresh:
@@ -423,20 +402,11 @@ def _launch_alignment_analysis(log_dir: Path, *, build_type: str, subjects: list
     if not analyzer_binary_path(build_type).is_file():
         print("[alignment] analyzer build failed", file=sys.stderr)
         return False
-    run_alignment_analysis(log_dir, build_type, subjects)
-    return True
+    return run_alignment_analysis(log_dir, build_type, subjects)
 
 
 def _run_sim(args: argparse.Namespace) -> int:
     preset = _load_simulation_preset(args.config)
-    overrides: list[str] = []
-    if args.gpu_time_multiplier_from is not None:
-        multiplier = _read_recommended_multiplier(args.gpu_time_multiplier_from)
-        overrides.append(f"pools.main.groups.0.worker.gpu_time_multiplier={multiplier}")
-        print(
-            f"[alignment] injecting worker.gpu_time_multiplier={multiplier} "
-            f"from kernel-align {args.gpu_time_multiplier_from}"
-        )
     print(f"[alignment] simulation: {args.config}")
     if not args.dry_run:
         io_config = preset.get("io")
@@ -453,7 +423,6 @@ def _run_sim(args: argparse.Namespace) -> int:
         build_type=args.build_type,
         refresh=args.refresh,
         no_analyze=args.no_analyze,
-        overrides=overrides,
     )
 
 
@@ -486,9 +455,7 @@ def _run_timing_predict(args: argparse.Namespace) -> int:
     config: TimingPredictPhaseConfig = load_timing_predict_config(args.config)
     write_artifact_kind(config.log_dir.parent, ArtifactKind.ALIGNMENT_BUNDLE)
     # Read the sim *preset* (not a completed run): timing-predict is kernel-only,
-    # so it needs the gpu / arch / backends but never a finished simulation. This
-    # lets it run before the sim, so kernel-align can derive the multiplier the
-    # sim then bakes in.
+    # so it needs the gpu / arch / backends but never a finished simulation.
     preset = _load_simulation_preset(config.simulation_preset)
     gpu, arch = _simulation_target(preset)
     profile_result = _load_profile_result(config.profile_log_dir)
@@ -545,6 +512,13 @@ def _run_compare(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     try:
+        if args.command == "prepare-workload":
+            from alignment.workload_input import prepare_workload
+
+            options = vars(args).copy()
+            options.pop("command")
+            print(json.dumps(prepare_workload(**options), indent=2))
+            return 0
         if args.command == "sim":
             return _run_sim(args)
         if args.command == "profile":

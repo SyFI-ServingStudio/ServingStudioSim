@@ -17,6 +17,7 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
 use crate::arch::config::{AttnArchSel, FfnArchSel, IterArchSel, ModelSpec, RoutingKind};
+use crate::arch::contract::SpeculativeUnifiedModel;
 use crate::arch::model_cfg::ModelCfg;
 use crate::arch::moe_model_cfg::MoeModelCfg;
 use crate::arch::{
@@ -28,12 +29,13 @@ use crate::arch::{
     DenseParallel, DenseTpParallel, DpAttnTpFfnParallel, FfnLayerwiseModel, Glm52DsaMoeModel,
     Glm52DsaMoeParallel, Glm52ModelCfg, Glm52MtpMode, Glm52SglangNvfp4TpDsaMoeModel,
     Glm52SglangNvfp4TpDsaMoeParallel, Glm52VllmDsaMoeModel, Glm52VllmDsaMoeParallel,
-    Glm52VllmNvfp4DsaMoeModel, Glm52VllmNvfp4DsaMoeParallel, IterwiseUnifiedModel,
-    Llama3DenseModel, Llama3DenseTpModel, Llama3DpAttnTpFfnModel, Qwen36LocalModel,
-    Qwen36LocalParallel, Qwen36ModelCfg, Qwen3AttnLayerwiseModel, Qwen3AttnParallel,
-    Qwen3FfnMoeLayerwiseModel, Qwen3FfnMoeParallel, Qwen3Fp8FfnMoeLayerwiseModel,
-    Qwen3Fp8FfnMoeParallel, Qwen3MoeDpAttnEpFfnModel, Qwen3MoeFp8DpAttnEpFfnModel,
-    Qwen3MoeFp8Parallel, Qwen3MoeParallel, Qwen3VllmMoeDpAttnEpFfnModel, Qwen3VllmMoeParallel,
+    Glm52VllmNvfp4DsaMoeModel, Glm52VllmNvfp4DsaMoeParallel, Glm52VllmNvfp4DsaMoeSpeculativeModel,
+    IterwiseUnifiedModel, Llama3DenseModel, Llama3DenseTpModel, Llama3DpAttnTpFfnModel,
+    Qwen36LocalModel, Qwen36LocalParallel, Qwen36ModelCfg, Qwen3AttnLayerwiseModel,
+    Qwen3AttnParallel, Qwen3FfnMoeLayerwiseModel, Qwen3FfnMoeParallel,
+    Qwen3Fp8FfnMoeLayerwiseModel, Qwen3Fp8FfnMoeParallel, Qwen3MoeDpAttnEpFfnModel,
+    Qwen3MoeFp8DpAttnEpFfnModel, Qwen3MoeFp8Parallel, Qwen3MoeParallel,
+    Qwen3VllmMoeDpAttnEpFfnModel, Qwen3VllmMoeParallel,
 };
 use crate::timing::routing::RoutingDistribution;
 use crate::timing::PerfApiBridge;
@@ -128,6 +130,8 @@ struct ExpertPopularityProfileV1 {
 struct ExpertPopularityProfile {
     schema_version: u32,
     model: String,
+    #[serde(default)]
+    model_role: Option<String>,
     num_moe_layers: u32,
     num_logical_experts: u32,
     expert_parallel_size: u16,
@@ -178,6 +182,26 @@ struct ExpertPopularityAggregationV3 {
 enum ExpertPopularityAggregation {
     V2(ExpertPopularityAggregationV2),
     V3(ExpertPopularityAggregationV3),
+    V4(ExpertPopularityAggregationV4),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExpertPopularityAggregationV4 {
+    scope: String,
+    observed_eplb_step_min: u64,
+    observed_eplb_step_max: u64,
+    record_count: u64,
+    raw_record_count: u64,
+    discarded_oversized_record_count: u64,
+    discarded_oversized_eplb_steps: Vec<u64>,
+    discarded_outside_replay_window_record_count: u64,
+    max_tokens_per_step: u64,
+    max_forwards_per_step: u64,
+    replay_start_monotonic_ns: u64,
+    replay_end_monotonic_ns: u64,
+    observed_monotonic_ns_min: u64,
+    observed_monotonic_ns_max: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -271,6 +295,7 @@ fn load_expert_popularity(
     ep_size: u16,
     expected_num_moe_layers: u32,
     expected_experts_per_token: u32,
+    expected_role: Option<&str>,
 ) -> Result<RoutingDistribution> {
     let profile_file =
         File::open(path).with_context(|| format!("opening expert popularity profile {path}"))?;
@@ -278,6 +303,16 @@ fn load_expert_popularity(
         .with_context(|| format!("parsing expert popularity profile {path}"))?;
     let version: ExpertPopularityVersion = serde_json::from_value(profile_value.clone())
         .with_context(|| format!("reading expert popularity schema_version from {path}"))?;
+    if let Some(role) = expected_role {
+        anyhow::ensure!(
+            version.schema_version == 4
+                && profile_value
+                    .get("model_role")
+                    .and_then(|value| value.as_str())
+                    == Some(role),
+            "expert popularity profile {path} requires schema v4 with model_role={role}"
+        );
+    }
 
     let (num_logical_experts, counts_by_layer, legacy_ratios) = match version.schema_version {
         1 => {
@@ -316,7 +351,7 @@ fn load_expert_popularity(
             };
             (profile.num_logical_experts, profile.counts_by_layer, ratios)
         }
-        2 | 3 => {
+        2 | 3 | 4 => {
             let profile: ExpertPopularityProfile = serde_json::from_value(profile_value)
                 .with_context(|| {
                     format!(
@@ -335,7 +370,7 @@ fn load_expert_popularity(
             (profile.num_logical_experts, profile.counts_by_layer, None)
         }
         other => bail!(
-            "unsupported expert popularity schema_version {} in {} (supported: 1 legacy, 2, 3)",
+            "unsupported expert popularity schema_version {} in {} (supported: 1 legacy, 2, 3, 4)",
             other,
             path
         ),
@@ -387,8 +422,16 @@ fn validate_expert_popularity(
     path: &str,
 ) -> Result<()> {
     anyhow::ensure!(
-        matches!(profile.schema_version, 2 | 3),
+        matches!(profile.schema_version, 2 | 3 | 4),
         "internal expert popularity version mismatch"
+    );
+    anyhow::ensure!(
+        if profile.schema_version == 4 {
+            matches!(profile.model_role.as_deref(), Some("target" | "draft"))
+        } else {
+            profile.model_role.is_none()
+        },
+        "expert popularity profile {path} has invalid model_role for its schema"
     );
     anyhow::ensure!(
         !profile.model.is_empty(),
@@ -441,6 +484,26 @@ fn validate_expert_popularity(
                 && aggregation.discarded_oversized_record_count
                     == aggregation.discarded_oversized_eplb_steps.len() as u64,
             "expert popularity profile {path} has invalid v3 aggregation metadata"
+        ),
+        (ExpertPopularityAggregation::V4(aggregation), 4) => anyhow::ensure!(
+            aggregation.scope == "replay_window_within_role_specific_token_ceiling"
+                && aggregation.record_count > 0
+                && aggregation.observed_eplb_step_min <= aggregation.observed_eplb_step_max
+                && aggregation.max_tokens_per_step > 0
+                && aggregation.max_forwards_per_step > 0
+                && (profile.model_role.as_deref() != Some("target")
+                    || aggregation.max_forwards_per_step == 1)
+                && aggregation.replay_start_monotonic_ns > 0
+                && aggregation.replay_start_monotonic_ns <= aggregation.observed_monotonic_ns_min
+                && aggregation.observed_monotonic_ns_min <= aggregation.observed_monotonic_ns_max
+                && aggregation.observed_monotonic_ns_max <= aggregation.replay_end_monotonic_ns
+                && u128::from(aggregation.raw_record_count)
+                    == u128::from(aggregation.record_count)
+                        + u128::from(aggregation.discarded_oversized_record_count)
+                        + u128::from(aggregation.discarded_outside_replay_window_record_count)
+                && aggregation.discarded_oversized_record_count
+                    == aggregation.discarded_oversized_eplb_steps.len() as u64,
+            "expert popularity profile {path} has invalid v4 aggregation metadata"
         ),
         _ => bail!(
             "expert popularity profile {path} schema_version does not match its aggregation shape"
@@ -580,6 +643,7 @@ pub fn resolve_routing_source(
             ep_size,
             num_moe_layers,
             experts_per_token,
+            None,
         );
     }
     Ok(resolve_routing(kind, seed, num_experts))
@@ -967,6 +1031,78 @@ pub fn glm52_vllm_nvfp4_dsa_moe(
         .context("building B200 GLM-5.2 NVFP4 model (often a missing profile.db row)")
 }
 
+/// Build the B200 GLM-5.2 NVFP4 target-verify graph with its MTP proposer.
+///
+/// The result is a different type from [`glm52_vllm_nvfp4_dsa_moe`]'s, not the
+/// same one with speculation switched on, so a deployment that binds it has
+/// committed to speculating.
+#[allow(clippy::too_many_arguments)]
+pub fn glm52_vllm_nvfp4_dsa_moe_speculative(
+    model_spec: &ModelSpec,
+    ep_size: u16,
+    nvl_num_gpu: u16,
+    max_model_len: u32,
+    routing_kind: RoutingKind,
+    routing_seed: Option<u64>,
+    mtp_mode: Glm52MtpMode,
+    expert_popularity_file: Option<&str>,
+    draft_expert_popularity_file: Option<&str>,
+    draft_tokens: u32,
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<Glm52VllmNvfp4DsaMoeSpeculativeModel> {
+    let model_cfg = glm52_model_cfg(model_spec).context("loading exact GLM-5.2 NVFP4 config")?;
+    anyhow::ensure!(
+        expert_popularity_file.is_some() == draft_expert_popularity_file.is_some(),
+        "speculative GLM requires target and draft expert popularity files together"
+    );
+    anyhow::ensure!(
+        expert_popularity_file.is_none() || routing_kind == RoutingKind::Uniform,
+        "profile-backed target/draft popularity requires routing=uniform"
+    );
+    let routing_for = |path: Option<&str>, layers, role| match path {
+        Some(path) => load_expert_popularity(
+            path,
+            model_cfg.num_experts.get(),
+            ep_size,
+            layers,
+            model_cfg.router_top_k,
+            Some(role),
+        ),
+        None => Ok(resolve_routing(
+            routing_kind,
+            routing_seed,
+            model_cfg.num_experts.get(),
+        )),
+    };
+    let target_routing = routing_for(
+        expert_popularity_file,
+        num_sparse_layers(&model_cfg),
+        "target",
+    )?;
+    let draft_routing = routing_for(draft_expert_popularity_file, 1, "draft")?;
+    let parallel = Glm52VllmNvfp4DsaMoeParallel {
+        ep_size,
+        nvl_num_gpu,
+        max_model_len,
+        gpu_name: gpu.to_string(),
+    };
+    let configs = glm52_vllm_nvfp4_dsa_moe::build_speculative_configs(
+        &model_cfg,
+        &parallel,
+        &target_routing,
+        &draft_routing,
+        model_spec.fp8,
+        mtp_mode,
+        draft_tokens,
+    )
+    .context("expanding speculative B200 GLM-5.2 NVFP4 architecture configs")?;
+    let resolved = glm52_vllm_nvfp4_dsa_moe::resolve_configs(&configs);
+    glm52_vllm_nvfp4_dsa_moe::build_speculative(name.to_string(), resolved, bridge)
+        .context("building speculative B200 GLM-5.2 NVFP4 model (often a missing profile.db row)")
+}
+
 /// Build SGLang's B200 GLM-5.2 NVFP4 graph under pure tensor parallelism.
 /// Routing is resolved at EP1 because every TP rank owns all experts.
 #[allow(clippy::too_many_arguments)]
@@ -1310,7 +1446,51 @@ pub fn build_iter_model(
             name,
             bridge,
         )?),
+        IterArchSel::Glm52VllmNvfp4DsaMoeSpeculative { .. } => {
+            bail!("timing-predict: use arch.speculative_iter for a speculative model")
+        }
     })
+}
+
+/// Build the speculative query contract without an L5 worker.
+pub fn build_speculative_iter_model(
+    selector: &IterArchSel,
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<(Box<dyn SpeculativeUnifiedModel>, u32)> {
+    match selector {
+        IterArchSel::Glm52VllmNvfp4DsaMoeSpeculative {
+            model,
+            ep_size,
+            nvl_num_gpu,
+            max_model_len,
+            routing,
+            routing_seed,
+            mtp_mode,
+            draft_tokens,
+            expert_popularity_file,
+            draft_expert_popularity_file,
+        } => Ok((
+            Box::new(glm52_vllm_nvfp4_dsa_moe_speculative(
+                model,
+                *ep_size,
+                *nvl_num_gpu,
+                *max_model_len,
+                *routing,
+                *routing_seed,
+                *mtp_mode,
+                expert_popularity_file.as_deref(),
+                draft_expert_popularity_file.as_deref(),
+                *draft_tokens,
+                gpu,
+                name,
+                bridge,
+            )?),
+            *draft_tokens,
+        )),
+        _ => bail!("timing-predict speculative_iter requires a speculative architecture"),
+    }
 }
 
 /// Build ONE AFD attn-side model from its selector, boxed as `dyn` — the
@@ -1597,6 +1777,46 @@ mod tests {
         .unwrap_err();
         assert!(format!("{error:#}").contains("invalid v3 aggregation metadata"));
 
+        let mut v4_profile = profile.clone();
+        v4_profile["schema_version"] = serde_json::json!(4);
+        v4_profile["model_role"] = serde_json::json!("target");
+        v4_profile["aggregation"] = serde_json::json!({
+            "scope": "replay_window_within_role_specific_token_ceiling",
+            "observed_eplb_step_min": 10,
+            "observed_eplb_step_max": 11,
+            "record_count": 2,
+            "raw_record_count": 4,
+            "discarded_oversized_record_count": 1,
+            "discarded_oversized_eplb_steps": [9],
+            "discarded_outside_replay_window_record_count": 1,
+            "max_tokens_per_step": 32,
+            "max_forwards_per_step": 1,
+            "replay_start_monotonic_ns": 100,
+            "replay_end_monotonic_ns": 200,
+            "observed_monotonic_ns_min": 110,
+            "observed_monotonic_ns_max": 190
+        });
+        let mut v4_file = tempfile::NamedTempFile::new().unwrap();
+        write!(v4_file, "{v4_profile}").unwrap();
+        let v4_path = v4_file.path().to_str().unwrap();
+        let target = load_expert_popularity(v4_path, 4, 2, 2, 2, Some("target")).unwrap();
+        assert_eq!(target.ppm(), routing.ppm());
+        let wrong_role = load_expert_popularity(v4_path, 4, 2, 2, 2, Some("draft")).unwrap_err();
+        assert!(format!("{wrong_role:#}").contains("model_role=draft"));
+        assert!(load_expert_popularity(profile_path, 4, 2, 2, 2, Some("target")).is_err());
+        v4_profile["aggregation"]["observed_monotonic_ns_max"] = serde_json::json!(201);
+        let mut outside_file = tempfile::NamedTempFile::new().unwrap();
+        write!(outside_file, "{v4_profile}").unwrap();
+        assert!(load_expert_popularity(
+            outside_file.path().to_str().unwrap(),
+            4,
+            2,
+            2,
+            2,
+            Some("target")
+        )
+        .is_err());
+
         let mut unknown_field_profile = profile;
         unknown_field_profile["unregulated"] = serde_json::json!(true);
         let mut invalid_file = tempfile::NamedTempFile::new().unwrap();
@@ -1654,6 +1874,37 @@ mod tests {
         assert_eq!(built.num_attn_dp_groups(), 1);
         assert_eq!(built.num_attn_shards(), 4);
         assert_eq!(built.cost_log_manifest().slots.len(), 474);
+    }
+
+    #[test]
+    fn speculative_glm52_builds_through_its_typed_predict_dispatch() {
+        let bridge = PerfApiBridge::new_uninit_for_test();
+        bridge.enable_enumerate();
+        let selector = IterArchSel::Glm52VllmNvfp4DsaMoeSpeculative {
+            model: glm52_model_spec(),
+            ep_size: 4,
+            nvl_num_gpu: 4,
+            max_model_len: 8192,
+            routing: RoutingKind::Uniform,
+            routing_seed: None,
+            mtp_mode: Glm52MtpMode::IndexShare,
+            draft_tokens: 5,
+            expert_popularity_file: None,
+            draft_expert_popularity_file: None,
+        };
+        let (built, drafts) =
+            build_speculative_iter_model(&selector, "NVIDIA B200", "test", &bridge)
+                .expect("build the speculative NVFP4 GLM");
+        assert_eq!(drafts, 5);
+        assert!(build_iter_model(&selector, "NVIDIA B200", "test", &bridge).is_err());
+
+        assert_eq!(built.gpus_per_replica(), 4);
+        assert_eq!(built.max_model_len(), 8_192);
+        // The target alone is 474 slots. A speculative iteration bills those
+        // plus five draft passes, so its cost log is a different shape and no
+        // consumer can read one as the other.
+        assert!(built.cost_log_manifest().slots.len() > 474);
+        assert_eq!(built.num_attn_shards(), 4);
     }
 
     #[test]

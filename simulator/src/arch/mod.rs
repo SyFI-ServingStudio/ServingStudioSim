@@ -28,7 +28,8 @@ pub mod qwen3_vllm_moe_dp_attn_ep_ffn;
 pub use config::{AttnArchSel, FfnArchSel, IterArchSel, ModelSpec, RoutingKind};
 pub use contract::{
     ArchGroupInput, AttnArchInput, AttnLayerwiseModel, FfnArchInput, FfnLayerwiseModel,
-    IterwiseUnifiedModel, UnifiedArchInput,
+    IterwiseUnifiedModel, SpeculativeArchGroupInput, SpeculativeArchInput, SpeculativeDecodeInput,
+    SpeculativeUnifiedModel, UnifiedArchInput,
 };
 pub use deepseek_v4_vllm::{
     DeepseekV4ModelCfg, DeepseekV4VllmConfigs, DeepseekV4VllmModel, DeepseekV4VllmParallel,
@@ -47,7 +48,7 @@ pub use glm52_vllm_dsa_moe::{
 };
 pub use glm52_vllm_nvfp4_dsa_moe::{
     Glm52VllmNvfp4DsaMoeConfigs, Glm52VllmNvfp4DsaMoeModel, Glm52VllmNvfp4DsaMoeParallel,
-    Glm52VllmNvfp4DsaMoeResolved,
+    Glm52VllmNvfp4DsaMoeResolved, Glm52VllmNvfp4DsaMoeSpeculativeModel,
 };
 pub use llama3_dense::{DenseParallel, Llama3DenseModel};
 pub use llama3_dense_tp::{DenseTpParallel, Llama3DenseTpModel};

@@ -258,7 +258,9 @@ pub struct GroupInput {
 /// inputs. Null row → empty vec. Struct field order is fixed by the sim writer
 /// (`simulator/src/log/rows.rs::build_groups_column`): 0 batch_tokens, 1
 /// prefill_tokens, 2 decode_request_count, 3 decode_kv_total, 4 prefill_prefix_lens
-/// (`List<UInt32>`), 5 prefill_append_lens (`List<UInt32>`).
+/// (`List<UInt32>`), 5 prefill_append_lens (`List<UInt32>`), 6 decode_query_rows.
+/// These indices are positional, so the writer appends new columns after the last
+/// one and never inserts. Field 6 is written but not read here yet.
 pub fn value_groups(array: &ArrayRef, row: usize) -> Result<Vec<GroupInput>> {
     let list = array
         .as_any()

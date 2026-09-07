@@ -37,6 +37,8 @@ different timelines and should not be hidden behind one giant FSM abstraction.
 |---|---|---|---|---|
 | `barebone` | `FullAttnKv` | `LocalPrefillDecodeAdmission<SessionStartOrder>` | `UnifiedIterExecution` | `IterBatchWorker` |
 | `hp_unified` | `FullAttnKv` with N partitions | `LocalPrefillDecodeAdmission<SessionStartOrder>` with prefix affinity then RR misses | `UnifiedIterExecution` | `IterBatchWorker` |
+| `chunked_prefill` | `FullAttnKv` with N partitions | `ChunkedPrefillAdmission<PendingOrder>` | `UnifiedIterExecution` | `IterBatchWorker` |
+| `speculative` | `FullAttnKv` with N partitions | `ChunkedPrefillAdmission<PendingOrder, SpeculativeDecodeCompletion>` | `SpeculativeIterExecution` | `IterBatchWorker` |
 | `pd_prefill` | `FullAttnKv` with held-KV ledger | `PrefillHandoffAdmission<SessionStartOrder>` | `UnifiedIterExecution` | `IterBatchWorker` |
 | `pd_decode` | `FullAttnKv` | thin inline landed-request ingress | `UnifiedIterExecution` | `PullDecodeWorker` |
 | `disagg_attn` | `FullAttnKv` | `FreshRequestSlotAdmission<SessionStartOrder>` | `AttentionLayerExecutionAdapter` | `SlotAttentionWorker` + private `AttentionSlotPipeline` |
@@ -164,6 +166,21 @@ one stable head through `peek`/`pop`:
 - `FreshRequestSlotAdmission<P>` implements AFD's two-level admission: enqueue
   into `P` first, then reserve fitting heads and hand them to the slot shell.
 
+`DecodeCompletion` is a sub-axis of the chunked-prefill lifecycle, not a second
+lifecycle: it owns only how far one resident decode moves per iteration.
+`SingleTokenDecodeCompletion` is the ordinary one-row-in/one-token-out engine.
+`SpeculativeDecodeCompletion` submits a fixed `draft_tokens + 1` verify window
+per resident request and retires the target's own token plus the leading run of
+accepted drafts, so its requests advance by different distances in the same
+iteration. Membership, capacity, and batch composition stay with the lifecycle;
+the query width it publishes is what sizes the mixed-iteration token budget and
+what the execution adapter lowers into the L4 input.
+
+Its acceptance draw is keyed by `(seed, request, tokens already emitted, draft
+position)` rather than drawn from one stream, so a request accepts the same
+chain no matter which requests it was batched with. Comparing two schedulers on
+one trace therefore measures the schedulers, not a reshuffled random stream.
+
 The lifecycle freezes `AdmissionCandidate` facts once at enqueue. Its
 `conversation_start_time` is a session's first trace-declared arrival, or the
 standalone request's own release. Production builders choose `SessionStartOrder`,
@@ -184,6 +201,20 @@ Execution owns the model, reusable input buffer shape, and `CostBuffers`:
   Multi-partition workers also retain the exact per-partition token vector for
   ragged EP communication; the execution adapter derives it from those same
   groups without changing placement.
+- `SpeculativeIterExecution` is its sibling for a model that implements
+  `SpeculativeUnifiedModel` instead of `IterwiseUnifiedModel`. It builds a
+  `SpeculativeArchInput`, whose decode side carries a `(kv_len, query_len)` pair
+  per request rather than one KV length: a verify pass submits `draft_tokens + 1`
+  rows per resident decode, so `decode_tokens` counts query rows and request
+  cardinality is no longer recoverable from it. The width is a worker-lifetime
+  constant because it selects a profiled kernel shape; how far a request actually
+  advances after the verify belongs to the lifecycle's `DecodeCompletion`, not
+  here.
+  The complete verify window must fit within `max_model_len`. A boundary batch
+  that requires fewer query rows fails explicitly; clipping only the context
+  would discard resident keys and invalidate necessary-work conservation.
+  vLLM can shorten these boundary batches, which this fixed-width model does
+  not yet represent.
 - `AttentionLayerExecutionAdapter` builds one slot's `AttnArchInput` and costs
   one attention layer.
 - `FfnSectionExecutionAdapter` splits token counts across FFN DP groups and
@@ -246,7 +277,11 @@ worker as the request's recorded location.
 Every concrete recipe is isolated in a `build_*_worker.rs` file. Repeated
 allocation/capacity/sampler/cost setup lives in a family-neutral or
 family-private essentials helper, while the recipe visibly selects its concrete
-KV, admission, execution, and shell.
+KV, admission, execution, and shell. The whole-iteration helper
+(`workers/iter_build_essentials.rs`) takes plain model facts — GPUs per replica,
+attention shard count, KV bytes per token, cost manifest — instead of a model
+handle, so it names no L4 model trait and cannot select an execution adapter. It
+returns the `CostBuffers`; the recipe wraps them.
 
 Deployments and pool controllers only call those recipes:
 

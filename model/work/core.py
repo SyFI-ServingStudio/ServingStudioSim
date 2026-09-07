@@ -105,6 +105,9 @@ class AttnInteraction:
     # Optional semantic phase used only for independent per-location accounting.
     # It never affects attention math.
     phase: str | None = None
+    # Equal independent interactions can be counted without expanding a run's
+    # histogram into one Python object per request and iteration.
+    multiplicity: float = 1
 
     def pairs(self) -> float:
         """(query, key) pairs actually computed. Causal uses the exact triangle."""
@@ -112,9 +115,9 @@ class AttnInteraction:
         if self.mask == "causal":
             # queries sit at the end of the sequence: query i attends to
             # (num_cached_key + i + 1) keys, summed over i in [0, q) -> q*(k - (q-1)/2).
-            return q * (k - (q - 1) / 2.0)
+            return self.multiplicity * q * (k - (q - 1) / 2.0)
         if self.mask in ("full", "cross"):
-            return float(q * k)
+            return self.multiplicity * float(q * k)
         raise ValueError(f"unknown attention mask {self.mask!r}")
 
 
@@ -140,6 +143,14 @@ class Workload:
     # analyzer payloads cannot carry this axis, so zero is the conservative legacy
     # default: never invent a compulsory state read that was not observed.
     prefill_stateful_requests: int = 0
+    # Extra passes this forward runs over layers the main body does not, keyed by
+    # the :attr:`LayerStack.stage` that consumes them — a speculative proposer's
+    # draft passes today. Each value is an ordinary ``Workload`` describing that
+    # stage's own rows and attention geometry, because a draft pass forwards a
+    # different number of rows than the body it drafts for. A stage with no entry
+    # here did not run: its stacks contribute no segments, no parameters, and no
+    # bytes, which is what keeps a non-speculative label byte-identical.
+    stages: dict[str, Workload] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         value = self.prefill_stateful_requests
@@ -148,7 +159,11 @@ class Workload:
 
     @property
     def num_attention_steps(self) -> int:
-        return len(self.attn) if self.attention_step_count is None else self.attention_step_count
+        return (
+            sum(i.multiplicity for i in self.attn)
+            if self.attention_step_count is None
+            else self.attention_step_count
+        )
 
     @classmethod
     def causal_lm(
@@ -235,12 +250,15 @@ class Workload:
                 phase_tokens = (
                     self.attention_tokens_by_phase.get(phase, 0)
                     if self.attention_tokens_by_phase is not None
-                    else sum(interaction.num_query for interaction in interactions)
+                    else sum(
+                        interaction.num_query * interaction.multiplicity
+                        for interaction in interactions
+                    )
                 )
                 phase_steps = (
                     self.attention_step_count_by_phase.get(phase, 0)
                     if self.attention_step_count_by_phase is not None
-                    else len(interactions)
+                    else sum(interaction.multiplicity for interaction in interactions)
                 )
             partitions.append(
                 (
@@ -528,12 +546,36 @@ class LayerStack:
     linear + full attention) has one stack per archetype. ``tag`` prefixes this stack's
     segment names so the archetypes stay distinct in the per-op table — it is empty for
     uniform models, keeping their segment names bare (``qkv``, ``attn``, …).
+
+    ``stage`` names the :attr:`Workload.stages` entry this stack runs against.
+    ``None`` — the default — is the main body, which every forward runs. A named
+    stage runs only when the workload carries it, so a checkpoint's optional
+    layers (a speculative proposer's) can live in the same model without charging
+    a workload that never touched them.
+
+    ``extra_matmuls`` carries per-layer projections that belong to neither the
+    attention nor the FFN — the MTP layer's ``eh_proj`` is the only one today.
+
+    ``count`` is how many times these weights are *traversed*, which is what byte
+    traffic and FLOPs scale with. ``param_count`` is how many distinct copies of
+    them the checkpoint holds, and defaults to ``count`` because a stack normally
+    means that many separate layers. Set it to zero for a stack that is another
+    pass over weights an earlier stack already counted: the recurrent draft steps
+    re-enter the one MTP layer, so they re-read it (they are serially dependent,
+    so no implementation can fuse the reads) without adding parameters.
     """
 
     attn: AttentionSpec
     ffn: FFNSpec
     count: int
     tag: str = ""
+    stage: str | None = None
+    extra_matmuls: list[MatmulGroup] = field(default_factory=list)
+    param_count: int | None = None
+
+    @property
+    def distinct_instances(self) -> int:
+        return self.count if self.param_count is None else self.param_count
 
 
 @dataclass
@@ -543,12 +585,19 @@ class LearnedWeightGroup:
     The global lower bound permits surrounding activations to remain on-chip, but a
     learned vector still must be read.  ``breakdown`` assigns its parameter identity;
     the group intentionally contributes no irreducible activation FLOPs.
+
+    ``count`` / ``param_count`` split traversals from distinct copies exactly as
+    :class:`LayerStack` does.
     """
 
     name: str
     elements: int
     count: int
     breakdown: str = "norm"
+    param_count: int | None = None
+    #: Same meaning as :attr:`LayerStack.stage`: a group naming a stage the
+    #: workload does not run is not read, so it is not billed.
+    stage: str | None = None
 
 
 # Existing builders use the more specific historical name.
@@ -586,7 +635,11 @@ class Model:
 
     @property
     def num_layers(self) -> int:
-        return sum(stack.count for stack in self.layers)
+        """Distinct decoder layers the main body runs — the config's
+        ``num_hidden_layers``. Staged stacks are excluded: they are optional
+        layers past the body (an MTP proposer's), and a stack that re-enters one
+        of them contributes no layer of its own."""
+        return sum(stack.distinct_instances for stack in self.layers if stack.stage is None)
 
     def weight_bytes_per_instance(self, group: MatmulGroup) -> float:
         """HBM bytes for ONE instance of ``group``'s matrix, at its stored precision.
@@ -645,7 +698,16 @@ class Model:
         )
 
     def label(self, wl: Workload) -> WorkLabel:
-        tokens = wl.matmul_tokens
+        # A workload naming a stage no stack runs would silently contribute an
+        # output-projection row with nothing behind it, so it is a caller bug
+        # rather than an empty result.
+        declared = {stack.stage for stack in self.layers if stack.stage is not None}
+        undeclared = sorted(set(wl.stages) - declared)
+        if undeclared:
+            raise ValueError(
+                f"{self.name}: workload carries stage(s) {undeclared} that no layer stack runs"
+            )
+
         segments: list[Segment] = []
         breakdown = empty_breakdown()
         activated_params = 0
@@ -656,9 +718,22 @@ class Model:
         # A weight matmul computes 2·T·N·K FLOPs and reads its matrix from HBM once (only
         # the hit expert subset for a routed group). The stack ``tag`` prefixes segment
         # names so a hybrid model's archetypes stay distinct in the per-op table.
+        #
+        # A staged stack is labelled against its own sub-workload and skipped
+        # entirely when this forward did not run that stage — parameters and
+        # bytes accumulate inside this loop, so skipping the stack is also what
+        # keeps its weights out of the totals.
         for stack in self.layers:
+            stack_wl = wl if stack.stage is None else wl.stages.get(stack.stage)
+            if stack_wl is None:
+                continue
+            tokens = stack_wl.matmul_tokens
             prefix = f"{stack.tag}." if stack.tag else ""
-            for group in (*stack.attn.matmul_groups(), *stack.ffn.matmul_groups()):
+            for group in (
+                *stack.attn.matmul_groups(),
+                *stack.ffn.matmul_groups(),
+                *stack.extra_matmuls,
+            ):
                 loaded = group.loaded_instances(tokens)
                 segments.append(
                     Segment(
@@ -671,9 +746,10 @@ class Model:
                         compute_dtype=self.matmul_compute_dtype(group),
                     )
                 )
-                activated_params += group.activated_params * stack.count
-                total_params += group.total_params * stack.count
-                breakdown[_PARAM_BUCKET[group.bucket]] += group.total_params * stack.count
+                instances = stack.distinct_instances
+                activated_params += group.activated_params * instances
+                total_params += group.total_params * instances
+                breakdown[_PARAM_BUCKET[group.bucket]] += group.total_params * instances
 
             for component in (stack.attn, stack.ffn):
                 for weight in getattr(component, "learned_weight_groups", lambda: [])():
@@ -688,7 +764,7 @@ class Model:
                             compute_dtype=self.master_dtype,
                         )
                     )
-                    params = weight.elements * stack.count
+                    params = weight.elements * stack.distinct_instances
                     activated_params += params
                     total_params += params
                     breakdown[weight.breakdown] += params
@@ -698,7 +774,7 @@ class Model:
             # cache writes); older specs retain the historical fused rows.
             custom_semantics = getattr(stack.attn, "semantic_segments", None)
             if custom_semantics is not None:
-                for semantic in custom_semantics(wl):
+                for semantic in custom_semantics(stack_wl):
                     segments.append(
                         Segment(
                             name=f"{prefix}{semantic.name}",
@@ -716,7 +792,9 @@ class Model:
             else:
                 phase_compute_dtype = getattr(stack.attn, "phase_compute_dtype", None)
                 attention_phases = (
-                    wl.attention_phases() if stack.attn.split_attention_phases else [(None, wl)]
+                    stack_wl.attention_phases()
+                    if stack.attn.split_attention_phases
+                    else [(None, stack_wl)]
                 )
                 for phase, phase_workload in attention_phases:
                     phase_suffix = f".{phase}" if phase is not None else ""
@@ -735,7 +813,7 @@ class Model:
                             compute_dtype=mechanism_dtype or self.master_dtype,
                         )
                     )
-                cache_write_bytes = stack.attn.cache_write_bytes(wl)
+                cache_write_bytes = stack.attn.cache_write_bytes(stack_wl)
                 if cache_write_bytes > 0.0:
                     segments.append(
                         Segment(
@@ -756,6 +834,8 @@ class Model:
         # FP8 quantizes 2-D matrices, and both GLM-5.2-FP8 and Qwen3-235B-FP8 list
         # every layernorm in `modules_to_not_convert`.
         for norm_weight in self.norm_weights:
+            if norm_weight.stage is not None and norm_weight.stage not in wl.stages:
+                continue
             segments.append(
                 Segment(
                     name=norm_weight.name,
@@ -767,7 +847,9 @@ class Model:
                     compute_dtype=self.master_dtype,
                 )
             )
-            norm_params = norm_weight.elements * norm_weight.count
+            norm_params = norm_weight.elements * (
+                norm_weight.count if norm_weight.param_count is None else norm_weight.param_count
+            )
             activated_params += norm_params
             total_params += norm_params
             breakdown[norm_weight.breakdown] += norm_params
@@ -792,7 +874,7 @@ class Model:
                 bucket="embedding",
                 byte_kind="weights",
                 flops=0.0,
-                bytes=min(tokens, self.vocab) * self.hidden * self.weight_dtype_bytes,
+                bytes=min(wl.matmul_tokens, self.vocab) * self.hidden * self.weight_dtype_bytes,
                 count=1,
                 compute_dtype=self.master_dtype,
             )
@@ -816,6 +898,27 @@ class Model:
                 compute_dtype=self.matmul_compute_dtype(lm_head_group),
             )
         )
+
+        # A stage that samples runs the output projection over its own rows, on a
+        # launch of its own. The FLOPs are compulsory; the bytes are not, because
+        # the stage shares the model's head weights (GLM-5.2's MTP layer holds a
+        # `shared_head`, tied to `lm_head`) and F_min's read-once convention
+        # already charged that matrix above. A stage with its own untied head
+        # would need its own weight row — none exists today.
+        for stage_name, stage_wl in sorted(wl.stages.items()):
+            if stage_wl.head_positions <= 0:
+                continue
+            segments.append(
+                Segment(
+                    name=f"{stage_name}.lm_head",
+                    bucket="lm_head",
+                    byte_kind="weights",
+                    flops=2.0 * stage_wl.head_positions * self.hidden * self.vocab,
+                    bytes=0.0,
+                    count=1,
+                    compute_dtype=self.matmul_compute_dtype(lm_head_group),
+                )
+            )
 
         # --- roll segments up into the aggregate FLOP / byte buckets ---
         flops = empty_flops()

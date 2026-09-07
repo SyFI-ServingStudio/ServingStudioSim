@@ -913,6 +913,23 @@ fn prediction_catalog_is_first_class_and_does_not_create_a_run() {
     assert!(descriptor.get("deployment").is_none());
 }
 
+#[test]
+fn speculative_prediction_remains_discoverable_as_a_prediction() {
+    let temporary = TempDir::new().unwrap();
+    let path = temporary.path().join("spec5");
+    make_prediction(&path, "p_spec5");
+    let metadata_path = path.join("prediction.meta.json");
+    let mut metadata: Value = serde_json::from_slice(&fs::read(&metadata_path).unwrap()).unwrap();
+    metadata["selector"] = json!("speculative_iter");
+    metadata["arch_type"] = json!("glm52_vllm_nvfp4_dsa_moe_speculative");
+    fs::write(metadata_path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+    let roots = configure_logs_roots(vec![temporary.path().to_path_buf()]).unwrap();
+    let catalog = serde_json::to_value(build_prediction_catalog(&roots).unwrap()).unwrap();
+    assert_eq!(catalog["predictions"][0]["selector"], "speculative_iter");
+    assert!(resolve_prediction(&roots, "p_spec5").is_ok());
+    assert!(discover_runs(&roots).unwrap().is_empty());
+}
+
 #[tokio::test]
 async fn prediction_http_routes_publish_catalog_descriptor_cases_and_problem_json() {
     let temporary = TempDir::new().expect("temporary logs root");

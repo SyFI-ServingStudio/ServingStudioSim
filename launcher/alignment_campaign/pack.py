@@ -124,6 +124,7 @@ class ProfilePass:
     kind: str
     name: str
     trace: str
+    warmup: bool = False
 
 
 @dataclass(frozen=True)
@@ -182,6 +183,8 @@ class Case:
     attn_gpu_memory_gb: Calibrated
     rate: Calibrated | None
     provenance: dict[str, Any]
+    chunk_size: int | None = None
+    speculative_acceptance: Calibrated | None = None
 
     @property
     def slug(self) -> str:
@@ -194,6 +197,8 @@ class Case:
         found = {"attn_gpu_memory_gb": self.attn_gpu_memory_gb}
         if self.rate is not None:
             found["rate"] = self.rate
+        if self.speculative_acceptance is not None:
+            found["speculative_acceptance"] = self.speculative_acceptance
         return found
 
     def trace_for(self, role: str) -> TraceSpec:
@@ -372,6 +377,7 @@ def _variant(name: str, raw: Any) -> Variant:
         kind = _typed(_require(entry, "kind", pass_where), str, f"{pass_where}.kind")
         pass_name = _typed(_require(entry, "name", pass_where), str, f"{pass_where}.name")
         trace = _typed(_require(entry, "trace", pass_where), str, f"{pass_where}.trace")
+        warmup = _typed(entry.pop("warmup", False), bool, f"{pass_where}.warmup")
         _reject_extra(entry, pass_where)
         if kind not in PROFILE_KINDS:
             raise PackError(
@@ -381,7 +387,7 @@ def _variant(name: str, raw: Any) -> Variant:
             raise PackError(
                 f"{pass_where}.trace must be one of {sorted(TRACE_ROLES)}, got {trace!r}"
             )
-        passes.append(ProfilePass(kind=kind, name=pass_name, trace=trace))
+        passes.append(ProfilePass(kind=kind, name=pass_name, trace=trace, warmup=warmup))
 
     # `tokenizer` defaults to `checkpoint`: for every alignment run so far the
     # tokenizer ships inside the checkpoint directory, and repeating the key
@@ -430,6 +436,8 @@ def _case(raw: Any, index_hint: int) -> Case:
     where = f"cases[{case_index:02d}_{name}]"
 
     max_concurrency_raw = body.pop("max_concurrency", None)
+    chunk_size_raw = body.pop("chunk_size", None)
+    acceptance_raw = body.pop("speculative_acceptance", None)
     rate_raw = body.pop("rate", None)
     kernel_raw = body.pop("kernel_trace", None)
     window_raw = body.pop("analyze_iterations", None)
@@ -493,8 +501,20 @@ def _case(raw: Any, index_hint: int) -> Case:
         ),
         rate=(None if rate_raw is None else _calibrated(rate_raw, f"{where}.rate")),
         provenance=dict(body.pop("provenance", {}) or {}),
+        chunk_size=None if chunk_size_raw is None else _typed(chunk_size_raw, int, f"{where}.chunk_size"),
+        speculative_acceptance=None if acceptance_raw is None else _calibrated(
+            acceptance_raw, f"{where}.speculative_acceptance"
+        ),
     )
     _reject_extra(body, where)
+    if case.chunk_size is not None and case.chunk_size <= 0:
+        raise PackError(f"{where}.chunk_size must be positive")
+    if case.speculative_acceptance is not None:
+        probabilities = case.speculative_acceptance.value
+        if not isinstance(probabilities, list) or not probabilities or any(
+            type(value) not in (int, float) or not 0 <= value <= 1 for value in probabilities
+        ):
+            raise PackError(f"{where}.speculative_acceptance.value must be a non-empty probability list")
 
     # The two arrival vocabularies are separate spellings of one decision, and a
     # config that disagrees with itself produces a simulation of a different

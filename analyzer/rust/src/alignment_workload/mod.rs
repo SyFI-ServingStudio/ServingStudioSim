@@ -183,8 +183,8 @@ fn read_measured_points(
             record.iteration_index
         );
         ensure!(
-            record.schema_version == 2,
-            "alignment-workload requires schema-v2 full-run metrics with host-monotonic timestamps; got schema_version {} at iteration {}",
+            (2..=4).contains(&record.schema_version),
+            "alignment-workload requires schema-v2/v3/v4 full-run metrics with host-monotonic timestamps; got schema_version {} at iteration {}",
             record.schema_version,
             record.iteration_index
         );
@@ -732,6 +732,28 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![1200, 1201]
         );
+    }
+
+    #[test]
+    fn speculative_metric_versions_preserve_request_count_and_resident_kv() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("metrics.jsonl");
+        for version in [3, 4] {
+            let row = json!({
+                "schema_version": version, "input_adapter": "vllm_text",
+                "iteration_index": 7, "prefill_tokens": 0,
+                "decode_requests": 2, "decode_tokens_scheduled": 12,
+                "decode_kv_lens": [100, 200], "decode_query_lens": [6, 6],
+                "prefill_chunk_pairs": [],
+                "observed_start_monotonic_ns": 100,
+                "observed_end_monotonic_ns": 200,
+                "observed_elapsed_ms": 0.0001
+            });
+            fs::write(&path, format!("{row}\n")).unwrap();
+            let points = read_measured_points(&path, None, None).unwrap();
+            assert_eq!(points[0].decode_batch_size, 2);
+            assert_eq!(points[0].scheduled_kv_tokens, 300);
+        }
     }
 
     #[test]

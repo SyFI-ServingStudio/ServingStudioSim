@@ -7,20 +7,70 @@ evidence; their comparison policies remain separate.
 
 The framework-to-simulator path is an explicit phased workflow; each phase has
 one config and one disjoint artifact root. The
-GPU-cycle duty-cycle correction (`gpu_time_multiplier`) is a pure measured
-quantity: the analyzer's **kernel-align** pass derives it before the simulation,
-and the simulation phase injects it automatically. So `analyze` splits into two
-semantic passes that bracket the simulation:
+GPU-cycle duty-cycle correction (`gpu_time_multiplier`) is an explicit worker
+setting. The analyzer's **kernel-align** pass can recommend a measured value;
+simulation runs independently using its preset. `analyze` has separate kernel
+and request E2E passes:
 
 ```text
 profile.yaml ─────── alignment profile ──────────────→ profile/
 timing_predict.yaml ─ alignment timing-predict ──────→ timing_predict/   (reads simulation.yaml preset)
 analyze_kernel.yaml ─ alignment analyze (kernel-align)→ analysis_kernel/  (emits recommended_gpu_time_multiplier)
-simulation.yaml ──── alignment sim ──────────────────→ simulation/        (auto-injects the multiplier)
+simulation.yaml ──── alignment sim ──────────────────→ simulation/        (uses explicit worker settings)
 analyze_e2e.yaml ─── alignment analyze (e2e-align) ──→ analysis_e2e/      (consumes the completed sim)
 ```
 
 No phase implicitly launches the next one. YAML and JSON are both accepted.
+
+## Observed-Conditioned Workload Inputs
+
+For an independent CSV workload, explicitly prepare per-request acceptance
+probabilities from its complete `workload_metrics` pass:
+
+```bash
+uv run python -m launcher alignment prepare-workload \
+  --source-trace logs/<experiment>/trace.csv \
+  --profile-dir logs/<experiment>/profile_workload \
+  --output-trace logs/<experiment>/trace_observed.csv \
+  --draft-tokens 5 --missing-acceptance run-aggregate \
+  --request-id-prefix independent_
+```
+
+Depth and missing-sample policy are required. `error` rejects any unobserved
+conditional probability; `run-aggregate` uses observed counts pooled across
+this same request population, and still rejects positions with no evidence.
+The ID prefix is explicit (default empty), not inferred from model names.
+The command validates request IDs, declared arrivals, lengths and successful
+completion before writing a new trace and `.manifest.json`. Other CSV columns
+are preserved; existing output files are refused. The manifest records source
+hashes, fallback positions and `predictive_alignment: false`. These inputs
+condition on observations; they do not replay scheduling or individual random
+outcomes and are not independent predictions.
+
+Select the generated trace explicitly in the simulation preset. This command
+never edits worker settings, KV capacity, timing multipliers or analysis paths.
+Historical reuse, startup diagnostics and the duplicate RNG implementation are
+preserved on `spec5-alignment-experiments`, outside the feature's merge scope.
+
+Campaign `extract`/`compare` uses the E2E analysis manifest to audit independent
+CSV request identities, lengths and completion against `request_slo.parquet`.
+Failed identity checks make a case unavailable. Legacy reports without a manifest
+and other workload formats retain count checks and explicitly report identity
+audit unavailability. Timing statistics continue to come from Analyzer reports;
+the audit does not pair latency samples or recompute TTFT/TPOT.
+
+Set `workload.warmup: true` to warm all input shapes before measurement.
+Independent warmup requests cap output at 32 tokens and use saturated arrivals;
+the measured workload retains its original output lengths and arrival policy.
+This requires vLLM with `server.enable_server_load_tracking: true`; NSYS passes
+must use `cuda_profiler_api`. The launcher enables `VLLM_SERVER_DEV_MODE=1` for
+the cache management endpoint. Req-frontend drains the warmup and resets prefix
+caching, then hands control to the launcher before submitting measured requests.
+Warmup records stay in separate frontend files. The complete server log remains
+raw evidence; its persisted measurement byte offset produces a separate
+measurement log for iteration, request and popularity extraction, including resume.
+Acceptance counter snapshots and the capture timer start at this same boundary.
+
 `simulation.yaml` remains an ordinary VibeSim preset. Paths in the other configs
 are resolved relative to the declaring config file.
 
@@ -46,6 +96,13 @@ analyzer/
 predictor. It receives resolved artifacts from the launcher and writes only
 timing-predict inputs. The analyze launcher alone creates
 `analysis/alignment_manifest.json`.
+
+For Spec5, a decode-lifecycle request may recompute context after preemption.
+Schema-v4 rows with matching per-request geometry, no drafted/accepted candidates,
+and query width above the backend's `1 + draft_tokens` decode threshold lower to
+prefill chunk pairs. The original observation stays intact and all query tokens
+remain in the predicted workload. Missing evidence or unsupported short verification
+widths still fail validation.
 
 `alignment/nsys/evidence.py` owns framework-neutral process attribution, NVTX
 ranges, CUDA runtime correlation, kernel classification, and interval arithmetic.
@@ -200,7 +257,10 @@ has timing-predict or analysis fields.
 
 ### Expert-popularity artifact contract
 
-New captures write schema v3, formally described by
+Role-selected vLLM captures write schema v4, including separate target and draft
+artifacts, described by
+[`expert_popularity_v4.schema.json`](schema/expert_popularity_v4.schema.json).
+Other captures retain schema v3, formally described by
 [`alignment/schema/expert_popularity_v3.schema.json`](schema/expert_popularity_v3.schema.json).
 The authoritative tensor is `counts_by_layer[layer][logical_expert]`; each value
 is a nonnegative count of routed token-expert assignments, so one input token
@@ -230,10 +290,16 @@ its TP group. These are examples, not engine defaults. The summary records the
 raw, accepted, and discarded record counts and the discarded EPLB steps, so
 this filtering is auditable rather than implicit.
 
-The Rust consumer treats v2 and v3 as closed contracts and rejects unknown
-fields or cross-field inconsistencies. Schemas v1 and v2 remain read-only
-compatibility for existing run directories; the profiler generates v3.
-The instrumented vLLM raw record is also version 2 and supplies
+For schema v4, aggregation first selects the model role and exact monotonic
+replay window. The ceiling additionally multiplies by `max_forwards_per_step`
+so repeated draft forwards are retained. Target and draft are written to
+`expert_popularity.json` and `draft_expert_popularity.json`; replay counter
+deltas are recorded separately in `spec_decode_metrics.json`.
+
+The Rust consumer treats v2-v4 as closed contracts and rejects unknown fields,
+role mismatches or cross-field inconsistencies. Historical schemas remain
+readable. Instrumented vLLM raw schema v3 adds `model_role`,
+`max_forwards_per_step` and `observed_monotonic_ns` alongside
 `expert_parallel_size` and `experts_per_token` from the running EPLB state;
 the summary extractor verifies the recorded expert degree against YAML and
 checks that these values remain constant across the capture. The count-reduction
@@ -254,10 +320,25 @@ input_builder:
   group_assignment: single
 ```
 
+For chain speculative verification, select the input contract explicitly:
+
+```yaml
+input_builder:
+  type: speculative_engine_text
+  draft_tokens: 5
+  measured_phase: forward
+  group_assignment: single
+```
+
+`draft_tokens` is required and must match the preset's explicit
+`arch.draft_tokens`. The builder never infers speculative semantics from an
+architecture name or assumes a draft depth. Existing speculative configs using
+`engine_text` must select `speculative_engine_text` before rebuilding inputs;
+ordinary `engine_text` and its legacy `vllm_text` alias remain unchanged.
+
 Timing prediction is kernel-only, so it reads the simulation **preset**
 (`simulation_preset`), not a completed run — it takes the gpu, arch, and backend
-policy straight from `simulation.yaml`. This lets it run before the simulation,
-so kernel-align can derive the multiplier the simulation later bakes in. The
+policy straight from `simulation.yaml`. This lets it run independently of the simulation. The
 builder writes `timing_predict_cases.json`, `timing_predict_case_map.json`,
 `timing_predict_config.json`, and `timing_predict_input_manifest.json`, then the
 launcher invokes the generic timing-predict command. The generated predictor
@@ -306,6 +387,17 @@ and an unfused split boundary sharing one `tp_allreduce` slot); the analyzer
 resolves the per-iteration owner from the operations present. One *operation*
 still keeps a single consistent `type`/`role`/`simulated_slots`.
 The labeled JSON is the only mapping source; there is no separate mapping YAML.
+
+An unmapped collective can declare `cross_rank: synchronizing` and a non-empty
+`collective` identity. This reviewed identity joins occurrences across rank
+sequences before arrival-wait subtraction; it does not claim any simulated slot
+or contribute to mapped coverage. Rules express this with `status: unmapped`,
+`operation` as the collective identity, and no slot/type/role fields. Match by
+phase and source-backed neighbors as for mapped operations. Unidentified
+unmapped rows remain separate; names alone never imply a cross-rank join.
+The report preserves raw residency mapping coverage and separately exposes
+`measured_critical_path_fraction`, whose denominator removes overlap and
+collective arrival wait on the same selected device as the timing comparison.
 
 ```json
 {
@@ -406,8 +498,7 @@ data is never reconstructed or substituted from client measurements.
 uv run python -m launcher alignment profile logs/<experiment>/profile.yaml
 uv run python -m launcher alignment timing-predict logs/<experiment>/timing_predict.yaml
 uv run python -m launcher alignment analyze logs/<experiment>/analyze_kernel.yaml
-uv run python -m launcher alignment sim logs/<experiment>/simulation.yaml \
-  --gpu-time-multiplier-from logs/<experiment>/analysis_kernel
+uv run python -m launcher alignment sim logs/<experiment>/simulation.yaml
 uv run python -m launcher alignment analyze logs/<experiment>/analyze_e2e.yaml
 ```
 
@@ -445,11 +536,11 @@ index rather than scanning the detail shard:
 That resource contains the iteration total, measured kernels, simulated slots,
 and semantic-operation summary.
 
-`--gpu-time-multiplier-from <kernel-align-dir>` makes the simulation read that
-pass's `recommended_gpu_time_multiplier` and inject it as
-`--override pools.main.groups.0.worker.gpu_time_multiplier=<v>` — no manual copy.
-Omit the flag to run the simulation with whatever `gpu_time_multiplier` the
-preset's worker already carries (defaults to 1.0).
+Simulation uses the preset's explicit `worker.gpu_time_multiplier` (default 1.0).
+Kernel alignment reports a recommendation, but is not a simulation prerequisite
+and cannot override the preset. When adopting a recommendation, record its source
+and any cross-workload approximation in the experiment notes and set the value
+in the preset before running. Previously used report-source CLI flags are removed.
 
 Standalone NSYS normalization remains available as:
 
@@ -552,7 +643,7 @@ model needing one pass, or three, adds no enum anywhere:
 | *(per profile pass)* | `<name>.yaml` | `<name>/` | `alignment profile` |
 | `timing_predict` | `timing_predict.yaml` | `timing_predict/` | `alignment timing-predict` |
 | `analysis_kernel` | `analyze_kernel.yaml` | `analysis_kernel/` | `alignment analyze` |
-| `simulation` | `simulation.yaml` | `simulation/` | `alignment sim --gpu-time-multiplier-from …/analysis_kernel` |
+| `simulation` | `simulation.yaml` | `simulation/` | `alignment sim` |
 | `analysis_e2e` | `analyze_e2e.yaml` | `analysis_e2e/` | `alignment analyze` |
 
 A **pack** is the matrix as data: `campaign.yaml` (cases and topology variants),
@@ -640,3 +731,9 @@ its critical child, and the optimality ladder's R2 rung folds `Max → mean` and
 labels the gap "imbalance". Two different computations sharing one GPU are none
 of those things — same-device overlap makes wall time ≥ max(children), not ≤ —
 so modelling it would need a new node kind, not a reused one.
+## Alignment execution status
+
+The launcher checks each selected subject in the current `analyzer_timing.json`
+after computation. A zero Analyzer process exit code is insufficient: a failed
+or missing subject makes the alignment phase fail, and rendering does not run.
+The interactive `alignment-timeline` payload has no separate PNG renderer.

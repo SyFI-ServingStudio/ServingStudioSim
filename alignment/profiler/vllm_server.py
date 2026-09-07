@@ -203,6 +203,7 @@ def write_launch_metadata(
     keep = (
         "CUDA_VISIBLE_DEVICES",
         "VLLM_NVTX_SCOPES_FOR_PROFILING",
+        "VLLM_SERVER_DEV_MODE",
         "PYTHONPATH",
         "PATH",
         "LD_LIBRARY_PATH",
@@ -224,6 +225,52 @@ def write_launch_metadata(
     Path(path).write_text(json.dumps(metadata, indent=2))
 
 
+def speculative_decode_enabled(cfg: ServerConfig) -> bool:
+    return any(arg.split("=", 1)[0] == "--speculative-config" for arg in cfg.extra_args)
+
+
+def _parse_spec_decode_metrics(text: str) -> dict:
+    from prometheus_client.parser import text_string_to_metric_families
+
+    names = {
+        f"vllm:spec_decode_{name}_total": name
+        for name in ("num_drafts", "num_draft_tokens", "num_accepted_tokens")
+    }
+    position_name = "vllm:spec_decode_num_accepted_tokens_per_pos_total"
+    totals: dict[str, int] = {}
+    positions: dict[str, int] = {}
+    seen: set[tuple] = set()
+    for family in text_string_to_metric_families(text):
+        for sample in family.samples:
+            if sample.name not in names and sample.name != position_name:
+                continue
+            identity = (sample.name, tuple(sorted(sample.labels.items())))
+            if identity in seen:
+                raise ValueError(f"duplicate spec-decode counter: {identity}")
+            seen.add(identity)
+            value = sample.value
+            if not value.is_integer() or value < 0:
+                raise ValueError(f"invalid spec-decode counter: {sample.name}={value}")
+            if sample.name == position_name:
+                position = sample.labels.get("position", "")
+                if not position.isdecimal() or str(int(position)) != position:
+                    raise ValueError(f"invalid spec-decode position: {position!r}")
+                positions[position] = positions.get(position, 0) + int(value)
+            else:
+                name = names[sample.name]
+                totals[name] = totals.get(name, 0) + int(value)
+    if set(totals) != set(names.values()) or not positions:
+        raise ValueError("missing required spec-decode Prometheus counters")
+    return {**totals, "accepted_per_position": positions}
+
+
+def fetch_spec_decode_metrics(base_url: str) -> dict:
+    status, body = _get(f"{base_url}/metrics")
+    if status != 200 or body is None:
+        raise RuntimeError("cannot fetch vLLM spec-decode Prometheus counters")
+    return _parse_spec_decode_metrics(body.decode())
+
+
 def _get(url: str, timeout: float = 5.0):
     try:
         with urllib.request.urlopen(url, timeout=timeout) as resp:
@@ -232,9 +279,7 @@ def _get(url: str, timeout: float = 5.0):
         return None, None
 
 
-def set_cuda_profile(
-    base_url: str, *, active: bool, timeout: float | None = None
-) -> None:
+def set_cuda_profile(base_url: str, *, active: bool, timeout: float | None = None) -> None:
     """Start or stop vLLM's worker-owned CUDA profiler through its HTTP API.
 
     Stopping can block while Nsight finalizes a large report inside the worker;

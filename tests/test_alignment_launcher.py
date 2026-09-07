@@ -308,6 +308,28 @@ def _write_timing_artifacts(tmp_path: Path) -> Path:
     return result.input_manifest
 
 
+@pytest.mark.parametrize("depth", [1, 3, 5])
+def test_explicit_speculative_input_config_round_trip(tmp_path, depth):
+    paths = _phase_configs(tmp_path)
+    raw = yaml.safe_load(paths["timing"].read_text())
+    raw["input_builder"] = {"type": "speculative_engine_text", "draft_tokens": depth}
+    _write_config(paths["timing"], raw)
+    spec = alignment_launcher.load_timing_predict_config(paths["timing"]).input_builder
+    assert spec.to_mapping() == {
+        "type": "speculative_engine_text", "draft_tokens": depth,
+        "measured_phase": "forward", "group_assignment": "single",
+    }
+
+
+def test_speculative_input_config_has_no_implicit_depth(tmp_path):
+    paths = _phase_configs(tmp_path)
+    raw = yaml.safe_load(paths["timing"].read_text())
+    raw["input_builder"] = {"type": "speculative_engine_text"}
+    _write_config(paths["timing"], raw)
+    with pytest.raises(ValueError, match="draft_tokens"):
+        alignment_launcher.load_timing_predict_config(paths["timing"])
+
+
 def test_alignment_sim_runs_only_existing_simulation(tmp_path, monkeypatch):
     paths = _phase_configs(tmp_path)
     calls = []
@@ -319,7 +341,7 @@ def test_alignment_sim_runs_only_existing_simulation(tmp_path, monkeypatch):
 
     assert alignment_launcher.main(["sim", str(paths["simulation"])]) == 0
     assert calls[0][0] == paths["simulation"]
-    assert calls[0][1]["overrides"] == []
+    assert "overrides" not in calls[0][1]
     assert json.loads((tmp_path / "artifact.meta.json").read_text()) == {
         "schema_version": 1,
         "artifact_kind": "alignment_bundle",
@@ -334,8 +356,12 @@ def test_alignment_sim_dry_run_does_not_publish_bundle_marker(tmp_path, monkeypa
     assert not (tmp_path / "artifact.meta.json").exists()
 
 
-def test_alignment_sim_auto_injects_kernel_align_multiplier(tmp_path, monkeypatch):
+def test_alignment_sim_preserves_explicit_worker_multiplier(tmp_path, monkeypatch):
     paths = _phase_configs(tmp_path)
+    preset = yaml.safe_load(paths["simulation"].read_text())
+    preset["pools"]["main"]["groups"][0]["worker"]["gpu_time_multiplier"] = 1.17
+    _write_config(paths["simulation"], preset)
+    before = paths["simulation"].read_bytes()
     kernel_align = tmp_path / "kernel_align_run"
     report = kernel_align / "reports" / "alignment_iteration_report.json"
     report.parent.mkdir(parents=True)
@@ -347,30 +373,19 @@ def test_alignment_sim_auto_injects_kernel_align_multiplier(tmp_path, monkeypatc
         lambda path, **kwargs: calls.append((path, kwargs)) or 0,
     )
 
-    assert (
-        alignment_launcher.main(
-            ["sim", str(paths["simulation"]), "--gpu-time-multiplier-from", str(kernel_align)]
-        )
-        == 0
-    )
-    assert calls[0][1]["overrides"] == ["pools.main.groups.0.worker.gpu_time_multiplier=1.329"]
+    assert alignment_launcher.main(["sim", str(paths["simulation"])]) == 0
+    assert calls[0][0] == paths["simulation"]
+    assert "overrides" not in calls[0][1]
+    assert paths["simulation"].read_bytes() == before
 
 
-def test_alignment_sim_rejects_below_unity_multiplier(tmp_path, monkeypatch, capsys):
+def test_alignment_sim_rejects_removed_calibration_flag(tmp_path):
     paths = _phase_configs(tmp_path)
-    kernel_align = tmp_path / "kernel_align_run"
-    report = kernel_align / "reports" / "alignment_iteration_report.json"
-    report.parent.mkdir(parents=True)
-    report.write_text(json.dumps({"meta": {"recommended_gpu_time_multiplier": 0.5}}))
-    monkeypatch.setattr(alignment_launcher, "_launch_simulation", lambda *args, **kwargs: 0)
-
-    assert (
+    with pytest.raises(SystemExit) as error:
         alignment_launcher.main(
-            ["sim", str(paths["simulation"]), "--gpu-time-multiplier-from", str(kernel_align)]
+            ["sim", str(paths["simulation"]), "--gpu-time-multiplier-from", str(tmp_path)]
         )
-        == 2
-    )
-    assert "recommended_gpu_time_multiplier" in capsys.readouterr().err
+    assert error.value.code == 2
 
 
 def test_profile_config_is_profile_only_and_config_relative(tmp_path, monkeypatch):
@@ -1738,14 +1753,45 @@ def test_alignment_analysis_calls_only_selected_subjects(tmp_path, monkeypatch):
 
     def fake_capture(argv):
         invocations.append(argv)
+        if argv[1] == "alignment":
+            (log_dir / "reports").mkdir(exist_ok=True)
+            (log_dir / "reports" / "analyzer_timing.json").write_text(
+                json.dumps({"subjects": [{"name": "alignment-e2e", "status": "ok"}]})
+            )
         return 0, "alignment accepted\n"
 
     monkeypatch.setattr(launcher_exec, "analyzer_binary_path", lambda build_type: analyzer)
     monkeypatch.setattr(launcher_exec, "_run_capture_sync", fake_capture)
 
-    launcher_exec.run_alignment_analysis(log_dir, "release", ["alignment-e2e"])
+    assert launcher_exec.run_alignment_analysis(log_dir, "release", ["alignment-e2e"])
     assert invocations[0] == [str(analyzer), "alignment", str(log_dir), "alignment-e2e"]
     assert invocations[1][-1:] == ["alignment-e2e"]
+
+
+@pytest.mark.parametrize("outcome", ["failed", "missing", "stale"])
+def test_alignment_analysis_does_not_publish_failed_compute(tmp_path, monkeypatch, outcome):
+    analyzer = tmp_path / "analyze"
+    analyzer.touch()
+    log_dir = tmp_path / "analysis"
+    reports = log_dir / "reports"
+    reports.mkdir(parents=True)
+    timing = reports / "analyzer_timing.json"
+    timing.write_text(json.dumps({"subjects": [{"name": "alignment-iteration", "status": "ok"}]}))
+    invocations = []
+
+    def fake_capture(argv):
+        invocations.append(argv)
+        if outcome != "stale":
+            rows = [] if outcome == "missing" else [
+                {"name": "alignment-iteration", "status": "failed"}
+            ]
+            timing.write_text(json.dumps({"subjects": rows}))
+        return 0, "compute process exited zero\n"
+
+    monkeypatch.setattr(launcher_exec, "analyzer_binary_path", lambda build_type: analyzer)
+    monkeypatch.setattr(launcher_exec, "_run_capture_sync", fake_capture)
+    assert not launcher_exec.run_alignment_analysis(log_dir, "release", ["alignment-iteration"])
+    assert len(invocations) == 1
 
 
 def test_req_frontend_invocation_keeps_independent_as_a_typed_frontend(tmp_path, monkeypatch):

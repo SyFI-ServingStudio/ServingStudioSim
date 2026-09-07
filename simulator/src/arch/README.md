@@ -47,6 +47,15 @@ attn_kv_bytes_per_gpu × num_attn_shards
        total_kv_bytes_per_token
 ```
 
+### Speculative Iter-wise
+
+`SpeculativeUnifiedModel` consumes `SpeculativeArchInput`: each decode request
+carries its final verify-row KV length and query width separately. The compiled
+tree includes target verification and draft passes. Offline prediction selects
+`arch.speculative_iter` with the same speculative architecture selector used by
+deployment; its cases contain `decode_requests: [[final_kv_len, query_len], ...]`.
+`build_speculative_iter_model` constructs this contract without a worker.
+
 ### Layer-wise AFD
 
 `AttnLayerwiseModel` consumes `AttnArchInput` and costs one attention layer.

@@ -1,25 +1,33 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyModule};
 use serde_json::Value;
 
 use crate::timing::bridge::{
-    intern_backend, ArgsPayload, DType, DbMetadata, KernelKind, KernelMetrics, PerfApiError,
-    ProfilerVersion,
+    ArgsPayload, DType, DbMetadata, KernelKind, KernelMetrics, PerfApiError, ProfilerVersion,
+    intern_backend,
 };
 
 /// One kernel's profile-coverage line for the `dry-run` report: how many of its
 /// enumerated specs are missing from `profile.db` (i.e. would be JIT-profiled on a
 /// real build). `name` is the kernel's dotted path; counts are summed over its
-/// backends.
+/// backends. Shared profile identities count only at their first role in a
+/// dry-run report, matching the number of rows JIT would need to measure.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KernelMissing {
     pub name: String,
     pub kind: KernelKind,
     pub missing: usize,
     pub total: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+struct DryRunReport {
+    rows: Vec<KernelMissing>,
+    // Backend is inside the canonical ArgsPayload JSON; role is not a DB key.
+    seen: HashSet<(KernelKind, String, String)>,
 }
 
 /// One distinct kernel's structural facts for the `emit-backends` enumerator: its
@@ -80,7 +88,7 @@ pub struct PerfApiBridge {
     /// `Some(..)` puts the bridge in dry-run mode: `Kernel::build` counts missing
     /// specs into this report instead of fitting caches (see `enable_dry_run`).
     /// Interior-mutable because `build` borrows the bridge by `&` only.
-    dry_run: RefCell<Option<Vec<KernelMissing>>>,
+    dry_run: RefCell<Option<DryRunReport>>,
     /// Active per-role backend override map (dotted role `name` → interned
     /// candidate backends). `Kernel::build` consults it by role `name` on the RUN
     /// path to replace a kernel's const-default candidate set. `None` (the default,
@@ -123,7 +131,7 @@ impl PerfApiBridge {
     /// `count_missing` (no cache fit) and accumulate one [`KernelMissing`] per
     /// kernel. Drain the result with [`take_dry_run_report`](Self::take_dry_run_report).
     pub fn enable_dry_run(&self) {
-        *self.dry_run.borrow_mut() = Some(Vec::new());
+        *self.dry_run.borrow_mut() = Some(DryRunReport::default());
     }
 
     /// Whether the bridge is in dry-run mode (set by [`enable_dry_run`](Self::enable_dry_run)).
@@ -134,7 +142,7 @@ impl PerfApiBridge {
     /// Record one kernel's coverage line. No-op when not in dry-run mode.
     pub fn record_missing(&self, name: String, kind: KernelKind, missing: usize, total: usize) {
         if let Some(report) = self.dry_run.borrow_mut().as_mut() {
-            report.push(KernelMissing {
+            report.rows.push(KernelMissing {
                 name,
                 kind,
                 missing,
@@ -143,11 +151,33 @@ impl PerfApiBridge {
         }
     }
 
+    /// Assign each complete profile identity to its first role in this report.
+    /// Repeated roles share DB rows and therefore do not add JIT work.
+    pub fn unique_dry_run_specs(
+        &self,
+        kind: KernelKind,
+        gpu_name: &str,
+        specs: Vec<ArgsPayload>,
+    ) -> Vec<ArgsPayload> {
+        let mut state = self.dry_run.borrow_mut();
+        let report = state
+            .as_mut()
+            .expect("unique_dry_run_specs requires dry-run mode");
+        specs
+            .into_iter()
+            .filter(|spec| {
+                let fields = serde_json::to_string(spec.fields())
+                    .expect("ArgsPayload fields are JSON values");
+                report.seen.insert((kind, gpu_name.to_owned(), fields))
+            })
+            .collect()
+    }
+
     /// Take the accumulated dry-run report, leaving the bridge in dry-run mode
     /// with an empty report. Empty `Vec` if dry-run was never enabled.
     pub fn take_dry_run_report(&self) -> Vec<KernelMissing> {
         match self.dry_run.borrow_mut().as_mut() {
-            Some(report) => std::mem::take(report),
+            Some(report) => std::mem::take(report).rows,
             None => Vec::new(),
         }
     }
@@ -617,7 +647,7 @@ fn optional_string(item: &PyAny, field: &str) -> Result<Option<String>, PerfApiE
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_payload_backends_match, shared_backend, PerfApiBridge};
+    use super::{PerfApiBridge, ensure_payload_backends_match, shared_backend};
     use crate::timing::bridge::payload::intern_backend;
     use crate::timing::bridge::{ArgsPayload, PerfApiError};
     use serde_json::Value;
@@ -756,7 +786,7 @@ mod tests {
         assert_eq!(report[0].compute_dtype, Some(super::DType::Fp8E4m3));
         assert_eq!(report[1].compute_dtype, None); // comm is dtype-agnostic
         assert_eq!(report[1].pool, ""); // deployment-level, no active pool
-                                        // draining leaves an empty report while still in enumerate mode.
+        // draining leaves an empty report while still in enumerate mode.
         assert!(bridge.take_enum_report().is_empty());
         assert!(bridge.is_enumerate());
     }
@@ -786,6 +816,34 @@ mod tests {
     fn ensure_payload_backends_match_passes_on_uniform_batch() {
         let batch = vec![payload(Some("torch")), payload(Some("torch"))];
         assert!(ensure_payload_backends_match(&batch, "torch").is_ok());
+    }
+
+    #[test]
+    fn dry_run_counts_complete_cache_keys_once_and_resets_with_report() {
+        let bridge = PerfApiBridge::new_uninit_for_test();
+        bridge.enable_dry_run();
+        let spec = payload(Some("torch"));
+        let count = |kind, gpu, specs| bridge.unique_dry_run_specs(kind, gpu, specs).len();
+        assert_eq!(
+            count("single_gemm", "B200", vec![spec.clone(), spec.clone()]),
+            1
+        );
+        assert_eq!(count("single_gemm", "B200", vec![spec.clone()]), 0);
+        assert_eq!(count("batched_gemm", "B200", vec![spec.clone()]), 1);
+        assert_eq!(count("single_gemm", "H200", vec![spec.clone()]), 1);
+        assert_eq!(
+            count("single_gemm", "B200", vec![payload(Some("triton"))]),
+            1
+        );
+        let mut other_shape = spec.clone();
+        other_shape.insert("m", Value::from(4096));
+        assert_eq!(count("single_gemm", "B200", vec![other_shape]), 1);
+
+        bridge.record_missing("target.gemm".to_string(), "single_gemm", 1, 1);
+        assert_eq!(bridge.take_dry_run_report().len(), 1);
+        assert!(bridge.is_dry_run());
+        assert_eq!(count("single_gemm", "B200", vec![spec]), 1);
+        assert!(bridge.take_dry_run_report().is_empty());
     }
 
     #[test]

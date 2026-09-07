@@ -173,6 +173,12 @@ Everything flows through `perf_api`. There are exactly two internal paths.
 
 1. Resolve `gpu_name` (explicit arg, else auto-detect via torch).
 2. `find_kernel_profiler_spec(kind, backend)` → `Table(spec, DB_PATH).query(...)`.
+
+Set `VIBESIM_PROFILE_DB` to an absolute path to isolate a simulation or
+timing-predict run's profile database, including its demand-driven JIT writes.
+The default remains `profiling/profile.db`; an explicit kernel-profile `--db`
+overrides the environment selection. Preserve source databases when reproducing
+historical results and record the selected database with the experiment.
 3. Hits return `Metrics`; misses return `MissingEntry`.
 4. If there are misses **and** JIT is enabled, call `run_profile_batch` to fill
    them, then re-query. With `force=True`, skip the first query and re-profile
