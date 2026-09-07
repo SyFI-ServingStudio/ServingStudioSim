@@ -66,10 +66,12 @@ source identities and historical provenance limitations. Its SHA-256 remains
 
 - vLLM: `0b8edfb` to `2c2f73f`; speculative observation and target/draft routing records.
 - Req-frontend: `dbe0f9e` to `ec54cd0`; acceptance trace support and bounded warmup.
-- GitHub commit API returned HTTP422 for both new gitlinks on 2026-09-06.
-  Publish and verify dependency branches before publishing the parent PR.
-- Remote master still equals the review baseline `fe65028`; API permission checks
-  confirm push access to all three repositories. No remote changes made yet.
+- Both gitlinks are published on `vibesim-spec5-alignment` and their remote
+  branch SHAs were verified on 2026-09-07:
+  [vLLM](https://github.com/serendipity-zk/vllm/tree/vibesim-spec5-alignment),
+  [req-frontend](https://github.com/uw-syfi/request-factory/tree/vibesim-spec5-alignment).
+- Main PR: https://github.com/SyFI-VibeSim/VibeSim/pull/32.
+  The verified master/review baseline is `fe65028`.
 
 ## Contribution licensing
 
