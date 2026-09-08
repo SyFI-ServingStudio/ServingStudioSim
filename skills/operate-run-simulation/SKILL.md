@@ -78,6 +78,8 @@ If the user did not give a name, ask for one before proceeding.
    `analyze_subjects` key from the copied preset or variants manifest so the
    launcher runs every applicable analyzer subject. Do not add `--no-analyze`
    to the launch command by default.
+   For MoE models, select the routing source using the MoE rule below before
+   the dry run.
 8. **Dry-run first** — validate + expand without launching, and inspect the run
    plan and per-run `log_dir`s:
    ```bash
@@ -91,6 +93,11 @@ If the user did not give a name, ask for one before proceeding.
    ```bash
    uv run python -m launcher logs/<experiment-name>/preset.yaml
    ```
+
+## MoE routing source
+
+Before running any MoE model, read and apply
+[the shared popularity-file selection rule](references/moe-routing.md).
 
 ## Sweeps
 
@@ -268,6 +275,7 @@ After setup and launch, report:
 - copied preset path
 - the `--dry-run` plan summary (run count)
 - exact launcher command used
+- MoE routing source: selected popularity file(s), or the reason for uniform fallback
 - analysis selection (`all applicable` by default, or the user-requested subset)
 - any analyzer subjects that failed best-effort post-run analysis
 

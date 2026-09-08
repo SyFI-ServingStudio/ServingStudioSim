@@ -55,13 +55,8 @@ pub struct ModelSpec {
 
 // ── iter-wise contract (unified, pd) ────────────────────────────────────────
 
-/// MoE expert routing distribution kind (the `routing` selector on
-/// [`IterArchSel::Qwen3MoeDpAttnEpFfn`]). v1 exposes `uniform` and a seeded
-/// `random`; the model layer also carries `power_law` / explicit `from_profile`
-/// (see `timing::routing::RoutingDistribution`), while a measured profile is
-/// supplied separately through `expert_popularity_file`. Kept a small closed
-/// set so the launcher validates it as a `string` param with `choices`
-/// (mirrored by [`ROUTING_KINDS`]).
+/// MoE routing source: synthetic uniform/random demand, or a custom distribution
+/// loaded from `expert_popularity_file`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RoutingKind {
@@ -70,10 +65,15 @@ pub enum RoutingKind {
     Uniform,
     /// Deterministic pseudo-random skew seeded by `routing_seed`.
     Random,
+    /// Measured distribution; requires `expert_popularity_file`.
+    Custom,
 }
 
 /// The `routing` choices the launcher schema advertises (mirror of [`RoutingKind`]).
-const ROUTING_KINDS: [&str; 2] = ["uniform", "random"];
+const ROUTING_KINDS: [&str; 3] = ["uniform", "random", "custom"];
+
+// AFD FFN selectors do not yet accept popularity files.
+const SYNTHETIC_ROUTING_KINDS: [&str; 2] = ["uniform", "random"];
 
 /// GLM-5.2 proposer modes exposed by the iter selector. This mirrors
 /// [`Glm52MtpMode`]'s serde representation.
@@ -170,7 +170,8 @@ pub enum IterArchSel {
         nvl_num_gpu: u16,
         /// Expert routing distribution: `uniform` (default) spreads load evenly;
         /// `random` draws a deterministic pseudo-random skew seeded by
-        /// `routing_seed`. Drives the L2 MoE dispatch/combine `BottleneckCurve`
+        /// `routing_seed`; `custom` loads `expert_popularity_file`.
+        /// Drives the L2 MoE dispatch/combine `BottleneckCurve`
         /// and the L3 grouped-GEMM `local_ppm` shards. Omitted → `uniform`.
         #[serde(default)]
         #[param(string, default = "uniform", choices = ROUTING_KINDS)]
@@ -291,7 +292,7 @@ pub enum IterArchSel {
         #[param(string, default = "off", choices = GLM52_MTP_MODES, cache_key)]
         mtp_mode: Glm52MtpMode,
         /// Measured per-expert popularity from a profile pass. Requires
-        /// `routing = uniform`; the profile replaces the synthetic distribution.
+        /// `routing = custom`; uniform/random routing cannot carry a profile.
         #[serde(default)]
         #[param(cache_key)]
         expert_popularity_file: Option<String>,
@@ -420,7 +421,7 @@ pub enum IterArchSel {
         #[param(string, default = "off", choices = GLM52_MTP_MODES, cache_key)]
         mtp_mode: Glm52MtpMode,
         /// Measured per-expert popularity from a profile pass. Requires
-        /// `routing = uniform`; the profile replaces the synthetic distribution.
+        /// `routing = custom`; uniform/random routing cannot carry a profile.
         #[serde(default)]
         #[param(cache_key)]
         expert_popularity_file: Option<String>,
@@ -548,7 +549,7 @@ mod iter_tests {
     #[test]
     fn qwen_selector_parses_profile_path_and_marks_it_cache_relevant() {
         let parsed = parse_qwen(
-            r#","attn_tp_size":4,"ep_size":4,"hp_size":1,"nvl_num_gpu":4,"expert_popularity_file":"profile_expert_popularity/expert_popularity.json""#,
+            r#","attn_tp_size":4,"ep_size":4,"hp_size":1,"nvl_num_gpu":4,"routing":"custom","expert_popularity_file":"profile_expert_popularity/expert_popularity.json""#,
         )
         .expect("qwen selector with popularity profile parses");
         let IterArchSel::Qwen3MoeDpAttnEpFfn {
@@ -589,7 +590,7 @@ mod iter_tests {
             IterArchSel::Qwen3MoeFp8DpAttnEpFfn { .. }
         ));
         let parsed = parse_vllm_qwen(
-            r#", "attn_tp_size":4,"ep_size":4,"hp_size":1,"nvl_num_gpu":4,"expert_popularity_file":"expert_popularity.json""#,
+            r#", "attn_tp_size":4,"ep_size":4,"hp_size":1,"nvl_num_gpu":4,"routing":"custom","expert_popularity_file":"expert_popularity.json""#,
         )
         .expect("vLLM-alignment Qwen selector parses");
         assert!(matches!(
@@ -736,12 +737,11 @@ mod iter_tests {
         // distribution, so a DP+EP alignment run could only assume uniform
         // routing -- a silent confound on exactly the grouped-GEMM operations
         // that deviate most. Same field and same semantics as the Qwen
-        // variants: the profile replaces the synthetic distribution and is
-        // rejected outright if a non-uniform `routing` is also requested.
+        // variants: custom routing explicitly selects the measured file.
         for tag in ["glm52_dsa_moe", "glm52_vllm_dsa_moe"] {
             let parsed: IterArchSel = serde_json::from_str(&format!(
                 r#"{{"type":"{tag}","model_config":"model/config/glm52_fp8.json","fp8":true,
-                     "expert_popularity_file":"profile_expert_popularity/expert_popularity.json"}}"#
+                     "routing":"custom","expert_popularity_file":"profile_expert_popularity/expert_popularity.json"}}"#
             ))
             .expect("GLM selector accepts an expert-popularity profile");
             let file = match &parsed {
@@ -841,7 +841,10 @@ mod iter_tests {
         }
         let routing = get("routing");
         assert_eq!(routing["default"], "uniform");
-        assert_eq!(routing["choices"], serde_json::json!(["uniform", "random"]));
+        assert_eq!(
+            routing["choices"],
+            serde_json::json!(["uniform", "random", "custom"])
+        );
         let mtp = get("mtp_mode");
         assert_eq!(mtp["default"], "off");
         assert_eq!(
@@ -926,7 +929,7 @@ pub enum FfnArchSel {
         /// Expert routing distribution: `uniform` (default) or `random` (seeded by
         /// `routing_seed`). Drives the L2 MoE dispatch/combine simulation.
         #[serde(default)]
-        #[param(string, default = "uniform", choices = ROUTING_KINDS)]
+        #[param(string, default = "uniform", choices = SYNTHETIC_ROUTING_KINDS)]
         routing: RoutingKind,
         /// Seed for `routing = random` (ignored for `uniform`).
         #[serde(default)]
@@ -945,7 +948,7 @@ pub enum FfnArchSel {
         #[param(default = 8, cache_key)]
         nvl_num_gpu: u16,
         #[serde(default)]
-        #[param(string, default = "uniform", choices = ROUTING_KINDS)]
+        #[param(string, default = "uniform", choices = SYNTHETIC_ROUTING_KINDS)]
         routing: RoutingKind,
         #[serde(default)]
         routing_seed: Option<u64>,

@@ -7,7 +7,7 @@ arch:
     fp8: false
     tp_size: 4
     max_model_len: 8192
-    routing: uniform
+    routing: custom
     routing_seed: null
     mtp_mode: off
     expert_popularity_file: presets/alignment/glm52_nvfp4_b200_sglang_tp4/expert_popularity.json

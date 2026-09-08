@@ -142,3 +142,12 @@ Use the `impl-compose-arch` skill when adding an L4 model. Keep the concrete
 model's `build_configs → resolve_configs → build` path in its family file, add
 the smallest selector/build dispatch entry, and test cost consistency before
 wiring a deployment.
+
+## MoE routing configuration
+
+`routing: custom` requires `expert_popularity_file` and loads its measured
+distribution. `uniform` (the schema default) and seeded `random` are synthetic
+and reject popularity files. Migrate older `uniform` + file configs to `custom`.
+A missing or invalid custom file fails; the runtime never falls back to uniform.
+Speculative models require both target and draft popularity files together.
+AFD FFN selectors without a popularity-file field support only synthetic routing.

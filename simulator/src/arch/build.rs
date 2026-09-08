@@ -100,11 +100,14 @@ pub fn resolve_routing(
     kind: RoutingKind,
     seed: Option<u64>,
     num_experts: u32,
-) -> RoutingDistribution {
-    match kind {
+) -> Result<RoutingDistribution> {
+    Ok(match kind {
         RoutingKind::Uniform => RoutingDistribution::uniform(num_experts),
         RoutingKind::Random => RoutingDistribution::random(num_experts, seed.unwrap_or(0)),
-    }
+        RoutingKind::Custom => anyhow::bail!(
+            "routing=custom requires expert_popularity_file on an arch that supports it"
+        ),
+    })
 }
 
 /// Legacy schema-v1 subset. Keep this permissive reader only so existing
@@ -619,9 +622,8 @@ fn ensure_normalized_probabilities(
     Ok(())
 }
 
-/// Resolve the Qwen routing source. An explicit popularity profile is a
-/// complete routing snapshot, so combining it with the synthetic `random`
-/// selector is rejected instead of silently choosing one policy.
+/// Resolve custom routing from a required profile, or synthetic uniform/random
+/// routing without a profile. Invalid combinations fail rather than falling back.
 pub fn resolve_routing_source(
     kind: RoutingKind,
     seed: Option<u64>,
@@ -633,8 +635,8 @@ pub fn resolve_routing_source(
 ) -> Result<RoutingDistribution> {
     if let Some(path) = expert_popularity_file {
         anyhow::ensure!(
-            kind == RoutingKind::Uniform,
-            "expert_popularity_file cannot be combined with routing={:?}; omit the profile or use routing=uniform",
+            kind == RoutingKind::Custom,
+            "expert_popularity_file cannot be combined with routing={:?}; omit the profile or use routing=custom",
             kind
         );
         return load_expert_popularity(
@@ -646,7 +648,7 @@ pub fn resolve_routing_source(
             None,
         );
     }
-    Ok(resolve_routing(kind, seed, num_experts))
+    resolve_routing(kind, seed, num_experts)
 }
 
 /// Build the dense (single-GPU) Llama3 model.
@@ -1058,8 +1060,8 @@ pub fn glm52_vllm_nvfp4_dsa_moe_speculative(
         "speculative GLM requires target and draft expert popularity files together"
     );
     anyhow::ensure!(
-        expert_popularity_file.is_none() || routing_kind == RoutingKind::Uniform,
-        "profile-backed target/draft popularity requires routing=uniform"
+        expert_popularity_file.is_none() || routing_kind == RoutingKind::Custom,
+        "profile-backed target/draft popularity requires routing=custom"
     );
     let routing_for = |path: Option<&str>, layers, role| match path {
         Some(path) => load_expert_popularity(
@@ -1070,11 +1072,7 @@ pub fn glm52_vllm_nvfp4_dsa_moe_speculative(
             model_cfg.router_top_k,
             Some(role),
         ),
-        None => Ok(resolve_routing(
-            routing_kind,
-            routing_seed,
-            model_cfg.num_experts.get(),
-        )),
+        None => resolve_routing(routing_kind, routing_seed, model_cfg.num_experts.get()),
     };
     let target_routing = routing_for(
         expert_popularity_file,
@@ -1184,7 +1182,7 @@ pub fn qwen3_ffn_moe(
     bridge: &PerfApiBridge,
 ) -> Result<Qwen3FfnMoeLayerwiseModel> {
     let model_cfg = moe_model_cfg(model_spec)?;
-    let routing = resolve_routing(routing_kind, routing_seed, model_cfg.num_experts.get());
+    let routing = resolve_routing(routing_kind, routing_seed, model_cfg.num_experts.get())?;
     let parallel = Qwen3FfnMoeParallel {
         attn_tp_size,
         ep_size,
@@ -1211,7 +1209,7 @@ pub fn qwen3_fp8_ffn_moe(
     bridge: &PerfApiBridge,
 ) -> Result<Qwen3Fp8FfnMoeLayerwiseModel> {
     let model_cfg = moe_model_cfg(model_spec)?;
-    let routing = resolve_routing(routing_kind, routing_seed, model_cfg.num_experts.get());
+    let routing = resolve_routing(routing_kind, routing_seed, model_cfg.num_experts.get())?;
     let parallel = Qwen3Fp8FfnMoeParallel {
         attn_tp_size,
         ep_size,
@@ -1605,7 +1603,28 @@ mod tests {
     }
 
     #[test]
-    fn expert_popularity_profile_replaces_uniform_routing_and_preserves_ppm_sum() {
+    fn routing_source_requires_explicit_custom_and_never_falls_back() {
+        for kind in [RoutingKind::Uniform, RoutingKind::Random] {
+            assert!(resolve_routing_source(kind, None, 4, 2, 2, 2, None).is_ok());
+            let error =
+                resolve_routing_source(kind, None, 4, 2, 2, 2, Some("unused.json")).unwrap_err();
+            assert!(error.to_string().contains("use routing=custom"));
+        }
+        let error =
+            resolve_routing_source(RoutingKind::Custom, None, 4, 2, 2, 2, None).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("requires expert_popularity_file"));
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.json");
+        assert!(
+            resolve_routing_source(RoutingKind::Custom, None, 4, 2, 2, 2, missing.to_str())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn custom_expert_popularity_profile_loads_and_preserves_ppm_sum() {
         let mut profile_file = tempfile::NamedTempFile::new().unwrap();
         write!(
             profile_file,
@@ -1619,7 +1638,7 @@ mod tests {
         .unwrap();
         let profile_path = profile_file.path().to_str().unwrap();
         let routing =
-            resolve_routing_source(RoutingKind::Uniform, None, 4, 2, 2, 2, Some(profile_path))
+            resolve_routing_source(RoutingKind::Custom, None, 4, 2, 2, 2, Some(profile_path))
                 .unwrap();
         assert_eq!(routing.num_experts(), 4);
         assert_eq!(
@@ -1657,7 +1676,7 @@ mod tests {
         .unwrap();
 
         let routing = resolve_routing_source(
-            RoutingKind::Uniform,
+            RoutingKind::Custom,
             None,
             4,
             2,
@@ -1711,7 +1730,7 @@ mod tests {
         let profile_path = profile_file.path().to_str().unwrap();
 
         let routing =
-            resolve_routing_source(RoutingKind::Uniform, None, 4, 2, 2, 2, Some(profile_path))
+            resolve_routing_source(RoutingKind::Custom, None, 4, 2, 2, 2, Some(profile_path))
                 .unwrap();
         assert_eq!(routing.ppm(), &[375_000, 250_000, 218_750, 156_250]);
         assert_eq!(routing.layer_ppm().len(), 2);
@@ -1726,7 +1745,7 @@ mod tests {
         let mut infeasible_file = tempfile::NamedTempFile::new().unwrap();
         write!(infeasible_file, "{infeasible_profile}").unwrap();
         let error = resolve_routing_source(
-            RoutingKind::Uniform,
+            RoutingKind::Custom,
             None,
             4,
             2,
@@ -1752,7 +1771,7 @@ mod tests {
         let mut v3_file = tempfile::NamedTempFile::new().unwrap();
         write!(v3_file, "{v3_profile}").unwrap();
         assert!(resolve_routing_source(
-            RoutingKind::Uniform,
+            RoutingKind::Custom,
             None,
             4,
             2,
@@ -1766,7 +1785,7 @@ mod tests {
         let mut invalid_v3_file = tempfile::NamedTempFile::new().unwrap();
         write!(invalid_v3_file, "{v3_profile}").unwrap();
         let error = resolve_routing_source(
-            RoutingKind::Uniform,
+            RoutingKind::Custom,
             None,
             4,
             2,
@@ -1822,7 +1841,7 @@ mod tests {
         let mut invalid_file = tempfile::NamedTempFile::new().unwrap();
         write!(invalid_file, "{unknown_field_profile}").unwrap();
         let error = resolve_routing_source(
-            RoutingKind::Uniform,
+            RoutingKind::Custom,
             None,
             4,
             2,
@@ -1950,7 +1969,7 @@ mod tests {
                 nvl_num_gpu: 8,
                 gpu_name: "NVIDIA H200".to_string(),
             };
-            let routing = resolve_routing(RoutingKind::Random, Some(19), 256);
+            let routing = resolve_routing(RoutingKind::Random, Some(19), 256).unwrap();
             let configs =
                 glm52_dsa_moe::build_configs(&model, &parallel, &routing, false, mode).unwrap();
             assert_eq!(configs.parallel.ep_size, 16);

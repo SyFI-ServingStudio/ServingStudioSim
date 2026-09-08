@@ -374,7 +374,8 @@ drop work or inflate the critical path.
 
 For MoE baseline reproduction, capture logical routing/popularity outside the
 timed range — the `profile_kind: expert_popularity` pass above — and inject that
-same demand into the simulator through the arch's `expert_popularity_file`.
+same demand into the simulator with `routing: custom` and the arch's
+`expert_popularity_file`.
 Preserve original layer and step/request identity, token count, top-k, logical
 expert counts, route-weight mass, and temporal variation. A single model-wide
 histogram erases layer skew and bursts and cannot support per-iteration
