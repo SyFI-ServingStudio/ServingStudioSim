@@ -37,6 +37,10 @@ Start from the nearest `presets/predict_*.json` file. Set:
 - a fresh `log_dir`;
 - `cases_file`, resolved relative to the config file.
 
+For MoE models, first read and apply the
+[shared popularity-file selection rule](../operate-run-simulation/references/moe-routing.md).
+Select routing before running the predictor.
+
 The cases file is a top-level JSON array:
 
 - `iter` and `attn`: each case contains `groups`, one per expected attention-DP
@@ -87,7 +91,8 @@ Use `operate-use-analyzer` to read user-visible prediction values after analysis
 completes.
 
 Report the selector, config and cases paths, command, `log_dir`, per-case totals,
-and any profiling failure. For AFD, report attention and FFN results separately.
+and any profiling failure. For MoE, report the selected popularity file(s) or
+the reason for uniform fallback. For AFD, report attention and FFN results separately.
 
 ## Boundaries
 

@@ -50,7 +50,7 @@ variants:
       fp8: false
       ep_size: 4
       nvl_num_gpu: 4
-      routing: uniform
+      routing: custom
       expert_popularity_file: expert_popularity.json
       mtp_mode: 'off'
     worker:

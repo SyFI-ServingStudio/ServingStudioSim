@@ -99,6 +99,32 @@ def test_pack_check_reports_no_errors(pack):
     assert not errors, "\n".join(str(item) for item in errors)
 
 
+@pytest.mark.parametrize("routing", [None, "uniform", "random"])
+def test_campaign_rejects_popularity_files_without_custom_routing(pack, routing):
+    original = pack.variant_of(pack.cases[0])
+    arch = dict(original.arch)
+    if routing is None:
+        arch.pop("routing", None)
+    else:
+        arch["routing"] = routing
+    variant = dataclasses.replace(original, arch=arch)
+    patched = dataclasses.replace(pack, variants={variant.name: variant})
+    findings = check_module._check_expert_popularity(patched)
+    assert any(item.level == "error" and "require routing=custom" in item.message
+               for item in findings)
+
+
+@pytest.mark.parametrize("reference", [None, "", 42])
+def test_campaign_custom_routing_requires_a_file_path(pack, reference):
+    original = pack.variant_of(pack.cases[0])
+    arch = {**original.arch, "routing": "custom", "expert_popularity_file": reference}
+    variant = dataclasses.replace(original, arch=arch)
+    patched = dataclasses.replace(pack, variants={variant.name: variant})
+    findings = check_module._check_expert_popularity(patched)
+    assert any(item.level == "error" and "routing=custom requires" in item.message
+               for item in findings)
+
+
 def test_pack_declares_provisional_inputs_explicitly(pack):
     """A provisional value is allowed — GLM case 09's rate knee is one in the
     accepted run — but it must be named, so `--record` can refuse by default."""
