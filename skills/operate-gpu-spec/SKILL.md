@@ -84,7 +84,7 @@ Intel RoCE), which have their own (typically 8-GPU) intra-node domain.
 
 ## Search / query a value
 
-The file is JSON — use `jq` (from `main/`):
+The file is JSON — use `jq` (from `VibeSim/`):
 
 ```bash
 # All fields for one GPU

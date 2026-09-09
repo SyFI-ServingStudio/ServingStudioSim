@@ -1,6 +1,6 @@
 ---
 name: dev-create-worktree
-description: Use when the user asks to create, adopt, or set up a git worktree for VibeSim development, including converting an existing agent checkout into a wt-topic tree. Creates a sibling worktree from current main and provisions required working-copy artifacts. NOT for the parallel-writing-subagent isolation flow (that is dev-orchestrate-parallel-subagents).
+description: Use when the user asks to create, adopt, or set up a git worktree for VibeSim development, including converting an existing agent checkout into a wt-topic tree. Creates a sibling worktree from the current VibeSim checkout and provisions required working-copy artifacts. NOT for the parallel-writing-subagent isolation flow (that is dev-orchestrate-parallel-subagents).
 ---
 
 # Create an VibeSim worktree
@@ -31,7 +31,7 @@ needs are therefore missing or unsafe in a fresh or adopted worktree:
    absolute source checkout, while vLLM's precompiled CUDA extensions are
    materialized as untracked `.so` files beside that source. Copying or moving
    `.venv` can therefore leave the interpreter in `wt-topic` importing Python
-   from `main/`, or leave `wt-topic` source without `_C`, `_moe_C`,
+   from `VibeSim/`, or leave `wt-topic` source without `_C`, `_moe_C`,
    `_flashmla_C`, and the FlashAttention extensions. Rebind the environment to
    the new checkout before any alignment run.
 
@@ -44,12 +44,12 @@ run alignment.
 
 ## Convention
 
-Worktrees are **siblings of `main/`**, named `wt-<topic>/` — never nested inside
-`main/`. The workspace root holds `main/` and every `wt-*/` next to it:
+Worktrees are **siblings of `VibeSim/`**, named `wt-<topic>/` — never nested inside
+`VibeSim/`. The workspace root holds `VibeSim/` and every `wt-*/` next to it:
 
 ```
 <workspace-root>/
-├── main/          ← primary tree (source of the working profile.db + traces)
+├── VibeSim/       ← primary tree (source of the working profile.db + traces)
 ├── wt-<topic>/    ← what this skill creates
 └── …
 ```
@@ -57,8 +57,8 @@ Worktrees are **siblings of `main/`**, named `wt-<topic>/` — never nested insi
 Set these once:
 
 ```bash
-WORKSPACE_ROOT=<directory-containing-main>
-MAIN_WORKTREE=$WORKSPACE_ROOT/main
+WORKSPACE_ROOT=<directory-containing-VibeSim>
+MAIN_WORKTREE=$WORKSPACE_ROOT/VibeSim
 WORKTREE_TOPIC=<topic>              # short kebab, e.g. kv-cache-logging
 NEW_WORKTREE=$WORKSPACE_ROOT/wt-$WORKTREE_TOPIC
 BRANCH_NAME=$WORKTREE_TOPIC         # or a name the user gave
@@ -66,9 +66,9 @@ BRANCH_NAME=$WORKTREE_TOPIC         # or a name the user gave
 
 ## Steps
 
-### 1. Create the worktree off the current `main/` HEAD
+### 1. Create the worktree off the current `VibeSim/` HEAD
 
-Branch from whatever `main/` currently has checked out (the code you explored),
+Branch from whatever `VibeSim/` currently has checked out (the code you explored),
 NOT from `master`/`origin` — the active mainline branch here is usually an
 `afd-*` / feature branch, and its committed line numbers are what any plan was
 written against.
@@ -152,7 +152,7 @@ If the dry-run errors on a missing `trace/aime_long.csv`, step 3 did not land.
 
 - Once the worktree is ready, use `operate-run-simulation` to launch sims and
   `dev-run-tests` for the test tiers — both assume the artifacts this skill staged.
-- For importing a coherent change from `main/` into an existing worktree, use
+- For importing a coherent change from `VibeSim/` into an existing worktree, use
   `dev-present-changes-for-review`; do not copy selected files to imitate a
   rebase.
 - For isolating **multiple concurrent writing subagents**, use

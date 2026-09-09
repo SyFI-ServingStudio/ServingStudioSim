@@ -200,7 +200,7 @@ python/              The render side (matplotlib over payload JSON).
   alignment_iteration/, alignment_e2e/, alignment_workload/  Alignment payload renderers.
                        (`alignment-timeline` has no matplotlib renderer: its payload exists to be
                         panned and zoomed, and a static PNG of it would only restate the sibling's
-                        stacks. Its consumers are `viz-ui/smoke/align/` and the app's alignment view.)
+                        stacks. Its consumers are `VibeSimUI/smoke/align/` and the app's alignment view.)
   sweep/               Cross-run 1-D line, 2-D heatmap, and N-D faceted sweep plots.
   common/              Shared plotting: payload loader + run-dir layout, figure
                        scaffolding, CDF plot, style.

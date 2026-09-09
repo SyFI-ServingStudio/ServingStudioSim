@@ -57,7 +57,7 @@ Request on stdin, JSON on stdout (tracing goes to stderr — stdout stays pure):
 
 This is all `cache_fidelity.py::ground_truth` does — no per-kernel Python.
 
-## The harness — `main/tools/cache-fidelity-analyzer/`
+## The harness — `VibeSim/tools/cache-fidelity-analyzer/`
 
 - **`cache_fidelity.py`** — generic, kernel-agnostic core + CLI. Exposes
   `kernel_query`, `query_grid`, `eval_kind`, `ground_truth`, `generic_probes`,
@@ -76,7 +76,7 @@ cell midpoints, cross-axis diagonal, beyond-grid extrapolation) automatically,
 1D/2D/3D alike.
 
 ```bash
-cd main
+cd VibeSim
 uv run cargo build --release -p simulator        # kernel-query lives in this binary
 # cfg.json = full KernelConfig, e.g.
 #   {"backends":["cutlass"],"gpu_name":"NVIDIA H200","n":4096,"k":4096,"dtype":"bf16"}
@@ -104,7 +104,7 @@ them) and physical specs to perf_api — the re-axis stays invisible. Use
 `truth_kind=` if a variant profiles through another kind's table (`profile_kind`).
 
 ```bash
-cd main
+cd VibeSim
 uv run python tools/cache-fidelity-analyzer/flashinfer_attn_fidelity.py \
     --model-config model/config/llama3_8b.json --gpu-name "NVIDIA H200" \
     --backends fa2,fa3 --log-dir logs/<YYYYMMDD_N_cache_fidelity>/fidelity

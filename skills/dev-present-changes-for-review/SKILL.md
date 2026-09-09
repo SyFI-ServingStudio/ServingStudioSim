@@ -56,7 +56,7 @@ defines *how many rounds and when*.
    lives behind another Git boundary. Check tracked binary handoffs such as
    `profiling/profile.db` for `skip-worktree`; status silence is not proof that
    their working copy equals the committed copy.
-   When the same feature crosses `main/` and a topic worktree, verify the
+   When the same feature crosses `VibeSim/` and a topic worktree, verify the
    producer → persisted/service state → route/registry → consumer → behavior
    test closure before treating either diff as self-contained. Record which
    coherent scoped commit the worktree rebased onto; file copying is not

@@ -30,7 +30,7 @@ workspace `[profile.release]` already sets `debug = true`, so release carries
 DWARF for inline attribution — no separate `profiling` profile needed.
 
 ```bash
-cd /m-coriander/coriander/kanzhu/VibeSim_workspace/main
+cd /m-coriander/coriander/kanzhu/VibeSim_workspace/VibeSim
 uv run cargo build --release -p simulator
 ```
 

@@ -2,7 +2,7 @@
 
 ## Agent Input
 
-Work in `/m-coriander/coriander/kanzhu/VibeSim_workspace/main` with no prior
+Work in `/m-coriander/coriander/kanzhu/VibeSim_workspace/VibeSim` with no prior
 knowledge beyond repo-local instructions. Use the appropriate repo-local skill
 to query, but not profile, the existing L1 kernel `single_gemm` with backend
 `torch`.

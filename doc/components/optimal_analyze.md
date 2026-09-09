@@ -9,7 +9,7 @@ The implementation is authoritative:
 
 - computation: `analyzer/rust/src/optimality/`;
 - offline plots: `analyzer/python/optimality/optimality_plot.py`;
-- interactive plots: workspace `viz-ui/app/src/features/metrics/optimality*.ts`.
+- interactive plots: workspace `VibeSimUI/app/src/features/metrics/optimality*.ts`.
 
 ## 1. What “optimal” means
 

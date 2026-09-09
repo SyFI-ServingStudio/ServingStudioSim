@@ -7,7 +7,7 @@ description: >-
 
 # Skill Of Skills
 
-This is the map for repo-local skills. Keep these skills in `main/skills/`; the
+This is the map for repo-local skills. Keep these skills in `VibeSim/skills/`; the
 workspace `.codex/skills` path should point here rather than becoming a separate
 source of truth.
 
@@ -128,13 +128,13 @@ dev-llm-serving - implement or review real LLM/multimodal serving framework code
 
 When adding or renaming a skill:
 
-- put the skill under `main/skills/<skill-name>/SKILL.md`;
+- put the skill under `VibeSim/skills/<skill-name>/SKILL.md`;
 - choose the prefix by role, not by implementation language;
 - update this tree if the skill becomes part of a routed workflow;
 - update parent skill descriptions so agents can discover the relationship from
   metadata alone;
 - run the skill validator for each changed skill;
-- search for stale names with `rg "<old-skill-name>" main/skills`.
+- search for stale names with `rg "<old-skill-name>" VibeSim/skills`.
 
 If a lower-level skill starts duplicating a parent, move the duplicated details
 down to the leaf and let the parent point to it. If a top skill grows into a

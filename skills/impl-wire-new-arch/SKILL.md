@@ -134,7 +134,7 @@ minimal predict config (see `operate-run-timing-predict`; templates in
 `presets/predict_qwen3_235b_*`) selecting the new arch and a couple of cases:
 
 ```bash
-cd /m-coriander/coriander/kanzhu/VibeSim_workspace/main
+cd /m-coriander/coriander/kanzhu/VibeSim_workspace/VibeSim
 uv run python -m launcher timing-predict presets/<new_arch_predict>.json
 ```
 

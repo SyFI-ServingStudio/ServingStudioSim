@@ -45,7 +45,7 @@ repo ids that would change the answer.
 
 2. Download Hugging Face metadata first.
 
-Run from `main/` and prefer `uv run python` so the same environment is used as
+Run from `VibeSim/` and prefer `uv run python` so the same environment is used as
 the rest of VibeSim. Download `config.json` and `README.md`; optionally download
 small metadata files such as `generation_config.json` or `tokenizer_config.json`
 when they answer the user question. Do not download weights.

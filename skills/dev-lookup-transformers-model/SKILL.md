@@ -34,7 +34,7 @@ families have several nearby variants.
 
 ## Workflow
 
-Run commands from `main/` and use `uv run python`, so you inspect the same
+Run commands from `VibeSim/` and use `uv run python`, so you inspect the same
 environment VibeSim uses.
 
 If arriving from `top-explore-models`, reuse its resolved repo id, downloaded

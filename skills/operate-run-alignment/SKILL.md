@@ -50,7 +50,7 @@ it to TP1 or collapse DP batches.
 
 ## Run the shared phases
 
-From `main/`, run each phase through the launcher (`uv run python -m launcher
+From `VibeSim/`, run each phase through the launcher (`uv run python -m launcher
 alignment {profile,timing-predict,analyze,sim}`; see README for the configs).
 Each phase is an explicit checkpoint with a disjoint artifact root; no phase
 launches the next. The duty-cycle `gpu_time_multiplier` is no longer hand-derived
