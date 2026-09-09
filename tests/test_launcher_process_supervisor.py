@@ -5,10 +5,13 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
+
+import pytest
 
 from launcher.process import ProcessSpec, ProcessSupervisor
 from launcher.process.artifacts import (
@@ -53,9 +56,7 @@ def test_root_exit_with_inherited_output_descriptor_cleans_descendant(tmp_path: 
     )
 
     result = asyncio.run(
-        ProcessSupervisor().run(
-            _spec([code], tmp_path, log_path=tmp_path / "stage.log")
-        )
+        ProcessSupervisor().run(_spec([code], tmp_path, log_path=tmp_path / "stage.log"))
     )
 
     assert time.monotonic() - started < 5
@@ -86,9 +87,7 @@ def test_joined_process_pool_is_not_reported_as_a_leak(tmp_path: Path) -> None:
         "pool = Pool(2); print(pool.map(abs, [-1, -2])); pool.close(); pool.join()"
     )
 
-    result = asyncio.run(
-        ProcessSupervisor().run(_spec([code], tmp_path, capture_output=True))
-    )
+    result = asyncio.run(ProcessSupervisor().run(_spec([code], tmp_path, capture_output=True)))
 
     assert result.succeeded
     assert not result.leaked_descendants
@@ -106,9 +105,7 @@ def test_cancellation_terminates_the_process_group(tmp_path: Path) -> None:
 
     async def run_and_cancel() -> int:
         task = asyncio.create_task(
-            ProcessSupervisor().run(
-                _spec([code], tmp_path, log_path=tmp_path / "cancel.log")
-            )
+            ProcessSupervisor().run(_spec([code], tmp_path, log_path=tmp_path / "cancel.log"))
         )
         deadline = time.monotonic() + 5
         while not child_pid_path.exists() and time.monotonic() < deadline:
@@ -130,9 +127,7 @@ def test_cancellation_terminates_the_process_group(tmp_path: Path) -> None:
 
 
 def test_sync_adapter_uses_same_process_group_contract(tmp_path: Path) -> None:
-    result = ProcessSupervisor().run_sync(
-        _spec(["print('sync')"], tmp_path, capture_output=True)
-    )
+    result = ProcessSupervisor().run_sync(_spec(["print('sync')"], tmp_path, capture_output=True))
 
     assert result.succeeded
     assert result.output.strip() == "sync"
@@ -144,9 +139,7 @@ def test_repeated_short_processes_do_not_leak_fds_or_threads(tmp_path: Path) -> 
     supervisor = ProcessSupervisor()
 
     for _iteration in range(30):
-        result = supervisor.run_sync(
-            _spec(["print('short')"], tmp_path, capture_output=True)
-        )
+        result = supervisor.run_sync(_spec(["print('short')"], tmp_path, capture_output=True))
         assert result.succeeded
 
     descriptor_count_after = len(list(Path("/proc/self/fd").iterdir()))
@@ -246,9 +239,7 @@ def test_simulation_artifact_contract_accepts_zero_request_run(tmp_path: Path) -
             }
         )
     )
-    (tmp_path / "raw/run_meta.json").write_text(
-        json.dumps({"schema_version": 1, "workers": []})
-    )
+    (tmp_path / "raw/run_meta.json").write_text(json.dumps({"schema_version": 1, "workers": []}))
 
     validation = validate_simulation_artifacts(tmp_path)
 
@@ -287,3 +278,60 @@ def _pid_exists(process_id: int) -> bool:
     except ProcessLookupError:
         return False
     return True
+
+
+@pytest.mark.parametrize("synchronous", [True, False])
+def test_exited_unreaped_group_is_not_a_live_descendant(synchronous: bool) -> None:
+    # Keep a real zombie until assertions finish, without leaving it to PID 1.
+    process = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)
+    child = process.pid
+    try:
+        os.waitid(os.P_PID, child, os.WEXITED | os.WNOWAIT)
+        os.killpg(child, 0)  # The old existence-only check reports this group.
+        supervisor = ProcessSupervisor()
+        if synchronous:
+            leaked = supervisor._clean_leaked_descendants_sync(child)
+        else:
+            leaked = asyncio.run(supervisor._clean_leaked_descendants(child))
+        assert not leaked
+    finally:
+        process.wait()
+
+
+def test_sync_root_exit_with_live_descendant_still_fails(tmp_path: Path) -> None:
+    result = ProcessSupervisor().run_sync(
+        _spec(
+            [
+                "import subprocess, sys; subprocess.Popen([sys.executable, '-c', "
+                "'import time; time.sleep(30)'])"
+            ],
+            tmp_path,
+            capture_output=True,
+        )
+    )
+    assert result.exit_code == 0
+    assert result.leaked_descendants
+    assert not result.succeeded
+
+
+@pytest.mark.parametrize("stage", ["simulator compilation", "schema discovery"])
+def test_build_error_identifies_stage_and_cleanup_failure(stage, capsys) -> None:
+    from launcher.exec import _report_build_failure
+    from launcher.process import ProcessResult
+
+    result = ProcessResult(
+        argv=("tool",),
+        pid=123,
+        process_group_id=123,
+        exit_code=0,
+        elapsed_seconds=1,
+        leaked_descendants=True,
+        output="tool diagnostic",
+    )
+    _report_build_failure(stage, result)
+    error = capsys.readouterr().err
+    assert stage in error
+    assert "live descendants" in error
+    assert "exit_code=0" in error
+    assert "process_group_id=123" in error
+    assert "tool diagnostic" in error

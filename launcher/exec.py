@@ -145,6 +145,20 @@ def _profile_env() -> dict[str, str]:
     return env
 
 
+def _report_build_failure(stage: str, result: ProcessResult) -> None:
+    reason = result.termination_reason or (
+        "live descendants remained after root exit"
+        if result.leaked_descendants
+        else "nonzero exit status"
+    )
+    sys.stderr.write(
+        f"{stage} failed: {reason}; exit_code={result.exit_code}, "
+        f"pid={result.pid}, process_group_id={result.process_group_id}\n"
+    )
+    if result.output:
+        sys.stderr.write(result.output + "\n")
+
+
 def cargo_build(build_type: str = "debug", build_analyzer: bool = True) -> bool:
     """Build the simulator crate, then run schema discovery (INV-8). Returns
     True on success; on failure no schema is written (design §1.2.7 bootstrap
@@ -160,6 +174,7 @@ def cargo_build(build_type: str = "debug", build_analyzer: bool = True) -> bool:
             ProcessSpec(argv=cmd, cwd=REPO_ROOT, env=build_env, name="build-simulator")
         )
         if not build_result.succeeded:
+            _report_build_failure("simulator compilation", build_result)
             return False
 
         # Schema discovery: list-params → deployment_schema.json.
@@ -174,12 +189,10 @@ def cargo_build(build_type: str = "debug", build_analyzer: bool = True) -> bool:
             )
         )
         if not schema_result.succeeded:
-            sys.stderr.write(f"schema discovery failed:\n{schema_result.output}")
+            _report_build_failure("schema discovery", schema_result)
             return False
         schema_path = schema_json_path(build_type)
-        temporary_schema = schema_path.with_name(
-            f".{schema_path.name}.{os.getpid()}.tmp"
-        )
+        temporary_schema = schema_path.with_name(f".{schema_path.name}.{os.getpid()}.tmp")
         try:
             temporary_schema.write_text(schema_result.output)
             os.replace(temporary_schema, schema_path)
@@ -201,6 +214,7 @@ def cargo_build(build_type: str = "debug", build_analyzer: bool = True) -> bool:
             )
         )
         if not analyzer_result.succeeded:
+            _report_build_failure("analyzer compilation", analyzer_result)
             sys.stderr.write("[warn] analyzer build failed; runs will skip post-run analysis\n")
         return True
 
