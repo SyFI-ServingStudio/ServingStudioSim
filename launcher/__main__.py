@@ -475,7 +475,7 @@ def main(argv: list[str] | None = None) -> int:
     from .exec import cargo_build
 
     if not cargo_build(args.build_type, build_analyzer=not args.no_analyze):
-        sys.exit("build failed; cannot produce deployment schema (see errors above)")
+        sys.exit("launcher preparation failed (see stage-specific error above)")
 
     try:
         schema = load_schema(args.build_type)

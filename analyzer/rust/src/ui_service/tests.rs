@@ -1732,6 +1732,33 @@ fn workload_resource_accepts_launcher_experiment_trace_path() {
 }
 
 #[test]
+fn workload_resource_accepts_csv_directly_in_experiment_directory() {
+    let repository = TempDir::new().expect("temporary repository");
+    let logs_root = repository.path().join("logs");
+    let run_path = logs_root.join("experiment/rate32");
+    make_core_run(&run_path);
+    let source_path = "logs/experiment/trace.csv";
+    let params_path = run_path.join("raw/params.json");
+    let params = fs::read_to_string(&params_path)
+        .expect("read params")
+        .replace("trace/workload.csv", source_path);
+    fs::write(params_path, params).expect("write params");
+    fs::write(
+        repository.path().join(source_path),
+        "id,input_len,output_len,arrival_time\n0,1024,256,0\n1,1024,256,1000\n",
+    )
+    .expect("write trace");
+    let roots = configure_logs_roots(vec![logs_root.clone()]).expect("configure root");
+    let run = discover_runs(&roots).expect("discover").pop().expect("run");
+    for root in [repository.path(), logs_root.as_path()] {
+        let workload = read_workload(&run, root).expect("read experiment trace");
+        assert_eq!(workload["request_count"], 2);
+        assert_eq!(workload["average_input_tokens"], 1024.0);
+        assert_eq!(workload["average_output_tokens"], 256.0);
+    }
+}
+
+#[test]
 fn workload_resource_rejects_paths_outside_trace() {
     let temporary = TempDir::new().expect("temporary logs root");
     let run_path = temporary.path().join("simulation");

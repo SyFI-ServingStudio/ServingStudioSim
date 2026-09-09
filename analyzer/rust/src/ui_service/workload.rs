@@ -148,8 +148,17 @@ fn validate_trace_path(source_path: &str) -> Result<()> {
         .iter()
         .take(components.len().saturating_sub(1))
         .any(|component| matches!(component, Component::Normal(name) if *name == "trace"));
-    if !is_normal_relative || !passes_through_trace_directory {
-        bail!("trace file must be a relative path inside a trace directory");
+    // Launchers also store generated CSVs directly in an experiment directory.
+    // Canonical containment is checked separately before the file is opened.
+    let is_experiment_csv = components
+        .iter()
+        .take(components.len().saturating_sub(1))
+        .any(|component| matches!(component, Component::Normal(name) if *name == "logs"))
+        && relative
+            .extension()
+            .is_some_and(|extension| extension == "csv");
+    if !is_normal_relative || !(passes_through_trace_directory || is_experiment_csv) {
+        bail!("trace file must be a relative path inside a trace directory or a CSV under logs");
     }
     Ok(())
 }
