@@ -99,7 +99,6 @@ struct SweepCatalogEntry {
     sweep_id: String,
     kind: AggregateKind,
     display_name: String,
-    payload_href: String,
     axes: Vec<String>,
     num_runs: usize,
     status: SweepStatus,
@@ -124,7 +123,6 @@ pub(super) fn build_filtered_sweep_catalog(
         .filter(|sweep| filter.status.is_none_or(|status| sweep.status == status))
         .take(filter.limit.unwrap_or(usize::MAX))
         .map(|sweep| SweepCatalogEntry {
-            payload_href: format!("sweeps/{}/payload", sweep.sweep_id),
             workspace_id: sweep.workspace_id,
             sweep_id: sweep.sweep_id,
             kind: sweep.kind,

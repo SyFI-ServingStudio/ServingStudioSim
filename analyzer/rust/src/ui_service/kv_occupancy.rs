@@ -24,8 +24,7 @@ pub(super) fn kv_occupancy_descriptor(run: &DiscoveredRun) -> Result<Option<Valu
     Ok(Some(json!({
         "status": "ready",
         "schema_version": 1,
-        "report_href": "subjects/kv-occupancy/report",
-        "payload_href": "subjects/kv-occupancy/payload",
+        "views": ["report", "payload"],
     })))
 }
 

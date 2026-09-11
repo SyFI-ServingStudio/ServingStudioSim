@@ -26,8 +26,7 @@ pub(super) fn optimality_descriptor(run: &DiscoveredRun) -> Result<Option<Value>
     let mut descriptor = json!({
         "status": "ready",
         "schema_version": 1,
-        "report_href": "subjects/optimality/report",
-        "payload_href": "subjects/optimality/payload",
+        "views": ["report", "payload"],
     });
     let locked_ready = regular_file(&run.path.join(LOCKED_REPORT))
         && regular_file(&run.path.join(LOCKED_PAYLOAD))
@@ -44,8 +43,7 @@ pub(super) fn optimality_descriptor(run: &DiscoveredRun) -> Result<Option<Value>
     if locked_ready {
         descriptor["variants"] = json!({
             "batch_locked": {
-                "report_href": "subjects/optimality/variants/batch-locked/report",
-                "payload_href": "subjects/optimality/variants/batch-locked/payload",
+                "views": ["report", "payload"],
             }
         });
     }

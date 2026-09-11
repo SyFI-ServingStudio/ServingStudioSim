@@ -50,6 +50,9 @@ pub(super) struct DiscoveredRun {
     pub(super) workspace_id: String,
     pub(super) run_id: String,
     pub(super) display_name: String,
+    /// Configured root that owns this run. Run parameters resolve `logs/...`
+    /// trace paths against this root, not against the Analyzer checkout.
+    pub(super) logs_root: PathBuf,
     pub(super) path: PathBuf,
     pub(super) lifecycle: Lifecycle,
     pub(super) updated_time: SystemTime,
@@ -192,6 +195,7 @@ fn discover_runs_under_root(root: &ConfiguredRoot, runs: &mut Vec<DiscoveredRun>
                 workspace_id: root.workspace_id.clone(),
                 run_id: opaque_run_id(&root.workspace_id, relative),
                 display_name: display_name(&root.path, relative),
+                logs_root: root.path.clone(),
                 lifecycle: run_lifecycle(&directory),
                 updated_time: run_updated_at(&directory),
                 path: directory,

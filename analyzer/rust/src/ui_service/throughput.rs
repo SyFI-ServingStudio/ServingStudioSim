@@ -24,8 +24,7 @@ pub(super) fn throughput_descriptor(run: &DiscoveredRun) -> Result<Option<Value>
     Ok(Some(json!({
         "status": "ready",
         "schema_version": 1,
-        "report_href": "subjects/throughput/report",
-        "payload_href": "subjects/throughput/payload",
+        "views": ["report", "payload"],
     })))
 }
 

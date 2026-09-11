@@ -125,7 +125,7 @@ kernel evidence for all E2E cases. Both coverage denominators and each report's
 original prediction/label provenance remain explicit.
 
 The server latency sidecar selects only the `server_ttft` and `server_tpot` fields
-from each completed warm bundle's `/api/v1/alignments/{id}/subjects/e2e/report`.
+from each completed warm bundle's `/api/analyzer/v1/alignments/{id}/subjects/e2e/report`.
 It preserves each metric's sample count, measured/simulated percentiles in ms,
 resource ID and SHA-256 of the HTTP response. Refresh these exact resources when reports change; derive displayed errors as `(simulated/measured - 1)*100`.
 Keep unavailable cases visible and never substitute client fields or means.

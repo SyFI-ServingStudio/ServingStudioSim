@@ -22,8 +22,7 @@ pub(super) fn kernel_input_distribution_descriptor(run: &DiscoveredRun) -> Resul
     Ok(Some(json!({
         "status": "ready",
         "schema_version": 1,
-        "report_href": "subjects/kernel-input-distribution/report",
-        "payload_href": "subjects/kernel-input-distribution/payload",
+        "views": ["report", "payload"],
     })))
 }
 

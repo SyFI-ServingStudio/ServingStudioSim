@@ -24,8 +24,7 @@ pub(super) fn slo_general_descriptor(run: &DiscoveredRun) -> Result<Option<Value
     Ok(Some(json!({
         "status": "ready",
         "schema_version": 1,
-        "report_href": "subjects/slo-general/report",
-        "payload_href": "subjects/slo-general/payload",
+        "views": ["report", "payload"],
     })))
 }
 
