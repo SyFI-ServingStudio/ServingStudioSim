@@ -106,6 +106,10 @@ struct SweepCatalogEntry {
     deployments: Vec<String>,
     traces: Vec<String>,
     updated_at: String,
+    /// Present for singletons so a catalog consumer can open the run analyzer
+    /// directly instead of hopping through the one-run aggregate page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run_id: Option<String>,
 }
 
 #[cfg(test)]
@@ -134,6 +138,10 @@ pub(super) fn build_filtered_sweep_catalog(
             deployments: sweep.deployments,
             traces: sweep.traces,
             updated_at: timestamp(sweep.updated_time),
+            run_id: match &sweep.source {
+                AggregateSource::Singleton(run) => Some(run.run_id.clone()),
+                AggregateSource::Manifest(_) => None,
+            },
         })
         .collect();
     Ok(SweepCatalog {

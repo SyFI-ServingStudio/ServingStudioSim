@@ -16,6 +16,7 @@ use serde_json::{json, Value};
 use super::artifact::read_json;
 use super::artifact_kind::{read_artifact_kind, ArtifactKind};
 use super::discovery::{ignored_directory_name, regular_file, timestamp, ConfiguredRoot};
+use super::scoped_optimality::scoped_optimality_capability;
 use super::worker_detail::{prediction_case_summary, CostLogSource, OperationIndexCache};
 use super::{PredictionNotFound, PROTOCOL_VERSION};
 
@@ -296,6 +297,7 @@ pub(super) fn prediction_descriptor(prediction: &DiscoveredPrediction) -> Value 
             } else {
                 Value::Null
             },
+            "scoped-optimality": scoped_optimality_capability(&prediction.path),
         },
     })
 }

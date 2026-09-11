@@ -52,10 +52,15 @@ struct GroupParams {
 struct ArchParams {
     #[serde(rename = "type")]
     arch_type: String,
+    #[serde(default)]
+    fp8: bool,
 }
 
 struct PoolModelSpec {
     arch_type: String,
+    /// The pool-wide precision rule that predates per-row `compute_dtype`.
+    /// Used only for semantic rows whose labeler did not report a dtype.
+    fallback_dtype: String,
 }
 
 /// Run-scoped semantic attribution inputs. Params and every mapping file are
@@ -91,13 +96,15 @@ impl LocationCatalog {
                 .into_iter()
                 .next()
                 .with_context(|| format!("params has no group for pool {pool_tag:?}"))?;
-            // The pool's precision is deliberately NOT read from `arch.fp8` here:
-            // the labeler reports a compute dtype per semantic row, which is the
-            // only description that survives a mixed-precision checkpoint.
+            // The pool's precision is deliberately NOT preferred over the
+            // labeler's per-row compute dtype, which is the only description
+            // that survives a mixed-precision checkpoint. `arch.fp8` remains
+            // only as the fallback for rows from pre-compute_dtype labelers.
             pool_specs.insert(
                 pool_tag,
                 PoolModelSpec {
                     arch_type: group.arch.arch_type,
+                    fallback_dtype: if group.arch.fp8 { "fp8" } else { "bf16" }.to_owned(),
                 },
             );
         }
@@ -217,11 +224,15 @@ impl LocationCatalog {
                 .segments
                 .iter()
                 .map(|segment| {
-                    let peak_tflops = gpu_spec.peak_tflops(&segment.compute_dtype);
+                    // Pre-compute_dtype labelers implied the pool's model dtype.
+                    let dtype = segment
+                        .compute_dtype
+                        .as_deref()
+                        .unwrap_or(&pool_spec.fallback_dtype);
+                    let peak_tflops = gpu_spec.peak_tflops(dtype);
                     if peak_tflops <= 0.0 {
                         bail!(
-                            "GPU spec lacks a positive {} compute peak, needed by semantic row {:?}",
-                            segment.compute_dtype,
+                            "GPU spec lacks a positive {dtype} compute peak, needed by semantic row {:?}",
                             segment.name
                         );
                     }
@@ -462,7 +473,7 @@ mod tests {
             flops: 1.0,
             bytes: 2.0,
             necessary_gpu_s: 2.0,
-            compute_dtype: "bf16".to_string(),
+            compute_dtype: Some("bf16".to_string()),
         }
     }
 
@@ -508,7 +519,7 @@ mod tests {
             flops,
             bytes,
             necessary_gpu_s,
-            compute_dtype: "bf16".to_string(),
+            compute_dtype: Some("bf16".to_string()),
         }
     }
 
@@ -547,6 +558,7 @@ mod tests {
                 "unified".to_string(),
                 PoolModelSpec {
                     arch_type: "test_arch".to_string(),
+                    fallback_dtype: "bf16".to_string(),
                 },
             )]),
         };
