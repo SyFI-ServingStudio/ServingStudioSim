@@ -23,6 +23,7 @@ mod model;
 mod optimality;
 mod prediction;
 mod request_state;
+mod scoped_optimality;
 mod slo;
 mod sweep;
 #[cfg(test)]
@@ -100,6 +101,7 @@ use prediction::{
     DiscoveredPrediction,
 };
 use request_state::{read_request_state_payload, read_request_state_report};
+use scoped_optimality::scoped_optimality_report;
 use slo::{read_slo_general_payload, read_slo_general_report};
 use sweep::{
     build_filtered_sweep_catalog, read_sweep_payload, resolve_sweep, SweepCatalogFilter,
@@ -391,6 +393,10 @@ fn read_only_router(state: ServiceState) -> Router {
             get(get_prediction_kernel_throughput_analysis),
         )
         .route(
+            "/api/analyzer/v1/predictions/{prediction_id}/subjects/scoped-optimality/report",
+            get(get_prediction_scoped_optimality),
+        )
+        .route(
             "/api/analyzer/v1/predictions/{prediction_id}/cases/{case_id}/subjects/optimality-kernel-ladder/payload",
             get(get_prediction_optimality_kernel_ladder),
         )
@@ -513,6 +519,10 @@ fn read_only_router(state: ServiceState) -> Router {
         .route(
             "/api/analyzer/v1/runs/{run_id}/subjects/optimality/payload",
             get(get_optimality_payload),
+        )
+        .route(
+            "/api/analyzer/v1/runs/{run_id}/subjects/scoped-optimality/report",
+            get(get_run_scoped_optimality),
         )
         .route(
             "/api/analyzer/v1/runs/{run_id}/subjects/optimality/variants/batch_locked/report",
@@ -996,6 +1006,57 @@ async fn get_prediction_kernel_throughput_analysis(
         Ok(Ok(value)) => Json(value).into_response(),
         Ok(Err(error)) => prediction_resource_error(error),
         Err(error) => prediction_resource_error(anyhow::anyhow!(error)),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ScopedOptimalityQuery {
+    path: Option<String>,
+    label: Option<String>,
+}
+
+fn missing_scoped_selector(query: &ScopedOptimalityQuery) -> Option<Response> {
+    (query.path.is_none() && query.label.is_none()).then(|| {
+        problem(
+            StatusCode::BAD_REQUEST,
+            "scope_selector_missing",
+            "Provide a `path` or `label` query parameter naming a CostTree node.",
+        )
+    })
+}
+
+fn scoped_optimality_error(error: anyhow::Error) -> Response {
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(json!({
+            "code": "scoped_optimality_failed",
+            "detail": format!("{error:#}"),
+        })),
+    )
+        .into_response()
+}
+
+async fn get_prediction_scoped_optimality(
+    RoutePath(prediction_id): RoutePath<String>,
+    Query(query): Query<ScopedOptimalityQuery>,
+    State(state): State<ServiceState>,
+) -> Response {
+    if let Some(response) = missing_scoped_selector(&query) {
+        return response;
+    }
+    let prediction = match state.resolve_prediction(&prediction_id) {
+        Ok(prediction) => prediction,
+        Err(error) => return prediction_resource_error(error),
+    };
+    match scoped_optimality_report(
+        &prediction.path,
+        query.path.as_deref(),
+        query.label.as_deref(),
+    )
+    .await
+    {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => scoped_optimality_error(error),
     }
 }
 
@@ -1528,6 +1589,38 @@ async fn get_optimality_payload(
     State(state): State<ServiceState>,
 ) -> Response {
     read_run_resource(state, run_id, |run| read_optimality_payload(&run)).await
+}
+
+async fn get_run_scoped_optimality(
+    RoutePath(run_id): RoutePath<String>,
+    Query(query): Query<ScopedOptimalityQuery>,
+    State(state): State<ServiceState>,
+) -> Response {
+    if let Some(response) = missing_scoped_selector(&query) {
+        return response;
+    }
+    let run = match state.resolve_run(&run_id) {
+        Ok(run) => run,
+        Err(error) if error.downcast_ref::<RunNotFound>().is_some() => {
+            return problem(
+                StatusCode::NOT_FOUND,
+                "run_not_found",
+                "The requested run is not present below the configured logs roots.",
+            )
+        }
+        Err(error) => {
+            eprintln!("[analyze] scoped optimality discovery failed: {error:#}");
+            return problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "artifact_read_failed",
+                "The requested run resource could not be read.",
+            );
+        }
+    };
+    match scoped_optimality_report(&run.path, query.path.as_deref(), query.label.as_deref()).await {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => scoped_optimality_error(error),
+    }
 }
 
 async fn get_locked_optimality_report(

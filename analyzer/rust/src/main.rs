@@ -83,6 +83,21 @@ enum Command {
         /// in its `reports/` and `payloads/` subdirectories.
         experiment_dir: PathBuf,
     },
+    /// Analyze one CostTree subtree without changing the existing run reports.
+    /// The command writes `reports/optimality_scoped_<slug>.json` only.
+    OptimalityScoped {
+        /// Run directory (holds `raw/cost_log/` and `raw/cost_manifest/`).
+        log_dir: PathBuf,
+        /// Stable CostTree path, for example `iter/1` (the layer Scale node).
+        /// The first component may name the section; child components are
+        /// zero-based ordinals among the selected node's children.
+        #[arg(long)]
+        path: Option<String>,
+        /// Exact CostTree node label. Use `section::label` when a label is
+        /// repeated across sections.
+        #[arg(long)]
+        label: Option<String>,
+    },
     /// List the available analyzer subjects and what each produces.
     List,
     /// Serve the read-only protocol-v1 run catalog for viz-ui.
@@ -172,6 +187,14 @@ async fn main() -> Result<()> {
             subjects,
         } => alignment(analysis_log_dir, subjects).await,
         Command::Sweep { experiment_dir } => sweep::run(&experiment_dir),
+        Command::OptimalityScoped {
+            log_dir,
+            path,
+            label,
+        } => {
+            let ctx = build_session();
+            optimality::run_scoped(&ctx, &log_dir, path.as_deref(), label.as_deref()).await
+        }
         Command::Trace {
             log_dir,
             regions,

@@ -470,6 +470,21 @@ async fn get_json(router: Router, uri: &str) -> (StatusCode, Value) {
     (status, value)
 }
 
+#[tokio::test]
+async fn scoped_optimality_routes_require_an_explicit_scope_selector() {
+    let temporary = TempDir::new().expect("temporary logs root");
+    let router = prediction_test_router(temporary.path());
+
+    for uri in [
+        "/api/analyzer/v1/runs/r_missing/subjects/scoped-optimality/report",
+        "/api/analyzer/v1/predictions/p_missing/subjects/scoped-optimality/report",
+    ] {
+        let (status, problem) = get_json(router.clone(), uri).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(problem["code"], "scope_selector_missing");
+    }
+}
+
 fn make_core_run(path: &Path) {
     write_artifact_marker(path, "simulation_run");
     fs::create_dir_all(path.join("raw")).expect("create raw directory");
