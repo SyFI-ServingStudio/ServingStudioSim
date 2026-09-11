@@ -197,7 +197,7 @@ pub(super) fn details_descriptor(run: &DiscoveredRun) -> Option<Value> {
         json!({
             "status": "ready",
             "schema_version": 1,
-            "href": "workers",
+            "views": ["payload"],
         })
     })
 }

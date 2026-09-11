@@ -24,8 +24,7 @@ pub(super) fn utilization_descriptor(run: &DiscoveredRun) -> Result<Option<Value
     Ok(Some(json!({
         "status": "ready",
         "schema_version": 1,
-        "report_href": "subjects/utilization/report",
-        "payload_href": "subjects/utilization/payload",
+        "views": ["report", "payload"],
     })))
 }
 

@@ -3,7 +3,7 @@
 //! This is the crate-level home of the exact, case-insensitive `name` / `aliases`
 //! lookup that both consumers share:
 //!
-//! - `ui_service/hardware.rs` - the read-only `/api/v1/hardware/gpus` endpoint
+//! - `ui_service/hardware.rs` - the read-only `/api/analyzer/v1/hardware/gpus` endpoint
 //!   and the curve/series hardware ceilings. Unknown dtype or GPU yields `None` /
 //!   `unavailable`, never a fabricated default (e.g. H200).
 //! - `optimality/spec.rs` - the R5 hardware-limit rung. It adapts the same

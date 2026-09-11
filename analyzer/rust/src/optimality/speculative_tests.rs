@@ -19,12 +19,17 @@ async fn speculative_exact_iteration_handoff_reconciles_r6_r7() {
         .unwrap()
         .parent()
         .unwrap();
+    // The run must sit under a logs root for discovery to find it, but `logs/`
+    // is untracked working data — a fresh clone or worktree does not have one,
+    // and `tempdir_in` on a missing directory fails before the test starts.
+    let logs = repo.join("logs");
+    std::fs::create_dir_all(&logs).unwrap();
     for (mode, depth, mapping) in [
         ("index_share", 5, "index_share"),
         ("full_index", 5, "full_index"),
         ("index_share", 1, "single_draft"),
     ] {
-        let dir = tempfile::tempdir_in(repo.join("logs")).unwrap();
+        let dir = tempfile::tempdir_in(&logs).unwrap();
         std::fs::create_dir(dir.path().join("raw")).unwrap();
         std::fs::write(dir.path().join("raw/params.json"), json!({"pools":{"main":{"groups":[{
             "gpu":"NVIDIA B200", "arch":{"type":"glm52_vllm_nvfp4_dsa_moe_speculative",

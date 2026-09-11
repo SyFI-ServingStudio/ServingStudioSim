@@ -24,8 +24,7 @@ pub(super) fn concurrency_descriptor(run: &DiscoveredRun) -> Result<Option<Value
     Ok(Some(json!({
         "status": "ready",
         "schema_version": 1,
-        "report_href": "subjects/concurrency/report",
-        "payload_href": "subjects/concurrency/payload",
+        "views": ["report", "payload"],
     })))
 }
 

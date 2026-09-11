@@ -31,6 +31,12 @@ tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
 # The first UI wiring slice exposes only a read-only run catalog. Axum owns the
 # small HTTP surface; filesystem discovery remains explicit in this crate.
 axum = "0.8"
+# Response compression as a layer over the whole route table. Every JSON
+# response the UI reads goes out compressed, rather than the one alignment path
+# that used to gzip itself by hand. Brotli is included because browsers prefer
+# it and it is meaningfully smaller on the large analysis payloads; gzip stays
+# for anything that does not ask for br.
+tower-http = { version = "0.6", features = ["compression-br", "compression-gzip"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 sha2 = "0.10"
 # Pure-Rust linear algebra — used only by `src/pca.rs` for the symmetric
