@@ -14,6 +14,7 @@ use super::kv_occupancy::kv_occupancy_descriptor;
 use super::model::model_config_path;
 use super::optimality::optimality_descriptor;
 use super::request_state::request_state_descriptor;
+use super::scoped_optimality::scoped_optimality_subject_descriptor;
 use super::slo::slo_general_descriptor;
 use super::throughput::throughput_descriptor;
 use super::utilization::utilization_descriptor;
@@ -47,7 +48,7 @@ pub(super) fn build_descriptor(run: &DiscoveredRun) -> Result<Value> {
         "display_name": run.display_name,
         "deployment": deployment,
         "lifecycle": run.lifecycle,
-        "summary": { "href": "summary" },
+        "summary": { "views": ["report"] },
         "subjects": {},
         "details": {},
         "traces": {},
@@ -55,7 +56,7 @@ pub(super) fn build_descriptor(run: &DiscoveredRun) -> Result<Value> {
 
     if regular_file(&run.path.join("raw/run_meta.json")) {
         descriptor["topology"] = json!({
-            "href": "topology",
+            "views": ["payload"],
             "media_type": "application/json",
             "schema_version": 1,
         });
@@ -63,14 +64,14 @@ pub(super) fn build_descriptor(run: &DiscoveredRun) -> Result<Value> {
     if let Some(model_config) = model_config_path(&params)? {
         descriptor["model_name"] = Value::String(model_config);
         descriptor["model"] = json!({
-            "href": "model",
+            "views": ["payload"],
             "media_type": "application/json",
             "schema_version": 2,
         });
     }
     if !trace_file_paths(&params)?.is_empty() {
         descriptor["workload"] = json!({
-            "href": "workload",
+            "views": ["payload"],
             "media_type": "application/json",
             "schema_version": 1,
         });
@@ -101,6 +102,9 @@ pub(super) fn build_descriptor(run: &DiscoveredRun) -> Result<Value> {
     }
     if let Some(kernel_time_share) = kernel_time_share_descriptor(run)? {
         descriptor["subjects"]["kernel-time-share"] = kernel_time_share;
+    }
+    if let Some(scoped_optimality) = scoped_optimality_subject_descriptor(&run.path) {
+        descriptor["subjects"]["scoped-optimality"] = scoped_optimality;
     }
     let optimality_ready = if let Some(optimality) = optimality_descriptor(run)? {
         descriptor["subjects"]["optimality"] = optimality;

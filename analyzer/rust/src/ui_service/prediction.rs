@@ -16,6 +16,7 @@ use serde_json::{json, Value};
 use super::artifact::read_json;
 use super::artifact_kind::{read_artifact_kind, ArtifactKind};
 use super::discovery::{ignored_directory_name, regular_file, timestamp, ConfiguredRoot};
+use super::scoped_optimality::scoped_optimality_capability;
 use super::worker_detail::{prediction_case_summary, CostLogSource, OperationIndexCache};
 use super::{PredictionNotFound, PROTOCOL_VERSION};
 
@@ -88,7 +89,6 @@ struct PredictionCatalogEntry {
     gpu: String,
     case_count: usize,
     status: &'static str,
-    descriptor_href: String,
     updated_at: String,
 }
 
@@ -109,7 +109,6 @@ pub(super) fn build_prediction_catalog(roots: &[ConfiguredRoot]) -> Result<Predi
                 "pending"
             };
             PredictionCatalogEntry {
-                descriptor_href: format!("predictions/{}/descriptor", prediction.prediction_id()),
                 workspace_id: prediction.workspace_id,
                 prediction_id: prediction.metadata.prediction_id,
                 kind: "timing_predict",
@@ -292,11 +291,13 @@ pub(super) fn prediction_descriptor(prediction: &DiscoveredPrediction) -> Value 
             "analysis": if prediction.analysis_ready() { "complete" } else { "not_started" },
         },
         "resources": {
-            "cases_href": format!("predictions/{}/cases", prediction.prediction_id()),
-            "kernel_input_distribution_href": prediction.analysis_ready().then(|| format!(
-                "predictions/{}/subjects/kernel-input-distribution/payload",
-                prediction.prediction_id()
-            )),
+            "cases": { "views": ["payload"] },
+            "kernel-input-distribution": if prediction.analysis_ready() {
+                json!({ "views": ["payload"] })
+            } else {
+                Value::Null
+            },
+            "scoped-optimality": scoped_optimality_capability(&prediction.path),
         },
     })
 }

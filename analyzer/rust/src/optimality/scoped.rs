@@ -321,7 +321,8 @@ pub(crate) async fn compute_scoped(
                 RungReport {
                     value_gpu_seconds: floors.r6_gpu_s,
                     unit: "GPU-seconds",
-                    definition: "sum of per-semantic model.work hardware rooflines in the selected scope",
+                    definition:
+                        "sum of per-semantic model.work hardware rooflines in the selected scope",
                 },
             );
             rungs.insert(
@@ -411,9 +412,7 @@ fn parse_path(raw: &str) -> Result<ParsedPath> {
             continue;
         }
         let ordinal = component.parse::<usize>().with_context(|| {
-            format!(
-                "invalid CostTree path {raw:?}: {component:?} is not a child ordinal"
-            )
+            format!("invalid CostTree path {raw:?}: {component:?} is not a child ordinal")
         })?;
         ordinals.push(ordinal);
     }
@@ -478,8 +477,8 @@ fn resolve_selection(
             ancestor_scale: matched.ancestor_scale,
         });
     }
-    let signature =
-        expected_signature.ok_or_else(|| anyhow!("CostTree selector matched no node in any cost manifest"))?;
+    let signature = expected_signature
+        .ok_or_else(|| anyhow!("CostTree selector matched no node in any cost manifest"))?;
     let mut occurrence_index = HashMap::new();
     for (index, occurrence) in occurrences.iter().enumerate() {
         let key = (
@@ -527,7 +526,9 @@ fn resolve_in_doc(selector: &Selector, doc: &ManifestDoc) -> Result<Vec<NodeMatc
                 {
                     Ok(vec![path_match.clone()])
                 }
-                (Some(_), Some(_)) => bail!("--path and --label resolve to different CostTree nodes"),
+                (Some(_), Some(_)) => {
+                    bail!("--path and --label resolve to different CostTree nodes")
+                }
                 _ => Ok(Vec::new()),
             }
         }
@@ -772,8 +773,8 @@ fn canonical_path(signature: &NodeSignature) -> String {
 
 fn load_hardware_inputs(log_dir: &Path, selection: &Selection) -> HardwareInputs {
     let params = read_params(log_dir);
-    let run_gpu_name = read_run_meta(log_dir)
-        .and_then(|(_, name)| (!name.trim().is_empty()).then_some(name));
+    let run_gpu_name =
+        read_run_meta(log_dir).and_then(|(_, name)| (!name.trim().is_empty()).then_some(name));
     let mut gpu_counts = read_worker_gpu_counts(log_dir)
         .unwrap_or_default()
         .into_iter()
@@ -877,9 +878,10 @@ async fn measure_scope(
             }
             let worker = worker_value as u16;
             let section = value_string(section_column, row)?;
-            let Some(&occurrence_index) = selection
-                .occurrence_index
-                .get(&(pool.clone(), worker, section.clone()))
+            let Some(&occurrence_index) =
+                selection
+                    .occurrence_index
+                    .get(&(pool.clone(), worker, section.clone()))
             else {
                 continue;
             };
@@ -887,9 +889,9 @@ async fn measure_scope(
             let manifest_doc = manifests
                 .get(&occurrence.worker)
                 .with_context(|| format!("selected worker {:?} disappeared", occurrence.worker))?;
-            let manifest = manifest_doc
-                .section(&occurrence.section)
-                .with_context(|| format!("selected section {:?} disappeared", occurrence.section))?;
+            let manifest = manifest_doc.section(&occurrence.section).with_context(|| {
+                format!("selected section {:?} disappeared", occurrence.section)
+            })?;
             let scope_row = ScopeRow {
                 slot_time_ms: value_f32_list(times_column, row)?,
                 slot_flops: value_f32_list(flops_column, row)?,
@@ -957,7 +959,10 @@ fn validate_row(manifest: &Manifest, row: &ScopeRow) -> Result<()> {
                 values.len()
             );
         }
-        if values.iter().any(|value| !value.is_finite() || *value < 0.0) {
+        if values
+            .iter()
+            .any(|value| !value.is_finite() || *value < 0.0)
+        {
             bail!("selected CostTree row has invalid {name} values");
         }
     }
@@ -1116,15 +1121,12 @@ async fn compute_semantic_floors(
         }
 
         let selected = selected_semantics(map, manifest_doc, occurrence)?;
-        let composition = labels
-            .workers
-            .get(&occurrence.worker)
-            .with_context(|| {
-                format!(
-                    "model.work label missing for selected worker {:?}",
-                    occurrence.worker
-                )
-            })?;
+        let composition = labels.workers.get(&occurrence.worker).with_context(|| {
+            format!(
+                "model.work label missing for selected worker {:?}",
+                occurrence.worker
+            )
+        })?;
         let label = composition
             .labels
             .first()
@@ -1165,14 +1167,13 @@ async fn compute_semantic_floors(
             total_bytes += segment.bytes;
         }
     }
-    let (_, dtype, _, spec) =
-        common_hardware.context("selected semantic scope has no workers")?;
+    let (_, dtype, _, spec) = common_hardware.context("selected semantic scope has no workers")?;
     let peak_tflops = spec.peak_tflops(&dtype);
     if peak_tflops <= 0.0 || spec.mem_bandwidth_gbps <= 0.0 {
         bail!("selected semantic scope has no positive fused hardware ceiling");
     }
-    let r7 = (total_flops / (peak_tflops * 1e12))
-        .max(total_bytes / (spec.mem_bandwidth_gbps * 1e9));
+    let r7 =
+        (total_flops / (peak_tflops * 1e12)).max(total_bytes / (spec.mem_bandwidth_gbps * 1e9));
     Ok(SemanticFloors {
         r6_gpu_s: segmented_gpu_s,
         r7_gpu_s: r7,
@@ -1211,7 +1212,10 @@ fn load_location_maps(root: &Path) -> Result<Vec<LocationMap>> {
         let mut names = BTreeSet::new();
         for location in &map.locations {
             if !names.insert(location.location.as_str()) {
-                bail!("location map {:?} contains duplicate location", map.mapping_id);
+                bail!(
+                    "location map {:?} contains duplicate location",
+                    map.mapping_id
+                );
             }
         }
         maps.push(map);
@@ -1233,7 +1237,11 @@ fn select_location_map<'a>(
         .collect::<BTreeSet<_>>();
     let candidates = maps
         .iter()
-        .filter(|map| map.arch_types.iter().any(|candidate| candidate == arch_type))
+        .filter(|map| {
+            map.arch_types
+                .iter()
+                .any(|candidate| candidate == arch_type)
+        })
         .filter(|map| {
             map.locations
                 .iter()
@@ -1373,8 +1381,8 @@ fn semantic_floor_values(
         };
         flops += segment.flops;
         bytes += segment.bytes;
-        segmented += (segment.flops / (peak * 1e12))
-            .max(segment.bytes / (spec.mem_bandwidth_gbps * 1e9));
+        segmented +=
+            (segment.flops / (peak * 1e12)).max(segment.bytes / (spec.mem_bandwidth_gbps * 1e9));
     }
     let fused = (flops / (peak * 1e12)).max(bytes / (spec.mem_bandwidth_gbps * 1e9));
     Ok((segmented, fused))
@@ -1465,8 +1473,11 @@ mod tests {
         let occurrence = &selection.occurrences[0];
         assert_eq!(selection.signature.leaves, ["q_norm", "k_norm"]);
         assert_eq!(occurrence.ancestor_scale, 1.0);
-        let weights =
-            selected_leaf_weights(&sample_manifest(), occurrence.node_idx, occurrence.ancestor_scale);
+        let weights = selected_leaf_weights(
+            &sample_manifest(),
+            occurrence.node_idx,
+            occurrence.ancestor_scale,
+        );
         assert_eq!(weights, vec![(1, 2.0), (2, 2.0)]);
     }
 
@@ -1519,8 +1530,7 @@ mod tests {
         }];
         let selected = BTreeSet::from(["q_norm".to_owned()]);
         let spec = test_spec();
-        let (segmented, fused) =
-            semantic_floor_values(&segments, &selected, spec, "bf16").unwrap();
+        let (segmented, fused) = semantic_floor_values(&segments, &selected, spec, "bf16").unwrap();
         assert!(segmented >= fused);
         let missing = BTreeSet::from(["k_norm".to_owned()]);
         let error = semantic_floor_values(&segments, &missing, spec, "bf16").unwrap_err();

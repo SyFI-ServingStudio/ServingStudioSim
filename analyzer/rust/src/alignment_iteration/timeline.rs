@@ -37,22 +37,22 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{ensure, Context, Result};
 use datafusion::prelude::SessionContext;
 use rayon::prelude::*;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::path::Path;
 
 use super::host::{self, HostWindow};
 use super::{
-    CaseMapDoc, CompiledInventory, DutyCycleSample, IterationMeasurement, JsonlShardWriter,
-    MeasuredIteration, SimCase, duty_cycle_recommendation, interval_union_ns, kernel_name_index,
-    leaf_scales, load_inventory, load_sim_cases, measure_iteration, measured_critical_path,
-    measured_gpu_cycles_ms, occurrence_ns, parsed_trace, physical_kernel_rows,
-    pooled_gpu_time_multiplier, read_json, screen_duty_cycle_outliers, single_iter_manifest,
+    duty_cycle_recommendation, interval_union_ns, kernel_name_index, leaf_scales, load_inventory,
+    load_sim_cases, measure_iteration, measured_critical_path, measured_gpu_cycles_ms,
+    occurrence_ns, parsed_trace, physical_kernel_rows, pooled_gpu_time_multiplier, read_json,
+    screen_duty_cycle_outliers, single_iter_manifest, CaseMapDoc, CompiledInventory,
+    DutyCycleSample, IterationMeasurement, JsonlShardWriter, MeasuredIteration, SimCase,
 };
 use crate::alignment_input;
-use crate::io::{SCHEMA_VERSION, read_cost_manifests, resolve_artifact_path};
+use crate::io::{read_cost_manifests, resolve_artifact_path, SCHEMA_VERSION};
 
 /// How many representatives the default selection names. Not a payload-size
 /// bound — the detail is sharded — but a curation one: a picker listing two
@@ -639,7 +639,7 @@ fn select_iterations(
     let mut priority = Vec::new();
     let mut rest = Vec::new();
     for entry in ordered {
-        if seen_types.insert(entry.0.0) {
+        if seen_types.insert(entry.0 .0) {
             priority.push(entry);
         } else {
             rest.push(entry);

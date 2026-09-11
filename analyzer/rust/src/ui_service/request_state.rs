@@ -24,8 +24,7 @@ pub(super) fn request_state_descriptor(run: &DiscoveredRun) -> Result<Option<Val
     Ok(Some(json!({
         "status": "ready",
         "schema_version": 1,
-        "report_href": "subjects/request-state/report",
-        "payload_href": "subjects/request-state/payload",
+        "views": ["report", "payload"],
     })))
 }
 

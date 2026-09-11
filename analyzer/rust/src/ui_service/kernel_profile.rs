@@ -106,7 +106,6 @@ pub(super) struct KernelProfileCatalogEntry {
     provenance_source: String,
     legacy: bool,
     status: &'static str,
-    descriptor_href: String,
     updated_at: String,
 }
 
@@ -235,7 +234,6 @@ fn catalog_entry(profile: &DiscoveredKernelProfile) -> KernelProfileCatalogEntry
         } else {
             "pending"
         },
-        descriptor_href: format!("kernel-profiles/{}/descriptor", profile.profile_id),
         updated_at: timestamp(profile.updated_time),
     }
 }
@@ -345,7 +343,7 @@ pub(super) fn profile_descriptor(profile: &DiscoveredKernelProfile) -> Value {
     let identity = kernel_identity(profile);
     let kind = identity.kind.clone().or_else(|| identity.table.clone());
     let resources = json!({
-        "curve_href": format!("kernel-profiles/{}/curve", profile.profile_id()),
+        "curve": { "views": ["payload"] },
     });
     let metadata = profile.metadata.as_ref();
     let created_at = metadata.and_then(|meta| meta.created_at.clone());

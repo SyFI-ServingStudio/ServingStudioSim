@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -34,7 +35,10 @@ use super::kernel_profile::{
     build_kernel_profile_catalog, discover_kernel_profiles, profile_curve, profile_descriptor,
     resolve_kernel_profile,
 };
-use super::kernel_time_share::{read_kernel_time_share_payload, read_kernel_time_share_report};
+use super::kernel_time_share::{
+    read_kernel_time_share_payload, read_kernel_time_share_report,
+    read_kernel_time_share_worker_payload,
+};
 use super::kv_occupancy::{read_kv_occupancy_payload, read_kv_occupancy_report};
 use super::model::read_model;
 use super::optimality::{
@@ -54,6 +58,7 @@ use super::workload::read_workload;
 use super::workload_conservation::{
     read_workload_conservation_payload, read_workload_conservation_report,
 };
+use super::ArtifactNotFound;
 use super::{
     service_router, timeline_profile_log_line, OperationIndexCache, RootSource, ServiceState,
     TimelineProfileEvent,
@@ -465,6 +470,21 @@ async fn get_json(router: Router, uri: &str) -> (StatusCode, Value) {
     (status, value)
 }
 
+#[tokio::test]
+async fn scoped_optimality_routes_require_an_explicit_scope_selector() {
+    let temporary = TempDir::new().expect("temporary logs root");
+    let router = prediction_test_router(temporary.path());
+
+    for uri in [
+        "/api/analyzer/v1/runs/r_missing/subjects/scoped-optimality/report",
+        "/api/analyzer/v1/predictions/p_missing/subjects/scoped-optimality/report",
+    ] {
+        let (status, problem) = get_json(router.clone(), uri).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(problem["code"], "scope_selector_missing");
+    }
+}
+
 fn make_core_run(path: &Path) {
     write_artifact_marker(path, "simulation_run");
     fs::create_dir_all(path.join("raw")).expect("create raw directory");
@@ -715,9 +735,34 @@ fn make_core_run(path: &Path) {
                     "share_pct": 100.0
                 }]
             },
-            "pools": [],
-            "workers": [],
-            "positions": [],
+            "pools": [{
+                "pool_tag": "attn",
+                "num_workers": 1,
+                "kernel_time_ms": 10.0,
+                "segments": [{
+                    "position": "attn.decode",
+                    "kind": "flashinfer_attn_decode",
+                    "kernel_time_ms": 10.0,
+                    "share_pct": 100.0
+                }]
+            }],
+            "workers": [{
+                "pool_tag": "attn",
+                "worker_id": 0,
+                "kernel_time_ms": 10.0,
+                "raw_rows": 400,
+                "sampled_rows": 40,
+                "sample_stride": 10,
+                "segments": [{
+                    "position": "attn.decode",
+                    "kind": "flashinfer_attn_decode",
+                    "kernel_time_ms": 10.0,
+                    "share_pct": 100.0
+                }]
+            }],
+            "positions": [
+                {"name": "attn.decode", "kind": "flashinfer_attn_decode", "overall_share_pct": 100.0}
+            ],
             "definitions": {
                 "tree_attribution": "critical path with Sum/Scale/Max/overlap"
             }
@@ -938,13 +983,16 @@ async fn prediction_http_routes_publish_catalog_descriptor_cases_and_problem_jso
     make_prediction_cost_source(&prediction_path);
     let router = prediction_test_router(temporary.path());
 
-    let (catalog_status, catalog) = get_json(router.clone(), "/api/v1/predictions").await;
+    let (catalog_status, catalog) = get_json(router.clone(), "/api/analyzer/v1/predictions").await;
     assert_eq!(catalog_status, StatusCode::OK);
     assert_eq!(catalog["predictions"][0]["prediction_id"], "p_http_test");
     assert_eq!(catalog["predictions"][0]["status"], "ready");
 
-    let (descriptor_status, descriptor) =
-        get_json(router.clone(), "/api/v1/predictions/p_http_test/descriptor").await;
+    let (descriptor_status, descriptor) = get_json(
+        router.clone(),
+        "/api/analyzer/v1/predictions/p_http_test/descriptor",
+    )
+    .await;
     assert_eq!(descriptor_status, StatusCode::OK);
     assert_eq!(descriptor["kind"], "timing_predict");
     assert_eq!(descriptor["lifecycle"]["prediction"], "complete");
@@ -953,7 +1001,7 @@ async fn prediction_http_routes_publish_catalog_descriptor_cases_and_problem_jso
 
     let (cases_status, cases) = get_json(
         router.clone(),
-        "/api/v1/predictions/p_http_test/cases?offset=0&limit=10",
+        "/api/analyzer/v1/predictions/p_http_test/subjects/cases/payload?offset=0&limit=10",
     )
     .await;
     assert_eq!(cases_status, StatusCode::OK);
@@ -969,7 +1017,7 @@ async fn prediction_http_routes_publish_catalog_descriptor_cases_and_problem_jso
     assert!(cases["cases"][0].get("worker").is_none());
 
     let (missing_status, missing) =
-        get_json(router, "/api/v1/predictions/p_absent/descriptor").await;
+        get_json(router, "/api/analyzer/v1/predictions/p_absent/descriptor").await;
     assert_eq!(missing_status, StatusCode::NOT_FOUND);
     assert_eq!(missing["code"], "prediction_not_found");
     assert!(missing["detail"]
@@ -1170,11 +1218,9 @@ fn discovers_nested_runs_and_ignores_directory_shells() {
     let completed_value = serde_json::to_value(completed).expect("serialize completed run");
     assert_eq!(completed_value["lifecycle"]["simulation"], "complete");
     assert_eq!(completed_value["lifecycle"]["analysis"], "complete");
+    // The id is the whole identity a catalog row owes the client. Its addresses
+    // follow from `runs/{run_id}/…`, so the row does not restate them.
     assert!(completed.run_id.starts_with("r_"));
-    assert_eq!(
-        completed.descriptor_href,
-        format!("runs/{}/descriptor", completed.run_id)
-    );
 
     let pending = catalog
         .runs
@@ -1284,7 +1330,11 @@ async fn sweep_catalog_supports_bounded_ready_discovery_and_latest_alias() {
     make_sweep(&temporary.path().join("20260801_0_older_ready"), true);
     let router = prediction_test_router(temporary.path());
 
-    let (status, catalog) = get_json(router.clone(), "/api/v1/sweeps?status=ready&limit=1").await;
+    let (status, catalog) = get_json(
+        router.clone(),
+        "/api/analyzer/v1/sweeps?status=ready&limit=1",
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(catalog["sweeps"].as_array().map(Vec::len), Some(1));
     assert_eq!(
@@ -1293,12 +1343,12 @@ async fn sweep_catalog_supports_bounded_ready_discovery_and_latest_alias() {
     );
     assert_eq!(catalog["sweeps"][0]["status"], "ready");
 
-    let (status, latest) = get_json(router.clone(), "/api/v1/sweeps/latest").await;
+    let (status, latest) = get_json(router.clone(), "/api/analyzer/v1/sweeps/latest").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(latest["sweeps"].as_array().map(Vec::len), Some(1));
     assert_eq!(latest["sweeps"][0], catalog["sweeps"][0]);
 
-    let (status, problem) = get_json(router, "/api/v1/sweeps?limit=0").await;
+    let (status, problem) = get_json(router, "/api/analyzer/v1/sweeps?limit=0").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(problem["code"], "invalid_sweep_catalog_limit");
 }
@@ -1459,83 +1509,70 @@ fn descriptor_indexes_existing_core_resources() {
     assert_eq!(descriptor["run_id"], run.run_id);
     assert_eq!(descriptor["deployment"], "afd");
     assert_eq!(descriptor["model_name"], "model/config/qwen.json");
-    assert_eq!(descriptor["model"]["href"], "model");
+    assert_eq!(descriptor["model"]["views"][0], "payload");
     assert_eq!(descriptor["model"]["schema_version"], 2);
-    assert_eq!(descriptor["summary"]["href"], "summary");
-    assert_eq!(descriptor["topology"]["href"], "topology");
+    assert_eq!(descriptor["summary"]["views"][0], "report");
+    assert_eq!(descriptor["topology"]["views"][0], "payload");
     assert_eq!(descriptor["topology"]["schema_version"], 1);
-    assert_eq!(descriptor["workload"]["href"], "workload");
+    assert_eq!(descriptor["workload"]["views"][0], "payload");
     assert_eq!(descriptor["workload"]["schema_version"], 1);
     assert_eq!(descriptor["subjects"]["concurrency"]["status"], "ready");
-    assert_eq!(
-        descriptor["subjects"]["concurrency"]["payload_href"],
-        "subjects/concurrency/payload"
-    );
+    assert!(descriptor["subjects"]["concurrency"]["views"]
+        .as_array()
+        .is_some_and(|views| views.iter().any(|view| view == "payload")));
     assert_eq!(descriptor["subjects"]["request-state"]["status"], "ready");
-    assert_eq!(
-        descriptor["subjects"]["request-state"]["payload_href"],
-        "subjects/request-state/payload"
-    );
+    assert!(descriptor["subjects"]["request-state"]["views"]
+        .as_array()
+        .is_some_and(|views| views.iter().any(|view| view == "payload")));
     assert_eq!(descriptor["subjects"]["slo-general"]["status"], "ready");
-    assert_eq!(
-        descriptor["subjects"]["slo-general"]["report_href"],
-        "subjects/slo-general/report"
-    );
-    assert_eq!(
-        descriptor["subjects"]["slo-general"]["payload_href"],
-        "subjects/slo-general/payload"
-    );
+    assert!(descriptor["subjects"]["slo-general"]["views"]
+        .as_array()
+        .is_some_and(|views| views.iter().any(|view| view == "report")));
+    assert!(descriptor["subjects"]["slo-general"]["views"]
+        .as_array()
+        .is_some_and(|views| views.iter().any(|view| view == "payload")));
     assert_eq!(descriptor["subjects"]["throughput"]["status"], "ready");
-    assert_eq!(
-        descriptor["subjects"]["throughput"]["report_href"],
-        "subjects/throughput/report"
-    );
-    assert_eq!(
-        descriptor["subjects"]["throughput"]["payload_href"],
-        "subjects/throughput/payload"
-    );
+    assert!(descriptor["subjects"]["throughput"]["views"]
+        .as_array()
+        .is_some_and(|views| views.iter().any(|view| view == "report")));
+    assert!(descriptor["subjects"]["throughput"]["views"]
+        .as_array()
+        .is_some_and(|views| views.iter().any(|view| view == "payload")));
     assert_eq!(descriptor["subjects"]["utilization"]["status"], "ready");
-    assert_eq!(
-        descriptor["subjects"]["utilization"]["report_href"],
-        "subjects/utilization/report"
-    );
-    assert_eq!(
-        descriptor["subjects"]["utilization"]["payload_href"],
-        "subjects/utilization/payload"
-    );
+    assert!(descriptor["subjects"]["utilization"]["views"]
+        .as_array()
+        .is_some_and(|views| views.iter().any(|view| view == "report")));
+    assert!(descriptor["subjects"]["utilization"]["views"]
+        .as_array()
+        .is_some_and(|views| views.iter().any(|view| view == "payload")));
     assert_eq!(descriptor["subjects"]["kv-occupancy"]["status"], "ready");
-    assert_eq!(
-        descriptor["subjects"]["kv-occupancy"]["report_href"],
-        "subjects/kv-occupancy/report"
-    );
-    assert_eq!(
-        descriptor["subjects"]["kv-occupancy"]["payload_href"],
-        "subjects/kv-occupancy/payload"
-    );
+    assert!(descriptor["subjects"]["kv-occupancy"]["views"]
+        .as_array()
+        .is_some_and(|views| views.iter().any(|view| view == "report")));
+    assert!(descriptor["subjects"]["kv-occupancy"]["views"]
+        .as_array()
+        .is_some_and(|views| views.iter().any(|view| view == "payload")));
     assert_eq!(
         descriptor["subjects"]["kernel-input-distribution"]["status"],
         "ready"
     );
-    assert_eq!(
-        descriptor["subjects"]["kernel-input-distribution"]["payload_href"],
-        "subjects/kernel-input-distribution/payload"
-    );
+    assert!(descriptor["subjects"]["kernel-input-distribution"]["views"]
+        .as_array()
+        .is_some_and(|views| views.iter().any(|view| view == "payload")));
     assert_eq!(
         descriptor["subjects"]["kernel-time-share"]["status"],
         "ready"
     );
-    assert_eq!(
-        descriptor["subjects"]["kernel-time-share"]["payload_href"],
-        "subjects/kernel-time-share/payload"
-    );
+    assert!(descriptor["subjects"]["kernel-time-share"]["views"]
+        .as_array()
+        .is_some_and(|views| views.iter().any(|view| view == "payload")));
     assert_eq!(
         descriptor["subjects"]["workload-conservation"]["status"],
         "ready"
     );
-    assert_eq!(
-        descriptor["subjects"]["workload-conservation"]["payload_href"],
-        "subjects/workload-conservation/payload"
-    );
+    assert!(descriptor["subjects"]["workload-conservation"]["views"]
+        .as_array()
+        .is_some_and(|views| views.iter().any(|view| view == "payload")));
     assert!(descriptor["analysis"]["revision"]
         .as_str()
         .is_some_and(|revision| revision.starts_with("legacy-sha256-")));
@@ -2026,6 +2063,58 @@ fn kernel_time_share_resources_preserve_critical_path_attribution() {
     assert!(payload["definitions"]["tree_attribution"]
         .as_str()
         .is_some_and(|definition| definition.contains("critical path")));
+
+    // Pools stay whole — the entry view is a comparison across them — while
+    // each worker becomes an index entry whose composition has its own address.
+    assert_eq!(payload["schema_version"], 2);
+    assert_eq!(payload["pools"][0]["segments"][0]["share_pct"], 100.0);
+    assert_eq!(payload["workers"][0]["pool_tag"], "attn");
+    assert_eq!(payload["workers"][0]["worker_id"], 0);
+    assert_eq!(payload["workers"][0]["sample_stride"], 10);
+    // The sampling totals in `meta` stay checkable against their parts.
+    assert_eq!(payload["workers"][0]["raw_rows"], 400);
+    assert_eq!(payload["workers"][0]["sampled_rows"], 40);
+    assert!(payload["workers"][0].get("segments").is_none());
+}
+
+#[test]
+fn kernel_time_share_worker_scope_serves_only_that_worker() {
+    let temporary = TempDir::new().expect("temporary logs root");
+    make_core_run(&temporary.path().join("simulation"));
+    let roots =
+        configure_logs_roots(vec![temporary.path().to_path_buf()]).expect("configure logs root");
+    let run = discover_runs(&roots)
+        .expect("discover runs")
+        .pop()
+        .expect("one run");
+
+    let worker =
+        read_kernel_time_share_worker_payload(&run, "attn", 0).expect("read worker composition");
+    assert_eq!(
+        worker["scope"],
+        json!({"kind": "worker", "pool_tag": "attn", "worker_id": 0})
+    );
+    // A stride is chosen from this worker's own row count, so a reader judging
+    // how exact these numbers are does not need the cluster read to find out.
+    assert_eq!(worker["sample_stride"], 10);
+    assert_eq!(worker["segments"][0]["kernel_time_ms"], 10.0);
+
+    // Run-wide material is not repeated once per drill-down.
+    assert!(worker.get("definitions").is_none());
+    assert!(worker.get("positions").is_none());
+    assert!(worker.get("overall").is_none());
+    assert!(worker.get("pools").is_none());
+
+    // An address that names no worker is a miss, not an empty document.
+    for missing in [
+        read_kernel_time_share_worker_payload(&run, "attn", 7).err(),
+        read_kernel_time_share_worker_payload(&run, "moe", 0).err(),
+    ] {
+        assert!(missing
+            .expect("unknown worker must fail")
+            .downcast_ref::<ArtifactNotFound>()
+            .is_some());
+    }
 }
 
 #[test]
@@ -2044,13 +2133,12 @@ fn optimality_resources_expose_waterfall_levels_and_kernels() {
 
     let descriptor = build_descriptor(&run).expect("descriptor");
     assert_eq!(descriptor["subjects"]["optimality"]["status"], "ready");
+    assert!(descriptor["subjects"]["optimality"]["views"]
+        .as_array()
+        .is_some_and(|views| views.iter().any(|view| view == "payload")));
     assert_eq!(
-        descriptor["subjects"]["optimality"]["payload_href"],
-        "subjects/optimality/payload"
-    );
-    assert_eq!(
-        descriptor["subjects"]["optimality"]["variants"]["batch_locked"]["payload_href"],
-        "subjects/optimality/variants/batch-locked/payload"
+        descriptor["subjects"]["optimality"]["variants"]["batch_locked"]["views"][1],
+        "payload"
     );
     assert_eq!(
         descriptor["details"]["iteration-optimality-kernel-ladder"]["status"],
@@ -2264,6 +2352,253 @@ fn does_not_follow_directory_symlinks() {
     assert!(catalog.runs.is_empty());
 }
 
+/// Issue a request with an `Accept-Encoding` and report what came back.
+///
+/// Returns the negotiated `Content-Encoding` alongside the body so a test can
+/// assert both that compression happened and that the body still decodes — an
+/// encoding header over an unencoded body is the failure worth catching.
+async fn get_with_encoding(
+    router: Router,
+    uri: &str,
+    accept_encoding: &str,
+) -> (StatusCode, Option<String>, axum::body::Bytes) {
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri(uri)
+                .header(axum::http::header::ACCEPT_ENCODING, accept_encoding)
+                .body(Body::empty())
+                .expect("build HTTP test request"),
+        )
+        .await
+        .expect("route HTTP test request");
+    let status = response.status();
+    let encoding = response
+        .headers()
+        .get(axum::http::header::CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let body = to_bytes(response.into_body(), 8 * 1024 * 1024)
+        .await
+        .expect("read HTTP test response body");
+    (status, encoding, body)
+}
+
+/// The read tree accepts no writes.
+///
+/// Asserting the old address is gone matters as much as asserting the new one
+/// works: a `POST` route left mounted under the read prefix would keep the read API
+/// looking like it takes writes, which is the whole reason the endpoint moved.
+#[tokio::test]
+async fn the_browser_profiling_sink_is_not_part_of_the_read_only_api() {
+    let temporary = TempDir::new().expect("temporary logs root");
+    let router = prediction_test_router(temporary.path());
+    let event = serde_json::to_vec(&json!({
+        "session_id": "s1",
+        "event": "first-paint",
+    }))
+    .expect("encode event");
+
+    let post = |router: Router, uri: &'static str, body: Vec<u8>| async move {
+        router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .expect("build HTTP test request"),
+            )
+            .await
+            .expect("route HTTP test request")
+            .status()
+    };
+
+    assert_eq!(
+        post(
+            router.clone(),
+            "/api/dev/v1/profile/timeline",
+            event.clone()
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        post(router, "/api/analyzer/v1/profile/timeline", event).await,
+        StatusCode::NOT_FOUND
+    );
+}
+
+/// A reload of an unchanged artifact should cost a conditional request, not a
+/// payload.
+///
+/// The three assertions are the whole contract: the first read carries a
+/// validator, sending that validator back yields 304 with no body, and a
+/// validator that does not match still yields the artifact. Without the last
+/// one a broken comparison would look like a working cache.
+#[tokio::test]
+async fn an_unchanged_artifact_revalidates_instead_of_being_resent() {
+    let temporary = TempDir::new().expect("temporary logs root");
+    let prediction_path = temporary.path().join("predict-llama");
+    make_prediction(&prediction_path, "p_http_test");
+    make_prediction_cost_source(&prediction_path);
+    let router = prediction_test_router(temporary.path());
+
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/analyzer/v1/predictions")
+                .body(Body::empty())
+                .expect("build HTTP test request"),
+        )
+        .await
+        .expect("route HTTP test request");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(axum::http::header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok()),
+        Some("no-cache"),
+        "an artifact must be storable and revalidated, not uncacheable"
+    );
+    let etag = response
+        .headers()
+        .get(axum::http::header::ETAG)
+        .and_then(|value| value.to_str().ok())
+        .expect("first read carries a validator")
+        .to_owned();
+    assert!(etag.starts_with("W/"), "validator is weak: {etag}");
+
+    let (status, body) =
+        conditional_get(router.clone(), "/api/analyzer/v1/predictions", &etag).await;
+    assert_eq!(status, StatusCode::NOT_MODIFIED);
+    assert!(body.is_empty(), "304 must not carry the payload it saved");
+
+    // Pinning the revision into the address makes the answer cacheable outright:
+    // the revision IS the content hash, so a URL carrying it can never resolve
+    // to different bytes.
+    let revision = etag.trim_start_matches("W/").trim_matches('"');
+    let (status, cache_control) = cache_control_of(
+        router.clone(),
+        &format!("/api/analyzer/v1/predictions?rev={revision}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        cache_control.as_deref(),
+        Some("max-age=31536000, immutable")
+    );
+
+    // A pin that no longer matches — the analysis was re-run — falls back to
+    // revalidation rather than serving a year-old promise about new bytes.
+    let (status, cache_control) =
+        cache_control_of(router.clone(), "/api/analyzer/v1/predictions?rev=stale").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(cache_control.as_deref(), Some("no-cache"));
+
+    // A stale validator is not a match, so the artifact is served in full.
+    let (status, body) = conditional_get(
+        router,
+        "/api/analyzer/v1/predictions",
+        "W/\"not-the-current-one\"",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!body.is_empty());
+}
+
+async fn cache_control_of(router: Router, uri: &str) -> (StatusCode, Option<String>) {
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri(uri)
+                .body(Body::empty())
+                .expect("build HTTP test request"),
+        )
+        .await
+        .expect("route HTTP test request");
+    let status = response.status();
+    let cache_control = response
+        .headers()
+        .get(axum::http::header::CACHE_CONTROL)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    (status, cache_control)
+}
+
+async fn conditional_get(
+    router: Router,
+    uri: &str,
+    if_none_match: &str,
+) -> (StatusCode, axum::body::Bytes) {
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri(uri)
+                .header(axum::http::header::IF_NONE_MATCH, if_none_match)
+                .body(Body::empty())
+                .expect("build HTTP test request"),
+        )
+        .await
+        .expect("route HTTP test request");
+    let status = response.status();
+    let body = to_bytes(response.into_body(), 8 * 1024 * 1024)
+        .await
+        .expect("read HTTP test response body");
+    (status, body)
+}
+
+/// Compression is a property of the route table, not of one handler.
+///
+/// The service used to gzip exactly one response — the alignment payload — from
+/// inside its handler, while the other thirty went out uncompressed. These
+/// assertions are about the arrangement: any JSON route compresses, a client
+/// that does not ask still gets plain bytes, and an already-compressed image is
+/// left alone.
+#[tokio::test]
+async fn json_routes_compress_for_clients_that_ask_and_leave_images_alone() {
+    let temporary = TempDir::new().expect("temporary logs root");
+    let prediction_path = temporary.path().join("predict-llama");
+    make_prediction(&prediction_path, "p_http_test");
+    make_prediction_cost_source(&prediction_path);
+    make_kernel_measurement(&temporary.path().join("measure-gemm"), "km_http_test");
+    let router = prediction_test_router(temporary.path());
+
+    let (status, encoding, body) =
+        get_with_encoding(router.clone(), "/api/analyzer/v1/predictions", "gzip").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(encoding.as_deref(), Some("gzip"));
+    let mut decoded = Vec::new();
+    flate2::read::GzDecoder::new(body.as_ref())
+        .read_to_end(&mut decoded)
+        .expect("decode gzip body");
+    let catalog: Value = serde_json::from_slice(&decoded).expect("decode catalog JSON");
+    assert_eq!(catalog["predictions"][0]["prediction_id"], "p_http_test");
+
+    // Content negotiation still applies: a client that asks for nothing gets a
+    // body it can read without a decoder.
+    let (status, plain) = get_json(router.clone(), "/api/analyzer/v1/predictions").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(plain, catalog);
+
+    // A PNG is already compressed. Re-encoding it would spend CPU to make it
+    // slightly larger, so the default predicate excludes image content types.
+    let (status, encoding, bytes) = get_with_encoding(
+        router,
+        "/api/analyzer/v1/kernel-measurements/km_http_test/plots/runtime_trend.png",
+        "gzip",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(encoding, None);
+    assert_eq!(
+        bytes.as_ref(),
+        &[0x89u8, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]
+    );
+}
+
 async fn get_bytes(router: Router, uri: &str) -> (StatusCode, axum::body::Bytes) {
     let response = router
         .oneshot(
@@ -2336,13 +2671,13 @@ async fn kernel_profile_http_routes_publish_descriptor_and_enriched_curve() {
     write_gpu_spec_fixture(logs);
     let router = prediction_test_router(logs);
 
-    let (status, catalog) = get_json(router.clone(), "/api/v1/kernel-profiles").await;
+    let (status, catalog) = get_json(router.clone(), "/api/analyzer/v1/kernel-profiles").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(catalog["kernel_profiles"][0]["profile_id"], "kp_http_test");
 
     let (status, descriptor) = get_json(
         router.clone(),
-        "/api/v1/kernel-profiles/kp_http_test/descriptor",
+        "/api/analyzer/v1/kernel-profiles/kp_http_test/descriptor",
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -2353,12 +2688,13 @@ async fn kernel_profile_http_routes_publish_descriptor_and_enriched_curve() {
     assert_eq!(descriptor["gpu"]["observed_name"], "NVIDIA H200");
     assert_eq!(descriptor["gpu_provenance"]["source"], "measurement");
     assert_eq!(descriptor["lifecycle"]["profile"], "complete");
-    assert_eq!(
-        descriptor["resources"]["curve_href"],
-        "kernel-profiles/kp_http_test/curve"
-    );
+    assert_eq!(descriptor["resources"]["curve"]["views"][0], "payload");
 
-    let (status, curve) = get_json(router, "/api/v1/kernel-profiles/kp_http_test/curve").await;
+    let (status, curve) = get_json(
+        router,
+        "/api/analyzer/v1/kernel-profiles/kp_http_test/subjects/curve/payload",
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(curve["schemaVersion"], 1);
     assert_eq!(curve["hardware"]["matched"], true);
@@ -2392,7 +2728,7 @@ async fn kernel_measurement_http_routes_publish_descriptor_summary_and_plot() {
 
     let (status, descriptor) = get_json(
         router.clone(),
-        "/api/v1/kernel-measurements/km_http_test/descriptor",
+        "/api/analyzer/v1/kernel-measurements/km_http_test/descriptor",
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -2402,19 +2738,18 @@ async fn kernel_measurement_http_routes_publish_descriptor_summary_and_plot() {
     assert_eq!(descriptor["gpu_provenance"]["source"], "measurement");
     assert_eq!(descriptor["duration_s"], 10.0);
     assert_eq!(descriptor["shape"]["k"], 8);
-    assert_eq!(
-        descriptor["resources"]["summary_href"],
-        "kernel-measurements/km_http_test/summary"
-    );
+    assert_eq!(descriptor["resources"]["summary"]["views"][0], "report");
     let plots = descriptor["resources"]["plots"].as_array().expect("plots");
     assert_eq!(plots.len(), 2);
+    // Names, not addresses: the plot set is discovered on disk, but where each
+    // one lives follows from the name.
     assert!(plots
         .iter()
-        .any(|p| p.as_str() == Some("kernel-measurements/km_http_test/plots/runtime_trend.png")));
+        .any(|p| p.as_str() == Some("runtime_trend.png")));
 
     let (status, summary) = get_json(
         router.clone(),
-        "/api/v1/kernel-measurements/km_http_test/summary",
+        "/api/analyzer/v1/kernel-measurements/km_http_test/subjects/summary/report",
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -2423,7 +2758,7 @@ async fn kernel_measurement_http_routes_publish_descriptor_summary_and_plot() {
 
     let (status, bytes) = get_bytes(
         router.clone(),
-        "/api/v1/kernel-measurements/km_http_test/plots/runtime_trend.png",
+        "/api/analyzer/v1/kernel-measurements/km_http_test/plots/runtime_trend.png",
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -2435,7 +2770,7 @@ async fn kernel_measurement_http_routes_publish_descriptor_summary_and_plot() {
     // A traversal-shaped request never resolves to OS files (route mismatch → 4xx).
     let (status, bytes) = get_bytes(
         router.clone(),
-        "/api/v1/kernel-measurements/km_http_test/plots/../curve.json",
+        "/api/analyzer/v1/kernel-measurements/km_http_test/plots/../curve.json",
     )
     .await;
     assert_ne!(status, StatusCode::OK);
@@ -2443,7 +2778,7 @@ async fn kernel_measurement_http_routes_publish_descriptor_summary_and_plot() {
     // Undeclared names are rejected with the artifact_missing problem body.
     let (status, error) = get_json(
         router,
-        "/api/v1/kernel-measurements/km_http_test/plots/summary.json",
+        "/api/analyzer/v1/kernel-measurements/km_http_test/plots/summary.json",
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
@@ -2713,8 +3048,11 @@ async fn hardware_gpus_http_route_resolves_and_requires_name() {
     write_gpu_spec_fixture(temporary.path());
     let router = prediction_test_router(temporary.path());
 
-    let (status, value) =
-        get_json(router.clone(), "/api/v1/hardware/gpus?name=NVIDIA%20H200").await;
+    let (status, value) = get_json(
+        router.clone(),
+        "/api/analyzer/v1/hardware/gpus?name=NVIDIA%20H200",
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(value["matched"], true);
     assert_eq!(value["canonical_name"], "H200-SXM-141GB");
@@ -2725,7 +3063,7 @@ async fn hardware_gpus_http_route_resolves_and_requires_name() {
     assert_eq!(value["peaks"]["bf16_tflops"], 990.0);
     assert_eq!(value["hbm_bandwidth_gbps"], 4800.0);
 
-    let (status, value) = get_json(router.clone(), "/api/v1/hardware/gpus").await;
+    let (status, value) = get_json(router.clone(), "/api/analyzer/v1/hardware/gpus").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(value["code"], "gpu_name_required");
 }
@@ -3182,7 +3520,7 @@ fn the_bundle_is_the_analysis_parent_and_discovery_stops_there() {
 }
 
 #[test]
-fn an_ungenerated_subject_is_named_but_offers_no_href() {
+fn an_ungenerated_subject_is_named_but_serves_no_view() {
     let temporary = TempDir::new().expect("temp dir");
     write_alignment_bundle(temporary.path());
     let roots =
@@ -3192,14 +3530,22 @@ fn an_ungenerated_subject_is_named_but_offers_no_href() {
     let descriptor = alignment_descriptor(alignment, &roots);
 
     assert_eq!(descriptor["subjects"]["timeline"]["status"], "ready");
-    assert!(descriptor["subjects"]["timeline"]["payload_href"].is_string());
+    assert_eq!(descriptor["subjects"]["timeline"]["views"][1], "payload");
     // Missing is a state, not an absence: the client must be able to say "not
     // generated" rather than infer it from a key that is not there.
     assert_eq!(descriptor["subjects"]["e2e"]["status"], "not_generated");
-    assert!(descriptor["subjects"]["e2e"]["payload_href"].is_null());
-    // Only the sharded subjects offer a per-iteration href.
-    assert!(descriptor["subjects"]["timeline"]["iteration_href"].is_string());
-    assert!(descriptor["subjects"]["e2e"]["iteration_href"].is_null());
+    assert_eq!(
+        descriptor["subjects"]["e2e"]["views"]
+            .as_array()
+            .map(Vec::len),
+        Some(0)
+    );
+    // Only the sharded subjects can be read one iteration at a time.
+    assert_eq!(
+        descriptor["subjects"]["timeline"]["has_iteration_detail"],
+        true
+    );
+    assert_eq!(descriptor["subjects"]["e2e"]["has_iteration_detail"], false);
 }
 
 #[test]

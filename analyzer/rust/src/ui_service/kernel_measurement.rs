@@ -119,7 +119,6 @@ pub(super) struct KernelMeasurementCatalogEntry {
     gpu_observed_name: Option<String>,
     legacy: bool,
     status: &'static str,
-    descriptor_href: String,
     updated_at: String,
 }
 
@@ -174,10 +173,6 @@ fn catalog_entry(measurement: &DiscoveredKernelMeasurement) -> KernelMeasurement
         } else {
             "pending"
         },
-        descriptor_href: format!(
-            "kernel-measurements/{}/descriptor",
-            measurement.measurement_id
-        ),
         updated_at: timestamp(measurement.updated_time),
     }
 }
@@ -288,17 +283,12 @@ pub(super) fn resolve_kernel_measurement(
 }
 
 pub(super) fn measurement_descriptor(measurement: &DiscoveredKernelMeasurement) -> Value {
-    let summary_href = format!("kernel-measurements/{}/summary", measurement.measurement_id);
+    // Plot NAMES, not plot addresses. A measurement's plots are the one part of
+    // this service that is not addressable by grammar alone — the set of names
+    // is discovered on disk — so the descriptor's job is to list them. Where
+    // each one lives is `kernel-measurements/{id}/plots/{name}`, which the
+    // client can build once it has the name.
     let plots = measurement.plot_names();
-    let plot_hrefs = plots
-        .iter()
-        .map(|name| {
-            format!(
-                "kernel-measurements/{}/plots/{name}",
-                measurement.measurement_id
-            )
-        })
-        .collect::<Vec<_>>();
     let (kernel, gpu, gpu_provenance) = match &measurement.metadata {
         Some(metadata) => (
             json!({
@@ -382,8 +372,8 @@ pub(super) fn measurement_descriptor(measurement: &DiscoveredKernelMeasurement) 
             }
         },
         "resources": {
-            "summary_href": summary_href,
-            "plots": plot_hrefs,
+            "summary": { "views": ["report"] },
+            "plots": plots,
         },
     })
 }

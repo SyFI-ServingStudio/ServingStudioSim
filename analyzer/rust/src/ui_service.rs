@@ -23,6 +23,7 @@ mod model;
 mod optimality;
 mod prediction;
 mod request_state;
+mod scoped_optimality;
 mod slo;
 mod sweep;
 #[cfg(test)]
@@ -35,7 +36,6 @@ mod workload;
 mod workload_conservation;
 
 use std::collections::HashMap;
-use std::io::Write;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -43,19 +43,21 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use axum::extract::{DefaultBodyLimit, Path as RoutePath, Query, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::body::Body;
+use axum::extract::{DefaultBodyLimit, Path as RoutePath, Query, Request, State};
+use axum::http::{header, HeaderValue, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use tower_http::compression::CompressionLayer;
 
 use crate::optimality::{
-    compute_scoped, iteration_kernel_ladder, iteration_waterfall, prediction_kernel_ladder,
-    prediction_waterfall,
+    iteration_kernel_ladder, iteration_waterfall, prediction_kernel_ladder, prediction_waterfall,
 };
-use crate::session::build_session;
 use alignment::{
     alignment_artifact_bytes, alignment_descriptor,
     alignment_detail_index as build_alignment_detail_index,
@@ -84,7 +86,10 @@ use kernel_profile::{
     build_kernel_profile_catalog, profile_curve, profile_descriptor, resolve_kernel_profile,
 };
 use kernel_throughput_analysis::analyze_kernel_throughput;
-use kernel_time_share::{read_kernel_time_share_payload, read_kernel_time_share_report};
+use kernel_time_share::{
+    read_kernel_time_share_payload, read_kernel_time_share_report,
+    read_kernel_time_share_worker_payload,
+};
 use kv_occupancy::{read_kv_occupancy_payload, read_kv_occupancy_report};
 use model::read_model;
 use optimality::{
@@ -96,6 +101,7 @@ use prediction::{
     DiscoveredPrediction,
 };
 use request_state::{read_request_state_payload, read_request_state_report};
+use scoped_optimality::scoped_optimality_report;
 use slo::{read_slo_general_payload, read_slo_general_report};
 use sweep::{
     build_filtered_sweep_catalog, read_sweep_payload, resolve_sweep, SweepCatalogFilter,
@@ -309,7 +315,7 @@ pub(crate) async fn serve(
         .await
         .with_context(|| format!("bind analyzer UI service to {bind}"))?;
     eprintln!(
-        "[analyze] serving run, sweep, prediction, alignment, kernel-profile, kernel-measurement, and hardware catalogs at http://{bind}/api/v1/{{runs,sweeps,predictions,alignments,kernel-profiles,kernel-measurements,hardware}}"
+        "[analyze] serving run, sweep, prediction, alignment, kernel-profile, kernel-measurement, and hardware catalogs at http://{bind}/api/analyzer/v1/{{runs,sweeps,predictions,alignments,kernel-profiles,kernel-measurements,hardware}}"
     );
     axum::serve(listener, app)
         .await
@@ -321,222 +327,366 @@ pub(crate) async fn serve(
 /// the exact production route table without binding a port or duplicating
 /// handler wiring.
 fn service_router(state: ServiceState) -> Router {
+    read_only_router(state).merge(dev_router())
+}
+
+/// The browser-profiling sink.
+///
+/// It is a `POST` that writes a line to the analyzer's stderr, and it used to
+/// sit on `/api/v1/profile/timeline` — inside the tree that otherwise only ever
+/// reads finished analysis off disk. Sharing a prefix with the read API made
+/// the read API look like it accepts writes: a reverse proxy or a deployment
+/// policy that wants to expose the artifacts read-only had no prefix to say so
+/// with.
+///
+/// `/api/dev/v1/` is that prefix. The body limit lives here too, because this
+/// is the only route in the service that receives a body at all.
+fn dev_router() -> Router {
     Router::new()
-        .route("/api/v1/profile/timeline", post(profile_timeline))
-        .route("/api/v1/alignments", get(list_alignments))
+        .route("/api/dev/v1/profile/timeline", post(profile_timeline))
+        .layer(DefaultBodyLimit::max(TIMELINE_PROFILE_BODY_LIMIT))
+}
+
+/// Every route that reads an artifact. No handler here takes a request body.
+fn read_only_router(state: ServiceState) -> Router {
+    Router::new()
+        .route("/api/analyzer/v1/alignments", get(list_alignments))
         .route(
-            "/api/v1/alignments/{alignment_id}/descriptor",
+            "/api/analyzer/v1/alignments/{alignment_id}/descriptor",
             get(get_alignment_descriptor),
         )
         .route(
-            "/api/v1/alignments/{alignment_id}/subjects/{subject}/report",
+            "/api/analyzer/v1/alignments/{alignment_id}/subjects/{subject}/report",
             get(get_alignment_report),
         )
         .route(
-            "/api/v1/alignments/{alignment_id}/subjects/{subject}/payload",
+            "/api/analyzer/v1/alignments/{alignment_id}/subjects/{subject}/payload",
             get(get_alignment_payload),
         )
         .route(
-            "/api/v1/alignments/{alignment_id}/subjects/{subject}/iterations/{iteration_id}",
+            "/api/analyzer/v1/alignments/{alignment_id}/subjects/{subject}/iterations/{iteration_id}",
             get(get_alignment_iteration),
         )
         .route(
-            "/api/v1/alignments/{alignment_id}/subjects/iteration/sequences/{phase}/{sequence_id}",
+            "/api/analyzer/v1/alignments/{alignment_id}/subjects/iteration/sequences/{phase}/{sequence_id}",
             get(get_alignment_sequence),
         )
-        .route("/api/v1/predictions", get(list_predictions))
+        .route("/api/analyzer/v1/predictions", get(list_predictions))
         .route(
-            "/api/v1/predictions/{prediction_id}/descriptor",
+            "/api/analyzer/v1/predictions/{prediction_id}/descriptor",
             get(get_prediction_descriptor),
         )
         .route(
-            "/api/v1/predictions/{prediction_id}/cases",
+            "/api/analyzer/v1/predictions/{prediction_id}/subjects/cases/payload",
             get(get_prediction_cases),
         )
         .route(
-            "/api/v1/predictions/{prediction_id}/subjects/kernel-input-distribution/payload",
+            "/api/analyzer/v1/predictions/{prediction_id}/subjects/kernel-input-distribution/payload",
             get(get_prediction_kernel_input_distribution),
         )
         .route(
-            "/api/v1/predictions/{prediction_id}/cases/{case_id}/operations/{operation_id}/cost-tree",
+            "/api/analyzer/v1/predictions/{prediction_id}/cases/{case_id}/operations/{operation_id}/subjects/cost-tree/payload",
             get(get_prediction_cost_tree),
         )
         .route(
-            "/api/v1/predictions/{prediction_id}/cases/{case_id}/operations/{operation_id}/cost-tree/{leaf_id}/kernel-throughput-analysis",
+            "/api/analyzer/v1/predictions/{prediction_id}/cases/{case_id}/operations/{operation_id}/leaves/{leaf_id}/subjects/kernel-throughput-analysis/payload",
             get(get_prediction_kernel_throughput_analysis),
         )
         .route(
-            "/api/v1/predictions/{prediction_id}/optimality-scoped",
-            get(get_prediction_optimality_scoped),
+            "/api/analyzer/v1/predictions/{prediction_id}/subjects/scoped-optimality/report",
+            get(get_prediction_scoped_optimality),
         )
         .route(
-            "/api/v1/predictions/{prediction_id}/cases/{case_id}/optimality-kernel-ladder",
+            "/api/analyzer/v1/predictions/{prediction_id}/cases/{case_id}/subjects/optimality-kernel-ladder/payload",
             get(get_prediction_optimality_kernel_ladder),
         )
         .route(
-            "/api/v1/predictions/{prediction_id}/cases/{case_id}/optimality-waterfall",
+            "/api/analyzer/v1/predictions/{prediction_id}/cases/{case_id}/subjects/optimality-waterfall/payload",
             get(get_prediction_optimality_waterfall),
         )
-        .route("/api/v1/kernel-profiles", get(list_kernel_profiles))
+        .route("/api/analyzer/v1/kernel-profiles", get(list_kernel_profiles))
         .route(
-            "/api/v1/kernel-profiles/{profile_id}/descriptor",
+            "/api/analyzer/v1/kernel-profiles/{profile_id}/descriptor",
             get(get_kernel_profile_descriptor),
         )
         .route(
-            "/api/v1/kernel-profiles/{profile_id}/curve",
+            "/api/analyzer/v1/kernel-profiles/{profile_id}/subjects/curve/payload",
             get(get_kernel_profile_curve),
         )
-        .route("/api/v1/kernel-measurements", get(list_kernel_measurements))
+        .route("/api/analyzer/v1/kernel-measurements", get(list_kernel_measurements))
         .route(
-            "/api/v1/kernel-measurements/{measurement_id}/descriptor",
+            "/api/analyzer/v1/kernel-measurements/{measurement_id}/descriptor",
             get(get_kernel_measurement_descriptor),
         )
         .route(
-            "/api/v1/kernel-measurements/{measurement_id}/summary",
+            "/api/analyzer/v1/kernel-measurements/{measurement_id}/subjects/summary/report",
             get(get_kernel_measurement_summary),
         )
         .route(
-            "/api/v1/kernel-measurements/{measurement_id}/plots/{plot_name}",
+            "/api/analyzer/v1/kernel-measurements/{measurement_id}/plots/{plot_name}",
             get(get_kernel_measurement_plot),
         )
-        .route("/api/v1/hardware/gpus", get(get_hardware_gpus))
-        .route("/api/v1/runs", get(list_runs))
-        .route("/api/v1/sweeps", get(list_sweeps))
-        .route("/api/v1/sweeps/latest", get(get_latest_sweep))
-        .route("/api/v1/sweeps/{sweep_id}/payload", get(get_sweep_payload))
+        .route("/api/analyzer/v1/hardware/gpus", get(get_hardware_gpus))
+        .route("/api/analyzer/v1/runs", get(list_runs))
+        .route("/api/analyzer/v1/sweeps", get(list_sweeps))
+        .route("/api/analyzer/v1/sweeps/latest", get(get_latest_sweep))
+        .route("/api/analyzer/v1/sweeps/{sweep_id}/subjects/sweep/payload", get(get_sweep_payload))
+        .route("/api/analyzer/v1/runs/{run_id}/descriptor", get(get_descriptor))
+        .route("/api/analyzer/v1/runs/{run_id}/subjects/summary/report", get(get_summary))
+        .route("/api/analyzer/v1/runs/{run_id}/subjects/topology/payload", get(get_topology))
+        .route("/api/analyzer/v1/runs/{run_id}/subjects/model/payload", get(get_model))
+        .route("/api/analyzer/v1/runs/{run_id}/subjects/workload/payload", get(get_workload))
         .route(
-            "/api/v1/runs/{run_id}/optimality-scoped",
-            get(get_run_optimality_scoped),
-        )
-        .route("/api/v1/runs/{run_id}/descriptor", get(get_descriptor))
-        .route("/api/v1/runs/{run_id}/summary", get(get_summary))
-        .route("/api/v1/runs/{run_id}/topology", get(get_topology))
-        .route("/api/v1/runs/{run_id}/model", get(get_model))
-        .route("/api/v1/runs/{run_id}/workload", get(get_workload))
-        .route(
-            "/api/v1/runs/{run_id}/subjects/concurrency/report",
+            "/api/analyzer/v1/runs/{run_id}/subjects/concurrency/report",
             get(get_concurrency_report),
         )
         .route(
-            "/api/v1/runs/{run_id}/subjects/concurrency/payload",
+            "/api/analyzer/v1/runs/{run_id}/subjects/concurrency/payload",
             get(get_concurrency_payload),
         )
         .route(
-            "/api/v1/runs/{run_id}/subjects/request-state/report",
+            "/api/analyzer/v1/runs/{run_id}/subjects/request-state/report",
             get(get_request_state_report),
         )
         .route(
-            "/api/v1/runs/{run_id}/subjects/request-state/payload",
+            "/api/analyzer/v1/runs/{run_id}/subjects/request-state/payload",
             get(get_request_state_payload),
         )
         .route(
-            "/api/v1/runs/{run_id}/subjects/slo-general/report",
+            "/api/analyzer/v1/runs/{run_id}/subjects/slo-general/report",
             get(get_slo_general_report),
         )
         .route(
-            "/api/v1/runs/{run_id}/subjects/slo-general/payload",
+            "/api/analyzer/v1/runs/{run_id}/subjects/slo-general/payload",
             get(get_slo_general_payload),
         )
         .route(
-            "/api/v1/runs/{run_id}/subjects/throughput/report",
+            "/api/analyzer/v1/runs/{run_id}/subjects/throughput/report",
             get(get_throughput_report),
         )
         .route(
-            "/api/v1/runs/{run_id}/subjects/throughput/payload",
+            "/api/analyzer/v1/runs/{run_id}/subjects/throughput/payload",
             get(get_throughput_payload),
         )
         .route(
-            "/api/v1/runs/{run_id}/subjects/utilization/report",
+            "/api/analyzer/v1/runs/{run_id}/subjects/utilization/report",
             get(get_utilization_report),
         )
         .route(
-            "/api/v1/runs/{run_id}/subjects/utilization/payload",
+            "/api/analyzer/v1/runs/{run_id}/subjects/utilization/payload",
             get(get_utilization_payload),
         )
         .route(
-            "/api/v1/runs/{run_id}/subjects/batch/report",
+            "/api/analyzer/v1/runs/{run_id}/subjects/batch/report",
             get(get_batch_report),
         )
         .route(
-            "/api/v1/runs/{run_id}/subjects/batch/payload",
+            "/api/analyzer/v1/runs/{run_id}/subjects/batch/payload",
             get(get_batch_payload),
         )
         .route(
-            "/api/v1/runs/{run_id}/subjects/kv-occupancy/report",
+            "/api/analyzer/v1/runs/{run_id}/subjects/kv-occupancy/report",
             get(get_kv_occupancy_report),
         )
         .route(
-            "/api/v1/runs/{run_id}/subjects/kv-occupancy/payload",
+            "/api/analyzer/v1/runs/{run_id}/subjects/kv-occupancy/payload",
             get(get_kv_occupancy_payload),
         )
         .route(
-            "/api/v1/runs/{run_id}/subjects/kernel-input-distribution/report",
+            "/api/analyzer/v1/runs/{run_id}/subjects/kernel-input-distribution/report",
             get(get_kernel_input_distribution_report),
         )
         .route(
-            "/api/v1/runs/{run_id}/subjects/kernel-input-distribution/payload",
+            "/api/analyzer/v1/runs/{run_id}/subjects/kernel-input-distribution/payload",
             get(get_kernel_input_distribution_payload),
         )
         .route(
-            "/api/v1/runs/{run_id}/subjects/kernel-time-share/report",
+            "/api/analyzer/v1/runs/{run_id}/subjects/kernel-time-share/report",
             get(get_kernel_time_share_report),
         )
         .route(
-            "/api/v1/runs/{run_id}/subjects/kernel-time-share/payload",
+            "/api/analyzer/v1/runs/{run_id}/subjects/kernel-time-share/payload",
             get(get_kernel_time_share_payload),
         )
         .route(
-            "/api/v1/runs/{run_id}/subjects/optimality/report",
+            "/api/analyzer/v1/runs/{run_id}/workers/{pool_tag}/{worker_id}/subjects/kernel-time-share/payload",
+            get(get_worker_kernel_time_share_payload),
+        )
+        .route(
+            "/api/analyzer/v1/runs/{run_id}/subjects/optimality/report",
             get(get_optimality_report),
         )
         .route(
-            "/api/v1/runs/{run_id}/subjects/optimality/payload",
+            "/api/analyzer/v1/runs/{run_id}/subjects/optimality/payload",
             get(get_optimality_payload),
         )
         .route(
-            "/api/v1/runs/{run_id}/subjects/optimality/variants/batch-locked/report",
+            "/api/analyzer/v1/runs/{run_id}/subjects/scoped-optimality/report",
+            get(get_run_scoped_optimality),
+        )
+        .route(
+            "/api/analyzer/v1/runs/{run_id}/subjects/optimality/variants/batch_locked/report",
             get(get_locked_optimality_report),
         )
         .route(
-            "/api/v1/runs/{run_id}/subjects/optimality/variants/batch-locked/payload",
+            "/api/analyzer/v1/runs/{run_id}/subjects/optimality/variants/batch_locked/payload",
             get(get_locked_optimality_payload),
         )
         .route(
-            "/api/v1/runs/{run_id}/subjects/workload-conservation/report",
+            "/api/analyzer/v1/runs/{run_id}/subjects/workload-conservation/report",
             get(get_workload_conservation_report),
         )
         .route(
-            "/api/v1/runs/{run_id}/subjects/workload-conservation/payload",
+            "/api/analyzer/v1/runs/{run_id}/subjects/workload-conservation/payload",
             get(get_workload_conservation_payload),
         )
         .route(
-            "/api/v1/runs/{run_id}/workers/{pool_tag}/{worker_id}/operations",
+            "/api/analyzer/v1/runs/{run_id}/workers/{pool_tag}/{worker_id}/subjects/operations/payload",
             get(get_worker_operations),
         )
         .route(
-            "/api/v1/runs/{run_id}/workers/{pool_tag}/{worker_id}/operations/seek",
+            "/api/analyzer/v1/runs/{run_id}/workers/{pool_tag}/{worker_id}/subjects/operations/seek",
             get(seek_worker_operation),
         )
         .route(
-            "/api/v1/runs/{run_id}/workers/{pool_tag}/{worker_id}/iterations/{iter_id}/optimality-kernel-ladder",
+            "/api/analyzer/v1/runs/{run_id}/workers/{pool_tag}/{worker_id}/iterations/{iter_id}/subjects/optimality-kernel-ladder/payload",
             get(get_iteration_optimality_kernel_ladder),
         )
         .route(
-            "/api/v1/runs/{run_id}/workers/{pool_tag}/{worker_id}/iterations/{iter_id}/optimality-waterfall",
+            "/api/analyzer/v1/runs/{run_id}/workers/{pool_tag}/{worker_id}/iterations/{iter_id}/subjects/optimality-waterfall/payload",
             get(get_iteration_optimality_waterfall),
         )
         .route(
-            "/api/v1/runs/{run_id}/workers/{pool_tag}/{worker_id}/operations/{iter_id}/{batch_id}/{operation_id}/cost-tree",
+            "/api/analyzer/v1/runs/{run_id}/workers/{pool_tag}/{worker_id}/operations/{iter_id}/{batch_id}/{operation_id}/subjects/cost-tree/payload",
             get(get_worker_cost_tree),
         )
         .route(
-            "/api/v1/runs/{run_id}/workers/{pool_tag}/{worker_id}/operations/{iter_id}/{batch_id}/{operation_id}/cost-tree/{leaf_id}/kernel-throughput-analysis",
+            "/api/analyzer/v1/runs/{run_id}/workers/{pool_tag}/{worker_id}/operations/{iter_id}/{batch_id}/{operation_id}/leaves/{leaf_id}/subjects/kernel-throughput-analysis/payload",
             get(get_kernel_throughput_analysis),
         )
         .with_state(state)
-        // The service otherwise receives no bodies. Bound this temporary
-        // browser-profiling sink in case DevTools is left running.
-        .layer(DefaultBodyLimit::max(TIMELINE_PROFILE_BODY_LIMIT))
+        // Compress every response, not one of them.
+        //
+        // These payloads are analysis JSON — long arrays of numbers with
+        // repeated keys — which is close to the best case for a text codec, and
+        // the readers that matter are browsers on the other side of a network.
+        // The default predicate skips bodies under 32 bytes and anything
+        // already typed as an image, so the measurement plots are not
+        // re-compressed. SVG plots are excluded by that same rule and would
+        // compress well; serving them under a non-image content type is the way
+        // to change that, not loosening the predicate.
+        .layer(CompressionLayer::new())
+        // Inside the compression layer on the response path, so the validator is
+        // computed over the bytes the analyzer produced rather than over one
+        // particular encoding of them.
+        .layer(middleware::from_fn(revalidate))
+}
+
+/// An address that does not name a revision: store it, but ask before reusing.
+///
+/// `no-cache` does not mean "do not store". Paired with the ETag below, a reload
+/// of a page whose analysis has not changed costs one conditional request per
+/// artifact and no payload bytes at all.
+const REVALIDATE: &str = "no-cache";
+
+/// An address that names the revision it got. Safe to keep for a year.
+///
+/// The promise is only sound because the revision IS the content hash: if the
+/// analysis is re-run and the bytes change, the hash changes, the pinned URL no
+/// longer matches, and this header is not sent. A stale `immutable` hit is
+/// therefore not expressible.
+const IMMUTABLE: &str = "max-age=31536000, immutable";
+
+/// Query parameter a client uses to pin the revision it already has.
+///
+/// The client does not have to know a revision in advance. It reads once
+/// without one, gets the ETag, and pins it — which is what
+/// `ResultRef.revision` in `VibeSimUI/new-design.md` is for, and why that field
+/// is optional with "absent means latest".
+const REVISION_PARAM: &str = "rev";
+
+/// The revision inside a validator: the hash with `W/` and the quotes removed.
+///
+/// A revision travels in a URL, so it is spelled as a bare token; an ETag is an
+/// HTTP header field with its own syntax. They are the same value in two
+/// notations, and this is the one place that converts between them.
+fn revision_of(etag: &str) -> &str {
+    etag.trim_start_matches("W/").trim_matches('"')
+}
+
+/// Read `rev=` out of a raw query string.
+///
+/// Hand-parsed rather than through an extractor because this runs for every
+/// route, and the routes have their own, differently-shaped query types.
+fn pinned_revision(query: &str) -> Option<String> {
+    query.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=')?;
+        (key == REVISION_PARAM).then(|| value.to_owned())
+    })
+}
+
+/// Attach a validator to every response, and answer a matching request with 304.
+///
+/// The service serves files whose content is a pure function of an analysis
+/// that has already finished. Re-sending an unchanged 540 KB payload because
+/// the user pressed Back is waste that neither compression nor caching headers
+/// alone remove: compression still sends the bytes, and a plain `max-age` would
+/// have to guess how long the analysis stays put.
+///
+/// The tag is weak (`W/`). A strong validator has to differ per content-coding,
+/// and this one is computed before compression precisely so it identifies the
+/// analyzer's output rather than one negotiated encoding of it — which is what
+/// "weak" means.
+async fn revalidate(request: Request, next: Next) -> Response {
+    let if_none_match = request
+        .headers()
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let pinned_revision = request.uri().query().and_then(pinned_revision);
+    let response = next.run(request).await;
+
+    // Only successful, fully-buffered responses have a stable identity worth
+    // validating. Errors and redirects are left exactly as the handler wrote
+    // them.
+    if response.status() != StatusCode::OK {
+        return response;
+    }
+    let (mut parts, body) = response.into_parts();
+    let bytes = match axum::body::to_bytes(body, usize::MAX).await {
+        Ok(bytes) => bytes,
+        // The body was already consumed or failed mid-stream; there is nothing
+        // left to hash and nothing useful to say about it.
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+
+    let etag = format!("W/\"{:x}\"", Sha256::digest(&bytes));
+    if let Ok(value) = HeaderValue::from_str(&etag) {
+        parts.headers.insert(header::ETAG, value);
+    }
+    let revision = revision_of(&etag);
+    let pinned = pinned_revision.as_deref() == Some(revision);
+    parts.headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static(if pinned { IMMUTABLE } else { REVALIDATE }),
+    );
+
+    // `If-None-Match` may list several tags, and `*` matches any existing
+    // representation.
+    let matched = if_none_match.is_some_and(|header| {
+        header
+            .split(',')
+            .map(str::trim)
+            .any(|candidate| candidate == "*" || candidate == etag)
+    });
+    if matched {
+        parts.status = StatusCode::NOT_MODIFIED;
+        // A 304 carries the validator and no body; Content-Length would
+        // describe bytes that are not being sent.
+        parts.headers.remove(header::CONTENT_LENGTH);
+        return Response::from_parts(parts, Body::empty());
+    }
+    Response::from_parts(parts, Body::from(bytes))
 }
 
 #[derive(Deserialize)]
@@ -631,28 +781,26 @@ async fn get_alignment_descriptor(
 
 async fn get_alignment_report(
     RoutePath((alignment_id, subject)): RoutePath<(String, String)>,
-    headers: HeaderMap,
     State(state): State<ServiceState>,
 ) -> Response {
     match state
         .resolve_alignment(&alignment_id)
         .and_then(|alignment| alignment_artifact_bytes(&alignment, &subject, false))
     {
-        Ok(bytes) => alignment_json_bytes_response(bytes, Some(&headers)),
+        Ok(bytes) => alignment_json_bytes_response(bytes),
         Err(error) => alignment_resource_error(error),
     }
 }
 
 async fn get_alignment_payload(
     RoutePath((alignment_id, subject)): RoutePath<(String, String)>,
-    headers: HeaderMap,
     State(state): State<ServiceState>,
 ) -> Response {
     match state
         .resolve_alignment(&alignment_id)
         .and_then(|alignment| alignment_artifact_bytes(&alignment, &subject, true))
     {
-        Ok(bytes) => alignment_json_bytes_response(bytes, Some(&headers)),
+        Ok(bytes) => alignment_json_bytes_response(bytes),
         Err(error) => alignment_resource_error(error),
     }
 }
@@ -665,7 +813,6 @@ async fn get_alignment_payload(
 async fn get_alignment_iteration(
     RoutePath((alignment_id, subject, iteration_id)): RoutePath<(String, String, String)>,
     Query(query): Query<AlignmentIterationQuery>,
-    headers: HeaderMap,
     State(state): State<ServiceState>,
 ) -> Response {
     let detail = state
@@ -684,7 +831,7 @@ async fn get_alignment_iteration(
             }
         });
     match detail {
-        Ok(bytes) => alignment_json_bytes_response(bytes, Some(&headers)),
+        Ok(bytes) => alignment_json_bytes_response(bytes),
         Err(error) => alignment_resource_error(error),
     }
 }
@@ -692,7 +839,6 @@ async fn get_alignment_iteration(
 /// One folded multi-stream program selected by the mapping board.
 async fn get_alignment_sequence(
     RoutePath((alignment_id, phase, sequence_id)): RoutePath<(String, String, String)>,
-    headers: HeaderMap,
     State(state): State<ServiceState>,
 ) -> Response {
     let detail = state
@@ -702,7 +848,7 @@ async fn get_alignment_sequence(
             read_alignment_sequence(&index, &phase, &sequence_id)
         });
     match detail {
-        Ok(bytes) => alignment_json_bytes_response(bytes, Some(&headers)),
+        Ok(bytes) => alignment_json_bytes_response(bytes),
         Err(error) => alignment_resource_error(error),
     }
 }
@@ -712,42 +858,17 @@ struct AlignmentIterationQuery {
     projection: Option<String>,
 }
 
-/// Serve analyzer-owned JSON verbatim, using gzip when the browser accepts it.
+/// Alignment artifacts are already the JSON the client wants, so they go out as
+/// bytes rather than through `Json` — parsing and re-serializing a payload this
+/// size to change nothing about it is pure cost.
 ///
-/// The alignment artifacts are repetitive (kernel names, operation labels and
-/// host rows), so compression reduces the large timeline/report transfer while
-/// leaving the on-disk shard and its byte offsets unchanged. `None` means the
-/// caller is an artifact endpoint whose route has no need to inspect request
-/// headers yet; it still gets the raw canonical bytes.
-fn alignment_json_bytes_response(bytes: Vec<u8>, headers: Option<&HeaderMap>) -> Response {
-    let accepts_gzip = headers
-        .and_then(|headers| headers.get(header::ACCEPT_ENCODING))
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| {
-            value.split(',').any(|encoding| {
-                encoding
-                    .trim()
-                    .split(';')
-                    .next()
-                    .is_some_and(|name| name.eq_ignore_ascii_case("gzip"))
-            })
-        });
-    if accepts_gzip {
-        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
-        if encoder.write_all(&bytes).is_ok() {
-            if let Ok(compressed) = encoder.finish() {
-                return (
-                    [
-                        (header::CONTENT_TYPE, "application/json"),
-                        (header::CONTENT_ENCODING, "gzip"),
-                        (header::VARY, "Accept-Encoding"),
-                    ],
-                    compressed,
-                )
-                    .into_response();
-            }
-        }
-    }
+/// This function used to gzip the body itself, sniffing `Accept-Encoding` and
+/// building the header set by hand. It was the only compressed response in the
+/// service: the other 30 went out uncompressed because compression lived in one
+/// handler instead of in front of all of them. `CompressionLayer` in
+/// `service_router` now covers every route, so this is back to being what it
+/// reads as.
+fn alignment_json_bytes_response(bytes: Vec<u8>) -> Response {
     ([(header::CONTENT_TYPE, "application/json")], bytes).into_response()
 }
 
@@ -885,6 +1006,57 @@ async fn get_prediction_kernel_throughput_analysis(
         Ok(Ok(value)) => Json(value).into_response(),
         Ok(Err(error)) => prediction_resource_error(error),
         Err(error) => prediction_resource_error(anyhow::anyhow!(error)),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ScopedOptimalityQuery {
+    path: Option<String>,
+    label: Option<String>,
+}
+
+fn missing_scoped_selector(query: &ScopedOptimalityQuery) -> Option<Response> {
+    (query.path.is_none() && query.label.is_none()).then(|| {
+        problem(
+            StatusCode::BAD_REQUEST,
+            "scope_selector_missing",
+            "Provide a `path` or `label` query parameter naming a CostTree node.",
+        )
+    })
+}
+
+fn scoped_optimality_error(error: anyhow::Error) -> Response {
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(json!({
+            "code": "scoped_optimality_failed",
+            "detail": format!("{error:#}"),
+        })),
+    )
+        .into_response()
+}
+
+async fn get_prediction_scoped_optimality(
+    RoutePath(prediction_id): RoutePath<String>,
+    Query(query): Query<ScopedOptimalityQuery>,
+    State(state): State<ServiceState>,
+) -> Response {
+    if let Some(response) = missing_scoped_selector(&query) {
+        return response;
+    }
+    let prediction = match state.resolve_prediction(&prediction_id) {
+        Ok(prediction) => prediction,
+        Err(error) => return prediction_resource_error(error),
+    };
+    match scoped_optimality_report(
+        &prediction.path,
+        query.path.as_deref(),
+        query.label.as_deref(),
+    )
+    .await
+    {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => scoped_optimality_error(error),
     }
 }
 
@@ -1237,113 +1409,6 @@ async fn get_summary(
     read_run_resource(state, run_id, |run| read_summary(&run)).await
 }
 
-#[derive(Deserialize)]
-struct ScopedOptimalityQuery {
-    path: Option<String>,
-    label: Option<String>,
-}
-
-/// Prediction twin of [`get_run_optimality_scoped`]: the artifact layout under
-/// `raw/` is identical, only the catalog that names the directory differs.
-async fn get_prediction_optimality_scoped(
-    RoutePath(prediction_id): RoutePath<String>,
-    Query(query): Query<ScopedOptimalityQuery>,
-    State(state): State<ServiceState>,
-) -> Response {
-    if query.path.is_none() && query.label.is_none() {
-        return problem(
-            StatusCode::BAD_REQUEST,
-            "scope_selector_missing",
-            "Provide a `path` or `label` query parameter naming a CostTree node.",
-        );
-    }
-    let prediction = match state.resolve_prediction(&prediction_id) {
-        Ok(prediction) => prediction,
-        Err(error) => return prediction_resource_error(error),
-    };
-    scoped_optimality_response(&prediction.path, &query).await
-}
-
-async fn scoped_optimality_response(
-    log_dir: &std::path::Path,
-    query: &ScopedOptimalityQuery,
-) -> Response {
-    let ctx = build_session();
-    match compute_scoped(&ctx, log_dir, query.path.as_deref(), query.label.as_deref()).await {
-        Ok((report, _slug)) => match serde_json::to_value(&report) {
-            Ok(value) => Json(value).into_response(),
-            Err(error) => {
-                eprintln!("[analyze] scoped optimality serialization failed: {error:#}");
-                problem(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "artifact_read_failed",
-                    "The scoped optimality report could not be serialized.",
-                )
-            }
-        },
-        // Selector mistakes and missing artifacts both land here; the error
-        // chain names the exact cause, so pass it through for the UI to show.
-        Err(error) => (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(json!({
-                "code": "scoped_optimality_failed",
-                "detail": format!("{error:#}"),
-            })),
-        )
-            .into_response(),
-    }
-}
-
-/// Compute scoped optimality for one CostTree node on demand. Read-only: the
-/// CLI variant persists a report file, but a browser request must never write
-/// into the run directory.
-async fn get_run_optimality_scoped(
-    RoutePath(run_id): RoutePath<String>,
-    Query(query): Query<ScopedOptimalityQuery>,
-    State(state): State<ServiceState>,
-) -> Response {
-    if query.path.is_none() && query.label.is_none() {
-        return problem(
-            StatusCode::BAD_REQUEST,
-            "scope_selector_missing",
-            "Provide a `path` or `label` query parameter naming a CostTree node.",
-        );
-    }
-    let root_source = Arc::clone(&state.root_source);
-    let run = match tokio::task::spawn_blocking(move || {
-        let roots = root_source.load()?;
-        resolve_run(&roots, &run_id)
-    })
-    .await
-    {
-        Ok(Ok(run)) => run,
-        Ok(Err(error)) if error.downcast_ref::<RunNotFound>().is_some() => {
-            return problem(
-                StatusCode::NOT_FOUND,
-                "run_not_found",
-                "The requested run is not present below the configured logs roots.",
-            )
-        }
-        Ok(Err(error)) => {
-            eprintln!("[analyze] scoped optimality discovery failed: {error:#}");
-            return problem(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "artifact_read_failed",
-                "The requested run resource could not be read.",
-            );
-        }
-        Err(error) => {
-            eprintln!("[analyze] scoped optimality worker failed: {error}");
-            return problem(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "artifact_read_failed",
-                "The requested run resource could not be read.",
-            );
-        }
-    };
-    scoped_optimality_response(&run.path, &query).await
-}
-
 async fn get_topology(
     RoutePath(run_id): RoutePath<String>,
     State(state): State<ServiceState>,
@@ -1363,8 +1428,11 @@ async fn get_workload(
     RoutePath(run_id): RoutePath<String>,
     State(state): State<ServiceState>,
 ) -> Response {
-    let repo_root = Arc::clone(&state.repo_root);
-    read_run_resource(state, run_id, move |run| read_workload(&run, &repo_root)).await
+    read_run_resource(state, run_id, |run| {
+        let logs_root = run.logs_root.clone();
+        read_workload(&run, &logs_root)
+    })
+    .await
 }
 
 async fn get_concurrency_report(
@@ -1499,6 +1567,16 @@ async fn get_kernel_time_share_payload(
     read_run_resource(state, run_id, |run| read_kernel_time_share_payload(&run)).await
 }
 
+async fn get_worker_kernel_time_share_payload(
+    RoutePath((run_id, pool_tag, worker_id)): RoutePath<(String, String, u16)>,
+    State(state): State<ServiceState>,
+) -> Response {
+    read_run_resource(state, run_id, move |run| {
+        read_kernel_time_share_worker_payload(&run, &pool_tag, worker_id)
+    })
+    .await
+}
+
 async fn get_optimality_report(
     RoutePath(run_id): RoutePath<String>,
     State(state): State<ServiceState>,
@@ -1511,6 +1589,38 @@ async fn get_optimality_payload(
     State(state): State<ServiceState>,
 ) -> Response {
     read_run_resource(state, run_id, |run| read_optimality_payload(&run)).await
+}
+
+async fn get_run_scoped_optimality(
+    RoutePath(run_id): RoutePath<String>,
+    Query(query): Query<ScopedOptimalityQuery>,
+    State(state): State<ServiceState>,
+) -> Response {
+    if let Some(response) = missing_scoped_selector(&query) {
+        return response;
+    }
+    let run = match state.resolve_run(&run_id) {
+        Ok(run) => run,
+        Err(error) if error.downcast_ref::<RunNotFound>().is_some() => {
+            return problem(
+                StatusCode::NOT_FOUND,
+                "run_not_found",
+                "The requested run is not present below the configured logs roots.",
+            )
+        }
+        Err(error) => {
+            eprintln!("[analyze] scoped optimality discovery failed: {error:#}");
+            return problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "artifact_read_failed",
+                "The requested run resource could not be read.",
+            );
+        }
+    };
+    match scoped_optimality_report(&run.path, query.path.as_deref(), query.label.as_deref()).await {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => scoped_optimality_error(error),
+    }
 }
 
 async fn get_locked_optimality_report(
