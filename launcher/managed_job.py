@@ -8,37 +8,22 @@ Direct developer invocations have no context and therefore remain local-only.
 
 from __future__ import annotations
 
-import json
-import os
 import threading
-import urllib.error
-import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-MANAGED_JOB_CONTEXT_ENV = "VIBESIM_MANAGED_JOB_CONTEXT"
-LEGACY_MANAGED_RUN_CONTEXT_ENV = "VIBESIM_MANAGED_RUN_CONTEXT"
-
-
-def _read_context() -> dict[str, Any] | None:
-    configured_path = os.environ.get(MANAGED_JOB_CONTEXT_ENV, "").strip()
-    if not configured_path:
-        configured_path = os.environ.get(LEGACY_MANAGED_RUN_CONTEXT_ENV, "").strip()
-    if not configured_path:
-        return None
-    path = Path(configured_path)
-    try:
-        payload = json.loads(path.read_text("utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        raise RuntimeError(f"managed job context could not be read: {path}") from error
-    if not isinstance(payload, dict):
-        raise RuntimeError("managed job context must contain a JSON object")
-    if payload.get("schema_version") != 1:
-        raise RuntimeError(
-            f"managed job context has unsupported schema_version {payload.get('schema_version')!r}"
-        )
-    return payload
+from .managed_client import (
+    LEGACY_MANAGED_RUN_CONTEXT_ENV as LEGACY_MANAGED_RUN_CONTEXT_ENV,
+)
+from .managed_client import (
+    MANAGED_JOB_CONTEXT_ENV as MANAGED_JOB_CONTEXT_ENV,
+)
+from .managed_client import (
+    callback_prefix,
+    post,
+    read_context,
+)
 
 
 @dataclass(slots=True)
@@ -53,24 +38,20 @@ class ManagedJob:
     resource_id: str | None = None
     _reported_statuses: set[str] = field(default_factory=set)
     _status_lock: threading.Lock = field(default_factory=threading.Lock)
+    managed_jobs_api: str | None = field(default=None, kw_only=True)
 
     @classmethod
     def from_environment(cls, job_kind: str) -> ManagedJob | None:
-        payload = _read_context()
+        payload = read_context()
         if payload is None:
             return None
-        backend_url = payload.get("backend_url")
-        capability_token = payload.get("capability_token")
-        if not isinstance(backend_url, str) or not backend_url.startswith(("http://", "https://")):
-            raise RuntimeError("managed job context has invalid backend_url")
-        if not isinstance(capability_token, str) or not capability_token:
-            raise RuntimeError("managed job context is missing capability_token")
         if not job_kind:
             raise ValueError("managed job kind must not be empty")
         return cls(
-            backend_url=backend_url.rstrip("/"),
-            capability_token=capability_token,
+            backend_url=payload["backend_url"].rstrip("/"),
+            capability_token=payload["capability_token"],
             job_kind=job_kind,
+            managed_jobs_api=payload.get("managed_jobs_api"),
         )
 
     def register(
@@ -88,7 +69,7 @@ class ManagedJob:
         if analyzer_resource_id is not None:
             request_payload["analyzerResourceId"] = analyzer_resource_id
         response = self._request(
-            "/api/internal/managed-jobs/register",
+            self._prefix() + "/register",
             request_payload,
         )
         self.job_id = _required_string(response, "jobId")
@@ -113,40 +94,16 @@ class ManagedJob:
             if summary is not None:
                 payload["summary"] = summary
             self._request(
-                f"/api/internal/managed-jobs/{self.job_id}/status",
+                f"{self._prefix()}/{self.job_id}/status",
                 payload,
             )
             self._reported_statuses.add(status)
 
     def _request(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
-        http_request = urllib.request.Request(
-            f"{self.backend_url}{path}",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {self.capability_token}",
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(http_request, timeout=15) as response:
-                body = response.read()
-        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as error:
-            detail = ""
-            if isinstance(error, urllib.error.HTTPError):
-                try:
-                    detail = error.read().decode("utf-8", "replace")[:500]
-                except OSError:
-                    detail = ""
-            suffix = f": {detail}" if detail else ""
-            raise RuntimeError(f"managed job backend request failed ({path}){suffix}") from error
-        try:
-            decoded = json.loads(body)
-        except json.JSONDecodeError as error:
-            raise RuntimeError(f"managed job backend returned invalid JSON ({path})") from error
-        if not isinstance(decoded, dict):
-            raise RuntimeError(f"managed job backend returned a non-object response ({path})")
-        return decoded
+        return post(self.backend_url, self.capability_token, path, payload)
+
+    def _prefix(self) -> str:
+        return callback_prefix(self.managed_jobs_api, simulation=False)
 
 
 def prepare_managed_job(
