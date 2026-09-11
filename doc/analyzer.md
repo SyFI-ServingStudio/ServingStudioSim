@@ -308,7 +308,7 @@ If copied experiment directories retain the same launcher-issued
 identity rather than publishing an invalid duplicate route. It keeps the first
 entry under the normal catalog priority (newer experiment date, then newer
 artifact update time), with stable workspace/name/path tie-breakers. Catalog
-discovery and `GET /api/v1/sweeps/{sweep_id}/payload` resolve through this same
+discovery and `GET /api/analyzer/v1/sweeps/{sweep_id}/subjects/sweep/payload` resolve through this same
 canonical entry. The directories are not merged and their members are not
 combined.
 
@@ -359,12 +359,12 @@ agent state are not sweep-analysis inputs.
 The read-only UI service publishes sweep analysis as a separate protocol-v1
 resource family:
 
-- `GET /api/v1/sweeps` discovers experiment envelopes containing
+- `GET /api/analyzer/v1/sweeps` discovers experiment envelopes containing
   `sweep_manifest.json` plus unclaimed singleton runs below the configured logs
   roots. Each catalog entry has an opaque `sweep_id`, `kind` (`sweep` or
   `singleton`), display name, ordered axes, member count, aggregate status,
   experiment date, deployment/trace filter values, and payload href.
-- `GET /api/v1/sweeps/{sweep_id}/payload` projects the existing
+- `GET /api/analyzer/v1/sweeps/{sweep_id}/subjects/sweep/payload` projects the existing
   `sweep_metrics_grid.json` for a manifest sweep. For a singleton it projects
   the same bounded scalars directly from that run's existing summary and
   analyzer reports; neither path rescans parquet.
@@ -430,12 +430,12 @@ must not be used to publish a prediction pool or worker hierarchy.
 
 The read-only protocol is:
 
-- `GET /api/v1/predictions` lists bounded prediction descriptors by opaque id.
-- `GET /api/v1/predictions/{prediction_id}/descriptor` returns selector,
+- `GET /api/analyzer/v1/predictions` lists bounded prediction descriptors by opaque id.
+- `GET /api/analyzer/v1/predictions/{prediction_id}/descriptor` returns selector,
   architecture/GPU provenance, lifecycle, and detail hrefs.
-- `GET /api/v1/predictions/{prediction_id}/cases?offset=&limit=` pages the
+- `GET /api/analyzer/v1/predictions/{prediction_id}/subjects/cases/payload?offset=&limit=` pages the
   snapshotted case inputs together with their exact operation summaries.
-- `GET /api/v1/predictions/{prediction_id}/cases/{case_id}/operations/{operation_id}/cost-tree`
+- `GET /api/analyzer/v1/predictions/{prediction_id}/cases/{case_id}/operations/{operation_id}/subjects/cost-tree/payload`
   reconstructs one exact tree.
 - Kernel-throughput and exact-iteration optimality routes hang below the same
   selected case/operation identity. Prediction-level kernel-input-distribution
@@ -451,15 +451,15 @@ wall-clock timeline.
 
 Agent consumers reuse this same read-only protocol rather than receiving a
 second metric API. A generic Analyzer MCP adapter may expose GET access below
-`/api/v1/`, but it must accept only relative Analyzer paths, reject traversal
+`/api/analyzer/v1/`, but it must accept only relative Analyzer paths, reject traversal
 and arbitrary origins, and bound response size and request time. It never
 recomputes metrics. An Agent uses an explicit UI or managed-workflow resource ID
 when available. Otherwise it may inspect the newest-first discovery catalog:
 
-- `GET /api/v1/sweeps?status=ready&limit=5` returns bounded candidates;
-- `GET /api/v1/sweeps/latest` returns the same catalog envelope with the newest
+- `GET /api/analyzer/v1/sweeps?status=ready&limit=5` returns bounded candidates;
+- `GET /api/analyzer/v1/sweeps/latest` returns the same catalog envelope with the newest
   ready candidate, if any; and
-- `GET /api/v1/sweeps/{sweep_id}/payload` reads the selected exact result.
+- `GET /api/analyzer/v1/sweeps/{sweep_id}/subjects/sweep/payload` reads the selected exact result.
 
 `status` accepts `ready` or `pending`; `limit` accepts `1..=100`. Catalog order
 is experiment date descending, then artifact update time descending. The Agent
@@ -527,26 +527,26 @@ service must not assume that every launcher trace is under one root-level
 L1 kernel profiling and trend measurements are first-class Analyzer resources,
 peer to runs, sweeps, and timing predictions. The read-only protocol is:
 
-- `GET /api/v1/kernel-profiles` discovers `kernel_profile` artifacts by opaque
+- `GET /api/analyzer/v1/kernel-profiles` discovers `kernel_profile` artifacts by opaque
   id (`kp_<uuid>`), workspace-aware, ignoring `old-logs`, rejecting duplicate or
   invalid ids.
-- `GET /api/v1/kernel-profiles/{profile_id}/descriptor` returns kernel
+- `GET /api/analyzer/v1/kernel-profiles/{profile_id}/descriptor` returns kernel
   kind/table/backend/metric family, explicit GPU provenance (requested DB cache
   key, worker-observed physical GPU, `measurement` vs `cache_key` source),
   lifecycle, and the curve href.
-- `GET /api/v1/kernel-profiles/{profile_id}/curve` serves the immutable
+- `GET /api/analyzer/v1/kernel-profiles/{profile_id}/curve` serves the immutable
   `curve.json` enriched with per-row hardware ceilings (see below); the artifact
   file is never rewritten.
-- `GET /api/v1/kernel-measurements` discovers `kernel_measurement` artifacts
+- `GET /api/analyzer/v1/kernel-measurements` discovers `kernel_measurement` artifacts
   (`km_<uuid>`), workspace-aware with the same id hygiene.
-- `GET /api/v1/kernel-measurements/{measurement_id}/descriptor` exposes the
+- `GET /api/analyzer/v1/kernel-measurements/{measurement_id}/descriptor` exposes the
   declared shape, duration, telemetry, GPU provenance, and summary/plot hrefs.
-- `GET /api/v1/kernel-measurements/{measurement_id}/summary` serves the existing
+- `GET /api/analyzer/v1/kernel-measurements/{measurement_id}/summary` serves the existing
   `summary.json` artifact (`schema_version` 1, passthrough).
-- `GET /api/v1/kernel-measurements/{measurement_id}/plots/{plot_name}` serves a
+- `GET /api/analyzer/v1/kernel-measurements/{measurement_id}/plots/{plot_name}` serves a
   declared image. The plot path accepts exactly one normal component and only a name
   the resource declares, so traversal and undeclared files are impossible.
-- `GET /api/v1/hardware/gpus?name=<gpu_name>` resolves the GPU spec catalog.
+- `GET /api/analyzer/v1/hardware/gpus?name=<gpu_name>` resolves the GPU spec catalog.
 
 The Python profiling artifact path owns the metadata and never depends on a
 conversation backend (direct development runs also write resource identity).

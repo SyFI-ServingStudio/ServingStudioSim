@@ -22,8 +22,7 @@ pub(super) fn workload_conservation_descriptor(run: &DiscoveredRun) -> Result<Op
     Ok(Some(json!({
         "status": "ready",
         "schema_version": 1,
-        "report_href": "subjects/workload-conservation/report",
-        "payload_href": "subjects/workload-conservation/payload",
+        "views": ["report", "payload"],
     })))
 }
 

@@ -17,7 +17,7 @@ pub(super) fn resolve_gpu(repo_root: &std::path::Path, name: &str) -> Result<Opt
     Ok(crate::hardware::resolve_gpu(repo_root, name))
 }
 
-/// The public ``GET /api/v1/hardware/gpus?name=...`` projection.
+/// The public ``GET /api/analyzer/v1/hardware/gpus?name=...`` projection.
 pub(super) fn hardware_gpu_response(requested: &str, resolved: Option<&ResolvedGpu>) -> Value {
     match resolved {
         Some(gpu) => json!({

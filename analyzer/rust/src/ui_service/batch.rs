@@ -24,8 +24,7 @@ pub(super) fn batch_descriptor(run: &DiscoveredRun) -> Result<Option<Value>> {
     Ok(Some(json!({
         "status": "ready",
         "schema_version": 1,
-        "report_href": "subjects/batch/report",
-        "payload_href": "subjects/batch/payload",
+        "views": ["report", "payload"],
     })))
 }
 

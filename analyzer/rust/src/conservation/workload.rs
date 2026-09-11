@@ -174,7 +174,9 @@ fn uses_speculative_worker(params: &Value) -> bool {
                 pool.get("groups")
                     .and_then(Value::as_array)
                     .is_some_and(|groups| {
-                        groups.iter().any(|group| group["worker"]["type"] == "speculative")
+                        groups
+                            .iter()
+                            .any(|group| group["worker"]["type"] == "speculative")
                     })
             })
         })
@@ -1482,9 +1484,11 @@ mod tests {
             }
         }
         assert!(!uses_speculative_worker(&json!({})));
-        assert!(!uses_speculative_worker(&json!({"pools": {"main": {"groups": [{
-            "arch": {"type": "glm52_vllm_nvfp4_dsa_moe_speculative"}
-        }]}}})));
+        assert!(!uses_speculative_worker(
+            &json!({"pools": {"main": {"groups": [{
+                "arch": {"type": "glm52_vllm_nvfp4_dsa_moe_speculative"}
+            }]}}})
+        ));
     }
 
     #[test]

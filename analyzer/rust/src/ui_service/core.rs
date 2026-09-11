@@ -37,7 +37,7 @@ pub(super) fn build_descriptor(run: &DiscoveredRun) -> Result<Value> {
         "display_name": run.display_name,
         "deployment": deployment,
         "lifecycle": run.lifecycle,
-        "summary": { "href": "summary" },
+        "summary": { "views": ["report"] },
         "subjects": {},
         "details": {},
         "traces": {},
@@ -45,7 +45,7 @@ pub(super) fn build_descriptor(run: &DiscoveredRun) -> Result<Value> {
 
     if regular_file(&run.path.join("raw/run_meta.json")) {
         descriptor["topology"] = json!({
-            "href": "topology",
+            "views": ["payload"],
             "media_type": "application/json",
             "schema_version": 1,
         });
@@ -53,14 +53,14 @@ pub(super) fn build_descriptor(run: &DiscoveredRun) -> Result<Value> {
     if let Some(model_config) = model_config_path(&params)? {
         descriptor["model_name"] = Value::String(model_config);
         descriptor["model"] = json!({
-            "href": "model",
+            "views": ["payload"],
             "media_type": "application/json",
             "schema_version": 2,
         });
     }
     if !trace_file_paths(&params)?.is_empty() {
         descriptor["workload"] = json!({
-            "href": "workload",
+            "views": ["payload"],
             "media_type": "application/json",
             "schema_version": 1,
         });

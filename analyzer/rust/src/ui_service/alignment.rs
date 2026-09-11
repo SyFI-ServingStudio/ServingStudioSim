@@ -126,10 +126,6 @@ impl DiscoveredAlignment {
         }
     }
 
-    fn subject_href(&self, subject: &str, leaf: &str) -> String {
-        format!("alignments/{}/subjects/{subject}/{leaf}", self.alignment_id)
-    }
-
     /// The timing prediction this bundle's modelled side came out of.
     ///
     /// Only the kernel manifest names it, because the modelled side is a
@@ -166,7 +162,6 @@ struct AlignmentCatalogEntry {
     display_name: String,
     kernel_analysis: &'static str,
     e2e_analysis: &'static str,
-    descriptor_href: String,
     updated_at: String,
 }
 
@@ -181,7 +176,6 @@ pub(super) fn build_alignment_catalog(roots: &[ConfiguredRoot]) -> Result<Alignm
     let alignments = alignments
         .into_iter()
         .map(|alignment| AlignmentCatalogEntry {
-            descriptor_href: format!("alignments/{}/descriptor", alignment.alignment_id),
             kernel_analysis: alignment.half_status(KERNEL_ANALYSIS_DIR),
             e2e_analysis: alignment.half_status(E2E_ANALYSIS_DIR),
             kind: "alignment",
@@ -376,12 +370,12 @@ pub(super) fn alignment_descriptor(
                 (*subject).to_owned(),
                 json!({
                     "status": if available { "ready" } else { "not_generated" },
-                    "report_href": available.then(|| alignment.subject_href(subject, "report")),
-                    "payload_href": available.then(|| alignment.subject_href(subject, "payload")),
-                    "iteration_href": available
-                        .then(|| detail_section(subject))
-                        .flatten()
-                        .map(|_| alignment.subject_href(subject, "iterations/{iteration_id}")),
+                    "views": if available { json!(["report", "payload"]) } else { json!([]) },
+                    // Whether one iteration can be read on its own. It is a
+                    // property of the subject, not a second address: the shape
+                    // is `subjects/{name}/iterations/{id}` for every subject
+                    // that has it.
+                    "has_iteration_detail": available && detail_section(subject).is_some(),
                 }),
             )
         })

@@ -1827,7 +1827,9 @@ fn join_mapped_occurrences(
 
     for (aggregate_key, item) in inventory_kernels {
         let identity = item.operation.clone().or_else(|| {
-            item.collective.as_ref().map(|name| format!("unmapped-collective/{name}"))
+            item.collective
+                .as_ref()
+                .map(|name| format!("unmapped-collective/{name}"))
         });
         let Some(operation) = identity.as_ref() else {
             joined.push((aggregate_key.clone(), item.clone()));
