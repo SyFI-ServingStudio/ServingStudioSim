@@ -8,8 +8,7 @@ orchestrator (1:1), the pool topology, and each pool's contract class (which arc
 scheduling logic of its own.
 
 This is the practical, code-matching reference; the code is the ground truth.
-For the layer overview see `doc/detailed_design/L6.md`; the archived config-tree
-design intent is `old-doc/new-interface-design.md`.
+For the layer overview see `doc/detailed_design/L6.md`.
 
 ## The `Deployment` trait + dispatch
 
@@ -69,7 +68,7 @@ embeds the run-global specs and fixes which **pool roles** exist:
    draft/verify execution contract. PD worker tags belong to the `pd` deployment.
 4. **Select the arch by its explicit tag** — the wired unified arms are
    `Llama3Dense`, `Llama3DenseTp`, `Llama3DpAttnTpFfn`, `Qwen3MoeDpAttnEpFfn`,
-   `Qwen3MoeFp8DpAttnEpFfn`, `Qwen3VllmMoeDpAttnEpFfn`, `Glm52DsaMoe`, and
+   `Qwen3MoeFp8DpAttnEpFfn`, `Qwen3VllmMoeDpAttnEpFfn`, and
    `Glm52VllmDsaMoe`, plus the explicit NVFP4 provider variants.
    `Glm52VllmNvfp4DsaMoeSpeculative` requires the `Speculative` worker with the
    same draft depth; it has its own L4 identity. Dispatch is provider-first, *not* a

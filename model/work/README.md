@@ -38,13 +38,11 @@ non-communication location. An empty semantic list means that location has zero
 minimum under the cross-leaf-fusion convention. The mapping never derives
 minimum work from simulator shapes.
 
-One arch type needs one map, and arch types that model the same model still need
-one each. `glm52_dsa_moe_unified.json` (126 locations),
-`glm52_vllm_dsa_moe_unified.json` (166), and
-`glm52_vllm_nvfp4_dsa_moe_unified.json` (114) share all 82 semantic rows. Their
-different decompositions split the same work into different leaves; quantize,
-gather, and fill leaves have zero minimum, while communication leaves never
-appear in a map.
+One arch type needs one map. `glm52_vllm_dsa_moe_unified.json` (166 locations)
+and `glm52_vllm_nvfp4_dsa_moe_unified.json` (114) share all 82 semantic rows.
+Their different precision and decompositions split the same necessary work into
+different leaves; quantize, gather, and fill leaves have zero minimum, while
+communication leaves never appear in a map.
 
 Learned normalization scales are compulsory model weights and therefore remain
 in the minimum at their norm locations. Only the intermediate norm/activation

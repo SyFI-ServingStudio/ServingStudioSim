@@ -1,7 +1,7 @@
 """Turn a structured preset into the concrete config trees a run actually uses.
 
 A preset is the config tree (`deployment` / `workload` / `io` / `pools`) plus
-three optional launcher control blocks (new-interface-design §11):
+three optional launcher control blocks (L7 design):
 
     sweep:        {name: [values] | {label: value}}   # independent dims
     compound:     {group: {label: {member: value}}}    # correlated dims (zip)

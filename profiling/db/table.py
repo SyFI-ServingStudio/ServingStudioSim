@@ -480,7 +480,7 @@ def _git_tree_stamp(repo_root: Path) -> str:
     """
     try:
         result = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
+            ["git", "rev-parse", "--show-toplevel", "HEAD"],
             cwd=repo_root,
             capture_output=True,
             text=True,
@@ -488,7 +488,10 @@ def _git_tree_stamp(repo_root: Path) -> str:
         )
     except (FileNotFoundError, subprocess.CalledProcessError):
         return "unknown"
-    head = result.stdout.strip()
+    lines = result.stdout.splitlines()
+    if len(lines) != 2 or Path(lines[0]).resolve() != repo_root.resolve():
+        return "unknown"
+    head = lines[1].strip()
     if not head:
         return "unknown"
     try:

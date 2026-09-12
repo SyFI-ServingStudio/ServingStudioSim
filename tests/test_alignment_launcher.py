@@ -1652,7 +1652,7 @@ def test_timing_predict_snapshots_private_labeler_params(tmp_path):
     config = {
         "arch": {
             "iter": {
-                "type": "glm52_dsa_moe",
+                "type": "glm52_vllm_dsa_moe",
                 "model_config": "model/config/glm52.json",
                 "fp8": False,
                 "ep_size": 8,

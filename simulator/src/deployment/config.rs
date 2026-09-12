@@ -1,4 +1,4 @@
-//! Structured run config (L7 assembly) — new-interface-design §6.
+//! Structured run config (L7 assembly).
 //!
 //! These are the top-level types a concrete config file deserializes into, and
 //! the run-global specs they embed. They live with the deployment layer because
@@ -449,10 +449,8 @@ pools:
         };
         assert_eq!(a.pools.attn.groups[0].replicas, 8);
         assert_eq!(a.pools.ffn.groups[0].replicas, 1);
-        match &a.pools.attn.groups[0].arch {
-            AttnArchSel::Qwen3AttnTp { attn_tp_size, .. } => assert_eq!(*attn_tp_size, 4),
-            other => panic!("expected qwen3_attn_tp, got {other:?}"),
-        }
+        let AttnArchSel::Qwen3AttnTp { attn_tp_size, .. } = &a.pools.attn.groups[0].arch;
+        assert_eq!(*attn_tp_size, 4);
         match &a.pools.ffn.groups[0].arch {
             FfnArchSel::Qwen3FfnMoe {
                 attn_tp_size,

@@ -2,7 +2,7 @@
 //!
 //! `simulator list-params` prints the JSON produced here; the launcher writes it
 //! to `target/<profile>/deployment_schema.json` and walks a concrete config
-//! against it (new-interface-design §11). It is NOT a cartesian product of
+//! against it (L7 design). It is NOT a cartesian product of
 //! (deployment × arch × worker) — it publishes the structure:
 //!   - `deployments`: each deployment's pool roles → contract class;
 //!   - `providers`: per contract class, each arch/worker tag's params;
@@ -56,7 +56,7 @@ fn providers_with_flattened(
     Value::Object(m)
 }
 
-/// Build the full `list-params` registry JSON (new-interface-design §11.1).
+/// Build the full `list-params` registry JSON.
 pub fn list_params() -> Value {
     json!({
         "deployments": {

@@ -2,8 +2,8 @@
 
 ## Agent Input
 
-Work in `/m-coriander/coriander/kanzhu/VibeSim_workspace/VibeSim` with no prior
-knowledge beyond repo-local instructions. Use the appropriate repo-local skill
+Work in the repository root supplied by the test harness with no prior knowledge
+beyond repo-local instructions. Use the appropriate repo-local skill
 to count missing rows for an existing L1 kernel without profiling anything.
 
 Use table `single_gemm`, backend `torch`, a fresh temporary DB under `/tmp`, and

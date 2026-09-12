@@ -2,7 +2,8 @@
 
 The normal development CLI has no managed context and only writes a stable
 ``experiment.meta.json`` sidecar.  UI/headless Agent runtimes inject one
-short-lived capability path through ``VIBESIM_MANAGED_RUN_CONTEXT``.  In that mode
+short-lived capability path through ``VIBESIM_MANAGED_JOB_CONTEXT`` (or the
+legacy ``VIBESIM_MANAGED_RUN_CONTEXT``). In that mode
 registration is mandatory and happens before any official run artifact is
 created.
 """
@@ -10,16 +11,21 @@ created.
 from __future__ import annotations
 
 import json
-import os
 import threading
-import urllib.error
-import urllib.request
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-MANAGED_CONTEXT_ENV = "VIBESIM_MANAGED_RUN_CONTEXT"
+from .managed_client import (
+    LEGACY_MANAGED_RUN_CONTEXT_ENV,
+    UNIFIED_JOBS_API,
+    callback_prefix,
+    post,
+    read_context,
+)
+
+MANAGED_CONTEXT_ENV = LEGACY_MANAGED_RUN_CONTEXT_ENV
 EXPERIMENT_METADATA_FILENAME = "experiment.meta.json"
 MANAGED_AGGREGATE_SUBJECTS = ("slo-general", "throughput", "utilization")
 
@@ -57,29 +63,17 @@ class ManagedRun:
     approved_root: str | None = None
     _reported_statuses: set[str] = field(default_factory=set)
     _status_lock: threading.Lock = field(default_factory=threading.Lock)
+    managed_jobs_api: str | None = field(default=None, kw_only=True)
 
     @classmethod
     def from_environment(cls) -> ManagedRun | None:
-        configured_path = os.environ.get(MANAGED_CONTEXT_ENV, "").strip()
-        if not configured_path:
+        payload = read_context()
+        if payload is None:
             return None
-        payload = _read_json(Path(configured_path))
-        if payload.get("schema_version") != 1:
-            raise RuntimeError(
-                "managed run context has unsupported schema_version "
-                f"{payload.get('schema_version')!r}"
-            )
-        backend_url = payload.get("backend_url")
-        capability_token = payload.get("capability_token")
-        if not isinstance(backend_url, str) or not backend_url.startswith(
-            ("http://", "https://")
-        ):
-            raise RuntimeError("managed run context has invalid backend_url")
-        if not isinstance(capability_token, str) or not capability_token:
-            raise RuntimeError("managed run context is missing capability_token")
         return cls(
-            backend_url=backend_url.rstrip("/"),
-            capability_token=capability_token,
+            backend_url=payload["backend_url"].rstrip("/"),
+            capability_token=payload["capability_token"],
+            managed_jobs_api=payload.get("managed_jobs_api"),
         )
 
     def register(
@@ -89,14 +83,21 @@ class ManagedRun:
         run_count: int,
         axes: list[str],
     ) -> None:
-        response = self._request(
-            "/api/internal/managed-runs/register",
+        payload = (
             {
+                "jobKind": "simulation",
+                "artifactRoot": str(experiment_root),
+                "runCount": run_count,
+                "axes": axes,
+            }
+            if self.managed_jobs_api == UNIFIED_JOBS_API
+            else {
                 "experimentRoot": str(experiment_root),
                 "runCount": run_count,
                 "axes": axes,
-            },
+            }
         )
+        response = self._request(self._prefix() + "/register", payload)
         self.job_id = _required_string(response, "jobId")
         self.experiment_id = _required_string(response, "experimentId")
         self.approved_root = _required_string(response, "approvedRoot")
@@ -113,46 +114,16 @@ class ManagedRun:
             if status in self._reported_statuses:
                 return
             self._request(
-                f"/api/internal/managed-runs/{self.job_id}/status",
+                f"{self._prefix()}/{self.job_id}/status",
                 {"status": status},
             )
             self._reported_statuses.add(status)
 
     def _request(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
-        request = urllib.request.Request(
-            f"{self.backend_url}{path}",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {self.capability_token}",
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=15) as response:
-                body = response.read()
-        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as error:
-            detail = ""
-            if isinstance(error, urllib.error.HTTPError):
-                try:
-                    detail = error.read().decode("utf-8", "replace")[:500]
-                except OSError:
-                    detail = ""
-            suffix = f": {detail}" if detail else ""
-            raise RuntimeError(
-                f"managed run backend request failed ({path}){suffix}"
-            ) from error
-        try:
-            decoded = json.loads(body)
-        except json.JSONDecodeError as error:
-            raise RuntimeError(
-                f"managed run backend returned invalid JSON ({path})"
-            ) from error
-        if not isinstance(decoded, dict):
-            raise RuntimeError(
-                f"managed run backend returned a non-object response ({path})"
-            )
-        return decoded
+        return post(self.backend_url, self.capability_token, path, payload)
+
+    def _prefix(self) -> str:
+        return callback_prefix(self.managed_jobs_api, simulation=True)
 
 
 def prepare_experiment(
@@ -179,9 +150,7 @@ def _write_development_metadata(experiment_root: Path) -> None:
     metadata_path = experiment_root / EXPERIMENT_METADATA_FILENAME
     if metadata_path.is_file():
         payload = _read_json(metadata_path)
-        if payload.get("schema_version") != 1 or not isinstance(
-            payload.get("experiment_id"), str
-        ):
+        if payload.get("schema_version") != 1 or not isinstance(payload.get("experiment_id"), str):
             raise RuntimeError(f"incompatible experiment metadata: {metadata_path}")
         return
     payload = {
@@ -197,7 +166,5 @@ def _write_development_metadata(experiment_root: Path) -> None:
 def _required_string(payload: dict[str, Any], field_name: str) -> str:
     value = payload.get(field_name)
     if not isinstance(value, str) or not value:
-        raise RuntimeError(
-            f"managed run backend response is missing {field_name!r}"
-        )
+        raise RuntimeError(f"managed run backend response is missing {field_name!r}")
     return value

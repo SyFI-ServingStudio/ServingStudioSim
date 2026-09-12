@@ -89,7 +89,6 @@ presets/          runnable deployment/prediction configurations
 skills/           canonical VibeSim Agent workflows
 tests/            CPU, GPU, binary, database, and Agent test tiers
 doc/              current architecture and detailed design
-old-doc/          archived legacy design symlink
 ```
 
 Start with [`doc/README.md`](doc/README.md) and

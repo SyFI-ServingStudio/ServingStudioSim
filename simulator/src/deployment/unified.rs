@@ -3,10 +3,10 @@
 //!
 //! `build` reads the structured `UnifiedConfig`: a single pool (`main`) with one
 //! homogeneous group. The arch is selected by its explicit tag (NO `tp_size`
-//! dispatch — provider-first, new-interface-design §4). Wired arms are
+//! dispatch; see the L4/L6 design). Wired arms are
 //! `llama3_dense` + `barebone`, `llama3_dense_tp` + `barebone`,
 //! `llama3_dp_attn_tp_ffn` + `hp_unified`, and `qwen3_moe_dp_attn_ep_ffn` +
-//! `hp_unified`, `glm52_dsa_moe` + `hp_unified`, and
+//! `hp_unified`, `glm52_vllm_dsa_moe` + `hp_unified`, and
 //! `glm52_vllm_nvfp4_dsa_moe` + either `hp_unified` or `chunked_prefill`,
 //! `glm52_vllm_nvfp4_dsa_moe_speculative` + `speculative`, and
 //! `glm52_sglang_nvfp4_tp_dsa_moe` + `chunked_prefill`. GLM's TP1 local
@@ -579,38 +579,6 @@ impl Deployment for UnifiedDeployment {
                     &g.worker,
                 )
             }
-            IterArchSel::Glm52DsaMoe {
-                ep_size,
-                nvl_num_gpu,
-                routing,
-                routing_seed,
-                mtp_mode,
-                expert_popularity_file,
-                ..
-            } => {
-                ensure_hp_unified(&g.worker)?;
-                let model = Arc::new(arch_build::glm52_dsa_moe(
-                    model_spec,
-                    *ep_size,
-                    *nvl_num_gpu,
-                    *routing,
-                    *routing_seed,
-                    *mtp_mode,
-                    expert_popularity_file.as_deref(),
-                    &gpu_name,
-                    MODEL_NAME,
-                    bridge,
-                )?);
-                Ok(assemble_flow(
-                    model,
-                    store,
-                    worker_config,
-                    log_dir,
-                    gpu_name,
-                    dp_cfg,
-                    build_hp_worker,
-                ))
-            }
         }
     }
 }
@@ -775,7 +743,7 @@ fn placement_into(p: PlacementPolicy) -> DpPlacementPolicy {
 mod tests {
     use super::*;
     use crate::arch::{
-        Glm52DsaMoeModel, Glm52VllmNvfp4DsaMoeModel, Glm52VllmNvfp4DsaMoeSpeculativeModel,
+        Glm52VllmDsaMoeModel, Glm52VllmNvfp4DsaMoeModel, Glm52VllmNvfp4DsaMoeSpeculativeModel,
         Qwen36LocalModel,
     };
     use crate::common::RequestId;
@@ -825,7 +793,7 @@ mod tests {
 
     #[test]
     fn glm52_hp_unified_pair_satisfies_the_iter_worker_contract() {
-        assert_iter_worker_contract::<HpUnifiedWorker<Glm52DsaMoeModel>>();
+        assert_iter_worker_contract::<HpUnifiedWorker<Glm52VllmDsaMoeModel>>();
         ensure_hp_unified(&hp_worker()).expect("GLM accepts hp_unified");
     }
 
@@ -910,7 +878,7 @@ pools:
       - gpu: "NVIDIA H200"
         replicas: 1
         arch:
-          type: glm52_dsa_moe
+          type: glm52_vllm_dsa_moe
           model_config: model/config/glm52.json
           fp8: false
           ep_size: 8
@@ -928,7 +896,7 @@ pools:
             panic!("expected unified config")
         };
         let group = &cfg.pools.main.groups[0];
-        let IterArchSel::Glm52DsaMoe {
+        let IterArchSel::Glm52VllmDsaMoe {
             ep_size,
             nvl_num_gpu,
             mtp_mode,

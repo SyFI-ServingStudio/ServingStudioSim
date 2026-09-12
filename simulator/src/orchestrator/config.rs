@@ -1,4 +1,4 @@
-//! Pool + group topology config (L6) — new-interface-design §6.1 / §8.
+//! Pool + group topology config (L6).
 //!
 //! A pool is always `{ placement, groups: [...] }` — never inlined. A homogeneous
 //! pool has a `groups` list of length 1; heterogeneous = several groups on

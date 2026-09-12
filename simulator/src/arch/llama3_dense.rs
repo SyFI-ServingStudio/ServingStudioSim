@@ -87,8 +87,8 @@ pub struct Llama3DenseModel {
 }
 
 /// This arch's numeric parallel input: dense local has no sharding, so the only
-/// dim it forwards is the `gpu_name` every kernel lookup keys on (L4 §3.8). Per
-/// new-interface-design §13: each arch owns the numeric parallel struct it needs,
+/// dim it forwards is the `gpu_name` every kernel lookup keys on (L4 §3.8). Each
+/// arch owns the numeric parallel struct it needs,
 /// replacing the retired shared `ParallelCfg` union.
 #[derive(Clone, Debug)]
 pub struct DenseParallel {

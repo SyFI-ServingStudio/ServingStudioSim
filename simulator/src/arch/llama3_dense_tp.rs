@@ -91,8 +91,8 @@ pub struct Llama3DenseTpModel {
 }
 
 /// This arch's numeric parallel input: the Megatron `tp_size` it shards on plus
-/// the `gpu_name` every kernel lookup keys on (L4 §3.8). Per new-interface-design
-/// §13: each arch owns the numeric parallel struct it needs, replacing the retired
+/// the `gpu_name` every kernel lookup keys on (L4 §3.8). Each arch owns the
+/// numeric parallel struct it needs, replacing the retired
 /// shared `ParallelCfg` union.
 #[derive(Clone, Debug)]
 pub struct DenseTpParallel {

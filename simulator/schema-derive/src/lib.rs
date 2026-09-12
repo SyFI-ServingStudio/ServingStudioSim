@@ -1,5 +1,5 @@
 //! Derive the launcher `ParamDef` schema directly from the config types, so a
-//! field and its schema entry cannot drift (new-interface-design §11).
+//! field and its schema entry cannot drift (L7 design).
 //!
 //! Two derives, both emitting an inherent `const` that `schema::dump::list_params`
 //! aggregates:

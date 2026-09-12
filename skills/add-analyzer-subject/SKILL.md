@@ -104,8 +104,7 @@ Read these first and cite the sections you use:
 
 - `doc/analyzer.md` — the analyzer design contract: the report/payload envelope,
   the flat registry, categories = grain + source (find your metric's row or justify
-  a new category), and the applicability/scope gate. It supersedes the archived
-  `old-doc/analyzer.md`.
+  a new category), and the applicability/scope gate.
 - `analyzer/README.md` — the code-matching reference and the **canonical Subjects
   catalog** (every registered subject + what it reads and emits); confirm your
   metric is not a duplicate and note where it will be listed.
@@ -116,7 +115,7 @@ Read these first and cite the sections you use:
     `analyzer/python/throughput/segment_plot.py`, or the simpler
     `analyzer/rust/src/utilization/series.rs` +
     `analyzer/python/utilization/util_plot.py`.
-- The `cost_log` schema (`old-doc/logging.md`) if your source is `cost_log`.
+- The `cost_log` schema (`simulator/src/log/README.md`) if your source is `cost_log`.
 
 ## Decide before coding
 

@@ -19,7 +19,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use anyhow::{bail, ensure, Context};
+use anyhow::{ensure, Context};
 
 use crate::arch::build as arch_build;
 use crate::arch::{AttnArchSel, FfnArchSel};
@@ -252,10 +252,6 @@ impl Deployment for AfdDeployment {
                     Some(cfg.io.log_dir.clone()),
                 ))
             }
-            (a, f) => bail!(
-                "afd: unsupported attn/ffn arch pairing (got attn={a:?}, ffn={f:?}); \
-                 wired pairs: qwen3_attn→qwen3_ffn_moe or qwen3_fp8_ffn_moe"
-            ),
         }
     }
 }

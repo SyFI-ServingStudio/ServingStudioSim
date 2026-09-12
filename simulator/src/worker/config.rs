@@ -1,5 +1,5 @@
 //! Worker (L5) config surface — the worker *selectors*, co-located with the L5
-//! workers they pick (new-interface-design §2).
+//! workers they pick (L5 design).
 //!
 //! Each selector is a serde tagged enum (`#[serde(tag = "type")]`), the symmetric
 //! sibling of the arch selector. `barebone` / `hp_unified` are wired for

@@ -1,7 +1,7 @@
 //! Numeric model dims (`ModelCfg`) consumed by model_arch `build_configs`
 //! (L4 design.md §1.1). The parallel/sharding degrees are NOT here: each arch
 //! owns its own numeric parallel struct (`DenseParallel`, `DenseTpParallel`, …)
-//! co-located with the arch, per new-interface-design §13 (the retired shared
+//! co-located with the arch, per the L4 design (the retired shared
 //! `ParallelCfg` union).
 //!
 //! These are the *resolved numeric* dims, distinct from the CLI parameter layer

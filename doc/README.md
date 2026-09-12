@@ -51,6 +51,9 @@ infrastructure.
   tells you which directory implements which layer.
 - **[invariants.md](invariants.md)** — the cross-cutting rules every layer upholds,
   in one place.
+- **[architecture_compatibility.md](architecture_compatibility.md)** — supported
+  architecture selectors, parallel-layout coverage, and migration rules for
+  retired selectors.
 - **[detailed_design/](detailed_design/)** — one concise document per layer
   (`L1.md` … `L7.md`): its role, boundary, the directory and key types that
   implement it, and its own invariants.
@@ -63,17 +66,13 @@ infrastructure.
   ladder, and how the independent necessary-work labeler under `model/work/`
   feeds it.
 
-Two companion sources sit alongside this folder:
+One companion source sits alongside this folder:
 
 - **Per-module `README.md` files** live next to the code
   (`simulator/src/*/README.md`, `profiling/`, `launcher/`, `analyzer/`,
   `model/work/`, `alignment/`). They are the finest-grained, code-matching
   reference; when a README disagrees with these docs, the code — and the README
   next to it — wins.
-- **`old-doc/`** is the archived design record (deep cost-math derivations, design
-  rationale, discussions, and forward-looking plans). This `doc/` folder is the
-  clean, current picture; `old-doc/` is where the history and the math live.
-
 ## What sits outside the seven layers
 
 Three top-level directories deliberately do not belong to a layer, because each

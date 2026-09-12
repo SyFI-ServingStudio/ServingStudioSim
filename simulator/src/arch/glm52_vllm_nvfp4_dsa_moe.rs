@@ -25,7 +25,7 @@ use anyhow::Result;
 use crate::arch::contract::{
     IterwiseUnifiedModel, SpeculativeArchInput, SpeculativeUnifiedModel, UnifiedArchInput,
 };
-use crate::arch::glm52_dsa_moe::{Glm52ModelCfg, Glm52MtpMode};
+use crate::arch::glm52_model_cfg::{Glm52ModelCfg, Glm52MtpMode};
 use crate::common::Fabric;
 use crate::op::attention::DsaSparseMlaExactVarlenConfig;
 use crate::op::Op;
@@ -2477,7 +2477,7 @@ mod tests {
     }
 
     fn model() -> Glm52ModelCfg {
-        crate::arch::glm52_dsa_moe::parse_model_json(&exact_json_value().to_string()).unwrap()
+        crate::arch::glm52_model_cfg::parse_model_json(&exact_json_value().to_string()).unwrap()
     }
 
     fn parallel(ep_size: u16) -> Glm52VllmNvfp4DsaMoeParallel {
@@ -3166,10 +3166,8 @@ mod tests {
             5,
         )
         .unwrap();
-        let full_index = build_speculative(
-            "unified".into(), resolve_configs(&full_index_cfg), &bridge,
-        )
-        .unwrap();
+        let full_index =
+            build_speculative("unified".into(), resolve_configs(&full_index_cfg), &bridge).unwrap();
         let full_index_slots = full_index.cost_tree().slots;
         let mut slot_names = slot_names;
         slot_names.extend(full_index_slots.iter().map(|slot| slot.name.as_str()));

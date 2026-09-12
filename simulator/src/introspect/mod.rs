@@ -18,7 +18,8 @@
 //!     by). Builds the kernel like `eval`, then reads the peak straight off the
 //!     cache cells — no query points, no coords remap. Needs the bridge.
 //!
-//! Division of labor: Python (`tools/cache_fidelity.py`) owns the one config and
+//! Division of labor: Python (`tools/cache-fidelity-analyzer/cache_fidelity.py`)
+//! owns the one config and
 //! feeds it to **both** the Rust interpolation (here) and the perf_api ground
 //! truth, so they can't describe different kernels. Rust owns only the
 //! authoritative interpolation + grid metadata; it never profiles ground truth

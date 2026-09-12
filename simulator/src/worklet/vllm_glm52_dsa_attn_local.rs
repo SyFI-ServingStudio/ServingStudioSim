@@ -1,7 +1,7 @@
 //! GLM-5.2 local DSA attention worklet in **vLLM kernel granularity**.
 //!
-//! Same section as [`super::glm52_dsa_attn_local`]: TP1 MLA attention with the
-//! optional DSA indexer, from the entry residual RMSNorm through o_proj.
+//! Models TP1 MLA attention with the optional DSA indexer, from the entry
+//! residual RMSNorm through o_proj.
 //!
 //! The one divergence: vLLM launches a BF16->FP8 block quantisation
 //! (`fp8_blockscale_gemm::scale_1x128_kernel`) before **each** dense FP8 GEMM,

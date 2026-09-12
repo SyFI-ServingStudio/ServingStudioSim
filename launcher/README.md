@@ -8,8 +8,7 @@ repro metadata, spawning runs in parallel, and kicking off post-run analysis. It
 contains **no simulation logic**; the Rust binary does the actual work.
 
 This is the practical, code-matching reference. For the layer overview see
-`doc/detailed_design/L7.md`; the archived config-tree design intent is
-`old-doc/new-interface-design.md`. If this file disagrees with the code, the code wins — open an issue.
+`doc/detailed_design/L7.md`. If this file disagrees with the code, the code wins.
 
 ## What it exposes / what it requires
 
@@ -35,6 +34,34 @@ This is the practical, code-matching reference. For the layer overview see
 - For real runs: GPUs + a warm/warmable `profile.db` (the launcher prebuilds it).
 - Optionally the standalone **`analyzer`** crate + its Python renderer (post-run
   analysis is best-effort; a missing analyzer never fails a run).
+
+## Managed Agent Callbacks
+
+Agent processes provide a short-lived capability context via
+`VIBESIM_MANAGED_JOB_CONTEXT`, falling back to `VIBESIM_MANAGED_RUN_CONTEXT`
+only when the preferred variable is empty. Both simulation and typed jobs use
+this precedence. A configured but unreadable or invalid context is fatal;
+commands never silently become unmanaged after such a failure.
+
+The context remains schema version 1. An absent `managed_jobs_api` selects the
+legacy `/api/internal/managed-runs` or `/api/internal/managed-jobs` callback
+family. The explicit value `"agent-v1"` selects
+`/api/agent/v1/internal/jobs` for all four kinds: simulation, timing prediction,
+kernel profiling, and kernel measurement. Other values, including null, fail
+before any HTTP request. The Agent backend owns the context and its capability.
+
+Register at the selected prefix's `/register` before creating official
+artifacts. Post lifecycle status to `/{job_id}/status` under the same prefix.
+The client never switches endpoints after an HTTP failure: the server may
+already have accepted the request. It checks approved output paths and retains
+existing status deduplication. Descriptor and summary fields remain transmitted
+for compatibility but are currently ignored by the Agent server; Analyzer owns
+the numerical results.
+
+Without a context, developer commands remain local and simulation writes its
+stable development metadata. Existing workspace copies retain their old
+launcher clients after an image rebuild, so the backend must retain legacy
+callbacks until those copies are migrated.
 
 ## Directory map
 
