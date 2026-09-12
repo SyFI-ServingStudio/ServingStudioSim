@@ -3,13 +3,13 @@ name: dev-clean-reimplement-for-merge
 description: >-
   Use when a feature is substantially complete and accepted, but its development
   branch is too iterative or messy to merge directly. Reimplement the accepted
-  behavior cleanly from current master while preserving equivalence and following
+  behavior cleanly from current main while preserving equivalence and following
   each ServingStudio Sim layer's established patterns.
 ---
 
 # Clean Reimplementation For Merge
 
-Prepare finished work for master by rebuilding it from a clean master-based
+Prepare finished work for main by rebuilding it from a clean main-based
 branch. Treat the development branch as behavioral evidence, not as the source
 layout to preserve.
 
@@ -37,18 +37,18 @@ equivalence checks.
 
 ## 2. Start From Current Master
 
-Create a fresh branch and worktree from the current remote master commit. Record
+Create a fresh branch and worktree from the current remote main commit. Record
 the exact base SHA. Refresh the remote ref when authorized; otherwise state how
 current the local ref is.
 
 Use `dev-create-worktree` for worktree layout and required working-copy
-artifacts, with one override: this workflow must branch from the verified master
+artifacts, with one override: this workflow must branch from the verified main
 SHA, not from the development branch currently checked out. Do not copy whole
 source files or cherry-pick the messy feature series as a shortcut. An isolated
 commit may be cherry-picked only after confirming that every hunk already has
-the clean shape intended for master.
+the clean shape intended for main.
 
-Run the relevant baseline checks on master before implementation. A pre-existing
+Run the relevant baseline checks on main before implementation. A pre-existing
 failure must be recorded rather than attributed to the reimplementation.
 
 ## 3. Map Each Behavior To Its Owner
@@ -111,7 +111,7 @@ not merely with the old source diff.
   `dev-run-tests` according to the changed surface.
 - Confirm that persisted measurements and generated artifacts were preserved
   intentionally rather than hidden by worktree state.
-- Review the complete master-to-clean diff with
+- Review the complete main-to-clean diff with
   `dev-present-changes-for-review` and apply `dev-file-design-review` to the
   highest-risk owner files.
 
@@ -140,17 +140,17 @@ alone is not a reason for changed behavior.
 
 ## Completion
 
-The branch is ready to propose for master only when:
+The branch is ready to propose for main only when:
 
 - the behavior-to-owner map is fully implemented;
 - no accepted behavior depends on code left only in the old branch;
 - duplication and test-value passes were completed per implementation unit;
-- the final diff follows current master conventions and contains no temporary
+- the final diff follows current main conventions and contains no temporary
   migration scaffolding without an active consumer;
 - equivalence evidence and intentional differences are recorded;
 - relevant tests pass, with baseline failures and unavailable tiers stated;
 - commits are reviewable units that explain behavior, not the chronology of the
   original experimentation.
 
-Report the master base SHA, clean branch/worktree, behavior equivalence results,
+Report the main base SHA, clean branch/worktree, behavior equivalence results,
 intentional differences, validation performed, and any remaining merge risk.

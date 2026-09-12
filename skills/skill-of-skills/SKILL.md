@@ -118,7 +118,7 @@ dev-run-tests - select and run ServingStudioSim test tiers
 dev-compose-worker - plan, estimate, implement, compose, and review production L5 workers against the four-axis ownership rules
 dev-file-design-review - review one file against docs and contracts
 dev-present-changes-for-review - organize a diff for human review
-dev-clean-reimplement-for-merge - rebuild accepted but unmergeably iterative branch work cleanly from master, preserving behavior
+dev-clean-reimplement-for-merge - rebuild accepted but unmergeably iterative branch work cleanly from main, preserving behavior
 dev-build-serving-repetitive-unit - kernel/layer-timing development with reduced depth but production model, loader, engine, API, and profiler paths
 dev-compose-kernel - compose a real serving kernel, fused boundary, or collective change through six practical steps
 dev-llm-serving - implement or review real LLM/multimodal serving framework code using the copied models/algorithms/backends/frameworks/hardware/engines/tooling reference library

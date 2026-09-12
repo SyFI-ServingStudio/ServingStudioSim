@@ -68,10 +68,9 @@ BRANCH_NAME=$WORKTREE_TOPIC         # or a name the user gave
 
 ### 1. Create the worktree off the current `ServingStudioSim/` HEAD
 
-Branch from whatever `ServingStudioSim/` currently has checked out (the code you explored),
-NOT from `master`/`origin` — the active mainline branch here is usually an
-`afd-*` / feature branch, and its committed line numbers are what any plan was
-written against.
+Branch from the commit currently checked out in `ServingStudioSim/` (the code
+you explored). The default branch is `main`, but an explicitly selected feature
+branch may be the intended base; preserve that choice and the reviewed commit.
 
 ```bash
 BASE_BRANCH=$(git -C "$MAIN_WORKTREE" rev-parse --abbrev-ref HEAD)
