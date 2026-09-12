@@ -10,7 +10,7 @@ alignment/profiler/vllm    # branch: moesim-profile
 alignment/profiler/sglang  # branch: vibesim-alignment
 ```
 
-Initialize both from the VibeSim checkout:
+Initialize both from the ServingStudio Sim checkout:
 
 ```bash
 git submodule update --init alignment/profiler/vllm alignment/profiler/sglang

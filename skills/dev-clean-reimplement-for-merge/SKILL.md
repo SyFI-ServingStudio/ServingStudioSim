@@ -4,7 +4,7 @@ description: >-
   Use when a feature is substantially complete and accepted, but its development
   branch is too iterative or messy to merge directly. Reimplement the accepted
   behavior cleanly from current master while preserving equivalence and following
-  each VibeSim layer's established patterns.
+  each ServingStudio Sim layer's established patterns.
 ---
 
 # Clean Reimplementation For Merge

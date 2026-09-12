@@ -2,7 +2,7 @@
 name: dev-compose-kernel
 description: >-
   Develop or integrate a real serving kernel, fused boundary, or communication
-  path. Not for VibeSim L1 cost kernels.
+  path. Not for ServingStudio Sim L1 cost kernels.
 ---
 
 # Compose A Production Serving Kernel
@@ -40,7 +40,7 @@ is MIT HAN Lab's
 [`kernel-design-agents`](https://github.com/mit-han-lab/kernel-design-agents),
 including `KernelWiki` and `ncu-report-skill`. Follow its official setup, record
 the revision, and keep it task-local rather than silently copying it into
-VibeSim. Re-profile on the target GPU.
+ServingStudio Sim. Re-profile on the target GPU.
 
 Develop outside the server first. Test against a trusted reference and the
 current kernel using production dtypes, layouts, maximum shapes, edge values,
@@ -99,4 +99,4 @@ optimization into the same trial.
 - Real serving kernel work: this skill.
 - Read-only implementation search: `dev-explore-kernel`.
 - Serving-system techniques outside the kernel boundary: `dev-llm-serving`.
-- VibeSim L1 profiling/cost-model kernels: `top-add-kernel`, not this skill.
+- ServingStudio Sim L1 profiling/cost-model kernels: `top-add-kernel`, not this skill.

@@ -1,4 +1,4 @@
-# VibeSim Profiling (L1)
+# ServingStudio Sim Profiling (L1)
 
 The **L1 cost layer**: the source of truth for "how long does one kernel take on
 one GPU". The Rust simulator never measures a kernel itself — it asks this Python

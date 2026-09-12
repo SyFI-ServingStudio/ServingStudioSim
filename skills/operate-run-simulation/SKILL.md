@@ -1,14 +1,14 @@
 ---
 name: operate-run-simulation
-description: Use when the user wants to run an VibeSim simulation from a preset (YAML preferred, JSON also accepted). This skill locates the repo logs root, names the experiment as date_index_short_name, prefers expressing requested variations as internal sweeps inside one copied preset, always does a dry run to inspect the expanded run plan before launching, and runs through the VibeSim launcher.
+description: Use when the user wants to run a ServingStudio Sim simulation from a preset (YAML preferred, JSON also accepted). This skill locates the repo logs root, names the experiment as date_index_short_name, prefers expressing requested variations as internal sweeps inside one copied preset, always does a dry run to inspect the expanded run plan before launching, and runs through the ServingStudio Sim launcher.
 ---
 
-# Run VibeSim Simulation
+# Run ServingStudio Sim Simulation
 
-Prepare and run an VibeSim simulation from an existing preset. This is the
-VibeSim analogue of the global `run-moesim-experiment` skill — same shape (copy a
+Prepare and run a ServingStudio Sim simulation from an existing preset. This is the
+ServingStudio Sim analogue of the global `run-moesim-experiment` skill — same shape (copy a
 preset into a dated experiment dir, encode variations as sweeps, launch), but
-the launcher and conventions below are VibeSim-specific. When in doubt about the
+the launcher and conventions below are ServingStudio Sim-specific. When in doubt about the
 preset/sweep philosophy, defer to `run-moesim-experiment`.
 
 **Preset format is the nested config tree** (`deployment` / `workload` / `io` /
@@ -35,7 +35,7 @@ so you never set `LD_LIBRARY_PATH`/`PYTHONPATH` by hand.
 
 ## Trigger
 
-Use when the user wants to run a named VibeSim simulation, gives a preset to
+Use when the user wants to run a named ServingStudio Sim simulation, gives a preset to
 run, or wants a preset copied into a dedicated dated experiment log directory
 before launch.
 

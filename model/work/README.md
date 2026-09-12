@@ -1,6 +1,6 @@
 # `model/work/` — optimal necessary-work labeler
 
-The **independent ground-truth accountant** for VibeSim's redundancy analysis. Given a
+The **independent ground-truth accountant** for ServingStudio Sim's redundancy analysis. Given a
 model `config.json` + a `Workload`, it computes the *theoretical minimum* compute
 (FLOPs) and memory traffic (bytes) the forward MUST do, plus total/activated parameter
 counts. A real run's *achieved* work (the sim's logged `slot_flops` / `slot_bytes`,
@@ -257,5 +257,5 @@ convention, so `params["activated"]` exposes **all** of them rather than picking
 
 Derive the matmul inventory + attention/KV math from the **model's true architecture**
 (HF modeling code / paper — route through `top-split-model-into-kernels`), *not* by copying
-VibeSim's arch shapes. Add/compose the specs, register the `architectures[0]` string, add a
+ServingStudio Sim's arch shapes. Add/compose the specs, register the `architectures[0]` string, add a
 golden. The `impl-add-model-work-label` skill formalizes this.

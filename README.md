@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="doc/assets/vibesim-logo.svg" alt="VibeSim logo" width="64">
+  <img src="doc/assets/servingstudio-symbol.svg" alt="ServingStudio logo" width="64">
 </p>
 
-<h1 align="center">VibeSim</h1>
+<h1 align="center">ServingStudio Sim</h1>
 
 <p align="center">
   <strong>A fast LLM serving simulator grounded in real GPU kernel measurements.</strong>
@@ -17,9 +17,9 @@
 
 ---
 
-VibeSim is a discrete-event simulator and performance-modeling toolkit for LLM
+ServingStudio Sim is a discrete-event simulator and performance-modeling toolkit for LLM
 serving systems. How much traffic can a deployment sustain? Which parallel layout
-works best? Where is GPU time being spent? VibeSim helps answer these questions
+works best? Where is GPU time being spent? ServingStudio Sim helps answer these questions
 by composing **measured GPU kernel timings** into predictions of serving
 throughput and latency.
 
@@ -29,12 +29,12 @@ before provisioning a cluster, then use the same analysis to guide improvements
 in a real serving framework.
 
 For the complete browser + Agent + Analyzer deployment, use the
-[`VibeSimWorkspace`](https://github.com/SyFI-VibeSim/VibeSimWorkspace)
+[`ServingStudio`](https://github.com/SyFI-ServingStudio/ServingStudio)
 meta-repository.
 
 ## 📣 News
 
-- **September 2026:** VibeSim is now available!
+- **September 2026:** ServingStudio Sim is now available!
 
 ---
 
@@ -68,7 +68,7 @@ meta-repository.
 ## 🗂️ Repository map
 
 ```text
-VibeSim/
+ServingStudioSim/
 ├── simulator/    Rust simulation engine, model execution, and scheduling
 ├── profiling/    GPU kernel measurements and reusable timing database
 ├── launcher/     Experiment CLI, parameter sweeps, and timing predictions
@@ -112,18 +112,18 @@ the simulation does not load model weights.
 ### 1. Build
 
 > [!TIP]
-> **Recommended: set up through [VibeSimWorkspace](https://github.com/SyFI-VibeSim/VibeSimWorkspace).**
+> **Recommended: set up through [ServingStudio](https://github.com/SyFI-ServingStudio/ServingStudio).**
 > It pins compatible versions of the simulator, Agent, and browser UI and provides
 > shared setup and build commands. Follow its
-> [setup guide](https://github.com/SyFI-VibeSim/VibeSimWorkspace/blob/main/reproduce.md)
+> [setup guide](https://github.com/SyFI-ServingStudio/ServingStudio/blob/main/reproduce.md)
 > for the complete environment.
 
 For a standalone simulator checkout, clone this repository and initialize its
 pinned submodules:
 
 ```bash
-git clone --recurse-submodules https://github.com/SyFI-VibeSim/VibeSim.git
-cd VibeSim
+git clone --recurse-submodules https://github.com/SyFI-ServingStudio/ServingStudioSim.git
+cd ServingStudioSim
 
 just sync
 uv run cargo build --release --workspace

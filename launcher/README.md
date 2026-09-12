@@ -1,4 +1,4 @@
-# VibeSim Launcher (L7)
+# ServingStudio Sim Launcher (L7)
 
 The **run interface**: turn a **preset** (a JSON/YAML config) into one or more
 reproducible invocations of the Rust `simulator` binary. The launcher owns

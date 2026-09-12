@@ -1,4 +1,4 @@
-# VibeSim — agent notes
+# ServingStudio Sim — agent notes
 
 Discrete-event simulator for ML serving/training workloads. Rust core
 (`simulator/`) + Python L1 profiling/launcher, bridged via PyO3.

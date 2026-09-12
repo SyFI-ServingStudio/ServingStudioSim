@@ -1,7 +1,7 @@
 ---
 name: top-compose-real-framework-from-sim
 description: >-
-  Build or optimize a real serving framework through repeated simulation, one measured trial, and the Align framework to VibeSim side of operate-run-alignment.
+  Build or optimize a real serving framework through repeated simulation, one measured trial, and the Align framework to ServingStudio Sim side of operate-run-alignment.
 ---
 
 THIS SKILL IS MAINLY FOR ORCHESTRATOR
@@ -20,7 +20,7 @@ them; treat them as trusted evaluation contracts.
 Before planning implementation work, identify and record the user's intended
 starting mode:
 
-- **Fresh build** — compose a new implementation from VibeSim evidence and the
+- **Fresh build** — compose a new implementation from ServingStudio Sim evidence and the
   trusted evaluation contracts. Do not assume an existing serving framework,
   repository, runnable server, or measured baseline.
 - **Existing-code optimization** — use the user-selected codebase as the real
@@ -42,13 +42,13 @@ that its actual state is compatible with that mode.
 
 ## Direction invariant
 
-**VibeSim is the optimization reference; the real framework is the
+**ServingStudio Sim is the optimization reference; the real framework is the
 implementation being improved.** Keep simulation predictions, measured framework
 results, and comparisons derived from named artifacts separate. Never fill an
 evidence gap with an estimate. Alignment evidence is reusable in both directions:
 it can expose simulator fidelity gaps and real-framework implementation gaps.
 Using it here must not reverse the target by copying an accidental real-engine
-limitation into VibeSim.
+limitation into ServingStudio Sim.
 
 The hard guard, applied every time a real measurement seems to contradict the
 simulated target:
@@ -71,7 +71,7 @@ simulation destroys the target that justified the work.
 
 This workflow is a repeated three-beat loop, not a one-pass linear plan:
 
-1. **Tick — VibeSim advances first.** Establish the grounded target, inspect the
+1. **Tick — ServingStudio Sim advances first.** Establish the grounded target, inspect the
    full analyzer evidence, and **freeze exactly one hypothesis** as a trial brief.
 2. **Tock — the real framework catches up.** Implement that single change, pass
    trusted correctness, and run the canonical benchmark. **A Tock ends at
@@ -128,7 +128,7 @@ decides what may change, and in which direction.
 | Class | Fields | Rule |
 | --- | --- | --- |
 | **Exogenous — must match** | every value fixed by the user, trusted evaluator/benchmark, or environment; commonly model/checkpoint revision, dtype, quantization, KV dtype, GPU type/count/topology, TP/PP/EP/CP, arrival process, request-rate or concurrency policy, input/output length distributions, warmup, duration, request cap, cutoff, SLO, and throughput/TTFT/TPOT/correctness definitions | Identical on both sides. Classification follows **who fixed the value**, not the field's intrinsic name. **Only a change in this class may update the comparison contract.** |
-| **Simulated target design** | only choices left unfixed for VibeSim to select; these may include scheduler, batching policy, KV allocation/layout, kernel/backend, parallelism, or deployment topology | Chosen by VibeSim. The real implementation **chases** it. Never copied backward from the real engine. A field is not a target-design field merely because it is usually tunable. |
+| **Simulated target design** | only choices left unfixed for ServingStudio Sim to select; these may include scheduler, batching policy, KV allocation/layout, kernel/backend, parallelism, or deployment topology | Chosen by ServingStudio Sim. The real implementation **chases** it. Never copied backward from the real engine. A field is not a target-design field merely because it is usually tunable. |
 | **Current real-engine limitations** | active slot count; allocated KV memory; synchronization points; CUDA-graph coverage; current backend behavior; host/Python overhead | **Diagnostic gaps.** Never an experimental control, never copied into the simulation target. Fixed in reality or recorded as an open gap. |
 
 **Comparison table gate.** Before *every* sim/real comparison, write each field
@@ -139,7 +139,7 @@ being smuggled in as an experimental control.
 #### Two comparison perspectives
 
 These are evidence perspectives, not launcher modes or CLI flags. **Baseline
-reproduction** asks whether VibeSim explains the real implementation under the
+reproduction** asks whether ServingStudio Sim explains the real implementation under the
 same contract, specialization, layout, precision, topology, and workload;
 residuals are fidelity or attribution gaps. **Target exploration** changes
 declared design axes within the external contract and physical feasibility; its
@@ -151,7 +151,7 @@ and never slow the target merely to improve alignment.
 Trusted command semantics belong to the real evidence protocol, not to an
 imaginary simulation command parity rule. Exact profiler executable, capture
 mode, and flag parity applies between comparable **real baseline and real
-trial Probe captures**. VibeSim need not and cannot run the real profiler
+trial Probe captures**. ServingStudio Sim need not and cannot run the real profiler
 command.
 
 Do not compare runs whose workloads or metric semantics differ. Make the
@@ -227,21 +227,21 @@ server's real capacity. Before reading any result as saturation:
 A result at that ceiling is **evaluator-limited**. Label it so. It is not server
 saturation, and it is not evidence that the real engine has reached its limit.
 
-### Step 2 — Tick: establish and advance the VibeSim target
+### Step 2 — Tick: establish and advance the ServingStudio Sim target
 
-Work directly through existing repo-local VibeSim skills when necessary:
+Work directly through existing repo-local ServingStudio Sim skills when necessary:
 
 - use `top-explore-models` when checkpoint facts are unclear;
-- use `top-add-new-arch` when VibeSim lacks the model architecture;
+- use `top-add-new-arch` when ServingStudio Sim lacks the model architecture;
 - use `top-add-kernel` when a required kernel/backend is missing;
 - use `operate-run-simulation` for a serving-workload throughput target;
 - use `operate-run-timing-predict` for one-iteration timing to get kernel time;
-- use the **Align framework to VibeSim** side of `operate-run-alignment` to align the
+- use the **Align framework to ServingStudio Sim** side of `operate-run-alignment` to align the
   target with the measured baseline or trial through the same production entry
   point used by the full model.
 
 First use the simulator to find a strong solution and establish a performance
-target. Confirm that VibeSim supports the exact architecture, kernel semantics,
+target. Confirm that ServingStudio Sim supports the exact architecture, kernel semantics,
 deployment, and GPU. Do not force a nearby model, omit unsupported work, or
 replace missing measurements with guessed costs.
 
@@ -252,7 +252,7 @@ calculation is not a throughput result. Cite the preset snapshot, launcher
 command, log directory, and reports used.
 
 When the simulator itself is wrong or incomplete, pause real-framework work,
-repair VibeSim through its owning top/orchestrator/impl skill, rerun the target,
+repair ServingStudio Sim through its owning top/orchestrator/impl skill, rerun the target,
 and only then resume.
 
 Search beyond the current framework's slots, graph coverage, scheduler,
@@ -351,7 +351,7 @@ to be fixed in reality — never a reason to adjust the simulation, and never an
 experimental control to be held constant.
 
 **2. Explain from existing artifacts first.** Use `operate-run-alignment` to
-produce or resume the shared labeled comparison against the frozen VibeSim
+produce or resume the shared labeled comparison against the frozen ServingStudio Sim
 target. Two causes need separating,
 because they have different fixes and only one moves the simulated breakdown:
 
@@ -406,7 +406,7 @@ only by absolute speedup, but also by whether the proposal was technically
 sound, whether the implementation actually tested that proposal, and whether the
 explanation fits the measured result. A change whose delta sits inside the noise
 band is *inconclusive* — record it that way rather than resolving it by
-preference. Preserve the VibeSim target and every available real-framework
+preference. Preserve the ServingStudio Sim target and every available real-framework
 baseline, and record the decision before starting another trial.
 
 Do not infer a causal speedup from aggregate throughput, phase occupancy, or
@@ -435,8 +435,8 @@ fused-boundary trials, while `dev-llm-serving` supplies broader references.
 1. **Kernel** — a single hot kernel dominates. Swap it for a faster implementation or
    backend. First **look for a public solution** (a faster attention / GEMM / norm
    kernel, a backend such as FlashInfer / CUTLASS, a fused variant); if one exists,
-   **point the simulator at it** — ask VibeSim to model it, or to implement it with
-   your guidance. You can also **ask VibeSim directly for a kernel suggestion** — it
+   **point the simulator at it** — ask ServingStudio Sim to model it, or to implement it with
+   your guidance. You can also **ask ServingStudio Sim directly for a kernel suggestion** — it
    knows its own kernel catalog and what is fast on the target GPU. →
    `dev-compose-kernel`, with backend references from `dev-llm-serving`.
 2. **Operation** — the cost is in *how ops are wired*, not one kernel. Fuse operations
@@ -479,7 +479,7 @@ Report:
 - the real comparison contract, its three-way field classification, and the
   starting state (empty or existing revision);
 - the implementation mode and the five-field provenance declaration;
-- VibeSim target and CostTree/analyzer provenance;
+- ServingStudio Sim target and CostTree/analyzer provenance;
 - each frozen trial and implementation diff;
 - trusted correctness, benchmark, and profiler artifacts;
 - predicted versus measured results with diagnosed residuals;
@@ -493,7 +493,7 @@ Report:
 
 ## Neighboring workflows
 
-- Shared VibeSim/framework alignment: `operate-run-alignment`; techniques:
+- Shared ServingStudioSim/framework alignment: `operate-run-alignment`; techniques:
   `dev-llm-serving`; kernels: `dev-compose-kernel`; phase-level Probe evidence:
   `operate-profile-serving-run`.
 - Complete reduced model: `dev-build-serving-repetitive-unit`; second-engine comparison: `operate-compare-serving-performance`.

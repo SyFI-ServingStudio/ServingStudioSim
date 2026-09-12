@@ -93,7 +93,7 @@ text-to-image、text-to-video、image-to-video 仍是独立的 step-based family
 ## 3. Typed frontend 与 replay 的正交边界
 
 config 用完整的 `input_file_format` 选择 req-frontend concrete loader，并用
-`input_file_tags` 添加正交列束；loader 验证并解析后，VibeSim adapter 直接产出：
+`input_file_tags` 添加正交列束；loader 验证并解析后，ServingStudio Sim adapter 直接产出：
 
 ```text
 ScheduledRequest<TextGenerationDefinition>
@@ -127,7 +127,7 @@ SessionDependency::Independent
 SessionDependency::Chained
 ```
 
-共享 crate 的 `ArrivalMode` 决定 release time 从哪来；VibeSim 的
+共享 crate 的 `ArrivalMode` 决定 release time 从哪来；ServingStudio Sim 的
 `ArrivalSchedule` 只额外携带 rate-1-normalized trace 所需的 `request_rate` 算术。
 `CapacityLimit` 决定同时能有几个 unit 活着；`SessionDependency` 决定一行是否必须等待同 session predecessor completion +
 `tool_wait_after_ms`。三轴全组合合法 —— 尤其 `trace_timed + max_concurrency`：

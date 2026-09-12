@@ -1,5 +1,5 @@
 //! `glm52_vllm_dsa_moe` — GLM-5.2 iter-wise architecture in **vLLM kernel
-//! granularity**, for VibeSim-vs-vLLM alignment.
+//! granularity**, for ServingStudioSim-vs-vLLM alignment.
 //!
 //! Attention is TP1 and independently replicated over the EP ranks. Decoder
 //! layers 0--2 execute the dense FFN and a full DSA indexer; layers 3--5 reuse

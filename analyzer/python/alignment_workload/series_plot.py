@@ -33,7 +33,7 @@ _PLOTS = (
     ),
     (
         "iteration_cycle_ms",
-        "Actual iteration cycle: vLLM vs VibeSim",
+        "Actual iteration cycle: vLLM vs ServingStudioSim",
         "iteration cycle (ms)",
         "alignment_iteration_time_by_iteration.png",
     ),
@@ -116,7 +116,7 @@ def _render_series(
     simulated_x, simulated_values = zip(*simulated_points, strict=True)
     measured_label = "vLLM GPU cycle" if key == "iteration_cycle_ms" else "vLLM measured"
     simulated_label = (
-        "VibeSim actual cycle" if key == "iteration_cycle_ms" else "VibeSim"
+        "ServingStudioSim actual cycle" if key == "iteration_cycle_ms" else "ServingStudioSim"
     )
 
     fig, ax = new_axes(figsize=(10.0, 4.8))

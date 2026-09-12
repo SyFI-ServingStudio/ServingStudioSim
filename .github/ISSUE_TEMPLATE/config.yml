@@ -4,5 +4,5 @@
 blank_issues_enabled: true
 contact_links:
   - name: Design docs
-    url: https://github.com/SyFI-VibeSim/VibeSim/blob/master/doc/README.md
+    url: https://github.com/SyFI-ServingStudio/ServingStudioSim/blob/master/doc/README.md
     about: The current design record — architecture, invariants, per-layer detailed design, and the analyzer subject catalog. Start here before filing a design question.

@@ -1,8 +1,8 @@
-"""Double-sided evidence exchange between VibeSim and real frameworks.
+"""Double-sided evidence exchange between ServingStudioSim and real frameworks.
 
 Framework-to-simulator analysis validates L1–L4 predictions with real serving
 profiles. Simulator-to-framework analysis attributes real implementation probes
-against a VibeSim target. Both consume the same normalized Nsight evidence; only
+against a ServingStudioSim target. Both consume the same normalized Nsight evidence; only
 their comparison policy differs.
 
 The design record is `doc/`; the practical reference is `alignment/README.md`.

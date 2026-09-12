@@ -1,7 +1,7 @@
 ---
 name: impl-register-kernel
 description: >-
-  Use when implementing the Python profiling registration for an VibeSim L1 kernel
+  Use when implementing the Python profiling registration for a ServingStudio Sim L1 kernel
   kind or backend after the orchestrator has classified the task. Covers the
   current profiling/ contracts: per-kind kernel module, co-located Args schema,
   lazy RunnerRef, BackendSupport, runner contract, tests, and no shared

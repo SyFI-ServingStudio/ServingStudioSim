@@ -25,7 +25,7 @@ of files. The review has five required dimensions:
 
 2. **Find the design contract before judging**
    - Search `README*`, `doc/`, and repo-local `AGENTS.md` when present.
-   - For VibeSim, map the file path to its layer via `doc/architecture.md`, then
+   - For ServingStudio Sim, map the file path to its layer via `doc/architecture.md`, then
      read the relevant `doc/detailed_design/L<n>.md`.
    - Record the concrete doc anchor that justifies each nontrivial change.
    - If no doc guideline exists for a proposed change, ask the user or label it

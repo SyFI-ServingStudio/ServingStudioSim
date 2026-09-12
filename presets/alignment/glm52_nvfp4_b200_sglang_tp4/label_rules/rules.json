@@ -292,7 +292,7 @@
         "body.sparse_cycle_index_share.moe.router.router_gemm_bf16_proxy",
         "body.sparse_initial_index_share.moe.router.router_gemm_bf16_proxy"
       ],
-      "note": "hidden 6144 -> 256 experts, bf16. The proxy slot name is VibeSim's; the kernel is the router itself.",
+      "note": "hidden 6144 -> 256 experts, bf16. The proxy slot name is ServingStudioSim's; the kernel is the router itself.",
       "source_experiment": "20260828_0_glm52_nvfp4_pure_tp_sglang_alignment"
     },
     {

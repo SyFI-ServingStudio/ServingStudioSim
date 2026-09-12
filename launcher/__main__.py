@@ -1,4 +1,4 @@
-"""VibeSim launcher CLI dispatch — no simulation logic (L7 design).
+"""ServingStudioSim launcher CLI dispatch — no simulation logic (L7 design).
 
 Modes:
 
@@ -57,7 +57,7 @@ def _build_argparse():
 
     parser = argparse.ArgumentParser(
         prog="python -m launcher",
-        description="VibeSim launcher simulation mode — run or sweep YAML/JSON presets.",
+        description="ServingStudioSim launcher simulation mode — run or sweep YAML/JSON presets.",
         epilog=(
             "Other modes:\n"
             "  python -m launcher timing-predict CONFIG.yaml|json [...]\n"
@@ -424,7 +424,7 @@ def main(argv: list[str] | None = None) -> int:
         return run_timing_predict(argv[1:])
 
     # Keep L1 profiling ownership in ``profiling.cli`` while exposing one
-    # operator-facing VibeSim command surface alongside timing-predict and sim.
+    # operator-facing ServingStudioSim command surface alongside timing-predict and sim.
     if argv and argv[0] == "kernel-profile":
         from profiling.cli import main as run_kernel_profile
 

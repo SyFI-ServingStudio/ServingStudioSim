@@ -1,6 +1,6 @@
 ---
 name: top-explore-models
-description: "Use as the top-level entry point when the user asks to understand a new Transformer model or Hugging Face checkpoint before VibeSim modeling work. Answers high-level model questions such as parameter scale, overall architecture, attention type, layer/head/hidden dimensions, context length, MoE layout, multimodal branches, and public architecture notes by collecting Hugging Face metadata/config/model-card evidence first. Route KV cache size/capacity calculations and attention/cache classification for MHA/GQA/MLA/DSA/GDN/custom mechanisms to dev-calculate-kv-cache-capacity. Route deeper Torch implementation, operation-list, forward-path, or kernel-semantics questions to dev-lookup-transformers-model."
+description: "Use as the top-level entry point when the user asks to understand a new Transformer model or Hugging Face checkpoint before ServingStudio Sim modeling work. Answers high-level model questions such as parameter scale, overall architecture, attention type, layer/head/hidden dimensions, context length, MoE layout, multimodal branches, and public architecture notes by collecting Hugging Face metadata/config/model-card evidence first. Route KV cache size/capacity calculations and attention/cache classification for MHA/GQA/MLA/DSA/GDN/custom mechanisms to dev-calculate-kv-cache-capacity. Route deeper Torch implementation, operation-list, forward-path, or kernel-semantics questions to dev-lookup-transformers-model."
 ---
 
 # Top Explore Models
@@ -10,7 +10,7 @@ how large the model is, what the component stack looks like, what attention or
 state-space mechanism it uses, which dimensions control shapes, and what public
 materials say about the architecture. Work from current evidence, not memory.
 
-This skill does not implement VibeSim support and does not list every Torch
+This skill does not implement ServingStudio Sim support and does not list every Torch
 operation. If the request requires local PyTorch code semantics, exact forward
 paths, kernel-relevant operation lists, cache behavior, or a runnable Torch
 reference, FIRST EXECUTE THIS SKILL, then consider 
@@ -45,8 +45,8 @@ repo ids that would change the answer.
 
 2. Download Hugging Face metadata first.
 
-Run from `VibeSim/` and prefer `uv run python` so the same environment is used as
-the rest of VibeSim. Download `config.json` and `README.md`; optionally download
+Run from `ServingStudioSim/` and prefer `uv run python` so the same environment is used as
+the rest of ServingStudio Sim. Download `config.json` and `README.md`; optionally download
 small metadata files such as `generation_config.json` or `tokenizer_config.json`
 when they answer the user question. Do not download weights.
 
@@ -126,7 +126,7 @@ gathering the required model/config facts and route to
 `dev-calculate-kv-cache-capacity`. Carry forward the source paths and values for
 layers, query heads, KV heads, head dim, dtype, context length, layer types,
 sliding-window/MLA/DSA/GDN flags, quantization flags, public architecture
-sources, and any VibeSim memory budget.
+sources, and any ServingStudio Sim memory budget.
 
 ## Routing To Code Exploration
 
@@ -152,7 +152,7 @@ Use `dev-calculate-kv-cache-capacity` only after this skill has collected the
 model/config facts needed to choose the right cache model. For dense
 MHA/MQA/GQA, carry forward `num_hidden_layers`, `num_attention_heads`,
 `num_key_value_heads`, `head_dim` or inferred head dim, KV dtype, context length,
-page/block size if known, and any VibeSim `attn_gpu_memory_gb` budget.
+page/block size if known, and any ServingStudio Sim `attn_gpu_memory_gb` budget.
 
 If the attention type is MLA, DSA, GDN, sliding-window, quantized KV, compressed
 KV, or a custom/still-unresolved documented mechanism, route directly to

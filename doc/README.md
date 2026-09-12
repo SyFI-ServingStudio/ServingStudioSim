@@ -1,6 +1,6 @@
-# VibeSim
+# ServingStudio Sim
 
-VibeSim is a discrete-event simulator that predicts the performance of
+ServingStudio Sim is a discrete-event simulator that predicts the performance of
 machine-learning **serving** workloads.
 Its defining choice is that timing is **measured, not modelled from first
 principles**: the cost of every GPU kernel is profiled once on real hardware into

@@ -1,6 +1,6 @@
 """Model-independent physics for the optimal necessary-work labeler.
 
-This module holds the *ground-truth* accountant for VibeSim's redundancy analysis:
+This module holds the *ground-truth* accountant for ServingStudioSim's redundancy analysis:
 given a model and a workload, what is the THEORETICAL MINIMUM compute (FLOPs) and
 memory traffic (bytes) that the forward MUST do? A real run's *achieved* work
 (the sim's logged ``slot_flops`` / ``slot_bytes``, summed with the physical GPU

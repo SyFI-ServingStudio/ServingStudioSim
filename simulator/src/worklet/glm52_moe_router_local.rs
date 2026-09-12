@@ -4,7 +4,7 @@
 //! Frameworks may cast base-dtype activations before the router GEMM or request
 //! FP32 output directly from a mixed-input GEMM. Then
 //! sigmoid, correction bias, grouped top-8 selection, normalization, and 5/2
-//! scaling produce routed weights and expert indices. VibeSim has no measured
+//! scaling produce routed weights and expert indices. ServingStudioSim has no measured
 //! FP32 `single_gemm` backend for this shape, so `router_gemm_bf16_proxy` is an
 //! explicitly labeled timing proxy: BF16 by default and FP8 in the bounded
 //! GLM FP8 selector. It is not production-exact in either mode.

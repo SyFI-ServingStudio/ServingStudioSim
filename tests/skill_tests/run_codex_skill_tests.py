@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run VibeSim skill-test cases through Codex CLI runner and judge agents."""
+"""Run ServingStudioSim skill-test cases through Codex CLI runner and judge agents."""
 
 from __future__ import annotations
 
@@ -388,7 +388,7 @@ def truncate_for_console(text: str, max_output_chars: int) -> str:
 def build_runner_prompt(case: SkillTestCase) -> str:
     # The runner intentionally receives only the task prompt, not the expected
     # output or pass/fail rubric. That preserves the test as an evaluation.
-    return f"""You are the runner for an VibeSim repo-local skill test.
+    return f"""You are the runner for an ServingStudioSim repo-local skill test.
 
 Follow the task below exactly. Discover and use repo-local instructions/skills
 as a normal fresh coding agent would. Do not modify repository files unless the
@@ -406,7 +406,7 @@ def build_judge_prompt(
     runner_final: str,
 ) -> str:
     command = shell_join(runner_run.command)
-    return f"""You are the judge for an VibeSim repo-local skill test.
+    return f"""You are the judge for an ServingStudioSim repo-local skill test.
 
 Evaluate whether the runner output satisfies the case. Return only JSON matching
 the supplied output schema. Do not edit files and do not run repo commands.

@@ -1,13 +1,13 @@
 ---
 name: top-align-with-framework
 description: >-
-  Align VibeSim to a real framework across kernel timing, GPU duty cycle, and TTFT/TPOT.
+  Align ServingStudio Sim to a real framework across kernel timing, GPU duty cycle, and TTFT/TPOT.
   Routes execution and fixes; does not run phases or edit code.
 ---
 
 # Top Align With Framework
 
-Top-level skill for **judging** whether VibeSim is well aligned to a real serving
+Top-level skill for **judging** whether ServingStudio Sim is well aligned to a real serving
 framework (vLLM or SGLang), from one measured alignment run. `operate-run-alignment`
 *produces* the comparison; this skill *interprets* it — what to compare, what a
 healthy gap looks like, and how to diagnose a bad one. You route and judge here;
@@ -34,7 +34,7 @@ async), not the cost model.
 
 ## Step 0 — Run the alignment
 
-Route to the **Align VibeSim to framework** side of `operate-run-alignment`. It produces the artifacts every
+Route to the **Align ServingStudio Sim to framework** side of `operate-run-alignment`. It produces the artifacts every
 check below reads: the per-iteration labeled kernel breakdown (measured duration
 vs simulated CostTree slot per mapped operation) plus the kernel-align pass's
 `recommended_gpu_time_multiplier` (in `alignment_iteration_report.json` meta), and

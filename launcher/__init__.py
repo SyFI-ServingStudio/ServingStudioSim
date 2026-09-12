@@ -1,4 +1,4 @@
-"""VibeSim launcher (L7-α) — Python orchestration for sim runs.
+"""ServingStudioSim launcher (L7-α) — Python orchestration for sim runs.
 
 Public entry points for callers (skills, tests, researchers) that import the
 launcher rather than shelling out to `python -m launcher`. Per design §1.4

@@ -1,4 +1,4 @@
-"""Shared pytest gating + fixtures for the VibeSim test tiers.
+"""Shared pytest gating + fixtures for the ServingStudioSim test tiers.
 
 Tests declare a **capability tier** with a marker; this conftest auto-skips the
 ones the host can't run, so bare ``uv run pytest`` "just works" anywhere:

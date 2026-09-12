@@ -1,6 +1,6 @@
 ---
 name: operate-profile-sim-speed
-description: Use when asked to profile, perf, or speed up the VibeSim *simulator wallclock* (how fast a run executes), not the modeled cluster throughput and not L1 kernel profiling. Covers building a symbol-rich release binary, capturing a `perf record` of a representative run, and reading the per-thread / flat breakdown to find the bottleneck.
+description: Use when asked to profile, perf, or speed up the ServingStudio Sim *simulator wallclock* (how fast a run executes), not the modeled cluster throughput and not L1 kernel profiling. Covers building a symbol-rich release binary, capturing a `perf record` of a representative run, and reading the per-thread / flat breakdown to find the bottleneck.
 ---
 
 # Profile Sim Speed
@@ -247,7 +247,7 @@ for tbk,tb,fr in sorted(rows, reverse=True)[:18]:
 ```
 
 `tbk` (blocks) ≈ malloc/free calls = the churn that shows as `_int_*` in perf;
-`tb` (bytes) flags large transient buffers. The recurring VibeSim finding is
+`tb` (bytes) flags large transient buffers. The recurring ServingStudio Sim finding is
 **per-iteration scratch `Vec`s** (`build_arch_input`, `complete_iter`,
 `CostTree::aggregate`, `projected_peak`) that should be reused buffers held on the
 worker (the `cost_slots` pattern), plus stray `.clone()`s (`eval_buf`).

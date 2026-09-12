@@ -1,6 +1,6 @@
 ---
 name: dev-compose-worker
-description: "Use when planning or estimating a new VibeSim worker combination, or when implementing, composing, reviewing, renaming, moving, or tidying production L5 worker code under `simulator/src/worker/`: KV stores and capability traits, admission lifecycle/selection policies, execution adapters, cadence shells, family directories, `build_*_worker` recipes, and L6 wiring. Enforces the canonical four-axis ownership, share-vs-new and difficulty analysis, pending-membership rule, shell discriminator, construction/file boundaries, complete changed-file coverage, and behavior-preserving validation. Not for L4 kernel/cost-model implementation or an unrelated general file review."
+description: "Use when planning or estimating a new ServingStudio Sim worker combination, or when implementing, composing, reviewing, renaming, moving, or tidying production L5 worker code under `simulator/src/worker/`: KV stores and capability traits, admission lifecycle/selection policies, execution adapters, cadence shells, family directories, `build_*_worker` recipes, and L6 wiring. Enforces the canonical four-axis ownership, share-vs-new and difficulty analysis, pending-membership rule, shell discriminator, construction/file boundaries, complete changed-file coverage, and behavior-preserving validation. Not for L4 kernel/cost-model implementation or an unrelated general file review."
 ---
 
 # Compose Worker

@@ -1,7 +1,7 @@
 [project]
 name = "vibesim"
 version = "0.1.0"
-description = "VibeSim — discrete-event simulator for ML serving + training workloads"
+description = "ServingStudio Sim — discrete-event simulator for ML serving + training workloads"
 requires-python = ">=3.12,<3.13"
 # Source-available, not OSI open source. Dual community licensing: PolyForm
 # Noncommercial 1.0.0 OR PolyForm Internal Use 1.0.0, plus separately negotiated
