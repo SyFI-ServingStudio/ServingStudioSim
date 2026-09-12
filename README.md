@@ -1,111 +1,181 @@
-# VibeSim Core
+<p align="center">
+  <img src="doc/assets/vibesim-logo.svg" alt="VibeSim logo" width="64">
+</p>
+
+<h1 align="center">VibeSim</h1>
+
+<p align="center">
+  <strong>A fast LLM serving simulator grounded in real GPU kernel measurements.</strong>
+</p>
+
+<p align="center">
+  <a href="#key-features">Features</a> ·
+  <a href="#repository-map">Repository map</a> ·
+  <a href="#quick-start">Quick start</a> ·
+  <a href="doc/README.md">Documentation</a>
+</p>
+
+---
 
 VibeSim is a discrete-event simulator and performance-modeling toolkit for LLM
-serving systems. This repository contains the Rust simulator, Rust Analyzer,
-Python launcher, kernel profiler, model/deployment definitions, and the
-repository-local Agent skills that operate them.
+serving systems. How much traffic can a deployment sustain? Which parallel layout
+works best? Where is GPU time being spent? VibeSim helps answer these questions
+by composing **measured GPU kernel timings** into predictions of serving
+throughput and latency.
+
+Define an experiment in YAML, replay a workload, and trace the results from the
+whole deployment down to individual requests and kernels. Explore configurations
+before provisioning a cluster, then use the same analysis to guide improvements
+in a real serving framework.
 
 For the complete browser + Agent + Analyzer deployment, use the
-[`VibeSimWorkspace`](https://github.com/serendipity-zk/VibeSimWorkspace)
-meta-repository. It pins compatible revisions of this repository, VibeSimAgent,
-and VibeSimUI and provides the tested `reproduce.md` and root `justfile`.
+[`VibeSimWorkspace`](https://github.com/SyFI-VibeSim/VibeSimWorkspace)
+meta-repository.
 
-## Requirements
+## 📣 News
 
-- Python 3.12 managed by `uv`
-- Rust stable
-- NVIDIA driver/CUDA stack for profiling and GPU-backed predictions
-- A writable, large-capacity `TMPDIR`
+- **September 2026:** VibeSim is now available!
 
-Do not run Python or install packages with the system interpreter. Use
-`uv run ...` and `uv add ...` from the repository root.
+---
 
-## Build and inspect
+<a id="key-features"></a>
 
-```bash
-uv sync
-cargo build --release
+## ✨ Key features
 
-# Rust-authoritative deployment schema and Launcher-rendered human view
-cargo run --release -- list-params
-uv run python -m launcher list-params --human
+- 🧩 **Flexible configuration.** Explore dense and MoE models across GPU layouts,
+  precisions, and serving strategies, including unified serving, prefill/decode
+  disaggregation, attention/FFN disaggregation, and speculative decoding.
+  YAML sweeps make it easy to compare configurations. See the
+  [architecture compatibility matrix](doc/architecture_compatibility.md) for
+  supported combinations.
+- ⚡ **Fast simulation.** A Rust event engine and reusable, compiled cost trees
+  evaluate changing batch shapes efficiently, making long workloads and broad
+  configuration sweeps practical.
+- 🎯 **Accurate predictions.** Kernel costs come from measurements on real GPUs.
+  Alignment workflows compare predictions with vLLM and SGLang at kernel,
+  iteration, and end-to-end levels for supported execution graphs.
+- 🔎 **Full observability.** Inspect throughput and latency alongside request
+  lifecycles, batch composition, KV occupancy, and per-kernel costs. Analyzer
+  produces structured reports, plots, and Perfetto timelines from run artifacts.
+- 📊 **Optimization insights.** Attribute simulated GPU time to idle time, load
+  imbalance, batching, communication, and kernel efficiency. Independent
+  model-work bounds help explain the remaining gap to theoretical performance.
 
-# Launcher and Analyzer surfaces
-uv run python -m launcher --help
-cargo run -p analyzer --release -- --help
-```
+---
 
-The launcher is the supported run boundary. It builds/discovers the simulator
-schema, validates presets, expands sweep/compound/variant axes, prebuilds kernel
-cache rows, records provenance, starts simulations, and triggers requested
-Analyzer subjects.
+<a id="repository-map"></a>
 
-```bash
-# Inspect the expanded plan before launching
-uv run python -m launcher presets/unified_aime.yaml --dry-run
-
-# Launch the preset
-uv run python -m launcher presets/unified_aime.yaml
-
-# Offline timing and existing-kernel profiling entry points
-uv run python -m launcher timing-predict --help
-uv run python -m launcher kernel-profile --help
-```
-
-Use a task-scoped directory under `$TMPDIR` for scratch databases or generated
-inputs. Production and managed runs write durable artifacts beneath their
-declared workspace `logs/` roots.
-
-## Analyzer
-
-Analyzer is the read-only resource authority for simulation runs and sweeps,
-timing predictions, kernel profiles, kernel measurements, rendered plots, and
-GPU hardware limits.
-
-```bash
-cargo build -p analyzer --release
-target/release/analyze serve \
-  --bind 127.0.0.1:8787 \
-  --workspace-registry ../agent-workspaces/registry.json
-```
-
-The workspace registry is maintained by VibeSimAgent. Analyzer discovers
-approved workspace roots through that registry; it does not own conversation or
-job-lifecycle state.
-
-## Repository map
+## 🗂️ Repository map
 
 ```text
-simulator/        Rust L1-L7 simulator and deployment schema
-profiling/        Python kernel registry, runners, execution backend, and cache
-launcher/         preset, sweep, managed-run, timing-predict, and profile CLI
-analyzer/         Rust read API and Python plot renderer
-alignment/        vLLM-under-nsys profiling and measured-vs-simulated reconciliation
-model/            model configurations, and model/work/ the independent
-                  theoretical-minimum FLOP/byte labeler
-gpu/              hardware specification catalog
-trace/            trace generators and checked-in samples
-presets/          runnable deployment/prediction configurations
-skills/           canonical VibeSim Agent workflows
-tests/            CPU, GPU, binary, database, and Agent test tiers
-doc/              current architecture and detailed design
+VibeSim/
+├── simulator/    Rust simulation engine, model execution, and scheduling
+├── profiling/    GPU kernel measurements and reusable timing database
+├── launcher/     Experiment CLI, parameter sweeps, and timing predictions
+├── analyzer/     Performance reports, plots, and trace exports
+├── alignment/    Validation against vLLM and SGLang measurements
+├── model/        Model configurations and independent FLOP/byte bounds
+├── gpu/          GPU hardware specifications
+├── trace/        Workload generators and sample traces
+├── presets/      Simulation, prediction, and alignment configurations
+├── skills/       Agent workflows for experiments and development
+├── tests/        Simulation, profiling, and integration tests
+└── doc/          Architecture, design, and compatibility documentation
 ```
 
-Start with [`doc/README.md`](doc/README.md) and
-[`doc/architecture.md`](doc/architecture.md). Operational details live beside
-their implementation, especially [`launcher/README.md`](launcher/README.md) and
-[`profiling/README.md`](profiling/README.md).
+See the [architecture guide](doc/architecture.md) for how the components fit
+together, or the [documentation index](doc/README.md) for detailed references.
 
-## Validation
+---
 
-The repository test tiers intentionally separate CPU-only checks from GPU,
-built-binary, warm-database, and Agent-runtime checks. Use the repository
-`dev-run-tests` skill or inspect `just --list` before selecting a tier.
+<a id="quick-start"></a>
 
-For focused changes, format and test only the touched files. Do not run
-workspace-wide formatters over unrelated worktrees or generated artifacts.
+## 🚀 Quick start
 
-## Licensing
+### Requirements
+
+- **Linux** and **Git**, including submodule support.
+- **Rust stable and Cargo** to build the simulator and Analyzer.
+- **Python 3.12**, managed by **uv**, for the launcher and kernel profiler.
+- **just** to run the repository's dependency setup and test commands.
+- **A C/C++ build toolchain** for native dependencies and linking, plus **mold**
+  on Linux x86-64, as required by [the Cargo configuration](.cargo/config.toml).
+- Enough writable disk space for dependencies, build artifacts, and run logs.
+- A compatible NVIDIA GPU and CUDA environment when profiling missing kernel
+  measurements. The simulation itself runs on the CPU using cached costs.
+
+The repository includes `profiling/profile.db`. Cache coverage depends on the
+selected GPU, kernel backend, and input shapes; filling missing measurements
+requires the corresponding hardware. Model configuration files are included;
+the simulation does not load model weights.
+
+### 1. Build
+
+> [!TIP]
+> **Recommended: set up through [VibeSimWorkspace](https://github.com/SyFI-VibeSim/VibeSimWorkspace).**
+> It pins compatible versions of the simulator, Agent, and browser UI and provides
+> shared setup and build commands. Follow its
+> [setup guide](https://github.com/SyFI-VibeSim/VibeSimWorkspace/blob/main/reproduce.md)
+> for the complete environment.
+
+For a standalone simulator checkout, clone this repository and initialize its
+pinned submodules:
+
+```bash
+git clone --recurse-submodules https://github.com/SyFI-VibeSim/VibeSim.git
+cd VibeSim
+
+just sync
+uv run cargo build --release --workspace
+```
+
+`just sync` installs the Python environment in the required dependency order.
+Run Python and Cargo commands through `uv run` from the repository root so the
+simulator's embedded Python uses that environment.
+
+### 2. Run Llama 3 8B
+
+The included [smoke preset](presets/unified_smoke.yaml) models Llama 3 8B in BF16
+on one NVIDIA H200. It replays three small requests from
+[`trace/smoke.csv`](trace/smoke.csv) and runs until all requests finish.
+
+```bash
+# Validate the preset and inspect the expanded configuration.
+uv run python -m launcher presets/unified_smoke.yaml --dry-run
+
+# Run the simulation and generate analysis.
+uv run python -m launcher presets/unified_smoke.yaml
+```
+
+### 3. Explore the results
+
+The launcher records the experiment inputs and runs the simulator and Analyzer.
+The example should complete all **three requests**. Its output lives in
+`logs/unified_smoke/`:
+
+| Output | Contents |
+| --- | --- |
+| `summary.json` | Run completion and simulation summary |
+| `raw/` | Request records, kernel costs, and resolved configuration |
+| `reports/` | Analysis summaries, including throughput and latency |
+| `payloads/` | Structured data behind the analysis |
+| `plots/` | Rendered figures |
+
+To explore additional settings and experiments:
+
+```bash
+uv run python -m launcher list-params --human
+uv run python -m launcher --help
+```
+
+See [`launcher/README.md`](launcher/README.md) for sweeps and timing predictions,
+[`profiling/README.md`](profiling/README.md) for kernel measurements, and
+[`analyzer/README.md`](analyzer/README.md) for interpreting results. Run
+`just test-cpu` for the CPU test suite.
+
+---
+
+## 📄 Licensing
 
 This project is source-available under a dual community licensing
 model.
