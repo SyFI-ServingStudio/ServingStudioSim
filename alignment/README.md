@@ -1,7 +1,7 @@
-# VibeSim Alignment
+# ServingStudio Sim Alignment
 
 Alignment exchanges evidence in both directions: measured framework runs validate
-VibeSim predictions, while VibeSim predictions provide the reference used to
+ServingStudio Sim predictions, while ServingStudio Sim predictions provide the reference used to
 attribute framework changes. Both directions consume the same normalized Nsight
 evidence; their comparison policies remain separate.
 
@@ -71,7 +71,7 @@ raw evidence; its persisted measurement byte offset produces a separate
 measurement log for iteration, request and popularity extraction, including resume.
 Acceptance counter snapshots and the capture timer start at this same boundary.
 
-`simulation.yaml` remains an ordinary VibeSim preset. Paths in the other configs
+`simulation.yaml` remains an ordinary ServingStudio Sim preset. Paths in the other configs
 are resolved relative to the declaring config file.
 
 ## Ownership

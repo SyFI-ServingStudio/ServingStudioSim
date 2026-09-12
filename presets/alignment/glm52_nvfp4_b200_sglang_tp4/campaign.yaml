@@ -98,7 +98,7 @@ variants:
       # No `enable_server_load_tracking` either: the SGLang driver never reads
       # it, and its `/v1/loads` idle endpoint needs no launch flag.
       extra_args:
-      # VibeSim models FlashInfer's TRTLLM fused all-reduce -- that is what the
+      # ServingStudioSim models FlashInfer's TRTLLM fused all-reduce -- that is what the
       # `all_reduce_fusion` / `all_reduce_residual_rms_norm` leaves were profiled
       # against, and what vLLM runs. SGLang's `auto` resolves to `mnnvl` on
       # Blackwell, a different kernel family, so pinning `trtllm` is a modeling

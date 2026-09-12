@@ -1,7 +1,7 @@
 ---
 name: impl-wire-kernel-to-rust
 description: >-
-  Use when implementing the Rust timing/cache wiring for an VibeSim L1 kernel
+  Use when implementing the Rust timing/cache wiring for a ServingStudio Sim L1 kernel
   after the orchestrator has validated the Python profiling handoff and selected
   the Rust Config/Input/cache shape. Covers KernelSpec implementation,
   sweep/enumerate/cache wiring, mod.rs exports, slot_input logging, Rust tests,

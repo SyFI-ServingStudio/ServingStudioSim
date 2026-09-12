@@ -1,9 +1,9 @@
 # Spec5 Alignment Evidence
 
 This directory follows the campaign workflow used by
-[PR 25](https://github.com/SyFI-VibeSim/VibeSim/pull/25),
-[PR 27](https://github.com/SyFI-VibeSim/VibeSim/pull/27), and
-[PR 28](https://github.com/SyFI-VibeSim/VibeSim/pull/28).
+[PR 25](https://github.com/SyFI-ServingStudio/ServingStudioSim/pull/25),
+[PR 27](https://github.com/SyFI-ServingStudio/ServingStudioSim/pull/27), and
+[PR 28](https://github.com/SyFI-ServingStudio/ServingStudioSim/pull/28).
 The workload queue is finished. This is retained review evidence, not an accepted
 baseline: missing pairs and tolerance failures remain explicit.
 

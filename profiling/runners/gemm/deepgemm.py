@@ -4,7 +4,7 @@
 L1a-only: allocate tensors, time one kernel, return metrics. Both mirror
 ref/profile/gemm/grouped_gemm_deepgemm.py: `profile_single_gemm` ports the ref's
 dense `fp8_gemm_nt`; `profile_grouped_gemm` ports the m-grouped contiguous kernel
-but generalizes the ref's uniform `batch_size`-per-expert to VibeSim's variable
+but generalizes the ref's uniform `batch_size`-per-expert to ServingStudioSim's variable
 `per_group_batches` vector — the distribution-sensitive cost driver (§2.8).
 
 DeepGEMM grouped needs each expert's rows aligned to the contiguous-layout

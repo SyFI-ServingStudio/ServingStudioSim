@@ -176,7 +176,7 @@ def _container_source_volume_args() -> list[str]:
 
     The image owns the dependency boundary, including the instrumented vLLM
     checkout, its virtual environment, and native extensions. Development mode
-    overlays only VibeSim's pure-Python worker code and GPU catalog read-only so
+    overlays only ServingStudioSim's pure-Python worker code and GPU catalog read-only so
     newly registered profilers run without rebuilding that dependency image.
     Release measurements can request the fully frozen source snapshot with
     ``VIBESIM_PROFILE_SOURCE_MODE=image``.

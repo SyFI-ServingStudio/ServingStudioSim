@@ -1,4 +1,4 @@
-//! Arrow schema definitions for the VibeSim parquet streams.
+//! Arrow schema definitions for the ServingStudioSim parquet streams.
 //!
 //! Modeled on `ref/moesim-rs/src/logging/schemas.rs` — each stream gets a
 //! `pub fn xxx_schema() -> Arc<Schema>` returning a real

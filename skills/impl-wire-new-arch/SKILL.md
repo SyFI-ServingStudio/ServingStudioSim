@@ -1,7 +1,7 @@
 ---
 name: impl-wire-new-arch
 description: >-
-  Use when wiring a just-built VibeSim L4 arch model into the shared dispatch sites
+  Use when wiring a just-built ServingStudio Sim L4 arch model into the shared dispatch sites
   so it is selectable by tag, predictable via timing-predict, and ready for a
   future worker — the integration step AFTER impl-compose-arch has produced the
   arch file. Covers arch/mod.rs re-exports, the arch/build.rs concrete builder +

@@ -1,4 +1,4 @@
-# VibeSim test-tier runner. One recipe per capability tier (see tests/conftest.py
+# ServingStudioSim test-tier runner. One recipe per capability tier (see tests/conftest.py
 # + skill `dev-run-tests`). Install just: `cargo install just` (or your package mgr).
 #
 #   just            # = test-cpu (the fast default gate)

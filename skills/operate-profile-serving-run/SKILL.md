@@ -17,7 +17,7 @@ Three neighbours it is deliberately NOT:
 
 - `operate-profile-sim-speed` — how fast the *simulator binary* executes.
 - `operate-profile-existing-kernel` — filling L1 `profile.db` rows.
-- `operate-run-alignment` — the phased VibeSim↔framework alignment pipeline.
+- `operate-run-alignment` — the phased ServingStudio Sim↔framework alignment pipeline.
   It reuses this evidence while keeping alignment comparison policy separate.
 
 For tool-altitude selection (torch profiler vs nsys vs ncu) read
@@ -432,5 +432,5 @@ do not reason across the difference:
 - The workflow that calls this skill at its Probe step:
   `top-compose-real-framework-from-sim`.
 - Simulator wallclock: `operate-profile-sim-speed`. L1 kernel rows:
-  `operate-profile-existing-kernel`. Bidirectional VibeSim/framework alignment:
+  `operate-profile-existing-kernel`. Bidirectional ServingStudioSim/framework alignment:
   `operate-run-alignment`.

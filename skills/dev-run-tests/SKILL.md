@@ -1,11 +1,11 @@
 ---
 name: dev-run-tests
-description: Use when asked to run, select, or understand VibeSim's tests — which tier needs a GPU / the built binary / an agent runtime / is just CPU, how the auto-skip works, and how the per-GPU throughput & sim-speed goldens are recorded. Covers the `just test-*` recipes, pytest markers, and the GPU-type-tagged golden store. NOT for writing a new kernel's cache-fidelity check (that is impl-validate-kernel-cache).
+description: Use when asked to run, select, or understand ServingStudio Sim's tests — which tier needs a GPU / the built binary / an agent runtime / is just CPU, how the auto-skip works, and how the per-GPU throughput & sim-speed goldens are recorded. Covers the `just test-*` recipes, pytest markers, and the GPU-type-tagged golden store. NOT for writing a new kernel's cache-fidelity check (that is impl-validate-kernel-cache).
 ---
 
-# Run VibeSim Tests (capability tiers)
+# Run ServingStudio Sim Tests (capability tiers)
 
-VibeSim tests span three runtimes (Rust `cargo test`, `pytest`, and a Codex
+ServingStudio Sim tests span three runtimes (Rust `cargo test`, `pytest`, and a Codex
 skill-test harness) and several **capability tiers**. A test declares its tier
 with a pytest marker; `tests/conftest.py` **auto-skips** the tiers the host can't
 run, so bare `uv run pytest` "just works" anywhere. Prefer the `just` recipes —

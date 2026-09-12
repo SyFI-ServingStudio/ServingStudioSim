@@ -18,6 +18,6 @@ alternate across resident-group iterations. Exact replacements, input hashes,
 result hashes, and the correction identity are verified before build and
 included in the cache fingerprint and completion marker.
 
-`binding.cpp` is VibeSim-owned compatibility scaffolding. It exposes the
+`binding.cpp` is ServingStudio Sim-owned compatibility scaffolding. It exposes the
 corrected v0.23-derived kernel through the private `_C_pinned_topk` Torch
 namespace needed by the available Torch 2.10 stable ABI.

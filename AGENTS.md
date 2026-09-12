@@ -1,4 +1,4 @@
-# VibeSim — agent notes
+# ServingStudio Sim — agent notes
 
 **The project rules for this repo live in [`CLAUDE.md`](CLAUDE.md). Read it
 first.** It covers the environment (`just sync`, everything under `uv`), how to

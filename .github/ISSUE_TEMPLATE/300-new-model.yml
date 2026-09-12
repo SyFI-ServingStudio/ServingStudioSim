@@ -7,7 +7,7 @@ body:
 - type: markdown
   attributes:
     value: >
-      #### Adding a model in VibeSim is not one change. It is a split of the forward pass into
+      #### Adding a model in ServingStudioSim is not one change. It is a split of the forward pass into
       kernels, whatever **measured** L1 rows that split turns out to need, the L2-L4
       composition on top, and an independent `model.work` label. The `top-add-new-arch` skill
       routes the whole sequence; this issue exists to agree on the target and the shape of the
@@ -26,7 +26,7 @@ body:
     required: true
 - type: textarea
   attributes:
-    label: The closest architecture VibeSim already supports
+    label: The closest architecture ServingStudioSim already supports
     description: >
       See `simulator/src/arch/`. Which existing arch is nearest, and where does the new model
       diverge from it? Reuse is the default; a new file needs a reason.
@@ -38,7 +38,7 @@ body:
     description: >
       Operations with no existing kernel, fused boundaries a real framework launches
       differently, a cache/state shape that is not plain KV, a routing or sparsity scheme with
-      no current cost model, a collective VibeSim has never measured. Name the ones you know
+      no current cost model, a collective ServingStudioSim has never measured. Name the ones you know
       about — an unmeasured shape must fail as a missing cache identity, never silently borrow
       a neighbor's timing.
   validations:
@@ -55,5 +55,5 @@ body:
     label: Reference implementation
     description: >
       The serving path you intend to mirror — vLLM, SGLang, TensorRT-LLM, or the Transformers
-      reference — and any known divergence between them for this model. VibeSim costs what a
+      reference — and any known divergence between them for this model. ServingStudioSim costs what a
       framework actually launches, so this choice is part of the specification.

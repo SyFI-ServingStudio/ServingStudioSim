@@ -1,6 +1,6 @@
 """Optimal necessary-work labeler.
 
-The independent ground-truth accountant for VibeSim's redundancy analysis: from a
+The independent ground-truth accountant for ServingStudioSim's redundancy analysis: from a
 model ``config.json`` + a :class:`Workload`, compute the theoretical MINIMUM compute
 (FLOPs) and memory traffic (bytes), plus total/activated parameter counts. See
 ``README.md`` for the contract and the four pinned conventions.

@@ -9,7 +9,7 @@ workload:
   input_file_format: text-generation-independent
   arrival_mode: trace_timed
   # Trace timestamps are already the captured absolute millisecond schedule.
-  # VibeSim scales trace_timed timestamps by request_rate, so 1.0 is required
+  # ServingStudioSim scales trace_timed timestamps by request_rate, so 1.0 is required
   # to preserve them exactly.
   request_rate: 1.0
   session_dependency: independent

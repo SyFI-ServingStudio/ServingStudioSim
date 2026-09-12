@@ -601,7 +601,7 @@ const IMMUTABLE: &str = "max-age=31536000, immutable";
 ///
 /// The client does not have to know a revision in advance. It reads once
 /// without one, gets the ETag, and pins it — which is what
-/// `ResultRef.revision` in `VibeSimUI/new-design.md` is for, and why that field
+/// `ResultRef.revision` in `ServingStudioUI/new-design.md` is for, and why that field
 /// is optional with "absent means latest".
 const REVISION_PARAM: &str = "rev";
 

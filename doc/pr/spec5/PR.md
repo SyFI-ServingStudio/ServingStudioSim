@@ -70,7 +70,7 @@ source identities and historical provenance limitations. Its SHA-256 remains
   branch SHAs were verified on 2026-09-07:
   [vLLM](https://github.com/serendipity-zk/vllm/tree/vibesim-spec5-alignment),
   [req-frontend](https://github.com/uw-syfi/request-factory/tree/vibesim-spec5-alignment).
-- Main PR: https://github.com/SyFI-VibeSim/VibeSim/pull/32.
+- Main PR: https://github.com/SyFI-ServingStudio/ServingStudioSim/pull/32.
   The verified master/review baseline is `fe65028`.
 
 ## Contribution licensing

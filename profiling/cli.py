@@ -61,7 +61,7 @@ def main(
 def build_parser(*, prog: str = "python -m profiling") -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=prog,
-        description="Run, query, or maintain VibeSim L1 profile data.",
+        description="Run, query, or maintain ServingStudioSim L1 profile data.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 

@@ -10,7 +10,7 @@ body:
       #### Use an RFC when the change needs agreement *before* the code exists — a layer
       contract, a new deployment or worker shape, a cross-cutting refactor, or landing a large
       body of work from elsewhere. Past RFCs are
-      [here](https://github.com/SyFI-VibeSim/VibeSim/issues?q=label%3ARFC+sort%3Aupdated-desc).
+      [here](https://github.com/SyFI-ServingStudio/ServingStudioSim/issues?q=label%3ARFC+sort%3Aupdated-desc).
 - type: textarea
   attributes:
     label: Motivation.

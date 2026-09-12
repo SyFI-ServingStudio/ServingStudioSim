@@ -1,6 +1,6 @@
 ---
 name: orchestrator-add-kernel-to-python-profile
-description: Use when orchestrating Python-side VibeSim L1 profiling work for a new kernel kind or a new backend of an existing kind. This skill is for the coordinator who writes implementer briefs, defines completion checks, and sequences Torch reference work before framework backends. It does not cover Rust timing/cache wiring.
+description: Use when orchestrating Python-side ServingStudio Sim L1 profiling work for a new kernel kind or a new backend of an existing kind. This skill is for the coordinator who writes implementer briefs, defines completion checks, and sequences Torch reference work before framework backends. It does not cover Rust timing/cache wiring.
 ---
 
 # Orchestrator Add Kernel To Python Profile
@@ -43,8 +43,8 @@ implementation.
 Classify the request before doing anything else:
 
 - **Brand-new kernel kind**: the user is asking for a new operation family, not
-  just another implementation of an operation VibeSim already knows how to
-  describe. For example, if VibeSim currently has `rmsnorm` and `single_gemm`, and
+  just another implementation of an operation ServingStudio Sim already knows how to
+  describe. For example, if ServingStudio Sim currently has `rmsnorm` and `single_gemm`, and
   the user asks to add convolution, convolution is a new kernel kind. It needs a
   new semantic contract, args shape, Torch reference, runner, and registry
   entry.

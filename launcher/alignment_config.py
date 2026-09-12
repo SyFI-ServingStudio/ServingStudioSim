@@ -1,6 +1,6 @@
 """Strict launcher-owned schemas for the three alignment-specific phases.
 
-The ordinary simulation phase keeps using the normal VibeSim preset schema.
+The ordinary simulation phase keeps using the normal ServingStudioSim preset schema.
 Every path parsed here is resolved relative to the file that declared it, so a
 dated experiment directory can be moved as one self-contained unit. Runtime
 modules receive typed values and never parse YAML or JSON themselves.

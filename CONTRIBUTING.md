@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for your interest in VibeSim.
+Thanks for your interest in ServingStudio Sim.
 
 Working conventions — environment, test tiers, formatting radius, the skill tree
 — live in [`CLAUDE.md`](CLAUDE.md), [`AGENTS.md`](AGENTS.md), and
@@ -10,7 +10,7 @@ to check before merging.
 
 ## Contributor License Agreement
 
-VibeSim is source-available under two community licenses and is separately
+ServingStudio Sim is source-available under two community licenses and is separately
 available under commercial licenses (see [`LICENSING.md`](LICENSING.md)). For
 that to hold together, the project must have the right to license *the whole
 codebase*, including contributions, under all of those terms.

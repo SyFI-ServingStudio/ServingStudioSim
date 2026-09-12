@@ -1,6 +1,6 @@
 # Licensing
 
-VibeSim is **source-available**, not OSI-approved open source. The source is
+ServingStudio Sim is **source-available**, not OSI-approved open source. The source is
 published and readable, and two community licenses cover a wide range of use at
 no charge — but they are not open-source licenses, because they restrict the
 field of use.
@@ -45,7 +45,7 @@ company's internal business purposes, including commercial ones. It contains no
 distribution grant at all: under this license you may not distribute the
 software, modified or not.
 
-Note what falls between them. A for-profit company may run and modify VibeSim
+Note what falls between them. A for-profit company may run and modify ServingStudio Sim
 internally for free. The moment it hands the software — or a product built on
 it — to anyone outside the company, neither community license covers that.
 

@@ -2,7 +2,7 @@
 name: top-add-new-arch
 description: >-
   Use as the top entry point when the user wants to add a whole new model
-  architecture to VibeSim end to end — explore it, split its forward into kernels,
+  architecture to ServingStudio Sim end to end — explore it, split its forward into kernels,
   categorize every element into L1/L2/L3/L4, build the kernels, ops, worklets,
   and model_arch, then add an independent model.work necessary-work label. The
   one criterion running through the timing layers is the
@@ -15,7 +15,7 @@ description: >-
 # Top Add New Arch
 
 Top-level umbrella orchestrator for standing up a brand-new model architecture in
-VibeSim end to end. You sequence lower skills and build bottom-up. Do not implement
+ServingStudio Sim end to end. You sequence lower skills and build bottom-up. Do not implement
 kernels, ops, worklets, or the arch file from here — each phase routes to a
 dedicated skill.
 

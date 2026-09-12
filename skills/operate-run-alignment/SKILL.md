@@ -1,7 +1,7 @@
 ---
 name: operate-run-alignment
 description: >-
-  Run, resume, or inspect the shared VibeSim↔framework evidence pipeline for
+  Run, resume, or inspect the shared ServingStudio Sim↔framework evidence pipeline for
   vLLM or SGLang. Its artifacts support both simulator validation through
   top-align-with-framework and framework optimization through
   top-compose-real-framework-from-sim.
@@ -10,7 +10,7 @@ description: >-
 # Run Alignment
 
 Operate the existing alignment pipeline to produce one reproducible evidence
-exchange between VibeSim and a measured vLLM or SGLang run. Keep every matching
+exchange between ServingStudio Sim and a measured vLLM or SGLang run. Keep every matching
 decision in the labeled kernel-sequence JSON; never create a separate mapping
 YAML.
 
@@ -24,10 +24,10 @@ Run the same capture, normalization, labeling, and comparison path in both
 directions. Choose the consumer from the user's question before interpreting the
 result:
 
-- **Align VibeSim to framework:** determine whether the simulator faithfully explains
+- **Align ServingStudio Sim to framework:** determine whether the simulator faithfully explains
   the measured framework. Hand the completed artifacts to
   `top-align-with-framework` for judgment and simulator-side repair routing.
-- **Align framework to VibeSim:** use the simulated target and its measured-only /
+- **Align framework to ServingStudio Sim:** use the simulated target and its measured-only /
   simulated-only gaps to locate framework implementation opportunities. Hand
   the same artifacts to `top-compose-real-framework-from-sim`, which owns trial
   selection, implementation, controlled baseline/trial measurement, and the
@@ -50,7 +50,7 @@ it to TP1 or collapse DP batches.
 
 ## Run the shared phases
 
-From `VibeSim/`, run each phase through the launcher (`uv run python -m launcher
+From `ServingStudioSim/`, run each phase through the launcher (`uv run python -m launcher
 alignment {profile,timing-predict,analyze,sim}`; see README for the configs).
 Each phase is an explicit checkpoint with a disjoint artifact root; no phase
 launches the next. The duty-cycle `gpu_time_multiplier` is no longer hand-derived
@@ -183,7 +183,7 @@ single-config path below when there is one workload and no matrix.
    against the CostTree, and writes `recommended_gpu_time_multiplier` into
    `reports/alignment_iteration_report.json`. This pass needs no DES simulation;
    fix the labeled source on failure, never the analyzer output.
-4. **Simulation** — ordinary VibeSim preset with explicit worker settings:
+4. **Simulation** — ordinary ServingStudio Sim preset with explicit worker settings:
 
    ```bash
    uv run python -m launcher alignment sim logs/<experiment>/simulation.yaml

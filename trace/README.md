@@ -1,6 +1,6 @@
 # Trace generators and samples
 
-VibeSim and req-frontend's `independent` frontend consume the same
+ServingStudio Sim and req-frontend's `independent` frontend consume the same
 independent-request CSV schema:
 
 ```text

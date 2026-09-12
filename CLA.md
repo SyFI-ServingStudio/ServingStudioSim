@@ -15,7 +15,7 @@ relies on it commercially.
 
 # Contributor License Agreement
 
-Thank you for contributing to VibeSim.
+Thank you for contributing to ServingStudio Sim.
 
 This agreement lets the project keep offering the software under its two
 community licenses *and* offer separate commercial licenses covering the whole

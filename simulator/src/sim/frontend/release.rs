@@ -24,10 +24,10 @@ use crate::common::{RequestId, Time};
 
 pub use req_frontend::release::ArrivalMode;
 
-/// VibeSim's resolved pacing input.
+/// ServingStudioSim's resolved pacing input.
 ///
 /// [`ArrivalMode`] is the shared cross-consumer choice. The rate stays beside
-/// it here because VibeSim stores rate-1-normalized arrivals, while the measured
+/// it here because ServingStudioSim stores rate-1-normalized arrivals, while the measured
 /// client rescales a trace from its observed absolute rate.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ArrivalSchedule {

@@ -1,6 +1,6 @@
 # Architecture
 
-VibeSim is organised as a strict seven-layer stack. Each layer answers exactly one
+ServingStudio Sim is organised as a strict seven-layer stack. Each layer answers exactly one
 question, consumes only the layer directly below it, and hides everything under it
 from the layer above. Two properties fall out of that discipline:
 

@@ -313,7 +313,7 @@ def analyze_e2e_document(variant: Variant) -> dict[str, Any]:
 def simulation_document(
     pack: Pack, case: Case, variant: Variant, case_dir: Path, repo_root: Path
 ) -> dict[str, Any]:
-    """The ordinary VibeSim preset.
+    """The ordinary ServingStudioSim preset.
 
     Unlike the four launcher-owned phase configs, a preset's paths are
     repo-root-relative, not config-relative — so this is the one document that

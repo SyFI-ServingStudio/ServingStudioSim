@@ -1,11 +1,11 @@
 ---
 name: dev-create-worktree
-description: Use when the user asks to create, adopt, or set up a git worktree for VibeSim development, including converting an existing agent checkout into a wt-topic tree. Creates a sibling worktree from the current VibeSim checkout and provisions required working-copy artifacts. NOT for the parallel-writing-subagent isolation flow (that is dev-orchestrate-parallel-subagents).
+description: Use when the user asks to create, adopt, or set up a git worktree for ServingStudio Sim development, including converting an existing agent checkout into a wt-topic tree. Creates a sibling worktree from the current ServingStudio Sim checkout and provisions required working-copy artifacts. NOT for the parallel-writing-subagent isolation flow (that is dev-orchestrate-parallel-subagents).
 ---
 
-# Create an VibeSim worktree
+# Create a ServingStudio Sim worktree
 
-Spin up an isolated git worktree for a piece of VibeSim work AND stage the test
+Spin up an isolated git worktree for a piece of ServingStudio Sim work AND stage the test
 inputs that a bare `git worktree add` leaves behind, so the new tree can run
 `uv run python -m launcher …` and `just test-*` without first re-profiling
 kernels or hunting for trace files.
@@ -31,7 +31,7 @@ needs are therefore missing or unsafe in a fresh or adopted worktree:
    absolute source checkout, while vLLM's precompiled CUDA extensions are
    materialized as untracked `.so` files beside that source. Copying or moving
    `.venv` can therefore leave the interpreter in `wt-topic` importing Python
-   from `VibeSim/`, or leave `wt-topic` source without `_C`, `_moe_C`,
+   from `ServingStudioSim/`, or leave `wt-topic` source without `_C`, `_moe_C`,
    `_flashmla_C`, and the FlashAttention extensions. Rebind the environment to
    the new checkout before any alignment run.
 
@@ -44,12 +44,12 @@ run alignment.
 
 ## Convention
 
-Worktrees are **siblings of `VibeSim/`**, named `wt-<topic>/` — never nested inside
-`VibeSim/`. The workspace root holds `VibeSim/` and every `wt-*/` next to it:
+Worktrees are **siblings of `ServingStudioSim/`**, named `wt-<topic>/` — never nested inside
+`ServingStudioSim/`. The workspace root holds `ServingStudioSim/` and every `wt-*/` next to it:
 
 ```
 <workspace-root>/
-├── VibeSim/       ← primary tree (source of the working profile.db + traces)
+├── ServingStudioSim/       ← primary tree (source of the working profile.db + traces)
 ├── wt-<topic>/    ← what this skill creates
 └── …
 ```
@@ -57,8 +57,8 @@ Worktrees are **siblings of `VibeSim/`**, named `wt-<topic>/` — never nested i
 Set these once:
 
 ```bash
-WORKSPACE_ROOT=<directory-containing-VibeSim>
-MAIN_WORKTREE=$WORKSPACE_ROOT/VibeSim
+WORKSPACE_ROOT=<directory-containing-ServingStudioSim>
+MAIN_WORKTREE=$WORKSPACE_ROOT/ServingStudioSim
 WORKTREE_TOPIC=<topic>              # short kebab, e.g. kv-cache-logging
 NEW_WORKTREE=$WORKSPACE_ROOT/wt-$WORKTREE_TOPIC
 BRANCH_NAME=$WORKTREE_TOPIC         # or a name the user gave
@@ -66,9 +66,9 @@ BRANCH_NAME=$WORKTREE_TOPIC         # or a name the user gave
 
 ## Steps
 
-### 1. Create the worktree off the current `VibeSim/` HEAD
+### 1. Create the worktree off the current `ServingStudioSim/` HEAD
 
-Branch from whatever `VibeSim/` currently has checked out (the code you explored),
+Branch from whatever `ServingStudioSim/` currently has checked out (the code you explored),
 NOT from `master`/`origin` — the active mainline branch here is usually an
 `afd-*` / feature branch, and its committed line numbers are what any plan was
 written against.
@@ -152,7 +152,7 @@ If the dry-run errors on a missing `trace/aime_long.csv`, step 3 did not land.
 
 - Once the worktree is ready, use `operate-run-simulation` to launch sims and
   `dev-run-tests` for the test tiers — both assume the artifacts this skill staged.
-- For importing a coherent change from `VibeSim/` into an existing worktree, use
+- For importing a coherent change from `ServingStudioSim/` into an existing worktree, use
   `dev-present-changes-for-review`; do not copy selected files to imitate a
   rebase.
 - For isolating **multiple concurrent writing subagents**, use

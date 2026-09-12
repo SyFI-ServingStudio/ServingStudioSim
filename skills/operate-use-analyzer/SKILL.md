@@ -1,11 +1,11 @@
 ---
 name: operate-use-analyzer
-description: Use when selecting, reading, comparing, interpreting, or citing an existing VibeSim Analyzer result, including simulation sweeps/singletons, timing predictions, kernel profiles, and kernel measurements. Makes Analyzer the numerical authority, selects an exact resource from explicit UI context, a just-created managed result, or the recent catalog, and copies exact citation tokens returned beside result values. Not for producing the result itself; use the matching operate-run-* or operate-profile-* skill first.
+description: Use when selecting, reading, comparing, interpreting, or citing an existing ServingStudio Analyzer result, including simulation sweeps/singletons, timing predictions, kernel profiles, and kernel measurements. Makes Analyzer the numerical authority, selects an exact resource from explicit UI context, a just-created managed result, or the recent catalog, and copies exact citation tokens returned beside result values. Not for producing the result itself; use the matching operate-run-* or operate-profile-* skill first.
 ---
 
-# Use VibeSim Analyzer
+# Use ServingStudio Analyzer
 
-Use Analyzer whenever a user-visible claim depends on an existing VibeSim
+Use Analyzer whenever a user-visible claim depends on an existing ServingStudio Sim
 result. The conversation backend owns lifecycle and ownership links; Analyzer
 owns result values, descriptors, curves, plots, and hardware limits.
 

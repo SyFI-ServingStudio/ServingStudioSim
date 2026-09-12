@@ -1,13 +1,13 @@
 ---
 name: skill-of-skills
 description: >-
-  Add, rename, organize, or select repo-local VibeSim skills. Defines naming
+  Add, rename, organize, or select repo-local ServingStudio Sim skills. Defines naming
   levels, workflow routing, and writing quality.
 ---
 
 # Skill Of Skills
 
-This is the map for repo-local skills. Keep these skills in `VibeSim/skills/`; the
+This is the map for repo-local skills. Keep these skills in `ServingStudioSim/skills/`; the
 workspace `.codex/skills` path should point here rather than becoming a separate
 source of truth.
 
@@ -77,23 +77,23 @@ top-explore-models - understand a new model or checkpoint from HF/public sources
 ├── dev-calculate-kv-cache-capacity - calculate KV cache bytes and capacity
 └── dev-lookup-transformers-model - inspect local Transformers/Torch semantics
 
-top-split-model-into-kernels - break a model forward into the VibeSim kernel sequence
+top-split-model-into-kernels - break a model forward into the ServingStudioSim kernel sequence
 ├── top-explore-models - step 1: establish the architecture (entry above)
 ├── dev-lookup-transformers-model - what math each op computes (shared)
 └── dev-explore-kernel - whether a real fused kernel exists in the ecosystem (shared)
 
-top-align-with-framework - consume the Align VibeSim to framework side of shared evidence to evaluate simulator fidelity (kernel-only deviation + missing-chunk coverage, GPU duty cycle, TTFT/TPOT)
+top-align-with-framework - consume the Align ServingStudioSim to framework side of shared evidence to evaluate simulator fidelity (kernel-only deviation + missing-chunk coverage, GPU duty cycle, TTFT/TPOT)
 ├── operate-run-alignment - produce the shared labeled evidence (Step 0, below)
 ├── operate-align-moe-kernel - diagnose one fused MoE kernel from exact input through full-run popularity
 ├── impl-validate-kernel-cache - fix a wrong-shape kernel cost surfaced by Check 1
 └── top-add-kernel - add/repair a kernel whose backend the sim mismodels
 
-top-compose-real-framework-from-sim - actively build a real serving framework from VibeSim evidence in a Tick (sim) / Tock (one measured trial) / Probe (attribute and decide) loop; the orchestrator owns the workflow and delegates only actual code writing
+top-compose-real-framework-from-sim - actively build a real serving framework from ServingStudioSim evidence in a Tick (sim) / Tock (one measured trial) / Probe (attribute and decide) loop; the orchestrator owns the workflow and delegates only actual code writing
 ├── top-explore-models - establish exact checkpoint architecture and support requirements
-├── top-add-new-arch - add missing VibeSim L1–L4 support before selecting a real-code trial
+├── top-add-new-arch - add missing ServingStudioSim L1–L4 support before selecting a real-code trial
 ├── top-add-kernel - add missing measured kernel/backend support
 ├── operate-run-simulation - produce the comparable serving-workload target and analyzer artifacts
-├── operate-run-alignment - consume the Align framework to VibeSim side of the same shared labeled evidence
+├── operate-run-alignment - consume the Align framework to ServingStudioSim side of the same shared labeled evidence
 ├── operate-run-timing-predict - compare user-supplied explicit building-block inputs through the existing offline predictor
 ├── operate-profile-serving-run - capture and attribute a real serving profile (the Probe step)
 ├── dev-build-serving-repetitive-unit - investigate kernels with a complete reduced model on the production execution path
@@ -104,7 +104,7 @@ top-compose-real-framework-from-sim - actively build a real serving framework fr
 operate-run-simulation - run deployment simulations from presets (DES, workload trace)
 operate-run-timing-predict - offline per-building-block cost prediction (no DES; iter=PD, attn+ffn=AFD)
 operate-use-analyzer - select, read, interpret, and cite Analyzer-owned simulation, prediction, profile, and measurement results
-operate-run-alignment - produce one shared VibeSim↔framework comparison for vLLM or SGLang; Align VibeSim to framework through top-align-with-framework, or Align framework to VibeSim through top-compose-real-framework-from-sim
+operate-run-alignment - produce one shared ServingStudioSim↔framework comparison for vLLM or SGLang; Align ServingStudioSim to framework through top-align-with-framework, or Align framework to ServingStudioSim through top-compose-real-framework-from-sim
 operate-align-moe-kernel - diagnose one existing fused MoE kernel with exact-input, iteration-popularity, and full-run comparisons
 operate-gpu-spec - query or update the GPU spec catalog
 operate-profile-sim-speed - profile simulator wallclock speed
@@ -112,9 +112,9 @@ operate-profile-serving-run - capture a comparable bounded profile of a real ser
 operate-profile-existing-kernel - query or fill registered profiler rows
 operate-compare-serving-performance - compare two real serving engines under one request/numeric contract, overall metrics first and coarse device-region totals second
 
-dev-create-worktree - create an VibeSim development worktree
+dev-create-worktree - create a ServingStudioSim development worktree
 dev-orchestrate-parallel-subagents - isolate concurrent writing subagents
-dev-run-tests - select and run VibeSim test tiers
+dev-run-tests - select and run ServingStudioSim test tiers
 dev-compose-worker - plan, estimate, implement, compose, and review production L5 workers against the four-axis ownership rules
 dev-file-design-review - review one file against docs and contracts
 dev-present-changes-for-review - organize a diff for human review
@@ -128,13 +128,13 @@ dev-llm-serving - implement or review real LLM/multimodal serving framework code
 
 When adding or renaming a skill:
 
-- put the skill under `VibeSim/skills/<skill-name>/SKILL.md`;
+- put the skill under `ServingStudioSim/skills/<skill-name>/SKILL.md`;
 - choose the prefix by role, not by implementation language;
 - update this tree if the skill becomes part of a routed workflow;
 - update parent skill descriptions so agents can discover the relationship from
   metadata alone;
 - run the skill validator for each changed skill;
-- search for stale names with `rg "<old-skill-name>" VibeSim/skills`.
+- search for stale names with `rg "<old-skill-name>" ServingStudioSim/skills`.
 
 If a lower-level skill starts duplicating a parent, move the duplicated details
 down to the leaf and let the parent point to it. If a top skill grows into a

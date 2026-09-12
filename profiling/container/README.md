@@ -1,6 +1,6 @@
 # vLLM profiler container
 
-This image is the dependency boundary for VibeSim kernels registered with
+This image is the dependency boundary for ServingStudio Sim kernels registered with
 `subprocess_env="vllm_env"`. It pins CUDA 13.0, the instrumented vLLM checkout,
 the matching cu130 native wheel, Torch, FlashInfer, and the CUPTI build tools.
 

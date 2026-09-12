@@ -1,7 +1,7 @@
 ---
 name: operate-profile-existing-kernel
 description: >-
-  Query, fill, refresh, validate, or measure a registered VibeSim L1 kernel
+  Query, fill, refresh, validate, or measure a registered ServingStudio Sim L1 kernel
   profile, including DB-row provenance and preservation.
 ---
 
@@ -35,7 +35,7 @@ uv run python -m launcher kernel-profile run <table> --backend <backend> (--spec
 `python -m profiling ...` remains a compatibility/developer entry and calls the
 same `profiling.cli` implementation. Skills and managed Agent runs use the
 launcher form so simulation, timing prediction, alignment, and kernel profiling
-share one VibeSim command surface.
+share one ServingStudio Sim command surface.
 
 Spec input rules:
 

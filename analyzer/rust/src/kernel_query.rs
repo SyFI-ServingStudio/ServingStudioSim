@@ -16,7 +16,7 @@ use std::process::{Command, Stdio};
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 
-/// The VibeSim repo root the launcher env + built binaries live under. The
+/// The ServingStudioSim repo root the launcher env + built binaries live under. The
 /// analyzer is launched from the repo (directly or via `python -m launcher`), so
 /// the current working directory is the honest default; `run_kernel_query`
 /// resolves the launcher module against that project with `uv run`.
@@ -24,7 +24,7 @@ pub(crate) fn repo_root() -> Result<PathBuf> {
     std::env::current_dir().context("resolve analyzer repository root (current dir)")
 }
 
-/// The file that marks a directory as a VibeSim checkout. It is the labeler
+/// The file that marks a directory as a ServingStudioSim checkout. It is the labeler
 /// module the optimality floors spawn, so a directory holding it also holds the
 /// `model/config`, `model/work/location_maps`, `gpu/spec.json`, and `uv` project
 /// that every checkout-owned asset below is read from.

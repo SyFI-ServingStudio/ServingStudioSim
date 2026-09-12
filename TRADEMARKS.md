@@ -8,7 +8,7 @@ concern from the software licenses, which cover copyright and patents.
 > branding in a way that falsely suggests sponsorship, endorsement, or
 > official status.
 
-No registered trademark is claimed for "VibeSim" here, and the `®` symbol is
+No registered trademark is claimed for "ServingStudio Sim" here, and the `®` symbol is
 not used. This document states how the project asks that its name be used; it
 does not assert rights beyond what the project can actually establish.
 
@@ -16,10 +16,10 @@ does not assert rights beyond what the project can actually establish.
 
 Truthful, descriptive references need no permission. For example:
 
-- "a fork of VibeSim"
-- "built with VibeSim"
-- "compatible with VibeSim"
-- naming VibeSim in a paper, talk, benchmark, comparison, or bug report
+- "a fork of ServingStudio Sim"
+- "built with ServingStudio Sim"
+- "compatible with ServingStudio Sim"
+- naming ServingStudio Sim in a paper, talk, benchmark, comparison, or bug report
 
 Use the name to say what something *is* or what it *works with*. That is
 nominative use and this policy does not restrict it.
@@ -46,6 +46,6 @@ implicit branding rights beyond them.
 
 Names such as vLLM, SGLang, TensorRT-LLM, FlashInfer, NVIDIA, PyTorch, and the
 model names appearing in this repository belong to their respective owners. They
-are used here descriptively, to identify the software and models VibeSim
+are used here descriptively, to identify the software and models ServingStudio Sim
 measures, models, or interoperates with. No affiliation or endorsement is
 implied.

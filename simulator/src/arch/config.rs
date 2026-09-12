@@ -190,7 +190,7 @@ pub enum IterArchSel {
         expert_popularity_file: Option<String>,
     },
     /// Native FP8 Qwen recipe: per-token/group quantized dense projections,
-    /// DeepGEMM expert kernels, and VibeSim's P2P EP dispatch/combine graph.
+    /// DeepGEMM expert kernels, and ServingStudioSim's P2P EP dispatch/combine graph.
     Qwen3MoeFp8DpAttnEpFfn {
         #[serde(flatten)]
         model: ModelSpec,
@@ -214,7 +214,7 @@ pub enum IterArchSel {
     /// Alignment-only Qwen recipe matching the target vLLM execution path:
     /// FlashInfer/TensorRT-LLM block-scale expert GEMMs plus local finalize and
     /// an EP all-reduce. The generic Qwen tag above intentionally retains
-    /// VibeSim's original DeepGEMM + P2P communication recipe.
+    /// ServingStudioSim's original DeepGEMM + P2P communication recipe.
     Qwen3VllmMoeDpAttnEpFfn {
         #[serde(flatten)]
         model: ModelSpec,

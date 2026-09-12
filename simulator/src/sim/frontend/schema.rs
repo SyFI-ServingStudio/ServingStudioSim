@@ -1,8 +1,8 @@
-//! Adapt req-frontend's validated input rows into statically typed VibeSim requests.
+//! Adapt req-frontend's validated input rows into statically typed ServingStudioSim requests.
 //!
 //! The shared crate owns complete input-file formats, header matching, CSV
 //! decoding, tag decoding, and format-specific structural validation. This
-//! module starts after that boundary: it assigns VibeSim's dense ids and turns
+//! module starts after that boundary: it assigns ServingStudioSim's dense ids and turns
 //! each shared row into one concrete [`RequestDefinition`].
 
 use std::collections::HashMap;
@@ -93,7 +93,7 @@ fn parse_independent_metadata(
         scheduling: SchedulingDeclaration {
             priority: i32::try_from(priority.priority_or_default()).with_context(|| {
                 format!(
-                    "request {source_request_id:?}: priority does not fit VibeSim's i32 contract"
+                    "request {source_request_id:?}: priority does not fit ServingStudioSim's i32 contract"
                 )
             })?,
         },

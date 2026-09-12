@@ -1,4 +1,4 @@
-"""Generate a deterministic fixed-shape VibeSim request trace.
+"""Generate a deterministic fixed-shape ServingStudioSim request trace.
 
 Use this for load-generator capacity tests where shape variance would obscure
 the offered-load boundary. Arrival times are milliseconds, matching the L7 and

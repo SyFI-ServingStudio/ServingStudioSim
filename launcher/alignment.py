@@ -42,7 +42,7 @@ ALIGNMENT_MANIFEST_SCHEMA_VERSION = 9
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m launcher alignment",
-        description="Run one explicit stage of the VibeSim↔vLLM alignment workflow.",
+        description="Run one explicit stage of the ServingStudioSim↔vLLM alignment workflow.",
     )
     commands = parser.add_subparsers(dest="command", required=True)
 
@@ -56,7 +56,7 @@ def _build_parser() -> argparse.ArgumentParser:
     prepare.add_argument("--missing-acceptance", choices=["error", "run-aggregate"], required=True)
     prepare.add_argument("--request-id-prefix", default="")
 
-    sim = commands.add_parser("sim", help="Run the ordinary VibeSim simulation.")
+    sim = commands.add_parser("sim", help="Run the ordinary ServingStudioSim simulation.")
     sim.add_argument("config", type=Path, help="Simulation preset YAML/JSON")
     sim.add_argument("--dry-run", action="store_true", help="Validate and expand only.")
     sim.add_argument("--build-type", default="release", help="Cargo profile (default: release).")

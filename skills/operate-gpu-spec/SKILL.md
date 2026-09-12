@@ -84,7 +84,7 @@ Intel RoCE), which have their own (typically 8-GPU) intra-node domain.
 
 ## Search / query a value
 
-The file is JSON — use `jq` (from `VibeSim/`):
+The file is JSON — use `jq` (from `ServingStudioSim/`):
 
 ```bash
 # All fields for one GPU
@@ -127,7 +127,7 @@ about a GPU with no row, or a field that is `null`/absent:
    on-demand "medium" price.
 3. **Clearly label it as a searched result**, so the user knows it is NOT a
    vetted catalog number. Prefix the answer, e.g.:
-   > ⚠ Not in the VibeSim GPU catalog — this is a web-searched result (source: …),
+   > ⚠ Not in the ServingStudio Sim GPU catalog — this is a web-searched result (source: …),
    > not a catalog-backed value.
    Cite the source and, for prices, the fetch date (they move).
 4. **Never present a searched or from-memory value as catalog-backed.**

@@ -7,7 +7,7 @@ experiment trees remain untracked.
 | Figure | Evidence |
 |---|---|
 | `kernel_alignment_case14.png` | Per-iteration kernel timing for case 14, near-full long decode at concurrency 21 |
-| `workload_alignment_case14.png` | Full-trace scheduled-KV workload for the same case, comparing vLLM and VibeSim |
+| `workload_alignment_case14.png` | Full-trace scheduled-KV workload for the same case, comparing vLLM and ServingStudio Sim |
 | `e2e_cdf_case15.png` | End-to-end request-latency CDF for case 15, KV-overcommit mixed churn at concurrency 14 |
 
 The figures were copied without modification from

@@ -58,7 +58,7 @@ Write down, from the true model implementation:
 - embeddings, output head, norms, parameter tying, and dtype assumptions;
 - formulas for compulsory FLOPs, parameter bytes, and persistent state traffic.
 
-Do not use VibeSim's partitioned or fused kernel shapes as evidence for these
+Do not use ServingStudio Sim's partitioned or fused kernel shapes as evidence for these
 formulas.
 
 ### 2. Compose or extend the accountant
