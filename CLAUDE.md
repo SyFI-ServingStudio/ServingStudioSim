@@ -1,7 +1,7 @@
 # VibeSim — agent notes
 
 Discrete-event simulator for ML serving/training workloads. Rust core
-(`simulator/`) + Python L1 profiling/launcher, bridged via PyO3. Answer user questions using Chinese. Draft plans also in Chinese. Write code comments in English.
+(`simulator/`) + Python L1 profiling/launcher, bridged via PyO3.
 
 `doc/README.md` is the current design record — the seven-layer stack, one
 document per layer, the invariants, and the analyzer contract. Per-module
@@ -40,7 +40,7 @@ install just`) — they encode the env gotchas:
 
 ```bash
 just test-cpu     # Rust --lib + mocked pytest, xdist-parallel (~19 s). The default gate.
-                  #   `just test-cpu workers=4` on a smaller host.
+                  #   `just test-cpu 4` on a smaller host.
 just test-gpu     # gpu tier (throughput regression, cupti). Needs a CUDA device;
                   #   the launcher builds the binary + warms profile.db itself.
 just test-all     # cpu + gpu — the usual "did my refactor break anything".
