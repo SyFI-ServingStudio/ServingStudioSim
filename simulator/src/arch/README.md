@@ -95,7 +95,7 @@ reimplement model assembly.
 
 - `ModelCfg` loads dense-decoder dimensions.
 - `MoeModelCfg` extends those facts with MoE dimensions. GLM-5.2's DSA/MoE
-  dimensions live in `Glm52ModelCfg` (`glm52_dsa_moe.rs`), because its
+  dimensions live in `Glm52ModelCfg` (`glm52_model_cfg.rs`), because its
   heterogeneous 78-layer schedule and indexer dimensions are not a `MoeModelCfg`
   extension.
 - `ParallelCfg` and the family-specific parallel structs resolve TP, EP,
@@ -112,11 +112,11 @@ extent or KV sharding from selector fields.
 Serde-tagged selectors are provider-first: selecting a tag reveals only that
 variant's parameters.
 
-| Contract | Wired selectors | Explicitly unsupported selectors |
-|---|---|---|
-| `IterArchSel` | `llama3_dense`, `llama3_dense_tp`, `llama3_dp_attn_tp_ffn`, `qwen3_moe_dp_attn_ep_ffn`, `qwen3_moe_fp8_dp_attn_ep_ffn`, `qwen3_vllm_moe_dp_attn_ep_ffn`, `glm52_dsa_moe`, `glm52_vllm_dsa_moe` | none |
-| `AttnArchSel` | `qwen3_attn_tp` | `llama3_attn_tp` |
-| `FfnArchSel` | `qwen3_ffn_moe`, `qwen3_fp8_ffn_moe` | `deepseek_ffn_moe` |
+| Contract | Wired selectors |
+|---|---|
+| `IterArchSel` | `qwen36_local`, `llama3_dense`, `llama3_dense_tp`, `llama3_dp_attn_tp_ffn`, `qwen3_moe_dp_attn_ep_ffn`, `qwen3_moe_fp8_dp_attn_ep_ffn`, `qwen3_vllm_moe_dp_attn_ep_ffn`, `deepseek_v4_vllm`, `deepseek_v4_vllm_serial_streams`, `glm52_vllm_dsa_moe`, `glm52_vllm_nvfp4_dsa_moe`, `glm52_vllm_nvfp4_dsa_moe_speculative`, `glm52_sglang_nvfp4_tp_dsa_moe` |
+| `AttnArchSel` | `qwen3_attn_tp` |
+| `FfnArchSel` | `qwen3_ffn_moe`, `qwen3_fp8_ffn_moe` |
 
 `ModelSpec` is flattened into every tag and carries `model_config`, layer
 controls, and `fp8`. `ParamStruct`/`ProviderSchema` generate the launcher
@@ -128,7 +128,9 @@ schema; no second hand-maintained config union belongs here.
   - Llama3 dense/TP → `barebone`
   - Llama3 DP-attention/TP-FFN → `hp_unified`
   - Qwen3 MoE DP-attention/EP-FFN (native BF16, native FP8, or vLLM-aligned FP8) → `hp_unified`
-  - GLM-5.2 DSA/MoE (native or vLLM-aligned) → `hp_unified`
+  - GLM-5.2 vLLM DSA/MoE → `hp_unified`
+  - GLM-5.2 vLLM NVFP4 → `hp_unified`, `chunked_prefill`, or `speculative`
+  - GLM-5.2 SGLang NVFP4 pure TP → `chunked_prefill`
 - PD:
   - Llama3 TP prefill → Llama3 TP decode
   - Llama3 TP prefill → Llama3 DP-attention/TP-FFN decode
@@ -142,6 +144,9 @@ Use the `impl-compose-arch` skill when adding an L4 model. Keep the concrete
 model's `build_configs → resolve_configs → build` path in its family file, add
 the smallest selector/build dispatch entry, and test cost consistency before
 wiring a deployment.
+
+See [`doc/architecture_compatibility.md`](../../../doc/architecture_compatibility.md)
+for selector compatibility and migration rules.
 
 ## MoE routing configuration
 

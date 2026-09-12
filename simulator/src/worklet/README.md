@@ -95,8 +95,7 @@ Each module re-exports its `{Worklet, Config, Input, Resolved}` quartet through
 | AFD `qwen3_attn_layerwise` | `attn_block_tp` |
 | AFD `qwen3_ffn_moe_layerwise` | `pre_attn_proj_tp`, `post_attn_router_tp`, `native_moe_router_local`, `native_moe_expert_compute_local` |
 | AFD `qwen3_fp8_ffn_moe_layerwise` | `fp8_pre_attn_proj_tp`, `fp8_post_attn_router_tp`, `native_fp8_moe_router_local`, `native_moe_expert_compute_local` |
-| `glm52_dsa_moe` | `glm52_dsa_attn_local`, `glm52_dense_ffn_local`, `glm52_moe_router_local`, `glm52_shared_expert_local`, `moe_expert_compute_local`, `glm52_mtp_prelude_local`, `glm52_mtp_head_local` |
-| `glm52_vllm_dsa_moe` | `vllm_glm52_dsa_attn_local`, `vllm_glm52_dense_ffn_local`, `vllm_glm52_shared_expert_local`, plus the four GLM sections it shares unchanged with the native arch |
+| `glm52_vllm_dsa_moe` | `vllm_glm52_dsa_attn_local`, `vllm_glm52_dense_ffn_local`, `vllm_glm52_shared_expert_local`, plus the shared GLM router, expert, and MTP sections |
 | `glm52_vllm_nvfp4_dsa_moe` | `vllm_glm52_dsa_attn_local`, neutral `glm52_dense_ffn_local`, `glm52_shared_expert_local`, `nvfp4_moe_local`, plus the unchanged GLM router and MTP sections |
 | `glm52_vllm_nvfp4_dsa_moe_speculative` | Same target sections; draft uses `bf16_moe_local`, MTP prelude/head, and first/recurrent attention sections |
 | `glm52_sglang_nvfp4_tp_dsa_moe` | `sglang_glm52_dsa_attn_local`, `sglang_glm52_moe_router_local`, `sglang_moe_finalize_local`, neutral `glm52_dense_ffn_local`, `glm52_shared_expert_local`, `nvfp4_moe_local`, plus the unchanged GLM MTP sections |

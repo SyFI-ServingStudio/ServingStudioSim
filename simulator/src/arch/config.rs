@@ -30,7 +30,7 @@ use serde::Deserialize;
 
 use schema_derive::{ParamStruct, ProviderSchema};
 
-use super::glm52_dsa_moe::Glm52MtpMode;
+use super::glm52_model_cfg::Glm52MtpMode;
 
 /// Model identity + layer controls. Flattened into every arch tag (§4), so it
 /// carries no `deny_unknown_fields` (the flattened struct must let the arch's
@@ -264,10 +264,8 @@ pub enum IterArchSel {
         #[param(cache_key)]
         expert_popularity_file: Option<String>,
     },
-    /// The same GLM-5.2 schedule as `glm52_dsa_moe`, expressed in vLLM's kernel
-    /// granularity for framework alignment. Same parameters, same topology; the
-    /// graphs differ only in how leaves are cut. See
-    /// `arch/glm52_vllm_dsa_moe.rs` for the itemised divergences.
+    /// GLM-5.2's aligned vLLM execution graph with local TP1 attention and
+    /// expert parallelism across the replica.
     Glm52VllmDsaMoe {
         #[serde(flatten)]
         model: ModelSpec,
@@ -394,38 +392,6 @@ pub enum IterArchSel {
         #[param(cache_key)]
         expert_popularity_file: Option<String>,
     },
-    /// GLM-5.2's exact heterogeneous 78-layer DSA/MoE schedule. Attention is
-    /// local (TP1) on every EP rank and pairs with `hp_unified`, whose KV/input
-    /// partitions correspond one-for-one with the EP ranks.
-    Glm52DsaMoe {
-        #[serde(flatten)]
-        model: ModelSpec,
-        /// Expert-parallel ranks and independent local-attention DP groups.
-        #[serde(default = "default_glm52_parallel_size")]
-        #[param(default = 8, cache_key)]
-        ep_size: u16,
-        /// NVLink-domain size for the MoE dispatch/combine split.
-        #[serde(default = "default_glm52_parallel_size")]
-        #[param(default = 8, cache_key)]
-        nvl_num_gpu: u16,
-        /// Expert routing distribution used by dispatch/combine.
-        #[serde(default)]
-        #[param(string, default = "uniform", choices = ROUTING_KINDS)]
-        routing: RoutingKind,
-        /// Seed for `routing = random`; ignored for uniform routing.
-        #[serde(default)]
-        routing_seed: Option<u64>,
-        /// Optional MTP proposer work: off, full-index step 0, or a later
-        /// IndexShare step.
-        #[serde(default)]
-        #[param(string, default = "off", choices = GLM52_MTP_MODES, cache_key)]
-        mtp_mode: Glm52MtpMode,
-        /// Measured per-expert popularity from a profile pass. Requires
-        /// `routing = custom`; uniform/random routing cannot carry a profile.
-        #[serde(default)]
-        #[param(cache_key)]
-        expert_popularity_file: Option<String>,
-    },
 }
 
 impl IterArchSel {
@@ -441,7 +407,6 @@ impl IterArchSel {
             | Self::Qwen3VllmMoeDpAttnEpFfn { model, .. }
             | Self::DeepseekV4Vllm { model, .. }
             | Self::DeepseekV4VllmSerialStreams { model, .. }
-            | Self::Glm52DsaMoe { model, .. }
             | Self::Glm52VllmDsaMoe { model, .. }
             | Self::Glm52VllmNvfp4DsaMoe { model, .. }
             | Self::Glm52VllmNvfp4DsaMoeSpeculative { model, .. }
@@ -540,9 +505,9 @@ mod iter_tests {
         ))
     }
 
-    fn parse(extra: &str) -> Result<IterArchSel, serde_json::Error> {
+    fn parse_glm52(extra: &str) -> Result<IterArchSel, serde_json::Error> {
         serde_json::from_str(&format!(
-            r#"{{"type":"glm52_dsa_moe","model_config":"model/config/glm52.json","fp8":false{extra}}}"#
+            r#"{{"type":"glm52_vllm_dsa_moe","model_config":"model/config/glm52.json","fp8":false{extra}}}"#
         ))
     }
 
@@ -733,39 +698,28 @@ mod iter_tests {
 
     #[test]
     fn glm52_selector_accepts_a_measured_expert_popularity_profile() {
-        // The GLM graphs previously had no way to consume a measured expert
-        // distribution, so a DP+EP alignment run could only assume uniform
-        // routing -- a silent confound on exactly the grouped-GEMM operations
-        // that deviate most. Same field and same semantics as the Qwen
-        // variants: custom routing explicitly selects the measured file.
-        for tag in ["glm52_dsa_moe", "glm52_vllm_dsa_moe"] {
-            let parsed: IterArchSel = serde_json::from_str(&format!(
-                r#"{{"type":"{tag}","model_config":"model/config/glm52_fp8.json","fp8":true,
-                     "routing":"custom","expert_popularity_file":"profile_expert_popularity/expert_popularity.json"}}"#
-            ))
-            .expect("GLM selector accepts an expert-popularity profile");
-            let file = match &parsed {
-                IterArchSel::Glm52DsaMoe {
-                    expert_popularity_file,
-                    ..
-                }
-                | IterArchSel::Glm52VllmDsaMoe {
-                    expert_popularity_file,
-                    ..
-                } => expert_popularity_file.clone(),
-                _ => panic!("expected a GLM arch"),
-            };
-            assert_eq!(
-                file.as_deref(),
-                Some("profile_expert_popularity/expert_popularity.json")
-            );
-        }
+        let parsed: IterArchSel = serde_json::from_str(
+            r#"{"type":"glm52_vllm_dsa_moe","model_config":"model/config/glm52_fp8.json","fp8":true,
+                 "routing":"custom","expert_popularity_file":"profile_expert_popularity/expert_popularity.json"}"#,
+        )
+        .expect("GLM selector accepts an expert-popularity profile");
+        let IterArchSel::Glm52VllmDsaMoe {
+            expert_popularity_file,
+            ..
+        } = parsed
+        else {
+            panic!("expected glm52_vllm_dsa_moe")
+        };
+        assert_eq!(
+            expert_popularity_file.as_deref(),
+            Some("profile_expert_popularity/expert_popularity.json")
+        );
     }
 
     #[test]
     fn glm52_selector_defaults_and_model_are_exact() {
-        let parsed = parse("").expect("default GLM selector parses");
-        let IterArchSel::Glm52DsaMoe {
+        let parsed = parse_glm52("").expect("default GLM selector parses");
+        let IterArchSel::Glm52VllmDsaMoe {
             model,
             ep_size,
             nvl_num_gpu,
@@ -775,7 +729,7 @@ mod iter_tests {
             expert_popularity_file,
         } = &parsed
         else {
-            panic!("expected glm52_dsa_moe")
+            panic!("expected glm52_vllm_dsa_moe")
         };
         assert_eq!(model.model_config, "model/config/glm52.json");
         assert!(!model.fp8);
@@ -795,13 +749,13 @@ mod iter_tests {
             ("full_index", Glm52MtpMode::FullIndex),
             ("index_share", Glm52MtpMode::IndexShare),
         ] {
-            let parsed = parse(&format!(
+            let parsed = parse_glm52(&format!(
                 r#","ep_size":16,"nvl_num_gpu":8,"routing":"random","routing_seed":73,"mtp_mode":"{wire}""#
             ))
             .unwrap();
             assert!(matches!(
                 parsed,
-                IterArchSel::Glm52DsaMoe {
+                IterArchSel::Glm52VllmDsaMoe {
                     ep_size: 16,
                     nvl_num_gpu: 8,
                     routing: RoutingKind::Random,
@@ -815,7 +769,7 @@ mod iter_tests {
 
     #[test]
     fn glm52_selector_rejects_malformed_mtp_mode() {
-        let error = parse(r#","mtp_mode":"shared""#).unwrap_err();
+        let error = parse_glm52(r#","mtp_mode":"shared""#).unwrap_err();
         assert!(error.to_string().contains("unknown variant"));
     }
 
@@ -823,7 +777,7 @@ mod iter_tests {
     fn glm52_schema_exposes_exact_defaults_choices_and_cache_keys() {
         let (_, params) = IterArchSel::SCHEMA
             .iter()
-            .find(|(tag, _)| *tag == "glm52_dsa_moe")
+            .find(|(tag, _)| *tag == "glm52_vllm_dsa_moe")
             .expect("glm52 selector schema row");
         let params = serde_json::to_value(params).unwrap();
         let get = |name: &str| {
@@ -853,22 +807,22 @@ mod iter_tests {
         );
         assert_eq!(mtp["affects_cache"], true);
     }
+
+    #[test]
+    fn retired_glm52_selector_is_not_published_or_accepted() {
+        assert!(!IterArchSel::SCHEMA
+            .iter()
+            .any(|(tag, _)| *tag == "glm52_dsa_moe"));
+        let raw =
+            r#"{"type":"glm52_dsa_moe","model_config":"model/config/glm52.json","fp8":false}"#;
+        assert!(serde_json::from_str::<IterArchSel>(raw).is_err());
+    }
 }
 // ── layer-wise attn / ffn contract (AFD) ────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize, ProviderSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AttnArchSel {
-    Llama3AttnTp {
-        #[serde(flatten)]
-        model: ModelSpec,
-        /// Tensor parallelism size.
-        #[param(default = 2, cache_key)]
-        tp_size: u16,
-        /// Attention head parallelism.
-        #[param(default = 1, cache_key)]
-        head_parallel: u16,
-    },
     /// Qwen3-MoE attention side (layer-wise AFD attn pool). **One worker = one DP
     /// shard**: attention sharded over `attn_tp_size` head-parallel ranks, with its
     /// own KV cache and request stream. Data parallelism is the attn pool's
@@ -887,7 +841,7 @@ impl AttnArchSel {
     /// The model identity/dims this arch operates on (every variant carries it).
     pub fn model(&self) -> &ModelSpec {
         match self {
-            Self::Llama3AttnTp { model, .. } | Self::Qwen3AttnTp { model, .. } => model,
+            Self::Qwen3AttnTp { model, .. } => model,
         }
     }
 }
@@ -895,16 +849,6 @@ impl AttnArchSel {
 #[derive(Debug, Clone, Deserialize, ProviderSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum FfnArchSel {
-    DeepseekFfnMoe {
-        #[serde(flatten)]
-        model: ModelSpec,
-        /// Tensor parallelism size.
-        #[param(default = 2, cache_key)]
-        tp_size: u16,
-        /// Expert parallelism size.
-        #[param(default = 8, cache_key)]
-        ep_size: u16,
-    },
     /// BF16/native Qwen3-MoE FFN side (layer-wise AFD ffn pool): qkv / o_proj (on the attn-TP
     /// layout) + post_norm + router + EP MoE, plus the iteration embed / final_norm
     /// / lm_head. Mirrors the FFN-side cost of the unified `qwen3_moe_dp_attn_ep_ffn`;
@@ -959,9 +903,27 @@ impl FfnArchSel {
     /// The model identity/dims this arch operates on (every variant carries it).
     pub fn model(&self) -> &ModelSpec {
         match self {
-            Self::DeepseekFfnMoe { model, .. }
-            | Self::Qwen3FfnMoe { model, .. }
-            | Self::Qwen3Fp8FfnMoe { model, .. } => model,
+            Self::Qwen3FfnMoe { model, .. } | Self::Qwen3Fp8FfnMoe { model, .. } => model,
         }
+    }
+}
+
+#[cfg(test)]
+mod layerwise_tests {
+    use super::*;
+
+    #[test]
+    fn unimplemented_layerwise_placeholders_are_not_published_or_accepted() {
+        assert!(!AttnArchSel::SCHEMA
+            .iter()
+            .any(|(tag, _)| *tag == "llama3_attn_tp"));
+        assert!(!FfnArchSel::SCHEMA
+            .iter()
+            .any(|(tag, _)| *tag == "deepseek_ffn_moe"));
+
+        let llama = r#"{"type":"llama3_attn_tp","model_config":"m.json","fp8":false,"tp_size":2,"head_parallel":1}"#;
+        let deepseek = r#"{"type":"deepseek_ffn_moe","model_config":"m.json","fp8":false,"tp_size":2,"ep_size":8}"#;
+        assert!(serde_json::from_str::<AttnArchSel>(llama).is_err());
+        assert!(serde_json::from_str::<FfnArchSel>(deepseek).is_err());
     }
 }

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use crate::arch::contract::{IterwiseUnifiedModel, UnifiedArchInput};
-use crate::arch::glm52_dsa_moe::{Glm52ModelCfg, Glm52MtpMode};
+use crate::arch::glm52_model_cfg::{Glm52ModelCfg, Glm52MtpMode};
 use crate::common::Fabric;
 use crate::op::attention::DsaSparseMlaExactVarlenConfig;
 use crate::op::Op;
@@ -1470,7 +1470,7 @@ mod tests {
     }
 
     fn model() -> Glm52ModelCfg {
-        crate::arch::glm52_dsa_moe::parse_model_json(&exact_json_value().to_string()).unwrap()
+        crate::arch::glm52_model_cfg::parse_model_json(&exact_json_value().to_string()).unwrap()
     }
 
     fn parallel(tp_size: u16) -> Glm52SglangNvfp4TpDsaMoeParallel {

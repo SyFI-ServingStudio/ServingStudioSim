@@ -36,7 +36,7 @@ profile-container-build:
 # `workers` is the xdist worker count. Not `auto`: that means one worker per core,
 # and each worker pays ~9 s importing torch + flashinfer, so a big host spends
 # more on startup than it saves. 16 is the measured knee here (17 s, against 19 s
-# at 8 and 24); override on a smaller machine with `just test-cpu workers=4`.
+# at 8 and 24); override on a smaller machine with `just test-cpu 4`.
 test-cpu workers="16": sync
     LD_LIBRARY_PATH="{{libdir}}:${LD_LIBRARY_PATH:-}" uv run --no-sync cargo test -p simulator --lib
     uv run --no-sync pytest -m "not gpu and not agent and not bench" -n {{workers}}

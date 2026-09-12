@@ -68,7 +68,7 @@ embeds the run-global specs and fixes which **pool roles** exist:
    draft/verify execution contract. PD worker tags belong to the `pd` deployment.
 4. **Select the arch by its explicit tag** — the wired unified arms are
    `Llama3Dense`, `Llama3DenseTp`, `Llama3DpAttnTpFfn`, `Qwen3MoeDpAttnEpFfn`,
-   `Qwen3MoeFp8DpAttnEpFfn`, `Qwen3VllmMoeDpAttnEpFfn`, `Glm52DsaMoe`, and
+   `Qwen3MoeFp8DpAttnEpFfn`, `Qwen3VllmMoeDpAttnEpFfn`, and
    `Glm52VllmDsaMoe`, plus the explicit NVFP4 provider variants.
    `Glm52VllmNvfp4DsaMoeSpeculative` requires the `Speculative` worker with the
    same draft depth; it has its own L4 identity. Dispatch is provider-first, *not* a

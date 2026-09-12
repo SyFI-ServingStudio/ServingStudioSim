@@ -675,7 +675,7 @@ def test_glm52_hand_derived_params_and_decode_goldens():
     assert label.bytes["kv"] == 195_469_056
 
 
-def test_glm52_segments_holdouts_and_unified_map_are_complete():
+def test_glm52_segments_and_holdouts_are_complete():
     model = load_model(GLM52)
     label = model.label(Workload.causal_lm(prefill=[(8, 0)], decode=[4096], sampled=2))
     names = {segment.name for segment in label.segments}
@@ -718,30 +718,6 @@ def test_glm52_segments_holdouts_and_unified_map_are_complete():
         )
         == 3_975_840
     )
-
-    map_path = (
-        Path(__file__).resolve().parents[1]
-        / "model"
-        / "work"
-        / "location_maps"
-        / "glm52_dsa_moe_unified.json"
-    )
-    location_map = json.loads(map_path.read_text())
-    mapped = [semantic for row in location_map["locations"] for semantic in row["semantics"]]
-    assert location_map["schema_version"] == 1
-    assert location_map["arch_types"] == ["glm52_dsa_moe"]
-    assert (
-        len(location_map["locations"])
-        == len({row["location"] for row in location_map["locations"]})
-        == 126
-    )
-    assert len(mapped) == len(set(mapped))
-    assert set(mapped) == names
-    assert all(
-        ".dispatch." not in row["location"] and ".combine." not in row["location"]
-        for row in location_map["locations"]
-    )
-
 
 # Real Qwen3.6-27B text_config: L=64, hidden=5120, intermediate=17408, vocab=248320,
 # head_dim=256, num_qo=24, num_kv=4, attn_output_gate; GDN: v_heads=48, k_heads=16,
@@ -1924,8 +1900,6 @@ def test_vllm_location_map_covers_every_non_communication_leaf():
     assert not any(location.endswith((".moe.dispatch", ".moe.combine")) for location in locations)
     # vLLM splits each routed-expert projection into a quantize and a grouped GEMM;
     # only the GEMM carries the semantic weight work.
-    native = json.loads((maps_dir / "glm52_dsa_moe_unified.json").read_text())
-    native_semantics = {row["location"]: row["semantics"] for row in native["locations"]}
     vllm_semantics = {row["location"]: row["semantics"] for row in location_map["locations"]}
     for tag in (
         "sparse_initial_index_share",
@@ -1934,7 +1908,7 @@ def test_vllm_location_map_covers_every_non_communication_leaf():
     ):
         for projection in ("gate_up", "down"):
             native_name = f"unified.body.{tag}.moe.routed_experts.{projection}"
-            assert vllm_semantics[f"{native_name}.gemm"] == native_semantics[native_name]
+            assert vllm_semantics[f"{native_name}.gemm"]
             assert vllm_semantics[f"{native_name}.input_quant"] == []
 
 

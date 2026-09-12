@@ -21,20 +21,19 @@ use crate::arch::contract::SpeculativeUnifiedModel;
 use crate::arch::model_cfg::ModelCfg;
 use crate::arch::moe_model_cfg::MoeModelCfg;
 use crate::arch::{
-    deepseek_v4_vllm, glm52_dsa_moe, glm52_sglang_nvfp4_tp_dsa_moe, glm52_vllm_dsa_moe,
-    glm52_vllm_nvfp4_dsa_moe, llama3_dense, llama3_dense_tp, llama3_dp_attn_tp_ffn, qwen36_local,
-    qwen3_attn_layerwise, qwen3_ffn_moe_layerwise, qwen3_fp8_ffn_moe_layerwise,
-    qwen3_moe_dp_attn_ep_ffn, qwen3_moe_fp8_dp_attn_ep_ffn, qwen3_vllm_moe_dp_attn_ep_ffn,
-    AttnLayerwiseModel, DeepseekV4ModelCfg, DeepseekV4VllmModel, DeepseekV4VllmParallel,
-    DenseParallel, DenseTpParallel, DpAttnTpFfnParallel, FfnLayerwiseModel, Glm52DsaMoeModel,
-    Glm52DsaMoeParallel, Glm52ModelCfg, Glm52MtpMode, Glm52SglangNvfp4TpDsaMoeModel,
-    Glm52SglangNvfp4TpDsaMoeParallel, Glm52VllmDsaMoeModel, Glm52VllmDsaMoeParallel,
-    Glm52VllmNvfp4DsaMoeModel, Glm52VllmNvfp4DsaMoeParallel, Glm52VllmNvfp4DsaMoeSpeculativeModel,
-    IterwiseUnifiedModel, Llama3DenseModel, Llama3DenseTpModel, Llama3DpAttnTpFfnModel,
-    Qwen36LocalModel, Qwen36LocalParallel, Qwen36ModelCfg, Qwen3AttnLayerwiseModel,
-    Qwen3AttnParallel, Qwen3FfnMoeLayerwiseModel, Qwen3FfnMoeParallel,
-    Qwen3Fp8FfnMoeLayerwiseModel, Qwen3Fp8FfnMoeParallel, Qwen3MoeDpAttnEpFfnModel,
-    Qwen3MoeFp8DpAttnEpFfnModel, Qwen3MoeFp8Parallel, Qwen3MoeParallel,
+    deepseek_v4_vllm, glm52_sglang_nvfp4_tp_dsa_moe, glm52_vllm_dsa_moe, glm52_vllm_nvfp4_dsa_moe,
+    llama3_dense, llama3_dense_tp, llama3_dp_attn_tp_ffn, qwen36_local, qwen3_attn_layerwise,
+    qwen3_ffn_moe_layerwise, qwen3_fp8_ffn_moe_layerwise, qwen3_moe_dp_attn_ep_ffn,
+    qwen3_moe_fp8_dp_attn_ep_ffn, qwen3_vllm_moe_dp_attn_ep_ffn, AttnLayerwiseModel,
+    DeepseekV4ModelCfg, DeepseekV4VllmModel, DeepseekV4VllmParallel, DenseParallel,
+    DenseTpParallel, DpAttnTpFfnParallel, FfnLayerwiseModel, Glm52ModelCfg, Glm52MtpMode,
+    Glm52SglangNvfp4TpDsaMoeModel, Glm52SglangNvfp4TpDsaMoeParallel, Glm52VllmDsaMoeModel,
+    Glm52VllmDsaMoeParallel, Glm52VllmNvfp4DsaMoeModel, Glm52VllmNvfp4DsaMoeParallel,
+    Glm52VllmNvfp4DsaMoeSpeculativeModel, IterwiseUnifiedModel, Llama3DenseModel,
+    Llama3DenseTpModel, Llama3DpAttnTpFfnModel, Qwen36LocalModel, Qwen36LocalParallel,
+    Qwen36ModelCfg, Qwen3AttnLayerwiseModel, Qwen3AttnParallel, Qwen3FfnMoeLayerwiseModel,
+    Qwen3FfnMoeParallel, Qwen3Fp8FfnMoeLayerwiseModel, Qwen3Fp8FfnMoeParallel,
+    Qwen3MoeDpAttnEpFfnModel, Qwen3MoeFp8DpAttnEpFfnModel, Qwen3MoeFp8Parallel, Qwen3MoeParallel,
     Qwen3VllmMoeDpAttnEpFfnModel, Qwen3VllmMoeParallel,
 };
 use crate::timing::routing::RoutingDistribution;
@@ -86,7 +85,7 @@ pub fn glm52_model_cfg(model_spec: &ModelSpec) -> Result<Glm52ModelCfg> {
 fn ensure_glm52_model_spec(model_spec: &ModelSpec) -> Result<()> {
     if model_spec.num_layers.is_some() || model_spec.sim_num_layers.is_some() {
         bail!(
-            "glm52_dsa_moe rejects num_layers/sim_num_layers overrides; the exact heterogeneous 78-layer schedule is required"
+            "GLM-5.2 architecture rejects num_layers/sim_num_layers overrides; the exact heterogeneous 78-layer schedule is required"
         );
     }
     Ok(())
@@ -898,51 +897,7 @@ pub fn deepseek_v4_vllm(
         .context("building DeepSeek V4 vLLM model (often a missing profile.db row)")
 }
 
-/// Build the GLM-5.2 local-attention + EP-MoE model. Both offline timing
-/// prediction and the unified `hp_unified` deployment consume this concrete
-/// path.
-#[allow(clippy::too_many_arguments)]
-pub fn glm52_dsa_moe(
-    model_spec: &ModelSpec,
-    ep_size: u16,
-    nvl_num_gpu: u16,
-    routing_kind: RoutingKind,
-    routing_seed: Option<u64>,
-    mtp_mode: Glm52MtpMode,
-    expert_popularity_file: Option<&str>,
-    gpu: &str,
-    name: &str,
-    bridge: &PerfApiBridge,
-) -> Result<Glm52DsaMoeModel> {
-    let model_cfg = glm52_model_cfg(model_spec).context("loading exact GLM-5.2 model config")?;
-    let routing = resolve_routing_source(
-        routing_kind,
-        routing_seed,
-        model_cfg.num_experts.get(),
-        ep_size,
-        // GLM's first three decoder layers are dense, so the MoE-layer count a
-        // popularity profile is keyed by is NOT `num_layers` (unlike Qwen,
-        // where every layer is sparse).
-        num_sparse_layers(&model_cfg),
-        model_cfg.router_top_k,
-        expert_popularity_file,
-    )?;
-    let parallel = Glm52DsaMoeParallel {
-        ep_size,
-        nvl_num_gpu,
-        gpu_name: gpu.to_string(),
-    };
-    let configs =
-        glm52_dsa_moe::build_configs(&model_cfg, &parallel, &routing, model_spec.fp8, mtp_mode)
-            .context("expanding GLM-5.2 architecture configs")?;
-    let resolved = glm52_dsa_moe::resolve_configs(&configs);
-    glm52_dsa_moe::build(name.to_string(), resolved, bridge)
-        .context("building GLM-5.2 DSA-MoE model (often a missing profile.db row)")
-}
-
-/// Build the GLM-5.2 model in vLLM kernel granularity. Same topology and
-/// parameters as [`glm52_dsa_moe`]; only the leaf cuts differ, so the two share
-/// the checkpoint identity and the layer-override refusal.
+/// Build the GLM-5.2 model in aligned vLLM kernel granularity.
 #[allow(clippy::too_many_arguments)]
 pub fn glm52_vllm_dsa_moe(
     model_spec: &ModelSpec,
@@ -1362,26 +1317,6 @@ pub fn build_iter_model(
             name,
             bridge,
         )?),
-        IterArchSel::Glm52DsaMoe {
-            model,
-            ep_size,
-            nvl_num_gpu,
-            routing,
-            routing_seed,
-            mtp_mode,
-            expert_popularity_file,
-        } => Box::new(glm52_dsa_moe(
-            model,
-            *ep_size,
-            *nvl_num_gpu,
-            *routing,
-            *routing_seed,
-            *mtp_mode,
-            expert_popularity_file.as_deref(),
-            gpu,
-            name,
-            bridge,
-        )?),
         IterArchSel::Glm52VllmDsaMoe {
             model,
             ep_size,
@@ -1495,10 +1430,9 @@ pub fn build_speculative_iter_model(
 /// [`build_iter_model`] counterpart for the attn arch. The model-only seam the
 /// offline `timing-predict` (attn arch) path uses: it drives [`AttnLayerwiseModel`]
 /// directly, no worker/flow. The `afd` deployment does NOT box — it calls the
-/// concrete [`qwen3_attn`] builder to keep its worker factory monomorphized. Only
-/// the qwen3 arch has a layer-wise predict path; the llama3 attn variant bails
-/// (mirrors `AfdDeployment`). Returning `Box<dyn>` (not `impl`) is what lets a
-/// second buildable attn arch land as one more match arm without a signature break.
+/// concrete [`qwen3_attn`] builder to keep its worker factory monomorphized.
+/// Returning `Box<dyn>` (not `impl`) lets another implemented attention arch be
+/// added without a signature break.
 pub fn build_attn_model(
     sel: &AttnArchSel,
     gpu: &str,
@@ -1510,16 +1444,11 @@ pub fn build_attn_model(
             model,
             attn_tp_size,
         } => Box::new(qwen3_attn(model, *attn_tp_size, gpu, name, bridge)?),
-        AttnArchSel::Llama3AttnTp { .. } => bail!(
-            "timing-predict attn: only the qwen3_attn_tp arch has a layer-wise \
-             predict path (got llama3_attn_tp)"
-        ),
     })
 }
 
 /// Build ONE AFD ffn-side model from its selector, boxed as `dyn` — the ffn
-/// counterpart to [`build_attn_model`]. Only the qwen3 arch has a layer-wise
-/// predict path; the deepseek ffn variant bails (mirrors `AfdDeployment`).
+/// counterpart to [`build_attn_model`].
 pub fn build_ffn_model(
     sel: &FfnArchSel,
     gpu: &str,
@@ -1563,10 +1492,6 @@ pub fn build_ffn_model(
             name,
             bridge,
         )?),
-        FfnArchSel::DeepseekFfnMoe { .. } => bail!(
-            "timing-predict ffn: only qwen3_ffn_moe and qwen3_fp8_ffn_moe have \
-             layer-wise predict paths (got deepseek_ffn_moe)"
-        ),
     })
 }
 
@@ -1964,17 +1889,17 @@ mod tests {
             Glm52MtpMode::FullIndex,
             Glm52MtpMode::IndexShare,
         ] {
-            let parallel = Glm52DsaMoeParallel {
+            let parallel = Glm52VllmDsaMoeParallel {
                 ep_size: 16,
                 nvl_num_gpu: 8,
                 gpu_name: "NVIDIA H200".to_string(),
             };
             let routing = resolve_routing(RoutingKind::Random, Some(19), 256).unwrap();
             let configs =
-                glm52_dsa_moe::build_configs(&model, &parallel, &routing, false, mode).unwrap();
+                glm52_vllm_dsa_moe::build_configs(&model, &parallel, &routing, false, mode)
+                    .unwrap();
             assert_eq!(configs.parallel.ep_size, 16);
             assert_eq!(configs.parallel.nvl_num_gpu, 8);
-            assert_eq!(configs.moe_dispatch.routing, routing);
             assert_eq!(configs.mtp_mode, mode);
             assert_eq!(configs.mtp_attention.is_some(), mode != Glm52MtpMode::Off);
             assert_eq!(

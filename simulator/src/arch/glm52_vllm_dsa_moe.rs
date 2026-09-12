@@ -1,17 +1,15 @@
 //! `glm52_vllm_dsa_moe` — GLM-5.2 iter-wise architecture in **vLLM kernel
 //! granularity**, for VibeSim-vs-vLLM alignment.
 //!
-//! Structurally identical to [`super::glm52_dsa_moe`]: attention is TP1 and
-//! independently replicated over the EP ranks; decoder layers 0--2 execute the
-//! dense FFN and a full DSA indexer; layers 3--5 reuse the layer-2 index; layers
-//! 6--77 repeat a four-layer cadence containing one full-index layer and three
-//! IndexShare layers; shared-expert compute is conservatively serialized with
-//! routed-expert work.
+//! Attention is TP1 and independently replicated over the EP ranks. Decoder
+//! layers 0--2 execute the dense FFN and a full DSA indexer; layers 3--5 reuse
+//! the layer-2 index; layers 6--77 repeat a four-layer cadence containing one
+//! full-index layer and three IndexShare layers. Shared-expert compute is
+//! conservatively serialized with routed-expert work.
 //!
 //! Sparse-MoE communication is pure EP and is priced by the **profiled**
 //! flashinfer MNNVL all-to-all (`moe_alltoall`, plus `moe_alltoall_prepare` for
-//! the metadata pass), not by the simulated `p2p_intra`/`p2p_inter` byte model
-//! the native graph uses. That buys the real kernel's fan-out and contention.
+//! the metadata pass). That captures the real kernel's fan-out and contention.
 //!
 //! The transfer leaf is keyed by two row counts, `(max_send_rows,
 //! max_recv_rows)`, so both imbalances reach it: how the tokens are spread over
@@ -22,35 +20,26 @@
 //! whose key is the token count alone; a uniformly-drawn benchmark under-reads a
 //! real skewed layer there by ~9%, which is ~3% of the MoE communication budget.
 //!
-//! This is a **separate static graph**, not a flag on the native arch -- the same
-//! split Qwen uses (`qwen3_moe_dp_attn_ep_ffn` / `_fp8_` /
-//! `qwen3_vllm_moe_dp_attn_ep_ffn`). The two files diverge only in leaf
-//! granularity, and keeping them apart is what stops either graph from growing
-//! `if measuring_vllm` branches.
-//!
-//! Divergences from the native graph, each traced to measured evidence recorded
-//! in `doc/alignment/glm52_dp8_ep8_report.md`:
+//! The leaf boundaries follow measured evidence recorded in
+//! `doc/alignment/glm52_dp8_ep8_report.md`:
 //!   - **fp8 activation quantisation is an explicit leaf.** vLLM launches
 //!     `scale_1x128_kernel<bf16, fp8_e4m3, float>` before every dense fp8 GEMM
 //!     (411 launches/iteration, 0.758 ms/iteration = 1.9% of measured forward
-//!     kernel time). The native graph has no such leaf, because its L1 GEMM
-//!     runner quantises outside the timed closure
-//!     (`profiling/runners/gemm/deepgemm.py`) -- so the cost is simply absent
-//!     there, not folded in.
+//!     kernel time).
 //!
 //! The checkpoint identity (`Glm52ModelCfg`) and MTP identity (`Glm52MtpMode`)
-//! are shared with the native graph rather than re-parsed here: they describe the
-//! checkpoint, which does not change with the measurement viewpoint.
+//! are shared across GLM execution graphs because they describe the checkpoint,
+//! which does not change with the serving framework.
 //!
 //! The checkpoint advertises a 1,048,576-token context. The accepted L1 timing
-//! domain is deliberately capped at 131,072 tokens, as in the native graph.
+//! domain reaches that full context and fails closed beyond it.
 
 use std::sync::Arc;
 
 use anyhow::Result;
 
 use crate::arch::contract::{IterwiseUnifiedModel, UnifiedArchInput};
-use crate::arch::glm52_dsa_moe::{Glm52ModelCfg, Glm52MtpMode};
+use crate::arch::glm52_model_cfg::{Glm52ModelCfg, Glm52MtpMode};
 use crate::common::Fabric;
 use crate::op::Op;
 use crate::timing::bridge::DType;
@@ -1941,7 +1930,7 @@ mod tests {
     }
 
     fn model() -> Glm52ModelCfg {
-        crate::arch::glm52_dsa_moe::parse_model_json(&exact_json_value().to_string()).unwrap()
+        crate::arch::glm52_model_cfg::parse_model_json(&exact_json_value().to_string()).unwrap()
     }
 
     fn parallel(ep_size: u16) -> Glm52VllmDsaMoeParallel {
@@ -2369,8 +2358,8 @@ mod tests {
         // measured kernel templates do:
         //   22 per EP rank -- this graph's new dense-GEMM quants (the 411
         //      `scale_1x128<bf16, fp8_e4m3, float>` launches);
-        //    6 per EP rank -- the routed grouped-GEMM quants the native graph
-        //      already models (the 150 `scale_1x128<(bool)0, ...>` launches),
+        //    6 per EP rank -- the routed grouped-GEMM quants already present in
+        //      the base FP8 graph (the 150 `scale_1x128<(bool)0, ...>` launches),
         //      contributed by `expert_slots` in the three sparse variants.
         let dense_gemm_quants_per_rank = dense + sparse_full + sparse_share + sparse_share;
         let routed_quants_per_rank = 3 * 2;
@@ -2390,11 +2379,9 @@ mod tests {
         assert_eq!(3 + 3 + 18 * (1 + 3), 78);
         assert_eq!(FULL_INDEX_LAYERS.len(), 21);
         assert_eq!(78 - FULL_INDEX_LAYERS.len(), 57);
-        // BF16 counts match the native graph exactly: with no FP8 GEMM there
-        // is nothing to quantise, so this graph adds no leaves.
-        // Each sparse-layer variant carries two leaves the native graph has no
-        // equivalent of: combine's zero fill and its top-k reduction, split out
-        // of the profiled transfer so that leaf's cache stays two-dimensional.
+        // With no FP8 GEMM there is nothing to quantise. Each sparse-layer
+        // variant additionally carries combine's zero fill and top-k reduction,
+        // split out so the profiled transfer cache stays two-dimensional.
         // Three sparse variants without MTP, four with it.
         assert_eq!(
             expected_slot_count(8, false, Glm52MtpMode::Off),
@@ -2411,8 +2398,8 @@ mod tests {
         // FP8 adds the vLLM activation-quantisation leaves: five per layer
         // variant (attention 3 + FFN 2), plus a sixth on the two variants that
         // run an indexer (its q_proj). That is 22 x ep = 176 more than the
-        // native graph's 1_074. See `doc/alignment/glm52_dp8_ep8_report.md`
-        // section 4.3, which decodes each measured launch by its GEMM shape.
+        // 1,074-leaf base census. See `doc/alignment/glm52_dp8_ep8_report.md`
+        // section 4.3, which identifies each measured launch by its GEMM shape.
         assert_eq!(
             expected_slot_count(8, true, Glm52MtpMode::Off),
             1_074 + 176 + 15 + 3 * 2
@@ -2573,7 +2560,7 @@ mod tests {
 
     #[test]
     fn production_l4_uses_only_the_labeled_max_constructor() {
-        let production = include_str!("glm52_dsa_moe.rs")
+        let production = include_str!("glm52_vllm_dsa_moe.rs")
             .split("#[cfg(test)]")
             .next()
             .expect("production source precedes tests");

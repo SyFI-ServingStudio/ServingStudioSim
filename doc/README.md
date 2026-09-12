@@ -51,6 +51,9 @@ infrastructure.
   tells you which directory implements which layer.
 - **[invariants.md](invariants.md)** — the cross-cutting rules every layer upholds,
   in one place.
+- **[architecture_compatibility.md](architecture_compatibility.md)** — supported
+  architecture selectors, parallel-layout coverage, and migration rules for
+  retired selectors.
 - **[detailed_design/](detailed_design/)** — one concise document per layer
   (`L1.md` … `L7.md`): its role, boundary, the directory and key types that
   implement it, and its own invariants.

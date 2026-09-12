@@ -449,10 +449,8 @@ pools:
         };
         assert_eq!(a.pools.attn.groups[0].replicas, 8);
         assert_eq!(a.pools.ffn.groups[0].replicas, 1);
-        match &a.pools.attn.groups[0].arch {
-            AttnArchSel::Qwen3AttnTp { attn_tp_size, .. } => assert_eq!(*attn_tp_size, 4),
-            other => panic!("expected qwen3_attn_tp, got {other:?}"),
-        }
+        let AttnArchSel::Qwen3AttnTp { attn_tp_size, .. } = &a.pools.attn.groups[0].arch;
+        assert_eq!(*attn_tp_size, 4);
         match &a.pools.ffn.groups[0].arch {
             FfnArchSel::Qwen3FfnMoe {
                 attn_tp_size,
