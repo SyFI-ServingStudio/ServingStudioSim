@@ -8,8 +8,7 @@ repro metadata, spawning runs in parallel, and kicking off post-run analysis. It
 contains **no simulation logic**; the Rust binary does the actual work.
 
 This is the practical, code-matching reference. For the layer overview see
-`doc/detailed_design/L7.md`; the archived config-tree design intent is
-`old-doc/new-interface-design.md`. If this file disagrees with the code, the code wins — open an issue.
+`doc/detailed_design/L7.md`. If this file disagrees with the code, the code wins.
 
 ## What it exposes / what it requires
 

@@ -1,6 +1,6 @@
 //! `simulator` binary entry — clap top-level CLI and subcommand dispatch.
 //!
-//! Surface (new-interface-design §13.1): each run-like subcommand takes a path
+//! Per the L7 design, each run-like subcommand takes a path
 //! to ONE structured config file (YAML/JSON), which the launcher writes:
 //!   - `run <config>`              — run one sim
 //!   - `build-cache-only <config>` — prebuild profile.db, no sim

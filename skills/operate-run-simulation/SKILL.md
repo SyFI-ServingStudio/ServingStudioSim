@@ -21,11 +21,9 @@ For the *offline* cost predictor (explicit batch shapes, no discrete-event sim /
 workload / pools) use `operate-run-timing-predict` instead — this skill is only
 for a real deployment run driven by a workload trace.
 
-Repo root:
-- `/m-coriander/coriander/kanzhu/VibeSim_workspace/VibeSim`
-
-Canonical logs root:
-- `/m-coriander/coriander/kanzhu/VibeSim_workspace/VibeSim/logs`
+Resolve the repository root from the active checkout with
+`git rev-parse --show-toplevel`. Its `logs/` directory is the canonical logs
+root for that checkout.
 
 Launcher (run from the repo root):
 - `uv run python -m launcher <preset>.yaml [--dry-run] [--override path=value ...]`
@@ -83,7 +81,7 @@ If the user did not give a name, ask for one before proceeding.
 8. **Dry-run first** — validate + expand without launching, and inspect the run
    plan and per-run `log_dir`s:
    ```bash
-   cd /m-coriander/coriander/kanzhu/VibeSim_workspace/VibeSim
+   cd "$(git rev-parse --show-toplevel)"
    uv run python -m launcher logs/<experiment-name>/preset.yaml --dry-run
    ```
    Confirm the `[plan] N run(s)` count and that each expanded `log_dir` is
@@ -137,7 +135,7 @@ at eval. The default set is the arch's const-default. To tailor it per kernel:
    entry per kernel role, pre-filled with the current default and annotated
    `kind | dtype | options | shape`:
    ```bash
-   cd /m-coriander/coriander/kanzhu/VibeSim_workspace/VibeSim
+   cd "$(git rev-parse --show-toplevel)"
    uv run python -m launcher logs/<experiment-name>/preset.yaml \
      --emit-backends logs/<experiment-name>/backends.yaml
    ```

@@ -1,4 +1,4 @@
-//! Structured run config (L7 assembly) — new-interface-design §6.
+//! Structured run config (L7 assembly).
 //!
 //! These are the top-level types a concrete config file deserializes into, and
 //! the run-global specs they embed. They live with the deployment layer because

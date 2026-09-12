@@ -103,8 +103,8 @@ pub struct Llama3DpAttnTpFfnModel {
 /// This arch's numeric parallel input: the attention TP degree (`attn_tp_size`,
 /// heads sharded) and the FFN TP degree (`ffn_tp_size`, hidden/intermediate
 /// sharded), plus the `gpu_name` every kernel lookup keys on (L4 §3.8). The DP
-/// degree is derived (`ffn_tp_size / attn_tp_size`). Per new-interface-design §13:
-/// each arch owns the numeric parallel struct it needs.
+/// degree is derived (`ffn_tp_size / attn_tp_size`). Each arch owns the numeric
+/// parallel struct it needs.
 #[derive(Clone, Debug)]
 pub struct DpAttnTpFfnParallel {
     pub attn_tp_size: u16,

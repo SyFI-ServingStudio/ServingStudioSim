@@ -1,4 +1,4 @@
-"""Load the Rust-authoritative deployment schema (new-interface-design §11).
+"""Load the Rust-authoritative deployment schema (L7 design).
 
 Per L7 design / INV-7, per-param data lives in the Rust binary, not in Python.
 `cargo_build()` (see `launcher.exec`) runs `simulator list-params` after a
@@ -166,7 +166,7 @@ def _merge_backends_file(preset: dict, source: str) -> dict:
         preset["backends"] = _unflatten_backends(flat, "backends")
     return preset
 
-# Fixed skeleton key sets (the uniform pool shape — new-interface-design §8).
+# Fixed skeleton key sets for the uniform pool shape (L6/L7 design).
 _POOL_KEYS = frozenset({"placement", "groups"})
 _GROUP_FLAT = ("gpu", "replicas")  # group_common fields (looked up on each group)
 _GROUP_KEYS = frozenset({"gpu", "replicas", "arch", "worker"})

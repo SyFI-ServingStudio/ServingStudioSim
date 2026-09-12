@@ -7,9 +7,9 @@ description: "Use when planning or estimating a new VibeSim worker combination, 
 
 Apply these rules to production L5 worker changes. Treat
 `doc/detailed_design/L5.md` as the canonical design and
-`simulator/src/worker/README.md` as the production tree guide. Old reference or
-sketch code may explain behavior only when the canonical design and production
-code leave a detail unclear; it never overrides them.
+`simulator/src/worker/README.md` as the production tree guide. Git history may
+explain behavior only when the canonical design and production code leave a
+detail unclear; it never overrides them.
 
 This skill specializes `dev-file-design-review` for L5. Use the stricter rule
 when the two overlap.

@@ -3,7 +3,7 @@
 //!
 //! `build` reads the structured `UnifiedConfig`: a single pool (`main`) with one
 //! homogeneous group. The arch is selected by its explicit tag (NO `tp_size`
-//! dispatch — provider-first, new-interface-design §4). Wired arms are
+//! dispatch; see the L4/L6 design). Wired arms are
 //! `llama3_dense` + `barebone`, `llama3_dense_tp` + `barebone`,
 //! `llama3_dp_attn_tp_ffn` + `hp_unified`, and `qwen3_moe_dp_attn_ep_ffn` +
 //! `hp_unified`, `glm52_dsa_moe` + `hp_unified`, and

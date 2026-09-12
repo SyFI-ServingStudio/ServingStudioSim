@@ -30,7 +30,7 @@ serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 # Structured run-config input (YAML is a JSON superset → one loader path). Note:
 # serde_yaml is archived upstream but stable; it is the JSON-superset parser the
-# launcher writes configs for (new-interface-design §12.5).
+# launcher writes configs for (L7 design).
 serde_yaml = "0.9"
 anyhow = "1"
 thiserror = "2"

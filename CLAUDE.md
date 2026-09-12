@@ -4,9 +4,8 @@ Discrete-event simulator for ML serving/training workloads. Rust core
 (`simulator/`) + Python L1 profiling/launcher, bridged via PyO3. Answer user questions using Chinese. Draft plans also in Chinese. Write code comments in English.
 
 `doc/README.md` is the current design record — the seven-layer stack, one
-document per layer, the invariants, and the analyzer contract. `old-doc/` is the
-archived rationale and cost math, not the current picture. Per-module `README.md`
-files sit next to the code and win over `doc/` when they disagree.
+document per layer, the invariants, and the analyzer contract. Per-module
+`README.md` files sit next to the code and win over `doc/` when they disagree.
 
 ## Environment (read first)
 

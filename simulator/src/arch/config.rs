@@ -1,5 +1,5 @@
 //! Arch (L4) config surface — the model-arch *selectors*, co-located with the L4
-//! implementations they pick (new-interface-design §2 / §4).
+//! implementations they pick (L4 design).
 //!
 //! Each selector is a serde tagged enum (`#[serde(tag = "type")]`): choosing the
 //! tag is the only way that variant's params appear — no global union,

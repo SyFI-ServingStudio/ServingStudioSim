@@ -8,8 +8,7 @@ orchestrator (1:1), the pool topology, and each pool's contract class (which arc
 scheduling logic of its own.
 
 This is the practical, code-matching reference; the code is the ground truth.
-For the layer overview see `doc/detailed_design/L6.md`; the archived config-tree
-design intent is `old-doc/new-interface-design.md`.
+For the layer overview see `doc/detailed_design/L6.md`.
 
 ## The `Deployment` trait + dispatch
 

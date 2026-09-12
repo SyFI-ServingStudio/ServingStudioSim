@@ -2,8 +2,8 @@
 
 ## Agent Input
 
-Work in `/m-coriander/coriander/kanzhu/VibeSim_workspace/VibeSim` with no prior
-knowledge beyond repo-local instructions. Use the appropriate repo-local skill
+Work in the repository root supplied by the test harness with no prior knowledge
+beyond repo-local instructions. Use the appropriate repo-local skill
 to profile the existing L1 kernel `single_gemm` with backend `torch`.
 
 Use exactly one spec:

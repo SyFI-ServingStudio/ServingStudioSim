@@ -1,7 +1,7 @@
 //! Deployment registry — each deployment deserializes a structured run config
 //! and assembles the L6b `Flow` it represents.
 //!
-//! Per new-interface-design §2/§10: the `deployment` tag (top-level serde tag on
+//! Per the L6 design, the `deployment` tag (top-level serde tag on
 //! `config::RunConfig`) fixes the orchestrator (L6, 1:1), the topology, and each
 //! pool's contract class. A `Deployment` impl turns its concrete config into a
 //! `Box<dyn Flow>`; the per-arch/worker providers inside the config carry their

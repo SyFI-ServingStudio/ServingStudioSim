@@ -1,4 +1,4 @@
-"""Concrete config tree → Rust binary argv (new-interface-design §13.1).
+"""Concrete config tree → Rust binary argv (L7 design).
 
 Each run-like subcommand (`run` / `build-cache-only` / `dry-run`) takes a path
 to ONE structured config file. This module strips the launcher-internal keys,

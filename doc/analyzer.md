@@ -604,9 +604,7 @@ inferred.
 
 ## Relationship to other docs
 
-This document supersedes the archived `old-doc/analyzer.md` (kept only as design
-history in a separate repo; it is not maintained). For the code-matching module
-reference and the canonical per-subject catalog, see
+For the code-matching module reference and the canonical per-subject catalog, see
 [`analyzer/README.md`](../analyzer/README.md); for where the analyzer sits in the
 layer stack, see [architecture.md](architecture.md); for the step-by-step of adding
 a metric, use the `add-analyzer-subject` skill.

@@ -1,4 +1,4 @@
-"""L7 launcher unit tests (structured config interface, new-interface-design §11).
+"""L7 launcher unit tests for the structured config interface.
 
 Most tests run against an inline `Registry` fixture (deterministic, no build
 dependency); a few integration tests load the real Rust-generated schema /
