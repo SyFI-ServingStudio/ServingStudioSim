@@ -221,7 +221,7 @@ pub struct Glm52VllmNvfp4DsaMoeResolved {
     pub mtp_head: Option<Glm52MtpHeadLocalWorkletResolved>,
 }
 
-fn fit_failed(reason: impl Into<String>) -> BuildError {
+pub(crate) fn fit_failed(reason: impl Into<String>) -> BuildError {
     BuildError::FitFailed {
         kind: ARCH_KIND,
         reason: reason.into(),
@@ -1222,9 +1222,9 @@ impl Glm52MtpPass {
 /// MTP pass to this section; the speculative model appends a draft stage that
 /// runs a different number of times and bills different shapes. Neither is a
 /// special case of the other, so neither owns the other -- they own this.
-struct Glm52TargetForward {
+pub(crate) struct Glm52TargetForward {
     name: String,
-    ep_size: u16,
+    pub(crate) ep_size: u16,
     embedding: Op<ElementwiseKernel>,
     embedding_allreduce_fallback: Op<AllReduceKernel>,
     embedding_allreduce_fusion: Op<AllReduceFusionKernel>,
@@ -1353,7 +1353,7 @@ pub struct Glm52VllmNvfp4DsaMoeSpeculativeModel {
 }
 
 impl Glm52TargetForward {
-    fn build(
+    pub(crate) fn build(
         name: String,
         resolved: &Glm52VllmNvfp4DsaMoeResolved,
         bridge: &PerfApiBridge,
@@ -1587,7 +1587,7 @@ impl Glm52TargetForward {
     /// own tail -- the MTP pass or the draft stage -- into the same builder and
     /// label the root for itself. The slot order is the order of this vector,
     /// so it is also the shared prefix of both models' cost logs.
-    fn compile_children(&self, builder: &mut CostTreeBuilder) -> Vec<CostNode> {
+    pub(crate) fn compile_children(&self, builder: &mut CostTreeBuilder) -> Vec<CostNode> {
         let embedding = labeled_max(
             format!("{}.main.embedding [Max over TP ranks]", self.name),
             (0..self.ep_size)
@@ -1683,7 +1683,7 @@ impl Glm52TargetForward {
     ///
     /// The slot order matches `compile_children`, so a model that appends its
     /// own tail after calling this fills the same prefix either way.
-    fn eval(&self, batch: &NormalizedBatch, ev: &mut Evaluator) {
+    pub(crate) fn eval(&self, batch: &NormalizedBatch, ev: &mut Evaluator) {
         let group = &batch.groups[0];
         for _ in 0..self.ep_size {
             eval_atomic_or_zero(
@@ -1989,23 +1989,25 @@ impl SpeculativeUnifiedModel for Glm52VllmNvfp4DsaMoeSpeculativeModel {
 }
 
 #[derive(Clone, Debug)]
-struct NormalizedGroup {
-    batch_tokens: u32,
-    /// Requests in this group, prefilling and decoding alike. A draft pass
-    /// forwards exactly this many rows, one endpoint per request.
-    request_count: u32,
+pub(crate) struct NormalizedGroup {
+    pub(crate) batch_tokens: u32,
+    /// Requests in this group, prefilling and decoding alike. An MTP draft pass
+    /// forwards exactly this many rows, one endpoint per request. A
+    /// block-parallel proposer forwards `1 + draft_tokens` rows per request
+    /// instead -- see `arch::glm53_vllm_nvfp4_dsa_moe_dflash2`.
+    pub(crate) request_count: u32,
     /// Rows the sampler needs logits for: one per prefill request, and every
     /// decode query row, because a verify step scores all of them. This exceeds
     /// `request_count` by the drafted positions.
     logits_rows: u32,
     /// One entry per request, at that request's own KV length.
-    endpoint_context_lens: Vec<u32>,
+    pub(crate) endpoint_context_lens: Vec<u32>,
     attention_input: VllmGlm52DsaAttnLocalWorkletInput,
 }
 
 #[derive(Clone, Debug)]
-struct NormalizedBatch {
-    groups: Vec<NormalizedGroup>,
+pub(crate) struct NormalizedBatch {
+    pub(crate) groups: Vec<NormalizedGroup>,
     total_tokens: u32,
 }
 
@@ -2159,7 +2161,7 @@ fn normalize_input(
     })
 }
 
-fn normalize_speculative_input(
+pub(crate) fn normalize_speculative_input(
     input: &SpeculativeArchInput,
     draft_tokens: u32,
     max_model_len: u32,
@@ -2387,7 +2389,7 @@ fn expected_speculative_slot_count(
     expected_slot_count(ep_size) + expected_mtp_pass_slots(ep_size, false) + recurrent
 }
 
-fn state_bytes_per_token(
+pub(crate) fn state_bytes_per_token(
     ep_size: u16,
     mtp_mode: Glm52MtpMode,
 ) -> std::result::Result<u64, BuildError> {
