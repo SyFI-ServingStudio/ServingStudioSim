@@ -1944,3 +1944,27 @@ def test_qwen3_moe_fp8_quantizes_experts_but_not_the_router():
         embedding = next(seg for seg in label.segments if seg.name == "embedding")
         assert embedding.compute_dtype == "bf16"
         assert embedding.bytes == min(1_000_000, model.vocab) * model.hidden * 2
+
+
+GLM53_NVFP4 = Path(__file__).resolve().parents[1] / "model" / "config" / "glm53_nvfp4.json"
+
+
+def test_glm53_target_is_dimensionally_the_glm52_graph():
+    """GLM-5.3's target reuses GLM-5.2's arch, so the two configs must stay identical.
+
+    The published checkpoints agree on every field this repo reads: the 78-layer
+    stack, the 21-full/57-shared indexer schedule, the 3-dense/75-sparse MLP
+    schedule, and the MoE and MLA dimensions. Only `transformers_version`
+    differs. Their quantization configs are encoded differently but describe the
+    same scheme -- routed experts in layers 3..77 quantized, attention, shared
+    experts, the router gate, the dense layers, and the MTP layer's experts not.
+    A future revision that breaks this has to be caught here, because the
+    speculative arch simply points at whichever config the preset names.
+    """
+    glm52 = json.loads(GLM52_NVFP4.read_text())
+    glm53 = json.loads(GLM53_NVFP4.read_text())
+    assert set(glm52) == set(glm53)
+    assert {k: v for k, v in glm53.items() if k != "transformers_version"} == {
+        k: v for k, v in glm52.items() if k != "transformers_version"
+    }
+    assert compute_parameter_counts(GLM53_NVFP4) == compute_parameter_counts(GLM52_NVFP4)
