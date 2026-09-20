@@ -13,6 +13,7 @@ pub mod attn_block_tp;
 pub mod attn_local;
 pub mod bf16_moe_local;
 pub mod deepseek_v4_attention_local;
+pub mod dflash2_context_kv_local;
 pub mod deepseek_v4_moe_expert_compute_local;
 pub mod deepseek_v4_moe_router_local;
 pub mod deepseek_v4_shared_expert_local;
@@ -66,6 +67,10 @@ pub use deepseek_v4_attention_local::{
     DeepseekV4AttentionEntry, DeepseekV4AttentionLocalWorklet,
     DeepseekV4AttentionLocalWorkletConfig, DeepseekV4AttentionLocalWorkletInput,
     DeepseekV4AttentionLocalWorkletResolved,
+};
+pub use dflash2_context_kv_local::{
+    Dflash2ContextKvLocalWorklet, Dflash2ContextKvLocalWorkletConfig,
+    Dflash2ContextKvLocalWorkletInput, Dflash2ContextKvLocalWorkletResolved,
 };
 pub use deepseek_v4_moe_expert_compute_local::{
     DeepseekV4MoeExpertComputeLocalWorklet, DeepseekV4MoeExpertComputeLocalWorkletConfig,
