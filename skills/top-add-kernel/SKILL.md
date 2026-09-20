@@ -33,16 +33,23 @@ completion.
 
 A split table usually names more than one *new dedicated kernel*. They are
 independent work — different kinds, different runner files, different
-`profile.db` tables — so run them in parallel. Who fans out depends on the role
-you are in:
+`profile.db` tables — so run them in parallel, **in batches of 3**: launch three
+subagents, wait for that batch to close out, then launch the next three. Who
+fans out depends on the role you are in:
 
 - **Only agent** (nobody above you, nobody below). Launch one subagent per
-  kernel, in parallel; each runs this skill end to end for its own kernel. Do
-  not walk the list yourself.
+  kernel, three at a time; each runs this skill end to end for its own kernel.
+  Do not walk the list yourself.
 - **Orchestrator.** Give the implementer the **whole set in one brief**. Issuing
-  one kernel per brief serializes work that has no ordering constraint.
-- **Implementer handed the set.** Fan out again — one subagent per kernel, in
-  parallel. Receiving several kernels is not an instruction to do them in order.
+  one kernel per brief serializes work that has no ordering constraint. The
+  implementer owns the batching, not you.
+- **Implementer handed the set.** Fan out again — one subagent per kernel, three
+  at a time. Receiving several kernels is not an instruction to do them in order.
+
+Three, not all of them: each agent wants a GPU for its profiling submission and
+its own worktree build, so an unbounded fan-out contends for both and you get
+measurements taken on a busy card. Three also keeps the batch small enough to
+verify before the next one starts.
 
 Before any fan-out, take the reuse verdict below **once for the whole set**: two
 agents must not independently mint the same new kind. Then sequence only what

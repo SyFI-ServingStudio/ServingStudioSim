@@ -67,7 +67,7 @@ top-add-new-arch - add a whole model architecture end to end (capture → split 
 ├── impl-add-model-work-label - add the independent model.work label and semantic location maps for R6/R7 (Phase 4, before Validate)
 └── top-align-with-framework - Phase 5: close the loop on the same capture; ranks which placeholder to promote next
 
-top-add-kernel - add an L1 kernel end to end (several at once: fan out one subagent per kernel)
+top-add-kernel - add an L1 kernel end to end (several at once: fan out one subagent per kernel, 3 at a time)
 ├── orchestrator-add-kernel-to-python-profile - plan and verify Python profiling
 │   ├── dev-explore-kernel - search vLLM/SGLang/FlashInfer for a source to wrap (shared)
 │   └── impl-register-kernel - register a Python profiler kind or backend
