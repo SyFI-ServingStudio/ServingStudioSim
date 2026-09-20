@@ -29,6 +29,33 @@ Each implementer brief must be a narrow leaf task that names the exact `impl-*`
 skill to use and the evidence required for you, the orchestrator, to verify
 completion.
 
+## Several kernels at once
+
+A split table usually names more than one *new dedicated kernel*. They are
+independent work — different kinds, different runner files, different
+`profile.db` tables — so run them in parallel. Who fans out depends on the role
+you are in:
+
+- **Only agent** (nobody above you, nobody below). Launch one subagent per
+  kernel, in parallel; each runs this skill end to end for its own kernel. Do
+  not walk the list yourself.
+- **Orchestrator.** Give the implementer the **whole set in one brief**. Issuing
+  one kernel per brief serializes work that has no ordering constraint.
+- **Implementer handed the set.** Fan out again — one subagent per kernel, in
+  parallel. Receiving several kernels is not an instruction to do them in order.
+
+Before any fan-out, take the reuse verdict below **once for the whole set**: two
+agents must not independently mint the same new kind. Then sequence only what
+genuinely depends — a new backend of a kind another agent is still creating.
+
+Two or more agents writing one repo need `dev-orchestrate-parallel-subagents`:
+a git worktree each, or they clobber each other on `mod.rs`, `__init__.py`, and
+the registry. Read it before launching.
+
+This does not override `top-add-new-arch`'s largest-share-first stop rule. That
+rule decides **which** kernels are worth building; the ones that clear it go in
+parallel, not one after another.
+
 ## Steps
 
 Before choosing either path, require a reuse verdict. Compare the nearest

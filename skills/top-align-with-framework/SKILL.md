@@ -32,6 +32,23 @@ diagnosing loose-level gaps first wastes effort:
 A clean tight level under a dirty loose level points at structure (scheduling,
 async), not the cost model.
 
+## Two ways you get called
+
+Usually you are the check on an existing arch: something looks off, and you find
+out what. But you are also the closing step of `top-add-new-arch`, which captures
+a real run *before* writing any code (its Phase 0) and builds the arch's kernels
+in measured-duration order. In that case the same capture comes back to you, and
+Check 1's per-kernel deviation ranking decides what happens next: the largest
+remaining gap names the `elementwise` placeholder that should be promoted to a
+real kernel. Nothing about the checks changes; where the fix goes does.
+
+For a newly built arch, read the two coverage findings as split verdicts rather
+than labeling misses. A large simulated slot with no measured kernel usually means
+an op was **folded** into a neighbor that does not actually fuse it. A large
+unmapped measured kernel usually means the split **missed an op** outright. Both
+route back to `top-split-model-into-kernels` to re-decide that op's home — after
+you have confirmed the labeling is right, per the guilty-until-proven rule below.
+
 ## Step 0 — Run the alignment
 
 Route to the **Align ServingStudio Sim to framework** side of `operate-run-alignment`. It produces the artifacts every
@@ -181,7 +198,10 @@ TTFT/TPOT/throughput. Then route the fix:
   `operate-align-moe-kernel`;
 - a wrong-shape or missing kernel cost → `impl-validate-kernel-cache` /
   `top-add-kernel`;
-- a mis-mapped or missing simulated slot → `operate-run-alignment`'s labeling.
+- a mis-mapped or missing simulated slot → `operate-run-alignment`'s labeling;
+- an op the arch never modeled, or folded into a kernel that does not fuse it →
+  `top-split-model-into-kernels` to re-decide its home, then `top-add-new-arch`'s
+  L1 step to build it.
 
 Stop and return to the user when a deviation's cause is genuinely ambiguous
 (model gap vs thermal artifact) rather than guessing — the attribution decides
