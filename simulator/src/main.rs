@@ -224,17 +224,55 @@ fn cmd_run(config: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `build-cache-only` — enable JIT profiling, run the L4 cascade so missing
-/// kernels are profiled into `profile.db`, then exit before the tick loop.
+/// `build-cache-only` — collect every miss in one walk, then measure them all in
+/// one pass, then exit before the tick loop.
+///
+/// This used to enable JIT and let the L4 cascade profile on demand, node by
+/// node. An instrumented tp4/ep4/spec5 fill showed the cost of that: 23
+/// `(kind, backend)` units became 55 separate profiling calls (`elementwise` 14
+/// times, `single_gemm` 11), each fanned across four GPUs and joined, for 208
+/// worker launches and 208 cold JIT/autotune caches. Nothing overlapped across
+/// calls, so all four cards idled together 20% of the run. Measured end to end,
+/// collecting first and running each unit whole on one card does the same 6308
+/// rows in 2595 GPU-seconds instead of 6256.
+///
+/// The collect walk is the bridge's dry-run mode, which calls only
+/// `count_missing` and never fits, so no kernel time is needed to discover what
+/// is missing. JIT stays off throughout: nothing is profiled on demand, and
+/// `issue_collected` does all the measuring.
 fn cmd_build_cache(config: &Path) -> anyhow::Result<()> {
     let cfg = load_config(config)?;
     let bridge = PerfApiBridge::new().context("starting the PyO3 perf_api bridge")?;
+    bridge.enable_dry_run();
     bridge
-        .enable_jit_profiling()
-        .context("enabling JIT profiling for cache build")?;
+        .begin_collect()
+        .context("starting the profiling collect pass")?;
     let store: SharedRequests = Rc::new(RefCell::new(RequestStore::new()));
-    let _flow = build_flow(&cfg, &bridge, store)?;
-    tracing::info!("cache build complete: profile.db populated via JIT");
+    let flow = build_flow(&cfg, &bridge, store)?;
+    drop(flow);
+
+    // The plan is worth printing before spending GPU time on it: this is the
+    // point at which a grid that quietly grew by an order of magnitude is still
+    // cheap to notice.
+    let report = bridge.take_dry_run_report();
+    let total_missing: usize = report.iter().map(|k| k.missing).sum();
+    let total_specs: usize = report.iter().map(|k| k.total).sum();
+    println!(
+        "cache build plan: {} kernels, {total_missing} / {total_specs} specs missing",
+        report.len()
+    );
+    for k in report.iter().filter(|k| k.missing > 0) {
+        println!(
+            "  {:<40} ({:<16}) {:>8} / {:<8} missing",
+            k.name, k.kind, k.missing, k.total
+        );
+    }
+    // Called even at zero: it clears the collector and reports the no-op, and
+    // an early return here would leave the collector installed.
+    bridge
+        .issue_collected(total_missing)
+        .context("measuring the collected profiling work")?;
+    tracing::info!("cache build complete: profile.db populated");
     Ok(())
 }
 

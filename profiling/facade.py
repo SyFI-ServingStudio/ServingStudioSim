@@ -23,6 +23,7 @@ from profiling.db.batch import (
 from profiling.db.kind import KernelKind
 from profiling.db.registry import find_kernel_profiler_spec, iter_kernel_profiler_specs
 from profiling.db.table import MissingEntry, Table
+from profiling.plan import active_collector
 from profiling.profilers.energy import require_measured_energy
 from profiling.runners.metrics import ComputeMetrics, Metrics
 
@@ -366,6 +367,22 @@ def _count_missing(
     profiler_spec = find_kernel_profiler_spec(kernel_kind, backend)
     table = Table(profiler_spec, db_path)
     present = table.exists(args_list, backend=backend, gpu_name=resolved_gpu)
+    collector = active_collector()
+    if collector is not None:
+        # The simulator's dry-run mode walks the whole build cascade calling only
+        # `count_missing`, never fitting and never profiling. That walk already
+        # visits every cost-tree node, so it is the collect pass: record what is
+        # absent here and one `issue` can measure all of it, instead of 55
+        # separate demand-driven calls each fanning across four cards.
+        collector.record(
+            kernel_kind,
+            backend,
+            [args_to_spec(args) for args, found in zip(args_list, present) if not found],
+            # The key the miss was found under, so the fill writes back to the
+            # same place. `resolved_gpu`, not `gpu_name`: this is the key
+            # `table.exists` just used.
+            gpu_name=resolved_gpu,
+        )
     return present.count(False)
 
 

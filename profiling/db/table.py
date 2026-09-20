@@ -31,6 +31,10 @@ STANDARD_COLUMNS = [
     "backend_version",
     "verified",
 ]
+# How long a writer waits for the write lock before giving up. See
+# `Table._write_transaction`.
+_WRITE_LOCK_TIMEOUT_S = 120.0
+
 COMPUTE_METRIC_COLUMNS = ["time_ms", "tflops", "memory_bandwidth_gbps", "energy_j"]
 # message_size for comm kernels is an args/cache-key column, NOT a measured
 # result — the simulator derives moved bytes from busbw × time. So it is not a
@@ -216,9 +220,18 @@ class Table:
 
     @contextmanager
     def _write_transaction(self) -> Iterator[sqlite3.Connection]:
-        """Own schema preparation and persistence as one write transaction."""
+        """Own schema preparation and persistence as one write transaction.
+
+        The timeout is not the default 5 s because writers are now concurrent:
+        ``profiling.plan.issue`` measures one unit per GPU on its own thread and
+        each finishes with an insert, so a 1400-row insert can be holding the
+        write lock while another unit's ``migrate_connection`` DDL arrives. Five
+        seconds of that and the second unit raises `database is locked`, which
+        discards GPU time already spent. Waiting is always cheaper than
+        remeasuring.
+        """
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite3.connect(self.db_path, timeout=_WRITE_LOCK_TIMEOUT_S) as conn:
             conn.row_factory = sqlite3.Row
             migrate_connection(conn)
             self._ensure_schema(conn)

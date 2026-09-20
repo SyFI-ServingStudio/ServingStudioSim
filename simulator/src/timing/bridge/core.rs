@@ -302,6 +302,32 @@ impl PerfApiBridge {
         self.call_perf_api_void("enable_jit_profiling")
     }
 
+    /// Start the collect pass: `count_missing` records what is absent instead of
+    /// only counting it. Pair with [`issue_collected`](Self::issue_collected),
+    /// and run the build cascade in dry-run mode in between.
+    pub fn begin_collect(&self) -> Result<(), PerfApiError> {
+        self.call_perf_api_void("begin_collect")
+    }
+
+    /// Measure everything the collect pass recorded, one whole `(kind, backend)`
+    /// unit per GPU. Errors if any unit could not run.
+    ///
+    /// `expected_specs` is this side's own missing count, from the dry-run
+    /// report. The counts and the work list travel separately — the report holds
+    /// counts for display, the Python collector holds the specs — so passing it
+    /// across lets a disagreement fail here rather than resurface as a
+    /// kernel-at-a-time JIT during the next real run.
+    pub fn issue_collected(&self, expected_specs: usize) -> Result<(), PerfApiError> {
+        Python::with_gil(|py| {
+            let perf_api = PyModule::import(py, "profiling.perf_api").py_err()?;
+            perf_api
+                .getattr("issue_collected")
+                .and_then(|func| func.call1((expected_specs,)))
+                .py_err()?;
+            Ok(())
+        })
+    }
+
     fn call_perf_api_void(&self, attr: &str) -> Result<(), PerfApiError> {
         Python::with_gil(|py| {
             let perf_api = PyModule::import(py, "profiling.perf_api").py_err()?;
