@@ -1462,6 +1462,41 @@ pub fn glm53_vllm_nvfp4_dsa_moe_dflash2(
 /// 6 layers, hidden 6144, intermediate 12288, 64 query / 8 KV heads at
 /// head_dim 128, vocab 154880, `conv_kernel_size` 2, `conv_group_size` 16,
 /// `selector_rank` 256, `selector_top_k` 16, and six `target_layer_ids`.
+#[cfg(test)]
+mod dflash2_kv_tests {
+    use super::*;
+
+    fn parallel() -> Glm52VllmNvfp4DsaMoeParallel {
+        Glm52VllmNvfp4DsaMoeParallel {
+            ep_size: 4,
+            nvl_num_gpu: 4,
+            max_model_len: 8192,
+            gpu_name: "NVIDIA B200".to_string(),
+        }
+    }
+
+    #[test]
+    fn the_draft_kv_addend_ignores_the_sliding_window() {
+        // The defect this catches: reading `sliding_window` as a storage bound
+        // as well as a compute bound. It is not one -- the capture's startup
+        // says vLLM could not unify the page sizes and allocates the draft's
+        // layers "as full attention for cache allocation". Billing a window
+        // would under-count the pool by the ratio of context to window, which
+        // at 131072 tokens is 64x.
+        let narrow = dflash2_draft_resolved(&parallel(), 7, 512).unwrap();
+        let wide = dflash2_draft_resolved(&parallel(), 7, 131_072).unwrap();
+        let narrow_bytes =
+            glm53_vllm_nvfp4_dsa_moe_dflash2::draft_kv_bytes_per_token(&narrow).unwrap();
+        assert_eq!(
+            narrow_bytes,
+            glm53_vllm_nvfp4_dsa_moe_dflash2::draft_kv_bytes_per_token(&wide).unwrap(),
+        );
+        // 6 layers * 8 KV heads * 128 * 2 (K and V) * 1 byte, summed over the
+        // four attention ranks the heads are sharded across.
+        assert_eq!(narrow_bytes, 6 * 8 * 128 * 2);
+    }
+}
+
 fn dflash2_draft_resolved(
     parallel: &Glm52VllmNvfp4DsaMoeParallel,
     draft_tokens: u32,
@@ -1479,10 +1514,10 @@ fn dflash2_draft_resolved(
         norm_backends: vec!["flashinfer"],
         gemm_backends: vec!["torch_linear"],
         elementwise_backends: vec!["triton"],
-        // The draft runs FlashAttention, not FlashInfer -- the capture's server
-        // log selects `FLASH_ATTN` for it and JIT-compiles
-        // `FlashAttentionForwardSm100`. `fa3` is that family's rect identity.
-        attention_backends: vec!["fa3", "fa2"],
+        // `fa2` is the only rect backend with a working ragged path on B200,
+        // and it is bf16-only -- see the worklet's note on why the leaf is
+        // measured in bf16 while the engine runs fp8.
+        attention_backends: vec!["fa2"],
         tp_size,
         gpu_name: gpu_name.clone(),
         hidden_dim: Dim::param("dflash2_hidden", 6144),
@@ -1495,6 +1530,8 @@ fn dflash2_draft_resolved(
         dtype: DType::Bf16,
         gemm_dtype: DType::Bf16,
         kv_dtype: DType::Fp8E4m3,
+        attn_q_dtype: DType::Bf16,
+        attn_kv_dtype: DType::Bf16,
     };
     let context_kv_cfg = Dflash2ContextKvLocalWorkletConfig {
         norm_backends: vec!["flashinfer"],

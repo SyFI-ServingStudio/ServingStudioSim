@@ -29,6 +29,18 @@
 //! The draft phase as a whole is 1.61 ms of a 16.90 ms decode iteration (9.5%),
 //! and attention within it is 5.7% of that — 0.54% of the iteration, over six
 //! launches.
+//!
+//! # The attention leaf is measured in bf16, not fp8
+//!
+//! The engine attends **fp8** KV with an fp8 query. No `flashinfer_attn_rect`
+//! backend can measure that on B200 today: `fa2` has no fp8 tensor-core path,
+//! `cudnn` is bf16-only, `fa3`'s ragged kernels are built for SM90 and have no
+//! Blackwell image, and `trt` (Blackwell-only) has no ragged kernel at all. The
+//! leaf is therefore measured at bf16/bf16, which reads twice the KV bytes the
+//! engine does and so **overstates** this term. It is bounded: attention is
+//! 0.54% of a decode iteration, so the overstatement cannot exceed a few tenths
+//! of a percent, and it errs slow rather than fast. Revisit when a Blackwell
+//! ragged fp8 rect kernel lands.
 
 use std::sync::Arc;
 
@@ -75,6 +87,15 @@ pub struct Dflash2DraftLayerLocalWorkletConfig {
     pub dtype: DType,
     pub gemm_dtype: DType,
     pub kv_dtype: DType,
+    /// Dtypes the attention leaf is *measured* at, which are not always the
+    /// dtypes the engine runs. The engine attends fp8 KV with an fp8 query (the
+    /// capture's server log notes the missing q scale being set from k_scale,
+    /// which only matters to fp8 attention backends), but no B200 rect backend
+    /// can measure that today -- see the module note. Kept as explicit fields
+    /// rather than derived from `kv_dtype` so the substitution is visible at the
+    /// call site instead of hidden in a default.
+    pub attn_q_dtype: DType,
+    pub attn_kv_dtype: DType,
 }
 
 /// One grouped convolution's byte rates. `prepare` also runs a projection; both
@@ -240,8 +261,8 @@ impl Dflash2DraftAttnLocalWorklet {
                 num_qo_heads: qo_heads_per_rank,
                 num_kv_heads: kv_heads_per_rank,
                 head_dim: cfg.head_dim.clone(),
-                q_dtype: cfg.dtype,
-                kv_dtype: cfg.kv_dtype,
+                q_dtype: cfg.attn_q_dtype,
+                kv_dtype: cfg.attn_kv_dtype,
                 o_dtype: cfg.dtype,
             },
             o_proj: SingleGemmKernelConfig {
@@ -675,6 +696,14 @@ fn validate_config(cfg: &Dflash2DraftLayerLocalWorkletConfig) -> Result<(), Stri
     if cfg.tp_size == 0 {
         return Err("tp_size must be positive".to_string());
     }
+    // The ragged rect path requires one compute dtype for both operands.
+    if cfg.attn_q_dtype != cfg.attn_kv_dtype {
+        return Err(format!(
+            "ragged rect attention requires attn_q_dtype == attn_kv_dtype, got {} and {}",
+            cfg.attn_q_dtype.as_str(),
+            cfg.attn_kv_dtype.as_str()
+        ));
+    }
     for (name, value) in [
         ("num_qo_heads", cfg.num_qo_heads.get()),
         ("num_kv_heads", cfg.num_kv_heads.get()),
@@ -779,6 +808,8 @@ mod tests {
             dtype: DType::Bf16,
             gemm_dtype: DType::Bf16,
             kv_dtype: DType::Fp8E4m3,
+            attn_q_dtype: DType::Bf16,
+            attn_kv_dtype: DType::Bf16,
         }
     }
 

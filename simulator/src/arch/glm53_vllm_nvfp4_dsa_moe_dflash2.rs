@@ -238,28 +238,39 @@ pub struct Glm53VllmNvfp4DsaMoeDflash2Model {
     num_attn_dp_groups: u16,
     num_attn_shards: u16,
     total_state_bytes_per_token: u64,
-    /// Per-request bytes the draft's own KV reserves, over and above the
-    /// per-token target state. See [`Self::draft_kv_bytes_per_request`].
-    draft_kv_bytes_per_request: u64,
+    /// Per-token bytes the draft's own KV adds to the target's, summed over the
+    /// attention ranks. See [`Self::draft_kv_bytes_per_token`].
+    draft_kv_bytes_per_token: u64,
     cost_flat: Vec<FlatCostNode>,
     n_slots: usize,
 }
 
 impl Glm53VllmNvfp4DsaMoeDflash2Model {
-    /// The draft's KV footprint is **capped**, not per-token.
+    /// The draft's KV is billed **per token**, uncapped by its window.
     ///
-    /// GLM-5.2's MTP draft KV grows with context exactly like the target's, so
-    /// it folds into `state_bytes_per_token` as a flat addend. DFlash2's draft
-    /// is a sliding-window GQA stack: past `sliding_window` tokens its cache
-    /// stops growing. Amortizing it per token would bill a 131072-token request
-    /// for roughly 64x the memory it actually holds.
+    /// The window bounds what the draft *attends to*, so the natural guess is
+    /// that it also bounds what the draft *stores* -- a flat per-request reserve
+    /// of `sliding_window` tokens instead of a per-token addend. The capture
+    /// says otherwise, in one line at startup:
     ///
-    /// The worker contract exposes only a per-token scalar, so this is reported
-    /// separately and subtracted from the KV budget as a fixed reserve -- which
-    /// is also what vLLM does, sizing the draft's pool by `max_num_seqs` rather
-    /// than sharing the target's token pool.
-    pub fn draft_kv_bytes_per_request(&self) -> u64 {
-        self.draft_kv_bytes_per_request
+    /// ```text
+    /// kv_cache_utils.py:1868] KV cache page sizes cannot be unified; treating
+    /// sliding-window layers as full attention for cache allocation.
+    /// Sliding-window attention compute is unchanged.
+    /// ```
+    ///
+    /// The draft's six layers cannot share a page size with the target's MLA
+    /// latent, so vLLM gives up on unifying them and allocates them as full
+    /// attention out of the one pool it reports as `GPU KV cache size`. The
+    /// window survives only on the compute side, which is exactly where this
+    /// model keeps it: the attention rectangles cap `kv_len` at
+    /// `sliding_window` while this addend does not.
+    ///
+    /// Folding it into the per-token scalar is therefore both the faithful
+    /// model and the one the worker contract already carries -- no per-request
+    /// reserve has to be subtracted in `build_speculative_worker`.
+    pub fn draft_kv_bytes_per_token(&self) -> u64 {
+        self.draft_kv_bytes_per_token
     }
 
     fn cost_tree(&self) -> CostTree {
@@ -380,7 +391,7 @@ pub fn build_dflash2(
     }
     let ep_size = resolved.raw_cfg.parallel.ep_size;
     let max_model_len = resolved.raw_cfg.parallel.max_model_len;
-    let draft_kv_bytes_per_request = draft_kv_bytes_per_request(&draft)?;
+    let draft_kv_bytes_per_token = draft_kv_bytes_per_token(&draft)?;
     let target = Glm52TargetForward::build(name.clone(), &resolved, bridge)?;
     let stage = Dflash2DraftStage::build(format!("{name}.dflash2"), &draft, bridge)?;
 
@@ -391,11 +402,14 @@ pub fn build_dflash2(
         max_model_len,
         num_attn_dp_groups: 1,
         num_attn_shards: ep_size,
-        // The proposer is a separate dense checkpoint: it adds no per-token
-        // state to the target's, which is why `Glm52MtpMode::Off` is right here
-        // and not an oversight. Its own cache is the capped reserve below.
-        total_state_bytes_per_token: state_bytes_per_token(ep_size, Glm52MtpMode::Off)?,
-        draft_kv_bytes_per_request,
+        // `Glm52MtpMode::Off` is right and not an oversight: the proposer is a
+        // separate checkpoint, so it adds none of MTP's *target-side* state.
+        // What it does add is its own six GQA layers, which vLLM allocates out
+        // of the same pool -- see `draft_kv_bytes_per_token`.
+        total_state_bytes_per_token: state_bytes_per_token(ep_size, Glm52MtpMode::Off)?
+            .checked_add(draft_kv_bytes_per_token)
+            .ok_or_else(|| fit_failed("total state bytes per token overflow u64"))?,
+        draft_kv_bytes_per_token,
         cost_flat: Vec::new(),
         n_slots: 0,
     };
@@ -405,10 +419,12 @@ pub fn build_dflash2(
     Ok(model)
 }
 
-/// `layers * kv_heads * head_dim * 2 (K and V) * kv_dtype * sliding_window`,
-/// summed over the attention ranks so it matches the worker's physical-total
-/// KV contract.
-fn draft_kv_bytes_per_request(draft: &Dflash2DraftResolved) -> Result<u64, BuildError> {
+/// `layers * kv_heads * head_dim * 2 (K and V) * kv_dtype`, summed over the
+/// attention ranks so it matches the worker's physical-total KV contract.
+///
+/// `sliding_window` is deliberately absent -- see
+/// [`Glm53VllmNvfp4DsaMoeDflash2Model::draft_kv_bytes_per_token`].
+pub(crate) fn draft_kv_bytes_per_token(draft: &Dflash2DraftResolved) -> Result<u64, BuildError> {
     let append = &draft.context_kv.context_kv_append;
     let per_rank_per_token = u64::from(draft.num_draft_layers)
         .checked_mul(u64::from(append.num_kv_heads.get()))
@@ -419,8 +435,7 @@ fn draft_kv_bytes_per_request(draft: &Dflash2DraftResolved) -> Result<u64, Build
     let ranks = u64::from(draft.context_kv.raw_cfg.tp_size);
     per_rank_per_token
         .checked_mul(ranks)
-        .and_then(|value| value.checked_mul(u64::from(draft.sliding_window)))
-        .ok_or_else(|| fit_failed("DFlash2 draft KV reserve overflows u64"))
+        .ok_or_else(|| fit_failed("DFlash2 draft KV bytes per token overflows u64"))
 }
 
 fn build_allreduce(

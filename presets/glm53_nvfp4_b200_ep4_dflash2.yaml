@@ -1,0 +1,51 @@
+# GLM-5.3 NVFP4 on one four-GPU B200 NVLink domain with a DFlash2 proposer.
+#
+# The same rank group and context cap as `glm52_nvfp4_b200_ep4_speculative.yaml`,
+# so the two speculative deployments are directly comparable. The difference is
+# the proposer: MTP drafts one token at a time and feeds each back, DFlash2
+# drafts the whole block of seven in a single forward pass. Its own attention is
+# a 2048-token sliding window, so the draft's KV is a per-request reserve rather
+# than a per-token rate.
+#
+# `accept_rate` is the per-position conditional chain measured in
+# `logs/20260920_0_glm53_dflash2_phase0` (38427 drafts): folding it back gives a
+# draft mean of 2.521769, which is the capture's `mean_acceptance_length` of
+# 3.521769 minus the bonus token. Note the shape -- position 1 dips to 0.689 and
+# then climbs to 0.909 -- a uniform rate would misstate both ends.
+deployment: unified
+
+workload:
+  trace_files:
+    - presets/glm53_dflash2_smoke.csv
+  input_file_format: text-generation-independent
+  input_file_tags: [speculative]
+  arrival_mode: trace_timed
+  session_dependency: independent
+  run_to_end: true
+
+io:
+  log_dir: logs/glm53_nvfp4_b200_ep4_dflash2
+
+pools:
+  main:
+    groups:
+      - gpu: "NVIDIA B200"
+        replicas: 1
+        arch:
+          type: glm53_vllm_nvfp4_dsa_moe_dflash2
+          model_config: model/config/glm53_nvfp4.json
+          fp8: false
+          ep_size: 4
+          nvl_num_gpu: 4
+          max_model_len: 8192
+          routing: uniform
+          draft_tokens: 7
+          draft_sliding_window: 2048
+        worker:
+          type: speculative
+          attn_gpu_memory_gb: 120.0
+          # Decode spends this cap in query rows, so a resident decode costs the
+          # whole verify width (8) here, not one row.
+          max_batch_tokens: 8192
+          # Must match the arch's: the width selects a profiled kernel shape.
+          draft_tokens: 7
