@@ -22,22 +22,31 @@ use crate::arch::model_cfg::ModelCfg;
 use crate::arch::moe_model_cfg::MoeModelCfg;
 use crate::arch::{
     deepseek_v4_vllm, glm52_sglang_nvfp4_tp_dsa_moe, glm52_vllm_dsa_moe, glm52_vllm_nvfp4_dsa_moe,
-    llama3_dense, llama3_dense_tp, llama3_dp_attn_tp_ffn, qwen36_local, qwen3_attn_layerwise,
+    glm53_vllm_nvfp4_dsa_moe_dflash2, llama3_dense, llama3_dense_tp, llama3_dp_attn_tp_ffn, qwen36_local, qwen3_attn_layerwise,
     qwen3_ffn_moe_layerwise, qwen3_fp8_ffn_moe_layerwise, qwen3_moe_dp_attn_ep_ffn,
     qwen3_moe_fp8_dp_attn_ep_ffn, qwen3_vllm_moe_dp_attn_ep_ffn, AttnLayerwiseModel,
     DeepseekV4ModelCfg, DeepseekV4VllmModel, DeepseekV4VllmParallel, DenseParallel,
     DenseTpParallel, DpAttnTpFfnParallel, FfnLayerwiseModel, Glm52ModelCfg, Glm52MtpMode,
     Glm52SglangNvfp4TpDsaMoeModel, Glm52SglangNvfp4TpDsaMoeParallel, Glm52VllmDsaMoeModel,
     Glm52VllmDsaMoeParallel, Glm52VllmNvfp4DsaMoeModel, Glm52VllmNvfp4DsaMoeParallel,
-    Glm52VllmNvfp4DsaMoeSpeculativeModel, IterwiseUnifiedModel, Llama3DenseModel,
+    Glm52VllmNvfp4DsaMoeSpeculativeModel, Dflash2DraftResolved,
+    Glm53VllmNvfp4DsaMoeDflash2Model, IterwiseUnifiedModel, Llama3DenseModel,
     Llama3DenseTpModel, Llama3DpAttnTpFfnModel, Qwen36LocalModel, Qwen36LocalParallel,
     Qwen36ModelCfg, Qwen3AttnLayerwiseModel, Qwen3AttnParallel, Qwen3FfnMoeLayerwiseModel,
     Qwen3FfnMoeParallel, Qwen3Fp8FfnMoeLayerwiseModel, Qwen3Fp8FfnMoeParallel,
     Qwen3MoeDpAttnEpFfnModel, Qwen3MoeFp8DpAttnEpFfnModel, Qwen3MoeFp8Parallel, Qwen3MoeParallel,
     Qwen3VllmMoeDpAttnEpFfnModel, Qwen3VllmMoeParallel,
 };
+use crate::timing::bridge::DType;
+use crate::timing::kernels::AllReduceKernelConfig;
+use crate::common::Fabric;
 use crate::timing::routing::RoutingDistribution;
-use crate::timing::PerfApiBridge;
+use crate::timing::{Dim, PerfApiBridge};
+use crate::worklet::{
+    Dflash2ContextKvLocalWorklet, Dflash2ContextKvLocalWorkletConfig, Dflash2DraftAttnLocalWorklet,
+    Dflash2DraftFfnLocalWorklet, Dflash2DraftLayerLocalWorkletConfig, Dflash2SelectorLocalWorklet,
+    Dflash2SelectorLocalWorkletConfig,
+};
 
 /// `ModelSpec` → dense [`ModelCfg`], applying the `sim_num_layers` / `num_layers`
 /// override that truncates layer COUNT before `build_configs` (per-layer shape
@@ -1379,9 +1388,158 @@ pub fn build_iter_model(
             name,
             bridge,
         )?),
-        IterArchSel::Glm52VllmNvfp4DsaMoeSpeculative { .. } => {
+        IterArchSel::Glm52VllmNvfp4DsaMoeSpeculative { .. }
+        | IterArchSel::Glm53VllmNvfp4DsaMoeDflash2 { .. } => {
             bail!("timing-predict: use arch.speculative_iter for a speculative model")
         }
+    })
+}
+
+/// Build the GLM target graph driven by a DFlash2 block-parallel proposer.
+///
+/// The draft is a separate dense checkpoint, so its dimensions come from that
+/// checkpoint rather than from the GLM config expansion, and it has no expert
+/// popularity of its own -- six GQA layers with a plain SwiGLU MLP route
+/// nothing.
+#[allow(clippy::too_many_arguments)]
+pub fn glm53_vllm_nvfp4_dsa_moe_dflash2(
+    model_spec: &ModelSpec,
+    ep_size: u16,
+    nvl_num_gpu: u16,
+    max_model_len: u32,
+    routing_kind: RoutingKind,
+    routing_seed: Option<u64>,
+    expert_popularity_file: Option<&str>,
+    draft_tokens: u32,
+    draft_sliding_window: u32,
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<Glm53VllmNvfp4DsaMoeDflash2Model> {
+    let model_cfg = glm52_model_cfg(model_spec).context("loading exact GLM NVFP4 target config")?;
+    anyhow::ensure!(
+        expert_popularity_file.is_none() || routing_kind == RoutingKind::Custom,
+        "profile-backed target popularity requires routing=custom"
+    );
+    let target_routing = match expert_popularity_file {
+        Some(path) => load_expert_popularity(
+            path,
+            model_cfg.num_experts.get(),
+            ep_size,
+            num_sparse_layers(&model_cfg),
+            model_cfg.router_top_k,
+            Some("target"),
+        ),
+        None => resolve_routing(routing_kind, routing_seed, model_cfg.num_experts.get()),
+    }?;
+    let parallel = Glm52VllmNvfp4DsaMoeParallel {
+        ep_size,
+        nvl_num_gpu,
+        max_model_len,
+        gpu_name: gpu.to_string(),
+    };
+    // The target verifies the drafted positions and the token they extend, and
+    // `mtp_mode` stays off: the proposer is not the MTP layer, so the target
+    // must not allocate or run it.
+    let configs = glm52_vllm_nvfp4_dsa_moe::build_speculative_configs(
+        &model_cfg,
+        &parallel,
+        &target_routing,
+        &target_routing,
+        model_spec.fp8,
+        Glm52MtpMode::IndexShare,
+        draft_tokens,
+    )
+    .context("expanding GLM NVFP4 target configs for a DFlash2 deployment")?;
+    let resolved = glm52_vllm_nvfp4_dsa_moe::resolve_configs(&configs);
+    let draft = dflash2_draft_resolved(&parallel, draft_tokens, draft_sliding_window)
+        .context("expanding the DFlash2 draft configs")?;
+    glm53_vllm_nvfp4_dsa_moe_dflash2::build_dflash2(name.to_string(), resolved, draft, bridge)
+        .context("building GLM-5.3 NVFP4 + DFlash2 (often a missing profile.db row)")
+}
+
+/// The DFlash2 draft checkpoint's dimensions, from its own `config.json`:
+/// 6 layers, hidden 6144, intermediate 12288, 64 query / 8 KV heads at
+/// head_dim 128, vocab 154880, `conv_kernel_size` 2, `conv_group_size` 16,
+/// `selector_rank` 256, `selector_top_k` 16, and six `target_layer_ids`.
+fn dflash2_draft_resolved(
+    parallel: &Glm52VllmNvfp4DsaMoeParallel,
+    draft_tokens: u32,
+    sliding_window: u32,
+) -> Result<Dflash2DraftResolved> {
+    anyhow::ensure!(draft_tokens > 0, "DFlash2 draft_tokens must be positive");
+    anyhow::ensure!(
+        sliding_window > 0,
+        "DFlash2 draft_sliding_window must be positive"
+    );
+    let tp_size = parallel.ep_size;
+    let gpu_name = parallel.gpu_name.clone();
+    let layer_cfg = Dflash2DraftLayerLocalWorkletConfig {
+        residual_norm_backends: vec!["vllm_cuda"],
+        norm_backends: vec!["flashinfer"],
+        gemm_backends: vec!["torch_linear"],
+        elementwise_backends: vec!["triton"],
+        // The draft runs FlashAttention, not FlashInfer -- the capture's server
+        // log selects `FLASH_ATTN` for it and JIT-compiles
+        // `FlashAttentionForwardSm100`. `fa3` is that family's rect identity.
+        attention_backends: vec!["fa3", "fa2"],
+        tp_size,
+        gpu_name: gpu_name.clone(),
+        hidden_dim: Dim::param("dflash2_hidden", 6144),
+        intermediate_dim: Dim::param("dflash2_intermediate", 12288),
+        num_qo_heads: Dim::param("dflash2_qo_heads", 64),
+        num_kv_heads: Dim::param("dflash2_kv_heads", 8),
+        head_dim: Dim::param("dflash2_head_dim", 128),
+        conv_taps: 2,
+        conv_group_size: 16,
+        dtype: DType::Bf16,
+        gemm_dtype: DType::Bf16,
+        kv_dtype: DType::Fp8E4m3,
+    };
+    let context_kv_cfg = Dflash2ContextKvLocalWorkletConfig {
+        norm_backends: vec!["flashinfer"],
+        gemm_backends: vec!["torch_linear"],
+        elementwise_backends: vec!["triton"],
+        kv_cache_append_backends: vec!["vllm_cuda"],
+        tp_size,
+        gpu_name: gpu_name.clone(),
+        hidden_dim: Dim::param("dflash2_hidden", 6144),
+        num_draft_layers: 6,
+        num_aux_layers: 6,
+        num_kv_heads: Dim::param("dflash2_kv_heads", 8),
+        head_dim: Dim::param("dflash2_head_dim", 128),
+        kv_cache_block_size: 64,
+        kv_cache_layout: "NHD".to_string(),
+        kv_scale_granularity: "tensor".to_string(),
+        dtype: DType::Bf16,
+        gemm_dtype: DType::Bf16,
+        kv_dtype: DType::Fp8E4m3,
+    };
+    let selector_cfg = Dflash2SelectorLocalWorkletConfig {
+        gemm_backends: vec!["torch_linear"],
+        elementwise_backends: vec!["triton"],
+        tp_size,
+        gpu_name: gpu_name.clone(),
+        hidden_dim: Dim::param("dflash2_hidden", 6144),
+        vocab_size: Dim::param("dflash2_vocab", 154880),
+        selector_rank: 256,
+        selector_top_k: 16,
+        dtype: DType::Bf16,
+        gemm_dtype: DType::Bf16,
+    };
+    Ok(Dflash2DraftResolved {
+        num_draft_layers: 6,
+        sliding_window,
+        context_kv: Dflash2ContextKvLocalWorklet::resolve_config(&context_kv_cfg),
+        draft_attn: Dflash2DraftAttnLocalWorklet::resolve_config(&layer_cfg),
+        draft_ffn: Dflash2DraftFfnLocalWorklet::resolve_config(&layer_cfg),
+        selector: Dflash2SelectorLocalWorklet::resolve_config(&selector_cfg),
+        tp_allreduce: AllReduceKernelConfig {
+            backends: vec!["nccl", "nvshmem"],
+            gpu_name,
+            num_gpus: u32::from(tp_size),
+            fabric: Fabric::Nvlink,
+        },
     })
 }
 

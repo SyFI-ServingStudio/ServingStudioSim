@@ -20,9 +20,8 @@ use std::sync::Arc;
 use crate::op::Op;
 use crate::timing::bridge::DType;
 use crate::timing::kernels::{
-    BatchedGemmKernel, BatchedGemmKernelConfig, BatchedGemmKernelInput, ElementwiseKernel,
-    ElementwiseKernelConfig, ElementwiseKernelInput, SingleGemmKernel, SingleGemmKernelConfig,
-    SingleGemmKernelInput,
+    ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput, SingleGemmKernel,
+    SingleGemmKernelConfig, SingleGemmKernelInput,
 };
 use crate::timing::{
     BuildError, CostNode, CostTreeBuilder, Dim, Evaluator, LeafMetrics, PerfApiBridge, Probe,
@@ -48,7 +47,6 @@ const SOURCE_ORDER: [&str; 5] = [
 #[derive(Clone, Debug)]
 pub struct Dflash2SelectorLocalWorkletConfig {
     pub gemm_backends: Vec<&'static str>,
-    pub batched_gemm_backends: Vec<&'static str>,
     pub elementwise_backends: Vec<&'static str>,
     pub tp_size: u16,
     pub gpu_name: String,
@@ -67,7 +65,7 @@ pub struct Dflash2SelectorLocalWorkletResolved {
     pub candidate_topk: ElementwiseKernelConfig,
     pub hidden_projection: SingleGemmKernelConfig,
     pub codebook_gather: ElementwiseKernelConfig,
-    pub edge_scores: BatchedGemmKernelConfig,
+    pub edge_scores: SingleGemmKernelConfig,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -84,7 +82,7 @@ pub struct Dflash2SelectorLocalWorklet {
     pub candidate_topk: Op<ElementwiseKernel>,
     pub hidden_projection: Op<SingleGemmKernel>,
     pub codebook_gather: Op<ElementwiseKernel>,
-    pub edge_scores: Op<BatchedGemmKernel>,
+    pub edge_scores: Op<SingleGemmKernel>,
     resolved: Dflash2SelectorLocalWorkletResolved,
 }
 
@@ -141,15 +139,18 @@ impl Dflash2SelectorLocalWorklet {
                 input_bytes_per_token: gather_bytes.into(),
                 output_bytes_per_token: gather_bytes.into(),
             },
-            // `einsum("blpr,blcr->blpc")` is, per scored row, `top_k` batches of
-            // `[top_k, rank] x [rank, top_k]`. `num_batches` is a static config
-            // axis while the row count is the sweep, so the identity is carried
-            // as `top_k` batches swept over rows: same operand widths, same
-            // total `rows * top_k * top_k * rank` multiply-accumulates.
-            edge_scores: BatchedGemmKernelConfig {
-                backends: cfg.batched_gemm_backends.clone(),
+            // `einsum("blpr,blcr->blpc")` is, per scored row, `top_k` batches
+            // of `[top_k, rank] x [rank, top_k]`. It is priced as one GEMM of
+            // the same operand widths over `rows * top_k` rows: identical
+            // multiply-accumulate count and identical `n`/`k`, differing only in
+            // how the work is batched. `batched_gemm`'s backend identities are
+            // deliberately frozen to GLM's Q-absorption and V-up layouts, and
+            // this section sits below the measured top-12 of a phase that is
+            // itself 9.5% of an iteration, so inventing a generic batched
+            // backend would buy nothing it could not also distort.
+            edge_scores: SingleGemmKernelConfig {
+                backends: cfg.gemm_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
-                num_batches: cfg.selector_top_k.into(),
                 n: cfg.selector_top_k.into(),
                 k: cfg.selector_rank.into(),
                 dtype: cfg.gemm_dtype,
@@ -196,7 +197,7 @@ impl Dflash2SelectorLocalWorklet {
                 &name,
                 "edge_scores",
                 resolved.edge_scores.clone(),
-                BatchedGemmKernel::build,
+                SingleGemmKernel::build,
                 bridge,
             )?,
             name,
@@ -231,7 +232,15 @@ impl Dflash2SelectorLocalWorklet {
             ev,
         );
         eval_atomic_or_zero(&self.codebook_gather, streamed, zero, ev);
-        eval_atomic_or_zero(&self.edge_scores, BatchedGemmKernelInput { m: rows }, zero, ev);
+        // `rows * top_k` because the batch axis is folded into the row count.
+        eval_atomic_or_zero(
+            &self.edge_scores,
+            SingleGemmKernelInput {
+                m: rows.saturating_mul(self.resolved.raw_cfg.selector_top_k),
+            },
+            zero,
+            ev,
+        );
     }
 }
 
@@ -312,7 +321,6 @@ mod tests {
     fn cfg() -> Dflash2SelectorLocalWorkletConfig {
         Dflash2SelectorLocalWorkletConfig {
             gemm_backends: vec!["torch"],
-            batched_gemm_backends: vec!["torch"],
             elementwise_backends: vec!["triton"],
             tp_size: 4,
             gpu_name: "NVIDIA B200".to_string(),
@@ -351,7 +359,6 @@ mod tests {
     #[test]
     fn edge_scoring_keeps_the_bilinear_operand_widths() {
         let resolved = Dflash2SelectorLocalWorklet::resolve_config(&cfg());
-        assert_eq!(resolved.edge_scores.num_batches.get(), SELECTOR_TOP_K);
         assert_eq!(resolved.edge_scores.n.get(), SELECTOR_TOP_K);
         assert_eq!(resolved.edge_scores.k.get(), SELECTOR_RANK);
     }
