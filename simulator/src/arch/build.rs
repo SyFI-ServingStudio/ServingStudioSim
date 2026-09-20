@@ -1440,14 +1440,18 @@ pub fn glm53_vllm_nvfp4_dsa_moe_dflash2(
     };
     // The target verifies the drafted positions and the token they extend, and
     // `mtp_mode` stays off: the proposer is not the MTP layer, so the target
-    // must not allocate or run it.
+    // must not allocate or run it. The GLM-5.3 checkpoint does carry
+    // `num_nextn_predict_layers: 1`, but `--speculative-config {"method":
+    // "dflash", ...}` never instantiates it -- the capture's server log
+    // mentions no MTP or nextn layer at all. `Off` is what keeps this model's
+    // cost tree and its `state_bytes_per_token` telling the same story.
     let configs = glm52_vllm_nvfp4_dsa_moe::build_speculative_configs(
         &model_cfg,
         &parallel,
         &target_routing,
         &target_routing,
         model_spec.fp8,
-        Glm52MtpMode::IndexShare,
+        Glm52MtpMode::Off,
         draft_tokens,
     )
     .context("expanding GLM NVFP4 target configs for a DFlash2 deployment")?;
@@ -1611,6 +1615,33 @@ pub fn build_speculative_iter_model(
                 expert_popularity_file.as_deref(),
                 draft_expert_popularity_file.as_deref(),
                 *draft_tokens,
+                gpu,
+                name,
+                bridge,
+            )?),
+            *draft_tokens,
+        )),
+        IterArchSel::Glm53VllmNvfp4DsaMoeDflash2 {
+            model,
+            ep_size,
+            nvl_num_gpu,
+            max_model_len,
+            routing,
+            routing_seed,
+            draft_tokens,
+            draft_sliding_window,
+            expert_popularity_file,
+        } => Ok((
+            Box::new(glm53_vllm_nvfp4_dsa_moe_dflash2(
+                model,
+                *ep_size,
+                *nvl_num_gpu,
+                *max_model_len,
+                *routing,
+                *routing_seed,
+                expert_popularity_file.as_deref(),
+                *draft_tokens,
+                *draft_sliding_window,
                 gpu,
                 name,
                 bridge,

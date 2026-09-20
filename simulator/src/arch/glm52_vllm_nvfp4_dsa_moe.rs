@@ -325,10 +325,17 @@ pub fn build_configs(
     build_configs_for_decode(model, parallel, routing, routing, fp8, mtp_mode, 1, None)
 }
 
-/// The same recipe with a `draft_tokens`-deep MTP proposer in front of it.
+/// The same recipe with a `draft_tokens`-wide verify window in front of it.
 ///
 /// `draft_routing` is the MTP layer's own expert-routing evidence: it is one
-/// layer with its own load distribution, not a slice of the body's.
+/// layer with its own load distribution, not a slice of the body's. It is
+/// ignored when `mtp_mode` is off.
+///
+/// `mtp_mode` may be off here. Speculating does not imply MTP: GLM-5.3's
+/// DFlash2 proposer is a separate checkpoint, so its target widens the decode
+/// to `draft_tokens + 1` rows while running no MTP layer at all. The
+/// GLM-5.2-specific requirement that a proposer exist lives in
+/// [`build_speculative`], which owns the model that needs one.
 pub fn build_speculative_configs(
     model: &Glm52ModelCfg,
     parallel: &Glm52VllmNvfp4DsaMoeParallel,
@@ -340,11 +347,6 @@ pub fn build_speculative_configs(
 ) -> Result<Glm52VllmNvfp4DsaMoeConfigs, BuildError> {
     if draft_tokens == 0 {
         return Err(fit_failed("speculative draft_tokens must be positive"));
-    }
-    if mtp_mode == Glm52MtpMode::Off {
-        return Err(fit_failed(
-            "speculative GLM-5.2 build requires mtp_mode != off",
-        ));
     }
     // The target verifies the drafted positions and the token they extend, so
     // one decode request submits `draft_tokens + 1` query rows per iteration.
@@ -2705,9 +2707,16 @@ mod tests {
     }
 
     #[test]
-    fn a_speculative_recipe_needs_a_proposer_and_a_positive_depth() {
+    fn a_speculative_recipe_needs_a_positive_depth_but_not_an_mtp_layer() {
         let routing = RoutingDistribution::uniform(NUM_EXPERTS);
-        assert!(build_speculative_configs(
+        // Speculating does not imply MTP. GLM-5.3's DFlash2 proposer is a
+        // separate checkpoint, so its target widens the decode to
+        // `draft_tokens + 1` rows while running no MTP layer -- `Off` here is a
+        // real deployment, not a misconfiguration. The GLM-5.2-specific
+        // requirement that a proposer exist belongs to `build_speculative`,
+        // which owns the model that needs one; see
+        // `an_mtp_less_recipe_cannot_build_the_glm52_speculative_model`.
+        let mtp_less = build_speculative_configs(
             &model(),
             &parallel(4),
             &routing,
@@ -2716,7 +2725,12 @@ mod tests {
             Glm52MtpMode::Off,
             5,
         )
-        .is_err());
+        .unwrap();
+        assert_eq!(mtp_less.dense_full_index_attention.decode_next_n, 6);
+        assert!(mtp_less.mtp_attention.is_none());
+        assert!(mtp_less.mtp_head.is_none());
+        assert_eq!(mtp_less.speculative_draft_tokens, Some(5));
+
         assert!(build_speculative_configs(
             &model(),
             &parallel(4),
@@ -2741,6 +2755,36 @@ mod tests {
         assert_eq!(ordinary.mtp_attention.as_ref().unwrap().decode_next_n, 1);
         assert!(ordinary.mtp_recurrent_attention.is_none());
         assert!(ordinary.speculative_draft_tokens.is_none());
+    }
+
+    #[test]
+    fn an_mtp_less_recipe_cannot_build_the_glm52_speculative_model() {
+        // The other half of moving the guard out of `build_speculative_configs`
+        // so DFlash2 can widen the decode without an MTP layer: GLM-5.2's own
+        // speculative model *is* the MTP layer, so it must still refuse a
+        // recipe that has none. Losing this would build a proposer-free
+        // "speculative" GLM-5.2 that silently models a free draft.
+        let routing = RoutingDistribution::uniform(NUM_EXPERTS);
+        let cfg = build_speculative_configs(
+            &model(),
+            &parallel(4),
+            &routing,
+            &routing,
+            false,
+            Glm52MtpMode::Off,
+            5,
+        )
+        .unwrap();
+        let bridge = PerfApiBridge::new_uninit_for_test();
+        bridge.enable_enumerate();
+        let err = match build_speculative("unified".to_string(), resolve_configs(&cfg), &bridge) {
+            Err(err) => err,
+            Ok(_) => panic!("a GLM-5.2 speculative model without an MTP layer has no proposer"),
+        };
+        assert!(
+            err.to_string().contains("requires an MTP proposer"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
