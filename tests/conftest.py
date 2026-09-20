@@ -157,3 +157,38 @@ def golden(gpu_name: str, request: pytest.FixtureRequest):
     """Factory: `golden("throughput")` → a `Golden` for the detected GPU."""
     update = request.config.getoption("--update-golden")
     return lambda metric: Golden(metric, gpu_name, update)
+
+
+@pytest.fixture(autouse=True)
+def _restore_measurement_policy_env():
+    """Undo measurement-policy settings after every test.
+
+    ``set_energy_enabled`` settles the policy for the whole process, which is
+    what the 96 ``Energy.perf`` call sites need and what makes it leak between
+    tests. ``monkeypatch`` cannot catch it: the value is a module global set
+    several frames below the test, not something the test wrote. A CLI test that
+    turned energy off once left every following test running with the window
+    disabled, which is how ``test_energy_warns_multi_gpu`` began failing only
+    when run after it.
+
+    The environment variables are still restored because they remain the
+    user-facing knob that the module state falls back to.
+    """
+
+    from profiling.profilers import energy
+
+    names = (
+        energy.ENERGY_ENV,
+        energy.REQUIRE_ENERGY_ENV,
+        "VIBESIM_PROFILE_CUPTI_BUDGET_MS",
+        "VIBESIM_PROFILE_CUPTI_TRACE",
+    )
+    saved = {name: os.environ.get(name) for name in names}
+    saved_policy = (energy._energy_policy, energy._require_energy_policy)
+    yield
+    energy._energy_policy, energy._require_energy_policy = saved_policy
+    for name, value in saved.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value

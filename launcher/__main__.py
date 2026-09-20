@@ -117,6 +117,23 @@ def _build_argparse():
         help="perf sampling frequency for --profile (default: 499).",
     )
     parser.add_argument(
+        "--energy",
+        dest="energy",
+        action="store_true",
+        default=None,
+        help="Measure the NVML energy window while profiling, and refuse to run on "
+        "cached rows that lack it (energy_j = 0.0 means 'not measured'). Default "
+        "comes from the preset's `energy:` key, which itself defaults to false: "
+        "the window is a second ~500 ms loop per spec and the largest single cost "
+        "in a cache fill.",
+    )
+    parser.add_argument(
+        "--no-energy",
+        dest="energy",
+        action="store_false",
+        help="Skip the energy window even if the preset asks for it.",
+    )
+    parser.add_argument(
         "--no-analyze",
         action="store_true",
         help="Skip the per-run analyzer (Rust SLO compute + Python plots) that "
@@ -405,6 +422,65 @@ def _expand_manifest(
     return merged
 
 
+def _apply_energy_policy(
+    flag: bool | None,
+    preset_values: list[bool | None],
+    preset_paths: list[str],
+) -> bool:
+    """Resolve the energy policy for this batch and record it for the workers.
+
+    Order: an explicit `--energy`/`--no-energy` wins, else the preset's `energy:`
+    key, else off. Off is the default because the NVML window is a second
+    ~500 ms loop per spec -- on a clean tp4/ep4 fill it cost more than the timing
+    it accompanies.
+
+    "Else off" is left to ``energy_enabled()``'s own default rather than settled
+    here, so that an exported ``VIBESIM_PROFILE_ENERGY`` still has a vote when
+    nothing in the invocation states a policy. Settling it unconditionally meant
+    ``VIBESIM_PROFILE_ENERGY=1 python -m launcher preset.yaml`` measured no
+    energy, and the CLI already guards the same way.
+
+    The policy is process state, not a signature parameter, because the profiler
+    that honours it runs in a worker subprocess (sometimes a container) several
+    frames below here. Turning it on also turns on the requirement that every
+    row the simulator consumes actually carries energy, so a cache filled
+    without it fails loudly instead of reporting zero joules.
+
+    A batch shares one process and therefore one policy, so presets that
+    disagree are an error rather than a silent last-wins.
+    """
+
+    from profiling.profilers.energy import set_energy_enabled, set_require_measured_energy
+
+    if flag is None:
+        stated = {value for value in preset_values if value is not None}
+        if len(stated) > 1:
+            print(
+                "[invalid] presets disagree on `energy:` "
+                f"({', '.join(sorted(str(v) for v in stated))}) and one batch shares "
+                f"one measurement policy: {', '.join(preset_paths)}. Pass --energy or "
+                "--no-energy to settle it, or split the batch.",
+                file=sys.stderr,
+            )
+            return False
+        for value in stated:
+            if not isinstance(value, bool):
+                print(
+                    f"[invalid] `energy:` must be true or false, got {value!r}",
+                    file=sys.stderr,
+                )
+                return False
+        if not stated:
+            return True
+        enabled = stated.pop()
+    else:
+        enabled = flag
+
+    set_energy_enabled(enabled)
+    set_require_measured_energy(enabled)
+    return True
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
 
@@ -488,6 +564,7 @@ def main(argv: list[str] | None = None) -> int:
     all_candidates: list[dict] = []
     last_preset: dict = {}
     analyze_subjects: list[str] | None = None
+    preset_energy: list[bool | None] = []
     for preset_path in args.presets:
         try:
             preset = _load_preset(Path(preset_path))
@@ -498,6 +575,10 @@ def main(argv: list[str] | None = None) -> int:
         # `analyze_subjects` is a launcher-only key (which post-run analyzer
         # subjects to render). Pop it BEFORE schema validation / sweep expansion
         # so it never reaches the simulator CLI; omit = all applicable subjects.
+        # `energy` is launcher-only measurement policy with no RunConfig field,
+        # so it is popped here for the same reason as `analyze_subjects`: past
+        # this point the tree is the simulator's payload.
+        preset_energy.append(preset.pop("energy", None))
         subjects = preset.pop("analyze_subjects", None)
         if subjects is not None:
             if not (isinstance(subjects, list) and all(isinstance(s, str) for s in subjects)):
@@ -519,6 +600,9 @@ def main(argv: list[str] | None = None) -> int:
         if cands is None:
             return 2
         all_candidates.extend(cands)
+
+    if not _apply_energy_policy(args.energy, preset_energy, args.presets):
+        return 2
 
     print(f"[plan] {len(all_candidates)} run(s) across {len(args.presets)} preset(s)")
     if not all_candidates:

@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import tempfile
 import xml.etree.ElementTree as ET
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 
 from profiling.db.kind import KernelKind
@@ -21,6 +22,11 @@ from profiling.exec.env import (
 )
 from profiling.exec.payload import chunk_result_from_payload, resolve_chunk_backend
 from profiling.exec.pool import ChunkResult, GpuChunk, GpuPool
+from profiling.instrument import TIMELINE_ENV, span
+from profiling.profilers.energy import energy_enabled
+from profiling.profilers.timer import CUPTI_BUDGET_ENV, CUPTI_TRACE_ENV, TIMER_COMPARE_ENV
+
+CONTAINER_INDUCTOR_CACHE_ENV = "VIBESIM_CONTAINER_INDUCTOR_CACHE"
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _CONTAINER_SOURCE_MODE_ENV = "VIBESIM_PROFILE_SOURCE_MODE"
@@ -69,6 +75,14 @@ class LocalGpuChunk(GpuChunk):
                     {
                         "kernel_kind": kernel_kind,
                         "specs": chunk_specs,
+                        # Measurement policy travels in the payload, like the
+                        # `measure` block, because the payload is the one thing
+                        # every worker gets the same way on every path -- host
+                        # subprocess or container. Forwarding it in the
+                        # environment instead meant a container worker silently
+                        # used a different policy whenever the forwarding list
+                        # fell behind.
+                        "energy": energy_enabled(),
                     }
                 ),
                 encoding="utf-8",
@@ -77,11 +91,14 @@ class LocalGpuChunk(GpuChunk):
                 cmd, env = _container_worker_command(profiler_env, self.gpus, Path(tmp))
             else:
                 cmd, env = _host_worker_command(profiler_env, self.gpus, input_path, output_path)
-            completed = subprocess.run(cmd, env=env, capture_output=True, text=True, check=False)
-            if completed.returncode != 0:
-                error = (
-                    completed.stderr.strip() or completed.stdout.strip() or "local profile failed"
+            # The gap between this span and the worker.boot span inside it is
+            # process/container start: fork, image, CUDA context.
+            with span("worker.subprocess", kind=kernel_kind, specs=len(chunk_specs)):
+                completed = subprocess.run(
+                    cmd, env=env, capture_output=True, text=True, check=False
                 )
+            if completed.returncode != 0:
+                error = _worker_failure_message(completed)
                 return [ChunkResult(metrics=None, error=error) for _ in chunk_specs]
 
             worker_response = json.loads(output_path.read_text(encoding="utf-8"))
@@ -89,6 +106,49 @@ class LocalGpuChunk(GpuChunk):
                 chunk_result_from_payload(result_payload)
                 for result_payload in worker_response["results"]
             ]
+
+
+_WORKER_STREAM_TAIL_CHARS = 2000
+
+
+def _worker_failure_message(completed: subprocess.CompletedProcess[str]) -> str:
+    """Describe a worker that exited non-zero, without hiding half the evidence.
+
+    The previous version was ``stderr.strip() or stdout.strip()``. Container
+    workers print a wrapper banner to stderr on every single run, so stderr was
+    always non-empty, the ``or`` always short-circuited, and stdout was never
+    reported. A chunk of 1426 specs then failed with nothing but that banner as
+    the cause.
+
+    The exit status was dropped entirely, which erased the one distinction that
+    matters first: a negative ``returncode`` is a signal, so the worker was
+    killed (OOM, segfault) rather than raising -- and a killed worker leaves no
+    traceback to look for.
+
+    Both streams are tailed rather than headed: a traceback ends with the
+    exception, and a crash log ends with the crash.
+    """
+
+    status = completed.returncode
+    if status < 0:
+        try:
+            name = signal.Signals(-status).name
+        except ValueError:
+            name = f"signal {-status}"
+        headline = f"worker killed by {name} (returncode {status})"
+    else:
+        headline = f"worker exited {status}"
+
+    parts = [headline]
+    for label, stream in (("stderr", completed.stderr), ("stdout", completed.stdout)):
+        text = (stream or "").strip()
+        if not text:
+            parts.append(f"{label}: <empty>")
+            continue
+        if len(text) > _WORKER_STREAM_TAIL_CHARS:
+            text = "...(truncated)... " + text[-_WORKER_STREAM_TAIL_CHARS:]
+        parts.append(f"{label}: {text}")
+    return " | ".join(parts)
 
 
 def _host_worker_command(
@@ -129,7 +189,50 @@ def _container_worker_command(
         )
     ).resolve()
     cache_dir.mkdir(parents=True, exist_ok=True)
-    gpu_request = f'"device={",".join(str(gpu) for gpu in gpus)}"'
+    # Address the cards by UUID, never by index. See gpu_uuids_for_indices.
+    gpu_request = f'"device={",".join(gpu_uuids_for_indices(gpus))}"'
+    # A container does not inherit this process's environment, so measurement
+    # policy has to be handed over explicitly; the host worker gets it for free
+    # through os.environ.copy(). Anything here that changes what a number MEANS
+    # belongs on this list, or a container row would silently be measured under
+    # a different policy than the host rows it sits beside. The energy window is
+    # not on the list because it rides the JSON payload, which both worker paths
+    # read identically -- that is the shape the rest of these should move to.
+    policy_args = [
+        argument
+        for name in (CUPTI_BUDGET_ENV, CUPTI_TRACE_ENV, TIMELINE_ENV, TIMER_COMPARE_ENV)
+        if name in os.environ
+        for argument in ("--env", f"{name}={os.environ[name]}")
+    ]
+    # Forwarding a path in the environment is only half the handover: the path
+    # has to exist inside the container too. The trace file is the one policy
+    # value that names a host path, and without this the container silently
+    # writes nothing while the host workers beside it trace normally -- a
+    # diagnostic that is blank for exactly the runs you most wanted to inspect.
+    # Mounted at its own absolute path so one env value works on both sides.
+    # Same handover as the trace: a path forwarded in the environment is only
+    # half the job, the directory has to exist inside the container too.
+    host_paths = [os.environ.get(CUPTI_TRACE_ENV), os.environ.get(TIMELINE_ENV)]
+    mounted: list[str] = []
+    trace_volume_args = []
+    for host_path in host_paths:
+        if not host_path:
+            continue
+        parent = str(Path(host_path).parent.resolve())
+        if parent in mounted:
+            continue
+        mounted.append(parent)
+        trace_volume_args += ["--volume", f"{parent}:{parent}"]
+    # Set empty to leave inductor on its ephemeral /tmp default. Exists so the
+    # persistent cache can be A/B'd against the old behaviour on one card: a
+    # compile cache is not supposed to change a measured number, and the only
+    # way to say that about this one is to measure both.
+    inductor_cache = os.environ.get(
+        CONTAINER_INDUCTOR_CACHE_ENV, "/cache/home/.cache/torchinductor"
+    )
+    inductor_args = (
+        ["--env", f"TORCHINDUCTOR_CACHE_DIR={inductor_cache}"] if inductor_cache else []
+    )
     source_volume_args = _container_source_volume_args()
     volume_args = [
         argument
@@ -155,10 +258,19 @@ def _container_worker_command(
             "USER=vibesim",
             "--env",
             "LOGNAME=vibesim",
+            # Inductor defaults to /tmp/torchinductor_<user>, and /tmp inside a
+            # --rm container dies with the container, so every submission
+            # recompiles from nothing. /cache is the bind mount below, so this
+            # points it at the same place the host workers already use.
+            # Triton and FlashInfer need no equivalent: both derive their cache
+            # from HOME, which is already inside /cache.
+            *inductor_args,
+            *policy_args,
             "--volume",
             f"{exchange_dir.resolve()}:/io",
             "--volume",
             f"{cache_dir}:/cache",
+            *trace_volume_args,
             *source_volume_args,
             *volume_args,
             profiler_env.image,
@@ -199,7 +311,7 @@ def _container_source_volume_args() -> list[str]:
     return volume_args
 
 
-def find_idle_gpus(memory_threshold_mb: int = 1000, util_threshold_pct: int = 10) -> list[int]:
+def _nvidia_smi_xml() -> ET.Element | None:
     try:
         result = subprocess.run(
             ["nvidia-smi", "-q", "-x"],
@@ -208,9 +320,50 @@ def find_idle_gpus(memory_threshold_mb: int = 1000, util_threshold_pct: int = 10
             check=True,
         )
     except (FileNotFoundError, subprocess.CalledProcessError):
+        return None
+    return ET.fromstring(result.stdout)
+
+
+def gpu_uuids_for_indices(gpu_indices: Sequence[int]) -> list[str]:
+    """Name the cards at ``gpu_indices`` by UUID, for a reader in another view.
+
+    A GPU index only means something relative to the device list the process
+    that read it could see, and a container runtime reads a different one: under
+    a device cgroup (Slurm's ``ConstrainDevices``, say) the one allocated card
+    enumerates here as index 0, while ``dockerd`` sits outside that cgroup and
+    resolves ``--gpus device=0`` to the host's first card. Passing the index
+    across that boundary silently profiles whatever GPU 0 happens to be —
+    someone else's job, or every concurrent worker piling onto one card. A UUID
+    names the same silicon in both views, so the container path uses it.
+
+    Raises when a UUID cannot be established, rather than falling back to the
+    index: the fallback is exactly the mis-targeting this exists to prevent.
+    """
+
+    root = _nvidia_smi_xml()
+    if root is None:
+        raise RuntimeError("nvidia-smi is required to address container GPUs by UUID")
+
+    uuid_by_index: dict[int, str] = {}
+    for gpu_index, gpu in enumerate(root.findall("gpu")):
+        gpu_uuid = (gpu.findtext("uuid") or "").strip()
+        if gpu_uuid:
+            uuid_by_index[gpu_index] = gpu_uuid
+
+    missing = [gpu_index for gpu_index in gpu_indices if gpu_index not in uuid_by_index]
+    if missing:
+        raise RuntimeError(
+            f"nvidia-smi reported no UUID for GPU index(es) {missing}; "
+            f"indices visible here are {sorted(uuid_by_index)}"
+        )
+    return [uuid_by_index[gpu_index] for gpu_index in gpu_indices]
+
+
+def find_idle_gpus(memory_threshold_mb: int = 1000, util_threshold_pct: int = 10) -> list[int]:
+    root = _nvidia_smi_xml()
+    if root is None:
         return []
 
-    root = ET.fromstring(result.stdout)
     visible_gpu_order = _cuda_visible_gpu_order(root, os.environ.get("CUDA_VISIBLE_DEVICES"))
     visible_gpu_set = set(visible_gpu_order) if visible_gpu_order is not None else None
     idle_by_index = {}

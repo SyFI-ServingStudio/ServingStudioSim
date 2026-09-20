@@ -78,8 +78,9 @@ def test_profile_run_writes_immutable_snapshot(monkeypatch, tmp_path: Path) -> N
         db_path,
         jit_enabled: bool,
         force: bool = False,
+        persist: bool = True,
     ):
-        del kernel_kind, backend, gpu_name, db_path, jit_enabled, force
+        del kernel_kind, backend, gpu_name, db_path, jit_enabled, force, persist
         return KindTimesResult(
             results=[
                 ComputeMetrics(
@@ -107,6 +108,8 @@ def test_profile_run_writes_immutable_snapshot(monkeypatch, tmp_path: Path) -> N
         db=None,
         gpu_name="NVIDIA H200",
         force=False,
+        fresh=False,
+        energy=True,
         output_dir=output_dir,
         json=True,
     )

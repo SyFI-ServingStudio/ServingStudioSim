@@ -20,6 +20,7 @@ from profiling.db.kind import KernelKind
 from profiling.db.registry import find_kernel_profiler_spec, resolve_spec_backend
 from profiling.db.table import ProfileRow, Table
 from profiling.gpu_catalog import resolve_gpu_spec
+from profiling.instrument import span
 from profiling.runners.metrics import Metrics
 
 if TYPE_CHECKING:
@@ -178,12 +179,13 @@ def execute_profile_batch(
     # Identity validation happens once after all chunks finish, before any insert.
     for (backend, gpu_count), classified_specs in classified_by_backend_gpu_count.items():
         profiler_spec = find_kernel_profiler_spec(kernel_kind, backend)
-        reserved_chunks = list(
-            selected_pool.acquire_chunks(
-                gpu_count,
-                max_concurrent=len(classified_specs),
+        with span("pool.acquire", kind=kernel_kind, backend=backend):
+            reserved_chunks = list(
+                selected_pool.acquire_chunks(
+                    gpu_count,
+                    max_concurrent=len(classified_specs),
+                )
             )
-        )
         if not reserved_chunks:
             raise RuntimeError(f"pool returned no chunks for {backend} with {gpu_count} GPU(s)")
 
@@ -232,7 +234,8 @@ def execute_profile_batch(
                     for prepared_spec, chunk_result in successful_profiles
                     if chunk_result.metrics is not None
                 ]
-                Table(profiler_spec, db_path).insert(profile_rows)
+                with span("db.insert", kind=kernel_kind, rows=len(profile_rows)):
+                    Table(profiler_spec, db_path).insert(profile_rows)
     else:
         effective_cache_key, observed_after_validation = gpu_name, None
 
@@ -263,9 +266,15 @@ def _log_batch_failures(
 ) -> None:
     """Surface runner errors that would otherwise become anonymous cache misses."""
     failed = sum(failures.values())
-    level = logging.ERROR if failed == attempted else logging.WARNING
+    total_failure = failed == attempted
+    level = logging.ERROR if total_failure else logging.WARNING
     reasons = [
-        f"{count}x {_display_failure_reason(reason)}"
+        # Truncating is right for a partial failure -- a handful of OOM specs
+        # inside a large batch should not bury the log. It is wrong when every
+        # spec failed: that backend is now a hard stop for whatever asked for
+        # it, and the 240-char cut lands in the middle of the traceback,
+        # leaving "File ..." and nothing about what actually raised.
+        f"{count}x {reason if total_failure else _display_failure_reason(reason)}"
         for reason, count in failures.most_common(_MAX_REPORTED_FAILURE_REASONS)
     ]
     omitted = len(failures) - len(reasons)
@@ -399,7 +408,11 @@ def _run_chunk_assignment(
     chunk_assignment: _ChunkAssignment,
 ) -> list[tuple[_PreparedProfileSpec, ChunkResult]]:
     chunk_specs = [prepared_spec.chunk_spec for prepared_spec in chunk_assignment.assigned_specs]
-    chunk_results = chunk_assignment.chunk.run(kernel_kind, chunk_specs)
+    # One span per chunk. A kernel group ends when its slowest chunk ends, so
+    # the spread between these is the synchronisation loss -- the part that does
+    # not shrink by adding cards.
+    with span("chunk.run", kind=kernel_kind, specs=len(chunk_specs)):
+        chunk_results = chunk_assignment.chunk.run(kernel_kind, chunk_specs)
     if len(chunk_results) != len(chunk_assignment.assigned_specs):
         raise RuntimeError(
             "execution backend returned "

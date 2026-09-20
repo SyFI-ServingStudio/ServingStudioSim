@@ -38,7 +38,6 @@ from pathlib import Path
 
 import pytest
 import yaml
-
 from fixtures.gen_throughput_trace import DEFAULT_N, DEFAULT_SEED, write_trace
 
 # Fixed config — any change to the preset templates below invalidates the

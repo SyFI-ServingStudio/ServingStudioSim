@@ -1899,3 +1899,133 @@ def test_real_schema_shape():
     assert "barebone" in real.worker_tags("iter_wise")
     tp = next(p for p in real.arch_params("iter_wise", "llama3_dense_tp") if p["name"] == "tp_size")
     assert tp["affects_cache"] is True
+
+
+# ── energy policy ────────────────────────────────────────────────────────────
+#
+# `energy:` decides whether profiling opens the NVML window. It defaults to off
+# because the window is a second ~500 ms loop per spec: on a clean tp4/ep4 fill
+# it cost more than the timing it accompanies (64 rms_norm specs took 3.57 s
+# with it off and 77.95 s with it on). Turning it on also requires that every
+# row the simulator consumes actually carries energy, because `energy_j = 0.0`
+# means "not measured" and would otherwise reach the output parquet as zero
+# joules.
+
+
+def _energy_env(monkeypatch):
+    from launcher.__main__ import _apply_energy_policy
+    from profiling.profilers import energy
+
+    monkeypatch.delenv(energy.ENERGY_ENV, raising=False)
+    monkeypatch.delenv(energy.REQUIRE_ENERGY_ENV, raising=False)
+    return _apply_energy_policy, energy
+
+
+def test_energy_defaults_off_when_no_preset_or_flag_says_otherwise(monkeypatch):
+    apply, energy = _energy_env(monkeypatch)
+    assert apply(None, [None], ["p.yaml"]) is True
+    assert energy.energy_enabled() is False
+    assert energy.require_measured_energy() is False
+
+
+def test_energy_true_in_a_preset_also_requires_rows_to_carry_it(monkeypatch):
+    apply, energy = _energy_env(monkeypatch)
+    assert apply(None, [True], ["p.yaml"]) is True
+    assert energy.energy_enabled() is True
+    # The second half of the switch: asking for energy means a cache filled
+    # without it is an error, not a silent zero.
+    assert energy.require_measured_energy() is True
+
+
+def test_energy_flag_overrides_the_preset(monkeypatch):
+    apply, energy = _energy_env(monkeypatch)
+    assert apply(False, [True], ["p.yaml"]) is True
+    assert energy.energy_enabled() is False
+    assert energy.require_measured_energy() is False
+
+
+def test_energy_rejects_presets_that_disagree(monkeypatch, capsys):
+    """One batch is one process and therefore one measurement policy, so a
+    last-wins would silently measure some presets and not others."""
+
+    apply, _ = _energy_env(monkeypatch)
+    assert apply(None, [True, False], ["a.yaml", "b.yaml"]) is False
+    assert "disagree on `energy:`" in capsys.readouterr().err
+
+
+def test_energy_rejects_a_non_boolean(monkeypatch, capsys):
+    apply, _ = _energy_env(monkeypatch)
+    assert apply(None, ["maybe"], ["p.yaml"]) is False
+    assert "must be true or false" in capsys.readouterr().err
+
+
+def test_simulation_refuses_rows_whose_energy_was_never_measured(monkeypatch):
+    """The check the launcher arms: a row with energy_j = 0.0 cannot answer a
+    run that asked for energy, so it fails at the shared facade core rather than
+    becoming a plausible zero in the output parquet."""
+
+    from profiling.facade import UnmeasuredEnergyError, _reject_unmeasured_energy
+    from profiling.profilers import energy
+    from profiling.runners.metrics import ComputeMetrics
+
+    monkeypatch.setenv(energy.REQUIRE_ENERGY_ENV, "1")
+    measured = ComputeMetrics(
+        time_ms=1.0, tflops=2.0, memory_bandwidth_gbps=3.0, energy_j=4.0
+    )
+    unmeasured = ComputeMetrics(
+        time_ms=1.0, tflops=2.0, memory_bandwidth_gbps=3.0, energy_j=0.0
+    )
+
+    _reject_unmeasured_energy([measured], "single_gemm", "torch_linear", "NVIDIA B200")
+
+    with pytest.raises(UnmeasuredEnergyError, match="not measured"):
+        _reject_unmeasured_energy(
+            [measured, unmeasured], "single_gemm", "torch_linear", "NVIDIA B200"
+        )
+
+    # Timing-only runs are a legitimate use of the same rows.
+    monkeypatch.setenv(energy.REQUIRE_ENERGY_ENV, "0")
+    _reject_unmeasured_energy([unmeasured], "single_gemm", "torch_linear", "NVIDIA B200")
+
+
+def test_energy_requirement_does_not_reject_comm_rows(monkeypatch):
+    """`CommMetrics.energy_j` is a structural zero, not a skipped measurement.
+
+    No comm runner has ever measured it. Judging it by the compute rule made
+    `energy: true` raise on the first all-reduce of any tp>1 run, with a message
+    telling the user to re-profile with energy on -- which could never succeed,
+    so the run was unfixably broken rather than merely wrong.
+    """
+
+    from profiling.facade import _reject_unmeasured_energy
+    from profiling.profilers import energy
+    from profiling.runners.metrics import CommMetrics
+
+    monkeypatch.setenv(energy.REQUIRE_ENERGY_ENV, "1")
+    comm = CommMetrics(time_ms=1.0, algbw_gbps=2.0, busbw_gbps=3.0)
+    assert comm.energy_j == 0.0
+
+    _reject_unmeasured_energy([comm], "all_reduce", "nccl", "NVIDIA B200")
+
+
+def test_energy_leaves_an_exported_policy_alone_when_nothing_states_one(monkeypatch):
+    """No flag and no preset key means the launcher has no opinion to record.
+
+    Settling it anyway wrote `VIBESIM_PROFILE_ENERGY=0` into the simulator
+    child's environment, so `VIBESIM_PROFILE_ENERGY=1 python -m launcher ...`
+    measured no energy. The CLI already guards the same way.
+    """
+
+    apply, energy = _energy_env(monkeypatch)
+    monkeypatch.setenv(energy.ENERGY_ENV, "1")
+
+    assert apply(None, [None], ["p.yaml"]) is True
+    assert energy.energy_enabled() is True
+
+
+def test_energy_flag_still_overrides_an_exported_policy(monkeypatch):
+    apply, energy = _energy_env(monkeypatch)
+    monkeypatch.setenv(energy.ENERGY_ENV, "1")
+
+    assert apply(False, [None], ["p.yaml"]) is True
+    assert energy.energy_enabled() is False

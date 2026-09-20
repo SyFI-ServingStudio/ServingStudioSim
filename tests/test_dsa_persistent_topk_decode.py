@@ -949,7 +949,7 @@ def test_native_profile_times_only_complete_op_and_returns_metrics(monkeypatch, 
     monkeypatch.setattr(runner, "_validate_native_semantics", lambda *args, **kwargs: None)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: events.append(("sync",)))
 
-    def fake_cuda_event(kernel, *, warmup):
+    def fake_cupti(kernel, *, warmup):
         events.append(("timer", warmup))
         assert kernel() is None
         return 0.25
@@ -959,7 +959,7 @@ def test_native_profile_times_only_complete_op_and_returns_metrics(monkeypatch, 
         assert kernel() is None
         return 0.125
 
-    monkeypatch.setattr(runner.Timer, "cuda_event", fake_cuda_event)
+    monkeypatch.setattr(runner.Timer, "cupti", fake_cupti)
     monkeypatch.setattr(runner.Energy, "perf", fake_energy)
     metrics = runner.profile_dsa_persistent_topk_decode_vllm_cuda(
         **(_BASE_SPEC | {"batch_size": 1, "context_len": 7, "next_n": next_n})
@@ -995,7 +995,7 @@ def test_native_profile_translates_op_runtime_failure(monkeypatch) -> None:
     monkeypatch.setattr(runner, "_build_native_operands", lambda *args, **kwargs: operands)
     monkeypatch.setattr(runner, "_validate_native_semantics", lambda *args, **kwargs: None)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
-    monkeypatch.setattr(runner.Timer, "cuda_event", lambda kernel, **kwargs: kernel())
+    monkeypatch.setattr(runner.Timer, "cupti", lambda kernel, **kwargs: kernel())
     with pytest.raises(KernelLaunchFailed, match="synthetic pinned op failure"):
         runner.profile_dsa_persistent_topk_decode_vllm_cuda(
             **(_BASE_SPEC | {"batch_size": 1, "context_len": 3, "next_n": 1})

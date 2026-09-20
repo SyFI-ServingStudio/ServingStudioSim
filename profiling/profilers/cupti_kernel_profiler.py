@@ -716,6 +716,7 @@ class CuptiKernelProfiler:
         min_duration_ms: int = 2_000,
         min_iter: int = 20,
         max_iter: int = 50_000,
+        launch_count: int | None = None,
         clear_l2_before_run: bool = True,
         clear_l2_between_launches: bool = True,
         kernel_name_contains: str | None = None,
@@ -729,6 +730,13 @@ class CuptiKernelProfiler:
         window containing that many logical launches. This keeps the requested
         active-time budget without injecting periodic capture restarts into the
         workload's power/clock state.
+
+        ``launch_count`` supplies that count directly and skips the estimator,
+        for a caller that has already measured the rate. It is the only way to
+        fix the count and keep the single-window property: ``profile`` with
+        ``num_iter=N`` opens N separate CUPTI windows, and the idle gaps between
+        them let the board recover, which reads a power-capped kernel as much as
+        13% faster than it sustains.
 
         By default every logical launch starts after a read-only reduction over
         the L2-displacement buffer. The clear kernels are captured for ordering
@@ -746,6 +754,8 @@ class CuptiKernelProfiler:
             raise ValueError("min_iter must be positive")
         if max_iter < min_iter:
             raise ValueError("max_iter must be >= min_iter")
+        if launch_count is not None and launch_count <= 0:
+            raise ValueError("launch_count must be positive")
 
         torch_mod = _require_torch()
         for _ in range(num_warmup):
@@ -764,27 +774,32 @@ class CuptiKernelProfiler:
             clear_l2_between_launches=clear_l2_between_launches,
             kernel_name_contains=kernel_name_contains,
         )
-        estimate_ms, _, _ = _capture_launch_unit(
-            self,
-            fn,
-            launches_per_run=estimate_iter,
-            clear_l2_before_run=clear_l2_before_run,
-            clear_l2_between_launches=clear_l2_between_launches,
-            kernel_name_contains=kernel_name_contains,
-            launch_pattern=launch_pattern,
-            interval_union=interval_union,
-        )
-        estimate_mean_ms = fmean(estimate_ms)
-        if estimate_mean_ms <= 0:
-            raise RuntimeError(f"CUPTI duration estimate must be positive, got {estimate_mean_ms}")
+        if launch_count is not None:
+            formal_iter = launch_count
+        else:
+            estimate_ms, _, _ = _capture_launch_unit(
+                self,
+                fn,
+                launches_per_run=estimate_iter,
+                clear_l2_before_run=clear_l2_before_run,
+                clear_l2_between_launches=clear_l2_between_launches,
+                kernel_name_contains=kernel_name_contains,
+                launch_pattern=launch_pattern,
+                interval_union=interval_union,
+            )
+            estimate_mean_ms = fmean(estimate_ms)
+            if estimate_mean_ms <= 0:
+                raise RuntimeError(
+                    f"CUPTI duration estimate must be positive, got {estimate_mean_ms}"
+                )
 
-        estimated_iter = max(ceil(min_duration_ms / estimate_mean_ms), min_iter)
-        # ``max_iter`` is an execution-budget cap, not an error threshold. Very
-        # short kernels can otherwise turn a modest active-time target into
-        # millions of cold-L2 launches and CUPTI records. The capped sample is
-        # still a valid per-launch mean; it simply stops before exhausting the
-        # requested active-time budget.
-        formal_iter = min(estimated_iter, max_iter)
+            estimated_iter = max(ceil(min_duration_ms / estimate_mean_ms), min_iter)
+            # ``max_iter`` is an execution-budget cap, not an error threshold. Very
+            # short kernels can otherwise turn a modest active-time target into
+            # millions of cold-L2 launches and CUPTI records. The capped sample is
+            # still a valid per-launch mean; it simply stops before exhausting the
+            # requested active-time budget.
+            formal_iter = min(estimated_iter, max_iter)
 
         per_iter_ms, matched_kernel_names, matched_kernel_count_per_run = _capture_launch_unit(
             self,
@@ -979,6 +994,7 @@ def profile_kernel_for_duration(
     min_duration_ms: int = 2_000,
     min_iter: int = 20,
     max_iter: int = 50_000,
+    launch_count: int | None = None,
     clear_l2_bytes: int | None = None,
     clear_l2_before_run: bool = True,
     clear_l2_between_launches: bool = True,
@@ -993,6 +1009,7 @@ def profile_kernel_for_duration(
         min_duration_ms=min_duration_ms,
         min_iter=min_iter,
         max_iter=max_iter,
+        launch_count=launch_count,
         clear_l2_before_run=clear_l2_before_run,
         clear_l2_between_launches=clear_l2_between_launches,
         kernel_name_contains=kernel_name_contains,

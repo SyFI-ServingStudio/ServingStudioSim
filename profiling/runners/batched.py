@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
+from profiling.instrument import span
 from profiling.runners.metrics import Metrics, RunnerResult
 
 SingleSpecFn = Callable[..., Metrics]
@@ -35,11 +36,16 @@ def batched(single_fn: SingleSpecFn) -> ListRunner:
     def run(kwargs_list: list[dict]) -> list[RunnerResult]:
         results: list[RunnerResult] = []
         for kwargs in kwargs_list:
-            try:
-                results.append(RunnerResult(metrics=single_fn(**kwargs)))
-            except Exception as exc:  # noqa: BLE001 — capture per-item, keep the batch alive
-                _empty_cuda_cache()
-                results.append(RunnerResult(error=str(exc)))
+            # One span per spec. Subtracting the spec's CUPTI capture (already
+            # in the cupti trace) leaves the per-spec cost that is not the
+            # measurement: input allocation, JIT, the energy window when on.
+            with span("spec", fn=single_fn.__name__) as extra:
+                try:
+                    results.append(RunnerResult(metrics=single_fn(**kwargs)))
+                except Exception as exc:  # noqa: BLE001 — capture per-item, keep the batch alive
+                    _empty_cuda_cache()
+                    results.append(RunnerResult(error=str(exc)))
+                    extra["failed"] = True
         return results
 
     return run

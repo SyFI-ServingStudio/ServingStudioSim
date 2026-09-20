@@ -569,6 +569,41 @@ only in non-kernel params (request rate, replicas, `log_dir`, …) collapse to o
 prebuild. `--cache-report` runs the binary's `dry-run` per key to show coverage
 without building anything.
 
+### `energy:` — measure NVML energy, or refuse rows that lack it
+
+```yaml
+energy: false     # default; may be omitted
+```
+`--energy` / `--no-energy` override it for one invocation. A batch shares one
+process and therefore one policy, so presets that disagree are rejected rather
+than last-wins.
+
+**Off by default because the window is expensive.** `Energy.perf` opens a second
+loop per spec that runs for a fixed `DEFAULT_MIN_DURATION_MS` (500 ms) plus
+warmup and a `pynvml.nvmlInit()`. Measured on B200: 64 `rms_norm` specs profile
+in 3.57 s with it off and 77.95 s with it on, and on a clean tp4/ep4 fill it was
+the single largest cost — larger than the CUPTI timing it accompanies. Nothing
+in the timing path needs it.
+
+**On means rows must actually carry it.** `energy_j = 0.0` means "not measured"
+on every path that can produce it (window skipped, pynvml absent, NVML handle
+unresolvable, column default), and the simulator writes the value straight into
+its output parquet — where a cache filled without the window reads as a run that
+drew no power. So `energy: true` also sets `VIBESIM_REQUIRE_ENERGY`, and
+`profiling.facade` raises `UnmeasuredEnergyError` naming the kernel, backend and
+count as soon as such a row is read. Re-profile those rows with energy on, or
+run `energy: false` and read the zeros for what they are.
+
+The policy is not a `RunConfig` field: the code that honours it is `Energy.perf`,
+read from 96 runner call sites whose signatures carry only the kernel's own
+arguments. So it is settled as process state (`set_energy_enabled`) and each
+spawn carries it into the child by writing it into that child's input —
+the simulator binary gets `VIBESIM_PROFILE_ENERGY` / `VIBESIM_REQUIRE_ENERGY` in
+the environment `launcher.exec` builds for it, and a profiling worker gets an
+`energy` key in the JSON payload, the same on the host path and the container
+path. Exporting the two variables yourself still works as the outermost default;
+an explicit flag or preset key overrides them without writing them back.
+
 ## Resume & output layout
 
 - **Resume (default):** `.complete` is only a finalize commit, not proof by
