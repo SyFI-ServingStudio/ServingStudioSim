@@ -1,7 +1,7 @@
 [submodule "alignment/profiler/vllm"]
 	path = alignment/profiler/vllm
 	url = https://github.com/serendipity-zk/vllm.git
-	branch = moesim-profile
+	branch = glm53-dflash2-alignment
 [submodule "alignment/profiler/sglang"]
 	path = alignment/profiler/sglang
 	url = https://github.com/serendipity-zk/sglang.git
