@@ -14,12 +14,15 @@ import argparse
 import importlib.metadata
 import json
 import sys
+import time
 from pathlib import Path
 
 from profiling.db.batch import args_to_spec, coerce_args
 from profiling.db.kind import KernelKind
 from profiling.db.registry import find_kernel_profiler_spec
 from profiling.exec.payload import metrics_to_payload, resolve_chunk_backend
+from profiling.instrument import emit, span
+from profiling.profilers.energy import set_energy_enabled
 from profiling.profilers.measure_context import (
     MeasureContext,
     clear_measure_context,
@@ -27,13 +30,26 @@ from profiling.profilers.measure_context import (
 )
 from profiling.runners.metrics import RunnerResult
 
+_PROCESS_STARTED = time.time()
+
 
 def _worker_main(input_path: Path, output_path: Path) -> None:
+    # _PROCESS_STARTED is captured at import, so this span covers the
+    # interpreter's own start-up cost as seen from inside: torch and the backend
+    # import, CUDA context creation, registry resolution.
+    boot_started = _PROCESS_STARTED
     worker_request = json.loads(input_path.read_text(encoding="utf-8"))
     kernel_kind: KernelKind = worker_request["kernel_kind"]
     chunk_specs = worker_request["specs"]
     backend = resolve_chunk_backend(kernel_kind, chunk_specs)
     profiler_spec = find_kernel_profiler_spec(kernel_kind, backend)
+
+    # Settled before any runner loads, because `Energy.perf` is read 96 call
+    # sites down and none of those signatures carries policy. Absent key → leave
+    # the process default alone, so a payload written by an older controller
+    # still runs.
+    if "energy" in worker_request:
+        set_energy_enabled(bool(worker_request["energy"]))
 
     # An optional `measure` block turns this run into the trend+telemetry probe:
     # the context makes the shared Timer.cupti seam capture per-launch durations
@@ -58,8 +74,10 @@ def _worker_main(input_path: Path, output_path: Path) -> None:
     ]
     if measure_context is not None:
         set_measure_context(measure_context)
+    emit("worker.boot", boot_started, time.time(), kind=kernel_kind, specs=len(kwargs_list))
     try:
-        results = runner(kwargs_list)
+        with span("worker.runner", kind=kernel_kind, specs=len(kwargs_list)):
+            results = runner(kwargs_list)
     finally:
         if measure_context is not None:
             clear_measure_context()

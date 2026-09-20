@@ -57,8 +57,23 @@ def _build_subprocess_env() -> dict[str, str]:
     (so `import profiling...` resolves the repo-local perf_api package, which is
     not installed into site-packages) and the venv site-packages (torch / the
     profiler stack).
+
+    It also carries the measurement policy the launcher resolved. That child is
+    a separate process running its own Python, so a policy settled in this one
+    does not reach it; the environment is how a spawn configures a child, and
+    writing it here -- at the spawn, from the resolved value -- keeps it visible
+    rather than a side effect of whoever last called ``set_energy_enabled``.
     """
+    from profiling.profilers.energy import (
+        ENERGY_ENV,
+        REQUIRE_ENERGY_ENV,
+        energy_enabled,
+        require_measured_energy,
+    )
+
     env = os.environ.copy()
+    env[ENERGY_ENV] = "1" if energy_enabled() else "0"
+    env[REQUIRE_ENERGY_ENV] = "1" if require_measured_energy() else "0"
     env["PYTHON"] = sys.executable
     env["PYO3_PYTHON"] = sys.executable
     env.pop("PYTHONHOME", None)

@@ -29,7 +29,7 @@ The supported CLI is:
 uv run python -m launcher kernel-profile list [--json]
 uv run python -m launcher kernel-profile count-missing <table> --backend <backend> (--spec JSON | --specs PATH) [--gpu-name NAME] [--db PATH] [--json]
 uv run python -m launcher kernel-profile query <table> --backend <backend> (--spec JSON | --specs PATH) [--gpu-name NAME] [--db PATH] [--json]
-uv run python -m launcher kernel-profile run <table> --backend <backend> (--spec JSON | --specs PATH) [--force] [--output-dir DIR] [--gpu-name NAME] [--db PATH] [--json]
+uv run python -m launcher kernel-profile run <table> --backend <backend> (--spec JSON | --specs PATH) [--force | --fresh] [--output-dir DIR] [--gpu-name NAME] [--db PATH] [--json]
 ```
 
 `python -m profiling ...` remains a compatibility/developer entry and calls the
@@ -56,6 +56,13 @@ Important semantics:
   missing specs are profiled, then results are queried.
 - `run --force` refreshes every provided spec through `perf_api` even if rows
   already exist.
+- `run --fresh` measures every provided spec exactly like `--force` but inserts
+  nothing: the DB is left untouched and the reported metrics come straight from
+  the measurement. Use it to look at a kernel's numbers without moving the
+  shared cache. The two flags are mutually exclusive, and because nothing is
+  written, a `--fresh` result is **not** DB evidence — its `missing_count`
+  counts specs whose runner failed in that run, not rows absent from the DB, and
+  a follow-up `count-missing` will (correctly) still report those rows missing.
 - `run --output-dir DIR` writes immutable `request.json`, `results.json`,
   `curve.json`, and `job.meta.json`. A managed Agent run requires this option;
   put it below the workspace `logs/` root. Direct development calls may omit it
@@ -221,7 +228,8 @@ only after doing the exact action, or write `N/A: reason`.
 - [] Confirm the command does not narrow the device set (no
   `CUDA_VISIBLE_DEVICES`, no `VIBESIM_PROFILE_GPUS`) — L1 detects and arranges
   idle GPUs itself. If it does, record the concrete reason.
-- [] Choose the command mode: `count-missing`, `query`, `run`, or `run --force`.
+- [] Choose the command mode: `count-missing`, `query`, `run`, `run --force`,
+  or `run --fresh` (measure without persisting).
 - [] For `run` / `run --force`, choose a fresh `--output-dir` below `logs/` when
   the result must appear in the managed UI. Never reuse an artifact directory
   containing an existing immutable snapshot.
@@ -237,7 +245,8 @@ only after doing the exact action, or write `N/A: reason`.
   errored. If manual sharding was required, record the allowed exception and
   supporting evidence.
 - [] For `run` or `run --force`, run `count-missing` again on the same
-  table/backend/specs/DB/gpu-name to verify persistence.
+  table/backend/specs/DB/gpu-name to verify persistence. Skip this for
+  `run --fresh`, which is expected to leave the rows missing.
 - [] For `query` or completed `run`, verify the JSON result count equals the
   spec count and each result has `status: "ok"` unless reporting misses.
 - [] Sanity-check metrics by family: compute rows have `time_ms`, `tflops`,
@@ -267,9 +276,10 @@ items as `[x]` only when complete.
   multi-spec request, or an allowed manual-sharding exception is documented
   with evidence.
 - [] `count-missing` was run before profiling, or skipped with a stated reason.
-- [] `run` or `run --force` completed with exit code 0.
+- [] `run`, `run --force`, or `run --fresh` completed with exit code 0.
 - [] Any retry contained only specs previously reported missing or errored.
 - [] Post-run `count-missing` returned 0, or every remaining miss is listed.
+  N/A for `run --fresh`, which persists nothing by design.
 - [] `query` or run output returned one result per input spec.
 - [] No result has `status: "missing"` unless the final answer explicitly
   reports the miss.
@@ -295,7 +305,7 @@ Always report:
   `skills/operate-profile-existing-kernel/SKILL.md`.
 - Docs checked: concrete doc paths/sections.
 - Command(s): exact CLI command(s), including `--db`, `--gpu-name`, and
-  `--force` when used.
+  `--force` / `--fresh` when used.
 - Scope: table, backend, spec count, DB path, and whether DB path was temporary
   or shared.
 - Submission: confirm one complete `run --specs` call, or report the allowed
@@ -304,7 +314,8 @@ Always report:
   whether the command relied on CUDA device-name auto-resolution. State that the
   device set was left to L1's idle-GPU detection, or report the narrowing and
   its concrete reason.
-- Mode: read-only query, count-missing, JIT-fill, or force refresh.
+- Mode: read-only query, count-missing, JIT-fill, force refresh, or fresh
+  (measured, not persisted). For `fresh`, say plainly that no row was written.
 - Result: missing count before/after when available.
 - Metrics: compact table of returned metrics, or JSON status summary for large
   batches. For small batches, include the input `KernelArgs` columns next to

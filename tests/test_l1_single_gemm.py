@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import sqlite3
 import subprocess
@@ -12,6 +13,7 @@ from pathlib import Path
 import pytest
 
 import profiling.exec.env as exec_env
+import profiling.exec.local as local_exec
 from profiling import perf_api
 from profiling.db import (
     SCHEMA_HASH,
@@ -237,6 +239,8 @@ def test_energy_perf_uses_total_energy_counter(monkeypatch: pytest.MonkeyPatch):
     from profiling.profilers import energy as energy_mod
     from profiling.profilers.energy import Energy
 
+    # The window is opt-in; this test is about what it does once opened.
+    monkeypatch.setenv(energy_mod.ENERGY_ENV, "1")
     energy_mod._TOTAL_ENERGY_SUPPORTED_BY_GPU.clear()
 
     class FakeCuda:
@@ -307,6 +311,8 @@ def test_energy_perf_resolves_remapped_cuda_device_by_uuid(
     from profiling.profilers import energy as energy_mod
     from profiling.profilers.energy import Energy
 
+    # The window is opt-in; this test is about what it does once opened.
+    monkeypatch.setenv(energy_mod.ENERGY_ENV, "1")
     energy_mod._TOTAL_ENERGY_SUPPORTED_BY_GPU.clear()
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "3,1")
 
@@ -387,6 +393,8 @@ def test_energy_perf_does_not_guess_nvml_index_when_uuid_is_unavailable(
     from profiling.profilers import energy as energy_mod
     from profiling.profilers.energy import Energy
 
+    # The window is opt-in; this test is about what it does once opened.
+    monkeypatch.setenv(energy_mod.ENERGY_ENV, "1")
     energy_mod._TOTAL_ENERGY_SUPPORTED_BY_GPU.clear()
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "3")
 
@@ -426,6 +434,8 @@ def test_energy_perf_uses_passed_timing_for_iteration_count(
     from profiling.profilers import energy as energy_mod
     from profiling.profilers.energy import Energy
 
+    # The window is opt-in; this test is about what it does once opened.
+    monkeypatch.setenv(energy_mod.ENERGY_ENV, "1")
     energy_mod._TOTAL_ENERGY_SUPPORTED_BY_GPU.clear()
 
     class FakeCuda:
@@ -505,6 +515,8 @@ def test_energy_window_restarts_cleanly_when_planned_iters_are_short(
     from profiling.profilers import energy as energy_mod
     from profiling.profilers.energy import Energy
 
+    # The window is opt-in; this test is about what it does once opened.
+    monkeypatch.setenv(energy_mod.ENERGY_ENV, "1")
     energy_mod._TOTAL_ENERGY_SUPPORTED_BY_GPU.clear()
 
     perf_counter_values = iter([0.0, 0.4, 10.0, 11.1])
@@ -586,6 +598,8 @@ def test_energy_perf_falls_back_to_power_polling(monkeypatch: pytest.MonkeyPatch
     from profiling.profilers import energy as energy_mod
     from profiling.profilers.energy import Energy
 
+    # The window is opt-in; this test is about what it does once opened.
+    monkeypatch.setenv(energy_mod.ENERGY_ENV, "1")
     energy_mod._TOTAL_ENERGY_SUPPORTED_BY_GPU.clear()
 
     class FakeCuda:
@@ -1371,6 +1385,56 @@ def test_local_chunk_rejects_mixed_backends_before_subprocess(monkeypatch: pytes
                 {"m": 8, "n": 8, "k": 8, "dtype": "fp16", "backend": "other"},
             ],
         )
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_local_chunk_puts_the_energy_policy_in_the_worker_payload(
+    enabled: bool,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The payload is the channel, on every worker path.
+
+    ``Energy.perf`` is read 96 runner call sites down, so the policy has to be
+    process state by the time a runner loads; the payload is how that state gets
+    into the worker's process rather than being inferred from an environment the
+    controller hoped it inherited.
+    """
+
+    from profiling.profilers import energy as energy_mod
+
+    energy_mod.set_energy_enabled(enabled)
+    seen: dict[str, object] = {}
+
+    def fake_run(cmd, **kwargs):
+        del cmd
+        input_path = next(
+            Path(argument) for argument in _last_command if argument.endswith("input.json")
+        )
+        seen["payload"] = json.loads(input_path.read_text(encoding="utf-8"))
+        raise _StopWorker
+
+    _last_command: list[str] = []
+    real_host_command = local_exec._host_worker_command
+
+    def capture_host_command(*args, **kwargs):
+        cmd, env = real_host_command(*args, **kwargs)
+        _last_command[:] = cmd
+        return cmd, env
+
+    monkeypatch.setattr(local_exec, "_host_worker_command", capture_host_command)
+    monkeypatch.setattr(local_exec.subprocess, "run", fake_run)
+
+    with pytest.raises(_StopWorker):
+        LocalGpuChunk([0]).run(
+            "single_gemm",
+            [{"m": 8, "n": 8, "k": 8, "dtype": "fp16", "backend": "torch"}],
+        )
+
+    assert seen["payload"]["energy"] is enabled
+
+
+class _StopWorker(Exception):
+    """Ends the chunk once the payload has been read; no GPU is involved."""
 
 
 def test_local_chunk_uses_selected_external_python_and_project_path(

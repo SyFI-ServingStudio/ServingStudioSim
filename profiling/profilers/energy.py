@@ -28,6 +28,99 @@ from profiling.profilers._duration import (
 _TOTAL_ENERGY_SUPPORTED_BY_GPU: dict[str | int, bool] = {}
 _MAX_CLEAN_RESTARTS = 3
 
+ENERGY_ENV = "VIBESIM_PROFILE_ENERGY"
+REQUIRE_ENERGY_ENV = "VIBESIM_REQUIRE_ENERGY"
+_DISABLED_VALUES = frozenset({"0", "false", "no", "off"})
+
+# Process-local measurement policy. `None` means "nobody in this process has
+# said", and only then does the environment get a vote.
+#
+# The environment is a user-facing knob here, not an internal channel: an
+# explicit setting never writes it back. It used to, and that is what made this
+# awkward -- `set_energy_enabled` mutating `os.environ` meant every argparse
+# default had to be `None` to avoid clobbering an exported value, every worker
+# spawn had to remember to forward the variable, and the setting leaked between
+# tests. The policy now crosses a process boundary by being written into that
+# process's input: the worker's JSON payload (`profiling.exec.local`), or the
+# simulator child's environment at its spawn site (`launcher.exec`).
+_energy_policy: bool | None = None
+_require_energy_policy: bool | None = None
+
+
+def _env_flag(name: str, default: str) -> bool:
+    # An empty value counts as unset. `NAME= cmd` is the ordinary way to clear a
+    # variable for one command, and `docker --env NAME=` produces the same; with
+    # a bare membership test "" is not in the disabled set, so clearing the
+    # variable would have switched the expensive window on.
+    raw = os.environ.get(name, "").strip()
+    return (raw or default).lower() not in _DISABLED_VALUES
+
+
+def energy_enabled() -> bool:
+    """Whether ``Energy.perf`` should open its NVML window at all.
+
+    Energy is a second measurement loop on top of the timing one: warmup
+    launches plus ``DEFAULT_MIN_DURATION_MS`` (500 ms) of wall clock, per spec.
+
+    Off unless asked for, via ``VIBESIM_PROFILE_ENERGY=1`` or the flag that
+    writes it. It is opt-in because almost nothing reads ``energy_j`` -- the
+    simulator's cost model is timing-only -- while the window is the single
+    largest cost in a cache fill: measured on a tp4/ep4/spec5 preset it was
+    1564 s of a 3112 s fill. The launcher has defaulted it off for a while
+    through its own ``energy:`` key; this makes the library agree, so a direct
+    ``python -m profiling run`` no longer pays for what the launcher skips.
+
+    A skipped measurement reports ``0.0``, which is what this helper already
+    returns when pynvml is absent, CUDA is unavailable, the NVML handle cannot
+    be resolved, or NVML errors. The schema agrees: ``energy_j`` is
+    ``REAL NOT NULL DEFAULT 0.0`` and readers coerce with ``or 0.0``. So a zero
+    means "not measured" on every path, including this one, and a consumer must
+    not read it as "measured zero joules".
+    """
+
+    if _energy_policy is not None:
+        return _energy_policy
+    return _env_flag(ENERGY_ENV, "0")
+
+
+def require_measured_energy() -> bool:
+    """Whether a row reaching the simulator must carry a measured ``energy_j``.
+
+    Separate from :func:`energy_enabled`, and off unless asked for. The two
+    answer different questions: one is "measure energy in this profiling run",
+    the other is "refuse to run on rows that never were". A run that asks for
+    energy is usually filling a cache that already holds rows measured without
+    it, and those rows come back as ``energy_j = 0.0`` -- which means "not
+    measured" everywhere in this codebase, including the schema default. Left
+    alone they would reach the simulator's output parquet as a plausible-looking
+    zero joules. The launcher turns this on exactly when its ``energy`` flag is
+    true.
+    """
+
+    if _require_energy_policy is not None:
+        return _require_energy_policy
+    return _env_flag(REQUIRE_ENERGY_ENV, "0")
+
+
+def set_require_measured_energy(required: bool) -> None:
+    """Settle the requirement for this process."""
+
+    global _require_energy_policy
+    _require_energy_policy = required
+
+
+def set_energy_enabled(enabled: bool) -> None:
+    """Settle the policy for this process.
+
+    Only this process. Carrying it to another one is the spawn site's job, and
+    each spawn site does it by writing the value into that process's input --
+    see ``profiling.exec.local`` (the worker's JSON payload) and
+    ``launcher.exec`` (the simulator child's environment).
+    """
+
+    global _energy_policy
+    _energy_policy = enabled
+
 
 @dataclass(frozen=True)
 class _EnergyAttempt:
@@ -47,11 +140,14 @@ class Energy:
         min_rep: int | None = None,
         per_iter_time_ms: float | None = None,
     ) -> float:
+        # Checked before the warmup loop: skipping has to skip the launches too,
+        # or the opt-out would still pay most of what it is meant to avoid.
+        if not energy_enabled():
+            return 0.0
+
         # Time-centric like Timer: poll for at least min_duration_ms, but never
         # fewer than min_rep iterations (the larger wins).
-        min_duration_ms = (
-            DEFAULT_MIN_DURATION_MS if min_duration_ms is None else min_duration_ms
-        )
+        min_duration_ms = DEFAULT_MIN_DURATION_MS if min_duration_ms is None else min_duration_ms
         min_rep = DEFAULT_MIN_REP if min_rep is None else min_rep
         warn_if_multi_gpu_duration_mode("Energy.perf")
         for _ in range(warmup):

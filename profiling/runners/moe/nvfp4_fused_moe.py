@@ -7,6 +7,7 @@ from typing import Any
 from profiling.db.args import DType
 from profiling.profilers.energy import Energy
 from profiling.profilers.timer import Timer
+from profiling.runners.autotune_cache import autotune_cached
 from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
 from profiling.runners.moe.exact_topk import exact_topk_ids
@@ -361,7 +362,7 @@ def _profile_nvfp4_fused_moe_sm100(
         # signature, so timing an extra autotune here would select a tactic its
         # production invocation does not use.
         if stack != "sglang":
-            with autotune():
+            with autotune_cached(autotune, f"nvfp4_fused_moe.{stack}"):
                 run_once()
         else:
             run_once()

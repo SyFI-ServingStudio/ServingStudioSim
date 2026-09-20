@@ -23,7 +23,13 @@ from profiling.db.batch import (
 from profiling.db.kind import KernelKind
 from profiling.db.registry import find_kernel_profiler_spec, iter_kernel_profiler_specs
 from profiling.db.table import MissingEntry, Table
-from profiling.runners.metrics import Metrics
+from profiling.plan import active_collector
+from profiling.profilers.energy import require_measured_energy
+from profiling.runners.metrics import ComputeMetrics, Metrics
+
+
+class UnmeasuredEnergyError(RuntimeError):
+    """A run asked for energy and got rows that were never measured for it."""
 
 
 @dataclass(frozen=True)
@@ -126,12 +132,17 @@ def run_kind_times(
     db_path: Path,
     jit_enabled: bool,
     force: bool = False,
+    persist: bool = True,
 ) -> KindTimesResult:
     """Internal typed entry the profiling CLI calls for one kind's run.
 
     Returns results AND this invocation's typed GPU provenance so the artifact writer
     never reads an ambient channel. Shares the exact same core ``_get_times`` as the
     generated public facade, so public and CLI behavior cannot drift.
+
+    ``persist=False`` is the CLI's ``--fresh``: measure every spec, hand the rows
+    back, and leave ``profile.db`` untouched. It is only defined together with
+    ``force``.
     """
     args_list = _coerce_input_specs(kernel_kind, backend, specs)
     return _get_times(
@@ -142,6 +153,7 @@ def run_kind_times(
         db_path=db_path,
         jit_enabled=jit_enabled,
         force=force,
+        persist=persist,
     )
 
 
@@ -216,7 +228,13 @@ def _get_times(
     db_path: Path,
     jit_enabled: bool,
     force: bool,
+    persist: bool = True,
 ) -> KindTimesResult:
+    if not persist and not force:
+        # The cache-read half and the measured half would have to be stitched back
+        # together by hand, and nothing asks for that. Keep the unpersisted mode to
+        # the one shape the CLI exposes rather than inventing a second policy here.
+        raise ValueError("persist=False is only defined together with force=True")
     resolved_gpu = _resolve_gpu_name(gpu_name)
     profiler_spec = find_kernel_profiler_spec(kernel_kind, backend)
     table = Table(profiler_spec, db_path)
@@ -230,10 +248,14 @@ def _get_times(
             outcome = execute_profile_batch(
                 kernel_kind,
                 profile_specs,
-                db_path=db_path,
+                db_path=db_path if persist else None,
                 gpu_name=resolved_gpu,
             )
-        results = table.query(args_list, backend=backend, gpu_name=resolved_gpu)
+        results = (
+            table.query(args_list, backend=backend, gpu_name=resolved_gpu)
+            if persist
+            else _unpersisted_results(outcome, args_list, kernel_kind, backend, resolved_gpu)
+        )
     else:
         results = table.query(args_list, backend=backend, gpu_name=resolved_gpu)
 
@@ -247,12 +269,89 @@ def _get_times(
                 gpu_name=resolved_gpu,
             )
             results = table.query(args_list, backend=backend, gpu_name=resolved_gpu)
+    _reject_unmeasured_energy(results, kernel_kind, backend, resolved_gpu)
     provenance = (
         outcome.provenance
         if outcome is not None and outcome.provenance is not None
         else ProfileProvenance(source="cache_key", requested_gpu_name=resolved_gpu)
     )
     return KindTimesResult(results=results, provenance=provenance)
+
+
+def _reject_unmeasured_energy(
+    results: Sequence[Metrics | MissingEntry],
+    kernel_kind: KernelKind,
+    backend: str,
+    gpu_name: str,
+) -> None:
+    """Fail the run when energy was asked for and a row does not carry it.
+
+    ``energy_j = 0.0`` means "not measured" on every path that can produce it --
+    the NVML window skipped, pynvml missing, the handle unresolvable, or a
+    column default -- so nothing downstream can tell it from a real zero. The
+    simulator writes the value straight into its output parquet, where a cache
+    filled without the energy window would read as a run that drew no power.
+    Raise here, at the one core both the public facade and the CLI share, rather
+    than let it become a plausible number in an artifact.
+
+    Off unless ``VIBESIM_REQUIRE_ENERGY`` says otherwise, because a row measured
+    without energy is perfectly valid input for a timing-only simulation; it is
+    only wrong when the caller asked for energy.
+
+    ``CommMetrics`` is out of scope, and has to be excluded by type rather than
+    by value. It declares ``energy_j: float = 0.0``, but no comm runner has ever
+    measured it -- the rank-group runners build their metrics without the field
+    -- so a zero there is a structural constant, not a skipped measurement.
+    Judging it by the same rule made ``energy: true`` fail on the first
+    all-reduce of any tp>1 run, with a message telling the user to re-profile
+    with energy on, which could never succeed.
+    """
+
+    if not require_measured_energy():
+        return
+    offenders = [result for result in results if _is_unmeasured_compute_energy(result)]
+    if not offenders:
+        return
+    raise UnmeasuredEnergyError(
+        f"{len(offenders)} of {len(results)} {kernel_kind}:{backend} rows on "
+        f"{gpu_name} have energy_j = 0.0, which means not measured. The run asked "
+        f"for energy, so these rows cannot answer it. Re-profile them with energy "
+        f"on (launcher `energy: true`, or `python -m profiling run --energy ...`), "
+        f"or set `energy: false` to run timing-only."
+    )
+
+
+def _is_unmeasured_compute_energy(result: Metrics | MissingEntry) -> bool:
+    return isinstance(result, ComputeMetrics) and result.energy_j == 0.0
+
+
+def _unpersisted_results(
+    outcome: ProfileBatchOutcome | None,
+    args_list: list[KernelArgs],
+    kernel_kind: KernelKind,
+    backend: str,
+    resolved_gpu: str,
+) -> list[Metrics | MissingEntry]:
+    """Return the just-measured rows directly, because no row was written to read back.
+
+    The persisted path re-queries the table so the caller sees exactly what landed in
+    the cache. With nothing inserted there is nothing to re-query, so the ``Metrics``
+    already in hand are the answer, and a spec whose runner failed becomes the same
+    ``MissingEntry`` the query path would have reported for an absent row.
+    """
+
+    batch_results = outcome.results if outcome is not None else []
+    return [
+        metrics
+        if metrics is not None
+        else MissingEntry(
+            kernel_kind=kernel_kind,
+            backend=backend,
+            gpu_name=resolved_gpu,
+            args=args,
+        )
+        for metrics, args in zip(batch_results, args_list, strict=True)
+    ]
 
 
 # Dry-run implementation. This must stay read-only: no JIT, no runner, no pool.
@@ -267,7 +366,24 @@ def _count_missing(
     resolved_gpu = _resolve_gpu_name(gpu_name)
     profiler_spec = find_kernel_profiler_spec(kernel_kind, backend)
     table = Table(profiler_spec, db_path)
-    return table.exists(args_list, backend=backend, gpu_name=resolved_gpu).count(False)
+    present = table.exists(args_list, backend=backend, gpu_name=resolved_gpu)
+    collector = active_collector()
+    if collector is not None:
+        # The simulator's dry-run mode walks the whole build cascade calling only
+        # `count_missing`, never fitting and never profiling. That walk already
+        # visits every cost-tree node, so it is the collect pass: record what is
+        # absent here and one `issue` can measure all of it, instead of 55
+        # separate demand-driven calls each fanning across four cards.
+        collector.record(
+            kernel_kind,
+            backend,
+            [args_to_spec(args) for args, found in zip(args_list, present) if not found],
+            # The key the miss was found under, so the fill writes back to the
+            # same place. `resolved_gpu`, not `gpu_name`: this is the key
+            # `table.exists` just used.
+            gpu_name=resolved_gpu,
+        )
+    return present.count(False)
 
 
 # Input normalization. Public APIs accept dicts for ergonomics, but the table

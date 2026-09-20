@@ -48,6 +48,15 @@ This is why `KernelKind` strings must match exactly across the boundary (below).
 **Required from below** (only paid when an actual measurement happens):
 
 - One or more **idle GPUs** (`exec/local.py:find_idle_gpus` reads `nvidia-smi`).
+  Host workers receive those indices through `CUDA_VISIBLE_DEVICES`; container
+  workers receive **UUIDs** (`exec/local.py:gpu_uuids_for_indices`). The index is
+  only meaningful in the device view the process that read it could see, and the
+  container runtime has a different one — under a device cgroup (Slurm's
+  `ConstrainDevices`) the allocated card enumerates here as index 0 while
+  `dockerd`, outside the cgroup, resolves `--gpus device=0` to the host's first
+  card. Passing the index across silently profiles GPU 0 instead: concurrent
+  workers pile onto one card, and the idle check that cleared the allocated card
+  never sees it. Resolution raises rather than falling back to the index.
 - The **backend's runtime libraries** — torch, FlashInfer, Triton, NCCL/NVSHMEM —
   available in the selected subprocess interpreter. These are imported **lazily
   inside the worker subprocess**, never in the simulator/main process.
@@ -78,6 +87,15 @@ is intentional: periodic CUPTI restart gaps materially change the power/clock
 state of sustained GEMMs. Fixed `rep` remains the explicit median-of-three
 escape hatch. This is distinct from `Energy.perf`'s 500 ms minimum
 wall-clock/NVML window.
+
+That energy window is **off unless asked for** — `VIBESIM_PROFILE_ENERGY=1`, or
+`--energy` on `python -m profiling run` / `measure`, or the launcher's
+`energy: true`. It is a second measurement loop per spec and the largest single
+cost in a cache fill, while nothing in the timing path reads `energy_j`. Rows
+measured without it record `energy_j = 0.0`, which means "not measured"
+everywhere in this codebase; see `launcher/README.md` for the `energy:` key and
+the `VIBESIM_REQUIRE_ENERGY` guard that stops such a row reaching a run that
+asked for energy.
 
 ## First-class Analyzer resources
 
@@ -182,7 +200,10 @@ historical results and record the selected database with the experiment.
 3. Hits return `Metrics`; misses return `MissingEntry`.
 4. If there are misses **and** JIT is enabled, call `run_profile_batch` to fill
    them, then re-query. With `force=True`, skip the first query and re-profile
-   every spec. `count_missing` uses `Table.exists` and **never** profiles.
+   every spec. `force=True, persist=False` (the CLI's `--fresh`) re-profiles the
+   same way but passes `db_path=None` down to the batch, so nothing is inserted
+   and the freshly measured `Metrics` are returned directly instead of re-read.
+   `count_missing` uses `Table.exists` and **never** profiles.
 
 **Profile path — `run_profile_batch`** (`db/batch.py`), the single runner funnel:
 
@@ -267,7 +288,7 @@ call runners or `run_profile_batch` directly:
 python -m launcher kernel-profile list [--json]
 python -m launcher kernel-profile query         <table> --backend <b> [--spec '{...}'] [--specs file] [--gpu-name N] [--db path]
 python -m launcher kernel-profile count-missing <table> --backend <b> ...
-python -m launcher kernel-profile run           <table> --backend <b> [--force] ...
+python -m launcher kernel-profile run           <table> --backend <b> [--force | --fresh] ...
 python -m launcher kernel-profile measure       <table> --backend <b> --spec '{...}' [--output-dir DIR] [--duration-s 10] [--telemetry-hz 20] [--no-clear-l2]
 python -m launcher kernel-profile merge-db LEFT.db RIGHT.db --output MERGED.db [--report REPORT.json]
 python -m launcher kernel-profile audit-provenance [--db profile.db] [--json]
@@ -276,6 +297,20 @@ python -m launcher kernel-profile audit-provenance [--db profile.db] [--json]
 `run` enables JIT for the call (or uses `force=True`), so it is the one CLI verb
 that can launch real GPU work; `query`/`count-missing` are read-only.
 `python -m profiling` remains a developer-compatible alias for these subcommands.
+
+`--force` and `--fresh` both measure every requested spec and differ only in
+whether the rows are kept: `--force` inserts them, `--fresh` inserts nothing and
+reports the measurement it just took. Reach for `--fresh` to look at a kernel's
+numbers — a quick re-measure, a what-if on timing knobs, an off-grid probe —
+without moving the shared cache; nothing downstream can then read that number as
+if it were cached evidence. Because nothing is written, `--fresh` has no row to
+re-query, so its results come straight from the batch, and its reported
+`missing_count` counts the specs whose runner failed in *this* run rather than
+the rows still absent from the DB. Its `--output-dir` snapshot is a normal
+first-class Analyzer resource, recorded with `mode: fresh`. `--fresh` remains a
+cache operation in spirit (ordinary `Metrics` for a whole spec batch); `measure`
+is the separate cache-free *diagnostic* for one spec's per-launch trend and NVML
+telemetry.
 
 `merge-db` reads both inputs without modifying them. It copies rows and whole
 tables found on only one side and deduplicates rows whose declared

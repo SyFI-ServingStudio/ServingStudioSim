@@ -154,11 +154,23 @@ def _fake_triton_recording(calls: list[tuple[int, int]], timings: list[float]):
     return SimpleNamespace(testing=SimpleNamespace(do_bench=fake_do_bench))
 
 
-def _fake_cupti_module(calls: list[dict[str, object]], *, mean_ms: float = 3.0):
+_FLAT_LAUNCHES = [3.0] * 40
+# First quarter ~3.0, last quarter ~3.6: a kernel that downclocked inside the window.
+_DRIFTING_LAUNCHES = [3.0] * 20 + [3.6] * 20
+
+
+def _fake_cupti_module(
+    calls: list[dict[str, object]],
+    *,
+    mean_ms: float = 3.0,
+    per_iter_ms: list[float] | None = None,
+):
+    launches = _FLAT_LAUNCHES if per_iter_ms is None else per_iter_ms
+
     def fake_duration(fn, **kwargs):
         kwargs["_kind"] = "duration"
         calls.append(kwargs)
-        return SimpleNamespace(mean_ms=mean_ms)
+        return SimpleNamespace(mean_ms=mean_ms, per_iter_ms=launches)
 
     def fake_profile_kernel(fn, **kwargs):
         kwargs["_kind"] = "fixed"
@@ -172,10 +184,12 @@ def _fake_cupti_module(calls: list[dict[str, object]], *, mean_ms: float = 3.0):
     )
 
 
-def test_timer_cupti_default_estimates_then_captures_one_duration_window(
+def test_timer_cupti_keeps_the_probe_when_the_kernel_does_not_drift(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    # No rep => ten-sample estimate followed by one uninterrupted formal capture.
+    """A kernel that holds full clock is final within the probe, so that capture
+    is the answer and the 2000 ms budget is never opened."""
+
     calls: list[dict[str, object]] = []
     monkeypatch.setitem(
         sys.modules, "profiling.profilers.cupti_kernel_profiler", _fake_cupti_module(calls)
@@ -198,11 +212,156 @@ def test_timer_cupti_default_estimates_then_captures_one_duration_window(
         10,
         True,
         True,
-        2_000,
-        20,
-        50_000,
+        100,
+        10,
+        1_000,  # the probe's own cap, not _CUPTI_MAX_ITER
     )
     assert c["kernel_name_contains"] == "rmsnorm"
+
+
+def test_timer_cupti_spends_the_full_budget_when_the_probe_drifts(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A throttled kernel pays the full 2000 ms, sized by a fixed launch count
+    rather than a second ten-launch estimate the probe already made redundant."""
+
+    calls: list[dict[str, object]] = []
+    monkeypatch.setitem(
+        sys.modules,
+        "profiling.profilers.cupti_kernel_profiler",
+        _fake_cupti_module(calls, per_iter_ms=_DRIFTING_LAUNCHES),
+    )
+
+    assert Timer.cupti(lambda: None) == 3.0
+    # Both captures go through the duration entry point. The sized one must NOT
+    # be profile_kernel: that opens one CUPTI window per launch, and the idle
+    # gaps between windows read a power-capped kernel up to 13% fast.
+    assert [c["_kind"] for c in calls] == ["duration", "duration"]
+    assert calls[0]["min_duration_ms"] == 100
+    assert calls[0].get("launch_count") is None  # the probe sizes itself
+    # The count follows the probe's CLOSING rate (3.6 ms, the throttled one),
+    # not its opening 3.0 ms -- ceil(2000 / 3.6) rather than ceil(2000 / 3.0).
+    assert calls[1]["launch_count"] == 556
+
+
+def test_timer_cupti_full_budget_count_honours_the_launch_bounds(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls: list[dict[str, object]] = []
+    monkeypatch.setitem(
+        sys.modules,
+        "profiling.profilers.cupti_kernel_profiler",
+        _fake_cupti_module(calls, per_iter_ms=_DRIFTING_LAUNCHES),
+    )
+
+    assert Timer.cupti(lambda: None, max_rep=200) == 3.0
+    assert calls[1]["launch_count"] == 200
+
+
+def test_timer_cupti_does_not_clear_a_kernel_it_could_not_sample(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Too few launches to split in half means no verdict, so pay the full budget.
+    Such a kernel is slow enough that the probe costs little next to it."""
+
+    calls: list[dict[str, object]] = []
+    monkeypatch.setitem(
+        sys.modules,
+        "profiling.profilers.cupti_kernel_profiler",
+        _fake_cupti_module(calls, per_iter_ms=[3.0] * 5),
+    )
+
+    assert Timer.cupti(lambda: None) == 3.0
+    assert [c["_kind"] for c in calls] == ["duration", "duration"]
+    assert calls[1]["launch_count"] == 667
+
+
+def test_timer_cupti_clears_a_kernel_sampled_only_at_the_launch_floor(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A probe sized at _CUPTI_MIN_ITER still gets a verdict, split in halves.
+
+    This is the slow-kernel path, and refusing it a verdict is the most
+    expensive mistake the test can make: the kernel pays the probe AND the full
+    budget, ending up slower than a plain fixed budget would have been. Measured
+    over the A/B, 26 such captures spent 53.8 s to move the answer by 0.10%.
+    """
+
+    calls: list[dict[str, object]] = []
+    monkeypatch.setitem(
+        sys.modules,
+        "profiling.profilers.cupti_kernel_profiler",
+        _fake_cupti_module(calls, per_iter_ms=[13.0] * 10),
+    )
+
+    Timer.cupti(lambda: None)
+    assert [c["_kind"] for c in calls] == ["duration"]
+
+
+def test_timer_cupti_keeps_the_probe_when_drift_stays_under_the_tolerance(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """1.5% apart head to tail is under tolerance and buys nothing to confirm.
+
+    Grouped by reported drift, the full budget then moved the answer by 0.56%
+    for drift in 1-2% but by 4.9-7.3% above it, so the threshold sits at 2%.
+    """
+
+    calls: list[dict[str, object]] = []
+    monkeypatch.setitem(
+        sys.modules,
+        "profiling.profilers.cupti_kernel_profiler",
+        _fake_cupti_module(calls, per_iter_ms=[1.0] * 20 + [1.015] * 20),
+    )
+
+    Timer.cupti(lambda: None)
+    assert [c["_kind"] for c in calls] == ["duration"]
+
+
+def test_timer_cupti_pays_the_full_budget_when_drift_clears_the_tolerance(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """2.5% apart is real throttling, and the probe's tail is not the answer."""
+
+    calls: list[dict[str, object]] = []
+    monkeypatch.setitem(
+        sys.modules,
+        "profiling.profilers.cupti_kernel_profiler",
+        _fake_cupti_module(calls, per_iter_ms=[1.0] * 20 + [1.025] * 20),
+    )
+
+    Timer.cupti(lambda: None)
+    assert [c["_kind"] for c in calls] == ["duration", "duration"]
+
+
+def test_timer_cupti_re_estimates_when_the_probe_reports_no_launches(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Without a per-launch series there is nothing to size the capture from, so
+    the full budget falls back to the duration-sized path and its own estimate."""
+
+    calls: list[dict[str, object]] = []
+    monkeypatch.setitem(
+        sys.modules,
+        "profiling.profilers.cupti_kernel_profiler",
+        _fake_cupti_module(calls, per_iter_ms=[]),
+    )
+
+    assert Timer.cupti(lambda: None) == 3.0
+    assert [c["_kind"] for c in calls] == ["duration", "duration"]
+    assert [c["min_duration_ms"] for c in calls] == [100, 2_000]
+
+
+def test_timer_cupti_explicit_budget_skips_the_probe(monkeypatch: pytest.MonkeyPatch):
+    calls: list[dict[str, object]] = []
+    monkeypatch.setitem(
+        sys.modules,
+        "profiling.profilers.cupti_kernel_profiler",
+        _fake_cupti_module(calls, per_iter_ms=_DRIFTING_LAUNCHES),
+    )
+
+    assert Timer.cupti(lambda: None, min_duration_ms=5_000) == 3.0
+    assert [c["min_duration_ms"] for c in calls] == [5_000]
 
 
 def test_timer_cupti_duration_count_bounds_pass_through(monkeypatch: pytest.MonkeyPatch):
@@ -591,3 +750,108 @@ def test_local_cupti_profiler_points_at_csrc_extension():
 
     assert cupti_kernel_profiler.EXT_SOURCE.name == "cupti_activity_profiler.cpp"
     assert cupti_kernel_profiler.EXT_SOURCE.exists()
+
+
+def test_timer_cupti_budget_env_pins_the_capture(monkeypatch: pytest.MonkeyPatch):
+    """The A/B knob behaves exactly like an explicit budget: no probe, no drift
+    verdict, one capture at the requested length."""
+
+    calls: list[dict[str, object]] = []
+    monkeypatch.setitem(
+        sys.modules,
+        "profiling.profilers.cupti_kernel_profiler",
+        _fake_cupti_module(calls, per_iter_ms=_DRIFTING_LAUNCHES),
+    )
+    monkeypatch.setenv("VIBESIM_PROFILE_CUPTI_BUDGET_MS", "2000")
+
+    assert Timer.cupti(lambda: None) == 3.0
+    assert [c["min_duration_ms"] for c in calls] == [2_000]
+
+
+def test_timer_cupti_explicit_budget_outranks_the_env(monkeypatch: pytest.MonkeyPatch):
+    calls: list[dict[str, object]] = []
+    monkeypatch.setitem(
+        sys.modules, "profiling.profilers.cupti_kernel_profiler", _fake_cupti_module(calls)
+    )
+    monkeypatch.setenv("VIBESIM_PROFILE_CUPTI_BUDGET_MS", "2000")
+
+    assert Timer.cupti(lambda: None, min_duration_ms=750) == 3.0
+    assert [c["min_duration_ms"] for c in calls] == [750]
+
+
+@pytest.mark.parametrize("value", ["2s", "", "-1"])
+def test_timer_cupti_budget_env_rejects_a_value_it_cannot_honour(
+    monkeypatch: pytest.MonkeyPatch, value: str
+):
+    """A typo must not quietly restore the adaptive default -- a comparison run
+    under the wrong budget looks successful and measures nothing."""
+
+    calls: list[dict[str, object]] = []
+    monkeypatch.setitem(
+        sys.modules, "profiling.profilers.cupti_kernel_profiler", _fake_cupti_module(calls)
+    )
+    monkeypatch.setenv("VIBESIM_PROFILE_CUPTI_BUDGET_MS", value)
+
+    if value == "":
+        # Blank reads as "not set", which is the shape an unset shell var takes.
+        assert Timer.cupti(lambda: None) == 3.0
+        assert calls[0]["min_duration_ms"] == 100
+        return
+    with pytest.raises(ValueError, match="VIBESIM_PROFILE_CUPTI_BUDGET_MS"):
+        Timer.cupti(lambda: None)
+
+
+def test_timer_cupti_never_splits_the_budget_across_capture_windows(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The sized capture must stay one uninterrupted CUPTI window.
+
+    ``profile_kernel`` with ``num_iter=N`` opens N windows, and the board
+    recovers in the gaps: measured on batched_gemm and single_gemm, that read
+    power-capped kernels 1-13% faster than they sustain, reproducibly. The
+    fixed-count path exists precisely to avoid that, so a regression here is a
+    silent accuracy loss rather than a failure.
+    """
+
+    calls: list[dict[str, object]] = []
+    monkeypatch.setitem(
+        sys.modules,
+        "profiling.profilers.cupti_kernel_profiler",
+        _fake_cupti_module(calls, per_iter_ms=_DRIFTING_LAUNCHES),
+    )
+
+    Timer.cupti(lambda: None)
+    assert not any(call["_kind"] == "fixed" for call in calls)
+
+
+def test_timer_cupti_probe_is_capped_tighter_than_the_full_budget(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A microsecond kernel's cost is its launch COUNT, not its budget: every
+    launch pays ~0.05 ms of L2 displacement and CUPTI overhead regardless. One
+    shared cap therefore made the probe cost exactly what the full budget costs
+    and saved nothing at the short end."""
+
+    calls: list[dict[str, object]] = []
+    monkeypatch.setitem(
+        sys.modules,
+        "profiling.profilers.cupti_kernel_profiler",
+        _fake_cupti_module(calls, per_iter_ms=_DRIFTING_LAUNCHES),
+    )
+
+    Timer.cupti(lambda: None)
+    assert calls[0]["max_iter"] == 1_000
+    assert calls[1]["max_iter"] == 10_000
+
+
+def test_timer_cupti_max_rep_also_bounds_the_probe(monkeypatch: pytest.MonkeyPatch):
+    """``max_rep`` is a ceiling on every capture; it must not be raised by the
+    probe having a cap of its own."""
+
+    calls: list[dict[str, object]] = []
+    monkeypatch.setitem(
+        sys.modules, "profiling.profilers.cupti_kernel_profiler", _fake_cupti_module(calls)
+    )
+
+    Timer.cupti(lambda: None, max_rep=200)
+    assert calls[0]["max_iter"] == 200

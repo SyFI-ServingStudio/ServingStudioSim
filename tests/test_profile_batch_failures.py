@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import logging
+import signal
+import subprocess
 from collections import Counter
 
 import pytest
 
 from profiling.db.batch import _log_batch_failures, execute_profile_batch
+from profiling.exec.local import _worker_failure_message
 from profiling.exec.pool import ChunkResult, GpuChunk, GpuPool
 from profiling.runners.metrics import ComputeMetrics
 
@@ -160,3 +163,49 @@ def test_failure_summary_limits_distinct_reasons_and_reason_length(
     assert "2x " + "x" * 237 + "..." in message
     assert "1 additional reason(s)" in message
     assert "omitted" not in message
+
+
+def _completed(returncode: int, stdout: str = "", stderr: str = "") -> subprocess.CompletedProcess:
+    return subprocess.CompletedProcess(args=["worker"], returncode=returncode,
+                                       stdout=stdout, stderr=stderr)
+
+
+def test_worker_failure_keeps_stdout_when_a_container_banner_fills_stderr() -> None:
+    """Container workers print a wrapper banner to stderr on every run, so
+    `stderr or stdout` always short-circuited and the real cause on stdout was
+    never reported."""
+
+    message = _worker_failure_message(
+        _completed(
+            1,
+            stdout="Traceback (most recent call last):\nValueError: bad shape",
+            stderr="--- Wrapper: Applying owner=kanzhu, memory=432834647654 bytes ---",
+        )
+    )
+
+    assert "ValueError: bad shape" in message
+    assert "Wrapper: Applying owner" in message
+
+
+def test_worker_failure_names_the_signal_that_killed_the_worker() -> None:
+    """A killed worker leaves no traceback, so the exit status is the only
+    evidence there is; the old message dropped it."""
+
+    message = _worker_failure_message(_completed(-signal.SIGKILL, stderr="banner only"))
+
+    assert "SIGKILL" in message
+    assert f"returncode {-signal.SIGKILL}" in message
+
+
+def test_worker_failure_marks_an_empty_stream_rather_than_omitting_it() -> None:
+    message = _worker_failure_message(_completed(2, stdout="", stderr="boom"))
+
+    assert "stdout: <empty>" in message
+    assert "stderr: boom" in message
+
+
+def test_worker_failure_tails_a_long_stream_because_the_exception_is_last() -> None:
+    message = _worker_failure_message(_completed(1, stderr="x" * 5000 + "RuntimeError: last"))
+
+    assert "RuntimeError: last" in message
+    assert "truncated" in message

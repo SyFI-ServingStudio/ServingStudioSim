@@ -653,7 +653,19 @@ def profile_dsa_persistent_topk_decode_vllm_cuda(
         # Correctness above is the exact-shape first launch. Synchronize before
         # formal timing so source verification, build/load, and setup are absent.
         torch.cuda.synchronize()
-        time_ms = Timer.cuda_event(kernel, warmup=5)
+        # CUPTI, not CUDA events. This was the only production backend in the
+        # table still on `Timer.cuda_event`; the other 97 runner call sites all
+        # price kernel-only time, and summing a launch-inclusive row into a cost
+        # tree with kernel-only rows charges this kernel's dispatch twice.
+        #
+        # Measured over 80 stride-sampled specs (job 613): the event timer reads
+        # 1.03x to 3.80x the CUPTI time, median 1.24x, and never less. These
+        # kernels are 2-22 us, so a ~5 us launch gap is most of the difference,
+        # and the ratio is largest on the smallest shapes. Taking the
+        # measurement also cost 1.5 s/spec under events (a flat
+        # 3 x DEFAULT_MIN_DURATION_MS, no drift probe) against 0.120 s/spec
+        # under CUPTI's adaptive budget -- 670 s of a full fill's 3151 GPU-s.
+        time_ms = Timer.cupti(kernel, warmup=5)
         energy_j = Energy.perf(kernel, warmup=5, per_iter_time_ms=time_ms)
         # Logical traffic counts valid FP32 logits, one int32 length per row,
         # and all int32 output slots. It excludes the 1 MiB scratch workspace,
