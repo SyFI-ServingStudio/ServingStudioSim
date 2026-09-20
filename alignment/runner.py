@@ -489,7 +489,10 @@ def _finalize_profile(
             model_role="target" if speculative else None,
             **window,
         )
-        if speculative:
+        # A dense draft (DFlash2 is six GQA layers with a plain SwiGLU MLP) has
+        # no experts for EPLB to report, and asking anyway fails the pass with
+        # `no VibeSimAlignmentExpertLoad records found`.
+        if speculative and driver.draft_has_moe_experts(cfg.server):
             draft_load_path = engine_dir / f"{cfg.name}_draft_expert_load.jsonl"
             draft_popularity_path = log_dir / "draft_expert_popularity.json"
             draft_count = record_extraction.extract_expert_popularity(

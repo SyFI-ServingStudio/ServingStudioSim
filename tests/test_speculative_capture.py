@@ -151,3 +151,49 @@ def test_finalize_speculative_popularity_produces_both_routing_artifacts(tmp_pat
     assert draft["model_role"] == "draft"
     assert target["counts_by_layer"] != draft["counts_by_layer"]
     assert Path(result["spec_decode_metrics_json"]).is_file()
+
+
+def server_with_speculative_config(spec: dict):
+    return SimpleNamespace(extra_args=["--speculative-config", json.dumps(spec)])
+
+
+def test_an_mtp_draft_shares_the_target_experts():
+    # No `model` key: the draft layer lives in the target checkpoint and routes
+    # through its MoE, so popularity is defined for it.
+    cfg = server_with_speculative_config({"method": "mtp", "num_speculative_tokens": 5})
+    assert vllm_server.draft_has_moe_experts(cfg)
+
+
+def test_a_dense_draft_checkpoint_has_no_expert_popularity(tmp_path):
+    # DFlash2 is six dense GQA layers with a plain SwiGLU MLP. Asking EPLB for
+    # its expert load fails the whole popularity pass with `no
+    # VibeSimAlignmentExpertLoad records found`, which reads like broken
+    # instrumentation rather than an absent MoE.
+    draft = tmp_path / "dflash2"
+    draft.mkdir()
+    (draft / "config.json").write_text(
+        json.dumps({"architectures": ["DFlash2DraftModel"], "num_hidden_layers": 6})
+    )
+    cfg = server_with_speculative_config(
+        {"method": "dflash", "model": str(draft), "num_speculative_tokens": 7}
+    )
+    assert not vllm_server.draft_has_moe_experts(cfg)
+
+
+def test_a_moe_draft_checkpoint_keeps_its_popularity_pass(tmp_path):
+    draft = tmp_path / "moe_draft"
+    draft.mkdir()
+    (draft / "config.json").write_text(json.dumps({"n_routed_experts": 128}))
+    cfg = server_with_speculative_config({"model": str(draft)})
+    assert vllm_server.draft_has_moe_experts(cfg)
+
+
+def test_an_unreadable_draft_config_does_not_silence_the_popularity_pass(tmp_path):
+    # Absence of evidence is not evidence of absence: keep asking and let the
+    # extraction report what it actually finds.
+    cfg = server_with_speculative_config({"model": str(tmp_path / "missing")})
+    assert vllm_server.draft_has_moe_experts(cfg)
+
+
+def test_a_run_without_speculation_has_no_draft_at_all():
+    assert not vllm_server.draft_has_moe_experts(SimpleNamespace(extra_args=[]))

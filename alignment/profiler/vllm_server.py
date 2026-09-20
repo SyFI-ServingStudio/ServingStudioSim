@@ -229,6 +229,53 @@ def speculative_decode_enabled(cfg: ServerConfig) -> bool:
     return any(arg.split("=", 1)[0] == "--speculative-config" for arg in cfg.extra_args)
 
 
+def _speculative_config(cfg: ServerConfig) -> dict:
+    args = list(cfg.extra_args)
+    for index, arg in enumerate(args):
+        key, sep, inline = arg.partition("=")
+        if key != "--speculative-config":
+            continue
+        raw = inline if sep else (args[index + 1] if index + 1 < len(args) else "")
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def draft_has_moe_experts(cfg: ServerConfig) -> bool:
+    """Whether the draft model routes tokens to experts.
+
+    Expert popularity is only defined for a draft that has experts. An MTP
+    draft layer lives in the target checkpoint and shares its MoE, so it does.
+    A draft named by its own `model` path is a separate checkpoint and may be
+    dense -- DFlash2 is six dense GQA layers with a plain SwiGLU MLP -- and
+    then EPLB has nothing to report for it. Asking anyway fails the whole
+    popularity pass with `no VibeSimAlignmentExpertLoad records found`, which
+    reads like broken instrumentation rather than an absent MoE.
+    """
+    if not speculative_decode_enabled(cfg):
+        return False
+    spec = _speculative_config(cfg)
+    draft_path = spec.get("model")
+    if not draft_path:
+        # No separate checkpoint: the draft is part of the target (MTP), so it
+        # routes through the target's experts.
+        return True
+    config_path = Path(draft_path) / "config.json"
+    try:
+        draft_config = json.loads(config_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        # Unreadable draft config is not evidence of absence; keep the previous
+        # behaviour and let the extraction report what it finds.
+        return True
+    return any(
+        key in draft_config
+        for key in ("n_routed_experts", "num_experts", "num_local_experts")
+    )
+
+
 def _parse_spec_decode_metrics(text: str) -> dict:
     from prometheus_client.parser import text_string_to_metric_families
 
