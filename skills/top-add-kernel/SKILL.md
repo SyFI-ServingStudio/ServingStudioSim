@@ -40,11 +40,12 @@ fans out depends on the role you are in:
 - **Only agent** (nobody above you, nobody below). Launch one subagent per
   kernel, three at a time; each runs this skill end to end for its own kernel.
   Do not walk the list yourself.
-- **Orchestrator.** Give the implementer the **whole set in one brief**. Issuing
-  one kernel per brief serializes work that has no ordering constraint. The
-  implementer owns the batching, not you.
-- **Implementer handed the set.** Fan out again — one subagent per kernel, three
-  at a time. Receiving several kernels is not an instruction to do them in order.
+- **Orchestrator.** Hand over **three kernels per brief**, and issue the next
+  brief after that batch closes out. One kernel per brief serializes work that
+  has no ordering constraint; the whole table in one brief hands down a queue
+  the implementer has to bound anyway.
+- **Implementer handed a batch.** Fan out — one subagent per kernel, all three
+  at once. Receiving several kernels is not an instruction to do them in order.
 
 Three, not all of them: each agent wants a GPU for its profiling submission and
 its own worktree build, so an unbounded fan-out contends for both and you get

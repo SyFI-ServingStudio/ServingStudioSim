@@ -111,6 +111,7 @@ operate-use-analyzer - select, read, interpret, and cite Analyzer-owned simulati
 operate-run-alignment - produce one shared ServingStudioSim↔framework comparison for vLLM or SGLang; Align ServingStudioSim to framework through top-align-with-framework, or Align framework to ServingStudioSim through top-compose-real-framework-from-sim
 operate-align-moe-kernel - diagnose one existing fused MoE kernel with exact-input, iteration-popularity, and full-run comparisons
 operate-gpu-spec - query or update the GPU spec catalog
+operate-manage-jit-and-autotune-caches - reuse JIT/autotune work across engine restarts and profiling worker processes instead of rebuilding it every time
 operate-profile-sim-speed - profile simulator wallclock speed
 operate-profile-serving-run - capture a comparable bounded profile of a real serving process and attribute its wall time to named engine phases (NVTX readiness + instrumentation contract, node-level CUDA-graph tracing, nsys SQLite aggregation)
 operate-profile-existing-kernel - query or fill registered profiler rows
