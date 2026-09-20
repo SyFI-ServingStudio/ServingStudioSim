@@ -1,0 +1,198 @@
+{
+  "schema_version": 1,
+  "note": "DFlash2 draft-phase rules, read off the draft ranges of the 20260920_0 NSYS capture. One rule set, not a chain: every rule here is keyed on a kernel name that occurs exactly once per draft program position, or on a name plus an immediate program-order neighbour that disambiguates it, so no two rules can claim a position with different operations and the order they are tried in cannot change the result.\n\nThis file is deliberately partial. The draft decoder layer runs ~60 kernels, and roughly forty of them are bare `elementwise_kernel` / `vectorized_elementwise_kernel` launches belonging to the four grouped-convolution halves. Those cannot be separated by name and their neighbours are each other, so labeling them soundly needs the conv halves decomposed on the simulator side first -- which is the disposition this capture recommends, not something a rule can paper over. Until then they stay unmapped rather than being guessed into a slot.",
+  "rules": [
+    {
+      "operation": "dflash2.context_kv.aux_hidden_fc",
+      "phase": "draft",
+      "name": "nvjet_sm100_tst_256x192_64x4_2x1_2cta_v_bz_splitK_TNT",
+      "type": "model",
+      "role": "projection of the six collected target hidden states down to the draft width",
+      "cross_rank": "independent",
+      "slot_suffixes": ["dflash2.context_kv.aux_hidden_fc"],
+      "note": "This tile occurs once in the whole draft program, at its k=36864 shape. The splitK reduce that follows it is a second rule."
+    },
+    {
+      "operation": "dflash2.context_kv.aux_hidden_fc",
+      "phase": "draft",
+      "name": "cublasLt::splitKreduce_kernel",
+      "after_name": "nvjet_sm100_tst_256x192_64x4_2x1_2cta_v_bz_splitK_TNT",
+      "type": "model",
+      "role": "split-K reduction of the aux hidden projection",
+      "cross_rank": "independent",
+      "slot_suffixes": ["dflash2.context_kv.aux_hidden_fc"],
+      "note": "splitKreduce runs after every split-K GEMM in the draft, so the predicate is the GEMM it reduces, never the name alone."
+    },
+    {
+      "operation": "dflash2.context_kv.fused_kv_proj",
+      "phase": "draft",
+      "name": "nvjet_sm100_tst_64x128_64x13_2x1_2cta_v_bz_TNT",
+      "type": "model",
+      "role": "one GEMM emitting K and V for all six draft layers",
+      "cross_rank": "independent",
+      "slot_suffixes": ["dflash2.context_kv.fused_kv_proj"]
+    },
+    {
+      "operation": "dflash2.context_kv.hidden_norm",
+      "phase": "draft",
+      "name": "vllm::rms_norm_kernel<c10::BFloat16, (int)8, (int)2, (bool)1>",
+      "after_name": "_prepare_dflash_inputs_kernel",
+      "type": "model",
+      "role": "norm of the projected hidden state before the fused KV projection",
+      "cross_rank": "independent",
+      "slot_suffixes": ["dflash2.context_kv.hidden_norm"],
+      "note": "The same rms_norm template also runs in the draft's input embedding; the input-prep kernel in front of this one is what separates them."
+    },
+    {
+      "operation": "dflash2.context_kv.grouped_k_norm",
+      "phase": "draft",
+      "name": "vllm::rms_norm_kernel<c10::BFloat16, (int)8, (int)4, (bool)1>",
+      "type": "model",
+      "role": "per-head K norm over tokens x layers x KV heads",
+      "cross_rank": "independent",
+      "slot_suffixes": ["dflash2.context_kv.grouped_k_norm"],
+      "note": "The (8, 4) template occurs once in the draft; the layer's q_norm and k_norm use a different one."
+    },
+    {
+      "operation": "dflash2.context_kv.fused_rope",
+      "phase": "draft",
+      "name": "vllm::rotary_embedding_kernel",
+      "after_name": "vllm::rms_norm_kernel<c10::BFloat16, (int)8, (int)4, (bool)1>",
+      "type": "model",
+      "role": "one rope call over tokens x layers",
+      "cross_rank": "independent",
+      "slot_suffixes": ["dflash2.context_kv.fused_rope"],
+      "note": "The decoder layer runs the same kernel; the grouped K norm only precedes the context-KV one."
+    },
+    {
+      "operation": "dflash2.layer.attn.rope",
+      "phase": "draft",
+      "name": "vllm::rotary_embedding_kernel",
+      "before_name": "scaled_fp8_quant_kernel_strided_group_shape",
+      "type": "model",
+      "role": "rope on the draft layer's own Q and K",
+      "cross_rank": "independent",
+      "slot_suffixes": ["dflash2.layer.attn.rope"],
+      "note": "The fp8 query quantization only follows the layer's rope, never the context-KV one."
+    },
+    {
+      "operation": "dflash2.layer.attn.attention",
+      "phase": "draft",
+      "name": "flash_attncuteprepare_schedulerFlashPre",
+      "type": "model",
+      "role": "scheduler setup for the non-causal draft attention",
+      "cross_rank": "independent",
+      "slot_suffixes": ["dflash2.layer.attn.attention"]
+    },
+    {
+      "operation": "dflash2.layer.attn.attention",
+      "phase": "draft",
+      "name": "flash_attncuteflash_fwd_sm100FlashAtten",
+      "type": "model",
+      "role": "the non-causal (q_len, kv_len) draft attention itself",
+      "cross_rank": "independent",
+      "slot_suffixes": ["dflash2.layer.attn.attention"],
+      "note": "The measured identity is vLLM's CuTe SM100 FlashAttention. The simulator prices this slot through `flashinfer_attn_rect` on `fa2` in bf16 because no rect backend can measure fp8 non-causal attention on B200; see the worklet's note."
+    },
+    {
+      "operation": "dflash2.layer.attn.attention",
+      "phase": "draft",
+      "name": "flash_attncuteflash_fwd_combineFlashAtt",
+      "type": "model",
+      "role": "split-KV combine for the draft attention",
+      "cross_rank": "independent",
+      "slot_suffixes": ["dflash2.layer.attn.attention"]
+    },
+    {
+      "operation": "dflash2.layer.ffn.silu_and_mul",
+      "phase": "draft",
+      "name": "act_and_mul_kernel",
+      "type": "model",
+      "role": "SiLU and multiply between the draft FFN's two projections",
+      "cross_rank": "independent",
+      "slot_suffixes": ["dflash2.layer.ffn.silu_and_mul"],
+      "note": "Occurs once per draft layer and nowhere else in the phase."
+    },
+    {
+      "operation": "dflash2.layer.ffn.down_proj",
+      "phase": "draft",
+      "name": "nvjet_sm100_tst_64x8_64x16_4x1_v_bz_TNT",
+      "after_name": "act_and_mul_kernel",
+      "type": "model",
+      "role": "draft FFN down projection",
+      "cross_rank": "independent",
+      "slot_suffixes": ["dflash2.layer.ffn.down_proj"],
+      "note": "The same non-splitK tile is also the layer's o_proj; the activation in front of it is what separates them."
+    },
+    {
+      "operation": "dflash2.layer.attn.o_proj",
+      "phase": "draft",
+      "name": "nvjet_sm100_tst_64x8_64x16_4x1_v_bz_TNT",
+      "after_name": "flash_attncuteflash_fwd_combineFlashAtt",
+      "type": "model",
+      "role": "draft attention output projection",
+      "cross_rank": "independent",
+      "slot_suffixes": ["dflash2.layer.attn.o_proj"]
+    },
+    {
+      "operation": "dflash2.layer.ffn.gate_up_proj",
+      "phase": "draft",
+      "name": "nvjet_sm100_tst_64x8_64x16_2x1_v_bz_splitK_TNT",
+      "before_name": "cublasLt::splitKreduce_kernel",
+      "type": "model",
+      "role": "fused gate and up projection",
+      "cross_rank": "independent",
+      "slot_suffixes": ["dflash2.layer.ffn.gate_up_proj"],
+      "note": "The 2x1 cluster variant is the widest GEMM in the layer and occurs once per layer."
+    },
+    {
+      "operation": "dflash2.layer.ffn.gate_up_proj",
+      "phase": "draft",
+      "name": "cublasLt::splitKreduce_kernel",
+      "after_name": "nvjet_sm100_tst_64x8_64x16_2x1_v_bz_splitK_TNT",
+      "type": "model",
+      "role": "split-K reduction of the fused gate and up projection",
+      "cross_rank": "independent",
+      "slot_suffixes": ["dflash2.layer.ffn.gate_up_proj"]
+    },
+    {
+      "operation": "dflash2.layer.attn_allreduce",
+      "phase": "draft",
+      "name": "trtllm_mnnvl_allreduce::oneshotAllreduceFusionKernel",
+      "after_name": "nvjet_sm100_tst_64x8_64x16_4x1_v_bz_TNT",
+      "before_name": "at::native::elementwise_kernel",
+      "type": "collective",
+      "role": "TP reduction of the draft attention output",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": ["dflash2.layer.attn_allreduce"],
+      "note": "Both of the layer's collectives follow the same tile; they are separated in a second pass once the neighbouring operations carry labels."
+    },
+    {
+      "operation": "dflash2.selector.candidate_topk",
+      "phase": "draft",
+      "name": "flashinfer::sampling::RadixTopKKernel_Unified",
+      "type": "model",
+      "role": "top-k over the draft vocabulary logits",
+      "cross_rank": "independent",
+      "slot_suffixes": ["dflash2.selector.candidate_topk"]
+    },
+    {
+      "operation": "dflash2.selector.candidate_topk",
+      "phase": "draft",
+      "name": "flashinfer::sampling::FilteredTopKUnifiedKernel",
+      "type": "model",
+      "role": "filtered top-k pass over the draft vocabulary logits",
+      "cross_rank": "independent",
+      "slot_suffixes": ["dflash2.selector.candidate_topk"]
+    },
+    {
+      "operation": "dflash2.selector.candidate_topk",
+      "phase": "draft",
+      "name": "flashinfer::sampling::FinalizeTopKIndicesKernel",
+      "type": "model",
+      "role": "finalizes the candidate indices",
+      "cross_rank": "independent",
+      "slot_suffixes": ["dflash2.selector.candidate_topk"]
+    }
+  ]
+}
