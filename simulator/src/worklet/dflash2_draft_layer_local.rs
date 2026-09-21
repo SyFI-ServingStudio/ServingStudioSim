@@ -26,9 +26,9 @@
 //! `vllm_mla_rope` documents (an inductor fusion that rewrites a whole tensor to
 //! change a slice of it) is a different situation.
 //!
-//! The draft phase as a whole is 1.61 ms of a 16.90 ms decode iteration (9.5%),
-//! and attention within it is 5.7% of that — 0.54% of the iteration, over six
-//! launches.
+//! Over the 296 pure-decode iterations of the Phase 0 capture, the draft phase
+//! is 1.675 ms of a 22.296 ms decode iteration (7.5%), and attention within it
+//! is 0.131 ms — 0.59% of the iteration, over six launches.
 //!
 //! # The attention leaf is measured in bf16, not fp8
 //!
@@ -37,10 +37,21 @@
 //! `cudnn` is bf16-only, `fa3`'s ragged kernels are built for SM90 and have no
 //! Blackwell image, and `trt` (Blackwell-only) has no ragged kernel at all. The
 //! leaf is therefore measured at bf16/bf16, which reads twice the KV bytes the
-//! engine does and so **overstates** this term. It is bounded: attention is
-//! 0.54% of a decode iteration, so the overstatement cannot exceed a few tenths
-//! of a percent, and it errs slow rather than fast. Revisit when a Blackwell
-//! ragged fp8 rect kernel lands.
+//! engine does, so it **overstates** this term and errs slow rather than fast.
+//!
+//! The capture measures the overstatement rather than leaving it to argument:
+//! `dflash2.layer.attn.attention` is 0.131 ms measured against 0.199 ms
+//! simulated per decode iteration, **+52%**, or 0.069 ms — **0.31% of a decode
+//! iteration**. Two things differ at once and the split between them is not
+//! separable here: the dtype, and the implementation (the engine runs vLLM's
+//! CuTe SM100 FlashAttention, the leaf is profiled against FlashInfer `fa2`).
+//! A pure-bandwidth argument would predict +100% from the dtype alone, so the
+//! implementation difference is plainly working the other way.
+//!
+//! This is second in line behind `selector.candidate_topk`, which overstates by
+//! 0.357 ms per decode iteration — 5.2x more. It is also a different kind of
+//! repair: closing it needs a Blackwell ragged fp8 rect kernel, or a CuTe SM100
+//! identity, at L1. Recomposing this worklet cannot reach it.
 
 use std::sync::Arc;
 
