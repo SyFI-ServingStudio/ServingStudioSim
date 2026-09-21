@@ -8,13 +8,15 @@
 //! here, so this layer holds the topology shape without depending on the concrete
 //! L4/L5 selector types (the per-deployment configs in L7 instantiate them).
 //!
-//! `placement` is the only pool-level policy (L6 routing among replicas);
+//! Pool-level policy is L6 routing among replicas — `placement` (where a fresh
+//! arrival goes) and `migration` (when resident work moves between replicas);
 //! everything provider-specific lives on the arch/worker tags. The launcher
 //! schema is derived: `#[derive(ParamStruct)]` on [`GroupSpec`] emits the flat
 //! group fields (gpu / replicas) and on [`PoolSpec`] the flat pool fields
-//! (placement); `groups` / `arch` / `worker` are `#[param(skip)]` (they are
-//! nested sub-trees, not scalar params). The params do not touch `Arch` /
-//! `Worker`, so `dump` reads them off a `<(), ()>` instantiation.
+//! (placement + the migration trio); `groups` / `arch` / `worker` are
+//! `#[param(skip)]` (they are nested sub-trees, not scalar params). The params
+//! do not touch `Arch` / `Worker`, so `dump` reads them off a `<(), ()>`
+//! instantiation.
 
 use serde::Deserialize;
 
@@ -22,14 +24,35 @@ use schema_derive::ParamStruct;
 
 /// L6 per-pool worker selection policy. Closed set → serde enum (kebab-case so
 /// `least-queued` / `round-robin` match the wire spelling).
+///
+/// `trace-directed` is not a load heuristic: it obeys the `target_worker`
+/// column of the trace's `placement` tag, which is how a run reproduces an
+/// exact placement sequence instead of whatever a load metric happened to pick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PlacementPolicy {
     LeastQueued,
     RoundRobin,
+    TraceDirected,
 }
 
-const PLACEMENT_CHOICES: [&str; 2] = ["least-queued", "round-robin"];
+const PLACEMENT_CHOICES: [&str; 3] = ["least-queued", "round-robin", "trace-directed"];
+
+/// When a pool moves resident work between its own workers.
+///
+/// `off` is the default and costs nothing: the flow holds no policy at all, so
+/// an untouched preset's tick does not gain a load snapshot or a virtual call.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MigrationPolicySel {
+    #[default]
+    Off,
+    /// Drain a worker whose active batch has fallen below
+    /// `migration_threshold` onto the busiest remaining worker.
+    ActiveBatchBelow,
+}
+
+const MIGRATION_CHOICES: [&str; 2] = ["off", "active-batch-below"];
 
 /// One pool: a placement policy plus one-or-more homogeneous groups.
 #[derive(Debug, Clone, Deserialize, ParamStruct)]
@@ -38,8 +61,29 @@ pub struct PoolSpec<Arch, Worker> {
     /// Worker placement policy within the pool.
     #[param(string, default = "least-queued", choices = PLACEMENT_CHOICES)]
     pub placement: PlacementPolicy,
+    /// When this pool migrates resident work between its own workers.
+    #[serde(default)]
+    #[param(string, default = "off", choices = MIGRATION_CHOICES)]
+    pub migration: MigrationPolicySel,
+    /// `active-batch-below`: the active-batch count under which a worker
+    /// becomes a drain candidate. Read only by that policy.
+    #[serde(default = "default_migration_threshold")]
+    #[param(default = 32)]
+    pub migration_threshold: u32,
+    /// Minimum sim time between two migrations of this pool. Zero lets the
+    /// policy fire on consecutive ticks, which is only sane for a trigger that
+    /// cannot re-arm — the built-in one retires its source, so it cannot.
+    #[serde(default)]
+    #[param(default = 0.0)]
+    pub migration_cooldown_ms: f64,
     #[param(skip)]
     pub groups: Vec<GroupSpec<Arch, Worker>>,
+}
+
+/// Mirrors the launcher schema default so a hand-written preset that omits the
+/// field gets the same number the launcher would have filled in.
+const fn default_migration_threshold() -> u32 {
+    32
 }
 
 /// One homogeneous group: a GPU type, a replica count (= DP fan-out), and the

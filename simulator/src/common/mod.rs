@@ -12,8 +12,8 @@ pub mod time;
 pub use fabric::Fabric;
 pub use id::{BatchId, ExpertId, GroupId, IdMap, PoolId, RequestId, WorkerId};
 pub use request::{
-    ActiveRequest, Request, RequestCore, RequestLifecycle, RequestRecord, RequestStore,
-    RequestTelemetry, SchedulingContract, SharedRequests, SloContract,
+    ActiveRequest, PlacementDirective, Request, RequestCore, RequestLifecycle, RequestRecord,
+    RequestStore, RequestTelemetry, SchedulingContract, SharedRequests, SloContract,
 };
 pub use request_family::{
     AcceptanceProfile, AudioExtent, AudioTextGenerationDefinition, AudioTextGenerationRequest,

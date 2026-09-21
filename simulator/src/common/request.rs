@@ -36,6 +36,23 @@ pub struct SloContract {
     pub e2e_slo: Option<Time>,
 }
 
+/// Where the trace says this request must run.
+///
+/// Routing, not ranking: a [`SchedulingContract`] orders a queue, a directive
+/// names a machine. Separate from scheduling because they have different
+/// consumers — L5 admission reads the priority and would have to ignore this,
+/// while L6 routing reads this and never sees a queue.
+///
+/// `None` is a real third state, not worker 0: the trace declines to place this
+/// request and the pool's own placement policy chooses. A pool configured to
+/// obey the trace refuses the `None` rather than inventing a worker.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PlacementDirective {
+    /// Pool-relative worker index. Bounds-checked by L6, which owns the replica
+    /// list; nothing below L6 knows how many workers exist.
+    pub worker: Option<WorkerId>,
+}
+
 /// Stable facts carried by every live request.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RequestCore {
@@ -44,14 +61,15 @@ pub struct RequestCore {
     pub arrival_time: Time,
     pub slo: SloContract,
     pub scheduling: SchedulingContract,
+    pub placement: PlacementDirective,
 }
 
 /// One concrete request whose definition fixes its family at the type level.
 ///
 /// ```compile_fail
 /// use simulator::common::{
-///     ImageExtent, ImageGenerationDefinition, Request, RequestCore, RequestId,
-///     SchedulingContract, SloContract, TextGenerationDefinition, Time,
+///     ImageExtent, ImageGenerationDefinition, PlacementDirective, Request, RequestCore,
+///     RequestId, SchedulingContract, SloContract, TextGenerationDefinition, Time,
 /// };
 /// fn accepts_text(_: Request<TextGenerationDefinition>) {}
 /// let image = Request::new(
@@ -60,6 +78,7 @@ pub struct RequestCore {
 ///         arrival_time: Time::ZERO,
 ///         slo: SloContract::default(),
 ///         scheduling: SchedulingContract::default(),
+///         placement: PlacementDirective::default(),
 ///     },
 ///     ImageGenerationDefinition {
 ///         text_prompt_tokens: 8,

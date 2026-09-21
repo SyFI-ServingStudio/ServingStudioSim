@@ -736,6 +736,7 @@ fn placement_into(p: PlacementPolicy) -> DpPlacementPolicy {
     match p {
         PlacementPolicy::LeastQueued => DpPlacementPolicy::LeastQueued,
         PlacementPolicy::RoundRobin => DpPlacementPolicy::RoundRobin,
+        PlacementPolicy::TraceDirected => DpPlacementPolicy::TraceDirected,
     }
 }
 

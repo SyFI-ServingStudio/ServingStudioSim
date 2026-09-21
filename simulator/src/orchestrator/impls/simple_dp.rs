@@ -5,6 +5,7 @@
 use crate::common::{PoolId, Request, RequestId, SharedRequests, Time, WorkerId};
 use crate::worker::{CostSource, GpuCluster, IterWorker, SharedGpuCluster, WorkerEventCommon};
 
+use super::super::migration::WorkerLoad;
 use super::super::{Flow, OrchAction, WorkerFactory};
 
 /// Sentinel for a quiescent worker. `Option<Time>` would add a tag; the simulator
@@ -15,10 +16,15 @@ const NO_WAKEUP_TIME: Time = Time::from_ns(u64::MAX);
 // ── Configs & policy (simple_dp-specific; L6 design.md §「simple DP」) ──────────
 
 /// Worker placement within a DP pool.
-#[derive(Clone, Copy, Debug)]
+///
+/// `TraceDirected` is not a load heuristic: each arrival names its own worker
+/// through the trace's `placement` tag, and the pool obeys it. That makes a
+/// placement sequence reproducible, which a load metric cannot be.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DpPlacementPolicy {
     LeastQueued,
     RoundRobin,
+    TraceDirected,
 }
 
 /// Config for one DP pool — pure orchestration (which workers, how to place).
@@ -47,6 +53,15 @@ pub struct SimpleDpPoolController<W: IterWorker> {
     worker_wakeup_times: Vec<Time>,
     placement: DpPlacementPolicy,
     rr_next: usize,
+    /// Current host of each worker index: `redirect[i] == WorkerId(i)` while
+    /// worker `i` is live, and the worker it was drained onto once it retires.
+    /// A trace-declared target is resolved through this, so a request pinned to
+    /// a retired worker follows the work that already left it rather than
+    /// refilling a machine the pool has decided to empty.
+    ///
+    /// Only ever written by `migrate`, which retires the source and requires a
+    /// live destination — so the chain is at most one hop and cannot cycle.
+    redirect: Vec<WorkerId>,
 }
 
 impl<W: IterWorker> SimpleDpPoolController<W> {
@@ -67,6 +82,7 @@ impl<W: IterWorker> SimpleDpPoolController<W> {
         Self {
             pool: cfg.pool,
             worker_wakeup_times: vec![NO_WAKEUP_TIME; workers.len()],
+            redirect: (0..workers.len() as u16).map(WorkerId).collect(),
             workers,
             placement: cfg.placement,
             rr_next: 0,
@@ -108,6 +124,11 @@ impl<W: IterWorker> SimpleDpPoolController<W> {
         match self.placement {
             DpPlacementPolicy::LeastQueued => self.choose_least_queued_idx(),
             DpPlacementPolicy::RoundRobin => self.choose_round_robin_idx(),
+            // A trace-directed pool never asks a policy which worker to use —
+            // the flow reads the request's own target and calls `route_msg_to`.
+            DpPlacementPolicy::TraceDirected => {
+                unreachable!("a trace-directed pool routes through route_msg_to, not placement")
+            }
         }
     }
 
@@ -131,6 +152,46 @@ impl<W: IterWorker> SimpleDpPoolController<W> {
 
     pub fn pool(&self) -> PoolId {
         self.pool
+    }
+
+    pub fn placement(&self) -> DpPlacementPolicy {
+        self.placement
+    }
+
+    pub fn num_workers(&self) -> usize {
+        self.workers.len()
+    }
+
+    /// Resolve a trace-declared worker to the one currently hosting its work.
+    ///
+    /// Identity until something migrates. Panics on an out-of-pool id for the
+    /// same reason `route_msg_to` does: the alternative is a request that
+    /// silently never runs.
+    pub fn resolve(&self, worker: WorkerId) -> WorkerId {
+        let mut current = worker;
+        for _ in 0..=self.redirect.len() {
+            let next = self.redirect[current.0 as usize];
+            if next == current {
+                return current;
+            }
+            current = next;
+        }
+        unreachable!("redirect chain cycled; migrate never retires a destination")
+    }
+
+    /// Read every worker's load for a migration policy. Retired workers stay in
+    /// the snapshot so a policy sees the whole pool, not just its live part.
+    pub fn snapshot_loads(&self, out: &mut Vec<WorkerLoad>) {
+        out.clear();
+        out.extend(self.workers.iter().enumerate().map(|(idx, worker)| {
+            let status = worker.status();
+            WorkerLoad {
+                worker: WorkerId(idx as u16),
+                queued_requests: status.queued_requests,
+                active_requests: status.active_requests,
+                retired: self.redirect[idx] != WorkerId(idx as u16),
+            }
+        }));
     }
 
     // ── Tick driving ──────────────────────────────────────────────────────────
@@ -220,8 +281,33 @@ where
 {
     fn on_arrival(&mut self, req: Request) {
         let rid = req.core.id;
+        let declared = req.core.placement.worker;
         self.requests.borrow_mut().insert(req);
-        self.dp_pool.admit(rid);
+        match (self.dp_pool.placement(), declared) {
+            (DpPlacementPolicy::TraceDirected, Some(target)) => {
+                assert!(
+                    (target.0 as usize) < self.dp_pool.num_workers(),
+                    "{rid:?} names worker {} but the pool has {} of them",
+                    target.0,
+                    self.dp_pool.num_workers(),
+                );
+                let host = self.dp_pool.resolve(target);
+                self.dp_pool.route_msg_to(host, W::Msg::from(rid));
+            }
+            // Both mismatches are configuration errors, and both are refused
+            // rather than papered over: falling back to a load policy would
+            // silently produce a run that is not the placement the trace
+            // describes, which is the one thing this mode exists to guarantee.
+            (DpPlacementPolicy::TraceDirected, None) => panic!(
+                "a trace-directed pool needs a target_worker on every request, \
+                 but {rid:?} declared none"
+            ),
+            (other, Some(_)) => panic!(
+                "{rid:?} declares a target_worker, but this pool places by {other:?}; \
+                 set the pool's placement to trace-directed or drop the placement tag"
+            ),
+            (_, None) => self.dp_pool.admit(rid),
+        }
     }
 
     fn tick(&mut self, now: Time) -> Vec<OrchAction> {
@@ -247,7 +333,7 @@ mod tests {
     use super::*;
     use crate::common::RequestStore;
     use crate::orchestrator::UnifiedWorkerFactory;
-    use crate::test_helpers::{text_request, FakeModel};
+    use crate::test_helpers::{text_request, text_request_on, FakeModel};
     use crate::worker::{build_barebone_worker, BareboneWorker, WorkerConfig};
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -275,6 +361,29 @@ mod tests {
             },
         };
         (SimpleDpFlow::new(cfg, factory), store)
+    }
+
+    /// Run until nothing is left, returning completions in id order.
+    fn drain_to_completion(flow: &mut SimpleDpFlow<BareboneWorker<FakeModel>>) -> Vec<RequestId> {
+        let mut completed = Vec::new();
+        for step in 0..500u64 {
+            for a in flow.tick(Time::from_ms(step as f64)) {
+                let OrchAction::Complete { req } = a;
+                completed.push(req);
+            }
+        }
+        completed.sort_by_key(|r| r.0);
+        completed
+    }
+
+    /// Every worker this request was ever observed on, in visit order.
+    fn workers_visited(store: &SharedRequests, req: RequestId) -> Vec<WorkerId> {
+        store.borrow()[req]
+            .lifecycle
+            .stage_log
+            .iter()
+            .map(|event| event.worker)
+            .collect()
     }
 
     #[test]
@@ -311,5 +420,83 @@ mod tests {
             n += flow.tick(Time::from_ms(step as f64)).len();
         }
         assert_eq!(n, 4);
+    }
+
+    #[test]
+    fn a_trace_directed_pool_puts_every_request_where_the_trace_said() {
+        // Worker 2 is named by every row even though it is the busiest place to
+        // put them — the whole point is that load does not get a vote.
+        let (mut flow, store) = build_flow(3, DpPlacementPolicy::TraceDirected);
+        for id in 0..4u32 {
+            flow.on_arrival(text_request_on(
+                RequestId(id),
+                8,
+                2,
+                Time::ZERO,
+                WorkerId(2),
+            ));
+        }
+
+        let completed = drain_to_completion(&mut flow);
+
+        assert_eq!(completed, (0..4).map(RequestId).collect::<Vec<_>>());
+        for id in 0..4u32 {
+            let visited = workers_visited(&store, RequestId(id));
+            assert!(!visited.is_empty(), "request {id} recorded no stage");
+            assert!(
+                visited.iter().all(|worker| *worker == WorkerId(2)),
+                "request {id} ran on {visited:?}, not only on the declared worker 2"
+            );
+        }
+    }
+
+    #[test]
+    fn a_trace_directed_pool_spreads_exactly_as_the_trace_spells_it() {
+        let (mut flow, store) = build_flow(2, DpPlacementPolicy::TraceDirected);
+        // Deliberately lopsided: three on worker 0, one on worker 1. A load
+        // policy would never produce this, which is what makes it evidence.
+        let declared = [WorkerId(0), WorkerId(0), WorkerId(0), WorkerId(1)];
+        for (id, worker) in declared.iter().enumerate() {
+            flow.on_arrival(text_request_on(
+                RequestId(id as u32),
+                8,
+                2,
+                Time::ZERO,
+                *worker,
+            ));
+        }
+
+        drain_to_completion(&mut flow);
+
+        for (id, worker) in declared.iter().enumerate() {
+            let visited = workers_visited(&store, RequestId(id as u32));
+            assert!(
+                visited.iter().all(|seen| seen == worker),
+                "request {id} was declared on {worker:?} but ran on {visited:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "needs a target_worker on every request")]
+    fn a_trace_directed_pool_refuses_a_request_that_names_no_worker() {
+        let (mut flow, _store) = build_flow(2, DpPlacementPolicy::TraceDirected);
+        flow.on_arrival(text_request(RequestId(0), 8, 2, Time::ZERO));
+    }
+
+    #[test]
+    #[should_panic(expected = "places by LeastQueued")]
+    fn a_load_placed_pool_refuses_a_request_that_names_a_worker() {
+        // Silently ignoring the column would produce a run that is not the
+        // placement the trace describes, with nothing in the output saying so.
+        let (mut flow, _store) = build_flow(2, DpPlacementPolicy::LeastQueued);
+        flow.on_arrival(text_request_on(RequestId(0), 8, 2, Time::ZERO, WorkerId(1)));
+    }
+
+    #[test]
+    #[should_panic(expected = "but the pool has 2 of them")]
+    fn a_target_outside_the_pool_is_refused() {
+        let (mut flow, _store) = build_flow(2, DpPlacementPolicy::TraceDirected);
+        flow.on_arrival(text_request_on(RequestId(0), 8, 2, Time::ZERO, WorkerId(5)));
     }
 }

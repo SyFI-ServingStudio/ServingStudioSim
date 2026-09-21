@@ -13,17 +13,20 @@ use req_frontend::schema::format::{
     audio_to_text, image_to_text, image_to_video, omni_generation, text_generation, text_to_image,
     text_to_speech, text_to_video, video_to_text, ParsedIndependentRow,
 };
-use req_frontend::schema::{RequestPriority, RequestSession, RequestSlo, RequestSpeculative};
+use req_frontend::schema::{
+    RequestPlacement, RequestPriority, RequestSession, RequestSlo, RequestSpeculative,
+};
 
 use super::arrival::{
-    ReleaseMetadata, ScheduledRequest, SchedulingDeclaration, SessionReleaseMetadata,
+    PlacementDeclaration, ReleaseMetadata, ScheduledRequest, SchedulingDeclaration,
+    SessionReleaseMetadata,
 };
 use crate::common::{
     AudioExtent, AudioTextGenerationDefinition, DecodingStrategy, ImageExtent,
     ImageGenerationDefinition, ImageTextGenerationDefinition, ImageToVideoDefinition,
     OmniGenerationDefinition, RequestDefinition, RequestId, SessionInput, SloContract,
     SpeechGenerationDefinition, TextGenerationDefinition, Time, VideoExtent,
-    VideoGenerationDefinition, VideoTextGenerationDefinition,
+    VideoGenerationDefinition, VideoTextGenerationDefinition, WorkerId,
 };
 
 pub use req_frontend::schema::{InputFileFormat, InputFileSchema, RequestFamily, TraceTag};
@@ -46,10 +49,12 @@ struct ParsedMetadata {
     release: ReleaseMetadata,
     slo: SloContract,
     scheduling: SchedulingDeclaration,
+    placement: PlacementDeclaration,
     session_input: SessionInput,
     decoding: DecodingStrategy,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn parse_independent_metadata(
     source_request_id: &str,
     trace_arrival_time_ms: f64,
@@ -57,6 +62,7 @@ fn parse_independent_metadata(
     slo: RequestSlo,
     priority: RequestPriority,
     speculative: RequestSpeculative,
+    placement: RequestPlacement,
     session_start_times: &mut HashMap<u32, Time>,
     source_identities: &mut SourceIdentities,
 ) -> Result<ParsedMetadata> {
@@ -96,6 +102,9 @@ fn parse_independent_metadata(
                     "request {source_request_id:?}: priority does not fit ServingStudioSim's i32 contract"
                 )
             })?,
+        },
+        placement: PlacementDeclaration {
+            target_worker: placement.target_worker.map(WorkerId),
         },
         session_input,
         decoding: speculative.strategy(),
@@ -150,6 +159,7 @@ where
             parsed.slo,
             parsed.priority,
             parsed.speculative,
+            parsed.placement,
             session_start_times,
             source_identities,
         )?;
@@ -158,6 +168,7 @@ where
             release: metadata.release,
             slo: metadata.slo,
             scheduling: metadata.scheduling,
+            placement: metadata.placement,
             definition,
         });
     }
@@ -219,6 +230,9 @@ impl TraceDefinition for TextGenerationDefinition {
                             scheduling: SchedulingDeclaration {
                                 priority: i32::try_from(round.priority.priority_or_default())
                                     .context("session request priority does not fit i32")?,
+                            },
+                            placement: PlacementDeclaration {
+                                target_worker: round.placement.target_worker.map(WorkerId),
                             },
                             definition: Self {
                                 prompt_tokens: usize_to_u32(round.input_len, "input_len")?,

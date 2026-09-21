@@ -13,7 +13,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{bail, ensure, Context};
+use anyhow::{bail, ensure, Context, Result};
 
 use crate::arch::build as arch_build;
 use crate::arch::contract::IterwiseUnifiedModel;
@@ -67,8 +67,8 @@ impl Deployment for PdDeployment {
             dg.arch.model().model_config,
         );
 
-        let prefill_cfg = pool_cfg(PD_PREFILL_POOL, pg.replicas, cfg.pools.prefill.placement);
-        let decode_cfg = pool_cfg(PD_DECODE_POOL, dg.replicas, cfg.pools.decode.placement);
+        let prefill_cfg = pool_cfg(PD_PREFILL_POOL, pg.replicas, cfg.pools.prefill.placement)?;
+        let decode_cfg = pool_cfg(PD_DECODE_POOL, dg.replicas, cfg.pools.decode.placement)?;
 
         let prefill_wc = worker_config(
             &pg.worker,
@@ -287,12 +287,12 @@ fn pool_cfg(
     pool: crate::common::PoolId,
     replicas: u16,
     placement: PlacementPolicy,
-) -> SimpleDpPoolConfig {
-    SimpleDpPoolConfig {
+) -> Result<SimpleDpPoolConfig> {
+    Ok(SimpleDpPoolConfig {
         pool,
         num_workers: replicas,
-        placement: placement_into(placement),
-    }
+        placement: placement_into(placement)?,
+    })
 }
 
 /// Assemble a [`PdFlow`] from two built models. Generic over each pool's concrete
@@ -372,9 +372,17 @@ fn build_transfer_cost(gpu_name: &str, bridge: &PerfApiBridge) -> anyhow::Result
     Ok(CostSource::Kernel(kernel))
 }
 
-fn placement_into(p: PlacementPolicy) -> DpPlacementPolicy {
-    match p {
+fn placement_into(p: PlacementPolicy) -> Result<DpPlacementPolicy> {
+    Ok(match p {
         PlacementPolicy::LeastQueued => DpPlacementPolicy::LeastQueued,
         PlacementPolicy::RoundRobin => DpPlacementPolicy::RoundRobin,
-    }
+        // A PD worker id is role-relative — prefill 0 and decode 0 are two
+        // different machines — so one `target_worker` column cannot name a
+        // worker unambiguously. Refusing is better than picking a role for the
+        // trace's author.
+        PlacementPolicy::TraceDirected => bail!(
+            "pd: placement `trace-directed` is unsupported — a PD worker id is \
+             relative to its pool, so one trace column cannot name one worker"
+        ),
+    })
 }
