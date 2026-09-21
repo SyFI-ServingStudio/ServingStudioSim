@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "note": "DFlash2 draft-phase rules, read off the draft ranges of the 20260920_0 NSYS capture. One rule set, not a chain: every rule here is keyed on a kernel name that occurs exactly once per draft program position, or on a name plus an immediate program-order neighbour that disambiguates it, so no two rules can claim a position with different operations and the order they are tried in cannot change the result.\n\nThis file is deliberately partial. The draft decoder layer runs ~60 kernels, and roughly forty of them are bare `elementwise_kernel` / `vectorized_elementwise_kernel` launches belonging to the four grouped-convolution halves. Those cannot be separated by name and their neighbours are each other, so labeling them soundly needs the conv halves decomposed on the simulator side first -- which is the disposition this capture recommends, not something a rule can paper over. Until then they stay unmapped rather than being guessed into a slot.",
+  "note": "DFlash2 draft-phase rules, read off the draft ranges of the 20260920_0 NSYS capture. One rule set, not a chain: every rule here is keyed on a kernel name that occurs exactly once per draft program position, or on a name plus an immediate program-order neighbour that disambiguates it, so no two rules can claim a position with different operations and the order they are tried in cannot change the result.\n\nThis file is deliberately partial. The draft decoder layer runs ~60 kernels, and roughly forty of them are bare `elementwise_kernel` / `vectorized_elementwise_kernel` launches belonging to the four grouped-convolution halves. Those cannot be separated by name and their neighbours are each other, so labeling them soundly needs the conv halves decomposed on the simulator side first -- which is the disposition this capture recommends, not something a rule can paper over. Until then they stay unmapped rather than being guessed into a slot.\n\nThe two `ncclDevKernel_AllGather_RING_LL` launches between the selector's two top-k selections are the other deliberate omission. They are the `get_top_k_tokens` value and id all-gathers, and the selector worklet does not price them, so mapping them would compare measured time against a slot that does not exist.",
   "rules": [
     {
       "operation": "dflash2.context_kv.aux_hidden_fc",
@@ -172,27 +172,52 @@
       "phase": "draft",
       "name": "flashinfer::sampling::RadixTopKKernel_Unified",
       "type": "model",
-      "role": "top-k over the draft vocabulary logits",
+      "role": "radix select of this rank's top candidates out of its own vocabulary shard",
       "cross_rank": "independent",
-      "slot_suffixes": ["dflash2.selector.candidate_topk"]
+      "slot_suffixes": ["dflash2.selector.candidate_topk"],
+      "note": "The vocabulary top-k is two selections, not one. `LogitsProcessor.get_top_k_tokens` never all-gathers the logits: each rank selects `top_k` from its own 38720-column shard, the ranks all-gather the values and the ids, and a second selection takes the global `top_k` out of the 64 gathered candidates. flashinfer's `top_k` dispatches on width, so the two calls land on different kernels and the capture separates them by name alone: the radix path here for the shard, the filtered path below for the gathered block. Both occur exactly once per draft program position in all 18 draft sequences."
     },
     {
       "operation": "dflash2.selector.candidate_topk",
+      "phase": "draft",
+      "name": "flashinfer::sampling::StableSortTopKByValueKernel",
+      "after_name": "flashinfer::sampling::RadixTopKKernel_Unified",
+      "type": "model",
+      "role": "on-device value sort of the shard selection's output",
+      "cross_rank": "independent",
+      "slot_suffixes": ["dflash2.selector.candidate_topk"],
+      "note": "`_topk` passes `sorted=True`, so each of the two selections ends in this sort; the same template instantiation runs for both, 36 launches against 18 draft sequences. Name alone cannot say which selection a launch belongs to, so each rule names the selection kernel immediately in front of it. The two predicates are disjoint and neither can fire on the other's position, so the order the rules are tried in does not matter. The simulator prices the sort inside the `logits_topk` leaf, because the profiled callable is the whole `flashinfer.top_k(..., sorted=True)` launch sequence rather than the select kernel alone."
+    },
+    {
+      "operation": "dflash2.selector.candidate_topk_merge",
       "phase": "draft",
       "name": "flashinfer::sampling::FilteredTopKUnifiedKernel",
       "type": "model",
-      "role": "filtered top-k pass over the draft vocabulary logits",
+      "role": "filtered select of the global top candidates out of the all-gathered block",
       "cross_rank": "independent",
-      "slot_suffixes": ["dflash2.selector.candidate_topk"]
+      "slot_suffixes": ["dflash2.selector.candidate_topk_merge"],
+      "note": "The second `_topk`, over `top_k * tp_size` = 64 columns. flashinfer takes its filtered path at this width instead of the radix path, which is why no neighbour predicate is needed to tell the merge select from the shard select."
     },
     {
-      "operation": "dflash2.selector.candidate_topk",
+      "operation": "dflash2.selector.candidate_topk_merge",
       "phase": "draft",
       "name": "flashinfer::sampling::FinalizeTopKIndicesKernel",
       "type": "model",
-      "role": "finalizes the candidate indices",
+      "role": "resolves the merge selection's column indices",
       "cross_rank": "independent",
-      "slot_suffixes": ["dflash2.selector.candidate_topk"]
+      "slot_suffixes": ["dflash2.selector.candidate_topk_merge"],
+      "note": "Second launch of the filtered path, so it belongs to the same merge selection as the kernel above. The radix path the shard select takes has no equivalent index pass."
+    },
+    {
+      "operation": "dflash2.selector.candidate_topk_merge",
+      "phase": "draft",
+      "name": "flashinfer::sampling::StableSortTopKByValueKernel",
+      "after_name": "flashinfer::sampling::FinalizeTopKIndicesKernel",
+      "type": "model",
+      "role": "on-device value sort of the merge selection's output",
+      "cross_rank": "independent",
+      "slot_suffixes": ["dflash2.selector.candidate_topk_merge"],
+      "note": "The merge selection's half of the sorted=True pair; see the shard selection's sort rule for why the predicate is the preceding kernel."
     }
   ]
 }
