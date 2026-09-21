@@ -494,7 +494,7 @@
       "phase": "forward",
       "stream_role": "primary",
       "type": "model",
-      "role": "DSA prefill index logits",
+      "role": "DSA indexer MQA logits over the prefill query rows",
       "cross_rank": "independent",
       "slot_suffixes": [
         "body.dense_full_index.attention.indexer.prefill_logits",
@@ -510,7 +510,7 @@
       "operation": "attention.indexer.prefill_logits",
       "name": "sm100_fp8_mqa_logits",
       "type": "model",
-      "role": "DSA prefill index logits",
+      "role": "DSA indexer MQA logits over the prefill query rows",
       "cross_rank": "independent",
       "slot_suffixes": [
         "body.dense_full_index.attention.indexer.prefill_logits",

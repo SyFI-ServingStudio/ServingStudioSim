@@ -344,6 +344,242 @@
         "body.sparse_initial_index_share.attention.fused_qkv_a_proj"
       ],
       "note": "When the first half of the A projection is split-K its reduction lands between the two halves. `before_name: nvjet_` is load-bearing and not decoration: without it this rule also matches the reduction that feeds the shared expert's activation, which is the gate/up projection's and not this one's."
+    },
+    {
+      "operation": "main.lm_head",
+      "phase": "sample",
+      "name": "nvjet_",
+      "after_name": "vectorized_gather_kernel",
+      "type": "model",
+      "role": "tensor-parallel language-model head projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "main.lm_head"
+      ],
+      "note": "The head runs on the rows a gather has just selected, which is the only place in the sample phase a GEMM follows a gather. Keyed on the predecessor's name because the gather itself is unmapped -- it is vLLM's last-token selection and the model folds it into the head."
+    },
+    {
+      "operation": "main.lm_head",
+      "phase": "sample",
+      "name": "cublasLt::splitKreduce_kernel",
+      "after": "main.lm_head",
+      "type": "model",
+      "role": "tensor-parallel language-model head projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "main.lm_head"
+      ]
+    },
+    {
+      "operation": "attention.indexer.selection",
+      "phase": "forward",
+      "name": "CatArrayBatchedCopy",
+      "after": "attention.indexer.rope",
+      "type": "model",
+      "role": "DSA indexer key/query preparation and top-k selection: the quantisations, the key layernorm, the weight scale, the index cache append and the top-k buffer fill",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.indexer.k_layernorm",
+        "body.dense_full_index.attention.indexer.q_quant",
+        "body.dense_full_index.attention.indexer.weight_scale",
+        "body.dense_full_index.attention.indexer.index_cache_append",
+        "body.dense_full_index.attention.indexer.topk_buffer_fill",
+        "body.sparse_cycle_full_index.attention.indexer.k_layernorm",
+        "body.sparse_cycle_full_index.attention.indexer.q_quant",
+        "body.sparse_cycle_full_index.attention.indexer.weight_scale",
+        "body.sparse_cycle_full_index.attention.indexer.index_cache_append",
+        "body.sparse_cycle_full_index.attention.indexer.topk_buffer_fill"
+      ],
+      "note": "One operation for the whole span between the indexer's rope and `q_absorb`, for the same reason `attention.sparse_mla.preparation` is: the bracket is evidence, the order inside it is not. The span holds eleven unmapped positions and the manifest holds eleven indexer leaves between those two anchors, but the measured members are a `CatArrayBatchedCopy`, a run of generic ATen elementwise kernels and one attention kernel, none of whose names says which leaf it is.\n\nThe bracket does settle one thing that was open before. `fmhaSm100aKernel_QkvBfloat16OBfloat16H256SeparateQkvCausalVarSeqQ128Kv` was left unlabeled on an earlier pass because it could not be placed: it is not the DSA MLA kernel, which is `fmhaSm100fKernel_QkvE4m3OBfloat16HQk576HV512...`, and it sits before `q_absorb`, which the manifest puts ahead of the main attention. With both anchors labeled it is inside the indexer block, so it is an indexer kernel, and `indexer.prefill_logits` is the only attention-shaped leaf in the span. That pairing is not what this rule asserts and nothing here depends on it -- the claim is the span.\n\n`slot_suffixes` lists only the indexer leaves no other operation already claims. Adding the ones the name-keyed rules own -- `prefill_logits`, `decode_logits`, `decode_topk`, `prefill_cache_gather` -- would count their simulated time twice."
+    },
+    {
+      "operation": "attention.indexer.selection",
+      "phase": "forward",
+      "name": "CatArrayBatchedCopy",
+      "after": "attention.indexer.decode_topk",
+      "type": "model",
+      "role": "DSA indexer key/query preparation and top-k selection: the quantisations, the key layernorm, the weight scale, the index cache append and the top-k buffer fill",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.indexer.k_layernorm",
+        "body.dense_full_index.attention.indexer.q_quant",
+        "body.dense_full_index.attention.indexer.weight_scale",
+        "body.dense_full_index.attention.indexer.index_cache_append",
+        "body.dense_full_index.attention.indexer.topk_buffer_fill",
+        "body.sparse_cycle_full_index.attention.indexer.k_layernorm",
+        "body.sparse_cycle_full_index.attention.indexer.q_quant",
+        "body.sparse_cycle_full_index.attention.indexer.weight_scale",
+        "body.sparse_cycle_full_index.attention.indexer.index_cache_append",
+        "body.sparse_cycle_full_index.attention.indexer.topk_buffer_fill"
+      ],
+      "note": "The same span in the layers whose indexer ran the decode top-k, where that kernel rather than the rope is the last labeled position before it."
+    },
+    {
+      "operation": "attention.indexer.selection",
+      "phase": "forward",
+      "name": "elementwise_kernel",
+      "after": "attention.indexer.selection",
+      "type": "model",
+      "role": "DSA indexer key/query preparation and top-k selection: the quantisations, the key layernorm, the weight scale, the index cache append and the top-k buffer fill",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.indexer.k_layernorm",
+        "body.dense_full_index.attention.indexer.q_quant",
+        "body.dense_full_index.attention.indexer.weight_scale",
+        "body.dense_full_index.attention.indexer.index_cache_append",
+        "body.dense_full_index.attention.indexer.topk_buffer_fill",
+        "body.sparse_cycle_full_index.attention.indexer.k_layernorm",
+        "body.sparse_cycle_full_index.attention.indexer.q_quant",
+        "body.sparse_cycle_full_index.attention.indexer.weight_scale",
+        "body.sparse_cycle_full_index.attention.indexer.index_cache_append",
+        "body.sparse_cycle_full_index.attention.indexer.topk_buffer_fill"
+      ],
+      "note": "Chains along the run. It cannot walk out of the span: `q_absorb` closes it and is a GEMM, which this name fragment does not match."
+    },
+    {
+      "operation": "attention.sparse_mla.preparation",
+      "phase": "forward",
+      "name": "CatArrayBatchedCopy",
+      "after": "attention.q_absorb",
+      "type": "model",
+      "role": "sparse MLA input preparation: the query concatenation, the latent KV cache append and the sparse index remap",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.sparse_mla.query_concat",
+        "body.dense_full_index.attention.sparse_mla.mla_cache_append",
+        "body.dense_full_index.attention.sparse_mla.index_remap",
+        "body.sparse_cycle_full_index.attention.sparse_mla.query_concat",
+        "body.sparse_cycle_full_index.attention.sparse_mla.mla_cache_append",
+        "body.sparse_cycle_full_index.attention.sparse_mla.index_remap",
+        "body.sparse_cycle_index_share.attention.sparse_mla.query_concat",
+        "body.sparse_cycle_index_share.attention.sparse_mla.mla_cache_append",
+        "body.sparse_cycle_index_share.attention.sparse_mla.index_remap",
+        "body.sparse_initial_index_share.attention.sparse_mla.query_concat",
+        "body.sparse_initial_index_share.attention.sparse_mla.mla_cache_append",
+        "body.sparse_initial_index_share.attention.sparse_mla.index_remap"
+      ],
+      "note": "The query concatenation itself, which is the first thing after the absorb and was outside the three positions this operation started with."
+    },
+    {
+      "operation": "dflash2.selector.lm_head",
+      "phase": "draft",
+      "name": "nvjet_",
+      "before": "dflash2.selector.lm_head",
+      "type": "model",
+      "role": "draft vocabulary projection feeding the candidate selection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.selector.lm_head"
+      ],
+      "note": "The GEMM whose split-K reduction the rule above already names."
+    },
+    {
+      "operation": "attention.sparse_mla",
+      "phase": "forward",
+      "name": "fmhaSm100aKernel",
+      "type": "model",
+      "role": "sparse MLA attention",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.sparse_mla.decode",
+        "body.dense_full_index.attention.sparse_mla.prefill",
+        "body.sparse_cycle_full_index.attention.sparse_mla.decode",
+        "body.sparse_cycle_full_index.attention.sparse_mla.prefill",
+        "body.sparse_cycle_index_share.attention.sparse_mla.decode",
+        "body.sparse_cycle_index_share.attention.sparse_mla.prefill",
+        "body.sparse_initial_index_share.attention.sparse_mla.decode",
+        "body.sparse_initial_index_share.attention.sparse_mla.prefill"
+      ],
+      "note": "The MLA prefill attention, on the path where vLLM does not absorb: no `q_absorb` and no `v_up` run in these layers, the query and key are materialised at head dim 256, and the kernel is plain causal variable-length FlashAttention rather than the DSA kernel. Two things settle it. The bracket: it is the last position before `attention.o_proj`, and the manifest has only the attention between the indexer and the output projection. And the companions: `ComputeLSEFromMDKernel` and `merge_attn_states_kernel` run beside it, which is the chunked prefix merge and belongs to nothing else.\n\nIt was left unlabeled on two earlier passes because the DSA kernel is `fmhaSm100fKernel_QkvE4m3OBfloat16HQk576HV512...` and this one looked like a different family -- which it is, but of the same operation. `Sm100a` versus `Sm100f` is the tell, and the name alone is enough to separate them."
+    },
+    {
+      "operation": "attention.indexer.prefill_logits",
+      "phase": "forward",
+      "name": "nvjet_",
+      "after": "attention.indexer.selection",
+      "type": "model",
+      "role": "DSA indexer MQA logits over the prefill query rows",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.indexer.prefill_logits",
+        "body.sparse_cycle_full_index.attention.indexer.prefill_logits"
+      ],
+      "note": "On the prefill path the index logits are a cuBLAS GEMM rather than the `deep_gemm` kernel the name-keyed rule owns. Same operation, different implementation: it is the only GEMM between the indexer's key concatenation and the masking run that selects from its output."
+    },
+    {
+      "operation": "attention.indexer.prefill_topk",
+      "phase": "forward",
+      "name": "elementwise_kernel",
+      "after": "attention.indexer.prefill_logits",
+      "type": "model",
+      "role": "DSA prefill top-k selection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.indexer.prefill_topk",
+        "body.sparse_cycle_full_index.attention.indexer.prefill_topk"
+      ],
+      "note": "The selection the logits feed, which the capture runs as a run of ATen comparisons, bitwise operations and binary functors rather than one kernel. Bracketed by the logits GEMM behind it and the attention in front of it."
+    },
+    {
+      "operation": "attention.indexer.prefill_topk",
+      "phase": "forward",
+      "name": "elementwise_kernel",
+      "after": "attention.indexer.prefill_topk",
+      "type": "model",
+      "role": "DSA prefill top-k selection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.indexer.prefill_topk",
+        "body.sparse_cycle_full_index.attention.indexer.prefill_topk"
+      ]
+    },
+    {
+      "operation": "attention.sparse_mla.preparation",
+      "phase": "forward",
+      "name": "elementwise_kernel",
+      "after": "attention.indexer.decode_topk",
+      "type": "model",
+      "role": "sparse MLA input preparation: the query concatenation, the latent KV cache append and the sparse index remap",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.sparse_mla.query_concat",
+        "body.dense_full_index.attention.sparse_mla.mla_cache_append",
+        "body.dense_full_index.attention.sparse_mla.index_remap",
+        "body.sparse_cycle_full_index.attention.sparse_mla.query_concat",
+        "body.sparse_cycle_full_index.attention.sparse_mla.mla_cache_append",
+        "body.sparse_cycle_full_index.attention.sparse_mla.index_remap",
+        "body.sparse_cycle_index_share.attention.sparse_mla.query_concat",
+        "body.sparse_cycle_index_share.attention.sparse_mla.mla_cache_append",
+        "body.sparse_cycle_index_share.attention.sparse_mla.index_remap",
+        "body.sparse_initial_index_share.attention.sparse_mla.query_concat",
+        "body.sparse_initial_index_share.attention.sparse_mla.mla_cache_append",
+        "body.sparse_initial_index_share.attention.sparse_mla.index_remap"
+      ],
+      "note": "On the decode path the preparation run starts right after the indexer's top-k, which is the last labeled position before it, and is longer than the three positions this operation started from."
+    },
+    {
+      "operation": "attention.sparse_mla.preparation",
+      "phase": "forward",
+      "name": "elementwise_kernel",
+      "after": "attention.sparse_mla.preparation",
+      "type": "model",
+      "role": "sparse MLA input preparation: the query concatenation, the latent KV cache append and the sparse index remap",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.sparse_mla.query_concat",
+        "body.dense_full_index.attention.sparse_mla.mla_cache_append",
+        "body.dense_full_index.attention.sparse_mla.index_remap",
+        "body.sparse_cycle_full_index.attention.sparse_mla.query_concat",
+        "body.sparse_cycle_full_index.attention.sparse_mla.mla_cache_append",
+        "body.sparse_cycle_full_index.attention.sparse_mla.index_remap",
+        "body.sparse_cycle_index_share.attention.sparse_mla.query_concat",
+        "body.sparse_cycle_index_share.attention.sparse_mla.mla_cache_append",
+        "body.sparse_cycle_index_share.attention.sparse_mla.index_remap",
+        "body.sparse_initial_index_share.attention.sparse_mla.query_concat",
+        "body.sparse_initial_index_share.attention.sparse_mla.mla_cache_append",
+        "body.sparse_initial_index_share.attention.sparse_mla.index_remap"
+      ],
+      "note": "Chains along that run. The attention closes it and is not an elementwise kernel."
     }
   ]
 }

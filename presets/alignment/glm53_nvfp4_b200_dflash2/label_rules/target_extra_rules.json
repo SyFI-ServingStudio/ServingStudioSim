@@ -181,15 +181,23 @@
       "phase": "forward",
       "name": "_fused_norm_rope_kernel",
       "type": "model",
-      "role": "fused latent-KV norm and rope on the main attention path",
+      "role": "fused Q and latent-KV norm and rope on the main attention path",
       "cross_rank": "independent",
       "slot_suffixes": [
         "body.dense_full_index.attention.main_rope",
         "body.sparse_cycle_full_index.attention.main_rope",
         "body.sparse_cycle_index_share.attention.main_rope",
-        "body.sparse_initial_index_share.attention.main_rope"
+        "body.sparse_initial_index_share.attention.main_rope",
+        "body.dense_full_index.attention.q_a_rms_norm",
+        "body.sparse_cycle_full_index.attention.q_a_rms_norm",
+        "body.sparse_cycle_index_share.attention.q_a_rms_norm",
+        "body.sparse_initial_index_share.attention.q_a_rms_norm",
+        "body.dense_full_index.attention.kv_a_rms_norm",
+        "body.sparse_cycle_full_index.attention.kv_a_rms_norm",
+        "body.sparse_cycle_index_share.attention.kv_a_rms_norm",
+        "body.sparse_initial_index_share.attention.kv_a_rms_norm"
       ],
-      "note": "Sits between the fused QKV-A projection and the Q absorb in every layer of this capture. The simulated slot is `vllm_mla_rope`, whose measured rows are known to depend on batch size through a dynamo shape-cache limit -- that is a profiling caveat for the slot, not a reason to label this kernel elsewhere."
+      "note": "Three simulated leaves, one measured kernel, and the argument is exhaustion rather than the name. Every layer in this capture runs exactly one `_fused_norm_rope_kernel`, between the A projection and `q_b_proj`. The manifest puts `q_a_rms_norm` in that same span, so it is certainly part of this kernel. `kv_a_rms_norm` and `main_rope` sit after `q_b_proj` in the manifest -- but the capture goes straight from `q_b_proj` to `q_absorb` with no kernel in between, so there is nothing else left to own them. Claiming only `main_rope`, which is what this rule did before, left 570 ms of simulated norm time with no measured counterpart and made the operation read -21.6 ms on the decode iterations for no physical reason."
     },
     {
       "operation": "attention.indexer.q_proj",

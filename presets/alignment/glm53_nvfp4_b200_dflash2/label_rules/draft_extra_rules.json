@@ -65,6 +65,639 @@
       "slot_suffixes": [
         "dflash2.selector.lm_head"
       ]
+    },
+    {
+      "operation": "dflash2.layer.attn_allreduce",
+      "phase": "draft",
+      "name": "trtllm_mnnvl_allreduce::twoshotAllreduceKernel",
+      "after": "dflash2.layer.attn.o_proj",
+      "type": "collective",
+      "role": "TP reduction of the draft attention output",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": [
+        "dflash2.layer.attn_allreduce"
+      ],
+      "note": "Keyed on the projection it reduces. This separates the draft layers' own reductions, which the model does have leaves for, from the draft's input-embedding reduction, which it does not: that one opens a segment body and so has no mapped predecessor at all, which is exactly what this predicate excludes."
+    },
+    {
+      "operation": "dflash2.layer.ffn_allreduce",
+      "phase": "draft",
+      "name": "trtllm_mnnvl_allreduce::twoshotAllreduceKernel",
+      "after": "dflash2.layer.ffn.down_proj",
+      "type": "collective",
+      "role": "TP reduction of the draft FFN output",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": [
+        "dflash2.layer.ffn_allreduce"
+      ],
+      "note": "Keyed on the projection it reduces. This separates the draft layers' own reductions, which the model does have leaves for, from the draft's input-embedding reduction, which it does not: that one opens a segment body and so has no mapped predecessor at all, which is exactly what this predicate excludes."
+    },
+    {
+      "operation": "dflash2.layer.attn_allreduce",
+      "phase": "draft",
+      "name": "trtllm_mnnvl_allreduce::oneshotAllreduceFusionKernel",
+      "after": "dflash2.layer.attn.o_proj",
+      "type": "collective",
+      "role": "TP reduction of the draft attention output",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": [
+        "dflash2.layer.attn_allreduce"
+      ],
+      "note": "The one-shot variant of the rule above; which path runs is a size decision inside FlashInfer."
+    },
+    {
+      "operation": "dflash2.layer.ffn_allreduce",
+      "phase": "draft",
+      "name": "trtllm_mnnvl_allreduce::oneshotAllreduceFusionKernel",
+      "after": "dflash2.layer.ffn.down_proj",
+      "type": "collective",
+      "role": "TP reduction of the draft FFN output",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": [
+        "dflash2.layer.ffn_allreduce"
+      ],
+      "note": "The one-shot variant of the rule above; which path runs is a size decision inside FlashInfer."
+    },
+    {
+      "operation": "dflash2.layer.ffn.attn_conv_finish",
+      "phase": "draft",
+      "name": "elementwise_kernel",
+      "after": "dflash2.layer.attn_allreduce",
+      "type": "model",
+      "role": "grouped-convolution finish on the draft attention path",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.layer.ffn.attn_conv_finish"
+      ],
+      "note": "The model prices this half of the grouped convolution as one `elementwise` leaf and the capture runs a run of ATen launches for it, so one operation covers the run. That gap is a fidelity question about the leaf, which is exactly what labeling it makes measurable; leaving it unmapped would hide it instead. The run is bracketed by the reduction it follows and the end of the layer body."
+    },
+    {
+      "operation": "dflash2.layer.ffn.attn_conv_finish",
+      "phase": "draft",
+      "name": "elementwise_kernel",
+      "after": "dflash2.layer.ffn.attn_conv_finish",
+      "type": "model",
+      "role": "grouped-convolution finish on the draft attention path",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.layer.ffn.attn_conv_finish"
+      ]
+    },
+    {
+      "operation": "dflash2.layer.ffn.mlp_conv_finish",
+      "phase": "draft",
+      "name": "elementwise_kernel",
+      "after": "dflash2.layer.ffn_allreduce",
+      "type": "model",
+      "role": "grouped-convolution finish on the draft FFN path",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.layer.ffn.mlp_conv_finish"
+      ],
+      "note": "The model prices this half of the grouped convolution as one `elementwise` leaf and the capture runs a run of ATen launches for it, so one operation covers the run. That gap is a fidelity question about the leaf, which is exactly what labeling it makes measurable; leaving it unmapped would hide it instead. The run is bracketed by the reduction it follows and the end of the layer body."
+    },
+    {
+      "operation": "dflash2.layer.ffn.mlp_conv_finish",
+      "phase": "draft",
+      "name": "elementwise_kernel",
+      "after": "dflash2.layer.ffn.mlp_conv_finish",
+      "type": "model",
+      "role": "grouped-convolution finish on the draft FFN path",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.layer.ffn.mlp_conv_finish"
+      ]
+    },
+    {
+      "operation": "dflash2.layer.attn.k_norm",
+      "phase": "draft",
+      "name": "vllm::rms_norm_kernel",
+      "before": "dflash2.layer.attn.rope",
+      "type": "model",
+      "role": "draft attention key norm",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.layer.attn.k_norm"
+      ],
+      "note": "The manifest runs q_norm, then k_norm, then the rope, so the norm immediately before the rope is the key's."
+    },
+    {
+      "operation": "dflash2.layer.attn.q_norm",
+      "phase": "draft",
+      "name": "vllm::rms_norm_kernel",
+      "before": "dflash2.layer.attn.k_norm",
+      "type": "model",
+      "role": "draft attention query norm",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.layer.attn.q_norm"
+      ],
+      "note": "And the one behind the key norm is the query's."
+    },
+    {
+      "operation": "dflash2.layer.attn.qkv_proj",
+      "phase": "draft",
+      "name": "cublasLt::splitKreduce_kernel",
+      "before": "dflash2.layer.attn.q_norm",
+      "type": "model",
+      "role": "draft fused QKV projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.layer.attn.qkv_proj"
+      ],
+      "note": "The split-K reduction of the projection the two norms consume."
+    },
+    {
+      "operation": "dflash2.layer.attn.qkv_proj",
+      "phase": "draft",
+      "name": "nvjet_",
+      "before": "dflash2.layer.attn.q_norm",
+      "type": "model",
+      "role": "draft fused QKV projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.layer.attn.qkv_proj"
+      ]
+    },
+    {
+      "operation": "dflash2.layer.attn.qkv_proj",
+      "phase": "draft",
+      "name": "nvjet_",
+      "before": "dflash2.layer.attn.qkv_proj",
+      "before_name": "cublasLt::splitKreduce_kernel",
+      "type": "model",
+      "role": "draft fused QKV projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.layer.attn.qkv_proj"
+      ]
+    },
+    {
+      "operation": "dflash2.layer.attn.conv_and_input",
+      "phase": "draft",
+      "name": "elementwise_kernel",
+      "before": "dflash2.layer.attn.qkv_proj",
+      "type": "model",
+      "role": "draft layer input residual norm and the attention half of the grouped convolution, projection and prepare together",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.layer.attn.input_add_rms_norm",
+        "dflash2.layer.attn.attn_conv_projection",
+        "dflash2.layer.attn.attn_conv_prepare"
+      ],
+      "note": "One operation for the run that opens a draft layer, because the run opens a folded segment body and so has no predecessor to key on -- every rule here reaches it backwards from `qkv_proj`, and a backward chain cannot tell the three leaves apart. The manifest has exactly three leaves between the layer boundary and `qkv_proj`: the input residual norm, the convolution projection and the convolution prepare. The chain terminates on its own: it only relabels unmapped positions, so it stops at the previous layer's labeled tail."
+    },
+    {
+      "operation": "dflash2.layer.attn.conv_and_input",
+      "phase": "draft",
+      "name": "elementwise_kernel",
+      "before": "dflash2.layer.attn.conv_and_input",
+      "type": "model",
+      "role": "draft layer input residual norm and the attention half of the grouped convolution, projection and prepare together",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.layer.attn.input_add_rms_norm",
+        "dflash2.layer.attn.attn_conv_projection",
+        "dflash2.layer.attn.attn_conv_prepare"
+      ]
+    },
+    {
+      "operation": "dflash2.layer.attn.conv_and_input",
+      "phase": "draft",
+      "name": "vllm::rms_norm_kernel",
+      "before": "dflash2.layer.attn.qkv_proj",
+      "type": "model",
+      "role": "draft layer input residual norm and the attention half of the grouped convolution, projection and prepare together",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.layer.attn.input_add_rms_norm",
+        "dflash2.layer.attn.attn_conv_projection",
+        "dflash2.layer.attn.attn_conv_prepare"
+      ],
+      "note": "One operation for the run that opens a draft layer, because the run opens a folded segment body and so has no predecessor to key on -- every rule here reaches it backwards from `qkv_proj`, and a backward chain cannot tell the three leaves apart. The manifest has exactly three leaves between the layer boundary and `qkv_proj`: the input residual norm, the convolution projection and the convolution prepare. The chain terminates on its own: it only relabels unmapped positions, so it stops at the previous layer's labeled tail."
+    },
+    {
+      "operation": "dflash2.layer.attn.conv_and_input",
+      "phase": "draft",
+      "name": "vllm::rms_norm_kernel",
+      "before": "dflash2.layer.attn.conv_and_input",
+      "type": "model",
+      "role": "draft layer input residual norm and the attention half of the grouped convolution, projection and prepare together",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.layer.attn.input_add_rms_norm",
+        "dflash2.layer.attn.attn_conv_projection",
+        "dflash2.layer.attn.attn_conv_prepare"
+      ]
+    },
+    {
+      "operation": "dflash2.layer.attn.conv_and_input",
+      "phase": "draft",
+      "name": "nvjet_",
+      "before": "dflash2.layer.attn.qkv_proj",
+      "type": "model",
+      "role": "draft layer input residual norm and the attention half of the grouped convolution, projection and prepare together",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.layer.attn.input_add_rms_norm",
+        "dflash2.layer.attn.attn_conv_projection",
+        "dflash2.layer.attn.attn_conv_prepare"
+      ],
+      "note": "One operation for the run that opens a draft layer, because the run opens a folded segment body and so has no predecessor to key on -- every rule here reaches it backwards from `qkv_proj`, and a backward chain cannot tell the three leaves apart. The manifest has exactly three leaves between the layer boundary and `qkv_proj`: the input residual norm, the convolution projection and the convolution prepare. The chain terminates on its own: it only relabels unmapped positions, so it stops at the previous layer's labeled tail."
+    },
+    {
+      "operation": "dflash2.layer.attn.conv_and_input",
+      "phase": "draft",
+      "name": "nvjet_",
+      "before": "dflash2.layer.attn.conv_and_input",
+      "type": "model",
+      "role": "draft layer input residual norm and the attention half of the grouped convolution, projection and prepare together",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.layer.attn.input_add_rms_norm",
+        "dflash2.layer.attn.attn_conv_projection",
+        "dflash2.layer.attn.attn_conv_prepare"
+      ]
+    },
+    {
+      "operation": "dflash2.layer.attn.conv_and_input",
+      "phase": "draft",
+      "name": "cublasLt::splitKreduce_kernel",
+      "before": "dflash2.layer.attn.qkv_proj",
+      "type": "model",
+      "role": "draft layer input residual norm and the attention half of the grouped convolution, projection and prepare together",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.layer.attn.input_add_rms_norm",
+        "dflash2.layer.attn.attn_conv_projection",
+        "dflash2.layer.attn.attn_conv_prepare"
+      ],
+      "note": "One operation for the run that opens a draft layer, because the run opens a folded segment body and so has no predecessor to key on -- every rule here reaches it backwards from `qkv_proj`, and a backward chain cannot tell the three leaves apart. The manifest has exactly three leaves between the layer boundary and `qkv_proj`: the input residual norm, the convolution projection and the convolution prepare. The chain terminates on its own: it only relabels unmapped positions, so it stops at the previous layer's labeled tail."
+    },
+    {
+      "operation": "dflash2.layer.attn.conv_and_input",
+      "phase": "draft",
+      "name": "cublasLt::splitKreduce_kernel",
+      "before": "dflash2.layer.attn.conv_and_input",
+      "type": "model",
+      "role": "draft layer input residual norm and the attention half of the grouped convolution, projection and prepare together",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.layer.attn.input_add_rms_norm",
+        "dflash2.layer.attn.attn_conv_projection",
+        "dflash2.layer.attn.attn_conv_prepare"
+      ]
+    },
+    {
+      "operation": "dflash2.layer.ffn.attn_conv_finish",
+      "phase": "draft",
+      "name": "vllm::_typeConvert",
+      "after": "dflash2.layer.ffn.attn_conv_finish",
+      "type": "model",
+      "role": "grouped-convolution finish on the draft attention path",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.layer.ffn.attn_conv_finish"
+      ],
+      "note": "The dtype conversion that closes the run, which ATen emits as its own launch."
+    },
+    {
+      "operation": "dflash2.layer.ffn.mlp_conv_finish",
+      "phase": "draft",
+      "name": "vllm::_typeConvert",
+      "after": "dflash2.layer.ffn.mlp_conv_finish",
+      "type": "model",
+      "role": "grouped-convolution finish on the draft FFN path",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.layer.ffn.mlp_conv_finish"
+      ],
+      "note": "The dtype conversion that closes the run, which ATen emits as its own launch."
+    },
+    {
+      "operation": "dflash2.layer.ffn.gate_up_proj",
+      "phase": "draft",
+      "name": "nvjet_",
+      "before": "dflash2.layer.ffn.silu_and_mul",
+      "type": "model",
+      "role": "fused gate and up projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.layer.ffn.gate_up_proj"
+      ],
+      "note": "The projection the activation consumes."
+    },
+    {
+      "operation": "dflash2.layer.ffn.gate_up_proj",
+      "phase": "draft",
+      "name": "cublasLt::splitKreduce_kernel",
+      "before": "dflash2.layer.ffn.silu_and_mul",
+      "type": "model",
+      "role": "fused gate and up projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.layer.ffn.gate_up_proj"
+      ]
+    },
+    {
+      "operation": "dflash2.layer.ffn.gate_up_proj",
+      "phase": "draft",
+      "name": "nvjet_",
+      "before": "dflash2.layer.ffn.gate_up_proj",
+      "before_name": "cublasLt::splitKreduce_kernel",
+      "type": "model",
+      "role": "fused gate and up projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.layer.ffn.gate_up_proj"
+      ]
+    },
+    {
+      "operation": "dflash2.layer.ffn.conv_and_norm",
+      "phase": "draft",
+      "name": "elementwise_kernel",
+      "before": "dflash2.layer.ffn.gate_up_proj",
+      "type": "model",
+      "role": "draft post-attention residual norm and the FFN half of the grouped convolution, projection and prepare together",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.layer.ffn.post_attn_add_rms_norm",
+        "dflash2.layer.ffn.mlp_conv_projection",
+        "dflash2.layer.ffn.mlp_conv_prepare"
+      ],
+      "note": "The mirror of `dflash2.layer.attn.conv_and_input` on the FFN side, and aggregated for the same reason: the manifest has exactly three leaves between the attention half's convolution finish and the gate/up projection -- the post-attention residual norm, the convolution projection and the convolution prepare -- and a backward chain from the projection cannot tell them apart. The run's members are ATen elementwise launches, a `CatArrayBatchedCopy`, an `arange` and a cuBLAS pair, none of which names its leaf."
+    },
+    {
+      "operation": "dflash2.layer.ffn.conv_and_norm",
+      "phase": "draft",
+      "name": "elementwise_kernel",
+      "before": "dflash2.layer.ffn.conv_and_norm",
+      "type": "model",
+      "role": "draft post-attention residual norm and the FFN half of the grouped convolution, projection and prepare together",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.layer.ffn.post_attn_add_rms_norm",
+        "dflash2.layer.ffn.mlp_conv_projection",
+        "dflash2.layer.ffn.mlp_conv_prepare"
+      ]
+    },
+    {
+      "operation": "dflash2.layer.ffn.conv_and_norm",
+      "phase": "draft",
+      "name": "vllm::rms_norm_kernel",
+      "before": "dflash2.layer.ffn.gate_up_proj",
+      "type": "model",
+      "role": "draft post-attention residual norm and the FFN half of the grouped convolution, projection and prepare together",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.layer.ffn.post_attn_add_rms_norm",
+        "dflash2.layer.ffn.mlp_conv_projection",
+        "dflash2.layer.ffn.mlp_conv_prepare"
+      ],
+      "note": "The mirror of `dflash2.layer.attn.conv_and_input` on the FFN side, and aggregated for the same reason: the manifest has exactly three leaves between the attention half's convolution finish and the gate/up projection -- the post-attention residual norm, the convolution projection and the convolution prepare -- and a backward chain from the projection cannot tell them apart. The run's members are ATen elementwise launches, a `CatArrayBatchedCopy`, an `arange` and a cuBLAS pair, none of which names its leaf."
+    },
+    {
+      "operation": "dflash2.layer.ffn.conv_and_norm",
+      "phase": "draft",
+      "name": "vllm::rms_norm_kernel",
+      "before": "dflash2.layer.ffn.conv_and_norm",
+      "type": "model",
+      "role": "draft post-attention residual norm and the FFN half of the grouped convolution, projection and prepare together",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.layer.ffn.post_attn_add_rms_norm",
+        "dflash2.layer.ffn.mlp_conv_projection",
+        "dflash2.layer.ffn.mlp_conv_prepare"
+      ]
+    },
+    {
+      "operation": "dflash2.layer.ffn.conv_and_norm",
+      "phase": "draft",
+      "name": "nvjet_",
+      "before": "dflash2.layer.ffn.gate_up_proj",
+      "type": "model",
+      "role": "draft post-attention residual norm and the FFN half of the grouped convolution, projection and prepare together",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.layer.ffn.post_attn_add_rms_norm",
+        "dflash2.layer.ffn.mlp_conv_projection",
+        "dflash2.layer.ffn.mlp_conv_prepare"
+      ],
+      "note": "The mirror of `dflash2.layer.attn.conv_and_input` on the FFN side, and aggregated for the same reason: the manifest has exactly three leaves between the attention half's convolution finish and the gate/up projection -- the post-attention residual norm, the convolution projection and the convolution prepare -- and a backward chain from the projection cannot tell them apart. The run's members are ATen elementwise launches, a `CatArrayBatchedCopy`, an `arange` and a cuBLAS pair, none of which names its leaf."
+    },
+    {
+      "operation": "dflash2.layer.ffn.conv_and_norm",
+      "phase": "draft",
+      "name": "nvjet_",
+      "before": "dflash2.layer.ffn.conv_and_norm",
+      "type": "model",
+      "role": "draft post-attention residual norm and the FFN half of the grouped convolution, projection and prepare together",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.layer.ffn.post_attn_add_rms_norm",
+        "dflash2.layer.ffn.mlp_conv_projection",
+        "dflash2.layer.ffn.mlp_conv_prepare"
+      ]
+    },
+    {
+      "operation": "dflash2.layer.ffn.conv_and_norm",
+      "phase": "draft",
+      "name": "cublasLt::splitKreduce_kernel",
+      "before": "dflash2.layer.ffn.gate_up_proj",
+      "type": "model",
+      "role": "draft post-attention residual norm and the FFN half of the grouped convolution, projection and prepare together",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.layer.ffn.post_attn_add_rms_norm",
+        "dflash2.layer.ffn.mlp_conv_projection",
+        "dflash2.layer.ffn.mlp_conv_prepare"
+      ],
+      "note": "The mirror of `dflash2.layer.attn.conv_and_input` on the FFN side, and aggregated for the same reason: the manifest has exactly three leaves between the attention half's convolution finish and the gate/up projection -- the post-attention residual norm, the convolution projection and the convolution prepare -- and a backward chain from the projection cannot tell them apart. The run's members are ATen elementwise launches, a `CatArrayBatchedCopy`, an `arange` and a cuBLAS pair, none of which names its leaf."
+    },
+    {
+      "operation": "dflash2.layer.ffn.conv_and_norm",
+      "phase": "draft",
+      "name": "cublasLt::splitKreduce_kernel",
+      "before": "dflash2.layer.ffn.conv_and_norm",
+      "type": "model",
+      "role": "draft post-attention residual norm and the FFN half of the grouped convolution, projection and prepare together",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.layer.ffn.post_attn_add_rms_norm",
+        "dflash2.layer.ffn.mlp_conv_projection",
+        "dflash2.layer.ffn.mlp_conv_prepare"
+      ]
+    },
+    {
+      "operation": "dflash2.layer.ffn.conv_and_norm",
+      "phase": "draft",
+      "name": "CatArrayBatchedCopy",
+      "before": "dflash2.layer.ffn.gate_up_proj",
+      "type": "model",
+      "role": "draft post-attention residual norm and the FFN half of the grouped convolution, projection and prepare together",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.layer.ffn.post_attn_add_rms_norm",
+        "dflash2.layer.ffn.mlp_conv_projection",
+        "dflash2.layer.ffn.mlp_conv_prepare"
+      ],
+      "note": "The mirror of `dflash2.layer.attn.conv_and_input` on the FFN side, and aggregated for the same reason: the manifest has exactly three leaves between the attention half's convolution finish and the gate/up projection -- the post-attention residual norm, the convolution projection and the convolution prepare -- and a backward chain from the projection cannot tell them apart. The run's members are ATen elementwise launches, a `CatArrayBatchedCopy`, an `arange` and a cuBLAS pair, none of which names its leaf."
+    },
+    {
+      "operation": "dflash2.layer.ffn.conv_and_norm",
+      "phase": "draft",
+      "name": "CatArrayBatchedCopy",
+      "before": "dflash2.layer.ffn.conv_and_norm",
+      "type": "model",
+      "role": "draft post-attention residual norm and the FFN half of the grouped convolution, projection and prepare together",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.layer.ffn.post_attn_add_rms_norm",
+        "dflash2.layer.ffn.mlp_conv_projection",
+        "dflash2.layer.ffn.mlp_conv_prepare"
+      ]
+    },
+    {
+      "operation": "dflash2.layer.ffn.conv_and_norm",
+      "phase": "draft",
+      "name": "elementwise_kernel_with_index",
+      "before": "dflash2.layer.ffn.gate_up_proj",
+      "type": "model",
+      "role": "draft post-attention residual norm and the FFN half of the grouped convolution, projection and prepare together",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.layer.ffn.post_attn_add_rms_norm",
+        "dflash2.layer.ffn.mlp_conv_projection",
+        "dflash2.layer.ffn.mlp_conv_prepare"
+      ],
+      "note": "The mirror of `dflash2.layer.attn.conv_and_input` on the FFN side, and aggregated for the same reason: the manifest has exactly three leaves between the attention half's convolution finish and the gate/up projection -- the post-attention residual norm, the convolution projection and the convolution prepare -- and a backward chain from the projection cannot tell them apart. The run's members are ATen elementwise launches, a `CatArrayBatchedCopy`, an `arange` and a cuBLAS pair, none of which names its leaf."
+    },
+    {
+      "operation": "dflash2.layer.ffn.conv_and_norm",
+      "phase": "draft",
+      "name": "elementwise_kernel_with_index",
+      "before": "dflash2.layer.ffn.conv_and_norm",
+      "type": "model",
+      "role": "draft post-attention residual norm and the FFN half of the grouped convolution, projection and prepare together",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.layer.ffn.post_attn_add_rms_norm",
+        "dflash2.layer.ffn.mlp_conv_projection",
+        "dflash2.layer.ffn.mlp_conv_prepare"
+      ]
+    },
+    {
+      "operation": "dflash2.layer.ffn.conv_and_norm",
+      "phase": "draft",
+      "name": "vllm::_typeConvert",
+      "before": "dflash2.layer.ffn.gate_up_proj",
+      "type": "model",
+      "role": "draft post-attention residual norm and the FFN half of the grouped convolution, projection and prepare together",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.layer.ffn.post_attn_add_rms_norm",
+        "dflash2.layer.ffn.mlp_conv_projection",
+        "dflash2.layer.ffn.mlp_conv_prepare"
+      ],
+      "note": "The mirror of `dflash2.layer.attn.conv_and_input` on the FFN side, and aggregated for the same reason: the manifest has exactly three leaves between the attention half's convolution finish and the gate/up projection -- the post-attention residual norm, the convolution projection and the convolution prepare -- and a backward chain from the projection cannot tell them apart. The run's members are ATen elementwise launches, a `CatArrayBatchedCopy`, an `arange` and a cuBLAS pair, none of which names its leaf."
+    },
+    {
+      "operation": "dflash2.layer.ffn.conv_and_norm",
+      "phase": "draft",
+      "name": "vllm::_typeConvert",
+      "before": "dflash2.layer.ffn.conv_and_norm",
+      "type": "model",
+      "role": "draft post-attention residual norm and the FFN half of the grouped convolution, projection and prepare together",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.layer.ffn.post_attn_add_rms_norm",
+        "dflash2.layer.ffn.mlp_conv_projection",
+        "dflash2.layer.ffn.mlp_conv_prepare"
+      ]
+    },
+    {
+      "operation": "dflash2.layer.attn.conv_and_input",
+      "phase": "draft",
+      "name": "CatArrayBatchedCopy",
+      "before": "dflash2.layer.attn.qkv_proj",
+      "type": "model",
+      "role": "draft layer input residual norm and the attention half of the grouped convolution, projection and prepare together",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.layer.attn.input_add_rms_norm",
+        "dflash2.layer.attn.attn_conv_projection",
+        "dflash2.layer.attn.attn_conv_prepare"
+      ]
+    },
+    {
+      "operation": "dflash2.layer.attn.conv_and_input",
+      "phase": "draft",
+      "name": "CatArrayBatchedCopy",
+      "before": "dflash2.layer.attn.conv_and_input",
+      "type": "model",
+      "role": "draft layer input residual norm and the attention half of the grouped convolution, projection and prepare together",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.layer.attn.input_add_rms_norm",
+        "dflash2.layer.attn.attn_conv_projection",
+        "dflash2.layer.attn.attn_conv_prepare"
+      ]
+    },
+    {
+      "operation": "dflash2.layer.attn.conv_and_input",
+      "phase": "draft",
+      "name": "elementwise_kernel_with_index",
+      "before": "dflash2.layer.attn.qkv_proj",
+      "type": "model",
+      "role": "draft layer input residual norm and the attention half of the grouped convolution, projection and prepare together",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.layer.attn.input_add_rms_norm",
+        "dflash2.layer.attn.attn_conv_projection",
+        "dflash2.layer.attn.attn_conv_prepare"
+      ]
+    },
+    {
+      "operation": "dflash2.layer.attn.conv_and_input",
+      "phase": "draft",
+      "name": "elementwise_kernel_with_index",
+      "before": "dflash2.layer.attn.conv_and_input",
+      "type": "model",
+      "role": "draft layer input residual norm and the attention half of the grouped convolution, projection and prepare together",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.layer.attn.input_add_rms_norm",
+        "dflash2.layer.attn.attn_conv_projection",
+        "dflash2.layer.attn.attn_conv_prepare"
+      ]
+    },
+    {
+      "operation": "dflash2.layer.attn.conv_and_input",
+      "phase": "draft",
+      "name": "vllm::_typeConvert",
+      "before": "dflash2.layer.attn.qkv_proj",
+      "type": "model",
+      "role": "draft layer input residual norm and the attention half of the grouped convolution, projection and prepare together",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.layer.attn.input_add_rms_norm",
+        "dflash2.layer.attn.attn_conv_projection",
+        "dflash2.layer.attn.attn_conv_prepare"
+      ]
+    },
+    {
+      "operation": "dflash2.layer.attn.conv_and_input",
+      "phase": "draft",
+      "name": "vllm::_typeConvert",
+      "before": "dflash2.layer.attn.conv_and_input",
+      "type": "model",
+      "role": "draft layer input residual norm and the attention half of the grouped convolution, projection and prepare together",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.layer.attn.input_add_rms_norm",
+        "dflash2.layer.attn.attn_conv_projection",
+        "dflash2.layer.attn.attn_conv_prepare"
+      ]
     }
   ]
 }
