@@ -33,13 +33,13 @@ use crate::timing::kernels::{
     GdnChunkScaledDotKktKernelInput, GdnChunkSolveTrilKernelInput, GdnChunkStateUpdateKernelInput,
     GdnGatedRmsNormKernelInput, GdnPrefillPostConvKernelInput, GdnRecurrentDecodeKernelInput,
     GemmFp32OutputKernelInput, GroupedGemmKernelInput, KvCacheAppendKernelInput,
-    MhcRmsNormKernelInput, MlaCacheAppendKernelInput, MlaRopeQuantizeFp8KernelInput,
-    MoeAlignBlockSizeKernelInput, MoeAlltoallKernelInput, MoeAlltoallPrepareKernelInput,
-    MoeEpCollectiveKernelInput, MoeFinalizeFuseSharedKernelInput, MoeFinalizeRoutingKernelInput,
-    MoeFusedTopkKernelInput, MoeSumKernelInput, MoeTopkSoftplusSqrtKernelInput,
-    Mxfp4MarlinMoeGemmKernelInput, Nvfp4FusedMoeKernelInput, Nvfp4QuantKernelInput,
-    P2pInterKernelInput, P2pIntraKernelInput, ResidualRmsNormKernelInput, RmsNormKernelInput,
-    SingleGemmKernelInput, VllmFusedMoeKernelInput, VllmMlaRopeKernelInput,
+    LogitsTopkKernelInput, MhcRmsNormKernelInput, MlaCacheAppendKernelInput,
+    MlaRopeQuantizeFp8KernelInput, MoeAlignBlockSizeKernelInput, MoeAlltoallKernelInput,
+    MoeAlltoallPrepareKernelInput, MoeEpCollectiveKernelInput, MoeFinalizeFuseSharedKernelInput,
+    MoeFinalizeRoutingKernelInput, MoeFusedTopkKernelInput, MoeSumKernelInput,
+    MoeTopkSoftplusSqrtKernelInput, Mxfp4MarlinMoeGemmKernelInput, Nvfp4FusedMoeKernelInput,
+    Nvfp4QuantKernelInput, P2pInterKernelInput, P2pIntraKernelInput, ResidualRmsNormKernelInput,
+    RmsNormKernelInput, SingleGemmKernelInput, VllmFusedMoeKernelInput, VllmMlaRopeKernelInput,
 };
 
 /// The prefill aggregating leaf's input: the full `(prefix_len, append_len)`
@@ -137,6 +137,7 @@ log_inputs! {
     GdnRecurrentDecode => GdnRecurrentDecodeKernelInput,
     MoeFinalizeRouting => MoeFinalizeRoutingKernelInput,
     MoeFusedTopk => MoeFusedTopkKernelInput,
+    LogitsTopk => LogitsTopkKernelInput,
     MoeAlignBlockSize => MoeAlignBlockSizeKernelInput,
     MoeEpCollective => MoeEpCollectiveKernelInput,
     Mxfp4MarlinMoeGemm => Mxfp4MarlinMoeGemmKernelInput,

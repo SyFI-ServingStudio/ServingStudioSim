@@ -11,17 +11,31 @@
 //! producing the `selector_top_k` candidate ids per position); the selector then
 //! scores the edges between consecutive positions.
 //!
+//! The vocabulary top-k is two selections, not one. `LogitsProcessor::
+//! get_top_k_tokens` never all-gathers the logits: each rank selects `top_k`
+//! from its own vocabulary shard, the ranks all-gather `top_k` values and ids,
+//! and a second selection takes the global `top_k` out of the `top_k * tp_size`
+//! gathered candidates. Both calls are `logits_processor._topk`, so both are
+//! `logits_topk` leaves — `candidate_topk` at the shard width and
+//! `candidate_topk_merge` at the gathered width. The all-gather between them is
+//! `ncclDevKernel_AllGather_RING_LL` in the capture and is not priced here.
+//!
 //! Measured against `logs/20260920_0_glm53_dflash2_phase0` (B200, tp=4): nothing
 //! in this section reached the top-12 of the `draft` phase by busy time. The
-//! codebook gather shows up as `vectorized_gather_kernel` at 216 launches.
+//! codebook gather shows up as `vectorized_gather_kernel` at 216 launches. The
+//! top-k was the section's worst error all the same: as an `elementwise`
+//! placeholder it swept the vocabulary shard's bytes and predicted 0.388 ms
+//! against a measured 0.030 ms, because a radix select does not read a row the
+//! way an elementwise pass does.
 
 use std::sync::Arc;
 
 use crate::op::Op;
 use crate::timing::bridge::DType;
 use crate::timing::kernels::{
-    ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput, SingleGemmKernel,
-    SingleGemmKernelConfig, SingleGemmKernelInput,
+    ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput, LogitsTopkKernel,
+    LogitsTopkKernelConfig, LogitsTopkKernelInput, SingleGemmKernel, SingleGemmKernelConfig,
+    SingleGemmKernelInput,
 };
 use crate::timing::{
     BuildError, CostNode, CostTreeBuilder, Dim, Evaluator, LeafMetrics, PerfApiBridge, Probe,
@@ -36,9 +50,10 @@ const SELECTOR_RANK: u32 = 256;
 const SELECTOR_TOP_K: u32 = 16;
 
 #[cfg(test)]
-const SOURCE_ORDER: [&str; 5] = [
+const SOURCE_ORDER: [&str; 6] = [
     "lm_head",
     "candidate_topk",
+    "candidate_topk_merge",
     "hidden_projection",
     "codebook_gather",
     "edge_scores",
@@ -48,6 +63,7 @@ const SOURCE_ORDER: [&str; 5] = [
 pub struct Dflash2SelectorLocalWorkletConfig {
     pub gemm_backends: Vec<&'static str>,
     pub elementwise_backends: Vec<&'static str>,
+    pub topk_backends: Vec<&'static str>,
     pub tp_size: u16,
     pub gpu_name: String,
     pub hidden_dim: Dim,
@@ -62,7 +78,8 @@ pub struct Dflash2SelectorLocalWorkletConfig {
 pub struct Dflash2SelectorLocalWorkletResolved {
     pub raw_cfg: Dflash2SelectorLocalWorkletConfig,
     pub lm_head: SingleGemmKernelConfig,
-    pub candidate_topk: ElementwiseKernelConfig,
+    pub candidate_topk: LogitsTopkKernelConfig,
+    pub candidate_topk_merge: LogitsTopkKernelConfig,
     pub hidden_projection: SingleGemmKernelConfig,
     pub codebook_gather: ElementwiseKernelConfig,
     pub edge_scores: SingleGemmKernelConfig,
@@ -79,7 +96,8 @@ pub struct Dflash2SelectorLocalWorkletInput {
 pub struct Dflash2SelectorLocalWorklet {
     pub name: String,
     pub lm_head: Op<SingleGemmKernel>,
-    pub candidate_topk: Op<ElementwiseKernel>,
+    pub candidate_topk: Op<LogitsTopkKernel>,
+    pub candidate_topk_merge: Op<LogitsTopkKernel>,
     pub hidden_projection: Op<SingleGemmKernel>,
     pub codebook_gather: Op<ElementwiseKernel>,
     pub edge_scores: Op<SingleGemmKernel>,
@@ -93,15 +111,17 @@ impl Dflash2SelectorLocalWorklet {
         validate_config(cfg)
             .unwrap_or_else(|reason| panic!("invalid Dflash2SelectorLocalWorkletConfig: {reason}"));
 
-        let vocab_per_rank = cfg.vocab_size.clone() / Dim::param("vocab_tp", u32::from(cfg.tp_size));
+        let vocab_per_rank =
+            cfg.vocab_size.clone() / Dim::param("vocab_tp", u32::from(cfg.tp_size));
         let dtype_bytes = cfg.dtype.size_bytes();
-        // The top-k reduction streams this rank's logits once.
-        let topk_input_bytes =
-            checked_product("candidate_topk.input_bytes_per_token", &[vocab_per_rank.get(), 4])
-                .expect("validated DFlash2 top-k input byte rate must fit u32");
-        let topk_output_bytes =
-            checked_product("candidate_topk.output_bytes_per_token", &[cfg.selector_top_k, 4])
-                .expect("validated DFlash2 top-k output byte rate must fit u32");
+        // The merge selection runs over what the all-gather produced: every
+        // rank's `top_k` candidates side by side, so `top_k` out of
+        // `top_k * tp_size`.
+        let gathered_candidates = checked_product(
+            "candidate_topk_merge.num_columns",
+            &[cfg.selector_top_k, u32::from(cfg.tp_size)],
+        )
+        .expect("validated DFlash2 gathered candidate width must fit u32");
         // Two codebook rows per candidate edge: one predecessor, one successor,
         // each `selector_rank` wide. The gather is indirect, so the vocabulary
         // row count is an identity of the access pattern, not of the bytes.
@@ -119,11 +139,22 @@ impl Dflash2SelectorLocalWorklet {
                 k: cfg.hidden_dim.clone(),
                 dtype: cfg.gemm_dtype,
             },
-            candidate_topk: ElementwiseKernelConfig {
-                backends: cfg.elementwise_backends.clone(),
+            // The selection reads this rank's own vocabulary shard. `lm_head`
+            // emits it in `gemm_dtype`, and the top-k templates on the value
+            // type it is handed, so the two dtypes are the same one.
+            candidate_topk: LogitsTopkKernelConfig {
+                backends: cfg.topk_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
-                input_bytes_per_token: topk_input_bytes.into(),
-                output_bytes_per_token: topk_output_bytes.into(),
+                num_columns: vocab_per_rank.clone(),
+                top_k: cfg.selector_top_k,
+                dtype: cfg.gemm_dtype,
+            },
+            candidate_topk_merge: LogitsTopkKernelConfig {
+                backends: cfg.topk_backends.clone(),
+                gpu_name: cfg.gpu_name.clone(),
+                num_columns: gathered_candidates.into(),
+                top_k: cfg.selector_top_k,
+                dtype: cfg.gemm_dtype,
             },
             hidden_projection: SingleGemmKernelConfig {
                 backends: cfg.gemm_backends.clone(),
@@ -176,7 +207,14 @@ impl Dflash2SelectorLocalWorklet {
                 &name,
                 "candidate_topk",
                 resolved.candidate_topk.clone(),
-                ElementwiseKernel::build,
+                LogitsTopkKernel::build,
+                bridge,
+            )?,
+            candidate_topk_merge: build_atomic(
+                &name,
+                "candidate_topk_merge",
+                resolved.candidate_topk_merge.clone(),
+                LogitsTopkKernel::build,
                 bridge,
             )?,
             hidden_projection: build_atomic(
@@ -211,6 +249,7 @@ impl Dflash2SelectorLocalWorklet {
             child: Box::new(CostNode::Sum(vec![
                 self.lm_head.compile(builder),
                 self.candidate_topk.compile(builder),
+                self.candidate_topk_merge.compile(builder),
                 self.hidden_projection.compile(builder),
                 self.codebook_gather.compile(builder),
                 self.edge_scores.compile(builder),
@@ -222,9 +261,13 @@ impl Dflash2SelectorLocalWorklet {
         let rows = input.scored_rows;
         let zero = rows == 0;
         let streamed = ElementwiseKernelInput { num_tokens: rows };
+        // Both selections run over the same scored rows; only the matrix width
+        // differs, and that is config, not input.
+        let selected = LogitsTopkKernelInput { num_rows: rows };
 
         eval_atomic_or_zero(&self.lm_head, SingleGemmKernelInput { m: rows }, zero, ev);
-        eval_atomic_or_zero(&self.candidate_topk, streamed.clone(), zero, ev);
+        eval_atomic_or_zero(&self.candidate_topk, selected.clone(), zero, ev);
+        eval_atomic_or_zero(&self.candidate_topk_merge, selected, zero, ev);
         eval_atomic_or_zero(
             &self.hidden_projection,
             SingleGemmKernelInput { m: rows },
@@ -322,6 +365,7 @@ mod tests {
         Dflash2SelectorLocalWorkletConfig {
             gemm_backends: vec!["torch"],
             elementwise_backends: vec!["triton"],
+            topk_backends: vec!["flashinfer", "torch"],
             tp_size: 4,
             gpu_name: "NVIDIA B200".to_string(),
             hidden_dim: Dim::param("hidden_dim", HIDDEN_DIM),
@@ -340,6 +384,7 @@ mod tests {
             [
                 "lm_head",
                 "candidate_topk",
+                "candidate_topk_merge",
                 "hidden_projection",
                 "codebook_gather",
                 "edge_scores",
