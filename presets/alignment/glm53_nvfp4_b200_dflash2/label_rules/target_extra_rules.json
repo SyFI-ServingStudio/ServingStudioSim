@@ -1,0 +1,266 @@
+{
+  "schema_version": 1,
+  "note": "Target-side rules this capture needs that the ported GLM-5.2 spec-5 set does not cover. Two reasons they are missing there: the spec-5 capture reduced through FlashInfer's `allreduce_fusion_kernel_twoshot_sync`, while this one takes the MNNVL path (`twoshotAllreduceKernel` + `rmsNormLamport`), and several DSA indexer kernels and GEMM tiles carry names that capture never saw.\n\nOne rule set, not a chain. Each predicate below is either a name that occurs in exactly one semantic position, or a name plus the *operation* of an immediate neighbour (never a tile name, which varies with shape). The neighbour-keyed rules need a second sweep to fire, which is why the driver runs to a label-state fixpoint.\n\nWhere one measured kernel occurs in layer families whose slots are named differently -- the three sparse families call it `moe.*` and the dense prefix calls it `ffn.*` -- the rule lists both suffixes under one operation. That is the same convention the ported file uses for its four-family GEMM rules: the operation is a semantic name and `slot_suffixes` does the resolution, so the pairing is correct in aggregate.",
+  "rules": [
+    {
+      "operation": "attention.tp_allreduce_residual_norm",
+      "phase": "forward",
+      "name": "trtllm_mnnvl_allreduce::twoshotAllreduceKernel",
+      "after": "attention.o_proj",
+      "type": "collective",
+      "role": "attention TP all-reduce fused with the following residual RMSNorm",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.tp_allreduce_residual_norm",
+        "body.sparse_cycle_full_index.attention.tp_allreduce_residual_norm",
+        "body.sparse_cycle_index_share.attention.tp_allreduce_residual_norm",
+        "body.sparse_initial_index_share.attention.tp_allreduce_residual_norm"
+      ],
+      "note": "Keyed on the operation of the preceding position, not on its tile name: o_proj's `nvjet_*` variant changes with the batch, and this capture shows at least eight of them in front of this collective."
+    },
+    {
+      "operation": "attention.tp_allreduce_residual_norm",
+      "phase": "forward",
+      "name": "trtllm_mnnvl_allreduce::rmsNormLamport",
+      "after": "attention.tp_allreduce_residual_norm",
+      "type": "collective",
+      "role": "attention TP all-reduce fused with the following residual RMSNorm",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.tp_allreduce_residual_norm",
+        "body.sparse_cycle_full_index.attention.tp_allreduce_residual_norm",
+        "body.sparse_cycle_index_share.attention.tp_allreduce_residual_norm",
+        "body.sparse_initial_index_share.attention.tp_allreduce_residual_norm"
+      ],
+      "note": "All 108 `rmsNormLamport` positions in the capture follow a `twoshotAllreduceKernel`, so the owner is whichever reduction that one is. The simulated slot is one fused `all_reduce_residual_rms_norm` leaf, so both measured kernels belong to it."
+    },
+    {
+      "operation": "moe.tp_allreduce",
+      "phase": "forward",
+      "name": "trtllm_mnnvl_allreduce::twoshotAllreduceKernel",
+      "after_name": "void at::native::vectorized_elementwise_kernel",
+      "type": "collective",
+      "role": "MoE TP all-reduce fused with the next block input residual RMSNorm",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": [
+        "body.sparse_cycle_full_index.moe.tp_allreduce",
+        "body.sparse_cycle_index_share.moe.tp_allreduce",
+        "body.sparse_initial_index_share.moe.tp_allreduce",
+        "body.dense_full_index.ffn.tp_allreduce",
+        "body.dense_full_index.attention.input_add_rms_norm",
+        "body.sparse_cycle_full_index.attention.input_add_rms_norm",
+        "body.sparse_cycle_index_share.attention.input_add_rms_norm",
+        "body.sparse_initial_index_share.attention.input_add_rms_norm",
+        "main.final_residual_rms_norm"
+      ],
+      "note": "Among this capture's `twoshotAllreduceKernel` positions the predecessor partitions them exactly three ways: `vectorized_elementwise_kernel` (54, the expert block), an o_proj `nvjet_*` tile (attention), and `vocab_parallel_embedding_kernel` (the embedding). So the generic predecessor name is a sound discriminator here even though it would not be in general."
+    },
+    {
+      "operation": "moe.tp_allreduce",
+      "phase": "forward",
+      "name": "trtllm_mnnvl_allreduce::rmsNormLamport",
+      "after": "moe.tp_allreduce",
+      "type": "collective",
+      "role": "MoE TP all-reduce fused with the next block input residual RMSNorm",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": [
+        "body.sparse_cycle_full_index.moe.tp_allreduce",
+        "body.sparse_cycle_index_share.moe.tp_allreduce",
+        "body.sparse_initial_index_share.moe.tp_allreduce",
+        "body.dense_full_index.ffn.tp_allreduce",
+        "body.dense_full_index.attention.input_add_rms_norm",
+        "body.sparse_cycle_full_index.attention.input_add_rms_norm",
+        "body.sparse_cycle_index_share.attention.input_add_rms_norm",
+        "body.sparse_initial_index_share.attention.input_add_rms_norm",
+        "main.final_residual_rms_norm"
+      ]
+    },
+    {
+      "operation": "main.embedding.tp_allreduce",
+      "phase": "forward",
+      "name": "trtllm_mnnvl_allreduce::twoshotAllreduceKernel",
+      "after_name": "void vllm::vocab_embedding::vocab_parallel_embedding_kernel",
+      "type": "collective",
+      "role": "vocabulary-parallel embedding output all-reduce",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": [
+        "main.embedding.tp_allreduce",
+        "main.embedding.tp_allreduce_fallback"
+      ],
+      "note": "This one is followed by a plain `rms_norm_kernel`, not `rmsNormLamport`: the embedding reduction is not fused with a residual add."
+    },
+    {
+      "operation": "attention.tp_allreduce_residual_norm",
+      "phase": "forward",
+      "name": "trtllm_mnnvl_allreduce::oneshotAllreduceFusionKernel",
+      "after": "attention.o_proj",
+      "type": "collective",
+      "role": "attention TP all-reduce fused with the following residual RMSNorm",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.tp_allreduce_residual_norm",
+        "body.sparse_cycle_full_index.attention.tp_allreduce_residual_norm",
+        "body.sparse_cycle_index_share.attention.tp_allreduce_residual_norm",
+        "body.sparse_initial_index_share.attention.tp_allreduce_residual_norm"
+      ],
+      "note": "The one-shot path fuses what the two-shot path splits across `twoshotAllreduceKernel` and `rmsNormLamport`, so there is a single position to label and no Lamport rule to pair with it. Which path runs is a batch-size decision inside FlashInfer; the simulated slot is the same fused leaf either way."
+    },
+    {
+      "operation": "moe.tp_allreduce",
+      "phase": "forward",
+      "name": "trtllm_mnnvl_allreduce::oneshotAllreduceFusionKernel",
+      "after_name": "void at::native::vectorized_elementwise_kernel",
+      "type": "collective",
+      "role": "MoE TP all-reduce fused with the next block input residual RMSNorm",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": [
+        "body.sparse_cycle_full_index.moe.tp_allreduce",
+        "body.sparse_cycle_index_share.moe.tp_allreduce",
+        "body.sparse_initial_index_share.moe.tp_allreduce",
+        "body.dense_full_index.ffn.tp_allreduce",
+        "body.dense_full_index.attention.input_add_rms_norm",
+        "body.sparse_cycle_full_index.attention.input_add_rms_norm",
+        "body.sparse_cycle_index_share.attention.input_add_rms_norm",
+        "body.sparse_initial_index_share.attention.input_add_rms_norm",
+        "main.final_residual_rms_norm"
+      ]
+    },
+    {
+      "operation": "main.embedding.tp_allreduce",
+      "phase": "forward",
+      "name": "trtllm_mnnvl_allreduce::oneshotAllreduceFusionKernel",
+      "after_name": "void vllm::vocab_embedding::vocab_parallel_embedding_kernel",
+      "type": "collective",
+      "role": "vocabulary-parallel embedding output all-reduce",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": [
+        "main.embedding.tp_allreduce",
+        "main.embedding.tp_allreduce_fallback"
+      ]
+    },
+    {
+      "operation": "attention.indexer.prefill_logits",
+      "phase": "forward",
+      "name": "deep_gemm::sm100_mqa_logits",
+      "type": "model",
+      "role": "DSA indexer MQA logits over the prefill query rows",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.indexer.prefill_logits",
+        "body.sparse_cycle_full_index.attention.indexer.prefill_logits"
+      ],
+      "note": "Only the two `full_index` families own an indexer; the `index_share` families reuse a previous layer's top-k and run none of these kernels."
+    },
+    {
+      "operation": "attention.indexer.decode_logits",
+      "phase": "forward",
+      "name": "deep_gemm::sm100_paged_mqa_logits",
+      "type": "model",
+      "role": "DSA indexer MQA logits over the paged decode rows",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.indexer.decode_logits",
+        "body.sparse_cycle_full_index.attention.indexer.decode_logits"
+      ]
+    },
+    {
+      "operation": "attention.indexer.decode_topk",
+      "phase": "forward",
+      "name": "vllm::cooperative::cooperative_topk_cs",
+      "type": "model",
+      "role": "cooperative top-k over the decode indexer logits",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.indexer.decode_topk",
+        "body.sparse_cycle_full_index.attention.indexer.decode_topk"
+      ],
+      "note": "The `_cs2` and `_cs4` template variants are the same selection at different cluster sizes, so the shared prefix is the right predicate."
+    },
+    {
+      "operation": "attention.main_rope",
+      "phase": "forward",
+      "name": "_fused_norm_rope_kernel",
+      "type": "model",
+      "role": "fused latent-KV norm and rope on the main attention path",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.main_rope",
+        "body.sparse_cycle_full_index.attention.main_rope",
+        "body.sparse_cycle_index_share.attention.main_rope",
+        "body.sparse_initial_index_share.attention.main_rope"
+      ],
+      "note": "Sits between the fused QKV-A projection and the Q absorb in every layer of this capture. The simulated slot is `vllm_mla_rope`, whose measured rows are known to depend on batch size through a dynamo shape-cache limit -- that is a profiling caveat for the slot, not a reason to label this kernel elsewhere."
+    },
+    {
+      "operation": "attention.indexer.q_proj",
+      "phase": "forward",
+      "name": "fused_q_cutedsl",
+      "type": "model",
+      "role": "DSA indexer query projection, CuTe-DSL fused",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.indexer.q_proj",
+        "body.sparse_cycle_full_index.attention.indexer.q_proj"
+      ],
+      "note": "Immediately precedes `cp_gather_indexer_k_quant_cache_kernel`, which the ported rules already own as `attention.indexer.prefill_cache_gather`, so it is on the indexer path and not the main one."
+    },
+    {
+      "operation": "moe.shared_expert.silu_and_mul",
+      "phase": "forward",
+      "name": "vllm::act_and_mul_kernel",
+      "type": "model",
+      "role": "SiLU and multiply between the shared expert's two projections",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.sparse_cycle_full_index.moe.shared_expert.silu_and_mul",
+        "body.sparse_cycle_index_share.moe.shared_expert.silu_and_mul",
+        "body.sparse_initial_index_share.moe.shared_expert.silu_and_mul",
+        "body.dense_full_index.ffn.silu_and_mul"
+      ],
+      "note": "The three dense layers run the same kernel as their FFN activation, which is why the dense suffix is listed too."
+    },
+    {
+      "operation": "moe.tp_allreduce",
+      "phase": "forward",
+      "name": "trtllm_mnnvl_allreduce::rmsNormLamport",
+      "before": "attention.fused_qkv_a_proj",
+      "type": "collective",
+      "role": "MoE TP all-reduce fused with the next block input residual RMSNorm",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": [
+        "body.sparse_cycle_full_index.moe.tp_allreduce",
+        "body.sparse_cycle_index_share.moe.tp_allreduce",
+        "body.sparse_initial_index_share.moe.tp_allreduce",
+        "body.dense_full_index.ffn.tp_allreduce",
+        "body.dense_full_index.attention.input_add_rms_norm",
+        "body.sparse_cycle_full_index.attention.input_add_rms_norm",
+        "body.sparse_cycle_index_share.attention.input_add_rms_norm",
+        "body.sparse_initial_index_share.attention.input_add_rms_norm",
+        "main.final_residual_rms_norm"
+      ],
+      "note": "Identified from the successor instead of the predecessor, for the reductions that open a folded segment body and so have no predecessor at all. The three reduction sites are distinguishable either way: only the expert block's is followed by the next layer's first projection. The attention one is followed by the router, and the embedding one by a plain `rms_norm_kernel` rather than the Lamport variant."
+    },
+    {
+      "operation": "moe.tp_allreduce",
+      "phase": "forward",
+      "name": "trtllm_mnnvl_allreduce::twoshotAllreduceKernel",
+      "before": "moe.tp_allreduce",
+      "before_name": "trtllm_mnnvl_allreduce::rmsNormLamport",
+      "type": "collective",
+      "role": "MoE TP all-reduce fused with the next block input residual RMSNorm",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": [
+        "body.sparse_cycle_full_index.moe.tp_allreduce",
+        "body.sparse_cycle_index_share.moe.tp_allreduce",
+        "body.sparse_initial_index_share.moe.tp_allreduce",
+        "body.dense_full_index.ffn.tp_allreduce",
+        "body.dense_full_index.attention.input_add_rms_norm",
+        "body.sparse_cycle_full_index.attention.input_add_rms_norm",
+        "body.sparse_cycle_index_share.attention.input_add_rms_norm",
+        "body.sparse_initial_index_share.attention.input_add_rms_norm",
+        "main.final_residual_rms_norm"
+      ],
+      "note": "Fires after the rule above: the Lamport norm names the reduction it completes."
+    }
+  ]
+}

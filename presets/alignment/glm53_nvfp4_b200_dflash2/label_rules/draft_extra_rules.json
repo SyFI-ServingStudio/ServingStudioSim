@@ -1,0 +1,70 @@
+{
+  "schema_version": 1,
+  "note": "Draft-phase GEMMs identified by position rather than by tile name.\n\n`draft_rules.json` names one `nvjet_*` variant per operation, which is what the first pass through this capture found. It is not enough: cuBLAS picks a different tile per draft-layer shape, and the six draft layers plus the context-KV block and the selector show more than twenty variants. The predicate here is the *operation* of an immediate neighbour, which comes from the cost manifest's slot order and does not move when the tile does.\n\nThe draft phase keeps four kernels deliberately unmapped, and no rule below should be extended to cover them. They are the four places where the capture runs work the model has no leaf for: the `CatArrayBatchedCopy` that opens the phase, the draft's own input embedding and its reduction, the per-layer `reshape_and_cache_flash_kernel` that runs in addition to the six context appends, and the ATen launches behind each grouped-convolution half. Labeling those would compare measured time against a slot that does not exist; they belong in a model decomposition instead.",
+  "rules": [
+    {
+      "operation": "dflash2.layer.attn.o_proj",
+      "phase": "draft",
+      "name": "nvjet_",
+      "after": "dflash2.layer.attn.attention",
+      "type": "model",
+      "role": "draft attention output projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.layer.attn.o_proj"
+      ],
+      "note": "The projection the attention feeds."
+    },
+    {
+      "operation": "dflash2.layer.ffn.down_proj",
+      "phase": "draft",
+      "name": "nvjet_",
+      "after": "dflash2.layer.ffn.silu_and_mul",
+      "type": "model",
+      "role": "draft FFN down projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.layer.ffn.down_proj"
+      ],
+      "note": "The projection the activation feeds."
+    },
+    {
+      "operation": "dflash2.context_kv.fused_kv_proj",
+      "phase": "draft",
+      "name": "nvjet_",
+      "after": "dflash2.context_kv.hidden_norm",
+      "type": "model",
+      "role": "one GEMM emitting K and V for all six draft layers",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.context_kv.fused_kv_proj"
+      ],
+      "note": "The context-KV block's only GEMM, between its hidden norm and its grouped key norm."
+    },
+    {
+      "operation": "dflash2.selector.lm_head",
+      "phase": "draft",
+      "name": "nvjet_",
+      "before": "dflash2.selector.candidate_topk",
+      "type": "model",
+      "role": "draft vocabulary projection feeding the candidate selection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.selector.lm_head"
+      ],
+      "note": "The selector's vocabulary projection. Its split-K variant puts a reduction between this GEMM and the selection, which the rule below picks up instead."
+    },
+    {
+      "operation": "dflash2.selector.lm_head",
+      "phase": "draft",
+      "name": "cublasLt::splitKreduce_kernel",
+      "before": "dflash2.selector.candidate_topk",
+      "type": "model",
+      "role": "draft vocabulary projection feeding the candidate selection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.selector.lm_head"
+      ]
+    }
+  ]
+}

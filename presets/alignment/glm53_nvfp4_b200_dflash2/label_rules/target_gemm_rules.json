@@ -1,0 +1,349 @@
+{
+  "schema_version": 1,
+  "note": "The GEMM tiles and MNNVL one-shot collectives this capture runs that the ported GLM-5.2 spec-5 set does not name.\n\nNone of these rules names a tile. Enumerating tiles was the first attempt and it does not converge: cuBLAS picks a different `nvjet_*` variant per layer shape, and this capture alone shows more than thirty of them across six operations, with the same variant serving two different operations in different layers. `name` is a substring predicate, so `nvjet_` plus the *operation* of a neighbour is both shorter and stronger evidence -- it is the cost manifest's slot order, which is the one authority on what a decoder layer's GEMMs are.\n\nSeveral rules can only fire after another has run: the GEMM feeding a split-K reduction is identified by the reduction, and the reduction is identified by what *it* feeds. That is three sweeps deep for the router. The driver must therefore run this file, `target_rules.json` and `target_extra_rules.json` to a joint label-state fixpoint rather than once each.",
+  "rules": [
+    {
+      "operation": "attention.fused_qkv_a_proj",
+      "phase": "forward",
+      "name": "nvjet_",
+      "before": "attention.main_rope",
+      "type": "model",
+      "role": "fused Q and latent KV projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.fused_qkv_a_proj",
+        "body.sparse_cycle_full_index.attention.fused_qkv_a_proj",
+        "body.sparse_cycle_index_share.attention.fused_qkv_a_proj",
+        "body.sparse_initial_index_share.attention.fused_qkv_a_proj"
+      ],
+      "note": "The layer's first GEMM: the fused norm-and-rope that consumes it is the next position."
+    },
+    {
+      "operation": "attention.fused_qkv_a_proj",
+      "phase": "forward",
+      "name": "cublasLt::splitKreduce_kernel",
+      "before": "attention.main_rope",
+      "type": "model",
+      "role": "fused Q and latent KV projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.fused_qkv_a_proj",
+        "body.sparse_cycle_full_index.attention.fused_qkv_a_proj",
+        "body.sparse_cycle_index_share.attention.fused_qkv_a_proj",
+        "body.sparse_initial_index_share.attention.fused_qkv_a_proj"
+      ],
+      "note": "The ported file has this rule keyed on `attention.normalization_and_rope`, which is what GLM-5.2 called the operation; GLM-5.3 calls it `attention.main_rope`, so the ported rule matches nothing here."
+    },
+    {
+      "operation": "attention.fused_qkv_a_proj",
+      "phase": "forward",
+      "name": "nvjet_",
+      "before": "attention.fused_qkv_a_proj",
+      "before_name": "cublasLt::splitKreduce_kernel",
+      "type": "model",
+      "role": "fused Q and latent KV projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.fused_qkv_a_proj",
+        "body.sparse_cycle_full_index.attention.fused_qkv_a_proj",
+        "body.sparse_cycle_index_share.attention.fused_qkv_a_proj",
+        "body.sparse_initial_index_share.attention.fused_qkv_a_proj"
+      ],
+      "note": "Fires only after the rule above has labeled the reduction: the split-K GEMM is two positions from the rope, so its own neighbour is the reduction and not the rope. Both neighbour predicates are given because `before` alone would also admit the non-split GEMM the first rule already owns."
+    },
+    {
+      "operation": "attention.q_b_proj",
+      "phase": "forward",
+      "name": "nvjet_",
+      "after": "attention.main_rope",
+      "before": "attention.q_absorb",
+      "type": "model",
+      "role": "query up projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.q_b_proj",
+        "body.sparse_cycle_full_index.attention.q_b_proj",
+        "body.sparse_cycle_index_share.attention.q_b_proj",
+        "body.sparse_initial_index_share.attention.q_b_proj"
+      ]
+    },
+    {
+      "operation": "attention.indexer.wk_weights_proj",
+      "phase": "forward",
+      "name": "nvjet_",
+      "after": "attention.q_absorb",
+      "before": "attention.indexer.q_proj",
+      "type": "model",
+      "role": "DSA indexer key-weight projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.indexer.wk_weights_proj",
+        "body.sparse_cycle_full_index.attention.indexer.wk_weights_proj"
+      ],
+      "note": "Only the two `full_index` families own an indexer; the `index_share` families reuse a previous layer's top-k."
+    },
+    {
+      "operation": "attention.o_proj",
+      "phase": "forward",
+      "name": "nvjet_",
+      "before_name": "trtllm_mnnvl_allreduce::twoshotAllreduceKernel",
+      "type": "model",
+      "role": "attention output projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.o_proj",
+        "body.sparse_cycle_full_index.attention.o_proj",
+        "body.sparse_cycle_index_share.attention.o_proj",
+        "body.sparse_initial_index_share.attention.o_proj"
+      ],
+      "note": "Of this capture's three reduction sites only the attention one has a GEMM in front of it: the expert block reduces after an elementwise and the embedding after the vocabulary gather. So `a GEMM immediately before a reduction` names o_proj uniquely here."
+    },
+    {
+      "operation": "attention.o_proj",
+      "phase": "forward",
+      "name": "nvjet_",
+      "before_name": "trtllm_mnnvl_allreduce::oneshotAllreduceFusionKernel",
+      "type": "model",
+      "role": "attention output projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.o_proj",
+        "body.sparse_cycle_full_index.attention.o_proj",
+        "body.sparse_cycle_index_share.attention.o_proj",
+        "body.sparse_initial_index_share.attention.o_proj"
+      ],
+      "note": "Same argument at the one-shot reduction, which this capture uses for the smaller batches."
+    },
+    {
+      "operation": "moe.shared_expert.gate_up_proj",
+      "phase": "forward",
+      "name": "nvjet_",
+      "before": "moe.shared_expert.silu_and_mul",
+      "type": "model",
+      "role": "shared-expert gate and up projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.sparse_cycle_full_index.moe.shared_expert.gate_up_proj",
+        "body.sparse_cycle_index_share.moe.shared_expert.gate_up_proj",
+        "body.sparse_initial_index_share.moe.shared_expert.gate_up_proj",
+        "body.dense_full_index.ffn.gate_up_proj"
+      ],
+      "note": "The activation between the two projections is what identifies this one; the three dense layers run the same pair as their FFN, which is why the dense suffix is listed."
+    },
+    {
+      "operation": "moe.router",
+      "phase": "forward",
+      "name": "nvjet_",
+      "before": "moe.router",
+      "before_name": "cublasLt::splitKreduce_kernel",
+      "type": "model",
+      "role": "BF16-to-FP32 router GEMM assembly; vLLM fuses FP32 output conversion into the GEMM",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.sparse_cycle_full_index.moe.router.router_gemm_bf16_proxy",
+        "body.sparse_cycle_index_share.moe.router.router_gemm_bf16_proxy",
+        "body.sparse_initial_index_share.moe.router.router_gemm_bf16_proxy"
+      ],
+      "note": "Third sweep: the reduction above names the GEMM that feeds it. Leaving this pair unmapped is what made `moe.router` read 0.0012 ms measured against 0.444 ms simulated."
+    },
+    {
+      "operation": "moe.router",
+      "phase": "forward",
+      "name": "nvjet_",
+      "before": "moe.shared_expert.gate_up_proj",
+      "type": "model",
+      "role": "BF16-to-FP32 router GEMM assembly; vLLM fuses FP32 output conversion into the GEMM",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.sparse_cycle_full_index.moe.router.router_gemm_bf16_proxy",
+        "body.sparse_cycle_index_share.moe.router.router_gemm_bf16_proxy",
+        "body.sparse_initial_index_share.moe.router.router_gemm_bf16_proxy"
+      ],
+      "note": "The non-split-K case: the router GEMM sits directly in front of the gate/up projection."
+    },
+    {
+      "operation": "moe.shared_expert.down_proj",
+      "phase": "forward",
+      "name": "nvjet_",
+      "after": "moe.shared_expert.silu_and_mul",
+      "type": "model",
+      "role": "shared-expert down projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.sparse_cycle_full_index.moe.shared_expert.down_proj",
+        "body.sparse_cycle_index_share.moe.shared_expert.down_proj",
+        "body.sparse_initial_index_share.moe.shared_expert.down_proj",
+        "body.dense_full_index.ffn.down_proj"
+      ],
+      "note": "The projection the activation feeds. The dense suffix is listed for the same reason as on the gate/up rule: this capture's activation kernel does not distinguish a dense layer's FFN from a sparse layer's shared expert, so one operation owns both slot names."
+    },
+    {
+      "operation": "attention.fused_qkv_a_proj",
+      "phase": "forward",
+      "name": "nvjet_",
+      "before": "attention.fused_qkv_a_proj",
+      "before_name": "nvjet_",
+      "type": "model",
+      "role": "fused Q and latent KV projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.fused_qkv_a_proj",
+        "body.sparse_cycle_full_index.attention.fused_qkv_a_proj",
+        "body.sparse_cycle_index_share.attention.fused_qkv_a_proj",
+        "body.sparse_initial_index_share.attention.fused_qkv_a_proj"
+      ],
+      "note": "vLLM does not always emit the A projection as one GEMM: in most layers of this capture the Q and latent-KV halves are two back-to-back `nvjet_*` launches between the previous layer's reduction and the norm-and-rope. The manifest has exactly one GEMM slot in that span, so both launches are it."
+    },
+    {
+      "operation": "attention.indexer.rope",
+      "phase": "forward",
+      "name": "vllm::rotary_embedding_kernel",
+      "after": "attention.indexer.q_proj",
+      "type": "model",
+      "role": "DSA indexer rotary embedding",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.indexer.rope",
+        "body.sparse_cycle_full_index.attention.indexer.rope"
+      ],
+      "note": "The indexer's own rope, immediately after its query projection. The main path's rope is fused into `_fused_norm_rope_kernel` and is a different kernel entirely."
+    },
+    {
+      "operation": "dflash2.context_kv.aux_hidden_fc",
+      "phase": "draft",
+      "name": "nvjet_",
+      "before_name": "_prepare_dflash_inputs_kernel",
+      "type": "model",
+      "role": "projection of the six collected target hidden states down to the draft width",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "dflash2.context_kv.aux_hidden_fc"
+      ],
+      "note": "The draft phase's first GEMM, ahead of vLLM's DFlash2 input preparation, and the manifest's first draft slot. Its measured 87.4 ms against the slot's 93.4 ms simulated is consistent with that reading, but the position is what the label rests on."
+    },
+    {
+      "operation": "attention.sparse_mla.preparation",
+      "phase": "forward",
+      "name": "FillFunctor<unsigned char>",
+      "before": "attention.sparse_mla",
+      "type": "model",
+      "role": "sparse MLA input preparation: the query concatenation, the latent KV cache append and the sparse index remap",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.sparse_mla.query_concat",
+        "body.dense_full_index.attention.sparse_mla.mla_cache_append",
+        "body.dense_full_index.attention.sparse_mla.index_remap",
+        "body.sparse_cycle_full_index.attention.sparse_mla.query_concat",
+        "body.sparse_cycle_full_index.attention.sparse_mla.mla_cache_append",
+        "body.sparse_cycle_full_index.attention.sparse_mla.index_remap",
+        "body.sparse_cycle_index_share.attention.sparse_mla.query_concat",
+        "body.sparse_cycle_index_share.attention.sparse_mla.mla_cache_append",
+        "body.sparse_cycle_index_share.attention.sparse_mla.index_remap",
+        "body.sparse_initial_index_share.attention.sparse_mla.query_concat",
+        "body.sparse_initial_index_share.attention.sparse_mla.mla_cache_append",
+        "body.sparse_initial_index_share.attention.sparse_mla.index_remap"
+      ],
+      "note": "One operation for three positions, deliberately, because the evidence supports the span and not the order inside it. Every sparse-MLA attention launch in this capture is preceded by exactly three positions -- `FillFunctor<int>`, a kernel whose name the profile lost, and `FillFunctor<unsigned char>` -- and the cost manifest has exactly three leaves in that same span: `query_concat`, `mla_cache_append` and `index_remap`. What is NOT established is which measured kernel is which leaf: two of the three are generic ATen fills whose names say nothing about their role, so pairing them off in order would be a guess dressed as a reading. Comparing the three together against the three leaves together is the strongest claim the capture actually supports."
+    },
+    {
+      "operation": "attention.sparse_mla.preparation",
+      "phase": "forward",
+      "name": "kernel",
+      "after_name": "FillFunctor<int>",
+      "before_name": "FillFunctor<unsigned char>",
+      "type": "model",
+      "role": "sparse MLA input preparation: the query concatenation, the latent KV cache append and the sparse index remap",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.sparse_mla.query_concat",
+        "body.dense_full_index.attention.sparse_mla.mla_cache_append",
+        "body.dense_full_index.attention.sparse_mla.index_remap",
+        "body.sparse_cycle_full_index.attention.sparse_mla.query_concat",
+        "body.sparse_cycle_full_index.attention.sparse_mla.mla_cache_append",
+        "body.sparse_cycle_full_index.attention.sparse_mla.index_remap",
+        "body.sparse_cycle_index_share.attention.sparse_mla.query_concat",
+        "body.sparse_cycle_index_share.attention.sparse_mla.mla_cache_append",
+        "body.sparse_cycle_index_share.attention.sparse_mla.index_remap",
+        "body.sparse_initial_index_share.attention.sparse_mla.query_concat",
+        "body.sparse_initial_index_share.attention.sparse_mla.mla_cache_append",
+        "body.sparse_initial_index_share.attention.sparse_mla.index_remap"
+      ],
+      "note": "Pinned by both neighbour names rather than by a chain: the bare fragment `kernel` is a substring of nearly every measured name, so a chain keyed on it would walk backwards out of this span."
+    },
+    {
+      "operation": "attention.sparse_mla.preparation",
+      "phase": "forward",
+      "name": "FillFunctor<int>",
+      "before": "attention.sparse_mla.preparation",
+      "type": "model",
+      "role": "sparse MLA input preparation: the query concatenation, the latent KV cache append and the sparse index remap",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.sparse_mla.query_concat",
+        "body.dense_full_index.attention.sparse_mla.mla_cache_append",
+        "body.dense_full_index.attention.sparse_mla.index_remap",
+        "body.sparse_cycle_full_index.attention.sparse_mla.query_concat",
+        "body.sparse_cycle_full_index.attention.sparse_mla.mla_cache_append",
+        "body.sparse_cycle_full_index.attention.sparse_mla.index_remap",
+        "body.sparse_cycle_index_share.attention.sparse_mla.query_concat",
+        "body.sparse_cycle_index_share.attention.sparse_mla.mla_cache_append",
+        "body.sparse_cycle_index_share.attention.sparse_mla.index_remap",
+        "body.sparse_initial_index_share.attention.sparse_mla.query_concat",
+        "body.sparse_initial_index_share.attention.sparse_mla.mla_cache_append",
+        "body.sparse_initial_index_share.attention.sparse_mla.index_remap"
+      ]
+    },
+    {
+      "operation": "moe.shared_expert.gate_up_proj",
+      "phase": "forward",
+      "name": "cublasLt::splitKreduce_kernel",
+      "before": "moe.shared_expert.silu_and_mul",
+      "type": "model",
+      "role": "shared-expert gate and up projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.sparse_cycle_full_index.moe.shared_expert.gate_up_proj",
+        "body.sparse_cycle_index_share.moe.shared_expert.gate_up_proj",
+        "body.sparse_initial_index_share.moe.shared_expert.gate_up_proj",
+        "body.dense_full_index.ffn.gate_up_proj"
+      ],
+      "overwrite": true,
+      "note": "`overwrite` because this position is claimed twice across rule files and the other claim is wrong. The decode sequences fold the expert block into a four-position body -- gate/up GEMM, split-K reduction, activation, down projection -- whose first position has no predecessor at all, and a chain of `attention.fused_qkv_a_proj` rules reaches it from the other side and labels both GEMM and reduction as the attention A projection. The consequence is visible in the numbers: before this rule `moe.shared_expert.gate_up_proj` read 2.0 ms measured against 183.6 ms simulated on the decode iterations while reading +3.6% on the mixed ones, which is not a model error but 450 positions labeled as a different operation. `label check` cannot see this: it reads final labels, and the two claims live in different files, so no single `apply` ever sees them together."
+    },
+    {
+      "operation": "moe.shared_expert.gate_up_proj",
+      "phase": "forward",
+      "name": "nvjet_",
+      "before": "moe.shared_expert.gate_up_proj",
+      "before_name": "cublasLt::splitKreduce_kernel",
+      "type": "model",
+      "role": "shared-expert gate and up projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.sparse_cycle_full_index.moe.shared_expert.gate_up_proj",
+        "body.sparse_cycle_index_share.moe.shared_expert.gate_up_proj",
+        "body.sparse_initial_index_share.moe.shared_expert.gate_up_proj",
+        "body.dense_full_index.ffn.gate_up_proj"
+      ],
+      "overwrite": true,
+      "note": "The GEMM the reduction above reduces."
+    },
+    {
+      "operation": "attention.fused_qkv_a_proj",
+      "phase": "forward",
+      "name": "cublasLt::splitKreduce_kernel",
+      "before": "attention.fused_qkv_a_proj",
+      "before_name": "nvjet_",
+      "type": "model",
+      "role": "fused Q and latent KV projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.fused_qkv_a_proj",
+        "body.sparse_cycle_full_index.attention.fused_qkv_a_proj",
+        "body.sparse_cycle_index_share.attention.fused_qkv_a_proj",
+        "body.sparse_initial_index_share.attention.fused_qkv_a_proj"
+      ],
+      "note": "When the first half of the A projection is split-K its reduction lands between the two halves. `before_name: nvjet_` is load-bearing and not decoration: without it this rule also matches the reduction that feeds the shared expert's activation, which is the gate/up projection's and not this one's."
+    }
+  ]
+}

@@ -4,8 +4,11 @@
 # so the two speculative deployments are directly comparable. The difference is
 # the proposer: MTP drafts one token at a time and feeds each back, DFlash2
 # drafts the whole block of seven in a single forward pass. Its own attention is
-# a 2048-token sliding window, so the draft's KV is a per-request reserve rather
-# than a per-token rate.
+# a 2048-token sliding window, but that window does not bound its KV: vLLM
+# cannot unify the page sizes of a windowed and a full-attention layer, so it
+# allocates the draft's layers as full attention out of the shared pool. The
+# draft's KV is therefore a per-token rate like the target's, not a per-request
+# reserve, and it is folded into the worker's per-token state bytes.
 #
 # `accept_rate` is the per-position conditional chain measured in
 # `logs/20260920_0_glm53_dflash2_phase0` (38427 drafts): folding it back gives a

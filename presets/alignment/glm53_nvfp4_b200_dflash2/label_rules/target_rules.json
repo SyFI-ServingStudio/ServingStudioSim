@@ -2022,7 +2022,8 @@
       "slot_suffixes": [
         "body.sparse_cycle_full_index.moe.shared_expert.down_proj",
         "body.sparse_cycle_index_share.moe.shared_expert.down_proj",
-        "body.sparse_initial_index_share.moe.shared_expert.down_proj"
+        "body.sparse_initial_index_share.moe.shared_expert.down_proj",
+        "body.dense_full_index.ffn.down_proj"
       ],
       "note": "Structural seed: reads kernel names only, so it fires on the first sweep and gives the neighbour-dependent rules for this operation something to start from. Synthesized under the same soundness test as the rest.",
       "phase": "forward",
@@ -2042,7 +2043,8 @@
       "slot_suffixes": [
         "body.sparse_cycle_full_index.moe.shared_expert.down_proj",
         "body.sparse_cycle_index_share.moe.shared_expert.down_proj",
-        "body.sparse_initial_index_share.moe.shared_expert.down_proj"
+        "body.sparse_initial_index_share.moe.shared_expert.down_proj",
+        "body.dense_full_index.ffn.down_proj"
       ],
       "note": "Serialized shared-expert down projection immediately precedes routed-expert input quantization.",
       "source_experiment": "20260824_1_glm52_nvfp4_b200_ep4_c32_serial_shared",
@@ -2062,7 +2064,8 @@
       "slot_suffixes": [
         "body.sparse_cycle_full_index.moe.shared_expert.down_proj",
         "body.sparse_cycle_index_share.moe.shared_expert.down_proj",
-        "body.sparse_initial_index_share.moe.shared_expert.down_proj"
+        "body.sparse_initial_index_share.moe.shared_expert.down_proj",
+        "body.dense_full_index.ffn.down_proj"
       ],
       "note": "Full-capture review: physical tile or launch variant identified by same-stream model-operation neighbors; no sequence, rank, EP offset, or iteration identifier is used.",
       "source_experiment": "20260823_2_glm52_nvfp4_b200_ep4_c32_long_enwik9",
@@ -2082,7 +2085,8 @@
       "slot_suffixes": [
         "body.sparse_cycle_full_index.moe.shared_expert.down_proj",
         "body.sparse_cycle_index_share.moe.shared_expert.down_proj",
-        "body.sparse_initial_index_share.moe.shared_expert.down_proj"
+        "body.sparse_initial_index_share.moe.shared_expert.down_proj",
+        "body.dense_full_index.ffn.down_proj"
       ],
       "note": "Final GEMM of the concurrent shared-expert gate/up, activation, down assembly.",
       "source_experiment": "20260825_34_glm52_b200_ep4_workload_matrix",
@@ -2102,7 +2106,8 @@
       "slot_suffixes": [
         "body.sparse_cycle_full_index.moe.shared_expert.gate_up_proj",
         "body.sparse_cycle_index_share.moe.shared_expert.gate_up_proj",
-        "body.sparse_initial_index_share.moe.shared_expert.gate_up_proj"
+        "body.sparse_initial_index_share.moe.shared_expert.gate_up_proj",
+        "body.dense_full_index.ffn.gate_up_proj"
       ],
       "note": "Full-capture review: physical tile or launch variant identified by same-stream model-operation neighbors; no sequence, rank, EP offset, or iteration identifier is used.",
       "source_experiment": "20260823_2_glm52_nvfp4_b200_ep4_c32_long_enwik9",
@@ -2122,7 +2127,8 @@
       "slot_suffixes": [
         "body.sparse_cycle_full_index.moe.shared_expert.gate_up_proj",
         "body.sparse_cycle_index_share.moe.shared_expert.gate_up_proj",
-        "body.sparse_initial_index_share.moe.shared_expert.gate_up_proj"
+        "body.sparse_initial_index_share.moe.shared_expert.gate_up_proj",
+        "body.dense_full_index.ffn.gate_up_proj"
       ],
       "note": "Final serialized shared gate/up reduction feeding the reviewed activation.",
       "source_experiment": "20260824_1_glm52_nvfp4_b200_ep4_c32_serial_shared",
@@ -2142,7 +2148,8 @@
       "slot_suffixes": [
         "body.sparse_cycle_full_index.moe.shared_expert.gate_up_proj",
         "body.sparse_cycle_index_share.moe.shared_expert.gate_up_proj",
-        "body.sparse_initial_index_share.moe.shared_expert.gate_up_proj"
+        "body.sparse_initial_index_share.moe.shared_expert.gate_up_proj",
+        "body.dense_full_index.ffn.gate_up_proj"
       ],
       "note": "Concurrent three-kernel shared-expert assembly: GEMM is immediately followed by the shared SiLU/multiply kernel.",
       "source_experiment": "20260825_34_glm52_b200_ep4_workload_matrix",
@@ -2161,7 +2168,8 @@
       "slot_suffixes": [
         "body.sparse_cycle_full_index.moe.shared_expert.gate_up_proj",
         "body.sparse_cycle_index_share.moe.shared_expert.gate_up_proj",
-        "body.sparse_initial_index_share.moe.shared_expert.gate_up_proj"
+        "body.sparse_initial_index_share.moe.shared_expert.gate_up_proj",
+        "body.dense_full_index.ffn.gate_up_proj"
       ],
       "note": "Structural seed: reads kernel names only, so it fires on the first sweep and gives the neighbour-dependent rules for this operation something to start from. Synthesized under the same soundness test as the rest.",
       "phase": "forward",
@@ -2181,7 +2189,8 @@
       "slot_suffixes": [
         "body.sparse_cycle_full_index.moe.shared_expert.gate_up_proj",
         "body.sparse_cycle_index_share.moe.shared_expert.gate_up_proj",
-        "body.sparse_initial_index_share.moe.shared_expert.gate_up_proj"
+        "body.sparse_initial_index_share.moe.shared_expert.gate_up_proj",
+        "body.dense_full_index.ffn.gate_up_proj"
       ],
       "note": "A split-K gate/up producer immediately feeds its reduction. At an unfolded layer boundary the preceding down GEMM also precedes the next gate/up GEMM, so operation adjacency alone is insufficient.",
       "source_experiment": "20260823_2_glm52_nvfp4_b200_ep4_c32_long_enwik9",
@@ -2202,7 +2211,8 @@
       "slot_suffixes": [
         "body.sparse_cycle_full_index.moe.shared_expert.gate_up_proj",
         "body.sparse_cycle_index_share.moe.shared_expert.gate_up_proj",
-        "body.sparse_initial_index_share.moe.shared_expert.gate_up_proj"
+        "body.sparse_initial_index_share.moe.shared_expert.gate_up_proj",
+        "body.dense_full_index.ffn.gate_up_proj"
       ],
       "note": "Full-capture review: physical tile or launch variant identified by same-stream model-operation neighbors; no sequence, rank, EP offset, or iteration identifier is used.",
       "source_experiment": "20260823_2_glm52_nvfp4_b200_ep4_c32_long_enwik9",
@@ -2223,7 +2233,8 @@
       "slot_suffixes": [
         "body.sparse_cycle_full_index.moe.shared_expert.gate_up_proj",
         "body.sparse_cycle_index_share.moe.shared_expert.gate_up_proj",
-        "body.sparse_initial_index_share.moe.shared_expert.gate_up_proj"
+        "body.sparse_initial_index_share.moe.shared_expert.gate_up_proj",
+        "body.dense_full_index.ffn.gate_up_proj"
       ],
       "note": "No-splitK serialized shared gate/up GEMM immediately feeding the reviewed shared activation.",
       "source_experiment": "20260825_34_glm52_b200_ep4_workload_matrix",
@@ -2241,7 +2252,8 @@
       "slot_suffixes": [
         "body.sparse_cycle_full_index.moe.shared_expert.gate_up_proj",
         "body.sparse_cycle_index_share.moe.shared_expert.gate_up_proj",
-        "body.sparse_initial_index_share.moe.shared_expert.gate_up_proj"
+        "body.sparse_initial_index_share.moe.shared_expert.gate_up_proj",
+        "body.dense_full_index.ffn.gate_up_proj"
       ],
       "note": "Structural seed: reads kernel names only, so it fires on the first sweep and gives the neighbour-dependent rules for this operation something to start from. Synthesized under the same soundness test as the rest.",
       "phase": "forward",
@@ -2262,7 +2274,8 @@
       "slot_suffixes": [
         "body.sparse_cycle_full_index.moe.shared_expert.gate_up_proj",
         "body.sparse_cycle_index_share.moe.shared_expert.gate_up_proj",
-        "body.sparse_initial_index_share.moe.shared_expert.gate_up_proj"
+        "body.sparse_initial_index_share.moe.shared_expert.gate_up_proj",
+        "body.dense_full_index.ffn.gate_up_proj"
       ],
       "note": "Serialized split-K producer feeding a reviewed shared gate/up reduction. Narrowed to the GEMM after the router: the one before it is the router's own split-K producer.",
       "source_experiment": "20260824_1_glm52_nvfp4_b200_ep4_c32_serial_shared",
@@ -2279,7 +2292,10 @@
       "type": "model",
       "role": "shared-expert gate and up projection",
       "slot_suffixes": [
-        "moe.shared_expert.gate_up_proj"
+        "body.sparse_cycle_full_index.moe.shared_expert.gate_up_proj",
+        "body.sparse_cycle_index_share.moe.shared_expert.gate_up_proj",
+        "body.sparse_initial_index_share.moe.shared_expert.gate_up_proj",
+        "body.dense_full_index.ffn.gate_up_proj"
       ],
       "note": "Mixed sparse bodies use one direct shared-expert gate/up GEMM after the router assembly.",
       "source_experiment": "20260825_8_glm52_nvfp4_b200_ep4_serial_shared_fused_alignment",

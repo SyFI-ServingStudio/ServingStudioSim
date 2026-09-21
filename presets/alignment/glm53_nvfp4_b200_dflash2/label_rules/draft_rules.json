@@ -9,7 +9,9 @@
       "type": "model",
       "role": "projection of the six collected target hidden states down to the draft width",
       "cross_rank": "independent",
-      "slot_suffixes": ["dflash2.context_kv.aux_hidden_fc"],
+      "slot_suffixes": [
+        "dflash2.context_kv.aux_hidden_fc"
+      ],
       "note": "This tile occurs once in the whole draft program, at its k=36864 shape. The splitK reduce that follows it is a second rule."
     },
     {
@@ -18,9 +20,11 @@
       "name": "cublasLt::splitKreduce_kernel",
       "after_name": "nvjet_sm100_tst_256x192_64x4_2x1_2cta_v_bz_splitK_TNT",
       "type": "model",
-      "role": "split-K reduction of the aux hidden projection",
+      "role": "projection of the six collected target hidden states down to the draft width",
       "cross_rank": "independent",
-      "slot_suffixes": ["dflash2.context_kv.aux_hidden_fc"],
+      "slot_suffixes": [
+        "dflash2.context_kv.aux_hidden_fc"
+      ],
       "note": "splitKreduce runs after every split-K GEMM in the draft, so the predicate is the GEMM it reduces, never the name alone."
     },
     {
@@ -30,7 +34,9 @@
       "type": "model",
       "role": "one GEMM emitting K and V for all six draft layers",
       "cross_rank": "independent",
-      "slot_suffixes": ["dflash2.context_kv.fused_kv_proj"]
+      "slot_suffixes": [
+        "dflash2.context_kv.fused_kv_proj"
+      ]
     },
     {
       "operation": "dflash2.context_kv.hidden_norm",
@@ -40,7 +46,9 @@
       "type": "model",
       "role": "norm of the projected hidden state before the fused KV projection",
       "cross_rank": "independent",
-      "slot_suffixes": ["dflash2.context_kv.hidden_norm"],
+      "slot_suffixes": [
+        "dflash2.context_kv.hidden_norm"
+      ],
       "note": "The same rms_norm template also runs in the draft's input embedding; the input-prep kernel in front of this one is what separates them."
     },
     {
@@ -50,7 +58,9 @@
       "type": "model",
       "role": "per-head K norm over tokens x layers x KV heads",
       "cross_rank": "independent",
-      "slot_suffixes": ["dflash2.context_kv.grouped_k_norm"],
+      "slot_suffixes": [
+        "dflash2.context_kv.grouped_k_norm"
+      ],
       "note": "The (8, 4) template occurs once in the draft; the layer's q_norm and k_norm use a different one."
     },
     {
@@ -61,7 +71,9 @@
       "type": "model",
       "role": "one rope call over tokens x layers",
       "cross_rank": "independent",
-      "slot_suffixes": ["dflash2.context_kv.fused_rope"],
+      "slot_suffixes": [
+        "dflash2.context_kv.fused_rope"
+      ],
       "note": "The decoder layer runs the same kernel; the grouped K norm only precedes the context-KV one."
     },
     {
@@ -72,7 +84,9 @@
       "type": "model",
       "role": "rope on the draft layer's own Q and K",
       "cross_rank": "independent",
-      "slot_suffixes": ["dflash2.layer.attn.rope"],
+      "slot_suffixes": [
+        "dflash2.layer.attn.rope"
+      ],
       "note": "The fp8 query quantization only follows the layer's rope, never the context-KV one."
     },
     {
@@ -82,7 +96,9 @@
       "type": "model",
       "role": "scheduler setup for the non-causal draft attention",
       "cross_rank": "independent",
-      "slot_suffixes": ["dflash2.layer.attn.attention"]
+      "slot_suffixes": [
+        "dflash2.layer.attn.attention"
+      ]
     },
     {
       "operation": "dflash2.layer.attn.attention",
@@ -91,7 +107,9 @@
       "type": "model",
       "role": "the non-causal (q_len, kv_len) draft attention itself",
       "cross_rank": "independent",
-      "slot_suffixes": ["dflash2.layer.attn.attention"],
+      "slot_suffixes": [
+        "dflash2.layer.attn.attention"
+      ],
       "note": "The measured identity is vLLM's CuTe SM100 FlashAttention. The simulator prices this slot through `flashinfer_attn_rect` on `fa2` in bf16 because no rect backend can measure fp8 non-causal attention on B200; see the worklet's note."
     },
     {
@@ -101,7 +119,9 @@
       "type": "model",
       "role": "split-KV combine for the draft attention",
       "cross_rank": "independent",
-      "slot_suffixes": ["dflash2.layer.attn.attention"]
+      "slot_suffixes": [
+        "dflash2.layer.attn.attention"
+      ]
     },
     {
       "operation": "dflash2.layer.ffn.silu_and_mul",
@@ -110,7 +130,9 @@
       "type": "model",
       "role": "SiLU and multiply between the draft FFN's two projections",
       "cross_rank": "independent",
-      "slot_suffixes": ["dflash2.layer.ffn.silu_and_mul"],
+      "slot_suffixes": [
+        "dflash2.layer.ffn.silu_and_mul"
+      ],
       "note": "Occurs once per draft layer and nowhere else in the phase."
     },
     {
@@ -121,7 +143,9 @@
       "type": "model",
       "role": "draft FFN down projection",
       "cross_rank": "independent",
-      "slot_suffixes": ["dflash2.layer.ffn.down_proj"],
+      "slot_suffixes": [
+        "dflash2.layer.ffn.down_proj"
+      ],
       "note": "The same non-splitK tile is also the layer's o_proj; the activation in front of it is what separates them."
     },
     {
@@ -132,7 +156,9 @@
       "type": "model",
       "role": "draft attention output projection",
       "cross_rank": "independent",
-      "slot_suffixes": ["dflash2.layer.attn.o_proj"]
+      "slot_suffixes": [
+        "dflash2.layer.attn.o_proj"
+      ]
     },
     {
       "operation": "dflash2.layer.ffn.gate_up_proj",
@@ -142,7 +168,9 @@
       "type": "model",
       "role": "fused gate and up projection",
       "cross_rank": "independent",
-      "slot_suffixes": ["dflash2.layer.ffn.gate_up_proj"],
+      "slot_suffixes": [
+        "dflash2.layer.ffn.gate_up_proj"
+      ],
       "note": "The 2x1 cluster variant is the widest GEMM in the layer and occurs once per layer."
     },
     {
@@ -151,9 +179,11 @@
       "name": "cublasLt::splitKreduce_kernel",
       "after_name": "nvjet_sm100_tst_64x8_64x16_2x1_v_bz_splitK_TNT",
       "type": "model",
-      "role": "split-K reduction of the fused gate and up projection",
+      "role": "fused gate and up projection",
       "cross_rank": "independent",
-      "slot_suffixes": ["dflash2.layer.ffn.gate_up_proj"]
+      "slot_suffixes": [
+        "dflash2.layer.ffn.gate_up_proj"
+      ]
     },
     {
       "operation": "dflash2.layer.attn_allreduce",
@@ -164,7 +194,9 @@
       "type": "collective",
       "role": "TP reduction of the draft attention output",
       "cross_rank": "synchronizing",
-      "slot_suffixes": ["dflash2.layer.attn_allreduce"],
+      "slot_suffixes": [
+        "dflash2.layer.attn_allreduce"
+      ],
       "note": "Both of the layer's collectives follow the same tile; they are separated in a second pass once the neighbouring operations carry labels."
     },
     {
@@ -174,7 +206,9 @@
       "type": "model",
       "role": "radix select of this rank's top candidates out of its own vocabulary shard",
       "cross_rank": "independent",
-      "slot_suffixes": ["dflash2.selector.candidate_topk"],
+      "slot_suffixes": [
+        "dflash2.selector.candidate_topk"
+      ],
       "note": "The vocabulary top-k is two selections, not one. `LogitsProcessor.get_top_k_tokens` never all-gathers the logits: each rank selects `top_k` from its own 38720-column shard, the ranks all-gather the values and the ids, and a second selection takes the global `top_k` out of the 64 gathered candidates. flashinfer's `top_k` dispatches on width, so the two calls land on different kernels and the capture separates them by name alone: the radix path here for the shard, the filtered path below for the gathered block. Both occur exactly once per draft program position in all 18 draft sequences."
     },
     {
@@ -185,7 +219,9 @@
       "type": "model",
       "role": "on-device value sort of the shard selection's output",
       "cross_rank": "independent",
-      "slot_suffixes": ["dflash2.selector.candidate_topk"],
+      "slot_suffixes": [
+        "dflash2.selector.candidate_topk"
+      ],
       "note": "`_topk` passes `sorted=True`, so each of the two selections ends in this sort; the same template instantiation runs for both, 36 launches against 18 draft sequences. Name alone cannot say which selection a launch belongs to, so each rule names the selection kernel immediately in front of it. The two predicates are disjoint and neither can fire on the other's position, so the order the rules are tried in does not matter. The simulator prices the sort inside the `logits_topk` leaf, because the profiled callable is the whole `flashinfer.top_k(..., sorted=True)` launch sequence rather than the select kernel alone."
     },
     {
@@ -195,7 +231,9 @@
       "type": "model",
       "role": "filtered select of the global top candidates out of the all-gathered block",
       "cross_rank": "independent",
-      "slot_suffixes": ["dflash2.selector.candidate_topk_merge"],
+      "slot_suffixes": [
+        "dflash2.selector.candidate_topk_merge"
+      ],
       "note": "The second `_topk`, over `top_k * tp_size` = 64 columns. flashinfer takes its filtered path at this width instead of the radix path, which is why no neighbour predicate is needed to tell the merge select from the shard select."
     },
     {
@@ -205,7 +243,9 @@
       "type": "model",
       "role": "resolves the merge selection's column indices",
       "cross_rank": "independent",
-      "slot_suffixes": ["dflash2.selector.candidate_topk_merge"],
+      "slot_suffixes": [
+        "dflash2.selector.candidate_topk_merge"
+      ],
       "note": "Second launch of the filtered path, so it belongs to the same merge selection as the kernel above. The radix path the shard select takes has no equivalent index pass."
     },
     {
@@ -216,7 +256,9 @@
       "type": "model",
       "role": "on-device value sort of the merge selection's output",
       "cross_rank": "independent",
-      "slot_suffixes": ["dflash2.selector.candidate_topk_merge"],
+      "slot_suffixes": [
+        "dflash2.selector.candidate_topk_merge"
+      ],
       "note": "The merge selection's half of the sorted=True pair; see the shard selection's sort rule for why the predicate is the preceding kernel."
     }
   ]
