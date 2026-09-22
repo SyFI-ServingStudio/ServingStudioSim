@@ -17,6 +17,8 @@ from typing import Any
 
 from alignment.load_generator.config import LoadGeneratorConfig
 from alignment.profiler.config import (
+    PROFILE_KINDS,
+    ROUTING_PROFILE_KINDS,
     IdleWaitConfig,
     NsysConfig,
     ProfileConfig,
@@ -199,10 +201,10 @@ def load_profile_config(path: Path, *, require_python_runtime: bool = True) -> P
             "python_runtime.environment.FLASHINFER_DISABLE_JIT: '1' so a missing "
             "prebuilt module fails before runtime compilation"
         )
-    if config.profile_kind not in {"nsys", "expert_popularity", "workload_metrics"}:
+    if config.profile_kind not in PROFILE_KINDS:
         raise ValueError(
-            "invalid profile config: profile_kind must be 'nsys', "
-            f"'expert_popularity', or 'workload_metrics', got {config.profile_kind!r}"
+            "invalid profile config: profile_kind must be one of "
+            f"{sorted(PROFILE_KINDS)}, got {config.profile_kind!r}"
         )
     visible_devices = [
         device.strip() for device in config.cuda_visible_devices.split(",") if device.strip()
@@ -212,11 +214,11 @@ def load_profile_config(path: Path, *, require_python_runtime: bool = True) -> P
         "expert_parallel_size": config.server.expert_parallel_size,
         "expert_count_reduction_group_size": (config.server.expert_count_reduction_group_size),
     }
-    if config.profile_kind == "expert_popularity" and any(
+    if config.profile_kind in ROUTING_PROFILE_KINDS and any(
         value is None for value in expert_topology.values()
     ):
         raise ValueError(
-            "invalid profile config: expert_popularity requires explicit "
+            f"invalid profile config: {config.profile_kind} requires explicit "
             "server.expert_parallel_size and "
             "server.expert_count_reduction_group_size"
         )

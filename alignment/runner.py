@@ -34,12 +34,19 @@ from .profiler import (
     runtime_artifacts,
     sglang_server,
     spec_decode,
+    token_corpus,
     vllm_server,
 )
-from .profiler.config import ProfileConfig
+from .profiler.config import PROFILE_KINDS, ROUTING_PROFILE_KINDS, ProfileConfig
 from .profiler.engine_records import SGLANG_RECORDS, VLLM_RECORDS
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+#: Where a `token_corpus` replay persists one `.npz` of routed experts per
+#: request, and where the packed corpus lands. Both are under the pass's own
+#: `log_dir`, so re-running the pass replaces them wholesale.
+ROUTED_EXPERTS_DIR = "routed_experts"
+TOKEN_CORPUS_DIR = "token_corpus"
 
 # One entry per supported engine: the launch driver, the log dialect its records
 # arrive in, and the venv python a config that names no `fork_python` defaults to.
@@ -107,7 +114,7 @@ def _expert_popularity_group_sizes(cfg: ProfileConfig) -> tuple[int, int]:
     reduction_group_size = cfg.server.expert_count_reduction_group_size
     if expert_parallel_size is None or reduction_group_size is None:
         raise ValueError(
-            "expert_popularity requires explicit server.expert_parallel_size and "
+            f"{cfg.profile_kind} requires explicit server.expert_parallel_size and "
             "server.expert_count_reduction_group_size"
         )
     return expert_parallel_size, reduction_group_size
@@ -188,10 +195,9 @@ def run_profile(cfg: ProfileConfig, *, resume: bool = False) -> dict:
     server_argv = [] if resume else driver.build_server_argv(fork_python, cfg.server)
     if not resume:
         _append_backend_server_args(server_argv, cfg)
-    is_expert_popularity = cfg.profile_kind == "expert_popularity"
-    is_workload_metrics = cfg.profile_kind == "workload_metrics"
+    is_routing = cfg.profile_kind in ROUTING_PROFILE_KINDS
     is_nsys = cfg.profile_kind == "nsys"
-    if not (is_nsys or is_expert_popularity or is_workload_metrics):
+    if cfg.profile_kind not in PROFILE_KINDS:
         raise ValueError(f"unsupported profile_kind: {cfg.profile_kind!r}")
     if is_nsys and not resume:
         server_argv += list(driver.NSYS_CAPTURE_SERVER_ARGS)
@@ -219,9 +225,9 @@ def run_profile(cfg: ProfileConfig, *, resume: bool = False) -> dict:
     if not resume and cfg.workload.warmup:
         # vLLM exposes reset_prefix_cache through its development router.
         env["VLLM_SERVER_DEV_MODE"] = "1"
-    if is_expert_popularity and not resume:
-        # This pass measures routing counts, not phase timing.  NVTX construction
-        # and NSYS are disabled so its deliberate EPLB all-reduce/D2H logging
+    if is_routing and not resume:
+        # These passes measure routing, not phase timing.  NVTX construction and
+        # NSYS are disabled so their deliberate EPLB all-reduce/D2H logging
         # overhead cannot be confused with the timing pass.
         env.update(driver.TIMING_INSTRUMENTATION_OFF_ENV)
     _preflight_capture_environment(
@@ -298,6 +304,7 @@ def run_profile(cfg: ProfileConfig, *, resume: bool = False) -> dict:
         "nsys": "external nsys",
         "workload_metrics": "bare workload metrics",
         "expert_popularity": "bare expert popularity",
+        "token_corpus": "bare token corpus",
     }
     mode = mode_by_kind[cfg.profile_kind]
     print(f"[profile] launching ({mode}): {' '.join(full_argv[:6])} ... (log: {server_log})")
@@ -430,7 +437,7 @@ def _finalize_profile(
     here reads only files the capture already wrote, so it is cheap and
     repeatable, unlike the capture itself.
     """
-    is_expert_popularity = cfg.profile_kind == "expert_popularity"
+    is_routing = cfg.profile_kind in ROUTING_PROFILE_KINDS
     is_workload_metrics = cfg.profile_kind == "workload_metrics"
     driver, records, _ = _engine(cfg)
 
@@ -461,8 +468,8 @@ def _finalize_profile(
         measurement_log, metrics_jsonl, dp_size=cfg.server.dp_size, records=records
     )
 
-    if is_expert_popularity:
-        # This pass deliberately disables the engine's timing instrumentation.
+    if is_routing:
+        # These passes deliberately disable the engine's timing instrumentation.
         # Request timing belongs to the clean NSYS pass; requiring it here
         # would reject an otherwise valid popularity capture.
         expert_load_jsonl = engine_dir / f"{cfg.name}_expert_load.jsonl"
@@ -511,8 +518,25 @@ def _finalize_profile(
                 draft_expert_popularity_json=str(draft_popularity_path),
                 draft_expert_record_count=draft_count,
             )
+        corpus_artifacts = {}
+        if cfg.profile_kind == "token_corpus":
+            # Packed from the routes the replay persisted, and sized by the
+            # marginal this same pass just extracted: the popularity profile is
+            # the authority on how many logical experts the model has, so the
+            # corpus cannot disagree with the marginal it ships beside.
+            manifest = token_corpus.pack_token_corpus(
+                log_dir / ROUTED_EXPERTS_DIR,
+                log_dir / TOKEN_CORPUS_DIR,
+                num_experts=json.loads(expert_popularity_json.read_text())["num_logical_experts"],
+            )
+            corpus_artifacts = {
+                "token_corpus_manifest": str(log_dir / TOKEN_CORPUS_DIR / "manifest.json"),
+                "token_corpus_tokens": manifest["num_tokens"],
+                "token_corpus_layers": manifest["num_layers"],
+            }
         result = {
             **spec_artifacts,
+            **corpus_artifacts,
             "profile_kind": cfg.profile_kind,
             "engine": cfg.engine,
             "log_dir": str(log_dir),
@@ -529,9 +553,12 @@ def _finalize_profile(
             "drive_summary": drive_summary,
         }
         (log_dir / "profile_result.json").write_text(json.dumps(result, indent=2))
+        corpus_note = (
+            f" corpus_tokens={corpus_artifacts['token_corpus_tokens']}" if corpus_artifacts else ""
+        )
         print(
-            f"[profile] expert popularity: records={expert_record_count} "
-            f"artifact={expert_popularity_json.name}"
+            f"[profile] {cfg.profile_kind}: records={expert_record_count} "
+            f"artifact={expert_popularity_json.name}{corpus_note}"
         )
         return result
 

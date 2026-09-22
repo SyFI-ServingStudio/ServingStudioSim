@@ -484,24 +484,25 @@ def test_non_popularity_profile_does_not_require_expert_topology(tmp_path):
 
 
 @pytest.mark.parametrize("engine", ["vllm", "sglang"])
-def test_expert_popularity_requires_explicit_engine_neutral_topology(tmp_path, engine):
+@pytest.mark.parametrize("profile_kind", ["expert_popularity", "token_corpus"])
+def test_a_routing_pass_requires_explicit_engine_neutral_topology(tmp_path, engine, profile_kind):
     paths = _phase_configs(tmp_path)
     raw = yaml.safe_load(paths["profile"].read_text())
     raw["engine"] = engine
     if engine == "sglang":
         raw["python_runtime"] = _python_runtime_document()
-    raw["profile_kind"] = "expert_popularity"
+    raw["profile_kind"] = profile_kind
     raw["cuda_visible_devices"] = "0,1,2,3"
     raw["server"]["tp_size"] = 2
     raw["server"]["dp_size"] = 2
     paths["profile"].write_text(yaml.safe_dump(raw))
 
-    with pytest.raises(ValueError, match="expert_popularity requires explicit"):
+    with pytest.raises(ValueError, match=f"{profile_kind} requires explicit"):
         load_profile_config(paths["profile"])
 
     raw["server"]["expert_parallel_size"] = 1
     paths["profile"].write_text(yaml.safe_dump(raw))
-    with pytest.raises(ValueError, match="expert_popularity requires explicit"):
+    with pytest.raises(ValueError, match=f"{profile_kind} requires explicit"):
         load_profile_config(paths["profile"])
 
     raw["server"]["expert_count_reduction_group_size"] = 2
@@ -999,6 +1000,7 @@ def test_nsys_preflight_is_scoped_to_new_captures():
     for profile_kind, resume in (
         ("workload_metrics", False),
         ("expert_popularity", False),
+        ("token_corpus", False),
         ("nsys", True),
     ):
         alignment_runner._preflight_capture_environment(

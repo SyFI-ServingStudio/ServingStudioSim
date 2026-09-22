@@ -159,6 +159,15 @@ class NsysConfig:
             )
 
 
+#: Every `profile_kind` a profile config may name.
+PROFILE_KINDS = frozenset({"nsys", "workload_metrics", "expert_popularity", "token_corpus"})
+
+#: The passes that observe MoE routing. They launch the server bare with the
+#: engine's timing instrumentation off, and both need the expert topology
+#: declared because their records are already rank-reduced.
+ROUTING_PROFILE_KINDS = frozenset({"expert_popularity", "token_corpus"})
+
+
 @dataclass
 class ProfileConfig:
     """One real-server ground-truth profiling run."""
@@ -171,8 +180,15 @@ class ProfileConfig:
 
     # ``nsys`` is the timing/segment capture consumed by kernel alignment.
     # ``workload_metrics`` is a clean full-run scheduler/request timing pass.
-    # ``expert_popularity`` is a separate, deliberately unprofiled pass whose
-    # synchronization and D2H logging overhead must not contaminate timing.
+    # ``token_corpus`` records the routed experts of every accepted token and
+    # packs them into the corpus the simulator's ``routing: corpus`` samples. It
+    # keeps the per-step expert-load stream on as well, so one pass yields the
+    # corpus, the per-expert marginal, and the ground truth to score both.
+    # ``expert_popularity`` is the same pass without the per-token routes and is
+    # DEPRECATED: a marginal can only be resampled independently, and a serving
+    # batch is not independent. Prefer ``token_corpus`` for anything that drafts.
+    # Both are deliberately unprofiled -- their synchronization and D2H logging
+    # overhead must not contaminate timing.
     profile_kind: str = "nsys"
 
     # --- engine side ---

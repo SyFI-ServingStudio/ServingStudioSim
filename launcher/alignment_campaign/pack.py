@@ -37,6 +37,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from alignment.profiler.config import PROFILE_KINDS
+
 from ..schema.loader import PresetError, _load_preset
 
 #: Repository root. Rendered configs anchor to it and recorded provenance is
@@ -46,8 +48,6 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 PACK_SCHEMA_VERSION = 1
 HOST_SCHEMA_VERSION = 1
 
-#: `profile_kind` values `launcher.alignment_config.load_profile_config` accepts.
-PROFILE_KINDS = frozenset({"nsys", "expert_popularity", "workload_metrics"})
 
 #: Which of a case's two traces a profile pass drives. `kernel` is the bounded
 #: NSYS capture; `workload` is the full run that e2e alignment consumes. A case
