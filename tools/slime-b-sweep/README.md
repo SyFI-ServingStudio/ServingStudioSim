@@ -12,8 +12,11 @@ this directory is only the plumbing.
 | `extract_firings.py` | **runs on coriander** — every threshold firing with its timestamp and train group, from `run.log.gz`. Gives both the firing instant and the abort loop's duration. |
 | `extract_decode_batch.py` | **runs on coriander** — SGLang's own `Decode batch` telemetry for one arm: running requests, batch KV, generation throughput. |
 | `extract_inference_times.py` | **runs on coriander** — per-rollout `inference_time_s` from each arm's `report.json`. Redundant with the engine windows; kept because it is one file read instead of a 4 MB trace parse. |
+| `extract_training_times.py` | **runs on coriander** — per-rollout training phase split: `report.json`'s five spans merged with the `tuner_decision` record's GPU-second accounting. `busy_gpu_s` is what the chunk cost is calibrated against. |
+| `extract_train_chunks.py` | **runs on coriander** — every `train_chunk` record. Good for the *shape* of a chunk and not for a total: the log drops about 4 of the 64 grabs a rollout makes. |
+| `extract_colocate_times.py` | **runs on coriander** — the colocate arm of the same sweep, which recorded the very lengths the streaming arms replay. The denominator of the speedup figure. |
 | `find_alignment_multipliers.py` | scans an alignment run tree for `recommended_gpu_time_multiplier`. Used to establish that llama3-8b TP1 never had one derived. |
-| `analyze_sweep.py` | runs locally — the whole comparison and all three figures. |
+| `analyze_sweep.py` | runs locally — the whole comparison and all five figures. The last two need the runs to carry a `train` section. |
 | `data/` | the extracted measured data, so the analysis reruns without touching coriander. |
 
 ## Reproducing
@@ -30,6 +33,14 @@ done
 ssh coriander 'python3 $REMOTE/extract_engine_windows.py' > tools/slime-b-sweep/data/all_arms.csv
 ssh coriander 'python3 $REMOTE/extract_firings.py'        > tools/slime-b-sweep/data/fires.csv
 
+# the training side, same shape
+for s in extract_training_times extract_train_chunks extract_colocate_times; do
+  scp tools/slime-b-sweep/$s.py coriander:$REMOTE/
+done
+ssh coriander 'python3 $REMOTE/extract_training_times.py' > tools/slime-b-sweep/data/train_times.csv
+ssh coriander 'python3 $REMOTE/extract_train_chunks.py'   > tools/slime-b-sweep/data/train_chunks.csv
+ssh coriander 'python3 $REMOTE/extract_colocate_times.py' > tools/slime-b-sweep/data/colocate_times.csv
+
 # per simulated sweep
 uv run python -m launcher presets/slime_B_sweep_sgl_fa3.yaml
 uv run python tools/slime-b-sweep/analyze_sweep.py logs/<sweep_dir>
@@ -41,7 +52,7 @@ check is not paranoia: a Rust panic leaves a partial parquet and no
 double-migration panic showed up as a rollout that finished 30% early, which
 looks like a result rather than a crash.
 
-## Two things the measured data will mislead you about
+## Four things the measured data will mislead you about
 
 **Engine windows end at idle, not at release.** An engine's `inference` slice
 stops when that engine runs dry; its GPU is not handed back to training until
@@ -54,3 +65,19 @@ low-B arms by about 9% and manufactures a systematic error that is not there.
 r = 0.54; bucket by `#token` and compare medians instead. This data can pin the
 *level* of the cost model and cannot settle whether framework overhead is
 constant per iteration or proportional to GPU time.
+
+**`train_metrics` is short.** A rollout makes 64 grabs and usually only ~60
+chunk records get written, so its `total_tokens` sums to 94% ± 1.4% of the
+trace's `input_len + output_len`. The coverage tracks the record count (60
+records → 93.6%, 78 → 100.0%, r = 0.80) and three B=128 cells match the trace to
+the exact token: the trace is right and the log is short. Calibrate a chunk cost
+against `busy_gpu_s` from the per-rollout `tuner_decision` record, which spans
+the whole thing — fitting the logged `chunk_total_s` leaves the simulated
+training span 10–20% low.
+
+**Colocate routes differently.** The colocate baseline is a matched arm on the
+same lengths, but it generates through sgl-router `cache_aware` while the
+streaming arms use `engine = group_index % 8`. Its generation half runs ~5%
+slower for that reason alone, so part of the speedup figure is routing and not
+overlap. (Its placement is also unrecoverable — `engine_rank` is -1 — which is
+why it can be a denominator and never a trace.)
