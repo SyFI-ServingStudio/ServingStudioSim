@@ -1491,9 +1491,20 @@ def test_a_replay_cannot_pack_a_previous_captures_requests(tmp_path):
     assert list(routes.iterdir()) == []
 
 
-def test_an_authored_eplb_config_keeps_its_settings_and_gains_the_log(tmp_path):
-    """The pass adds what it needs to a tuned object rather than skipping it."""
-    argv = ["--enable-expert-parallel", "--eplb-config", '{"window_size": 1000}']
+@pytest.mark.parametrize(
+    "authored",
+    [
+        ["--eplb-config", '{"window_size": 1000}'],
+        ['--eplb-config={"window_size": 1000}'],
+    ],
+    ids=["separate", "joined"],
+)
+def test_an_authored_eplb_config_keeps_its_settings_and_gains_the_log(tmp_path, authored):
+    """The pass adds what it needs to a tuned object rather than skipping it.
+
+    argparse keeps the last occurrence, so a second flag would drop the tuning.
+    """
+    argv = ["--enable-expert-parallel", *authored]
     alignment_runner._append_backend_server_args(
         argv,
         _routing_profile(
@@ -1506,9 +1517,9 @@ def test_an_authored_eplb_config_keeps_its_settings_and_gains_the_log(tmp_path):
         ),
     )
 
-    merged = json.loads(argv[argv.index("--eplb-config") + 1])
+    [config] = [arg for arg in argv if arg.startswith("--eplb-config")]
+    merged = json.loads(config.split("=", 1)[1])
     assert merged == {"window_size": 1000, "log_balancedness": True}
-    assert argv.count("--eplb-config") == 1
 
 
 def test_a_routing_pass_asks_for_the_expert_load_stream_only_where_it_exists(tmp_path):

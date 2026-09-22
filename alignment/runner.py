@@ -256,7 +256,11 @@ def _append_backend_server_args(server_argv: list[str], cfg: ProfileConfig) -> N
     if cfg.captures_expert_load:
         options += _EXPERT_LOAD_SERVER_ARGS
     for flag, value in options:
-        if flag not in server_argv:
+        # argparse accepts both `--flag value` and `--flag=value`.
+        present = [
+            i for i, arg in enumerate(server_argv) if arg == flag or arg.startswith(f"{flag}=")
+        ]
+        if not present:
             server_argv.append(flag)
             if value is not None:
                 server_argv.append(value)
@@ -267,12 +271,15 @@ def _append_backend_server_args(server_argv: list[str], cfg: ProfileConfig) -> N
         # rather than a switch. A preset that tuned one of them must not
         # silently drop the setting the pass cannot work without, so the two are
         # merged and the pass's own setting wins.
-        index = server_argv.index(flag) + 1
-        if index >= len(server_argv):
-            raise ValueError(f"{flag} in server args carries no value")
-        server_argv[index] = json.dumps(
-            {**json.loads(server_argv[index]), **json.loads(value)}, separators=(",", ":")
-        )
+        index = present[-1]
+        if server_argv[index] == flag:
+            if index + 1 >= len(server_argv):
+                raise ValueError(f"{flag} in server args carries no value")
+            authored = server_argv.pop(index + 1)
+        else:
+            authored = server_argv[index].split("=", 1)[1]
+        merged = {**json.loads(authored), **json.loads(value)}
+        server_argv[index] = f"{flag}={json.dumps(merged, separators=(',', ':'))}"
 
 
 def _preflight_capture_environment(
