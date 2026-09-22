@@ -62,8 +62,8 @@ def _validate_args(
     return args
 
 
-def _build_operands(torch: Any, args: _Args) -> dict[str, Any]:
-    device = torch.device("cuda")
+def _build_operands(torch: Any, args: _Args, *, device: Any | None = None) -> dict[str, Any]:
+    device = torch.device("cuda") if device is None else device
     generator = torch.Generator(device=device)
     generator.manual_seed(42)
     h, k, v = args.num_heads, args.head_k_dim, args.head_v_dim
@@ -93,7 +93,8 @@ def _build_operands(torch: Any, args: _Args) -> dict[str, Any]:
         "onorm_g": torch.randn(
             (args.batch_size, seg), dtype=bf16, device=device, generator=generator
         ).contiguous(),
-        "onorm_weight": torch.ones(seg, dtype=fp32, device=device),
+        # The output norm is per value channel, not per packed q/k/v segment.
+        "onorm_weight": torch.ones(v, dtype=fp32, device=device),
         "ssm_states": torch.randn(
             (slots, h, v, k), dtype=fp32, device=device, generator=generator
         ).contiguous(),
@@ -102,6 +103,12 @@ def _build_operands(torch: Any, args: _Args) -> dict[str, Any]:
 
 
 def _invoke(fn: Any, operands: dict[str, Any], args: _Args) -> Any:
+    # SGLang's exact Python signature is:
+    # kda_fused_decode(
+    #     mixed_qkv, a, b, conv_states, w_q_t, w_k_t, w_v_t, conv_bias,
+    #     A_log, dt_bias, onorm_g, onorm_weight, ssm_states, cache_indices,
+    #     scale, onorm_eps, lower_bound=None,
+    # )
     return fn(
         operands["mixed_qkv"],
         operands["a"],

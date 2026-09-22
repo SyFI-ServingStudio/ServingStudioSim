@@ -180,6 +180,78 @@ def test_kda_production_operands_match_sglang_decode_layout():
     assert operands.dt_bias.dtype is torch.float32
 
 
+def test_kda_fused_operands_match_sglang_argument_contract():
+    from profiling.runners.attention.kda_fused_decode import (
+        _build_operands,
+        _invoke,
+        _validate_args,
+    )
+
+    args = _validate_args(2, 12, 128, 128, "bf16", "fp32", -5.0)
+    operands = _build_operands(torch, args, device=torch.device("cpu"))
+    expected_shapes = {
+        "mixed_qkv": (2, 4608),
+        "a": (2, 1536),
+        "b": (2, 12),
+        "conv_states": (3, 3, 4608),
+        "w_q_t": (4, 1536),
+        "w_k_t": (4, 1536),
+        "w_v_t": (4, 1536),
+        "conv_bias": (4608,),
+        "A_log": (12,),
+        "dt_bias": (1536,),
+        "onorm_g": (2, 1536),
+        "onorm_weight": (128,),
+        "ssm_states": (3, 12, 128, 128),
+        "cache_indices": (2,),
+    }
+    assert {name: tuple(value.shape) for name, value in operands.items()} == expected_shapes
+    for name in ("w_q_t", "w_k_t", "w_v_t", "conv_bias", "A_log", "dt_bias", "onorm_weight"):
+        assert operands[name].dtype is torch.float32
+    for name in ("mixed_qkv", "a", "b", "conv_states", "onorm_g"):
+        assert operands[name].dtype is torch.bfloat16
+    assert operands["ssm_states"].dtype is torch.float32
+    assert operands["cache_indices"].dtype is torch.int32
+
+    captured: dict[str, object] = {}
+
+    def fake_kernel(*positional: object, **keyword: object) -> None:
+        captured["positional"] = positional
+        captured["keyword"] = keyword
+
+    _invoke(fake_kernel, operands, args)
+    positional = captured["positional"]
+    assert isinstance(positional, tuple)
+    assert all(
+        actual is operands[name]
+        for actual, name in zip(
+            positional,
+            (
+                "mixed_qkv",
+                "a",
+                "b",
+                "conv_states",
+                "w_q_t",
+                "w_k_t",
+                "w_v_t",
+                "conv_bias",
+                "A_log",
+                "dt_bias",
+                "onorm_g",
+                "onorm_weight",
+                "ssm_states",
+                "cache_indices",
+            ),
+            strict=True,
+        )
+    )
+    assert captured["keyword"] == {
+        "scale": 128**-0.5,
+        "onorm_eps": 1e-6,
+        "lower_bound": -5.0,
+    }
+
+
 def test_mla_reference_handles_paged_latent_cache_on_cpu():
     from profiling.runners.attention.mla_decode_attention import mla_decode_attention_reference
 
