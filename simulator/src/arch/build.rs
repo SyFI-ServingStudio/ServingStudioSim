@@ -1115,14 +1115,15 @@ pub fn glm52_vllm_nvfp4_dsa_moe_speculative(
     };
     // The target verifies the drafted positions plus the token they extend, so
     // one request contributes `draft_tokens + 1` consecutive rows to a body
-    // step. Each draft pass submits one row per request, so the MTP layer's
-    // block is one token wide however deep the proposer runs.
+    // step. The proposer's first call forwards those same rows through the MTP
+    // layer; only its later calls submit one row per request.
     let verify_width = draft_tokens
         .checked_add(1)
         .context("speculative draft_tokens + 1 overflows u32")?;
     let body = num_sparse_layers(&model_cfg) as usize;
     let body_demand = source.demand(0..body, verify_width)?;
-    let mtp_demand = source.demand(body..body + 1, 1)?;
+    let mtp_demand = source.demand(body..body + 1, verify_width)?;
+    let mtp_recurrent_demand = source.demand(body..body + 1, 1)?;
     let parallel = Glm52VllmNvfp4DsaMoeParallel {
         ep_size,
         nvl_num_gpu,
@@ -1134,6 +1135,7 @@ pub fn glm52_vllm_nvfp4_dsa_moe_speculative(
         &parallel,
         &body_demand,
         &mtp_demand,
+        &mtp_recurrent_demand,
         model_spec.fp8,
         mtp_mode,
         draft_tokens,
