@@ -53,6 +53,26 @@ register(
 register(
     KernelProfilerSpec(
         kernel_kind=KIND,
+        backend="sglang_k3_absorb",
+        supports=BackendSupport(
+            compute=frozenset({DType.BF16}),
+            gpus=frozenset({"NVIDIA B200"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.gemm.batched_gemm",
+            function_name="profile_sglang_k3_absorb",
+        ),
+        table_name=KIND,
+        args_schema=BatchedGemmArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="sglang_k3_env",
+    )
+)
+
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
         backend="torch_mla_v_up_glm52",
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),

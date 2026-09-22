@@ -130,12 +130,25 @@ def _container_worker_command(
     ).resolve()
     cache_dir.mkdir(parents=True, exist_ok=True)
     gpu_request = f'"device={",".join(str(gpu) for gpu in gpus)}"'
+    container_user = profiler_env.user or f"{os.getuid()}:{os.getgid()}"
     source_volume_args = _container_source_volume_args()
     volume_args = [
         argument
         for host_path, container_path in additional_volumes
         for argument in ("--volume", f"{host_path.resolve()}:{container_path}")
     ]
+    configured_volume_args = [
+        argument
+        for host_path, container_path, mode in profiler_env.volume_mounts
+        for argument in ("--volume", f"{host_path.resolve()}:{container_path}:{mode}")
+    ]
+    configured_env_args = [
+        argument
+        for key, value in profiler_env.environment
+        for argument in ("--env", f"{key}={value}")
+    ]
+    shm_args = [] if profiler_env.shm_size is None else ["--shm-size", profiler_env.shm_size]
+    worker_command = profiler_env.worker_command or ()
     return (
         [
             "docker",
@@ -148,20 +161,24 @@ def _container_worker_command(
             "--gpus",
             gpu_request,
             "--user",
-            f"{os.getuid()}:{os.getgid()}",
+            container_user,
             "--env",
             "HOME=/cache/home",
             "--env",
             "USER=vibesim",
             "--env",
             "LOGNAME=vibesim",
+            *configured_env_args,
+            *shm_args,
             "--volume",
             f"{exchange_dir.resolve()}:/io",
             "--volume",
             f"{cache_dir}:/cache",
             *source_volume_args,
+            *configured_volume_args,
             *volume_args,
             profiler_env.image,
+            *worker_command,
             "--worker-input",
             "/io/input.json",
             "--worker-output",

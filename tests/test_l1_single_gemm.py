@@ -1474,6 +1474,7 @@ def test_documented_profile_env_registry_complete():
         "flashinfer_local",
         "sglang_env",
         "vllm_env",
+        "sglang_k3_env",
     }
     assert set(ENV_REGISTRY) == expected_envs
     assert (
@@ -1484,6 +1485,12 @@ def test_documented_profile_env_registry_complete():
     assert isinstance(vllm_env, ContainerProfileEnv)
     assert vllm_env.image == "vibesim-profiler-vllm:cu130"
     vllm_env.validate()
+    sglang_env = ENV_REGISTRY["sglang_k3_env"]
+    assert isinstance(sglang_env, ContainerProfileEnv)
+    assert sglang_env.image == "lmsysorg/sglang:v0.5.20"
+    assert sglang_env.worker_command == ("python", "-m", "profiling.exec.local_worker")
+    assert sglang_env.shm_size == "32g"
+    assert sglang_env.user == "0:0"
 
 
 def test_comm_launcher_interfaces_exist():

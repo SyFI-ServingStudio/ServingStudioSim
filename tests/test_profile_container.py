@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from profiling.exec.env import ContainerProfileEnv
 from profiling.exec.local import _container_worker_command
 
@@ -54,6 +56,40 @@ def test_container_worker_can_use_frozen_image_source(tmp_path: Path, monkeypatc
     assert not any("/opt/vibesim/profiling:ro" in argument for argument in command)
     assert not any("/opt/vibesim/launcher:ro" in argument for argument in command)
     assert not any("/opt/vibesim/gpu:ro" in argument for argument in command)
+
+
+def test_sglang_k3_container_has_pinned_runtime_contract(tmp_path: Path, monkeypatch) -> None:
+    exchange_dir = tmp_path / "exchange"
+    cache_dir = tmp_path / "cache"
+    exchange_dir.mkdir()
+    flashinfer_cache = Path("/raid/yilegu/flashinfer_cache")
+    if not flashinfer_cache.exists():
+        pytest.skip("operator-only offline FlashInfer cache is not mounted")
+    monkeypatch.setenv("VIBESIM_PROFILE_CACHE_DIR", str(cache_dir))
+
+    from profiling.exec.env import ENV_REGISTRY
+
+    command, _env = _container_worker_command(
+        ENV_REGISTRY["sglang_k3_env"],
+        [0],
+        exchange_dir,
+    )
+
+    assert "lmsysorg/sglang:v0.5.20" in command
+    assert "--shm-size" in command
+    assert "32g" in command
+    assert command[command.index("--user") + 1] == "0:0"
+    assert "SGLANG_OPT_FUSED_KDA_VERIFY=0" in command
+    assert "HF_HUB_OFFLINE=1" in command
+    assert "HOME=/root" in command
+    assert "PYTHONPATH=/opt/vibesim" in command
+    assert f"{flashinfer_cache}:/root/.cache/flashinfer:ro" in command
+    image_index = command.index("lmsysorg/sglang:v0.5.20")
+    assert command[image_index + 1 : image_index + 4] == [
+        "python",
+        "-m",
+        "profiling.exec.local_worker",
+    ]
 
 
 def test_container_worker_rejects_unknown_source_mode(tmp_path: Path, monkeypatch) -> None:

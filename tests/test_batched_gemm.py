@@ -18,6 +18,7 @@ from profiling.kernels.batched_gemm import KIND, BatchedGemmArgs
 from profiling.runners.exceptions import ProfilerNotImplemented
 
 _Q_BACKEND = "torch_mla_q_absorb_glm52"
+_K3_BACKEND = "sglang_k3_absorb"
 _V_UP_BACKEND = "torch_mla_v_up_glm52"
 
 
@@ -54,7 +55,7 @@ def test_kind_table_backend_and_runner_ref_contract():
     spec = find_kernel_profiler_spec(KIND, _Q_BACKEND)
 
     assert KIND == "batched_gemm"
-    assert known_backends(KIND) == [_Q_BACKEND, _V_UP_BACKEND]
+    assert known_backends(KIND) == [_Q_BACKEND, _K3_BACKEND, _V_UP_BACKEND]
     assert spec.kernel_kind == KIND
     assert spec.table_name == KIND
     assert spec.backend == _Q_BACKEND
@@ -76,6 +77,29 @@ def test_v_up_registration_reuses_kind_table_args_and_facade():
     assert v_spec.subprocess_env is None
     assert v_spec.runner_ref.module_name == "profiling.runners.gemm.batched_gemm"
     assert v_spec.runner_ref.function_name == "profile_mla_v_up_glm52"
+
+
+def test_sglang_k3_registration_is_b200_only_and_uses_the_container():
+    spec = find_kernel_profiler_spec(KIND, _K3_BACKEND)
+
+    assert spec.kernel_kind == spec.table_name == KIND
+    assert spec.args_schema is BatchedGemmArgs
+    assert spec.metric_family is MetricFamily.COMPUTE
+    assert spec.subprocess_env == "sglang_k3_env"
+    assert spec.supports.gpus == frozenset({"NVIDIA B200"})
+    assert spec.supports.allows(DType.BF16, gpu="NVIDIA B200")
+    assert not spec.supports.allows(DType.BF16, gpu="NVIDIA H200")
+    assert spec.runner_ref.module_name == "profiling.runners.gemm.batched_gemm"
+    assert spec.runner_ref.function_name == "profile_sglang_k3_absorb"
+
+
+@pytest.mark.parametrize("k,n", [(128, 512), (512, 128)])
+def test_sglang_k3_absorb_validation_pins_decode_shapes(k: int, n: int):
+    from profiling.runners.gemm.batched_gemm import _validate_k3_absorb_args
+
+    assert _validate_k3_absorb_args(12, 1, n, k, "bf16")[:4] == (12, 1, n, k)
+    with pytest.raises(ValueError, match="m=1"):
+        _validate_k3_absorb_args(12, 2, n, k, "bf16")
 
 
 @pytest.mark.parametrize("backend", [_Q_BACKEND, _V_UP_BACKEND])

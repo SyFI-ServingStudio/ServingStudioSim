@@ -50,10 +50,13 @@ pub mod gdn_prefill_post_conv;
 pub mod gdn_recurrent_decode;
 pub mod gemm_fp32_output;
 pub mod grouped_gemm;
+pub mod kda_fused_decode;
+pub mod kda_recurrent_decode;
 pub mod kv_cache_append;
 pub mod mhc_fused_post_pre_rms_norm;
 pub mod mhc_pre_rms_norm;
 pub mod mla_cache_append;
+pub mod mla_decode_attention;
 pub mod mla_rope_quantize_fp8;
 pub mod moe_align_block_size;
 pub mod moe_alltoall;
@@ -65,6 +68,7 @@ pub mod moe_finalize_routing;
 pub mod moe_fused_topk;
 pub mod moe_sum;
 pub mod moe_topk_softplus_sqrt;
+pub mod mxfp4_fused_moe;
 pub mod mxfp4_marlin_moe_gemm;
 pub mod nvfp4_fused_moe;
 pub mod nvfp4_quant;
@@ -261,6 +265,13 @@ pub use gemm_fp32_output::{
 pub use grouped_gemm::{
     GroupedGemmKernel, GroupedGemmKernelConfig, GroupedGemmKernelInput, GroupedGemmSpec,
 };
+pub use kda_fused_decode::{
+    KdaFusedDecodeKernel, KdaFusedDecodeKernelConfig, KdaFusedDecodeKernelInput, KdaFusedDecodeSpec,
+};
+pub use kda_recurrent_decode::{
+    KdaRecurrentDecodeKernel, KdaRecurrentDecodeKernelConfig, KdaRecurrentDecodeKernelInput,
+    KdaRecurrentDecodeSpec,
+};
 pub use kv_cache_append::{
     KvCacheAppendKernel, KvCacheAppendKernelConfig, KvCacheAppendKernelInput, KvCacheAppendSpec,
 };
@@ -270,6 +281,10 @@ pub use mhc_pre_rms_norm::{
 };
 pub use mla_cache_append::{
     MlaCacheAppendKernel, MlaCacheAppendKernelConfig, MlaCacheAppendKernelInput, MlaCacheAppendSpec,
+};
+pub use mla_decode_attention::{
+    MlaDecodeAttentionKernel, MlaDecodeAttentionKernelConfig, MlaDecodeAttentionKernelInput,
+    MlaDecodeAttentionSpec,
 };
 pub use mla_rope_quantize_fp8::{
     MlaRopeQuantizeFp8Kernel, MlaRopeQuantizeFp8KernelConfig, MlaRopeQuantizeFp8KernelInput,
@@ -309,6 +324,9 @@ pub use moe_sum::{MoeSumKernel, MoeSumKernelConfig, MoeSumKernelInput, MoeSumSpe
 pub use moe_topk_softplus_sqrt::{
     MoeTopkSoftplusSqrtKernel, MoeTopkSoftplusSqrtKernelConfig, MoeTopkSoftplusSqrtKernelInput,
     MoeTopkSoftplusSqrtSpec,
+};
+pub use mxfp4_fused_moe::{
+    Mxfp4FusedMoeKernel, Mxfp4FusedMoeKernelConfig, Mxfp4FusedMoeKernelInput, Mxfp4FusedMoeSpec,
 };
 pub use mxfp4_marlin_moe_gemm::{
     Mxfp4MarlinMoeFcRole, Mxfp4MarlinMoeGemmKernel, Mxfp4MarlinMoeGemmKernelConfig,

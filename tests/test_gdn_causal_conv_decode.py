@@ -65,7 +65,7 @@ def test_registration_table_kind_runner_and_support_contract() -> None:
     spec = find_kernel_profiler_spec(KIND, "torch")
 
     assert KIND == "gdn_causal_conv_decode"
-    assert known_backends(KIND) == ["torch", "vllm_triton"]
+    assert known_backends(KIND) == ["torch", "sglang_triton", "vllm_triton"]
     assert spec.kernel_kind == spec.table_name == KIND
     assert spec.backend == "torch"
     assert spec.args_schema is GdnCausalConvDecodeArgs
@@ -84,6 +84,22 @@ def test_registration_table_kind_runner_and_support_contract() -> None:
     assert spec.supports.allows(DType.BF16, gpu="NVIDIA B200")
     assert not spec.supports.allows(DType.FP16, gpu="NVIDIA H200")
     assert not spec.supports.allows(DType.FP32, gpu="NVIDIA H200")
+
+
+def test_sglang_triton_registration_is_b200_only_and_uses_the_container() -> None:
+    spec = find_kernel_profiler_spec(KIND, "sglang_triton")
+
+    assert spec.kernel_kind == spec.table_name == KIND
+    assert spec.args_schema is GdnCausalConvDecodeArgs
+    assert spec.metric_family is MetricFamily.COMPUTE
+    assert spec.subprocess_env == "sglang_k3_env"
+    assert spec.supports.gpus == frozenset({"NVIDIA B200"})
+    assert spec.supports.allows(DType.BF16, gpu="NVIDIA B200")
+    assert not spec.supports.allows(DType.BF16, gpu="NVIDIA H200")
+    assert spec.runner_ref.module_name == (
+        "profiling.runners.attention.gdn_causal_conv_decode_sglang_triton"
+    )
+    assert spec.runner_ref.function_name == ("profile_gdn_causal_conv_decode_sglang_triton")
 
 
 def test_vllm_triton_registration_reuses_schema_table_and_is_h200_only() -> None:

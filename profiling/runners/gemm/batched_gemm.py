@@ -29,6 +29,8 @@ _KV_LORA_RANK = 512
 _V_HEAD_DIM = 256
 _PACKED_HEAD_WIDTH = _QK_NOPE_HEAD_DIM + _V_HEAD_DIM
 _H200_PADDED_HEADS = 64
+_K3_HEAD_COUNTS = frozenset({12, 96})
+_K3_ABSORB_SHAPES = frozenset({(128, 512), (512, 128)})
 
 
 @dataclass(frozen=True)
@@ -71,7 +73,8 @@ def _validate_args(
         )
     if num_batches not in _SUPPORTED_HEAD_COUNTS:
         raise ValueError(
-            f"torch_mla_q_absorb_glm52 supports num_batches in {sorted(_SUPPORTED_HEAD_COUNTS)}, got {num_batches}"
+            "torch_mla_q_absorb_glm52 supports num_batches in "
+            f"{sorted(_SUPPORTED_HEAD_COUNTS)}, got {num_batches}"
         )
     if (k, n) != (_QK_NOPE_HEAD_DIM, _KV_LORA_RANK):
         raise ValueError(f"torch_mla_q_absorb_glm52 requires (k, n) == (192, 512), got ({k}, {n})")
@@ -111,7 +114,8 @@ def _validate_v_up_args(
         )
     if num_batches not in _SUPPORTED_HEAD_COUNTS:
         raise ValueError(
-            f"torch_mla_v_up_glm52 supports num_batches in {sorted(_SUPPORTED_HEAD_COUNTS)}, got {num_batches}"
+            "torch_mla_v_up_glm52 supports num_batches in "
+            f"{sorted(_SUPPORTED_HEAD_COUNTS)}, got {num_batches}"
         )
     if (k, n) != (_KV_LORA_RANK, _V_HEAD_DIM):
         raise ValueError(f"torch_mla_v_up_glm52 requires (k, n) == (512, 256), got ({k}, {n})")
@@ -128,6 +132,67 @@ def _validate_v_up_cuda_device(torch: Any) -> None:
         raise ProfilerNotImplemented(
             f"torch_mla_v_up_glm52 is verified only on {sorted(_SUPPORTED_GPUS)}, got {gpu_name}"
         )
+
+
+def _validate_k3_absorb_args(
+    num_batches: int,
+    m: int,
+    n: int,
+    k: int,
+    dtype: DType | str,
+) -> tuple[int, int, int, int, DType]:
+    values = (int(num_batches), int(m), int(n), int(k))
+    dtype = DType.from_value(dtype)
+    if min(values) <= 0:
+        raise ValueError("num_batches, m, n, and k must be positive")
+    if num_batches not in _K3_HEAD_COUNTS:
+        raise ValueError(f"K3 absorb BMM requires heads in {sorted(_K3_HEAD_COUNTS)}")
+    if m != 1:
+        raise ValueError(f"K3 absorb decode BMM requires m=1, got {m}")
+    if (k, n) not in _K3_ABSORB_SHAPES:
+        raise ValueError("K3 absorb BMM requires (k,n)=(128,512) or (512,128)")
+    if dtype is not DType.BF16:
+        raise ValueError("K3 absorb BMM requires dtype=bf16")
+    return *values, dtype
+
+
+def profile_sglang_k3_absorb(
+    num_batches: int,
+    m: int,
+    n: int,
+    k: int,
+    dtype: DType | str,
+) -> ComputeMetrics:
+    num_batches, m, n, k, dtype = _validate_k3_absorb_args(num_batches, m, n, k, dtype)
+    try:
+        import torch
+    except ImportError as exc:
+        raise ProfilerNotImplemented("torch is required for the K3 absorb BMM") from exc
+    if not torch.cuda.is_available():
+        raise ProfilerNotImplemented("CUDA is required for the K3 absorb BMM")
+    if str(torch.cuda.get_device_name(torch.cuda.current_device())) != "NVIDIA B200":
+        raise ProfilerNotImplemented("K3 absorb BMM is verified only on NVIDIA B200")
+    lhs = torch.randn((num_batches, m, k), dtype=torch.bfloat16, device="cuda")
+    rhs = torch.randn((num_batches, k, n), dtype=torch.bfloat16, device="cuda")
+    output = torch.empty((num_batches, m, n), dtype=torch.bfloat16, device="cuda")
+
+    def kernel() -> None:
+        torch.bmm(lhs, rhs, out=output)
+
+    try:
+        time_ms = Timer.cupti(kernel)
+        energy_j = Energy.perf(kernel, warmup=5, per_iter_time_ms=time_ms)
+    except RuntimeError as exc:
+        raise KernelLaunchFailed(str(exc)) from exc
+    seconds = time_ms / 1000.0
+    flops = 2 * num_batches * m * n * k
+    bytes_accessed = (num_batches * (m * k + k * n + m * n)) * dtype.size_bytes()
+    return ComputeMetrics(
+        time_ms=float(time_ms),
+        tflops=flops / seconds / 1e12 if seconds else 0.0,
+        memory_bandwidth_gbps=bytes_accessed / seconds / 1e9 if seconds else 0.0,
+        energy_j=float(energy_j),
+    )
 
 
 def _build_q_absorb_operands(

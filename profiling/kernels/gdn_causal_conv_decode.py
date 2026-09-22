@@ -51,6 +51,26 @@ register(
 register(
     KernelProfilerSpec(
         kernel_kind=KIND,
+        backend="sglang_triton",
+        supports=BackendSupport(
+            compute=frozenset({DType.BF16}),
+            gpus=frozenset({"NVIDIA B200"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.attention.gdn_causal_conv_decode_sglang_triton",
+            function_name="profile_gdn_causal_conv_decode_sglang_triton",
+        ),
+        table_name=KIND,
+        args_schema=GdnCausalConvDecodeArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="sglang_k3_env",
+    )
+)
+
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
         backend="vllm_triton",
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),

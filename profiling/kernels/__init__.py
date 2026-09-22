@@ -60,10 +60,13 @@ from profiling.kernels import (
     gdn_recurrent_decode,  # noqa: F401
     gemm_fp32_output,  # noqa: F401
     grouped_gemm,  # noqa: F401
+    kda_fused_decode,  # noqa: F401
+    kda_recurrent_decode,  # noqa: F401
     kv_cache_append,  # noqa: F401
     mhc_fused_post_pre_rms_norm,  # noqa: F401
     mhc_pre_rms_norm,  # noqa: F401
     mla_cache_append,  # noqa: F401
+    mla_decode_attention,  # noqa: F401
     mla_rope_quantize_fp8,  # noqa: F401
     moe_align_block_size,  # noqa: F401
     moe_alltoall,  # noqa: F401
@@ -75,6 +78,7 @@ from profiling.kernels import (
     moe_fused_topk,  # noqa: F401
     moe_sum,  # noqa: F401
     moe_topk_softplus_sqrt,  # noqa: F401
+    mxfp4_fused_moe,  # noqa: F401
     mxfp4_marlin_moe_gemm,  # noqa: F401
     nvfp4_fused_moe,  # noqa: F401
     nvfp4_quant,  # noqa: F401

@@ -72,12 +72,35 @@ class ContainerProfileEnv:
 
     name: str
     image: str
+    worker_command: tuple[str, ...] = ()
+    environment: tuple[tuple[str, str], ...] = ()
+    shm_size: str | None = None
+    volume_mounts: tuple[tuple[Path, Path, str], ...] = ()
+    user: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "worker_command", tuple(self.worker_command))
+        object.__setattr__(self, "environment", tuple(self.environment))
+        object.__setattr__(
+            self,
+            "volume_mounts",
+            tuple(
+                (Path(host), Path(container), mode) for host, container, mode in self.volume_mounts
+            ),
+        )
 
     def validate(self) -> None:
         if not self.image:
             raise ValueError(f"profiling env {self.name!r} has no container image")
         if shutil.which("docker") is None:
             raise FileNotFoundError("docker is required for container profiling")
+        if self.shm_size is not None and not self.shm_size:
+            raise ValueError(f"profiling env {self.name!r} has an empty shm size")
+        for host_path, _container_path, _mode in self.volume_mounts:
+            if not host_path.exists():
+                raise FileNotFoundError(
+                    f"profiling env {self.name!r} volume source does not exist: {host_path}"
+                )
 
 
 _PROFILE_ENVS_ROOT = Path.home() / "profile_envs"
@@ -128,6 +151,24 @@ ENV_REGISTRY: dict[str, ProfileEnv | ContainerProfileEnv] = {
     "vllm_env": ContainerProfileEnv(
         "vllm_env",
         os.environ.get("VIBESIM_VLLM_PROFILE_IMAGE", "vibesim-profiler-vllm:cu130"),
+    ),
+    "sglang_k3_env": ContainerProfileEnv(
+        "sglang_k3_env",
+        "lmsysorg/sglang:v0.5.20",
+        worker_command=("python", "-m", "profiling.exec.local_worker"),
+        environment=(
+            ("SGLANG_OPT_FUSED_KDA_VERIFY", "0"),
+            ("HF_HUB_OFFLINE", "1"),
+            ("HOME", "/root"),
+            ("PYTHONPATH", "/opt/vibesim"),
+        ),
+        shm_size="32g",
+        volume_mounts=(
+            (Path("/raid/yilegu/flashinfer_cache"), Path("/root/.cache/flashinfer"), "ro"),
+        ),
+        # The pinned image keeps /root mode 0700. The required offline-cache
+        # mount is under /root, so this environment must retain root access.
+        user="0:0",
     ),
 }
 
