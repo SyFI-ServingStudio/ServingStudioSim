@@ -147,8 +147,9 @@ def _validate_k3_absorb_args(
         raise ValueError("num_batches, m, n, and k must be positive")
     if num_batches not in _K3_HEAD_COUNTS:
         raise ValueError(f"K3 absorb BMM requires heads in {sorted(_K3_HEAD_COUNTS)}")
-    if m != 1:
-        raise ValueError(f"K3 absorb decode BMM requires m=1, got {m}")
+    # m = decode tokens in the batch (one per request): the absorb bmm is
+    # [heads, B, 128] @ [heads, 128, 512] (and [heads, B, 512] @ [heads, 512, 128]),
+    # so the cost tree sweeps m over the batch sizes; any positive m is valid.
     if (k, n) not in _K3_ABSORB_SHAPES:
         raise ValueError("K3 absorb BMM requires (k,n)=(128,512) or (512,128)")
     if dtype is not DType.BF16:
