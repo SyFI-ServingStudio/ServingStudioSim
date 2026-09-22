@@ -30,6 +30,7 @@ use crate::common::Fabric;
 use crate::op::attention::DsaSparseMlaExactVarlenConfig;
 use crate::op::Op;
 use crate::timing::bridge::DType;
+use crate::timing::expert_demand::ExpertDemand;
 use crate::timing::kernels::{
     AllReduceFusionKernel, AllReduceFusionKernelConfig, AllReduceFusionKernelInput,
     AllReduceFusionSpec, AllReduceKernel, AllReduceKernelConfig, AllReduceKernelInput,
@@ -499,11 +500,12 @@ fn build_configs_for_decode(
             topk_group: 1,
             routed_scaling_numerator: 5,
             routed_scaling_denominator: 2,
-            layerwise_global_ppm: Vec::new(),
+            expert_demand: ExpertDemand::Popularity {
+                layerwise_global_ppm: Vec::new(),
+            },
             folded_rank_position: 0,
         },
-        routing,
-        NUM_LAYERS - NUM_DENSE_LAYERS,
+        ExpertDemand::popularity(routing, NUM_LAYERS - NUM_DENSE_LAYERS),
     );
     // The MTP layer is one layer, so its EP workload fold sees a single layer
     // of routing evidence rather than the 75 the body folds over.
@@ -524,11 +526,12 @@ fn build_configs_for_decode(
                 topk_group: 1,
                 routed_scaling_numerator: 5,
                 routed_scaling_denominator: 2,
-                layerwise_global_ppm: Vec::new(),
+                expert_demand: ExpertDemand::Popularity {
+                    layerwise_global_ppm: Vec::new(),
+                },
                 folded_rank_position: 0,
             },
-            mtp_routing,
-            1,
+            ExpertDemand::popularity(mtp_routing, 1),
         )
     });
 
@@ -2543,7 +2546,7 @@ mod tests {
         assert!(cfg
             .nvfp4_moe
             .windows(2)
-            .all(|pair| pair[0].layerwise_global_ppm == pair[1].layerwise_global_ppm));
+            .all(|pair| pair[0].expert_demand == pair[1].expert_demand));
         for rank in &cfg.nvfp4_moe {
             assert_eq!(rank.quant_backends, vec!["vllm_cuda"]);
             assert_eq!(rank.moe_backends, vec!["flashinfer_trtllm_sm100"]);

@@ -11,12 +11,10 @@
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::CacheKind;
+use crate::timing::expert_demand::ExpertDemand;
 use crate::timing::kernels::engine::{register_kernel, KernelSpec};
-use crate::timing::routing::sample_and_fold_layerwise_topk_expert_counts;
 use crate::timing::sweep::{Axis, SweepGrid};
 use crate::timing::{Dim, KernelConfig, SweepCoords};
-
-const FOLD_SEED: u64 = 0xF01D_5EED;
 
 #[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Bf16FusedMoeKernelConfig {
@@ -35,8 +33,8 @@ pub struct Bf16FusedMoeKernelConfig {
     pub topk_group: u32,
     pub routed_scaling_numerator: u32,
     pub routed_scaling_denominator: u32,
-    /// Identity-free global popularity for every modeled MoE layer.
-    pub layerwise_global_ppm: Vec<Vec<u32>>,
+    /// Where the routed demand for a profiled shape comes from.
+    pub expert_demand: ExpertDemand,
     /// Position in the active-count-ranked EP workload list. This chooses a
     /// representative local histogram without adding physical rank identity to
     /// the Python profiler key.
@@ -56,15 +54,15 @@ impl KernelSpec for Bf16FusedMoeSpec {
 
     const KIND: KernelKind = "bf16_fused_moe";
 
-    fn sweep_grid(_config: &Self::Config) -> SweepGrid {
+    fn sweep_grid(config: &Self::Config) -> SweepGrid {
         // Deliberately the same axis as `nvfp4_fused_moe`. A draft step and a
         // target step are measured at the same token counts, so the two surfaces
         // stay directly comparable instead of requiring interpolation on one
         // side of every speculative comparison.
-        SweepGrid::new(vec![Axis::chain([
+        SweepGrid::new(vec![config.expert_demand.token_axis(Axis::chain([
             Axis::values([1, 4, 8, 16, 32, 48]),
             Axis::token_axis(),
-        ])])
+        ]))])
     }
 
     fn cache_kind(_backend: &'static str) -> CacheKind {
@@ -76,34 +74,23 @@ impl KernelSpec for Bf16FusedMoeSpec {
         grid: &SweepGrid,
         backend: &'static str,
     ) -> Vec<ArgsPayload> {
-        let num_experts = config.num_experts.get() as usize;
-        let num_local_experts = config.num_local_experts.get() as usize;
-        assert!(num_local_experts > 0, "num_local_experts must be non-zero");
-        assert_eq!(
-            num_experts % num_local_experts,
-            0,
-            "local experts must evenly partition global experts"
-        );
-        let rank_offset = config.folded_rank_position as usize * num_local_experts;
-        assert!(
-            rank_offset + num_local_experts <= num_experts,
-            "folded_rank_position must select an EP rank"
-        );
+        // Resolved once: a token corpus is hundreds of megabytes on disk and
+        // the grid has tens of points. The arch builder has already proven it
+        // readable, so a failure here is a corpus that changed underneath a
+        // built config.
+        let demand = config
+            .expert_demand
+            .prepare()
+            .expect("a validated expert-demand source must stay readable");
 
         grid.expand_1d(|num_tokens| {
-            let mut per_expert_batches = sample_and_fold_layerwise_topk_expert_counts(
-                &config.layerwise_global_ppm,
+            let per_expert_batches = demand.per_expert_batches(
                 config.top_k,
                 num_tokens as u32,
-                num_local_experts,
-                FOLD_SEED,
+                config.num_experts.get() as usize,
+                config.num_local_experts.get() as usize,
+                config.folded_rank_position,
             );
-            assert_eq!(
-                per_expert_batches.len(),
-                num_experts,
-                "routing profile width must match num_experts"
-            );
-            per_expert_batches.rotate_left(rank_offset);
 
             ArgsPayload::new()
                 .with("backend", backend)
@@ -134,6 +121,7 @@ mod tests {
     use super::{Bf16FusedMoeKernelConfig, Bf16FusedMoeKernelInput, Bf16FusedMoeSpec};
     use crate::timing::bridge::DType;
     use crate::timing::cache::CacheKind;
+    use crate::timing::expert_demand::ExpertDemand;
     use crate::timing::kernels::engine::{KernelConfig, KernelSpec};
     use crate::timing::kernels::nvfp4_fused_moe::Nvfp4FusedMoeSpec;
     use crate::timing::{Dim, SweepCoords};
@@ -145,15 +133,17 @@ mod tests {
     const TOP_K: u32 = 2;
 
     /// Two modeled layers, deliberately skewed so a rank rotation is observable.
-    fn popularity() -> Vec<Vec<u32>> {
-        vec![
-            vec![
-                400_000, 300_000, 100_000, 100_000, 50_000, 30_000, 15_000, 5_000,
+    fn popularity() -> ExpertDemand {
+        ExpertDemand::Popularity {
+            layerwise_global_ppm: vec![
+                vec![
+                    400_000, 300_000, 100_000, 100_000, 50_000, 30_000, 15_000, 5_000,
+                ],
+                vec![
+                    300_000, 300_000, 150_000, 100_000, 80_000, 40_000, 20_000, 10_000,
+                ],
             ],
-            vec![
-                300_000, 300_000, 150_000, 100_000, 80_000, 40_000, 20_000, 10_000,
-            ],
-        ]
+        }
     }
 
     fn config(folded_rank_position: u32) -> Bf16FusedMoeKernelConfig {
@@ -171,7 +161,7 @@ mod tests {
             topk_group: 1,
             routed_scaling_numerator: 1,
             routed_scaling_denominator: 1,
-            layerwise_global_ppm: popularity(),
+            expert_demand: popularity(),
             folded_rank_position,
         }
     }
@@ -226,7 +216,7 @@ mod tests {
                 topk_group: 1,
                 routed_scaling_numerator: 1,
                 routed_scaling_denominator: 1,
-                layerwise_global_ppm: popularity(),
+                expert_demand: popularity(),
                 folded_rank_position: 0,
             },
         );

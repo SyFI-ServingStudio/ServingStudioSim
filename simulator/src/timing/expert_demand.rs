@@ -14,7 +14,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::routing::sample_and_fold_layerwise_topk_expert_counts;
+use super::routing::{sample_and_fold_layerwise_topk_expert_counts, RoutingDistribution};
 use super::token_corpus::{TokenCorpus, TokenCorpusConfig};
 
 /// The seed every demand source folds at, so a profiled shape is reproducible.
@@ -33,6 +33,26 @@ pub enum ExpertDemand {
 }
 
 impl ExpertDemand {
+    /// Materialize a routing distribution over the layers a model actually
+    /// routes. A distribution carries no layer count of its own — a synthetic
+    /// one is a single vector — so the architecture supplies it.
+    pub fn popularity(routing: &RoutingDistribution, num_layers: u32) -> Self {
+        Self::Popularity {
+            layerwise_global_ppm: routing.layerwise_ppm(num_layers),
+        }
+    }
+
+    /// Expert count this source produces histograms over, so a consumer can
+    /// check it against the model without knowing which source it holds.
+    pub fn num_experts(&self) -> usize {
+        match self {
+            Self::Popularity {
+                layerwise_global_ppm,
+            } => layerwise_global_ppm.first().map_or(0, Vec::len),
+            Self::Corpus(config) => config.num_experts,
+        }
+    }
+
     /// Resolve the payload once, before a sweep folds every grid point.
     ///
     /// The split exists because a corpus is hundreds of megabytes on disk and a
@@ -96,6 +116,42 @@ impl PreparedDemand<'_> {
             ),
             Self::Corpus(corpus) => corpus.sample_and_fold(num_tokens, experts_per_rank),
         }
+    }
+
+    /// The per-expert row counts a fused-MoE profiler receives: the folded
+    /// histogram rotated so the requested workload rank leads.
+    ///
+    /// The fold ranks EP shards by active experts then rows, so
+    /// `folded_rank_position` selects a representative local histogram —
+    /// position 0 is the critical rank — without putting physical rank identity
+    /// into the profiler key.
+    pub fn per_expert_batches(
+        &self,
+        top_k: u32,
+        num_tokens: u32,
+        num_experts: usize,
+        num_local_experts: usize,
+        folded_rank_position: u32,
+    ) -> Vec<u32> {
+        assert!(num_local_experts > 0, "num_local_experts must be non-zero");
+        assert_eq!(
+            num_experts % num_local_experts,
+            0,
+            "local experts must evenly partition global experts"
+        );
+        let rank_offset = folded_rank_position as usize * num_local_experts;
+        assert!(
+            rank_offset + num_local_experts <= num_experts,
+            "folded_rank_position must select an EP rank"
+        );
+        let mut folded = self.sample_and_fold(top_k, num_tokens, num_local_experts);
+        assert_eq!(
+            folded.len(),
+            num_experts,
+            "demand source width must match num_experts"
+        );
+        folded.rotate_left(rank_offset);
+        folded
     }
 }
 

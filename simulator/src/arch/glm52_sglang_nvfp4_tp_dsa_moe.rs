@@ -15,6 +15,7 @@ use crate::common::Fabric;
 use crate::op::attention::DsaSparseMlaExactVarlenConfig;
 use crate::op::Op;
 use crate::timing::bridge::DType;
+use crate::timing::expert_demand::ExpertDemand;
 use crate::timing::kernels::{
     AllReduceFusionKernel, AllReduceFusionKernelConfig, AllReduceFusionKernelInput,
     AllReduceFusionSpec, AllReduceKernel, AllReduceKernelConfig, AllReduceKernelInput,
@@ -344,11 +345,12 @@ pub fn build_configs(
             topk_group: 1,
             routed_scaling_numerator: 5,
             routed_scaling_denominator: 2,
-            layerwise_global_ppm: Vec::new(),
+            expert_demand: ExpertDemand::Popularity {
+                layerwise_global_ppm: Vec::new(),
+            },
             folded_rank_position: 0,
         },
-        routing,
-        NUM_LAYERS - NUM_DENSE_LAYERS,
+        ExpertDemand::popularity(routing, NUM_LAYERS - NUM_DENSE_LAYERS),
     );
 
     Ok(Glm52SglangNvfp4TpDsaMoeConfigs {
