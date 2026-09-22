@@ -632,12 +632,6 @@ struct ExpertDemandSource<'a> {
     /// The body's routed layers — the axis an expert-popularity profile is
     /// validated against, and the boundary past which one has no evidence.
     num_routed_layers: u32,
-    /// Every layer a capture of this model records: the body's routed layers
-    /// plus any MTP layer. A corpus must describe exactly this axis, because
-    /// its payload length only fixes the *product* of its dimensions — a
-    /// manifest that halves the token count and doubles the layer count has the
-    /// same bytes and the same checksum, and samples every other token.
-    num_recorded_layers: u32,
 }
 
 impl ExpertDemandSource<'_> {
@@ -670,14 +664,18 @@ impl ExpertDemandSource<'_> {
                 self.num_experts
             );
             // Checking the layer axis is what makes the other dimensions
-            // trustworthy: the payload length constrains only their product.
+            // trustworthy: the payload length constrains only their product, so
+            // a manifest that trades tokens for layers keeps its bytes and its
+            // checksum while sampling every other token. The axis is the body,
+            // plus one slot when the capture ran a drafter -- whether this build
+            // prices that slot is its own business, so a speculative capture
+            // still serves a counterfactual run without drafting.
+            let body = self.num_routed_layers as usize;
             anyhow::ensure!(
-                config.num_layers == self.num_recorded_layers as usize,
-                "token corpus {path} records {} layers; this model records {} \
-                 ({} routed body layers plus any MTP layer)",
+                config.num_layers == body || config.num_layers == body + 1,
+                "token corpus {path} records {} layers; this model has {body} routed \
+                 body layers, and a capture records those plus at most one MTP layer",
                 config.num_layers,
-                self.num_recorded_layers,
-                self.num_routed_layers
             );
             return Ok(demand);
         }
@@ -1052,8 +1050,6 @@ pub fn glm52_vllm_nvfp4_dsa_moe(
         expert_popularity_file,
         token_corpus_file,
         num_routed_layers: num_sparse_layers(&model_cfg),
-        num_recorded_layers: num_sparse_layers(&model_cfg)
-            + u32::from(mtp_mode != Glm52MtpMode::Off),
     };
     // Ordinary decode submits one row per request, so a verify block is one
     // token wide and a contiguous draw is a single draw.
@@ -1116,7 +1112,6 @@ pub fn glm52_vllm_nvfp4_dsa_moe_speculative(
         expert_popularity_file,
         token_corpus_file,
         num_routed_layers: num_sparse_layers(&model_cfg),
-        num_recorded_layers: num_sparse_layers(&model_cfg) + 1,
     };
     // The target verifies the drafted positions plus the token they extend, so
     // one request contributes `draft_tokens + 1` consecutive rows to a body
@@ -1176,7 +1171,6 @@ pub fn glm52_sglang_nvfp4_tp_dsa_moe(
         expert_popularity_file,
         token_corpus_file,
         num_routed_layers: num_sparse_layers(&model_cfg),
-        num_recorded_layers: num_sparse_layers(&model_cfg),
     };
     let demand = source.demand(0..num_sparse_layers(&model_cfg) as usize, 1)?;
     let parallel = Glm52SglangNvfp4TpDsaMoeParallel {
@@ -1645,7 +1639,6 @@ mod tests {
             expert_popularity_file: None,
             token_corpus_file: Some(&corpus.data_file.replace("routes.u16", "manifest.json")),
             num_routed_layers: 7,
-            num_recorded_layers: 8,
         };
         let body = source.demand(0..7, 6).unwrap();
         let mtp = source.demand(7..8, 1).unwrap();
@@ -1682,7 +1675,6 @@ mod tests {
             expert_popularity_file: popularity,
             token_corpus_file: token_corpus,
             num_routed_layers: 7,
-            num_recorded_layers: 8,
         };
         let demand = |s: ExpertDemandSource<'_>| s.demand(0..7, 6);
 
@@ -1705,11 +1697,21 @@ mod tests {
         // manifest that trades tokens for layers keeps its byte count and its
         // checksum while sampling every other token.
         let restated = ExpertDemandSource {
-            num_recorded_layers: 16,
+            num_routed_layers: 3,
             ..source(RoutingKind::Corpus, None, Some(&manifest))
         };
-        let error = demand(restated).unwrap_err();
-        assert!(format!("{error:#}").contains("records 8 layers; this model records 16"));
+        let error = ExpertDemandSource::demand(&restated, 0..3, 6).unwrap_err();
+        assert!(format!("{error:#}").contains("records 8 layers; this model has 3"));
+
+        // Both legitimate axes load: a capture without a drafter records the
+        // body alone, and `restated` above failed only for being neither.
+        // (A drafted capture pricing an undrafted build is the 0..7 call in
+        // `a_corpus_serves_the_body_and_the_mtp_layer_from_one_artifact`.)
+        let undrafted = ExpertDemandSource {
+            num_routed_layers: 8,
+            ..source(RoutingKind::Corpus, None, Some(&manifest))
+        };
+        ExpertDemandSource::demand(&undrafted, 0..8, 1).expect("the body of an 8-layer corpus");
 
         // Leaving the other kind's file behind is rejected in both directions:
         // the cost would not change, so nothing would show which source was read.
@@ -1745,7 +1747,6 @@ mod tests {
             expert_popularity_file: profile.path().to_str(),
             token_corpus_file: None,
             num_routed_layers: 2,
-            num_recorded_layers: 3,
         };
         let ppm = |demand| match demand {
             ExpertDemand::Popularity {
