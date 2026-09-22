@@ -218,10 +218,22 @@ def compose_library_path(profile_env: ProfileEnv, existing: str | None) -> str:
 def resolve_profile_env(name: str | None) -> ProfileEnv | ContainerProfileEnv:
     env_name = name or "default_env"
     try:
-        return ENV_REGISTRY[env_name]
+        env = ENV_REGISTRY[env_name]
     except KeyError as exc:
         known_envs = sorted(ENV_REGISTRY)
         raise ValueError(f"unknown profiling env {env_name!r}; known envs: {known_envs}") from exc
+    # The host `sglang_env` is the instrumented-fork venv under
+    # alignment/profiler/sglang (submodule + `.venv-sglang`), which many checkouts do
+    # not carry. When it is absent, serve the sglang backends (sglang_bf16_auto,
+    # sglang_fused_a_auto, sglang_router_auto, sglang_cuda) from the pinned
+    # sglang v0.5.20 container env instead -- the same runners, imported from the
+    # image's sglang. Set VIBESIM_SGLANG_ENV_FALLBACK to another env name or to
+    # "none" to disable the substitution.
+    if env_name == "sglang_env" and isinstance(env, ProfileEnv):
+        fallback = os.environ.get("VIBESIM_SGLANG_ENV_FALLBACK", "sglang_k3_env")
+        if fallback != "none" and not env.python_executable.exists() and fallback in ENV_REGISTRY:
+            return ENV_REGISTRY[fallback]
+    return env
 
 
 __all__ = [
