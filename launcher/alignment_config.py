@@ -227,6 +227,12 @@ def load_profile_config(path: Path, *, require_python_runtime: bool = True) -> P
             "invalid profile config: profile_kind token_corpus needs a workload backend "
             f"that returns routed experts, and {config.workload.backend.type!r} does not"
         )
+    opted_out_of_eplb = "--no-enable-eplb" in config.server.extra_args
+    if config.profile_kind == "expert_popularity" and opted_out_of_eplb:
+        raise ValueError(
+            "invalid profile config: profile_kind expert_popularity reads EPLB's "
+            "expert-load stream, which --no-enable-eplb turns off; use token_corpus"
+        )
     # Expert parallelism is declared twice -- as a server flag and as the degree
     # the records are reduced over -- and the two must agree. Disagreeing is how
     # a capture ends up paying for an expert-load stream it cannot aggregate, or
