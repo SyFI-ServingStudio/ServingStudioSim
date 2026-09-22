@@ -97,9 +97,13 @@ def test_sglang_k3_registration_is_b200_only_and_uses_the_container():
 def test_sglang_k3_absorb_validation_pins_decode_shapes(k: int, n: int):
     from profiling.runners.gemm.batched_gemm import _validate_k3_absorb_args
 
+    # m = decode tokens in the batch (one per request); the cost tree sweeps it.
     assert _validate_k3_absorb_args(12, 1, n, k, "bf16")[:4] == (12, 1, n, k)
-    with pytest.raises(ValueError, match="m=1"):
-        _validate_k3_absorb_args(12, 2, n, k, "bf16")
+    assert _validate_k3_absorb_args(96, 128, n, k, "bf16")[:4] == (96, 128, n, k)
+    with pytest.raises(ValueError, match="positive"):
+        _validate_k3_absorb_args(12, 0, n, k, "bf16")
+    with pytest.raises(ValueError, match="heads"):
+        _validate_k3_absorb_args(7, 1, n, k, "bf16")
 
 
 @pytest.mark.parametrize("backend", [_Q_BACKEND, _V_UP_BACKEND])
