@@ -42,9 +42,10 @@ from .profiler.engine_records import SGLANG_RECORDS, VLLM_RECORDS
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-#: Where a `token_corpus` replay persists one `.npz` of routed experts per
+#: Where a `token_corpus` replay persists one `.npy` of routed experts per
 #: request, and where the packed corpus lands. Both are under the pass's own
-#: `log_dir`, so re-running the pass replaces them wholesale.
+#: `log_dir`, and the replay clears the first one so a re-run cannot pack a
+#: previous capture's requests alongside its own.
 ROUTED_EXPERTS_DIR = "routed_experts"
 TOKEN_CORPUS_DIR = "token_corpus"
 
@@ -210,6 +211,22 @@ def _num_routed_experts(cfg: ProfileConfig) -> int:
     )
 
 
+def _prepared_routes_dir(cfg: ProfileConfig, log_dir: Path) -> Path | None:
+    """An empty directory for this replay's routes, or None for a pass with none.
+
+    Emptied rather than merely created. The packer concatenates every `.npy` it
+    finds, so a re-run into the same log directory -- or a run whose request set
+    shrank -- would otherwise pack a previous capture's requests into a corpus
+    that then checksums and provenances as if it were one recording.
+    """
+    if cfg.profile_kind != "token_corpus":
+        return None
+    routes = log_dir / ROUTED_EXPERTS_DIR
+    shutil.rmtree(routes, ignore_errors=True)
+    routes.mkdir(parents=True)
+    return routes
+
+
 # What a pass needs the engine to do, beyond what the profile config asks for.
 # A capture pass should be one command: the operator names the kind, and the
 # flags that kind cannot work without are this module's business, not theirs.
@@ -239,11 +256,23 @@ def _append_backend_server_args(server_argv: list[str], cfg: ProfileConfig) -> N
     if cfg.captures_expert_load:
         options += _EXPERT_LOAD_SERVER_ARGS
     for flag, value in options:
-        if flag in server_argv:
+        if flag not in server_argv:
+            server_argv.append(flag)
+            if value is not None:
+                server_argv.append(value)
             continue
-        server_argv.append(flag)
-        if value is not None:
-            server_argv.append(value)
+        if value is None:
+            continue
+        # A valued option here carries a JSON object, which is a set of settings
+        # rather than a switch. A preset that tuned one of them must not
+        # silently drop the setting the pass cannot work without, so the two are
+        # merged and the pass's own setting wins.
+        index = server_argv.index(flag) + 1
+        if index >= len(server_argv):
+            raise ValueError(f"{flag} in server args carries no value")
+        server_argv[index] = json.dumps(
+            {**json.loads(server_argv[index]), **json.loads(value)}, separators=(",", ":")
+        )
 
 
 def _preflight_capture_environment(
@@ -488,9 +517,7 @@ def run_profile(cfg: ProfileConfig, *, resume: bool = False) -> dict:
                 # Only the corpus pass needs per-token routes, and it pays for
                 # them with the replay's streaming timeline. An expert_popularity
                 # pass reads the server's own counters and keeps its timeline.
-                routed_experts_dir=(
-                    log_dir / ROUTED_EXPERTS_DIR if cfg.profile_kind == "token_corpus" else None
-                ),
+                routed_experts_dir=_prepared_routes_dir(cfg, log_dir),
             )
             replay_end_monotonic_ns = time.monotonic_ns()
             # EngineCore metrics use the same host CLOCK_MONOTONIC domain. The

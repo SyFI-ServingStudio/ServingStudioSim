@@ -167,7 +167,10 @@ by how many of a rank's expert groups are non-empty, which is a statement about
 co-occurrence and so unanswerable from a marginal — that is what `corpus` is
 for, and it only differs from `popularity` where the verify width exceeds one.
 
-The two sources also differ in how many artifacts a model needs. A corpus is
-layer-indexed, so the body MoE and the MTP MoE are two slices of one file. A
-marginal has already summed the layer axis away, so a speculative model on
-`routing: popularity` needs target and draft popularity files together.
+The two sources also differ in what they can say about a speculative model's
+MTP layer. A corpus is layer-indexed, so the body MoE and the MTP MoE are two
+slices of one file and the MTP layer's own routing is measured. A marginal has
+already summed the layer axis away and was captured over the body's layers, so
+the MTP layer folds that profile's layer-summed distribution -- the same
+evidence at the only resolution a marginal has. One file either way; there is no
+separate draft profile.

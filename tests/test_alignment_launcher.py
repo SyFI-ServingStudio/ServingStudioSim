@@ -504,11 +504,16 @@ def test_a_popularity_pass_requires_explicit_engine_neutral_topology(tmp_path, e
     with pytest.raises(ValueError, match="expert_popularity requires explicit"):
         load_profile_config(paths["profile"])
 
-    # The same config is a valid corpus capture: the topology is what a
-    # marginal is reduced over, and a corpus records logical ids instead.
+    # The same config is a valid corpus capture on vLLM: the topology is what a
+    # marginal is reduced over, and a corpus records logical ids instead. On
+    # SGLang there is no per-token route to return at all.
     raw["profile_kind"] = "token_corpus"
     paths["profile"].write_text(yaml.safe_dump(raw))
-    assert load_profile_config(paths["profile"]).server.expert_count_reduction_group_size is None
+    if engine == "vllm":
+        assert load_profile_config(paths["profile"]).server.expert_parallel_size == 1
+    else:
+        with pytest.raises(ValueError, match="token_corpus requires engine vllm"):
+            load_profile_config(paths["profile"])
 
     raw["profile_kind"] = "expert_popularity"
     raw["server"]["expert_count_reduction_group_size"] = 2
@@ -1416,6 +1421,7 @@ def test_the_yaml_expert_topology_reaches_the_expert_load_extractor(tmp_path, mo
     cfg = _routing_profile(
         tmp_path,
         "expert_popularity",
+        extra_args=["--enable-expert-parallel"],
         expert_parallel_size=2,
         expert_count_reduction_group_size=4,
     )
@@ -1468,6 +1474,41 @@ def test_a_pass_that_asks_for_the_expert_load_stream_also_requires_it(tmp_path):
         )
         == {}
     )
+
+
+def test_a_replay_cannot_pack_a_previous_captures_requests(tmp_path):
+    """The packer concatenates every file it finds, so the directory is emptied."""
+    cfg = _routing_profile(tmp_path / "corpus", "token_corpus")
+    routes = Path(cfg.log_dir) / alignment_runner.ROUTED_EXPERTS_DIR
+    routes.mkdir(parents=True)
+    stale = routes / "from-a-previous-run-0000.npy"
+    stale.write_bytes(b"stale")
+
+    prepared = alignment_runner._prepared_routes_dir(cfg, Path(cfg.log_dir))
+
+    assert prepared == routes
+    assert not stale.exists()
+    assert list(routes.iterdir()) == []
+
+
+def test_an_authored_eplb_config_keeps_its_settings_and_gains_the_log(tmp_path):
+    """The pass adds what it needs to a tuned object rather than skipping it."""
+    argv = ["--enable-expert-parallel", "--eplb-config", '{"window_size": 1000}']
+    alignment_runner._append_backend_server_args(
+        argv,
+        _routing_profile(
+            tmp_path / "tuned",
+            "token_corpus",
+            tp_size=4,
+            extra_args=["--enable-expert-parallel"],
+            expert_parallel_size=4,
+            expert_count_reduction_group_size=4,
+        ),
+    )
+
+    merged = json.loads(argv[argv.index("--eplb-config") + 1])
+    assert merged == {"window_size": 1000, "log_balancedness": True}
+    assert argv.count("--eplb-config") == 1
 
 
 def test_a_routing_pass_asks_for_the_expert_load_stream_only_where_it_exists(tmp_path):

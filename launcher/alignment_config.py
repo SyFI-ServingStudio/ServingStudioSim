@@ -18,6 +18,7 @@ from typing import Any
 from alignment.load_generator.config import LoadGeneratorConfig
 from alignment.profiler.config import (
     PROFILE_KINDS,
+    ROUTING_PROFILE_KINDS,
     IdleWaitConfig,
     NsysConfig,
     ProfileConfig,
@@ -213,6 +214,27 @@ def load_profile_config(path: Path, *, require_python_runtime: bool = True) -> P
         "expert_parallel_size": config.server.expert_parallel_size,
         "expert_count_reduction_group_size": (config.server.expert_count_reduction_group_size),
     }
+    # Recording per-token routes is a fork-specific server capability, and only
+    # the vLLM fork has it. Rejecting the combination here costs nothing; letting
+    # it through spends a scheduled job to die in the other engine's argparse.
+    if config.profile_kind == "token_corpus" and config.engine != "vllm":
+        raise ValueError(
+            f"invalid profile config: profile_kind token_corpus requires engine vllm, "
+            f"got {config.engine!r}"
+        )
+    # Expert parallelism is declared twice -- as a server flag and as the degree
+    # the records are reduced over -- and the two must agree. Disagreeing is how
+    # a capture ends up paying for an expert-load stream it cannot aggregate, or
+    # aggregating over a topology the server never ran.
+    if config.profile_kind in ROUTING_PROFILE_KINDS and config.engine == "vllm":
+        flagged = "--enable-expert-parallel" in config.server.extra_args
+        declared = config.server.expert_parallel_size
+        if declared is not None and flagged != (declared > 1):
+            raise ValueError(
+                "invalid profile config: server.expert_parallel_size "
+                f"{declared} and --enable-expert-parallel "
+                f"{'present' if flagged else 'absent'} disagree about expert parallelism"
+            )
     # The topology is what the marginal is reduced over, so it is required by
     # the pass whose product that is, and by any routing pass that will take the
     # expert-load stream alongside its own product -- capturing that stream and

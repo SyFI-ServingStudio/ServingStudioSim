@@ -34,6 +34,7 @@ from launcher.alignment_campaign import check as check_module
 from launcher.alignment_campaign import compare as compare_module
 from launcher.alignment_campaign import execute, label
 from launcher.alignment_campaign import extract as extract_module
+from launcher.alignment_campaign import render as render_module
 from launcher.alignment_campaign.metrics import (
     REPORT_LOCATIONS,
     SUPPORTED_SCHEMAS,
@@ -250,6 +251,59 @@ def test_render_writes_every_phase_config(pack, tmp_path):
         stem = phase if variant.pass_named(phase) else PHASE_CONFIG_STEMS[phase]
         assert (rendered.directory / f"{stem}.yaml").is_file(), phase
     assert (rendered.directory / "trace.csv").is_file()
+
+
+def test_render_resolves_a_corpus_path_the_way_it_resolves_a_marginal(pack, tmp_path):
+    """A pack-relative corpus reaches the simulator as a path it can resolve.
+
+    `TokenCorpusConfig::from_manifest` resolves against the process, not the
+    pack, so leaving the authored string alone fails the build after the capture
+    it depends on has already run.
+    """
+    import dataclasses
+
+    case = pack.cases[0]
+    variant = pack.variant_of(case)
+    corpus = dataclasses.replace(
+        variant,
+        arch={
+            **{k: v for k, v in variant.arch.items() if k != "expert_popularity_file"},
+            "routing": "corpus",
+            "token_corpus_file": "token_corpus/manifest.json",
+        },
+    )
+
+    document = render_module.simulation_document(pack, case, corpus, tmp_path, REPO_ROOT)
+
+    rendered = document["pools"]["main"]["groups"][0]["arch"]["token_corpus_file"]
+    assert rendered != "token_corpus/manifest.json"
+    assert rendered.endswith("token_corpus/manifest.json")
+    assert (REPO_ROOT / rendered) == (pack.root / "token_corpus/manifest.json").resolve()
+
+
+def test_render_leaves_a_hub_reference_for_the_launcher_to_fetch(pack, tmp_path):
+    """`hf://` is resolved during launcher expansion; it is not a pack path."""
+    import dataclasses
+
+    reference = "hf://uw/corpora@0123456789abcdef0123456789abcdef01234567/glm53/manifest.json"
+    case = pack.cases[0]
+    corpus = dataclasses.replace(
+        pack.variant_of(case),
+        arch={
+            **{
+                k: v
+                for k, v in pack.variant_of(case).arch.items()
+                if k != "expert_popularity_file"
+            },
+            "routing": "corpus",
+            "token_corpus_file": reference,
+        },
+    )
+
+    document = render_module.simulation_document(pack, case, corpus, tmp_path, REPO_ROOT)
+
+    arch = document["pools"]["main"]["groups"][0]["arch"]
+    assert arch["token_corpus_file"] == reference
 
 
 def test_render_never_leaks_a_stub_host_into_the_pack(pack, tmp_path):

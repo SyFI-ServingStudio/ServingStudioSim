@@ -348,9 +348,14 @@ def simulation_document(
             f"variants.{variant.name}.arch must not set max_model_len; it is per-case"
         )
     arch["max_model_len"] = case.max_model_len
-    popularity = arch.get("expert_popularity_file")
-    if isinstance(popularity, str) and popularity:
-        arch["expert_popularity_file"] = _preset_path(pack.root / popularity, repo_root)
+    # Both measured-routing artifacts are named pack-relative in a variant and
+    # must reach the simulator as paths it can resolve from the repository root.
+    # A corpus manifest is resolved relative to the process, so leaving it
+    # pack-relative fails the build after the capture has already run.
+    for key in ("expert_popularity_file", "token_corpus_file"):
+        reference = arch.get(key)
+        if isinstance(reference, str) and reference and not reference.startswith("hf://"):
+            arch[key] = _preset_path(pack.root / reference, repo_root)
 
     worker = dict(variant.worker)
     for derived in ("attn_gpu_memory_gb", "gpu_time_multiplier"):

@@ -66,14 +66,23 @@ def _request_sort_key(path: Path) -> tuple:
     )
 
 
-def _routed_layers(arrays: list[np.ndarray], num_layers: int) -> range:
+def _routed_layers(arrays: list[np.ndarray], num_layers: int, top_k: int) -> range:
     """The contiguous span of layers that recorded routes.
 
     A dense layer never calls the capture hook, so its rows stay zero for the
-    whole capture. The span is required to be contiguous because the simulator
+    whole capture, and a routed row holds top-k *distinct* experts -- which is
+    what makes all-zero unambiguous, and why it requires top-k above one. The span is required to be contiguous because the simulator
     addresses the corpus by layer *range*: a gap would make "the first N layers"
     mean something other than what the model's first N routed layers are.
     """
+    if top_k < 2:
+        # With one slot a token routed to expert 0 is indistinguishable from a
+        # layer that never routed, so this rule cannot separate them. The
+        # capture is fine; this inference is what does not hold.
+        raise ValueError(
+            "a top-1 router cannot be told apart from a dense layer by an "
+            "all-zero row; the routed layer span must be supplied instead"
+        )
     routed = np.zeros(num_layers, dtype=bool)
     for ids in arrays:
         if ids.shape[0]:
@@ -131,7 +140,7 @@ def pack_token_corpus(
         arrays.append(ids[1:])
 
     num_model_layers, top_k = shape
-    layers = _routed_layers(arrays, num_model_layers)
+    layers = _routed_layers(arrays, num_model_layers, top_k)
 
     segments: list[dict] = []
     payload_parts: list[np.ndarray] = []

@@ -163,8 +163,9 @@ class NsysConfig:
 PROFILE_KINDS = frozenset({"nsys", "workload_metrics", "expert_popularity", "token_corpus"})
 
 #: The passes that observe MoE routing. They launch the server bare with the
-#: engine's timing instrumentation off, and both need the expert topology
-#: declared because their records are already rank-reduced.
+#: engine's timing instrumentation off. Whichever of them aggregates a
+#: rank-reduced marginal needs the expert topology declared; a corpus records
+#: logical expert ids and does not.
 ROUTING_PROFILE_KINDS = frozenset({"expert_popularity", "token_corpus"})
 
 
@@ -222,9 +223,11 @@ class ProfileConfig:
 
         That stream is the only per-step view of what the engine actually ran --
         one rank-synchronized record per forward -- so a routing pass takes it
-        alongside its own product. vLLM's balancedness log is its only source
-        and vLLM refuses EPLB without expert parallelism, so a deployment
-        without either cannot produce it.
+        alongside its own product. vLLM's balancedness log is its only source,
+        and vLLM refuses EPLB both without expert parallelism and without more
+        than one rank to balance across, so a deployment missing either cannot
+        produce it. Asking for it there would not yield a marginal; it would
+        stop the server from starting.
 
         Asking and requiring are the same question: a pass that asked for the
         stream and got nothing is a defect, not a deployment that happens to
@@ -234,4 +237,5 @@ class ProfileConfig:
             self.profile_kind in ROUTING_PROFILE_KINDS
             and self.engine == "vllm"
             and "--enable-expert-parallel" in self.server.extra_args
+            and self.server.tp_size * self.server.dp_size > 1
         )

@@ -385,22 +385,40 @@ def _check_label_rules(pack: Pack) -> list[Finding]:
     return findings
 
 
+#: Each measured routing kind, the arch field naming its artifact, and the
+#: schema versions this simulator reads. `check` exists to fail a pack before it
+#: reaches a GPU, so both kinds are validated, not only the older one.
+_ROUTING_ARTIFACTS = {
+    "popularity": ("expert_popularity_file", (2, 3, 4)),
+    "corpus": ("token_corpus_file", (1,)),
+}
+
+
 def _check_expert_popularity(pack: Pack) -> list[Finding]:
     findings: list[Finding] = []
-    key = "expert_popularity_file"
     for name, variant in pack.variants.items():
-        reference = variant.arch.get(key)
         routing = variant.arch.get("routing", "uniform")
-        where = f"variants.{name}.arch.{key}"
-        if routing == "popularity":
-            if not isinstance(reference, str) or not reference.strip():
-                findings.append(Finding("error", where,
-                                        "routing=popularity requires a non-empty file path"))
-        elif reference is not None:
-            findings.append(Finding("error", f"variants.{name}.arch.routing",
-                                    "a popularity file requires routing=popularity; "
-                                    "uniform/random must omit it"))
+        expected_key, versions = _ROUTING_ARTIFACTS.get(routing, (None, ()))
+        for key, _ in _ROUTING_ARTIFACTS.values():
+            reference = variant.arch.get(key)
+            where = f"variants.{name}.arch.{key}"
+            if key == expected_key:
+                if not isinstance(reference, str) or not reference.strip():
+                    findings.append(Finding("error", where,
+                                            f"routing={routing} requires a non-empty file path"))
+            elif reference is not None:
+                findings.append(Finding("error", f"variants.{name}.arch.routing",
+                                        f"{key} requires routing="
+                                        f"{'popularity' if 'popularity' in key else 'corpus'}; "
+                                        "uniform/random must omit it"))
+        if expected_key is None:
+            continue
+        reference = variant.arch.get(expected_key)
         if not isinstance(reference, str) or not reference:
+            continue
+        where = f"variants.{name}.arch.{expected_key}"
+        if reference.startswith("hf://"):
+            # Fetched during launcher expansion; there is nothing on disk yet.
             continue
         path = pack.root / reference
         if not path.is_file():
@@ -412,9 +430,17 @@ def _check_expert_popularity(pack: Pack) -> list[Finding]:
             findings.append(Finding("error", where, f"unreadable: {exc}"))
             continue
         version = document.get("schema_version")
-        if version not in (2, 3, 4):
+        if version not in versions:
             findings.append(Finding("error", where,
-                                    f"schema_version must be 2, 3 or 4, got {version!r}"))
+                                    f"schema_version must be "
+                                    f"{' or '.join(str(v) for v in versions)}, got {version!r}"))
+            continue
+        if routing == "corpus":
+            payload = path.parent / str(document.get("data_file", ""))
+            if not payload.is_file():
+                findings.append(Finding("error", where,
+                                        f"manifest names a payload that is not beside it: "
+                                        f"{document.get('data_file')!r}"))
     return findings
 
 
