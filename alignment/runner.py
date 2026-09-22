@@ -120,9 +120,41 @@ def _expert_popularity_group_sizes(cfg: ProfileConfig) -> tuple[int, int]:
     return expert_parallel_size, reduction_group_size
 
 
+def _num_routed_experts(cfg: ProfileConfig) -> int:
+    """How many experts the checkpoint routes over, read from the checkpoint.
+
+    The corpus needs this to range-check the ids it packs. Taking it from the
+    model rather than from the expert-popularity marginal this pass also writes
+    keeps the two artifacts independent: a corpus is a recording of the model,
+    not of the other artifact, and one produced without the marginal must still
+    be describable.
+    """
+    config_path = Path(cfg.server.model_path) / "config.json"
+    document = json.loads(config_path.read_text())
+    text_config = document.get("text_config", document)
+    for key in ("num_experts", "n_routed_experts", "num_local_experts"):
+        value = text_config.get(key)
+        if isinstance(value, int) and value > 0:
+            return value
+    raise ValueError(
+        f"{config_path} names no routed expert count "
+        "(num_experts / n_routed_experts / num_local_experts)"
+    )
+
+
+# What a pass needs the engine to do, beyond what the profile config asks for.
+# A capture pass should be one command: the operator names the kind, and the
+# flags that kind cannot work without are this module's business, not theirs.
+_PROFILE_KIND_SERVER_ARGS = {"token_corpus": ("--enable-return-routed-experts",)}
+
+
 def _append_backend_server_args(server_argv: list[str], cfg: ProfileConfig) -> None:
-    """Add backend-required server flags exactly once to the persisted launch argv."""
-    for argument in cfg.workload.backend.required_server_args:
+    """Add backend- and pass-required server flags exactly once to the launch argv."""
+    required = (
+        *cfg.workload.backend.required_server_args,
+        *_PROFILE_KIND_SERVER_ARGS.get(cfg.profile_kind, ()),
+    )
+    for argument in required:
         if argument not in server_argv:
             server_argv.append(argument)
 
@@ -526,14 +558,12 @@ def _finalize_profile(
             )
         corpus_artifacts = {}
         if cfg.profile_kind == "token_corpus":
-            # Packed from the routes the replay persisted, and sized by the
-            # marginal this same pass just extracted: the popularity profile is
-            # the authority on how many logical experts the model has, so the
-            # corpus cannot disagree with the marginal it ships beside.
+            # Packed from the routes the replay persisted, and range-checked
+            # against the checkpoint's own expert count.
             manifest = token_corpus.pack_token_corpus(
                 log_dir / ROUTED_EXPERTS_DIR,
                 log_dir / TOKEN_CORPUS_DIR,
-                num_experts=json.loads(expert_popularity_json.read_text())["num_logical_experts"],
+                num_experts=_num_routed_experts(cfg),
             )
             corpus_artifacts = {
                 "token_corpus_manifest": str(log_dir / TOKEN_CORPUS_DIR / "manifest.json"),
