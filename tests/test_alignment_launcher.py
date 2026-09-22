@@ -2232,3 +2232,29 @@ def test_a_corpus_is_published_only_when_every_request_carried_routes(
     else:
         with pytest.raises(ValueError, match="carried routes"):
             alignment_runner._check_routes_cover_replay(summary, routes)
+
+
+def test_a_hub_model_id_reads_its_config_from_the_hub_cache(tmp_path, monkeypatch):
+    """`model_path` is what vLLM's --model accepted, a repo id included."""
+    import huggingface_hub
+
+    cached = tmp_path / "snapshot" / "config.json"
+    cached.parent.mkdir()
+    cached.write_text(json.dumps({"n_routed_experts": 256}))
+    fetched = []
+
+    def fake_download(repo_id, filename):
+        fetched.append((repo_id, filename))
+        return str(cached)
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_download)
+    monkeypatch.chdir(tmp_path)
+
+    assert alignment_runner._checkpoint_config("nvidia/GLM-5.2-NVFP4") == cached
+    assert fetched == [("nvidia/GLM-5.2-NVFP4", "config.json")]
+
+    local = tmp_path / "checkpoint"
+    local.mkdir()
+    (local / "config.json").write_text("{}")
+    assert alignment_runner._checkpoint_config(str(local)) == local / "config.json"
+    assert len(fetched) == 1

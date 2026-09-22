@@ -189,6 +189,20 @@ def _extract_expert_load(
     return artifacts
 
 
+def _checkpoint_config(model_path: str) -> Path:
+    """The `config.json` of the checkpoint the server loaded.
+
+    `model_path` is whatever the server's `--model` accepted: a local
+    directory, or a hub repo id the server has already fetched into the cache.
+    """
+    local = Path(model_path) / "config.json"
+    if local.is_file():
+        return local
+    from huggingface_hub import hf_hub_download
+
+    return Path(hf_hub_download(repo_id=model_path, filename="config.json"))
+
+
 def _num_routed_experts(cfg: ProfileConfig) -> int:
     """How many experts the checkpoint routes over, read from the checkpoint.
 
@@ -198,7 +212,7 @@ def _num_routed_experts(cfg: ProfileConfig) -> int:
     not of the other artifact, and one produced without the marginal must still
     be describable.
     """
-    config_path = Path(cfg.server.model_path) / "config.json"
+    config_path = _checkpoint_config(cfg.server.model_path)
     document = json.loads(config_path.read_text())
     text_config = document.get("text_config", document)
     for key in ("num_experts", "n_routed_experts", "num_local_experts"):
