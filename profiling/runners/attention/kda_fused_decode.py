@@ -52,11 +52,15 @@ def _validate_args(
         raise ValueError(
             "SGLang K3 fused KDA requires positive batch, 12 heads, and 128-wide heads"
         )
-    # The fused kernel takes the recurrent state in fp32 (default) or bf16
-    # (--mamba-ssm-dtype bfloat16, the cookbook B200 recipe); the single-layer
-    # driver verified _prepare_fused_decode engages with either.
-    if args.dtype is not DType.BF16 or args.state_dtype not in (DType.FP32, DType.BF16):
-        raise ValueError("SGLang K3 fused KDA requires dtype=bf16 and state_dtype in {fp32, bf16}")
+    # sglang's kda_fused_decode.covered() admits ONLY an fp32 recurrent state
+    # (kernels/ops/attention/kda_fused_decode.py:92); with --mamba-ssm-dtype
+    # bfloat16 (the cookbook B200 recipe) the backend falls back to the unfused
+    # Triton chain (gdn_causal_conv_decode + kda_recurrent_decode + gdn_gated_rms_norm).
+    if args.dtype is not DType.BF16 or args.state_dtype is not DType.FP32:
+        raise ValueError(
+            "SGLang K3 fused KDA requires dtype=bf16 and state_dtype=fp32 "
+            "(bf16 state is not covered by the fused kernel; use the split kinds)"
+        )
     if not math.isfinite(args.lower_bound) or args.lower_bound >= 0.0:
         raise ValueError("KDA lower_bound must be a finite negative value")
     return args
