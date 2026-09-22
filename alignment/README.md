@@ -179,10 +179,12 @@ server:
 Do not copy these numbers by engine name: state the actual sharding and
 expert-count synchronization groups of the deployment being captured.
 
-A `token_corpus` pass may state the same two facts, and then produces the
-marginal as a by-product alongside the corpus. Omitting them is also valid:
-a corpus records logical expert ids, which a deployment routes over whether or
-not it shards experts, so the pass then produces routes alone.
+A `token_corpus` pass on vLLM with `--enable-expert-parallel` and more than one
+rank also takes EPLB's expert-load stream, so it states the same two facts and
+produces the marginal alongside the corpus. Without expert parallelism there is
+no stream and no topology to state: a corpus records logical expert ids, so the
+pass produces routes alone. A model that does not implement EPLB opts out with
+`--no-enable-eplb` in `server.extra_args` and likewise records routes alone.
 
 Set `engine: sglang` to use the instrumented SGLang submodule instead. Its
 default environment path is

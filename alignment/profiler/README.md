@@ -150,9 +150,10 @@ reduced over them is that pass's only product. The profiler never derives either
 value from the engine name. For example, a current SGLang pure-TP run commonly
 states 1 and `tp_size`, respectively; a current vLLM EP run commonly states its
 EP size for both. Those are deployment facts to encode, not defaults in the
-parser. A `token_corpus` profile may state them to get the marginal as a
-by-product; omitting them yields routes alone, since a corpus holds logical
-expert ids and needs no topology to describe them.
+parser. A `token_corpus` profile states them wherever it takes the expert-load
+stream (`ProfileConfig.captures_expert_load`: vLLM, `--enable-expert-parallel`,
+more than one rank, and no `--no-enable-eplb`); elsewhere it records routes
+alone, since a corpus holds logical expert ids and needs no topology.
 
 ```bash
 cd alignment/profiler/sglang/python
