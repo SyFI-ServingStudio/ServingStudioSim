@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from ..core import MatmulGroup, Workload
+from .attn_residual import KimiAttentionResidual
 from .base import AttentionSemantic
 
 
@@ -28,6 +29,7 @@ class MLA:
     v_head_dim: int
     kv_dtype_bytes: float = 2.0
     output_gate: bool = False
+    attn_residual: KimiAttentionResidual | None = None
 
     def matmul_groups(self) -> list[MatmulGroup]:
         groups = [
@@ -81,7 +83,14 @@ class MLA:
                     module="self_attn.g_proj",
                 )
             )
+        if self.attn_residual is not None:
+            groups.extend(self.attn_residual.matmul_groups())
         return groups
+
+    def learned_weight_groups(self):
+        if self.attn_residual is None:
+            return []
+        return self.attn_residual.learned_weight_groups()
 
     @property
     def cache_width(self) -> int:
@@ -101,8 +110,7 @@ class MLA:
     def kv_bytes(self, wl: Workload) -> float:
         per_cached_token = self.cache_width * self.kv_dtype_bytes
         return per_cached_token * sum(
-            interaction.num_cached_key * interaction.multiplicity
-            for interaction in wl.attn
+            interaction.num_cached_key * interaction.multiplicity for interaction in wl.attn
         )
 
     def cache_write_bytes(self, wl: Workload) -> float:
@@ -128,4 +136,6 @@ class MLA:
                     bytes=self.cache_write_bytes(wl),
                 )
             )
+        if self.attn_residual is not None:
+            rows.extend(self.attn_residual.semantic_segments(wl))
         return rows

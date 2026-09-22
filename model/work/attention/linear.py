@@ -23,6 +23,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from ..core import LearnedWeightGroup, MatmulGroup, Workload
+from .attn_residual import KimiAttentionResidual
 from .base import AttentionSemantic
 
 
@@ -162,8 +163,9 @@ class KimiDeltaAttention:
     """Kimi Delta Attention (KDA) used by Kimi-K3.
 
     KDA has the same fixed-size delta-rule state as GatedDeltaNet, but its
-    projection inventory is different: q/k/v, beta, and full-rank forget/output
-    gates are all projected directly from the model hidden width.
+    projection inventory is different: q/k/v and the output gate are full-rank
+    projections from the model hidden width, while the forget gate uses the
+    low-rank ``f_a``/``f_b`` pair from the production implementation.
     """
 
     split_attention_phases = False
@@ -174,6 +176,7 @@ class KimiDeltaAttention:
     conv_kernel: int
     state_dtype_bytes: float
     activation_dtype_bytes: float = 2.0
+    attn_residual: KimiAttentionResidual | None = None
 
     @property
     def projection_dim(self) -> int:
@@ -189,17 +192,14 @@ class KimiDeltaAttention:
 
     @property
     def convolution_state_bytes(self) -> float:
-        return (
-            self.conv_dim
-            * (self.conv_kernel - 1)
-            * self.activation_dtype_bytes
-        )
+        return self.conv_dim * (self.conv_kernel - 1) * self.activation_dtype_bytes
 
     def matmul_groups(self) -> list[MatmulGroup]:
         projection = self.projection_dim
-        return [
+        groups = [
             # One fused runtime projection contains the three independent q/k/v
-            # matrices; its parameter and FLOP totals are their sum.
+            # matrices. The output gate is a fourth slice of the same fused
+            # qkvg matrix and is kept as a separate accounting row below.
             MatmulGroup(
                 "qkv",
                 n=3 * projection,
@@ -215,18 +215,25 @@ class KimiDeltaAttention:
                 module="self_attn.b_proj",
             ),
             MatmulGroup(
-                "forget_gate",
-                n=projection,
+                "f_a",
+                n=self.head_dim,
                 k=self.hidden,
                 bucket="attn_proj",
-                module="self_attn.f_proj",
+                module="self_attn.f_a_proj",
+            ),
+            MatmulGroup(
+                "f_b",
+                n=projection,
+                k=self.head_dim,
+                bucket="attn_proj",
+                module="self_attn.f_b_proj",
             ),
             MatmulGroup(
                 "output_gate",
                 n=projection,
                 k=self.hidden,
                 bucket="attn_proj",
-                module="self_attn.g_proj",
+                module="self_attn.fused_qkvg_proj",
             ),
             MatmulGroup(
                 "conv1d",
@@ -243,16 +250,22 @@ class KimiDeltaAttention:
                 module="self_attn.o_proj",
             ),
         ]
+        if self.attn_residual is not None:
+            groups.extend(self.attn_residual.matmul_groups())
+        return groups
 
     def learned_weight_groups(self) -> list[LearnedWeightGroup]:
         # K3 stores A_log in the head-dimension format (128), while dt_bias is
         # per projected q/k/v channel (96*128). The gated output norm has one
         # learned scale vector per head width, shared across heads.
-        return [
+        groups = [
             LearnedWeightGroup("a_log", self.head_dim, 1, "attn"),
             LearnedWeightGroup("dt_bias", self.projection_dim, 1, "attn"),
             LearnedWeightGroup("gated_norm", self.head_dim, 1, "norm"),
         ]
+        if self.attn_residual is not None:
+            groups.extend(self.attn_residual.learned_weight_groups())
+        return groups
 
     def internal_flops(self, wl: Workload) -> float:
         # The recurrent KDA step performs k^T S, the rank-1 delta update, and
@@ -272,34 +285,21 @@ class KimiDeltaAttention:
         decode_requests = decode.num_attention_steps
         recurrent = self.recurrent_state_bytes
         convolution = self.convolution_state_bytes
-        return [
+        rows = [
             AttentionSemantic("attn.prefill", flops=self.internal_flops(prefill)),
             AttentionSemantic("attn.decode", flops=self.internal_flops(decode)),
-            AttentionSemantic(
-                "recurrent_state.prefill_read", bytes=recurrent * stateful
-            ),
-            AttentionSemantic(
-                "recurrent_state.prefill_write", bytes=recurrent * prefill_requests
-            ),
-            AttentionSemantic(
-                "recurrent_state.decode_read", bytes=recurrent * decode_requests
-            ),
-            AttentionSemantic(
-                "recurrent_state.decode_write", bytes=recurrent * decode_requests
-            ),
-            AttentionSemantic(
-                "conv_state.prefill_read", bytes=convolution * stateful
-            ),
-            AttentionSemantic(
-                "conv_state.prefill_write", bytes=convolution * prefill_requests
-            ),
-            AttentionSemantic(
-                "conv_state.decode_read", bytes=convolution * decode_requests
-            ),
-            AttentionSemantic(
-                "conv_state.decode_write", bytes=convolution * decode_requests
-            ),
+            AttentionSemantic("recurrent_state.prefill_read", bytes=recurrent * stateful),
+            AttentionSemantic("recurrent_state.prefill_write", bytes=recurrent * prefill_requests),
+            AttentionSemantic("recurrent_state.decode_read", bytes=recurrent * decode_requests),
+            AttentionSemantic("recurrent_state.decode_write", bytes=recurrent * decode_requests),
+            AttentionSemantic("conv_state.prefill_read", bytes=convolution * stateful),
+            AttentionSemantic("conv_state.prefill_write", bytes=convolution * prefill_requests),
+            AttentionSemantic("conv_state.decode_read", bytes=convolution * decode_requests),
+            AttentionSemantic("conv_state.decode_write", bytes=convolution * decode_requests),
         ]
+        if self.attn_residual is not None:
+            rows.extend(self.attn_residual.semantic_segments(wl))
+        return rows
 
     def kv_bytes(self, wl: Workload) -> float:
         return sum(row.bytes for row in self.semantic_segments(wl))
