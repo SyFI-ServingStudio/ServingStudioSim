@@ -21,12 +21,15 @@ git submodule update --init alignment/profiler/vllm alignment/profiler/sglang
 The vLLM fork adds `vllm_iteration(N): <phase>` NVTX scopes and a versioned
 `VibeSimAlignmentIteration {json}` model-input record. It also emits one
 `VibeSimAlignmentRequestTiming {json}` record when each request completes. The
-MoE popularity pass additionally emits `VibeSimAlignmentExpertLoad {json}` only
-when EPLB balancedness logging is explicitly enabled. Each record contains the
-EP-reduced per-layer token counts mapped back to logical expert ids; the launcher
-aggregates these into `expert_popularity.json`. This pass runs without NSYS and
-must be separate from the timing pass because the reduction and D2H conversion
-are deliberate measurement overhead. Each request-timing record contains both
+MoE routing passes additionally emit `VibeSimAlignmentExpertLoad {json}` only
+when EPLB balancedness logging is explicitly enabled — which the runner enables
+for them, so no operator flag is required. Each record contains the EP-reduced
+per-layer token counts mapped back to logical expert ids; the launcher
+aggregates these into `expert_popularity.json`. A `token_corpus` pass also
+returns the experts each token routed to on the response itself, which the load
+generator persists per request. These passes run without NSYS and must be
+separate from the timing pass because the reduction and D2H conversion are
+deliberate measurement overhead. Each request-timing record contains both
 first-token and decode-span timing.
 
 Raw expert-load schema v3 adds model role, maximum forwards per engine step and
@@ -139,13 +142,17 @@ pipeline. Build its environment under the submodule's `python/` directory,
 which is the default path selected when `engine: sglang` and no `fork_python`
 override is supplied:
 
-Expert-popularity topology is a YAML-only contract for every engine. A profile
-must state both `server.expert_parallel_size` (the expert-sharding degree) and
-`server.expert_count_reduction_group_size` (the rank population already summed
-into one expert-count record). The profiler never derives either value from the
-engine name. For example, a current SGLang pure-TP run commonly states 1 and
-`tp_size`, respectively; a current vLLM EP run commonly states its EP size for
-both. Those are deployment facts to encode, not defaults in the parser.
+Expert-popularity topology is a YAML-only contract for every engine. An
+`expert_popularity` profile must state both `server.expert_parallel_size` (the
+expert-sharding degree) and `server.expert_count_reduction_group_size` (the rank
+population already summed into one expert-count record), because the marginal
+reduced over them is that pass's only product. The profiler never derives either
+value from the engine name. For example, a current SGLang pure-TP run commonly
+states 1 and `tp_size`, respectively; a current vLLM EP run commonly states its
+EP size for both. Those are deployment facts to encode, not defaults in the
+parser. A `token_corpus` profile may state them to get the marginal as a
+by-product; omitting them yields routes alone, since a corpus holds logical
+expert ids and needs no topology to describe them.
 
 ```bash
 cd alignment/profiler/sglang/python
@@ -319,10 +326,12 @@ EngineCore-output wait plus output fan-out. The extractor compares durations
 within their originating clock domains and never subtracts EngineCore and API
 absolute timestamps across processes.
 
-The separate `expert_popularity` pass disables the selected engine's timing
-instrumentation, so it neither emits nor requires this request-timing artifact.
-Its only model-side ground truth is the expert-load record stream described
-above; timing evidence always comes from the NSYS pass.
+The separate `token_corpus` and `expert_popularity` passes disable the selected
+engine's timing instrumentation, so they neither emit nor require this
+request-timing artifact. Their model-side ground truth is the expert-load record
+stream described above — one rank-synchronized record per forward, which is what
+a sampled corpus fold is scored against — plus, for `token_corpus`, the returned
+per-token routes; timing evidence always comes from the NSYS pass.
 The resulting summary follows
 [`alignment/schema/expert_popularity_v3.schema.json`](../schema/expert_popularity_v3.schema.json):
 `counts_by_layer[layer][logical_expert]` is authoritative, while EP degree,

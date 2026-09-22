@@ -60,11 +60,13 @@ needs the arch you have not written yet.)
 - **How.** Route to `operate-run-alignment` and run **only its profile phase**,
   `profile_kind: nsys`. Stop there: the label and analyze phases compare against
   a CostTree you do not have yet. They run in Phase 5, on this same capture.
-- **MoE models get a second pass**, `profile_kind: expert_popularity`. Routing
-  skew redistributes tokens into fuller and emptier expert groups, which changes
-  the grouped-GEMM cost, and the arch you are about to write needs an
-  `expert_popularity_file` field to consume the measurement. Discovering that
-  after L4 is a rewrite, not an addition.
+- **MoE models get a second pass**, `profile_kind: token_corpus`. Routing skew
+  redistributes tokens into fuller and emptier expert groups, which changes the
+  grouped-GEMM cost, and the arch you are about to write needs a
+  `token_corpus_file` field to consume the measurement. Discovering that after L4
+  is a rewrite, not an addition. (`expert_popularity` reduces the same run to a
+  per-layer marginal and is deprecated: it is only correct where the batch is
+  independent, i.e. no speculative decoding.)
 - **What it gives you.** The folded measured kernel sequence per engine phase —
   real launch granularity, plus each kernel's share of iteration time. That share
   is the priority order for the entire build. And Phase 5 reuses the same capture,

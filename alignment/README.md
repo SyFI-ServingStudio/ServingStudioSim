@@ -179,6 +179,11 @@ server:
 Do not copy these numbers by engine name: state the actual sharding and
 expert-count synchronization groups of the deployment being captured.
 
+A `token_corpus` pass may state the same two facts, and then produces the
+marginal as a by-product alongside the corpus. Omitting them is also valid:
+a corpus records logical expert ids, which a deployment routes over whether or
+not it shards experts, so the pass then produces routes alone.
+
 Set `engine: sglang` to use the instrumented SGLang submodule instead. Its
 default environment path is
 `alignment/profiler/sglang/python/.venv-sglang/bin/python`, so
@@ -219,16 +224,24 @@ supplies neither leaves continuation to re-encoded output text, which is not
 guaranteed to reproduce the ids the server cached — prefer `vllm_tokens` when a
 prefix-cache number matters.
 
-For MoE alignment, profiling may use three explicit passes with identical model,
+For MoE alignment, profiling may use four explicit passes with identical model,
 topology, backend, and workload settings:
 
-- `profile_kind: expert_popularity` runs the selected engine without NSYS and
-  writes `expert_popularity.json` containing aggregated logical expert
-  counts/probabilities by layer. Its synchronization and D2H logging overhead
-  is intentionally excluded from timing evidence. Every such YAML must state
+- `profile_kind: token_corpus` runs the selected engine without NSYS and writes
+  the experts every accepted token routed to, layer by layer, as
+  `token_corpus/{manifest,routes.u16,provenance}.json` — the artifact the
+  simulator's `routing: corpus` samples. It is the preferred MoE demand source:
+  a marginal can only be resampled independently and a verify block is not
+  independent. The runner appends the server flags the pass cannot work without,
+  so no operator flag is required.
+- `profile_kind: expert_popularity` runs the same way and reduces the run to
+  `expert_popularity.json`, aggregated logical expert counts/probabilities by
+  layer. It is DEPRECATED in favour of `token_corpus`, which also writes this
+  file when the topology is declared. Every such YAML must state
   `server.expert_parallel_size` and
   `server.expert_count_reduction_group_size`; neither value is inferred from
-  `engine`, `tp_size`, or `dp_size`.
+  `engine`, `tp_size`, or `dp_size`. Both passes exclude their synchronization
+  and D2H logging overhead from timing evidence.
 - `profile_kind: nsys` (default) is the ordinary timing/segment capture consumed
   by timing-predict and alignment analysis. It must disable popularity logging.
 - `profile_kind: workload_metrics` runs the instrumented vLLM server without
@@ -249,10 +262,12 @@ per-request TTFT/TPOT in `vllm/<name>_request_timings.jsonl`, and
 `profile_result.json` beneath `profile/`. `profile_result.replay_result`
 identifies the req-frontend per-request JSONL used later for client-observed E2E
 comparison, while `profile_result.request_timings_jsonl` identifies the vLLM
-engine-core timing records. The expert-popularity pass writes its replay/server
-logs, raw expert-load JSONL, aggregated `expert_popularity.json`, and its own
-`profile_result.json`; it deliberately emits no request-timing artifact because
-the shared profiling instrumentation is disabled for that pass. Neither pass
+engine-core timing records. The routing passes write their replay/server logs
+and their own `profile_result.json`; `token_corpus` adds `routed_experts/` (one
+`.npy` per replayed request) and the packed `token_corpus/`, and both add the
+raw expert-load JSONL and aggregated `expert_popularity.json` whenever the
+expert topology is declared. They deliberately emit no request-timing artifact
+because the shared profiling instrumentation is disabled for them. No pass here
 has timing-predict or analysis fields.
 
 ### Expert-popularity artifact contract

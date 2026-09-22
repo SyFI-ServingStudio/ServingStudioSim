@@ -95,7 +95,7 @@ If the user did not give a name, ask for one before proceeding.
 ## MoE routing source
 
 Before running any MoE model, read and apply
-[the shared popularity-file selection rule](references/moe-routing.md).
+[the shared routing-source selection rule](references/moe-routing.md).
 
 ## Sweeps
 
@@ -273,7 +273,7 @@ After setup and launch, report:
 - copied preset path
 - the `--dry-run` plan summary (run count)
 - exact launcher command used
-- MoE routing source: selected popularity file(s), or the reason for uniform fallback
+- MoE routing source: the selected corpus or popularity file, or the reason for uniform fallback
 - analysis selection (`all applicable` by default, or the user-requested subset)
 - any analyzer subjects that failed best-effort post-run analysis
 
