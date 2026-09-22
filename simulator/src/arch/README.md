@@ -174,3 +174,8 @@ already summed the layer axis away and was captured over the body's layers, so
 the MTP layer folds that profile's layer-summed distribution -- the same
 evidence at the only resolution a marginal has. One file either way; there is no
 separate draft profile.
+
+A corpus records the body's routed layers, plus one MTP slot when the capture
+ran a drafter. A build that prices an MTP layer needs that slot; a build that
+does not may still read a drafted capture, which is how the same traffic is
+priced without speculation.

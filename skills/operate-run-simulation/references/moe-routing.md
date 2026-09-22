@@ -17,7 +17,8 @@ MoE arch that costs routed experts, including TP-only models.
 3. Match the checkpoint and workload where recorded, and verify expert count,
    MoE layer count, top-k, and EP size against the selected arch. For a corpus
    also check that its `group_size` equals the deployment's verify width
-   (`draft_tokens + 1`). Prefer the same workload/campaign when several files
+   (`draft_tokens + 1`), and that it records one MTP slot past the body when
+   the arch prices an MTP layer. Prefer the same workload/campaign when several files
    match; record any workload difference. Do not alter metadata to make an
    incompatible file pass.
 4. Set `routing: corpus` with `token_corpus_file`, or `routing: popularity` with
