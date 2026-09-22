@@ -18,7 +18,6 @@ from typing import Any
 from alignment.load_generator.config import LoadGeneratorConfig
 from alignment.profiler.config import (
     PROFILE_KINDS,
-    ROUTING_PROFILE_KINDS,
     IdleWaitConfig,
     NsysConfig,
     ProfileConfig,
@@ -214,7 +213,11 @@ def load_profile_config(path: Path, *, require_python_runtime: bool = True) -> P
         "expert_parallel_size": config.server.expert_parallel_size,
         "expert_count_reduction_group_size": (config.server.expert_count_reduction_group_size),
     }
-    if config.profile_kind in ROUTING_PROFILE_KINDS and any(
+    # Only the pass whose product is the marginal needs the topology that
+    # marginal is reduced over. A token_corpus pass records logical expert ids
+    # and may declare it to get the marginal as a by-product, but must not be
+    # blocked for lacking it. Either way, a declared value is still checked.
+    if config.profile_kind == "expert_popularity" and any(
         value is None for value in expert_topology.values()
     ):
         raise ValueError(

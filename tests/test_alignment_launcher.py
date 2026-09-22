@@ -484,27 +484,33 @@ def test_non_popularity_profile_does_not_require_expert_topology(tmp_path):
 
 
 @pytest.mark.parametrize("engine", ["vllm", "sglang"])
-@pytest.mark.parametrize("profile_kind", ["expert_popularity", "token_corpus"])
-def test_a_routing_pass_requires_explicit_engine_neutral_topology(tmp_path, engine, profile_kind):
+def test_a_popularity_pass_requires_explicit_engine_neutral_topology(tmp_path, engine):
     paths = _phase_configs(tmp_path)
     raw = yaml.safe_load(paths["profile"].read_text())
     raw["engine"] = engine
     if engine == "sglang":
         raw["python_runtime"] = _python_runtime_document()
-    raw["profile_kind"] = profile_kind
+    raw["profile_kind"] = "expert_popularity"
     raw["cuda_visible_devices"] = "0,1,2,3"
     raw["server"]["tp_size"] = 2
     raw["server"]["dp_size"] = 2
     paths["profile"].write_text(yaml.safe_dump(raw))
 
-    with pytest.raises(ValueError, match=f"{profile_kind} requires explicit"):
+    with pytest.raises(ValueError, match="expert_popularity requires explicit"):
         load_profile_config(paths["profile"])
 
     raw["server"]["expert_parallel_size"] = 1
     paths["profile"].write_text(yaml.safe_dump(raw))
-    with pytest.raises(ValueError, match=f"{profile_kind} requires explicit"):
+    with pytest.raises(ValueError, match="expert_popularity requires explicit"):
         load_profile_config(paths["profile"])
 
+    # The same config is a valid corpus capture: the topology is what a
+    # marginal is reduced over, and a corpus records logical ids instead.
+    raw["profile_kind"] = "token_corpus"
+    paths["profile"].write_text(yaml.safe_dump(raw))
+    assert load_profile_config(paths["profile"]).server.expert_count_reduction_group_size is None
+
+    raw["profile_kind"] = "expert_popularity"
     raw["server"]["expert_count_reduction_group_size"] = 2
     paths["profile"].write_text(yaml.safe_dump(raw))
     server = load_profile_config(paths["profile"]).server
@@ -1386,25 +1392,77 @@ def test_sglang_duplicate_expert_record_from_one_dp_owner_is_rejected(tmp_path):
         )
 
 
-def test_runner_passes_yaml_expert_popularity_group_sizes_for_every_engine(tmp_path):
+def _routing_profile(tmp_path: Path, profile_kind: str, **server) -> ProfileConfig:
+    tmp_path.mkdir(parents=True, exist_ok=True)
     paths = _phase_configs(tmp_path)
     raw = yaml.safe_load(paths["profile"].read_text())
-    raw["profile_kind"] = "expert_popularity"
+    raw["profile_kind"] = profile_kind
     raw["cuda_visible_devices"] = "0,1,2,3,4,5,6,7"
     raw["server"]["tp_size"] = 4
     raw["server"]["dp_size"] = 2
-    raw["server"]["expert_parallel_size"] = 2
-    raw["server"]["expert_count_reduction_group_size"] = 4
+    raw["server"].update(server)
     paths["profile"].write_text(yaml.safe_dump(raw))
+    return load_profile_config(paths["profile"])
 
-    vllm_config = load_profile_config(paths["profile"])
-    assert alignment_runner._expert_popularity_group_sizes(vllm_config) == (2, 4)
 
-    raw["engine"] = "sglang"
-    raw["python_runtime"] = _python_runtime_document()
-    paths["profile"].write_text(yaml.safe_dump(raw))
-    sglang_config = load_profile_config(paths["profile"])
-    assert alignment_runner._expert_popularity_group_sizes(sglang_config) == (2, 4)
+def test_the_yaml_expert_topology_reaches_the_expert_load_extractor(tmp_path, monkeypatch):
+    seen: dict = {}
+
+    def record(*_args, **kwargs):
+        seen.update(kwargs)
+        return 7
+
+    monkeypatch.setattr(alignment_runner.record_extraction, "extract_expert_popularity", record)
+    cfg = _routing_profile(
+        tmp_path,
+        "expert_popularity",
+        expert_parallel_size=2,
+        expert_count_reduction_group_size=4,
+    )
+
+    artifacts = alignment_runner._extract_expert_load(
+        cfg,
+        tmp_path / "server.log",
+        tmp_path,
+        tmp_path,
+        engine_records.VLLM_RECORDS,
+        speculative=False,
+        window={},
+    )
+
+    assert (seen["expert_parallel_size"], seen["reduction_group_size"]) == (2, 4)
+    assert artifacts["expert_record_count"] == 7
+
+
+def test_only_the_popularity_pass_requires_an_expert_topology(tmp_path):
+    """The marginal is that pass's product; for a corpus pass it is a by-product.
+
+    A corpus records logical expert ids, which a deployment with no declared
+    expert topology still routes over, so its absence must not fail the capture.
+    """
+    with pytest.raises(ValueError, match="expert_parallel_size"):
+        alignment_runner._extract_expert_load(
+            _routing_profile(tmp_path / "a", "expert_popularity"),
+            tmp_path / "server.log",
+            tmp_path,
+            tmp_path,
+            engine_records.VLLM_RECORDS,
+            speculative=False,
+            window={},
+        )
+
+    assert (
+        alignment_runner._extract_expert_load(
+            _routing_profile(tmp_path / "b", "token_corpus"),
+            tmp_path / "server.log",
+            tmp_path,
+            tmp_path,
+            engine_records.VLLM_RECORDS,
+            speculative=False,
+            window={},
+        )
+        == {}
+    )
 
 
 @pytest.mark.parametrize("reduction_group_size", [0, -1, True, 1.5])

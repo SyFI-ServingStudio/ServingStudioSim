@@ -108,16 +108,84 @@ def _resolve_fork_python(cfg: ProfileConfig) -> str:
     return str(fork)
 
 
-def _expert_popularity_group_sizes(cfg: ProfileConfig) -> tuple[int, int]:
-    """Read both independent expert-popularity populations from the config."""
+def _extract_expert_load(
+    cfg: ProfileConfig,
+    measurement_log: Path,
+    engine_dir: Path,
+    log_dir: Path,
+    records,
+    *,
+    speculative: bool,
+    window: dict,
+) -> dict:
+    """EPLB's per-step expert-load stream, and the marginal aggregated from it.
+
+    Returns the artifacts it wrote, empty when the deployment declared no
+    expert topology to reduce over. That is fatal for the pass whose product
+    the marginal is, and merely uninteresting for a corpus pass: a corpus
+    records the routes themselves, in logical expert ids, and needs neither the
+    topology nor the marginal to describe them.
+    """
+    required = cfg.profile_kind == "expert_popularity"
     expert_parallel_size = cfg.server.expert_parallel_size
     reduction_group_size = cfg.server.expert_count_reduction_group_size
     if expert_parallel_size is None or reduction_group_size is None:
-        raise ValueError(
-            f"{cfg.profile_kind} requires explicit server.expert_parallel_size and "
-            "server.expert_count_reduction_group_size"
+        if required:
+            raise ValueError(
+                f"{cfg.profile_kind} requires explicit server.expert_parallel_size and "
+                "server.expert_count_reduction_group_size"
+            )
+        return {}
+
+    shared = {
+        "expert_parallel_size": expert_parallel_size,
+        "reduction_group_size": reduction_group_size,
+        "max_tokens_per_step": max(
+            cfg.server.chunk_size,
+            cfg.server.max_cudagraph_capture_size or 0,
+        ),
+        "dp_size": cfg.server.dp_size,
+        "records": records,
+        **window,
+    }
+    expert_load_jsonl = engine_dir / f"{cfg.name}_expert_load.jsonl"
+    expert_popularity_json = log_dir / "expert_popularity.json"
+    record_count = record_extraction.extract_expert_popularity(
+        measurement_log,
+        expert_load_jsonl,
+        expert_popularity_json,
+        model_role="target" if speculative else None,
+        required=required,
+        **shared,
+    )
+    if record_count is None:
+        # The extractor opens its output before it can know the server logged
+        # anything; an empty stream is litter, not an artifact.
+        expert_load_jsonl.unlink(missing_ok=True)
+        return {}
+
+    artifacts = {
+        "expert_load_jsonl": str(expert_load_jsonl),
+        "expert_popularity_json": str(expert_popularity_json),
+        "expert_record_count": record_count,
+    }
+    if speculative:
+        # The drafter routes over its own experts and is logged under its own
+        # role, so it is a second population of the same stream, not a slice.
+        draft_load_jsonl = engine_dir / f"{cfg.name}_draft_expert_load.jsonl"
+        draft_popularity_json = log_dir / "draft_expert_popularity.json"
+        artifacts.update(
+            draft_expert_load_jsonl=str(draft_load_jsonl),
+            draft_expert_popularity_json=str(draft_popularity_json),
+            draft_expert_record_count=record_extraction.extract_expert_popularity(
+                measurement_log,
+                draft_load_jsonl,
+                draft_popularity_json,
+                model_role="draft",
+                **shared,
+            ),
         )
-    return expert_parallel_size, reduction_group_size
+    return artifacts
 
 
 def _num_routed_experts(cfg: ProfileConfig) -> int:
@@ -145,18 +213,37 @@ def _num_routed_experts(cfg: ProfileConfig) -> int:
 # What a pass needs the engine to do, beyond what the profile config asks for.
 # A capture pass should be one command: the operator names the kind, and the
 # flags that kind cannot work without are this module's business, not theirs.
-_PROFILE_KIND_SERVER_ARGS = {"token_corpus": ("--enable-return-routed-experts",)}
+_PROFILE_KIND_SERVER_ARGS = {"token_corpus": (("--enable-return-routed-experts", None),)}
+
+# EPLB's balancedness log is the only per-step view of what the engine actually
+# ran: one rank-synchronized expert-load record per forward. A corpus says what
+# a *token* routes to; that stream says what a *step* routed to, which is what
+# a sampled fold has to be scored against. Both routing passes ask for it, so
+# one capture yields the corpus, the referee, and the marginal. It is vLLM's
+# only expert-load source and it requires expert parallelism, so it is asked
+# for only when the deployment already has it.
+_EXPERT_LOAD_SERVER_ARGS = (
+    ("--enable-eplb", None),
+    ("--eplb-config", '{"log_balancedness": true}'),
+)
 
 
 def _append_backend_server_args(server_argv: list[str], cfg: ProfileConfig) -> None:
     """Add backend- and pass-required server flags exactly once to the launch argv."""
-    required = (
-        *cfg.workload.backend.required_server_args,
-        *_PROFILE_KIND_SERVER_ARGS.get(cfg.profile_kind, ()),
-    )
-    for argument in required:
+    for argument in cfg.workload.backend.required_server_args:
         if argument not in server_argv:
             server_argv.append(argument)
+    if cfg.profile_kind not in ROUTING_PROFILE_KINDS:
+        return
+    options = list(_PROFILE_KIND_SERVER_ARGS.get(cfg.profile_kind, ()))
+    if "--enable-expert-parallel" in server_argv:
+        options += _EXPERT_LOAD_SERVER_ARGS
+    for flag, value in options:
+        if flag in server_argv:
+            continue
+        server_argv.append(flag)
+        if value is not None:
+            server_argv.append(value)
 
 
 def _preflight_capture_environment(
@@ -510,52 +597,20 @@ def _finalize_profile(
         # These passes deliberately disable the engine's timing instrumentation.
         # Request timing belongs to the clean NSYS pass; requiring it here
         # would reject an otherwise valid popularity capture.
-        expert_load_jsonl = engine_dir / f"{cfg.name}_expert_load.jsonl"
-        expert_popularity_json = log_dir / "expert_popularity.json"
-        expert_parallel_size, reduction_group_size = _expert_popularity_group_sizes(cfg)
-        window = {}
-        if speculative:
-            window = {
+        expert_load_artifacts = _extract_expert_load(
+            cfg,
+            measurement_log,
+            engine_dir,
+            log_dir,
+            records,
+            speculative=speculative,
+            window={
                 "replay_start_monotonic_ns": drive_summary.get("replay_start_monotonic_ns"),
                 "replay_end_monotonic_ns": drive_summary.get("replay_end_monotonic_ns"),
             }
-        expert_record_count = record_extraction.extract_expert_popularity(
-            measurement_log,
-            expert_load_jsonl,
-            expert_popularity_json,
-            expert_parallel_size=expert_parallel_size,
-            reduction_group_size=reduction_group_size,
-            max_tokens_per_step=max(
-                cfg.server.chunk_size,
-                cfg.server.max_cudagraph_capture_size or 0,
-            ),
-            dp_size=cfg.server.dp_size,
-            records=records,
-            model_role="target" if speculative else None,
-            **window,
+            if speculative
+            else {},
         )
-        if speculative:
-            draft_load_path = engine_dir / f"{cfg.name}_draft_expert_load.jsonl"
-            draft_popularity_path = log_dir / "draft_expert_popularity.json"
-            draft_count = record_extraction.extract_expert_popularity(
-                measurement_log,
-                draft_load_path,
-                draft_popularity_path,
-                expert_parallel_size=expert_parallel_size,
-                reduction_group_size=reduction_group_size,
-                max_tokens_per_step=max(
-                    cfg.server.chunk_size, cfg.server.max_cudagraph_capture_size or 0
-                ),
-                dp_size=cfg.server.dp_size,
-                records=records,
-                model_role="draft",
-                **window,
-            )
-            spec_artifacts.update(
-                draft_expert_load_jsonl=str(draft_load_path),
-                draft_expert_popularity_json=str(draft_popularity_path),
-                draft_expert_record_count=draft_count,
-            )
         corpus_artifacts = {}
         if cfg.profile_kind == "token_corpus":
             # Packed from the routes the replay persisted, and range-checked
@@ -573,13 +628,11 @@ def _finalize_profile(
         result = {
             **spec_artifacts,
             **corpus_artifacts,
+            **expert_load_artifacts,
             "profile_kind": cfg.profile_kind,
             "engine": cfg.engine,
             "log_dir": str(log_dir),
             "metrics_jsonl": str(metrics_jsonl),
-            "expert_load_jsonl": str(expert_load_jsonl),
-            "expert_popularity_json": str(expert_popularity_json),
-            "expert_record_count": expert_record_count,
             "server_log": str(server_log),
             "gpu": cfg.gpu,
             "server_tp_size": cfg.server.tp_size,
@@ -589,13 +642,15 @@ def _finalize_profile(
             "drive_summary": drive_summary,
         }
         (log_dir / "profile_result.json").write_text(json.dumps(result, indent=2))
-        corpus_note = (
-            f" corpus_tokens={corpus_artifacts['token_corpus_tokens']}" if corpus_artifacts else ""
+        produced = []
+        if corpus_artifacts:
+            produced.append(f"corpus_tokens={corpus_artifacts['token_corpus_tokens']}")
+        produced.append(
+            f"expert_load_records={expert_load_artifacts['expert_record_count']}"
+            if expert_load_artifacts
+            else "expert_load=absent"
         )
-        print(
-            f"[profile] {cfg.profile_kind}: records={expert_record_count} "
-            f"artifact={expert_popularity_json.name}{corpus_note}"
-        )
+        print(f"[profile] {cfg.profile_kind}: {' '.join(produced)}")
         return result
 
     request_timings_jsonl = engine_dir / f"{cfg.name}_request_timings.jsonl"

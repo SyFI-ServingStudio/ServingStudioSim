@@ -63,12 +63,12 @@ class ServerConfig:
     # visible-device and normalized-profile population contracts.
     dp_size: int = 1
     # Number of ranks across which the expert axis is sharded. Every
-    # expert-popularity profile must state this in YAML; other profile kinds do
-    # not consume it.
+    # expert-popularity profile must state this in YAML. A token_corpus profile
+    # may state it to get the marginal as well, and omitting it only means the
+    # pass produces routes alone; other profile kinds do not consume it.
     expert_parallel_size: int | None = None
     # Number of ranks already represented by each synchronized expert-count
-    # record. This is independent of expert sharding and must also be stated in
-    # every expert-popularity YAML.
+    # record. This is independent of expert sharding and follows the same rule.
     expert_count_reduction_group_size: int | None = None
     served_model_name: str | None = None
     startup_timeout: float = 900.0

@@ -644,12 +644,17 @@ def extract_expert_popularity(
     replay_end_monotonic_ns: int | None = None,
     dp_size: int = 1,
     records: EngineRecords = VLLM_RECORDS,
-) -> int:
+    required: bool = True,
+) -> int | None:
     """Extract and aggregate rank-synchronized logical-expert token counts.
 
     The vLLM fork emits one record per model step only when EPLB balancedness
     logging is explicitly enabled. Counts are already reduced and mapped from
     physical replicas back to logical expert ids.
+
+    `required=False` returns `None` instead of raising when the server ran
+    without that logging. A pass whose product is something else -- a token
+    corpus -- should not fail because this by-product is absent.
 
     ``reduction_group_size`` is the number of ranks represented by those
     already-summed counts. It is independent of ``expert_parallel_size`` and
@@ -702,13 +707,13 @@ def extract_expert_popularity(
             if not records.owns_scheduler_record(line):
                 continue
             record = json.loads(match.group(1))
-            required = {
+            required_keys = {
                 "schema_version",
                 "model",
                 "eplb_step",
                 "logical_expert_counts",
             }
-            missing = required - set(record)
+            missing = required_keys - set(record)
             if missing:
                 raise ValueError(f"alignment expert-load record missing {sorted(missing)}")
             if record["schema_version"] not in {1, 2, 3}:
@@ -846,8 +851,12 @@ def extract_expert_popularity(
             accepted_records.append(record)
 
     if not raw_records or expected_shape is None or aggregate_counts is None:
+        if not required:
+            return None
         raise ValueError("no VibeSimAlignmentExpertLoad records found in server log")
     if not accepted_records:
+        if not required:
+            return None
         raise ValueError("no expert-load records remain within the configured token ceiling")
     assert expected_model is not None and experts_per_token is not None
 
