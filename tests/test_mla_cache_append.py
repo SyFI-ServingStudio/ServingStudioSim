@@ -149,6 +149,34 @@ def test_vllm_cuda_supports_bf16_and_fp8_cache_on_h200_and_b200():
     )
 
 
+def test_sglang_cuda_supports_plain_and_page_planar_fp8_on_b200():
+    spec = find_kernel_profiler_spec(KIND, _SGLANG_BACKEND)
+    support = spec.supports
+
+    assert spec.subprocess_env == "sglang_env"
+    assert spec.runner_ref.function_name == "profile_mla_cache_append_sglang_cuda"
+    assert support.allows(
+        DType.FP8_E4M3,
+        kv_dtype=DType.FP8_E4M3,
+        gpu="NVIDIA B200",
+    )
+    assert support.allows(
+        DType.BF16,
+        kv_dtype=DType.FP8_E4M3,
+        gpu="NVIDIA B200",
+    )
+    assert not support.allows(
+        DType.BF16,
+        kv_dtype=DType.BF16,
+        gpu="NVIDIA B200",
+    )
+    assert not support.allows(
+        DType.BF16,
+        kv_dtype=DType.FP8_E4M3,
+        gpu="NVIDIA H200",
+    )
+
+
 def test_registry_barrel_import_is_lazy():
     completed = subprocess.run(
         [
@@ -306,6 +334,50 @@ def test_vllm_validation_accepts_fp8_cache():
         allow_fp8_cache=True,
     )
     assert validated[4:6] == (DType.BF16, DType.FP8_E4M3)
+
+
+def test_sglang_validation_accepts_kimi_k3_page_planar_fp8():
+    from profiling.runners.attention.mla_cache_append import _validate_args
+
+    validated = _validate_args(
+        128,
+        512,
+        64,
+        64,
+        DType.BF16,
+        DType.FP8_E4M3,
+        "page_planar_fp8",
+        allow_fp8_cache=True,
+        allow_fp8_input=True,
+        allowed_cache_formats=("plain", "page_planar_fp8"),
+        backend_name="sglang_cuda",
+    )
+    assert validated == (
+        128,
+        512,
+        64,
+        64,
+        DType.BF16,
+        DType.FP8_E4M3,
+        "page_planar_fp8",
+    )
+
+
+def test_sglang_page_planar_fp8_rejects_non_k3_dtypes_before_import():
+    from profiling.runners.attention.mla_cache_append import (
+        profile_mla_cache_append_sglang_cuda,
+    )
+
+    with pytest.raises(ValueError, match="page_planar_fp8 requires BF16 input"):
+        profile_mla_cache_append_sglang_cuda(
+            num_tokens=1,
+            kv_lora_rank=512,
+            rope_dim=64,
+            block_size=64,
+            input_dtype=DType.FP8_E4M3,
+            kv_dtype=DType.FP8_E4M3,
+            cache_format="page_planar_fp8",
+        )
 
 
 @pytest.mark.parametrize("cache_format", ["fp8_ds_mla", "Plain", ""])
@@ -513,6 +585,36 @@ def test_operand_constructor_uses_spare_block_for_long_prefill():
     assert torch.unique(operands.slot_mapping).numel() == 16384
 
 
+def test_sglang_page_planar_fp8_operands_match_pool_layout():
+    from profiling.runners.attention.mla_cache_append import (
+        _build_sglang_page_planar_fp8_operands,
+    )
+
+    operands = _build_sglang_page_planar_fp8_operands(
+        torch,
+        num_tokens=5,
+        kv_lora_rank=512,
+        rope_dim=64,
+        block_size=64,
+        torch_dtype=torch.bfloat16,
+        device="cpu",
+    )
+
+    assert operands.kv_buffer.shape == (256 * 64 + 64, 1, 576)
+    assert operands.kv_buffer.dtype is torch.float8_e4m3fn
+    assert operands.kv_buffer_2d.shape == (256 * 64 + 64, 576)
+    assert operands.cache_k_nope.shape == (5, 512)
+    assert operands.cache_k_rope.shape == (5, 64)
+    assert operands.q_nope.shape == (5, 12, 512)
+    assert operands.q_rope.shape == (5, 12, 64)
+    assert operands.cache_k_nope.dtype is torch.bfloat16
+    assert operands.q_nope.dtype is torch.bfloat16
+    assert operands.locations.dtype is torch.int64
+    assert operands.locations.is_contiguous()
+    assert torch.unique(operands.locations).numel() == 5
+    assert int(operands.locations.max()) < 256 * 64
+
+
 def test_write_helper_matches_reference_and_mutates_only_cache():
     from profiling.runners.attention.mla_cache_append import (
         _build_operands,
@@ -584,6 +686,100 @@ def test_logical_traffic_is_2312_bytes_per_glm_token():
         )
         == 3 * 2312
     )
+
+
+def test_page_planar_fp8_traffic_is_1728_bytes_per_kimi_k3_token():
+    from profiling.runners.attention.mla_cache_append import (
+        _page_planar_fp8_logical_bytes,
+    )
+
+    assert _page_planar_fp8_logical_bytes(
+        num_tokens=3,
+        kv_lora_rank=512,
+        rope_dim=64,
+        input_dtype=DType.BF16,
+        kv_dtype=DType.FP8_E4M3,
+    ) == 3 * (576 * 2 + 576)
+
+
+def test_sglang_page_planar_fp8_wraps_the_production_call(monkeypatch):
+    from profiling.runners.attention import mla_cache_append as runner
+
+    captured = {}
+    operands = SimpleNamespace(
+        kv_buffer_2d=object(),
+        locations=object(),
+        cache_k_nope=object(),
+        cache_k_rope=object(),
+        q_nope=object(),
+        q_rope=object(),
+    )
+
+    def build_operands(_torch, **kwargs):
+        captured["build_kwargs"] = kwargs
+        return operands
+
+    def set_mla_kv_concat_q_fp8(**kwargs):
+        captured["kernel_args"] = kwargs
+
+    package_names = [
+        "sglang",
+        "sglang.kernels",
+        "sglang.kernels.ops",
+        "sglang.kernels.ops.attention",
+    ]
+    for package_name in package_names:
+        package = ModuleType(package_name)
+        package.__path__ = []
+        monkeypatch.setitem(sys.modules, package_name, package)
+    wrapper = ModuleType("sglang.kernels.ops.attention.set_mla_kv_concat_q")
+    wrapper.set_mla_kv_concat_q_fp8 = set_mla_kv_concat_q_fp8
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.kernels.ops.attention.set_mla_kv_concat_q",
+        wrapper,
+    )
+
+    monkeypatch.setattr(runner, "_validate_sglang_cuda_device", lambda _torch: None)
+    monkeypatch.setattr(runner, "_build_sglang_page_planar_fp8_operands", build_operands)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+
+    def fake_timer(kernel, **kwargs):
+        captured["timer_kwargs"] = kwargs
+        kernel()
+        return 1.0
+
+    monkeypatch.setattr(runner.Timer, "cupti", fake_timer)
+    monkeypatch.setattr(runner.Energy, "perf", lambda *_args, **_kwargs: 0.0)
+
+    metrics = runner.profile_mla_cache_append_sglang_cuda(
+        num_tokens=128,
+        kv_lora_rank=512,
+        rope_dim=64,
+        block_size=64,
+        input_dtype=DType.BF16,
+        kv_dtype=DType.FP8_E4M3,
+        cache_format="page_planar_fp8",
+    )
+
+    assert captured["kernel_args"] == {
+        "kv_buffer": operands.kv_buffer_2d,
+        "loc": operands.locations,
+        "cache_k_nope": operands.cache_k_nope,
+        "cache_k_rope": operands.cache_k_rope,
+        "q_nope": operands.q_nope,
+        "q_rope": operands.q_rope,
+        "dcp_world_size": 1,
+        "dcp_rank": 0,
+    }
+    assert captured["timer_kwargs"] == {
+        "warmup": 5,
+        "kernel_name": "set_mla_kv_concat_q_fp8_kernel",
+    }
+    assert metrics.time_ms == 1.0
+    assert metrics.memory_bandwidth_gbps == pytest.approx(128 * 1728 / 1e6)
+    assert metrics.energy_j == 0.0
 
 
 def test_generated_facades_are_available():

@@ -1,8 +1,9 @@
-"""Plain MLA paged-cache append kernel kind.
+"""MLA paged-cache append kernel kind.
 
 The first backend measures the two-write Torch semantic composite for
 GLM-5.2's 512-wide latent plus 64-wide RoPE cache entry. The production-aligned
-backend measures vLLM's fused one-launch CUDA implementation.
+backend measures vLLM's fused one-launch CUDA implementation. SGLang exposes
+both its existing plain pre-quantized path and Kimi-K3's page-planar fp8 path.
 """
 
 from __future__ import annotations
@@ -79,7 +80,7 @@ register(
         kernel_kind=KIND,
         backend="sglang_cuda",
         supports=BackendSupport(
-            compute=frozenset({DType.FP8_E4M3}),
+            compute=frozenset({DType.BF16, DType.FP8_E4M3}),
             kv=frozenset({DType.FP8_E4M3}),
             gpus=frozenset({"NVIDIA B200"}),
         ),
