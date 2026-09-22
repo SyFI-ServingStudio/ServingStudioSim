@@ -29,6 +29,7 @@ from .alignment_config import (
     load_timing_predict_config,
 )
 from .artifact_kind import ArtifactKind, write_artifact_kind
+from .corpus import CorpusError, resolve_hf_references
 from .schema.loader import PresetError, _load_preset
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -108,12 +109,16 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _load_simulation_preset(path: Path) -> dict[str, Any]:
-    """Validate one ordinary simulation preset without introducing a wrapper."""
+    """Validate one ordinary simulation preset without introducing a wrapper.
+
+    Hub references are resolved here, as the ordinary launcher resolves them,
+    because the arch this returns reaches the binary through timing-predict.
+    """
     if path.suffix.lower() not in CONFIG_SUFFIXES:
         raise ValueError(f"simulation config must be YAML or JSON: {path}")
     try:
-        return _load_preset(path)
-    except PresetError as exc:
+        return resolve_hf_references(_load_preset(path))
+    except (PresetError, CorpusError) as exc:
         raise ValueError(str(exc)) from exc
 
 

@@ -268,9 +268,16 @@ def _emit_backends(args, schema: Registry) -> int:
     # kernel role sets (e.g. tp=1 has no all_reduce) can't share one backends file,
     # so reject at emit; runs that differ only in shape share it (shapes → `(varies)`).
     # `_format_log_dir` templates each `log_dir` so a reject names the run (…/tp1).
-    normalized = [_format_log_dir(normalize_params(c, schema)) for c in candidates]
     try:
+        # The builder reads a corpus to size its sweep, so it needs the file.
+        normalized = [
+            resolve_hf_references(_format_log_dir(normalize_params(c, schema)))
+            for c in candidates
+        ]
         roles = emit_roles(normalized, args.build_type)
+    except CorpusError as exc:
+        print(f"[invalid] {source}: {exc}", file=sys.stderr)
+        return 2
     except BackendEnumError as exc:
         print(f"[invalid] {source}: emit-backends failed: {exc}", file=sys.stderr)
         return 2

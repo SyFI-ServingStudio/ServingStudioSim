@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 import pytest
+import yaml
 
 from launcher import corpus as corpus_module
 from launcher.corpus import CorpusError, resolve_hf_references
@@ -106,3 +107,39 @@ def test_a_payload_in_a_subdirectory_of_its_manifest_resolves(tmp_path, monkeypa
         {"token_corpus_file": f"hf://uw/corpora@{SHA}/glm53/manifest.json"}
     )
     assert resolved == {"token_corpus_file": str(snapshot / "glm53" / "manifest.json")}
+
+
+def _corpus_preset(tmp_path):
+    """The shipped SGLang preset, pointed at a hub corpus instead of a marginal."""
+    raw = yaml.safe_load(Path("presets/glm52_nvfp4_b200_sglang_tp4_diverse.yaml").read_text())
+    arch = raw["pools"]["main"]["groups"][0]["arch"]
+    arch.pop("expert_popularity_file")
+    arch.update(routing="corpus", token_corpus_file=f"hf://uw/corpora@{SHA}/glm53/manifest.json")
+    path = tmp_path / "preset.yaml"
+    path.write_text(yaml.safe_dump(raw))
+    return path
+
+
+def test_emit_backends_hands_the_builder_a_path_not_a_reference(hub, tmp_path, monkeypatch):
+    """Every entry that reaches the binary resolves references, not only a run."""
+    import launcher.backends as backends_module
+    from launcher.__main__ import main as launcher_main
+
+    seen = []
+
+    def fake_emit_roles(configs, _build_type):
+        seen.extend(configs)
+        return {}
+
+    monkeypatch.setattr(backends_module, "emit_roles", fake_emit_roles)
+    monkeypatch.setattr(backends_module, "render_skeleton", lambda *_: "")
+
+    assert launcher_main(["--emit-backends", "-", str(_corpus_preset(tmp_path))]) == 0
+    assert seen and "hf://" not in json.dumps(seen)
+
+
+def test_timing_predict_reads_the_preset_with_references_resolved(hub, tmp_path):
+    from launcher.alignment import _load_simulation_preset
+
+    preset = _load_simulation_preset(_corpus_preset(tmp_path))
+    assert "hf://" not in json.dumps(preset)
