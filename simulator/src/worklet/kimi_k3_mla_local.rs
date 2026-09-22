@@ -162,7 +162,9 @@ impl KimiK3MlaLocalWorklet {
                 kv_lora_rank: cfg.kv_lora_rank.clone(),
                 rope_dim: cfg.rope_dim.clone(),
                 block_size: PAGE_SIZE,
-                input_dtype: cfg.cache_dtype,
+                // The latent+rope vector arrives in the activation dtype (bf16) and is
+                // quantized to the fp8 cache inside set_mla_kv_concat_q_fp8.
+                input_dtype: cfg.dtype,
                 kv_dtype: cfg.cache_dtype,
                 cache_format: "page_planar_fp8".to_string(),
             },
