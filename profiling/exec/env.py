@@ -164,7 +164,10 @@ ENV_REGISTRY: dict[str, ProfileEnv | ContainerProfileEnv] = {
         ),
         shm_size="32g",
         volume_mounts=(
-            (Path("/raid/yilegu/flashinfer_cache"), Path("/root/.cache/flashinfer"), "ro"),
+            # rw: flashinfer appends flashinfer_jit.log (and may JIT new kernels) under
+            # its cache root even when every cubin is already present; a read-only mount
+            # makes the trtllm/cute-dsl MLA backends fail with EROFS before launching.
+            (Path("/raid/yilegu/flashinfer_cache"), Path("/root/.cache/flashinfer"), "rw"),
         ),
         # The pinned image keeps /root mode 0700. The required offline-cache
         # mount is under /root, so this environment must retain root access.
