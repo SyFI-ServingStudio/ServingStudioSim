@@ -67,10 +67,18 @@ pub enum RoutingKind {
     Random,
     /// Measured per-expert marginal; requires `expert_popularity_file`.
     Popularity,
+    /// Recorded per-token expert routes; requires `token_corpus_file`. Unlike a
+    /// marginal it keeps whole tokens, so a batch's verify blocks can be
+    /// sampled as the contiguous runs they are.
+    Corpus,
 }
 
 /// The `routing` choices the launcher schema advertises (mirror of [`RoutingKind`]).
-const ROUTING_KINDS: [&str; 3] = ["uniform", "random", "popularity"];
+const ROUTING_KINDS: [&str; 4] = ["uniform", "random", "popularity", "corpus"];
+
+// Only the GLM-5.2 NVFP4 archs read a token corpus so far; the rest advertise
+// the marginal-backed kinds.
+const MARGINAL_ROUTING_KINDS: [&str; 3] = ["uniform", "random", "popularity"];
 
 // AFD FFN selectors do not yet accept popularity files.
 const SYNTHETIC_ROUTING_KINDS: [&str; 2] = ["uniform", "random"];
@@ -119,7 +127,7 @@ pub enum IterArchSel {
         #[serde(flatten)]
         model: ModelSpec,
         #[serde(default)]
-        #[param(string, default = "uniform", choices = ROUTING_KINDS)]
+        #[param(string, default = "uniform", choices = MARGINAL_ROUTING_KINDS)]
         routing: RoutingKind,
         #[serde(default)]
         routing_seed: Option<u64>,
@@ -174,7 +182,7 @@ pub enum IterArchSel {
         /// Drives the L2 MoE dispatch/combine `BottleneckCurve`
         /// and the L3 grouped-GEMM `local_ppm` shards. Omitted → `uniform`.
         #[serde(default)]
-        #[param(string, default = "uniform", choices = ROUTING_KINDS)]
+        #[param(string, default = "uniform", choices = MARGINAL_ROUTING_KINDS)]
         routing: RoutingKind,
         /// Seed for `routing = random` (ignored for `uniform`). Fixed so a run is
         /// reproducible (the throughput golden is bit-identical); vary it to
@@ -203,7 +211,7 @@ pub enum IterArchSel {
         #[param(default = 8, cache_key)]
         nvl_num_gpu: u16,
         #[serde(default)]
-        #[param(string, default = "uniform", choices = ROUTING_KINDS)]
+        #[param(string, default = "uniform", choices = MARGINAL_ROUTING_KINDS)]
         routing: RoutingKind,
         #[serde(default)]
         routing_seed: Option<u64>,
@@ -227,7 +235,7 @@ pub enum IterArchSel {
         #[param(default = 8, cache_key)]
         nvl_num_gpu: u16,
         #[serde(default)]
-        #[param(string, default = "uniform", choices = ROUTING_KINDS)]
+        #[param(string, default = "uniform", choices = MARGINAL_ROUTING_KINDS)]
         routing: RoutingKind,
         #[serde(default)]
         routing_seed: Option<u64>,
@@ -241,7 +249,7 @@ pub enum IterArchSel {
         #[serde(flatten)]
         model: ModelSpec,
         #[serde(default)]
-        #[param(string, default = "uniform", choices = ROUTING_KINDS)]
+        #[param(string, default = "uniform", choices = MARGINAL_ROUTING_KINDS)]
         routing: RoutingKind,
         #[serde(default)]
         routing_seed: Option<u64>,
@@ -256,7 +264,7 @@ pub enum IterArchSel {
         #[serde(flatten)]
         model: ModelSpec,
         #[serde(default)]
-        #[param(string, default = "uniform", choices = ROUTING_KINDS)]
+        #[param(string, default = "uniform", choices = MARGINAL_ROUTING_KINDS)]
         routing: RoutingKind,
         #[serde(default)]
         routing_seed: Option<u64>,
@@ -279,7 +287,7 @@ pub enum IterArchSel {
         nvl_num_gpu: u16,
         /// Expert routing distribution used by dispatch/combine.
         #[serde(default)]
-        #[param(string, default = "uniform", choices = ROUTING_KINDS)]
+        #[param(string, default = "uniform", choices = MARGINAL_ROUTING_KINDS)]
         routing: RoutingKind,
         /// Seed for `routing = random`; ignored for uniform routing.
         #[serde(default)]
@@ -322,6 +330,13 @@ pub enum IterArchSel {
         #[serde(default)]
         #[param(cache_key)]
         expert_popularity_file: Option<String>,
+        /// Recorded per-token expert routes from a `token_corpus` pass, as
+        /// a manifest path. Requires `routing = corpus`. One artifact covers
+        /// every routed layer, so the body MoE and the MTP MoE read slices
+        /// of it rather than separate files.
+        #[serde(default)]
+        #[param(cache_key)]
+        token_corpus_file: Option<String>,
     },
     /// [`Self::Glm52VllmNvfp4DsaMoe`] driving its MTP layer as a real drafter:
     /// one target verify pass over `draft_tokens + 1` rows per decode request,
@@ -368,6 +383,13 @@ pub enum IterArchSel {
         #[serde(default)]
         #[param(cache_key)]
         draft_expert_popularity_file: Option<String>,
+        /// Recorded per-token expert routes from a `token_corpus` pass, as
+        /// a manifest path. Requires `routing = corpus`. One artifact covers
+        /// every routed layer, so the body MoE and the MTP MoE read slices
+        /// of it rather than separate files.
+        #[serde(default)]
+        #[param(cache_key)]
+        token_corpus_file: Option<String>,
     },
     /// SGLang's B200 NVFP4 launch graph under pure tensor parallelism. Every
     /// rank owns all experts (EP1) and shards the routed intermediate axis by
@@ -391,6 +413,13 @@ pub enum IterArchSel {
         #[serde(default)]
         #[param(cache_key)]
         expert_popularity_file: Option<String>,
+        /// Recorded per-token expert routes from a `token_corpus` pass, as
+        /// a manifest path. Requires `routing = corpus`. One artifact covers
+        /// every routed layer, so the body MoE and the MTP MoE read slices
+        /// of it rather than separate files.
+        #[serde(default)]
+        #[param(cache_key)]
+        token_corpus_file: Option<String>,
     },
 }
 
@@ -632,6 +661,7 @@ mod iter_tests {
             routing_seed,
             mtp_mode,
             expert_popularity_file,
+            token_corpus_file,
         } = &parsed
         else {
             panic!("expected glm52_vllm_nvfp4_dsa_moe")
@@ -644,6 +674,7 @@ mod iter_tests {
         assert_eq!(*routing_seed, None);
         assert_eq!(*mtp_mode, Glm52MtpMode::Off);
         assert_eq!(*expert_popularity_file, None);
+        assert_eq!(*token_corpus_file, None);
         assert!(std::ptr::eq(parsed.model(), model));
         assert!(IterArchSel::SCHEMA
             .iter()
@@ -664,6 +695,7 @@ mod iter_tests {
             routing_seed,
             mtp_mode,
             expert_popularity_file,
+            token_corpus_file,
         } = &parsed
         else {
             panic!("expected glm52_sglang_nvfp4_tp_dsa_moe")
@@ -676,6 +708,7 @@ mod iter_tests {
         assert_eq!(*routing_seed, None);
         assert_eq!(*mtp_mode, Glm52MtpMode::Off);
         assert_eq!(*expert_popularity_file, None);
+        assert_eq!(*token_corpus_file, None);
         assert!(std::ptr::eq(parsed.model(), model));
 
         let params = IterArchSel::SCHEMA

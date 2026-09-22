@@ -12,6 +12,7 @@
 //! change (a pre-computed table over the sweep grid, say) without touching a
 //! call site.
 
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
 use super::routing::{sample_and_fold_layerwise_topk_expert_counts, RoutingDistribution};
@@ -40,6 +41,23 @@ impl ExpertDemand {
         Self::Popularity {
             layerwise_global_ppm: routing.layerwise_ppm(num_layers),
         }
+    }
+
+    /// Bind a recorded corpus to one MoE callable: its verify width and the
+    /// layers it covers. The fold seed is shared with the popularity path so
+    /// both sources are reproducible the same way.
+    ///
+    /// Validated here rather than at first use: a kernel's `enumerate` runs
+    /// deep inside a build cascade, where an unreadable corpus would surface as
+    /// a missing profile row instead of a bad config.
+    pub fn corpus(
+        manifest: &str,
+        group_size: u32,
+        layers: std::ops::Range<usize>,
+    ) -> anyhow::Result<Self> {
+        let config = TokenCorpusConfig::from_manifest(manifest, group_size, FOLD_SEED, layers)?;
+        config.load().context("reading the token corpus payload")?;
+        Ok(Self::Corpus(config))
     }
 
     /// Expert count this source produces histograms over, so a consumer can
@@ -252,7 +270,7 @@ mod tests {
             ),
         ];
         for ((group_size, seed, candidates), cases) in groups {
-            let mut config = TokenCorpusConfig::from_manifest(RECORDED, group_size, seed)
+            let mut config = TokenCorpusConfig::from_manifest(RECORDED, group_size, seed, 0..75)
                 .expect("recorded corpus manifest loads");
             config.sampling_candidates = candidates;
             let demand = ExpertDemand::Corpus(config);

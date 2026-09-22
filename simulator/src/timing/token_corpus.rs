@@ -30,6 +30,15 @@ pub struct TokenCorpusConfig {
     /// block structure is what the corpus exists to avoid.
     #[serde(default = "one")]
     pub group_size: u32,
+    /// Layers this binding folds over, as a half-open range into the
+    /// artifact's layer axis. A capture covers every routed layer of the
+    /// deployment at once, so a body MoE and an MTP MoE are two slices of one
+    /// corpus rather than two artifacts — which is what a per-expert marginal
+    /// can never be, having already summed the layer axis away.
+    #[serde(default)]
+    pub layer_start: usize,
+    #[serde(default)]
+    pub layer_end: usize,
     #[serde(default)]
     pub seed: u64,
     /// Candidate draws to choose between. One *real* draw is selected; an
@@ -74,7 +83,16 @@ impl TokenCorpusConfig {
     /// Read a manifest and bind it to one deployment's sampling parameters.
     /// `data_file` is rewritten to an absolute path so the config stays valid
     /// however the process later moves.
-    pub fn from_manifest(path: &str, group_size: u32, seed: u64) -> Result<Self> {
+    ///
+    /// `layers` is required rather than defaulted to the whole artifact: which
+    /// layers a MoE callable covers is the caller's fact, and a silent whole-
+    /// corpus default would price an MTP layer with the body's routing.
+    pub fn from_manifest(
+        path: &str,
+        group_size: u32,
+        seed: u64,
+        layers: std::ops::Range<usize>,
+    ) -> Result<Self> {
         let path = Path::new(path)
             .canonicalize()
             .context("locating token corpus manifest")?;
@@ -89,8 +107,15 @@ impl TokenCorpusConfig {
         config.data_file = data.to_string_lossy().into_owned();
         config.group_size = group_size;
         config.seed = seed;
+        config.layer_start = layers.start;
+        config.layer_end = layers.end;
         config.validate()?;
         Ok(config)
+    }
+
+    /// Layers the folded histogram averages over.
+    fn layers(&self) -> std::ops::Range<usize> {
+        self.layer_start..self.layer_end
     }
 
     fn validate(&self) -> Result<()> {
@@ -106,6 +131,13 @@ impl TokenCorpusConfig {
         ensure!(
             self.num_tokens >= self.group_size as usize,
             "token corpus is shorter than one sampling group"
+        );
+        ensure!(
+            self.layer_start < self.layer_end && self.layer_end <= self.num_layers,
+            "token corpus layer slice {}..{} is not inside its {} layers",
+            self.layer_start,
+            self.layer_end,
+            self.num_layers
         );
         ensure!(
             self.num_layers > 0
@@ -161,15 +193,19 @@ impl TokenCorpusConfig {
 }
 
 impl TokenCorpus {
-    /// One complete global histogram per layer for `num_tokens` sampled tokens.
+    /// One complete global histogram per layer for `num_tokens` sampled tokens,
+    /// over the config's layer slice.
     ///
     /// Tokens arrive in runs of `group_size`: a decode step of N tokens is
     /// `⌈N/w⌉` sequences contributing w consecutive positions each, so the draw
     /// takes that many independent windows. All layers share the chosen
-    /// positions, because a token's routing is correlated across layers too.
+    /// positions, because a token's routing is correlated across layers too —
+    /// which is also why slicing happens here and not in the packer: the body
+    /// and MTP slices of one draw must see the same tokens.
     fn sample_layer_counts(&self, num_tokens: u32, seed: u64) -> Vec<Vec<u32>> {
         let config = &self.config;
-        let mut counts = vec![vec![0u32; config.num_experts]; config.num_layers];
+        let layers = config.layers();
+        let mut counts = vec![vec![0u32; config.num_experts]; layers.len()];
         let mut state = seed;
         let mut remaining = num_tokens as usize;
         while remaining > 0 {
@@ -191,7 +227,7 @@ impl TokenCorpus {
                 }
             };
             for token in start..start + take {
-                for (layer, row) in counts.iter_mut().enumerate() {
+                for (layer, row) in layers.clone().zip(counts.iter_mut()) {
                     let offset = (token * config.num_layers + layer) * config.top_k;
                     for &expert in &self.ids[offset..offset + config.top_k] {
                         row[expert as usize] += 1;
@@ -319,7 +355,8 @@ pub(crate) mod tests {
         });
         let path = dir.join("manifest.json");
         std::fs::write(&path, manifest.to_string()).expect("corpus manifest");
-        TokenCorpusConfig::from_manifest(path.to_str().unwrap(), 8, 0).expect("manifest loads")
+        TokenCorpusConfig::from_manifest(path.to_str().unwrap(), 8, 0, 0..num_layers)
+            .expect("manifest loads")
     }
 
     #[test]
@@ -362,6 +399,34 @@ pub(crate) mod tests {
         assert_eq!(folded.len(), 64);
         assert_eq!(folded.iter().map(|&c| u64::from(c)).sum::<u64>(), 24 * 8);
         assert_eq!(folded, corpus.sample_and_fold(24, 16));
+    }
+
+    /// The unification this replaces two popularity files with: one artifact,
+    /// two callables, and the last layer really does route differently from the
+    /// body — so a slice is not a relabelling of the same histogram.
+    #[test]
+    fn a_layer_slice_folds_only_its_own_layers() {
+        let dir = temp_dir("slice");
+        let whole = synthetic(&dir, 64, 8, 4, 256);
+        let slice = |layers: std::ops::Range<usize>| {
+            let mut config = whole.clone();
+            config.layer_start = layers.start;
+            config.layer_end = layers.end;
+            config.load().unwrap().sample_and_fold(24, 16)
+        };
+        let last = slice(3..4);
+        assert_eq!(last.iter().map(|&c| u64::from(c)).sum::<u64>(), 24 * 8);
+        assert_ne!(last, slice(0..3), "the MTP slice is not the body's fold");
+        assert_ne!(last, slice(0..4));
+    }
+
+    #[test]
+    fn a_layer_slice_outside_the_corpus_is_rejected() {
+        let dir = temp_dir("slice-range");
+        let mut config = synthetic(&dir, 64, 8, 4, 128);
+        config.layer_end = 5;
+        let error = config.load().expect_err("layer 4 was never recorded");
+        assert!(format!("{error:#}").contains("layer slice"));
     }
 
     #[test]

@@ -27,7 +27,13 @@ this to every MoE arch that costs routed experts, including TP-only models.
    report that issue rather than silently substituting uniform. If the user
    explicitly requires a file/measured routing, a missing file is an error too.
 
-`popularity` requires a valid file; `uniform` and `random` reject popularity files.
+`popularity` requires a valid file; `uniform` and `random` reject popularity
+files. `corpus` reads recorded per-token routes from `token_corpus_file` on the
+GLM-5.2 NVFP4 archs: prefer it over `popularity` when the deployment drafts
+(`draft_tokens > 0`), because a marginal cannot express which experts a verify
+block's tokens jointly select. At verify width 1 the two agree and either is
+fine. One corpus covers every routed layer, so a speculative model needs no
+second file for its MTP layer.
 The runtime never falls back from a measured source to uniform. The agent chooses any
 permitted fallback while preparing the config and reports it with the result.
 Check `simulator/src/arch/config.rs` for supported fields and
