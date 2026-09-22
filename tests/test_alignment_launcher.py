@@ -1434,26 +1434,31 @@ def test_the_yaml_expert_topology_reaches_the_expert_load_extractor(tmp_path, mo
     assert artifacts["expert_record_count"] == 7
 
 
-def test_only_the_popularity_pass_requires_an_expert_topology(tmp_path):
-    """The marginal is that pass's product; for a corpus pass it is a by-product.
+def test_a_pass_that_asks_for_the_expert_load_stream_also_requires_it(tmp_path):
+    """Asking and requiring are one question, and the answer is the deployment.
 
-    A corpus records logical expert ids, which a deployment with no declared
-    expert topology still routes over, so its absence must not fail the capture.
+    A corpus capture on a deployment with no expert parallelism cannot produce
+    the stream at all, and still records the routes themselves; one that turns
+    EPLB on and then finds nothing has a defect, not a missing by-product.
     """
-    with pytest.raises(ValueError, match="expert_parallel_size"):
-        alignment_runner._extract_expert_load(
-            _routing_profile(tmp_path / "a", "expert_popularity"),
-            tmp_path / "server.log",
-            tmp_path,
-            tmp_path,
-            engine_records.VLLM_RECORDS,
-            speculative=False,
-            window={},
-        )
+    for kind, server in (
+        ("expert_popularity", {}),
+        ("token_corpus", {"extra_args": ["--enable-expert-parallel"]}),
+    ):
+        with pytest.raises(ValueError, match="expert_parallel_size"):
+            alignment_runner._extract_expert_load(
+                _routing_profile(tmp_path / kind, kind, **server),
+                tmp_path / "server.log",
+                tmp_path,
+                tmp_path,
+                engine_records.VLLM_RECORDS,
+                speculative=False,
+                window={},
+            )
 
     assert (
         alignment_runner._extract_expert_load(
-            _routing_profile(tmp_path / "b", "token_corpus"),
+            _routing_profile(tmp_path / "no-ep", "token_corpus"),
             tmp_path / "server.log",
             tmp_path,
             tmp_path,
@@ -1463,6 +1468,30 @@ def test_only_the_popularity_pass_requires_an_expert_topology(tmp_path):
         )
         == {}
     )
+
+
+def test_a_routing_pass_asks_for_the_expert_load_stream_only_where_it_exists(tmp_path):
+    """vLLM's balancedness log is its only source, and it refuses EPLB without EP."""
+    argv: list[str] = ["--enable-expert-parallel"]
+    alignment_runner._append_backend_server_args(
+        argv,
+        _routing_profile(
+            tmp_path / "ep",
+            "token_corpus",
+            extra_args=["--enable-expert-parallel"],
+            expert_parallel_size=2,
+            expert_count_reduction_group_size=4,
+        ),
+    )
+    assert argv[argv.index("--eplb-config") + 1] == '{"log_balancedness": true}'
+    assert "--enable-return-routed-experts" in argv
+
+    bare: list[str] = []
+    alignment_runner._append_backend_server_args(
+        bare, _routing_profile(tmp_path / "tp", "token_corpus")
+    )
+    assert "--enable-eplb" not in bare
+    assert "--enable-return-routed-experts" in bare
 
 
 @pytest.mark.parametrize("reduction_group_size", [0, -1, True, 1.5])

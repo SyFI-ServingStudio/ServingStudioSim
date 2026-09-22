@@ -213,11 +213,13 @@ def load_profile_config(path: Path, *, require_python_runtime: bool = True) -> P
         "expert_parallel_size": config.server.expert_parallel_size,
         "expert_count_reduction_group_size": (config.server.expert_count_reduction_group_size),
     }
-    # Only the pass whose product is the marginal needs the topology that
-    # marginal is reduced over. A token_corpus pass records logical expert ids
-    # and may declare it to get the marginal as a by-product, but must not be
-    # blocked for lacking it. Either way, a declared value is still checked.
-    if config.profile_kind == "expert_popularity" and any(
+    # The topology is what the marginal is reduced over, so it is required by
+    # the pass whose product that is, and by any routing pass that will take the
+    # expert-load stream alongside its own product -- capturing that stream and
+    # then discarding it for want of two declared integers is the server paying
+    # EPLB's synchronization cost for nothing. A corpus capture with neither
+    # keeps working: it records logical expert ids and needs no topology.
+    if (config.profile_kind == "expert_popularity" or config.captures_expert_load) and any(
         value is None for value in expert_topology.values()
     ):
         raise ValueError(

@@ -8,7 +8,19 @@ import pytest
 
 from alignment import runner
 from alignment.profiler import record_extraction, vllm_server
+from alignment.profiler.config import ProfileConfig
 from alignment.profiler.spec_decode import replay_delta
+
+
+class Config(SimpleNamespace):
+    """A profile config with only the fields one finalize path reads.
+
+    It borrows the real derived property rather than restating it, so a change
+    to what decides an expert-load capture reaches this test instead of quietly
+    passing a stale answer.
+    """
+
+    captures_expert_load = ProfileConfig.captures_expert_load
 
 
 def exposition(drafts, tokens, accepted, positions):
@@ -111,7 +123,7 @@ def test_finalize_speculative_popularity_produces_both_routing_artifacts(tmp_pat
     source.write_text(
         "\n".join("VibeSimAlignmentExpertLoad " + json.dumps(row) for row in expert_rows())
     )
-    cfg = SimpleNamespace(
+    cfg = Config(
         name="spec5",
         workload=SimpleNamespace(warmup=False),
         engine="vllm",

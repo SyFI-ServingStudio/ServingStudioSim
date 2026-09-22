@@ -215,3 +215,23 @@ class ProfileConfig:
 
     # --- workload: req-frontend consumes the same source trace as the simulator ---
     workload: LoadGeneratorConfig = None  # type: ignore[assignment]
+
+    @property
+    def captures_expert_load(self) -> bool:
+        """Whether this pass will ask the engine for EPLB's expert-load stream.
+
+        That stream is the only per-step view of what the engine actually ran --
+        one rank-synchronized record per forward -- so a routing pass takes it
+        alongside its own product. vLLM's balancedness log is its only source
+        and vLLM refuses EPLB without expert parallelism, so a deployment
+        without either cannot produce it.
+
+        Asking and requiring are the same question: a pass that asked for the
+        stream and got nothing is a defect, not a deployment that happens to
+        have no marginal.
+        """
+        return (
+            self.profile_kind in ROUTING_PROFILE_KINDS
+            and self.engine == "vllm"
+            and "--enable-expert-parallel" in self.server.extra_args
+        )

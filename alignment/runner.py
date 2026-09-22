@@ -120,13 +120,13 @@ def _extract_expert_load(
 ) -> dict:
     """EPLB's per-step expert-load stream, and the marginal aggregated from it.
 
-    Returns the artifacts it wrote, empty when the deployment declared no
-    expert topology to reduce over. That is fatal for the pass whose product
-    the marginal is, and merely uninteresting for a corpus pass: a corpus
-    records the routes themselves, in logical expert ids, and needs neither the
-    topology nor the marginal to describe them.
+    Required whenever the pass asked the engine for the stream, and whenever
+    the marginal is the pass's own product. Returns `{}` only for the case that
+    can produce neither: a corpus capture on a deployment with no expert
+    parallelism, which still records the routes themselves in logical expert
+    ids and needs no topology to describe them.
     """
-    required = cfg.profile_kind == "expert_popularity"
+    required = cfg.captures_expert_load or cfg.profile_kind == "expert_popularity"
     expert_parallel_size = cfg.server.expert_parallel_size
     reduction_group_size = cfg.server.expert_count_reduction_group_size
     if expert_parallel_size is None or reduction_group_size is None:
@@ -236,7 +236,7 @@ def _append_backend_server_args(server_argv: list[str], cfg: ProfileConfig) -> N
     if cfg.profile_kind not in ROUTING_PROFILE_KINDS:
         return
     options = list(_PROFILE_KIND_SERVER_ARGS.get(cfg.profile_kind, ()))
-    if "--enable-expert-parallel" in server_argv:
+    if cfg.captures_expert_load:
         options += _EXPERT_LOAD_SERVER_ARGS
     for flag, value in options:
         if flag in server_argv:
