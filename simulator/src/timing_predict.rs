@@ -453,13 +453,21 @@ mod provenance_tests {
     }
 }
 
-/// Offline prediction bridge: inspect cache coverage without attempting to JIT
-/// profile. This keeps timing-predict usable on CPU-only development hosts and
-/// lets the caller report the complete cold-cache work in one error.
+/// Offline prediction bridge: the first model build runs in dry-run mode to
+/// inspect cache coverage without touching a GPU, so a CPU-only development host
+/// gets the complete cold-cache work reported in one error. On a GPU host (an
+/// explicit `VIBESIM_PROFILE_GPUS` set, or `VIBESIM_TIMING_PREDICT_JIT=1`) the
+/// same misses are instead JIT-profiled into `profile.db` on the second build,
+/// which is how a new arch's rows get filled (skill operate-run-timing-predict).
 fn predict_bridge() -> Result<PerfApiBridge> {
     let bridge = PerfApiBridge::new().context("starting the PyO3 perf_api bridge")?;
     bridge.enable_dry_run();
     Ok(bridge)
+}
+
+fn predict_jit_fill_enabled() -> bool {
+    std::env::var_os("VIBESIM_PROFILE_GPUS").is_some_and(|v| !v.is_empty())
+        || std::env::var("VIBESIM_TIMING_PREDICT_JIT").map(|v| v == "1").unwrap_or(false)
 }
 
 fn ensure_predict_cache_ready(bridge: &PerfApiBridge) -> Result<()> {
@@ -479,6 +487,14 @@ fn ensure_predict_cache_ready(bridge: &PerfApiBridge) -> Result<()> {
             "  {} ({}) {} / {} missing\n",
             row.name, row.kind, row.missing, row.total
         ));
+    }
+    if predict_jit_fill_enabled() {
+        eprintln!("{message}  -> GPU host: JIT-profiling the missing rows into profile.db");
+        bridge.disable_dry_run();
+        bridge
+            .enable_jit_profiling()
+            .context("enabling JIT profiling for the offline prediction")?;
+        return Ok(());
     }
     bail!("{message}");
 }
