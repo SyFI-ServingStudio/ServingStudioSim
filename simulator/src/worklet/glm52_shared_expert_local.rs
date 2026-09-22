@@ -165,8 +165,31 @@ impl Glm52SharedExpertLocalWorklet {
     }
 
     pub fn eval(&self, input: &Glm52SharedExpertLocalWorkletInput, ev: &mut Evaluator) {
+        self.eval_or_zero(input, false, ev);
+    }
+
+    /// The same three leaves as [`Self::eval`], with the caller able to force
+    /// every one of them to zero.
+    ///
+    /// vLLM launches the shared expert on its own stream, so whether it costs
+    /// anything depends on the batch: at decode width the routed experts leave
+    /// idle SMs and it hides underneath them, while a batch carrying prefill
+    /// rows saturates the device and it has to queue. An arch therefore mints
+    /// this worklet twice per rank -- once concurrent with the routed slice,
+    /// once serial after it -- and zeroes whichever one the batch shape does
+    /// not select, the way [`DsaSparseMlaAttentionOp`] carries a prefill leaf
+    /// and a decode leaf and fills one. The tree keeps a fixed shape and a
+    /// fixed slot count (INV-1); only the values move.
+    ///
+    /// [`DsaSparseMlaAttentionOp`]: crate::op::DsaSparseMlaAttentionOp
+    pub fn eval_or_zero(
+        &self,
+        input: &Glm52SharedExpertLocalWorkletInput,
+        zero: bool,
+        ev: &mut Evaluator,
+    ) {
         let work = work_inputs(input.batch_tokens);
-        let zero = input.batch_tokens == 0;
+        let zero = zero || input.batch_tokens == 0;
 
         eval_atomic_or_zero(&self.gate_up_proj, work.gate_up_proj, zero, ev);
         eval_atomic_or_zero(&self.silu_and_mul, work.silu_and_mul, zero, ev);

@@ -828,11 +828,34 @@ impl Glm52RoutedExperts {
         }
     }
 
-    /// One node per EP child: that child's shared expert plus its routed slice.
+    /// One node per EP child: that child's shared expert concurrent with its
+    /// routed slice.
     ///
     /// The shared expert is compiled inside each child because it runs on every
     /// rank, so the `Max` above this bills one rank's whole FFN, not a shared
     /// expert added to the busiest rank's routed slice.
+    ///
+    /// Within a child the two are `Max`, not `Sum`: vLLM launches the shared
+    /// expert on its own stream, so it runs concurrently with the router and the
+    /// routed experts rather than after them. Measured on the job 706 capture
+    /// (`logs/20260921_1_glm53_dflash2_graph2048`, 268 decode iterations, per
+    /// segment on the barrier critical path): the shared expert's own union is
+    /// 1.310 ms/iter but its marginal contribution to the
+    /// `router + shared + routed` region is 0.123 ms -- 9.4%. Billing it
+    /// serially charged 0.996 ms for that 0.123 ms and made the region 15.4%
+    /// too expensive (region 8.688 ms measured vs 10.027 ms modeled).
+    ///
+    /// `overlap` stays 1.0: L4 only expresses whether work is concurrent, never
+    /// a fitted slowdown factor (a real <1.0 belongs inside an L3 worklet). The
+    /// routed slice dominates its child at every layer -- 8.589 vs 0.996 ms/iter
+    /// summed -- so `max` resolves to the routed slice and the shared expert
+    /// becomes free, which is the right limit while the router remains a serial
+    /// sibling below. The residual after this change is the router itself: it is
+    /// 94% concurrent too (0.443 ms billed against a 0.027 ms marginal), but it
+    /// joins one level up and folding it in would move a child across that join.
+    ///
+    /// `Max` sums `flops`/`bytes`/`energy` (INV-4), so the shared expert's work
+    /// still counts; only its time overlaps away.
     fn compile_with_shared(
         &self,
         shared_expert: &Glm52SharedExpertLocalWorklet,
@@ -843,8 +866,14 @@ impl Glm52RoutedExperts {
                 .iter()
                 .map(|expert| {
                     CostNode::Sum(vec![
+                        CostNode::Max {
+                            overlap: 1.0,
+                            children: vec![
+                                shared_expert.compile(builder),
+                                expert.compile(builder),
+                            ],
+                        },
                         shared_expert.compile(builder),
-                        expert.compile(builder),
                     ])
                 })
                 .collect(),
@@ -852,8 +881,14 @@ impl Glm52RoutedExperts {
                 .iter()
                 .map(|expert| {
                     CostNode::Sum(vec![
+                        CostNode::Max {
+                            overlap: 1.0,
+                            children: vec![
+                                shared_expert.compile(builder),
+                                expert.compile(builder),
+                            ],
+                        },
                         shared_expert.compile(builder),
-                        expert.compile(builder),
                     ])
                 })
                 .collect(),
@@ -864,29 +899,34 @@ impl Glm52RoutedExperts {
         &self,
         shared_expert: &Glm52SharedExpertLocalWorklet,
         batch_tokens: u32,
+        overlapped: bool,
         ev: &mut Evaluator,
     ) {
         match self {
             Self::Nvfp4(experts) => {
+                let shared = Glm52SharedExpertLocalWorkletInput { batch_tokens };
                 for expert in experts {
-                    shared_expert.eval(&Glm52SharedExpertLocalWorkletInput { batch_tokens }, ev);
+                    shared_expert.eval_or_zero(&shared, !overlapped, ev);
                     expert.eval(
                         &Nvfp4MoeLocalWorkletInput {
                             num_tokens: batch_tokens,
                         },
                         ev,
                     );
+                    shared_expert.eval_or_zero(&shared, overlapped, ev);
                 }
             }
             Self::Bf16(experts) => {
+                let shared = Glm52SharedExpertLocalWorkletInput { batch_tokens };
                 for expert in experts {
-                    shared_expert.eval(&Glm52SharedExpertLocalWorkletInput { batch_tokens }, ev);
+                    shared_expert.eval_or_zero(&shared, !overlapped, ev);
                     expert.eval(
                         &Bf16MoeLocalWorkletInput {
                             num_tokens: batch_tokens,
                         },
                         ev,
                     );
+                    shared_expert.eval_or_zero(&shared, overlapped, ev);
                 }
             }
         }
@@ -1109,8 +1149,20 @@ impl Glm52SparseBody {
                 ev,
             );
         }
+        // The shared expert only disappears behind the routed slice when the
+        // device has room for it. Switch on the same signal the attention op
+        // already switches on -- whether this batch carries prefill rows --
+        // rather than on a fitted token threshold, because the measurement is
+        // near-binary: the shared expert's marginal contribution to the
+        // `router + shared + routed` region is 9.4% of its own span on decode
+        // batches but 89.0% on mixed and 87.7% on pure prefill (job 706
+        // capture, 747 iterations, per segment on the barrier critical path).
+        let overlapped = group
+            .attention_input
+            .prefill_query_cache_pairs
+            .is_empty();
         self.routed_experts
-            .eval_with_shared(&self.shared_expert, group.batch_tokens, ev);
+            .eval_with_shared(&self.shared_expert, group.batch_tokens, overlapped, ev);
         let use_ffn_fusion =
             batch.total_tokens > 0 && batch.total_tokens <= self.ffn_allreduce_max_fused_tokens;
         eval_atomic_or_zero(
@@ -2349,8 +2401,11 @@ fn expected_slot_count(ep_size: u16) -> usize {
     // Scale nodes do not mint additional slots. Each static section is built
     // once, while rank-local work is represented by Max over TP/EP children.
     let dense = ep * (ATTN_FULL_SLOTS + DENSE_FFN_SLOTS) + 4;
-    let sparse_shared =
-        ep * (ATTN_SHARED_SLOTS + ROUTER_SLOTS + SHARED_EXPERT_SLOTS + NVFP4_EXPERT_SLOTS) + 4;
+    // The shared expert is minted twice per rank -- concurrent with the routed
+    // slice and serial after it -- because the batch shape picks one.
+    let sparse_shared = ep
+        * (ATTN_SHARED_SLOTS + ROUTER_SLOTS + 2 * SHARED_EXPERT_SLOTS + NVFP4_EXPERT_SLOTS)
+        + 4;
     let sparse_full = sparse_shared + ep * (ATTN_FULL_SLOTS - ATTN_SHARED_SLOTS);
     (ep + 2) + dense + sparse_shared + sparse_full + sparse_shared + ep + ep
 }
@@ -2363,8 +2418,9 @@ fn expected_slot_count(ep_size: u16) -> usize {
 #[cfg(test)]
 fn expected_mtp_pass_slots(ep_size: u16, shares_index: bool) -> usize {
     let ep = usize::from(ep_size);
-    let sparse_shared =
-        ep * (ATTN_SHARED_SLOTS + ROUTER_SLOTS + SHARED_EXPERT_SLOTS + BF16_EXPERT_SLOTS) + 4;
+    let sparse_shared = ep
+        * (ATTN_SHARED_SLOTS + ROUTER_SLOTS + 2 * SHARED_EXPERT_SLOTS + BF16_EXPERT_SLOTS)
+        + 4;
     let decoder = if shares_index {
         sparse_shared
     } else {
