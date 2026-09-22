@@ -18,6 +18,7 @@ use serde::Deserialize;
 
 use crate::arch::config::{AttnArchSel, FfnArchSel, IterArchSel, ModelSpec, RoutingKind};
 use crate::arch::contract::SpeculativeUnifiedModel;
+use crate::arch::kimi_k3_sglang;
 use crate::arch::model_cfg::ModelCfg;
 use crate::arch::moe_model_cfg::MoeModelCfg;
 use crate::arch::{
@@ -37,6 +38,7 @@ use crate::arch::{
     Qwen3MoeFp8DpAttnEpFfnModel, Qwen3MoeFp8Parallel, Qwen3MoeParallel,
     Qwen3VllmMoeDpAttnEpFfnModel, Qwen3VllmMoeParallel,
 };
+use crate::arch::{KimiK3SglangModel, KimiK3SglangParallel};
 use crate::timing::routing::RoutingDistribution;
 use crate::timing::PerfApiBridge;
 
@@ -721,6 +723,44 @@ pub fn qwen36_local(
         .context("building local Qwen3.6 TP1/EP1 model (often a missing profile.db row)")
 }
 
+/// Build Kimi-K3's exact heterogeneous SGLang recipe. Offline prediction and
+/// unified deployment both use this builder so their model contracts cannot
+/// diverge.
+#[allow(clippy::too_many_arguments)]
+pub fn kimi_k3_sglang(
+    model_spec: &ModelSpec,
+    attn_tp_size: u16,
+    ep_size: u16,
+    pp_size: u16,
+    dcp_size: u16,
+    heads_per_rank: Option<u16>,
+    local_experts: Option<u32>,
+    sim_kda_layers: Option<u32>,
+    sim_mla_layers: Option<u32>,
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<KimiK3SglangModel> {
+    let model_cfg =
+        kimi_k3_sglang::KimiK3ModelCfg::from_json(Path::new(&model_spec.model_config), model_spec)
+            .context("loading exact Kimi-K3 model config")?;
+    let parallel = KimiK3SglangParallel {
+        attn_tp_size,
+        ep_size,
+        pp_size,
+        dcp_size,
+        heads_per_rank,
+        local_experts,
+        sim_kda_layers,
+        sim_mla_layers,
+        gpu_name: gpu.to_string(),
+    };
+    let configs = kimi_k3_sglang::build_configs(&model_cfg, &parallel)?;
+    let resolved = kimi_k3_sglang::resolve_configs(&configs);
+    kimi_k3_sglang::build(name.to_string(), resolved, bridge)
+        .context("building Kimi-K3 SGLang model (often a missing profile.db row)")
+}
+
 /// Build the DP-attention + TP-FFN dense Llama3 model.
 pub fn dp_attn_tp_ffn(
     model_spec: &ModelSpec,
@@ -1246,6 +1286,30 @@ pub fn build_iter_model(
             *routing,
             *routing_seed,
             expert_popularity_file.as_deref(),
+            gpu,
+            name,
+            bridge,
+        )?),
+        IterArchSel::KimiK3Sglang {
+            model,
+            attn_tp_size,
+            ep_size,
+            pp_size,
+            dcp_size,
+            heads_per_rank,
+            local_experts,
+            sim_kda_layers,
+            sim_mla_layers,
+        } => Box::new(kimi_k3_sglang(
+            model,
+            *attn_tp_size,
+            *ep_size,
+            *pp_size,
+            *dcp_size,
+            *heads_per_rank,
+            *local_experts,
+            *sim_kda_layers,
+            *sim_mla_layers,
             gpu,
             name,
             bridge,

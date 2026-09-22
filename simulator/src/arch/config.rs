@@ -102,6 +102,22 @@ const fn default_glm52_draft_tokens() -> u32 {
     5
 }
 
+const fn default_kimi_k3_attn_tp_size() -> u16 {
+    8
+}
+
+const fn default_kimi_k3_ep_size() -> u16 {
+    8
+}
+
+const fn default_kimi_k3_pp_size() -> u16 {
+    2
+}
+
+const fn default_kimi_k3_dcp_size() -> u16 {
+    1
+}
+
 /// Iteration-wise arch provider. Sharding parameters live only on the variants
 /// that consume them (provider-first: select the arch, then it exposes its own
 /// params).
@@ -126,6 +142,43 @@ pub enum IterArchSel {
         #[serde(default)]
         #[param(cache_key)]
         expert_popularity_file: Option<String>,
+    },
+    /// Kimi-K3's B200 SGLang graph: attention TP, routed-expert EP, and PP are
+    /// independent selector fields so the production and rank1 alignment
+    /// topologies use the same arch recipe.
+    KimiK3Sglang {
+        #[serde(flatten)]
+        model: ModelSpec,
+        #[serde(default = "default_kimi_k3_attn_tp_size")]
+        #[param(default = 8, cache_key)]
+        attn_tp_size: u16,
+        #[serde(default = "default_kimi_k3_ep_size")]
+        #[param(default = 8, cache_key)]
+        ep_size: u16,
+        #[serde(default = "default_kimi_k3_pp_size")]
+        #[param(default = 2, cache_key)]
+        pp_size: u16,
+        #[serde(default = "default_kimi_k3_dcp_size")]
+        #[param(default = 1, cache_key)]
+        dcp_size: u16,
+        /// Optional rank-local alignment shape. Production derives 96/TP;
+        /// rank1 sets this to 12 to retain one production rank's head width.
+        #[serde(default)]
+        #[param(cache_key)]
+        heads_per_rank: Option<u16>,
+        /// Optional local expert count. Production derives 896/EP; rank1 uses
+        /// 112 to model one production EP shard on one GPU.
+        #[serde(default)]
+        #[param(cache_key)]
+        local_experts: Option<u32>,
+        /// Set exactly one of these for a one-layer alignment probe. Both absent
+        /// means the complete explicit heterogeneous schedule.
+        #[serde(default)]
+        #[param(cache_key)]
+        sim_kda_layers: Option<u32>,
+        #[serde(default)]
+        #[param(cache_key)]
+        sim_mla_layers: Option<u32>,
     },
     Llama3Dense {
         #[serde(flatten)]
@@ -433,6 +486,7 @@ impl IterArchSel {
     pub fn model(&self) -> &ModelSpec {
         match self {
             Self::Qwen36Local { model, .. }
+            | Self::KimiK3Sglang { model, .. }
             | Self::Llama3Dense { model }
             | Self::Llama3DenseTp { model, .. }
             | Self::Llama3DpAttnTpFfn { model, .. }
@@ -852,6 +906,49 @@ mod iter_tests {
             serde_json::json!(["off", "full_index", "index_share"])
         );
         assert_eq!(mtp["affects_cache"], true);
+    }
+
+    #[test]
+    fn kimi_k3_sglang_selector_publishes_both_topologies_and_layer_overrides() {
+        let parsed: IterArchSel = serde_json::from_str(
+            r#"{"type":"kimi_k3_sglang","model_config":"model/config/kimi_k3.json","fp8":false,"attn_tp_size":1,"ep_size":1,"pp_size":1,"heads_per_rank":12,"local_experts":112,"sim_kda_layers":1,"sim_mla_layers":0}"#,
+        )
+        .expect("Kimi-K3 rank1 selector parses");
+        let IterArchSel::KimiK3Sglang {
+            model,
+            attn_tp_size,
+            ep_size,
+            pp_size,
+            dcp_size,
+            heads_per_rank,
+            local_experts,
+            sim_kda_layers,
+            sim_mla_layers,
+        } = &parsed
+        else {
+            panic!("expected kimi_k3_sglang");
+        };
+        assert_eq!(model.model_config, "model/config/kimi_k3.json");
+        assert_eq!((*attn_tp_size, *ep_size, *pp_size, *dcp_size), (1, 1, 1, 1));
+        assert_eq!(*heads_per_rank, Some(12));
+        assert_eq!(*local_experts, Some(112));
+        assert_eq!(*sim_kda_layers, Some(1));
+        assert_eq!(*sim_mla_layers, Some(0));
+        assert!(std::ptr::eq(parsed.model(), model));
+
+        let (_, params) = IterArchSel::SCHEMA
+            .iter()
+            .find(|(tag, _)| *tag == "kimi_k3_sglang")
+            .expect("Kimi-K3 provider schema row");
+        let names = params.iter().map(|param| param.name).collect::<Vec<_>>();
+        assert!(names.contains(&"attn_tp_size"));
+        assert!(names.contains(&"ep_size"));
+        assert!(names.contains(&"pp_size"));
+        assert!(names.contains(&"dcp_size"));
+        assert!(names.contains(&"heads_per_rank"));
+        assert!(names.contains(&"local_experts"));
+        assert!(names.contains(&"sim_kda_layers"));
+        assert!(names.contains(&"sim_mla_layers"));
     }
 }
 // ── layer-wise attn / ffn contract (AFD) ────────────────────────────────────
