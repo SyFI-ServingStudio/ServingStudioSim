@@ -555,6 +555,7 @@ impl Deployment for UnifiedDeployment {
                 draft_tokens,
                 draft_sliding_window,
                 expert_popularity_file,
+                expert_token_corpus_file,
                 ..
             } => {
                 ensure_speculative(&g.worker, *draft_tokens)?;
@@ -566,6 +567,7 @@ impl Deployment for UnifiedDeployment {
                     *routing,
                     *routing_seed,
                     expert_popularity_file.as_deref(),
+                    expert_token_corpus_file.as_deref(),
                     *draft_tokens,
                     *draft_sliding_window,
                     &gpu_name,

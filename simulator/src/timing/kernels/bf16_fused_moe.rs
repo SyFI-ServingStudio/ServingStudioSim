@@ -227,6 +227,7 @@ mod tests {
                 routed_scaling_numerator: 1,
                 routed_scaling_denominator: 1,
                 layerwise_global_ppm: popularity(),
+                token_corpus: None,
                 folded_rank_position: 0,
             },
         );

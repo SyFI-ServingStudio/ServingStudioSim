@@ -156,3 +156,37 @@ and reject popularity files. Migrate older `uniform` + file configs to `custom`.
 A missing or invalid custom file fails; the runtime never falls back to uniform.
 Speculative models require both target and draft popularity files together.
 AFD FFN selectors without a popularity-file field support only synthetic routing.
+
+### Recorded-token routing for GLM-5.3 DFlash2
+
+`glm53_vllm_nvfp4_dsa_moe_dflash2` accepts an optional
+`expert_token_corpus_file`. This replaces popularity resampling for the target's
+NVFP4 fused-MoE profile inputs. Existing popularity settings remain available to
+other consumers; omitting the corpus preserves the previous behavior.
+
+The corpus manifest is JSON with `schema_version: 1`, `data_file`, `num_tokens`,
+`num_layers`, `num_experts`, `top_k`, and `checksum_fnv1a64`. Its payload is a
+little-endian u16 array in `[token, layer, top_k]` order; `data_file` is relative
+to the manifest. The checksum is unsigned 64-bit FNV-1a over the payload bytes.
+Model dimensions, payload length/checksum, expert bounds and per-token top-k
+uniqueness are validated before profiling. Paths and checksum enter cache identity.
+
+At cache construction, the verify width (`draft_tokens + 1`) determines the
+sampling group length. Uniform, independent window starts are drawn with
+replacement from the concatenated corpus; request boundaries are not consulted.
+The final group uses the remaining token count. Every layer uses the same token
+positions. Layer counts then pass through the existing rank sorting and layer
+folding before profiling. The manifest accepts `sampling_candidates` (default16).
+For every profile point, generate that many CPU candidates independently and
+select one complete folded histogram. Its heaviest rank is ordered by active
+experts, then token-expert assignments. The selected candidate minimizes the
+equal-weight squared distance of both empirical midrank percentiles to50%;
+ties use the earliest candidate. Counts are never averaged across candidates.
+Use `sampling_candidates: 1` to reproduce single-draw sampling. `routing_seed` selects the deterministic sampling seed
+(default `0xF01D5EED`). No corpus access or sampling occurs during iteration
+execution: eval uses the ordinary fitted kernel cache. The low-token profile grid
+also includes the first eight multiples of the verify width.
+
+The current experimental corpus contains accepted generated tokens. Using it
+for prefill or mixed batches is an explicit approximation, not prompt replay.
+See `logs/20260921_0_token_sample` for a corpus producer and prediction experiment.

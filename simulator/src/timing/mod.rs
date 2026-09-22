@@ -7,6 +7,7 @@ pub mod dims;
 pub mod kernels;
 pub mod result;
 pub mod routing;
+pub mod token_corpus;
 pub mod slot_input;
 pub mod sweep;
 

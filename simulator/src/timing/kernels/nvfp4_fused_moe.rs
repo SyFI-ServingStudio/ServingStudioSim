@@ -33,6 +33,8 @@ pub struct Nvfp4FusedMoeKernelConfig {
     pub routed_scaling_denominator: u32,
     /// Identity-free global popularity for every modeled MoE layer.
     pub layerwise_global_ppm: Vec<Vec<u32>>,
+    #[serde(default)]
+    pub token_corpus: Option<crate::timing::token_corpus::TokenCorpusConfig>,
     /// Position in the active-count-ranked EP workload list. This chooses a
     /// representative local histogram without adding physical rank identity to
     /// the Python profiler key.
@@ -52,11 +54,17 @@ impl KernelSpec for Nvfp4FusedMoeSpec {
 
     const KIND: KernelKind = "nvfp4_fused_moe";
 
-    fn sweep_grid(_config: &Self::Config) -> SweepGrid {
-        SweepGrid::new(vec![Axis::chain([
-            Axis::values([1, 4, 8, 16, 32, 48]),
-            Axis::token_axis(),
-        ])])
+    fn sweep_grid(config: &Self::Config) -> SweepGrid {
+        let mut values = Axis::chain([Axis::values([1, 4, 8, 16, 32, 48]), Axis::token_axis()]);
+        if let Some(corpus) = &config.token_corpus {
+            values = Axis::chain([
+                values,
+                (1..=8)
+                    .map(|i| f64::from(corpus.group_size) * f64::from(i))
+                    .collect(),
+            ]);
+        }
+        SweepGrid::new(vec![values])
     }
 
     fn cache_kind(_backend: &'static str) -> CacheKind {
@@ -82,14 +90,24 @@ impl KernelSpec for Nvfp4FusedMoeSpec {
             "folded_rank_position must select an EP rank"
         );
 
+        let corpus = config.token_corpus.as_ref().map(|c| {
+            assert_eq!(c.num_experts, num_experts);
+            assert_eq!(c.top_k, config.top_k as usize);
+            c.load()
+                .expect("validated token corpus must remain readable and unchanged")
+        });
         grid.expand_1d(|num_tokens| {
-            let mut per_expert_batches = sample_and_fold_layerwise_topk_expert_counts(
-                &config.layerwise_global_ppm,
-                config.top_k,
-                num_tokens as u32,
-                num_local_experts,
-                FOLD_SEED,
-            );
+            let mut per_expert_batches = if let Some(corpus) = &corpus {
+                corpus.sample_and_fold(num_tokens as u32, num_local_experts)
+            } else {
+                sample_and_fold_layerwise_topk_expert_counts(
+                    &config.layerwise_global_ppm,
+                    config.top_k,
+                    num_tokens as u32,
+                    num_local_experts,
+                    FOLD_SEED,
+                )
+            };
             assert_eq!(
                 per_expert_batches.len(),
                 num_experts,
@@ -153,8 +171,30 @@ mod tests {
                     220_000, 200_000, 160_000, 120_000, 100_000, 80_000, 70_000, 50_000,
                 ],
             ],
+            token_corpus: None,
             folded_rank_position: 0,
         }
+    }
+
+    #[test]
+    fn corpus_grid_includes_verify_multiples_and_stays_bounded() {
+        let mut config = config();
+        config.token_corpus = Some(crate::timing::token_corpus::TokenCorpusConfig {
+            schema_version: 1,
+            data_file: String::new(),
+            num_tokens: 100,
+            num_layers: 2,
+            num_experts: 8,
+            top_k: 2,
+            checksum_fnv1a64: 0,
+            group_size: 8,
+            seed: 42,
+            sampling_candidates: 16,
+        });
+        let grid = Nvfp4FusedMoeSpec::sweep_grid(&config);
+        let values = grid.expand_1d(|n| n as u32);
+        assert!(values.contains(&24) && values.contains(&40) && values.contains(&56));
+        assert!(values.len() <= 500);
     }
 
     #[test]

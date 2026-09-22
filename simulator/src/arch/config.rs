@@ -422,6 +422,10 @@ pub enum IterArchSel {
         #[serde(default)]
         #[param(cache_key)]
         expert_popularity_file: Option<String>,
+        /// Recorded target-token routes, sampled in verify-width groups at profile build time.
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_token_corpus_file: Option<String>,
     },
     /// SGLang's B200 NVFP4 launch graph under pure tensor parallelism. Every
     /// rank owns all experts (EP1) and shards the routed intermediate axis by

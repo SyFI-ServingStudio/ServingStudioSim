@@ -345,6 +345,7 @@ pub fn build_configs(
             routed_scaling_numerator: 5,
             routed_scaling_denominator: 2,
             layerwise_global_ppm: Vec::new(),
+            token_corpus: None,
             folded_rank_position: 0,
         },
         routing,

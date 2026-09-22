@@ -1410,6 +1410,7 @@ pub fn glm53_vllm_nvfp4_dsa_moe_dflash2(
     routing_kind: RoutingKind,
     routing_seed: Option<u64>,
     expert_popularity_file: Option<&str>,
+    expert_token_corpus_file: Option<&str>,
     draft_tokens: u32,
     draft_sliding_window: u32,
     gpu: &str,
@@ -1445,7 +1446,7 @@ pub fn glm53_vllm_nvfp4_dsa_moe_dflash2(
     // "dflash", ...}` never instantiates it -- the capture's server log
     // mentions no MTP or nextn layer at all. `Off` is what keeps this model's
     // cost tree and its `state_bytes_per_token` telling the same story.
-    let configs = glm52_vllm_nvfp4_dsa_moe::build_speculative_configs(
+    let mut configs = glm52_vllm_nvfp4_dsa_moe::build_speculative_configs(
         &model_cfg,
         &parallel,
         &target_routing,
@@ -1455,6 +1456,21 @@ pub fn glm53_vllm_nvfp4_dsa_moe_dflash2(
         draft_tokens,
     )
     .context("expanding GLM NVFP4 target configs for a DFlash2 deployment")?;
+    if let Some(path) = expert_token_corpus_file {
+        let width = draft_tokens.checked_add(1).context("verify width overflow")?;
+        let corpus = crate::timing::token_corpus::TokenCorpusConfig::from_manifest(
+            path, width, routing_seed.unwrap_or(0xF01D_5EED),
+        )?;
+        anyhow::ensure!(corpus.num_layers == num_sparse_layers(&model_cfg) as usize
+            && corpus.num_experts == model_cfg.num_experts.get() as usize
+            && corpus.top_k == model_cfg.router_top_k as usize,
+            "token corpus dimensions must match the target model");
+        // Validate before constructing any kernel caches or issuing profiling work.
+        corpus.load()?;
+        for config in &mut configs.nvfp4_moe {
+            config.token_corpus = Some(corpus.clone());
+        }
+    }
     let resolved = glm52_vllm_nvfp4_dsa_moe::resolve_configs(&configs);
     let draft = dflash2_draft_resolved(&parallel, draft_tokens, draft_sliding_window)
         .context("expanding the DFlash2 draft configs")?;
@@ -1636,6 +1652,7 @@ pub fn build_speculative_iter_model(
             draft_tokens,
             draft_sliding_window,
             expert_popularity_file,
+            expert_token_corpus_file,
         } => Ok((
             Box::new(glm53_vllm_nvfp4_dsa_moe_dflash2(
                 model,
@@ -1645,6 +1662,7 @@ pub fn build_speculative_iter_model(
                 *routing,
                 *routing_seed,
                 expert_popularity_file.as_deref(),
+                expert_token_corpus_file.as_deref(),
                 *draft_tokens,
                 *draft_sliding_window,
                 gpu,

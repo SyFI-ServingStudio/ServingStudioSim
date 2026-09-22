@@ -43,6 +43,7 @@ pub struct Nvfp4MoeLocalWorkletConfig {
     pub routed_scaling_numerator: u32,
     pub routed_scaling_denominator: u32,
     pub layerwise_global_ppm: Vec<Vec<u32>>,
+    pub token_corpus: Option<crate::timing::token_corpus::TokenCorpusConfig>,
     /// Position in the active-count-ranked EP workload list produced by the
     /// shared complete-layer fold. It is not a physical rank identity.
     pub folded_rank_position: u32,
@@ -181,6 +182,7 @@ impl Nvfp4MoeLocalWorklet {
                 routed_scaling_numerator: cfg.routed_scaling_numerator,
                 routed_scaling_denominator: cfg.routed_scaling_denominator,
                 layerwise_global_ppm: cfg.layerwise_global_ppm.clone(),
+                token_corpus: cfg.token_corpus.clone(),
                 folded_rank_position: cfg.folded_rank_position,
             },
             experts_per_device,
@@ -277,6 +279,7 @@ mod tests {
             routed_scaling_numerator: 5,
             routed_scaling_denominator: 2,
             layerwise_global_ppm: Vec::new(),
+            token_corpus: None,
             folded_rank_position: 0,
         }
     }
