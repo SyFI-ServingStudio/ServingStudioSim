@@ -244,6 +244,43 @@ impl Deployment for UnifiedDeployment {
                     build_qwen36_hybrid_worker,
                 ))
             }
+            IterArchSel::KimiK3Sglang {
+                attn_tp_size,
+                ep_size,
+                pp_size,
+                dcp_size,
+                heads_per_rank,
+                local_experts,
+                sim_kda_layers,
+                sim_mla_layers,
+                ..
+            } => {
+                ensure_hp_or_chunked_worker("Kimi-K3 SGLang", &g.worker)?;
+                let model = Arc::new(arch_build::kimi_k3_sglang(
+                    model_spec,
+                    *attn_tp_size,
+                    *ep_size,
+                    *pp_size,
+                    *dcp_size,
+                    *heads_per_rank,
+                    *local_experts,
+                    *sim_kda_layers,
+                    *sim_mla_layers,
+                    &gpu_name,
+                    MODEL_NAME,
+                    bridge,
+                )?);
+                assemble_hp_or_chunked_flow(
+                    "Kimi-K3 SGLang",
+                    model,
+                    store,
+                    worker_config,
+                    log_dir,
+                    gpu_name,
+                    dp_cfg,
+                    &g.worker,
+                )
+            }
             IterArchSel::Llama3Dense { .. } => {
                 ensure_barebone(&g.worker)?;
                 let model = Arc::new(arch_build::dense(

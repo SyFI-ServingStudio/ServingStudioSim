@@ -26,6 +26,11 @@ pub mod glm52_moe_router_local;
 pub mod glm52_mtp_head_local;
 pub mod glm52_mtp_prelude_local;
 pub mod glm52_shared_expert_local;
+mod kimi_k3_common;
+pub mod kimi_k3_dense_local;
+pub mod kimi_k3_kda_local;
+pub mod kimi_k3_mla_local;
+pub mod kimi_k3_moe_local;
 pub mod mlp_block_tp;
 pub mod moe_expert_compute_local;
 pub mod native_fp8_moe_router_local;
@@ -115,6 +120,22 @@ pub use glm52_mtp_prelude_local::{
 pub use glm52_shared_expert_local::{
     Glm52SharedExpertLocalWorklet, Glm52SharedExpertLocalWorkletConfig,
     Glm52SharedExpertLocalWorkletInput, Glm52SharedExpertLocalWorkletResolved,
+};
+pub use kimi_k3_dense_local::{
+    KimiK3DenseLocalWorklet, KimiK3DenseLocalWorkletConfig, KimiK3DenseLocalWorkletInput,
+    KimiK3DenseLocalWorkletResolved,
+};
+pub use kimi_k3_kda_local::{
+    KimiK3KdaLocalWorklet, KimiK3KdaLocalWorkletConfig, KimiK3KdaLocalWorkletInput,
+    KimiK3KdaLocalWorkletResolved,
+};
+pub use kimi_k3_mla_local::{
+    KimiK3MlaLocalWorklet, KimiK3MlaLocalWorkletConfig, KimiK3MlaLocalWorkletInput,
+    KimiK3MlaLocalWorkletResolved,
+};
+pub use kimi_k3_moe_local::{
+    KimiK3MoeLocalWorklet, KimiK3MoeLocalWorkletConfig, KimiK3MoeLocalWorkletInput,
+    KimiK3MoeLocalWorkletResolved,
 };
 pub use mlp_block_tp::{
     MlpBlockTpWorklet, MlpBlockTpWorkletConfig, MlpBlockTpWorkletInput, MlpBlockTpWorkletResolved,

@@ -39,7 +39,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{bail, ensure, Context, Result};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -54,7 +54,7 @@ use crate::arch::contract::{
 use crate::arch::{AttnArchSel, FfnArchSel, IterArchSel};
 use crate::common::{Time, WorkerId};
 use crate::deployment::BackendOverrides;
-use crate::timing::{CostManifestDoc, PerfApiBridge};
+use crate::timing::{CostManifestDoc, KernelMissing, PerfApiBridge};
 use crate::worker::CostBuffers;
 
 /// The AFD deployment's dotted-leaf prefix (see `deployment/afd.rs`). Predicting
@@ -339,6 +339,7 @@ pub fn run_timing_predict(config_path: &Path) -> Result<()> {
             let _scope = bridge.with_backend_overrides("main", cfg.backends.get("main"));
             let model = build_iter_model(sel, &cfg.gpu, UNIFIED_MODEL_NAME, &bridge)
                 .context("building the iter-wise arch model")?;
+            ensure_predict_cache_ready(&bridge)?;
             let cases: Vec<PredictCase> = load_cases(&cfg.cases_file, config_path)?;
             let n = cases.len();
             run_iter_cases(&*model, cases, &cfg.log_dir)?;
@@ -349,6 +350,7 @@ pub fn run_timing_predict(config_path: &Path) -> Result<()> {
             let (model, draft_tokens) =
                 build_speculative_iter_model(sel, &cfg.gpu, UNIFIED_MODEL_NAME, &bridge)
                     .context("building the speculative iter-wise model")?;
+            ensure_predict_cache_ready(&bridge)?;
             let cases: Vec<SpeculativePredictCase> = load_cases(&cfg.cases_file, config_path)?;
             let n = cases.len();
             run_speculative_iter_cases(&*model, draft_tokens, cases, &cfg.log_dir)?;
@@ -357,6 +359,7 @@ pub fn run_timing_predict(config_path: &Path) -> Result<()> {
         PredictArchSel::Attn(sel) => {
             let _scope = bridge.with_backend_overrides("attn", cfg.backends.get("attn"));
             let model = build_attn_model(sel, &cfg.gpu, AFD_MODEL_NAME, &bridge)?;
+            ensure_predict_cache_ready(&bridge)?;
             let cases: Vec<PredictCase> = load_cases(&cfg.cases_file, config_path)?;
             let n = cases.len();
             run_attn_cases(&*model, cases, &cfg.log_dir)?;
@@ -365,6 +368,7 @@ pub fn run_timing_predict(config_path: &Path) -> Result<()> {
         PredictArchSel::Ffn(sel) => {
             let _scope = bridge.with_backend_overrides("ffn", cfg.backends.get("ffn"));
             let model = build_ffn_model(sel, &cfg.gpu, AFD_MODEL_NAME, &bridge)?;
+            ensure_predict_cache_ready(&bridge)?;
             let cases: Vec<FfnArchInput> = load_cases(&cfg.cases_file, config_path)?;
             let n = cases.len();
             run_ffn_cases(&*model, cases, &cfg.log_dir)?;
@@ -404,7 +408,7 @@ mod provenance_tests {
     use serde_json::Value;
     use tempfile::tempdir;
 
-    use super::{PREDICTION_PROVENANCE_FILE, write_prediction_provenance};
+    use super::{write_prediction_provenance, PREDICTION_PROVENANCE_FILE};
 
     #[test]
     fn prediction_provenance_preserves_l4_gpu_extent() {
@@ -430,15 +434,33 @@ mod provenance_tests {
     }
 }
 
-/// Offline what-if bridge: JIT-fill missing `profile.db` rows on build (like
-/// `kernel-query`), rather than the strict fail-fast a real `run` uses. A warm
-/// cache then needs no GPU; a cold one profiles on demand.
+/// Offline prediction bridge: inspect cache coverage without attempting to JIT
+/// profile. This keeps timing-predict usable on CPU-only development hosts and
+/// lets the caller report the complete cold-cache work in one error.
 fn predict_bridge() -> Result<PerfApiBridge> {
     let bridge = PerfApiBridge::new().context("starting the PyO3 perf_api bridge")?;
-    bridge
-        .enable_jit_profiling()
-        .context("enabling JIT profiling for offline prediction")?;
+    bridge.enable_dry_run();
     Ok(bridge)
+}
+
+fn ensure_predict_cache_ready(bridge: &PerfApiBridge) -> Result<()> {
+    let report = bridge.take_dry_run_report();
+    let missing: Vec<&KernelMissing> = report.iter().filter(|row| row.missing > 0).collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    let total_missing: usize = missing.iter().map(|row| row.missing).sum();
+    let total_specs: usize = missing.iter().map(|row| row.total).sum();
+    let mut message =
+        format!("timing-predict cache misses: {total_missing} / {total_specs} specs missing\n");
+    for row in missing {
+        message.push_str(&format!(
+            "  {} ({}) {} / {} missing\n",
+            row.name, row.kind, row.missing, row.total
+        ));
+    }
+    bail!("{message}");
 }
 
 /// Run the iter-wise cases: one [`CostBuffers::run_iter`] per case (one parquet row
