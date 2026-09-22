@@ -3,8 +3,7 @@
 use crate::op::Op;
 use crate::timing::bridge::DType;
 use crate::timing::kernels::{
-    ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput, ResidualRmsNormKernel,
-    ResidualRmsNormKernelConfig, ResidualRmsNormKernelInput, SingleGemmKernel,
+    ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput, SingleGemmKernel,
     SingleGemmKernelConfig, SingleGemmKernelInput,
 };
 use crate::timing::{CostNode, CostTreeBuilder, Dim, Evaluator, PerfApiBridge};
@@ -15,7 +14,7 @@ const HIDDEN: u32 = 7_168;
 const INTERMEDIATE: u32 = 33_792;
 
 #[cfg(test)]
-const SOURCE_ORDER: [&str; 4] = ["post_attention_layernorm", "gate_up", "situ", "down"];
+const SOURCE_ORDER: [&str; 3] = ["gate_up", "situ", "down"];
 
 #[derive(Clone, Debug)]
 pub struct KimiK3DenseLocalWorkletConfig {
@@ -23,7 +22,6 @@ pub struct KimiK3DenseLocalWorkletConfig {
     pub hidden: Dim,
     pub intermediate: Dim,
     pub dtype: DType,
-    pub residual_norm_backends: Vec<&'static str>,
     pub gemm_backends: Vec<&'static str>,
     pub elementwise_backends: Vec<&'static str>,
 }
@@ -31,7 +29,6 @@ pub struct KimiK3DenseLocalWorkletConfig {
 #[derive(Clone, Debug)]
 pub struct KimiK3DenseLocalWorkletResolved {
     pub raw_cfg: KimiK3DenseLocalWorkletConfig,
-    pub post_attention_layernorm: ResidualRmsNormKernelConfig,
     pub gate_up: SingleGemmKernelConfig,
     pub situ: ElementwiseKernelConfig,
     pub down: SingleGemmKernelConfig,
@@ -44,7 +41,6 @@ pub struct KimiK3DenseLocalWorkletInput {
 
 pub struct KimiK3DenseLocalWorklet {
     pub name: String,
-    pub post_attention_layernorm: Op<ResidualRmsNormKernel>,
     pub gate_up: Op<SingleGemmKernel>,
     pub situ: Op<ElementwiseKernel>,
     pub down: Op<SingleGemmKernel>,
@@ -56,12 +52,6 @@ impl KimiK3DenseLocalWorklet {
         validate_config(cfg)
             .unwrap_or_else(|reason| panic!("invalid KimiK3DenseLocalWorkletConfig: {reason}"));
         KimiK3DenseLocalWorkletResolved {
-            post_attention_layernorm: ResidualRmsNormKernelConfig {
-                backends: cfg.residual_norm_backends.clone(),
-                gpu_name: cfg.gpu_name.clone(),
-                hidden: cfg.hidden.clone(),
-                dtype: cfg.dtype,
-            },
             gate_up: SingleGemmKernelConfig {
                 backends: cfg.gemm_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
@@ -92,13 +82,6 @@ impl KimiK3DenseLocalWorklet {
         bridge: &PerfApiBridge,
     ) -> Result<Self, crate::timing::BuildError> {
         Ok(Self {
-            post_attention_layernorm: build_atomic(
-                &name,
-                "post_attention_layernorm",
-                resolved.post_attention_layernorm.clone(),
-                ResidualRmsNormKernel::build,
-                bridge,
-            )?,
             gate_up: build_atomic(
                 &name,
                 "gate_up",
@@ -132,7 +115,6 @@ impl KimiK3DenseLocalWorklet {
                 self.name, self.resolved.raw_cfg.hidden, self.resolved.raw_cfg.intermediate
             ),
             child: Box::new(CostNode::Sum(vec![
-                self.post_attention_layernorm.compile(builder),
                 self.gate_up.compile(builder),
                 self.situ.compile(builder),
                 self.down.compile(builder),
@@ -142,12 +124,6 @@ impl KimiK3DenseLocalWorklet {
 
     pub fn eval(&self, input: &KimiK3DenseLocalWorkletInput, evaluator: &mut Evaluator) {
         let rows = input.batch_tokens;
-        eval_atomic_or_zero(
-            &self.post_attention_layernorm,
-            ResidualRmsNormKernelInput { m: rows },
-            rows == 0,
-            evaluator,
-        );
         eval_atomic_or_zero(
             &self.gate_up,
             SingleGemmKernelInput { m: rows },
@@ -195,7 +171,6 @@ mod tests {
             hidden: HIDDEN.into(),
             intermediate: INTERMEDIATE.into(),
             dtype: DType::Bf16,
-            residual_norm_backends: vec!["vllm_cuda"],
             gemm_backends: vec!["sglang_bf16_auto"],
             elementwise_backends: vec!["triton"],
         }
@@ -203,7 +178,7 @@ mod tests {
 
     #[test]
     fn dense_swiglu_shapes_and_byte_rates_are_frozen() {
-        assert_eq!(SOURCE_ORDER.len(), 4);
+        assert_eq!(SOURCE_ORDER.len(), 3);
         let resolved = KimiK3DenseLocalWorklet::resolve_config(&config());
         assert_eq!(resolved.gate_up.n, 67_584);
         assert_eq!(resolved.gate_up.k, HIDDEN);

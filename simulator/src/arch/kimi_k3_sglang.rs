@@ -525,7 +525,6 @@ pub fn build_configs(
             hidden: model.hidden.clone(),
             intermediate: model.dense_intermediate.clone(),
             dtype: DType::Bf16,
-            residual_norm_backends: RESIDUAL_NORM_BACKENDS.to_vec(),
             gemm_backends: GEMM_BACKENDS.to_vec(),
             elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
         }),
@@ -1190,6 +1189,88 @@ mod tests {
             local_recurrent_state_bytes_per_request(configs.counts.dense + configs.counts.kda, 12)
                 .get(),
             (420_864 * 69)
+        );
+    }
+
+    #[test]
+    fn production_cost_tree_freezes_slot_order_and_communication_leaves() {
+        let production = KimiK3SglangParallel {
+            attn_tp_size: 8,
+            ep_size: 8,
+            pp_size: 2,
+            dcp_size: 1,
+            heads_per_rank: None,
+            local_experts: None,
+            sim_kda_layers: None,
+            sim_mla_layers: None,
+            gpu_name: "NVIDIA B200".into(),
+        };
+        let bridge = PerfApiBridge::new_uninit_for_test();
+        bridge.enable_enumerate();
+        let configs = build_configs(&model(), &production).unwrap();
+        let enumerated = build("unified".into(), resolve_configs(&configs), &bridge).unwrap();
+        let tree = enumerated.cost_tree();
+        let names: Vec<&str> = tree.slots.iter().map(|slot| slot.name.as_str()).collect();
+        assert_eq!(tree.n_slots(), 48);
+        assert_eq!(
+            names,
+            [
+                "unified.embedding",
+                "unified.dense.attention.input_layernorm",
+                "unified.dense.attention.qkvbfg_a_proj",
+                "unified.dense.attention.kda_fused_decode",
+                "unified.dense.attention.o_proj",
+                "unified.dense.attention.tp_allreduce_zero",
+                "unified.dense.attention.post_attention_layernorm",
+                "unified.dense.ffn.gate_up",
+                "unified.dense.ffn.situ",
+                "unified.dense.ffn.down",
+                "unified.kda.attention.input_layernorm",
+                "unified.kda.attention.qkvbfg_a_proj",
+                "unified.kda.attention.kda_fused_decode",
+                "unified.kda.attention.o_proj",
+                "unified.kda.attention.tp_allreduce_zero",
+                "unified.kda.attention.post_attention_layernorm",
+                "unified.kda.moe.merged_front",
+                "unified.kda.moe.shared_gate_up_activation",
+                "unified.kda.moe.shared_down",
+                "unified.kda.moe.mxfp4_fused_moe",
+                "unified.kda.moe.routed_norm",
+                "unified.kda.moe.latent_up",
+                "unified.kda.moe.add3",
+                "unified.kda.moe.ep_alltoall_zero",
+                "unified.mla.attention.input_layernorm",
+                "unified.mla.attention.fused_qkv_a_proj",
+                "unified.mla.attention.q_a_layernorm",
+                "unified.mla.attention.q_b_proj",
+                "unified.mla.attention.kv_a_layernorm",
+                "unified.mla.attention.q_absorb",
+                "unified.mla.attention.mla_cache_append",
+                "unified.mla.attention.mla_decode_attention",
+                "unified.mla.attention.v_up",
+                "unified.mla.attention.output_gate",
+                "unified.mla.attention.sigmoid_mul",
+                "unified.mla.attention.o_proj",
+                "unified.mla.attention.tp_allreduce_zero",
+                "unified.mla.attention.post_attention_layernorm",
+                "unified.mla.moe.merged_front",
+                "unified.mla.moe.shared_gate_up_activation",
+                "unified.mla.moe.shared_down",
+                "unified.mla.moe.mxfp4_fused_moe",
+                "unified.mla.moe.routed_norm",
+                "unified.mla.moe.latent_up",
+                "unified.mla.moe.add3",
+                "unified.mla.moe.ep_alltoall_zero",
+                "unified.final_norm",
+                "unified.lm_head",
+            ]
+        );
+        assert_eq!(
+            tree.slots
+                .iter()
+                .filter(|slot| slot.kind == "all_reduce" || slot.kind == "moe_alltoall")
+                .count(),
+            5
         );
     }
 
