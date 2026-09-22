@@ -134,6 +134,13 @@ impl PerfApiBridge {
         *self.dry_run.borrow_mut() = Some(DryRunReport::default());
     }
 
+    /// Leave dry-run mode after a coverage check has confirmed that every
+    /// requested profile row is already cached. The next kernel build then fits
+    /// normal runtime caches from those rows without attempting JIT profiling.
+    pub fn disable_dry_run(&self) {
+        *self.dry_run.borrow_mut() = None;
+    }
+
     /// Whether the bridge is in dry-run mode (set by [`enable_dry_run`](Self::enable_dry_run)).
     pub fn is_dry_run(&self) -> bool {
         self.dry_run.borrow().is_some()
@@ -844,6 +851,8 @@ mod tests {
         assert!(bridge.is_dry_run());
         assert_eq!(count("single_gemm", "B200", vec![spec]), 1);
         assert!(bridge.take_dry_run_report().is_empty());
+        bridge.disable_dry_run();
+        assert!(!bridge.is_dry_run());
     }
 
     #[test]

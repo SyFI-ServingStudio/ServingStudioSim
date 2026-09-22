@@ -337,9 +337,13 @@ pub fn run_timing_predict(config_path: &Path) -> Result<()> {
     let (num_cases, gpu_count) = match &cfg.arch {
         PredictArchSel::Iter(sel) => {
             let _scope = bridge.with_backend_overrides("main", cfg.backends.get("main"));
+            {
+                let _coverage_model = build_iter_model(sel, &cfg.gpu, UNIFIED_MODEL_NAME, &bridge)
+                    .context("checking iter-wise arch cache coverage")?;
+                ensure_predict_cache_ready(&bridge)?;
+            }
             let model = build_iter_model(sel, &cfg.gpu, UNIFIED_MODEL_NAME, &bridge)
-                .context("building the iter-wise arch model")?;
-            ensure_predict_cache_ready(&bridge)?;
+                .context("building the iter-wise arch model from cached timings")?;
             let cases: Vec<PredictCase> = load_cases(&cfg.cases_file, config_path)?;
             let n = cases.len();
             run_iter_cases(&*model, cases, &cfg.log_dir)?;
@@ -347,10 +351,15 @@ pub fn run_timing_predict(config_path: &Path) -> Result<()> {
         }
         PredictArchSel::SpeculativeIter(sel) => {
             let _scope = bridge.with_backend_overrides("main", cfg.backends.get("main"));
+            {
+                let _coverage_model =
+                    build_speculative_iter_model(sel, &cfg.gpu, UNIFIED_MODEL_NAME, &bridge)
+                        .context("checking speculative iter cache coverage")?;
+                ensure_predict_cache_ready(&bridge)?;
+            }
             let (model, draft_tokens) =
                 build_speculative_iter_model(sel, &cfg.gpu, UNIFIED_MODEL_NAME, &bridge)
-                    .context("building the speculative iter-wise model")?;
-            ensure_predict_cache_ready(&bridge)?;
+                    .context("building the speculative iter-wise model from cached timings")?;
             let cases: Vec<SpeculativePredictCase> = load_cases(&cfg.cases_file, config_path)?;
             let n = cases.len();
             run_speculative_iter_cases(&*model, draft_tokens, cases, &cfg.log_dir)?;
@@ -358,8 +367,13 @@ pub fn run_timing_predict(config_path: &Path) -> Result<()> {
         }
         PredictArchSel::Attn(sel) => {
             let _scope = bridge.with_backend_overrides("attn", cfg.backends.get("attn"));
-            let model = build_attn_model(sel, &cfg.gpu, AFD_MODEL_NAME, &bridge)?;
-            ensure_predict_cache_ready(&bridge)?;
+            {
+                let _coverage_model = build_attn_model(sel, &cfg.gpu, AFD_MODEL_NAME, &bridge)
+                    .context("checking attention cache coverage")?;
+                ensure_predict_cache_ready(&bridge)?;
+            }
+            let model = build_attn_model(sel, &cfg.gpu, AFD_MODEL_NAME, &bridge)
+                .context("building the attention model from cached timings")?;
             let cases: Vec<PredictCase> = load_cases(&cfg.cases_file, config_path)?;
             let n = cases.len();
             run_attn_cases(&*model, cases, &cfg.log_dir)?;
@@ -367,8 +381,13 @@ pub fn run_timing_predict(config_path: &Path) -> Result<()> {
         }
         PredictArchSel::Ffn(sel) => {
             let _scope = bridge.with_backend_overrides("ffn", cfg.backends.get("ffn"));
-            let model = build_ffn_model(sel, &cfg.gpu, AFD_MODEL_NAME, &bridge)?;
-            ensure_predict_cache_ready(&bridge)?;
+            {
+                let _coverage_model = build_ffn_model(sel, &cfg.gpu, AFD_MODEL_NAME, &bridge)
+                    .context("checking FFN cache coverage")?;
+                ensure_predict_cache_ready(&bridge)?;
+            }
+            let model = build_ffn_model(sel, &cfg.gpu, AFD_MODEL_NAME, &bridge)
+                .context("building the FFN model from cached timings")?;
             let cases: Vec<FfnArchInput> = load_cases(&cfg.cases_file, config_path)?;
             let n = cases.len();
             run_ffn_cases(&*model, cases, &cfg.log_dir)?;
@@ -447,6 +466,7 @@ fn ensure_predict_cache_ready(bridge: &PerfApiBridge) -> Result<()> {
     let report = bridge.take_dry_run_report();
     let missing: Vec<&KernelMissing> = report.iter().filter(|row| row.missing > 0).collect();
     if missing.is_empty() {
+        bridge.disable_dry_run();
         return Ok(());
     }
 
