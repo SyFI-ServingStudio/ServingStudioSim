@@ -253,6 +253,31 @@ the **DB key columns** (in declaration order), and the **public spec dict** keys
 `backend` and `gpu_name` are routing/identity, not args — they stay out of the
 schema and are passed as separate kwargs / DB columns.
 
+### Standalone profiling environments
+
+Most backends run in the project `.venv` (`subprocess_env="default_env"` or the
+`flashinfer_pip_env` alias). A backend gets its own entry in
+`profiling/exec/env.py` only for a real ABI or linker conflict. Those envs live
+at `~/profile_envs/<name>` and are **not** created by `just sync`; build them
+once, from the exact command recorded here, so a measured row can be traced to a
+reproducible dependency set rather than to a machine's history.
+
+`sgl_kernel_env` — SGLang's own FlashAttention-3, for the `sgl_fa3` decode
+backend. sgl-kernel ships a prebuilt CUDA extension linked against a Torch this
+project does not pin, so importing it in the project venv fails with an
+`undefined symbol` from `libc10_cuda`. Two packages, nothing else:
+
+```bash
+uv venv --python 3.12 ~/profile_envs/sgl_kernel
+uv pip install --python ~/profile_envs/sgl_kernel/bin/python \
+    torch==2.8.0 --torch-backend=cu128
+uv pip install --python ~/profile_envs/sgl_kernel/bin/python \
+    sgl-kernel==0.3.17 numpy ninja
+```
+
+`ninja` and `numpy` are for the JIT-built CUPTI timing extension, not for the
+kernel. Pin Torch to the cu12x build when the host driver predates CUDA 13.
+
 ## DB shape
 
 One table per args schema, keyed `UNIQUE(gpu_name, backend, <args...>)`. Re-profiling

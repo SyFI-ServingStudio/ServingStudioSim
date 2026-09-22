@@ -123,6 +123,14 @@ ENV_REGISTRY: dict[str, ProfileEnv | ContainerProfileEnv] = {
         _SGLANG_PYTHON,
         additional_python_paths=(_SGLANG_PYTHON_ROOT,),
     ),
+    # sgl-kernel's prebuilt CUDA extensions are ABI-bound to the Torch they were
+    # compiled against, which is not the Torch this project pins. Deliberately a
+    # standalone env holding one wheel plus its Torch rather than the full
+    # `sglang_env`: the kernels profiled from it are called directly, so nothing
+    # here needs the serving framework, and keeping the dependency surface at
+    # two packages is what makes the recorded rows reproducible from the setup
+    # command in profiling/README.md instead of from someone's container.
+    "sgl_kernel_env": ProfileEnv("sgl_kernel_env", _profile_env_python("sgl_kernel")),
     # vLLM runners execute in the pinned image; host source and Python packages
     # are deliberately outside this environment boundary.
     "vllm_env": ContainerProfileEnv(

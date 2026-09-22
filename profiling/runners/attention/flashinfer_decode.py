@@ -36,6 +36,12 @@ from profiling.runners.exceptions import KernelLaunchFailed, ProfilerNotImplemen
 from profiling.runners.metrics import ComputeMetrics
 
 _PAGE_SIZE = 16
+# SGLang's server default is page_size=1, and the captured slime deployment runs
+# it. Page size is not a free knob here: it is the framework's KV-pool geometry,
+# so each backend row is measured at the one its own framework uses. Comparing
+# the sgl_fa3 row against fa2 therefore compares two deployments, not two
+# kernels at matched inputs -- which is what the simulator needs.
+_SGL_PAGE_SIZE = 1
 
 
 def _run_cudnn_decode(
@@ -85,6 +91,99 @@ def _run_cudnn_decode(
     return _common.measure(benchmark_fn, flops=flops, bytes_accessed=bytes_accessed)
 
 
+def _run_sgl_fa3_decode(
+    *,
+    batch_size: int,
+    seq_len: int,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    q_dtype: DType | str,
+    kv_dtype: DType | str,
+    o_dtype: DType | str,
+) -> ComputeMetrics:
+    """SGLang's FA3 decode: ``sgl_kernel.flash_attn.flash_attn_with_kvcache``.
+
+    Not FlashInfer's ``backend="fa3"``. SGLang's ``attention_backend=fa3``
+    selects ``FlashAttentionBackend``, whose ``forward_decode`` calls sgl-kernel's
+    own vendored FlashAttention-3. Argument shapes and flags below mirror that
+    call site's plain (non-MLA, non-SWA, non-cascade, non-spec-decode) path:
+    varlen query with one token per request, a dense ``page_table``, and
+    ``causal=True`` -- which is a no-op for a single query token but is what the
+    production call passes, so the kernel picks the same tile schedule.
+
+    ``scheduler_metadata`` stays ``None``: the sgl-kernel version pinned for this
+    backend accepts the argument but exposes no ``get_scheduler_metadata`` to
+    build it, matching the SGLang release that has no precompute.
+    """
+    import torch
+
+    if any(_common.is_fp8(d) for d in (q_dtype, kv_dtype, o_dtype)):
+        # fp8 KV needs k_descale/v_descale this runner does not build; refuse
+        # rather than silently measure an unscaled kernel.
+        raise ProfilerNotImplemented("sgl_fa3 decode runner supports bf16 only")
+
+    try:
+        from sgl_kernel.flash_attn import flash_attn_with_kvcache, is_fa3_supported
+    except ImportError as exc:
+        raise ProfilerNotImplemented(
+            "sgl-kernel is required for the sgl_fa3 backend; see profiling/README.md"
+        ) from exc
+    if not is_fa3_supported():
+        raise ProfilerNotImplemented("sgl-kernel FA3 (ver=3) requires a Hopper GPU")
+
+    inp = _common.build_paged_decode_inputs(
+        batch_size=batch_size,
+        seq_len=seq_len,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        q_dtype=q_dtype,
+        kv_dtype=kv_dtype,
+        o_dtype=o_dtype,
+        page_size=_SGL_PAGE_SIZE,
+    )
+    # Same contiguous per-request page runs the FlashInfer rows use, reshaped
+    # from CSR indices into the dense (batch, pages) table FA3 wants.
+    page_table = inp.kv_indices.view(batch_size, -1)
+    cache_seqlens = torch.full((batch_size,), seq_len, dtype=torch.int32, device="cuda")
+    cu_seqlens_q = torch.arange(batch_size + 1, dtype=torch.int32, device="cuda")
+
+    def benchmark_fn():
+        return flash_attn_with_kvcache(
+            q=inp.q,
+            k_cache=inp.k_cache,
+            v_cache=inp.v_cache,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=1,
+            softmax_scale=head_dim**-0.5,
+            causal=True,
+            window_size=(-1, -1),
+            softcap=0.0,
+            scheduler_metadata=None,
+            num_splits=0,
+            ver=3,
+        )
+
+    # FA3's first call resolves its heuristic split count and any lazy op
+    # registration. Settle that before CUPTI learns the steady-state pattern,
+    # exactly as the FlashInfer fa3 path does.
+    benchmark_fn()
+    torch.cuda.synchronize()
+
+    flops = _common.attention_flops(
+        q_len=1,
+        kv_len=seq_len,
+        num_qo_heads=num_qo_heads,
+        head_dim=head_dim,
+        causal=False,
+        batch_size=batch_size,
+    )
+    return _common.measure(benchmark_fn, flops=flops, bytes_accessed=inp.bytes_accessed)
+
+
 def _run_decode(
     *,
     backend: str,
@@ -120,6 +219,18 @@ def _run_decode(
         raise ProfilerNotImplemented("torch is required for attention runners") from exc
     if not torch.cuda.is_available():
         raise ProfilerNotImplemented("CUDA is required for attention runners")
+
+    if backend == "sgl_fa3":
+        return _run_sgl_fa3_decode(
+            batch_size=batch_size,
+            seq_len=seq_len,
+            num_qo_heads=num_qo_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            q_dtype=q_dtype,
+            kv_dtype=kv_dtype,
+            o_dtype=o_dtype,
+        )
 
     if backend == "cudnn":
         return _run_cudnn_decode(
@@ -247,3 +358,9 @@ def profile_flashinfer_attn_decode_trt(**kwargs) -> ComputeMetrics:
 
 def profile_flashinfer_attn_decode_cudnn(**kwargs) -> ComputeMetrics:
     return _run_decode(backend="cudnn", **kwargs)
+
+
+def profile_flashinfer_attn_decode_sgl_fa3(**kwargs) -> ComputeMetrics:
+    """Profile SGLang's decode attention (sgl-kernel FA3, not FlashInfer's)."""
+
+    return _run_decode(backend="sgl_fa3", **kwargs)

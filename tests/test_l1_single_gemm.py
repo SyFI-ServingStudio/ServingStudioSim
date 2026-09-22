@@ -1537,6 +1537,7 @@ def test_documented_profile_env_registry_complete():
         "flashinfer_pip_env",
         "flashinfer_local",
         "sglang_env",
+        "sgl_kernel_env",
         "vllm_env",
     }
     assert set(ENV_REGISTRY) == expected_envs
