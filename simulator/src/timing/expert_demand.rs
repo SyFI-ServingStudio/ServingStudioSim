@@ -12,6 +12,9 @@
 //! change (a pre-computed table over the sweep grid, say) without touching a
 //! call site.
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
+
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
@@ -20,6 +23,34 @@ use super::token_corpus::{TokenCorpus, TokenCorpusConfig};
 
 /// The seed every demand source folds at, so a profiled shape is reproducible.
 const FOLD_SEED: u64 = 0xF01D_5EED;
+
+/// Payloads already read this process, keyed by the file and the checksum that
+/// identifies its contents.
+///
+/// One build resolves the same corpus once per MoE callable and again per
+/// kernel config per backend, and each resolution is a hundreds-of-megabytes
+/// read plus a full top-k distinctness scan. The manifest's checksum is the
+/// corpus's identity, so two configs naming the same one are the same bytes and
+/// a second read can only confirm what the first proved.
+type CorpusCache = Mutex<HashMap<(String, u64), Arc<Vec<u16>>>>;
+static LOADED_CORPORA: OnceLock<CorpusCache> = OnceLock::new();
+
+fn load_cached(config: &TokenCorpusConfig) -> anyhow::Result<TokenCorpus> {
+    let key = (config.data_file.clone(), config.checksum_fnv1a64);
+    let cache = LOADED_CORPORA.get_or_init(Default::default);
+    let cached = cache.lock().expect("corpus cache").get(&key).cloned();
+    if let Some(ids) = cached {
+        // Sampling parameters live in the config, not the payload, so another
+        // callable binds its own group size and layer slice to these bytes.
+        return TokenCorpus::rebind(config, ids);
+    }
+    let corpus = config.load()?;
+    cache
+        .lock()
+        .expect("corpus cache")
+        .insert(key, corpus.payload());
+    Ok(corpus)
+}
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -99,7 +130,7 @@ impl ExpertDemand {
             } => PreparedDemand::Popularity(layerwise_global_ppm),
             // Loading here rather than in the config keeps the payload out of
             // the cache key; the checksum in the manifest is the identity.
-            Self::Corpus(config) => PreparedDemand::Corpus(config.load()?),
+            Self::Corpus(config) => PreparedDemand::Corpus(load_cached(config)?),
         })
     }
 

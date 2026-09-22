@@ -69,6 +69,12 @@ impl KernelSpec for Bf16FusedMoeSpec {
         CacheKind::Cache1DLinear
     }
 
+    /// The corpus arm names a payload on disk, and `enumerate` has no way to
+    /// report that it moved.
+    fn validate_config(config: &Self::Config) -> anyhow::Result<()> {
+        config.expert_demand.prepare().map(|_| ())
+    }
+
     fn enumerate(
         config: &Self::Config,
         grid: &SweepGrid,
@@ -81,7 +87,7 @@ impl KernelSpec for Bf16FusedMoeSpec {
         let demand = config
             .expert_demand
             .prepare()
-            .expect("a validated expert-demand source must stay readable");
+            .expect("validate_config proved this source readable");
 
         grid.expand_1d(|num_tokens| {
             let per_expert_batches = demand.per_expert_batches(

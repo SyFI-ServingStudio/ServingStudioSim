@@ -61,6 +61,12 @@ impl KernelSpec for Nvfp4FusedMoeSpec {
         CacheKind::Cache1DLinear
     }
 
+    /// The corpus arm names a payload on disk, and `enumerate` has no way to
+    /// report that it moved.
+    fn validate_config(config: &Self::Config) -> anyhow::Result<()> {
+        config.expert_demand.prepare().map(|_| ())
+    }
+
     fn enumerate(
         config: &Self::Config,
         grid: &SweepGrid,
@@ -73,7 +79,7 @@ impl KernelSpec for Nvfp4FusedMoeSpec {
         let demand = config
             .expert_demand
             .prepare()
-            .expect("a validated expert-demand source must stay readable");
+            .expect("validate_config proved this source readable");
 
         grid.expand_1d(|num_tokens| {
             let per_expert_batches = demand.per_expert_batches(
@@ -170,6 +176,32 @@ mod tests {
         assert!(!fields.contains_key("ep_rank"));
         assert!(!fields.contains_key("local_expert_offset"));
         assert!(!fields.contains_key("launch_role"));
+    }
+
+    #[test]
+    fn a_corpus_that_moved_is_reported_rather_than_panicking_the_query() {
+        // `kernel-query` deserializes a config nothing built, so the file it
+        // names may be gone. `enumerate` cannot say so; this is where it is said.
+        let mut moved = config();
+        moved.expert_demand = crate::timing::expert_demand::ExpertDemand::Corpus(
+            crate::timing::token_corpus::TokenCorpusConfig {
+                schema_version: 1,
+                data_file: "/nonexistent/routes.u16".into(),
+                num_tokens: 128,
+                num_layers: 4,
+                num_experts: 64,
+                top_k: 8,
+                checksum_fnv1a64: 0,
+                group_size: 8,
+                layer_start: 0,
+                layer_end: 4,
+                seed: 0,
+                sampling_candidates: 16,
+            },
+        );
+
+        let error = Nvfp4FusedMoeSpec::validate_config(&moved).expect_err("a moved corpus");
+        assert!(format!("{error:#}").contains("token corpus data"));
     }
 
     #[test]

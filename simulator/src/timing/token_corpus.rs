@@ -6,6 +6,7 @@
 //! This corpus keeps whole tokens, so a draw can reproduce that correlation by
 //! taking contiguous windows the width of the verify block.
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -59,7 +60,10 @@ fn one() -> u32 {
 /// A validated corpus with its payload resident.
 pub struct TokenCorpus {
     config: TokenCorpusConfig,
-    ids: Vec<u16>,
+    /// Shared so a second callable of the same corpus -- the MTP layer, or the
+    /// same arch under another backend -- binds its own sampling parameters to
+    /// bytes that are already read and already validated.
+    ids: Arc<Vec<u16>>,
 }
 
 /// Summarised rather than derived: `ids` holds one entry per recorded
@@ -93,17 +97,28 @@ impl TokenCorpusConfig {
         seed: u64,
         layers: std::ops::Range<usize>,
     ) -> Result<Self> {
-        let path = Path::new(path)
-            .canonicalize()
-            .context("locating token corpus manifest")?;
-        let mut config: Self = serde_json::from_slice(&std::fs::read(&path)?)
-            .context("reading token corpus manifest")?;
-        let data = path
-            .parent()
-            .expect("a canonical file path has a parent")
+        let path = Path::new(path);
+        // The manifest's own directory, canonicalized *without* resolving the
+        // manifest itself. A hub snapshot links `snapshots/<sha>/manifest.json`
+        // at a content-addressed blob, so canonicalizing the file would put the
+        // payload lookup in the blob store, where nothing named `routes.u16`
+        // exists. `data_file` is relative to where the manifest is published,
+        // not to where its bytes happen to live.
+        let base = match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent,
+            _ => Path::new("."),
+        }
+        .canonicalize()
+        .with_context(|| format!("locating token corpus manifest directory for {path:?}"))?;
+        let mut config: Self = serde_json::from_slice(
+            &std::fs::read(path)
+                .with_context(|| format!("reading token corpus manifest {path:?}"))?,
+        )
+        .context("parsing token corpus manifest")?;
+        let data = base
             .join(&config.data_file)
             .canonicalize()
-            .context("locating token corpus data")?;
+            .with_context(|| format!("locating token corpus data {:?}", config.data_file))?;
         config.data_file = data.to_string_lossy().into_owned();
         config.group_size = group_size;
         config.seed = seed;
@@ -187,12 +202,30 @@ impl TokenCorpusConfig {
         }
         Ok(TokenCorpus {
             config: self.clone(),
-            ids,
+            ids: Arc::new(ids),
         })
     }
 }
 
 impl TokenCorpus {
+    /// The validated payload, for a caller that keeps it across configs.
+    pub(super) fn payload(&self) -> Arc<Vec<u16>> {
+        Arc::clone(&self.ids)
+    }
+
+    /// The same payload under another config's sampling parameters.
+    ///
+    /// Only the group size, seed and layer slice differ between callables of
+    /// one corpus; the dimensions and checksum are the corpus's identity, and
+    /// `config.validate()` re-checks the slice against them.
+    pub(super) fn rebind(config: &TokenCorpusConfig, ids: Arc<Vec<u16>>) -> Result<Self> {
+        config.validate()?;
+        Ok(Self {
+            config: config.clone(),
+            ids,
+        })
+    }
+
     /// One complete global histogram per layer for `num_tokens` sampled tokens,
     /// over the config's layer slice.
     ///
@@ -357,6 +390,35 @@ pub(crate) mod tests {
         std::fs::write(&path, manifest.to_string()).expect("corpus manifest");
         TokenCorpusConfig::from_manifest(path.to_str().unwrap(), 8, 0, 0..num_layers)
             .expect("manifest loads")
+    }
+
+    #[test]
+    fn a_manifest_reached_through_a_symlink_still_finds_its_payload() {
+        // The hub's cache layout: a revision directory of symlinks into a
+        // content-addressed blob store. Resolving the manifest before looking
+        // for `data_file` would search the blob store, where the payload has no
+        // name of its own.
+        let dir = temp_dir("hub-layout");
+        let blobs = dir.join("blobs");
+        let snapshot = dir.join("snapshots").join("0123456789abcdef");
+        std::fs::create_dir_all(&blobs).expect("blob store");
+        std::fs::create_dir_all(&snapshot).expect("snapshot");
+        let config = synthetic(&blobs, 64, 8, 4, 128);
+        for (blob, name) in [("routes.u16", "routes.u16"), ("manifest.json", "manifest.json")] {
+            let link = snapshot.join(name);
+            let _ = std::fs::remove_file(&link);
+            std::os::unix::fs::symlink(blobs.join(blob), &link).expect("hub symlink");
+        }
+
+        let resolved = TokenCorpusConfig::from_manifest(
+            snapshot.join("manifest.json").to_str().unwrap(),
+            8,
+            7,
+            0..4,
+        )
+        .expect("a snapshot manifest resolves its payload");
+        assert_eq!(resolved.num_tokens, config.num_tokens);
+        resolved.load().expect("the payload behind the link loads");
     }
 
     #[test]
