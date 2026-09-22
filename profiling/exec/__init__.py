@@ -36,7 +36,16 @@ def get_default_pool() -> GpuPool:
     # residency/util. Unset (the default) keeps the safe idle-GPU selection.
     forced = os.environ.get("VIBESIM_PROFILE_GPUS")
     if forced:
-        gpus = [int(x) for x in forced.split(",") if x.strip()]
+        # Accept indices ("0,1") or device UUIDs ("GPU-...."). UUIDs are what a
+        # slurm/cgroup allocation hands out: inside the job the granted device shows
+        # up as index 0 in nvidia-smi, but `docker --gpus device=0` (and the host
+        # CUDA_VISIBLE_DEVICES) would address the HOST's GPU 0 instead. Both
+        # `--gpus device=<uuid>` and CUDA_VISIBLE_DEVICES=<uuid> are valid.
+        gpus: list = [
+            int(x) if x.strip().isdigit() else x.strip()
+            for x in forced.split(",")
+            if x.strip()
+        ]
         if gpus:
             return LocalGpuPool(gpus=gpus)
     return LocalGpuPool()
