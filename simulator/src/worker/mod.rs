@@ -33,8 +33,8 @@ pub use kv::{PrefixCacheConfig, PrefixCacheMode, PrefixCachePolicy};
 pub use types::{
     AttnWorkerEvent, AttnWorkerMsg, BatchFsmState, FfnPullSource, FfnTask, FfnTaskKind,
     FfnWorkerEvent, FfnWorkerMsg, IterCursor, IterEndState, PdDecodeEvent, PdDecodeMsg,
-    PdPrefillEvent, PdPrefillMsg, TransferPlan, WorkerConfig, WorkerEventCommon, WorkerFsmState,
-    WorkerMsgCommon, WorkerStatus,
+    PdPrefillEvent, PdPrefillMsg, TrainWorkerEvent, TrainWorkerMsg, TransferPlan, WorkerConfig,
+    WorkerEventCommon, WorkerFsmState, WorkerMsgCommon, WorkerStatus,
 };
 pub(crate) use workers::afd_attention::build_afd_attention_worker;
 pub use workers::afd_attention::DisaggAttnWorker;
@@ -50,3 +50,4 @@ pub use workers::iter::{
 };
 pub(crate) use workers::pd_decode::build_pd_decode_worker;
 pub use workers::pd_decode::PdDecodeWorker;
+pub use workers::train::chunk_worker::{train_cost_manifest, TrainChunkCost, TrainChunkWorker};

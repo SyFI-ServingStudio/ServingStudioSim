@@ -189,6 +189,41 @@ pub enum PdDecodeEvent {
     },
 }
 
+/// A training block's message set: one chunk of finished prompt groups to run a
+/// fused forward+backward over. It carries no `RequestId` — by the time work
+/// reaches the trainer the requests are complete and only their token counts
+/// matter — so this enum deliberately has no `From<RequestId>` and a training
+/// pool never routes through the universal `admit`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TrainWorkerMsg {
+    /// One chunk, already cut by L6's grab policy.
+    Chunk {
+        chunk_id: u32,
+        /// Prompt groups in this chunk — what the grab policy handed over, kept
+        /// so the completion can report it without the pool re-deriving it.
+        groups: u16,
+        /// Per-sample token counts (`prompt + emitted`). The chunk's cost is
+        /// their sum; the list itself is what the `cost_log` row records.
+        samples: Vec<u32>,
+    },
+}
+
+/// A training block's event set: the chunk landed and the block is free.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrainWorkerEvent {
+    ChunkComplete {
+        worker: WorkerId,
+        chunk_id: u32,
+        groups: u16,
+        tokens: u64,
+        /// When the block took the chunk, and when it gave it back. Both are
+        /// reported because the pair is the training timeline an RL run is
+        /// measured by — first start to last end.
+        started: Time,
+        ended: Time,
+    },
+}
+
 // ── Universal-request ergonomics ──────────────────────────────────────────────
 //
 // `From<RequestId>` on every Msg enum lets the pool controller's universal

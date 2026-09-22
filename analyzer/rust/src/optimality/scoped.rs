@@ -6,7 +6,7 @@
 //! to publish those global rungs. Semantic R6/R7 is enabled only after the
 //! exact location map and independent model.work label both reconcile.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
@@ -1073,7 +1073,8 @@ async fn compute_semantic_floors(
         .context("raw/params.json is required to prove semantic model.work scope")?;
     let root = repo_root().context("repository root is required for location maps")?;
     let maps = load_location_maps(&root)?;
-    let labels = floors::compute_saturated_run_labels(ctx, log_dir, 1).await?;
+    // Scoped analysis names its own streams, so nothing calibrated reaches here.
+    let labels = floors::compute_saturated_run_labels(ctx, log_dir, 1, &HashSet::new()).await?;
 
     let mut mapping_ids = BTreeSet::new();
     let mut semantic_names = BTreeSet::new();

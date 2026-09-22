@@ -35,14 +35,15 @@ use crate::deployment::UnifiedConfig;
 use crate::orchestrator::common::WorkerBuildFn;
 use crate::orchestrator::{
     DpPlacementPolicy, Flow, MigrationPolicySel, MigrationTrigger, PlacementPolicy, PoolSpec,
-    SimpleDpConfig, SimpleDpFlow, SimpleDpPoolConfig, UnifiedWorkerFactory,
+    SimpleDpConfig, SimpleDpFlow, SimpleDpPoolConfig, TrainingConfig, TrainingSel,
+    UnifiedWorkerFactory,
 };
 use crate::timing::PerfApiBridge;
 use crate::worker::{
     build_barebone_worker, build_chunked_prefill_worker, build_hp_worker,
     build_qwen36_hybrid_worker, build_speculative_worker, resolve_prefix_cache_config, BatchPolicy,
     IterWorkerSel, KvAdmissionConfig, MigratableWorker, PendingOrderKind, PrefixCacheMode,
-    PrefixCachePolicy, WorkerConfig, WorkerMsgCommon,
+    PrefixCachePolicy, TrainChunkCost, WorkerConfig, WorkerMsgCommon,
 };
 
 use super::Deployment;
@@ -193,6 +194,7 @@ impl Deployment for UnifiedDeployment {
             ..WorkerConfig::default()
         };
 
+        let log_dir: Option<PathBuf> = Some(cfg.io.log_dir.clone());
         let dp_cfg = SimpleDpConfig {
             dp_pool: SimpleDpPoolConfig {
                 pool: PoolId(0),
@@ -200,8 +202,9 @@ impl Deployment for UnifiedDeployment {
                 placement: placement_into(pool.placement),
             },
             migration: migration_into(pool),
+            training: training_into(pool)?,
+            log_dir: log_dir.clone(),
         };
-        let log_dir: Option<PathBuf> = Some(cfg.io.log_dir.clone());
         let gpu_name = g.gpu.clone();
 
         // Scope the single pool `main` over the whole arch match: one call
@@ -809,6 +812,36 @@ fn migration_into<A, W>(pool: &PoolSpec<A, W>) -> Option<MigrationTrigger> {
                 pool.migration_workers_per_train_group,
                 Time::from_ms(pool.migration_group_latency_ms),
             ))
+        }
+    }
+}
+
+/// Build the pool's training side, or `None` for the default `off` — which, as
+/// with `migration_into`, means no object at all rather than an idle one.
+///
+/// The rate is required: a training pool with no cost would train the whole
+/// rollout in an instant and report a finish time that looks like a result.
+fn training_into<A, W>(pool: &PoolSpec<A, W>) -> anyhow::Result<Option<TrainingConfig>> {
+    match pool.training {
+        TrainingSel::Off => Ok(None),
+        TrainingSel::StreamingWorkSteal => {
+            ensure!(
+                pool.train_tokens_per_s > 0.0,
+                "training is on but train_tokens_per_s is {}; the chunk cost is a \
+                 calibration and has no default worth using",
+                pool.train_tokens_per_s,
+            );
+            Ok(Some(TrainingConfig {
+                workers_per_block: pool.migration_workers_per_train_group,
+                group_size: pool.migration_group_size,
+                cost: TrainChunkCost {
+                    tokens_per_s: pool.train_tokens_per_s,
+                    overhead: Time::from_ms(pool.train_chunk_overhead_ms),
+                },
+                bulk_grab: pool.train_groups_per_grab,
+                tail_threshold: pool.train_tail_threshold,
+                expected_groups: pool.train_expected_groups,
+            }))
         }
     }
 }

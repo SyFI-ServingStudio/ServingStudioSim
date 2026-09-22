@@ -2,6 +2,8 @@
 //! L6a (`SimpleDpPoolController`) + L6b (`SimpleDpFlow`) live in one file because
 //! the deployment is tiny, but stay two structs (L6 design.md §「simple DP」).
 
+use std::path::PathBuf;
+
 use crate::common::{PoolId, Request, RequestId, SharedRequests, Time, WorkerId};
 use crate::worker::{
     CostSource, GpuCluster, IterWorker, MigratableWorker, SharedGpuCluster, WorkerEventCommon,
@@ -9,7 +11,8 @@ use crate::worker::{
 };
 
 use super::super::migration::{MigrationOrder, MigrationPolicy, MigrationTrigger, WorkerLoad};
-use super::super::{Flow, OrchAction, WorkerFactory};
+use super::super::training::{TrainingConfig, TrainingPool};
+use super::super::{BackgroundWork, Flow, OrchAction, WorkerFactory};
 
 /// Sentinel for a quiescent worker. `Option<Time>` would add a tag; the simulator
 /// clock is a `u64` newtype, so this keeps the hot wakeup array dense while still
@@ -48,6 +51,14 @@ pub struct SimpleDpConfig {
     /// pays nothing — no per-tick virtual call and no load snapshot — and every
     /// existing preset keeps today's tick path instruction for instruction.
     pub migration: Option<MigrationTrigger>,
+    /// The RL training side, or `None` for the default: the run ends when
+    /// generation does. Same reasoning as `migration` — off means the objects
+    /// are never built, not that they sit idle.
+    pub training: Option<TrainingConfig>,
+    /// Where the training blocks write their `cost_log`. Inference workers get
+    /// theirs through the factory; the training blocks are built here, so this
+    /// is their path in.
+    pub log_dir: Option<PathBuf>,
 }
 
 // ── L6a: pool-local orchestration ─────────────────────────────────────────────
@@ -139,16 +150,21 @@ impl GroupLedger {
         self.unfinished[group] += 1;
     }
 
-    fn completed(&mut self, request: RequestId) {
+    /// Retire one member, returning the group if that was its last one —
+    /// the moment the group becomes useful to a trainer, and the only moment
+    /// anything downstream cares about.
+    fn completed(&mut self, request: RequestId) -> Option<usize> {
         let group = self.group_of(request);
         let host = self.host[group].0 as usize;
         let left = &mut self.unfinished[group];
         assert!(*left > 0, "prompt group {group} completed more than it holds");
         *left -= 1;
-        if *left == 0 {
+        let emptied = *left == 0;
+        if emptied {
             self.per_worker[host] -= 1;
         }
         self.completed_per_worker[host] += 1;
+        emptied.then_some(group)
     }
 
     /// Groups still in flight on `worker`, lowest id first — the order a
@@ -231,10 +247,21 @@ impl<W: IterWorker> SimpleDpPoolController<W> {
         }
     }
 
-    pub fn note_completion(&mut self, request: RequestId) {
-        if let Some(groups) = self.groups.as_mut() {
-            groups.completed(request);
-        }
+    /// Record a completion, returning the prompt group it just finished off (if
+    /// any). A pool that tracks no groups returns `None` for every request.
+    pub fn note_completion(&mut self, request: RequestId) -> Option<usize> {
+        self.groups
+            .as_mut()
+            .and_then(|groups| groups.completed(request))
+    }
+
+    /// Every request id of `group`. Panics if the pool tracks no groups — a
+    /// caller asking about one has already been told a group exists.
+    pub fn group_members(&self, group: usize) -> Vec<RequestId> {
+        self.groups
+            .as_ref()
+            .expect("group membership needs the ledger a group-aware policy installs")
+            .members(group)
     }
 
     // ── Outward API (called by L6b) ───────────────────────────────────────────
@@ -574,6 +601,10 @@ pub struct SimpleDpFlow<W: IterWorker<Event = WorkerEventCommon>> {
     /// without the flow gaining a type parameter that every deployment, preset
     /// and factory would then have to spell out.
     migration: Option<Box<dyn MigrationPolicy>>,
+    /// The RL training side, or `None` when this deployment only generates.
+    /// Holds its own blocks, so a run with it on keeps going after the last
+    /// request lands — see [`Flow::background`].
+    training: Option<TrainingPool>,
     /// Reused per-tick migration scratch, allocated only on the first tick that
     /// actually runs a policy.
     loads: Vec<WorkerLoad>,
@@ -598,9 +629,26 @@ where
             CostSource::analytic(f64::INFINITY),
         )));
         let mut dp_pool = SimpleDpPoolController::new(&cfg.dp_pool, &factory, &cluster);
-        if let Some(trigger) = cfg.migration.as_ref() {
-            dp_pool.track_groups(trigger.group_size());
+        // Both sides count the same prompt groups, so they share one ledger and
+        // must agree on what a group is.
+        if let (Some(trigger), Some(training)) = (cfg.migration.as_ref(), cfg.training.as_ref()) {
+            assert_eq!(
+                trigger.group_size(),
+                training.group_size,
+                "migration and training disagree about the prompt group size",
+            );
         }
+        let group_size = cfg
+            .migration
+            .as_ref()
+            .map(MigrationTrigger::group_size)
+            .or(cfg.training.as_ref().map(|training| training.group_size));
+        if let Some(size) = group_size {
+            dp_pool.track_groups(size);
+        }
+        let training = cfg
+            .training
+            .map(|training| TrainingPool::new(training, dp_pool.num_workers(), cfg.log_dir));
         Self {
             requests,
             dp_pool,
@@ -609,6 +657,7 @@ where
             migration: cfg
                 .migration
                 .map(|trigger| Box::new(trigger) as Box<dyn MigrationPolicy>),
+            training,
             loads: Vec::new(),
             orders: Vec::new(),
             migrated: Vec::new(),
@@ -690,15 +739,51 @@ where
         let mut actions = Vec::new();
         for ev in events.drain(..) {
             let WorkerEventCommon::RequestComplete { req, .. } = ev;
-            self.dp_pool.note_completion(req);
+            let finished_group = self.dp_pool.note_completion(req);
+            // A group reaches the trainer only when its slowest sample lands,
+            // carrying what that step will run over: every member's prompt plus
+            // everything it generated.
+            if let (Some(group), Some(training)) = (finished_group, self.training.as_mut()) {
+                let store = self.requests.borrow();
+                training.admit(
+                    self.dp_pool
+                        .group_members(group)
+                        .into_iter()
+                        .map(|member| {
+                            let record = &store[member];
+                            record.request.definition.prompt_tokens
+                                + record.progress.output_tokens_emitted
+                        })
+                        .collect(),
+                );
+            }
             actions.push(OrchAction::Complete { req });
         }
         self.events = events;
+
+        // The training side reads the pool *after* this tick's completions and
+        // migrations, so a block that empties now is the trainer's now.
+        if self.training.is_some() {
+            self.dp_pool.snapshot_loads(&mut self.loads);
+            let training = self.training.as_mut().expect("checked");
+            training.observe(&self.loads);
+            training.tick(now);
+        }
         actions
     }
 
     fn cluster(&self) -> &SharedGpuCluster {
         &self.cluster
+    }
+
+    fn background(&self) -> BackgroundWork {
+        match self.training.as_ref() {
+            Some(training) => BackgroundWork {
+                outstanding: training.outstanding(),
+                completed: training.chunks_completed(),
+            },
+            None => BackgroundWork::default(),
+        }
     }
 }
 
@@ -706,9 +791,10 @@ where
 mod tests {
     use super::*;
     use crate::common::RequestStore;
+    use crate::common::UnifiedStage;
+    use crate::orchestrator::training::TrainingConfig;
     use crate::orchestrator::UnifiedWorkerFactory;
     use crate::test_helpers::{text_request, text_request_on, FakeModel};
-    use crate::common::UnifiedStage;
     use crate::worker::{
         build_barebone_worker, build_chunked_prefill_worker, BareboneWorker, ChunkedPrefillWorker,
         WorkerConfig,
@@ -729,6 +815,15 @@ mod tests {
         placement: DpPlacementPolicy,
         migration: Option<MigrationTrigger>,
     ) -> (SimpleDpFlow<BareboneWorker<FakeModel>>, SharedRequests) {
+        build_flow_training(num_workers, placement, migration, None)
+    }
+
+    fn build_flow_training(
+        num_workers: u16,
+        placement: DpPlacementPolicy,
+        migration: Option<MigrationTrigger>,
+        training: Option<TrainingConfig>,
+    ) -> (SimpleDpFlow<BareboneWorker<FakeModel>>, SharedRequests) {
         let store: SharedRequests = Rc::new(RefCell::new(RequestStore::new()));
         let factory = UnifiedWorkerFactory::new(
             Arc::new(FakeModel::for_ms(1.0)),
@@ -746,6 +841,8 @@ mod tests {
                 placement,
             },
             migration,
+            training,
+            log_dir: None,
         };
         (SimpleDpFlow::new(cfg, factory), store)
     }
@@ -919,6 +1016,8 @@ mod tests {
                 placement,
             },
             migration,
+            training: None,
+            log_dir: None,
         };
         (SimpleDpFlow::new(cfg, factory), store)
     }
@@ -1202,5 +1301,77 @@ mod tests {
             Some(&WorkerId(0)),
             "a group move does not retire its source, so the trace still reaches it"
         );
+    }
+
+    fn training_cfg(group_size: u32, workers_per_block: u16) -> TrainingConfig {
+        TrainingConfig {
+            workers_per_block,
+            group_size,
+            cost: crate::worker::TrainChunkCost {
+                tokens_per_s: 1_000.0,
+                overhead: Time::ZERO,
+            },
+            bulk_grab: 1,
+            tail_threshold: 0,
+            expected_groups: 0,
+        }
+    }
+
+    /// The default is no training at all: the flow builds no blocks and reports
+    /// nothing outstanding, so a preset that never asked for it sees the run it
+    /// has always seen.
+    #[test]
+    fn training_off_is_the_default_and_changes_nothing() {
+        let (mut flow, _store) = build_flow(2, DpPlacementPolicy::RoundRobin);
+        for id in 0..4u32 {
+            flow.on_arrival(text_request(RequestId(id), 8, 2, Time::ZERO));
+        }
+        let completed = drain_to_completion(&mut flow);
+        assert_eq!(completed.len(), 4);
+        assert!(flow.training.is_none());
+        assert_eq!(flow.background(), BackgroundWork::default());
+    }
+
+    /// A prompt group is worth nothing to the trainer until its slowest sample
+    /// lands — and what it is then worth is every member's prompt plus
+    /// everything that member generated.
+    #[test]
+    fn a_group_reaches_training_only_when_its_slowest_sample_lands() {
+        let (mut flow, _store) = build_flow_training(
+            2,
+            DpPlacementPolicy::TraceDirected,
+            None,
+            Some(training_cfg(2, 2)),
+        );
+        // One group of two on one engine (a group never spans engines), with
+        // one sample far slower than the other.
+        flow.on_arrival(text_request_on(RequestId(0), 8, 1, Time::ZERO, WorkerId(0)));
+        flow.on_arrival(text_request_on(RequestId(1), 8, 20, Time::ZERO, WorkerId(0)));
+
+        let mut first_done = None;
+        for step in 0..500u64 {
+            let now = Time::from_ms(step as f64);
+            for action in flow.tick(now) {
+                let OrchAction::Complete { req } = action;
+                if req == RequestId(0) {
+                    first_done = Some(step);
+                }
+            }
+            if first_done == Some(step) {
+                assert_eq!(
+                    flow.training.as_ref().expect("training on").queued(),
+                    (0, 0),
+                    "seven-eighths of a group is still nothing to train on"
+                );
+            }
+        }
+        assert!(first_done.is_some(), "the fast sample should have completed");
+        let training = flow.training.as_ref().expect("training on");
+        assert_eq!(training.queued(), (0, 0), "the group was picked up");
+        assert_eq!(training.groups_per_block(), [1]);
+        // The chunk's token count shows up as its duration: at 1,000 tok/s with
+        // no overhead, (8 + 1) + (8 + 20) tokens is 37 ms and nothing else is.
+        let (start, end) = training.window().expect("one chunk ran");
+        assert_eq!(end.as_ms() - start.as_ms(), 37.0);
     }
 }

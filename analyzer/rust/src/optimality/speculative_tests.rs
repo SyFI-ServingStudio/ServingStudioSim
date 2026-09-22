@@ -122,9 +122,14 @@ async fn speculative_exact_iteration_handoff_reconciles_r6_r7() {
                 .all(|kernel| kernel.necessary_work.is_some()));
             ladder.to_json().unwrap();
         }
-        let compositions = floors::compute_batch_locked_run_labels(&ctx, dir.path(), 50_000)
-            .await
-            .unwrap();
+        let compositions = floors::compute_batch_locked_run_labels(
+            &ctx,
+            dir.path(),
+            50_000,
+            &std::collections::HashSet::new(),
+        )
+        .await
+        .unwrap();
         assert!(compositions.errors.is_empty(), "{:?}", compositions.errors);
         assert_eq!(compositions.batch_locked_iterations, Some(1));
     }

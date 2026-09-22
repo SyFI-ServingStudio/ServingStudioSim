@@ -48,7 +48,7 @@ workload:
   run_to_end: true
 
 io:
-  log_dir: logs/20260921_6_slime_B_sweep_bygroup/{rollout}_{B}
+  log_dir: logs/20260921_7_slime_B_sweep_train/{rollout}_{B}
   log_stage_transitions: true
 
 pools:
@@ -69,6 +69,40 @@ pools:
     # the loop costs ~0.7 s per group held at the crossing: 0 / 1 / 4 / 7 / 10 s
     # of release span at B = 16 / 32 / 64 / 96 / 128.
     migration_group_latency_ms: 700
+    # Training. A block starts the instant both of its engines are empty and
+    # takes finished prompt groups off one shared queue, so the block that is
+    # released first trains the most — which is the whole point of releasing
+    # early. What this models is how long a block is HELD, so the cost is fitted
+    # against the trainer's own `busy_gpu_s` (halved: a block is a TP=2 pair),
+    # over the five arms' 100 rollouts:
+    #
+    #     busy_pair_s = trace_tokens / 9,296 + 1.227 per chunk   (+0.1% mean, 1.9% |mean|)
+    #
+    # NOT against the sum of that rollout's logged `chunk_total_s`, for two
+    # reasons: a pair is held for more than the fwd/bwd chunks it logs, and
+    # `train_metrics` drops chunk records (about 60 of the 64 grabs a rollout
+    # makes get written, taking ~6% of the tokens with them — which is why the
+    # logged `total_tokens` reads as 94% of the trace's). `busy_gpu_s` comes
+    # from the per-rollout `tuner_decision` record and spans the whole thing.
+    # Interior idle inside the span is 0.5%, so "held continuously" is right.
+    #
+    # Those are MEASURED seconds, and this deployment's clock is not: generation
+    # runs fast by the end-to-end factor k = 1.1623 that analyze_sweep.py
+    # multiplies every simulated time by. So the knobs carry the conversion —
+    # 9,296 x k and 1,227 / k — and the analysis then scales generation and
+    # training by the same k, landing both in measured seconds. (The release
+    # latency above is NOT converted: 700 is a sim-clock value, swept and fitted
+    # in this clock rather than measured in the other one.)
+    training: streaming-work-steal
+    train_tokens_per_s: 10805
+    train_chunk_overhead_ms: 1056
+    # slime's `max_items_per_grab`, and its graduated tail ladder counted
+    # against `expected_items_per_rollout` = rollout_batch_size = 128 groups.
+    # Confirmed against this arm's 1,283 logged grabs, which come to exactly
+    # 48 x 2, then 4 x 4, 4 x 2 and 8 x 1 per rollout.
+    train_groups_per_grab: 2
+    train_tail_threshold: 8
+    train_expected_groups: 128
     groups:
       - gpu: "NVIDIA H200"
         replicas: 8

@@ -59,6 +59,23 @@ pub enum MigrationPolicySel {
 
 const MIGRATION_CHOICES: [&str; 3] = ["off", "active-batch-below", "train-group-samples-below"];
 
+/// Whether this pool's engines also train, and how they pick up the work.
+///
+/// `off` is the default and costs nothing: no training blocks are built, the
+/// tick path is untouched, and the run still ends with the last request.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TrainingSel {
+    #[default]
+    Off,
+    /// One shared queue of finished prompt groups; every block that frees takes
+    /// from it as it goes. slime's streaming mode with the graduated tail-split
+    /// grab policy — see `orchestrator::training`.
+    StreamingWorkSteal,
+}
+
+const TRAINING_CHOICES: [&str; 2] = ["off", "streaming-work-steal"];
+
 /// One pool: a placement policy plus one-or-more homogeneous groups.
 #[derive(Debug, Clone, Deserialize, ParamStruct)]
 #[serde(deny_unknown_fields)]
@@ -77,14 +94,22 @@ pub struct PoolSpec<Arch, Worker> {
     #[param(default = 32)]
     pub migration_threshold: u32,
     /// Requests per prompt group, numbered in consecutive id blocks. One means
-    /// "no grouping". Read only by `train-group-samples-below`, which counts a
-    /// group's full size until its slowest member lands.
+    /// "no grouping".
+    ///
+    /// **Workload topology, not a migration knob** — the `migration_` prefix is
+    /// a scar from where it was first needed. Both `train-group-samples-below`
+    /// (which counts a group's full size until its slowest member lands) and the
+    /// trainer (whose queue item is one whole group) read this same number, and
+    /// they are refused if they disagree. Renaming it would move a field every
+    /// committed preset and the param schema already spell, so it stays.
     #[serde(default = "default_migration_group_size")]
     #[param(default = 1)]
     pub migration_group_size: u32,
-    /// Workers per train group, blocked by worker id. Read only by
-    /// `train-group-samples-below`, which releases a whole block at a time
-    /// because a block is useful to training only once all of it is free.
+    /// Workers per train group, blocked by worker id. Same topology caveat as
+    /// `migration_group_size`: a *train group* is a block of engines the trainer
+    /// borrows out and takes back whole, so the release trigger and the trainer
+    /// both mean this block. The release side hands one back only when all of it
+    /// is free; the training side starts the moment all of it is.
     #[serde(default = "default_migration_workers_per_train_group")]
     #[param(default = 1)]
     pub migration_workers_per_train_group: u16,
@@ -104,6 +129,50 @@ pub struct PoolSpec<Arch, Worker> {
     #[serde(default)]
     #[param(default = 0.0)]
     pub migration_group_latency_ms: f64,
+    /// Whether this pool's engines also train on what they generated, and how a
+    /// freed block picks the work up. Off by default: the run then ends with the
+    /// last request, as it always has.
+    #[serde(default)]
+    #[param(string, default = "off", choices = TRAINING_CHOICES)]
+    pub training: TrainingSel,
+    /// Training throughput of one block, tokens per simulated second — the
+    /// linear term of the chunk cost.
+    ///
+    /// **A calibration, not a derivation.** There are no training rows in
+    /// `profile.db`, so this is fitted end to end and does not follow a change
+    /// of model, parallelism or hardware; re-measure when any of those move.
+    /// Fit it against the token count the simulator will feed it — the trace's
+    /// `input_len + output_len` — which is not necessarily the one the trainer
+    /// reports; see `worker::workers::train::chunk_worker`.
+    #[serde(default)]
+    #[param(default = 0.0)]
+    pub train_tokens_per_s: f64,
+    /// Fixed per-chunk cost on top of the rate: the framework work a grab pays
+    /// whatever its size, and the reason a policy that cuts the tail into
+    /// single-group chunks pays for the fan-out.
+    #[serde(default)]
+    #[param(default = 0.0)]
+    pub train_chunk_overhead_ms: f64,
+    /// Prompt groups a free block takes per grab — slime's
+    /// `max_items_per_grab`. The measured run used 2.
+    #[serde(default = "default_train_groups_per_grab")]
+    #[param(default = 1)]
+    pub train_groups_per_grab: u16,
+    /// Tail ladder base, slime's `TAIL_SINGLE_ITEM_THRESHOLD`. With this many
+    /// groups left to hand out, a grab drops to one; the cap steps down
+    /// `bulk → 4 → 2 → 1` through `4x → 2x → x`, fanning the heavy tail across
+    /// every block instead of letting one block swallow it. Zero turns the
+    /// ladder off.
+    #[serde(default)]
+    #[param(default = 0)]
+    pub train_tail_threshold: u32,
+    /// Prompt groups the rollout will produce — slime's
+    /// `expected_items_per_rollout`, which is what the tail ladder counts its
+    /// remainder against. Configured rather than derived, there and here: a
+    /// queue cannot know how much is still coming. Zero turns the ladder off.
+    #[serde(default)]
+    #[param(default = 0)]
+    pub train_expected_groups: u32,
     #[param(skip)]
     pub groups: Vec<GroupSpec<Arch, Worker>>,
 }
@@ -119,6 +188,10 @@ const fn default_migration_group_size() -> u32 {
 }
 
 const fn default_migration_workers_per_train_group() -> u16 {
+    1
+}
+
+const fn default_train_groups_per_grab() -> u16 {
     1
 }
 

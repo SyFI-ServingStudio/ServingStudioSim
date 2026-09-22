@@ -4,7 +4,7 @@
 //! bookkeeping (gpu-count degrade, missing roster, no spec, empty peaks) stays here
 //! because it is orchestration glue, not part of any one stage.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -24,6 +24,12 @@ use super::{
     KERNEL_RUNG_KEYS, RUNG_KEYS, UNLOCKED_ITERATION_REPLICATION_FACTOR,
 };
 use super::{floors, fold, grid_peaks, kernel, levels, location, prepare};
+
+/// Manifest leaf `kind` for a cost its producer **measured end to end** rather
+/// than composed out of kernels — the simulator's training blocks write one such
+/// leaf per chunk. There is no kernel identity behind it and therefore no rate
+/// ceiling to compare it against, so it is outside this ladder by construction.
+const CALIBRATED_KIND: &str = "calibrated";
 
 /// cost_log columns this subject depends on (drift guard).
 pub(super) const COST_COLS: &[&str] = &[
@@ -144,6 +150,43 @@ pub async fn run_optimality(
             unavailable_payload(log_dir, reason, lock_batch_size),
         ));
     }
+    // Drop any stream whose manifest is entirely calibrated. Their rows would
+    // otherwise land in the exact per-worker busy total (an unconditional SQL
+    // sum over every row) while no kernel ever claims them, and the ladder's
+    // "Σ per-kernel = per-rung" reconciliation would fail on the difference.
+    // Dropping them is also the honest reading: what a training block costs was
+    // measured, so asking how far it sits from its roofline has no answer.
+    let calibrated_workers: Vec<(String, u16)> = workers
+        .iter()
+        .map(|worker| (worker.pool_tag.clone(), worker.worker_id))
+        .filter(|key| {
+            manifests_by_worker.get(key).is_some_and(|manifest_doc| {
+                manifest_doc.sections.iter().all(|section| {
+                    section
+                        .manifest
+                        .slots
+                        .iter()
+                        .all(|leaf| leaf.kind == CALIBRATED_KIND)
+                })
+            })
+        })
+        .collect();
+    let excluded_workers: HashSet<(String, u16)> = calibrated_workers.iter().cloned().collect();
+    if !calibrated_workers.is_empty() {
+        let pools: BTreeSet<&str> = calibrated_workers
+            .iter()
+            .map(|(pool_tag, _)| pool_tag.as_str())
+            .collect();
+        caveats.push(format!(
+            "{} calibrated stream(s) excluded ({}): their cost was measured end to end, \
+             not composed from kernels, so no rung applies to it",
+            calibrated_workers.len(),
+            pools.into_iter().collect::<Vec<_>>().join(", "),
+        ));
+        workers.retain(|worker| {
+            !excluded_workers.contains(&(worker.pool_tag.clone(), worker.worker_id))
+        });
+    }
     // A cost_log worker with no run_meta GPU count falls back to G=1 (see
     // `read_exact_worker_totals`), which understates its GPU·s. On a v4 roster this never
     // happens; on a pre-v4 log a non-KV worker (null `pool_tag`) is missing from the
@@ -191,10 +234,21 @@ pub async fn run_optimality(
     // its roofline with occurrence weight. Unlocked composition uses one saturated
     // large-batch label per worker and may recompute rooflines after work rollup.
     let run_label_result = if lock_batch_size {
-        floors::compute_batch_locked_run_labels(ctx, log_dir, FLOORS_TARGET_SAMPLED_ITERS).await
+        floors::compute_batch_locked_run_labels(
+            ctx,
+            log_dir,
+            FLOORS_TARGET_SAMPLED_ITERS,
+            &excluded_workers,
+        )
+        .await
     } else {
-        floors::compute_saturated_run_labels(ctx, log_dir, UNLOCKED_ITERATION_REPLICATION_FACTOR)
-            .await
+        floors::compute_saturated_run_labels(
+            ctx,
+            log_dir,
+            UNLOCKED_ITERATION_REPLICATION_FACTOR,
+            &excluded_workers,
+        )
+        .await
     };
     let run_labels = match run_label_result {
         Ok(computed_labels) => Some(computed_labels),

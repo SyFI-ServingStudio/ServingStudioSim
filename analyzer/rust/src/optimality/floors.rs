@@ -24,7 +24,7 @@
 //! request; a per-level label failure degrades only that scope and leaves other
 //! worker/pool labels available.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -135,11 +135,13 @@ pub(super) async fn compute_saturated_run_labels(
     ctx: &SessionContext,
     log_dir: &Path,
     replication_factor: u32,
+    excluded: &HashSet<(String, u16)>,
 ) -> Result<RunLabels> {
     if replication_factor == 0 {
         return Err(anyhow!("worker replication factor must be positive"));
     }
-    let by_worker = collect_workload_by_worker(ctx).await?;
+    let mut by_worker = collect_workload_by_worker(ctx).await?;
+    by_worker.retain(|worker_key, _| !excluded.contains(worker_key));
     if by_worker.is_empty() {
         return Err(anyhow!("no cost_log workload rows to aggregate"));
     }
@@ -202,9 +204,11 @@ pub(super) async fn compute_batch_locked_run_labels(
     ctx: &SessionContext,
     log_dir: &Path,
     target_sampled_decode_iterations: u64,
+    excluded: &HashSet<(String, u16)>,
 ) -> Result<RunLabels> {
-    let samples_by_worker =
+    let mut samples_by_worker =
         collect_workload_shapes_by_worker(ctx, target_sampled_decode_iterations).await?;
+    samples_by_worker.retain(|worker_key, _| !excluded.contains(worker_key));
     let shapes_by_worker: HashMap<(String, u16), Vec<WeightedWorkload>> = samples_by_worker
         .iter()
         .map(|(worker_key, sample)| (worker_key.clone(), sample.shapes.clone()))
