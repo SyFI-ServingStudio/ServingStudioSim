@@ -1,0 +1,140 @@
+# The fixed-B sweep, simulated: 20 rollouts x 5 migration thresholds.
+#
+# Ground truth is the measured arms' per-rollout `inference_time_s`. The
+# no-migration arm (slime_20roll_sgl_fa3.yaml) already lands at a constant
+# 0.861 of measured, so what this sweep tests is not the level but whether
+# the modelled release reproduces B's EFFECT: measured generation gets
+# slightly longer as B rises, not shorter (handoff SS5b).
+#
+# SGLang-decode variant of slime_rollout0_8gpu_replay.yaml.
+#
+# Exactly one role differs from the base preset's best-of-N outcome: decode
+# attention is priced with `sgl_fa3` instead of `fa2`. SGLang ran with
+# attention_backend='fa3', but that selects sgl-kernel's own FlashAttention-3,
+# NOT FlashInfer's backend="fa3" — the two measure far apart, so the FlashInfer
+# `fa3` arm (slime_rollout0_8gpu_replay_fa3.yaml) does not price this
+# deployment. Prefill stays at fa2, which is what best-of-N picked in the base
+# run: SGLang's prefill is also sgl-kernel's, but that is a separate kernel
+# kind, not yet profiled, and leaving it alone keeps this arm a one-variable
+# comparison against the base run.
+#
+# Every other role repeats the arch default because the map must cover all of
+# them.
+#
+# slime fixed-B sweep, rollout 0 — replayed on 8 GPUs at the recorded placement.
+#
+# Source: coriander:/m-coriander/coriander/mjacob2/slime/experiments/long_rl_training/
+#   deepseek_r1_8b/results_fixed_B_sweep_20roll/sample_lengths.csv (rollout 0),
+# described by perf_analysis/HANDOFF_B_sweep_and_engine_analysis.md §1.
+# 1024 samples = 128 groups x 8, one engine per GPU (TP=1), and `target_worker`
+# is that file's `engine` column — the streaming router's group round-robin,
+# NOT the colocate baseline's cache_aware routing. Per-engine group/sample/token
+# totals reconcile exactly with the handoff's rollout-0 table.
+#
+# No migration: this is the un-consolidated baseline the 1.52x output-length
+# draw acts on, so engine finish times should spread on length luck alone.
+deployment: unified
+
+workload:
+  trace_files: ${rollout}
+  input_file_format: text-generation-independent
+  input_file_tags: [placement]
+  # Every sample arrives at 0. That is faithful, not a simplification: slime
+  # dispatches a whole rollout at once and the client semaphore is sized
+  # 512 x 8 = 4096 permits against 1024 samples, so it never gates (handoff §4).
+  arrival_mode: trace_timed
+  request_rate: 1.0
+  session_dependency: independent
+  run_to_end: true
+
+io:
+  log_dir: logs/20260921_6_slime_B_sweep_bygroup/{rollout}_{B}
+  log_stage_transitions: true
+
+pools:
+  main:
+    placement: trace-directed
+    # slime's `train_group_batch_threshold_aggressive`: engines are borrowed
+    # from training in blocks of 2 (train_tp=2, infer_tp=1), and a block is
+    # handed back once the samples still in flight across it fall below B.
+    migration: train-group-samples-below
+    migration_threshold: ${B}
+    # rollout_batch_size 128 x n_samples_per_prompt 8; a prompt group's samples
+    # are consecutive ids and all count until its slowest one lands.
+    migration_group_size: 8
+    migration_workers_per_train_group: 2
+    # Crossing the threshold is not leaving. slime hands a block back one prompt
+    # group at a time — abort the group on its engine, wait, re-dispatch it —
+    # and the engines keep decoding throughout. Measured across all five arms
+    # the loop costs ~0.7 s per group held at the crossing: 0 / 1 / 4 / 7 / 10 s
+    # of release span at B = 16 / 32 / 64 / 96 / 128.
+    migration_group_latency_ms: 700
+    groups:
+      - gpu: "NVIDIA H200"
+        replicas: 8
+        arch:
+          # DeepSeek-R1-Distill-Llama-8B is Llama-3.1-8B's architecture.
+          type: llama3_dense
+          model_config: model/config/llama3_8b.json
+        worker:
+          type: chunked_prefill
+          # Captured SGLang: chunked_prefill_size=8192, enable_mixed_chunk=False.
+          max_batch_tokens: 8192
+          batch_policy: separate-prefill-priority
+          # max_total_num_tokens=660,522 per engine x 131,072 KV bytes/token
+          # (K 41.20 + V 41.20 GiB) = 86.58 GB. Read off these arms' own server
+          # banners, not a different capture: four of the five report 660,522
+          # and B=96 reports 647,888, so the budget is a property of the run,
+          # and at B>=96 the surviving engine sits against it for minutes.
+          attn_gpu_memory_gb: 86.58
+          # SGLang's own admission/retraction mechanics, server defaults from the
+          # capture. This run saturates KV — 128 samples/engine sum to ~1.0M
+          # tokens against a 675k budget — so the retraction path is load-bearing.
+          kv_admission_policy: bounded-future
+          kv_page_size: 1
+          kv_max_future_tokens: 4096
+          kv_initial_new_token_ratio: 0.7
+          kv_minimum_new_token_ratio: 0.098
+          kv_new_token_ratio_decay_steps: 600
+          kv_retract_decode_steps: 20
+          decode_retraction_policy: length
+          gpu_time_multiplier: 1.0
+
+backends:
+  main/unified.embedding: [triton]
+  main/unified.pre_attn.input_norm: [flashinfer]
+  main/unified.pre_attn.qkv_proj: [torch, torch_linear]
+  main/unified.attn.attn.kv_cache_append: [vllm_cuda]
+  main/unified.attn.attn.prefill: [fa2]
+  main/unified.attn.attn.decode: [sgl_fa3]
+  main/unified.post_attn.o_proj: [torch, torch_linear]
+  main/unified.post_attn.post_norm: [flashinfer]
+  main/unified.post_attn.up_gate_proj: [torch, torch_linear]
+  main/unified.post_attn.activation: [triton]
+  main/unified.post_attn.down_proj: [torch, torch_linear]
+  main/unified.final_norm: [flashinfer]
+  main/unified.lm_head: [torch, torch_linear]
+
+sweep:
+  rollout:
+    r0: ["trace/slime_rollout0.csv"]
+    r1: ["trace/slime_rollout1.csv"]
+    r2: ["trace/slime_rollout2.csv"]
+    r3: ["trace/slime_rollout3.csv"]
+    r4: ["trace/slime_rollout4.csv"]
+    r5: ["trace/slime_rollout5.csv"]
+    r6: ["trace/slime_rollout6.csv"]
+    r7: ["trace/slime_rollout7.csv"]
+    r8: ["trace/slime_rollout8.csv"]
+    r9: ["trace/slime_rollout9.csv"]
+    r10: ["trace/slime_rollout10.csv"]
+    r11: ["trace/slime_rollout11.csv"]
+    r12: ["trace/slime_rollout12.csv"]
+    r13: ["trace/slime_rollout13.csv"]
+    r14: ["trace/slime_rollout14.csv"]
+    r15: ["trace/slime_rollout15.csv"]
+    r16: ["trace/slime_rollout16.csv"]
+    r17: ["trace/slime_rollout17.csv"]
+    r18: ["trace/slime_rollout18.csv"]
+    r19: ["trace/slime_rollout19.csv"]
+  B: [16, 32, 64, 96, 128]

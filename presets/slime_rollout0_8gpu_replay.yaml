@@ -1,0 +1,62 @@
+# slime fixed-B sweep, rollout 0 — replayed on 8 GPUs at the recorded placement.
+#
+# Source: coriander:/m-coriander/coriander/mjacob2/slime/experiments/long_rl_training/
+#   deepseek_r1_8b/results_fixed_B_sweep_20roll/sample_lengths.csv (rollout 0),
+# described by perf_analysis/HANDOFF_B_sweep_and_engine_analysis.md §1.
+# 1024 samples = 128 groups x 8, one engine per GPU (TP=1), and `target_worker`
+# is that file's `engine` column — the streaming router's group round-robin,
+# NOT the colocate baseline's cache_aware routing. Per-engine group/sample/token
+# totals reconcile exactly with the handoff's rollout-0 table.
+#
+# No migration: this is the un-consolidated baseline the 1.52x output-length
+# draw acts on, so engine finish times should spread on length luck alone.
+deployment: unified
+
+workload:
+  trace_files:
+    - trace/slime_rollout0.csv
+  input_file_format: text-generation-independent
+  input_file_tags: [placement]
+  # Every sample arrives at 0. That is faithful, not a simplification: slime
+  # dispatches a whole rollout at once and the client semaphore is sized
+  # 512 x 8 = 4096 permits against 1024 samples, so it never gates (handoff §4).
+  arrival_mode: trace_timed
+  request_rate: 1.0
+  session_dependency: independent
+  run_to_end: true
+
+io:
+  log_dir: logs/slime_rollout0_8gpu
+  log_stage_transitions: true
+
+pools:
+  main:
+    placement: trace-directed
+    migration: "off"
+    groups:
+      - gpu: "NVIDIA H200"
+        replicas: 8
+        arch:
+          # DeepSeek-R1-Distill-Llama-8B is Llama-3.1-8B's architecture.
+          type: llama3_dense
+          model_config: model/config/llama3_8b.json
+        worker:
+          type: chunked_prefill
+          # Captured SGLang: chunked_prefill_size=8192, enable_mixed_chunk=False.
+          max_batch_tokens: 8192
+          batch_policy: separate-prefill-priority
+          # max_total_num_tokens=674,973 per engine at mem_fraction_static=0.70,
+          # x 131,072 KV bytes/token (K 41.20 + V 41.20 GiB) = 88.47 GB.
+          attn_gpu_memory_gb: 88.47
+          # SGLang's own admission/retraction mechanics, server defaults from the
+          # capture. This run saturates KV — 128 samples/engine sum to ~1.0M
+          # tokens against a 675k budget — so the retraction path is load-bearing.
+          kv_admission_policy: bounded-future
+          kv_page_size: 1
+          kv_max_future_tokens: 4096
+          kv_initial_new_token_ratio: 0.7
+          kv_minimum_new_token_ratio: 0.098
+          kv_new_token_ratio_decay_steps: 600
+          kv_retract_decode_steps: 20
+          decode_retraction_policy: length
+          gpu_time_multiplier: 1.0
