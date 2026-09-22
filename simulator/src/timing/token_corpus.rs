@@ -404,7 +404,10 @@ pub(crate) mod tests {
         std::fs::create_dir_all(&blobs).expect("blob store");
         std::fs::create_dir_all(&snapshot).expect("snapshot");
         let config = synthetic(&blobs, 64, 8, 4, 128);
-        for (blob, name) in [("routes.u16", "routes.u16"), ("manifest.json", "manifest.json")] {
+        for (blob, name) in [
+            ("routes.u16", "routes.u16"),
+            ("manifest.json", "manifest.json"),
+        ] {
             let link = snapshot.join(name);
             let _ = std::fs::remove_file(&link);
             std::os::unix::fs::symlink(blobs.join(blob), &link).expect("hub symlink");

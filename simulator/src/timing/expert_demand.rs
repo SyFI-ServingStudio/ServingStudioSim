@@ -24,19 +24,31 @@ use super::token_corpus::{TokenCorpus, TokenCorpusConfig};
 /// The seed every demand source folds at, so a profiled shape is reproducible.
 const FOLD_SEED: u64 = 0xF01D_5EED;
 
-/// Payloads already read this process, keyed by the file and the checksum that
-/// identifies its contents.
+/// Payloads already read this process, keyed by the file, the checksum that
+/// identifies its contents, and every dimension `load` validated them against.
 ///
 /// One build resolves the same corpus once per MoE callable and again per
 /// kernel config per backend, and each resolution is a hundreds-of-megabytes
 /// read plus a full top-k distinctness scan. The manifest's checksum is the
 /// corpus's identity, so two configs naming the same one are the same bytes and
-/// a second read can only confirm what the first proved.
-type CorpusCache = Mutex<HashMap<(String, u64), Arc<Vec<u16>>>>;
+/// a second read can only confirm what the first proved -- provided they also
+/// describe those bytes alike. The checksum does not cover the dimensions, so
+/// a config that restates them is a miss and gets the full check.
+type CorpusKey = (String, u64, [usize; 4]);
+type CorpusCache = Mutex<HashMap<CorpusKey, Arc<Vec<u16>>>>;
 static LOADED_CORPORA: OnceLock<CorpusCache> = OnceLock::new();
 
 fn load_cached(config: &TokenCorpusConfig) -> anyhow::Result<TokenCorpus> {
-    let key = (config.data_file.clone(), config.checksum_fnv1a64);
+    let key = (
+        config.data_file.clone(),
+        config.checksum_fnv1a64,
+        [
+            config.num_tokens,
+            config.num_layers,
+            config.num_experts,
+            config.top_k,
+        ],
+    );
     let cache = LOADED_CORPORA.get_or_init(Default::default);
     let cached = cache.lock().expect("corpus cache").get(&key).cloned();
     if let Some(ids) = cached {
@@ -269,6 +281,29 @@ mod tests {
                 "{multiple} verify blocks must be profiled"
             );
         }
+    }
+
+    /// A config that restates a cached corpus's dimensions gets the check a
+    /// cold load would have given it, not the bytes the first config proved.
+    #[test]
+    fn a_warm_cache_still_refuses_a_restated_corpus() {
+        let corpus = crate::timing::token_corpus::tests::synthetic(
+            &crate::timing::token_corpus::tests::temp_dir("warm-restated"),
+            64,
+            4,
+            8,
+            128,
+        );
+        ExpertDemand::Corpus(corpus.clone()).prepare().unwrap();
+
+        let halved = crate::timing::token_corpus::TokenCorpusConfig {
+            num_tokens: 64,
+            ..corpus
+        };
+        let Err(error) = ExpertDemand::Corpus(halved).prepare() else {
+            panic!("a restated corpus must not bind to the cached payload");
+        };
+        assert!(format!("{error:#}").contains("byte length does not match"));
     }
 
     /// The recorded GLM-5.3 corpus this work was measured on. Opt-in: it is a
