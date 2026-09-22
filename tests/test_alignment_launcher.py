@@ -2172,6 +2172,18 @@ def test_vllm_tokens_backend_adds_server_flag_once(tmp_path):
     assert server_argv.count("--tokens-only") == 1
 
 
+def test_a_corpus_pass_refuses_a_protocol_that_returns_no_routes(tmp_path):
+    """Every response would fail to fold; a launch would only spend the job."""
+    paths = _phase_configs(tmp_path)
+    raw = yaml.safe_load(paths["profile"].read_text())
+    raw["profile_kind"] = "token_corpus"
+    raw["workload"]["backend"] = {"type": "vllm_tokens"}
+    paths["profile"].write_text(yaml.safe_dump(raw))
+
+    with pytest.raises(ValueError, match="'vllm_tokens' does not"):
+        load_profile_config(paths["profile"])
+
+
 def test_launcher_main_dispatches_alignment_subcommand(monkeypatch):
     from launcher import __main__ as launcher_main
 

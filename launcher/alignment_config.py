@@ -222,6 +222,11 @@ def load_profile_config(path: Path, *, require_python_runtime: bool = True) -> P
             f"invalid profile config: profile_kind token_corpus requires engine vllm, "
             f"got {config.engine!r}"
         )
+    if config.profile_kind == "token_corpus" and not config.workload.backend.returns_routed_experts:
+        raise ValueError(
+            "invalid profile config: profile_kind token_corpus needs a workload backend "
+            f"that returns routed experts, and {config.workload.backend.type!r} does not"
+        )
     # Expert parallelism is declared twice -- as a server flag and as the degree
     # the records are reduced over -- and the two must agree. Disagreeing is how
     # a capture ends up paying for an expert-load stream it cannot aggregate, or

@@ -62,10 +62,12 @@ def resolve_reference(reference: str) -> str:
             raise CorpusError(f"{reference} is not readable JSON: {exc}") from exc
         if isinstance(data_file, str) and data_file:
             payload = _download(repo, revision, str(Path(path).parent / data_file))
-            if payload.parent != local.parent:
+            # The loader resolves `data_file` against the manifest's directory,
+            # so that is where the hub must have put it -- a subdirectory too.
+            if payload != local.parent / data_file:
                 raise CorpusError(
-                    f"{reference}: the hub placed {data_file} in {payload.parent}, "
-                    f"not beside its manifest in {local.parent}"
+                    f"{reference}: the hub placed {data_file} at {payload}, "
+                    f"not where its manifest in {local.parent} names it"
                 )
     return str(local)
 

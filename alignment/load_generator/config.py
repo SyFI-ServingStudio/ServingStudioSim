@@ -49,6 +49,9 @@ class OpenAIBackendConfig:
     type: ClassVar[str] = "openai"
     cli_value: ClassVar[str] = "openai"
     required_server_args: ClassVar[tuple[str, ...]] = ()
+    # Whether req-frontend reads per-request routed experts off this protocol's
+    # responses (`Backend::routed_experts`); a token_corpus pass needs it.
+    returns_routed_experts: ClassVar[bool] = True
 
 
 @dataclass
@@ -56,6 +59,7 @@ class VllmTokensBackendConfig:
     type: ClassVar[str] = "vllm_tokens"
     cli_value: ClassVar[str] = "vllm-tokens"
     required_server_args: ClassVar[tuple[str, ...]] = ("--tokens-only",)
+    returns_routed_experts: ClassVar[bool] = False
 
 
 BackendConfig = OpenAIBackendConfig | VllmTokensBackendConfig

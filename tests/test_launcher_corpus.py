@@ -83,5 +83,26 @@ def test_a_manifest_whose_payload_lands_elsewhere_is_refused(tmp_path, monkeypat
 
     monkeypatch.setattr(corpus_module, "_download", fake_download)
 
-    with pytest.raises(CorpusError, match="not beside its manifest"):
+    with pytest.raises(CorpusError, match="not where its manifest"):
         resolve_hf_references({"token_corpus_file": f"hf://uw/corpora@{SHA}/glm53/manifest.json"})
+
+
+def test_a_payload_in_a_subdirectory_of_its_manifest_resolves(tmp_path, monkeypatch):
+    """The loader reads `data_file` relative to the manifest, subdirectories included."""
+    snapshot = tmp_path / "snapshot"
+
+    def fake_download(repo, revision, path):
+        local = snapshot / path
+        local.parent.mkdir(parents=True, exist_ok=True)
+        if path.endswith(".json"):
+            local.write_text(json.dumps({"data_file": "data/routes.u16"}))
+        else:
+            local.write_bytes(b"")
+        return local
+
+    monkeypatch.setattr(corpus_module, "_download", fake_download)
+
+    resolved = resolve_hf_references(
+        {"token_corpus_file": f"hf://uw/corpora@{SHA}/glm53/manifest.json"}
+    )
+    assert resolved == {"token_corpus_file": str(snapshot / "glm53" / "manifest.json")}
