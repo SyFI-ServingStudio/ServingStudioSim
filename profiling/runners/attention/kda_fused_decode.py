@@ -95,9 +95,10 @@ def _build_operands(torch: Any, args: _Args, *, device: Any | None = None) -> di
         ).contiguous(),
         # The output norm is per value channel, not per packed q/k/v segment.
         "onorm_weight": torch.ones(v, dtype=fp32, device=device),
+        # recurrent state in the requested dtype (fp32 default; bf16 = --mamba-ssm-dtype bfloat16)
         "ssm_states": torch.randn(
             (slots, h, v, k), dtype=fp32, device=device, generator=generator
-        ).contiguous(),
+        ).to(fp32 if args.state_dtype is DType.FP32 else bf16).contiguous(),
         "cache_indices": torch.arange(1, args.batch_size + 1, dtype=torch.int32, device=device),
     }
 
