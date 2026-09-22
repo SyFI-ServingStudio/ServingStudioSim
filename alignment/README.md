@@ -311,7 +311,8 @@ this filtering is auditable rather than implicit.
 For schema v4, aggregation first selects the model role and exact monotonic
 replay window. The ceiling additionally multiplies by `max_forwards_per_step`
 so repeated draft forwards are retained. Target and draft are written to
-`expert_popularity.json` and `draft_expert_popularity.json`; replay counter
+`expert_popularity.json` and `draft_expert_popularity.json`, the latter only
+when the drafter has experts to log (an n-gram drafter has none); replay counter
 deltas are recorded separately in `spec_decode_metrics.json`.
 
 The Rust consumer treats v2-v4 as closed contracts and rejects unknown fields,

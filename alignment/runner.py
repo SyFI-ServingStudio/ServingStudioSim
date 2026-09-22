@@ -171,21 +171,28 @@ def _extract_expert_load(
         "expert_record_count": record_count,
     }
     if speculative:
-        # The drafter routes over its own experts and is logged under its own
-        # role, so it is a second population of the same stream, not a slice.
+        # A drafter with experts routes over its own and is logged under its
+        # own role, so it is a second population of the same stream, not a
+        # slice. An n-gram or other expert-free drafter logs nothing, and no
+        # consumer requires the draft marginal, so its absence is not an error.
         draft_load_jsonl = engine_dir / f"{cfg.name}_draft_expert_load.jsonl"
         draft_popularity_json = log_dir / "draft_expert_popularity.json"
-        artifacts.update(
-            draft_expert_load_jsonl=str(draft_load_jsonl),
-            draft_expert_popularity_json=str(draft_popularity_json),
-            draft_expert_record_count=record_extraction.extract_expert_popularity(
-                measurement_log,
-                draft_load_jsonl,
-                draft_popularity_json,
-                model_role="draft",
-                **shared,
-            ),
+        draft_count = record_extraction.extract_expert_popularity(
+            measurement_log,
+            draft_load_jsonl,
+            draft_popularity_json,
+            model_role="draft",
+            required=False,
+            **shared,
         )
+        if draft_count is None:
+            draft_load_jsonl.unlink(missing_ok=True)
+        else:
+            artifacts.update(
+                draft_expert_load_jsonl=str(draft_load_jsonl),
+                draft_expert_popularity_json=str(draft_popularity_json),
+                draft_expert_record_count=draft_count,
+            )
     return artifacts
 
 

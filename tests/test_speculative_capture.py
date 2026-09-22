@@ -118,11 +118,14 @@ def test_popularity_separates_roles_and_preserves_reduction_group(tmp_path):
         assert result["aggregation"]["discarded_outside_replay_window_record_count"] == 2
 
 
-def test_finalize_speculative_popularity_produces_both_routing_artifacts(tmp_path):
+@pytest.mark.parametrize("drafter_has_experts", [True, False], ids=["mtp", "ngram"])
+def test_finalize_speculative_popularity_produces_both_routing_artifacts(
+    tmp_path, drafter_has_experts
+):
     source = tmp_path / "server.log"
-    source.write_text(
-        "\n".join("VibeSimAlignmentExpertLoad " + json.dumps(row) for row in expert_rows())
-    )
+    # An n-gram drafter runs no MoE, so only the target logs expert load.
+    rows = [row for row in expert_rows() if drafter_has_experts or row["model_role"] == "target"]
+    source.write_text("\n".join("VibeSimAlignmentExpertLoad " + json.dumps(row) for row in rows))
     cfg = Config(
         name="spec5",
         workload=SimpleNamespace(warmup=False),
@@ -158,8 +161,12 @@ def test_finalize_speculative_popularity_produces_both_routing_artifacts(tmp_pat
         nsys_executable=None,
     )
     target = json.loads(Path(result["expert_popularity_json"]).read_text())
-    draft = json.loads(Path(result["draft_expert_popularity_json"]).read_text())
     assert target["model_role"] == "target"
+    assert Path(result["spec_decode_metrics_json"]).is_file()
+    if not drafter_has_experts:
+        assert "draft_expert_popularity_json" not in result
+        assert not (tmp_path / "spec5_draft_expert_load.jsonl").exists()
+        return
+    draft = json.loads(Path(result["draft_expert_popularity_json"]).read_text())
     assert draft["model_role"] == "draft"
     assert target["counts_by_layer"] != draft["counts_by_layer"]
-    assert Path(result["spec_decode_metrics_json"]).is_file()
