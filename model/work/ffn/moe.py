@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from ..core import MatmulGroup
+from ..core import LearnedWeightGroup, MatmulGroup
 
 
 @dataclass
@@ -32,6 +32,13 @@ class MoE:
     # stack that is quantized differently from the body (GLM-5.2's MTP layer
     # keeps BF16 experts under an NVFP4 checkpoint) is what makes them distinct.
     module_prefix: str = ""
+    #: Optional latent expert input width. When set, routed experts run in this
+    #: width while the two projections around them remain full-hidden matrices.
+    expert_input_dim: int | None = None
+    #: Learned router correction bias used by the noaux_tc routing method.
+    router_bias_elements: int = 0
+    #: Learned RMSNorm scale between the routed expert down/up projections.
+    routed_norm_elements: int = 0
 
     def _module(self, path: str) -> str:
         return f"{self.module_prefix}.{path}" if self.module_prefix else path
@@ -39,6 +46,7 @@ class MoE:
     def matmul_groups(self) -> list[MatmulGroup]:
         if self.shared_gate and self.shared_intermediate <= 0:
             raise ValueError("shared_gate requires shared_intermediate > 0")
+        expert_input = self.expert_input_dim or self.hidden
         groups = [
             # `mlp.gate` is the router matrix, and both GLM-5.2-FP8 and
             # Qwen3-235B-FP8 leave it at the master dtype.
@@ -52,7 +60,7 @@ class MoE:
             MatmulGroup(
                 "expert_gate_up",
                 n=2 * self.moe_intermediate,
-                k=self.hidden,
+                k=expert_input,
                 activated_mult=self.top_k,
                 total_count=self.num_experts,
                 bucket="expert",
@@ -61,7 +69,7 @@ class MoE:
             ),
             MatmulGroup(
                 "expert_down",
-                n=self.hidden,
+                n=expert_input,
                 k=self.moe_intermediate,
                 activated_mult=self.top_k,
                 total_count=self.num_experts,
@@ -70,6 +78,27 @@ class MoE:
                 module=self._module("mlp.experts.down_proj"),
             ),
         ]
+        if self.expert_input_dim is not None:
+            groups.insert(
+                1,
+                MatmulGroup(
+                    "routed_expert_down_proj",
+                    n=expert_input,
+                    k=self.hidden,
+                    bucket="dense_ffn",
+                    module=self._module("mlp.routed_expert_down_proj"),
+                ),
+            )
+            groups.insert(
+                4,
+                MatmulGroup(
+                    "routed_expert_up_proj",
+                    n=self.hidden,
+                    k=expert_input,
+                    bucket="dense_ffn",
+                    module=self._module("mlp.routed_expert_up_proj"),
+                ),
+            )
         if self.shared_intermediate > 0:
             groups.append(
                 MatmulGroup(
@@ -99,4 +128,26 @@ class MoE:
                         module=self._module("mlp.shared_expert_gate"),
                     )
                 )
+        return groups
+
+    def learned_weight_groups(self) -> list[LearnedWeightGroup]:
+        groups: list[LearnedWeightGroup] = []
+        if self.router_bias_elements:
+            groups.append(
+                LearnedWeightGroup(
+                    "router_correction_bias",
+                    self.router_bias_elements,
+                    1,
+                    "router",
+                )
+            )
+        if self.routed_norm_elements:
+            groups.append(
+                LearnedWeightGroup(
+                    "routed_expert_norm",
+                    self.routed_norm_elements,
+                    1,
+                    "norm",
+                )
+            )
         return groups

@@ -49,6 +49,8 @@ _DTYPE_BYTES = {
     "float8": 1,
     "fp8": 1,
     "float8_e4m3fn": 1,
+    "fp8_e4m3": 1,
+    "fp8_e5m2": 1,
     "float8_e5m2": 1,
     "f8": 1,
     "int8": 1,
@@ -73,6 +75,8 @@ _CANONICAL_DTYPE = {
     "float8": "fp8",
     "float8_e4m3fn": "fp8",
     "float8_e5m2": "fp8",
+    "fp8_e4m3": "fp8",
+    "fp8_e5m2": "fp8",
     "f8": "fp8",
 }
 

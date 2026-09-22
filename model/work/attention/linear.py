@@ -155,3 +155,155 @@ class GatedDeltaNet:
     def cache_write_bytes(self, wl: Workload) -> float:
         # `kv_bytes` already counts every recurrent/convolution-state transaction.
         return 0.0
+
+
+@dataclass
+class KimiDeltaAttention:
+    """Kimi Delta Attention (KDA) used by Kimi-K3.
+
+    KDA has the same fixed-size delta-rule state as GatedDeltaNet, but its
+    projection inventory is different: q/k/v, beta, and full-rank forget/output
+    gates are all projected directly from the model hidden width.
+    """
+
+    split_attention_phases = False
+
+    hidden: int
+    num_heads: int
+    head_dim: int
+    conv_kernel: int
+    state_dtype_bytes: float
+    activation_dtype_bytes: float = 2.0
+
+    @property
+    def projection_dim(self) -> int:
+        return self.num_heads * self.head_dim
+
+    @property
+    def conv_dim(self) -> int:
+        return 3 * self.projection_dim
+
+    @property
+    def recurrent_state_bytes(self) -> float:
+        return self.num_heads * self.head_dim * self.head_dim * self.state_dtype_bytes
+
+    @property
+    def convolution_state_bytes(self) -> float:
+        return (
+            self.conv_dim
+            * (self.conv_kernel - 1)
+            * self.activation_dtype_bytes
+        )
+
+    def matmul_groups(self) -> list[MatmulGroup]:
+        projection = self.projection_dim
+        return [
+            # One fused runtime projection contains the three independent q/k/v
+            # matrices; its parameter and FLOP totals are their sum.
+            MatmulGroup(
+                "qkv",
+                n=3 * projection,
+                k=self.hidden,
+                bucket="attn_proj",
+                module="self_attn.fused_qkvg_proj",
+            ),
+            MatmulGroup(
+                "beta",
+                n=self.num_heads,
+                k=self.hidden,
+                bucket="attn_proj",
+                module="self_attn.b_proj",
+            ),
+            MatmulGroup(
+                "forget_gate",
+                n=projection,
+                k=self.hidden,
+                bucket="attn_proj",
+                module="self_attn.f_proj",
+            ),
+            MatmulGroup(
+                "output_gate",
+                n=projection,
+                k=self.hidden,
+                bucket="attn_proj",
+                module="self_attn.g_proj",
+            ),
+            MatmulGroup(
+                "conv1d",
+                n=self.conv_dim,
+                k=self.conv_kernel,
+                bucket="attn_proj",
+                module="self_attn.qkv_conv1d",
+            ),
+            MatmulGroup(
+                "o_proj",
+                n=self.hidden,
+                k=projection,
+                bucket="attn_proj",
+                module="self_attn.o_proj",
+            ),
+        ]
+
+    def learned_weight_groups(self) -> list[LearnedWeightGroup]:
+        # K3 stores A_log in the head-dimension format (128), while dt_bias is
+        # per projected q/k/v channel (96*128). The gated output norm has one
+        # learned scale vector per head width, shared across heads.
+        return [
+            LearnedWeightGroup("a_log", self.head_dim, 1, "attn"),
+            LearnedWeightGroup("dt_bias", self.projection_dim, 1, "attn"),
+            LearnedWeightGroup("gated_norm", self.head_dim, 1, "norm"),
+        ]
+
+    def internal_flops(self, wl: Workload) -> float:
+        # The recurrent KDA step performs k^T S, the rank-1 delta update, and
+        # q^T S: three d_k*d_v MAC products per value head and token.
+        return 6.0 * self.num_heads * self.head_dim * self.head_dim * wl.matmul_tokens
+
+    def semantic_segments(self, wl: Workload) -> list[AttentionSemantic]:
+        phases = dict(wl.attention_phases())
+        prefill = phases.get("prefill", Workload(0, 0))
+        decode = phases.get("decode", Workload(0, 0))
+        # Preserve the historical direct-spec behavior for an untagged workload.
+        if None in phases and not prefill.num_attention_steps and not decode.num_attention_steps:
+            decode = phases[None]
+
+        prefill_requests = prefill.num_attention_steps
+        stateful = prefill.prefill_stateful_requests
+        decode_requests = decode.num_attention_steps
+        recurrent = self.recurrent_state_bytes
+        convolution = self.convolution_state_bytes
+        return [
+            AttentionSemantic("attn.prefill", flops=self.internal_flops(prefill)),
+            AttentionSemantic("attn.decode", flops=self.internal_flops(decode)),
+            AttentionSemantic(
+                "recurrent_state.prefill_read", bytes=recurrent * stateful
+            ),
+            AttentionSemantic(
+                "recurrent_state.prefill_write", bytes=recurrent * prefill_requests
+            ),
+            AttentionSemantic(
+                "recurrent_state.decode_read", bytes=recurrent * decode_requests
+            ),
+            AttentionSemantic(
+                "recurrent_state.decode_write", bytes=recurrent * decode_requests
+            ),
+            AttentionSemantic(
+                "conv_state.prefill_read", bytes=convolution * stateful
+            ),
+            AttentionSemantic(
+                "conv_state.prefill_write", bytes=convolution * prefill_requests
+            ),
+            AttentionSemantic(
+                "conv_state.decode_read", bytes=convolution * decode_requests
+            ),
+            AttentionSemantic(
+                "conv_state.decode_write", bytes=convolution * decode_requests
+            ),
+        ]
+
+    def kv_bytes(self, wl: Workload) -> float:
+        return sum(row.bytes for row in self.semantic_segments(wl))
+
+    def cache_write_bytes(self, wl: Workload) -> float:
+        # State writes are already represented as semantic rows above.
+        return 0.0

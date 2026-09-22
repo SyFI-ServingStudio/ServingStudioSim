@@ -143,12 +143,27 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--batch-file", help="JSON {prefill:[[app,pre]], decode:[kv], sampled}")
     parser.add_argument("--gpu", default="H200", help="GPU name for the roofline (default H200)")
     parser.add_argument("--dtype", default=None, help="roofline dtype (default: config's)")
+    parser.add_argument(
+        "--mamba-ssm-dtype",
+        choices=("float32", "bfloat16", "float16"),
+        help="override KDA temporal-state dtype (Kimi-K3; default float32)",
+    )
+    parser.add_argument(
+        "--kv-cache-dtype",
+        choices=("bfloat16", "float16", "fp8_e4m3", "fp8_e5m2"),
+        help="override MLA latent-cache dtype (Kimi-K3; default bfloat16)",
+    )
     parser.add_argument("--num-gpus", type=int, default=1, help="GPUs the work is spread over")
     parser.add_argument("--json", action="store_true", help="emit JSON instead of a table")
     args = parser.parse_args(argv)
 
     with open(args.config) as handle:
         raw_config = json.load(handle)
+    text_config = raw_config.get("text_config", raw_config)
+    if args.mamba_ssm_dtype is not None:
+        text_config["mamba_ssm_dtype"] = args.mamba_ssm_dtype
+    if args.kv_cache_dtype is not None:
+        text_config["kv_cache_dtype"] = args.kv_cache_dtype
     model = build_model(raw_config)
     workload = _workload(args)
     label = model.label(workload)

@@ -34,7 +34,7 @@ from dataclasses import dataclass
 _LAYER_PREFIX = re.compile(r"^model\.(?:language_model\.)?layers\.\d+\.")
 _MODEL_PREFIX = re.compile(r"^model\.")
 
-_SUPPORTED_QUANT_METHODS = ("fp8", "modelopt")
+_SUPPORTED_QUANT_METHODS = ("fp8", "modelopt", "compressed-tensors")
 
 
 def _layer_relative(module: str) -> str:
@@ -97,6 +97,40 @@ def parse_quantization_config(raw_config: dict) -> QuantScheme | None:
             f"unsupported quant_method {method!r}; model.work knows "
             f"{_SUPPORTED_QUANT_METHODS} — extend quantization.py before using this config"
         )
+    if method == "compressed-tensors":
+        if quant.get("format") != "mxfp4-pack-quantized":
+            raise ValueError(
+                "model.work only supports compressed-tensors K3 configs with "
+                "format='mxfp4-pack-quantized'"
+            )
+        groups = quant.get("config_groups", {})
+        group = groups.get("group_0")
+        weights = group.get("weights") if isinstance(group, dict) else None
+        if not isinstance(weights, dict):
+            raise ValueError("MXFP4 config must contain config_groups.group_0.weights")
+        group_size = int(weights.get("group_size", 0))
+        if (
+            int(weights.get("num_bits", 0)) != 4
+            or weights.get("strategy") != "group"
+            or weights.get("scale_dtype") != "torch.uint8"
+            or group_size != 32
+        ):
+            raise ValueError(
+                "unsupported K3 MXFP4 weights; expected 4-bit grouped weights, "
+                "group_size=32, and torch.uint8 scales"
+            )
+        # The checkpoint's ignore regexes describe the same fact, but the
+        # accountant uses the explicit semantic module subtree so it cannot
+        # accidentally quantize attention or latent/shared projections.
+        return QuantScheme(
+            bytes_per_weight=0.5,
+            compute_dtype="fp4",
+            block_shape=(1, group_size),
+            scale_dtype_bytes=1.0,
+            not_converted=frozenset(),
+            converted_prefixes=frozenset({"mlp.experts"}),
+        )
+
     if method == "modelopt":
         if quant.get("quant_algo") != "NVFP4":
             raise ValueError(

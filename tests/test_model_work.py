@@ -27,6 +27,7 @@ from model.work.quantization import parse_quantization_config
 from model.work.registry import REGISTRY, UnknownArchitecture, build_model
 
 CONFIG = Path(__file__).resolve().parents[1] / "model" / "config" / "llama3_8b.json"
+KIMI_K3 = Path(__file__).resolve().parents[1] / "model" / "config" / "kimi_k3.json"
 
 L = 32
 HIDDEN = 4096
@@ -1970,3 +1971,304 @@ def test_qwen3_moe_fp8_quantizes_experts_but_not_the_router():
         embedding = next(seg for seg in label.segments if seg.name == "embedding")
         assert embedding.compute_dtype == "bf16"
         assert embedding.bytes == min(1_000_000, model.vocab) * model.hidden * 2
+
+
+# Kimi-K3's text backbone: the wrapper config is 93 layers wide, with one dense
+# KDA layer, 68 KDA MoE layers, and 24 MLA MoE layers.
+K3_HIDDEN = 7168
+K3_VOCAB = 163840
+K3_LAYERS = 93
+K3_KDA_LAYERS = 69
+K3_MOE_LAYERS = 92
+K3_MLA_LAYERS = 24
+K3_HEADS = 96
+K3_HEAD_DIM = 128
+K3_KDA_PROJECTION = K3_HEADS * K3_HEAD_DIM
+K3_EXPERTS = 896
+K3_TOP_K = 16
+K3_MOE_INTERMEDIATE = 3072
+K3_ROUTED_HIDDEN = 3584
+K3_SHARED_INTERMEDIATE = 2 * K3_MOE_INTERMEDIATE
+
+
+@pytest.fixture(scope="module")
+def kimi_k3_model():
+    return load_model(KIMI_K3)
+
+
+def _k3_loaded_experts(tokens: int) -> float:
+    return K3_EXPERTS * (1 - (1 - 1 / K3_EXPERTS) ** (tokens * K3_TOP_K))
+
+
+def _k3_mxfp4_matrix_bytes(n: int, k: int) -> float:
+    # Four-bit e2m1 values use half a byte, plus one uint8 scale per 32 values.
+    return n * k * (0.5 + 1 / 32)
+
+
+def _k3_expected_weight_bytes(tokens: int) -> float:
+    hidden = K3_HIDDEN
+    projection = K3_KDA_PROJECTION
+    kda_matrix_params = (
+        3 * projection * hidden
+        + K3_HEADS * hidden
+        + 2 * projection * hidden
+        + 3 * projection * 4
+        + hidden * projection
+    )
+    mla_matrix_params = (
+        (1536 + 512 + 64) * hidden
+        + K3_HEADS * (128 + 64) * 1536
+        + K3_HEADS * 128 * 512
+        + K3_HEADS * 128 * 512
+        + hidden * projection
+        + projection * hidden
+    )
+    dense_ffn_params = 2 * 33792 * hidden + hidden * 33792
+    latent_ffn_params = hidden * K3_ROUTED_HIDDEN + K3_ROUTED_HIDDEN * hidden
+    shared_params = (
+        2 * K3_SHARED_INTERMEDIATE * hidden + hidden * K3_SHARED_INTERMEDIATE
+    )
+    routed_matrix_bytes = _k3_mxfp4_matrix_bytes(
+        2 * K3_MOE_INTERMEDIATE, K3_ROUTED_HIDDEN
+    ) + _k3_mxfp4_matrix_bytes(K3_MOE_INTERMEDIATE, K3_ROUTED_HIDDEN)
+    norm_params = (
+        2 * hidden * K3_LAYERS
+        + hidden
+        + K3_KDA_LAYERS * K3_HEAD_DIM
+        + K3_MOE_LAYERS * K3_ROUTED_HIDDEN
+        + K3_MLA_LAYERS * (1536 + 512)
+    )
+    return (
+        # The embedding gather reads only the rows used by this workload; the
+        # untied lm_head reads its complete table once.
+        2 * min(tokens, K3_VOCAB) * hidden
+        + 2 * K3_VOCAB * hidden
+        + 2 * norm_params
+        + 2 * (
+            K3_KDA_LAYERS * (kda_matrix_params + K3_HEAD_DIM + projection)
+            + K3_MLA_LAYERS * mla_matrix_params
+            + dense_ffn_params
+            + K3_MOE_LAYERS * latent_ffn_params
+            + K3_MOE_LAYERS * shared_params
+            + K3_MOE_LAYERS * (K3_EXPERTS * hidden + K3_EXPERTS)
+        )
+        + K3_MOE_LAYERS * _k3_loaded_experts(tokens) * routed_matrix_bytes
+    )
+
+
+def test_kimi_k3_registry_geometry_schedule_and_mxfp4(kimi_k3_model):
+    from model.work.models import kimi_k3
+
+    assert REGISTRY["KimiLinearForCausalLM"] is kimi_k3.build
+    assert REGISTRY["KimiK3ForConditionalGeneration"] is kimi_k3.build
+    assert kimi_k3_model.name == "KimiK3ForConditionalGeneration"
+    assert kimi_k3_model.hidden == K3_HIDDEN
+    assert kimi_k3_model.vocab == K3_VOCAB
+    assert kimi_k3_model.tie_word_embeddings is False
+    assert kimi_k3_model.master_dtype == "bf16"
+    assert kimi_k3_model.quant.compute_dtype == "fp4"
+    assert kimi_k3_model.quant.bytes_per_weight == 0.5
+    assert kimi_k3_model.quant.block_shape == (1, 32)
+    assert kimi_k3_model.quant.scale_dtype_bytes == 1.0
+    assert kimi_k3_model.quant.converted_prefixes == frozenset({"mlp.experts"})
+    assert [(stack.tag, stack.count) for stack in kimi_k3_model.layers] == [
+        ("dense", 1),
+        ("kda", 68),
+        ("mla", 24),
+    ]
+    dense, kda, mla = kimi_k3_model.layers
+    assert dense.attn.__class__.__name__ == "KimiDeltaAttention"
+    assert kda.attn.__class__.__name__ == "KimiDeltaAttention"
+    assert mla.attn.__class__.__name__ == "MLA"
+    assert dense.ffn.__class__.__name__ == "DenseSwiGLU"
+    assert kda.ffn.expert_input_dim == K3_ROUTED_HIDDEN
+    assert kda.ffn.shared_intermediate == K3_SHARED_INTERMEDIATE
+    assert kda.ffn.router_bias_elements == K3_EXPERTS
+    assert kda.ffn.routed_norm_elements == K3_ROUTED_HIDDEN
+    assert {
+        group.name
+        for group in (*kda.attn.matmul_groups(), *kda.ffn.matmul_groups())
+        if kimi_k3_model.quant.is_converted(group.module)
+    } == {"expert_gate_up", "expert_down"}
+
+
+def test_kimi_k3_hand_derived_parameter_inventory(kimi_k3_model):
+    label = kimi_k3_model.label(Workload.causal_lm(decode=[1], sampled=1))
+    hidden = K3_HIDDEN
+    projection = K3_KDA_PROJECTION
+
+    # KDA attention: q/k/v, beta, full-rank f/g, short conv, and o_proj. The
+    # A_log and dt_bias vectors are included in the attention bucket; the
+    # 128-element gated norm is part of the norm bucket below.
+    kda_attn = (
+        3 * projection * hidden
+        + K3_HEADS * hidden
+        + 2 * projection * hidden
+        + 3 * projection * 4
+        + hidden * projection
+        + K3_HEAD_DIM
+        + projection
+    )
+    # MLA partitions kv_b_proj into 96 q_nope@W_UK and 96 W_UV views.
+    mla_attn = (
+        (1536 + 512 + 64) * hidden
+        + K3_HEADS * (128 + 64) * 1536
+        + K3_HEADS * 128 * 512
+        + K3_HEADS * 128 * 512
+        + hidden * projection
+        + projection * hidden
+    )
+    dense_ffn = 2 * 33792 * hidden + hidden * 33792
+    latent_ffn = hidden * K3_ROUTED_HIDDEN + K3_ROUTED_HIDDEN * hidden
+    routed_expert = K3_EXPERTS * (
+        2 * K3_MOE_INTERMEDIATE * K3_ROUTED_HIDDEN
+        + K3_MOE_INTERMEDIATE * K3_ROUTED_HIDDEN
+    )
+    shared = (
+        2 * K3_SHARED_INTERMEDIATE * hidden + hidden * K3_SHARED_INTERMEDIATE
+    )
+    router = K3_EXPERTS * hidden + K3_EXPERTS
+    norms = (
+        2 * hidden * K3_LAYERS
+        + K3_KDA_LAYERS * K3_HEAD_DIM
+        + K3_MOE_LAYERS * K3_ROUTED_HIDDEN
+        + K3_MLA_LAYERS * (1536 + 512)
+        + hidden
+    )
+    expected_breakdown = {
+        "embedding": K3_VOCAB * hidden,
+        "norm": norms,
+        "attn": K3_KDA_LAYERS * kda_attn + K3_MLA_LAYERS * mla_attn,
+        "ffn": dense_ffn + K3_MOE_LAYERS * latent_ffn,
+        "experts": K3_MOE_LAYERS * routed_expert,
+        "shared": K3_MOE_LAYERS * shared,
+        "router": K3_MOE_LAYERS * router,
+        "lm_head": K3_VOCAB * hidden,
+    }
+    assert expected_breakdown == {
+        "embedding": 1_174_405_120,
+        "norm": 1_728_128,
+        "attn": 42_096_448_128,
+        "ffn": 5_453_643_776,
+        "experts": 2_722_740_830_208,
+        "shared": 12_155_092_992,
+        "router": 590_955_008,
+        "lm_head": 1_174_405_120,
+    }
+    assert label.params["breakdown"] == expected_breakdown
+    assert label.params["total"] == 2_785_387_508_480
+    active_routed = K3_MOE_LAYERS * K3_TOP_K * (routed_expert // K3_EXPERTS)
+    active_layers = (
+        expected_breakdown["attn"]
+        + expected_breakdown["ffn"]
+        + active_routed
+        + expected_breakdown["shared"]
+        + expected_breakdown["router"]
+        + expected_breakdown["norm"]
+    )
+    assert active_layers == 108_918_240_000
+    assert label.params["activated"] == {
+        "layers": active_layers,
+        "with_embed_head": 111_267_050_240,
+    }
+    assert compute_parameter_counts(KIMI_K3) == {
+        "total": 2_785_387_508_480,
+        "active": 111_267_050_240,
+        "active_layers": 108_918_240_000,
+        "active_definition": "with_embed_head",
+    }
+
+
+def test_kimi_k3_hand_derived_decode_traffic_and_work_goldens(kimi_k3_model):
+    batch = 128
+    kv_len = 8192
+    projection = K3_KDA_PROJECTION
+    state_per_request = K3_HEADS * K3_HEAD_DIM * K3_HEAD_DIM * 4
+    conv_per_request = (4 - 1) * (3 * projection) * 2
+
+    decode = kimi_k3_model.label(
+        Workload.causal_lm(decode=[kv_len] * batch, sampled=batch)
+    )
+    assert decode.flops == {
+        "attn_proj": 10_776_471_404_544,
+        "attn_internal": 5_340_389_179_392,
+        "ffn": 16_954_651_836_416,
+        "router": 151_263_379_456,
+        "lm_head": 300_647_710_720,
+    }
+    assert decode.bytes["weights"] == pytest.approx(
+        _k3_expected_weight_bytes(batch), rel=1e-14
+    )
+    assert decode.bytes["weights"] == pytest.approx(1_422_483_507_434.0256, rel=1e-14)
+    # One KDA layer reads and writes a 96x128x128 FP32 recurrent state and a
+    # (kernel-1)x(3x96x128) BF16 convolution state for every decode request.
+    assert decode.bytes["kv"] == pytest.approx(
+        K3_KDA_LAYERS * batch * 2 * (state_per_request + conv_per_request)
+        + K3_MLA_LAYERS * batch * kv_len * (512 + 64) * 2
+    )
+    assert decode.bytes["kv"] == 144_030_302_208
+
+    by_name = {segment.name: segment for segment in decode.segments}
+    assert by_name["dense.recurrent_state.decode_read"].bytes == batch * state_per_request
+    assert by_name["dense.recurrent_state.decode_write"].bytes == batch * state_per_request
+    assert by_name["dense.conv_state.decode_read"].bytes == batch * conv_per_request
+    assert by_name["dense.conv_state.decode_write"].bytes == batch * conv_per_request
+
+    # The routed expert draw count is B*top_k. Each MXFP4 matrix uses 17/32
+    # bytes per weight, so the two routed matrices below are the expected
+    # loaded-expert traffic for one MoE layer.
+    loaded = _k3_loaded_experts(batch)
+    routed_bytes = loaded * (
+        _k3_mxfp4_matrix_bytes(2 * K3_MOE_INTERMEDIATE, K3_ROUTED_HIDDEN)
+        + _k3_mxfp4_matrix_bytes(K3_MOE_INTERMEDIATE, K3_ROUTED_HIDDEN)
+    )
+    assert (
+        by_name["kda.expert_gate_up"].bytes + by_name["kda.expert_down"].bytes
+    ) == pytest.approx(routed_bytes, rel=1e-14)
+    assert by_name["kda.expert_gate_up"].compute_dtype == "fp4"
+    assert by_name["kda.expert_down"].compute_dtype == "fp4"
+    assert by_name["kda.router"].bytes == 2 * K3_EXPERTS * K3_HIDDEN
+    assert by_name["kda.routed_expert_down_proj"].bytes == 2 * K3_HIDDEN * K3_ROUTED_HIDDEN
+    assert by_name["kda.routed_expert_up_proj"].bytes == 2 * K3_ROUTED_HIDDEN * K3_HIDDEN
+
+    # MLA reads the 576-element latent cache for every prior key and appends
+    # one 576-element BF16 entry for each new decode token.
+    assert by_name["mla.attn.decode"].bytes == batch * (kv_len - 1) * 576 * 2
+    assert by_name["mla.mla_cache_append"].bytes == batch * 576 * 2
+    assert by_name["mla.attn.decode"].flops == (
+        2 * K3_HEADS * (512 + 64 + 512) * kv_len * batch
+    )
+
+    long_decode = kimi_k3_model.label(
+        Workload.causal_lm(decode=[1_048_576], sampled=1)
+    )
+    assert long_decode.flops == {
+        "attn_proj": 84_191_182_848,
+        "attn_internal": 5_257_691_136_000,
+        "ffn": 132_458_217_472,
+        "router": 1_181_745_152,
+        "lm_head": 2_348_810_240,
+    }
+    assert long_decode.bytes["weights"] == pytest.approx(
+        _k3_expected_weight_bytes(1), rel=1e-14
+    )
+    assert long_decode.bytes["weights"] == pytest.approx(148_559_047_894.36414, rel=1e-14)
+    assert long_decode.bytes["kv"] == 29_889_773_568
+
+    prefill = kimi_k3_model.label(Workload.causal_lm(prefill=[(8192, 0)], sampled=1))
+    assert prefill.flops == {
+        "attn_proj": 689_694_169_890_816,
+        "attn_internal": 173_580_163_743_744,
+        "ffn": 1_085_097_717_530_624,
+        "router": 9_680_856_285_184,
+        "lm_head": 2_348_810_240,
+    }
+    assert prefill.bytes["weights"] == pytest.approx(
+        _k3_expected_weight_bytes(8192), rel=1e-14
+    )
+    assert prefill.bytes["weights"] == 1_569_518_052_864
+    assert prefill.bytes["kv"] == (
+        K3_KDA_LAYERS * (state_per_request + conv_per_request)
+        + K3_MLA_LAYERS * 8192 * 576 * 2
+    )
+    assert prefill.bytes["kv"] == 675_864_576
