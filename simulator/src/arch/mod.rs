@@ -15,6 +15,7 @@ pub mod glm52_vllm_nvfp4_dsa_moe;
 pub mod llama3_dense;
 pub mod llama3_dense_tp;
 pub mod llama3_dp_attn_tp_ffn;
+pub mod kimi_k3_sglang;
 pub mod model_cfg;
 pub mod moe_model_cfg;
 pub mod qwen36_local;
@@ -53,6 +54,10 @@ pub use glm52_vllm_nvfp4_dsa_moe::{
 pub use llama3_dense::{DenseParallel, Llama3DenseModel};
 pub use llama3_dense_tp::{DenseTpParallel, Llama3DenseTpModel};
 pub use llama3_dp_attn_tp_ffn::{DpAttnTpFfnParallel, Llama3DpAttnTpFfnModel};
+pub use kimi_k3_sglang::{
+    KimiK3LayerCounts, KimiK3ModelCfg, KimiK3SglangConfigs, KimiK3SglangModel,
+    KimiK3SglangParallel, KimiK3SglangResolved,
+};
 pub use model_cfg::ModelCfg;
 pub use moe_model_cfg::MoeModelCfg;
 pub use qwen36_local::{
