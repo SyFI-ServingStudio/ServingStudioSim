@@ -74,8 +74,12 @@ def _validate_args(
         raise ValueError("KDA lower_bound must be a finite negative value")
     if production and (args.num_heads, args.head_k_dim, args.head_v_dim) != (12, 128, 128):
         raise ValueError("SGLang K3 KDA decode requires num_heads=12 and head dims 128")
-    if production and args.state_dtype is not DType.FP32:
-        raise ValueError("SGLang K3 KDA decode requires state_dtype=fp32")
+    # The Triton recurrent kernel (fused_sigmoid_gating_delta_rule_update) runs with
+    # an fp32 OR bf16 state: the cookbook B200 recipe (--mamba-ssm-dtype bfloat16)
+    # takes exactly this path because the fused kernel is not covered for bf16
+    # (verified on B200 with the single-layer driver, kernel table of job 892).
+    if production and args.state_dtype not in (DType.FP32, DType.BF16):
+        raise ValueError("SGLang K3 KDA decode requires state_dtype in {fp32, bf16}")
     return args
 
 
