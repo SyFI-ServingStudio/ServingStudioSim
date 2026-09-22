@@ -154,12 +154,17 @@ def enumerate_kernels(config: dict, build_type: str = "debug") -> list[dict]:
                 argv=[str(binary), "emit-backends", str(cfg_path)],
                 cwd=REPO_ROOT,
                 capture_output=True,
+                # `emit-backends` writes JSON on stdout and its build log — the
+                # whole cost tree — on stderr. Folded together the log lands in
+                # front of the document and every parse fails, so the two
+                # streams have to stay apart.
+                separate_stderr=True,
                 env=_build_subprocess_env(),
                 name="emit-backends",
             )
         )
     if not result.succeeded:
-        raise BackendEnumError(result.output.strip() or "emit-backends failed")
+        raise BackendEnumError(result.stderr_output.strip() or "emit-backends failed")
     return json.loads(result.output)
 
 

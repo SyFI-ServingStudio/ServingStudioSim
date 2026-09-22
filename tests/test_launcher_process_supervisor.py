@@ -47,6 +47,32 @@ def test_capture_uses_root_process_completion(tmp_path: Path) -> None:
     assert "stderr" in result.output
 
 
+def test_separate_stderr_keeps_a_machine_readable_stdout_parsable(tmp_path: Path) -> None:
+    # `emit-backends` writes JSON on stdout and its build log on stderr. Folded
+    # into one stream the log lands in front of the document and every parse
+    # fails, so the two have to be readable apart.
+    result = asyncio.run(
+        ProcessSupervisor().run(
+            _spec(
+                ["import sys; print('LOG LINE', file=sys.stderr); print('[{\"a\": 1}]')"],
+                tmp_path,
+                capture_output=True,
+                separate_stderr=True,
+            )
+        )
+    )
+
+    assert result.succeeded
+    assert json.loads(result.output) == [{"a": 1}]
+    assert "LOG LINE" in result.stderr_output
+    assert "LOG LINE" not in result.output
+
+
+def test_separate_stderr_requires_capture_output(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="separate_stderr requires capture_output"):
+        _spec(["pass"], tmp_path, separate_stderr=True)
+
+
 def test_root_exit_with_inherited_output_descriptor_cleans_descendant(tmp_path: Path) -> None:
     started = time.monotonic()
     code = (
