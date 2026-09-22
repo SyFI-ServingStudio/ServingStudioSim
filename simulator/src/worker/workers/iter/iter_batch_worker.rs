@@ -341,6 +341,10 @@ where
     fn drain_requests(&mut self, now: Time, requests: &[RequestId], out: &mut Vec<RequestId>) {
         IterBatchWorker::drain_requests(self, now, requests, out);
     }
+
+    fn drop_retained_prefixes(&mut self, now: Time) {
+        self.kv_store.drop_retained_prefixes(now);
+    }
 }
 
 #[cfg(test)]
@@ -446,11 +450,13 @@ mod tests {
                 session_id: 10,
                 session_start_time: Time::from_ms_u64(10),
                 declared_prefix_tokens: 0,
+                rounds_in_session: 1,
             };
             requests[RequestId(1)].request.definition.session = SessionInput::Session {
                 session_id: 1,
                 session_start_time: Time::from_ms_u64(1),
                 declared_prefix_tokens: 0,
+                rounds_in_session: 1,
             };
         }
         let mut worker = worker_with(Rc::clone(&store), config_with_budget(8));
@@ -504,6 +510,7 @@ mod tests {
                     session_id: 7,
                     session_start_time: Time::ZERO,
                     declared_prefix_tokens: 100,
+                    rounds_in_session: 1,
                 };
             }
         }
@@ -564,6 +571,7 @@ mod tests {
                     session_id: 7,
                     session_start_time: Time::ZERO,
                     declared_prefix_tokens: 100,
+                    rounds_in_session: 1,
                 };
             }
         }
@@ -1037,6 +1045,7 @@ mod tests {
                         session_id: 7,
                         session_start_time: Time::ZERO,
                         declared_prefix_tokens: 100,
+                        rounds_in_session: 1,
                     };
                 }
             }

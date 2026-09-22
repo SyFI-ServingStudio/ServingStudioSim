@@ -260,6 +260,10 @@ impl IterWorkerKv for HybridGdnKv {
         Some(partition)
     }
 
+    fn drop_retained_prefixes(&mut self, now: Time) {
+        HybridGdnKv::drop_retained_prefixes(self, now);
+    }
+
     fn visit_prefill_admits(&self, partition: PartitionId, mut visitor: impl FnMut(RequestId)) {
         for request in self.partitions[partition as usize].iter_prefill_admits() {
             visitor(request);
@@ -493,6 +497,23 @@ impl HybridGdnKv {
         self.prefix_caches[partition as usize].shrink_to(physical_limit)
     }
 
+    /// Throw away every retained prefix this worker holds, one journal row per
+    /// entry. Called when the pool retires the worker: the tier's sessions are
+    /// still alive, they just have to be re-prefilled wherever they land next.
+    pub(crate) fn drop_retained_prefixes(&mut self, now: Time) {
+        for partition in 0..self.prefix_caches.len() as PartitionId {
+            for (retained_by, mutation) in self.prefix_caches[partition as usize].drop_all() {
+                self.journal.record_mutation(
+                    retained_by,
+                    partition,
+                    now,
+                    mutation,
+                    PrefixCacheEventKind::Evict(PrefixCacheEvictionReason::WorkerRetired),
+                    0,
+                );
+            }
+        }
+    }
     fn retain_prefix(
         &mut self,
         request: RequestId,
@@ -506,6 +527,7 @@ impl HybridGdnKv {
         let physical_limit = self.prefix_cache_physical_limit(partition);
         let insert_result = self.prefix_caches[partition as usize].insert(
             session_id,
+            request,
             tokens,
             physical_limit,
             cache_return_metadata,
@@ -645,7 +667,13 @@ mod tests {
         for (prompt_tokens, expected_hit, measured_percent) in expected {
             let mut kv_store = store(10_000_000, STATE_TOKENS, BLOCK);
             // First turn retains what it can; the second turn replays it.
-            kv_store.prefix_caches[0].insert(7, u64::from(prompt_tokens), 10_000_000, None);
+            kv_store.prefix_caches[0].insert(
+                7,
+                RequestId(0),
+                u64::from(prompt_tokens),
+                10_000_000,
+                None,
+            );
             let hit = kv_store.prefix_caches[0].peek(7, prompt_tokens);
             assert_eq!(
                 hit, expected_hit,
@@ -666,6 +694,7 @@ mod tests {
             session_id: 7,
             session_start_time: Time::ZERO,
             declared_prefix_tokens: 0,
+            rounds_in_session: 1,
         };
         let resolved_prefill = kv_store.preview_prefill_context(0, 5_000, session);
         let footprint = kv_store.footprint(RequestId(0), 5_000, 0);
@@ -703,7 +732,8 @@ mod tests {
 
         // Ask to retain five intervals; only two fit, and the entry is cut at a
         // snapshot boundary rather than at whatever the byte budget allowed.
-        let insert_result = kv_store.prefix_caches[0].insert(7, 5 * interval, capacity, None);
+        let insert_result =
+            kv_store.prefix_caches[0].insert(7, RequestId(0), 5 * interval, capacity, None);
         assert_eq!(insert_result.retained_tokens, 2 * interval);
         assert_eq!(
             kv_store.prefix_caches[0].used_charge(),
@@ -722,7 +752,8 @@ mod tests {
     #[test]
     fn a_prefix_shorter_than_one_snapshot_interval_is_not_retained() {
         let mut kv_store = store(10_000_000, STATE_TOKENS, CHECKPOINT_INTERVAL);
-        let insert_result = kv_store.prefix_caches[0].insert(7, 2_047, 10_000_000, None);
+        let insert_result =
+            kv_store.prefix_caches[0].insert(7, RequestId(0), 2_047, 10_000_000, None);
         assert_eq!(insert_result.retained_tokens, 0);
         assert_eq!(kv_store.prefix_caches[0].used_charge(), 0);
     }
@@ -731,7 +762,7 @@ mod tests {
     fn the_soft_tier_yields_entirely_when_the_hard_tier_fills_the_partition() {
         let capacity = 40_000;
         let mut kv_store = store(capacity, STATE_TOKENS, CHECKPOINT_INTERVAL);
-        kv_store.prefix_caches[0].insert(7, 4_096, capacity, None);
+        kv_store.prefix_caches[0].insert(7, RequestId(0), 4_096, capacity, None);
         assert!(kv_store.prefix_caches[0].used_charge() > 0);
 
         // Fill the hard tier: 8 residents × (2_000 context + 3_168 state) ≈ 41k,
@@ -799,7 +830,7 @@ mod tests {
     #[test]
     fn a_zero_interval_model_degrades_to_plain_full_attention_accounting() {
         let mut kv_store = store(10_000, 0, 0);
-        kv_store.prefix_caches[0].insert(7, 137, 10_000, None);
+        kv_store.prefix_caches[0].insert(7, RequestId(0), 137, 10_000, None);
         assert_eq!(kv_store.prefix_caches[0].peek(7, 137), 137);
         assert_eq!(kv_store.prefix_caches[0].used_charge(), 137);
         assert_eq!(kv_store.clamped_live_checkpoint_charge(0), 0);

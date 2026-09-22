@@ -34,9 +34,9 @@ use crate::common::{PoolId, SharedRequests, Time};
 use crate::deployment::UnifiedConfig;
 use crate::orchestrator::common::WorkerBuildFn;
 use crate::orchestrator::{
-    DpPlacementPolicy, Flow, MigrationPolicySel, MigrationTrigger, PlacementPolicy, PoolSpec,
-    SimpleDpConfig, SimpleDpFlow, SimpleDpPoolConfig, TrainingConfig, TrainingSel,
-    UnifiedWorkerFactory,
+    DpPlacementPolicy, Flow, GroupBy, GroupBySel, MigrationPolicySel, MigrationTrigger,
+    PlacementPolicy, PoolSpec, SimpleDpConfig, SimpleDpFlow, SimpleDpPoolConfig, TracePlacementSel,
+    TrainingConfig, TrainingSel, UnifiedWorkerFactory,
 };
 use crate::timing::PerfApiBridge;
 use crate::worker::{
@@ -125,6 +125,9 @@ impl Deployment for UnifiedDeployment {
                 batch_policy,
                 kv_admission,
                 gpu_time_multiplier,
+                prefix_cache_mode,
+                prefix_cache_policy,
+                prefix_cache_max_gpu_memory_gb,
             } => {
                 let kv_admission = kv_admission.resolve()?;
                 ensure!(
@@ -138,9 +141,9 @@ impl Deployment for UnifiedDeployment {
                     *gpu_time_multiplier,
                     Some(*max_batch_tokens),
                     PendingOrderKind::Fifo,
-                    PrefixCacheMode::Opportunistic,
-                    PrefixCachePolicy::Lru,
-                    None,
+                    *prefix_cache_mode,
+                    *prefix_cache_policy,
+                    *prefix_cache_max_gpu_memory_gb,
                     *batch_policy,
                     kv_admission,
                 )
@@ -200,10 +203,15 @@ impl Deployment for UnifiedDeployment {
                 pool: PoolId(0),
                 num_workers: g.replicas,
                 placement: placement_into(pool.placement),
+                ignore_trace_placement: matches!(pool.trace_placement, TracePlacementSel::Ignore),
             },
             migration: migration_into(pool),
             training: training_into(pool)?,
             log_dir: log_dir.clone(),
+            group_by: match pool.group_by {
+                GroupBySel::IdBlock => GroupBy::IdBlock,
+                GroupBySel::Session => GroupBy::Session,
+            },
         };
         let gpu_name = g.gpu.clone();
 
@@ -896,6 +904,9 @@ mod tests {
             batch_policy: BatchPolicy::Mix,
             kv_admission: crate::worker::config::KvAdmissionSpec::default(),
             gpu_time_multiplier: 1.0,
+            prefix_cache_mode: PrefixCacheMode::Opportunistic,
+            prefix_cache_policy: PrefixCachePolicy::Lru,
+            prefix_cache_max_gpu_memory_gb: None,
         }
     }
 

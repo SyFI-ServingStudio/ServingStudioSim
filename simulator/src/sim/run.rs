@@ -519,8 +519,8 @@ mod tests {
     use super::*;
     use crate::common::{PoolId, RequestStore, SessionInput, SloContract, UnifiedStage, WorkerId};
     use crate::orchestrator::{
-        DpPlacementPolicy, SimpleDpConfig, SimpleDpFlow, SimpleDpPoolConfig, TrainingConfig,
-        UnifiedWorkerFactory,
+        DpPlacementPolicy, GroupBy, SimpleDpConfig, SimpleDpFlow, SimpleDpPoolConfig,
+        TrainingConfig, UnifiedWorkerFactory,
     };
     use crate::sim::frontend::TraceFrontend;
     use crate::sim::frontend::{
@@ -585,6 +585,7 @@ mod tests {
                 pool: PoolId(0),
                 num_workers: 1,
                 placement: DpPlacementPolicy::RoundRobin,
+                ignore_trace_placement: false,
             },
             migration: None,
             training: Some(TrainingConfig {
@@ -598,6 +599,7 @@ mod tests {
                 tail_threshold: 0,
                 expected_groups: 0,
             }),
+            group_by: GroupBy::IdBlock,
             log_dir: None,
         };
         let mut flow = SimpleDpFlow::new(cfg, factory);
@@ -656,9 +658,11 @@ mod tests {
                 pool: PoolId(0),
                 num_workers: 2,
                 placement: DpPlacementPolicy::RoundRobin,
+                ignore_trace_placement: false,
             },
             migration: None,
             training: None,
+            group_by: GroupBy::IdBlock,
             log_dir: None,
         };
         let mut flow = SimpleDpFlow::new(cfg, factory);
@@ -726,9 +730,11 @@ mod tests {
                 pool: PoolId(0),
                 num_workers: 1,
                 placement: DpPlacementPolicy::RoundRobin,
+                ignore_trace_placement: false,
             },
             migration: None,
             training: None,
+            group_by: GroupBy::IdBlock,
             log_dir: None,
         };
         let mut flow = SimpleDpFlow::new(cfg, factory);
@@ -774,6 +780,7 @@ mod tests {
                 session_id: 7,
                 session_start_time: Time::ZERO,
                 declared_prefix_tokens: 100,
+                rounds_in_session: 1,
             };
             request.core.slo = SloContract {
                 ttft_slo: Some(Time::from_ms(300.0)),

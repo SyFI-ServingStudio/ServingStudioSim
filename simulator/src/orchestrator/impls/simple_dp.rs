@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 
-use crate::common::{PoolId, Request, RequestId, SharedRequests, Time, WorkerId};
+use crate::common::{PoolId, Request, RequestId, SessionInput, SharedRequests, Time, WorkerId};
 use crate::worker::{
     CostSource, GpuCluster, IterWorker, MigratableWorker, SharedGpuCluster, WorkerEventCommon,
     WorkerMsgCommon,
@@ -40,6 +40,12 @@ pub struct SimpleDpPoolConfig {
     pub pool: PoolId,
     pub num_workers: u16,
     pub placement: DpPlacementPolicy,
+    /// Read a trace-declared `target_worker` under a load policy instead of
+    /// refusing it. Default `false` keeps the refusal, which is what stops a
+    /// placed trace from being silently re-placed; a counterfactual arm sets it
+    /// to say the re-placement is the experiment. Ignored under
+    /// `TraceDirected`, which needs the column either way.
+    pub ignore_trace_placement: bool,
 }
 
 /// Config for the whole simple_dp deployment.
@@ -59,6 +65,19 @@ pub struct SimpleDpConfig {
     /// theirs through the factory; the training blocks are built here, so this
     /// is their path in.
     pub log_dir: Option<PathBuf>,
+    /// What one group is. Only consulted when something asks for groups at all
+    /// — a pool with neither migration nor training counts none either way.
+    pub group_by: GroupBy,
+}
+
+/// Preset-level choice of [`GroupKey`]: the size of an id block is not a
+/// separate decision (it comes from whichever of migration/training is on), so
+/// the selector carries no payload.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GroupBy {
+    #[default]
+    IdBlock,
+    Session,
 }
 
 // ── L6a: pool-local orchestration ─────────────────────────────────────────────
@@ -72,6 +91,8 @@ pub struct SimpleDpPoolController<W: IterWorker> {
     /// outer tick whose `now >= wakeup_time`.
     worker_wakeup_times: Vec<Time>,
     placement: DpPlacementPolicy,
+    /// See [`SimpleDpPoolConfig::ignore_trace_placement`].
+    ignore_trace_placement: bool,
     rr_next: usize,
     /// Current host of each worker index: `redirect[i] == WorkerId(i)` while
     /// worker `i` is live, and the worker it was drained onto once it retires.
@@ -88,24 +109,57 @@ pub struct SimpleDpPoolController<W: IterWorker> {
     groups: Option<GroupLedger>,
 }
 
-/// Which worker holds each prompt group, and how much of each group is left.
+/// What one *group* of requests is — the unit both the migration trigger and
+/// the trainer ask about.
 ///
-/// A *prompt group* is a block of `size` consecutive request ids. The group is
-/// in flight until its last member completes — the reading an RL rollout needs,
-/// because a training step cannot consume a prompt's samples until the slowest
-/// one lands, so a nearly-finished group still pins a worker.
+/// The two shapes differ in more than naming. An RL prompt group's samples are
+/// generated in parallel and all of them exist from the start, so the ledger can
+/// tell the group is done by watching its arrived members drain. A conversation's
+/// rounds arrive one at a time (a chained successor is released by its
+/// predecessor's completion), so that same test would fire after *every* round;
+/// only the trace's declared round count says which zero is the last one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GroupKey {
+    /// A block of `size` consecutive request ids. Derived from the id rather
+    /// than declared per request: the trace formats that carry grouped work
+    /// number their samples in contiguous blocks, and a column would have to be
+    /// validated against that anyway.
+    IdBlock { size: u32 },
+    /// One conversation, identified by its session id and sized by the round
+    /// count the trace declares.
+    Session,
+}
+
+/// What the ledger is told about an arriving request: which group it joins and,
+/// when the trace declares it, how many members that group will ever have.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GroupMembership {
+    group: usize,
+    /// `None` = not declared, so the group counts as finished once its arrived
+    /// members have. `Some(n)` = finished only after `n` completions.
+    expected: Option<u32>,
+}
+
+/// Which worker holds each group, and how much of each group is left.
 ///
-/// Derived from the id rather than declared per request: the trace formats that
-/// carry grouped work number their samples in contiguous blocks, and a column
-/// would have to be validated against that anyway. A mismatch is caught, not
-/// tolerated — see the split-group assertion in `arrived`.
+/// A group is in flight until its last member completes — the reading an RL
+/// rollout needs, because a training step cannot consume a prompt's samples
+/// until the slowest one lands, so a nearly-finished group still pins a worker.
 #[derive(Debug)]
 struct GroupLedger {
-    size: u32,
+    /// Group of each request id, `NO_GROUP` for one the ledger never saw.
+    /// Dense because request ids are.
+    group_of: Vec<u32>,
+    /// Every request id that has joined each group, in arrival order.
+    members: Vec<Vec<RequestId>>,
     /// Worker currently holding each group, by group id.
     host: Vec<WorkerId>,
     /// Members of each group not yet complete, by group id.
     unfinished: Vec<u32>,
+    /// Members of each group already complete, by group id.
+    finished: Vec<u32>,
+    /// Declared member count per group; see [`GroupMembership::expected`].
+    expected: Vec<Option<u32>>,
     /// Groups with at least one unfinished member, by worker index.
     per_worker: Vec<u32>,
     /// Requests completed on each worker. A policy that fires on a drop in
@@ -114,26 +168,43 @@ struct GroupLedger {
     completed_per_worker: Vec<u32>,
 }
 
+/// `group_of` entry for a request the ledger has not been told about.
+const NO_GROUP: u32 = u32::MAX;
+
 impl GroupLedger {
-    fn new(size: u32, num_workers: usize) -> Self {
-        assert!(size > 0, "a prompt group needs at least one request");
+    fn new(num_workers: usize) -> Self {
         Self {
-            size,
+            group_of: Vec::new(),
+            members: Vec::new(),
             host: Vec::new(),
             unfinished: Vec::new(),
+            finished: Vec::new(),
+            expected: Vec::new(),
             per_worker: vec![0; num_workers],
             completed_per_worker: vec![0; num_workers],
         }
     }
 
     fn group_of(&self, request: RequestId) -> usize {
-        request.0 as usize / self.size as usize
+        let group = self
+            .group_of
+            .get(request.0 as usize)
+            .copied()
+            .unwrap_or(NO_GROUP);
+        assert_ne!(
+            group, NO_GROUP,
+            "{request:?} completed without ever being recorded as an arrival"
+        );
+        group as usize
     }
 
-    fn arrived(&mut self, request: RequestId, worker: WorkerId) {
-        let group = self.group_of(request);
+    fn arrived(&mut self, request: RequestId, worker: WorkerId, membership: GroupMembership) {
+        let GroupMembership { group, expected } = membership;
         if group >= self.unfinished.len() {
             self.unfinished.resize(group + 1, 0);
+            self.finished.resize(group + 1, 0);
+            self.expected.resize(group + 1, None);
+            self.members.resize(group + 1, Vec::new());
             self.host.resize(group + 1, worker);
         }
         if self.unfinished[group] == 0 {
@@ -142,11 +213,23 @@ impl GroupLedger {
         } else {
             assert_eq!(
                 self.host[group], worker,
-                "prompt group {group} is split across workers {:?} and {worker:?}; \
+                "group {group} is split across workers {:?} and {worker:?}; \
                  a group-counting migration policy needs each group on one worker",
                 self.host[group],
             );
         }
+        if let Some(declared) = expected {
+            let seen = self.expected[group].get_or_insert(declared);
+            assert_eq!(
+                *seen, declared,
+                "group {group} was declared {seen} members and then {declared}",
+            );
+        }
+        if request.0 as usize >= self.group_of.len() {
+            self.group_of.resize(request.0 as usize + 1, NO_GROUP);
+        }
+        self.group_of[request.0 as usize] = group as u32;
+        self.members[group].push(request);
         self.unfinished[group] += 1;
     }
 
@@ -157,14 +240,21 @@ impl GroupLedger {
         let group = self.group_of(request);
         let host = self.host[group].0 as usize;
         let left = &mut self.unfinished[group];
-        assert!(*left > 0, "prompt group {group} completed more than it holds");
+        assert!(*left > 0, "group {group} completed more than it holds");
         *left -= 1;
         let emptied = *left == 0;
+        self.finished[group] += 1;
         if emptied {
             self.per_worker[host] -= 1;
         }
         self.completed_per_worker[host] += 1;
-        emptied.then_some(group)
+        // A declared count is the authority when there is one: a chained
+        // conversation empties after every round, and only the declared total
+        // distinguishes the last of those from the rest.
+        match self.expected[group] {
+            Some(declared) => (self.finished[group] == declared).then_some(group),
+            None => emptied.then_some(group),
+        }
     }
 
     /// Groups still in flight on `worker`, lowest id first — the order a
@@ -186,13 +276,11 @@ impl GroupLedger {
             .find(|group| self.unfinished[*group] > 0 && self.host[*group] == worker)
     }
 
-    /// Every request id belonging to `group`, finished or not. Ids are numbered
-    /// in consecutive blocks, so this is arithmetic rather than a lookup — and
-    /// the caller hands the whole block to the worker, which knows which of them
+    /// Every request id that has joined `group`, finished or not, in arrival
+    /// order. The caller hands the list to a worker, which knows which of them
     /// it is actually still holding.
-    fn members(&self, group: usize) -> Vec<RequestId> {
-        let first = group as u32 * self.size;
-        (first..first + self.size).map(RequestId).collect()
+    fn members(&self, group: usize) -> &[RequestId] {
+        &self.members[group]
     }
 
     fn moved(&mut self, group: usize, to: WorkerId) {
@@ -227,23 +315,37 @@ impl<W: IterWorker> SimpleDpPoolController<W> {
             redirect: (0..workers.len() as u16).map(WorkerId).collect(),
             workers,
             placement: cfg.placement,
+            ignore_trace_placement: cfg.ignore_trace_placement,
             rr_next: 0,
             groups: None,
         }
     }
 
-    /// Start counting prompt groups of `size` requests. Called once, when a
-    /// migration policy is installed; a pool without one never tracks them.
-    pub fn track_groups(&mut self, size: u32) {
-        self.groups = Some(GroupLedger::new(size, self.workers.len()));
+    /// Start counting groups. Called once, when a migration policy or the
+    /// trainer is installed; a pool with neither never tracks them.
+    pub fn track_groups(&mut self) {
+        self.groups = Some(GroupLedger::new(self.workers.len()));
+    }
+
+    /// Whether this pool counts groups at all.
+    pub fn tracks_groups(&self) -> bool {
+        self.groups.is_some()
     }
 
     /// Record that `request` has been placed on `worker`. Separate from the
     /// enqueue itself because a resume is not an arrival: the ledger already
     /// counts a migrated request, and re-counting it would double its group.
-    pub fn note_arrival(&mut self, request: RequestId, worker: WorkerId) {
-        if let Some(groups) = self.groups.as_mut() {
-            groups.arrived(request, worker);
+    ///
+    /// The membership comes from the caller because only the flow can see the
+    /// request definition the group is derived from.
+    pub fn note_arrival(
+        &mut self,
+        request: RequestId,
+        worker: WorkerId,
+        membership: Option<GroupMembership>,
+    ) {
+        if let (Some(groups), Some(membership)) = (self.groups.as_mut(), membership) {
+            groups.arrived(request, worker, membership);
         }
     }
 
@@ -257,7 +359,7 @@ impl<W: IterWorker> SimpleDpPoolController<W> {
 
     /// Every request id of `group`. Panics if the pool tracks no groups — a
     /// caller asking about one has already been told a group exists.
-    pub fn group_members(&self, group: usize) -> Vec<RequestId> {
+    pub fn group_members(&self, group: usize) -> &[RequestId] {
         self.groups
             .as_ref()
             .expect("group membership needs the ledger a group-aware policy installs")
@@ -336,6 +438,10 @@ impl<W: IterWorker> SimpleDpPoolController<W> {
         self.placement
     }
 
+    pub fn ignore_trace_placement(&self) -> bool {
+        self.ignore_trace_placement
+    }
+
     pub fn num_workers(&self) -> usize {
         self.workers.len()
     }
@@ -412,16 +518,21 @@ where
 {
     /// Admit a fresh request (the universal entry) — wraps in the chosen
     /// worker's `W::Msg::from(rid)`. PD-side admits via `admit_msg` directly.
-    pub fn admit(&mut self, rid: RequestId) {
+    pub fn admit(&mut self, rid: RequestId, membership: Option<GroupMembership>) {
         let idx = self.choose_worker_idx();
-        self.note_arrival(rid, WorkerId(idx as u16));
+        self.note_arrival(rid, WorkerId(idx as u16), membership);
         self.enqueue_at(idx, W::Msg::from(rid));
     }
 
     /// Admit a fresh request to a *named* worker — the trace-directed entry.
     /// Unlike `route_msg_to` this is an arrival, so it reaches the ledger.
-    pub fn admit_to(&mut self, worker: WorkerId, rid: RequestId) {
-        self.note_arrival(rid, worker);
+    pub fn admit_to(
+        &mut self,
+        worker: WorkerId,
+        rid: RequestId,
+        membership: Option<GroupMembership>,
+    ) {
+        self.note_arrival(rid, worker, membership);
         self.enqueue_at(worker.0 as usize, W::Msg::from(rid));
     }
 }
@@ -461,7 +572,7 @@ where
                 assert_ne!(order.src(), *dst, "a migration must name two workers");
                 scratch.clear();
                 self.workers[src].drain_resident(now, scratch);
-                self.retire(src, *dst);
+                self.retire(now, src, *dst);
                 for request in std::mem::take(scratch) {
                     self.resume_on(now, *dst, request);
                     scratch.push(request);
@@ -501,7 +612,7 @@ where
 
                 scratch.clear();
                 self.workers[src].drain_resident(now, scratch);
-                self.retire(src, *retire_to);
+                self.retire(now, src, *retire_to);
                 let drained = std::mem::take(scratch);
                 for (group, dst) in resident.iter().zip(dsts) {
                     if let Some(groups) = self.groups.as_mut() {
@@ -535,7 +646,7 @@ where
                 // and the worker is neither retired nor redirected. That is the
                 // whole point — a block being handed back one group at a time is
                 // still a working engine until its last group is gone.
-                self.workers[src].drain_requests(now, &members, scratch);
+                self.workers[src].drain_requests(now, members, scratch);
                 self.groups
                     .as_mut()
                     .expect("checked above")
@@ -564,8 +675,14 @@ where
 
     /// Take `src` out of the pool. Later trace arrivals pinned to it follow the
     /// work that already left rather than refilling a machine being emptied.
-    fn retire(&mut self, src: usize, to: WorkerId) {
+    fn retire(&mut self, now: Time, src: usize, to: WorkerId) {
         self.redirect[src] = to;
+        // Nothing routes here again, so the retained tier is dead weight on a
+        // GPU that is about to be the trainer's. Its sessions are alive and will
+        // land on `to` — where they miss, and pay a full prefill. That burst is
+        // a real cost of handing a block back, and it only shows up if the tier
+        // actually goes.
+        self.workers[src].drop_retained_prefixes(now);
         // The source keeps whatever wakeup it had: an in-flight forward pass is
         // still running on its GPU even though its requests have left.
     }
@@ -605,6 +722,8 @@ pub struct SimpleDpFlow<W: IterWorker<Event = WorkerEventCommon>> {
     /// Holds its own blocks, so a run with it on keeps going after the last
     /// request lands — see [`Flow::background`].
     training: Option<TrainingPool>,
+    /// What a group is, or `None` when nothing counts them.
+    group_key: Option<GroupKey>,
     /// Reused per-tick migration scratch, allocated only on the first tick that
     /// actually runs a policy.
     loads: Vec<WorkerLoad>,
@@ -638,13 +757,20 @@ where
                 "migration and training disagree about the prompt group size",
             );
         }
-        let group_size = cfg
-            .migration
-            .as_ref()
-            .map(MigrationTrigger::group_size)
-            .or(cfg.training.as_ref().map(|training| training.group_size));
-        if let Some(size) = group_size {
-            dp_pool.track_groups(size);
+        // A group is counted when either side asks for one. `Session` is a
+        // choice the preset makes; `IdBlock` takes its size from whichever of
+        // the two is installed.
+        let group_key = match cfg.group_by {
+            GroupBy::Session => Some(GroupKey::Session),
+            GroupBy::IdBlock => cfg
+                .migration
+                .as_ref()
+                .map(MigrationTrigger::group_size)
+                .or(cfg.training.as_ref().map(|training| training.group_size))
+                .map(|size| GroupKey::IdBlock { size }),
+        };
+        if group_key.is_some() {
+            dp_pool.track_groups();
         }
         let training = cfg
             .training
@@ -658,6 +784,7 @@ where
                 .migration
                 .map(|trigger| Box::new(trigger) as Box<dyn MigrationPolicy>),
             training,
+            group_key,
             loads: Vec::new(),
             orders: Vec::new(),
             migrated: Vec::new(),
@@ -673,9 +800,40 @@ where
         group_size: u32,
     ) {
         if policy.is_some() {
-            self.dp_pool.track_groups(group_size);
+            self.dp_pool.track_groups();
+            // Only supplies a key the pool does not already have. A
+            // session-grouped pool counts conversations whether or not it also
+            // migrates, and `group_size` has no meaning for it.
+            self.group_key
+                .get_or_insert(GroupKey::IdBlock { size: group_size });
         }
         self.migration = policy;
+    }
+
+    /// Which group a fresh arrival joins, under whatever key this pool counts.
+    ///
+    /// `Session` reads the conversation the trace declared; an id block is
+    /// arithmetic. A session group's size is declared, an id block's is not —
+    /// see [`GroupMembership::expected`].
+    fn membership(&self, rid: RequestId, session: SessionInput) -> Option<GroupMembership> {
+        match self.group_key? {
+            GroupKey::IdBlock { size } => Some(GroupMembership {
+                group: rid.0 as usize / size as usize,
+                expected: None,
+            }),
+            GroupKey::Session => {
+                let session_id = session.session_id().unwrap_or_else(|| {
+                    panic!(
+                        "{rid:?} has no session id, but this pool groups by session; \
+                         a session-grouped run needs a trace that declares one"
+                    )
+                });
+                Some(GroupMembership {
+                    group: session_id as usize,
+                    expected: Some(session.rounds_in_session()),
+                })
+            }
+        }
     }
 }
 
@@ -687,6 +845,7 @@ where
     fn on_arrival(&mut self, req: Request) {
         let rid = req.core.id;
         let declared = req.core.placement.worker;
+        let membership = self.membership(rid, req.definition.session);
         self.requests.borrow_mut().insert(req);
         match (self.dp_pool.placement(), declared) {
             (DpPlacementPolicy::TraceDirected, Some(target)) => {
@@ -697,7 +856,7 @@ where
                     self.dp_pool.num_workers(),
                 );
                 let host = self.dp_pool.resolve(target);
-                self.dp_pool.admit_to(host, rid);
+                self.dp_pool.admit_to(host, rid, membership);
             }
             // Both mismatches are configuration errors, and both are refused
             // rather than papered over: falling back to a load policy would
@@ -707,11 +866,16 @@ where
                 "a trace-directed pool needs a target_worker on every request, \
                  but {rid:?} declared none"
             ),
-            (other, Some(_)) => panic!(
+            // Unless the preset says the re-placement IS the experiment: a
+            // counterfactual arm reads the same placed trace and asks what a
+            // load policy would have done with the same work.
+            (other, Some(_)) if !self.dp_pool.ignore_trace_placement() => panic!(
                 "{rid:?} declares a target_worker, but this pool places by {other:?}; \
-                 set the pool's placement to trace-directed or drop the placement tag"
+                 set the pool's placement to trace-directed, drop the placement tag, \
+                 or set trace_placement: ignore to re-place the trace on purpose"
             ),
-            (_, None) => self.dp_pool.admit(rid),
+            // Either no declaration, or one the pool was told to ignore.
+            (_, _) => self.dp_pool.admit(rid, membership),
         }
     }
 
@@ -745,17 +909,46 @@ where
             // everything it generated.
             if let (Some(group), Some(training)) = (finished_group, self.training.as_mut()) {
                 let store = self.requests.borrow();
-                training.admit(
-                    self.dp_pool
-                        .group_members(group)
-                        .into_iter()
+                let members = self.dp_pool.group_members(group);
+                let samples = match self.group_key.expect("a finished group implies a key") {
+                    // Parallel samples of one prompt: each is its own sequence.
+                    GroupKey::IdBlock { .. } => members
+                        .iter()
                         .map(|member| {
-                            let record = &store[member];
+                            let record = &store[*member];
                             record.request.definition.prompt_tokens
                                 + record.progress.output_tokens_emitted
                         })
                         .collect(),
-                );
+                    // One conversation trained once, on the transcript as it
+                    // stands at the end. The rounds share a prefix, so summing
+                    // them would count that prefix once per round; the last
+                    // round's own context already contains every earlier one —
+                    // `declared_prefix + prompt` is the post-prefill context
+                    // `ResolvedPrefillContext` guarantees. A major compaction
+                    // resets the declared prefix, and the shorter trajectory
+                    // that follows is then exactly what this reads.
+                    GroupKey::Session => {
+                        // The last round is the highest id in the group: a
+                        // session's rounds are emitted in order by the loader
+                        // and ids are interned in emit order. Read that way
+                        // rather than "the round that finished last", which is
+                        // the same under chained release and need not be under
+                        // independent release.
+                        let last = members
+                            .iter()
+                            .max()
+                            .copied()
+                            .expect("a finished group has members");
+                        let record = &store[last];
+                        vec![
+                            record.request.definition.session.declared_prefix_tokens()
+                                + record.request.definition.prompt_tokens
+                                + record.progress.output_tokens_emitted,
+                        ]
+                    }
+                };
+                training.admit(samples);
             }
             actions.push(OrchAction::Complete { req });
         }
@@ -794,7 +987,7 @@ mod tests {
     use crate::common::UnifiedStage;
     use crate::orchestrator::training::TrainingConfig;
     use crate::orchestrator::UnifiedWorkerFactory;
-    use crate::test_helpers::{text_request, text_request_on, FakeModel};
+    use crate::test_helpers::{session_round, text_request, text_request_on, FakeModel};
     use crate::worker::{
         build_barebone_worker, build_chunked_prefill_worker, BareboneWorker, ChunkedPrefillWorker,
         WorkerConfig,
@@ -824,6 +1017,27 @@ mod tests {
         migration: Option<MigrationTrigger>,
         training: Option<TrainingConfig>,
     ) -> (SimpleDpFlow<BareboneWorker<FakeModel>>, SharedRequests) {
+        build_flow_grouped(
+            num_workers,
+            placement,
+            migration,
+            training,
+            GroupBy::IdBlock,
+            false,
+        )
+    }
+
+    /// The full knob set. Session grouping and the trace-placement escape hatch
+    /// are only exercised by a handful of tests, so the shorter constructors
+    /// above stay the default shape.
+    fn build_flow_grouped(
+        num_workers: u16,
+        placement: DpPlacementPolicy,
+        migration: Option<MigrationTrigger>,
+        training: Option<TrainingConfig>,
+        group_by: GroupBy,
+        ignore_trace_placement: bool,
+    ) -> (SimpleDpFlow<BareboneWorker<FakeModel>>, SharedRequests) {
         let store: SharedRequests = Rc::new(RefCell::new(RequestStore::new()));
         let factory = UnifiedWorkerFactory::new(
             Arc::new(FakeModel::for_ms(1.0)),
@@ -839,10 +1053,12 @@ mod tests {
                 pool: PoolId(0),
                 num_workers,
                 placement,
+                ignore_trace_placement,
             },
             migration,
             training,
             log_dir: None,
+            group_by,
         };
         (SimpleDpFlow::new(cfg, factory), store)
     }
@@ -996,6 +1212,18 @@ mod tests {
         SimpleDpFlow<ChunkedPrefillWorker<FakeModel>>,
         SharedRequests,
     ) {
+        build_chunked_flow_grouped(num_workers, placement, migration, GroupBy::IdBlock)
+    }
+
+    fn build_chunked_flow_grouped(
+        num_workers: u16,
+        placement: DpPlacementPolicy,
+        migration: Option<MigrationTrigger>,
+        group_by: GroupBy,
+    ) -> (
+        SimpleDpFlow<ChunkedPrefillWorker<FakeModel>>,
+        SharedRequests,
+    ) {
         let store: SharedRequests = Rc::new(RefCell::new(RequestStore::new()));
         let factory = UnifiedWorkerFactory::new(
             Arc::new(FakeModel::for_ms(1.0)),
@@ -1014,10 +1242,12 @@ mod tests {
                 pool: PoolId(0),
                 num_workers,
                 placement,
+                ignore_trace_placement: false,
             },
             migration,
             training: None,
             log_dir: None,
+            group_by,
         };
         (SimpleDpFlow::new(cfg, factory), store)
     }
@@ -1373,5 +1603,324 @@ mod tests {
         // no overhead, (8 + 1) + (8 + 20) tokens is 37 ms and nothing else is.
         let (start, end) = training.window().expect("one chunk ran");
         assert_eq!(end.as_ms() - start.as_ms(), 37.0);
+    }
+
+    // ── Sessions ──────────────────────────────────────────────────────────────
+
+    /// [`session_round`] plus the engine the trace recorded this round on.
+    fn session_round_on(
+        request_id: RequestId,
+        session_id: u32,
+        rounds_in_session: u32,
+        declared_prefix_tokens: u32,
+        prompt_tokens: u32,
+        target_output_tokens: u32,
+        target_worker: WorkerId,
+    ) -> Request {
+        let mut request = session_round(
+            request_id,
+            session_id,
+            rounds_in_session,
+            declared_prefix_tokens,
+            prompt_tokens,
+            target_output_tokens,
+        );
+        request.core.placement = crate::common::PlacementDirective {
+            worker: Some(target_worker),
+        };
+        request
+    }
+
+    /// Run a chained conversation: a round is released by its predecessor's
+    /// completion, which is what the frontend's `SessionDependency::Chained`
+    /// does, and the reason the ledger cannot read "nothing outstanding" as
+    /// "conversation over".
+    ///
+    /// `after_round` sees the flow once each round has landed, with the index of
+    /// the round that just finished.
+    fn drain_chained<W>(
+        flow: &mut SimpleDpFlow<W>,
+        rounds: Vec<Request>,
+        mut after_round: impl FnMut(&SimpleDpFlow<W>, usize),
+    ) where
+        W: MigratableWorker<Event = WorkerEventCommon>,
+        W::Msg: From<RequestId> + From<WorkerMsgCommon>,
+    {
+        let total = rounds.len();
+        let mut rounds = rounds.into_iter();
+        let mut next = rounds.next();
+        let mut landed = 0usize;
+        for step in 0..500u64 {
+            let now = Time::from_ms(step as f64);
+            if let Some(round) = next.take() {
+                flow.on_arrival(round);
+            }
+            for action in flow.tick(now) {
+                let OrchAction::Complete { req: _ } = action;
+                after_round(flow, landed);
+                landed += 1;
+                next = rounds.next();
+            }
+        }
+        assert_eq!(landed, total, "not every round completed");
+    }
+
+    /// Placement is the trace's to give for a conversation exactly as it is for
+    /// a standalone request: every round goes where the recording put it, and
+    /// the pool does not get a vote.
+    #[test]
+    fn a_trace_placed_session_follows_its_recorded_engine() {
+        let (mut flow, store) = build_flow_grouped(
+            3,
+            DpPlacementPolicy::TraceDirected,
+            None,
+            None,
+            GroupBy::Session,
+            false,
+        );
+        // The recording moved the conversation between engines mid-way; a
+        // placement policy would never have produced this sequence, which is
+        // precisely why it has to come from the column.
+        let engines = [WorkerId(2), WorkerId(0), WorkerId(2)];
+        let rounds: Vec<Request> = engines
+            .iter()
+            .enumerate()
+            .map(|(round, engine)| {
+                session_round_on(
+                    RequestId(round as u32),
+                    0,
+                    3,
+                    4 * round as u32,
+                    8,
+                    2,
+                    *engine,
+                )
+            })
+            .collect();
+
+        drain_chained(&mut flow, rounds, |_, _| {});
+
+        for (round, engine) in engines.iter().enumerate() {
+            let visited = workers_visited(&store, RequestId(round as u32));
+            assert!(!visited.is_empty(), "round {round} recorded no stage");
+            assert!(
+                visited.iter().all(|worker| worker == engine),
+                "round {round} ran on {visited:?}, not on the recorded {engine:?}"
+            );
+        }
+    }
+
+    /// A load policy reading a placed trace is refused, because a run that
+    /// silently re-places it is not the run the trace describes — unless the
+    /// preset says the re-placement IS the experiment.
+    #[test]
+    #[should_panic(expected = "declares a target_worker")]
+    fn a_load_policy_refuses_a_placed_trace() {
+        let (mut flow, _store) = build_flow(2, DpPlacementPolicy::LeastQueued);
+        flow.on_arrival(text_request_on(RequestId(0), 8, 2, Time::ZERO, WorkerId(1)));
+    }
+
+    /// The counterfactual arm: the same placed trace, read with the column
+    /// ignored, so the pool's own policy decides.
+    #[test]
+    fn a_load_policy_takes_a_placed_trace_when_told_to_ignore_it() {
+        let (mut flow, store) = build_flow_grouped(
+            2,
+            DpPlacementPolicy::RoundRobin,
+            None,
+            None,
+            GroupBy::IdBlock,
+            true,
+        );
+        // Every row names worker 1; round-robin must spread them anyway.
+        for id in 0..4u32 {
+            flow.on_arrival(text_request_on(
+                RequestId(id),
+                8,
+                2,
+                Time::ZERO,
+                WorkerId(1),
+            ));
+        }
+
+        drain_to_completion(&mut flow);
+
+        let placed: Vec<WorkerId> = (0..4)
+            .map(|id| workers_visited(&store, RequestId(id))[0])
+            .collect();
+        assert_eq!(
+            placed,
+            vec![WorkerId(0), WorkerId(1), WorkerId(0), WorkerId(1)],
+            "the declared worker 1 should have been ignored entirely"
+        );
+    }
+
+    /// Regression: a chained conversation empties after *every* round, so a
+    /// ledger that reads "no members outstanding" as "group finished" hands the
+    /// trainer a transcript that is still being written.
+    #[test]
+    fn a_chained_session_is_not_complete_until_its_last_round_lands() {
+        let (mut flow, _store) = build_flow_grouped(
+            1,
+            DpPlacementPolicy::RoundRobin,
+            None,
+            Some(training_cfg(1, 1)),
+            GroupBy::Session,
+            false,
+        );
+        let rounds: Vec<Request> = (0..3u32)
+            .map(|round| session_round(RequestId(round), 0, 3, 4 * round, 8, 2))
+            .collect();
+
+        drain_chained(&mut flow, rounds, |flow, landed| {
+            let training = flow.training.as_ref().expect("training on");
+            if landed < 2 {
+                assert!(
+                    !training.outstanding() && training.chunks_completed() == 0,
+                    "round {landed} of 3 put a half-written transcript in front of the trainer"
+                );
+            }
+        });
+
+        let training = flow.training.as_ref().expect("training on");
+        assert_eq!(
+            training.groups_per_block(),
+            [1],
+            "three rounds are one conversation, so one training item"
+        );
+    }
+
+    /// One conversation is trained once, on the transcript as it stands at the
+    /// end. The rounds share a prefix, so summing them would count that prefix
+    /// once per round.
+    #[test]
+    fn a_session_trains_on_its_final_trajectory_once() {
+        let (mut flow, _store) = build_flow_grouped(
+            1,
+            DpPlacementPolicy::RoundRobin,
+            None,
+            Some(training_cfg(1, 1)),
+            GroupBy::Session,
+            false,
+        );
+        // (prefix, prompt, output) per round. Per-round sums would be
+        // 10 + 16 + 22 = 48; the trajectory is the last round's own context.
+        let shape = [(0u32, 8u32, 2u32), (10, 4, 2), (16, 4, 2)];
+        let rounds: Vec<Request> = shape
+            .iter()
+            .enumerate()
+            .map(|(round, (prefix, prompt, output))| {
+                session_round(RequestId(round as u32), 0, 3, *prefix, *prompt, *output)
+            })
+            .collect();
+
+        drain_chained(&mut flow, rounds, |_, _| {});
+
+        let training = flow.training.as_ref().expect("training on");
+        assert_eq!(training.groups_per_block(), [1]);
+        // At 1,000 tok/s with no overhead a chunk lasts one ms per token, so
+        // the window is the trajectory: 16 declared prefix + 4 prompt + 2 output.
+        let (start, end) = training.window().expect("one chunk ran");
+        assert_eq!(end.as_ms() - start.as_ms(), 22.0);
+    }
+
+    /// A major compaction resets the declared prefix, so the trajectory the
+    /// trainer sees really is shorter — no separate rule, just the last round.
+    #[test]
+    fn a_compacted_session_trains_on_the_shorter_trajectory() {
+        let (mut flow, _store) = build_flow_grouped(
+            1,
+            DpPlacementPolicy::RoundRobin,
+            None,
+            Some(training_cfg(1, 1)),
+            GroupBy::Session,
+            false,
+        );
+        let shape = [(0u32, 8u32, 2u32), (10, 4, 2), (0, 5, 2)];
+        let rounds: Vec<Request> = shape
+            .iter()
+            .enumerate()
+            .map(|(round, (prefix, prompt, output))| {
+                session_round(RequestId(round as u32), 0, 3, *prefix, *prompt, *output)
+            })
+            .collect();
+
+        drain_chained(&mut flow, rounds, |_, _| {});
+
+        let training = flow.training.as_ref().expect("training on");
+        let (start, end) = training.window().expect("one chunk ran");
+        assert_eq!(end.as_ms() - start.as_ms(), 7.0, "0 + 5 + 2");
+    }
+
+    /// An id-block pool counts id blocks even when the trace carries session
+    /// metadata: the key is the pool's choice, not something a request can
+    /// change under it.
+    #[test]
+    fn id_block_grouping_is_unchanged_by_session_metadata() {
+        let (mut flow, _store) = build_flow_grouped(
+            1,
+            DpPlacementPolicy::RoundRobin,
+            None,
+            Some(training_cfg(2, 1)),
+            GroupBy::IdBlock,
+            false,
+        );
+        // Four rounds of one conversation, grouped two at a time by id — and
+        // summed per member, because an id block's members are parallel samples.
+        for round in 0..4u32 {
+            flow.on_arrival(session_round(RequestId(round), 0, 4, 4 * round, 8, 2));
+        }
+
+        drain_to_completion(&mut flow);
+
+        let training = flow.training.as_ref().expect("training on");
+        assert_eq!(
+            training.groups_per_block(),
+            [2],
+            "four requests in blocks of two is two groups, whatever session they name"
+        );
+    }
+
+    /// A conversation is pinned to the engine the recording used, but that
+    /// engine can be handed back to the trainer mid-conversation. The later
+    /// rounds then follow the work rather than refilling a machine the pool has
+    /// decided to empty.
+    #[test]
+    fn a_session_whose_host_retired_follows_the_redirect() {
+        let (mut flow, store) =
+            build_chunked_flow_grouped(2, DpPlacementPolicy::TraceDirected, None, GroupBy::Session);
+        flow.set_migration_policy(
+            Some(Box::new(MigrateOnce {
+                // Mid-round 0: the conversation is in flight when its host
+                // goes, which is the case the redirect exists for.
+                at: Time::from_ms(10.0),
+                order: MigrationOrder::Consolidate {
+                    src: WorkerId(0),
+                    dst: WorkerId(1),
+                },
+                fired: false,
+            })),
+            1,
+        );
+        // Every round names worker 0, the engine the recording used.
+        let rounds: Vec<Request> = (0..3u32)
+            .map(|round| session_round_on(RequestId(round), 0, 3, 4 * round, 8, 30, WorkerId(0)))
+            .collect();
+
+        drain_chained(&mut flow, rounds, |_, _| {});
+
+        let landed = |round: u32| {
+            *workers_visited(&store, RequestId(round))
+                .last()
+                .expect("a completed round has stages")
+        };
+        assert_eq!(landed(0), WorkerId(1), "round 0 was drained onto worker 1");
+        for round in 1..3u32 {
+            assert_eq!(
+                landed(round),
+                WorkerId(1),
+                "round {round} refilled the retired worker 0"
+            );
+        }
     }
 }

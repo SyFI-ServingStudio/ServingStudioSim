@@ -15,6 +15,17 @@ pub enum SessionInput {
         /// Trace-declared reusable KV. This is a requirement, not an observed
         /// cache hit; a prefix-capable KV implementation must resolve it.
         declared_prefix_tokens: u32,
+        /// How many rounds the trace declares for this conversation, this one
+        /// included. Trace-given like `target_output_tokens`, not a prediction.
+        ///
+        /// It is what lets a consumer tell "this round finished" from "this
+        /// conversation finished". Under `SessionDependency::Chained` only one
+        /// round of a session is ever in flight, so a counter of what is still
+        /// outstanding hits zero after *every* round; only the declared total
+        /// says which of those zeros is the last one. A count rather than an
+        /// is-final flag because under independent release the rounds may
+        /// complete out of order.
+        rounds_in_session: u32,
     },
 }
 
@@ -53,6 +64,18 @@ impl SessionInput {
                 declared_prefix_tokens,
                 ..
             } => declared_prefix_tokens,
+        }
+    }
+
+    /// Rounds this conversation declares. A standalone request is its own
+    /// one-round conversation, which is the same reading `session_start_or`
+    /// takes.
+    pub const fn rounds_in_session(self) -> u32 {
+        match self {
+            Self::Standalone => 1,
+            Self::Session {
+                rounds_in_session, ..
+            } => rounds_in_session,
         }
     }
 }

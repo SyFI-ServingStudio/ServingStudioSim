@@ -113,7 +113,8 @@ where
     fn on_arrival(&mut self, req: Request) {
         let rid = req.core.id;
         self.requests.borrow_mut().insert(req);
-        self.prefill_pool.admit(rid);
+        // PD counts no groups, so there is no membership to record.
+        self.prefill_pool.admit(rid, None);
     }
 
     fn tick(&mut self, now: Time) -> Vec<OrchAction> {
@@ -233,11 +234,13 @@ mod tests {
             pool: PD_PREFILL_POOL,
             num_workers: 1,
             placement: DpPlacementPolicy::RoundRobin,
+            ignore_trace_placement: false,
         };
         let decode_cfg = SimpleDpPoolConfig {
             pool: PD_DECODE_POOL,
             num_workers: 1,
             placement: DpPlacementPolicy::RoundRobin,
+            ignore_trace_placement: false,
         };
         // FakeModel: 1 gpu/replica, 1 attn dp group → num_attn_shards = 1.
         // Analytic cost so the transfer path is exercised without a real kernel.

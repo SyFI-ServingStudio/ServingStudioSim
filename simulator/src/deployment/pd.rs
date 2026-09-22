@@ -292,6 +292,9 @@ fn pool_cfg(
         pool,
         num_workers: replicas,
         placement: placement_into(placement)?,
+        // PD routes through its own flow, which never reads a trace-declared
+        // target, so there is nothing here to ignore.
+        ignore_trace_placement: false,
     })
 }
 

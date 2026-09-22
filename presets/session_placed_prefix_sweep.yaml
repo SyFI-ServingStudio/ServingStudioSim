@@ -1,0 +1,72 @@
+# Session placement x prefix cache: four arms over one multi-round trace.
+#
+# The question is what session-aware prefix reuse is worth, and it only has an
+# answer if both halves can be turned off independently:
+#
+#   routing=recorded      each round goes where the recording put it
+#   routing=least_queued  the same trace read with the placement column ignored
+#   cache=opportunistic   completed-session KV may be reused by a later round
+#   cache=disabled        it may not — the no-reuse control
+#
+# `recorded x opportunistic` is the arm that has ground truth. The other three
+# are counterfactuals: `least_queued` says how much of the hit rate came from
+# the placement rather than from the cache, and `disabled` prices the cache with
+# the placement held fixed.
+#
+# The trace here is the committed smoke fixture with a `target_worker` column
+# added (see trace/README.md). It is four conversations — enough to exercise the
+# path, not enough to measure anything. Point `trace_files` at the full
+# `tracelab_*` trace, with its own recorded engine column, to get a number.
+deployment: unified
+
+workload:
+  trace_files:
+    - trace/session_execution_v2_placed_smoke.csv
+  input_file_format: text-generation-session-execution-v2
+  # Without this the `target_worker` column is not read at all.
+  input_file_tags: [placement]
+  arrival_mode: trace_timed
+  # A round is released by its predecessor's completion plus the recorded tool
+  # wait. The later rounds' own arrival times are the RECORDING's throughput,
+  # which is the quantity being predicted, so they are deliberately not used.
+  session_dependency: chained
+  run_to_end: true
+  request_rate: 1.0
+
+io:
+  log_dir: logs/session_placed_prefix_sweep/{routing}_{cache}
+
+pools:
+  main:
+    placement: ${placement}
+    trace_placement: ${trace_placement}
+    # One conversation is one group. The trainer is off here, but the ledger is
+    # what makes "this round finished" distinguishable from "this conversation
+    # finished", and that reading is the session one.
+    group_by: session
+    groups:
+      - gpu: "NVIDIA H200"
+        replicas: 2
+        arch:
+          type: llama3_dense
+          model_config: model/config/llama3_8b.json
+        worker:
+          type: barebone
+          prefix_cache_mode: ${cache}
+
+compound:
+  routing:
+    # Replay: obey the column, which is the only way a placement SEQUENCE is
+    # reproducible rather than merely plausible.
+    recorded:
+      placement: trace-directed
+      trace_placement: require
+    # Counterfactual: the same rows, the column not read. `ignore` is required —
+    # a load policy silently re-placing a placed trace is refused by default,
+    # because that run is not the one the trace describes.
+    least_queued:
+      placement: least-queued
+      trace_placement: ignore
+
+sweep:
+  cache: [opportunistic, disabled]

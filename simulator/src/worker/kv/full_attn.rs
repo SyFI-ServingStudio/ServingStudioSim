@@ -154,6 +154,10 @@ impl IterWorkerKv for FullAttnKv {
         FullAttnKv::release_external(self, request, current_kv)
     }
 
+    fn drop_retained_prefixes(&mut self, now: Time) {
+        FullAttnKv::drop_retained_prefixes(self, now);
+    }
+
     fn visit_prefill_admits(&self, partition: PartitionId, mut visitor: impl FnMut(RequestId)) {
         for request in self.prefill_admits(partition) {
             visitor(request);
@@ -779,6 +783,23 @@ impl FullAttnKv {
         self.prefix_caches[partition as usize].shrink_to(physical_limit)
     }
 
+    /// Throw away every retained prefix this worker holds, one journal row per
+    /// entry. Called when the pool retires the worker: the tier's sessions are
+    /// still alive, they just have to be re-prefilled wherever they land next.
+    pub(crate) fn drop_retained_prefixes(&mut self, now: Time) {
+        for partition in 0..self.prefix_caches.len() as PartitionId {
+            for (retained_by, mutation) in self.prefix_caches[partition as usize].drop_all() {
+                self.journal.record_mutation(
+                    retained_by,
+                    partition,
+                    now,
+                    mutation,
+                    PrefixCacheEventKind::Evict(PrefixCacheEvictionReason::WorkerRetired),
+                    0,
+                );
+            }
+        }
+    }
     fn retain_prefix(
         &mut self,
         request: RequestId,
@@ -792,6 +813,7 @@ impl FullAttnKv {
         let physical_limit = self.prefix_cache_physical_limit(partition);
         let insert_result = self.prefix_caches[partition as usize].insert(
             session_id,
+            request,
             tokens,
             physical_limit,
             cache_return_metadata,
@@ -825,7 +847,7 @@ mod tests {
     use super::*;
     use std::fs::File;
 
-    use arrow_array::{StringArray, UInt64Array};
+    use arrow_array::{StringArray, UInt32Array, UInt64Array};
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use tempfile::tempdir;
 
@@ -862,6 +884,7 @@ mod tests {
                 session_id: 7,
                 session_start_time: Time::ZERO,
                 declared_prefix_tokens: 100,
+                rounds_in_session: 1,
             },
         );
         assert_eq!(resolved_prefill.resident_prefix_tokens(), 0);
@@ -878,14 +901,15 @@ mod tests {
             None,
             None,
         );
-        kv_store.prefix_caches[1].insert(7, 50, 100, None);
-        kv_store.prefix_caches[2].insert(7, 80, 100, None);
+        kv_store.prefix_caches[1].insert(7, RequestId(0), 50, 100, None);
+        kv_store.prefix_caches[2].insert(7, RequestId(0), 80, 100, None);
 
         assert_eq!(
             kv_store.retained_prefix_partition(SessionInput::Session {
                 session_id: 7,
                 session_start_time: Time::ZERO,
                 declared_prefix_tokens: 60,
+                rounds_in_session: 1,
             }),
             Some(2)
         );
@@ -894,6 +918,7 @@ mod tests {
                 session_id: 7,
                 session_start_time: Time::ZERO,
                 declared_prefix_tokens: 40,
+                rounds_in_session: 1,
             }),
             Some(1),
             "equal reusable lengths keep the lowest partition deterministic"
@@ -901,6 +926,70 @@ mod tests {
         assert_eq!(
             kv_store.retained_prefix_partition(SessionInput::Standalone),
             None
+        );
+    }
+
+    /// Retiring a worker takes its retained tier with it. The sessions behind
+    /// those entries are alive and will land on whichever worker took the work
+    /// over, where they miss — that burst of full prefills is a real cost of
+    /// handing a block back, and it only exists if the tier actually goes.
+    #[test]
+    fn retiring_a_worker_drops_its_retained_prefixes() {
+        let log_directory = tempdir().unwrap();
+        let prefix_cache_logger =
+            PrefixCacheLogger::open(log_directory.path(), "main", crate::common::WorkerId(0))
+                .unwrap();
+        let mut kv_store = FullAttnKv::with_prefix_cache(
+            2,
+            100,
+            capped_prefix_cache(100, PrefixCachePolicy::Lru),
+            None,
+            Some(prefix_cache_logger),
+        );
+        kv_store.prefix_caches[0].insert(7, RequestId(3), 40, 100, None);
+        kv_store.prefix_caches[1].insert(9, RequestId(4), 30, 100, None);
+
+        kv_store.drop_retained_prefixes(Time::from_ms(5.0));
+
+        assert_eq!(kv_store.prefix_caches[0].used_charge(), 0);
+        assert_eq!(kv_store.prefix_caches[1].used_charge(), 0);
+        drop(kv_store);
+
+        let path = log_directory
+            .path()
+            .join("raw/prefix_cache_event/worker_main_0.parquet");
+        let mut reader = ParquetRecordBatchReaderBuilder::try_new(File::open(path).unwrap())
+            .unwrap()
+            .build()
+            .unwrap();
+        let batch = reader.next().unwrap().unwrap();
+        assert_eq!(batch.num_rows(), 2);
+        let column = |name: &str| {
+            batch
+                .column_by_name(name)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(
+            (0..2)
+                .map(|row| column("reason").value(row).to_string())
+                .collect::<Vec<_>>(),
+            ["worker-retired", "worker-retired"]
+        );
+        // Attributed to the request that left each entry behind, so the row is
+        // still joinable even though nothing triggered the drop.
+        let requests = batch
+            .column_by_name("request_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap();
+        assert_eq!(
+            (0..2).map(|row| requests.value(row)).collect::<Vec<_>>(),
+            [3, 4]
         );
     }
 
@@ -913,7 +1002,7 @@ mod tests {
             None,
             None,
         );
-        kv_store.prefix_caches[0].insert(1, 80, 100, None);
+        kv_store.prefix_caches[0].insert(1, RequestId(0), 80, 100, None);
         assert_eq!(kv_store.prefix_caches[0].used_tokens(), 80);
 
         let footprint = kv_store.footprint(RequestId(0), 60, 30);
@@ -942,6 +1031,7 @@ mod tests {
             session_id: 7,
             session_start_time: Time::ZERO,
             declared_prefix_tokens: 0,
+            rounds_in_session: 1,
         };
         let resolved_prefill = kv_store.preview_prefill_context(0, 80, session_input);
         let session_footprint = kv_store.footprint(RequestId(0), 80, 0);
@@ -1017,7 +1107,7 @@ mod tests {
             None,
             None,
         );
-        kv_store.prefix_caches[0].insert(7, 60, 100, None);
+        kv_store.prefix_caches[0].insert(7, RequestId(0), 60, 100, None);
         let resolved_prefill = kv_store.preview_prefill_context(
             0,
             10,
@@ -1025,6 +1115,7 @@ mod tests {
                 session_id: 7,
                 session_start_time: Time::ZERO,
                 declared_prefix_tokens: 50,
+                rounds_in_session: 1,
             },
         );
         assert_eq!(resolved_prefill.resident_prefix_tokens(), 50);

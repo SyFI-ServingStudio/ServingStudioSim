@@ -38,6 +38,48 @@ pub enum PlacementPolicy {
 
 const PLACEMENT_CHOICES: [&str; 3] = ["least-queued", "round-robin", "trace-directed"];
 
+/// What a load policy does when the trace declares a `target_worker` anyway.
+///
+/// A trace recorded on a real deployment carries where that deployment put each
+/// request. Replaying it under `trace-directed` reproduces that placement; the
+/// counterfactual — "what would a load policy have done with the same work" —
+/// needs the same trace read with the column ignored.
+///
+/// `require` is the default and refuses the combination, because a placed trace
+/// silently routed by load is a run that is not the experiment anyone meant to
+/// describe. `ignore` is how a preset says it meant it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TracePlacementSel {
+    /// A declared `target_worker` must be obeyed, so only `trace-directed` may
+    /// read such a trace.
+    #[default]
+    Require,
+    /// The `target_worker` column is not read; the pool's own placement policy
+    /// decides. `trace-directed` still needs the column and is unaffected.
+    Ignore,
+}
+
+const TRACE_PLACEMENT_CHOICES: [&str; 2] = ["require", "ignore"];
+
+/// What a *group* is, for the migration trigger and the trainer that share one
+/// ledger. Both ask the same question — "is this unit of work finished yet" —
+/// and the unit differs by workload.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GroupBySel {
+    /// A block of `migration_group_size` consecutive request ids: an RL prompt
+    /// group, whose samples are generated in parallel.
+    #[default]
+    IdBlock,
+    /// One conversation, all of its rounds. A multi-round trace declares how
+    /// many rounds each session has, which is what says when the last one has
+    /// landed — a round finishing is not a conversation finishing.
+    Session,
+}
+
+const GROUP_BY_CHOICES: [&str; 2] = ["id-block", "session"];
+
 /// When a pool moves resident work between its own workers.
 ///
 /// `off` is the default and costs nothing: the flow holds no policy at all, so
@@ -83,6 +125,12 @@ pub struct PoolSpec<Arch, Worker> {
     /// Worker placement policy within the pool.
     #[param(string, default = "least-queued", choices = PLACEMENT_CHOICES)]
     pub placement: PlacementPolicy,
+    /// Whether a trace-declared `target_worker` binds a non-trace-directed
+    /// `placement`. Default `require` refuses the pair; `ignore` is how a
+    /// counterfactual arm says it is deliberately re-placing a placed trace.
+    #[serde(default)]
+    #[param(string, default = "require", choices = TRACE_PLACEMENT_CHOICES)]
+    pub trace_placement: TracePlacementSel,
     /// When this pool migrates resident work between its own workers.
     #[serde(default)]
     #[param(string, default = "off", choices = MIGRATION_CHOICES)]
@@ -93,8 +141,15 @@ pub struct PoolSpec<Arch, Worker> {
     #[serde(default = "default_migration_threshold")]
     #[param(default = 32)]
     pub migration_threshold: u32,
+    /// What one group is: a block of consecutive request ids, or a whole
+    /// conversation. Read by the migration trigger and the trainer, which share
+    /// one ledger. `id-block` sizes itself by `migration_group_size`; `session`
+    /// takes the round count the trace declares and ignores that field.
+    #[serde(default)]
+    #[param(string, default = "id-block", choices = GROUP_BY_CHOICES)]
+    pub group_by: GroupBySel,
     /// Requests per prompt group, numbered in consecutive id blocks. One means
-    /// "no grouping".
+    /// "no grouping". Ignored under `group_by: session`.
     ///
     /// **Workload topology, not a migration knob** — the `migration_` prefix is
     /// a scar from where it was first needed. Both `train-group-samples-below`

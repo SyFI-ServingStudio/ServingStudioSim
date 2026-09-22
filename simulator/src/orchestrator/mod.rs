@@ -12,9 +12,12 @@ pub mod migration;
 pub mod training;
 
 pub use self::common::{GpuCluster, GpuInfo, OrchAction, UnifiedWorkerFactory, WorkerFactory};
-pub use config::{GroupSpec, MigrationPolicySel, PlacementPolicy, PoolSpec, TrainingSel};
+pub use config::{
+    GroupBySel, GroupSpec, MigrationPolicySel, PlacementPolicy, PoolSpec, TracePlacementSel,
+    TrainingSel,
+};
 pub use impls::{
-    AfdAttnPoolController, AfdFfnPoolController, AfdFlow, DpPlacementPolicy, PdFlow,
+    AfdAttnPoolController, AfdFfnPoolController, AfdFlow, DpPlacementPolicy, GroupBy, PdFlow,
     SimpleDpConfig, SimpleDpFlow, SimpleDpPoolConfig, SimpleDpPoolController, AFD_ATTN_POOL,
     AFD_FFN_POOL, PD_DECODE_POOL, PD_PREFILL_POOL,
 };

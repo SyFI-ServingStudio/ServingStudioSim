@@ -33,6 +33,8 @@ pub enum PrefixCacheEvictionReason {
     ReplacementPolicy,
     RetentionCapacity,
     SameSessionReplacement,
+    /// The worker holding the tier was retired, so the whole tier went with it.
+    WorkerRetired,
 }
 
 /// Why an active request returned its context to the retained cache.
@@ -70,6 +72,7 @@ impl PrefixCacheEventKind {
             Self::Evict(PrefixCacheEvictionReason::ActiveKvPressure) => "active-kv-pressure",
             Self::Evict(PrefixCacheEvictionReason::ReplacementPolicy) => "replacement-policy",
             Self::Evict(PrefixCacheEvictionReason::RetentionCapacity) => "retention-capacity",
+            Self::Evict(PrefixCacheEvictionReason::WorkerRetired) => "worker-retired",
             Self::Evict(PrefixCacheEvictionReason::SameSessionReplacement) => {
                 "same-session-replacement"
             }

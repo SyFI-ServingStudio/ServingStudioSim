@@ -92,6 +92,27 @@ pub(crate) const fn text_request_on(
     request
 }
 
+/// One round of a multi-round conversation. The round's own index is not a
+/// field anywhere — the loader emits rounds in order and the request id carries
+/// that order — so this takes what the round actually declares.
+pub(crate) const fn session_round(
+    request_id: RequestId,
+    session_id: u32,
+    rounds_in_session: u32,
+    declared_prefix_tokens: u32,
+    prompt_tokens: u32,
+    target_output_tokens: u32,
+) -> Request<TextGenerationDefinition> {
+    let mut request = text_request(request_id, prompt_tokens, target_output_tokens, Time::ZERO);
+    request.definition.session = SessionInput::Session {
+        session_id,
+        session_start_time: Time::ZERO,
+        declared_prefix_tokens,
+        rounds_in_session,
+    };
+    request
+}
+
 /// Fixed-cost stand-in for an L4 model. `eval_iter` returns `time_ms = ms`
 /// (no cost-tree, empty slot vector) and asserts the worker fed exactly one
 /// group per DP shard. `dp_groups` doubles as `gpus_per_replica` and

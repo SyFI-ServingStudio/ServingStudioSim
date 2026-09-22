@@ -314,6 +314,20 @@ pub enum IterWorkerSel {
         #[serde(default = "default_gpu_time_multiplier")]
         #[param(default = 1.0)]
         gpu_time_multiplier: f64,
+        /// Whether completed-session KV may reuse currently idle attention KV.
+        /// `disabled` is the no-reuse control arm — the only way to price what
+        /// prefix reuse is worth on a session workload.
+        #[serde(default)]
+        #[param(string, default = "opportunistic", choices = PREFIX_CACHE_MODE_CHOICES)]
+        prefix_cache_mode: PrefixCacheMode,
+        /// Victim policy used only when retained session KV is enabled.
+        #[serde(default)]
+        #[param(string, default = "lru", choices = PREFIX_CACHE_POLICY_CHOICES)]
+        prefix_cache_policy: PrefixCachePolicy,
+        /// Optional ceiling (GB) for retained session KV inside the same
+        /// attention budget. None uses all dynamically available slack.
+        #[serde(default)]
+        prefix_cache_max_gpu_memory_gb: Option<f64>,
     },
     /// Chunked prefill with a speculating decode engine: one verify pass per
     /// iteration submits `draft_tokens + 1` rows per resident decode and retires
@@ -485,6 +499,29 @@ mod tests {
         assert!(matches!(
             worker,
             IterWorkerSel::Barebone {
+                prefix_cache_mode: PrefixCacheMode::Opportunistic,
+                prefix_cache_policy: PrefixCachePolicy::Lru,
+                prefix_cache_max_gpu_memory_gb: None,
+                ..
+            }
+        ));
+    }
+
+    /// `chunked_prefill` used to have no prefix-cache fields at all — the
+    /// deployment wired `opportunistic / lru / None` in by hand. The knobs exist
+    /// so a `disabled` control arm is expressible; every committed preset that
+    /// does not mention them must keep running exactly as it did.
+    #[test]
+    fn chunked_prefill_defaults_match_todays_hardcoded_values() {
+        let worker: IterWorkerSel = serde_yaml::from_str(
+            "type: chunked_prefill\nattn_gpu_memory_gb: 120.0\nmax_batch_tokens: 2048\n\
+             batch_policy: mix\n",
+        )
+        .expect("parse chunked_prefill worker");
+
+        assert!(matches!(
+            worker,
+            IterWorkerSel::ChunkedPrefill {
                 prefix_cache_mode: PrefixCacheMode::Opportunistic,
                 prefix_cache_policy: PrefixCachePolicy::Lru,
                 prefix_cache_max_gpu_memory_gb: None,

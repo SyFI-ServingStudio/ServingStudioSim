@@ -275,6 +275,14 @@ pub trait IterWorkerKv: KvStore {
     fn status_active(&self, partition: PartitionId) -> u32;
     fn release_external(&mut self, request: RequestId, current_kv: u64) -> Option<PartitionId>;
 
+    /// Throw away every retained prefix, on every partition.
+    ///
+    /// Separate from the drain methods on purpose: a drain hands *live*
+    /// requests to another worker, while this discards KV belonging to sessions
+    /// that have already finished a round. They are only ever called together
+    /// because a retired worker does both.
+    fn drop_retained_prefixes(&mut self, now: Time);
+
     /// Static-dispatch iteration over this iteration's fresh prefills.
     fn visit_prefill_admits(&self, partition: PartitionId, visitor: impl FnMut(RequestId));
 

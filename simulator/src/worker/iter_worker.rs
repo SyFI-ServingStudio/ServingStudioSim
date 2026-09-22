@@ -92,6 +92,14 @@ where
     /// worker back one prompt group at a time needs the worker to keep running
     /// the rest, which `drain_resident` cannot say.
     fn drain_requests(&mut self, now: Time, requests: &[RequestId], out: &mut Vec<RequestId>);
+
+    /// Discard every retained prefix this worker holds.
+    ///
+    /// Not part of a drain: a drain moves live requests, this drops KV kept for
+    /// sessions between rounds. The pool calls it when it retires the worker,
+    /// because those bytes sit on a GPU that is about to be someone else's —
+    /// and the sessions themselves will land elsewhere and miss.
+    fn drop_retained_prefixes(&mut self, now: Time);
 }
 
 /// L6-facing capability for an AFD FFN executor.  Unlike attention there is no
