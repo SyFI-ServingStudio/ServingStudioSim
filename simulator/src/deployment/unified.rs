@@ -514,7 +514,6 @@ impl Deployment for UnifiedDeployment {
                 mtp_mode,
                 draft_tokens,
                 expert_popularity_file,
-                draft_expert_popularity_file,
                 token_corpus_file,
                 ..
             } => {
@@ -533,7 +532,6 @@ impl Deployment for UnifiedDeployment {
                     *routing_seed,
                     *mtp_mode,
                     expert_popularity_file.as_deref(),
-                    draft_expert_popularity_file.as_deref(),
                     token_corpus_file.as_deref(),
                     *draft_tokens,
                     &gpu_name,

@@ -348,10 +348,9 @@ def simulation_document(
             f"variants.{variant.name}.arch must not set max_model_len; it is per-case"
         )
     arch["max_model_len"] = case.max_model_len
-    for key in ("expert_popularity_file", "draft_expert_popularity_file"):
-        popularity = arch.get(key)
-        if isinstance(popularity, str) and popularity:
-            arch[key] = _preset_path(pack.root / popularity, repo_root)
+    popularity = arch.get("expert_popularity_file")
+    if isinstance(popularity, str) and popularity:
+        arch["expert_popularity_file"] = _preset_path(pack.root / popularity, repo_root)
 
     worker = dict(variant.worker)
     for derived in ("attn_gpu_memory_gb", "gpu_time_multiplier"):

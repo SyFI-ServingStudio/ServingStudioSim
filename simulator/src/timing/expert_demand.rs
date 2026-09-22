@@ -43,6 +43,21 @@ impl ExpertDemand {
         }
     }
 
+    /// A marginal read at one layer's resolution.
+    ///
+    /// The MTP layer sits outside the layers an expert-popularity profile was
+    /// captured over, and a marginal has no layer axis left to extend, so it
+    /// folds the profile's layer-summed distribution — the same evidence, at
+    /// the only resolution a marginal has. Measuring that layer's own routing
+    /// is what `routing: corpus` is for. Synthetic uniform and random routing
+    /// carry no layer axis to begin with, so for them this is [`Self::popularity`]
+    /// at one layer.
+    pub fn popularity_summed(routing: &RoutingDistribution) -> Self {
+        Self::Popularity {
+            layerwise_global_ppm: vec![routing.ppm().to_vec()],
+        }
+    }
+
     /// Bind a recorded corpus to one MoE callable: its verify width and the
     /// layers it covers. The fold seed is shared with the popularity path so
     /// both sources are reproducible the same way.

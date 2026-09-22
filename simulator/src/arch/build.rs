@@ -301,7 +301,6 @@ fn load_expert_popularity(
     ep_size: u16,
     expected_num_moe_layers: u32,
     expected_experts_per_token: u32,
-    expected_role: Option<&str>,
 ) -> Result<RoutingDistribution> {
     let profile_file =
         File::open(path).with_context(|| format!("opening expert popularity profile {path}"))?;
@@ -309,17 +308,6 @@ fn load_expert_popularity(
         .with_context(|| format!("parsing expert popularity profile {path}"))?;
     let version: ExpertPopularityVersion = serde_json::from_value(profile_value.clone())
         .with_context(|| format!("reading expert popularity schema_version from {path}"))?;
-    if let Some(role) = expected_role {
-        anyhow::ensure!(
-            version.schema_version == 4
-                && profile_value
-                    .get("model_role")
-                    .and_then(|value| value.as_str())
-                    == Some(role),
-            "expert popularity profile {path} requires schema v4 with model_role={role}"
-        );
-    }
-
     let (num_logical_experts, counts_by_layer, legacy_ratios) = match version.schema_version {
         1 => {
             let profile: ExpertPopularityProfileV1 = serde_json::from_value(profile_value)
@@ -631,8 +619,8 @@ fn ensure_normalized_probabilities(
 /// The callables differ by which layers they cover and how wide a verify block
 /// their batch carries. A token corpus answers both from one artifact — the
 /// layers are a slice and the width is a sampling parameter. A marginal has
-/// already summed the layer axis away, so it can only answer with a second
-/// file, which is why `draft_expert_popularity_file` exists at all.
+/// already summed the layer axis away, so every callable of a model folds the
+/// same one; the MTP layer's own routing is measured through a corpus.
 struct ExpertDemandSource<'a> {
     kind: RoutingKind,
     seed: Option<u64>,
@@ -640,30 +628,16 @@ struct ExpertDemandSource<'a> {
     experts_per_token: u32,
     ep_size: u16,
     expert_popularity_file: Option<&'a str>,
-    /// The MTP layer's own marginal. `None` makes the MTP callable reuse the
-    /// body's, which is what a non-speculative build has always done.
-    draft_expert_popularity_file: Option<&'a str>,
     token_corpus_file: Option<&'a str>,
-}
-
-/// Which MoE callable a demand is being resolved for.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum MoeCallable {
-    /// The body's routed layers.
-    Body,
-    /// The single MTP layer that follows them.
-    Mtp,
+    /// The body's routed layers — the axis an expert-popularity profile is
+    /// validated against, and the boundary past which one has no evidence.
+    num_routed_layers: u32,
 }
 
 impl ExpertDemandSource<'_> {
     /// `layers` is the callable's slice of the model's routed layer axis and
     /// `group_size` the verify width its batch presents.
-    fn demand(
-        &self,
-        callable: MoeCallable,
-        layers: std::ops::Range<usize>,
-        group_size: u32,
-    ) -> Result<ExpertDemand> {
+    fn demand(&self, layers: std::ops::Range<usize>, group_size: u32) -> Result<ExpertDemand> {
         if self.kind == RoutingKind::Corpus {
             let path = self
                 .token_corpus_file
@@ -688,25 +662,20 @@ impl ExpertDemandSource<'_> {
             "token_corpus_file cannot be combined with routing={:?}; omit it or use routing=corpus",
             self.kind
         );
-        // Without a draft profile the MTP layer prices against the body's
-        // marginal, unchanged from before this arm could be sliced.
-        let (path, role) = match (callable, self.draft_expert_popularity_file) {
-            (MoeCallable::Mtp, Some(draft)) => (Some(draft), Some("draft")),
-            (_, Some(_)) => (self.expert_popularity_file, Some("target")),
-            (_, None) => (self.expert_popularity_file, None),
-        };
-        let num_layers = layers.len() as u32;
         let routing = resolve_routing_source(
             self.kind,
             self.seed,
             self.num_experts,
             self.ep_size,
-            num_layers,
+            self.num_routed_layers,
             self.experts_per_token,
-            path,
-            role,
+            self.expert_popularity_file,
         )?;
-        Ok(ExpertDemand::popularity(&routing, num_layers))
+        Ok(if layers.end <= self.num_routed_layers as usize {
+            ExpertDemand::popularity(&routing, layers.len() as u32)
+        } else {
+            ExpertDemand::popularity_summed(&routing)
+        })
     }
 }
 
@@ -721,7 +690,6 @@ pub fn resolve_routing_source(
     num_moe_layers: u32,
     experts_per_token: u32,
     expert_popularity_file: Option<&str>,
-    expected_role: Option<&str>,
 ) -> Result<RoutingDistribution> {
     if let Some(path) = expert_popularity_file {
         anyhow::ensure!(
@@ -735,7 +703,6 @@ pub fn resolve_routing_source(
             ep_size,
             num_moe_layers,
             experts_per_token,
-            expected_role,
         );
     }
     resolve_routing(kind, seed, num_experts)
@@ -801,7 +768,6 @@ pub fn qwen36_local(
         model_cfg.num_layers,
         model_cfg.top_k,
         expert_popularity_file,
-        None,
     )?;
     let parallel = Qwen36LocalParallel {
         gpu_name: gpu.to_string(),
@@ -858,7 +824,6 @@ pub fn qwen3_moe(
         model_cfg.num_layers,
         model_cfg.top_k,
         expert_popularity_file,
-        None,
     )?;
     let parallel = Qwen3MoeParallel {
         attn_tp_size,
@@ -897,7 +862,6 @@ pub fn qwen3_moe_fp8(
         model_cfg.num_layers,
         model_cfg.top_k,
         expert_popularity_file,
-        None,
     )?;
     let parallel = Qwen3MoeFp8Parallel {
         attn_tp_size,
@@ -938,7 +902,6 @@ pub fn qwen3_vllm_moe(
         model_cfg.num_layers,
         model_cfg.top_k,
         expert_popularity_file,
-        None,
     )?;
     let parallel = Qwen3VllmMoeParallel {
         attn_tp_size,
@@ -978,7 +941,6 @@ pub fn deepseek_v4_vllm(
         model_cfg.num_layers,
         model_cfg.top_k,
         expert_popularity_file,
-        None,
     )?;
     let parallel = DeepseekV4VllmParallel {
         ep_size: 4,
@@ -1019,7 +981,6 @@ pub fn glm52_vllm_dsa_moe(
         num_sparse_layers(&model_cfg),
         model_cfg.router_top_k,
         expert_popularity_file,
-        None,
     )?;
     let parallel = Glm52VllmDsaMoeParallel {
         ep_size,
@@ -1065,18 +1026,18 @@ pub fn glm52_vllm_nvfp4_dsa_moe(
         experts_per_token: model_cfg.router_top_k,
         ep_size,
         expert_popularity_file,
-        draft_expert_popularity_file: None,
         token_corpus_file,
+        num_routed_layers: num_sparse_layers(&model_cfg),
     };
     // Ordinary decode submits one row per request, so a verify block is one
     // token wide and a contiguous draw is a single draw.
     let body = num_sparse_layers(&model_cfg) as usize;
-    let body_demand = source.demand(MoeCallable::Body, 0..body, 1)?;
+    let body_demand = source.demand(0..body, 1)?;
     // Only when the layer exists: a marginal has no layer axis left to slice,
     // so resolving one for an `mtp_mode: off` build could only fail on evidence
     // that build never reads.
     let mtp_demand = (mtp_mode != Glm52MtpMode::Off)
-        .then(|| source.demand(MoeCallable::Mtp, body..body + 1, 1))
+        .then(|| source.demand(body..body + 1, 1))
         .transpose()?;
     let parallel = Glm52VllmNvfp4DsaMoeParallel {
         ep_size,
@@ -1113,7 +1074,6 @@ pub fn glm52_vllm_nvfp4_dsa_moe_speculative(
     routing_seed: Option<u64>,
     mtp_mode: Glm52MtpMode,
     expert_popularity_file: Option<&str>,
-    draft_expert_popularity_file: Option<&str>,
     token_corpus_file: Option<&str>,
     draft_tokens: u32,
     gpu: &str,
@@ -1121,10 +1081,6 @@ pub fn glm52_vllm_nvfp4_dsa_moe_speculative(
     bridge: &PerfApiBridge,
 ) -> Result<Glm52VllmNvfp4DsaMoeSpeculativeModel> {
     let model_cfg = glm52_model_cfg(model_spec).context("loading exact GLM-5.2 NVFP4 config")?;
-    anyhow::ensure!(
-        expert_popularity_file.is_some() == draft_expert_popularity_file.is_some(),
-        "speculative GLM requires target and draft expert popularity files together"
-    );
     let source = ExpertDemandSource {
         kind: routing_kind,
         seed: routing_seed,
@@ -1132,8 +1088,8 @@ pub fn glm52_vllm_nvfp4_dsa_moe_speculative(
         experts_per_token: model_cfg.router_top_k,
         ep_size,
         expert_popularity_file,
-        draft_expert_popularity_file,
         token_corpus_file,
+        num_routed_layers: num_sparse_layers(&model_cfg),
     };
     // The target verifies the drafted positions plus the token they extend, so
     // one request contributes `draft_tokens + 1` consecutive rows to a body
@@ -1143,8 +1099,8 @@ pub fn glm52_vllm_nvfp4_dsa_moe_speculative(
         .checked_add(1)
         .context("speculative draft_tokens + 1 overflows u32")?;
     let body = num_sparse_layers(&model_cfg) as usize;
-    let body_demand = source.demand(MoeCallable::Body, 0..body, verify_width)?;
-    let mtp_demand = source.demand(MoeCallable::Mtp, body..body + 1, 1)?;
+    let body_demand = source.demand(0..body, verify_width)?;
+    let mtp_demand = source.demand(body..body + 1, 1)?;
     let parallel = Glm52VllmNvfp4DsaMoeParallel {
         ep_size,
         nvl_num_gpu,
@@ -1191,14 +1147,10 @@ pub fn glm52_sglang_nvfp4_tp_dsa_moe(
         // EP1: every TP rank owns all experts, so the fold sees one whole rank.
         ep_size: 1,
         expert_popularity_file,
-        draft_expert_popularity_file: None,
         token_corpus_file,
+        num_routed_layers: num_sparse_layers(&model_cfg),
     };
-    let demand = source.demand(
-        MoeCallable::Body,
-        0..num_sparse_layers(&model_cfg) as usize,
-        1,
-    )?;
+    let demand = source.demand(0..num_sparse_layers(&model_cfg) as usize, 1)?;
     let parallel = Glm52SglangNvfp4TpDsaMoeParallel {
         tp_size,
         max_model_len,
@@ -1525,7 +1477,6 @@ pub fn build_speculative_iter_model(
             mtp_mode,
             draft_tokens,
             expert_popularity_file,
-            draft_expert_popularity_file,
             token_corpus_file,
         } => Ok((
             Box::new(glm52_vllm_nvfp4_dsa_moe_speculative(
@@ -1537,7 +1488,6 @@ pub fn build_speculative_iter_model(
                 *routing_seed,
                 *mtp_mode,
                 expert_popularity_file.as_deref(),
-                draft_expert_popularity_file.as_deref(),
                 token_corpus_file.as_deref(),
                 *draft_tokens,
                 gpu,
@@ -1665,11 +1615,11 @@ mod tests {
             experts_per_token: 4,
             ep_size: 2,
             expert_popularity_file: None,
-            draft_expert_popularity_file: None,
             token_corpus_file: Some(&corpus.data_file.replace("routes.u16", "manifest.json")),
+            num_routed_layers: 7,
         };
-        let body = source.demand(MoeCallable::Body, 0..7, 6).unwrap();
-        let mtp = source.demand(MoeCallable::Mtp, 7..8, 1).unwrap();
+        let body = source.demand(0..7, 6).unwrap();
+        let mtp = source.demand(7..8, 1).unwrap();
 
         assert_eq!((body.num_experts(), mtp.num_experts()), (64, 64));
         assert_ne!(
@@ -1701,10 +1651,10 @@ mod tests {
             experts_per_token: 4,
             ep_size: 2,
             expert_popularity_file: popularity,
-            draft_expert_popularity_file: None,
             token_corpus_file: token_corpus,
+            num_routed_layers: 7,
         };
-        let demand = |s: ExpertDemandSource<'_>| s.demand(MoeCallable::Body, 0..7, 6);
+        let demand = |s: ExpertDemandSource<'_>| s.demand(0..7, 6);
 
         let missing = demand(source(RoutingKind::Corpus, None, None)).unwrap_err();
         assert!(missing.to_string().contains("requires token_corpus_file"));
@@ -1722,16 +1672,64 @@ mod tests {
         assert!(format!("{error:#}").contains("records top-4 of 64 experts"));
     }
 
+    /// The other half of the same point: a marginal was captured over the body's
+    /// layers and stops there, so the MTP layer folds the layer-summed
+    /// distribution rather than a layer of its own.
+    #[test]
+    fn a_marginal_gives_the_mtp_layer_the_only_resolution_it_has() {
+        let mut profile = tempfile::NamedTempFile::new().unwrap();
+        // Two layers that disagree completely, so a sum is distinguishable from
+        // either of them.
+        write!(
+            profile,
+            r#"{{"schema_version": 1, "num_logical_experts": 4,
+                 "counts_by_layer": [[100, 0, 0, 0], [25, 25, 25, 25]]}}"#
+        )
+        .unwrap();
+        let source = ExpertDemandSource {
+            kind: RoutingKind::Popularity,
+            seed: None,
+            num_experts: 4,
+            experts_per_token: 2,
+            ep_size: 2,
+            expert_popularity_file: profile.path().to_str(),
+            token_corpus_file: None,
+            num_routed_layers: 2,
+        };
+        let ppm = |demand| match demand {
+            ExpertDemand::Popularity {
+                layerwise_global_ppm,
+            } => layerwise_global_ppm,
+            _ => unreachable!("popularity routing resolves to the popularity arm"),
+        };
+
+        assert_eq!(
+            ppm(source.demand(0..2, 1).unwrap()),
+            vec![
+                vec![1_000_000, 0, 0, 0],
+                vec![250_000, 250_000, 250_000, 250_000]
+            ],
+            "the body reads the profile's own layers"
+        );
+        // One layer, and not either of the body's: the profile has no row for
+        // the MTP layer, so the only honest answer is the mean of the rows it
+        // does have.
+        assert_eq!(
+            ppm(source.demand(2..3, 1).unwrap()),
+            vec![vec![625_000, 125_000, 125_000, 125_000]]
+        );
+    }
+
     #[test]
     fn routing_source_requires_explicit_custom_and_never_falls_back() {
         for kind in [RoutingKind::Uniform, RoutingKind::Random] {
-            assert!(resolve_routing_source(kind, None, 4, 2, 2, 2, None, None).is_ok());
-            let error = resolve_routing_source(kind, None, 4, 2, 2, 2, Some("unused.json"), None)
-                .unwrap_err();
+            assert!(resolve_routing_source(kind, None, 4, 2, 2, 2, None).is_ok());
+            let error =
+                resolve_routing_source(kind, None, 4, 2, 2, 2, Some("unused.json")).unwrap_err();
             assert!(error.to_string().contains("use routing=popularity"));
         }
-        let error = resolve_routing_source(RoutingKind::Popularity, None, 4, 2, 2, 2, None, None)
-            .unwrap_err();
+        let error =
+            resolve_routing_source(RoutingKind::Popularity, None, 4, 2, 2, 2, None).unwrap_err();
         assert!(error
             .to_string()
             .contains("requires expert_popularity_file"));
@@ -1745,7 +1743,6 @@ mod tests {
             2,
             2,
             missing.to_str(),
-            None
         )
         .is_err());
     }
@@ -1772,7 +1769,6 @@ mod tests {
             2,
             2,
             Some(profile_path),
-            None,
         )
         .unwrap();
         assert_eq!(routing.num_experts(), 4);
@@ -1789,7 +1785,6 @@ mod tests {
             2,
             2,
             Some(profile_path),
-            None,
         )
         .is_err());
     }
@@ -1819,7 +1814,6 @@ mod tests {
             2,
             2,
             profile_file.path().to_str(),
-            None,
         )
         .unwrap();
 
@@ -1874,7 +1868,6 @@ mod tests {
             2,
             2,
             Some(profile_path),
-            None,
         )
         .unwrap();
         assert_eq!(routing.ppm(), &[375_000, 250_000, 218_750, 156_250]);
@@ -1897,7 +1890,6 @@ mod tests {
             2,
             2,
             infeasible_file.path().to_str(),
-            None,
         )
         .unwrap_err();
         assert!(format!("{error:#}").contains("infeasible distinct top-k marginals"));
@@ -1924,7 +1916,6 @@ mod tests {
             2,
             2,
             v3_file.path().to_str(),
-            None,
         )
         .is_ok());
 
@@ -1939,7 +1930,6 @@ mod tests {
             2,
             2,
             invalid_v3_file.path().to_str(),
-            None,
         )
         .unwrap_err();
         assert!(format!("{error:#}").contains("invalid v3 aggregation metadata"));
@@ -1966,23 +1956,12 @@ mod tests {
         let mut v4_file = tempfile::NamedTempFile::new().unwrap();
         write!(v4_file, "{v4_profile}").unwrap();
         let v4_path = v4_file.path().to_str().unwrap();
-        let target = load_expert_popularity(v4_path, 4, 2, 2, 2, Some("target")).unwrap();
-        assert_eq!(target.ppm(), routing.ppm());
-        let wrong_role = load_expert_popularity(v4_path, 4, 2, 2, 2, Some("draft")).unwrap_err();
-        assert!(format!("{wrong_role:#}").contains("model_role=draft"));
-        assert!(load_expert_popularity(profile_path, 4, 2, 2, 2, Some("target")).is_err());
+        let v4 = load_expert_popularity(v4_path, 4, 2, 2, 2).unwrap();
+        assert_eq!(v4.ppm(), routing.ppm());
         v4_profile["aggregation"]["observed_monotonic_ns_max"] = serde_json::json!(201);
         let mut outside_file = tempfile::NamedTempFile::new().unwrap();
         write!(outside_file, "{v4_profile}").unwrap();
-        assert!(load_expert_popularity(
-            outside_file.path().to_str().unwrap(),
-            4,
-            2,
-            2,
-            2,
-            Some("target")
-        )
-        .is_err());
+        assert!(load_expert_popularity(outside_file.path().to_str().unwrap(), 4, 2, 2, 2).is_err());
 
         let mut unknown_field_profile = profile;
         unknown_field_profile["unregulated"] = serde_json::json!(true);
@@ -1996,7 +1975,6 @@ mod tests {
             2,
             2,
             invalid_file.path().to_str(),
-            None,
         )
         .unwrap_err();
         assert!(format!("{error:#}").contains("unknown field"));
@@ -2059,7 +2037,6 @@ mod tests {
             mtp_mode: Glm52MtpMode::IndexShare,
             draft_tokens: 5,
             expert_popularity_file: None,
-            draft_expert_popularity_file: None,
             token_corpus_file: None,
         };
         let (built, drafts) =

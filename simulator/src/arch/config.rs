@@ -379,10 +379,6 @@ pub enum IterArchSel {
         #[serde(default)]
         #[param(cache_key)]
         expert_popularity_file: Option<String>,
-        /// Role-tagged MTP routing from the same replay as the target profile.
-        #[serde(default)]
-        #[param(cache_key)]
-        draft_expert_popularity_file: Option<String>,
         /// Recorded per-token expert routes from a `token_corpus` pass, as
         /// a manifest path. Requires `routing = corpus`. One artifact covers
         /// every routed layer, so the body MoE and the MTP MoE read slices

@@ -326,7 +326,16 @@ pub fn build_configs(
 ) -> Result<Glm52VllmNvfp4DsaMoeConfigs, BuildError> {
     // Every decode request submits one query row, so the sparse-MLA leaves
     // sweep the width-1 identity and there is no recurrent draft pass.
-    build_configs_for_decode(model, parallel, body_demand, mtp_demand, fp8, mtp_mode, 1, None)
+    build_configs_for_decode(
+        model,
+        parallel,
+        body_demand,
+        mtp_demand,
+        fp8,
+        mtp_mode,
+        1,
+        None,
+    )
 }
 
 /// The same recipe with a `draft_tokens`-deep MTP proposer in front of it.
@@ -2519,7 +2528,10 @@ mod tests {
             &model(),
             &p,
             &ExpertDemand::popularity(&RoutingDistribution::uniform(NUM_EXPERTS), 1),
-            Some(&ExpertDemand::popularity(&RoutingDistribution::uniform(NUM_EXPERTS), 1)),
+            Some(&ExpertDemand::popularity(
+                &RoutingDistribution::uniform(NUM_EXPERTS),
+                1,
+            )),
             false,
             Glm52MtpMode::Off,
         )
@@ -2585,7 +2597,10 @@ mod tests {
             &model(),
             &parallel(4),
             &ExpertDemand::popularity(&RoutingDistribution::uniform(NUM_EXPERTS), 1),
-            Some(&ExpertDemand::popularity(&RoutingDistribution::uniform(NUM_EXPERTS), 1)),
+            Some(&ExpertDemand::popularity(
+                &RoutingDistribution::uniform(NUM_EXPERTS),
+                1,
+            )),
             false,
             Glm52MtpMode::Off,
         )
@@ -2624,7 +2639,10 @@ mod tests {
             &model(),
             &parallel(4),
             &ExpertDemand::popularity(&RoutingDistribution::uniform(NUM_EXPERTS), 1),
-            Some(&ExpertDemand::popularity(&RoutingDistribution::uniform(NUM_EXPERTS), 1)),
+            Some(&ExpertDemand::popularity(
+                &RoutingDistribution::uniform(NUM_EXPERTS),
+                1,
+            )),
             false,
             Glm52MtpMode::FullIndex,
         )
@@ -2646,15 +2664,39 @@ mod tests {
 
         let mut invalid = parallel(4);
         invalid.ep_size = 0;
-        assert!(build_configs(&m, &invalid, &routing, Some(&routing), false, Glm52MtpMode::Off).is_err());
+        assert!(build_configs(
+            &m,
+            &invalid,
+            &routing,
+            Some(&routing),
+            false,
+            Glm52MtpMode::Off
+        )
+        .is_err());
 
         let mut invalid = parallel(4);
         invalid.nvl_num_gpu = 3;
-        assert!(build_configs(&m, &invalid, &routing, Some(&routing), false, Glm52MtpMode::Off).is_err());
+        assert!(build_configs(
+            &m,
+            &invalid,
+            &routing,
+            Some(&routing),
+            false,
+            Glm52MtpMode::Off
+        )
+        .is_err());
 
         let mut invalid = parallel(4);
         invalid.max_model_len = 0;
-        assert!(build_configs(&m, &invalid, &routing, Some(&routing), false, Glm52MtpMode::Off).is_err());
+        assert!(build_configs(
+            &m,
+            &invalid,
+            &routing,
+            Some(&routing),
+            false,
+            Glm52MtpMode::Off
+        )
+        .is_err());
 
         assert!(build_configs(
             &m,
@@ -2671,7 +2713,10 @@ mod tests {
             &m,
             &parallel(4),
             &ExpertDemand::popularity(&RoutingDistribution::uniform(128), 1),
-            Some(&ExpertDemand::popularity(&RoutingDistribution::uniform(128), 1)),
+            Some(&ExpertDemand::popularity(
+                &RoutingDistribution::uniform(128),
+                1
+            )),
             false,
             Glm52MtpMode::Off,
         )
@@ -2842,7 +2887,10 @@ mod tests {
             &model(),
             &parallel(4),
             &ExpertDemand::popularity(&RoutingDistribution::uniform(NUM_EXPERTS), 1),
-            Some(&ExpertDemand::popularity(&RoutingDistribution::uniform(NUM_EXPERTS), 1)),
+            Some(&ExpertDemand::popularity(
+                &RoutingDistribution::uniform(NUM_EXPERTS),
+                1,
+            )),
             false,
             Glm52MtpMode::Off,
         )
@@ -2864,7 +2912,10 @@ mod tests {
                 &model(),
                 &parallel(4),
                 &ExpertDemand::popularity(&RoutingDistribution::uniform(NUM_EXPERTS), 1),
-                Some(&ExpertDemand::popularity(&RoutingDistribution::uniform(NUM_EXPERTS), 1)),
+                Some(&ExpertDemand::popularity(
+                    &RoutingDistribution::uniform(NUM_EXPERTS),
+                    1,
+                )),
                 false,
                 mode,
             )
@@ -2881,7 +2932,10 @@ mod tests {
             &model(),
             &parallel(4),
             &ExpertDemand::popularity(&RoutingDistribution::uniform(NUM_EXPERTS), 1),
-            Some(&ExpertDemand::popularity(&RoutingDistribution::uniform(NUM_EXPERTS), 1)),
+            Some(&ExpertDemand::popularity(
+                &RoutingDistribution::uniform(NUM_EXPERTS),
+                1,
+            )),
             false,
             Glm52MtpMode::Off,
         )
@@ -2930,7 +2984,10 @@ mod tests {
             &model(),
             &parallel(4),
             &ExpertDemand::popularity(&RoutingDistribution::uniform(NUM_EXPERTS), 1),
-            Some(&ExpertDemand::popularity(&RoutingDistribution::uniform(NUM_EXPERTS), 1)),
+            Some(&ExpertDemand::popularity(
+                &RoutingDistribution::uniform(NUM_EXPERTS),
+                1,
+            )),
             false,
             Glm52MtpMode::Off,
         )

@@ -110,7 +110,7 @@ def test_campaign_rejects_popularity_files_without_custom_routing(pack, routing)
     variant = dataclasses.replace(original, arch=arch)
     patched = dataclasses.replace(pack, variants={variant.name: variant})
     findings = check_module._check_expert_popularity(patched)
-    assert any(item.level == "error" and "require routing=popularity" in item.message
+    assert any(item.level == "error" and "requires routing=popularity" in item.message
                for item in findings)
 
 
