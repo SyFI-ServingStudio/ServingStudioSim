@@ -2207,3 +2207,28 @@ def test_profile_resume_flag_reaches_the_runner(tmp_path, monkeypatch):
 
     assert alignment_launcher.main(["profile", str(paths["profile"]), "--resume"]) == 0
     assert resumed == [True]
+
+
+@pytest.mark.parametrize(
+    ("success", "failed", "files", "accepted"),
+    [(2, 0, 2, True), (2, 0, 1, False), (1, 1, 1, False)],
+    ids=["whole", "a_success_without_routes", "a_failed_request"],
+)
+def test_a_corpus_is_published_only_when_every_request_carried_routes(
+    tmp_path, success, failed, files, accepted
+):
+    """The load generator exits cleanly when a response lacks routes."""
+    summary = tmp_path / "summary.json"
+    summary.write_text(
+        json.dumps({"replay": {"common": {"success_steps": success, "failed_steps": failed}}})
+    )
+    routes = tmp_path / "routed_experts"
+    routes.mkdir()
+    for index in range(files):
+        (routes / f"request-{index}.npy").write_bytes(b"")
+
+    if accepted:
+        alignment_runner._check_routes_cover_replay(summary, routes)
+    else:
+        with pytest.raises(ValueError, match="carried routes"):
+            alignment_runner._check_routes_cover_replay(summary, routes)

@@ -579,6 +579,23 @@ def run_profile(cfg: ProfileConfig, *, resume: bool = False) -> dict:
     )
 
 
+def _check_routes_cover_replay(summary_path: Path, routes: Path) -> None:
+    """Refuse a corpus that silently lost some of the replay's requests.
+
+    The load generator records a request whose response carried no routes as a
+    failed step and still exits cleanly, and the packer reads whatever files
+    exist. One file per successful step is the only evidence the two agree.
+    """
+    common = json.loads(Path(summary_path).read_text())["replay"]["common"]
+    captured = len(list(routes.glob("*.npy")))
+    if common["failed_steps"] or captured != common["success_steps"]:
+        raise ValueError(
+            f"token_corpus replay: {common['success_steps']} steps succeeded and "
+            f"{common['failed_steps']} failed, but {captured} carried routes; a corpus "
+            "missing requests would be packed as if it were the whole workload"
+        )
+
+
 def _finalize_profile(
     cfg: ProfileConfig,
     *,
@@ -649,10 +666,12 @@ def _finalize_profile(
         if cfg.profile_kind == "token_corpus":
             # Packed from the routes the replay persisted, and range-checked
             # against the checkpoint's own expert count.
+            _check_routes_cover_replay(prepared_replay.summary_path, log_dir / ROUTED_EXPERTS_DIR)
             manifest = token_corpus.pack_token_corpus(
                 log_dir / ROUTED_EXPERTS_DIR,
                 log_dir / TOKEN_CORPUS_DIR,
                 num_experts=_num_routed_experts(cfg),
+                drafted=speculative,
             )
             corpus_artifacts = {
                 "token_corpus_manifest": str(log_dir / TOKEN_CORPUS_DIR / "manifest.json"),
