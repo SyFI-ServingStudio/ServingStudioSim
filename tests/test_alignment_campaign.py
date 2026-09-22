@@ -110,18 +110,18 @@ def test_campaign_rejects_popularity_files_without_custom_routing(pack, routing)
     variant = dataclasses.replace(original, arch=arch)
     patched = dataclasses.replace(pack, variants={variant.name: variant})
     findings = check_module._check_expert_popularity(patched)
-    assert any(item.level == "error" and "require routing=custom" in item.message
+    assert any(item.level == "error" and "require routing=popularity" in item.message
                for item in findings)
 
 
 @pytest.mark.parametrize("reference", [None, "", 42])
 def test_campaign_custom_routing_requires_a_file_path(pack, reference):
     original = pack.variant_of(pack.cases[0])
-    arch = {**original.arch, "routing": "custom", "expert_popularity_file": reference}
+    arch = {**original.arch, "routing": "popularity", "expert_popularity_file": reference}
     variant = dataclasses.replace(original, arch=arch)
     patched = dataclasses.replace(pack, variants={variant.name: variant})
     findings = check_module._check_expert_popularity(patched)
-    assert any(item.level == "error" and "routing=custom requires" in item.message
+    assert any(item.level == "error" and "routing=popularity requires" in item.message
                for item in findings)
 
 

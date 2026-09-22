@@ -103,8 +103,8 @@ pub fn resolve_routing(
     Ok(match kind {
         RoutingKind::Uniform => RoutingDistribution::uniform(num_experts),
         RoutingKind::Random => RoutingDistribution::random(num_experts, seed.unwrap_or(0)),
-        RoutingKind::Custom => anyhow::bail!(
-            "routing=custom requires expert_popularity_file on an arch that supports it"
+        RoutingKind::Popularity => anyhow::bail!(
+            "routing=popularity requires expert_popularity_file on an arch that supports it"
         ),
     })
 }
@@ -621,7 +621,7 @@ fn ensure_normalized_probabilities(
     Ok(())
 }
 
-/// Resolve custom routing from a required profile, or synthetic uniform/random
+/// Resolve measured routing from a required profile, or synthetic uniform/random
 /// routing without a profile. Invalid combinations fail rather than falling back.
 pub fn resolve_routing_source(
     kind: RoutingKind,
@@ -634,8 +634,8 @@ pub fn resolve_routing_source(
 ) -> Result<RoutingDistribution> {
     if let Some(path) = expert_popularity_file {
         anyhow::ensure!(
-            kind == RoutingKind::Custom,
-            "expert_popularity_file cannot be combined with routing={:?}; omit the profile or use routing=custom",
+            kind == RoutingKind::Popularity,
+            "expert_popularity_file cannot be combined with routing={:?}; omit the profile or use routing=popularity",
             kind
         );
         return load_expert_popularity(
@@ -1015,8 +1015,8 @@ pub fn glm52_vllm_nvfp4_dsa_moe_speculative(
         "speculative GLM requires target and draft expert popularity files together"
     );
     anyhow::ensure!(
-        expert_popularity_file.is_none() || routing_kind == RoutingKind::Custom,
-        "profile-backed target/draft popularity requires routing=custom"
+        expert_popularity_file.is_none() || routing_kind == RoutingKind::Popularity,
+        "profile-backed target/draft popularity requires routing=popularity"
     );
     let routing_for = |path: Option<&str>, layers, role| match path {
         Some(path) => load_expert_popularity(
@@ -1533,17 +1533,17 @@ mod tests {
             assert!(resolve_routing_source(kind, None, 4, 2, 2, 2, None).is_ok());
             let error =
                 resolve_routing_source(kind, None, 4, 2, 2, 2, Some("unused.json")).unwrap_err();
-            assert!(error.to_string().contains("use routing=custom"));
+            assert!(error.to_string().contains("use routing=popularity"));
         }
         let error =
-            resolve_routing_source(RoutingKind::Custom, None, 4, 2, 2, 2, None).unwrap_err();
+            resolve_routing_source(RoutingKind::Popularity, None, 4, 2, 2, 2, None).unwrap_err();
         assert!(error
             .to_string()
             .contains("requires expert_popularity_file"));
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("missing.json");
         assert!(
-            resolve_routing_source(RoutingKind::Custom, None, 4, 2, 2, 2, missing.to_str())
+            resolve_routing_source(RoutingKind::Popularity, None, 4, 2, 2, 2, missing.to_str())
                 .is_err()
         );
     }
@@ -1563,7 +1563,7 @@ mod tests {
         .unwrap();
         let profile_path = profile_file.path().to_str().unwrap();
         let routing =
-            resolve_routing_source(RoutingKind::Custom, None, 4, 2, 2, 2, Some(profile_path))
+            resolve_routing_source(RoutingKind::Popularity, None, 4, 2, 2, 2, Some(profile_path))
                 .unwrap();
         assert_eq!(routing.num_experts(), 4);
         assert_eq!(
@@ -1601,7 +1601,7 @@ mod tests {
         .unwrap();
 
         let routing = resolve_routing_source(
-            RoutingKind::Custom,
+            RoutingKind::Popularity,
             None,
             4,
             2,
@@ -1655,7 +1655,7 @@ mod tests {
         let profile_path = profile_file.path().to_str().unwrap();
 
         let routing =
-            resolve_routing_source(RoutingKind::Custom, None, 4, 2, 2, 2, Some(profile_path))
+            resolve_routing_source(RoutingKind::Popularity, None, 4, 2, 2, 2, Some(profile_path))
                 .unwrap();
         assert_eq!(routing.ppm(), &[375_000, 250_000, 218_750, 156_250]);
         assert_eq!(routing.layer_ppm().len(), 2);
@@ -1670,7 +1670,7 @@ mod tests {
         let mut infeasible_file = tempfile::NamedTempFile::new().unwrap();
         write!(infeasible_file, "{infeasible_profile}").unwrap();
         let error = resolve_routing_source(
-            RoutingKind::Custom,
+            RoutingKind::Popularity,
             None,
             4,
             2,
@@ -1696,7 +1696,7 @@ mod tests {
         let mut v3_file = tempfile::NamedTempFile::new().unwrap();
         write!(v3_file, "{v3_profile}").unwrap();
         assert!(resolve_routing_source(
-            RoutingKind::Custom,
+            RoutingKind::Popularity,
             None,
             4,
             2,
@@ -1710,7 +1710,7 @@ mod tests {
         let mut invalid_v3_file = tempfile::NamedTempFile::new().unwrap();
         write!(invalid_v3_file, "{v3_profile}").unwrap();
         let error = resolve_routing_source(
-            RoutingKind::Custom,
+            RoutingKind::Popularity,
             None,
             4,
             2,
@@ -1766,7 +1766,7 @@ mod tests {
         let mut invalid_file = tempfile::NamedTempFile::new().unwrap();
         write!(invalid_file, "{unknown_field_profile}").unwrap();
         let error = resolve_routing_source(
-            RoutingKind::Custom,
+            RoutingKind::Popularity,
             None,
             4,
             2,

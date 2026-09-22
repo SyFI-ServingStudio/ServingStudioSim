@@ -40,7 +40,7 @@ variants:
       fp8: false
       ep_size: 4
       nvl_num_gpu: 4
-      routing: custom
+      routing: popularity
       expert_popularity_file: expert_popularity.json
       draft_expert_popularity_file: draft_expert_popularity.json
       mtp_mode: full_index

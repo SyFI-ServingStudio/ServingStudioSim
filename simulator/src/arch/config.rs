@@ -55,8 +55,8 @@ pub struct ModelSpec {
 
 // ── iter-wise contract (unified, pd) ────────────────────────────────────────
 
-/// MoE routing source: synthetic uniform/random demand, or a custom distribution
-/// loaded from `expert_popularity_file`.
+/// Where a MoE arch's expert demand comes from: synthetic uniform/random
+/// demand, or a measured distribution loaded from `expert_popularity_file`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RoutingKind {
@@ -65,12 +65,12 @@ pub enum RoutingKind {
     Uniform,
     /// Deterministic pseudo-random skew seeded by `routing_seed`.
     Random,
-    /// Measured distribution; requires `expert_popularity_file`.
-    Custom,
+    /// Measured per-expert marginal; requires `expert_popularity_file`.
+    Popularity,
 }
 
 /// The `routing` choices the launcher schema advertises (mirror of [`RoutingKind`]).
-const ROUTING_KINDS: [&str; 3] = ["uniform", "random", "custom"];
+const ROUTING_KINDS: [&str; 3] = ["uniform", "random", "popularity"];
 
 // AFD FFN selectors do not yet accept popularity files.
 const SYNTHETIC_ROUTING_KINDS: [&str; 2] = ["uniform", "random"];
@@ -170,7 +170,7 @@ pub enum IterArchSel {
         nvl_num_gpu: u16,
         /// Expert routing distribution: `uniform` (default) spreads load evenly;
         /// `random` draws a deterministic pseudo-random skew seeded by
-        /// `routing_seed`; `custom` loads `expert_popularity_file`.
+        /// `routing_seed`; `popularity` loads `expert_popularity_file`.
         /// Drives the L2 MoE dispatch/combine `BottleneckCurve`
         /// and the L3 grouped-GEMM `local_ppm` shards. Omitted → `uniform`.
         #[serde(default)]
@@ -290,7 +290,7 @@ pub enum IterArchSel {
         #[param(string, default = "off", choices = GLM52_MTP_MODES, cache_key)]
         mtp_mode: Glm52MtpMode,
         /// Measured per-expert popularity from a profile pass. Requires
-        /// `routing = custom`; uniform/random routing cannot carry a profile.
+        /// `routing = popularity`; uniform/random routing cannot carry a profile.
         #[serde(default)]
         #[param(cache_key)]
         expert_popularity_file: Option<String>,
@@ -514,7 +514,7 @@ mod iter_tests {
     #[test]
     fn qwen_selector_parses_profile_path_and_marks_it_cache_relevant() {
         let parsed = parse_qwen(
-            r#","attn_tp_size":4,"ep_size":4,"hp_size":1,"nvl_num_gpu":4,"routing":"custom","expert_popularity_file":"profile_expert_popularity/expert_popularity.json""#,
+            r#","attn_tp_size":4,"ep_size":4,"hp_size":1,"nvl_num_gpu":4,"routing":"popularity","expert_popularity_file":"profile_expert_popularity/expert_popularity.json""#,
         )
         .expect("qwen selector with popularity profile parses");
         let IterArchSel::Qwen3MoeDpAttnEpFfn {
@@ -555,7 +555,7 @@ mod iter_tests {
             IterArchSel::Qwen3MoeFp8DpAttnEpFfn { .. }
         ));
         let parsed = parse_vllm_qwen(
-            r#", "attn_tp_size":4,"ep_size":4,"hp_size":1,"nvl_num_gpu":4,"routing":"custom","expert_popularity_file":"expert_popularity.json""#,
+            r#", "attn_tp_size":4,"ep_size":4,"hp_size":1,"nvl_num_gpu":4,"routing":"popularity","expert_popularity_file":"expert_popularity.json""#,
         )
         .expect("vLLM-alignment Qwen selector parses");
         assert!(matches!(
@@ -700,7 +700,7 @@ mod iter_tests {
     fn glm52_selector_accepts_a_measured_expert_popularity_profile() {
         let parsed: IterArchSel = serde_json::from_str(
             r#"{"type":"glm52_vllm_dsa_moe","model_config":"model/config/glm52_fp8.json","fp8":true,
-                 "routing":"custom","expert_popularity_file":"profile_expert_popularity/expert_popularity.json"}"#,
+                 "routing":"popularity","expert_popularity_file":"profile_expert_popularity/expert_popularity.json"}"#,
         )
         .expect("GLM selector accepts an expert-popularity profile");
         let IterArchSel::Glm52VllmDsaMoe {
@@ -797,7 +797,7 @@ mod iter_tests {
         assert_eq!(routing["default"], "uniform");
         assert_eq!(
             routing["choices"],
-            serde_json::json!(["uniform", "random", "custom"])
+            serde_json::json!(["uniform", "random", "popularity"])
         );
         let mtp = get("mtp_mode");
         assert_eq!(mtp["default"], "off");

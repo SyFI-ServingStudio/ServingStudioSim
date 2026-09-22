@@ -123,8 +123,8 @@ variants:
       # all-to-all, so both parameters are absent from this arch tag rather than
       # set to a neutral value.
       #
-      # `routing: custom` loads the measured distribution from the file below.
-      routing: custom
+      # `routing: popularity` loads the measured distribution from the file below.
+      routing: popularity
       # Pack-relative. `render.simulation_document` rewrites it to the
       # repo-relative `presets/alignment/glm52_nvfp4_b200_sglang_tp4/expert_popularity.json`
       # that the rendered simulation preset carries.

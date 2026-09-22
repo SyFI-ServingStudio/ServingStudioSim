@@ -150,9 +150,10 @@ for selector compatibility and migration rules.
 
 ## MoE routing configuration
 
-`routing: custom` requires `expert_popularity_file` and loads its measured
+`routing: popularity` requires `expert_popularity_file` and loads its measured
 distribution. `uniform` (the schema default) and seeded `random` are synthetic
-and reject popularity files. Migrate older `uniform` + file configs to `custom`.
-A missing or invalid custom file fails; the runtime never falls back to uniform.
+and reject popularity files. Migrate older `uniform` + file configs to
+`popularity`. A missing or invalid profile fails; the runtime never falls back
+to uniform.
 Speculative models require both target and draft popularity files together.
 AFD FFN selectors without a popularity-file field support only synthetic routing.

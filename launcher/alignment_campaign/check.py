@@ -393,16 +393,16 @@ def _check_expert_popularity(pack: Pack) -> list[Finding]:
         references = [variant.arch.get(key) for key in paths.values()]
         routing = variant.arch.get("routing", "uniform")
         where_arch = f"variants.{name}.arch"
-        if routing == "custom":
+        if routing == "popularity":
             required = paths.values() if speculative else (paths["target"],)
             for key in required:
                 reference = variant.arch.get(key)
                 if not isinstance(reference, str) or not reference.strip():
                     findings.append(Finding("error", f"{where_arch}.{key}",
-                                            "routing=custom requires a non-empty popularity file path"))
+                                            "routing=popularity requires a non-empty popularity file path"))
         elif any(reference is not None for reference in references):
             findings.append(Finding("error", f"{where_arch}.routing",
-                                    "popularity files require routing=custom; uniform/random must omit them"))
+                                    "popularity files require routing=popularity; uniform/random must omit them"))
         if speculative and any(references) and not all(references):
             findings.append(Finding("error", f"variants.{name}.arch", "target and draft popularity files must be provided together"))
         for role, key in paths.items():

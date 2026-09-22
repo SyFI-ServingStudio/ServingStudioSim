@@ -33,7 +33,7 @@ N copies to keep in sync. Tolerances are a judgement about one matrix, so they
 live in the pack. Machine facts live in the host profile, so moving a matrix to
 another box is one file.
 
-Measured routing inputs require `routing: custom` alongside
+Measured routing inputs require `routing: popularity` alongside
 `expert_popularity_file` in the variant arch. Synthetic `uniform`/`random`
 routing must omit popularity files. Speculative models require target and draft
 files together. `check` rejects mismatched selectors and missing file paths
