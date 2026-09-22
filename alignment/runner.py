@@ -189,18 +189,32 @@ def _extract_expert_load(
     return artifacts
 
 
-def _checkpoint_config(model_path: str) -> Path:
+def _server_option(extra_args: list[str], flag: str) -> str | None:
+    """The value of `flag` in a server argv, in either argparse spelling."""
+    value = None
+    for index, arg in enumerate(extra_args):
+        if arg == flag and index + 1 < len(extra_args):
+            value = extra_args[index + 1]
+        elif arg.startswith(f"{flag}="):
+            value = arg.split("=", 1)[1]
+    return value
+
+
+def _checkpoint_config(server) -> Path:
     """The `config.json` of the checkpoint the server loaded.
 
-    `model_path` is whatever the server's `--model` accepted: a local
-    directory, or a hub repo id the server has already fetched into the cache.
+    vLLM reads it from `--hf-config-path` when given and otherwise from
+    `--model`, either a local directory or a hub repo id at `--revision`, which
+    the server has already fetched into the cache.
     """
-    local = Path(model_path) / "config.json"
+    source = _server_option(server.extra_args, "--hf-config-path") or server.model_path
+    local = Path(source) / "config.json"
     if local.is_file():
         return local
     from huggingface_hub import hf_hub_download
 
-    return Path(hf_hub_download(repo_id=model_path, filename="config.json"))
+    revision = _server_option(server.extra_args, "--revision")
+    return Path(hf_hub_download(repo_id=source, filename="config.json", revision=revision))
 
 
 def _num_routed_experts(cfg: ProfileConfig) -> int:
@@ -212,7 +226,7 @@ def _num_routed_experts(cfg: ProfileConfig) -> int:
     not of the other artifact, and one produced without the marginal must still
     be describable.
     """
-    config_path = _checkpoint_config(cfg.server.model_path)
+    config_path = _checkpoint_config(cfg.server)
     document = json.loads(config_path.read_text())
     text_config = document.get("text_config", document)
     for key in ("num_experts", "n_routed_experts", "num_local_experts"):

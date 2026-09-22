@@ -232,10 +232,16 @@ class ProfileConfig:
         Asking and requiring are the same question: a pass that asked for the
         stream and got nothing is a defect, not a deployment that happens to
         have no marginal.
+
+        EPLB also needs the model to implement it, which only loading the model
+        can tell. A model that does not is declared the engine's own way, with
+        ``--no-enable-eplb``, and its pass records routes alone.
         """
+        extra_args = self.server.extra_args
         return (
             self.profile_kind in ROUTING_PROFILE_KINDS
             and self.engine == "vllm"
-            and "--enable-expert-parallel" in self.server.extra_args
+            and "--enable-expert-parallel" in extra_args
+            and "--no-enable-eplb" not in extra_args
             and self.server.tp_size * self.server.dp_size > 1
         )

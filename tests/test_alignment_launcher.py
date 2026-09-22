@@ -7,6 +7,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -2243,18 +2244,57 @@ def test_a_hub_model_id_reads_its_config_from_the_hub_cache(tmp_path, monkeypatc
     cached.write_text(json.dumps({"n_routed_experts": 256}))
     fetched = []
 
-    def fake_download(repo_id, filename):
-        fetched.append((repo_id, filename))
+    def fake_download(repo_id, filename, revision):
+        fetched.append((repo_id, filename, revision))
         return str(cached)
 
     monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_download)
     monkeypatch.chdir(tmp_path)
+    server = SimpleNamespace(model_path="nvidia/GLM-5.2-NVFP4", extra_args=[])
 
-    assert alignment_runner._checkpoint_config("nvidia/GLM-5.2-NVFP4") == cached
-    assert fetched == [("nvidia/GLM-5.2-NVFP4", "config.json")]
+    assert alignment_runner._checkpoint_config(server) == cached
+    # The revision the server loaded, in either spelling.
+    server.extra_args = ["--revision", "abc123"]
+    alignment_runner._checkpoint_config(server)
+    server.extra_args = ["--revision=def456"]
+    alignment_runner._checkpoint_config(server)
+    assert fetched == [
+        ("nvidia/GLM-5.2-NVFP4", "config.json", None),
+        ("nvidia/GLM-5.2-NVFP4", "config.json", "abc123"),
+        ("nvidia/GLM-5.2-NVFP4", "config.json", "def456"),
+    ]
 
     local = tmp_path / "checkpoint"
     local.mkdir()
     (local / "config.json").write_text("{}")
-    assert alignment_runner._checkpoint_config(str(local)) == local / "config.json"
-    assert len(fetched) == 1
+    assert (
+        alignment_runner._checkpoint_config(SimpleNamespace(model_path=str(local), extra_args=[]))
+        == local / "config.json"
+    )
+    # A separate config path wins over the weights, as it does in the server.
+    overridden = tmp_path / "config-only"
+    overridden.mkdir()
+    (overridden / "config.json").write_text("{}")
+    assert (
+        alignment_runner._checkpoint_config(
+            SimpleNamespace(model_path=str(local), extra_args=["--hf-config-path", str(overridden)])
+        )
+        == overridden / "config.json"
+    )
+    assert len(fetched) == 3
+
+
+def test_a_model_without_eplb_opts_out_of_the_expert_load_stream(tmp_path):
+    """Only loading the model shows whether it balances; the operator says so."""
+    argv = ["--enable-expert-parallel", "--no-enable-eplb"]
+    cfg = _routing_profile(
+        tmp_path / "no-eplb",
+        "token_corpus",
+        # No topology declared: a pass without the stream has nothing to reduce.
+        extra_args=["--enable-expert-parallel", "--no-enable-eplb"],
+    )
+    alignment_runner._append_backend_server_args(argv, cfg)
+
+    assert not cfg.captures_expert_load
+    assert "--enable-eplb" not in argv
+    assert "--enable-return-routed-experts" in argv
