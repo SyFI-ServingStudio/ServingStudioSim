@@ -83,7 +83,7 @@ def test_sglang_k3_container_has_pinned_runtime_contract(tmp_path: Path, monkeyp
     assert "HF_HUB_OFFLINE=1" in command
     assert "HOME=/root" in command
     assert "PYTHONPATH=/opt/vibesim" in command
-    assert f"{flashinfer_cache}:/root/.cache/flashinfer:ro" in command
+    assert f"{flashinfer_cache}:/root/.cache/flashinfer:rw" in command
     image_index = command.index("lmsysorg/sglang:v0.5.20")
     assert command[image_index + 1 : image_index + 4] == [
         "python",
