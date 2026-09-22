@@ -28,6 +28,7 @@ import json
 import sys
 from pathlib import Path
 
+from .corpus import CorpusError, resolve_hf_references
 from .schema import (
     _format_log_dir,
     expand_sweep_params,
@@ -335,6 +336,14 @@ def _expand_preset(
                 return None
             env[axis] = label
         cand = _format_log_dir(normalize_params(candidate, schema))
+        # Recordings the preset names by repository and revision rather than
+        # carrying in git. Resolved here so the binary only ever sees a path,
+        # and so an unfetchable one fails before a GPU is allocated.
+        try:
+            cand = resolve_hf_references(cand)
+        except CorpusError as exc:
+            print(f"[invalid] {source}: {exc}", file=sys.stderr)
+            return None
         if axis is not None:
             cand["io"]["log_dir"] = f"{label}/{cand['io']['log_dir']}"
         candidates.append(cand)

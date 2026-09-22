@@ -34,6 +34,21 @@ GLM-5.2 NVFP4 archs: prefer it over `popularity` when the deployment drafts
 block's tokens jointly select. At verify width 1 the two agree and either is
 fine. A corpus is also the only source that measures the MTP layer's own
 routing, because it keeps the layer axis a marginal has summed away.
+
+A corpus is hundreds of megabytes, so it is not in the repository.
+`token_corpus_file` accepts either a local path — what a fresh capture writes,
+under `<log_dir>/token_corpus/manifest.json` — or a hub reference that the
+launcher fetches during expansion:
+
+```yaml
+routing: corpus
+token_corpus_file: hf://uw-syfi/servingstudio-corpora@<commit-sha>/glm53/manifest.json
+```
+
+The revision must be a commit sha; a branch or tag is refused. Search for an
+existing corpus the same way as a popularity file, and record which one was
+used — two corpora of the same model are different recordings.
+
 The runtime never falls back from a measured source to uniform. The agent chooses any
 permitted fallback while preparing the config and reports it with the result.
 Check `simulator/src/arch/config.rs` for supported fields and
