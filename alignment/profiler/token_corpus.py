@@ -132,13 +132,15 @@ def pack_token_corpus(
     out_dir: Path,
     *,
     num_experts: int,
-    drafted: bool = False,
+    num_target_layers: int | None = None,
     scope: str = "accepted generated tokens; no prompt or rejected draft routes",
 ) -> dict:
     """Concatenate every captured request into one corpus under `out_dir`.
 
-    `drafted` says the capture ran a drafter, whose slot is the last model
-    layer; only that slot may be empty for a token, and only then.
+    `num_target_layers` is the checkpoint's `num_hidden_layers`. The capture
+    buffer appends a slot past them only for an MTP drafter, so a capture wider
+    than the target drafted, and only that last slot may be empty for a token.
+    Without it every routed layer must be whole.
 
     Returns the manifest. Raises when the capture is empty or internally
     inconsistent; nothing is written in that case.
@@ -171,6 +173,14 @@ def pack_token_corpus(
         arrays.append(ids[1:])
 
     num_model_layers, top_k = shape
+    drafted = False
+    if num_target_layers is not None:
+        if num_model_layers < num_target_layers:
+            raise ValueError(
+                f"routes cover {num_model_layers} layers but the checkpoint has "
+                f"{num_target_layers}; the capture was not of this model"
+            )
+        drafted = num_model_layers > num_target_layers
     layers = _routed_layers(arrays, num_model_layers, top_k)
     if drafted and layers.stop != num_model_layers:
         # The capture buffer appends the drafter's slot after the target's

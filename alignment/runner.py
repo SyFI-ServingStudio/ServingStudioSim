@@ -217,6 +217,21 @@ def _checkpoint_config(server) -> Path:
     return Path(hf_hub_download(repo_id=source, filename="config.json", revision=revision))
 
 
+def _checkpoint_text_config(cfg: ProfileConfig) -> tuple[Path, dict]:
+    config_path = _checkpoint_config(cfg.server)
+    document = json.loads(config_path.read_text())
+    return config_path, document.get("text_config", document)
+
+
+def _num_target_layers(cfg: ProfileConfig) -> int:
+    """The checkpoint's own decoder depth, past which a capture holds MTP slots."""
+    config_path, text_config = _checkpoint_text_config(cfg)
+    value = text_config.get("num_hidden_layers")
+    if not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{config_path} names no num_hidden_layers")
+    return value
+
+
 def _num_routed_experts(cfg: ProfileConfig) -> int:
     """How many experts the checkpoint routes over, read from the checkpoint.
 
@@ -226,9 +241,7 @@ def _num_routed_experts(cfg: ProfileConfig) -> int:
     not of the other artifact, and one produced without the marginal must still
     be describable.
     """
-    config_path = _checkpoint_config(cfg.server)
-    document = json.loads(config_path.read_text())
-    text_config = document.get("text_config", document)
+    config_path, text_config = _checkpoint_text_config(cfg)
     for key in ("num_experts", "n_routed_experts", "num_local_experts"):
         value = text_config.get(key)
         if isinstance(value, int) and value > 0:
@@ -699,7 +712,7 @@ def _finalize_profile(
                 log_dir / ROUTED_EXPERTS_DIR,
                 log_dir / TOKEN_CORPUS_DIR,
                 num_experts=_num_routed_experts(cfg),
-                drafted=speculative,
+                num_target_layers=_num_target_layers(cfg),
             )
             corpus_artifacts = {
                 "token_corpus_manifest": str(log_dir / TOKEN_CORPUS_DIR / "manifest.json"),

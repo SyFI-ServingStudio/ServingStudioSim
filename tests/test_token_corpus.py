@@ -115,7 +115,11 @@ def test_a_step_that_skipped_drafting_drops_its_tokens_not_the_pack(tmp_path):
     captured[4:, -1, :] = 0  # the MTP slot of the last two generated tokens
     write_request(source, "session_s1_round_000000", captured)
 
-    manifest = pack_token_corpus(source, tmp_path / "corpus", num_experts=64, drafted=True)
+    # The capture is one slot wider than the target: the MTP drafter's.
+    target_layers = DENSE_LAYERS + 3
+    manifest = pack_token_corpus(
+        source, tmp_path / "corpus", num_experts=64, num_target_layers=target_layers
+    )
 
     assert (manifest["num_tokens"], manifest["num_layers"]) == (3, 4)
     payload = (tmp_path / "corpus" / "routes.u16").read_bytes()
@@ -135,6 +139,11 @@ def test_without_a_drafter_an_empty_last_layer_is_a_defect(tmp_path):
 
     with pytest.raises(ValueError, match="token 3 recorded no routes"):
         pack_token_corpus(source, tmp_path / "corpus", num_experts=64)
+    # A speculative capture whose drafter was not MTP has no extra slot either.
+    with pytest.raises(ValueError, match="token 3 recorded no routes"):
+        pack_token_corpus(
+            source, tmp_path / "corpus", num_experts=64, num_target_layers=DENSE_LAYERS + 4
+        )
 
 
 def test_a_drafted_capture_that_never_recorded_its_slot_is_refused(tmp_path):
@@ -145,7 +154,9 @@ def test_a_drafted_capture_that_never_recorded_its_slot_is_refused(tmp_path):
     write_request(source, "session_s1_round_000000", captured)
 
     with pytest.raises(ValueError, match="must record the MTP slot"):
-        pack_token_corpus(source, tmp_path / "corpus", num_experts=64, drafted=True)
+        pack_token_corpus(
+            source, tmp_path / "corpus", num_experts=64, num_target_layers=DENSE_LAYERS + 3
+        )
 
 
 def test_a_token_missing_a_body_layer_is_refused(tmp_path):
