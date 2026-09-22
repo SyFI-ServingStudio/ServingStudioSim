@@ -107,6 +107,35 @@ def test_a_layer_that_routes_nowhere_inside_the_span_is_refused(tmp_path):
         pack_token_corpus(source, tmp_path / "corpus", num_experts=64)
 
 
+def test_a_step_that_skipped_drafting_drops_its_tokens_not_the_pack(tmp_path):
+    """A sequence past the drafter's limit still decodes, with no MTP routes."""
+    source = tmp_path / "capture"
+    source.mkdir()
+    captured = routes(5)
+    captured[4:, -1, :] = 0  # the MTP slot of the last two generated tokens
+    write_request(source, "session_s1_round_000000", captured)
+
+    manifest = pack_token_corpus(source, tmp_path / "corpus", num_experts=64)
+
+    assert (manifest["num_tokens"], manifest["num_layers"]) == (3, 4)
+    payload = (tmp_path / "corpus" / "routes.u16").read_bytes()
+    assert payload == captured[1:4, DENSE_LAYERS:, :].astype("<u2").tobytes()
+    provenance = json.loads((tmp_path / "corpus" / "provenance.json").read_text())
+    assert provenance["tokens_dropped_without_draft_routes"] == 2
+    assert provenance["request_segments"][0]["length"] == 3
+
+
+def test_a_token_missing_a_body_layer_is_refused(tmp_path):
+    source = tmp_path / "capture"
+    source.mkdir()
+    captured = routes(4)
+    captured[2, DENSE_LAYERS + 1, :] = 0
+    write_request(source, "session_s1_round_000000", captured)
+
+    with pytest.raises(ValueError, match="token 1 recorded no routes"):
+        pack_token_corpus(source, tmp_path / "corpus", num_experts=64)
+
+
 @pytest.mark.parametrize(
     ("mutate", "message"),
     [

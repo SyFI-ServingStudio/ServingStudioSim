@@ -71,9 +71,10 @@ def _routed_layers(arrays: list[np.ndarray], num_layers: int, top_k: int) -> ran
 
     A dense layer never calls the capture hook, so its rows stay zero for the
     whole capture, and a routed row holds top-k *distinct* experts -- which is
-    what makes all-zero unambiguous, and why it requires top-k above one. The span is required to be contiguous because the simulator
-    addresses the corpus by layer *range*: a gap would make "the first N layers"
-    mean something other than what the model's first N routed layers are.
+    what makes all-zero unambiguous, and why it requires top-k above one. The
+    span is required to be contiguous because the simulator addresses the corpus
+    by layer *range*: a gap would make "the first N layers" mean something other
+    than what the model's first N routed layers are.
     """
     if top_k < 2:
         # With one slot a token routed to expert 0 is indistinguishable from a
@@ -98,6 +99,29 @@ def _routed_layers(arrays: list[np.ndarray], num_layers: int, top_k: int) -> ran
             f"span {span.start}..{span.stop}; the corpus layer axis must be contiguous"
         )
     return span
+
+
+def _drop_undrafted_tokens(path: Path, ids: np.ndarray) -> tuple[np.ndarray, int]:
+    """Remove the tokens whose step ran no drafter, and count them.
+
+    The engine skips drafting for a step whose sequences no longer fit the
+    drafter, so the MTP slot -- the span's last layer -- stays zero for those
+    tokens while every body layer routed. The token is real but only partly
+    recorded, and a corpus row must be whole, so it is left out. Any other
+    unrouted layer is a capture defect and is refused.
+    """
+    routed = ids.any(axis=2)
+    if routed.all() or routed.shape[1] < 2:
+        return ids, 0
+    undrafted = routed[:, :-1].all(axis=1) & ~routed[:, -1]
+    broken = ~routed.all(axis=1) & ~undrafted
+    if broken.any():
+        token = int(np.flatnonzero(broken)[0])
+        raise ValueError(
+            f"{path.name}: token {token} recorded no routes for a layer inside the routed "
+            "span other than the last; only a skipped draft step leaves a layer empty"
+        )
+    return ids[~undrafted], int(undrafted.sum())
 
 
 def pack_token_corpus(
@@ -145,8 +169,11 @@ def pack_token_corpus(
     segments: list[dict] = []
     payload_parts: list[np.ndarray] = []
     offset = 0
+    undrafted_tokens = 0
     for path, ids in zip(paths, arrays, strict=True):
         ids = ids[:, layers.start : layers.stop, :]
+        ids, undrafted = _drop_undrafted_tokens(path, ids)
+        undrafted_tokens += undrafted
         # A request whose generation was one token long contributes no
         # *accepted* routes: the last generated token never runs a forward.
         # That is a real capture, not a broken one, so it is kept as an empty
@@ -187,6 +214,7 @@ def pack_token_corpus(
                 "scope": scope,
                 "num_model_layers": int(num_model_layers),
                 "model_layer_indices": list(layers),
+                "tokens_dropped_without_draft_routes": undrafted_tokens,
                 "request_segments": segments,
             },
             indent=2,
