@@ -115,7 +115,7 @@ def test_a_step_that_skipped_drafting_drops_its_tokens_not_the_pack(tmp_path):
     captured[4:, -1, :] = 0  # the MTP slot of the last two generated tokens
     write_request(source, "session_s1_round_000000", captured)
 
-    manifest = pack_token_corpus(source, tmp_path / "corpus", num_experts=64)
+    manifest = pack_token_corpus(source, tmp_path / "corpus", num_experts=64, drafted=True)
 
     assert (manifest["num_tokens"], manifest["num_layers"]) == (3, 4)
     payload = (tmp_path / "corpus" / "routes.u16").read_bytes()
@@ -123,6 +123,29 @@ def test_a_step_that_skipped_drafting_drops_its_tokens_not_the_pack(tmp_path):
     provenance = json.loads((tmp_path / "corpus" / "provenance.json").read_text())
     assert provenance["tokens_dropped_without_draft_routes"] == 2
     assert provenance["request_segments"][0]["length"] == 3
+
+
+def test_without_a_drafter_an_empty_last_layer_is_a_defect(tmp_path):
+    """The same hole in an undrafted capture is a body layer that did not record."""
+    source = tmp_path / "capture"
+    source.mkdir()
+    captured = routes(5)
+    captured[4, -1, :] = 0
+    write_request(source, "session_s1_round_000000", captured)
+
+    with pytest.raises(ValueError, match="token 3 recorded no routes"):
+        pack_token_corpus(source, tmp_path / "corpus", num_experts=64)
+
+
+def test_a_drafted_capture_that_never_recorded_its_slot_is_refused(tmp_path):
+    source = tmp_path / "capture"
+    source.mkdir()
+    captured = routes(4)
+    captured[:, -1, :] = 0
+    write_request(source, "session_s1_round_000000", captured)
+
+    with pytest.raises(ValueError, match="must record the MTP slot"):
+        pack_token_corpus(source, tmp_path / "corpus", num_experts=64, drafted=True)
 
 
 def test_a_token_missing_a_body_layer_is_refused(tmp_path):

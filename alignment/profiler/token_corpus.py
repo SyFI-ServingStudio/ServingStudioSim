@@ -101,25 +101,28 @@ def _routed_layers(arrays: list[np.ndarray], num_layers: int, top_k: int) -> ran
     return span
 
 
-def _drop_undrafted_tokens(path: Path, ids: np.ndarray) -> tuple[np.ndarray, int]:
+def _drop_undrafted_tokens(path: Path, ids: np.ndarray, drafted: bool) -> tuple[np.ndarray, int]:
     """Remove the tokens whose step ran no drafter, and count them.
 
     The engine skips drafting for a step whose sequences no longer fit the
-    drafter, so the MTP slot -- the span's last layer -- stays zero for those
-    tokens while every body layer routed. The token is real but only partly
-    recorded, and a corpus row must be whole, so it is left out. Any other
-    unrouted layer is a capture defect and is refused.
+    drafter, so the MTP slot -- the span's last layer in a drafted capture --
+    stays zero for those tokens while every body layer routed. The token is
+    real but only partly recorded, and a corpus row must be whole, so it is left
+    out. Any other unrouted layer is a capture defect and is refused; without a
+    drafter the last layer is a body layer like the rest.
     """
     routed = ids.any(axis=2)
-    if routed.all() or routed.shape[1] < 2:
+    if routed.all():
         return ids, 0
-    undrafted = routed[:, :-1].all(axis=1) & ~routed[:, -1]
+    undrafted = np.zeros(routed.shape[0], dtype=bool)
+    if drafted and routed.shape[1] > 1:
+        undrafted = routed[:, :-1].all(axis=1) & ~routed[:, -1]
     broken = ~routed.all(axis=1) & ~undrafted
     if broken.any():
         token = int(np.flatnonzero(broken)[0])
         raise ValueError(
             f"{path.name}: token {token} recorded no routes for a layer inside the routed "
-            "span other than the last; only a skipped draft step leaves a layer empty"
+            "span; only a skipped draft step may leave one empty, and only the MTP slot"
         )
     return ids[~undrafted], int(undrafted.sum())
 
@@ -129,9 +132,13 @@ def pack_token_corpus(
     out_dir: Path,
     *,
     num_experts: int,
+    drafted: bool = False,
     scope: str = "accepted generated tokens; no prompt or rejected draft routes",
 ) -> dict:
     """Concatenate every captured request into one corpus under `out_dir`.
+
+    `drafted` says the capture ran a drafter, whose slot is the last model
+    layer; only that slot may be empty for a token, and only then.
 
     Returns the manifest. Raises when the capture is empty or internally
     inconsistent; nothing is written in that case.
@@ -165,6 +172,13 @@ def pack_token_corpus(
 
     num_model_layers, top_k = shape
     layers = _routed_layers(arrays, num_model_layers, top_k)
+    if drafted and layers.stop != num_model_layers:
+        # The capture buffer appends the drafter's slot after the target's
+        # layers, so a drafted capture whose span stops short never recorded it.
+        raise ValueError(
+            f"a drafted capture must record the MTP slot, model layer {num_model_layers - 1}, "
+            f"but routes stop at layer {layers.stop - 1}"
+        )
 
     segments: list[dict] = []
     payload_parts: list[np.ndarray] = []
@@ -172,7 +186,7 @@ def pack_token_corpus(
     undrafted_tokens = 0
     for path, ids in zip(paths, arrays, strict=True):
         ids = ids[:, layers.start : layers.stop, :]
-        ids, undrafted = _drop_undrafted_tokens(path, ids)
+        ids, undrafted = _drop_undrafted_tokens(path, ids, drafted)
         undrafted_tokens += undrafted
         # A request whose generation was one token long contributes no
         # *accepted* routes: the last generated token never runs a forward.
