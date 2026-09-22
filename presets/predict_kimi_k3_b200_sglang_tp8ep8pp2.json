@@ -7,7 +7,8 @@
       "attn_tp_size": 8,
       "ep_size": 8,
       "pp_size": 2,
-      "dcp_size": 1
+      "dcp_size": 1,
+      "kda_state_dtype": "bf16"
     }
   },
   "gpu": "NVIDIA B200",

@@ -12,10 +12,10 @@
       "local_experts": 112,
       "sim_kda_layers": 1,
       "sim_mla_layers": 0,
-      "kda_state_dtype": "bf16"
+      "kda_state_dtype": "fp32"
     }
   },
   "gpu": "NVIDIA B200",
-  "log_dir": "logs/predict_kimi_k3_b200_rank1_layer_kda",
+  "log_dir": "logs/predict_kimi_k3_b200_rank1_layer_kda_fp32state",
   "cases_file": "predict_kimi_k3_b200_rank1_layer_kda_cases.json"
 }

@@ -40,7 +40,7 @@ use crate::arch::{
 };
 use crate::arch::{KimiK3SglangModel, KimiK3SglangParallel};
 use crate::timing::routing::RoutingDistribution;
-use crate::timing::PerfApiBridge;
+use crate::timing::{DType, PerfApiBridge};
 
 /// `ModelSpec` → dense [`ModelCfg`], applying the `sim_num_layers` / `num_layers`
 /// override that truncates layer COUNT before `build_configs` (per-layer shape
@@ -737,10 +737,17 @@ pub fn kimi_k3_sglang(
     local_experts: Option<u32>,
     sim_kda_layers: Option<u32>,
     sim_mla_layers: Option<u32>,
+    kda_state_dtype: &str,
     gpu: &str,
     name: &str,
     bridge: &PerfApiBridge,
 ) -> Result<KimiK3SglangModel> {
+    let kda_state_dtype = DType::from_wire(kda_state_dtype)
+        .with_context(|| "Kimi-K3 kda_state_dtype must be fp32 or bf16")?;
+    anyhow::ensure!(
+        matches!(kda_state_dtype, DType::Bf16 | DType::Fp32),
+        "Kimi-K3 kda_state_dtype must be fp32 or bf16"
+    );
     let model_cfg =
         kimi_k3_sglang::KimiK3ModelCfg::from_json(Path::new(&model_spec.model_config), model_spec)
             .context("loading exact Kimi-K3 model config")?;
@@ -749,6 +756,7 @@ pub fn kimi_k3_sglang(
         ep_size,
         pp_size,
         dcp_size,
+        kda_state_dtype,
         heads_per_rank,
         local_experts,
         sim_kda_layers,
@@ -1300,6 +1308,7 @@ pub fn build_iter_model(
             local_experts,
             sim_kda_layers,
             sim_mla_layers,
+            kda_state_dtype,
         } => Box::new(kimi_k3_sglang(
             model,
             *attn_tp_size,
@@ -1310,6 +1319,7 @@ pub fn build_iter_model(
             *local_experts,
             *sim_kda_layers,
             *sim_mla_layers,
+            kda_state_dtype,
             gpu,
             name,
             bridge,

@@ -253,6 +253,7 @@ impl Deployment for UnifiedDeployment {
                 local_experts,
                 sim_kda_layers,
                 sim_mla_layers,
+                kda_state_dtype,
                 ..
             } => {
                 ensure_hp_or_chunked_worker("Kimi-K3 SGLang", &g.worker)?;
@@ -266,6 +267,7 @@ impl Deployment for UnifiedDeployment {
                     *local_experts,
                     *sim_kda_layers,
                     *sim_mla_layers,
+                    kda_state_dtype,
                     &gpu_name,
                     MODEL_NAME,
                     bridge,

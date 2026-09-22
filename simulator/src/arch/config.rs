@@ -118,6 +118,12 @@ const fn default_kimi_k3_dcp_size() -> u16 {
     1
 }
 
+fn default_kimi_k3_kda_state_dtype() -> String {
+    "bf16".to_owned()
+}
+
+const KDA_STATE_DTYPES: [&str; 2] = ["bf16", "fp32"];
+
 /// Iteration-wise arch provider. Sharding parameters live only on the variants
 /// that consume them (provider-first: select the arch, then it exposes its own
 /// params).
@@ -179,6 +185,11 @@ pub enum IterArchSel {
         #[serde(default)]
         #[param(cache_key)]
         sim_mla_layers: Option<u32>,
+        /// Recurrent KDA state precision. BF16 selects SGLang's split Triton
+        /// decode chain; FP32 selects the fused KDA decode launch.
+        #[serde(default = "default_kimi_k3_kda_state_dtype")]
+        #[param(string, default = "bf16", choices = KDA_STATE_DTYPES, cache_key)]
+        kda_state_dtype: String,
     },
     Llama3Dense {
         #[serde(flatten)]
@@ -924,6 +935,7 @@ mod iter_tests {
             local_experts,
             sim_kda_layers,
             sim_mla_layers,
+            kda_state_dtype,
         } = &parsed
         else {
             panic!("expected kimi_k3_sglang");
@@ -934,6 +946,7 @@ mod iter_tests {
         assert_eq!(*local_experts, Some(112));
         assert_eq!(*sim_kda_layers, Some(1));
         assert_eq!(*sim_mla_layers, Some(0));
+        assert_eq!(kda_state_dtype, "bf16");
         assert!(std::ptr::eq(parsed.model(), model));
 
         let (_, params) = IterArchSel::SCHEMA
@@ -949,6 +962,14 @@ mod iter_tests {
         assert!(names.contains(&"local_experts"));
         assert!(names.contains(&"sim_kda_layers"));
         assert!(names.contains(&"sim_mla_layers"));
+        assert!(names.contains(&"kda_state_dtype"));
+        let state_dtype = params
+            .iter()
+            .find(|param| param.name == "kda_state_dtype")
+            .expect("Kimi-K3 state dtype schema parameter");
+        let state_dtype = serde_json::to_value(state_dtype).unwrap();
+        assert_eq!(state_dtype["default"], "bf16");
+        assert_eq!(state_dtype["choices"], serde_json::json!(["bf16", "fp32"]));
     }
 }
 // ── layer-wise attn / ffn contract (AFD) ────────────────────────────────────

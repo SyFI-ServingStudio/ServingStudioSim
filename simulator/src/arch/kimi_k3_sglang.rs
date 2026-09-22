@@ -63,6 +63,7 @@ const CACHE_APPEND_BACKENDS: &[&str] = &["sglang_cuda"];
 const MLA_ATTENTION_BACKENDS: &[&str] =
     &["sglang_cutedsl_mla", "sglang_trtllm_mla", "sglang_triton"];
 const KDA_FUSED_BACKENDS: &[&str] = &["sglang_fused"];
+const KDA_TRITON_BACKENDS: &[&str] = &["sglang_triton"];
 const MOE_BACKENDS: &[&str] = &["sglang_trtllm_mxfp4"];
 const ELEMENTWISE_BACKENDS: &[&str] = &["triton"];
 const LM_HEAD_BACKENDS: &[&str] = &["torch_linear"];
@@ -309,6 +310,7 @@ pub struct KimiK3SglangParallel {
     pub ep_size: u16,
     pub pp_size: u16,
     pub dcp_size: u16,
+    pub kda_state_dtype: DType,
     pub heads_per_rank: Option<u16>,
     pub local_experts: Option<u32>,
     pub sim_kda_layers: Option<u32>,
@@ -322,6 +324,10 @@ impl KimiK3SglangParallel {
         ensure!(self.ep_size > 0, "ep_size must be positive");
         ensure!(self.pp_size > 0, "pp_size must be positive");
         ensure!(self.dcp_size == 1, "Kimi-K3 v1 requires dcp_size=1");
+        ensure!(
+            matches!(self.kda_state_dtype, DType::Bf16 | DType::Fp32),
+            "kda_state_dtype must be bf16 or fp32"
+        );
         ensure!(
             self.ep_size % self.attn_tp_size == 0,
             "ep_size must be divisible by attn_tp_size"
@@ -464,9 +470,12 @@ pub fn build_configs(
         conv_kernel: model.conv_kernel.clone(),
         lower_bound: model.gate_lower_bound,
         dtype: DType::Bf16,
-        state_dtype: DType::Bf16,
+        kda_state_dtype: parallel.kda_state_dtype,
         gemm_backends: GEMM_BACKENDS.to_vec(),
         fused_decode_backends: KDA_FUSED_BACKENDS.to_vec(),
+        causal_conv_decode_backends: KDA_TRITON_BACKENDS.to_vec(),
+        recurrent_decode_backends: KDA_TRITON_BACKENDS.to_vec(),
+        gated_norm_backends: KDA_TRITON_BACKENDS.to_vec(),
         residual_norm_backends: RESIDUAL_NORM_BACKENDS.to_vec(),
         tp_size: parallel.attn_tp_size,
     };
@@ -628,11 +637,11 @@ fn local_kv_bytes_per_token(mla_layers: u32) -> Dim {
     Dim::param("mla_cache_width_bytes", 576) * Dim::param("mla_layers", mla_layers)
 }
 
-fn local_recurrent_state_bytes_per_request(kda_layers: u32, heads: u32) -> Dim {
+fn local_recurrent_state_bytes_per_request(kda_layers: u32, heads: u32, state_dtype: DType) -> Dim {
     let state = Dim::param("kda_heads", heads)
         * Dim::param("kda_state_key_dim", HEAD_DIM)
         * Dim::param("kda_state_value_dim", HEAD_DIM)
-        * Dim::param("kda_state_dtype_bytes", 2);
+        * Dim::param("kda_state_dtype_bytes", state_dtype.size_bytes());
     let conv = Dim::param("kda_conv_taps", CONV_KERNEL - 1)
         * Dim::param("kda_conv_channels", 3 * heads * HEAD_DIM)
         * Dim::param("kda_conv_dtype_bytes", 2);
@@ -646,8 +655,11 @@ pub fn build(
 ) -> Result<KimiK3SglangModel, BuildError> {
     let heads = resolved.parallel.heads_per_rank_value();
     let total_kv_bytes_per_token = local_kv_bytes_per_token(resolved.counts.mla);
-    let recurrent_state_bytes_per_request =
-        local_recurrent_state_bytes_per_request(resolved.counts.dense + resolved.counts.kda, heads);
+    let recurrent_state_bytes_per_request = local_recurrent_state_bytes_per_request(
+        resolved.counts.dense + resolved.counts.kda,
+        heads,
+        resolved.parallel.kda_state_dtype,
+    );
     let recurrent_checkpoint_interval_tokens = if resolved.counts.dense + resolved.counts.kda > 0 {
         Dim::param("attn_res_block_size", ATTN_RES_BLOCK_SIZE)
     } else {
@@ -1104,6 +1116,7 @@ mod tests {
             ep_size: 1,
             pp_size: 1,
             dcp_size: 1,
+            kda_state_dtype: DType::Bf16,
             heads_per_rank: Some(12),
             local_experts: Some(112),
             sim_kda_layers,
@@ -1123,6 +1136,7 @@ mod tests {
             ep_size: 8,
             pp_size: 2,
             dcp_size: 1,
+            kda_state_dtype: DType::Bf16,
             heads_per_rank: None,
             local_experts: None,
             sim_kda_layers: None,
@@ -1177,6 +1191,7 @@ mod tests {
             ep_size: 8,
             pp_size: 2,
             dcp_size: 1,
+            kda_state_dtype: DType::Bf16,
             heads_per_rank: None,
             local_experts: None,
             sim_kda_layers: None,
@@ -1186,9 +1201,22 @@ mod tests {
         let configs = build_configs(&cfg, &production).unwrap();
         assert_eq!(local_kv_bytes_per_token(configs.counts.mla).get(), 13_824);
         assert_eq!(
-            local_recurrent_state_bytes_per_request(configs.counts.dense + configs.counts.kda, 12)
-                .get(),
+            local_recurrent_state_bytes_per_request(
+                configs.counts.dense + configs.counts.kda,
+                12,
+                DType::Bf16,
+            )
+            .get(),
             (420_864 * 69)
+        );
+        assert_eq!(
+            local_recurrent_state_bytes_per_request(
+                configs.counts.dense + configs.counts.kda,
+                12,
+                DType::Fp32,
+            )
+            .get(),
+            814_080 * 69
         );
     }
 
@@ -1199,6 +1227,7 @@ mod tests {
             ep_size: 8,
             pp_size: 2,
             dcp_size: 1,
+            kda_state_dtype: DType::Bf16,
             heads_per_rank: None,
             local_experts: None,
             sim_kda_layers: None,
@@ -1211,14 +1240,16 @@ mod tests {
         let enumerated = build("unified".into(), resolve_configs(&configs), &bridge).unwrap();
         let tree = enumerated.cost_tree();
         let names: Vec<&str> = tree.slots.iter().map(|slot| slot.name.as_str()).collect();
-        assert_eq!(tree.n_slots(), 48);
+        assert_eq!(tree.n_slots(), 52);
         assert_eq!(
             names,
             [
                 "unified.embedding",
                 "unified.dense.attention.input_layernorm",
                 "unified.dense.attention.qkvbfg_a_proj",
-                "unified.dense.attention.kda_fused_decode",
+                "unified.dense.attention.kda_conv_decode",
+                "unified.dense.attention.kda_recurrent_decode",
+                "unified.dense.attention.kda_gated_norm",
                 "unified.dense.attention.o_proj",
                 "unified.dense.attention.tp_allreduce_zero",
                 "unified.dense.attention.post_attention_layernorm",
@@ -1227,7 +1258,9 @@ mod tests {
                 "unified.dense.ffn.down",
                 "unified.kda.attention.input_layernorm",
                 "unified.kda.attention.qkvbfg_a_proj",
-                "unified.kda.attention.kda_fused_decode",
+                "unified.kda.attention.kda_conv_decode",
+                "unified.kda.attention.kda_recurrent_decode",
+                "unified.kda.attention.kda_gated_norm",
                 "unified.kda.attention.o_proj",
                 "unified.kda.attention.tp_allreduce_zero",
                 "unified.kda.attention.post_attention_layernorm",
@@ -1281,6 +1314,7 @@ mod tests {
             ep_size: 4,
             pp_size: 1,
             dcp_size: 1,
+            kda_state_dtype: DType::Bf16,
             heads_per_rank: None,
             local_experts: None,
             sim_kda_layers: Some(1),
