@@ -282,20 +282,29 @@ def _predict_case_count(config_path: Path, cfg: dict) -> int | None:
     return len(payload) if isinstance(payload, list) else None
 
 
-def _binary_config(config_path: Path, cfg: dict, log_dir: Path) -> Path:
-    """The config the binary reads: this one, or a copy with hub references resolved.
+def _resolved_config(config_path: Path, cfg: dict) -> dict | None:
+    """`cfg` with hub references resolved, or None when it has none.
 
-    The binary only reads paths. A copy is written only when there is a
-    reference to resolve, beside the run's own outputs, with `cases_file` made
-    absolute because the binary resolves it against the config's directory.
+    The binary only reads paths. `cases_file` is made absolute because the
+    binary resolves it against the directory of the config it reads, and the
+    resolved copy lives elsewhere.
     """
     resolved = resolve_hf_references(cfg)
     if resolved == cfg:
-        return config_path
+        return None
     cases_file = resolved.get("cases_file")
     if isinstance(cases_file, str) and not Path(cases_file).is_absolute():
         resolved["cases_file"] = str((config_path.parent / cases_file).resolve())
-    log_dir.mkdir(parents=True, exist_ok=True)
+    return resolved
+
+
+def _binary_config(config_path: Path, resolved: dict | None, log_dir: Path) -> Path:
+    """The config the binary reads: this one, or the resolved copy beside the outputs.
+
+    Writes into the run directory, so call it only while holding its lease.
+    """
+    if resolved is None:
+        return config_path
     copy = log_dir / "timing_predict_config.resolved.json"
     copy.write_text(json.dumps(resolved, indent=2))
     return copy
@@ -316,7 +325,7 @@ async def run_one(config_path: Path, build_type: str, analyze: bool) -> bool:
 
     # Before any job is announced: a reference that cannot be fetched is a
     # config error, not a failed prediction.
-    binary_config = _binary_config(config_path, cfg, log_dir)
+    resolved = _resolved_config(config_path, cfg)
     prediction_id = _prediction_id(log_dir)
     descriptor = _predict_descriptor(config_path, cfg)
     managed_job = prepare_managed_job(
@@ -333,6 +342,7 @@ async def run_one(config_path: Path, build_type: str, analyze: bool) -> bool:
         if managed_job is not None:
             managed_job.report("running")
         write_artifact_kind(log_dir, ArtifactKind.TIMING_PREDICTION)
+        binary_config = _binary_config(config_path, resolved, log_dir)
         binary = binary_path(build_type)
         argv = [str(binary), "timing-predict", str(binary_config)]
         journal = RunJournal(log_dir)

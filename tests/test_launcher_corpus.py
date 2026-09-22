@@ -147,26 +147,75 @@ def test_timing_predict_reads_the_preset_with_references_resolved(hub, tmp_path)
     assert "hf://" not in json.dumps(preset)
 
 
-def test_a_direct_prediction_hands_the_binary_resolved_paths(hub, tmp_path):
-    """`python -m launcher timing-predict` reads the config the user wrote."""
-    from launcher.timing_predict import _binary_config
-
+def _direct_prediction(tmp_path):
     config_dir = tmp_path / "presets"
     config_dir.mkdir()
-    config_path = config_dir / "predict.yaml"
     cfg = {
         "arch": {"iter": {"token_corpus_file": f"hf://uw/corpora@{SHA}/glm53/manifest.json"}},
         "cases_file": "predict_cases.yaml",
     }
-    log_dir = tmp_path / "logs" / "run"
+    return config_dir / "predict.yaml", cfg
 
-    copy = _binary_config(config_path, cfg, log_dir)
+
+def test_a_direct_prediction_hands_the_binary_resolved_paths(hub, tmp_path):
+    """`python -m launcher timing-predict` reads the config the user wrote."""
+    from launcher.timing_predict import _binary_config, _resolved_config
+
+    config_path, cfg = _direct_prediction(tmp_path)
+    log_dir = tmp_path / "logs" / "run"
+    log_dir.mkdir(parents=True)
+
+    copy = _binary_config(config_path, _resolved_config(config_path, cfg), log_dir)
 
     written = json.loads(copy.read_text())
     assert copy.parent == log_dir
     assert "hf://" not in json.dumps(written)
     # The binary resolves cases_file against the config it reads.
-    assert written["cases_file"] == str((config_dir / "predict_cases.yaml").resolve())
+    assert written["cases_file"] == str((config_path.parent / "predict_cases.yaml").resolve())
     # A config with nothing to resolve is handed over untouched.
     plain = {"arch": {"iter": {"token_corpus_file": "local/manifest.json"}}}
-    assert _binary_config(config_path, plain, log_dir) == config_path
+    assert _resolved_config(config_path, plain) is None
+    assert _binary_config(config_path, None, log_dir) == config_path
+
+
+def test_the_resolved_copy_is_written_only_under_the_run_directory_lease(
+    hub, tmp_path, monkeypatch
+):
+    """A rerun waiting on the lease must not overwrite the config a running job reads."""
+    import asyncio
+
+    import launcher.timing_predict as timing_predict
+
+    config_path, cfg = _direct_prediction(tmp_path)
+    log_dir = tmp_path / "logs" / "run"
+    cfg["log_dir"] = str(log_dir)
+    config_path.write_text(json.dumps(cfg))
+    copy = log_dir / "timing_predict_config.resolved.json"
+    seen_before_lease = []
+
+    class Lease:
+        async def acquire(self):
+            seen_before_lease.append(copy.exists())
+
+        def release(self):
+            pass
+
+    class Leases:
+        def run_directory(self, _log_dir):
+            return Lease()
+
+    class Stop(Exception):
+        pass
+
+    def stop(_build_type):
+        raise Stop
+
+    monkeypatch.setattr(timing_predict, "_LAUNCHER_LEASES", Leases())
+    monkeypatch.setattr(timing_predict, "prepare_managed_job", lambda *_, **__: None)
+    monkeypatch.setattr(timing_predict, "binary_path", stop)
+
+    with pytest.raises(Stop):
+        asyncio.run(timing_predict.run_one(config_path, "release", analyze=False))
+
+    assert seen_before_lease == [False]
+    assert copy.is_file()
