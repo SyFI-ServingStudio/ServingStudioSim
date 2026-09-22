@@ -54,7 +54,13 @@ const QK_NOPE_HEAD_DIM: u32 = 192;
 const ROPE_DIM: u32 = 64;
 const V_HEAD_DIM: u32 = 256;
 const MODEL_INDEX_HEADS: u32 = 32;
-const PROFILE_INDEX_HEADS: u32 = 64;
+/// vLLM launches the logits kernels at the model's own 32 index heads; it does
+/// not pad the indexer query. Every captured trace agrees: GLM-5.3 (job 706)
+/// runs `deep_gemm::sm100_mqa_logits<32, 128, ...>` with `BLOCK_Q = 4`, and the
+/// GLM-5.2 captures run `sm100_fp8_mqa_logits<32, 128, ...>`, both alongside a
+/// paged decode kernel that also carries 32. `sparse_attn_indexer.py` slices
+/// `q_quant` straight into `fp8_fp4_mqa_logits` with no head padding.
+const PROFILE_INDEX_HEADS: u32 = 32;
 const INDEX_HEAD_DIM: u32 = 128;
 const SELECTED_K: u32 = 2048;
 /// Full-context fixtures for the inherited H200 tests. Production configs may
@@ -1006,7 +1012,7 @@ mod tests {
             rope_dim: Dim::param("qk_rope_head_dim", 64),
             v_head_dim: Dim::param("v_head_dim", 256),
             model_num_index_heads: Dim::param("model_num_index_heads", 32),
-            profile_num_index_heads: Dim::param("profile_num_index_heads", 64),
+            profile_num_index_heads: Dim::param("profile_num_index_heads", 32),
             index_head_dim: Dim::param("index_head_dim", 128),
             selected_k: 2048,
             max_model_len: Dim::param("max_model_len", MAX_MODEL_LEN),
@@ -1134,7 +1140,7 @@ mod tests {
 
         let indexer = r.indexer.expect("full-index layer");
         assert_eq!(indexer.model_num_index_heads, 32);
-        assert_eq!(indexer.profile_num_index_heads, 64);
+        assert_eq!(indexer.profile_num_index_heads, 32);
 
         assert_eq!(r.sparse_mla.attention_q_dtype, DType::Fp8E4m3);
         assert_eq!(r.sparse_mla.attention_cache_dtype, DType::Fp8E4m3);
@@ -1216,7 +1222,7 @@ mod tests {
         let full = VllmGlm52DsaAttnLocalWorklet::resolve_config(&cfg(true, 1));
         let indexer = full.indexer.as_ref().expect("full-index layer");
         assert_eq!(indexer.model_num_index_heads, 32);
-        assert_eq!(indexer.profile_num_index_heads, 64);
+        assert_eq!(indexer.profile_num_index_heads, 32);
         assert_eq!(indexer.next_n, 1);
         assert!(worklet_label("layer.attn", &full.raw_cfg).contains("indexer=full"));
 
@@ -1351,7 +1357,7 @@ mod tests {
         for mutate in [
             |cfg: &mut VllmGlm52DsaAttnLocalWorkletConfig| cfg.num_attention_heads = 32.into(),
             |cfg: &mut VllmGlm52DsaAttnLocalWorkletConfig| cfg.model_num_index_heads = 64.into(),
-            |cfg: &mut VllmGlm52DsaAttnLocalWorkletConfig| cfg.profile_num_index_heads = 32.into(),
+            |cfg: &mut VllmGlm52DsaAttnLocalWorkletConfig| cfg.profile_num_index_heads = 64.into(),
             |cfg: &mut VllmGlm52DsaAttnLocalWorkletConfig| cfg.base_dtype = DType::Fp32,
             |cfg: &mut VllmGlm52DsaAttnLocalWorkletConfig| cfg.index_cache_dtype = DType::Bf16,
             |cfg: &mut VllmGlm52DsaAttnLocalWorkletConfig| cfg.selected_k = 1024,

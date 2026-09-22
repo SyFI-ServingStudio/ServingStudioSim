@@ -95,7 +95,7 @@ const QK_NOPE_HEAD_DIM: u32 = 192;
 const ROPE_DIM: u32 = 64;
 const V_HEAD_DIM: u32 = 256;
 const MODEL_INDEX_HEADS: u32 = 32;
-const PROFILE_INDEX_HEADS: u32 = 64;
+const PROFILE_INDEX_HEADS: u32 = 32;
 const INDEX_HEAD_DIM: u32 = 128;
 const INDEX_TOP_K: u32 = 2_048;
 const CHECKPOINT_MAX_CONTEXT: u32 = 1_048_576;
@@ -2313,7 +2313,7 @@ mod tests {
             .as_ref()
             .unwrap();
         assert_eq!(indexer.model_num_index_heads, 32);
-        assert_eq!(indexer.profile_num_index_heads, 64);
+        assert_eq!(indexer.profile_num_index_heads, 32);
         assert_eq!(resolved.dense_ffn.gate_up_proj.n, 24_576);
         assert_eq!(
             resolved.sparse_router.raw_cfg.router_semantic_dtype,
