@@ -50,6 +50,21 @@ pub trait IterAdmission<K: KvStore> {
     );
     fn queued_requests(&self) -> u32;
     fn cancel_pending(&mut self, request: RequestId) -> bool;
+
+    /// Give up every pending entry, appending their ids in selection order.
+    ///
+    /// Pending membership is this axis's to own, so nothing outside can empty
+    /// the queue. Releasing KV is the KV axis's half and stays with the shell.
+    fn drain_pending(&mut self, out: &mut Vec<RequestId>);
+
+    /// Forget per-request admission bookkeeping for a request whose KV the
+    /// shell released out from under this lifecycle.
+    ///
+    /// Default no-op: only a lifecycle that tracks an in-flight episode
+    /// (chunked prefill) has anything to forget. Without it a request that
+    /// comes back later trips that lifecycle's own "already in an episode"
+    /// assertion.
+    fn forget_admitted(&mut self, _request: RequestId) {}
 }
 
 pub trait SlotPipelineAdmission<K: KvStore> {

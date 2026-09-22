@@ -3,7 +3,7 @@
 //! The shell owns cadence and cross-axis sequencing. KV, Admission, and Execution
 //! are statically composed; the FSM itself is deliberately not an axis.
 
-use crate::common::{RequestId, Time, WorkerId};
+use crate::common::{RequestId, Time, UnifiedStage, WorkerId};
 use crate::worker::admission::{
     ChunkedPrefillAdmission, IterAdmission, LocalPrefillDecodeAdmission, PendingOrder,
     PrefillHandoffAdmission, SpeculativeDecodeCompletion,
@@ -11,11 +11,11 @@ use crate::worker::admission::{
 use crate::worker::execution::{
     IterModelExecution, SpeculativeIterExecution, UnifiedIterExecution,
 };
-use crate::worker::iter_worker::IterWorker;
+use crate::worker::iter_worker::{IterWorker, MigratableWorker};
 use crate::worker::kv::{FullAttnKv, HybridGdnKv, IterWorkerKv};
 use crate::worker::shared::context::WorkerContext;
 use crate::worker::types::{
-    BatchFsmState, IterBatchPlan, IterCursor, WorkerFsmState, WorkerStatus,
+    BatchFsmState, IterBatchPlan, IterCursor, WorkerFsmState, WorkerMsgCommon, WorkerStatus,
 };
 
 struct IterationFsm {
@@ -210,6 +210,89 @@ where
         self.kv_store.release_external(request, current_kv)
     }
 
+    /// Give up every request this worker holds, releasing their KV, and append
+    /// their ids to `out` in a deterministic order: queued first, then each
+    /// partition's prefill admits, then its decode members.
+    ///
+    /// The two halves come from their respective owners — the queue from the
+    /// admission policy, residency from the KV ledger — because nothing else
+    /// knows both. A request mid-chunk appears only through the KV sweep: it
+    /// holds capacity, so it is residency, not queue.
+    ///
+    /// The iteration FSM is left alone on purpose. If a forward pass is already
+    /// running, its `compute_end` still stands and this worker stays busy until
+    /// it lands; the drained requests simply are not there when it completes.
+    pub fn drain_resident(&mut self, now: Time, out: &mut Vec<RequestId>) {
+        let first = out.len();
+        self.admission.drain_pending(out);
+        self.release_residency(now, first, |_| true, out);
+    }
+
+    /// Give up only the named requests, appending the ones this worker actually
+    /// held — queued first, then resident — and leaving everything else running.
+    ///
+    /// Ids it does not hold are skipped rather than rejected. A caller naming a
+    /// prompt group off a ledger cannot know which of that group's samples have
+    /// already finished, and making it find out would hand it exactly the
+    /// residency bookkeeping this method exists to keep inside L5.
+    pub fn drain_requests(&mut self, now: Time, requests: &[RequestId], out: &mut Vec<RequestId>) {
+        let first = out.len();
+        for request in requests {
+            // True only for a request still waiting in a queue. One that has
+            // started holds KV, so it belongs to the residency sweep below and
+            // listing it here would hand the same id over twice.
+            if self.admission.cancel_pending(*request) {
+                out.push(*request);
+            }
+        }
+        self.release_residency(now, first, |request| requests.contains(&request), out);
+    }
+
+    /// The half of a drain the KV ledger owns: release everything resident that
+    /// `wanted` accepts, then stamp what left. `first` is where this drain's own
+    /// ids start in `out`, so the stamping covers the queued half too.
+    ///
+    /// `visit_*` borrow the store immutably while `release_request` needs it
+    /// mutably, so residency is collected before anything is released. Migration
+    /// is rare; one scratch allocation is cheaper than a field the hot path
+    /// would carry.
+    fn release_residency(
+        &mut self,
+        now: Time,
+        first: usize,
+        wanted: impl Fn(RequestId) -> bool,
+        out: &mut Vec<RequestId>,
+    ) {
+        let mut resident: Vec<(RequestId, u64)> = Vec::new();
+        for partition in 0..self.kv_store.num_partitions() as u16 {
+            self.kv_store.visit_prefill_admits(partition, |request| {
+                if wanted(request) {
+                    resident.push((request, 0));
+                }
+            });
+            self.kv_store
+                .visit_decode_members(partition, |request, current_kv| {
+                    if wanted(request) {
+                        resident.push((request, current_kv));
+                    }
+                });
+        }
+        for (request, current_kv) in resident {
+            self.release_request(request, current_kv);
+            self.admission.forget_admitted(request);
+            out.push(request);
+        }
+        let mut store = self.context.requests.borrow_mut();
+        for request in &out[first..] {
+            // A request drained in the middle of its own recomputation restarts
+            // that recomputation on the destination, so the episode open here
+            // has no one left to finish it.
+            store[*request].abandon_reprocessed_prefill();
+            self.context
+                .stamp_stage(&mut store[*request], now, UnifiedStage::Suspended as u16);
+        }
+    }
+
     pub fn id(&self) -> WorkerId {
         self.context.id
     }
@@ -238,6 +321,25 @@ where
 
     fn status(&self) -> WorkerStatus {
         IterBatchWorker::status(self)
+    }
+}
+
+/// The `Msg = WorkerMsgCommon` bound is what selects the migratable families:
+/// every unified recipe (barebone, hp_unified, chunked_prefill, speculative,
+/// qwen36_hybrid) satisfies it, while `PdPrefillWorker` — whose `Msg` is
+/// `PdPrefillMsg` — is excluded by the type system rather than by a check.
+impl<K, A, E> MigratableWorker for IterBatchWorker<K, A, E>
+where
+    K: IterWorkerKv,
+    A: IterAdmission<K, Msg = WorkerMsgCommon>,
+    E: IterModelExecution<K>,
+{
+    fn drain_resident(&mut self, now: Time, out: &mut Vec<RequestId>) {
+        IterBatchWorker::drain_resident(self, now, out);
+    }
+
+    fn drain_requests(&mut self, now: Time, requests: &[RequestId], out: &mut Vec<RequestId>) {
+        IterBatchWorker::drain_requests(self, now, requests, out);
     }
 }
 
@@ -1024,5 +1126,343 @@ mod tests {
         assert_eq!(worker.kv_store.prefill_admits(0).count(), 2);
         assert_eq!(worker.kv_store.prefill_admits(1).count(), 2);
         assert_eq!(worker.admission.queued_requests(), 2);
+    }
+
+    // ── Migration primitives (L5 half of a pool migration) ────────────────────
+
+    /// Drive `worker` from `now` until it stops asking to be woken, or `steps`
+    /// milliseconds elapse.
+    fn run_ms(worker: &mut ChunkedPrefillWorker<FakeModel>, from: u64, steps: u64) -> Vec<RequestId> {
+        let mut events = Vec::new();
+        let mut completed = Vec::new();
+        for step in from..from + steps {
+            worker.tick(Time::from_ms(step as f64), &mut events);
+            for event in events.drain(..) {
+                let WorkerEventCommon::RequestComplete { req, .. } = event;
+                completed.push(req);
+            }
+        }
+        completed
+    }
+
+    #[test]
+    fn drain_resident_hands_back_everything_the_worker_holds() {
+        // A KV budget far below what four long decodes need: after a few
+        // iterations the worker holds some requests in its ledger and the rest
+        // in its queue, so the drain has to cover both halves of its state.
+        let store = shared_with(&[(0, 4, 20), (1, 4, 20), (2, 4, 20), (3, 4, 20)]);
+        let mut worker = build_chunked_prefill_worker(
+            WorkerId(0),
+            "main",
+            Arc::new(FakeModel::for_ms(1.0)),
+            Rc::clone(&store),
+            bounded_future_config(64, 24),
+            None,
+            PoolId(0),
+            "test-gpu",
+            test_cluster(),
+        );
+        for request in 0..4 {
+            worker.enqueue(WorkerMsgCommon::Request(RequestId(request)));
+        }
+        run_ms(&mut worker, 0, 3);
+        let before = worker.status();
+        assert!(
+            before.active_requests > 0 && before.queued_requests > 0,
+            "the fixture should leave work in both the queue and the KV ledger, got {before:?}"
+        );
+
+        let mut drained = Vec::new();
+        worker.drain_resident(Time::from_ms(10.0), &mut drained);
+
+        drained.sort_by_key(|request| request.0);
+        assert_eq!(drained, (0..4).map(RequestId).collect::<Vec<_>>());
+        let status = worker.status();
+        assert_eq!((status.queued_requests, status.active_requests), (0, 0));
+        assert!(
+            run_ms(&mut worker, 10, 20).is_empty(),
+            "a drained worker must not keep completing requests that left it"
+        );
+        for request in 0..4 {
+            assert_eq!(
+                store.borrow()[RequestId(request)]
+                    .lifecycle
+                    .stage_log
+                    .last()
+                    .map(|event| event.code),
+                Some(UnifiedStage::Suspended as u16),
+                "the drain should leave every request suspended on this worker"
+            );
+        }
+    }
+
+    #[test]
+    fn drain_requests_takes_only_what_it_names() {
+        // Same fixture as the full drain, so the named pair straddles the queue
+        // and the KV ledger the same way. The two it does not name have to be
+        // left running: a worker handing one prompt group back is not leaving.
+        let store = shared_with(&[(0, 4, 20), (1, 4, 20), (2, 4, 20), (3, 4, 20)]);
+        let mut worker = build_chunked_prefill_worker(
+            WorkerId(0),
+            "main",
+            Arc::new(FakeModel::for_ms(1.0)),
+            Rc::clone(&store),
+            bounded_future_config(64, 24),
+            None,
+            PoolId(0),
+            "test-gpu",
+            test_cluster(),
+        );
+        for request in 0..4 {
+            worker.enqueue(WorkerMsgCommon::Request(RequestId(request)));
+        }
+        run_ms(&mut worker, 0, 3);
+        let before = worker.status();
+
+        let mut drained = Vec::new();
+        // `RequestId(9)` is not on this worker at all — the caller names a whole
+        // prompt group without knowing which of its samples have finished.
+        worker.drain_requests(
+            Time::from_ms(10.0),
+            &[RequestId(0), RequestId(2), RequestId(9)],
+            &mut drained,
+        );
+
+        drained.sort_by_key(|request| request.0);
+        assert_eq!(drained, vec![RequestId(0), RequestId(2)]);
+        let after = worker.status();
+        assert_eq!(
+            after.queued_requests + after.active_requests,
+            before.queued_requests + before.active_requests - 2,
+            "exactly the two named requests left; got {before:?} then {after:?}"
+        );
+        for request in [1, 3] {
+            assert_ne!(
+                store.borrow()[RequestId(request)]
+                    .lifecycle
+                    .stage_log
+                    .last()
+                    .map(|event| event.code),
+                Some(UnifiedStage::Suspended as u16),
+                "request {request} was not named and must still be running here"
+            );
+        }
+        let completed = run_ms(&mut worker, 10, 400);
+        assert_eq!(
+            completed.len(),
+            2,
+            "the worker keeps running what it kept: {completed:?}"
+        );
+    }
+
+    #[test]
+    fn drain_does_not_cancel_the_in_flight_iteration() {
+        // The GPU is genuinely still running a forward pass that was already
+        // launched. Cancelling it here would make migration free.
+        let store = shared_with(&[(0, 64, 4)]);
+        let mut worker = chunked_worker(store, BatchPolicy::Mix, 128);
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(0)));
+        let mut events = Vec::new();
+        let compute_end = worker
+            .tick(Time::ZERO, &mut events)
+            .expect("the first tick starts an iteration");
+        assert!(compute_end > Time::ZERO);
+
+        worker.drain_resident(Time::ZERO, &mut Vec::new());
+
+        assert_eq!(
+            worker.tick(Time::ZERO, &mut events),
+            Some(compute_end),
+            "the worker stays busy until the launched pass lands"
+        );
+    }
+
+    #[test]
+    fn a_second_migration_can_land_mid_recomputation() {
+        // Two blocks release in the same rollout and the same request is caught
+        // by both, the second one while it is still re-prefilling on the first
+        // destination. The abandoned episode has to be closed out, or the third
+        // worker opens one on top of it.
+        let store = shared_with(&[(0, 200, 20)]);
+        // Small enough that `prompt + emitted` needs several chunks, so the
+        // second drain has somewhere to land mid-recomputation.
+        let mut a = chunked_worker_named(WorkerId(0), Rc::clone(&store), 64);
+        let mut b = chunked_worker_named(WorkerId(1), Rc::clone(&store), 64);
+        let mut c = chunked_worker_named(WorkerId(2), Rc::clone(&store), 64);
+        a.enqueue(WorkerMsgCommon::Request(RequestId(0)));
+
+        let mut events = Vec::new();
+        let mut now = Time::ZERO;
+        for step in 0..400 {
+            now = Time::from_ms(step as f64);
+            a.tick(now, &mut events);
+            if store.borrow()[RequestId(0)].progress.output_tokens_emitted >= 5 {
+                break;
+            }
+        }
+        let emitted = store.borrow()[RequestId(0)].progress.output_tokens_emitted;
+        assert_eq!(emitted, 5, "the fixture should hand over mid-decode");
+
+        let mut drained = Vec::new();
+        a.drain_resident(now, &mut drained);
+        b.enqueue(WorkerMsgCommon::Resume {
+            req: RequestId(0),
+            at: now,
+        });
+
+        // Let b get a chunk or two of the recomputation done, then take it away
+        // before the episode can close.
+        for step in 1..400 {
+            now += Time::from_ms(step as f64);
+            b.tick(now, &mut events);
+            let episode = store.borrow()[RequestId(0)].telemetry.reprocessed_prefills[0];
+            if episode.prefill_tokens_processed > 0 {
+                break;
+            }
+        }
+        {
+            let requests = store.borrow();
+            let episode = requests[RequestId(0)].telemetry.reprocessed_prefills[0];
+            assert!(!episode.completed, "b must still be recomputing");
+            assert!(episode.prefill_tokens_processed > 0);
+            assert!(episode.prefill_tokens_processed < 200 + emitted);
+        }
+
+        drained.clear();
+        b.drain_resident(now, &mut drained);
+        assert_eq!(drained, vec![RequestId(0)]);
+        c.enqueue(WorkerMsgCommon::Resume {
+            req: RequestId(0),
+            at: now,
+        });
+
+        events.clear();
+        for step in 0..600 {
+            c.tick(now + Time::from_ms(step as f64), &mut events);
+            if !events.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(events.len(), 1, "the third worker must finish the request");
+
+        let requests = store.borrow();
+        let moved = &requests[RequestId(0)];
+        assert!(moved.lifecycle.completed);
+        assert_eq!(moved.progress.output_tokens_emitted, 20);
+        let episodes = &moved.telemetry.reprocessed_prefills;
+        assert_eq!(episodes.len(), 2, "one recomputation per migration");
+        assert!(episodes[0].abandoned && !episodes[0].completed);
+        assert!(episodes[1].completed && !episodes[1].abandoned);
+        assert_eq!(
+            episodes[1].prefill_tokens_processed,
+            200 + emitted,
+            "the second recomputation starts over, it does not resume the first"
+        );
+    }
+
+    #[test]
+    fn a_resumed_request_reprefills_its_prompt_plus_what_it_already_emitted() {
+        // The full migration round trip at L5: one worker gives a decoding
+        // request up, another takes it over from an id alone and has to
+        // re-derive the work from the shared record.
+        let store = shared_with(&[(0, 4, 20)]);
+        let mut src = chunked_worker_named(WorkerId(0), Rc::clone(&store), 64);
+        let mut dst = chunked_worker_named(WorkerId(1), Rc::clone(&store), 64);
+        src.enqueue(WorkerMsgCommon::Request(RequestId(0)));
+
+        let mut events = Vec::new();
+        let mut handoff = Time::ZERO;
+        for step in 0..100 {
+            handoff = Time::from_ms(step as f64);
+            src.tick(handoff, &mut events);
+            if store.borrow()[RequestId(0)].progress.output_tokens_emitted >= 5 {
+                break;
+            }
+        }
+        let emitted = store.borrow()[RequestId(0)].progress.output_tokens_emitted;
+        let ttft = store.borrow()[RequestId(0)].telemetry.first_output_time;
+        assert_eq!(emitted, 5, "the fixture should hand over mid-decode");
+
+        let mut drained = Vec::new();
+        src.drain_resident(handoff, &mut drained);
+        assert_eq!(drained, vec![RequestId(0)]);
+        for request in drained {
+            dst.enqueue(WorkerMsgCommon::Resume {
+                req: request,
+                at: handoff,
+            });
+        }
+
+        events.clear();
+        for step in 0..200 {
+            dst.tick(handoff + Time::from_ms(step as f64), &mut events);
+            if !events.is_empty() {
+                break;
+            }
+        }
+
+        assert_eq!(events.len(), 1, "the destination must complete the request");
+        let requests = store.borrow();
+        let moved = &requests[RequestId(0)];
+        assert!(moved.lifecycle.completed);
+        assert_eq!(
+            moved.progress.output_tokens_emitted, 20,
+            "decode progress must not restart"
+        );
+        assert_eq!(
+            moved.telemetry.first_output_time, ttft,
+            "migration is a recompute, not a new request: TTFT stands"
+        );
+        assert_eq!(moved.telemetry.retraction_count, 1);
+        let episode = moved.telemetry.reprocessed_prefills[0];
+        assert_eq!(episode.output_tokens_before, emitted);
+        assert_eq!(
+            episode.prefill_tokens_processed,
+            4 + emitted,
+            "the destination re-prefills prompt + what was already emitted"
+        );
+        assert!(episode.completed);
+        let codes: Vec<u16> = moved
+            .lifecycle
+            .stage_log
+            .iter()
+            .map(|event| event.code)
+            .collect();
+        let suspended = codes
+            .iter()
+            .position(|code| *code == UnifiedStage::Suspended as u16)
+            .expect("the drain is observable in the stage timeline");
+        assert_eq!(codes[suspended + 1], UnifiedStage::Pending as u16);
+        assert_eq!(
+            moved.lifecycle.stage_log[suspended].worker,
+            WorkerId(0),
+            "the suspension belongs to the worker that gave the request up"
+        );
+        assert_eq!(
+            moved.lifecycle.stage_log[suspended + 1].worker,
+            WorkerId(1),
+            "and the re-queue belongs to the worker that took it over"
+        );
+    }
+
+    fn chunked_worker_named(
+        id: WorkerId,
+        store: SharedRequests,
+        max_batch_tokens: u32,
+    ) -> ChunkedPrefillWorker<FakeModel> {
+        build_chunked_prefill_worker(
+            id,
+            "main",
+            Arc::new(FakeModel::for_ms(1.0)),
+            store,
+            WorkerConfig {
+                max_batch_tokens: Some(max_batch_tokens),
+                ..WorkerConfig::default()
+            },
+            None,
+            PoolId(0),
+            "test-gpu",
+            test_cluster(),
+        )
     }
 }

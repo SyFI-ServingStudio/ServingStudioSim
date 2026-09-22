@@ -194,6 +194,67 @@ impl<P: PendingOrderPolicy, D> ChunkedPrefillAdmission<P, D> {
         request: RequestId,
         now: Time,
     ) {
+        self.enqueue_reprocessed(kv_store, context, usize::from(partition), request, now);
+    }
+
+    /// Queue a request that has not started anywhere: its whole prompt is left
+    /// to prefill and its whole output budget is left to emit.
+    ///
+    /// `entered_at` is when the request reached *this* worker — its arrival
+    /// time for an ordinary admit, and the migration instant for a request
+    /// handed over while still queued. The stage timeline has to move forward.
+    fn enqueue_fresh<K: ChunkedPrefillKv>(
+        &mut self,
+        kv_store: &K,
+        context: &WorkerContext,
+        partition: usize,
+        request: RequestId,
+        entered_at: Time,
+    ) {
+        let (fresh_prompt_tokens, remaining_output_tokens, session_input, conversation_start_time) = {
+            let mut store = context.requests.borrow_mut();
+            let record = &mut store[request];
+            context.stamp_stage(record, entered_at, UnifiedStage::Pending as u16);
+            (
+                record.request.definition.prompt_tokens,
+                record.request.definition.target_output_tokens,
+                record.request.definition.session,
+                record
+                    .request
+                    .definition
+                    .session
+                    .session_start_or(record.request.core.arrival_time),
+            )
+        };
+        let candidate = self.enqueue_sequence.freeze(
+            request,
+            fresh_prompt_tokens,
+            remaining_output_tokens,
+            session_input,
+            conversation_start_time,
+            kv_store.resident_prefix_tokens(fresh_prompt_tokens, session_input),
+        );
+        let (policy, policy_context) = &mut self.partition_policies[partition];
+        debug_assert!(!policy.contains(request));
+        policy.push(candidate, policy_context);
+    }
+
+    /// Queue a request whose KV is gone as a fresh prefill of
+    /// `prompt + emitted` tokens, without resetting its TTFT.
+    ///
+    /// One arithmetic serving two causes: local decode retraction (this worker
+    /// ran out of KV) and migration (another worker handed the request over).
+    /// Both mean the same physical thing — the context is gone and has to be
+    /// recomputed — so they must not drift into two answers for how much work
+    /// is left.
+    fn enqueue_reprocessed<K: ChunkedPrefillKv>(
+        &mut self,
+        kv_store: &K,
+        context: &WorkerContext,
+        partition: usize,
+        request: RequestId,
+        now: Time,
+    ) {
         let (
             reprocessed_input_tokens,
             remaining_output_tokens,
@@ -234,7 +295,7 @@ impl<P: PendingOrderPolicy, D> ChunkedPrefillAdmission<P, D> {
             conversation_start_time,
             resident_prefix_tokens,
         );
-        let (policy, policy_context) = &mut self.partition_policies[partition as usize];
+        let (policy, policy_context) = &mut self.partition_policies[partition];
         policy.push(candidate, policy_context);
     }
 
@@ -289,39 +350,36 @@ where
     type Event = WorkerEventCommon;
 
     fn accept_message(&mut self, kv_store: &mut K, msg: Self::Msg, context: &WorkerContext) {
-        let WorkerMsgCommon::Request(request) = msg;
         debug_assert_eq!(self.partition_policies.len(), kv_store.num_partitions());
-        let (fresh_prompt_tokens, remaining_output_tokens, session_input, conversation_start_time) = {
-            let mut store = context.requests.borrow_mut();
-            let record = &mut store[request];
-            let arrival_time = record.request.core.arrival_time;
-            context.stamp_stage(record, arrival_time, UnifiedStage::Pending as u16);
+        let (request, entered_at) = match msg {
+            WorkerMsgCommon::Request(request) => {
+                let arrival_time = context.requests.borrow()[request].request.core.arrival_time;
+                (request, arrival_time)
+            }
+            WorkerMsgCommon::Resume { req, at } => (req, at),
+        };
+        // A request that never started anywhere carries no progress and no
+        // prefix-cache observation, so it is admitted exactly as a fresh
+        // arrival is. One that did start has already recorded a cache hit and
+        // may have emitted tokens, so its remaining work is a recompute.
+        // `Request` is always the first case; a resume can be either.
+        let (started, session_input) = {
+            let store = context.requests.borrow();
+            let record = &store[request];
             (
-                record.request.definition.prompt_tokens,
-                record.request.definition.target_output_tokens,
+                record.lifecycle.admitted,
                 record.request.definition.session,
-                record
-                    .request
-                    .definition
-                    .session
-                    .session_start_or(arrival_time),
             )
         };
-        let candidate = self.enqueue_sequence.freeze(
-            request,
-            fresh_prompt_tokens,
-            remaining_output_tokens,
-            session_input,
-            conversation_start_time,
-            kv_store.resident_prefix_tokens(fresh_prompt_tokens, session_input),
-        );
         // Placement is frozen when the request enters the worker. Retained KV
         // has hard affinity; cold requests use the same generic balance policy
         // as ordinary local admission.
         let partition = self.choose_partition(kv_store, session_input);
-        let (policy, policy_context) = &mut self.partition_policies[partition];
-        debug_assert!(!policy.contains(request));
-        policy.push(candidate, policy_context);
+        if started {
+            self.enqueue_reprocessed(kv_store, context, partition, request, entered_at);
+        } else {
+            self.enqueue_fresh(kv_store, context, partition, request, entered_at);
+        }
     }
 
     fn form_batch(
@@ -611,9 +669,17 @@ where
                     if finished {
                         if reprocessed {
                             record.complete_reprocessed_prefill();
-                            record.record_token(now, context.log_tokens());
-                        } else {
+                        }
+                        // Which token this is depends on the request, not on
+                        // why it prefilled: a retracted decode already has a
+                        // TTFT and must not reset it, but a request whose
+                        // *prefill* was interrupted — migration can do that,
+                        // local retraction cannot — is still emitting its
+                        // first token and would otherwise never get one.
+                        if record.telemetry.first_output_time.is_none() {
                             record.record_first_token(now, context.log_tokens());
+                        } else {
+                            record.record_token(now, context.log_tokens());
                         }
                         context.stamp_stage(
                             record,
@@ -676,5 +742,26 @@ where
             }
         }
         false
+    }
+
+    fn drain_pending(&mut self, out: &mut Vec<RequestId>) {
+        // Only the not-yet-started queues. A request mid-chunk holds KV and is
+        // therefore the shell's to release; it reaches `forget_admitted`
+        // through that path, not this one, and listing it here would hand the
+        // same id to the destination twice.
+        for (policy, context) in &mut self.partition_policies {
+            while let Some(candidate) = policy.pop(context) {
+                out.push(candidate.request_id);
+            }
+        }
+    }
+
+    fn forget_admitted(&mut self, request: RequestId) {
+        self.prefill_episodes.remove(&request);
+        for active_chunk in &mut self.active_chunks {
+            if active_chunk.is_some_and(|candidate| candidate.request_id == request) {
+                *active_chunk = None;
+            }
+        }
     }
 }

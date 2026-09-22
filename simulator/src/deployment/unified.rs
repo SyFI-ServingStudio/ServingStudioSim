@@ -4,7 +4,8 @@
 //! `build` reads the structured `UnifiedConfig`: a single pool (`main`) with one
 //! homogeneous group. The arch is selected by its explicit tag (NO `tp_size`
 //! dispatch; see the L4/L6 design). Wired arms are
-//! `llama3_dense` + `barebone`, `llama3_dense_tp` + `barebone`,
+//! `llama3_dense` + either `barebone` or `chunked_prefill`, `llama3_dense_tp` +
+//! either of the same two,
 //! `llama3_dp_attn_tp_ffn` + `hp_unified`, and `qwen3_moe_dp_attn_ep_ffn` +
 //! `hp_unified`, `glm52_vllm_dsa_moe` + `hp_unified`, and
 //! `glm52_vllm_nvfp4_dsa_moe` + either `hp_unified` or `chunked_prefill`,
@@ -29,19 +30,19 @@ use anyhow::{bail, ensure};
 use crate::arch::build as arch_build;
 use crate::arch::contract::IterwiseUnifiedModel;
 use crate::arch::{Glm52MtpMode, IterArchSel};
-use crate::common::{PoolId, SharedRequests};
+use crate::common::{PoolId, SharedRequests, Time};
 use crate::deployment::UnifiedConfig;
 use crate::orchestrator::common::WorkerBuildFn;
 use crate::orchestrator::{
-    DpPlacementPolicy, Flow, PlacementPolicy, SimpleDpConfig, SimpleDpFlow, SimpleDpPoolConfig,
-    UnifiedWorkerFactory,
+    DpPlacementPolicy, Flow, MigrationPolicySel, MigrationTrigger, PlacementPolicy, PoolSpec,
+    SimpleDpConfig, SimpleDpFlow, SimpleDpPoolConfig, UnifiedWorkerFactory,
 };
 use crate::timing::PerfApiBridge;
 use crate::worker::{
     build_barebone_worker, build_chunked_prefill_worker, build_hp_worker,
     build_qwen36_hybrid_worker, build_speculative_worker, resolve_prefix_cache_config, BatchPolicy,
-    IterWorker, IterWorkerSel, KvAdmissionConfig, PendingOrderKind, PrefixCacheMode,
-    PrefixCachePolicy, WorkerConfig,
+    IterWorkerSel, KvAdmissionConfig, MigratableWorker, PendingOrderKind, PrefixCacheMode,
+    PrefixCachePolicy, WorkerConfig, WorkerMsgCommon,
 };
 
 use super::Deployment;
@@ -198,6 +199,7 @@ impl Deployment for UnifiedDeployment {
                 num_workers: g.replicas,
                 placement: placement_into(pool.placement),
             },
+            migration: migration_into(pool),
         };
         let log_dir: Option<PathBuf> = Some(cfg.io.log_dir.clone());
         let gpu_name = g.gpu.clone();
@@ -245,34 +247,36 @@ impl Deployment for UnifiedDeployment {
                 ))
             }
             IterArchSel::Llama3Dense { .. } => {
-                ensure_barebone(&g.worker)?;
+                ensure_barebone_or_chunked("llama3_dense", &g.worker)?;
                 let model = Arc::new(arch_build::dense(
                     model_spec, &gpu_name, MODEL_NAME, bridge,
                 )?);
-                Ok(assemble_flow(
+                assemble_barebone_or_chunked_flow(
+                    "llama3_dense",
                     model,
                     store,
                     worker_config,
                     log_dir,
                     gpu_name,
                     dp_cfg,
-                    build_barebone_worker,
-                ))
+                    &g.worker,
+                )
             }
             IterArchSel::Llama3DenseTp { tp_size, .. } => {
-                ensure_barebone(&g.worker)?;
+                ensure_barebone_or_chunked("llama3_dense_tp", &g.worker)?;
                 let model = Arc::new(arch_build::dense_tp(
                     model_spec, *tp_size, &gpu_name, MODEL_NAME, bridge,
                 )?);
-                Ok(assemble_flow(
+                assemble_barebone_or_chunked_flow(
+                    "llama3_dense_tp",
                     model,
                     store,
                     worker_config,
                     log_dir,
                     gpu_name,
                     dp_cfg,
-                    build_barebone_worker,
-                ))
+                    &g.worker,
+                )
             }
             IterArchSel::Llama3DpAttnTpFfn {
                 attn_tp_size,
@@ -654,6 +658,57 @@ fn ensure_hp_unified(worker: &IterWorkerSel) -> anyhow::Result<()> {
     }
 }
 
+/// The dense llama3 archs accept `barebone` or `chunked_prefill`. They differ
+/// only on the admission axis — same `FullAttnKv`, same `UnifiedIterExecution`
+/// — so the pairing is a policy choice, not a type constraint, and a study that
+/// needs chunking (or migration, which only `chunked_prefill` can take over)
+/// should not have to change arch.
+fn ensure_barebone_or_chunked(arch_name: &str, worker: &IterWorkerSel) -> anyhow::Result<()> {
+    match worker {
+        IterWorkerSel::Barebone { .. } | IterWorkerSel::ChunkedPrefill { .. } => Ok(()),
+        other => bail!(
+            "unified: {arch_name} requires worker `barebone` or `chunked_prefill`, got {other:?}"
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn assemble_barebone_or_chunked_flow<M>(
+    arch_name: &str,
+    model: Arc<M>,
+    store: SharedRequests,
+    worker_config: WorkerConfig,
+    log_dir: Option<PathBuf>,
+    gpu_name: String,
+    dp_cfg: SimpleDpConfig,
+    worker: &IterWorkerSel,
+) -> anyhow::Result<Box<dyn Flow>>
+where
+    M: IterwiseUnifiedModel,
+{
+    match worker {
+        IterWorkerSel::Barebone { .. } => Ok(assemble_flow(
+            model,
+            store,
+            worker_config,
+            log_dir,
+            gpu_name,
+            dp_cfg,
+            build_barebone_worker,
+        )),
+        IterWorkerSel::ChunkedPrefill { .. } => Ok(assemble_flow(
+            model,
+            store,
+            worker_config,
+            log_dir,
+            gpu_name,
+            dp_cfg,
+            build_chunked_prefill_worker,
+        )),
+        other => bail!("unified: unsupported {arch_name} worker {other:?}"),
+    }
+}
+
 /// Whole-iteration arches with a captured chunked-prefill runtime may use the
 /// ordinary HP admission recipe or the dedicated hard-cap/chunking recipe.
 fn ensure_hp_or_chunked_worker(arch_name: &str, worker: &IterWorkerSel) -> anyhow::Result<()> {
@@ -717,8 +772,11 @@ where
     // No L4 bound on `M`: `build_fn` already states the model contract its
     // recipe needs, and the speculative recipe's model implements
     // `SpeculativeUnifiedModel` rather than `IterwiseUnifiedModel`.
-    W: IterWorker<Event = crate::worker::WorkerEventCommon> + 'static,
-    W::Msg: From<crate::common::RequestId>,
+    // `MigratableWorker` is what lets this flow carry a migration hook. Every
+    // worker a unified deployment can build satisfies it; the families that
+    // cannot be drained (PD, AFD) never reach this function.
+    W: MigratableWorker<Event = crate::worker::WorkerEventCommon> + 'static,
+    W::Msg: From<crate::common::RequestId> + From<WorkerMsgCommon>,
 {
     let factory = UnifiedWorkerFactory::new(
         model,
@@ -730,6 +788,29 @@ where
         build_fn,
     );
     Box::new(SimpleDpFlow::new(dp_cfg, factory))
+}
+
+/// Build the pool's migration hook, or `None` for the default `off`.
+///
+/// `off` deliberately yields no policy object at all: the flow then skips the
+/// whole hook, so a preset that does not ask for migration runs the same tick
+/// path it ran before migration existed.
+fn migration_into<A, W>(pool: &PoolSpec<A, W>) -> Option<MigrationTrigger> {
+    match pool.migration {
+        MigrationPolicySel::Off => None,
+        MigrationPolicySel::ActiveBatchBelow => Some(MigrationTrigger::active_batch_below(
+            pool.migration_threshold,
+            Time::from_ms(pool.migration_cooldown_ms),
+        )),
+        MigrationPolicySel::TrainGroupSamplesBelow => {
+            Some(MigrationTrigger::train_group_samples_below(
+                pool.migration_threshold,
+                pool.migration_group_size,
+                pool.migration_workers_per_train_group,
+                Time::from_ms(pool.migration_group_latency_ms),
+            ))
+        }
+    }
 }
 
 fn placement_into(p: PlacementPolicy) -> DpPlacementPolicy {
@@ -745,10 +826,10 @@ mod tests {
     use super::*;
     use crate::arch::{
         Glm52VllmDsaMoeModel, Glm52VllmNvfp4DsaMoeModel, Glm52VllmNvfp4DsaMoeSpeculativeModel,
-        Qwen36LocalModel,
+        Llama3DenseModel, Qwen36LocalModel,
     };
     use crate::common::RequestId;
-    use crate::worker::{ChunkedPrefillWorker, HpUnifiedWorker, WorkerEventCommon};
+    use crate::worker::{BareboneWorker, ChunkedPrefillWorker, HpUnifiedWorker, WorkerEventCommon};
 
     fn hp_worker() -> IterWorkerSel {
         IterWorkerSel::HpUnified {
@@ -785,10 +866,12 @@ mod tests {
         }
     }
 
+    /// The contract `assemble_flow` demands: the `IterWorker` surface plus
+    /// drainability, since a unified flow can carry a migration hook.
     fn assert_iter_worker_contract<W>()
     where
-        W: IterWorker<Event = WorkerEventCommon> + 'static,
-        W::Msg: From<RequestId>,
+        W: MigratableWorker<Event = WorkerEventCommon> + 'static,
+        W::Msg: From<RequestId> + From<WorkerMsgCommon>,
     {
     }
 
@@ -803,6 +886,23 @@ mod tests {
         assert_iter_worker_contract::<ChunkedPrefillWorker<Glm52VllmNvfp4DsaMoeModel>>();
         ensure_hp_or_chunked_worker("GLM-4.5 NVFP4", &chunked_prefill_worker())
             .expect("GLM NVFP4 accepts the dedicated chunked-prefill worker");
+    }
+
+    /// The dense llama3 archs take either admission policy. `chunked_prefill`
+    /// is what a migrating pool needs, since only it can re-prefill a request
+    /// whose KV another worker dropped.
+    #[test]
+    fn llama3_dense_pairs_with_barebone_or_chunked_prefill() {
+        assert_iter_worker_contract::<BareboneWorker<Llama3DenseModel>>();
+        assert_iter_worker_contract::<ChunkedPrefillWorker<Llama3DenseModel>>();
+        ensure_barebone_or_chunked("llama3_dense", &barebone_worker())
+            .expect("llama3_dense accepts barebone");
+        ensure_barebone_or_chunked("llama3_dense", &chunked_prefill_worker())
+            .expect("llama3_dense accepts chunked_prefill");
+        let error = ensure_barebone_or_chunked("llama3_dense", &hp_worker())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("`barebone` or `chunked_prefill`"), "{error}");
     }
 
     /// Qwen3.6 local keeps the `barebone` preset tag — cadence, admission and

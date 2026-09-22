@@ -3,9 +3,12 @@
 //! the deployment is tiny, but stay two structs (L6 design.md §「simple DP」).
 
 use crate::common::{PoolId, Request, RequestId, SharedRequests, Time, WorkerId};
-use crate::worker::{CostSource, GpuCluster, IterWorker, SharedGpuCluster, WorkerEventCommon};
+use crate::worker::{
+    CostSource, GpuCluster, IterWorker, MigratableWorker, SharedGpuCluster, WorkerEventCommon,
+    WorkerMsgCommon,
+};
 
-use super::super::migration::WorkerLoad;
+use super::super::migration::{MigrationOrder, MigrationPolicy, MigrationTrigger, WorkerLoad};
 use super::super::{Flow, OrchAction, WorkerFactory};
 
 /// Sentinel for a quiescent worker. `Option<Time>` would add a tag; the simulator
@@ -39,6 +42,12 @@ pub struct SimpleDpPoolConfig {
 /// Config for the whole simple_dp deployment.
 pub struct SimpleDpConfig {
     pub dp_pool: SimpleDpPoolConfig,
+    /// The pool's migration hook, or `None` for the default: never migrate.
+    ///
+    /// `None` rather than a do-nothing policy so a pool that does not opt in
+    /// pays nothing — no per-tick virtual call and no load snapshot — and every
+    /// existing preset keeps today's tick path instruction for instruction.
+    pub migration: Option<MigrationTrigger>,
 }
 
 // ── L6a: pool-local orchestration ─────────────────────────────────────────────
@@ -62,6 +71,123 @@ pub struct SimpleDpPoolController<W: IterWorker> {
     /// Only ever written by `migrate`, which retires the source and requires a
     /// live destination — so the chain is at most one hop and cannot cycle.
     redirect: Vec<WorkerId>,
+    /// Prompt-group bookkeeping, present only while a migration policy is
+    /// installed. Nothing else in the pool needs it, and a pool that never
+    /// migrates should not pay to maintain it.
+    groups: Option<GroupLedger>,
+}
+
+/// Which worker holds each prompt group, and how much of each group is left.
+///
+/// A *prompt group* is a block of `size` consecutive request ids. The group is
+/// in flight until its last member completes — the reading an RL rollout needs,
+/// because a training step cannot consume a prompt's samples until the slowest
+/// one lands, so a nearly-finished group still pins a worker.
+///
+/// Derived from the id rather than declared per request: the trace formats that
+/// carry grouped work number their samples in contiguous blocks, and a column
+/// would have to be validated against that anyway. A mismatch is caught, not
+/// tolerated — see the split-group assertion in `arrived`.
+#[derive(Debug)]
+struct GroupLedger {
+    size: u32,
+    /// Worker currently holding each group, by group id.
+    host: Vec<WorkerId>,
+    /// Members of each group not yet complete, by group id.
+    unfinished: Vec<u32>,
+    /// Groups with at least one unfinished member, by worker index.
+    per_worker: Vec<u32>,
+    /// Requests completed on each worker. A policy that fires on a drop in
+    /// load needs to tell "this block has drained" from "this block has not
+    /// started yet", and the two look identical in `per_worker` alone.
+    completed_per_worker: Vec<u32>,
+}
+
+impl GroupLedger {
+    fn new(size: u32, num_workers: usize) -> Self {
+        assert!(size > 0, "a prompt group needs at least one request");
+        Self {
+            size,
+            host: Vec::new(),
+            unfinished: Vec::new(),
+            per_worker: vec![0; num_workers],
+            completed_per_worker: vec![0; num_workers],
+        }
+    }
+
+    fn group_of(&self, request: RequestId) -> usize {
+        request.0 as usize / self.size as usize
+    }
+
+    fn arrived(&mut self, request: RequestId, worker: WorkerId) {
+        let group = self.group_of(request);
+        if group >= self.unfinished.len() {
+            self.unfinished.resize(group + 1, 0);
+            self.host.resize(group + 1, worker);
+        }
+        if self.unfinished[group] == 0 {
+            self.host[group] = worker;
+            self.per_worker[worker.0 as usize] += 1;
+        } else {
+            assert_eq!(
+                self.host[group], worker,
+                "prompt group {group} is split across workers {:?} and {worker:?}; \
+                 a group-counting migration policy needs each group on one worker",
+                self.host[group],
+            );
+        }
+        self.unfinished[group] += 1;
+    }
+
+    fn completed(&mut self, request: RequestId) {
+        let group = self.group_of(request);
+        let host = self.host[group].0 as usize;
+        let left = &mut self.unfinished[group];
+        assert!(*left > 0, "prompt group {group} completed more than it holds");
+        *left -= 1;
+        if *left == 0 {
+            self.per_worker[host] -= 1;
+        }
+        self.completed_per_worker[host] += 1;
+    }
+
+    /// Groups still in flight on `worker`, lowest id first — the order a
+    /// `Scatter` deals destinations out in.
+    fn resident(&self, worker: WorkerId, out: &mut Vec<usize>) {
+        out.clear();
+        out.extend(
+            (0..self.unfinished.len())
+                .filter(|group| self.unfinished[*group] > 0 && self.host[*group] == worker),
+        );
+    }
+
+    /// The lowest-id group still in flight on `worker` — the one a `MoveGroup`
+    /// hands over. Same ordering as [`Self::resident`], so a release that moves
+    /// its groups one at a time visits them in the order a `Scatter` would have
+    /// dealt them out.
+    fn first_resident(&self, worker: WorkerId) -> Option<usize> {
+        (0..self.unfinished.len())
+            .find(|group| self.unfinished[*group] > 0 && self.host[*group] == worker)
+    }
+
+    /// Every request id belonging to `group`, finished or not. Ids are numbered
+    /// in consecutive blocks, so this is arithmetic rather than a lookup — and
+    /// the caller hands the whole block to the worker, which knows which of them
+    /// it is actually still holding.
+    fn members(&self, group: usize) -> Vec<RequestId> {
+        let first = group as u32 * self.size;
+        (first..first + self.size).map(RequestId).collect()
+    }
+
+    fn moved(&mut self, group: usize, to: WorkerId) {
+        let from = self.host[group];
+        if from == to {
+            return;
+        }
+        self.per_worker[from.0 as usize] -= 1;
+        self.per_worker[to.0 as usize] += 1;
+        self.host[group] = to;
+    }
 }
 
 impl<W: IterWorker> SimpleDpPoolController<W> {
@@ -86,6 +212,28 @@ impl<W: IterWorker> SimpleDpPoolController<W> {
             workers,
             placement: cfg.placement,
             rr_next: 0,
+            groups: None,
+        }
+    }
+
+    /// Start counting prompt groups of `size` requests. Called once, when a
+    /// migration policy is installed; a pool without one never tracks them.
+    pub fn track_groups(&mut self, size: u32) {
+        self.groups = Some(GroupLedger::new(size, self.workers.len()));
+    }
+
+    /// Record that `request` has been placed on `worker`. Separate from the
+    /// enqueue itself because a resume is not an arrival: the ledger already
+    /// counts a migrated request, and re-counting it would double its group.
+    pub fn note_arrival(&mut self, request: RequestId, worker: WorkerId) {
+        if let Some(groups) = self.groups.as_mut() {
+            groups.arrived(request, worker);
+        }
+    }
+
+    pub fn note_completion(&mut self, request: RequestId) {
+        if let Some(groups) = self.groups.as_mut() {
+            groups.completed(request);
         }
     }
 
@@ -113,7 +261,10 @@ impl<W: IterWorker> SimpleDpPoolController<W> {
     /// `worker_id` is outside this pool — silently dropping the ack would
     /// leak the held reservation forever, so a bad id is treated as a bug.
     pub fn route_msg_to(&mut self, worker_id: WorkerId, msg: W::Msg) {
-        let idx = worker_id.0 as usize;
+        self.enqueue_at(worker_id.0 as usize, msg);
+    }
+
+    fn enqueue_at(&mut self, idx: usize, msg: W::Msg) {
         self.workers[idx].enqueue(msg);
         if self.worker_wakeup_times[idx] == NO_WAKEUP_TIME {
             self.worker_wakeup_times[idx] = Time::ZERO;
@@ -189,6 +340,14 @@ impl<W: IterWorker> SimpleDpPoolController<W> {
                 worker: WorkerId(idx as u16),
                 queued_requests: status.queued_requests,
                 active_requests: status.active_requests,
+                in_flight_groups: self
+                    .groups
+                    .as_ref()
+                    .map_or(0, |groups| groups.per_worker[idx]),
+                completed_requests: self
+                    .groups
+                    .as_ref()
+                    .map_or(0, |groups| groups.completed_per_worker[idx]),
                 retired: self.redirect[idx] != WorkerId(idx as u16),
             }
         }));
@@ -227,7 +386,168 @@ where
     /// Admit a fresh request (the universal entry) — wraps in the chosen
     /// worker's `W::Msg::from(rid)`. PD-side admits via `admit_msg` directly.
     pub fn admit(&mut self, rid: RequestId) {
-        self.admit_msg(W::Msg::from(rid));
+        let idx = self.choose_worker_idx();
+        self.note_arrival(rid, WorkerId(idx as u16));
+        self.enqueue_at(idx, W::Msg::from(rid));
+    }
+
+    /// Admit a fresh request to a *named* worker — the trace-directed entry.
+    /// Unlike `route_msg_to` this is an arrival, so it reaches the ledger.
+    pub fn admit_to(&mut self, worker: WorkerId, rid: RequestId) {
+        self.note_arrival(rid, worker);
+        self.enqueue_at(worker.0 as usize, W::Msg::from(rid));
+    }
+}
+
+// Migration is a capability, not part of the pool contract: the extra bounds
+// live on their own impl block so PD's pools — which reuse this controller with
+// a non-migratable worker — are unaffected.
+impl<W: MigratableWorker> SimpleDpPoolController<W>
+where
+    W::Msg: From<WorkerMsgCommon>,
+{
+    /// Execute one order: drain `src`, retire it onto `dst`, and re-admit every
+    /// drained request there. Returns how many requests moved.
+    ///
+    /// L6 never learns what happens to those requests. It asks the source to
+    /// give them up and hands the ids to the destination; whether the
+    /// destination recomputes them, and how much work that is, belongs to L5.
+    ///
+    /// Panics on `src == dst`, an out-of-pool id, or a destination that has
+    /// itself been retired. All three are policy bugs, and quietly skipping any
+    /// of them would strand requests on a worker nothing routes to again.
+    pub fn migrate(
+        &mut self,
+        now: Time,
+        order: &MigrationOrder,
+        scratch: &mut Vec<RequestId>,
+    ) -> usize {
+        let src = order.src().0 as usize;
+        assert!(
+            src < self.workers.len(),
+            "migration {order:?} names a worker outside a pool of {}",
+            self.workers.len()
+        );
+        match order {
+            MigrationOrder::Consolidate { src: _, dst } => {
+                self.check_destination(order, *dst);
+                assert_ne!(order.src(), *dst, "a migration must name two workers");
+                scratch.clear();
+                self.workers[src].drain_resident(now, scratch);
+                self.retire(src, *dst);
+                for request in std::mem::take(scratch) {
+                    self.resume_on(now, *dst, request);
+                    scratch.push(request);
+                }
+                scratch.len()
+            }
+            MigrationOrder::Scatter {
+                src: _,
+                dsts,
+                retire_to,
+            } => {
+                // Where each group is must be read before the drain: draining
+                // is what makes the source's residency empty, and the ledger is
+                // the only record of which request belongs to which group.
+                let mut resident = Vec::new();
+                if let Some(groups) = self.groups.as_ref() {
+                    groups.resident(order.src(), &mut resident);
+                }
+                assert_eq!(
+                    resident.len(),
+                    dsts.len(),
+                    "migration {order:?} names {} destination(s) for {} in-flight group(s); \
+                     the policy and the pool disagree about what the source holds",
+                    dsts.len(),
+                    resident.len(),
+                );
+                self.check_destination(order, *retire_to);
+                assert_ne!(
+                    order.src(),
+                    *retire_to,
+                    "a released worker must redirect somewhere other than itself"
+                );
+                for dst in dsts {
+                    self.check_destination(order, *dst);
+                    assert_ne!(order.src(), *dst, "a migration must name two workers");
+                }
+
+                scratch.clear();
+                self.workers[src].drain_resident(now, scratch);
+                self.retire(src, *retire_to);
+                let drained = std::mem::take(scratch);
+                for (group, dst) in resident.iter().zip(dsts) {
+                    if let Some(groups) = self.groups.as_mut() {
+                        groups.moved(*group, *dst);
+                    }
+                }
+                for request in &drained {
+                    let dst = self
+                        .groups
+                        .as_ref()
+                        .map(|groups| groups.host[groups.group_of(*request)])
+                        .expect("a scatter needs the group ledger a migration policy installs");
+                    self.resume_on(now, dst, *request);
+                }
+                *scratch = drained;
+                scratch.len()
+            }
+            MigrationOrder::MoveGroup { src: _, dst } => {
+                self.check_destination(order, *dst);
+                assert_ne!(order.src(), *dst, "a migration must name two workers");
+                let groups = self
+                    .groups
+                    .as_ref()
+                    .expect("a group move needs the group ledger a migration policy installs");
+                let group = groups.first_resident(order.src()).unwrap_or_else(|| {
+                    panic!("migration {order:?} moves a group off a worker holding none")
+                });
+                let members = groups.members(group);
+                scratch.clear();
+                // The source keeps running: only this group's requests leave,
+                // and the worker is neither retired nor redirected. That is the
+                // whole point — a block being handed back one group at a time is
+                // still a working engine until its last group is gone.
+                self.workers[src].drain_requests(now, &members, scratch);
+                self.groups
+                    .as_mut()
+                    .expect("checked above")
+                    .moved(group, *dst);
+                for request in std::mem::take(scratch) {
+                    self.resume_on(now, *dst, request);
+                    scratch.push(request);
+                }
+                scratch.len()
+            }
+        }
+    }
+
+    fn check_destination(&self, order: &MigrationOrder, dst: WorkerId) {
+        let idx = dst.0 as usize;
+        assert!(
+            idx < self.workers.len(),
+            "migration {order:?} names a worker outside a pool of {}",
+            self.workers.len()
+        );
+        assert_eq!(
+            self.redirect[idx], dst,
+            "migration {order:?} targets a worker that was itself retired"
+        );
+    }
+
+    /// Take `src` out of the pool. Later trace arrivals pinned to it follow the
+    /// work that already left rather than refilling a machine being emptied.
+    fn retire(&mut self, src: usize, to: WorkerId) {
+        self.redirect[src] = to;
+        // The source keeps whatever wakeup it had: an in-flight forward pass is
+        // still running on its GPU even though its requests have left.
+    }
+
+    fn resume_on(&mut self, now: Time, dst: WorkerId, request: RequestId) {
+        self.enqueue_at(
+            dst.0 as usize,
+            W::Msg::from(WorkerMsgCommon::Resume { req: request, at: now }),
+        );
     }
 }
 
@@ -246,6 +566,19 @@ pub struct SimpleDpFlow<W: IterWorker<Event = WorkerEventCommon>> {
     /// deployment's workers only emit `RequestComplete`) into it during
     /// `tick_collect`, then it is drained here and cleared for the next tick.
     events: Vec<WorkerEventCommon>,
+    /// The pool's migration hook, or `None` when the pool never migrates — the
+    /// default, and the reason the untouched tick path stays free of both the
+    /// virtual call and the snapshot below.
+    ///
+    /// Boxed as a trait object so a study can plug its own rule in a test
+    /// without the flow gaining a type parameter that every deployment, preset
+    /// and factory would then have to spell out.
+    migration: Option<Box<dyn MigrationPolicy>>,
+    /// Reused per-tick migration scratch, allocated only on the first tick that
+    /// actually runs a policy.
+    loads: Vec<WorkerLoad>,
+    orders: Vec<MigrationOrder>,
+    migrated: Vec<RequestId>,
 }
 
 impl<W> SimpleDpFlow<W>
@@ -264,20 +597,43 @@ where
         let cluster: SharedGpuCluster = std::rc::Rc::new(std::cell::RefCell::new(GpuCluster::new(
             CostSource::analytic(f64::INFINITY),
         )));
-        let dp_pool = SimpleDpPoolController::new(&cfg.dp_pool, &factory, &cluster);
+        let mut dp_pool = SimpleDpPoolController::new(&cfg.dp_pool, &factory, &cluster);
+        if let Some(trigger) = cfg.migration.as_ref() {
+            dp_pool.track_groups(trigger.group_size());
+        }
         Self {
             requests,
             dp_pool,
             cluster,
             events: Vec::new(),
+            migration: cfg
+                .migration
+                .map(|trigger| Box::new(trigger) as Box<dyn MigrationPolicy>),
+            loads: Vec::new(),
+            orders: Vec::new(),
+            migrated: Vec::new(),
         }
+    }
+
+    /// Install a migration hook this deployment's presets cannot name — the
+    /// "function hook" half of the policy surface, used by studies and tests
+    /// that implement [`MigrationPolicy`] themselves.
+    pub fn set_migration_policy(
+        &mut self,
+        policy: Option<Box<dyn MigrationPolicy>>,
+        group_size: u32,
+    ) {
+        if policy.is_some() {
+            self.dp_pool.track_groups(group_size);
+        }
+        self.migration = policy;
     }
 }
 
 impl<W> Flow for SimpleDpFlow<W>
 where
-    W: IterWorker<Event = WorkerEventCommon>,
-    W::Msg: From<RequestId>,
+    W: MigratableWorker<Event = WorkerEventCommon>,
+    W::Msg: From<RequestId> + From<WorkerMsgCommon>,
 {
     fn on_arrival(&mut self, req: Request) {
         let rid = req.core.id;
@@ -292,7 +648,7 @@ where
                     self.dp_pool.num_workers(),
                 );
                 let host = self.dp_pool.resolve(target);
-                self.dp_pool.route_msg_to(host, W::Msg::from(rid));
+                self.dp_pool.admit_to(host, rid);
             }
             // Both mismatches are configuration errors, and both are refused
             // rather than papered over: falling back to a load policy would
@@ -311,12 +667,30 @@ where
     }
 
     fn tick(&mut self, now: Time) -> Vec<OrchAction> {
+        // Migration runs before the workers tick, so a destination can start
+        // prefilling what it just took over in this same tick, and so every
+        // decision reads the state at the tick boundary rather than a
+        // half-advanced pool.
+        if let Some(policy) = self.migration.as_mut() {
+            self.dp_pool.snapshot_loads(&mut self.loads);
+            self.orders.clear();
+            policy.decide(now, &self.loads, &mut self.orders);
+            // Moved out and back so `migrate` can borrow the pool mutably while
+            // the order list keeps its allocation across ticks.
+            let mut orders = std::mem::take(&mut self.orders);
+            for order in orders.drain(..) {
+                self.dp_pool.migrate(now, &order, &mut self.migrated);
+            }
+            self.orders = orders;
+        }
+
         let mut events = std::mem::take(&mut self.events);
         events.clear();
         self.dp_pool.tick_collect(now, &mut events);
         let mut actions = Vec::new();
         for ev in events.drain(..) {
             let WorkerEventCommon::RequestComplete { req, .. } = ev;
+            self.dp_pool.note_completion(req);
             actions.push(OrchAction::Complete { req });
         }
         self.events = events;
@@ -334,7 +708,11 @@ mod tests {
     use crate::common::RequestStore;
     use crate::orchestrator::UnifiedWorkerFactory;
     use crate::test_helpers::{text_request, text_request_on, FakeModel};
-    use crate::worker::{build_barebone_worker, BareboneWorker, WorkerConfig};
+    use crate::common::UnifiedStage;
+    use crate::worker::{
+        build_barebone_worker, build_chunked_prefill_worker, BareboneWorker, ChunkedPrefillWorker,
+        WorkerConfig,
+    };
     use std::cell::RefCell;
     use std::rc::Rc;
     use std::sync::Arc;
@@ -342,6 +720,14 @@ mod tests {
     fn build_flow(
         num_workers: u16,
         placement: DpPlacementPolicy,
+    ) -> (SimpleDpFlow<BareboneWorker<FakeModel>>, SharedRequests) {
+        build_flow_with(num_workers, placement, None)
+    }
+
+    fn build_flow_with(
+        num_workers: u16,
+        placement: DpPlacementPolicy,
+        migration: Option<MigrationTrigger>,
     ) -> (SimpleDpFlow<BareboneWorker<FakeModel>>, SharedRequests) {
         let store: SharedRequests = Rc::new(RefCell::new(RequestStore::new()));
         let factory = UnifiedWorkerFactory::new(
@@ -359,6 +745,7 @@ mod tests {
                 num_workers,
                 placement,
             },
+            migration,
         };
         (SimpleDpFlow::new(cfg, factory), store)
     }
@@ -498,5 +885,322 @@ mod tests {
     fn a_target_outside_the_pool_is_refused() {
         let (mut flow, _store) = build_flow(2, DpPlacementPolicy::TraceDirected);
         flow.on_arrival(text_request_on(RequestId(0), 8, 2, Time::ZERO, WorkerId(5)));
+    }
+
+    // ── Migration ─────────────────────────────────────────────────────────────
+
+    /// A chunked-prefill pool: the family that can take a resumed request over,
+    /// because it already re-prefills a request whose KV it dropped.
+    fn build_chunked_flow(
+        num_workers: u16,
+        placement: DpPlacementPolicy,
+        migration: Option<MigrationTrigger>,
+    ) -> (
+        SimpleDpFlow<ChunkedPrefillWorker<FakeModel>>,
+        SharedRequests,
+    ) {
+        let store: SharedRequests = Rc::new(RefCell::new(RequestStore::new()));
+        let factory = UnifiedWorkerFactory::new(
+            Arc::new(FakeModel::for_ms(1.0)),
+            Rc::clone(&store),
+            WorkerConfig {
+                max_batch_tokens: Some(64),
+                ..WorkerConfig::default()
+            },
+            None,
+            "test-gpu".to_string(),
+            "main",
+            build_chunked_prefill_worker::<FakeModel>,
+        );
+        let cfg = SimpleDpConfig {
+            dp_pool: SimpleDpPoolConfig {
+                pool: PoolId(0),
+                num_workers,
+                placement,
+            },
+            migration,
+        };
+        (SimpleDpFlow::new(cfg, factory), store)
+    }
+
+    /// The "function hook" a study writes: one order at a chosen time, so the
+    /// test pins migration mechanics rather than a trigger's heuristics.
+    struct MigrateOnce {
+        at: Time,
+        order: MigrationOrder,
+        fired: bool,
+    }
+
+    impl MigrationPolicy for MigrateOnce {
+        fn decide(&mut self, now: Time, _loads: &[WorkerLoad], out: &mut Vec<MigrationOrder>) {
+            if !self.fired && now >= self.at {
+                self.fired = true;
+                out.push(self.order.clone());
+            }
+        }
+    }
+
+    fn stage_codes(store: &SharedRequests, req: RequestId) -> Vec<u16> {
+        store.borrow()[req]
+            .lifecycle
+            .stage_log
+            .iter()
+            .map(|event| event.code)
+            .collect()
+    }
+
+    #[test]
+    fn a_pool_never_migrates_unless_it_was_asked_to() {
+        // The default has to be free as well as inert: `None`, not a boxed
+        // policy that decides to do nothing every tick.
+        let (mut flow, store) = build_flow(2, DpPlacementPolicy::RoundRobin);
+        assert!(flow.migration.is_none(), "migration is opt-in");
+
+        for id in 0..5u32 {
+            flow.on_arrival(text_request(RequestId(id), 8, 3, Time::ZERO));
+        }
+        let completed = drain_to_completion(&mut flow);
+
+        assert_eq!(completed, (0..5).map(RequestId).collect::<Vec<_>>());
+        for id in 0..5u32 {
+            let request = RequestId(id);
+            assert_eq!(store.borrow()[request].telemetry.retraction_count, 0);
+            assert!(
+                !stage_codes(&store, request).contains(&(UnifiedStage::Suspended as u16)),
+                "request {id} was suspended by a pool that has no migration policy"
+            );
+            let visited = workers_visited(&store, request);
+            assert!(
+                visited.iter().all(|worker| *worker == visited[0]),
+                "request {id} moved workers without a migration policy: {visited:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn releasing_a_train_group_moves_each_prompt_group_whole() {
+        // Four workers in two blocks of two, prompt groups of two requests.
+        // Block 0 holds a short group on worker 0 and a long one on worker 1;
+        // block 1 holds six groups and stays busy throughout. Once the short
+        // group lands, block 0 is down to one group — 2 samples, under the
+        // 6-sample threshold — and the block is handed back.
+        //
+        // The assertion that matters is cohesion: both members of the long
+        // group must land on the SAME destination. The policy counts load in
+        // whole groups, so a group split across two workers would be counted
+        // twice for the rest of the run.
+        let (mut flow, store) = build_chunked_flow(
+            4,
+            DpPlacementPolicy::TraceDirected,
+            Some(MigrationTrigger::train_group_samples_below(6, 2, 2, Time::ZERO)),
+        );
+        let declared = |id: u32| match id {
+            0..=1 => WorkerId(0),
+            2..=3 => WorkerId(1),
+            4..=9 => WorkerId(2),
+            _ => WorkerId(3),
+        };
+        for id in 0..16u32 {
+            let output = if id < 2 { 2 } else { 30 };
+            flow.on_arrival(text_request_on(
+                RequestId(id),
+                8,
+                output,
+                Time::ZERO,
+                declared(id),
+            ));
+        }
+        const LATE: RequestId = RequestId(16);
+
+        let mut completed = Vec::new();
+        for step in 0..900u64 {
+            let now = Time::from_ms(step as f64);
+            if step == 200 {
+                flow.on_arrival(text_request_on(LATE, 8, 2, now, WorkerId(0)));
+            }
+            for action in flow.tick(now) {
+                let OrchAction::Complete { req } = action;
+                completed.push(req);
+            }
+        }
+
+        assert_eq!(completed.len(), 17, "a release must not lose or duplicate work");
+        let landed = |id: u32| {
+            *workers_visited(&store, RequestId(id))
+                .last()
+                .expect("a completed request has stages")
+        };
+        assert_eq!(
+            landed(2),
+            landed(3),
+            "the long prompt group was split across {:?} and {:?}",
+            landed(2),
+            landed(3)
+        );
+        assert!(
+            landed(2).0 >= 2,
+            "the long group stayed on the released block: {:?}",
+            landed(2)
+        );
+        for id in 2..4u32 {
+            let request = RequestId(id);
+            assert_eq!(
+                store.borrow()[request].telemetry.retraction_count,
+                1,
+                "request {id} moved, so it must have re-prefilled exactly once"
+            );
+            assert!(
+                stage_codes(&store, request).contains(&(UnifiedStage::Suspended as u16)),
+                "request {id} moved without recording a suspension"
+            );
+        }
+        for id in 0..2u32 {
+            assert_eq!(
+                store.borrow()[RequestId(id)].telemetry.retraction_count,
+                0,
+                "request {id} finished before the release and must not have moved"
+            );
+        }
+        // Worker 0 held nothing by the time the block fired, and is retired all
+        // the same: a block is only useful to training once all of it is free.
+        assert!(
+            landed(16).0 >= 2,
+            "a row pinned to a released worker must follow the work that left: {:?}",
+            landed(16)
+        );
+    }
+
+    #[test]
+    fn migration_drains_the_source_and_redirects_what_the_trace_sends_it_later() {
+        let (mut flow, store) = build_chunked_flow(2, DpPlacementPolicy::TraceDirected, None);
+        flow.set_migration_policy(
+            Some(Box::new(MigrateOnce {
+                at: Time::from_ms(3.0),
+                order: MigrationOrder::Consolidate {
+                    src: WorkerId(0),
+                    dst: WorkerId(1),
+                },
+                fired: false,
+            })),
+            1,
+        );
+        // Every row names worker 0, including the one that arrives after the
+        // pool has already emptied it.
+        for id in 0..3u32 {
+            flow.on_arrival(text_request_on(RequestId(id), 8, 6, Time::ZERO, WorkerId(0)));
+        }
+        const LATE: RequestId = RequestId(3);
+
+        let mut completed = Vec::new();
+        for step in 0..500u64 {
+            let now = Time::from_ms(step as f64);
+            if step == 10 {
+                flow.on_arrival(text_request_on(LATE, 8, 2, now, WorkerId(0)));
+            }
+            for action in flow.tick(now) {
+                let OrchAction::Complete { req } = action;
+                completed.push(req);
+            }
+        }
+
+        completed.sort_by_key(|request| request.0);
+        assert_eq!(
+            completed,
+            vec![RequestId(0), RequestId(1), RequestId(2), LATE],
+            "a migration must not lose or duplicate a request"
+        );
+        for id in 0..3u32 {
+            let request = RequestId(id);
+            let codes = stage_codes(&store, request);
+            let suspended = codes
+                .iter()
+                .position(|code| *code == UnifiedStage::Suspended as u16)
+                .unwrap_or_else(|| panic!("request {id} never left worker 0: {codes:?}"));
+            assert_eq!(codes[suspended + 1], UnifiedStage::Pending as u16);
+            let visited = workers_visited(&store, request);
+            assert_eq!(visited[suspended], WorkerId(0));
+            assert_eq!(visited[suspended + 1], WorkerId(1));
+            let record = &store.borrow()[request];
+            assert_eq!(record.telemetry.retraction_count, 1);
+            assert!(
+                record.telemetry.first_output_time.unwrap()
+                    <= record.lifecycle.stage_log[suspended].time,
+                "a migrated request keeps the TTFT it already earned"
+            );
+        }
+        assert_eq!(
+            workers_visited(&store, LATE).first(),
+            Some(&WorkerId(1)),
+            "a row pinned to a retired worker must follow the work that left it"
+        );
+    }
+
+    #[test]
+    fn a_group_move_takes_one_group_and_leaves_the_source_running() {
+        // Two prompt groups of two on worker 0. Moving one must take exactly
+        // that group's requests, leave the other group where it is, and leave
+        // worker 0 a working member of the pool — unretired, so a later arrival
+        // pinned to it still lands on it. That last part is what separates this
+        // from `Scatter`: a block being handed back one group at a time is not
+        // gone until its last group is.
+        let (mut flow, store) = build_chunked_flow(2, DpPlacementPolicy::TraceDirected, None);
+        flow.set_migration_policy(
+            Some(Box::new(MigrateOnce {
+                at: Time::from_ms(3.0),
+                order: MigrationOrder::MoveGroup {
+                    src: WorkerId(0),
+                    dst: WorkerId(1),
+                },
+                fired: false,
+            })),
+            2,
+        );
+        for id in 0..4u32 {
+            flow.on_arrival(text_request_on(RequestId(id), 8, 6, Time::ZERO, WorkerId(0)));
+        }
+        // Ids are dense, so the late row opens a third group of its own.
+        const LATE: RequestId = RequestId(4);
+
+        let mut completed = Vec::new();
+        for step in 0..500u64 {
+            let now = Time::from_ms(step as f64);
+            if step == 10 {
+                flow.on_arrival(text_request_on(LATE, 8, 2, now, WorkerId(0)));
+            }
+            for action in flow.tick(now) {
+                let OrchAction::Complete { req } = action;
+                completed.push(req);
+            }
+        }
+
+        completed.sort_by_key(|request| request.0);
+        assert_eq!(
+            completed,
+            vec![RequestId(0), RequestId(1), RequestId(2), RequestId(3), LATE],
+        );
+        // Group 0 is ids 0 and 1 — the lowest-id group resident on the source.
+        for id in 0..2u32 {
+            let visited = workers_visited(&store, RequestId(id));
+            assert_eq!(
+                visited.last(),
+                Some(&WorkerId(1)),
+                "request {id} belongs to the moved group"
+            );
+            assert_eq!(store.borrow()[RequestId(id)].telemetry.retraction_count, 1);
+        }
+        for id in 2..4u32 {
+            assert!(
+                workers_visited(&store, RequestId(id))
+                    .iter()
+                    .all(|worker| *worker == WorkerId(0)),
+                "request {id} was not in the moved group and must not have moved"
+            );
+            assert_eq!(store.borrow()[RequestId(id)].telemetry.retraction_count, 0);
+        }
+        assert_eq!(
+            workers_visited(&store, LATE).first(),
+            Some(&WorkerId(0)),
+            "a group move does not retire its source, so the trace still reaches it"
+        );
     }
 }

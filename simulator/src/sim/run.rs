@@ -578,6 +578,7 @@ mod tests {
                 num_workers: 2,
                 placement: DpPlacementPolicy::RoundRobin,
             },
+            migration: None,
         };
         let mut flow = SimpleDpFlow::new(cfg, factory);
         let mut frontend = TraceFrontend::load(
@@ -645,6 +646,7 @@ mod tests {
                 num_workers: 1,
                 placement: DpPlacementPolicy::RoundRobin,
             },
+            migration: None,
         };
         let mut flow = SimpleDpFlow::new(cfg, factory);
         let mut frontend = TraceFrontend::load(

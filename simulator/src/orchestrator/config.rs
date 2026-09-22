@@ -50,9 +50,14 @@ pub enum MigrationPolicySel {
     /// Drain a worker whose active batch has fallen below
     /// `migration_threshold` onto the busiest remaining worker.
     ActiveBatchBelow,
+    /// Hand a whole block of `migration_workers_per_train_group` workers back at
+    /// once, when the samples still in flight across it fall below
+    /// `migration_threshold`, scattering its prompt groups over the workers of
+    /// the other blocks.
+    TrainGroupSamplesBelow,
 }
 
-const MIGRATION_CHOICES: [&str; 2] = ["off", "active-batch-below"];
+const MIGRATION_CHOICES: [&str; 3] = ["off", "active-batch-below", "train-group-samples-below"];
 
 /// One pool: a placement policy plus one-or-more homogeneous groups.
 #[derive(Debug, Clone, Deserialize, ParamStruct)]
@@ -65,17 +70,40 @@ pub struct PoolSpec<Arch, Worker> {
     #[serde(default)]
     #[param(string, default = "off", choices = MIGRATION_CHOICES)]
     pub migration: MigrationPolicySel,
-    /// `active-batch-below`: the active-batch count under which a worker
-    /// becomes a drain candidate. Read only by that policy.
+    /// The count under which a migration fires. `active-batch-below` reads it
+    /// as one worker's active batch; `train-group-samples-below` reads it as the
+    /// samples still in flight across a whole block of workers.
     #[serde(default = "default_migration_threshold")]
     #[param(default = 32)]
     pub migration_threshold: u32,
+    /// Requests per prompt group, numbered in consecutive id blocks. One means
+    /// "no grouping". Read only by `train-group-samples-below`, which counts a
+    /// group's full size until its slowest member lands.
+    #[serde(default = "default_migration_group_size")]
+    #[param(default = 1)]
+    pub migration_group_size: u32,
+    /// Workers per train group, blocked by worker id. Read only by
+    /// `train-group-samples-below`, which releases a whole block at a time
+    /// because a block is useful to training only once all of it is free.
+    #[serde(default = "default_migration_workers_per_train_group")]
+    #[param(default = 1)]
+    pub migration_workers_per_train_group: u16,
     /// Minimum sim time between two migrations of this pool. Zero lets the
     /// policy fire on consecutive ticks, which is only sane for a trigger that
     /// cannot re-arm — the built-in one retires its source, so it cannot.
     #[serde(default)]
     #[param(default = 0.0)]
     pub migration_cooldown_ms: f64,
+    /// What handing back one prompt group costs in wall clock. Read only by
+    /// `train-group-samples-below`. Zero, the default, releases a block in one
+    /// step; anything positive makes it hand its groups over one at a time,
+    /// `migration_group_latency_ms` apart, decoding what it still holds the
+    /// whole way out and retiring only once the last one has left. A real
+    /// router aborts and re-dispatches one group at a time, so a block holding
+    /// fifteen of them takes ten seconds to go.
+    #[serde(default)]
+    #[param(default = 0.0)]
+    pub migration_group_latency_ms: f64,
     #[param(skip)]
     pub groups: Vec<GroupSpec<Arch, Worker>>,
 }
@@ -84,6 +112,14 @@ pub struct PoolSpec<Arch, Worker> {
 /// field gets the same number the launcher would have filled in.
 const fn default_migration_threshold() -> u32 {
     32
+}
+
+const fn default_migration_group_size() -> u32 {
+    1
+}
+
+const fn default_migration_workers_per_train_group() -> u16 {
+    1
 }
 
 /// One homogeneous group: a GPU type, a replica count (= DP fan-out), and the

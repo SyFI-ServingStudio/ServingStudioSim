@@ -82,6 +82,15 @@ impl IterBatchPlan {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkerMsgCommon {
     Request(RequestId),
+    /// Take over a request another worker drained: its KV is already gone, and
+    /// its remaining work is a fresh prefill of `prompt + emitted` tokens.
+    ///
+    /// Carries no lengths — the receiver reads the shared record, which is the
+    /// only copy of how far the request actually got. `at` is here because
+    /// `enqueue` has no clock and the `Request` arm stamps its stage at the
+    /// request's *arrival* time; reusing that for a resume would run the
+    /// location timeline backwards. Same shape as `PdPrefillMsg::ReleaseKv`.
+    Resume { req: RequestId, at: Time },
 }
 
 /// Universal completion event. Worker types that have no role-specific events

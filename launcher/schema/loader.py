@@ -166,8 +166,10 @@ def _merge_backends_file(preset: dict, source: str) -> dict:
         preset["backends"] = _unflatten_backends(flat, "backends")
     return preset
 
-# Fixed skeleton key sets for the uniform pool shape (L6/L7 design).
-_POOL_KEYS = frozenset({"placement", "groups"})
+# Fixed skeleton key sets for the uniform pool shape (L6/L7 design). A pool's
+# scalar params come from the schema's `pool_common`, so adding one in Rust
+# needs no change here; only the nested `groups` subtree is named by hand.
+_POOL_SUBTREES = frozenset({"groups"})
 _GROUP_FLAT = ("gpu", "replicas")  # group_common fields (looked up on each group)
 _GROUP_KEYS = frozenset({"gpu", "replicas", "arch", "worker"})
 
@@ -318,9 +320,8 @@ def iter_slots(registry: Registry, config: dict, *, create: bool = False) -> Ite
         pool = _child(pools, role)
         if pool is None:
             continue
-        placement = _pdef(registry.pool_common, "placement")
-        if placement is not None:
-            yield Slot(pool, "placement", placement, ("pools", role, "placement"))
+        for pdef in registry.pool_common:
+            yield Slot(pool, pdef["name"], pdef, ("pools", role, pdef["name"]))
         groups = pool.get("groups")
         if not isinstance(groups, list):
             continue
@@ -386,7 +387,8 @@ def unknown_keys(registry: Registry, config: dict) -> list[str]:
         pool = pools.get(role)
         if not isinstance(pool, dict):
             continue
-        _check(pool, set(_POOL_KEYS), f"pools.{role}")
+        pool_allowed = {p["name"] for p in registry.pool_common} | _POOL_SUBTREES
+        _check(pool, pool_allowed, f"pools.{role}")
         groups = pool.get("groups")
         if not isinstance(groups, list):
             continue

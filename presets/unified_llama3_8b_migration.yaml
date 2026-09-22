@@ -1,0 +1,55 @@
+# llama3-8b, two replicas, deterministic placement + worker consolidation.
+#
+# The trace names the worker for every request, so the placement sequence is
+# reproducible rather than a function of load. Worker 1's requests have
+# staggered output lengths, so its active batch decays past the threshold
+# mid-run; the pool then drains it onto worker 0 and retires it. The last eight
+# rows still name worker 1 and must land on worker 0 instead — that is the
+# redirect, and it is visible in `stage_worker_ids`.
+#
+# Migration is recompute, not KV transfer: a moved request re-prefills
+# `prompt + emitted` tokens on its destination, which shows up as
+# `retraction_count` / `reprocessed_prefill_*` in `request_slo.parquet` and as
+# a `suspended:migration` stage between the two workers.
+deployment: unified
+
+workload:
+  trace_files:
+    - trace/migration_smoke.csv
+  input_file_format: text-generation-independent
+  # Declares the `target_worker` column. Without it the header check refuses
+  # the trace, and with it every row must carry a target.
+  input_file_tags: [placement]
+  arrival_mode: trace_timed
+  # The trace's `arrival_time` column is rate-1 normalized, so pin the rate to
+  # 1 req/s and the CSV's milliseconds are the milliseconds the sim replays.
+  # The default (10) would compress this trace's timeline tenfold.
+  request_rate: 1.0
+  session_dependency: independent
+  run_to_end: true
+
+io:
+  log_dir: logs/unified_llama3_8b_migration
+  # The migration is only observable through the stage timeline.
+  log_stage_transitions: true
+
+pools:
+  main:
+    placement: trace-directed
+    migration: active-batch-below
+    migration_threshold: 32
+    migration_cooldown_ms: 50.0
+    groups:
+      - gpu: "NVIDIA H200"
+        replicas: 2
+        arch:
+          type: llama3_dense
+          model_config: model/config/llama3_8b.json
+        worker:
+          # `chunked_prefill`, not `barebone`: only its admission lifecycle can
+          # take over a request whose KV another worker dropped.
+          type: chunked_prefill
+          attn_gpu_memory_gb: 120.0
+          max_batch_tokens: 2048
+          batch_policy: mix
+          gpu_time_multiplier: 1.0

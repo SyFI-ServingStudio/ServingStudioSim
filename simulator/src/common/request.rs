@@ -120,6 +120,13 @@ pub struct ReprocessedPrefillEpisode {
     pub prefix_cache_hit_tokens: u32,
     pub prefill_tokens_processed: u32,
     pub completed: bool,
+    /// The worker holding this recomputation gave the request away before
+    /// finishing it, so nothing will ever complete this episode. Kept in the
+    /// list rather than dropped: the tokens were really spent and really
+    /// wasted, which is the quantity a migration study is measuring. Not a
+    /// parquet column — the list already says it, since an incomplete episode
+    /// followed by another one is exactly an abandoned one.
+    pub abandoned: bool,
 }
 
 /// Observations collected without changing request-family semantics.
@@ -244,11 +251,14 @@ impl ActiveRequest<TextGenerationDefinition> {
     }
 
     pub fn begin_reprocessed_prefill(&mut self, prefix_cache_hit_tokens: u32) {
+        // The bar is "no episode in flight", not "the last one finished": a
+        // request handed to another worker mid-recomputation legitimately
+        // starts over there, and its abandoned episode is never completed.
         assert!(
             self.telemetry
                 .reprocessed_prefills
                 .last()
-                .is_none_or(|episode| episode.completed),
+                .is_none_or(|episode| episode.completed || episode.abandoned),
             "request {} began overlapping reprocessed-prefill episodes",
             self.request.core.id.0,
         );
@@ -259,7 +269,19 @@ impl ActiveRequest<TextGenerationDefinition> {
                 prefix_cache_hit_tokens,
                 prefill_tokens_processed: 0,
                 completed: false,
+                abandoned: false,
             });
+    }
+
+    /// Give up the recomputation in flight, if there is one. Idempotent, and a
+    /// no-op for a request that was not being recomputed — the caller is a
+    /// drain, which does not know or care which of its requests were.
+    pub fn abandon_reprocessed_prefill(&mut self) {
+        if let Some(episode) = self.telemetry.reprocessed_prefills.last_mut() {
+            if !episode.completed {
+                episode.abandoned = true;
+            }
+        }
     }
 
     pub fn record_reprocessed_prefill_tokens(&mut self, tokens: u32) {
