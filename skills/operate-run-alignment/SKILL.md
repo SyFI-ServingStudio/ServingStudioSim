@@ -145,10 +145,13 @@ single-config path below when there is one workload and no matrix.
    without — the routed-experts return, and EPLB's per-step expert-load log when
    the deployment has expert parallelism — so one `token_corpus` capture yields
    the corpus, that per-step stream to score a sampled fold against, and the
-   marginal. Declare `server.expert_parallel_size` and
-   `server.expert_count_reduction_group_size` to get the marginal too; omit them
-   and the pass produces routes alone. `expert_popularity` requires both,
-   because the marginal is its only product.
+   marginal. Whenever the pass takes that stream (vLLM with
+   `--enable-expert-parallel` and more than one rank) it requires
+   `server.expert_parallel_size` and `server.expert_count_reduction_group_size`,
+   the topology the marginal is reduced over. A model that does not implement
+   EPLB opts out with `--no-enable-eplb` in `server.extra_args` and the pass
+   records routes alone. `expert_popularity` always requires both, because the
+   marginal is its only product.
 2. **Timing prediction** — set the typed input builder. It reads the simulation
    *preset* (`simulation.yaml` via `simulation_preset`) for gpu/arch/backends, so
    it runs before any completed simulation. `measured_phase: forward` only

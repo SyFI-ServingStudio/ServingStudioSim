@@ -265,10 +265,11 @@ comparison, while `profile_result.request_timings_jsonl` identifies the vLLM
 engine-core timing records. The routing passes write their replay/server logs
 and their own `profile_result.json`; `token_corpus` adds `routed_experts/` (one
 `.npy` per replayed request) and the packed `token_corpus/`, and both add the
-raw expert-load JSONL and aggregated `expert_popularity.json` whenever the
-expert topology is declared. They deliberately emit no request-timing artifact
-because the shared profiling instrumentation is disabled for them. No pass here
-has timing-predict or analysis fields.
+raw expert-load JSONL and aggregated `expert_popularity.json` whenever the pass
+takes EPLB's expert-load stream (`ProfileConfig.captures_expert_load`). They
+deliberately emit no request-timing artifact because the shared profiling
+instrumentation is disabled for them. No pass here has timing-predict or
+analysis fields.
 
 ### Expert-popularity artifact contract
 
