@@ -30,6 +30,7 @@ import uuid
 from pathlib import Path
 
 from .artifact_kind import ArtifactKind, write_artifact_kind
+from .corpus import CorpusError, resolve_hf_references
 from .exec import (
     REPO_ROOT,
     _build_subprocess_env,
@@ -281,6 +282,25 @@ def _predict_case_count(config_path: Path, cfg: dict) -> int | None:
     return len(payload) if isinstance(payload, list) else None
 
 
+def _binary_config(config_path: Path, cfg: dict, log_dir: Path) -> Path:
+    """The config the binary reads: this one, or a copy with hub references resolved.
+
+    The binary only reads paths. A copy is written only when there is a
+    reference to resolve, beside the run's own outputs, with `cases_file` made
+    absolute because the binary resolves it against the config's directory.
+    """
+    resolved = resolve_hf_references(cfg)
+    if resolved == cfg:
+        return config_path
+    cases_file = resolved.get("cases_file")
+    if isinstance(cases_file, str) and not Path(cases_file).is_absolute():
+        resolved["cases_file"] = str((config_path.parent / cases_file).resolve())
+    log_dir.mkdir(parents=True, exist_ok=True)
+    copy = log_dir / "timing_predict_config.resolved.json"
+    copy.write_text(json.dumps(resolved, indent=2))
+    return copy
+
+
 async def run_one(config_path: Path, build_type: str, analyze: bool) -> bool:
     """Run one already-built predictor config.
 
@@ -294,6 +314,9 @@ async def run_one(config_path: Path, build_type: str, analyze: bool) -> bool:
         # launcher-side log_dir to the same root so stdout.log + analysis line up.
         log_dir = REPO_ROOT / log_dir
 
+    # Before any job is announced: a reference that cannot be fetched is a
+    # config error, not a failed prediction.
+    binary_config = _binary_config(config_path, cfg, log_dir)
     prediction_id = _prediction_id(log_dir)
     descriptor = _predict_descriptor(config_path, cfg)
     managed_job = prepare_managed_job(
@@ -311,7 +334,7 @@ async def run_one(config_path: Path, build_type: str, analyze: bool) -> bool:
             managed_job.report("running")
         write_artifact_kind(log_dir, ArtifactKind.TIMING_PREDICTION)
         binary = binary_path(build_type)
-        argv = [str(binary), "timing-predict", str(config_path)]
+        argv = [str(binary), "timing-predict", str(binary_config)]
         journal = RunJournal(log_dir)
         async with _LAUNCHER_LEASES.profile_database(write=True):
             journal.update(
@@ -425,6 +448,12 @@ def main(argv: list[str]) -> int:
             print(f"[invalid] {c}: not a file", file=sys.stderr)
             rc = 2
             continue
-        if not asyncio.run(run_one(config_path, build_type, analyze)):
+        try:
+            succeeded = asyncio.run(run_one(config_path, build_type, analyze))
+        except CorpusError as exc:
+            print(f"[invalid] {c}: {exc}", file=sys.stderr)
+            rc = 2
+            continue
+        if not succeeded:
             rc = rc or 1
     return rc

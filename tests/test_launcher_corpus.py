@@ -35,7 +35,9 @@ def hub(tmp_path, monkeypatch):
 
 
 def test_a_manifest_reference_also_fetches_the_payload_beside_it(hub):
-    resolved = resolve_hf_references({"arch": {"token_corpus_file": f"hf://uw/corpora@{SHA}/glm53/manifest.json"}})
+    resolved = resolve_hf_references(
+        {"arch": {"token_corpus_file": f"hf://uw/corpora@{SHA}/glm53/manifest.json"}}
+    )
 
     assert resolved["arch"]["token_corpus_file"].endswith("glm53/manifest.json")
     # The simulator resolves `data_file` relative to the manifest, so fetching
@@ -143,3 +145,28 @@ def test_timing_predict_reads_the_preset_with_references_resolved(hub, tmp_path)
 
     preset = _load_simulation_preset(_corpus_preset(tmp_path))
     assert "hf://" not in json.dumps(preset)
+
+
+def test_a_direct_prediction_hands_the_binary_resolved_paths(hub, tmp_path):
+    """`python -m launcher timing-predict` reads the config the user wrote."""
+    from launcher.timing_predict import _binary_config
+
+    config_dir = tmp_path / "presets"
+    config_dir.mkdir()
+    config_path = config_dir / "predict.yaml"
+    cfg = {
+        "arch": {"iter": {"token_corpus_file": f"hf://uw/corpora@{SHA}/glm53/manifest.json"}},
+        "cases_file": "predict_cases.yaml",
+    }
+    log_dir = tmp_path / "logs" / "run"
+
+    copy = _binary_config(config_path, cfg, log_dir)
+
+    written = json.loads(copy.read_text())
+    assert copy.parent == log_dir
+    assert "hf://" not in json.dumps(written)
+    # The binary resolves cases_file against the config it reads.
+    assert written["cases_file"] == str((config_dir / "predict_cases.yaml").resolve())
+    # A config with nothing to resolve is handed over untouched.
+    plain = {"arch": {"iter": {"token_corpus_file": "local/manifest.json"}}}
+    assert _binary_config(config_path, plain, log_dir) == config_path
