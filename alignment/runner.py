@@ -366,6 +366,12 @@ def run_profile(cfg: ProfileConfig, *, resume: bool = False) -> dict:
             drive_summary = load_generator.run_replay(
                 cfg.workload, prepared_replay, base_url=base_url, model=model,
                 measurement_ready=measurement_ready,
+                # Only the corpus pass needs per-token routes, and it pays for
+                # them with the replay's streaming timeline. An expert_popularity
+                # pass reads the server's own counters and keeps its timeline.
+                routed_experts_dir=(
+                    log_dir / ROUTED_EXPERTS_DIR if cfg.profile_kind == "token_corpus" else None
+                ),
             )
             replay_end_monotonic_ns = time.monotonic_ns()
             # EngineCore metrics use the same host CLOCK_MONOTONIC domain. The

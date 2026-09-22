@@ -7,9 +7,15 @@ which experts a step's tokens *jointly* select, which a marginal has already
 summed away. Sampling contiguous runs of it reproduces the correlation a verify
 block has; resampling a marginal cannot, by construction.
 
-Input is one `.npz` per replayed request, written by the capture pass: an
-`expert_ids` array of shape `(tokens, layers, top_k)` plus the token ids,
-absolute token positions, and the model layer indices those layers are.
+Input is one `.npy` per replayed request, written verbatim by the load
+generator from what the instrumented server returned: shape
+`(rows, model_layers, top_k)` over *every* model layer, whose first row is the
+last prompt token's forward. This module owns turning that into the corpus:
+dropping the prompt row, and reducing the layer axis to the layers that
+actually route. Dense layers never call the capture hook, so they stay zero,
+and a routed row always holds top-k *distinct* experts -- which makes all-zero
+an unambiguous "not routed" rather than a threshold.
+
 Output is `routes.u16` (little-endian, C order `[token, layer, slot]`), the
 `manifest.json` the Rust `TokenCorpusConfig` deserializes, and a
 `provenance.json` that keeps request identity *outside* the sampler -- the
@@ -23,6 +29,7 @@ pack that refuses.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import numpy as np
@@ -47,16 +54,41 @@ def fnv1a64(payload: bytes) -> int:
     return digest
 
 
-def _request_sort_key(path: Path) -> tuple[int, str]:
-    """Order by the numeric request suffix when there is one, else by name.
+def _request_sort_key(path: Path) -> tuple:
+    """Natural order over the request id, so `s10` sorts after `s2`.
 
     Concatenation order decides where the seams between requests fall, and a
     sampled window may cross one. Making it deterministic is what lets two packs
     of the same capture produce the same bytes.
     """
-    stem = path.stem
-    _, _, suffix = stem.rpartition("_")
-    return (int(suffix), stem) if suffix.isdigit() else (1 << 62, stem)
+    return tuple(
+        (1, int(part)) if part.isdigit() else (0, part) for part in re.split(r"(\d+)", path.stem)
+    )
+
+
+def _routed_layers(arrays: list[np.ndarray], num_layers: int) -> range:
+    """The contiguous span of layers that recorded routes.
+
+    A dense layer never calls the capture hook, so its rows stay zero for the
+    whole capture. The span is required to be contiguous because the simulator
+    addresses the corpus by layer *range*: a gap would make "the first N layers"
+    mean something other than what the model's first N routed layers are.
+    """
+    routed = np.zeros(num_layers, dtype=bool)
+    for ids in arrays:
+        if ids.shape[0]:
+            routed |= ids.any(axis=(0, 2))
+    covered = np.flatnonzero(routed)
+    if not covered.size:
+        raise ValueError("the capture recorded no routed layers at all")
+    span = range(int(covered[0]), int(covered[-1]) + 1)
+    if covered.size != len(span):
+        missing = sorted(set(span) - set(covered.tolist()))
+        raise ValueError(
+            f"model layers {missing[:3]} route nowhere but sit inside the routed "
+            f"span {span.start}..{span.stop}; the corpus layer axis must be contiguous"
+        )
+    return span
 
 
 def pack_token_corpus(
@@ -76,52 +108,53 @@ def pack_token_corpus(
     if num_experts > 65536:
         raise ValueError("a token corpus stores expert ids as u16")
 
-    paths = sorted(Path(source).glob("request_*.npz"), key=_request_sort_key)
+    paths = sorted(Path(source).glob("*.npy"), key=_request_sort_key)
     if not paths:
         raise ValueError(f"no captured request routes under {source}")
 
     arrays: list[np.ndarray] = []
-    segments: list[dict] = []
     shape: tuple[int, int] | None = None
-    layer_indices: list[int] | None = None
-    offset = 0
     for path in paths:
-        with np.load(path, allow_pickle=False) as data:
-            ids = data["expert_ids"]
-            layers = data["model_layer_indices"].tolist()
-            if ids.ndim != 3:
-                raise ValueError(f"{path.name}: expected a (tokens, layers, top_k) array")
-            if shape is None:
-                shape, layer_indices = ids.shape[1:], layers
-            elif ids.shape[1:] != shape:
-                raise ValueError(
-                    f"{path.name}: routes are {ids.shape[1:]}, the capture's first request "
-                    f"was {shape}; one corpus describes one model"
-                )
-            elif layers != layer_indices:
-                raise ValueError(
-                    f"{path.name}: covers model layers {layers[:3]}..., "
-                    f"the capture's first request covered {layer_indices[:3]}..."
-                )
-            # A request whose generation was one token long contributes no
-            # *accepted* routes: the last generated token never runs a forward.
-            # That is a real capture, not a broken one, so it is kept as an
-            # empty segment rather than rejected.
-            if ids.shape[0]:
-                if ids.min() < 0 or ids.max() >= num_experts:
-                    raise ValueError(f"{path.name}: expert id outside 0..{num_experts - 1}")
-                # The router selects top-k *distinct* experts. A repeat means
-                # the capture recorded padding or an uninitialized row, which
-                # would show up downstream only as an implausibly concentrated
-                # fold.
-                if np.any(np.diff(np.sort(ids, axis=-1), axis=-1) == 0):
-                    raise ValueError(f"{path.name}: a token selected the same expert twice")
-            arrays.append(ids.astype("<u2"))
-            segments.append({"request": path.stem, "start": offset, "length": int(ids.shape[0])})
-            offset += int(ids.shape[0])
+        ids = np.load(path, allow_pickle=False)
+        if ids.ndim != 3:
+            raise ValueError(f"{path.name}: expected a (tokens, layers, top_k) array")
+        if shape is None:
+            shape = ids.shape[1:]
+        elif ids.shape[1:] != shape:
+            raise ValueError(
+                f"{path.name}: routes are {ids.shape[1:]}, the capture's first request "
+                f"was {shape}; one corpus describes one model"
+            )
+        # Row 0 is the last prompt token's forward -- the capture is anchored
+        # there so that every row after it is provably a forward some generated
+        # token caused. The corpus keeps only those.
+        arrays.append(ids[1:])
 
-    num_layers, top_k = shape
-    payload = np.concatenate(arrays).tobytes()
+    num_model_layers, top_k = shape
+    layers = _routed_layers(arrays, num_model_layers)
+
+    segments: list[dict] = []
+    payload_parts: list[np.ndarray] = []
+    offset = 0
+    for path, ids in zip(paths, arrays, strict=True):
+        ids = ids[:, layers.start : layers.stop, :]
+        # A request whose generation was one token long contributes no
+        # *accepted* routes: the last generated token never runs a forward.
+        # That is a real capture, not a broken one, so it is kept as an empty
+        # segment rather than rejected.
+        if ids.shape[0]:
+            if ids.min() < 0 or ids.max() >= num_experts:
+                raise ValueError(f"{path.name}: expert id outside 0..{num_experts - 1}")
+            # The router selects top-k *distinct* experts. A repeat means the
+            # capture recorded padding or an uninitialized row, which would show
+            # up downstream only as an implausibly concentrated fold.
+            if np.any(np.diff(np.sort(ids, axis=-1), axis=-1) == 0):
+                raise ValueError(f"{path.name}: a token selected the same expert twice")
+        payload_parts.append(ids.astype("<u2"))
+        segments.append({"request": path.stem, "start": offset, "length": int(ids.shape[0])})
+        offset += int(ids.shape[0])
+
+    payload = np.concatenate(payload_parts).tobytes()
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / DATA_FILE).write_bytes(payload)
@@ -129,7 +162,7 @@ def pack_token_corpus(
         "schema_version": SCHEMA_VERSION,
         "data_file": DATA_FILE,
         "num_tokens": offset,
-        "num_layers": int(num_layers),
+        "num_layers": len(layers),
         "num_experts": num_experts,
         "top_k": int(top_k),
         "checksum_fnv1a64": fnv1a64(payload),
@@ -143,7 +176,8 @@ def pack_token_corpus(
                 "source": str(Path(source).resolve()),
                 "encoding": "little-endian u16, C order [token, layer, top_k]",
                 "scope": scope,
-                "model_layer_indices": layer_indices,
+                "num_model_layers": int(num_model_layers),
+                "model_layer_indices": list(layers),
                 "request_segments": segments,
             },
             indent=2,
