@@ -112,25 +112,44 @@ categories:
 | `alignment-workload` | one scheduler iteration by recorded iteration id | full-run vLLM structured iteration metrics (NSYS window anchors the replay segment) + sim `cost_log` |
 
 For a symmetric tensor-parallel alignment, one measured iteration contains one
-range set per rank. The analyzer constructs a complete path independently on
-every physical device from that device's own NSYS intervals, then selects the
-longest arrival-reduced path. It never copies an occurrence maximum onto every
-device. Per-kernel and per-operation rows are interval-union contributions on
-the selected device, so they add up to the headline `measured_ms`.
+range set per rank. The analyzer reduces it with the **barrier model**
+(`alignment_iteration/barrier.rs`). A synchronizing collective is a barrier:
+every rank must arrive before any rank leaves. An iteration is therefore a chain
+of short races separated by barriers, and a different rank can win each one.
 
-- **independent** (compute, point-to-point): the selected device contributes its
-  own interval-union duration. Rank imbalance remains visible in the per-device
-  candidates rather than being spliced operation-by-operation across ranks.
-- **synchronizing** (all-reduce / all-gather / all-to-all / fused all-reduce+norm):
-  a barrier whose per-rank kernel duration includes waiting for the slowest rank
-  to arrive. After physical overlap attribution, the selected-device
-  contribution is capped at `max(end) - max(start)`, dropping arrival wait
-  without copying another rank's duration onto this device.
+- A **barrier** is a maximal run of consecutive synchronizing positions
+  (all-reduce / all-gather / all-to-all / fused all-reduce+norm, per the mapping
+  table's `cross_rank`). Its cost on the path is `max(end) - max(start)` over
+  ranks: from the last arrival to the last exit. The earlier arrivals' waiting,
+  `collective_skew_ms`, is reported but not on the path, because it coincides
+  with the slow rank's busy time, which is already counted.
+- A **segment** is the window between two barriers. Each rank's busy time in it
+  is the union of its non-collective launches across its streams, clipped to the
+  window. The rank with the largest union wins the segment. The window is shared,
+  so that is also the rank with the least idle time. The last rank to arrive at
+  the closing barrier is reported beside it as the gating rank, with its own gap.
 
-The dropped arrival wait is not attributed to any kernel; it surfaces only in the
-wall-clock `measured_gpu_cycle_ms`. The kernel-align pass's derived duty-cycle
-multiplier `recommended_gpu_time_multiplier = Σ measured_gpu_cycle_ms / Σ
-measured_ms` uses the selected-device reduced kernel path that timing-predict
+The windows and barriers tile the iteration over every rank, exactly:
+
+```text
+wall_ms       = measured_ms + idle_internal_ms + idle_boundary_ms
+measured_ms   = critical_busy_ms + collective_ms
+critical_busy = measured_kernel_sum_ms - hidden_same_stream_ms - hidden_cross_stream_ms
+```
+
+Per-kernel and per-operation rows are each position's share of that path. Within
+a segment, the winner's busy union is split by one sweep: sort by start, let the
+wider launch win a tie, and give each launch only what no earlier launch covered.
+A barrier's net goes to its positions by their own last-arrival-to-last-exit
+extent. The rows therefore add up to `measured_ms`. A barrier over only part of
+the ranks (a collective inside one data-parallel group) is rejected until a
+group-aware barrier is needed.
+
+Idle, collective skew, and the gap between iterations surface only in the
+wall-clock `measured_gpu_cycle_ms` (`measured_gpu_cycle_ms - wall_ms` is the
+inter-iteration gap, which is negative when iterations overlap). The kernel-align
+pass's duty-cycle multiplier `recommended_gpu_time_multiplier = Σ
+measured_gpu_cycle_ms / Σ measured_ms` uses the barrier path that timing-predict
 models. The pool excludes iterations whose duty-cycle
 factor is both above 2.0 and an MAD outlier within its own stage — one host stall
 would otherwise reach every simulated iteration through this single constant —
@@ -167,23 +186,28 @@ carries each stream as its own **track**: kernels are serialized track-major
 track, and both the labeling walk's ordered-neighbour evidence and the analyzer's
 positional validation stop at a track edge.
 
-Adding literal kernel durations would count overlap twice. The analyzer unions
-every selected-device interval before removing collective arrival wait. This
-covers cross-stream concurrency and same-track PDL;
-`measured_excluded_overlap_ms = measured_kernel_sum_ms -
-measured_physical_path_ms` reports the full deduction. The narrower
-`measured_concurrent_hidden_ms` remains an audit of the cross-track subset.
+Adding literal kernel durations would count overlap twice. The segment winner's
+busy time is a union, and what the union removed is split by who covered it.
+Each covered stretch is charged to the launch holding the running maximum end,
+which started no later and so covers the whole stretch alone.
+`hidden_same_stream_ms` is coverage by an earlier launch on the same stream
+(PDL, which may include `griddepcontrol.wait` residency, i.e. hidden launch
+latency). `hidden_cross_stream_ms` is coverage from another stream.
+`hidden_under_collective_{same,cross}_stream_ms` is non-collective work that ran
+inside a barrier window on the last rank to leave. That time is already inside
+`collective_ms` and is not subtracted again.
 
-The sampled breakdown shows only that selected device. Material tracks get their
-own compact row; small tracks are preserved in one explicit aggregate row rather
-than creating hundreds of mostly empty labels. Per operation and per measured
-kernel, `concurrent_hidden_ms` says how much of it
-the framework managed to hide. One overlap is one shared stretch of wall clock,
-so it is charged to the later-starting track only — the side stream that joined a
-device already busy. That is what makes these rows sum back to the iteration's
-`measured_concurrent_hidden_ms` instead of twice it, and it is why the breakdown
-plot can hatch the hidden share inside the operations that actually overlapped.
-This is **evidence about the measured schedule, not an instruction to the cost
+Independently of the path, every measured kernel row carries `overlap`: its
+launches' duration and how much of it overlapped any other launch on the same
+device, only same-stream launches, or only other-stream launches. The timeline
+payload goes further and names each overlapping partner position per launch
+(`measured.kernels[].ov`). A shared stretch appears on both sides of a pair, so
+these are diagnostics, not a decomposition.
+
+The sampled breakdown draws the streams of the rank that owns the most critical
+busy time. Material tracks get their own compact row; small tracks are preserved
+in one explicit aggregate row rather than creating hundreds of mostly empty
+labels. This is **evidence about the measured schedule, not an instruction to the cost
 model** — and specifically it must not become a `CostNode::Max`. Every
 `Max` in the simulator is a cross-rank fan-out of interchangeable replicas: the
 attribution below forwards only its critical child, and the `optimality` ladder's

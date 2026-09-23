@@ -384,12 +384,94 @@ neighbors, semantics, and tensor/collective ownership — never a remembered
 ordinal or demangled name alone. Alignment reports facts and candidate owners;
 it does not select the next framework optimization.
 
-For multi-device, multi-stream timing, construct one complete reduced path per
-device first: mapped work, unmapped work, and stream overlap must share the same
-device timeline. Select the critical device only after that composition. Never
-take separate maxima for mapped, unmapped, and overlap components and splice
-them into a path that no device executed. Collective residency or arrival wait
-is timeline evidence, not kernel duration.
+For multi-device, multi-stream timing, the analyzer's barrier critical path
+composes each device's complete busy time per segment (the stretch between two
+collectives) first: mapped work, unmapped work, and stream overlap share the
+same device timeline. Each segment's winner is chosen only after that
+composition, so the owner may change between segments. Never take separate
+maxima for mapped, unmapped, and overlap components and splice them into a
+segment no device executed. A collective enters only as its net (last arrival to
+last exit); early-rank arrival wait is `collective_skew_ms`, reported off the
+path, not kernel duration.
+
+### Measured time taxonomy
+
+Every quantity below is per iteration and computed in exact integer nanoseconds.
+Each iteration row of `reports/alignment_iteration_report.json` and each
+timeline `measured` block carry these fields. The identities hold with a residual
+of exactly 0, and the analyzer refuses to emit an iteration whose tiling does
+not close.
+
+```
+measured_gpu_cycle_ms = wall_ms + inter-iteration gap          (gap may be < 0)
+wall_ms               = measured_ms + idle_internal_ms + idle_boundary_ms
+measured_ms           = critical_busy_ms + collective_ms        (barrier critical path)
+critical_busy_ms      = measured_kernel_sum_ms
+                        - hidden_same_stream_ms - hidden_cross_stream_ms
+recommended_gpu_time_multiplier = Σ measured_gpu_cycle_ms / Σ measured_ms
+```
+
+The critical path is therefore not the busy time. It contains collective time
+that no compute kernel covers, and it excludes idle time: `idle_internal_ms` is
+outside `critical_busy_ms`.
+
+Structure:
+
+- **Barrier.** A maximal run of consecutive synchronizing (`cross_rank`)
+  positions.
+  - *enter*: the latest first start over ranks (the last arrival).
+  - *exit*: the latest last end over ranks.
+- **Segment.** The stretch before, between, or after barriers, with bounds taken
+  over all ranks. Segments and barrier nets tile the wall window.
+- **Winner.** The rank with the most busy time in a segment, which is the same as
+  the least idle time; the lowest device id wins ties. The owner may change from
+  segment to segment, and `critical_rank_switches` counts the changes.
+- **Gating rank.** For each timeline segment, `gating_device_id` is the last
+  arriver at the closing barrier (or, in the tail segment, the last finisher).
+  `gating_gap_ns` is that rank's own non-busy time. It is a diagnostic and often
+  differs from the winner.
+
+Terms of the identities:
+
+| Field | Definition |
+| --- | --- |
+| `measured_ms` | The barrier critical path: `critical_busy_ms + collective_ms`. It is the denominator of the multiplier and the headline of Check 1. |
+| `critical_busy_ms` | Σ over segments of the winner's busy union (its non-synchronizing launches, clipped to the segment). `critical_busy_ms_by_device` splits it by winner. |
+| `collective_ms` | Σ over barriers of net = exit − max(enter, previous exit): from the last arrival to the last exit. Compute that overlaps the collective stays inside this term. |
+| `collective_skew_ms` | Σ over barriers of (last arrival − first arrival): early ranks waiting. It is **off the path and not additive**, because it overlaps the slow rank's busy time. This is the "network wait" that does *not* lengthen the iteration. |
+| `idle_internal_ms` | The winner's gaps between its first and last busy instant in each segment, for example host launch bubbles. |
+| `idle_boundary_ms` | The winner's head and tail in each segment: waiting at the barrier edges. |
+| `wall_ms` | The last kernel end minus the first kernel start, over every rank. |
+| `measured_gpu_cycle_ms` | The next valid iteration's first-kernel start minus this iteration's first-kernel start. The final valid iteration has no cycle. `cycle − wall` is the inter-iteration gap, which is negative when iterations overlap. |
+| `measured_kernel_sum_ms` | On-path kernel sum: Σ of the winners' clipped launch durations before overlap is removed. |
+| `hidden_same_stream_ms` | Part of the on-path kernel sum covered by an earlier launch on the **same stream** (PDL). This can be `griddepcontrol.wait` residency, i.e. launch latency hidden rather than compute overlapped. |
+| `hidden_cross_stream_ms` | Part covered by a launch on **another stream** (multi-stream overlap). Each hidden stretch is charged to the launch holding the running maximum end, bucketed by that launch's stream (`stream_id`, else track). |
+| `hidden_under_collective_{same,cross}_stream_ms` | Non-synchronizing launch time inside barrier windows on the last-exit rank. It is already inside `collective_ms`, so it is reported and **never subtracted**. Together with the two segment buckets this forms a 2×2 grid: same/cross stream × hidden under compute/collective. |
+| `all_rank_kernel_sum_ms` | Every non-synchronizing launch on every rank. It gives scale only and is not part of any identity. |
+
+Per operation and per kernel:
+
+- `operation_measured_ms` sums to `measured_ms` exactly. Each operation gets
+  the winners' sweep slices plus each barrier's net split across the barrier's
+  operations by per-operation extent. The integer remainder goes to the last
+  operation. The kernel row `duration_ms` (timeline `crit_ms`) is one
+  position's share. `on_path_kernel_ms` (timeline `path_ms`) is its winners'
+  clipped durations before overlap. `reduced_duration_ms` is the per-occurrence
+  cross-rank reduction, kept for audit.
+- The per-kernel overlap diagnostic is computed per device over **all**
+  launches, collectives included, and does not depend on barriers.
+  - The report kernel row's `overlap` gives `duration_ms`, `overlap_ms` and
+    `overlap_pct` (the intersection with the union of every other launch), plus
+    `same_stream_ms` and `cross_stream_ms`.
+  - Timeline `ov[i]`, aligned to `iv[i]`, is `[overlap_ns, same_stream_ns,
+    cross_stream_ns, stream_id, partners]`. `partners` is `[position,
+    overlap_ns]`, and the position resolves to the name, operation, sync flag,
+    and stream.
+  - PDL onto a collective is still reported, with the collective as the partner.
+  - An overlapping pair counts on **both** sides, so Σ `overlap_ms` is not the
+    hidden total. Against `alignment/nsys/overlap.py` on the same launches:
+    Σ `same_stream_ns` = `pdl_same_stream_trace_reduction_ns` + the time the
+    stream is at depth ≥ 2.
 
 Stream plots use the same reduced logical work as the numerical report, not raw
 residency intervals. Show material streams separately and aggregate small
