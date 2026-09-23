@@ -18,6 +18,7 @@ pub mod deepseek_v4_moe_router_local;
 pub mod deepseek_v4_shared_expert_local;
 pub mod dflash2_context_kv_local;
 pub mod dflash2_draft_layer_local;
+pub mod dflash2_selector_local;
 pub mod fp8_attn_block_tp;
 pub mod fp8_post_attn_router_tp;
 pub mod fp8_pre_attn_proj_tp;
@@ -90,6 +91,10 @@ pub use dflash2_draft_layer_local::{
     Dflash2DraftAttnLocalWorkletResolved, Dflash2DraftFfnLocalWorklet,
     Dflash2DraftFfnLocalWorkletInput, Dflash2DraftFfnLocalWorkletResolved,
     Dflash2DraftLayerLocalWorkletConfig,
+};
+pub use dflash2_selector_local::{
+    Dflash2SelectorLocalWorklet, Dflash2SelectorLocalWorkletConfig,
+    Dflash2SelectorLocalWorkletInput, Dflash2SelectorLocalWorkletResolved,
 };
 pub use fp8_attn_block_tp::{
     Fp8AttnBlockTpWorklet, Fp8AttnBlockTpWorkletConfig, Fp8AttnBlockTpWorkletInput,
