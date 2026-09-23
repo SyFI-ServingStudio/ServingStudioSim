@@ -43,11 +43,12 @@ use rayon::prelude::*;
 use serde_json::{json, Value};
 use std::path::Path;
 
+use super::barrier;
 use super::host::{self, HostWindow};
 use super::{
     duty_cycle_recommendation, interval_union_ns, kernel_name_index, leaf_scales, load_inventory,
-    load_sim_cases, measure_iteration, measured_critical_path, measured_gpu_cycles_ms,
-    occurrence_ns, parsed_trace, physical_kernel_rows, pooled_gpu_time_multiplier, read_json,
+    load_sim_cases, measure_iteration, measured_gpu_cycles_ms, measured_path_fields, occurrence_ns,
+    parsed_trace, physical_kernel_rows, pooled_gpu_time_multiplier, read_json,
     screen_duty_cycle_outliers, single_iter_manifest, CaseMapDoc, CompiledInventory,
     DutyCycleSample, IterationMeasurement, JsonlShardWriter, MeasuredIteration, SimCase,
 };
@@ -92,10 +93,7 @@ struct IterationSummary {
     stage: String,
     iteration_type: String,
     identity_sequence: String,
-    critical_device_id: Option<i64>,
     measured_ms: f64,
-    measured_physical_path_ms: f64,
-    measured_kernel_sum_ms: f64,
     simulated_ms: f64,
     relative_diff_pct: f64,
 }
@@ -254,12 +252,15 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
                 )
             })?;
             let measurement = measure_iteration(measured_iter, &inventory, &kernel_names)?;
-            let measured_reduction = measured_critical_path(&measurement);
+            let measured_ms = barrier::barrier_path(&measurement)
+                .with_context(|| format!("measured iteration {}", measured_iter.iteration))?
+                .critical_path_ns() as f64
+                / 1e6;
             let sample = DutyCycleSample {
                 iteration: measured_iter.iteration,
                 stage: joined.stage.clone(),
                 measured_gpu_cycle_ms: gpu_cycles_ms.get(&measured_iter.iteration).copied(),
-                measured_ms: measured_reduction.critical_path_ms,
+                measured_ms,
                 measured_busy_union_ms: measurement.busy_union_ms,
                 jit_stall_ms: measured_iter.jit_stall_ns as f64 / 1.0e6,
                 jit_module_loads: measured_iter.jit_module_loads,
@@ -273,15 +274,9 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
                     .sequence_id(IDENTITY_PHASE, measured_iter.iteration)
                     .unwrap_or("")
                     .to_string(),
-                critical_device_id: measured_reduction.device_id,
-                measured_ms: measured_reduction.critical_path_ms,
-                measured_physical_path_ms: measured_reduction.physical_path_ms,
-                measured_kernel_sum_ms: measured_reduction.kernel_sum_ms,
+                measured_ms,
                 simulated_ms: sim.total_ms,
-                relative_diff_pct: relative_pct(
-                    sim.total_ms - measured_reduction.critical_path_ms,
-                    measured_reduction.critical_path_ms,
-                ),
+                relative_diff_pct: relative_pct(sim.total_ms - measured_ms, measured_ms),
             };
             let logical_names = measurement
                 .kernels
@@ -754,7 +749,8 @@ fn build_iteration(
     let offset = |ns: u64| (ns as i64) - (time_origin_ns as i64);
 
     // ---- measured -----------------------------------------------------------
-    let measured_reduction = measured_critical_path(measurement);
+    let path = barrier::barrier_path(measurement)?;
+    let overlaps = barrier::launch_overlaps(measurement);
     let mut measured_operation_ms: BTreeMap<&str, f64> = BTreeMap::new();
     let mut measured_operation_rows: BTreeMap<&str, usize> = BTreeMap::new();
     let mut kernel_rows = Vec::with_capacity(measurement.kernels.len());
@@ -762,7 +758,7 @@ fn build_iteration(
         let occurrence = occurrence_ns(&item.launches, item.synchronizing);
         if let Some(operation) = &item.operation {
             *measured_operation_ms.entry(operation.as_str()).or_default() +=
-                measured_reduction.kernel_critical_ms[kernel_index];
+                path.kernel_critical_ns[kernel_index] as f64 / 1e6;
             *measured_operation_rows
                 .entry(operation.as_str())
                 .or_default() += 1;
@@ -774,8 +770,14 @@ fn build_iteration(
         );
         let name_id = timeline_names.resolve(item.name_id, &item.name)?;
         used_name_ids.insert(name_id);
-        let mut launches: Vec<_> = item.launches.clone();
-        launches.sort_by_key(|launch| (launch.device_id, launch.start_ns));
+        let mut order: Vec<usize> = (0..item.launches.len()).collect();
+        order.sort_by_key(|&index| {
+            (
+                item.launches[index].device_id,
+                item.launches[index].start_ns,
+            )
+        });
+        let launches: Vec<_> = order.iter().map(|&index| item.launches[index]).collect();
         kernel_rows.push(json!({
             "ph": item.phase,
             "row": item.row_id,
@@ -786,9 +788,21 @@ fn build_iteration(
             "physical_kernels": physical_kernel_rows(item),
             "sync": item.synchronizing,
             "occ_ns": occurrence,
-            "selected_raw_ms": measured_reduction.kernel_raw_ms[kernel_index],
-            "selected_effective_ms": measured_reduction.kernel_effective_ms[kernel_index],
-            "selected_critical_ms": measured_reduction.kernel_critical_ms[kernel_index],
+            "crit_ms": path.kernel_critical_ns[kernel_index] as f64 / 1e6,
+            "path_ms": path.kernel_on_path_ns[kernel_index] as f64 / 1e6,
+            "ov": order
+                .iter()
+                .map(|&index| {
+                    let overlap = &overlaps[kernel_index][index];
+                    json!([
+                        overlap.overlap_ns,
+                        overlap.same_stream_ns,
+                        overlap.cross_stream_ns,
+                        item.launches[index].stream_id,
+                        overlap.partners,
+                    ])
+                })
+                .collect::<Vec<_>>(),
             "iv": launches
                 .iter()
                 .map(|launch| {
@@ -882,6 +896,43 @@ fn build_iteration(
         );
     }
 
+    let path_fields = measured_path_fields(&path);
+    let mut measured_block = json!({
+        "critical_path_ms": summary.measured_ms,
+        "busy_union_ms": measurement.busy_union_ms,
+        "kernels": kernel_rows,
+        "segments": path.segments.iter().map(|segment| json!({
+            "start_ns": offset(segment.start_ns),
+            "end_ns": offset(segment.end_ns),
+            "winner": segment.winner,
+            "busy_ns_by_device": segment
+                .busy_ns_by_device
+                .iter()
+                .map(|(device, ns)| (device.to_string(), *ns))
+                .collect::<BTreeMap<_, _>>(),
+            "idle_internal_ns": segment.idle_internal_ns,
+            "idle_boundary_ns": segment.idle_boundary_ns,
+            "gating_device_id": segment.gating_device_id,
+            "gating_gap_ns": segment.gating_gap_ns,
+        })).collect::<Vec<_>>(),
+        "barriers": path.barriers.iter().map(|barrier| json!({
+            "positions": barrier.positions,
+            "enter_ns": offset(barrier.enter_ns),
+            "exit_ns": offset(barrier.exit_ns),
+            "net_ns": barrier.net_ns,
+            "skew_ns": barrier.skew_ns,
+            "last_exit_device": barrier.last_exit_device,
+        })).collect::<Vec<_>>(),
+    });
+    let measured_map = measured_block
+        .as_object_mut()
+        .expect("measured block is an object");
+    for (key, value) in &path_fields {
+        if key != "measured_ms" {
+            measured_map.insert(key.clone(), value.clone());
+        }
+    }
+
     let occupancy = reference.occupancy();
     let host_rows = host_context.and_then(|context| context.rows);
     let detail = json!({
@@ -897,14 +948,7 @@ fn build_iteration(
             .map(|(start, end)| json!([offset(start), offset(end)])),
         "measured_gpu_cycle_ms": measured_gpu_cycle_ms,
         "simulated_gpu_cycle_ms": simulated_gpu_cycle_ms,
-        "measured": {
-            "critical_path_ms": summary.measured_ms,
-            "physical_path_ms": summary.measured_physical_path_ms,
-            "kernel_sum_ms": summary.measured_kernel_sum_ms,
-            "critical_device_id": summary.critical_device_id,
-            "busy_union_ms": measurement.busy_union_ms,
-            "kernels": kernel_rows,
-        },
+        "measured": measured_block,
         "simulated": {
             "total_ms": sim.total_ms,
             "slot_ms": sim.slot_ms,
@@ -916,17 +960,13 @@ fn build_iteration(
         "host": host_rows.map(host::IterationHost::value),
     });
 
-    let report = json!({
+    let mut report = json!({
         "iteration_id": summary.iteration_id,
         "case_index": summary.case_index,
         "stage": summary.stage,
         "iteration_type": summary.iteration_type,
         "identity_sequence": summary.identity_sequence,
         "selected_as": reason.label(),
-        "measured_ms": summary.measured_ms,
-        "measured_physical_path_ms": summary.measured_physical_path_ms,
-        "measured_kernel_sum_ms": summary.measured_kernel_sum_ms,
-        "critical_device_id": summary.critical_device_id,
         "simulated_ms": summary.simulated_ms,
         "delta_ms": summary.simulated_ms - summary.measured_ms,
         "relative_diff_pct": summary.relative_diff_pct,
@@ -944,6 +984,10 @@ fn build_iteration(
             time_origin_ns,
         ),
     });
+    report
+        .as_object_mut()
+        .expect("report row is an object")
+        .extend(path_fields);
 
     // The picker's row. Everything here is a scalar the reader sorts or filters
     // on before choosing what to fetch; anything per-kernel stays in the shard.
@@ -956,7 +1000,7 @@ fn build_iteration(
         "selected_as": reason.label(),
         "anchor_ns": anchor_ns.map(offset),
         "measured_ms": summary.measured_ms,
-        "critical_device_id": summary.critical_device_id,
+        "critical_rank_switches": path.critical_rank_switches,
         "simulated_ms": summary.simulated_ms,
         "relative_diff_pct": summary.relative_diff_pct,
         "measured_gpu_cycle_ms": measured_gpu_cycle_ms,
@@ -1217,7 +1261,11 @@ fn definitions() -> Value {
         "gpu_span_ns": "reference rank's [first kernel start, last kernel end]. The correlated kernel span, NOT the NVTX range: under CUDA graphs the range can close before its own kernels finish",
         "measured.kernels[].iv": "one [device_id, start_ns, end_ns, correlation_id, track_index] per rank launch of this kernel position, unreduced. Bubbles are the complement of the union of these over the span, and must be computed from these raw intervals rather than from drawn geometry; correlation_id is the NSYS launch identity used to connect the CUDA API lane",
         "measured.kernels[].iv[4]": "the concurrent CUDA stream (track) this launch ran on, 0 being the one that opened the range. Launches on different tracks of one device overlap in wall time, so a single lane per device would draw them as if they had been serial: give each (device, track) its own lane. A single-stream capture has track 0 only and draws exactly as before",
-        "measured.kernels[].occ_ns": "this occurrence's cross-rank reduction retained for audit. selected_raw_ms, selected_effective_ms, and selected_critical_ms show the selected device's literal duration, interval-union contribution, and post-collective-arrival contribution; selected_critical_ms sums to measured.critical_path_ms",
+        "measured.kernels[].occ_ns": "this occurrence's cross-rank reduction retained for audit",
+        "measured.kernels[].crit_ms": "this position's share of measured.critical_path_ms under the barrier model; these sum to it exactly. path_ms is its segment winners' clipped launch durations",
+        "measured.kernels[].ov": "one [overlap_ns, same_stream_ns, cross_stream_ns, stream_id, partners] per entry of iv, in the same order. overlap_ns is the intersection with the union of every other launch on the same device; same/cross restrict that to launches on this launch's stream or on others. partners is [[position, ns], ...] naming each overlapping position by its index in measured.kernels. A shared stretch appears on both sides of a pair. same_stream_ns may be griddepcontrol.wait residency (PDL)",
+        "measured.segments": "the windows between barriers, in time order: [start_ns, end_ns], the winning rank (largest busy union), every rank's busy ns, the winner's idle split, and the gating rank (last to arrive at the closing barrier, or last to finish for the final window) with its own non-busy ns",
+        "measured.barriers": "one per maximal run of consecutive synchronizing positions: the positions, last arrival (enter_ns), last exit (exit_ns), net_ns on the path, skew_ns off it, and the rank that left last",
         "simulated.slot_ms": "per-slot UNIT time. Feed these to the cost-tree unfold and let Scale{n} repeat them; critical-path-attributed times would render a losing Max branch as a zero-width leaf",
         "slot_multiplicity": "each slot's exact CostTree Scale multiplicity; folded workload = slot_ms x slot_multiplicity. Shared by every iteration because the tree shape is static",
         "operation_totals": "the ONLY sound join between the two lanes. occurrence_ratio is a counting ratio (3 measured kernels priced as 1 modelled leaf), never a per-kernel correspondence",
@@ -1257,10 +1305,7 @@ mod tests {
             stage: kind.to_string(),
             iteration_type: kind.to_string(),
             identity_sequence: sequence.to_string(),
-            critical_device_id: None,
             measured_ms: 1.0,
-            measured_physical_path_ms: 1.0,
-            measured_kernel_sum_ms: 1.0,
             simulated_ms: 1.0 + relative / 100.0,
             relative_diff_pct: relative,
         }
