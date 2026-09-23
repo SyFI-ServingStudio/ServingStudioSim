@@ -2,155 +2,155 @@
   "analyzer_schema": {
     "ep4_tp4_dp1/01_micro_throughput_c256": {
       "e2e": 1,
-      "iteration": 2,
+      "iteration": 3,
       "workload": 1
     },
     "ep4_tp4_dp1/02_graph_boundaries_c128": {
       "e2e": 1,
-      "iteration": 2,
+      "iteration": 3,
       "workload": 1
     },
     "ep4_tp4_dp1/03_balanced_anchor_c32": {
       "e2e": 1,
-      "iteration": 2,
+      "iteration": 3,
       "workload": 1
     },
     "ep4_tp4_dp1/04_prefill_spectrum_c32": {
       "e2e": 1,
-      "iteration": 2,
+      "iteration": 3,
       "workload": 1
     },
     "ep4_tp4_dp1/05_decode_spectrum_c64": {
       "e2e": 1,
-      "iteration": 2,
+      "iteration": 3,
       "workload": 1
     },
     "ep4_tp4_dp1/06_long_long_c8": {
       "e2e": 1,
-      "iteration": 2,
+      "iteration": 3,
       "workload": 1
     },
     "ep4_tp4_dp1/07_quadrant_interference_c48": {
       "e2e": 1,
-      "iteration": 2,
+      "iteration": 3,
       "workload": 1
     },
     "ep4_tp4_dp1/08_completion_churn_c96": {
       "e2e": 1,
-      "iteration": 2,
+      "iteration": 3,
       "workload": 1
     },
     "ep4_tp4_dp1/09_rate_knee": {
       "e2e": 1,
-      "iteration": 2,
+      "iteration": 3,
       "workload": 1
     },
     "ep4_tp4_dp1/10_full_saturation_rate": {
       "e2e": 1,
-      "iteration": 2,
+      "iteration": 3,
       "workload": 1
     },
     "ep4_tp4_dp1/11_long_prefill_ladder_c1": {
       "e2e": 1,
-      "iteration": 2,
+      "iteration": 3,
       "workload": 1
     },
     "ep4_tp4_dp1/12_ultra_context_decode_c1": {
       "e2e": 1,
-      "iteration": 2,
+      "iteration": 3,
       "workload": 1
     },
     "ep4_tp4_dp1/13_generation_length_matrix_c8": {
       "e2e": 1,
-      "iteration": 2,
+      "iteration": 3,
       "workload": 1
     },
     "ep4_tp4_dp1/14_near_full_long_decode_c21": {
       "e2e": 1,
-      "iteration": 2,
+      "iteration": 3,
       "workload": 1
     },
     "ep4_tp4_dp1/15_kv_overcommit_mixed_churn_c14": {
       "e2e": 1,
-      "iteration": 2,
+      "iteration": 3,
       "workload": 1
     }
   },
   "case_reports": {
     "ep4_tp4_dp1/01_micro_throughput_c256": {
-      "e2e": "logs/20260827_0_glm52_nvfp4_l1_clean_alignment/cases/01_micro_throughput_c256/analysis_e2e/reports/alignment_e2e_report.json",
-      "iteration": "logs/20260827_0_glm52_nvfp4_l1_clean_alignment/cases/01_micro_throughput_c256/analysis_kernel/reports/alignment_iteration_report.json",
-      "workload": "logs/20260827_0_glm52_nvfp4_l1_clean_alignment/cases/01_micro_throughput_c256/analysis_e2e/reports/alignment_workload_report.json"
+      "e2e": ".../new/01_micro_throughput_c256/analysis_e2e/reports/alignment_e2e_report.json",
+      "iteration": ".../new/01_micro_throughput_c256/analysis_kernel/reports/alignment_iteration_report.json",
+      "workload": ".../new/01_micro_throughput_c256/analysis_e2e/reports/alignment_workload_report.json"
     },
     "ep4_tp4_dp1/02_graph_boundaries_c128": {
-      "e2e": "logs/20260827_0_glm52_nvfp4_l1_clean_alignment/cases/02_graph_boundaries_c128/analysis_e2e/reports/alignment_e2e_report.json",
-      "iteration": "logs/20260827_0_glm52_nvfp4_l1_clean_alignment/cases/02_graph_boundaries_c128/analysis_kernel/reports/alignment_iteration_report.json",
-      "workload": "logs/20260827_0_glm52_nvfp4_l1_clean_alignment/cases/02_graph_boundaries_c128/analysis_e2e/reports/alignment_workload_report.json"
+      "e2e": ".../new/02_graph_boundaries_c128/analysis_e2e/reports/alignment_e2e_report.json",
+      "iteration": ".../new/02_graph_boundaries_c128/analysis_kernel/reports/alignment_iteration_report.json",
+      "workload": ".../new/02_graph_boundaries_c128/analysis_e2e/reports/alignment_workload_report.json"
     },
     "ep4_tp4_dp1/03_balanced_anchor_c32": {
-      "e2e": "logs/20260827_0_glm52_nvfp4_l1_clean_alignment/cases/03_balanced_anchor_c32/analysis_e2e/reports/alignment_e2e_report.json",
-      "iteration": "logs/20260827_0_glm52_nvfp4_l1_clean_alignment/cases/03_balanced_anchor_c32/analysis_kernel/reports/alignment_iteration_report.json",
-      "workload": "logs/20260827_0_glm52_nvfp4_l1_clean_alignment/cases/03_balanced_anchor_c32/analysis_e2e/reports/alignment_workload_report.json"
+      "e2e": ".../new/03_balanced_anchor_c32/analysis_e2e/reports/alignment_e2e_report.json",
+      "iteration": ".../new/03_balanced_anchor_c32/analysis_kernel/reports/alignment_iteration_report.json",
+      "workload": ".../new/03_balanced_anchor_c32/analysis_e2e/reports/alignment_workload_report.json"
     },
     "ep4_tp4_dp1/04_prefill_spectrum_c32": {
-      "e2e": "logs/20260827_0_glm52_nvfp4_l1_clean_alignment/cases/04_prefill_spectrum_c32/analysis_e2e/reports/alignment_e2e_report.json",
-      "iteration": "logs/20260827_0_glm52_nvfp4_l1_clean_alignment/cases/04_prefill_spectrum_c32/analysis_kernel/reports/alignment_iteration_report.json",
-      "workload": "logs/20260827_0_glm52_nvfp4_l1_clean_alignment/cases/04_prefill_spectrum_c32/analysis_e2e/reports/alignment_workload_report.json"
+      "e2e": ".../new/04_prefill_spectrum_c32/analysis_e2e/reports/alignment_e2e_report.json",
+      "iteration": ".../new/04_prefill_spectrum_c32/analysis_kernel/reports/alignment_iteration_report.json",
+      "workload": ".../new/04_prefill_spectrum_c32/analysis_e2e/reports/alignment_workload_report.json"
     },
     "ep4_tp4_dp1/05_decode_spectrum_c64": {
-      "e2e": "logs/20260827_0_glm52_nvfp4_l1_clean_alignment/cases/05_decode_spectrum_c64/analysis_e2e/reports/alignment_e2e_report.json",
-      "iteration": "logs/20260827_0_glm52_nvfp4_l1_clean_alignment/cases/05_decode_spectrum_c64/analysis_kernel/reports/alignment_iteration_report.json",
-      "workload": "logs/20260827_0_glm52_nvfp4_l1_clean_alignment/cases/05_decode_spectrum_c64/analysis_e2e/reports/alignment_workload_report.json"
+      "e2e": ".../new/05_decode_spectrum_c64/analysis_e2e/reports/alignment_e2e_report.json",
+      "iteration": ".../new/05_decode_spectrum_c64/analysis_kernel/reports/alignment_iteration_report.json",
+      "workload": ".../new/05_decode_spectrum_c64/analysis_e2e/reports/alignment_workload_report.json"
     },
     "ep4_tp4_dp1/06_long_long_c8": {
-      "e2e": "logs/20260827_0_glm52_nvfp4_l1_clean_alignment/cases/06_long_long_c8/analysis_e2e/reports/alignment_e2e_report.json",
-      "iteration": "logs/20260827_0_glm52_nvfp4_l1_clean_alignment/cases/06_long_long_c8/analysis_kernel/reports/alignment_iteration_report.json",
-      "workload": "logs/20260827_0_glm52_nvfp4_l1_clean_alignment/cases/06_long_long_c8/analysis_e2e/reports/alignment_workload_report.json"
+      "e2e": ".../new/06_long_long_c8/analysis_e2e/reports/alignment_e2e_report.json",
+      "iteration": ".../new/06_long_long_c8/analysis_kernel/reports/alignment_iteration_report.json",
+      "workload": ".../new/06_long_long_c8/analysis_e2e/reports/alignment_workload_report.json"
     },
     "ep4_tp4_dp1/07_quadrant_interference_c48": {
-      "e2e": "logs/20260827_0_glm52_nvfp4_l1_clean_alignment/cases/07_quadrant_interference_c48/analysis_e2e/reports/alignment_e2e_report.json",
-      "iteration": "logs/20260827_0_glm52_nvfp4_l1_clean_alignment/cases/07_quadrant_interference_c48/analysis_kernel/reports/alignment_iteration_report.json",
-      "workload": "logs/20260827_0_glm52_nvfp4_l1_clean_alignment/cases/07_quadrant_interference_c48/analysis_e2e/reports/alignment_workload_report.json"
+      "e2e": ".../new/07_quadrant_interference_c48/analysis_e2e/reports/alignment_e2e_report.json",
+      "iteration": ".../new/07_quadrant_interference_c48/analysis_kernel/reports/alignment_iteration_report.json",
+      "workload": ".../new/07_quadrant_interference_c48/analysis_e2e/reports/alignment_workload_report.json"
     },
     "ep4_tp4_dp1/08_completion_churn_c96": {
-      "e2e": "logs/20260827_0_glm52_nvfp4_l1_clean_alignment/cases/08_completion_churn_c96/analysis_e2e/reports/alignment_e2e_report.json",
-      "iteration": "logs/20260827_0_glm52_nvfp4_l1_clean_alignment/cases/08_completion_churn_c96/analysis_kernel/reports/alignment_iteration_report.json",
-      "workload": "logs/20260827_0_glm52_nvfp4_l1_clean_alignment/cases/08_completion_churn_c96/analysis_e2e/reports/alignment_workload_report.json"
+      "e2e": ".../new/08_completion_churn_c96/analysis_e2e/reports/alignment_e2e_report.json",
+      "iteration": ".../new/08_completion_churn_c96/analysis_kernel/reports/alignment_iteration_report.json",
+      "workload": ".../new/08_completion_churn_c96/analysis_e2e/reports/alignment_workload_report.json"
     },
     "ep4_tp4_dp1/09_rate_knee": {
-      "e2e": "logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/09_rate_knee/analysis_e2e/reports/alignment_e2e_report.json",
-      "iteration": "logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/09_rate_knee/analysis_kernel/reports/alignment_iteration_report.json",
-      "workload": "logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/09_rate_knee/analysis_e2e/reports/alignment_workload_report.json"
+      "e2e": ".../new/09_rate_knee/analysis_e2e/reports/alignment_e2e_report.json",
+      "iteration": ".../new/09_rate_knee/analysis_kernel/reports/alignment_iteration_report.json",
+      "workload": ".../new/09_rate_knee/analysis_e2e/reports/alignment_workload_report.json"
     },
     "ep4_tp4_dp1/10_full_saturation_rate": {
-      "e2e": "logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/10_full_saturation_rate/analysis_e2e/reports/alignment_e2e_report.json",
-      "iteration": "logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/10_full_saturation_rate/analysis_kernel/reports/alignment_iteration_report.json",
-      "workload": "logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/10_full_saturation_rate/analysis_e2e/reports/alignment_workload_report.json"
+      "e2e": ".../new/10_full_saturation_rate/analysis_e2e/reports/alignment_e2e_report.json",
+      "iteration": ".../new/10_full_saturation_rate/analysis_kernel/reports/alignment_iteration_report.json",
+      "workload": ".../new/10_full_saturation_rate/analysis_e2e/reports/alignment_workload_report.json"
     },
     "ep4_tp4_dp1/11_long_prefill_ladder_c1": {
-      "e2e": "logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/11_long_prefill_ladder_c1/analysis_e2e/reports/alignment_e2e_report.json",
-      "iteration": "logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/11_long_prefill_ladder_c1/analysis_kernel/reports/alignment_iteration_report.json",
-      "workload": "logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/11_long_prefill_ladder_c1/analysis_e2e/reports/alignment_workload_report.json"
+      "e2e": ".../new/11_long_prefill_ladder_c1/analysis_e2e/reports/alignment_e2e_report.json",
+      "iteration": ".../new/11_long_prefill_ladder_c1/analysis_kernel/reports/alignment_iteration_report.json",
+      "workload": ".../new/11_long_prefill_ladder_c1/analysis_e2e/reports/alignment_workload_report.json"
     },
     "ep4_tp4_dp1/12_ultra_context_decode_c1": {
-      "e2e": "logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/12_ultra_context_decode_c1/analysis_e2e/reports/alignment_e2e_report.json",
-      "iteration": "logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/12_ultra_context_decode_c1/analysis_kernel/reports/alignment_iteration_report.json",
-      "workload": "logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/12_ultra_context_decode_c1/analysis_e2e/reports/alignment_workload_report.json"
+      "e2e": ".../new/12_ultra_context_decode_c1/analysis_e2e/reports/alignment_e2e_report.json",
+      "iteration": ".../new/12_ultra_context_decode_c1/analysis_kernel/reports/alignment_iteration_report.json",
+      "workload": ".../new/12_ultra_context_decode_c1/analysis_e2e/reports/alignment_workload_report.json"
     },
     "ep4_tp4_dp1/13_generation_length_matrix_c8": {
-      "e2e": "logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/13_generation_length_matrix_c8/analysis_e2e/reports/alignment_e2e_report.json",
-      "iteration": "logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/13_generation_length_matrix_c8/analysis_kernel/reports/alignment_iteration_report.json",
-      "workload": "logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/13_generation_length_matrix_c8/analysis_e2e/reports/alignment_workload_report.json"
+      "e2e": ".../new/13_generation_length_matrix_c8/analysis_e2e/reports/alignment_e2e_report.json",
+      "iteration": ".../new/13_generation_length_matrix_c8/analysis_kernel/reports/alignment_iteration_report.json",
+      "workload": ".../new/13_generation_length_matrix_c8/analysis_e2e/reports/alignment_workload_report.json"
     },
     "ep4_tp4_dp1/14_near_full_long_decode_c21": {
-      "e2e": "logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/14_near_full_long_decode_c21/analysis_e2e/reports/alignment_e2e_report.json",
-      "iteration": "logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/14_near_full_long_decode_c21/analysis_kernel/reports/alignment_iteration_report.json",
-      "workload": "logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/14_near_full_long_decode_c21/analysis_e2e/reports/alignment_workload_report.json"
+      "e2e": ".../new/14_near_full_long_decode_c21/analysis_e2e/reports/alignment_e2e_report.json",
+      "iteration": ".../new/14_near_full_long_decode_c21/analysis_kernel/reports/alignment_iteration_report.json",
+      "workload": ".../new/14_near_full_long_decode_c21/analysis_e2e/reports/alignment_workload_report.json"
     },
     "ep4_tp4_dp1/15_kv_overcommit_mixed_churn_c14": {
-      "e2e": "logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/15_kv_overcommit_mixed_churn_c14/analysis_e2e/reports/alignment_e2e_report.json",
-      "iteration": "logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/15_kv_overcommit_mixed_churn_c14/analysis_kernel/reports/alignment_iteration_report.json",
-      "workload": "logs/20260827_1_glm52_nvfp4_long_context_alignment/cases/15_kv_overcommit_mixed_churn_c14/analysis_e2e/reports/alignment_workload_report.json"
+      "e2e": ".../new/15_kv_overcommit_mixed_churn_c14/analysis_e2e/reports/alignment_e2e_report.json",
+      "iteration": ".../new/15_kv_overcommit_mixed_churn_c14/analysis_kernel/reports/alignment_iteration_report.json",
+      "workload": ".../new/15_kv_overcommit_mixed_churn_c14/analysis_e2e/reports/alignment_workload_report.json"
     }
   },
   "formulas": {
@@ -173,7 +173,6 @@
     "09_rate_knee.rate"
   ],
   "recorded_from": [
-    "logs/20260827_0_glm52_nvfp4_l1_clean_alignment/cases",
-    "logs/20260827_1_glm52_nvfp4_long_context_alignment/cases"
+    ".../ServingStudio/wt-dflash2-land/logs/20260923_2_glm52_cost_fixes/new"
   ]
 }
