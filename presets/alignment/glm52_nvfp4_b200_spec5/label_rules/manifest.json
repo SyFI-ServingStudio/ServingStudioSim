@@ -1,7 +1,8 @@
 {
   "schema_version": 2,
   "rule_files": [
-    "rules.json"
+    "rules.json",
+    "v028_rules.json"
   ],
-  "provenance": "Measured-name predicates preserved from glm52-spec5 at 223c9e0. Defaults expanded per rule; recurrent step_1..step_4 slot suffixes translated to the clean folded mtp.recurrent namespace. Obsolete router_fp32_cast candidates removed because the router GEMM includes the conversion. Every remaining suffix resolves against the compiled Spec5 tree in a CPU regression. This is not a new GPU validation result."
+  "provenance": "Measured-name predicates preserved from glm52-spec5 at 223c9e0. Defaults expanded per rule; recurrent step_1..step_4 slot suffixes translated to the clean folded mtp.recurrent namespace. Obsolete router_fp32_cast candidates removed because the router GEMM includes the conversion. Every remaining suffix resolves against the compiled Spec5 tree in a CPU regression. This is not a new GPU validation result. v028_rules.json (20260923_1_fork_v028) adds the kernels the servingstudio-alignment fork (v0.28) launches: MNNVL all-reduce, fused norm/RoPE, fused indexer Q, tss router GEMM, the MRv2 sample and draft phases, and the MTP embedding and eh_norm prelude. rules.json predicates that also fired on v0.28 kernels were narrowed. The rules follow the pinned fork; on the v0.28 capture of spec5 case 1 map coverage is 94.4% (A-line capture: 94.3%)."
 }

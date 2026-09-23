@@ -3365,19 +3365,25 @@ mod tests {
         let mut slot_names = slot_names;
         slot_names.extend(full_index_slots.iter().map(|slot| slot.name.as_str()));
         let mut unresolved = std::collections::BTreeSet::new();
-        let encoded = include_str!(
-            "../../../presets/alignment/glm52_nvfp4_b200_spec5/label_rules/rules.json"
-        );
-        let document: serde_json::Value = serde_json::from_str(encoded).unwrap();
-        for rule in document["rules"].as_array().unwrap() {
-            if rule["status"] == "unmapped" {
-                assert!(rule.get("slot_suffixes").is_none());
-                continue;
-            }
-            for suffix in rule["slot_suffixes"].as_array().unwrap() {
-                let suffix = suffix.as_str().unwrap();
-                if !slot_names.iter().any(|name| name.ends_with(suffix)) {
-                    unresolved.insert(suffix.to_string());
+        let rules_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("presets/alignment/glm52_nvfp4_b200_spec5/label_rules");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(rules_dir.join("manifest.json")).unwrap())
+                .unwrap();
+        for file in manifest["rule_files"].as_array().unwrap() {
+            let path = rules_dir.join(file.as_str().unwrap());
+            let document: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            for rule in document["rules"].as_array().unwrap() {
+                if rule["status"] == "unmapped" {
+                    assert!(rule.get("slot_suffixes").is_none());
+                    continue;
+                }
+                for suffix in rule["slot_suffixes"].as_array().unwrap() {
+                    let suffix = suffix.as_str().unwrap();
+                    if !slot_names.iter().any(|name| name.ends_with(suffix)) {
+                        unresolved.insert(suffix.to_string());
+                    }
                 }
             }
         }

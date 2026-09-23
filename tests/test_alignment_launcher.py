@@ -2200,8 +2200,8 @@ def test_a_corpus_pass_refuses_a_protocol_that_returns_no_routes(tmp_path):
         load_profile_config(paths["profile"])
 
 
-def test_a_corpus_pass_refuses_the_v2_model_runner(tmp_path):
-    """The server refuses route capture under V2 only after the job is scheduled."""
+def test_a_corpus_pass_refuses_the_v1_model_runner(tmp_path):
+    """The server refuses MTP route capture under V1 only after the job is scheduled."""
     paths = _phase_configs(tmp_path)
     raw = yaml.safe_load(paths["profile"].read_text())
     raw["profile_kind"] = "token_corpus"
@@ -2209,11 +2209,11 @@ def test_a_corpus_pass_refuses_the_v2_model_runner(tmp_path):
         "packages": [
             {"name": "nvtx", "version": "0.2.16", "index_url": "https://pypi.org/simple"}
         ],
-        "environment": {"VLLM_USE_V2_MODEL_RUNNER": "1"},
+        "environment": {"VLLM_USE_V2_MODEL_RUNNER": "0"},
     }
     paths["profile"].write_text(yaml.safe_dump(raw))
 
-    with pytest.raises(ValueError, match="V1 model runner"):
+    with pytest.raises(ValueError, match="model runner V2"):
         load_profile_config(paths["profile"])
 
 

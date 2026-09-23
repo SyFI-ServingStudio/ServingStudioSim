@@ -228,12 +228,12 @@ def load_profile_config(path: Path, *, require_python_runtime: bool = True) -> P
             f"that returns routed experts, and {config.workload.backend.type!r} does not"
         )
     runtime_env = config.python_runtime.environment if config.python_runtime else {}
-    if config.profile_kind == "token_corpus" and runtime_env.get("VLLM_USE_V2_MODEL_RUNNER") == "1":
-        # The capturer lives in the V1 GPU model runner; the server refuses the
-        # combination at startup, after the job has already been scheduled.
+    if config.profile_kind == "token_corpus" and runtime_env.get("VLLM_USE_V2_MODEL_RUNNER") == "0":
+        # The pinned fork records an MTP drafter's routes only in model runner
+        # V2; V1 refuses at startup, after the job has already been scheduled.
         raise ValueError(
-            "invalid profile config: profile_kind token_corpus needs the V1 model "
-            "runner; drop VLLM_USE_V2_MODEL_RUNNER=1 from python_runtime.environment"
+            "invalid profile config: profile_kind token_corpus needs model runner "
+            "V2; drop VLLM_USE_V2_MODEL_RUNNER=0 from python_runtime.environment"
         )
     opted_out_of_eplb = "--no-enable-eplb" in config.server.extra_args
     if config.profile_kind == "expert_popularity" and opted_out_of_eplb:

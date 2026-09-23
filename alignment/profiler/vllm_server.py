@@ -7,7 +7,7 @@ vLLM), records launch metadata, and offers ready/idle polling over the
 OpenAI-compatible endpoints. The actual spawn is wrapped by `nsys_capture.py` and
 orchestrated in `__main__.py`.
 
-The fork (`alignment/profiler/vllm`, branch `moesim-profile`) adds the
+The fork (`alignment/profiler/vllm`, branch `servingstudio-alignment`) adds the
 `vllm_iteration(N): <phase>` NVTX scopes (gated by `VLLM_NVTX_SCOPES_FOR_PROFILING`)
 and a versioned `VibeSimAlignmentIteration {json}` record containing the exact
 model input shape consumed by the typed predictor adapter. Per-request

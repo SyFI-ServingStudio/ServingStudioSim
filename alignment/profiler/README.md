@@ -6,7 +6,7 @@ and the same versioned alignment records, so capture parsing and downstream
 analysis stay shared. The parent repository pins the exact fork commits:
 
 ```text
-alignment/profiler/vllm    # branch: moesim-profile
+alignment/profiler/vllm    # branch: servingstudio-alignment
 alignment/profiler/sglang  # branch: vibesim-alignment
 ```
 
@@ -49,12 +49,28 @@ its committed count is `null` if the scheduler has already removed the request.
 Such work contributes to raw verification totals, but cannot advance effective
 client output when deriving per-request acceptance rates.
 
+### One maintained fork line
+
+`servingstudio-alignment` is the only maintained line, on upstream vLLM
+v0.28.1rc0 (`8369aff`). Its `ALIGNMENT.md` records the base, what the line adds
+(instrumentation, MTP drafter route capture under model runner V2, record-only
+EPLB), and how each commit of the retired `moesim-profile` line was carried.
+`moesim-profile` stays on the remote because recorded captures name it. Every
+capture's `<name>_launch.json` records the fork's `head`, `branch`, and
+`status_short` under `fork_git`.
+
+To move to a newer upstream, rebase `servingstudio-alignment` onto it in an
+isolated checkout, update the base SHA in `ALIGNMENT.md`, rebuild `.venv` with
+the new base as the wheel commit, run the fork's focused tests listed there,
+and run a GPU capture through `alignment-campaign` before bumping the Sim
+gitlink.
+
 Only its `.venv` is missing — build it once. `runner.py` defaults `fork_python`
 to `alignment/profiler/vllm/.venv/bin/python`; override `fork_python` in
 the align config to point elsewhere.
 
-The instrumentation on `moesim-profile` is Python-only (NVTX scopes + iteration
-metrics logging), so the **precompiled fast path** works — no multi-hour CUDA
+The instrumentation on `servingstudio-alignment` is Python-only (NVTX scopes +
+iteration metrics logging), so the **precompiled fast path** works — no multi-hour CUDA
 compile. The submodule is detached at the parent gitlink, so explicitly select
 the last upstream commit before the `feat(alignment):` patches. Without this,
 vLLM's setup cannot resolve the branch and silently falls back to the latest
@@ -85,7 +101,7 @@ if [ -z "$FIRST_ALIGNMENT_COMMIT" ]; then
 fi
 PRECOMPILED_BASE_COMMIT=$(git rev-parse "$FIRST_ALIGNMENT_COMMIT^")
 if git diff --name-only "$PRECOMPILED_BASE_COMMIT"..HEAD | \
-  rg '\.(c|cc|cpp|cu|cuh|h|hpp|rs)$'; then
+  grep -E '\.(c|cc|cpp|cu|cuh|h|hpp|rs)$'; then
   echo "alignment fork has native changes; build vLLM from source" >&2
   exit 1
 fi
@@ -103,7 +119,9 @@ VLLM_USE_PRECOMPILED=1 \
 uv pip install --python .venv/bin/python nvtx
 
 # Sanity: the fork imports and exposes the instrumentation env var.
-uv run --python .venv/bin/python python -c "import vllm, vllm.envs as e; print(vllm.__version__, hasattr(e, 'VLLM_NVTX_SCOPES_FOR_PROFILING'))"
+# (Call the venv directly: `uv run` inside this directory resolves vLLM's own
+# pyproject instead.)
+.venv/bin/python -c "import vllm, vllm.envs as e; print(vllm.__version__, hasattr(e, 'VLLM_NVTX_SCOPES_FOR_PROFILING'))"
 ```
 
 Import success is not a CUDA-runtime qualification: an older driver can load the

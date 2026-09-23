@@ -114,11 +114,12 @@
         "body.sparse_cycle_index_share.attention.fused_qkv_a_proj",
         "body.sparse_initial_index_share.attention.fused_qkv_a_proj"
       ],
-      "note": "Full-capture review: physical tile or launch variant identified by same-stream model-operation neighbors; no sequence, rank, EP offset, or iteration identifier is used.",
+      "note": "Full-capture review: physical tile or launch variant identified by same-stream model-operation neighbors; no sequence, rank, EP offset, or iteration identifier is used. The v0.28 fork runs this split-K pair ahead of act_and_mul or _fused_norm_rope_kernel for other operations, so the rule also names what follows.",
       "source_experiment": "20260823_2_glm52_nvfp4_b200_ep4_c32_long_enwik9",
       "excluded_slot_prefixes": [
         "unified.mtp."
-      ]
+      ],
+      "before_name": "nvjet_sm100_tst_"
     },
     {
       "operation": "attention.fused_qkv_a_proj",
@@ -185,7 +186,6 @@
       "name": "nvjet_sm100_tst_",
       "stream_role": "primary",
       "after_name": "<none>",
-      "before_name": "cublasLt::splitKreduce_kernel",
       "type": "model",
       "role": "fused Q and latent KV projection",
       "cross_rank": "independent",
@@ -195,7 +195,29 @@
         "body.sparse_cycle_index_share.attention.fused_qkv_a_proj",
         "body.sparse_initial_index_share.attention.fused_qkv_a_proj"
       ],
-      "note": "Structural seed: reads kernel names only, so it fires on the first sweep and gives the neighbour-dependent rules for this operation something to start from. Synthesized under the same soundness test as the rest.",
+      "note": "Body-initial A-projection GEMM, identified by its split-K reduction. The v0.28 fork runs this split-K pair ahead of act_and_mul or _fused_norm_rope_kernel for other operations, so the rule also names what follows.",
+      "phase": "forward",
+      "excluded_slot_prefixes": [
+        "unified.mtp."
+      ],
+      "before": "attention.fused_qkv_a_proj"
+    },
+    {
+      "operation": "attention.fused_qkv_a_proj",
+      "name": "cublasLt::splitKreduce_kernel",
+      "stream_role": "primary",
+      "after_name": "nvjet_sm100_tst_",
+      "before_name": "nvjet_sm100_tst_",
+      "type": "model",
+      "role": "fused Q and latent KV projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.fused_qkv_a_proj",
+        "body.sparse_cycle_full_index.attention.fused_qkv_a_proj",
+        "body.sparse_cycle_index_share.attention.fused_qkv_a_proj",
+        "body.sparse_initial_index_share.attention.fused_qkv_a_proj"
+      ],
+      "note": "Structural seed: reads kernel names only. A split-K reduction between two GEMMs on the primary stream is the A-projection's; on v0.28 the same reduction ahead of act_and_mul or _fused_norm_rope_kernel belongs to other operations.",
       "phase": "forward",
       "excluded_slot_prefixes": [
         "unified.mtp."
@@ -325,7 +347,6 @@
       "phase": "forward",
       "stream_role": "primary",
       "after": "<none>",
-      "before_name": "cublasLt::splitKreduce_kernel",
       "type": "model",
       "role": "fused Q and latent KV projection",
       "cross_rank": "independent",
@@ -335,11 +356,12 @@
         "body.sparse_cycle_index_share.attention.fused_qkv_a_proj",
         "body.sparse_initial_index_share.attention.fused_qkv_a_proj"
       ],
-      "note": "Full-capture review: physical tile or launch variant identified by same-stream model-operation neighbors; no sequence, rank, EP offset, or iteration identifier is used. Split by predecessor. The fused QKV GEMM opens a decoder body, so it either follows the previous layer's MoE collective or starts the body. The GEMM that follows the fused QKV reduction is q_b_proj, not another fused QKV.",
+      "note": "Full-capture review: physical tile or launch variant identified by same-stream model-operation neighbors; no sequence, rank, EP offset, or iteration identifier is used. Split by predecessor. The fused QKV GEMM opens a decoder body, so it either follows the previous layer's MoE collective or starts the body. The GEMM that follows the fused QKV reduction is q_b_proj, not another fused QKV. Identified by its split-K reduction: on v0.28 a body-initial split-K pair also serves wk_weights_proj and the shared expert.",
       "source_experiment": "20260823_2_glm52_nvfp4_b200_ep4_c32_long_enwik9",
       "excluded_slot_prefixes": [
         "unified.mtp."
-      ]
+      ],
+      "before": "attention.fused_qkv_a_proj"
     },
     {
       "operation": "attention.fused_qkv_a_proj",
@@ -1697,11 +1719,12 @@
         "body.sparse_cycle_index_share.moe.router.router_gemm_bf16_proxy",
         "body.sparse_initial_index_share.moe.router.router_gemm_bf16_proxy"
       ],
-      "note": "At a sparse-layer boundary, the TNN GEMM immediately after the attention collective is the 256-way router projection. Split by consumer. After the attention collective a TNN GEMM is the router when it feeds the router's split-K reduction, the shared expert, or nothing; when it feeds the dense activation it is the dense FFN gate/up.",
+      "note": "At a sparse-layer boundary, the TNN GEMM immediately after the attention collective is the 256-way router projection. Split by consumer. After the attention collective a TNN GEMM is the router when it feeds the router's split-K reduction, the shared expert, or nothing; when it feeds the dense activation it is the dense FFN gate/up. On v0.28 the shared expert's GEMM follows the attention all-reduce here (the router runs on the concurrent stream), so the rule names v0.22's fused all-reduce kernel.",
       "source_experiment": "20260825_34_glm52_b200_ep4_workload_matrix",
       "excluded_slot_prefixes": [
         "unified.mtp."
-      ]
+      ],
+      "after_name": "allreduce_fusion"
     },
     {
       "operation": "moe.router",
@@ -1718,11 +1741,12 @@
         "body.sparse_cycle_index_share.moe.router.router_gemm_bf16_proxy",
         "body.sparse_initial_index_share.moe.router.router_gemm_bf16_proxy"
       ],
-      "note": "At a sparse-layer boundary, the TNN GEMM immediately after the attention collective is the 256-way router projection. Split by consumer. After the attention collective a TNN GEMM is the router when it feeds the router's split-K reduction, the shared expert, or nothing; when it feeds the dense activation it is the dense FFN gate/up.",
+      "note": "At a sparse-layer boundary, the TNN GEMM immediately after the attention collective is the 256-way router projection. Split by consumer. After the attention collective a TNN GEMM is the router when it feeds the router's split-K reduction, the shared expert, or nothing; when it feeds the dense activation it is the dense FFN gate/up. On v0.28 the shared expert's GEMM follows the attention all-reduce here (the router runs on the concurrent stream), so the rule names v0.22's fused all-reduce kernel.",
       "source_experiment": "20260825_34_glm52_b200_ep4_workload_matrix",
       "excluded_slot_prefixes": [
         "unified.mtp."
-      ]
+      ],
+      "after_name": "allreduce_fusion"
     },
     {
       "operation": "moe.router",
@@ -1739,11 +1763,12 @@
         "body.sparse_cycle_index_share.moe.router.router_gemm_bf16_proxy",
         "body.sparse_initial_index_share.moe.router.router_gemm_bf16_proxy"
       ],
-      "note": "At a sparse-layer boundary, the TNN GEMM immediately after the attention collective is the 256-way router projection. Split by consumer. After the attention collective a TNN GEMM is the router when it feeds the router's split-K reduction, the shared expert, or nothing; when it feeds the dense activation it is the dense FFN gate/up.",
+      "note": "At a sparse-layer boundary, the TNN GEMM immediately after the attention collective is the 256-way router projection. Split by consumer. After the attention collective a TNN GEMM is the router when it feeds the router's split-K reduction, the shared expert, or nothing; when it feeds the dense activation it is the dense FFN gate/up. On v0.28 the shared expert's GEMM follows the attention all-reduce here (the router runs on the concurrent stream), so the rule names v0.22's fused all-reduce kernel.",
       "source_experiment": "20260825_34_glm52_b200_ep4_workload_matrix",
       "excluded_slot_prefixes": [
         "unified.mtp."
-      ]
+      ],
+      "after_name": "allreduce_fusion"
     },
     {
       "operation": "moe.router",
@@ -1988,11 +2013,12 @@
       "slot_suffixes": [
         "moe.router.router_gemm_bf16_proxy"
       ],
-      "note": "Producer half of the router split-K assembly after its reduction tail has been identified.",
+      "note": "Producer half of the router split-K assembly after its reduction tail has been identified. On v0.28 the shared expert's GEMM follows the attention all-reduce here (the router runs on the concurrent stream), so the rule names v0.22's fused all-reduce kernel.",
       "source_experiment": "20260825_8_glm52_nvfp4_b200_ep4_serial_shared_fused_alignment",
       "excluded_slot_prefixes": [
         "unified.mtp."
-      ]
+      ],
+      "after_name": "allreduce_fusion"
     },
     {
       "operation": "moe.router",
@@ -2006,11 +2032,12 @@
       "slot_suffixes": [
         "moe.router.router_gemm_bf16_proxy"
       ],
-      "note": "The first split-K GEMM assembly after the sparse attention boundary is the 6144x256 router. The following assembly is shared-expert gate/up. GateLinear emits FP32 output from the GEMM, so there is no separate cast launch.",
+      "note": "The first split-K GEMM assembly after the sparse attention boundary is the 6144x256 router. The following assembly is shared-expert gate/up. GateLinear emits FP32 output from the GEMM, so there is no separate cast launch. On v0.28 the shared expert's GEMM follows the attention all-reduce here (the router runs on the concurrent stream), so the rule names v0.22's fused all-reduce kernel.",
       "source_experiment": "20260825_8_glm52_nvfp4_b200_ep4_serial_shared_fused_alignment",
       "excluded_slot_prefixes": [
         "unified.mtp."
-      ]
+      ],
+      "after_name": "allreduce_fusion"
     },
     {
       "operation": "moe.shared_expert.down_proj",
@@ -3254,7 +3281,9 @@
         "mtp.step_0.decoder_sparse.moe.router.router_gemm_bf16_proxy",
         "mtp.recurrent.decoder_sparse.moe.router.router_gemm_bf16_proxy"
       ],
-      "phase": "draft"
+      "phase": "draft",
+      "after_name": "allreduce_fusion",
+      "note": "On v0.28 the shared expert's GEMM follows the attention all-reduce here (the router runs on the concurrent stream), so the rule names v0.22's fused all-reduce kernel."
     },
     {
       "operation": "mtp.decoder.moe.router",
@@ -3294,12 +3323,13 @@
         "mtp.step_0.decoder_sparse.moe.shared_expert.gate_up_proj",
         "mtp.recurrent.decoder_sparse.moe.shared_expert.gate_up_proj"
       ],
-      "phase": "draft"
+      "phase": "draft",
+      "before": "mtp.decoder.moe.shared_expert.gate_up_proj",
+      "note": "On v0.22 the shared expert overlaps on the concurrent stream; on v0.28 that stream carries the router GEMM ahead of the routed experts, so the reduction is identified by the SiLU that follows it."
     },
     {
       "operation": "mtp.decoder.moe.shared_expert.gate_up_proj",
       "name": "cublasLt::splitKreduce_kernel",
-      "after": "mtp.decoder.moe.shared_expert.gate_up_proj",
       "stream_role": "concurrent",
       "type": "model",
       "role": "MTP decoder shared-expert gate/up projection",
@@ -3307,7 +3337,9 @@
         "mtp.step_0.decoder_sparse.moe.shared_expert.gate_up_proj",
         "mtp.recurrent.decoder_sparse.moe.shared_expert.gate_up_proj"
       ],
-      "phase": "draft"
+      "phase": "draft",
+      "before_name": "triton_poi_fused_mul_silu_slice_0",
+      "note": "On v0.22 the shared expert overlaps on the concurrent stream; on v0.28 that stream carries the router GEMM ahead of the routed experts, so the reduction is identified by the SiLU that follows it."
     },
     {
       "operation": "mtp.decoder.moe.shared_expert.silu_and_mul",
@@ -3646,7 +3678,8 @@
         "mtp.step_0.decoder_sparse.attention.indexer.wk_weights_proj",
         "mtp.recurrent.decoder_sparse.attention.indexer.wk_weights_proj"
       ],
-      "note": "Run-linked f0c72dfb65 eagle_head subgraph0 executes K6144/N160 WK before K6144/N2624 QKV after input RMSNorm. This small split-K tile and its completion belong to WK, not QKV."
+      "note": "Run-linked f0c72dfb65 eagle_head subgraph0 executes K6144/N160 WK before K6144/N2624 QKV after input RMSNorm. This small split-K tile and its completion belong to WK, not QKV. v0.22 runs wk_weights_proj first after the input norm; v0.28 runs fused_qkv_a_proj first, so the rule names v0.22's Triton norm.",
+      "after_name": "triton_red_fused_rms_norm"
     },
     {
       "operation": "mtp.decoder.attention.indexer.wk_weights_proj",
