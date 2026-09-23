@@ -49,12 +49,19 @@ launcher fetches during expansion:
 
 ```yaml
 routing: corpus
-token_corpus_file: hf://uw-syfi/servingstudio-corpora@<commit-sha>/glm53/manifest.json
+token_corpus_file: hf://UW-SyFI/servingstudio-corpora@43eda3dceb647df4802da27fb4fef3afc8a68fda/glm52_nvfp4_mtp5/manifest.json
 ```
 
 The revision must be a commit sha; a branch or tag is refused. Search for an
 existing corpus the same way as a popularity file, and record which one was
 used — two corpora of the same model are different recordings.
+
+Published corpora live in the private hub repository
+`UW-SyFI/servingstudio-corpora`, which needs a Hugging Face login with access to
+the `UW-SyFI` organization. Its `README.md` records each capture's model,
+deployment, and workload. Today it holds `glm52_nvfp4_mtp5`: GLM-5.2 NVFP4, vLLM
+TP4 EP4 with MTP-5, the reference above. Publish a new capture as a new
+directory, and reference it by the upload's commit.
 
 Both artifacts come from one capture: `profile_kind: token_corpus` in
 `operate-run-alignment`, which writes the corpus and, when the expert topology
