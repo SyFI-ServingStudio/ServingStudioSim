@@ -21,6 +21,7 @@ _GLOBAL_NUM_EXPERTS = 896
 _NUM_LOCAL_EXPERTS = 112
 _SUPPORTED_NUM_EXPERTS = frozenset({_NUM_LOCAL_EXPERTS, _GLOBAL_NUM_EXPERTS})
 _TOP_K = 16
+_RANK_LOCAL_TOP_K = 2
 _EPILOGUE_TILE_M = 128
 
 
@@ -50,7 +51,6 @@ def _validate_args(**kwargs: Any) -> dict[str, Any]:
         "hidden_size": _HIDDEN_SIZE,
         "intermediate_size": _INTERMEDIATE_SIZE,
         "num_local_experts": _NUM_LOCAL_EXPERTS,
-        "top_k": _TOP_K,
         "group_size": _GROUP_SIZE,
         "n_group": 1,
         "topk_group": 1,
@@ -63,6 +63,17 @@ def _validate_args(**kwargs: Any) -> dict[str, Any]:
         raise ValueError(
             f"K3 MXFP4 requires num_experts in {{{supported}}}, "
             f"got {args['num_experts']}"
+        )
+    allowed_top_k = (
+        {_TOP_K}
+        if args["num_experts"] == _GLOBAL_NUM_EXPERTS
+        else {_RANK_LOCAL_TOP_K, _TOP_K}
+    )
+    if args["top_k"] not in allowed_top_k:
+        supported = ", ".join(str(value) for value in sorted(allowed_top_k))
+        raise ValueError(
+            f"K3 MXFP4 requires top_k in {{{supported}}} for "
+            f"num_experts={args['num_experts']}, got {args['top_k']}"
         )
     if args["weight_format"] != _WEIGHT_FORMAT:
         raise ValueError(f"unsupported MXFP4 weight format: {args['weight_format']}")
@@ -296,6 +307,8 @@ def profile_mxfp4_fused_moe(
                 local_expert_offset=0,
                 local_num_experts=args["num_local_experts"],
                 routed_scaling_factor=None,
+                # The K3 layer's standard routed-topk path converts its
+                # DeepSeek-V3 router output to the TopK FlashInfer ABI here.
                 routing_method_type=RoutingMethodType.TopK.value,
                 do_finalize=True,
                 enable_pdl=True,

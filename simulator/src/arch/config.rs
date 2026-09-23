@@ -177,6 +177,18 @@ pub enum IterArchSel {
         #[serde(default)]
         #[param(cache_key)]
         local_experts: Option<u32>,
+        /// Optional rank-local routed assignments per token. Rank-1 alignment
+        /// sets this to 2 to emulate the local share of global top-16 routing;
+        /// production omits it and keeps the global top-16 contract.
+        #[serde(default)]
+        #[param(cache_key)]
+        local_top_k: Option<u32>,
+        /// Optional one-layer routing histogram emitted by an alignment
+        /// payload. When absent, rank-1 uses the analytic Poisson-like
+        /// fallback over its 112 local experts.
+        #[serde(default)]
+        #[param(cache_key)]
+        routing_histogram_file: Option<String>,
         /// Set exactly one of these for a one-layer alignment probe. Both absent
         /// means the complete explicit heterogeneous schedule.
         #[serde(default)]
@@ -922,7 +934,7 @@ mod iter_tests {
     #[test]
     fn kimi_k3_sglang_selector_publishes_both_topologies_and_layer_overrides() {
         let parsed: IterArchSel = serde_json::from_str(
-            r#"{"type":"kimi_k3_sglang","model_config":"model/config/kimi_k3.json","fp8":false,"attn_tp_size":1,"ep_size":1,"pp_size":1,"heads_per_rank":12,"local_experts":112,"sim_kda_layers":1,"sim_mla_layers":0}"#,
+            r#"{"type":"kimi_k3_sglang","model_config":"model/config/kimi_k3.json","fp8":false,"attn_tp_size":1,"ep_size":1,"pp_size":1,"heads_per_rank":12,"local_experts":112,"local_top_k":2,"sim_kda_layers":1,"sim_mla_layers":0}"#,
         )
         .expect("Kimi-K3 rank1 selector parses");
         let IterArchSel::KimiK3Sglang {
@@ -933,6 +945,8 @@ mod iter_tests {
             dcp_size,
             heads_per_rank,
             local_experts,
+            local_top_k,
+            routing_histogram_file,
             sim_kda_layers,
             sim_mla_layers,
             kda_state_dtype,
@@ -944,6 +958,8 @@ mod iter_tests {
         assert_eq!((*attn_tp_size, *ep_size, *pp_size, *dcp_size), (1, 1, 1, 1));
         assert_eq!(*heads_per_rank, Some(12));
         assert_eq!(*local_experts, Some(112));
+        assert_eq!(*local_top_k, Some(2));
+        assert!(routing_histogram_file.is_none());
         assert_eq!(*sim_kda_layers, Some(1));
         assert_eq!(*sim_mla_layers, Some(0));
         assert_eq!(kda_state_dtype, "bf16");
@@ -960,6 +976,8 @@ mod iter_tests {
         assert!(names.contains(&"dcp_size"));
         assert!(names.contains(&"heads_per_rank"));
         assert!(names.contains(&"local_experts"));
+        assert!(names.contains(&"local_top_k"));
+        assert!(names.contains(&"routing_histogram_file"));
         assert!(names.contains(&"sim_kda_layers"));
         assert!(names.contains(&"sim_mla_layers"));
         assert!(names.contains(&"kda_state_dtype"));

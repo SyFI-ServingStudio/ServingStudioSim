@@ -133,18 +133,21 @@ def test_k3_specs_coerce_representative_json_shapes():
     assert moe.per_expert_batches[:16] == (16,) * 16
 
 
-@pytest.mark.parametrize("num_experts", [112, 896])
-def test_mxfp4_runner_accepts_rank_local_and_global_routing_widths(num_experts):
+@pytest.mark.parametrize(
+    ("num_experts", "top_k"),
+    [(112, 2), (112, 16), (896, 16)],
+)
+def test_mxfp4_runner_accepts_rank_local_and_global_routing_widths(num_experts, top_k):
     from profiling.runners.moe.mxfp4_fused_moe import _validate_args
 
-    counts = [16] * 16 + [0] * (num_experts - 16)
+    counts = [top_k] * 16 + [0] * (num_experts - 16)
     args = _validate_args(
         num_tokens=16,
         hidden_size=3584,
         intermediate_size=3072,
         num_experts=num_experts,
         num_local_experts=112,
-        top_k=16,
+        top_k=top_k,
         input_dtype="bf16",
         weight_format="mxfp4_e2m1_ue8m0",
         group_size=32,

@@ -317,6 +317,8 @@ pub struct KimiK3SglangParallel {
     pub kda_state_dtype: DType,
     pub heads_per_rank: Option<u16>,
     pub local_experts: Option<u32>,
+    pub local_top_k: Option<u32>,
+    pub routing_histogram: Option<Vec<f32>>,
     pub sim_kda_layers: Option<u32>,
     pub sim_mla_layers: Option<u32>,
     pub gpu_name: String,
@@ -356,6 +358,29 @@ impl KimiK3SglangParallel {
             model.num_experts.get() % local_experts == 0,
             "local_experts must divide the global expert count"
         );
+        if let Some(local_top_k) = self.local_top_k {
+            ensure!(local_top_k > 0, "local_top_k must be positive");
+            ensure!(
+                local_top_k <= model.top_k,
+                "local_top_k must not exceed global top_k"
+            );
+            if local_top_k != model.top_k {
+                ensure!(
+                    self.ep_size == 1 && local_experts < model.num_experts.get(),
+                    "a reduced local_top_k is only valid for a rank-local probe"
+                );
+            }
+        }
+        if self.routing_histogram.is_some() {
+            ensure!(
+                self.ep_size == 1,
+                "routing_histogram is only supported for a rank-local alignment probe"
+            );
+            ensure!(
+                self.local_top_k.is_some(),
+                "routing_histogram requires explicit local_top_k"
+            );
+        }
         ensure!(
             u32::from(self.ep_size) * u32::from(self.pp_size) <= u32::from(u16::MAX),
             "ep_size*pp_size does not fit the worker GPU count"
@@ -389,6 +414,10 @@ impl KimiK3SglangParallel {
     pub fn local_experts_value_from_constants(&self) -> u32 {
         self.local_experts
             .unwrap_or(NUM_EXPERTS / u32::from(self.ep_size))
+    }
+
+    pub fn routing_top_k_value(&self, model: &KimiK3ModelCfg) -> u32 {
+        self.local_top_k.unwrap_or(model.top_k)
     }
 
     pub fn num_attn_dp_groups(&self) -> u16 {
@@ -446,13 +475,20 @@ fn pipeline_stage_counts(
             let last = (stage + 1) * model.num_layers / pp;
             let in_stage = |layer: &u32| (*layer >= first) && (*layer <= last);
             KimiK3LayerCounts {
-                dense: model.kda_layers.iter().any(|layer| *layer == 1 && in_stage(layer)) as u32,
+                dense: model
+                    .kda_layers
+                    .iter()
+                    .any(|layer| *layer == 1 && in_stage(layer)) as u32,
                 kda: model
                     .kda_layers
                     .iter()
                     .filter(|layer| **layer != 1 && in_stage(layer))
                     .count() as u32,
-                mla: model.full_attn_layers.iter().filter(|layer| in_stage(layer)).count() as u32,
+                mla: model
+                    .full_attn_layers
+                    .iter()
+                    .filter(|layer| in_stage(layer))
+                    .count() as u32,
             }
         })
         .collect()
@@ -510,6 +546,7 @@ pub fn build_configs(
     } else {
         model.num_experts.get()
     };
+    let routing_top_k = parallel.routing_top_k_value(model);
     let include_model_io = parallel.sim_kda_layers.is_none() && parallel.sim_mla_layers.is_none();
 
     let kda_cfg = || KimiK3KdaLocalWorkletConfig {
@@ -538,7 +575,8 @@ pub fn build_configs(
         local_experts: local_experts.into(),
         moe_intermediate: model.moe_intermediate.clone(),
         shared_intermediate: model.shared_intermediate.clone(),
-        top_k: model.top_k,
+        top_k: routing_top_k,
+        routing_histogram: parallel.routing_histogram.clone(),
         ep_size: parallel.ep_size,
         dtype: DType::Bf16,
         gemm_backends: GEMM_BACKENDS.to_vec(),
@@ -809,6 +847,21 @@ impl KimiK3SglangModel {
             "global_heads": NUM_HEADS,
             "local_experts": self.parallel.local_experts_value_from_constants(),
             "global_experts": NUM_EXPERTS,
+            "routing_experts": if self.parallel.ep_size == 1 {
+                self.parallel.local_experts_value_from_constants()
+            } else {
+                NUM_EXPERTS
+            },
+            "routing_top_k": self.parallel.local_top_k.unwrap_or(TOP_K),
+            "routing_source": if self.parallel.local_top_k.is_some() {
+                if self.parallel.routing_histogram.is_some() {
+                    "measured_alignment_payload"
+                } else {
+                    "analytic_uniform_poisson_like"
+                }
+            } else {
+                "production_global_top16"
+            },
             "layer_counts": counts(self.counts),
             "pp_stage_layer_counts": self.pp_stage_counts.iter().copied().map(counts).collect::<Vec<_>>(),
             "pp_size": self.parallel.pp_size,
@@ -1207,6 +1260,8 @@ mod tests {
             kda_state_dtype: DType::Bf16,
             heads_per_rank: Some(12),
             local_experts: Some(112),
+            local_top_k: Some(2),
+            routing_histogram: None,
             sim_kda_layers,
             sim_mla_layers,
             gpu_name: "NVIDIA B200".into(),
@@ -1227,6 +1282,8 @@ mod tests {
             kda_state_dtype: DType::Bf16,
             heads_per_rank: None,
             local_experts: None,
+            local_top_k: None,
+            routing_histogram: None,
             sim_kda_layers: None,
             sim_mla_layers: None,
             gpu_name: "NVIDIA B200".into(),
@@ -1262,7 +1319,12 @@ mod tests {
         bridge.enable_enumerate();
         let resolved = resolve_configs(&configs);
         assert_eq!(
-            resolved.mla_moe.as_ref().unwrap().mxfp4_fused_moe.num_experts,
+            resolved
+                .mla_moe
+                .as_ref()
+                .unwrap()
+                .mxfp4_fused_moe
+                .num_experts,
             896
         );
         let enumerated = build("unified".into(), resolved, &bridge).unwrap();
@@ -1290,7 +1352,10 @@ mod tests {
         );
         let resolved = resolve_configs(&kda);
         assert_eq!(resolved.kda_attention.as_ref().unwrap().raw_cfg.heads, 12);
-        assert_eq!(resolved.kda_moe.as_ref().unwrap().raw_cfg.local_experts, 112);
+        assert_eq!(
+            resolved.kda_moe.as_ref().unwrap().raw_cfg.local_experts,
+            112
+        );
         assert_eq!(
             resolved
                 .kda_moe
@@ -1323,6 +1388,8 @@ mod tests {
             kda_state_dtype: DType::Bf16,
             heads_per_rank: None,
             local_experts: None,
+            local_top_k: None,
+            routing_histogram: None,
             sim_kda_layers: None,
             sim_mla_layers: None,
             gpu_name: "NVIDIA B200".into(),
@@ -1359,6 +1426,8 @@ mod tests {
             kda_state_dtype: DType::Bf16,
             heads_per_rank: None,
             local_experts: None,
+            local_top_k: None,
+            routing_histogram: None,
             sim_kda_layers: None,
             sim_mla_layers: None,
             gpu_name: "NVIDIA B200".into(),
@@ -1448,6 +1517,8 @@ mod tests {
             kda_state_dtype: DType::Bf16,
             heads_per_rank: None,
             local_experts: None,
+            local_top_k: None,
+            routing_histogram: None,
             sim_kda_layers: Some(1),
             sim_mla_layers: Some(0),
             gpu_name: "NVIDIA B200".into(),

@@ -26,20 +26,12 @@ const MOE_INTERMEDIATE: u32 = 3_072;
 const TOP_K: u32 = 16;
 const SHARED_INTERMEDIATE: u32 = 6_144;
 
-// The rank-1 alignment driver uses the same seeded random-initialized K3 gate
-// as the layer probe. These are its synchronized B=128 top-k hit counts,
-// treated as a popularity profile so every simulator batch gets a reproducible
-// realization with the same sparse expert load shape. Production EP8 keeps
-// the existing 896-expert routing law below.
-const K3_RANK1_DRIVER_B128_COUNTS: &[f32] = &[
-    0.0, 27.0, 5.0, 0.0, 0.0, 40.0, 1.0, 124.0, 0.0, 0.0, 2.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-    0.0, 1.0, 102.0, 28.0, 128.0, 92.0, 0.0, 1.0, 15.0, 18.0, 10.0, 10.0, 0.0, 1.0, 111.0, 0.0,
-    6.0, 0.0, 0.0, 49.0, 0.0, 123.0, 0.0, 0.0, 0.0, 0.0, 47.0, 0.0, 0.0, 0.0, 0.0, 0.0, 79.0, 1.0,
-    1.0, 32.0, 17.0, 0.0, 0.0, 0.0, 126.0, 0.0, 0.0, 7.0, 0.0, 125.0, 6.0, 0.0, 0.0, 119.0, 0.0,
-    0.0, 0.0, 3.0, 0.0, 0.0, 0.0, 0.0, 23.0, 0.0, 5.0, 66.0, 0.0, 0.0, 4.0, 0.0, 0.0, 4.0, 14.0,
-    0.0, 50.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 4.0, 0.0, 0.0, 74.0, 0.0, 0.0, 128.0, 0.0, 0.0,
-    88.0, 0.0, 126.0, 0.0, 0.0, 0.0, 4.0,
-];
+// The realistic rank-1 payloads expose timing/kernel tables but no expert-count
+// histogram. The analytic fallback is a uniform expectation over 112 local
+// experts; independent weighted top-2 sampling below produces the expected
+// Poisson-like realized load for 128 x 2 = 256 assignments. A future alignment
+// payload with measured counts can replace this source without changing the
+// production global routing path.
 
 #[cfg(test)]
 const SOURCE_ORDER: [&str; 8] = [
@@ -67,6 +59,9 @@ pub struct KimiK3MoeLocalWorkletConfig {
     pub moe_intermediate: Dim,
     pub shared_intermediate: Dim,
     pub top_k: u32,
+    /// Measured alignment probabilities/counts, when a payload supplied them.
+    /// `None` selects the analytic rank-local fallback.
+    pub routing_histogram: Option<Vec<f32>>,
     pub ep_size: u16,
     pub dtype: DType,
     pub gemm_backends: Vec<&'static str>,
@@ -111,12 +106,24 @@ impl KimiK3MoeLocalWorklet {
             .unwrap_or_else(|reason| panic!("invalid KimiK3MoeLocalWorkletConfig: {reason}"));
         let merged_front_n =
             2 * cfg.shared_intermediate.get() + cfg.num_experts.get() + cfg.latent_hidden.get();
-        let rank1_driver_profile = cfg.routing_experts.get() == cfg.local_experts.get();
-        let ppm = if rank1_driver_profile {
-            k3_rank1_driver_ppm()
-        } else {
-            uniform_ppm(cfg.routing_experts.get())
-        };
+        let measured_routing = cfg.routing_histogram.is_some();
+        let analytic_rank_local_routing = !measured_routing
+            && cfg.routing_experts.get() == cfg.local_experts.get()
+            && cfg.top_k < TOP_K;
+        let ppm = cfg
+            .routing_histogram
+            .as_deref()
+            .map(|histogram| {
+                assert_eq!(histogram.len(), cfg.routing_experts.get() as usize);
+                RoutingDistribution::from_profile(histogram).ppm().to_vec()
+            })
+            .unwrap_or_else(|| {
+                if analytic_rank_local_routing {
+                    analytic_rank1_ppm(cfg.routing_experts.get())
+                } else {
+                    uniform_ppm(cfg.routing_experts.get())
+                }
+            });
         KimiK3MoeLocalWorkletResolved {
             merged_front: SingleGemmKernelConfig {
                 backends: cfg.gemm_backends.clone(),
@@ -159,7 +166,7 @@ impl KimiK3MoeLocalWorklet {
                 gemm1_clamp_limit: 25,
                 layerwise_global_ppm: vec![ppm],
                 folded_rank_position: 0,
-                stochastic_routing: rank1_driver_profile,
+                stochastic_routing: analytic_rank_local_routing || measured_routing,
             },
             routed_norm: RmsNormKernelConfig {
                 backends: cfg.rms_norm_backends.clone(),
@@ -334,11 +341,9 @@ fn uniform_ppm(num_experts: u32) -> Vec<u32> {
         .collect()
 }
 
-fn k3_rank1_driver_ppm() -> Vec<u32> {
-    assert_eq!(K3_RANK1_DRIVER_B128_COUNTS.len(), 112);
-    RoutingDistribution::from_profile(K3_RANK1_DRIVER_B128_COUNTS)
-        .ppm()
-        .to_vec()
+fn analytic_rank1_ppm(num_experts: u32) -> Vec<u32> {
+    assert_eq!(num_experts, 112);
+    RoutingDistribution::uniform(num_experts).ppm().to_vec()
 }
 
 fn validate_config(cfg: &KimiK3MoeLocalWorkletConfig) -> Result<(), String> {
@@ -367,11 +372,17 @@ fn validate_config(cfg: &KimiK3MoeLocalWorkletConfig) -> Result<(), String> {
     if cfg.routing_experts != cfg.local_experts && cfg.routing_experts != cfg.num_experts {
         return Err("routing_experts must equal local_experts or num_experts".to_string());
     }
-    if cfg.routing_experts.get() < cfg.top_k {
+    if cfg.top_k == 0 || cfg.routing_experts.get() < cfg.top_k {
         return Err("routing_experts must be at least top_k".to_string());
     }
-    if cfg.top_k != TOP_K {
-        return Err(format!("top_k must be {TOP_K}, got {}", cfg.top_k));
+    if cfg.top_k > TOP_K {
+        return Err(format!("top_k must not exceed {TOP_K}, got {}", cfg.top_k));
+    }
+    if cfg.routing_experts == cfg.num_experts && cfg.top_k != TOP_K {
+        return Err(format!(
+            "global routing must use top_k={TOP_K}, got {}",
+            cfg.top_k
+        ));
     }
     if cfg.dtype != DType::Bf16 {
         return Err("K3 MoE activations use bf16".to_string());
@@ -394,6 +405,7 @@ mod tests {
             moe_intermediate: MOE_INTERMEDIATE.into(),
             shared_intermediate: SHARED_INTERMEDIATE.into(),
             top_k: TOP_K,
+            routing_histogram: None,
             ep_size: 8,
             dtype: DType::Bf16,
             gemm_backends: vec!["sglang_bf16_auto"],
@@ -433,21 +445,27 @@ mod tests {
     }
 
     #[test]
-    fn rank1_driver_routing_profile_is_normalized_and_topk_compatible() {
-        let ppm = k3_rank1_driver_ppm();
+    fn rank1_analytic_routing_profile_is_normalized_and_poisson_like() {
+        let ppm = analytic_rank1_ppm(112);
         assert_eq!(ppm.len(), 112);
         assert_eq!(
             ppm.iter().map(|&value| u64::from(value)).sum::<u64>(),
             1_000_000
         );
-        assert!(ppm.iter().filter(|&&value| value > 0).count() >= TOP_K as usize);
+        assert!(ppm.iter().all(|&value| value > 0));
+        let counts =
+            crate::timing::routing::sample_random_topk_expert_counts(&ppm, 2, 128, 0xF01D_5EED);
+        assert_eq!(counts.iter().sum::<u32>(), 256);
+        assert!(counts.iter().min() < counts.iter().max());
 
         let mut cfg = config();
         cfg.routing_experts = 112.into();
         cfg.ep_size = 1;
+        cfg.top_k = 2;
         let resolved = KimiK3MoeLocalWorklet::resolve_config(&cfg);
         assert!(resolved.mxfp4_fused_moe.stochastic_routing);
         assert_eq!(resolved.mxfp4_fused_moe.num_experts, 112);
+        assert_eq!(resolved.mxfp4_fused_moe.top_k, 2);
     }
 
     #[test]

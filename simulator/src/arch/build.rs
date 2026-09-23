@@ -735,6 +735,8 @@ pub fn kimi_k3_sglang(
     dcp_size: u16,
     heads_per_rank: Option<u16>,
     local_experts: Option<u32>,
+    local_top_k: Option<u32>,
+    routing_histogram_file: Option<&str>,
     sim_kda_layers: Option<u32>,
     sim_mla_layers: Option<u32>,
     kda_state_dtype: &str,
@@ -751,6 +753,9 @@ pub fn kimi_k3_sglang(
     let model_cfg =
         kimi_k3_sglang::KimiK3ModelCfg::from_json(Path::new(&model_spec.model_config), model_spec)
             .context("loading exact Kimi-K3 model config")?;
+    let routing_histogram = routing_histogram_file
+        .map(|path| load_kimi_routing_histogram(path, local_experts.unwrap_or(112)))
+        .transpose()?;
     let parallel = KimiK3SglangParallel {
         attn_tp_size,
         ep_size,
@@ -759,6 +764,8 @@ pub fn kimi_k3_sglang(
         kda_state_dtype,
         heads_per_rank,
         local_experts,
+        local_top_k,
+        routing_histogram,
         sim_kda_layers,
         sim_mla_layers,
         gpu_name: gpu.to_string(),
@@ -767,6 +774,71 @@ pub fn kimi_k3_sglang(
     let resolved = kimi_k3_sglang::resolve_configs(&configs);
     kimi_k3_sglang::build(name.to_string(), resolved, bridge)
         .context("building Kimi-K3 SGLang model (often a missing profile.db row)")
+}
+
+/// Read the optional one-layer routing payload used by rank-local alignment.
+/// The payload may be a bare count/probability array or an object containing
+/// `counts`, `histogram`, `per_expert_counts`, `probabilities`, or a one-layer
+/// `counts_by_layer` array. Values are normalized by `RoutingDistribution` at
+/// the worklet boundary, so counts and probabilities are interchangeable.
+fn load_kimi_routing_histogram(path: &str, expected_experts: u32) -> Result<Vec<f32>> {
+    let file = File::open(path)
+        .with_context(|| format!("opening Kimi-K3 routing histogram {path}"))?;
+    let value: serde_json::Value = serde_json::from_reader(file)
+        .with_context(|| format!("parsing Kimi-K3 routing histogram {path}"))?;
+    let values = value
+        .as_array()
+        .or_else(|| {
+            [
+                "counts",
+                "histogram",
+                "per_expert_counts",
+                "probabilities",
+                "probabilities_all_layers",
+                "counts_all_layers",
+            ]
+            .iter()
+            .find_map(|key| value.get(*key).and_then(serde_json::Value::as_array))
+        })
+        .or_else(|| {
+            value
+                .get("counts_by_layer")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|layers| layers.first())
+                .and_then(serde_json::Value::as_array)
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Kimi-K3 routing histogram {path} must contain an expert-value array"
+            )
+        })?;
+    anyhow::ensure!(
+        values.len() == expected_experts as usize,
+        "Kimi-K3 routing histogram {path} has {} entries, expected {}",
+        values.len(),
+        expected_experts
+    );
+    let values = values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let value = value.as_f64().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Kimi-K3 routing histogram {path} value {index} is not numeric"
+                )
+            })?;
+            anyhow::ensure!(
+                value.is_finite() && value >= 0.0,
+                "Kimi-K3 routing histogram {path} value {index} must be finite and non-negative"
+            );
+            Ok(value as f32)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    anyhow::ensure!(
+        values.iter().any(|value| *value > 0.0),
+        "Kimi-K3 routing histogram {path} has zero routing mass"
+    );
+    Ok(values)
 }
 
 /// Build the DP-attention + TP-FFN dense Llama3 model.
@@ -1306,6 +1378,8 @@ pub fn build_iter_model(
             dcp_size,
             heads_per_rank,
             local_experts,
+            local_top_k,
+            routing_histogram_file,
             sim_kda_layers,
             sim_mla_layers,
             kda_state_dtype,
@@ -1317,6 +1391,8 @@ pub fn build_iter_model(
             *dcp_size,
             *heads_per_rank,
             *local_experts,
+            *local_top_k,
+            routing_histogram_file.as_deref(),
             *sim_kda_layers,
             *sim_mla_layers,
             kda_state_dtype,
