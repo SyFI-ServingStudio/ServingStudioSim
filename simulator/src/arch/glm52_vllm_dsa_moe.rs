@@ -95,6 +95,8 @@ const QK_NOPE_HEAD_DIM: u32 = 192;
 const ROPE_DIM: u32 = 64;
 const V_HEAD_DIM: u32 = 256;
 const MODEL_INDEX_HEADS: u32 = 32;
+/// vLLM launches the logits kernels unpadded at H32 (see the NVFP4 arch). This
+/// H200 arch stays at H64 until its H32 rows are profiled on an H200.
 const PROFILE_INDEX_HEADS: u32 = 64;
 const INDEX_HEAD_DIM: u32 = 128;
 const INDEX_TOP_K: u32 = 2_048;

@@ -9,9 +9,10 @@
 //! communication remains outside both attention compound ops.
 //!
 //! GLM-5.2 has 32 semantic index heads. Projection and elementwise byte shapes
-//! therefore always use H32. Logits may be billed at the physical H32 launch
-//! (SGLang) or the padded H64 launch (vLLM); the caller fixes that measured
-//! identity without changing model semantics.
+//! therefore always use H32. Logits are billed at the physical launch, which
+//! captures of both SGLang and vLLM show at H32; H64 stays a permitted choice
+//! for a caller whose H32 rows are not profiled yet. The caller fixes that
+//! measured identity without changing model semantics.
 
 use std::sync::Arc;
 

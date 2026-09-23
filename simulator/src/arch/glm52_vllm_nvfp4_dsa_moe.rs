@@ -77,7 +77,10 @@ const QK_NOPE_HEAD_DIM: u32 = 192;
 const ROPE_DIM: u32 = 64;
 const V_HEAD_DIM: u32 = 256;
 const MODEL_INDEX_HEADS: u32 = 32;
-const PROFILE_INDEX_HEADS: u32 = 64;
+/// vLLM launches the indexer logits kernels at the model's 32 heads: B200
+/// captures run `sm100_*mqa_logits<32, 128, ...>`, and `sparse_attn_indexer.py`
+/// passes `q_quant` to them unpadded.
+const PROFILE_INDEX_HEADS: u32 = 32;
 const INDEX_HEAD_DIM: u32 = 128;
 const INDEX_TOP_K: u32 = 2_048;
 const CHECKPOINT_MAX_CONTEXT: u32 = 1_048_576;
