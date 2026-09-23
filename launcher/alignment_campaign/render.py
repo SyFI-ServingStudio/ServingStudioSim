@@ -52,7 +52,7 @@ from typing import Any
 
 import yaml
 
-from alignment.load_generator.config import IndependentFrontendConfig
+from alignment.load_generator.config import IndependentFrontendConfig, routes_backend
 
 from .pack import Case, HostProfile, Pack, PackError, TraceSpec, Variant
 
@@ -202,11 +202,14 @@ def _server_block(pack: Pack, variant: Variant, case: Case, host: HostProfile) -
 
 
 def _workload_block(
-    variant: Variant, case: Case, host: HostProfile, trace_name: str
+    variant: Variant, case: Case, host: HostProfile, trace_name: str, profile_kind: str
 ) -> dict[str, Any]:
+    backend = variant.backend
+    if profile_kind == "token_corpus":
+        backend = routes_backend(backend)
     body: dict[str, Any] = {
         "frontend": {"type": IndependentFrontendConfig.type, "path": f"./{trace_name}"},
-        "backend": {"type": variant.backend},
+        "backend": {"type": backend},
         "text_file": host.text_corpus,
         "tokenizer": host.checkpoint_path(variant.tokenizer),
         "token_pool_limit": 1_000_000,
@@ -268,7 +271,7 @@ def profile_document(
             nsys["analyze_iteration_start"] = start
             nsys["analyze_iteration_end"] = end
         document["nsys"] = nsys
-    document["workload"] = _workload_block(variant, case, host, trace_name)
+    document["workload"] = _workload_block(variant, case, host, trace_name, profile_pass.kind)
     if profile_pass.warmup:
         document["workload"]["warmup"] = True
     return document

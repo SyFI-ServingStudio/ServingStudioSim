@@ -69,6 +69,18 @@ _BACKEND_CONFIGS = {
 }
 
 
+def routes_backend(backend_type: str) -> str:
+    """`backend_type` if it returns routed experts, else the protocol that does.
+
+    Routes describe the tokens the model routed, not the wire they came back
+    on, so a routing capture may use a different protocol from its campaign's
+    timed passes without changing what it measures.
+    """
+    if _BACKEND_CONFIGS[backend_type].returns_routed_experts:
+        return backend_type
+    return OpenAIBackendConfig.type
+
+
 def _load_tagged_config(value: dict, registry: dict, field_name: str):
     if not isinstance(value, dict):
         raise ValueError(f"{field_name} must be a mapping")

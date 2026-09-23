@@ -253,6 +253,39 @@ def test_render_writes_every_phase_config(pack, tmp_path):
     assert (rendered.directory / "trace.csv").is_file()
 
 
+def test_a_corpus_pass_renders_on_the_protocol_that_returns_routes(pack, tmp_path):
+    """A `vllm_tokens` campaign gains a corpus pass without a second variant.
+
+    The timed passes keep the campaign's backend; only the capture switches.
+    """
+    case = pack.cases[0]
+    original = pack.variant_of(case)
+    timed = next(item for item in original.profile_passes if item.kind != "token_corpus")
+    variant = dataclasses.replace(
+        original,
+        backend="vllm_tokens",
+        server={
+            **original.server,
+            "expert_parallel_size": 4,
+            "expert_count_reduction_group_size": 4,
+        },
+        profile_passes=(
+            *original.profile_passes,
+            dataclasses.replace(timed, kind="token_corpus", name="p_corpus"),
+        ),
+    )
+    host = check_module.host_for(pack, None)
+
+    def backend(pass_name):
+        document = render_module.profile_document(
+            pack, case, variant, host, pass_name, REPO_ROOT
+        )
+        return document["workload"]["backend"]["type"]
+
+    assert backend("p_corpus") == "openai"
+    assert backend(timed.name) == "vllm_tokens"
+
+
 def test_render_resolves_a_corpus_path_the_way_it_resolves_a_marginal(pack, tmp_path):
     """A pack-relative corpus reaches the simulator as a path it can resolve.
 
@@ -509,6 +542,7 @@ def test_plan_skips_a_complete_phase_and_refresh_reselects_it(pack, tmp_path):
     artifacts = tmp_path / case.slug / phase
     artifacts.mkdir(parents=True)
     for name in execute._artifacts_for(variant, phase):
+        (artifacts / name).parent.mkdir(parents=True, exist_ok=True)
         (artifacts / name).write_text("{}")
     mark_complete(artifacts)
 
