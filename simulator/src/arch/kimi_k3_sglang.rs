@@ -62,7 +62,10 @@ const FUSED_QKV_A_BACKENDS: &[&str] = &["sglang_fused_a_auto"];
 const ABSORB_BACKENDS: &[&str] = &["sglang_k3_absorb"];
 const CACHE_APPEND_BACKENDS: &[&str] = &["sglang_cuda"];
 const MLA_ATTENTION_BACKENDS: &[&str] =
-    &["sglang_cutedsl_mla", "sglang_trtllm_mla", "sglang_triton"];
+    // cute-dsl is what the cookbook B200 recipes resolve for decode (trtllm-gen is
+    // the non-DCP default); the Triton split-KV path is a fallback sglang never
+    // picks on Blackwell and its profiler is not yet stable -> not costed.
+    &["sglang_cutedsl_mla", "sglang_trtllm_mla"];
 const KDA_FUSED_BACKENDS: &[&str] = &["sglang_fused"];
 const KDA_TRITON_BACKENDS: &[&str] = &["sglang_triton"];
 const MOE_BACKENDS: &[&str] = &["sglang_trtllm_mxfp4"];

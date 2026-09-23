@@ -493,7 +493,7 @@ mod tests {
             projection_backends: vec!["sglang_bf16_auto"],
             absorb_backends: vec!["sglang_k3_absorb"],
             cache_append_backends: vec!["sglang_cuda"],
-            attention_backends: vec!["sglang_cutedsl_mla", "sglang_trtllm_mla", "sglang_triton"],
+            attention_backends: vec!["sglang_cutedsl_mla", "sglang_trtllm_mla"],
             elementwise_backends: vec!["triton"],
             tp_size: 8,
         }
