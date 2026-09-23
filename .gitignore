@@ -52,3 +52,7 @@ model/work/examples/
 
 /tmp/
 .cache/
+
+# Local experiment evidence and retired source/environment snapshots.
+/artifacts/
+/old-wt/

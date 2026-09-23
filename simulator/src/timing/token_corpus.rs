@@ -194,7 +194,7 @@ impl TokenCorpus {
 /// from the same heaviest rank (active count first, assignments second).
 /// Midrank percentile distances have a common denominator, so integer scores
 /// give exact, deterministic comparisons even when many candidates tie.
-fn median_candidate(candidates: &[Vec<u32>], experts_per_rank: usize) -> usize {
+pub fn median_candidate(candidates: &[Vec<u32>], experts_per_rank: usize) -> usize {
     assert!(!candidates.is_empty() && experts_per_rank > 0);
     let features: Vec<_> = candidates
         .iter()

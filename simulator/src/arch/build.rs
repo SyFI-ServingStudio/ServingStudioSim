@@ -300,7 +300,7 @@ fn canonicalize_layerwise_expert_counts(
     Ok(canonical_layers)
 }
 
-fn load_expert_popularity(
+pub fn load_expert_popularity(
     path: &str,
     expected_num_experts: u32,
     ep_size: u16,

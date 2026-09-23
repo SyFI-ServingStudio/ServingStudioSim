@@ -269,6 +269,48 @@
         "main.final_residual_rms_norm"
       ],
       "note": "Fires after the rule above: the Lamport norm names the reduction it completes."
+    },
+    {
+      "operation": "moe.tp_allreduce",
+      "phase": "forward",
+      "name": "trtllm_mnnvl_allreduce::twoshotAllreduceKernel",
+      "after": "moe.shared_expert.down_proj",
+      "type": "collective",
+      "role": "MoE TP all-reduce fused with the next block input residual RMSNorm",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": [
+        "body.sparse_cycle_full_index.moe.tp_allreduce",
+        "body.sparse_cycle_index_share.moe.tp_allreduce",
+        "body.sparse_initial_index_share.moe.tp_allreduce",
+        "body.dense_full_index.ffn.tp_allreduce",
+        "body.dense_full_index.attention.input_add_rms_norm",
+        "body.sparse_cycle_full_index.attention.input_add_rms_norm",
+        "body.sparse_cycle_index_share.attention.input_add_rms_norm",
+        "body.sparse_initial_index_share.attention.input_add_rms_norm",
+        "main.final_residual_rms_norm"
+      ],
+      "note": "The dense layers' FFN reduction. The rule above keys this operation on an `at::native::vectorized_elementwise_kernel` predecessor, which is the sum of the shared and routed expert outputs -- a step the dense layers do not have, since they have no routed experts. There the projection reduces directly, so the predecessor is the down_proj itself."
+    },
+    {
+      "operation": "moe.tp_allreduce",
+      "phase": "forward",
+      "name": "trtllm_mnnvl_allreduce::oneshotAllreduceFusionKernel",
+      "after": "moe.shared_expert.down_proj",
+      "type": "collective",
+      "role": "MoE TP all-reduce fused with the next block input residual RMSNorm",
+      "cross_rank": "synchronizing",
+      "slot_suffixes": [
+        "body.sparse_cycle_full_index.moe.tp_allreduce",
+        "body.sparse_cycle_index_share.moe.tp_allreduce",
+        "body.sparse_initial_index_share.moe.tp_allreduce",
+        "body.dense_full_index.ffn.tp_allreduce",
+        "body.dense_full_index.attention.input_add_rms_norm",
+        "body.sparse_cycle_full_index.attention.input_add_rms_norm",
+        "body.sparse_cycle_index_share.attention.input_add_rms_norm",
+        "body.sparse_initial_index_share.attention.input_add_rms_norm",
+        "main.final_residual_rms_norm"
+      ],
+      "note": "Same reduction at the one-shot collective, which this capture uses for the smaller batches."
     }
   ]
 }

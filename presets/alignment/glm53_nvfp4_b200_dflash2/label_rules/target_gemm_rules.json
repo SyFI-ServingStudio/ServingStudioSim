@@ -96,7 +96,42 @@
         "body.sparse_cycle_index_share.attention.o_proj",
         "body.sparse_initial_index_share.attention.o_proj"
       ],
-      "note": "Of this capture's three reduction sites only the attention one has a GEMM in front of it: the expert block reduces after an elementwise and the embedding after the vocabulary gather. So `a GEMM immediately before a reduction` names o_proj uniquely here."
+      "note": "A GEMM immediately in front of a reduction is o_proj at the ATTENTION reduction only. The earlier form of this rule stated that uniquely, on the grounds that the expert block reduces after an elementwise and the embedding after the vocabulary gather -- but it missed the dense layers, whose FFN down_proj is also a GEMM sitting directly in front of a reduction. Naming the permitted predecessor is what restores the uniqueness, so the rule is split once per predecessor rather than relying on file order to out-run the down_proj rule. This variant covers the absorbed decode path, where the value up-projection feeds it.",
+      "after": "attention.v_up"
+    },
+    {
+      "operation": "attention.o_proj",
+      "phase": "forward",
+      "name": "nvjet_",
+      "before_name": "trtllm_mnnvl_allreduce::twoshotAllreduceKernel",
+      "type": "model",
+      "role": "attention output projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.o_proj",
+        "body.sparse_cycle_full_index.attention.o_proj",
+        "body.sparse_cycle_index_share.attention.o_proj",
+        "body.sparse_initial_index_share.attention.o_proj"
+      ],
+      "note": "A GEMM immediately in front of a reduction is o_proj at the ATTENTION reduction only. The earlier form of this rule stated that uniquely, on the grounds that the expert block reduces after an elementwise and the embedding after the vocabulary gather -- but it missed the dense layers, whose FFN down_proj is also a GEMM sitting directly in front of a reduction. Naming the permitted predecessor is what restores the uniqueness, so the rule is split once per predecessor rather than relying on file order to out-run the down_proj rule. This variant covers the non-absorbed path, whose layers run no v_up and hand the attention output straight to it.",
+      "after": "attention.sparse_mla"
+    },
+    {
+      "operation": "attention.o_proj",
+      "phase": "forward",
+      "name": "nvjet_",
+      "before_name": "trtllm_mnnvl_allreduce::twoshotAllreduceKernel",
+      "type": "model",
+      "role": "attention output projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.o_proj",
+        "body.sparse_cycle_full_index.attention.o_proj",
+        "body.sparse_cycle_index_share.attention.o_proj",
+        "body.sparse_initial_index_share.attention.o_proj"
+      ],
+      "note": "A GEMM immediately in front of a reduction is o_proj at the ATTENTION reduction only. The earlier form of this rule stated that uniquely, on the grounds that the expert block reduces after an elementwise and the embedding after the vocabulary gather -- but it missed the dense layers, whose FFN down_proj is also a GEMM sitting directly in front of a reduction. Naming the permitted predecessor is what restores the uniqueness, so the rule is split once per predecessor rather than relying on file order to out-run the down_proj rule. This variant covers a folded loop body that opens on it.",
+      "after": "<none>"
     },
     {
       "operation": "attention.o_proj",
@@ -112,7 +147,42 @@
         "body.sparse_cycle_index_share.attention.o_proj",
         "body.sparse_initial_index_share.attention.o_proj"
       ],
-      "note": "Same argument at the one-shot reduction, which this capture uses for the smaller batches."
+      "note": "A GEMM immediately in front of a reduction is o_proj at the ATTENTION reduction only. The earlier form of this rule stated that uniquely, on the grounds that the expert block reduces after an elementwise and the embedding after the vocabulary gather -- but it missed the dense layers, whose FFN down_proj is also a GEMM sitting directly in front of a reduction. Naming the permitted predecessor is what restores the uniqueness, so the rule is split once per predecessor rather than relying on file order to out-run the down_proj rule. This variant covers the absorbed decode path, where the value up-projection feeds it.",
+      "after": "attention.v_up"
+    },
+    {
+      "operation": "attention.o_proj",
+      "phase": "forward",
+      "name": "nvjet_",
+      "before_name": "trtllm_mnnvl_allreduce::oneshotAllreduceFusionKernel",
+      "type": "model",
+      "role": "attention output projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.o_proj",
+        "body.sparse_cycle_full_index.attention.o_proj",
+        "body.sparse_cycle_index_share.attention.o_proj",
+        "body.sparse_initial_index_share.attention.o_proj"
+      ],
+      "note": "A GEMM immediately in front of a reduction is o_proj at the ATTENTION reduction only. The earlier form of this rule stated that uniquely, on the grounds that the expert block reduces after an elementwise and the embedding after the vocabulary gather -- but it missed the dense layers, whose FFN down_proj is also a GEMM sitting directly in front of a reduction. Naming the permitted predecessor is what restores the uniqueness, so the rule is split once per predecessor rather than relying on file order to out-run the down_proj rule. This variant covers the non-absorbed path, whose layers run no v_up and hand the attention output straight to it.",
+      "after": "attention.sparse_mla"
+    },
+    {
+      "operation": "attention.o_proj",
+      "phase": "forward",
+      "name": "nvjet_",
+      "before_name": "trtllm_mnnvl_allreduce::oneshotAllreduceFusionKernel",
+      "type": "model",
+      "role": "attention output projection",
+      "cross_rank": "independent",
+      "slot_suffixes": [
+        "body.dense_full_index.attention.o_proj",
+        "body.sparse_cycle_full_index.attention.o_proj",
+        "body.sparse_cycle_index_share.attention.o_proj",
+        "body.sparse_initial_index_share.attention.o_proj"
+      ],
+      "note": "A GEMM immediately in front of a reduction is o_proj at the ATTENTION reduction only. The earlier form of this rule stated that uniquely, on the grounds that the expert block reduces after an elementwise and the embedding after the vocabulary gather -- but it missed the dense layers, whose FFN down_proj is also a GEMM sitting directly in front of a reduction. Naming the permitted predecessor is what restores the uniqueness, so the rule is split once per predecessor rather than relying on file order to out-run the down_proj rule. This variant covers a folded loop body that opens on it.",
+      "after": "<none>"
     },
     {
       "operation": "moe.shared_expert.gate_up_proj",
@@ -151,6 +221,7 @@
       "phase": "forward",
       "name": "nvjet_",
       "before": "moe.shared_expert.gate_up_proj",
+      "before_name": "nvjet_",
       "type": "model",
       "role": "BF16-to-FP32 router GEMM assembly; vLLM fuses FP32 output conversion into the GEMM",
       "cross_rank": "independent",
@@ -159,7 +230,7 @@
         "body.sparse_cycle_index_share.moe.router.router_gemm_bf16_proxy",
         "body.sparse_initial_index_share.moe.router.router_gemm_bf16_proxy"
       ],
-      "note": "The non-split-K case: the router GEMM sits directly in front of the gate/up projection."
+      "note": "The non-split-K case: the router GEMM sits directly in front of the gate/up projection. `before_name` is what keeps it there. The shared expert's own gate/up GEMM is also an `nvjet_` whose successor carries this operation -- but that successor is the split-K REDUCTION, not the GEMM. Without the name test this rule reaches across and claims the shared expert's GEMM, and because apply() takes the first matching rule in file order and then stops, it does so ahead of the corrective overwrite rule further down, which then never runs. Requiring the successor to be a GEMM separates the two cases with no ordering assumption."
     },
     {
       "operation": "moe.shared_expert.down_proj",

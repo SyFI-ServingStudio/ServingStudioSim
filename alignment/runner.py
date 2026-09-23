@@ -491,29 +491,51 @@ def _finalize_profile(
         )
         # A dense draft (DFlash2 is six GQA layers with a plain SwiGLU MLP) has
         # no experts for EPLB to report, and asking anyway fails the pass with
-        # `no VibeSimAlignmentExpertLoad records found`.
+        # `no VibeSimAlignmentExpertLoad records found`. Having experts is not
+        # sufficient either: vLLM attaches EPLB only to a draft implementing its
+        # `MixtureOfExperts` interface, and the DSpark DeepSeek-V4 draft does
+        # not, so it routes tokens that are never reported. The engine logs
+        # nothing distinguishing either way -- the GLM-5.3-Flash MTP draft is
+        # instrumented and still prints no drafter line -- so the only honest
+        # test is to ask for the records and treat their absence as absence.
         if speculative and driver.draft_has_moe_experts(cfg.server):
             draft_load_path = engine_dir / f"{cfg.name}_draft_expert_load.jsonl"
             draft_popularity_path = log_dir / "draft_expert_popularity.json"
-            draft_count = record_extraction.extract_expert_popularity(
-                measurement_log,
-                draft_load_path,
-                draft_popularity_path,
-                expert_parallel_size=expert_parallel_size,
-                reduction_group_size=reduction_group_size,
-                max_tokens_per_step=max(
-                    cfg.server.chunk_size, cfg.server.max_cudagraph_capture_size or 0
-                ),
-                dp_size=cfg.server.dp_size,
-                records=records,
-                model_role="draft",
-                **window,
-            )
-            spec_artifacts.update(
-                draft_expert_load_jsonl=str(draft_load_path),
-                draft_expert_popularity_json=str(draft_popularity_path),
-                draft_expert_record_count=draft_count,
-            )
+            try:
+                draft_count = record_extraction.extract_expert_popularity(
+                    measurement_log,
+                    draft_load_path,
+                    draft_popularity_path,
+                    expert_parallel_size=expert_parallel_size,
+                    reduction_group_size=reduction_group_size,
+                    max_tokens_per_step=max(
+                        cfg.server.chunk_size, cfg.server.max_cudagraph_capture_size or 0
+                    ),
+                    dp_size=cfg.server.dp_size,
+                    records=records,
+                    model_role="draft",
+                    **window,
+                )
+            except ValueError as error:
+                if "no VibeSimAlignmentExpertLoad records found" not in str(error):
+                    raise
+                # The draft routes tokens the engine does not report. Say so and
+                # keep the target capture, which is complete and is what the
+                # whole pass exists to produce -- discarding it here would throw
+                # away a full replay over a reporting gap in the draft.
+                draft_load_path.unlink(missing_ok=True)
+                spec_artifacts.update(draft_expert_records_unavailable=True)
+                print(
+                    "[profile] draft MoE is not instrumented by the engine; "
+                    "no draft expert popularity for this capture",
+                    flush=True,
+                )
+            else:
+                spec_artifacts.update(
+                    draft_expert_load_jsonl=str(draft_load_path),
+                    draft_expert_popularity_json=str(draft_popularity_path),
+                    draft_expert_record_count=draft_count,
+                )
         result = {
             **spec_artifacts,
             "profile_kind": cfg.profile_kind,
