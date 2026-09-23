@@ -152,6 +152,10 @@ single-config path below when there is one workload and no matrix.
    EPLB opts out with `--no-enable-eplb` in `server.extra_args` and the pass
    records routes alone. `expert_popularity` always requires both, because the
    marginal is its only product.
+
+   Only the `openai` workload backend returns routes, so a `token_corpus` pass
+   runs on `openai` even when the campaign's timed passes use `vllm_tokens`;
+   the routes are a property of the tokens routed, not of the wire protocol.
 2. **Timing prediction** — set the typed input builder. It reads the simulation
    *preset* (`simulation.yaml` via `simulation_preset`) for gpu/arch/backends, so
    it runs before any completed simulation. `measured_phase: forward` only
