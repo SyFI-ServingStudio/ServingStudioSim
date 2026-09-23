@@ -25,9 +25,10 @@ const HEAD_DIM: u32 = 128;
 const CONV_KERNEL: u32 = 4;
 
 #[cfg(test)]
-const FUSED_SOURCE_ORDER: [&str; 6] = [
+const FUSED_SOURCE_ORDER: [&str; 7] = [
     "input_layernorm",
     "qkvbfg_a_proj",
+    "qkvbfg_a_proj_bfa",
     "kda_fused_decode",
     "o_proj",
     "tp_allreduce_zero",
@@ -35,9 +36,10 @@ const FUSED_SOURCE_ORDER: [&str; 6] = [
 ];
 
 #[cfg(test)]
-const SPLIT_SOURCE_ORDER: [&str; 8] = [
+const SPLIT_SOURCE_ORDER: [&str; 9] = [
     "input_layernorm",
     "qkvbfg_a_proj",
+    "qkvbfg_a_proj_bfa",
     "kda_conv_decode",
     "kda_recurrent_decode",
     "kda_gated_norm",
@@ -70,6 +72,7 @@ pub struct KimiK3KdaLocalWorkletResolved {
     pub raw_cfg: KimiK3KdaLocalWorkletConfig,
     pub input_layernorm: ResidualRmsNormKernelConfig,
     pub qkvbfg_a_proj: SingleGemmKernelConfig,
+    pub qkvbfg_a_proj_bfa: SingleGemmKernelConfig,
     pub kda_fused_decode: Option<KdaFusedDecodeKernelConfig>,
     pub kda_conv_decode: Option<GdnCausalConvDecodeKernelConfig>,
     pub kda_recurrent_decode: Option<KdaRecurrentDecodeKernelConfig>,
@@ -88,6 +91,7 @@ pub struct KimiK3KdaLocalWorklet {
     pub name: String,
     pub input_layernorm: Op<ResidualRmsNormKernel>,
     pub qkvbfg_a_proj: Op<SingleGemmKernel>,
+    pub qkvbfg_a_proj_bfa: Op<SingleGemmKernel>,
     pub kda_fused_decode: Option<Op<KdaFusedDecodeKernel>>,
     pub kda_conv_decode: Option<Op<GdnCausalConvDecodeKernel>>,
     pub kda_recurrent_decode: Option<Op<KdaRecurrentDecodeKernel>>,
@@ -103,12 +107,15 @@ impl KimiK3KdaLocalWorklet {
         validate_config(cfg)
             .unwrap_or_else(|reason| panic!("invalid KimiK3KdaLocalWorkletConfig: {reason}"));
 
-        // SGLang's full-rank KDA projection is qkv + two head-width slices +
-        // one per-head beta slice. The recipe deliberately keeps the natural
-        // width (7692 for 12 heads) and does not invent an alignment pad.
+        // SGLang emits q/k/v/g as one 4*projection_size GEMM (6144 columns for
+        // 12 heads), while the [f_a|b] GEMV is issued on the alternate stream.
+        // The latter is padded to the kernel's 8-column alignment (128+12 ->
+        // 144), so the two production shapes must remain separate leaves.
         let heads = cfg.heads.get();
         let head_dim = cfg.head_dim.get();
-        let qkvbfg_n = 3 * heads * head_dim + 2 * heads * head_dim + heads;
+        let projection_size = heads * head_dim;
+        let qkvbfg_n = 4 * projection_size;
+        let qkvbfg_bfa_n = (head_dim + heads + 7) / 8 * 8;
 
         let kda_fused_decode =
             (cfg.kda_state_dtype == DType::Fp32).then(|| KdaFusedDecodeKernelConfig {
@@ -160,6 +167,13 @@ impl KimiK3KdaLocalWorklet {
                 backends: cfg.gemm_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
                 n: qkvbfg_n.into(),
+                k: cfg.hidden.clone(),
+                dtype: cfg.dtype,
+            },
+            qkvbfg_a_proj_bfa: SingleGemmKernelConfig {
+                backends: cfg.gemm_backends.clone(),
+                gpu_name: cfg.gpu_name.clone(),
+                n: qkvbfg_bfa_n.into(),
                 k: cfg.hidden.clone(),
                 dtype: cfg.dtype,
             },
@@ -265,6 +279,13 @@ impl KimiK3KdaLocalWorklet {
                 SingleGemmKernel::build,
                 bridge,
             )?,
+            qkvbfg_a_proj_bfa: build_atomic(
+                &name,
+                "qkvbfg_a_proj_bfa",
+                resolved.qkvbfg_a_proj_bfa.clone(),
+                SingleGemmKernel::build,
+                bridge,
+            )?,
             kda_fused_decode,
             kda_conv_decode,
             kda_recurrent_decode,
@@ -290,10 +311,20 @@ impl KimiK3KdaLocalWorklet {
     }
 
     pub fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
-        let mut children = vec![
-            self.input_layernorm.compile(builder),
-            self.qkvbfg_a_proj.compile(builder),
-        ];
+        let input_layernorm = self.input_layernorm.compile(builder);
+        let qkvbfg_a_proj = self.qkvbfg_a_proj.compile(builder);
+        let qkvbfg_a_proj_bfa = self.qkvbfg_a_proj_bfa.compile(builder);
+        let qkvbfg = CostNode::Labeled {
+            label: format!(
+                "{}.qkvbfg [wide qkvg + alternate-stream bfa GEMV]",
+                self.name
+            ),
+            child: Box::new(CostNode::Max {
+                overlap: 1.0,
+                children: vec![qkvbfg_a_proj, qkvbfg_a_proj_bfa],
+            }),
+        };
+        let mut children = vec![input_layernorm, qkvbfg];
         if let Some(kda_fused_decode) = &self.kda_fused_decode {
             children.push(kda_fused_decode.compile(builder));
         } else {
@@ -341,6 +372,14 @@ impl KimiK3KdaLocalWorklet {
         );
         eval_atomic_or_zero(
             &self.qkvbfg_a_proj,
+            SingleGemmKernelInput {
+                m: input.batch_tokens,
+            },
+            input.batch_tokens == 0,
+            evaluator,
+        );
+        eval_atomic_or_zero(
+            &self.qkvbfg_a_proj_bfa,
             SingleGemmKernelInput {
                 m: input.batch_tokens,
             },
@@ -480,9 +519,11 @@ mod tests {
     #[test]
     fn source_order_and_resolved_shapes_are_frozen() {
         let resolved = KimiK3KdaLocalWorklet::resolve_config(&config());
-        assert_eq!(resolved.qkvbfg_a_proj.n, 7_692);
+        assert_eq!(resolved.qkvbfg_a_proj.n, 4 * 12 * HEAD_DIM);
         assert_eq!(resolved.qkvbfg_a_proj.k, HIDDEN);
-        assert_eq!(SPLIT_SOURCE_ORDER.len(), 8);
+        assert_eq!(resolved.qkvbfg_a_proj_bfa.n, 144);
+        assert_eq!(resolved.qkvbfg_a_proj_bfa.k, HIDDEN);
+        assert_eq!(SPLIT_SOURCE_ORDER.len(), 9);
         assert!(resolved.kda_fused_decode.is_none());
         let conv = resolved.kda_conv_decode.as_ref().unwrap();
         assert_eq!(conv.channels, 3 * 12 * HEAD_DIM);
@@ -498,7 +539,7 @@ mod tests {
         let mut fp32 = config();
         fp32.kda_state_dtype = DType::Fp32;
         let resolved = KimiK3KdaLocalWorklet::resolve_config(&fp32);
-        assert_eq!(FUSED_SOURCE_ORDER.len(), 6);
+        assert_eq!(FUSED_SOURCE_ORDER.len(), 7);
         assert!(resolved.kda_conv_decode.is_none());
         assert!(resolved.kda_recurrent_decode.is_none());
         assert!(resolved.kda_gated_norm.is_none());
@@ -550,6 +591,7 @@ mod tests {
             [
                 "model.kda.input_layernorm",
                 "model.kda.qkvbfg_a_proj",
+                "model.kda.qkvbfg_a_proj_bfa",
                 "model.kda.kda_conv_decode",
                 "model.kda.kda_recurrent_decode",
                 "model.kda.kda_gated_norm",
@@ -558,9 +600,9 @@ mod tests {
                 "model.kda.post_attention_layernorm",
             ]
         );
-        assert_eq!(split[2].1, "gdn_causal_conv_decode");
-        assert_eq!(split[3].1, "kda_recurrent_decode");
-        assert_eq!(split[4].1, "gdn_gated_rms_norm");
+        assert_eq!(split[3].1, "gdn_causal_conv_decode");
+        assert_eq!(split[4].1, "kda_recurrent_decode");
+        assert_eq!(split[5].1, "gdn_gated_rms_norm");
 
         let mut fp32 = config();
         fp32.kda_state_dtype = DType::Fp32;
@@ -573,13 +615,14 @@ mod tests {
             [
                 "model.kda.input_layernorm",
                 "model.kda.qkvbfg_a_proj",
+                "model.kda.qkvbfg_a_proj_bfa",
                 "model.kda.kda_fused_decode",
                 "model.kda.o_proj",
                 "model.kda.tp_allreduce_zero",
                 "model.kda.post_attention_layernorm",
             ]
         );
-        assert_eq!(fused[2].1, "kda_fused_decode");
+        assert_eq!(fused[3].1, "kda_fused_decode");
     }
 
     #[test]

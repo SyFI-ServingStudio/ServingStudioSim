@@ -261,10 +261,12 @@ def _build_sglang_page_planar_fp8_operands(
     generator = torch.Generator(device=device)
     generator.manual_seed(42)
 
-    # MLATokenToKVPool uses ``size + page_size`` rows for its NHD backing.
+    # MLATokenToKVPool stores FP8 pages as uint8, then the CUDA kernel views
+    # those bytes as FP8. Allocating torch.float8_e4m3fn here changes the pool
+    # ABI and does not measure the production page-planar path.
     kv_buffer = torch.zeros(
         (num_slots + block_size, 1, row_width),
-        dtype=torch.float8_e4m3fn,
+        dtype=torch.uint8,
         device=device,
     )
     cache_k_nope = torch.randn(

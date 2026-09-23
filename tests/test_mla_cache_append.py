@@ -601,7 +601,7 @@ def test_sglang_page_planar_fp8_operands_match_pool_layout():
     )
 
     assert operands.kv_buffer.shape == (256 * 64 + 64, 1, 576)
-    assert operands.kv_buffer.dtype is torch.float8_e4m3fn
+    assert operands.kv_buffer.dtype is torch.uint8
     assert operands.kv_buffer_2d.shape == (256 * 64 + 64, 576)
     assert operands.cache_k_nope.shape == (5, 512)
     assert operands.cache_k_rope.shape == (5, 64)

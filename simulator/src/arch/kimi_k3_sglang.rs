@@ -1346,13 +1346,14 @@ mod tests {
         let enumerated = build("unified".into(), resolve_configs(&configs), &bridge).unwrap();
         let tree = enumerated.cost_tree();
         let names: Vec<&str> = tree.slots.iter().map(|slot| slot.name.as_str()).collect();
-        assert_eq!(tree.n_slots(), 52);
+        assert_eq!(tree.n_slots(), 54);
         assert_eq!(
             names,
             [
                 "unified.embedding",
                 "unified.dense.attention.input_layernorm",
                 "unified.dense.attention.qkvbfg_a_proj",
+                "unified.dense.attention.qkvbfg_a_proj_bfa",
                 "unified.dense.attention.kda_conv_decode",
                 "unified.dense.attention.kda_recurrent_decode",
                 "unified.dense.attention.kda_gated_norm",
@@ -1364,6 +1365,7 @@ mod tests {
                 "unified.dense.ffn.down",
                 "unified.kda.attention.input_layernorm",
                 "unified.kda.attention.qkvbfg_a_proj",
+                "unified.kda.attention.qkvbfg_a_proj_bfa",
                 "unified.kda.attention.kda_conv_decode",
                 "unified.kda.attention.kda_recurrent_decode",
                 "unified.kda.attention.kda_gated_norm",

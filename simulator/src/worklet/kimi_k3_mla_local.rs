@@ -329,26 +329,55 @@ impl KimiK3MlaLocalWorklet {
     }
 
     pub fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
+        // The q and KV latent paths fan out after fused_qkv_a_proj. The gate
+        // GEMM is launched on SGLang's alternate stream and joins before the
+        // sigmoid/multiply barrier, so both stream boundaries are explicit.
+        let input_layernorm = self.input_layernorm.compile(builder);
+        let fused_qkv_a_proj = self.fused_qkv_a_proj.compile(builder);
+        let q_a_layernorm = self.q_a_layernorm.compile(builder);
+        let q_b_proj = self.q_b_proj.compile(builder);
+        let kv_a_layernorm = self.kv_a_layernorm.compile(builder);
+        let q_absorb = self.q_absorb.compile(builder);
+        let cache_append = self.cache_append.compile(builder);
+        let decode_attention = self.decode_attention.compile(builder);
+        let v_up = self.v_up.compile(builder);
+        let output_gate = self.output_gate.compile(builder);
+        let sigmoid_mul = self.sigmoid_mul.compile(builder);
+        let o_proj = self.o_proj.compile(builder);
+        let tp_allreduce_zero = self.tp_allreduce_zero.compile(builder);
+        let post_attention_layernorm = self.post_attention_layernorm.compile(builder);
+
+        let latent_paths = CostNode::Labeled {
+            label: format!("{}.latent q/KV paths [concurrent streams]", self.name),
+            child: Box::new(CostNode::Max {
+                overlap: 1.0,
+                children: vec![
+                    CostNode::Sum(vec![q_a_layernorm, q_b_proj, q_absorb]),
+                    CostNode::Sum(vec![kv_a_layernorm, cache_append]),
+                ],
+            }),
+        };
+        let attention_core =
+            CostNode::Sum(vec![fused_qkv_a_proj, latent_paths, decode_attention, v_up]);
+        let attention_and_gate = CostNode::Labeled {
+            label: format!("{}.attention + output gate [concurrent streams]", self.name),
+            child: Box::new(CostNode::Max {
+                overlap: 1.0,
+                children: vec![attention_core, output_gate],
+            }),
+        };
         CostNode::Labeled {
             label: format!(
                 "{} (KimiK3MlaLocalWorklet) [TP{}; heads={}]",
                 self.name, self.resolved.raw_cfg.tp_size, self.resolved.raw_cfg.heads
             ),
             child: Box::new(CostNode::Sum(vec![
-                self.input_layernorm.compile(builder),
-                self.fused_qkv_a_proj.compile(builder),
-                self.q_a_layernorm.compile(builder),
-                self.q_b_proj.compile(builder),
-                self.kv_a_layernorm.compile(builder),
-                self.q_absorb.compile(builder),
-                self.cache_append.compile(builder),
-                self.decode_attention.compile(builder),
-                self.v_up.compile(builder),
-                self.output_gate.compile(builder),
-                self.sigmoid_mul.compile(builder),
-                self.o_proj.compile(builder),
-                self.tp_allreduce_zero.compile(builder),
-                self.post_attention_layernorm.compile(builder),
+                input_layernorm,
+                attention_and_gate,
+                sigmoid_mul,
+                o_proj,
+                tp_allreduce_zero,
+                post_attention_layernorm,
             ])),
         }
     }
