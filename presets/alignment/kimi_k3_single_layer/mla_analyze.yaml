@@ -1,0 +1,7 @@
+schema_version: 1
+profile_log_dir: /raid/yilegu/roofline_guided_agent/VibeSimWorkspace/scripts-local/vibesim-analysis-container/kimi_single_layer/align/mla_b128_l8192
+timing_predict_log_dir: /raid/yilegu/roofline_guided_agent/VibeSimWorkspace/main-k3-rust/logs/alignment_kimi_k3_single_layer_mla_timing_predict
+log_dir: /raid/yilegu/roofline_guided_agent/VibeSimWorkspace/main-k3-rust/logs/alignment_kimi_k3_single_layer_mla
+iteration:
+  enabled: true
+  labeled_kernel_sequences_file: /raid/yilegu/roofline_guided_agent/VibeSimWorkspace/scripts-local/vibesim-analysis-container/kimi_single_layer/align/mla_b128_l8192/kernel_sequences_labeled.json

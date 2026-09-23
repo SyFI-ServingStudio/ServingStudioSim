@@ -1,0 +1,33 @@
+deployment: unified
+
+workload:
+  trace_files:
+    - trace/smoke.csv
+  input_file_format: text-generation-independent
+  arrival_mode: trace_timed
+  session_dependency: independent
+  run_to_end: true
+
+io:
+  log_dir: logs/alignment_kimi_k3_single_layer_kda_simulation
+
+pools:
+  main:
+    groups:
+      - gpu: "NVIDIA B200"
+        replicas: 1
+        arch:
+          type: kimi_k3_sglang
+          model_config: model/config/kimi_k3.json
+          fp8: false
+          attn_tp_size: 1
+          ep_size: 1
+          pp_size: 1
+          dcp_size: 1
+          heads_per_rank: 12
+          local_experts: 112
+          sim_kda_layers: 1
+          sim_mla_layers: 0
+          kda_state_dtype: bf16
+        worker:
+          type: barebone

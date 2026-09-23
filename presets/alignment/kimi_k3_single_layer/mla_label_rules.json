@@ -1,0 +1,249 @@
+{
+  "schema_version": 1,
+  "source_experiment": "kimi-k3-mla-single-layer-b128-l8192",
+  "rules": [
+    {
+      "name": "nvjet_sm100_tst_64x64_64x16_2x1_2cta_v_bz_splitK_TNT",
+      "operation": "unified.mla.attention.fused_qkv_a_proj",
+      "type": "single_gemm",
+      "role": "fused MLA qkv/a projection",
+      "slot_suffixes": ["fused_qkv_a_proj"],
+      "phase": "forward",
+      "stream_role": "primary",
+      "note": "Fused 7168-to-2112 projection."
+    },
+    {
+      "name": "cublasLt::splitKreduce_kernel",
+      "after_name": "nvjet_sm100_tst_64x64_64x16_2x1_2cta_v_bz_splitK_TNT",
+      "operation": "unified.mla.attention.fused_qkv_a_proj",
+      "type": "single_gemm",
+      "role": "fused MLA qkv/a projection",
+      "slot_suffixes": ["fused_qkv_a_proj"],
+      "phase": "forward",
+      "stream_role": "primary",
+      "note": "Split-K reduction belonging to the fused projection."
+    },
+    {
+      "name": "nvjet_sm100_tst_32x64_64x16_2x2_2cta_h_bz_TNN",
+      "operation": "unified.mla.attention.output_gate",
+      "type": "single_gemm",
+      "role": "concurrent MLA output-gate projection",
+      "slot_suffixes": ["output_gate"],
+      "phase": "forward",
+      "stream_role": "concurrent",
+      "note": "The gate projection is issued on the side stream before the attention core."
+    },
+    {
+      "name": "i641536i64div81_tensorptrbf16gmemalign16o15361",
+      "operation": "unified.mla.attention.q_a_layernorm",
+      "type": "rms_norm",
+      "role": "MLA q latent normalization",
+      "slot_suffixes": ["q_a_layernorm"],
+      "phase": "forward",
+      "stream_role": "concurrent",
+      "note": "RMSNorm over q_lora_rank 1536."
+    },
+    {
+      "name": "nvjet_sm100_tst_64x32_64x16_2x1_2cta_v_bz_TNT",
+      "operation": "unified.mla.attention.q_b_proj",
+      "type": "single_gemm",
+      "role": "MLA q_b projection",
+      "slot_suffixes": ["q_b_proj"],
+      "phase": "forward",
+      "stream_role": "concurrent",
+      "note": "q_lora_rank to per-head q projection."
+    },
+    {
+      "name": "i64512i64div81_tensorptrbf16gmemalign16o5121",
+      "operation": "unified.mla.attention.kv_a_layernorm",
+      "type": "rms_norm",
+      "role": "MLA KV latent normalization",
+      "slot_suffixes": ["kv_a_layernorm"],
+      "phase": "forward",
+      "stream_role": "concurrent",
+      "note": "RMSNorm over kv_lora_rank 512."
+    },
+    {
+      "name": "nvjet_sm100_tst_96x64_64x15_1x2_2cta_h_bz_TNN",
+      "operation": "unified.mla.attention.q_absorb",
+      "type": "batched_gemm",
+      "role": "MLA q-nope absorption",
+      "slot_suffixes": ["q_absorb"],
+      "phase": "forward",
+      "stream_role": "concurrent",
+      "note": "Per-head q_nope by W_KC batched GEMM."
+    },
+    {
+      "name": "set_mla_kv_concat_q_fp8_kernel",
+      "operation": "unified.mla.attention.mla_cache_append",
+      "type": "mla_cache_append",
+      "role": "paged FP8 latent-KV append",
+      "slot_suffixes": ["mla_cache_append"],
+      "phase": "forward",
+      "stream_role": "concurrent",
+      "note": "K3 page-planar FP8 cache write for 512 latent plus 64 rope values."
+    },
+    {
+      "name": "kernel_cutlass_split_kv_kernel_flashinfercute_dslattentionmonolithicmla_decode_fp8",
+      "operation": "unified.mla.attention.mla_decode_attention",
+      "type": "mla_decode_attention",
+      "role": "MLA paged decode attention",
+      "slot_suffixes": ["mla_decode_attention"],
+      "phase": "forward",
+      "stream_role": "concurrent",
+      "note": "Cute-DSL FP8 paged MLA decode kernel."
+    },
+    {
+      "name": "nvjet_sm100_tst_64x32_64x16_2x4_2cta_h_bz_TNT",
+      "operation": "unified.mla.attention.v_up",
+      "type": "batched_gemm",
+      "role": "MLA value up projection",
+      "slot_suffixes": ["v_up"],
+      "phase": "forward",
+      "stream_role": "concurrent",
+      "note": "Per-head latent value up batched GEMM."
+    },
+    {
+      "name": "mla_output_gate_kernel",
+      "operation": "unified.mla.attention.sigmoid_mul",
+      "type": "elementwise",
+      "role": "MLA output-gate sigmoid multiply",
+      "slot_suffixes": ["sigmoid_mul"],
+      "phase": "forward",
+      "stream_role": "primary",
+      "note": "The custom kernel applies sigmoid(g_proj) to the attention output."
+    },
+    {
+      "name": "nvjet_sm100_tst_112x64_64x14_2x2_2cta_h_bz_TNN",
+      "after": "unified.mla.attention.sigmoid_mul",
+      "operation": "unified.mla.attention.o_proj",
+      "type": "single_gemm",
+      "role": "MLA attention output projection",
+      "slot_suffixes": ["o_proj"],
+      "phase": "forward",
+      "stream_role": "primary",
+      "note": "The repeated 112x64 tile is the o_proj before the MoE chain."
+    },
+    {
+      "name": "nvjet_sm100_tss_240x64_64x9_1x2_2cta_h_bz_TNN",
+      "operation": "unified.mla.moe.merged_front",
+      "type": "single_gemm",
+      "role": "merged router/shared/latent MoE front projection",
+      "slot_suffixes": ["merged_front"],
+      "phase": "forward",
+      "stream_role": "primary",
+      "note": "SGLang's merged BF16 MoE front projection."
+    },
+    {
+      "name": "sglang::situ_and_mul_kernel",
+      "operation": "unified.mla.moe.shared_gate_up_activation",
+      "type": "elementwise",
+      "role": "shared expert SiTU gate/up activation",
+      "slot_suffixes": ["shared_gate_up_activation"],
+      "phase": "forward",
+      "stream_role": "primary",
+      "note": "Shared-expert SiTU gate/up fusion."
+    },
+    {
+      "name": "nvjet_sm100_tst_128x64_64x10_2x2_2cta_h_bz_TNT",
+      "operation": "unified.mla.moe.shared_down",
+      "type": "single_gemm",
+      "role": "shared expert down projection",
+      "slot_suffixes": ["shared_down"],
+      "phase": "forward",
+      "stream_role": "primary",
+      "note": "Shared expert 6144-to-7168 projection."
+    },
+    {
+      "name": "_router_triton_kernel",
+      "operation": "unified.mla.moe.mxfp4_fused_moe",
+      "type": "mxfp4_fused_moe",
+      "role": "routed MXFP4 MoE routing and expert path",
+      "slot_suffixes": ["mxfp4_fused_moe"],
+      "phase": "forward",
+      "stream_role": "primary",
+      "note": "Routing is folded into the registered fused-MoE leaf."
+    },
+    {
+      "name": "per_token_group_quant_flat_kernel",
+      "operation": "unified.mla.moe.mxfp4_fused_moe",
+      "type": "mxfp4_fused_moe",
+      "role": "routed MXFP4 MoE routing and expert path",
+      "slot_suffixes": ["mxfp4_fused_moe"],
+      "phase": "forward",
+      "stream_role": "primary",
+      "note": "FP8 activation quantization used by the fused routed expert call."
+    },
+    {
+      "name": "routingIndicesClusterKernel",
+      "operation": "unified.mla.moe.mxfp4_fused_moe",
+      "type": "mxfp4_fused_moe",
+      "role": "routed MXFP4 MoE routing and expert path",
+      "slot_suffixes": ["mxfp4_fused_moe"],
+      "phase": "forward",
+      "stream_role": "primary",
+      "note": "Top-k routing index construction is inside the fused-MoE leaf."
+    },
+    {
+      "name": "bmm_MxE4m3_MxE2m1",
+      "operation": "unified.mla.moe.mxfp4_fused_moe",
+      "type": "mxfp4_fused_moe",
+      "role": "routed MXFP4 MoE routing and expert path",
+      "slot_suffixes": ["mxfp4_fused_moe"],
+      "phase": "forward",
+      "stream_role": "primary",
+      "note": "MXFP4 routed expert gate/up grouped GEMM."
+    },
+    {
+      "name": "bmm_Bfloat16_MxE2m1",
+      "operation": "unified.mla.moe.mxfp4_fused_moe",
+      "type": "mxfp4_fused_moe",
+      "role": "routed MXFP4 MoE routing and expert path",
+      "slot_suffixes": ["mxfp4_fused_moe"],
+      "phase": "forward",
+      "stream_role": "primary",
+      "note": "BF16 output-side grouped GEMM from the MXFP4 expert path."
+    },
+    {
+      "name": "finalizeKernelVecLoad",
+      "operation": "unified.mla.moe.mxfp4_fused_moe",
+      "type": "mxfp4_fused_moe",
+      "role": "routed MXFP4 MoE routing and expert path",
+      "slot_suffixes": ["mxfp4_fused_moe"],
+      "phase": "forward",
+      "stream_role": "primary",
+      "note": "Fused-MoE finalize launch."
+    },
+    {
+      "name": "i64358435841_tensorptrbf16gmemalign16o35841",
+      "operation": "unified.mla.moe.routed_norm",
+      "type": "rms_norm",
+      "role": "routed latent expert normalization",
+      "slot_suffixes": ["routed_norm"],
+      "phase": "forward",
+      "stream_role": "primary",
+      "note": "RMSNorm over the 3584-dimensional routed latent output."
+    },
+    {
+      "name": "nvjet_sm100_tst_112x64_64x14_2x2_2cta_h_bz_TNN",
+      "after": "unified.mla.moe.routed_norm",
+      "operation": "unified.mla.moe.latent_up",
+      "type": "single_gemm",
+      "role": "routed latent up projection",
+      "slot_suffixes": ["latent_up"],
+      "phase": "forward",
+      "stream_role": "primary",
+      "note": "The repeated 112x64 tile is disambiguated by the routed-norm predecessor."
+    },
+    {
+      "name": "sglang::add3_kernel",
+      "operation": "unified.mla.moe.add3",
+      "type": "elementwise",
+      "role": "routed/shared/residual three-way add",
+      "slot_suffixes": ["add3"],
+      "phase": "forward",
+      "stream_role": "primary",
+      "note": "K3 MoE tail add."
+    }
+  ]
+}

@@ -1,0 +1,8 @@
+schema_version: 1
+simulation_preset: /raid/yilegu/roofline_guided_agent/VibeSimWorkspace/main-k3-rust/presets/alignment/kimi_k3_single_layer/mla_simulation.yaml
+profile_log_dir: /raid/yilegu/roofline_guided_agent/VibeSimWorkspace/scripts-local/vibesim-analysis-container/kimi_single_layer/align/mla_b128_l8192
+log_dir: /raid/yilegu/roofline_guided_agent/VibeSimWorkspace/main-k3-rust/logs/alignment_kimi_k3_single_layer_mla_timing_predict
+input_builder:
+  type: engine_text
+  measured_phase: forward
+  group_assignment: single
