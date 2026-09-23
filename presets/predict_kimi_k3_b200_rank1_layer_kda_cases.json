@@ -1,3 +1,5 @@
 [
-  { "groups": [ { "decode_count": 1, "average_decode_length": 8192 } ] }
+  { "groups": [ { "decode_count": 1, "average_decode_length": 8192 } ] },
+  { "groups": [ { "decode_count": 32, "average_decode_length": 8192 } ] },
+  { "groups": [ { "decode_count": 128, "average_decode_length": 8192 } ] }
 ]
