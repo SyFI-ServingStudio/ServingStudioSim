@@ -297,3 +297,41 @@ def test_k3_shape_gates_are_runner_validation_not_registry_fallbacks():
         validate_conv(1, 8192, 4, "bf16", "bf16")
     with pytest.raises(ValueError, match="hidden=128"):
         validate_norm(1, 256, "bf16")
+
+
+@pytest.mark.parametrize(
+    "backend",
+    ["sglang_cutedsl_mla", "sglang_trtllm_mla", "sglang_triton"],
+)
+def test_mla_runner_pads_short_page_tables_for_every_backend(backend):
+    from profiling.runners.attention.mla_decode_attention import (
+        _padded_kv_len,
+        _pages_per_request,
+        _validate_args,
+    )
+
+    args = _validate_args(12, 512, 64, "bf16", "bf16", 64, 1, 64, backend=backend)
+    assert _padded_kv_len(args.kv_len) == 128
+    assert _pages_per_request(args) == 2
+
+
+def test_mla_runner_rejects_kv_allocations_beyond_the_profile_pool():
+    from profiling.runners.attention.mla_decode_attention import (
+        _build_operands,
+        _validate_args,
+    )
+    from profiling.runners.exceptions import ProfilerNotImplemented
+
+    args = _validate_args(
+        12,
+        512,
+        64,
+        "bf16",
+        "fp8_e4m3",
+        64,
+        128,
+        1_048_576,
+        backend="sglang_cutedsl_mla",
+    )
+    with pytest.raises(ProfilerNotImplemented, match="48 GiB"):
+        _build_operands(None, args)

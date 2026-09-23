@@ -13,6 +13,9 @@ from profiling.runners.attention._common import WORKSPACE_BYTES, to_torch_dtype
 from profiling.runners.exceptions import KernelLaunchFailed, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
 
+_KV_PAGE_TABLE_ALIGNMENT = 128
+_MAX_PROFILE_KV_BYTES = 48 * 1024**3
+
 
 @dataclass(frozen=True)
 class _Args:
@@ -86,46 +89,84 @@ def _validate_args(
     return args
 
 
+def _padded_kv_len(kv_len: int) -> int:
+    """Match SGLang's short-sequence page-table padding for 64-token pages."""
+    return math.ceil(kv_len / _KV_PAGE_TABLE_ALIGNMENT) * _KV_PAGE_TABLE_ALIGNMENT
+
+
+def _pages_per_request(args: _Args) -> int:
+    return math.ceil(_padded_kv_len(args.kv_len) / args.page_size)
+
+
+def _kv_cache_bytes(args: _Args) -> int:
+    return (
+        args.batch_size
+        * _padded_kv_len(args.kv_len)
+        * (args.kv_lora_rank + args.rope_dim)
+        * int(args.kv_dtype.size_bytes())
+    )
+
+
+def _check_profile_allocation(args: _Args) -> None:
+    kv_bytes = _kv_cache_bytes(args)
+    if kv_bytes > _MAX_PROFILE_KV_BYTES:
+        raise ProfilerNotImplemented(
+            "MLA KV cache footprint exceeds the 48 GiB profiling pool: "
+            f"batch_size={args.batch_size}, kv_len={args.kv_len}, "
+            f"allocated_kv_len={_padded_kv_len(args.kv_len)}, bytes={kv_bytes}"
+        )
+
+
 def _build_operands(torch: Any, args: _Args) -> _Operands:
-    device = torch.device("cuda")
-    query_dtype = torch.float16 if args.q_dtype is DType.FP8_E4M3 else to_torch_dtype(args.q_dtype)
-    cache_dtype = (
-        torch.float16 if args.kv_dtype is DType.FP8_E4M3 else to_torch_dtype(args.kv_dtype)
-    )
-    generator = torch.Generator(device=device)
-    generator.manual_seed(42)
-    pages_per_request = math.ceil(args.kv_len / args.page_size)
-    total_pages = args.batch_size * pages_per_request
-    latent_dim = args.kv_lora_rank + args.rope_dim
-    query = torch.randn(
-        (args.batch_size, 1, args.num_heads, latent_dim),
-        dtype=query_dtype,
-        device=device,
-        generator=generator,
-    )
-    cache = torch.randn(
-        (total_pages, 1, args.page_size, latent_dim),
-        dtype=cache_dtype,
-        device=device,
-        generator=generator,
-    )
-    # SGLang quantizes the model-native query to FP8 whenever the MLA KV pool
-    # is FP8, so the decode callable sees the same storage dtype as the cache.
-    if args.q_dtype is DType.FP8_E4M3 or args.kv_dtype is DType.FP8_E4M3:
-        query = query.to(torch.float8_e4m3fn)
-    if args.kv_dtype is DType.FP8_E4M3:
-        cache = cache.to(torch.float8_e4m3fn)
-    block_tables = torch.arange(total_pages, dtype=torch.int32, device=device).view(
-        args.batch_size, pages_per_request
-    )
-    seq_lens = torch.full((args.batch_size,), args.kv_len, dtype=torch.int32, device=device)
-    return _Operands(
-        query.contiguous(),
-        cache.contiguous(),
-        block_tables,
-        seq_lens,
-        torch.empty(WORKSPACE_BYTES, dtype=torch.uint8, device=device),
-    )
+    _check_profile_allocation(args)
+    try:
+        device = torch.device("cuda")
+        query_dtype = (
+            torch.float16 if args.q_dtype is DType.FP8_E4M3 else to_torch_dtype(args.q_dtype)
+        )
+        cache_dtype = (
+            torch.float16 if args.kv_dtype is DType.FP8_E4M3 else to_torch_dtype(args.kv_dtype)
+        )
+        generator = torch.Generator(device=device)
+        generator.manual_seed(42)
+        pages_per_request = _pages_per_request(args)
+        total_pages = args.batch_size * pages_per_request
+        latent_dim = args.kv_lora_rank + args.rope_dim
+        query = torch.randn(
+            (args.batch_size, 1, args.num_heads, latent_dim),
+            dtype=query_dtype,
+            device=device,
+            generator=generator,
+        )
+        cache = torch.randn(
+            (total_pages, 1, args.page_size, latent_dim),
+            dtype=cache_dtype,
+            device=device,
+            generator=generator,
+        )
+        # SGLang quantizes the model-native query to FP8 whenever the MLA KV pool
+        # is FP8, so the decode callable sees the same storage dtype as the cache.
+        if args.q_dtype is DType.FP8_E4M3 or args.kv_dtype is DType.FP8_E4M3:
+            query = query.to(torch.float8_e4m3fn)
+        if args.kv_dtype is DType.FP8_E4M3:
+            cache = cache.to(torch.float8_e4m3fn)
+        block_tables = torch.arange(total_pages, dtype=torch.int32, device=device).view(
+            args.batch_size, pages_per_request
+        )
+        seq_lens = torch.full((args.batch_size,), args.kv_len, dtype=torch.int32, device=device)
+        return _Operands(
+            query.contiguous(),
+            cache.contiguous(),
+            block_tables,
+            seq_lens,
+            torch.empty(WORKSPACE_BYTES, dtype=torch.uint8, device=device),
+        )
+    except RuntimeError as exc:
+        if "out of memory" in str(exc).lower():
+            raise ProfilerNotImplemented(
+                "MLA KV cache allocation exceeded the profiling pool"
+            ) from exc
+        raise
 
 
 def mla_decode_attention_reference(
@@ -234,7 +275,7 @@ def _run_triton(args: _Args) -> ComputeMetrics:
     if not torch.cuda.is_available():
         raise ProfilerNotImplemented("CUDA is required for SGLang MLA profiling")
     operands = _build_operands(torch, args)
-    pages_per_request = math.ceil(args.kv_len / args.page_size)
+    pages_per_request = _pages_per_request(args)
     token_count = args.batch_size * pages_per_request * args.page_size
     k_buffer = operands.cache.view(token_count, 1, args.kv_lora_rank + args.rope_dim)
     v_buffer = k_buffer[..., : args.kv_lora_rank]

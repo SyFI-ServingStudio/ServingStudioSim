@@ -6,6 +6,8 @@ use crate::timing::kernels::engine::{register_kernel, KernelSpec};
 use crate::timing::sweep::{Axis, SweepGrid};
 use crate::timing::{Dim, KernelConfig, SweepCoords};
 
+const MAX_PROFILE_KV_BYTES: f64 = 48.0 * 1024.0 * 1024.0 * 1024.0;
+
 #[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct MlaDecodeAttentionKernelConfig {
     #[serde(deserialize_with = "de_backends")]
@@ -36,11 +38,19 @@ impl KernelSpec for MlaDecodeAttentionSpec {
     const KIND: KernelKind = "mla_decode_attention";
 
     fn sweep_grid(_config: &Self::Config) -> SweepGrid {
-        SweepGrid::new(vec![Axis::pow2(0, 8), Axis::pow2(6, 22)])
+        SweepGrid::new(vec![Axis::pow2(0, 7), Axis::pow2(7, 20)])
     }
 
     fn cache_kind(_backend: &'static str) -> CacheKind {
         CacheKind::Cache2DLinear(Extrapolation::Weighted)
+    }
+
+    fn infeasible_mask(config: &Self::Config, grid: &SweepGrid) -> Vec<bool> {
+        let latent_dim = f64::from(config.kv_lora_rank.get() + config.rope_dim.get());
+        let kv_bytes_per_token = latent_dim * f64::from(config.kv_dtype.size_bytes());
+        grid.expand_2d(|batch_size, kv_len| {
+            batch_size * kv_len * kv_bytes_per_token > MAX_PROFILE_KV_BYTES
+        })
     }
 
     fn enumerate(
@@ -91,12 +101,45 @@ mod tests {
         let cfg = config();
         assert_eq!(MlaDecodeAttentionSpec::KIND, "mla_decode_attention");
         assert_eq!(cfg.num_heads, 12);
-        assert_eq!(MlaDecodeAttentionSpec::sweep_grid(&cfg).axes().len(), 2);
-        assert_eq!(MlaDecodeAttentionSpec::sweep_grid(&cfg).axes()[1][0], 64.0);
+        let grid = MlaDecodeAttentionSpec::sweep_grid(&cfg);
+        assert_eq!(grid.axes().len(), 2);
+        assert_eq!(grid.axes()[0], Axis::pow2(0, 7));
+        assert_eq!(grid.axes()[1], Axis::pow2(7, 20));
         assert_eq!(
             MlaDecodeAttentionSpec::cache_kind("sglang_cutedsl_mla"),
             CacheKind::Cache2DLinear(Extrapolation::Weighted)
         );
+    }
+
+    #[test]
+    fn memory_mask_preserves_the_k3_points_for_bf16_and_fp8() {
+        let cfg = config();
+        let grid = MlaDecodeAttentionSpec::sweep_grid(&cfg);
+        let columns = grid.axes()[1].len();
+        let cell = |mask: &[bool], batch_size: f64, kv_len: f64| {
+            let row = grid.axes()[0]
+                .iter()
+                .position(|&value| value == batch_size)
+                .unwrap();
+            let column = grid.axes()[1]
+                .iter()
+                .position(|&value| value == kv_len)
+                .unwrap();
+            mask[row * columns + column]
+        };
+
+        let bf16_mask = MlaDecodeAttentionSpec::infeasible_mask(&cfg, &grid);
+        assert_eq!(bf16_mask.len(), 8 * 14);
+        assert!(!cell(&bf16_mask, 1.0, 1_048_576.0));
+        assert!(!cell(&bf16_mask, 16.0, 65_536.0));
+        assert!(!cell(&bf16_mask, 128.0, 8_192.0));
+        assert!(cell(&bf16_mask, 64.0, 1_048_576.0));
+
+        let mut fp8_cfg = cfg;
+        fp8_cfg.kv_dtype = DType::Fp8E4m3;
+        let fp8_mask = MlaDecodeAttentionSpec::infeasible_mask(&fp8_cfg, &grid);
+        assert!(!cell(&fp8_mask, 64.0, 1_048_576.0));
+        assert!(cell(&fp8_mask, 128.0, 1_048_576.0));
     }
 
     #[test]
@@ -112,7 +155,7 @@ mod tests {
         );
         let payload = MlaDecodeAttentionSpec::enumerate(
             &config(),
-            &SweepGrid::new(vec![Axis::values([1]), Axis::values([64])]),
+            &SweepGrid::new(vec![Axis::values([1]), Axis::values([128])]),
             "sglang_triton",
         )[0]
         .clone();
