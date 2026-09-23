@@ -355,6 +355,12 @@ impl SpeculativeUnifiedModel for Glm53VllmNvfp4DsaMoeDflash2Model {
         self.num_attn_shards
     }
 
+    /// DFlash drafts one bonus query plus `draft_tokens` mask queries per
+    /// request; vLLM reserves the mask queries in the scheduling budget.
+    fn drafting_slots_per_request(&self) -> u32 {
+        self.draft_tokens
+    }
+
     fn cost_log_manifest(&self) -> CostManifest {
         self.cost_tree().manifest()
     }

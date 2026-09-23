@@ -359,6 +359,17 @@ pub trait SpeculativeUnifiedModel: Send + Sync + 'static {
     fn num_attn_shards(&self) -> u16 {
         (self.gpus_per_replica() / self.num_attn_dp_groups().max(1)).max(1)
     }
+
+    /// Batch-token slots the drafter adds to every scheduled request, beyond
+    /// the rows the request itself submits. vLLM charges them against
+    /// `max_num_batched_tokens` for each request it schedules, decode or
+    /// prefill chunk (`SpeculativeConfig.max_num_new_slots_for_drafting`): a
+    /// parallel drafter such as DFlash runs K mask queries per request, which
+    /// share the engine's input buffers. A sequential drafter (MTP, EAGLE)
+    /// reuses the verify rows and adds none.
+    fn drafting_slots_per_request(&self) -> u32 {
+        0
+    }
 }
 
 #[cfg(test)]

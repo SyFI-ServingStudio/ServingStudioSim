@@ -48,9 +48,11 @@ pub(crate) fn build_speculative_worker<M: SpeculativeUnifiedModel>(
         "speculative worker requires speculative_draft_tokens > 0; \
          zero drafts is the chunked-prefill worker"
     );
+    let drafting_slots = model.drafting_slots_per_request();
     assert!(
         draft_tokens
             .checked_add(1)
+            .and_then(|width| width.checked_add(drafting_slots))
             .is_some_and(|width| width <= max_batch_tokens),
         "speculative verify width must fit max_batch_tokens"
     );
@@ -114,6 +116,7 @@ pub(crate) fn build_speculative_worker<M: SpeculativeUnifiedModel>(
             draft_tokens,
             config.speculative_acceptance_seed.unwrap_or(0),
         ),
+        drafting_slots,
     );
 
     IterBatchWorker::from_components(
@@ -332,6 +335,89 @@ mod tests {
         let mut config = config(KvAdmissionConfig::FullFootprint);
         config.max_batch_tokens = Some(DRAFT_TOKENS);
         build(config, shared_with(&[]));
+    }
+
+    #[test]
+    fn drafting_slots_are_charged_to_every_scheduled_request() {
+        // The defect this catches: budgeting a parallel drafter's requests at
+        // the verify width alone. vLLM charges DFlash K more slots per scheduled
+        // request, so at 33 tokens and k=5 it runs 3 requests per step, not 5.
+        use std::sync::atomic::{AtomicU32, Ordering};
+        const BUDGET: u32 = 33;
+        struct DraftSlotModel {
+            drafting_slots: u32,
+            most_requests: AtomicU32,
+        }
+        impl SpeculativeUnifiedModel for DraftSlotModel {
+            fn eval_speculative_iter(
+                &self,
+                batch: &SpeculativeArchInput,
+                slots: &mut Vec<LeafMetrics>,
+                scratch: &mut Vec<LeafMetrics>,
+            ) -> LeafMetrics {
+                for group in &batch.groups {
+                    let requests = group.request_count();
+                    assert!(group.batch_tokens + requests * self.drafting_slots <= BUDGET);
+                    self.most_requests.fetch_max(requests, Ordering::Relaxed);
+                }
+                FakeSpeculativeModel.eval_speculative_iter(batch, slots, scratch)
+            }
+            fn total_kv_bytes_per_token(&self) -> u64 {
+                1024
+            }
+            fn max_model_len(&self) -> u32 {
+                8192
+            }
+            fn gpus_per_replica(&self) -> u16 {
+                1
+            }
+            fn drafting_slots_per_request(&self) -> u32 {
+                self.drafting_slots
+            }
+        }
+        for (drafting_slots, expected_requests) in [(0, 5), (DRAFT_TOKENS, 3)] {
+            let rows: Vec<_> = (0..8).map(|id| (id, 1, OUTPUT_TOKENS)).collect();
+            let requests = shared_with(&rows);
+            for id in 0..8 {
+                requests.borrow_mut()[RequestId(id)]
+                    .request
+                    .definition
+                    .decoding = DecodingStrategy::Speculative {
+                    accept_rate: AcceptanceProfile::Uniform(0.0),
+                };
+            }
+            let model = Arc::new(DraftSlotModel {
+                drafting_slots,
+                most_requests: AtomicU32::new(0),
+            });
+            let mut config = config(KvAdmissionConfig::FullFootprint);
+            config.max_batch_tokens = Some(BUDGET);
+            let mut worker = build_speculative_worker(
+                WorkerId(0),
+                "test",
+                model.clone(),
+                requests.clone(),
+                config,
+                None,
+                PoolId(0),
+                "test-gpu",
+                test_cluster(),
+            );
+            for id in 0..8 {
+                worker.enqueue(WorkerMsgCommon::Request(RequestId(id)));
+            }
+            for tick in 0..200 {
+                worker.tick(Time::from_ms(tick as f64), &mut Vec::new());
+            }
+            for id in 0..8 {
+                assert!(requests.borrow()[RequestId(id)].lifecycle.completed);
+            }
+            assert_eq!(
+                model.most_requests.load(Ordering::Relaxed),
+                expected_requests,
+                "drafting_slots={drafting_slots}"
+            );
+        }
     }
 
     #[test]
