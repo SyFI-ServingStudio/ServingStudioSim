@@ -548,6 +548,44 @@ impl Deployment for UnifiedDeployment {
                     build_speculative_worker,
                 ))
             }
+            IterArchSel::Glm53VllmNvfp4DsaMoeDflash2 {
+                ep_size,
+                nvl_num_gpu,
+                max_model_len,
+                routing,
+                routing_seed,
+                draft_tokens,
+                draft_sliding_window,
+                expert_popularity_file,
+                token_corpus_file,
+                ..
+            } => {
+                ensure_speculative(&g.worker, *draft_tokens)?;
+                let model = Arc::new(arch_build::glm53_vllm_nvfp4_dsa_moe_dflash2(
+                    model_spec,
+                    *ep_size,
+                    *nvl_num_gpu,
+                    *max_model_len,
+                    *routing,
+                    *routing_seed,
+                    expert_popularity_file.as_deref(),
+                    token_corpus_file.as_deref(),
+                    *draft_tokens,
+                    *draft_sliding_window,
+                    &gpu_name,
+                    MODEL_NAME,
+                    bridge,
+                )?);
+                Ok(assemble_flow(
+                    model,
+                    store,
+                    worker_config,
+                    log_dir,
+                    gpu_name,
+                    dp_cfg,
+                    build_speculative_worker,
+                ))
+            }
             IterArchSel::Glm52SglangNvfp4TpDsaMoe {
                 tp_size,
                 max_model_len,

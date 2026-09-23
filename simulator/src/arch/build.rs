@@ -22,23 +22,32 @@ use crate::arch::model_cfg::ModelCfg;
 use crate::arch::moe_model_cfg::MoeModelCfg;
 use crate::arch::{
     deepseek_v4_vllm, glm52_sglang_nvfp4_tp_dsa_moe, glm52_vllm_dsa_moe, glm52_vllm_nvfp4_dsa_moe,
-    llama3_dense, llama3_dense_tp, llama3_dp_attn_tp_ffn, qwen36_local, qwen3_attn_layerwise,
-    qwen3_ffn_moe_layerwise, qwen3_fp8_ffn_moe_layerwise, qwen3_moe_dp_attn_ep_ffn,
-    qwen3_moe_fp8_dp_attn_ep_ffn, qwen3_vllm_moe_dp_attn_ep_ffn, AttnLayerwiseModel,
-    DeepseekV4ModelCfg, DeepseekV4VllmModel, DeepseekV4VllmParallel, DenseParallel,
-    DenseTpParallel, DpAttnTpFfnParallel, FfnLayerwiseModel, Glm52ModelCfg, Glm52MtpMode,
-    Glm52SglangNvfp4TpDsaMoeModel, Glm52SglangNvfp4TpDsaMoeParallel, Glm52VllmDsaMoeModel,
-    Glm52VllmDsaMoeParallel, Glm52VllmNvfp4DsaMoeModel, Glm52VllmNvfp4DsaMoeParallel,
-    Glm52VllmNvfp4DsaMoeSpeculativeModel, IterwiseUnifiedModel, Llama3DenseModel,
-    Llama3DenseTpModel, Llama3DpAttnTpFfnModel, Qwen36LocalModel, Qwen36LocalParallel,
-    Qwen36ModelCfg, Qwen3AttnLayerwiseModel, Qwen3AttnParallel, Qwen3FfnMoeLayerwiseModel,
-    Qwen3FfnMoeParallel, Qwen3Fp8FfnMoeLayerwiseModel, Qwen3Fp8FfnMoeParallel,
-    Qwen3MoeDpAttnEpFfnModel, Qwen3MoeFp8DpAttnEpFfnModel, Qwen3MoeFp8Parallel, Qwen3MoeParallel,
+    glm53_vllm_nvfp4_dsa_moe_dflash2, llama3_dense, llama3_dense_tp, llama3_dp_attn_tp_ffn,
+    qwen36_local, qwen3_attn_layerwise, qwen3_ffn_moe_layerwise, qwen3_fp8_ffn_moe_layerwise,
+    qwen3_moe_dp_attn_ep_ffn, qwen3_moe_fp8_dp_attn_ep_ffn, qwen3_vllm_moe_dp_attn_ep_ffn,
+    AttnLayerwiseModel, DeepseekV4ModelCfg, DeepseekV4VllmModel, DeepseekV4VllmParallel,
+    DenseParallel, DenseTpParallel, Dflash2DraftResolved, DpAttnTpFfnParallel, FfnLayerwiseModel,
+    Glm52ModelCfg, Glm52MtpMode, Glm52SglangNvfp4TpDsaMoeModel, Glm52SglangNvfp4TpDsaMoeParallel,
+    Glm52VllmDsaMoeModel, Glm52VllmDsaMoeParallel, Glm52VllmNvfp4DsaMoeModel,
+    Glm52VllmNvfp4DsaMoeParallel, Glm52VllmNvfp4DsaMoeSpeculativeModel,
+    Glm53VllmNvfp4DsaMoeDflash2Model, IterwiseUnifiedModel, Llama3DenseModel, Llama3DenseTpModel,
+    Llama3DpAttnTpFfnModel, Qwen36LocalModel, Qwen36LocalParallel, Qwen36ModelCfg,
+    Qwen3AttnLayerwiseModel, Qwen3AttnParallel, Qwen3FfnMoeLayerwiseModel, Qwen3FfnMoeParallel,
+    Qwen3Fp8FfnMoeLayerwiseModel, Qwen3Fp8FfnMoeParallel, Qwen3MoeDpAttnEpFfnModel,
+    Qwen3MoeFp8DpAttnEpFfnModel, Qwen3MoeFp8Parallel, Qwen3MoeParallel,
     Qwen3VllmMoeDpAttnEpFfnModel, Qwen3VllmMoeParallel,
 };
+use crate::common::Fabric;
+use crate::timing::bridge::DType;
+use crate::timing::kernels::AllReduceKernelConfig;
 use crate::timing::routing::RoutingDistribution;
 use crate::timing::ExpertDemand;
-use crate::timing::PerfApiBridge;
+use crate::timing::{Dim, PerfApiBridge};
+use crate::worklet::{
+    Dflash2ContextKvLocalWorklet, Dflash2ContextKvLocalWorkletConfig, Dflash2DraftAttnLocalWorklet,
+    Dflash2DraftFfnLocalWorklet, Dflash2DraftLayerLocalWorkletConfig, Dflash2SelectorLocalWorklet,
+    Dflash2SelectorLocalWorkletConfig,
+};
 
 /// `ModelSpec` → dense [`ModelCfg`], applying the `sim_num_layers` / `num_layers`
 /// override that truncates layer COUNT before `build_configs` (per-layer shape
@@ -1146,6 +1155,157 @@ pub fn glm52_vllm_nvfp4_dsa_moe_speculative(
         .context("building speculative B200 GLM-5.2 NVFP4 model (often a missing profile.db row)")
 }
 
+/// Build the GLM target graph driven by a DFlash2 block-parallel proposer.
+///
+/// The draft is a separate dense checkpoint, so its dimensions come from that
+/// checkpoint rather than from the GLM config expansion, and it routes nothing:
+/// six GQA layers with a plain SwiGLU MLP.
+#[allow(clippy::too_many_arguments)]
+pub fn glm53_vllm_nvfp4_dsa_moe_dflash2(
+    model_spec: &ModelSpec,
+    ep_size: u16,
+    nvl_num_gpu: u16,
+    max_model_len: u32,
+    routing_kind: RoutingKind,
+    routing_seed: Option<u64>,
+    expert_popularity_file: Option<&str>,
+    token_corpus_file: Option<&str>,
+    draft_tokens: u32,
+    draft_sliding_window: u32,
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<Glm53VllmNvfp4DsaMoeDflash2Model> {
+    let model_cfg = glm52_model_cfg(model_spec).context("loading exact GLM NVFP4 target config")?;
+    let source = ExpertDemandSource {
+        kind: routing_kind,
+        seed: routing_seed,
+        num_experts: model_cfg.num_experts.get(),
+        experts_per_token: model_cfg.router_top_k,
+        ep_size,
+        expert_popularity_file,
+        token_corpus_file,
+        num_routed_layers: num_sparse_layers(&model_cfg),
+    };
+    let verify_width = draft_tokens
+        .checked_add(1)
+        .context("speculative draft_tokens + 1 overflows u32")?;
+    let body = num_sparse_layers(&model_cfg) as usize;
+    let body_demand = source.demand(0..body, verify_width)?;
+    let parallel = Glm52VllmNvfp4DsaMoeParallel {
+        ep_size,
+        nvl_num_gpu,
+        max_model_len,
+        gpu_name: gpu.to_string(),
+    };
+    // The GLM-5.3 checkpoint does carry `num_nextn_predict_layers: 1`, but
+    // `--speculative-config {"method": "dflash", ...}` never instantiates it --
+    // the capture's server log mentions no MTP or nextn layer at all.
+    let configs = glm52_vllm_nvfp4_dsa_moe::build_verify_configs(
+        &model_cfg,
+        &parallel,
+        &body_demand,
+        model_spec.fp8,
+        draft_tokens,
+    )
+    .context("expanding GLM NVFP4 target configs for a DFlash2 deployment")?;
+    let resolved = glm52_vllm_nvfp4_dsa_moe::resolve_configs(&configs);
+    let draft = dflash2_draft_resolved(&parallel, draft_tokens, draft_sliding_window)
+        .context("expanding the DFlash2 draft configs")?;
+    glm53_vllm_nvfp4_dsa_moe_dflash2::build_dflash2(name.to_string(), resolved, draft, bridge)
+        .context("building GLM-5.3 NVFP4 + DFlash2 (often a missing profile.db row)")
+}
+
+/// The DFlash2 draft checkpoint's dimensions, from its own `config.json`:
+/// 6 layers, hidden 6144, intermediate 12288, 64 query / 8 KV heads at
+/// head_dim 128, vocab 154880, `conv_kernel_size` 2, `conv_group_size` 16,
+/// `selector_rank` 256, `selector_top_k` 16, and six `target_layer_ids`.
+fn dflash2_draft_resolved(
+    parallel: &Glm52VllmNvfp4DsaMoeParallel,
+    draft_tokens: u32,
+    sliding_window: u32,
+) -> Result<Dflash2DraftResolved> {
+    anyhow::ensure!(draft_tokens > 0, "DFlash2 draft_tokens must be positive");
+    anyhow::ensure!(
+        sliding_window > 0,
+        "DFlash2 draft_sliding_window must be positive"
+    );
+    let tp_size = parallel.ep_size;
+    let gpu_name = parallel.gpu_name.clone();
+    let layer_cfg = Dflash2DraftLayerLocalWorkletConfig {
+        residual_norm_backends: vec!["vllm_cuda"],
+        norm_backends: vec!["flashinfer"],
+        gemm_backends: vec!["torch_linear"],
+        elementwise_backends: vec!["triton"],
+        // `fa2` is the only rect backend with a working ragged path on B200,
+        // and it is bf16-only -- see the worklet's note on why the leaf is
+        // measured in bf16 while the engine runs fp8.
+        attention_backends: vec!["fa2"],
+        tp_size,
+        gpu_name: gpu_name.clone(),
+        hidden_dim: Dim::param("dflash2_hidden", 6144),
+        intermediate_dim: Dim::param("dflash2_intermediate", 12288),
+        num_qo_heads: Dim::param("dflash2_qo_heads", 64),
+        num_kv_heads: Dim::param("dflash2_kv_heads", 8),
+        head_dim: Dim::param("dflash2_head_dim", 128),
+        conv_taps: 2,
+        conv_group_size: 16,
+        dtype: DType::Bf16,
+        gemm_dtype: DType::Bf16,
+        attn_q_dtype: DType::Bf16,
+        attn_kv_dtype: DType::Bf16,
+    };
+    let context_kv_cfg = Dflash2ContextKvLocalWorkletConfig {
+        norm_backends: vec!["flashinfer"],
+        gemm_backends: vec!["torch_linear"],
+        elementwise_backends: vec!["triton"],
+        kv_cache_append_backends: vec!["vllm_cuda"],
+        tp_size,
+        gpu_name: gpu_name.clone(),
+        hidden_dim: Dim::param("dflash2_hidden", 6144),
+        num_draft_layers: 6,
+        num_aux_layers: 6,
+        num_kv_heads: Dim::param("dflash2_kv_heads", 8),
+        head_dim: Dim::param("dflash2_head_dim", 128),
+        kv_cache_block_size: 64,
+        kv_cache_layout: "NHD".to_string(),
+        kv_scale_granularity: "tensor".to_string(),
+        dtype: DType::Bf16,
+        gemm_dtype: DType::Bf16,
+        kv_dtype: DType::Fp8E4m3,
+    };
+    let selector_cfg = Dflash2SelectorLocalWorkletConfig {
+        gemm_backends: vec!["torch_linear"],
+        elementwise_backends: vec!["triton"],
+        // The capture runs flashinfer's radix select
+        // (`RadixTopKKernel_Unified` and the filtered/finalize pair), so that
+        // is the identity to price against; `torch` stays behind it as the
+        // semantic fallback the kernel kind also registers.
+        topk_backends: vec!["flashinfer", "torch"],
+        tp_size,
+        gpu_name: gpu_name.clone(),
+        hidden_dim: Dim::param("dflash2_hidden", 6144),
+        vocab_size: Dim::param("dflash2_vocab", 154880),
+        selector_rank: 256,
+        selector_top_k: 16,
+        dtype: DType::Bf16,
+        gemm_dtype: DType::Bf16,
+    };
+    Ok(Dflash2DraftResolved {
+        sliding_window,
+        context_kv: Dflash2ContextKvLocalWorklet::resolve_config(&context_kv_cfg),
+        draft_attn: Dflash2DraftAttnLocalWorklet::resolve_config(&layer_cfg),
+        draft_ffn: Dflash2DraftFfnLocalWorklet::resolve_config(&layer_cfg),
+        selector: Dflash2SelectorLocalWorklet::resolve_config(&selector_cfg),
+        tp_allreduce: AllReduceKernelConfig {
+            backends: vec!["nccl", "nvshmem"],
+            gpu_name,
+            num_gpus: u32::from(tp_size),
+            fabric: Fabric::Nvlink,
+        },
+    })
+}
+
 /// Build SGLang's B200 GLM-5.2 NVFP4 graph under pure tensor parallelism.
 /// Routing is resolved at EP1 because every TP rank owns all experts.
 #[allow(clippy::too_many_arguments)]
@@ -1477,7 +1637,8 @@ pub fn build_iter_model(
             name,
             bridge,
         )?),
-        IterArchSel::Glm52VllmNvfp4DsaMoeSpeculative { .. } => {
+        IterArchSel::Glm52VllmNvfp4DsaMoeSpeculative { .. }
+        | IterArchSel::Glm53VllmNvfp4DsaMoeDflash2 { .. } => {
             bail!("timing-predict: use arch.speculative_iter for a speculative model")
         }
     })
@@ -1514,6 +1675,35 @@ pub fn build_speculative_iter_model(
                 expert_popularity_file.as_deref(),
                 token_corpus_file.as_deref(),
                 *draft_tokens,
+                gpu,
+                name,
+                bridge,
+            )?),
+            *draft_tokens,
+        )),
+        IterArchSel::Glm53VllmNvfp4DsaMoeDflash2 {
+            model,
+            ep_size,
+            nvl_num_gpu,
+            max_model_len,
+            routing,
+            routing_seed,
+            draft_tokens,
+            draft_sliding_window,
+            expert_popularity_file,
+            token_corpus_file,
+        } => Ok((
+            Box::new(glm53_vllm_nvfp4_dsa_moe_dflash2(
+                model,
+                *ep_size,
+                *nvl_num_gpu,
+                *max_model_len,
+                *routing,
+                *routing_seed,
+                expert_popularity_file.as_deref(),
+                token_corpus_file.as_deref(),
+                *draft_tokens,
+                *draft_sliding_window,
                 gpu,
                 name,
                 bridge,
@@ -2317,5 +2507,31 @@ mod tests {
         );
         assert!(!attn_cfgs.attn.fp8);
         assert_eq!(attn_cfgs.attn.kv_dtype(), DType::Bf16);
+    }
+
+    #[test]
+    fn the_dflash2_draft_kv_addend_ignores_the_sliding_window() {
+        // The window bounds what the draft attends to, not what it stores: vLLM
+        // cannot unify the draft's page size with the MLA latent's, so it
+        // allocates the draft layers "as full attention for cache allocation".
+        // Billing a window would under-count the pool by context / window,
+        // which at 131072 tokens is 64x.
+        let parallel = Glm52VllmNvfp4DsaMoeParallel {
+            ep_size: 4,
+            nvl_num_gpu: 4,
+            max_model_len: 8192,
+            gpu_name: "NVIDIA B200".to_string(),
+        };
+        let narrow = dflash2_draft_resolved(&parallel, 7, 512).unwrap();
+        let wide = dflash2_draft_resolved(&parallel, 7, 131_072).unwrap();
+        let narrow_bytes =
+            glm53_vllm_nvfp4_dsa_moe_dflash2::draft_kv_bytes_per_token(&narrow).unwrap();
+        assert_eq!(
+            narrow_bytes,
+            glm53_vllm_nvfp4_dsa_moe_dflash2::draft_kv_bytes_per_token(&wide).unwrap(),
+        );
+        // 6 layers * 8 KV heads * 128 * 2 (K and V) * 1 byte, summed over the
+        // four attention ranks the heads are sharded across.
+        assert_eq!(narrow_bytes, 6 * 8 * 128 * 2);
     }
 }
