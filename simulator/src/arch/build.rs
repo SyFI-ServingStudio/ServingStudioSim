@@ -2074,7 +2074,8 @@ mod tests {
         assert_eq!(built.gpus_per_replica(), 4);
         assert_eq!(built.num_attn_dp_groups(), 1);
         assert_eq!(built.num_attn_shards(), 4);
-        assert_eq!(built.cost_log_manifest().slots.len(), 474);
+        // 3 sparse sections x 4 ranks x 3 leaves for the serial shared expert.
+        assert_eq!(built.cost_log_manifest().slots.len(), 474 + 36);
     }
 
     #[test]

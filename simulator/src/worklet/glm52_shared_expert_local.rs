@@ -165,8 +165,21 @@ impl Glm52SharedExpertLocalWorklet {
     }
 
     pub fn eval(&self, input: &Glm52SharedExpertLocalWorkletInput, ev: &mut Evaluator) {
+        self.eval_or_zero(input, false, ev);
+    }
+
+    /// [`Self::eval`], with the caller able to zero every leaf. An arch that
+    /// mints this worklet twice -- concurrent with the routed experts and
+    /// serial after them -- fills the copy the batch selects and zeroes the
+    /// other, keeping the tree's shape and slot count fixed (INV-1).
+    pub fn eval_or_zero(
+        &self,
+        input: &Glm52SharedExpertLocalWorkletInput,
+        zero: bool,
+        ev: &mut Evaluator,
+    ) {
         let work = work_inputs(input.batch_tokens);
-        let zero = input.batch_tokens == 0;
+        let zero = zero || input.batch_tokens == 0;
 
         eval_atomic_or_zero(&self.gate_up_proj, work.gate_up_proj, zero, ev);
         eval_atomic_or_zero(&self.silu_and_mul, work.silu_and_mul, zero, ev);
