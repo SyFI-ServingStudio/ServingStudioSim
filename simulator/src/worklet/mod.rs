@@ -16,6 +16,8 @@ pub mod deepseek_v4_attention_local;
 pub mod deepseek_v4_moe_expert_compute_local;
 pub mod deepseek_v4_moe_router_local;
 pub mod deepseek_v4_shared_expert_local;
+pub mod dflash2_context_kv_local;
+pub mod dflash2_draft_layer_local;
 pub mod fp8_attn_block_tp;
 pub mod fp8_post_attn_router_tp;
 pub mod fp8_pre_attn_proj_tp;
@@ -78,6 +80,16 @@ pub use deepseek_v4_moe_router_local::{
 pub use deepseek_v4_shared_expert_local::{
     DeepseekV4SharedExpertLocalWorklet, DeepseekV4SharedExpertLocalWorkletConfig,
     DeepseekV4SharedExpertLocalWorkletInput, DeepseekV4SharedExpertLocalWorkletResolved,
+};
+pub use dflash2_context_kv_local::{
+    Dflash2ContextKvLocalWorklet, Dflash2ContextKvLocalWorkletConfig,
+    Dflash2ContextKvLocalWorkletInput, Dflash2ContextKvLocalWorkletResolved,
+};
+pub use dflash2_draft_layer_local::{
+    Dflash2DraftAttnLocalWorklet, Dflash2DraftAttnLocalWorkletInput,
+    Dflash2DraftAttnLocalWorkletResolved, Dflash2DraftFfnLocalWorklet,
+    Dflash2DraftFfnLocalWorkletInput, Dflash2DraftFfnLocalWorkletResolved,
+    Dflash2DraftLayerLocalWorkletConfig,
 };
 pub use fp8_attn_block_tp::{
     Fp8AttnBlockTpWorklet, Fp8AttnBlockTpWorkletConfig, Fp8AttnBlockTpWorkletInput,

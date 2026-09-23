@@ -50,6 +50,15 @@ pub struct AttnPrefillLog {
     pub prefill_chunk_pairs: Vec<(u32, u32)>,
 }
 
+/// The DFlash2 draft-attention aggregating leaf's input: every request's
+/// `(q_len, kv_len)` rectangle summed into one slot. Unlike prefill there is no
+/// causal split -- the draft attends its whole query block over the whole
+/// context -- so the faithful record is the rectangle list itself.
+#[derive(Clone, Serialize)]
+pub struct Dflash2DraftAttnLog {
+    pub rectangles: Vec<(u32, u32)>,
+}
+
 /// Gated DeltaNet causal-convolution prefill fan-in: every request-local
 /// sequence length whose metrics were accumulated into the one fixed leaf.
 #[derive(Clone, Serialize)]
@@ -156,6 +165,7 @@ log_inputs! {
     DsaSparseMlaDecode => DsaSparseMlaDecodeLog,
     AttnDecode  => FlashinferAttnDecodeKernelInput,
     AttnRect    => FlashinferAttnRectKernelInput,
+    Dflash2DraftAttn => Dflash2DraftAttnLog,
     KvCacheAppend => KvCacheAppendKernelInput,
     MlaCacheAppend => MlaCacheAppendKernelInput,
     DsaIndexCacheAppend => DsaIndexCacheAppendKernelInput,
