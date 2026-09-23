@@ -418,11 +418,13 @@ impl Dflash2DraftAttnLocalWorklet {
             ev,
         );
 
-        // One aggregating slot over every request's rectangle. `add_fanin` (not
+        // One aggregating slot, priced as ONE launch over every request's
+        // rectangle: the engine runs a single varlen FlashAttention call per
+        // layer, not one per request. See `batched_rectangle`. `add_fanin` (not
         // `add`) so the slot carries the selected backend rather than the ZERO
         // accumulator's sentinel, which would read as "never executed".
         let mut attention = LeafMetrics::ZERO;
-        for &(q_len, kv_len) in &input.rectangles {
+        if let Some((q_len, kv_len)) = batched_rectangle(&input.rectangles) {
             attention.add_fanin(
                 self.attention
                     .kernel
@@ -757,6 +759,34 @@ where
     ))
 }
 
+/// The single rectangle one batched draft-attention launch is priced as:
+/// `q_len = sum(q_i)` and `kv_len = sum(q_i * kv_i) / sum(q_i)`, rounded up.
+///
+/// The rect leaf is profiled one request at a time, so summing it per request
+/// bills the launch and its fixed latency once per request. The engine makes one
+/// varlen call per layer, and on the v0.28 captures
+/// (`logs/20260923_4_glm53_dflash2_pack`) the per-request sum overstated
+/// `dflash2.layer.attn.attention` 55x at 256 concurrent requests (811 ms simulated
+/// vs 14.6 ms measured over the case) and 9x at 32; the error grew with the
+/// request count, not the context. One rectangle keeps the attention work
+/// (`sum(q_i * kv_i)`, every query row against its own keys) and bills one
+/// launch. It reads the keys of one mean-length context rather than every
+/// request's own, which errs fast on a KV-bound call; the leaf is measured at
+/// bf16 against the engine's fp8, which errs slow (see the module note).
+fn batched_rectangle(rectangles: &[(u32, u32)]) -> Option<(u32, u32)> {
+    let q_total: u64 = rectangles.iter().map(|&(q, _)| u64::from(q)).sum();
+    if q_total == 0 {
+        return None;
+    }
+    let work: u64 = rectangles
+        .iter()
+        .map(|&(q, kv)| u64::from(q) * u64::from(kv))
+        .sum();
+    let q_len = u32::try_from(q_total).expect("draft query rows fit u32");
+    let kv_len = u32::try_from(work.div_ceil(q_total)).expect("mean kv_len fits u32");
+    Some((q_len, kv_len))
+}
+
 fn eval_atomic_or_zero<K>(op: &Op<K>, input: K::Input, zero: bool, ev: &mut Evaluator)
 where
     K: Probe,
@@ -795,6 +825,15 @@ mod tests {
             attn_q_dtype: DType::Bf16,
             attn_kv_dtype: DType::Bf16,
         }
+    }
+
+    #[test]
+    fn a_batch_of_rectangles_is_one_launch_with_the_same_work() {
+        assert_eq!(batched_rectangle(&[]), None);
+        assert_eq!(batched_rectangle(&[(0, 100)]), None);
+        assert_eq!(batched_rectangle(&[(8, 100)]), Some((8, 100)));
+        // 8*100 + 8*301 = 3208 query-key pairs over 16 rows: 200.5, rounded up.
+        assert_eq!(batched_rectangle(&[(8, 100), (8, 301)]), Some((16, 201)));
     }
 
     #[test]
