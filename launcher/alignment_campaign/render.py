@@ -21,8 +21,8 @@ copy of; configs are built as dicts and dumped, so a malformed nesting is a
 | `--speculative-config` `model`       | host `checkpoints[variant.draft_checkpoint]` |
 | `arch.max_model_len`                 | case                                    |
 | `worker.attn_gpu_memory_gb`          | case (calibrated)                       |
-| `worker.gpu_time_multiplier`         | always 1.0 — the sim run injects the    |
-|                                      | kernel-align value with `--override`    |
+| `worker.gpu_time_multiplier`         | always 1.0; kernel-align only reports a |
+|                                      | recommendation, nothing injects it      |
 | `workload.arrival_mode` / `rate`     | case                                    |
 
 ## Two normalizations that are not cosmetic
@@ -425,14 +425,14 @@ def simulation_document(
             raise PackError(
                 f"variants.{variant.name}.worker must not set {derived}; "
                 "attn_gpu_memory_gb is per-case calibrated and gpu_time_multiplier "
-                "is injected by the simulation phase from the kernel-align result"
+                "is fixed at 1.0 (kernel-align reports the measured duty cycle)"
             )
     worker["attn_gpu_memory_gb"] = case.attn_gpu_memory_gb.value
     if case.chunk_size is not None:
         worker["max_batch_tokens"] = case.chunk_size
-    # Rendered as the neutral 1.0 on purpose: `alignment sim` overrides it with
-    # the multiplier read out of the completed kernel-align artifact, so a preset
-    # that already carried one would make the source of the number ambiguous.
+    # Rendered as the neutral 1.0 on purpose: the E2E checks judge the model
+    # without a duty-cycle correction, and kernel-align reports the measured
+    # multiplier as its own metric. Nothing reads that report back into the sim.
     worker["gpu_time_multiplier"] = 1.0
 
     document = {
