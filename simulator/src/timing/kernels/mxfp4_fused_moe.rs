@@ -3,7 +3,10 @@
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::CacheKind;
 use crate::timing::kernels::engine::{register_kernel, KernelSpec};
-use crate::timing::routing::sample_and_fold_layerwise_topk_expert_counts;
+use crate::timing::routing::{
+    sample_and_fold_layerwise_random_topk_expert_counts,
+    sample_and_fold_layerwise_topk_expert_counts,
+};
 use crate::timing::sweep::{Axis, SweepGrid};
 use crate::timing::{Dim, KernelConfig, SweepCoords};
 
@@ -33,6 +36,8 @@ pub struct Mxfp4FusedMoeKernelConfig {
     pub gemm1_clamp_limit: u32,
     pub layerwise_global_ppm: Vec<Vec<u32>>,
     pub folded_rank_position: u32,
+    #[serde(default)]
+    pub stochastic_routing: bool,
 }
 
 #[derive(Clone, SweepCoords, serde::Serialize, serde::Deserialize)]
@@ -72,13 +77,23 @@ impl KernelSpec for Mxfp4FusedMoeSpec {
         assert!(rank_offset + local_experts <= num_experts);
 
         grid.expand_1d(|num_tokens| {
-            let mut per_expert_batches = sample_and_fold_layerwise_topk_expert_counts(
-                &config.layerwise_global_ppm,
-                config.top_k,
-                num_tokens as u32,
-                local_experts,
-                FOLD_SEED,
-            );
+            let mut per_expert_batches = if config.stochastic_routing {
+                sample_and_fold_layerwise_random_topk_expert_counts(
+                    &config.layerwise_global_ppm,
+                    config.top_k,
+                    num_tokens as u32,
+                    local_experts,
+                    FOLD_SEED,
+                )
+            } else {
+                sample_and_fold_layerwise_topk_expert_counts(
+                    &config.layerwise_global_ppm,
+                    config.top_k,
+                    num_tokens as u32,
+                    local_experts,
+                    FOLD_SEED,
+                )
+            };
             per_expert_batches.rotate_left(rank_offset);
             ArgsPayload::new()
                 .with("backend", backend)
@@ -139,6 +154,7 @@ mod tests {
             gemm1_clamp_limit: 25,
             layerwise_global_ppm: vec![ppm],
             folded_rank_position: 0,
+            stochastic_routing: false,
         }
     }
 

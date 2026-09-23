@@ -14,9 +14,9 @@
 //!   there.
 //! - **simulated** — the per-slot UNIT times plus the shared cost manifest. The
 //!   renderer unfolds them the same way `trace::place` does, so the sim lane and
-//!   a `.pftrace` of the same iteration agree by construction. Unit times, not
-//!   critical-path-attributed ones: a losing `Max` branch is 0 there and would
-//!   render as a zero-width leaf.
+//!   a `.pftrace` of the same iteration agree by construction. Unit times are
+//!   retained for the manifest; alignment breakdowns proportionally attribute a
+//!   `Max` node's critical duration to every positive-time child.
 //!
 //! **Nothing here pairs a measured kernel with a simulated leaf.** In this very
 //! capture the ratio is 1:1, 2:1 and 3:1 depending on the operation, and some

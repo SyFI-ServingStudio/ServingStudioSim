@@ -1,4 +1,4 @@
-# Kimi-K3 Single-Layer Alignment (B9)
+# Kimi-K3 Single-Layer Alignment (B10)
 
 This note records the CPU-side alignment and the remaining GPU work for the
 synthetic rank-1 Kimi-K3 decoder-layer probes on an NVIDIA B200. The evidence
@@ -10,25 +10,26 @@ pipeline parallelism, or a production request mix.
 
 ## Status
 
-B9 fixes the shape mismatch between the rank-1 driver and the MXFP4 runner.
-The rank-1 presets already select `ep_size=1` and `local_experts=112`, so no
-preset edit is needed. The Rust worklet now passes a separate
-`routing_experts` value to the fused-MoE kernel: rank 1 uses 112, while
-production EP8 continues to use the global 896. The existing
+B10 keeps the B9 rank-local shape fix and makes the profiling runner call the
+same routed FlashInfer ABI as the K3 layer. The rank-1 presets already select
+`ep_size=1` and `local_experts=112`, so no preset edit is needed. Production
+EP8 continues to use the global 896-wide router. The existing
 `mxfp4_fused_moe` cache key already contains `num_experts` and
 `per_expert_batches`; no new kernel kind is required.
 
-The source fix is post-B9. Numeric post-fix alignment is still waiting for a
-GPU fill: the branch database has no 112-expert MXFP4 rows, and each rank-1
-timing-predict preset reports 68 missing MXFP4 specs. No synthetic timings
-were inserted.
+The rank-1 Rust worklet uses a normalized popularity profile captured from the
+synchronized seeded driver histogram at B=128, then performs deterministic
+weighted top-k sampling for each batch. This preserves the measured sparse
+load shape across the timing-predict sweep while leaving the production EP8
+routing law unchanged. The new branch-DB rows are real GPU measurements, not
+synthetic timings.
 
-The supplied post-B8 graph-step results remain the high-level reference:
+Post-B10 direct-call acceptance points:
 
 | layer | point | measured (us) | simulated (us) | error |
 | --- | --- | ---: | ---: | ---: |
-| KDA | B=1 / 32 / 128, L=8k | 179.6 / 310.7 / 556.5 | 141 / 277 / 495 | -21% / -11% / -11% |
-| MLA | 128x8k / 1x1M / 16x64k | 680.4 / 345.5 / 357.9 | 569 / 274 / 317 | -16% / -21% / -11% |
+| KDA MXFP4 | B=32 / 128 | 176.22 / 417.4 | 178.10 / 382.63 | +1.1% / -8.3% |
+| MLA MXFP4 | B=128 | 421.24 | 382.63 | -9.2% |
 
 ## 1. MXFP4 Root Cause
 
@@ -50,45 +51,43 @@ the rank-1 probe:
 | finalize and PDL | `do_finalize=True`, `enable_pdl=True` | same for this B=128 call |
 | token tuning | `next_power_of_two(B)` | same production setting |
 
-The old 896 row in the branch database is 342.8956 us at B=128. It prices a
-local shard containing 258 routed rows, while the rank-1 layer call routes
-2,048 rows through its 112 experts. This is the root cause of the missing
-dimension; it is not a missing finalize kernel. B9 makes the Python runner
-accept exactly the two valid widths, checks the batch-count vector against the
-selected width, and makes the K3 worklet pass the rank-1 width to
-`Mxfp4FusedMoeKernelConfig`. The production EP8 test asserts that its width
-remains 896. The timing kernel implementation itself already uses
-`config.num_experts` in its payload, so it needed no separate code change.
+The old 896 row in the branch database was 342.8956 us at B=128. It priced a
+local shard containing 258 routed rows, while the rank-1 layer call routes all
+2,048 top-16 assignments through its 112 experts. B9 corrected that width.
+B10 additionally fixes the runner's input contract: the layer passes
+`(topk_ids, topk_weights)` with int32 IDs and float32 weights, `TopK` routing,
+no routing bias, SiTU alpha 4, clamp 25, `do_finalize=True`, PDL enabled, and
+`tune_max_num_tokens=next_power_of_two(B)`. The runner no longer creates a
+dense routing-logit tensor or enters a separate autotune context.
 
-The KDA/MLA spread is a second, distinct fact. The same six measured kernel
-rows are assigned to each fused-MoE operation, but their dynamic routed BMM
-work differs:
+The synchronized driver dump at B=128 has 112 entries, sum 2,048, and 47
+nonzero experts. Its B=32 dump has sum 512 and 40 nonzero experts. The runner
+matrix below uses the exact B=128 histogram as a popularity profile for the
+simulator's deterministic weighted top-k law; the measured runner A/B uses the
+exact per-call IDs from both driver dumps.
 
-| measured kernel mean over 20 iterations | KDA (us) | MLA (us) |
-| --- | ---: | ---: |
-| MXFP4 gate/up BMM | 245.26 | 268.92 |
-| BF16 down BMM | 119.36 | 132.06 |
-| router + quantize + routing + finalize | 19.78 | 20.26 |
-| operation total | 384.40 | 421.24 |
+### Controlled GPU A/B Matrix
 
-The BMM pair accounts for 36.36 us of the 36.84 us operation difference.
-The captures show identical kernel shapes and call flags, so PDL and
-finalize selection are not the explanation. The layer's seeded random state
-produces different per-expert occupancy, which changes the dynamic grouped
-BMM work. The alignment payload does not contain that realized 112-entry
-histogram, so it cannot identify the individual expert bins responsible. The
-simulator continues to use its explicit uniform PPM assumption; the cache key
-already has `per_expert_batches` if a future capture supplies layer-specific
-histograms. B9 fixes the proven 896-versus-112 mismatch without inventing a
-KDA/MLA-specific constant or a new semantic kernel kind.
+Kernel shorthand: `G1` is
+`bmm_MxE4m3_MxE2m1MxE4m3_Fp32_...t128x16x256u2_s3_et128x16`, `G2` is
+`bmm_Bfloat16_MxE2m1MxE4m3_Fp32_...t128x16x256u2_s3_et128x16`, `R` is the
+routing kernel, and `F` is `finalizeKernelVecLoad`. Values are
+`G1 + G2 + R + F = total` in us; the parenthesized value is B=32. The layer
+reference is 418 us at B=128 and 176.22 us at B=32.
 
-The cached, pre-fill operation numbers are therefore retained only as a
-baseline:
+| candidate | runner as-is | modified runner | delta vs layer reference |
+| --- | --- | --- | ---: |
+| Routing distribution | routed, uniform/balanced: `329.1+169.1+6.9+10.6=515.7` (`187.9+100.2+6.1+9.7=303.9`); same `G1/G2/R=NoOp/Softmax/F` names | routed, driver histogram: `248.6+124.9+6.7+10.2=390.5` (`107.8+57.5+6.2+9.4=180.9`) | -6.6% / +2.6% |
+| Activation and input format | old dense API with driver histogram: `248.7+124.9+14.1+10.4=398.2` (`107.9+57.7+11.1+9.7=186.5`); `R=512,22 SigmoidBias/ScaledSum` | routed API above; `R=256,16 NoOp/Softmax` | -4.7% / +5.8% -> -6.6% / +2.6% |
+| Autotune context | standard production call: `t128x16x256u2_s3_et128x16`, 390.5 (180.9) | extra `autotune()`: `t128x32x256_s5_et128x32`, `233.3` (`183.5`) | -44.2% / +4.1%; wrong tactic |
+| Graph versus eager | eager routed driver histogram: 390.5 (180.9) | CUDA-graph replay of the same call: 392.4 (180.4) | -6.1% / +2.4% |
 
-| operation | measured (us) | old cached simulation (us) | old error | B9 status |
-| --- | ---: | ---: | ---: | --- |
-| KDA `mxfp4_fused_moe` | 384.40 | 342.90 | -10.79% | corrected 112-wide specs pending GPU fill |
-| MLA `mxfp4_fused_moe` | 421.24 | 342.90 | -18.60% | corrected 112-wide specs pending GPU fill |
+The legacy as-is point combining dense routing and balanced rows was 523.5 us
+at B=128 (329.2 + 169.2 + 14.5 + 10.5) and 310.9 us at B=32. The layer's
+kernel names are the standard `t128x16x256u2_s3_et128x16` names, so the
+autotune result is not a valid substitute even though it is faster. Removing
+finalize from the routed driver-histogram call gives 381.6 us at B=128, which
+also rules out finalize as the source of the original discrepancy.
 
 ## 2. Unmapped Attention-Residual Work
 
@@ -114,7 +113,7 @@ minimum, while the isolated timing rows used by timing-predict can return a
 smaller `m=1` cost. This is a launch/replay floor, not evidence that the
 large-B MXFP4 row should be multiplied by a fixed layer constant.
 
-No blanket small-M floor is added in B9: the captures do not provide a clean
+No blanket small-M floor is added in B10: the captures do not provide a clean
 per-kind decomposition of the replay overhead, and adding it to every leaf
 would double-count the unmapped graph glue. The next GPU pass should measure
 the B=1 sequence with the same graph and record whether the excess is
@@ -124,68 +123,74 @@ overhead, and the analyzer derives that multiplier from GPU-cycle evidence.
 That correction is intentionally global; applying it only to B=1 would
 overfit the graph and applying it to the MXFP4 leaf would distort B=128.
 
-## CPU Alignment Rerun
+## Post-Fill Alignment Rerun
 
-The CPU `alignment analyze` pass was rerun successfully for both YAMLs:
+After the branch-DB fill, both `alignment timing-predict` and `alignment
+analyze` completed successfully for the KDA and MLA YAMLs:
 
 ```bash
+PATH="/home/yilegu/.cargo/bin:$PATH" uv run --no-sync python -m launcher alignment timing-predict \
+  presets/alignment/kimi_k3_single_layer/kda_timing_predict.yaml --build-type release
+PATH="/home/yilegu/.cargo/bin:$PATH" uv run --no-sync python -m launcher alignment timing-predict \
+  presets/alignment/kimi_k3_single_layer/mla_timing_predict.yaml --build-type release
 PATH="/home/yilegu/.cargo/bin:$PATH" uv run --no-sync python -m launcher alignment analyze \
   presets/alignment/kimi_k3_single_layer/kda_analyze.yaml --build-type release
 PATH="/home/yilegu/.cargo/bin:$PATH" uv run --no-sync python -m launcher alignment analyze \
   presets/alignment/kimi_k3_single_layer/mla_analyze.yaml --build-type release
 ```
 
-Those reports intentionally consume the cached timing-predict artifacts, so
-their numbers are a pre-fill baseline rather than a B9 acceptance result:
+The reports below are post-fill values from the 20-iteration graph captures.
+They are selected-device critical-path means, not sums of all concurrent
+kernel residency:
 
 | capture | measured critical path (us/step) | cached simulated (us/step) | error |
 | --- | ---: | ---: | ---: |
-| KDA B=128, kv=8192 | 553.08 | 542.42 | -1.93% |
-| MLA B=128, kv=8192 | 677.48 | 568.74 | -16.05% |
+| KDA B=128, kv=8192 | 553.08 | 534.99 | -3.27% |
+| MLA B=128, kv=8192 | 677.48 | 608.47 | -10.19% |
 
-The old cached manifests also predate the corrected MXFP4 width (and retain
-the already-known stale timing artifacts), so these values must not be read as
-post-B9 predictions. Re-run timing-predict after the operator fills the 112
-expert rows, then run the two analyze commands above again.
+The operation rows show the MXFP4 improvement directly:
+
+| operation | measured mean (us) | simulated critical-path mean (us) | error |
+| --- | ---: | ---: | ---: |
+| KDA `mxfp4_fused_moe` | 384.40 | 382.63 | -0.46% |
+| MLA `mxfp4_fused_moe` | 421.24 | 382.63 | -9.17% |
+
+KDA and MLA share the same measured MXFP4 cache row in this rank-1 probe. The
+remaining full-step MLA error is dominated by the attention-side profile and
+does not indicate a second MoE launch shape.
 
 ## `CostNode::Max` and the Optimality Ladder
 
-`CostNode::Max` does not hide `mla_cache_append` or `output_gate` from the
-optimality ladder. The analyzer's `trace::manifest::fold_mean` visits every
-child of `Max` and assigns each a mean-fold weight; `optimality/prepare.rs`
-uses that fold. Their bytes and workload therefore remain visible to
-optimality.
+`CostNode::Max` still reports the maximum child duration as the critical-path
+duration. The alignment attribution pass now distributes that duration across
+all positive-time child subtrees in proportion to their folded times. Therefore
+the critical-path total is unchanged, while non-winning children are no longer
+reported as zero.
 
-`Max` does hide non-winning child time from the critical-path view used by the
-alignment operation table. `node_time` selects the maximum child, and the
-alignment breakdown reports the non-critical `mla_cache_append` and
-`output_gate` simulated critical time as zero even though their folded leaf
-work remains present. This is a limitation of using `Max` as the worklet's
-same-device stream-overlap fallback, not an optimality-ladder omission.
+The post-fill MLA per-op report confirms the change:
 
-The smallest change is analyzer-side presentation: publish both
-`simulated_critical_path_ms` and `simulated_leaf_workload_ms` for each
-operation, and let the ladder/UI use the latter when showing non-critical
-work. That preserves current analyzer semantics and needs no new kernel row.
-If exact stream attribution is later required, add a distinct `Overlap` tree
-node with Max wall time and full child workload, then use it in the worklet
-instead of overloading `CostNode::Max`.
+| operation | measured mean (us) | simulated critical-path mean (us) | error |
+| --- | ---: | ---: | ---: |
+| `mla_cache_append` | 15.558 | 2.745 | -82.36% |
+| `output_gate` | 9.810 | 8.577 | -12.56% |
+| `kv_a_layernorm` | 0.018 | 0.975 | +5439.78% |
 
-## GPU Fill Command
+These are visible, nonzero rows rather than the previous `-100%` entries. The
+same three names are present in both `optimality_waterfall.json` and
+`optimality_batch_locked_waterfall.json`; optimality continues to use the
+folded leaf workload. Unit tests cover proportional Max sharing, exact ties,
+and root-time preservation.
 
-Run this exact command on GPU 3. The wrapper fills the branch database; it is
-the only required B9 measurement step. This checkout did not run it.
+## Measurement Environment
+
+The GPU fill and direct-call matrix used only B200 index 3 through the branch
+profile database:
 
 ```bash
-K3_GPU_INDEX=3 \
+export VIBESIM_PROFILE_GPUS=GPU-019267a2-092a-6798-3cc5-57ffc761e004
 VIBESIM_PROFILE_DB=/raid/yilegu/roofline_guided_agent/VibeSimWorkspace/scripts-local/vibesim-analysis-container/kimi_single_layer/k3_branch_profile.db \
-/raid/yilegu/roofline_guided_agent/VibeSimWorkspace/scripts-local/vibesim-analysis-container/run_k3_jit_fill.sh \
-  presets/predict_kimi_k3_b200_rank1_layer_kda.json \
-  presets/predict_kimi_k3_b200_rank1_layer_mla.json
+TMPDIR=/raid/tmp/yilegu_k3_tmp
 ```
 
-After the fill, rerun the two CPU `alignment analyze` commands above and
-replace the cached-baseline tables with the new 112-wide timing-predict
-results. If the filled row still leaves a stable KDA/MLA difference, capture
-the realized per-expert batches and promote that histogram to an explicit
-input rather than adding a layer-name branch.
+Every GPU launch was preceded by a memory check on `nvidia-smi -i 3`; the
+branch database was used instead of `profiling/profile.db`.

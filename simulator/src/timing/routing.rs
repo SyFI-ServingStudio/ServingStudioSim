@@ -522,6 +522,66 @@ pub fn sample_topk_expert_counts(ppm: &[u32], top_k: u32, n_tokens: u32, seed: u
     cells.sample_counts(n_tokens, &mut rng)
 }
 
+/// Sample a complete global histogram using independent weighted draws without
+/// replacement for each token. This preserves distinct top-k assignments while
+/// retaining the Poisson-like load variance of a real router. It is intentionally
+/// separate from [`sample_topk_expert_counts`]: the systematic law remains the
+/// default for communication and all existing compute kernels.
+fn sample_random_topk_expert_counts_with_rng(
+    ppm: &[u32],
+    top_k: u32,
+    n_tokens: u32,
+    rng: &mut RoutingRng,
+) -> Vec<u32> {
+    let total_ppm: u32 = ppm.iter().sum();
+    assert_eq!(
+        total_ppm,
+        RoutingDistribution::TOTAL_PPM,
+        "random routing requires a normalized global ppm distribution"
+    );
+    let positive_experts = ppm.iter().filter(|&&mass| mass > 0).count();
+    assert!(
+        top_k > 0 && top_k as usize <= positive_experts,
+        "top_k {top_k} exceeds the positive-mass expert count {positive_experts}"
+    );
+
+    let mut counts = vec![0u32; ppm.len()];
+    let mut available = Vec::with_capacity(ppm.len());
+    for _ in 0..n_tokens {
+        available.clear();
+        available.extend(0..ppm.len());
+        let mut remaining_ppm = total_ppm;
+        for _ in 0..top_k {
+            let draw = rng.below(remaining_ppm);
+            let mut cumulative = 0u32;
+            let selected_position = available
+                .iter()
+                .position(|&expert| {
+                    cumulative += ppm[expert];
+                    draw < cumulative
+                })
+                .expect("positive-mass expert must be selectable");
+            let selected = available.swap_remove(selected_position);
+            counts[selected] += 1;
+            remaining_ppm -= ppm[selected];
+        }
+    }
+    counts
+}
+
+/// Sample one complete global expert-count histogram with independent
+/// weighted top-k draws. Consumers must shard this returned realization rather
+/// than sampling each EP rank independently.
+pub fn sample_random_topk_expert_counts(
+    ppm: &[u32],
+    top_k: u32,
+    n_tokens: u32,
+    seed: u64,
+) -> Vec<u32> {
+    let mut rng = RoutingRng::new(seed);
+    sample_random_topk_expert_counts_with_rng(ppm, top_k, n_tokens, &mut rng)
+}
+
 /// Sample every layer into a complete global histogram before any rank-local
 /// projection or cross-layer fold. The single RNG stream makes the synthetic
 /// iteration reproducible while keeping each layer draw independent.
@@ -627,6 +687,24 @@ pub fn sample_and_fold_layerwise_topk_expert_counts(
     fold_layerwise_expert_counts(&layers, experts_per_rank)
 }
 
+/// Sample complete global layer histograms with independent weighted top-k
+/// draws before folding them. The single RNG stream keeps the representative
+/// workload deterministic while retaining per-token routing variance.
+pub fn sample_and_fold_layerwise_random_topk_expert_counts(
+    layer_ppm: &[Vec<u32>],
+    top_k: u32,
+    n_tokens: u32,
+    experts_per_rank: usize,
+    seed: u64,
+) -> Vec<u32> {
+    let mut rng = RoutingRng::new(seed);
+    let layers = layer_ppm
+        .iter()
+        .map(|ppm| sample_random_topk_expert_counts_with_rng(ppm, top_k, n_tokens, &mut rng))
+        .collect::<Vec<_>>();
+    fold_layerwise_expert_counts(&layers, experts_per_rank)
+}
+
 /// Drive shuffled-systematic top-k routing for `n_tokens` tokens and invoke
 /// `on_token` once per token with that token's realized hit state:
 /// `hit_rank[r]` / `hit_dom[d]` are the per-rank / per-domain DISTINCT-hit masks
@@ -686,8 +764,8 @@ mod tests {
     use crate::timing::routing::{
         balanced_expert_counts, fold_layerwise_expert_counts, for_each_routed_token,
         ranks_per_nvl_domain, sample_and_fold_layerwise_topk_expert_counts,
-        sample_layerwise_topk_expert_counts, sample_topk_expert_counts, RoutingDistribution,
-        RoutingRng, SystematicCells,
+        sample_layerwise_topk_expert_counts, sample_random_topk_expert_counts,
+        sample_topk_expert_counts, RoutingDistribution, RoutingRng, SystematicCells,
     };
 
     #[test]
@@ -972,6 +1050,23 @@ mod tests {
         );
         assert_eq!(compressed, projected);
         assert_eq!(compressed.iter().sum::<u32>(), n_tokens * top_k);
+    }
+
+    #[test]
+    fn random_topk_sampling_is_reproducible_and_retains_load_variance() {
+        let dist = RoutingDistribution::uniform(112);
+        let (top_k, n_tokens, seed) = (16u32, 128u32, 0xF01D_5EEDu64);
+        let counts = sample_random_topk_expert_counts(dist.ppm(), top_k, n_tokens, seed);
+        assert_eq!(
+            counts,
+            sample_random_topk_expert_counts(dist.ppm(), top_k, n_tokens, seed)
+        );
+        assert_eq!(counts.iter().sum::<u32>(), n_tokens * top_k);
+        assert!(
+            counts.iter().min() < counts.iter().max(),
+            "independent routing must not collapse to a balanced histogram"
+        );
+        assert!(counts.iter().all(|&count| count <= n_tokens));
     }
 
     #[test]

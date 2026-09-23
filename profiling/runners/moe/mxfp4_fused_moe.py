@@ -225,7 +225,7 @@ def profile_mxfp4_fused_moe(
     args = _validate_args(**locals())
     try:
         import torch
-        from flashinfer import trtllm_fp4_block_scale_moe
+        from flashinfer.fused_moe import trtllm_fp4_block_scale_routed_moe
         from flashinfer.tllm_enums import ActivationType, RoutingMethodType
         from sglang.kernels.ops.quantization.per_token_group_quant import (
             per_token_group_quant,
@@ -240,16 +240,13 @@ def profile_mxfp4_fused_moe(
             top_k=args["top_k"],
             per_expert_batches=args["per_expert_batches"],
         )
-        routing_logits = torch.full(
-            (args["num_tokens"], args["num_experts"]),
-            -16.0,
-            dtype=torch.bfloat16,
+        selected = torch.tensor(ids, dtype=torch.int32, device=device)
+        topk_weights = torch.full(
+            (args["num_tokens"], args["top_k"]),
+            1.0 / args["top_k"],
+            dtype=torch.float32,
             device=device,
         )
-        selected = torch.tensor(ids, dtype=torch.int64, device=device)
-        priorities = torch.arange(args["top_k"], dtype=torch.bfloat16, device=device)
-        routing_logits.scatter_(1, selected, (16.0 - priorities).expand_as(selected).contiguous())
-        routing_bias = torch.zeros(args["num_experts"], dtype=torch.bfloat16, device=device)
         hidden_states = torch.randn(
             (args["num_tokens"], args["hidden_size"]),
             dtype=torch.bfloat16,
@@ -259,7 +256,7 @@ def profile_mxfp4_fused_moe(
             hidden_states, group_size=_GROUP_SIZE, scale_ue8m0=True
         )
         hidden_states_scale = hidden_states_scale.view(torch.float8_e4m3fn)
-        w13, s13, b13, w2, s2, b2 = _prepare_weights(torch, args)
+        w13, s13, _, w2, s2, _ = _prepare_weights(torch, args)
         alpha = torch.full(
             (args["num_local_experts"],), args["gemm1_alpha"], dtype=torch.float32, device=device
         )
@@ -274,38 +271,37 @@ def profile_mxfp4_fused_moe(
         )
 
         def run_once() -> Any:
-            return trtllm_fp4_block_scale_moe(
-                routing_logits=routing_logits,
-                routing_bias=routing_bias,
+            return trtllm_fp4_block_scale_routed_moe(
+                topk_ids=(selected, topk_weights),
+                routing_bias=None,
                 hidden_states=hidden_states,
                 hidden_states_scale=hidden_states_scale,
                 gemm1_weights=w13,
                 gemm1_weights_scale=s13,
-                gemm1_bias=b13,
+                gemm1_bias=None,
                 gemm1_alpha=alpha,
                 gemm1_beta=clamp,
                 gemm1_clamp_limit=None,
                 gemm2_weights=w2,
                 gemm2_weights_scale=s2,
-                gemm2_bias=b2,
+                gemm2_bias=None,
                 output1_scale_scalar=None,
                 output1_scale_gate_scalar=None,
                 output2_scale_scalar=None,
                 num_experts=args["num_experts"],
                 top_k=args["top_k"],
-                n_group=args["n_group"],
-                topk_group=args["topk_group"],
+                n_group=None,
+                topk_group=None,
                 intermediate_size=args["intermediate_size"],
                 local_expert_offset=0,
                 local_num_experts=args["num_local_experts"],
-                routed_scaling_factor=args["routed_scaling_factor"],
-                routing_method_type=RoutingMethodType.DeepSeekV3.value,
+                routed_scaling_factor=None,
+                routing_method_type=RoutingMethodType.TopK.value,
                 do_finalize=True,
                 enable_pdl=True,
                 activation_type=ActivationType.Situ.value,
                 output=output,
                 tune_max_num_tokens=_next_power_of_two(args["num_tokens"]),
-                norm_topk_prob=True,
             )
 
         run_once()
@@ -330,7 +326,7 @@ def profile_mxfp4_fused_moe(
     )
     seconds = time_ms / 1000.0
     bytes_accessed = (
-        args["num_tokens"] * args["num_experts"] * 2
+        args["num_tokens"] * args["top_k"] * (4 + 4)
         + local_rows * args["hidden_size"] * 2
         + args["num_tokens"] * args["hidden_size"] * 2
     )

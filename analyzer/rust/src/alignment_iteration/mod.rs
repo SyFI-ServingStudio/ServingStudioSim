@@ -1283,8 +1283,9 @@ fn build_breakdown(
     let mut simulated_kernels = Vec::new();
     let mut iteration_unmapped_simulated_ms = 0.0;
     // Keep folded workload for mapping coverage, but attribute visible
-    // simulated time through the CostTree's Sum/Max/Scale semantics. An
-    // EP Max branch must contribute only its winning leaf to the UI path.
+    // simulated time through the CostTree's Sum/Max/Scale semantics. A Max
+    // node retains its critical-path duration while sharing it across the
+    // positive-time child subtrees so non-winning EP work remains visible.
     let critical_path_ms_by_slot = critical_path_leaf_ms(manifest, &sim.slot_ms)?;
     let attributed_simulated_ms: f64 = critical_path_ms_by_slot.iter().sum();
     ensure!(
@@ -2090,8 +2091,10 @@ fn leaf_scales(manifest: &Manifest) -> Result<Vec<u64>> {
 }
 
 /// Attribute one prediction row back to leaf slots while exactly preserving
-/// the CostTree root. A `Max` selects its slowest child; exact ties retain the
-/// first child, which is the stable rank-0 branch for EP fan-out trees.
+/// the CostTree root. A `Max` retains its slowest-child duration divided by
+/// overlap, then shares that duration across children in proportion to their
+/// subtree times. This keeps parallel alternatives visible without changing
+/// the critical-path total.
 fn critical_path_leaf_ms(manifest: &Manifest, slot_ms: &[f64]) -> Result<Vec<f64>> {
     const TIME_EPSILON_MS: f64 = 1e-12;
 
@@ -2154,9 +2157,14 @@ fn critical_path_leaf_ms(manifest: &Manifest, slot_ms: &[f64]) -> Result<Vec<f64
             FlatCostNode::Scale { n, children } => {
                 node_weights[children.start] += weight * f64::from(*n);
             }
-            FlatCostNode::Max { overlap, children } => {
-                let critical_child = first_max_child(children.clone(), &node_times);
-                node_weights[critical_child] += weight / f64::from(*overlap).max(TIME_EPSILON_MS);
+            FlatCostNode::Max { children, .. } => {
+                let child_time_sum: f64 = children.clone().map(|child| node_times[child]).sum();
+                if child_time_sum > 0.0 {
+                    let branch_weight = weight * node_times[index] / child_time_sum;
+                    for child in children.clone() {
+                        node_weights[child] += branch_weight;
+                    }
+                }
             }
         }
     }
@@ -3243,7 +3251,7 @@ fn definitions() -> Value {
         "physical_kernels": "all physical inventory rows represented by one semantic occurrence, including each row's identity and the devices that launched it. Singular row and name fields remain for backward compatibility",
         "simulated_kernel_folded_ms": "one L1 leaf slot time multiplied by its exact CostTree Scale multiplicity",
         "simulated_kernel_context": "present only when a slot name is not unique, and then it is the shallowest CostTree label that separates this occurrence from its namesakes (for Qwen3.6, `GDN layer` vs `gated-GQA layer`). One worklet built once and compiled into several tree positions gives its slots identical names by design -- ownership resolves by name, so both nodes get the same operation -- and this is what a reader needs to tell two identical rows apart. It is display context, never a join key",
-        "simulated_kernel_critical_path_ms": "the leaf's contribution to timing-predict total_time_ms after exact CostTree Sum/Scale/Max/overlap attribution; an exact Max tie selects the first child",
+        "simulated_kernel_critical_path_ms": "the leaf's contribution to timing-predict total_time_ms after exact CostTree Sum/Scale/Max/overlap attribution; Max duration is shared across positive-time child subtrees in proportion to their folded times",
         "mapping_coverage": "duration/workload fraction assigned by embedded labels; unmatched entries stay explicit and are never filled with zero. Measured coverage is scored against measured_kernel_sum_ms, NOT the concurrency-deducted critical path, so a fully-labeled concurrent capture reports 100% rather than more",
         "measured_critical_path_fraction": "mapped contribution divided by the complete selected-device critical path, after overlap and collective arrival-wait removal; reported separately from raw residency coverage",
         "sequences": "the labelled kernel programs as the labeler wrote them, still folded: a `repeat{n}` band is one layer repeated, not n rows. Joined to a breakdown by row_id, which is `sequence_id:expanded_ordinal`",
@@ -3349,7 +3357,7 @@ mod tests {
     }
 
     #[test]
-    fn critical_path_leaf_ms_preserves_sum_scale_and_max() {
+    fn critical_path_leaf_ms_preserves_sum_scale_and_shares_max() {
         let manifest = Manifest {
             slots: vec![test_leaf("a"), test_leaf("b"), test_leaf("c")],
             // Sum(Leaf a, Scale{2}(Max(Leaf b, Leaf c))).
@@ -3370,15 +3378,16 @@ mod tests {
             node_labels: vec![None; 6],
         };
 
-        // Root = 4 + 2 * (max(6, 10) / 2) = 14. Only c is critical.
+        // Root = 4 + 2 * (max(6, 10) / 2) = 14. The Max duration is shared
+        // between b and c in proportion to their subtree times.
         assert_eq!(
             critical_path_leaf_ms(&manifest, &[4.0, 6.0, 10.0]).unwrap(),
-            vec![4.0, 0.0, 10.0]
+            vec![4.0, 3.75, 6.25]
         );
     }
 
     #[test]
-    fn critical_path_leaf_ms_breaks_exact_max_tie_to_first_child() {
+    fn critical_path_leaf_ms_shares_exact_max_tie() {
         let manifest = Manifest {
             slots: vec![test_leaf("rank0"), test_leaf("rank1")],
             nodes: vec![
@@ -3394,7 +3403,7 @@ mod tests {
 
         assert_eq!(
             critical_path_leaf_ms(&manifest, &[5.0, 5.0]).unwrap(),
-            vec![5.0, 0.0]
+            vec![2.5, 2.5]
         );
     }
 
