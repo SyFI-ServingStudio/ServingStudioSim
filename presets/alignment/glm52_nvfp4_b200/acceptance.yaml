@@ -13,10 +13,11 @@ schema_version: 1
 
 # The report schemas these tolerances were written against. `compare` refuses to
 # record a golden when a run's reports disagree, because a duration-weighted
-# kernel error (schema 2) and an unweighted per-iteration mean (schema 1) are
-# different statistics that would otherwise share a key.
+# kernel error (schema 2+) and an unweighted per-iteration mean (schema 1) are
+# different statistics, and schema 3 measures the barrier critical path rather
+# than one device's; either way they would otherwise share a key.
 analyzer_schema:
-  iteration: 2
+  iteration: 3
   e2e: 1
   workload: 1
 

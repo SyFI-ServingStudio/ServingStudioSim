@@ -295,7 +295,8 @@ It keeps the overview and other subject-level plots directly under `plots/`,
 then groups breakdowns in batches of 32 under raw-id ranges such as
 `plots/iter_6_to_305/iter_6_breakdown.png`. Sampling therefore bounds rendering
 cost without changing any computed statistic or discarding payload rows.
-Each breakdown selects the same complete critical device as its headline, shows
+Each breakdown draws the device holding the largest share of the barrier critical
+path (`critical_busy_ms_by_device`), shows
 its material CUDA streams separately, and folds the small tail into one explicit
 `other streams` row. It reads only the sampled timeline byte ranges. Breakdowns
 use a pre-sized 150-DPI canvas, skip the tight-bounding-box redraw, and use

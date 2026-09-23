@@ -22,10 +22,13 @@ statistics, so reading both would mean either two metric names to keep aligned
 forever, or one name whose meaning turns over with the schema — and a golden key
 that silently switches statistic is worse than one that goes missing.
 
-The analyzer settled the question: `ALIGNMENT_ITERATION_SCHEMA_VERSION` is 2 and
-nothing in the tree emits 1, so the v1 path was reachable only by a report old
-enough that its numbers predate the current mapping. `measure_case` now rejects
-it by name. `e2e` and `workload` are still v1 — that is the version the analyzer
+The analyzer settled the question: nothing in the tree emits 1, so the v1 path
+was reachable only by a report old enough that its numbers predate the current
+mapping. `measure_case` now rejects it by name. v3 keeps v2's statistics but
+measures a different path: `measured_ms` is the barrier critical path (each window
+between collectives won by its own slowest rank) instead of one selected device's
+path. A v2 kernel error and a v3 one are not comparable, so v2 is refused the same
+way. `e2e` and `workload` are still v1 — that is the version the analyzer
 writes today (`analyzer/rust/src/io.rs`), not a legacy one.
 
 Only three small reports are read (iteration 132 KB - 1 MB, e2e ~6 KB, workload
@@ -43,7 +46,7 @@ from typing import Any
 METRICS_SCHEMA_VERSION = 1
 
 #: Report schema versions the formula table knows how to read.
-SUPPORTED_SCHEMAS = {"iteration": (2,), "e2e": (1,), "workload": (1,)}
+SUPPORTED_SCHEMAS = {"iteration": (3,), "e2e": (1,), "workload": (1,)}
 
 #: Where each report sits inside a case run directory.
 REPORT_LOCATIONS = {

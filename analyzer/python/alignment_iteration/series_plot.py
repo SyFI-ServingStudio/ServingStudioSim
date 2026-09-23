@@ -502,10 +502,18 @@ def _render_stream_breakdown(
     *,
     run_label: str,
 ) -> Path:
-    """Draw compact real streams plus one measured and one simulated path."""
-    device_id = breakdown.get("critical_device_id")
-    if device_id is None:
-        device_id = timeline_iteration["measured"].get("critical_device_id")
+    """Draw compact real streams plus one measured and one simulated path.
+
+    The streams are drawn for the rank that owns the most critical busy time.
+    Under the barrier model no single rank owns the whole path, so this is the
+    rank whose streams explain the largest share of it.
+    """
+    busy_by_device = breakdown.get("critical_busy_ms_by_device") or {}
+    device_id = (
+        min(busy_by_device, key=lambda item: (-float(busy_by_device[item]), int(item)))
+        if busy_by_device
+        else None
+    )
     if device_id is None:
         work_by_device: dict[int, int] = defaultdict(int)
         for kernel in timeline_iteration["measured"]["kernels"]:
@@ -518,10 +526,9 @@ def _render_stream_breakdown(
 
     stream_rows = _stream_operation_rows(timeline_iteration, device_id)
     displayed_streams = _display_stream_rows(stream_rows)
-    # This is the exact reduced path used by the acceptance comparison. Its
-    # measured-kernel rows already carry each operation's reduced share and sum
-    # to measured_ms; rebuilding it from stream rows and the audit-only hidden
-    # maximum can leave overlap in the lane and even invert the delta's sign.
+    # This is the exact barrier path used by the acceptance comparison. Its
+    # measured-kernel rows carry each position's share and sum to measured_ms;
+    # rebuilding it from stream rows would put overlap back into the lane.
     measured_ms = float(breakdown["measured_ms"])
     measured_path = _compact_path_rows(
         [
@@ -533,38 +540,6 @@ def _render_stream_breakdown(
             for row in breakdown["measured_kernels"]
         ],
         measured_ms,
-    )
-
-    # Newer schema-v2 artifacts carry the selected device's interval-union
-    # attribution. Older v2 artifacts predate these fields, so omit this audit
-    # lane instead of making an otherwise valid result impossible to redraw.
-    measured_timeline_kernels = timeline_iteration["measured"]["kernels"]
-    device_timeline_kernels = [
-        kernel
-        for kernel in measured_timeline_kernels
-        if any(int(interval[0]) == device_id for interval in kernel["iv"])
-    ]
-    busy_union_value = breakdown.get("measured_physical_path_ms")
-    show_busy_union = busy_union_value is not None and all(
-        "selected_effective_ms" in kernel for kernel in device_timeline_kernels
-    )
-    busy_union_ms = float(busy_union_value) if show_busy_union else None
-    busy_path = (
-        _compact_path_rows(
-            [
-                row
-                for rows in _stream_operation_rows(
-                    timeline_iteration,
-                    device_id,
-                    duration_field="selected_effective_ms",
-                    duration_divisor=1.0,
-                ).values()
-                for row in rows
-            ],
-            busy_union_ms,
-        )
-        if busy_union_ms is not None
-        else []
     )
 
     simulated_path = [
@@ -598,12 +573,8 @@ def _render_stream_breakdown(
     comparison_rows = _operation_comparison_rows(semantic_names, measured_path, simulated_path)
 
     labels = [f"GPU {device_id} {label}" for label, _rows in displayed_streams]
-    if busy_union_ms is not None:
-        labels.append(f"GPU {device_id} busy (union)")
-    labels.extend(["Nsight reduced critical path", "Timing-predict critical path"])
+    labels.extend(["Nsight barrier critical path", "Timing-predict critical path"])
     rows_to_draw = [rows for _label, rows in displayed_streams]
-    if busy_union_ms is not None:
-        rows_to_draw.append(busy_path)
     rows_to_draw.extend([measured_path, simulated_path])
     table_blocks = min(BREAKDOWN_TABLE_BLOCKS, max(1, len(semantic_names)))
     table_rows = math.ceil(len(semantic_names) / table_blocks)
@@ -634,11 +605,12 @@ def _render_stream_breakdown(
     simulated_ms = sum(float(row["duration_ms"]) for row in simulated_path)
     delta_ms = simulated_ms - measured_ms
     relative_pct = delta_ms / measured_ms * 100.0 if measured_ms > 0.0 else math.nan
-    busy_union_title = f" (busy union {busy_union_ms:.3f} ms)" if busy_union_ms is not None else ""
+    switches = breakdown.get("critical_rank_switches")
+    switches_title = f" · critical rank changed {switches}x" if switches is not None else ""
     axis.set_title(
         f"{run_label}\nIteration {breakdown['iteration_id']} · {breakdown['stage']} · "
-        f"critical device {device_id}\n"
-        f"Nsight {measured_ms:.3f} ms{busy_union_title} · "
+        f"streams of GPU {device_id}{switches_title}\n"
+        f"Nsight {measured_ms:.3f} ms · "
         f"Timing-predict {simulated_ms:.3f} ms · "
         f"delta {delta_ms:+.3f} ms ({relative_pct:+.2f}%)",
         fontweight="bold",
@@ -704,7 +676,6 @@ def _render_breakdown(row: dict, out_path: Path, *, run_label: str) -> Path:
         value_key="duration_ms",
         colors=measured_colors,
         label=_measured_key,
-        hidden_key="concurrent_hidden_ms",
     )
     simulated_handles, simulated_centers = _draw_stack(
         ax,
@@ -735,15 +706,10 @@ def _render_breakdown(row: dict, out_path: Path, *, run_label: str) -> Path:
             )
         )
 
-    measured_sum = float(row.get("measured_kernel_sum_ms", 0.0))
+    # Each measured row is its share of the barrier critical path, so the lane
+    # sums to measured_ms with every overlap already removed.
+    measured_sum = float(row.get("measured_ms", 0.0))
     simulated_sum = float(row.get("simulated_critical_path_ms", 0.0))
-    # The measured lane lays every occurrence end to end, so when the framework
-    # ran two CUDA streams at once the lane is longer than the GPU was busy by
-    # exactly the overlap. Draw that surplus instead of letting the bar quietly
-    # grow: the stack stays the like-for-like partner of a CostTree `Sum`, and
-    # the shaded tail says how much of it never cost wall time. Zero, and so
-    # invisible, on a single-stream capture.
-    hidden_ms = float(row.get("measured_concurrent_hidden_ms", 0.0) or 0.0)
     _draw_cumulative_critical_path_error(
         cumulative_ax,
         measured,
@@ -757,12 +723,7 @@ def _render_breakdown(row: dict, out_path: Path, *, run_label: str) -> Path:
         shared_path_limit_ms = 1.0
     ax.set_xlim(0.0, shared_path_limit_ms)
     cumulative_ax.set_xlim(0.0, shared_path_limit_ms)
-    measured_label = f"Nsight measured\n{measured_sum:.3f} ms replica path"
-    if hidden_ms > 1e-9:
-        measured_label += (
-            f"\n(−{hidden_ms:.3f} ms hatched: ran\n"
-            f"concurrently → {measured_sum - hidden_ms:.3f} ms busy)"
-        )
+    measured_label = f"Nsight measured\n{measured_sum:.3f} ms barrier critical path"
     ax.set_yticks([1.0, 0.0])
     ax.set_yticklabels(
         [
@@ -834,7 +795,6 @@ def _draw_stack(
     value_key: str,
     colors: list,
     label: Callable[[str, dict], str],
-    hidden_key: str | None = None,
 ) -> tuple[list[Patch], dict[str, list[float]]]:
     """Draw one stack and retain every center owned by each operation.
 
@@ -858,27 +818,6 @@ def _draw_stack(
             edgecolor="white",
             linewidth=0.7,
         )
-        # Hatch the part of THIS segment that ran while an earlier CUDA stream
-        # was already busy. The lane is a sum laid end to end, not a time axis,
-        # so the mark cannot say when the overlap happened — but putting it on
-        # the operation that actually overlapped is the difference between "the
-        # shared expert was hidden" and a meaningless lump at the end of the
-        # bar. The analyzer charges each overlap to one side only, so the
-        # hatched marks across the lane add up to the `-N ms` in its label.
-        hidden = float(item.get(hidden_key, 0.0) or 0.0) if hidden_key else 0.0
-        hidden = min(hidden, value)
-        if hidden > 1e-9:
-            ax.barh(
-                y,
-                hidden,
-                left=left + value - hidden,
-                height=0.58,
-                facecolor="none",
-                edgecolor="0.25",
-                hatch="////",
-                linewidth=0.0,
-                zorder=4,
-            )
         if total > 0.0 and value / total >= 0.025:
             text = segment_id if value / total < 0.09 else f"{segment_id}\n{value:.3f}"
             ax.text(
@@ -1049,13 +988,11 @@ def _aggregate_measured_for_plot(rows: list[dict]) -> list[dict]:
                 "operation": operation,
                 "calls": 0,
                 "duration_ms": 0.0,
-                "concurrent_hidden_ms": 0.0,
                 "row_count": 0,
             }
         aggregate = aggregates[key]
         aggregate["calls"] += int(row.get("calls", 1))
         aggregate["duration_ms"] += float(row["duration_ms"])
-        aggregate["concurrent_hidden_ms"] += float(row.get("concurrent_hidden_ms", 0.0) or 0.0)
         aggregate["row_count"] += 1
     return [aggregates[key] for key in order]
 

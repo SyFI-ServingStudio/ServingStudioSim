@@ -1494,10 +1494,10 @@ def test_alignment_analyzer_and_renderer_end_to_end(tmp_path):
     )
     e2e_report = json.loads((analysis / "reports" / "alignment_e2e_report.json").read_text())
     assert iteration_report["mapping"]["coverage"]["measured_duration_fraction"] == 1.0
-    # Schema 2 streams run-wide audit rows into the sibling JSONL named by the
-    # report. Follow that contract instead of the deliberately empty bootstrap
-    # array retained for compatibility.
-    assert iteration_report["schema_version"] == 2
+    # Schema 2 and later stream run-wide audit rows into the sibling JSONL named
+    # by the report. Follow that contract instead of the deliberately empty
+    # bootstrap array retained for compatibility.
+    assert iteration_report["schema_version"] == 3
     assert iteration_report["kernels"] == []
     kernel_detail = iteration_report["kernel_detail"]
     assert kernel_detail["rows"] == 3
@@ -1509,6 +1509,17 @@ def test_alignment_analyzer_and_renderer_end_to_end(tmp_path):
         "model.lm_head",
     }
     assert iteration_report["iterations"][0]["measured_ms"] == 3.5
+    # The barrier path's identities close exactly on every emitted row.
+    for row in iteration_report["iterations"]:
+        assert row["measured_ms"] == pytest.approx(row["critical_busy_ms"] + row["collective_ms"])
+        assert row["wall_ms"] == pytest.approx(
+            row["measured_ms"] + row["idle_internal_ms"] + row["idle_boundary_ms"]
+        )
+        assert row["critical_busy_ms"] == pytest.approx(
+            row["measured_kernel_sum_ms"]
+            - row["hidden_same_stream_ms"]
+            - row["hidden_cross_stream_ms"]
+        )
     # The iteration pass self-computes the duty-cycle multiplier from measured
     # quantities alone: Σ measured_gpu_cycle_ms / Σ measured_ms over iterations
     # that have a next-iteration cycle. Only iteration 0 has a cycle here

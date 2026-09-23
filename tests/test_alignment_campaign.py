@@ -1116,7 +1116,7 @@ def test_an_iteration_report_older_than_the_current_schema_is_refused(tmp_path):
     assert not measurement.metrics
 
     # e2e and workload are v1 by current design, not by legacy.
-    assert SUPPORTED_SCHEMAS == {"iteration": (2,), "e2e": (1,), "workload": (1,)}
+    assert SUPPORTED_SCHEMAS == {"iteration": (3,), "e2e": (1,), "workload": (1,)}
 
 
 def test_ratio_convention_is_simulated_over_measured():

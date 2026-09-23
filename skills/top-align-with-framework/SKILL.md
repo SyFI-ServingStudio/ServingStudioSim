@@ -136,13 +136,19 @@ modeled time deviates a lot from measured, and attribute it:
 Kernel-only sums exclude the inter-kernel gaps (launch overhead, sync, scheduling)
 that real wall time contains. The kernel-align pass derives the duty-cycle
 correction `recommended_gpu_time_multiplier = Σ measured_gpu_cycle_ms / Σ
-measured_ms` — the same per-occurrence `measured_ms` reduction the breakdown
-reports, so numerator and denominator are one consistent metric. Judge whether
-that correction is reasonable:
+measured_ms` — the same barrier critical path the breakdown reports, so
+numerator and denominator are one consistent metric. Judge whether that
+correction is reasonable:
 
-- multi-device evidence was reduced as complete per-device paths before the
-  critical device was selected; mapped, unmapped, and overlap maxima were not
-  chosen independently;
+- multi-device evidence was reduced by the barrier model: each window between
+  collectives is won by its own busiest rank, so no single device is charged
+  for the whole iteration. Read the multiplier through the exact identities in
+  `operate-run-alignment` → "Measured time taxonomy":
+  `measured_gpu_cycle_ms = wall_ms + gap`, `wall_ms = measured_ms +
+  idle_internal_ms + idle_boundary_ms`, and `measured_ms = critical_busy_ms +
+  collective_ms`. A large multiplier then decomposes into idle inside
+  segments (launch bubbles), idle at barrier edges, or the gap between
+  iterations; `collective_skew_ms` is off the path and never part of it;
 - collective residency/wait remains timeline evidence rather than being counted
   as CUDA kernel duration, and stream plots preserve reduced work totals even
   when small streams are aggregated;

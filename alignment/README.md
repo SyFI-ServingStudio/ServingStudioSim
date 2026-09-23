@@ -415,8 +415,8 @@ or contribute to mapped coverage. Rules express this with `status: unmapped`,
 phase and source-backed neighbors as for mapped operations. Unidentified
 unmapped rows remain separate; names alone never imply a cross-rank join.
 The report preserves raw residency mapping coverage and separately exposes
-`measured_critical_path_fraction`, whose denominator removes overlap and
-collective arrival wait on the same selected device as the timing comparison.
+`measured_critical_path_fraction`, whose denominator is the barrier critical
+path used by the timing comparison.
 
 ```json
 {
@@ -593,8 +593,8 @@ standalone command. It pools `Σ measured_gpu_cycle_ms / Σ measured_ms` over
 iterations that have a next-iteration GPU cycle (a GPU cycle is one iteration's
 first attributed kernel start to the next kernel-bearing iteration's first kernel
 start on the same device; the terminal iteration per device is excluded). The
-denominator is Check 1's selected-device reduced kernel path: the same kernel
-quantity timing-predict models before the correction expands it to the observed
+denominator is Check 1's barrier critical path (busy plus collective): the same
+kernel quantity timing-predict models before the correction expands it to the observed
 GPU cycle. `measured_busy_union_ms` remains separate audit evidence and is not
 the denominator. Treat the factor as experiment-specific, never a GPU-wide
 constant.
@@ -698,11 +698,12 @@ not a join key. Independent data-parallel schedulers can have diverging counters
 so the parser instead pairs only mutual, unique overlaps of attributed GPU-kernel
 envelopes. Missing kernel evidence, ambiguous overlap, and incomplete phase
 inventory remain explicitly unpaired. Analysis applies labels independently to
-each rank, then builds one interval-union path per physical device. A
-synchronizing collective is capped by `max(end) - max(start)` to remove arrival
-wait; independent work keeps the selected device's own contribution. The
-longest complete device path supplies the headline and the duty-cycle
-denominator. The physical all-device busy union remains a separate audit value.
+each rank, then reduces the iteration with the barrier model
+(`doc/analyzer.md`): each run of synchronizing positions is a barrier costing
+`max(end) - max(start)`, and each window between barriers is won by the rank
+with the largest busy union in it. That path supplies the headline and the
+duty-cycle denominator. The physical all-device busy union remains a separate
+audit value.
 
 ## Concurrent CUDA streams: the track axis
 
@@ -730,18 +731,12 @@ resets `after` / `after_name` / `before_name` at the boundary, because those
 evidence keys mean "in the same execution stream" and there is no *before*
 between two things that ran at once.
 
-**Concurrency is unioned, not summed.** The selected device's physical kernel
-intervals are unioned before collective arrival wait is removed. This counts
-both same-stream PDL and multi-stream overlap once. `measured_excluded_overlap_ms`
-reports the full deduction; `measured_concurrent_hidden_ms` retains the narrower
-cross-stream subset as audit evidence.
-
-Per operation and per measured kernel, `concurrent_hidden_ms` charges that
-overlap to the **later-starting track only** — the side stream that joined a
-device already busy. Splitting it between both sides would make no set of rows
-add up to the iteration total; charging it forward telescopes exactly, so the
-breakdown plot can hatch each operation's hidden share in place and the marks
-still sum to the number in the lane's label.
+**Concurrency is unioned, not summed.** Each segment winner's launches are
+unioned, which counts same-stream PDL and multi-stream overlap once. The removed
+time is split exactly into `hidden_same_stream_ms` and `hidden_cross_stream_ms`
+by which launch covered it. Every measured kernel row also reports its own
+`overlap` with other launches on the same device (any, same-stream, other-stream),
+and the timeline payload names the overlapping partners per launch.
 
 **This is measurement, not a cost-model instruction.** It must not be turned into
 a `CostNode::Max`: every `Max` in the simulator

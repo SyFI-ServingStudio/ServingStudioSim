@@ -226,7 +226,7 @@ golden's provenance sidecar, so the derivation stays visible without living in
 every pack.
 
 The table **pins the report `schema_version` it reads** rather than adapting to
-whichever one it is handed: `iteration` 2, `e2e` 1, `workload` 1 — the versions
+whichever one it is handed: `iteration` 3, `e2e` 1, `workload` 1 — the versions
 the analyzer emits today (`ALIGNMENT_ITERATION_SCHEMA_VERSION`, `io::SCHEMA_VERSION`).
 Anything else lands in a case's `issues` and clears `available`, so it becomes an
 unavailable case rather than a wrong number.
