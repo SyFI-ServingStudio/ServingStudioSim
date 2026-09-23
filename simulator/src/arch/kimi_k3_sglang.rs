@@ -502,6 +502,14 @@ pub fn build_configs(
     let gpu = parallel.gpu_name.clone();
     let heads = parallel.heads_per_rank_value();
     let local_experts = parallel.local_experts_value(model);
+    // The standalone rank-1 probe builds SGLang's MoE config with the
+    // per-rank expert width (112) and keeps EP only as metadata. Production
+    // EP8 keeps the 896-wide router and hands 112 experts to the local rank.
+    let routing_experts = if parallel.ep_size == 1 {
+        local_experts
+    } else {
+        model.num_experts.get()
+    };
     let include_model_io = parallel.sim_kda_layers.is_none() && parallel.sim_mla_layers.is_none();
 
     let kda_cfg = || KimiK3KdaLocalWorkletConfig {
@@ -526,6 +534,7 @@ pub fn build_configs(
         hidden: model.hidden.clone(),
         latent_hidden: model.latent_hidden.clone(),
         num_experts: model.num_experts.clone(),
+        routing_experts: routing_experts.into(),
         local_experts: local_experts.into(),
         moe_intermediate: model.moe_intermediate.clone(),
         shared_intermediate: model.shared_intermediate.clone(),
@@ -1251,7 +1260,12 @@ mod tests {
 
         let bridge = PerfApiBridge::new_uninit_for_test();
         bridge.enable_enumerate();
-        let enumerated = build("unified".into(), resolve_configs(&configs), &bridge).unwrap();
+        let resolved = resolve_configs(&configs);
+        assert_eq!(
+            resolved.mla_moe.as_ref().unwrap().mxfp4_fused_moe.num_experts,
+            896
+        );
+        let enumerated = build("unified".into(), resolved, &bridge).unwrap();
         let scope = enumerated.model_work_scope();
         assert_eq!(scope["kda_state_dtype"], json!("bf16"));
         assert_eq!(scope["heads_per_rank"], json!(12));
@@ -1275,8 +1289,17 @@ mod tests {
             }
         );
         let resolved = resolve_configs(&kda);
-        assert_eq!(resolved.kda_attention.unwrap().raw_cfg.heads, 12);
-        assert_eq!(resolved.kda_moe.unwrap().raw_cfg.local_experts, 112);
+        assert_eq!(resolved.kda_attention.as_ref().unwrap().raw_cfg.heads, 12);
+        assert_eq!(resolved.kda_moe.as_ref().unwrap().raw_cfg.local_experts, 112);
+        assert_eq!(
+            resolved
+                .kda_moe
+                .as_ref()
+                .unwrap_or_else(|| panic!("rank-1 KDA MoE missing"))
+                .mxfp4_fused_moe
+                .num_experts,
+            112
+        );
         let mla = build_configs(&cfg, &rank1(Some(0), Some(1))).unwrap();
         assert_eq!(
             mla.counts,

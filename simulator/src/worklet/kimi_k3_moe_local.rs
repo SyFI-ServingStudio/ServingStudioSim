@@ -43,6 +43,10 @@ pub struct KimiK3MoeLocalWorkletConfig {
     pub hidden: Dim,
     pub latent_hidden: Dim,
     pub num_experts: Dim,
+    /// Expert width passed to the rank-local FlashInfer call. The production
+    /// graph routes over all 896 experts; the rank-1 alignment driver shrinks
+    /// that call to its 112 local experts and keeps EP as metadata.
+    pub routing_experts: Dim,
     pub local_experts: Dim,
     pub moe_intermediate: Dim,
     pub shared_intermediate: Dim,
@@ -91,7 +95,7 @@ impl KimiK3MoeLocalWorklet {
             .unwrap_or_else(|reason| panic!("invalid KimiK3MoeLocalWorkletConfig: {reason}"));
         let merged_front_n =
             2 * cfg.shared_intermediate.get() + cfg.num_experts.get() + cfg.latent_hidden.get();
-        let ppm = uniform_ppm(cfg.num_experts.get());
+        let ppm = uniform_ppm(cfg.routing_experts.get());
         KimiK3MoeLocalWorkletResolved {
             merged_front: SingleGemmKernelConfig {
                 backends: cfg.gemm_backends.clone(),
@@ -118,7 +122,7 @@ impl KimiK3MoeLocalWorklet {
                 gpu_name: cfg.gpu_name.clone(),
                 hidden_size: cfg.latent_hidden.clone(),
                 intermediate_size: cfg.moe_intermediate.clone(),
-                num_experts: cfg.num_experts.clone(),
+                num_experts: cfg.routing_experts.clone(),
                 num_local_experts: cfg.local_experts.clone(),
                 top_k: cfg.top_k,
                 input_dtype: cfg.dtype,
@@ -331,6 +335,12 @@ fn validate_config(cfg: &KimiK3MoeLocalWorkletConfig) -> Result<(), String> {
     if cfg.local_experts.get() == 0 || cfg.num_experts.get() % cfg.local_experts.get() != 0 {
         return Err("local_experts must be a positive divisor of num_experts".to_string());
     }
+    if cfg.routing_experts != cfg.local_experts && cfg.routing_experts != cfg.num_experts {
+        return Err("routing_experts must equal local_experts or num_experts".to_string());
+    }
+    if cfg.routing_experts.get() < cfg.top_k {
+        return Err("routing_experts must be at least top_k".to_string());
+    }
     if cfg.top_k != TOP_K {
         return Err(format!("top_k must be {TOP_K}, got {}", cfg.top_k));
     }
@@ -350,6 +360,7 @@ mod tests {
             hidden: HIDDEN.into(),
             latent_hidden: LATENT_HIDDEN.into(),
             num_experts: NUM_EXPERTS.into(),
+            routing_experts: NUM_EXPERTS.into(),
             local_experts: 112.into(),
             moe_intermediate: MOE_INTERMEDIATE.into(),
             shared_intermediate: SHARED_INTERMEDIATE.into(),
@@ -373,6 +384,7 @@ mod tests {
         assert_eq!(resolved.shared_down.n, HIDDEN);
         assert_eq!(resolved.mxfp4_fused_moe.hidden_size, LATENT_HIDDEN);
         assert_eq!(resolved.mxfp4_fused_moe.intermediate_size, MOE_INTERMEDIATE);
+        assert_eq!(resolved.mxfp4_fused_moe.num_experts, NUM_EXPERTS);
         assert_eq!(resolved.mxfp4_fused_moe.num_local_experts, 112);
         assert_eq!(resolved.mxfp4_fused_moe.top_k, TOP_K);
         assert_eq!(resolved.routed_norm.hidden, LATENT_HIDDEN);

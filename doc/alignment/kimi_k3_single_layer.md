@@ -1,168 +1,191 @@
-# Kimi-K3 Single-Layer Alignment
+# Kimi-K3 Single-Layer Alignment (B9)
 
-This bundle records the CPU-side alignment setup for the synthetic B=128,
-kv=8192 Kimi-K3 decoder-layer probes. The measured inputs are the forward-only
-NSYS artifacts under `scripts-local/.../kimi_single_layer/align/`; the checked-in
-YAMLs rebuild timing-predict inputs from those traces and the branch-local K3
-profile database. KDA uses the BF16-state split decode worklet. The paged-FP8
-MLA prediction subsequently completed and was analyzed with its own label set.
+This note records the CPU-side alignment and the remaining GPU work for the
+synthetic rank-1 Kimi-K3 decoder-layer probes on an NVIDIA B200. The evidence
+is the 20-iteration CUDA-graph captures under
+`scripts-local/vibesim-analysis-container/kimi_single_layer/align/`, their
+parsed kernel sequences, and the branch profile database. It is not a
+full-model result: the probe does not exercise the 93-layer scheduler,
+pipeline parallelism, or a production request mix.
 
-The KDA labels keep the wide fused-QKVG projection and the concurrent
-`[f_a|beta]` projection as separate leaves. The side-stream leaf is placed in a
-`CostNode::Max` with the wide leaf: its bytes and work remain accounted for,
-while its time is removed from the critical path. This is the available
-worklet-level fallback because the analyzer has no same-device stream-overlap
-node. The follow-on `f_b` projection is part of that alternate stream but is
-not a separate Rust leaf. Routing and the two routed expert GEMMs remain folded
-into `mxfp4_fused_moe`, while the two `attn_res_fused_tma_kernel` launches plus
-CUDA-graph glue remain explicitly unmapped. The resulting numbers are evidence
-from one instrumented decoder layer, not full-model alignment: no K3 checkpoint
-is available here, and the probe does not exercise the 93-layer scheduler,
-pipeline parallelism, or request mix.
+## Status
 
-## KDA Result
+B9 fixes the shape mismatch between the rank-1 driver and the MXFP4 runner.
+The rank-1 presets already select `ep_size=1` and `local_experts=112`, so no
+preset edit is needed. The Rust worklet now passes a separate
+`routing_experts` value to the fused-MoE kernel: rank 1 uses 112, while
+production EP8 continues to use the global 896. The existing
+`mxfp4_fused_moe` cache key already contains `num_experts` and
+`per_expert_batches`; no new kernel kind is required.
 
-The kernel-align report uses the 20 repeated B=128, kv=8192 decode iterations.
-Times below are per-step means from `reports/alignment_iteration_report.json`;
-relative error is `(simulated - measured) / measured`.
+The source fix is post-B9. Numeric post-fix alignment is still waiting for a
+GPU fill: the branch database has no 112-expert MXFP4 rows, and each rank-1
+timing-predict preset reports 68 missing MXFP4 specs. No synthetic timings
+were inserted.
 
-| operation | measured (us) | simulated (us) | relative error |
-| --- | ---: | ---: | ---: |
-| `attention.qkvbfg_a_proj` | 21.77 | 64.79 | +197.72% |
-| `moe.mxfp4_fused_moe` | 384.40 | 342.90 | -10.79% |
-| `attention.kda_recurrent_decode` | 25.50 | 30.11 | +18.08% |
-| `moe.shared_gate_up_activation` | 5.18 | 1.92 | -62.69% |
-| `moe.merged_front` | 47.69 | 45.76 | -4.04% |
-| `attention.o_proj` | 6.95 | 5.60 | -19.41% |
-| `attention.kda_conv_decode` | 5.48 | 6.57 | +20.08% |
-| `moe.add3` | 3.42 | 2.36 | -29.40% |
-| `moe.routed_norm` | 2.18 | 2.59 | +19.46% |
-| `attention.kda_gated_norm` | 3.02 | 2.74 | -9.01% |
-| `moe.shared_down` | 18.91 | 18.83 | -0.43% |
-| `moe.latent_up` | 11.54 | 11.68 | +1.27% |
+The supplied post-B8 graph-step results remain the high-level reference:
 
-The measured critical path is 553.08 us/step versus 542.42 us/step simulated.
-The duration-weighted signed and absolute errors are -1.9266% and 1.9266%
-(11.0616 ms measured versus 10.8485 ms simulated across 20 steps). The
-recommended duty-cycle multiplier is 1.00723. Unmapped measured time averages
-17.04 us/step, ranging from 16.38 to 18.11 us: the two TMA launches account
-for about 9.04 us, and fill/add/direct-copy graph glue accounts for the rest.
-The separate torch graph probe reports 623.2 us and 676.8 us of total kernel
-residency; those are not substituted for the NSYS critical-path measurements.
+| layer | point | measured (us) | simulated (us) | error |
+| --- | --- | ---: | ---: | ---: |
+| KDA | B=1 / 32 / 128, L=8k | 179.6 / 310.7 / 556.5 | 141 / 277 / 495 | -21% / -11% / -11% |
+| MLA | 128x8k / 1x1M / 16x64k | 680.4 / 345.5 / 357.9 | 569 / 274 / 317 | -16% / -21% / -11% |
 
-The first three cost-model follow-ups, ordered by aggregate absolute error, are:
+## 1. MXFP4 Root Cause
 
-1. `qkvbfg_a_proj`: the old simulator modeled one serial 7168-to-7692 GEMM,
-   while SGLang launches a wide QKVG projection with shape
-   `m=128,n=6144,k=7168` (`4 * 12 * 128`) plus an alternate-stream GEMV with
-   padded shape `m=128,n=144,k=7168` (`128 + 12`, rounded to 8). The worklet
-   now models those as separate leaves in a `CostNode::Max`; the production
-   table shows about 21.6 us for the wide kernel and about 21.3 us for the
-   side leaf (16.5 us GEMV plus 4.9 us split-K reduction). The branch profile
-   database has neither new shape family, so the corrected timing-predict
-   cannot run to completion on CPU. It reports 68 missing `m` rows for each
-   leaf (136 rows total); no synthetic CPU values were inserted.
-2. `mxfp4_fused_moe`: the measured `t128x16x256` MXFP4/BF16 expert pair plus
-   routing/finalize totals about 384 us, 10.8% above the `sglang_trtllm_mxfp4`
-   row. The runner times one `trtllm_fp4_block_scale_moe` call with
-   `do_finalize=True`, so routing and finalize are already included in the
-   registered row. No measured expert histogram is present in this alignment
-   payload; the simulator's uniform PPM is therefore still an explicit
-   assumption rather than a hidden omission.
-3. `kda_recurrent_decode`: the BF16-state measured
-   `fused_sigmoid_gating_delta_rule_update_kernel` is 18.1% faster than the
-   `sglang_triton` recurrent row. The lookup was checked against the probe's
-   exact B=128, 12-head, head-dim-128, BF16-state shape and the runner passes
-   the production-style `a`, `b`, and `cache_indices` layout. Likewise,
-   `kda_conv_decode` uses the exact 4608-channel, kernel-4, BF16-state row.
-   These residual errors are therefore kernel-model/cache fidelity gaps, not
-   shape mismatches.
+The driver captures use `--experts 112 --ep 8`. The generated `run.json`
+files for both KDA and MLA therefore contain `num_experts=112`,
+`num_experts_per_token=16`, and two shared experts. The `ep` value is metadata
+in this single-layer driver; the FlashInfer call receives a 112-wide routing
+logit tensor and 112 local experts.
 
-## KDA Post-Fix Status
+Before B9, the runner and simulator used the production global width even for
+the rank-1 probe:
 
-The corrected tree was compiled and inspected, but a complete post-fix KDA
-alignment is not claimable on this CPU-only checkout because the branch profile
-database lacks the 136 production rows needed by the new leaves. The current
-comparison is consequently:
+| input | old runner / rank-1 simulator | driver layer call |
+| --- | --- | --- |
+| `num_experts` | 896 | 112 |
+| `num_local_experts` | 112 | 112 |
+| `per_expert_batches` | 896 entries; the first local shard has 258 rows at B=128 | 112 entries; all 2,048 top-16 assignments are local |
+| `top_k`, routing, activation | 16, DeepSeek-V3 sigmoid, SiTU | same |
+| finalize and PDL | `do_finalize=True`, `enable_pdl=True` | same for this B=128 call |
+| token tuning | `next_power_of_two(B)` | same production setting |
 
-| leaf | measured production evidence (us) | old simulated (us) | post-fix status |
-| --- | ---: | ---: | --- |
-| `attention.qkvbfg_a_proj` (wide QKVG) | 21.77 | 64.79 | blocked on `m=128,n=6144,k=7168` and the remaining `m` sweep |
-| `attention.qkvbfg_a_proj_bfa` (side GEMV + split-K) | about 21.3 | folded into 64.79 | blocked on `m=128,n=144,k=7168` and the remaining `m` sweep |
-| `moe.mxfp4_fused_moe` | 384.40 | 342.90 | -10.79%; one-call runner confirmed, uniform PPM retained |
-| `attention.kda_recurrent_decode` | 25.50 | 30.11 | +18.08%; exact probe row confirmed |
-| `attention.kda_conv_decode` | 5.48 | 6.57 | +20.08%; exact probe row confirmed |
+The old 896 row in the branch database is 342.8956 us at B=128. It prices a
+local shard containing 258 routed rows, while the rank-1 layer call routes
+2,048 rows through its 112 experts. This is the root cause of the missing
+dimension; it is not a missing finalize kernel. B9 makes the Python runner
+accept exactly the two valid widths, checks the batch-count vector against the
+selected width, and makes the K3 worklet pass the rank-1 width to
+`Mxfp4FusedMoeKernelConfig`. The production EP8 test asserts that its width
+remains 896. The timing kernel implementation itself already uses
+`config.num_experts` in its payload, so it needed no separate code change.
 
-After the missing rows are measured, rerun `kda_timing_predict.yaml` before
-applying the new label manifest. The old manifest still contains the former
-7168-to-7692 request because the failed preflight deliberately did not replace
-it.
+The KDA/MLA spread is a second, distinct fact. The same six measured kernel
+rows are assigned to each fused-MoE operation, but their dynamic routed BMM
+work differs:
 
-## MLA Result
+| measured kernel mean over 20 iterations | KDA (us) | MLA (us) |
+| --- | ---: | ---: |
+| MXFP4 gate/up BMM | 245.26 | 268.92 |
+| BF16 down BMM | 119.36 | 132.06 |
+| router + quantize + routing + finalize | 19.78 | 20.26 |
+| operation total | 384.40 | 421.24 |
 
-The completed MLA pass covered the same 20 B=128, kv=8192 decode iterations.
-The original serial tree measured 677.48 us/step versus 584.64 us simulated,
-for a duration-weighted signed/absolute error of -13.7038% / 13.7038%.
-Mapped measured coverage was 98.02%, with 13.93 us/step of unmapped TMA and
-graph glue. The cache-append runner was also corrected to allocate the
-page-planar FP8 backing store as `torch.uint8`, matching the production
-UnifiedKVPool byte storage; its existing database row still needs a GPU
-refresh.
+The BMM pair accounts for 36.36 us of the 36.84 us operation difference.
+The captures show identical kernel shapes and call flags, so PDL and
+finalize selection are not the explanation. The layer's seeded random state
+produces different per-expert occupancy, which changes the dynamic grouped
+BMM work. The alignment payload does not contain that realized 112-entry
+histogram, so it cannot identify the individual expert bins responsible. The
+simulator continues to use its explicit uniform PPM assumption; the cache key
+already has `per_expert_batches` if a future capture supplies layer-specific
+histograms. B9 fixes the proven 896-versus-112 mismatch without inventing a
+KDA/MLA-specific constant or a new semantic kernel kind.
 
-The structural rerun with the two available `CostNode::Max` fan-outs produced
-568.74 us/step simulated versus the same 677.48 us measured, or -16.0507%
-duration-weighted error. Because `Max` is currently also the analyzer's
-critical-path attribution operator, non-critical leaves report zero simulated
-time even though their bytes and work are included in the tree:
+The cached, pre-fill operation numbers are therefore retained only as a
+baseline:
 
-| operation | measured (us) | structural simulated (us) | relative error |
-| --- | ---: | ---: | ---: |
-| `moe.mxfp4_fused_moe` | 421.24 | 342.90 | -18.60% |
-| `moe.merged_front` | 39.61 | 45.76 | +15.56% |
-| `attention.fused_qkv_a_proj` | 8.21 | 11.55 | +56.56% |
-| `attention.mla_cache_append` | 15.56 | 0.00 | hidden by Max attribution |
-| `attention.output_gate` | 9.81 | 0.00 | hidden by Max attribution |
-| `attention.mla_decode_attention` | 107.32 | 104.47 | -2.66% |
-| `moe.shared_gate_up_activation` | 4.96 | 1.92 | -60.84% |
-| `attention.o_proj` | 6.53 | 5.60 | -14.23% |
-| `moe.latent_up` | 11.40 | 11.68 | +2.51% |
-| `moe.shared_down` | 18.79 | 18.83 | +0.19% |
+| operation | measured (us) | old cached simulation (us) | old error | B9 status |
+| --- | ---: | ---: | ---: | --- |
+| KDA `mxfp4_fused_moe` | 384.40 | 342.90 | -10.79% | corrected 112-wide specs pending GPU fill |
+| MLA `mxfp4_fused_moe` | 421.24 | 342.90 | -18.60% | corrected 112-wide specs pending GPU fill |
 
-This structural rerun is not an acceptance result: the cache row is stale and
-the current analyzer cannot attribute same-device overlap to both branches.
-The two largest actionable gaps remain the MXFP4 row (-18.60%) and the cache
-append row (15.56 us measured but hidden by the fallback). A GPU refresh plus a
-first-class overlap attribution node is required before the MLA <=10% target
-can be evaluated fairly.
+## 2. Unmapped Attention-Residual Work
 
-## Operator Profile Commands
+Each graph has two `sglang::attn_res_fused_tma_kernel` launches with
+`attn_res_block_size=12`. Their mean combined cost is 9.04 us for KDA and
+8.86 us for MLA. The total unmapped measured work is 17.04 us/step for KDA
+and 13.93 us/step for MLA, leaving approximately 8.00 and 5.07 us of
+fill/add/direct-copy CUDA-graph glue respectively.
 
-Run the following on the profiling GPU with the branch database. The two KDA
-commands below are the probe-critical `m=128` rows; the timing-predict output
-lists the other `m` values that must be repeated for a complete sweep. The MLA
-command refreshes the corrected page-planar byte-storage runner.
+This remains an explicit measurement floor in the alignment note. It is not
+folded into an existing GEMM or generic `elementwise` leaf: the TMA kernel is
+a distinct SGLang backend operation and no measured profile row exists for
+that backend. Adding an unmeasured elementwise row would make the number look
+mapped without improving fidelity. A future dedicated TMA kind can replace
+the floor after a GPU measurement.
+
+## 3. Small-M Launch Floor
+
+The KDA B=1 graph is 179.6 us measured versus 141 us simulated, a 38.6 us
+gap. The graph has 26 launches in the KDA sequence and 29 in the corresponding
+MLA-sized sequence. Several graph-replay launches have a practical 2-3 us
+minimum, while the isolated timing rows used by timing-predict can return a
+smaller `m=1` cost. This is a launch/replay floor, not evidence that the
+large-B MXFP4 row should be multiplied by a fixed layer constant.
+
+No blanket small-M floor is added in B9: the captures do not provide a clean
+per-kind decomposition of the replay overhead, and adding it to every leaf
+would double-count the unmapped graph glue. The next GPU pass should measure
+the B=1 sequence with the same graph and record whether the excess is
+concentrated in the existing small-M rows or in a separate floor.
+Other worker paths expose `gpu_time_multiplier` for whole-step inter-kernel
+overhead, and the analyzer derives that multiplier from GPU-cycle evidence.
+That correction is intentionally global; applying it only to B=1 would
+overfit the graph and applying it to the MXFP4 leaf would distort B=128.
+
+## CPU Alignment Rerun
+
+The CPU `alignment analyze` pass was rerun successfully for both YAMLs:
 
 ```bash
-export VIBESIM_PROFILE_DB=/raid/yilegu/roofline_guided_agent/VibeSimWorkspace/scripts-local/vibesim-analysis-container/kimi_single_layer/k3_branch_profile.db
-
-uv run --no-sync python -m launcher kernel-profile run single_gemm \
-  --backend sglang_bf16_auto \
-  --gpu-name "NVIDIA B200" \
-  --db /raid/yilegu/roofline_guided_agent/VibeSimWorkspace/scripts-local/vibesim-analysis-container/kimi_single_layer/k3_branch_profile.db \
-  --spec '{"m":128,"n":6144,"k":7168,"dtype":"bf16"}' \
-  --json --output-dir /raid/yilegu/roofline_guided_agent/VibeSimWorkspace/scripts-local/vibesim-analysis-container/kimi_single_layer/profiles/refresh_k3_kda_qkvg_m128_n6144
-
-uv run --no-sync python -m launcher kernel-profile run single_gemm \
-  --backend sglang_bf16_auto \
-  --gpu-name "NVIDIA B200" \
-  --db /raid/yilegu/roofline_guided_agent/VibeSimWorkspace/scripts-local/vibesim-analysis-container/kimi_single_layer/k3_branch_profile.db \
-  --spec '{"m":128,"n":144,"k":7168,"dtype":"bf16"}' \
-  --json --output-dir /raid/yilegu/roofline_guided_agent/VibeSimWorkspace/scripts-local/vibesim-analysis-container/kimi_single_layer/profiles/refresh_k3_kda_bfa_m128_n144
-
-uv run --no-sync python -m launcher kernel-profile run mla_cache_append \
-  --backend sglang_cuda \
-  --gpu-name "NVIDIA B200" \
-  --db /raid/yilegu/roofline_guided_agent/VibeSimWorkspace/scripts-local/vibesim-analysis-container/kimi_single_layer/k3_branch_profile.db \
-  --spec '{"num_tokens":128,"kv_lora_rank":512,"rope_dim":64,"block_size":64,"input_dtype":"bf16","kv_dtype":"fp8_e4m3","cache_format":"page_planar_fp8"}' \
-  --json --output-dir /raid/yilegu/roofline_guided_agent/VibeSimWorkspace/scripts-local/vibesim-analysis-container/kimi_single_layer/profiles/refresh_k3_mla_cache_b128
+PATH="/home/yilegu/.cargo/bin:$PATH" uv run --no-sync python -m launcher alignment analyze \
+  presets/alignment/kimi_k3_single_layer/kda_analyze.yaml --build-type release
+PATH="/home/yilegu/.cargo/bin:$PATH" uv run --no-sync python -m launcher alignment analyze \
+  presets/alignment/kimi_k3_single_layer/mla_analyze.yaml --build-type release
 ```
+
+Those reports intentionally consume the cached timing-predict artifacts, so
+their numbers are a pre-fill baseline rather than a B9 acceptance result:
+
+| capture | measured critical path (us/step) | cached simulated (us/step) | error |
+| --- | ---: | ---: | ---: |
+| KDA B=128, kv=8192 | 553.08 | 542.42 | -1.93% |
+| MLA B=128, kv=8192 | 677.48 | 568.74 | -16.05% |
+
+The old cached manifests also predate the corrected MXFP4 width (and retain
+the already-known stale timing artifacts), so these values must not be read as
+post-B9 predictions. Re-run timing-predict after the operator fills the 112
+expert rows, then run the two analyze commands above again.
+
+## `CostNode::Max` and the Optimality Ladder
+
+`CostNode::Max` does not hide `mla_cache_append` or `output_gate` from the
+optimality ladder. The analyzer's `trace::manifest::fold_mean` visits every
+child of `Max` and assigns each a mean-fold weight; `optimality/prepare.rs`
+uses that fold. Their bytes and workload therefore remain visible to
+optimality.
+
+`Max` does hide non-winning child time from the critical-path view used by the
+alignment operation table. `node_time` selects the maximum child, and the
+alignment breakdown reports the non-critical `mla_cache_append` and
+`output_gate` simulated critical time as zero even though their folded leaf
+work remains present. This is a limitation of using `Max` as the worklet's
+same-device stream-overlap fallback, not an optimality-ladder omission.
+
+The smallest change is analyzer-side presentation: publish both
+`simulated_critical_path_ms` and `simulated_leaf_workload_ms` for each
+operation, and let the ladder/UI use the latter when showing non-critical
+work. That preserves current analyzer semantics and needs no new kernel row.
+If exact stream attribution is later required, add a distinct `Overlap` tree
+node with Max wall time and full child workload, then use it in the worklet
+instead of overloading `CostNode::Max`.
+
+## GPU Fill Command
+
+Run this exact command on GPU 3. The wrapper fills the branch database; it is
+the only required B9 measurement step. This checkout did not run it.
+
+```bash
+K3_GPU_INDEX=3 \
+VIBESIM_PROFILE_DB=/raid/yilegu/roofline_guided_agent/VibeSimWorkspace/scripts-local/vibesim-analysis-container/kimi_single_layer/k3_branch_profile.db \
+/raid/yilegu/roofline_guided_agent/VibeSimWorkspace/scripts-local/vibesim-analysis-container/run_k3_jit_fill.sh \
+  presets/predict_kimi_k3_b200_rank1_layer_kda.json \
+  presets/predict_kimi_k3_b200_rank1_layer_mla.json
+```
+
+After the fill, rerun the two CPU `alignment analyze` commands above and
+replace the cached-baseline tables with the new 112-wide timing-predict
+results. If the filled row still leaves a stable KDA/MLA difference, capture
+the realized per-expert batches and promote that histogram to an explicit
+input rather than adding a layer-name branch.

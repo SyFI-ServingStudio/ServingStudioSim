@@ -17,8 +17,9 @@ _ROUTING_METHOD = "deepseek_v3_sigmoid"
 _ACTIVATION = "situ"
 _HIDDEN_SIZE = 3584
 _INTERMEDIATE_SIZE = 3072
-_NUM_EXPERTS = 896
+_GLOBAL_NUM_EXPERTS = 896
 _NUM_LOCAL_EXPERTS = 112
+_SUPPORTED_NUM_EXPERTS = frozenset({_NUM_LOCAL_EXPERTS, _GLOBAL_NUM_EXPERTS})
 _TOP_K = 16
 _EPILOGUE_TILE_M = 128
 
@@ -48,7 +49,6 @@ def _validate_args(**kwargs: Any) -> dict[str, Any]:
     expected = {
         "hidden_size": _HIDDEN_SIZE,
         "intermediate_size": _INTERMEDIATE_SIZE,
-        "num_experts": _NUM_EXPERTS,
         "num_local_experts": _NUM_LOCAL_EXPERTS,
         "top_k": _TOP_K,
         "group_size": _GROUP_SIZE,
@@ -58,6 +58,12 @@ def _validate_args(**kwargs: Any) -> dict[str, Any]:
     for name, value in expected.items():
         if args[name] != value:
             raise ValueError(f"K3 MXFP4 requires {name}={value}, got {args[name]}")
+    if args["num_experts"] not in _SUPPORTED_NUM_EXPERTS:
+        supported = ", ".join(str(value) for value in sorted(_SUPPORTED_NUM_EXPERTS))
+        raise ValueError(
+            f"K3 MXFP4 requires num_experts in {{{supported}}}, "
+            f"got {args['num_experts']}"
+        )
     if args["weight_format"] != _WEIGHT_FORMAT:
         raise ValueError(f"unsupported MXFP4 weight format: {args['weight_format']}")
     if args["routing_method"] != _ROUTING_METHOD or args["activation"] != _ACTIVATION:
@@ -66,8 +72,11 @@ def _validate_args(**kwargs: Any) -> dict[str, Any]:
         raise ValueError("K3 MXFP4 requires routed_scaling_factor=1.0")
     if args["gemm1_alpha"] != 4.0 or args["gemm1_clamp_limit"] != 25.0:
         raise ValueError("K3 MXFP4 requires gemm1_alpha=4.0 and gemm1_clamp_limit=25.0")
-    if len(args["per_expert_batches"]) != _NUM_EXPERTS:
-        raise ValueError("per_expert_batches must contain 896 global expert counts")
+    if len(args["per_expert_batches"]) != args["num_experts"]:
+        raise ValueError(
+            "per_expert_batches must contain one count per routed expert "
+            f"({args['num_experts']})"
+        )
     exact_topk_ids(
         num_tokens=args["num_tokens"],
         top_k=args["top_k"],

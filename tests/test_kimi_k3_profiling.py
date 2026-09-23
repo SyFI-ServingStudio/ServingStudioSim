@@ -133,6 +133,33 @@ def test_k3_specs_coerce_representative_json_shapes():
     assert moe.per_expert_batches[:16] == (16,) * 16
 
 
+@pytest.mark.parametrize("num_experts", [112, 896])
+def test_mxfp4_runner_accepts_rank_local_and_global_routing_widths(num_experts):
+    from profiling.runners.moe.mxfp4_fused_moe import _validate_args
+
+    counts = [16] * 16 + [0] * (num_experts - 16)
+    args = _validate_args(
+        num_tokens=16,
+        hidden_size=3584,
+        intermediate_size=3072,
+        num_experts=num_experts,
+        num_local_experts=112,
+        top_k=16,
+        input_dtype="bf16",
+        weight_format="mxfp4_e2m1_ue8m0",
+        group_size=32,
+        routing_method="deepseek_v3_sigmoid",
+        activation="situ",
+        n_group=1,
+        topk_group=1,
+        routed_scaling_factor=1.0,
+        gemm1_alpha=4.0,
+        gemm1_clamp_limit=25.0,
+        per_expert_batches=counts,
+    )
+    assert len(args["per_expert_batches"]) == num_experts
+
+
 def test_kda_reference_is_cpu_testable_and_updates_state():
     from profiling.runners.attention.kda_recurrent_decode import (
         kda_recurrent_decode_reference,
