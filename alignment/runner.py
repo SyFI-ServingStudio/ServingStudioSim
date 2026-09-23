@@ -286,10 +286,14 @@ _PROFILE_KIND_SERVER_ARGS = {"token_corpus": (("--enable-return-routed-experts",
 # a sampled fold has to be scored against. Both routing passes ask for it, so
 # one capture yields the corpus, the referee, and the marginal. It is vLLM's
 # only expert-load source and it requires expert parallelism, so it is asked
-# for only when the deployment already has it.
+# for only when the deployment already has it. `rearrange: false` keeps it a
+# recorder: a rearranging EPLB allocates a layer of expert weights per model as
+# a transfer buffer and rehearses a transfer in `profile_run`, which on GLM-5.2
+# MTP-5 TP4 cost ~16 GiB per GPU and left the timed passes' memory budget no KV
+# cache at all. It would also move experts mid-capture.
 _EXPERT_LOAD_SERVER_ARGS = (
     ("--enable-eplb", None),
-    ("--eplb-config", '{"log_balancedness": true}'),
+    ("--eplb-config", '{"log_balancedness": true, "rearrange": false}'),
 )
 
 

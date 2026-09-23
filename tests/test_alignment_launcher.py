@@ -1520,7 +1520,7 @@ def test_an_authored_eplb_config_keeps_its_settings_and_gains_the_log(tmp_path, 
 
     [config] = [arg for arg in argv if arg.startswith("--eplb-config")]
     merged = json.loads(config.split("=", 1)[1])
-    assert merged == {"window_size": 1000, "log_balancedness": True}
+    assert merged == {"window_size": 1000, "log_balancedness": True, "rearrange": False}
 
 
 def test_a_routing_pass_asks_for_the_expert_load_stream_only_where_it_exists(tmp_path):
@@ -1536,7 +1536,10 @@ def test_a_routing_pass_asks_for_the_expert_load_stream_only_where_it_exists(tmp
             expert_count_reduction_group_size=4,
         ),
     )
-    assert argv[argv.index("--eplb-config") + 1] == '{"log_balancedness": true}'
+    assert json.loads(argv[argv.index("--eplb-config") + 1]) == {
+        "log_balancedness": True,
+        "rearrange": False,
+    }
     assert "--enable-return-routed-experts" in argv
 
     bare: list[str] = []
@@ -2194,6 +2197,23 @@ def test_a_corpus_pass_refuses_a_protocol_that_returns_no_routes(tmp_path):
     paths["profile"].write_text(yaml.safe_dump(raw))
 
     with pytest.raises(ValueError, match="'vllm_tokens' does not"):
+        load_profile_config(paths["profile"])
+
+
+def test_a_corpus_pass_refuses_the_v2_model_runner(tmp_path):
+    """The server refuses route capture under V2 only after the job is scheduled."""
+    paths = _phase_configs(tmp_path)
+    raw = yaml.safe_load(paths["profile"].read_text())
+    raw["profile_kind"] = "token_corpus"
+    raw["python_runtime"] = {
+        "packages": [
+            {"name": "nvtx", "version": "0.2.16", "index_url": "https://pypi.org/simple"}
+        ],
+        "environment": {"VLLM_USE_V2_MODEL_RUNNER": "1"},
+    }
+    paths["profile"].write_text(yaml.safe_dump(raw))
+
+    with pytest.raises(ValueError, match="V1 model runner"):
         load_profile_config(paths["profile"])
 
 
