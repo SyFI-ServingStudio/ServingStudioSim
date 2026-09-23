@@ -4,6 +4,7 @@
   "arch_types": [
     "kimi_k3_sglang"
   ],
+  "kda_state_dtype": "fp32",
   "locations": [
     {"location": "unified.embedding", "semantics": ["embedding"]},
     {"location": "unified.dense.attention.input_layernorm", "semantics": ["dense.input_layernorm"]},

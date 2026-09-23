@@ -9,6 +9,7 @@
 //! interleave attn-of-layer-N with ffn-of-layer-(N-1).
 
 use crate::timing::{CostManifest, CostManifestDoc, LeafMetrics, SlotInput};
+use serde_json::Value;
 
 /// One attention/FFN group view for an iter-wise batch. Local/unified and PD
 /// prefill/decode workers usually pass one group; HP/DP-attn variants may pass
@@ -84,6 +85,13 @@ pub struct UnifiedArchInput {
 /// iteration (embedding → layers → lm_head). `&UnifiedArchInput` is concrete on
 /// the signature (no `dyn`); L5 binds via `<M: IterwiseUnifiedModel>` generic.
 pub trait IterwiseUnifiedModel: Send + Sync + 'static {
+    /// Optional independent model.work scope emitted beside a timing-predict
+    /// manifest.  Most architectures use the complete model config; an arch
+    /// with rank-local or truncated layers can publish its exact semantic view.
+    fn model_work_scope(&self) -> Option<Value> {
+        None
+    }
+
     /// Per-iter cost of the whole iteration (embedding → layers → lm_head) via the
     /// compiled CostTree path: stream each leaf's [`LeafMetrics`] into `slots`
     /// (the caller's reused buffer — cleared + refilled to the manifest length),

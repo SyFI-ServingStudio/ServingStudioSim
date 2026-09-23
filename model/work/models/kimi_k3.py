@@ -7,6 +7,8 @@ text-serving workloads accepted by ``model.work``.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from ..attention.attn_residual import KimiAttentionResidual
 from ..attention.linear import KimiDeltaAttention
 from ..attention.mla import MLA
@@ -14,6 +16,112 @@ from ..core import LayerStack, Model, NormWeightGroup, dtype_bytes
 from ..ffn.dense import DenseSwiGLU
 from ..ffn.moe import MoE
 from ..quantization import parse_quantization_config
+
+
+@dataclass(frozen=True)
+class KimiK3WorkScope:
+    """The rank/stage shape emitted by the Kimi-K3 simulator arch.
+
+    The simulator's manifest is a physical rank-local view, while the model
+    config describes the complete checkpoint.  Keeping this bridge explicit
+    prevents the accountant from silently labeling the 93-layer, 96-head,
+    896-expert model for a one-layer or one-rank prediction.
+    """
+
+    dense_layers: int
+    kda_layers: int
+    mla_layers: int
+    heads_per_rank: int
+    local_experts: int
+    kda_state_dtype: str | None = None
+    include_model_io: bool = True
+    work_scale: float = 1.0
+    global_heads: int = 96
+    global_experts: int = 896
+    pp_size: int = 1
+    pp_stage_layer_counts: tuple[tuple[int, int, int], ...] = ()
+
+    @classmethod
+    def from_dict(cls, raw: dict) -> "KimiK3WorkScope":
+        if raw.get("schema_version") != 1:
+            raise ValueError("unsupported Kimi-K3 model.work scope schema")
+        counts = raw.get("layer_counts")
+        if not isinstance(counts, dict):
+            raise ValueError("Kimi-K3 model.work scope requires layer_counts")
+
+        def positive_int(name: str, value: object) -> int:
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"Kimi-K3 scope {name} must be a non-negative integer")
+            return value
+
+        dense_layers = positive_int("dense", counts.get("dense", 0))
+        kda_layers = positive_int("kda", counts.get("kda", 0))
+        mla_layers = positive_int("mla", counts.get("mla", 0))
+        heads = positive_int("heads_per_rank", raw.get("heads_per_rank"))
+        local_experts = positive_int("local_experts", raw.get("local_experts"))
+        global_heads = positive_int("global_heads", raw.get("global_heads", 96))
+        global_experts = positive_int("global_experts", raw.get("global_experts", 896))
+        pp_size = positive_int("pp_size", raw.get("pp_size", 1))
+        if pp_size == 0:
+            raise ValueError("Kimi-K3 scope pp_size must be positive")
+        if not heads or not local_experts:
+            raise ValueError("Kimi-K3 scope rank-local heads and experts must be positive")
+        if global_heads != 96 or global_experts != 896:
+            raise ValueError("Kimi-K3 scope global geometry does not match the checkpoint")
+        if global_heads % heads or global_experts % local_experts:
+            raise ValueError("Kimi-K3 scope rank-local geometry must divide global geometry")
+        state_dtype = raw.get("kda_state_dtype")
+        if state_dtype is not None and state_dtype not in {"bf16", "fp32"}:
+            raise ValueError("Kimi-K3 scope kda_state_dtype must be bf16 or fp32")
+        work_scale = raw.get("work_scale", 1.0)
+        if isinstance(work_scale, bool) or not isinstance(work_scale, (int, float)):
+            raise ValueError("Kimi-K3 scope work_scale must be positive")
+        work_scale = float(work_scale)
+        if work_scale <= 0.0:
+            raise ValueError("Kimi-K3 scope work_scale must be positive")
+        include_model_io = raw.get("include_model_io", True)
+        if not isinstance(include_model_io, bool):
+            raise ValueError("Kimi-K3 scope include_model_io must be boolean")
+        raw_stage_counts = raw.get("pp_stage_layer_counts")
+        stage_counts: tuple[tuple[int, int, int], ...] = ()
+        if raw_stage_counts is not None:
+            if not isinstance(raw_stage_counts, list) or len(raw_stage_counts) != pp_size:
+                raise ValueError("Kimi-K3 scope pp_stage_layer_counts must match pp_size")
+            parsed_stages = []
+            for index, stage in enumerate(raw_stage_counts):
+                if not isinstance(stage, dict):
+                    raise ValueError(f"Kimi-K3 scope PP stage {index} must be an object")
+                parsed_stages.append(
+                    (
+                        positive_int("stage dense", stage.get("dense", 0)),
+                        positive_int("stage kda", stage.get("kda", 0)),
+                        positive_int("stage mla", stage.get("mla", 0)),
+                    )
+                )
+            stage_counts = tuple(parsed_stages)
+            stage_totals = tuple(
+                sum(stage[index] for stage in stage_counts) for index in range(3)
+            )
+            if stage_totals != (
+                dense_layers,
+                kda_layers,
+                mla_layers,
+            ):
+                raise ValueError("Kimi-K3 PP stage layer counts do not sum to layer_counts")
+        return cls(
+            dense_layers=dense_layers,
+            kda_layers=kda_layers,
+            mla_layers=mla_layers,
+            heads_per_rank=heads,
+            local_experts=local_experts,
+            kda_state_dtype=state_dtype,
+            include_model_io=include_model_io,
+            work_scale=work_scale,
+            global_heads=global_heads,
+            global_experts=global_experts,
+            pp_size=pp_size,
+            pp_stage_layer_counts=stage_counts,
+        )
 
 
 def _text_config(raw_config: dict) -> dict:
@@ -54,14 +162,19 @@ def _layer_norms(tag: str, hidden: int, count: int) -> list[NormWeightGroup]:
     ]
 
 
-def build(raw_config: dict) -> Model:
+def build(raw_config: dict, scope: dict | None = None) -> Model:
     text = _text_config(raw_config)
     kda_layers, full_layers = _validate_schedule(text)
+    work_scope = KimiK3WorkScope.from_dict(scope) if scope is not None else None
 
     hidden = text["hidden_size"]
     master_dtype = text.get("dtype") or text.get("torch_dtype", "bfloat16")
     weight_bytes = dtype_bytes(master_dtype)
-    state_bytes = dtype_bytes(text.get("mamba_ssm_dtype", "float32"))
+    state_bytes = dtype_bytes(
+        work_scope.kda_state_dtype
+        if work_scope is not None and work_scope.kda_state_dtype is not None
+        else text.get("mamba_ssm_dtype", "float32")
+    )
     conv_state_bytes = dtype_bytes(text.get("mamba_conv_dtype", "bfloat16"))
     kv_cache_bytes = dtype_bytes(text.get("kv_cache_dtype", "bfloat16"))
 
@@ -90,10 +203,18 @@ def build(raw_config: dict) -> Model:
             include_output=include_output,
         )
 
+    heads = work_scope.heads_per_rank if work_scope is not None else linear_config["num_heads"]
+    moe_local_experts = work_scope.local_experts if work_scope is not None else None
+    moe_routing_scale = (
+        (moe_local_experts / text["num_experts"])
+        if moe_local_experts is not None
+        else 1.0
+    )
+
     def make_kda(attn_residual: KimiAttentionResidual | None) -> KimiDeltaAttention:
         return KimiDeltaAttention(
             hidden=hidden,
-            num_heads=linear_config["num_heads"],
+            num_heads=heads,
             head_dim=linear_config["head_dim"],
             conv_kernel=linear_config["short_conv_kernel_size"],
             state_dtype_bytes=state_bytes,
@@ -108,7 +229,7 @@ def build(raw_config: dict) -> Model:
     kda_moe = make_kda(kda_moe_residual)
     mla = MLA(
         hidden=hidden,
-        num_heads=text["num_attention_heads"],
+        num_heads=heads,
         q_lora_rank=text["q_lora_rank"],
         kv_lora_rank=text["kv_lora_rank"],
         qk_nope_head_dim=text["qk_nope_head_dim"],
@@ -131,36 +252,55 @@ def build(raw_config: dict) -> Model:
         routed_norm_elements=(
             text["routed_expert_hidden_size"] if text.get("latent_moe_use_norm", False) else 0
         ),
+        local_experts=moe_local_experts,
+        routing_scale=moe_routing_scale,
     )
 
-    kda_moe_count = len(kda_moe_indices)
+    dense_count = work_scope.dense_layers if work_scope is not None else 1
+    kda_moe_count = work_scope.kda_layers if work_scope is not None else len(kda_moe_indices)
+    mla_count = work_scope.mla_layers if work_scope is not None else len(full_indices)
     # Layer 1 is the only dense KDA layer; the remaining KDA layers are MoE.
-    if 1 not in kda_layers or kda_moe_count != 68:
+    if work_scope is None and (1 not in kda_layers or kda_moe_count != 68):
         raise ValueError("Kimi-K3 expects layer 1 to be the dense KDA layer")
 
-    layers = [
-        LayerStack(
-            attn=dense_kda,
-            ffn=dense,
-            count=1,
-            tag="dense",
-            extra_matmuls=(
-                dense_kda_residual.output_matmul_groups() if dense_kda_residual is not None else []
-            ),
-        ),
-        LayerStack(attn=kda_moe, ffn=moe, count=kda_moe_count, tag="kda"),
-        LayerStack(attn=mla, ffn=moe, count=len(full_indices), tag="mla"),
-    ]
+    layers = []
+    if dense_count:
+        layers.append(
+            LayerStack(
+                attn=dense_kda,
+                ffn=dense,
+                count=dense_count,
+                tag="dense",
+                extra_matmuls=(
+                    dense_kda_residual.output_matmul_groups()
+                    if dense_kda_residual is not None
+                    else []
+                ),
+            )
+        )
+    if kda_moe_count:
+        layers.append(LayerStack(attn=kda_moe, ffn=moe, count=kda_moe_count, tag="kda"))
+    if mla_count:
+        layers.append(LayerStack(attn=mla, ffn=moe, count=mla_count, tag="mla"))
 
-    norm_weights = [
-        *_layer_norms("dense", hidden, 1),
-        *_layer_norms("kda", hidden, kda_moe_count),
-        *_layer_norms("mla", hidden, len(full_layers)),
-        NormWeightGroup("mla.q_a_layernorm", text["q_lora_rank"], len(full_layers)),
-        NormWeightGroup("mla.kv_a_layernorm", text["kv_lora_rank"], len(full_layers)),
-        NormWeightGroup("final_norm", hidden, 1),
-    ]
-    if dense_kda_residual is not None:
+    norm_weights = []
+    if dense_count:
+        norm_weights.extend(_layer_norms("dense", hidden, dense_count))
+    if kda_moe_count:
+        norm_weights.extend(_layer_norms("kda", hidden, kda_moe_count))
+    if mla_count:
+        norm_weights.extend(_layer_norms("mla", hidden, mla_count))
+        norm_weights.extend(
+            [
+                NormWeightGroup("mla.q_a_layernorm", text["q_lora_rank"], mla_count),
+                NormWeightGroup("mla.kv_a_layernorm", text["kv_lora_rank"], mla_count),
+            ]
+        )
+    if work_scope is None or work_scope.include_model_io:
+        norm_weights.append(NormWeightGroup("final_norm", hidden, 1))
+    if dense_kda_residual is not None and dense_count and (
+        work_scope is None or work_scope.include_model_io
+    ):
         norm_weights.extend(dense_kda_residual.output_learned_weight_groups())
 
     return Model(
@@ -175,4 +315,6 @@ def build(raw_config: dict) -> Model:
         norm_weights=norm_weights,
         master_dtype=master_dtype,
         quant=parse_quantization_config(text),
+        include_model_io=work_scope is None or work_scope.include_model_io,
+        work_scale=work_scope.work_scale if work_scope is not None else 1.0,
     )

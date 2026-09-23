@@ -68,7 +68,7 @@ from .core import (
     gpu_mem_bandwidth_gbps,
     gpu_peak_tflops,
 )
-from .registry import load_model
+from .registry import load_model, load_model_scoped
 
 
 @cache
@@ -78,7 +78,12 @@ def _model(config_path: str):
 
 
 def _model_for_spec(spec: dict):
-    model = _model(spec["config"])
+    scope = spec.get("model_work_scope")
+    model = (
+        load_model_scoped(spec["config"], scope)
+        if scope is not None
+        else _model(spec["config"])
+    )
     if spec.get("arch_type") != "glm52_vllm_nvfp4_dsa_moe_speculative":
         return model
     mode = spec.get("mtp_mode", "index_share")
@@ -136,6 +141,8 @@ def _pool_specs(log_dir: Path) -> dict[str, dict]:
     ``quantization_config``. The two must agree — see :func:`_check_precision`.
     """
     params = json.loads((log_dir / "raw" / "params.json").read_text())
+    scope_path = log_dir / "raw" / "model_work_scope.json"
+    model_work_scope = json.loads(scope_path.read_text()) if scope_path.is_file() else None
     specs: dict[str, dict] = {}
     for pool_tag, pool in params.get("pools", {}).items():
         group = pool["groups"][0]
@@ -143,7 +150,12 @@ def _pool_specs(log_dir: Path) -> dict[str, dict]:
         arch_type = arch.get("type", "")
         arch_quant_dtype = (
             "fp4"
-            if arch_type in ("glm52_vllm_nvfp4_dsa_moe", "glm52_vllm_nvfp4_dsa_moe_speculative")
+            if arch_type
+            in (
+                "glm52_vllm_nvfp4_dsa_moe",
+                "glm52_vllm_nvfp4_dsa_moe_speculative",
+                "kimi_k3_sglang",
+            )
             else None
         )
         if arch.get("fp8"):
@@ -158,6 +170,7 @@ def _pool_specs(log_dir: Path) -> dict[str, dict]:
             "arch_fp8": bool(arch.get("fp8")),
             "arch_quant_dtype": arch_quant_dtype,
             "dtype": "fp8" if arch.get("fp8") else "bf16",
+            "model_work_scope": model_work_scope,
         }
     return specs
 

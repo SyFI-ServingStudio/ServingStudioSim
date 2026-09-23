@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use anyhow::{ensure, Context, Result};
 use serde::Deserialize;
+use serde_json::json;
 
 use crate::arch::config::ModelSpec;
 use crate::arch::contract::{IterwiseUnifiedModel, UnifiedArchInput};
@@ -382,6 +383,11 @@ impl KimiK3SglangParallel {
             .unwrap_or(model.num_experts.get() / u32::from(self.ep_size))
     }
 
+    pub fn local_experts_value_from_constants(&self) -> u32 {
+        self.local_experts
+            .unwrap_or(NUM_EXPERTS / u32::from(self.ep_size))
+    }
+
     pub fn num_attn_dp_groups(&self) -> u16 {
         self.ep_size / self.attn_tp_size
     }
@@ -419,10 +425,41 @@ fn layer_counts(
     Ok(KimiK3LayerCounts { dense: 0, kda, mla })
 }
 
+fn pipeline_stage_counts(
+    model: &KimiK3ModelCfg,
+    parallel: &KimiK3SglangParallel,
+    counts: KimiK3LayerCounts,
+) -> Vec<KimiK3LayerCounts> {
+    if parallel.pp_size == 1
+        || parallel.sim_kda_layers.is_some()
+        || parallel.sim_mla_layers.is_some()
+    {
+        return vec![counts];
+    }
+    let pp = u32::from(parallel.pp_size);
+    (0..pp)
+        .map(|stage| {
+            let first = stage * model.num_layers / pp + 1;
+            let last = (stage + 1) * model.num_layers / pp;
+            let in_stage = |layer: &u32| (*layer >= first) && (*layer <= last);
+            KimiK3LayerCounts {
+                dense: model.kda_layers.iter().any(|layer| *layer == 1 && in_stage(layer)) as u32,
+                kda: model
+                    .kda_layers
+                    .iter()
+                    .filter(|layer| **layer != 1 && in_stage(layer))
+                    .count() as u32,
+                mla: model.full_attn_layers.iter().filter(|layer| in_stage(layer)).count() as u32,
+            }
+        })
+        .collect()
+}
+
 #[derive(Clone, Debug)]
 pub struct KimiK3SglangConfigs {
     pub parallel: KimiK3SglangParallel,
     pub counts: KimiK3LayerCounts,
+    pub pp_stage_counts: Vec<KimiK3LayerCounts>,
     pub include_model_io: bool,
     pub embedding: Option<ElementwiseKernelConfig>,
     pub dense_attention: Option<KimiK3KdaLocalWorkletConfig>,
@@ -439,6 +476,7 @@ pub struct KimiK3SglangConfigs {
 pub struct KimiK3SglangResolved {
     pub parallel: KimiK3SglangParallel,
     pub counts: KimiK3LayerCounts,
+    pub pp_stage_counts: Vec<KimiK3LayerCounts>,
     pub include_model_io: bool,
     pub embedding: Option<ElementwiseKernelConfig>,
     pub dense_attention: Option<KimiK3KdaLocalWorkletResolved>,
@@ -457,6 +495,7 @@ pub fn build_configs(
 ) -> Result<KimiK3SglangConfigs> {
     parallel.validate(model)?;
     let counts = layer_counts(model, parallel)?;
+    let pp_stage_counts = pipeline_stage_counts(model, parallel, counts);
     let gpu = parallel.gpu_name.clone();
     let heads = parallel.heads_per_rank_value();
     let local_experts = parallel.local_experts_value(model);
@@ -521,6 +560,7 @@ pub fn build_configs(
     Ok(KimiK3SglangConfigs {
         parallel: parallel.clone(),
         counts,
+        pp_stage_counts,
         include_model_io,
         embedding: include_model_io.then(|| ElementwiseKernelConfig {
             backends: ELEMENTWISE_BACKENDS.to_vec(),
@@ -561,6 +601,7 @@ pub fn resolve_configs(cfg: &KimiK3SglangConfigs) -> KimiK3SglangResolved {
     KimiK3SglangResolved {
         parallel: cfg.parallel.clone(),
         counts: cfg.counts,
+        pp_stage_counts: cfg.pp_stage_counts.clone(),
         include_model_io: cfg.include_model_io,
         embedding: cfg.embedding.clone(),
         dense_attention: cfg
@@ -596,6 +637,7 @@ pub struct KimiK3SglangModel {
     pub name: String,
     pub parallel: KimiK3SglangParallel,
     pub counts: KimiK3LayerCounts,
+    pub pp_stage_counts: Vec<KimiK3LayerCounts>,
     pub embedding: Option<Op<ElementwiseKernel>>,
     pub dense_attention: Option<KimiK3KdaLocalWorklet>,
     pub dense_ffn: Option<KimiK3DenseLocalWorklet>,
@@ -711,6 +753,7 @@ pub fn build(
         name,
         parallel: resolved.parallel,
         counts: resolved.counts,
+        pp_stage_counts: resolved.pp_stage_counts,
         total_kv_bytes_per_token,
         recurrent_state_bytes_per_request,
         recurrent_checkpoint_interval_tokens,
@@ -733,6 +776,35 @@ pub fn build(
 }
 
 impl KimiK3SglangModel {
+    /// Exact model.work scope for this concrete rank-local model.  The timing
+    /// tree is built once for the logical model, while the prediction's GPU
+    /// extent includes every PP stage.  `work_scale` therefore converts the
+    /// logical traversal to the per-stage work that the analyzer multiplies by
+    /// the replica GPU count.
+    pub fn model_work_scope(&self) -> serde_json::Value {
+        let counts = |value: KimiK3LayerCounts| {
+            json!({
+                "dense": value.dense,
+                "kda": value.kda,
+                "mla": value.mla,
+            })
+        };
+        json!({
+            "schema_version": 1,
+            "arch_type": ARCH_KIND,
+            "kda_state_dtype": self.parallel.kda_state_dtype.as_str(),
+            "heads_per_rank": self.parallel.heads_per_rank_value(),
+            "global_heads": NUM_HEADS,
+            "local_experts": self.parallel.local_experts_value_from_constants(),
+            "global_experts": NUM_EXPERTS,
+            "layer_counts": counts(self.counts),
+            "pp_stage_layer_counts": self.pp_stage_counts.iter().copied().map(counts).collect::<Vec<_>>(),
+            "pp_size": self.parallel.pp_size,
+            "work_scale": 1.0 / f64::from(self.parallel.pp_size),
+            "include_model_io": self.embedding.is_some(),
+        })
+    }
+
     pub fn cost_tree(&self) -> CostTree {
         let mut builder = CostTreeBuilder::new();
         let mut children = Vec::new();
@@ -1032,6 +1104,10 @@ fn normalize_input(
 }
 
 impl IterwiseUnifiedModel for KimiK3SglangModel {
+    fn model_work_scope(&self) -> Option<serde_json::Value> {
+        Some(self.model_work_scope())
+    }
+
     fn eval_iter(
         &self,
         batch: &UnifiedArchInput,
@@ -1152,8 +1228,35 @@ mod tests {
                 mla: 24
             }
         );
+        assert_eq!(
+            configs.pp_stage_counts,
+            vec![
+                KimiK3LayerCounts {
+                    dense: 1,
+                    kda: 34,
+                    mla: 11,
+                },
+                KimiK3LayerCounts {
+                    dense: 0,
+                    kda: 34,
+                    mla: 13,
+                },
+            ]
+        );
         assert_eq!(production.num_attn_dp_groups(), 1);
         assert_eq!(production.gpus_per_replica(), 16);
+
+        let bridge = PerfApiBridge::new_uninit_for_test();
+        bridge.enable_enumerate();
+        let enumerated = build("unified".into(), resolve_configs(&configs), &bridge).unwrap();
+        let scope = enumerated.model_work_scope();
+        assert_eq!(scope["kda_state_dtype"], json!("bf16"));
+        assert_eq!(scope["heads_per_rank"], json!(12));
+        assert_eq!(scope["local_experts"], json!(112));
+        assert_eq!(scope["pp_size"], json!(2));
+        assert_eq!(scope["work_scale"], json!(0.5));
+        assert_eq!(scope["include_model_io"], json!(true));
+        assert_eq!(scope["pp_stage_layer_counts"].as_array().unwrap().len(), 2);
     }
 
     #[test]

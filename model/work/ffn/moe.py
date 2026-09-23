@@ -39,6 +39,12 @@ class MoE:
     router_bias_elements: int = 0
     #: Learned RMSNorm scale between the routed expert down/up projections.
     routed_norm_elements: int = 0
+    #: Number of experts resident on this rank.  The router still projects to
+    #: ``num_experts``; only routed weight loading and expert parameter identity
+    #: use this local count.
+    local_experts: int | None = None
+    #: Fraction of global top-k selections handled by this rank's expert shard.
+    routing_scale: float = 1.0
 
     def _module(self, path: str) -> str:
         return f"{self.module_prefix}.{path}" if self.module_prefix else path
@@ -47,6 +53,11 @@ class MoE:
         if self.shared_gate and self.shared_intermediate <= 0:
             raise ValueError("shared_gate requires shared_intermediate > 0")
         expert_input = self.expert_input_dim or self.hidden
+        local_experts = self.local_experts or self.num_experts
+        if local_experts <= 0 or self.num_experts % local_experts != 0:
+            raise ValueError("local_experts must be a positive divisor of num_experts")
+        if self.routing_scale <= 0.0 or self.routing_scale > 1.0:
+            raise ValueError("routing_scale must be in (0, 1]")
         groups = [
             # `mlp.gate` is the router matrix, and both GLM-5.2-FP8 and
             # Qwen3-235B-FP8 leave it at the master dtype.
@@ -62,20 +73,22 @@ class MoE:
                 n=2 * self.moe_intermediate,
                 k=expert_input,
                 activated_mult=self.top_k,
-                total_count=self.num_experts,
+                total_count=local_experts,
                 bucket="expert",
                 routed=True,
                 module=self._module("mlp.experts.gate_up_proj"),
+                activated_scale=self.routing_scale,
             ),
             MatmulGroup(
                 "expert_down",
                 n=expert_input,
                 k=self.moe_intermediate,
                 activated_mult=self.top_k,
-                total_count=self.num_experts,
+                total_count=local_experts,
                 bucket="expert",
                 routed=True,
                 module=self._module("mlp.experts.down_proj"),
+                activated_scale=self.routing_scale,
             ),
         ]
         if self.expert_input_dim is not None:

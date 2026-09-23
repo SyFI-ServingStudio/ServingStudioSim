@@ -326,10 +326,13 @@ class MatmulGroup:
     bucket: str = "dense_ffn"
     routed: bool = False  # weights are routed experts -> only the hit subset is loaded
     module: str | None = None
+    # A rank-local routed expert shard receives this fraction of the global
+    # top-k selections.  The default keeps every existing model whole.
+    activated_scale: float = 1.0
 
     @property
-    def activated_params(self) -> int:
-        return self.activated_mult * self.n * self.k
+    def activated_params(self) -> float:
+        return self.activated_scale * self.activated_mult * self.n * self.k
 
     @property
     def total_params(self) -> int:
@@ -345,7 +348,7 @@ class MatmulGroup:
         """
         if not self.routed or self.total_count <= 1:
             return float(self.total_count)
-        draws = matmul_tokens * self.activated_mult
+        draws = matmul_tokens * self.activated_mult * self.activated_scale
         experts = self.total_count
         return experts * (1.0 - (1.0 - 1.0 / experts) ** draws)
 
@@ -394,14 +397,17 @@ class Segment:
     bytes: float
     count: int
     compute_dtype: str | None = None
+    # Fractional layer/stage scopes retain one semantic row per manifest leaf
+    # while representing the work held by one PP stage.
+    scale: float = 1.0
 
     @property
     def flops_total(self) -> float:
-        return self.flops * self.count
+        return self.flops * self.count * self.scale
 
     @property
     def bytes_total(self) -> float:
-        return self.bytes * self.count
+        return self.bytes * self.count * self.scale
 
     def _instance_seconds(self, peak_tflops: float, bandwidth_gbps: float) -> tuple[float, float]:
         return self.flops / (peak_tflops * 1e12), self.bytes / (bandwidth_gbps * 1e9)
@@ -413,7 +419,7 @@ class Segment:
     def time_ms(self, peak_tflops: float, bandwidth_gbps: float) -> float:
         """Minimal time for all ``count`` instances = count · max(compute, memory)."""
         compute_s, memory_s = self._instance_seconds(peak_tflops, bandwidth_gbps)
-        return max(compute_s, memory_s) * self.count * 1e3
+        return max(compute_s, memory_s) * self.count * self.scale * 1e3
 
 
 @dataclass
@@ -510,6 +516,7 @@ class WorkLabel:
             {
                 "name": seg.name,
                 "count": seg.count,
+                "scale": seg.scale,
                 "flops": seg.flops_total,
                 "bytes": seg.bytes_total,
                 "compute_dtype": seg.compute_dtype or dtype,
@@ -631,11 +638,17 @@ class Model:
     #: What the checkpoint's ``quantization_config`` declared, if anything. None
     #: means every weight is stored and computed at ``master_dtype``.
     quant: QuantScheme | None = None
+    #: Rank-local/truncated timing-predict scopes can omit model I/O entirely.
+    include_model_io: bool = True
+    #: A PP timing row holds one stage's share of a replica-wide traversal.
+    work_scale: float = 1.0
 
     def __post_init__(self) -> None:
         # Builders pass the config's own spelling ("bfloat16"); segments and the
         # analyzer wire compare dtypes as strings, so normalize once here.
         self.master_dtype = canonical_dtype(self.master_dtype)
+        if self.work_scale <= 0.0:
+            raise ValueError("model work_scale must be positive")
 
     @property
     def num_layers(self) -> int:
@@ -864,44 +877,47 @@ class Model:
         # entries cannot force more than one full table pass, and a smaller batch
         # touches at most ``tokens`` distinct rows. Without the cap a giant aggregate
         # batch (T ≫ vocab) would over-count the embedding read ~T/vocab times.
-        embedding_params = self.vocab * self.hidden
-        breakdown["embedding"] += embedding_params
-        total_params += embedding_params
-        # The embedding table always stays at the master dtype: FP8 quantizers walk
-        # the Linear modules, and an `nn.Embedding` is not one. `modules_to_not_convert`
-        # is therefore silent about it in some checkpoints (Qwen3-235B-FP8 omits it,
-        # GLM-5.2-FP8 lists it) — but neither one's index carries a
-        # `model.embed_tokens.weight_scale_inv`, so the list is not the authority here.
-        segments.append(
-            Segment(
-                name="embedding",
-                bucket="embedding",
-                byte_kind="weights",
-                flops=0.0,
-                bytes=min(wl.matmul_tokens, self.vocab) * self.hidden * self.weight_dtype_bytes,
-                count=1,
-                compute_dtype=self.master_dtype,
+        embedding_params = 0
+        lm_head_params = 0
+        if self.include_model_io:
+            embedding_params = self.vocab * self.hidden
+            breakdown["embedding"] += embedding_params
+            total_params += embedding_params
+            # The embedding table always stays at the master dtype: FP8 quantizers walk
+            # the Linear modules, and an `nn.Embedding` is not one. `modules_to_not_convert`
+            # is therefore silent about it in some checkpoints (Qwen3-235B-FP8 omits it,
+            # GLM-5.2-FP8 lists it) — but neither one's index carries a
+            # `model.embed_tokens.weight_scale_inv`, so the list is not the authority here.
+            segments.append(
+                Segment(
+                    name="embedding",
+                    bucket="embedding",
+                    byte_kind="weights",
+                    flops=0.0,
+                    bytes=min(wl.matmul_tokens, self.vocab) * self.hidden * self.weight_dtype_bytes,
+                    count=1,
+                    compute_dtype=self.master_dtype,
+                )
             )
-        )
 
-        # --- lm_head projection (whole iteration): reads its weight matrix once. ---
-        lm_head_params = 0 if self.tie_word_embeddings else self.vocab * self.hidden
-        breakdown["lm_head"] += lm_head_params
-        total_params += lm_head_params
-        lm_head_group = MatmulGroup(
-            "lm_head", n=self.vocab, k=self.hidden, bucket="dense_ffn", module="lm_head"
-        )
-        segments.append(
-            Segment(
-                name="lm_head",
-                bucket="lm_head",
-                byte_kind="weights",
-                flops=2.0 * wl.head_positions * self.hidden * self.vocab,
-                bytes=self.weight_bytes_per_instance(lm_head_group),
-                count=1,
-                compute_dtype=self.matmul_compute_dtype(lm_head_group),
+            # --- lm_head projection (whole iteration): reads its weight matrix once. ---
+            lm_head_params = 0 if self.tie_word_embeddings else self.vocab * self.hidden
+            breakdown["lm_head"] += lm_head_params
+            total_params += lm_head_params
+            lm_head_group = MatmulGroup(
+                "lm_head", n=self.vocab, k=self.hidden, bucket="dense_ffn", module="lm_head"
             )
-        )
+            segments.append(
+                Segment(
+                    name="lm_head",
+                    bucket="lm_head",
+                    byte_kind="weights",
+                    flops=2.0 * wl.head_positions * self.hidden * self.vocab,
+                    bytes=self.weight_bytes_per_instance(lm_head_group),
+                    count=1,
+                    compute_dtype=self.matmul_compute_dtype(lm_head_group),
+                )
+            )
 
         # A stage that samples runs the output projection over its own rows, on a
         # launch of its own. The FLOPs are compulsory; the bytes are not, because
@@ -909,20 +925,24 @@ class Model:
         # `shared_head`, tied to `lm_head`) and F_min's read-once convention
         # already charged that matrix above. A stage with its own untied head
         # would need its own weight row — none exists today.
-        for stage_name, stage_wl in sorted(wl.stages.items()):
-            if stage_wl.head_positions <= 0:
-                continue
-            segments.append(
-                Segment(
-                    name=f"{stage_name}.lm_head",
-                    bucket="lm_head",
-                    byte_kind="weights",
-                    flops=2.0 * stage_wl.head_positions * self.hidden * self.vocab,
-                    bytes=0.0,
-                    count=1,
-                    compute_dtype=self.matmul_compute_dtype(lm_head_group),
+        if self.include_model_io:
+            for stage_name, stage_wl in sorted(wl.stages.items()):
+                if stage_wl.head_positions <= 0:
+                    continue
+                segments.append(
+                    Segment(
+                        name=f"{stage_name}.lm_head",
+                        bucket="lm_head",
+                        byte_kind="weights",
+                        flops=2.0 * stage_wl.head_positions * self.hidden * self.vocab,
+                        bytes=0.0,
+                        count=1,
+                        compute_dtype=self.matmul_compute_dtype(lm_head_group),
+                    )
                 )
-            )
+
+        for segment in segments:
+            segment.scale = self.work_scale
 
         # --- roll segments up into the aggregate FLOP / byte buckets ---
         flops = empty_flops()

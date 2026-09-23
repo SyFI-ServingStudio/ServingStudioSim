@@ -151,12 +151,15 @@ struct ArchParams {
     arch_type: String,
     #[serde(default)]
     fp8: bool,
+    #[serde(default)]
+    kda_state_dtype: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 struct PoolSpec {
     arch_type: String,
     dtype: String,
+    kda_state_dtype: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -164,6 +167,8 @@ struct LocationMap {
     schema_version: u64,
     mapping_id: String,
     arch_types: Vec<String>,
+    #[serde(default)]
+    kda_state_dtype: Option<String>,
     locations: Vec<LocationRule>,
 }
 
@@ -1042,9 +1047,12 @@ fn is_communication_kind(kind: &str) -> bool {
     matches!(
         kind,
         "all_reduce"
+            | "all_reduce_fusion"
+            | "all_reduce_residual_rms_norm"
             | "all_gather"
             | "reduce_scatter"
             | "all_to_all"
+            | "moe_alltoall"
             | "broadcast"
             | "gather"
             | "scatter"
@@ -1073,7 +1081,7 @@ async fn compute_semantic_floors(
     let mut mapping_ids = BTreeSet::new();
     let mut semantic_names = BTreeSet::new();
     let mut common_hardware: Option<(String, String, String, GpuSpec)> = None;
-    let mut total_flops = 0.0;
+    let mut total_compute_gpu_s = 0.0;
     let mut total_bytes = 0.0;
     let mut segmented_gpu_s = 0.0;
 
@@ -1095,7 +1103,12 @@ async fn compute_semantic_floors(
                 )
             })?;
         let manifest_doc = &manifests[&occurrence.worker];
-        let map = select_location_map(&maps, &pool_spec.arch_type, manifest_doc)?;
+        let map = select_location_map(
+            &maps,
+            &pool_spec.arch_type,
+            pool_spec.kda_state_dtype.as_deref(),
+            manifest_doc,
+        )?;
         mapping_ids.insert(map.mapping_id.clone());
         let hardware_key = (
             pool_spec.arch_type.clone(),
@@ -1134,13 +1147,14 @@ async fn compute_semantic_floors(
         if peak_tflops <= 0.0 || bandwidth_gbps <= 0.0 {
             bail!("selected semantic scope has no positive hardware peak or bandwidth");
         }
-        let (occurrence_segmented_gpu_s, _) = semantic_floor_values(
+        let (occurrence_segmented_gpu_s, occurrence_fused_gpu_s) = semantic_floor_values(
             &label.label.segments,
             &selected,
             hardware_ref.spec,
             &pool_spec.dtype,
         )?;
         segmented_gpu_s += occurrence_segmented_gpu_s;
+        total_compute_gpu_s += occurrence_fused_gpu_s;
         for semantic in selected {
             semantic_names.insert(semantic.clone());
             let matching = label
@@ -1161,7 +1175,6 @@ async fn compute_semantic_floors(
             {
                 bail!("model.work semantic segment {semantic:?} has invalid work");
             }
-            total_flops += segment.flops;
             total_bytes += segment.bytes;
         }
     }
@@ -1171,8 +1184,7 @@ async fn compute_semantic_floors(
     if peak_tflops <= 0.0 || spec.mem_bandwidth_gbps <= 0.0 {
         bail!("selected semantic scope has no positive fused hardware ceiling");
     }
-    let r7 = (total_flops / (peak_tflops * 1e12))
-        .max(total_bytes / (spec.mem_bandwidth_gbps * 1e9));
+    let r7 = total_compute_gpu_s.max(total_bytes / (spec.mem_bandwidth_gbps * 1e9));
     Ok(SemanticFloors {
         r6_gpu_s: segmented_gpu_s,
         r7_gpu_s: r7,
@@ -1186,6 +1198,9 @@ fn pool_spec(params: &ParamsDocument, pool: &str) -> Option<PoolSpec> {
     Some(PoolSpec {
         arch_type: group.arch.arch_type.clone(),
         dtype: if group.arch.fp8 { "fp8" } else { "bf16" }.to_owned(),
+        kda_state_dtype: group.arch.kda_state_dtype.clone().or_else(|| {
+            (group.arch.arch_type == "kimi_k3_sglang").then(|| "bf16".to_owned())
+        }),
     })
 }
 
@@ -1222,6 +1237,7 @@ fn load_location_maps(root: &Path) -> Result<Vec<LocationMap>> {
 fn select_location_map<'a>(
     maps: &'a [LocationMap],
     arch_type: &str,
+    kda_state_dtype: Option<&str>,
     manifest_doc: &ManifestDoc,
 ) -> Result<&'a LocationMap> {
     let expected = manifest_doc
@@ -1235,20 +1251,32 @@ fn select_location_map<'a>(
         .iter()
         .filter(|map| map.arch_types.iter().any(|candidate| candidate == arch_type))
         .filter(|map| {
-            map.locations
+            if arch_type == "kimi_k3_sglang" {
+                map.kda_state_dtype.as_deref() == kda_state_dtype
+            } else {
+                map.kda_state_dtype.is_none()
+            }
+        })
+        .filter(|map| {
+            let mapped = map
+                .locations
                 .iter()
                 .map(|location| location.location.as_str())
-                .collect::<BTreeSet<_>>()
-                == expected
+                .collect::<BTreeSet<_>>();
+            if arch_type == "kimi_k3_sglang" {
+                expected.is_subset(&mapped)
+            } else {
+                expected == mapped
+            }
         })
         .collect::<Vec<_>>();
     match candidates.as_slice() {
         [map] => Ok(map),
         [] => bail!(
-            "no exact semantic location map for arch type {arch_type:?} and selected run manifest"
+            "no semantic location map for arch type {arch_type:?}, state dtype {kda_state_dtype:?}, and selected run manifest"
         ),
         _ => bail!(
-            "multiple exact semantic location maps for arch type {arch_type:?}: {:?}",
+            "multiple semantic location maps for arch type {arch_type:?}, state dtype {kda_state_dtype:?}: {:?}",
             candidates
                 .iter()
                 .map(|map| map.mapping_id.as_str())
@@ -1271,8 +1299,17 @@ fn selected_semantics(
         .section(&occurrence.section)
         .context("selected section missing while applying location map")?;
     let leaf_names = descendant_leaves(manifest, occurrence.node_idx);
+    let communication = manifest
+        .slots
+        .iter()
+        .filter(|leaf| is_communication_kind(&leaf.kind))
+        .map(|leaf| leaf.name.as_str())
+        .collect::<BTreeSet<_>>();
     let mut semantics = BTreeSet::new();
     for location in leaf_names {
+        if communication.contains(location.as_str()) {
+            continue;
+        }
         let rule = rules
             .get(location.as_str())
             .with_context(|| format!("location map has no rule for selected leaf {location:?}"))?;
@@ -1354,13 +1391,12 @@ fn semantic_floor_values(
     spec: GpuSpec,
     dtype: &str,
 ) -> Result<(f64, f64)> {
-    let peak = spec.peak_tflops(dtype);
-    if peak <= 0.0 || spec.mem_bandwidth_gbps <= 0.0 {
+    if spec.mem_bandwidth_gbps <= 0.0 {
         bail!("semantic hardware spec has no positive compute peak or bandwidth");
     }
-    let mut flops = 0.0;
     let mut bytes = 0.0;
     let mut segmented = 0.0;
+    let mut compute_gpu_s = 0.0;
     for name in selected {
         let matches = segments
             .iter()
@@ -1371,12 +1407,18 @@ fn semantic_floor_values(
             [] => bail!("semantic segment {name:?} is missing"),
             _ => bail!("semantic segment {name:?} is ambiguous"),
         };
-        flops += segment.flops;
+        let segment_dtype = segment.compute_dtype.as_deref().unwrap_or(dtype);
+        let peak = spec.peak_tflops(segment_dtype);
+        if peak <= 0.0 {
+            bail!("semantic hardware spec has no positive {segment_dtype} compute peak");
+        }
+        let compute = segment.flops / (peak * 1e12);
+        let memory = segment.bytes / (spec.mem_bandwidth_gbps * 1e9);
         bytes += segment.bytes;
-        segmented += (segment.flops / (peak * 1e12))
-            .max(segment.bytes / (spec.mem_bandwidth_gbps * 1e9));
+        compute_gpu_s += compute;
+        segmented += compute.max(memory);
     }
-    let fused = (flops / (peak * 1e12)).max(bytes / (spec.mem_bandwidth_gbps * 1e9));
+    let fused = compute_gpu_s.max(bytes / (spec.mem_bandwidth_gbps * 1e9));
     Ok((segmented, fused))
 }
 
@@ -1506,6 +1548,30 @@ mod tests {
             assert!(reasons.contains(rung));
         }
         assert!(omissions.iter().all(|omission| !omission.reason.is_empty()));
+    }
+
+    #[test]
+    fn communication_leaf_filter_matches_manifest_kinds() {
+        for kind in [
+            "all_reduce",
+            "all_reduce_fusion",
+            "all_reduce_residual_rms_norm",
+            "all_gather",
+            "reduce_scatter",
+            "all_to_all",
+            "moe_alltoall",
+            "broadcast",
+            "gather",
+            "scatter",
+            "send",
+            "recv",
+            "p2p_send",
+            "nccl_kernel",
+            "comm_marker",
+        ] {
+            assert!(is_communication_kind(kind), "{kind} must be communication");
+        }
+        assert!(!is_communication_kind("moe_alltoall_prepare"));
     }
 
     #[test]

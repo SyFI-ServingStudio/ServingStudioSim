@@ -334,7 +334,7 @@ pub fn run_timing_predict(config_path: &Path) -> Result<()> {
     // not assume a shared shape: iter/attn take the attention-shaped [`PredictCase`];
     // ffn takes [`FfnArchInput`] itself (token counts only), which rejects the
     // attention vocabulary the ffn cost never reads.
-    let (num_cases, gpu_count) = match &cfg.arch {
+    let (num_cases, gpu_count, model_work_scope) = match &cfg.arch {
         PredictArchSel::Iter(sel) => {
             let _scope = bridge.with_backend_overrides("main", cfg.backends.get("main"));
             {
@@ -347,7 +347,7 @@ pub fn run_timing_predict(config_path: &Path) -> Result<()> {
             let cases: Vec<PredictCase> = load_cases(&cfg.cases_file, config_path)?;
             let n = cases.len();
             run_iter_cases(&*model, cases, &cfg.log_dir)?;
-            (n, model.gpus_per_replica())
+            (n, model.gpus_per_replica(), model.model_work_scope())
         }
         PredictArchSel::SpeculativeIter(sel) => {
             let _scope = bridge.with_backend_overrides("main", cfg.backends.get("main"));
@@ -363,7 +363,7 @@ pub fn run_timing_predict(config_path: &Path) -> Result<()> {
             let cases: Vec<SpeculativePredictCase> = load_cases(&cfg.cases_file, config_path)?;
             let n = cases.len();
             run_speculative_iter_cases(&*model, draft_tokens, cases, &cfg.log_dir)?;
-            (n, model.gpus_per_replica())
+            (n, model.gpus_per_replica(), None)
         }
         PredictArchSel::Attn(sel) => {
             let _scope = bridge.with_backend_overrides("attn", cfg.backends.get("attn"));
@@ -377,7 +377,7 @@ pub fn run_timing_predict(config_path: &Path) -> Result<()> {
             let cases: Vec<PredictCase> = load_cases(&cfg.cases_file, config_path)?;
             let n = cases.len();
             run_attn_cases(&*model, cases, &cfg.log_dir)?;
-            (n, model.gpus_per_replica())
+            (n, model.gpus_per_replica(), None)
         }
         PredictArchSel::Ffn(sel) => {
             let _scope = bridge.with_backend_overrides("ffn", cfg.backends.get("ffn"));
@@ -391,15 +391,34 @@ pub fn run_timing_predict(config_path: &Path) -> Result<()> {
             let cases: Vec<FfnArchInput> = load_cases(&cfg.cases_file, config_path)?;
             let n = cases.len();
             run_ffn_cases(&*model, cases, &cfg.log_dir)?;
-            (n, model.gpus_per_replica())
+            (n, model.gpus_per_replica(), None)
         }
     };
     write_prediction_provenance(&cfg.log_dir, &cfg.gpu, gpu_count)?;
+    if let Some(scope) = model_work_scope {
+        write_model_work_scope(&cfg.log_dir, &scope)?;
+    }
 
     tracing::info!(
         log_dir = %cfg.log_dir.display(),
         "timing-predict wrote {num_cases} case(s)"
     );
+    Ok(())
+}
+
+const MODEL_WORK_SCOPE_FILE: &str = "model_work_scope.json";
+
+fn write_model_work_scope(log_dir: &Path, scope: &serde_json::Value) -> Result<()> {
+    let raw_dir = log_dir.join("raw");
+    fs::create_dir_all(&raw_dir)
+        .with_context(|| format!("creating prediction raw directory {}", raw_dir.display()))?;
+    let output_path = raw_dir.join(MODEL_WORK_SCOPE_FILE);
+    let temporary_path = raw_dir.join(format!(".{MODEL_WORK_SCOPE_FILE}.tmp"));
+    fs::write(&temporary_path, serde_json::to_vec_pretty(scope)?).with_context(|| {
+        format!("writing model.work scope {}", temporary_path.display())
+    })?;
+    fs::rename(&temporary_path, &output_path)
+        .with_context(|| format!("publishing model.work scope {}", output_path.display()))?;
     Ok(())
 }
 

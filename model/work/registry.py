@@ -33,7 +33,7 @@ class UnknownArchitecture(KeyError):
     """Raised when a config's architecture has no registered min-work builder."""
 
 
-def build_model(raw_config: dict) -> Model:
+def build_model(raw_config: dict, scope: dict | None = None) -> Model:
     architectures = raw_config.get("architectures") or []
     if len(architectures) != 1:
         raise ValueError(f"expected exactly one architecture, got {architectures!r}")
@@ -44,6 +44,12 @@ def build_model(raw_config: dict) -> Model:
             f"{architecture} has no min-work builder; add one under work/models/ and "
             f"register it in work/registry.py (see skill impl-add-model-work-label)"
         )
+    if scope is not None:
+        if builder is not kimi_k3.build:
+            raise ValueError(
+                f"model.work scope is only supported for Kimi-K3, not {architecture!r}"
+            )
+        return builder(raw_config, scope=scope)
     return builder(raw_config)
 
 
@@ -52,3 +58,10 @@ def load_model(config_path: str | Path) -> Model:
     with open(config_path) as handle:
         raw_config = json.load(handle)
     return build_model(raw_config)
+
+
+def load_model_scoped(config_path: str | Path, scope: dict) -> Model:
+    """Load a model with an arch-emitted rank/stage semantic scope."""
+    with open(config_path) as handle:
+        raw_config = json.load(handle)
+    return build_model(raw_config, scope=scope)

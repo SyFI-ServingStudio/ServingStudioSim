@@ -2334,3 +2334,34 @@ def test_kimi_k3_hand_derived_decode_traffic_and_work_goldens(kimi_k3_model):
         * (2 * K3_ATTN_RES_SUM_NVB + K3_ATTN_RES_WRITE_LAYERS + K3_ATTN_RES_OUTPUT_NVB)
     )
     assert prefill.bytes["kv"] == 96_507_322_368
+
+
+def test_kimi_k3_arch_emitted_scope_uses_one_rank_local_kda_layer():
+    from model.work.registry import load_model_scoped
+
+    scope = {
+        "schema_version": 1,
+        "arch_type": "kimi_k3_sglang",
+        "kda_state_dtype": "bf16",
+        "heads_per_rank": 12,
+        "global_heads": 96,
+        "local_experts": 112,
+        "global_experts": 896,
+        "layer_counts": {"dense": 0, "kda": 1, "mla": 0},
+        "pp_stage_layer_counts": [{"dense": 0, "kda": 1, "mla": 0}],
+        "pp_size": 1,
+        "work_scale": 1.0,
+        "include_model_io": False,
+    }
+    model = load_model_scoped(KIMI_K3, scope)
+    assert [(stack.tag, stack.count) for stack in model.layers] == [("kda", 1)]
+    assert model.layers[0].attn.num_heads == 12
+    assert model.layers[0].attn.state_dtype_bytes == 2
+    assert model.layers[0].ffn.local_experts == 112
+    assert model.layers[0].ffn.routing_scale == pytest.approx(112 / 896)
+
+    label = model.label(Workload.causal_lm(decode=[8192] * 128, sampled=128))
+    assert not {segment.name for segment in label.segments} & {"embedding", "lm_head"}
+    expert_gate_up = next(segment for segment in label.segments if segment.name == "kda.expert_gate_up")
+    assert expert_gate_up.bytes > 0
+    assert expert_gate_up.compute_dtype == "fp4"

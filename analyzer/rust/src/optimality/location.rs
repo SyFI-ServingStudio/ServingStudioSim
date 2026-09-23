@@ -24,6 +24,8 @@ struct LocationMap {
     schema_version: u64,
     mapping_id: String,
     arch_types: Vec<String>,
+    #[serde(default)]
+    kda_state_dtype: Option<String>,
     locations: Vec<LocationRule>,
 }
 
@@ -54,6 +56,8 @@ struct ArchParams {
     arch_type: String,
     #[serde(default)]
     fp8: bool,
+    #[serde(default)]
+    kda_state_dtype: Option<String>,
 }
 
 struct PoolModelSpec {
@@ -61,6 +65,7 @@ struct PoolModelSpec {
     /// The pool-wide precision rule that predates per-row `compute_dtype`.
     /// Used only for semantic rows whose labeler did not report a dtype.
     fallback_dtype: String,
+    kda_state_dtype: Option<String>,
 }
 
 /// Run-scoped semantic attribution inputs. Params and every mapping file are
@@ -103,8 +108,11 @@ impl LocationCatalog {
             pool_specs.insert(
                 pool_tag,
                 PoolModelSpec {
-                    arch_type: group.arch.arch_type,
+                    arch_type: group.arch.arch_type.clone(),
                     fallback_dtype: if group.arch.fp8 { "fp8" } else { "bf16" }.to_owned(),
+                    kda_state_dtype: group.arch.kda_state_dtype.or_else(|| {
+                        (group.arch.arch_type == "kimi_k3_sglang").then(|| "bf16".to_owned())
+                    }),
                 },
             );
         }
@@ -203,7 +211,12 @@ impl LocationCatalog {
             .pool_specs
             .get(pool_tag)
             .with_context(|| format!("semantic attribution missing pool {pool_tag:?}"))?;
-        let location_map = select_location_map(&self.maps, &pool_spec.arch_type, kernel_locations)?;
+        let location_map = select_location_map(
+            &self.maps,
+            &pool_spec.arch_type,
+            pool_spec.kda_state_dtype.as_deref(),
+            kernel_locations,
+        )?;
         let bandwidth_gbps = gpu_spec.mem_bandwidth_gbps;
         if bandwidth_gbps <= 0.0 {
             bail!("GPU spec lacks positive memory bandwidth");
@@ -247,7 +260,16 @@ impl LocationCatalog {
                     ))
                 })
                 .collect::<Result<_>>()?;
-            for rule in &location_map.locations {
+            let expected_locations: BTreeSet<&str> = kernel_locations
+                .iter()
+                .filter(|location| !location.is_communication)
+                .map(|location| location.name.as_str())
+                .collect();
+            for rule in location_map
+                .locations
+                .iter()
+                .filter(|rule| expected_locations.contains(rule.location.as_str()))
+            {
                 let work = rule.semantics.iter().try_fold(
                     NecessaryWork::default(),
                     |mut total, semantic| {
@@ -299,7 +321,16 @@ impl LocationCatalog {
             .iter()
             .map(|kernel| kernel.name.clone())
             .collect();
-        for rule in &location_map.locations {
+        let expected_locations: BTreeSet<&str> = kernel_locations
+            .iter()
+            .filter(|location| !location.is_communication)
+            .map(|location| location.name.as_str())
+            .collect();
+        for rule in location_map
+            .locations
+            .iter()
+            .filter(|rule| expected_locations.contains(rule.location.as_str()))
+        {
             if !existing_names.contains(&rule.location)
                 && work_by_location[rule.location.as_str()].necessary_gpu_s() > 0.0
             {
@@ -353,6 +384,7 @@ impl LocationCatalog {
 fn select_location_map<'map>(
     maps: &'map [LocationMap],
     arch_type: &str,
+    kda_state_dtype: Option<&str>,
     kernel_locations: &[KernelLocation],
 ) -> Result<&'map LocationMap> {
     let expected_locations: BTreeSet<&str> = kernel_locations
@@ -369,21 +401,32 @@ fn select_location_map<'map>(
                 .any(|candidate| candidate == arch_type)
         })
         .filter(|location_map| {
-            location_map
+            if arch_type == "kimi_k3_sglang" {
+                location_map.kda_state_dtype.as_deref() == kda_state_dtype
+            } else {
+                location_map.kda_state_dtype.is_none()
+            }
+        })
+        .filter(|location_map| {
+            let mapped_locations = location_map
                 .locations
                 .iter()
                 .map(|rule| rule.location.as_str())
-                .collect::<BTreeSet<_>>()
-                == expected_locations
+                .collect::<BTreeSet<_>>();
+            if arch_type == "kimi_k3_sglang" {
+                expected_locations.is_subset(&mapped_locations)
+            } else {
+                expected_locations == mapped_locations
+            }
         })
         .collect();
     match matches.as_slice() {
         [location_map] => Ok(*location_map),
         [] => Err(anyhow!(
-            "no semantic location map matches arch type {arch_type:?} and its exact manifest locations"
+            "no semantic location map matches arch type {arch_type:?}, state dtype {kda_state_dtype:?}, and manifest locations"
         )),
         _ => Err(anyhow!(
-            "multiple semantic location maps match arch type {arch_type:?} and its exact manifest locations: {:?}",
+            "multiple semantic location maps match arch type {arch_type:?}, state dtype {kda_state_dtype:?}, and manifest locations: {:?}",
             matches
                 .iter()
                 .map(|location_map| location_map.mapping_id.as_str())
@@ -411,6 +454,7 @@ fn validate_mapping(
     let mapped_locations: BTreeSet<&str> = location_map
         .locations
         .iter()
+        .filter(|rule| expected_locations.contains(rule.location.as_str()))
         .map(|rule| rule.location.as_str())
         .collect();
     if expected_locations != mapped_locations {
@@ -424,7 +468,13 @@ fn validate_mapping(
                 .collect::<Vec<_>>()
         );
     }
-    if mapped_locations.len() != location_map.locations.len() {
+    if mapped_locations.len()
+        != location_map
+            .locations
+            .iter()
+            .filter(|rule| expected_locations.contains(rule.location.as_str()))
+            .count()
+    {
         bail!("location map contains duplicate location rows");
     }
     let expected_semantics: BTreeSet<&str> = segments
@@ -434,6 +484,7 @@ fn validate_mapping(
     let mapped_semantics: Vec<&str> = location_map
         .locations
         .iter()
+        .filter(|rule| expected_locations.contains(rule.location.as_str()))
         .flat_map(|rule| rule.semantics.iter().map(String::as_str))
         .collect();
     let unique_semantics: BTreeSet<&str> = mapped_semantics.iter().copied().collect();
@@ -483,6 +534,7 @@ mod tests {
             schema_version: 1,
             mapping_id: "test".to_string(),
             arch_types: vec!["test".to_string()],
+            kda_state_dtype: None,
             locations: vec![LocationRule {
                 location: "model.gemm".to_string(),
                 semantics: vec!["gemm".to_string()],
@@ -549,6 +601,7 @@ mod tests {
                 schema_version: 1,
                 mapping_id: "test".to_string(),
                 arch_types: vec!["test_arch".to_string()],
+                kda_state_dtype: None,
                 locations: vec![LocationRule {
                     location: "unified.fused".to_string(),
                     semantics: vec!["gemm".to_string(), "norm".to_string()],
@@ -559,6 +612,7 @@ mod tests {
                 PoolModelSpec {
                     arch_type: "test_arch".to_string(),
                     fallback_dtype: "bf16".to_string(),
+                    kda_state_dtype: None,
                 },
             )]),
         };
@@ -609,6 +663,7 @@ mod tests {
                 schema_version: 1,
                 mapping_id: "unified".to_string(),
                 arch_types: vec!["llama3_dense".to_string()],
+                kda_state_dtype: None,
                 locations: vec![LocationRule {
                     location: "unified.gemm".to_string(),
                     semantics: vec!["gemm".to_string()],
@@ -618,6 +673,7 @@ mod tests {
                 schema_version: 1,
                 mapping_id: "pd".to_string(),
                 arch_types: vec!["llama3_dense".to_string()],
+                kda_state_dtype: None,
                 locations: vec![LocationRule {
                     location: "pd.gemm".to_string(),
                     semantics: vec!["gemm".to_string()],
@@ -625,7 +681,57 @@ mod tests {
             },
         ];
 
-        let selected = select_location_map(&maps, "llama3_dense", &[location("pd.gemm")]).unwrap();
+        let selected =
+            select_location_map(&maps, "llama3_dense", None, &[location("pd.gemm")]).unwrap();
         assert_eq!(selected.mapping_id, "pd");
+    }
+
+    #[test]
+    fn kimi_map_selection_accepts_a_truncated_manifest_and_uses_state_dtype() {
+        let maps = vec![
+            LocationMap {
+                schema_version: 1,
+                mapping_id: "kimi-bf16".to_string(),
+                arch_types: vec!["kimi_k3_sglang".to_string()],
+                kda_state_dtype: Some("bf16".to_string()),
+                locations: vec![
+                    LocationRule {
+                        location: "unified.kda".to_string(),
+                        semantics: vec!["kda".to_string()],
+                    },
+                    LocationRule {
+                        location: "unified.mla".to_string(),
+                        semantics: vec!["mla".to_string()],
+                    },
+                ],
+            },
+            LocationMap {
+                schema_version: 1,
+                mapping_id: "kimi-fp32".to_string(),
+                arch_types: vec!["kimi_k3_sglang".to_string()],
+                kda_state_dtype: Some("fp32".to_string()),
+                locations: vec![LocationRule {
+                    location: "unified.kda".to_string(),
+                    semantics: vec!["kda".to_string()],
+                }],
+            },
+        ];
+
+        let selected = select_location_map(
+            &maps,
+            "kimi_k3_sglang",
+            Some("bf16"),
+            &[location("unified.kda")],
+        )
+        .unwrap();
+        assert_eq!(selected.mapping_id, "kimi-bf16");
+        let selected = select_location_map(
+            &maps,
+            "kimi_k3_sglang",
+            Some("fp32"),
+            &[location("unified.kda")],
+        )
+        .unwrap();
+        assert_eq!(selected.mapping_id, "kimi-fp32");
     }
 }
