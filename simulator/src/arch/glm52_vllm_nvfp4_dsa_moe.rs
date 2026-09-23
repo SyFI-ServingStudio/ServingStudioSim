@@ -30,6 +30,7 @@ use crate::common::Fabric;
 use crate::op::attention::DsaSparseMlaExactVarlenConfig;
 use crate::op::Op;
 use crate::timing::bridge::DType;
+use crate::timing::expert_demand::ExpertDemand;
 use crate::timing::kernels::{
     AllReduceFusionKernel, AllReduceFusionKernelConfig, AllReduceFusionKernelInput,
     AllReduceFusionSpec, AllReduceKernel, AllReduceKernelConfig, AllReduceKernelInput,
@@ -39,7 +40,6 @@ use crate::timing::kernels::{
     ResidualRmsNormKernelConfig, ResidualRmsNormKernelInput, SingleGemmKernel,
     SingleGemmKernelConfig, SingleGemmKernelInput,
 };
-use crate::timing::routing::RoutingDistribution;
 use crate::timing::{
     BuildError, CostManifest, CostNode, CostTree, CostTreeBuilder, Dim, Evaluator, FlatCostNode,
     LeafMetrics, PerfApiBridge, Probe, SlotInput,
@@ -178,6 +178,10 @@ pub struct Glm52VllmNvfp4DsaMoeConfigs {
     /// layers and leaves this one in BF16, so it is a different L1 callable
     /// with different args -- not `nvfp4_moe` at another shape.
     pub mtp_bf16_moe: Option<Vec<Bf16MoeLocalWorkletConfig>>,
+    /// The same experts under the proposer's later calls, whose one row per
+    /// request carries no verify block. Present exactly when
+    /// `mtp_recurrent_attention` is.
+    pub mtp_recurrent_bf16_moe: Option<Vec<Bf16MoeLocalWorkletConfig>>,
     pub tp_allreduce: AllReduceKernelConfig,
     pub tp_allreduce_fusion: AllReduceFusionKernelConfig,
     pub tp_allreduce_fused: AllReduceResidualRmsNormKernelConfig,
@@ -209,6 +213,7 @@ pub struct Glm52VllmNvfp4DsaMoeResolved {
     pub shared_expert: Glm52SharedExpertLocalWorkletResolved,
     pub nvfp4_moe: Vec<Nvfp4MoeLocalWorkletResolved>,
     pub mtp_bf16_moe: Option<Vec<Bf16MoeLocalWorkletResolved>>,
+    pub mtp_recurrent_bf16_moe: Option<Vec<Bf16MoeLocalWorkletResolved>>,
     pub tp_allreduce: AllReduceKernelConfig,
     pub tp_allreduce_fusion: AllReduceFusionKernelConfig,
     pub tp_allreduce_fused: AllReduceResidualRmsNormKernelConfig,
@@ -316,24 +321,44 @@ fn attention_config(
 pub fn build_configs(
     model: &Glm52ModelCfg,
     parallel: &Glm52VllmNvfp4DsaMoeParallel,
-    routing: &RoutingDistribution,
+    body_demand: &ExpertDemand,
+    // `mtp_demand` is required exactly when `mtp_mode` is not `Off`: there is
+    // nothing to resolve it from otherwise, and a build that never reaches the
+    // MTP layer must not fail on evidence it will not use.
+    mtp_demand: Option<&ExpertDemand>,
     fp8: bool,
     mtp_mode: Glm52MtpMode,
 ) -> Result<Glm52VllmNvfp4DsaMoeConfigs, BuildError> {
     // Every decode request submits one query row, so the sparse-MLA leaves
     // sweep the width-1 identity and there is no recurrent draft pass.
-    build_configs_for_decode(model, parallel, routing, routing, fp8, mtp_mode, 1, None)
+    build_configs_for_decode(
+        model,
+        parallel,
+        body_demand,
+        mtp_demand,
+        None,
+        fp8,
+        mtp_mode,
+        1,
+        None,
+    )
 }
 
 /// The same recipe with a `draft_tokens`-deep MTP proposer in front of it.
 ///
-/// `draft_routing` is the MTP layer's own expert-routing evidence: it is one
-/// layer with its own load distribution, not a slice of the body's.
+/// `mtp_demand` is the MTP layer's own routed demand. It is one layer with its
+/// own load, which a corpus expresses as a layer slice of the same artifact and
+/// a marginal can only express as a second file. The proposer's first call
+/// forwards the target's verify blocks and `mtp_recurrent_demand` prices the
+/// one-row-per-request calls after it; a corpus samples the two at different
+/// widths, and a marginal gives the same answer to both.
+#[allow(clippy::too_many_arguments)]
 pub fn build_speculative_configs(
     model: &Glm52ModelCfg,
     parallel: &Glm52VllmNvfp4DsaMoeParallel,
-    target_routing: &RoutingDistribution,
-    draft_routing: &RoutingDistribution,
+    body_demand: &ExpertDemand,
+    mtp_demand: &ExpertDemand,
+    mtp_recurrent_demand: &ExpertDemand,
     fp8: bool,
     mtp_mode: Glm52MtpMode,
     draft_tokens: u32,
@@ -354,8 +379,9 @@ pub fn build_speculative_configs(
     build_configs_for_decode(
         model,
         parallel,
-        target_routing,
-        draft_routing,
+        body_demand,
+        Some(mtp_demand),
+        Some(mtp_recurrent_demand),
         fp8,
         mtp_mode,
         decode_next_n,
@@ -367,8 +393,9 @@ pub fn build_speculative_configs(
 fn build_configs_for_decode(
     model: &Glm52ModelCfg,
     parallel: &Glm52VllmNvfp4DsaMoeParallel,
-    routing: &RoutingDistribution,
-    mtp_routing: &RoutingDistribution,
+    body_demand: &ExpertDemand,
+    mtp_demand: Option<&ExpertDemand>,
+    mtp_recurrent_demand: Option<&ExpertDemand>,
     fp8: bool,
     mtp_mode: Glm52MtpMode,
     decode_next_n: u32,
@@ -399,10 +426,22 @@ fn build_configs_for_decode(
             parallel.max_model_len
         )));
     }
-    if routing.num_experts() != NUM_EXPERTS {
+    let mtp_demand = match (mtp_mode, mtp_demand) {
+        (Glm52MtpMode::Off, _) => None,
+        (_, Some(demand)) => Some(demand),
+        (_, None) => {
+            return Err(fit_failed(
+                "an MTP layer needs its own expert demand; none was resolved",
+            ))
+        }
+    };
+    if body_demand.num_experts() != NUM_EXPERTS as usize
+        || mtp_demand.is_some_and(|demand| demand.num_experts() != NUM_EXPERTS as usize)
+    {
         return Err(fit_failed(format!(
-            "routing distribution has {} experts, expected {NUM_EXPERTS}",
-            routing.num_experts()
+            "expert demand covers {} / {:?} experts, expected {NUM_EXPERTS}",
+            body_demand.num_experts(),
+            mtp_demand.map(ExpertDemand::num_experts)
         )));
     }
     if fp8 {
@@ -499,15 +538,16 @@ fn build_configs_for_decode(
             topk_group: 1,
             routed_scaling_numerator: 5,
             routed_scaling_denominator: 2,
-            layerwise_global_ppm: Vec::new(),
+            expert_demand: ExpertDemand::Popularity {
+                layerwise_global_ppm: Vec::new(),
+            },
             folded_rank_position: 0,
         },
-        routing,
-        NUM_LAYERS - NUM_DENSE_LAYERS,
+        body_demand.clone(),
     );
     // The MTP layer is one layer, so its EP workload fold sees a single layer
     // of routing evidence rather than the 75 the body folds over.
-    let mtp_bf16_moe = (mtp_mode != Glm52MtpMode::Off).then(|| {
+    let mtp_experts = |demand: &ExpertDemand| {
         Bf16MoeLocalWorkletConfig::split_for_ep(
             Bf16MoeLocalWorkletConfig {
                 hidden: model.hidden_dim.clone(),
@@ -524,13 +564,24 @@ fn build_configs_for_decode(
                 topk_group: 1,
                 routed_scaling_numerator: 5,
                 routed_scaling_denominator: 2,
-                layerwise_global_ppm: Vec::new(),
+                expert_demand: ExpertDemand::Popularity {
+                    layerwise_global_ppm: Vec::new(),
+                },
                 folded_rank_position: 0,
             },
-            mtp_routing,
-            1,
+            demand.clone(),
         )
-    });
+    };
+    let mtp_bf16_moe = mtp_demand.map(mtp_experts);
+    let mtp_recurrent_bf16_moe = match (&mtp_recurrent_attention, mtp_recurrent_demand) {
+        (None, _) => None,
+        (Some(_), Some(demand)) => Some(mtp_experts(demand)),
+        (Some(_), None) => {
+            return Err(fit_failed(
+                "a recurrent draft pass needs its own MTP expert demand",
+            ))
+        }
+    };
 
     Ok(Glm52VllmNvfp4DsaMoeConfigs {
         model: model.clone(),
@@ -590,6 +641,7 @@ fn build_configs_for_decode(
         },
         nvfp4_moe,
         mtp_bf16_moe,
+        mtp_recurrent_bf16_moe,
         tp_allreduce: AllReduceKernelConfig {
             backends: ALLREDUCE_BACKENDS.to_vec(),
             gpu_name: parallel.gpu_name.clone(),
@@ -774,6 +826,12 @@ pub fn resolve_configs(cfgs: &Glm52VllmNvfp4DsaMoeConfigs) -> Glm52VllmNvfp4DsaM
             .map(Nvfp4MoeLocalWorklet::resolve_config)
             .collect(),
         mtp_bf16_moe: cfgs.mtp_bf16_moe.as_ref().map(|configs| {
+            configs
+                .iter()
+                .map(Bf16MoeLocalWorklet::resolve_config)
+                .collect()
+        }),
+        mtp_recurrent_bf16_moe: cfgs.mtp_recurrent_bf16_moe.as_ref().map(|configs| {
             configs
                 .iter()
                 .map(Bf16MoeLocalWorklet::resolve_config)
@@ -1148,6 +1206,7 @@ impl Glm52MtpPass {
         name: &str,
         prelude: Glm52MtpPreludeLocalWorkletResolved,
         attention: VllmGlm52DsaAttnLocalWorkletResolved,
+        experts: Option<&[Bf16MoeLocalWorkletResolved]>,
         head: Glm52MtpHeadLocalWorkletResolved,
         common: &Glm52VllmNvfp4DsaMoeResolved,
         bridge: &PerfApiBridge,
@@ -1162,10 +1221,7 @@ impl Glm52MtpPass {
                 format!("{name}.decoder_sparse"),
                 attention,
                 common,
-                common
-                    .mtp_bf16_moe
-                    .as_deref()
-                    .ok_or_else(|| fit_failed("MTP expert configs are missing"))?,
+                experts.ok_or_else(|| fit_failed("MTP expert configs are missing"))?,
                 bridge,
             )?,
             head: Glm52MtpHeadLocalWorklet::build(format!("{name}.head"), head, bridge)?,
@@ -1533,6 +1589,7 @@ pub fn build_speculative(
         &format!("{name}.mtp.step_0"),
         prelude.clone(),
         first_attention,
+        resolved.mtp_bf16_moe.as_deref(),
         head.clone(),
         &resolved,
         bridge,
@@ -1552,6 +1609,7 @@ pub fn build_speculative(
             &format!("{name}.mtp.recurrent"),
             prelude,
             recurrent_attention,
+            resolved.mtp_recurrent_bf16_moe.as_deref(),
             head,
             &resolved,
             bridge,
@@ -2433,6 +2491,7 @@ mod tests {
     use crate::arch::contract::{
         ArchGroupInput, SpeculativeArchGroupInput, SpeculativeDecodeInput,
     };
+    use crate::timing::routing::RoutingDistribution;
     use std::collections::BTreeSet;
     use std::path::Path;
 
@@ -2496,7 +2555,11 @@ mod tests {
         let cfg = build_configs(
             &model(),
             &p,
-            &RoutingDistribution::uniform(NUM_EXPERTS),
+            &ExpertDemand::popularity(&RoutingDistribution::uniform(NUM_EXPERTS), 1),
+            Some(&ExpertDemand::popularity(
+                &RoutingDistribution::uniform(NUM_EXPERTS),
+                1,
+            )),
             false,
             Glm52MtpMode::Off,
         )
@@ -2543,7 +2606,7 @@ mod tests {
         assert!(cfg
             .nvfp4_moe
             .windows(2)
-            .all(|pair| pair[0].layerwise_global_ppm == pair[1].layerwise_global_ppm));
+            .all(|pair| pair[0].expert_demand == pair[1].expert_demand));
         for rank in &cfg.nvfp4_moe {
             assert_eq!(rank.quant_backends, vec!["vllm_cuda"]);
             assert_eq!(rank.moe_backends, vec!["flashinfer_trtllm_sm100"]);
@@ -2561,7 +2624,11 @@ mod tests {
         let cfg = build_configs(
             &model(),
             &parallel(4),
-            &RoutingDistribution::uniform(NUM_EXPERTS),
+            &ExpertDemand::popularity(&RoutingDistribution::uniform(NUM_EXPERTS), 1),
+            Some(&ExpertDemand::popularity(
+                &RoutingDistribution::uniform(NUM_EXPERTS),
+                1,
+            )),
             false,
             Glm52MtpMode::Off,
         )
@@ -2599,7 +2666,11 @@ mod tests {
         let cfg = build_configs(
             &model(),
             &parallel(4),
-            &RoutingDistribution::uniform(NUM_EXPERTS),
+            &ExpertDemand::popularity(&RoutingDistribution::uniform(NUM_EXPERTS), 1),
+            Some(&ExpertDemand::popularity(
+                &RoutingDistribution::uniform(NUM_EXPERTS),
+                1,
+            )),
             false,
             Glm52MtpMode::FullIndex,
         )
@@ -2616,31 +2687,64 @@ mod tests {
 
     #[test]
     fn parallel_model_and_checkpoint_contracts_fail_closed() {
-        let routing = RoutingDistribution::uniform(NUM_EXPERTS);
+        let routing = ExpertDemand::popularity(&RoutingDistribution::uniform(NUM_EXPERTS), 1);
         let m = model();
 
         let mut invalid = parallel(4);
         invalid.ep_size = 0;
-        assert!(build_configs(&m, &invalid, &routing, false, Glm52MtpMode::Off).is_err());
+        assert!(build_configs(
+            &m,
+            &invalid,
+            &routing,
+            Some(&routing),
+            false,
+            Glm52MtpMode::Off
+        )
+        .is_err());
 
         let mut invalid = parallel(4);
         invalid.nvl_num_gpu = 3;
-        assert!(build_configs(&m, &invalid, &routing, false, Glm52MtpMode::Off).is_err());
+        assert!(build_configs(
+            &m,
+            &invalid,
+            &routing,
+            Some(&routing),
+            false,
+            Glm52MtpMode::Off
+        )
+        .is_err());
 
         let mut invalid = parallel(4);
         invalid.max_model_len = 0;
-        assert!(build_configs(&m, &invalid, &routing, false, Glm52MtpMode::Off).is_err());
+        assert!(build_configs(
+            &m,
+            &invalid,
+            &routing,
+            Some(&routing),
+            false,
+            Glm52MtpMode::Off
+        )
+        .is_err());
 
-        assert!(
-            build_configs(&m, &parallel(4), &routing, true, Glm52MtpMode::Off)
-                .unwrap_err()
-                .to_string()
-                .contains("fp8=false")
-        );
         assert!(build_configs(
             &m,
             &parallel(4),
-            &RoutingDistribution::uniform(128),
+            &routing,
+            Some(&routing),
+            true,
+            Glm52MtpMode::Off
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("fp8=false"));
+        assert!(build_configs(
+            &m,
+            &parallel(4),
+            &ExpertDemand::popularity(&RoutingDistribution::uniform(128), 1),
+            Some(&ExpertDemand::popularity(
+                &RoutingDistribution::uniform(128),
+                1
+            )),
             false,
             Glm52MtpMode::Off,
         )
@@ -2652,8 +2756,9 @@ mod tests {
         let cfg = build_speculative_configs(
             &model(),
             &parallel(4),
-            &RoutingDistribution::uniform(NUM_EXPERTS),
-            &RoutingDistribution::uniform(NUM_EXPERTS),
+            &ExpertDemand::popularity(&RoutingDistribution::uniform(NUM_EXPERTS), 1),
+            &ExpertDemand::popularity(&RoutingDistribution::uniform(NUM_EXPERTS), 1),
+            &ExpertDemand::popularity(&RoutingDistribution::uniform(NUM_EXPERTS), 1),
             false,
             Glm52MtpMode::IndexShare,
             5,
@@ -2691,8 +2796,9 @@ mod tests {
         let cfg = build_speculative_configs(
             &model(),
             &parallel(4),
-            &RoutingDistribution::uniform(NUM_EXPERTS),
-            &RoutingDistribution::uniform(NUM_EXPERTS),
+            &ExpertDemand::popularity(&RoutingDistribution::uniform(NUM_EXPERTS), 1),
+            &ExpertDemand::popularity(&RoutingDistribution::uniform(NUM_EXPERTS), 1),
+            &ExpertDemand::popularity(&RoutingDistribution::uniform(NUM_EXPERTS), 1),
             false,
             Glm52MtpMode::IndexShare,
             1,
@@ -2704,10 +2810,11 @@ mod tests {
 
     #[test]
     fn a_speculative_recipe_needs_a_proposer_and_a_positive_depth() {
-        let routing = RoutingDistribution::uniform(NUM_EXPERTS);
+        let routing = ExpertDemand::popularity(&RoutingDistribution::uniform(NUM_EXPERTS), 1);
         assert!(build_speculative_configs(
             &model(),
             &parallel(4),
+            &routing,
             &routing,
             &routing,
             false,
@@ -2718,6 +2825,7 @@ mod tests {
         assert!(build_speculative_configs(
             &model(),
             &parallel(4),
+            &routing,
             &routing,
             &routing,
             false,
@@ -2731,6 +2839,7 @@ mod tests {
             &model(),
             &parallel(4),
             &routing,
+            Some(&routing),
             false,
             Glm52MtpMode::IndexShare,
         )
@@ -2741,6 +2850,57 @@ mod tests {
         assert!(ordinary.speculative_draft_tokens.is_none());
     }
 
+    /// The first draft call forwards the target's verify blocks, so a corpus
+    /// must sample its rows as blocks; the calls after it are one row per
+    /// request. Each pass has to price the demand its own batch presents.
+    #[test]
+    fn each_draft_pass_prices_the_mtp_experts_at_its_own_width() {
+        let first = ExpertDemand::popularity(&RoutingDistribution::uniform(NUM_EXPERTS), 1);
+        let mut recurrent_ppm = vec![0; NUM_EXPERTS as usize];
+        recurrent_ppm[0] = 1_000_000;
+        let recurrent = ExpertDemand::Popularity {
+            layerwise_global_ppm: vec![recurrent_ppm],
+        };
+        let cfg = build_speculative_configs(
+            &model(),
+            &parallel(4),
+            &first,
+            &first,
+            &recurrent,
+            false,
+            Glm52MtpMode::IndexShare,
+            5,
+        )
+        .unwrap();
+        let demands = |configs: &Option<Vec<Bf16MoeLocalWorkletConfig>>| {
+            configs
+                .as_ref()
+                .expect("the pass has experts")
+                .iter()
+                .map(|rank| rank.expert_demand.clone())
+                .collect::<Vec<_>>()
+        };
+
+        assert!(demands(&cfg.mtp_bf16_moe).iter().all(|d| *d == first));
+        assert!(demands(&cfg.mtp_recurrent_bf16_moe)
+            .iter()
+            .all(|d| *d == recurrent));
+
+        // A one-deep draft has no later call to price.
+        let shallow = build_speculative_configs(
+            &model(),
+            &parallel(4),
+            &first,
+            &first,
+            &recurrent,
+            false,
+            Glm52MtpMode::IndexShare,
+            1,
+        )
+        .unwrap();
+        assert!(shallow.mtp_recurrent_bf16_moe.is_none());
+    }
+
     #[test]
     fn the_mtp_layer_bills_its_experts_through_the_bf16_fused_moe_leaf() {
         // The checkpoint quantizes the 78 body layers' routed experts and
@@ -2748,10 +2908,11 @@ mod tests {
         // path charges it an activation-quantization launch it never makes and
         // a fused-MoE kernel it never calls -- a measured identity belonging to
         // different weights.
-        let routing = RoutingDistribution::uniform(NUM_EXPERTS);
+        let routing = ExpertDemand::popularity(&RoutingDistribution::uniform(NUM_EXPERTS), 1);
         let cfg = build_speculative_configs(
             &model(),
             &parallel(4),
+            &routing,
             &routing,
             &routing,
             false,
@@ -2792,8 +2953,15 @@ mod tests {
 
         // An ordinary deployment never runs the layer, so it carries no config
         // for its experts at all.
-        let ordinary =
-            build_configs(&model(), &parallel(4), &routing, false, Glm52MtpMode::Off).unwrap();
+        let ordinary = build_configs(
+            &model(),
+            &parallel(4),
+            &routing,
+            Some(&routing),
+            false,
+            Glm52MtpMode::Off,
+        )
+        .unwrap();
         assert!(ordinary.mtp_bf16_moe.is_none());
     }
 
@@ -2802,7 +2970,11 @@ mod tests {
         let cfg = build_configs(
             &model(),
             &parallel(4),
-            &RoutingDistribution::uniform(NUM_EXPERTS),
+            &ExpertDemand::popularity(&RoutingDistribution::uniform(NUM_EXPERTS), 1),
+            Some(&ExpertDemand::popularity(
+                &RoutingDistribution::uniform(NUM_EXPERTS),
+                1,
+            )),
             false,
             Glm52MtpMode::Off,
         )
@@ -2823,7 +2995,11 @@ mod tests {
             let asked_for_mtp = build_configs(
                 &model(),
                 &parallel(4),
-                &RoutingDistribution::uniform(NUM_EXPERTS),
+                &ExpertDemand::popularity(&RoutingDistribution::uniform(NUM_EXPERTS), 1),
+                Some(&ExpertDemand::popularity(
+                    &RoutingDistribution::uniform(NUM_EXPERTS),
+                    1,
+                )),
                 false,
                 mode,
             )
@@ -2839,7 +3015,11 @@ mod tests {
         let cfg = build_configs(
             &model(),
             &parallel(4),
-            &RoutingDistribution::uniform(NUM_EXPERTS),
+            &ExpertDemand::popularity(&RoutingDistribution::uniform(NUM_EXPERTS), 1),
+            Some(&ExpertDemand::popularity(
+                &RoutingDistribution::uniform(NUM_EXPERTS),
+                1,
+            )),
             false,
             Glm52MtpMode::Off,
         )
@@ -2887,7 +3067,11 @@ mod tests {
         let cfg = build_configs(
             &model(),
             &parallel(4),
-            &RoutingDistribution::uniform(NUM_EXPERTS),
+            &ExpertDemand::popularity(&RoutingDistribution::uniform(NUM_EXPERTS), 1),
+            Some(&ExpertDemand::popularity(
+                &RoutingDistribution::uniform(NUM_EXPERTS),
+                1,
+            )),
             false,
             Glm52MtpMode::Off,
         )
@@ -3097,13 +3281,14 @@ mod tests {
 
     #[test]
     fn a_speculative_iteration_compiles_its_own_tree_not_the_ordinary_one() {
-        let routing = RoutingDistribution::uniform(NUM_EXPERTS);
+        let routing = ExpertDemand::popularity(&RoutingDistribution::uniform(NUM_EXPERTS), 1);
         let bridge = PerfApiBridge::new_uninit_for_test();
         bridge.enable_enumerate();
 
         let spec_cfg = build_speculative_configs(
             &model(),
             &parallel(4),
+            &routing,
             &routing,
             &routing,
             false,
@@ -3118,8 +3303,15 @@ mod tests {
             expected_speculative_slot_count(4, Glm52MtpMode::IndexShare, 5)
         );
 
-        let ordinary_cfg =
-            build_configs(&model(), &parallel(4), &routing, false, Glm52MtpMode::Off).unwrap();
+        let ordinary_cfg = build_configs(
+            &model(),
+            &parallel(4),
+            &routing,
+            Some(&routing),
+            false,
+            Glm52MtpMode::Off,
+        )
+        .unwrap();
         let ordinary = build(
             "unified".to_string(),
             resolve_configs(&ordinary_cfg),
@@ -3161,6 +3353,7 @@ mod tests {
             &parallel(4),
             &routing,
             &routing,
+            &routing,
             false,
             Glm52MtpMode::FullIndex,
             5,
@@ -3196,13 +3389,14 @@ mod tests {
 
     #[test]
     fn each_recipe_builds_only_its_own_model() {
-        let routing = RoutingDistribution::uniform(NUM_EXPERTS);
+        let routing = ExpertDemand::popularity(&RoutingDistribution::uniform(NUM_EXPERTS), 1);
         let bridge = PerfApiBridge::new_uninit_for_test();
         bridge.enable_enumerate();
 
         let spec_cfg = build_speculative_configs(
             &model(),
             &parallel(4),
+            &routing,
             &routing,
             &routing,
             false,
@@ -3212,8 +3406,15 @@ mod tests {
         .unwrap();
         assert!(build("unified".to_string(), resolve_configs(&spec_cfg), &bridge).is_err());
 
-        let ordinary_cfg =
-            build_configs(&model(), &parallel(4), &routing, false, Glm52MtpMode::Off).unwrap();
+        let ordinary_cfg = build_configs(
+            &model(),
+            &parallel(4),
+            &routing,
+            Some(&routing),
+            false,
+            Glm52MtpMode::Off,
+        )
+        .unwrap();
         assert!(build_speculative(
             "unified".to_string(),
             resolve_configs(&ordinary_cfg),
@@ -3225,7 +3426,7 @@ mod tests {
     #[test]
     fn speculative_necessary_work_maps_cover_the_compiled_locations() {
         use std::collections::BTreeSet;
-        let routing = RoutingDistribution::uniform(NUM_EXPERTS);
+        let routing = ExpertDemand::popularity(&RoutingDistribution::uniform(NUM_EXPERTS), 1);
         let bridge = PerfApiBridge::new_uninit_for_test();
         bridge.enable_enumerate();
         for ep in [4, 8] {
@@ -3255,6 +3456,7 @@ mod tests {
                 let cfg = build_speculative_configs(
                     &model(),
                     &parallel(ep),
+                    &routing,
                     &routing,
                     &routing,
                     false,

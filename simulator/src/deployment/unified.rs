@@ -476,6 +476,7 @@ impl Deployment for UnifiedDeployment {
                 routing_seed,
                 mtp_mode,
                 expert_popularity_file,
+                token_corpus_file,
                 ..
             } => {
                 ensure_hp_or_chunked_worker("GLM-4.5 NVFP4", &g.worker)?;
@@ -488,6 +489,7 @@ impl Deployment for UnifiedDeployment {
                     *routing_seed,
                     *mtp_mode,
                     expert_popularity_file.as_deref(),
+                    token_corpus_file.as_deref(),
                     &gpu_name,
                     MODEL_NAME,
                     bridge,
@@ -512,7 +514,7 @@ impl Deployment for UnifiedDeployment {
                 mtp_mode,
                 draft_tokens,
                 expert_popularity_file,
-                draft_expert_popularity_file,
+                token_corpus_file,
                 ..
             } => {
                 ensure_speculative(&g.worker, *draft_tokens)?;
@@ -530,7 +532,7 @@ impl Deployment for UnifiedDeployment {
                     *routing_seed,
                     *mtp_mode,
                     expert_popularity_file.as_deref(),
-                    draft_expert_popularity_file.as_deref(),
+                    token_corpus_file.as_deref(),
                     *draft_tokens,
                     &gpu_name,
                     MODEL_NAME,
@@ -553,6 +555,7 @@ impl Deployment for UnifiedDeployment {
                 routing_seed,
                 mtp_mode,
                 expert_popularity_file,
+                token_corpus_file,
                 ..
             } => {
                 ensure_hp_or_chunked_worker("GLM-5.2 SGLang NVFP4 pure TP", &g.worker)?;
@@ -564,6 +567,7 @@ impl Deployment for UnifiedDeployment {
                     *routing_seed,
                     *mtp_mode,
                     expert_popularity_file.as_deref(),
+                    token_corpus_file.as_deref(),
                     &gpu_name,
                     MODEL_NAME,
                     bridge,

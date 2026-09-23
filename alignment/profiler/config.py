@@ -63,12 +63,12 @@ class ServerConfig:
     # visible-device and normalized-profile population contracts.
     dp_size: int = 1
     # Number of ranks across which the expert axis is sharded. Every
-    # expert-popularity profile must state this in YAML; other profile kinds do
-    # not consume it.
+    # expert-popularity profile must state this in YAML, and so must a
+    # token_corpus profile that takes the expert-load stream
+    # (`captures_expert_load`); other profile kinds do not consume it.
     expert_parallel_size: int | None = None
     # Number of ranks already represented by each synchronized expert-count
-    # record. This is independent of expert sharding and must also be stated in
-    # every expert-popularity YAML.
+    # record. This is independent of expert sharding and follows the same rule.
     expert_count_reduction_group_size: int | None = None
     served_model_name: str | None = None
     startup_timeout: float = 900.0
@@ -159,6 +159,16 @@ class NsysConfig:
             )
 
 
+#: Every `profile_kind` a profile config may name.
+PROFILE_KINDS = frozenset({"nsys", "workload_metrics", "expert_popularity", "token_corpus"})
+
+#: The passes that observe MoE routing. They launch the server bare with the
+#: engine's timing instrumentation off. Whichever of them aggregates a
+#: rank-reduced marginal needs the expert topology declared; a corpus records
+#: logical expert ids and does not.
+ROUTING_PROFILE_KINDS = frozenset({"expert_popularity", "token_corpus"})
+
+
 @dataclass
 class ProfileConfig:
     """One real-server ground-truth profiling run."""
@@ -171,8 +181,15 @@ class ProfileConfig:
 
     # ``nsys`` is the timing/segment capture consumed by kernel alignment.
     # ``workload_metrics`` is a clean full-run scheduler/request timing pass.
-    # ``expert_popularity`` is a separate, deliberately unprofiled pass whose
-    # synchronization and D2H logging overhead must not contaminate timing.
+    # ``token_corpus`` records the routed experts of every accepted token and
+    # packs them into the corpus the simulator's ``routing: corpus`` samples. It
+    # keeps the per-step expert-load stream on as well, so one pass yields the
+    # corpus, the per-expert marginal, and the ground truth to score both.
+    # ``expert_popularity`` is the same pass without the per-token routes and is
+    # DEPRECATED: a marginal can only be resampled independently, and a serving
+    # batch is not independent. Prefer ``token_corpus`` for anything that drafts.
+    # Both are deliberately unprofiled -- their synchronization and D2H logging
+    # overhead must not contaminate timing.
     profile_kind: str = "nsys"
 
     # --- engine side ---
@@ -199,3 +216,32 @@ class ProfileConfig:
 
     # --- workload: req-frontend consumes the same source trace as the simulator ---
     workload: LoadGeneratorConfig = None  # type: ignore[assignment]
+
+    @property
+    def captures_expert_load(self) -> bool:
+        """Whether this pass will ask the engine for EPLB's expert-load stream.
+
+        That stream is the only per-step view of what the engine actually ran --
+        one rank-synchronized record per forward -- so a routing pass takes it
+        alongside its own product. vLLM's balancedness log is its only source,
+        and vLLM refuses EPLB both without expert parallelism and without more
+        than one rank to balance across, so a deployment missing either cannot
+        produce it. Asking for it there would not yield a marginal; it would
+        stop the server from starting.
+
+        Asking and requiring are the same question: a pass that asked for the
+        stream and got nothing is a defect, not a deployment that happens to
+        have no marginal.
+
+        EPLB also needs the model to implement it, which only loading the model
+        can tell. A model that does not is declared the engine's own way, with
+        ``--no-enable-eplb``, and its pass records routes alone.
+        """
+        extra_args = self.server.extra_args
+        return (
+            self.profile_kind in ROUTING_PROFILE_KINDS
+            and self.engine == "vllm"
+            and "--enable-expert-parallel" in extra_args
+            and "--no-enable-eplb" not in extra_args
+            and self.server.tp_size * self.server.dp_size > 1
+        )

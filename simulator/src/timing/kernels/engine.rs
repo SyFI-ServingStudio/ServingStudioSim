@@ -132,6 +132,21 @@ pub trait KernelSpec: 'static {
         grid: &SweepGrid,
         backend: &'static str,
     ) -> Vec<ArgsPayload>;
+
+    /// Reject a config whose external inputs cannot be read, before anything
+    /// builds on them.
+    ///
+    /// `enumerate` has no error channel -- it fills a grid, and a kernel with
+    /// nothing to say about a cell has no way to say so -- which is right for
+    /// the arithmetic every kernel does there, but not for a config that names
+    /// a file. An arch builder proves such a file readable when it constructs
+    /// the config; a config deserialized straight from JSON never went through
+    /// one, so this runs at that boundary instead.
+    ///
+    /// Default: nothing to check.
+    fn validate_config(_config: &Self::Config) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 /// Generic kernel struct. Per-kernel files export
@@ -468,6 +483,7 @@ where
 {
     let config: S::Config = serde_json::from_value(config)
         .map_err(|e| anyhow::anyhow!("config does not match {} KernelConfig: {e}", S::KIND))?;
+    S::validate_config(&config)?;
     let kernel = Kernel::<S>::build(S::KIND.to_string(), config, bridge)?;
     Ok(Box::new(kernel))
 }
@@ -485,6 +501,7 @@ where
 {
     let config: S::Config = serde_json::from_value(config)
         .map_err(|e| anyhow::anyhow!("config does not match {} KernelConfig: {e}", S::KIND))?;
+    S::validate_config(&config)?;
     let grid_axes = S::sweep_grid(&config).axes().to_vec();
     Ok((
         config.describe_config(),

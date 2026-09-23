@@ -64,6 +64,7 @@ _PROFILE_ARTIFACTS = {
     "nsys": ("profile_result.json", "parsed.json", "kernel_sequences.json"),
     "workload_metrics": ("profile_result.json",),
     "expert_popularity": ("profile_result.json",),
+    "token_corpus": ("profile_result.json", "token_corpus/manifest.json"),
 }
 _PIPELINE_ARTIFACTS = {
     TIMING_PREDICT_PHASE: ("timing_predict_input_manifest.json", "prediction.cases.json"),

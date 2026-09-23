@@ -34,6 +34,7 @@ from launcher.alignment_campaign import check as check_module
 from launcher.alignment_campaign import compare as compare_module
 from launcher.alignment_campaign import execute, label
 from launcher.alignment_campaign import extract as extract_module
+from launcher.alignment_campaign import render as render_module
 from launcher.alignment_campaign.metrics import (
     REPORT_LOCATIONS,
     SUPPORTED_SCHEMAS,
@@ -110,18 +111,18 @@ def test_campaign_rejects_popularity_files_without_custom_routing(pack, routing)
     variant = dataclasses.replace(original, arch=arch)
     patched = dataclasses.replace(pack, variants={variant.name: variant})
     findings = check_module._check_expert_popularity(patched)
-    assert any(item.level == "error" and "require routing=custom" in item.message
+    assert any(item.level == "error" and "requires routing=popularity" in item.message
                for item in findings)
 
 
 @pytest.mark.parametrize("reference", [None, "", 42])
 def test_campaign_custom_routing_requires_a_file_path(pack, reference):
     original = pack.variant_of(pack.cases[0])
-    arch = {**original.arch, "routing": "custom", "expert_popularity_file": reference}
+    arch = {**original.arch, "routing": "popularity", "expert_popularity_file": reference}
     variant = dataclasses.replace(original, arch=arch)
     patched = dataclasses.replace(pack, variants={variant.name: variant})
     findings = check_module._check_expert_popularity(patched)
-    assert any(item.level == "error" and "routing=custom requires" in item.message
+    assert any(item.level == "error" and "routing=popularity requires" in item.message
                for item in findings)
 
 
@@ -250,6 +251,92 @@ def test_render_writes_every_phase_config(pack, tmp_path):
         stem = phase if variant.pass_named(phase) else PHASE_CONFIG_STEMS[phase]
         assert (rendered.directory / f"{stem}.yaml").is_file(), phase
     assert (rendered.directory / "trace.csv").is_file()
+
+
+def test_a_corpus_pass_renders_on_the_protocol_that_returns_routes(pack, tmp_path):
+    """A `vllm_tokens` campaign gains a corpus pass without a second variant.
+
+    The timed passes keep the campaign's backend; only the capture switches.
+    """
+    case = pack.cases[0]
+    original = pack.variant_of(case)
+    timed = next(item for item in original.profile_passes if item.kind != "token_corpus")
+    variant = dataclasses.replace(
+        original,
+        backend="vllm_tokens",
+        server={
+            **original.server,
+            "expert_parallel_size": 4,
+            "expert_count_reduction_group_size": 4,
+        },
+        profile_passes=(
+            *original.profile_passes,
+            dataclasses.replace(timed, kind="token_corpus", name="p_corpus"),
+        ),
+    )
+    host = check_module.host_for(pack, None)
+
+    def backend(pass_name):
+        document = render_module.profile_document(
+            pack, case, variant, host, pass_name, REPO_ROOT
+        )
+        return document["workload"]["backend"]["type"]
+
+    assert backend("p_corpus") == "openai"
+    assert backend(timed.name) == "vllm_tokens"
+
+
+def test_render_resolves_a_corpus_path_the_way_it_resolves_a_marginal(pack, tmp_path):
+    """A pack-relative corpus reaches the simulator as a path it can resolve.
+
+    `TokenCorpusConfig::from_manifest` resolves against the process, not the
+    pack, so leaving the authored string alone fails the build after the capture
+    it depends on has already run.
+    """
+    import dataclasses
+
+    case = pack.cases[0]
+    variant = pack.variant_of(case)
+    corpus = dataclasses.replace(
+        variant,
+        arch={
+            **{k: v for k, v in variant.arch.items() if k != "expert_popularity_file"},
+            "routing": "corpus",
+            "token_corpus_file": "token_corpus/manifest.json",
+        },
+    )
+
+    document = render_module.simulation_document(pack, case, corpus, tmp_path, REPO_ROOT)
+
+    rendered = document["pools"]["main"]["groups"][0]["arch"]["token_corpus_file"]
+    assert rendered != "token_corpus/manifest.json"
+    assert rendered.endswith("token_corpus/manifest.json")
+    assert (REPO_ROOT / rendered) == (pack.root / "token_corpus/manifest.json").resolve()
+
+
+def test_render_leaves_a_hub_reference_for_the_launcher_to_fetch(pack, tmp_path):
+    """`hf://` is resolved during launcher expansion; it is not a pack path."""
+    import dataclasses
+
+    reference = "hf://uw/corpora@0123456789abcdef0123456789abcdef01234567/glm53/manifest.json"
+    case = pack.cases[0]
+    corpus = dataclasses.replace(
+        pack.variant_of(case),
+        arch={
+            **{
+                k: v
+                for k, v in pack.variant_of(case).arch.items()
+                if k != "expert_popularity_file"
+            },
+            "routing": "corpus",
+            "token_corpus_file": reference,
+        },
+    )
+
+    document = render_module.simulation_document(pack, case, corpus, tmp_path, REPO_ROOT)
+
+    arch = document["pools"]["main"]["groups"][0]["arch"]
+    assert arch["token_corpus_file"] == reference
 
 
 def test_render_never_leaks_a_stub_host_into_the_pack(pack, tmp_path):
@@ -455,6 +542,7 @@ def test_plan_skips_a_complete_phase_and_refresh_reselects_it(pack, tmp_path):
     artifacts = tmp_path / case.slug / phase
     artifacts.mkdir(parents=True)
     for name in execute._artifacts_for(variant, phase):
+        (artifacts / name).parent.mkdir(parents=True, exist_ok=True)
         (artifacts / name).write_text("{}")
     mark_complete(artifacts)
 

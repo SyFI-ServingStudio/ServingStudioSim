@@ -15,6 +15,7 @@ use crate::common::Fabric;
 use crate::op::attention::DsaSparseMlaExactVarlenConfig;
 use crate::op::Op;
 use crate::timing::bridge::DType;
+use crate::timing::expert_demand::ExpertDemand;
 use crate::timing::kernels::{
     AllReduceFusionKernel, AllReduceFusionKernelConfig, AllReduceFusionKernelInput,
     AllReduceFusionSpec, AllReduceKernel, AllReduceKernelConfig, AllReduceKernelInput,
@@ -24,7 +25,6 @@ use crate::timing::kernels::{
     ResidualRmsNormKernelConfig, ResidualRmsNormKernelInput, SingleGemmKernel,
     SingleGemmKernelConfig, SingleGemmKernelInput,
 };
-use crate::timing::routing::RoutingDistribution;
 use crate::timing::{
     BuildError, CostManifest, CostNode, CostTree, CostTreeBuilder, Dim, Evaluator, FlatCostNode,
     LeafMetrics, PerfApiBridge, Probe, SlotInput,
@@ -253,7 +253,7 @@ fn attention_config(
 pub fn build_configs(
     model: &Glm52ModelCfg,
     parallel: &Glm52SglangNvfp4TpDsaMoeParallel,
-    routing: &RoutingDistribution,
+    demand: &ExpertDemand,
     fp8: bool,
     mtp_mode: Glm52MtpMode,
 ) -> Result<Glm52SglangNvfp4TpDsaMoeConfigs, BuildError> {
@@ -276,10 +276,10 @@ pub fn build_configs(
             parallel.max_model_len,
         )));
     }
-    if routing.num_experts() != NUM_EXPERTS {
+    if demand.num_experts() != NUM_EXPERTS as usize {
         return Err(fit_failed(format!(
-            "routing has {} experts, expected {NUM_EXPERTS}",
-            routing.num_experts()
+            "expert demand covers {} experts, expected {NUM_EXPERTS}",
+            demand.num_experts()
         )));
     }
     if fp8 {
@@ -344,11 +344,12 @@ pub fn build_configs(
             topk_group: 1,
             routed_scaling_numerator: 5,
             routed_scaling_denominator: 2,
-            layerwise_global_ppm: Vec::new(),
+            expert_demand: ExpertDemand::Popularity {
+                layerwise_global_ppm: Vec::new(),
+            },
             folded_rank_position: 0,
         },
-        routing,
-        NUM_LAYERS - NUM_DENSE_LAYERS,
+        demand.clone(),
     );
 
     Ok(Glm52SglangNvfp4TpDsaMoeConfigs {
@@ -1422,6 +1423,7 @@ mod tests {
 
     use super::*;
     use crate::arch::contract::ArchGroupInput;
+    use crate::timing::routing::RoutingDistribution;
 
     fn exact_json_value() -> serde_json::Value {
         let indexer_types: Vec<&str> = (0..NUM_LAYERS)
@@ -1485,7 +1487,7 @@ mod tests {
         build_configs(
             &model(),
             &parallel(4),
-            &RoutingDistribution::uniform(NUM_EXPERTS),
+            &ExpertDemand::popularity(&RoutingDistribution::uniform(NUM_EXPERTS), 1),
             false,
             mtp_mode,
         )
@@ -1786,7 +1788,7 @@ mod tests {
 
     #[test]
     fn invalid_parallel_and_batch_contracts_fail_closed() {
-        let routing = RoutingDistribution::uniform(NUM_EXPERTS);
+        let routing = ExpertDemand::popularity(&RoutingDistribution::uniform(NUM_EXPERTS), 1);
         for tp_size in [0, 1, 2, 3, 6, 8, 16] {
             assert!(build_configs(
                 &model(),

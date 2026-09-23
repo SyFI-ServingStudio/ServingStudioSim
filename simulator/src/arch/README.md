@@ -150,9 +150,32 @@ for selector compatibility and migration rules.
 
 ## MoE routing configuration
 
-`routing: custom` requires `expert_popularity_file` and loads its measured
-distribution. `uniform` (the schema default) and seeded `random` are synthetic
-and reject popularity files. Migrate older `uniform` + file configs to `custom`.
-A missing or invalid custom file fails; the runtime never falls back to uniform.
-Speculative models require both target and draft popularity files together.
-AFD FFN selectors without a popularity-file field support only synthetic routing.
+`routing` names where a MoE arch's routed demand comes from.
+
+`uniform` (the schema default) and seeded `random` are synthetic marginals and
+reject every measured artifact. `popularity` requires `expert_popularity_file`
+and loads a measured per-expert marginal; migrate older `uniform` + file configs
+to it. `corpus` requires `token_corpus_file` and samples recorded per-token
+routes. A missing or invalid artifact fails; the runtime never falls back to
+uniform. AFD FFN selectors with no artifact field support only synthetic
+routing.
+
+Resampling a marginal draws tokens independently, and a serving batch is not
+independent: under speculative decoding one request submits `draft_tokens + 1`
+consecutive positions that route almost alike. A grouped GEMM is billed partly
+by how many of a rank's expert groups are non-empty, which is a statement about
+co-occurrence and so unanswerable from a marginal — that is what `corpus` is
+for, and it only differs from `popularity` where the verify width exceeds one.
+
+The two sources also differ in what they can say about a speculative model's
+MTP layer. A corpus is layer-indexed, so the body MoE and the MTP MoE are two
+slices of one file and the MTP layer's own routing is measured. A marginal has
+already summed the layer axis away and was captured over the body's layers, so
+the MTP layer folds that profile's layer-summed distribution -- the same
+evidence at the only resolution a marginal has. One file either way; there is no
+separate draft profile.
+
+A corpus records the body's routed layers, plus one MTP slot when the capture
+ran a drafter. A build that prices an MTP layer needs that slot; a build that
+does not may still read a drafted capture, which is how the same traffic is
+priced without speculation.

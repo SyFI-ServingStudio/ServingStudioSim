@@ -32,7 +32,11 @@ pools:
           ep_size: 4
           nvl_num_gpu: 4
           max_model_len: 8192
-          routing: uniform
+          # Recorded per-token routes of this deployment (GLM-5.2 NVFP4, vLLM
+          # TP4 EP4, MTP-5), sampled in verify-width groups; the MTP layer is the
+          # corpus's last layer. See skills/operate-run-simulation/references/moe-routing.md.
+          routing: corpus
+          token_corpus_file: hf://UW-SyFI/servingstudio-corpora@43eda3dceb647df4802da27fb4fef3afc8a68fda/glm52_nvfp4_mtp5/manifest.json
           mtp_mode: index_share
           draft_tokens: 5
         worker:

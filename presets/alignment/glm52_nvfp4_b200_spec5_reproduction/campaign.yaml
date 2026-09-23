@@ -43,9 +43,8 @@
         "fp8": false,
         "ep_size": 4,
         "nvl_num_gpu": 4,
-        "routing": "custom",
+        "routing": "popularity",
         "expert_popularity_file": "../glm52_nvfp4_b200_spec5/expert_popularity.json",
-        "draft_expert_popularity_file": "../glm52_nvfp4_b200_spec5/draft_expert_popularity.json",
         "mtp_mode": "full_index",
         "draft_tokens": 5
       },
@@ -104,9 +103,8 @@
         "fp8": false,
         "ep_size": 4,
         "nvl_num_gpu": 4,
-        "routing": "custom",
+        "routing": "popularity",
         "expert_popularity_file": "../glm52_nvfp4_b200_spec5/expert_popularity.json",
-        "draft_expert_popularity_file": "../glm52_nvfp4_b200_spec5/draft_expert_popularity.json",
         "mtp_mode": "full_index",
         "draft_tokens": 5
       },
@@ -165,9 +163,8 @@
         "fp8": false,
         "ep_size": 8,
         "nvl_num_gpu": 8,
-        "routing": "custom",
+        "routing": "popularity",
         "expert_popularity_file": "tp8_target_popularity.json",
-        "draft_expert_popularity_file": "tp8_draft_popularity.json",
         "mtp_mode": "full_index",
         "draft_tokens": 5
       },

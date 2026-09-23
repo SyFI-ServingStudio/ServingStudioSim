@@ -29,6 +29,41 @@ Each implementer brief must be a narrow leaf task that names the exact `impl-*`
 skill to use and the evidence required for you, the orchestrator, to verify
 completion.
 
+## Several kernels at once
+
+A split table usually names more than one *new dedicated kernel*. They are
+independent work — different kinds, different runner files, different
+`profile.db` tables — so run them in parallel, **in batches of 3**: launch three
+subagents, wait for that batch to close out, then launch the next three. Who
+fans out depends on the role you are in:
+
+- **Only agent** (nobody above you, nobody below). Launch one subagent per
+  kernel, three at a time; each runs this skill end to end for its own kernel.
+  Do not walk the list yourself.
+- **Orchestrator.** Hand over **three kernels per brief**, and issue the next
+  brief after that batch closes out. One kernel per brief serializes work that
+  has no ordering constraint; the whole table in one brief hands down a queue
+  the implementer has to bound anyway.
+- **Implementer handed a batch.** Fan out — one subagent per kernel, all three
+  at once. Receiving several kernels is not an instruction to do them in order.
+
+Three, not all of them: each agent wants a GPU for its profiling submission and
+its own worktree build, so an unbounded fan-out contends for both and you get
+measurements taken on a busy card. Three also keeps the batch small enough to
+verify before the next one starts.
+
+Before any fan-out, take the reuse verdict below **once for the whole set**: two
+agents must not independently mint the same new kind. Then sequence only what
+genuinely depends — a new backend of a kind another agent is still creating.
+
+Two or more agents writing one repo need `dev-orchestrate-parallel-subagents`:
+a git worktree each, or they clobber each other on `mod.rs`, `__init__.py`, and
+the registry. Read it before launching.
+
+This does not override `top-add-new-arch`'s largest-share-first stop rule. That
+rule decides **which** kernels are worth building; the ones that clear it go in
+parallel, not one after another.
+
 ## Steps
 
 Before choosing either path, require a reuse verdict. Compare the nearest

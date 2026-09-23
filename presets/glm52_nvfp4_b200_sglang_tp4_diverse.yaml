@@ -29,7 +29,7 @@ pools:
           fp8: false
           tp_size: 4
           max_model_len: 131072
-          routing: custom
+          routing: popularity
           routing_seed: null
           expert_popularity_file: presets/alignment/glm52_nvfp4_b200_sglang_tp4/expert_popularity.json
           mtp_mode: "off"

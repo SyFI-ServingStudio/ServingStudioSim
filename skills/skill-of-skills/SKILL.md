@@ -56,16 +56,18 @@ completion condition should be obvious.
 ## Current Tree
 
 ```text
-top-add-new-arch - add a whole model architecture end to end (explore → split → build L1–L4)
+top-add-new-arch - add a whole model architecture end to end (capture → split → build L1–L4, largest kernel first)
+├── operate-run-alignment - Phase 0: capture the real vLLM/SGLang kernel sequence that drives the split (profile phase only; needs no arch)
 ├── top-split-model-into-kernels - explore + break the forward into the kernel/op sequence
 ├── top-add-kernel - create each new L1 kernel (L1-Python impl-register-kernel + L1-Rust impl-wire-kernel-to-rust)
 ├── impl-compose-op - compose kernels into L2 ops
 ├── impl-compose-worklet - compose ops into L3 sync-section worklets
 ├── impl-compose-arch - wire worklets into the L4 model_arch cost file
 ├── impl-wire-new-arch - integrate the arch into dispatch/build/timing-predict/deployment (Phase 3)
-└── impl-add-model-work-label - add the independent model.work label and semantic location maps for R6/R7 (Phase 4, before Validate)
+├── impl-add-model-work-label - add the independent model.work label and semantic location maps for R6/R7 (Phase 4, before Validate)
+└── top-align-with-framework - Phase 5: close the loop on the same capture; ranks which placeholder to promote next
 
-top-add-kernel - add an L1 kernel end to end
+top-add-kernel - add an L1 kernel end to end (several at once: fan out one subagent per kernel, 3 at a time)
 ├── orchestrator-add-kernel-to-python-profile - plan and verify Python profiling
 │   ├── dev-explore-kernel - search vLLM/SGLang/FlashInfer for a source to wrap (shared)
 │   └── impl-register-kernel - register a Python profiler kind or backend
@@ -77,16 +79,18 @@ top-explore-models - understand a new model or checkpoint from HF/public sources
 ├── dev-calculate-kv-cache-capacity - calculate KV cache bytes and capacity
 └── dev-lookup-transformers-model - inspect local Transformers/Torch semantics
 
-top-split-model-into-kernels - break a model forward into the ServingStudioSim kernel sequence
+top-split-model-into-kernels - break a model forward into the ServingStudioSim kernel sequence, ordered by measured share
 ├── top-explore-models - step 1: establish the architecture (entry above)
+├── operate-run-alignment - measured launch granularity, when no capture was supplied (profile phase only)
 ├── dev-lookup-transformers-model - what math each op computes (shared)
-└── dev-explore-kernel - whether a real fused kernel exists in the ecosystem (shared)
+└── dev-explore-kernel - which callable to wrap; and, with no capture, whether a real fused kernel exists (shared)
 
 top-align-with-framework - consume the Align ServingStudioSim to framework side of shared evidence to evaluate simulator fidelity (kernel-only deviation + missing-chunk coverage, GPU duty cycle, TTFT/TPOT)
 ├── operate-run-alignment - produce the shared labeled evidence (Step 0, below)
 ├── operate-align-moe-kernel - diagnose one fused MoE kernel from exact input through full-run popularity
 ├── impl-validate-kernel-cache - fix a wrong-shape kernel cost surfaced by Check 1
-└── top-add-kernel - add/repair a kernel whose backend the sim mismodels
+├── top-add-kernel - add/repair a kernel whose backend the sim mismodels
+└── top-split-model-into-kernels - re-decide the home of an op the split missed or wrongly folded
 
 top-compose-real-framework-from-sim - actively build a real serving framework from ServingStudioSim evidence in a Tick (sim) / Tock (one measured trial) / Probe (attribute and decide) loop; the orchestrator owns the workflow and delegates only actual code writing
 ├── top-explore-models - establish exact checkpoint architecture and support requirements
@@ -107,6 +111,7 @@ operate-use-analyzer - select, read, interpret, and cite Analyzer-owned simulati
 operate-run-alignment - produce one shared ServingStudioSim↔framework comparison for vLLM or SGLang; Align ServingStudioSim to framework through top-align-with-framework, or Align framework to ServingStudioSim through top-compose-real-framework-from-sim
 operate-align-moe-kernel - diagnose one existing fused MoE kernel with exact-input, iteration-popularity, and full-run comparisons
 operate-gpu-spec - query or update the GPU spec catalog
+operate-manage-jit-and-autotune-caches - reuse JIT/autotune work across engine restarts and profiling worker processes instead of rebuilding it every time
 operate-profile-sim-speed - profile simulator wallclock speed
 operate-profile-serving-run - capture a comparable bounded profile of a real serving process and attribute its wall time to named engine phases (NVTX readiness + instrumentation contract, node-level CUDA-graph tracing, nsys SQLite aggregation)
 operate-profile-existing-kernel - query or fill registered profiler rows

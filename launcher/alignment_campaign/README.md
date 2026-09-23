@@ -33,13 +33,14 @@ N copies to keep in sync. Tolerances are a judgement about one matrix, so they
 live in the pack. Machine facts live in the host profile, so moving a matrix to
 another box is one file.
 
-Measured routing inputs require `routing: custom` alongside
-`expert_popularity_file` in the variant arch. Synthetic `uniform`/`random`
-routing must omit popularity files. Speculative models require target and draft
-files together. `check` rejects mismatched selectors and missing file paths
-before a simulation is launched. Rendering preserves the routing selector and
-converts pack-relative file paths to simulator paths; it never falls back to
-uniform.
+Measured routing inputs require `routing: popularity` alongside
+`expert_popularity_file`, or `routing: corpus` alongside `token_corpus_file`, in
+the variant arch. Synthetic `uniform`/`random` routing must omit both. One file
+serves a speculative model's body and MTP layers either way. `check` rejects a
+selector naming the other kind's file, a missing or unreadable artifact, an
+unsupported schema version, and a corpus manifest whose payload is not beside
+it. Rendering preserves the routing selector and converts pack-relative file
+paths to simulator paths; it never falls back to uniform.
 
 ## Verbs
 

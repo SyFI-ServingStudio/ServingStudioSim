@@ -17,6 +17,8 @@ from typing import Any
 
 from alignment.load_generator.config import LoadGeneratorConfig
 from alignment.profiler.config import (
+    PROFILE_KINDS,
+    ROUTING_PROFILE_KINDS,
     IdleWaitConfig,
     NsysConfig,
     ProfileConfig,
@@ -199,10 +201,10 @@ def load_profile_config(path: Path, *, require_python_runtime: bool = True) -> P
             "python_runtime.environment.FLASHINFER_DISABLE_JIT: '1' so a missing "
             "prebuilt module fails before runtime compilation"
         )
-    if config.profile_kind not in {"nsys", "expert_popularity", "workload_metrics"}:
+    if config.profile_kind not in PROFILE_KINDS:
         raise ValueError(
-            "invalid profile config: profile_kind must be 'nsys', "
-            f"'expert_popularity', or 'workload_metrics', got {config.profile_kind!r}"
+            "invalid profile config: profile_kind must be one of "
+            f"{sorted(PROFILE_KINDS)}, got {config.profile_kind!r}"
         )
     visible_devices = [
         device.strip() for device in config.cuda_visible_devices.split(",") if device.strip()
@@ -212,11 +214,57 @@ def load_profile_config(path: Path, *, require_python_runtime: bool = True) -> P
         "expert_parallel_size": config.server.expert_parallel_size,
         "expert_count_reduction_group_size": (config.server.expert_count_reduction_group_size),
     }
-    if config.profile_kind == "expert_popularity" and any(
+    # Recording per-token routes is a fork-specific server capability, and only
+    # the vLLM fork has it. Rejecting the combination here costs nothing; letting
+    # it through spends a scheduled job to die in the other engine's argparse.
+    if config.profile_kind == "token_corpus" and config.engine != "vllm":
+        raise ValueError(
+            f"invalid profile config: profile_kind token_corpus requires engine vllm, "
+            f"got {config.engine!r}"
+        )
+    if config.profile_kind == "token_corpus" and not config.workload.backend.returns_routed_experts:
+        raise ValueError(
+            "invalid profile config: profile_kind token_corpus needs a workload backend "
+            f"that returns routed experts, and {config.workload.backend.type!r} does not"
+        )
+    runtime_env = config.python_runtime.environment if config.python_runtime else {}
+    if config.profile_kind == "token_corpus" and runtime_env.get("VLLM_USE_V2_MODEL_RUNNER") == "1":
+        # The capturer lives in the V1 GPU model runner; the server refuses the
+        # combination at startup, after the job has already been scheduled.
+        raise ValueError(
+            "invalid profile config: profile_kind token_corpus needs the V1 model "
+            "runner; drop VLLM_USE_V2_MODEL_RUNNER=1 from python_runtime.environment"
+        )
+    opted_out_of_eplb = "--no-enable-eplb" in config.server.extra_args
+    if config.profile_kind == "expert_popularity" and opted_out_of_eplb:
+        raise ValueError(
+            "invalid profile config: profile_kind expert_popularity reads EPLB's "
+            "expert-load stream, which --no-enable-eplb turns off; use token_corpus"
+        )
+    # Expert parallelism is declared twice -- as a server flag and as the degree
+    # the records are reduced over -- and the two must agree. Disagreeing is how
+    # a capture ends up paying for an expert-load stream it cannot aggregate, or
+    # aggregating over a topology the server never ran.
+    if config.profile_kind in ROUTING_PROFILE_KINDS and config.engine == "vllm":
+        flagged = "--enable-expert-parallel" in config.server.extra_args
+        declared = config.server.expert_parallel_size
+        if declared is not None and flagged != (declared > 1):
+            raise ValueError(
+                "invalid profile config: server.expert_parallel_size "
+                f"{declared} and --enable-expert-parallel "
+                f"{'present' if flagged else 'absent'} disagree about expert parallelism"
+            )
+    # The topology is what the marginal is reduced over, so it is required by
+    # the pass whose product that is, and by any routing pass that will take the
+    # expert-load stream alongside its own product -- capturing that stream and
+    # then discarding it for want of two declared integers is the server paying
+    # EPLB's synchronization cost for nothing. A corpus capture with neither
+    # keeps working: it records logical expert ids and needs no topology.
+    if (config.profile_kind == "expert_popularity" or config.captures_expert_load) and any(
         value is None for value in expert_topology.values()
     ):
         raise ValueError(
-            "invalid profile config: expert_popularity requires explicit "
+            f"invalid profile config: {config.profile_kind} requires explicit "
             "server.expert_parallel_size and "
             "server.expert_count_reduction_group_size"
         )

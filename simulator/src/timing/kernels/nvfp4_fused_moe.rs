@@ -5,12 +5,10 @@
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::CacheKind;
+use crate::timing::expert_demand::ExpertDemand;
 use crate::timing::kernels::engine::{register_kernel, KernelSpec};
-use crate::timing::routing::sample_and_fold_layerwise_topk_expert_counts;
 use crate::timing::sweep::{Axis, SweepGrid};
 use crate::timing::{Dim, KernelConfig, SweepCoords};
-
-const FOLD_SEED: u64 = 0xF01D_5EED;
 
 #[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Nvfp4FusedMoeKernelConfig {
@@ -31,8 +29,8 @@ pub struct Nvfp4FusedMoeKernelConfig {
     pub topk_group: u32,
     pub routed_scaling_numerator: u32,
     pub routed_scaling_denominator: u32,
-    /// Identity-free global popularity for every modeled MoE layer.
-    pub layerwise_global_ppm: Vec<Vec<u32>>,
+    /// Where the routed demand for a profiled shape comes from.
+    pub expert_demand: ExpertDemand,
     /// Position in the active-count-ranked EP workload list. This chooses a
     /// representative local histogram without adding physical rank identity to
     /// the Python profiler key.
@@ -52,15 +50,21 @@ impl KernelSpec for Nvfp4FusedMoeSpec {
 
     const KIND: KernelKind = "nvfp4_fused_moe";
 
-    fn sweep_grid(_config: &Self::Config) -> SweepGrid {
-        SweepGrid::new(vec![Axis::chain([
+    fn sweep_grid(config: &Self::Config) -> SweepGrid {
+        SweepGrid::new(vec![config.expert_demand.token_axis(Axis::chain([
             Axis::values([1, 4, 8, 16, 32, 48]),
             Axis::token_axis(),
-        ])])
+        ]))])
     }
 
     fn cache_kind(_backend: &'static str) -> CacheKind {
         CacheKind::Cache1DLinear
+    }
+
+    /// The corpus arm names a payload on disk, and `enumerate` has no way to
+    /// report that it moved.
+    fn validate_config(config: &Self::Config) -> anyhow::Result<()> {
+        config.expert_demand.prepare().map(|_| ())
     }
 
     fn enumerate(
@@ -68,34 +72,23 @@ impl KernelSpec for Nvfp4FusedMoeSpec {
         grid: &SweepGrid,
         backend: &'static str,
     ) -> Vec<ArgsPayload> {
-        let num_experts = config.num_experts.get() as usize;
-        let num_local_experts = config.num_local_experts.get() as usize;
-        assert!(num_local_experts > 0, "num_local_experts must be non-zero");
-        assert_eq!(
-            num_experts % num_local_experts,
-            0,
-            "local experts must evenly partition global experts"
-        );
-        let rank_offset = config.folded_rank_position as usize * num_local_experts;
-        assert!(
-            rank_offset + num_local_experts <= num_experts,
-            "folded_rank_position must select an EP rank"
-        );
+        // Resolved once: a token corpus is hundreds of megabytes on disk and
+        // the grid has tens of points. The arch builder has already proven it
+        // readable, so a failure here is a corpus that changed underneath a
+        // built config.
+        let demand = config
+            .expert_demand
+            .prepare()
+            .expect("validate_config proved this source readable");
 
         grid.expand_1d(|num_tokens| {
-            let mut per_expert_batches = sample_and_fold_layerwise_topk_expert_counts(
-                &config.layerwise_global_ppm,
+            let per_expert_batches = demand.per_expert_batches(
                 config.top_k,
                 num_tokens as u32,
-                num_local_experts,
-                FOLD_SEED,
+                config.num_experts.get() as usize,
+                config.num_local_experts.get() as usize,
+                config.folded_rank_position,
             );
-            assert_eq!(
-                per_expert_batches.len(),
-                num_experts,
-                "routing profile width must match num_experts"
-            );
-            per_expert_batches.rotate_left(rank_offset);
 
             ArgsPayload::new()
                 .with("backend", backend)
@@ -145,14 +138,16 @@ mod tests {
             topk_group: 1,
             routed_scaling_numerator: 5,
             routed_scaling_denominator: 2,
-            layerwise_global_ppm: vec![
-                vec![
-                    250_000, 200_000, 150_000, 100_000, 100_000, 80_000, 70_000, 50_000,
+            expert_demand: ExpertDemand::Popularity {
+                layerwise_global_ppm: vec![
+                    vec![
+                        250_000, 200_000, 150_000, 100_000, 100_000, 80_000, 70_000, 50_000,
+                    ],
+                    vec![
+                        220_000, 200_000, 160_000, 120_000, 100_000, 80_000, 70_000, 50_000,
+                    ],
                 ],
-                vec![
-                    220_000, 200_000, 160_000, 120_000, 100_000, 80_000, 70_000, 50_000,
-                ],
-            ],
+            },
             folded_rank_position: 0,
         }
     }
@@ -181,6 +176,32 @@ mod tests {
         assert!(!fields.contains_key("ep_rank"));
         assert!(!fields.contains_key("local_expert_offset"));
         assert!(!fields.contains_key("launch_role"));
+    }
+
+    #[test]
+    fn a_corpus_that_moved_is_reported_rather_than_panicking_the_query() {
+        // `kernel-query` deserializes a config nothing built, so the file it
+        // names may be gone. `enumerate` cannot say so; this is where it is said.
+        let mut moved = config();
+        moved.expert_demand = crate::timing::expert_demand::ExpertDemand::Corpus(
+            crate::timing::token_corpus::TokenCorpusConfig {
+                schema_version: 1,
+                data_file: "/nonexistent/routes.u16".into(),
+                num_tokens: 128,
+                num_layers: 4,
+                num_experts: 64,
+                top_k: 8,
+                checksum_fnv1a64: 0,
+                group_size: 8,
+                layer_start: 0,
+                layer_end: 4,
+                seed: 0,
+                sampling_candidates: 16,
+            },
+        );
+
+        let error = Nvfp4FusedMoeSpec::validate_config(&moved).expect_err("a moved corpus");
+        assert!(format!("{error:#}").contains("token corpus data"));
     }
 
     #[test]

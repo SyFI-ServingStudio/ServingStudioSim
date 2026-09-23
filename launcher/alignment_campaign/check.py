@@ -385,45 +385,62 @@ def _check_label_rules(pack: Pack) -> list[Finding]:
     return findings
 
 
+#: Each measured routing kind, the arch field naming its artifact, and the
+#: schema versions this simulator reads. `check` exists to fail a pack before it
+#: reaches a GPU, so both kinds are validated, not only the older one.
+_ROUTING_ARTIFACTS = {
+    "popularity": ("expert_popularity_file", (2, 3, 4)),
+    "corpus": ("token_corpus_file", (1,)),
+}
+
+
 def _check_expert_popularity(pack: Pack) -> list[Finding]:
     findings: list[Finding] = []
     for name, variant in pack.variants.items():
-        speculative = variant.arch.get("type") == "glm52_vllm_nvfp4_dsa_moe_speculative"
-        paths = {"target": "expert_popularity_file", "draft": "draft_expert_popularity_file"}
-        references = [variant.arch.get(key) for key in paths.values()]
         routing = variant.arch.get("routing", "uniform")
-        where_arch = f"variants.{name}.arch"
-        if routing == "custom":
-            required = paths.values() if speculative else (paths["target"],)
-            for key in required:
-                reference = variant.arch.get(key)
-                if not isinstance(reference, str) or not reference.strip():
-                    findings.append(Finding("error", f"{where_arch}.{key}",
-                                            "routing=custom requires a non-empty popularity file path"))
-        elif any(reference is not None for reference in references):
-            findings.append(Finding("error", f"{where_arch}.routing",
-                                    "popularity files require routing=custom; uniform/random must omit them"))
-        if speculative and any(references) and not all(references):
-            findings.append(Finding("error", f"variants.{name}.arch", "target and draft popularity files must be provided together"))
-        for role, key in paths.items():
+        expected_key, versions = _ROUTING_ARTIFACTS.get(routing, (None, ()))
+        for key, _ in _ROUTING_ARTIFACTS.values():
             reference = variant.arch.get(key)
-            if not isinstance(reference, str) or not reference:
-                continue
             where = f"variants.{name}.arch.{key}"
-            path = pack.root / reference
-            if not path.is_file():
-                findings.append(Finding("error", where, f"missing: {reference}"))
-                continue
-            try:
-                document = json.loads(path.read_text())
-            except json.JSONDecodeError as exc:
-                findings.append(Finding("error", where, f"unreadable: {exc}"))
-                continue
-            version = document.get("schema_version")
-            if version not in (2, 3, 4):
-                findings.append(Finding("error", where, f"schema_version must be 2, 3 or 4, got {version!r}"))
-            if speculative and (version != 4 or document.get("model_role") != role):
-                findings.append(Finding("error", where, f"speculative popularity requires schema v4 and model_role={role}"))
+            if key == expected_key:
+                if not isinstance(reference, str) or not reference.strip():
+                    findings.append(Finding("error", where,
+                                            f"routing={routing} requires a non-empty file path"))
+            elif reference is not None:
+                findings.append(Finding("error", f"variants.{name}.arch.routing",
+                                        f"{key} requires routing="
+                                        f"{'popularity' if 'popularity' in key else 'corpus'}; "
+                                        "uniform/random must omit it"))
+        if expected_key is None:
+            continue
+        reference = variant.arch.get(expected_key)
+        if not isinstance(reference, str) or not reference:
+            continue
+        where = f"variants.{name}.arch.{expected_key}"
+        if reference.startswith("hf://"):
+            # Fetched during launcher expansion; there is nothing on disk yet.
+            continue
+        path = pack.root / reference
+        if not path.is_file():
+            findings.append(Finding("error", where, f"missing: {reference}"))
+            continue
+        try:
+            document = json.loads(path.read_text())
+        except json.JSONDecodeError as exc:
+            findings.append(Finding("error", where, f"unreadable: {exc}"))
+            continue
+        version = document.get("schema_version")
+        if version not in versions:
+            findings.append(Finding("error", where,
+                                    f"schema_version must be "
+                                    f"{' or '.join(str(v) for v in versions)}, got {version!r}"))
+            continue
+        if routing == "corpus":
+            payload = path.parent / str(document.get("data_file", ""))
+            if not payload.is_file():
+                findings.append(Finding("error", where,
+                                        f"manifest names a payload that is not beside it: "
+                                        f"{document.get('data_file')!r}"))
     return findings
 
 

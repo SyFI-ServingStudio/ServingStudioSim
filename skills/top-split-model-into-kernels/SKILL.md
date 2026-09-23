@@ -9,7 +9,9 @@ description: >-
   granularity), then applies the boundary rules to assign each op a home: reuse
   an existing kernel, a new dedicated kernel (hand to top-add-kernel), an
   `elementwise` byte-placeholder, or fold into a neighbor. Never skips a
-  cost-bearing op. Produces a per-op decision table, not code.
+  cost-bearing op. When a measured vLLM/SGLang capture is available it is the
+  primary evidence for launch granularity, and the table is ordered by each op's
+  measured share of iteration time. Produces a per-op decision table, not code.
 ---
 
 # Top Split Model Into Kernels
@@ -39,6 +41,22 @@ reference decomposition, reuse its verdicts wholesale, and only give the
 model reuses every dense projection/norm/MLP verdict and only re-decides
 attention.
 
+## Ask for the measured capture before inferring granularity
+
+If the model runs in vLLM or SGLang, a measured nsys capture settles launch
+granularity that source reading can only estimate. Your caller may already have
+one — `top-add-new-arch` takes it in its Phase 0 — and if not, one can be
+produced by the profile phase of `operate-run-alignment` alone, with no
+ServingStudio Sim arch in place. Ask for it before you start deciding.
+
+The capture gives you the folded kernel sequence per engine phase: how many
+launches each region of the forward really issues, and each one's share of
+iteration time. It does not give you semantics — a demangled name and its
+`suggested_category` are hints, not proof, so keep reading the model source for
+what the math is. Without a capture, everything below still works; just record
+each granularity call as `inferred, unverified` so the reader knows which
+verdicts have not been checked against a real run.
+
 ## Per-op investigation
 
 For each op that needs deciding, gather two facts before judging:
@@ -47,9 +65,12 @@ For each op that needs deciding, gather two facts before judging:
   path, QKV / RoPE / cache / MLP / MoE semantics). Read HF/Torch for the math,
   not the granularity: HF eager materializes everything and does NOT reflect
   kernel launch boundaries.
-- **Whether a real fused kernel exists, at what launch granularity** — via
-  `dev-explore-kernel` (vLLM / SGLang / FlashInfer / flash-attn / cutlass). The
-  fact that matters is whether the op is issued as one fused launch or several.
+- **Whether a real fused kernel exists, at what launch granularity.** With a
+  capture, read it off the measured sequence and use `dev-explore-kernel` only
+  for what the trace cannot show: which public callable to wrap and how
+  `KernelArgs` map onto it, the wrapper plan `top-add-kernel` needs. Without a
+  capture, `dev-explore-kernel` (vLLM / SGLang / FlashInfer / flash-attn /
+  cutlass) also has to answer the granularity question from source.
 
 ## Assign a home (four verdicts, never skip)
 
@@ -109,10 +130,23 @@ backend is not a license to reinterpret an existing kind's args.
 A per-op decision table for one decoder layer, plus the outside-loop ops (embed,
 final norm, lm_head):
 
-| op | math (source anchor) | fused kernel found? | verdict | maps to |
-|----|----------------------|---------------------|---------|---------|
+| op | math (source anchor) | measured kernel(s) / share | fused launch? (evidence) | verdict | maps to |
+|----|----------------------|----------------------------|--------------------------|---------|---------|
 
 For each op record the verdict, the target kernel kind + args axes (or the
 `elementwise` byte-rate, or the host kernel it folds into), and the evidence
-anchor. Every cost-bearing op must appear — verify completeness before returning.
-Route the verdict-2 ops to `top-add-kernel`.
+anchor. With a capture, the measured column names the kernel(s) by engine phase /
+track / folded position and gives the op's share of iteration time; without one it
+reads `— (no capture)` and the fused column reads `inferred, unverified`.
+
+**Sort the table by measured share, descending.** Whoever builds from it works
+top-down, so the order carries the priority — the big kernels are the ones worth
+a dedicated `top-add-kernel` run, and a placeholder low in the table costs only
+its own share.
+
+Verify completeness in both directions before returning. Every cost-bearing op
+must appear. And with a capture, every measured kernel with material duration
+must land in some row or be named explicitly as framework plumbing (bookkeeping,
+alloc/fill/copy, launch prep, sampling) — a big measured kernel you cannot place
+means you missed an op, which is exactly the failure the table exists to prevent.
+Route the verdict-2 ops to `top-add-kernel`, largest share first.

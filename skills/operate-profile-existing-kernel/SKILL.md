@@ -345,3 +345,10 @@ uv run python -m launcher kernel-profile run single_gemm --backend torch --gpu-n
 uv run python -m launcher kernel-profile count-missing single_gemm --backend torch --gpu-name "H100" --specs specs.json --db "$TMPDIR/single-gemm/profile.db" --json
 uv run python -m launcher kernel-profile query single_gemm --backend torch --gpu-name "H100" --specs specs.jsonl --db "$TMPDIR/single-gemm/profile.db" --json
 ```
+
+## Do not re-tune what an earlier run already tuned
+
+A FlashInfer-autotuned kernel re-derives its tactics in every worker process
+unless the runner wraps `profiling/runners/autotune_cache.py` — one submission
+measured 166 s of tuning against 5.7 s of measuring. Before a large fill, read
+`operate-manage-jit-and-autotune-caches`.

@@ -4,11 +4,13 @@ pub mod bridge;
 pub mod cache;
 pub mod cost_tree;
 pub mod dims;
+pub mod expert_demand;
 pub mod kernels;
 pub mod result;
 pub mod routing;
 pub mod slot_input;
 pub mod sweep;
+pub mod token_corpus;
 
 pub use bridge::{
     BackendOverrideGuard, BuildError, DType, KernelEnum, KernelMissing, PerfApiBridge,
@@ -20,6 +22,7 @@ pub use cost_tree::{
     Evaluator, FlatCostNode, LeafDesc,
 };
 pub use dims::Dim;
+pub use expert_demand::ExpertDemand;
 pub use kernels::engine::KernelConfig;
 pub use result::{CacheProbe, Probe};
 pub use slot_input::{AttnPrefillLog, GdnCausalConvPrefillLog, SlotInput};

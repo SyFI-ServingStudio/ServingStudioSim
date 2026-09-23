@@ -20,10 +20,10 @@ use std::sync::Arc;
 
 use crate::op::Op;
 use crate::timing::bridge::DType;
+use crate::timing::expert_demand::ExpertDemand;
 use crate::timing::kernels::{
     Bf16FusedMoeKernel, Bf16FusedMoeKernelConfig, Bf16FusedMoeKernelInput,
 };
-use crate::timing::routing::RoutingDistribution;
 use crate::timing::{BuildError, CostNode, CostTreeBuilder, Dim, Evaluator, PerfApiBridge};
 
 #[derive(Clone, Debug)]
@@ -44,7 +44,8 @@ pub struct Bf16MoeLocalWorkletConfig {
     pub topk_group: u32,
     pub routed_scaling_numerator: u32,
     pub routed_scaling_denominator: u32,
-    pub layerwise_global_ppm: Vec<Vec<u32>>,
+    /// Where the routed demand for a profiled shape comes from.
+    pub expert_demand: ExpertDemand,
     /// Position in the active-count-ranked EP workload list produced by the
     /// shared complete-layer fold. It is not a physical rank identity.
     pub folded_rank_position: u32,
@@ -54,21 +55,17 @@ impl Bf16MoeLocalWorkletConfig {
     /// Build one local config per ranked EP workload from the same global
     /// layerwise routing evidence. Sampling and folding remain inside L1 so all
     /// children share one deterministic routing law.
-    pub fn split_for_ep(
-        mut template: Self,
-        routing: &RoutingDistribution,
-        num_moe_layers: u32,
-    ) -> Vec<Self> {
+    pub fn split_for_ep(mut template: Self, demand: ExpertDemand) -> Vec<Self> {
         let ep = usize::from(template.ep_size);
         assert!(ep > 0, "ep_size must be non-zero");
         let num_experts = template.num_experts.get() as usize;
         assert_eq!(num_experts % ep, 0, "experts must evenly partition EP");
         assert_eq!(
-            routing.num_experts() as usize,
+            demand.num_experts(),
             num_experts,
-            "routing width must match num_experts"
+            "demand source width must match num_experts"
         );
-        template.layerwise_global_ppm = routing.layerwise_ppm(num_moe_layers);
+        template.expert_demand = demand;
 
         (0..ep)
             .map(|position| {
@@ -80,22 +77,18 @@ impl Bf16MoeLocalWorkletConfig {
     }
 
     /// Build the one rank-symmetric config for pure tensor parallelism.
-    pub fn replicated_for_tp(
-        mut template: Self,
-        routing: &RoutingDistribution,
-        num_moe_layers: u32,
-    ) -> Self {
+    pub fn replicated_for_tp(mut template: Self, demand: ExpertDemand) -> Self {
         assert_eq!(
             template.ep_size, 1,
             "pure tensor parallelism leaves no expert parallelism"
         );
         assert!(template.tp_size > 0, "tp_size must be non-zero");
         assert_eq!(
-            routing.num_experts(),
-            template.num_experts.get(),
-            "routing width must match num_experts"
+            demand.num_experts(),
+            template.num_experts.get() as usize,
+            "demand source width must match num_experts"
         );
-        template.layerwise_global_ppm = routing.layerwise_ppm(num_moe_layers);
+        template.expert_demand = demand;
         template.folded_rank_position = 0;
         template
     }
@@ -140,12 +133,10 @@ impl Bf16MoeLocalWorklet {
             cfg.folded_rank_position < u32::from(cfg.ep_size),
             "folded rank position must select an EP workload"
         );
-        assert!(!cfg.layerwise_global_ppm.is_empty());
-        assert!(
-            cfg.layerwise_global_ppm
-                .iter()
-                .all(|layer| layer.len() == cfg.num_experts.get() as usize),
-            "every routing layer must match num_experts"
+        assert_eq!(
+            cfg.expert_demand.num_experts(),
+            cfg.num_experts.get() as usize,
+            "demand source width must match num_experts"
         );
 
         let experts_per_device = cfg.num_experts.clone() / Dim::param("ep", u32::from(cfg.ep_size));
@@ -166,7 +157,7 @@ impl Bf16MoeLocalWorklet {
                 topk_group: cfg.topk_group,
                 routed_scaling_numerator: cfg.routed_scaling_numerator,
                 routed_scaling_denominator: cfg.routed_scaling_denominator,
-                layerwise_global_ppm: cfg.layerwise_global_ppm.clone(),
+                expert_demand: cfg.expert_demand.clone(),
                 folded_rank_position: cfg.folded_rank_position,
             },
             experts_per_device,
@@ -223,6 +214,7 @@ impl Bf16MoeLocalWorklet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::timing::routing::RoutingDistribution;
 
     fn template(ep_size: u16, tp_size: u16) -> Bf16MoeLocalWorkletConfig {
         Bf16MoeLocalWorkletConfig {
@@ -240,7 +232,9 @@ mod tests {
             topk_group: 1,
             routed_scaling_numerator: 5,
             routed_scaling_denominator: 2,
-            layerwise_global_ppm: Vec::new(),
+            expert_demand: ExpertDemand::Popularity {
+                layerwise_global_ppm: Vec::new(),
+            },
             folded_rank_position: 0,
         }
     }
@@ -253,8 +247,7 @@ mod tests {
         // have.
         let config = Bf16MoeLocalWorkletConfig::replicated_for_tp(
             template(1, 4),
-            &RoutingDistribution::uniform(256),
-            1,
+            ExpertDemand::popularity(&RoutingDistribution::uniform(256), 1),
         );
         let resolved = Bf16MoeLocalWorklet::resolve_config(&config);
 
@@ -269,7 +262,10 @@ mod tests {
                 .map(|expert| (expert + 1) as f32)
                 .collect::<Vec<_>>(),
         );
-        let configs = Bf16MoeLocalWorkletConfig::split_for_ep(template(4, 1), &popularity, 1);
+        let configs = Bf16MoeLocalWorkletConfig::split_for_ep(
+            template(4, 1),
+            ExpertDemand::popularity(&popularity, 1),
+        );
 
         assert_eq!(configs.len(), 4);
         assert_eq!(
@@ -281,7 +277,7 @@ mod tests {
         );
         assert!(configs
             .windows(2)
-            .all(|pair| pair[0].layerwise_global_ppm == pair[1].layerwise_global_ppm));
+            .all(|pair| pair[0].expert_demand == pair[1].expert_demand));
 
         let resolved = Bf16MoeLocalWorklet::resolve_config(&configs[3]);
         assert_eq!(resolved.experts_per_device, 64);
@@ -295,8 +291,7 @@ mod tests {
     fn pure_tp_shards_intermediate_and_keeps_every_expert() {
         let config = Bf16MoeLocalWorkletConfig::replicated_for_tp(
             template(1, 4),
-            &RoutingDistribution::uniform(256),
-            1,
+            ExpertDemand::popularity(&RoutingDistribution::uniform(256), 1),
         );
         let resolved = Bf16MoeLocalWorklet::resolve_config(&config);
 
@@ -308,12 +303,11 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "routing width must match num_experts")]
+    #[should_panic(expected = "demand source width must match num_experts")]
     fn ep_split_rejects_wrong_routing_width() {
         let _ = Bf16MoeLocalWorkletConfig::split_for_ep(
             template(4, 1),
-            &RoutingDistribution::uniform(128),
-            1,
+            ExpertDemand::popularity(&RoutingDistribution::uniform(128), 1),
         );
     }
 
@@ -322,8 +316,7 @@ mod tests {
     fn replicated_for_tp_rejects_expert_parallelism() {
         let _ = Bf16MoeLocalWorkletConfig::replicated_for_tp(
             template(4, 4),
-            &RoutingDistribution::uniform(256),
-            1,
+            ExpertDemand::popularity(&RoutingDistribution::uniform(256), 1),
         );
     }
 

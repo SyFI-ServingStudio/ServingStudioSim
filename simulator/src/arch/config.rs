@@ -55,8 +55,8 @@ pub struct ModelSpec {
 
 // ── iter-wise contract (unified, pd) ────────────────────────────────────────
 
-/// MoE routing source: synthetic uniform/random demand, or a custom distribution
-/// loaded from `expert_popularity_file`.
+/// Where a MoE arch's expert demand comes from: synthetic uniform/random
+/// demand, or a measured distribution loaded from `expert_popularity_file`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RoutingKind {
@@ -65,12 +65,20 @@ pub enum RoutingKind {
     Uniform,
     /// Deterministic pseudo-random skew seeded by `routing_seed`.
     Random,
-    /// Measured distribution; requires `expert_popularity_file`.
-    Custom,
+    /// Measured per-expert marginal; requires `expert_popularity_file`.
+    Popularity,
+    /// Recorded per-token expert routes; requires `token_corpus_file`. Unlike a
+    /// marginal it keeps whole tokens, so a batch's verify blocks can be
+    /// sampled as the contiguous runs they are.
+    Corpus,
 }
 
 /// The `routing` choices the launcher schema advertises (mirror of [`RoutingKind`]).
-const ROUTING_KINDS: [&str; 3] = ["uniform", "random", "custom"];
+const ROUTING_KINDS: [&str; 4] = ["uniform", "random", "popularity", "corpus"];
+
+// Only the GLM-5.2 NVFP4 archs read a token corpus so far; the rest advertise
+// the marginal-backed kinds.
+const MARGINAL_ROUTING_KINDS: [&str; 3] = ["uniform", "random", "popularity"];
 
 // AFD FFN selectors do not yet accept popularity files.
 const SYNTHETIC_ROUTING_KINDS: [&str; 2] = ["uniform", "random"];
@@ -119,7 +127,7 @@ pub enum IterArchSel {
         #[serde(flatten)]
         model: ModelSpec,
         #[serde(default)]
-        #[param(string, default = "uniform", choices = ROUTING_KINDS)]
+        #[param(string, default = "uniform", choices = MARGINAL_ROUTING_KINDS)]
         routing: RoutingKind,
         #[serde(default)]
         routing_seed: Option<u64>,
@@ -170,11 +178,11 @@ pub enum IterArchSel {
         nvl_num_gpu: u16,
         /// Expert routing distribution: `uniform` (default) spreads load evenly;
         /// `random` draws a deterministic pseudo-random skew seeded by
-        /// `routing_seed`; `custom` loads `expert_popularity_file`.
+        /// `routing_seed`; `popularity` loads `expert_popularity_file`.
         /// Drives the L2 MoE dispatch/combine `BottleneckCurve`
         /// and the L3 grouped-GEMM `local_ppm` shards. Omitted → `uniform`.
         #[serde(default)]
-        #[param(string, default = "uniform", choices = ROUTING_KINDS)]
+        #[param(string, default = "uniform", choices = MARGINAL_ROUTING_KINDS)]
         routing: RoutingKind,
         /// Seed for `routing = random` (ignored for `uniform`). Fixed so a run is
         /// reproducible (the throughput golden is bit-identical); vary it to
@@ -203,7 +211,7 @@ pub enum IterArchSel {
         #[param(default = 8, cache_key)]
         nvl_num_gpu: u16,
         #[serde(default)]
-        #[param(string, default = "uniform", choices = ROUTING_KINDS)]
+        #[param(string, default = "uniform", choices = MARGINAL_ROUTING_KINDS)]
         routing: RoutingKind,
         #[serde(default)]
         routing_seed: Option<u64>,
@@ -227,7 +235,7 @@ pub enum IterArchSel {
         #[param(default = 8, cache_key)]
         nvl_num_gpu: u16,
         #[serde(default)]
-        #[param(string, default = "uniform", choices = ROUTING_KINDS)]
+        #[param(string, default = "uniform", choices = MARGINAL_ROUTING_KINDS)]
         routing: RoutingKind,
         #[serde(default)]
         routing_seed: Option<u64>,
@@ -241,7 +249,7 @@ pub enum IterArchSel {
         #[serde(flatten)]
         model: ModelSpec,
         #[serde(default)]
-        #[param(string, default = "uniform", choices = ROUTING_KINDS)]
+        #[param(string, default = "uniform", choices = MARGINAL_ROUTING_KINDS)]
         routing: RoutingKind,
         #[serde(default)]
         routing_seed: Option<u64>,
@@ -256,7 +264,7 @@ pub enum IterArchSel {
         #[serde(flatten)]
         model: ModelSpec,
         #[serde(default)]
-        #[param(string, default = "uniform", choices = ROUTING_KINDS)]
+        #[param(string, default = "uniform", choices = MARGINAL_ROUTING_KINDS)]
         routing: RoutingKind,
         #[serde(default)]
         routing_seed: Option<u64>,
@@ -279,7 +287,7 @@ pub enum IterArchSel {
         nvl_num_gpu: u16,
         /// Expert routing distribution used by dispatch/combine.
         #[serde(default)]
-        #[param(string, default = "uniform", choices = ROUTING_KINDS)]
+        #[param(string, default = "uniform", choices = MARGINAL_ROUTING_KINDS)]
         routing: RoutingKind,
         /// Seed for `routing = random`; ignored for uniform routing.
         #[serde(default)]
@@ -290,7 +298,7 @@ pub enum IterArchSel {
         #[param(string, default = "off", choices = GLM52_MTP_MODES, cache_key)]
         mtp_mode: Glm52MtpMode,
         /// Measured per-expert popularity from a profile pass. Requires
-        /// `routing = custom`; uniform/random routing cannot carry a profile.
+        /// `routing = popularity`; uniform/random routing cannot carry a profile.
         #[serde(default)]
         #[param(cache_key)]
         expert_popularity_file: Option<String>,
@@ -322,6 +330,13 @@ pub enum IterArchSel {
         #[serde(default)]
         #[param(cache_key)]
         expert_popularity_file: Option<String>,
+        /// Recorded per-token expert routes from a `token_corpus` pass, as
+        /// a manifest path. Requires `routing = corpus`. One artifact covers
+        /// every routed layer, so the body MoE and the MTP MoE read slices
+        /// of it rather than separate files.
+        #[serde(default)]
+        #[param(cache_key)]
+        token_corpus_file: Option<String>,
     },
     /// [`Self::Glm52VllmNvfp4DsaMoe`] driving its MTP layer as a real drafter:
     /// one target verify pass over `draft_tokens + 1` rows per decode request,
@@ -364,10 +379,13 @@ pub enum IterArchSel {
         #[serde(default)]
         #[param(cache_key)]
         expert_popularity_file: Option<String>,
-        /// Role-tagged MTP routing from the same replay as the target profile.
+        /// Recorded per-token expert routes from a `token_corpus` pass, as
+        /// a manifest path. Requires `routing = corpus`. One artifact covers
+        /// every routed layer, so the body MoE and the MTP MoE read slices
+        /// of it rather than separate files.
         #[serde(default)]
         #[param(cache_key)]
-        draft_expert_popularity_file: Option<String>,
+        token_corpus_file: Option<String>,
     },
     /// SGLang's B200 NVFP4 launch graph under pure tensor parallelism. Every
     /// rank owns all experts (EP1) and shards the routed intermediate axis by
@@ -391,6 +409,13 @@ pub enum IterArchSel {
         #[serde(default)]
         #[param(cache_key)]
         expert_popularity_file: Option<String>,
+        /// Recorded per-token expert routes from a `token_corpus` pass, as
+        /// a manifest path. Requires `routing = corpus`. One artifact covers
+        /// every routed layer, so the body MoE and the MTP MoE read slices
+        /// of it rather than separate files.
+        #[serde(default)]
+        #[param(cache_key)]
+        token_corpus_file: Option<String>,
     },
 }
 
@@ -514,7 +539,7 @@ mod iter_tests {
     #[test]
     fn qwen_selector_parses_profile_path_and_marks_it_cache_relevant() {
         let parsed = parse_qwen(
-            r#","attn_tp_size":4,"ep_size":4,"hp_size":1,"nvl_num_gpu":4,"routing":"custom","expert_popularity_file":"profile_expert_popularity/expert_popularity.json""#,
+            r#","attn_tp_size":4,"ep_size":4,"hp_size":1,"nvl_num_gpu":4,"routing":"popularity","expert_popularity_file":"profile_expert_popularity/expert_popularity.json""#,
         )
         .expect("qwen selector with popularity profile parses");
         let IterArchSel::Qwen3MoeDpAttnEpFfn {
@@ -555,7 +580,7 @@ mod iter_tests {
             IterArchSel::Qwen3MoeFp8DpAttnEpFfn { .. }
         ));
         let parsed = parse_vllm_qwen(
-            r#", "attn_tp_size":4,"ep_size":4,"hp_size":1,"nvl_num_gpu":4,"routing":"custom","expert_popularity_file":"expert_popularity.json""#,
+            r#", "attn_tp_size":4,"ep_size":4,"hp_size":1,"nvl_num_gpu":4,"routing":"popularity","expert_popularity_file":"expert_popularity.json""#,
         )
         .expect("vLLM-alignment Qwen selector parses");
         assert!(matches!(
@@ -632,6 +657,7 @@ mod iter_tests {
             routing_seed,
             mtp_mode,
             expert_popularity_file,
+            token_corpus_file,
         } = &parsed
         else {
             panic!("expected glm52_vllm_nvfp4_dsa_moe")
@@ -644,6 +670,7 @@ mod iter_tests {
         assert_eq!(*routing_seed, None);
         assert_eq!(*mtp_mode, Glm52MtpMode::Off);
         assert_eq!(*expert_popularity_file, None);
+        assert_eq!(*token_corpus_file, None);
         assert!(std::ptr::eq(parsed.model(), model));
         assert!(IterArchSel::SCHEMA
             .iter()
@@ -664,6 +691,7 @@ mod iter_tests {
             routing_seed,
             mtp_mode,
             expert_popularity_file,
+            token_corpus_file,
         } = &parsed
         else {
             panic!("expected glm52_sglang_nvfp4_tp_dsa_moe")
@@ -676,6 +704,7 @@ mod iter_tests {
         assert_eq!(*routing_seed, None);
         assert_eq!(*mtp_mode, Glm52MtpMode::Off);
         assert_eq!(*expert_popularity_file, None);
+        assert_eq!(*token_corpus_file, None);
         assert!(std::ptr::eq(parsed.model(), model));
 
         let params = IterArchSel::SCHEMA
@@ -700,7 +729,7 @@ mod iter_tests {
     fn glm52_selector_accepts_a_measured_expert_popularity_profile() {
         let parsed: IterArchSel = serde_json::from_str(
             r#"{"type":"glm52_vllm_dsa_moe","model_config":"model/config/glm52_fp8.json","fp8":true,
-                 "routing":"custom","expert_popularity_file":"profile_expert_popularity/expert_popularity.json"}"#,
+                 "routing":"popularity","expert_popularity_file":"profile_expert_popularity/expert_popularity.json"}"#,
         )
         .expect("GLM selector accepts an expert-popularity profile");
         let IterArchSel::Glm52VllmDsaMoe {
@@ -797,7 +826,7 @@ mod iter_tests {
         assert_eq!(routing["default"], "uniform");
         assert_eq!(
             routing["choices"],
-            serde_json::json!(["uniform", "random", "custom"])
+            serde_json::json!(["uniform", "random", "popularity"])
         );
         let mtp = get("mtp_mode");
         assert_eq!(mtp["default"], "off");

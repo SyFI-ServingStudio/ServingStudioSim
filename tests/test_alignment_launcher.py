@@ -7,6 +7,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -484,7 +485,7 @@ def test_non_popularity_profile_does_not_require_expert_topology(tmp_path):
 
 
 @pytest.mark.parametrize("engine", ["vllm", "sglang"])
-def test_expert_popularity_requires_explicit_engine_neutral_topology(tmp_path, engine):
+def test_a_popularity_pass_requires_explicit_engine_neutral_topology(tmp_path, engine):
     paths = _phase_configs(tmp_path)
     raw = yaml.safe_load(paths["profile"].read_text())
     raw["engine"] = engine
@@ -504,6 +505,18 @@ def test_expert_popularity_requires_explicit_engine_neutral_topology(tmp_path, e
     with pytest.raises(ValueError, match="expert_popularity requires explicit"):
         load_profile_config(paths["profile"])
 
+    # The same config is a valid corpus capture on vLLM: the topology is what a
+    # marginal is reduced over, and a corpus records logical ids instead. On
+    # SGLang there is no per-token route to return at all.
+    raw["profile_kind"] = "token_corpus"
+    paths["profile"].write_text(yaml.safe_dump(raw))
+    if engine == "vllm":
+        assert load_profile_config(paths["profile"]).server.expert_parallel_size == 1
+    else:
+        with pytest.raises(ValueError, match="token_corpus requires engine vllm"):
+            load_profile_config(paths["profile"])
+
+    raw["profile_kind"] = "expert_popularity"
     raw["server"]["expert_count_reduction_group_size"] = 2
     paths["profile"].write_text(yaml.safe_dump(raw))
     server = load_profile_config(paths["profile"]).server
@@ -999,6 +1012,7 @@ def test_nsys_preflight_is_scoped_to_new_captures():
     for profile_kind, resume in (
         ("workload_metrics", False),
         ("expert_popularity", False),
+        ("token_corpus", False),
         ("nsys", True),
     ):
         alignment_runner._preflight_capture_environment(
@@ -1384,25 +1398,156 @@ def test_sglang_duplicate_expert_record_from_one_dp_owner_is_rejected(tmp_path):
         )
 
 
-def test_runner_passes_yaml_expert_popularity_group_sizes_for_every_engine(tmp_path):
+def _routing_profile(tmp_path: Path, profile_kind: str, **server) -> ProfileConfig:
+    tmp_path.mkdir(parents=True, exist_ok=True)
     paths = _phase_configs(tmp_path)
     raw = yaml.safe_load(paths["profile"].read_text())
-    raw["profile_kind"] = "expert_popularity"
+    raw["profile_kind"] = profile_kind
     raw["cuda_visible_devices"] = "0,1,2,3,4,5,6,7"
     raw["server"]["tp_size"] = 4
     raw["server"]["dp_size"] = 2
-    raw["server"]["expert_parallel_size"] = 2
-    raw["server"]["expert_count_reduction_group_size"] = 4
+    raw["server"].update(server)
     paths["profile"].write_text(yaml.safe_dump(raw))
+    return load_profile_config(paths["profile"])
 
-    vllm_config = load_profile_config(paths["profile"])
-    assert alignment_runner._expert_popularity_group_sizes(vllm_config) == (2, 4)
 
-    raw["engine"] = "sglang"
-    raw["python_runtime"] = _python_runtime_document()
-    paths["profile"].write_text(yaml.safe_dump(raw))
-    sglang_config = load_profile_config(paths["profile"])
-    assert alignment_runner._expert_popularity_group_sizes(sglang_config) == (2, 4)
+def test_the_yaml_expert_topology_reaches_the_expert_load_extractor(tmp_path, monkeypatch):
+    seen: dict = {}
+
+    def record(*_args, **kwargs):
+        seen.update(kwargs)
+        return 7
+
+    monkeypatch.setattr(alignment_runner.record_extraction, "extract_expert_popularity", record)
+    cfg = _routing_profile(
+        tmp_path,
+        "expert_popularity",
+        extra_args=["--enable-expert-parallel"],
+        expert_parallel_size=2,
+        expert_count_reduction_group_size=4,
+    )
+
+    artifacts = alignment_runner._extract_expert_load(
+        cfg,
+        tmp_path / "server.log",
+        tmp_path,
+        tmp_path,
+        engine_records.VLLM_RECORDS,
+        speculative=False,
+        window={},
+    )
+
+    assert (seen["expert_parallel_size"], seen["reduction_group_size"]) == (2, 4)
+    assert artifacts["expert_record_count"] == 7
+
+
+def test_a_pass_that_asks_for_the_expert_load_stream_also_requires_it(tmp_path):
+    """Asking and requiring are one question, and the answer is the deployment.
+
+    A corpus capture on a deployment with no expert parallelism cannot produce
+    the stream at all, and still records the routes themselves; one that turns
+    EPLB on and then finds nothing has a defect, not a missing by-product.
+    """
+    for kind, server in (
+        ("expert_popularity", {}),
+        ("token_corpus", {"extra_args": ["--enable-expert-parallel"]}),
+    ):
+        with pytest.raises(ValueError, match="expert_parallel_size"):
+            alignment_runner._extract_expert_load(
+                _routing_profile(tmp_path / kind, kind, **server),
+                tmp_path / "server.log",
+                tmp_path,
+                tmp_path,
+                engine_records.VLLM_RECORDS,
+                speculative=False,
+                window={},
+            )
+
+    assert (
+        alignment_runner._extract_expert_load(
+            _routing_profile(tmp_path / "no-ep", "token_corpus"),
+            tmp_path / "server.log",
+            tmp_path,
+            tmp_path,
+            engine_records.VLLM_RECORDS,
+            speculative=False,
+            window={},
+        )
+        == {}
+    )
+
+
+def test_a_replay_cannot_pack_a_previous_captures_requests(tmp_path):
+    """The packer concatenates every file it finds, so the directory is emptied."""
+    cfg = _routing_profile(tmp_path / "corpus", "token_corpus")
+    routes = Path(cfg.log_dir) / alignment_runner.ROUTED_EXPERTS_DIR
+    routes.mkdir(parents=True)
+    stale = routes / "from-a-previous-run-0000.npy"
+    stale.write_bytes(b"stale")
+
+    prepared = alignment_runner._prepared_routes_dir(cfg, Path(cfg.log_dir))
+
+    assert prepared == routes
+    assert not stale.exists()
+    assert list(routes.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "authored",
+    [
+        ["--eplb-config", '{"window_size": 1000}'],
+        ['--eplb-config={"window_size": 1000}'],
+    ],
+    ids=["separate", "joined"],
+)
+def test_an_authored_eplb_config_keeps_its_settings_and_gains_the_log(tmp_path, authored):
+    """The pass adds what it needs to a tuned object rather than skipping it.
+
+    argparse keeps the last occurrence, so a second flag would drop the tuning.
+    """
+    argv = ["--enable-expert-parallel", *authored]
+    alignment_runner._append_backend_server_args(
+        argv,
+        _routing_profile(
+            tmp_path / "tuned",
+            "token_corpus",
+            tp_size=4,
+            extra_args=["--enable-expert-parallel"],
+            expert_parallel_size=4,
+            expert_count_reduction_group_size=4,
+        ),
+    )
+
+    [config] = [arg for arg in argv if arg.startswith("--eplb-config")]
+    merged = json.loads(config.split("=", 1)[1])
+    assert merged == {"window_size": 1000, "log_balancedness": True, "rearrange": False}
+
+
+def test_a_routing_pass_asks_for_the_expert_load_stream_only_where_it_exists(tmp_path):
+    """vLLM's balancedness log is its only source, and it refuses EPLB without EP."""
+    argv: list[str] = ["--enable-expert-parallel"]
+    alignment_runner._append_backend_server_args(
+        argv,
+        _routing_profile(
+            tmp_path / "ep",
+            "token_corpus",
+            extra_args=["--enable-expert-parallel"],
+            expert_parallel_size=2,
+            expert_count_reduction_group_size=4,
+        ),
+    )
+    assert json.loads(argv[argv.index("--eplb-config") + 1]) == {
+        "log_balancedness": True,
+        "rearrange": False,
+    }
+    assert "--enable-return-routed-experts" in argv
+
+    bare: list[str] = []
+    alignment_runner._append_backend_server_args(
+        bare, _routing_profile(tmp_path / "tp", "token_corpus")
+    )
+    assert "--enable-eplb" not in bare
+    assert "--enable-return-routed-experts" in bare
 
 
 @pytest.mark.parametrize("reduction_group_size", [0, -1, True, 1.5])
@@ -2031,6 +2176,47 @@ def test_vllm_tokens_backend_adds_server_flag_once(tmp_path):
     assert server_argv.count("--tokens-only") == 1
 
 
+def test_a_popularity_pass_refuses_the_eplb_opt_out(tmp_path):
+    """The marginal is the stream's only product; the replay would run for nothing."""
+    paths = _phase_configs(tmp_path)
+    raw = yaml.safe_load(paths["profile"].read_text())
+    raw["profile_kind"] = "expert_popularity"
+    raw["server"]["extra_args"] = ["--no-enable-eplb"]
+    paths["profile"].write_text(yaml.safe_dump(raw))
+
+    with pytest.raises(ValueError, match="use token_corpus"):
+        load_profile_config(paths["profile"])
+
+
+def test_a_corpus_pass_refuses_a_protocol_that_returns_no_routes(tmp_path):
+    """Every response would fail to fold; a launch would only spend the job."""
+    paths = _phase_configs(tmp_path)
+    raw = yaml.safe_load(paths["profile"].read_text())
+    raw["profile_kind"] = "token_corpus"
+    raw["workload"]["backend"] = {"type": "vllm_tokens"}
+    paths["profile"].write_text(yaml.safe_dump(raw))
+
+    with pytest.raises(ValueError, match="'vllm_tokens' does not"):
+        load_profile_config(paths["profile"])
+
+
+def test_a_corpus_pass_refuses_the_v2_model_runner(tmp_path):
+    """The server refuses route capture under V2 only after the job is scheduled."""
+    paths = _phase_configs(tmp_path)
+    raw = yaml.safe_load(paths["profile"].read_text())
+    raw["profile_kind"] = "token_corpus"
+    raw["python_runtime"] = {
+        "packages": [
+            {"name": "nvtx", "version": "0.2.16", "index_url": "https://pypi.org/simple"}
+        ],
+        "environment": {"VLLM_USE_V2_MODEL_RUNNER": "1"},
+    }
+    paths["profile"].write_text(yaml.safe_dump(raw))
+
+    with pytest.raises(ValueError, match="V1 model runner"):
+        load_profile_config(paths["profile"])
+
+
 def test_launcher_main_dispatches_alignment_subcommand(monkeypatch):
     from launcher import __main__ as launcher_main
 
@@ -2054,3 +2240,93 @@ def test_profile_resume_flag_reaches_the_runner(tmp_path, monkeypatch):
 
     assert alignment_launcher.main(["profile", str(paths["profile"]), "--resume"]) == 0
     assert resumed == [True]
+
+
+@pytest.mark.parametrize(
+    ("success", "failed", "files", "accepted"),
+    [(2, 0, 2, True), (2, 0, 1, False), (1, 1, 1, False)],
+    ids=["whole", "a_success_without_routes", "a_failed_request"],
+)
+def test_a_corpus_is_published_only_when_every_request_carried_routes(
+    tmp_path, success, failed, files, accepted
+):
+    """The load generator exits cleanly when a response lacks routes."""
+    summary = tmp_path / "summary.json"
+    summary.write_text(
+        json.dumps({"replay": {"common": {"success_steps": success, "failed_steps": failed}}})
+    )
+    routes = tmp_path / "routed_experts"
+    routes.mkdir()
+    for index in range(files):
+        (routes / f"request-{index}.npy").write_bytes(b"")
+
+    if accepted:
+        alignment_runner._check_routes_cover_replay(summary, routes)
+    else:
+        with pytest.raises(ValueError, match="carried routes"):
+            alignment_runner._check_routes_cover_replay(summary, routes)
+
+
+def test_a_hub_model_id_reads_its_config_from_the_hub_cache(tmp_path, monkeypatch):
+    """`model_path` is what vLLM's --model accepted, a repo id included."""
+    import huggingface_hub
+
+    cached = tmp_path / "snapshot" / "config.json"
+    cached.parent.mkdir()
+    cached.write_text(json.dumps({"n_routed_experts": 256}))
+    fetched = []
+
+    def fake_download(repo_id, filename, revision):
+        fetched.append((repo_id, filename, revision))
+        return str(cached)
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_download)
+    monkeypatch.chdir(tmp_path)
+    server = SimpleNamespace(model_path="nvidia/GLM-5.2-NVFP4", extra_args=[])
+
+    assert alignment_runner._checkpoint_config(server) == cached
+    # The revision the server loaded, in either spelling.
+    server.extra_args = ["--revision", "abc123"]
+    alignment_runner._checkpoint_config(server)
+    server.extra_args = ["--revision=def456"]
+    alignment_runner._checkpoint_config(server)
+    assert fetched == [
+        ("nvidia/GLM-5.2-NVFP4", "config.json", None),
+        ("nvidia/GLM-5.2-NVFP4", "config.json", "abc123"),
+        ("nvidia/GLM-5.2-NVFP4", "config.json", "def456"),
+    ]
+
+    local = tmp_path / "checkpoint"
+    local.mkdir()
+    (local / "config.json").write_text("{}")
+    assert (
+        alignment_runner._checkpoint_config(SimpleNamespace(model_path=str(local), extra_args=[]))
+        == local / "config.json"
+    )
+    # A separate config path wins over the weights, as it does in the server.
+    overridden = tmp_path / "config-only"
+    overridden.mkdir()
+    (overridden / "config.json").write_text("{}")
+    assert (
+        alignment_runner._checkpoint_config(
+            SimpleNamespace(model_path=str(local), extra_args=["--hf-config-path", str(overridden)])
+        )
+        == overridden / "config.json"
+    )
+    assert len(fetched) == 3
+
+
+def test_a_model_without_eplb_opts_out_of_the_expert_load_stream(tmp_path):
+    """Only loading the model shows whether it balances; the operator says so."""
+    argv = ["--enable-expert-parallel", "--no-enable-eplb"]
+    cfg = _routing_profile(
+        tmp_path / "no-eplb",
+        "token_corpus",
+        # No topology declared: a pass without the stream has nothing to reduce.
+        extra_args=["--enable-expert-parallel", "--no-enable-eplb"],
+    )
+    alignment_runner._append_backend_server_args(argv, cfg)
+
+    assert not cfg.captures_expert_load
+    assert "--enable-eplb" not in argv
+    assert "--enable-return-routed-experts" in argv

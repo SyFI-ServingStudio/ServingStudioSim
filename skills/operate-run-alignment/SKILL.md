@@ -103,16 +103,17 @@ single-config path below when there is one workload and no matrix.
    model cache, and fork venv (`fork_python` must import `torch` and the
    selected engine).
 
-   `profile_kind` selects one of three passes, and they are not
+   `profile_kind` selects one of four passes, and they are not
    interchangeable — each buys one kind of evidence at the cost of another, so
    pick by which check will consume it (see `alignment/README.md` for the
    config fields):
 
    | `profile_kind` | NSYS | Buys | Costs |
    |---|---|---|---|
-   | `nsys` (default) | yes, bounded window | per-kernel/segment truth for Check 1 | a short window, plus capture/flush pauses; must disable popularity logging |
+   | `nsys` (default) | yes, bounded window | per-kernel/segment truth for Check 1 | a short window, plus capture/flush pauses; must disable routing logging |
    | `workload_metrics` | no | the complete scheduler timeline and per-request timing, uncontaminated, for the whole run | no kernel detail |
-   | `expert_popularity` | no | logical expert counts/probabilities by layer, for MoE routing demand | its EPLB sync and D2H logging must never enter timing evidence |
+   | `token_corpus` | no | the experts every accepted token routed to, layer by layer — the measured MoE routing demand | its synchronization and D2H logging must never enter timing evidence; the corpus is ~150 MB per capture |
+   | `expert_popularity` | no | the same run reduced to a per-layer marginal | the same costs, and a marginal is only resamplable independently — DEPRECATED |
 
    Use `cuda_profiler_api` + CUDA graph node tracing for the `nsys` pass.
 
@@ -122,14 +123,39 @@ single-config path below when there is one workload and no matrix.
    one. Run `workload_metrics` for that, with identical model, topology,
    backend, and workload settings so the two passes are comparable.
 
-   Run `expert_popularity` for **any** MoE model, not only an EP deployment.
-   Expert parallelism is what makes routing skew produce dispatch/combine
-   traffic, but a grouped GEMM is charged per expert group whatever the
-   placement: skew leaves the total token-expert selections unchanged while
-   redistributing them into fuller and emptier groups. A local/TP1 MoE arch
-   that assumes balanced routing will therefore mis-cost its expert GEMM, and
-   the deviation surfaces in Check 1 as an unexplained MoE slot gap that is
-   easy to misattribute to the kernel cost model.
+   Run `token_corpus` for **any** MoE model, not only an EP deployment. Expert
+   parallelism is what makes routing skew produce dispatch/combine traffic, but
+   a grouped GEMM is charged per expert group whatever the placement: skew
+   leaves the total token-expert selections unchanged while redistributing them
+   into fuller and emptier groups. A local/TP1 MoE arch that assumes balanced
+   routing will therefore mis-cost its expert GEMM, and the deviation surfaces
+   in Check 1 as an unexplained MoE slot gap that is easy to misattribute to the
+   kernel cost model.
+
+   Prefer `token_corpus` over `expert_popularity` whenever the deployment
+   drafts. A marginal can only be resampled independently, and a verify block is
+   not independent: one sequence contributes `draft_tokens + 1` consecutive
+   positions that route almost alike. Scored against recorded per-step routing,
+   the marginal misses the busiest rank's active-expert count by 15.15% where a
+   corpus sampled in groups of the verify width misses by 2.40%, against a floor
+   of 1.91%. At verify width 1 the two agree, which is why `expert_popularity`
+   still exists rather than being deleted.
+
+   Neither pass needs extra flags. The runner appends what the kind cannot work
+   without — the routed-experts return, and EPLB's per-step expert-load log when
+   the deployment has expert parallelism — so one `token_corpus` capture yields
+   the corpus, that per-step stream to score a sampled fold against, and the
+   marginal. Whenever the pass takes that stream (vLLM with
+   `--enable-expert-parallel` and more than one rank) it requires
+   `server.expert_parallel_size` and `server.expert_count_reduction_group_size`,
+   the topology the marginal is reduced over. A model that does not implement
+   EPLB opts out with `--no-enable-eplb` in `server.extra_args` and the pass
+   records routes alone. `expert_popularity` always requires both, because the
+   marginal is its only product.
+
+   Only the `openai` workload backend returns routes, so a `token_corpus` pass
+   runs on `openai` even when the campaign's timed passes use `vllm_tokens`;
+   the routes are a property of the tokens routed, not of the wire protocol.
 2. **Timing prediction** — set the typed input builder. It reads the simulation
    *preset* (`simulation.yaml` via `simulation_preset`) for gpu/arch/backends, so
    it runs before any completed simulation. `measured_phase: forward` only
@@ -372,19 +398,21 @@ drop work or inflate the critical path.
 
 ## Preserve routing and workload equivalence
 
-For MoE baseline reproduction, capture logical routing/popularity outside the
-timed range — the `profile_kind: expert_popularity` pass above — and inject that
-same demand into the simulator with `routing: custom` and the arch's
-`expert_popularity_file`.
+For MoE baseline reproduction, capture logical routing outside the timed range —
+the `profile_kind: token_corpus` pass above — and inject that same demand into
+the simulator with `routing: corpus` and the arch's `token_corpus_file`, or
+`routing: popularity` and `expert_popularity_file` when only a marginal exists.
 Preserve original layer and step/request identity, token count, top-k, logical
 expert counts, route-weight mass, and temporal variation. A single model-wide
 histogram erases layer skew and bursts and cannot support per-iteration
 critical-path alignment.
 
-If the arch has no `expert_popularity_file` field, it is costing a hardcoded
-balanced assumption. That is a gap to report, not a reason to skip the pass: an
-arch whose grouped GEMM reads a routing distribution can consume a measured one,
-and adding the selector field is a small, patterned change.
+If the arch has neither field, it is costing a hardcoded balanced assumption.
+That is a gap to report, not a reason to skip the pass: an arch whose grouped
+GEMM reads a routing distribution can consume a measured one, and adding the
+selector field is a small, patterned change. See
+`operate-run-simulation/references/moe-routing.md` for the four routing kinds
+and for hosting a corpus by repository and revision instead of in git.
 
 Keep logical demand separate from framework realization. The reusable input is
 the token-to-expert assignment and route weight before EP placement, padding,

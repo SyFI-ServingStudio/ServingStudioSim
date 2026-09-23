@@ -73,8 +73,14 @@ def run_replay(
     base_url: str,
     model: str,
     measurement_ready: Callable[[], None] | None = None,
+    routed_experts_dir: Path | None = None,
 ) -> dict:
-    """Replay the shared trace through its explicitly selected wire backend."""
+    """Replay the shared trace through its explicitly selected wire backend.
+
+    `routed_experts_dir` turns the replay non-streaming and collects the routes
+    the server took per request. The caller decides when that trade is worth
+    making; this layer only knows that it costs the per-event timeline.
+    """
     prepared.log_path.parent.mkdir(parents=True, exist_ok=True)
     protocol_base_url = (
         f"{base_url.rstrip('/')}/v1"
@@ -121,6 +127,8 @@ def run_replay(
         argv.append("--warmup")
     if measurement_ready is not None:
         argv.append("--measurement-gate")
+    if routed_experts_dir is not None:
+        argv.extend(["--routed-experts-dir", str(routed_experts_dir)])
     argv.extend(config.extra_args)
 
     if measurement_ready is None:
@@ -157,4 +165,5 @@ def run_replay(
         "log_path": str(prepared.log_path),
         "summary_path": str(prepared.summary_path),
         "warmup": config.warmup,
+        "routed_experts_dir": str(routed_experts_dir) if routed_experts_dir else None,
     }

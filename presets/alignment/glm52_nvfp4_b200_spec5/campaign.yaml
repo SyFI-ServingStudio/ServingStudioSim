@@ -25,6 +25,10 @@ variants:
     server:
       tp_size: 4
       dp_size: 1
+      # The expert topology the corpus pass reduces EPLB's per-step expert-load
+      # log over: four EP ranks, each logging the same rank-synchronized step.
+      expert_parallel_size: 4
+      expert_count_reduction_group_size: 4
       chunk_size: 2052
       max_cudagraph_capture_size: 2052
       enable_server_load_tracking: true
@@ -40,9 +44,8 @@ variants:
       fp8: false
       ep_size: 4
       nvl_num_gpu: 4
-      routing: custom
+      routing: popularity
       expert_popularity_file: expert_popularity.json
-      draft_expert_popularity_file: draft_expert_popularity.json
       mtp_mode: full_index
       draft_tokens: 5
     worker:
@@ -60,6 +63,11 @@ variants:
       name: profile_nsys
       trace: kernel
       warmup: true
+    # The measured routing demand: every accepted token's experts, body and MTP
+    # layer. Rendered on the openai backend, the one that returns routes.
+    - kind: token_corpus
+      name: profile_corpus
+      trace: workload
     input_builder:
       type: speculative_engine_text
       draft_tokens: 5
