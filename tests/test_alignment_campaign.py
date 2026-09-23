@@ -101,9 +101,11 @@ def test_pack_check_reports_no_errors(pack):
 
 
 @pytest.mark.parametrize("routing", [None, "uniform", "random"])
-def test_campaign_rejects_popularity_files_without_custom_routing(pack, routing):
+def test_campaign_rejects_measured_routing_files_under_synthetic_routing(pack, routing):
     original = pack.variant_of(pack.cases[0])
     arch = dict(original.arch)
+    # Each pack carries one measured artifact: a marginal or a token corpus.
+    kind = "popularity" if "expert_popularity_file" in arch else "corpus"
     if routing is None:
         arch.pop("routing", None)
     else:
@@ -111,7 +113,7 @@ def test_campaign_rejects_popularity_files_without_custom_routing(pack, routing)
     variant = dataclasses.replace(original, arch=arch)
     patched = dataclasses.replace(pack, variants={variant.name: variant})
     findings = check_module._check_expert_popularity(patched)
-    assert any(item.level == "error" and "requires routing=popularity" in item.message
+    assert any(item.level == "error" and f"requires routing={kind}" in item.message
                for item in findings)
 
 
@@ -505,8 +507,62 @@ def test_speculative_case_keeps_replay_trace_and_calibrates_simulation(pack, tmp
         case,
         speculative_acceptance=dataclasses.replace(case.speculative_acceptance, value=rates[:2]),
     )
-    with pytest.raises(PackError, match="draft_tokens must agree"):
+    with pytest.raises(PackError, match="must both set draft_tokens"):
         case_documents(patched, bad_case, check_module.host_for(patched, None), tmp_path, REPO_ROOT)
+    # The two speculative archs default to different depths, so neither side
+    # may fall back to one.
+    implicit = dataclasses.replace(
+        variant, arch={key: value for key, value in variant.arch.items() if key != "draft_tokens"}
+    )
+    implicit_pack = dataclasses.replace(pack, variants={**pack.variants, variant.name: implicit})
+    with pytest.raises(PackError, match="must both set draft_tokens"):
+        case_documents(
+            implicit_pack, case, check_module.host_for(implicit_pack, None), tmp_path, REPO_ROOT
+        )
+
+
+def _with_speculative_args(pack, extra_args, draft_checkpoint="dflash2_draft"):
+    case = pack.cases[0]
+    original = pack.variant_of(case)
+    variant = dataclasses.replace(
+        original,
+        server={**original.server, "extra_args": extra_args},
+        draft_checkpoint=draft_checkpoint,
+    )
+    patched = dataclasses.replace(pack, variants={**pack.variants, variant.name: variant})
+    return patched, case, variant
+
+
+@pytest.mark.parametrize("inline", [False, True])
+def test_a_draft_checkpoint_reaches_the_speculative_config_as_a_host_path(pack, tmp_path, inline):
+    config = '{"method":"dflash","num_speculative_tokens":7}'
+    extra_args = (
+        [f"--speculative-config={config}"] if inline else ["--speculative-config", config]
+    )
+    patched, case, variant = _with_speculative_args(pack, extra_args)
+    host = check_module.host_for(patched, None)
+    documents = case_documents(patched, case, host, tmp_path, REPO_ROOT)
+    args = documents[f"{variant.profile_passes[0].name}.yaml"]["server"]["extra_args"]
+    raw = args[0].partition("=")[2] if inline else args[1]
+    assert json.loads(raw) == {
+        "method": "dflash",
+        "num_speculative_tokens": 7,
+        "model": host.checkpoint_path("dflash2_draft"),
+    }
+
+
+@pytest.mark.parametrize(
+    ("extra_args", "message"),
+    [
+        ([], "exactly one --speculative-config"),
+        (["--speculative-config", '{"method":"dflash","model":"/raid/hf/x"}'], "without `model`"),
+        (["--speculative-config", "dflash"], "is not JSON"),
+    ],
+)
+def test_a_draft_checkpoint_rejects_a_config_it_cannot_own(pack, tmp_path, extra_args, message):
+    patched, case, _ = _with_speculative_args(pack, extra_args)
+    with pytest.raises(PackError, match=message):
+        case_documents(patched, case, check_module.host_for(patched, None), tmp_path, REPO_ROOT)
 
 
 # ── readiness and planning (pure; no subprocess) ─────────────────────────────

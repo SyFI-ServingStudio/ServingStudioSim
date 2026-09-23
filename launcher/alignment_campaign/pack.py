@@ -150,6 +150,10 @@ class Variant:
     #: but pinning it lets a migrated pack reproduce an accepted config byte-wise.
     run_name_prefix: str = ""
     raw_overrides: dict[str, Any] = field(default_factory=dict)
+    #: Key into the host profile's `checkpoints` for a proposer that ships as its
+    #: own checkpoint. Rendering writes its path into `--speculative-config`, so
+    #: the pack never carries a machine's HF cache path.
+    draft_checkpoint: str | None = None
 
     def pass_named(self, name: str) -> ProfilePass | None:
         for item in self.profile_passes:
@@ -419,6 +423,11 @@ def _variant(name: str, raw: Any) -> Variant:
         replicas=_typed(body.pop("replicas", 1), int, f"{where}.replicas"),
         run_name_prefix=_typed(body.pop("run_name_prefix", ""), str, f"{where}.run_name_prefix"),
         raw_overrides=dict(body.pop("raw_overrides", {}) or {}),
+        draft_checkpoint=(
+            None
+            if (draft_checkpoint := body.pop("draft_checkpoint", None)) is None
+            else _typed(draft_checkpoint, str, f"{where}.draft_checkpoint")
+        ),
     )
     _reject_extra(body, where)
     if len({item.name for item in variant.profile_passes}) != len(variant.profile_passes):

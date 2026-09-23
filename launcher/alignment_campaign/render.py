@@ -18,6 +18,7 @@ copy of; configs are built as dicts and dumped, so a malformed nesting is a
 | `server.port` / `startup_timeout`    | host                                    |
 | `server.gpu_memory_utilization`      | case (it decides KV capacity)           |
 | `server.extra_args`                  | variant + `--max-model-len` from case   |
+| `--speculative-config` `model`       | host `checkpoints[variant.draft_checkpoint]` |
 | `arch.max_model_len`                 | case                                    |
 | `worker.attn_gpu_memory_gb`          | case (calibrated)                       |
 | `worker.gpu_time_multiplier`         | always 1.0 — the sim run injects the    |
@@ -158,6 +159,53 @@ def trace_text(case: Case, spec: TraceSpec, *, speculative_acceptance: list[floa
 
 # ── config bodies ────────────────────────────────────────────────────────────
 
+SPECULATIVE_CONFIG_FLAG = "--speculative-config"
+
+
+def _with_draft_checkpoint(variant: Variant, host: HostProfile, args: list[str]) -> list[str]:
+    """Point the variant's `--speculative-config` at its proposer checkpoint.
+
+    The pack names the proposer by host checkpoint key, never by path, and the
+    config it writes must leave `model` to this function -- a path there would
+    be one machine's HF cache committed into a pack.
+    """
+    if variant.draft_checkpoint is None:
+        return args
+    where = f"variants.{variant.name}"
+    positions = [
+        index
+        for index, argument in enumerate(args)
+        if argument.partition("=")[0].replace("_", "-") == SPECULATIVE_CONFIG_FLAG
+    ]
+    if len(positions) != 1:
+        raise PackError(
+            f"{where}.draft_checkpoint needs exactly one {SPECULATIVE_CONFIG_FLAG} "
+            f"in server.extra_args, found {len(positions)}"
+        )
+    index = positions[0]
+    inline = "=" in args[index]
+    if not inline and index + 1 >= len(args):
+        raise PackError(f"{where}.server.extra_args: {SPECULATIVE_CONFIG_FLAG} has no value")
+    raw = args[index].partition("=")[2] if inline else args[index + 1]
+    try:
+        config = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise PackError(f"{where}: {SPECULATIVE_CONFIG_FLAG} is not JSON: {error}") from None
+    if not isinstance(config, dict) or "model" in config:
+        raise PackError(
+            f"{where}: {SPECULATIVE_CONFIG_FLAG} must be a JSON object without `model` "
+            f"when draft_checkpoint is set; rendering supplies the path"
+        )
+    config["model"] = host.checkpoint_path(variant.draft_checkpoint)
+    rendered = json.dumps(config, separators=(",", ":"))
+    result = list(args)
+    if inline:
+        result[index] = f"{args[index].partition('=')[0]}={rendered}"
+    else:
+        result[index + 1] = rendered
+    return result
+
+
 def _extra_args(variant: Variant, case: Case) -> list[str]:
     """Variant flags plus the context limit in the target engine's spelling.
 
@@ -197,7 +245,7 @@ def _server_block(pack: Pack, variant: Variant, case: Case, host: HostProfile) -
     if case.chunk_size is not None:
         body["chunk_size"] = case.chunk_size
     body["startup_timeout"] = host.startup_timeout
-    body["extra_args"] = _extra_args(variant, case)
+    body["extra_args"] = _with_draft_checkpoint(variant, host, _extra_args(variant, case))
     return body
 
 
@@ -323,13 +371,24 @@ def simulation_document(
     cannot be written once and moved. Paths are emitted repo-relative when the
     run directory is inside the repository and absolute otherwise.
     """
-    speculative = variant.arch.get("type") == "glm52_vllm_nvfp4_dsa_moe_speculative"
+    # The speculative worker is the contract that consumes per-position
+    # acceptance, whichever proposer the arch models, so it is what decides.
+    speculative = variant.worker.get("type") == "speculative"
     if speculative != (case.speculative_acceptance is not None):
-        raise PackError(f"{case.slug}: speculative architecture and acceptance must be configured together")
+        raise PackError(f"{case.slug}: speculative worker and acceptance must be configured together")
     if speculative:
-        depth = variant.arch.get("draft_tokens", 5)
-        if len(case.speculative_acceptance.value) != depth or variant.worker.get("draft_tokens", 5) != depth:
-            raise PackError(f"{case.slug}: acceptance length, worker and architecture draft_tokens must agree")
+        # Stated on both sides rather than defaulted: the two speculative archs
+        # default to different depths, and a silent default is how they drift.
+        depth = variant.arch.get("draft_tokens")
+        if (
+            depth is None
+            or variant.worker.get("draft_tokens") != depth
+            or len(case.speculative_acceptance.value) != depth
+        ):
+            raise PackError(
+                f"{case.slug}: arch and worker must both set draft_tokens, and the "
+                f"acceptance vector must have that many positions"
+            )
     trace_name = SPECULATIVE_TRACE_NAME if speculative else WORKLOAD_TRACE_NAME
     workload: dict[str, Any] = {
         "trace_files": [_preset_path(case_dir / trace_name, repo_root)],
