@@ -84,6 +84,16 @@ _PROFILE_ENVS_ROOT = Path.home() / "profile_envs"
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _PROJECT_UV_PYTHON = _PROJECT_ROOT / ".venv" / "bin" / "python"
 _SGLANG_CHECKOUT = _PROJECT_ROOT / "alignment" / "profiler" / "sglang"
+# The instrumented vLLM fork is the production engine for alignment captures.
+# A separate worktree without the initialized submodule points here at the
+# checkout that owns the built `.venv`.
+_VLLM_FORK_CHECKOUT = Path(
+    os.environ.get("VIBESIM_VLLM_FORK_ROOT", _PROJECT_ROOT / "alignment" / "profiler" / "vllm")
+)
+_VLLM_FORK_PYTHON = _VLLM_FORK_CHECKOUT / ".venv" / "bin" / "python"
+_VLLM_FORK_TORCH_LIB = (
+    _VLLM_FORK_CHECKOUT / ".venv" / "lib" / "python3.12" / "site-packages" / "torch" / "lib"
+)
 _SGLANG_PYTHON_ROOT = _SGLANG_CHECKOUT / "python"
 _SGLANG_PYTHON = _SGLANG_PYTHON_ROOT / ".venv-sglang" / "bin" / "python"
 
@@ -122,6 +132,15 @@ ENV_REGISTRY: dict[str, ProfileEnv | ContainerProfileEnv] = {
         "sglang_env",
         _SGLANG_PYTHON,
         additional_python_paths=(_SGLANG_PYTHON_ROOT,),
+    ),
+    # The alignment fork's own venv (alignment/profiler/README.md). Source and
+    # native extensions come from that checkout, and Torch's CUDA runtime is
+    # resolved first, as the alignment server launch does.
+    "vllm_fork_env": ProfileEnv(
+        "vllm_fork_env",
+        _VLLM_FORK_PYTHON,
+        additional_python_paths=(_VLLM_FORK_CHECKOUT,),
+        additional_library_paths=(_VLLM_FORK_TORCH_LIB,),
     ),
     # vLLM runners execute in the pinned image; host source and Python packages
     # are deliberately outside this environment boundary.
