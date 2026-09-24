@@ -72,6 +72,22 @@ const OTHER_TOP_K_CONTEXT_AXIS: [u32; 18] = [
     524288, 1048576,
 ];
 
+/// Context axis of the GLM-5.3-Flash kpool fork backend (`top_k` = 512 pools).
+///
+/// Its long-row time depends on the context in a data-dependent, repeatable way
+/// (B200 scan, job 1134): power-of-two lengths dip 13-15% below their
+/// neighbours and 3600..5000 pools sit on a lower 5.2-5.6 us plateau. The
+/// points therefore avoid powers of two above the short-row bracket and
+/// bracket the plateau at 3300/3800 and 4800/6500, so interpolation reads
+/// the level an arbitrary pool count sees. 14 points up to 8192 keep 34 x 14 =
+/// 476 feasible coordinates at max_model_len 8192.
+const POOLED_FORK_CONTEXT_AXIS: [u32; 23] = [
+    0, 128, 511, 512, 513, 600, 1100, 1700, 2500, 3300, 3800, 4800, 6500, 8192, 16384, 32767,
+    32768, 32769, 65536, 131072, 262144, 524288, 1048576,
+];
+
+const POOLED_FORK_BACKEND: &str = "vllm_fork_cuda";
+
 /// Context axis for one `top_k`.
 ///
 /// Rows no longer than `top_k` take the kernel's short path, so the axis
@@ -99,7 +115,13 @@ impl KernelSpec for DsaPersistentTopkDecodeSpec {
     fn sweep_grid(config: &Self::Config) -> SweepGrid {
         SweepGrid::new(vec![
             Axis::values(BATCH_AXIS),
-            Axis::values(context_axis(config.top_k)),
+            Axis::values(
+                if config.backends.contains(&POOLED_FORK_BACKEND) && config.top_k == 512 {
+                    POOLED_FORK_CONTEXT_AXIS.to_vec()
+                } else {
+                    context_axis(config.top_k)
+                },
+            ),
         ])
     }
 
@@ -540,18 +562,22 @@ mod tests {
         let grid = DsaPersistentTopkDecodeSpec::sweep_grid(&cfg);
         assert!(grid.axes()[1].windows(2).all(|pair| pair[0] < pair[1]));
         assert!(grid.axes()[1]
-            .windows(7)
-            .any(|w| w == [256.0, 510.0, 511.0, 512.0, 513.0, 514.0, 1024.0]));
+            .windows(3)
+            .any(|w| w == [511.0, 512.0, 513.0]));
+        // Powers of two above the short-row bracket are measured dips (job 1134).
+        assert!(!grid.axes()[1]
+            .iter()
+            .any(|&c| [1024.0, 2048.0, 4096.0].contains(&c)));
         let mask = DsaPersistentTopkDecodeSpec::infeasible_mask(&cfg, &grid);
         assert_eq!(mask.iter().filter(|&&masked| !masked).count(), 34 * 14);
 
         let payloads = DsaPersistentTopkDecodeSpec::enumerate(&cfg, &grid, FORK_BACKEND);
         assert_eq!(
-            serde_json::to_value(payload_for(&payloads, &grid, 32, 1024).fields()).unwrap(),
+            serde_json::to_value(payload_for(&payloads, &grid, 32, 1100).fields()).unwrap(),
             serde_json::json!({
                 "backend": FORK_BACKEND,
                 "batch_size": 32,
-                "context_len": 1024,
+                "context_len": 1100,
                 "next_n": 1,
                 "max_model_len": 8192,
                 "top_k": 512,
