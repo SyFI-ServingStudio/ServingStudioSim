@@ -39,7 +39,14 @@ impl KernelSpec for KdaRecurrentDecodeSpec {
     /// Batch 1..512 in powers of two. Batch 1 stays a measured point because
     /// it has no copy launches and so sits off the batch >= 2 line.
     fn sweep_grid(_config: &Self::Config) -> SweepGrid {
-        SweepGrid::new(vec![Axis::pow2(0, 9)])
+        // Powers of two plus 12 and 24: the batch-8..32 curve is concave (the
+        // four copy launches and the recurrent kernel fill the SMs at different
+        // batch sizes; B200 job 1138), so pow2 alone misses batch 12/24 by
+        // 11-16%.
+        let mut batches = Axis::pow2(0, 9);
+        batches.extend([12.0, 24.0]);
+        batches.sort_by(f64::total_cmp);
+        SweepGrid::new(vec![batches])
     }
 
     fn cache_kind(_backend: &'static str) -> CacheKind {
@@ -95,21 +102,21 @@ mod tests {
         assert_eq!(cfg.kv_dtype(), None);
     }
 
-    /// Catches a grid that drops the batch-1 (no-copy) point or exceeds the
-    /// frozen 10-point feasible budget.
+    /// Catches a grid that drops the batch-1 (no-copy) point or the measured
+    /// 12/24 curvature points, or grows past its 12-point feasible budget.
     #[test]
-    fn grid_is_pow2_1_to_512_with_batch_one_and_ten_feasible_points() {
+    fn grid_is_pow2_1_to_512_plus_12_and_24_with_twelve_feasible_points() {
         let cfg = config();
         let grid = KdaRecurrentDecodeSpec::sweep_grid(&cfg);
         assert_eq!(grid.axes().len(), 1);
         assert_eq!(
             grid.axes()[0],
-            [1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0]
+            [1.0, 2.0, 4.0, 8.0, 12.0, 16.0, 24.0, 32.0, 64.0, 128.0, 256.0, 512.0]
         );
         assert!(KdaRecurrentDecodeSpec::infeasible_mask(&cfg, &grid).is_empty());
         assert_eq!(
             KdaRecurrentDecodeSpec::enumerate(&cfg, &grid, "vllm_triton").len(),
-            10
+            12
         );
         assert_eq!(
             KdaRecurrentDecodeSpec::cache_kind("vllm_triton"),
@@ -136,7 +143,7 @@ mod tests {
         assert_eq!(first["num_heads"], Value::from(16_u32));
         assert_eq!(first["head_dim"], Value::from(128_u32));
         assert_eq!(first["dtype"], Value::from("bf16"));
-        assert_eq!(payloads[9].fields()["batch_size"], Value::from(512_u32));
+        assert_eq!(payloads[11].fields()["batch_size"], Value::from(512_u32));
     }
 
     /// Catches an Input that does not project batch_size onto the cache axis
