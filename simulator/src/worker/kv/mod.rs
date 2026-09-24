@@ -234,14 +234,27 @@ pub trait ChunkedPrefillKv: PrefixKv + IterWorkerKv {
         max_future_tokens: u32,
         page_size: u32,
     ) -> Self::Footprint;
+    /// `decode_step_tokens` is how far each running decode advances in the
+    /// same step as this prefill, 0 when prefill steps run no decode; the
+    /// admission then also leaves room for that step.
     fn fits_bounded_future(
         &self,
         partition: PartitionId,
         footprint: &Self::Footprint,
         max_future_tokens: u32,
         new_token_ratio: f64,
+        decode_step_tokens: u32,
     ) -> bool;
-    fn prepare_next_decode(&mut self, partition: PartitionId, page_size: u32, now: Time) -> u64;
+    /// Shortfall, in tokens, for the next decode step, after shrinking the
+    /// prefix cache. `step_tokens` is how far one decode can advance per step:
+    /// 1 for autoregressive decode, the verify width for a speculating engine.
+    fn prepare_next_decode(
+        &mut self,
+        partition: PartitionId,
+        page_size: u32,
+        step_tokens: u32,
+        now: Time,
+    ) -> u64;
     fn visit_decode_states(&self, partition: PartitionId, visitor: impl FnMut(RequestId, u64, u32));
     fn reserve_chunked_prefill_context(
         &mut self,

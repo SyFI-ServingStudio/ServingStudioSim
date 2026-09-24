@@ -1,0 +1,12 @@
+{
+  "schema_version": 2,
+  "rule_files": [
+    "target_rules.json",
+    "target_gemm_rules.json",
+    "target_extra_rules.json",
+    "draft_rules.json",
+    "draft_extra_rules.json"
+  ],
+  "provenance": "Target rules start from the GLM-5.2 spec-5 pack, draft rules from the DFlash2 capture logs/20260920_0_glm53_dflash2_phase0. Both were checked and corrected against the folded launch programs of this pack's own captures: logs/20260923_4_glm53_dflash2_pack/runs/0[1-8]*/profile_nsys (Slurm 1013-1014, vLLM servingstudio-alignment on the v0.28.1rc0 base, B200 x4, TP4 EP4, DFlash2-7). The corrections are recorded as scripts in that log directory under rules_iter/. Three of them change what is mapped. (1) A GEMM opening a folded body before the TP reduction is the dense layers' FFN down_proj, not o_proj. (2) v0.28 runs prefill of at most index_topk (2048) tokens as dense or masked MHA: kv_b GEMM, ATen mask run, causal fmhaSm100a. The GLM-5.2 lineage had labeled that chain as indexer operations; it is now measured-only, except for the attention kernel itself. (3) `vllm::_typeConvert` is fused_add_rms_norm_kernel's SFINAE guard, so the draft's fused norms belong to the norm leaves. Rules that matched no position in any of the eight cases were then deleted (299 -> 140), which changed no label. Map coverage on the kernel critical path is 88.5-98.3% per case.",
+  "note": "One order-independent rule set split across five files by origin; the files are a union, not a chain. On all eight captured cases `alignment-campaign label` reports 0 order-dependent positions, and `alignment-campaign check` reports 0 subsumptions."
+}

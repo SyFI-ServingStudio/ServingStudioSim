@@ -28,6 +28,12 @@ impl PendingOrderPolicy for FifoOrder {
     }
 
     #[inline]
+    fn push_front(&mut self, candidate: AdmissionCandidate, _context: &mut Self::Context) {
+        self.queued_kv_tokens += candidate.queued_kv_tokens();
+        self.queue.push_front(candidate);
+    }
+
+    #[inline]
     fn peek(&self) -> Option<AdmissionCandidate> {
         self.queue.front().copied()
     }

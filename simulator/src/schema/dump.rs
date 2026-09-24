@@ -73,7 +73,10 @@ pub fn list_params() -> Value {
             "worker": {
                 "iter_wise":       providers_with_flattened(
                     IterWorkerSel::SCHEMA,
-                    &[("chunked_prefill", KvAdmissionSpec::PARAMS)],
+                    &[
+                        ("chunked_prefill", KvAdmissionSpec::PARAMS),
+                        ("speculative", KvAdmissionSpec::PARAMS),
+                    ],
                 ),
                 "layer_wise_attn": providers(AttnWorkerSel::SCHEMA),
                 "layer_wise_ffn":  providers(FfnWorkerSel::SCHEMA),
@@ -235,11 +238,17 @@ mod tests {
     }
 
     #[test]
-    fn chunked_prefill_schema_includes_flattened_kv_admission_spec() {
+    fn iter_worker_schemas_include_flattened_kv_admission_spec() {
         let schema = list_params();
-        let params = schema["providers"]["worker"]["iter_wise"]["chunked_prefill"]["params"]
+        for worker in ["chunked_prefill", "speculative"] {
+            check_flattened_kv_admission_spec(&schema, worker);
+        }
+    }
+
+    fn check_flattened_kv_admission_spec(schema: &serde_json::Value, worker: &str) {
+        let params = schema["providers"]["worker"]["iter_wise"][worker]["params"]
             .as_array()
-            .expect("chunked-prefill params are an array");
+            .expect("worker params are an array");
         let policy = params
             .iter()
             .find(|param| param["name"] == "kv_admission_policy")

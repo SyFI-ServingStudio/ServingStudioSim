@@ -145,7 +145,9 @@ presets/alignment/
 A **variant** is a topology: `deployment`, `gpu` (the canonical name from
 `gpu/spec.json`), `checkpoint` (a key into the host profile), `engine`,
 `backend`, `server`, `arch`, `worker`, `input_builder`, `label_rules`, and
-`profile_passes`.
+`profile_passes`. A proposer that ships as its own checkpoint (DFlash2) is named
+by `draft_checkpoint`, another host key: the variant's `--speculative-config`
+omits `model` and rendering fills it with that checkpoint's path.
 
 `arch` is an **open dict** validated against the tag's parameters in the
 Rust-exported `deployment_schema.json` via `Registry.arch_params`. It is not a
@@ -176,7 +178,33 @@ setting. Optional calibrated `speculative_acceptance` supplies one conditional
 probability per draft position. Rendering preserves the real-engine trace and
 writes a separate `trace_speculative.csv` for the simulator with its required
 `speculative` input tag. Architecture depth, worker depth and vector length must
-agree; borrowed calibration remains marked `provisional`.
+agree, and both depths must be stated rather than defaulted, since the two
+speculative archs default differently. The speculative worker, not a particular
+arch tag, is what makes a case speculative. Borrowed calibration remains marked
+`provisional`.
+
+Acceptance can depend on output position. On GLM-5.3 DFlash2 over enwik9, for
+example, tokens per verify round rose from about 2.6 over the first 128 output
+tokens to 5.5-7.6 beyond 2048. A single case-wide chain is token-weighted, so it
+gives short requests the acceptance of long ones. Optional calibrated
+`speculative_acceptance_by_output_position` refines the chain, and requires it.
+
+```yaml
+speculative_acceptance_by_output_position:
+  value:
+  - {from: 1, p: [...]}    # K + 1 probabilities of 0..K accepted drafts per round
+  - {from: 128, p: [...]}  # ascending `from`; the last bucket is open-ended
+  status: measured
+  derived_from: ...
+```
+
+Each `p` is measured from the workload pass's `decode_request_progress`, bucketed
+by `output_tokens_before`. Rendering folds the buckets a request's declared
+`output_len` crosses into that request's `accept_rate` chain, weighting each
+bucket by the verify rounds it costs (`render.acceptance_chain`). This stays
+predictive: it pools every request by position and reads only the trace's
+output length. Replaying each request's own realized acceptance would condition
+on the measured run.
 
 Two case fields carry more weight than their size suggests:
 

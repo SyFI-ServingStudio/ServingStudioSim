@@ -5,7 +5,9 @@
 //! never rotate through the policy again. KV ownership is policy-defined:
 //! historical deployments reserve the complete request footprint, whereas a
 //! bounded-future deployment pairs a waiting-request estimate with decode-time
-//! physical allocation checks and retraction.
+//! physical allocation checks and retraction. Under `Mix` the decode check runs
+//! before admission and a retracting step admits nothing (vLLM); under
+//! `SeparatePrefillPriority` it runs on decode-only iterations (SGLang).
 //!
 //! Batch composition is independent of KV membership. `Mix` lets resident
 //! decode share the remaining chunk budget. `SeparatePrefillPriority` emits a
@@ -40,6 +42,10 @@ pub struct ChunkedPrefillAdmission<P: PendingOrderPolicy, D = SingleTokenDecodeC
     balance: LoadBalance,
     active_chunks: Vec<Option<AdmissionCandidate>>,
     prefill_episodes: HashMap<RequestId, bool>,
+    /// Order in which each running request was last admitted from the waiting
+    /// queue; FCFS retraction evicts the most recent one.
+    admission_order: HashMap<RequestId, u64>,
+    next_admission: u64,
     /// How far one resident decode moves per iteration. Ordinary decode retires
     /// one token; speculative decode retires up to the verify width.
     decode_completion: D,
@@ -110,6 +116,8 @@ impl<P: PendingOrderPolicy, D> ChunkedPrefillAdmission<P, D> {
             balance,
             active_chunks: Vec::new(),
             prefill_episodes: HashMap::new(),
+            admission_order: HashMap::new(),
+            next_admission: 0,
             decode_completion,
             drafting_slots,
         }
@@ -193,12 +201,30 @@ impl<P: PendingOrderPolicy, D> ChunkedPrefillAdmission<P, D> {
             .map(|(_, request)| request)
     }
 
+    /// vLLM's FCFS preemption: the request that most recently entered the
+    /// running set goes first.
+    fn select_fcfs_retraction<K: ChunkedPrefillKv>(
+        &self,
+        kv_store: &K,
+        partition: u16,
+    ) -> Option<RequestId> {
+        let mut victim = None;
+        kv_store.visit_decode_states(partition, |request, _, _| {
+            let order = self.admission_order[&request];
+            if victim.is_none_or(|(best, _)| order > best) {
+                victim = Some((order, request));
+            }
+        });
+        victim.map(|(_, request)| request)
+    }
+
     fn requeue_retracted<K: ChunkedPrefillKv>(
         &mut self,
         kv_store: &K,
         context: &WorkerContext,
         partition: u16,
         request: RequestId,
+        retraction_policy: DecodeRetractionPolicy,
         now: Time,
     ) {
         let (
@@ -241,21 +267,28 @@ impl<P: PendingOrderPolicy, D> ChunkedPrefillAdmission<P, D> {
             conversation_start_time,
             resident_prefix_tokens,
         );
+        self.admission_order.remove(&request);
         let (policy, policy_context) = &mut self.partition_policies[partition as usize];
-        policy.push(candidate, policy_context);
+        match retraction_policy {
+            DecodeRetractionPolicy::Length => policy.push(candidate, policy_context),
+            DecodeRetractionPolicy::Fcfs => policy.push_front(candidate, policy_context),
+        }
     }
 
+    /// Retract decodes until every partition fits its next decode step, each
+    /// request advancing up to `step_tokens`. Returns whether it retracted.
     fn prepare_decode<K: ChunkedPrefillKv>(
         &mut self,
         kv_store: &mut K,
         context: &WorkerContext,
         now: Time,
         config: BoundedFutureKvAdmissionConfig,
+        step_tokens: u32,
     ) -> bool {
         let mut retracted_any = false;
         for partition in 0..kv_store.num_partitions() as u16 {
             while kv_store.has_live_decode(partition)
-                && kv_store.prepare_next_decode(partition, config.page_size, now) > 0
+                && kv_store.prepare_next_decode(partition, config.page_size, step_tokens, now) > 0
             {
                 let live_count = kv_store.live_decode_count(partition);
                 assert!(
@@ -263,12 +296,23 @@ impl<P: PendingOrderPolicy, D> ChunkedPrefillAdmission<P, D> {
                     "bounded-future decode cannot fit its last request; abort lifecycle is required"
                 );
                 let request = match config.retraction_policy {
-                    DecodeRetractionPolicy::Length => self
-                        .select_length_retraction(kv_store, context, partition)
-                        .expect("decode shortfall requires a retraction candidate"),
-                };
+                    DecodeRetractionPolicy::Length => {
+                        self.select_length_retraction(kv_store, context, partition)
+                    }
+                    DecodeRetractionPolicy::Fcfs => {
+                        self.select_fcfs_retraction(kv_store, partition)
+                    }
+                }
+                .expect("decode shortfall requires a retraction candidate");
                 kv_store.release(request, partition);
-                self.requeue_retracted(kv_store, context, partition, request, now);
+                self.requeue_retracted(
+                    kv_store,
+                    context,
+                    partition,
+                    request,
+                    config.retraction_policy,
+                    now,
+                );
                 retracted_any = true;
             }
         }
@@ -277,7 +321,7 @@ impl<P: PendingOrderPolicy, D> ChunkedPrefillAdmission<P, D> {
         } else {
             self.decay_new_token_ratio(config);
         }
-        (0..kv_store.num_partitions() as u16).any(|partition| kv_store.has_live_decode(partition))
+        retracted_any
     }
 
     #[cfg(test)]
@@ -342,12 +386,24 @@ where
         debug_assert_eq!(self.partition_policies.len(), num_partitions);
         self.active_chunks.resize(num_partitions, None);
         batch_plan.reset_decode_participation(num_partitions, true);
-        let had_decode =
-            (0..num_partitions as u16).any(|partition| kv_store.has_live_decode(partition));
+        let has_live_decode = |kv_store: &K| {
+            (0..num_partitions as u16).any(|partition| kv_store.has_live_decode(partition))
+        };
         let mixes_prefill_with_decode = self.batch_policy == BatchPolicy::Mix;
         let bounded_config = self.bounded_config();
-        let current_new_token_ratio = self.current_new_token_ratio;
         let query_width = self.decode_completion.query_tokens_per_request();
+        // A mixed engine (vLLM) schedules its running decodes first, each
+        // claiming KV for its next step, and admits no waiting request in a step
+        // that had to preempt. A separate-prefill engine (SGLang) checks decode
+        // headroom only on the decode-only steps it runs, below.
+        let retracted_before_admission = match bounded_config {
+            Some(config) if mixes_prefill_with_decode && has_live_decode(kv_store) => {
+                self.prepare_decode(kv_store, context, now, config, query_width)
+            }
+            _ => false,
+        };
+        let had_decode = has_live_decode(kv_store);
+        let current_new_token_ratio = self.current_new_token_ratio;
         // Every scheduled request, decode or prefill chunk, also spends the
         // drafter's slots.
         let drafting_slots = self.drafting_slots;
@@ -411,7 +467,8 @@ where
 
         for partition_index in 0..num_partitions {
             let partition = partition_index as u16;
-            while self.active_chunks[partition_index].is_none()
+            while !retracted_before_admission
+                && self.active_chunks[partition_index].is_none()
                 && remaining_budgets[partition_index] > drafting_slots
             {
                 let (policy, policy_context) = &mut self.partition_policies[partition_index];
@@ -457,6 +514,11 @@ where
                         &footprint,
                         config.max_future_tokens,
                         current_new_token_ratio,
+                        if mixes_prefill_with_decode {
+                            query_width
+                        } else {
+                            0
+                        },
                     ),
                 };
                 if !fits {
@@ -464,6 +526,9 @@ where
                 }
                 let popped = policy.pop(policy_context);
                 debug_assert_eq!(popped, Some(candidate));
+                self.admission_order
+                    .insert(candidate.request_id, self.next_admission);
+                self.next_admission += 1;
                 if candidate.remaining_output_tokens > 1 {
                     if let Some(slots) = future_decode_slots.as_mut() {
                         slots[partition_index] -= 1;
@@ -515,13 +580,12 @@ where
             }
         }
 
-        let had_decode = if !had_prefill && had_decode {
-            match bounded_config {
-                None => true,
-                Some(config) => self.prepare_decode(kv_store, context, now, config),
+        let had_decode = match bounded_config {
+            Some(config) if !mixes_prefill_with_decode && !had_prefill && had_decode => {
+                self.prepare_decode(kv_store, context, now, config, query_width);
+                has_live_decode(kv_store)
             }
-        } else {
-            had_decode
+            _ => had_decode,
         };
 
         let has_batch = had_decode || had_prefill;
@@ -659,6 +723,7 @@ where
             kv_store.clear_prefill_admits(partition);
 
             for request in completed {
+                self.admission_order.remove(&request);
                 kv_store.release_retaining_prefix(request, partition, now);
                 events.push(WorkerEventCommon::RequestComplete {
                     worker: context.id,

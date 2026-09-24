@@ -296,10 +296,24 @@ composition refactor does not create a second deployment layer.
 
 `chunked_prefill` is a generic whole-iteration recipe, not a model-specific
 scheduler. It uses the ordinary pending-order and partition-placement
-contracts, reserves the complete request KV footprint once, and exposes prompt
-chunks bounded by `max_batch_tokens`. Its shell-owned iteration plan expresses
-whether resident decode shares that iteration (`mix`) or waits behind a
-runnable prefill (`separate-prefill-priority`); KV membership is unchanged in
-both cases. It does not replay an observed DP rank or rewrite request shapes,
-and the batch policy does not imply SGLang's separate optimistic-reservation or
-decode-retraction mechanisms.
+contracts and exposes prompt chunks bounded by `max_batch_tokens`. Its
+shell-owned iteration plan expresses whether resident decode shares that
+iteration (`mix`) or waits behind a runnable prefill
+(`separate-prefill-priority`); KV membership is unchanged in both cases. It
+does not replay an observed DP rank or rewrite request shapes.
+
+KV admission is a separate selector component (`kv_admission_policy`), shared
+by `chunked_prefill` and `speculative`:
+
+- `full-footprint` (default) reserves the complete request KV footprint once
+  and never retracts.
+- `bounded-future` admits against a near-future estimate. It then checks
+  every decode step's physical allocation, sized at `min(step, remaining
+  output)` per request, where the step is the verify width under speculation.
+  On a shortfall it retracts a decode for recompute. A `mix` engine claims that
+  step before admitting and admits nothing in a step that retracted, as vLLM
+  does; a `separate-prefill-priority` engine checks only on its decode-only
+  steps, as SGLang does.
+- `decode_retraction_policy` selects the victim. `length` (SGLang) takes the
+  fewest emitted tokens and requeues behind waiting requests. `fcfs` (vLLM)
+  takes the most recently admitted request and requeues it at the head.

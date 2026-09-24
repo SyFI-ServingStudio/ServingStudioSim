@@ -206,6 +206,7 @@ impl ChunkedPrefillKv for FullAttnKv {
         footprint: &Self::Footprint,
         max_future_tokens: u32,
         new_token_ratio: f64,
+        decode_step_tokens: u32,
     ) -> bool {
         debug_assert_eq!(footprint.basis, ReservationBasis::BoundedFuture);
         let partition_state = &self.partitions[partition as usize];
@@ -213,15 +214,26 @@ impl ChunkedPrefillKv for FullAttnKv {
             + self.ledger.partition_promised(partition)
             + self.ledger.partition_held(partition)
             + footprint.reserved_tokens();
-        let running_future =
+        let mut running_future =
             partition_state.bounded_future_decode_tokens(max_future_tokens, new_token_ratio);
+        if decode_step_tokens > 0 {
+            // Bounded-future admission runs on one-token pages only.
+            let next_step = partition_state.next_decode_allocation_tokens(1, decode_step_tokens);
+            running_future = running_future.max(next_step as f64);
+        }
         protected_tokens as f64 + running_future < partition_state.capacity_tokens() as f64
     }
 
-    fn prepare_next_decode(&mut self, partition: PartitionId, page_size: u32, now: Time) -> u64 {
+    fn prepare_next_decode(
+        &mut self,
+        partition: PartitionId,
+        page_size: u32,
+        step_tokens: u32,
+        now: Time,
+    ) -> u64 {
         assert!(page_size > 0, "decode page size must be positive");
         let partition_state = &self.partitions[partition as usize];
-        let required = partition_state.next_decode_allocation_tokens(page_size);
+        let required = partition_state.next_decode_allocation_tokens(page_size, step_tokens);
         if required == 0 {
             return 0;
         }
@@ -564,6 +576,10 @@ impl FullAttnKv {
     }
 
     pub(crate) fn advance(&mut self, scope: AdvanceScope<'_>, steps: u32) {
+        let partition = match scope {
+            AdvanceScope::WholePartition(partition)
+            | AdvanceScope::RequestSubset { partition, .. } => partition,
+        };
         for _ in 0..steps {
             match scope {
                 AdvanceScope::WholePartition(partition) => {
@@ -581,6 +597,15 @@ impl FullAttnKv {
                 }
             }
         }
+        // Admission must have claimed every step's tokens before the step ran;
+        // advancing never checks capacity itself.
+        let state = &self.partitions[partition as usize];
+        debug_assert!(
+            state.resident_tokens() <= state.capacity_tokens(),
+            "decode advance overfilled KV partition {partition}: {} of {} tokens",
+            state.resident_tokens(),
+            state.capacity_tokens()
+        );
     }
 
     pub(crate) fn clear_prefill_admits(&mut self, partition: PartitionId) {

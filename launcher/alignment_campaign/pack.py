@@ -150,6 +150,10 @@ class Variant:
     #: but pinning it lets a migrated pack reproduce an accepted config byte-wise.
     run_name_prefix: str = ""
     raw_overrides: dict[str, Any] = field(default_factory=dict)
+    #: Key into the host profile's `checkpoints` for a proposer that ships as its
+    #: own checkpoint. Rendering writes its path into `--speculative-config`, so
+    #: the pack never carries a machine's HF cache path.
+    draft_checkpoint: str | None = None
 
     def pass_named(self, name: str) -> ProfilePass | None:
         for item in self.profile_passes:
@@ -185,6 +189,13 @@ class Case:
     provenance: dict[str, Any]
     chunk_size: int | None = None
     speculative_acceptance: Calibrated | None = None
+    #: Acceptance as a function of output position: `value` is a list of
+    #: `{from, p}` buckets, `from` the first `output_tokens_before` a bucket
+    #: covers (ascending, the first at most 1) and `p` the per-verify-round
+    #: distribution of accepted drafts 0..K. Rendering folds the buckets a
+    #: request's declared output length crosses into that request's chain, so
+    #: short and long requests stop sharing one token-weighted chain.
+    speculative_acceptance_by_output_position: Calibrated | None = None
 
     @property
     def slug(self) -> str:
@@ -199,6 +210,10 @@ class Case:
             found["rate"] = self.rate
         if self.speculative_acceptance is not None:
             found["speculative_acceptance"] = self.speculative_acceptance
+        if self.speculative_acceptance_by_output_position is not None:
+            found["speculative_acceptance_by_output_position"] = (
+                self.speculative_acceptance_by_output_position
+            )
         return found
 
     def trace_for(self, role: str) -> TraceSpec:
@@ -333,6 +348,32 @@ def _calibrated(raw: Any, where: str) -> Calibrated:
     return Calibrated(value=value, status=status, derived_from=derived_from, evidence=evidence)
 
 
+def _check_acceptance_buckets(buckets: Any, depth: int, where: str) -> None:
+    if not isinstance(buckets, list) or not buckets:
+        raise PackError(f"{where} must be a non-empty list of {{from, p}} buckets")
+    previous = None
+    for index, bucket in enumerate(buckets):
+        at = f"{where}[{index}]"
+        if not isinstance(bucket, dict) or set(bucket) != {"from", "p"}:
+            raise PackError(f"{at} must be a mapping with exactly 'from' and 'p'")
+        start, dist = bucket["from"], bucket["p"]
+        if type(start) is not int or start < 0 or (previous is not None and start <= previous):
+            raise PackError(f"{at}.from must be a non-negative int above the previous bucket's")
+        if index == 0 and start > 1:
+            raise PackError(f"{at}.from must be at most 1 so every decode position has a bucket")
+        if (
+            not isinstance(dist, list)
+            or len(dist) != depth + 1
+            or any(type(x) not in (int, float) or x < 0 for x in dist)
+            or abs(sum(dist) - 1) > 1e-6
+        ):
+            raise PackError(
+                f"{at}.p must be {depth + 1} non-negative probabilities of 0..{depth} "
+                "accepted drafts summing to 1"
+            )
+        previous = start
+
+
 def _trace_spec(raw: Any, where: str) -> TraceSpec:
     if not isinstance(raw, dict):
         raise PackError(f"{where}: must be a mapping")
@@ -419,6 +460,11 @@ def _variant(name: str, raw: Any) -> Variant:
         replicas=_typed(body.pop("replicas", 1), int, f"{where}.replicas"),
         run_name_prefix=_typed(body.pop("run_name_prefix", ""), str, f"{where}.run_name_prefix"),
         raw_overrides=dict(body.pop("raw_overrides", {}) or {}),
+        draft_checkpoint=(
+            None
+            if (draft_checkpoint := body.pop("draft_checkpoint", None)) is None
+            else _typed(draft_checkpoint, str, f"{where}.draft_checkpoint")
+        ),
     )
     _reject_extra(body, where)
     if len({item.name for item in variant.profile_passes}) != len(variant.profile_passes):
@@ -438,6 +484,7 @@ def _case(raw: Any, index_hint: int) -> Case:
     max_concurrency_raw = body.pop("max_concurrency", None)
     chunk_size_raw = body.pop("chunk_size", None)
     acceptance_raw = body.pop("speculative_acceptance", None)
+    by_position_raw = body.pop("speculative_acceptance_by_output_position", None)
     rate_raw = body.pop("rate", None)
     kernel_raw = body.pop("kernel_trace", None)
     window_raw = body.pop("analyze_iterations", None)
@@ -505,6 +552,9 @@ def _case(raw: Any, index_hint: int) -> Case:
         speculative_acceptance=None if acceptance_raw is None else _calibrated(
             acceptance_raw, f"{where}.speculative_acceptance"
         ),
+        speculative_acceptance_by_output_position=None if by_position_raw is None else _calibrated(
+            by_position_raw, f"{where}.speculative_acceptance_by_output_position"
+        ),
     )
     _reject_extra(body, where)
     if case.chunk_size is not None and case.chunk_size <= 0:
@@ -515,6 +565,17 @@ def _case(raw: Any, index_hint: int) -> Case:
             type(value) not in (int, float) or not 0 <= value <= 1 for value in probabilities
         ):
             raise PackError(f"{where}.speculative_acceptance.value must be a non-empty probability list")
+    if case.speculative_acceptance_by_output_position is not None:
+        if case.speculative_acceptance is None:
+            raise PackError(
+                f"{where}: speculative_acceptance_by_output_position refines speculative_acceptance "
+                "and needs it"
+            )
+        _check_acceptance_buckets(
+            case.speculative_acceptance_by_output_position.value,
+            len(case.speculative_acceptance.value),
+            f"{where}.speculative_acceptance_by_output_position.value",
+        )
 
     # The two arrival vocabularies are separate spellings of one decision, and a
     # config that disagrees with itself produces a simulation of a different

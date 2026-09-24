@@ -1,0 +1,106 @@
+{
+  "analyzer_schema": {
+    "ep4_tp4_dp1/01_micro_throughput_c256": {
+      "e2e": 1,
+      "iteration": 3,
+      "workload": 1
+    },
+    "ep4_tp4_dp1/02_graph_boundaries_c128": {
+      "e2e": 1,
+      "iteration": 3,
+      "workload": 1
+    },
+    "ep4_tp4_dp1/03_balanced_anchor_c32": {
+      "e2e": 1,
+      "iteration": 3,
+      "workload": 1
+    },
+    "ep4_tp4_dp1/04_prefill_spectrum_c32": {
+      "e2e": 1,
+      "iteration": 3,
+      "workload": 1
+    },
+    "ep4_tp4_dp1/05_decode_spectrum_c64": {
+      "e2e": 1,
+      "iteration": 3,
+      "workload": 1
+    },
+    "ep4_tp4_dp1/06_long_long_c8": {
+      "e2e": 1,
+      "iteration": 3,
+      "workload": 1
+    },
+    "ep4_tp4_dp1/07_quadrant_interference_c48": {
+      "e2e": 1,
+      "iteration": 3,
+      "workload": 1
+    },
+    "ep4_tp4_dp1/08_completion_churn_c96": {
+      "e2e": 1,
+      "iteration": 3,
+      "workload": 1
+    }
+  },
+  "case_reports": {
+    "ep4_tp4_dp1/01_micro_throughput_c256": {
+      "e2e": "logs/20260923_5_glm53_dflash2_force_mqa/runs/01_micro_throughput_c256/analysis_e2e/reports/alignment_e2e_report.json",
+      "iteration": "logs/20260923_5_glm53_dflash2_force_mqa/runs/01_micro_throughput_c256/analysis_kernel/reports/alignment_iteration_report.json",
+      "workload": "logs/20260923_5_glm53_dflash2_force_mqa/runs/01_micro_throughput_c256/analysis_e2e/reports/alignment_workload_report.json"
+    },
+    "ep4_tp4_dp1/02_graph_boundaries_c128": {
+      "e2e": "logs/20260923_5_glm53_dflash2_force_mqa/runs/02_graph_boundaries_c128/analysis_e2e/reports/alignment_e2e_report.json",
+      "iteration": "logs/20260923_5_glm53_dflash2_force_mqa/runs/02_graph_boundaries_c128/analysis_kernel/reports/alignment_iteration_report.json",
+      "workload": "logs/20260923_5_glm53_dflash2_force_mqa/runs/02_graph_boundaries_c128/analysis_e2e/reports/alignment_workload_report.json"
+    },
+    "ep4_tp4_dp1/03_balanced_anchor_c32": {
+      "e2e": "logs/20260923_5_glm53_dflash2_force_mqa/runs/03_balanced_anchor_c32/analysis_e2e/reports/alignment_e2e_report.json",
+      "iteration": "logs/20260923_5_glm53_dflash2_force_mqa/runs/03_balanced_anchor_c32/analysis_kernel/reports/alignment_iteration_report.json",
+      "workload": "logs/20260923_5_glm53_dflash2_force_mqa/runs/03_balanced_anchor_c32/analysis_e2e/reports/alignment_workload_report.json"
+    },
+    "ep4_tp4_dp1/04_prefill_spectrum_c32": {
+      "e2e": "logs/20260923_5_glm53_dflash2_force_mqa/runs/04_prefill_spectrum_c32/analysis_e2e/reports/alignment_e2e_report.json",
+      "iteration": "logs/20260923_5_glm53_dflash2_force_mqa/runs/04_prefill_spectrum_c32/analysis_kernel/reports/alignment_iteration_report.json",
+      "workload": "logs/20260923_5_glm53_dflash2_force_mqa/runs/04_prefill_spectrum_c32/analysis_e2e/reports/alignment_workload_report.json"
+    },
+    "ep4_tp4_dp1/05_decode_spectrum_c64": {
+      "e2e": "logs/20260923_5_glm53_dflash2_force_mqa/runs/05_decode_spectrum_c64/analysis_e2e/reports/alignment_e2e_report.json",
+      "iteration": "logs/20260923_5_glm53_dflash2_force_mqa/runs/05_decode_spectrum_c64/analysis_kernel/reports/alignment_iteration_report.json",
+      "workload": "logs/20260923_5_glm53_dflash2_force_mqa/runs/05_decode_spectrum_c64/analysis_e2e/reports/alignment_workload_report.json"
+    },
+    "ep4_tp4_dp1/06_long_long_c8": {
+      "e2e": "logs/20260923_5_glm53_dflash2_force_mqa/runs/06_long_long_c8/analysis_e2e/reports/alignment_e2e_report.json",
+      "iteration": "logs/20260923_5_glm53_dflash2_force_mqa/runs/06_long_long_c8/analysis_kernel/reports/alignment_iteration_report.json",
+      "workload": "logs/20260923_5_glm53_dflash2_force_mqa/runs/06_long_long_c8/analysis_e2e/reports/alignment_workload_report.json"
+    },
+    "ep4_tp4_dp1/07_quadrant_interference_c48": {
+      "e2e": "logs/20260923_5_glm53_dflash2_force_mqa/runs/07_quadrant_interference_c48/analysis_e2e/reports/alignment_e2e_report.json",
+      "iteration": "logs/20260923_5_glm53_dflash2_force_mqa/runs/07_quadrant_interference_c48/analysis_kernel/reports/alignment_iteration_report.json",
+      "workload": "logs/20260923_5_glm53_dflash2_force_mqa/runs/07_quadrant_interference_c48/analysis_e2e/reports/alignment_workload_report.json"
+    },
+    "ep4_tp4_dp1/08_completion_churn_c96": {
+      "e2e": "logs/20260923_5_glm53_dflash2_force_mqa/runs/08_completion_churn_c96/analysis_e2e/reports/alignment_e2e_report.json",
+      "iteration": "logs/20260923_5_glm53_dflash2_force_mqa/runs/08_completion_churn_c96/analysis_kernel/reports/alignment_iteration_report.json",
+      "workload": "logs/20260923_5_glm53_dflash2_force_mqa/runs/08_completion_churn_c96/analysis_e2e/reports/alignment_workload_report.json"
+    }
+  },
+  "formulas": {
+    "decode_batch_mean_pct": "ratio(workload.metrics.decode_batch_size.{simulated,measured}.mean)",
+    "e2e_mean_pct": "ratio(e2e.latency.e2e.{simulated,measured}_ms.mean)",
+    "gpu_time_multiplier": "iteration.meta.recommended_gpu_time_multiplier",
+    "iteration_cycle_mean_pct": "ratio(workload.metrics.iteration_cycle_ms.{simulated,measured}.mean)",
+    "iterations_pct": "ratio(workload.meta.{simulated,measured}_iterations)",
+    "kernel_abs_pct": "iteration.comparison.all.absolute_error_pct",
+    "kernel_signed_pct": "iteration.comparison.all.signed_error_pct",
+    "map_coverage_pct": "iteration.mapping.coverage.measured_duration_fraction * 100",
+    "output_tps_pct": "ratio(e2e.throughput.simulated_completion_tps, e2e.throughput.measured_client_completion_tps)",
+    "prefill_tokens_mean_pct": "ratio(workload.metrics.prefill_tokens.{simulated,measured}.mean)",
+    "scheduled_kv_mean_pct": "ratio(workload.metrics.scheduled_kv_tokens.{simulated,measured}.mean)",
+    "server_tpot_mean_pct": "ratio(e2e.latency.server_tpot.{simulated,measured}_ms.mean)",
+    "server_ttft_mean_pct": "ratio(e2e.latency.server_ttft.{simulated,measured}_ms.mean)"
+  },
+  "pack": "glm53_nvfp4_b200_dflash2",
+  "provisional_inputs": [],
+  "recorded_from": [
+    "logs/20260923_5_glm53_dflash2_force_mqa/runs"
+  ]
+}

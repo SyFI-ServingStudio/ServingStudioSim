@@ -93,7 +93,9 @@ def host_for(pack: Pack, host: HostProfile | None) -> HostProfile:
     checkpoints = dict(base.checkpoints)
     roles = dict(base.device_roles)
     for variant in pack.variants.values():
-        for key in (variant.checkpoint, variant.tokenizer):
+        for key in (variant.checkpoint, variant.tokenizer, variant.draft_checkpoint):
+            if key is None:
+                continue
             checkpoints.setdefault(key, f"/nonexistent/checkpoints/{key}")
         world_size = int(variant.server.get("tp_size", 1)) * int(variant.server.get("dp_size", 1))
         for case in pack.cases:

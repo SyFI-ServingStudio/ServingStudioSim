@@ -1,0 +1,102 @@
+{
+  "note": "The traces themselves are not committed: they are `shapes` x `repeats` from campaign.yaml, and `alignment-campaign check` regenerates and compares against this record. Written by `check --update-invariants`, which only ever ADDS a trace. Re-recording an existing one means deleting its entry here first, on purpose, in a reviewable diff.",
+  "schema_version": 1,
+  "traces": {
+    "traces/01_micro_throughput_c256.csv": {
+      "arrival_span_ms": 1023000.0,
+      "distinct_request_ids": 1024,
+      "distinct_shapes": 4,
+      "input_tokens": 61440,
+      "max_input_len": 128,
+      "max_output_len": 64,
+      "max_total_len": 192,
+      "output_tokens": 45056,
+      "request_count": 1024,
+      "sha256": "8bb7b3a7cede69918a2d11e3d1a546d71501d9dc509b476102a81f159ecb7ce4"
+    },
+    "traces/02_graph_boundaries_c128.csv": {
+      "arrival_span_ms": 527000.0,
+      "distinct_request_ids": 528,
+      "distinct_shapes": 11,
+      "input_tokens": 47424,
+      "max_input_len": 256,
+      "max_output_len": 64,
+      "max_total_len": 320,
+      "output_tokens": 26112,
+      "request_count": 528,
+      "sha256": "fd8fead746207b9d7b3b0896a8a0c8ec4464652428b3b959f5155dd7499b642d"
+    },
+    "traces/03_balanced_anchor_c32.csv": {
+      "arrival_span_ms": 239000.0,
+      "distinct_request_ids": 240,
+      "distinct_shapes": 10,
+      "input_tokens": 525312,
+      "max_input_len": 4096,
+      "max_output_len": 256,
+      "max_total_len": 4352,
+      "output_tokens": 46080,
+      "request_count": 240,
+      "sha256": "af2a7ef498b7c7ce4bc4ae25ca7aeb49568770a9855c757844595b31e828b12a"
+    },
+    "traces/04_prefill_spectrum_c32.csv": {
+      "arrival_span_ms": 155000.0,
+      "distinct_request_ids": 156,
+      "distinct_shapes": 13,
+      "input_tokens": 1873152,
+      "max_input_len": 65536,
+      "max_output_len": 64,
+      "max_total_len": 65600,
+      "output_tokens": 9984,
+      "request_count": 156,
+      "sha256": "bbfd24490ab4052bf664c440acf994fc5d38da38a2132cf12deb1679a1c28765"
+    },
+    "traces/05_decode_spectrum_c64.csv": {
+      "arrival_span_ms": 175000.0,
+      "distinct_request_ids": 176,
+      "distinct_shapes": 11,
+      "input_tokens": 266240,
+      "max_input_len": 8192,
+      "max_output_len": 8192,
+      "max_total_len": 12288,
+      "output_tokens": 485632,
+      "request_count": 176,
+      "sha256": "72b3e2313e16b6844ea5490549a3c8391e70bbe80593aecdb8d4115c6661a068"
+    },
+    "traces/06_long_long_c8.csv": {
+      "arrival_span_ms": 63000.0,
+      "distinct_request_ids": 64,
+      "distinct_shapes": 8,
+      "input_tokens": 368640,
+      "max_input_len": 10240,
+      "max_output_len": 4096,
+      "max_total_len": 12288,
+      "output_tokens": 209920,
+      "request_count": 64,
+      "sha256": "c1cc163d6fe4fb9be4dc10c99350efe1d44b2d59d52c04a3136a547b1d6beb7b"
+    },
+    "traces/07_quadrant_interference_c48.csv": {
+      "arrival_span_ms": 191000.0,
+      "distinct_request_ids": 192,
+      "distinct_shapes": 8,
+      "input_tokens": 1058304,
+      "max_input_len": 12288,
+      "max_output_len": 4096,
+      "max_total_len": 13312,
+      "output_tokens": 307200,
+      "request_count": 192,
+      "sha256": "084ade3034652e3e35c3523923e84d7623f041a582db52b1ad11563ced283995"
+    },
+    "traces/08_completion_churn_c96.csv": {
+      "arrival_span_ms": 287000.0,
+      "distinct_request_ids": 288,
+      "distinct_shapes": 12,
+      "input_tokens": 448512,
+      "max_input_len": 4096,
+      "max_output_len": 4096,
+      "max_total_len": 6144,
+      "output_tokens": 212784,
+      "request_count": 288,
+      "sha256": "62eacf147f39065c8d95761dd155e7fabd85cb671cec1b78e794d0a365e1370f"
+    }
+  }
+}

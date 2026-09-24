@@ -1,0 +1,989 @@
+schema_version: 1
+pack: glm53_nvfp4_b200_dflash2
+description: GLM-5.3 NVFP4 with a vLLM DFlash2 proposer (7 drafted tokens) on B200,
+  EP4/TP4/DP1. Cases 01-08 replay the GLM-5.2 spec5 workload families at the same
+  shapes and concurrency, with chunk ceilings rounded to multiples of the verify
+  width 8, so the two speculative deployments are comparable case by case.
+recorded_on:
+  host: b200_raid
+  gpu: NVIDIA B200
+  checkpoint_snapshots:
+    glm53_nvfp4: models--incoai--GLM-5.3-NVFP4/snapshots/54e52520606f96b3d9fc84088ad22882a61648ac
+    glm53_dflash2: models--incoai--GLM-5.3-DFlash2/snapshots/425aa615ce320caac34400208b30808c8f14f76c
+  nsys_version: 2025.5.2
+  device_roles:
+    primary: 0,1,2,3
+variants:
+  ep4_tp4_dp1:
+    deployment: unified
+    gpu: NVIDIA B200
+    replicas: 1
+    checkpoint: glm53_nvfp4
+    # The proposer ships as its own checkpoint; rendering writes its host path
+    # into `--speculative-config`.
+    draft_checkpoint: glm53_dflash2
+    engine: vllm
+    backend: vllm_tokens
+    run_name_prefix: glm53_b200_ep4_dflash2
+    server:
+      tp_size: 4
+      dp_size: 1
+      expert_parallel_size: 4
+      expert_count_reduction_group_size: 4
+      chunk_size: 2048
+      # The capture grid is rounded up to a multiple of the verify width 8, and
+      # 2048 already is one, so the top bucket survives. Left unset, vLLM caps it
+      # at 1024 on SM100 and every prefill iteration runs eager.
+      max_cudagraph_capture_size: 2048
+      enable_server_load_tracking: true
+      # DFlash drafts 8 query rows per request into buffers sized by the
+      # 2048-token budget. vLLM's default of 1024 sequences sends the startup
+      # dummy run 8192 rows and fails with an index-out-of-bounds assert.
+      # 2048 / 8 = 256 is also the most decode requests one step can hold, and
+      # no case exceeds concurrency 256, so the cap never binds a real step.
+      extra_args:
+      - --max-num-seqs
+      - '256'
+      - --enable-expert-parallel
+      - --kv-cache-dtype
+      - fp8_e4m3
+      - --speculative-config
+      - '{"method":"dflash","num_speculative_tokens":7}'
+      # Keep every sparse MLA prefill on the MQA path, as v0.22 did. v0.28's
+      # default sends prefills up to 2048 tokens through dense/masked MHA,
+      # launched op by op between graph pieces. On case 02 that cost 33% of
+      # the run (job 1024: 10341 -> 6927 ms, same tokens and acceptance).
+      - --attention-config
+      - '{"sparse_mla_force_mqa": true}'
+    arch:
+      type: glm53_vllm_nvfp4_dsa_moe_dflash2
+      model_config: model/config/glm53_nvfp4.json
+      fp8: false
+      ep_size: 4
+      nvl_num_gpu: 4
+      routing: corpus
+      token_corpus_file: hf://UW-SyFI/servingstudio-corpora@c09af698f8192222ee8852f8c727630789890310/glm53_nvfp4_dflash2/manifest.json
+      draft_tokens: 7
+      draft_sliding_window: 2048
+    worker:
+      type: speculative
+      max_batch_tokens: 2048
+      batch_policy: mix
+      draft_tokens: 7
+      acceptance_seed: 73
+      # vLLM's KV discipline: admit a request once its prompt and first verify
+      # window fit (no reservation for the rest of its output), claim every
+      # running decode's next verify window first, and on a shortfall preempt
+      # the most recently admitted request back to the head of the queue.
+      # Full-footprint admission never preempted, where case 05 preempted 72 of
+      # 176 requests: TTFT +37.7% and TPOT -48.3% under full footprint, against
+      # +5.5% and -11.5% here.
+      kv_admission_policy: bounded-future
+      kv_page_size: 1
+      kv_max_future_tokens: 8
+      kv_initial_new_token_ratio: 0.0
+      kv_minimum_new_token_ratio: 0.0
+      kv_new_token_ratio_decay_steps: 1
+      kv_retract_decode_steps: 1
+      decode_retraction_policy: fcfs
+    profile_passes:
+    - kind: workload_metrics
+      name: profile_workload
+      trace: workload
+      warmup: true
+    - kind: nsys
+      name: profile_nsys
+      trace: kernel
+      warmup: true
+    # The target's measured routing demand; the proposer is dense and routes
+    # nothing. Rendered on the openai backend, the one that returns routes.
+    - kind: token_corpus
+      name: profile_corpus
+      trace: workload
+    input_builder:
+      type: speculative_engine_text
+      draft_tokens: 7
+      measured_phase: forward
+      group_assignment: per_dp_rank
+    label_rules: label_rules/manifest.json
+cases:
+- index: 1
+  name: micro_throughput_c256
+  variant: ep4_tp4_dp1
+  purpose: Maximum request batching and scheduler pressure.
+  coverage:
+  - batching
+  - scheduler_pressure
+  max_model_len: 8192
+  max_concurrency: 256
+  chunk_size: 2048
+  speculative_acceptance:
+    value:
+    - 0.642583324459589
+    - 0.5364156102411136
+    - 0.5284213778189681
+    - 0.5758550131540485
+    - 0.6299492385786802
+    - 0.6857373086220789
+    - 0.7238542890716804
+    status: measured
+    derived_from: 'Conditional accepted-token count ratios from this case''s warm workload pass: position
+      0 / num_drafts (18782 drafts), then position i / position i-1.'
+    evidence: logs/20260923_5_glm53_dflash2_force_mqa/runs/01_micro_throughput_c256/profile_workload/spec_decode_metrics.json
+  speculative_acceptance_by_output_position:
+    value:
+    - from: 1
+      p:
+      - 0.36108161097949515
+      - 0.3010374969365248
+      - 0.16191487623560166
+      - 0.08063066742913161
+      - 0.03627154644228413
+      - 0.020014704680990116
+      - 0.01176374479209215
+      - 0.0272853525038804
+    - from: 32
+      p:
+      - 0.3505580186515823
+      - 0.29200428069102585
+      - 0.16373643173826632
+      - 0.07093716557101361
+      - 0.04357131937012689
+      - 0.02216786424094175
+      - 0.013912245833970341
+      - 0.043112673903072926
+    status: measured
+    derived_from: Per-verify-round distribution of accepted drafts, from this case's warm workload pass
+      `decode_request_progress`, bucketed by output_tokens_before at [1, 32, 128, 512, 1024, 2048, 4096,
+      8192]; buckets under 50 rounds merged into the previous one.
+    evidence: logs/20260923_5_glm53_dflash2_force_mqa/runs/01_micro_throughput_c256/profile_workload/vllm/glm53_b200_ep4_dflash2_01_micro_throughput_c256_workload_metrics.jsonl
+  profile_arrival_mode: saturated
+  simulation_arrival_mode: saturated
+  gpu_memory_utilization: 0.75
+  capture_seconds: 15.0
+  device_role: primary
+  workload_trace:
+    file: traces/01_micro_throughput_c256.csv
+    shapes:
+    - - 16
+      - 16
+    - - 32
+      - 32
+    - - 64
+      - 64
+    - - 128
+      - 64
+    repeats: 256
+  attn_gpu_memory_gb:
+    value: 7.514121216
+    status: measured
+    derived_from: Workload GPU KV cache capacity 128896 tokens; 58296 bytes/token/rank is 55224 (target
+      MLA + index, no MTP layer) plus 3072 (six draft GQA layers, 2 of 8 KV heads per rank, fp8 K and V),
+      so per-rank budget is C * 58296 / 1e9 GB.
+    evidence: logs/20260923_5_glm53_dflash2_force_mqa/runs/01_micro_throughput_c256/profile_workload/vllm/glm53_b200_ep4_dflash2_01_micro_throughput_c256_workload_server.log
+  provenance:
+    workload_source: glm52_nvfp4_b200_spec5 case 01, same shapes and repeats
+- index: 2
+  name: graph_boundaries_c128
+  variant: ep4_tp4_dp1
+  purpose: CUDA graph and small-batch kernel boundaries.
+  coverage:
+  - cuda_graph_boundaries
+  - small_batch
+  max_model_len: 8192
+  max_concurrency: 128
+  chunk_size: 2048
+  speculative_acceptance:
+    value:
+    - 0.6400595404223649
+    - 0.5523255813953488
+    - 0.5297368421052632
+    - 0.581718827620467
+    - 0.6575576430401366
+    - 0.7259740259740259
+    - 0.7352415026833632
+    status: measured
+    derived_from: 'Conditional accepted-token count ratios from this case''s warm workload pass: position
+      0 / num_drafts (10749 drafts), then position i / position i-1.'
+    evidence: logs/20260923_5_glm53_dflash2_force_mqa/runs/02_graph_boundaries_c128/profile_workload/spec_decode_metrics.json
+  speculative_acceptance_by_output_position:
+    value:
+    - from: 1
+      p:
+      - 0.3708006718924972
+      - 0.2889137737961926
+      - 0.1633538633818589
+      - 0.07460806270996641
+      - 0.036114221724524075
+      - 0.019456886898096305
+      - 0.012877939529675251
+      - 0.03387458006718925
+    - from: 32
+      p:
+      - 0.33805162364696084
+      - 0.2819872328615043
+      - 0.17207882320288648
+      - 0.08576186511240633
+      - 0.03968914793227866
+      - 0.019983347210657785
+      - 0.015542603386067166
+      - 0.04690535664723841
+    status: measured
+    derived_from: Per-verify-round distribution of accepted drafts, from this case's warm workload pass
+      `decode_request_progress`, bucketed by output_tokens_before at [1, 32, 128, 512, 1024, 2048, 4096,
+      8192]; buckets under 50 rounds merged into the previous one.
+    evidence: logs/20260923_5_glm53_dflash2_force_mqa/runs/02_graph_boundaries_c128/profile_workload/vllm/glm53_b200_ep4_dflash2_02_graph_boundaries_c128_workload_metrics.jsonl
+  profile_arrival_mode: saturated
+  simulation_arrival_mode: saturated
+  gpu_memory_utilization: 0.75
+  capture_seconds: 15.0
+  device_role: primary
+  workload_trace:
+    file: traces/02_graph_boundaries_c128.csv
+    shapes:
+    - - 1
+      - 32
+    - - 15
+      - 32
+    - - 16
+      - 32
+    - - 31
+      - 32
+    - - 32
+      - 32
+    - - 63
+      - 64
+    - - 64
+      - 64
+    - - 127
+      - 64
+    - - 128
+      - 64
+    - - 255
+      - 64
+    - - 256
+      - 64
+    repeats: 48
+  attn_gpu_memory_gb:
+    value: 7.514121216
+    status: measured
+    derived_from: Workload GPU KV cache capacity 128896 tokens; 58296 bytes/token/rank is 55224 (target
+      MLA + index, no MTP layer) plus 3072 (six draft GQA layers, 2 of 8 KV heads per rank, fp8 K and V),
+      so per-rank budget is C * 58296 / 1e9 GB.
+    evidence: logs/20260923_5_glm53_dflash2_force_mqa/runs/02_graph_boundaries_c128/profile_workload/vllm/glm53_b200_ep4_dflash2_02_graph_boundaries_c128_workload_server.log
+  provenance:
+    workload_source: glm52_nvfp4_b200_spec5 case 02, same shapes and repeats
+- index: 3
+  name: balanced_anchor_c32
+  variant: ep4_tp4_dp1
+  purpose: Comparable extension of the existing c32 anchor.
+  coverage:
+  - balanced_anchor
+  max_model_len: 8192
+  max_concurrency: 32
+  chunk_size: 4096
+  speculative_acceptance:
+    value:
+    - 0.6903313817995794
+    - 0.5880609304240428
+    - 0.5588070568468216
+    - 0.5690303182159859
+    - 0.6147071774548657
+    - 0.6712034383954155
+    - 0.7694770544290288
+    status: measured
+    derived_from: 'Conditional accepted-token count ratios from this case''s warm workload pass: position
+      0 / num_drafts (17593 drafts), then position i / position i-1.'
+    evidence: logs/20260923_5_glm53_dflash2_force_mqa/runs/03_balanced_anchor_c32/profile_workload/spec_decode_metrics.json
+  speculative_acceptance_by_output_position:
+    value:
+    - from: 1
+      p:
+      - 0.28125
+      - 0.29945054945054944
+      - 0.19162087912087913
+      - 0.0989010989010989
+      - 0.052884615384615384
+      - 0.0260989010989011
+      - 0.008585164835164836
+      - 0.04120879120879121
+    - from: 32
+      p:
+      - 0.3123948401570387
+      - 0.2886146943353898
+      - 0.1773415591699383
+      - 0.09904655075715087
+      - 0.049579360628154795
+      - 0.024789680314077397
+      - 0.010992708917554684
+      - 0.03724060572069546
+    - from: 128
+      p:
+      - 0.3198057578910857
+      - 0.2702046479361776
+      - 0.17551161984044397
+      - 0.09521331945889698
+      - 0.04838709677419355
+      - 0.02809573361082206
+      - 0.016129032258064516
+      - 0.04665279223031564
+    status: measured
+    derived_from: Per-verify-round distribution of accepted drafts, from this case's warm workload pass
+      `decode_request_progress`, bucketed by output_tokens_before at [1, 32, 128, 512, 1024, 2048, 4096,
+      8192]; buckets under 50 rounds merged into the previous one.
+    evidence: logs/20260923_5_glm53_dflash2_force_mqa/runs/03_balanced_anchor_c32/profile_workload/vllm/glm53_b200_ep4_dflash2_03_balanced_anchor_c32_workload_metrics.jsonl
+  profile_arrival_mode: saturated
+  simulation_arrival_mode: saturated
+  gpu_memory_utilization: 0.75
+  capture_seconds: 15.0
+  device_role: primary
+  workload_trace:
+    file: traces/03_balanced_anchor_c32.csv
+    shapes:
+    - - 256
+      - 128
+    - - 256
+      - 256
+    - - 1024
+      - 128
+    - - 1024
+      - 256
+    - - 2048
+      - 128
+    - - 2048
+      - 256
+    - - 3072
+      - 128
+    - - 3968
+      - 256
+    - - 4096
+      - 128
+    - - 4096
+      - 256
+    repeats: 24
+  attn_gpu_memory_gb:
+    value: 6.917170176
+    status: measured
+    derived_from: Workload GPU KV cache capacity 118656 tokens; 58296 bytes/token/rank is 55224 (target
+      MLA + index, no MTP layer) plus 3072 (six draft GQA layers, 2 of 8 KV heads per rank, fp8 K and V),
+      so per-rank budget is C * 58296 / 1e9 GB.
+    evidence: logs/20260923_5_glm53_dflash2_force_mqa/runs/03_balanced_anchor_c32/profile_workload/vllm/glm53_b200_ep4_dflash2_03_balanced_anchor_c32_workload_server.log
+  provenance:
+    workload_source: glm52_nvfp4_b200_spec5 case 03, same shapes and repeats
+- index: 4
+  name: prefill_spectrum_c32
+  variant: ep4_tp4_dp1
+  purpose: Prefill scaling across the old 2K boundary and the active 8K chunk boundary.
+  coverage:
+  - prefill_scaling
+  - chunk_boundary
+  max_model_len: 131072
+  max_concurrency: 32
+  chunk_size: 8192
+  speculative_acceptance:
+    value:
+    - 0.6721311475409836
+    - 0.5676274944567627
+    - 0.5305989583333334
+    - 0.5484662576687117
+    - 0.5279642058165548
+    - 0.597457627118644
+    - 0.723404255319149
+    status: measured
+    derived_from: 'Conditional accepted-token count ratios from this case''s warm workload pass: position
+      0 / num_drafts (4026 drafts), then position i / position i-1.'
+    evidence: logs/20260923_5_glm53_dflash2_force_mqa/runs/04_prefill_spectrum_c32/profile_workload/spec_decode_metrics.json
+  speculative_acceptance_by_output_position:
+    value:
+    - from: 1
+      p:
+      - 0.31565906838453917
+      - 0.2993062438057483
+      - 0.18681863230921705
+      - 0.09018830525272548
+      - 0.051040634291377604
+      - 0.020317145688800792
+      - 0.009415262636273538
+      - 0.027254707631318136
+    - from: 32
+      p:
+      - 0.3401394422310757
+      - 0.2818725099601594
+      - 0.17131474103585656
+      - 0.09262948207171315
+      - 0.053784860557768925
+      - 0.026892430278884463
+      - 0.0099601593625498
+      - 0.023406374501992032
+    status: measured
+    derived_from: Per-verify-round distribution of accepted drafts, from this case's warm workload pass
+      `decode_request_progress`, bucketed by output_tokens_before at [1, 32, 128, 512, 1024, 2048, 4096,
+      8192]; buckets under 50 rounds merged into the previous one.
+    evidence: logs/20260923_5_glm53_dflash2_force_mqa/runs/04_prefill_spectrum_c32/profile_workload/vllm/glm53_b200_ep4_dflash2_04_prefill_spectrum_c32_workload_metrics.jsonl
+  profile_arrival_mode: saturated
+  simulation_arrival_mode: saturated
+  # spec5 ran this case at 0.76. The GLM-5.3 target plus the proposer leave
+  # 5.42 GiB of KV there at chunk 8192, less than one 131072-token request
+  # needs (6.2 GiB), and vLLM refuses to start.
+  gpu_memory_utilization: 0.85
+  capture_seconds: 15.0
+  device_role: primary
+  workload_trace:
+    file: traces/04_prefill_spectrum_c32.csv
+    shapes:
+    - - 128
+      - 64
+    - - 512
+      - 64
+    - - 1984
+      - 64
+    - - 2048
+      - 64
+    - - 2112
+      - 64
+    - - 4096
+      - 64
+    - - 6144
+      - 64
+    - - 7936
+      - 64
+    - - 8192
+      - 64
+    - - 8256
+      - 64
+    - - 16384
+      - 64
+    - - 32768
+      - 64
+    - - 65536
+      - 64
+    repeats: 12
+  attn_gpu_memory_gb:
+    value: 26.47104768
+    status: measured
+    derived_from: Workload GPU KV cache capacity 454080 tokens; 58296 bytes/token/rank is 55224 (target
+      MLA + index, no MTP layer) plus 3072 (six draft GQA layers, 2 of 8 KV heads per rank, fp8 K and V),
+      so per-rank budget is C * 58296 / 1e9 GB.
+    evidence: logs/20260923_5_glm53_dflash2_force_mqa/runs/04_prefill_spectrum_c32/profile_workload/vllm/glm53_b200_ep4_dflash2_04_prefill_spectrum_c32_workload_server.log
+  provenance:
+    workload_source: glm52_nvfp4_b200_spec5 case 04, same shapes and repeats
+- index: 5
+  name: decode_spectrum_c64
+  variant: ep4_tp4_dp1
+  purpose: Decode residence, KV growth, and batch contraction.
+  coverage:
+  - decode_residence
+  - kv_growth
+  max_model_len: 16384
+  max_concurrency: 64
+  chunk_size: 4096
+  speculative_acceptance:
+    value:
+    - 0.7890761334473909
+    - 0.7367713539238749
+    - 0.7841587946205232
+    - 0.8393410016324846
+    - 0.883816592519729
+    - 0.9252036221986139
+    - 0.943078984061022
+    status: measured
+    derived_from: 'Conditional accepted-token count ratios from this case''s warm workload pass: position
+      0 / num_drafts (116900 drafts), then position i / position i-1.'
+    evidence: logs/20260923_5_glm53_dflash2_force_mqa/runs/05_decode_spectrum_c64/profile_workload/spec_decode_metrics.json
+  speculative_acceptance_by_output_position:
+    value:
+    - from: 1
+      p:
+      - 0.30014224751066854
+      - 0.3148411569464201
+      - 0.17354196301564723
+      - 0.0905642484589853
+      - 0.047889995258416314
+      - 0.02702702702702703
+      - 0.016121384542437174
+      - 0.029871977240398292
+    - from: 32
+      p:
+      - 0.31726438698915765
+      - 0.29157631359466224
+      - 0.1848206839032527
+      - 0.08807339449541285
+      - 0.04603836530442035
+      - 0.02268557130942452
+      - 0.01701417848206839
+      - 0.03252710592160134
+    - from: 128
+      p:
+      - 0.3102026270237247
+      - 0.26718256796660217
+      - 0.16276346604215455
+      - 0.09291314530088586
+      - 0.05086040118114245
+      - 0.02565930149679259
+      - 0.017258934935342633
+      - 0.07315955605335506
+    - from: 512
+      p:
+      - 0.26026906747148193
+      - 0.24451378587140007
+      - 0.15330707453066653
+      - 0.08772827254591027
+      - 0.05371118727300629
+      - 0.029720190291063483
+      - 0.018108343137756406
+      - 0.15264207887871503
+    - from: 1024
+      p:
+      - 0.21692147324530925
+      - 0.218589298123697
+      - 0.1292564280750521
+      - 0.07692842251563586
+      - 0.050868658790826964
+      - 0.02856150104239055
+      - 0.01980542043085476
+      - 0.2590687977762335
+    - from: 2048
+      p:
+      - 0.14323426193360042
+      - 0.1664337401782664
+      - 0.09711481723034877
+      - 0.06146153607254884
+      - 0.03851051274884313
+      - 0.02335476257026616
+      - 0.016739650299698747
+      - 0.4531507189664275
+    - from: 4096
+      p:
+      - 0.013970673132432745
+      - 0.022052880729707885
+      - 0.01778085671400531
+      - 0.012700611938575222
+      - 0.007735827271677635
+      - 0.012123311395912712
+      - 0.01662625562868029
+      - 0.8970095831890083
+    status: measured
+    derived_from: Per-verify-round distribution of accepted drafts, from this case's warm workload pass
+      `decode_request_progress`, bucketed by output_tokens_before at [1, 32, 128, 512, 1024, 2048, 4096,
+      8192]; buckets under 50 rounds merged into the previous one.
+    evidence: logs/20260923_5_glm53_dflash2_force_mqa/runs/05_decode_spectrum_c64/profile_workload/vllm/glm53_b200_ep4_dflash2_05_decode_spectrum_c64_workload_metrics.jsonl
+  profile_arrival_mode: saturated
+  simulation_arrival_mode: saturated
+  gpu_memory_utilization: 0.75
+  capture_seconds: 15.0
+  device_role: primary
+  workload_trace:
+    file: traces/05_decode_spectrum_c64.csv
+    shapes:
+    - - 128
+      - 16
+    - - 128
+      - 128
+    - - 128
+      - 512
+    - - 128
+      - 1024
+    - - 128
+      - 2048
+    - - 128
+      - 4096
+    - - 512
+      - 2048
+    - - 1024
+      - 4096
+    - - 2048
+      - 8192
+    - - 4096
+      - 4096
+    - - 8192
+      - 4096
+    repeats: 16
+  attn_gpu_memory_gb:
+    value: 6.644811264
+    status: measured
+    derived_from: Workload GPU KV cache capacity 113984 tokens; 58296 bytes/token/rank is 55224 (target
+      MLA + index, no MTP layer) plus 3072 (six draft GQA layers, 2 of 8 KV heads per rank, fp8 K and V),
+      so per-rank budget is C * 58296 / 1e9 GB.
+    evidence: logs/20260923_5_glm53_dflash2_force_mqa/runs/05_decode_spectrum_c64/profile_workload/vllm/glm53_b200_ep4_dflash2_05_decode_spectrum_c64_workload_server.log
+  provenance:
+    workload_source: glm52_nvfp4_b200_spec5 case 05, same shapes and repeats
+- index: 6
+  name: long_long_c8
+  variant: ep4_tp4_dp1
+  purpose: Long-prefill plus long-decode interaction near context capacity.
+  coverage:
+  - long_prefill
+  - long_decode
+  max_model_len: 16384
+  max_concurrency: 8
+  chunk_size: 4096
+  speculative_acceptance:
+    value:
+    - 0.7764165678691733
+    - 0.7335789422657424
+    - 0.7571532412608207
+    - 0.8109181358003142
+    - 0.859656675456062
+    - 0.909358372456964
+    - 0.9226956701314794
+    status: measured
+    derived_from: 'Conditional accepted-token count ratios from this case''s warm workload pass: position
+      0 / num_drafts (53139 drafts), then position i / position i-1.'
+    evidence: logs/20260923_5_glm53_dflash2_force_mqa/runs/06_long_long_c8/profile_workload/spec_decode_metrics.json
+  speculative_acceptance_by_output_position:
+    value:
+    - from: 1
+      p:
+      - 0.2712082262210797
+      - 0.3046272493573265
+      - 0.19794344473007713
+      - 0.09640102827763496
+      - 0.055269922879177376
+      - 0.02956298200514139
+      - 0.019280205655526992
+      - 0.02570694087403599
+    - from: 32
+      p:
+      - 0.3230704344158583
+      - 0.2813159004639393
+      - 0.17334458034584563
+      - 0.08730493462673977
+      - 0.053985660059046814
+      - 0.030366933783213833
+      - 0.016448755799240825
+      - 0.034162800506115566
+    - from: 128
+      p:
+      - 0.3111085870059064
+      - 0.26692412539754656
+      - 0.1683325761017719
+      - 0.09223080417991822
+      - 0.049522944116310766
+      - 0.025329395729213992
+      - 0.01522035438437074
+      - 0.07133121308496138
+    - from: 512
+      p:
+      - 0.27774358974358976
+      - 0.23343589743589743
+      - 0.14256410256410257
+      - 0.0838974358974359
+      - 0.05323076923076923
+      - 0.03169230769230769
+      - 0.019282051282051283
+      - 0.15815384615384614
+    - from: 1024
+      p:
+      - 0.19353556762485097
+      - 0.1924095906742615
+      - 0.13253411047820904
+      - 0.08140151013379256
+      - 0.05053649489998675
+      - 0.026427341369717843
+      - 0.023314346271029275
+      - 0.2998410385481521
+    - from: 2048
+      p:
+      - 0.1551597502754315
+      - 0.15650630432121435
+      - 0.1170277879789448
+      - 0.07295874648059739
+      - 0.04400783449626637
+      - 0.025829354878198065
+      - 0.02417676582201004
+      - 0.4043334557473375
+    status: measured
+    derived_from: Per-verify-round distribution of accepted drafts, from this case's warm workload pass
+      `decode_request_progress`, bucketed by output_tokens_before at [1, 32, 128, 512, 1024, 2048, 4096,
+      8192]; buckets under 50 rounds merged into the previous one.
+    evidence: logs/20260923_5_glm53_dflash2_force_mqa/runs/06_long_long_c8/profile_workload/vllm/glm53_b200_ep4_dflash2_06_long_long_c8_workload_metrics.jsonl
+  profile_arrival_mode: saturated
+  simulation_arrival_mode: saturated
+  gpu_memory_utilization: 0.75
+  capture_seconds: 15.0
+  device_role: primary
+  workload_trace:
+    file: traces/06_long_long_c8.csv
+    shapes:
+    - - 2048
+      - 4096
+    - - 3072
+      - 3072
+    - - 4096
+      - 3968
+    - - 5120
+      - 2944
+    - - 6144
+      - 1920
+    - - 7168
+      - 4096
+    - - 8192
+      - 4096
+    - - 10240
+      - 2048
+    repeats: 8
+  attn_gpu_memory_gb:
+    value: 6.644811264
+    status: measured
+    derived_from: Workload GPU KV cache capacity 113984 tokens; 58296 bytes/token/rank is 55224 (target
+      MLA + index, no MTP layer) plus 3072 (six draft GQA layers, 2 of 8 KV heads per rank, fp8 K and V),
+      so per-rank budget is C * 58296 / 1e9 GB.
+    evidence: logs/20260923_5_glm53_dflash2_force_mqa/runs/06_long_long_c8/profile_workload/vllm/glm53_b200_ep4_dflash2_06_long_long_c8_workload_server.log
+  provenance:
+    workload_source: glm52_nvfp4_b200_spec5 case 06, same shapes and repeats
+- index: 7
+  name: quadrant_interference_c48
+  variant: ep4_tp4_dp1
+  purpose: All four IO quadrants sharing continuous batches.
+  coverage:
+  - io_quadrants
+  - continuous_batching
+  max_model_len: 16384
+  max_concurrency: 48
+  chunk_size: 8192
+  speculative_acceptance:
+    value:
+    - 0.7815916536199661
+    - 0.7345643684352275
+    - 0.76846398863402
+    - 0.8275234829282839
+    - 0.875644120932579
+    - 0.9088065843621399
+    - 0.9375113204129687
+    status: measured
+    derived_from: 'Conditional accepted-token count ratios from this case''s warm workload pass: position
+      0 / num_drafts (76009 drafts), then position i / position i-1.'
+    evidence: logs/20260923_5_glm53_dflash2_force_mqa/runs/07_quadrant_interference_c48/profile_workload/spec_decode_metrics.json
+  speculative_acceptance_by_output_position:
+    value:
+    - from: 1
+      p:
+      - 0.322280630812778
+      - 0.30206227254346946
+      - 0.17994338859684594
+      - 0.08370400323493732
+      - 0.046906591184795794
+      - 0.02507076425394258
+      - 0.01213101496158512
+      - 0.027901334411645773
+    - from: 32
+      p:
+      - 0.3078876816706646
+      - 0.30351347537745166
+      - 0.16875970086073092
+      - 0.08847184986595175
+      - 0.04868068294059546
+      - 0.02793847890503739
+      - 0.01693241145759842
+      - 0.037815718921969804
+    - from: 128
+      p:
+      - 0.31628400394028944
+      - 0.26680306130181103
+      - 0.16140031825414866
+      - 0.09002045919527166
+      - 0.05092066378722437
+      - 0.027354701826172615
+      - 0.015609608244297947
+      - 0.07160718345078428
+    - from: 512
+      p:
+      - 0.2525459640489372
+      - 0.24113184334631946
+      - 0.15959264575217005
+      - 0.09336340646572347
+      - 0.053653202105119265
+      - 0.035404278586562775
+      - 0.01995762422254118
+      - 0.14435103547262662
+    - from: 1024
+      p:
+      - 0.19835000877654907
+      - 0.18805219121174888
+      - 0.12772804399976595
+      - 0.07319641916798315
+      - 0.04856357147036452
+      - 0.03317535545023697
+      - 0.02252647592300041
+      - 0.30840793400035105
+    - from: 2048
+      p:
+      - 0.10987786188640691
+      - 0.12111642595086611
+      - 0.08428923048344401
+      - 0.05317419774299912
+      - 0.03264756420378025
+      - 0.02368457716063716
+      - 0.016114800538708028
+      - 0.5590953420331584
+    status: measured
+    derived_from: Per-verify-round distribution of accepted drafts, from this case's warm workload pass
+      `decode_request_progress`, bucketed by output_tokens_before at [1, 32, 128, 512, 1024, 2048, 4096,
+      8192]; buckets under 50 rounds merged into the previous one.
+    evidence: logs/20260923_5_glm53_dflash2_force_mqa/runs/07_quadrant_interference_c48/profile_workload/vllm/glm53_b200_ep4_dflash2_07_quadrant_interference_c48_workload_metrics.jsonl
+  profile_arrival_mode: saturated
+  simulation_arrival_mode: saturated
+  gpu_memory_utilization: 0.75
+  capture_seconds: 15.0
+  device_role: primary
+  workload_trace:
+    file: traces/07_quadrant_interference_c48.csv
+    shapes:
+    - - 128
+      - 128
+    - - 128
+      - 4096
+    - - 4096
+      - 128
+    - - 3072
+      - 3072
+    - - 7936
+      - 128
+    - - 8192
+      - 4096
+    - - 8256
+      - 128
+    - - 12288
+      - 1024
+    repeats: 24
+  attn_gpu_memory_gb:
+    value: 5.383752192
+    status: measured
+    derived_from: Workload GPU KV cache capacity 92352 tokens; 58296 bytes/token/rank is 55224 (target MLA
+      + index, no MTP layer) plus 3072 (six draft GQA layers, 2 of 8 KV heads per rank, fp8 K and V), so
+      per-rank budget is C * 58296 / 1e9 GB.
+    evidence: logs/20260923_5_glm53_dflash2_force_mqa/runs/07_quadrant_interference_c48/profile_workload/vllm/glm53_b200_ep4_dflash2_07_quadrant_interference_c48_workload_server.log
+  provenance:
+    workload_source: glm52_nvfp4_b200_spec5 case 07, same shapes and repeats
+- index: 8
+  name: completion_churn_c96
+  variant: ep4_tp4_dp1
+  purpose: Rapid completions, shrinking batches, and request replacement.
+  coverage:
+  - completion_churn
+  - admission
+  max_model_len: 8192
+  max_concurrency: 96
+  chunk_size: 2048
+  speculative_acceptance:
+    value:
+    - 0.7428188593920108
+    - 0.689379932356257
+    - 0.7188133708379669
+    - 0.7825453883605588
+    - 0.8374811024537737
+    - 0.89217524126918
+    - 0.9221789883268483
+    status: measured
+    derived_from: 'Conditional accepted-token count ratios from this case''s warm workload pass: position
+      0 / num_drafts (59705 drafts), then position i / position i-1.'
+    evidence: logs/20260923_5_glm53_dflash2_force_mqa/runs/08_completion_churn_c96/profile_workload/spec_decode_metrics.json
+  speculative_acceptance_by_output_position:
+    value:
+    - from: 1
+      p:
+      - 0.3002526163839769
+      - 0.3208228076506676
+      - 0.18549260194875497
+      - 0.08769397329483941
+      - 0.04294478527607362
+      - 0.02309635510645976
+      - 0.01154817755322988
+      - 0.028148682785997834
+    - from: 32
+      p:
+      - 0.3118028966206093
+      - 0.2974862660229732
+      - 0.1786249375728317
+      - 0.09505576827035125
+      - 0.048110537706009655
+      - 0.02247378058931247
+      - 0.012651906109538872
+      - 0.033793907108373565
+    - from: 128
+      p:
+      - 0.32165346966768504
+      - 0.2750794937340233
+      - 0.16958663258307874
+      - 0.08984350645302076
+      - 0.04520231934659268
+      - 0.026871999501215788
+      - 0.015836398777978676
+      - 0.055926179936405016
+    - from: 512
+      p:
+      - 0.27356382279479424
+      - 0.24819245431839096
+      - 0.1556461154200079
+      - 0.0886683317996582
+      - 0.05074273695280663
+      - 0.02977520704614171
+      - 0.019652951229131063
+      - 0.1337583804390693
+    - from: 1024
+      p:
+      - 0.21371527777777777
+      - 0.18255208333333334
+      - 0.12369791666666667
+      - 0.07473958333333333
+      - 0.04956597222222222
+      - 0.026128472222222223
+      - 0.018663194444444444
+      - 0.3109375
+    - from: 2048
+      p:
+      - 0.10829662261380323
+      - 0.09899657366617719
+      - 0.06081742535487029
+      - 0.038423886441507585
+      - 0.0390357317670093
+      - 0.020680372001957905
+      - 0.015173764072442487
+      - 0.618575624082232
+    status: measured
+    derived_from: Per-verify-round distribution of accepted drafts, from this case's warm workload pass
+      `decode_request_progress`, bucketed by output_tokens_before at [1, 32, 128, 512, 1024, 2048, 4096,
+      8192]; buckets under 50 rounds merged into the previous one.
+    evidence: logs/20260923_5_glm53_dflash2_force_mqa/runs/08_completion_churn_c96/profile_workload/vllm/glm53_b200_ep4_dflash2_08_completion_churn_c96_workload_metrics.jsonl
+  profile_arrival_mode: saturated
+  simulation_arrival_mode: saturated
+  gpu_memory_utilization: 0.75
+  capture_seconds: 15.0
+  device_role: primary
+  workload_trace:
+    file: traces/08_completion_churn_c96.csv
+    shapes:
+    - - 128
+      - 1
+    - - 128
+      - 16
+    - - 512
+      - 64
+    - - 512
+      - 256
+    - - 512
+      - 1024
+    - - 512
+      - 4096
+    - - 2048
+      - 1
+    - - 2048
+      - 16
+    - - 2048
+      - 64
+    - - 2048
+      - 256
+    - - 4096
+      - 1024
+    - - 4096
+      - 2048
+    repeats: 24
+  attn_gpu_memory_gb:
+    value: 7.514121216
+    status: measured
+    derived_from: Workload GPU KV cache capacity 128896 tokens; 58296 bytes/token/rank is 55224 (target
+      MLA + index, no MTP layer) plus 3072 (six draft GQA layers, 2 of 8 KV heads per rank, fp8 K and V),
+      so per-rank budget is C * 58296 / 1e9 GB.
+    evidence: logs/20260923_5_glm53_dflash2_force_mqa/runs/08_completion_churn_c96/profile_workload/vllm/glm53_b200_ep4_dflash2_08_completion_churn_c96_workload_server.log
+  provenance:
+    workload_source: glm52_nvfp4_b200_spec5 case 08, same shapes and repeats
