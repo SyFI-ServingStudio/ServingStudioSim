@@ -49,7 +49,7 @@ import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import yaml
 
@@ -129,12 +129,49 @@ def config_stem(variant: Variant, phase: str) -> str:
 
 # ── traces ───────────────────────────────────────────────────────────────────
 
-def trace_text(case: Case, spec: TraceSpec, *, speculative_acceptance: list[float] | None = None) -> str:
+def acceptance_chain(case: Case, output_len: int) -> list[float]:
+    """The conditional acceptance chain one request of `output_len` tokens gets.
+
+    Without output-position buckets every request gets the case chain. With
+    them, bucket b covers decode positions [from_b, from_b+1) of the request's
+    [1, output_len); the request spends n_b = tokens_b / E_b verify rounds
+    there, E_b = sum_a (a + 1) p_b(a). Its per-round distribution is
+    q = sum_b n_b p_b / sum_b n_b, and position k's conditional acceptance is
+    P(a >= k + 1) / P(a >= k) under q.
+    """
+    assert case.speculative_acceptance is not None
+    if case.speculative_acceptance_by_output_position is None:
+        return list(case.speculative_acceptance.value)
+    buckets = case.speculative_acceptance_by_output_position.value
+    depth = len(buckets[0]["p"]) - 1
+    mixed = [0.0] * (depth + 1)
+    total_rounds = 0.0
+    for index, bucket in enumerate(buckets):
+        end = buckets[index + 1]["from"] if index + 1 < len(buckets) else output_len
+        tokens = max(0, min(output_len, end) - max(1, bucket["from"]))
+        if tokens == 0:
+            continue
+        dist = bucket["p"]
+        rounds = tokens / sum((accepted + 1) * dist[accepted] for accepted in range(depth + 1))
+        total_rounds += rounds
+        for accepted in range(depth + 1):
+            mixed[accepted] += rounds * dist[accepted]
+    if total_rounds == 0:
+        # One output token: no decode round, so the chain is never consulted.
+        mixed, total_rounds = list(buckets[0]["p"]), 1.0
+    tail = [sum(mixed[k:]) / total_rounds for k in range(depth + 2)]
+    return [tail[k + 1] / tail[k] if tail[k] > 0 else 0.0 for k in range(depth)]
+
+
+def trace_text(
+    case: Case, spec: TraceSpec, *, speculative_acceptance: Callable[[int], list[float]] | None = None
+) -> str:
     """Regenerate one trace from its shapes.
 
     Request ids carry the case slug so two cases replayed into one server are
     never confused, and arrival times are a deterministic 1 req/s baseline that
     `saturated` discards and `trace-timed` rescales by `rate`.
+    `speculative_acceptance` maps a request's output length to its chain.
     """
     buffer = io.StringIO()
     writer = csv.writer(buffer, lineterminator="\n")
@@ -152,7 +189,7 @@ def trace_text(case: Case, spec: TraceSpec, *, speculative_acceptance: list[floa
             )
         row = [f"{prefix}-{index:04d}", input_len, output_len, float(index * 1000)]
         if speculative_acceptance is not None:
-            row.append(json.dumps(speculative_acceptance, separators=(",", ":")))
+            row.append(json.dumps(speculative_acceptance(output_len), separators=(",", ":")))
         writer.writerow(row)
     return buffer.getvalue()
 
@@ -384,6 +421,13 @@ def simulation_document(
             depth is None
             or variant.worker.get("draft_tokens") != depth
             or len(case.speculative_acceptance.value) != depth
+            or (
+                case.speculative_acceptance_by_output_position is not None
+                and any(
+                    len(bucket["p"]) != depth + 1
+                    for bucket in case.speculative_acceptance_by_output_position.value
+                )
+            )
         ):
             raise PackError(
                 f"{case.slug}: arch and worker must both set draft_tokens, and the "
@@ -524,7 +568,9 @@ def case_traces(pack: Pack, case: Case) -> dict[str, str]:
     traces = {WORKLOAD_TRACE_NAME: trace_text(case, case.workload_trace)}
     if case.speculative_acceptance is not None:
         traces[SPECULATIVE_TRACE_NAME] = trace_text(
-            case, case.workload_trace, speculative_acceptance=case.speculative_acceptance.value
+            case,
+            case.workload_trace,
+            speculative_acceptance=lambda output_len: acceptance_chain(case, output_len),
         )
     if case.kernel_trace is not None:
         traces[KERNEL_TRACE_NAME] = trace_text(case, case.kernel_trace)

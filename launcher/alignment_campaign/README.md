@@ -183,6 +183,29 @@ speculative archs default differently. The speculative worker, not a particular
 arch tag, is what makes a case speculative. Borrowed calibration remains marked
 `provisional`.
 
+Acceptance can depend on output position. On GLM-5.3 DFlash2 over enwik9, for
+example, tokens per verify round rose from about 2.6 over the first 128 output
+tokens to 5.5-7.6 beyond 2048. A single case-wide chain is token-weighted, so it
+gives short requests the acceptance of long ones. Optional calibrated
+`speculative_acceptance_by_output_position` refines the chain, and requires it.
+
+```yaml
+speculative_acceptance_by_output_position:
+  value:
+  - {from: 1, p: [...]}    # K + 1 probabilities of 0..K accepted drafts per round
+  - {from: 128, p: [...]}  # ascending `from`; the last bucket is open-ended
+  status: measured
+  derived_from: ...
+```
+
+Each `p` is measured from the workload pass's `decode_request_progress`, bucketed
+by `output_tokens_before`. Rendering folds the buckets a request's declared
+`output_len` crosses into that request's `accept_rate` chain, weighting each
+bucket by the verify rounds it costs (`render.acceptance_chain`). This stays
+predictive: it pools every request by position and reads only the trace's
+output length. Replaying each request's own realized acceptance would condition
+on the measured run.
+
 Two case fields carry more weight than their size suggests:
 
 - **`attn_gpu_memory_gb` and `rate` are `Calibrated`**, not plain numbers. Each

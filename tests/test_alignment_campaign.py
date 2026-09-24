@@ -34,6 +34,7 @@ from launcher.alignment_campaign import check as check_module
 from launcher.alignment_campaign import compare as compare_module
 from launcher.alignment_campaign import execute, label
 from launcher.alignment_campaign import extract as extract_module
+from launcher.alignment_campaign import pack as pack_module
 from launcher.alignment_campaign import render as render_module
 from launcher.alignment_campaign.metrics import (
     REPORT_LOCATIONS,
@@ -470,6 +471,7 @@ def test_speculative_case_keeps_replay_trace_and_calibrates_simulation(pack, tmp
     case = dataclasses.replace(
         original_case, chunk_size=4096,
         speculative_acceptance=dataclasses.replace(original_case.attn_gpu_memory_gb, value=rates),
+        speculative_acceptance_by_output_position=None,
     )
     variant = dataclasses.replace(
         original_variant,
@@ -519,6 +521,62 @@ def test_speculative_case_keeps_replay_trace_and_calibrates_simulation(pack, tmp
         case_documents(
             implicit_pack, case, check_module.host_for(implicit_pack, None), tmp_path, REPO_ROOT
         )
+
+
+def test_acceptance_by_output_position_gives_each_request_its_own_chain(pack, tmp_path):
+    original_case = pack.cases[0]
+    original_variant = pack.variant_of(original_case)
+    calibrated = original_case.attn_gpu_memory_gb
+    early = [0.5, 0.25, 0.25]  # E = 1.75 tokens per round
+    late = [0.0, 0.0, 1.0]  # E = 3
+    case = dataclasses.replace(
+        original_case,
+        speculative_acceptance=dataclasses.replace(calibrated, value=[0.6, 0.6]),
+        speculative_acceptance_by_output_position=dataclasses.replace(
+            calibrated, value=[{"from": 1, "p": early}, {"from": 8, "p": late}]
+        ),
+    )
+    # Entirely inside the first bucket: that bucket's distribution as a chain.
+    assert render_module.acceptance_chain(case, 8) == pytest.approx([0.5, 0.5])
+    # 7 tokens early (4 rounds) and 21 late (7 rounds): q = (2, 1, 8) / 11.
+    assert render_module.acceptance_chain(case, 29) == pytest.approx([9 / 11, 8 / 9])
+    variant = dataclasses.replace(
+        original_variant,
+        arch={**original_variant.arch, "type": "glm52_vllm_nvfp4_dsa_moe_speculative", "draft_tokens": 2},
+        worker={**original_variant.worker, "type": "speculative", "draft_tokens": 2},
+    )
+    patched = dataclasses.replace(pack, variants={**pack.variants, variant.name: variant})
+    case_documents(patched, case, check_module.host_for(patched, None), tmp_path, REPO_ROOT)
+    rows = list(csv.DictReader(io.StringIO(case_traces(patched, case)["trace_speculative.csv"])))
+    for row in rows:
+        assert json.loads(row["accept_rate"]) == pytest.approx(
+            render_module.acceptance_chain(case, int(row["output_len"]))
+        )
+
+    deeper = dataclasses.replace(
+        case,
+        speculative_acceptance_by_output_position=dataclasses.replace(
+            calibrated, value=[{"from": 1, "p": [0.25] * 4}]
+        ),
+    )
+    with pytest.raises(PackError, match="must both set draft_tokens"):
+        case_documents(patched, deeper, check_module.host_for(patched, None), tmp_path, REPO_ROOT)
+
+
+@pytest.mark.parametrize(
+    ("buckets", "message"),
+    [
+        ([], "non-empty list"),
+        ([{"from": 2, "p": [1.0, 0.0, 0.0]}], "at most 1"),
+        ([{"from": 1, "p": [1.0, 0.0, 0.0]}, {"from": 1, "p": [1.0, 0.0, 0.0]}], "above the previous"),
+        ([{"from": 1, "p": [0.5, 0.0, 0.0]}], "summing to 1"),
+        ([{"from": 1, "p": [1.0, 0.0]}], "3 non-negative probabilities"),
+        ([{"from": 1}], "exactly 'from' and 'p'"),
+    ],
+)
+def test_acceptance_by_output_position_rejects_malformed_buckets(buckets, message):
+    with pytest.raises(PackError, match=message):
+        pack_module._check_acceptance_buckets(buckets, 2, "here")
 
 
 def _with_speculative_args(pack, extra_args, draft_checkpoint="dflash2_draft"):
