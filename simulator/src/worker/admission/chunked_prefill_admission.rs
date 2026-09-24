@@ -5,7 +5,9 @@
 //! never rotate through the policy again. KV ownership is policy-defined:
 //! historical deployments reserve the complete request footprint, whereas a
 //! bounded-future deployment pairs a waiting-request estimate with decode-time
-//! physical allocation checks and retraction.
+//! physical allocation checks and retraction. Under `Mix` the decode check runs
+//! before admission and a retracting step admits nothing (vLLM); under
+//! `SeparatePrefillPriority` it runs on decode-only iterations (SGLang).
 //!
 //! Batch composition is independent of KV membership. `Mix` lets resident
 //! decode share the remaining chunk budget. `SeparatePrefillPriority` emits a
