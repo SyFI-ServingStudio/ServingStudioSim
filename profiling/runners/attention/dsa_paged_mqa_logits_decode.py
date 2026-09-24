@@ -32,6 +32,19 @@ _CACHE_FORMAT = "page_planar_fp8_fp32_scale"
 _REQUIRED_GPU = "NVIDIA H200"
 _DEEPGEMM_EXPECTED_SMS = {"NVIDIA H200": 132, "NVIDIA B200": 148}
 _DEEPGEMM_KERNEL_NAME = "fp8_paged_mqa_logits"
+# The vLLM fork (GLM-5.3-Flash production) vendors DeepGEMM 2.6.1, whose
+# unified FP8/MXFP4 entry point launches `sm100_paged_mqa_logits`. Its kpool
+# indexer calls it with the pool-granular context (seq_len // index_kpool) per
+# row, a 64-pool cache page, the same page-planar FP8 + FP32-scale layout
+# (ue8m0 rounding changes only the scale values), and a token-wide
+# max_model_len logits row.
+_FORK_BACKEND = "deepgemm_fp8_vllm_fork"
+_FORK_KERNEL_NAME = "sm100_paged_mqa_logits"
+_FORK_SUPPORTED_GPUS = ("NVIDIA B200",)
+# Outside timing, the first request's rows are checked against the Torch
+# composite on the valid columns.
+_FORK_CHECK_RTOL = 1e-3
+_FORK_CHECK_ATOL = 1e-3
 
 
 @dataclass(frozen=True)
@@ -184,7 +197,9 @@ def _validate_cuda_device(torch: Any) -> None:
         )
 
 
-def _validate_deepgemm_cuda_device(torch: Any) -> int:
+def _validate_deepgemm_cuda_device(
+    torch: Any, *, supported_gpus: tuple[str, ...] = tuple(_DEEPGEMM_EXPECTED_SMS)
+) -> int:
     """Validate a profiled deployment identity and return its SM schedule."""
     if not torch.cuda.is_available():
         raise ProfilerNotImplemented(
@@ -192,10 +207,10 @@ def _validate_deepgemm_cuda_device(torch: Any) -> int:
         )
     device = torch.cuda.current_device()
     gpu_name = str(torch.cuda.get_device_name(device))
-    if gpu_name not in _DEEPGEMM_EXPECTED_SMS:
+    if gpu_name not in supported_gpus:
         raise ProfilerNotImplemented(
             "dsa_paged_mqa_logits_decode deepgemm_fp8 is verified only on "
-            f"{' or '.join(_DEEPGEMM_EXPECTED_SMS)}, got {gpu_name}"
+            f"{' or '.join(supported_gpus)}, got {gpu_name}"
         )
     num_sms = int(torch.cuda.get_device_properties(device).multi_processor_count)
     expected_sms = _DEEPGEMM_EXPECTED_SMS[gpu_name]
@@ -225,13 +240,11 @@ def _load_deepgemm_backend() -> tuple[Any, Any]:
         supported = support_api()
     except (RuntimeError, OSError) as exc:
         raise ProfilerNotImplemented(
-            "DeepGEMM support could not be initialized for "
-            "dsa_paged_mqa_logits_decode:deepgemm_fp8"
+            "DeepGEMM support could not be initialized for dsa_paged_mqa_logits_decode:deepgemm_fp8"
         ) from exc
     if not supported:
         raise ProfilerNotImplemented(
-            "DeepGEMM is unavailable or unsupported for "
-            "dsa_paged_mqa_logits_decode:deepgemm_fp8"
+            "DeepGEMM is unavailable or unsupported for dsa_paged_mqa_logits_decode:deepgemm_fp8"
         )
     if not callable(getattr(deep_gemm, "get_paged_mqa_logits_metadata", None)):
         raise ProfilerNotImplemented(
@@ -646,6 +659,39 @@ def profile_dsa_paged_mqa_logits_decode_torch(
         raise KernelLaunchFailed(str(exc)) from exc
 
 
+def _check_against_composite(
+    torch: Any,
+    operands: _DsaPagedMqaLogitsDecodeOperands,
+    output: Any,
+    *,
+    context_len: int,
+    max_model_len: int,
+) -> None:
+    """Compare the first request's logits rows with the Torch composite."""
+    next_n = operands.q.shape[1]
+    first = _DsaPagedMqaLogitsDecodeOperands(
+        q=operands.q[:1],
+        cache=operands.cache,
+        weights=operands.weights[:next_n],
+        context_lens=operands.context_lens[:1],
+        block_table=operands.block_table[:1],
+        key_view=operands.key_view,
+        scale_view=operands.scale_view,
+        logical_pages=operands.logical_pages,
+        padded_context=operands.padded_context,
+    )
+    expected = _torch_composite(first, context_len=context_len, max_model_len=max_model_len)
+    actual = output[:next_n, :context_len].float()
+    if not torch.allclose(
+        actual, expected[:, :context_len], rtol=_FORK_CHECK_RTOL, atol=_FORK_CHECK_ATOL
+    ):
+        max_abs = float((actual - expected[:, :context_len]).abs().max().item())
+        raise KernelLaunchFailed(
+            f"dsa_paged_mqa_logits_decode:{_FORK_BACKEND} disagrees with the Torch "
+            f"composite: max abs error {max_abs:.6f}"
+        )
+
+
 def _profile_dsa_paged_mqa_logits_decode_deepgemm_fp8(
     load_backend: Any,
     batch_size: int,
@@ -664,6 +710,9 @@ def _profile_dsa_paged_mqa_logits_decode_deepgemm_fp8(
     page_mapping: str,
     cache_format: str,
     clean_logits: bool,
+    kernel_name: str = _DEEPGEMM_KERNEL_NAME,
+    supported_gpus: tuple[str, ...] = tuple(_DEEPGEMM_EXPECTED_SMS),
+    check_correctness: bool = False,
 ) -> ComputeMetrics:
     """Shared profiling implementation for the fused DeepGEMM decode callable."""
     (
@@ -702,7 +751,7 @@ def _profile_dsa_paged_mqa_logits_decode_deepgemm_fp8(
         clean_logits,
     )
     torch, deep_gemm = load_backend()
-    num_sms = _validate_deepgemm_cuda_device(torch)
+    num_sms = _validate_deepgemm_cuda_device(torch, supported_gpus=supported_gpus)
 
     try:
         operands = _build_operands(
@@ -725,11 +774,20 @@ def _profile_dsa_paged_mqa_logits_decode_deepgemm_fp8(
         )
 
         # Compile and initialize the exact shape before formal CUPTI timing.
-        kernel()
+        output = kernel()
         torch.cuda.synchronize()
+        if check_correctness:
+            _check_against_composite(
+                torch,
+                operands,
+                output,
+                context_len=context_len,
+                max_model_len=max_model_len,
+            )
+            del output
         time_ms = Timer.cupti(
             kernel,
-            kernel_name=_DEEPGEMM_KERNEL_NAME,
+            kernel_name=kernel_name,
         )
         energy_j = Energy.perf(
             kernel,
@@ -772,4 +830,19 @@ def profile_dsa_paged_mqa_logits_decode_deepgemm_fp8(**kwargs: Any) -> ComputeMe
     return _profile_dsa_paged_mqa_logits_decode_deepgemm_fp8(
         _load_deepgemm_backend,
         **kwargs,
+    )
+
+
+def profile_dsa_paged_mqa_logits_decode_deepgemm_fp8_vllm_fork(**kwargs: Any) -> ComputeMetrics:
+    """Profile the vLLM fork's DeepGEMM 2.6.1 paged-decode callable (B200).
+
+    For GLM-5.3-Flash's kpool indexer, ``context_len`` is the row's pool count
+    and ``max_model_len`` the token-granular logits width.
+    """
+    return _profile_dsa_paged_mqa_logits_decode_deepgemm_fp8(
+        _load_deepgemm_backend,
+        **kwargs,
+        kernel_name=_FORK_KERNEL_NAME,
+        supported_gpus=_FORK_SUPPORTED_GPUS,
+        check_correctness=True,
     )

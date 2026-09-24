@@ -79,7 +79,7 @@ def test_registration_support_policy_and_facades() -> None:
     native_spec = find_kernel_profiler_spec(KIND, _NATIVE_BACKEND)
 
     assert KIND == "dsa_persistent_topk_decode"
-    assert known_backends(KIND) == [_TORCH_BACKEND, _NATIVE_BACKEND]
+    assert known_backends(KIND) == [_TORCH_BACKEND, _NATIVE_BACKEND, "vllm_fork_cuda"]
     for spec in (torch_spec, native_spec):
         assert spec.kernel_kind == spec.table_name == KIND
         assert spec.args_schema is DsaPersistentTopkDecodeArgs
@@ -1000,3 +1000,43 @@ def test_native_profile_translates_op_runtime_failure(monkeypatch) -> None:
         runner.profile_dsa_persistent_topk_decode_vllm_cuda(
             **(_BASE_SPEC | {"batch_size": 1, "context_len": 3, "next_n": 1})
         )
+
+
+def test_vllm_fork_registration_runs_on_b200_in_the_fork_env() -> None:
+    spec = find_kernel_profiler_spec(KIND, "vllm_fork_cuda")
+
+    assert spec.args_schema is DsaPersistentTopkDecodeArgs
+    assert spec.table_name == KIND
+    assert spec.subprocess_env == "vllm_fork_env"
+    assert spec.supports.allows(DType.FP32, gpu="NVIDIA B200")
+    assert not spec.supports.allows(DType.FP32, gpu="NVIDIA H200")
+    assert spec.runner_ref.function_name == "profile_dsa_persistent_topk_decode_vllm_fork_cuda"
+
+
+def test_vllm_fork_accepts_kpool_top_k_while_v023_backend_keeps_2048() -> None:
+    from profiling.runners.attention import dsa_persistent_topk_decode as runner
+
+    # GLM-5.3-Flash kpool: 2048 pools of an 8192-token request, token-wide rows.
+    kpool = _BASE_SPEC | {"context_len": 2048, "max_model_len": 8192, "top_k": 512}
+    kpool["logits_row_stride"] = 8192
+    validated = runner._validate_args(**kpool, allowed_top_k=runner._FORK_TOP_K)
+    assert validated[1] == 2048 and validated[4] == 512
+    with pytest.raises(ValueError, match="requires top_k=2048, got 512"):
+        runner._validate_args(**kpool)
+
+
+def test_vllm_fork_entry_forwards_its_backend_and_top_k_set(monkeypatch) -> None:
+    from profiling.runners.attention import dsa_persistent_topk_decode as runner
+
+    calls = []
+    monkeypatch.setattr(
+        runner,
+        "_profile_native_persistent_topk",
+        lambda *args: calls.append(args) or "metrics",
+    )
+    spec = _BASE_SPEC | {"top_k": 512}
+    assert runner.profile_dsa_persistent_topk_decode_vllm_fork_cuda(**spec) == "metrics"
+    assert runner.profile_dsa_persistent_topk_decode_vllm_cuda(**_BASE_SPEC) == "metrics"
+    assert calls[0][:2] == ("vllm_fork_cuda", frozenset({512, 1024, 2048}))
+    assert calls[0][2:] == tuple(spec.values())
+    assert calls[1][:2] == ("vllm_cuda", frozenset({2048}))

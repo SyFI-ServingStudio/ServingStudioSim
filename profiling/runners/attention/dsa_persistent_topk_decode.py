@@ -28,6 +28,14 @@ _CONTEXT_MODE = "uniform"
 _REQUIRED_GPU = "NVIDIA H200"
 _VLLM_SUPPORTED_GPUS = ("NVIDIA H200", "NVIDIA B200")
 _WORKSPACE_BYTES = 1024 * 1024
+# The vLLM fork (GLM-5.3-Flash production) ships a newer persistent_topk: rows
+# are clamped to min(stride, max_seq_len), and the >32-row FilteredTopK path
+# gained a <=32K histogram-4096 short path. Its kpool indexer selects
+# index_topk / index_kpool = 512 pools, so this backend also accepts the
+# callable's other K instantiations.
+_FORK_BACKEND = "vllm_fork_cuda"
+_FORK_SUPPORTED_GPUS = ("NVIDIA B200",)
+_FORK_TOP_K = frozenset({512, 1024, 2048})
 
 
 @dataclass(frozen=True)
@@ -62,6 +70,7 @@ def _validate_args(
     logits_dtype: DType | str,
     index_dtype: str,
     context_mode: str,
+    allowed_top_k: frozenset[int] = frozenset({_TOP_K}),
 ) -> tuple[int, int, int, int, int, int, DType, str, str]:
     batch_size = int(batch_size)
     context_len = int(context_len)
@@ -97,8 +106,9 @@ def _validate_args(
         raise ValueError(
             f"context_len must be <= max_model_len, got {context_len} and {max_model_len}"
         )
-    if top_k != _TOP_K:
-        raise ValueError(f"dsa_persistent_topk_decode requires top_k=2048, got {top_k}")
+    if top_k not in allowed_top_k:
+        required = " or ".join(f"top_k={value}" for value in sorted(allowed_top_k))
+        raise ValueError(f"dsa_persistent_topk_decode requires {required}, got {top_k}")
     if logits_row_stride <= 0 or logits_row_stride < max_model_len:
         raise ValueError(
             "logits_row_stride must be positive and >= max_model_len, "
@@ -135,7 +145,10 @@ def _validate_cuda_device(torch: Any, *, backend: str = "torch") -> str:
             f"CUDA is required for the {backend} dsa_persistent_topk_decode backend"
         )
     gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
-    supported_gpus = _VLLM_SUPPORTED_GPUS if backend == "vllm_cuda" else (_REQUIRED_GPU,)
+    supported_gpus = {
+        "vllm_cuda": _VLLM_SUPPORTED_GPUS,
+        _FORK_BACKEND: _FORK_SUPPORTED_GPUS,
+    }.get(backend, (_REQUIRED_GPU,))
     if gpu_name not in supported_gpus:
         raise ProfilerNotImplemented(
             f"{backend} dsa_persistent_topk_decode is verified only on "
@@ -579,7 +592,9 @@ def _load_native_op(torch: Any) -> Any:
         raise KernelLaunchFailed(str(exc)) from exc
 
 
-def profile_dsa_persistent_topk_decode_vllm_cuda(
+def _profile_native_persistent_topk(
+    backend: str,
+    allowed_top_k: frozenset[int],
     batch_size: int,
     context_len: int,
     next_n: int,
@@ -590,7 +605,7 @@ def profile_dsa_persistent_topk_decode_vllm_cuda(
     index_dtype: str,
     context_mode: str,
 ) -> ComputeMetrics:
-    """Profile the complete corrected v0.23-derived persistent callable."""
+    """Profile one packaged persistent_topk callable through its full contract."""
     (
         batch_size,
         context_len,
@@ -611,15 +626,16 @@ def profile_dsa_persistent_topk_decode_vllm_cuda(
         logits_dtype,
         index_dtype,
         context_mode,
+        allowed_top_k=allowed_top_k,
     )
     try:
         import torch
     except ImportError as exc:
         raise ProfilerNotImplemented(
-            "torch is required for the vllm_cuda dsa_persistent_topk_decode backend"
+            f"torch is required for the {backend} dsa_persistent_topk_decode backend"
         ) from exc
 
-    gpu_name = _validate_cuda_device(torch, backend="vllm_cuda")
+    gpu_name = _validate_cuda_device(torch, backend=backend)
     op = _load_native_op(torch)
 
     try:
@@ -639,7 +655,7 @@ def profile_dsa_persistent_topk_decode_vllm_cuda(
             operands,
             top_k=top_k,
             max_seq_len=context_len,
-            strict_reference=gpu_name != "NVIDIA B200",
+            strict_reference=backend == _FORK_BACKEND or gpu_name != "NVIDIA B200",
         )
 
         def kernel() -> None:
@@ -685,3 +701,65 @@ def profile_dsa_persistent_topk_decode_vllm_cuda(
         )
     except RuntimeError as exc:
         raise KernelLaunchFailed(str(exc)) from exc
+
+
+def profile_dsa_persistent_topk_decode_vllm_cuda(
+    batch_size: int,
+    context_len: int,
+    next_n: int,
+    max_model_len: int,
+    top_k: int,
+    logits_row_stride: int,
+    logits_dtype: DType | str,
+    index_dtype: str,
+    context_mode: str,
+) -> ComputeMetrics:
+    """Profile the complete corrected v0.23-derived persistent callable."""
+    return _profile_native_persistent_topk(
+        "vllm_cuda",
+        frozenset({_TOP_K}),
+        batch_size,
+        context_len,
+        next_n,
+        max_model_len,
+        top_k,
+        logits_row_stride,
+        logits_dtype,
+        index_dtype,
+        context_mode,
+    )
+
+
+def profile_dsa_persistent_topk_decode_vllm_fork_cuda(
+    batch_size: int,
+    context_len: int,
+    next_n: int,
+    max_model_len: int,
+    top_k: int,
+    logits_row_stride: int,
+    logits_dtype: DType | str,
+    index_dtype: str,
+    context_mode: str,
+) -> ComputeMetrics:
+    """Profile the vLLM fork's persistent_topk (GLM-5.3-Flash kpool K=512).
+
+    For kpool, ``context_len`` is the row's pool count (floor(tokens / 4)) and
+    ``max_model_len`` the logits width, which vLLM keeps token-granular. The
+    call passes ``max_seq_len = context_len``; production passes the batch's
+    token max_seq_len instead. The scalar only gates the cooperative radix
+    setup (``> 32768``) on the <=32-row path, so the two agree whenever the
+    token context is <= 32768 or the batch has more than 32 rows.
+    """
+    return _profile_native_persistent_topk(
+        _FORK_BACKEND,
+        _FORK_TOP_K,
+        batch_size,
+        context_len,
+        next_n,
+        max_model_len,
+        top_k,
+        logits_row_stride,
+        logits_dtype,
+        index_dtype,
+        context_mode,
+    )
