@@ -44,6 +44,9 @@ PDL_ADVANCE_LAUNCH_TOKENS = 16
 ONE_SHOT_THRESHOLD_BYTES = 64 * 1024 * 8 * 2
 # Graph replay amortizes host launch cost over several back-to-back collectives.
 OPERATIONS_PER_GRAPH = 10
+# The family default (100 timed ops, about 1 ms at small T) leaves microsecond
+# rows at +-30% run to run; time at least this many ops per shape instead.
+MIN_TIMED_OPERATIONS = 1000
 
 _ELEM_SIZE = {DType.BF16: 2, DType.FP16: 2, DType.FP32: 4}
 
@@ -229,7 +232,7 @@ def _profile_one_shape(
         launch=launch,
         input_tensor=input_tensor,
         warmup=warmup,
-        rep=rep,
+        rep=max(rep, MIN_TIMED_OPERATIONS),
         operations_per_graph=OPERATIONS_PER_GRAPH,
     )
     return _comm_payload(
