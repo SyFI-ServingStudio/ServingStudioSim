@@ -1,5 +1,9 @@
 """Profiling runners for GLM-5.2's plain MLA cache append.
 
+The vLLM backend also admits ``rope_dim=0`` (GLM-5.3-Flash: 512-wide latent,
+no decoupled RoPE key). Production passes ``k_pe.squeeze(1)`` of width 0 to the
+same ``concat_and_cache_mla`` op, which then writes only the latent row.
+
 The Torch timed callable contains only the two indexed writes that implement
 the semantic composite. The production-aligned vLLM callable is its single
 fused ``concat_and_cache_mla_kernel`` launch.
@@ -49,6 +53,7 @@ def _validate_args(
     *,
     allow_fp8_cache: bool = False,
     allow_fp8_input: bool = False,
+    allow_zero_rope: bool = False,
 ) -> tuple[int, int, int, int, DType, DType, str]:
     num_tokens = int(num_tokens)
     kv_lora_rank = int(kv_lora_rank)
@@ -58,19 +63,23 @@ def _validate_args(
     kv_dtype = DType.from_value(kv_dtype)
     cache_format = str(cache_format)
 
-    if num_tokens <= 0 or kv_lora_rank <= 0 or rope_dim <= 0 or block_size <= 0:
+    min_rope_dim = 0 if allow_zero_rope else 1
+    if num_tokens <= 0 or kv_lora_rank <= 0 or rope_dim < min_rope_dim or block_size <= 0:
         raise ValueError(
-            "num_tokens, kv_lora_rank, rope_dim, and block_size must be > 0, "
+            f"num_tokens, kv_lora_rank, and block_size must be > 0 and rope_dim >= {min_rope_dim}, "
             f"got {num_tokens}, {kv_lora_rank}, {rope_dim}, and {block_size}"
         )
-    if (kv_lora_rank, rope_dim, block_size) != (
-        _KV_LORA_RANK,
-        _ROPE_DIM,
-        _BLOCK_SIZE,
+    supported_rope_dims = (_ROPE_DIM, 0) if allow_zero_rope else (_ROPE_DIM,)
+    if (
+        kv_lora_rank != _KV_LORA_RANK
+        or rope_dim not in supported_rope_dims
+        or block_size != _BLOCK_SIZE
     ):
+        allowed = " or ".join(
+            f"({_KV_LORA_RANK}, {rope}, {_BLOCK_SIZE})" for rope in supported_rope_dims
+        )
         raise ValueError(
-            "torch mla_cache_append requires "
-            "(kv_lora_rank, rope_dim, block_size) == (512, 64, 64), "
+            f"mla_cache_append requires (kv_lora_rank, rope_dim, block_size) == {allowed}, "
             f"got ({kv_lora_rank}, {rope_dim}, {block_size})"
         )
     supported_kv_dtypes = {DType.BF16, DType.FP8_E4M3} if allow_fp8_cache else {DType.BF16}
@@ -400,6 +409,19 @@ def profile_mla_cache_append_sglang_cuda(
     )
 
 
+def _verify_vllm_launch(
+    torch: Any, kernel: Any, operands: _MlaCacheAppendOperands, kv_lora_rank: int
+) -> None:
+    """Untimed: every mapped slot holds [kv_c, k_pe] cast to the cache dtype (scale 1)."""
+    kernel()
+    torch.cuda.synchronize()
+    rows = operands.cache[operands.block_indices, operands.block_offsets].float()
+    expected = torch.cat([operands.kv_c, operands.k_pe], dim=-1).to(operands.cache.dtype).float()
+    torch.testing.assert_close(rows, expected, rtol=0.0, atol=0.0)
+    if rows.shape[-1] != kv_lora_rank + operands.k_pe.shape[-1]:
+        raise AssertionError("cache row width must equal kv_lora_rank + rope_dim")
+
+
 def profile_mla_cache_append_vllm_cuda(
     num_tokens: int,
     kv_lora_rank: int,
@@ -427,6 +449,7 @@ def profile_mla_cache_append_vllm_cuda(
         kv_dtype,
         cache_format,
         allow_fp8_cache=True,
+        allow_zero_rope=True,
     )
     try:
         import torch
@@ -463,6 +486,8 @@ def profile_mla_cache_append_vllm_cuda(
                 "auto" if kv_dtype is DType.BF16 else "fp8_e4m3",
                 scale,
             )
+
+        _verify_vllm_launch(torch, kernel, operands, kv_lora_rank)
 
         # Allocation and layout setup stay outside the callable. The CUPTI
         # filter selects only vLLM's one fused device launch.
