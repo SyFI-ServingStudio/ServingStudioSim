@@ -449,6 +449,46 @@ mod tests {
         assert_eq!(payload.backend(), Some(backend));
     }
 
+    /// Catches the GLM-5.3-Flash kpool fork payload drifting from the Python
+    /// `deepgemm_fp8_vllm_fork` args (b2-dsa 5.3), and states its feasible count.
+    #[test]
+    fn pooled_fork_payloads_match_python_args() {
+        const FORK_BACKEND: &str = "deepgemm_fp8_vllm_fork";
+        let mut cfg = config(8192);
+        cfg.backends = vec![FORK_BACKEND];
+        cfg.gpu_name = "NVIDIA B200".to_string();
+        cfg.num_heads = Dim::param("index_n_heads", 32);
+        let grid = DsaPagedMqaLogitsDecodeSpec::sweep_grid(&cfg);
+        let mask = DsaPagedMqaLogitsDecodeSpec::infeasible_mask(&cfg, &grid);
+        assert_eq!(mask.iter().filter(|&&masked| !masked).count(), 18 * 14);
+
+        let payloads = DsaPagedMqaLogitsDecodeSpec::enumerate(&cfg, &grid, FORK_BACKEND);
+        let index = grid.axes()[0].iter().position(|&b| b == 32.0).unwrap() * grid.axes()[1].len()
+            + grid.axes()[1].iter().position(|&c| c == 1024.0).unwrap();
+        assert_eq!(
+            serde_json::to_value(payloads[index].fields()).unwrap(),
+            serde_json::json!({
+                "backend": FORK_BACKEND,
+                "batch_size": 32,
+                "context_len": 1024,
+                "next_n": 1,
+                "max_model_len": 8192,
+                "num_heads": 32,
+                "head_dim": 128,
+                "block_size": 64,
+                "q_dtype": "fp8_e4m3",
+                "cache_dtype": "fp8_e4m3",
+                "scale_dtype": "fp32",
+                "weight_dtype": "fp32",
+                "output_dtype": "fp32",
+                "context_mode": "uniform",
+                "page_mapping": "unique_scattered",
+                "cache_format": "page_planar_fp8_fp32_scale",
+                "clean_logits": false,
+            })
+        );
+    }
+
     #[test]
     fn dtype_tags_expose_fp8_compute_and_kv() {
         let cfg = config(131072);
