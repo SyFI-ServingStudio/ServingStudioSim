@@ -290,9 +290,11 @@ impl KernelSpec for DsaSparseMlaAttentionSpec {
 /// `selected_k` for unpooled patterns, `index_topk + index_kpool - 1` pooled.
 fn canonical_valid_counts(pattern: ValidCountsPattern, q: u32, s: u32, k: u32) -> String {
     match pattern {
-        ValidCountsPattern::UniformFull | ValidCountsPattern::PooledUniformFull { .. } => {
-            format!("u:{}x{q}", s.min(k))
-        }
+        ValidCountsPattern::UniformFull => format!("u:{}x{q}", s.min(k)),
+        ValidCountsPattern::PooledUniformFull {
+            index_topk,
+            index_kpool,
+        } => canonical_pooled_counts(q, s, index_topk, index_kpool),
         ValidCountsPattern::CausalTail => {
             if q > s {
                 return masked_placeholder(q);
@@ -315,6 +317,51 @@ fn canonical_valid_counts(pattern: ValidCountsPattern, q: u32, s: u32, k: u32) -
             canonical_speculative_counts(q, s, k, group_size)
         }
     }
+}
+
+/// Pooled decode rows past `index_topk` keep `index_topk` pools plus the
+/// `n mod index_kpool` tail tokens of their own context `n`. A decode batch's
+/// contexts are unrelated, so its rows spread over every tail phase: row `i`
+/// sees `min(s, index_topk + i mod index_kpool)`. The phases are not
+/// interchangeable on B200 (job 1141, 32 queries): 2048 / 2049 / 2050 / 2051
+/// active rows take 16.8 / 26.3 / 21.9 / 18.8 us and the phase-mixed batch
+/// 21.9 us, so a single saturated count would misstate the batch by up to 30%.
+///
+/// The encoding mirrors Python `_encode_valid_counts`: uniform, then a +1
+/// ramp, then the shortest repeating group.
+fn canonical_pooled_counts(q: u32, s: u32, index_topk: u32, index_kpool: u32) -> String {
+    if s <= index_topk {
+        return format!("u:{s}x{q}");
+    }
+    let counts: Vec<u32> = (0..q)
+        .map(|row| s.min(index_topk + row % index_kpool))
+        .collect();
+    if counts.iter().all(|&count| count == counts[0]) {
+        return format!("u:{}x{q}", counts[0]);
+    }
+    if counts
+        .iter()
+        .enumerate()
+        .all(|(row, &count)| count == counts[0] + row as u32)
+    {
+        return format!("r:{}..{}", counts[0], counts[counts.len() - 1]);
+    }
+    let len = counts.len();
+    let period = (1..=len)
+        .find(|&candidate| {
+            len % candidate == 0
+                && counts
+                    .iter()
+                    .enumerate()
+                    .all(|(row, &count)| count == counts[row % candidate])
+        })
+        .expect("the whole vector is always a period");
+    let group = counts[..period]
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("g:({group})x{}", len / period)
 }
 
 /// Scale the frozen group-of-two query anchors by request count.
@@ -702,15 +749,25 @@ mod tests {
         let grid = DsaSparseMlaAttentionSpec::sweep_grid(&cfg);
         let payloads = DsaSparseMlaAttentionSpec::enumerate(&cfg, &grid, FORK_BACKEND);
 
-        for (s, expected) in [(1024, 1024), (2048, 2048), (2051, 2051), (4096, 2051)] {
-            let fields = payload_for(&payloads, &grid, 32, s).fields();
-            assert_eq!(
-                fields.get("valid_counts"),
-                Some(&Value::from(format!("u:{expected}x32")))
-            );
+        // Past index_topk the rows spread over the four tail phases (job 1141).
+        for (q, s, expected) in [
+            (32, 1024, "u:1024x32"),
+            (32, 2048, "u:2048x32"),
+            (32, 2051, "g:(2048,2049,2050,2051)x8"),
+            (32, 4096, "g:(2048,2049,2050,2051)x8"),
+            (4, 4096, "r:2048..2051"),
+            (2, 4096, "r:2048..2049"),
+        ] {
+            let fields = payload_for(&payloads, &grid, q, s).fields();
+            assert_eq!(fields.get("valid_counts"), Some(&Value::from(expected)));
         }
+        let odd = payload_for(&payloads, &grid, 127, 4096).fields()["valid_counts"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(odd.starts_with("g:(2048,2049,2050,2051,2048,") && odd.ends_with(",2050)x1"));
         let fields = payload_for(&payloads, &grid, 1, 1_048_576).fields();
-        assert_eq!(fields.get("valid_counts"), Some(&Value::from("u:2051x1")));
+        assert_eq!(fields.get("valid_counts"), Some(&Value::from("u:2048x1")));
         assert_eq!(
             serde_json::to_value(fields).unwrap(),
             serde_json::json!({
@@ -728,7 +785,7 @@ mod tests {
                 "cache_dtype": "fp8_e4m3",
                 "index_dtype": "int32",
                 "output_dtype": "bf16",
-                "valid_counts": "u:2051x1",
+                "valid_counts": "u:2048x1",
                 "index_distribution": "unique_scattered_pages",
                 "cache_layout": "hnd_paged_mqa_fp8_latent",
             })
