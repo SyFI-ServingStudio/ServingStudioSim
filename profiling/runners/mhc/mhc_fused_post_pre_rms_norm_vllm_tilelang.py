@@ -9,6 +9,7 @@ from profiling.profilers.timer import Timer
 from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
 from profiling.runners.mhc._deepseek_v4 import (
+    BOUNDARY_GPUS,
     HC_EPS,
     POST_MULTIPLIER,
     RMS_EPS,
@@ -17,7 +18,7 @@ from profiling.runners.mhc._deepseek_v4 import (
     assert_outputs_close,
     prepare_common,
     reference_pre,
-    require_h200,
+    require_gpu,
     validate_args,
 )
 
@@ -74,7 +75,7 @@ def profile_mhc_fused_post_pre_rms_norm_vllm_tilelang(
         raise ProfilerNotImplemented(f"{_KIND} requires pinned vLLM and TileLang") from exc
 
     try:
-        require_h200(torch, _KIND)
+        require_gpu(torch, _KIND, BOUNDARY_GPUS)
         inputs = prepare_common(torch, shape)
         x = torch.randn((shape.num_tokens, 4096), dtype=torch.bfloat16).cuda()
         post_mix, comb_mix, _ = reference_pre(torch, inputs)

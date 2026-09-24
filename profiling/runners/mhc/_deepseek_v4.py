@@ -6,7 +6,14 @@ from typing import Any
 from profiling.db.args import DType
 from profiling.runners.exceptions import ProfilerNotImplemented
 
-BACKEND_GPU = "NVIDIA H200"
+TERMINAL_HEAD_GPUS = ("NVIDIA H200",)
+# The post/pre boundary callables are shared by DeepSeek V4 (H200) and
+# GLM-5.3-Flash (B200); both GPUs were checked against the Torch reference.
+# GLM-5.3-Flash runs them with rms_norm_eps=1e-5 instead of RMS_EPS below; the
+# eps is a scalar and does not change the launch sequence or the timing. The
+# terminal head stays H200-only: GLM-5.3-Flash has no hc_head and ends with
+# mhc_post -> mean over hc -> RMSNorm instead.
+BOUNDARY_GPUS = ("NVIDIA H200", "NVIDIA B200")
 HIDDEN_SIZE = 4096
 HC_MULT = 4
 RMS_EPS = 1e-6
@@ -47,12 +54,12 @@ def validate_args(
     return Shape(num_tokens)
 
 
-def require_h200(torch: Any, kind: str) -> None:
+def require_gpu(torch: Any, kind: str, gpus: tuple[str, ...]) -> None:
     if not torch.cuda.is_available():
         raise ProfilerNotImplemented(f"{kind} requires CUDA")
     gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
-    if gpu_name != BACKEND_GPU:
-        raise ProfilerNotImplemented(f"{kind} is verified only on {BACKEND_GPU}, got {gpu_name}")
+    if gpu_name not in gpus:
+        raise ProfilerNotImplemented(f"{kind} is verified only on {gpus}, got {gpu_name}")
 
 
 def prepare_common(torch: Any, shape: Shape) -> CommonInputs:
@@ -101,6 +108,7 @@ def assert_outputs_close(torch: Any, actual: tuple[Any, ...], expected: tuple[An
 
 
 __all__ = [
+    "BOUNDARY_GPUS",
     "CommonInputs",
     "HC_EPS",
     "HC_MULT",
@@ -109,9 +117,10 @@ __all__ = [
     "RMS_EPS",
     "SINKHORN_ITERATIONS",
     "Shape",
+    "TERMINAL_HEAD_GPUS",
     "assert_outputs_close",
     "prepare_common",
     "reference_pre",
-    "require_h200",
+    "require_gpu",
     "validate_args",
 ]

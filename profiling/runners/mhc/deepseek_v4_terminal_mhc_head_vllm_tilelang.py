@@ -11,10 +11,11 @@ from profiling.runners.metrics import ComputeMetrics
 from profiling.runners.mhc._deepseek_v4 import (
     HC_EPS,
     RMS_EPS,
+    TERMINAL_HEAD_GPUS,
     CommonInputs,
     prepare_common,
     reference_pre,
-    require_h200,
+    require_gpu,
     validate_args,
 )
 
@@ -71,7 +72,7 @@ def profile_deepseek_v4_terminal_mhc_head_vllm_tilelang(
         raise ProfilerNotImplemented(f"{_KIND} requires pinned vLLM and TileLang") from exc
 
     try:
-        require_h200(torch, _KIND)
+        require_gpu(torch, _KIND, TERMINAL_HEAD_GPUS)
         inputs = prepare_common(torch, shape)
         x = torch.randn(
             (shape.num_tokens, hidden_size), dtype=torch.bfloat16, device="cuda"
