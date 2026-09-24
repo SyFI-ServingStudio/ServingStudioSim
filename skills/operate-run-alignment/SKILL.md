@@ -515,6 +515,75 @@ weight totals, post-placement per-layer rank distributions, padding/drop policy,
 generated kernel shapes, and simulated message sizes. Reading the artifact or
 setting a config field is not proof that the CostTree consumed it.
 
+## Preserve speculative acceptance structure
+
+Acceptance differs from request to request, and within one request it changes
+with output position. Do not treat a case-wide chain as the acceptance of every
+request. A pack's `speculative_acceptance` is one per-position conditional chain
+computed from the case's aggregate counters (`spec_decode_metrics.json`), and
+render writes that same chain into every trace row's `accept_rate`. Aggregated
+this way, the chain is token-weighted. Totals come out right: e2e mean,
+throughput, and iteration count. But short requests get the acceptance of long
+ones.
+
+GLM-5.3 DFlash2 on the enwik9 workload showed how large the spread is. Tokens
+emitted per verify round rose with output position, and every output-length
+class followed the same curve:
+
+| output position | tokens per round |
+|---|---|
+| first 128 tokens | about 2.6 |
+| up to 1024 | 3.2 |
+| up to 3072 | 4.8 |
+| up to 4096 | 5.7 |
+
+The case chain gave every request about 4.0. Case 07 matched on e2e (-1.1%)
+and TTFT (+1.7%), yet its request-weighted mean TPOT read -26%. The 96
+short-output requests decoded 30-40% fast in the sim, while the long-output
+requests matched within 5%.
+
+Before interpreting a TPOT gap in a speculative case:
+
+- Split measured acceptance by output-length class and by output position from
+  the workload pass: `decode_request_progress[]` carries per-step
+  `accepted_draft_tokens`, `emitted_tokens`, and `output_tokens_before`. Put it
+  beside the sim's per-request `speculative_progress` (`decode_rounds`,
+  `emitted_tokens` in `request_slo.parquet`).
+- Compare per class. Separate the rounds-per-request gap (acceptance) from the
+  time-per-round gap (step cost). They have different owners.
+- A mixed-length case whose totals agree while mean TPOT does not usually has
+  acceptance spread, not a cost-model error. Look for preemption, and for
+  step-cost gaps concentrated in mixed steps, before blaming acceptance.
+
+The trace format already carries a chain per row. Filling each row with that
+request's measured chain conditions on the realized run, so it is an
+observed-conditioned counterfactual (`predictive_alignment: false`). Report it
+next to the predictive result, never instead of it. The predictive fix is the
+pack's `speculative_acceptance_by_output_position`: pooled per-position buckets
+from the workload pass, which render folds into one chain per request from its
+`output_len`. It took case 07's TPOT from -26% to -11% and case 08's from -24%
+to -6%.
+
+## Match the engine's KV admission
+
+When a case is KV-bound, TTFT and TPOT depend on who waits and who gets
+preempted. That is a scheduler policy, and the sim has to use the engine's.
+The worker default, `full-footprint`, reserves every request's whole output at
+admission and never preempts. vLLM reserves nothing past the next step. It
+admits a request once its prompt fits, allocates each running request's next
+window first, and on a shortfall `running.pop()`s the most recently admitted
+request and prepends it to the waiting queue. SGLang's retraction removes the
+request with the fewest emitted tokens and requeues it behind the waiting ones.
+
+Count preemptions in the workload pass before judging a TTFT or TPOT gap.
+When every running request fits the token budget, a request is scheduled on
+every step, so a gap in its `decode_request_progress` rounds is a preemption.
+GLM-5.3 DFlash2 case 05 (c64, long outputs) preempted 72 of 176 requests. Under
+full footprint the sim never preempted and read TTFT +38% and TPOT -48%. With
+`kv_admission_policy: bounded-future` and `decode_retraction_policy: fcfs`
+(`kv_max_future_tokens` = verify width, both ratios 0) it read +5.5% and
+-11.5%. `length` (the SGLang policy) overshot to TTFT -55% and TPOT +93%.
+
 ## Verify completion
 
 The experiment is complete only when: `analysis/alignment_manifest.json` uses the
