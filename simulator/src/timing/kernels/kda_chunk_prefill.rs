@@ -21,8 +21,16 @@
 //!   chunk-parallel launch -- 29 decodes add +36% at equal token count.
 //!
 //! For `L >= 64` the chunk count `R*L/64 + D` is bilinear in `(L, R)`, which
-//! trilinear interpolation reproduces inside a cell. Only the prefill-token
-//! ceiling `L*R` needs masking.
+//! trilinear interpolation reproduces inside a cell.
+//!
+//! The shortest `L` anchor is 2, not 1: a length-1 "prefill" never reaches
+//! this callable (vLLM's GDN-family metadata uses decode threshold 1, so every
+//! query-length-1 request is a decode and lands on the `D` axis), and the
+//! Python runner rejects the all-length-1, no-decode batch. For `2 <= L <= 64`
+//! each prefill sequence is one chunk, so at fixed `R` both the chunk count
+//! (`R + D`) and the token-proportional copies (`R*L`) are linear in `L` --
+//! exact for the `[2, 64]` cell. Only the prefill-token ceiling `L*R` is
+//! masked.
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::CacheKind;
@@ -97,9 +105,9 @@ impl KernelSpec for KdaChunkPrefillSpec {
 
     fn sweep_grid(_config: &Self::Config) -> SweepGrid {
         SweepGrid::new(vec![
-            // L = 1 anchors the sub-chunk regime (chunks = R + D); from one
+            // L = 2 anchors the sub-chunk regime (chunks = R + D); from one
             // chunk (64) up, powers of two to the 8,192-token query domain.
-            Axis::chain([vec![1.0], Axis::pow2(6, 13)]),
+            Axis::chain([vec![2.0], Axis::pow2(6, 13)]),
             Axis::pow2(0, 9),
             Axis::values([0, 1, 2, 4, 8, 16, 32, 64]),
         ])
@@ -232,7 +240,7 @@ mod tests {
         let grid = KdaChunkPrefillSpec::sweep_grid(&cfg);
         assert_eq!(
             grid.axes()[0],
-            vec![1.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 2048.0, 4096.0, 8192.0]
+            vec![2.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 2048.0, 4096.0, 8192.0]
         );
         assert_eq!(grid.axes()[1].first(), Some(&1.0));
         assert_eq!(grid.axes()[1].last(), Some(&512.0));
@@ -243,6 +251,7 @@ mod tests {
 
         let mask = KdaChunkPrefillSpec::infeasible_mask(&cfg, &grid);
         assert_eq!(mask.len(), 720);
+        // 54 (L, R) pairs x 8 D.
         assert_eq!(mask.iter().filter(|&&masked| !masked).count(), 432);
 
         let payloads = KdaChunkPrefillSpec::enumerate(&cfg, &grid, "vllm_triton");
