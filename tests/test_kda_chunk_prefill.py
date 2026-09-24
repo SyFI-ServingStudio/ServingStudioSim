@@ -91,6 +91,37 @@ def test_rejects_shapes_outside_the_verified_path(override: dict) -> None:
         runner.validate_args(**{**_CAPTURE, **override})
 
 
+@pytest.mark.parametrize(
+    "shape",
+    [
+        dict(num_tokens=1, max_sequence_length=1, num_decode_sequences=0),
+        dict(num_tokens=9, max_sequence_length=1, num_decode_sequences=4),
+    ],
+)
+def test_rejects_query_length_one_prefill_as_unreachable(shape: dict) -> None:
+    # Defect: the T=1 spec reaching the callable, which writes through its
+    # already-contiguous q/k/v views into qkv (the old "mutated qkv" failure) and
+    # tunes the worker's autotune state at a launch-bound shape before failing.
+    with pytest.raises(ValueError, match="unreachable.*decode_threshold=1"):
+        runner.validate_args(**{**_CAPTURE, **shape})
+
+
+def test_autotune_anchor_is_the_capture_layout_at_the_spec_heads() -> None:
+    # Defect: the anchor drifting with the row (order dependence again) or
+    # ignoring the spec's tuning-key axes (H, K, dtype).
+    row = runner.validate_args(
+        **{**_CAPTURE, "num_tokens": 70, "max_sequence_length": 66, "num_heads": 8,
+           "num_decode_sequences": 4}
+    )
+    anchor = runner.anchor_shape(row)
+    assert (anchor.num_tokens, anchor.max_sequence_length, anchor.num_decode_sequences) == (
+        2048,
+        2019,
+        29,
+    )
+    assert (anchor.num_heads, anchor.head_dim, anchor.dtype) == (8, 128, DType.BF16)
+
+
 def test_invoke_reproduces_the_production_call() -> None:
     # Defect: timing contiguous q/k/v (skips the callable's three copy launches),
     # or dropping safe_gate / in-kernel l2norm / the final-state write.
