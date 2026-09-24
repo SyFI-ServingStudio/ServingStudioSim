@@ -327,7 +327,9 @@ pub enum IterWorkerSel {
         #[param(default = 80.0)]
         attn_gpu_memory_gb: f64,
         /// Chunked-prefill cap: max tokens per batch. Decode spends it in query
-        /// rows, so a resident decode costs the whole verify width here.
+        /// rows, so a resident decode costs the whole verify width here, and
+        /// every scheduled request also costs the arch's drafting slots
+        /// (DFlash: `draft_tokens`; MTP: none).
         max_batch_tokens: u32,
         /// Candidate positions drafted per request per iteration. Must equal the
         /// arch selector's `draft_tokens`: it picks the profiled verify shape.

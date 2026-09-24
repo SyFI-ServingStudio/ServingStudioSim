@@ -36,7 +36,7 @@ MoE arch that costs routed experts, including TP-only models.
 
 `popularity` requires a valid file; `uniform` and `random` reject popularity
 files. `corpus` reads recorded per-token routes from `token_corpus_file` on the
-GLM-5.2 NVFP4 archs: prefer it over `popularity` when the deployment drafts
+GLM-5.2 NVFP4 archs and GLM-5.3 DFlash2: prefer it over `popularity` when the deployment drafts
 (`draft_tokens > 0`), because a marginal cannot express which experts a verify
 block's tokens jointly select. At verify width 1 the two agree and either is
 fine. A corpus is also the only source that measures the MTP layer's own
@@ -59,9 +59,15 @@ used — two corpora of the same model are different recordings.
 Published corpora live in the private hub repository
 `UW-SyFI/servingstudio-corpora`, which needs a Hugging Face login with access to
 the `UW-SyFI` organization. Its `README.md` records each capture's model,
-deployment, and workload. Today it holds `glm52_nvfp4_mtp5`: GLM-5.2 NVFP4, vLLM
-TP4 EP4 with MTP-5, the reference above. Publish a new capture as a new
-directory, and reference it by the upload's commit.
+deployment, and workload. Today it holds:
+
+- `glm52_nvfp4_mtp5`: GLM-5.2 NVFP4, vLLM TP4 EP4 with MTP-5, the reference
+  above;
+- `glm53_nvfp4_dflash2`: GLM-5.3 NVFP4, vLLM TP4 EP4 with DFlash2-7, body layers
+  only, at commit `c09af698f8192222ee8852f8c727630789890310`.
+
+Publish a new capture as a new directory, and reference it by the upload's
+commit.
 
 Both artifacts come from one capture: `profile_kind: token_corpus` in
 `operate-run-alignment`, which writes the corpus and, when the expert topology

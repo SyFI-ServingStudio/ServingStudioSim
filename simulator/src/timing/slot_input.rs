@@ -33,13 +33,13 @@ use crate::timing::kernels::{
     GdnChunkScaledDotKktKernelInput, GdnChunkSolveTrilKernelInput, GdnChunkStateUpdateKernelInput,
     GdnGatedRmsNormKernelInput, GdnPrefillPostConvKernelInput, GdnRecurrentDecodeKernelInput,
     GemmFp32OutputKernelInput, GroupedGemmKernelInput, KvCacheAppendKernelInput,
-    MhcRmsNormKernelInput, MlaCacheAppendKernelInput, MlaRopeQuantizeFp8KernelInput,
-    MoeAlignBlockSizeKernelInput, MoeAlltoallKernelInput, MoeAlltoallPrepareKernelInput,
-    MoeEpCollectiveKernelInput, MoeFinalizeFuseSharedKernelInput, MoeFinalizeRoutingKernelInput,
-    MoeFusedTopkKernelInput, MoeSumKernelInput, MoeTopkSoftplusSqrtKernelInput,
-    Mxfp4MarlinMoeGemmKernelInput, Nvfp4FusedMoeKernelInput, Nvfp4QuantKernelInput,
-    P2pInterKernelInput, P2pIntraKernelInput, ResidualRmsNormKernelInput, RmsNormKernelInput,
-    SingleGemmKernelInput, VllmFusedMoeKernelInput, VllmMlaRopeKernelInput,
+    LogitsTopkKernelInput, MhcRmsNormKernelInput, MlaCacheAppendKernelInput,
+    MlaRopeQuantizeFp8KernelInput, MoeAlignBlockSizeKernelInput, MoeAlltoallKernelInput,
+    MoeAlltoallPrepareKernelInput, MoeEpCollectiveKernelInput, MoeFinalizeFuseSharedKernelInput,
+    MoeFinalizeRoutingKernelInput, MoeFusedTopkKernelInput, MoeSumKernelInput,
+    MoeTopkSoftplusSqrtKernelInput, Mxfp4MarlinMoeGemmKernelInput, Nvfp4FusedMoeKernelInput,
+    Nvfp4QuantKernelInput, P2pInterKernelInput, P2pIntraKernelInput, ResidualRmsNormKernelInput,
+    RmsNormKernelInput, SingleGemmKernelInput, VllmFusedMoeKernelInput, VllmMlaRopeKernelInput,
 };
 
 /// The prefill aggregating leaf's input: the full `(prefix_len, append_len)`
@@ -48,6 +48,15 @@ use crate::timing::kernels::{
 #[derive(Clone, Serialize)]
 pub struct AttnPrefillLog {
     pub prefill_chunk_pairs: Vec<(u32, u32)>,
+}
+
+/// The DFlash2 draft-attention aggregating leaf's input: every request's
+/// `(q_len, kv_len)` rectangle summed into one slot. Unlike prefill there is no
+/// causal split -- the draft attends its whole query block over the whole
+/// context -- so the faithful record is the rectangle list itself.
+#[derive(Clone, Serialize)]
+pub struct Dflash2DraftAttnLog {
+    pub rectangles: Vec<(u32, u32)>,
 }
 
 /// Gated DeltaNet causal-convolution prefill fan-in: every request-local
@@ -128,6 +137,7 @@ log_inputs! {
     GdnRecurrentDecode => GdnRecurrentDecodeKernelInput,
     MoeFinalizeRouting => MoeFinalizeRoutingKernelInput,
     MoeFusedTopk => MoeFusedTopkKernelInput,
+    LogitsTopk => LogitsTopkKernelInput,
     MoeAlignBlockSize => MoeAlignBlockSizeKernelInput,
     MoeEpCollective => MoeEpCollectiveKernelInput,
     Mxfp4MarlinMoeGemm => Mxfp4MarlinMoeGemmKernelInput,
@@ -156,6 +166,7 @@ log_inputs! {
     DsaSparseMlaDecode => DsaSparseMlaDecodeLog,
     AttnDecode  => FlashinferAttnDecodeKernelInput,
     AttnRect    => FlashinferAttnRectKernelInput,
+    Dflash2DraftAttn => Dflash2DraftAttnLog,
     KvCacheAppend => KvCacheAppendKernelInput,
     MlaCacheAppend => MlaCacheAppendKernelInput,
     DsaIndexCacheAppend => DsaIndexCacheAppendKernelInput,

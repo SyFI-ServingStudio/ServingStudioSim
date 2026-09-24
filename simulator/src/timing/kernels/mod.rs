@@ -51,6 +51,7 @@ pub mod gdn_recurrent_decode;
 pub mod gemm_fp32_output;
 pub mod grouped_gemm;
 pub mod kv_cache_append;
+pub mod logits_topk;
 pub mod mhc_fused_post_pre_rms_norm;
 pub mod mhc_pre_rms_norm;
 pub mod mla_cache_append;
@@ -263,6 +264,9 @@ pub use grouped_gemm::{
 };
 pub use kv_cache_append::{
     KvCacheAppendKernel, KvCacheAppendKernelConfig, KvCacheAppendKernelInput, KvCacheAppendSpec,
+};
+pub use logits_topk::{
+    LogitsTopkKernel, LogitsTopkKernelConfig, LogitsTopkKernelInput, LogitsTopkSpec,
 };
 pub use mhc_fused_post_pre_rms_norm::{MhcFusedPostPreRmsNormKernel, MhcFusedPostPreRmsNormSpec};
 pub use mhc_pre_rms_norm::{

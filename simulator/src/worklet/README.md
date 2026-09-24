@@ -98,6 +98,7 @@ Each module re-exports its `{Worklet, Config, Input, Resolved}` quartet through
 | `glm52_vllm_dsa_moe` | `vllm_glm52_dsa_attn_local`, `vllm_glm52_dense_ffn_local`, `vllm_glm52_shared_expert_local`, plus the shared GLM router, expert, and MTP sections |
 | `glm52_vllm_nvfp4_dsa_moe` | `vllm_glm52_dsa_attn_local`, neutral `glm52_dense_ffn_local`, `glm52_shared_expert_local`, `nvfp4_moe_local`, plus the unchanged GLM router and MTP sections |
 | `glm52_vllm_nvfp4_dsa_moe_speculative` | Same target sections; draft uses `bf16_moe_local`, MTP prelude/head, and first/recurrent attention sections |
+| `glm53_vllm_nvfp4_dsa_moe_dflash2` | Same target sections without the MTP layer; draft uses `dflash2_context_kv_local`, `dflash2_draft_layer_local` (attention and FFN halves), and `dflash2_selector_local` |
 | `glm52_sglang_nvfp4_tp_dsa_moe` | `sglang_glm52_dsa_attn_local`, `sglang_glm52_moe_router_local`, `sglang_moe_finalize_local`, neutral `glm52_dense_ffn_local`, `glm52_shared_expert_local`, `nvfp4_moe_local`, plus the unchanged GLM MTP sections |
 
 When a provider-prefixed module has a neutral sibling, it is the **same sync

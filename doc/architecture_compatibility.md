@@ -34,6 +34,7 @@ the graph that produced them.
 | `glm52_vllm_dsa_moe` | vLLM-aligned BF16 or FP8 DSA/MoE | local TP1 attention replicated across configurable EP ranks; `nvl_num_gpu` divides `ep_size` | canonical replacement for `glm52_dsa_moe` |
 | `glm52_vllm_nvfp4_dsa_moe` | vLLM-aligned NVFP4 DSA/MoE | shared TP/EP rank group, with one attention group | distinct precision and parallel topology |
 | `glm52_vllm_nvfp4_dsa_moe_speculative` | vLLM-aligned NVFP4 target plus MTP draft passes | same TP/EP topology as the ordinary NVFP4 graph | distinct model and speculative-worker contract |
+| `glm53_vllm_nvfp4_dsa_moe_dflash2` | the same NVFP4 target, run without its MTP layer, plus one DFlash2 block-parallel draft pass | same TP/EP topology; the draft is TP-sharded over the same ranks | distinct proposer checkpoint and cost tree |
 | `glm52_sglang_nvfp4_tp_dsa_moe` | SGLang-aligned NVFP4 DSA/MoE | pure TP with EP1; every rank owns all experts | covers a topology the vLLM graph cannot represent |
 | `qwen36_local` | heterogeneous local FP8 graph | fixed TP1/EP1 | only Qwen3.6 graph |
 

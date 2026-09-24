@@ -25,7 +25,7 @@ pub use dims::Dim;
 pub use expert_demand::ExpertDemand;
 pub use kernels::engine::KernelConfig;
 pub use result::{CacheProbe, Probe};
-pub use slot_input::{AttnPrefillLog, GdnCausalConvPrefillLog, SlotInput};
+pub use slot_input::{AttnPrefillLog, Dflash2DraftAttnLog, GdnCausalConvPrefillLog, SlotInput};
 pub use sweep::{Axis, Coords, SweepCoords, SweepGrid};
 // Re-export derive macros under the same names as their traits so users only
 // import `crate::timing::{SweepCoords, KernelConfig}` once for both `impl`

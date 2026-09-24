@@ -234,7 +234,7 @@ pub struct Glm52VllmNvfp4DsaMoeResolved {
     pub mtp_head: Option<Glm52MtpHeadLocalWorkletResolved>,
 }
 
-fn fit_failed(reason: impl Into<String>) -> BuildError {
+pub(crate) fn fit_failed(reason: impl Into<String>) -> BuildError {
     BuildError::FitFailed {
         kind: ARCH_KIND,
         reason: reason.into(),
@@ -392,6 +392,38 @@ pub fn build_speculative_configs(
         Some(mtp_recurrent_demand),
         fp8,
         mtp_mode,
+        decode_next_n,
+        Some(draft_tokens),
+    )
+}
+
+/// The target of a speculative deployment whose proposer is not the MTP layer.
+///
+/// It verifies `draft_tokens + 1` rows per decode request like any speculative
+/// target, but runs no MTP layer: a separate draft checkpoint (GLM-5.3's
+/// DFlash2) owns the proposal, so the target carries no MTP configs and no MTP
+/// state. The proposer's own model builds the draft stage.
+pub fn build_verify_configs(
+    model: &Glm52ModelCfg,
+    parallel: &Glm52VllmNvfp4DsaMoeParallel,
+    body_demand: &ExpertDemand,
+    fp8: bool,
+    draft_tokens: u32,
+) -> Result<Glm52VllmNvfp4DsaMoeConfigs, BuildError> {
+    if draft_tokens == 0 {
+        return Err(fit_failed("speculative draft_tokens must be positive"));
+    }
+    let decode_next_n = draft_tokens
+        .checked_add(1)
+        .ok_or_else(|| fit_failed("speculative draft_tokens + 1 overflows u32"))?;
+    build_configs_for_decode(
+        model,
+        parallel,
+        body_demand,
+        None,
+        None,
+        fp8,
+        Glm52MtpMode::Off,
         decode_next_n,
         Some(draft_tokens),
     )
@@ -1308,9 +1340,9 @@ impl Glm52MtpPass {
 /// MTP pass to this section; the speculative model appends a draft stage that
 /// runs a different number of times and bills different shapes. Neither is a
 /// special case of the other, so neither owns the other -- they own this.
-struct Glm52TargetForward {
+pub(crate) struct Glm52TargetForward {
     name: String,
-    ep_size: u16,
+    pub(crate) ep_size: u16,
     embedding: Op<ElementwiseKernel>,
     embedding_allreduce_fallback: Op<AllReduceKernel>,
     embedding_allreduce_fusion: Op<AllReduceFusionKernel>,
@@ -1439,7 +1471,7 @@ pub struct Glm52VllmNvfp4DsaMoeSpeculativeModel {
 }
 
 impl Glm52TargetForward {
-    fn build(
+    pub(crate) fn build(
         name: String,
         resolved: &Glm52VllmNvfp4DsaMoeResolved,
         bridge: &PerfApiBridge,
@@ -1675,7 +1707,7 @@ impl Glm52TargetForward {
     /// own tail -- the MTP pass or the draft stage -- into the same builder and
     /// label the root for itself. The slot order is the order of this vector,
     /// so it is also the shared prefix of both models' cost logs.
-    fn compile_children(&self, builder: &mut CostTreeBuilder) -> Vec<CostNode> {
+    pub(crate) fn compile_children(&self, builder: &mut CostTreeBuilder) -> Vec<CostNode> {
         let embedding = labeled_max(
             format!("{}.main.embedding [Max over TP ranks]", self.name),
             (0..self.ep_size)
@@ -1771,7 +1803,7 @@ impl Glm52TargetForward {
     ///
     /// The slot order matches `compile_children`, so a model that appends its
     /// own tail after calling this fills the same prefix either way.
-    fn eval(&self, batch: &NormalizedBatch, ev: &mut Evaluator) {
+    pub(crate) fn eval(&self, batch: &NormalizedBatch, ev: &mut Evaluator) {
         let group = &batch.groups[0];
         for _ in 0..self.ep_size {
             eval_atomic_or_zero(
@@ -2077,23 +2109,23 @@ impl SpeculativeUnifiedModel for Glm52VllmNvfp4DsaMoeSpeculativeModel {
 }
 
 #[derive(Clone, Debug)]
-struct NormalizedGroup {
-    batch_tokens: u32,
-    /// Requests in this group, prefilling and decoding alike. A draft pass
+pub(crate) struct NormalizedGroup {
+    pub(crate) batch_tokens: u32,
+    /// Requests in this group, prefilling and decoding alike. An MTP draft pass
     /// forwards exactly this many rows, one endpoint per request.
-    request_count: u32,
+    pub(crate) request_count: u32,
     /// Rows the sampler needs logits for: one per prefill request, and every
     /// decode query row, because a verify step scores all of them. This exceeds
     /// `request_count` by the drafted positions.
     logits_rows: u32,
     /// One entry per request, at that request's own KV length.
-    endpoint_context_lens: Vec<u32>,
+    pub(crate) endpoint_context_lens: Vec<u32>,
     attention_input: VllmGlm52DsaAttnLocalWorkletInput,
 }
 
 #[derive(Clone, Debug)]
-struct NormalizedBatch {
-    groups: Vec<NormalizedGroup>,
+pub(crate) struct NormalizedBatch {
+    pub(crate) groups: Vec<NormalizedGroup>,
     total_tokens: u32,
 }
 
@@ -2247,7 +2279,7 @@ fn normalize_input(
     })
 }
 
-fn normalize_speculative_input(
+pub(crate) fn normalize_speculative_input(
     input: &SpeculativeArchInput,
     draft_tokens: u32,
     max_model_len: u32,
@@ -2475,7 +2507,7 @@ fn expected_speculative_slot_count(
     expected_slot_count(ep_size) + expected_mtp_pass_slots(ep_size, false) + recurrent
 }
 
-fn state_bytes_per_token(
+pub(crate) fn state_bytes_per_token(
     ep_size: u16,
     mtp_mode: Glm52MtpMode,
 ) -> std::result::Result<u64, BuildError> {
@@ -2819,6 +2851,40 @@ mod tests {
         let recurrent = cfg.mtp_recurrent_attention.as_ref().unwrap();
         assert_eq!(recurrent.decode_next_n, 1);
         assert!(!recurrent.include_indexer);
+    }
+
+    #[test]
+    fn a_verify_only_target_widens_the_decode_and_runs_no_mtp_layer() {
+        // A proposer from its own checkpoint (DFlash2) still makes the target
+        // verify `draft_tokens + 1` rows, but must not bill or allocate the MTP
+        // layer the GLM checkpoint happens to carry.
+        let cfg = build_verify_configs(
+            &model(),
+            &parallel(4),
+            &ExpertDemand::popularity(&RoutingDistribution::uniform(NUM_EXPERTS), 1),
+            false,
+            7,
+        )
+        .unwrap();
+        for attention in [
+            &cfg.dense_full_index_attention,
+            &cfg.initial_shared_attention,
+            &cfg.cycle_full_attention,
+            &cfg.cycle_shared_attention,
+        ] {
+            assert_eq!(attention.decode_next_n, 8);
+        }
+        assert_eq!(cfg.speculative_draft_tokens, Some(7));
+        assert_eq!(cfg.mtp_mode, Glm52MtpMode::Off);
+        assert!(cfg.mtp_attention.is_none());
+        assert!(cfg.mtp_recurrent_attention.is_none());
+        assert!(cfg.mtp_bf16_moe.is_none());
+        assert!(cfg.mtp_prelude.is_none() && cfg.mtp_head.is_none());
+
+        // The GLM-5.2 speculative model has no proposer to run from these.
+        let bridge = PerfApiBridge::new_uninit_for_test();
+        bridge.enable_enumerate();
+        assert!(build_speculative("unified".to_string(), resolve_configs(&cfg), &bridge).is_err());
     }
 
     #[test]

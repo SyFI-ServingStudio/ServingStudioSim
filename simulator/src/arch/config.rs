@@ -110,6 +110,17 @@ const fn default_glm52_draft_tokens() -> u32 {
     5
 }
 
+/// The DFlash2 checkpoint's own block size is 8: one bonus token plus seven
+/// drafted positions.
+const fn default_dflash2_draft_tokens() -> u32 {
+    7
+}
+
+/// `sliding_window` in the DFlash2 draft checkpoint.
+const fn default_dflash2_sliding_window() -> u32 {
+    2048
+}
+
 /// Iteration-wise arch provider. Sharding parameters live only on the variants
 /// that consume them (provider-first: select the arch, then it exposes its own
 /// params).
@@ -387,6 +398,55 @@ pub enum IterArchSel {
         #[param(cache_key)]
         token_corpus_file: Option<String>,
     },
+    /// The same GLM target graph driven by a **DFlash2** proposer instead of the
+    /// MTP layer.
+    ///
+    /// The distinction that matters here is not the checkpoint but the drafting
+    /// shape: DFlash2 proposes a whole block in one forward pass, so there is no
+    /// recurrence to fold and the draft forwards `draft_tokens + 1` rows per
+    /// request rather than one. It also carries its own dense checkpoint, so it
+    /// routes nothing and has no `mtp_mode`.
+    Glm53VllmNvfp4DsaMoeDflash2 {
+        #[serde(flatten)]
+        model: ModelSpec,
+        /// Shared tensor/expert-parallel rank count.
+        #[serde(default = "default_glm52_nvfp4_parallel_size")]
+        #[param(default = 4, cache_key)]
+        ep_size: u16,
+        #[serde(default = "default_glm52_nvfp4_parallel_size")]
+        #[param(default = 4, cache_key)]
+        nvl_num_gpu: u16,
+        /// Configured context cap and padded DSA-logits row stride.
+        #[serde(default = "default_glm52_nvfp4_max_model_len")]
+        #[param(default = 1048576, cache_key)]
+        max_model_len: u32,
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS)]
+        routing: RoutingKind,
+        #[serde(default)]
+        routing_seed: Option<u64>,
+        /// Candidate positions drafted per request per iteration. Fixes the
+        /// verify width at `draft_tokens + 1`, which selects a profiled kernel
+        /// shape and so cannot vary per iteration.
+        #[serde(default = "default_dflash2_draft_tokens")]
+        #[param(default = 7, cache_key)]
+        draft_tokens: u32,
+        /// The draft's own attention window. It caps the context each draft
+        /// query attends to, not the draft's KV: vLLM allocates those layers as
+        /// full attention, so their cache still grows with every token.
+        #[serde(default = "default_dflash2_sliding_window")]
+        #[param(default = 2048, cache_key)]
+        draft_sliding_window: u32,
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+        /// Recorded per-token target expert routes from a `token_corpus` pass,
+        /// as a manifest path. Requires `routing = corpus`. Only the body
+        /// slice is read: this target runs no MTP layer.
+        #[serde(default)]
+        #[param(cache_key)]
+        token_corpus_file: Option<String>,
+    },
     /// SGLang's B200 NVFP4 launch graph under pure tensor parallelism. Every
     /// rank owns all experts (EP1) and shards the routed intermediate axis by
     /// TP, so there is no expert-parallel or NVLink-domain selector.
@@ -435,6 +495,7 @@ impl IterArchSel {
             | Self::Glm52VllmDsaMoe { model, .. }
             | Self::Glm52VllmNvfp4DsaMoe { model, .. }
             | Self::Glm52VllmNvfp4DsaMoeSpeculative { model, .. }
+            | Self::Glm53VllmNvfp4DsaMoeDflash2 { model, .. }
             | Self::Glm52SglangNvfp4TpDsaMoe { model, .. } => model,
         }
     }

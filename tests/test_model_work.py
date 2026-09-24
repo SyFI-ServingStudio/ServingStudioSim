@@ -1506,6 +1506,7 @@ def test_gated_attention_doubles_q_projection():
 
 GLM52_FP8 = Path(__file__).resolve().parents[1] / "model" / "config" / "glm52_fp8.json"
 GLM52_NVFP4 = Path(__file__).resolve().parents[1] / "model" / "config" / "glm52_nvfp4.json"
+GLM53_NVFP4 = Path(__file__).resolve().parents[1] / "model" / "config" / "glm53_nvfp4.json"
 QWEN3_235B = (
     Path(__file__).resolve().parents[1] / "model" / "config" / "qwen3_235b_thinking_2507.json"
 )
@@ -1944,3 +1945,19 @@ def test_qwen3_moe_fp8_quantizes_experts_but_not_the_router():
         embedding = next(seg for seg in label.segments if seg.name == "embedding")
         assert embedding.compute_dtype == "bf16"
         assert embedding.bytes == min(1_000_000, model.vocab) * model.hidden * 2
+
+
+def test_glm53_target_is_dimensionally_the_glm52_graph():
+    """GLM-5.3's target runs through GLM-5.2's arch, so the two configs must agree.
+
+    The published NVFP4 checkpoints agree on every field this repo reads; only
+    `transformers_version` differs. Their quantization configs are encoded
+    differently but describe the same scheme (routed experts in layers 3..77
+    quantized, the MTP layer's experts not). A revision that breaks this must
+    fail here, because the DFlash2 arch reuses the GLM-5.2 target forward.
+    """
+    glm52 = json.loads(GLM52_NVFP4.read_text())
+    glm53 = json.loads(GLM53_NVFP4.read_text())
+    assert {k: v for k, v in glm53.items() if k != "transformers_version"} == {
+        k: v for k, v in glm52.items() if k != "transformers_version"
+    }

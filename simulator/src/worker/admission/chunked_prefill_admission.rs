@@ -43,6 +43,10 @@ pub struct ChunkedPrefillAdmission<P: PendingOrderPolicy, D = SingleTokenDecodeC
     /// How far one resident decode moves per iteration. Ordinary decode retires
     /// one token; speculative decode retires up to the verify width.
     decode_completion: D,
+    /// Budget tokens charged to every scheduled request on top of its own rows
+    /// (see `SpeculativeUnifiedModel::drafting_slots_per_request`). Zero for
+    /// ordinary decode and sequential drafters.
+    drafting_slots: u32,
 }
 
 impl<P: PendingOrderPolicy> ChunkedPrefillAdmission<P, SingleTokenDecodeCompletion> {
@@ -60,6 +64,7 @@ impl<P: PendingOrderPolicy> ChunkedPrefillAdmission<P, SingleTokenDecodeCompleti
             kv_admission,
             balance,
             SingleTokenDecodeCompletion,
+            0,
         )
     }
 }
@@ -72,6 +77,7 @@ impl<P: PendingOrderPolicy, D> ChunkedPrefillAdmission<P, D> {
         kv_admission: KvAdmissionConfig,
         balance: LoadBalance,
         decode_completion: D,
+        drafting_slots: u32,
     ) -> Self {
         assert!(max_batch_tokens > 0, "chunked prefill cap must be positive");
         assert!(
@@ -105,6 +111,7 @@ impl<P: PendingOrderPolicy, D> ChunkedPrefillAdmission<P, D> {
             active_chunks: Vec::new(),
             prefill_episodes: HashMap::new(),
             decode_completion,
+            drafting_slots,
         }
     }
 
@@ -341,6 +348,10 @@ where
         let bounded_config = self.bounded_config();
         let current_new_token_ratio = self.current_new_token_ratio;
         let query_width = self.decode_completion.query_tokens_per_request();
+        // Every scheduled request, decode or prefill chunk, also spends the
+        // drafter's slots.
+        let drafting_slots = self.drafting_slots;
+        let decode_budget = query_width + drafting_slots;
         // One short prompt can create a whole verify window next iteration.
         // Reserve those future query slots before admitting its prefill; an
         // unfinished active chunk keeps its reservation across iterations.
@@ -349,7 +360,7 @@ where
                 .map(|partition| {
                     let active = self.active_chunks[partition]
                         .is_some_and(|candidate| candidate.remaining_output_tokens > 1);
-                    (self.max_batch_tokens / query_width)
+                    (self.max_batch_tokens / decode_budget)
                         .saturating_sub(kv_store.live_decode_count(partition as u16))
                         .saturating_sub(u32::from(active))
                 })
@@ -365,7 +376,7 @@ where
                     self.max_batch_tokens.saturating_sub(
                         kv_store
                             .live_decode_count(partition)
-                            .saturating_mul(query_width),
+                            .saturating_mul(decode_budget),
                     )
                 } else {
                     self.max_batch_tokens
@@ -382,7 +393,8 @@ where
             let remaining = kv_store
                 .resolved_prefill_context(candidate.request_id)
                 .remaining_prefill_tokens();
-            let chunk_tokens = remaining.min(remaining_budgets[partition_index]);
+            let chunk_tokens =
+                remaining.min(remaining_budgets[partition_index].saturating_sub(drafting_slots));
             if chunk_tokens == 0 {
                 continue;
             }
@@ -391,7 +403,7 @@ where
                 partition_index as u16,
                 chunk_tokens,
             );
-            remaining_budgets[partition_index] -= chunk_tokens;
+            remaining_budgets[partition_index] -= chunk_tokens + drafting_slots;
             if chunk_tokens == remaining {
                 self.active_chunks[partition_index] = None;
             }
@@ -400,7 +412,7 @@ where
         for partition_index in 0..num_partitions {
             let partition = partition_index as u16;
             while self.active_chunks[partition_index].is_none()
-                && remaining_budgets[partition_index] > 0
+                && remaining_budgets[partition_index] > drafting_slots
             {
                 let (policy, policy_context) = &mut self.partition_policies[partition_index];
                 policy.refresh_head(&mut |candidate| {
@@ -484,9 +496,10 @@ where
                     "request entered two simultaneous prefill episodes"
                 );
                 let remaining = resolved_prefill.remaining_prefill_tokens();
-                let chunk_tokens = remaining.min(remaining_budgets[partition_index]);
+                let chunk_tokens =
+                    remaining.min(remaining_budgets[partition_index] - drafting_slots);
                 kv_store.schedule_prefill_chunk(candidate.request_id, partition, chunk_tokens);
-                remaining_budgets[partition_index] -= chunk_tokens;
+                remaining_budgets[partition_index] -= chunk_tokens + drafting_slots;
                 if chunk_tokens < remaining {
                     self.active_chunks[partition_index] = Some(candidate);
                 }
