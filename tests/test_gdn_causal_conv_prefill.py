@@ -116,7 +116,7 @@ def test_registration_table_kind_runner_and_support_contract() -> None:
     assert not spec.supports.allows(DType.FP32, gpu="NVIDIA H200")
 
 
-def test_vllm_registration_reuses_schema_table_and_is_h200_only() -> None:
+def test_vllm_registration_reuses_schema_table_and_is_h200_b200_only() -> None:
     spec = find_kernel_profiler_spec(KIND, "vllm_triton")
 
     assert spec.kernel_kind == spec.table_name == KIND
@@ -132,10 +132,10 @@ def test_vllm_registration_reuses_schema_table_and_is_h200_only() -> None:
 
     assert spec.supports.compute == frozenset({DType.BF16})
     assert spec.supports.kv is None
-    assert spec.supports.gpus == frozenset({"NVIDIA H200"})
+    assert spec.supports.gpus == frozenset({"NVIDIA H200", "NVIDIA B200"})
     assert spec.supports.allows(DType.BF16, gpu="NVIDIA H200")
     assert not spec.supports.allows(DType.BF16, gpu="NVIDIA H100")
-    assert not spec.supports.allows(DType.BF16, gpu="NVIDIA B200")
+    assert spec.supports.allows(DType.BF16, gpu="NVIDIA B200")
     assert not spec.supports.allows(DType.FP16, gpu="NVIDIA H200")
 
 
@@ -549,7 +549,7 @@ def test_vllm_profile_timed_callable_is_one_fused_call(monkeypatch) -> None:
         fn()
         return 0.25
 
-    monkeypatch.setattr(runner, "_require_h200", lambda _torch: None)
+    monkeypatch.setattr(runner, "_require_supported_gpu", lambda _torch: None)
     monkeypatch.setattr(runner, "_load_vllm_components", lambda: (fake_fused, object()))
     monkeypatch.setattr(runner, "_build_operands", fake_build)
     monkeypatch.setattr(runner, "_check_correctness", fake_guard)
