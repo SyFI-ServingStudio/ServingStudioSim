@@ -11,6 +11,9 @@ __all__ = ["dsa_sparse_mla_attention_reference"]
 _LATENT_DIM = 512
 _ROPE_DIM = 64
 _SCORE_DIM = _LATENT_DIM + _ROPE_DIM
+# GLM-5.3-Flash has no rope part (qk_rope_head_dim=0), so its score width is
+# the 512-wide latent alone. The value path is the first 512 dims either way.
+_SUPPORTED_SCORE_DIMS = (_SCORE_DIM, _LATENT_DIM)
 _VALUE_DIM = _LATENT_DIM
 _QUERY_CHUNK_SIZE = 8
 
@@ -25,7 +28,8 @@ def dsa_sparse_mla_attention_reference(
     """Return BF16 selected MLA attention in a fresh ``[Q, H, 512]`` tensor.
 
     The score and value paths use FP32: QK consumes all 576 dimensions (the
-    512-dimensional latent part followed by 64 RoPE dimensions), while PV uses
+    512-dimensional latent part followed by 64 RoPE dimensions; 512 alone for
+    GLM-5.3-Flash's rope-free layout, where q and cache are both 512 wide), while PV uses
     the first 512 cache dimensions as values. Every negative index and every
     index outside the cache is masked. Duplicate valid indices deliberately
     retain repeated softmax mass, and rows with no valid index return zeros.
@@ -61,7 +65,7 @@ def dsa_sparse_mla_attention_reference(
         gathered = cache_rows.index_select(0, safe_indices.reshape(-1)).reshape(
             query_end - query_start,
             selected_indices.shape[2],
-            _SCORE_DIM,
+            q.shape[2],
         )
         gathered = gathered.float()
         gathered.masked_fill_(~valid.unsqueeze(-1), 0.0)
@@ -136,15 +140,15 @@ def _validate_ranks_and_shapes(
         raise ValueError("q must contain at least one query")
     if q.shape[1] <= 0:
         raise ValueError("q must contain at least one head")
-    if q.shape[2] != _SCORE_DIM:
-        raise ValueError(f"q score width must be {_SCORE_DIM}, got {q.shape[2]}")
+    if q.shape[2] not in _SUPPORTED_SCORE_DIMS:
+        raise ValueError(f"q score width must be {_SCORE_DIM} or {_LATENT_DIM}, got {q.shape[2]}")
 
     if cache.shape[0] <= 0:
         raise ValueError("cache must contain at least one token")
     if cache.shape[1] != 1:
         raise ValueError(f"cache must have exactly one MQA head, got {cache.shape[1]}")
-    if cache.shape[2] != _SCORE_DIM:
-        raise ValueError(f"cache score width must be {_SCORE_DIM}, got {cache.shape[2]}")
+    if cache.shape[2] != q.shape[2]:
+        raise ValueError(f"cache score width must be {q.shape[2]}, got {cache.shape[2]}")
 
     if selected_indices.shape[0] != q.shape[0]:
         raise ValueError(

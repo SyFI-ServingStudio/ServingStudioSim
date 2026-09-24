@@ -1,4 +1,4 @@
-"""GLM-5.2 BF16 selected sparse MLA attention kernel kind."""
+"""GLM-5.2 / GLM-5.3-Flash selected sparse MLA attention kernel kind."""
 
 from __future__ import annotations
 
@@ -76,6 +76,32 @@ register(
         metric_family=MetricFamily.COMPUTE,
         batch_outlier_policy=BatchOutlierPolicy(),
         subprocess_env="vllm_env",
+    )
+)
+
+
+# GLM-5.3-Flash (qk_rope_head_dim=0): FlashInfer's native no-rope sparse MLA,
+# which exists only in the vLLM fork's FlashInfer 0.6.18. Accepts rope_dim=0,
+# cache_layout "hnd_paged_mqa_fp8_latent", and selected_k (the page-table width
+# passed as sparse_mla_top_k) of 2048 or the kpool buffer's 2176.
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="flashinfer_trtllm_fp8_vllm_fork",
+        supports=BackendSupport(
+            compute=frozenset({DType.FP8_E4M3}),
+            kv=frozenset({DType.FP8_E4M3}),
+            gpus=frozenset({"NVIDIA B200"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.attention.dsa_sparse_mla_attention",
+            function_name="profile_dsa_sparse_mla_attention_flashinfer_trtllm_fp8_vllm_fork",
+        ),
+        table_name=KIND,
+        args_schema=DsaSparseMlaAttentionArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="vllm_fork_env",
     )
 )
 
