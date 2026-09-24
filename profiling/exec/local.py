@@ -8,7 +8,7 @@ import signal
 import subprocess
 import tempfile
 import xml.etree.ElementTree as ET
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
 
 from profiling.db.kind import KernelKind
@@ -87,10 +87,15 @@ class LocalGpuChunk(GpuChunk):
                 ),
                 encoding="utf-8",
             )
+            worker_env = dict(profiler_spec.worker_env)
             if isinstance(profiler_env, ContainerProfileEnv):
-                cmd, env = _container_worker_command(profiler_env, self.gpus, Path(tmp))
+                cmd, env = _container_worker_command(
+                    profiler_env, self.gpus, Path(tmp), worker_env=worker_env
+                )
             else:
-                cmd, env = _host_worker_command(profiler_env, self.gpus, input_path, output_path)
+                cmd, env = _host_worker_command(
+                    profiler_env, self.gpus, input_path, output_path, worker_env=worker_env
+                )
             # The gap between this span and the worker.boot span inside it is
             # process/container start: fork, image, CUDA context.
             with span("worker.subprocess", kind=kernel_kind, specs=len(chunk_specs)):
@@ -156,8 +161,13 @@ def _host_worker_command(
     gpus: list[int],
     input_path: Path,
     output_path: Path,
+    *,
+    worker_env: Mapping[str, str] | None = None,
 ) -> tuple[list[str], dict[str, str]]:
     env = os.environ.copy()
+    # The row's own worker policy (KernelProfilerSpec.worker_env) wins over the
+    # inherited environment; the backend-owned variables below win over both.
+    env.update(worker_env or {})
     env["CUDA_VISIBLE_DEVICES"] = ",".join(str(gpu) for gpu in gpus)
     env["PYTHONPATH"] = compose_pythonpath(profiler_env, env.get("PYTHONPATH"))
     if profiler_env.additional_library_paths:
@@ -181,6 +191,8 @@ def _container_worker_command(
     gpus: list[int],
     exchange_dir: Path,
     additional_volumes: tuple[tuple[Path, Path], ...] = (),
+    *,
+    worker_env: Mapping[str, str] | None = None,
 ) -> tuple[list[str], dict[str, str]]:
     cache_dir = Path(
         os.environ.get(
@@ -212,6 +224,13 @@ def _container_worker_command(
     # Mounted at its own absolute path so one env value works on both sides.
     # Same handover as the trace: a path forwarded in the environment is only
     # half the job, the directory has to exist inside the container too.
+    # The row's own worker policy (KernelProfilerSpec.worker_env) is handed
+    # over the same way.
+    policy_args += [
+        argument
+        for name, value in (worker_env or {}).items()
+        for argument in ("--env", f"{name}={value}")
+    ]
     host_paths = [os.environ.get(CUPTI_TRACE_ENV), os.environ.get(TIMELINE_ENV)]
     mounted: list[str] = []
     trace_volume_args = []

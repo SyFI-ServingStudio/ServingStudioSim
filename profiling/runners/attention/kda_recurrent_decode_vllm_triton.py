@@ -29,13 +29,22 @@ Timing is the CUPTI sum over the five launches of one call
 production does. The delta rule with unit-norm k and beta in (0, 1) is
 contractive, so repeated timing calls keep the state finite.
 
+Autotune state. The recurrent kernel on this path is not ``@autotune``d in
+the pinned fork, but the call lives in the same module as the autotuned chunk
+kernels. To keep a future autotuned config from depending on grid order, the
+registry row disables autotune persistence and the runner makes one anchor call
+at batch 32 (the capture's decode batch) per worker and (num_heads, head_dim,
+dtype) before any row, like the chunk-prefill runner. The note in
+``backend_version`` records the anchor and the selected-config digest
+(``configs=0`` while nothing on the path is autotuned).
+
 FLOPs and bytes are semantic logical counts, not physical Triton work.
 """
 
 from __future__ import annotations
 
 import importlib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from profiling.db.args import DType
@@ -54,6 +63,7 @@ from profiling.runners.exceptions import (
     ProfilerNotImplemented,
 )
 from profiling.runners.metrics import ComputeMetrics
+from profiling.runners.triton_autotune_pin import AutotunePin
 
 _BACKEND = "kda_recurrent_decode:vllm_triton"
 _MODULE = "vllm.models.glm5next.nvidia.ops.third_party.kda"
@@ -66,6 +76,10 @@ LOWER_BOUND = -5.0
 # tests/models/kimi_k3/test_kda.py::test_kda_spec_decode_correctness.
 OUTPUT_RMSE_RATIO_TOL = 1e-3
 STATE_RMSE_RATIO_TOL = 3e-3
+# Autotune anchor batch: the capture's decode batch. Heads, head dim and dtype
+# come from the spec.
+AUTOTUNE_ANCHOR_BATCH = 32
+_PIN = AutotunePin((_MODULE, "vllm.third_party.flash_linear_attention"))
 
 
 @dataclass(frozen=True)
@@ -274,6 +288,7 @@ def profile_kda_recurrent_decode_vllm_triton(
             environment_label="the vllm_fork_env (alignment vLLM fork)",
         )
         device = torch.device("cuda", torch.cuda.current_device())
+        pin_autotune(torch, callable_, shape, device=device)
         operands = build_operands(torch, shape, device=device)
         check_correctness(torch, callable_, operands, shape)
 
@@ -298,6 +313,28 @@ def profile_kda_recurrent_decode_vllm_triton(
     )
 
 
+def pin_autotune(
+    torch: Any, callable_: Any, shape: KdaRecurrentDecodeShape, *, device: Any
+) -> str:
+    """Tune once per worker and state key at the anchor, before any other call."""
+    anchor = replace(shape, batch_size=AUTOTUNE_ANCHOR_BATCH)
+
+    def tune() -> None:
+        invoke(callable_, build_operands(torch, anchor, device=device))
+        torch.cuda.synchronize()
+
+    state = (shape.num_heads, shape.head_dim, shape.dtype.value)
+    return _PIN.ensure(state, f"B{anchor.batch_size}/H{anchor.num_heads}", tune)
+
+
+def row_provenance(
+    batch_size: int, num_heads: int, head_dim: int, dtype: DType | str
+) -> str | None:
+    """The autotune note for a row this worker just measured (registry hook)."""
+    del batch_size
+    return _PIN.note((num_heads, head_dim, DType.from_value(dtype).value))
+
+
 def semantic_flops(shape: KdaRecurrentDecodeShape) -> float:
     """Logical FLOPs of one step per (sequence, head): the K x V decay, the
     k^T.S read, the rank-1 update and the q.S read-out (1 + 3 * 2 = 7 K*V)."""
@@ -320,7 +357,9 @@ __all__ = [
     "check_correctness",
     "invoke",
     "logical_bytes",
+    "pin_autotune",
     "profile_kda_recurrent_decode_vllm_triton",
+    "row_provenance",
     "semantic_flops",
     "state_slots",
     "validate_args",

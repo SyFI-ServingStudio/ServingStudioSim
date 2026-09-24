@@ -27,6 +27,17 @@ do on KDA layers 1..33 of a real iteration. Only layer 0 of each iteration pays
 the ~23 us of small index launches plus the host sync that a cache miss costs.
 That cost is not part of this row.
 
+Autotune state. Seven of the FLA/KDA Triton kernels are ``@autotune``d on
+keys that hold H/K/BT but not the token count, so the first shape a process
+tunes picks the configs for every later row (b2-stab). The registry row
+therefore disables autotune persistence (``TRITON_CACHE_AUTOTUNING=0``), and
+before a worker's first row of a given (num_heads, head_dim, dtype) the runner
+tunes once at the documented anchor: the capture layout T=2048, L=2019, D=29
+(one 2019-token prefill with 29 co-scheduled decodes), at the spec's own heads,
+head dim and dtype. The token layout never changes with H; only the tuning-key
+axes come from the spec. The anchor and a digest of the selected configs go
+into the row's ``backend_version`` through ``row_provenance``.
+
 FLOPs and bytes are semantic logical counts, not physical Triton work.
 """
 
@@ -53,6 +64,7 @@ from profiling.runners.exceptions import (
     ProfilerNotImplemented,
 )
 from profiling.runners.metrics import ComputeMetrics
+from profiling.runners.triton_autotune_pin import AutotunePin
 
 _BACKEND = "kda_chunk_prefill:vllm_triton"
 _MODULE = "vllm.models.glm5next.nvidia.ops.third_party.kda"
@@ -66,6 +78,13 @@ CHUNK_SIZE = 64
 LOWER_BOUND = -5.0
 # The fork's own chunk-KDA-vs-naive tolerance (tests/models/kimi_k3/test_kda.py).
 RMSE_RATIO_TOL = 5e-3
+# Autotune anchor (num_tokens, max_sequence_length, num_decode_sequences): the
+# GLM-5.3-Flash capture shape. Heads, head dim and dtype come from the spec.
+AUTOTUNE_ANCHOR = (2048, 2019, 29)
+# Modules whose @autotune kernels the call reaches: the vendored KDA kernels and
+# the FLA ops they import (chunk_delta_h, solve_tril, l2norm, cumsum).
+_AUTOTUNE_MODULES = (_MODULE, "vllm.third_party.flash_linear_attention")
+_PIN = AutotunePin(_AUTOTUNE_MODULES)
 # Correctness witness bounds: the per-token oracle loop is O(T) launches.
 _GUARD_MAX_DECODES = 8
 _GUARD_MAX_LENGTH = 1024
@@ -120,6 +139,16 @@ def validate_args(
         raise ValueError("num_decode_sequences must be >= 0")
     if shape.max_sequence_length < 1:
         raise ValueError("max_sequence_length must be >= 1")
+    if shape.max_sequence_length == 1:
+        # vLLM's GDN/KDA metadata splits with decode_threshold=1, so a
+        # query-length-1 sequence is always a decode and never reaches this
+        # prefill call. (At T=1 the q/k/v views are also already contiguous, so
+        # the call would write through into the caller's qkv buffer.)
+        raise ValueError(
+            "max_sequence_length=1 is unreachable on the KDA prefill path: every "
+            "query-length-1 sequence is a decode (decode_threshold=1); use "
+            "num_decode_sequences, or kda_recurrent_decode for a pure-decode batch"
+        )
     if shape.num_prefill_tokens < shape.max_sequence_length:
         # The prefill branch runs only when there is at least one prefill; a
         # pure-decode batch takes fused_recurrent_kda instead (another kind).
@@ -303,6 +332,7 @@ def profile_kda_chunk_prefill_vllm_triton(
             environment_label="the vllm_fork_env (alignment vLLM fork)",
         )
         device = torch.device("cuda", torch.cuda.current_device())
+        pin_autotune(torch, callable_, shape, device=device)
         guard = guard_shape(shape)
         check_correctness(torch, callable_, build_operands(torch, guard, device=device), guard)
         operands = build_operands(torch, shape, device=device)
@@ -330,6 +360,47 @@ def profile_kda_chunk_prefill_vllm_triton(
     )
 
 
+def anchor_shape(shape: KdaChunkPrefillShape) -> KdaChunkPrefillShape:
+    tokens, length, decodes = AUTOTUNE_ANCHOR
+    return replace(
+        shape, num_tokens=tokens, max_sequence_length=length, num_decode_sequences=decodes
+    )
+
+
+def _autotune_state(shape: KdaChunkPrefillShape) -> tuple[int, int, str]:
+    return (shape.num_heads, shape.head_dim, shape.dtype.value)
+
+
+def pin_autotune(
+    torch: Any, callable_: Any, shape: KdaChunkPrefillShape, *, device: Any
+) -> str:
+    """Tune once per worker and state key at the anchor, before any other call."""
+    anchor = anchor_shape(shape)
+    label = (
+        f"T{anchor.num_tokens}/L{anchor.max_sequence_length}/"
+        f"D{anchor.num_decode_sequences}/H{anchor.num_heads}"
+    )
+
+    def tune() -> None:
+        invoke(callable_, build_operands(torch, anchor, device=device))
+        torch.cuda.synchronize()
+
+    return _PIN.ensure(_autotune_state(shape), label, tune)
+
+
+def row_provenance(
+    num_tokens: int,
+    max_sequence_length: int,
+    num_decode_sequences: int,
+    num_heads: int,
+    head_dim: int,
+    dtype: DType | str,
+) -> str | None:
+    """The autotune note for a row this worker just measured (registry hook)."""
+    del num_tokens, max_sequence_length, num_decode_sequences
+    return _PIN.note((num_heads, head_dim, DType.from_value(dtype).value))
+
+
 def semantic_flops(shape: KdaChunkPrefillShape) -> float:
     """Logical 2*MAC count per token and head, at chunk width C=64.
 
@@ -354,6 +425,7 @@ def logical_bytes(shape: KdaChunkPrefillShape) -> float:
 
 
 __all__ = [
+    "AUTOTUNE_ANCHOR",
     "CHUNK_SIZE",
     "KdaChunkPrefillShape",
     "build_operands",
@@ -362,7 +434,10 @@ __all__ = [
     "invoke",
     "logical_bytes",
     "num_chunks",
+    "anchor_shape",
+    "pin_autotune",
     "profile_kda_chunk_prefill_vllm_triton",
+    "row_provenance",
     "semantic_flops",
     "sequence_boundaries",
     "sequence_lengths",

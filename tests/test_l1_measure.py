@@ -478,7 +478,7 @@ def test_measure_worker_uses_container_and_mounts_output(tmp_path, monkeypatch):
     measurement_dir.mkdir()
     captured = {}
 
-    def fake_container_command(profiler_env, gpus, exchange_dir, additional_volumes=()):
+    def fake_container_command(profiler_env, gpus, exchange_dir, additional_volumes=(), **_):
         captured["profiler_env"] = profiler_env
         captured["gpus"] = gpus
         captured["additional_volumes"] = additional_volumes

@@ -83,7 +83,15 @@ def _worker_main(input_path: Path, output_path: Path) -> None:
             clear_measure_context()
     gpu_name = _current_gpu_name()
     runtime_versions = _runtime_versions(backend)
-    worker_results = [_to_payload(result, gpu_name, runtime_versions) for result in results]
+    row_provenance = profiler_spec.load_row_provenance()
+    worker_results = [
+        _to_payload(
+            result,
+            gpu_name,
+            _with_row_provenance(runtime_versions, row_provenance, kwargs, result),
+        )
+        for result, kwargs in zip(results, kwargs_list, strict=True)
+    ]
 
     output: dict = {"results": worker_results}
     if measure_context is not None:
@@ -136,6 +144,23 @@ def _to_payload(
         "gpu_name": gpu_name,
         **(runtime_versions or {}),
     }
+
+
+def _with_row_provenance(
+    runtime_versions: dict[str, str | None],
+    row_provenance,
+    kwargs: dict,
+    result: RunnerResult,
+) -> dict[str, str | None]:
+    """Append the row's worker-state note (``KernelProfilerSpec.row_provenance_ref``)
+    to ``backend_version``, the free-text provenance column every table has."""
+    if row_provenance is None or result.metrics is None:
+        return runtime_versions
+    note = row_provenance(**kwargs)
+    if not note:
+        return runtime_versions
+    version = runtime_versions.get("backend_version")
+    return {**runtime_versions, "backend_version": f"{version}; {note}" if version else note}
 
 
 def _current_gpu_name() -> str | None:
