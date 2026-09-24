@@ -89,3 +89,16 @@ def test_importing_kernel_module_does_not_eager_import_runner():
     ]
     completed = subprocess.run(command, capture_output=True, text=True, check=True)
     assert completed.stdout.strip() == "False"
+
+
+def test_vllm_cuda_backend_runs_vllms_own_op_in_the_vllm_image():
+    from profiling.db.registry import find_kernel_profiler_spec
+    from profiling.runners.norm.rms_norm_vllm_cuda import _validate_args
+
+    spec = find_kernel_profiler_spec("rms_norm", "vllm_cuda")
+    assert spec.subprocess_env == "vllm_env"
+    assert spec.supports.gpus == frozenset({"NVIDIA B200"})
+    assert spec.runner_ref.function_name == "profile_rms_norm_vllm_cuda"
+    assert _validate_args(32, 4096, "bf16")[:2] == (32, 4096)
+    with pytest.raises(ValueError, match="bf16"):
+        _validate_args(32, 4096, "fp16")
