@@ -3,6 +3,16 @@
 //! This is shape-keyed rather than byte-keyed: vLLM passes a contiguous
 //! `[num_tokens, hidden_dim]` tensor and changes the PDL completion policy at
 //! 16 tokens. The generic `all_reduce` kind cannot represent either property.
+//!
+//! The `flashinfer_mnnvl` backend (FlashInfer >= 0.6.18 MNNVL all-reduce, the
+//! vLLM `auto` choice on B200) switches from one-shot to two-shot inside the
+//! call once `num_tokens * hidden_dim * num_gpus * elem_size` exceeds 1 MiB, so
+//! its grid carries the last one-shot and the first two-shot token count.
+//!
+//! Above the workspace cap vLLM routes to a different all-reduce, so the grid
+//! stops at the cap. No mask or clamp is applied: a query above the cap
+//! extrapolates linearly from the last two-shot segment and is flagged
+//! `EXTRAPOLATED` rather than silently pinned to the cap time.
 
 use crate::common::Fabric;
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
@@ -53,6 +63,18 @@ impl AllReduceFusionSpec {
             .expect("all-reduce bytes per token overflow");
         (Self::max_fused_bytes(config.num_gpus) / bytes_per_token) as u32
     }
+
+    /// FlashInfer `MNNVL_ONE_SHOT_THRESHOLD` (`trtllm_mnnvl_ar.py`): one-shot
+    /// iff the all-gathered payload `T * H * N * elem` is at most 1 MiB.
+    const MNNVL_ONE_SHOT_BYTES: u64 = 1024 * 1024;
+
+    /// Largest token count for which the MNNVL backend runs one-shot.
+    pub fn mnnvl_max_oneshot_tokens(config: &AllReduceFusionKernelConfig) -> u32 {
+        let bytes_per_token = u64::from(config.hidden_dim)
+            * u64::from(config.num_gpus)
+            * config.dtype.size_bytes() as u64;
+        (Self::MNNVL_ONE_SHOT_BYTES / bytes_per_token) as u32
+    }
 }
 
 impl KernelSpec for AllReduceFusionSpec {
@@ -63,12 +85,22 @@ impl KernelSpec for AllReduceFusionSpec {
 
     fn sweep_grid(config: &Self::Config) -> SweepGrid {
         let max_fused_tokens = Self::max_fused_tokens(config);
-        let mut tokens = Axis::chain([Axis::values([1, 2, 4, 8, 16, 17]), Axis::token_axis()]);
-        tokens.retain(|num_tokens| *num_tokens <= f64::from(max_fused_tokens));
-        if tokens.last().copied() != Some(f64::from(max_fused_tokens)) {
-            tokens.push(f64::from(max_fused_tokens));
-            tokens.sort_by(f64::total_cmp);
+        let mut boundaries = vec![max_fused_tokens];
+        // Only MNNVL has the in-call one-shot/two-shot switch; keeping it off
+        // the trtllm grid avoids resampling that backend's existing rows.
+        if config.backends.contains(&"flashinfer_mnnvl") {
+            let last_oneshot = Self::mnnvl_max_oneshot_tokens(config);
+            if last_oneshot > 0 {
+                boundaries.extend([last_oneshot, last_oneshot + 1]);
+            }
         }
+        let mut tokens = Axis::chain([
+            Axis::values([1, 2, 4, 8, 16, 17]),
+            Axis::token_axis(),
+            Axis::values(boundaries),
+        ]);
+        tokens.retain(|num_tokens| *num_tokens <= f64::from(max_fused_tokens));
+        tokens.sort_by(f64::total_cmp);
         SweepGrid::new(vec![tokens])
     }
 
@@ -136,6 +168,57 @@ mod tests {
 
         let tp8 = AllReduceFusionSpec::sweep_grid(&config(8));
         assert_eq!(tp8.axes()[0].last(), Some(&85.0));
+    }
+
+    fn mnnvl_config(num_gpus: u32) -> AllReduceFusionKernelConfig {
+        AllReduceFusionKernelConfig {
+            backends: vec!["flashinfer_mnnvl"],
+            hidden_dim: 4096,
+            ..config(num_gpus)
+        }
+    }
+
+    #[test]
+    fn trtllm_grid_has_no_mnnvl_strategy_points() {
+        let tp4 = AllReduceFusionSpec::sweep_grid(&config(4));
+        assert!(!tp4.axes()[0].contains(&21.0));
+        assert!(!tp4.axes()[0].contains(&22.0));
+    }
+
+    #[test]
+    fn mnnvl_sweep_brackets_oneshot_switch_and_stops_at_cap() {
+        let config = mnnvl_config(4);
+        assert_eq!(AllReduceFusionSpec::mnnvl_max_oneshot_tokens(&config), 32);
+        assert_eq!(AllReduceFusionSpec::max_fused_tokens(&config), 4096);
+
+        let grid = AllReduceFusionSpec::sweep_grid(&config);
+        let tokens = &grid.axes()[0];
+        for t in [16.0, 17.0, 32.0, 33.0] {
+            assert!(tokens.contains(&t), "missing {t}");
+        }
+        assert_eq!(tokens.last(), Some(&4096.0));
+        assert!(tokens.windows(2).all(|w| w[0] < w[1]));
+        assert_eq!(tokens.len(), 41);
+
+        let tp8 = AllReduceFusionSpec::sweep_grid(&mnnvl_config(8));
+        assert!(tp8.axes()[0].contains(&16.0) && tp8.axes()[0].contains(&17.0));
+        assert_eq!(tp8.axes()[0].last(), Some(&128.0));
+    }
+
+    #[test]
+    fn mnnvl_enumerate_matches_python_schema() {
+        let config = mnnvl_config(4);
+        let grid = AllReduceFusionSpec::sweep_grid(&config);
+        let payloads = AllReduceFusionSpec::enumerate(&config, &grid, "flashinfer_mnnvl");
+        assert_eq!(payloads.len(), grid.axes()[0].len());
+        let fields = payloads[0].fields();
+        assert_eq!(fields.len(), 6);
+        assert_eq!(
+            fields.get("backend"),
+            Some(&Value::from("flashinfer_mnnvl"))
+        );
+        assert_eq!(fields.get("hidden_dim"), Some(&Value::from(4096_u32)));
+        assert_eq!(fields.get("fabric"), Some(&Value::from("nvlink")));
     }
 
     #[test]
