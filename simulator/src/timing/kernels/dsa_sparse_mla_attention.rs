@@ -54,16 +54,19 @@ const SPECULATIVE_CACHE_AXIS: [u32; 31] = [
     2049, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576,
 ];
 /// Pooled decode queries stop at the TRTLLM 32,768-query launch guard, so the
-/// grid carries no cell the backend must mask.
-const POOLED_QUERY_AXIS: [u32; 20] = [
-    1, 2, 4, 8, 16, 32, 64, 127, 128, 129, 255, 256, 257, 512, 1024, 2048, 4096, 8192, 16384, 32768,
+/// grid carries no cell the backend must mask. 96 splits the 64..127 decode
+/// batch gap, where the saturated time bends (B200 b3 fidelity).
+const POOLED_QUERY_AXIS: [u32; 21] = [
+    1, 2, 4, 8, 16, 32, 64, 96, 127, 128, 129, 255, 256, 257, 512, 1024, 2048, 4096, 8192, 16384,
+    32768,
 ];
 /// Pooled context points below and above the saturating count. The
 /// pooling-derived `index_topk` and cap points are added by
 /// `pooled_cache_axis`; past the cap only the gather footprint grows.
-const POOLED_CACHE_AXIS: [u32; 20] = [
-    1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 1536, 4096, 8192, 16384, 32768, 65536, 131072,
-    262144, 1048576,
+/// 768 splits 512..1024, where small-batch time dips then climbs.
+const POOLED_CACHE_AXIS: [u32; 21] = [
+    1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 768, 1024, 1536, 4096, 8192, 16384, 32768, 65536,
+    131072, 262144, 1048576,
 ];
 /// Backends whose TRTLLM-gen launch rejects more than 32,768 query rows.
 const TRTLLM_BACKENDS: [&str; 2] = ["flashinfer_trtllm_fp8", "flashinfer_trtllm_fp8_vllm_fork"];
@@ -744,7 +747,7 @@ mod tests {
         assert_eq!(grid.axes()[0].last(), Some(&32768.0));
         assert_eq!(grid.axes()[1].last(), Some(&1_048_576.0));
         let mask = DsaSparseMlaAttentionSpec::infeasible_mask(&cfg, &grid);
-        assert_mask_split(&mask, 440, 0);
+        assert_mask_split(&mask, 21 * 23, 0);
     }
 
     #[test]
