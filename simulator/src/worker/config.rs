@@ -47,10 +47,14 @@ const KV_ADMISSION_POLICY_CHOICES: [&str; 2] = ["full-footprint", "bounded-futur
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum DecodeRetractionPolicy {
+    /// SGLang: fewest emitted tokens first, requeued behind waiting requests.
     Length,
+    /// vLLM FCFS: the most recently admitted request first, requeued ahead of
+    /// every waiting request.
+    Fcfs,
 }
 
-const DECODE_RETRACTION_POLICY_CHOICES: [&str; 1] = ["length"];
+const DECODE_RETRACTION_POLICY_CHOICES: [&str; 2] = ["length", "fcfs"];
 
 /// Fully resolved bounded-future scheduler constants. These are mechanics, not
 /// calibrated performance values; the SGLang preset states its captured values
@@ -73,7 +77,7 @@ pub enum KvAdmissionConfig {
     BoundedFuture(BoundedFutureKvAdmissionConfig),
 }
 
-/// Selector-level KV admission settings for chunked prefill.
+/// Selector-level KV admission settings for chunked-prefill and speculative workers.
 ///
 /// This struct is flattened into the worker document to preserve the existing
 /// YAML surface while keeping the policy and all of its dependent knobs one
@@ -346,6 +350,11 @@ pub enum IterWorkerSel {
         #[serde(default = "default_batch_policy")]
         #[param(string, default = "mix", choices = BATCH_POLICY_CHOICES)]
         batch_policy: BatchPolicy,
+        /// KV capacity and decode-retraction policy. See
+        /// [`IterWorkerSel::ChunkedPrefill`]; bounded-future sizes each decode's
+        /// next-step headroom at the verify width.
+        #[serde(flatten)]
+        kv_admission: KvAdmissionSpec,
         /// GPU wall/kernel time multiplier (≥ 1.0); models inter-kernel overhead
         /// (see [`default_gpu_time_multiplier`]). cost_log stays pre-scale.
         #[serde(default = "default_gpu_time_multiplier")]

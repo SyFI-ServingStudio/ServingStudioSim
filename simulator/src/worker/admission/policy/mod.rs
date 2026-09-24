@@ -98,6 +98,11 @@ impl PendingOrderPolicy for PendingOrder {
     }
 
     #[inline]
+    fn push_front(&mut self, candidate: AdmissionCandidate, context: &mut Self::Context) {
+        dispatch!(self, inner => inner.push_front(candidate, context))
+    }
+
+    #[inline]
     fn refresh_head(&mut self, resident_prefix_tokens: &mut dyn FnMut(AdmissionCandidate) -> u32) {
         dispatch!(self, inner => inner.refresh_head(resident_prefix_tokens))
     }
@@ -231,6 +236,12 @@ pub trait PendingOrderPolicy {
     type Context;
 
     fn push(&mut self, candidate: AdmissionCandidate, context: &mut Self::Context);
+
+    /// Return a preempted request ahead of every waiting one. Default: a
+    /// policy that ranks on its own key has no front, so this is `push`.
+    fn push_front(&mut self, candidate: AdmissionCandidate, context: &mut Self::Context) {
+        self.push(candidate, context);
+    }
 
     /// Reconcile the head with live KV state before the lifecycle reads it.
     /// `resident_prefix_tokens` re-answers what `AdmissionCandidate` froze at

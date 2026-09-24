@@ -123,30 +123,22 @@ impl Deployment for UnifiedDeployment {
                 batch_policy,
                 kv_admission,
                 gpu_time_multiplier,
-            } => {
-                let kv_admission = kv_admission.resolve()?;
-                ensure!(
-                    !matches!(kv_admission, KvAdmissionConfig::BoundedFuture(_))
-                        || *batch_policy == BatchPolicy::SeparatePrefillPriority,
-                    "bounded-future KV admission currently requires \
-                     batch_policy=separate-prefill-priority"
-                );
-                (
-                    *attn_gpu_memory_gb,
-                    *gpu_time_multiplier,
-                    Some(*max_batch_tokens),
-                    PendingOrderKind::Fifo,
-                    PrefixCacheMode::Opportunistic,
-                    PrefixCachePolicy::Lru,
-                    None,
-                    *batch_policy,
-                    kv_admission,
-                )
-            }
+            } => (
+                *attn_gpu_memory_gb,
+                *gpu_time_multiplier,
+                Some(*max_batch_tokens),
+                PendingOrderKind::Fifo,
+                PrefixCacheMode::Opportunistic,
+                PrefixCachePolicy::Lru,
+                None,
+                *batch_policy,
+                kv_admission.resolve()?,
+            ),
             IterWorkerSel::Speculative {
                 attn_gpu_memory_gb,
                 max_batch_tokens,
                 batch_policy,
+                kv_admission,
                 gpu_time_multiplier,
                 // Read by the two helpers below so this arm keeps the same
                 // bindings as its siblings. See `ssm_checkpoint_interval_tokens`.
@@ -160,9 +152,7 @@ impl Deployment for UnifiedDeployment {
                 PrefixCachePolicy::Lru,
                 None,
                 *batch_policy,
-                // Not a selector field: bounded-future predicts page crossings
-                // from single-token advance, which an accepted chain skips.
-                KvAdmissionConfig::FullFootprint,
+                kv_admission.resolve()?,
             ),
             IterWorkerSel::PdPrefill { .. } | IterWorkerSel::PdDecode { .. } => {
                 bail!("unified: pd_prefill / pd_decode workers belong to the `pd` deployment")
@@ -959,6 +949,7 @@ pools:
             draft_tokens,
             acceptance_seed: Some(7),
             batch_policy: BatchPolicy::Mix,
+            kv_admission: Default::default(),
             gpu_time_multiplier: 1.0,
         }
     }

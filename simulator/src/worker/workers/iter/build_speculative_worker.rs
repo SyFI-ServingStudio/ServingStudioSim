@@ -16,7 +16,6 @@ use crate::log::PrefixCacheLogger;
 use crate::worker::admission::{
     ChunkedPrefillAdmission, LoadBalance, PendingOrder, SpeculativeDecodeCompletion,
 };
-use crate::worker::config::KvAdmissionConfig;
 use crate::worker::execution::SpeculativeIterExecution;
 use crate::worker::gpu_cluster::SharedGpuCluster;
 use crate::worker::kv::FullAttnKv;
@@ -55,16 +54,6 @@ pub(crate) fn build_speculative_worker<M: SpeculativeUnifiedModel>(
             .and_then(|width| width.checked_add(drafting_slots))
             .is_some_and(|width| width <= max_batch_tokens),
         "speculative verify width must fit max_batch_tokens"
-    );
-    // Bounded-future admission predicts the next allocation from
-    // `current_kv % page_size == 0`, which only holds while a decode advances
-    // one token at a time. An accepted chain skips page boundaries, so the
-    // prediction would under-allocate silently. Full-footprint reserves the
-    // whole remaining output up front and is therefore safe at any step size.
-    assert!(
-        matches!(config.kv_admission, KvAdmissionConfig::FullFootprint),
-        "speculative decode requires full-footprint KV admission: bounded-future \
-         predicts page crossings from single-token advance and would under-allocate"
     );
     let prefix_cache_logger = PrefixCacheLogger::open_opt(cost_log_dir.as_deref(), pool_tag, id);
     let num_partitions = model.num_attn_dp_groups().max(1) as usize;
@@ -299,26 +288,99 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "speculative decode requires full-footprint KV admission")]
-    fn bounded_future_admission_cannot_carry_a_speculating_engine() {
-        // The defect this catches: bounded-future predicts the next page
-        // crossing from `current_kv % page_size == 0`, a predicate that only
-        // holds at one token per step. An accepted chain steps over it and the
-        // worker over-admits without ever reporting a capacity failure.
-        build(
-            config(KvAdmissionConfig::BoundedFuture(
-                BoundedFutureKvAdmissionConfig {
-                    page_size: 1,
-                    max_future_tokens: 4,
-                    initial_new_token_ratio: 0.7,
-                    minimum_new_token_ratio: 0.098,
-                    new_token_ratio_decay_steps: 600,
-                    retract_decode_steps: 2,
-                    retraction_policy: DecodeRetractionPolicy::Length,
-                },
-            )),
-            shared_with(&[]),
+    fn bounded_future_admission_retracts_before_a_verify_overflows_kv() {
+        // The defect this catches: sizing a speculating engine's decode headroom
+        // at one token per request. A verify advances up to k+1 positions, so
+        // the store would overfill silently and retract only afterwards.
+        use std::sync::atomic::{AtomicU32, Ordering};
+        const CAPACITY: u64 = 76;
+        const OUTPUT: u32 = 24;
+        struct CapacityModel {
+            most_decodes: AtomicU32,
+        }
+        impl SpeculativeUnifiedModel for CapacityModel {
+            fn eval_speculative_iter(
+                &self,
+                batch: &SpeculativeArchInput,
+                slots: &mut Vec<LeafMetrics>,
+                scratch: &mut Vec<LeafMetrics>,
+            ) -> LeafMetrics {
+                for group in &batch.groups {
+                    self.most_decodes
+                        .fetch_max(group.decode_requests.len() as u32, Ordering::Relaxed);
+                }
+                FakeSpeculativeModel.eval_speculative_iter(batch, slots, scratch)
+            }
+            fn total_kv_bytes_per_token(&self) -> u64 {
+                1024
+            }
+            fn max_model_len(&self) -> u32 {
+                8192
+            }
+            fn gpus_per_replica(&self) -> u16 {
+                1
+            }
+        }
+        let rows: Vec<_> = (0..4).map(|id| (id, PROMPT_TOKENS, OUTPUT)).collect();
+        let requests = shared_with(&rows);
+        for id in 0..4 {
+            requests.borrow_mut()[RequestId(id)]
+                .request
+                .definition
+                .decoding = DecodingStrategy::Speculative {
+                accept_rate: AcceptanceProfile::Uniform(1.0),
+            };
+        }
+        let model = Arc::new(CapacityModel {
+            most_decodes: AtomicU32::new(0),
+        });
+        let mut config = config(KvAdmissionConfig::BoundedFuture(
+            BoundedFutureKvAdmissionConfig {
+                page_size: 1,
+                max_future_tokens: 8,
+                initial_new_token_ratio: 0.0,
+                minimum_new_token_ratio: 0.0,
+                new_token_ratio_decay_steps: 1,
+                retract_decode_steps: 1,
+                retraction_policy: DecodeRetractionPolicy::Length,
+            },
+        ));
+        config.attn_kv_bytes = CAPACITY * 1024;
+        let mut worker = build_speculative_worker(
+            WorkerId(0),
+            "test",
+            model.clone(),
+            requests.clone(),
+            config,
+            None,
+            PoolId(0),
+            "test-gpu",
+            test_cluster(),
         );
+        for id in 0..4 {
+            worker.enqueue(WorkerMsgCommon::Request(RequestId(id)));
+        }
+        for tick in 0..400 {
+            // `FullAttnKv::advance` asserts the store never overfills.
+            worker.tick(Time::from_ms(tick as f64), &mut Vec::new());
+        }
+
+        let requests = requests.borrow();
+        for id in 0..4 {
+            let record = &requests[RequestId(id)];
+            assert!(record.lifecycle.completed, "request {id}");
+            assert_eq!(
+                record.progress.output_tokens_emitted, OUTPUT,
+                "request {id}"
+            );
+        }
+        assert!(
+            (0..4).any(|id| requests[RequestId(id)].telemetry.retraction_count > 0),
+            "the pressure this test builds must force a retraction"
+        );
+        // Full-footprint would hold two (2 x 32 of 76 tokens); bounded-future
+        // admits on the near future and decodes more at once.
+        assert!(model.most_decodes.load(Ordering::Relaxed) > 2);
     }
 
     #[test]

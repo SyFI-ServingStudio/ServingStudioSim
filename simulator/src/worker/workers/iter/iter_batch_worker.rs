@@ -773,6 +773,67 @@ mod tests {
     }
 
     #[test]
+    fn fcfs_retraction_resumes_the_most_recent_preemption_first() {
+        // Three requests fit the bounded estimate, then decode growth retracts
+        // request 2 and later request 1. SGLang's length policy requeues each
+        // behind the waiting set, so 2 resumes first; vLLM's FCFS prepends each
+        // preempted request, so 1, preempted last, resumes first.
+        for (policy, first_resumed) in [
+            (DecodeRetractionPolicy::Length, 2),
+            (DecodeRetractionPolicy::Fcfs, 1),
+        ] {
+            let store = shared_with(&[(0, 4, 20), (1, 4, 20), (2, 4, 20)]);
+            let mut config = bounded_future_config(64, 24);
+            config.pending_order = crate::worker::admission::PendingOrderKind::Fifo;
+            let KvAdmissionConfig::BoundedFuture(bounded) = &mut config.kv_admission else {
+                unreachable!("bounded_future_config builds bounded-future admission")
+            };
+            bounded.retraction_policy = policy;
+            let mut worker = build_chunked_prefill_worker(
+                WorkerId(0),
+                "main",
+                Arc::new(FakeModel::for_ms(1.0)),
+                Rc::clone(&store),
+                config,
+                None,
+                PoolId(0),
+                "test-gpu",
+                test_cluster(),
+            );
+            for id in 0..3 {
+                worker.enqueue(WorkerMsgCommon::Request(RequestId(id)));
+            }
+            for step in 0..200 {
+                worker.tick(Time::from_ms(step as f64), &mut Vec::new());
+            }
+
+            let requests = store.borrow();
+            let resumed_at = |id: u32| {
+                let record = &requests[RequestId(id)];
+                assert!(record.lifecycle.completed, "{policy:?}: request {id}");
+                assert_eq!(
+                    record.telemetry.retraction_count, 1,
+                    "{policy:?}: request {id}"
+                );
+                // The second Prefill stage is the re-prefill after retraction.
+                record
+                    .lifecycle
+                    .stage_log
+                    .iter()
+                    .filter(|event| event.code == UnifiedStage::Prefill as u16)
+                    .nth(1)
+                    .expect("a retracted request re-prefills")
+                    .time
+            };
+            let other = 3 - first_resumed;
+            assert!(
+                resumed_at(first_resumed) < resumed_at(other),
+                "{policy:?}: request {first_resumed} must resume before request {other}"
+            );
+        }
+    }
+
+    #[test]
     fn bounded_future_retraction_requeues_reprefills_and_preserves_ttft() {
         // Each request needs 23 KV tokens by completion and therefore fits by
         // itself in 24 tokens. The source-style bounded estimate admits both,

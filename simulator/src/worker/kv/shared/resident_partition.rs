@@ -197,7 +197,24 @@ impl ResidentPartitionState {
             .sum()
     }
 
-    pub(crate) fn next_decode_allocation_tokens(&self, page_size: u32) -> u64 {
+    /// Tokens the next decode step may allocate. With one-token pages each
+    /// decode needs as many tokens as it can advance, `step_tokens` capped by
+    /// its remaining output; a speculating engine sets `step_tokens` to its
+    /// verify width, as vLLM allocates slots for the new token plus lookahead.
+    /// Larger pages predict a crossing from `current_kv % page_size == 0`,
+    /// which only holds at one token per step.
+    pub(crate) fn next_decode_allocation_tokens(&self, page_size: u32, step_tokens: u32) -> u64 {
+        assert!(step_tokens > 0, "a decode step advances at least one token");
+        if page_size == 1 {
+            return self
+                .iter_decoding()
+                .map(|(_, state)| u64::from(state.remaining_decode.min(step_tokens)))
+                .sum();
+        }
+        assert_eq!(
+            step_tokens, 1,
+            "multi-token decode steps need one-token pages: page crossings are predicted from single-token advance"
+        );
         let page_size = u64::from(page_size);
         self.iter_decoding()
             .filter(|(_, state)| state.current_kv % page_size == 0)
