@@ -140,6 +140,7 @@ def test_single_gemm_known_backends_include_framework_dispatches():
         "sglang_bf16_auto",
         "sglang_fused_a_auto",
         "deepgemm",
+        "deepgemm_vllm_fork",
     }
 
 
