@@ -234,6 +234,43 @@ impl Deployment for UnifiedDeployment {
                     build_qwen36_hybrid_worker,
                 ))
             }
+            // Hybrid KV like Qwen3.6: 34 KDA layers of per-request recurrent
+            // state (fp32 SSM + conv window) and 11 DSA layers of per-token MLA
+            // latent + kpool index cache share one attention budget. The
+            // hybrid recipe is the only one that charges both; the chunked and
+            // hp_unified recipes would leave the KDA state invisible.
+            IterArchSel::Glm53FlashVllmFp8KdaDsaMoe {
+                tp_size,
+                max_model_len,
+                routing,
+                routing_seed,
+                expert_popularity_file,
+                token_corpus_file,
+                ..
+            } => {
+                ensure_barebone(&g.worker)?;
+                let model = Arc::new(arch_build::glm53_flash_vllm_fp8_kda_dsa_moe(
+                    model_spec,
+                    *tp_size,
+                    *max_model_len,
+                    *routing,
+                    *routing_seed,
+                    expert_popularity_file.as_deref(),
+                    token_corpus_file.as_deref(),
+                    &gpu_name,
+                    MODEL_NAME,
+                    bridge,
+                )?);
+                Ok(assemble_flow(
+                    model,
+                    store,
+                    worker_config,
+                    log_dir,
+                    gpu_name,
+                    dp_cfg,
+                    build_qwen36_hybrid_worker,
+                ))
+            }
             IterArchSel::Llama3Dense { .. } => {
                 ensure_barebone(&g.worker)?;
                 let model = Arc::new(arch_build::dense(
