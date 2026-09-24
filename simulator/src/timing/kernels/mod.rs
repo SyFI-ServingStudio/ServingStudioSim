@@ -50,6 +50,7 @@ pub mod gdn_prefill_post_conv;
 pub mod gdn_recurrent_decode;
 pub mod gemm_fp32_output;
 pub mod grouped_gemm;
+pub mod kda_chunk_prefill;
 pub mod kv_cache_append;
 pub mod logits_topk;
 pub mod mhc_fused_post_pre_rms_norm;
@@ -261,6 +262,10 @@ pub use gemm_fp32_output::{
 };
 pub use grouped_gemm::{
     GroupedGemmKernel, GroupedGemmKernelConfig, GroupedGemmKernelInput, GroupedGemmSpec,
+};
+pub use kda_chunk_prefill::{
+    KdaChunkPrefillKernel, KdaChunkPrefillKernelConfig, KdaChunkPrefillKernelInput,
+    KdaChunkPrefillSpec,
 };
 pub use kv_cache_append::{
     KvCacheAppendKernel, KvCacheAppendKernelConfig, KvCacheAppendKernelInput, KvCacheAppendSpec,
