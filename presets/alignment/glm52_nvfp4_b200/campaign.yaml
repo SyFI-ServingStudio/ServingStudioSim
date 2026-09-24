@@ -516,7 +516,6 @@ cases:
     - - 491520
       - 64
     repeats: 2
-    id_suffix: full
   kernel_trace:
     file: traces/11_long_prefill_ladder_c1.nsys.csv
     shapes:
@@ -592,7 +591,6 @@ cases:
     - - 8192
       - 4096
     repeats: 1
-    id_suffix: full
   kernel_trace:
     file: traces/12_ultra_context_decode_c1.nsys.csv
     shapes:
@@ -677,7 +675,6 @@ cases:
     - - 32768
       - 32768
     repeats: 1
-    id_suffix: full
   kernel_trace:
     file: traces/13_generation_length_matrix_c8.nsys.csv
     shapes:
@@ -736,7 +733,6 @@ cases:
     - - 49152
       - 2048
     repeats: 10
-    id_suffix: full
   kernel_trace:
     file: traces/14_near_full_long_decode_c21.nsys.csv
     shapes:
@@ -822,7 +818,6 @@ cases:
     - - 49152
       - 8192
     repeats: 12
-    id_suffix: full
   kernel_trace:
     file: traces/15_kv_overcommit_mixed_churn_c14.nsys.csv
     shapes:

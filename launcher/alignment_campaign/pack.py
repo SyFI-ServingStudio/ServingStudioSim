@@ -100,10 +100,10 @@ class TraceSpec:
     directory and `check` regenerates it to compare against the sha256 in
     `traces/invariants.json`. Committing the rows too would be committing the
     same data twice, and `file` names the entry in that record rather than a
-    file in the tree. `id_suffix` exists because the two source generators
-    disagreed: the first wrote `<slug>-0000`, the second `<slug>-full-0000`.
-    That difference is in the bytes the accepted runs consumed, so it is data,
-    not something to normalize away.
+    file in the tree. `id_suffix` keeps a case's two traces apart when both
+    are replayed against one server: a kernel trace writes `<slug>-nsys-0000`.
+    The IDs are in the bytes the accepted captures replayed, and the request
+    audit joins on them, so they are data, not something to normalize away.
     """
 
     file: str

@@ -54,7 +54,11 @@ const QK_NOPE_HEAD_DIM: u32 = 192;
 const ROPE_DIM: u32 = 64;
 const V_HEAD_DIM: u32 = 256;
 const MODEL_INDEX_HEADS: u32 = 32;
-const PROFILE_INDEX_HEADS: u32 = 64;
+/// Head counts a logits row may be profiled at. vLLM slices `q_quant` straight
+/// into the MQA-logits kernels without padding, so B200 captures launch
+/// `sm100_*mqa_logits<32, 128, ...>`; H64 remains for the H200 arch, whose H32
+/// rows have not been profiled.
+const PROFILE_INDEX_HEAD_CHOICES: [u32; 2] = [MODEL_INDEX_HEADS, 64];
 const INDEX_HEAD_DIM: u32 = 128;
 const SELECTED_K: u32 = 2048;
 /// Full-context fixtures for the inherited H200 tests. Production configs may
@@ -784,11 +788,6 @@ fn validate_config(cfg: &VllmGlm52DsaAttnLocalWorkletConfig) -> Result<(), Strin
             cfg.model_num_index_heads.get(),
             MODEL_INDEX_HEADS,
         ),
-        (
-            "profile_num_index_heads",
-            cfg.profile_num_index_heads.get(),
-            PROFILE_INDEX_HEADS,
-        ),
         ("index_head_dim", cfg.index_head_dim.get(), INDEX_HEAD_DIM),
         ("selected_k", cfg.selected_k, SELECTED_K),
         ("cache_block_size", cfg.cache_block_size, CACHE_BLOCK_SIZE),
@@ -802,6 +801,12 @@ fn validate_config(cfg: &VllmGlm52DsaAttnLocalWorkletConfig) -> Result<(), Strin
         if actual != required {
             return Err(format!("{name} must be {required}, got {actual}"));
         }
+    }
+    let profile_heads = cfg.profile_num_index_heads.get();
+    if !PROFILE_INDEX_HEAD_CHOICES.contains(&profile_heads) {
+        return Err(format!(
+            "profile_num_index_heads must be one of {PROFILE_INDEX_HEAD_CHOICES:?}, got {profile_heads}"
+        ));
     }
     let max_model_len = cfg.max_model_len.get();
     let logits_row_stride = cfg.logits_row_stride.get();
@@ -1351,7 +1356,7 @@ mod tests {
         for mutate in [
             |cfg: &mut VllmGlm52DsaAttnLocalWorkletConfig| cfg.num_attention_heads = 32.into(),
             |cfg: &mut VllmGlm52DsaAttnLocalWorkletConfig| cfg.model_num_index_heads = 64.into(),
-            |cfg: &mut VllmGlm52DsaAttnLocalWorkletConfig| cfg.profile_num_index_heads = 32.into(),
+            |cfg: &mut VllmGlm52DsaAttnLocalWorkletConfig| cfg.profile_num_index_heads = 16.into(),
             |cfg: &mut VllmGlm52DsaAttnLocalWorkletConfig| cfg.base_dtype = DType::Fp32,
             |cfg: &mut VllmGlm52DsaAttnLocalWorkletConfig| cfg.index_cache_dtype = DType::Bf16,
             |cfg: &mut VllmGlm52DsaAttnLocalWorkletConfig| cfg.selected_k = 1024,

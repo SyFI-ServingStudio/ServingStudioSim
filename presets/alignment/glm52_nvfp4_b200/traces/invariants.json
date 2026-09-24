@@ -132,7 +132,7 @@
       "max_total_len": 491584,
       "output_tokens": 800,
       "request_count": 20,
-      "sha256": "fabea7a2ea28b43964bed5d055e8946f003c66eaa7b4629bbe72711a556b98c9"
+      "sha256": "80186a63aae86bda3bf305888fa1aea4371aae9071124ebbec3280ea4b1c2d0e"
     },
     "traces/11_long_prefill_ladder_c1.nsys.csv": {
       "arrival_span_ms": 6000.0,
@@ -156,7 +156,7 @@
       "max_total_len": 462848,
       "output_tokens": 26880,
       "request_count": 15,
-      "sha256": "6522cc1ebb9f14fce80d47426d010fff8b2bd59d5fa697b836bd9b606a004e82"
+      "sha256": "4cbdf34b7281cb771273a3681aa27dfd9fa28c3260970180e58596028fde4cff"
     },
     "traces/12_ultra_context_decode_c1.nsys.csv": {
       "arrival_span_ms": 2000.0,
@@ -180,7 +180,7 @@
       "max_total_len": 65536,
       "output_tokens": 368640,
       "request_count": 24,
-      "sha256": "d32d2d11c582403c2a3af1ce515c073163cca2a659cb34bd00adc1ade8fe6b30"
+      "sha256": "46f6f7d46abb36234a40545caf56666a16b74e0c36a37b5ca90e58cf8838eb9a"
     },
     "traces/13_generation_length_matrix_c8.nsys.csv": {
       "arrival_span_ms": 7000.0,
@@ -204,7 +204,7 @@
       "max_total_len": 51200,
       "output_tokens": 348160,
       "request_count": 60,
-      "sha256": "fe76d6eaafeed37f7fdbb821ddfde20cc53a2cd586be3bf1d6b1073d0d5f59b6"
+      "sha256": "4a1e429b3e686c35b74a4d9c68918143b4b976466ff1f26d1b9b6f0c0ccdd0c3"
     },
     "traces/14_near_full_long_decode_c21.nsys.csv": {
       "arrival_span_ms": 20000.0,
@@ -228,7 +228,7 @@
       "max_total_len": 100352,
       "output_tokens": 860160,
       "request_count": 72,
-      "sha256": "c18699c3e3b7ced031665e6d9a47f04e7da685c596e47b259b07c073b96796c3"
+      "sha256": "5aea0707e3400cbb458d7ac106c511463d35897222d93d06a02460819f9cee42"
     },
     "traces/15_kv_overcommit_mixed_churn_c14.nsys.csv": {
       "arrival_span_ms": 13000.0,
