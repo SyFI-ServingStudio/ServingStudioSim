@@ -54,7 +54,12 @@ def test_kind_table_backend_and_runner_ref_contract():
     spec = find_kernel_profiler_spec(KIND, _Q_BACKEND)
 
     assert KIND == "batched_gemm"
-    assert known_backends(KIND) == [_Q_BACKEND, _V_UP_BACKEND]
+    assert known_backends(KIND) == [
+        _Q_BACKEND,
+        _V_UP_BACKEND,
+        "torch_mla_q_absorb_glm53",
+        "torch_mla_v_up_glm53",
+    ]
     assert spec.kernel_kind == KIND
     assert spec.table_name == KIND
     assert spec.backend == _Q_BACKEND
@@ -374,3 +379,23 @@ def test_logical_traffic_excludes_packed_gaps():
 def test_generated_facades_are_available():
     assert hasattr(perf_api, "get_batched_gemm_times")
     assert hasattr(perf_api, "count_missing_batched_gemm")
+
+
+def test_glm53_layouts_have_no_rope_split_and_no_head_padding():
+    """GLM-5.3 absorbs the full 256-wide q head and writes an unpadded V-up input."""
+    from profiling.runners.gemm import batched_gemm as runner
+
+    q = runner._build_layout_q_absorb_operands(
+        torch, runner._GLM53_LAYOUT, num_batches=16, m=3, torch_dtype=torch.float32, device="cpu"
+    )
+    assert tuple(q.lhs.shape) == (16, 3, 256)
+    assert q.lhs.stride() == (256, 16 * 256, 1)
+    assert tuple(q.rhs.shape) == (16, 256, 512)
+    v = runner._build_layout_v_up_operands(
+        torch, runner._GLM53_LAYOUT, num_batches=16, m=3, torch_dtype=torch.float32, device="cpu"
+    )
+    assert tuple(v.attention_base.shape) == (3, 16, 512)
+    assert tuple(v.rhs.shape) == (16, 512, 256)
+    assert tuple(v.out.shape) == (16, 3, 256)
+    with pytest.raises(ValueError, match=r"\(256, 512\)"):
+        runner._validate_layout_args("torch_mla_q_absorb_glm53", (256, 512), 16, 3, 512, 192, "bf16")
