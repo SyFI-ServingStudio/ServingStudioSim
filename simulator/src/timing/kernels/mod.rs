@@ -7,6 +7,7 @@ pub mod batched_gemm;
 pub mod bf16_fused_moe;
 pub mod clamped_swiglu;
 pub mod deepseek_v41_mega_attn;
+pub mod deepseek_v41_qnorm_rope_kv_insert;
 pub mod deepseek_v4_fused_inv_rope_fp8_quant;
 pub mod deepseek_v4_fused_q_kv_rmsnorm;
 pub mod deepseek_v4_indexer_mqa_logits_decode;
@@ -99,6 +100,10 @@ pub use clamped_swiglu::{
 pub use deepseek_v41_mega_attn::{
     DeepseekV41MegaAttnKernel, DeepseekV41MegaAttnKernelConfig, DeepseekV41MegaAttnKernelInput,
     DeepseekV41MegaAttnSpec,
+};
+pub use deepseek_v41_qnorm_rope_kv_insert::{
+    DeepseekV41QnormRopeKvInsertKernel, DeepseekV41QnormRopeKvInsertKernelConfig,
+    DeepseekV41QnormRopeKvInsertKernelInput, DeepseekV41QnormRopeKvInsertSpec,
 };
 pub use deepseek_v4_fused_inv_rope_fp8_quant::{
     DeepseekV4FusedInvRopeFp8QuantKernel, DeepseekV4FusedInvRopeFp8QuantKernelConfig,
