@@ -275,24 +275,36 @@ impl TokenCorpus {
     /// Draw `sampling_candidates` complete folded histograms and return the
     /// most central *real* one. Deterministic in the config's seed.
     pub fn sample_and_fold(&self, num_tokens: u32, experts_per_rank: usize) -> Vec<u32> {
-        let candidates: Vec<_> = (0..self.config.sampling_candidates)
-            .map(|draw| {
-                let seed = self
-                    .config
-                    .seed
-                    .wrapping_add(u64::from(draw).wrapping_mul(CANDIDATE_STRIDE));
-                fold_layerwise_expert_counts(
-                    &self.sample_layer_counts(num_tokens, seed),
-                    experts_per_rank,
-                )
-            })
+        let candidates = (0..self.sampling_candidates())
+            .map(|draw| self.candidate(num_tokens, experts_per_rank, draw))
             .collect();
-        let selected = median_candidate(&candidates, experts_per_rank);
-        candidates
-            .into_iter()
-            .nth(selected)
-            .expect("median_candidate returns an in-range index")
+        select_candidate(candidates, experts_per_rank)
     }
+
+    /// How many candidates [`Self::sample_and_fold`] draws per token count.
+    pub(super) fn sampling_candidates(&self) -> u32 {
+        self.config.sampling_candidates
+    }
+
+    /// Candidate `draw` of [`Self::sample_and_fold`]. Each draw has its own
+    /// seed, so candidates are independent and can be drawn in any order.
+    pub(super) fn candidate(&self, num_tokens: u32, experts_per_rank: usize, draw: u32) -> Vec<u32> {
+        let seed = self
+            .config
+            .seed
+            .wrapping_add(u64::from(draw).wrapping_mul(CANDIDATE_STRIDE));
+        fold_layerwise_expert_counts(&self.sample_layer_counts(num_tokens, seed), experts_per_rank)
+    }
+}
+
+/// The candidate [`TokenCorpus::sample_and_fold`] returns, from all of its
+/// draws in draw order.
+pub(super) fn select_candidate(candidates: Vec<Vec<u32>>, experts_per_rank: usize) -> Vec<u32> {
+    let selected = median_candidate(&candidates, experts_per_rank);
+    candidates
+        .into_iter()
+        .nth(selected)
+        .expect("median_candidate returns an in-range index")
 }
 
 /// Decorrelates the candidate seeds without needing a second RNG.

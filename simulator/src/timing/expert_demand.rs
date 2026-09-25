@@ -19,7 +19,7 @@ use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
 use super::routing::{sample_and_fold_layerwise_topk_expert_counts, RoutingDistribution};
-use super::token_corpus::{TokenCorpus, TokenCorpusConfig};
+use super::token_corpus::{select_candidate, TokenCorpus, TokenCorpusConfig};
 
 /// The seed every demand source folds at, so a profiled shape is reproducible.
 const FOLD_SEED: u64 = 0xF01D_5EED;
@@ -194,8 +194,62 @@ impl PreparedDemand<'_> {
         }
     }
 
-    /// The per-expert row counts a fused-MoE profiler receives: the folded
-    /// histogram rotated so the requested workload rank leads.
+    /// [`Self::sample_and_fold`] at every token count, in order.
+    ///
+    /// Each histogram is a deterministic function of its own seed, so they are
+    /// drawn on worker threads without changing a single count. A corpus
+    /// histogram is the median of independent candidates, and each candidate is
+    /// its own task: the largest grid point alone is ~15% of a sweep's work, so
+    /// splitting only by grid point would leave it as the critical path.
+    fn sample_and_fold_many(
+        &self,
+        top_k: u32,
+        token_counts: &[u32],
+        experts_per_rank: usize,
+    ) -> Vec<Vec<u32>> {
+        match self {
+            Self::Popularity(_) => parallel_by_cost(
+                &token_counts.iter().map(|&n| u64::from(n)).collect::<Vec<_>>(),
+                |index| self.sample_and_fold(top_k, token_counts[index], experts_per_rank),
+            ),
+            Self::Corpus(corpus) => {
+                let draws = corpus.sampling_candidates() as usize;
+                let costs: Vec<u64> = token_counts
+                    .iter()
+                    .flat_map(|&n| std::iter::repeat(u64::from(n)).take(draws))
+                    .collect();
+                let mut candidates = parallel_by_cost(&costs, |task| {
+                    corpus.candidate(
+                        token_counts[task / draws],
+                        experts_per_rank,
+                        (task % draws) as u32,
+                    )
+                })
+                .into_iter();
+                token_counts
+                    .iter()
+                    .map(|_| select_candidate(candidates.by_ref().take(draws).collect(), experts_per_rank))
+                    .collect()
+            }
+        }
+    }
+}
+
+/// Folded histograms already drawn this process, per demand source, `top_k`,
+/// and EP shard width, then per token count.
+///
+/// Every MoE layer body of a model shares one demand source, and each body
+/// builds one kernel per `folded_rank_position`, so a build asks for the same
+/// histograms many times: GLM-5.3 DFlash2 builds 12 fused-MoE kernels (3 bodies
+/// x 4 rank positions) over one corpus. The rank position only rotates the
+/// folded vector, so it stays out of the key.
+type FoldKey = (ExpertDemand, u32, usize);
+type FoldCache = Mutex<HashMap<FoldKey, HashMap<u32, Arc<Vec<u32>>>>>;
+static FOLDED: OnceLock<FoldCache> = OnceLock::new();
+
+impl ExpertDemand {
+    /// The per-expert row counts a fused-MoE profiler receives at each token
+    /// count: the folded histogram rotated so the requested workload rank leads.
     ///
     /// The fold ranks EP shards by active experts then rows, so
     /// `folded_rank_position` selects a representative local histogram —
@@ -204,11 +258,11 @@ impl PreparedDemand<'_> {
     pub fn per_expert_batches(
         &self,
         top_k: u32,
-        num_tokens: u32,
+        token_counts: &[u32],
         num_experts: usize,
         num_local_experts: usize,
         folded_rank_position: u32,
-    ) -> Vec<u32> {
+    ) -> anyhow::Result<Vec<Vec<u32>>> {
         assert!(num_local_experts > 0, "num_local_experts must be non-zero");
         assert_eq!(
             num_experts % num_local_experts,
@@ -220,15 +274,91 @@ impl PreparedDemand<'_> {
             rank_offset + num_local_experts <= num_experts,
             "folded_rank_position must select an EP rank"
         );
-        let mut folded = self.sample_and_fold(top_k, num_tokens, num_local_experts);
-        assert_eq!(
-            folded.len(),
-            num_experts,
-            "demand source width must match num_experts"
-        );
-        folded.rotate_left(rank_offset);
-        folded
+
+        let key = (self.clone(), top_k, num_local_experts);
+        let cache = FOLDED.get_or_init(Default::default);
+        let mut missing: Vec<u32> = {
+            let cache = cache.lock().expect("folded demand cache");
+            let known = cache.get(&key);
+            token_counts
+                .iter()
+                .copied()
+                .filter(|n| known.is_none_or(|known| !known.contains_key(n)))
+                .collect()
+        };
+        missing.sort_unstable();
+        missing.dedup();
+        if !missing.is_empty() {
+            let drawn = self
+                .prepare()?
+                .sample_and_fold_many(top_k, &missing, num_local_experts);
+            let mut cache = cache.lock().expect("folded demand cache");
+            let known = cache.entry(key.clone()).or_default();
+            for (n, folded) in missing.into_iter().zip(drawn) {
+                known.insert(n, Arc::new(folded));
+            }
+        }
+
+        let cache = cache.lock().expect("folded demand cache");
+        let known = &cache[&key];
+        Ok(token_counts
+            .iter()
+            .map(|n| {
+                let mut folded = known[n].as_ref().clone();
+                assert_eq!(
+                    folded.len(),
+                    num_experts,
+                    "demand source width must match num_experts"
+                );
+                folded.rotate_left(rank_offset);
+                folded
+            })
+            .collect())
     }
+}
+
+/// Upper bound on sampling threads. Enough to hide a corpus sweep behind the
+/// rest of the build without taking a shared host's cores from concurrent runs.
+const MAX_SAMPLING_THREADS: usize = 32;
+
+/// `f(0..costs.len())` on worker threads, results in index order. Tasks start
+/// most expensive first so the longest one is not the last to begin.
+fn parallel_by_cost<T: Send>(costs: &[u64], f: impl Fn(usize) -> T + Sync) -> Vec<T> {
+    let threads = std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(MAX_SAMPLING_THREADS)
+        .min(costs.len());
+    if threads <= 1 {
+        return (0..costs.len()).map(f).collect();
+    }
+    let mut order: Vec<usize> = (0..costs.len()).collect();
+    order.sort_by_key(|&index| std::cmp::Reverse(costs[index]));
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let mut results: Vec<Option<T>> = std::iter::repeat_with(|| None).take(costs.len()).collect();
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..threads)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut done = Vec::new();
+                    loop {
+                        let slot = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(&index) = order.get(slot) else { break };
+                        done.push((index, f(index)));
+                    }
+                    done
+                })
+            })
+            .collect();
+        for worker in workers {
+            for (index, value) in worker.join().expect("sampling worker panicked") {
+                results[index] = Some(value);
+            }
+        }
+    });
+    results
+        .into_iter()
+        .map(|value| value.expect("every task ran"))
+        .collect()
 }
 
 #[cfg(test)]
