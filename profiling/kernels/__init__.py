@@ -42,6 +42,7 @@ from profiling.kernels import (
     dsa_sparse_mla_prefill,  # noqa: F401
     dsa_topk_prefill,  # noqa: F401
     elementwise,  # noqa: F401
+    engram_lookup,  # noqa: F401
     flashinfer_attn_decode,  # noqa: F401
     flashinfer_attn_prefill,  # noqa: F401
     flashinfer_attn_rect,  # noqa: F401
