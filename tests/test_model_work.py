@@ -2310,3 +2310,45 @@ def test_glm53_locked_floor_uses_the_served_fp8_mla_cache(tmp_path):
     assert rows["dsa_moe.attn.decode"]["bytes"] == 2 * 32 * 2047 * 512 * 11
     assert rows["dsa_moe.attn.decode"]["compute_dtype"] == "fp8"
     assert result["segmented"] >= result["necessary"] > 0
+
+
+G53_LOCATION_MAP = (
+    Path(__file__).resolve().parent.parent
+    / "model/work/location_maps/glm53_flash_vllm_fp8_kda_dsa_moe_unified.json"
+)
+
+
+def test_glm53_location_map_consumes_every_semantic_row_once():
+    """Every served-model semantic row maps to exactly one TP4/EP4 CostTree location.
+
+    The simulator test ``necessary_work_map_covers_the_compiled_locations`` pins the
+    location side. Redundancy is mapped to ``[]``: the duplicate router GEMM
+    (``gate_recompute``), the fp32 indexer head-weights recompute, glue/copy/quant
+    placeholders, and EP ranks 1-3 (ranks run concurrently, so the whole-model routed
+    expert work sits on rank 0's location).
+    """
+    mapping = json.loads(G53_LOCATION_MAP.read_text())
+    assert mapping["schema_version"] == 1
+    assert mapping["arch_types"] == ["glm53_flash_vllm_fp8_kda_dsa_moe"]
+    rules = {row["location"]: row["semantics"] for row in mapping["locations"]}
+    assert len(rules) == len(mapping["locations"]) == 128
+    mapped = [semantic for semantics in rules.values() for semantic in semantics]
+    assert len(mapped) == len(set(mapped))
+    model = work_floors._model_for_spec(
+        {"arch_type": "glm53_flash_vllm_fp8_kda_dsa_moe", "config": str(GLM53)}
+    )
+    for prefill, decode in (([], [2048] * 32), ([(0, 2048)], []), ([(2019, 29)], [3000])):
+        workload = work_floors._aggregate_workload(_g53_geometry_totals(prefill, decode))
+        assert {segment.name for segment in model.label(workload).segments} == set(mapped)
+    for tag in ("dsa_moe", "kda_moe"):
+        assert rules[f"unified.{tag}.moe.router.gate"] == [f"{tag}.router", f"{tag}.router_bias"]
+        assert rules[f"unified.{tag}.moe.router.gate_recompute"] == []
+        assert rules[f"unified.{tag}.moe.routed_rank0.fused_moe"] == [
+            f"{tag}.expert_gate_up",
+            f"{tag}.expert_down",
+        ]
+        for rank in (1, 2, 3):
+            assert rules[f"unified.{tag}.moe.routed_rank{rank}.fused_moe"] == []
+    assert rules["unified.first_kda_dense.attn_mhc_pre"][0] == "first_kda_dense.mhc.attn_fn"
+    assert rules["unified.final_mhc_post"] == ["mhc.final_post"]
+    assert rules["unified.hc_expand"] == rules["unified.hc_contract_mean"] == []

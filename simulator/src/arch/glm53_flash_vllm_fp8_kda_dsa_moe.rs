@@ -1273,6 +1273,34 @@ mod tests {
         assert_eq!(model.cost_log_manifest().slots.len(), model.n_slots);
     }
 
+    #[test]
+    fn necessary_work_map_covers_the_compiled_locations() {
+        use std::collections::BTreeSet;
+        let model = built();
+        // Kpool DSA work is per-request in context, so the labeler needs each KV length.
+        assert!(model.logs_decode_kv_lens());
+        let manifest = model.cost_log_manifest();
+        let actual: BTreeSet<_> = manifest
+            .slots
+            .iter()
+            .filter(|slot| slot.kind != "all_reduce_fusion")
+            .map(|slot| slot.name.as_str())
+            .collect();
+        let map: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../model/work/location_maps/glm53_flash_vllm_fp8_kda_dsa_moe_unified.json"
+        ))
+        .unwrap();
+        assert_eq!(map["arch_types"], serde_json::json!([ARCH_KIND]));
+        let mapped: BTreeSet<_> = map["locations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["location"].as_str().unwrap())
+            .collect();
+        assert_eq!(actual, mapped);
+        assert_eq!(mapped.len(), 128);
+    }
+
     fn leaf_order(node: &CostNode, out: &mut Vec<usize>) {
         match node {
             CostNode::Leaf(slot) => out.push(*slot),
