@@ -10,6 +10,13 @@
 //! axis has no point between 128 and 256 or between 384 and 512, so linear
 //! interpolation would smear each step over a whole cell. Configs that name
 //! this backend therefore add points just below, at and above each switch.
+//!
+//! Past T=448 the 16-split launch also steps by ~10 us each time its work
+//! spills into another wave: every 64-token block runs 16 splits on B200's 148
+//! SMs, so wave k ends at T = 64 * floor(148 * k / 16) (576, 1152, 1728, ...).
+//! Up to T=4096, where one extra wave still adds 10-50%, the grid holds the
+//! last T of each wave and T+8. Above that a step is at most ~12% and the
+//! 256-token spacing keeps the error within a few percent.
 
 use crate::timing::bridge::{ArgsPayload, KernelKind};
 use crate::timing::cache::CacheKind;
@@ -25,9 +32,14 @@ const DEEPGEMM_MEGA: &str = "deepgemm_mega";
 /// one probe step (8) on either side, plus 256 inside the 27-split range.
 const DEEPGEMM_MEGA_SPLIT_POINTS: [u32; 10] = [184, 192, 200, 256, 312, 320, 328, 440, 448, 456];
 
-/// The shared MHC token grid, plus the K-split points when `deepgemm_mega` is
-/// a candidate. Only that backend's configs get the extra rows; `vllm_tilelang`
-/// runs on H200 only and never shares a config with it.
+/// Last token count of each 16-split wave up to T=4096 and the next probe step.
+const DEEPGEMM_MEGA_WAVE_POINTS: [u32; 14] = [
+    576, 584, 1152, 1160, 1728, 1736, 2368, 2376, 2944, 2952, 3520, 3528, 4096, 4104,
+];
+
+/// The shared MHC token grid, plus the K-split and wave points when
+/// `deepgemm_mega` is a candidate. Only that backend's configs get the extra
+/// rows; `vllm_tilelang` runs on H200 only and never shares a config with it.
 fn fused_sweep_grid(config: &MhcRmsNormKernelConfig) -> SweepGrid {
     if !config.backends.contains(&DEEPGEMM_MEGA) {
         return sweep_grid();
@@ -36,6 +48,7 @@ fn fused_sweep_grid(config: &MhcRmsNormKernelConfig) -> SweepGrid {
     let mut axis = Axis::chain([
         base.axes()[0].clone(),
         Axis::values(DEEPGEMM_MEGA_SPLIT_POINTS),
+        Axis::values(DEEPGEMM_MEGA_WAVE_POINTS),
     ]);
     axis.sort_by(f64::total_cmp);
     SweepGrid::new(vec![axis])
@@ -85,10 +98,11 @@ mod tests {
         }
     }
 
-    /// Catches a grid that interpolates across a `mega_mhc` K-split step (the
-    /// cache would smear the 192->193 jump over 128..256) or that is unsorted.
+    /// Catches a grid that interpolates across a `mega_mhc` K-split or wave step
+    /// (the cache would smear the 192->193 jump over 128..256, or the 576->577
+    /// wave jump over 512..640) or that is unsorted.
     #[test]
-    fn deepgemm_mega_grid_brackets_each_k_split_switch() {
+    fn deepgemm_mega_grid_brackets_each_k_split_and_wave_step() {
         let cfg = config("deepgemm_mega", "NVIDIA B200", 5120);
         let grid = MhcFusedPostPreRmsNormSpec::sweep_grid(&cfg);
         let axis = &grid.axes()[0];
@@ -97,11 +111,12 @@ mod tests {
             "axis must be strictly increasing"
         );
         for t in [
-            184.0, 192.0, 200.0, 256.0, 312.0, 320.0, 328.0, 440.0, 448.0, 456.0,
+            184.0, 192.0, 200.0, 256.0, 312.0, 320.0, 328.0, 440.0, 448.0, 456.0, 576.0, 584.0,
+            1728.0, 1736.0, 2368.0, 2376.0, 3520.0, 3528.0,
         ] {
-            assert!(axis.contains(&t), "missing K-split point {t}");
+            assert!(axis.contains(&t), "missing K-split or wave point {t}");
         }
-        assert_eq!(axis.len(), 77);
+        assert_eq!(axis.len(), 88);
         let payloads = MhcFusedPostPreRmsNormSpec::enumerate(&cfg, &grid, "deepgemm_mega");
         let p = &payloads[axis.iter().position(|&t| t == 192.0).unwrap()];
         let mut keys: Vec<_> = p.fields().keys().map(String::as_str).collect();
