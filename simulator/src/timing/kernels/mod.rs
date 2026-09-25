@@ -32,6 +32,7 @@ pub mod dsa_sparse_mla_prefill;
 pub mod dsa_topk_prefill;
 pub mod elementwise;
 pub mod engine;
+pub mod engram_lookup;
 pub mod flashinfer_attn_decode;
 pub mod flashinfer_attn_prefill;
 pub mod flashinfer_attn_rect;
@@ -196,6 +197,9 @@ pub use elementwise::{
     ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput, ElementwiseSpec,
 };
 pub use engine::{Kernel, KernelConfig, KernelSpec};
+pub use engram_lookup::{
+    EngramLookupKernel, EngramLookupKernelConfig, EngramLookupKernelInput, EngramLookupSpec,
+};
 pub use flashinfer_attn_decode::{
     FlashinferAttnDecodeKernel, FlashinferAttnDecodeKernelConfig, FlashinferAttnDecodeKernelInput,
     FlashinferAttnDecodeSpec,
