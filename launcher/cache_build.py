@@ -23,7 +23,10 @@ from __future__ import annotations
 
 import asyncio
 import re
+import sys
 from pathlib import Path
+
+from profiling.gpu_policy import GpuDisabledError, require_gpu
 
 from .exec import REPO_ROOT, _build_subprocess_env, binary_path
 from .process import ProcessSpec, ProcessSupervisor
@@ -170,6 +173,13 @@ async def prebuild_caches(
                     resources=["profile-db:exclusive"],
                 )
                 continue
+            try:
+                require_gpu(f"filling {missing_before} missing profile.db spec(s)")
+            except GpuDisabledError as error:
+                # Say so here rather than start a cache builder that can only fail.
+                print(f"[no-gpu] {cfg_dir}: {error}", file=sys.stderr)
+                journal.update("ensure_cache", StageState.FAILED, error=str(error))
+                return False
 
             build_spec = ProcessSpec(
                 argv=build_argv,

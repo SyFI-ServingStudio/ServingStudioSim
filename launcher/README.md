@@ -666,16 +666,18 @@ python -m launcher <preset.yaml|json> [<preset2.yaml|json> ...]
                    [--build-type <cargo-profile>] [--profile [--profile-freq HZ]]
                    [--no-analyze] [--no-plot] [--emit-backends [FILE]]
 python -m launcher timing-predict <config.yaml|json> [<config2.yaml|json> ...]
-                   [--build-type <cargo-profile>] [--no-analyze]
+                   [--build-type <cargo-profile>] [--no-analyze] [--dry-run]
 python -m launcher kernel-profile {list,query,count-missing,run,measure,merge-db,audit-provenance} ...
 python -m launcher list-params [--human] [--build-type ...]
 python -m launcher alignment sim <simulation.yaml|json> [simulation options]
 python -m launcher alignment profile <profile.yaml|json> [--dry-run]
-python -m launcher alignment timing-predict <timing_predict.yaml|json> [--build-type ...]
+python -m launcher alignment timing-predict <timing_predict.yaml|json> [--build-type ...] [--dry-run]
 python -m launcher alignment analyze <analyze.yaml|json> [--build-type ...]
 python -m launcher alignment-campaign {check,render,run,label,extract,compare} ...
 python -m launcher migrate-artifact-kinds (--check|--apply) [--registry PATH]
 ```
+
+`--no-gpu` may be added anywhere to any of these commands.
 
 - Simulation presets, timing-predict configs, and all alignment stage inputs
   accept YAML (`.yaml` / `.yml`) or JSON.
@@ -690,6 +692,14 @@ python -m launcher migrate-artifact-kinds (--check|--apply) [--registry PATH]
   writes the annotated `backends:` skeleton (stdout, or `FILE`), then exits — the
   starting point for a `backends_file` (see the `backends` section above).
 - `--profile` wraps a single run with `perf record` (skill `operate-profile-sim-speed`).
+- `--no-gpu` (any mode, or `SERVINGSTUDIO_NO_GPU=1`) guarantees the command uses
+  no GPU. The launcher sets the variable and empties `CUDA_VISIBLE_DEVICES` for
+  itself and every child. Each GPU entry point in `profiling/` and
+  `alignment/runner.py` checks it (`profiling/gpu_policy.py`), so a step that
+  needs a GPU fails and names itself: a cache prebuild with missing rows
+  (before any builder starts), a timing-predict JIT fill, `kernel-profile
+  run`/`measure`, and an `alignment profile` capture (`--resume` still works).
+  A run over a warm `profile.db` is unaffected.
 - `timing-predict` evaluates explicit batch shapes without a workload, scheduler,
   clock, or discrete-event simulation; its config is not a deployment preset.
   The launcher snapshots a private `raw/params.json` model/GPU projection so the
@@ -698,6 +708,12 @@ python -m launcher migrate-artifact-kinds (--check|--apply) [--registry PATH]
   `raw/prediction_provenance.json` from the concrete L4 model, and the launcher
   uses its authoritative `gpus_per_replica()` value in `prediction.meta.json`;
   timing-predict does not create simulation `run_meta.json`.
+- `timing-predict --dry-run` builds the model on the simulator's dry-run bridge,
+  checks every case against it, and prints the `profile.db` specs a real run
+  would JIT. It costs nothing, writes nothing under `log_dir`, announces no job,
+  and needs no GPU. `alignment timing-predict --dry-run` builds the measured
+  cases in a scratch directory and runs the same check. A real run also checks
+  every case before costing the first, so a bad case writes no rows.
 - Every first-class output root gets `artifact.meta.json` with one explicit kind:
   `simulation_run`, `simulation_sweep`, `timing_prediction`, `alignment_bundle`,
   `kernel_profile`, or `kernel_measurement`. Analyzer uses this marker as its only

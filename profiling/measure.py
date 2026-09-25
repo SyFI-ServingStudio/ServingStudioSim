@@ -34,6 +34,7 @@ from profiling.exec.env import (
     resolve_profile_env,
 )
 from profiling.exec.local import _container_worker_command, find_idle_gpus
+from profiling.gpu_policy import require_gpu
 
 
 class MeasureError(RuntimeError):
@@ -71,6 +72,7 @@ def measure_kernel(
     resolved_output_dir = Path(output_dir).resolve()
     resolved_output_dir.mkdir(parents=True, exist_ok=True)
 
+    require_gpu(f"measuring {kernel_kind}:{resolved_backend}")
     idle_gpus = find_idle_gpus()
     if not idle_gpus:
         raise MeasureError("no idle GPU found for measure")

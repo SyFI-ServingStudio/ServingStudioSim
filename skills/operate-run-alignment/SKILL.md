@@ -163,6 +163,13 @@ single-config path below when there is one workload and no matrix.
    emitted CostTree leaf slots before mapping. A cold profile DB may JIT-fill and
    need the matching GPU.
 
+   Preview with `alignment timing-predict <timing_predict.yaml> --dry-run`. It
+   builds the measured cases in a scratch directory, checks each against the
+   model, and prints the `profile.db` specs a real run would JIT. It writes
+   nothing into the bundle. Under `--no-gpu`, `alignment profile` is refused
+   before the engine starts (a `--resume` still runs), and a timing-predict with
+   missing rows fails instead of profiling.
+
    **Do not manually pre-fill the cache for an alignment campaign.** Run
    timing-predict or simulation on the real case inputs and let their ordinary
    `perf_api` lookups JIT-fill the exact demanded shapes. Never invent a broad

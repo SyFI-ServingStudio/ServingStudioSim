@@ -23,6 +23,7 @@ from profiling.db.batch import (
 from profiling.db.kind import KernelKind
 from profiling.db.registry import find_kernel_profiler_spec, iter_kernel_profiler_specs
 from profiling.db.table import MissingEntry, Table
+from profiling.gpu_policy import NO_GPU_ENV, gpu_disabled
 from profiling.plan import active_collector
 from profiling.profilers.energy import require_measured_energy
 from profiling.runners.metrics import ComputeMetrics, Metrics
@@ -417,6 +418,8 @@ def _coerce_input_specs(
 def _resolve_gpu_name(gpu_name: str | None) -> str:
     if gpu_name:
         return gpu_name
+    if gpu_disabled():
+        raise ValueError(f"gpu_name is required when {NO_GPU_ENV} is set")
     try:
         import torch
 

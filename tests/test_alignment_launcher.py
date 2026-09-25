@@ -1603,6 +1603,40 @@ def test_timing_predict_uses_one_phase_config_and_no_labeled_inventory(tmp_path,
     assert not (output / "kernel_sequences_labeled.json").exists()
 
 
+def test_timing_predict_dry_run_builds_cases_in_scratch_and_writes_nothing(tmp_path, monkeypatch):
+    paths = _phase_configs(tmp_path)
+    _write_completed_inputs(tmp_path)
+    seen = []
+
+    def launch(path, **kwargs):
+        # The predictor sees real cases while the scratch directory still exists.
+        seen.append((json.loads(path.read_text()), kwargs))
+        assert json.loads(Path(seen[0][0]["cases_file"]).read_text())
+        return 0
+
+    monkeypatch.setattr(alignment_launcher, "_launch_timing_predict", launch)
+    before = sorted(tmp_path.rglob("*"))
+
+    assert alignment_launcher.main(["timing-predict", str(paths["timing"]), "--dry-run"]) == 0
+    [(predict_config, kwargs)] = seen
+    assert kwargs == {"build_type": "release", "dry_run": True}
+    assert not Path(predict_config["log_dir"]).exists()
+    assert sorted(tmp_path.rglob("*")) == before
+
+
+def test_timing_predict_dry_run_is_forwarded_to_the_predictor(tmp_path, monkeypatch):
+    config_path = tmp_path / "timing_predict_config.json"
+    config_path.write_text("{}")
+    launched = []
+    monkeypatch.setattr(timing_predict_launcher, "main", lambda argv: launched.append(argv) or 0)
+
+    assert (
+        alignment_launcher._launch_timing_predict(config_path, build_type="release", dry_run=True)
+        == 0
+    )
+    assert launched == [[str(config_path), "--build-type", "release", "--dry-run"]]
+
+
 def test_timing_predict_launcher_keeps_post_run_analysis_enabled(tmp_path, monkeypatch):
     config_path = tmp_path / "timing_predict_config.json"
     config_path.write_text("{}")

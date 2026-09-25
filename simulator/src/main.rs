@@ -27,6 +27,7 @@ use simulator::sim::{
     SessionDependency, TickCfg, TraceTag,
 };
 use simulator::timing::PerfApiBridge;
+use simulator::timing_predict::PredictMode;
 
 // Heap profiling (opt-in, `--features dhat-heap`): dhat's allocator only
 // intercepts Rust's `GlobalAlloc`, so Python/torch C-side allocations bypass it
@@ -74,7 +75,20 @@ enum Cmd {
     /// `{iter|attn|ffn}` + gpu + a cases_file) and writes the standard
     /// `raw/cost_log` + `cost_manifest` artifacts (one row per case/section, tagged
     /// with `section`/`layer`), which `analyze trace` / `analyze run` consume.
-    TimingPredict(RunArgs),
+    ///
+    /// `--dry-run` builds the model and validates every case without costing any:
+    /// it reports the `profile.db` specs a real run would JIT, writes nothing, and
+    /// needs no GPU.
+    TimingPredict(PredictArgs),
+}
+
+#[derive(Args)]
+struct PredictArgs {
+    /// Path to the predict config (`.yaml` / `.yml` / `.json`).
+    config: PathBuf,
+    /// Validate and report missing `profile.db` specs; cost and write nothing.
+    #[arg(long)]
+    dry_run: bool,
 }
 
 /// Shared payload for `run` / `build-cache-only` / `dry-run`: a path to one
@@ -160,7 +174,14 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::KernelQuery => simulator::introspect::run_kernel_query(),
-        Cmd::TimingPredict(args) => simulator::timing_predict::run_timing_predict(&args.config),
+        Cmd::TimingPredict(args) => simulator::timing_predict::run_timing_predict(
+            &args.config,
+            if args.dry_run {
+                PredictMode::DryRun
+            } else {
+                PredictMode::Run
+            },
+        ),
     }
 }
 

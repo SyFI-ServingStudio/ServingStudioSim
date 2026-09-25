@@ -13,6 +13,7 @@ import filecmp
 import json
 import shutil
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -89,6 +90,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     predict.add_argument("config", type=Path, help="Timing-predict phase YAML/JSON")
     predict.add_argument("--build-type", default="release", help="Cargo profile.")
+    predict.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Build and validate the cases in a scratch directory; predict and write nothing.",
+    )
 
     analyze = commands.add_parser(
         "analyze", help="Compare completed profile, prediction, and simulation artifacts."
@@ -390,14 +396,17 @@ def _launch_simulation(
         return int(exc.code) if isinstance(exc.code, int) else 2
 
 
-def _launch_timing_predict(config_path: Path, *, build_type: str) -> int:
+def _launch_timing_predict(config_path: Path, *, build_type: str, dry_run: bool = False) -> int:
     from .timing_predict import main as timing_predict_main
 
+    argv = [str(config_path), "--build-type", build_type]
+    if dry_run:
+        argv.append("--dry-run")
     try:
         # A prediction is not complete until Analyzer has materialized its cost
         # subjects. In particular, unlocked optimality needs the cached grid-peak
         # sidecar; skipping analysis silently collapses R3 onto R2 in the UI.
-        return timing_predict_main([str(config_path), "--build-type", build_type])
+        return timing_predict_main(argv)
     except SystemExit as exc:
         return int(exc.code) if isinstance(exc.code, int) else 2
 
@@ -461,7 +470,21 @@ def _run_profile(args: argparse.Namespace) -> int:
 
 def _run_timing_predict(args: argparse.Namespace) -> int:
     config: TimingPredictPhaseConfig = load_timing_predict_config(args.config)
+    if args.dry_run:
+        # The same inputs, built where nothing reads them and removed afterwards.
+        with tempfile.TemporaryDirectory(prefix="alignment-timing-predict-") as scratch:
+            predict_config = _build_timing_predict_inputs(config, Path(scratch))
+            print(f"[alignment] timing-predict dry run: {args.config}")
+            return _launch_timing_predict(predict_config, build_type=args.build_type, dry_run=True)
     write_artifact_kind(config.log_dir.parent, ArtifactKind.ALIGNMENT_BUNDLE)
+    predict_config = _build_timing_predict_inputs(config, config.log_dir)
+    _snapshot_config(args.config, config.log_dir, "timing_predict")
+    print(f"[alignment] timing-predict: {predict_config}")
+    return _launch_timing_predict(predict_config, build_type=args.build_type)
+
+
+def _build_timing_predict_inputs(config: TimingPredictPhaseConfig, output_dir: Path) -> Path:
+    """Write the measured cases and predictor config under `output_dir`; return the config."""
     # Read the sim *preset* (not a completed run): timing-predict is kernel-only,
     # so it needs the gpu / arch / backends but never a finished simulation.
     preset = _load_simulation_preset(config.simulation_preset)
@@ -477,16 +500,14 @@ def _run_timing_predict(args: argparse.Namespace) -> int:
             simulation_preset=config.simulation_preset,
             profile_log_dir=config.profile_log_dir,
             parsed_nsys=_profile_artifact(profile_result, "parsed_nsys"),
-            output_dir=config.log_dir,
+            output_dir=output_dir,
             gpu=gpu,
             arch=arch,
             backends=_preset_backends(preset),
             input_spec=config.input_builder,
         )
     )
-    _snapshot_config(args.config, config.log_dir, "timing_predict")
-    print(f"[alignment] timing-predict: {build_result.predict_config}")
-    return _launch_timing_predict(build_result.predict_config, build_type=args.build_type)
+    return build_result.predict_config
 
 
 def _run_analyze(args: argparse.Namespace) -> int:
