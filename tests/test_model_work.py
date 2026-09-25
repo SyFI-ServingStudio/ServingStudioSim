@@ -45,6 +45,15 @@ EMBED = VOCAB * HIDDEN  # 525_336_576
 NORMS = (2 * L + 1) * HIDDEN
 
 
+def _columns(weighted_shapes: list[dict]) -> dict:
+    """The column-per-field wire form of `{"occurrences", "totals"}` rows."""
+    fields = weighted_shapes[0]["totals"] if weighted_shapes else {}
+    return {
+        "occurrences": [shape["occurrences"] for shape in weighted_shapes],
+        "totals": {name: [shape["totals"][name] for shape in weighted_shapes] for name in fields},
+    }
+
+
 @pytest.fixture(scope="module")
 def model():
     return load_model(CONFIG)
@@ -131,7 +140,7 @@ def test_speculative_floors_refuse_incomplete_stage_geometry(tmp_path):
         )
     )
     unlocked = work_floors.compute_floors(tmp_path, {"main": {}})
-    locked = work_floors.compute_locked_compositions(tmp_path, {"main/0": []})
+    locked = work_floors.compute_locked_compositions(tmp_path, {"main/0": _columns([])})
     assert "per-stage workload geometry" in unlocked["main"]["error"]
     assert "per-stage workload geometry" in locked["main/0"]["error"]
 
@@ -173,9 +182,9 @@ def test_locked_composition_evaluates_each_shape_before_addition(
         {"occurrences": 2, "totals": prefill_shape},
     ]
 
-    result = work_floors.compute_locked_compositions(Path("unused"), {"main/0": weighted_shapes})[
-        "main/0"
-    ]
+    result = work_floors.compute_locked_compositions(
+        Path("unused"), {"main/0": _columns(weighted_shapes)}
+    )["main/0"]
 
     expected_fused = 0.0
     expected_segmented = 0.0
@@ -228,9 +237,13 @@ def test_small_group_skips_the_basis_it_cannot_pay_for(monkeypatch, model):
     ]
 
     monkeypatch.setattr(work_floors, "_MIN_BASIS_GROUP", 24)
-    small = work_floors.compute_locked_compositions(Path("unused"), {"main/0": shapes})["main/0"]
+    small = work_floors.compute_locked_compositions(Path("unused"), {"main/0": _columns(shapes)})[
+        "main/0"
+    ]
     monkeypatch.setattr(work_floors, "_MIN_BASIS_GROUP", 1)
-    affine = work_floors.compute_locked_compositions(Path("unused"), {"main/0": shapes})["main/0"]
+    affine = work_floors.compute_locked_compositions(Path("unused"), {"main/0": _columns(shapes)})[
+        "main/0"
+    ]
 
     assert small["composition"]["affine_bases"] == 0
     assert small["composition"]["direct_fallback_bases"] == 1
@@ -718,6 +731,7 @@ def test_glm52_segments_and_holdouts_are_complete():
         )
         == 3_975_840
     )
+
 
 # Real Qwen3.6-27B text_config: L=64, hidden=5120, intermediate=17408, vocab=248320,
 # head_dim=256, num_qo=24, num_kv=4, attn_output_gate; GDN: v_heads=48, k_heads=16,
