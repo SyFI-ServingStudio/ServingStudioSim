@@ -7,8 +7,8 @@ pub mod dsa_sparse_mla;
 pub mod flashinfer;
 
 pub use deepseek_v41_indexer::{
-    DeepseekV41CandidateRole, DeepseekV41IndexerOp, DeepseekV41IndexerOpConfig,
-    DeepseekV41IndexerOpInput, DeepseekV41IndexerOpResolved,
+    byte_rate_placeholder_shape, DeepseekV41CandidateRole, DeepseekV41IndexerOp,
+    DeepseekV41IndexerOpConfig, DeepseekV41IndexerOpInput, DeepseekV41IndexerOpResolved,
 };
 pub use deepseek_v41_mega_attn::{
     DeepseekV41MegaAttnOp, DeepseekV41MegaAttnOpConfig, DeepseekV41MegaAttnOpInput,

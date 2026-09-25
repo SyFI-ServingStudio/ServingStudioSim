@@ -12,6 +12,7 @@
 //! - The NCCL AllGather stand-in (see [`all_gather_as_all_reduce_bytes`]).
 
 use crate::common::Fabric;
+use crate::op::attention::byte_rate_placeholder_shape;
 use crate::op::Op;
 use crate::timing::kernels::{AllReduceKernelConfig, ElementwiseKernelConfig};
 use crate::timing::{CostNode, CostTreeBuilder, Evaluator, LeafMetrics, Probe, SlotInput};
@@ -74,12 +75,17 @@ pub(super) fn nccl_all_gather_proxy(
     }
 }
 
+/// An elementwise byte placeholder, shaped by
+/// [`byte_rate_placeholder_shape`] (high fan-in reduces stream their bytes
+/// evenly so the `triton` runner measures bandwidth, not a serial loop).
 pub(super) fn placeholder(
     backends: &[&'static str],
     gpu_name: &str,
     input_bytes_per_token: u32,
     output_bytes_per_token: u32,
 ) -> ElementwiseKernelConfig {
+    let (input_bytes_per_token, output_bytes_per_token) =
+        byte_rate_placeholder_shape(input_bytes_per_token, output_bytes_per_token);
     ElementwiseKernelConfig {
         backends: backends.to_vec(),
         gpu_name: gpu_name.to_string(),

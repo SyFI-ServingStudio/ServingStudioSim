@@ -51,6 +51,29 @@ pub const LOGIT_TILE_BYTES: u32 = 4096;
 /// write is already folded into the tile count; the `elementwise` runner
 /// rejects a zero-byte output, so these tiles write one int32.
 pub const READ_TILE_OUTPUT_BYTES: u32 = 4;
+/// Largest input:output byte ratio a V4.1 placeholder keeps as written.
+pub const MAX_PLACEHOLDER_FAN_IN: u32 = 8;
+
+/// The `(input, output)` bytes per token a V4.1 elementwise placeholder is
+/// profiled at.
+///
+/// A placeholder stands for a launch by the bytes it streams. The `triton`
+/// elementwise runner is a fan-in reduce: one lane per output byte loops over
+/// `input / output` inputs, so a launch with a tiny output (a 4 KiB logit tile
+/// feeding a top-k, the hc-prenorm's 96-byte mix) runs on a handful of CTAs
+/// and measures loop latency, not bandwidth (72 us for 48 hc-prenorm rows,
+/// ~180 us per decode top-k in the first B200 prediction). Above
+/// [`MAX_PLACEHOLDER_FAN_IN`] the same total bytes are split evenly between
+/// read and write, which keeps the byte count and restores full-grid
+/// streaming.
+pub fn byte_rate_placeholder_shape(input: u32, output: u32) -> (u32, u32) {
+    if output > 0 && input > MAX_PLACEHOLDER_FAN_IN * output {
+        let half = (input + output).div_ceil(2);
+        (half, half)
+    } else {
+        (input, output)
+    }
+}
 /// One index-cache key: 128 FP8 bytes plus one fp32 scale.
 const INDEX_KEY_BYTES: u32 = 132;
 
@@ -126,11 +149,14 @@ impl DeepseekV41IndexerOp {
             "index page block must be 64 or 128, got {}",
             cfg.page_block_size
         );
-        let elementwise = |input: u32, output: u32| ElementwiseKernelConfig {
-            backends: cfg.elementwise_backends.clone(),
-            gpu_name: cfg.gpu_name.clone(),
-            input_bytes_per_token: input.into(),
-            output_bytes_per_token: output.into(),
+        let elementwise = |input: u32, output: u32| {
+            let (input, output) = byte_rate_placeholder_shape(input, output);
+            ElementwiseKernelConfig {
+                backends: cfg.elementwise_backends.clone(),
+                gpu_name: cfg.gpu_name.clone(),
+                input_bytes_per_token: input.into(),
+                output_bytes_per_token: output.into(),
+            }
         };
         DeepseekV41IndexerOpResolved {
             prefill_k_gather: elementwise(INDEX_KEY_BYTES, INDEX_KEY_BYTES),
@@ -423,5 +449,16 @@ mod tests {
             (131_072, 128)
         );
         assert_eq!(r1.candidates.unwrap().output_bytes_per_token.get(), LOGIT_TILE_BYTES);
+    }
+
+    #[test]
+    fn high_fan_in_placeholders_stream_the_same_bytes_evenly() {
+        assert_eq!(byte_rate_placeholder_shape(4096, 4), (2050, 2050));
+        assert_eq!(byte_rate_placeholder_shape(40960, 96), (20528, 20528));
+        assert_eq!(byte_rate_placeholder_shape(8256, 4224), (8256, 4224));
+        assert_eq!(byte_rate_placeholder_shape(4, 10240), (4, 10240));
+        let r = DeepseekV41IndexerOp::resolve(&cfg(2, DeepseekV41CandidateRole::None));
+        assert_eq!(r.decode_topk.input_bytes_per_token.get(), 2050);
+        assert_eq!(r.decode_topk.output_bytes_per_token.get(), 2050);
     }
 }
