@@ -42,6 +42,8 @@ use crate::timing::kernels::{
     RmsNormKernelInput, SingleGemmKernelInput, VllmFusedMoeKernelInput, VllmMlaRopeKernelInput,
 };
 
+use crate::timing::kernels::DeepseekV41MegaAttnKernelInput;
+
 /// The prefill aggregating leaf's input: the full `(prefix_len, append_len)`
 /// fan-out the attention op summed into one slot (many prefill requests fold to a
 /// single leaf).
@@ -153,6 +155,7 @@ log_inputs! {
     DeepseekV4SparseAttnCompressStore => DeepseekV4SparseAttnCompressStoreKernelInput,
     DeepseekV4SparseMlaDecode => DeepseekV4SparseMlaDecodeKernelInput,
     DeepseekV4SparseMlaPrefill => DeepseekV4SparseMlaPrefillKernelInput,
+    DeepseekV41MegaAttn => DeepseekV41MegaAttnKernelInput,
     MoeTopkSoftplusSqrt => MoeTopkSoftplusSqrtKernelInput,
     GemmFp32Output => GemmFp32OutputKernelInput,
     MlaRopeQuantizeFp8 => MlaRopeQuantizeFp8KernelInput,
