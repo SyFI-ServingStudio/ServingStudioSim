@@ -5,6 +5,7 @@ pub mod all_reduce_fusion;
 pub mod all_reduce_residual_rms_norm;
 pub mod batched_gemm;
 pub mod bf16_fused_moe;
+pub mod causal_conv1d_prefill;
 pub mod clamped_swiglu;
 pub mod deepseek_v4_fused_inv_rope_fp8_quant;
 pub mod deepseek_v4_fused_q_kv_rmsnorm;
@@ -50,6 +51,10 @@ pub mod gdn_prefill_post_conv;
 pub mod gdn_recurrent_decode;
 pub mod gemm_fp32_output;
 pub mod grouped_gemm;
+pub mod k3_add3_prefill;
+pub mod k3_attn_res_prefill;
+pub mod k3_situ_and_mul_prefill;
+pub mod kda_chunk_prefill;
 pub mod kda_fused_decode;
 pub mod kda_recurrent_decode;
 pub mod kv_cache_append;
@@ -57,6 +62,9 @@ pub mod mhc_fused_post_pre_rms_norm;
 pub mod mhc_pre_rms_norm;
 pub mod mla_cache_append;
 pub mod mla_decode_attention;
+pub mod mla_merge_state;
+pub mod mla_prefill_attention;
+pub mod mla_prefix_gather;
 pub mod mla_rope_quantize_fp8;
 pub mod moe_align_block_size;
 pub mod moe_alltoall;
@@ -94,6 +102,10 @@ pub use batched_gemm::{
 };
 pub use bf16_fused_moe::{
     Bf16FusedMoeKernel, Bf16FusedMoeKernelConfig, Bf16FusedMoeKernelInput, Bf16FusedMoeSpec,
+};
+pub use causal_conv1d_prefill::{
+    CausalConv1dPrefillKernel, CausalConv1dPrefillKernelConfig, CausalConv1dPrefillKernelInput,
+    CausalConv1dPrefillSpec,
 };
 pub use clamped_swiglu::{
     ClampedSwigluKernel, ClampedSwigluKernelConfig, ClampedSwigluKernelInput, ClampedSwigluSpec,
@@ -265,6 +277,21 @@ pub use gemm_fp32_output::{
 pub use grouped_gemm::{
     GroupedGemmKernel, GroupedGemmKernelConfig, GroupedGemmKernelInput, GroupedGemmSpec,
 };
+pub use k3_add3_prefill::{
+    K3Add3PrefillKernel, K3Add3PrefillKernelConfig, K3Add3PrefillKernelInput, K3Add3PrefillSpec,
+};
+pub use k3_attn_res_prefill::{
+    K3AttnResPrefillKernel, K3AttnResPrefillKernelConfig, K3AttnResPrefillKernelInput,
+    K3AttnResPrefillSpec,
+};
+pub use k3_situ_and_mul_prefill::{
+    K3SituAndMulPrefillKernel, K3SituAndMulPrefillKernelConfig, K3SituAndMulPrefillKernelInput,
+    K3SituAndMulPrefillSpec,
+};
+pub use kda_chunk_prefill::{
+    KdaChunkPrefillKernel, KdaChunkPrefillKernelConfig, KdaChunkPrefillKernelInput,
+    KdaChunkPrefillSpec,
+};
 pub use kda_fused_decode::{
     KdaFusedDecodeKernel, KdaFusedDecodeKernelConfig, KdaFusedDecodeKernelInput, KdaFusedDecodeSpec,
 };
@@ -285,6 +312,17 @@ pub use mla_cache_append::{
 pub use mla_decode_attention::{
     MlaDecodeAttentionKernel, MlaDecodeAttentionKernelConfig, MlaDecodeAttentionKernelInput,
     MlaDecodeAttentionSpec,
+};
+pub use mla_merge_state::{
+    MlaMergeStateKernel, MlaMergeStateKernelConfig, MlaMergeStateKernelInput, MlaMergeStateSpec,
+};
+pub use mla_prefill_attention::{
+    MlaPrefillAttentionKernel, MlaPrefillAttentionKernelConfig, MlaPrefillAttentionKernelInput,
+    MlaPrefillAttentionSpec,
+};
+pub use mla_prefix_gather::{
+    MlaPrefixGatherKernel, MlaPrefixGatherKernelConfig, MlaPrefixGatherKernelInput,
+    MlaPrefixGatherSpec,
 };
 pub use mla_rope_quantize_fp8::{
     MlaRopeQuantizeFp8Kernel, MlaRopeQuantizeFp8KernelConfig, MlaRopeQuantizeFp8KernelInput,

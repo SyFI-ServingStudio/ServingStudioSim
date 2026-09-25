@@ -37,6 +37,7 @@ pub struct KimiK3DenseLocalWorkletResolved {
 #[derive(Clone, Debug, Default)]
 pub struct KimiK3DenseLocalWorkletInput {
     pub batch_tokens: u32,
+    pub prefill_chunk_pairs: Vec<(u32, u32)>,
 }
 
 pub struct KimiK3DenseLocalWorklet {
@@ -123,7 +124,7 @@ impl KimiK3DenseLocalWorklet {
     }
 
     pub fn eval(&self, input: &KimiK3DenseLocalWorkletInput, evaluator: &mut Evaluator) {
-        let rows = input.batch_tokens;
+        let rows = phase_token_count(input.batch_tokens, &input.prefill_chunk_pairs);
         eval_atomic_or_zero(
             &self.gate_up,
             SingleGemmKernelInput { m: rows },
@@ -143,6 +144,16 @@ impl KimiK3DenseLocalWorklet {
             evaluator,
         );
     }
+}
+
+fn phase_token_count(batch_tokens: u32, pairs: &[(u32, u32)]) -> u32 {
+    if pairs.is_empty() {
+        return batch_tokens;
+    }
+    pairs
+        .iter()
+        .try_fold(0_u32, |total, &(_prefix, append)| total.checked_add(append))
+        .expect("Kimi-K3 dense prefill token count must fit u32")
 }
 
 fn validate_config(cfg: &KimiK3DenseLocalWorkletConfig) -> Result<(), String> {
@@ -186,5 +197,11 @@ mod tests {
         assert_eq!(resolved.situ.output_bytes_per_token, 67_584);
         assert_eq!(resolved.down.k, INTERMEDIATE);
         assert_eq!(resolved.down.n, HIDDEN);
+    }
+
+    #[test]
+    fn prefill_rows_are_taken_from_append_lengths() {
+        assert_eq!(phase_token_count(17, &[]), 17);
+        assert_eq!(phase_token_count(99, &[(49_152, 4_096); 4]), 16_384);
     }
 }

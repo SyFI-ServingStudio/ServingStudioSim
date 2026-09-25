@@ -194,3 +194,93 @@ TMPDIR=/raid/tmp/yilegu_k3_tmp
 
 Every GPU launch was preceded by a memory check on `nvidia-smi -i 3`; the
 branch database was used instead of `profiling/profile.db`.
+
+## B12 Chunked Prefill
+
+B12 adds rank-local chunked-prefill timing for the KDA and MLA layer variants.
+This is still layer-level kernel evidence from the eager single-layer driver;
+it is not a server alignment. The fill used only GPU 7 and the branch database:
+
+```bash
+VIBESIM_PROFILE_GPUS=GPU-c88e489a-0693-2c29-a1e3-30952377f742
+VIBESIM_PROFILE_DB=/raid/yilegu/roofline_guided_agent/VibeSimWorkspace/scripts-local/vibesim-analysis-container/kimi_single_layer/k3_branch_profile.db
+TMPDIR=/raid/tmp_yilegu_k3_tmp
+```
+
+### Phase-1 Decision Table
+
+The classification below is from the per-kernel tables in
+`profiles/prefill_kda_*.json` and `profiles/prefill_mla_*.json`. Existing dense
+GEMM, cache-append, norm, and MXFP4 kinds are reused with prefill-shaped
+arguments. The new fused leaves preserve the production callable boundary.
+
+| Profile evidence | KDA decision | MLA decision |
+| --- | --- | --- |
+| `nvjet_sm100_tss_*` | Reuse `gemm_fp32_output` for the merged front | Reuse `gemm_fp32_output` for the merged front |
+| `nvjet_sm100_tst_*` and small BF16 GEMMs | Reuse `single_gemm` at `m=T` for qkvbfg, shared/down, latent/up, and output projections | Reuse `single_gemm` at `m=T` for projections; reuse `batched_gemm` for latent KV BMM |
+| `bmm_MxE4m3_*` plus route/finalize/quant support | Reuse histogram-aware `mxfp4_fused_moe` with `top_k=2` and `2T` routed rows | Same reuse; the local 112-expert route remains in the cache key |
+| `_causal_conv1d_fwd_kernel` | New `causal_conv1d_prefill` | N/A |
+| KDA l2norm, cumsum, recompute, intra/inter solve, and output kernels | New `kda_chunk_prefill` group | N/A |
+| `attn_res_fused_tma` | New `k3_attn_res_prefill`, two launches, one valid block | New `k3_attn_res_prefill`, two launches, one valid block |
+| `chunk_gated_delta_rule_fwd_kernel_h_blockdim64` and related KDA kernels | Part of `kda_chunk_prefill` | N/A |
+| `trtllm_ragged_attention_deepseek` causal pass | N/A | New `mla_prefill_attention`, `causal=true`, `q_len=T`, `kv_len=T` |
+| `trtllm_ragged_attention_deepseek` prefix pass | N/A | New `mla_prefill_attention`, `causal=false`, `q_len=T`, `kv_len=prefix_chunk` |
+| `create_chunked_prefix_cache_kv_indices` and latent-KV gather | N/A | New `mla_prefix_gather` composite |
+| `merge_state` | N/A | New `mla_merge_state` |
+| SiTU and the final three-way add | New `k3_situ_and_mul_prefill` and `k3_add3_prefill` | Same new leaves |
+| BF16 residual adds, copies, route bookkeeping, and small fills | Fold into the owning attention/MoE boundary or keep as an elementwise placeholder; no independent kind | Same policy |
+
+The new runners call the production SGLang/FlashInfer entry points in the
+`sglang_k3_env` worker: `causal_conv1d_fn`, `chunk_kda`,
+`trtllm_ragged_attention_deepseek`, `attn_res_fused_tma`, the MLA cache
+helpers, `merge_state`, `situ_and_mul`, and `add3`. Decode configurations and
+decode preset numbers are unchanged.
+
+### Direct-Call Leaf Evidence
+
+The branch rows are direct-call medians. The eager driver tables expose a
+larger resident-layer launch context, so the following is the useful
+per-leaf comparison rather than a claim that the two measurement boundaries
+are interchangeable. Values are microseconds for KDA B=1, T=16384, fresh
+prefix unless stated otherwise.
+
+| Logical leaf or group | Eager profile | Direct-call row used by the predictor |
+| --- | ---: | ---: |
+| Merged FP32 front GEMM | `nvjet_sm100_tss`: 5817.5 | 2694.3 |
+| Four large BF16 projection GEMMs | `nvjet_sm100_tst`, total 6111.4 | 2831.1 |
+| MXFP4 routed MoE and physical route tail | 2962.8 | 1449.7 |
+| Two attention-residual TMA launches | 1882.6 | 323.9 |
+| Causal convolution | 130.6 | 125.0 |
+| KDA chunk group | 1245.2 | 1057.0 |
+| SiTU | 254.9 | 207.5 |
+| `add3` | 647.0 | 130.5 |
+
+The same pattern is visible in MLA: the eager prefix profile has 6144.4 us of
+prefix ragged attention versus 3533.2 us for the isolated callable, and the
+fresh MLA profile has a 2736.2 us SiTU launch while the direct row is 207.5 us.
+These differences persist after force-refreshing the major rows on GPU 7;
+they are not missing cache keys.
+
+### Prefill Prediction Comparison
+
+`timing-predict` was run against the four prefill preset/case files with the
+branch DB. The supplied `result_prefill_*.json` values are eager `us_step`.
+
+| Layer / point | Supplied eager us_step | Simulated us_step | Error |
+| --- | ---: | ---: | ---: |
+| KDA `1,16384,pf` | 22132.0 | 8894 | -59.8% |
+| KDA `1,16384,pf49152` | 22534.7 | 8972 | -60.2% |
+| KDA `4,4096,pf` | 22110.6 | 8537 | -61.4% |
+| MLA `1,16384,pf49152` | 29538.0 | 11792 | -60.1% |
+| MLA `1,16384,pf` | 20584.9 | 8002 | -61.1% |
+| MLA `4,4096,pf` | 17762.8 | 7557 | -57.5% |
+
+These direct-call predictions do not meet the requested 15% eager-layer target.
+The discrepancy is concentrated in the resident-layer `nvjet`, fused-MoE,
+attention-residual, and prefix-attention launches, not in the prefix-path
+selection: the fresh/prefix/batch-4 branches select the expected leaves and
+the prefix MLA path has the expected gather, latent BMM, ragged attention, and
+merge sequence. A future calibration pass needs a profiler boundary that
+retains the full eager layer's weight residency and stream state; applying a
+global multiplier to these direct-call rows would also corrupt the unchanged
+decode alignment.

@@ -57,3 +57,23 @@ register(
         subprocess_env="sglang_k3_env",
     )
 )
+
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="sglang_trtllm_mxfp4_prefill",
+        supports=BackendSupport(
+            compute=frozenset({DType.BF16}),
+            gpus=frozenset({"NVIDIA B200"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.moe.mxfp4_fused_moe",
+            function_name="profile_mxfp4_fused_moe_prefill",
+        ),
+        table_name=KIND,
+        args_schema=Mxfp4FusedMoeArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="sglang_k3_env",
+    )
+)

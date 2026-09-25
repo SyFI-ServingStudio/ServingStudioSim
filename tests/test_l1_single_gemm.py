@@ -137,6 +137,7 @@ def test_single_gemm_known_backends_include_framework_dispatches():
         "torch_linear_vllm",
         "sglang_bf16_auto",
         "sglang_fused_a_auto",
+        "sglang_k3_raw_bf16",
         "deepgemm",
     }
 

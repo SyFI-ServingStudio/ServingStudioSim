@@ -2,15 +2,17 @@
 //!
 //! SGLang uses the fused KDA launch for an FP32 recurrent state. Its cookbook
 //! BF16-state path launches the causal-convolution update, recurrent update, and
-//! gated RMS norm as three sequential Triton kernels. Prefill is present in the
-//! input contract, but this decode-first recipe leaves the decode leaves at zero
-//! for prefill because no K3 prefill profile is registered here.
+//! gated RMS norm as three sequential Triton kernels. Prefill uses separate
+//! variable-length conv and chunked-KDA leaves; decode leaves remain unchanged.
 
 use crate::op::Op;
 use crate::timing::bridge::DType;
 use crate::timing::kernels::{
+    CausalConv1dPrefillKernel, CausalConv1dPrefillKernelConfig, CausalConv1dPrefillKernelInput,
     GdnCausalConvDecodeKernel, GdnCausalConvDecodeKernelConfig, GdnCausalConvDecodeKernelInput,
     GdnGatedRmsNormKernel, GdnGatedRmsNormKernelConfig, GdnGatedRmsNormKernelInput,
+    K3AttnResPrefillKernel, K3AttnResPrefillKernelConfig, K3AttnResPrefillKernelInput,
+    KdaChunkPrefillKernel, KdaChunkPrefillKernelConfig, KdaChunkPrefillKernelInput,
     KdaFusedDecodeKernel, KdaFusedDecodeKernelConfig, KdaFusedDecodeKernelInput,
     KdaRecurrentDecodeKernel, KdaRecurrentDecodeKernelConfig, KdaRecurrentDecodeKernelInput,
     ResidualRmsNormKernel, ResidualRmsNormKernelConfig, ResidualRmsNormKernelInput,
@@ -25,25 +27,41 @@ const HEAD_DIM: u32 = 128;
 const CONV_KERNEL: u32 = 4;
 
 #[cfg(test)]
-const FUSED_SOURCE_ORDER: [&str; 7] = [
+const FUSED_SOURCE_ORDER: [&str; 15] = [
     "input_layernorm",
+    "attn_res_prefill",
     "qkvbfg_a_proj",
     "qkvbfg_a_proj_bfa",
+    "qkvbfg_a_proj_prefill",
+    "qkvbfg_a_proj_bfa_prefill",
+    "qkvbfg_f_b_prefill",
     "kda_fused_decode",
+    "kda_conv_prefill",
+    "kda_chunk_prefill",
+    "kda_gated_norm_prefill",
     "o_proj",
+    "o_proj_prefill",
     "tp_allreduce_zero",
     "post_attention_layernorm",
 ];
 
 #[cfg(test)]
-const SPLIT_SOURCE_ORDER: [&str; 9] = [
+const SPLIT_SOURCE_ORDER: [&str; 17] = [
     "input_layernorm",
+    "attn_res_prefill",
     "qkvbfg_a_proj",
     "qkvbfg_a_proj_bfa",
+    "qkvbfg_a_proj_prefill",
+    "qkvbfg_a_proj_bfa_prefill",
+    "qkvbfg_f_b_prefill",
     "kda_conv_decode",
     "kda_recurrent_decode",
     "kda_gated_norm",
+    "kda_conv_prefill",
+    "kda_chunk_prefill",
+    "kda_gated_norm_prefill",
     "o_proj",
+    "o_proj_prefill",
     "tp_allreduce_zero",
     "post_attention_layernorm",
 ];
@@ -59,11 +77,14 @@ pub struct KimiK3KdaLocalWorkletConfig {
     pub dtype: DType,
     pub kda_state_dtype: DType,
     pub gemm_backends: Vec<&'static str>,
+    pub prefill_gemm_backends: Vec<&'static str>,
     pub fused_decode_backends: Vec<&'static str>,
+    pub prefill_backends: Vec<&'static str>,
     pub causal_conv_decode_backends: Vec<&'static str>,
     pub recurrent_decode_backends: Vec<&'static str>,
     pub gated_norm_backends: Vec<&'static str>,
     pub residual_norm_backends: Vec<&'static str>,
+    pub prefill_attn_res_backends: Vec<&'static str>,
     pub tp_size: u16,
 }
 
@@ -71,13 +92,21 @@ pub struct KimiK3KdaLocalWorkletConfig {
 pub struct KimiK3KdaLocalWorkletResolved {
     pub raw_cfg: KimiK3KdaLocalWorkletConfig,
     pub input_layernorm: ResidualRmsNormKernelConfig,
+    pub prefill_attn_res: K3AttnResPrefillKernelConfig,
     pub qkvbfg_a_proj: SingleGemmKernelConfig,
     pub qkvbfg_a_proj_bfa: SingleGemmKernelConfig,
+    pub qkvbfg_a_proj_prefill: SingleGemmKernelConfig,
+    pub qkvbfg_a_proj_bfa_prefill: SingleGemmKernelConfig,
+    pub qkvbfg_f_b_prefill: SingleGemmKernelConfig,
     pub kda_fused_decode: Option<KdaFusedDecodeKernelConfig>,
+    pub kda_conv_prefill: CausalConv1dPrefillKernelConfig,
+    pub kda_chunk_prefill: KdaChunkPrefillKernelConfig,
+    pub kda_gated_norm_prefill: GdnGatedRmsNormKernelConfig,
     pub kda_conv_decode: Option<GdnCausalConvDecodeKernelConfig>,
     pub kda_recurrent_decode: Option<KdaRecurrentDecodeKernelConfig>,
     pub kda_gated_norm: Option<GdnGatedRmsNormKernelConfig>,
     pub o_proj: SingleGemmKernelConfig,
+    pub o_proj_prefill: SingleGemmKernelConfig,
     pub post_attention_layernorm: ResidualRmsNormKernelConfig,
 }
 
@@ -85,18 +114,27 @@ pub struct KimiK3KdaLocalWorkletResolved {
 pub struct KimiK3KdaLocalWorkletInput {
     pub batch_tokens: u32,
     pub decode_tokens: u32,
+    pub prefill_chunk_pairs: Vec<(u32, u32)>,
 }
 
 pub struct KimiK3KdaLocalWorklet {
     pub name: String,
     pub input_layernorm: Op<ResidualRmsNormKernel>,
+    pub prefill_attn_res: Op<K3AttnResPrefillKernel>,
     pub qkvbfg_a_proj: Op<SingleGemmKernel>,
     pub qkvbfg_a_proj_bfa: Op<SingleGemmKernel>,
+    pub qkvbfg_a_proj_prefill: Op<SingleGemmKernel>,
+    pub qkvbfg_a_proj_bfa_prefill: Op<SingleGemmKernel>,
+    pub qkvbfg_f_b_prefill: Op<SingleGemmKernel>,
     pub kda_fused_decode: Option<Op<KdaFusedDecodeKernel>>,
+    pub kda_conv_prefill: Op<CausalConv1dPrefillKernel>,
+    pub kda_chunk_prefill: Op<KdaChunkPrefillKernel>,
+    pub kda_gated_norm_prefill: Op<GdnGatedRmsNormKernel>,
     pub kda_conv_decode: Option<Op<GdnCausalConvDecodeKernel>>,
     pub kda_recurrent_decode: Option<Op<KdaRecurrentDecodeKernel>>,
     pub kda_gated_norm: Option<Op<GdnGatedRmsNormKernel>>,
     pub o_proj: Op<SingleGemmKernel>,
+    pub o_proj_prefill: Op<SingleGemmKernel>,
     pub tp_allreduce_zero: Op<super::kimi_k3_common::ZeroAllReduceProbe>,
     pub post_attention_layernorm: Op<ResidualRmsNormKernel>,
     resolved: KimiK3KdaLocalWorkletResolved,
@@ -128,6 +166,23 @@ impl KimiK3KdaLocalWorklet {
                 state_dtype: cfg.kda_state_dtype,
                 lower_bound: cfg.lower_bound,
             });
+        let kda_conv_prefill = CausalConv1dPrefillKernelConfig {
+            backends: cfg.prefill_backends.clone(),
+            gpu_name: cfg.gpu_name.clone(),
+            channels: (3 * heads * head_dim).into(),
+            kernel_size: cfg.conv_kernel.clone(),
+            dtype: cfg.dtype,
+            state_dtype: cfg.kda_state_dtype,
+        };
+        let kda_chunk_prefill = KdaChunkPrefillKernelConfig {
+            backends: cfg.prefill_backends.clone(),
+            gpu_name: cfg.gpu_name.clone(),
+            num_heads: cfg.heads.clone(),
+            head_dim: cfg.head_dim.clone(),
+            dtype: cfg.dtype,
+            state_dtype: cfg.kda_state_dtype,
+            lower_bound: cfg.lower_bound,
+        };
         let kda_conv_decode =
             (cfg.kda_state_dtype == DType::Bf16).then(|| GdnCausalConvDecodeKernelConfig {
                 backends: cfg.causal_conv_decode_backends.clone(),
@@ -148,19 +203,32 @@ impl KimiK3KdaLocalWorklet {
                 state_dtype: cfg.kda_state_dtype,
                 lower_bound: cfg.lower_bound,
             });
+        let gated_norm_config = GdnGatedRmsNormKernelConfig {
+            backends: cfg.gated_norm_backends.clone(),
+            gpu_name: cfg.gpu_name.clone(),
+            hidden: cfg.head_dim.clone(),
+            dtype: cfg.dtype,
+        };
+        // Prefill applies the gated output norm in Python for both state
+        // dtypes. BF16 decode keeps a separate slot so mixed decode/prefill
+        // iterations can push both launches without violating slot order.
         let kda_gated_norm =
-            (cfg.kda_state_dtype == DType::Bf16).then(|| GdnGatedRmsNormKernelConfig {
-                backends: cfg.gated_norm_backends.clone(),
-                gpu_name: cfg.gpu_name.clone(),
-                hidden: cfg.head_dim.clone(),
-                dtype: cfg.dtype,
-            });
+            (cfg.kda_state_dtype == DType::Bf16).then(|| gated_norm_config.clone());
 
         KimiK3KdaLocalWorkletResolved {
             input_layernorm: ResidualRmsNormKernelConfig {
                 backends: cfg.residual_norm_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
                 hidden: cfg.hidden.clone(),
+                dtype: cfg.dtype,
+            },
+            prefill_attn_res: K3AttnResPrefillKernelConfig {
+                backends: cfg.prefill_attn_res_backends.clone(),
+                gpu_name: cfg.gpu_name.clone(),
+                hidden_size: cfg.hidden.clone(),
+                num_valid_blocks: 1,
+                num_launches: 2,
+                write_prefix: false,
                 dtype: cfg.dtype,
             },
             qkvbfg_a_proj: SingleGemmKernelConfig {
@@ -177,12 +245,43 @@ impl KimiK3KdaLocalWorklet {
                 k: cfg.hidden.clone(),
                 dtype: cfg.dtype,
             },
+            qkvbfg_a_proj_prefill: SingleGemmKernelConfig {
+                backends: cfg.prefill_gemm_backends.clone(),
+                gpu_name: cfg.gpu_name.clone(),
+                n: qkvbfg_n.into(),
+                k: cfg.hidden.clone(),
+                dtype: cfg.dtype,
+            },
+            qkvbfg_a_proj_bfa_prefill: SingleGemmKernelConfig {
+                backends: cfg.prefill_gemm_backends.clone(),
+                gpu_name: cfg.gpu_name.clone(),
+                n: qkvbfg_bfa_n.into(),
+                k: cfg.hidden.clone(),
+                dtype: cfg.dtype,
+            },
+            qkvbfg_f_b_prefill: SingleGemmKernelConfig {
+                backends: cfg.prefill_gemm_backends.clone(),
+                gpu_name: cfg.gpu_name.clone(),
+                n: projection_size.into(),
+                k: cfg.head_dim.clone(),
+                dtype: cfg.dtype,
+            },
             kda_fused_decode,
+            kda_conv_prefill,
+            kda_chunk_prefill,
+            kda_gated_norm_prefill: gated_norm_config,
             kda_conv_decode,
             kda_recurrent_decode,
             kda_gated_norm,
             o_proj: SingleGemmKernelConfig {
                 backends: cfg.gemm_backends.clone(),
+                gpu_name: cfg.gpu_name.clone(),
+                n: cfg.hidden.clone(),
+                k: (heads * head_dim).into(),
+                dtype: cfg.dtype,
+            },
+            o_proj_prefill: SingleGemmKernelConfig {
+                backends: cfg.prefill_gemm_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
                 n: cfg.hidden.clone(),
                 k: (heads * head_dim).into(),
@@ -225,6 +324,27 @@ impl KimiK3KdaLocalWorklet {
                 )
             })
             .transpose()?;
+        let kda_conv_prefill = build_atomic(
+            &name,
+            "kda_conv_prefill",
+            resolved.kda_conv_prefill.clone(),
+            CausalConv1dPrefillKernel::build,
+            bridge,
+        )?;
+        let kda_chunk_prefill = build_atomic(
+            &name,
+            "kda_chunk_prefill",
+            resolved.kda_chunk_prefill.clone(),
+            KdaChunkPrefillKernel::build,
+            bridge,
+        )?;
+        let kda_gated_norm_prefill = build_atomic(
+            &name,
+            "kda_gated_norm_prefill",
+            resolved.kda_gated_norm_prefill.clone(),
+            GdnGatedRmsNormKernel::build,
+            bridge,
+        )?;
         let kda_conv_decode = resolved
             .kda_conv_decode
             .clone()
@@ -272,6 +392,13 @@ impl KimiK3KdaLocalWorklet {
                 ResidualRmsNormKernel::build,
                 bridge,
             )?,
+            prefill_attn_res: build_atomic(
+                &name,
+                "attn_res_prefill",
+                resolved.prefill_attn_res.clone(),
+                K3AttnResPrefillKernel::build,
+                bridge,
+            )?,
             qkvbfg_a_proj: build_atomic(
                 &name,
                 "qkvbfg_a_proj",
@@ -286,7 +413,31 @@ impl KimiK3KdaLocalWorklet {
                 SingleGemmKernel::build,
                 bridge,
             )?,
+            qkvbfg_a_proj_prefill: build_atomic(
+                &name,
+                "qkvbfg_a_proj_prefill",
+                resolved.qkvbfg_a_proj_prefill.clone(),
+                SingleGemmKernel::build,
+                bridge,
+            )?,
+            qkvbfg_a_proj_bfa_prefill: build_atomic(
+                &name,
+                "qkvbfg_a_proj_bfa_prefill",
+                resolved.qkvbfg_a_proj_bfa_prefill.clone(),
+                SingleGemmKernel::build,
+                bridge,
+            )?,
+            qkvbfg_f_b_prefill: build_atomic(
+                &name,
+                "qkvbfg_f_b_prefill",
+                resolved.qkvbfg_f_b_prefill.clone(),
+                SingleGemmKernel::build,
+                bridge,
+            )?,
             kda_fused_decode,
+            kda_conv_prefill,
+            kda_chunk_prefill,
+            kda_gated_norm_prefill,
             kda_conv_decode,
             kda_recurrent_decode,
             kda_gated_norm,
@@ -294,6 +445,13 @@ impl KimiK3KdaLocalWorklet {
                 &name,
                 "o_proj",
                 resolved.o_proj.clone(),
+                SingleGemmKernel::build,
+                bridge,
+            )?,
+            o_proj_prefill: build_atomic(
+                &name,
+                "o_proj_prefill",
+                resolved.o_proj_prefill.clone(),
                 SingleGemmKernel::build,
                 bridge,
             )?,
@@ -312,8 +470,12 @@ impl KimiK3KdaLocalWorklet {
 
     pub fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
         let input_layernorm = self.input_layernorm.compile(builder);
+        let prefill_attn_res = self.prefill_attn_res.compile(builder);
         let qkvbfg_a_proj = self.qkvbfg_a_proj.compile(builder);
         let qkvbfg_a_proj_bfa = self.qkvbfg_a_proj_bfa.compile(builder);
+        let qkvbfg_a_proj_prefill = self.qkvbfg_a_proj_prefill.compile(builder);
+        let qkvbfg_a_proj_bfa_prefill = self.qkvbfg_a_proj_bfa_prefill.compile(builder);
+        let qkvbfg_f_b_prefill = self.qkvbfg_f_b_prefill.compile(builder);
         let qkvbfg = CostNode::Labeled {
             label: format!(
                 "{}.qkvbfg [wide qkvg + alternate-stream bfa GEMV]",
@@ -324,9 +486,25 @@ impl KimiK3KdaLocalWorklet {
                 children: vec![qkvbfg_a_proj, qkvbfg_a_proj_bfa],
             }),
         };
-        let mut children = vec![input_layernorm, qkvbfg];
+        let qkvbfg_prefill = CostNode::Labeled {
+            label: format!("{}.qkvbfg prefill [raw eager GEMMs]", self.name),
+            child: Box::new(CostNode::Max {
+                overlap: 1.0,
+                children: vec![qkvbfg_a_proj_prefill, qkvbfg_a_proj_bfa_prefill],
+            }),
+        };
+        let mut children = vec![
+            input_layernorm,
+            prefill_attn_res,
+            qkvbfg,
+            qkvbfg_prefill,
+            qkvbfg_f_b_prefill,
+        ];
         if let Some(kda_fused_decode) = &self.kda_fused_decode {
             children.push(kda_fused_decode.compile(builder));
+            children.push(self.kda_conv_prefill.compile(builder));
+            children.push(self.kda_chunk_prefill.compile(builder));
+            children.push(self.kda_gated_norm_prefill.compile(builder));
         } else {
             children.push(
                 self.kda_conv_decode
@@ -346,9 +524,13 @@ impl KimiK3KdaLocalWorklet {
                     .expect("BF16 KDA mode must build gated norm")
                     .compile(builder),
             );
+            children.push(self.kda_conv_prefill.compile(builder));
+            children.push(self.kda_chunk_prefill.compile(builder));
+            children.push(self.kda_gated_norm_prefill.compile(builder));
         }
         children.extend([
             self.o_proj.compile(builder),
+            self.o_proj_prefill.compile(builder),
             self.tp_allreduce_zero.compile(builder),
             self.post_attention_layernorm.compile(builder),
         ]);
@@ -362,28 +544,49 @@ impl KimiK3KdaLocalWorklet {
     }
 
     pub fn eval(&self, input: &KimiK3KdaLocalWorkletInput, evaluator: &mut Evaluator) {
+        let rows = phase_token_count(input.batch_tokens, &input.prefill_chunk_pairs);
+        let is_prefill = !input.prefill_chunk_pairs.is_empty();
         eval_atomic_or_zero(
             &self.input_layernorm,
-            ResidualRmsNormKernelInput {
-                m: input.batch_tokens,
-            },
-            input.batch_tokens == 0,
+            ResidualRmsNormKernelInput { m: rows },
+            rows == 0 || is_prefill,
+            evaluator,
+        );
+        eval_atomic_or_zero(
+            &self.prefill_attn_res,
+            K3AttnResPrefillKernelInput { num_tokens: rows },
+            rows == 0 || !is_prefill,
             evaluator,
         );
         eval_atomic_or_zero(
             &self.qkvbfg_a_proj,
-            SingleGemmKernelInput {
-                m: input.batch_tokens,
-            },
-            input.batch_tokens == 0,
+            SingleGemmKernelInput { m: rows },
+            rows == 0 || is_prefill,
             evaluator,
         );
         eval_atomic_or_zero(
             &self.qkvbfg_a_proj_bfa,
-            SingleGemmKernelInput {
-                m: input.batch_tokens,
-            },
-            input.batch_tokens == 0,
+            SingleGemmKernelInput { m: rows },
+            rows == 0 || is_prefill,
+            evaluator,
+        );
+        eval_atomic_or_zero(
+            &self.qkvbfg_a_proj_prefill,
+            SingleGemmKernelInput { m: rows },
+            rows == 0 || !is_prefill,
+            evaluator,
+        );
+        eval_atomic_or_zero(
+            &self.qkvbfg_a_proj_bfa_prefill,
+            SingleGemmKernelInput { m: rows },
+            rows == 0 || !is_prefill,
+            evaluator,
+        );
+        let prefill_rows = prefill_token_count(&input.prefill_chunk_pairs);
+        eval_atomic_or_zero(
+            &self.qkvbfg_f_b_prefill,
+            SingleGemmKernelInput { m: prefill_rows },
+            prefill_rows == 0,
             evaluator,
         );
         if let Some(kda_fused_decode) = &self.kda_fused_decode {
@@ -395,6 +598,7 @@ impl KimiK3KdaLocalWorklet {
                 input.decode_tokens == 0,
                 evaluator,
             );
+            eval_prefill(self, input, evaluator);
         } else {
             eval_atomic_or_zero(
                 self.kda_conv_decode
@@ -428,27 +632,30 @@ impl KimiK3KdaLocalWorklet {
                 input.decode_tokens == 0,
                 evaluator,
             );
+            eval_prefill(self, input, evaluator);
         }
         eval_atomic_or_zero(
             &self.o_proj,
-            SingleGemmKernelInput {
-                m: input.batch_tokens,
-            },
-            input.batch_tokens == 0,
+            SingleGemmKernelInput { m: rows },
+            rows == 0 || is_prefill,
+            evaluator,
+        );
+        eval_atomic_or_zero(
+            &self.o_proj_prefill,
+            SingleGemmKernelInput { m: rows },
+            rows == 0 || !is_prefill,
             evaluator,
         );
         self.tp_allreduce_zero.eval(
             &crate::timing::kernels::AllReduceKernelInput {
-                message_size_bytes: u64::from(input.batch_tokens) * u64::from(HIDDEN) * 2,
+                message_size_bytes: u64::from(rows) * u64::from(HIDDEN) * 2,
             },
             evaluator,
         );
         eval_atomic_or_zero(
             &self.post_attention_layernorm,
-            ResidualRmsNormKernelInput {
-                m: input.batch_tokens,
-            },
-            input.batch_tokens == 0,
+            ResidualRmsNormKernelInput { m: rows },
+            rows == 0 || is_prefill,
             evaluator,
         );
     }
@@ -479,6 +686,12 @@ fn validate_config(cfg: &KimiK3KdaLocalWorkletConfig) -> Result<(), String> {
     if cfg.gemm_backends.is_empty() {
         return Err("K3 KDA requires a non-empty GEMM backend list".to_string());
     }
+    if cfg.prefill_backends.is_empty() {
+        return Err("K3 KDA requires a non-empty prefill backend list".to_string());
+    }
+    if cfg.prefill_attn_res_backends.is_empty() {
+        return Err("K3 KDA requires a non-empty attention-residual backend list".to_string());
+    }
     if cfg.kda_state_dtype == DType::Fp32 && cfg.fused_decode_backends.is_empty() {
         return Err("K3 KDA FP32 state requires a fused decode backend".to_string());
     }
@@ -490,6 +703,108 @@ fn validate_config(cfg: &KimiK3KdaLocalWorkletConfig) -> Result<(), String> {
         return Err("K3 KDA BF16 state requires split decode backends".to_string());
     }
     Ok(())
+}
+
+fn prefill_token_count(pairs: &[(u32, u32)]) -> u32 {
+    pairs
+        .iter()
+        .try_fold(0_u32, |total, &(_prefix, append)| total.checked_add(append))
+        .expect("KDA prefill token count must fit u32")
+}
+
+fn phase_token_count(batch_tokens: u32, pairs: &[(u32, u32)]) -> u32 {
+    if pairs.is_empty() {
+        batch_tokens
+    } else {
+        prefill_token_count(pairs)
+    }
+}
+
+fn prefill_input(pairs: &[(u32, u32)]) -> Option<CausalConv1dPrefillKernelInput> {
+    if pairs.is_empty() {
+        return None;
+    }
+    let max_sequence_length = pairs
+        .iter()
+        .map(|&(_prefix, append)| append)
+        .max()
+        .expect("non-empty prefill pairs have an append length");
+    let prefix_len = pairs
+        .iter()
+        .map(|&(prefix, _append)| prefix)
+        .max()
+        .expect("non-empty prefill pairs have a prefix length");
+    Some(CausalConv1dPrefillKernelInput {
+        num_tokens: prefill_token_count(pairs),
+        max_sequence_length,
+        num_sequences: pairs.len() as u32,
+        prefix_len,
+    })
+}
+
+fn eval_prefill(
+    worklet: &KimiK3KdaLocalWorklet,
+    input: &KimiK3KdaLocalWorkletInput,
+    evaluator: &mut Evaluator,
+) {
+    let Some(conv_input) = prefill_input(&input.prefill_chunk_pairs) else {
+        eval_atomic_or_zero(
+            &worklet.kda_conv_prefill,
+            CausalConv1dPrefillKernelInput {
+                num_tokens: 0,
+                max_sequence_length: 0,
+                num_sequences: 0,
+                prefix_len: 0,
+            },
+            true,
+            evaluator,
+        );
+        eval_atomic_or_zero(
+            &worklet.kda_chunk_prefill,
+            KdaChunkPrefillKernelInput {
+                num_tokens: 0,
+                max_sequence_length: 0,
+                num_sequences: 0,
+                prefix_len: 0,
+            },
+            true,
+            evaluator,
+        );
+        eval_atomic_or_zero(
+            &worklet.kda_gated_norm_prefill,
+            GdnGatedRmsNormKernelInput { m: 0 },
+            true,
+            evaluator,
+        );
+        return;
+    };
+    eval_atomic_or_zero(
+        &worklet.kda_conv_prefill,
+        conv_input.clone(),
+        false,
+        evaluator,
+    );
+    eval_atomic_or_zero(
+        &worklet.kda_chunk_prefill,
+        KdaChunkPrefillKernelInput {
+            num_tokens: conv_input.num_tokens,
+            max_sequence_length: conv_input.max_sequence_length,
+            num_sequences: conv_input.num_sequences,
+            prefix_len: conv_input.prefix_len,
+        },
+        false,
+        evaluator,
+    );
+    let m = conv_input
+        .num_tokens
+        .checked_mul(worklet.resolved.raw_cfg.heads.get())
+        .expect("KDA gated norm row count must fit u32");
+    eval_atomic_or_zero(
+        &worklet.kda_gated_norm_prefill,
+        GdnGatedRmsNormKernelInput { m },
+        false,
+        evaluator,
+    );
 }
 
 #[cfg(test)]
@@ -507,11 +822,14 @@ mod tests {
             dtype: DType::Bf16,
             kda_state_dtype: DType::Bf16,
             gemm_backends: vec!["sglang_bf16_auto"],
+            prefill_gemm_backends: vec!["sglang_k3_raw_bf16"],
             fused_decode_backends: vec!["sglang_fused"],
+            prefill_backends: vec!["sglang_triton"],
             causal_conv_decode_backends: vec!["sglang_triton"],
             recurrent_decode_backends: vec!["sglang_triton"],
             gated_norm_backends: vec!["sglang_triton"],
             residual_norm_backends: vec!["vllm_cuda"],
+            prefill_attn_res_backends: vec!["sglang_k3"],
             tp_size: 8,
         }
     }
@@ -523,11 +841,15 @@ mod tests {
         assert_eq!(resolved.qkvbfg_a_proj.k, HIDDEN);
         assert_eq!(resolved.qkvbfg_a_proj_bfa.n, 144);
         assert_eq!(resolved.qkvbfg_a_proj_bfa.k, HIDDEN);
-        assert_eq!(SPLIT_SOURCE_ORDER.len(), 9);
+        assert_eq!(resolved.qkvbfg_f_b_prefill.n, 12 * HEAD_DIM);
+        assert_eq!(resolved.qkvbfg_f_b_prefill.k, HEAD_DIM);
+        assert_eq!(SPLIT_SOURCE_ORDER.len(), 17);
         assert!(resolved.kda_fused_decode.is_none());
         let conv = resolved.kda_conv_decode.as_ref().unwrap();
         assert_eq!(conv.channels, 3 * 12 * HEAD_DIM);
         assert_eq!(conv.state_dtype, DType::Bf16);
+        assert_eq!(resolved.kda_conv_prefill.channels, 3 * 12 * HEAD_DIM);
+        assert_eq!(resolved.kda_chunk_prefill.num_heads, 12);
         let recurrent = resolved.kda_recurrent_decode.as_ref().unwrap();
         assert_eq!(recurrent.num_heads, 12);
         assert_eq!(recurrent.head_k_dim, HEAD_DIM);
@@ -539,7 +861,7 @@ mod tests {
         let mut fp32 = config();
         fp32.kda_state_dtype = DType::Fp32;
         let resolved = KimiK3KdaLocalWorklet::resolve_config(&fp32);
-        assert_eq!(FUSED_SOURCE_ORDER.len(), 7);
+        assert_eq!(FUSED_SOURCE_ORDER.len(), 15);
         assert!(resolved.kda_conv_decode.is_none());
         assert!(resolved.kda_recurrent_decode.is_none());
         assert!(resolved.kda_gated_norm.is_none());
@@ -590,19 +912,29 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 "model.kda.input_layernorm",
+                "model.kda.attn_res_prefill",
                 "model.kda.qkvbfg_a_proj",
                 "model.kda.qkvbfg_a_proj_bfa",
+                "model.kda.qkvbfg_a_proj_prefill",
+                "model.kda.qkvbfg_a_proj_bfa_prefill",
+                "model.kda.qkvbfg_f_b_prefill",
                 "model.kda.kda_conv_decode",
                 "model.kda.kda_recurrent_decode",
                 "model.kda.kda_gated_norm",
+                "model.kda.kda_conv_prefill",
+                "model.kda.kda_chunk_prefill",
+                "model.kda.kda_gated_norm_prefill",
                 "model.kda.o_proj",
+                "model.kda.o_proj_prefill",
                 "model.kda.tp_allreduce_zero",
                 "model.kda.post_attention_layernorm",
             ]
         );
-        assert_eq!(split[3].1, "gdn_causal_conv_decode");
-        assert_eq!(split[4].1, "kda_recurrent_decode");
-        assert_eq!(split[5].1, "gdn_gated_rms_norm");
+        assert_eq!(split[7].1, "gdn_causal_conv_decode");
+        assert_eq!(split[8].1, "kda_recurrent_decode");
+        assert_eq!(split[9].1, "gdn_gated_rms_norm");
+        assert_eq!(split[10].1, "causal_conv1d_prefill");
+        assert_eq!(split[11].1, "kda_chunk_prefill");
 
         let mut fp32 = config();
         fp32.kda_state_dtype = DType::Fp32;
@@ -614,15 +946,23 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 "model.kda.input_layernorm",
+                "model.kda.attn_res_prefill",
                 "model.kda.qkvbfg_a_proj",
                 "model.kda.qkvbfg_a_proj_bfa",
+                "model.kda.qkvbfg_a_proj_prefill",
+                "model.kda.qkvbfg_a_proj_bfa_prefill",
+                "model.kda.qkvbfg_f_b_prefill",
                 "model.kda.kda_fused_decode",
+                "model.kda.kda_conv_prefill",
+                "model.kda.kda_chunk_prefill",
+                "model.kda.kda_gated_norm_prefill",
                 "model.kda.o_proj",
+                "model.kda.o_proj_prefill",
                 "model.kda.tp_allreduce_zero",
                 "model.kda.post_attention_layernorm",
             ]
         );
-        assert_eq!(fused[3].1, "kda_fused_decode");
+        assert_eq!(fused[7].1, "kda_fused_decode");
     }
 
     #[test]
@@ -630,9 +970,20 @@ mod tests {
         let input = KimiK3KdaLocalWorkletInput {
             batch_tokens: 17,
             decode_tokens: 5,
+            prefill_chunk_pairs: Vec::new(),
         };
         assert_eq!(input.batch_tokens, 17);
         assert_eq!(input.decode_tokens, 5);
         assert_eq!(KimiK3KdaLocalWorkletInput::default().decode_tokens, 0);
+    }
+
+    #[test]
+    fn prefill_input_selects_both_new_leaves_and_keeps_prefix_state() {
+        let input = prefill_input(&[(49_152, 16_384), (49_152, 16_384)]).unwrap();
+        assert_eq!(input.num_tokens, 32_768);
+        assert_eq!(input.max_sequence_length, 16_384);
+        assert_eq!(input.num_sequences, 2);
+        assert_eq!(input.prefix_len, 49_152);
+        assert!(prefill_input(&[]).is_none());
     }
 }

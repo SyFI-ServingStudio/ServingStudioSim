@@ -58,6 +58,12 @@ const MAX_MODEL_LEN: u32 = 1_048_576;
 const RESIDUAL_NORM_BACKENDS: &[&str] = &["vllm_cuda"];
 const RMS_NORM_BACKENDS: &[&str] = &["flashinfer"];
 const GEMM_BACKENDS: &[&str] = &["sglang_bf16_auto"];
+const K3_PREFILL_GEMM_BACKENDS: &[&str] = &["sglang_k3_raw_bf16"];
+const K3_PREFILL_FP32_GEMM_BACKENDS: &[&str] = &["sglang_k3_fp32_auto"];
+const K3_PREFILL_BF16_GEMM_BACKENDS: &[&str] = &["sglang_k3_raw_bf16"];
+const K3_PREFILL_ACTIVATION_BACKENDS: &[&str] = &["sglang_k3"];
+const K3_PREFILL_ADD3_BACKENDS: &[&str] = &["sglang_k3"];
+const K3_PREFILL_ATTN_RES_BACKENDS: &[&str] = &["sglang_k3"];
 const FUSED_QKV_A_BACKENDS: &[&str] = &["sglang_fused_a_auto"];
 const ABSORB_BACKENDS: &[&str] = &["sglang_k3_absorb"];
 const CACHE_APPEND_BACKENDS: &[&str] = &["sglang_cuda"];
@@ -66,9 +72,11 @@ const MLA_ATTENTION_BACKENDS: &[&str] =
     // the non-DCP default); the Triton split-KV path is a fallback sglang never
     // picks on Blackwell and its profiler is not yet stable -> not costed.
     &["sglang_cutedsl_mla", "sglang_trtllm_mla"];
+const MLA_PREFILL_ATTENTION_BACKENDS: &[&str] = &["sglang_trtllm_mla"];
 const KDA_FUSED_BACKENDS: &[&str] = &["sglang_fused"];
 const KDA_TRITON_BACKENDS: &[&str] = &["sglang_triton"];
 const MOE_BACKENDS: &[&str] = &["sglang_trtllm_mxfp4"];
+const MOE_PREFILL_BACKENDS: &[&str] = &["sglang_trtllm_mxfp4_prefill"];
 const ELEMENTWISE_BACKENDS: &[&str] = &["triton"];
 const LM_HEAD_BACKENDS: &[&str] = &["torch_linear"];
 
@@ -559,11 +567,14 @@ pub fn build_configs(
         dtype: DType::Bf16,
         kda_state_dtype: parallel.kda_state_dtype,
         gemm_backends: GEMM_BACKENDS.to_vec(),
+        prefill_gemm_backends: K3_PREFILL_GEMM_BACKENDS.to_vec(),
         fused_decode_backends: KDA_FUSED_BACKENDS.to_vec(),
+        prefill_backends: KDA_TRITON_BACKENDS.to_vec(),
         causal_conv_decode_backends: KDA_TRITON_BACKENDS.to_vec(),
         recurrent_decode_backends: KDA_TRITON_BACKENDS.to_vec(),
         gated_norm_backends: KDA_TRITON_BACKENDS.to_vec(),
         residual_norm_backends: RESIDUAL_NORM_BACKENDS.to_vec(),
+        prefill_attn_res_backends: K3_PREFILL_ATTN_RES_BACKENDS.to_vec(),
         tp_size: parallel.attn_tp_size,
     };
     let moe_cfg = || KimiK3MoeLocalWorkletConfig {
@@ -580,9 +591,14 @@ pub fn build_configs(
         ep_size: parallel.ep_size,
         dtype: DType::Bf16,
         gemm_backends: GEMM_BACKENDS.to_vec(),
+        prefill_gemm_backends: K3_PREFILL_FP32_GEMM_BACKENDS.to_vec(),
+        prefill_bf16_gemm_backends: K3_PREFILL_BF16_GEMM_BACKENDS.to_vec(),
+        prefill_activation_backends: K3_PREFILL_ACTIVATION_BACKENDS.to_vec(),
+        prefill_add3_backends: K3_PREFILL_ADD3_BACKENDS.to_vec(),
         elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
         rms_norm_backends: RMS_NORM_BACKENDS.to_vec(),
         moe_backends: MOE_BACKENDS.to_vec(),
+        prefill_moe_backends: MOE_PREFILL_BACKENDS.to_vec(),
     };
     let mla_cfg = || KimiK3MlaLocalWorkletConfig {
         gpu_name: gpu.clone(),
@@ -600,9 +616,13 @@ pub fn build_configs(
         rms_norm_backends: RMS_NORM_BACKENDS.to_vec(),
         fused_qkv_a_backends: FUSED_QKV_A_BACKENDS.to_vec(),
         projection_backends: GEMM_BACKENDS.to_vec(),
+        prefill_projection_backends: K3_PREFILL_GEMM_BACKENDS.to_vec(),
         absorb_backends: ABSORB_BACKENDS.to_vec(),
         cache_append_backends: CACHE_APPEND_BACKENDS.to_vec(),
         attention_backends: MLA_ATTENTION_BACKENDS.to_vec(),
+        prefill_attention_backends: MLA_PREFILL_ATTENTION_BACKENDS.to_vec(),
+        prefill_aux_backends: KDA_TRITON_BACKENDS.to_vec(),
+        prefill_attn_res_backends: K3_PREFILL_ATTN_RES_BACKENDS.to_vec(),
         elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
         tp_size: parallel.attn_tp_size,
     };
@@ -992,6 +1012,7 @@ impl KimiK3SglangModel {
             ffn.eval(
                 &KimiK3DenseLocalWorkletInput {
                     batch_tokens: normalized.ffn_tokens,
+                    prefill_chunk_pairs: normalized.prefill_chunk_pairs.clone(),
                 },
                 evaluator,
             );
@@ -1001,6 +1022,7 @@ impl KimiK3SglangModel {
             moe.eval(
                 &KimiK3MoeLocalWorkletInput {
                     num_tokens: normalized.ffn_tokens,
+                    prefill_chunk_pairs: normalized.prefill_chunk_pairs.clone(),
                 },
                 evaluator,
             );
@@ -1010,6 +1032,7 @@ impl KimiK3SglangModel {
             moe.eval(
                 &KimiK3MoeLocalWorkletInput {
                     num_tokens: normalized.ffn_tokens,
+                    prefill_chunk_pairs: normalized.prefill_chunk_pairs.clone(),
                 },
                 evaluator,
             );
@@ -1037,6 +1060,7 @@ impl KimiK3SglangModel {
 struct NormalizedInput {
     ffn_tokens: u32,
     request_count: u32,
+    prefill_chunk_pairs: Vec<(u32, u32)>,
     kda_attention: KimiK3KdaLocalWorkletInput,
     mla_attention: KimiK3MlaLocalWorkletInput,
 }
@@ -1079,6 +1103,7 @@ fn normalize_input(
 
     let mut ffn_tokens = 0_u32;
     let mut request_count = 0_u32;
+    let mut prefill_chunk_pairs = Vec::new();
     let mut critical_index = 0_usize;
     for (index, group) in input.groups.iter().enumerate() {
         let prefill_tokens =
@@ -1102,6 +1127,7 @@ fn normalize_input(
                     sum.checked_add(append)
                         .ok_or_else(|| format!("group {index} prefill token overflow"))
                 })?;
+        prefill_chunk_pairs.extend_from_slice(&group.prefill_chunk_pairs);
         if group.prefill_tokens != prefill_tokens {
             return Err(format!(
                 "group {index} prefill_tokens {} must equal append sum {prefill_tokens}",
@@ -1157,13 +1183,16 @@ fn normalize_input(
     Ok(NormalizedInput {
         ffn_tokens,
         request_count,
+        prefill_chunk_pairs: prefill_chunk_pairs.clone(),
         kda_attention: KimiK3KdaLocalWorkletInput {
             batch_tokens: critical.batch_tokens,
             decode_tokens: critical.decode_kv_lens.len() as u32,
+            prefill_chunk_pairs: critical.prefill_chunk_pairs.clone(),
         },
         mla_attention: KimiK3MlaLocalWorkletInput {
             batch_tokens: critical.batch_tokens,
             decode_kv_lens: critical.decode_kv_lens.clone(),
+            prefill_chunk_pairs: critical.prefill_chunk_pairs.clone(),
         },
     })
 }
@@ -1438,61 +1467,98 @@ mod tests {
         let enumerated = build("unified".into(), resolve_configs(&configs), &bridge).unwrap();
         let tree = enumerated.cost_tree();
         let names: Vec<&str> = tree.slots.iter().map(|slot| slot.name.as_str()).collect();
-        assert_eq!(tree.n_slots(), 54);
+        assert_eq!(tree.n_slots(), 91);
         assert_eq!(
             names,
             [
                 "unified.embedding",
                 "unified.dense.attention.input_layernorm",
+                "unified.dense.attention.attn_res_prefill",
                 "unified.dense.attention.qkvbfg_a_proj",
                 "unified.dense.attention.qkvbfg_a_proj_bfa",
+                "unified.dense.attention.qkvbfg_a_proj_prefill",
+                "unified.dense.attention.qkvbfg_a_proj_bfa_prefill",
+                "unified.dense.attention.qkvbfg_f_b_prefill",
                 "unified.dense.attention.kda_conv_decode",
                 "unified.dense.attention.kda_recurrent_decode",
                 "unified.dense.attention.kda_gated_norm",
+                "unified.dense.attention.kda_conv_prefill",
+                "unified.dense.attention.kda_chunk_prefill",
+                "unified.dense.attention.kda_gated_norm_prefill",
                 "unified.dense.attention.o_proj",
+                "unified.dense.attention.o_proj_prefill",
                 "unified.dense.attention.tp_allreduce_zero",
                 "unified.dense.attention.post_attention_layernorm",
                 "unified.dense.ffn.gate_up",
                 "unified.dense.ffn.situ",
                 "unified.dense.ffn.down",
                 "unified.kda.attention.input_layernorm",
+                "unified.kda.attention.attn_res_prefill",
                 "unified.kda.attention.qkvbfg_a_proj",
                 "unified.kda.attention.qkvbfg_a_proj_bfa",
+                "unified.kda.attention.qkvbfg_a_proj_prefill",
+                "unified.kda.attention.qkvbfg_a_proj_bfa_prefill",
+                "unified.kda.attention.qkvbfg_f_b_prefill",
                 "unified.kda.attention.kda_conv_decode",
                 "unified.kda.attention.kda_recurrent_decode",
                 "unified.kda.attention.kda_gated_norm",
+                "unified.kda.attention.kda_conv_prefill",
+                "unified.kda.attention.kda_chunk_prefill",
+                "unified.kda.attention.kda_gated_norm_prefill",
                 "unified.kda.attention.o_proj",
+                "unified.kda.attention.o_proj_prefill",
                 "unified.kda.attention.tp_allreduce_zero",
                 "unified.kda.attention.post_attention_layernorm",
                 "unified.kda.moe.merged_front",
+                "unified.kda.moe.merged_front_prefill",
                 "unified.kda.moe.shared_gate_up_activation",
+                "unified.kda.moe.shared_gate_up_activation_prefill",
                 "unified.kda.moe.shared_down",
+                "unified.kda.moe.shared_down_prefill",
                 "unified.kda.moe.mxfp4_fused_moe",
+                "unified.kda.moe.mxfp4_fused_moe_prefill",
                 "unified.kda.moe.routed_norm",
                 "unified.kda.moe.latent_up",
+                "unified.kda.moe.latent_up_prefill",
                 "unified.kda.moe.add3",
+                "unified.kda.moe.add3_prefill",
                 "unified.kda.moe.ep_alltoall_zero",
                 "unified.mla.attention.input_layernorm",
+                "unified.mla.attention.attn_res_prefill",
                 "unified.mla.attention.fused_qkv_a_proj",
                 "unified.mla.attention.q_a_layernorm",
                 "unified.mla.attention.q_b_proj",
+                "unified.mla.attention.q_b_proj_prefill",
                 "unified.mla.attention.kv_a_layernorm",
                 "unified.mla.attention.q_absorb",
                 "unified.mla.attention.mla_cache_append",
                 "unified.mla.attention.mla_decode_attention",
                 "unified.mla.attention.v_up",
+                "unified.mla.attention.mla_prefix_gather",
+                "unified.mla.attention.mla_kv_b_proj_prefill",
+                "unified.mla.attention.mla_prefill_attention_prefix",
+                "unified.mla.attention.mla_prefill_attention_causal",
+                "unified.mla.attention.mla_merge_state",
                 "unified.mla.attention.output_gate",
+                "unified.mla.attention.output_gate_prefill",
                 "unified.mla.attention.sigmoid_mul",
                 "unified.mla.attention.o_proj",
+                "unified.mla.attention.o_proj_prefill",
                 "unified.mla.attention.tp_allreduce_zero",
                 "unified.mla.attention.post_attention_layernorm",
                 "unified.mla.moe.merged_front",
+                "unified.mla.moe.merged_front_prefill",
                 "unified.mla.moe.shared_gate_up_activation",
+                "unified.mla.moe.shared_gate_up_activation_prefill",
                 "unified.mla.moe.shared_down",
+                "unified.mla.moe.shared_down_prefill",
                 "unified.mla.moe.mxfp4_fused_moe",
+                "unified.mla.moe.mxfp4_fused_moe_prefill",
                 "unified.mla.moe.routed_norm",
                 "unified.mla.moe.latent_up",
+                "unified.mla.moe.latent_up_prefill",
                 "unified.mla.moe.add3",
+                "unified.mla.moe.add3_prefill",
                 "unified.mla.moe.ep_alltoall_zero",
                 "unified.final_norm",
                 "unified.lm_head",

@@ -70,6 +70,7 @@ def profile_single_gemm_sglang_bf16(
     try:
         import torch
         import torch.nn.functional as functional
+        import torch.nn.functional as functional
         from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import (
             cutedsl_bf16_gemm,
             use_cutedsl_bf16_gemm,
@@ -142,5 +143,54 @@ def profile_single_gemm_sglang_fused_a(
 
         elements = activations.numel() + weight.numel() + m * n
         return _measure(kernel, m, n, k, dtype, elements)
+    except RuntimeError as exc:
+        raise KernelLaunchFailed(str(exc)) from exc
+
+
+def profile_single_gemm_sglang_k3_raw_bf16(
+    m: int,
+    n: int,
+    k: int,
+    dtype: DType | str,
+) -> ComputeMetrics:
+    """Profile K3's eager raw BF16 module-projection path.
+
+    K3's chunked-prefill path deliberately bypasses the module GEMM dispatcher
+    for several merged and deferred projections.  This backend keeps that
+    eager path separate from the decode CuTe-DSL backend while retaining the
+    shared ``single_gemm`` cache schema.
+    """
+    _validate_shape(m, n, k)
+    dtype = DType.from_value(dtype)
+    if dtype is not DType.BF16:
+        raise ValueError(f"K3 raw BF16 GEMM requires bf16, got {dtype.value}")
+
+    try:
+        import torch
+        import torch.nn.functional as functional
+    except ImportError as exc:
+        raise ProfilerNotImplemented("the SGLang environment is required") from exc
+
+    _require_sm100("sglang_k3_raw_bf16")
+    try:
+        generator = torch.Generator(device="cuda").manual_seed(31)
+        activations = torch.randn(m, k, dtype=torch.bfloat16, device="cuda", generator=generator)
+        weight = torch.randn(n, k, dtype=torch.bfloat16, device="cuda", generator=generator)
+
+        def kernel():
+            # K3's module projections use F.linear when the production
+            # dispatcher is not initialized for CuTe-DSL. Its cuBLAS
+            # heuristic/layout differs from torch.mm(..., out=...), so keep
+            # the isolated leaf on the same callable.
+            return functional.linear(activations, weight)
+
+        return _measure(
+            kernel,
+            m,
+            n,
+            k,
+            dtype,
+            activations.numel() + weight.numel() + m * n,
+        )
     except RuntimeError as exc:
         raise KernelLaunchFailed(str(exc)) from exc

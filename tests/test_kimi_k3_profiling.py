@@ -17,7 +17,24 @@ def test_k3_kinds_and_backends_are_registered_without_runner_imports():
         "sglang_trtllm_mla",
         "sglang_triton",
     }
-    assert set(known_backends("mxfp4_fused_moe")) == {"sglang_trtllm_mxfp4"}
+    assert set(known_backends("mxfp4_fused_moe")) == {
+        "sglang_trtllm_mxfp4",
+        "sglang_trtllm_mxfp4_prefill",
+    }
+    assert set(known_backends("causal_conv1d_prefill")) == {"sglang_triton"}
+    assert set(known_backends("kda_chunk_prefill")) == {"sglang_triton"}
+    assert set(known_backends("mla_prefill_attention")) == {"sglang_trtllm_mla"}
+    assert set(known_backends("mla_prefix_gather")) == {"sglang_triton"}
+    assert set(known_backends("mla_merge_state")) == {"sglang_triton"}
+    assert set(known_backends("k3_situ_and_mul_prefill")) == {"sglang_k3"}
+    assert set(known_backends("k3_add3_prefill")) == {"sglang_k3"}
+    assert set(known_backends("k3_attn_res_prefill")) == {"sglang_k3"}
+    for kind, backend in (
+        ("single_gemm", "sglang_k3_raw_bf16"),
+        ("gemm_fp32_output", "sglang_k3_fp32_auto"),
+        ("mxfp4_fused_moe", "sglang_trtllm_mxfp4_prefill"),
+    ):
+        assert find_kernel_profiler_spec(kind, backend).subprocess_env == "sglang_k3_env"
     for kind in (
         "kda_recurrent_decode",
         "kda_fused_decode",

@@ -8,7 +8,10 @@
 use crate::op::Op;
 use crate::timing::bridge::DType;
 use crate::timing::kernels::{
-    ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput, Mxfp4FusedMoeKernel,
+    ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput, GemmFp32OutputKernel,
+    GemmFp32OutputKernelConfig, GemmFp32OutputKernelInput, K3Add3PrefillKernel,
+    K3Add3PrefillKernelConfig, K3Add3PrefillKernelInput, K3SituAndMulPrefillKernel,
+    K3SituAndMulPrefillKernelConfig, K3SituAndMulPrefillKernelInput, Mxfp4FusedMoeKernel,
     Mxfp4FusedMoeKernelConfig, Mxfp4FusedMoeKernelInput, RmsNormKernel, RmsNormKernelConfig,
     RmsNormKernelInput, SingleGemmKernel, SingleGemmKernelConfig, SingleGemmKernelInput,
 };
@@ -34,14 +37,20 @@ const SHARED_INTERMEDIATE: u32 = 6_144;
 // production global routing path.
 
 #[cfg(test)]
-const SOURCE_ORDER: [&str; 8] = [
+const SOURCE_ORDER: [&str; 14] = [
     "merged_front",
+    "merged_front_prefill",
     "shared_gate_up_activation",
+    "shared_gate_up_activation_prefill",
     "shared_down",
+    "shared_down_prefill",
     "mxfp4_fused_moe",
+    "mxfp4_fused_moe_prefill",
     "routed_norm",
     "latent_up",
+    "latent_up_prefill",
     "add3",
+    "add3_prefill",
     "ep_alltoall_zero",
 ];
 
@@ -65,37 +74,55 @@ pub struct KimiK3MoeLocalWorkletConfig {
     pub ep_size: u16,
     pub dtype: DType,
     pub gemm_backends: Vec<&'static str>,
+    pub prefill_gemm_backends: Vec<&'static str>,
+    pub prefill_bf16_gemm_backends: Vec<&'static str>,
+    pub prefill_activation_backends: Vec<&'static str>,
+    pub prefill_add3_backends: Vec<&'static str>,
     pub elementwise_backends: Vec<&'static str>,
     pub rms_norm_backends: Vec<&'static str>,
     pub moe_backends: Vec<&'static str>,
+    pub prefill_moe_backends: Vec<&'static str>,
 }
 
 #[derive(Clone, Debug)]
 pub struct KimiK3MoeLocalWorkletResolved {
     pub raw_cfg: KimiK3MoeLocalWorkletConfig,
     pub merged_front: SingleGemmKernelConfig,
+    pub merged_front_prefill: GemmFp32OutputKernelConfig,
     pub shared_gate_up_activation: ElementwiseKernelConfig,
+    pub shared_gate_up_activation_prefill: K3SituAndMulPrefillKernelConfig,
     pub shared_down: SingleGemmKernelConfig,
+    pub shared_down_prefill: SingleGemmKernelConfig,
     pub mxfp4_fused_moe: Mxfp4FusedMoeKernelConfig,
+    pub mxfp4_fused_moe_prefill: Mxfp4FusedMoeKernelConfig,
     pub routed_norm: RmsNormKernelConfig,
     pub latent_up: SingleGemmKernelConfig,
+    pub latent_up_prefill: SingleGemmKernelConfig,
     pub add3: ElementwiseKernelConfig,
+    pub add3_prefill: K3Add3PrefillKernelConfig,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct KimiK3MoeLocalWorkletInput {
     pub num_tokens: u32,
+    pub prefill_chunk_pairs: Vec<(u32, u32)>,
 }
 
 pub struct KimiK3MoeLocalWorklet {
     pub name: String,
     pub merged_front: Op<SingleGemmKernel>,
+    pub merged_front_prefill: Op<GemmFp32OutputKernel>,
     pub shared_gate_up_activation: Op<ElementwiseKernel>,
+    pub shared_gate_up_activation_prefill: Op<K3SituAndMulPrefillKernel>,
     pub shared_down: Op<SingleGemmKernel>,
+    pub shared_down_prefill: Op<SingleGemmKernel>,
     pub mxfp4_fused_moe: Op<Mxfp4FusedMoeKernel>,
+    pub mxfp4_fused_moe_prefill: Op<Mxfp4FusedMoeKernel>,
     pub routed_norm: Op<RmsNormKernel>,
     pub latent_up: Op<SingleGemmKernel>,
+    pub latent_up_prefill: Op<SingleGemmKernel>,
     pub add3: Op<ElementwiseKernel>,
+    pub add3_prefill: Op<K3Add3PrefillKernel>,
     pub ep_alltoall_zero: Op<ZeroMoeAlltoallProbe>,
     resolved: KimiK3MoeLocalWorkletResolved,
 }
@@ -106,6 +133,8 @@ impl KimiK3MoeLocalWorklet {
             .unwrap_or_else(|reason| panic!("invalid KimiK3MoeLocalWorkletConfig: {reason}"));
         let merged_front_n =
             2 * cfg.shared_intermediate.get() + cfg.num_experts.get() + cfg.latent_hidden.get();
+        let merged_front_prefill_n =
+            2 * cfg.shared_intermediate.get() + cfg.routing_experts.get() + cfg.latent_hidden.get();
         let measured_routing = cfg.routing_histogram.is_some();
         let analytic_rank_local_routing = !measured_routing
             && cfg.routing_experts.get() == cfg.local_experts.get()
@@ -132,11 +161,27 @@ impl KimiK3MoeLocalWorklet {
                 k: cfg.hidden.clone(),
                 dtype: cfg.dtype,
             },
+            merged_front_prefill: GemmFp32OutputKernelConfig {
+                backends: cfg.prefill_gemm_backends.clone(),
+                gpu_name: cfg.gpu_name.clone(),
+                n: merged_front_prefill_n.into(),
+                k: cfg.hidden.clone(),
+                input_dtype: cfg.dtype,
+            },
             shared_gate_up_activation: ElementwiseKernelConfig {
                 backends: cfg.elementwise_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
                 input_bytes_per_token: (2 * cfg.shared_intermediate.get() * 2).into(),
                 output_bytes_per_token: (cfg.shared_intermediate.get() * 2).into(),
+            },
+            shared_gate_up_activation_prefill: K3SituAndMulPrefillKernelConfig {
+                backends: cfg.prefill_activation_backends.clone(),
+                gpu_name: cfg.gpu_name.clone(),
+                hidden_size: cfg.shared_intermediate.clone(),
+                input_dtype: DType::Fp32,
+                output_dtype: cfg.dtype,
+                beta: 4,
+                linear_beta: 25,
             },
             shared_down: SingleGemmKernelConfig {
                 backends: cfg.gemm_backends.clone(),
@@ -145,8 +190,38 @@ impl KimiK3MoeLocalWorklet {
                 k: cfg.shared_intermediate.clone(),
                 dtype: cfg.dtype,
             },
+            shared_down_prefill: SingleGemmKernelConfig {
+                backends: cfg.prefill_bf16_gemm_backends.clone(),
+                gpu_name: cfg.gpu_name.clone(),
+                n: cfg.hidden.clone(),
+                k: cfg.shared_intermediate.clone(),
+                dtype: cfg.dtype,
+            },
             mxfp4_fused_moe: Mxfp4FusedMoeKernelConfig {
                 backends: cfg.moe_backends.clone(),
+                gpu_name: cfg.gpu_name.clone(),
+                hidden_size: cfg.latent_hidden.clone(),
+                intermediate_size: cfg.moe_intermediate.clone(),
+                num_experts: cfg.routing_experts.clone(),
+                num_local_experts: cfg.local_experts.clone(),
+                top_k: cfg.top_k,
+                input_dtype: cfg.dtype,
+                weight_format: "mxfp4_e2m1_ue8m0".to_string(),
+                group_size: 32,
+                routing_method: "deepseek_v3_sigmoid".to_string(),
+                activation: "situ".to_string(),
+                n_group: 1,
+                topk_group: 1,
+                routed_scaling_numerator: 1,
+                routed_scaling_denominator: 1,
+                gemm1_alpha: 4,
+                gemm1_clamp_limit: 25,
+                layerwise_global_ppm: vec![ppm.clone()],
+                folded_rank_position: 0,
+                stochastic_routing: analytic_rank_local_routing || measured_routing,
+            },
+            mxfp4_fused_moe_prefill: Mxfp4FusedMoeKernelConfig {
+                backends: cfg.prefill_moe_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
                 hidden_size: cfg.latent_hidden.clone(),
                 intermediate_size: cfg.moe_intermediate.clone(),
@@ -181,11 +256,24 @@ impl KimiK3MoeLocalWorklet {
                 k: cfg.latent_hidden.clone(),
                 dtype: cfg.dtype,
             },
+            latent_up_prefill: SingleGemmKernelConfig {
+                backends: cfg.prefill_bf16_gemm_backends.clone(),
+                gpu_name: cfg.gpu_name.clone(),
+                n: cfg.hidden.clone(),
+                k: cfg.latent_hidden.clone(),
+                dtype: cfg.dtype,
+            },
             add3: ElementwiseKernelConfig {
                 backends: cfg.elementwise_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
                 input_bytes_per_token: (3 * cfg.hidden.get() * 2).into(),
                 output_bytes_per_token: (cfg.hidden.get() * 2).into(),
+            },
+            add3_prefill: K3Add3PrefillKernelConfig {
+                backends: cfg.prefill_add3_backends.clone(),
+                gpu_name: cfg.gpu_name.clone(),
+                hidden_size: cfg.hidden.clone(),
+                dtype: cfg.dtype,
             },
             raw_cfg: cfg.clone(),
         }
@@ -212,11 +300,25 @@ impl KimiK3MoeLocalWorklet {
                 SingleGemmKernel::build,
                 bridge,
             )?,
+            merged_front_prefill: build_atomic(
+                &name,
+                "merged_front_prefill",
+                resolved.merged_front_prefill.clone(),
+                GemmFp32OutputKernel::build,
+                bridge,
+            )?,
             shared_gate_up_activation: build_atomic(
                 &name,
                 "shared_gate_up_activation",
                 resolved.shared_gate_up_activation.clone(),
                 ElementwiseKernel::build,
+                bridge,
+            )?,
+            shared_gate_up_activation_prefill: build_atomic(
+                &name,
+                "shared_gate_up_activation_prefill",
+                resolved.shared_gate_up_activation_prefill.clone(),
+                K3SituAndMulPrefillKernel::build,
                 bridge,
             )?,
             shared_down: build_atomic(
@@ -226,10 +328,24 @@ impl KimiK3MoeLocalWorklet {
                 SingleGemmKernel::build,
                 bridge,
             )?,
+            shared_down_prefill: build_atomic(
+                &name,
+                "shared_down_prefill",
+                resolved.shared_down_prefill.clone(),
+                SingleGemmKernel::build,
+                bridge,
+            )?,
             mxfp4_fused_moe: build_atomic(
                 &name,
                 "mxfp4_fused_moe",
                 resolved.mxfp4_fused_moe.clone(),
+                Mxfp4FusedMoeKernel::build,
+                bridge,
+            )?,
+            mxfp4_fused_moe_prefill: build_atomic(
+                &name,
+                "mxfp4_fused_moe_prefill",
+                resolved.mxfp4_fused_moe_prefill.clone(),
                 Mxfp4FusedMoeKernel::build,
                 bridge,
             )?,
@@ -247,11 +363,25 @@ impl KimiK3MoeLocalWorklet {
                 SingleGemmKernel::build,
                 bridge,
             )?,
+            latent_up_prefill: build_atomic(
+                &name,
+                "latent_up_prefill",
+                resolved.latent_up_prefill.clone(),
+                SingleGemmKernel::build,
+                bridge,
+            )?,
             add3: build_atomic(
                 &name,
                 "add3",
                 resolved.add3.clone(),
                 ElementwiseKernel::build,
+                bridge,
+            )?,
+            add3_prefill: build_atomic(
+                &name,
+                "add3_prefill",
+                resolved.add3_prefill.clone(),
+                K3Add3PrefillKernel::build,
                 bridge,
             )?,
             ep_alltoall_zero,
@@ -268,41 +398,72 @@ impl KimiK3MoeLocalWorklet {
             ),
             child: Box::new(CostNode::Sum(vec![
                 self.merged_front.compile(builder),
+                self.merged_front_prefill.compile(builder),
                 self.shared_gate_up_activation.compile(builder),
+                self.shared_gate_up_activation_prefill.compile(builder),
                 self.shared_down.compile(builder),
+                self.shared_down_prefill.compile(builder),
                 self.mxfp4_fused_moe.compile(builder),
+                self.mxfp4_fused_moe_prefill.compile(builder),
                 self.routed_norm.compile(builder),
                 self.latent_up.compile(builder),
+                self.latent_up_prefill.compile(builder),
                 self.add3.compile(builder),
+                self.add3_prefill.compile(builder),
                 self.ep_alltoall_zero.compile(builder),
             ])),
         }
     }
 
     pub fn eval(&self, input: &KimiK3MoeLocalWorkletInput, evaluator: &mut Evaluator) {
-        let rows = input.num_tokens;
+        let is_prefill = !input.prefill_chunk_pairs.is_empty();
+        let rows = phase_token_count(input.num_tokens, &input.prefill_chunk_pairs);
         eval_atomic_or_zero(
             &self.merged_front,
             SingleGemmKernelInput { m: rows },
-            rows == 0,
+            rows == 0 || is_prefill,
+            evaluator,
+        );
+        eval_atomic_or_zero(
+            &self.merged_front_prefill,
+            GemmFp32OutputKernelInput { m: rows },
+            rows == 0 || !is_prefill,
             evaluator,
         );
         eval_atomic_or_zero(
             &self.shared_gate_up_activation,
             ElementwiseKernelInput { num_tokens: rows },
-            rows == 0,
+            rows == 0 || is_prefill,
+            evaluator,
+        );
+        eval_atomic_or_zero(
+            &self.shared_gate_up_activation_prefill,
+            K3SituAndMulPrefillKernelInput { num_tokens: rows },
+            rows == 0 || !is_prefill,
             evaluator,
         );
         eval_atomic_or_zero(
             &self.shared_down,
             SingleGemmKernelInput { m: rows },
-            rows == 0,
+            rows == 0 || is_prefill,
+            evaluator,
+        );
+        eval_atomic_or_zero(
+            &self.shared_down_prefill,
+            SingleGemmKernelInput { m: rows },
+            rows == 0 || !is_prefill,
             evaluator,
         );
         eval_atomic_or_zero(
             &self.mxfp4_fused_moe,
             Mxfp4FusedMoeKernelInput { num_tokens: rows },
-            rows == 0,
+            rows == 0 || is_prefill,
+            evaluator,
+        );
+        eval_atomic_or_zero(
+            &self.mxfp4_fused_moe_prefill,
+            Mxfp4FusedMoeKernelInput { num_tokens: rows },
+            rows == 0 || !is_prefill,
             evaluator,
         );
         eval_atomic_or_zero(
@@ -314,13 +475,25 @@ impl KimiK3MoeLocalWorklet {
         eval_atomic_or_zero(
             &self.latent_up,
             SingleGemmKernelInput { m: rows },
-            rows == 0,
+            rows == 0 || is_prefill,
+            evaluator,
+        );
+        eval_atomic_or_zero(
+            &self.latent_up_prefill,
+            SingleGemmKernelInput { m: rows },
+            rows == 0 || !is_prefill,
             evaluator,
         );
         eval_atomic_or_zero(
             &self.add3,
             ElementwiseKernelInput { num_tokens: rows },
-            rows == 0,
+            rows == 0 || is_prefill,
+            evaluator,
+        );
+        eval_atomic_or_zero(
+            &self.add3_prefill,
+            K3Add3PrefillKernelInput { num_tokens: rows },
+            rows == 0 || !is_prefill,
             evaluator,
         );
         self.ep_alltoall_zero.eval(
@@ -331,6 +504,16 @@ impl KimiK3MoeLocalWorklet {
             evaluator,
         );
     }
+}
+
+fn phase_token_count(batch_tokens: u32, pairs: &[(u32, u32)]) -> u32 {
+    if pairs.is_empty() {
+        return batch_tokens;
+    }
+    pairs
+        .iter()
+        .try_fold(0_u32, |total, &(_prefix, append)| total.checked_add(append))
+        .expect("Kimi-K3 MoE prefill token count must fit u32")
 }
 
 fn uniform_ppm(num_experts: u32) -> Vec<u32> {
@@ -387,6 +570,18 @@ fn validate_config(cfg: &KimiK3MoeLocalWorkletConfig) -> Result<(), String> {
     if cfg.dtype != DType::Bf16 {
         return Err("K3 MoE activations use bf16".to_string());
     }
+    if cfg.prefill_gemm_backends.is_empty() {
+        return Err("K3 MoE prefill requires a FP32-output GEMM backend".to_string());
+    }
+    if cfg.prefill_moe_backends.is_empty() {
+        return Err("K3 MoE prefill requires an MXFP4 backend".to_string());
+    }
+    if cfg.prefill_activation_backends.is_empty() {
+        return Err("K3 MoE prefill requires a SiTU activation backend".to_string());
+    }
+    if cfg.prefill_add3_backends.is_empty() {
+        return Err("K3 MoE prefill requires an add3 backend".to_string());
+    }
     Ok(())
 }
 
@@ -409,29 +604,49 @@ mod tests {
             ep_size: 8,
             dtype: DType::Bf16,
             gemm_backends: vec!["sglang_bf16_auto"],
+            prefill_gemm_backends: vec!["sglang_k3_fp32_auto"],
+            prefill_bf16_gemm_backends: vec!["sglang_k3_raw_bf16"],
+            prefill_activation_backends: vec!["sglang_k3"],
+            prefill_add3_backends: vec!["sglang_k3"],
             elementwise_backends: vec!["triton"],
             rms_norm_backends: vec!["flashinfer"],
             moe_backends: vec!["sglang_trtllm_mxfp4"],
+            prefill_moe_backends: vec!["sglang_trtllm_mxfp4_prefill"],
         }
     }
 
     #[test]
     fn merged_front_and_expert_shapes_are_frozen() {
-        assert_eq!(SOURCE_ORDER.len(), 8);
+        assert_eq!(SOURCE_ORDER.len(), 14);
         let resolved = KimiK3MoeLocalWorklet::resolve_config(&config());
         assert_eq!(resolved.merged_front.n, 16_768);
         assert_eq!(resolved.merged_front.k, HIDDEN);
+        assert_eq!(resolved.merged_front_prefill.n, 16_768);
+        assert_eq!(resolved.merged_front_prefill.k, HIDDEN);
         assert_eq!(resolved.shared_down.k, 6_144);
         assert_eq!(resolved.shared_down.n, HIDDEN);
+        assert_eq!(
+            resolved.shared_gate_up_activation_prefill.hidden_size,
+            6_144
+        );
+        assert_eq!(
+            resolved.shared_gate_up_activation_prefill.backends,
+            vec!["sglang_k3"]
+        );
         assert_eq!(resolved.mxfp4_fused_moe.hidden_size, LATENT_HIDDEN);
         assert_eq!(resolved.mxfp4_fused_moe.intermediate_size, MOE_INTERMEDIATE);
         assert_eq!(resolved.mxfp4_fused_moe.num_experts, NUM_EXPERTS);
         assert_eq!(resolved.mxfp4_fused_moe.num_local_experts, 112);
         assert_eq!(resolved.mxfp4_fused_moe.top_k, TOP_K);
         assert!(!resolved.mxfp4_fused_moe.stochastic_routing);
+        assert_eq!(
+            resolved.mxfp4_fused_moe_prefill.backends,
+            vec!["sglang_trtllm_mxfp4_prefill"]
+        );
         assert_eq!(resolved.routed_norm.hidden, LATENT_HIDDEN);
         assert_eq!(resolved.latent_up.k, LATENT_HIDDEN);
         assert_eq!(resolved.latent_up.n, HIDDEN);
+        assert_eq!(resolved.add3_prefill.hidden_size, HIDDEN);
     }
 
     #[test]
@@ -466,11 +681,25 @@ mod tests {
         assert!(resolved.mxfp4_fused_moe.stochastic_routing);
         assert_eq!(resolved.mxfp4_fused_moe.num_experts, 112);
         assert_eq!(resolved.mxfp4_fused_moe.top_k, 2);
+        assert_eq!(resolved.merged_front_prefill.n, 15_984);
     }
 
     #[test]
     fn zero_tokens_still_have_a_stable_input_shape() {
         assert_eq!(KimiK3MoeLocalWorkletInput::default().num_tokens, 0);
-        assert_eq!(KimiK3MoeLocalWorkletInput { num_tokens: 32 }.num_tokens, 32);
+        assert_eq!(
+            KimiK3MoeLocalWorkletInput {
+                num_tokens: 32,
+                prefill_chunk_pairs: Vec::new(),
+            }
+            .num_tokens,
+            32
+        );
+    }
+
+    #[test]
+    fn prefill_front_is_selected_by_chunk_pairs() {
+        assert_eq!(phase_token_count(99, &[]), 99);
+        assert_eq!(phase_token_count(99, &[(49_152, 16_384)]), 16_384);
     }
 }

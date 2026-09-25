@@ -61,13 +61,10 @@ def _validate_args(**kwargs: Any) -> dict[str, Any]:
     if args["num_experts"] not in _SUPPORTED_NUM_EXPERTS:
         supported = ", ".join(str(value) for value in sorted(_SUPPORTED_NUM_EXPERTS))
         raise ValueError(
-            f"K3 MXFP4 requires num_experts in {{{supported}}}, "
-            f"got {args['num_experts']}"
+            f"K3 MXFP4 requires num_experts in {{{supported}}}, got {args['num_experts']}"
         )
     allowed_top_k = (
-        {_TOP_K}
-        if args["num_experts"] == _GLOBAL_NUM_EXPERTS
-        else {_RANK_LOCAL_TOP_K, _TOP_K}
+        {_TOP_K} if args["num_experts"] == _GLOBAL_NUM_EXPERTS else {_RANK_LOCAL_TOP_K, _TOP_K}
     )
     if args["top_k"] not in allowed_top_k:
         supported = ", ".join(str(value) for value in sorted(allowed_top_k))
@@ -85,8 +82,7 @@ def _validate_args(**kwargs: Any) -> dict[str, Any]:
         raise ValueError("K3 MXFP4 requires gemm1_alpha=4.0 and gemm1_clamp_limit=25.0")
     if len(args["per_expert_batches"]) != args["num_experts"]:
         raise ValueError(
-            "per_expert_batches must contain one count per routed expert "
-            f"({args['num_experts']})"
+            f"per_expert_batches must contain one count per routed expert ({args['num_experts']})"
         )
     exact_topk_ids(
         num_tokens=args["num_tokens"],
@@ -214,7 +210,7 @@ def _next_power_of_two(value: int) -> int:
     return 1 << (value - 1).bit_length()
 
 
-def profile_mxfp4_fused_moe(
+def _profile_mxfp4_fused_moe(
     num_tokens: int,
     hidden_size: int,
     intermediate_size: int,
@@ -232,8 +228,27 @@ def profile_mxfp4_fused_moe(
     gemm1_alpha: float,
     gemm1_clamp_limit: float,
     per_expert_batches: tuple[int, ...],
+    interval_union: bool,
 ) -> ComputeMetrics:
-    args = _validate_args(**locals())
+    args = _validate_args(
+        num_tokens=num_tokens,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        num_local_experts=num_local_experts,
+        top_k=top_k,
+        input_dtype=input_dtype,
+        weight_format=weight_format,
+        group_size=group_size,
+        routing_method=routing_method,
+        activation=activation,
+        n_group=n_group,
+        topk_group=topk_group,
+        routed_scaling_factor=routed_scaling_factor,
+        gemm1_alpha=gemm1_alpha,
+        gemm1_clamp_limit=gemm1_clamp_limit,
+        per_expert_batches=per_expert_batches,
+    )
     try:
         import torch
         from flashinfer.fused_moe import trtllm_fp4_block_scale_routed_moe
@@ -319,7 +334,7 @@ def profile_mxfp4_fused_moe(
 
         run_once()
         torch.cuda.synchronize(device)
-        time_ms = Timer.cupti(run_once, warmup=3, interval_union=True)
+        time_ms = Timer.cupti(run_once, warmup=3, interval_union=interval_union)
         energy_j = Energy.perf(run_once, warmup=5, per_iter_time_ms=time_ms)
     except torch.OutOfMemoryError as exc:
         raise OOMError("K3 MXFP4 fused MoE ran out of memory") from exc
@@ -348,4 +363,87 @@ def profile_mxfp4_fused_moe(
         tflops=flops / seconds / 1e12 if seconds else 0.0,
         memory_bandwidth_gbps=bytes_accessed / seconds / 1e9 if seconds else 0.0,
         energy_j=float(energy_j),
+    )
+
+
+def profile_mxfp4_fused_moe(
+    num_tokens: int,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    num_local_experts: int,
+    top_k: int,
+    input_dtype: DType | str,
+    weight_format: str,
+    group_size: int,
+    routing_method: str,
+    activation: str,
+    n_group: int,
+    topk_group: int,
+    routed_scaling_factor: float,
+    gemm1_alpha: float,
+    gemm1_clamp_limit: float,
+    per_expert_batches: tuple[int, ...],
+) -> ComputeMetrics:
+    return _profile_mxfp4_fused_moe(
+        num_tokens,
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        num_local_experts,
+        top_k,
+        input_dtype,
+        weight_format,
+        group_size,
+        routing_method,
+        activation,
+        n_group,
+        topk_group,
+        routed_scaling_factor,
+        gemm1_alpha,
+        gemm1_clamp_limit,
+        per_expert_batches,
+        interval_union=True,
+    )
+
+
+def profile_mxfp4_fused_moe_prefill(
+    num_tokens: int,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    num_local_experts: int,
+    top_k: int,
+    input_dtype: DType | str,
+    weight_format: str,
+    group_size: int,
+    routing_method: str,
+    activation: str,
+    n_group: int,
+    topk_group: int,
+    routed_scaling_factor: float,
+    gemm1_alpha: float,
+    gemm1_clamp_limit: float,
+    per_expert_batches: tuple[int, ...],
+) -> ComputeMetrics:
+    """Price all physical FlashInfer launches in an eager prefill layer."""
+    return _profile_mxfp4_fused_moe(
+        num_tokens,
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        num_local_experts,
+        top_k,
+        input_dtype,
+        weight_format,
+        group_size,
+        routing_method,
+        activation,
+        n_group,
+        topk_group,
+        routed_scaling_factor,
+        gemm1_alpha,
+        gemm1_clamp_limit,
+        per_expert_batches,
+        interval_union=False,
     )

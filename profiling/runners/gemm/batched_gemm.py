@@ -30,7 +30,7 @@ _V_HEAD_DIM = 256
 _PACKED_HEAD_WIDTH = _QK_NOPE_HEAD_DIM + _V_HEAD_DIM
 _H200_PADDED_HEADS = 64
 _K3_HEAD_COUNTS = frozenset({12, 96})
-_K3_ABSORB_SHAPES = frozenset({(128, 512), (512, 128)})
+_K3_ABSORB_SHAPES = frozenset({(128, 512), (512, 128), (512, 256)})
 
 
 @dataclass(frozen=True)
@@ -147,11 +147,14 @@ def _validate_k3_absorb_args(
         raise ValueError("num_batches, m, n, and k must be positive")
     if num_batches not in _K3_HEAD_COUNTS:
         raise ValueError(f"K3 absorb BMM requires heads in {sorted(_K3_HEAD_COUNTS)}")
-    # m = decode tokens in the batch (one per request): the absorb bmm is
-    # [heads, B, 128] @ [heads, 128, 512] (and [heads, B, 512] @ [heads, 512, 128]),
-    # so the cost tree sweeps m over the batch sizes; any positive m is valid.
+    # Decode uses [heads, B, 128] @ [heads, 128, 512] and
+    # [heads, B, 512] @ [heads, 512, 128]. Chunked-prefix MLA additionally
+    # projects cached latent rows with [heads, S, 512] @ [heads, 512, 256].
+    # Any positive m is valid for these shapes.
     if (k, n) not in _K3_ABSORB_SHAPES:
-        raise ValueError("K3 absorb BMM requires (k,n)=(128,512) or (512,128)")
+        raise ValueError(
+            "K3 absorb BMM requires (k,n) in {(128,512),(512,128),(512,256)}"
+        )
     if dtype is not DType.BF16:
         raise ValueError("K3 absorb BMM requires dtype=bf16")
     return *values, dtype
