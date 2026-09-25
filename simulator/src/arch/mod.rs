@@ -33,6 +33,10 @@ pub use contract::{
     IterwiseUnifiedModel, SpeculativeArchGroupInput, SpeculativeArchInput, SpeculativeDecodeInput,
     SpeculativeUnifiedModel, UnifiedArchInput,
 };
+pub use deepseek_v41_vllm::{
+    DeepseekV41ModelCfg, DeepseekV41VllmConfigs, DeepseekV41VllmModel, DeepseekV41VllmParallel,
+    DeepseekV41VllmResolved,
+};
 pub use deepseek_v4_vllm::{
     DeepseekV4ModelCfg, DeepseekV4VllmConfigs, DeepseekV4VllmModel, DeepseekV4VllmParallel,
     DeepseekV4VllmResolved,

@@ -76,8 +76,8 @@ pub enum RoutingKind {
 /// The `routing` choices the launcher schema advertises (mirror of [`RoutingKind`]).
 const ROUTING_KINDS: [&str; 4] = ["uniform", "random", "popularity", "corpus"];
 
-// Only the GLM-5.2 NVFP4 archs read a token corpus so far; the rest advertise
-// the marginal-backed kinds.
+// Only the GLM-5.2 NVFP4 and DeepSeek-V4.1 archs read a token corpus so far;
+// the rest advertise the marginal-backed kinds.
 const MARGINAL_ROUTING_KINDS: [&str; 3] = ["uniform", "random", "popularity"];
 
 // AFD FFN selectors do not yet accept popularity files.
@@ -282,6 +282,47 @@ pub enum IterArchSel {
         #[serde(default)]
         #[param(cache_key)]
         expert_popularity_file: Option<String>,
+    },
+    /// DeepSeek-V4.1-Flash at vLLM's physical kernel boundaries on B200: TP4
+    /// attention and EP4 experts over the same four ranks (deployment
+    /// invariants). Routed demand normally comes from the capture's token
+    /// corpus (`routing = corpus`), the demand its MoE rows were profiled on.
+    DeepseekV41Vllm {
+        #[serde(flatten)]
+        model: ModelSpec,
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS)]
+        routing: RoutingKind,
+        #[serde(default)]
+        routing_seed: Option<u64>,
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+        /// Recorded per-token expert routes from a `token_corpus` pass, as a
+        /// manifest path. Requires `routing = corpus`. All 40 routed layers
+        /// share one binding over the corpus's layer axis.
+        #[serde(default)]
+        #[param(cache_key)]
+        token_corpus_file: Option<String>,
+    },
+    /// The same DeepSeek-V4.1 kernels with the gated side streams (stage-A
+    /// input projections, the compressor aux stream, the shared expert)
+    /// serialized; the Engram lookups keep racing the main path. An explicit
+    /// alignment counterfactual, not a runtime knob on the production selector.
+    DeepseekV41VllmSerialStreams {
+        #[serde(flatten)]
+        model: ModelSpec,
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS)]
+        routing: RoutingKind,
+        #[serde(default)]
+        routing_seed: Option<u64>,
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+        #[serde(default)]
+        #[param(cache_key)]
+        token_corpus_file: Option<String>,
     },
     /// GLM-5.2's aligned vLLM execution graph with local TP1 attention and
     /// expert parallelism across the replica.
@@ -492,6 +533,8 @@ impl IterArchSel {
             | Self::Qwen3VllmMoeDpAttnEpFfn { model, .. }
             | Self::DeepseekV4Vllm { model, .. }
             | Self::DeepseekV4VllmSerialStreams { model, .. }
+            | Self::DeepseekV41Vllm { model, .. }
+            | Self::DeepseekV41VllmSerialStreams { model, .. }
             | Self::Glm52VllmDsaMoe { model, .. }
             | Self::Glm52VllmNvfp4DsaMoe { model, .. }
             | Self::Glm52VllmNvfp4DsaMoeSpeculative { model, .. }

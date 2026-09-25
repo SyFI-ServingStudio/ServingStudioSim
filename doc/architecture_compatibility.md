@@ -31,6 +31,8 @@ the graph that produced them.
 | `qwen3_attn_tp` + `qwen3_fp8_ffn_moe` | layer-wise AFD FP8 | attention TP workers plus a separately replicated EP FFN pool | distinct worker and scheduling contract |
 | `deepseek_v4_vllm` | vLLM-aligned FP4 MoE | fixed H200 EP4 in one NVLink domain, with four local-attention DP groups | canonical DeepSeek V4 graph |
 | `deepseek_v4_vllm_serial_streams` | the same kernels with source-level parallel regions serialized | same fixed layout as `deepseek_v4_vllm` | explicit alignment counterfactual; experimental |
+| `deepseek_v41_vllm` | vLLM-aligned MXFP4 MoE, MXFP8 dense GEMMs, Engram | fixed B200 TP4 attention with EP4 experts over the same four ranks; one attention group | canonical DeepSeek-V4.1-Flash graph; timing-predict only (no worker pairing yet) |
+| `deepseek_v41_vllm_serial_streams` | the same kernels with the gated side streams serialized | same fixed layout as `deepseek_v41_vllm` | explicit alignment counterfactual; experimental |
 | `glm52_vllm_dsa_moe` | vLLM-aligned BF16 or FP8 DSA/MoE | local TP1 attention replicated across configurable EP ranks; `nvl_num_gpu` divides `ep_size` | canonical replacement for `glm52_dsa_moe` |
 | `glm52_vllm_nvfp4_dsa_moe` | vLLM-aligned NVFP4 DSA/MoE | shared TP/EP rank group, with one attention group | distinct precision and parallel topology |
 | `glm52_vllm_nvfp4_dsa_moe_speculative` | vLLM-aligned NVFP4 target plus MTP draft passes | same TP/EP topology as the ordinary NVFP4 graph | distinct model and speculative-worker contract |

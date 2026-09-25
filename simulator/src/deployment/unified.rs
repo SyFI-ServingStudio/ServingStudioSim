@@ -426,6 +426,19 @@ impl Deployment for UnifiedDeployment {
                     &g.worker,
                 )
             }
+            IterArchSel::DeepseekV41Vllm { .. }
+            | IterArchSel::DeepseekV41VllmSerialStreams { .. } => {
+                // The model already satisfies the single-group TP contract the
+                // GLM-5.2 SGLang pure-TP arch runs on `hp_unified` /
+                // `chunked_prefill` (one attention group, four shards); pairing is
+                // one `assemble_hp_or_chunked_flow` call over
+                // `arch_build::deepseek_v41_vllm`, pending validation of its KV
+                // capacity accounting (per-token compressed/index state only).
+                bail!(
+                    "unified: deepseek_v41_vllm requires worker `hp_unified` or \
+                     `chunked_prefill`, not wired yet (timing-predict only)"
+                )
+            }
             IterArchSel::Glm52VllmDsaMoe {
                 ep_size,
                 nvl_num_gpu,
