@@ -2236,3 +2236,77 @@ def test_glm53_kpool_dsa_rejects_collapsed_geometry(glm53):
     )
     with pytest.raises(ValueError, match="per-request causal geometry"):
         glm53.label(collapsed)
+
+
+def _g53_geometry_totals(prefill: list[tuple[int, int]], decode: list[int]) -> dict:
+    """Analyzer wire totals for one iteration, with its per-request geometry."""
+    geometry: dict[str, int] = {}
+    for prefix, append in prefill:
+        key = f"prefill:{prefix}:{append}"
+        geometry[key] = geometry.get(key, 0) + 1
+    for kv_len in decode:
+        geometry[f"decode:{kv_len}"] = geometry.get(f"decode:{kv_len}", 0) + 1
+    return {
+        "matmul_tokens": sum(append for _, append in prefill) + len(decode),
+        "prefill_tokens": sum(append for _, append in prefill),
+        "decode_passes": len(decode),
+        "prefill_pairs": sum(a * p + a * (a + 1) // 2 for p, a in prefill),
+        "prefill_cached": sum(p for p, _ in prefill),
+        "decode_kv": sum(decode),
+        "prefill_requests": len(prefill),
+        "prefill_stateful_requests": sum(p > 0 for p, _ in prefill),
+        "request_geometry": geometry,
+    }
+
+
+def test_glm53_request_geometry_rebuilds_the_exact_causal_workload(glm53):
+    """The mixed timing-predict case (a 29-token chunk at 2019 + 3 decodes)."""
+    totals = _g53_geometry_totals([(2019, 29)], [3000, 10, 3000])
+    exact = Workload.causal_lm(prefill=[(29, 2019)], decode=[3000, 10, 3000])
+    rebuilt = glm53.label(work_floors._aggregate_workload(totals))
+    direct = glm53.label(exact)
+    assert {s.name: (s.flops_total, s.bytes_total) for s in rebuilt.segments} == {
+        s.name: (s.flops_total, s.bytes_total) for s in direct.segments
+    }
+    # The collapsed scalars alone are refused, and so is geometry that disagrees.
+    with pytest.raises(ValueError, match="per-request causal geometry"):
+        glm53.label(work_floors._aggregate_workload({**totals, "request_geometry": {}}))
+    with pytest.raises(ValueError, match="decode_kv=6010"):
+        work_floors._aggregate_workload({**totals, "decode_kv": 6000})
+
+
+def test_glm53_locked_floor_uses_the_served_fp8_mla_cache(tmp_path):
+    (tmp_path / "raw").mkdir()
+    (tmp_path / "raw" / "params.json").write_text(
+        json.dumps(
+            {
+                "pools": {
+                    "main": {
+                        "groups": [
+                            {
+                                "gpu": "NVIDIA B200",
+                                "arch": {
+                                    "type": "glm53_flash_vllm_fp8_kda_dsa_moe",
+                                    "model_config": str(GLM53),
+                                    "fp8": True,
+                                },
+                            }
+                        ]
+                    }
+                }
+            }
+        )
+    )
+    shapes = [
+        {"occurrences": 2, "totals": _g53_geometry_totals([], [2048] * 32)},
+        {"occurrences": 1, "totals": _g53_geometry_totals([(0, 2048)], [])},
+    ]
+    result = work_floors.compute_locked_compositions(tmp_path, {"main/0": shapes})["main/0"]
+    assert "error" not in result, result
+    assert result["composition"]["affine_bases"] == 0
+    rows = {segment["name"]: segment for segment in result["segments"]}
+    # FP8 latent: 512 B per token (the config alone would say BF16, 1024 B).
+    assert rows["dsa_moe.mla_cache_append"]["bytes"] == (2 * 32 + 2048) * 512 * 11
+    assert rows["dsa_moe.attn.decode"]["bytes"] == 2 * 32 * 2047 * 512 * 11
+    assert rows["dsa_moe.attn.decode"]["compute_dtype"] == "fp8"
+    assert result["segmented"] >= result["necessary"] > 0

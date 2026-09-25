@@ -163,6 +163,17 @@ pub trait IterwiseUnifiedModel: Send + Sync + 'static {
         0
     }
 
+    /// Whether the `cost_log` must keep each decode request's KV length.
+    ///
+    /// The default logs decode as a request count plus a KV total, which is all a
+    /// model whose necessary work is linear in context needs. A sparse-attention
+    /// model with a per-request top-k cap (GLM-5.3's kpool DSA) cannot recover its
+    /// minimum work from the total, so it opts in; the independent labeler then
+    /// reconstructs each request's exact causal interaction.
+    fn logs_decode_kv_lens(&self) -> bool {
+        false
+    }
+
     /// Token interval at which a checkpoint of [`Self::recurrent_state_bytes_per_request`]
     /// can be taken and later resumed from — vLLM's hybrid `block_size`.
     ///

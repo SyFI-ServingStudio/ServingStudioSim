@@ -1028,6 +1028,11 @@ impl IterwiseUnifiedModel for Glm53FlashVllmModel {
         HYBRID_BLOCK_SIZE
     }
 
+    /// The kpool DSA's top-k cap makes necessary work per-request in context.
+    fn logs_decode_kv_lens(&self) -> bool {
+        true
+    }
+
     fn gpus_per_replica(&self) -> u16 {
         self.tp_size
     }

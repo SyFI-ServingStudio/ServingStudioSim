@@ -344,19 +344,21 @@ impl CostBuffers {
         // One batch per iteration today; AFD/TBO emit several batches sharing an
         // iter_id with distinct batch_id via `run_section` instead.
         // `run_section` already applies `gpu_time_multiplier` and returns wall Time.
-        self.run_section(
-            "iter",
-            -1,
-            iter_id,
-            0,
-            &arch_input.groups,
-            None, // one fused eval per iteration — nothing to memoize
-            now,
-            |slots, scratch, inputs| match inputs {
-                Some(i) => model.eval_iter_with_inputs(arch_input, slots, scratch, i),
-                None => model.eval_iter(arch_input, slots, scratch),
-            },
-        )
+        let eval = |slots: &mut Vec<LeafMetrics>,
+                    scratch: &mut Vec<LeafMetrics>,
+                    inputs: Option<&mut Vec<SlotInput>>| match inputs {
+            Some(i) => model.eval_iter_with_inputs(arch_input, slots, scratch, i),
+            None => model.eval_iter(arch_input, slots, scratch),
+        };
+        // `None` cache key: one fused eval per iteration — nothing to memoize.
+        if model.logs_decode_kv_lens() {
+            let groups = DecodeKvLensGroupLog {
+                groups: &arch_input.groups,
+            };
+            self.run_section("iter", -1, iter_id, 0, &groups, None, now, eval)
+        } else {
+            self.run_section("iter", -1, iter_id, 0, &arch_input.groups, None, now, eval)
+        }
     }
 
     /// [`run_iter`](Self::run_iter) for a speculating model. Same one fused
@@ -416,6 +418,32 @@ impl GroupLogSource for Vec<ArchGroupInput> {
                 // two columns coincide here and diverge only under speculation.
                 decode_query_rows: g.decode_tokens,
                 speculative_geometry: None,
+                decode_kv_lens: None,
+            });
+        }
+    }
+}
+
+/// Borrowed [`GroupLogSource`] that also keeps every decode request's KV length,
+/// for models whose necessary work is not linear in the KV total
+/// ([`IterwiseUnifiedModel::logs_decode_kv_lens`]).
+struct DecodeKvLensGroupLog<'a> {
+    groups: &'a [ArchGroupInput],
+}
+
+impl GroupLogSource for DecodeKvLensGroupLog<'_> {
+    fn fill_group_log(&self, dst: &mut Vec<GroupInputLog>) {
+        dst.clear();
+        for g in self.groups {
+            dst.push(GroupInputLog {
+                batch_tokens: g.batch_tokens,
+                prefill_tokens: g.prefill_tokens,
+                decode_request_count: g.decode_tokens,
+                decode_kv_total: g.total_kv_len,
+                prefill_chunk_pairs: g.prefill_chunk_pairs.clone(),
+                decode_query_rows: g.decode_tokens,
+                speculative_geometry: None,
+                decode_kv_lens: Some(g.decode_kv_lens.clone()),
             });
         }
     }
@@ -435,6 +463,7 @@ impl GroupLogSource for Vec<u32> {
                 prefill_chunk_pairs: Vec::new(),
                 decode_query_rows: 0,
                 speculative_geometry: None,
+                decode_kv_lens: None,
             });
         }
     }
@@ -475,6 +504,7 @@ impl GroupLogSource for SpeculativeGroupLog<'_> {
                         .map(|r| (r.kv_len, r.query_len))
                         .collect(),
                 }),
+                decode_kv_lens: None,
             });
         }
     }
