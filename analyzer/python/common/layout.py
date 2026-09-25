@@ -14,6 +14,8 @@ RAW_DIR = "raw"
 REPORTS_DIR = "reports"
 PAYLOADS_DIR = "payloads"
 PLOTS_DIR = "plots"
+#: The `encoding` of a detail shard whose records are independent zstd frames.
+ZSTD_FRAMES = "zstd-frames"
 
 
 def resolve_artifact(log_dir: Path, name: str) -> Path:
@@ -37,13 +39,16 @@ def read_sharded_records(log_dir: Path, shard: dict, keys: list) -> list[dict]:
     index plus a `.jsonl`, and the index carries each record's `[offset, length]`
     (see the Rust `iteration_detail` / `breakdown_detail` sections). Reading only
     the wanted records is the point of that layout: a renderer that samples 128
-    of 2,040 iterations must not parse the other 1,912.
+    of 2,040 iterations must not parse the other 1,912. A `zstd-frames` shard
+    (`.jsonl.zst`) makes each range one zstd frame, which decodes to the index's
+    `decoded_lengths[key]` bytes.
 
     Returns records in the order of `keys`; a key the index does not know is
     skipped, because a payload written before its shard existed is a missing
     figure, not a crash.
     """
     byte_ranges = shard.get("byte_ranges") or {}
+    decode = _record_decoder(shard)
     path = resolve_artifact(log_dir, shard["file"])
     records = []
     with path.open("rb") as handle:
@@ -53,8 +58,20 @@ def read_sharded_records(log_dir: Path, shard: dict, keys: list) -> list[dict]:
                 continue
             offset, length = location
             handle.seek(offset)
-            records.append(json.loads(handle.read(length)))
+            records.append(json.loads(decode(str(key), handle.read(length))))
     return records
+
+
+def _record_decoder(shard: dict):
+    """`(key, raw range) -> JSON bytes` for the shard's `encoding`."""
+    if shard.get("encoding") != ZSTD_FRAMES:
+        return lambda _key, raw: raw
+    import pyarrow as pa
+
+    decoded_lengths = shard["decoded_lengths"]
+    return lambda key, raw: pa.decompress(
+        raw, decompressed_size=decoded_lengths[key], codec="zstd", asbytes=True
+    )
 
 
 def plot_output_path(log_dir: Path, name: str) -> Path:

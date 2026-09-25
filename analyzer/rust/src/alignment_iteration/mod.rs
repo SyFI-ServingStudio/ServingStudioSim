@@ -40,7 +40,7 @@ use crate::session::{
 use crate::trace::manifest::{node_time, FlatCostNode, Manifest, ManifestDoc};
 
 /// Sibling of the payload holding one iteration's kernel breakdown per line.
-const BREAKDOWN_DETAIL_FILE: &str = "alignment_iteration_breakdowns.jsonl";
+const BREAKDOWN_DETAIL_FILE: &str = "alignment_iteration_breakdowns.jsonl.zst";
 /// Run-wide per-position rows are audit data, not a page bootstrap resource.
 const KERNEL_INVENTORY_FILE: &str = "alignment_kernel_inventory.jsonl";
 /// Full folded programs are selected one at a time by the mapping board.
@@ -109,18 +109,17 @@ impl JsonlShardWriter {
         })
     }
 
-    fn write_line(&mut self, line: &[u8]) -> Result<(usize, usize)> {
+    /// Append one record already encoded by `encode_record`.
+    fn write_record(&mut self, record: &EncodedRecord) -> Result<(usize, usize)> {
         let offset = self.offset;
         let writer = self
             .writer
             .as_mut()
             .context("JSONL shard already finished")?;
-        writer.write_all(line)?;
-        writer.write_all(b"\n")?;
-        self.digest.update(line);
-        self.digest.update(b"\n");
-        self.offset += line.len() + 1;
-        Ok((offset, line.len()))
+        writer.write_all(&record.frame)?;
+        self.digest.update(&record.frame);
+        self.offset += record.frame.len();
+        Ok((offset, record.frame.len()))
     }
 
     fn finish(mut self, log_dir: &Path) -> Result<(String, PathBuf)> {
@@ -130,15 +129,11 @@ impl JsonlShardWriter {
             .with_context(|| format!("write {}", self.temp_path.display()))?;
         drop(writer);
 
-        let base = Path::new(self.base_file);
-        let stem = base
-            .file_stem()
-            .and_then(|value| value.to_str())
-            .context("JSONL shard base has no UTF-8 stem")?;
-        let extension = base
-            .extension()
-            .and_then(|value| value.to_str())
-            .context("JSONL shard base has no UTF-8 extension")?;
+        // `rows.jsonl.zst` -> `rows.<sha256>.jsonl.zst`: the hash goes before every extension.
+        let (stem, extension) = self
+            .base_file
+            .split_once('.')
+            .context("JSONL shard base has no extension")?;
         let hash = format!("{:x}", self.digest.clone().finalize());
         let file_name = format!("{stem}.{hash}.{extension}");
         let final_path = crate::io::payload_path(log_dir, &file_name);
@@ -164,6 +159,29 @@ impl JsonlShardWriter {
         }
         Ok((file_name, final_path))
     }
+}
+
+/// The `encoding` a `.jsonl.zst` shard's detail section declares.
+const ZSTD_FRAMES: &str = "zstd-frames";
+
+/// One record of a `.jsonl.zst` shard: the JSON line and its newline as an
+/// independent zstd frame. A reader decodes exactly one record from its byte
+/// range, and the concatenated frames still decompress (`zstd -d`) to the plain
+/// JSONL the shard replaces. Records are encoded where they are built, inside
+/// the parallel map, so the serial writer only appends and hashes ~8% of the
+/// bytes: a 4169-iteration TP4 capture's two shards were 19 GB as plain JSONL.
+struct EncodedRecord {
+    frame: Vec<u8>,
+    /// The record plus its newline, decoded.
+    decoded_len: usize,
+}
+
+fn encode_record(mut line: Vec<u8>) -> Result<EncodedRecord> {
+    line.push(b'\n');
+    Ok(EncodedRecord {
+        frame: zstd::bulk::compress(&line, 3).context("zstd-encode a shard record")?,
+        decoded_len: line.len(),
+    })
 }
 
 impl Drop for JsonlShardWriter {
@@ -676,6 +694,7 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
     // gigabyte of resident JSON for rows nothing reads twice.
     let mut breakdown_writer = JsonlShardWriter::create(log_dir, BREAKDOWN_DETAIL_FILE)?;
     let mut breakdown_ranges = serde_json::Map::new();
+    let mut breakdown_decoded_lengths = serde_json::Map::new();
     let mut total_delta = Vec::new();
     let mut total_relative = Vec::new();
     let mut total_abs_relative = Vec::new();
@@ -864,8 +883,11 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
                 .expect("iteration row is an object")
                 .extend(output.measured_path_fields);
             iteration_rows.push(row);
-            let (offset, length) = breakdown_writer.write_line(&output.line)?;
-            breakdown_ranges.insert(measured_iter.iteration.to_string(), json!([offset, length]));
+            let (offset, length) = breakdown_writer.write_record(&output.record)?;
+            let iteration_id = measured_iter.iteration.to_string();
+            breakdown_decoded_lengths
+                .insert(iteration_id.clone(), json!(output.record.decoded_len));
+            breakdown_ranges.insert(iteration_id, json!([offset, length]));
         }
     }
 
@@ -1112,8 +1134,9 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
         "sequence_detail": sequence_detail,
         "breakdown_detail": {
             "file": breakdown_file,
-            "encoding": "one JSON object per line, in the order of `iterations`",
+            "encoding": ZSTD_FRAMES,
             "byte_ranges": breakdown_ranges,
+            "decoded_lengths": breakdown_decoded_lengths,
         },
         "definitions": definitions,
     });
@@ -1236,8 +1259,8 @@ fn sequence_catalog(
 /// case, so it runs on a rayon worker; only the order-dependent folds in `run`
 /// stay serial.
 struct BreakdownOutput {
-    /// The serialized detail line, without its trailing newline.
-    line: Vec<u8>,
+    /// The breakdown line, encoded for the shard.
+    record: EncodedRecord,
     duty_cycle_sample: DutyCycleSample,
     measured_gpu_cycle_ms: Option<f64>,
     simulated_total_ms: f64,
@@ -1506,7 +1529,7 @@ fn build_breakdown(
     };
 
     Ok(BreakdownOutput {
-        line: serde_json::to_vec(&breakdown)?,
+        record: encode_record(serde_json::to_vec(&breakdown)?)?,
         duty_cycle_sample,
         measured_gpu_cycle_ms,
         simulated_total_ms: sim.total_ms,
@@ -3043,7 +3066,7 @@ fn definitions() -> Value {
         ("mapping_coverage", "duration/workload fraction assigned by embedded labels; unmatched entries stay explicit and are never filled with zero. Measured coverage is scored against measured_kernel_sum_ms, NOT the concurrency-deducted critical path, so a fully-labeled concurrent capture reports 100% rather than more"),
         ("measured_critical_path_fraction", "mapped contribution divided by the complete barrier critical path; reported separately from raw residency coverage"),
         ("sequences", "the labelled kernel programs as the labeler wrote them, still folded: a `repeat{n}` band is one layer repeated, not n rows. Joined to a breakdown by row_id, which is `sequence_id:expanded_ordinal`"),
-        ("breakdown_detail.byte_ranges", "iteration_id -> [byte offset, byte length] into the sibling .jsonl holding that iteration's measured and simulated kernel rows. Read that range and parse it as one JSON object; the whole file is never needed at once"),
+        ("breakdown_detail.byte_ranges", "iteration_id -> [byte offset, byte length] into the sibling .jsonl.zst holding that iteration's measured and simulated kernel rows. The range is one zstd frame (`encoding: zstd-frames`) that decodes to decoded_lengths[iteration_id] bytes: one JSON object and its newline. The whole file is never needed at once, and `zstd -d` turns it into plain JSONL"),
     ];
     Value::Object(
         pairs
@@ -3058,39 +3081,51 @@ mod tests {
     use super::*;
     use crate::trace::manifest::LeafDesc;
 
+    fn record(value: Value) -> EncodedRecord {
+        encode_record(serde_json::to_vec(&value).unwrap()).unwrap()
+    }
+
     #[test]
-    fn jsonl_shard_writer_records_seekable_ranges() {
+    fn jsonl_shard_writer_records_seekable_frames() {
         let log_dir = tempfile::tempdir().unwrap();
-        let mut writer = JsonlShardWriter::create(log_dir.path(), "rows.jsonl").unwrap();
-        let first = serde_json::to_vec(&json!({"row": 1})).unwrap();
-        let second = serde_json::to_vec(&json!({"row": 2, "wide": true})).unwrap();
-        let first_range = writer.write_line(&first).unwrap();
-        let second_range = writer.write_line(&second).unwrap();
+        let mut writer = JsonlShardWriter::create(log_dir.path(), "rows.jsonl.zst").unwrap();
+        let first = record(json!({"row": 1}));
+        let second = record(json!({"row": 2, "wide": true}));
+        let first_range = writer.write_record(&first).unwrap();
+        let second_range = writer.write_record(&second).unwrap();
         let (file_name, path) = writer.finish(log_dir.path()).unwrap();
 
         let bytes = fs::read(path).unwrap();
+        assert_eq!(bytes, [first.frame.as_slice(), &second.frame].concat());
+        let decode = |(offset, length): (usize, usize), decoded_len: usize| {
+            zstd::bulk::decompress(&bytes[offset..offset + length], decoded_len).unwrap()
+        };
         assert_eq!(
-            bytes,
-            [first.as_slice(), b"\n", second.as_slice(), b"\n"].concat()
+            decode(first_range, first.decoded_len),
+            b"{\"row\":1}\n".to_vec()
         );
-        assert_eq!(&bytes[first_range.0..first_range.0 + first_range.1], first);
         assert_eq!(
-            &bytes[second_range.0..second_range.0 + second_range.1],
-            second
+            decode(second_range, second.decoded_len),
+            b"{\"row\":2,\"wide\":true}\n".to_vec()
+        );
+        // The concatenated frames are one stream of the plain JSONL.
+        assert_eq!(
+            zstd::stream::decode_all(bytes.as_slice()).unwrap(),
+            b"{\"row\":1}\n{\"row\":2,\"wide\":true}\n".to_vec()
         );
         assert!(file_name.starts_with("rows."));
-        assert!(file_name.ends_with(".jsonl"));
+        assert!(file_name.ends_with(".zst"));
 
         // Re-emitting byte-identical content reuses the immutable generation.
-        let mut same = JsonlShardWriter::create(log_dir.path(), "rows.jsonl").unwrap();
-        same.write_line(&first).unwrap();
-        same.write_line(&second).unwrap();
+        let mut same = JsonlShardWriter::create(log_dir.path(), "rows.jsonl.zst").unwrap();
+        same.write_record(&first).unwrap();
+        same.write_record(&second).unwrap();
         let (same_file_name, _) = same.finish(log_dir.path()).unwrap();
         assert_eq!(same_file_name, file_name);
 
         // Different content cannot overwrite the generation an old index names.
-        let mut different = JsonlShardWriter::create(log_dir.path(), "rows.jsonl").unwrap();
-        different.write_line(br#"{"row":3}"#).unwrap();
+        let mut different = JsonlShardWriter::create(log_dir.path(), "rows.jsonl.zst").unwrap();
+        different.write_record(&record(json!({"row": 3}))).unwrap();
         let (different_file_name, _) = different.finish(log_dir.path()).unwrap();
         assert_ne!(different_file_name, file_name);
         assert_eq!(
@@ -3104,12 +3139,14 @@ mod tests {
         let log_dir = tempfile::tempdir().unwrap();
         let payload_dir = log_dir.path().join("payloads");
         fs::create_dir_all(&payload_dir).unwrap();
-        let published_path = payload_dir.join("rows.published.jsonl");
+        let published_path = payload_dir.join("rows.published.jsonl.zst");
         fs::write(&published_path, b"old generation\n").unwrap();
 
-        let mut failed = JsonlShardWriter::create(log_dir.path(), "rows.jsonl").unwrap();
+        let mut failed = JsonlShardWriter::create(log_dir.path(), "rows.jsonl.zst").unwrap();
         let temp_path = failed.temp_path.clone();
-        failed.write_line(br#"{"partial":true}"#).unwrap();
+        failed
+            .write_record(&record(json!({"partial": true})))
+            .unwrap();
         drop(failed);
 
         assert_eq!(fs::read(published_path).unwrap(), b"old generation\n");

@@ -462,6 +462,9 @@ pub(super) fn alignment_artifact_bytes(
     fs::read(&path).with_context(|| format!("read alignment artifact {}", path.display()))
 }
 
+/// The `encoding` of a detail shard whose records are independent zstd frames.
+const ZSTD_FRAMES: &str = "zstd-frames";
+
 /// The small index that points into one iteration-detail JSONL shard.
 ///
 /// The payload contains this metadata beside the plot series. Parse it once
@@ -471,6 +474,10 @@ pub(super) fn alignment_artifact_bytes(
 pub(super) struct AlignmentDetailIndex {
     pub(super) shard_path: PathBuf,
     pub(super) byte_ranges: HashMap<String, (u64, u64)>,
+    /// Each record's decoded size when the shard is `zstd-frames`: every range
+    /// is then one zstd frame holding the JSON line and its newline. `None` for
+    /// a plain `.jsonl` shard written before the analyzer compressed them.
+    pub(super) decoded_lengths: Option<HashMap<String, usize>>,
     /// The reference rank and drawable host threads are shared by every
     /// timeline detail row. Keeping them in the cached index lets the service
     /// build the UI's reference-lane projection without reopening the index.
@@ -517,6 +524,21 @@ pub(super) fn alignment_detail_index(
             Ok((iteration_id.clone(), (offset, length)))
         })
         .collect::<Result<HashMap<_, _>>>()?;
+    let decoded_lengths = match detail.get("encoding").and_then(Value::as_str) {
+        Some(ZSTD_FRAMES) => Some(
+            detail
+                .get("decoded_lengths")
+                .and_then(Value::as_object)
+                .ok_or(ArtifactNotFound)?
+                .iter()
+                .map(|(iteration_id, length)| {
+                    let length = length.as_u64().ok_or(ArtifactNotFound)?;
+                    Ok((iteration_id.clone(), length as usize))
+                })
+                .collect::<Result<HashMap<_, _>>>()?,
+        ),
+        _ => None,
+    };
     let reference_device_id = payload
         .get("meta")
         .and_then(|meta| meta.get("reference_device_id"))
@@ -545,6 +567,7 @@ pub(super) fn alignment_detail_index(
     Ok(AlignmentDetailIndex {
         shard_path,
         byte_ranges,
+        decoded_lengths,
         reference_device_id,
         reference_host_thread_ids,
     })
@@ -564,7 +587,25 @@ pub(super) fn read_alignment_iteration_detail(
     handle.seek(SeekFrom::Start(offset))?;
     let mut buffer = vec![0u8; length as usize];
     handle.read_exact(&mut buffer)?;
-    Ok(buffer)
+    let Some(decoded_lengths) = &index.decoded_lengths else {
+        return Ok(buffer);
+    };
+    let decoded_len = decoded_lengths
+        .get(iteration_id)
+        .copied()
+        .ok_or(ArtifactNotFound)?;
+    let mut line = zstd::bulk::decompress(&buffer, decoded_len).with_context(|| {
+        format!(
+            "decode iteration {iteration_id} of {}",
+            index.shard_path.display()
+        )
+    })?;
+    // The frame holds the line and its newline; serve the object alone, as a
+    // plain shard's range does.
+    if line.last() == Some(&b'\n') {
+        line.pop();
+    }
+    Ok(line)
 }
 
 pub(super) fn alignment_sequence_index(

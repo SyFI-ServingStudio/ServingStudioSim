@@ -84,6 +84,33 @@ def test_sharded_records_are_read_by_byte_range_in_the_order_asked_for(tmp_path)
     assert [record["iteration_id"] for record in read] == [9, 3]
 
 
+def test_zstd_frame_shards_decode_each_record_alone(tmp_path) -> None:
+    import json
+
+    import pyarrow as pa
+
+    payloads = tmp_path / "payloads"
+    payloads.mkdir()
+    byte_ranges, decoded_lengths, blob = {}, {}, b""
+    for iteration_id in (3, 7):
+        line = json.dumps({"iteration_id": iteration_id}).encode() + b"\n"
+        frame = pa.compress(line, codec="zstd", asbytes=True)
+        byte_ranges[str(iteration_id)] = [len(blob), len(frame)]
+        decoded_lengths[str(iteration_id)] = len(line)
+        blob += frame
+    (payloads / "shard.jsonl.zst").write_bytes(blob)
+    shard = {
+        "file": "shard.jsonl.zst",
+        "encoding": "zstd-frames",
+        "byte_ranges": byte_ranges,
+        "decoded_lengths": decoded_lengths,
+    }
+
+    read = read_sharded_records(tmp_path, shard, [7, 3])
+
+    assert [record["iteration_id"] for record in read] == [7, 3]
+
+
 def test_mapping_center_pairs_keeps_one_to_many_simulated_slots() -> None:
     measured_centers = {"layer.attention": [1.5]}
     simulated_centers = {"layer.attention": [2.0, 3.0]}

@@ -47,12 +47,12 @@ use std::path::Path;
 use super::barrier;
 use super::host::{self, HostWindow};
 use super::{
-    duty_cycle_recommendation, interval_union_ns, kernel_name_index, leaf_scales, load_inventory,
-    load_sim_cases, measure_iteration, measured_gpu_cycles_ms, measured_path_fields, occurrence_ns,
-    parsed_trace, physical_kernel_rows, pooled_gpu_time_multiplier, read_json,
-    screen_duty_cycle_outliers, single_iter_manifest, CaseMapDoc, CompiledInventory,
-    DutyCycleSample, IterationMeasurement, JsonlShardWriter, MeasuredIteration, PhysicalKernelRow,
-    SimCase,
+    duty_cycle_recommendation, encode_record, interval_union_ns, kernel_name_index, leaf_scales,
+    load_inventory, load_sim_cases, measure_iteration, measured_gpu_cycles_ms,
+    measured_path_fields, occurrence_ns, parsed_trace, physical_kernel_rows,
+    pooled_gpu_time_multiplier, read_json, screen_duty_cycle_outliers, single_iter_manifest,
+    CaseMapDoc, CompiledInventory, DutyCycleSample, EncodedRecord, IterationMeasurement,
+    JsonlShardWriter, MeasuredIteration, PhysicalKernelRow, SimCase,
 };
 use crate::alignment_input;
 use crate::io::{read_cost_manifests, resolve_artifact_path, SCHEMA_VERSION};
@@ -63,7 +63,7 @@ use crate::io::{read_cost_manifests, resolve_artifact_path, SCHEMA_VERSION};
 const MAX_ITERATIONS: usize = 32;
 
 /// Sibling of the payload holding one iteration's full detail per line.
-const ITERATION_DETAIL_FILE: &str = "alignment_timeline_iterations.jsonl";
+const ITERATION_DETAIL_FILE: &str = "alignment_timeline_iterations.jsonl.zst";
 
 /// The phase whose folded kernel program identifies an iteration's shape. The
 /// other phases (preprocess / sample / bookkeep …) are the same few kernels
@@ -374,6 +374,7 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
     let mut index_iterations = Vec::with_capacity(selected.len());
     let mut report_iterations = Vec::with_capacity(selected.len());
     let mut byte_ranges = serde_json::Map::new();
+    let mut decoded_lengths = serde_json::Map::new();
     let mut used_name_ids = BTreeSet::new();
     for chunk in selected.chunks(super::MEASURE_CHUNK) {
         let outputs = chunk
@@ -410,7 +411,7 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
                 )?;
                 Ok(TimelineOutput {
                     iteration_id: summary.iteration_id,
-                    line: built.detail,
+                    record: encode_record(built.detail)?,
                     index: built.index,
                     report: (*reason != Selection::FullCapture).then_some(built.report),
                     used_name_ids: built.used_name_ids,
@@ -420,8 +421,10 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
             .into_iter()
             .collect::<Result<Vec<_>>>()?;
         for output in outputs {
-            let (offset, length) = detail_writer.write_line(&output.line)?;
-            byte_ranges.insert(output.iteration_id.to_string(), json!([offset, length]));
+            let (offset, length) = detail_writer.write_record(&output.record)?;
+            let iteration_id = output.iteration_id.to_string();
+            decoded_lengths.insert(iteration_id.clone(), json!(output.record.decoded_len));
+            byte_ranges.insert(iteration_id, json!([offset, length]));
             index_iterations.push(output.index);
             if let Some(report) = output.report {
                 report_iterations.push(report);
@@ -527,8 +530,9 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
         "iterations": index_iterations,
         "iteration_detail": {
             "file": detail_file,
-            "encoding": "one JSON object per line, in the order of `iterations`",
+            "encoding": super::ZSTD_FRAMES,
             "byte_ranges": byte_ranges,
+            "decoded_lengths": decoded_lengths,
         },
         "definitions": definitions,
     });
@@ -681,7 +685,7 @@ struct HostContext<'a> {
 /// `Value` it came from, so the tree is dropped on the worker that built it.
 struct TimelineOutput {
     iteration_id: u64,
-    line: Vec<u8>,
+    record: EncodedRecord,
     index: Value,
     report: Option<Value>,
     used_name_ids: BTreeSet<u64>,
@@ -1350,7 +1354,7 @@ fn definitions() -> Value {
         "host.api": "per thread, one [start_ns, duration_ns, string_id, class_index, correlation_id] per CUDA runtime call, anchor-relative like host.nvtx. class_index indexes meta.host_timeline.api_classes; correlation_id is the NSYS launch identity used to connect this call to one measured kernel; a thread between two calls is unaccounted for, not idle — the capture carries no CPU sampling",
         "host.window_ns": "this iteration's host window, anchor-relative. Wider than the GPU span on both sides, and overlapping its neighbours' — that overlap is the pipelining, see meta.host_timeline.window_rule",
         "iterations": "one summary row per emitted iteration — the scalars a picker sorts on. Every per-kernel and per-host-event field lives in the detail shard instead",
-        "iteration_detail.byte_ranges": "iteration_id -> [byte offset, byte length] into the sibling .jsonl. Read that range and parse it as one JSON object; the whole file is never needed at once",
+        "iteration_detail.byte_ranges": "iteration_id -> [byte offset, byte length] into the sibling .jsonl.zst. The range is one zstd frame (`encoding: zstd-frames`) that decodes to decoded_lengths[iteration_id] bytes: one JSON object and its newline. The whole file is never needed at once, and `zstd -d` turns it into plain JSONL",
     })
 }
 

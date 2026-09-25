@@ -534,7 +534,8 @@ totals for `all` and each observed stage:
 `operations` uses the same totals and is ordered by descending absolute-error
 milliseconds. These rows join by semantic operation because measured CUDA
 kernels and simulated L1 slots are not generally one-to-one. The detailed
-physical rows remain in `payloads/alignment_iteration_breakdowns.jsonl`.
+physical rows remain in `payloads/alignment_iteration_breakdowns.<sha256>.jsonl.zst`,
+one zstd frame per iteration (see `analyzer/README.md`).
 
 Compare two completed kernel-align results without reopening either capture:
 

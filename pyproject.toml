@@ -33,17 +33,22 @@ dev = [
     "ruff>=0.14.0",
 ]
 # Analyzer plot renderer (analyzer/python). Reads Rust-emitted payload JSON and
-# draws PNGs — matplotlib only, no parquet/pandas (the Rust side owns parquet).
+# draws PNGs — no parquet/pandas (the Rust side owns parquet). `pyarrow` is only
+# its zstd codec, for the alignment detail shards' `zstd-frames` records.
 analyze = [
     "matplotlib>=3.9",
+    "pyarrow>=24.0.0",
 ]
 # L7-α launcher runtime deps. `asteval` evaluates `derived` / `constraints`
 # preset expressions in a sandboxed AST (no raw `eval`); see launcher/schema.
 # `pyyaml` reads YAML presets (the default preset format; JSON is the subset the
-# binary is handed). Mirrors the Rust side's `serde_yaml`.
+# binary is handed). Mirrors the Rust side's `serde_yaml`. `pyarrow` writes the
+# alignment parse's kernel rows (`alignment/nsys/parsed_io.py`) and reads run
+# parquet.
 launcher = [
     "asteval>=1.0.0",
     "prometheus-client>=0.20.0",
+    "pyarrow>=24.0.0",
     "pyyaml>=6.0",
 ]
 profiling = [
