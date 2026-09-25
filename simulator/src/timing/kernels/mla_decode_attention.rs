@@ -38,7 +38,17 @@ impl KernelSpec for MlaDecodeAttentionSpec {
     const KIND: KernelKind = "mla_decode_attention";
 
     fn sweep_grid(_config: &Self::Config) -> SweepGrid {
-        SweepGrid::new(vec![Axis::pow2(0, 7), Axis::pow2(7, 20)])
+        // Decode groups reach B=512, and the rank-1 oracle also exercises a
+        // 40,960-token per-request context. Keep the established power-of-two
+        // coverage while making those production points measured cache cells.
+        SweepGrid::new(vec![
+            Axis::pow2(0, 9),
+            Axis::chain([
+                Axis::pow2(7, 15),
+                Axis::values([40_960]),
+                Axis::pow2(16, 20),
+            ]),
+        ])
     }
 
     fn cache_kind(_backend: &'static str) -> CacheKind {
@@ -103,8 +113,15 @@ mod tests {
         assert_eq!(cfg.num_heads, 12);
         let grid = MlaDecodeAttentionSpec::sweep_grid(&cfg);
         assert_eq!(grid.axes().len(), 2);
-        assert_eq!(grid.axes()[0], Axis::pow2(0, 7));
-        assert_eq!(grid.axes()[1], Axis::pow2(7, 20));
+        assert_eq!(grid.axes()[0], Axis::pow2(0, 9));
+        assert_eq!(
+            grid.axes()[1],
+            Axis::chain([
+                Axis::pow2(7, 15),
+                Axis::values([40_960]),
+                Axis::pow2(16, 20),
+            ])
+        );
         assert_eq!(
             MlaDecodeAttentionSpec::cache_kind("sglang_cutedsl_mla"),
             CacheKind::Cache2DLinear(Extrapolation::Weighted)
@@ -129,17 +146,54 @@ mod tests {
         };
 
         let bf16_mask = MlaDecodeAttentionSpec::infeasible_mask(&cfg, &grid);
-        assert_eq!(bf16_mask.len(), 8 * 14);
+        assert_eq!(bf16_mask.len(), 10 * 15);
         assert!(!cell(&bf16_mask, 1.0, 1_048_576.0));
         assert!(!cell(&bf16_mask, 16.0, 65_536.0));
         assert!(!cell(&bf16_mask, 128.0, 8_192.0));
-        assert!(cell(&bf16_mask, 64.0, 1_048_576.0));
+        assert!(!cell(&bf16_mask, 512.0, 65_536.0));
+        assert!(cell(&bf16_mask, 512.0, 131_072.0));
 
         let mut fp8_cfg = cfg;
         fp8_cfg.kv_dtype = DType::Fp8E4m3;
         let fp8_mask = MlaDecodeAttentionSpec::infeasible_mask(&fp8_cfg, &grid);
         assert!(!cell(&fp8_mask, 64.0, 1_048_576.0));
         assert!(cell(&fp8_mask, 128.0, 1_048_576.0));
+    }
+
+    #[test]
+    fn large_decode_points_are_grid_covered_instead_of_extrapolated() {
+        use crate::timing::bridge::KernelMetrics;
+        use crate::timing::cache::interp::CoverageFlags;
+        use crate::timing::cache::{Cache, Cache2DLinear};
+
+        let cfg = config();
+        let grid = MlaDecodeAttentionSpec::sweep_grid(&cfg);
+        let samples = grid.expand_2d(|batch_size, kv_len| KernelMetrics {
+            time_ms: batch_size + kv_len,
+            tflops: Some(1.0),
+            memory_bandwidth_gbps: Some(1.0),
+            algbw_gbps: None,
+            busbw_gbps: None,
+            energy_j: 1.0,
+        });
+        let (cache, _warnings) =
+            Cache2DLinear::from_samples_with(&grid, &samples, Extrapolation::Weighted);
+
+        for [batch_size, kv_len] in [
+            [1.0, 8_192.0],
+            [32.0, 8_192.0],
+            [128.0, 8_192.0],
+            [256.0, 8_192.0],
+            [512.0, 8_192.0],
+            [16.0, 40_960.0],
+        ] {
+            let result = cache.eval(&[batch_size, kv_len]);
+            assert_eq!(
+                result.coverage,
+                CoverageFlags::EMPTY,
+                "MLA decode point ({batch_size}, {kv_len}) must be measured-grid covered"
+            );
+        }
     }
 
     #[test]

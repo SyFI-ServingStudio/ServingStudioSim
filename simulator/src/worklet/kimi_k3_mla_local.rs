@@ -384,8 +384,6 @@ impl KimiK3MlaLocalWorklet {
 
     pub fn eval(&self, input: &KimiK3MlaLocalWorkletInput, evaluator: &mut Evaluator) {
         let rows = input.batch_tokens;
-        let decode_batch = input.decode_kv_lens.len() as u32;
-        let kv_len = input.decode_kv_lens.iter().copied().max().unwrap_or(0);
         eval_atomic_or_zero(
             &self.input_layernorm,
             ResidualRmsNormKernelInput { m: rows },
@@ -430,11 +428,8 @@ impl KimiK3MlaLocalWorklet {
         );
         eval_atomic_or_zero(
             &self.decode_attention,
-            MlaDecodeAttentionKernelInput {
-                batch_size: decode_batch,
-                kv_len,
-            },
-            decode_batch == 0,
+            decode_attention_input(input),
+            input.decode_kv_lens.is_empty(),
             evaluator,
         );
         eval_atomic_or_zero(
@@ -473,6 +468,16 @@ impl KimiK3MlaLocalWorklet {
             rows == 0,
             evaluator,
         );
+    }
+}
+
+fn decode_attention_input(input: &KimiK3MlaLocalWorkletInput) -> MlaDecodeAttentionKernelInput {
+    MlaDecodeAttentionKernelInput {
+        // MLA receives one query per decode request. `decode_kv_total` is a
+        // workload aggregate; the callable expects the per-request context
+        // length and batch cardinality separately.
+        batch_size: input.decode_kv_lens.len() as u32,
+        kv_len: input.decode_kv_lens.iter().copied().max().unwrap_or(0),
     }
 }
 
@@ -557,7 +562,19 @@ mod tests {
             batch_tokens: 3,
             decode_kv_lens: vec![64, 8192],
         };
-        assert_eq!(input.decode_kv_lens.iter().copied().max(), Some(8192));
-        assert_eq!(input.decode_kv_lens.len(), 2);
+        let attention = decode_attention_input(&input);
+        assert_eq!(attention.batch_size, 2);
+        assert_eq!(attention.kv_len, 8192);
+    }
+
+    #[test]
+    fn large_uniform_decode_group_keeps_request_count_separate_from_kv_total() {
+        let input = KimiK3MlaLocalWorkletInput {
+            batch_tokens: 512,
+            decode_kv_lens: vec![8192; 512],
+        };
+        let attention = decode_attention_input(&input);
+        assert_eq!(attention.batch_size, 512);
+        assert_eq!(attention.kv_len, 8192);
     }
 }
