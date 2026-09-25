@@ -1,4 +1,10 @@
-//! BF16 GEMM whose production callable materializes an FP32 output.
+//! GEMM (BF16 or FP32 inputs) whose production callable materializes an FP32 output.
+//!
+//! Coverage gap: the DeepSeek-V4.1 router GateLinear (n=384, k=5120) runs a
+//! different kernel for m <= 16 in production (the cute-DSL `ll_bf16_gemm`
+//! tier of vLLM's `GateLinear`); only m > 16 falls through to
+//! `torch.mm(..., out_dtype=fp32)`. No backend profiles that tier yet, so the
+//! m <= 16 rows of that shape are the cuBLAS/nvjet time, not the production one.
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::CacheKind;
