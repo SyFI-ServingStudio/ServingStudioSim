@@ -1961,3 +1961,278 @@ def test_glm53_target_is_dimensionally_the_glm52_graph():
     assert {k: v for k, v in glm53.items() if k != "transformers_version"} == {
         k: v for k, v in glm52.items() if k != "transformers_version"
     }
+
+
+# ---------------------------------------------------------------------------
+# GLM-5.3-Flash (Glm5NextForConditionalGeneration): 34 KDA + 11 kpool-DSA layers over
+# a 4-stream mHC residual; 3 dense + 42 MoE FFNs. Every expectation below is written
+# out from the checkpoint's safetensors shapes (the vision tower and the MTP layer
+# 45 are out of scope); none is recomputed through the code under test.
+# ---------------------------------------------------------------------------
+
+GLM53 = Path(__file__).resolve().parents[1] / "model" / "config" / "glm53_flash.json"
+GLM53_SNAPSHOT = Path(
+    "/raid/hf/hub/models--zai-org--GLM-5.3-Flash/snapshots/03eb5366286afd40d2221b1d9c63a6dd1ba4832e"
+)
+G53_H = 4096
+G53_VOCAB = 154880
+G53_KDA_LAYERS, G53_DSA_LAYERS, G53_LAYERS = 34, 11, 45
+G53_DENSE_LAYERS, G53_MOE_LAYERS = 3, 42
+G53_KDA_HEADS, G53_KDA_DIM = 64, 128
+G53_KDA_WIDTH = G53_KDA_HEADS * G53_KDA_DIM  # 8192
+# KDA, per layer (all BF16): q/k/v 8192x4096; b_proj 64x4096; f_a/g_a 128x4096;
+# f_b/g_b 8192x128; three depthwise convs 8192x4; o_proj 4096x8192.
+G53_KDA_MATMUL = (
+    3 * G53_KDA_WIDTH * G53_H
+    + 64 * G53_H
+    + 2 * 128 * G53_H
+    + 2 * G53_KDA_WIDTH * 128
+    + 3 * G53_KDA_WIDTH * 4
+    + G53_H * G53_KDA_WIDTH
+)  # 137_199_616
+G53_KDA_VECTORS = 64 + G53_KDA_WIDTH + 128  # A_log, dt_bias, o_norm
+# DSA, per layer: q_a 1536x4096 (FP8), kv_a_proj_with_mqa 512x4096 (FP8), q_b
+# 16384x1536 (FP8), kv_b 32768x512 (BF16; the q_absorb + v_up views), o_proj
+# 4096x16384 (FP8); indexer wq_b 4096x1536, wk 128x4096, weights_proj 32x4096,
+# kpool gate 128x4096 (all BF16).
+G53_DSA_MATMUL = (
+    1536 * G53_H
+    + 512 * G53_H
+    + 16384 * 1536
+    + 32768 * 512
+    + G53_H * 16384
+    + 4096 * 1536
+    + 128 * G53_H
+    + 32 * G53_H
+    + 128 * G53_H
+)  # 142_606_336
+G53_DSA_VECTORS = 1536 + 512 + 4 * 128 + 2 * 128  # q_a/kv_a norms, kpool ape, k_norm w+b
+# mHC, per layer: hc_{attn,ffn}_fn 24x16384, _base 24, _scale 3; plus the input and
+# post-attention RMSNorm scales that run inside the pre kernels.
+G53_MHC_FN = 2 * 24 * (4 * G53_H)
+G53_MHC_VECTORS = 2 * (24 + 3) + 2 * G53_H
+G53_DENSE = 3 * 12288 * G53_H
+G53_EXPERT = 3 * 2048 * G53_H
+G53_ROUTER = 288 * G53_H
+G53_MOE_TOTAL = G53_ROUTER + 288 + 288 * G53_EXPERT + G53_EXPERT  # + e_score bias + shared
+G53_MOE_ACTIVE = G53_ROUTER + 288 + 8 * G53_EXPERT + G53_EXPERT
+G53_EMBED = G53_VOCAB * G53_H
+G53_COMMON = (
+    G53_KDA_LAYERS * (G53_KDA_MATMUL + G53_KDA_VECTORS)
+    + G53_DSA_LAYERS * (G53_DSA_MATMUL + G53_DSA_VECTORS)
+    + G53_LAYERS * (G53_MHC_FN + G53_MHC_VECTORS)
+    + G53_DENSE_LAYERS * G53_DENSE
+    + G53_H  # final norm
+)
+G53_TOTAL = G53_COMMON + G53_MOE_LAYERS * G53_MOE_TOTAL + 2 * G53_EMBED
+G53_ACTIVE_LAYERS = G53_COMMON + G53_MOE_LAYERS * G53_MOE_ACTIVE
+
+
+@pytest.fixture(scope="module")
+def glm53():
+    return load_model(GLM53)
+
+
+def test_glm53_registry_schedule_and_hand_derived_params(glm53):
+    assert REGISTRY["Glm5NextForConditionalGeneration"] is not None
+    assert [(stack.tag, stack.count) for stack in glm53.layers] == [
+        ("first_kda_dense", 1),
+        ("kda_dense", 2),
+        ("dsa_moe", 11),
+        ("kda_moe", 31),
+    ]
+    assert glm53.num_layers == G53_LAYERS
+    label = glm53.label(Workload(matmul_tokens=0, head_positions=0))
+    assert G53_TOTAL == 313_326_811_966
+    assert label.params["total"] == G53_TOTAL
+    assert label.params["activated"]["layers"] == G53_ACTIVE_LAYERS == 16_107_944_766
+    assert label.params["activated"]["with_embed_head"] == G53_ACTIVE_LAYERS + 2 * G53_EMBED
+    breakdown = label.params["breakdown"]
+    assert breakdown["residual_mix"] == G53_LAYERS * (G53_MHC_FN + 2 * (24 + 3))
+    assert breakdown["router"] == G53_MOE_LAYERS * (G53_ROUTER + 288)
+    assert breakdown["experts"] == G53_MOE_LAYERS * 288 * G53_EXPERT
+
+
+@pytest.mark.skipif(not GLM53_SNAPSHOT.exists(), reason="GLM-5.3-Flash checkpoint not present")
+def test_glm53_params_and_weight_bytes_match_the_safetensors_index(glm53):
+    """The checkpoint is the oracle: elements exactly; bytes up to FP32 vectors.
+
+    Excluded: ``model.visual.*`` (vision tower), layer 45 (the MTP layer), and
+    ``*.weight_scale_inv`` (FP8 block scales are not parameters; their bytes are
+    compared separately). The accountant bills learned vectors at the master dtype,
+    so the checkpoint's FP32 vectors (A_log, dt_bias, hc base/scale, e_score bias)
+    are the only byte residual: 2 extra bytes per FP32 element.
+    """
+    import struct
+
+    index = json.loads((GLM53_SNAPSHOT / "model.safetensors.index.json").read_text())
+    element_bytes = {"BF16": 2, "F32": 4, "F8_E4M3": 1}
+    elements = weight_bytes = scale_bytes = fp32_elements = 0
+    for shard in sorted(set(index["weight_map"].values())):
+        with open(GLM53_SNAPSHOT / shard, "rb") as handle:
+            header = json.loads(handle.read(struct.unpack("<Q", handle.read(8))[0]))
+        for name, tensor in header.items():
+            if name == "__metadata__" or "visual" in name or ".layers.45." in name:
+                continue
+            count = math.prod(tensor["shape"])
+            size = count * element_bytes[tensor["dtype"]]
+            if name.endswith("weight_scale_inv"):
+                scale_bytes += size
+                continue
+            elements += count
+            weight_bytes += size
+            fp32_elements += count if tensor["dtype"] == "F32" else 0
+    assert elements == G53_TOTAL
+
+    # Full-model weight bytes at stored precision, one pass over every instance.
+    accountant_bytes = 2 * G53_EMBED * 2  # BF16 embedding + lm_head
+    for stack in glm53.layers:
+        groups = [
+            *stack.attn.matmul_groups(),
+            *stack.ffn.matmul_groups(),
+            *stack.mixer.matmul_groups(),
+        ]
+        accountant_bytes += stack.count * sum(
+            group.total_count * glm53.weight_bytes_per_instance(group) for group in groups
+        )
+        vectors = [
+            *stack.attn.learned_weight_groups(),
+            *stack.mixer.learned_weight_groups(),
+        ]
+        accountant_bytes += stack.count * 2 * sum(weight.elements for weight in vectors)
+    accountant_bytes += 2 * sum(norm.elements * norm.count for norm in glm53.norm_weights)
+    assert fp32_elements == 295_230
+    assert accountant_bytes == weight_bytes + scale_bytes - 2 * fp32_elements
+
+
+def test_glm53_precision_follows_the_layer_qualified_exclusions(glm53):
+    """FP8 exactly where the checkpoint ships a ``weight_scale_inv``."""
+    dtypes = {
+        stack.tag: {
+            group.name: glm53.matmul_compute_dtype(group)
+            for group in (
+                *stack.attn.matmul_groups(),
+                *stack.ffn.matmul_groups(),
+                *stack.mixer.matmul_groups(),
+            )
+        }
+        for stack in glm53.layers
+    }
+    fp8 = {name for name, dtype in dtypes["dsa_moe"].items() if dtype == "fp8"}
+    assert fp8 == {
+        "q_a_proj",
+        "kv_a_proj",
+        "q_b_proj",
+        "o_proj",
+        "expert_gate_up",
+        "expert_down",
+        "shared_gate_up",
+        "shared_down",
+    }
+    # `self_attn.o_proj` is excluded on KDA layers only; DSA's o_proj stays FP8.
+    assert dtypes["kda_moe"]["o_proj"] == "bf16"
+    assert {name for name, dtype in dtypes["kda_dense"].items() if dtype == "fp8"} == {
+        "gate_up",
+        "down",
+    }
+    assert dtypes["kda_moe"]["router"] == "bf16"
+
+
+def test_glm53_kpool_closed_forms_match_brute_force():
+    from model.work.attention.glm53_kpool_dsa import (
+        pooled_prefix_sum,
+        selected_keys,
+        selected_prefix_sum,
+    )
+
+    for n in (0, 1, 3, 4, 5, 2047, 2048, 2051, 2052, 2053, 4100, 8193):
+        assert pooled_prefix_sum(n, 4) == sum(k // 4 for k in range(1, n + 1))
+        assert selected_prefix_sum(n, 2048, 4) == sum(min(k, 2048 + k % 4) for k in range(1, n + 1))
+    # All keys are selected up to 512 complete pools (k <= 2051), then top-2048 + tail.
+    assert [selected_keys(k, 2048, 4) for k in (2051, 2052, 8000, 8001)] == [2051, 2048, 2048, 2049]
+
+
+def test_glm53_decode_flop_and_byte_goldens(glm53):
+    """32 decodes at context 2048 (FP8 KV not declared by the config -> BF16 latent)."""
+    tokens = 32
+    label = glm53.label(Workload.causal_lm(decode=[2048] * tokens, sampled=tokens))
+    rows = {segment.name: segment for segment in label.segments}
+    kda_internal = 6 * G53_KDA_HEADS * G53_KDA_DIM * G53_KDA_DIM * tokens * G53_KDA_LAYERS
+    # k = 2048: floor(2048/4) = 512 pools scored; min(2048, 2048 + 0) = 2048 keys.
+    indexer = 2 * 32 * 128 * 512 * tokens * G53_DSA_LAYERS
+    sparse_mla = 2 * 64 * (512 + 512) * 2048 * tokens * G53_DSA_LAYERS
+    assert label.flops["attn_internal"] == kda_internal + indexer + sparse_mla
+    kda_proj = G53_KDA_MATMUL
+    dsa_proj = G53_DSA_MATMUL
+    assert label.flops["attn_proj"] == 2 * tokens * (
+        G53_KDA_LAYERS * kda_proj + G53_DSA_LAYERS * dsa_proj
+    )
+    assert label.flops["ffn"] == 2 * tokens * (
+        G53_DENSE_LAYERS * G53_DENSE + G53_MOE_LAYERS * 9 * G53_EXPERT
+    )
+    # The router is necessary once per MoE layer (vLLM computes it twice).
+    assert label.flops["router"] == 2 * tokens * G53_ROUTER * G53_MOE_LAYERS
+    assert label.flops["lm_head"] == 2 * tokens * G53_H * G53_VOCAB
+    pre, post = 2 * 4 * G53_H, 2 * 16 * G53_H + 2 * 4 * G53_H
+    mhc = (
+        G53_LAYERS * 2 * (2 * 24 * (4 * G53_H))  # hc_attn_fn + hc_ffn_fn projections
+        + G53_LAYERS * 2 * pre
+        + (2 * G53_LAYERS - 1) * post  # every boundary but the first has a post ...
+        + post  # ... and the last FFN's post is the standalone final post
+    ) * tokens
+    assert label.flops["residual_mix"] == mhc
+    # Decode reads the other 2047 selected keys' 512-wide BF16 latent, 511 index pools
+    # (2047 // 4) at 128 B + 4 B scale, and read+writes the 4 MiB fp32 KDA state.
+    assert rows["dsa_moe.attn.decode"].bytes_total == tokens * 2047 * 1024 * G53_DSA_LAYERS
+    assert rows["dsa_moe.indexer.decode"].bytes_total == tokens * 511 * 132 * G53_DSA_LAYERS
+    state = G53_KDA_HEADS * G53_KDA_DIM * G53_KDA_DIM * 4
+    assert rows["kda_moe.recurrent_state.decode_read"].bytes_total == tokens * state * 31
+    assert rows["kda_moe.conv_state.decode_write"].bytes_total == tokens * 3 * 8192 * 3 * 2 * 31
+    # Each request's new token is its 2048th, completing pool 512 (one 132 B entry);
+    # each new latent row is written once.
+    assert rows["dsa_moe.index_cache_append"].bytes_total == tokens * 132 * G53_DSA_LAYERS
+    assert rows["dsa_moe.mla_cache_append"].bytes_total == tokens * 1024 * G53_DSA_LAYERS
+
+
+def test_glm53_prefill_flop_goldens_and_saturated_chunk(glm53):
+    """One fresh 2048-token prefill, and a 100-token chunk past the top-k cap."""
+    label = glm53.label(Workload.causal_lm(prefill=[(2048, 0)], sampled=1))
+    # sum_{k=1..2048} floor(k/4) = 4*512*511/2 + 512 = 523_776 scored pools;
+    # every k <= 2051 keeps all keys: sum k = 2048*2049/2 = 2_098_176.
+    indexer = 2 * 32 * 128 * 523_776 * G53_DSA_LAYERS
+    sparse_mla = 2 * 64 * 1024 * 2_098_176 * G53_DSA_LAYERS
+    kda_internal = 6 * G53_KDA_HEADS * G53_KDA_DIM**2 * 2048 * G53_KDA_LAYERS
+    assert label.flops["attn_internal"] == kda_internal + indexer + sparse_mla
+    assert label.flops["lm_head"] == 2 * 1 * G53_H * G53_VOCAB
+    rows = {segment.name: segment for segment in label.segments}
+    # 2048 / 4 = 512 pools complete; nothing is cached before a fresh prefill.
+    assert rows["dsa_moe.index_cache_append"].bytes_total == 512 * 132 * G53_DSA_LAYERS
+    assert rows["dsa_moe.attn.prefill"].bytes_total == 0
+    assert rows["kda_moe.recurrent_state.prefill_write"].bytes_total == (
+        G53_KDA_HEADS * G53_KDA_DIM**2 * 4 * 31
+    )
+    assert rows["kda_moe.recurrent_state.prefill_read"].bytes_total == 0
+
+    chunk = glm53.label(Workload.causal_lm(prefill=[(100, 4000)], sampled=1))
+    rows = {segment.name: segment for segment in chunk.segments}
+    # k = 4001..4100: floors 3x1000 + 4x(1001..1024) + 1025 = 101_225;
+    # selected 100x2048 + sum(k mod 4) = 204_800 + 25x(1+2+3+0) = 204_950.
+    assert rows["dsa_moe.indexer.prefill"].flops_total == 2 * 32 * 128 * 101_225 * 11
+    assert rows["dsa_moe.attn.prefill"].flops_total == 2 * 64 * 1024 * 204_950 * 11
+    # The first query (k = 4001) reads min(4001, 2048 + 1) - 1 = 2048 cached latents.
+    assert rows["dsa_moe.attn.prefill"].bytes_total == 2048 * 1024 * 11
+    assert rows["dsa_moe.indexer.prefill"].bytes_total == 1000 * 132 * 11
+    assert rows["dsa_moe.index_cache_append"].bytes_total == (1025 - 1000) * 132 * 11
+
+
+def test_glm53_kpool_dsa_rejects_collapsed_geometry(glm53):
+    collapsed = Workload(
+        matmul_tokens=32,
+        head_positions=32,
+        attn=[AttnInteraction(1, 65536, 65536, "full", phase="decode")],
+        attention_step_count=32,
+        attention_step_count_by_phase={"prefill": 0, "decode": 32},
+        attention_tokens_by_phase={"prefill": 0, "decode": 32},
+    )
+    with pytest.raises(ValueError, match="per-request causal geometry"):
+        glm53.label(collapsed)
