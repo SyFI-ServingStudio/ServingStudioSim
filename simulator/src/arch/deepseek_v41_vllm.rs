@@ -638,21 +638,36 @@ fn index_plan(
         .collect()
 }
 
-/// All-rank bytes of per-token KV state. Each TP rank holds the one KV head
-/// (replicated): the four KV-source layers' NVFP4 compressed rows (288 B per
-/// `ratio` tokens) and the index owners' FP8 keys (132 B per `ratio` tokens).
-/// The ratio-0 sliding window (128 tokens per layer) is a per-request constant,
-/// not per-token state, so it is left out.
+/// All-rank bytes of per-token KV state, in vLLM's page layout. Each TP rank
+/// holds the one KV head (replicated). vLLM packs, per 128-token block, every
+/// KV-source layer's NVFP4 compressed page (288 B per `ratio` tokens) and each
+/// owned indexer FP8 key page (132 B per `ratio` tokens), each page rounded up
+/// to the 512 B TMA stride. With sources 2/8/14 at ratio 2 and 20 at ratio 1
+/// that is 135168 B per block, 1056 B per token per rank (the ratio-2 index
+/// pages round 8448 B up to 8704 B).
+///
+/// The sliding-window cache (40 layers x 528 B, 128-token window) and the
+/// ratio-2 compressor rings are per-request constants vLLM frees outside the
+/// window, not per-token state, so they are left out (a few MB per request).
 fn total_kv_bytes_per_token(model: &DeepseekV41ModelCfg, tp_size: u32) -> u64 {
-    let per_rank: u64 = model
+    const BLOCK_TOKENS: u64 = 128;
+    const PAGE_ALIGN: u64 = 512;
+    let page = |states: u64, bytes: u64| (states * bytes).div_ceil(PAGE_ALIGN) * PAGE_ALIGN;
+    let per_rank_block: u64 = model
         .kv_source_layer_ids
         .iter()
         .map(|&layer| {
-            let ratio = u64::from(model.compress_ratios[layer as usize]);
-            (288 + 132) / ratio
+            let states = BLOCK_TOKENS / u64::from(model.compress_ratios[layer as usize]);
+            // Index K caches are owned by KV sources that are also index sources.
+            let index = if model.index_source_layer_ids.contains(&layer) {
+                page(states, 132)
+            } else {
+                0
+            };
+            page(states, 288) + index
         })
         .sum();
-    per_rank * u64::from(tp_size)
+    per_rank_block / BLOCK_TOKENS * u64::from(tp_size)
 }
 
 fn layer_config(
@@ -1272,8 +1287,9 @@ mod tests {
         }
         assert_eq!(configs.head.vocab_size, 129_280);
         assert_eq!(configs.engram_prefetch.table_rows, ENGRAM_TABLE_ROWS_RANK0);
-        // (288 + 132) / 2 x 3 + (288 + 132) x 1, replicated on 4 ranks.
-        assert_eq!(configs.total_kv_bytes_per_token, (210 * 3 + 420) * 4);
+        // vLLM block of 128 tokens: 3 x (18432 + 8704) + (36864 + 16896)
+        // = 135168 B per rank -> 1056 B/token, replicated on 4 ranks.
+        assert_eq!(configs.total_kv_bytes_per_token, 1056 * 4);
 
         let resolved = resolve_configs(&configs);
         assert_eq!(resolved.head.lm_head.n.get(), 32_320);
