@@ -60,8 +60,9 @@ register(
 
 # vLLM's default FlashInfer all-reduce backend on single-node B200
 # (``VLLM_FLASHINFER_ALLREDUCE_BACKEND=auto`` -> mnnvl). It runs in the vLLM
-# fork venv because production pins FlashInfer 0.6.18 there; the project venv
-# ships 0.6.11, older than the mnnvl CUDA-graph fix vLLM relies on (>= 0.6.12).
+# fork venv, whose FlashInfer (0.7.0 in the DeepSeek-V4.1 fork) is the
+# production pin; the project venv ships 0.6.11, older than the mnnvl CUDA-graph
+# fix vLLM relies on (>= 0.6.12).
 # One-shot vs two-shot is FlashInfer's AUTO rule inside the call, not an arg.
 register(
     KernelProfilerSpec(
