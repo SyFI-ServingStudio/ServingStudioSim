@@ -19,6 +19,7 @@ from profiling.runners.exceptions import ProfilerNotImplemented
 
 _Q_BACKEND = "torch_mla_q_absorb_glm52"
 _V_UP_BACKEND = "torch_mla_v_up_glm52"
+_WO_A_BACKEND = "deepgemm_mxfp8_einsum_dsv41_wo_a"
 
 
 def test_args_field_order_and_dtype_coercion():
@@ -54,7 +55,7 @@ def test_kind_table_backend_and_runner_ref_contract():
     spec = find_kernel_profiler_spec(KIND, _Q_BACKEND)
 
     assert KIND == "batched_gemm"
-    assert known_backends(KIND) == [_Q_BACKEND, _V_UP_BACKEND]
+    assert known_backends(KIND) == [_Q_BACKEND, _V_UP_BACKEND, _WO_A_BACKEND]
     assert spec.kernel_kind == KIND
     assert spec.table_name == KIND
     assert spec.backend == _Q_BACKEND
