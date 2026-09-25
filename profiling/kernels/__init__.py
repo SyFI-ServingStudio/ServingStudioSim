@@ -30,6 +30,7 @@ from profiling.kernels import (
     deepseek_v4_sparse_mla_decode,  # noqa: F401
     deepseek_v4_sparse_mla_prefill,  # noqa: F401
     deepseek_v4_terminal_mhc_head,  # noqa: F401
+    deepseek_v41_mega_attn,  # noqa: F401
     dsa_index_cache_append,  # noqa: F401
     dsa_indexer_q_rope_quant,  # noqa: F401
     dsa_mqa_logits_prefill,  # noqa: F401
