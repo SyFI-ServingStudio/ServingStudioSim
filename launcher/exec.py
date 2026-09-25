@@ -345,9 +345,9 @@ async def run_analysis(
     JSON) then the Python renderer (payload JSON → PNGs). Failures warn and return
     — analysis must never fail an otherwise-successful run.
 
-    `render=False` skips the PNGs and keeps the reports, payloads and trace that
-    the Analyzer UI reads. A sweep does this by default: on a 640-run grid the
-    renderer was 73% of all CPU, more than the simulations themselves.
+    `render=False` (`--no-plot`) skips the PNGs and keeps the reports, payloads
+    and trace that the Analyzer UI reads. On a 640-run grid the renderer was 73%
+    of all CPU, more than the simulations themselves.
 
     Async: across a sweep, many runs' analyze+render overlap under the existing
     semaphore instead of serializing on a blocking call that stalls the event loop.
@@ -554,12 +554,15 @@ def run_alignment_analysis(
     return True
 
 
-def run_sweep_analysis(experiment_dir: Path, build_type: str = "debug") -> None:
+def run_sweep_analysis(
+    experiment_dir: Path, build_type: str = "debug", *, render: bool = True
+) -> None:
     """Synchronously collect and render one explicit launcher sweep.
 
     The simulation tasks and their per-run analyzers have already completed at
     this boundary. Rust reads `sweep_manifest.json` plus their small JSON reports;
-    Python only renders the resulting experiment-level payload.
+    Python only renders the resulting experiment-level payload, and not at all
+    when `render=False` (`--no-plot`).
     """
     analyzer = analyzer_binary_path(build_type)
     if not analyzer.exists():
@@ -587,6 +590,8 @@ def run_sweep_analysis(experiment_dir: Path, build_type: str = "debug") -> None:
         != 0
     ):
         print(f"[aggregate] sweep compute failed for {experiment_dir}")
+        return
+    if not render:
         return
     if (
         run_step(

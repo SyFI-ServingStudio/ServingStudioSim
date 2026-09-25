@@ -141,12 +141,12 @@ def _build_argparse():
         "otherwise runs after each successful run.",
     )
     parser.add_argument(
-        "--render-runs",
+        "--no-plot",
         action="store_true",
-        help="In a sweep, also render each run's PNGs. By default a sweep writes "
-        "every run's reports, payloads and trace but renders only its aggregate "
-        "figures; draw one run later with `python analyzer/python render <log_dir>`. "
-        "A single run always renders.",
+        help="Run the analyzer but render no PNGs (per run or for the sweep). "
+        "Reports, payloads and traces are still written, so the Analyzer UI works; "
+        "on a large sweep the PNGs cost more CPU than the simulations. Draw one run "
+        "later with `python analyzer/python render <log_dir>`.",
     )
     parser.add_argument(
         "--emit-backends",
@@ -694,6 +694,7 @@ def main(argv: list[str] | None = None) -> int:
             profile_freq=args.profile_freq,
             analyze=not args.no_analyze,
             analyze_subjects=analyze_subjects,
+            plot=not args.no_plot,
         )
         return 0 if ok else 1
     return run_sweep(
@@ -704,7 +705,7 @@ def main(argv: list[str] | None = None) -> int:
         refresh=args.refresh,
         analyze=not args.no_analyze,
         analyze_subjects=analyze_subjects,
-        render_runs=args.render_runs,
+        plot=not args.no_plot,
     )
 
 

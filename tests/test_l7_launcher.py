@@ -29,6 +29,7 @@ from launcher.exec import (
     run_analysis,
     run_iter_breakdown,
     run_logged_process,
+    run_sweep_analysis,
 )
 from launcher.process import ProcessResult
 from launcher.process.artifacts import ArtifactValidation
@@ -304,6 +305,25 @@ def test_run_analysis_renders_only_when_asked(monkeypatch, tmp_path, render):
     asyncio.run(run_analysis(log_dir, render=render))
 
     assert sorted(stages) == sorted(["analyze_compute", "trace", *(["render"] if render else [])])
+
+
+@pytest.mark.parametrize("render", [True, False])
+def test_sweep_analysis_renders_only_when_asked(monkeypatch, tmp_path, render):
+    analyzer_path = tmp_path / "analyze"
+    analyzer_path.write_text("")
+    commands: list[list[str]] = []
+
+    def capture(argv):
+        commands.append([str(argument) for argument in argv])
+        return 0, ""
+
+    monkeypatch.setattr("launcher.exec.analyzer_binary_path", lambda _build_type: analyzer_path)
+    monkeypatch.setattr("launcher.exec._run_capture_sync", capture)
+
+    run_sweep_analysis(tmp_path, render=render)
+
+    assert [command[1] for command in commands if command[0] == str(analyzer_path)] == ["sweep"]
+    assert any("render" in command for command in commands) == render
 
 
 def test_run_capture_avoids_asyncio_subprocess_transport(monkeypatch):
@@ -1629,12 +1649,15 @@ def test_aggregate_calls_rust_sweep_pipeline(monkeypatch, tmp_path):
 
     monkeypatch.setattr(
         "launcher.sweep.run_sweep_analysis",
-        lambda experiment_dir, build_type: calls.append((experiment_dir, build_type)),
+        lambda experiment_dir, build_type, *, render: calls.append(
+            (experiment_dir, build_type, render)
+        ),
     )
 
     _aggregate(tmp_path, "release")
+    _aggregate(tmp_path, "release", plot=False)
 
-    assert calls == [(tmp_path, "release")]
+    assert calls == [(tmp_path, "release", True), (tmp_path, "release", False)]
 
 
 # ── real subprocess plumbing (uses the built binary) ────────────────────────

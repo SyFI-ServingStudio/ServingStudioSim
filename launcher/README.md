@@ -183,14 +183,13 @@ EnsureCache → Simulate → ValidateRawArtifacts
 `ValidateRawArtifacts → Finalize`. BuildSimulator and BuildAnalyzer are batch
 stages before this per-run graph.
 
-A sweep drops `Render` from each run's graph unless `--render-runs` is given,
-so `Trace → Finalize`. Every run still gets its reports, payloads and trace,
-which the Analyzer UI reads, and the sweep still renders its aggregate figures.
-The per-run PNGs were the largest cost of a grid: on a 640-run Llama-3-8B sweep
-the renderer took ~22 CPU-s per run (16 forked matplotlib workers, 50 figures)
-against ~3 CPU-s for the simulation, 73% of the sweep's CPU. Draw one run
-afterwards with `python analyzer/python render <run log_dir>`. A single run
-always renders.
+`--no-plot` removes only `Render`, so `Trace → Finalize`, and the sweep skips
+its aggregate render too. Every run still gets its reports, payloads and trace,
+which the Analyzer UI reads. PNGs are the largest cost of a big grid: on a
+640-run Llama-3-8B sweep the renderer took ~22 CPU-s per run (16 forked
+matplotlib workers, 50 figures) against ~3 CPU-s for the simulation, 73% of the
+sweep's CPU, and `--no-plot` halved the sweep's wall time. Draw one run
+afterwards with `python analyzer/python render <run log_dir>`.
 
 Two concurrency mechanisms have different ownership:
 
@@ -665,7 +664,7 @@ python -m launcher <preset.yaml|json> [<preset2.yaml|json> ...]
                    [--override path=value ...]
                    [--dry-run] [--cache-report] [--refresh]
                    [--build-type <cargo-profile>] [--profile [--profile-freq HZ]]
-                   [--no-analyze] [--render-runs] [--emit-backends [FILE]]
+                   [--no-analyze] [--no-plot] [--emit-backends [FILE]]
 python -m launcher timing-predict <config.yaml|json> [<config2.yaml|json> ...]
                    [--build-type <cargo-profile>] [--no-analyze]
 python -m launcher kernel-profile {list,query,count-missing,run,measure,merge-db,audit-provenance} ...
