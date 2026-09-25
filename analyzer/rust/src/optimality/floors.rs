@@ -500,12 +500,19 @@ fn run_labeler_request(log_dir: &Path, request: Value) -> Result<Value> {
     // (128 threads on a 224-core host) spent ~95% of the labeler's CPU spinning
     // in `blas_thread_server` without shortening its wall time, oversubscribed
     // the host when a sweep analyzes runs in parallel, and made results drift
-    // run to run (reduction order; up to 4e-8 relative).
-    let mut child = Command::new("uv")
+    // run to run (reduction order; up to 4e-8 relative). Its matrix products are
+    // (shapes x ~8) @ (~8 x segments): one thread is within 0.14 s of the pool
+    // even at a million shapes. A caller that sets either variable keeps it.
+    let mut command = Command::new("uv");
+    command
         .args(["run", "python", "-m", "model.work.floors"])
-        .arg(&log_dir_abs)
-        .env("OPENBLAS_NUM_THREADS", "1")
-        .env("OMP_NUM_THREADS", "1")
+        .arg(&log_dir_abs);
+    for variable in ["OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS"] {
+        if std::env::var_os(variable).is_none() {
+            command.env(variable, "1");
+        }
+    }
+    let mut child = command
         .current_dir(&root)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
