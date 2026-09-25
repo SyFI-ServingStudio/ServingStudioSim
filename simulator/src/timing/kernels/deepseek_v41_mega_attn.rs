@@ -53,8 +53,6 @@ const MAX_REQUESTS: u32 = 256;
 const MAX_DECODE_ROWS: u32 = 2048;
 /// SMs on the only supported GPU (NVIDIA B200); the decode wave width at 64 heads.
 const B200_SMS: u32 = 148;
-/// Last decode row the grid covers; beyond it the cache extrapolates.
-const DECODE_GRID_ROWS: u32 = 1037;
 
 #[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct DeepseekV41MegaAttnKernelConfig {
@@ -448,12 +446,15 @@ fn token_axis(config: &DeepseekV41MegaAttnKernelConfig) -> Vec<f64> {
         let wave = rows_per_wave(config);
         let edges = (1..)
             .map(|waves| waves * wave)
-            .take_while(|&rows| rows < DECODE_GRID_ROWS)
+            .take_while(|&rows| rows < MAX_DECODE_ROWS)
             .flat_map(|rows| [rows, rows + 1]);
+        // End on the profiler's row limit, not on a wave edge, so any
+        // extrapolation keeps the average per-wave slope.
         let mut axis = [1, 2, 4, 8, 16, 32, 64, 128]
             .into_iter()
             .filter(|&rows| rows < wave)
             .chain(edges)
+            .chain([MAX_DECODE_ROWS])
             .collect::<Vec<_>>();
         axis.sort_unstable();
         return Axis::values(axis);
@@ -478,12 +479,16 @@ fn excess_axis(config: &DeepseekV41MegaAttnKernelConfig) -> Vec<f64> {
     if is_decode(config) || config.compress_ratio == 0 {
         return vec![0.0];
     }
-    let longest = config.max_model_len / config.compress_ratio;
+    // The top planes are one and two max-length requests at the largest
+    // token count; the second covers chunks that pad to two long requests.
+    let longest = f64::from(config.max_model_len / config.compress_ratio);
+    let floor = area_floor(config.max_num_batched_tokens, config.compress_ratio);
+    let (one, two) = (longest - floor, 2.0 * longest - floor);
     let mut axis = Axis::values([0, 1024, 4096, 16384, 65536])
         .into_iter()
-        .filter(|&rows| rows < f64::from(longest))
+        .filter(|&rows| rows < one)
         .collect::<Vec<_>>();
-    axis.push(f64::from(longest));
+    axis.extend([one, two]);
     axis
 }
 
@@ -566,6 +571,10 @@ mod tests {
     use super::*;
 
     fn config(mode: &str, ratio: u32) -> DeepseekV41MegaAttnKernelConfig {
+        config_with_heads(mode, ratio, 64)
+    }
+
+    fn config_with_heads(mode: &str, ratio: u32, heads: u32) -> DeepseekV41MegaAttnKernelConfig {
         serde_json::from_value(serde_json::json!({
             "backends": ["flashmla_mega"],
             "gpu_name": "NVIDIA B200",
@@ -573,7 +582,7 @@ mod tests {
             "compress_ratio": ratio,
             "window_size": 128,
             "index_topk": 512,
-            "num_heads": 64,
+            "num_heads": heads,
             "head_dim": 512,
             "rope_dim": 64,
             "max_model_len": 131072,
@@ -643,9 +652,9 @@ mod tests {
     /// and a grid past the 500 feasible-coordinate ceiling.
     #[test]
     fn canonical_batches_project_onto_their_grid_points() {
-        for mode in ["decode", "prefill"] {
+        for (mode, heads) in [("decode", 64), ("decode", 128), ("prefill", 64)] {
             for ratio in 0..=2 {
-                let config = config(mode, ratio);
+                let config = config_with_heads(mode, ratio, heads);
                 let grid = DeepseekV41MegaAttnSpec::sweep_grid(&config);
                 let mask = DeepseekV41MegaAttnSpec::infeasible_mask(&config, &grid);
                 let feasible = mask.iter().filter(|&&drop| !drop).count();
