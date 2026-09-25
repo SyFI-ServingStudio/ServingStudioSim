@@ -432,6 +432,7 @@ impl Deployment for UnifiedDeployment {
                 routing_seed,
                 expert_popularity_file,
                 token_corpus_file,
+                decoder_swa_bounded_replay,
                 ..
             }
             | IterArchSel::DeepseekV41VllmSerialStreams {
@@ -439,6 +440,7 @@ impl Deployment for UnifiedDeployment {
                 routing_seed,
                 expert_popularity_file,
                 token_corpus_file,
+                decoder_swa_bounded_replay,
                 ..
             }) => {
                 // Pure TP4 attention (one attention group, four replicated KV
@@ -456,6 +458,7 @@ impl Deployment for UnifiedDeployment {
                     expert_popularity_file.as_deref(),
                     token_corpus_file.as_deref(),
                     serialize_streams,
+                    *decoder_swa_bounded_replay,
                     &gpu_name,
                     MODEL_NAME,
                     bridge,

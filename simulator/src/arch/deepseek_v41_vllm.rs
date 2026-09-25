@@ -500,6 +500,82 @@ pub struct DeepseekV41VllmParallel {
     pub gpu_name: String,
     /// The serial-stream counterfactual: every gated side branch runs serial.
     pub serialize_streams: bool,
+    /// Decoder SWA bounded replay (what-if; see [`BoundedReplay`]).
+    pub decoder_swa_bounded_replay: bool,
+}
+
+/// Decoder SWA bounded replay: a counterfactual with no framework capture
+/// behind it. vLLM PR #58132 and SGLang `--enable-decoder-swa-bounded-replay`
+/// (`python/sglang/srt/models/deepseek_v4.py`, `late_layer_start` and the
+/// `late_layer_tail` slicing in `forward`) run the layers past the last KV
+/// source over each prefill request's last `sliding_window` extend tokens only:
+/// those layers own no compressed KV (ratio 0/1, not KV sources), so the only
+/// state they leave for later decode steps is the sliding window, and only the
+/// last token's hidden state reaches the head.
+///
+/// Modeled as a reduced input for every body whose layers are all
+/// `>= late_layer_start` (= `max(kv_source_layer_ids) + 1`, layer 21 on
+/// V4.1-Flash): each prefill chunk `(append, context)` becomes
+/// `(min(append, window), context)`, decode rows are unchanged, and the dense
+/// rows re-pad to the CUDA-graph size of the reduced token count (which also
+/// re-derives the aux-stream gate). Layer 0, the prologue, the Engram prefetch,
+/// layers `1..late_layer_start` and the head keep the full input. The cost tree
+/// is the same with the flag on or off; only slot inputs change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BoundedReplay {
+    pub late_layer_start: u32,
+    /// Replayed extend tokens per prefill chunk (`sliding_window`, 128).
+    pub window: u32,
+}
+
+impl BoundedReplay {
+    /// Derive the tail start from the config and check the SGLang
+    /// preconditions: every late layer compresses at ratio 0 or 1, is no KV
+    /// source, and has no Engram block.
+    pub fn from_model(model: &DeepseekV41ModelCfg) -> std::result::Result<Self, BuildError> {
+        let late_layer_start = model
+            .kv_source_layer_ids
+            .iter()
+            .max()
+            .map(|&last| last + 1)
+            .ok_or_else(|| fit_failed("decoder SWA bounded replay needs kv_source_layer_ids"))?;
+        if late_layer_start >= model.num_layers {
+            return Err(fit_failed(format!(
+                "decoder SWA bounded replay: late_layer_start {late_layer_start} leaves no tail"
+            )));
+        }
+        for layer in late_layer_start..model.num_layers {
+            let ratio = model.compress_ratios[layer as usize];
+            if ratio > 1
+                || model.kv_source_layer_ids.contains(&layer)
+                || model.engram_layer_ids.contains(&layer)
+            {
+                return Err(fit_failed(format!(
+                    "decoder SWA bounded replay: late layer {layer} must be a non-KV-source, \
+                     non-Engram layer with compress ratio 0 or 1 (got ratio {ratio})"
+                )));
+            }
+        }
+        Ok(Self {
+            late_layer_start,
+            window: model.sliding_window,
+        })
+    }
+
+    fn is_late(&self, layers: &[u32]) -> std::result::Result<bool, BuildError> {
+        let late = layers
+            .iter()
+            .filter(|&&l| l >= self.late_layer_start)
+            .count();
+        match late {
+            0 => Ok(false),
+            n if n == layers.len() => Ok(true),
+            _ => Err(fit_failed(format!(
+                "body for layers {layers:?} straddles late_layer_start {}",
+                self.late_layer_start
+            ))),
+        }
+    }
 }
 
 /// One body layer's worklet configs.
@@ -527,6 +603,10 @@ pub struct DeepseekV41VllmConfigs {
     plan: Vec<PlanNode>,
     pub head: DeepseekV41HeadTpWorkletConfig,
     pub total_kv_bytes_per_token: u64,
+    /// `Some` with `decoder_swa_bounded_replay` on.
+    pub bounded_replay: Option<BoundedReplay>,
+    /// Per body: evaluated on the bounded-replay input (all layers late).
+    pub late_bodies: Vec<bool>,
 }
 
 pub struct DeepseekV41LayerResolved {
@@ -544,6 +624,8 @@ pub struct DeepseekV41VllmResolved {
     plan: Vec<PlanNode>,
     head: DeepseekV41HeadTpWorkletResolved,
     total_kv_bytes_per_token: u64,
+    bounded_replay: Option<BoundedReplay>,
+    late_bodies: Vec<bool>,
 }
 
 fn fit_failed(reason: impl Into<String>) -> BuildError {
@@ -583,6 +665,17 @@ pub fn build_configs(
         bodies.push(layer_config(model, parallel, demand, kind, layers.to_vec()));
         bodies.len() - 1
     });
+    let bounded_replay = parallel
+        .decoder_swa_bounded_replay
+        .then(|| BoundedReplay::from_model(model))
+        .transpose()?;
+    let late_bodies = match &bounded_replay {
+        Some(replay) => bodies
+            .iter()
+            .map(|body: &DeepseekV41LayerConfig| replay.is_late(&body.layers))
+            .collect::<std::result::Result<Vec<_>, _>>()?,
+        None => vec![false; bodies.len()],
+    };
     let gpu = parallel.gpu_name.clone();
     Ok(DeepseekV41VllmConfigs {
         prologue: DeepseekV41PrologueTpWorkletConfig {
@@ -620,6 +713,8 @@ pub fn build_configs(
             elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
         },
         total_kv_bytes_per_token: total_kv_bytes_per_token(model, parallel.tp_size),
+        bounded_replay,
+        late_bodies,
     })
 }
 
@@ -788,6 +883,8 @@ pub fn resolve_configs(configs: &DeepseekV41VllmConfigs) -> DeepseekV41VllmResol
         plan: configs.plan.clone(),
         head: DeepseekV41HeadTpWorklet::resolve_config(&configs.head),
         total_kv_bytes_per_token: configs.total_kv_bytes_per_token,
+        bounded_replay: configs.bounded_replay,
+        late_bodies: configs.late_bodies.clone(),
     }
 }
 
@@ -869,6 +966,8 @@ pub struct DeepseekV41VllmModel {
     head: DeepseekV41HeadTpWorklet,
     serialize_streams: bool,
     total_kv_bytes_per_token: u64,
+    bounded_replay: Option<BoundedReplay>,
+    late_bodies: Vec<bool>,
     cost_flat: Vec<FlatCostNode>,
     n_slots: usize,
 }
@@ -901,6 +1000,8 @@ pub fn build(
         head: DeepseekV41HeadTpWorklet::build(format!("{name}.head"), resolved.head, bridge)?,
         serialize_streams,
         total_kv_bytes_per_token: resolved.total_kv_bytes_per_token,
+        bounded_replay: resolved.bounded_replay,
+        late_bodies: resolved.late_bodies,
         cost_flat: Vec::new(),
         n_slots: 0,
         name,
@@ -952,11 +1053,25 @@ impl DeepseekV41VllmModel {
             .collect()
     }
 
-    fn eval_plan(&self, plan: &[PlanNode], input: &NormalizedInput, evaluator: &mut Evaluator) {
+    /// `late` is the bounded-replay input, used for bodies in `late_bodies`.
+    fn eval_plan(
+        &self,
+        plan: &[PlanNode],
+        input: &NormalizedInput,
+        late: &NormalizedInput,
+        evaluator: &mut Evaluator,
+    ) {
         for node in plan {
             match node {
-                PlanNode::Body(index) => self.bodies[*index].eval(input, evaluator),
-                PlanNode::Repeat { body, .. } => self.eval_plan(body, input, evaluator),
+                PlanNode::Body(index) => {
+                    let body_input = if self.late_bodies[*index] {
+                        late
+                    } else {
+                        input
+                    };
+                    self.bodies[*index].eval(body_input, evaluator)
+                }
+                PlanNode::Repeat { body, .. } => self.eval_plan(body, input, late, evaluator),
             }
         }
     }
@@ -975,7 +1090,15 @@ impl DeepseekV41VllmModel {
             },
             evaluator,
         );
-        self.eval_plan(&self.plan, &input, evaluator);
+        let late = self
+            .bounded_replay
+            .map(|replay| bounded_replay_input(&input, replay.window));
+        self.eval_plan(
+            &self.plan,
+            &input,
+            late.as_ref().unwrap_or(&input),
+            evaluator,
+        );
         self.head.eval(
             &DeepseekV41HeadTpWorkletInput {
                 num_tokens: input.rows,
@@ -1106,6 +1229,35 @@ fn normalize_input(input: &UnifiedArchInput) -> std::result::Result<NormalizedIn
     })
 }
 
+/// The input of a bounded-replay late layer ([`BoundedReplay`]): each prefill
+/// chunk keeps only its last `window` extend tokens; decode rows are unchanged.
+fn bounded_replay_input(full: &NormalizedInput, window: u32) -> NormalizedInput {
+    let prefill_query_context_pairs: Vec<(u32, u32)> = full
+        .attention
+        .prefill_query_context_pairs
+        .iter()
+        .map(|&(append, context)| (append.min(window), context))
+        .collect();
+    let decode_tokens = full.attention.decode_kv_lens.len() as u32;
+    let tokens = decode_tokens
+        + prefill_query_context_pairs
+            .iter()
+            .map(|&(append, _)| append)
+            .sum::<u32>();
+    let rows = cudagraph_rows(tokens);
+    let decode_only = prefill_query_context_pairs.is_empty() && decode_tokens > 0;
+    NormalizedInput {
+        rows,
+        logits_rows: full.logits_rows,
+        attention: DeepseekV41AttentionTpWorkletInput {
+            num_tokens: rows,
+            prefill_query_context_pairs,
+            decode_kv_lens: full.attention.decode_kv_lens.clone(),
+            aux_stream_live: attention_aux_stream_live(decode_only, rows, MAX_FULL_GRAPH_TOKENS),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -1144,6 +1296,7 @@ mod tests {
             ep_size: 4,
             gpu_name: GPU_NAME.into(),
             serialize_streams: false,
+            decoder_swa_bounded_replay: false,
         }
     }
 
@@ -1493,6 +1646,260 @@ mod tests {
             tokens_per_source_rank: vec![],
         })
         .is_err());
+    }
+
+    fn replay_parallel() -> DeepseekV41VllmParallel {
+        DeepseekV41VllmParallel {
+            decoder_swa_bounded_replay: true,
+            ..parallel()
+        }
+    }
+
+    fn one_group(prefill: Vec<(u32, u32)>, decode: Vec<u32>) -> UnifiedArchInput {
+        UnifiedArchInput {
+            groups: vec![group(prefill, decode)],
+            tokens_per_source_rank: vec![],
+        }
+    }
+
+    #[test]
+    fn bounded_replay_starts_after_the_last_kv_source_and_splits_no_body() {
+        let cfg = model_cfg();
+        let off = build_configs(&cfg, &parallel(), &uniform_demand()).unwrap();
+        assert_eq!(off.bounded_replay, None);
+        assert!(off.late_bodies.iter().all(|&late| !late));
+
+        let on = build_configs(&cfg, &replay_parallel(), &uniform_demand()).unwrap();
+        assert_eq!(
+            on.bounded_replay,
+            Some(BoundedReplay {
+                late_layer_start: 21,
+                window: 128
+            })
+        );
+        // Same bodies and plan: the flag only picks inputs.
+        assert_eq!(on.plan, off.plan);
+        let late: Vec<_> = on
+            .bodies
+            .iter()
+            .zip(&on.late_bodies)
+            .filter(|(_, &late)| late)
+            .map(|(body, _)| body.layers.clone())
+            .collect();
+        assert_eq!(
+            late,
+            vec![
+                vec![21, 22, 23, 25, 26, 27, 29, 30, 31, 33, 34, 35],
+                vec![24, 28, 32, 36],
+                vec![37, 38, 39],
+            ]
+        );
+    }
+
+    #[test]
+    fn bounded_replay_rejects_a_tail_sglang_would_reject() {
+        let replay = BoundedReplay::from_model(&model_cfg()).unwrap();
+        assert!(replay.is_late(&[20, 21]).is_err());
+        assert_eq!(replay.is_late(&[21, 39]).ok(), Some(true));
+        assert_eq!(replay.is_late(&[1, 20]).ok(), Some(false));
+
+        let mut compressing = model_cfg();
+        compressing.compress_ratios[30] = 2;
+        assert!(BoundedReplay::from_model(&compressing).is_err());
+        let mut engram = model_cfg();
+        engram.engram_layer_ids.push(30);
+        assert!(BoundedReplay::from_model(&engram).is_err());
+        let mut no_sources = model_cfg();
+        no_sources.kv_source_layer_ids.clear();
+        assert!(BoundedReplay::from_model(&no_sources).is_err());
+        // A later last source moves the tail start with it.
+        let mut later = model_cfg();
+        later.kv_source_layer_ids.push(24);
+        assert_eq!(
+            BoundedReplay::from_model(&later).unwrap().late_layer_start,
+            25
+        );
+    }
+
+    #[test]
+    fn bounded_replay_input_keeps_the_last_window_of_each_chunk() {
+        let reduce = |prefill, decode| {
+            let full = normalize_input(&one_group(prefill, decode)).unwrap();
+            let late = bounded_replay_input(&full, 128);
+            (full, late)
+        };
+        // Cold 2048-token chunk: 2048 rows -> 128 rows at the late layers.
+        let (full, late) = reduce(vec![(0, 2048)], vec![]);
+        assert_eq!((full.rows, late.rows), (2048, 128));
+        assert_eq!(late.attention.num_tokens, 128);
+        assert_eq!(late.attention.prefill_query_context_pairs, [(128, 2048)]);
+        assert_eq!(late.logits_rows, 1);
+        assert!(!late.attention.aux_stream_live);
+
+        // A chunk no longer than the window is untouched.
+        let (full, late) = reduce(vec![(300, 100)], vec![]);
+        assert_eq!((full.rows, late.rows), (104, 104));
+        assert_eq!(late.attention.prefill_query_context_pairs, [(100, 400)]);
+
+        // Mixed: 45 decodes + chunks 1912 and 91 -> 45 + 128 + 91 = 264 tokens
+        // pad to 272 (full batch 2048).
+        let (full, late) = reduce(vec![(0, 1912), (4005, 91)], vec![300; 45]);
+        assert_eq!((full.rows, late.rows), (2048, 272));
+        assert_eq!(
+            late.attention.prefill_query_context_pairs,
+            [(128, 1912), (91, 4096)]
+        );
+        assert_eq!(late.attention.decode_kv_lens, vec![300; 45]);
+        assert!(!late.attention.aux_stream_live);
+
+        // Decode-only batches are unchanged, including the aux-stream gate.
+        let (full, late) = reduce(vec![], vec![1000; 48]);
+        assert_eq!((full.rows, late.rows), (48, 48));
+        assert_eq!(full.attention.decode_kv_lens, late.attention.decode_kv_lens);
+        assert!(late.attention.aux_stream_live && full.attention.aux_stream_live);
+
+        // Two decodes + a 200-token chunk -> 2 + 128 = 130 tokens -> 136 rows;
+        // a prefill is present, so the aux stream stays off.
+        let (_, late) = reduce(vec![(0, 200)], vec![10; 2]);
+        assert_eq!(late.rows, 136);
+        assert!(!late.attention.aux_stream_live);
+    }
+
+    #[test]
+    fn bounded_replay_keeps_the_cost_tree_shape() {
+        let bridge = PerfApiBridge::new_uninit_for_test();
+        bridge.enable_enumerate();
+        let tree = |parallel: &DeepseekV41VllmParallel| {
+            let configs = build_configs(&model_cfg(), parallel, &uniform_demand()).unwrap();
+            build("unified".into(), resolve_configs(&configs), &bridge).unwrap()
+        };
+        let (off, on) = (tree(&parallel()), tree(&replay_parallel()));
+        assert_eq!(off.n_slots, on.n_slots);
+        assert_eq!(off.cost_log_manifest(), on.cost_log_manifest());
+        assert_eq!(off.cost_flat.len(), on.cost_flat.len());
+    }
+
+    /// Real-cost checks: needs the warm `profiling/profile.db` rows and the
+    /// capture-2 token corpus. Run from the repo with
+    /// `cargo test -p simulator --lib bounded_replay_costs -- --ignored`.
+    #[test]
+    #[ignore = "needs warm profile.db rows and the capture-2 token corpus"]
+    fn bounded_replay_costs_against_profile_db() {
+        use crate::arch::config::IterArchSel;
+
+        let root = env!("CARGO_MANIFEST_DIR");
+        let corpus = format!(
+            "{root}/logs/20260924_0_dsv41_flash_capture/profile_corpus/token_corpus/manifest.json"
+        );
+        let selector = |extra: serde_json::Value| -> IterArchSel {
+            let mut json = serde_json::json!({
+                "type": "deepseek_v41_vllm",
+                "model_config": CONFIG,
+                "fp8": true,
+                "routing": "corpus",
+                "token_corpus_file": corpus,
+            });
+            json.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            serde_json::from_value(json).unwrap()
+        };
+        let bridge = PerfApiBridge::new().expect("perf_api bridge");
+        let build_model = |sel: &IterArchSel| {
+            crate::arch::build::build_iter_model(sel, GPU_NAME, "unified", &bridge).unwrap()
+        };
+        let default = build_model(&selector(serde_json::json!({})));
+        let off = build_model(&selector(
+            serde_json::json!({"decoder_swa_bounded_replay": false}),
+        ));
+        let on = build_model(&selector(
+            serde_json::json!({"decoder_swa_bounded_replay": true}),
+        ));
+        let names: Vec<String> = default
+            .cost_log_manifest()
+            .slots
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        let run = |model: &dyn IterwiseUnifiedModel, batch: &UnifiedArchInput| {
+            let (mut slots, mut scratch, mut inputs) = (Vec::new(), Vec::new(), Vec::new());
+            let total = model.eval_iter_with_inputs(batch, &mut slots, &mut scratch, &mut inputs);
+            let inputs: Vec<serde_json::Value> = inputs
+                .iter()
+                .map(|i| serde_json::to_value(i).unwrap())
+                .collect();
+            (total, format!("{slots:?}"), inputs)
+        };
+        let batches = [
+            one_group(vec![], vec![1000; 48]),
+            one_group(vec![(0, 2048)], vec![]),
+            one_group(vec![(300, 100)], vec![]),
+            one_group(vec![(0, 1912), (4005, 91)], vec![300; 45]),
+        ];
+        for batch in &batches {
+            // Flag off is bit-identical to the default (field absent) selector.
+            let (t_default, s_default, _) = run(default.as_ref(), batch);
+            let (t_off, s_off, _) = run(off.as_ref(), batch);
+            assert_eq!(format!("{t_default:?}"), format!("{t_off:?}"));
+            assert_eq!(s_default, s_off);
+        }
+        // Decode-only and a chunk within the window: identical on and off.
+        for batch in [&batches[0], &batches[2]] {
+            let (t_off, s_off, _) = run(off.as_ref(), batch);
+            let (t_on, s_on, _) = run(on.as_ref(), batch);
+            assert_eq!(format!("{t_off:?}"), format!("{t_on:?}"));
+            assert_eq!(s_off, s_on);
+        }
+        // Cold 2048 chunk: cheaper, late layers at 128 rows, earlier at 2048.
+        let (t_off, _, in_off) = run(off.as_ref(), &batches[1]);
+        let (t_on, _, in_on) = run(on.as_ref(), &batches[1]);
+        assert!(
+            t_on.m.time_ms < t_off.m.time_ms,
+            "on {} >= off {}",
+            t_on.m.time_ms,
+            t_off.m.time_ms
+        );
+        // Every dense row leaf of a late body runs 128 rows (2048 off). The
+        // indexer's key gathers count context keys, which stay at 2048.
+        for prefix in ["unified.layer21.", "unified.layer24.", "unified.layer37."] {
+            let row_leaves: Vec<usize> = (0..names.len())
+                .filter(|&slot| {
+                    names[slot].starts_with(prefix)
+                        && !names[slot].contains(".indexer.")
+                        && in_on[slot].get("num_tokens").is_some()
+                })
+                .collect();
+            assert!(row_leaves.len() >= 4, "{prefix}");
+            for slot in row_leaves {
+                assert_eq!(in_on[slot]["num_tokens"], 128, "{}", names[slot]);
+                assert_eq!(in_off[slot]["num_tokens"], 2048, "{}", names[slot]);
+            }
+        }
+        // The routed-expert and shared-expert GEMMs see the reduced rows too.
+        let ffn_m = |inputs: &[serde_json::Value], prefix: &str| -> Vec<serde_json::Value> {
+            (0..names.len())
+                .filter(|&slot| names[slot].starts_with(prefix) && names[slot].contains(".ffn."))
+                .filter_map(|slot| inputs[slot].get("m").cloned())
+                .collect()
+        };
+        let late_m = ffn_m(&in_on, "unified.layer21.");
+        assert!(
+            !late_m.is_empty() && late_m.iter().all(|m| m == 128),
+            "{late_m:?}"
+        );
+        assert!(ffn_m(&in_off, "unified.layer21.").iter().all(|m| m == 2048));
+        for (slot, name) in names.iter().enumerate() {
+            let early = [
+                "unified.prologue",
+                "unified.layer0.",
+                "unified.layer20.",
+                "unified.head",
+                "unified.engram_prefetch",
+            ];
+            if early.iter().any(|p| name.starts_with(p)) {
+                assert_eq!(in_on[slot], in_off[slot], "{name}");
+            }
+        }
     }
 
     #[test]

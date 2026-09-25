@@ -304,6 +304,12 @@ pub enum IterArchSel {
         #[serde(default)]
         #[param(cache_key)]
         token_corpus_file: Option<String>,
+        /// Decoder SWA bounded replay what-if (vLLM PR #58132 / SGLang
+        /// `--enable-decoder-swa-bounded-replay`): layers past the last KV
+        /// source run only each prefill chunk's last `sliding_window` extend
+        /// tokens. A counterfactual with no capture behind it; default off.
+        #[serde(default)]
+        decoder_swa_bounded_replay: bool,
     },
     /// The same DeepSeek-V4.1 kernels with the gated side streams (stage-A
     /// input projections, the compressor aux stream, the shared expert)
@@ -323,6 +329,12 @@ pub enum IterArchSel {
         #[serde(default)]
         #[param(cache_key)]
         token_corpus_file: Option<String>,
+        /// Decoder SWA bounded replay what-if (vLLM PR #58132 / SGLang
+        /// `--enable-decoder-swa-bounded-replay`): layers past the last KV
+        /// source run only each prefill chunk's last `sliding_window` extend
+        /// tokens. A counterfactual with no capture behind it; default off.
+        #[serde(default)]
+        decoder_swa_bounded_replay: bool,
     },
     /// GLM-5.2's aligned vLLM execution graph with local TP1 attention and
     /// expert parallelism across the replica.

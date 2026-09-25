@@ -991,7 +991,9 @@ pub fn deepseek_v4_vllm(
 /// resolves through the shared [`ExpertDemandSource`]: one binding over all 40
 /// routed layers, verify width 1 (no speculative decoding). The MoE rows were
 /// profiled on the capture's token corpus, so `routing = corpus` is the
-/// production choice. `serialize_streams` changes only CostTree composition.
+/// production choice. `serialize_streams` changes only CostTree composition;
+/// `decoder_swa_bounded_replay` (a counterfactual, see
+/// [`deepseek_v41_vllm::BoundedReplay`]) changes only the late layers' inputs.
 #[allow(clippy::too_many_arguments)]
 pub fn deepseek_v41_vllm(
     model_spec: &ModelSpec,
@@ -1000,6 +1002,7 @@ pub fn deepseek_v41_vllm(
     expert_popularity_file: Option<&str>,
     token_corpus_file: Option<&str>,
     serialize_streams: bool,
+    decoder_swa_bounded_replay: bool,
     gpu: &str,
     name: &str,
     bridge: &PerfApiBridge,
@@ -1011,6 +1014,7 @@ pub fn deepseek_v41_vllm(
         ep_size: 4,
         gpu_name: gpu.to_string(),
         serialize_streams,
+        decoder_swa_bounded_replay,
     };
     let source = ExpertDemandSource {
         kind: routing_kind,
@@ -1621,6 +1625,7 @@ pub fn build_iter_model(
             routing_seed,
             expert_popularity_file,
             token_corpus_file,
+            decoder_swa_bounded_replay,
         } => Box::new(deepseek_v41_vllm(
             model,
             *routing,
@@ -1628,6 +1633,7 @@ pub fn build_iter_model(
             expert_popularity_file.as_deref(),
             token_corpus_file.as_deref(),
             false,
+            *decoder_swa_bounded_replay,
             gpu,
             name,
             bridge,
@@ -1638,6 +1644,7 @@ pub fn build_iter_model(
             routing_seed,
             expert_popularity_file,
             token_corpus_file,
+            decoder_swa_bounded_replay,
         } => Box::new(deepseek_v41_vllm(
             model,
             *routing,
@@ -1645,6 +1652,7 @@ pub fn build_iter_model(
             expert_popularity_file.as_deref(),
             token_corpus_file.as_deref(),
             true,
+            *decoder_swa_bounded_replay,
             gpu,
             name,
             bridge,
