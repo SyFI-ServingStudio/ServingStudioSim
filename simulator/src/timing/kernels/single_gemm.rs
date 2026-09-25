@@ -30,13 +30,48 @@ pub struct SingleGemmKernelInput {
 
 pub struct SingleGemmSpec;
 
+/// Largest `m` the MXFP8 grid measures; beyond it the cache extrapolates.
+const MXFP8_M_MAX: u32 = 8192;
+
+/// `m` axis for the block-scaled MXFP8 GEMM (`flashinfer_mxfp8`).
+///
+/// FlashInfer autotunes `mm_mxfp8` per hybrid token bucket
+/// (`get_hybrid_num_tokens_buckets`: powers of two to 256, step 256 to 2048,
+/// step 512 to 4096, then powers of two) and maps a runtime `m` UP to its
+/// bucket, so the tactic is constant on each `(b_prev, b]` and may switch
+/// between `b` and `b + 1`. The axis measures every bucket `b` and `b + 1`, so
+/// linear interpolation never spans a tactic switch, plus mid-bucket points
+/// where a bucket is wider than 128 rows (tile-count steps inside one tactic).
+fn mxfp8_m_axis() -> Vec<f64> {
+    let buckets: Vec<u32> = (0..=8)
+        .map(|i| 1u32 << i)
+        .chain((512..=2048).step_by(256))
+        .chain((2560..=4096).step_by(512))
+        .chain([MXFP8_M_MAX])
+        .collect();
+    let mut m: Vec<u32> = buckets
+        .iter()
+        .flat_map(|&b| [b, b + 1])
+        .chain((384..=2048).step_by(256))
+        .chain((2304..=4096).step_by(512))
+        .chain((4608..=MXFP8_M_MAX).step_by(512))
+        .filter(|&v| v <= MXFP8_M_MAX)
+        .collect();
+    m.sort_unstable();
+    m.dedup();
+    Axis::values(m)
+}
+
 impl KernelSpec for SingleGemmSpec {
     type Config = SingleGemmKernelConfig;
     type Input = SingleGemmKernelInput;
 
     const KIND: KernelKind = "single_gemm";
 
-    fn sweep_grid(_config: &Self::Config) -> SweepGrid {
+    fn sweep_grid(config: &Self::Config) -> SweepGrid {
+        if config.dtype == DType::Mxfp8E4m3 {
+            return SweepGrid::new(vec![mxfp8_m_axis()]);
+        }
         // Dense decode routinely evaluates GEMMs below the shared token axis'
         // m=32 floor. Keep those points measured instead of extrapolating the
         // first [32, 64] segment into the scheduler's common 1..16 batches.
@@ -201,5 +236,51 @@ mod tests {
 
         assert_eq!(&grid.axes()[0][..6], &[1.0, 2.0, 4.0, 8.0, 16.0, 32.0]);
         assert_eq!(grid.axes()[0].len(), 68);
+    }
+
+    fn mxfp8_cfg() -> SingleGemmKernelConfig {
+        SingleGemmKernelConfig {
+            backends: vec!["flashinfer_mxfp8"],
+            gpu_name: "NVIDIA B200".to_string(),
+            n: 1792.into(),
+            k: 5120.into(),
+            dtype: DType::Mxfp8E4m3,
+        }
+    }
+
+    /// FlashInfer rounds `m` up to its hybrid tuning bucket, so a tactic switch
+    /// sits between bucket `b` and `b + 1`. Missing either side makes the
+    /// linear cache interpolate across two different kernels.
+    #[test]
+    fn mxfp8_grid_brackets_every_flashinfer_tuning_bucket() {
+        let grid = SingleGemmSpec::sweep_grid(&mxfp8_cfg());
+        let axis = &grid.axes()[0];
+        let has = |v: u32| axis.contains(&(v as f64));
+        let buckets = [
+            1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 768, 1024, 1280, 1536, 1792, 2048, 2560, 3072,
+            3584, 4096, 8192,
+        ];
+        for b in buckets {
+            assert!(has(b), "bucket {b} missing");
+            if b < 8192 {
+                assert!(has(b + 1), "first m past bucket {b} missing");
+            }
+        }
+        assert!(axis.windows(2).all(|w| w[0] < w[1]), "axis must be strictly increasing");
+        assert_eq!(axis.first(), Some(&1.0));
+        assert_eq!(axis.last(), Some(&8192.0));
+        assert_eq!(axis.len(), 58);
+    }
+
+    #[test]
+    fn mxfp8_enumerate_forwards_the_python_wire_schema() {
+        let cfg = mxfp8_cfg();
+        let grid = SingleGemmSpec::sweep_grid(&cfg);
+        let payloads = SingleGemmSpec::enumerate(&cfg, &grid, "flashinfer_mxfp8");
+        assert_eq!(payloads.len(), grid.axes()[0].len());
+        let fields = payloads[0].fields();
+        assert_eq!(fields.len(), 5);
+        assert_eq!(fields.get("dtype"), Some(&Value::from("mxfp8_e4m3")));
+        assert_eq!(fields.get("backend"), Some(&Value::from("flashinfer_mxfp8")));
     }
 }
