@@ -119,6 +119,10 @@ pub struct CostBuffers {
     /// Time is `kernel_time * gpu_time_multiplier` (inter-kernel overhead). From
     /// the worker's [`WorkerConfig`]; 1.0 = no overhead (predict passes 1.0).
     gpu_time_multiplier: f64,
+    /// Multiplier [`run_iter`](Self::run_iter) applies instead when the batch
+    /// schedules any prefill tokens. Equals `gpu_time_multiplier` unless set by
+    /// [`with_prefill_gpu_time_multiplier`](Self::with_prefill_gpu_time_multiplier).
+    prefill_gpu_time_multiplier: f64,
 }
 
 impl CostBuffers {
@@ -154,7 +158,18 @@ impl CostBuffers {
             cache: HashMap::default(),
             key_scratch: Vec::new(),
             gpu_time_multiplier,
+            prefill_gpu_time_multiplier: gpu_time_multiplier,
         }
+    }
+
+    /// Scale prefill-bearing iterations by `multiplier` instead of
+    /// `gpu_time_multiplier`; `None` keeps the single multiplier. Only
+    /// [`run_iter`](Self::run_iter) distinguishes the stages.
+    pub fn with_prefill_gpu_time_multiplier(mut self, multiplier: Option<f64>) -> Self {
+        if let Some(multiplier) = multiplier {
+            self.prefill_gpu_time_multiplier = multiplier;
+        }
+        self
     }
 
     /// Iter-wise convenience constructor: the model exposes one fused CostTree, so
@@ -219,6 +234,35 @@ impl CostBuffers {
             Option<&mut Vec<SlotInput>>,
         ) -> LeafMetrics,
     {
+        let multiplier = self.gpu_time_multiplier;
+        self.run_section_scaled(
+            section, layer, iter_id, batch_id, groups, cache_key, now, multiplier, eval,
+        )
+    }
+
+    /// [`run_section`](Self::run_section) with the wall-time multiplier chosen
+    /// by the caller.
+    #[allow(clippy::too_many_arguments)]
+    fn run_section_scaled<G, F>(
+        &mut self,
+        section: &'static str,
+        layer: i16,
+        iter_id: u64,
+        batch_id: u64,
+        groups: &G,
+        cache_key: Option<&[u32]>,
+        now: Time,
+        multiplier: f64,
+        eval: F,
+    ) -> Time
+    where
+        G: GroupLogSource,
+        F: FnOnce(
+            &mut Vec<LeafMetrics>,
+            &mut Vec<LeafMetrics>,
+            Option<&mut Vec<SlotInput>>,
+        ) -> LeafMetrics,
+    {
         // Build the key (packed section name + the caller's small identity) and try a
         // hit. Reuses `key_scratch`, so a hit allocates nothing.
         if let Some(ck) = cache_key {
@@ -262,7 +306,7 @@ impl CostBuffers {
                         tracing::warn!("cost_log record failed: {e}");
                     }
                 }
-                return self.wall_time(&agg);
+                return wall_time(&agg, multiplier);
             }
         }
 
@@ -318,15 +362,7 @@ impl CostBuffers {
             }
             self.cache.insert(self.key_scratch.as_slice().into(), snap);
         }
-        self.wall_time(&agg)
-    }
-
-    /// kernel-folded time → wall `Time`, applying this worker's inter-kernel
-    /// `gpu_time_multiplier` (≥ 1.0). The single place the overhead enters the
-    /// clock; `cost_log` rows are written pre-scale (pure kernel) by the callers
-    /// above, so folding a row's `slot_time_ms` still reproduces its `total_time_ms`.
-    fn wall_time(&self, agg: &LeafMetrics) -> Time {
-        Time::from_ms(agg.m.time_ms as f64 * self.gpu_time_multiplier)
+        wall_time(&agg, multiplier)
     }
 
     /// Iter-wise convenience over [`run_section`](Self::run_section): the whole
@@ -343,7 +379,12 @@ impl CostBuffers {
     ) -> Time {
         // One batch per iteration today; AFD/TBO emit several batches sharing an
         // iter_id with distinct batch_id via `run_section` instead.
-        // `run_section` already applies `gpu_time_multiplier` and returns wall Time.
+        // `run_section_scaled` applies the stage's multiplier and returns wall Time.
+        let multiplier = if arch_input.groups.iter().any(|g| g.prefill_tokens > 0) {
+            self.prefill_gpu_time_multiplier
+        } else {
+            self.gpu_time_multiplier
+        };
         let eval = |slots: &mut Vec<LeafMetrics>,
                     scratch: &mut Vec<LeafMetrics>,
                     inputs: Option<&mut Vec<SlotInput>>| match inputs {
@@ -355,9 +396,19 @@ impl CostBuffers {
             let groups = DecodeKvLensGroupLog {
                 groups: &arch_input.groups,
             };
-            self.run_section("iter", -1, iter_id, 0, &groups, None, now, eval)
+            self.run_section_scaled("iter", -1, iter_id, 0, &groups, None, now, multiplier, eval)
         } else {
-            self.run_section("iter", -1, iter_id, 0, &arch_input.groups, None, now, eval)
+            self.run_section_scaled(
+                "iter",
+                -1,
+                iter_id,
+                0,
+                &arch_input.groups,
+                None,
+                now,
+                multiplier,
+                eval,
+            )
         }
     }
 
@@ -390,6 +441,14 @@ impl CostBuffers {
             },
         )
     }
+}
+
+/// kernel-folded time → wall `Time`, applying the inter-kernel multiplier
+/// (≥ 1.0). The single place the overhead enters the clock; `cost_log` rows are
+/// written pre-scale (pure kernel) by the callers above, so folding a row's
+/// `slot_time_ms` still reproduces its `total_time_ms`.
+fn wall_time(agg: &LeafMetrics, multiplier: f64) -> Time {
+    Time::from_ms(agg.m.time_ms as f64 * multiplier)
 }
 
 /// The per-row `input_section` source for [`CostBuffers::run_section`]. Different
@@ -678,6 +737,32 @@ mod tests {
             },
         );
         assert_eq!(hit.as_ms(), 5.0);
+    }
+
+    /// A prefill multiplier scales only iterations that schedule prefill tokens;
+    /// a decode-only iteration keeps `gpu_time_multiplier`, and without the
+    /// override both stages share it.
+    #[test]
+    fn prefill_multiplier_scales_only_prefill_bearing_iterations() {
+        let model = crate::test_helpers::FakeModel::for_ms(2.0);
+        let decode = UnifiedArchInput {
+            groups: vec![grp(&[100, 200])],
+            tokens_per_source_rank: Vec::new(),
+        };
+        let mut mixed = decode.clone();
+        mixed.groups[0].prefill_tokens = 512;
+        mixed.groups[0].batch_tokens += 512;
+        let now = Time::from_ms(0.0);
+
+        let mut staged = CostBuffers::new(None, "iter", WorkerId(0), &trivial_manifest(), 1.25)
+            .with_prefill_gpu_time_multiplier(Some(1.5));
+        assert_eq!(staged.run_iter(&model, &decode, 0, now).as_ms(), 2.5);
+        assert_eq!(staged.run_iter(&model, &mixed, 1, now).as_ms(), 3.0);
+
+        let mut single = CostBuffers::new(None, "iter", WorkerId(0), &trivial_manifest(), 1.25)
+            .with_prefill_gpu_time_multiplier(None);
+        assert_eq!(single.run_iter(&model, &decode, 0, now).as_ms(), 2.5);
+        assert_eq!(single.run_iter(&model, &mixed, 1, now).as_ms(), 2.5);
     }
 
     /// With a logger attached, every call still emits one `cost_log` row (a hit does

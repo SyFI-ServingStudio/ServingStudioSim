@@ -23,6 +23,8 @@ copy of; configs are built as dicts and dumped, so a malformed nesting is a
 | `worker.attn_gpu_memory_gb`          | case (calibrated)                       |
 | `worker.gpu_time_multiplier`         | always 1.0; kernel-align only reports a |
 |                                      | recommendation, nothing injects it      |
+| `worker.prefill_gpu_time_multiplier` | variant, verbatim (a pack-declared      |
+|                                      | calibration, never the recommendation)  |
 | `workload.arrival_mode` / `rate`     | case                                    |
 
 ## Two normalizations that are not cosmetic

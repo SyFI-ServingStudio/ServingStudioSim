@@ -561,6 +561,12 @@ and cannot override the preset. When adopting a recommendation, record its sourc
 and any cross-workload approximation in the experiment notes and set the value
 in the preset before running. Previously used report-source CLI flags are removed.
 
+A `chunked_prefill` worker may also set `prefill_gpu_time_multiplier` (>= 1.0):
+iterations that carry prefill tokens use it instead of `gpu_time_multiplier`,
+which then applies to decode-only iterations. It is a calibration like the
+main multiplier; the kernel-align pass does not recommend it, so record its
+source with the value (see the GLM-5.3-Flash pack's variant `worker`).
+
 Standalone NSYS normalization remains available as:
 
 ```bash

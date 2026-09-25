@@ -318,6 +318,14 @@ pub enum IterWorkerSel {
         #[serde(default = "default_gpu_time_multiplier")]
         #[param(default = 1.0)]
         gpu_time_multiplier: f64,
+        /// Multiplier (≥ 1.0) for iterations that schedule any prefill tokens,
+        /// replacing `gpu_time_multiplier` there. A calibration knob: an engine
+        /// whose decode steps replay CUDA graphs but whose prefill runs eager
+        /// pieces leaves the GPU idle only in prefill-bearing iterations, which
+        /// one multiplier cannot express. None applies `gpu_time_multiplier` to
+        /// every iteration.
+        #[serde(default)]
+        prefill_gpu_time_multiplier: Option<f64>,
     },
     /// Chunked prefill with a speculating decode engine: one verify pass per
     /// iteration submits `draft_tokens + 1` rows per resident decode and retires

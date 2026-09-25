@@ -123,6 +123,8 @@ impl Deployment for UnifiedDeployment {
                 batch_policy,
                 kv_admission,
                 gpu_time_multiplier,
+                // Read by `prefill_gpu_time_multiplier` below.
+                ..
             } => (
                 *attn_gpu_memory_gb,
                 *gpu_time_multiplier,
@@ -171,6 +173,7 @@ impl Deployment for UnifiedDeployment {
             log_stage_transitions: cfg.io.log_stage_transitions,
             kv_log_stride: cfg.io.kv_log_stride,
             gpu_time_multiplier,
+            prefill_gpu_time_multiplier: prefill_gpu_time_multiplier(&g.worker)?,
             max_batch_tokens,
             pending_order,
             batch_policy,
@@ -726,6 +729,23 @@ fn ssm_checkpoint_interval_tokens(worker: &IterWorkerSel) -> Option<u32> {
     }
 }
 
+/// Prefill-iteration multiplier, carried by the `chunked_prefill` selector only.
+fn prefill_gpu_time_multiplier(worker: &IterWorkerSel) -> anyhow::Result<Option<f64>> {
+    match worker {
+        IterWorkerSel::ChunkedPrefill {
+            prefill_gpu_time_multiplier: Some(multiplier),
+            ..
+        } => {
+            ensure!(
+                multiplier.is_finite() && *multiplier >= 1.0,
+                "unified: prefill_gpu_time_multiplier must be a finite value >= 1.0 (got {multiplier})"
+            );
+            Ok(Some(*multiplier))
+        }
+        _ => Ok(None),
+    }
+}
+
 /// Draft candidate count, carried by the `speculative` selector only. Every other
 /// worker leaves it at `0`, which is what marks it as not speculating.
 fn speculative_draft_tokens(worker: &IterWorkerSel) -> u32 {
@@ -901,6 +921,7 @@ mod tests {
             batch_policy: BatchPolicy::Mix,
             kv_admission: crate::worker::config::KvAdmissionSpec::default(),
             gpu_time_multiplier: 1.0,
+            prefill_gpu_time_multiplier: None,
         }
     }
 
@@ -980,6 +1001,41 @@ mod tests {
             ssm_checkpoint_interval_tokens: Some(528),
         };
         assert_eq!(ssm_checkpoint_interval_tokens(&overridden), Some(528));
+    }
+
+    #[test]
+    fn the_prefill_multiplier_is_chunked_prefill_only_and_at_least_one() {
+        assert_eq!(
+            prefill_gpu_time_multiplier(&chunked_prefill_worker()).unwrap(),
+            None
+        );
+        assert_eq!(prefill_gpu_time_multiplier(&hp_worker()).unwrap(), None);
+        let with = |multiplier: f64| {
+            let IterWorkerSel::ChunkedPrefill {
+                attn_gpu_memory_gb,
+                max_batch_tokens,
+                batch_policy,
+                kv_admission,
+                gpu_time_multiplier,
+                ..
+            } = chunked_prefill_worker()
+            else {
+                unreachable!()
+            };
+            IterWorkerSel::ChunkedPrefill {
+                attn_gpu_memory_gb,
+                max_batch_tokens,
+                batch_policy,
+                kv_admission,
+                gpu_time_multiplier,
+                prefill_gpu_time_multiplier: Some(multiplier),
+            }
+        };
+        assert_eq!(prefill_gpu_time_multiplier(&with(1.2)).unwrap(), Some(1.2));
+        let error = prefill_gpu_time_multiplier(&with(0.9))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("prefill_gpu_time_multiplier must be a finite value >= 1.0"));
     }
 
     #[test]
