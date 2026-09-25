@@ -1264,11 +1264,11 @@ mod tests {
     fn compiled_tree_has_a_fixed_slot_count() {
         let model = built();
         // Prologue 3; per group: 2 boundaries + 2 all-reduces + attention
-        // (KDA 14, DSA 28) + FFN (dense 5; MoE 2 router + 2 glue + 4 ranks x
+        // (KDA 13, DSA 31) + FFN (dense 5; MoE 2 router + 2 glue + 4 ranks x
         // (5 + 2 + 5)); epilogue 4.
-        let kda_dense = 4 + 14 + 5;
-        let dsa_moe = 4 + 28 + 52;
-        let kda_moe = 4 + 14 + 52;
+        let kda_dense = 4 + 13 + 5;
+        let dsa_moe = 4 + 31 + 52;
+        let kda_moe = 4 + 13 + 52;
         assert_eq!(model.n_slots, 3 + 2 * kda_dense + dsa_moe + kda_moe + 4);
         assert_eq!(model.cost_log_manifest().slots.len(), model.n_slots);
     }

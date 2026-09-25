@@ -19,7 +19,13 @@
 //! Byte-sized elementwise placeholders stand in for the small indexer kernels
 //! (b2-dsa section 7 byte formulas), the prefill MQA logits / top-k, which vLLM
 //! skips while every prefill context fits `index_topk` tokens, and the
-//! framework glue (index plumbing, the query concat, the output copy).
+//! framework glue (index plumbing, the query concat, the output copy). The
+//! indexer k LayerNorm and the weights x q-scale multiply are Inductor-fused
+//! elementwise kernels with their own leaves. Copies that run far below
+//! streaming bandwidth (the transposed query concat, the output masked fill,
+//! the Hadamard quant) carry an effective-bandwidth byte factor anchored to
+//! the measured T = 2048 kernels, and a prefill-bearing iteration adds its
+//! `[rows, selected_k]` index plumbing (`prefill_glue`).
 //!
 //! A decode batch's indexer and attention shapes collapse to the batch's MAX
 //! context (the measured decode grids are uniform in context).
@@ -46,6 +52,31 @@ use super::glm53_common::{atomic, elementwise, push_or_zero, repeated};
 /// Small launches of index/mask plumbing present in every iteration.
 const GLUE_LAUNCHES: u32 = 17;
 const GLUE_BYTES_PER_TOKEN: u32 = 64;
+/// Extra index/mask plumbing of a prefill-bearing iteration: copies, compares
+/// and masked fills over `[rows, selected_k]` int32 index rows (vLLM's prefill
+/// topk/remap path). Capture 20260924_0 (T = 2048) has ~25 glue launches per
+/// DSA layer, 73.7 us in total, against ~12 launches and 20 us in decode.
+const PREFILL_GLUE_LAUNCHES: u32 = 8;
+/// Effective-bandwidth factors for copies that run far below streaming
+/// bandwidth. The placeholder still reads and writes the real tensor; the
+/// factor scales those bytes to the measured time at T = 2048
+/// (capture 20260924_0, iteration 886), because the elementwise curve is a
+/// streaming kernel.
+///
+/// * `q_concat`: `torch.cat((ql_nope.transpose(0, 1), q_pe))` with an empty
+///   `q_pe` (rope 0) is a `CatArrayBatchedCopy` of a transposed `[H, T, L]`
+///   view: 64 MiB in 98.4 us, ~1/10 of streaming bandwidth.
+const Q_CONCAT_EFFECTIVE_FACTOR: u32 = 10;
+/// * `output_copy`: the non-vectorized `masked_fill_` over the `[T, H, L]`
+///   attention output: 64 MiB in 32.2 us, ~1/3.5 of streaming bandwidth
+///   (applied as 7/2).
+const OUTPUT_COPY_EFFECTIVE_NUM: u32 = 7;
+const OUTPUT_COPY_EFFECTIVE_DEN: u32 = 2;
+/// * `q_fwht_quant`: the Hadamard-128 + ue8m0 quant is not a streaming kernel;
+///   16.8 us at T = 2048 for 25 MiB of real traffic. The factor matches the
+///   prefill-bearing time; decode (5.5 us at T = 32) stays latency-bound above
+///   any elementwise row and needs a dedicated L1 kind to match.
+const FWHT_EFFECTIVE_FACTOR: u32 = 5;
 /// `k[idx]` and `gate_score[idx]` gathers ahead of the prefill kpool write.
 const PREFILL_GATHER_LAUNCHES: u32 = 2;
 
@@ -90,7 +121,9 @@ pub struct Glm53DsaAttnLocalWorkletResolved {
     pub index_wq_b: SingleGemmKernelConfig,
     pub index_wk_weights: SingleGemmKernelConfig,
     pub index_head_weights: GemmFp32OutputKernelConfig,
+    pub index_k_norm: ElementwiseKernelConfig,
     pub index_q_fwht_quant: ElementwiseKernelConfig,
+    pub index_weight_scale: ElementwiseKernelConfig,
     pub kpool_gate_score: SingleGemmKernelConfig,
     pub prefill_gather: ElementwiseKernelConfig,
     pub kpool_decode_update: ElementwiseKernelConfig,
@@ -109,6 +142,7 @@ pub struct Glm53DsaAttnLocalWorkletResolved {
     pub v_up: BatchedGemmKernelConfig,
     pub o_proj: SingleGemmKernelConfig,
     pub glue: ElementwiseKernelConfig,
+    pub prefill_glue: ElementwiseKernelConfig,
 }
 
 /// One iteration's DSA work on this rank.
@@ -128,7 +162,9 @@ pub struct Glm53DsaAttnLocalWorklet {
     pub index_wq_b: Op<SingleGemmKernel>,
     pub index_wk_weights: Op<SingleGemmKernel>,
     pub index_head_weights: Op<GemmFp32OutputKernel>,
+    pub index_k_norm: Op<ElementwiseKernel>,
     pub index_q_fwht_quant: Op<ElementwiseKernel>,
+    pub index_weight_scale: Op<ElementwiseKernel>,
     pub kpool_gate_score: Op<SingleGemmKernel>,
     pub prefill_gather: Op<ElementwiseKernel>,
     pub kpool_decode_update: Op<ElementwiseKernel>,
@@ -147,6 +183,7 @@ pub struct Glm53DsaAttnLocalWorklet {
     pub v_up: Op<BatchedGemmKernel>,
     pub o_proj: Op<SingleGemmKernel>,
     pub glue: Op<ElementwiseKernel>,
+    pub prefill_glue: Op<ElementwiseKernel>,
     resolved: Glm53DsaAttnLocalWorkletResolved,
 }
 
@@ -205,8 +242,16 @@ impl Glm53DsaAttnLocalWorklet {
                 k: cfg.hidden.clone(),
                 input_dtype: DType::Fp32,
             },
+            // Inductor-fused fp32 LayerNorm of the indexer k: reads and writes
+            // one bf16 D row per token.
+            index_k_norm: ew(2 * index_dim, 2 * index_dim),
             // b2-dsa 7: reads 2*D*Hi, writes (D+4)*Hi per token.
-            index_q_fwht_quant: ew(2 * index_dim * index_heads, (index_dim + 4) * index_heads),
+            index_q_fwht_quant: ew(
+                FWHT_EFFECTIVE_FACTOR * 2 * index_dim * index_heads,
+                FWHT_EFFECTIVE_FACTOR * (index_dim + 4) * index_heads,
+            ),
+            // `weights * q_scale * scale`: two fp32 Hi rows in, one out.
+            index_weight_scale: ew(2 * 4 * index_heads, 4 * index_heads),
             kpool_gate_score: gemm(index_dim, cfg.hidden.clone()),
             // 2*P*2D bytes gathered per prefill token, split over two launches.
             prefill_gather: ew(kpool * 2 * index_dim, kpool * 2 * index_dim),
@@ -256,7 +301,10 @@ impl Glm53DsaAttnLocalWorklet {
                 cfg.kv_lora_rank.clone(),
                 cfg.qk_nope_head_dim.clone(),
             ),
-            q_concat: ew(latent_q_bytes, latent_q_bytes),
+            q_concat: ew(
+                Q_CONCAT_EFFECTIVE_FACTOR * latent_q_bytes,
+                Q_CONCAT_EFFECTIVE_FACTOR * latent_q_bytes,
+            ),
             q_fp8_quant: ew(latent_q_bytes, heads * (latent + 4)),
             sparse_mla: Glm53KpoolSparseMlaConfig {
                 sparse_attention_backends: cfg.sparse_attention_backends.clone(),
@@ -282,7 +330,10 @@ impl Glm53DsaAttnLocalWorklet {
                 page_table_mapping: "interleaved_requests".into(),
                 max_model_len: cfg.max_model_len,
             },
-            output_copy: ew(latent_q_bytes, latent_q_bytes),
+            output_copy: ew(
+                latent_q_bytes * OUTPUT_COPY_EFFECTIVE_NUM / OUTPUT_COPY_EFFECTIVE_DEN,
+                latent_q_bytes * OUTPUT_COPY_EFFECTIVE_NUM / OUTPUT_COPY_EFFECTIVE_DEN,
+            ),
             v_up: bmm(
                 &cfg.mla_bmm_v_up_backends,
                 cfg.v_head_dim.clone(),
@@ -290,6 +341,8 @@ impl Glm53DsaAttnLocalWorklet {
             ),
             o_proj: gemm(cfg.hidden.get(), (heads * cfg.v_head_dim.get()).into()),
             glue: ew(GLUE_BYTES_PER_TOKEN, GLUE_BYTES_PER_TOKEN),
+            // One int32 index row of `selected_k` lanes in and out per row.
+            prefill_glue: ew(4 * cfg.selected_k, 4 * cfg.selected_k),
             raw_cfg: cfg.clone(),
         }
     }
@@ -323,7 +376,9 @@ impl Glm53DsaAttnLocalWorklet {
                 GemmFp32OutputKernel::build,
                 bridge,
             )?,
+            index_k_norm: ew("indexer.k_norm", r.index_k_norm)?,
             index_q_fwht_quant: ew("indexer.q_fwht_quant", r.index_q_fwht_quant)?,
+            index_weight_scale: ew("indexer.weight_scale", r.index_weight_scale)?,
             kpool_gate_score: gemm("indexer.kpool_gate_score", r.kpool_gate_score)?,
             prefill_gather: ew("indexer.prefill_gather", r.prefill_gather)?,
             kpool_decode_update: ew("indexer.kpool_decode_update", r.kpool_decode_update)?,
@@ -358,6 +413,7 @@ impl Glm53DsaAttnLocalWorklet {
             v_up: atomic(n, "v_up", r.v_up, BatchedGemmKernel::build, bridge)?,
             o_proj: gemm("o_proj", r.o_proj)?,
             glue: ew("glue", r.glue)?,
+            prefill_glue: ew("prefill_glue", r.prefill_glue)?,
             name,
             resolved,
         })
@@ -378,7 +434,9 @@ impl Glm53DsaAttnLocalWorklet {
                 self.index_wq_b.compile(builder),
                 self.index_wk_weights.compile(builder),
                 self.index_head_weights.compile(builder),
+                self.index_k_norm.compile(builder),
                 self.index_q_fwht_quant.compile(builder),
+                self.index_weight_scale.compile(builder),
                 self.kpool_gate_score.compile(builder),
                 repeated(&self.prefill_gather, PREFILL_GATHER_LAUNCHES, builder),
                 self.kpool_decode_update.compile(builder),
@@ -397,6 +455,7 @@ impl Glm53DsaAttnLocalWorklet {
                 self.v_up.compile(builder),
                 self.o_proj.compile(builder),
                 repeated(&self.glue, GLUE_LAUNCHES, builder),
+                repeated(&self.prefill_glue, PREFILL_GLUE_LAUNCHES, builder),
             ])),
         }
     }
@@ -428,7 +487,9 @@ impl Glm53DsaAttnLocalWorklet {
             false,
             ev,
         );
+        push_or_zero(&self.index_k_norm, all.clone(), false, ev);
         push_or_zero(&self.index_q_fwht_quant, all.clone(), false, ev);
+        push_or_zero(&self.index_weight_scale, all.clone(), false, ev);
         push_or_zero(&self.kpool_gate_score, rows.clone(), false, ev);
         push_or_zero(
             &self.prefill_gather,
@@ -519,7 +580,8 @@ impl Glm53DsaAttnLocalWorklet {
             ev,
         );
         push_or_zero(&self.o_proj, rows, false, ev);
-        push_or_zero(&self.glue, all, false, ev);
+        push_or_zero(&self.glue, all.clone(), false, ev);
+        push_or_zero(&self.prefill_glue, all, no_prefill, ev);
     }
 }
 
@@ -682,7 +744,8 @@ mod tests {
         let mut builder = CostTreeBuilder::new();
         let root = worklet.compile(&mut builder);
         let tree = builder.finish(root);
-        assert_eq!(tree.slots.len(), 24 + 4);
+        assert_eq!(tree.slots.len(), 24 + 4 + 3);
+        assert!(tree.slots.iter().any(|slot| slot.name == "m.dsa.prefill_glue"));
         assert!(tree
             .slots
             .iter()

@@ -35,6 +35,10 @@
       "semantics": []
     },
     {
+      "location": "unified.dsa_moe.dsa.indexer.k_norm",
+      "semantics": []
+    },
+    {
       "location": "unified.dsa_moe.dsa.indexer.kpool_decode_update",
       "semantics": [
         "dsa_moe.index_cache_append",
@@ -84,6 +88,10 @@
       "semantics": []
     },
     {
+      "location": "unified.dsa_moe.dsa.indexer.weight_scale",
+      "semantics": []
+    },
+    {
       "location": "unified.dsa_moe.dsa.indexer.wk_weights",
       "semantics": [
         "dsa_moe.indexer.wk",
@@ -105,6 +113,10 @@
     },
     {
       "location": "unified.dsa_moe.dsa.output_copy",
+      "semantics": []
+    },
+    {
+      "location": "unified.dsa_moe.dsa.prefill_glue",
       "semantics": []
     },
     {
@@ -321,10 +333,6 @@
       ]
     },
     {
-      "location": "unified.first_kda_dense.kda.decode_glue",
-      "semantics": []
-    },
-    {
       "location": "unified.first_kda_dense.kda.f_b_proj",
       "semantics": [
         "first_kda_dense.f_b_proj"
@@ -465,10 +473,6 @@
       ]
     },
     {
-      "location": "unified.kda_dense.kda.decode_glue",
-      "semantics": []
-    },
-    {
       "location": "unified.kda_dense.kda.f_b_proj",
       "semantics": [
         "kda_dense.f_b_proj"
@@ -575,10 +579,6 @@
         "kda_moe.a_log",
         "kda_moe.dt_bias"
       ]
-    },
-    {
-      "location": "unified.kda_moe.kda.decode_glue",
-      "semantics": []
     },
     {
       "location": "unified.kda_moe.kda.f_b_proj",
