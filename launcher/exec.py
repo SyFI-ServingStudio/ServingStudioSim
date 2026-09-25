@@ -340,6 +340,7 @@ async def run_analysis(
     subjects: list[str] | None = None,
     *,
     render: bool = True,
+    render_only: bool = False,
 ) -> None:
     """Best-effort post-run analysis: Rust `analyze run` (parquet → report+payload
     JSON) then the Python renderer (payload JSON → PNGs). Failures warn and return
@@ -347,7 +348,9 @@ async def run_analysis(
 
     `render=False` (`--no-plot`) skips the PNGs and keeps the reports, payloads
     and trace that the Analyzer UI reads. On a 640-run grid the renderer was 73%
-    of all CPU, more than the simulations themselves.
+    of all CPU, more than the simulations themselves. `render_only=True` draws
+    the PNGs of a run whose compute and trace already exist — a run finished
+    with `--no-plot` and resumed without it.
 
     Async: across a sweep, many runs' analyze+render overlap under the existing
     semaphore instead of serializing on a blocking call that stalls the event loop.
@@ -433,6 +436,25 @@ async def run_analysis(
         print(f"[analyze] {analyzer} not built; skipping analysis for {log_dir}")
         return
     subjects = subjects or []
+
+    def render_step():
+        return _timed_step(
+            "render",
+            "analyze render",
+            [
+                sys.executable,
+                str(REPO_ROOT / "analyzer" / "python"),
+                "render",
+                str(log_dir),
+                *subjects,
+            ],
+            lambda: validate_render_artifacts(log_dir),
+        )
+
+    if render_only:
+        if await render_step() != 0:
+            print(f"[analyze] render failed for {log_dir}")
+        return
     # The analyzer owns variant completeness: a normal invocation generates both
     # unlocked and batch-locked optimality in one timing/report transaction.
     if (
@@ -452,31 +474,26 @@ async def run_analysis(
     # A standalone verb, not a subject (different output contract: a binary trace
     # for ui.perfetto.dev, not report/payload JSON), so it runs here with CLI
     # defaults rather than through the subject catalog. Best-effort like the rest.
-    trace_step = _timed_step(
-        "trace",
-        "analyze trace",
-        [str(analyzer), "trace", str(log_dir)],
-        lambda: validate_trace_artifacts(log_dir),
-    )
+    def trace_step():
+        return _timed_step(
+            "trace",
+            "analyze trace",
+            [str(analyzer), "trace", str(log_dir)],
+            lambda: validate_trace_artifacts(log_dir),
+        )
+
     if not render:
-        if await trace_step != 0:
+        if await trace_step() != 0:
             print(f"[analyze] trace failed for {log_dir}")
         return
+    # Both finish before either's exception propagates, so a render that fails
+    # to spawn cannot leave the trace running with nobody awaiting it.
     render_rc, trace_rc = await asyncio.gather(
-        _timed_step(
-            "render",
-            "analyze render",
-            [
-                sys.executable,
-                str(REPO_ROOT / "analyzer" / "python"),
-                "render",
-                str(log_dir),
-                *subjects,
-            ],
-            lambda: validate_render_artifacts(log_dir),
-        ),
-        trace_step,
+        render_step(), trace_step(), return_exceptions=True
     )
+    for outcome in (render_rc, trace_rc):
+        if isinstance(outcome, BaseException):
+            raise outcome
     if render_rc != 0:
         print(f"[analyze] render failed for {log_dir}")
     if trace_rc != 0:

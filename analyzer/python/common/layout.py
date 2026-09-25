@@ -45,9 +45,12 @@ def read_sharded_records(log_dir: Path, shard: dict, keys: list) -> list[dict]:
 
     Returns records in the order of `keys`; a key the index does not know is
     skipped, because a payload written before its shard existed is a missing
-    figure, not a crash.
+    figure, not a crash. So is a `zstd-frames` key without a decoded length.
     """
     byte_ranges = shard.get("byte_ranges") or {}
+    if shard.get("encoding") == ZSTD_FRAMES:
+        decoded_lengths = shard.get("decoded_lengths") or {}
+        byte_ranges = {key: value for key, value in byte_ranges.items() if key in decoded_lengths}
     decode = _record_decoder(shard)
     path = resolve_artifact(log_dir, shard["file"])
     records = []
@@ -68,7 +71,7 @@ def _record_decoder(shard: dict):
         return lambda _key, raw: raw
     import pyarrow as pa
 
-    decoded_lengths = shard["decoded_lengths"]
+    decoded_lengths = shard.get("decoded_lengths") or {}
     return lambda key, raw: pa.decompress(
         raw, decompressed_size=decoded_lengths[key], codec="zstd", asbytes=True
     )

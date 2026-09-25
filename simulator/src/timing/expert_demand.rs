@@ -211,7 +211,10 @@ impl PreparedDemand<'_> {
     ) -> Vec<Vec<u32>> {
         match self {
             Self::Popularity(_) => parallel_by_cost(
-                &token_counts.iter().map(|&n| u64::from(n)).collect::<Vec<_>>(),
+                &token_counts
+                    .iter()
+                    .map(|&n| u64::from(n))
+                    .collect::<Vec<_>>(),
                 |index| self.sample_and_fold(top_k, token_counts[index], experts_per_rank),
             ),
             Self::Corpus(corpus) => {
@@ -230,7 +233,12 @@ impl PreparedDemand<'_> {
                 .into_iter();
                 token_counts
                     .iter()
-                    .map(|_| select_candidate(candidates.by_ref().take(draws).collect(), experts_per_rank))
+                    .map(|_| {
+                        select_candidate(
+                            candidates.by_ref().take(draws).collect(),
+                            experts_per_rank,
+                        )
+                    })
                     .collect()
             }
         }
@@ -277,6 +285,9 @@ impl ExpertDemand {
             "folded_rank_position must select an EP rank"
         );
 
+        if token_counts.is_empty() {
+            return Ok(Vec::new());
+        }
         let key = (self.clone(), top_k, num_local_experts);
         let cache = FOLDED.get_or_init(Default::default);
         let mut missing: Vec<u32> = {
@@ -301,12 +312,17 @@ impl ExpertDemand {
             }
         }
 
-        let cache = cache.lock().expect("folded demand cache");
-        let known = &cache[&key];
-        Ok(token_counts
-            .iter()
-            .map(|n| {
-                let mut folded = known[n].as_ref().clone();
+        // Take the shared folds and release the lock before checking them: a
+        // panic while it is held would poison the cache for every other kernel.
+        let shared: Vec<Arc<Vec<u32>>> = {
+            let cache = cache.lock().expect("folded demand cache");
+            let known = &cache[&key];
+            token_counts.iter().map(|n| Arc::clone(&known[n])).collect()
+        };
+        Ok(shared
+            .into_iter()
+            .map(|folded| {
+                let mut folded = folded.as_ref().clone();
                 assert_eq!(
                     folded.len(),
                     num_experts,
@@ -384,6 +400,27 @@ mod tests {
         assert_eq!(folded.len(), 64);
         assert_eq!(folded.iter().map(|&c| u64::from(c)).sum::<u64>(), 24 * 8);
         assert_eq!(folded, prepared.sample_and_fold(8, 24, 16));
+    }
+
+    #[test]
+    fn an_empty_token_axis_draws_nothing() {
+        assert!(popularity(64, 2)
+            .per_expert_batches(8, &[], 64, 16, 0)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn a_width_mismatch_does_not_poison_the_shared_cache() {
+        // 64-expert demand folded for a 128-expert kernel: the width check fails.
+        let mismatch =
+            std::panic::catch_unwind(|| popularity(64, 3).per_expert_batches(8, &[4], 128, 16, 0));
+        assert!(mismatch.is_err());
+
+        let folded = popularity(64, 3)
+            .per_expert_batches(8, &[4], 64, 16, 0)
+            .unwrap();
+        assert_eq!(folded[0].len(), 64);
     }
 
     #[test]

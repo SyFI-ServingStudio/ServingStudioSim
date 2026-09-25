@@ -32,6 +32,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use crate::alignment_iteration::ZSTD_FRAMES;
+
 use super::artifact::read_json;
 use super::artifact_kind::{read_artifact_kind, ArtifactKind};
 use super::discovery::{
@@ -461,9 +463,6 @@ pub(super) fn alignment_artifact_bytes(
     let path = artifact_path(alignment, subject, payload)?;
     fs::read(&path).with_context(|| format!("read alignment artifact {}", path.display()))
 }
-
-/// The `encoding` of a detail shard whose records are independent zstd frames.
-const ZSTD_FRAMES: &str = "zstd-frames";
 
 /// The small index that points into one iteration-detail JSONL shard.
 ///

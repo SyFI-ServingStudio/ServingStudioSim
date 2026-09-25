@@ -47,8 +47,8 @@ class WorkflowPlan:
 def simulation_workflow(*, analyze: bool, render: bool = True) -> WorkflowPlan:
     """Compile the per-run graph; ``--no-analyze`` removes optional nodes.
 
-    ``render=False`` keeps compute and trace but drops the PNG render, which a
-    sweep skips by default (see `launcher.sweep.run_sweep`).
+    ``render=False`` (``--no-plot``) keeps compute and trace but drops the PNG
+    render.
     """
 
     nodes = [

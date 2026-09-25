@@ -161,8 +161,10 @@ impl JsonlShardWriter {
     }
 }
 
-/// The `encoding` a `.jsonl.zst` shard's detail section declares.
-const ZSTD_FRAMES: &str = "zstd-frames";
+/// The `encoding` a `.jsonl.zst` shard's detail section declares. The UI
+/// service reads it back (`ui_service::alignment`); Python's
+/// `analyzer/python/common/layout.py` spells the same wire string.
+pub(crate) const ZSTD_FRAMES: &str = "zstd-frames";
 
 /// One record of a `.jsonl.zst` shard: the JSON line and its newline as an
 /// independent zstd frame. A reader decodes exactly one record from its byte
@@ -1280,7 +1282,6 @@ struct BreakdownOutput {
     measured_path_fields: serde_json::Map<String, Value>,
 }
 
-#[allow(clippy::too_many_arguments)]
 /// One line of the breakdown shard. Typed for the reason `PhysicalKernelRow`
 /// gives; the field order is the old `json!` key order, and the barrier-path
 /// scalars follow it exactly as the old `extend` appended them.
@@ -1329,6 +1330,7 @@ struct MeasuredKernelRow<'a> {
     device_ids: &'a BTreeSet<i64>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_breakdown(
     joined: &CaseMap,
     measured_iter: &MeasuredIteration,

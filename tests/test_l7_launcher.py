@@ -307,6 +307,63 @@ def test_run_analysis_renders_only_when_asked(monkeypatch, tmp_path, render):
     assert sorted(stages) == sorted(["analyze_compute", "trace", *(["render"] if render else [])])
 
 
+def _analysis_harness(monkeypatch, tmp_path, supervise):
+    analyzer_path = tmp_path / "analyze"
+    analyzer_path.write_text("")
+    log_dir = tmp_path / "run"
+    log_dir.mkdir()
+    (log_dir / "stdout.log").write_text("")
+    monkeypatch.setattr("launcher.exec.analyzer_binary_path", lambda _build_type: analyzer_path)
+    monkeypatch.setattr("launcher.exec._PROCESS_SUPERVISOR.run", supervise)
+    for validator in (
+        "validate_json_outputs",
+        "validate_render_artifacts",
+        "validate_trace_artifacts",
+    ):
+        monkeypatch.setattr(f"launcher.exec.{validator}", lambda _path: ArtifactValidation(()))
+    return log_dir
+
+
+def _succeeded(spec):
+    return ProcessResult(
+        argv=tuple(str(argument) for argument in spec.argv),
+        pid=1,
+        process_group_id=1,
+        exit_code=0,
+        elapsed_seconds=0.0,
+    )
+
+
+def test_render_only_skips_compute_and_trace(monkeypatch, tmp_path):
+    stages: list[str] = []
+
+    async def supervise(spec):
+        stages.append(spec.name)
+        return _succeeded(spec)
+
+    log_dir = _analysis_harness(monkeypatch, tmp_path, supervise)
+    asyncio.run(run_analysis(log_dir, render_only=True))
+
+    assert stages == ["render"]
+
+
+def test_a_render_that_cannot_start_waits_for_the_trace(monkeypatch, tmp_path):
+    finished: list[str] = []
+
+    async def supervise(spec):
+        if spec.name == "render":
+            raise OSError("cannot spawn the renderer")
+        await asyncio.sleep(0.05)
+        finished.append(spec.name)
+        return _succeeded(spec)
+
+    log_dir = _analysis_harness(monkeypatch, tmp_path, supervise)
+    with pytest.raises(OSError, match="cannot spawn"):
+        asyncio.run(run_analysis(log_dir))
+
+    assert finished == ["analyze_compute", "trace"]
+
+
 @pytest.mark.parametrize("render", [True, False])
 def test_sweep_analysis_renders_only_when_asked(monkeypatch, tmp_path, render):
     analyzer_path = tmp_path / "analyze"
@@ -1772,6 +1829,30 @@ def test_resume_skips_completed_run(tmp_path, schema, monkeypatch):
     )
     params = normalize_params(_base(log_dir=str(log_dir)), schema)
     assert asyncio.run(_run_single_async(params, None, schema, "debug")) is True
+
+
+@pytest.mark.parametrize("plot", [True, False])
+def test_resume_renders_a_run_finished_without_plots(tmp_path, schema, monkeypatch, plot):
+    log_dir = tmp_path / "run"
+    (log_dir / "payloads").mkdir(parents=True)
+    (log_dir / "payloads" / "slo_general_cdf.json").write_text("{}")
+    _mark_complete(log_dir)
+    monkeypatch.setattr(
+        "launcher.sweep.validate_simulation_artifacts",
+        lambda _log_dir: ArtifactValidation(()),
+    )
+    calls: list[dict] = []
+
+    async def analysis(_log_dir, _build_type, _subjects, **options):
+        calls.append(options)
+
+    monkeypatch.setattr("launcher.sweep.run_analysis", analysis)
+    params = normalize_params(_base(log_dir=str(log_dir)), schema)
+
+    assert asyncio.run(_launch_one(params, "debug", render=plot)) is True
+    assert asyncio.run(_run_single_async(params, None, schema, "debug", plot=plot)) is True
+
+    assert calls == ([{"render_only": True}] * 2 if plot else [])
 
 
 def test_public_run_entrypoints_require_explicit_schema():

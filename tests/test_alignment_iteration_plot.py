@@ -110,6 +110,11 @@ def test_zstd_frame_shards_decode_each_record_alone(tmp_path) -> None:
 
     assert [record["iteration_id"] for record in read] == [7, 3]
 
+    # A range whose decoded length the index lost is a missing figure, not a crash.
+    del shard["decoded_lengths"]["3"]
+    read = read_sharded_records(tmp_path, shard, [7, 3])
+    assert [record["iteration_id"] for record in read] == [7]
+
 
 def test_mapping_center_pairs_keeps_one_to_many_simulated_slots() -> None:
     measured_centers = {"layer.attention": [1.5]}

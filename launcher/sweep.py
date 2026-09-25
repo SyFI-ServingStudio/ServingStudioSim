@@ -34,7 +34,11 @@ from .exec import (
 )
 from .managed_run import ManagedRun, managed_analysis_subjects, prepare_experiment
 from .process import ProcessSpec
-from .process.artifacts import ArtifactValidationError, validate_simulation_artifacts
+from .process.artifacts import (
+    ArtifactValidationError,
+    validate_render_artifacts,
+    validate_simulation_artifacts,
+)
 from .process.journal import RunJournal, StageState
 from .process.leases import LauncherLeases
 from .process.markers import COMPLETE_MARKER, has_marker, mark_complete
@@ -78,6 +82,15 @@ async def _run_directory_lease(
         yield
 
 
+def _has_plots(log_dir: Path) -> bool:
+    """Whether a finished run passes the renderer's own artifact contract."""
+    try:
+        validate_render_artifacts(log_dir)
+    except ArtifactValidationError:
+        return False
+    return True
+
+
 async def _launch_one(
     params: dict,
     build_type: str,
@@ -112,6 +125,13 @@ async def _launch_one(
 
     async with _run_directory_lease(log_dir, run_directory_lease_held):
         if not refresh and _is_complete(log_dir):
+            if workflow.contains(StageKind.RENDER) and not _has_plots(log_dir):
+                # Finished with `--no-plot`, resumed without it: draw the PNGs
+                # from the analysis already on disk instead of skipping them.
+                print(f"[render] {log_dir} complete without plots; rendering them")
+                async with scheduler.analysis_slot():
+                    await run_analysis(log_dir, build_type, analyze_subjects, render_only=True)
+                return True
             print(f"[skip] {log_dir} already complete (use --refresh to re-run)")
             return True
         journal.begin_attempts(
@@ -298,7 +318,11 @@ async def _run_single_async(
         managed_run = prepare_experiment(log_dir, run_count=1, axes=[])
         analyze_subjects = managed_analysis_subjects(managed_run, analyze_subjects)
         if not refresh and _is_complete(log_dir):
-            print(f"[skip] {log_dir} already complete (use --refresh to re-run)")
+            if analyze and plot and not _has_plots(log_dir):
+                print(f"[render] {log_dir} complete without plots; rendering them")
+                await run_analysis(log_dir, build_type, analyze_subjects, render_only=True)
+            else:
+                print(f"[skip] {log_dir} already complete (use --refresh to re-run)")
             if managed_run is not None:
                 managed_run.report("ready")
             return True

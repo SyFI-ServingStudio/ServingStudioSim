@@ -233,16 +233,22 @@ def emit_roles(candidates: list[dict], build_type: str = "debug") -> list[Role]:
     return _merge_role_variants(variants)
 
 
+#: Concurrent `emit-backends` processes; see `_enumerate_structures`.
+_MAX_ENUMERATIONS = 8
+
+
 def _enumerate_structures(representatives: list[dict], build_type: str) -> list[list[Role]]:
     """`dedup_roles(enumerate_kernels(c))` for each distinct structure, in order.
 
     Each enumeration is its own `simulator emit-backends` process, which spends
     most of its ~0.1 s starting the embedded interpreter and importing the kernel
-    registry. Run them side by side rather than one after another.
+    registry. Run them side by side rather than one after another, but only a
+    few at once: a corpus-routed MoE build reads its token corpus (hundreds of
+    MB) in every process, and the per-process corpus cache cannot share it.
     """
     if len(representatives) <= 1:
         return [dedup_roles(enumerate_kernels(c, build_type)) for c in representatives]
-    workers = min(len(representatives), os.cpu_count() or 1, 32)
+    workers = min(len(representatives), os.cpu_count() or 1, _MAX_ENUMERATIONS)
     with ThreadPoolExecutor(max_workers=workers) as pool:
         return list(
             pool.map(lambda c: dedup_roles(enumerate_kernels(c, build_type)), representatives)
