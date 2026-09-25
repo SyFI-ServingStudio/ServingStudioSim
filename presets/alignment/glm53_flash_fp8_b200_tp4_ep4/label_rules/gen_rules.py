@@ -46,7 +46,7 @@ GEMMS = (NVJ, TOP, WMMA)
 # ---------------- prologue / epilogue / boundaries ----------------
 op("embedding", "vocab-parallel embedding lookup", ["embedding"])
 op("hc_expand", "hyper-connection expand copy to [T,4,H]", ["hc_expand"])
-op("tp.all_reduce", "TP all-reduce (flashinfer trtllm MNNVL one-shot / two-shot) after embedding, attention and FFN",
+op("tp.all_reduce", "TP all-reduce (flashinfer trtllm MNNVL one-shot / two-shot, NCCL ring at large token counts) after embedding, attention and FFN",
    ["embedding_all_reduce", "attn_all_reduce", "ffn_all_reduce"], "collective")
 op("mhc.boundary", "mHC boundary: mhc_post, tf32 hc_prenorm GEMM and fused pre/RMSNorm between sublayers",
    ["attn_mhc_pre", "attn_mhc_post_pre", "ffn_mhc_post_pre", "final_mhc_post"])
@@ -55,7 +55,8 @@ op("final_norm", "final RMSNorm", ["final_norm"])
 op("lm_head", "tensor-parallel language-model head projection", ["lm_head"])
 
 M("embedding", "vocab_parallel_embedding_kernel", phase="forward")
-for n in ("twoshotAllreduceKernel", "oneshotAllreduceFusionKernel"):
+# NCCL ring: the diverse_100 8k-budget capture (20260925_0) falls back to it at large T.
+for n in ("twoshotAllreduceKernel", "oneshotAllreduceFusionKernel", "ncclDevKernel_AllReduce_Sum_bf16_RING_LL"):
     M("tp.all_reduce", n, phase="forward")
 M("hc_expand", EW, phase="forward", after="tp.all_reduce", before_name="hc_prenorm_gemm")
 for n in ("mhc_post_tilelang_kernel", "hc_prenorm_gemm", BIGFUSE, "mhc_fused_tilelang_kernel"):
@@ -171,6 +172,11 @@ for g in GEMMS:
     M(D + "indexer.wk_weights", g, after=D + "indexer.wq_b")
 M(D + "indexer.head_weights", COPY, after=D + "indexer.wk_weights")
 M(D + "indexer.head_weights", "cutlass_80_simt_sgemm")
+# cuBLAS picks other fp32 algorithms at the diverse_100 token counts (20260925_0).
+M(D + "indexer.head_weights", "cutlass3x_sm100_simt_sgemm")
+M(D + "indexer.head_weights", WMMA, after=D + "indexer.head_weights")
+M(D + "indexer.head_weights", "dot_kernel<float", after=D + "indexer.head_weights")
+M(D + "indexer.head_weights", "reduce_1Block_kernel<float", after=D + "indexer.head_weights")
 M(D + "indexer.k_norm", "triton_per_fused__to_copy_native_layer_norm_0")
 M(D + "indexer.q_fwht_quant", "_fwht_quant_kernel")
 M(D + "indexer.weight_scale", "triton_poi_fused_mul_unsqueeze_0")
@@ -192,6 +198,8 @@ M(D + "q_concat", "CatArrayBatchedCopy<", after=D + "q_absorb")
 M(D + "q_fp8_quant", "scaled_fp8_quant_kernel_strided_group_shape")
 M(D + "sparse_mla", "fmhaSm100fKernel_QkvE4m3OBfloat16H512PagedKvDenseDynamicTokenSparseP1MultiCtasKv")
 M(D + "sparse_mla", "fmhaSm100fKernel_QkvE4m3OBfloat16H512HVPerCta128PagedKvDenseDynamicTokenSparseP1MultiCtasKv")
+# Long-context, low-batch decode picks the 256-value-per-CTA variant (case 06, 20260925_4).
+M(D + "sparse_mla", "fmhaSm100fKernel_QkvE4m3OBfloat16H512HVPerCta256PagedKvDenseDynamicTokenSparseP1MultiCtasKv")
 M(D + "sparse_mla", "fmhaSm100fKernel_QkvE4m3OBfloat16H512PagedKvDenseDynamicTokenSparseP1VarSeq")
 M(D + "output_copy", EW, after=D + "sparse_mla")
 M(D + "v_up", NVJ, after=D + "output_copy")

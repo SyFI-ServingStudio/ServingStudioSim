@@ -17,7 +17,7 @@
    "operation": "tp.all_reduce",
    "name": "twoshotAllreduceKernel",
    "type": "collective",
-   "role": "TP all-reduce (flashinfer trtllm MNNVL one-shot / two-shot) after embedding, attention and FFN",
+   "role": "TP all-reduce (flashinfer trtllm MNNVL one-shot / two-shot, NCCL ring at large token counts) after embedding, attention and FFN",
    "slot_suffixes": [
     "embedding_all_reduce",
     "attn_all_reduce",
@@ -31,7 +31,7 @@
    "operation": "tp.all_reduce",
    "name": "oneshotAllreduceFusionKernel",
    "type": "collective",
-   "role": "TP all-reduce (flashinfer trtllm MNNVL one-shot / two-shot) after embedding, attention and FFN",
+   "role": "TP all-reduce (flashinfer trtllm MNNVL one-shot / two-shot, NCCL ring at large token counts) after embedding, attention and FFN",
    "slot_suffixes": [
     "embedding_all_reduce",
     "attn_all_reduce",
@@ -952,6 +952,18 @@
   },
   {
    "operation": "dsa.sparse_mla",
+   "name": "fmhaSm100fKernel_QkvE4m3OBfloat16H512HVPerCta256PagedKvDenseDynamicTokenSparseP1MultiCtasKv",
+   "type": "model",
+   "role": "token-sparse MLA attention (one launch per iteration)",
+   "slot_suffixes": [
+    "dsa.sparse_mla.prefill",
+    "dsa.sparse_mla.decode"
+   ],
+   "source_experiment": "logs/20260925_4_glm53_flash_campaign/06_long_long_c8",
+   "phase": "forward"
+  },
+  {
+   "operation": "dsa.sparse_mla",
    "name": "fmhaSm100fKernel_QkvE4m3OBfloat16H512PagedKvDenseDynamicTokenSparseP1VarSeq",
    "type": "model",
    "role": "token-sparse MLA attention (one launch per iteration)",
@@ -1571,6 +1583,67 @@
    ],
    "source_experiment": "logs/20260924_0_glm53_flash_b200_tp4_ep4_nsys",
    "after": "dsa.glue",
+   "phase": "forward"
+  },
+  {
+   "operation": "tp.all_reduce",
+   "name": "ncclDevKernel_AllReduce_Sum_bf16_RING_LL",
+   "type": "collective",
+   "role": "TP all-reduce (flashinfer trtllm MNNVL one-shot / two-shot, NCCL ring at large token counts) after embedding, attention and FFN",
+   "slot_suffixes": [
+    "embedding_all_reduce",
+    "attn_all_reduce",
+    "ffn_all_reduce"
+   ],
+   "source_experiment": "logs/20260925_0_glm53_flash_diverse100_c8k_nsys",
+   "cross_rank": "synchronizing",
+   "phase": "forward"
+  },
+  {
+   "operation": "dsa.indexer.head_weights",
+   "name": "cutlass3x_sm100_simt_sgemm",
+   "type": "model",
+   "role": "DSA indexer fp32 head-weights torch.mm (cast copy, SIMT sgemm, split-K reduce)",
+   "slot_suffixes": [
+    "dsa.indexer.head_weights"
+   ],
+   "source_experiment": "logs/20260925_0_glm53_flash_diverse100_c8k_nsys",
+   "phase": "forward"
+  },
+  {
+   "operation": "dsa.indexer.head_weights",
+   "name": "cutlass_80_wmma_tensorop",
+   "type": "model",
+   "role": "DSA indexer fp32 head-weights torch.mm (cast copy, SIMT sgemm, split-K reduce)",
+   "slot_suffixes": [
+    "dsa.indexer.head_weights"
+   ],
+   "source_experiment": "logs/20260925_0_glm53_flash_diverse100_c8k_nsys",
+   "after": "dsa.indexer.head_weights",
+   "phase": "forward"
+  },
+  {
+   "operation": "dsa.indexer.head_weights",
+   "name": "dot_kernel<float",
+   "type": "model",
+   "role": "DSA indexer fp32 head-weights torch.mm (cast copy, SIMT sgemm, split-K reduce)",
+   "slot_suffixes": [
+    "dsa.indexer.head_weights"
+   ],
+   "source_experiment": "logs/20260925_0_glm53_flash_diverse100_c8k_nsys",
+   "after": "dsa.indexer.head_weights",
+   "phase": "forward"
+  },
+  {
+   "operation": "dsa.indexer.head_weights",
+   "name": "reduce_1Block_kernel<float",
+   "type": "model",
+   "role": "DSA indexer fp32 head-weights torch.mm (cast copy, SIMT sgemm, split-K reduce)",
+   "slot_suffixes": [
+    "dsa.indexer.head_weights"
+   ],
+   "source_experiment": "logs/20260925_0_glm53_flash_diverse100_c8k_nsys",
+   "after": "dsa.indexer.head_weights",
    "phase": "forward"
   }
  ]
