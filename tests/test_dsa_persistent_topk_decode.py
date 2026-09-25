@@ -740,6 +740,59 @@ def test_composite_long_rows_select_local_top_values() -> None:
     assert operands.logits[0, actual[0].long()].tolist() == [7.0, 6.0, 5.0]
 
 
+def test_overflow_exemption_follows_the_fork_path_each_row_takes() -> None:
+    from profiling.runners.attention.dsa_persistent_topk_decode import (
+        _medium_overflow_explains,
+    )
+
+    # The linspace template at stride 524288 leaves a 64K row in [-1, -0.75],
+    # so its top coarse bin, (-0.875, -0.75], holds ~32K candidates and
+    # overflows the >32-row long path's 16K buffer.
+    length, top_k = 65536, 512
+    template = torch.linspace(-1.0, 1.0, 524288)
+    row = template[:length]
+    expected_values = row[torch.arange(length - top_k, length)]
+    # A kernel that kept the wrong threshold-bin members after the drop.
+    kept_early = torch.arange(52000, 52000 + top_k)
+    assert _medium_overflow_explains(torch, row, kept_early, expected_values, num_rows=33)
+    # One row takes the cooperative radix path, which buffers nothing.
+    assert not _medium_overflow_explains(torch, row, kept_early, expected_values, num_rows=1)
+    # A selection below the threshold bin (index 0 is -1.0) is not an overflow.
+    below = torch.cat([torch.arange(1), kept_early[1:]])
+    assert not _medium_overflow_explains(torch, row, below, expected_values, num_rows=33)
+    # The medium path keeps its own 8K-32K window and 4096-item buffer.
+    medium = template[:16384]
+    medium_expected = medium[torch.arange(16384 - top_k, 16384)]
+    medium_kept = torch.arange(1000, 1000 + top_k)
+    assert _medium_overflow_explains(torch, medium, medium_kept, medium_expected, num_rows=4)
+    assert not _medium_overflow_explains(torch, medium, medium_kept, medium_expected, num_rows=64)
+
+
+def test_overflow_exemption_covers_the_decode_and_short_paths() -> None:
+    from profiling.runners.attention.dsa_persistent_topk_decode import (
+        _medium_overflow_explains,
+    )
+
+    # An 8K row of the stride-524288 template spans [-1, -0.97]: about two
+    # 11-bit decode bins of ~4K items (DBUF holds 3708) and four 12-bit short
+    # bins of ~2K items (the short path keeps top_k ties).
+    length, top_k = 8192, 512
+    row = torch.linspace(-1.0, 1.0, 524288)[:length]
+    expected_values = row[torch.arange(length - top_k, length)]
+    kept = torch.arange(length - 1024, length - 1024 + top_k)
+    # <=32 rows: the decode path; >32 rows: the short path.
+    assert _medium_overflow_explains(torch, row, kept, expected_values, num_rows=4)
+    assert _medium_overflow_explains(torch, row, kept, expected_values, num_rows=64)
+    # Index 0 lies below the threshold bin on either path.
+    below = torch.cat([torch.arange(1), kept[1:]])
+    assert not _medium_overflow_explains(torch, row, below, expected_values, num_rows=4)
+    assert not _medium_overflow_explains(torch, row, below, expected_values, num_rows=64)
+    # A spread-out row fills no buffer, so a wrong selection stays a failure.
+    spread = torch.linspace(-1.0, 1.0, length)
+    spread_expected = spread[torch.arange(length - top_k, length)]
+    assert not _medium_overflow_explains(torch, spread, kept, spread_expected, num_rows=4)
+
+
 def test_logical_bytes_accounts_only_valid_prefixes_lengths_and_output() -> None:
     from profiling.runners.attention.dsa_persistent_topk_decode import _logical_bytes
 
