@@ -79,6 +79,13 @@ const CACHE_BLOCK_SIZE: u32 = 64;
 const HYBRID_BLOCK_SIZE: u32 = 2176;
 /// vLLM runs the shared expert on an aux stream at or below this batch size.
 const SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: u32 = 256;
+/// `Max{overlap}` of the aux-stream shared expert against its routed slice.
+/// The two streams contend for SMs and HBM: decode's routed and shared kernels
+/// each run 15-75% above their isolated profile.db rows, while the serial
+/// (T > 256) copies match within 2%. Measured union / isolated max over
+/// decode: 1.091 (20260924_0, bs 32) and 1.129 (20260925_0 diverse_100,
+/// bs 1-24, graph-padded) -> 1/0.9.
+const SHARED_EXPERTS_STREAM_OVERLAP: f32 = 0.9;
 
 const BF16_GEMM_BACKENDS: &[&str] = &["torch_linear_vllm"];
 const FP8_GEMM_BACKENDS: &[&str] = &["deepgemm_vllm_fork"];
@@ -572,10 +579,10 @@ struct MoeBlock {
 }
 
 impl MoeBlock {
-    /// Router, then one `Max` child per EP rank: that rank's shared expert
-    /// concurrent with its routed slice, plus a serial copy of the shared
-    /// expert for batches too large for the aux stream (one of the two copies
-    /// is filled per iteration; INV-1 fixes the shape).
+    /// Router, then per EP rank: that rank's shared expert concurrent with its
+    /// routed slice (a contended `Max`), plus serial copies of both for
+    /// batches too large for the aux stream. One of the two pairs is filled
+    /// per iteration; INV-1 fixes the shape.
     fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
         let router = self.router.compile(builder);
         let input_glue = self.input_glue.compile(builder);
@@ -583,13 +590,14 @@ impl MoeBlock {
             .routed
             .iter()
             .map(|routed| {
-                let concurrent = self.shared_expert.compile(builder);
-                let routed = routed.compile(builder);
+                let concurrent_shared = self.shared_expert.compile(builder);
+                let concurrent_routed = routed.compile(builder);
                 CostNode::Sum(vec![
                     CostNode::Max {
-                        overlap: 1.0,
-                        children: vec![concurrent, routed],
+                        overlap: SHARED_EXPERTS_STREAM_OVERLAP,
+                        children: vec![concurrent_shared, concurrent_routed],
                     },
+                    routed.compile(builder),
                     self.shared_expert.compile(builder),
                 ])
             })
@@ -623,9 +631,26 @@ impl MoeBlock {
             .eval(&Glm53MoeRouterLocalWorkletInput { num_tokens }, ev);
         push(&self.input_glue, ElementwiseKernelInput { num_tokens }, ev);
         let shared = Glm53Fp8MlpLocalWorkletInput { num_tokens };
+        // Zero tokens pushes zeros: exactly one of the two copies runs.
+        let (concurrent_tokens, serial_tokens) = if overlapped {
+            (num_tokens, 0)
+        } else {
+            (0, num_tokens)
+        };
         for routed in &self.routed {
             self.shared_expert.eval_or_zero(&shared, !overlapped, ev);
-            routed.eval(&Glm53RoutedMoeLocalWorkletInput { num_tokens }, ev);
+            routed.eval(
+                &Glm53RoutedMoeLocalWorkletInput {
+                    num_tokens: concurrent_tokens,
+                },
+                ev,
+            );
+            routed.eval(
+                &Glm53RoutedMoeLocalWorkletInput {
+                    num_tokens: serial_tokens,
+                },
+                ev,
+            );
             self.shared_expert.eval_or_zero(&shared, overlapped, ev);
         }
         push(
@@ -1297,10 +1322,10 @@ mod tests {
         let model = built();
         // Prologue 3; per group: 2 boundaries + 2 all-reduces + attention
         // (KDA 13, DSA 31) + FFN (dense 5; MoE 2 router + 2 glue + 4 ranks x
-        // (5 + 2 + 5)); epilogue 4.
+        // (concurrent 5 + 2, serial 2 + 5)); epilogue 4.
         let kda_dense = 4 + 13 + 5;
-        let dsa_moe = 4 + 31 + 52;
-        let kda_moe = 4 + 13 + 52;
+        let dsa_moe = 4 + 31 + 60;
+        let kda_moe = 4 + 13 + 60;
         assert_eq!(model.n_slots, 3 + 2 * kda_dense + dsa_moe + kda_moe + 4);
         assert_eq!(model.cost_log_manifest().slots.len(), model.n_slots);
     }
