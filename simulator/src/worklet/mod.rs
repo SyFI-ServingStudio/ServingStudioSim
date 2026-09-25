@@ -16,6 +16,8 @@ pub mod deepseek_v4_attention_local;
 pub mod deepseek_v4_moe_expert_compute_local;
 pub mod deepseek_v4_moe_router_local;
 pub mod deepseek_v4_shared_expert_local;
+pub mod deepseek_v41_attention_tp;
+pub mod deepseek_v41_common;
 pub mod dflash2_context_kv_local;
 pub mod dflash2_draft_layer_local;
 pub mod dflash2_selector_local;
@@ -81,6 +83,11 @@ pub use deepseek_v4_moe_router_local::{
 pub use deepseek_v4_shared_expert_local::{
     DeepseekV4SharedExpertLocalWorklet, DeepseekV4SharedExpertLocalWorkletConfig,
     DeepseekV4SharedExpertLocalWorkletInput, DeepseekV4SharedExpertLocalWorkletResolved,
+};
+pub use deepseek_v41_attention_tp::{
+    DeepseekV41AttentionEntry, DeepseekV41AttentionLayer, DeepseekV41AttentionTpWorklet,
+    DeepseekV41AttentionTpWorkletConfig, DeepseekV41AttentionTpWorkletInput,
+    DeepseekV41AttentionTpWorkletResolved, DeepseekV41IndexRole,
 };
 pub use dflash2_context_kv_local::{
     Dflash2ContextKvLocalWorklet, Dflash2ContextKvLocalWorkletConfig,
