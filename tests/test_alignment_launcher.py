@@ -22,6 +22,7 @@ from alignment.profiler import (
     vllm_server,
 )
 from alignment.profiler.config import (
+    IdleWaitConfig,
     ProfileConfig,
     PythonPackageArtifact,
     PythonRuntimeConfig,
@@ -1046,6 +1047,65 @@ def test_profile_server_argv_enables_prompt_token_details_once():
 
     assert server_argv.count("--enable-prompt-tokens-details") == 1
     assert "--trust-remote-code" in server_argv
+
+
+def test_vllm_server_launches_through_serve_with_four_api_servers_by_default():
+    argv = vllm_server.build_server_argv("fork-python", ServerConfig(model_path="model"))
+    # Only the CLI `serve` entry honors --api-server-count; the deprecated
+    # openai.api_server module parses the flag and still runs one process.
+    assert argv[1:5] == ["-m", "vllm.entrypoints.cli.main", "serve", "model"]
+    assert "vllm.entrypoints.openai.api_server" not in argv
+    assert argv[argv.index("--api-server-count") + 1] == "4"
+
+    one = vllm_server.build_server_argv(
+        "fork-python", ServerConfig(model_path="model", api_server_count=1)
+    )
+    assert one[one.index("--api-server-count") + 1] == "1"
+
+    with pytest.raises(ValueError, match="server.api_server_count"):
+        vllm_server.build_server_argv(
+            "fork-python",
+            ServerConfig(model_path="model", extra_args=["--api-server-count=8"]),
+        )
+    with pytest.raises(ValueError, match="positive integer"):
+        vllm_server.build_server_argv(
+            "fork-python", ServerConfig(model_path="model", api_server_count=0)
+        )
+
+
+def test_vllm_server_start_requires_the_announced_api_process_count(tmp_path):
+    log = tmp_path / "server.log"
+    log.write_text("(APIServer pid=1) INFO [utils.py:241] Started 4 API server processes\n")
+    vllm_server.verify_server_started(log, ServerConfig(model_path="model"))
+
+    log.write_text("(APIServer pid=1) INFO single-process startup\n")
+    with pytest.raises(RuntimeError, match="requested 4 vLLM API server processes"):
+        vllm_server.verify_server_started(log, ServerConfig(model_path="model"))
+    # One process announces nothing, so there is nothing to require.
+    vllm_server.verify_server_started(log, ServerConfig(model_path="model", api_server_count=1))
+
+
+def test_vllm_idle_needs_consecutive_zero_reads_across_api_processes(monkeypatch):
+    # Four processes; one still holds a request until the fifth read.
+    reads = iter([0, 0, 0, 1] + [0] * 16)
+    calls = []
+
+    def fake_get(url, timeout=5.0):
+        calls.append(url)
+        return 200, json.dumps({"server_load": next(reads)}).encode()
+
+    monkeypatch.setattr(vllm_server, "_get", fake_get)
+    monkeypatch.setattr(vllm_server.time, "sleep", lambda _: None)
+    idle = IdleWaitConfig(timeout=60.0, poll_interval=0.0)
+    assert vllm_server.wait_for_idle("http://x", idle, ServerConfig(model_path="model"))
+    assert len(calls) == 4 + 16
+
+
+def test_sglang_server_argv_refuses_the_vllm_api_server_count():
+    with pytest.raises(ValueError, match="no SGLang equivalent"):
+        sglang_server.build_server_argv(
+            "fork-python", ServerConfig(model_path="model", api_server_count=4)
+        )
 
 
 def test_sglang_server_argv_refuses_the_vllm_token_cudagraph_ceiling():

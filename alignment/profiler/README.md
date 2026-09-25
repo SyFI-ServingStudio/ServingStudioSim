@@ -473,6 +473,18 @@ performs a mandatory two-request prefix-cache preflight and reads
 `usage.prompt_tokens_details.cached_tokens`; experiment presets do not need to
 repeat `--enable-prompt-tokens-details` in `server.extra_args`.
 
+vLLM launches through `python -m vllm.entrypoints.cli.main serve` with
+`server.api_server_count` HTTP API processes, 4 when unset. The deprecated
+`vllm.entrypoints.openai.api_server` module parses `--api-server-count` but
+always runs one process. One process admits a burst of concurrent requests into
+EngineCore serially: on GLM-5.3-Flash TP4, 256 simultaneous requests entered
+EngineCore up to ~240 ms after the client sent them, so EngineCore TTFT started
+its clock late and client TTFT inflated. After readiness the launcher requires
+the log line `Started N API server processes` and fails otherwise; the flag
+belongs in `server.api_server_count`, never `server.extra_args`. `/load` is per
+process, so the idle wait needs 4 consecutive zero reads per process. SGLang
+has no equivalent and rejects the field.
+
 The simulation preset independently uses `io.log_dir`. Paths in `profile.yaml`
 are resolved relative to that file.
 
