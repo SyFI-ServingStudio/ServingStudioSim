@@ -21,7 +21,9 @@ annotation is derived from `config`.
 from __future__ import annotations
 
 import json
+import os
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -221,11 +223,30 @@ def emit_roles(candidates: list[dict], build_type: str = "debug") -> list[Role]:
     groups: dict[str, list[dict]] = {}
     for cand in candidates:
         groups.setdefault(_structure_key(cand), []).append(cand)
+    representatives = [members[0] for members in groups.values()]
     variants = [
-        (log_dir_of(members[0]), dedup_roles(enumerate_kernels(members[0], build_type)))
-        for members in groups.values()
+        (log_dir_of(representative), roles)
+        for representative, roles in zip(
+            representatives, _enumerate_structures(representatives, build_type)
+        )
     ]
     return _merge_role_variants(variants)
+
+
+def _enumerate_structures(representatives: list[dict], build_type: str) -> list[list[Role]]:
+    """`dedup_roles(enumerate_kernels(c))` for each distinct structure, in order.
+
+    Each enumeration is its own `simulator emit-backends` process, which spends
+    most of its ~0.1 s starting the embedded interpreter and importing the kernel
+    registry. Run them side by side rather than one after another.
+    """
+    if len(representatives) <= 1:
+        return [dedup_roles(enumerate_kernels(c, build_type)) for c in representatives]
+    workers = min(len(representatives), os.cpu_count() or 1, 32)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        return list(
+            pool.map(lambda c: dedup_roles(enumerate_kernels(c, build_type)), representatives)
+        )
 
 
 # ── skeleton rendering (`--emit-backends`) ───────────────────────────────────
@@ -360,15 +381,22 @@ def validate_backend_map(nested: dict, roles: list[Role]) -> list[str]:
     return errors
 
 
+#: Top-level sections the `emit-backends` build never reads when it builds kernels.
+#: A deployment's `build` takes its pools (arch, worker, pool policy) and only
+#: logging switches from `io`; the workload is replayed later, by the run. So
+#: a sweep over traces, rates or logging enumerates once.
+_NOT_STRUCTURAL = frozenset({"backends", "io", "workload"})
+
+
 def _structure_key(candidate: dict) -> str:
-    """A candidate's identity ignoring its `backends` map, `io.log_dir`, and
-    launcher-internal `_`-keys — so two runs that differ only in backend values
-    (a backend-only sweep) share one structure and are enumerated once, while an
-    fp8 / quant sweep (which changes kernel dtypes) re-enumerates."""
-    tree = {k: v for k, v in candidate.items() if k != "backends" and not k.startswith("_")}
-    io = tree.get("io")
-    if isinstance(io, dict):
-        tree["io"] = {k: v for k, v in io.items() if k != "log_dir"}
+    """A candidate's identity ignoring the sections that cannot change its
+    kernels (`_NOT_STRUCTURAL`) and launcher-internal `_`-keys — so runs that
+    differ only in backend values, workload or log paths share one structure and
+    are enumerated once, while an fp8 / quant sweep (which changes kernel dtypes)
+    re-enumerates."""
+    tree = {
+        k: v for k, v in candidate.items() if k not in _NOT_STRUCTURAL and not k.startswith("_")
+    }
     return json.dumps(tree, sort_keys=True, default=str)
 
 
@@ -387,8 +415,11 @@ def validate_backends_for_candidates(
             groups.setdefault(_structure_key(cand), []).append(cand)
 
     errors: list[str] = []
-    for members in groups.values():
-        roles = dedup_roles(enumerate_kernels(members[0], build_type))
+    members_by_structure = list(groups.values())
+    roles_by_structure = _enumerate_structures(
+        [members[0] for members in members_by_structure], build_type
+    )
+    for members, roles in zip(members_by_structure, roles_by_structure):
         for cand in members:
             for err in validate_backend_map(cand["backends"], roles):
                 errors.append(f"{log_dir_of(cand)}: {err}")
