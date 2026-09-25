@@ -784,3 +784,58 @@ def test_subsumptions_is_silent_when_a_key_can_separate_the_two_rules():
             _rule("moe.router", **base, stream_role="concurrent"),
         ]
     ) == []
+
+
+def test_an_exact_name_rule_claims_only_the_anonymous_kernel_not_every_name_containing_it():
+    """A launch literally named `kernel` is a fragment of every other name.
+
+    DeepSeek-V4.1's FusedQKRMSNorm is such a launch. A fragment rule for it
+    would also claim `_indexer_k_norm_rope_quant_store_kernel` beside it; the
+    exact rule claims the anonymous position alone, and `subsumptions` treats
+    the two spellings by the sets of names they can actually match.
+    """
+    kernels = [
+        {"name": "gemm_tile", "suggested_category": "gemm"},
+        {"name": "kernel", "suggested_category": "other"},
+        {"name": "quant_1280", "suggested_category": "other"},
+        {"name": "_indexer_k_norm_rope_quant_store_kernel", "suggested_category": "other"},
+        {"name": "quant_1280", "suggested_category": "other"},
+    ]
+    document = {
+        "phases": {
+            "forward": {
+                "unique_sequences": [
+                    {
+                        "sequence_id": "sequence_exact",
+                        "expanded_kernel_count": len(kernels),
+                        "occurrences": [{"device_id": 0, "iterations": [0]}],
+                        "tracks": _tracks([{"kernels": kernels}]),
+                    }
+                ]
+            }
+        }
+    }
+    exact = _rule("attention.qk_rmsnorm", name="kernel", name_exact=True, before_name="quant_1280")
+    fragment = _rule("attention.qk_rmsnorm", name="kernel", before_name="quant_1280")
+    slots = [("unified.layer0.gate_up_proj", "gemm")]
+
+    exact_doc = copy.deepcopy(document)
+    apply_rules(exact_doc, [exact], slots)
+    assert [p.operation for p in walk_kernels(exact_doc)] == [
+        None, "attention.qk_rmsnorm", None, None, None
+    ]
+    fragment_doc = copy.deepcopy(document)
+    apply_rules(fragment_doc, [fragment], slots)
+    assert [p.operation for p in walk_kernels(fragment_doc)][3] == "attention.qk_rmsnorm"
+
+    # The fragment claims every name the exact rule can match; not the reverse.
+    store = _rule("indexer.k_store", name="_indexer_k_norm_rope_quant_store_kernel")
+    other = _rule("other", name="kernel", name_exact=True, before_name="quant_1280")
+    assert len(subsumptions([fragment, other])) == 1
+    assert len(subsumptions([other, fragment])) == 1
+    assert subsumptions([exact, store]) == []
+    assert len(subsumptions([exact, other])) == 1
+    # An exact rule never contains a fragment rule, even one spelled the same.
+    assert subsumptions([_rule("wide", name="kernel", name_exact=True), store]) == []
+    with pytest.raises(ValueError, match="unknown keys"):
+        Rule.from_mapping({**exact.__dict__, "name_exactly": True})
