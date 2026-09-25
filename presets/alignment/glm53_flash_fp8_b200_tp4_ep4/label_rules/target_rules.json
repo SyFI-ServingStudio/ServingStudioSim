@@ -276,12 +276,12 @@
    "phase": "forward"
   },
   {
-   "operation": "kda.decode_glue",
+   "operation": "kda.recurrent_decode",
    "name": "at::native::elementwise_kernel",
    "type": "model",
-   "role": "KDA decode split/copy launches between conv and recurrent core",
+   "role": "KDA fused recurrent decode: the fused_recurrent_kda call, its q/k/v/state contiguous copies included",
    "slot_suffixes": [
-    "kda.decode_glue"
+    "kda.recurrent_decode"
    ],
    "source_experiment": "logs/20260924_0_glm53_flash_b200_tp4_ep4_nsys",
    "after": "<none>",
@@ -323,27 +323,27 @@
    "phase": "forward"
   },
   {
-   "operation": "kda.decode_glue",
+   "operation": "kda.recurrent_decode",
    "name": "at::native::elementwise_kernel",
    "type": "model",
-   "role": "KDA decode split/copy launches between conv and recurrent core",
+   "role": "KDA fused recurrent decode: the fused_recurrent_kda call, its q/k/v/state contiguous copies included",
    "slot_suffixes": [
-    "kda.decode_glue"
+    "kda.recurrent_decode"
    ],
    "source_experiment": "logs/20260924_0_glm53_flash_b200_tp4_ep4_nsys",
    "after": "kda.short_conv_decode",
    "phase": "forward"
   },
   {
-   "operation": "kda.decode_glue",
+   "operation": "kda.recurrent_decode",
    "name": "at::native::elementwise_kernel",
    "type": "model",
-   "role": "KDA decode split/copy launches between conv and recurrent core",
+   "role": "KDA fused recurrent decode: the fused_recurrent_kda call, its q/k/v/state contiguous copies included",
    "slot_suffixes": [
-    "kda.decode_glue"
+    "kda.recurrent_decode"
    ],
    "source_experiment": "logs/20260924_0_glm53_flash_b200_tp4_ep4_nsys",
-   "after": "kda.decode_glue",
+   "before": "kda.recurrent_decode",
    "phase": "forward"
   },
   {
@@ -473,7 +473,7 @@
    "operation": "kda.recurrent_decode",
    "name": "fused_recurrent_gated_delta_rule_fwd_kernel",
    "type": "model",
-   "role": "KDA fused recurrent decode",
+   "role": "KDA fused recurrent decode: the fused_recurrent_kda call, its q/k/v/state contiguous copies included",
    "slot_suffixes": [
     "kda.recurrent_decode"
    ],
@@ -714,12 +714,34 @@
    "phase": "forward"
   },
   {
+   "operation": "dsa.indexer.k_norm",
+   "name": "triton_per_fused__to_copy_native_layer_norm_0",
+   "type": "model",
+   "role": "DSA indexer k LayerNorm (Inductor-fused)",
+   "slot_suffixes": [
+    "dsa.indexer.k_norm"
+   ],
+   "source_experiment": "logs/20260924_0_glm53_flash_b200_tp4_ep4_nsys",
+   "phase": "forward"
+  },
+  {
    "operation": "dsa.indexer.q_fwht_quant",
    "name": "_fwht_quant_kernel",
    "type": "model",
    "role": "DSA indexer FWHT-128 + FP8 quant of q",
    "slot_suffixes": [
     "dsa.indexer.q_fwht_quant"
+   ],
+   "source_experiment": "logs/20260924_0_glm53_flash_b200_tp4_ep4_nsys",
+   "phase": "forward"
+  },
+  {
+   "operation": "dsa.indexer.weight_scale",
+   "name": "triton_poi_fused_mul_unsqueeze_0",
+   "type": "model",
+   "role": "DSA indexer head weights x q scale (Inductor-fused)",
+   "slot_suffixes": [
+    "dsa.indexer.weight_scale"
    ],
    "source_experiment": "logs/20260924_0_glm53_flash_b200_tp4_ep4_nsys",
    "phase": "forward"
@@ -905,34 +927,37 @@
    "phase": "forward"
   },
   {
-   "operation": "dsa.sparse_mla.decode",
+   "operation": "dsa.sparse_mla",
    "name": "fmhaSm100fKernel_QkvE4m3OBfloat16H512PagedKvDenseDynamicTokenSparseP1MultiCtasKv",
    "type": "model",
-   "role": "token-sparse MLA attention, decode-only variant",
+   "role": "token-sparse MLA attention (one launch per iteration)",
    "slot_suffixes": [
+    "dsa.sparse_mla.prefill",
     "dsa.sparse_mla.decode"
    ],
    "source_experiment": "logs/20260924_0_glm53_flash_b200_tp4_ep4_nsys",
    "phase": "forward"
   },
   {
-   "operation": "dsa.sparse_mla.decode",
+   "operation": "dsa.sparse_mla",
    "name": "fmhaSm100fKernel_QkvE4m3OBfloat16H512HVPerCta128PagedKvDenseDynamicTokenSparseP1MultiCtasKv",
    "type": "model",
-   "role": "token-sparse MLA attention, decode-only variant",
+   "role": "token-sparse MLA attention (one launch per iteration)",
    "slot_suffixes": [
+    "dsa.sparse_mla.prefill",
     "dsa.sparse_mla.decode"
    ],
    "source_experiment": "logs/20260924_0_glm53_flash_b200_tp4_ep4_nsys",
    "phase": "forward"
   },
   {
-   "operation": "dsa.sparse_mla.prefill",
+   "operation": "dsa.sparse_mla",
    "name": "fmhaSm100fKernel_QkvE4m3OBfloat16H512PagedKvDenseDynamicTokenSparseP1VarSeq",
    "type": "model",
-   "role": "token-sparse MLA attention, prefill-bearing variant",
+   "role": "token-sparse MLA attention (one launch per iteration)",
    "slot_suffixes": [
-    "dsa.sparse_mla.prefill"
+    "dsa.sparse_mla.prefill",
+    "dsa.sparse_mla.decode"
    ],
    "source_experiment": "logs/20260924_0_glm53_flash_b200_tp4_ep4_nsys",
    "phase": "forward"
@@ -946,19 +971,7 @@
     "dsa.output_copy"
    ],
    "source_experiment": "logs/20260924_0_glm53_flash_b200_tp4_ep4_nsys",
-   "after": "dsa.sparse_mla.decode",
-   "phase": "forward"
-  },
-  {
-   "operation": "dsa.output_copy",
-   "name": "at::native::elementwise_kernel",
-   "type": "model",
-   "role": "sparse MLA output copy",
-   "slot_suffixes": [
-    "dsa.output_copy"
-   ],
-   "source_experiment": "logs/20260924_0_glm53_flash_b200_tp4_ep4_nsys",
-   "after": "dsa.sparse_mla.prefill",
+   "after": "dsa.sparse_mla",
    "phase": "forward"
   },
   {
@@ -1408,9 +1421,10 @@
    "operation": "dsa.glue",
    "name": "at::native::vectorized_elementwise_kernel",
    "type": "model",
-   "role": "DSA index/mask plumbing (fills, aranges, compares, copies)",
+   "role": "DSA index/mask plumbing (fills, aranges, compares, copies), with the prefill [rows, selected_k] index plumbing",
    "slot_suffixes": [
-    "dsa.glue"
+    "dsa.glue",
+    "dsa.prefill_glue"
    ],
    "source_experiment": "logs/20260924_0_glm53_flash_b200_tp4_ep4_nsys",
    "after": "dsa.indexer.kpool_gate_score",
@@ -1420,9 +1434,10 @@
    "operation": "dsa.glue",
    "name": "elementwise_kernel_with_index",
    "type": "model",
-   "role": "DSA index/mask plumbing (fills, aranges, compares, copies)",
+   "role": "DSA index/mask plumbing (fills, aranges, compares, copies), with the prefill [rows, selected_k] index plumbing",
    "slot_suffixes": [
-    "dsa.glue"
+    "dsa.glue",
+    "dsa.prefill_glue"
    ],
    "source_experiment": "logs/20260924_0_glm53_flash_b200_tp4_ep4_nsys",
    "after": "dsa.indexer.kpool_gate_score",
@@ -1432,9 +1447,10 @@
    "operation": "dsa.glue",
    "name": "at::native::vectorized_elementwise_kernel",
    "type": "model",
-   "role": "DSA index/mask plumbing (fills, aranges, compares, copies)",
+   "role": "DSA index/mask plumbing (fills, aranges, compares, copies), with the prefill [rows, selected_k] index plumbing",
    "slot_suffixes": [
-    "dsa.glue"
+    "dsa.glue",
+    "dsa.prefill_glue"
    ],
    "source_experiment": "logs/20260924_0_glm53_flash_b200_tp4_ep4_nsys",
    "after": "dsa.indexer.kpool_tail_seed",
@@ -1444,9 +1460,10 @@
    "operation": "dsa.glue",
    "name": "elementwise_kernel_with_index",
    "type": "model",
-   "role": "DSA index/mask plumbing (fills, aranges, compares, copies)",
+   "role": "DSA index/mask plumbing (fills, aranges, compares, copies), with the prefill [rows, selected_k] index plumbing",
    "slot_suffixes": [
-    "dsa.glue"
+    "dsa.glue",
+    "dsa.prefill_glue"
    ],
    "source_experiment": "logs/20260924_0_glm53_flash_b200_tp4_ep4_nsys",
    "after": "dsa.indexer.kpool_decode_update",
@@ -1456,9 +1473,10 @@
    "operation": "dsa.glue",
    "name": "at::native::unrolled_elementwise_kernel",
    "type": "model",
-   "role": "DSA index/mask plumbing (fills, aranges, compares, copies)",
+   "role": "DSA index/mask plumbing (fills, aranges, compares, copies), with the prefill [rows, selected_k] index plumbing",
    "slot_suffixes": [
-    "dsa.glue"
+    "dsa.glue",
+    "dsa.prefill_glue"
    ],
    "source_experiment": "logs/20260924_0_glm53_flash_b200_tp4_ep4_nsys",
    "after": "dsa.indexer.topk_decode",
@@ -1468,9 +1486,10 @@
    "operation": "dsa.glue",
    "name": "at::native::unrolled_elementwise_kernel",
    "type": "model",
-   "role": "DSA index/mask plumbing (fills, aranges, compares, copies)",
+   "role": "DSA index/mask plumbing (fills, aranges, compares, copies), with the prefill [rows, selected_k] index plumbing",
    "slot_suffixes": [
-    "dsa.glue"
+    "dsa.glue",
+    "dsa.prefill_glue"
    ],
    "source_experiment": "logs/20260924_0_glm53_flash_b200_tp4_ep4_nsys",
    "after": "dsa.indexer.topk_prefill",
@@ -1480,9 +1499,10 @@
    "operation": "dsa.glue",
    "name": "at::native::elementwise_kernel",
    "type": "model",
-   "role": "DSA index/mask plumbing (fills, aranges, compares, copies)",
+   "role": "DSA index/mask plumbing (fills, aranges, compares, copies), with the prefill [rows, selected_k] index plumbing",
    "slot_suffixes": [
-    "dsa.glue"
+    "dsa.glue",
+    "dsa.prefill_glue"
    ],
    "source_experiment": "logs/20260924_0_glm53_flash_b200_tp4_ep4_nsys",
    "after": "dsa.indexer.expand_pools",
@@ -1492,9 +1512,10 @@
    "operation": "dsa.glue",
    "name": "at::native::vectorized_elementwise_kernel",
    "type": "model",
-   "role": "DSA index/mask plumbing (fills, aranges, compares, copies)",
+   "role": "DSA index/mask plumbing (fills, aranges, compares, copies), with the prefill [rows, selected_k] index plumbing",
    "slot_suffixes": [
-    "dsa.glue"
+    "dsa.glue",
+    "dsa.prefill_glue"
    ],
    "source_experiment": "logs/20260924_0_glm53_flash_b200_tp4_ep4_nsys",
    "after": "dsa.sparse_mla.index_remap",
@@ -1504,9 +1525,10 @@
    "operation": "dsa.glue",
    "name": "at::native::elementwise_kernel",
    "type": "model",
-   "role": "DSA index/mask plumbing (fills, aranges, compares, copies)",
+   "role": "DSA index/mask plumbing (fills, aranges, compares, copies), with the prefill [rows, selected_k] index plumbing",
    "slot_suffixes": [
-    "dsa.glue"
+    "dsa.glue",
+    "dsa.prefill_glue"
    ],
    "source_experiment": "logs/20260924_0_glm53_flash_b200_tp4_ep4_nsys",
    "after": "dsa.glue",
@@ -1516,9 +1538,10 @@
    "operation": "dsa.glue",
    "name": "at::native::vectorized_elementwise_kernel",
    "type": "model",
-   "role": "DSA index/mask plumbing (fills, aranges, compares, copies)",
+   "role": "DSA index/mask plumbing (fills, aranges, compares, copies), with the prefill [rows, selected_k] index plumbing",
    "slot_suffixes": [
-    "dsa.glue"
+    "dsa.glue",
+    "dsa.prefill_glue"
    ],
    "source_experiment": "logs/20260924_0_glm53_flash_b200_tp4_ep4_nsys",
    "after": "dsa.glue",
@@ -1528,9 +1551,10 @@
    "operation": "dsa.glue",
    "name": "at::native::unrolled_elementwise_kernel",
    "type": "model",
-   "role": "DSA index/mask plumbing (fills, aranges, compares, copies)",
+   "role": "DSA index/mask plumbing (fills, aranges, compares, copies), with the prefill [rows, selected_k] index plumbing",
    "slot_suffixes": [
-    "dsa.glue"
+    "dsa.glue",
+    "dsa.prefill_glue"
    ],
    "source_experiment": "logs/20260924_0_glm53_flash_b200_tp4_ep4_nsys",
    "after": "dsa.glue",
@@ -1540,9 +1564,10 @@
    "operation": "dsa.glue",
    "name": "elementwise_kernel_with_index",
    "type": "model",
-   "role": "DSA index/mask plumbing (fills, aranges, compares, copies)",
+   "role": "DSA index/mask plumbing (fills, aranges, compares, copies), with the prefill [rows, selected_k] index plumbing",
    "slot_suffixes": [
-    "dsa.glue"
+    "dsa.glue",
+    "dsa.prefill_glue"
    ],
    "source_experiment": "logs/20260924_0_glm53_flash_b200_tp4_ep4_nsys",
    "after": "dsa.glue",

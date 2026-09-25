@@ -76,12 +76,11 @@ for s, role in [("in_proj", "KDA in_proj_qkvbfg_a BF16 projection"),
                 ("g_b_proj", "KDA g_b low-rank output-gate projection"),
                 ("short_conv_prefill", "KDA merged q/k/v causal conv (varlen prefill)"),
                 ("short_conv_decode", "KDA merged q/k/v causal conv update (decode)"),
-                ("decode_glue", "KDA decode split/copy launches between conv and recurrent core"),
                 ("prefill_qkv_copy", "KDA prefill q/k/v contiguous copies around the qk l2norm"),
                 ("prefill_glue", "KDA prefill small launches: beta sigmoid, index scans, gate views"),
                 ("state_gather", "KDA prefill SSM state gather"),
                 ("chunk_prefill", "KDA chunk prefill (chunk_kda_with_fused_gate: l2norm, gate cumsum, kkt, inverse, w/u, h, o)"),
-                ("recurrent_decode", "KDA fused recurrent decode"),
+                ("recurrent_decode", "KDA fused recurrent decode: the fused_recurrent_kda call, its q/k/v/state contiguous copies included"),
                 ("state_scatter", "KDA prefill SSM state scatter"),
                 ("gated_norm", "KDA sigmoid-gated RMSNorm"),
                 ("o_proj", "KDA output projection")]:
@@ -96,12 +95,13 @@ for g in GEMMS:
 M(K + "g_b_proj", NVJ, before_name="_causal_conv1d")
 M(K + "f_b_proj", NVJ, before=K + "g_b_proj")
 M(K + "in_proj", NVJ, before=K + "f_b_proj")
-M(K + "decode_glue", EW, after="<none>", before="<none>")
+M(K + "recurrent_decode", EW, after="<none>", before="<none>")
 M(K + "prefill_qkv_copy", EW, before=K + "chunk_prefill")
 M(K + "short_conv_prefill", "_causal_conv1d_fwd_kernel")
 M(K + "short_conv_decode", "_causal_conv1d_update_kernel")
-M(K + "decode_glue", EW, after=K + "short_conv_decode")
-M(K + "decode_glue", EW, after=K + "decode_glue")
+# the fused_recurrent_kda input copies belong to the call (the L1 kind times them)
+M(K + "recurrent_decode", EW, after=K + "short_conv_decode")
+M(K + "recurrent_decode", EW, before=K + "recurrent_decode")
 M(K + "state_gather", "_gather_initial_states_kernel")
 M(K + "prefill_glue", "triton_poi_fused__to_copy_sigmoid_0")
 M(K + "prefill_qkv_copy", EW, after=K + "prefill_glue")
@@ -131,7 +131,9 @@ for s, role in [("fused_qkv_a", "DSA fused Q and latent KV projection"),
                 ("indexer.wq_b", "DSA indexer query projection"),
                 ("indexer.wk_weights", "DSA indexer key/weights projection"),
                 ("indexer.head_weights", "DSA indexer fp32 head-weights torch.mm (cast copy, SIMT sgemm, split-K reduce)"),
+                ("indexer.k_norm", "DSA indexer k LayerNorm (Inductor-fused)"),
                 ("indexer.q_fwht_quant", "DSA indexer FWHT-128 + FP8 quant of q"),
+                ("indexer.weight_scale", "DSA indexer head weights x q scale (Inductor-fused)"),
                 ("indexer.kpool_gate_score", "DSA indexer kpool gate-score projection"),
                 ("indexer.prefill_gather", "DSA prefill k[idx] / gate_score[idx] gathers"),
                 ("indexer.kpool_decode_update", "DSA kpool decode cache update"),
@@ -147,13 +149,16 @@ for s, role in [("fused_qkv_a", "DSA fused Q and latent KV projection"),
                 ("q_fp8_quant", "MLA query FP8 quant, with the two remap-buffer fills launched between it and the remap"),
                 ("sparse_mla.mla_cache_append", "MLA latent cache append"),
                 ("sparse_mla.index_remap", "sparse MLA request-to-global index remap (triton)"),
-                ("sparse_mla.prefill", "token-sparse MLA attention, prefill-bearing variant"),
-                ("sparse_mla.decode", "token-sparse MLA attention, decode-only variant"),
                 ("output_copy", "sparse MLA output copy"),
                 ("v_up", "MLA W_UV value up bmm"),
                 ("o_proj", "DSA output projection"),
-                ("glue", "DSA index/mask plumbing (fills, aranges, compares, copies)")]:
+]:
     op(D + s, role, [D + s])
+# one attention launch per iteration: the prefill-bearing variant runs every row
+op(D + "sparse_mla", "token-sparse MLA attention (one launch per iteration)",
+   [D + "sparse_mla.prefill", D + "sparse_mla.decode"])
+op(D + "glue", "DSA index/mask plumbing (fills, aranges, compares, copies), with the prefill [rows, selected_k] index plumbing",
+   [D + "glue", D + "prefill_glue"])
 
 # fused_qkv_a: plain GEMM straight into the norm, or split-K GEMM + reduce into the norm
 M(D + "fused_qkv_a", NVJ, after_name=BIGFUSE, before_name="_fused_q_kv_rmsnorm")
@@ -166,7 +171,9 @@ for g in GEMMS:
     M(D + "indexer.wk_weights", g, after=D + "indexer.wq_b")
 M(D + "indexer.head_weights", COPY, after=D + "indexer.wk_weights")
 M(D + "indexer.head_weights", "cutlass_80_simt_sgemm")
+M(D + "indexer.k_norm", "triton_per_fused__to_copy_native_layer_norm_0")
 M(D + "indexer.q_fwht_quant", "_fwht_quant_kernel")
+M(D + "indexer.weight_scale", "triton_poi_fused_mul_unsqueeze_0")
 for g in GEMMS:
     M(D + "indexer.kpool_gate_score", g, after_name="triton_poi_fused_mul_unsqueeze_0")
 M(D + "indexer.prefill_gather", "vectorized_gather_kernel", phase="forward")
@@ -183,11 +190,10 @@ M(D + "sparse_mla.mla_cache_append", "concat_and_cache_mla_kernel")
 M(D + "q_absorb", NVJ, after=D + "sparse_mla.mla_cache_append")
 M(D + "q_concat", "CatArrayBatchedCopy<", after=D + "q_absorb")
 M(D + "q_fp8_quant", "scaled_fp8_quant_kernel_strided_group_shape")
-M(D + "sparse_mla.decode", "fmhaSm100fKernel_QkvE4m3OBfloat16H512PagedKvDenseDynamicTokenSparseP1MultiCtasKv")
-M(D + "sparse_mla.decode", "fmhaSm100fKernel_QkvE4m3OBfloat16H512HVPerCta128PagedKvDenseDynamicTokenSparseP1MultiCtasKv")
-M(D + "sparse_mla.prefill", "fmhaSm100fKernel_QkvE4m3OBfloat16H512PagedKvDenseDynamicTokenSparseP1VarSeq")
-M(D + "output_copy", EW, after=D + "sparse_mla.decode")
-M(D + "output_copy", EW, after=D + "sparse_mla.prefill")
+M(D + "sparse_mla", "fmhaSm100fKernel_QkvE4m3OBfloat16H512PagedKvDenseDynamicTokenSparseP1MultiCtasKv")
+M(D + "sparse_mla", "fmhaSm100fKernel_QkvE4m3OBfloat16H512HVPerCta128PagedKvDenseDynamicTokenSparseP1MultiCtasKv")
+M(D + "sparse_mla", "fmhaSm100fKernel_QkvE4m3OBfloat16H512PagedKvDenseDynamicTokenSparseP1VarSeq")
+M(D + "output_copy", EW, after=D + "sparse_mla")
 M(D + "v_up", NVJ, after=D + "output_copy")
 M(D + "o_proj", NVJ, after=D + "v_up")
 # remap: third launch after the q FP8 quant. The two fills between them carry
