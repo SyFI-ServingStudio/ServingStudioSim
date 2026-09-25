@@ -335,11 +335,19 @@ async def run_logged_process(
 
 
 async def run_analysis(
-    log_dir: Path, build_type: str = "debug", subjects: list[str] | None = None
+    log_dir: Path,
+    build_type: str = "debug",
+    subjects: list[str] | None = None,
+    *,
+    render: bool = True,
 ) -> None:
     """Best-effort post-run analysis: Rust `analyze run` (parquet → report+payload
     JSON) then the Python renderer (payload JSON → PNGs). Failures warn and return
     — analysis must never fail an otherwise-successful run.
+
+    `render=False` skips the PNGs and keeps the reports, payloads and trace that
+    the Analyzer UI reads. A sweep does this by default: on a 640-run grid the
+    renderer was 73% of all CPU, more than the simulations themselves.
 
     Async: across a sweep, many runs' analyze+render overlap under the existing
     semaphore instead of serializing on a blocking call that stalls the event loop.
@@ -444,6 +452,16 @@ async def run_analysis(
     # A standalone verb, not a subject (different output contract: a binary trace
     # for ui.perfetto.dev, not report/payload JSON), so it runs here with CLI
     # defaults rather than through the subject catalog. Best-effort like the rest.
+    trace_step = _timed_step(
+        "trace",
+        "analyze trace",
+        [str(analyzer), "trace", str(log_dir)],
+        lambda: validate_trace_artifacts(log_dir),
+    )
+    if not render:
+        if await trace_step != 0:
+            print(f"[analyze] trace failed for {log_dir}")
+        return
     render_rc, trace_rc = await asyncio.gather(
         _timed_step(
             "render",
@@ -457,12 +475,7 @@ async def run_analysis(
             ],
             lambda: validate_render_artifacts(log_dir),
         ),
-        _timed_step(
-            "trace",
-            "analyze trace",
-            [str(analyzer), "trace", str(log_dir)],
-            lambda: validate_trace_artifacts(log_dir),
-        ),
+        trace_step,
     )
     if render_rc != 0:
         print(f"[analyze] render failed for {log_dir}")

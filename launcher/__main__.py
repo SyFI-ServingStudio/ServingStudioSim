@@ -141,6 +141,14 @@ def _build_argparse():
         "otherwise runs after each successful run.",
     )
     parser.add_argument(
+        "--render-runs",
+        action="store_true",
+        help="In a sweep, also render each run's PNGs. By default a sweep writes "
+        "every run's reports, payloads and trace but renders only its aggregate "
+        "figures; draw one run later with `python analyzer/python render <log_dir>`. "
+        "A single run always renders.",
+    )
+    parser.add_argument(
         "--emit-backends",
         nargs="?",
         const="-",
@@ -696,6 +704,7 @@ def main(argv: list[str] | None = None) -> int:
         refresh=args.refresh,
         analyze=not args.no_analyze,
         analyze_subjects=analyze_subjects,
+        render_runs=args.render_runs,
     )
 
 

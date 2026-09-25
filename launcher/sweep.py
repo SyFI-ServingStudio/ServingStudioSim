@@ -89,6 +89,8 @@ async def _launch_one(
     managed_run: ManagedRun | None = None,
     scheduler: ResourceScheduler | None = None,
     run_directory_lease_held: bool = False,
+    *,
+    render: bool = True,
 ) -> bool:
     """Metadata-then-spawn for a single (already normalized) param set. On resume
     (the default) a run whose log_dir already has a `.complete` marker is skipped;
@@ -101,10 +103,11 @@ async def _launch_one(
 
     `analyze=True` runs the post-run analyzer (Rust compute → Python plots) after
     a successful run; best-effort, so analysis failures never fail the run.
-    `analyze_subjects` narrows which subjects run (None/empty = all applicable)."""
+    `analyze_subjects` narrows which subjects run (None/empty = all applicable).
+    `render=False` keeps the analysis but skips its PNGs."""
     log_dir = Path(log_dir_of(params))
     scheduler = scheduler or ResourceScheduler(1)
-    workflow = simulation_workflow(analyze=analyze)
+    workflow = simulation_workflow(analyze=analyze, render=render)
     journal = RunJournal(log_dir)
 
     async with _run_directory_lease(log_dir, run_directory_lease_held):
@@ -218,7 +221,12 @@ async def _launch_one(
             if managed_run is not None:
                 managed_run.report("analysis_running")
             async with scheduler.analysis_slot():
-                await run_analysis(log_dir, build_type, analyze_subjects)
+                await run_analysis(
+                    log_dir,
+                    build_type,
+                    analyze_subjects,
+                    render=workflow.contains(StageKind.RENDER),
+                )
 
         _mark_complete(log_dir)
         journal.update(
@@ -336,13 +344,21 @@ def run_sweep(
     refresh: bool = False,
     analyze: bool = True,
     analyze_subjects: list[str] | None = None,
+    *,
+    render_runs: bool = False,
 ) -> int:
     """Expand-then-launch a full sweep. Returns a process exit code. The caller
     must pass the already-loaded Rust schema from `load_schema()`; the sweep
     layer never loads a schema implicitly. Resumes by default (skips runs marked
     `.complete`); `refresh=True` re-runs all. `analyze=True` runs the per-run
     analyzer after each successful run (best-effort); `analyze_subjects` narrows
-    which subjects."""
+    which subjects.
+
+    Each run gets its reports, payloads and trace, but not its PNGs unless
+    `render_runs=True`: the renderer spends ~22 CPU-s per run against ~3 for the
+    simulation, and the Analyzer UI draws from the payloads. The sweep's own
+    aggregate figures are still rendered. Draw one run's PNGs later with
+    `python analyzer/python render <run log_dir>`."""
     if schema is None:
         raise TypeError("run_sweep requires a loaded Schema; call load_schema() first")
     return asyncio.run(
@@ -355,6 +371,7 @@ def run_sweep(
             refresh,
             analyze,
             analyze_subjects,
+            render_runs,
         )
     )
 
@@ -368,6 +385,7 @@ async def _run_sweep_async(
     refresh: bool = False,
     analyze: bool = True,
     analyze_subjects: list[str] | None = None,
+    render_runs: bool = False,
 ) -> int:
     if not validate_unique_log_dirs(param_sets):
         return 2
@@ -429,6 +447,7 @@ async def _run_sweep_async(
                     analyze_subjects=analyze_subjects,
                     managed_run=managed_run,
                     scheduler=scheduler,
+                    render=render_runs,
                 )
 
             results = await asyncio.gather(

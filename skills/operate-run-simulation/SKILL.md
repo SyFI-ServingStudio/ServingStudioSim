@@ -255,6 +255,13 @@ one reads and emits is the canonical Subjects catalog in
 `analyzer/README.md` — point there instead of guessing metric names. Selection is
 the optional preset key `analyze_subjects`.
 
+A sweep skips each run's `plots/` PNGs by default; it still writes every
+run's `reports/`, `payloads/` and trace, and renders the sweep's aggregate
+figures. Pass `--render-runs` only when the user wants every run's PNGs. To
+look at one run's figures, render just that run afterwards:
+`uv run python analyzer/python render <run log_dir>`. A single-run preset
+always renders.
+
 **Default invariant: run all applicable subjects.** Omit `analyze_subjects`
 (preferred; an empty list has the same launcher meaning) and do not pass
 `--no-analyze`. “All” means every registered subject whose applicability gate

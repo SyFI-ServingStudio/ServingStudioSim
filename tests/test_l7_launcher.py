@@ -273,6 +273,39 @@ def test_run_analysis_delegates_both_optimality_modes_to_analyzer(monkeypatch, t
     assert analyzer_run_commands == [[str(analyzer_path), "run", str(log_dir), "optimality"]]
 
 
+@pytest.mark.parametrize("render", [True, False])
+def test_run_analysis_renders_only_when_asked(monkeypatch, tmp_path, render):
+    analyzer_path = tmp_path / "analyze"
+    analyzer_path.write_text("")
+    log_dir = tmp_path / "run"
+    log_dir.mkdir()
+    (log_dir / "stdout.log").write_text("")
+    stages: list[str] = []
+
+    async def supervise(spec):
+        stages.append(spec.name)
+        return ProcessResult(
+            argv=tuple(str(argument) for argument in spec.argv),
+            pid=1,
+            process_group_id=1,
+            exit_code=0,
+            elapsed_seconds=0.0,
+        )
+
+    monkeypatch.setattr("launcher.exec.analyzer_binary_path", lambda _build_type: analyzer_path)
+    monkeypatch.setattr("launcher.exec._PROCESS_SUPERVISOR.run", supervise)
+    for validator in (
+        "validate_json_outputs",
+        "validate_render_artifacts",
+        "validate_trace_artifacts",
+    ):
+        monkeypatch.setattr(f"launcher.exec.{validator}", lambda _path: ArtifactValidation(()))
+
+    asyncio.run(run_analysis(log_dir, render=render))
+
+    assert sorted(stages) == sorted(["analyze_compute", "trace", *(["render"] if render else [])])
+
+
 def test_run_capture_avoids_asyncio_subprocess_transport(monkeypatch):
     async def reject_asyncio_subprocess(*_arguments, **_keyword_arguments):
         raise AssertionError("analysis capture must not use the asyncio subprocess transport")
