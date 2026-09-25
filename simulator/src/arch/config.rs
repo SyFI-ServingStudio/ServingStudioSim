@@ -480,6 +480,12 @@ pub enum IterArchSel {
         #[serde(default)]
         #[param(cache_key)]
         token_corpus_file: Option<String>,
+        /// vLLM `--cudagraph-capture-sizes`. The engine pads an iteration's
+        /// token count up to the next captured size, and every kernel outside
+        /// the attention graph break runs on the padded rows. Empty: no
+        /// padding (eager).
+        #[serde(default)]
+        cudagraph_capture_sizes: Vec<u32>,
     },
     /// SGLang's B200 NVFP4 launch graph under pure tensor parallelism. Every
     /// rank owns all experts (EP1) and shards the routed intermediate axis by

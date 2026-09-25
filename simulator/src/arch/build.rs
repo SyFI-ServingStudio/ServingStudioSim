@@ -1171,6 +1171,7 @@ pub fn glm53_flash_vllm_fp8_kda_dsa_moe(
     routing_seed: Option<u64>,
     expert_popularity_file: Option<&str>,
     token_corpus_file: Option<&str>,
+    cudagraph_capture_sizes: &[u32],
     gpu: &str,
     name: &str,
     bridge: &PerfApiBridge,
@@ -1203,6 +1204,7 @@ pub fn glm53_flash_vllm_fp8_kda_dsa_moe(
         tp_size,
         max_model_len,
         gpu_name: gpu.to_string(),
+        cudagraph_capture_sizes: cudagraph_capture_sizes.to_vec(),
     };
     let configs = glm53_flash_vllm_fp8_kda_dsa_moe::build_configs(&model_cfg, &parallel, &demand)
         .context("expanding GLM-5.3-Flash architecture configs")?;
@@ -1701,6 +1703,7 @@ pub fn build_iter_model(
             routing_seed,
             expert_popularity_file,
             token_corpus_file,
+            cudagraph_capture_sizes,
         } => Box::new(glm53_flash_vllm_fp8_kda_dsa_moe(
             model,
             *tp_size,
@@ -1709,6 +1712,7 @@ pub fn build_iter_model(
             *routing_seed,
             expert_popularity_file.as_deref(),
             token_corpus_file.as_deref(),
+            cudagraph_capture_sizes,
             gpu,
             name,
             bridge,

@@ -263,6 +263,8 @@ pub struct Glm53FlashVllmParallel {
     pub tp_size: u16,
     pub max_model_len: u32,
     pub gpu_name: String,
+    /// vLLM `--cudagraph-capture-sizes`; empty runs eager (no padding).
+    pub cudagraph_capture_sizes: Vec<u32>,
 }
 
 /// Which attention and FFN a layer group carries, and how it opens.
@@ -677,8 +679,9 @@ impl LayerGroup {
         }
     }
 
-    fn eval(&self, batch: &NormalizedBatch, ev: &mut Evaluator) {
-        let tokens = batch.total_tokens;
+    /// `tokens` is the graph-padded row count every kernel outside the
+    /// attention graph break runs on; attention reads the real rows in `batch`.
+    fn eval(&self, batch: &NormalizedBatch, tokens: u32, ev: &mut Evaluator) {
         self.attn_boundary.eval(tokens, ev);
         match &self.attn {
             Attention::Kda(worklet) => worklet.eval(&batch.kda, ev),
@@ -712,6 +715,8 @@ pub struct Glm53FlashVllmModel {
     pub name: String,
     pub tp_size: u16,
     pub max_model_len: u32,
+    /// Sorted, deduplicated capture sizes (see `Glm53FlashVllmParallel`).
+    cudagraph_capture_sizes: Vec<u32>,
     embedding: Op<ElementwiseKernel>,
     embedding_all_reduce: Op<AllReduceFusionKernel>,
     hc_expand: Op<ElementwiseKernel>,
@@ -913,6 +918,12 @@ pub fn build(
         )?,
         tp_size: cfg.parallel.tp_size,
         max_model_len: cfg.parallel.max_model_len,
+        cudagraph_capture_sizes: {
+            let mut sizes = cfg.parallel.cudagraph_capture_sizes.clone();
+            sizes.sort_unstable();
+            sizes.dedup();
+            sizes
+        },
         total_kv_bytes_per_token,
         recurrent_state_bytes_per_request,
         cost_flat: Vec::new(),
@@ -955,7 +966,7 @@ impl Glm53FlashVllmModel {
     fn eval_into(&self, input: &UnifiedArchInput, ev: &mut Evaluator) {
         let batch = normalize_input(input, self.max_model_len)
             .unwrap_or_else(|reason| panic!("invalid Glm53FlashVllmModel input: {reason}"));
-        let tokens = batch.total_tokens;
+        let tokens = graph_padded_tokens(&self.cudagraph_capture_sizes, batch.total_tokens);
         push(
             &self.embedding,
             ElementwiseKernelInput { num_tokens: tokens },
@@ -972,7 +983,7 @@ impl Glm53FlashVllmModel {
             ev,
         );
         for group in &self.groups {
-            group.eval(&batch, ev);
+            group.eval(&batch, tokens, ev);
         }
         self.terminal_post
             .eval(&MhcTerminalPostInput { num_tokens: tokens }, ev);
@@ -1068,6 +1079,15 @@ impl IterwiseUnifiedModel for Glm53FlashVllmModel {
             "slot inputs must align with compiled slots"
         );
         total
+    }
+}
+
+/// The row count vLLM runs a CUDA-graph replay on: the smallest captured size
+/// that holds `tokens`, or `tokens` itself above the largest (eager).
+fn graph_padded_tokens(sorted_sizes: &[u32], tokens: u32) -> u32 {
+    match sorted_sizes.binary_search(&tokens) {
+        Ok(_) => tokens,
+        Err(index) => sorted_sizes.get(index).copied().unwrap_or(tokens),
     }
 }
 
@@ -1204,7 +1224,19 @@ mod tests {
             tp_size: 4,
             max_model_len: 8192,
             gpu_name: "NVIDIA B200".into(),
+            cudagraph_capture_sizes: Vec::new(),
         }
+    }
+
+    #[test]
+    fn graph_padding_rounds_up_to_the_next_captured_size() {
+        let sizes = [1, 2, 4, 8, 16, 24];
+        let padded: Vec<u32> = [1, 3, 5, 16, 17, 24, 25]
+            .iter()
+            .map(|&t| graph_padded_tokens(&sizes, t))
+            .collect();
+        assert_eq!(padded, [1, 4, 8, 16, 24, 24, 25]);
+        assert_eq!(graph_padded_tokens(&[], 7), 7);
     }
 
     fn built() -> Glm53FlashVllmModel {

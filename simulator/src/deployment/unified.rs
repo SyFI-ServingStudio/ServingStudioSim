@@ -39,9 +39,9 @@ use crate::orchestrator::{
 use crate::timing::PerfApiBridge;
 use crate::worker::{
     build_barebone_worker, build_chunked_prefill_worker, build_hp_worker,
-    build_qwen36_hybrid_worker, build_speculative_worker, resolve_prefix_cache_config, BatchPolicy,
-    IterWorker, IterWorkerSel, KvAdmissionConfig, PendingOrderKind, PrefixCacheMode,
-    PrefixCachePolicy, WorkerConfig,
+    build_hybrid_chunked_prefill_worker, build_qwen36_hybrid_worker, build_speculative_worker,
+    resolve_prefix_cache_config, BatchPolicy, IterWorker, IterWorkerSel, KvAdmissionConfig,
+    PendingOrderKind, PrefixCacheMode, PrefixCachePolicy, WorkerConfig,
 };
 
 use super::Deployment;
@@ -205,16 +205,16 @@ impl Deployment for UnifiedDeployment {
         // single-group barebone worker; the DP-attn / MoE archs run on the
         // multi-group hp_unified worker (one KV partition state per DP shard).
         match &g.arch {
-            // Barebone cadence, hybrid KV: 30 GDN layers of per-request
-            // recurrent state and 10 GQA layers of per-token KV live in one
-            // attention budget, so only the KV axis differs from the arms below.
+            // Hybrid KV: 30 GDN layers of per-request recurrent state and 10
+            // GQA layers of per-token KV live in one attention budget, so only
+            // the KV axis differs from the arms below.
             IterArchSel::Qwen36Local {
                 routing,
                 routing_seed,
                 expert_popularity_file,
                 ..
             } => {
-                ensure_barebone(&g.worker)?;
+                ensure_hybrid_worker("Qwen3.6 local", &g.worker)?;
                 let model = Arc::new(arch_build::qwen36_local(
                     model_spec,
                     *routing,
@@ -224,20 +224,21 @@ impl Deployment for UnifiedDeployment {
                     MODEL_NAME,
                     bridge,
                 )?);
-                Ok(assemble_flow(
+                assemble_hybrid_flow(
+                    "Qwen3.6 local",
                     model,
                     store,
                     worker_config,
                     log_dir,
                     gpu_name,
                     dp_cfg,
-                    build_qwen36_hybrid_worker,
-                ))
+                    &g.worker,
+                )
             }
             // Hybrid KV like Qwen3.6: 34 KDA layers of per-request recurrent
             // state (fp32 SSM + conv window) and 11 DSA layers of per-token MLA
-            // latent + kpool index cache share one attention budget. The
-            // hybrid recipe is the only one that charges both; the chunked and
+            // latent + kpool index cache share one attention budget. Only the
+            // hybrid recipes charge both; the full-attention chunked and
             // hp_unified recipes would leave the KDA state invisible.
             IterArchSel::Glm53FlashVllmFp8KdaDsaMoe {
                 tp_size,
@@ -246,9 +247,10 @@ impl Deployment for UnifiedDeployment {
                 routing_seed,
                 expert_popularity_file,
                 token_corpus_file,
+                cudagraph_capture_sizes,
                 ..
             } => {
-                ensure_barebone(&g.worker)?;
+                ensure_hybrid_worker("GLM-5.3-Flash vLLM FP8", &g.worker)?;
                 let model = Arc::new(arch_build::glm53_flash_vllm_fp8_kda_dsa_moe(
                     model_spec,
                     *tp_size,
@@ -257,19 +259,21 @@ impl Deployment for UnifiedDeployment {
                     *routing_seed,
                     expert_popularity_file.as_deref(),
                     token_corpus_file.as_deref(),
+                    cudagraph_capture_sizes,
                     &gpu_name,
                     MODEL_NAME,
                     bridge,
                 )?);
-                Ok(assemble_flow(
+                assemble_hybrid_flow(
+                    "GLM-5.3-Flash vLLM FP8",
                     model,
                     store,
                     worker_config,
                     log_dir,
                     gpu_name,
                     dp_cfg,
-                    build_qwen36_hybrid_worker,
-                ))
+                    &g.worker,
+                )
             }
             IterArchSel::Llama3Dense { .. } => {
                 ensure_barebone(&g.worker)?;
@@ -663,6 +667,53 @@ fn ensure_barebone(worker: &IterWorkerSel) -> anyhow::Result<()> {
     }
 }
 
+/// Hybrid-KV archs run on a hybrid-store recipe under either lifecycle:
+/// barebone admission or hard-capped chunked prefill.
+fn ensure_hybrid_worker(arch_name: &str, worker: &IterWorkerSel) -> anyhow::Result<()> {
+    match worker {
+        IterWorkerSel::Barebone { .. } | IterWorkerSel::ChunkedPrefill { .. } => Ok(()),
+        other => bail!(
+            "unified: {arch_name} requires worker `barebone` or `chunked_prefill`, got {other:?}"
+        ),
+    }
+}
+
+fn assemble_hybrid_flow<M>(
+    arch_name: &str,
+    model: Arc<M>,
+    store: SharedRequests,
+    worker_config: WorkerConfig,
+    log_dir: Option<PathBuf>,
+    gpu_name: String,
+    dp_cfg: SimpleDpConfig,
+    worker: &IterWorkerSel,
+) -> anyhow::Result<Box<dyn Flow>>
+where
+    M: IterwiseUnifiedModel,
+{
+    match worker {
+        IterWorkerSel::Barebone { .. } => Ok(assemble_flow(
+            model,
+            store,
+            worker_config,
+            log_dir,
+            gpu_name,
+            dp_cfg,
+            build_qwen36_hybrid_worker,
+        )),
+        IterWorkerSel::ChunkedPrefill { .. } => Ok(assemble_flow(
+            model,
+            store,
+            worker_config,
+            log_dir,
+            gpu_name,
+            dp_cfg,
+            build_hybrid_chunked_prefill_worker,
+        )),
+        other => bail!("unified: unsupported {arch_name} worker {other:?}"),
+    }
+}
+
 /// The hybrid KV recipe's optional snapshot-interval override. Only `barebone`
 /// carries it; every other selector leaves the arch's own alignment in force.
 fn ssm_checkpoint_interval_tokens(worker: &IterWorkerSel) -> Option<u32> {
@@ -813,7 +864,7 @@ mod tests {
     use super::*;
     use crate::arch::{
         Glm52VllmDsaMoeModel, Glm52VllmNvfp4DsaMoeModel, Glm52VllmNvfp4DsaMoeSpeculativeModel,
-        Qwen36LocalModel,
+        Glm53FlashVllmModel, Qwen36LocalModel,
     };
     use crate::common::RequestId;
     use crate::worker::{ChunkedPrefillWorker, HpUnifiedWorker, WorkerEventCommon};
@@ -882,6 +933,23 @@ mod tests {
         ensure_barebone(&barebone_worker()).expect("Qwen3.6 local accepts barebone");
         let error = ensure_barebone(&hp_worker()).unwrap_err().to_string();
         assert!(error.contains("requires worker `barebone`"));
+    }
+
+    /// Both hybrid archs take the hybrid store under either lifecycle.
+    #[test]
+    fn hybrid_archs_pair_with_barebone_or_chunked_prefill() {
+        assert_iter_worker_contract::<crate::worker::Qwen36HybridWorker<Glm53FlashVllmModel>>();
+        assert_iter_worker_contract::<crate::worker::HybridChunkedPrefillWorker<Glm53FlashVllmModel>>(
+        );
+        assert_iter_worker_contract::<crate::worker::HybridChunkedPrefillWorker<Qwen36LocalModel>>(
+        );
+        for worker in [barebone_worker(), chunked_prefill_worker()] {
+            ensure_hybrid_worker("GLM-5.3-Flash", &worker).expect("hybrid lifecycle");
+        }
+        let error = ensure_hybrid_worker("GLM-5.3-Flash", &hp_worker())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("requires worker `barebone` or `chunked_prefill`"));
     }
 
     #[test]

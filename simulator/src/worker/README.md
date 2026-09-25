@@ -44,6 +44,10 @@ different timelines and should not be hidden behind one giant FSM abstraction.
 | `disagg_attn` | `FullAttnKv` | `FreshRequestSlotAdmission<SessionStartOrder>` | `AttentionLayerExecutionAdapter` | `SlotAttentionWorker` + private `AttentionSlotPipeline` |
 | `disagg_ffn` | none | none; L6 sends complete tasks | `FfnSectionExecutionAdapter` | `BufferedFfnWorker` |
 
+Hybrid recurrent + attention archs (Qwen3.6 local, GLM-5.3-Flash) swap in
+`HybridGdnKv` under `barebone` (`Qwen36HybridWorker`) and `chunked_prefill`
+(`HybridChunkedPrefillWorker`).
+
 Aliases such as `BareboneWorker<M>` and `DisaggAttnWorker<M>` name these concrete
 generic compositions. They are not wrapper runtimes.
 
@@ -286,7 +290,8 @@ returns the `CostBuffers`; the recipe wraps them.
 Deployments and pool controllers only call those recipes:
 
 - unified → `build_barebone_worker` / `build_hp_worker` /
-  `build_chunked_prefill_worker`
+  `build_chunked_prefill_worker` / `build_speculative_worker` /
+  `build_qwen36_hybrid_worker` / `build_hybrid_chunked_prefill_worker`
 - PD → `build_pd_prefill_worker` / `build_pd_decode_worker`
 - AFD attention → `build_afd_attention_worker`
 - AFD FFN → `build_afd_ffn_worker`
@@ -300,7 +305,11 @@ contracts and exposes prompt chunks bounded by `max_batch_tokens`. Its
 shell-owned iteration plan expresses whether resident decode shares that
 iteration (`mix`) or waits behind a runnable prefill
 (`separate-prefill-priority`); KV membership is unchanged in both cases. It
-does not replay an observed DP rank or rewrite request shapes.
+does not replay an observed DP rank or rewrite request shapes. An optional
+chunk-end quantum (`with_chunk_end_quantum`) ports vLLM's Mamba `align` split:
+non-final chunks end on recurrent-state checkpoint boundaries, and the budget
+a clipped chunk leaves may start further prompts. Only the hybrid recipe sets
+it, from the arch's checkpoint interval, when prefix caching is on.
 
 KV admission is a separate selector component (`kv_admission_policy`), shared
 by `chunked_prefill` and `speculative`:
