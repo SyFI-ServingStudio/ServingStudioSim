@@ -39,6 +39,9 @@ def test_logical_bytes_include_fp32_output() -> None:
         (8, 512, 4096, "fp16"),
         (8, 288, 4096, "fp32"),
         (8, 32, 4096, "bf16"),
+        # k and n are validated as a production pair, not as independent sets.
+        (8, 288, 5120, "bf16"),
+        (8, 384, 4096, "bf16"),
     ],
 )
 def test_rejects_non_production_identity(arguments: tuple[object, ...]) -> None:
@@ -86,9 +89,7 @@ def test_fork_backend_is_registered_on_the_serving_stack() -> None:
     spec = get_spec("gemm_fp32_output", "torch_cublas_vllm_fork")
     assert spec.subprocess_env == "vllm_fork_env"
     assert spec.supports.compute == frozenset({DType.BF16, DType.FP32})
-    assert get_spec("gemm_fp32_output", "torch_cublas").supports.compute == frozenset(
-        {DType.BF16}
-    )
+    assert get_spec("gemm_fp32_output", "torch_cublas").supports.compute == frozenset({DType.BF16})
 
 
 def test_logical_bytes_use_four_byte_operands_for_fp32_input() -> None:
@@ -99,3 +100,12 @@ def test_logical_bytes_use_four_byte_operands_for_fp32_input() -> None:
 
 def test_router_width_is_accepted() -> None:
     assert _validate_args(32, 288, 4096, "bf16").n == 288
+
+
+@pytest.mark.parametrize("n", [384, 512, 1024])
+def test_deepseek_v41_router_and_compressor_widths_carry_k(n: int) -> None:
+    """V4.1 router (384) and compressors (512/1024) use k=5120; a fixed k would mis-time them."""
+    shape = _fork_args(48, n, 5120, "bf16")
+
+    assert (shape.k, shape.n) == (5120, n)
+    assert _logical_bytes(shape) == 2 * 48 * 5120 + 2 * n * 5120 + 4 * 48 * n

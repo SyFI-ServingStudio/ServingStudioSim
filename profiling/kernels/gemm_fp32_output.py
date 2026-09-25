@@ -46,8 +46,10 @@ register(
     )
 )
 
-# GLM-5.3 serving stack. Its cuBLAS selects the production split-K SGEMM for
-# the FP32 indexer head-weights form, which the container cuBLAS does not.
+# Alignment-fork serving stack. Its cuBLAS selects the production split-K SGEMM
+# for the GLM-5.3 FP32 indexer head-weights form, which the container cuBLAS
+# does not. On the DeepSeek-V4.1 fork it also emits the captured NvJet
+# (+ splitKreduce) kernels for the k=5120 router and compressor GEMMs.
 register(
     KernelProfilerSpec(
         kernel_kind=KIND,

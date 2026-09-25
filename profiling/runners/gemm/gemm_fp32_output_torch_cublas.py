@@ -1,10 +1,14 @@
-"""Profile the exact FP32-output ``torch.mm`` calls of DeepSeek V4 and GLM-5.3.
+"""Profile the exact FP32-output ``torch.mm`` calls of DeepSeek V4/V4.1 and GLM-5.3.
 
 Two production forms share this runner, selected by ``input_dtype``:
 
 - ``bf16``: ``torch.mm(x, weight.T, out_dtype=torch.float32)`` over a
   ``[n, k]`` BF16 weight. DeepSeek V4 attention closures and GLM-5.3 MoE
-  ``GateLinear`` Tier 4 (router, n=288).
+  ``GateLinear`` Tier 4 (router, n=288). DeepSeek-V4.1-Flash (k=5120) issues
+  the same call for its MoE router (``GateLinear`` Tier 4 above 16 tokens,
+  n=384) and for the kv-source compressor ``fused_wkv_wgate`` closure in
+  ``models/deepseek_v41/attention.py`` (n=1024 at compress ratio 2, n=512 at
+  ratio 1).
 - ``fp32``: ``torch.mm(x.float(), w)`` over a cached contiguous ``[k, n]`` FP32
   weight (GLM-5.3 DSA indexer head weights, ``_wp_fp32``, n=32). The
   ``x.float()`` cast is a separate elementwise launch, outside this boundary.
@@ -33,11 +37,14 @@ _SUPPORTED_DTYPES = frozenset({DType.BF16})
 _FORK_BACKEND = "gemm_fp32_output:torch_cublas_vllm_fork"
 _FORK_SUPPORTED_GPUS = frozenset({"NVIDIA B200"})
 _FORK_SUPPORTED_DTYPES = frozenset({DType.BF16, DType.FP32})
-_K = 4096
-# Verified production widths per input dtype.
-_SUPPORTED_N = {
-    DType.BF16: frozenset({256, 288, 512, 1024, 2048}),
-    DType.FP32: frozenset({32}),
+# Verified production (k, n) identities per input dtype.
+_SUPPORTED_KN = {
+    DType.BF16: frozenset(
+        {(4096, n) for n in (256, 288, 512, 1024, 2048)}
+        # DeepSeek-V4.1-Flash router (384) and compressors (512, 1024).
+        | {(5120, n) for n in (384, 512, 1024)}
+    ),
+    DType.FP32: frozenset({(4096, 32)}),
 }
 
 
@@ -45,6 +52,7 @@ _SUPPORTED_N = {
 class _Shape:
     m: int
     n: int
+    k: int = 4096
     input_dtype: DType = DType.BF16
 
 
@@ -83,12 +91,12 @@ def _validate_args(
     if dtype not in supported_dtypes:
         names = ", ".join(sorted(d.value for d in supported_dtypes))
         raise ProfilerNotImplemented(f"{backend} requires input_dtype in {{{names}}}")
-    if n not in _SUPPORTED_N[dtype] or k != _K:
+    if (k, n) not in _SUPPORTED_KN[dtype]:
         raise ProfilerNotImplemented(
-            f"{backend} requires n in {sorted(_SUPPORTED_N[dtype])} for "
-            f"input_dtype={dtype.value} and k={_K}"
+            f"{backend} requires (k, n) in {sorted(_SUPPORTED_KN[dtype])} for "
+            f"input_dtype={dtype.value}"
         )
-    return _Shape(m, n, dtype)
+    return _Shape(m, n, k, dtype)
 
 
 def _require_supported_gpu(
@@ -111,20 +119,22 @@ def _prepare(torch: Any, shape: _Shape) -> _Launch:
     generator = torch.Generator(device=device).manual_seed(31)
     if shape.input_dtype is DType.FP32:
         if torch.get_float32_matmul_precision() != "highest":
-            raise ProfilerNotImplemented(f"{_FORK_BACKEND} fp32 requires matmul precision 'highest'")
+            raise ProfilerNotImplemented(
+                f"{_FORK_BACKEND} fp32 requires matmul precision 'highest'"
+            )
         input_tensor = torch.randn(
-            (shape.m, _K), dtype=torch.float32, device=device, generator=generator
+            (shape.m, shape.k), dtype=torch.float32, device=device, generator=generator
         )
         weight = torch.randn(
-            (shape.n, _K), dtype=torch.float32, device=device, generator=generator
+            (shape.n, shape.k), dtype=torch.float32, device=device, generator=generator
         )
         # Production caches weight[head_dim:, :].t().contiguous().float().
         return _Launch(torch, input_tensor, weight.t().contiguous(), fp32_input=True)
     input_tensor = torch.randn(
-        (shape.m, _K), dtype=torch.bfloat16, device=device, generator=generator
+        (shape.m, shape.k), dtype=torch.bfloat16, device=device, generator=generator
     )
     weight = torch.randn(
-        (shape.n, _K), dtype=torch.bfloat16, device=device, generator=generator
+        (shape.n, shape.k), dtype=torch.bfloat16, device=device, generator=generator
     )
     return _Launch(torch, input_tensor, weight.T)
 
@@ -140,7 +150,7 @@ def _check_output(torch: Any, launch: _Launch) -> None:
 
 def _logical_bytes(shape: _Shape) -> int:
     width = shape.input_dtype.size_bytes()
-    return width * shape.m * _K + width * shape.n * _K + 4 * shape.m * shape.n
+    return width * shape.m * shape.k + width * shape.n * shape.k + 4 * shape.m * shape.n
 
 
 def profile_gemm_fp32_output_torch_cublas(
@@ -191,7 +201,7 @@ def _profile(shape: _Shape, *, backend: str, supported_gpus: frozenset[str]) -> 
         raise KernelLaunchFailed(f"{backend} failed") from exc
 
     elapsed_seconds = time_ms / 1000.0
-    flops = 2 * shape.m * shape.n * _K
+    flops = 2 * shape.m * shape.n * shape.k
     return ComputeMetrics(
         time_ms=float(time_ms),
         tflops=float(flops / elapsed_seconds / 1e12 if elapsed_seconds else 0.0),
