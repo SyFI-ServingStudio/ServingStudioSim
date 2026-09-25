@@ -102,6 +102,11 @@ const Q_ABSORB_BACKENDS: &[&str] = &["torch_mla_q_absorb_glm53"];
 const V_UP_BACKENDS: &[&str] = &["torch_mla_v_up_glm53"];
 const MQA_LOGITS_BACKENDS: &[&str] = &["deepgemm_fp8_vllm_fork"];
 const TOPK_BACKENDS: &[&str] = &["vllm_fork_cuda"];
+/// The fork's `fp8_fp4_mqa_logits` is DeepGEMM's `sm100_mqa_logits`; the
+/// packaged `deepgemm_fp8` rows time the same kernel (0.573 ms at 2048 x 65536
+/// against 0.55 ms measured at a 261K-token context in capture 20260925_4).
+const MQA_LOGITS_PREFILL_BACKENDS: &[&str] = &["deepgemm_fp8"];
+const TOPK_PREFILL_BACKENDS: &[&str] = &["vllm_fork_cuda"];
 const SPARSE_ATTN_BACKENDS: &[&str] = &["flashinfer_trtllm_fp8_vllm_fork"];
 const MLA_APPEND_BACKENDS: &[&str] = &["vllm_cuda"];
 const INDEX_REMAP_BACKENDS: &[&str] = &["vllm_fork_triton"];
@@ -460,6 +465,8 @@ pub fn build_configs(
             mla_bmm_v_up_backends: V_UP_BACKENDS.to_vec(),
             mqa_logits_backends: MQA_LOGITS_BACKENDS.to_vec(),
             topk_backends: TOPK_BACKENDS.to_vec(),
+            mqa_logits_prefill_backends: MQA_LOGITS_PREFILL_BACKENDS.to_vec(),
+            topk_prefill_backends: TOPK_PREFILL_BACKENDS.to_vec(),
             sparse_attention_backends: SPARSE_ATTN_BACKENDS.to_vec(),
             mla_cache_append_backends: MLA_APPEND_BACKENDS.to_vec(),
             index_remap_backends: INDEX_REMAP_BACKENDS.to_vec(),

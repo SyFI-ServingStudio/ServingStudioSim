@@ -91,7 +91,7 @@ def test_registration_support_and_facades() -> None:
     spec = find_kernel_profiler_spec(KIND, _BACKEND)
 
     assert KIND == "dsa_topk_prefill"
-    assert known_backends(KIND) == [_BACKEND, _VLLM_BACKEND, _SGLANG_BACKEND]
+    assert known_backends(KIND) == [_BACKEND, _VLLM_BACKEND, _SGLANG_BACKEND, "vllm_fork_cuda"]
     assert spec.kernel_kind == spec.table_name == KIND
     assert spec.args_schema is DsaTopkPrefillArgs
     assert spec.metric_family is MetricFamily.COMPUTE
@@ -550,3 +550,72 @@ def test_vllm_profile_translates_runtime_failure(monkeypatch) -> None:
     )
     with pytest.raises(KernelLaunchFailed, match="synthetic vLLM launch failure"):
         runner.profile_dsa_topk_prefill_vllm_cuda(**_BASE_SPEC)
+
+
+def test_fork_registration_runs_in_the_fork_env_on_b200_only() -> None:
+    fork_spec = find_kernel_profiler_spec(KIND, "vllm_fork_cuda")
+
+    assert fork_spec.table_name == KIND
+    assert fork_spec.args_schema is DsaTopkPrefillArgs
+    assert fork_spec.subprocess_env == "vllm_fork_env"
+    assert fork_spec.supports.allows(DType.FP32, gpu="NVIDIA B200")
+    assert not fork_spec.supports.allows(DType.FP32, gpu="NVIDIA H200")
+    assert fork_spec.runner_ref.function_name == "profile_dsa_topk_prefill_vllm_fork_cuda"
+
+
+def test_fork_accepts_the_kpool_top_k_and_vllm_cuda_does_not(monkeypatch) -> None:
+    from profiling.runners.attention import dsa_topk_prefill as runner
+
+    def fail_if_loaded():
+        raise AssertionError("loader must not run")
+
+    monkeypatch.setattr(runner, "_load_vllm_cuda_backend", fail_if_loaded)
+    with pytest.raises(ValueError, match="top_k=2048, got 512"):
+        runner.profile_dsa_topk_prefill_vllm_cuda(**(_BASE_SPEC | {"top_k": 512}))
+    with pytest.raises(ValueError, match="top_k=512 or top_k=1024 or top_k=2048, got 256"):
+        runner.profile_dsa_topk_prefill_vllm_fork_cuda(**(_BASE_SPEC | {"top_k": 256}))
+
+
+def test_fork_profile_forwards_select_k_512_and_checks_its_gpus(monkeypatch) -> None:
+    from profiling.runners.attention import dsa_topk_prefill as runner
+
+    operands = runner._build_operands(
+        torch, num_queries=4, num_keys=4096, top_k=512, logits_row_stride=4352, device="cpu"
+    )
+    calls, devices = [], []
+    fake_torch = SimpleNamespace(cuda=SimpleNamespace(synchronize=lambda: None))
+    monkeypatch.setattr(
+        runner, "_load_vllm_cuda_backend", lambda: (fake_torch, lambda *a: calls.append(a))
+    )
+    monkeypatch.setattr(
+        runner, "_validate_vllm_cuda_device", lambda _torch, *rest: devices.append(rest)
+    )
+    monkeypatch.setattr(runner, "_build_operands", lambda *args, **kwargs: operands)
+    monkeypatch.setattr(runner.Timer, "cupti", lambda kernel, *, kernel_name: kernel() or 0.5)
+    monkeypatch.setattr(runner.Energy, "perf", lambda *args, **kwargs: 0.25)
+
+    runner.profile_dsa_topk_prefill_vllm_fork_cuda(
+        **(
+            _BASE_SPEC
+            | {"num_queries": 4, "num_keys": 4096, "top_k": 512, "logits_row_stride": 4352}
+        )
+    )
+
+    assert devices == [("vllm_fork_cuda", ("NVIDIA B200",))]
+    assert [call[-1] for call in calls] == [512, 512]
+
+
+def test_fork_device_check_rejects_h200() -> None:
+    from profiling.runners.attention.dsa_topk_prefill import _validate_vllm_cuda_device
+
+    h200 = SimpleNamespace(
+        cuda=SimpleNamespace(
+            is_available=lambda: True,
+            current_device=lambda: 0,
+            get_device_name=lambda _device: "NVIDIA H200",
+        )
+    )
+    with pytest.raises(
+        ProfilerNotImplemented, match="vllm_fork_cuda is verified only on NVIDIA B200"
+    ):
+        _validate_vllm_cuda_device(h200, "vllm_fork_cuda", ("NVIDIA B200",))

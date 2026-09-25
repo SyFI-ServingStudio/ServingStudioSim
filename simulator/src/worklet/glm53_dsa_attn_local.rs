@@ -10,16 +10,15 @@
 //!   head weights are recomputed by an fp32 `torch.mm`.
 //! * The pooled (kpool) indexer: FWHT-128 + FP8 quant of q, the kpool cache
 //!   update, paged MQA logits and persistent top-k over `ceil(ctx / 4)` pools
-//!   (decode rows), and the pool-to-token expansion. The indexer replicates its
-//!   32 heads on every rank.
+//!   (decode rows), the prefill MQA logits and per-row top-k over each row's
+//!   `(pos + 1) / 4` pools, and the pool-to-token expansion. The indexer
+//!   replicates its 32 heads on every rank.
 //! * MLA: `W_UK` absorb, the FP8 query quant, the kpool sparse-MLA compound op
 //!   (cache append, remap, token-sparse attention for prefill and decode rows),
 //!   and `W_UV`.
 //!
 //! Byte-sized elementwise placeholders stand in for the small indexer kernels
-//! (b2-dsa section 7 byte formulas), the prefill MQA logits / top-k, which vLLM
-//! skips while every prefill context fits `index_topk` tokens, and the
-//! framework glue (index plumbing, the query concat, the output copy). The
+//! (b2-dsa section 7 byte formulas) and the framework glue (index plumbing, the query concat, the output copy). The
 //! indexer k LayerNorm and the weights x q-scale multiply are Inductor-fused
 //! elementwise kernels with their own leaves. Copies that run far below
 //! streaming bandwidth (the transposed query concat, the output masked fill,
@@ -38,12 +37,14 @@ use crate::timing::bridge::DType;
 use crate::timing::kernels::{
     BatchedGemmKernel, BatchedGemmKernelConfig, BatchedGemmKernelInput,
     DeepseekV4FusedQKvRmsnormKernel, DeepseekV4FusedQKvRmsnormKernelConfig,
-    DeepseekV4FusedQKvRmsnormKernelInput, DsaPagedMqaLogitsDecodeKernel,
+    DeepseekV4FusedQKvRmsnormKernelInput, DsaMqaLogitsPrefillKernel,
+    DsaMqaLogitsPrefillKernelConfig, DsaMqaLogitsPrefillKernelInput, DsaPagedMqaLogitsDecodeKernel,
     DsaPagedMqaLogitsDecodeKernelConfig, DsaPagedMqaLogitsDecodeKernelInput,
     DsaPersistentTopkDecodeKernel, DsaPersistentTopkDecodeKernelConfig,
-    DsaPersistentTopkDecodeKernelInput, ElementwiseKernel, ElementwiseKernelConfig,
-    ElementwiseKernelInput, GemmFp32OutputKernel, GemmFp32OutputKernelConfig,
-    GemmFp32OutputKernelInput, SingleGemmKernel, SingleGemmKernelConfig, SingleGemmKernelInput,
+    DsaPersistentTopkDecodeKernelInput, DsaTopkPrefillKernel, DsaTopkPrefillKernelConfig,
+    DsaTopkPrefillKernelInput, ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput,
+    GemmFp32OutputKernel, GemmFp32OutputKernelConfig, GemmFp32OutputKernelInput, SingleGemmKernel,
+    SingleGemmKernelConfig, SingleGemmKernelInput,
 };
 use crate::timing::{BuildError, CostNode, CostTreeBuilder, Dim, Evaluator, PerfApiBridge};
 
@@ -106,6 +107,8 @@ pub struct Glm53DsaAttnLocalWorkletConfig {
     pub mla_bmm_v_up_backends: Vec<&'static str>,
     pub mqa_logits_backends: Vec<&'static str>,
     pub topk_backends: Vec<&'static str>,
+    pub mqa_logits_prefill_backends: Vec<&'static str>,
+    pub topk_prefill_backends: Vec<&'static str>,
     pub sparse_attention_backends: Vec<&'static str>,
     pub mla_cache_append_backends: Vec<&'static str>,
     pub index_remap_backends: Vec<&'static str>,
@@ -131,8 +134,8 @@ pub struct Glm53DsaAttnLocalWorkletResolved {
     pub kpool_tail_seed: ElementwiseKernelConfig,
     pub mqa_logits_decode: DsaPagedMqaLogitsDecodeKernelConfig,
     pub topk_decode: DsaPersistentTopkDecodeKernelConfig,
-    pub mqa_logits_prefill: ElementwiseKernelConfig,
-    pub topk_prefill: ElementwiseKernelConfig,
+    pub mqa_logits_prefill: DsaMqaLogitsPrefillKernelConfig,
+    pub topk_prefill: DsaTopkPrefillKernelConfig,
     pub expand_pools: ElementwiseKernelConfig,
     pub q_absorb: BatchedGemmKernelConfig,
     pub q_concat: ElementwiseKernelConfig,
@@ -172,8 +175,8 @@ pub struct Glm53DsaAttnLocalWorklet {
     pub kpool_tail_seed: Op<ElementwiseKernel>,
     pub mqa_logits_decode: Op<DsaPagedMqaLogitsDecodeKernel>,
     pub topk_decode: Op<DsaPersistentTopkDecodeKernel>,
-    pub mqa_logits_prefill: Op<ElementwiseKernel>,
-    pub topk_prefill: Op<ElementwiseKernel>,
+    pub mqa_logits_prefill: Op<DsaMqaLogitsPrefillKernel>,
+    pub topk_prefill: Op<DsaTopkPrefillKernel>,
     pub expand_pools: Op<ElementwiseKernel>,
     pub q_absorb: Op<BatchedGemmKernel>,
     pub q_concat: Op<ElementwiseKernel>,
@@ -219,7 +222,6 @@ impl Glm53DsaAttnLocalWorklet {
         // The per-head latent query, bf16, and its FP8 copy with one fp32
         // scale per head.
         let latent_q_bytes = heads * latent * bf16.size_bytes();
-        let pooled_row_bytes = cfg.max_model_len * DType::Fp32.size_bytes();
         let window = cfg.index_topk + kpool - 1;
         Glm53DsaAttnLocalWorkletResolved {
             fused_qkv_a: gemm(cfg.q_lora_rank.get() + latent, cfg.hidden.clone()),
@@ -291,9 +293,31 @@ impl Glm53DsaAttnLocalWorklet {
                 index_dtype: "int32".into(),
                 context_mode: "uniform".into(),
             },
-            // FP8 q (+ scale) in, one token-wide fp32 logits row out.
-            mqa_logits_prefill: ew(index_heads * (index_dim + 4), pooled_row_bytes),
-            topk_prefill: ew(pooled_row_bytes, cfg.index_topk / kpool * 4),
+            // One launch per iteration over every prefill row; each row spans
+            // its own pool-granular context (`compress_ratio == index_kpool`).
+            mqa_logits_prefill: DsaMqaLogitsPrefillKernelConfig {
+                backends: cfg.mqa_logits_prefill_backends.clone(),
+                gpu_name: cfg.gpu_name.clone(),
+                num_sequences: 1,
+                num_heads: cfg.index_num_heads.clone(),
+                head_dim: cfg.index_head_dim.clone(),
+                q_dtype: DType::Fp8E4m3,
+                k_dtype: DType::Fp8E4m3,
+                k_scale_dtype: DType::Fp32,
+                weight_dtype: DType::Fp32,
+                output_dtype: DType::Fp32,
+                span_mode: "single_causal_tail".into(),
+                clean_logits: false,
+            },
+            topk_prefill: DsaTopkPrefillKernelConfig {
+                backends: cfg.topk_prefill_backends.clone(),
+                gpu_name: cfg.gpu_name.clone(),
+                num_sequences: 1,
+                top_k: cfg.index_topk / kpool,
+                logits_dtype: DType::Fp32,
+                index_dtype: "int32".into(),
+                span_mode: "single_causal_tail".into(),
+            },
             // Per row: int64 pool ids in, `index_topk + P - 1` int32 slots out.
             expand_pools: ew(8 * cfg.index_topk / kpool + 4, 4 * window),
             q_absorb: bmm(
@@ -398,8 +422,20 @@ impl Glm53DsaAttnLocalWorklet {
                 DsaPersistentTopkDecodeKernel::build,
                 bridge,
             )?,
-            mqa_logits_prefill: ew("indexer.mqa_logits_prefill", r.mqa_logits_prefill)?,
-            topk_prefill: ew("indexer.topk_prefill", r.topk_prefill)?,
+            mqa_logits_prefill: atomic(
+                n,
+                "indexer.mqa_logits_prefill",
+                r.mqa_logits_prefill,
+                DsaMqaLogitsPrefillKernel::build,
+                bridge,
+            )?,
+            topk_prefill: atomic(
+                n,
+                "indexer.topk_prefill",
+                r.topk_prefill,
+                DsaTopkPrefillKernel::build,
+                bridge,
+            )?,
             expand_pools: ew("indexer.expand_pools", r.expand_pools)?,
             q_absorb: atomic(n, "q_absorb", r.q_absorb, BatchedGemmKernel::build, bridge)?,
             q_concat: ew("q_concat", r.q_concat)?,
@@ -536,13 +572,19 @@ impl Glm53DsaAttnLocalWorklet {
         let skip_prefill_indexer = w.prefill_indexer_rows == 0;
         push_or_zero(
             &self.mqa_logits_prefill,
-            tokens(w.prefill_indexer_rows),
+            DsaMqaLogitsPrefillKernelInput {
+                num_queries: w.prefill_indexer_rows,
+                num_keys: w.prefill_indexer_keys,
+            },
             skip_prefill_indexer,
             ev,
         );
         push_or_zero(
             &self.topk_prefill,
-            tokens(w.prefill_indexer_rows),
+            DsaTopkPrefillKernelInput {
+                num_queries: w.prefill_indexer_rows,
+                num_keys: w.prefill_indexer_keys,
+            },
             skip_prefill_indexer,
             ev,
         );
@@ -591,9 +633,15 @@ struct Work {
     decode_rows: u32,
     /// `ceil(max decode context / index_kpool)`.
     decode_pools: u32,
-    /// Prefill rows of requests whose context exceeds `index_topk`; vLLM skips
-    /// the prefill indexer when every prefill context fits.
+    /// Every prefill row once any prefill context exceeds `index_topk`, else
+    /// 0: vLLM skips the prefill indexer only when every context fits, and
+    /// otherwise runs one logits and one top-k launch over all prefill rows.
     prefill_indexer_rows: u32,
+    /// The single-causal-tail key count whose `rows x keys` triangle holds as
+    /// many (row, pool) pairs as the iteration's rows, where the row at
+    /// position `pos` spans `(pos + 1) / index_kpool` completed pools. Never
+    /// below `prefill_indexer_rows` (the kernel contract `rows <= keys`).
+    prefill_indexer_keys: u32,
 }
 
 fn derive_work(
@@ -602,7 +650,8 @@ fn derive_work(
     index_kpool: u32,
 ) -> Result<Work, String> {
     let mut prefill_tokens = 0_u32;
-    let mut prefill_indexer_rows = 0_u32;
+    let mut needs_prefill_indexer = false;
+    let mut pooled_pairs = 0_u64;
     for (index, &(prefix, append)) in input.prefill_chunk_pairs.iter().enumerate() {
         if append == 0 {
             return Err(format!("prefill request {index} append must be positive"));
@@ -613,10 +662,20 @@ fn derive_work(
         prefill_tokens = prefill_tokens
             .checked_add(append)
             .ok_or("prefill token sum overflows u32")?;
-        if context > index_topk {
-            prefill_indexer_rows += append;
-        }
+        needs_prefill_indexer |= context > index_topk;
+        pooled_pairs +=
+            pool_prefix_sum(context, index_kpool) - pool_prefix_sum(prefix, index_kpool);
     }
+    let (prefill_indexer_rows, prefill_indexer_keys) = if needs_prefill_indexer {
+        let rows = u64::from(prefill_tokens);
+        // rows * keys - rows * (rows - 1) / 2 == pooled_pairs, solved for keys.
+        let keys = (2 * pooled_pairs + rows * (rows - 1)).div_ceil(2 * rows);
+        let keys =
+            u32::try_from(keys.max(rows)).map_err(|_| "prefill indexer keys overflow u32")?;
+        (prefill_tokens, keys)
+    } else {
+        (0, 0)
+    };
     let decode_rows = input.decode_kv_lens.len() as u32;
     if input.decode_kv_lens.contains(&0) {
         return Err("decode KV lengths must be positive".into());
@@ -634,7 +693,16 @@ fn derive_work(
         decode_rows,
         decode_pools: max_decode.div_ceil(index_kpool),
         prefill_indexer_rows,
+        prefill_indexer_keys,
     })
+}
+
+/// `sum over x in 1..=n of x / kpool`: the pools spanned by the rows at
+/// positions `0..n`.
+fn pool_prefix_sum(n: u32, kpool: u32) -> u64 {
+    let (n, kpool) = (u64::from(n), u64::from(kpool));
+    let (q, r) = (n / kpool, n % kpool);
+    kpool * q * q.saturating_sub(1) / 2 + q * (r + 1)
 }
 
 fn integer_sqrt(value: u32) -> u32 {
@@ -671,6 +739,8 @@ mod tests {
             mla_bmm_v_up_backends: vec!["torch_mla_v_up_glm53"],
             mqa_logits_backends: vec!["deepgemm_fp8_vllm_fork"],
             topk_backends: vec!["vllm_fork_cuda"],
+            mqa_logits_prefill_backends: vec!["deepgemm_fp8"],
+            topk_prefill_backends: vec!["vllm_fork_cuda"],
             sparse_attention_backends: vec!["flashinfer_trtllm_fp8_vllm_fork"],
             mla_cache_append_backends: vec!["vllm_cuda"],
             index_remap_backends: vec!["vllm_fork_triton"],
@@ -729,6 +799,49 @@ mod tests {
         )
         .unwrap();
         assert_eq!(long.prefill_indexer_rows, 100);
+        // Rows at positions 2000..2099 span 500..=525 pools (51225 pairs); a
+        // 100-row causal tail over 562 keys holds the same count.
+        assert_eq!(long.prefill_indexer_keys, 562);
+    }
+
+    #[test]
+    fn one_long_context_sends_every_prefill_row_through_the_indexer() {
+        let w = derive_work(
+            &Glm53DsaAttnLocalWorkletInput {
+                prefill_chunk_pairs: vec![(0, 1000), (261_120, 1048)],
+                decode_kv_lens: vec![500],
+            },
+            2048,
+            4,
+        )
+        .unwrap();
+        assert_eq!(w.prefill_indexer_rows, 2048);
+        let pairs = (pool_prefix_sum(1000, 4) + pool_prefix_sum(262_168, 4)
+            - pool_prefix_sum(261_120, 4)) as f64;
+        let (rows, keys) = (2048.0, f64::from(w.prefill_indexer_keys));
+        assert!((rows * keys - rows * (rows - 1.0) / 2.0 - pairs).abs() < rows);
+        // A short context alone keeps the contract `rows <= keys`.
+        let short = derive_work(
+            &Glm53DsaAttnLocalWorkletInput {
+                prefill_chunk_pairs: vec![(2048, 2048)],
+                decode_kv_lens: Vec::new(),
+            },
+            2048,
+            4,
+        )
+        .unwrap();
+        assert_eq!(
+            (short.prefill_indexer_rows, short.prefill_indexer_keys),
+            (2048, 2048)
+        );
+    }
+
+    #[test]
+    fn pool_prefix_sum_counts_completed_pools() {
+        let brute = |n: u32| (1..=n).map(|x| u64::from(x / 4)).sum::<u64>();
+        for n in [0, 1, 3, 4, 5, 7, 8, 9, 2047, 2048, 2049] {
+            assert_eq!(pool_prefix_sum(n, 4), brute(n), "n = {n}");
+        }
     }
 
     #[test]
@@ -745,7 +858,10 @@ mod tests {
         let root = worklet.compile(&mut builder);
         let tree = builder.finish(root);
         assert_eq!(tree.slots.len(), 24 + 4 + 3);
-        assert!(tree.slots.iter().any(|slot| slot.name == "m.dsa.prefill_glue"));
+        assert!(tree
+            .slots
+            .iter()
+            .any(|slot| slot.name == "m.dsa.prefill_glue"));
         assert!(tree
             .slots
             .iter()
