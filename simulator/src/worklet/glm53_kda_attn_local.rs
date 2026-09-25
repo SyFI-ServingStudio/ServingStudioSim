@@ -6,6 +6,10 @@
 //! merged q/k/v short conv, split/copy glue, the KDA core, the sigmoid-gated
 //! RMSNorm, and the BF16 `o_proj`.
 //!
+//! The decode core has no glue leaf of its own: `kda_recurrent_decode` times
+//! the whole `fused_recurrent_kda` call, whose four q/k/v/beta `.contiguous()`
+//! copies precede the recurrent kernel inside that call.
+//!
 //! Core selection is the fork's, not GDN's: an iteration with any prefill sends
 //! ALL of its tokens, decodes included, through one `chunk_kda_with_fused_gate`
 //! call (`kda_chunk_prefill`, `D` = decode count) and one varlen conv; a
@@ -32,8 +36,6 @@ use crate::timing::{BuildError, CostNode, CostTreeBuilder, Dim, Evaluator, PerfA
 use super::glm53_common::{atomic, elementwise, push_or_zero, repeated};
 
 const STATE_TRANSFER_UNIT_BYTES: u32 = 4096;
-/// Decode-only split/copy launches between the conv and the recurrent core.
-const DECODE_GLUE_LAUNCHES: u32 = 4;
 /// Prefill-bearing q/k/v `.contiguous()` copies ahead of the qk l2norm.
 const PREFILL_COPY_LAUNCHES: u32 = 3;
 /// Prefill-bearing small launches: beta sigmoid, index scans, gate views.
@@ -65,7 +67,6 @@ pub struct Glm53KdaAttnLocalWorkletResolved {
     pub g_b: SingleGemmKernelConfig,
     pub conv_prefill: GdnCausalConvPrefillKernelConfig,
     pub conv_decode: GdnCausalConvDecodeKernelConfig,
-    pub decode_glue: crate::timing::kernels::ElementwiseKernelConfig,
     pub prefill_copy: crate::timing::kernels::ElementwiseKernelConfig,
     pub prefill_small_glue: crate::timing::kernels::ElementwiseKernelConfig,
     pub state_gather: crate::timing::kernels::ElementwiseKernelConfig,
@@ -95,7 +96,6 @@ pub struct Glm53KdaAttnLocalWorklet {
     pub g_b: Op<SingleGemmKernel>,
     pub conv_prefill: Op<GdnCausalConvPrefillKernel>,
     pub conv_decode: Op<GdnCausalConvDecodeKernel>,
-    pub decode_glue: Op<ElementwiseKernel>,
     pub prefill_copy: Op<ElementwiseKernel>,
     pub prefill_small_glue: Op<ElementwiseKernel>,
     pub state_gather: Op<ElementwiseKernel>,
@@ -156,7 +156,6 @@ impl Glm53KdaAttnLocalWorklet {
                 state_dtype: cfg.activation_dtype,
             },
             // One q/k/v-sized head-major copy per launch.
-            decode_glue: ew(per_head_bytes, per_head_bytes),
             prefill_copy: ew(per_head_bytes, per_head_bytes),
             prefill_small_glue: ew(SMALL_GLUE_BYTES_PER_TOKEN, SMALL_GLUE_BYTES_PER_TOKEN),
             state_gather: ew(STATE_TRANSFER_UNIT_BYTES, STATE_TRANSFER_UNIT_BYTES),
@@ -207,13 +206,6 @@ impl Glm53KdaAttnLocalWorklet {
                 "short_conv_decode",
                 r.conv_decode,
                 GdnCausalConvDecodeKernel::build,
-                bridge,
-            )?,
-            decode_glue: atomic(
-                n,
-                "decode_glue",
-                r.decode_glue,
-                ElementwiseKernel::build,
                 bridge,
             )?,
             prefill_copy: atomic(
@@ -284,7 +276,6 @@ impl Glm53KdaAttnLocalWorklet {
                 self.g_b.compile(builder),
                 self.conv_prefill.compile(builder),
                 self.conv_decode.compile(builder),
-                repeated(&self.decode_glue, DECODE_GLUE_LAUNCHES, builder),
                 repeated(&self.prefill_copy, PREFILL_COPY_LAUNCHES, builder),
                 repeated(
                     &self.prefill_small_glue,
@@ -329,7 +320,6 @@ impl Glm53KdaAttnLocalWorklet {
             w.prefill_bearing,
             ev,
         );
-        push_or_zero(&self.decode_glue, tokens.clone(), w.prefill_bearing, ev);
         push_or_zero(&self.prefill_copy, tokens.clone(), decode_only, ev);
         push_or_zero(&self.prefill_small_glue, tokens.clone(), decode_only, ev);
         let state = ElementwiseKernelInput {
@@ -467,8 +457,8 @@ mod tests {
         let mut builder = CostTreeBuilder::new();
         let root = worklet.compile(&mut builder);
         let tree = builder.finish(root);
-        assert_eq!(tree.slots.len(), 14);
-        assert_eq!(tree.slots[9].name, "m.kda.chunk_prefill");
-        assert_eq!(tree.slots[10].name, "m.kda.recurrent_decode");
+        assert_eq!(tree.slots.len(), 13);
+        assert_eq!(tree.slots[8].name, "m.kda.chunk_prefill");
+        assert_eq!(tree.slots[9].name, "m.kda.recurrent_decode");
     }
 }
