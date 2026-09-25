@@ -114,7 +114,9 @@ impl ExpertDemand {
         layers: std::ops::Range<usize>,
     ) -> anyhow::Result<Self> {
         let config = TokenCorpusConfig::from_manifest(manifest, group_size, FOLD_SEED, layers)?;
-        config.load().context("reading the token corpus payload")?;
+        // Through the process cache: every MoE callable of a model (body and
+        // MTP slice) binds the same file, and `prepare` reads it again later.
+        load_cached(&config).context("reading the token corpus payload")?;
         Ok(Self::Corpus(config))
     }
 
