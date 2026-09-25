@@ -652,13 +652,14 @@ struct LayerGroup {
 
 impl LayerGroup {
     fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
-        let attn = match &self.attn {
-            Attention::Kda(worklet) => worklet.compile(builder),
-            Attention::Dsa(worklet) => worklet.compile(builder),
-        };
+        // Compile in eval push order (INV-2): the boundary's leaf precedes
+        // the attention leaves.
         let body = CostNode::Sum(vec![
             self.attn_boundary.compile(builder),
-            attn,
+            match &self.attn {
+                Attention::Kda(worklet) => worklet.compile(builder),
+                Attention::Dsa(worklet) => worklet.compile(builder),
+            },
             self.attn_all_reduce.compile(builder),
             self.ffn_boundary.compile(builder),
             match &self.ffn {
@@ -1265,6 +1266,25 @@ mod tests {
         let kda_moe = 4 + 14 + 52;
         assert_eq!(model.n_slots, 3 + 2 * kda_dense + dsa_moe + kda_moe + 4);
         assert_eq!(model.cost_log_manifest().slots.len(), model.n_slots);
+    }
+
+    fn leaf_order(node: &CostNode, out: &mut Vec<usize>) {
+        match node {
+            CostNode::Leaf(slot) => out.push(*slot),
+            CostNode::Sum(children) | CostNode::Max { children, .. } => {
+                children.iter().for_each(|child| leaf_order(child, out))
+            }
+            CostNode::Scale { child, .. } | CostNode::Labeled { child, .. } => {
+                leaf_order(child, out)
+            }
+        }
+    }
+
+    #[test]
+    fn leaves_appear_in_slot_order_so_labels_match_eval_pushes() {
+        let mut order = Vec::new();
+        leaf_order(&built().cost_tree().root, &mut order);
+        assert_eq!(order, (0..order.len()).collect::<Vec<_>>());
     }
 
     #[test]
