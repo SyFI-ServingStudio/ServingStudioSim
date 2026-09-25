@@ -26,6 +26,10 @@ pub enum DType {
     Fp32,
     Fp8E4m3,
     Fp8E5m2,
+    /// OCP MXFP8: e4m3 data with one ue8m0 scale per 32 elements. Distinct
+    /// from per-tensor `Fp8E4m3` because the block-scaled GEMM path (activation
+    /// quantize + block-scaled MMA) has its own timing.
+    Mxfp8E4m3,
     Int8,
     Int4,
 }
@@ -38,6 +42,7 @@ impl DType {
             DType::Fp32 => "fp32",
             DType::Fp8E4m3 => "fp8_e4m3",
             DType::Fp8E5m2 => "fp8_e5m2",
+            DType::Mxfp8E4m3 => "mxfp8_e4m3",
             DType::Int8 => "int8",
             DType::Int4 => "int4",
         }
@@ -46,11 +51,17 @@ impl DType {
     /// Bytes per element. Used by L3 worklets to size byte-keyed kernels (e.g.
     /// the elementwise activation's per-token I/O footprint). Int4 is sub-byte;
     /// it rounds up to 1 (no current model uses Int4 on a byte-keyed path).
+    /// Mxfp8E4m3 counts data bytes only (the 1/32 ue8m0 scale is excluded),
+    /// matching Python `DType.MXFP8_E4M3.size_bytes`.
     pub fn size_bytes(self) -> u32 {
         match self {
             DType::Fp32 => 4,
             DType::Fp16 | DType::Bf16 => 2,
-            DType::Fp8E4m3 | DType::Fp8E5m2 | DType::Int8 | DType::Int4 => 1,
+            DType::Fp8E4m3
+            | DType::Fp8E5m2
+            | DType::Mxfp8E4m3
+            | DType::Int8
+            | DType::Int4 => 1,
         }
     }
 
@@ -64,6 +75,7 @@ impl DType {
             "fp32" => DType::Fp32,
             "fp8_e4m3" => DType::Fp8E4m3,
             "fp8_e5m2" => DType::Fp8E5m2,
+            "mxfp8_e4m3" => DType::Mxfp8E4m3,
             "int8" => DType::Int8,
             "int4" => DType::Int4,
             _ => return None,
@@ -82,7 +94,7 @@ impl<'de> Deserialize<'de> for DType {
         let s = String::deserialize(d)?;
         DType::from_wire(&s).ok_or_else(|| {
             serde::de::Error::custom(format!(
-                "unknown dtype {s:?} (expected fp16/bf16/fp32/fp8_e4m3/fp8_e5m2/int8/int4)"
+                "unknown dtype {s:?} (expected fp16/bf16/fp32/fp8_e4m3/fp8_e5m2/mxfp8_e4m3/int8/int4)"
             ))
         })
     }
@@ -287,6 +299,7 @@ mod tests {
             DType::Fp32,
             DType::Fp8E4m3,
             DType::Fp8E5m2,
+            DType::Mxfp8E4m3,
             DType::Int8,
             DType::Int4,
         ] {
