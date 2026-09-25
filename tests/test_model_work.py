@@ -1971,6 +1971,13 @@ def test_glm53_target_is_dimensionally_the_glm52_graph():
 # parameters). The DSpark MTP layers and the vision tower are excluded.
 
 DSV41 = Path(__file__).resolve().parents[1] / "model" / "config" / "deepseek_v41_flash.json"
+DSV41_MAP = (
+    Path(__file__).resolve().parents[1]
+    / "model"
+    / "work"
+    / "location_maps"
+    / "deepseek_v41_vllm_tp4_ep4_unified.json"
+)
 D_H, D_V, D_Q, D_HD, D_NH, D_OL, D_OG = 5120, 129280, 1280, 512, 64, 1024, 8
 D_E, D_K, D_I = 384, 6, 2304
 D_IH, D_ID, D_TOPK, D_W, D_HC, D_MIX = 32, 128, 512, 128, 4, 24
@@ -2193,3 +2200,37 @@ def test_dsv41_excludes_mtp_and_vision_and_keeps_bf16_modules(dsv41):
     assert dtypes["l0_swa.shared_down"] == "fp8"
     assert not any(name.startswith(("mtp", "dspark", "vision")) for name in dtypes)
 
+
+def test_dsv41_location_map_consumes_every_semantic_once(dsv41):
+    location_map = json.loads(DSV41_MAP.read_text())
+    assert location_map["schema_version"] == 1
+    assert location_map["mapping_id"] == "deepseek-v41-vllm-tp4-ep4-unified-v1"
+    assert location_map["arch_types"] == ["deepseek_v41_vllm"]
+    locations = [row["location"] for row in location_map["locations"]]
+    mapped = [semantic for row in location_map["locations"] for semantic in row["semantics"]]
+    assert len(locations) == len(set(locations)) == 292
+    assert len(mapped) == len(set(mapped))
+    for workload in (
+        Workload.causal_lm(decode=[4096] * 3, sampled=3),
+        Workload.causal_lm(prefill=[(2048, 0)], sampled=1),
+        work_floors._aggregate_workload(
+            {"matmul_tokens": 2048, "prefill_tokens": 2003, "decode_passes": 45,
+             "prefill_pairs": 1_829_000, "prefill_cached": 4005, "decode_kv": 83_176,
+             "prefill_requests": 2}
+        ),
+    ):
+        assert set(mapped) == {segment.name for segment in dsv41.label(workload).segments}
+    semantics = {row["location"]: row["semantics"] for row in location_map["locations"]}
+    assert semantics["unified.layer20.attn.indexer.score.candidates"] == []
+    assert semantics["unified.layer24.attn.indexer.score.decode_logits"] == [
+        "c1_candidate_index.indexer.decode"
+    ]
+    assert semantics["unified.engram_prefetch.layer14.engram_lookup"] == [
+        "c2_source_engram.engram.table"
+    ]
+    assert semantics["unified.layer2.ffn.routed.fused_moe"] == [
+        "c2_source.expert_gate_up",
+        "c2_source.expert_down",
+    ]
+    assert not any("all_reduce" in location or "all_gather" in location for location in locations)
+    assert sum(not row["semantics"] for row in location_map["locations"]) == 99
