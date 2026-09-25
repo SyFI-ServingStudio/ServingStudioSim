@@ -18,6 +18,13 @@ pub mod deepseek_v4_moe_router_local;
 pub mod deepseek_v4_shared_expert_local;
 pub mod deepseek_v41_attention_tp;
 pub mod deepseek_v41_common;
+pub mod deepseek_v41_engram_prefetch_local;
+pub mod deepseek_v41_engram_tp;
+pub mod deepseek_v41_head_tp;
+#[cfg(test)]
+mod deepseek_v41_iteration_tests;
+pub mod deepseek_v41_moe_ffn_ep;
+pub mod deepseek_v41_prologue_tp;
 pub mod dflash2_context_kv_local;
 pub mod dflash2_draft_layer_local;
 pub mod dflash2_selector_local;
@@ -88,6 +95,26 @@ pub use deepseek_v41_attention_tp::{
     DeepseekV41AttentionEntry, DeepseekV41AttentionLayer, DeepseekV41AttentionTpWorklet,
     DeepseekV41AttentionTpWorkletConfig, DeepseekV41AttentionTpWorkletInput,
     DeepseekV41AttentionTpWorkletResolved, DeepseekV41IndexRole,
+};
+pub use deepseek_v41_engram_prefetch_local::{
+    DeepseekV41EngramPrefetchLocalWorklet, DeepseekV41EngramPrefetchLocalWorkletConfig, DeepseekV41EngramPrefetchLocalWorkletInput,
+    DeepseekV41EngramPrefetchLocalWorkletResolved,
+};
+pub use deepseek_v41_engram_tp::{
+    DeepseekV41EngramTpWorklet, DeepseekV41EngramTpWorkletConfig, DeepseekV41EngramTpWorkletInput,
+    DeepseekV41EngramTpWorkletResolved,
+};
+pub use deepseek_v41_head_tp::{
+    DeepseekV41HeadTpWorklet, DeepseekV41HeadTpWorkletConfig, DeepseekV41HeadTpWorkletInput,
+    DeepseekV41HeadTpWorkletResolved,
+};
+pub use deepseek_v41_moe_ffn_ep::{
+    DeepseekV41MoeFfnEpWorklet, DeepseekV41MoeFfnEpWorkletConfig, DeepseekV41MoeFfnEpWorkletInput,
+    DeepseekV41MoeFfnEpWorkletResolved,
+};
+pub use deepseek_v41_prologue_tp::{
+    DeepseekV41PrologueTpWorklet, DeepseekV41PrologueTpWorkletConfig, DeepseekV41PrologueTpWorkletInput,
+    DeepseekV41PrologueTpWorkletResolved,
 };
 pub use dflash2_context_kv_local::{
     Dflash2ContextKvLocalWorklet, Dflash2ContextKvLocalWorkletConfig,
