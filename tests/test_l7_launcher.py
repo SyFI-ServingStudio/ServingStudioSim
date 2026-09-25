@@ -23,6 +23,7 @@ from launcher.cache_build import cache_key
 from launcher.exec import (
     _build_subprocess_env,
     _cargo_build_env,
+    _launcher_python,
     _run_capture,
     binary_path,
     run_analysis,
@@ -1614,10 +1615,27 @@ def test_cargo_build_env_pins_launcher_python_and_drops_runtime_paths(
 
     env = _cargo_build_env()
 
-    assert env["PYTHON"] == sys.executable
-    assert env["PYO3_PYTHON"] == sys.executable
+    assert env["PYTHON"] == _launcher_python()
+    assert env["PYO3_PYTHON"] == _launcher_python()
     assert "PYTHONHOME" not in env
     assert "PYTHONPATH" not in env
+
+
+def test_launcher_python_collapses_venv_spellings_without_leaving_the_venv(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+):
+    base = tmp_path / "base" / "python3.12"
+    base.parent.mkdir()
+    base.write_text("")
+    bin_dir = tmp_path / "venv" / "bin"
+    bin_dir.mkdir(parents=True)
+    (bin_dir / "python").symlink_to(base)
+    (bin_dir / "python3").symlink_to("python")
+    (bin_dir / "python3.12").symlink_to("python")
+
+    for spelling in ("python", "python3", "python3.12"):
+        monkeypatch.setattr(sys, "executable", str(bin_dir / spelling))
+        assert _launcher_python() == str(bin_dir / "python")
 
 
 def test_logged_process_captures_stdout(tmp_path):

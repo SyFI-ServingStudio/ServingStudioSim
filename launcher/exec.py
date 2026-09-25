@@ -13,6 +13,7 @@ Per design §1.2.3 / §1.2.7:
 
 from __future__ import annotations
 
+import asyncio
 import os
 import shutil
 import sys
@@ -114,11 +115,33 @@ def _cargo_build_env() -> dict[str, str]:
     """
 
     env = os.environ.copy()
-    env["PYTHON"] = sys.executable
-    env["PYO3_PYTHON"] = sys.executable
+    python = _launcher_python()
+    env["PYTHON"] = python
+    env["PYO3_PYTHON"] = python
     env.pop("PYTHONHOME", None)
     env.pop("PYTHONPATH", None)
     return env
+
+
+def _launcher_python() -> str:
+    """The launcher's interpreter under one stable spelling.
+
+    A venv's ``python``, ``python3`` and ``python3.12`` are one interpreter behind
+    links, but PyO3's and ``build.rs``'s build scripts fingerprint ``PYO3_PYTHON``
+    as a string. ``uv run python`` reports ``.venv/bin/python3`` while pytest's
+    workers report ``.venv/bin/python``, so alternating between them recompiled
+    pyo3 and everything above it (~40 s) on the next launch. Follow only links
+    that stay in the executable's directory: that collapses the spellings
+    without leaving the venv for the base interpreter it links to.
+    """
+
+    path = Path(sys.executable)
+    while path.is_symlink():
+        target = path.parent / os.readlink(path)
+        if target.parent.resolve() != path.parent.resolve():
+            break
+        path = target
+    return str(path)
 
 
 # ── perf profiling (skill `operate-profile-sim-speed`) ──────────────────────────────
@@ -415,8 +438,14 @@ async def run_analysis(
     ):
         print(f"[analyze] compute failed for {log_dir}")
         return
-    if (
-        await _timed_step(
+    # Render and trace both read only compute's outputs and the raw logs, and the
+    # workflow plan gives them no edge between them, so they run concurrently.
+    # Always emit the per-kernel Perfetto timeline (traces/<prefix>.pftrace.gz).
+    # A standalone verb, not a subject (different output contract: a binary trace
+    # for ui.perfetto.dev, not report/payload JSON), so it runs here with CLI
+    # defaults rather than through the subject catalog. Best-effort like the rest.
+    render_rc, trace_rc = await asyncio.gather(
+        _timed_step(
             "render",
             "analyze render",
             [
@@ -427,24 +456,17 @@ async def run_analysis(
                 *subjects,
             ],
             lambda: validate_render_artifacts(log_dir),
-        )
-        != 0
-    ):
-        print(f"[analyze] render failed for {log_dir}")
-
-    # Always emit the per-kernel Perfetto timeline (traces/<prefix>.pftrace.gz).
-    # A standalone verb, not a subject (different output contract: a binary trace
-    # for ui.perfetto.dev, not report/payload JSON), so it runs here with CLI
-    # defaults rather than through the subject catalog. Best-effort like the rest.
-    if (
-        await _timed_step(
+        ),
+        _timed_step(
             "trace",
             "analyze trace",
             [str(analyzer), "trace", str(log_dir)],
             lambda: validate_trace_artifacts(log_dir),
-        )
-        != 0
-    ):
+        ),
+    )
+    if render_rc != 0:
+        print(f"[analyze] render failed for {log_dir}")
+    if trace_rc != 0:
         print(f"[analyze] trace failed for {log_dir}")
 
 
