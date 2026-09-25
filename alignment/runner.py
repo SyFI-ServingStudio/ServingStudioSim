@@ -28,6 +28,7 @@ from pathlib import Path
 
 from .load_generator import runner as load_generator
 from .nsys.parse import parse_host_timeline, parse_trace, parsed_window_ns, write_kernel_sequences
+from .nsys.parsed_io import write_parsed
 from .profiler import (
     nsys_capture,
     record_extraction,
@@ -843,7 +844,7 @@ def _finalize_profile(
             "normalized NSYS DP-rank population does not match server parallelism: "
             f"dp_ranks={observed_dp_ranks} dp_size={cfg.server.dp_size}"
         )
-    parsed_path.write_text(json.dumps(parsed, indent=2))
+    write_parsed(parsed_path, parsed)
     kernel_sequences_path = log_dir / "kernel_sequences.json"
     write_kernel_sequences(kernel_sequences_path, parsed, parsed_path)
     print(

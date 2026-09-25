@@ -13,6 +13,7 @@
 
 mod barrier;
 pub(crate) mod host;
+mod kernel_rows;
 pub(crate) mod timeline;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -180,6 +181,10 @@ const PREDICT_COLUMNS: &[&str] = &["iter_id", "total_time_ms", "slot_time_ms", "
 struct ParsedTrace {
     kernel_names: BTreeMap<String, String>,
     iteration_details: Vec<MeasuredIteration>,
+    /// Schema 6: the kernel rows live in a parquet sibling instead of inline
+    /// under each range (see `kernel_rows`). Consumed while loading.
+    #[serde(default)]
+    kernel_rows: Option<kernel_rows::KernelRowsRef>,
 }
 
 #[derive(Deserialize)]
@@ -303,6 +308,8 @@ struct MeasuredRange {
     /// widen an iteration's host window, never to measure GPU time.
     start_ns: u64,
     end_ns: u64,
+    /// Inline through schema 5; schema 6 omits it and `kernel_rows` fills it.
+    #[serde(default)]
     kernels: Vec<MeasuredKernel>,
 }
 
@@ -2565,7 +2572,11 @@ fn parsed_trace(path: &Path) -> Result<Arc<ParsedTrace>> {
     if let Some(hit) = guard.get(path) {
         return Ok(Arc::clone(hit));
     }
-    let trace = Arc::new(read_json(path)?);
+    let mut trace: ParsedTrace = read_json(path)?;
+    if let Some(rows) = trace.kernel_rows.take() {
+        kernel_rows::attach(&mut trace, path, &rows)?;
+    }
+    let trace = Arc::new(trace);
     guard.insert(path.to_path_buf(), Arc::clone(&trace));
     Ok(trace)
 }

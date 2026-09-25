@@ -258,7 +258,9 @@ formed by vLLM from those parallel ranks. Do not hide DP in `extra_args` because
 the device/rank population is part of artifact provenance.
 
 The NSYS pass writes the replay log, server log, NSYS report/SQLite,
-`parsed.json`, the folded label-ready `kernel_sequences.json`, the full-run
+`parsed.json` with its kernel rows in the sibling `parsed.kernels.parquet`
+(schema 6; `alignment/nsys/parsed_io.py` owns the layout and `read_parsed`
+reads any schema), the folded label-ready `kernel_sequences.json`, the full-run
 structured scheduler timeline in `vllm/<name>_metrics.jsonl`, engine-core
 per-request TTFT/TPOT in `vllm/<name>_request_timings.jsonl`, and
 `profile_result.json` beneath `profile/`. `profile_result.replay_result`
@@ -567,6 +569,8 @@ Standalone NSYS normalization remains available as:
 uv run python -m alignment parse --sqlite capture.sqlite --metrics metrics.jsonl \
   --iteration-start 24 --iteration-end 48 --output parsed.json
 ```
+
+`--output parsed.json` also writes `parsed.kernels.parquet` beside it.
 
 For concurrency diagnosis, parse only a bounded iteration window directly from
 the SQLite export and decompose raw kernel residency into same-stream PDL
