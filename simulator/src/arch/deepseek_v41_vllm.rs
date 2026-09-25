@@ -7,12 +7,14 @@
 //!
 //! ```text
 //! prologue (embedding, its all-reduce, Engram hash)
-//! Max{ Sum[layer-0 attention, layer-0 FFN], Engram lookups for layers 1 and 14 }
+//! Sum[layer-0 attention, layer-0 FFN, Engram lookups for layers 1 and 14]
 //! for layer in 1..40: [Engram block at 1, 14] -> attention(layer) -> MoE FFN
 //! head (hc post/collapse, final norm, lm_head, logits AllGather)
 //! ```
 //!
-//! The lookups are compiled and evaluated after the layer-0 main path they race
+//! The lookups run on side streams but contend with the layer-0 main path on
+//! the same device, so they are charged serially after it; they are compiled
+//! and evaluated after that path
 //! (`DeepseekV41EngramPrefetchLocalWorklet::compile_joined`).
 //!
 //! Layer folding: each body layer's type is its attention type (entry, compress
@@ -898,8 +900,8 @@ impl DeepseekV41VllmModel {
     pub fn cost_tree(&self) -> CostTree {
         let mut builder = CostTreeBuilder::new();
         let mut sections = vec![self.prologue.compile(&mut builder)];
-        // Hash -> layer-1 consumer: layer 0 races the two Engram lookups, which
-        // are minted after it.
+        // Hash -> layer-1 consumer: layer 0 plus the two contending Engram
+        // lookups, which are minted after it.
         let main_path = self.layer0.compile(&mut builder);
         sections.push(self.engram_prefetch.compile_joined(&mut builder, main_path));
         sections.extend(self.compile_plan(&self.plan, &mut builder));

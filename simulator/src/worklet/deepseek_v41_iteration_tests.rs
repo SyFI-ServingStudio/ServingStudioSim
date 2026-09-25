@@ -64,7 +64,7 @@ fn compile_iteration() -> CostTree {
 
     let mut b = CostTreeBuilder::new();
     let mut sections = vec![prologue.compile(&mut b)];
-    // Hash -> layer-1 consumer: layer 0 attention and FFN race the lookups.
+    // Hash -> layer-1 consumer: layer 0 attention and FFN, then the contending lookups.
     let main_path = CostNode::Sum(vec![attention(0).compile(&mut b), moe(0).compile(&mut b)]);
     sections.push(lookups.compile_joined(&mut b, main_path));
     for layer in 1..40 {
