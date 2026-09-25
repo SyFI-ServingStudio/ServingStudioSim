@@ -1,12 +1,17 @@
 //! GLM-5.3-Flash sparse MLA attention behind the pooled (kpool) indexer.
 //!
-//! One logical attention call is four launches in the vLLM fork: the MLA
-//! latent cache append, the request-local to global index remap, and the
-//! FlashInfer TRTLLM-gen token-sparse kernel, which serves prefill and decode
-//! rows alike (the fork has no dense-MHA prefill backend for this model). The
-//! compound op keeps the four as fixed leaves -- `mla_cache_append`,
-//! `index_remap`, `prefill`, `decode` -- so a mixed batch prices its prefill
-//! and decode rows against their own measured valid-count shapes.
+//! One logical attention call is three launches in the vLLM fork: the MLA
+//! latent cache append, the request-local to global index remap, and ONE
+//! FlashInfer TRTLLM-gen token-sparse kernel over every query row of the
+//! iteration (the fork has no dense-MHA prefill backend for this model). The
+//! compound op keeps four fixed leaves -- `mla_cache_append`, `index_remap`,
+//! `prefill`, `decode` -- and fills exactly one of the two attention leaves:
+//!
+//! * a decode-only iteration prices its rows on `decode`;
+//! * an iteration with any prefill sends ALL rows, the co-scheduled decode rows
+//!   included, through one `prefill` query and leaves `decode` at zero. The
+//!   capture logs/20260924_0_glm53_flash_b200_tp4_ep4_nsys shows exactly one
+//!   attention launch per DSA layer in every prefill-bearing iteration.
 //!
 //! The pooled indexer keeps `index_topk` pools of `index_kpool` tokens plus the
 //! trailing partial pool, so a row at causal position `n` sees
@@ -16,12 +21,14 @@
 //!
 //! * Decode rows use `ValidCountsPattern::PooledUniformFull`, collapsed to the
 //!   batch's MAX context (the measured pooled grid is uniform in context).
-//! * Prefill rows use `ValidCountsPattern::CausalTail` per request, fanned into
-//!   one slot. Its ramp is exact while a request's context is at most 2051; past
-//!   that the measured causal encoding caps at `selected_k` (2176) instead of
-//!   2051, overstating saturated rows by at most 6%. The Python encoder only
-//!   accepts a clipped ramp whose cap equals `selected_k`, so an exact pooled
-//!   prefill shape would need a new L1 encoding; this op does not add one.
+//! * A prefill-bearing call uses `ValidCountsPattern::CausalTail`, the only
+//!   measured multi-row encoding. The call is one query of `Q` = every row of
+//!   the iteration, with the cache length `S` chosen so the encoded ramp
+//!   (`S-Q+1 ..= S`, clipped at `selected_k`) carries the same total of valid
+//!   slots as the rows really read under the kpool law. Row count and slot
+//!   total are exact; only how the slots spread over rows is approximated.
+//!   A new L1 encoding with explicit per-row counts would remove that; this op
+//!   does not add one.
 
 use std::sync::Arc;
 
@@ -90,6 +97,7 @@ pub struct Glm53KpoolSparseMlaOp {
     pub decode: Arc<DsaSparseMlaAttentionKernel>,
     index_topk: u32,
     index_kpool: u32,
+    selected_k: u32,
 }
 
 /// The four L1 configurations one op identity expands into.
@@ -207,6 +215,7 @@ impl Glm53KpoolSparseMlaOp {
             )?),
             index_topk: cfg.index_topk,
             index_kpool: cfg.index_kpool,
+            selected_k: cfg.selected_k,
             name,
         })
     }
@@ -232,7 +241,7 @@ impl Glm53KpoolSparseMlaOp {
 
     /// Push the four slots in compile order (INV-2).
     pub fn eval(&self, input: &Glm53KpoolSparseMlaInput, ev: &mut Evaluator) {
-        let shape = derive_shape(input, self.index_topk, self.index_kpool)
+        let shape = derive_shape(input, self.index_topk, self.index_kpool, self.selected_k)
             .unwrap_or_else(|reason| panic!("invalid Glm53KpoolSparseMlaInput: {reason}"));
 
         let cache_append = MlaCacheAppendKernelInput {
@@ -262,16 +271,17 @@ impl Glm53KpoolSparseMlaOp {
                 .into()
         });
 
-        let mut metrics = LeafMetrics::ZERO;
-        for &(num_queries, num_cache_tokens) in &input.prefill_query_cache_pairs {
-            metrics.add_fanin(self.prefill.eval(&DsaSparseMlaAttentionKernelInput {
-                num_queries,
-                num_cache_tokens,
-            }));
-        }
+        let metrics = shape
+            .prefill
+            .as_ref()
+            .map_or(LeafMetrics::ZERO, |prefill| self.prefill.eval(prefill));
         ev.push(metrics, || {
             DsaSparseMlaPrefillLog {
-                prefill_query_cache_pairs: input.prefill_query_cache_pairs.clone(),
+                prefill_query_cache_pairs: shape
+                    .prefill
+                    .as_ref()
+                    .map(|p| vec![(p.num_queries, p.num_cache_tokens)])
+                    .unwrap_or_default(),
             }
             .into()
         });
@@ -297,7 +307,56 @@ impl Glm53KpoolSparseMlaOp {
 struct Shape {
     num_rows: u32,
     remap: Option<DsaSparseIndexRemapKernelInput>,
+    /// The single attention query of a prefill-bearing iteration, all rows.
+    prefill: Option<DsaSparseMlaAttentionKernelInput>,
+    /// The attention query of a decode-only iteration.
     decode: Option<DsaSparseMlaAttentionKernelInput>,
+}
+
+/// Valid slots of a causal ramp of `num_queries` rows ending at `num_cache_tokens`,
+/// each row clipped at `cap` -- what the measured `CausalTail` encoding reads.
+fn causal_tail_slots(num_queries: u32, num_cache_tokens: u32, cap: u32) -> u64 {
+    let first = u64::from(num_cache_tokens - num_queries + 1);
+    let last = u64::from(num_cache_tokens);
+    let cap = u64::from(cap);
+    if first >= cap {
+        return (last - first + 1) * cap;
+    }
+    let ramp_last = last.min(cap);
+    let ramp = (first + ramp_last) * (ramp_last - first + 1) / 2;
+    ramp + (last - ramp_last) * cap
+}
+
+/// One `CausalTail` query carrying `valid_counts.len()` rows and, as closely as
+/// the encoding allows, their total of valid slots.
+///
+/// The ramp total grows monotonically with the cache length, from `Q(Q+1)/2`
+/// at `S = Q` to `Q * cap` once every row is clipped, and every kpool count is
+/// at most `cap`, so the target is reachable unless it is below the minimum
+/// ramp (then `S = Q`).
+fn combined_causal_query(valid_counts: &[u32], cap: u32) -> DsaSparseMlaAttentionKernelInput {
+    let num_queries = valid_counts.len() as u32;
+    let target: u64 = valid_counts.iter().map(|&c| u64::from(c)).sum();
+    let (mut lo, mut hi) = (num_queries, num_queries + cap - 1);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if causal_tail_slots(num_queries, mid, cap) >= target {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    let above = causal_tail_slots(num_queries, lo, cap).abs_diff(target);
+    let below = (lo > num_queries)
+        .then(|| causal_tail_slots(num_queries, lo - 1, cap).abs_diff(target));
+    let num_cache_tokens = match below {
+        Some(below) if below < above => lo - 1,
+        _ => lo,
+    };
+    DsaSparseMlaAttentionKernelInput {
+        num_queries,
+        num_cache_tokens,
+    }
 }
 
 /// Slots a row at causal position `span` (1-based) reads under the kpool law.
@@ -309,6 +368,7 @@ fn derive_shape(
     input: &Glm53KpoolSparseMlaInput,
     index_topk: u32,
     index_kpool: u32,
+    selected_k: u32,
 ) -> Result<Shape, String> {
     let mut request_row_counts = Vec::new();
     let mut local_span_lengths = Vec::new();
@@ -348,17 +408,21 @@ fn derive_shape(
             "index remap supports at most {max_queries} query rows, got {num_rows}"
         ));
     }
+    let prefill_bearing = !input.prefill_query_cache_pairs.is_empty();
+    let prefill = prefill_bearing.then(|| combined_causal_query(&valid_counts, selected_k));
     let decode = input
         .decode_context_lens
         .iter()
         .copied()
         .max()
+        .filter(|_| !prefill_bearing)
         .map(|context| DsaSparseMlaAttentionKernelInput {
             num_queries: input.decode_context_lens.len() as u32,
             num_cache_tokens: context,
         });
     Ok(Shape {
         num_rows,
+        prefill,
         remap: (num_rows > 0).then_some(DsaSparseIndexRemapKernelInput {
             request_row_counts,
             local_span_lengths,
@@ -442,30 +506,65 @@ mod tests {
     }
 
     #[test]
-    fn mixed_batch_puts_decode_rows_first_and_collapses_decode_to_max() {
+    fn mixed_batch_runs_every_row_through_one_prefill_query() {
         let input = Glm53KpoolSparseMlaInput {
             prefill_query_cache_pairs: vec![(3, 5)],
             decode_context_lens: vec![1000, 4003],
         };
-        let shape = derive_shape(&input, 2048, 4).unwrap();
+        let shape = derive_shape(&input, 2048, 4, 2176).unwrap();
         assert_eq!(shape.num_rows, 5);
         let remap = shape.remap.unwrap();
         assert_eq!(remap.request_row_counts, [1, 1, 3]);
         assert_eq!(remap.local_span_lengths, [1000, 4003, 3, 4, 5]);
         assert_eq!(remap.valid_counts, [1000, 2051, 3, 4, 5]);
+        assert!(shape.decode.is_none());
+        let prefill = shape.prefill.unwrap();
+        assert_eq!(prefill.num_queries, 5);
+        // 3063 valid slots over 5 rows: the ramp ending at 615 holds 3065,
+        // closer than 614's 3060.
+        assert_eq!(prefill.num_cache_tokens, 615);
+        assert_eq!(causal_tail_slots(5, 615, 2176), 3065);
+    }
+
+    #[test]
+    fn decode_only_batch_collapses_decode_to_max() {
+        let input = Glm53KpoolSparseMlaInput {
+            prefill_query_cache_pairs: Vec::new(),
+            decode_context_lens: vec![1000, 4003],
+        };
+        let shape = derive_shape(&input, 2048, 4, 2176).unwrap();
+        assert!(shape.prefill.is_none());
         let decode = shape.decode.unwrap();
         assert_eq!((decode.num_queries, decode.num_cache_tokens), (2, 4003));
     }
 
     #[test]
+    fn single_prefill_keeps_its_own_ramp() {
+        // A lone prefill below the cap is its own exact CausalTail shape.
+        let input = Glm53KpoolSparseMlaInput {
+            prefill_query_cache_pairs: vec![(1000, 1500)],
+            decode_context_lens: Vec::new(),
+        };
+        let prefill = derive_shape(&input, 2048, 4, 2176).unwrap().prefill.unwrap();
+        assert_eq!((prefill.num_queries, prefill.num_cache_tokens), (1000, 1500));
+    }
+
+    #[test]
+    fn causal_tail_slots_clip_at_cap() {
+        assert_eq!(causal_tail_slots(3, 5, 2176), 12);
+        assert_eq!(causal_tail_slots(2, 2177, 2176), 2176 * 2);
+        assert_eq!(causal_tail_slots(3, 2177, 2176), 2175 + 2176 + 2176);
+    }
+
+    #[test]
     fn empty_batch_has_no_remap_and_bad_pairs_fail() {
-        let shape = derive_shape(&Glm53KpoolSparseMlaInput::default(), 2048, 4).unwrap();
-        assert!(shape.remap.is_none() && shape.decode.is_none());
+        let shape = derive_shape(&Glm53KpoolSparseMlaInput::default(), 2048, 4, 2176).unwrap();
+        assert!(shape.remap.is_none() && shape.decode.is_none() && shape.prefill.is_none());
         let bad = Glm53KpoolSparseMlaInput {
             prefill_query_cache_pairs: vec![(6, 5)],
             decode_context_lens: Vec::new(),
         };
-        assert!(derive_shape(&bad, 2048, 4).is_err());
+        assert!(derive_shape(&bad, 2048, 4, 2176).is_err());
     }
 
     #[test]
