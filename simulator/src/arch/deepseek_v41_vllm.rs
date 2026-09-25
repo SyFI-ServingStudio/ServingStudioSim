@@ -88,6 +88,11 @@ const MAX_MODEL_LEN: u32 = 131_072;
 const MAX_BATCHED_TOKENS: u32 = 2048;
 /// `--block-size 128`: one KV page; an index page holds `128 / ratio` keys.
 const KV_BLOCK_SIZE: u32 = 128;
+/// Index-cache page used to price ratio-1 index layers. Production pages hold
+/// `128 / ratio` keys (128 at ratio 1), but the `dsa_paged_mqa_logits_decode`
+/// DeepGEMM runner only builds 64-key pages (`_BLOCK_SIZE = 64`), so ratio-1
+/// scoring is priced on 64-key pages: the same keys in twice the pages.
+const RATIO1_INDEX_PAGE_FALLBACK: u32 = 64;
 /// SWA page of the fused q-norm/rope/KV insert (the profiled kernel identity).
 const SWA_BLOCK_SIZE: u32 = 32;
 /// FlashMLA's padded per-rank Q width.
@@ -687,7 +692,12 @@ fn layer_config(
             index_head_dim: model.index_head_dim.into(),
             index_topk: model.index_topk,
             window_size: model.sliding_window,
-            kv_block_size: KV_BLOCK_SIZE,
+            // `kv_block_size` only sizes the index page (`kv_block_size / ratio`).
+            kv_block_size: if kind.attention.compress_ratio == 1 {
+                RATIO1_INDEX_PAGE_FALLBACK
+            } else {
+                KV_BLOCK_SIZE
+            },
             swa_block_size: SWA_BLOCK_SIZE,
             max_model_len: MAX_MODEL_LEN,
             max_num_batched_tokens: MAX_BATCHED_TOKENS,
@@ -1265,6 +1275,12 @@ mod tests {
 
         let resolved = resolve_configs(&configs);
         assert_eq!(resolved.head.lm_head.n.get(), 32_320);
+        // Index pages: 64 keys at ratio 2 (production) and ratio 1 (fallback).
+        for body in &resolved.bodies {
+            if let Some(indexer) = &body.attention.indexer {
+                assert_eq!(indexer.page_block_size, 64, "layers {:?}", body.layers);
+            }
+        }
         assert_eq!(
             resolved.bodies[0].engram.as_ref().unwrap().wkv.k.get(),
             6144

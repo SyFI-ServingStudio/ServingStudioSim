@@ -47,6 +47,10 @@ use crate::timing::{
 
 /// Bytes of one placeholder tile: 1024 fp32 logits.
 pub const LOGIT_TILE_BYTES: u32 = 4096;
+/// Write side of a read-only tile (top-k, candidate writer). The per-row index
+/// write is already folded into the tile count; the `elementwise` runner
+/// rejects a zero-byte output, so these tiles write one int32.
+pub const READ_TILE_OUTPUT_BYTES: u32 = 4;
 /// One index-cache key: 128 FP8 bytes plus one fp32 scale.
 const INDEX_KEY_BYTES: u32 = 132;
 
@@ -144,7 +148,7 @@ impl DeepseekV41IndexerOp {
                 span_mode: "single_causal_tail".to_string(),
                 clean_logits: false,
             },
-            prefill_topk: elementwise(LOGIT_TILE_BYTES, 0),
+            prefill_topk: elementwise(LOGIT_TILE_BYTES, READ_TILE_OUTPUT_BYTES),
             decode_logits: DsaPagedMqaLogitsDecodeKernelConfig {
                 backends: cfg.logits_decode_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
@@ -167,13 +171,15 @@ impl DeepseekV41IndexerOp {
                 DeepseekV41CandidateRole::None => None,
                 // Block scores read the logits once; the candidate top-k and
                 // store are small next to that read.
-                DeepseekV41CandidateRole::Writer => Some(elementwise(LOGIT_TILE_BYTES, 0)),
+                DeepseekV41CandidateRole::Writer => {
+                    Some(elementwise(LOGIT_TILE_BYTES, READ_TILE_OUTPUT_BYTES))
+                }
                 // The mask rewrites non-candidate logits in place.
                 DeepseekV41CandidateRole::Consumer => {
                     Some(elementwise(LOGIT_TILE_BYTES, LOGIT_TILE_BYTES))
                 }
             },
-            decode_topk: elementwise(LOGIT_TILE_BYTES, 0),
+            decode_topk: elementwise(LOGIT_TILE_BYTES, READ_TILE_OUTPUT_BYTES),
             compress_ratio: cfg.compress_ratio,
         }
     }
