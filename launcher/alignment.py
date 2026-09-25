@@ -319,6 +319,9 @@ def _write_analysis_manifest(config: AnalyzePhaseConfig) -> Path:
         # Captures taken before the host sidecar existed simply have no host
         # lane; the subject degrades to the device-only view it always drew.
         host_timeline = _optional_profile_artifact(profile_result, "host_timeline")
+        # A schema-6 parse is unreadable without its kernel-row sibling; fail here,
+        # naming the file, rather than inside the analyzer. Older captures name none.
+        _optional_profile_artifact(profile_result, "parsed_kernel_rows")
         manifest = {
             **common,
             "profile_log_dir": str(config.profile_log_dir),

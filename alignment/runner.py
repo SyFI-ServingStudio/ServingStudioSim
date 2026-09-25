@@ -28,7 +28,7 @@ from pathlib import Path
 
 from .load_generator import runner as load_generator
 from .nsys.parse import parse_host_timeline, parse_trace, parsed_window_ns, write_kernel_sequences
-from .nsys.parsed_io import write_parsed
+from .nsys.parsed_io import kernel_rows_path, write_parsed
 from .profiler import (
     nsys_capture,
     record_extraction,
@@ -877,6 +877,9 @@ def _finalize_profile(
         "request_timings_jsonl": str(request_timings_jsonl),
         "request_timing_count": n_request_timings,
         "parsed_nsys": str(parsed_path),
+        # The schema-6 sibling `parsed.json` cannot be read without; recorded so a
+        # completion check can require it (`launcher.alignment_campaign.execute`).
+        "parsed_kernel_rows": str(kernel_rows_path(parsed_path)),
         "kernel_sequences": str(kernel_sequences_path),
         "host_timeline": str(host_timeline_path),
         "server_log": str(server_log),
