@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use anyhow::{ensure, Context, Result};
 use datafusion::prelude::SessionContext;
 use rayon::prelude::*;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -525,18 +525,32 @@ struct IterationKernelAggregate {
     physical_kernels: BTreeMap<PhysicalKernelIdentity, BTreeSet<i64>>,
 }
 
-fn physical_kernel_rows(item: &IterationKernelAggregate) -> Vec<Value> {
+/// One `physical_kernels` entry of a breakdown or timeline row.
+///
+/// The per-kernel rows of both shards are typed rather than `json!` objects:
+/// a 4169-iteration TP4 capture writes ~20M of them, and building each as a
+/// `Value` tree spent more CPU in malloc and map inserts than the analysis
+/// itself. Fields are declared in the old key order, so the bytes are unchanged.
+#[derive(Serialize)]
+struct PhysicalKernelRow<'a> {
+    sequence_id: &'a str,
+    row_id: &'a str,
+    name: &'a str,
+    name_id: u64,
+    category: &'a str,
+    device_ids: &'a BTreeSet<i64>,
+}
+
+fn physical_kernel_rows(item: &IterationKernelAggregate) -> Vec<PhysicalKernelRow<'_>> {
     item.physical_kernels
         .iter()
-        .map(|(identity, device_ids)| {
-            json!({
-                "sequence_id": identity.sequence_id,
-                "row_id": identity.row_id,
-                "name": identity.name,
-                "name_id": identity.name_id,
-                "category": identity.category,
-                "device_ids": device_ids,
-            })
+        .map(|(identity, device_ids)| PhysicalKernelRow {
+            sequence_id: &identity.sequence_id,
+            row_id: &identity.row_id,
+            name: &identity.name,
+            name_id: identity.name_id,
+            category: &identity.category,
+            device_ids,
         })
         .collect()
 }
@@ -1244,6 +1258,54 @@ struct BreakdownOutput {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// One line of the breakdown shard. Typed for the reason `PhysicalKernelRow`
+/// gives; the field order is the old `json!` key order, and the barrier-path
+/// scalars follow it exactly as the old `extend` appended them.
+#[derive(Serialize)]
+struct Breakdown<'a> {
+    case_index: u64,
+    iteration_id: u64,
+    stage: &'a str,
+    measured_kernels: Vec<MeasuredKernelRow<'a>>,
+    simulated_kernels: &'a [Value],
+    phase_summary: Vec<Value>,
+    operation_summary: Vec<Value>,
+    measured_track_busy: Vec<Value>,
+    critical_busy_ms_by_device: BTreeMap<String, f64>,
+    simulated_leaf_workload_ms: f64,
+    simulated_critical_path_ms: f64,
+    unmapped_measured_ms: f64,
+    unmapped_simulated_ms: f64,
+    #[serde(flatten)]
+    path_fields: serde_json::Map<String, Value>,
+}
+
+#[derive(Serialize)]
+struct MeasuredKernelRow<'a> {
+    phase: &'a str,
+    sequence_id: &'a str,
+    row_id: &'a str,
+    name: &'a str,
+    physical_kernel_names: &'a BTreeSet<String>,
+    source_row_ids: &'a BTreeSet<String>,
+    category: &'a str,
+    operation: Option<&'a str>,
+    operation_ordinal: Option<usize>,
+    physical_kernels: Vec<PhysicalKernelRow<'a>>,
+    synchronizing: bool,
+    collective: Option<&'a str>,
+    calls: usize,
+    rank_launches: usize,
+    replica_calls: f64,
+    duration_ms: f64,
+    on_path_kernel_ms: f64,
+    reduced_duration_ms: f64,
+    overlap: OverlapSummary,
+    track_indices: BTreeSet<usize>,
+    first_start_ns: Option<u64>,
+    device_ids: &'a BTreeSet<i64>,
+}
+
 fn build_breakdown(
     joined: &CaseMap,
     measured_iter: &MeasuredIteration,
@@ -1316,31 +1378,30 @@ fn build_breakdown(
         } else {
             iteration_unmapped_measured_ns += critical_ns;
         }
-        let track_indices: BTreeSet<usize> = item.launches.iter().map(|l| l.track_index).collect();
-        measured_kernel_rows.push(json!({
-            "phase": item.phase,
-            "sequence_id": item.sequence_id,
-            "row_id": item.row_id,
-            "name": item.name,
-            "physical_kernel_names": item.physical_kernel_names,
-            "source_row_ids": item.source_row_ids,
-            "category": item.category,
-            "operation": item.operation,
-            "operation_ordinal": item.operation_ordinal,
-            "physical_kernels": physical_kernel_rows(item),
-            "synchronizing": item.synchronizing,
-            "collective": item.collective,
-            "calls": item.launches.len(),
-            "rank_launches": item.launches.len(),
-            "replica_calls": item.launches.len() as f64 / device_count as f64,
-            "duration_ms": ms(critical_ns),
-            "on_path_kernel_ms": ms(on_path_ns),
-            "reduced_duration_ms": reduced_duration_ms,
-            "overlap": overlap_summary(&item.launches, &overlaps[kernel_index]),
-            "track_indices": track_indices,
-            "first_start_ns": item.first_start_ns,
-            "device_ids": item.device_ids,
-        }));
+        measured_kernel_rows.push(MeasuredKernelRow {
+            phase: &item.phase,
+            sequence_id: &item.sequence_id,
+            row_id: &item.row_id,
+            name: &item.name,
+            physical_kernel_names: &item.physical_kernel_names,
+            source_row_ids: &item.source_row_ids,
+            category: &item.category,
+            operation: item.operation.as_deref(),
+            operation_ordinal: item.operation_ordinal,
+            physical_kernels: physical_kernel_rows(item),
+            synchronizing: item.synchronizing,
+            collective: item.collective.as_deref(),
+            calls: item.launches.len(),
+            rank_launches: item.launches.len(),
+            replica_calls: item.launches.len() as f64 / device_count as f64,
+            duration_ms: ms(critical_ns),
+            on_path_kernel_ms: ms(on_path_ns),
+            reduced_duration_ms,
+            overlap: overlap_summary(&item.launches, &overlaps[kernel_index]),
+            track_indices: item.launches.iter().map(|l| l.track_index).collect(),
+            first_start_ns: item.first_start_ns,
+            device_ids: &item.device_ids,
+        });
     }
     let measured_critical_path_ms = ms(path.critical_path_ns());
     let measured_track_busy_ms = track_busy_ms(&measurement.track_intervals);
@@ -1423,29 +1484,26 @@ fn build_breakdown(
         .filter_map(|row| row["critical_path_ms"].as_f64())
         .sum::<f64>();
 
-    let mut breakdown = json!({
-        "case_index": joined.case_index,
-        "iteration_id": measured_iter.iteration,
-        "stage": joined.stage,
-        "measured_kernels": measured_kernel_rows,
-        "simulated_kernels": simulated_kernels,
-        "phase_summary": phase_summaries,
-        "operation_summary": operation_rows,
-        "measured_track_busy": measured_track_busy_ms,
-        "critical_busy_ms_by_device": path
+    let breakdown = Breakdown {
+        case_index: joined.case_index,
+        iteration_id: measured_iter.iteration,
+        stage: &joined.stage,
+        measured_kernels: measured_kernel_rows,
+        simulated_kernels: &simulated_kernels,
+        phase_summary: phase_summaries,
+        operation_summary: operation_rows,
+        measured_track_busy: measured_track_busy_ms,
+        critical_busy_ms_by_device: path
             .critical_busy_ns_by_device
             .iter()
             .map(|(device, ns)| (device.to_string(), ms(*ns)))
-            .collect::<BTreeMap<_, _>>(),
-        "simulated_leaf_workload_ms": simulated_leaf_workload_ms,
-        "simulated_critical_path_ms": simulated_critical_path_ms,
-        "unmapped_measured_ms": ms(iteration_unmapped_measured_ns),
-        "unmapped_simulated_ms": iteration_unmapped_simulated_ms,
-    });
-    breakdown
-        .as_object_mut()
-        .expect("breakdown is an object")
-        .extend(measured_path_fields(&path));
+            .collect(),
+        simulated_leaf_workload_ms,
+        simulated_critical_path_ms,
+        unmapped_measured_ms: ms(iteration_unmapped_measured_ns),
+        unmapped_simulated_ms: iteration_unmapped_simulated_ms,
+        path_fields: measured_path_fields(&path),
+    };
 
     Ok(BreakdownOutput {
         line: serde_json::to_vec(&breakdown)?,
@@ -2844,19 +2902,31 @@ fn measured_path_fields(path: &barrier::BarrierPath) -> serde_json::Map<String, 
 }
 
 /// One position's overlap with the rest of its devices, summed over its launches.
-fn overlap_summary(launches: &[KernelLaunch], overlaps: &[barrier::LaunchOverlap]) -> Value {
+#[derive(Serialize)]
+struct OverlapSummary {
+    duration_ms: f64,
+    overlap_ms: f64,
+    overlap_pct: Option<f64>,
+    same_stream_ms: f64,
+    cross_stream_ms: f64,
+}
+
+fn overlap_summary(
+    launches: &[KernelLaunch],
+    overlaps: &[barrier::LaunchOverlap],
+) -> OverlapSummary {
     let duration_ns: u64 = launches
         .iter()
         .map(|l| l.end_ns.saturating_sub(l.start_ns))
         .sum();
     let overlap_ns: u64 = overlaps.iter().map(|o| o.overlap_ns).sum();
-    json!({
-        "duration_ms": duration_ns as f64 / 1e6,
-        "overlap_ms": overlap_ns as f64 / 1e6,
-        "overlap_pct": ratio_pct(overlap_ns as f64, duration_ns as f64),
-        "same_stream_ms": overlaps.iter().map(|o| o.same_stream_ns).sum::<u64>() as f64 / 1e6,
-        "cross_stream_ms": overlaps.iter().map(|o| o.cross_stream_ns).sum::<u64>() as f64 / 1e6,
-    })
+    OverlapSummary {
+        duration_ms: duration_ns as f64 / 1e6,
+        overlap_ms: overlap_ns as f64 / 1e6,
+        overlap_pct: ratio_pct(overlap_ns as f64, duration_ns as f64),
+        same_stream_ms: overlaps.iter().map(|o| o.same_stream_ns).sum::<u64>() as f64 / 1e6,
+        cross_stream_ms: overlaps.iter().map(|o| o.cross_stream_ns).sum::<u64>() as f64 / 1e6,
+    }
 }
 
 /// Each track's own busy time, reported per device so a reader can see which
@@ -3385,25 +3455,25 @@ mod tests {
             BTreeSet::from(["sequence-a/0".into(), "sequence-b/0".into()])
         );
         assert_eq!(
-            physical_kernel_rows(&joined[0].1),
-            vec![
-                json!({
+            serde_json::to_value(physical_kernel_rows(&joined[0].1)).unwrap(),
+            json!([
+                {
                     "sequence_id": "sequence-a",
                     "row_id": "sequence-a/0",
                     "name": "tuned_kernel_for_large_rank_shape",
                     "name_id": 11,
                     "category": "test",
                     "device_ids": [1, 3],
-                }),
-                json!({
+                },
+                {
                     "sequence_id": "sequence-b",
                     "row_id": "sequence-b/0",
                     "name": "tuned_kernel_for_small_rank_shape",
                     "name_id": 12,
                     "category": "test",
                     "device_ids": [0, 2],
-                }),
-            ]
+                },
+            ])
         );
         assert_eq!(occurrence_ns(&joined[0].1.launches, false), 12);
     }
