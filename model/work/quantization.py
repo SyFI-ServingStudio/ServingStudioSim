@@ -18,6 +18,13 @@ Two things follow from a scheme and both matter to the necessary-work floor:
   is mixed: ``mlp.gate`` and the GLM indexer's ``indexers_proj`` stay BF16 even
   in an FP8 repo, and so does every norm, the embedding, and ``lm_head``.
 
+DeepSeek-V4.1 extends the FP8 block scheme in two ways its config states
+directly: ``scale_fmt: "ue8m0"`` stores each block scale as one E8M0 byte rather
+than an FP32 word, and ``expert_dtype: "fp4"`` stores routed experts as packed
+E2M1 with one E8M0 scale per 32 weights along K (MXFP4). Those experts multiply
+FP8 activations, which Blackwell's mixed FP8xFP4 MMA executes at the FP8 rate,
+so their compute dtype stays ``fp8``.
+
 For FP8, ``modules_to_not_convert`` is the authority for which is which. It is stated
 as fully-qualified checkpoint paths (``model.layers.7.mlp.gate``); a
 :class:`~model.work.core.MatmulGroup` names itself with the layer-relative path
@@ -55,6 +62,17 @@ class QuantScheme:
     #: If set, only these module subtrees are converted. ModelOpt's GLM-5.2
     #: NVFP4 checkpoint uses this to quantize routed experts and nothing else.
     converted_prefixes: frozenset[str] | None = None
+    #: Converted module subtrees stored under a different scheme, as
+    #: ``(prefix, scheme)`` pairs; DeepSeek-V4.1's MXFP4 routed experts.
+    module_schemes: tuple[tuple[str, QuantScheme], ...] = ()
+
+    def scheme_for(self, module: str | None) -> QuantScheme:
+        """The scheme a converted ``module`` is stored under."""
+        if module is not None:
+            for prefix, scheme in self.module_schemes:
+                if module == prefix or module.startswith(f"{prefix}."):
+                    return scheme
+        return self
 
     def is_converted(self, module: str) -> bool:
         """Was ``module`` (a layer-relative path) actually quantized?
@@ -123,14 +141,41 @@ def parse_quantization_config(raw_config: dict) -> QuantScheme | None:
     fmt = quant.get("fmt")
     if fmt not in (None, "e4m3", "e5m2"):
         raise ValueError(f"unsupported fp8 fmt {fmt!r}")
+    scale_fmt = quant.get("scale_fmt")
+    if scale_fmt not in (None, "ue8m0"):
+        raise ValueError(f"unsupported fp8 scale_fmt {scale_fmt!r}")
+    # A UE8M0 scale is a single exponent byte; the historical default is FP32.
+    scale_dtype_bytes = 1.0 if scale_fmt == "ue8m0" else 4.0
     block = quant.get("weight_block_size")
     block_shape = (int(block[0]), int(block[1])) if block else None
+    expert_dtype = quant.get("expert_dtype")
+    module_schemes: tuple[tuple[str, QuantScheme], ...] = ()
+    if expert_dtype is not None:
+        if expert_dtype != "fp4" or scale_fmt != "ue8m0":
+            raise ValueError(
+                f"unsupported expert_dtype {expert_dtype!r} with scale_fmt {scale_fmt!r}; "
+                "model.work knows only MXFP4 experts (fp4 + ue8m0)"
+            )
+        mxfp4_group = 32
+        module_schemes = (
+            (
+                "mlp.experts",
+                QuantScheme(
+                    bytes_per_weight=0.5,
+                    compute_dtype="fp8",
+                    block_shape=(1, mxfp4_group),
+                    scale_dtype_bytes=1.0,
+                    not_converted=frozenset(),
+                ),
+            ),
+        )
     return QuantScheme(
         bytes_per_weight=1.0,
         compute_dtype="fp8",
         block_shape=block_shape,
-        scale_dtype_bytes=4.0,
+        scale_dtype_bytes=scale_dtype_bytes,
         not_converted=frozenset(
             _layer_relative(module) for module in quant.get("modules_to_not_convert", ())
         ),
+        module_schemes=module_schemes,
     )

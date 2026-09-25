@@ -1961,3 +1961,235 @@ def test_glm53_target_is_dimensionally_the_glm52_graph():
     assert {k: v for k, v in glm53.items() if k != "transformers_version"} == {
         k: v for k, v in glm52.items() if k != "transformers_version"
     }
+
+
+# --------------------------------------------------------------------------- #
+# DeepSeek-V4.1-Flash: sliding-window + compressed sparse attention, mHC, engram
+# --------------------------------------------------------------------------- #
+# Hand-derived from DeepSeek's reference inference/model.py, the config, and the
+# checkpoint's safetensors headers (logical FP4 elements unpacked, scales not
+# parameters). The DSpark MTP layers and the vision tower are excluded.
+
+DSV41 = Path(__file__).resolve().parents[1] / "model" / "config" / "deepseek_v41_flash.json"
+D_H, D_V, D_Q, D_HD, D_NH, D_OL, D_OG = 5120, 129280, 1280, 512, 64, 1024, 8
+D_E, D_K, D_I = 384, 6, 2304
+D_IH, D_ID, D_TOPK, D_W, D_HC, D_MIX = 32, 128, 512, 128, 4, 24
+D_CAND = 2048 * 8
+D_ENGRAM_ROWS = (384_006_168, 384_016_682)
+D_ENGRAM_COLS = 3 * 8  # (max_ngram 4 - 1) n-grams x 8 heads
+D_ATTN_MM = (
+    D_Q * D_H  # wq_a
+    + D_NH * D_HD * D_Q  # wq_b
+    + D_HD * D_H  # wkv
+    + D_OG * D_OL * (D_NH * D_HD // D_OG)  # block-diagonal wo_a
+    + D_H * D_OG * D_OL  # wo_b
+)
+D_ATTN_VEC = D_Q + D_HD + D_NH  # q_norm, kv_norm, attn_sink
+D_COMP2 = 2 * D_HD * D_H + D_HD  # compressor wkv + wgate + norm (ratio 2)
+D_COMP1 = D_HD * D_H + D_HD  # compressor wkv + norm (ratio 1)
+D_IDX_Q = D_IH * D_ID * D_Q + D_IH * D_H  # indexer wq_b + weights_proj
+D_IDX_OWNER = D_IDX_Q + D_ID * D_HD + D_ID  # + wk + k_norm
+D_MHC = 2 * (D_MIX * D_HC * D_H + D_MIX + 3)  # fn, base, scale per sublayer
+D_EXPERT = 3 * D_I * D_H
+D_LAYER = (
+    D_ATTN_MM
+    + D_ATTN_VEC
+    + 2 * D_H  # attn_norm, ffn_norm
+    + D_MHC
+    + D_E * D_H  # router
+    + D_E  # router selection bias
+    + D_E * D_EXPERT
+    + D_EXPERT  # shared expert
+)
+D_ENGRAM_WKV = D_H * (D_HC + 1) * D_ENGRAM_COLS * 256
+D_ENGRAM = sum(D_ENGRAM_ROWS) * 256 + 2 * (D_ENGRAM_WKV + 2 * D_HC * D_H)
+
+
+@pytest.fixture(scope="module")
+def dsv41():
+    return load_model(DSV41)
+
+
+def test_dsv41_parameter_goldens_reconcile_with_the_checkpoint(dsv41):
+    label = dsv41.label(Workload(matmul_tokens=0, head_positions=0))
+    total = (
+        40 * D_LAYER
+        + 3 * D_COMP2
+        + D_COMP1
+        + 4 * D_IDX_OWNER
+        + 4 * D_IDX_Q
+        + D_ENGRAM
+        + 2 * D_V * D_H  # embed + untied head
+        + D_H  # final norm
+    )
+    # Sum of every non-vision, non-mtp, non-scale safetensors tensor (I8 FP4
+    # packs x2), minus the image-only router bias_vl: 763,205,315,794 - MTP
+    # 14,225,362,530 - vision/aligner/image tokens 485,268,480 - bias_vl 15,360.
+    assert total == 763_205_315_794 - 14_225_362_530 - 485_268_480 - 15_360
+    assert label.params["total"] == total == 748_494_669_424
+    active_layers = (
+        40 * (D_LAYER - D_E * D_EXPERT + D_K * D_EXPERT)
+        + 3 * D_COMP2
+        + D_COMP1
+        + 4 * D_IDX_OWNER
+        + 4 * D_IDX_Q
+        + 2 * (D_ENGRAM_WKV + 2 * D_HC * D_H + D_ENGRAM_COLS * 256)  # hashed rows only
+        + D_H
+    )
+    assert label.params["activated"]["layers"] == active_layers == 15_468_672_112
+    assert label.params["activated"]["with_embed_head"] == active_layers + 2 * D_V * D_H
+    breakdown = label.params["breakdown"]
+    assert breakdown["experts"] == 40 * D_E * D_EXPERT == 543_581_798_400
+    assert breakdown["engram"] == D_ENGRAM == 196_928_504_320
+    assert breakdown["mhc"] == 40 * D_MHC
+    assert sum(breakdown.values()) == total
+    assert compute_parameter_counts(DSV41)["total"] == total
+
+
+def test_dsv41_weight_bytes_reconcile_with_the_checkpoint(dsv41):
+    # MXFP4 experts: half a byte per weight plus one E8M0 byte per 32 along K.
+    expert_bytes = D_EXPERT // 2 + (2 * D_I * D_H + D_H * D_I) // 32
+    assert expert_bytes == 17_694_720 + 1_105_920
+    # 278.6 GB quoted for the checkpoint's packed experts = 40x384 body experts
+    # plus 3x128 DSpark experts, values only.
+    assert (40 * D_E + 3 * 128) * D_EXPERT // 2 == 278_585_671_680
+    # 196.9 GB quoted for engram = both FP8 tables plus both wkv, values only.
+    assert sum(D_ENGRAM_ROWS) * 256 + 2 * D_ENGRAM_WKV == 196_928_422_400
+    # A 2048-token batch hits every expert, so its weight floor reads all of them.
+    label = dsv41.label(Workload.causal_lm(prefill=[(2048, 0)], sampled=1))
+    by_name = {segment.name: segment for segment in label.segments}
+    experts = sum(
+        segment.bytes_total
+        for name, segment in by_name.items()
+        if name.endswith(("expert_gate_up", "expert_down")) and "shared" not in name
+    )
+    loaded = D_E * (1 - (1 - 1 / D_E) ** (2048 * D_K))
+    assert experts == pytest.approx(40 * loaded * expert_bytes, rel=1e-12)
+    # FP8 32x32 blocks with one E8M0 byte each; FP32 mixing; gathered engram rows.
+    assert by_name["l0_swa.wq_a"].bytes == D_Q * D_H + (D_Q // 32) * (D_H // 32)
+    assert by_name["l0_swa.wo_a"].bytes == D_OG * (D_OL * 4096 + 32 * 128)
+    assert by_name["l0_swa.router"].bytes == D_E * D_H * 2
+    assert by_name["l0_swa.mhc_attn.fn"].bytes == D_MIX * D_HC * D_H * 4
+    assert by_name["l1_swa_engram.engram.table"].bytes == 2048 * D_ENGRAM_COLS * 264
+    assert by_name["lm_head"].bytes == D_V * D_H * 2
+
+
+def _dsv41_attention_expectations(prefill: bool):
+    """(attn pairs by ratio, index pairs by role, kv bytes) for the two goldens."""
+    if prefill:  # one 2048-token chunk, no prefix
+        window = D_W * (D_W + 1) // 2 + (2048 - D_W) * D_W
+        # sum_j min(512, j // 2): floor sum to j=1023, then 1025 saturated queries.
+        ratio2 = (2 * 511 * 510 // 2 + 511 * 2) + 1025 * D_TOPK
+        ratio1 = D_TOPK * (D_TOPK + 1) // 2 + (2048 - D_TOPK) * D_TOPK
+        index2 = 1024 * 1024  # sum_j j // 2
+        index1 = 2048 * 2049 // 2  # below the 16384-position candidate cap
+        kv = (
+            40 * D_W * 528  # ring keeps only the last window of the chunk
+            + (3 * 1024 + 2048) * 288  # new compressed latents
+            + (3 * 1024 + 2048) * 68  # new index keys
+        )  # no cached reads, no carried partial group (2048 is even)
+    else:  # one decode token at kv_len 4096 (4095 cached)
+        window = D_W
+        ratio2 = D_TOPK  # min(512, 4096 // 2)
+        ratio1 = D_TOPK
+        index2 = 4096 // 2
+        index1 = 4096
+        reads = (
+            40 * (D_W - 1) * 528
+            + 38 * D_TOPK * 288
+            + 3 * (4095 // 2) * 68  # ratio-2 owners score every cached entry
+            + 5 * 4095 * 68  # layer 20 and the four candidate consumers
+        )
+        appends = 40 * 528 + 4 * 288 + 4 * 68
+        kv = reads + appends + 3 * 4096  # position 4095 completes a pair: one state read
+    attn_pairs = 2 * window + 18 * (window + ratio2) + 20 * (window + ratio1)
+    index_pairs = 3 * index2 + 5 * index1
+    return attn_pairs, index_pairs, kv
+
+
+@pytest.mark.parametrize("prefill", [False, True])
+def test_dsv41_flop_and_state_goldens(dsv41, prefill):
+    tokens = 2048 if prefill else 1
+    workload = (
+        Workload.causal_lm(prefill=[(2048, 0)], sampled=1)
+        if prefill
+        else Workload.causal_lm(decode=[4096], sampled=1)
+    )
+    label = dsv41.label(workload)
+    attn_pairs, index_pairs, kv = _dsv41_attention_expectations(prefill)
+    new_latents = 3 * 1024 + 2048 if prefill else 4
+    expected = {
+        "attn_proj": 2 * tokens * (40 * D_ATTN_MM + 3 * 2 * D_HD * D_H + D_HD * D_H + 8 * D_IDX_Q)
+        + 2 * new_latents * D_ID * D_HD,  # indexer wk runs per new latent
+        "attn_internal": 2 * D_NH * (2 * D_HD) * attn_pairs + 2 * D_IH * D_ID * index_pairs,
+        "ffn": 2 * tokens * 40 * (D_K + 1) * D_EXPERT,
+        "router": 2 * tokens * 40 * D_E * D_H,
+        "lm_head": 2 * D_V * D_H,
+        "mhc": 2 * tokens * 80 * D_MIX * D_HC * D_H,
+        "engram": 2 * tokens * 2 * D_ENGRAM_WKV,
+    }
+    assert label.flops == expected
+    if prefill:
+        assert label.flops_total == 69_062_896_386_048
+    else:
+        assert label.flops_total == 35_699_294_208
+    assert label.bytes["kv"] == kv
+
+
+def test_dsv41_collapsed_analyzer_geometry_matches_exact_single_requests(dsv41):
+    """floors.py sends one summed interaction per phase; one request is exact."""
+    for totals, exact in (
+        (
+            {"matmul_tokens": 1, "prefill_tokens": 0, "decode_passes": 1, "prefill_pairs": 0,
+             "prefill_cached": 0, "decode_kv": 4096, "prefill_requests": 0},
+            Workload.causal_lm(decode=[4096], sampled=1),
+        ),
+        (
+            {"matmul_tokens": 2048, "prefill_tokens": 2048, "decode_passes": 0,
+             "prefill_pairs": 2048 * 2049 // 2, "prefill_cached": 0, "decode_kv": 0,
+             "prefill_requests": 1},
+            Workload.causal_lm(prefill=[(2048, 0)], sampled=1),
+        ),
+    ):
+        collapsed = dsv41.label(work_floors._aggregate_workload(totals))
+        direct = dsv41.label(exact)
+        assert {s.name: (s.flops_total, s.bytes_total) for s in collapsed.segments} == {
+            s.name: (s.flops_total, s.bytes_total) for s in direct.segments
+        }
+
+
+def test_dsv41_sparse_caps_and_candidate_restriction(dsv41):
+    long_decode = dsv41.label(Workload.causal_lm(decode=[65_536], sampled=1))
+    rows = {segment.name: segment for segment in long_decode.segments}
+    # Attention saturates at window + top-k regardless of context.
+    assert rows["c1_share.attn.decode"].flops == 2 * D_NH * 2 * D_HD * (D_W + D_TOPK)
+    # Layer 20 scores every entry; the candidate consumers only 2048 blocks x 8.
+    assert rows["c1_source_candidate.indexer.decode"].flops == 2 * D_IH * D_ID * 65_536
+    assert rows["c1_candidate_index.indexer.decode"].flops == 2 * D_IH * D_ID * D_CAND
+    assert rows["c1_candidate_index.indexer.decode"].bytes == D_CAND * 68
+    # A ratio-2 decode token makes exactly one carried-group transaction.
+    for kv_len in (4096, 4097):
+        label = dsv41.label(Workload.causal_lm(decode=[kv_len], sampled=1))
+        state = {s.name: s for s in label.segments}["c2_source.compressor_state"]
+        assert state.bytes == 2 * D_HD * 4
+    # Every semantic row exists at zero work, so row sets never depend on the batch.
+    empty = {s.name for s in dsv41.label(Workload.causal_lm(decode=[4096])).segments}
+    mixed = {
+        s.name for s in dsv41.label(Workload.causal_lm(prefill=[(7, 3)], decode=[9])).segments
+    }
+    assert empty == mixed
+
+
+def test_dsv41_excludes_mtp_and_vision_and_keeps_bf16_modules(dsv41):
+    assert dsv41.num_layers == 40
+    assert [stack.count for stack in dsv41.layers] == [1, 1, 2, 10, 1, 5, 1, 12, 4, 3]
+    label = dsv41.label(Workload.causal_lm(decode=[4096], sampled=1))
+    dtypes = {segment.name: segment.compute_dtype for segment in label.segments}
+    assert dtypes["c2_source.compressor.wkv"] == "bf16"
+    assert dtypes["c2_source.indexer.weights_proj"] == "bf16"
+    assert dtypes["l0_swa.router"] == "bf16"
+    assert dtypes["lm_head"] == "bf16"
+    assert dtypes["l0_swa.expert_gate_up"] == "fp8"  # MXFP4 weights x FP8 activations
+    assert dtypes["l0_swa.shared_down"] == "fp8"
+    assert not any(name.startswith(("mtp", "dspark", "vision")) for name in dtypes)
+
