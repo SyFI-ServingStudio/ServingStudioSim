@@ -1,4 +1,7 @@
-"""BF16 matrix multiplication with FP32 output."""
+"""Matrix multiplication with FP32 output (BF16 or FP32 inputs).
+
+``input_dtype`` is the dtype of both GEMM operands; the output is always FP32.
+"""
 
 from dataclasses import dataclass
 
@@ -37,9 +40,33 @@ register(
         batch_outlier_policy=BatchOutlierPolicy(),
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
-            gpus=frozenset({"NVIDIA H200"}),
+            gpus=frozenset({"NVIDIA H200", "NVIDIA B200"}),
         ),
         subprocess_env="vllm_env",
+    )
+)
+
+# Alignment-fork serving stack. Its cuBLAS selects the production split-K SGEMM
+# for the GLM-5.3 FP32 indexer head-weights form, which the container cuBLAS
+# does not. On the DeepSeek-V4.1 fork it also emits the captured NvJet
+# (+ splitKreduce) kernels for the k=5120 router and compressor GEMMs.
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="torch_cublas_vllm_fork",
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.gemm.gemm_fp32_output_torch_cublas",
+            function_name="profile_gemm_fp32_output_torch_cublas_vllm_fork",
+        ),
+        table_name=KIND,
+        args_schema=GemmFp32OutputArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        supports=BackendSupport(
+            compute=frozenset({DType.BF16, DType.FP32}),
+            gpus=frozenset({"NVIDIA B200"}),
+        ),
+        subprocess_env="vllm_fork_env",
     )
 )
 
