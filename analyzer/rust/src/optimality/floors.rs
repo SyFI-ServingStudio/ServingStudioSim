@@ -496,9 +496,16 @@ fn run_labeler_request(log_dir: &Path, request: Value) -> Result<Value> {
         root.join(log_dir)
     };
 
+    // The labeler's numpy work is small dense algebra. A default OpenBLAS pool
+    // (128 threads on a 224-core host) spent ~95% of the labeler's CPU spinning
+    // in `blas_thread_server` without shortening its wall time, oversubscribed
+    // the host when a sweep analyzes runs in parallel, and made results drift
+    // run to run (reduction order; up to 4e-8 relative).
     let mut child = Command::new("uv")
         .args(["run", "python", "-m", "model.work.floors"])
         .arg(&log_dir_abs)
+        .env("OPENBLAS_NUM_THREADS", "1")
+        .env("OMP_NUM_THREADS", "1")
         .current_dir(&root)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
