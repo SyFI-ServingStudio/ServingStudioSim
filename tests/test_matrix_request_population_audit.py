@@ -81,3 +81,44 @@ def test_dense_ids_are_resolved_before_population_comparison(tmp_path, mutation)
         sidecar.write_text(json.dumps({"output_trace_sha256": "stale"}))
         stale = measure_case(tmp_path)
         assert any("manifest does not match" in issue for issue in stale.issues)
+
+
+def _write_population(tmp_path, arrivals, replay_arrivals):
+    rows = [
+        {"id": f"r{index}", "input_len": 8, "output_len": 4, "arrival_time": arrival}
+        for index, arrival in enumerate(arrivals)
+    ]
+    trace = tmp_path / "trace.csv"
+    with trace.open("w", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+    replay = tmp_path / "replay.jsonl"
+    replay.write_text("\n".join(json.dumps({
+        "source": {"data": {"id": row["id"], "input_len": 8, "output_len_target": 4,
+                            "arrival_time_ms": measured}},
+        "outcome": {"status": "SUCCESS", "output_len_actual": 4},
+    }) for row, measured in zip(rows, replay_arrivals)))
+    slo = tmp_path / "request_slo.parquet"
+    pq.write_table(pa.Table.from_pylist([
+        {"request_id": index, "completed": True, "fresh_prompt_tokens": 8, "num_output_tokens": 4}
+        for index in range(len(rows))
+    ]), slo)
+    return {"trace_path": trace, "replay_path": replay, "slo_path": slo}
+
+
+def test_a_rate_rescaled_replay_passes_with_one_arrival_scale(tmp_path):
+    # req-frontend `--rate 2.7` over a 1 req/s trace scales every offset by 1/2.7.
+    arrivals = [0.0, 1000.0, 2000.0, 3000.0]
+    paths = _write_population(tmp_path, arrivals, [a / 2.7 for a in arrivals])
+    result = audit_request_population(**paths)
+    assert result["all_ok"]
+    assert result["arrival_time_scale"] == pytest.approx(1 / 2.7)
+
+
+def test_an_arrival_off_the_common_scale_is_rejected(tmp_path):
+    arrivals = [0.0, 1000.0, 2000.0, 3000.0]
+    replayed = [a / 2.7 for a in arrivals]
+    replayed[1] += 5.0
+    with pytest.raises(ValueError, match="arrival or completion differ: r1"):
+        audit_request_population(**_write_population(tmp_path, arrivals, replayed))

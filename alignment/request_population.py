@@ -25,12 +25,30 @@ def read_trace(path: Path) -> tuple[list[str], list[dict]]:
     return fields, rows
 
 
+def arrival_time_scale(rows: list[dict], measured: dict) -> float:
+    """The factor req-frontend's `--rate` applied to the trace's arrival offsets.
+
+    `apply_arrival_rate` multiplies every offset by one `trace_rate / target_rate`
+    (1 when no rate is given), so the replay records scaled arrivals. Read at the
+    latest arrival, where it is best conditioned; every row must then agree.
+    """
+    anchor = max(rows, key=lambda row: float(row["arrival_time"]))
+    base = float(anchor["arrival_time"])
+    if base <= 0:
+        return 1.0
+    scale = measured[anchor["id"]]["source"]["data"]["arrival_time_ms"] / base
+    if not math.isfinite(scale) or scale < 0:
+        raise ValueError(f"invalid replay arrival-time scale {scale}")
+    return scale
+
+
 def validate_replay(rows: list[dict], replay_path: Path) -> dict:
     with replay_path.open() as stream:
         replay = [json.loads(line) for line in stream if line.strip()]
     measured = {row["source"]["data"]["id"]: row for row in replay}
     if len(measured) != len(replay) or set(measured) != {row["id"] for row in rows}:
         raise ValueError("measured request population differs from trace")
+    scale = arrival_time_scale(rows, measured)
     for row in rows:
         entry = measured[row["id"]]
         source, outcome = entry["source"]["data"], entry["outcome"]
@@ -39,7 +57,10 @@ def validate_replay(rows: list[dict], replay_path: Path) -> dict:
             and int(row["input_len"]) == source["input_len"]
             and int(row["output_len"]) == source["output_len_target"]
             == outcome["output_len_actual"]
-            and float(row["arrival_time"]) == source["arrival_time_ms"]
+            and math.isclose(
+                source["arrival_time_ms"], float(row["arrival_time"]) * scale,
+                rel_tol=1e-9, abs_tol=1e-6,
+            )
         ):
             raise ValueError(f"request lengths, arrival or completion differ: {row['id']}")
     return measured
@@ -50,7 +71,7 @@ def audit_request_population(*, trace_path: Path, replay_path: Path, slo_path: P
     import pyarrow.parquet as pq
 
     _, rows = read_trace(trace_path)
-    validate_replay(rows, replay_path)
+    measured = validate_replay(rows, replay_path)
     simulated_rows = pq.read_table(slo_path, columns=[
         "request_id", "completed", "fresh_prompt_tokens", "num_output_tokens",
     ]).to_pylist()
@@ -70,6 +91,7 @@ def audit_request_population(*, trace_path: Path, replay_path: Path, slo_path: P
     checks["per_request_lengths_arrivals_and_completion"] = not mismatches
     return {
         "available": True, "all_ok": all(checks.values()), "requests": len(rows),
+        "arrival_time_scale": arrival_time_scale(rows, measured),
         "checks": checks, "mismatched_source_ids": mismatches,
         "identities": [{"request_id": i, "source_id": row["id"]} for i, row in enumerate(rows)],
         "mapping_basis": "independent CSV row order before scheduling",
