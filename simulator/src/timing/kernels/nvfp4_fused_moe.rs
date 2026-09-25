@@ -11,6 +11,15 @@
 //! per-token-group-128 activations) with `deepseek_v3` routing,
 //! `n_group = topk_group = 1`, and routed scaling 5/2. Its autotuner stops at
 //! 8192 tokens, so larger grid points reuse the top tactic bucket.
+//!
+//! The DeepSeek-V4.1-Flash backend `flashinfer_trtllm_sm100_mxfp4`
+//! (`trtllm_fp4_block_scale_routed_moe`, MXFP8 activations) takes
+//! `mxfp4_ue8m0` / group 32 with `precomputed_dsv4` routing: finished top-k ids
+//! come in, so `n_group = topk_group = 1` and routed scaling is 1/1 (the router
+//! already applied it). Its time follows the local rank's active-expert count
+//! as much as the token count, which the folded histogram carries: the
+//! profiler reads the first `num_local_experts` entries as the rank it times,
+//! and `folded_rank_position = 0` puts the fold's critical rank there.
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::CacheKind;
@@ -350,5 +359,99 @@ mod tests {
             first[0].fields()["per_expert_batches"],
             second[0].fields()["per_expert_batches"]
         );
+    }
+
+    /// DeepSeek-V4.1-Flash EP4 (384 experts, 96 local, top-6) on the MXFP4 backend.
+    fn dsv41_flash_ep4_mxfp4(expert_demand: ExpertDemand) -> Nvfp4FusedMoeKernelConfig {
+        Nvfp4FusedMoeKernelConfig {
+            backends: vec!["flashinfer_trtllm_sm100_mxfp4"],
+            gpu_name: "NVIDIA B200".to_string(),
+            hidden_size: 5120.into(),
+            intermediate_size: 2304.into(),
+            num_experts: 384.into(),
+            num_local_experts: 96.into(),
+            top_k: 6,
+            input_dtype: DType::Bf16,
+            weight_format: "mxfp4_ue8m0".to_string(),
+            group_size: 32,
+            routing_method: "precomputed_dsv4".to_string(),
+            n_group: 1,
+            topk_group: 1,
+            routed_scaling_numerator: 1,
+            routed_scaling_denominator: 1,
+            expert_demand,
+            folded_rank_position: 0,
+        }
+    }
+
+    /// The MXFP4 runner rejects any other recipe value (group 32, 1/1 scale,
+    /// no grouping) and reads `per_expert_batches[..96]` as the rank it times.
+    /// A drifted field keys a row the runner refuses; a histogram whose leading
+    /// slice is not the busiest rank would price EP decode on an idle rank,
+    /// which at T=48 is the 164 us vs 111 us gap the Python backend measured.
+    #[test]
+    fn mxfp4_backend_forwards_the_dsv41_recipe_with_the_critical_rank_leading() {
+        // Skewed marginal: expert e gets weight 385 - e, so the first physical
+        // rank is busiest before folding and every rank stays active at T=2048.
+        let ppm: Vec<u32> = {
+            let weights: Vec<u64> = (0..384).map(|e| 385 - e).collect();
+            let total: u64 = weights.iter().sum();
+            let mut ppm: Vec<u32> = weights
+                .iter()
+                .map(|w| (w * 1_000_000 / total) as u32)
+                .collect();
+            ppm[0] += 1_000_000 - ppm.iter().sum::<u32>();
+            ppm
+        };
+        let config = dsv41_flash_ep4_mxfp4(ExpertDemand::Popularity {
+            layerwise_global_ppm: vec![ppm; 2],
+        });
+        let grid = SweepGrid::new(vec![Axis::values([48, 2048])]);
+        let payloads =
+            Nvfp4FusedMoeSpec::enumerate(&config, &grid, "flashinfer_trtllm_sm100_mxfp4");
+        assert_eq!(payloads.len(), 2);
+        for (payload, tokens) in payloads.iter().zip([48_u64, 2048]) {
+            let fields = payload.fields();
+            assert_eq!(fields.len(), 16, "Python Args fields plus backend");
+            let expect = [
+                ("backend", Value::from("flashinfer_trtllm_sm100_mxfp4")),
+                ("num_tokens", Value::from(tokens)),
+                ("hidden_size", Value::from(5120)),
+                ("intermediate_size", Value::from(2304)),
+                ("num_experts", Value::from(384)),
+                ("num_local_experts", Value::from(96)),
+                ("top_k", Value::from(6)),
+                ("input_dtype", Value::from("bf16")),
+                ("weight_format", Value::from("mxfp4_ue8m0")),
+                ("group_size", Value::from(32)),
+                ("routing_method", Value::from("precomputed_dsv4")),
+                ("n_group", Value::from(1)),
+                ("topk_group", Value::from(1)),
+                ("routed_scaling_numerator", Value::from(1)),
+                ("routed_scaling_denominator", Value::from(1)),
+            ];
+            for (name, value) in expect {
+                assert_eq!(fields[name], value, "{name} at T={tokens}");
+            }
+            let batches: Vec<u64> = fields["per_expert_batches"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|value| value.as_u64().unwrap())
+                .collect();
+            assert_eq!(batches.len(), 384, "global width at T={tokens}");
+            assert_eq!(batches.iter().sum::<u64>(), tokens * 6, "assignments at T={tokens}");
+            assert!(batches.iter().all(|&rows| rows <= tokens), "top-k is distinct");
+            let rank_key = |rank: &[u64]| {
+                (
+                    rank.iter().filter(|&&rows| rows > 0).count(),
+                    rank.iter().sum::<u64>(),
+                )
+            };
+            let leading = rank_key(&batches[..96]);
+            for rank in batches.chunks_exact(96).skip(1) {
+                assert!(leading >= rank_key(rank), "critical rank leads at T={tokens}");
+            }
+        }
     }
 }
