@@ -78,7 +78,10 @@ active-time estimate requests more launches. The default cap is 50,000 launches.
 By default, both passes run a
 read-only reduction over a 64 MiB (or
 `2 × reported L2`, whichever is larger) FP32 tensor before every logical
-callable launch. The reduction's CUPTI records validate ordering but are
+callable launch. Before 2026-09-25 the L2 size was read from a misspelled
+Torch attribute and always fell back to 64 MiB, so rows profiled earlier on a
+GPU with more than 32 MiB of L2 (H100, H200, B200) carry a warm-cache bias;
+refill such rows with `--force` before trusting small-kernel timings. The reduction's CUPTI records validate ordering but are
 excluded from the callable time. This clean-line displacement avoids the dirty
 writeback artifact of memset/`zero_()`; it remains a cold-ish preconditioner,
 not a hardware invalidate. `Timer.cupti(clear_l2=False)` is the explicit
