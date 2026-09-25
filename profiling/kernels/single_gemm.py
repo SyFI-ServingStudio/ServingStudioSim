@@ -9,15 +9,17 @@ Wire string: ``"single_gemm"`` — matches Rust ``KernelSpec::KIND`` in
 by ``profiling.facade`` to generate ``get_single_gemm_times`` /
 ``count_missing_single_gemm``.
 
-Four backends share this kind/table/schema: ``torch`` (contiguous-RHS
+All backends share this kind/table/schema: ``torch`` (contiguous-RHS
 ``torch.mm``), ``torch_linear`` (model-weight-layout ``F.linear`` in the main
 environment), ``torch_linear_vllm`` (the same expression in vLLM's pinned
-environment), and ``deepgemm`` (FP8 dense GEMM, ``dtype = fp8_e4m3``).
+environment), the SGLang BF16 variants, ``deepgemm`` (FP8 dense GEMM,
+``dtype = fp8_e4m3``), and ``flashinfer_mxfp8`` (the vLLM fork's MXFP8 linear:
+activation quant + CuTe-DSL block-scaled GEMM, ``dtype = mxfp8_e4m3``).
 BF16/FP16 model defaults offer both generic Torch variants and the timing cache
 selects the faster one per shape.
 
 Importing this module has a side effect: it appends ``KernelProfilerSpec`` rows
-to the registry. The runner modules ``profiling.runners.gemm.{torch,deepgemm}``
+to the registry. The runner modules under ``profiling.runners.gemm``
 are referenced lazily via ``RunnerRef`` so the main process never eager-imports
 torch/cuda.
 """
@@ -155,5 +157,28 @@ register(
         args_schema=SingleGemmArgs,
         metric_family=MetricFamily.COMPUTE,
         batch_outlier_policy=BatchOutlierPolicy(),
+    )
+)
+
+# vLLM-fork MXFP8 dense linear (DeepSeek-V4.1): one slot = the swizzled MXFP8
+# activation quant + FlashInfer CuTe-DSL block-scaled GEMM that
+# FlashInferCutedslMxfp8LinearKernel.apply_weights issues, bf16 out.
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="flashinfer_mxfp8",
+        supports=BackendSupport(
+            compute=frozenset({DType.MXFP8_E4M3}),
+            gpus=frozenset({"NVIDIA B200"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.gemm.flashinfer_mxfp8",
+            function_name="profile_single_gemm_flashinfer_mxfp8",
+        ),
+        table_name=KIND,
+        args_schema=SingleGemmArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="vllm_fork_env",
     )
 )
