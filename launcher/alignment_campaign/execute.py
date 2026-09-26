@@ -31,6 +31,7 @@ per-case stage state and exit codes.
 from __future__ import annotations
 
 import asyncio
+import json
 import shlex
 import sys
 from dataclasses import dataclass, field
@@ -131,6 +132,32 @@ def _artifacts_for(variant: Variant, phase: str) -> tuple[str, ...]:
     return _PIPELINE_ARTIFACTS.get(phase, ())
 
 
+#: Artifacts a profile names in its `profile_result.json` only when it wrote
+#: them. A schema-6 NSYS parse keeps its kernel rows beside `parsed.json`,
+#: which is unreadable without them; an older capture has no such sibling and
+#: names none, so it is still complete.
+_RECORDED_PROFILE_ARTIFACTS = {"nsys": ("parsed_kernel_rows",)}
+
+
+def _recorded_artifacts_exist(directory: Path, kind: str) -> bool:
+    keys = _RECORDED_PROFILE_ARTIFACTS.get(kind, ())
+    if not keys:
+        return True
+    try:
+        result = json.loads((directory / "profile_result.json").read_text())
+    except (OSError, ValueError):
+        return False
+    if not isinstance(result, dict):
+        return False
+    # By name inside this phase directory: the recorded path is absolute, and a
+    # moved or copied campaign must not look incomplete and re-profile.
+    return all(
+        isinstance(result[key], str) and (directory / Path(result[key]).name).is_file()
+        for key in keys
+        if result.get(key) is not None
+    )
+
+
 def phase_complete(case_dir: Path, variant: Variant, phase: str) -> bool:
     """Exit status *and* artifacts. `simulation` already carries a marker written
     by the ordinary launcher, so the campaign reads it rather than writing it."""
@@ -139,6 +166,9 @@ def phase_complete(case_dir: Path, variant: Variant, phase: str) -> bool:
         return False
     artifacts = _artifacts_for(variant, phase)
     if artifacts and not all((directory / name).exists() for name in artifacts):
+        return False
+    profile_pass = variant.pass_named(phase)
+    if profile_pass is not None and not _recorded_artifacts_exist(directory, profile_pass.kind):
         return False
     if phase == SIMULATION_PHASE:
         return has_marker(directory)

@@ -53,6 +53,7 @@ from .evidence import (
     merge_duration_ns,
     owning_global_pid,
 )
+from .parsed_io import kernel_rows_path, write_parsed
 from .sequence import build_device_kernel_sequences
 
 # Alignment traces require inline, indexed iteration markers. Stage information
@@ -1678,12 +1679,11 @@ def main(argv: list[str] | None = None) -> int:
         worker_ranks=worker_ranks,
         tp_size=args.tp_size,
     )
-    text = json.dumps(result, indent=2)
     if args.output:
-        Path(args.output).write_text(text)
-        print(f"wrote {args.output}")
+        write_parsed(Path(args.output), result)
+        print(f"wrote {args.output} and {kernel_rows_path(Path(args.output)).name}")
     else:
-        print(text)
+        print(json.dumps(result, separators=(",", ":")))
     if args.sequences_output:
         write_kernel_sequences(args.sequences_output, result, args.output)
         print(f"wrote {args.sequences_output}")

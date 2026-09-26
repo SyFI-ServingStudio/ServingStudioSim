@@ -34,7 +34,11 @@ from .exec import (
 )
 from .managed_run import ManagedRun, managed_analysis_subjects, prepare_experiment
 from .process import ProcessSpec
-from .process.artifacts import ArtifactValidationError, validate_simulation_artifacts
+from .process.artifacts import (
+    ArtifactValidationError,
+    validate_render_artifacts,
+    validate_simulation_artifacts,
+)
 from .process.journal import RunJournal, StageState
 from .process.leases import LauncherLeases
 from .process.markers import COMPLETE_MARKER, has_marker, mark_complete
@@ -78,6 +82,15 @@ async def _run_directory_lease(
         yield
 
 
+def _has_plots(log_dir: Path) -> bool:
+    """Whether a finished run passes the renderer's own artifact contract."""
+    try:
+        validate_render_artifacts(log_dir)
+    except ArtifactValidationError:
+        return False
+    return True
+
+
 async def _launch_one(
     params: dict,
     build_type: str,
@@ -89,6 +102,8 @@ async def _launch_one(
     managed_run: ManagedRun | None = None,
     scheduler: ResourceScheduler | None = None,
     run_directory_lease_held: bool = False,
+    *,
+    render: bool = True,
 ) -> bool:
     """Metadata-then-spawn for a single (already normalized) param set. On resume
     (the default) a run whose log_dir already has a `.complete` marker is skipped;
@@ -101,14 +116,22 @@ async def _launch_one(
 
     `analyze=True` runs the post-run analyzer (Rust compute → Python plots) after
     a successful run; best-effort, so analysis failures never fail the run.
-    `analyze_subjects` narrows which subjects run (None/empty = all applicable)."""
+    `analyze_subjects` narrows which subjects run (None/empty = all applicable).
+    `render=False` keeps the analysis but skips its PNGs."""
     log_dir = Path(log_dir_of(params))
     scheduler = scheduler or ResourceScheduler(1)
-    workflow = simulation_workflow(analyze=analyze)
+    workflow = simulation_workflow(analyze=analyze, render=render)
     journal = RunJournal(log_dir)
 
     async with _run_directory_lease(log_dir, run_directory_lease_held):
         if not refresh and _is_complete(log_dir):
+            if workflow.contains(StageKind.RENDER) and not _has_plots(log_dir):
+                # Finished with `--no-plot`, resumed without it: draw the PNGs
+                # from the analysis already on disk instead of skipping them.
+                print(f"[render] {log_dir} complete without plots; rendering them")
+                async with scheduler.analysis_slot():
+                    await run_analysis(log_dir, build_type, analyze_subjects, render_only=True)
+                return True
             print(f"[skip] {log_dir} already complete (use --refresh to re-run)")
             return True
         journal.begin_attempts(
@@ -218,7 +241,12 @@ async def _launch_one(
             if managed_run is not None:
                 managed_run.report("analysis_running")
             async with scheduler.analysis_slot():
-                await run_analysis(log_dir, build_type, analyze_subjects)
+                await run_analysis(
+                    log_dir,
+                    build_type,
+                    analyze_subjects,
+                    render=workflow.contains(StageKind.RENDER),
+                )
 
         _mark_complete(log_dir)
         journal.update(
@@ -242,13 +270,16 @@ def run_single(
     profile_freq: int = 499,
     analyze: bool = True,
     analyze_subjects: list[str] | None = None,
+    *,
+    plot: bool = True,
 ) -> bool:
     """Prebuild → metadata → run, for one param set. Synchronous entry. The
     caller must pass the already-loaded Rust schema from `load_schema()`; the
     sweep layer never loads a schema implicitly. Resumes by default (skips a run
     already marked `.complete`); `refresh=True` re-runs. `profile=True` wraps the
     run with `perf record` (skill `operate-profile-sim-speed`). `analyze=True` runs the
-    post-run analyzer (best-effort); `analyze_subjects` narrows which subjects."""
+    post-run analyzer (best-effort); `analyze_subjects` narrows which subjects;
+    `plot=False` (`--no-plot`) keeps the analysis but renders no PNGs."""
     if schema is None:
         raise TypeError("run_single requires a loaded Schema; call load_schema() first")
     return asyncio.run(
@@ -262,6 +293,7 @@ def run_single(
             profile_freq,
             analyze,
             analyze_subjects,
+            plot,
         )
     )
 
@@ -276,6 +308,7 @@ async def _run_single_async(
     profile_freq: int = 499,
     analyze: bool = True,
     analyze_subjects: list[str] | None = None,
+    plot: bool = True,
 ) -> bool:
     log_dir = Path(log_dir_of(params))
     run_directory_lease = _LAUNCHER_LEASES.run_directory(log_dir)
@@ -285,7 +318,11 @@ async def _run_single_async(
         managed_run = prepare_experiment(log_dir, run_count=1, axes=[])
         analyze_subjects = managed_analysis_subjects(managed_run, analyze_subjects)
         if not refresh and _is_complete(log_dir):
-            print(f"[skip] {log_dir} already complete (use --refresh to re-run)")
+            if analyze and plot and not _has_plots(log_dir):
+                print(f"[render] {log_dir} complete without plots; rendering them")
+                await run_analysis(log_dir, build_type, analyze_subjects, render_only=True)
+            else:
+                print(f"[skip] {log_dir} already complete (use --refresh to re-run)")
             if managed_run is not None:
                 managed_run.report("ready")
             return True
@@ -312,6 +349,7 @@ async def _run_single_async(
             managed_run,
             ResourceScheduler(1),
             True,
+            render=plot,
         )
         if managed_run is not None:
             managed_run.report("ready" if ok else "failed")
@@ -336,13 +374,16 @@ def run_sweep(
     refresh: bool = False,
     analyze: bool = True,
     analyze_subjects: list[str] | None = None,
+    *,
+    plot: bool = True,
 ) -> int:
     """Expand-then-launch a full sweep. Returns a process exit code. The caller
     must pass the already-loaded Rust schema from `load_schema()`; the sweep
     layer never loads a schema implicitly. Resumes by default (skips runs marked
     `.complete`); `refresh=True` re-runs all. `analyze=True` runs the per-run
     analyzer after each successful run (best-effort); `analyze_subjects` narrows
-    which subjects."""
+    which subjects. `plot=False` (`--no-plot`) keeps all of that analysis but
+    renders no PNGs, per run or for the sweep."""
     if schema is None:
         raise TypeError("run_sweep requires a loaded Schema; call load_schema() first")
     return asyncio.run(
@@ -355,6 +396,7 @@ def run_sweep(
             refresh,
             analyze,
             analyze_subjects,
+            plot,
         )
     )
 
@@ -368,6 +410,7 @@ async def _run_sweep_async(
     refresh: bool = False,
     analyze: bool = True,
     analyze_subjects: list[str] | None = None,
+    plot: bool = True,
 ) -> int:
     if not validate_unique_log_dirs(param_sets):
         return 2
@@ -429,6 +472,7 @@ async def _run_sweep_async(
                     analyze_subjects=analyze_subjects,
                     managed_run=managed_run,
                     scheduler=scheduler,
+                    render=plot,
                 )
 
             results = await asyncio.gather(
@@ -440,7 +484,7 @@ async def _run_sweep_async(
         if analyze and sweep_manifest_path is not None:
             if managed_run is not None:
                 managed_run.report("analysis_running")
-            _aggregate(base_dir, build_type)
+            _aggregate(base_dir, build_type, plot=plot)
 
         succeeded = all(results)
         if managed_run is not None:
@@ -559,13 +603,13 @@ def _write_sweep_manifest(param_sets: list[dict], base_dir: Path) -> Path | None
     return manifest_path
 
 
-def _aggregate(base_dir: Path, build_type: str = "debug") -> None:
+def _aggregate(base_dir: Path, build_type: str = "debug", *, plot: bool = True) -> None:
     """Best-effort Rust sweep collection + Python payload rendering.
 
     Membership was already persisted before launch. Keep this post-run boundary
     thin: the analyzer reads that manifest and the member reports.
     """
     try:
-        run_sweep_analysis(base_dir, build_type)
+        run_sweep_analysis(base_dir, build_type, render=plot)
     except Exception as exc:  # aggregation failure must not fail the sweep
         print(f"[aggregate] skipped: {exc}")

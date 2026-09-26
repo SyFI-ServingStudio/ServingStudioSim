@@ -44,8 +44,12 @@ class WorkflowPlan:
         return any(node.kind == kind for node in self.nodes)
 
 
-def simulation_workflow(*, analyze: bool) -> WorkflowPlan:
-    """Compile the per-run graph; ``--no-analyze`` removes optional nodes."""
+def simulation_workflow(*, analyze: bool, render: bool = True) -> WorkflowPlan:
+    """Compile the per-run graph; ``--no-analyze`` removes optional nodes.
+
+    ``render=False`` (``--no-plot``) keeps compute and trace but drops the PNG
+    render.
+    """
 
     nodes = [
         StageNode(StageKind.ENSURE_CACHE),
@@ -57,25 +61,28 @@ def simulation_workflow(*, analyze: bool) -> WorkflowPlan:
     ]
     final_dependencies = (StageKind.VALIDATE_RAW_ARTIFACTS,)
     if analyze:
-        nodes.extend(
-            [
-                StageNode(
-                    StageKind.ANALYZE_COMPUTE,
-                    (StageKind.VALIDATE_RAW_ARTIFACTS,),
-                    required=False,
-                ),
+        nodes.append(
+            StageNode(
+                StageKind.ANALYZE_COMPUTE,
+                (StageKind.VALIDATE_RAW_ARTIFACTS,),
+                required=False,
+            )
+        )
+        if render:
+            nodes.append(
                 StageNode(
                     StageKind.RENDER,
                     (StageKind.ANALYZE_COMPUTE,),
                     required=False,
-                ),
-                StageNode(
-                    StageKind.TRACE,
-                    (StageKind.ANALYZE_COMPUTE,),
-                    required=False,
-                ),
-            ]
+                )
+            )
+        nodes.append(
+            StageNode(
+                StageKind.TRACE,
+                (StageKind.ANALYZE_COMPUTE,),
+                required=False,
+            )
         )
-        final_dependencies = (StageKind.RENDER, StageKind.TRACE)
+        final_dependencies = (StageKind.RENDER, StageKind.TRACE) if render else (StageKind.TRACE,)
     nodes.append(StageNode(StageKind.FINALIZE, final_dependencies))
     return WorkflowPlan(tuple(nodes))

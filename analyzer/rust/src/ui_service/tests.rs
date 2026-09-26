@@ -3641,6 +3641,53 @@ fn one_iteration_is_read_by_byte_range_not_by_parsing_the_shard() {
 }
 
 #[test]
+fn a_zstd_frame_shard_serves_the_decoded_object() {
+    let temporary = TempDir::new().expect("temp dir");
+    write_alignment_bundle(temporary.path());
+    let payloads = temporary
+        .path()
+        .join("20260720_0_llama3_8b_tp_alignment/tp4/rate32/analysis_kernel/payloads");
+    let lines = [
+        json!({"iteration_id": 8, "measured": "eight"}).to_string() + "\n",
+        json!({"iteration_id": 9, "measured": "nine"}).to_string() + "\n",
+    ];
+    let frames = lines
+        .iter()
+        .map(|line| zstd::bulk::compress(line.as_bytes(), 3).expect("frame"))
+        .collect::<Vec<_>>();
+    fs::write(
+        payloads.join("alignment_timeline_iterations.jsonl.zst"),
+        frames.concat(),
+    )
+    .expect("zstd shard");
+    fs::write(
+        payloads.join("alignment_timeline.json"),
+        json!({
+            "iterations": [{"iteration_id": 8}, {"iteration_id": 9}],
+            "iteration_detail": {
+                "file": "alignment_timeline_iterations.jsonl.zst",
+                "encoding": "zstd-frames",
+                "byte_ranges": {
+                    "8": [0, frames[0].len()],
+                    "9": [frames[0].len(), frames[1].len()],
+                },
+                "decoded_lengths": {"8": lines[0].len(), "9": lines[1].len()},
+            },
+        })
+        .to_string(),
+    )
+    .expect("timeline payload");
+    let roots =
+        configure_logs_roots(vec![temporary.path().to_path_buf()]).expect("configure logs root");
+    let alignment = &discover_alignments(&roots).expect("discover")[0];
+
+    let second = alignment_iteration_detail(alignment, "timeline", "9").expect("iteration 9");
+
+    // The object alone, as a plain shard's range serves it: no trailing newline.
+    assert_eq!(second, lines[1].trim_end().as_bytes());
+}
+
+#[test]
 fn one_sequence_is_read_by_phase_and_id_from_its_shard() {
     let temporary = TempDir::new().expect("temp dir");
     write_alignment_bundle(temporary.path());

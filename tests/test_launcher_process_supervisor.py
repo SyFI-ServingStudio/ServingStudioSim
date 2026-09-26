@@ -272,6 +272,16 @@ def test_no_analyze_workflow_removes_optional_stages() -> None:
     assert with_analysis.contains(StageKind.TRACE)
 
 
+def test_unrendered_workflow_keeps_compute_and_trace() -> None:
+    workflow = simulation_workflow(analyze=True, render=False)
+
+    assert workflow.contains(StageKind.ANALYZE_COMPUTE)
+    assert workflow.contains(StageKind.TRACE)
+    assert not workflow.contains(StageKind.RENDER)
+    finalize = next(node for node in workflow.nodes if node.kind == StageKind.FINALIZE)
+    assert finalize.dependencies == (StageKind.TRACE,)
+
+
 def _pid_exists(process_id: int) -> bool:
     try:
         os.kill(process_id, 0)

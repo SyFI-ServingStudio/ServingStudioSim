@@ -40,17 +40,19 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::{ensure, Context, Result};
 use datafusion::prelude::SessionContext;
 use rayon::prelude::*;
+use serde::Serialize;
 use serde_json::{json, Value};
 use std::path::Path;
 
 use super::barrier;
 use super::host::{self, HostWindow};
 use super::{
-    duty_cycle_recommendation, interval_union_ns, kernel_name_index, leaf_scales, load_inventory,
-    load_sim_cases, measure_iteration, measured_gpu_cycles_ms, measured_path_fields, occurrence_ns,
-    parsed_trace, physical_kernel_rows, pooled_gpu_time_multiplier, read_json,
-    screen_duty_cycle_outliers, single_iter_manifest, CaseMapDoc, CompiledInventory,
-    DutyCycleSample, IterationMeasurement, JsonlShardWriter, MeasuredIteration, SimCase,
+    duty_cycle_recommendation, encode_record, interval_union_ns, kernel_name_index, leaf_scales,
+    load_inventory, load_sim_cases, measure_iteration, measured_gpu_cycles_ms,
+    measured_path_fields, occurrence_ns, parsed_trace, physical_kernel_rows,
+    pooled_gpu_time_multiplier, read_json, screen_duty_cycle_outliers, single_iter_manifest,
+    CaseMapDoc, CompiledInventory, DutyCycleSample, EncodedRecord, IterationMeasurement,
+    JsonlShardWriter, MeasuredIteration, PhysicalKernelRow, SimCase,
 };
 use crate::alignment_input;
 use crate::io::{read_cost_manifests, resolve_artifact_path, SCHEMA_VERSION};
@@ -61,7 +63,7 @@ use crate::io::{read_cost_manifests, resolve_artifact_path, SCHEMA_VERSION};
 const MAX_ITERATIONS: usize = 32;
 
 /// Sibling of the payload holding one iteration's full detail per line.
-const ITERATION_DETAIL_FILE: &str = "alignment_timeline_iterations.jsonl";
+const ITERATION_DETAIL_FILE: &str = "alignment_timeline_iterations.jsonl.zst";
 
 /// The phase whose folded kernel program identifies an iteration's shape. The
 /// other phases (preprocess / sample / bookkeep …) are the same few kernels
@@ -372,6 +374,7 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
     let mut index_iterations = Vec::with_capacity(selected.len());
     let mut report_iterations = Vec::with_capacity(selected.len());
     let mut byte_ranges = serde_json::Map::new();
+    let mut decoded_lengths = serde_json::Map::new();
     let mut used_name_ids = BTreeSet::new();
     for chunk in selected.chunks(super::MEASURE_CHUNK) {
         let outputs = chunk
@@ -408,7 +411,7 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
                 )?;
                 Ok(TimelineOutput {
                     iteration_id: summary.iteration_id,
-                    line: serde_json::to_vec(&built.detail)?,
+                    record: encode_record(built.detail)?,
                     index: built.index,
                     report: (*reason != Selection::FullCapture).then_some(built.report),
                     used_name_ids: built.used_name_ids,
@@ -418,8 +421,10 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
             .into_iter()
             .collect::<Result<Vec<_>>>()?;
         for output in outputs {
-            let (offset, length) = detail_writer.write_line(&output.line)?;
-            byte_ranges.insert(output.iteration_id.to_string(), json!([offset, length]));
+            let (offset, length) = detail_writer.write_record(&output.record)?;
+            let iteration_id = output.iteration_id.to_string();
+            decoded_lengths.insert(iteration_id.clone(), json!(output.record.decoded_len));
+            byte_ranges.insert(iteration_id, json!([offset, length]));
             index_iterations.push(output.index);
             if let Some(report) = output.report {
                 report_iterations.push(report);
@@ -525,8 +530,9 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
         "iterations": index_iterations,
         "iteration_detail": {
             "file": detail_file,
-            "encoding": "one JSON object per line, in the order of `iterations`",
+            "encoding": super::ZSTD_FRAMES,
             "byte_ranges": byte_ranges,
+            "decoded_lengths": decoded_lengths,
         },
         "definitions": definitions,
     });
@@ -679,15 +685,78 @@ struct HostContext<'a> {
 /// `Value` it came from, so the tree is dropped on the worker that built it.
 struct TimelineOutput {
     iteration_id: u64,
-    line: Vec<u8>,
+    record: EncodedRecord,
     index: Value,
     report: Option<Value>,
     used_name_ids: BTreeSet<u64>,
 }
 
+/// One line of the timeline detail shard, typed for the reason
+/// `super::PhysicalKernelRow` gives. Field order is the old `json!` key order.
+#[derive(Serialize)]
+struct TimelineDetail<'a> {
+    iteration_id: u64,
+    case_index: u64,
+    stage: &'a str,
+    iteration_type: &'a str,
+    identity_sequence: &'a str,
+    selected_as: &'static str,
+    anchor_ns: Option<i64>,
+    gpu_span_ns: Option<(i64, i64)>,
+    measured_gpu_cycle_ms: Option<f64>,
+    simulated_gpu_cycle_ms: Option<f64>,
+    measured: MeasuredBlock<'a>,
+    simulated: SimulatedBlock<'a>,
+    operation_totals: Vec<Value>,
+    host: Option<Value>,
+}
+
+#[derive(Serialize)]
+struct MeasuredBlock<'a> {
+    critical_path_ms: f64,
+    busy_union_ms: f64,
+    kernels: Vec<TimelineKernelRow<'a>>,
+    segments: Vec<Value>,
+    barriers: Vec<Value>,
+    /// The barrier-path scalars except `measured_ms`, which the block already
+    /// carries as `critical_path_ms`.
+    #[serde(flatten)]
+    path_fields: serde_json::Map<String, Value>,
+}
+
+#[derive(Serialize)]
+struct SimulatedBlock<'a> {
+    total_ms: f64,
+    slot_ms: &'a [f64],
+    slot_op: Vec<Value>,
+}
+
+/// `ov` per launch: overlap, same-stream, and cross-stream ns, stream id, partners.
+type OverlapCell<'a> = (u64, u64, u64, Option<u64>, &'a Vec<(usize, u64)>);
+/// `iv` per launch: device, start and end relative to the time origin,
+/// correlation id, track.
+type IntervalCell = (i64, i64, i64, Option<u64>, usize);
+
+#[derive(Serialize)]
+struct TimelineKernelRow<'a> {
+    ph: &'a str,
+    row: &'a str,
+    name_id: u64,
+    cat: &'a str,
+    op: Option<&'a str>,
+    operation_ordinal: Option<usize>,
+    physical_kernels: Vec<PhysicalKernelRow<'a>>,
+    sync: bool,
+    occ_ns: u64,
+    crit_ms: f64,
+    path_ms: f64,
+    ov: Vec<OverlapCell<'a>>,
+    iv: Vec<IntervalCell>,
+}
+
 struct BuiltIteration {
-    /// Everything, one line of the detail shard.
-    detail: Value,
+    /// Everything, one serialized line of the detail shard.
+    detail: Vec<u8>,
     /// The analyst-facing numbers, including the ranked gaps.
     report: Value,
     /// The scalars a picker needs before it fetches anything.
@@ -777,45 +846,45 @@ fn build_iteration(
                 item.launches[index].start_ns,
             )
         });
-        let launches: Vec<_> = order.iter().map(|&index| item.launches[index]).collect();
-        kernel_rows.push(json!({
-            "ph": item.phase,
-            "row": item.row_id,
-            "name_id": name_id,
-            "cat": item.category,
-            "op": item.operation,
-            "operation_ordinal": item.operation_ordinal,
-            "physical_kernels": physical_kernel_rows(item),
-            "sync": item.synchronizing,
-            "occ_ns": occurrence,
-            "crit_ms": path.kernel_critical_ns[kernel_index] as f64 / 1e6,
-            "path_ms": path.kernel_on_path_ns[kernel_index] as f64 / 1e6,
-            "ov": order
+        kernel_rows.push(TimelineKernelRow {
+            ph: &item.phase,
+            row: &item.row_id,
+            name_id,
+            cat: &item.category,
+            op: item.operation.as_deref(),
+            operation_ordinal: item.operation_ordinal,
+            physical_kernels: physical_kernel_rows(item),
+            sync: item.synchronizing,
+            occ_ns: occurrence,
+            crit_ms: path.kernel_critical_ns[kernel_index] as f64 / 1e6,
+            path_ms: path.kernel_on_path_ns[kernel_index] as f64 / 1e6,
+            ov: order
                 .iter()
                 .map(|&index| {
                     let overlap = &overlaps[kernel_index][index];
-                    json!([
+                    (
                         overlap.overlap_ns,
                         overlap.same_stream_ns,
                         overlap.cross_stream_ns,
                         item.launches[index].stream_id,
-                        overlap.partners,
-                    ])
+                        &overlap.partners,
+                    )
                 })
-                .collect::<Vec<_>>(),
-            "iv": launches
+                .collect(),
+            iv: order
                 .iter()
-                .map(|launch| {
-                    json!([
+                .map(|&index| {
+                    let launch = &item.launches[index];
+                    (
                         launch.device_id,
                         offset(launch.start_ns),
                         offset(launch.end_ns),
                         launch.correlation_id,
                         launch.track_index,
-                    ])
+                    )
                 })
-                .collect::<Vec<_>>(),
-        }));
+                .collect(),
+        });
     }
 
     // ---- simulated ----------------------------------------------------------
@@ -897,68 +966,78 @@ fn build_iteration(
     }
 
     let path_fields = measured_path_fields(&path);
-    let mut measured_block = json!({
-        "critical_path_ms": summary.measured_ms,
-        "busy_union_ms": measurement.busy_union_ms,
-        "kernels": kernel_rows,
-        "segments": path.segments.iter().map(|segment| json!({
-            "start_ns": offset(segment.start_ns),
-            "end_ns": offset(segment.end_ns),
-            "winner": segment.winner,
-            "busy_ns_by_device": segment
-                .busy_ns_by_device
-                .iter()
-                .map(|(device, ns)| (device.to_string(), *ns))
-                .collect::<BTreeMap<_, _>>(),
-            "idle_internal_ns": segment.idle_internal_ns,
-            "idle_boundary_ns": segment.idle_boundary_ns,
-            "gating_device_id": segment.gating_device_id,
-            "gating_gap_ns": segment.gating_gap_ns,
-        })).collect::<Vec<_>>(),
-        "barriers": path.barriers.iter().map(|barrier| json!({
-            "positions": barrier.positions,
-            "enter_ns": offset(barrier.enter_ns),
-            "exit_ns": offset(barrier.exit_ns),
-            "net_ns": barrier.net_ns,
-            "skew_ns": barrier.skew_ns,
-            "last_exit_device": barrier.last_exit_device,
-        })).collect::<Vec<_>>(),
-    });
-    let measured_map = measured_block
-        .as_object_mut()
-        .expect("measured block is an object");
-    for (key, value) in &path_fields {
-        if key != "measured_ms" {
-            measured_map.insert(key.clone(), value.clone());
-        }
-    }
+    let block_path_fields = path_fields
+        .iter()
+        .filter(|(key, _)| key.as_str() != "measured_ms")
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    let measured_block = MeasuredBlock {
+        critical_path_ms: summary.measured_ms,
+        busy_union_ms: measurement.busy_union_ms,
+        kernels: kernel_rows,
+        segments: path
+            .segments
+            .iter()
+            .map(|segment| {
+                json!({
+                    "start_ns": offset(segment.start_ns),
+                    "end_ns": offset(segment.end_ns),
+                    "winner": segment.winner,
+                    "busy_ns_by_device": segment
+                        .busy_ns_by_device
+                        .iter()
+                        .map(|(device, ns)| (device.to_string(), *ns))
+                        .collect::<BTreeMap<_, _>>(),
+                    "idle_internal_ns": segment.idle_internal_ns,
+                    "idle_boundary_ns": segment.idle_boundary_ns,
+                    "gating_device_id": segment.gating_device_id,
+                    "gating_gap_ns": segment.gating_gap_ns,
+                })
+            })
+            .collect::<Vec<_>>(),
+        barriers: path
+            .barriers
+            .iter()
+            .map(|barrier| {
+                json!({
+                    "positions": barrier.positions,
+                    "enter_ns": offset(barrier.enter_ns),
+                    "exit_ns": offset(barrier.exit_ns),
+                    "net_ns": barrier.net_ns,
+                    "skew_ns": barrier.skew_ns,
+                    "last_exit_device": barrier.last_exit_device,
+                })
+            })
+            .collect::<Vec<_>>(),
+        path_fields: block_path_fields,
+    };
 
     let occupancy = reference.occupancy();
     let host_rows = host_context.and_then(|context| context.rows);
-    let detail = json!({
-        "iteration_id": summary.iteration_id,
-        "case_index": summary.case_index,
-        "stage": summary.stage,
-        "iteration_type": summary.iteration_type,
-        "identity_sequence": summary.identity_sequence,
-        "selected_as": reason.label(),
-        "anchor_ns": anchor_ns.map(offset),
-        "gpu_span_ns": reference
+    let detail = serde_json::to_vec(&TimelineDetail {
+        iteration_id: summary.iteration_id,
+        case_index: summary.case_index,
+        stage: &summary.stage,
+        iteration_type: &summary.iteration_type,
+        identity_sequence: &summary.identity_sequence,
+        selected_as: reason.label(),
+        anchor_ns: anchor_ns.map(offset),
+        gpu_span_ns: reference
             .span
-            .map(|(start, end)| json!([offset(start), offset(end)])),
-        "measured_gpu_cycle_ms": measured_gpu_cycle_ms,
-        "simulated_gpu_cycle_ms": simulated_gpu_cycle_ms,
-        "measured": measured_block,
-        "simulated": {
-            "total_ms": sim.total_ms,
-            "slot_ms": sim.slot_ms,
-            "slot_op": slot_operations,
+            .map(|(start, end)| (offset(start), offset(end))),
+        measured_gpu_cycle_ms,
+        simulated_gpu_cycle_ms,
+        measured: measured_block,
+        simulated: SimulatedBlock {
+            total_ms: sim.total_ms,
+            slot_ms: &sim.slot_ms,
+            slot_op: slot_operations,
         },
-        "operation_totals": operation_totals,
+        operation_totals,
         // Absent when the capture carries no host sidecar, which is a different
         // fact from "the CPU did nothing" and must not render as an empty lane.
-        "host": host_rows.map(host::IterationHost::value),
-    });
+        host: host_rows.map(host::IterationHost::value),
+    })?;
 
     let mut report = json!({
         "iteration_id": summary.iteration_id,
@@ -1275,7 +1354,7 @@ fn definitions() -> Value {
         "host.api": "per thread, one [start_ns, duration_ns, string_id, class_index, correlation_id] per CUDA runtime call, anchor-relative like host.nvtx. class_index indexes meta.host_timeline.api_classes; correlation_id is the NSYS launch identity used to connect this call to one measured kernel; a thread between two calls is unaccounted for, not idle — the capture carries no CPU sampling",
         "host.window_ns": "this iteration's host window, anchor-relative. Wider than the GPU span on both sides, and overlapping its neighbours' — that overlap is the pipelining, see meta.host_timeline.window_rule",
         "iterations": "one summary row per emitted iteration — the scalars a picker sorts on. Every per-kernel and per-host-event field lives in the detail shard instead",
-        "iteration_detail.byte_ranges": "iteration_id -> [byte offset, byte length] into the sibling .jsonl. Read that range and parse it as one JSON object; the whole file is never needed at once",
+        "iteration_detail.byte_ranges": "iteration_id -> [byte offset, byte length] into the sibling .jsonl.zst. The range is one zstd frame (`encoding: zstd-frames`) that decodes to decoded_lengths[iteration_id] bytes: one JSON object and its newline. The whole file is never needed at once, and `zstd -d` turns it into plain JSONL",
     })
 }
 

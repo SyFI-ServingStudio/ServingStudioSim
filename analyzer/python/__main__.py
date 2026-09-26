@@ -61,20 +61,36 @@ def _invoke(job: Callable[[], Path]) -> Path:
     return job()
 
 
-def _run_jobs(jobs: list[Callable[[], Path]]) -> list[Path]:
+def _run_jobs(job_groups: list[list[Callable[[], Path]]]) -> list[Path]:
     """Render every figure in parallel, one process per worker. Fork context (not
     spawn) so workers inherit `sys.path[0]` — the `analyzer/python` dir, needed to
     import `common.*` — and the already-`Agg`-configured matplotlib. matplotlib is
     thread-hostile, so processes (not threads). Cap the pool: alignment can emit
     dozens of figures, while hundreds of forked matplotlib workers only multiply
-    memory pressure and make rendering slower."""
+    memory pressure and make rendering slower.
+
+    `job_groups` holds one list per subject. Results come back in that order, but
+    submission starts with the smallest groups: a subject with one or two jobs
+    draws a composite figure (the optimality ladder, the per-location throughput
+    grid) that alone takes seconds, while the one subject with a job per kernel
+    position emits a hundred small scatters. Submitted in subject order, the
+    composites started only after the scatters and set the stage's wall time."""
+    jobs = [job for group in job_groups for job in group]
     if not jobs:
         return []
+    offsets = [0]
+    for group in job_groups:
+        offsets.append(offsets[-1] + len(group))
+    schedule = sorted(range(len(job_groups)), key=lambda index: len(job_groups[index]))
     with ProcessPoolExecutor(
-        max_workers=min(len(jobs), 8),
+        max_workers=min(len(jobs), 16),
         mp_context=multiprocessing.get_context("fork"),
     ) as ex:
-        return list(ex.map(_invoke, jobs))
+        futures = [None] * len(jobs)
+        for group_index in schedule:
+            for index in range(offsets[group_index], offsets[group_index + 1]):
+                futures[index] = ex.submit(_invoke, jobs[index])
+        return [future.result() for future in futures]
 
 
 def main(argv: list[str]) -> int:
@@ -96,14 +112,14 @@ def main(argv: list[str]) -> int:
     else:
         default_subjects = RUN_SUBJECTS
     subjects = argv[2:] or default_subjects
-    jobs: list[Callable[[], Path]] = []
+    job_groups: list[list[Callable[[], Path]]] = []
     for subject in subjects:
         renderer = RENDERERS.get(subject)
         if renderer is None:
             print(f"[render] unknown subject {subject!r}; known: {', '.join(RENDERERS)}")
             continue
-        jobs.extend(renderer(log_dir))
-    paths = _run_jobs(jobs)
+        job_groups.append(renderer(log_dir))
+    paths = _run_jobs(job_groups)
     for path in paths:
         print(f"rendered {path}")
     return 0 if paths else 1

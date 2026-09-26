@@ -250,13 +250,19 @@ operation.
 | Question | Artifact and field |
 |---|---|
 | Per-iteration total error | `payloads/alignment_iteration_series.json` → `iterations[].delta_ms` / `relative_diff_pct` |
-| Per-iteration, per-operation error | `payloads/alignment_iteration_breakdowns.jsonl` → one iteration record's `operation_summary[]` |
+| Per-iteration, per-operation error | `payloads/alignment_iteration_breakdowns.<sha256>.jsonl.zst` → one iteration record's `operation_summary[]` |
 | Measured physical-kernel detail | The same breakdown record's `measured_kernels[]` |
 | Simulated CostTree-leaf detail | The same breakdown record's `simulated_kernels[]` |
 | Directional mapping gaps | The same breakdown record's `unmapped_measured_ms` / `unmapped_simulated_ms` |
-| Per-stream intervals and reduced occurrences | `payloads/alignment_timeline_iterations.jsonl` |
+| Per-stream intervals and reduced occurrences | `payloads/alignment_timeline_iterations.<sha256>.jsonl.zst` |
 | Mapping decisions and unresolved measured rows | `kernel_sequences_labeled.json` |
 | Whole-analysis aggregates and recommended multiplier | `reports/alignment_iteration_report.json` |
+
+The two `.jsonl.zst` shards hold one zstd frame per iteration. To read one
+iteration, use its `byte_ranges[id]` from the payload's `breakdown_detail` or
+`iteration_detail` and decode that frame; `analyzer/python/common/layout.py`
+`read_sharded_records` does this. To read all of them, `zstd -dc <shard>`
+streams the plain JSONL.
 
 `operation_summary[]` is the direct measured-versus-simulated comparison: it
 contains `measured_ms`, `simulated_ms`, `delta_ms`, and `relative_diff_pct` for

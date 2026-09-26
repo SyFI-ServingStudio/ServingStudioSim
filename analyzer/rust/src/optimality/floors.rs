@@ -24,13 +24,14 @@
 //! request; a per-level label failure degrades only that scope and leaves other
 //! worker/pool labels available.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{anyhow, Context, Result};
 use datafusion::prelude::SessionContext;
+use serde::Serialize;
 use serde_json::{json, Map, Value};
 
 use crate::conservation::workload::{
@@ -230,7 +231,7 @@ pub(super) async fn compute_batch_locked_run_labels(
         .max()
         .unwrap_or(1);
     let request = build_locked_request(&shapes_by_worker);
-    let response = run_labeler_request(log_dir, request)?;
+    let response = run_labeler_request(log_dir, &request)?;
     let ParsedLabels {
         mut labels,
         errors,
@@ -481,10 +482,10 @@ fn rollup_levels(
 
 fn run_labeler_json(log_dir: &Path, levels: &HashMap<String, WorkloadTotals>) -> Result<Value> {
     let request = build_request(levels);
-    run_labeler_request(log_dir, request)
+    run_labeler_request(log_dir, &request)
 }
 
-fn run_labeler_request(log_dir: &Path, request: Value) -> Result<Value> {
+fn run_labeler_request(log_dir: &Path, request: &impl Serialize) -> Result<Value> {
     // The checkout that produced this run, not the one the analyzer runs from:
     // `raw/params.json` names its model config repo-relatively, so the labeler
     // must resolve it against the same tree the run was launched in.
@@ -496,16 +497,30 @@ fn run_labeler_request(log_dir: &Path, request: Value) -> Result<Value> {
         root.join(log_dir)
     };
 
-    let mut child = Command::new("uv")
+    // The labeler's numpy work is small dense algebra. A default OpenBLAS pool
+    // (128 threads on a 224-core host) spent ~95% of the labeler's CPU spinning
+    // in `blas_thread_server` without shortening its wall time, oversubscribed
+    // the host when a sweep analyzes runs in parallel, and made results drift
+    // run to run (reduction order; up to 4e-8 relative). Its matrix products are
+    // (shapes x ~8) @ (~8 x segments): one thread is within 0.14 s of the pool
+    // even at a million shapes. A caller that sets either variable keeps it.
+    let mut command = Command::new("uv");
+    command
         .args(["run", "python", "-m", "model.work.floors"])
-        .arg(&log_dir_abs)
+        .arg(&log_dir_abs);
+    for variable in ["OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS"] {
+        if std::env::var_os(variable).is_none() {
+            command.env(variable, "1");
+        }
+    }
+    let mut child = command
         .current_dir(&root)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .context("spawn `uv run python -m model.work.floors`")?;
-    let request_bytes = serde_json::to_vec(&request)?;
+    let request_bytes = serde_json::to_vec(request)?;
     let write_result = child
         .stdin
         .take()
@@ -531,25 +546,66 @@ fn build_request(levels: &HashMap<String, WorkloadTotals>) -> Value {
     json!({ "levels": Value::Object(level_json) })
 }
 
-fn build_locked_request(shapes_by_worker: &HashMap<(String, u16), Vec<WeightedWorkload>>) -> Value {
-    let mut compositions = Map::new();
-    for ((pool_tag, worker_id), shapes) in shapes_by_worker {
-        compositions.insert(
-            format!("{pool_tag}/{worker_id}"),
-            Value::Array(
-                shapes
-                    .iter()
-                    .map(|shape| {
-                        json!({
-                            "occurrences": shape.occurrences,
-                            "totals": workload_json(&shape.totals),
-                        })
-                    })
-                    .collect(),
-            ),
-        );
+/// One worker's deduplicated shapes as parallel arrays: element `i` of every
+/// array describes shape `i`. The labeler reads each field as one column, and the
+/// request stops repeating nine key strings per shape — a 2000 s PD run sends
+/// 1.6M shapes, which took 7.9 s to build as a `serde_json::Value` tree alone.
+#[derive(Serialize)]
+struct LockedComposition<'a> {
+    occurrences: Vec<u64>,
+    totals: WorkloadColumns<'a>,
+}
+
+#[derive(Serialize)]
+struct WorkloadColumns<'a> {
+    matmul_tokens: Vec<f64>,
+    prefill_tokens: Vec<f64>,
+    decode_passes: Vec<f64>,
+    prefill_pairs: Vec<f64>,
+    prefill_cached: Vec<f64>,
+    decode_kv: Vec<f64>,
+    prefill_requests: Vec<f64>,
+    prefill_stateful_requests: Vec<f64>,
+    speculative_geometry: Vec<&'a BTreeMap<String, f64>>,
+}
+
+#[derive(Serialize)]
+struct LockedRequest<'a> {
+    locked_compositions: BTreeMap<String, LockedComposition<'a>>,
+}
+
+fn build_locked_request(
+    shapes_by_worker: &HashMap<(String, u16), Vec<WeightedWorkload>>,
+) -> LockedRequest<'_> {
+    let locked_compositions = shapes_by_worker
+        .iter()
+        .map(|((pool_tag, worker_id), shapes)| {
+            let column = |field: fn(&WorkloadTotals) -> f64| {
+                shapes.iter().map(|shape| field(&shape.totals)).collect()
+            };
+            let composition = LockedComposition {
+                occurrences: shapes.iter().map(|shape| shape.occurrences).collect(),
+                totals: WorkloadColumns {
+                    matmul_tokens: column(|totals| totals.matmul_tokens),
+                    prefill_tokens: column(|totals| totals.prefill_tokens),
+                    decode_passes: column(|totals| totals.decode_passes),
+                    prefill_pairs: column(|totals| totals.prefill_pairs),
+                    prefill_cached: column(|totals| totals.prefill_cached),
+                    decode_kv: column(|totals| totals.decode_kv),
+                    prefill_requests: column(|totals| totals.prefill_requests),
+                    prefill_stateful_requests: column(|totals| totals.prefill_stateful_requests),
+                    speculative_geometry: shapes
+                        .iter()
+                        .map(|shape| &shape.totals.speculative_geometry)
+                        .collect(),
+                },
+            };
+            (format!("{pool_tag}/{worker_id}"), composition)
+        })
+        .collect();
+    LockedRequest {
+        locked_compositions,
     }
-    json!({"locked_compositions": Value::Object(compositions)})
 }
 
 fn workload_json(totals: &WorkloadTotals) -> Value {
