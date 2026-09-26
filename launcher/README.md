@@ -719,8 +719,9 @@ It exposes four explicit stages with four independent configs:
   normalized `parsed.json`.
 - `alignment timing-predict` pairs those completed artifacts, generates exact
   predictor cases, and runs the offline predictor. Its arch, GPU, and complete
-  per-role backend policy come from the simulation run's normalized
-  `raw/params.json`, not the source preset.
+  per-role backend policy come from the simulation preset, normalized exactly as
+  `launcher sim` normalizes it: `backends_file` folded in and schema defaults
+  filled. No completed simulation is needed, and the preset must expand to one run.
 - `alignment analyze` assembles the analyzer manifest from completed artifact
   directories and invokes only the enabled top-level alignment subjects.
 

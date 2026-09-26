@@ -30,7 +30,7 @@ from .alignment_config import (
 )
 from .artifact_kind import ArtifactKind, write_artifact_kind
 from .corpus import CorpusError, resolve_hf_references
-from .schema.loader import PresetError, _load_preset
+from .schema.loader import PresetError, SchemaNotFound, _load_preset, load_schema
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CONFIG_SUFFIXES = frozenset({".json", ".yaml", ".yml"})
@@ -122,6 +122,37 @@ def _load_simulation_preset(path: Path) -> dict[str, Any]:
         raise ValueError(str(exc)) from exc
 
 
+def _normalize_simulation_preset(path: Path, *, build_type: str) -> dict[str, Any]:
+    """The sim preset as `launcher sim` hands it to the binary: `backends_file`
+    folded into a nested `backends` map, schema defaults filled (an omitted
+    `fp8` becomes `false`), and hub references resolved.
+
+    timing-predict forwards this arch and backend policy to the predictor, whose
+    config has no defaults of its own, so it must not read the raw preset.
+    """
+    from .__main__ import _expand_preset
+    from .exec import cargo_build
+
+    preset = _load_simulation_preset(path)
+    # The schema comes from `list-params`, which the build writes; building
+    # first keeps it in step with the binary that will run the prediction.
+    if not cargo_build(build_type, build_analyzer=False):
+        raise ValueError("simulator build failed (see error above)")
+    try:
+        schema = load_schema(build_type)
+    except SchemaNotFound as exc:
+        raise ValueError(str(exc)) from exc
+    candidates = _expand_preset(preset, schema, str(path))
+    if candidates is None:
+        raise ValueError(f"invalid simulation preset: {path} (see errors above)")
+    if len(candidates) != 1:
+        raise ValueError(
+            f"simulation preset {path} expands to {len(candidates)} runs; "
+            "alignment timing-predict needs exactly one"
+        )
+    return candidates[0]
+
+
 def _load_simulation_params(log_dir: Path) -> dict[str, Any]:
     params_path = log_dir / "raw" / "params.json"
     if not params_path.is_file():
@@ -153,30 +184,24 @@ def _simulation_target(params: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     return gpu, arch
 
 
-def _preset_backends(preset: dict[str, Any]) -> dict[str, dict[str, list[str]]]:
-    """Re-nest the sim preset's flat ``"pool/role": [candidates]`` backend map
-    into the ``{pool: {role: [candidates]}}`` form the timing predictor expects —
-    the same shape the launcher resolves into a completed run's params.json. The
-    backend policy is part of the simulated CostTree identity, so this must match
-    what the simulation will use.
+def _simulation_backends(params: dict[str, Any]) -> dict[str, dict[str, list[str]]]:
+    """The normalized preset's ``{pool: {role: [candidates]}}`` backend map, the
+    form the timing predictor expects. The backend policy is part of the
+    simulated CostTree identity, so this must match what the simulation will use.
     """
-    flat = preset.get("backends", {})
-    if not isinstance(flat, dict):
+    nested = params.get("backends", {})
+    if not isinstance(nested, dict):
         raise ValueError("simulation preset backends must be a mapping")
-    nested: dict[str, dict[str, list[str]]] = {}
-    for key, candidates in flat.items():
-        pool, separator, role = str(key).partition("/")
-        if not separator or not pool or not role:
-            raise ValueError(f"simulation preset backend key {key!r} must be 'pool/role'")
-        if (
-            not isinstance(candidates, list)
-            or not candidates
-            or not all(isinstance(candidate, str) for candidate in candidates)
-        ):
-            raise ValueError(
-                f"simulation preset backend {key!r} must map to a non-empty string list"
-            )
-        nested.setdefault(pool, {})[role] = list(candidates)
+    for pool, roles in nested.items():
+        for role, candidates in roles.items():
+            if (
+                not isinstance(candidates, list)
+                or not candidates
+                or not all(isinstance(candidate, str) for candidate in candidates)
+            ):
+                raise ValueError(
+                    f"simulation preset backend '{pool}/{role}' must map to a non-empty string list"
+                )
     return nested
 
 
@@ -461,7 +486,7 @@ def _run_timing_predict(args: argparse.Namespace) -> int:
     write_artifact_kind(config.log_dir.parent, ArtifactKind.ALIGNMENT_BUNDLE)
     # Read the sim *preset* (not a completed run): timing-predict is kernel-only,
     # so it needs the gpu / arch / backends but never a finished simulation.
-    preset = _load_simulation_preset(config.simulation_preset)
+    preset = _normalize_simulation_preset(config.simulation_preset, build_type=args.build_type)
     gpu, arch = _simulation_target(preset)
     profile_result = _load_profile_result(config.profile_log_dir)
     # No profile/simulation parallelism pre-check here: every arch spells its
@@ -477,7 +502,7 @@ def _run_timing_predict(args: argparse.Namespace) -> int:
             output_dir=config.log_dir,
             gpu=gpu,
             arch=arch,
-            backends=_preset_backends(preset),
+            backends=_simulation_backends(preset),
             input_spec=config.input_builder,
         )
     )

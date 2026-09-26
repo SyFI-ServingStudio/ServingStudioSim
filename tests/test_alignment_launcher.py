@@ -33,6 +33,7 @@ from launcher import alignment_config as alignment_config_module
 from launcher import exec as launcher_exec
 from launcher import timing_predict as timing_predict_launcher
 from launcher.alignment_config import load_analyze_config, load_profile_config
+from launcher.schema.loader import schema_from_dict
 
 
 def _write_config(path: Path, config: dict) -> None:
@@ -1584,7 +1585,50 @@ def test_analyze_rejects_mixing_kernel_align_and_e2e_phases(tmp_path):
         load_analyze_config(paths["analyze_kernel"])
 
 
-def test_timing_predict_uses_one_phase_config_and_no_labeled_inventory(tmp_path, monkeypatch):
+# The slice of `list-params` the `_phase_configs` simulation preset touches.
+# `fp8` carries a default, as it does in the real schema, so a preset may omit it.
+_SIMULATION_SCHEMA = {
+    "deployments": {"unified": {"pools": {"main": "iter_wise"}}},
+    "providers": {
+        "arch": {"iter_wise": {"llama3_dense": {"params": []}}},
+        "worker": {"iter_wise": {"barebone": {"params": []}}},
+    },
+    "arch_common": [
+        {"name": "model_config", "type": "string", "required": True, "description": ""},
+        {"name": "fp8", "type": "bool", "default": False, "description": ""},
+    ],
+    "group_common": [
+        {"name": "gpu", "type": "string", "required": True, "description": ""},
+        {"name": "replicas", "type": "int", "default": 1, "description": ""},
+    ],
+    "pool_common": [],
+    "common": {
+        "workload": [
+            {"name": "trace_files", "type": "path_list", "required": True, "description": ""},
+            {"name": "arrival_mode", "type": "string", "required": True, "description": ""},
+            {"name": "session_dependency", "type": "string", "required": True, "description": ""},
+        ],
+        "io": [{"name": "log_dir", "type": "path", "default": "logs", "description": ""}],
+    },
+}
+
+
+@pytest.fixture
+def simulation_schema(monkeypatch):
+    """Normalize the simulation preset against `_SIMULATION_SCHEMA`, not a build."""
+    monkeypatch.setattr(launcher_exec, "cargo_build", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        alignment_launcher, "load_schema", lambda build_type: schema_from_dict(_SIMULATION_SCHEMA)
+    )
+
+
+def _predict_config(tmp_path: Path) -> dict:
+    return json.loads((tmp_path / "timing_predict_run" / "timing_predict_config.json").read_text())
+
+
+def test_timing_predict_uses_one_phase_config_and_no_labeled_inventory(
+    tmp_path, monkeypatch, simulation_schema
+):
     paths = _phase_configs(tmp_path)
     _write_completed_inputs(tmp_path)
     launched = []
@@ -1617,7 +1661,9 @@ def test_timing_predict_launcher_keeps_post_run_analysis_enabled(tmp_path, monke
     assert launched == [[str(config_path), "--build-type", "release"]]
 
 
-def test_timing_predict_preserves_simulation_backend_policy(tmp_path, monkeypatch):
+def test_timing_predict_preserves_simulation_backend_policy(
+    tmp_path, monkeypatch, simulation_schema
+):
     paths = _phase_configs(tmp_path)
     _write_completed_inputs(tmp_path)
     # The preset carries backends in the flat "pool/role" form; timing-predict
@@ -1629,13 +1675,68 @@ def test_timing_predict_preserves_simulation_backend_policy(tmp_path, monkeypatc
     monkeypatch.setattr(alignment_launcher, "_launch_timing_predict", lambda *args, **kwargs: 0)
 
     assert alignment_launcher.main(["timing-predict", str(paths["timing"])]) == 0
-    predict_config = json.loads(
-        (tmp_path / "timing_predict_run" / "timing_predict_config.json").read_text()
+    assert _predict_config(tmp_path)["backends"] == {
+        "main": {"unified.pre_attn.qkv_proj": ["torch_linear"]}
+    }
+
+
+def test_timing_predict_reads_the_backends_file(tmp_path, monkeypatch, simulation_schema):
+    paths = _phase_configs(tmp_path)
+    _write_completed_inputs(tmp_path)
+    # `launcher sim` folds `backends_file` into the policy, so the prediction must
+    # too; the inline block loses to the file on a shared key, as it does there.
+    _write_config(
+        tmp_path / "backends.yaml",
+        {"backends": {"main/unified.pre_attn.qkv_proj": ["torch_linear"]}},
     )
-    assert predict_config["backends"] == {"main": {"unified.pre_attn.qkv_proj": ["torch_linear"]}}
+    preset = yaml.safe_load(paths["simulation"].read_text())
+    preset["backends_file"] = "./backends.yaml"
+    preset["backends"] = {
+        "main/unified.pre_attn.qkv_proj": ["cublas"],
+        "main/unified.post_attn.o_proj": ["cublas"],
+    }
+    paths["simulation"].write_text(yaml.safe_dump(preset))
+    monkeypatch.setattr(alignment_launcher, "_launch_timing_predict", lambda *args, **kwargs: 0)
+
+    assert alignment_launcher.main(["timing-predict", str(paths["timing"])]) == 0
+    assert _predict_config(tmp_path)["backends"] == {
+        "main": {
+            "unified.pre_attn.qkv_proj": ["torch_linear"],
+            "unified.post_attn.o_proj": ["cublas"],
+        }
+    }
 
 
-def test_timing_predict_warns_on_trace_mismatch(tmp_path, monkeypatch, capsys):
+def test_timing_predict_fills_arch_defaults(tmp_path, monkeypatch, simulation_schema):
+    paths = _phase_configs(tmp_path)
+    _write_completed_inputs(tmp_path)
+    # The `_phase_configs` preset omits `fp8`; the predictor's arch has no
+    # defaults, so the launcher must supply the schema's.
+    preset = yaml.safe_load(paths["simulation"].read_text())
+    assert "fp8" not in preset["pools"]["main"]["groups"][0]["arch"]
+    monkeypatch.setattr(alignment_launcher, "_launch_timing_predict", lambda *args, **kwargs: 0)
+
+    assert alignment_launcher.main(["timing-predict", str(paths["timing"])]) == 0
+    assert _predict_config(tmp_path)["arch"]["iter"]["fp8"] is False
+
+
+def test_timing_predict_rejects_a_preset_that_expands_to_several_runs(
+    tmp_path, monkeypatch, capsys, simulation_schema
+):
+    paths = _phase_configs(tmp_path)
+    _write_completed_inputs(tmp_path)
+    preset = yaml.safe_load(paths["simulation"].read_text())
+    preset["sweep"] = {"gpu": ["NVIDIA H200", "NVIDIA B200"]}
+    preset["pools"]["main"]["groups"][0]["gpu"] = "${gpu}"
+    preset["io"]["log_dir"] = str(tmp_path / "simulation_run_{gpu}")
+    paths["simulation"].write_text(yaml.safe_dump(preset))
+    monkeypatch.setattr(alignment_launcher, "_launch_timing_predict", lambda *args, **kwargs: 0)
+
+    assert alignment_launcher.main(["timing-predict", str(paths["timing"])]) == 2
+    assert "expands to 2 runs" in capsys.readouterr().err
+
+
+def test_timing_predict_warns_on_trace_mismatch(tmp_path, monkeypatch, capsys, simulation_schema):
     paths = _phase_configs(tmp_path)
     _write_completed_inputs(tmp_path)
     result_path = tmp_path / "profile_run" / "profile_result.json"
