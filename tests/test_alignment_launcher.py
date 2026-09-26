@@ -1647,7 +1647,9 @@ def test_timing_predict_uses_one_phase_config_and_no_labeled_inventory(
     assert not (output / "kernel_sequences_labeled.json").exists()
 
 
-def test_timing_predict_dry_run_builds_cases_in_scratch_and_writes_nothing(tmp_path, monkeypatch):
+def test_timing_predict_dry_run_builds_cases_in_scratch_and_writes_nothing(
+    tmp_path, monkeypatch, simulation_schema
+):
     paths = _phase_configs(tmp_path)
     _write_completed_inputs(tmp_path)
     seen = []
