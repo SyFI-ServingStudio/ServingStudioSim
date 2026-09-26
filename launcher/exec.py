@@ -193,8 +193,9 @@ def _report_build_failure(stage: str, result: ProcessResult) -> None:
         f"{stage} failed: {reason}; exit_code={result.exit_code}, "
         f"pid={result.pid}, process_group_id={result.process_group_id}\n"
     )
-    if result.output:
-        sys.stderr.write(result.output + "\n")
+    for text in (result.output, result.stderr):
+        if text:
+            sys.stderr.write(text + "\n")
 
 
 def cargo_build(build_type: str = "debug", build_analyzer: bool = True) -> bool:
@@ -223,6 +224,8 @@ def cargo_build(build_type: str = "debug", build_analyzer: bool = True) -> bool:
                 cwd=REPO_ROOT,
                 env=_build_subprocess_env(),
                 capture_output=True,
+                # stdout becomes deployment_schema.json verbatim.
+                separate_stderr=True,
                 name="discover-schema",
             )
         )

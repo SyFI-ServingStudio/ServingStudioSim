@@ -156,12 +156,14 @@ def enumerate_kernels(config: dict, build_type: str = "debug") -> list[dict]:
                 argv=[str(binary), "emit-backends", str(cfg_path)],
                 cwd=REPO_ROOT,
                 capture_output=True,
+                # stdout is the JSON; the build logs its cost tree to stderr.
+                separate_stderr=True,
                 env=_build_subprocess_env(),
                 name="emit-backends",
             )
         )
     if not result.succeeded:
-        raise BackendEnumError(result.output.strip() or "emit-backends failed")
+        raise BackendEnumError(result.stderr.strip() or "emit-backends failed")
     return json.loads(result.output)
 
 

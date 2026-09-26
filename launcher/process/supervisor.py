@@ -32,8 +32,9 @@ class ProcessSupervisor:
     async def run(self, spec: ProcessSpec) -> ProcessResult:
         with ExitStack() as resources:
             stdout_stream, capture_stream = self._open_stdout(spec, resources)
+            stderr_stream = self._open_stderr(spec, resources)
             stdin_stream = self._open_stdin(spec, resources)
-            process = self._spawn(spec, stdin_stream, stdout_stream)
+            process = self._spawn(spec, stdin_stream, stdout_stream, stderr_stream)
             started = time.monotonic()
             termination_reason: str | None = None
             try:
@@ -54,6 +55,7 @@ class ProcessSupervisor:
 
             leaked_descendants = await self._clean_leaked_descendants(process.pid)
             output = self._read_capture(capture_stream)
+            stderr = self._read_capture(stderr_stream)
             return ProcessResult(
                 argv=tuple(str(argument) for argument in spec.argv),
                 pid=process.pid,
@@ -61,6 +63,7 @@ class ProcessSupervisor:
                 exit_code=exit_code,
                 elapsed_seconds=time.monotonic() - started,
                 output=output,
+                stderr=stderr,
                 leaked_descendants=leaked_descendants,
                 termination_reason=termination_reason,
             )
@@ -70,8 +73,9 @@ class ProcessSupervisor:
 
         with ExitStack() as resources:
             stdout_stream, capture_stream = self._open_stdout(spec, resources)
+            stderr_stream = self._open_stderr(spec, resources)
             stdin_stream = self._open_stdin(spec, resources)
-            process = self._spawn(spec, stdin_stream, stdout_stream)
+            process = self._spawn(spec, stdin_stream, stdout_stream, stderr_stream)
             started = time.monotonic()
             termination_reason: str | None = None
             try:
@@ -87,6 +91,7 @@ class ProcessSupervisor:
 
             leaked_descendants = self._clean_leaked_descendants_sync(process.pid)
             output = self._read_capture(capture_stream)
+            stderr = self._read_capture(stderr_stream)
             return ProcessResult(
                 argv=tuple(str(argument) for argument in spec.argv),
                 pid=process.pid,
@@ -94,6 +99,7 @@ class ProcessSupervisor:
                 exit_code=exit_code,
                 elapsed_seconds=time.monotonic() - started,
                 output=output,
+                stderr=stderr,
                 leaked_descendants=leaked_descendants,
                 termination_reason=termination_reason,
             )
@@ -114,6 +120,12 @@ class ProcessSupervisor:
         return None, None
 
     @staticmethod
+    def _open_stderr(spec: ProcessSpec, resources: ExitStack) -> BinaryIO | None:
+        if not spec.separate_stderr:
+            return None
+        return resources.enter_context(tempfile.TemporaryFile(prefix="vibesim-process-stderr-"))
+
+    @staticmethod
     def _open_stdin(spec: ProcessSpec, resources: ExitStack) -> BinaryIO | int:
         if spec.input_bytes is None:
             return subprocess.DEVNULL
@@ -127,14 +139,19 @@ class ProcessSupervisor:
         spec: ProcessSpec,
         stdin_stream: BinaryIO | int,
         stdout_stream: BinaryIO | int | None,
+        stderr_stream: BinaryIO | None,
     ) -> subprocess.Popen[bytes]:
+        if stderr_stream is not None:
+            stderr: BinaryIO | int | None = stderr_stream
+        else:
+            stderr = subprocess.STDOUT if stdout_stream is not None else None
         return subprocess.Popen(
             [str(argument) for argument in spec.argv],
             cwd=spec.cwd,
             env=dict(spec.env) if spec.env is not None else None,
             stdin=stdin_stream,
             stdout=stdout_stream,
-            stderr=subprocess.STDOUT if stdout_stream is not None else None,
+            stderr=stderr,
             start_new_session=True,
             close_fds=True,
         )
