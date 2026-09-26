@@ -443,3 +443,16 @@ def test_validation_enumerates_each_structure_once(monkeypatch):
         for threshold in (8, 16)
         for trace in ("a.jsonl", "b.jsonl", "c.jsonl")
     }
+
+
+@pytest.mark.needs_binary
+def test_emit_backends_reads_the_real_binary(tmp_path):
+    """The binary logs its cost tree to stderr while stdout carries the JSON; the
+    launcher must parse stdout alone."""
+    from launcher.__main__ import main as launcher_main
+    from launcher.exec import REPO_ROOT
+
+    skeleton = tmp_path / "backends.yaml"
+    preset = REPO_ROOT / "presets" / "unified_smoke.yaml"
+    assert launcher_main(["--emit-backends", str(skeleton), str(preset)]) == 0
+    assert "main/unified.pre_attn.qkv_proj" in skeleton.read_text()

@@ -47,6 +47,25 @@ def test_capture_uses_root_process_completion(tmp_path: Path) -> None:
     assert "stderr" in result.output
 
 
+_BOTH_STREAMS = "import sys; print('[1, 2]'); print('[00:01.000] INFO log', file=sys.stderr)"
+
+
+@pytest.mark.parametrize("synchronous", [True, False])
+def test_separate_stderr_keeps_output_parseable(tmp_path: Path, synchronous: bool) -> None:
+    spec = _spec([_BOTH_STREAMS], tmp_path, capture_output=True, separate_stderr=True)
+    supervisor = ProcessSupervisor()
+    result = supervisor.run_sync(spec) if synchronous else asyncio.run(supervisor.run(spec))
+
+    assert result.succeeded
+    assert json.loads(result.output) == [1, 2]
+    assert result.stderr.strip() == "[00:01.000] INFO log"
+
+
+def test_separate_stderr_requires_capture(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="separate_stderr requires capture_output"):
+        _spec(["pass"], tmp_path, separate_stderr=True)
+
+
 def test_root_exit_with_inherited_output_descriptor_cleans_descendant(tmp_path: Path) -> None:
     started = time.monotonic()
     code = (
@@ -345,3 +364,19 @@ def test_build_error_identifies_stage_and_cleanup_failure(stage, capsys) -> None
     assert "exit_code=0" in error
     assert "process_group_id=123" in error
     assert "tool diagnostic" in error
+
+
+def test_build_error_reports_separated_stderr(capsys) -> None:
+    from launcher.exec import _report_build_failure
+    from launcher.process import ProcessResult
+
+    result = ProcessResult(
+        argv=("tool",),
+        pid=123,
+        process_group_id=123,
+        exit_code=1,
+        elapsed_seconds=1,
+        stderr="tool diagnostic",
+    )
+    _report_build_failure("schema discovery", result)
+    assert "tool diagnostic" in capsys.readouterr().err

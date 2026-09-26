@@ -498,21 +498,27 @@ def _run_timing_predict(args: argparse.Namespace) -> int:
     if args.dry_run:
         # The same inputs, built where nothing reads them and removed afterwards.
         with tempfile.TemporaryDirectory(prefix="alignment-timing-predict-") as scratch:
-            predict_config = _build_timing_predict_inputs(config, Path(scratch))
+            predict_config = _build_timing_predict_inputs(
+                config, Path(scratch), build_type=args.build_type
+            )
             print(f"[alignment] timing-predict dry run: {args.config}")
             return _launch_timing_predict(predict_config, build_type=args.build_type, dry_run=True)
     write_artifact_kind(config.log_dir.parent, ArtifactKind.ALIGNMENT_BUNDLE)
-    predict_config = _build_timing_predict_inputs(config, config.log_dir)
+    predict_config = _build_timing_predict_inputs(
+        config, config.log_dir, build_type=args.build_type
+    )
     _snapshot_config(args.config, config.log_dir, "timing_predict")
     print(f"[alignment] timing-predict: {predict_config}")
     return _launch_timing_predict(predict_config, build_type=args.build_type)
 
 
-def _build_timing_predict_inputs(config: TimingPredictPhaseConfig, output_dir: Path) -> Path:
+def _build_timing_predict_inputs(
+    config: TimingPredictPhaseConfig, output_dir: Path, *, build_type: str
+) -> Path:
     """Write the measured cases and predictor config under `output_dir`; return the config."""
     # Read the sim *preset* (not a completed run): timing-predict is kernel-only,
     # so it needs the gpu / arch / backends but never a finished simulation.
-    preset = _normalize_simulation_preset(config.simulation_preset, build_type=args.build_type)
+    preset = _normalize_simulation_preset(config.simulation_preset, build_type=build_type)
     gpu, arch = _simulation_target(preset)
     profile_result = _load_profile_result(config.profile_log_dir)
     # No profile/simulation parallelism pre-check here: every arch spells its
