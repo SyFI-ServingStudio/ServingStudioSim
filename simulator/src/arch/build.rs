@@ -1783,6 +1783,116 @@ pub fn build_ffn_model(
     })
 }
 
+/// One `#[supported]` combination of an iter-wise arch, built structure-only.
+#[derive(Debug, serde::Serialize)]
+pub struct SupportedBuild {
+    pub arch: &'static str,
+    /// The row's GPU (the group's `gpu`, the profile.db key).
+    pub gpu: String,
+    /// The row's arch params (`model_config` a `model/config/` stem). Params the
+    /// row leaves out took their schema defaults.
+    pub params: serde_json::Map<String, serde_json::Value>,
+    pub gpus_per_replica: Option<u16>,
+    /// The cost tree, in the `cost_manifest/*.json` form; `None` on error.
+    pub cost_manifest: Option<crate::timing::CostManifestDoc>,
+    pub error: Option<String>,
+}
+
+/// Build every `#[supported]` combination of every iter-wise arch on its row's
+/// GPU, structure only ([`PerfApiBridge::structure_only`]: no Python, `profile.db` or
+/// GPU). A combination that fails to parse or build (including a panicking
+/// shape assertion) is returned with its error, not raised.
+pub fn build_supported_iter_archs() -> Vec<SupportedBuild> {
+    use serde_json::{Map, Value};
+
+    let schema = crate::schema::list_params();
+    let common = schema["arch_common"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    for (tag, rows) in IterArchSel::SUPPORTED {
+        let own = schema["providers"]["arch"]["iter_wise"][*tag]["params"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        for row in *rows {
+            for combo in row.combinations() {
+                let mut arch = Map::new();
+                arch.insert("type".into(), (*tag).into());
+                for param in common.iter().chain(&own) {
+                    if let Some(default) = param.get("default") {
+                        arch.insert(
+                            param["name"].as_str().unwrap_or_default().into(),
+                            default.clone(),
+                        );
+                    }
+                }
+                let mut gpu = String::new();
+                let mut params = Map::new();
+                for (name, value) in &combo {
+                    if *name == "gpu" {
+                        gpu = value.as_str().unwrap_or_default().to_string();
+                        continue;
+                    }
+                    params.insert((*name).into(), value.clone());
+                    let value = match (*name, value) {
+                        ("model_config", Value::String(model)) => {
+                            Path::new(env!("CARGO_MANIFEST_DIR"))
+                                .join(format!("model/config/{model}.json"))
+                                .to_string_lossy()
+                                .into_owned()
+                                .into()
+                        }
+                        _ => value.clone(),
+                    };
+                    arch.insert((*name).into(), value);
+                }
+                let mut build = SupportedBuild {
+                    arch: tag,
+                    gpu,
+                    params,
+                    gpus_per_replica: None,
+                    cost_manifest: None,
+                    error: None,
+                };
+                let selector: IterArchSel = match serde_json::from_value(Value::Object(arch)) {
+                    Ok(selector) => selector,
+                    Err(e) => {
+                        build.error = Some(format!("config: {e}"));
+                        out.push(build);
+                        continue;
+                    }
+                };
+                let bridge = PerfApiBridge::structure_only();
+                let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    build_iter_model(&selector, &build.gpu, tag, &bridge)
+                }));
+                match built {
+                    Ok(Ok(model)) => {
+                        build.gpus_per_replica = Some(model.gpus_per_replica());
+                        build.cost_manifest = Some(crate::timing::CostManifestDoc::single(
+                            "iter",
+                            model.cost_log_manifest(),
+                        ));
+                    }
+                    Ok(Err(e)) => build.error = Some(format!("{e:#}")),
+                    Err(panic) => {
+                        let message = panic
+                            .downcast_ref::<String>()
+                            .cloned()
+                            .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
+                            .unwrap_or_else(|| "build panicked".into());
+                        build.error = Some(format!("build panicked: {message}"));
+                    }
+                }
+                out.push(build);
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Write;
@@ -2533,5 +2643,33 @@ mod tests {
         // 6 layers * 8 KV heads * 128 * 2 (K and V) * 1 byte, summed over the
         // four attention ranks the heads are sharded across.
         assert_eq!(narrow_bytes, 6 * 8 * 128 * 2);
+    }
+
+    /// Every `#[supported]` combination of an iter-wise arch builds its cost
+    /// tree, so a row cannot claim a deployment the arch cannot build.
+    #[test]
+    fn every_supported_iter_arch_deployment_builds_its_cost_tree() {
+        let builds = build_supported_iter_archs();
+        let failures: Vec<String> = builds
+            .iter()
+            .filter_map(|b| {
+                b.error
+                    .as_ref()
+                    .map(|e| format!("{} {:?}: {e}", b.arch, b.params))
+            })
+            .collect();
+        assert!(
+            failures.is_empty(),
+            "unbuildable #[supported] rows:\n{}",
+            failures.join("\n")
+        );
+        for b in &builds {
+            let doc = b.cost_manifest.as_ref().unwrap();
+            assert!(
+                !doc.sections[0].manifest.slots.is_empty(),
+                "{}: empty cost tree",
+                b.arch
+            );
+        }
     }
 }

@@ -4,6 +4,8 @@
 
 pub mod dump;
 pub mod param_def;
+pub mod supported;
 
 pub use dump::list_params;
 pub use param_def::{DefaultValue, ParamDef, ParamType};
+pub use supported::{SupportedRow, SupportedValues};

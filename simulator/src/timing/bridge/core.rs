@@ -127,6 +127,18 @@ impl PerfApiBridge {
         Ok(bridge)
     }
 
+    /// A bridge that can only build structure: enumerate mode, and no Python
+    /// perf_api at all, so nothing can reach `profile.db` or a GPU. For
+    /// commands that need a model's cost tree and nothing measured.
+    pub fn structure_only() -> Self {
+        Self {
+            dry_run: RefCell::new(None),
+            backend_overrides: RefCell::new(None),
+            active_pool: RefCell::new(None),
+            enumerate: RefCell::new(Some(Vec::new())),
+        }
+    }
+
     /// Switch the bridge into dry-run mode: subsequent `Kernel::build` calls only
     /// `count_missing` (no cache fit) and accumulate one [`KernelMissing`] per
     /// kernel. Drain the result with [`take_dry_run_report`](Self::take_dry_run_report).

@@ -7,6 +7,7 @@
 //!   - `dry-run <config>`          — report missing profile.db rows, no sim
 //!   - `emit-backends <config>`    — enumerate distinct kernels (JSON), no sim
 //!   - `list-params`               — emit the param-schema registry JSON
+//!   - `supported-cost-trees`      — each arch's `#[supported]` cost trees, no sim
 //!
 //! All three run-like subcommands share one parse (`load_config`) → `RunConfig`
 //! (a serde enum tagged by `deployment`) → `deployment::build_flow` dispatch.
@@ -70,6 +71,10 @@ enum Cmd {
     /// kernel by `{kind, config, query_points}`; writes the interpolated
     /// best-of-N metrics per point + the fitted grid axes on stdout.
     KernelQuery,
+    /// Build every `#[supported]` combination of every iter-wise arch and print
+    /// each one's cost tree (the `cost_manifest` form) as JSON. Structure only:
+    /// no config file, Python perf_api, profile.db or GPU.
+    SupportedCostTrees,
     /// Predict per-building-block timing offline for a batch of explicit batch
     /// shapes — NO sim/scheduler/trace. Reads a minimal config (one arch selector
     /// `{iter|attn|ffn}` + gpu + a cases_file) and writes the standard
@@ -174,6 +179,11 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::KernelQuery => simulator::introspect::run_kernel_query(),
+        Cmd::SupportedCostTrees => {
+            let builds = simulator::arch::build::build_supported_iter_archs();
+            println!("{}", serde_json::to_string(&builds)?);
+            Ok(())
+        }
         Cmd::TimingPredict(args) => simulator::timing_predict::run_timing_predict(
             &args.config,
             if args.dry_run {
