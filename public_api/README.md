@@ -30,6 +30,8 @@ All `GET`, under `/api/public/v1`.
 | `/kernels` | Catalog: every registered kind with its docs summary, backends, precisions, row coverage per GPU/backend/precision, and the models that run it; plus categories, GPUs with spec-sheet peaks, and models |
 | `/kernels/{kind}` | One kind: docs, measuring method, arguments with role (swept or fixed by the model) and unit, backends, torch reference, and each supported deployment with the shapes its cost tree asks for |
 | `/kernels/{kind}/rows` | Measured rows, column-oriented with a shared provenance table. Any query parameter filters a column by equality (`gpu`, `backend` or an argument); `format=csv` returns CSV |
+| `/kernels/{kind}/configs` | The kernel configs registered as reading the kind's rows (profile.db's kernel-config registry), one per config and GPU: identity, cache coordinates and grid shape, cells measured per backend, and the presets or predict configs that use it |
+| `/kernels/{kind}/configs/{config_hash}` | One config's grid on the simulator's cache axes: each cell's coordinates, profile.db args, whether the kernel can run it, and each backend's measured metrics there. `gpu` is required only when the config is registered on more than one GPU |
 
 ## Sources
 
@@ -43,4 +45,7 @@ All `GET`, under `/api/public/v1`.
   supported-cost-trees`, `simulator kernel-list` and `simulator kernel-query` (op
   `rows`), cached until the binary changes (`public_api/kernel/sources.py`);
 - GPU peaks: `gpu/spec.json`;
-- measurements: `profile.db`, aggregates cached until the file changes.
+- measurements: `profile.db`, aggregates cached until the file changes;
+- which configs read which rows: the kernel-config registry in `profile.db`
+  (`profiling/db/kernel_config.py`), filled by the launcher when a run or
+  prediction builds its kernel cache.

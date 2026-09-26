@@ -13,8 +13,13 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+from profiling.db import kernel_config
+from profiling.db.args import DType
 from profiling.db.doc import CUPTI_METHOD, KernelDoc, arg_docs
+from profiling.db.registry import iter_kernel_profiler_specs
+from profiling.db.table import ProfileRow, Table
 from profiling.kernels.single_gemm import SingleGemmArgs
+from profiling.runners.metrics import ComputeMetrics
 from public_api.app import PREFIX, create_app
 from public_api.kernel import library
 from public_api.kernel.library import PROVENANCE, KernelLibrary
@@ -195,8 +200,111 @@ def test_bad_requests(client: TestClient, path: str, params: dict, status: int) 
 
 def test_the_database_is_never_written(client: TestClient, db: Path) -> None:
     before = (hashlib.sha256(db.read_bytes()).hexdigest(), db.stat().st_mtime_ns)
-    for path in ("/kernels", "/kernels/single_gemm", "/kernels/single_gemm/rows"):
+    for path in (
+        "/kernels",
+        "/kernels/single_gemm",
+        "/kernels/single_gemm/rows",
+        "/kernels/single_gemm/configs",
+    ):
         assert client.get(f"{PREFIX}{path}").status_code == 200
     assert (hashlib.sha256(db.read_bytes()).hexdigest(), db.stat().st_mtime_ns) == before
     with FixtureSources(db_path=db).connect() as conn, pytest.raises(sqlite3.OperationalError):
         conn.execute("delete from single_gemm")
+
+
+def _registered_db(path: Path) -> str:
+    """A profile.db with torch rows at m=1 and m=2 of one n=6144 config, and that
+    config registered on a grid of m = 1, 2, 16 whose last cell cannot run.
+    Returns the config's hash."""
+
+    table = Table(next(iter_kernel_profiler_specs("single_gemm")), path)
+    table.insert(
+        [
+            ProfileRow(
+                args=SingleGemmArgs(m=m, n=6144, k=4096, dtype=DType.BF16),
+                metrics=ComputeMetrics(
+                    time_ms=0.01 * m, tflops=float(m), memory_bandwidth_gbps=1.0
+                ),
+                gpu_name="NVIDIA H200",
+                backend="torch",
+                profiler_git_hash="abc",
+                profiler_run_at="2026-09-26T00:00:00+00:00",
+            )
+            for m in (1, 2)
+        ]
+    )
+    identity = {"n": 6144, "k": 4096, "dtype": "bf16"}
+    record = {
+        "kind": "single_gemm",
+        "profile_kind": "single_gemm",
+        "gpu_name": "NVIDIA H200",
+        "identity": identity,
+        "grid": {
+            "cache_coords": ["m"],
+            "axes": [[1.0, 2.0, 16.0]],
+            "cells": [{"m": m, **identity} for m in (1, 2, 16)],
+            "infeasible": [2],
+        },
+        "uses": [{"pool": "main", "role": "unified.qkv"}],
+    }
+    source = {"timing_predict": "presets/predict_x.json", "gpu": "NVIDIA H200", "arch": {}}
+    kernel_config.register_kernel_configs(
+        path,
+        {"schema_version": kernel_config.RECORDS_SCHEMA_VERSION, "configs": [record]},
+        {"main": source},
+    )
+    return kernel_config.content_hash(identity)
+
+
+@pytest.fixture
+def registered(tmp_path: Path) -> tuple[TestClient, str, Path]:
+    path = tmp_path / "registered.db"
+    config_hash = _registered_db(path)
+    client = TestClient(create_app(KernelLibrary(FixtureSources(db_path=path))))
+    return client, config_hash, path
+
+
+def test_configs_list_what_each_backend_measured(registered) -> None:
+    client, config_hash, _ = registered
+    [config] = client.get(f"{PREFIX}/kernels/single_gemm/configs").json()["configs"]
+    assert config["config_hash"] == config_hash
+    assert config["gpu"] == "NVIDIA H200"
+    assert config["identity"] == {"n": 6144, "k": 4096, "dtype": "bf16"}
+    assert (config["cache_coords"], config["shape"], config["cells"]) == (["m"], [3], 3)
+    assert (config["infeasible"], config["measured"]) == (1, {"torch": 2})
+    assert config["uses"] == [
+        {
+            "source": {
+                "timing_predict": "presets/predict_x.json",
+                "gpu": "NVIDIA H200",
+                "arch": {},
+            },
+            "pool": "main",
+            "role": "unified.qkv",
+        }
+    ]
+
+
+def test_config_joins_grid_cells_to_rows(registered) -> None:
+    client, config_hash, path = registered
+    before = (hashlib.sha256(path.read_bytes()).hexdigest(), path.stat().st_mtime_ns)
+
+    config = client.get(f"{PREFIX}/kernels/single_gemm/configs/{config_hash}").json()
+
+    assert config["axes"] == [[1.0, 2.0, 16.0]]
+    points = config["points"]
+    assert [p["coords"] for p in points] == [[1.0], [2.0], [16.0]]
+    assert [p["feasible"] for p in points] == [True, True, False]
+    assert points[1]["args"] == {"m": 2, "n": 6144, "k": 4096, "dtype": "bf16"}
+    assert points[1]["measured"]["torch"]["tflops"] == 2.0
+    assert points[1]["measured"]["torch"]["outlier"] is False
+    assert points[2]["measured"] == {}
+    assert (hashlib.sha256(path.read_bytes()).hexdigest(), path.stat().st_mtime_ns) == before
+
+
+def test_config_lookup_errors(registered) -> None:
+    client, config_hash, _ = registered
+    base = f"{PREFIX}/kernels/single_gemm/configs"
+    assert client.get(f"{base}/no_such_hash").status_code == 404
+    assert client.get(f"{base}/{config_hash}", params={"gpu": "NVIDIA B200"}).status_code == 404
+    assert client.get(f"{PREFIX}/kernels/no_such_kind/configs").status_code == 404

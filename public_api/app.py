@@ -6,7 +6,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import PlainTextResponse
 
-from public_api.kernel.library import BadQuery, KernelLibrary, UnknownKind
+from public_api.kernel.library import BadQuery, KernelLibrary, UnknownConfig, UnknownKind
 
 PREFIX = "/api/public/v1"
 
@@ -24,6 +24,8 @@ def create_app(kernels: KernelLibrary) -> FastAPI:
             return await run_in_threadpool(build, *args)
         except UnknownKind as error:
             raise HTTPException(404, f"unknown kernel kind {error.args[0]!r}") from None
+        except UnknownConfig as error:
+            raise HTTPException(404, f"unknown kernel config {error.args[0]!r}") from None
         except BadQuery as error:
             raise HTTPException(400, str(error)) from None
 
@@ -56,5 +58,16 @@ def create_app(kernels: KernelLibrary) -> FastAPI:
                 headers={"Content-Disposition": f'attachment; filename="{kind}.csv"'},
             )
         return document
+
+    @app.get(f"{PREFIX}/kernels/{{kind}}/configs")
+    async def configs(kind: str) -> dict:
+        return await answer(kernels.configs, kind)
+
+    @app.get(f"{PREFIX}/kernels/{{kind}}/configs/{{config_hash}}")
+    async def config(kind: str, config_hash: str, gpu: str | None = None) -> dict:
+        """One config's grid on the simulator's cache axes, joined to the rows.
+        ``gpu`` is needed only when the config is registered on more than one."""
+
+        return await answer(kernels.config, kind, config_hash, gpu)
 
     return app

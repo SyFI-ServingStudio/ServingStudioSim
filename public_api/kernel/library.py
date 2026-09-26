@@ -13,7 +13,8 @@ Every field comes from a source that lives with the code; nothing here guesses:
   cost tree leaves;
 - a row's precision, from the column the Rust kernel names as its compute dtype;
 - GPU peaks from ``gpu/spec.json`` and model names from ``model/catalog.yaml``;
-- measurements from profile.db.
+- measurements from profile.db, and the kernel configs that read them from its
+  kernel-config registry (``profiling/db/kernel_config.py``).
 """
 
 from __future__ import annotations
@@ -31,8 +32,9 @@ import yaml
 from profiling.db.args import DType
 from profiling.db.doc import CATEGORIES, SUBCATEGORIES, arg_docs, kernel_doc
 from profiling.db.doc import METRICS as METRIC_DOCS
+from profiling.db.kernel_config import RegisteredConfig, cell_row_ids, registered_configs
 from profiling.db.registry import MetricFamily, iter_kernel_profiler_specs
-from profiling.db.table import STANDARD_COLUMNS
+from profiling.db.table import STANDARD_COLUMNS, Table
 from profiling.gpu_catalog import GpuSpecResolution, resolve_gpu_spec
 from profiling.runners.metrics import CommMetrics, ComputeMetrics
 from public_api.kernel.sources import KernelSources
@@ -51,6 +53,10 @@ METRICS = {
 
 class UnknownKind(LookupError):
     """No registered kernel kind has this name."""
+
+
+class UnknownConfig(LookupError):
+    """No registered kernel config of this kind has this hash."""
 
 
 class BadQuery(ValueError):
@@ -384,6 +390,112 @@ class KernelLibrary:
             "columns": ["gpu", "backend", *args, *metrics, "provenance"],
             "rows": rows,
             "provenance": provenance,
+        }
+
+    def _registered(self, kind: str, gpu: str | None = None) -> list[RegisteredConfig]:
+        """The registered configs whose grids read ``kind``'s rows (every backend's
+        table, though a kind's specs share one)."""
+
+        tables = dict.fromkeys(spec.table_name for spec in self._specs(kind))
+        with self.sources.connect() as conn:
+            return [
+                config
+                for table in tables
+                for config in registered_configs(conn, table, gpu_name=gpu)
+            ]
+
+    def _cell_rows(self, kind: str, config: RegisteredConfig) -> list[dict[str, dict]]:
+        """Per cell, the row each backend measured for it: ``{backend: row}``."""
+
+        spec = next(s for s in self._specs(kind) if s.table_name == config.profile_kind)
+        columns = ["id", "backend", *self._metrics(kind), "is_outlier"]
+        with self.sources.connect() as conn:
+            ids = cell_row_ids(
+                conn, Table(spec, self.sources.db_path), config.gpu_name, config.grid.cells
+            )
+            wanted = sorted({i for cell in ids for i in cell})
+            rows = {}
+            for start in range(0, len(wanted), 500):
+                chunk = wanted[start : start + 500]
+                query = (
+                    f'select {_quoted(columns)} from "{config.profile_kind}" '
+                    f"where id in ({', '.join('?' * len(chunk))})"
+                )
+                for record in conn.execute(query, chunk):
+                    rows[record[0]] = dict(zip(columns[1:], record[1:]))
+        return [{rows[i]["backend"]: rows[i] for i in cell} for cell in ids]
+
+    def configs(self, kind: str) -> dict:
+        """The kernel configs registered as reading ``kind``'s rows: one per
+        config and GPU, with how many of its grid cells each backend measured and
+        the deployments or predictions that use it."""
+
+        def compute() -> dict:
+            out = []
+            for config in self._registered(kind):
+                measured: dict[str, int] = {}
+                for cell in self._cell_rows(kind, config):
+                    for backend in cell:
+                        measured[backend] = measured.get(backend, 0) + 1
+                out.append(
+                    {
+                        "config_hash": config.config_hash,
+                        "kind": config.kind,
+                        "gpu": config.gpu_name,
+                        "identity": config.identity,
+                        "cache_coords": list(config.grid.cache_coords),
+                        "shape": [len(axis) for axis in config.grid.axes],
+                        "cells": len(config.grid.cells),
+                        "infeasible": len(config.grid.infeasible),
+                        "measured": measured,
+                        "uses": [asdict(use) for use in config.uses],
+                    }
+                )
+            return {"kind": kind, "configs": out}
+
+        return self.sources.cached_by_db(("configs", kind), compute)
+
+    def config(self, kind: str, config_hash: str, gpu: str | None) -> dict:
+        """One registered config's grid on the Rust cache axes: every cell's
+        coordinates, its profile.db args, whether the kernel can run it, and the
+        metrics each backend measured there (absent where nothing was)."""
+
+        matches = [c for c in self._registered(kind, gpu) if c.config_hash == config_hash]
+        if not matches:
+            raise UnknownConfig(config_hash)
+        if len(matches) > 1:
+            gpus = sorted(c.gpu_name for c in matches)
+            raise BadQuery(f"config {config_hash} is registered on {gpus}; pass gpu")
+        [config] = matches
+        grid = config.grid
+        metrics = self._metrics(kind)
+        points = [
+            {
+                "coords": list(grid.coords(i)),
+                "feasible": i not in grid.infeasible,
+                "args": cell,
+                "measured": {
+                    backend: {
+                        **{m: row[m] for m in metrics},
+                        "outlier": bool(row["is_outlier"]),
+                    }
+                    for backend, row in measured.items()
+                },
+            }
+            for i, (cell, measured) in enumerate(
+                zip(grid.cells, self._cell_rows(kind, config), strict=True)
+            )
+        ]
+        return {
+            "config_hash": config.config_hash,
+            "kind": config.kind,
+            "gpu": config.gpu_name,
+            "identity": config.identity,
+            "cache_coords": list(grid.cache_coords),
+            "axes": [list(axis) for axis in grid.axes],
+            "metrics": metrics,
+            "points": points,
+            "uses": [asdict(use) for use in config.uses],
         }
 
     @staticmethod
