@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import copy
+import json
 import sqlite3
+import zlib
+from contextlib import closing, nullcontext
 from pathlib import Path
 
 import pytest
@@ -288,3 +291,70 @@ def test_a_bool_arg_matches_the_text_the_table_stores(tmp_path: Path) -> None:
     with _read(db) as conn:
         assert conn.execute("SELECT is_neox_style FROM vllm_mla_rope").fetchone() == ("0",)
         assert [len(ids) for ids in kc.cell_row_ids(conn, table, GPU, [cell])] == [1]
+
+
+def test_cells_compare_decoded_not_by_their_compressed_bytes(tmp_path: Path) -> None:
+    """Another zlib build may compress the same cells to other bytes."""
+    db = tmp_path / "profile.db"
+    document = _document(_gemm_record(6144, [1, 2, 4]))
+    kc.register_kernel_configs(db, document, {"main": SOURCE})
+    with closing(sqlite3.connect(db)) as conn, conn:
+        [blob] = conn.execute(f"SELECT cells FROM {kc.CONFIG_TABLE}").fetchone()
+        recompressed = zlib.compress(zlib.decompress(blob), 1)
+        assert recompressed != blob
+        conn.execute(f"UPDATE {kc.CONFIG_TABLE} SET cells = ?", (recompressed,))
+
+    report = kc.register_kernel_configs(db, document, {"main": SOURCE})
+
+    assert not report.written
+
+
+def test_supported_deployments_register_with_their_row_as_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from launcher import kernel_configs
+    from launcher.process import ProcessResult
+
+    db = tmp_path / "profile.db"
+    _measure(db, 6144, [1])
+    build = {
+        "arch": "llama3_dense_tp",
+        "gpu": GPU,
+        "params": {"model_config": "llama3_8b", "tp_size": 1},
+        "error": None,
+        "kernel_configs": _document(
+            {
+                **_gemm_record(6144, [1, 2]),
+                "uses": [{"pool": "", "role": "llama3_dense_tp.attn_block.qkv_proj"}],
+            }
+        ),
+    }
+    ran = []
+
+    class Supervisor:
+        def run_sync(self, spec):
+            ran.append(list(spec.argv[1:]))
+            return ProcessResult(tuple(spec.argv), 1, 1, 0, 0.0, output=json.dumps([build]))
+
+    class Leases:
+        def profile_database(self, write):
+            return nullcontext()
+
+    monkeypatch.setattr(kernel_configs, "_PROCESS_SUPERVISOR", Supervisor())
+    monkeypatch.setattr(kernel_configs, "_LAUNCHER_LEASES", Leases())
+    monkeypatch.setattr(kernel_configs, "DB_PATH", db)
+
+    assert kernel_configs.register_supported_configs("release") == 0
+
+    assert ran == [["supported-cost-trees", "--kernel-configs"]]
+    with _read(db) as conn:
+        [config] = kc.registered_configs(conn, "single_gemm")
+    [use] = config.uses
+    assert use.source == {
+        "supported": {
+            "arch": "llama3_dense_tp",
+            "gpu": GPU,
+            "params": {"model_config": "llama3_8b", "tp_size": 1},
+        }
+    }
+    assert (use.pool, use.role) == ("", "llama3_dense_tp.attn_block.qkv_proj")

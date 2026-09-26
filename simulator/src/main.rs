@@ -81,7 +81,7 @@ enum Cmd {
     /// Build every `#[supported]` combination of every iter-wise arch and print
     /// each one's cost tree (the `cost_manifest` form) as JSON. Structure only:
     /// no config file, Python perf_api, profile.db or GPU.
-    SupportedCostTrees,
+    SupportedCostTrees(SupportedArgs),
     /// Predict per-building-block timing offline for a batch of explicit batch
     /// shapes — NO sim/scheduler/trace. Reads a minimal config (one arch selector
     /// `{iter|attn|ffn}` + gpu + a cases_file) and writes the standard
@@ -104,6 +104,16 @@ struct PredictArgs {
     /// See [`CacheArgs::kernel_configs_out`].
     #[arg(long, value_name = "FILE")]
     kernel_configs_out: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct SupportedArgs {
+    /// Also give each build's kernel configs (with the grid of args each one
+    /// reads) under `kernel_configs`, as the document `--kernel-configs-out`
+    /// writes. The launcher registers them in profile.db's kernel-config
+    /// registry.
+    #[arg(long)]
+    kernel_configs: bool,
 }
 
 /// `build-cache-only` / `dry-run`: a run config, and where to write the kernel
@@ -205,8 +215,8 @@ fn main() -> anyhow::Result<()> {
         }
         Cmd::KernelQuery => simulator::introspect::run_kernel_query(),
         Cmd::KernelList => simulator::introspect::run_kernel_list(),
-        Cmd::SupportedCostTrees => {
-            let builds = simulator::arch::build::build_supported_iter_archs();
+        Cmd::SupportedCostTrees(args) => {
+            let builds = simulator::arch::build::build_supported_iter_archs(args.kernel_configs);
             println!("{}", serde_json::to_string(&builds)?);
             Ok(())
         }

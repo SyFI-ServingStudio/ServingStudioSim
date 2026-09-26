@@ -672,6 +672,7 @@ python -m launcher <preset.yaml|json> [<preset2.yaml|json> ...]
                    [--dry-run] [--cache-report] [--register-kernel-configs] [--refresh]
                    [--build-type <cargo-profile>] [--profile [--profile-freq HZ]]
                    [--no-analyze] [--no-plot] [--emit-backends [FILE]]
+python -m launcher --register-supported-kernel-configs [--build-type <cargo-profile>]
 python -m launcher timing-predict <config.yaml|json> [<config2.yaml|json> ...]
                    [--build-type <cargo-profile>] [--no-analyze]
                    [--dry-run | --register-kernel-configs]
@@ -699,7 +700,10 @@ python -m launcher migrate-artifact-kinds (--check|--apply) [--registry PATH]
 - `--register-kernel-configs` registers the kernel configs each unique cache key
   asks profile.db for, with their grids, in the kernel-config registry, then
   exits. It runs the binary's `dry-run` (no GPU); `timing-predict
-  --register-kernel-configs` does the same for predict configs.
+  --register-kernel-configs` does the same for predict configs, and
+  `--register-supported-kernel-configs` for every `#[supported]` arch deployment
+  (`simulator supported-cost-trees --kernel-configs`), recorded with its
+  `#[supported]` row as the source.
 - `--emit-backends [FILE]` enumerates the distinct kernels (structural, no GPU) and
   writes the annotated `backends:` skeleton (stdout, or `FILE`), then exits — the
   starting point for a `backends_file` (see the `backends` section above).

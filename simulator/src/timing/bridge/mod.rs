@@ -5,7 +5,7 @@ pub mod error;
 pub mod payload;
 
 pub use core::{
-    write_config_records, BackendOverrideGuard, ConfigGrid, ConfigUse, KernelConfigRecord,
+    config_records_document, write_config_records, BackendOverrideGuard, ConfigGrid, ConfigUse, KernelConfigRecord,
     KernelEnum, KernelMissing, PerfApiBridge, CONFIG_RECORDS_SCHEMA_VERSION,
 };
 pub use error::{BuildError, PerfApiError};

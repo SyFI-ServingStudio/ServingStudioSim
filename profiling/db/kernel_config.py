@@ -13,8 +13,10 @@ them between databases the way it merges kind tables:
 - ``_kernel_config``: one config's grid on one GPU. ``identity`` is the Rust
   ``KernelConfig::identity`` (no ``gpu_name`` or ``backends``; those are row
   columns). ``cells`` holds, row-major over ``grid_axes``, the args of each grid
-  cell without ``backend``, stored by column (:func:`pack_cells`). The grid is
-  stored rather than recomputed because a corpus-routed MoE config names a
+  cell without ``backend``, stored by column (:func:`pack_cells`) as
+  zlib-compressed JSON: list-valued args (per-rank batches, row positions) make
+  a grid's cells the registry's bulk, and they compress about tenfold. The grid
+  is stored rather than recomputed because a corpus-routed MoE config names a
   payload file its reader may not have.
 - ``_kernel_config_source``: what built configs, as the launcher describes it
   (preset or timing-predict config, pool, GPU and arch block).
@@ -30,6 +32,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import zlib
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
@@ -66,7 +69,7 @@ _SCHEMA = (
         identity TEXT NOT NULL,
         cache_coords TEXT NOT NULL,
         grid_axes TEXT NOT NULL,
-        cells TEXT NOT NULL,
+        cells BLOB NOT NULL,
         infeasible TEXT NOT NULL,
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         UNIQUE(kind, config_hash, gpu_name)
@@ -287,7 +290,7 @@ def registered_configs(
             grid=ConfigGrid(
                 cache_coords=tuple(json.loads(cache_coords)),
                 axes=tuple(tuple(axis) for axis in json.loads(grid_axes)),
-                cells=tuple(unpack_cells(json.loads(cells))),
+                cells=tuple(_decode_cells(cells)),
                 infeasible=frozenset(json.loads(infeasible)),
             ),
             uses=tuple(uses.get((kind, config_hash, gpu), ())),
@@ -323,6 +326,14 @@ def pack_cells(cells: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         else:
             swept[column] = values
     return {"count": len(cells), "fixed": fixed, "swept": swept}
+
+
+def _encode_cells(cells: Sequence[Mapping[str, Any]]) -> bytes:
+    return zlib.compress(json.dumps(pack_cells(cells), separators=(",", ":")).encode(), 9)
+
+
+def _decode_cells(blob: bytes) -> list[dict[str, Any]]:
+    return unpack_cells(json.loads(zlib.decompress(blob)))
 
 
 def unpack_cells(packed: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -432,12 +443,25 @@ class _Record:
     def key(self) -> tuple[str, str, str]:
         return (self.kind, self.config_hash, self.gpu_name)
 
-    def grid_columns(self) -> tuple[str, str, str, str]:
+    def grid_columns(self) -> tuple[str, str, bytes, str]:
         return (
             json.dumps(self.cache_coords, separators=(",", ":")),
             json.dumps(self.axes, separators=(",", ":")),
-            json.dumps(pack_cells(self.cells), separators=(",", ":")),
+            _encode_cells(self.cells),
             json.dumps(self.infeasible, separators=(",", ":")),
+        )
+
+    def same_grid(self, stored: Sequence[Any]) -> bool:
+        """Whether a stored ``(profile_kind, cache_coords, grid_axes, cells,
+        infeasible)`` row is this record's grid. Cells compare decoded, so a
+        different zlib build's bytes do not count as a new grid."""
+        profile_kind, cache_coords, axes, cells, infeasible = stored
+        return (
+            profile_kind == self.profile_kind
+            and json.loads(cache_coords) == self.cache_coords
+            and json.loads(axes) == self.axes
+            and json.loads(infeasible) == self.infeasible
+            and _decode_cells(cells) == self.cells
         )
 
     def config_row(self) -> tuple[Any, ...]:
@@ -484,7 +508,7 @@ def _plan(
         )
         if stored is None:
             plan.new_configs.append(record)
-        elif tuple(stored) != (record.profile_kind, *record.grid_columns()):
+        elif not record.same_grid(stored):
             plan.regridded.append(record)
         for use in record.uses:
             source_hash = source_rows[use["pool"]][0]

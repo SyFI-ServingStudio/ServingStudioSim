@@ -97,21 +97,26 @@ pub struct ConfigUse {
     pub role: String,
 }
 
-/// Version of the document [`write_config_records`] writes.
+/// Version of the document [`config_records_document`] builds.
 pub const CONFIG_RECORDS_SCHEMA_VERSION: u32 = 1;
 
-/// Write `records` as the JSON document the launcher registers into
-/// profile.db's kernel-config registry (`profiling/db/kernel_config.py`).
+/// `records` as the JSON document the launcher registers into profile.db's
+/// kernel-config registry (`profiling/db/kernel_config.py`).
+pub fn config_records_document(records: &[KernelConfigRecord]) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": CONFIG_RECORDS_SCHEMA_VERSION,
+        "configs": records,
+    })
+}
+
+/// Write [`config_records_document`] of `records` to `path`.
 pub fn write_config_records(
     path: &std::path::Path,
     records: &[KernelConfigRecord],
 ) -> anyhow::Result<()> {
     use anyhow::Context;
-    let document = serde_json::json!({
-        "schema_version": CONFIG_RECORDS_SCHEMA_VERSION,
-        "configs": records,
-    });
-    let text = serde_json::to_string(&document).expect("config records serialize");
+    let text =
+        serde_json::to_string(&config_records_document(records)).expect("config records serialize");
     std::fs::write(path, text)
         .with_context(|| format!("writing kernel config records {}", path.display()))
 }

@@ -11,11 +11,13 @@ asked for them arrive together:
 - after a cache prebuild that profiled missing rows (`cache_build`);
 - after a timing-predict run, which JIT-profiles what it misses.
 
-`--register-kernel-configs` (presets) and `timing-predict
---register-kernel-configs` (predict configs) register without measuring
-anything: they run the simulator's `dry-run`, which needs no GPU. That is how
-configs whose rows were measured before the registry existed get registered, so
-they skip configs with no measured row at all.
+`--register-kernel-configs` (presets), `timing-predict
+--register-kernel-configs` (predict configs) and
+`--register-supported-kernel-configs` (every `#[supported]` arch deployment)
+register without measuring anything: they run the simulator's `dry-run` or
+`supported-cost-trees`, which need no GPU. That is how configs whose rows were
+measured before the registry existed get registered, so they skip configs with
+no measured row at all.
 """
 
 from __future__ import annotations
@@ -61,6 +63,12 @@ def predict_source(config: Mapping[str, Any], config_path: Path) -> dict[str, An
         "gpu": config["gpu"],
         "arch": config["arch"],
     }
+
+
+def supported_source(build: Mapping[str, Any]) -> dict[str, Any]:
+    """What built a supported deployment's configs: the `#[supported]` row's
+    arch, GPU and params, as `simulator supported-cost-trees` reports them."""
+    return {"supported": {"arch": build["arch"], "gpu": build["gpu"], "params": build["params"]}}
 
 
 def register_file(
@@ -120,6 +128,41 @@ def register_run_configs(candidates: list[tuple[str, dict]], build_type: str) ->
             with _LAUNCHER_LEASES.profile_database(write=True):
                 report = register_file(records, run_sources(config, preset), measured_only=True)
             print(f"[kernel-configs] {label}: {describe(report)}")
+    return rc
+
+
+def register_supported_configs(build_type: str) -> int:
+    """`--register-supported-kernel-configs`: register the kernel configs of
+    every `#[supported]` arch deployment. Returns a process exit code."""
+    argv = [str(binary_path(build_type)), "supported-cost-trees", "--kernel-configs"]
+    result = _PROCESS_SUPERVISOR.run_sync(
+        ProcessSpec(
+            argv=argv,
+            cwd=REPO_ROOT,
+            env={"RUST_LOG": "warn", **_build_subprocess_env()},
+            capture_output=True,
+            separate_stderr=True,
+            name="register-kernel-configs",
+        )
+    )
+    if not result.succeeded:
+        print(f"[kernel-configs] supported-cost-trees failed\n{result.stderr}", file=sys.stderr)
+        return 1
+    rc = 0
+    for build in json.loads(result.output):
+        label = f"{build['arch']} {build['gpu']} {json.dumps(build['params'])}"
+        if build["error"]:
+            print(f"[kernel-configs] {label}: {build['error']}", file=sys.stderr)
+            rc = 1
+            continue
+        document = build["kernel_configs"]
+        pools = {use["pool"] for config in document["configs"] for use in config["uses"]}
+        source = supported_source(build)
+        with _LAUNCHER_LEASES.profile_database(write=True):
+            report = register_kernel_configs(
+                DB_PATH, document, dict.fromkeys(pools, source), measured_only=True
+            )
+        print(f"[kernel-configs] {label}: {describe(report)}")
     return rc
 
 

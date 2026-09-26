@@ -1795,6 +1795,10 @@ pub struct SupportedBuild {
     pub gpus_per_replica: Option<u16>,
     /// The cost tree, in the `cost_manifest/*.json` form; `None` on error.
     pub cost_manifest: Option<crate::timing::CostManifestDoc>,
+    /// The kernel configs the build asks profile.db for, as the document
+    /// `--kernel-configs-out` writes; only when asked for, and `None` on error.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kernel_configs: Option<serde_json::Value>,
     pub error: Option<String>,
 }
 
@@ -1802,7 +1806,7 @@ pub struct SupportedBuild {
 /// GPU, structure only ([`PerfApiBridge::structure_only`]: no Python, `profile.db` or
 /// GPU). A combination that fails to parse or build (including a panicking
 /// shape assertion) is returned with its error, not raised.
-pub fn build_supported_iter_archs() -> Vec<SupportedBuild> {
+pub fn build_supported_iter_archs(kernel_configs: bool) -> Vec<SupportedBuild> {
     use serde_json::{Map, Value};
 
     let schema = crate::schema::list_params();
@@ -1854,6 +1858,7 @@ pub fn build_supported_iter_archs() -> Vec<SupportedBuild> {
                     params,
                     gpus_per_replica: None,
                     cost_manifest: None,
+                    kernel_configs: None,
                     error: None,
                 };
                 let selector: IterArchSel = match serde_json::from_value(Value::Object(arch)) {
@@ -1865,6 +1870,9 @@ pub fn build_supported_iter_archs() -> Vec<SupportedBuild> {
                     }
                 };
                 let bridge = PerfApiBridge::structure_only();
+                if kernel_configs {
+                    bridge.enable_config_records();
+                }
                 let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     build_iter_model(&selector, &build.gpu, tag, &bridge)
                 }));
@@ -1875,6 +1883,12 @@ pub fn build_supported_iter_archs() -> Vec<SupportedBuild> {
                             "iter",
                             model.cost_log_manifest(),
                         ));
+                        if kernel_configs {
+                            build.kernel_configs =
+                                Some(crate::timing::bridge::config_records_document(
+                                    &bridge.take_config_records(),
+                                ));
+                        }
                     }
                     Ok(Err(e)) => build.error = Some(format!("{e:#}")),
                     Err(panic) => {
@@ -2649,7 +2663,7 @@ mod tests {
     /// tree, so a row cannot claim a deployment the arch cannot build.
     #[test]
     fn every_supported_iter_arch_deployment_builds_its_cost_tree() {
-        let builds = build_supported_iter_archs();
+        let builds = build_supported_iter_archs(false);
         let failures: Vec<String> = builds
             .iter()
             .filter_map(|b| {
@@ -2671,5 +2685,24 @@ mod tests {
                 b.arch
             );
         }
+    }
+
+    /// Asked for, each supported build carries the kernel configs it builds, in
+    /// the document `--kernel-configs-out` writes.
+    #[test]
+    fn supported_builds_carry_their_kernel_configs_when_asked() {
+        for b in build_supported_iter_archs(true) {
+            let doc = b.kernel_configs.as_ref().expect("kernel_configs");
+            assert_eq!(
+                doc["schema_version"],
+                crate::timing::bridge::CONFIG_RECORDS_SCHEMA_VERSION
+            );
+            let configs = doc["configs"].as_array().unwrap();
+            assert!(!configs.is_empty(), "{} {:?}: no configs", b.arch, b.params);
+            assert!(configs.iter().all(|c| c["gpu_name"] == b.gpu.as_str()));
+        }
+        assert!(build_supported_iter_archs(false)
+            .iter()
+            .all(|b| b.kernel_configs.is_none()));
     }
 }

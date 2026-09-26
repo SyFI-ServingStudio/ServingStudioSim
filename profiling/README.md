@@ -275,15 +275,17 @@ record it, written by the builds that ask for the rows:
   `KernelConfig::identity` (no `gpu_name` or `backends`, `Dim` values only;
   `config_hash` is the SHA-256 of its sorted-key JSON), the profile table, the
   cache coordinate names, the grid axes, and each cell's args without `backend`,
-  stored by column. The grid is stored because it cannot always be recomputed:
-  a corpus-routed MoE config names a payload file.
-- `_kernel_config_source`, keyed `source_hash`: what built configs — the preset
-  or timing-predict config, pool, GPU and arch block.
+  stored by column as zlib-compressed JSON (list-valued args make cells the
+  bulk). The grid is stored because it cannot always be recomputed: a
+  corpus-routed MoE config names a payload file.
+- `_kernel_config_source`, keyed `source_hash`: what built configs — the preset,
+  timing-predict config or `#[supported]` row, pool, GPU and arch block.
 - `_kernel_config_use`: which `(pool, role)` of which source built which config.
 
 The launcher registers them after a cache prebuild that profiled and after a
 timing-predict run; `--register-kernel-configs` registers a preset's or predict
-config's configs with a dry-run (no GPU), for rows measured earlier.
+config's configs with a dry-run (no GPU), for rows measured earlier, and
+`--register-supported-kernel-configs` those of every `#[supported]` deployment.
 Registration writes nothing when every config, source and use is known.
 
 ## Adding a kernel

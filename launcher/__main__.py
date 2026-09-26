@@ -115,6 +115,13 @@ def _build_argparse():
         "For rows measured before the registry existed.",
     )
     parser.add_argument(
+        "--register-supported-kernel-configs",
+        action="store_true",
+        help="Register the kernel configs of every `#[supported]` arch deployment "
+        "(`simulator supported-cost-trees`) the way --register-kernel-configs does "
+        "for presets, then exit. Takes no preset.",
+    )
+    parser.add_argument(
         "--refresh",
         action="store_true",
         help="Re-run every run, ignoring `.complete` markers (default: resume — "
@@ -593,7 +600,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     args = _build_argparse().parse_args(argv)
-    if not args.presets:
+    if args.register_supported_kernel_configs and args.presets:
+        sys.exit("--register-supported-kernel-configs takes no preset")
+    if not args.presets and not args.register_supported_kernel_configs:
         sys.exit(
             "no preset given; usage: python -m launcher PRESET.yaml|json [...] "
             "(or choose timing-predict, kernel-profile, alignment, or list-params)"
@@ -608,6 +617,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if not cargo_build(args.build_type, build_analyzer=not args.no_analyze):
         sys.exit("launcher preparation failed (see stage-specific error above)")
+
+    if args.register_supported_kernel_configs:
+        from .kernel_configs import register_supported_configs
+
+        return register_supported_configs(args.build_type)
 
     try:
         schema = load_schema(args.build_type)
