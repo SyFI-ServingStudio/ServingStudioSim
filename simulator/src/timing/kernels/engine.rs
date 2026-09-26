@@ -34,6 +34,11 @@ pub trait KernelConfig:
     /// Auto-derived as `"{StructName}.backends"`.
     const BACKENDS_FIELD: &'static str;
 
+    /// The field tagged `#[compute_dtype]`, if any. Derived.
+    const COMPUTE_DTYPE_FIELD: Option<&'static str> = None;
+    /// The field tagged `#[kv_dtype]`, if any. Derived.
+    const KV_DTYPE_FIELD: Option<&'static str> = None;
+
     /// The GPU whose profiled rows this config caches. Part of the config
     /// identity (`Hash + Eq`), so distinct GPUs are distinct kernels / caches;
     /// passed to the bridge at `build` (`get_times` / `count_missing`) as the DB
@@ -438,6 +443,24 @@ impl<S: KernelSpec> Probe for Kernel<S> {
 /// alias), so adding a kernel touches only that kernel's own file.
 pub(crate) struct KernelQueryEntry {
     pub kind: &'static str,
+    /// The DB kind whose rows the kernel reads (`KernelSpec::profile_kind`).
+    pub profile_kind: fn() -> KernelKind,
+    /// `KernelConfig` fields (serde names): what fixes one kernel instance.
+    pub config_fields: fn() -> &'static [&'static str],
+    /// `Input` fields (serde names): the physical query, which is what the
+    /// profile.db rows sweep.
+    pub input_fields: fn() -> &'static [&'static str],
+    /// The cache coordinates an `Input` projects onto (`SweepCoords`).
+    pub coord_fields: fn() -> &'static [&'static str],
+    pub compute_dtype_field: Option<&'static str>,
+    pub kv_dtype_field: Option<&'static str>,
+    /// `rows` path: the profile.db rows one config measures and the rows each
+    /// runtime input reads ([`rows_from_json`]). No bridge, DB or GPU.
+    pub rows: fn(
+        serde_json::Value,
+        Option<&str>,
+        &[serde_json::Value],
+    ) -> anyhow::Result<serde_json::Value>,
     /// `eval` path: deserialize config, build the kernel (profiles missing grid
     /// rows), box it for interpolation. Needs the bridge.
     pub build: fn(serde_json::Value, &PerfApiBridge) -> anyhow::Result<Box<dyn CacheProbe>>,
@@ -464,10 +487,190 @@ impl KernelQueryEntry {
     {
         KernelQueryEntry {
             kind: S::KIND,
+            profile_kind: S::profile_kind,
+            config_fields: serde_field_names::<S::Config>,
+            input_fields: serde_field_names::<S::Input>,
+            coord_fields: <S::Input as SweepCoords>::coord_field_names,
+            compute_dtype_field: <S::Config as KernelConfig>::COMPUTE_DTYPE_FIELD,
+            kv_dtype_field: <S::Config as KernelConfig>::KV_DTYPE_FIELD,
+            rows: rows_from_json::<S>,
             build: build_probe_from_json::<S>,
             describe: describe_from_json::<S>,
         }
     }
+}
+
+/// The profile.db rows one kernel instance measures, and which of them each
+/// runtime input reads. The `rows`-path fn pointer; pure metadata (no bridge,
+/// DB or GPU).
+///
+/// Two transforms, both the kernel's own code:
+/// - config → rows: `enumerate` over `sweep_grid`, one row of DB args per grid
+///   cell, row-major. A column whose value changes across the cells is swept;
+///   one that never changes is fixed by the config.
+/// - input → rows: `cache_coords` places a runtime input in the grid. The rows
+///   it reads are the grid cells around it: on an axis value that value, between
+///   two values both, beyond the grid the nearest edge (`extrapolated`). How the
+///   cache weighs those cells depends on the cache kind and is not reported.
+///
+/// `backend` defaults to the config's first backend.
+fn rows_from_json<S>(
+    config: serde_json::Value,
+    backend: Option<&str>,
+    inputs: &[serde_json::Value],
+) -> anyhow::Result<serde_json::Value>
+where
+    S: KernelSpec,
+    S::Config: serde::de::DeserializeOwned,
+    S::Input: serde::de::DeserializeOwned,
+{
+    use serde_json::{json, Map, Value};
+
+    let config: S::Config = serde_json::from_value(config)
+        .map_err(|e| anyhow::anyhow!("config does not match {} KernelConfig: {e}", S::KIND))?;
+    S::validate_config(&config)?;
+    let backend = match backend {
+        Some(name) => *config
+            .backends()
+            .iter()
+            .find(|b| **b == name)
+            .ok_or_else(|| anyhow::anyhow!("{} config has no backend {name}", S::KIND))?,
+        None => *config
+            .backends()
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("{} config lists no backend", S::KIND))?,
+    };
+    let grid = S::sweep_grid(&config);
+    let axes = grid.axes();
+    let cells = grid.expand(|coords| coords.to_vec());
+    let args = S::enumerate(&config, &grid, backend);
+    anyhow::ensure!(
+        args.len() == cells.len(),
+        "{} enumerate returned {} rows for {} grid cells",
+        S::KIND,
+        args.len(),
+        cells.len()
+    );
+    let infeasible = S::infeasible_mask(&config, &grid);
+
+    let mut swept = Vec::new();
+    let mut fixed = Map::new();
+    for (column, first) in args[0].fields() {
+        if args
+            .iter()
+            .all(|row| row.fields().get(column) == Some(first))
+        {
+            fixed.insert(column.clone(), first.clone());
+        } else {
+            swept.push(column.clone());
+        }
+    }
+
+    let rows: Vec<Value> = cells
+        .iter()
+        .zip(&args)
+        .enumerate()
+        .map(|(i, (coords, row))| {
+            json!({
+                "coords": coords,
+                "args": row.fields(),
+                "feasible": !infeasible.get(i).copied().unwrap_or(false),
+            })
+        })
+        .collect();
+
+    let mut reads = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        let parsed: S::Input = serde_json::from_value(input.clone())
+            .map_err(|e| anyhow::anyhow!("input does not match {} Input: {e}", S::KIND))?;
+        let coords = S::cache_coords(&config, &parsed);
+        let mut extrapolated = false;
+        // Per axis, the indices of the cells around the coordinate.
+        let around: Vec<Vec<usize>> = axes
+            .iter()
+            .zip(coords.as_slice())
+            .map(|(axis, &x)| {
+                let last = axis.len() - 1;
+                if x < axis[0] || x > axis[last] {
+                    extrapolated = true;
+                    vec![if x < axis[0] { 0 } else { last }]
+                } else if let Some(i) = axis.iter().position(|&v| v == x) {
+                    vec![i]
+                } else {
+                    let upper = axis
+                        .iter()
+                        .position(|&v| v > x)
+                        .expect("x is inside the axis");
+                    vec![upper - 1, upper]
+                }
+            })
+            .collect();
+        let mut indices = vec![0usize];
+        for (d, picks) in around.iter().enumerate() {
+            let stride: usize = axes[d + 1..].iter().map(Vec::len).product();
+            indices = indices
+                .iter()
+                .flat_map(|base| picks.iter().map(move |p| base + p * stride))
+                .collect();
+        }
+        reads.push(json!({
+            "input": input,
+            "coords": coords.as_slice(),
+            "extrapolated": extrapolated,
+            "rows": indices,
+        }));
+    }
+
+    Ok(json!({
+        "kind": S::KIND,
+        "profile_kind": S::profile_kind(),
+        "backend": backend,
+        "cache_coords": <S::Input as SweepCoords>::coord_field_names(),
+        "grid_axes": axes,
+        "swept": swept,
+        "fixed": fixed,
+        "rows": rows,
+        "inputs": reads,
+    }))
+}
+
+/// The field names serde passes to `deserialize_struct` for `T`: a derived
+/// struct's fields, in order, with any `rename` applied. Read by a deserializer
+/// that records them and then refuses the value, so no `T` is built. Empty for
+/// a type that does not deserialize as a struct (e.g. one with a flattened
+/// field, which deserializes as a map).
+fn serde_field_names<T: serde::de::DeserializeOwned>() -> &'static [&'static str] {
+    use serde::de::{self, Visitor};
+
+    struct Probe<'a>(&'a mut &'static [&'static str]);
+
+    impl<'de> de::Deserializer<'de> for Probe<'_> {
+        type Error = de::value::Error;
+
+        fn deserialize_any<V: Visitor<'de>>(self, _: V) -> Result<V::Value, Self::Error> {
+            Err(de::Error::custom("field-name probe"))
+        }
+
+        fn deserialize_struct<V: Visitor<'de>>(
+            self,
+            _name: &'static str,
+            fields: &'static [&'static str],
+            _visitor: V,
+        ) -> Result<V::Value, Self::Error> {
+            *self.0 = fields;
+            Err(de::Error::custom("field-name probe"))
+        }
+
+        serde::forward_to_deserialize_any! {
+            bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+            bytes byte_buf option unit unit_struct newtype_struct seq tuple
+            tuple_struct map enum identifier ignored_any
+        }
+    }
+
+    let mut fields: &'static [&'static str] = &[];
+    let _ = T::deserialize(Probe(&mut fields));
+    fields
 }
 
 /// Deserialize `config` into `S::Config`, build that one kernel, box it as a

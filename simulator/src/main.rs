@@ -7,6 +7,7 @@
 //!   - `dry-run <config>`          — report missing profile.db rows, no sim
 //!   - `emit-backends <config>`    — enumerate distinct kernels (JSON), no sim
 //!   - `list-params`               — emit the param-schema registry JSON
+//!   - `kernel-list`               — every kernel kind's config / sweep fields
 //!   - `supported-cost-trees`      — each arch's `#[supported]` cost trees, no sim
 //!
 //! All three run-like subcommands share one parse (`load_config`) → `RunConfig`
@@ -71,6 +72,11 @@ enum Cmd {
     /// kernel by `{kind, config, query_points}`; writes the interpolated
     /// best-of-N metrics per point + the fitted grid axes on stdout.
     KernelQuery,
+    /// Print every registered kernel kind as JSON: the config fields that fix
+    /// one instance, the input fields its profile.db rows sweep, the cache
+    /// coordinates, and which config field is the compute / KV dtype. Reads the
+    /// kernel registry only (no config, GPU or profile.db).
+    KernelList,
     /// Build every `#[supported]` combination of every iter-wise arch and print
     /// each one's cost tree (the `cost_manifest` form) as JSON. Structure only:
     /// no config file, Python perf_api, profile.db or GPU.
@@ -179,6 +185,7 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::KernelQuery => simulator::introspect::run_kernel_query(),
+        Cmd::KernelList => simulator::introspect::run_kernel_list(),
         Cmd::SupportedCostTrees => {
             let builds = simulator::arch::build::build_supported_iter_archs();
             println!("{}", serde_json::to_string(&builds)?);
