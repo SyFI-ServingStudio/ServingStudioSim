@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
 
-use crate::timing::bridge::{ArgsPayload, KernelKind, KernelMetrics, PerfApiBridge};
+use crate::timing::bridge::{ArgsPayload, ConfigGrid, KernelKind, KernelMetrics, PerfApiBridge};
 use crate::timing::cache::interp::LeafMetrics;
 use crate::timing::cache::{BackendCache, CacheKind, OutlierWarning, PeakRates};
 use crate::timing::result::CacheProbe;
@@ -66,6 +66,23 @@ pub trait KernelConfig:
     /// introspection and presentation. `Dim` values retain formula provenance.
     fn describe_config(&self) -> serde_json::Value {
         serde_json::to_value(self).expect("KernelConfig must serialize to JSON")
+    }
+
+    /// The config's identity in profile.db's kernel-config registry: every
+    /// field except `gpu_name` and `backends`, which profile.db rows key in
+    /// their own columns, with each `Dim` reduced to its value. Two configs
+    /// that fold to the same shape share one identity however their dims were
+    /// derived.
+    fn identity(&self) -> serde_json::Value {
+        let mut identity = crate::timing::dims::values_only(|| {
+            serde_json::to_value(self).expect("KernelConfig must serialize to JSON")
+        });
+        let fields = identity
+            .as_object_mut()
+            .expect("KernelConfig must serialize as a struct");
+        fields.remove("gpu_name");
+        fields.remove("backends");
+        identity
     }
 
     /// The `symbol -> value` legend for this config's `Dim` shape fields — the
@@ -195,6 +212,20 @@ impl<S: KernelSpec> Kernel<S> {
             config.backends().len(),
             LeafMetrics::NO_BACKEND,
         );
+
+        // Kernel-config registry: record the config and the grid it asks for,
+        // whatever the mode. Recording enumerates the grid itself, so it does not
+        // depend on which of the paths below runs.
+        if bridge.records_configs() {
+            bridge.record_config(
+                &name,
+                S::KIND,
+                S::profile_kind(),
+                config.gpu_name(),
+                config.identity(),
+                || config_grid::<S>(&config),
+            )?;
+        }
 
         // Enumerate mode (`emit-backends`): record this kernel's structural facts
         // and return an empty kernel WITHOUT any profile.db lookup. GPU-free and
@@ -728,6 +759,49 @@ pub(crate) use register_kernel;
 
 // ─── internal helpers ───────────────────────────────────────────────────────
 
+/// The grid `config` asks profile.db for: cache axes, the args of each cell
+/// (without `backend`) and the infeasible cells. Enumerates every backend so a
+/// kernel whose args depend on the backend fails here instead of recording
+/// rows that only one backend reads.
+fn config_grid<S: KernelSpec>(config: &S::Config) -> Result<ConfigGrid, BuildError> {
+    let grid = S::sweep_grid(config);
+    let cells_for = |backend: &'static str| -> Vec<BTreeMap<String, serde_json::Value>> {
+        S::enumerate(config, &grid, backend)
+            .into_iter()
+            .map(|payload| {
+                let mut args = payload.fields().clone();
+                args.remove("backend");
+                args
+            })
+            .collect()
+    };
+    let (&first, rest) = config
+        .backends()
+        .split_first()
+        .expect("ensure_has_backends ran before recording");
+    let cells = cells_for(first);
+    for &other in rest {
+        if cells_for(other) != cells {
+            return Err(BuildError::BackendDependentArgs {
+                kind: S::KIND,
+                first,
+                other,
+            });
+        }
+    }
+    let infeasible = S::infeasible_mask(config, &grid)
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &drop)| drop.then_some(i))
+        .collect();
+    Ok(ConfigGrid {
+        cache_coords: <S::Input as SweepCoords>::coord_field_names(),
+        axes: grid.axes().to_vec(),
+        cells,
+        infeasible,
+    })
+}
+
 fn ensure_has_backends(
     kernel_kind: KernelKind,
     field_name: &'static str,
@@ -806,6 +880,98 @@ mod tests {
         ) -> Vec<ArgsPayload> {
             Vec::new()
         }
+    }
+
+    /// A 2x2 grid whose cell (1, 1) is infeasible; `by_backend` makes one args
+    /// column follow the backend.
+    struct GridSpec;
+
+    impl KernelSpec for GridSpec {
+        type Config = DefaultCoordsConfig;
+        type Input = DefaultCoordsInput;
+
+        const KIND: KernelKind = "grid_test";
+
+        fn sweep_grid(_config: &Self::Config) -> SweepGrid {
+            SweepGrid::new(vec![vec![1.0, 2.0], vec![10.0, 20.0]])
+        }
+
+        fn cache_kind(_backend: &'static str) -> CacheKind {
+            CacheKind::Cache2DLinear(Extrapolation::Clamp)
+        }
+
+        fn infeasible_mask(_config: &Self::Config, _grid: &SweepGrid) -> Vec<bool> {
+            vec![false, false, false, true]
+        }
+
+        fn enumerate(
+            config: &Self::Config,
+            grid: &SweepGrid,
+            backend: &'static str,
+        ) -> Vec<ArgsPayload> {
+            grid.expand(|coords| {
+                let payload = ArgsPayload::new()
+                    .with("backend", backend)
+                    .with("x", coords[0] as u32)
+                    .with("y", coords[1] as u32);
+                if config.gpu_name == "by_backend" {
+                    payload.with("tile", backend)
+                } else {
+                    payload
+                }
+            })
+        }
+    }
+
+    #[test]
+    fn config_grid_records_args_without_backend_and_infeasible_cells() {
+        let config = DefaultCoordsConfig {
+            backends: vec!["a", "b"],
+            gpu_name: "test-gpu".to_string(),
+        };
+        let grid = super::config_grid::<GridSpec>(&config).expect("grid");
+        assert_eq!(grid.cache_coords, &["x", "y"]);
+        assert_eq!(grid.axes, vec![vec![1.0, 2.0], vec![10.0, 20.0]]);
+        let cells: Vec<_> = grid
+            .cells
+            .iter()
+            .map(|cell| serde_json::to_value(cell).unwrap())
+            .collect();
+        assert_eq!(
+            cells,
+            vec![
+                serde_json::json!({"x": 1, "y": 10}),
+                serde_json::json!({"x": 1, "y": 20}),
+                serde_json::json!({"x": 2, "y": 10}),
+                serde_json::json!({"x": 2, "y": 20}),
+            ]
+        );
+        assert_eq!(grid.infeasible, vec![3]);
+    }
+
+    #[test]
+    fn config_grid_rejects_args_that_follow_the_backend() {
+        let config = DefaultCoordsConfig {
+            backends: vec!["a", "b"],
+            gpu_name: "by_backend".to_string(),
+        };
+        assert!(matches!(
+            super::config_grid::<GridSpec>(&config),
+            Err(BuildError::BackendDependentArgs {
+                kind: "grid_test",
+                first: "a",
+                other: "b",
+            })
+        ));
+    }
+
+    #[test]
+    fn identity_leaves_out_gpu_and_backends() {
+        let config = DefaultCoordsConfig {
+            backends: vec!["a"],
+            gpu_name: "test-gpu".to_string(),
+        };
+        assert_eq!(config.identity(), serde_json::json!({}));
     }
 
     #[test]

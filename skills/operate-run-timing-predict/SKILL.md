@@ -62,7 +62,10 @@ uv run python -m launcher timing-predict presets/<config>.json
 
 Multiple configs may be passed in one call, for example the two AFD halves.
 Supported flags are `--build-type <build-type>` (default `release`),
-`--no-analyze`, `--dry-run`, and `--no-gpu`. There is no `--override`.
+`--no-analyze`, `--dry-run`, `--register-kernel-configs`, and `--no-gpu`. There
+is no `--override`. A real run registers the kernel configs it asks profile.db
+for in the kernel-config registry; `--register-kernel-configs` does only that,
+with a dry-run and no GPU.
 
 Run `--dry-run` first on a new config. It builds the model, checks every case
 against it, and prints one line per kernel with the `profile.db` specs a real

@@ -107,6 +107,14 @@ def _build_argparse():
         "exit without building caches or running.",
     )
     parser.add_argument(
+        "--register-kernel-configs",
+        action="store_true",
+        help="Register the kernel configs each run asks profile.db for (and the "
+        "grid of rows each one reads) in profile.db's kernel-config registry, "
+        "then exit. Runs the simulator's dry-run only: no GPU, no profiling. "
+        "For rows measured before the registry existed.",
+    )
+    parser.add_argument(
         "--refresh",
         action="store_true",
         help="Re-run every run, ignoring `.complete` markers (default: resume — "
@@ -610,6 +618,8 @@ def main(argv: list[str] | None = None) -> int:
         return _emit_backends(args, schema)
 
     all_candidates: list[dict] = []
+    # The preset (or variants manifest) each candidate came from, in order.
+    candidate_presets: list[str] = []
     last_preset: dict = {}
     analyze_subjects: list[str] | None = None
     preset_energy: list[bool | None] = []
@@ -648,6 +658,7 @@ def main(argv: list[str] | None = None) -> int:
         if cands is None:
             return 2
         all_candidates.extend(cands)
+        candidate_presets.extend(preset_path for _ in cands)
 
     if not _apply_energy_policy(args.energy, preset_energy, args.presets):
         return 2
@@ -697,6 +708,21 @@ def main(argv: list[str] | None = None) -> int:
         from .cache_build import report_cache_coverage
 
         return report_cache_coverage(all_candidates, schema, args.build_type)
+
+    if args.register_kernel_configs:
+        from .cache_build import unique_by_cache_key
+        from .kernel_configs import register_run_configs
+
+        # Runs that differ only in non-kernel params build the same configs.
+        candidates = [
+            (preset, config)
+            for preset in dict.fromkeys(candidate_presets)
+            for config in unique_by_cache_key(
+                [c for p, c in zip(candidate_presets, all_candidates, strict=True) if p == preset],
+                schema,
+            )
+        ]
+        return register_run_configs(candidates, args.build_type)
 
     if args.profile:
         from .exec import perf_available
