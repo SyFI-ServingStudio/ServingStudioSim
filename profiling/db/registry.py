@@ -17,6 +17,7 @@ from enum import StrEnum
 from typing import Any
 
 from profiling.db.args import DType, KernelArgs
+from profiling.db.doc import BackendDoc
 from profiling.db.kind import KernelKind
 from profiling.db.outlier import BatchOutlierPolicy
 from profiling.runners.metrics import Metrics, RunnerResult
@@ -136,6 +137,9 @@ class KernelProfilerSpec:
     # spec. When False (the default) the single-spec runner is wrapped by
     # ``batched`` to satisfy the same contract.
     list_native: bool = False
+    # Reader-facing description of this backend for the Kernel Library. None
+    # until the kind is documented; see profiling/db/doc.py.
+    doc: BackendDoc | None = None
 
     @property
     def runner_module(self) -> str:
