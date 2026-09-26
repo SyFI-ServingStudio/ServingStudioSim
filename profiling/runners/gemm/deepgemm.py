@@ -228,3 +228,83 @@ def _prime(fn, torch, attempts: int = 3) -> None:
             torch.cuda.synchronize()
     if last_error is not None:
         raise last_error
+
+
+def profile_single_gemm_vllm_fork(
+    m: int,
+    n: int,
+    k: int,
+    dtype: DType | str,
+) -> ComputeMetrics:
+    """Blackwell DeepGEMM dense FP8 block GEMM exactly as the alignment fork calls it.
+
+    ``DeepGemmFp8BlockScaledMMKernel`` (``vllm/model_executor/kernels/linear/
+    scaled_mm/deep_gemm.py``) on SM100: activations come from
+    ``per_token_group_quant_fp8_packed_for_deepgemm`` (packed UE8M0 int32
+    scales), weights from ``deepgemm_post_process_fp8_weight_block`` (128x128
+    blocks, UE8M0 requant), and the timed call is ``vllm.utils.deep_gemm.
+    fp8_gemm_nt(..., is_deep_gemm_e8m0_used=True)`` into a BF16 output. Both
+    quantizations stay outside the timed boundary.
+    """
+    dtype = DType.from_value(dtype)
+    if dtype is not DType.FP8_E4M3:
+        raise ValueError(f"deepgemm_vllm_fork single-GEMM is FP8 E4M3-only, got {dtype.value}")
+    if n % 128 or k % 128:
+        raise ProfilerNotImplemented("deepgemm_vllm_fork requires n and k divisible by 128")
+    try:
+        import torch
+        from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+            deepgemm_post_process_fp8_weight_block,
+            per_token_group_quant_fp8_packed_for_deepgemm,
+        )
+        from vllm.utils.deep_gemm import fp8_gemm_nt
+    except ImportError as exc:
+        raise ProfilerNotImplemented("deepgemm_vllm_fork requires the vLLM fork") from exc
+    if not torch.cuda.is_available():
+        raise ProfilerNotImplemented("CUDA required for the deepgemm_vllm_fork runner")
+    gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
+    if gpu_name != "NVIDIA B200":
+        raise ProfilerNotImplemented(f"deepgemm_vllm_fork is verified only on NVIDIA B200, got {gpu_name}")
+
+    try:
+        generator = torch.Generator(device="cuda").manual_seed(29)
+        a_bf16 = torch.randn(m, k, device="cuda", dtype=torch.bfloat16, generator=generator)
+        b_bf16 = torch.randn(n, k, device="cuda", dtype=torch.bfloat16, generator=generator)
+        # Checkpoint-style 128x128 block weights with FP32 inverse scales.
+        blocks = b_bf16.float().view(n // 128, 128, k // 128, 128)
+        b_scale = blocks.abs().amax(dim=(1, 3)).clamp_min(1e-4) / 448.0
+        b_fp8 = (blocks / b_scale[:, None, :, None]).view(n, k).to(torch.float8_e4m3fn)
+        weight, weight_scale = deepgemm_post_process_fp8_weight_block(
+            wq=b_fp8, ws=b_scale.contiguous(), quant_block_shape=(128, 128), use_e8m0=True
+        )
+        a_fp8, a_scale = per_token_group_quant_fp8_packed_for_deepgemm(
+            a_bf16, 128, use_ue8m0=True
+        )
+        out = torch.empty(m, n, device="cuda", dtype=torch.bfloat16)
+
+        def kernel():
+            fp8_gemm_nt((a_fp8, a_scale), (weight, weight_scale), out, is_deep_gemm_e8m0_used=True)
+            return out
+
+        _prime(kernel, torch)
+        reference = a_bf16.float() @ b_bf16.float().T
+        cosine = torch.nn.functional.cosine_similarity(
+            out.float().flatten(), reference.flatten(), dim=0
+        )
+        if not bool(cosine > 0.99):
+            raise KernelLaunchFailed(f"deepgemm_vllm_fork output disagrees (cosine {float(cosine):.4f})")
+
+        time_ms = Timer.cupti(kernel, kernel_name=None)
+        energy_j = Energy.perf(kernel, warmup=5, per_iter_time_ms=time_ms)
+        flops = 2 * m * n * k
+        tflops = (flops / (time_ms / 1000.0)) / 1e12 if time_ms > 0 else 0.0
+        bytes_accessed = m * k + n * k + m * n * 2
+        bandwidth_gbps = (bytes_accessed / (time_ms / 1000.0)) / 1e9 if time_ms > 0 else 0.0
+        return ComputeMetrics(
+            time_ms=float(time_ms),
+            tflops=float(tflops),
+            memory_bandwidth_gbps=float(bandwidth_gbps),
+            energy_j=float(energy_j),
+        )
+    except RuntimeError as exc:
+        raise KernelLaunchFailed(str(exc)) from exc

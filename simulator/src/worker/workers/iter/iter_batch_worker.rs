@@ -81,6 +81,10 @@ pub type Qwen36HybridWorker<M> = IterBatchWorker<
     LocalPrefillDecodeAdmission<PendingOrder>,
     UnifiedIterExecution<M>,
 >;
+/// `ChunkedPrefillWorker` on every axis but KV: the hybrid store charges each
+/// request's recurrent state against the attention capacity.
+pub type HybridChunkedPrefillWorker<M> =
+    IterBatchWorker<HybridGdnKv, ChunkedPrefillAdmission<PendingOrder>, UnifiedIterExecution<M>>;
 pub type PdPrefillWorker<M> =
     IterBatchWorker<FullAttnKv, PrefillHandoffAdmission<PendingOrder>, UnifiedIterExecution<M>>;
 
@@ -256,6 +260,7 @@ mod tests {
     use crate::worker::types::{WorkerConfig, WorkerEventCommon, WorkerMsgCommon};
     use crate::worker::workers::iter::{
         build_barebone_worker, build_chunked_prefill_worker, build_hp_worker,
+        build_hybrid_chunked_prefill_worker,
     };
     use crate::worker::{BatchPolicy, DecodeRetractionPolicy, KvAdmissionConfig};
 
@@ -642,6 +647,104 @@ mod tests {
             .telemetry
             .first_output_time
             .is_some());
+    }
+
+    fn hybrid_chunked_worker(
+        store: SharedRequests,
+        chunk_end_quantum: Option<u32>,
+    ) -> HybridChunkedPrefillWorker<FakeModel> {
+        build_hybrid_chunked_prefill_worker(
+            WorkerId(0),
+            "main",
+            Arc::new(FakeModel::for_ms(1.0)),
+            store,
+            WorkerConfig {
+                max_batch_tokens: Some(10),
+                ssm_checkpoint_interval_tokens: chunk_end_quantum,
+                ..WorkerConfig::default()
+            },
+            None,
+            PoolId(0),
+            "test-gpu",
+            test_cluster(),
+        )
+    }
+
+    fn hybrid_chunk_pairs(
+        worker: &mut HybridChunkedPrefillWorker<FakeModel>,
+        now: Time,
+    ) -> Vec<(u32, u32)> {
+        assert!(worker.form_batch(now));
+        let mut input: crate::arch::UnifiedArchInput = Default::default();
+        worker.execution.build_iteration_input(
+            &worker.kv_store,
+            &worker.context.requests,
+            &worker.batch_plan,
+            &mut input,
+        );
+        worker.admission.complete_iteration(
+            &mut worker.kv_store,
+            &worker.context,
+            &worker.batch_plan,
+            &mut Vec::new(),
+            now,
+        );
+        input.groups[0].prefill_chunk_pairs.clone()
+    }
+
+    #[test]
+    fn hybrid_chunked_prefill_is_an_iter_worker() {
+        assert_iter_worker::<HybridChunkedPrefillWorker<FakeModel>>();
+    }
+
+    #[test]
+    fn checkpoint_aligned_chunks_leave_budget_for_a_second_prompt() {
+        let store = shared_with(&[(0, 20, 2), (1, 2, 1)]);
+        let mut worker = hybrid_chunked_worker(Rc::clone(&store), Some(4));
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(0)));
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(1)));
+
+        // 10 tokens of budget reach context 10; the chunk ends on boundary 8
+        // and the short prompt runs to completion in the two left over.
+        assert_eq!(
+            hybrid_chunk_pairs(&mut worker, Time::ZERO),
+            [(0, 8), (0, 2)]
+        );
+        assert!(store.borrow()[RequestId(1)]
+            .telemetry
+            .first_output_time
+            .is_some());
+        assert_eq!(
+            hybrid_chunk_pairs(&mut worker, Time::from_ms(1.0)),
+            [(8, 8)]
+        );
+        // The final chunk crosses no boundary and is not clipped.
+        assert_eq!(
+            hybrid_chunk_pairs(&mut worker, Time::from_ms(2.0)),
+            [(16, 4)]
+        );
+        assert!(store.borrow()[RequestId(0)]
+            .telemetry
+            .first_output_time
+            .is_some());
+    }
+
+    #[test]
+    fn without_a_checkpoint_interval_a_partial_chunk_spends_the_whole_budget() {
+        let store = shared_with(&[(0, 20, 2), (1, 2, 1)]);
+        let mut worker = hybrid_chunked_worker(Rc::clone(&store), None);
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(0)));
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(1)));
+
+        assert_eq!(hybrid_chunk_pairs(&mut worker, Time::ZERO), [(0, 10)]);
+        assert_eq!(
+            hybrid_chunk_pairs(&mut worker, Time::from_ms(1.0)),
+            [(10, 10)]
+        );
+        assert_eq!(
+            hybrid_chunk_pairs(&mut worker, Time::from_ms(2.0)),
+            [(0, 2)]
+        );
     }
 
     fn chunked_worker(

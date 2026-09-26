@@ -2,6 +2,15 @@
 //!
 //! Routing, gate/up, down, and finalize are one measured L1 boundary because
 //! Programmatic Dependent Launch overlaps their physical kernel intervals.
+//!
+//! Despite the kind name, `weight_format` selects the expert weight recipe and
+//! the backend string selects the callable. The NVFP4 backends
+//! (`flashinfer_trtllm_sm100*`) take `nvfp4_e2m1` / group 16. The GLM-5.3-Flash
+//! backend `flashinfer_trtllm_fp8_block_sm100` (`trtllm_fp8_block_scale_moe`,
+//! DeepSeek-FP8) takes `fp8_e4m3_block` / group 128 (128x128 weight blocks,
+//! per-token-group-128 activations) with `deepseek_v3` routing,
+//! `n_group = topk_group = 1`, and routed scaling 5/2. Its autotuner stops at
+//! 8192 tokens, so larger grid points reuse the top tactic bucket.
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::CacheKind;
@@ -176,6 +185,131 @@ mod tests {
         assert!(!fields.contains_key("ep_rank"));
         assert!(!fields.contains_key("local_expert_offset"));
         assert!(!fields.contains_key("launch_role"));
+    }
+
+    /// GLM-5.3-Flash EP4 on the DeepSeek-FP8 block-scale backend.
+    fn glm53_flash_ep4_fp8() -> Nvfp4FusedMoeKernelConfig {
+        Nvfp4FusedMoeKernelConfig {
+            backends: vec!["flashinfer_trtllm_fp8_block_sm100"],
+            gpu_name: "NVIDIA B200".to_string(),
+            hidden_size: 4096.into(),
+            intermediate_size: 2048.into(),
+            num_experts: 288.into(),
+            num_local_experts: 72.into(),
+            top_k: 8,
+            input_dtype: DType::Bf16,
+            weight_format: "fp8_e4m3_block".to_string(),
+            group_size: 128,
+            routing_method: "deepseek_v3".to_string(),
+            n_group: 1,
+            topk_group: 1,
+            routed_scaling_numerator: 5,
+            routed_scaling_denominator: 2,
+            expert_demand: ExpertDemand::popularity(
+                &crate::timing::routing::RoutingDistribution::uniform(288),
+                1,
+            ),
+            folded_rank_position: 0,
+        }
+    }
+
+    /// The FP8 backend reuses the NVFP4 args schema; a dropped or renamed
+    /// field would key a different profile row than the Python runner reads.
+    #[test]
+    fn fp8_block_backend_forwards_exactly_the_python_args() {
+        let config = glm53_flash_ep4_fp8();
+        let grid = SweepGrid::new(vec![Axis::values([1, 100, 3000])]);
+        let payloads =
+            Nvfp4FusedMoeSpec::enumerate(&config, &grid, "flashinfer_trtllm_fp8_block_sm100");
+        assert_eq!(payloads.len(), 3);
+        for (payload, tokens) in payloads.iter().zip([1_u64, 100, 3000]) {
+            let fields = payload.fields();
+            let mut names: Vec<&str> = fields.keys().map(String::as_str).collect();
+            names.sort_unstable();
+            assert_eq!(
+                names,
+                [
+                    "backend",
+                    "group_size",
+                    "hidden_size",
+                    "input_dtype",
+                    "intermediate_size",
+                    "n_group",
+                    "num_experts",
+                    "num_local_experts",
+                    "num_tokens",
+                    "per_expert_batches",
+                    "routed_scaling_denominator",
+                    "routed_scaling_numerator",
+                    "routing_method",
+                    "top_k",
+                    "topk_group",
+                    "weight_format",
+                ]
+            );
+            let expect = [
+                ("backend", Value::from("flashinfer_trtllm_fp8_block_sm100")),
+                ("num_tokens", Value::from(tokens)),
+                ("hidden_size", Value::from(4096)),
+                ("intermediate_size", Value::from(2048)),
+                ("num_experts", Value::from(288)),
+                ("num_local_experts", Value::from(72)),
+                ("top_k", Value::from(8)),
+                ("input_dtype", Value::from("bf16")),
+                ("weight_format", Value::from("fp8_e4m3_block")),
+                ("group_size", Value::from(128)),
+                ("routing_method", Value::from("deepseek_v3")),
+                ("n_group", Value::from(1)),
+                ("topk_group", Value::from(1)),
+                ("routed_scaling_numerator", Value::from(5)),
+                ("routed_scaling_denominator", Value::from(2)),
+            ];
+            for (name, value) in expect {
+                assert_eq!(fields[name], value, "{name} at T={tokens}");
+            }
+            let batches: Vec<u64> = fields["per_expert_batches"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|value| value.as_u64().unwrap())
+                .collect();
+            assert_eq!(batches.len(), 288, "global width at T={tokens}");
+            assert_eq!(batches.iter().sum::<u64>(), tokens * 8, "assignments at T={tokens}");
+            assert!(batches.iter().all(|&rows| rows <= tokens), "top-k is distinct");
+        }
+    }
+
+    /// Fidelity helper, not a check: prints the exact payloads `enumerate`
+    /// sends the profiler, so ground truth is measured on the histograms the
+    /// cache was built from rather than on a Python re-sampling of them.
+    ///
+    /// `NVFP4_MOE_DUMP_CONFIG` names a `Nvfp4FusedMoeKernelConfig` JSON file,
+    /// `NVFP4_MOE_DUMP_TOKENS` a comma list of token counts. Each payload is
+    /// printed on one line after the `PAYLOAD ` marker. Used by
+    /// `tools/cache-fidelity-analyzer/nvfp4_fused_moe_fidelity.py`.
+    #[test]
+    #[ignore = "fidelity payload dump; driven by nvfp4_fused_moe_fidelity.py"]
+    fn dump_enumerate_payloads() {
+        let (Ok(path), Ok(tokens)) = (
+            std::env::var("NVFP4_MOE_DUMP_CONFIG"),
+            std::env::var("NVFP4_MOE_DUMP_TOKENS"),
+        ) else {
+            return;
+        };
+        let config: Nvfp4FusedMoeKernelConfig =
+            serde_json::from_slice(&std::fs::read(&path).expect("dump config readable"))
+                .expect("dump config parses");
+        Nvfp4FusedMoeSpec::validate_config(&config).expect("dump config valid");
+        let tokens: Vec<f64> = tokens
+            .split(',')
+            .map(|t| t.trim().parse().expect("token count"))
+            .collect();
+        let grid = SweepGrid::new(vec![tokens]);
+        for backend in &config.backends {
+            for payload in Nvfp4FusedMoeSpec::enumerate(&config, &grid, backend) {
+                println!("PAYLOAD {}", serde_json::to_string(payload.fields()).unwrap());
+            }
+        }
     }
 
     #[test]

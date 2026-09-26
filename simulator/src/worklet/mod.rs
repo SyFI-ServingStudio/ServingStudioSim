@@ -28,6 +28,11 @@ pub mod glm52_moe_router_local;
 pub mod glm52_mtp_head_local;
 pub mod glm52_mtp_prelude_local;
 pub mod glm52_shared_expert_local;
+mod glm53_common;
+pub mod glm53_dsa_attn_local;
+pub mod glm53_fp8_mlp_local;
+pub mod glm53_kda_attn_local;
+pub mod glm53_moe_local;
 pub mod mlp_block_tp;
 pub mod moe_expert_compute_local;
 pub mod native_fp8_moe_router_local;
@@ -107,6 +112,23 @@ pub use fp8_post_attn_router_tp::{
 pub use fp8_pre_attn_proj_tp::{
     Fp8PreAttnProjTpWorklet, Fp8PreAttnProjTpWorkletConfig, Fp8PreAttnProjTpWorkletInput,
     Fp8PreAttnProjTpWorkletResolved,
+};
+pub use glm53_dsa_attn_local::{
+    Glm53DsaAttnLocalWorklet, Glm53DsaAttnLocalWorkletConfig, Glm53DsaAttnLocalWorkletInput,
+    Glm53DsaAttnLocalWorkletResolved,
+};
+pub use glm53_fp8_mlp_local::{
+    Glm53Fp8MlpLocalWorklet, Glm53Fp8MlpLocalWorkletConfig, Glm53Fp8MlpLocalWorkletInput,
+    Glm53Fp8MlpLocalWorkletResolved,
+};
+pub use glm53_kda_attn_local::{
+    Glm53KdaAttnLocalWorklet, Glm53KdaAttnLocalWorkletConfig, Glm53KdaAttnLocalWorkletInput,
+    Glm53KdaAttnLocalWorkletResolved,
+};
+pub use glm53_moe_local::{
+    Glm53MoeRouterLocalWorklet, Glm53MoeRouterLocalWorkletConfig, Glm53MoeRouterLocalWorkletInput,
+    Glm53RoutedMoeLocalWorklet, Glm53RoutedMoeLocalWorkletConfig, Glm53RoutedMoeLocalWorkletInput,
+    Glm53RoutedMoeLocalWorkletResolved,
 };
 pub use glm52_dense_ffn_local::{
     Glm52DenseFfnLocalWorklet, Glm52DenseFfnLocalWorkletConfig, Glm52DenseFfnLocalWorkletInput,

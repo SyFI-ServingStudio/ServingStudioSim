@@ -13,6 +13,14 @@
 //! request, so the group width is a physical property of the pattern rather than
 //! a fixed two. `ValidCountsPattern::SpeculativeGroups` carries it, and derives
 //! its axes from the group-of-two anchors by request count.
+//!
+//! GLM-5.3-Flash's pooled indexer (kpool) selects `index_topk` pools plus the
+//! trailing partial pool, so a row's active count is
+//! `min(n, index_topk + n mod index_kpool) <= index_topk + index_kpool - 1`
+//! (2051), inside a page table `round_up(2051, 128) = 2176` wide
+//! (`selected_k`). `ValidCountsPattern::PooledUniformFull` carries the pooling
+//! so decode derives `u:min(ctx, index_topk + index_kpool - 1)` instead of
+//! clipping at the page-table width, and sweeps its own smaller grid.
 
 use crate::timing::bridge::{ArgsPayload, DType, KernelKind, de_backends};
 use crate::timing::cache::{CacheKind, Extrapolation};
@@ -45,6 +53,23 @@ const SPECULATIVE_CACHE_AXIS: [u32; 31] = [
     1, 2, 3, 4, 8, 16, 23, 32, 45, 63, 64, 65, 127, 128, 129, 182, 256, 512, 1024, 2047, 2048,
     2049, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576,
 ];
+/// Pooled decode queries stop at the TRTLLM 32,768-query launch guard, so the
+/// grid carries no cell the backend must mask. 96 splits the 64..127 decode
+/// batch gap, where the saturated time bends (B200 b3 fidelity).
+const POOLED_QUERY_AXIS: [u32; 21] = [
+    1, 2, 4, 8, 16, 32, 64, 96, 127, 128, 129, 255, 256, 257, 512, 1024, 2048, 4096, 8192, 16384,
+    32768,
+];
+/// Pooled context points below and above the saturating count. The
+/// pooling-derived `index_topk` and cap points are added by
+/// `pooled_cache_axis`; past the cap only the gather footprint grows.
+/// 768 splits 512..1024, where small-batch time dips then climbs.
+const POOLED_CACHE_AXIS: [u32; 21] = [
+    1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 768, 1024, 1536, 4096, 8192, 16384, 32768, 65536,
+    131072, 262144, 1048576,
+];
+/// Backends whose TRTLLM-gen launch rejects more than 32,768 query rows.
+const TRTLLM_BACKENDS: [&str; 2] = ["flashinfer_trtllm_fp8", "flashinfer_trtllm_fp8_vllm_fork"];
 
 /// Which valid-slot-count shape a config sweeps.
 ///
@@ -60,6 +85,11 @@ pub enum ValidCountsPattern {
     /// A speculative verify step: `group_size` rows per request, each seeing one
     /// fewer context token than the next.
     SpeculativeGroups { group_size: u32 },
+    /// Pooled-indexer decode: every row sees its whole context, but the indexer
+    /// keeps at most `index_topk` pools of `index_kpool` tokens plus the
+    /// partial tail pool, so the count saturates at
+    /// `index_topk + index_kpool - 1`, below the `selected_k` page-table width.
+    PooledUniformFull { index_topk: u32, index_kpool: u32 },
 }
 
 impl ValidCountsPattern {
@@ -76,6 +106,35 @@ impl ValidCountsPattern {
             0 => None,
             1 => Some(Self::UniformFull),
             group_size => Some(Self::SpeculativeGroups { group_size }),
+        }
+    }
+
+    /// Largest active count a row can reach under this pattern.
+    ///
+    /// Unpooled patterns clip at the `selected_k` page-table width. The pooled
+    /// pattern keeps `index_topk` whole pools plus up to `index_kpool - 1`
+    /// trailing tokens (vLLM `_expand_pools_and_append_tail`), which must fit
+    /// the page table.
+    fn valid_count_cap(self, selected_k: u32) -> u32 {
+        match self {
+            Self::PooledUniformFull {
+                index_topk,
+                index_kpool,
+            } => {
+                assert!(
+                    index_topk > 0 && index_kpool > 0,
+                    "pooled index_topk and index_kpool must be positive"
+                );
+                let cap = index_topk
+                    .checked_add(index_kpool - 1)
+                    .expect("pooled valid-count cap overflows u32");
+                assert!(
+                    cap <= selected_k,
+                    "pooled valid-count cap {cap} exceeds selected_k {selected_k}"
+                );
+                cap
+            }
+            Self::UniformFull | Self::CausalTail | Self::SpeculativeGroups { .. } => selected_k,
         }
     }
 }
@@ -129,6 +188,15 @@ impl KernelSpec for DsaSparseMlaAttentionSpec {
                 speculative_query_axis(group_size),
                 speculative_cache_axis(group_size, config.selected_k),
             ),
+            ValidCountsPattern::PooledUniformFull { index_topk, .. } => (
+                POOLED_QUERY_AXIS.to_vec(),
+                pooled_cache_axis(
+                    index_topk,
+                    config
+                        .valid_counts_pattern
+                        .valid_count_cap(config.selected_k),
+                ),
+            ),
         };
         SweepGrid::new(vec![
             Axis::values(query_axis.iter().copied()),
@@ -149,10 +217,13 @@ impl KernelSpec for DsaSparseMlaAttentionSpec {
         // one iteration far below that, so 32,768 remains a generous measured
         // extrapolation guard without requiring an unsupported launch.
         let trtllm_query_too_large = |num_queries: f64| {
-            config.backends.contains(&"flashinfer_trtllm_fp8") && num_queries > 32_768.0
+            TRTLLM_BACKENDS
+                .iter()
+                .any(|backend| config.backends.contains(backend))
+                && num_queries > 32_768.0
         };
         match config.valid_counts_pattern {
-            ValidCountsPattern::UniformFull => {
+            ValidCountsPattern::UniformFull | ValidCountsPattern::PooledUniformFull { .. } => {
                 grid.expand_2d(|num_queries, _| trtllm_query_too_large(num_queries))
             }
             ValidCountsPattern::CausalTail => grid.expand_2d(|num_queries, num_cache_tokens| {
@@ -202,7 +273,9 @@ impl KernelSpec for DsaSparseMlaAttentionSpec {
                         config.valid_counts_pattern,
                         num_queries,
                         num_cache_tokens,
-                        config.selected_k,
+                        config
+                            .valid_counts_pattern
+                            .valid_count_cap(config.selected_k),
                     ),
                 )
                 .with("index_distribution", config.index_distribution.clone())
@@ -212,9 +285,16 @@ impl KernelSpec for DsaSparseMlaAttentionSpec {
 }
 
 /// Derive the exact canonical Python valid-count encoding from physical axes.
+///
+/// `k` is the pattern's valid-count cap (`ValidCountsPattern::valid_count_cap`):
+/// `selected_k` for unpooled patterns, `index_topk + index_kpool - 1` pooled.
 fn canonical_valid_counts(pattern: ValidCountsPattern, q: u32, s: u32, k: u32) -> String {
     match pattern {
         ValidCountsPattern::UniformFull => format!("u:{}x{q}", s.min(k)),
+        ValidCountsPattern::PooledUniformFull {
+            index_topk,
+            index_kpool,
+        } => canonical_pooled_counts(q, s, index_topk, index_kpool),
         ValidCountsPattern::CausalTail => {
             if q > s {
                 return masked_placeholder(q);
@@ -237,6 +317,51 @@ fn canonical_valid_counts(pattern: ValidCountsPattern, q: u32, s: u32, k: u32) -
             canonical_speculative_counts(q, s, k, group_size)
         }
     }
+}
+
+/// Pooled decode rows past `index_topk` keep `index_topk` pools plus the
+/// `n mod index_kpool` tail tokens of their own context `n`. A decode batch's
+/// contexts are unrelated, so its rows spread over every tail phase: row `i`
+/// sees `min(s, index_topk + i mod index_kpool)`. The phases are not
+/// interchangeable on B200 (job 1141, 32 queries): 2048 / 2049 / 2050 / 2051
+/// active rows take 16.8 / 26.3 / 21.9 / 18.8 us and the phase-mixed batch
+/// 21.9 us, so a single saturated count would misstate the batch by up to 30%.
+///
+/// The encoding mirrors Python `_encode_valid_counts`: uniform, then a +1
+/// ramp, then the shortest repeating group.
+fn canonical_pooled_counts(q: u32, s: u32, index_topk: u32, index_kpool: u32) -> String {
+    if s <= index_topk {
+        return format!("u:{s}x{q}");
+    }
+    let counts: Vec<u32> = (0..q)
+        .map(|row| s.min(index_topk + row % index_kpool))
+        .collect();
+    if counts.iter().all(|&count| count == counts[0]) {
+        return format!("u:{}x{q}", counts[0]);
+    }
+    if counts
+        .iter()
+        .enumerate()
+        .all(|(row, &count)| count == counts[0] + row as u32)
+    {
+        return format!("r:{}..{}", counts[0], counts[counts.len() - 1]);
+    }
+    let len = counts.len();
+    let period = (1..=len)
+        .find(|&candidate| {
+            len % candidate == 0
+                && counts
+                    .iter()
+                    .enumerate()
+                    .all(|(row, &count)| count == counts[row % candidate])
+        })
+        .expect("the whole vector is always a period");
+    let group = counts[..period]
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("g:({group})x{}", len / period)
 }
 
 /// Scale the frozen group-of-two query anchors by request count.
@@ -347,6 +472,17 @@ fn canonical_speculative_counts(q: u32, s: u32, k: u32, group_size: u32) -> Stri
         .collect::<Vec<_>>()
         .join(",");
     format!("g:({counts})x{}", q / group_size)
+}
+
+/// Pooled context axis: the fixed points plus `index_topk` (last unsaturated
+/// power-of-two anchor) and the saturating cap, so the linear cache never
+/// interpolates across the point where the count stops growing.
+fn pooled_cache_axis(index_topk: u32, cap: u32) -> Vec<u32> {
+    let mut axis = POOLED_CACHE_AXIS.to_vec();
+    axis.extend([index_topk, cap]);
+    axis.sort_unstable();
+    axis.dedup();
+    axis
 }
 
 fn masked_placeholder(q: u32) -> String {
@@ -576,6 +712,128 @@ mod tests {
 
         assert!(!masked(&mask, &grid, 32768, 1_048_576));
         assert!(masked(&mask, &grid, 65536, 1_048_576));
+    }
+
+    const FORK_BACKEND: &str = "flashinfer_trtllm_fp8_vllm_fork";
+
+    /// GLM-5.3-Flash TP4 decode on B200, the exact values of b2-dsa 5.1.
+    fn pooled_fork_config() -> DsaSparseMlaAttentionKernelConfig {
+        DsaSparseMlaAttentionKernelConfig {
+            backends: vec![FORK_BACKEND],
+            gpu_name: "NVIDIA B200".to_string(),
+            num_heads: Dim::param("num_attention_heads", 16),
+            num_kv_heads: Dim::param("num_kv_heads", 1),
+            selected_k: 2176,
+            latent_dim: Dim::param("kv_lora_rank", 512),
+            rope_dim: Dim::param("qk_rope_head_dim", 0),
+            value_dim: Dim::param("kv_lora_rank", 512),
+            softmax_scale_denominator: 16,
+            q_dtype: DType::Fp8E4m3,
+            cache_dtype: DType::Fp8E4m3,
+            index_dtype: "int32".to_string(),
+            output_dtype: DType::Bf16,
+            valid_counts_pattern: ValidCountsPattern::PooledUniformFull {
+                index_topk: 2048,
+                index_kpool: 4,
+            },
+            index_distribution: "unique_scattered_pages".to_string(),
+            cache_layout: "hnd_paged_mqa_fp8_latent".to_string(),
+        }
+    }
+
+    /// Catches a pooled decode clipping at the 2176-wide page table (up to 125
+    /// phantom active slots per row) or any drift from the fork runner's args.
+    #[test]
+    fn pooled_fork_payloads_cap_at_topk_plus_kpool_minus_one() {
+        let cfg = pooled_fork_config();
+        let grid = DsaSparseMlaAttentionSpec::sweep_grid(&cfg);
+        let payloads = DsaSparseMlaAttentionSpec::enumerate(&cfg, &grid, FORK_BACKEND);
+
+        // Past index_topk the rows spread over the four tail phases (job 1141).
+        for (q, s, expected) in [
+            (32, 1024, "u:1024x32"),
+            (32, 2048, "u:2048x32"),
+            (32, 2051, "g:(2048,2049,2050,2051)x8"),
+            (32, 4096, "g:(2048,2049,2050,2051)x8"),
+            (4, 4096, "r:2048..2051"),
+            (2, 4096, "r:2048..2049"),
+        ] {
+            let fields = payload_for(&payloads, &grid, q, s).fields();
+            assert_eq!(fields.get("valid_counts"), Some(&Value::from(expected)));
+        }
+        let odd = payload_for(&payloads, &grid, 127, 4096).fields()["valid_counts"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(odd.starts_with("g:(2048,2049,2050,2051,2048,") && odd.ends_with(",2050)x1"));
+        let fields = payload_for(&payloads, &grid, 1, 1_048_576).fields();
+        assert_eq!(fields.get("valid_counts"), Some(&Value::from("u:2048x1")));
+        assert_eq!(
+            serde_json::to_value(fields).unwrap(),
+            serde_json::json!({
+                "backend": FORK_BACKEND,
+                "num_queries": 1,
+                "num_cache_tokens": 1_048_576,
+                "num_heads": 16,
+                "num_kv_heads": 1,
+                "selected_k": 2176,
+                "latent_dim": 512,
+                "rope_dim": 0,
+                "value_dim": 512,
+                "softmax_scale": 0.0625,
+                "q_dtype": "fp8_e4m3",
+                "cache_dtype": "fp8_e4m3",
+                "index_dtype": "int32",
+                "output_dtype": "bf16",
+                "valid_counts": "u:2048x1",
+                "index_distribution": "unique_scattered_pages",
+                "cache_layout": "hnd_paged_mqa_fp8_latent",
+            })
+        );
+        assert_eq!(cfg.compute_dtype(), Some(DType::Fp8E4m3));
+        assert_eq!(cfg.kv_dtype(), Some(DType::Fp8E4m3));
+    }
+
+    /// Catches the pooled grid losing the saturation bracket or growing past
+    /// the 500-feasible-coordinate ceiling.
+    #[test]
+    fn pooled_grid_brackets_saturation_within_the_coordinate_ceiling() {
+        let cfg = pooled_fork_config();
+        let grid = DsaSparseMlaAttentionSpec::sweep_grid(&cfg);
+        assert_contiguous(&grid.axes()[1], &[1024, 1536, 2048, 2051, 4096]);
+        assert_eq!(grid.axes()[0].last(), Some(&32768.0));
+        assert_eq!(grid.axes()[1].last(), Some(&1_048_576.0));
+        let mask = DsaSparseMlaAttentionSpec::infeasible_mask(&cfg, &grid);
+        assert_mask_split(&mask, 21 * 23, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds selected_k")]
+    fn pooled_cap_must_fit_the_page_table() {
+        let mut cfg = pooled_fork_config();
+        cfg.selected_k = 2048;
+        DsaSparseMlaAttentionSpec::sweep_grid(&cfg);
+    }
+
+    /// Catches the fork backend escaping the TRTLLM >32,768-query guard.
+    #[test]
+    fn fork_backend_shares_the_trtllm_query_guard() {
+        let mut cfg = config(ValidCountsPattern::UniformFull);
+        cfg.backends = vec![FORK_BACKEND];
+        let grid = DsaSparseMlaAttentionSpec::sweep_grid(&cfg);
+        let mask = DsaSparseMlaAttentionSpec::infeasible_mask(&cfg, &grid);
+        assert!(!masked(&mask, &grid, 32768, 1_048_576));
+        assert!(masked(&mask, &grid, 65536, 1));
+
+        let pooled = pooled_fork_config();
+        let synthetic = crate::timing::sweep::SweepGrid::new(vec![
+            crate::timing::sweep::Axis::values([32768, 65536]),
+            crate::timing::sweep::Axis::values([2051]),
+        ]);
+        assert_eq!(
+            DsaSparseMlaAttentionSpec::infeasible_mask(&pooled, &synthetic),
+            vec![false, true]
+        );
     }
 
     #[test]

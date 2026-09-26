@@ -548,3 +548,30 @@ print(json.dumps({
         "kernels": False,
         "cuda_initialized": False,
     }
+
+
+def test_rope_free_512_wide_layout_equals_the_576_layout_with_zero_rope() -> None:
+    generator = torch.Generator().manual_seed(3)
+    q = torch.randn((3, 2, _VALUE_DIM), generator=generator).to(torch.bfloat16)
+    cache = torch.randn((9, 1, _VALUE_DIM), generator=generator).to(torch.bfloat16)
+    indices = torch.tensor([[[4, 0, -1, 8]], [[-1, -1, -1, -1]], [[2, 2, 7, 1]]], dtype=torch.int32)
+    padded_q = torch.zeros((3, 2, _SCORE_DIM), dtype=torch.bfloat16)
+    padded_cache = torch.zeros((9, 1, _SCORE_DIM), dtype=torch.bfloat16)
+    padded_q[..., :_VALUE_DIM] = q
+    padded_cache[..., :_VALUE_DIM] = cache
+
+    actual = dsa_sparse_mla_attention_reference(q, cache, indices, softmax_scale=_SCALE)
+    expected = dsa_sparse_mla_attention_reference(
+        padded_q, padded_cache, indices, softmax_scale=_SCALE
+    )
+
+    assert actual.shape == (3, 2, _VALUE_DIM)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_q_and_cache_widths_must_agree() -> None:
+    q = torch.zeros((1, 1, _VALUE_DIM), dtype=torch.bfloat16)
+    cache = torch.zeros((2, 1, _SCORE_DIM), dtype=torch.bfloat16)
+    indices = torch.zeros((1, 1, 1), dtype=torch.int32)
+    with pytest.raises(ValueError, match="cache score width must be 512"):
+        dsa_sparse_mla_attention_reference(q, cache, indices, softmax_scale=_SCALE)

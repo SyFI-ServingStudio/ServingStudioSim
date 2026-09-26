@@ -99,6 +99,11 @@ const fn default_glm52_nvfp4_max_model_len() -> u32 {
     1_048_576
 }
 
+/// The captured GLM-5.3-Flash deployment's `--max-model-len`.
+const fn default_glm53_flash_max_model_len() -> u32 {
+    8192
+}
+
 /// A speculative GLM must actually run its MTP layer, so unlike the ordinary
 /// selector it cannot default to `off`.
 const fn default_glm52_speculative_mtp_mode() -> Glm52MtpMode {
@@ -447,6 +452,41 @@ pub enum IterArchSel {
         #[param(cache_key)]
         token_corpus_file: Option<String>,
     },
+    /// GLM-5.3-Flash FP8 block checkpoint on B200 through the vLLM fork: 34 KDA
+    /// + 11 DSA (kpool indexer) layers, 3 dense + 42 MoE FFNs, 4-wide mHC. One
+    /// TP = EP rank group; MTP is not run.
+    Glm53FlashVllmFp8KdaDsaMoe {
+        #[serde(flatten)]
+        model: ModelSpec,
+        /// Shared tensor/expert-parallel rank count.
+        #[serde(default = "default_glm52_nvfp4_parallel_size")]
+        #[param(default = 4, cache_key)]
+        tp_size: u16,
+        /// Configured context cap: the indexer's logits row stride and the
+        /// sparse-index page-table extent.
+        #[serde(default = "default_glm53_flash_max_model_len")]
+        #[param(default = 8192, cache_key)]
+        max_model_len: u32,
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS)]
+        routing: RoutingKind,
+        #[serde(default)]
+        routing_seed: Option<u64>,
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+        /// Recorded per-token expert routes from a `token_corpus` pass, as a
+        /// manifest path. Requires `routing = corpus`.
+        #[serde(default)]
+        #[param(cache_key)]
+        token_corpus_file: Option<String>,
+        /// vLLM `--cudagraph-capture-sizes`. The engine pads an iteration's
+        /// token count up to the next captured size, and every kernel outside
+        /// the attention graph break runs on the padded rows. Empty: no
+        /// padding (eager).
+        #[serde(default)]
+        cudagraph_capture_sizes: Vec<u32>,
+    },
     /// SGLang's B200 NVFP4 launch graph under pure tensor parallelism. Every
     /// rank owns all experts (EP1) and shards the routed intermediate axis by
     /// TP, so there is no expert-parallel or NVLink-domain selector.
@@ -496,6 +536,7 @@ impl IterArchSel {
             | Self::Glm52VllmNvfp4DsaMoe { model, .. }
             | Self::Glm52VllmNvfp4DsaMoeSpeculative { model, .. }
             | Self::Glm53VllmNvfp4DsaMoeDflash2 { model, .. }
+            | Self::Glm53FlashVllmFp8KdaDsaMoe { model, .. }
             | Self::Glm52SglangNvfp4TpDsaMoe { model, .. } => model,
         }
     }

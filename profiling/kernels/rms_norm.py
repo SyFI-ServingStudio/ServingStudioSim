@@ -58,3 +58,25 @@ register(
         batch_outlier_policy=BatchOutlierPolicy(),
     )
 )
+
+# vLLM's own CUDA op (``RMSNorm.forward_cuda`` without residual), run in the
+# pinned vLLM image; ``csrc/layernorm_kernels.cu`` is identical in the fork.
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="vllm_cuda",
+        supports=BackendSupport(
+            compute=frozenset({DType.BF16}),
+            gpus=frozenset({"NVIDIA B200"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.norm.rms_norm_vllm_cuda",
+            function_name="profile_rms_norm_vllm_cuda",
+        ),
+        table_name=KIND,
+        args_schema=RmsNormArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="vllm_env",
+    )
+)

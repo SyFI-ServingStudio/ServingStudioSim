@@ -1,4 +1,4 @@
-//! DeepSeek V4 fused QR/KV RMSNorm launch.
+//! Fused QR/KV RMSNorm launch (DeepSeek V4; GLM-5.3 via the `vllm_fork_triton` backend).
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::CacheKind;
@@ -33,7 +33,9 @@ impl KernelSpec for DeepseekV4FusedQKvRmsnormSpec {
     fn sweep_grid(config: &Self::Config) -> SweepGrid {
         assert_eq!(config.q_dim.get(), 1536);
         assert_eq!(config.kv_dim.get(), 512);
-        assert_eq!(f64::from_bits(config.rms_eps_bits), 1.0e-6);
+        // DeepSeek V4 uses 1e-6, GLM-5.3 1e-5; the scalar never changes the launch.
+        let eps = f64::from_bits(config.rms_eps_bits);
+        assert!(eps == 1.0e-6 || eps == 1.0e-5, "unsupported rms_eps {eps}");
         let mut tokens = Axis::chain([Axis::pow2(0, 4), Axis::token_axis()]);
         tokens.sort_by(f64::total_cmp);
         tokens.dedup();
@@ -65,3 +67,27 @@ register_kernel!(
     DeepseekV4FusedQKvRmsnormKernel,
     DeepseekV4FusedQKvRmsnormSpec
 );
+
+#[cfg(test)]
+mod tests {
+    use super::{DeepseekV4FusedQKvRmsnormKernelConfig, DeepseekV4FusedQKvRmsnormSpec};
+    use crate::timing::bridge::DType;
+    use crate::timing::kernels::engine::KernelSpec;
+    use serde_json::Value;
+
+    #[test]
+    fn glm53_epsilon_is_forwarded_unchanged() {
+        let config = DeepseekV4FusedQKvRmsnormKernelConfig {
+            backends: vec!["vllm_fork_triton"],
+            gpu_name: "NVIDIA B200".to_string(),
+            q_dim: 1536.into(),
+            kv_dim: 512.into(),
+            rms_eps_bits: 1.0e-5_f64.to_bits(),
+            dtype: DType::Bf16,
+        };
+        let grid = DeepseekV4FusedQKvRmsnormSpec::sweep_grid(&config);
+        let payload =
+            &DeepseekV4FusedQKvRmsnormSpec::enumerate(&config, &grid, "vllm_fork_triton")[0];
+        assert_eq!(payload.fields().get("rms_eps"), Some(&Value::from(1.0e-5)));
+    }
+}

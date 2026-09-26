@@ -20,6 +20,11 @@
 //! constraint covers active + reserved + retained + held and their recurrent
 //! shares without a second admission ledger.
 //!
+//! Chunked prefill ([`ChunkedPrefillKv`]) keeps that single reservation: the
+//! state is promised with the request's first chunk and committed resident with
+//! its last. Where the engine can only checkpoint state on block boundaries, the
+//! lifecycle, not this store, clips chunk ends to them.
+//!
 //! ## Why prefix reuse quantizes
 //!
 //! A full-attention cache can resume from any token: page `i` is independent of
@@ -53,14 +58,17 @@ use crate::worker::kv::shared::prefix_cache_journal::PrefixCacheJournal;
 use crate::worker::kv::shared::request_ledger::RequestLedger;
 use crate::worker::kv::shared::resident_partition::ResidentPartitionState;
 use crate::worker::kv::{
-    IterWorkerKv, KvStore, PrefixCacheTokenConfig, PrefixKv, ResolvedPrefillContext,
+    ChunkedPrefillKv, IterWorkerKv, KvStore, PrefixCacheTokenConfig, PrefixKv,
+    ResolvedPrefillContext,
 };
 use crate::worker::shared::advance_scope::{AdvanceScope, PartitionId};
 
 /// Hard-tier charge of one request, in full-attention token equivalents.
 pub struct HybridKvFootprint {
     post_prefill_context_tokens: u32,
-    remaining_output_tokens: u32,
+    /// Decode tokens the reservation covers: the whole remaining output, or a
+    /// bounded-future estimate plus one page.
+    future_decode_tokens: u32,
     /// The whole model's recurrent state for this one request. Constant.
     state_tokens: u64,
 }
@@ -69,7 +77,7 @@ impl HybridKvFootprint {
     #[inline]
     fn reserved_charge(&self) -> u64 {
         u64::from(self.post_prefill_context_tokens)
-            + u64::from(self.remaining_output_tokens)
+            + u64::from(self.future_decode_tokens)
             + self.state_tokens
     }
 }
@@ -102,7 +110,7 @@ impl KvStore for HybridGdnKv {
     ) -> Self::Footprint {
         HybridKvFootprint {
             post_prefill_context_tokens,
-            remaining_output_tokens,
+            future_decode_tokens: remaining_output_tokens,
             state_tokens: self.state_tokens_per_request,
         }
     }
@@ -182,6 +190,7 @@ impl KvStore for HybridGdnKv {
     fn release(&mut self, request: RequestId, partition: PartitionId) {
         self.ledger.take_held(request);
         self.ledger.forget_promise(request);
+        self.ledger.forget_chunked_prefill(request);
         let current_kv = self.partitions[partition as usize]
             .decode_current_kv(request)
             .unwrap_or(0);
@@ -249,6 +258,7 @@ impl IterWorkerKv for HybridGdnKv {
     fn release_external(&mut self, request: RequestId, current_kv: u64) -> Option<PartitionId> {
         let Some(partition) = self.ledger.forget_placement(request) else {
             self.ledger.take_held(request);
+            self.ledger.forget_chunked_prefill(request);
             self.ledger.take_prefill_context(request);
             return None;
         };
@@ -256,6 +266,7 @@ impl IterWorkerKv for HybridGdnKv {
         partition_state.release_decode(request, current_kv);
         partition_state.remove_prefill_admit(request);
         self.ledger.forget_promise(request);
+        self.ledger.forget_chunked_prefill(request);
         self.ledger.take_prefill_context(request);
         Some(partition)
     }
@@ -400,6 +411,158 @@ impl PrefixKv for HybridGdnKv {
                 PrefixCacheRetentionReason::RequestComplete,
             );
         }
+    }
+}
+
+/// Chunked prefill over the same two tiers. The recurrent state is part of the
+/// one footprint reserved at admission, stays promised while chunks run, and
+/// becomes resident exactly once, when the last chunk commits the request.
+impl ChunkedPrefillKv for HybridGdnKv {
+    fn bounded_future_footprint(
+        &self,
+        _request: RequestId,
+        post_prefill_context_tokens: u32,
+        remaining_output_tokens: u32,
+        max_future_tokens: u32,
+        page_size: u32,
+    ) -> Self::Footprint {
+        let future_decode_tokens = remaining_output_tokens
+            .min(max_future_tokens)
+            .checked_add(page_size)
+            .expect("bounded-future KV footprint overflow");
+        HybridKvFootprint {
+            post_prefill_context_tokens,
+            future_decode_tokens,
+            state_tokens: self.state_tokens_per_request,
+        }
+    }
+
+    /// Like [`KvStore::fits`], only the hard tier is protected: retained
+    /// prefixes and live snapshots yield.
+    fn fits_bounded_future(
+        &self,
+        partition: PartitionId,
+        footprint: &Self::Footprint,
+        max_future_tokens: u32,
+        new_token_ratio: f64,
+        decode_step_tokens: u32,
+    ) -> bool {
+        let partition_state = &self.partitions[partition as usize];
+        let protected_tokens = partition_state.resident_tokens()
+            + self.ledger.partition_promised(partition)
+            + self.ledger.partition_held(partition)
+            + footprint.reserved_charge();
+        let mut running_future =
+            partition_state.bounded_future_decode_tokens(max_future_tokens, new_token_ratio);
+        if decode_step_tokens > 0 {
+            // Bounded-future admission runs on one-token pages only.
+            let next_step = partition_state.next_decode_allocation_tokens(1, decode_step_tokens);
+            running_future = running_future.max(next_step as f64);
+        }
+        protected_tokens as f64 + running_future < partition_state.capacity_tokens() as f64
+    }
+
+    /// The live-snapshot staircase keeps its precedence over retained prefixes
+    /// but, being soft, never counts toward the shortfall.
+    fn prepare_next_decode(
+        &mut self,
+        partition: PartitionId,
+        page_size: u32,
+        step_tokens: u32,
+        now: Time,
+    ) -> u64 {
+        assert!(page_size > 0, "decode page size must be positive");
+        let partition_state = &self.partitions[partition as usize];
+        let required = partition_state.next_decode_allocation_tokens(page_size, step_tokens);
+        if required == 0 {
+            return 0;
+        }
+        let trigger = partition_state
+            .first_decode_request()
+            .expect("positive decode allocation requires a live request");
+        let protected = partition_state.resident_tokens()
+            + self.ledger.partition_promised(partition)
+            + self.ledger.partition_held(partition);
+        let capacity = partition_state.capacity_tokens();
+        let slack_after_step = capacity.saturating_sub(protected.saturating_add(required));
+        let live_checkpoints = partition_state
+            .live_checkpoint_count(self.checkpoint_interval_tokens)
+            .saturating_mul(self.state_tokens_per_request)
+            .min(slack_after_step);
+        let cache_limit = slack_after_step - live_checkpoints;
+        let evictions = self.prefix_caches[partition as usize].shrink_to(cache_limit);
+        for eviction in evictions {
+            self.journal.record_mutation(
+                trigger,
+                partition,
+                now,
+                eviction,
+                PrefixCacheEventKind::Evict(PrefixCacheEvictionReason::ActiveKvPressure),
+                0,
+            );
+        }
+        let cache_tokens = self.prefix_caches[partition as usize].used_charge();
+        let available = capacity.saturating_sub(protected.saturating_add(cache_tokens));
+        required.saturating_sub(available)
+    }
+
+    fn visit_decode_states(
+        &self,
+        partition: PartitionId,
+        mut visitor: impl FnMut(RequestId, u64, u32),
+    ) {
+        for (request, current_kv, remaining_decode) in
+            self.partitions[partition as usize].decode_states()
+        {
+            visitor(request, current_kv, remaining_decode);
+        }
+    }
+
+    fn reserve_chunked_prefill_context(
+        &mut self,
+        request: RequestId,
+        partition: PartitionId,
+        resolved_prefill: ResolvedPrefillContext,
+        footprint: Self::Footprint,
+        now: Time,
+    ) {
+        self.reserve_prefill_context(request, partition, resolved_prefill, footprint, now);
+        self.ledger.promote_promise_to_chunked_prefill(request);
+    }
+
+    fn schedule_prefill_chunk(
+        &mut self,
+        request: RequestId,
+        partition: PartitionId,
+        chunk_tokens: u32,
+    ) {
+        debug_assert!(self.ledger.has_chunked_prefill(request));
+        self.ledger.schedule_prefill_chunk(request, chunk_tokens);
+        self.partitions[partition as usize].add_prefill_admit(request);
+    }
+
+    fn complete_prefill_chunk(&mut self, request: RequestId) {
+        self.ledger.complete_prefill_chunk(request);
+    }
+
+    fn finish_chunked_prefill(
+        &mut self,
+        request: RequestId,
+        partition: PartitionId,
+        remaining_output_tokens: u32,
+    ) {
+        let context_tokens = self
+            .ledger
+            .prefill_context(request)
+            .expect("chunked prefill context must exist")
+            .post_prefill_context_tokens();
+        self.ledger.forget_chunked_prefill(request);
+        self.commit_resident(
+            request,
+            partition,
+            u64::from(context_tokens),
+            remaining_output_tokens,
+        );
     }
 }
 
@@ -624,6 +787,68 @@ mod tests {
         kv_store.release(RequestId(0), 0);
         assert_eq!(kv_store.partitions[0].resident_tokens(), 0);
         assert_eq!(kv_store.ledger.partition_promised(0), 0);
+    }
+
+    // ── chunked prefill ──────────────────────────────────────────────────────
+
+    #[test]
+    fn a_chunked_prefill_keeps_its_state_promised_until_the_last_chunk_commits_it() {
+        let mut kv_store = store(100_000, STATE_TOKENS, CHECKPOINT_INTERVAL);
+        let resolved = kv_store.preview_prefill_context(0, 5_000, SessionInput::Standalone);
+        let footprint = kv_store.footprint(RequestId(0), 5_000, 20);
+        kv_store.reserve_chunked_prefill_context(RequestId(0), 0, resolved, footprint, Time::ZERO);
+        kv_store.drain_ready();
+        let promised = 5_000 + 20 + STATE_TOKENS;
+
+        for chunk in [2_048, 2_048] {
+            kv_store.schedule_prefill_chunk(RequestId(0), 0, chunk);
+            assert_eq!(kv_store.ledger.partition_promised(0), promised);
+            assert_eq!(kv_store.partitions[0].resident_tokens(), 0);
+            kv_store.complete_prefill_chunk(RequestId(0));
+            kv_store.clear_prefill_admits(0);
+        }
+        kv_store.schedule_prefill_chunk(RequestId(0), 0, 904);
+        kv_store.complete_prefill_chunk(RequestId(0));
+        kv_store.finish_chunked_prefill(RequestId(0), 0, 20);
+        assert_eq!(kv_store.ledger.partition_promised(0), 0);
+        assert_eq!(
+            kv_store.partitions[0].resident_tokens(),
+            5_000 + STATE_TOKENS,
+            "state becomes resident exactly once"
+        );
+
+        kv_store.release(RequestId(0), 0);
+        assert_eq!(kv_store.partitions[0].resident_tokens(), 0);
+    }
+
+    #[test]
+    fn a_request_cancelled_mid_prefill_returns_its_whole_reservation() {
+        let mut kv_store = store(100_000, STATE_TOKENS, CHECKPOINT_INTERVAL);
+        let resolved = kv_store.preview_prefill_context(0, 5_000, SessionInput::Standalone);
+        let footprint = kv_store.footprint(RequestId(0), 5_000, 20);
+        kv_store.reserve_chunked_prefill_context(RequestId(0), 0, resolved, footprint, Time::ZERO);
+        kv_store.schedule_prefill_chunk(RequestId(0), 0, 2_048);
+        kv_store.complete_prefill_chunk(RequestId(0));
+
+        kv_store.release(RequestId(0), 0);
+        assert_eq!(kv_store.ledger.partition_promised(0), 0);
+        assert_eq!(
+            kv_store.status_active(0),
+            1,
+            "the prefill admit clears with the iteration"
+        );
+        kv_store.clear_prefill_admits(0);
+        assert_eq!(kv_store.status_active(0), 0);
+    }
+
+    #[test]
+    fn a_bounded_future_footprint_still_carries_the_whole_state() {
+        let kv_store = store(100_000, STATE_TOKENS, CHECKPOINT_INTERVAL);
+        let footprint = kv_store.bounded_future_footprint(RequestId(0), 1_000, 500, 64, 1);
+        assert_eq!(footprint.reserved_charge(), 1_000 + 64 + 1 + STATE_TOKENS);
+        assert!(kv_store.fits_bounded_future(0, &footprint, 64, 0.7, 1));
+        let tight = store(1_000 + 65 + STATE_TOKENS, STATE_TOKENS, CHECKPOINT_INTERVAL);
+        assert!(!tight.fits_bounded_future(0, &footprint, 64, 0.7, 1));
     }
 
     // ── soft tier: quantized reuse ───────────────────────────────────────────

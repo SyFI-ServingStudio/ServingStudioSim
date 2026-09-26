@@ -50,6 +50,11 @@ decode ``mask="full"`` interaction (``pairs() = q·k`` with ``q=1``,
 ``k=Σpairs``) reproduce the GQA work exactly without a 1.7-billion-element list.
 ``attention_step_count`` separately preserves the original state-transaction
 count required by recurrent linear attention.
+
+A model whose work is not linear in those sums (GLM-5.3's kpool DSA caps every
+query at its own top-k) has its simulator log each request; its totals then also
+carry ``request_geometry`` (``"prefill:<prefix>:<append>"`` / ``"decode:<kv_len>"``
+-> count), which becomes exact causal interactions checked against the scalars.
 """
 
 from __future__ import annotations
@@ -77,8 +82,27 @@ def _model(config_path: str):
     return load_model(config_path)
 
 
+#: Arch types whose served deployment fixes the MLA latent cache at FP8
+#: (``--kv-cache-dtype fp8_e4m3``), a serving choice the checkpoint config omits.
+_FP8_MLA_CACHE_ARCHS = frozenset({"glm53_flash_vllm_fp8_kda_dsa_moe"})
+
+
+def _with_fp8_mla_cache(model):
+    from dataclasses import replace
+
+    layers = [
+        replace(stack, attn=replace(stack.attn, mla_cache_dtype_bytes=1.0))
+        if hasattr(stack.attn, "mla_cache_dtype_bytes")
+        else stack
+        for stack in model.layers
+    ]
+    return replace(model, layers=layers)
+
+
 def _model_for_spec(spec: dict):
     model = _model(spec["config"])
+    if spec.get("arch_type") in _FP8_MLA_CACHE_ARCHS:
+        return _with_fp8_mla_cache(model)
     if spec.get("arch_type") != "glm52_vllm_nvfp4_dsa_moe_speculative":
         return model
     mode = spec.get("mtp_mode", "index_share")
@@ -241,7 +265,9 @@ def _aggregate_workload(totals: dict) -> Workload:
     sampled = int(totals["decode_passes"]) + int(totals["prefill_requests"])
     attn: list[AttnInteraction] = []
     prefill_pairs = int(totals["prefill_pairs"])
-    if prefill_pairs > 0:
+    if totals.get("request_geometry"):
+        attn = _request_interactions(totals)
+    elif prefill_pairs > 0:
         attn.append(
             AttnInteraction(
                 1,
@@ -252,7 +278,7 @@ def _aggregate_workload(totals: dict) -> Workload:
             )
         )
     decode_kv = int(totals["decode_kv"])
-    if decode_kv > 0:
+    if decode_kv > 0 and not totals.get("request_geometry"):
         attn.append(AttnInteraction(1, decode_kv, decode_kv, "full", phase="decode"))
     prefill_tokens = int(totals["prefill_tokens"])
     decode_passes = int(totals["decode_passes"])
@@ -283,6 +309,60 @@ def _aggregate_workload(totals: dict) -> Workload:
         },
         prefill_stateful_requests=prefill_stateful_requests,
     )
+
+
+def _exact_count(value, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a number")
+    if not float(value).is_integer() or value <= 0:
+        raise ValueError(f"{name} must be a positive exact integer, got {value}")
+    return int(value)
+
+
+def _request_interactions(totals: dict) -> list[AttnInteraction]:
+    """Exact causal interactions from logged per-request geometry.
+
+    A decode ``kv_len`` counts the new token (the simulator's context is ``>= 1``),
+    so the query attends ``kv_len`` keys of which ``kv_len - 1`` are cached — the
+    same ``Σ kv_len`` pairs the scalar ``decode_kv`` carries. Every scalar the
+    geometry determines must agree with it; a partially logged workload is refused.
+    """
+    interactions: list[AttnInteraction] = []
+    decode_passes = decode_kv = 0
+    prefill_requests = prefill_pairs = prefill_cached = 0
+    for encoded, raw_count in sorted(totals["request_geometry"].items()):
+        count = _exact_count(raw_count, f"request_geometry[{encoded!r}]")
+        kind, *lengths = encoded.split(":")
+        values = [int(length) for length in lengths]
+        if kind == "decode" and len(values) == 1 and values[0] >= 1:
+            (kv_len,) = values
+            interactions.append(AttnInteraction(1, kv_len, kv_len - 1, "causal", "decode", count))
+            decode_passes += count
+            decode_kv += count * kv_len
+        elif kind == "prefill" and len(values) == 2 and values[1] >= 1:
+            prefix, append = values
+            interactions.append(
+                AttnInteraction(append, prefix + append, prefix, "causal", "prefill", count)
+            )
+            prefill_requests += count
+            prefill_pairs += count * (append * prefix + append * (append + 1) // 2)
+            prefill_cached += count * prefix
+        else:
+            raise ValueError(f"malformed request_geometry key {encoded!r}")
+    derived = {
+        "decode_passes": decode_passes,
+        "decode_kv": decode_kv,
+        "prefill_requests": prefill_requests,
+        "prefill_pairs": prefill_pairs,
+        "prefill_cached": prefill_cached,
+    }
+    for name, value in derived.items():
+        if int(totals.get(name, 0)) != value:
+            raise ValueError(
+                f"request_geometry gives {name}={value} but the workload carries "
+                f"{int(totals.get(name, 0))}; per-request geometry must cover every group"
+            )
+    return interactions
 
 
 def _peak_resolver(spec: dict):
@@ -586,7 +666,13 @@ def _validated_basis(
     """Build and independently validate one basis before any batch reduction."""
     totals = weighted_shapes[0]["totals"]
     basis_key = _basis_key(model, totals, has_routed_matmul)
-    if totals.get("speculative_geometry") or len(weighted_shapes) < _MIN_BASIS_GROUP:
+    # Per-request geometry exists exactly because the work is not affine in the
+    # scalars, so such shapes are always reduced directly.
+    if (
+        totals.get("speculative_geometry")
+        or totals.get("request_geometry")
+        or len(weighted_shapes) < _MIN_BASIS_GROUP
+    ):
         # Counted with the validation failures: both mean "this group was reduced
         # one shape at a time".
         basis_cache[basis_key] = None

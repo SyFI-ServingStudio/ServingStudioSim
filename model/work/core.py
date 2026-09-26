@@ -288,6 +288,7 @@ _FLOPS_BUCKET = {
     "expert": "ffn",
     "shared_expert": "ffn",
     "router": "router",
+    "residual_mix": "residual_mix",
 }
 _PARAM_BUCKET = {
     "attn_proj": "attn",
@@ -295,6 +296,7 @@ _PARAM_BUCKET = {
     "expert": "experts",
     "shared_expert": "shared",
     "router": "router",
+    "residual_mix": "residual_mix",
 }
 
 
@@ -351,6 +353,9 @@ class MatmulGroup:
 # ---------------------------------------------------------------------------
 
 _FLOPS_KEYS = ("attn_proj", "attn_internal", "ffn", "router", "lm_head")
+#: Buckets only a model with a :attr:`LayerStack.mixer` produces. They are added
+#: on first use so every other model's FLOP and parameter dicts stay unchanged.
+_OPTIONAL_KEYS = ("residual_mix",)
 _BYTES_KEYS = ("weights", "kv")
 _PARAM_BREAKDOWN_KEYS = (
     "embedding",
@@ -556,6 +561,11 @@ class LayerStack:
     ``extra_matmuls`` carries per-layer projections that belong to neither the
     attention nor the FFN — the MTP layer's ``eh_proj`` is the only one today.
 
+    ``mixer`` is an optional residual-stream mixer around the sublayers
+    (hyper-connections, e.g. GLM-5.3's mHC). Like an attention spec it may expose
+    ``matmul_groups()``, ``learned_weight_groups()``, and
+    ``semantic_segments(wl)``; its rows fold ``count`` times like the rest.
+
     ``count`` is how many times these weights are *traversed*, which is what byte
     traffic and FLOPs scale with. ``param_count`` is how many distinct copies of
     them the checkpoint holds, and defaults to ``count`` because a stack normally
@@ -572,6 +582,7 @@ class LayerStack:
     stage: str | None = None
     extra_matmuls: list[MatmulGroup] = field(default_factory=list)
     param_count: int | None = None
+    mixer: object | None = None
 
     @property
     def distinct_instances(self) -> int:
@@ -627,6 +638,9 @@ class Model:
     #: What the checkpoint's ``quantization_config`` declared, if anything. None
     #: means every weight is stored and computed at ``master_dtype``.
     quant: QuantScheme | None = None
+    #: Once-per-forward semantic work after the last layer that is neither a norm nor
+    #: the head (GLM-5.3's final mHC post). Each item exposes ``semantic_segments(wl)``.
+    epilogue: list[object] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         # Builders pass the config's own spelling ("bfloat16"); segments and the
@@ -729,10 +743,12 @@ class Model:
                 continue
             tokens = stack_wl.matmul_tokens
             prefix = f"{stack.tag}." if stack.tag else ""
+            mixer_groups = stack.mixer.matmul_groups() if stack.mixer is not None else []
             for group in (
                 *stack.attn.matmul_groups(),
                 *stack.ffn.matmul_groups(),
                 *stack.extra_matmuls,
+                *mixer_groups,
             ):
                 loaded = group.loaded_instances(tokens)
                 segments.append(
@@ -749,9 +765,12 @@ class Model:
                 instances = stack.distinct_instances
                 activated_params += group.activated_params * instances
                 total_params += group.total_params * instances
+                breakdown.setdefault(_PARAM_BUCKET[group.bucket], 0)
                 breakdown[_PARAM_BUCKET[group.bucket]] += group.total_params * instances
 
-            for component in (stack.attn, stack.ffn):
+            for component in (stack.attn, stack.ffn, stack.mixer):
+                if component is None:
+                    continue
                 for weight in getattr(component, "learned_weight_groups", lambda: [])():
                     segments.append(
                         Segment(
@@ -767,6 +786,7 @@ class Model:
                     params = weight.elements * stack.distinct_instances
                     activated_params += params
                     total_params += params
+                    breakdown.setdefault(weight.breakdown, 0)
                     breakdown[weight.breakdown] += params
 
             # Attention semantic phases remain independent of simulator shapes.
@@ -827,6 +847,23 @@ class Model:
                         )
                     )
 
+            mixer_semantics = (
+                getattr(stack.mixer, "semantic_segments", None) if stack.mixer is not None else None
+            )
+            if mixer_semantics is not None:
+                for semantic in mixer_semantics(stack_wl):
+                    segments.append(
+                        Segment(
+                            name=f"{prefix}{semantic.name}",
+                            bucket=semantic.bucket,
+                            byte_kind=semantic.byte_kind,
+                            flops=semantic.flops,
+                            bytes=semantic.bytes,
+                            count=stack.count,
+                            compute_dtype=semantic.compute_dtype or self.master_dtype,
+                        )
+                    )
+
         # Normalization activations can stay on-chip across a globally fused path,
         # but learned scale vectors are compulsory model weights. They intentionally
         # carry zero FLOPs here: only matmul/attention math is pinned as irreducible.
@@ -853,6 +890,20 @@ class Model:
             activated_params += norm_params
             total_params += norm_params
             breakdown[norm_weight.breakdown] += norm_params
+
+        for component in self.epilogue:
+            for semantic in component.semantic_segments(wl):
+                segments.append(
+                    Segment(
+                        name=semantic.name,
+                        bucket=semantic.bucket,
+                        byte_kind=semantic.byte_kind,
+                        flops=semantic.flops,
+                        bytes=semantic.bytes,
+                        count=1,
+                        compute_dtype=semantic.compute_dtype or self.master_dtype,
+                    )
+                )
 
         # --- embedding gather (whole iteration): reads the needed rows of the table. ---
         # The embedding matrix is a weight, so its read is capped at ONE pass of the
@@ -924,6 +975,8 @@ class Model:
         flops = empty_flops()
         byte_sum = empty_bytes()
         for segment in segments:
+            if segment.bucket in _OPTIONAL_KEYS:
+                flops.setdefault(segment.bucket, 0.0)
             if segment.bucket in flops:
                 flops[segment.bucket] += segment.flops_total
             byte_sum[segment.byte_kind] += segment.bytes_total

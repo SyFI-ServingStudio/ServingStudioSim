@@ -16,7 +16,7 @@ from typing import Any
 from profiling.db.args import DType
 from profiling.profilers.energy import Energy
 from profiling.profilers.timer import Timer
-from profiling.runners.attention._gdn_common import require_exact_gpu
+from profiling.runners.attention._gdn_common import require_supported_gpu
 from profiling.runners.attention.gdn_causal_conv_prefill_torch import (
     _logical_bytes,
     _semantic_flops,
@@ -34,7 +34,7 @@ _CALLABLE_NAME = "causal_conv1d_fn"
 _METADATA_MODULE = "vllm.v1.attention.backends.utils"
 _METADATA_NAME = "compute_causal_conv1d_metadata"
 _KERNEL_NAME = "_causal_conv1d_fwd_kernel"
-_REQUIRED_GPU = "NVIDIA H200"
+_SUPPORTED_GPUS = frozenset({"NVIDIA H200", "NVIDIA B200"})
 _SUPPORTED_KERNEL_SIZES = frozenset(range(2, 5))
 _BLOCK_M = 8
 _BLOCK_N = 256
@@ -174,8 +174,8 @@ def _expected_chunk_mapping(
     return batch_ids, offsets
 
 
-def _require_h200(torch: Any) -> None:
-    require_exact_gpu(torch, backend=_BACKEND, required_gpu=_REQUIRED_GPU)
+def _require_supported_gpu(torch: Any) -> None:
+    require_supported_gpu(torch, backend=_BACKEND, supported_gpus=_SUPPORTED_GPUS)
 
 
 def _load_vllm_components() -> tuple[Any, Any]:
@@ -438,7 +438,7 @@ def profile_gdn_causal_conv_prefill_vllm_triton(
     dtype: DType | str,
     state_dtype: DType | str,
 ) -> ComputeMetrics:
-    """Profile vLLM's fused fresh-prefill convolution on an NVIDIA H200."""
+    """Profile vLLM's fused fresh-prefill convolution on NVIDIA H200 or B200."""
     args = _validate_args(
         batch_size,
         sequence_length,
@@ -453,7 +453,7 @@ def profile_gdn_causal_conv_prefill_vllm_triton(
         raise ProfilerNotImplemented(f"PyTorch is required for {_BACKEND}") from exc
 
     try:
-        _require_h200(torch)
+        _require_supported_gpu(torch)
         fused_callable, metadata_helper = _load_vllm_components()
         device = torch.device("cuda", torch.cuda.current_device())
         guard_args = _guard_args(args)

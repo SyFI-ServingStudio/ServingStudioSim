@@ -563,6 +563,7 @@ fn workload_json(totals: &WorkloadTotals) -> Value {
         "prefill_requests": totals.prefill_requests,
         "prefill_stateful_requests": totals.prefill_stateful_requests,
         "speculative_geometry": totals.speculative_geometry,
+        "request_geometry": totals.request_geometry,
     })
 }
 

@@ -44,6 +44,26 @@ _TRTLLM_KERNEL_NAME = "fmhaSm100"
 _TRTLLM_SUPPORTED_NUM_HEADS = frozenset({8, 16})
 _TRTLLM_WORKSPACE_BYTES = 128 * 1024 * 1024
 _TRTLLM_PAGE_SIZE = 64
+# GLM-5.3-Flash takes FlashInfer's native no-rope MLA path
+# (`flashinfer.mla._core.nope_mla_dimensions`: kv_lora 512, qk_nope 256,
+# rope 0), which FlashInfer 0.6.12 in `vllm_env` lacks. The latent-only cache
+# row is 512 FP8 bytes, and the call adds a per-query `sparse_mla_top_k_lens`.
+# `selected_k` is the page-table width passed as `sparse_mla_top_k`; vLLM's
+# kpool buffer is round_up(index_topk + index_kpool - 1, 128) = 2176, while
+# `valid_counts` carries each row's compacted active length.
+_TRTLLM_FORK_BACKEND = "dsa_sparse_mla_attention:flashinfer_trtllm_fp8_vllm_fork"
+_TRTLLM_NOPE_CACHE_LAYOUT = "hnd_paged_mqa_fp8_latent"
+_TRTLLM_NOPE_ROPE_DIM = 0
+_TRTLLM_NOPE_SCORE_DIM = _LATENT_DIM
+_TRTLLM_NOPE_QK_NOPE_HEAD_DIM = 256
+_TRTLLM_FORK_SELECTED_K = frozenset({2048, 2176})
+# Rows checked against the Torch reference outside timing: the first rows plus
+# the last one. The reference costs O(rows * selected_k * 512) per head. The
+# E4M3 kernel also quantizes P to FP8, so the elementwise bound is relative to
+# the output's peak magnitude (B200 smoke: cosine 0.9998, max error 1.6%).
+_TRTLLM_CHECK_ROWS = 16
+_TRTLLM_CHECK_COSINE_MIN = 0.999
+_TRTLLM_CHECK_PEAK_RTOL = 0.05
 
 _UINT = r"(?:0|[1-9][0-9]*)"
 _UNIFORM_RE = re.compile(rf"u:({_UINT})x({_UINT})\Z")
@@ -208,6 +228,8 @@ def _validate_args(
     expected_cache_dtype: DType = DType.BF16,
     expected_output_dtype: DType = DType.BF16,
     expected_cache_layout: str = _CACHE_LAYOUT,
+    allowed_selected_k: frozenset[int] = frozenset({_SELECTED_K}),
+    expected_rope_dim: int = _ROPE_DIM,
 ) -> _ValidatedArgs:
     integers = {
         "num_queries": num_queries,
@@ -233,11 +255,13 @@ def _validate_args(
         raise ProfilerNotImplemented(f"num_cache_tokens must be >= 1, got {num_cache_tokens}")
     expected = {
         "num_kv_heads": (num_kv_heads, _NUM_KV_HEADS),
-        "selected_k": (selected_k, _SELECTED_K),
         "latent_dim": (latent_dim, _LATENT_DIM),
-        "rope_dim": (rope_dim, _ROPE_DIM),
+        "rope_dim": (rope_dim, expected_rope_dim),
         "value_dim": (value_dim, _VALUE_DIM),
     }
+    if selected_k not in allowed_selected_k:
+        required_k = " or ".join(str(value) for value in sorted(allowed_selected_k))
+        raise ProfilerNotImplemented(f"selected_k must be {required_k}, got {selected_k}")
     for name, (actual, required) in expected.items():
         if actual != required:
             raise ProfilerNotImplemented(f"{name} must be {required}, got {actual}")
@@ -636,8 +660,10 @@ def _check_flashmla_correctness(
         raise AssertionError("FlashMLA output aliases an input")
 
 
-def _logical_flops(*, num_queries: int, num_heads: int, selected_k: int) -> int:
-    return 2 * num_queries * num_heads * selected_k * (_SCORE_DIM + _VALUE_DIM)
+def _logical_flops(
+    *, num_queries: int, num_heads: int, selected_k: int, score_dim: int = _SCORE_DIM
+) -> int:
+    return 2 * num_queries * num_heads * selected_k * (score_dim + _VALUE_DIM)
 
 
 def _logical_bytes(
@@ -649,10 +675,11 @@ def _logical_bytes(
     q_bytes: int = 2,
     cache_bytes: int = 2,
     output_bytes: int = 2,
+    score_dim: int = _SCORE_DIM,
 ) -> int:
-    q_read = q_bytes * num_queries * num_heads * _SCORE_DIM
+    q_read = q_bytes * num_queries * num_heads * score_dim
     index_read = 4 * num_queries * selected_k
-    cache_read = cache_bytes * sum(valid_counts) * _SCORE_DIM
+    cache_read = cache_bytes * sum(valid_counts) * score_dim
     output_write = output_bytes * num_queries * num_heads * _VALUE_DIM
     max_lse_write = 8 * num_queries * num_heads
     return q_read + index_read + cache_read + output_write + max_lse_write
@@ -919,6 +946,282 @@ def profile_dsa_sparse_mla_attention_flashinfer_trtllm_fp8(
         valid_counts=validated.valid_counts,
         q_bytes=1,
         cache_bytes=1,
+    )
+    seconds = time_ms / 1000.0
+    return ComputeMetrics(
+        time_ms=float(time_ms),
+        energy_j=float(energy_j),
+        tflops=flops / seconds / 1e12,
+        memory_bandwidth_gbps=logical_bytes / seconds / 1e9,
+    )
+
+
+def _build_trtllm_nope_operands(
+    torch: Any,
+    validated: _ValidatedArgs,
+    *,
+    num_heads: int,
+    selected_k: int,
+    device: Any,
+) -> _TrtllmFp8Operands:
+    """Build seeded FP8 operands for the latent-only (rope 0) paged cache.
+
+    Small random templates are tiled into the full allocations so large grid
+    points never materialize a full-size FP32 source. The cache repeats every
+    page, so rows differ by in-page offset; queries repeat every template row.
+    """
+    fp8 = torch.float8_e4m3fn
+    generator = torch.Generator(device=device)
+    generator.manual_seed(0)
+    template_rows = min(validated.num_queries, _QUERY_CHUNK_SIZE)
+    q_template = torch.randn(
+        (template_rows, 1, num_heads, _TRTLLM_NOPE_SCORE_DIM),
+        generator=generator,
+        device=device,
+    ).to(fp8)
+    query = torch.empty(
+        (validated.num_queries, 1, num_heads, _TRTLLM_NOPE_SCORE_DIM),
+        dtype=fp8,
+        device=device,
+    )
+    for start in range(0, validated.num_queries, template_rows):
+        stop = min(start + template_rows, validated.num_queries)
+        query[start:stop].copy_(q_template[: stop - start])
+
+    num_pages = math.ceil(validated.num_cache_tokens / _TRTLLM_PAGE_SIZE)
+    cache = torch.empty(
+        (num_pages, 1, _TRTLLM_PAGE_SIZE, _TRTLLM_NOPE_SCORE_DIM),
+        dtype=fp8,
+        device=device,
+    )
+    page_template = torch.randn(
+        (1, 1, _TRTLLM_PAGE_SIZE, _TRTLLM_NOPE_SCORE_DIM),
+        generator=generator,
+        device=device,
+    ).to(fp8)
+    cache.copy_(page_template.expand_as(cache))
+
+    block_tables = torch.zeros(
+        (validated.num_queries, 1, selected_k),
+        dtype=torch.int32,
+        device=device,
+    )
+    for row, count in enumerate(validated.valid_counts):
+        indices = _row_indices(
+            torch,
+            row=row,
+            count=count,
+            num_cache_tokens=validated.num_cache_tokens,
+            distribution=validated.index_distribution,
+            device=device,
+        )
+        block_tables[row, 0, :count].copy_(indices.to(torch.int32))
+
+    return _TrtllmFp8Operands(
+        query=query,
+        cache=cache,
+        block_tables=block_tables,
+        seq_lens=torch.tensor(validated.valid_counts, dtype=torch.int32, device=device),
+        workspace=torch.zeros(_TRTLLM_WORKSPACE_BYTES, dtype=torch.uint8, device=device),
+    )
+
+
+def _launch_trtllm_nope(
+    callable_: Any,
+    operands: _TrtllmFp8Operands,
+    *,
+    softmax_scale: float,
+    selected_k: int,
+    top_k_lens: Any,
+) -> Any:
+    """Mirror `FlashInferMLASparseImpl.forward_mqa` for qk_rope_head_dim == 0."""
+    return callable_(
+        query=operands.query,
+        kv_cache=operands.cache,
+        workspace_buffer=operands.workspace,
+        qk_nope_head_dim=_TRTLLM_NOPE_QK_NOPE_HEAD_DIM,
+        kv_lora_rank=_LATENT_DIM,
+        qk_rope_head_dim=_TRTLLM_NOPE_ROPE_DIM,
+        block_tables=operands.block_tables,
+        seq_lens=operands.seq_lens,
+        max_seq_len=selected_k,
+        bmm1_scale=softmax_scale,
+        bmm2_scale=1.0,
+        sparse_mla_top_k=selected_k,
+        sparse_mla_top_k_lens=top_k_lens,
+    )
+
+
+def _check_trtllm_nope_correctness(
+    torch: Any,
+    operands: _TrtllmFp8Operands,
+    output: Any,
+    *,
+    valid_counts: Sequence[int],
+    softmax_scale: float,
+) -> None:
+    """Compare sampled rows with the committed Torch reference on dequantized FP8."""
+    from profiling.runners.attention.dsa_sparse_mla_attention_reference import (
+        dsa_sparse_mla_attention_reference,
+    )
+
+    num_queries = operands.query.shape[0]
+    rows = sorted({*range(min(num_queries, _TRTLLM_CHECK_ROWS)), num_queries - 1})
+    rows = [row for row in rows if valid_counts[row] > 0]
+    if not rows:
+        return
+    row_index = torch.tensor(rows, dtype=torch.int64, device=operands.query.device)
+    q = operands.query[:, 0].index_select(0, row_index).to(torch.bfloat16).contiguous()
+    cache = operands.cache.reshape(-1, 1, _TRTLLM_NOPE_SCORE_DIM).to(torch.bfloat16)
+    indices = operands.block_tables.index_select(0, row_index).clone()
+    counts = operands.seq_lens.index_select(0, row_index)
+    positions = torch.arange(indices.shape[-1], device=indices.device)
+    indices.masked_fill_(positions[None, None, :] >= counts[:, None, None], -1)
+    expected = dsa_sparse_mla_attention_reference(
+        q, cache, indices, softmax_scale=float(softmax_scale)
+    ).float()
+    actual = output[:, 0].index_select(0, row_index).float()
+    cosine = torch.nn.functional.cosine_similarity(
+        actual.reshape(len(rows), -1), expected.reshape(len(rows), -1), dim=-1
+    )
+    max_abs = float((actual - expected).abs().max().item())
+    peak = float(expected.abs().max().item())
+    if (
+        float(cosine.min().item()) < _TRTLLM_CHECK_COSINE_MIN
+        or max_abs > _TRTLLM_CHECK_PEAK_RTOL * peak
+    ):
+        raise KernelLaunchFailed(
+            f"{_TRTLLM_FORK_BACKEND} disagrees with the Torch reference: "
+            f"min cosine {float(cosine.min().item()):.6f}, max abs error {max_abs:.4f} "
+            f"at peak {peak:.4f}"
+        )
+
+
+def profile_dsa_sparse_mla_attention_flashinfer_trtllm_fp8_vllm_fork(
+    *,
+    num_queries: int,
+    num_cache_tokens: int,
+    num_heads: int,
+    num_kv_heads: int,
+    selected_k: int,
+    latent_dim: int,
+    rope_dim: int,
+    value_dim: int,
+    softmax_scale: float,
+    q_dtype: DType | str,
+    cache_dtype: DType | str,
+    index_dtype: str,
+    output_dtype: DType | str,
+    valid_counts: str,
+    index_distribution: str,
+    cache_layout: str,
+) -> ComputeMetrics:
+    """Profile the B200 no-rope sparse-MLA callable under the vLLM fork's FlashInfer."""
+    if num_heads not in _TRTLLM_SUPPORTED_NUM_HEADS:
+        raise ProfilerNotImplemented(
+            f"{_TRTLLM_FORK_BACKEND} supports num_heads in "
+            f"{sorted(_TRTLLM_SUPPORTED_NUM_HEADS)}, got {num_heads}"
+        )
+    validated = _validate_args(
+        num_queries=num_queries,
+        num_cache_tokens=num_cache_tokens,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        selected_k=selected_k,
+        latent_dim=latent_dim,
+        rope_dim=rope_dim,
+        value_dim=value_dim,
+        softmax_scale=softmax_scale,
+        q_dtype=q_dtype,
+        cache_dtype=cache_dtype,
+        index_dtype=index_dtype,
+        output_dtype=output_dtype,
+        valid_counts=valid_counts,
+        index_distribution=index_distribution,
+        cache_layout=cache_layout,
+        expected_num_heads=num_heads,
+        expected_q_dtype=DType.FP8_E4M3,
+        expected_cache_dtype=DType.FP8_E4M3,
+        expected_cache_layout=_TRTLLM_NOPE_CACHE_LAYOUT,
+        allowed_selected_k=_TRTLLM_FORK_SELECTED_K,
+        expected_rope_dim=_TRTLLM_NOPE_ROPE_DIM,
+    )
+
+    try:
+        import torch
+        from flashinfer.decode import trtllm_batch_decode_with_kv_cache_mla
+    except (ImportError, ModuleNotFoundError) as exc:
+        raise ProfilerNotImplemented(
+            f"{_TRTLLM_FORK_BACKEND} requires the repository vllm_fork_env"
+        ) from exc
+
+    try:
+        _require_b200(torch, backend=_TRTLLM_FORK_BACKEND)
+        device = torch.device("cuda", torch.cuda.current_device())
+        operands = _build_trtllm_nope_operands(
+            torch,
+            validated,
+            num_heads=num_heads,
+            selected_k=selected_k,
+            device=device,
+        )
+        # vLLM points empty rows at one valid dummy slot with length 1 (the
+        # kernel rejects zero-length rows) and zeroes their output afterwards.
+        # block_tables is zero-filled, so slot 0 is already the dummy.
+        top_k_lens = operands.seq_lens.clamp(min=1)
+
+        def kernel() -> Any:
+            return _launch_trtllm_nope(
+                trtllm_batch_decode_with_kv_cache_mla,
+                operands,
+                softmax_scale=float(softmax_scale),
+                selected_k=selected_k,
+                top_k_lens=top_k_lens,
+            )
+
+        output = kernel()
+        torch.cuda.synchronize(device)
+        expected_shape = (num_queries, 1, num_heads, value_dim)
+        if output.dtype is not torch.bfloat16 or tuple(output.shape) != expected_shape:
+            raise KernelLaunchFailed(
+                f"{_TRTLLM_FORK_BACKEND} returned {output.dtype} {tuple(output.shape)}, "
+                f"expected BF16 {expected_shape}"
+            )
+        if not torch.isfinite(output).all():
+            raise KernelLaunchFailed(f"{_TRTLLM_FORK_BACKEND} output must be finite")
+        _check_trtllm_nope_correctness(
+            torch,
+            operands,
+            output,
+            valid_counts=validated.valid_counts,
+            softmax_scale=float(softmax_scale),
+        )
+
+        time_ms = Timer.cupti(kernel, kernel_name=_TRTLLM_KERNEL_NAME)
+        energy_j = Energy.perf(kernel, warmup=5, per_iter_time_ms=time_ms)
+    except (KernelLaunchFailed, ProfilerNotImplemented):
+        raise
+    except torch.OutOfMemoryError as exc:
+        raise OOMError(f"{_TRTLLM_FORK_BACKEND} ran out of GPU memory") from exc
+    except Exception as exc:
+        raise KernelLaunchFailed(f"{_TRTLLM_FORK_BACKEND} native callable failed") from exc
+
+    # Same logical accounting as the kind's other backends: FLOPs over the
+    # selected_k page-table width, bytes over the active rows.
+    flops = _logical_flops(
+        num_queries=num_queries,
+        num_heads=num_heads,
+        selected_k=selected_k,
+        score_dim=_TRTLLM_NOPE_SCORE_DIM,
+    )
+    logical_bytes = _logical_bytes(
+        num_queries=num_queries,
+        num_heads=num_heads,
+        selected_k=selected_k,
+        valid_counts=validated.valid_counts,
+        q_bytes=1,
+        cache_bytes=1,
+        score_dim=_TRTLLM_NOPE_SCORE_DIM,
     )
     seconds = time_ms / 1000.0
     return ComputeMetrics(

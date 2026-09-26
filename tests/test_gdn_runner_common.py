@@ -10,8 +10,6 @@ import pytest
 from profiling.runners.exceptions import ProfilerNotImplemented
 
 _VLLM_GDN_RUNNER_MODULES = (
-    "profiling.runners.attention.gdn_causal_conv_decode_vllm_triton",
-    "profiling.runners.attention.gdn_causal_conv_prefill_vllm_triton",
     "profiling.runners.attention.gdn_chunk_local_cumsum_vllm_triton",
     "profiling.runners.attention.gdn_chunk_output_vllm_triton",
     "profiling.runners.attention.gdn_chunk_recompute_w_u_vllm_triton",
@@ -43,3 +41,21 @@ def test_vllm_gdn_runners_enforce_the_shared_h200_gate(runner_module_name: str) 
     with pytest.raises(ProfilerNotImplemented, match="verified only on NVIDIA H200"):
         runner_module._require_h200(_fake_torch("NVIDIA B200"))
     runner_module._require_h200(_fake_torch("NVIDIA H200"))
+
+
+@pytest.mark.parametrize(
+    "runner_module_name",
+    (
+        "profiling.runners.attention.gdn_causal_conv_decode_vllm_triton",
+        "profiling.runners.attention.gdn_causal_conv_prefill_vllm_triton",
+    ),
+)
+def test_vllm_causal_conv_runners_admit_h200_and_b200_only(runner_module_name: str) -> None:
+    runner_module = importlib.import_module(runner_module_name)
+
+    with pytest.raises(ProfilerNotImplemented, match="CUDA is required"):
+        runner_module._require_supported_gpu(_fake_torch("NVIDIA H200", cuda_available=False))
+    with pytest.raises(ProfilerNotImplemented, match="verified only on"):
+        runner_module._require_supported_gpu(_fake_torch("NVIDIA H100"))
+    runner_module._require_supported_gpu(_fake_torch("NVIDIA H200"))
+    runner_module._require_supported_gpu(_fake_torch("NVIDIA B200"))

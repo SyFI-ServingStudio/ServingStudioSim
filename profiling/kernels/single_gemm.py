@@ -157,3 +157,25 @@ register(
         batch_outlier_policy=BatchOutlierPolicy(),
     )
 )
+
+# Blackwell DeepGEMM through the alignment fork's FP8 block-scaled linear path
+# (packed UE8M0 activation scales, UE8M0-requantized 128x128 weight blocks).
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="deepgemm_vllm_fork",
+        supports=BackendSupport(
+            compute=frozenset({DType.FP8_E4M3}),
+            gpus=frozenset({"NVIDIA B200"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.gemm.deepgemm",
+            function_name="profile_single_gemm_vllm_fork",
+        ),
+        table_name=KIND,
+        args_schema=SingleGemmArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="vllm_fork_env",
+    )
+)

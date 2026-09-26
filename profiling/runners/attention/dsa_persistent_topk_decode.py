@@ -28,6 +28,41 @@ _CONTEXT_MODE = "uniform"
 _REQUIRED_GPU = "NVIDIA H200"
 _VLLM_SUPPORTED_GPUS = ("NVIDIA H200", "NVIDIA B200")
 _WORKSPACE_BYTES = 1024 * 1024
+# The vLLM fork (GLM-5.3-Flash production) ships a newer persistent_topk: rows
+# are clamped to min(stride, max_seq_len), and the >32-row FilteredTopK path
+# gained a <=32K histogram-4096 short path. Its kpool indexer selects
+# index_topk / index_kpool = 512 pools, so this backend also accepts the
+# callable's other K instantiations.
+_FORK_BACKEND = "vllm_fork_cuda"
+_FORK_SUPPORTED_GPUS = ("NVIDIA B200",)
+_FORK_TOP_K = frozenset({512, 1024, 2048})
+# Known fork bug (capture 20260925_0): the medium path
+# (histogram_256_topk, 8K < row <= 32K on the <=32-row kernel) buffers at most
+# MAX_BUFFERED_ITEMS threshold-bin candidates and silently drops the rest, so
+# its top-k is wrong when that bin overflows. The timing is still the
+# production kernel's, so those rows are recorded; the output is not trusted.
+_FORK_MEDIUM_MIN_EXCLUSIVE = 8192
+_FORK_MEDIUM_MAX = 32768
+_FORK_MEDIUM_MAX_BUFFERED_ITEMS = 4096
+# The same overflow in the >32-row FilteredTopK long path (row > 32K): it
+# buffers at most FILTERED_TOPK_SMEM_INPUT_SIZE threshold-bin candidates
+# (20260925_4 cases 11/12, stride 524288: the linspace template puts a whole
+# 32K-131K row into one coarse bin). Same handling as the medium path.
+_FORK_FILTERED_ROWS_MIN_EXCLUSIVE = 32
+_FORK_FILTERED_LONG_MIN_EXCLUSIVE = 32768
+_FORK_FILTERED_MAX_BUFFERED_ITEMS = 16384
+# The two remaining buffered paths drop overflow the same way (cases 11/12/15,
+# strides 262144/524288). The <=32-row decode path (row <= HIST2048_THRESHOLD)
+# bins by the top 11 fp16-key bits and double-buffers DBUF threshold-bin items;
+# the >32-row short path (row <= 32K) bins by the top 12 bits and keeps at most
+# top_k ties. A stride-wide ramp is not the cause to engineer away: ramping over
+# the live context instead reads 0.48-1.6x these rows' time (median 0.83), while
+# the measured topk_decode is already 9-19% slower than the stride-ramp rows.
+_FORK_DECODE_MAX = 8192
+_FORK_DECODE_MAX_BUFFERED_ITEMS = 3708
+_FORK_DECODE_BIN_SHIFT = 5
+_FORK_SHORT_BIN_SHIFT = 4
+_FORK_BYTE_BIN_SHIFT = 8
 
 
 @dataclass(frozen=True)
@@ -62,6 +97,7 @@ def _validate_args(
     logits_dtype: DType | str,
     index_dtype: str,
     context_mode: str,
+    allowed_top_k: frozenset[int] = frozenset({_TOP_K}),
 ) -> tuple[int, int, int, int, int, int, DType, str, str]:
     batch_size = int(batch_size)
     context_len = int(context_len)
@@ -97,8 +133,9 @@ def _validate_args(
         raise ValueError(
             f"context_len must be <= max_model_len, got {context_len} and {max_model_len}"
         )
-    if top_k != _TOP_K:
-        raise ValueError(f"dsa_persistent_topk_decode requires top_k=2048, got {top_k}")
+    if top_k not in allowed_top_k:
+        required = " or ".join(f"top_k={value}" for value in sorted(allowed_top_k))
+        raise ValueError(f"dsa_persistent_topk_decode requires {required}, got {top_k}")
     if logits_row_stride <= 0 or logits_row_stride < max_model_len:
         raise ValueError(
             "logits_row_stride must be positive and >= max_model_len, "
@@ -135,7 +172,10 @@ def _validate_cuda_device(torch: Any, *, backend: str = "torch") -> str:
             f"CUDA is required for the {backend} dsa_persistent_topk_decode backend"
         )
     gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
-    supported_gpus = _VLLM_SUPPORTED_GPUS if backend == "vllm_cuda" else (_REQUIRED_GPU,)
+    supported_gpus = {
+        "vllm_cuda": _VLLM_SUPPORTED_GPUS,
+        _FORK_BACKEND: _FORK_SUPPORTED_GPUS,
+    }.get(backend, (_REQUIRED_GPU,))
     if gpu_name not in supported_gpus:
         raise ProfilerNotImplemented(
             f"{backend} dsa_persistent_topk_decode is verified only on "
@@ -365,6 +405,60 @@ def _native_call(
     )
 
 
+def _fp16_key_bin(torch: Any, values: Any, shift: int) -> Any:
+    """Mirror the fork's fp16 sign-magnitude key, keeping its top ``16 - shift`` bits.
+
+    ``shift`` 8 is ``convert_to_uint8``, 5 ``decode_bin`` and 4 the short path's
+    ``extract_coarse_bin_N<12>``.
+    """
+    bits = values.to(torch.float16).view(torch.int16).to(torch.int32) & 0xFFFF
+    key = torch.where((bits & 0x8000) != 0, (~bits) & 0xFFFF, bits | 0x8000)
+    return key >> shift
+
+
+def _overflow_buffer(num_rows: int, length: int, top_k: int) -> tuple[int, int] | None:
+    """``(bin shift, buffered items)`` of the fork path this row takes, if it buffers."""
+    if num_rows > _FORK_FILTERED_ROWS_MIN_EXCLUSIVE:
+        if length > _FORK_FILTERED_LONG_MIN_EXCLUSIVE:
+            return _FORK_BYTE_BIN_SHIFT, _FORK_FILTERED_MAX_BUFFERED_ITEMS
+        return _FORK_SHORT_BIN_SHIFT, top_k
+    if length <= _FORK_DECODE_MAX:
+        return _FORK_DECODE_BIN_SHIFT, _FORK_DECODE_MAX_BUFFERED_ITEMS
+    if length <= _FORK_MEDIUM_MAX:
+        return _FORK_BYTE_BIN_SHIFT, _FORK_MEDIUM_MAX_BUFFERED_ITEMS
+    return None
+
+
+def _medium_overflow_explains(
+    torch: Any,
+    row_logits: Any,
+    actual_indices: Any,
+    expected_values: Any,
+    num_rows: int = 1,
+) -> bool:
+    """Return whether a threshold-bin buffer overflow accounts for one bad row.
+
+    The row must take a buffering path (every fork path but the <=32-row
+    cooperative radix one), its threshold bin (the bin of the reference k-th
+    value) must hold more candidates than that path buffers, and the kernel must
+    still have selected every element strictly above that bin and nothing below
+    it -- only the threshold-bin tie-break may differ.
+    """
+    length = int(row_logits.numel())
+    path = _overflow_buffer(num_rows, length, int(actual_indices.numel()))
+    if path is None:
+        return False
+    shift, buffered_items = path
+    bins = _fp16_key_bin(torch, row_logits, shift)
+    threshold = int(_fp16_key_bin(torch, expected_values.min().reshape(1), shift)[0])
+    if int((bins == threshold).sum()) <= buffered_items:
+        return False
+    selected_bins = bins.index_select(0, actual_indices)
+    if bool((selected_bins < threshold).any()):
+        return False
+    return int((selected_bins > threshold).sum()) == int((bins > threshold).sum())
+
+
 def _validate_native_semantics(
     torch: Any,
     op: Any,
@@ -373,8 +467,13 @@ def _validate_native_semantics(
     top_k: int,
     max_seq_len: int,
     strict_reference: bool = True,
+    medium_overflow_allowed: bool = False,
 ) -> None:
-    """Compare corrected native output with the committed semantic reference."""
+    """Compare corrected native output with the committed semantic reference.
+
+    ``medium_overflow_allowed`` accepts a mismatching row only when the fork's
+    medium-path buffer overflow fully explains it (see ``_FORK_MEDIUM_*``).
+    """
     from profiling.runners.attention.dsa_persistent_topk_decode_reference import (
         dsa_persistent_topk_decode_reference,
     )
@@ -418,19 +517,30 @@ def _validate_native_semantics(
             raise RuntimeError("persistent CUDA returned an out-of-range long-row index")
         if bool((actual_long.sort(dim=1).values.diff(dim=1) == 0).any()):
             raise RuntimeError("persistent CUDA returned duplicate long-row indices")
-        if strict_reference and not torch.equal(
-            actual_long.sort(dim=1).values,
-            expected_long.sort(dim=1).values,
-        ):
-            raise RuntimeError("pinned CUDA disagrees with long-row reference selections")
         long_logits = operands.logits.index_select(0, long_rows)
         actual_values = long_logits.gather(1, actual_long)
         expected_values = long_logits.gather(1, expected_long)
-        if strict_reference and not torch.equal(
-            actual_values.sort(dim=1).values,
-            expected_values.sort(dim=1).values,
-        ):
-            raise RuntimeError("pinned CUDA disagrees with long-row reference values")
+        if strict_reference:
+            selection_rows = (
+                actual_long.sort(dim=1).values != expected_long.sort(dim=1).values
+            ).any(dim=1)
+            value_rows = (
+                actual_values.sort(dim=1).values != expected_values.sort(dim=1).values
+            ).any(dim=1)
+            for position in torch.nonzero(selection_rows | value_rows).flatten().tolist():
+                length = int(operands.flat_lengths[long_rows[position]])
+                if not (
+                    medium_overflow_allowed
+                    and _medium_overflow_explains(
+                        torch,
+                        long_logits[position, :length],
+                        actual_long[position],
+                        expected_values[position],
+                        num_rows=int(operands.flat_lengths.numel()),
+                    )
+                ):
+                    kind = "values" if bool(value_rows[position]) else "selections"
+                    raise RuntimeError(f"pinned CUDA disagrees with long-row reference {kind}")
 
     if returned is not None:
         raise RuntimeError("pinned persistent_topk must return None")
@@ -579,7 +689,9 @@ def _load_native_op(torch: Any) -> Any:
         raise KernelLaunchFailed(str(exc)) from exc
 
 
-def profile_dsa_persistent_topk_decode_vllm_cuda(
+def _profile_native_persistent_topk(
+    backend: str,
+    allowed_top_k: frozenset[int],
     batch_size: int,
     context_len: int,
     next_n: int,
@@ -590,7 +702,7 @@ def profile_dsa_persistent_topk_decode_vllm_cuda(
     index_dtype: str,
     context_mode: str,
 ) -> ComputeMetrics:
-    """Profile the complete corrected v0.23-derived persistent callable."""
+    """Profile one packaged persistent_topk callable through its full contract."""
     (
         batch_size,
         context_len,
@@ -611,15 +723,16 @@ def profile_dsa_persistent_topk_decode_vllm_cuda(
         logits_dtype,
         index_dtype,
         context_mode,
+        allowed_top_k=allowed_top_k,
     )
     try:
         import torch
     except ImportError as exc:
         raise ProfilerNotImplemented(
-            "torch is required for the vllm_cuda dsa_persistent_topk_decode backend"
+            f"torch is required for the {backend} dsa_persistent_topk_decode backend"
         ) from exc
 
-    gpu_name = _validate_cuda_device(torch, backend="vllm_cuda")
+    gpu_name = _validate_cuda_device(torch, backend=backend)
     op = _load_native_op(torch)
 
     try:
@@ -639,7 +752,8 @@ def profile_dsa_persistent_topk_decode_vllm_cuda(
             operands,
             top_k=top_k,
             max_seq_len=context_len,
-            strict_reference=gpu_name != "NVIDIA B200",
+            strict_reference=backend == _FORK_BACKEND or gpu_name != "NVIDIA B200",
+            medium_overflow_allowed=backend == _FORK_BACKEND,
         )
 
         def kernel() -> None:
@@ -685,3 +799,65 @@ def profile_dsa_persistent_topk_decode_vllm_cuda(
         )
     except RuntimeError as exc:
         raise KernelLaunchFailed(str(exc)) from exc
+
+
+def profile_dsa_persistent_topk_decode_vllm_cuda(
+    batch_size: int,
+    context_len: int,
+    next_n: int,
+    max_model_len: int,
+    top_k: int,
+    logits_row_stride: int,
+    logits_dtype: DType | str,
+    index_dtype: str,
+    context_mode: str,
+) -> ComputeMetrics:
+    """Profile the complete corrected v0.23-derived persistent callable."""
+    return _profile_native_persistent_topk(
+        "vllm_cuda",
+        frozenset({_TOP_K}),
+        batch_size,
+        context_len,
+        next_n,
+        max_model_len,
+        top_k,
+        logits_row_stride,
+        logits_dtype,
+        index_dtype,
+        context_mode,
+    )
+
+
+def profile_dsa_persistent_topk_decode_vllm_fork_cuda(
+    batch_size: int,
+    context_len: int,
+    next_n: int,
+    max_model_len: int,
+    top_k: int,
+    logits_row_stride: int,
+    logits_dtype: DType | str,
+    index_dtype: str,
+    context_mode: str,
+) -> ComputeMetrics:
+    """Profile the vLLM fork's persistent_topk (GLM-5.3-Flash kpool K=512).
+
+    For kpool, ``context_len`` is the row's pool count (floor(tokens / 4)) and
+    ``max_model_len`` the logits width, which vLLM keeps token-granular. The
+    call passes ``max_seq_len = context_len``; production passes the batch's
+    token max_seq_len instead. The scalar only gates the cooperative radix
+    setup (``> 32768``) on the <=32-row path, so the two agree whenever the
+    token context is <= 32768 or the batch has more than 32 rows.
+    """
+    return _profile_native_persistent_topk(
+        _FORK_BACKEND,
+        _FORK_TOP_K,
+        batch_size,
+        context_len,
+        next_n,
+        max_model_len,
+        top_k,
+        logits_row_stride,
+        logits_dtype,
+        index_dtype,
+        context_mode,
+    )

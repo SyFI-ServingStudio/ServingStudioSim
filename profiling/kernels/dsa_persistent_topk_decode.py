@@ -69,3 +69,27 @@ register(
         subprocess_env="vllm_env",
     )
 )
+
+
+# The vLLM fork's persistent_topk (GLM-5.3-Flash production). Differs from the
+# v0.23 image on the >32-row FilteredTopK path; also accepts top_k 512 / 1024
+# (the kpool indexer selects 2048 / 4 = 512 pools).
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="vllm_fork_cuda",
+        supports=BackendSupport(
+            compute=frozenset({DType.FP32}),
+            gpus=frozenset({"NVIDIA B200"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.attention.dsa_persistent_topk_decode",
+            function_name="profile_dsa_persistent_topk_decode_vllm_fork_cuda",
+        ),
+        table_name=KIND,
+        args_schema=DsaPersistentTopkDecodeArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="vllm_fork_env",
+    )
+)

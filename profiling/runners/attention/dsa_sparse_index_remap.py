@@ -21,6 +21,10 @@ from profiling.runners.metrics import ComputeMetrics
 
 _BACKEND = "dsa_sparse_index_remap:torch"
 _VLLM_BACKEND = "dsa_sparse_index_remap:vllm_triton"
+_VLLM_FORK_BACKEND = "dsa_sparse_index_remap:vllm_fork_triton"
+# GLM-5.3-Flash kpool: a round_up(index_topk + index_kpool - 1, 128) = 2176-wide
+# index table (<= 2051 active entries per row) feeds the same remap wrapper.
+_FORK_SELECTED_K = frozenset({2048, 2176})
 _REQUIRED_GPU = "NVIDIA H200"
 _SELECTED_K = 2048
 _BLOCK_SIZE = 64
@@ -254,6 +258,7 @@ def _validate_args(
     workspace_partition: str,
     return_valid_counts: bool,
     index_dtype: str,
+    supported_selected_k: frozenset[int] = frozenset({_SELECTED_K}),
 ) -> _ValidatedArgs:
     integers = {
         "num_queries": num_queries,
@@ -279,12 +284,11 @@ def _validate_args(
         raise ProfilerNotImplemented(f"num_queries must be in 1..{_MAX_QUERIES}")
     if not 1 <= num_requests <= min(num_queries, 256):
         raise ProfilerNotImplemented("num_requests must be in 1..min(num_queries, 256)")
-    for name, actual, required in (
-        ("selected_k", selected_k, _SELECTED_K),
-        ("block_size", block_size, _BLOCK_SIZE),
-    ):
-        if actual != required:
-            raise ProfilerNotImplemented(f"{name} must be {required}, got {actual}")
+    if selected_k not in supported_selected_k:
+        allowed = " or ".join(str(value) for value in sorted(supported_selected_k))
+        raise ProfilerNotImplemented(f"selected_k must be {allowed}, got {selected_k}")
+    if block_size != _BLOCK_SIZE:
+        raise ProfilerNotImplemented(f"block_size must be {_BLOCK_SIZE}, got {block_size}")
     if not 1 <= max_blocks_per_request <= _MAX_BLOCKS_PER_REQUEST:
         raise ProfilerNotImplemented(
             f"max_blocks_per_request must be in 1..{_MAX_BLOCKS_PER_REQUEST}, "
@@ -912,6 +916,8 @@ def _check_vllm_triton_correctness(
     callable_: Any,
     operands: _Operands,
     validated: _ValidatedArgs,
+    *,
+    compacted: bool = False,
 ) -> None:
     from profiling.runners.attention.dsa_sparse_index_remap_reference import (
         dsa_sparse_index_remap_reference,
@@ -932,9 +938,112 @@ def _check_vllm_triton_correctness(
     expected_values = expected if isinstance(expected, tuple) else (expected,)
     if len(actual_values) != len(expected_values):
         raise KernelLaunchFailed(f"{_VLLM_BACKEND} returned the wrong output variant")
+    if compacted and validated.return_valid_counts:
+        # The fork scatters each row's valid slots to a prefix [0, count) in an
+        # unspecified order (COMPACT_TO_FRONT) and leaves the tail at -1.
+        (actual_out, actual_counts), (expected_out, expected_counts) = actual_values, expected_values
+        if not torch.equal(actual_counts, expected_counts):
+            raise KernelLaunchFailed(f"{_VLLM_FORK_BACKEND} valid counts disagree")
+        expected_sorted = torch.sort(expected_out, dim=1, descending=True).values
+        actual_sorted = torch.sort(actual_out, dim=1, descending=True).values
+        prefix = torch.arange(actual_out.shape[1], device=actual_out.device)[None, :]
+        in_prefix = prefix < actual_counts[:, None].long()
+        if not torch.equal(actual_sorted, expected_sorted) or bool(
+            ((actual_out >= 0) != in_prefix).any()
+        ):
+            raise KernelLaunchFailed(f"{_VLLM_FORK_BACKEND} disagrees with the reference")
+        return
     for actual_value, expected_value in zip(actual_values, expected_values, strict=True):
         if not torch.equal(actual_value, expected_value):
             raise KernelLaunchFailed(f"{_VLLM_BACKEND} disagrees with the reference")
+
+
+def _profile_vllm_triton_wrapper(
+    *,
+    backend_label: str,
+    supported_selected_k: frozenset[int],
+    compacted_output: bool = False,
+    num_queries: int,
+    num_requests: int,
+    selected_k: int,
+    block_size: int,
+    max_blocks_per_request: int,
+    request_row_counts: str,
+    local_span_lengths: str,
+    valid_counts: str,
+    index_distribution: str,
+    page_table_mapping: str,
+    workspace_partition: str,
+    return_valid_counts: bool,
+    index_dtype: str,
+) -> ComputeMetrics:
+    validated = _validate_args(
+        num_queries=num_queries,
+        num_requests=num_requests,
+        selected_k=selected_k,
+        block_size=block_size,
+        max_blocks_per_request=max_blocks_per_request,
+        request_row_counts=request_row_counts,
+        local_span_lengths=local_span_lengths,
+        valid_counts=valid_counts,
+        index_distribution=index_distribution,
+        page_table_mapping=page_table_mapping,
+        workspace_partition=workspace_partition,
+        return_valid_counts=return_valid_counts,
+        index_dtype=index_dtype,
+        supported_selected_k=supported_selected_k,
+    )
+    try:
+        import torch
+        from vllm.v1.attention.backends.mla.sparse_utils import (
+            triton_convert_req_index_to_global_index,
+        )
+    except (ImportError, ModuleNotFoundError) as exc:
+        raise ProfilerNotImplemented(f"{backend_label} requires its vLLM environment") from exc
+
+    try:
+        _require_b200(torch)
+        device = torch.device("cuda", torch.cuda.current_device())
+        operands = _build_operands(torch, validated, device=device)
+        _check_vllm_triton_correctness(
+            torch,
+            triton_convert_req_index_to_global_index,
+            operands,
+            validated,
+            compacted=compacted_output,
+        )
+
+        def kernel() -> Any:
+            return _launch_vllm_triton(
+                triton_convert_req_index_to_global_index,
+                operands,
+                validated,
+            )
+
+        time_ms = Timer.cupti(kernel, interval_union=True)
+        energy_j = Energy.perf(kernel, warmup=5, per_iter_time_ms=time_ms)
+    except (KernelLaunchFailed, ProfilerNotImplemented):
+        raise
+    except torch.OutOfMemoryError as exc:
+        raise OOMError(f"{backend_label} ran out of GPU memory") from exc
+    except Exception as exc:
+        raise KernelLaunchFailed(f"{backend_label} native callable failed") from exc
+
+    workspace_values, _ = _derive_workspace_metadata(validated)
+    logical_bytes = _logical_bytes(
+        num_queries=validated.num_queries,
+        selected_k=validated.selected_k,
+        valid_counts=validated.valid_counts,
+        workspace_ids=workspace_values,
+        return_valid_counts=validated.return_valid_counts,
+    )
+    seconds = time_ms / 1000.0
+    return ComputeMetrics(
+        time_ms=float(time_ms),
+        energy_j=float(energy_j),
+        tflops=0.0,
+        memory_bandwidth_gbps=logical_bytes / seconds / 1e9,
+    )
 
 
 def profile_dsa_sparse_index_remap_vllm_triton(
@@ -954,7 +1063,9 @@ def profile_dsa_sparse_index_remap_vllm_triton(
     index_dtype: str,
 ) -> ComputeMetrics:
     """Profile vLLM's production sparse-index Triton wrapper on B200."""
-    validated = _validate_args(
+    return _profile_vllm_triton_wrapper(
+        backend_label=_VLLM_BACKEND,
+        supported_selected_k=frozenset({_SELECTED_K}),
         num_queries=num_queries,
         num_requests=num_requests,
         selected_k=selected_k,
@@ -969,53 +1080,48 @@ def profile_dsa_sparse_index_remap_vllm_triton(
         return_valid_counts=return_valid_counts,
         index_dtype=index_dtype,
     )
-    try:
-        import torch
-        from vllm.v1.attention.backends.mla.sparse_utils import (
-            triton_convert_req_index_to_global_index,
-        )
-    except (ImportError, ModuleNotFoundError) as exc:
-        raise ProfilerNotImplemented(f"{_VLLM_BACKEND} requires the repository vllm_env") from exc
 
-    try:
-        _require_b200(torch)
-        device = torch.device("cuda", torch.cuda.current_device())
-        operands = _build_operands(torch, validated, device=device)
-        _check_vllm_triton_correctness(
-            torch,
-            triton_convert_req_index_to_global_index,
-            operands,
-            validated,
-        )
 
-        def kernel() -> Any:
-            return _launch_vllm_triton(
-                triton_convert_req_index_to_global_index,
-                operands,
-                validated,
-            )
+def profile_dsa_sparse_index_remap_vllm_fork_triton(
+    *,
+    num_queries: int,
+    num_requests: int,
+    selected_k: int,
+    block_size: int,
+    max_blocks_per_request: int,
+    request_row_counts: str,
+    local_span_lengths: str,
+    valid_counts: str,
+    index_distribution: str,
+    page_table_mapping: str,
+    workspace_partition: str,
+    return_valid_counts: bool,
+    index_dtype: str,
+) -> ComputeMetrics:
+    """Profile the alignment fork's sparse-index Triton wrapper on B200.
 
-        time_ms = Timer.cupti(kernel, interval_union=True)
-        energy_j = Energy.perf(kernel, warmup=5, per_iter_time_ms=time_ms)
-    except (KernelLaunchFailed, ProfilerNotImplemented):
-        raise
-    except torch.OutOfMemoryError as exc:
-        raise OOMError(f"{_VLLM_BACKEND} ran out of GPU memory") from exc
-    except Exception as exc:
-        raise KernelLaunchFailed(f"{_VLLM_BACKEND} native callable failed") from exc
-
-    workspace_values, _ = _derive_workspace_metadata(validated)
-    logical_bytes = _logical_bytes(
-        num_queries=validated.num_queries,
-        selected_k=validated.selected_k,
-        valid_counts=validated.valid_counts,
-        workspace_ids=workspace_values,
-        return_valid_counts=validated.return_valid_counts,
-    )
-    seconds = time_ms / 1000.0
-    return ComputeMetrics(
-        time_ms=float(time_ms),
-        energy_j=float(energy_j),
-        tflops=0.0,
-        memory_bandwidth_gbps=logical_bytes / seconds / 1e9,
+    The fork's ``triton_convert_req_index_to_global_index`` is a different
+    implementation from the pinned image's (a compile-keyed JIT kernel class
+    with single-tile and valid-count variants). With ``return_valid_counts`` it
+    compacts each row's valid slots to the front, which is what the trtllm-gen
+    sparse MLA kernel reads, so its check compares per-row sets. ``BLOCK_STRIDE_ROWS`` keeps its
+    default (``BLOCK_SIZE``); a hybrid page stride only changes address math.
+    """
+    return _profile_vllm_triton_wrapper(
+        backend_label=_VLLM_FORK_BACKEND,
+        supported_selected_k=_FORK_SELECTED_K,
+        compacted_output=True,
+        num_queries=num_queries,
+        num_requests=num_requests,
+        selected_k=selected_k,
+        block_size=block_size,
+        max_blocks_per_request=max_blocks_per_request,
+        request_row_counts=request_row_counts,
+        local_span_lengths=local_span_lengths,
+        valid_counts=valid_counts,
+        index_distribution=index_distribution,
+        page_table_mapping=page_table_mapping,
+        workspace_partition=workspace_partition,
+        return_valid_counts=return_valid_counts,
+        index_dtype=index_dtype,
     )

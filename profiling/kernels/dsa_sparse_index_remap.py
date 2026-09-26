@@ -73,3 +73,26 @@ register(
         subprocess_env="vllm_env",
     )
 )
+
+
+# Alignment-fork callable (GLM-5.3-Flash). selected_k is the index-table width:
+# 2048 (GLM-5.2 layout) or 2176 (kpool round_up(2048 + 4 - 1, 128)).
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="vllm_fork_triton",
+        supports=BackendSupport(
+            compute=None,
+            gpus=frozenset({"NVIDIA B200"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.attention.dsa_sparse_index_remap",
+            function_name="profile_dsa_sparse_index_remap_vllm_fork_triton",
+        ),
+        table_name=KIND,
+        args_schema=DsaSparseIndexRemapArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="vllm_fork_env",
+    )
+)

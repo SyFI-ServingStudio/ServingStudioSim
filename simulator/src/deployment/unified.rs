@@ -39,9 +39,9 @@ use crate::orchestrator::{
 use crate::timing::PerfApiBridge;
 use crate::worker::{
     build_barebone_worker, build_chunked_prefill_worker, build_hp_worker,
-    build_qwen36_hybrid_worker, build_speculative_worker, resolve_prefix_cache_config, BatchPolicy,
-    IterWorker, IterWorkerSel, KvAdmissionConfig, PendingOrderKind, PrefixCacheMode,
-    PrefixCachePolicy, WorkerConfig,
+    build_hybrid_chunked_prefill_worker, build_qwen36_hybrid_worker, build_speculative_worker,
+    resolve_prefix_cache_config, BatchPolicy, IterWorker, IterWorkerSel, KvAdmissionConfig,
+    PendingOrderKind, PrefixCacheMode, PrefixCachePolicy, WorkerConfig,
 };
 
 use super::Deployment;
@@ -123,6 +123,8 @@ impl Deployment for UnifiedDeployment {
                 batch_policy,
                 kv_admission,
                 gpu_time_multiplier,
+                // Read by `prefill_gpu_time_multiplier` below.
+                ..
             } => (
                 *attn_gpu_memory_gb,
                 *gpu_time_multiplier,
@@ -171,6 +173,7 @@ impl Deployment for UnifiedDeployment {
             log_stage_transitions: cfg.io.log_stage_transitions,
             kv_log_stride: cfg.io.kv_log_stride,
             gpu_time_multiplier,
+            prefill_gpu_time_multiplier: prefill_gpu_time_multiplier(&g.worker)?,
             max_batch_tokens,
             pending_order,
             batch_policy,
@@ -205,16 +208,16 @@ impl Deployment for UnifiedDeployment {
         // single-group barebone worker; the DP-attn / MoE archs run on the
         // multi-group hp_unified worker (one KV partition state per DP shard).
         match &g.arch {
-            // Barebone cadence, hybrid KV: 30 GDN layers of per-request
-            // recurrent state and 10 GQA layers of per-token KV live in one
-            // attention budget, so only the KV axis differs from the arms below.
+            // Hybrid KV: 30 GDN layers of per-request recurrent state and 10
+            // GQA layers of per-token KV live in one attention budget, so only
+            // the KV axis differs from the arms below.
             IterArchSel::Qwen36Local {
                 routing,
                 routing_seed,
                 expert_popularity_file,
                 ..
             } => {
-                ensure_barebone(&g.worker)?;
+                ensure_hybrid_worker("Qwen3.6 local", &g.worker)?;
                 let model = Arc::new(arch_build::qwen36_local(
                     model_spec,
                     *routing,
@@ -224,15 +227,56 @@ impl Deployment for UnifiedDeployment {
                     MODEL_NAME,
                     bridge,
                 )?);
-                Ok(assemble_flow(
+                assemble_hybrid_flow(
+                    "Qwen3.6 local",
                     model,
                     store,
                     worker_config,
                     log_dir,
                     gpu_name,
                     dp_cfg,
-                    build_qwen36_hybrid_worker,
-                ))
+                    &g.worker,
+                )
+            }
+            // Hybrid KV like Qwen3.6: 34 KDA layers of per-request recurrent
+            // state (fp32 SSM + conv window) and 11 DSA layers of per-token MLA
+            // latent + kpool index cache share one attention budget. Only the
+            // hybrid recipes charge both; the full-attention chunked and
+            // hp_unified recipes would leave the KDA state invisible.
+            IterArchSel::Glm53FlashVllmFp8KdaDsaMoe {
+                tp_size,
+                max_model_len,
+                routing,
+                routing_seed,
+                expert_popularity_file,
+                token_corpus_file,
+                cudagraph_capture_sizes,
+                ..
+            } => {
+                ensure_hybrid_worker("GLM-5.3-Flash vLLM FP8", &g.worker)?;
+                let model = Arc::new(arch_build::glm53_flash_vllm_fp8_kda_dsa_moe(
+                    model_spec,
+                    *tp_size,
+                    *max_model_len,
+                    *routing,
+                    *routing_seed,
+                    expert_popularity_file.as_deref(),
+                    token_corpus_file.as_deref(),
+                    cudagraph_capture_sizes,
+                    &gpu_name,
+                    MODEL_NAME,
+                    bridge,
+                )?);
+                assemble_hybrid_flow(
+                    "GLM-5.3-Flash vLLM FP8",
+                    model,
+                    store,
+                    worker_config,
+                    log_dir,
+                    gpu_name,
+                    dp_cfg,
+                    &g.worker,
+                )
             }
             IterArchSel::Llama3Dense { .. } => {
                 ensure_barebone(&g.worker)?;
@@ -626,6 +670,53 @@ fn ensure_barebone(worker: &IterWorkerSel) -> anyhow::Result<()> {
     }
 }
 
+/// Hybrid-KV archs run on a hybrid-store recipe under either lifecycle:
+/// barebone admission or hard-capped chunked prefill.
+fn ensure_hybrid_worker(arch_name: &str, worker: &IterWorkerSel) -> anyhow::Result<()> {
+    match worker {
+        IterWorkerSel::Barebone { .. } | IterWorkerSel::ChunkedPrefill { .. } => Ok(()),
+        other => bail!(
+            "unified: {arch_name} requires worker `barebone` or `chunked_prefill`, got {other:?}"
+        ),
+    }
+}
+
+fn assemble_hybrid_flow<M>(
+    arch_name: &str,
+    model: Arc<M>,
+    store: SharedRequests,
+    worker_config: WorkerConfig,
+    log_dir: Option<PathBuf>,
+    gpu_name: String,
+    dp_cfg: SimpleDpConfig,
+    worker: &IterWorkerSel,
+) -> anyhow::Result<Box<dyn Flow>>
+where
+    M: IterwiseUnifiedModel,
+{
+    match worker {
+        IterWorkerSel::Barebone { .. } => Ok(assemble_flow(
+            model,
+            store,
+            worker_config,
+            log_dir,
+            gpu_name,
+            dp_cfg,
+            build_qwen36_hybrid_worker,
+        )),
+        IterWorkerSel::ChunkedPrefill { .. } => Ok(assemble_flow(
+            model,
+            store,
+            worker_config,
+            log_dir,
+            gpu_name,
+            dp_cfg,
+            build_hybrid_chunked_prefill_worker,
+        )),
+        other => bail!("unified: unsupported {arch_name} worker {other:?}"),
+    }
+}
+
 /// The hybrid KV recipe's optional snapshot-interval override. Only `barebone`
 /// carries it; every other selector leaves the arch's own alignment in force.
 fn ssm_checkpoint_interval_tokens(worker: &IterWorkerSel) -> Option<u32> {
@@ -635,6 +726,23 @@ fn ssm_checkpoint_interval_tokens(worker: &IterWorkerSel) -> Option<u32> {
             ..
         } => *ssm_checkpoint_interval_tokens,
         _ => None,
+    }
+}
+
+/// Prefill-iteration multiplier, carried by the `chunked_prefill` selector only.
+fn prefill_gpu_time_multiplier(worker: &IterWorkerSel) -> anyhow::Result<Option<f64>> {
+    match worker {
+        IterWorkerSel::ChunkedPrefill {
+            prefill_gpu_time_multiplier: Some(multiplier),
+            ..
+        } => {
+            ensure!(
+                multiplier.is_finite() && *multiplier >= 1.0,
+                "unified: prefill_gpu_time_multiplier must be a finite value >= 1.0 (got {multiplier})"
+            );
+            Ok(Some(*multiplier))
+        }
+        _ => Ok(None),
     }
 }
 
@@ -776,7 +884,7 @@ mod tests {
     use super::*;
     use crate::arch::{
         Glm52VllmDsaMoeModel, Glm52VllmNvfp4DsaMoeModel, Glm52VllmNvfp4DsaMoeSpeculativeModel,
-        Qwen36LocalModel,
+        Glm53FlashVllmModel, Qwen36LocalModel,
     };
     use crate::common::RequestId;
     use crate::worker::{ChunkedPrefillWorker, HpUnifiedWorker, WorkerEventCommon};
@@ -813,6 +921,7 @@ mod tests {
             batch_policy: BatchPolicy::Mix,
             kv_admission: crate::worker::config::KvAdmissionSpec::default(),
             gpu_time_multiplier: 1.0,
+            prefill_gpu_time_multiplier: None,
         }
     }
 
@@ -847,6 +956,23 @@ mod tests {
         assert!(error.contains("requires worker `barebone`"));
     }
 
+    /// Both hybrid archs take the hybrid store under either lifecycle.
+    #[test]
+    fn hybrid_archs_pair_with_barebone_or_chunked_prefill() {
+        assert_iter_worker_contract::<crate::worker::Qwen36HybridWorker<Glm53FlashVllmModel>>();
+        assert_iter_worker_contract::<crate::worker::HybridChunkedPrefillWorker<Glm53FlashVllmModel>>(
+        );
+        assert_iter_worker_contract::<crate::worker::HybridChunkedPrefillWorker<Qwen36LocalModel>>(
+        );
+        for worker in [barebone_worker(), chunked_prefill_worker()] {
+            ensure_hybrid_worker("GLM-5.3-Flash", &worker).expect("hybrid lifecycle");
+        }
+        let error = ensure_hybrid_worker("GLM-5.3-Flash", &hp_worker())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("requires worker `barebone` or `chunked_prefill`"));
+    }
+
     #[test]
     fn the_snapshot_interval_override_is_barebone_only_and_defaults_to_the_arch() {
         assert_eq!(ssm_checkpoint_interval_tokens(&barebone_worker()), None);
@@ -875,6 +1001,41 @@ mod tests {
             ssm_checkpoint_interval_tokens: Some(528),
         };
         assert_eq!(ssm_checkpoint_interval_tokens(&overridden), Some(528));
+    }
+
+    #[test]
+    fn the_prefill_multiplier_is_chunked_prefill_only_and_at_least_one() {
+        assert_eq!(
+            prefill_gpu_time_multiplier(&chunked_prefill_worker()).unwrap(),
+            None
+        );
+        assert_eq!(prefill_gpu_time_multiplier(&hp_worker()).unwrap(), None);
+        let with = |multiplier: f64| {
+            let IterWorkerSel::ChunkedPrefill {
+                attn_gpu_memory_gb,
+                max_batch_tokens,
+                batch_policy,
+                kv_admission,
+                gpu_time_multiplier,
+                ..
+            } = chunked_prefill_worker()
+            else {
+                unreachable!()
+            };
+            IterWorkerSel::ChunkedPrefill {
+                attn_gpu_memory_gb,
+                max_batch_tokens,
+                batch_policy,
+                kv_admission,
+                gpu_time_multiplier,
+                prefill_gpu_time_multiplier: Some(multiplier),
+            }
+        };
+        assert_eq!(prefill_gpu_time_multiplier(&with(1.2)).unwrap(), Some(1.2));
+        let error = prefill_gpu_time_multiplier(&with(0.9))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("prefill_gpu_time_multiplier must be a finite value >= 1.0"));
     }
 
     #[test]

@@ -1,4 +1,7 @@
-//! GLM-5.2 request-local to global sparse-index remapping.
+//! GLM-5.2 / GLM-5.3 request-local to global sparse-index remapping.
+//!
+//! `selected_k` is the index-table width: 2048 (GLM-5.2) or 2176 (GLM-5.3
+//! kpool, `round_up(index_topk + index_kpool - 1, 128)`, at most 2051 valid).
 //!
 //! The native Triton launch scans a fixed `selected_k` row for every query.
 //! Its variable physical work is captured by query rows, mean valid slots, and
@@ -12,7 +15,8 @@ use crate::timing::kernels::engine::{register_kernel, KernelSpec};
 use crate::timing::sweep::{Axis, Coords, SweepGrid};
 use crate::timing::{KernelConfig, SweepCoords};
 
-const REQUIRED_SELECTED_K: u32 = 2048;
+const SUPPORTED_SELECTED_K: [u32; 2] = [2048, 2176];
+const MAX_SELECTED_K: u32 = 2176;
 const REQUIRED_BLOCK_SIZE: u32 = 64;
 const MAX_BLOCKS_PER_REQUEST: u32 = 16384;
 pub(crate) const MAX_QUERIES: u32 = 16384;
@@ -65,7 +69,7 @@ impl DsaSparseIndexRemapKernelInput {
             .valid_counts
             .iter()
             .zip(&self.local_span_lengths)
-            .all(|(&count, &span)| count <= REQUIRED_SELECTED_K.min(span)));
+            .all(|(&count, &span)| count <= MAX_SELECTED_K.min(span)));
 
         let workspace_rows = match &self.workspace_partition {
             None => 0,
@@ -106,13 +110,14 @@ impl SweepCoords for DsaSparseIndexRemapKernelInput {
 }
 
 fn canonical_input(
+    selected_k: u32,
     num_queries: u32,
     valid_count: u32,
     workspace_rows: u32,
 ) -> Option<DsaSparseIndexRemapKernelInput> {
     if num_queries == 0
         || num_queries > MAX_QUERIES
-        || valid_count > REQUIRED_SELECTED_K
+        || valid_count > selected_k
         || workspace_rows > num_queries
     {
         return None;
@@ -208,7 +213,7 @@ impl KernelSpec for DsaSparseIndexRemapSpec {
     const KIND: KernelKind = "dsa_sparse_index_remap";
 
     fn sweep_grid(config: &Self::Config) -> SweepGrid {
-        assert_eq!(config.selected_k, REQUIRED_SELECTED_K);
+        assert!(SUPPORTED_SELECTED_K.contains(&config.selected_k));
         assert_eq!(config.block_size, REQUIRED_BLOCK_SIZE);
         assert!((1..=MAX_BLOCKS_PER_REQUEST).contains(&config.max_blocks_per_request));
         SweepGrid::new(vec![
@@ -222,9 +227,10 @@ impl KernelSpec for DsaSparseIndexRemapSpec {
         CacheKind::Cache3DLinear
     }
 
-    fn infeasible_mask(_config: &Self::Config, grid: &SweepGrid) -> Vec<bool> {
+    fn infeasible_mask(config: &Self::Config, grid: &SweepGrid) -> Vec<bool> {
         grid.expand_3d(|num_queries, valid_count, workspace_rows| {
             canonical_input(
+                config.selected_k,
                 num_queries as u32,
                 valid_count as u32,
                 workspace_rows as u32,
@@ -240,11 +246,12 @@ impl KernelSpec for DsaSparseIndexRemapSpec {
     ) -> Vec<ArgsPayload> {
         grid.expand_3d(|num_queries, valid_count, workspace_rows| {
             let input = canonical_input(
+                config.selected_k,
                 num_queries as u32,
                 valid_count as u32,
                 workspace_rows as u32,
             )
-            .unwrap_or_else(|| canonical_input(1, 0, 0).unwrap());
+            .unwrap_or_else(|| canonical_input(config.selected_k, 1, 0, 0).unwrap());
             ArgsPayload::new()
                 .with("backend", backend)
                 .with("num_queries", input.valid_counts.len() as u32)
@@ -366,5 +373,25 @@ mod tests {
             "c:2047..2049@2048"
         );
         assert_eq!(encode_vector(&[2, 4, 2, 4], false, 2048), "g:(2,4)x2");
+    }
+
+    #[test]
+    fn kpool_table_width_enumerates_2176_and_admits_tail_counts() {
+        let mut config = config();
+        config.backends = vec!["vllm_fork_triton"];
+        config.selected_k = 2176;
+        let grid = DsaSparseIndexRemapSpec::sweep_grid(&config);
+        let payloads = DsaSparseIndexRemapSpec::enumerate(&config, &grid, "vllm_fork_triton");
+        assert!(payloads
+            .iter()
+            .all(|payload| payload.fields().get("selected_k") == Some(&Value::from(2176_u32))));
+        // kpool rows hold up to index_topk + index_kpool - 1 = 2051 valid slots.
+        let input = DsaSparseIndexRemapKernelInput {
+            request_row_counts: vec![4],
+            local_span_lengths: vec![4096; 4],
+            valid_counts: vec![2048, 2049, 2050, 2051],
+            workspace_partition: None,
+        };
+        assert_eq!(input.coords()[1], 2049.5);
     }
 }

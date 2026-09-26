@@ -531,6 +531,7 @@ def run_profile(cfg: ProfileConfig, *, resume: bool = False) -> dict:
         capture_timer_errors: list[BaseException] = []
         try:
             driver.wait_for_ready(base_url, proc, cfg.server.startup_timeout)
+            driver.verify_server_started(server_log, cfg.server)
             speculative = driver.speculative_decode_enabled(cfg.server)
             counters_before = None
             replay_start_monotonic_ns = None
@@ -539,7 +540,7 @@ def run_profile(cfg: ProfileConfig, *, resume: bool = False) -> dict:
             def measurement_ready() -> None:
                 nonlocal cuda_profile_active, capture_timer, counters_before
                 nonlocal replay_start_monotonic_ns, measurement_log_offset
-                if not driver.wait_for_idle(base_url, cfg.idle):
+                if not driver.wait_for_idle(base_url, cfg.idle, cfg.server):
                     raise RuntimeError("server did not drain before measurement")
                 measurement_log_offset = server_log.stat().st_size
                 if is_nsys and cfg.nsys.capture_mode == "cuda_profiler_api":
@@ -590,7 +591,7 @@ def run_profile(cfg: ProfileConfig, *, resume: bool = False) -> dict:
                 capture_timer.join()
             if capture_timer_errors:
                 raise RuntimeError("bounded NSYS capture stop failed") from capture_timer_errors[0]
-            drive_summary["reached_idle"] = driver.wait_for_idle(base_url, cfg.idle)
+            drive_summary["reached_idle"] = driver.wait_for_idle(base_url, cfg.idle, cfg.server)
             if speculative:
                 if not drive_summary["reached_idle"]:
                     raise RuntimeError(

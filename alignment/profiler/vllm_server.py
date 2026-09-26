@@ -34,6 +34,17 @@ VLLM_SOURCE_ROOT = Path(__file__).resolve().parent / "vllm"
 
 HEALTH_ENDPOINTS = ("/health", "/v1/models")
 
+# HTTP API processes when a preset does not choose. One process serialized a
+# 256-request burst at ~0.75 ms per request on GLM-5.3-Flash TP4, starting
+# EngineCore's TTFT clock up to ~240 ms after the client sent the request.
+DEFAULT_API_SERVER_COUNT = 4
+
+# `APIServerProcessManager` announces the processes it actually spawned. The
+# deprecated `vllm.entrypoints.openai.api_server` module accepts
+# `--api-server-count` but always runs one server, so only this line proves
+# the setting took effect.
+_API_SERVERS_STARTED_RE = re.compile(r"Started (\d+) API server processes")
+
 # Enables the /start_profile and /stop_profile routes. Those routes fan CUDA
 # profiler control into the actual GPU worker, which is the reliable
 # targeted-capture boundary for the spawned EngineCore.
@@ -67,14 +78,35 @@ _WORKER_RANK_RE = re.compile(
 )
 
 
+def api_server_count(cfg: ServerConfig) -> int:
+    """The HTTP API process count this server launches with."""
+    count = DEFAULT_API_SERVER_COUNT if cfg.api_server_count is None else cfg.api_server_count
+    if type(count) is not int or count < 1:
+        raise ValueError(f"server.api_server_count must be a positive integer, got {count!r}")
+    return count
+
+
 def build_server_argv(fork_python: str, cfg: ServerConfig) -> list[str]:
-    """The `python -m vllm.entrypoints.openai.api_server ...` argv."""
+    """The `python -m vllm.entrypoints.cli.main serve <model> ...` argv.
+
+    The CLI `serve` entry is the only one that honors `--api-server-count`.
+    """
+    if any(
+        argument == "--api-server-count" or argument.startswith("--api-server-count=")
+        for argument in cfg.extra_args
+    ):
+        raise ValueError(
+            "set the vLLM API process count with server.api_server_count, not "
+            "--api-server-count in server.extra_args"
+        )
     argv = [
         fork_python,
         "-m",
-        "vllm.entrypoints.openai.api_server",
-        "--model",
+        "vllm.entrypoints.cli.main",
+        "serve",
         cfg.model_path,
+        "--api-server-count",
+        str(api_server_count(cfg)),
         "--host",
         cfg.host,
         "--port",
@@ -345,16 +377,47 @@ def extract_worker_device_ranks(server_log: Path) -> dict[int, int]:
     return ranks
 
 
-def wait_for_idle(base_url: str, idle: IdleWaitConfig) -> bool:
+def verify_server_started(server_log: Path, cfg: ServerConfig) -> None:
+    """Fail unless the log shows the requested number of API processes.
+
+    One process logs no announcement, so only a multi-process request is checked.
+    """
+    expected = api_server_count(cfg)
+    if expected == 1:
+        return
+    started = [
+        int(match.group(1))
+        for match in _API_SERVERS_STARTED_RE.finditer(Path(server_log).read_text(errors="replace"))
+    ]
+    if started != [expected]:
+        raise RuntimeError(
+            f"requested {expected} vLLM API server processes, but the server log "
+            f"announces {started or 'none'}"
+        )
+
+
+# Each API process counts only its own in-flight requests, and a fresh
+# connection reaches an arbitrary one. Require this many consecutive zero reads
+# per process before calling the server idle.
+_IDLE_ZERO_READS_PER_API_SERVER = 4
+
+
+def wait_for_idle(base_url: str, idle: IdleWaitConfig, cfg: ServerConfig | None = None) -> bool:
     """Poll /load until in-flight requests drain to zero (server_load == 0).
 
     Stock vLLM (no `--enable-server-load-tracking`) has no /load endpoint; there
     the caller has already awaited request completion, so a 404 just returns True.
+    With several API processes /load is per process, so idle requires a run of
+    consecutive zero reads; the check is probabilistic, and it backs up the
+    caller's own completion wait rather than replacing it.
     """
     if not idle.enabled:
         return True
+    servers = 1 if cfg is None else api_server_count(cfg)
+    zero_reads_needed = 1 if servers == 1 else servers * _IDLE_ZERO_READS_PER_API_SERVER
     deadline = time.time() + idle.timeout
     saw_endpoint = False
+    zero_reads = 0
     while time.time() < deadline:
         status, body = _get(f"{base_url}/load")
         if status == 404:
@@ -362,9 +425,13 @@ def wait_for_idle(base_url: str, idle: IdleWaitConfig) -> bool:
         if status == 200 and body is not None:
             saw_endpoint = True
             try:
-                if json.loads(body).get("server_load", -1) == 0:
-                    return True
+                load = json.loads(body).get("server_load", -1)
             except json.JSONDecodeError:
-                pass
+                load = -1
+            zero_reads = zero_reads + 1 if load == 0 else 0
+            if zero_reads >= zero_reads_needed:
+                return True
+            if zero_reads:
+                continue  # poll the next process now; the wait is for load, not time
         time.sleep(idle.poll_interval)
     return not saw_endpoint

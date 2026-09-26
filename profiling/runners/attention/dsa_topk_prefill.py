@@ -27,6 +27,12 @@ _REQUIRED_GPU = "NVIDIA H200"
 _VLLM_SUPPORTED_GPUS = ("NVIDIA H200", "NVIDIA B200")
 _VLLM_KERNEL_NAME = "topKPerRowPrefill"
 _SGLANG_SUPPORTED_GPUS = ("NVIDIA B200",)
+# The vLLM fork (GLM-5.3-Flash production) calls the same op with the kpool
+# selection width index_topk / index_kpool = 512; 1024 and 2048 are the other
+# instantiations of the callable.
+_FORK_BACKEND = "vllm_fork_cuda"
+_FORK_SUPPORTED_GPUS = ("NVIDIA B200",)
+_FORK_TOP_K = frozenset({512, 1024, 2048})
 _SGLANG_KERNEL_NAME = "topk_transform_prefill_kernel"
 
 
@@ -51,6 +57,7 @@ def _validate_args(
     logits_dtype: DType | str,
     index_dtype: str,
     span_mode: str,
+    allowed_top_k: frozenset[int] = frozenset({_TOP_K}),
 ) -> tuple[int, int, int, int, int, DType, str, str]:
     num_queries = int(num_queries)
     num_keys = int(num_keys)
@@ -67,8 +74,9 @@ def _validate_args(
         raise ValueError(f"num_queries must be <= num_keys, got {num_queries} and {num_keys}")
     if num_sequences != _NUM_SEQUENCES:
         raise ValueError(f"dsa_topk_prefill requires num_sequences=1, got {num_sequences}")
-    if top_k != _TOP_K:
-        raise ValueError(f"dsa_topk_prefill requires top_k=2048, got {top_k}")
+    if top_k not in allowed_top_k:
+        required = " or ".join(f"top_k={value}" for value in sorted(allowed_top_k))
+        raise ValueError(f"dsa_topk_prefill requires {required}, got {top_k}")
     if logits_row_stride <= 0 or logits_row_stride < num_keys:
         raise ValueError(
             "logits_row_stride must be positive and >= num_keys, "
@@ -111,6 +119,7 @@ def _validate_vllm_args(
     logits_dtype: DType | str,
     index_dtype: str,
     span_mode: str,
+    allowed_top_k: frozenset[int] = frozenset({_TOP_K}),
 ) -> tuple[int, int, int, int, int, DType, str, str]:
     """Validate the production backend's argument identity.
 
@@ -130,18 +139,23 @@ def _validate_vllm_args(
         logits_dtype,
         index_dtype,
         span_mode,
+        allowed_top_k,
     )
     return validated
 
 
-def _validate_vllm_cuda_device(torch: Any) -> None:
+def _validate_vllm_cuda_device(
+    torch: Any,
+    backend: str = "vllm_cuda",
+    supported_gpus: tuple[str, ...] = _VLLM_SUPPORTED_GPUS,
+) -> None:
     if not torch.cuda.is_available():
-        raise ProfilerNotImplemented("CUDA is required for the dsa_topk_prefill vllm_cuda backend")
+        raise ProfilerNotImplemented(f"CUDA is required for the dsa_topk_prefill {backend} backend")
     gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
-    if gpu_name not in _VLLM_SUPPORTED_GPUS:
+    if gpu_name not in supported_gpus:
         raise ProfilerNotImplemented(
-            "dsa_topk_prefill vllm_cuda is verified only on "
-            f"{' or '.join(_VLLM_SUPPORTED_GPUS)}, got {gpu_name}"
+            f"dsa_topk_prefill {backend} is verified only on "
+            f"{' or '.join(supported_gpus)}, got {gpu_name}"
         )
 
 
@@ -165,7 +179,8 @@ def _load_vllm_cuda_backend() -> tuple[Any, Any]:
         from vllm import _custom_ops as custom_ops
     except (ImportError, OSError, RuntimeError) as exc:
         raise ProfilerNotImplemented(
-            "the instrumented vLLM CUDA environment is required for dsa_topk_prefill:vllm_cuda"
+            "an instrumented vLLM CUDA environment is required for "
+            "dsa_topk_prefill:vllm_cuda / vllm_fork_cuda"
         ) from exc
 
     del custom_ops  # Importing the extension registers the torch.ops._C schema.
@@ -420,6 +435,59 @@ def profile_dsa_topk_prefill_vllm_cuda(
     span_mode: str,
 ) -> ComputeMetrics:
     """Profile vLLM's one-launch production prefill DSA top-k kernel."""
+    return _profile_top_k_per_row_prefill(
+        None,
+        num_queries,
+        num_keys,
+        num_sequences,
+        top_k,
+        logits_row_stride,
+        logits_dtype,
+        index_dtype,
+        span_mode,
+    )
+
+
+def profile_dsa_topk_prefill_vllm_fork_cuda(
+    num_queries: int,
+    num_keys: int,
+    num_sequences: int,
+    top_k: int,
+    logits_row_stride: int,
+    logits_dtype: DType | str,
+    index_dtype: str,
+    span_mode: str,
+) -> ComputeMetrics:
+    """Profile the vLLM fork's top_k_per_row_prefill (GLM-5.3-Flash kpool K=512).
+
+    For kpool, ``num_keys`` counts pools: production rows span pool-granular
+    logits (``compress_ratio == index_kpool``) and select ``top_k`` pools.
+    """
+    return _profile_top_k_per_row_prefill(
+        _FORK_BACKEND,
+        num_queries,
+        num_keys,
+        num_sequences,
+        top_k,
+        logits_row_stride,
+        logits_dtype,
+        index_dtype,
+        span_mode,
+    )
+
+
+def _profile_top_k_per_row_prefill(
+    fork_backend: str | None,
+    num_queries: int,
+    num_keys: int,
+    num_sequences: int,
+    top_k: int,
+    logits_row_stride: int,
+    logits_dtype: DType | str,
+    index_dtype: str,
+    span_mode: str,
+) -> ComputeMetrics:
+    """Profile one packaged ``top_k_per_row_prefill``; ``None`` is ``vllm_cuda``."""
     (
         num_queries,
         num_keys,
@@ -438,9 +506,13 @@ def profile_dsa_topk_prefill_vllm_cuda(
         logits_dtype,
         index_dtype,
         span_mode,
+        _FORK_TOP_K if fork_backend else frozenset({_TOP_K}),
     )
     torch, top_k_per_row_prefill = _load_vllm_cuda_backend()
-    _validate_vllm_cuda_device(torch)
+    if fork_backend:
+        _validate_vllm_cuda_device(torch, fork_backend, _FORK_SUPPORTED_GPUS)
+    else:
+        _validate_vllm_cuda_device(torch)
 
     try:
         operands = _build_operands(

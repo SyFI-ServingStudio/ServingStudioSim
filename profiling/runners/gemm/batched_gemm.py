@@ -1,9 +1,14 @@
-"""Production-layout Torch runners for GLM-5.2 MLA batched GEMMs.
+"""Production-layout Torch runners for GLM-5.2 / GLM-5.3 MLA batched GEMMs.
 
 Each timed callable is only its unquantized ``torch.bmm(..., out=...)`` launch.
 Q-absorption and V-up layout construction mirror vLLM v0.23.0 commit
 ``0fc695fc6d1d82e9a5ac6835ac8e4e1c83703665`` in
 ``mla_attention.py::{process_weights_after_loading,_v_up_proj}``.
+
+The ``*_glm53`` backends reuse the same construction for GLM-5.3-Flash on the
+alignment fork (``mla_attention.py:1170-1252,993-1008,1300-1332``, unchanged
+there): qk_nope 256 with no RoPE part, v_head 256, kv_lora 512, and an unpadded
+attention output (``FlashInferMLASparseImpl`` sets no ``q_pad_num_heads``).
 """
 
 from __future__ import annotations
@@ -29,6 +34,36 @@ _KV_LORA_RANK = 512
 _V_HEAD_DIM = 256
 _PACKED_HEAD_WIDTH = _QK_NOPE_HEAD_DIM + _V_HEAD_DIM
 _H200_PADDED_HEADS = 64
+
+
+@dataclass(frozen=True)
+class _MlaLayout:
+    backend: str
+    q_head_width: int
+    qk_nope_head_dim: int
+    v_head_dim: int
+    kv_lora_rank: int
+    # Attention-output head stride for V-up; None means unpadded (num_batches).
+    padded_heads: int | None
+
+
+_GLM52_LAYOUT = _MlaLayout(
+    backend="glm52",
+    q_head_width=_Q_HEAD_WIDTH,
+    qk_nope_head_dim=_QK_NOPE_HEAD_DIM,
+    v_head_dim=_V_HEAD_DIM,
+    kv_lora_rank=_KV_LORA_RANK,
+    padded_heads=_H200_PADDED_HEADS,
+)
+_GLM53_LAYOUT = _MlaLayout(
+    backend="glm53",
+    q_head_width=256,
+    qk_nope_head_dim=256,
+    v_head_dim=256,
+    kv_lora_rank=512,
+    padded_heads=None,
+)
+_GLM53_SUPPORTED_GPUS = frozenset({"NVIDIA B200"})
 
 
 @dataclass(frozen=True)
@@ -352,3 +387,158 @@ def profile_mla_v_up_glm52(
         )
     except RuntimeError as exc:
         raise KernelLaunchFailed(str(exc)) from exc
+
+
+def _build_layout_q_absorb_operands(
+    torch: Any, layout: _MlaLayout, *, num_batches: int, m: int, torch_dtype: Any, device: str
+) -> _QAbsorbOperands:
+    """Q absorption: (N, B, P) x W_UK_T (N, P, L) -> (N, B, L) over kv_b_proj views."""
+    packed_width = layout.qk_nope_head_dim + layout.v_head_dim
+    q_base = torch.randn((m, num_batches, layout.q_head_width), dtype=torch_dtype, device=device)
+    lhs = q_base[..., : layout.qk_nope_head_dim].transpose(0, 1)
+    packed_weight = torch.randn(
+        (num_batches * packed_width, layout.kv_lora_rank), dtype=torch_dtype, device=device
+    )
+    packed_view = packed_weight.T.view(layout.kv_lora_rank, num_batches, packed_width)
+    w_uk, _w_uv = packed_view.split([layout.qk_nope_head_dim, layout.v_head_dim], dim=-1)
+    rhs = w_uk.permute(1, 2, 0)
+    out = torch.empty((num_batches, m, layout.kv_lora_rank), dtype=torch_dtype, device=device)
+    return _QAbsorbOperands(q_base=q_base, lhs=lhs, packed_weight=packed_weight, rhs=rhs, out=out)
+
+
+def _build_layout_v_up_operands(
+    torch: Any, layout: _MlaLayout, *, num_batches: int, m: int, torch_dtype: Any, device: str
+) -> _VUpOperands:
+    """V-up: (N, B, L) x W_UV (N, L, V) -> (N, B, V), written into a (B, N*V) output."""
+    packed_width = layout.qk_nope_head_dim + layout.v_head_dim
+    heads = layout.padded_heads or num_batches
+    attention_base = torch.randn((m, heads, layout.kv_lora_rank), dtype=torch_dtype, device=device)
+    attention_output = attention_base[:, :num_batches, :]
+    lhs = attention_output.transpose(0, 1)
+    packed_weight = torch.randn(
+        (num_batches * packed_width, layout.kv_lora_rank), dtype=torch_dtype, device=device
+    )
+    packed_view = packed_weight.T.view(layout.kv_lora_rank, num_batches, packed_width)
+    _w_uk, w_uv = packed_view.split([layout.qk_nope_head_dim, layout.v_head_dim], dim=-1)
+    rhs = w_uv.transpose(0, 1)
+    out_base = torch.empty((m, num_batches * layout.v_head_dim), dtype=torch_dtype, device=device)
+    out = out_base.view(m, num_batches, layout.v_head_dim).transpose(0, 1)
+    return _VUpOperands(
+        attention_base=attention_base,
+        attention_output=attention_output,
+        lhs=lhs,
+        packed_weight=packed_weight,
+        rhs=rhs,
+        out_base=out_base,
+        out=out,
+    )
+
+
+def _validate_layout_args(
+    backend: str,
+    expected_kn: tuple[int, int],
+    num_batches: int,
+    m: int,
+    n: int,
+    k: int,
+    dtype: DType | str,
+) -> tuple[int, int, int, int, DType]:
+    num_batches, m, n, k = int(num_batches), int(m), int(n), int(k)
+    dtype = DType.from_value(dtype)
+    if num_batches <= 0 or m <= 0 or n <= 0 or k <= 0:
+        raise ValueError(
+            "num_batches, m, n, and k must be > 0, got "
+            f"num_batches={num_batches}, m={m}, n={n}, k={k}"
+        )
+    if num_batches not in _SUPPORTED_HEAD_COUNTS:
+        raise ValueError(
+            f"{backend} supports num_batches in {sorted(_SUPPORTED_HEAD_COUNTS)}, got {num_batches}"
+        )
+    if (k, n) != expected_kn:
+        raise ValueError(f"{backend} requires (k, n) == {expected_kn}, got ({k}, {n})")
+    if dtype is not _SUPPORTED_DTYPE:
+        raise ValueError(f"{backend} supports only bf16, got {dtype.value}")
+    return num_batches, m, n, k, dtype
+
+
+def _profile_layout_bmm(
+    backend: str,
+    build: Any,
+    layout: _MlaLayout,
+    num_batches: int,
+    m: int,
+    n: int,
+    k: int,
+    dtype: DType,
+) -> ComputeMetrics:
+    try:
+        import torch
+    except ImportError as exc:
+        raise ProfilerNotImplemented(f"torch is required for the {backend} backend") from exc
+    if not torch.cuda.is_available():
+        raise ProfilerNotImplemented(f"CUDA is required for the {backend} backend")
+    gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
+    if gpu_name not in _GLM53_SUPPORTED_GPUS:
+        raise ProfilerNotImplemented(
+            f"{backend} is verified only on {sorted(_GLM53_SUPPORTED_GPUS)}, got {gpu_name}"
+        )
+    try:
+        operands = build(
+            torch, layout, num_batches=num_batches, m=m, torch_dtype=dtype.torch(), device="cuda"
+        )
+
+        def kernel() -> None:
+            torch.bmm(operands.lhs, operands.rhs, out=operands.out)
+
+        # Untimed semantic check on the exact strided operands.
+        kernel()
+        torch.cuda.synchronize()
+        expected = torch.bmm(operands.lhs.float(), operands.rhs.float())
+        torch.testing.assert_close(operands.out.float(), expected, rtol=2e-2, atol=2e-1)
+
+        time_ms = Timer.cupti(kernel)
+        energy_j = Energy.perf(kernel, warmup=5, per_iter_time_ms=time_ms)
+        flops = 2 * num_batches * m * n * k
+        tflops = (flops / (time_ms / 1000.0)) / 1e12 if time_ms > 0.0 else 0.0
+        bytes_accessed = int(_logical_elements(num_batches, m, n, k) * dtype.size_bytes())
+        bandwidth_gbps = (bytes_accessed / (time_ms / 1000.0)) / 1e9 if time_ms > 0.0 else 0.0
+        return ComputeMetrics(
+            time_ms=float(time_ms),
+            tflops=float(tflops),
+            memory_bandwidth_gbps=float(bandwidth_gbps),
+            energy_j=float(energy_j),
+        )
+    except RuntimeError as exc:
+        raise KernelLaunchFailed(str(exc)) from exc
+
+
+def profile_mla_q_absorb_glm53(
+    num_batches: int,
+    m: int,
+    n: int,
+    k: int,
+    dtype: DType | str,
+) -> ComputeMetrics:
+    """Profile GLM-5.3-Flash MLA Q absorption ([N,B,256] x [N,256,512])."""
+    backend = "torch_mla_q_absorb_glm53"
+    layout = _GLM53_LAYOUT
+    args = _validate_layout_args(
+        backend, (layout.qk_nope_head_dim, layout.kv_lora_rank), num_batches, m, n, k, dtype
+    )
+    return _profile_layout_bmm(backend, _build_layout_q_absorb_operands, layout, *args)
+
+
+def profile_mla_v_up_glm53(
+    num_batches: int,
+    m: int,
+    n: int,
+    k: int,
+    dtype: DType | str,
+) -> ComputeMetrics:
+    """Profile GLM-5.3-Flash MLA V-up ([N,B,512] x [N,512,256], unpadded heads)."""
+    backend = "torch_mla_v_up_glm53"
+    layout = _GLM53_LAYOUT
+    args = _validate_layout_args(
+        backend, (layout.kv_lora_rank, layout.v_head_dim), num_batches, m, n, k, dtype
+    )
+    return _profile_layout_bmm(backend, _build_layout_v_up_operands, layout, *args)

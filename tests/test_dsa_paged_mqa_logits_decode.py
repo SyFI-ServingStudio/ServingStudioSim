@@ -28,6 +28,7 @@ from profiling.runners.exceptions import KernelLaunchFailed, ProfilerNotImplemen
 
 _BACKEND = "torch"
 _DEEPGEMM_BACKEND = "deepgemm_fp8"
+_FORK_BACKEND = "deepgemm_fp8_vllm_fork"
 _BASE_SPEC = {
     "batch_size": 2,
     "context_len": 65,
@@ -92,7 +93,7 @@ def test_registration_support_and_facades():
     spec = find_kernel_profiler_spec(KIND, _BACKEND)
 
     assert KIND == "dsa_paged_mqa_logits_decode"
-    assert known_backends(KIND) == [_BACKEND, _DEEPGEMM_BACKEND]
+    assert known_backends(KIND) == [_BACKEND, _DEEPGEMM_BACKEND, _FORK_BACKEND]
     assert spec.kernel_kind == spec.table_name == KIND
     assert spec.args_schema is DsaPagedMqaLogitsDecodeArgs
     assert spec.metric_family is MetricFamily.COMPUTE
@@ -927,3 +928,81 @@ def test_cpu_composite_matches_reference_and_preserves_every_operand():
     )
     for tensor, snapshot in zip(tensors, snapshots, strict=True):
         assert torch.equal(tensor, snapshot)
+
+
+def test_vllm_fork_registration_runs_on_b200_in_the_fork_env():
+    spec = find_kernel_profiler_spec(KIND, _FORK_BACKEND)
+
+    assert spec.args_schema is DsaPagedMqaLogitsDecodeArgs
+    assert spec.table_name == KIND
+    assert spec.subprocess_env == "vllm_fork_env"
+    assert spec.supports.allows(DType.FP8_E4M3, DType.FP8_E4M3, gpu="NVIDIA B200")
+    assert not spec.supports.allows(DType.FP8_E4M3, DType.FP8_E4M3, gpu="NVIDIA H200")
+    assert spec.runner_ref.function_name == (
+        "profile_dsa_paged_mqa_logits_decode_deepgemm_fp8_vllm_fork"
+    )
+
+
+def test_vllm_fork_entry_times_the_unified_sm100_kernel_with_a_check(monkeypatch):
+    from profiling.runners.attention import dsa_paged_mqa_logits_decode as runner
+
+    calls = []
+
+    def shared(load_backend, **kwargs):
+        calls.append((load_backend, kwargs))
+        return "metrics"
+
+    monkeypatch.setattr(runner, "_profile_dsa_paged_mqa_logits_decode_deepgemm_fp8", shared)
+    # GLM-5.3-Flash TP4: 32 replicated indexer heads, 2048 pools of an 8192-token
+    # request, token-wide logits rows.
+    spec = _BASE_SPEC | {"num_heads": 32, "context_len": 2048, "max_model_len": 8192}
+    assert runner.profile_dsa_paged_mqa_logits_decode_deepgemm_fp8_vllm_fork(**spec) == "metrics"
+    load_backend, kwargs = calls[0]
+    assert load_backend is runner._load_deepgemm_backend
+    assert kwargs.pop("kernel_name") == "sm100_paged_mqa_logits"
+    assert kwargs.pop("supported_gpus") == ("NVIDIA B200",)
+    assert kwargs.pop("check_correctness") is True
+    assert kwargs == spec
+
+
+def test_vllm_fork_rejects_non_b200_before_launch():
+    from profiling.runners.attention.dsa_paged_mqa_logits_decode import (
+        _validate_deepgemm_cuda_device,
+    )
+
+    h200 = SimpleNamespace(
+        cuda=SimpleNamespace(
+            is_available=lambda: True,
+            current_device=lambda: 0,
+            get_device_name=lambda _device: "NVIDIA H200",
+            get_device_properties=lambda _device: SimpleNamespace(multi_processor_count=132),
+        )
+    )
+    with pytest.raises(ProfilerNotImplemented, match="verified only on NVIDIA B200"):
+        _validate_deepgemm_cuda_device(h200, supported_gpus=("NVIDIA B200",))
+
+
+def test_vllm_fork_composite_check_accepts_matching_and_rejects_wrong_logits():
+    from profiling.runners.attention.dsa_paged_mqa_logits_decode import (
+        _build_operands,
+        _check_against_composite,
+        _torch_composite,
+    )
+
+    operands = _build_operands(
+        torch,
+        batch_size=2,
+        context_len=65,
+        next_n=1,
+        max_model_len=128,
+        num_heads=32,
+        head_dim=128,
+        block_size=64,
+        device="cpu",
+    )
+    expected = _torch_composite(operands, context_len=65, max_model_len=128)
+    _check_against_composite(torch, operands, expected, context_len=65, max_model_len=128)
+    wrong = expected.clone()
+    wrong[0, 3] += 1.0
+    with pytest.raises(KernelLaunchFailed, match="disagrees with the Torch composite"):
+        _check_against_composite(torch, operands, wrong, context_len=65, max_model_len=128)

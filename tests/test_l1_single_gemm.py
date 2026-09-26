@@ -140,6 +140,7 @@ def test_single_gemm_known_backends_include_framework_dispatches():
         "sglang_bf16_auto",
         "sglang_fused_a_auto",
         "deepgemm",
+        "deepgemm_vllm_fork",
     }
 
 
@@ -1538,6 +1539,7 @@ def test_documented_profile_env_registry_complete():
         "flashinfer_local",
         "sglang_env",
         "vllm_env",
+        "vllm_fork_env",
     }
     assert set(ENV_REGISTRY) == expected_envs
     assert (
@@ -1548,6 +1550,11 @@ def test_documented_profile_env_registry_complete():
     assert isinstance(vllm_env, ContainerProfileEnv)
     assert vllm_env.image == "vibesim-profiler-vllm:cu130"
     vllm_env.validate()
+    # The fork env resolves Torch's CUDA runtime from its own venv first.
+    fork_env = ENV_REGISTRY["vllm_fork_env"]
+    assert isinstance(fork_env, ProfileEnv)
+    assert fork_env.additional_library_paths[0].parts[-2:] == ("torch", "lib")
+    assert fork_env.python_executable.parents[2] in fork_env.additional_python_paths
 
 
 def test_comm_launcher_interfaces_exist():

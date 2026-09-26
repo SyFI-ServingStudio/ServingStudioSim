@@ -10,6 +10,12 @@
 //! sweep axis: it raises the minimum measurable context to the group's first row
 //! and scales the padded logits allocation, and the physical coordinates stay
 //! batch/context.
+//!
+//! GLM-5.3-Flash's pooled indexer (vLLM fork `vllm_fork_cuda`) selects
+//! `top_k = 512` pools, `context_len` counts pools, and the logits row stays
+//! token-wide (`max_model_len = logits_row_stride = 8192`). Its context axis
+//! brackets the `top_k = 512` short-row boundary instead of 2048; the
+//! `top_k = 2048` axis is unchanged.
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::{CacheKind, Extrapolation};
@@ -47,6 +53,57 @@ pub struct DsaPersistentTopkDecodeKernelInput {
 /// the grid stays rectangular.
 const MAX_PROFILE_ALLOCATION_BYTES: f64 = 32.0 * 1024.0 * 1024.0 * 1024.0;
 
+const BATCH_AXIS: [u32; 34] = [
+    1, 2, 4, 8, 12, 15, 16, 17, 23, 24, 31, 32, 33, 39, 46, 48, 64, 65, 66, 67, 92, 96, 127, 128,
+    129, 130, 131, 132, 133, 197, 198, 199, 255, 256,
+];
+
+/// Measured `top_k = 2048` context axis, including the R.4 speculative repairs.
+const TOP_K_2048_CONTEXT_AXIS: [u32; 27] = [
+    0, 1, 2, 128, 256, 512, 1024, 2046, 2047, 2048, 2049, 2050, 2897, 4096, 5792, 8191, 8192, 8193,
+    16384, 32767, 32768, 32769, 65536, 131072, 262144, 524288, 1048576,
+];
+
+/// Context points for any other `top_k`, before its `top_k - 2 ..= top_k + 2`
+/// short-row bracket is added. The 32,768 bracket is the kernel's cooperative
+/// radix threshold.
+const OTHER_TOP_K_CONTEXT_AXIS: [u32; 18] = [
+    0, 1, 2, 128, 256, 1024, 2048, 4096, 8192, 16384, 32767, 32768, 32769, 65536, 131072, 262144,
+    524288, 1048576,
+];
+
+/// Context axis of the GLM-5.3-Flash kpool fork backend (`top_k` = 512 pools).
+///
+/// Its long-row time depends on the context in a data-dependent, repeatable way
+/// (B200 scan, job 1134): power-of-two lengths dip 13-15% below their
+/// neighbours and 3600..5000 pools sit on a lower 5.2-5.6 us plateau. The
+/// points therefore avoid powers of two above the short-row bracket and
+/// bracket the plateau at 3300/3800 and 4800/6500, so interpolation reads
+/// the level an arbitrary pool count sees. 14 points up to 8192 keep 34 x 14 =
+/// 476 feasible coordinates at max_model_len 8192.
+const POOLED_FORK_CONTEXT_AXIS: [u32; 23] = [
+    0, 128, 511, 512, 513, 600, 1100, 1700, 2500, 3300, 3800, 4800, 6500, 8192, 16384, 32767,
+    32768, 32769, 65536, 131072, 262144, 524288, 1048576,
+];
+
+const POOLED_FORK_BACKEND: &str = "vllm_fork_cuda";
+
+/// Context axis for one `top_k`.
+///
+/// Rows no longer than `top_k` take the kernel's short path, so the axis
+/// brackets `top_k` on both sides. `top_k = 2048` keeps its measured axis.
+fn context_axis(top_k: u32) -> Vec<u32> {
+    if top_k == 2048 {
+        return TOP_K_2048_CONTEXT_AXIS.to_vec();
+    }
+    assert!(top_k >= 2, "dsa_persistent_topk_decode top_k must be >= 2");
+    let mut axis = OTHER_TOP_K_CONTEXT_AXIS.to_vec();
+    axis.extend(top_k - 2..=top_k + 2);
+    axis.sort_unstable();
+    axis.dedup();
+    axis
+}
+
 pub struct DsaPersistentTopkDecodeSpec;
 
 impl KernelSpec for DsaPersistentTopkDecodeSpec {
@@ -55,16 +112,16 @@ impl KernelSpec for DsaPersistentTopkDecodeSpec {
 
     const KIND: KernelKind = "dsa_persistent_topk_decode";
 
-    fn sweep_grid(_config: &Self::Config) -> SweepGrid {
+    fn sweep_grid(config: &Self::Config) -> SweepGrid {
         SweepGrid::new(vec![
-            Axis::values([
-                1, 2, 4, 8, 12, 15, 16, 17, 23, 24, 31, 32, 33, 39, 46, 48, 64, 65, 66, 67, 92, 96,
-                127, 128, 129, 130, 131, 132, 133, 197, 198, 199, 255, 256,
-            ]),
-            Axis::values([
-                0, 1, 2, 128, 256, 512, 1024, 2046, 2047, 2048, 2049, 2050, 2897, 4096, 5792, 8191,
-                8192, 8193, 16384, 32767, 32768, 32769, 65536, 131072, 262144, 524288, 1048576,
-            ]),
+            Axis::values(BATCH_AXIS),
+            Axis::values(
+                if config.backends.contains(&POOLED_FORK_BACKEND) && config.top_k == 512 {
+                    POOLED_FORK_CONTEXT_AXIS.to_vec()
+                } else {
+                    context_axis(config.top_k)
+                },
+            ),
         ])
     }
 
@@ -476,6 +533,71 @@ mod tests {
         assert_eq!(fields.get("index_dtype"), Some(&Value::from("int32")));
         assert_eq!(fields.get("context_mode"), Some(&Value::from("uniform")));
         assert_eq!(payload.backend(), Some(VLLM_BACKEND));
+    }
+
+    const FORK_BACKEND: &str = "vllm_fork_cuda";
+
+    /// GLM-5.3-Flash kpool decode on B200 (b2-dsa 5.2): 512 pools selected,
+    /// `context_len` in pools, token-wide 8192 logits rows.
+    fn pooled_fork_config() -> DsaPersistentTopkDecodeKernelConfig {
+        DsaPersistentTopkDecodeKernelConfig {
+            backends: vec![FORK_BACKEND],
+            gpu_name: "NVIDIA B200".to_string(),
+            next_n: 1,
+            max_model_len: Dim::param("max_model_len", 8192),
+            top_k: 512,
+            logits_row_stride: Dim::param("max_model_len", 8192),
+            logits_dtype: DType::Fp32,
+            index_dtype: "int32".to_string(),
+            context_mode: "uniform".to_string(),
+        }
+    }
+
+    /// Catches the fork payload drifting from the Python `vllm_fork_cuda` args,
+    /// a top_k-512 grid that misses its short-row bracket, and a grid past the
+    /// 500-feasible-coordinate ceiling.
+    #[test]
+    fn pooled_fork_payloads_match_python_args_and_bracket_top_k() {
+        let cfg = pooled_fork_config();
+        let grid = DsaPersistentTopkDecodeSpec::sweep_grid(&cfg);
+        assert!(grid.axes()[1].windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(grid.axes()[1]
+            .windows(3)
+            .any(|w| w == [511.0, 512.0, 513.0]));
+        // Powers of two above the short-row bracket are measured dips (job 1134).
+        assert!(!grid.axes()[1]
+            .iter()
+            .any(|&c| [1024.0, 2048.0, 4096.0].contains(&c)));
+        let mask = DsaPersistentTopkDecodeSpec::infeasible_mask(&cfg, &grid);
+        assert_eq!(mask.iter().filter(|&&masked| !masked).count(), 34 * 14);
+
+        let payloads = DsaPersistentTopkDecodeSpec::enumerate(&cfg, &grid, FORK_BACKEND);
+        assert_eq!(
+            serde_json::to_value(payload_for(&payloads, &grid, 32, 1100).fields()).unwrap(),
+            serde_json::json!({
+                "backend": FORK_BACKEND,
+                "batch_size": 32,
+                "context_len": 1100,
+                "next_n": 1,
+                "max_model_len": 8192,
+                "top_k": 512,
+                "logits_row_stride": 8192,
+                "logits_dtype": "fp32",
+                "index_dtype": "int32",
+                "context_mode": "uniform",
+            })
+        );
+    }
+
+    /// The top_k-2048 axis is measured; generalizing the axis must not move it.
+    #[test]
+    fn top_k_2048_keeps_its_measured_context_axis() {
+        let mut cfg = pooled_fork_config();
+        cfg.top_k = 2048;
+        assert_eq!(
+            DsaPersistentTopkDecodeSpec::sweep_grid(&cfg).axes()[1],
+            CONTEXT_AXIS
+        );
     }
 
     #[test]

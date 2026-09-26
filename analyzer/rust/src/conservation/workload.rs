@@ -565,6 +565,11 @@ pub(crate) struct WorkloadTotals {
     pub(crate) prefill_stateful_requests: f64, // Σ chunks with prefix > 0 (state read)
     /// Raw group geometries and multiplicities; no model-specific work formulas.
     pub(crate) speculative_geometry: BTreeMap<String, f64>,
+    /// Exact per-request attention geometry and multiplicities, present only for
+    /// groups whose model logs `decode_kv_lens` (work not linear in the KV total):
+    /// `"prefill:<prefix>:<append>"` per prefill chunk and `"decode:<kv_len>"` per
+    /// decode request. Additive like the scalars, which it refines, not replaces.
+    pub(crate) request_geometry: BTreeMap<String, f64>,
 }
 
 /// One exact fixed-batch workload and the number of iterations with that shape.
@@ -588,6 +593,7 @@ struct WorkloadShape {
     prefill_requests: u64,
     prefill_stateful_requests: u64,
     speculative_geometry: BTreeMap<String, u64>,
+    request_geometry: BTreeMap<String, u64>,
 }
 
 impl WorkloadShape {
@@ -609,6 +615,11 @@ impl WorkloadShape {
                 .into_iter()
                 .map(|(geometry, count)| Ok((geometry, exact_count(count, "geometry count")?)))
                 .collect::<Result<_>>()?,
+            request_geometry: totals
+                .request_geometry
+                .into_iter()
+                .map(|(geometry, count)| Ok((geometry, exact_count(count, "request count")?)))
+                .collect::<Result<_>>()?,
         })
     }
 
@@ -624,6 +635,11 @@ impl WorkloadShape {
             prefill_stateful_requests: self.prefill_stateful_requests as f64,
             speculative_geometry: self
                 .speculative_geometry
+                .into_iter()
+                .map(|(geometry, count)| (geometry, count as f64))
+                .collect(),
+            request_geometry: self
+                .request_geometry
                 .into_iter()
                 .map(|(geometry, count)| (geometry, count as f64))
                 .collect(),
@@ -656,6 +672,9 @@ impl WorkloadTotals {
                 .entry(geometry.clone())
                 .or_default() += count;
         }
+        for (geometry, count) in &other.request_geometry {
+            *self.request_geometry.entry(geometry.clone()).or_default() += count;
+        }
     }
 
     /// Replicate independent copies of one workload without changing sequence
@@ -670,7 +689,11 @@ impl WorkloadTotals {
         self.decode_kv *= factor;
         self.prefill_requests *= factor;
         self.prefill_stateful_requests *= factor;
-        for count in self.speculative_geometry.values_mut() {
+        for count in self
+            .speculative_geometry
+            .values_mut()
+            .chain(self.request_geometry.values_mut())
+        {
             *count *= factor;
         }
     }
@@ -961,17 +984,21 @@ fn sort_shapes_with_flags(shapes: &mut [WeightedWorkload], prefill_flags: &mut [
     order.sort_by(|&left, &right| {
         let left = &shapes[left].totals;
         let right = &shapes[right].totals;
-        scalar_key(left).cmp(&scalar_key(right)).then_with(|| {
-            left.speculative_geometry
+        let geometry_key = |geometry: &'_ BTreeMap<String, f64>| {
+            geometry
                 .iter()
-                .map(|(key, count)| (key, count.to_bits()))
-                .cmp(
-                    right
-                        .speculative_geometry
-                        .iter()
-                        .map(|(key, count)| (key, count.to_bits())),
-                )
-        })
+                .map(|(key, count)| (key.clone(), count.to_bits()))
+                .collect::<Vec<_>>()
+        };
+        scalar_key(left)
+            .cmp(&scalar_key(right))
+            .then_with(|| {
+                geometry_key(&left.speculative_geometry)
+                    .cmp(&geometry_key(&right.speculative_geometry))
+            })
+            .then_with(|| {
+                geometry_key(&left.request_geometry).cmp(&geometry_key(&right.request_geometry))
+            })
     });
     let sorted_shapes: Vec<WeightedWorkload> =
         order.iter().map(|&index| shapes[index].clone()).collect();
@@ -1028,6 +1055,7 @@ struct WorkloadGroupColumns<'a> {
     prefill_prefix_lists: &'a ListArray,
     prefill_append_lists: &'a ListArray,
     speculative_geometry: Option<&'a StringArray>,
+    decode_kv_lens: Option<&'a ListArray>,
 }
 
 impl<'a> WorkloadGroupColumns<'a> {
@@ -1048,6 +1076,16 @@ impl<'a> WorkloadGroupColumns<'a> {
                         .ok_or_else(|| anyhow!("speculative_geometry must be Utf8"))
                 })
                 .transpose()?,
+            // Optional: older logs and models that do not opt in lack it or leave it null.
+            decode_kv_lens: groups
+                .column_by_name("decode_kv_lens")
+                .map(|column| {
+                    column
+                        .as_any()
+                        .downcast_ref::<ListArray>()
+                        .ok_or_else(|| anyhow!("decode_kv_lens must be a List"))
+                })
+                .transpose()?,
         })
     }
 
@@ -1065,6 +1103,24 @@ impl<'a> WorkloadGroupColumns<'a> {
             totals.prefill_tokens += self.prefill_tokens[element];
             totals.decode_passes += self.decode_requests[element];
             totals.decode_kv += self.decode_kv[element];
+            let request_geometry = self.decode_kv_lens.filter(|lists| !lists.is_null(element));
+            if let Some(lists) = request_geometry {
+                let kv_lens = lists.value(element);
+                let kv_lens = u32_values(&kv_lens, "decode_kv_lens")?;
+                if kv_lens.len() as f64 != self.decode_requests[element] {
+                    return Err(anyhow!(
+                        "decode_kv_lens has {} entries but decode_request_count is {}",
+                        kv_lens.len(),
+                        self.decode_requests[element]
+                    ));
+                }
+                for kv_len in kv_lens.values() {
+                    *totals
+                        .request_geometry
+                        .entry(format!("decode:{kv_len}"))
+                        .or_default() += 1.0;
+                }
+            }
             if self.prefill_prefix_lists.is_null(element)
                 || self.prefill_append_lists.is_null(element)
             {
@@ -1075,9 +1131,15 @@ impl<'a> WorkloadGroupColumns<'a> {
             let prefix_values = u32_values(&prefix_values, "prefill_prefix_lens")?;
             let append_values = u32_values(&append_values, "prefill_append_lens")?;
             for index in 0..prefix_values.len().min(append_values.len()) {
-                let prefix_length = prefix_values.value(index) as f64;
-                let append_length = append_values.value(index) as f64;
-                add_prefill_request(totals, prefix_length, append_length);
+                let prefix_length = prefix_values.value(index);
+                let append_length = append_values.value(index);
+                if request_geometry.is_some() {
+                    *totals
+                        .request_geometry
+                        .entry(format!("prefill:{prefix_length}:{append_length}"))
+                        .or_default() += 1.0;
+                }
+                add_prefill_request(totals, prefix_length as f64, append_length as f64);
             }
         }
         Ok(())
@@ -1731,6 +1793,87 @@ mod tests {
         assert_eq!(totals.prefill_pairs, 7_000.0);
         assert_eq!(totals.decode_kv, 16_000.0);
         assert_eq!(totals.prefill_stateful_requests, 1_000.0);
+    }
+
+    #[tokio::test]
+    async fn logged_decode_kv_lens_carry_exact_request_geometry() {
+        use std::sync::Arc;
+
+        use arrow_schema::{DataType, Field, Schema};
+        use datafusion::arrow::json::ReaderBuilder;
+
+        let list_u32 = || DataType::List(Arc::new(Field::new("item", DataType::UInt32, false)));
+        let groups = DataType::Struct(
+            vec![
+                Field::new("batch_tokens", DataType::UInt32, false),
+                Field::new("prefill_tokens", DataType::UInt32, false),
+                Field::new("decode_request_count", DataType::UInt32, false),
+                Field::new("decode_kv_total", DataType::UInt32, false),
+                Field::new("prefill_prefix_lens", list_u32(), false),
+                Field::new("prefill_append_lens", list_u32(), false),
+                Field::new("decode_kv_lens", list_u32(), true),
+            ]
+            .into(),
+        );
+        let schema = Schema::new(vec![
+            Field::new("pool_tag", DataType::Utf8, false),
+            Field::new("worker_id", DataType::UInt16, false),
+            Field::new("iter_id", DataType::UInt64, false),
+            Field::new(
+                "groups",
+                DataType::List(Arc::new(Field::new("item", groups, false))),
+                false,
+            ),
+        ]);
+        // Iteration 1 opts in (two decodes at 3000, one at 10, a 29-token chunk);
+        // iteration 2 is an older-style row with the column null.
+        let rows = [
+            json!({"pool_tag":"main","worker_id":0,"iter_id":1,"groups":[{
+                "batch_tokens":32,"prefill_tokens":29,"decode_request_count":3,
+                "decode_kv_total":6010,"prefill_prefix_lens":[2019],"prefill_append_lens":[29],
+                "decode_kv_lens":[3000,10,3000]}]}),
+            json!({"pool_tag":"main","worker_id":0,"iter_id":2,"groups":[{
+                "batch_tokens":1,"prefill_tokens":0,"decode_request_count":1,
+                "decode_kv_total":50,"prefill_prefix_lens":[],"prefill_append_lens":[],
+                "decode_kv_lens":null}]}),
+        ];
+        let encoded = rows
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let batch = ReaderBuilder::new(Arc::new(schema))
+            .build(encoded.as_bytes())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        let ctx = SessionContext::new();
+        ctx.register_batch("cost_log", batch).unwrap();
+
+        let exact = collect_iteration_workload(&ctx, "main", 0, 1)
+            .await
+            .unwrap();
+        assert_eq!(exact.decode_kv, 6010.0);
+        assert_eq!(exact.prefill_pairs, 29.0 * 2019.0 + 29.0 * 30.0 / 2.0);
+        assert_eq!(
+            exact.request_geometry,
+            BTreeMap::from([
+                ("decode:10".to_string(), 1.0),
+                ("decode:3000".to_string(), 2.0),
+                ("prefill:2019:29".to_string(), 1.0),
+            ])
+        );
+        let legacy = collect_iteration_workload(&ctx, "main", 0, 2)
+            .await
+            .unwrap();
+        assert!(legacy.request_geometry.is_empty());
+        assert_eq!(legacy.decode_kv, 50.0);
+
+        let mut rollup = exact.clone();
+        rollup.add(&exact);
+        rollup.scale(0.5);
+        assert_eq!(rollup.request_geometry, exact.request_geometry);
     }
 
     #[test]

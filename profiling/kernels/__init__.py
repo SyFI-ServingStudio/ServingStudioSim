@@ -60,6 +60,8 @@ from profiling.kernels import (
     gdn_recurrent_decode,  # noqa: F401
     gemm_fp32_output,  # noqa: F401
     grouped_gemm,  # noqa: F401
+    kda_chunk_prefill,  # noqa: F401
+    kda_recurrent_decode,  # noqa: F401
     kv_cache_append,  # noqa: F401
     logits_topk,  # noqa: F401
     mhc_fused_post_pre_rms_norm,  # noqa: F401

@@ -1,8 +1,12 @@
 //! Hard-capped chunked-prefill lifecycle for the whole-iteration shell.
 //!
-//! Pending policies own fresh and retracted requests. Once a prompt starts, at
-//! most one continuation is retained per attention partition; partial requests
-//! never rotate through the policy again. KV ownership is policy-defined:
+//! Pending policies own fresh and retracted requests. Once a prompt starts, its
+//! continuation stays in a partition-local started list, in start order, and
+//! never rotates through the policy again. Without a chunk-end quantum a partial
+//! chunk always spends the rest of the budget, so that list holds at most one
+//! request. A chunk-end quantum (vLLM's Mamba `align` cache mode) clips chunks
+//! to recurrent-state checkpoint boundaries; the leftover budget then admits
+//! further prompts and several may be partial at once. KV ownership is policy-defined:
 //! historical deployments reserve the complete request footprint, whereas a
 //! bounded-future deployment pairs a waiting-request estimate with decode-time
 //! physical allocation checks and retraction. Under `Mix` the decode check runs
@@ -23,7 +27,7 @@ use crate::common::{RequestId, SessionInput, Time, UnifiedStage};
 use crate::worker::config::{
     BatchPolicy, BoundedFutureKvAdmissionConfig, DecodeRetractionPolicy, KvAdmissionConfig,
 };
-use crate::worker::kv::ChunkedPrefillKv;
+use crate::worker::kv::{ChunkedPrefillKv, ResolvedPrefillContext};
 use crate::worker::shared::context::WorkerContext;
 use crate::worker::types::{IterBatchPlan, WorkerEventCommon, WorkerMsgCommon};
 
@@ -40,7 +44,12 @@ pub struct ChunkedPrefillAdmission<P: PendingOrderPolicy, D = SingleTokenDecodeC
     kv_admission: KvAdmissionConfig,
     current_new_token_ratio: f64,
     balance: LoadBalance,
-    active_chunks: Vec<Option<AdmissionCandidate>>,
+    /// Per partition: prompts that have started and still have prefill tokens
+    /// left to schedule, in start order.
+    started_prefills: Vec<Vec<AdmissionCandidate>>,
+    /// Context-token spacing that every non-final chunk must end on, when the
+    /// engine can only checkpoint recurrent state at those boundaries.
+    chunk_end_quantum: Option<u32>,
     prefill_episodes: HashMap<RequestId, bool>,
     /// Order in which each running request was last admitted from the waiting
     /// queue; FCFS retraction evicts the most recent one.
@@ -114,13 +123,21 @@ impl<P: PendingOrderPolicy, D> ChunkedPrefillAdmission<P, D> {
             kv_admission,
             current_new_token_ratio,
             balance,
-            active_chunks: Vec::new(),
+            started_prefills: Vec::new(),
+            chunk_end_quantum: None,
             prefill_episodes: HashMap::new(),
             admission_order: HashMap::new(),
             next_admission: 0,
             decode_completion,
             drafting_slots,
         }
+    }
+
+    /// End every non-final chunk on a multiple of `quantum` context tokens.
+    pub(crate) fn with_chunk_end_quantum(mut self, quantum: u32) -> Self {
+        assert!(quantum > 0, "chunk-end quantum must be positive");
+        self.chunk_end_quantum = Some(quantum);
+        self
     }
 
     fn choose_partition<K: ChunkedPrefillKv>(
@@ -384,7 +401,7 @@ where
     ) -> bool {
         let num_partitions = kv_store.num_partitions();
         debug_assert_eq!(self.partition_policies.len(), num_partitions);
-        self.active_chunks.resize(num_partitions, None);
+        self.started_prefills.resize_with(num_partitions, Vec::new);
         batch_plan.reset_decode_participation(num_partitions, true);
         let has_live_decode = |kv_store: &K| {
             (0..num_partitions as u16).any(|partition| kv_store.has_live_decode(partition))
@@ -407,18 +424,22 @@ where
         // Every scheduled request, decode or prefill chunk, also spends the
         // drafter's slots.
         let drafting_slots = self.drafting_slots;
+        let chunk_end_quantum = self.chunk_end_quantum;
+        let max_batch_tokens = self.max_batch_tokens;
         let decode_budget = query_width + drafting_slots;
         // One short prompt can create a whole verify window next iteration.
         // Reserve those future query slots before admitting its prefill; an
-        // unfinished active chunk keeps its reservation across iterations.
+        // unfinished started prompt keeps its reservation across iterations.
         let mut future_decode_slots = (query_width > 1).then(|| {
             (0..num_partitions)
                 .map(|partition| {
-                    let active = self.active_chunks[partition]
-                        .is_some_and(|candidate| candidate.remaining_output_tokens > 1);
+                    let started = self.started_prefills[partition]
+                        .iter()
+                        .filter(|candidate| candidate.remaining_output_tokens > 1)
+                        .count() as u32;
                     (self.max_batch_tokens / decode_budget)
                         .saturating_sub(kv_store.live_decode_count(partition as u16))
-                        .saturating_sub(u32::from(active))
+                        .saturating_sub(started)
                 })
                 .collect::<Vec<_>>()
         });
@@ -440,36 +461,36 @@ where
             })
             .collect();
 
-        // A partial request keeps partition-local priority until its prompt is
-        // complete, matching one EngineCore scheduler queue per DP partition.
+        // Started prompts keep partition-local priority, in start order, until
+        // their prompt is complete, matching one EngineCore scheduler queue per
+        // DP partition. One that cannot run this iteration keeps its place.
         for partition_index in 0..num_partitions {
-            let Some(candidate) = self.active_chunks[partition_index] else {
-                continue;
-            };
-            let remaining = kv_store
-                .resolved_prefill_context(candidate.request_id)
-                .remaining_prefill_tokens();
-            let chunk_tokens =
-                remaining.min(remaining_budgets[partition_index].saturating_sub(drafting_slots));
-            if chunk_tokens == 0 {
-                continue;
-            }
-            kv_store.schedule_prefill_chunk(
-                candidate.request_id,
-                partition_index as u16,
-                chunk_tokens,
-            );
-            remaining_budgets[partition_index] -= chunk_tokens + drafting_slots;
-            if chunk_tokens == remaining {
-                self.active_chunks[partition_index] = None;
-            }
+            let mut started_prefills = std::mem::take(&mut self.started_prefills[partition_index]);
+            started_prefills.retain(|candidate| {
+                let resolved_prefill = kv_store.resolved_prefill_context(candidate.request_id);
+                let chunk_tokens = next_chunk_tokens(
+                    resolved_prefill,
+                    remaining_budgets[partition_index].saturating_sub(drafting_slots),
+                    chunk_end_quantum,
+                    max_batch_tokens,
+                );
+                if chunk_tokens == 0 {
+                    return true;
+                }
+                kv_store.schedule_prefill_chunk(
+                    candidate.request_id,
+                    partition_index as u16,
+                    chunk_tokens,
+                );
+                remaining_budgets[partition_index] -= chunk_tokens + drafting_slots;
+                chunk_tokens < resolved_prefill.remaining_prefill_tokens()
+            });
+            self.started_prefills[partition_index] = started_prefills;
         }
 
         for partition_index in 0..num_partitions {
             let partition = partition_index as u16;
-            while !retracted_before_admission
-                && self.active_chunks[partition_index].is_none()
-                && remaining_budgets[partition_index] > drafting_slots
+            while !retracted_before_admission && remaining_budgets[partition_index] > drafting_slots
             {
                 let (policy, policy_context) = &mut self.partition_policies[partition_index];
                 policy.refresh_head(&mut |candidate| {
@@ -493,6 +514,18 @@ where
                     candidate.fresh_prompt_tokens,
                     candidate.session_input,
                 );
+                // A fresh prompt whose first chunk cannot end on a checkpoint
+                // boundary within the budget stops admission (vLLM breaks its
+                // waiting loop here rather than skipping ahead).
+                let chunk_tokens = next_chunk_tokens(
+                    resolved_prefill,
+                    remaining_budgets[partition_index] - drafting_slots,
+                    chunk_end_quantum,
+                    max_batch_tokens,
+                );
+                if chunk_tokens == 0 {
+                    break;
+                }
                 let footprint = match bounded_config {
                     None => kv_store.footprint(
                         candidate.request_id,
@@ -560,13 +593,10 @@ where
                         .is_none(),
                     "request entered two simultaneous prefill episodes"
                 );
-                let remaining = resolved_prefill.remaining_prefill_tokens();
-                let chunk_tokens =
-                    remaining.min(remaining_budgets[partition_index] - drafting_slots);
                 kv_store.schedule_prefill_chunk(candidate.request_id, partition, chunk_tokens);
                 remaining_budgets[partition_index] -= chunk_tokens + drafting_slots;
-                if chunk_tokens < remaining {
-                    self.active_chunks[partition_index] = Some(candidate);
+                if chunk_tokens < resolved_prefill.remaining_prefill_tokens() {
+                    self.started_prefills[partition_index].push(candidate);
                 }
             }
         }
@@ -594,7 +624,7 @@ where
                 .partition_policies
                 .iter()
                 .all(|(policy, _)| policy.len() == 0)
-            && self.active_chunks.iter().all(Option::is_none)
+            && self.started_prefills.iter().all(Vec::is_empty)
         {
             // SGLang resets its tracker only after running, chunked, and
             // waiting queues are all empty (`Scheduler::on_idle`). A blocked
@@ -747,12 +777,157 @@ where
                 return true;
             }
         }
-        for active_chunk in &mut self.active_chunks {
-            if active_chunk.is_some_and(|candidate| candidate.request_id == request) {
-                *active_chunk = None;
+        for started_prefills in &mut self.started_prefills {
+            let started_count = started_prefills.len();
+            started_prefills.retain(|candidate| candidate.request_id != request);
+            if started_prefills.len() != started_count {
                 self.prefill_episodes.remove(&request);
             }
         }
         false
+    }
+}
+
+/// The next chunk of `resolved_prefill` that `budget` tokens can carry, ending
+/// on a `chunk_end_quantum` boundary when one is set. `0` means the request
+/// cannot run this iteration.
+fn next_chunk_tokens(
+    resolved_prefill: ResolvedPrefillContext,
+    budget: u32,
+    chunk_end_quantum: Option<u32>,
+    max_chunk_tokens: u32,
+) -> u32 {
+    let remaining = resolved_prefill.remaining_prefill_tokens();
+    let chunk_tokens = remaining.min(budget);
+    match chunk_end_quantum {
+        None => chunk_tokens,
+        Some(quantum) => {
+            let start = resolved_prefill.active_chunk().0;
+            checkpoint_aligned_chunk_tokens(
+                start,
+                start + remaining,
+                chunk_tokens,
+                quantum,
+                max_chunk_tokens,
+            )
+        }
+    }
+}
+
+/// vLLM's `Scheduler._mamba_block_aligned_split` for a prompt whose next
+/// unprocessed context position is `start` and whose prefill ends at
+/// `prefill_end`: clip a `chunk_tokens`-long chunk so the recurrent state it
+/// leaves behind sits on a `quantum` boundary and can be checkpointed.
+///
+/// - A non-final chunk ends on the last boundary it reaches. When `quantum`
+///   exceeds the chunk cap no boundary may fit, so the chunk runs sub-block
+///   instead and re-aligns at the next boundary.
+/// - A chunk starting mid-block stops at the next boundary.
+/// - No chunk runs past the prompt's last boundary, so its state is cached
+///   before the unaligned tail.
+///
+/// The fork's partial-tail hash stop, shared-prefix junction stop, and in-chunk
+/// prefill checkpoints are not modeled.
+fn checkpoint_aligned_chunk_tokens(
+    start: u32,
+    prefill_end: u32,
+    chunk_tokens: u32,
+    quantum: u32,
+    max_chunk_tokens: u32,
+) -> u32 {
+    if chunk_tokens == 0 || start >= prefill_end {
+        return chunk_tokens;
+    }
+    let mut end = start + chunk_tokens;
+    if end < prefill_end {
+        let aligned_end = end / quantum * quantum;
+        if aligned_end > start || quantum <= max_chunk_tokens {
+            end = aligned_end;
+        }
+    }
+    let next_boundary = (start / quantum + 1) * quantum;
+    let last_boundary = prefill_end / quantum * quantum;
+    let stops = [
+        (start % quantum != 0).then_some(next_boundary),
+        Some(last_boundary),
+    ];
+    let end = stops
+        .into_iter()
+        .flatten()
+        .filter(|&stop| start < stop && stop < end)
+        .min()
+        .unwrap_or(end);
+    end.saturating_sub(start)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::checkpoint_aligned_chunk_tokens;
+
+    const BLOCK: u32 = 2_176;
+
+    #[test]
+    fn a_non_final_chunk_ends_on_the_last_checkpoint_boundary_it_reaches() {
+        // GLM-5.3-Flash at an 8192-token cap: 3 x 2176, as the trace shows.
+        assert_eq!(
+            checkpoint_aligned_chunk_tokens(0, 40_000, 8_192, BLOCK, 8_192),
+            6_528
+        );
+        assert_eq!(
+            checkpoint_aligned_chunk_tokens(6_528, 40_000, 8_192, BLOCK, 8_192),
+            6_528
+        );
+        // Budget shared with decode still floors to a boundary.
+        assert_eq!(
+            checkpoint_aligned_chunk_tokens(0, 40_000, 3_837, BLOCK, 8_192),
+            2_176
+        );
+    }
+
+    #[test]
+    fn a_budget_below_one_block_cannot_start_an_aligned_chunk() {
+        assert_eq!(
+            checkpoint_aligned_chunk_tokens(0, 40_000, 1_664, BLOCK, 8_192),
+            0
+        );
+    }
+
+    #[test]
+    fn no_chunk_runs_past_the_prompt_last_boundary() {
+        // The last 4532 tokens cross 43520 = 20 x 2176; the tail runs separately.
+        let prefill_end = 43_700;
+        assert_eq!(
+            checkpoint_aligned_chunk_tokens(39_168, prefill_end, 4_532, BLOCK, 8_192),
+            4_352
+        );
+        assert_eq!(
+            checkpoint_aligned_chunk_tokens(43_520, prefill_end, 180, BLOCK, 8_192),
+            180
+        );
+    }
+
+    #[test]
+    fn a_final_chunk_that_crosses_no_boundary_is_not_clipped() {
+        assert_eq!(
+            checkpoint_aligned_chunk_tokens(0, 1_801, 1_801, BLOCK, 8_192),
+            1_801
+        );
+    }
+
+    #[test]
+    fn a_block_wider_than_the_cap_runs_sub_block_then_realigns() {
+        // GLM-5.3-Flash at a 2048-token cap: 0 -> 2034 -> 2176, as the trace shows.
+        assert_eq!(
+            checkpoint_aligned_chunk_tokens(0, 5_000, 2_034, BLOCK, 2_048),
+            2_034
+        );
+        assert_eq!(
+            checkpoint_aligned_chunk_tokens(2_034, 5_000, 2_048, BLOCK, 2_048),
+            142
+        );
+        assert_eq!(
+            checkpoint_aligned_chunk_tokens(2_176, 5_000, 2_048, BLOCK, 2_048),
+            2_048
+        );
     }
 }

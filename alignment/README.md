@@ -561,6 +561,12 @@ and cannot override the preset. When adopting a recommendation, record its sourc
 and any cross-workload approximation in the experiment notes and set the value
 in the preset before running. Previously used report-source CLI flags are removed.
 
+A `chunked_prefill` worker may also set `prefill_gpu_time_multiplier` (>= 1.0):
+iterations that carry prefill tokens use it instead of `gpu_time_multiplier`,
+which then applies to decode-only iterations. It is a calibration like the
+main multiplier; the kernel-align pass does not recommend it, so record its
+source with the value (see the GLM-5.3-Flash pack's variant `worker`).
+
 Standalone NSYS normalization remains available as:
 
 ```bash
@@ -737,6 +743,12 @@ time is split exactly into `hidden_same_stream_ms` and `hidden_cross_stream_ms`
 by which launch covered it. Every measured kernel row also reports its own
 `overlap` with other launches on the same device (any, same-stream, other-stream),
 and the timeline payload names the overlapping partners per launch.
+A non-synchronizing launch that starts inside a collective on its own stream
+(a PDL dependent parked on `griddepcontrol.wait` while its rank spins in the
+all-reduce) has its start trimmed to that collective's end before the segment
+race. The trimmed residency is `pdl_wait_under_collective_ms`: off the path, like
+`collective_skew_ms`, so an early rank's wait cannot win a segment from the late
+rank. Cross-stream overlap with a collective is real compute and is not trimmed.
 
 **This is measurement, not a cost-model instruction.** It must not be turned into
 a `CostNode::Max`: every `Max` in the simulator

@@ -1021,6 +1021,10 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
             "duty_cycle_available": recommended_gpu_time_multiplier.is_some(),
             "duty_cycle_unavailable_reason": duty_cycle_unavailable_reason,
             "multiplier_excluded_iterations": multiplier_excluded_iterations,
+            "pdl_wait_under_collective_ms": iteration_rows
+                .iter()
+                .filter_map(|row| row.get("pdl_wait_under_collective_ms").and_then(Value::as_f64))
+                .sum::<f64>(),
         },
         "available": true,
         "total_iteration": {
@@ -2824,6 +2828,7 @@ fn measured_path_fields(path: &barrier::BarrierPath) -> serde_json::Map<String, 
         "hidden_cross_stream_ms": ms(path.hidden_cross_stream_ns),
         "hidden_under_collective_same_stream_ms": ms(path.hidden_under_collective_same_stream_ns),
         "hidden_under_collective_cross_stream_ms": ms(path.hidden_under_collective_cross_stream_ns),
+        "pdl_wait_under_collective_ms": ms(path.pdl_wait_under_collective_ns),
         "critical_rank_switches": path.critical_rank_switches,
     });
     match fields {
@@ -2934,6 +2939,7 @@ fn definitions() -> Value {
         ("hidden_cross_stream_ms", "winner launch time already covered by an earlier launch on another stream (multi-stream concurrency)"),
         ("hidden_under_collective_same_stream_ms", "non-collective launch time inside barrier windows on the last rank to leave, on the stream the collective ran on. Already inside collective_ms and not subtracted again"),
         ("hidden_under_collective_cross_stream_ms", "the same on other streams (compute overlapped with communication)"),
+        ("pdl_wait_under_collective_ms", "every rank's non-collective launch time that started inside a collective on its own device and stream, up to that collective's end: a PDL dependent resident on griddepcontrol.wait while its rank spins at the barrier. Trimmed from the launch before the segment race, so it is not busy: the winner's window counts it as idle and it is off the path, like collective_skew_ms. Cross-stream launches are not trimmed. The per-kernel overlap diagnostic still reports it"),
         ("critical_rank_switches", "how many times the segment winner changes between consecutive non-empty segments"),
         ("critical_busy_ms_by_device", "each rank's share of critical_busy_ms, from the segments it won"),
         ("measured_track_busy", "per device and concurrent track, that track own busy union and launch count"),
