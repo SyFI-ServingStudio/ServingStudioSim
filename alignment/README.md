@@ -359,7 +359,9 @@ ordinary `engine_text` and its legacy `vllm_text` alias remain unchanged.
 
 Timing prediction is kernel-only, so it reads the simulation **preset**
 (`simulation_preset`), not a completed run — it takes the gpu, arch, and backend
-policy straight from `simulation.yaml`. This lets it run independently of the simulation. The
+policy from `simulation.yaml`, normalized as `launcher sim` normalizes it
+(`backends_file` folded in, schema defaults such as `fp8` filled). This lets it
+run independently of the simulation. The
 builder writes `timing_predict_cases.json`, `timing_predict_case_map.json`,
 `timing_predict_config.json`, and `timing_predict_input_manifest.json`, then the
 launcher invokes the generic timing-predict command. The generated predictor
