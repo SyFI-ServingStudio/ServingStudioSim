@@ -17,7 +17,7 @@ from profiling.db.doc import CATEGORIES, SUBCATEGORIES, arg_docs, kernel_doc
 from profiling.db.registry import MetricFamily, iter_kernel_profiler_specs
 from profiling.runners.metrics import CommMetrics, ComputeMetrics
 
-DOCUMENTED: set[str] = set()
+DOCUMENTED = {"all_reduce", "flashinfer_attn_decode", "residual_rms_norm", "single_gemm"}
 
 METRICS = {
     MetricFamily.COMPUTE: {f.name for f in fields(ComputeMetrics)},
