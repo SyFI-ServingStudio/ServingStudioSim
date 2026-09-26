@@ -39,6 +39,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from profiling.db.args import KernelArgs
+from profiling.db.doc import BackendDoc, KernelDoc, arg
 from profiling.db.outlier import BatchOutlierPolicy
 from profiling.db.registry import (
     BackendSupport,
@@ -55,25 +56,63 @@ KIND: str = "moe_alltoall"
 class MoeAlltoallArgs(KernelArgs):
     # Ranks in the expert-parallel group. Every one of them is a real GPU the
     # launcher must reserve, and the kernel asserts the workspace spans them all.
-    ep_size: int
+    ep_size: int = arg(unit="GPUs", doc="GPUs in the expert-parallel group.")
     # Rows leaving the busiest sender, and arriving at the busiest receiver. A
     # collective ends when its slowest rank does, and a rank is loaded from both
     # sides at once; `sum(send) == sum(recv)` bounds their ratio by `ep_size`.
-    max_send_rows: int
-    max_recv_rows: int
+    max_send_rows: int = arg(unit="rows", doc="Rows sent by the busiest GPU.")
+    max_recv_rows: int = arg(unit="rows", doc="Rows received by the busiest GPU.")
     # Experts each token selects, and the global slot count they are drawn from.
     # Together they fix the fan-out: how many distinct ranks a token reaches,
     # which is what the runner reproduces in the send indices' reuse pattern.
-    top_k: int
-    slot_count: int
+    top_k: int = arg(unit="experts", doc="Expert slots selected per token.")
+    slot_count: int = arg(unit="experts", doc="Expert slots across the group.")
     # One row's payload. bf16 hidden for the vLLM block-scale path, which defers
     # activation quantisation until after the transfer.
-    hidden_bytes: int
+    hidden_bytes: int = arg(unit="bytes", doc="Bytes in one transferred row.")
     # "dispatch" or "combine".
-    direction: str
+    direction: str = arg(doc="Transfer direction: dispatch or combine.")
     # Fabric token (matches Rust `Fabric` serde wire form). A row/cache key only:
     # MNNVL is NVLink by construction.
-    fabric: str
+    fabric: str = arg(doc="Interconnect label used to identify the measurement.")
+
+
+DOC = KernelDoc(
+    title="MoE all-to-all transfer",
+    summary="Move token rows to expert GPUs or return expert outputs to their source GPUs.",
+    description=(
+        "In expert-parallel MoE, dispatch sends each token's row to the GPUs that "
+        "own its selected experts, and combine sends the expert outputs back. vLLM "
+        "runs both legs as this one transfer under "
+        "--all2all-backend=flashinfer_nvlink_two_sided. The transfer ends when its "
+        "slowest GPU ends, so the two row counts are those of the busiest sender "
+        "and the busiest receiver. The legs differ in how they read their input: "
+        "dispatch reads a token row once for every GPU it goes to, and combine "
+        "reads each expert-output row once."
+    ),
+    category="Communication",
+    formula=(
+        "payload bytes = max_send_rows · hidden_bytes",
+        "algbw = payload bytes / time",
+        "busbw = algbw",
+    ),
+    default_metric="time_ms",
+    method=(
+        "Mean time per call from CUDA events around 20 replays of a CUDA graph "
+        "that captures 4 to 100 moe_comm calls, fewer for larger transfers. Ten "
+        "eager calls and two replays warm up first. Rank 0's time is kept."
+    ),
+    caveats=(
+        "Combine's zero fill and top-k sum, which vLLM runs around the transfer, "
+        "are not included; the simulator prices them as separate elementwise "
+        "kernels.",
+        "The transfer indices are constructed from the requested row counts, "
+        "rather than sampled from a router's expert choices.",
+        "Bandwidth counts rank 0's sent payload, not traffic across all GPUs.",
+    ),
+    # No separate PyTorch reference implements this fabric-memory collective.
+    reference=None,
+)
 
 
 register(
@@ -98,5 +137,12 @@ register(
         # list_native: one rank-group spawn (plus one fabric-memory workspace
         # allocation, which is the expensive part) serves the whole chunk.
         list_native=True,
+        doc=BackendDoc(
+            summary=(
+                "FlashInfer's MNNVL moe_comm: every GPU sends and receives indexed "
+                "rows through a workspace in fabric memory."
+            ),
+            url="https://github.com/flashinfer-ai/flashinfer/blob/main/flashinfer/comm/trtllm_alltoall.py",
+        ),
     )
 )

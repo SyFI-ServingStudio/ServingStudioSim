@@ -27,6 +27,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from profiling.db.args import DType, KernelArgs
+from profiling.db.doc import CUPTI_METHOD, BackendDoc, KernelDoc, arg
 from profiling.db.outlier import BatchOutlierPolicy
 from profiling.db.registry import (
     BackendSupport,
@@ -41,10 +42,44 @@ KIND: str = "logits_topk"
 
 @dataclass(frozen=True)
 class LogitsTopkArgs(KernelArgs):
-    num_rows: int
-    num_columns: int
-    top_k: int
-    dtype: DType
+    num_rows: int = arg(unit="rows", doc="Score rows, one per scored position.")
+    num_columns: int = arg(unit="elements", doc="Scores in each row.")
+    top_k: int = arg(unit="elements", doc="Scores kept from each row.")
+    dtype: DType = arg(doc="Element type of the input scores and output values.")
+
+
+DOC = KernelDoc(
+    title="Logits top-k",
+    summary="Select the largest top_k scores and their column indices from each score row.",
+    description=(
+        "vLLM's vocab-parallel top-k takes the top_k logits from each GPU's "
+        "vocabulary shard, all-gathers the candidates, and takes top_k again from "
+        "the gathered block, without gathering the full logits. Both steps are "
+        "this kernel at different widths: num_columns is the shard's vocabulary "
+        "in the first and top_k · tp_size in the second. Scores are seeded "
+        "normal values."
+    ),
+    category="Other",
+    formula=(
+        "TFLOPS = num_rows · num_columns / time",
+        "GB/s = num_rows · [num_columns · bytes per value + top_k · (bytes per value + 4)] / time",
+    ),
+    default_metric="time_ms",
+    method=(
+        f"{CUPTI_METHOD} Every launch of the call is counted: selection, the "
+        "value sort and the index conversion. FlashInfer's selected values are "
+        "checked against torch.topk before timing."
+    ),
+    caveats=(
+        "TFLOPS treats one score comparison per input element as nominal work; "
+        "the selection algorithms can inspect elements more than once.",
+        "GB/s counts one read of the scores and writes of top_k values and "
+        "4-byte indices per row. FlashInfer converts its int32 indices to int64, "
+        "so this is not total device traffic.",
+    ),
+    # Both measured calls are library implementations; no separate PyTorch reference exists.
+    reference=None,
+)
 
 
 register(
@@ -60,6 +95,7 @@ register(
         args_schema=LogitsTopkArgs,
         metric_family=MetricFamily.COMPUTE,
         batch_outlier_policy=BatchOutlierPolicy(),
+        doc=BackendDoc(summary="torch.topk, vLLM's fallback when FlashInfer is unavailable."),
     )
 )
 
@@ -78,6 +114,13 @@ register(
         args_schema=LogitsTopkArgs,
         metric_family=MetricFamily.COMPUTE,
         batch_outlier_policy=BatchOutlierPolicy(),
+        doc=BackendDoc(
+            summary=(
+                "FlashInfer top_k with sorted=True and deterministic=True, the "
+                "call vLLM's logits processor makes."
+            ),
+            url="https://github.com/flashinfer-ai/flashinfer/blob/main/flashinfer/topk.py",
+        ),
     )
 )
 

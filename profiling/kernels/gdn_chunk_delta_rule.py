@@ -50,6 +50,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from profiling.db.args import DType, KernelArgs
+from profiling.db.doc import CUPTI_METHOD, BackendDoc, KernelDoc, arg
 from profiling.db.outlier import BatchOutlierPolicy
 from profiling.db.registry import (
     BackendSupport,
@@ -64,13 +65,56 @@ KIND: str = "gdn_chunk_delta_rule"
 
 @dataclass(frozen=True)
 class GdnChunkDeltaRuleArgs(KernelArgs):
-    num_tokens: int
-    max_sequence_length: int
-    num_key_heads: int
-    num_heads: int
-    key_head_dim: int
-    value_head_dim: int
-    dtype: DType
+    num_tokens: int = arg(unit="tokens", doc="Tokens across the input sequences.")
+    max_sequence_length: int = arg(unit="tokens", doc="Tokens in the longest input sequence.")
+    num_key_heads: int = arg(unit="heads", doc="Key and query heads shared by the output heads.")
+    num_heads: int = arg(unit="heads", doc="Output heads with separate values and states.")
+    key_head_dim: int = arg(unit="elements", doc="Features in each key and query head.")
+    value_head_dim: int = arg(unit="elements", doc="Features in each value and output head.")
+    dtype: DType = arg(doc="Element type of query, key and value inputs; only bf16 is measured.")
+
+
+DOC = KernelDoc(
+    title="Fused chunked delta rule",
+    summary="Compute Gated DeltaNet prefill output and final recurrent states in one launch.",
+    description=(
+        "The chunked gated delta rule of Qwen3.6's Gated DeltaNet prefill, "
+        "which vLLM on H200 runs as one FlashInfer CUTLASS kernel: it writes "
+        "every token's output and each sequence's final state. The inputs are "
+        "prepared as vLLM prepares them: queries and keys already L2-normalized"
+        " outside the call, the decay passed already exponentiated, beta in "
+        "FP32. The measurement uses num_tokens / max_sequence_length full "
+        "sequences plus one shorter remainder; FlashInfer picks its chunk "
+        "width."
+    ),
+    category="Attention",
+    subcategory="Gated DeltaNet",
+    formula=(
+        "state = 2·key_head_dim·value_head_dim·num_heads",
+        "intra = 2·64·(num_key_heads·key_head_dim + num_heads·value_head_dim)",
+        "FLOPs = num_tokens·2·(state + intra)",
+        "N = ⌈num_tokens / max_sequence_length⌉",
+        "bytes = 4·num_tokens·num_key_heads·key_head_dim + "
+        "4·num_tokens·num_heads·value_head_dim + 8·num_tokens·num_heads + "
+        "8·N·num_heads·key_head_dim·value_head_dim",
+        "TFLOPS = FLOPs / time",
+        "GB/s = bytes / time",
+    ),
+    default_metric="tflops",
+    method=(
+        f"{CUPTI_METHOD} "
+        "Only the FlatKernel launch is counted. Inputs, gates, sequence "
+        "boundaries and outputs are allocated before the capture."
+    ),
+    caveats=(
+        "Only H200 is measured.",
+        "Each call starts from an all-zero state.",
+        "The 64-token width appears only in the FLOP estimate; bytes count "
+        "minimum logical traffic, not physical traffic.",
+    ),
+    # No separate PyTorch reference exists for this fused kind.
+    reference=None,
+)
 
 
 register(
@@ -89,6 +133,13 @@ register(
         args_schema=GdnChunkDeltaRuleArgs,
         metric_family=MetricFamily.COMPUTE,
         batch_outlier_policy=BatchOutlierPolicy(),
+        doc=BackendDoc(
+            summary=(
+                "FlashInfer's chunk_gated_delta_rule CUTLASS call computes "
+                "output and final state in one launch."
+            ),
+            url="https://github.com/flashinfer-ai/flashinfer/blob/main/flashinfer/gdn_prefill.py",
+        ),
         subprocess_env="vllm_env",
     )
 )

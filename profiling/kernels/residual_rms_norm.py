@@ -110,7 +110,7 @@ register(
         batch_outlier_policy=BatchOutlierPolicy(),
         doc=BackendDoc(
             summary="vLLM's fused_add_rms_norm CUDA kernel: one in-place launch.",
-            url="https://github.com/vllm-project/vllm/blob/main/csrc/layernorm_kernels.cu",
+            url="https://github.com/vllm-project/vllm/blob/main/csrc/libtorch_stable/layernorm_kernels.cu",
         ),
         subprocess_env="vllm_env",
     )

@@ -1,8 +1,11 @@
 """DeepSeek V4 FP8 sparse-MLA decode CUDA-graph replay."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 
 from profiling.db.args import DType, KernelArgs
+from profiling.db.doc import CUPTI_METHOD, BackendDoc, KernelDoc, arg
 from profiling.db.outlier import BatchOutlierPolicy
 from profiling.db.registry import (
     BackendSupport,
@@ -25,19 +28,63 @@ class DeepseekV4SparseMlaDecodeArgs(KernelArgs):
     configurations, notably C128 width 512 at 65K versus 8192 at 1M.
     """
 
-    swa_valid_counts: tuple[int, ...]
-    extra_valid_counts: tuple[int, ...]
-    num_heads: int
-    num_kv_heads: int
-    head_dim: int
-    value_dim: int
-    swa_window: int
-    extra_index_capacity: int
-    compress_ratio: int
-    q_dtype: DType
-    cache_dtype: DType
-    output_dtype: DType
-    planner_mode: str
+    swa_valid_counts: tuple[int, ...] = arg(
+        unit="tokens", doc="Valid sliding-window keys for each flattened decode query."
+    )
+    extra_valid_counts: tuple[int, ...] = arg(
+        unit="tokens", doc="Valid selected compressed keys for each decode query."
+    )
+    num_heads: int = arg(unit="heads", doc="Query heads on this GPU.")
+    num_kv_heads: int = arg(unit="heads", doc="KV heads in the cache.")
+    head_dim: int = arg(unit="elements", doc="Elements in each query and key head.")
+    value_dim: int = arg(unit="elements", doc="Elements in each output head.")
+    swa_window: int = arg(unit="tokens", doc="Maximum sliding-window keys per query.")
+    extra_index_capacity: int = arg(unit="tokens", doc="Allocated selected-key indices per query.")
+    compress_ratio: int = arg(
+        unit="tokens", doc="Source tokens represented by one compressed cache position."
+    )
+    q_dtype: DType = arg(doc="Query element type.")
+    cache_dtype: DType = arg(doc="Cache element type.")
+    output_dtype: DType = arg(doc="Output element type.")
+    planner_mode: str = arg(doc="Whether a sparse launch runs before graph capture.")
+
+
+DOC = KernelDoc(
+    title="DeepSeek V4 sparse MLA decode",
+    summary="Attend from each decode query to sliding-window and optional compressed keys.",
+    description=(
+        "DeepSeek V4's sparse MLA in decode: each query row attends to its "
+        "sliding-window keys and, in compressed layers, to the compressed keys "
+        "the indexer selected, in one FlashMLA call. The two sources have "
+        "separate FP8 page sets and padded index arrays; swa_valid_counts and "
+        "extra_valid_counts give the valid entries per row. As in serving, the "
+        "call is captured in a CUDA graph and replayed."
+    ),
+    category="Attention",
+    subcategory="DSA",
+    formula=(
+        "O = softmax(q · K_selectedᵀ / √head_dim) · V_selected, per query head",
+        "S = Σ(swa_valid_counts) + Σ(extra_valid_counts); R = len(swa_valid_counts)",
+        "TFLOPS = 2·num_heads·(head_dim + value_dim)·S / time",
+        "GB/s = [R·num_heads·head_dim·2 + S·(584 + 4) + "
+        "R·4·(2 if compress_ratio > 1 else 1) + R·num_heads·(value_dim·2 + 4) "
+        "+ num_heads·4] / time",
+    ),
+    default_metric="tflops",
+    method=(
+        f"{CUPTI_METHOD} "
+        "The launches of each graph replay are counted, after three warm-up "
+        "replays. Graph capture and metadata construction are excluded; in "
+        "reused planner mode one sparse launch also runs before capture."
+    ),
+    caveats=(
+        "Queries are zero and cache rows hold patterned values with contiguous "
+        "valid indices; FlashMLA's work does not depend on the values.",
+        "GB/s counts the valid selected rows and indices, not the padding of the index arrays.",
+    ),
+    # The expected-output calculation is local to the measured runner.
+    reference=None,
+)
 
 
 register(
@@ -58,6 +105,13 @@ register(
             gpus=frozenset({"NVIDIA H200"}),
         ),
         subprocess_env="vllm_env",
+        doc=BackendDoc(
+            summary=(
+                "FlashMLA flash_mla_with_kvcache, as vLLM calls it, over FP8 "
+                "sliding-window and selected-key caches, replayed from a CUDA graph."
+            ),
+            url="https://github.com/deepseek-ai/FlashMLA",
+        ),
     )
 )
 

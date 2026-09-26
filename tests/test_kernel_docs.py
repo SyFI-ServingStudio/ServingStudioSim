@@ -1,8 +1,7 @@
-"""A documented kernel kind documents everything a reader sees.
+"""Every kernel kind documents everything a reader sees.
 
-Documentation is opt-in per kind while it is being written: a kind with a
-module-level ``DOC`` must be complete, and the kinds in ``DOCUMENTED`` must
-have one. Once every kind is documented, ``DOCUMENTED`` becomes all kinds.
+Each registered kind has a complete module-level ``DOC``, every Args field
+declared through ``arg``, and a ``BackendDoc`` on every backend.
 """
 
 from __future__ import annotations
@@ -16,8 +15,6 @@ from profiling.db.args import DType
 from profiling.db.doc import CATEGORIES, SUBCATEGORIES, arg_docs, kernel_doc
 from profiling.db.registry import MetricFamily, iter_kernel_profiler_specs
 from profiling.runners.metrics import CommMetrics, ComputeMetrics
-
-DOCUMENTED = {"all_reduce", "flashinfer_attn_decode", "residual_rms_norm", "single_gemm"}
 
 METRICS = {
     MetricFamily.COMPUTE: {f.name for f in fields(ComputeMetrics)},
@@ -36,8 +33,8 @@ KINDS = _kinds()
 DOCUMENTED_NOW = sorted(kind for kind in KINDS if kernel_doc(kind) is not None)
 
 
-def test_listed_kinds_are_documented() -> None:
-    assert DOCUMENTED <= set(DOCUMENTED_NOW)
+def test_every_kind_is_documented() -> None:
+    assert DOCUMENTED_NOW == sorted(KINDS)
 
 
 @pytest.mark.parametrize("kind", DOCUMENTED_NOW)
