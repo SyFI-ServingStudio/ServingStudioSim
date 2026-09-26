@@ -150,6 +150,8 @@ pub enum IterArchSel {
         #[serde(flatten)]
         model: ModelSpec,
     },
+    /// Megatron TP over dense Llama 3. `tp_size` must divide the KV heads (8).
+    #[supported(gpu = ["NVIDIA H200"], model_config = ["llama3_8b"], tp_size = [1, 2, 4, 8])]
     Llama3DenseTp {
         #[serde(flatten)]
         model: ModelSpec,

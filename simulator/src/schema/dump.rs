@@ -129,6 +129,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn dense_tp_publishes_its_supported_deployments() {
+        let schema = list_params();
+        let arch = &schema["providers"]["arch"]["iter_wise"];
+        assert_eq!(
+            arch["llama3_dense_tp"]["supported"],
+            json!([{"gpu": ["NVIDIA H200"], "model_config": ["llama3_8b"], "tp_size": [1, 2, 4, 8]}])
+        );
+        // An arch with no rows publishes no key (the launcher leaves it unchecked).
+        assert!(arch["llama3_dense"].get("supported").is_none());
+    }
+
     /// Every `#[supported]` row names a `gpu` and a `model_config`, and each other
     /// param is a param of that arch: its own, or a model field every arch carries.
     #[test]
