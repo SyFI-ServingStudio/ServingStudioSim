@@ -26,6 +26,7 @@ import asyncio
 import json
 import shutil
 import sys
+import tempfile
 import uuid
 from pathlib import Path
 
@@ -41,11 +42,13 @@ from .exec import (
     run_logged_process,
 )
 from .managed_job import prepare_managed_job
+from .process import ProcessSpec, ProcessSupervisor
 from .process.artifacts import ArtifactValidationError, validate_timing_prediction_artifacts
 from .process.journal import RunJournal, StageState
 from .process.leases import LauncherLeases
 
 _LAUNCHER_LEASES = LauncherLeases(REPO_ROOT)
+_PROCESS_SUPERVISOR = ProcessSupervisor()
 
 # The simulator's offline writer uses this physical stream tag. The prediction
 # API keeps it private, but the semantic labeler needs one stable key to match
@@ -369,6 +372,7 @@ async def run_one(config_path: Path, build_type: str, analyze: bool) -> bool:
                 result=result,
                 error="predictor failed or left process-group descendants",
             )
+            _report_failure(log_dir)
             if managed_job is not None:
                 managed_job.report("failed")
             return False
@@ -424,9 +428,61 @@ async def run_one(config_path: Path, build_type: str, analyze: bool) -> bool:
             run_directory_lease.release()
 
 
+def _report_failure(log_dir: Path) -> None:
+    """Name the failed prediction's log and its root cause on stderr.
+
+    anyhow prints the cause chain outermost first, so the last line is the root
+    (a missing row, a GPU refused under ``SERVINGSTUDIO_NO_GPU``, ...).
+    """
+    log_path = log_dir / "stdout.log"
+    try:
+        lines = [line.strip() for line in log_path.read_text(errors="replace").splitlines()]
+    except OSError:
+        lines = []
+    cause = next((line for line in reversed(lines) if line), "")
+    print(f"[failed] timing-predict: see {log_path}", file=sys.stderr)
+    if cause:
+        print(f"  {cause}", file=sys.stderr)
+
+
+def dry_run_one(config_path: Path, build_type: str) -> bool:
+    """Validate one predictor config without running it.
+
+    The binary builds the model on its dry-run bridge, lowers every case against
+    it, and prints the `profile.db` specs a real run would JIT-profile. Nothing is
+    costed or written under `log_dir`, no job is announced, and no GPU is used.
+    """
+    cfg = _load_config(config_path)
+    if not isinstance(cfg.get("log_dir"), str) or not cfg["log_dir"]:
+        raise ValueError("timing-predict config requires log_dir")
+    _resolve_cases(config_path, cfg)
+    resolved = _resolved_config(config_path, cfg)
+    with tempfile.TemporaryDirectory(prefix="timing-predict-dry-run-") as scratch:
+        binary_config = config_path
+        if resolved is not None:
+            binary_config = Path(scratch) / "timing_predict_config.resolved.json"
+            binary_config.write_text(json.dumps(resolved, indent=2))
+        argv = [str(binary_path(build_type)), "timing-predict", "--dry-run", str(binary_config)]
+        # The model build logs every cost tree at info; the report is the output.
+        env = {"RUST_LOG": "warn", **_build_subprocess_env()}
+        with _LAUNCHER_LEASES.profile_database(write=False):
+            result = _PROCESS_SUPERVISOR.run_sync(
+                ProcessSpec(
+                    argv=argv,
+                    cwd=REPO_ROOT,
+                    env=env,
+                    capture_output=True,
+                    name="timing-predict-dry-run",
+                )
+            )
+    print(result.output, end="" if result.output.endswith("\n") else "\n")
+    return result.succeeded
+
+
 def main(argv: list[str]) -> int:
     build_type = "release"
     analyze = True
+    dry_run = False
     configs: list[str] = []
     it = iter(argv)
     for tok in it:
@@ -436,6 +492,8 @@ def main(argv: list[str]) -> int:
                 sys.exit("timing-predict: --build-type needs a value")
         elif tok == "--no-analyze":
             analyze = False
+        elif tok == "--dry-run":
+            dry_run = True
         elif tok.startswith("-"):
             sys.exit(f"timing-predict: unknown flag {tok}")
         else:
@@ -448,7 +506,7 @@ def main(argv: list[str]) -> int:
         )
 
     # INV-8: the single shared build (also produces the analyzer binary).
-    if not cargo_build(build_type, build_analyzer=analyze):
+    if not cargo_build(build_type, build_analyzer=analyze and not dry_run):
         sys.exit("build failed (see errors above)")
 
     rc = 0
@@ -459,7 +517,19 @@ def main(argv: list[str]) -> int:
             rc = 2
             continue
         try:
-            succeeded = asyncio.run(run_one(config_path, build_type, analyze))
+            if dry_run:
+                print(f"[dry-run] {c}")
+                succeeded = dry_run_one(config_path, build_type)
+            else:
+                succeeded = asyncio.run(run_one(config_path, build_type, analyze))
+        except ValueError as exc:
+            # Only the dry run reports a config error this way; a real run's
+            # ValueError is raised after launch and keeps its traceback.
+            if not dry_run:
+                raise
+            print(f"[invalid] {c}: {exc}", file=sys.stderr)
+            rc = 2
+            continue
         except CorpusError as exc:
             print(f"[invalid] {c}: {exc}", file=sys.stderr)
             rc = 2

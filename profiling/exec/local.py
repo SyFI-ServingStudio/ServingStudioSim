@@ -22,6 +22,7 @@ from profiling.exec.env import (
 )
 from profiling.exec.payload import chunk_result_from_payload, resolve_chunk_backend
 from profiling.exec.pool import ChunkResult, GpuChunk, GpuPool
+from profiling.gpu_policy import require_gpu
 from profiling.instrument import TIMELINE_ENV, span
 from profiling.profilers.energy import energy_enabled
 from profiling.profilers.timer import CUPTI_BUDGET_ENV, CUPTI_TRACE_ENV, TIMER_COMPARE_ENV
@@ -43,6 +44,7 @@ class LocalGpuPool(GpuPool):
             raise ValueError(f"k must be >= 1, got {gpus_per_chunk}")
         if max_concurrent < 1:
             raise ValueError(f"max_concurrent must be >= 1, got {max_concurrent}")
+        require_gpu("acquiring profiling GPUs")
         available_gpus = self.gpus if self.gpus is not None else find_idle_gpus()
         if len(available_gpus) < gpus_per_chunk:
             raise RuntimeError(f"need {gpus_per_chunk} idle GPU(s), found {len(available_gpus)}")
@@ -312,6 +314,7 @@ def _container_source_volume_args() -> list[str]:
 
 
 def _nvidia_smi_xml() -> ET.Element | None:
+    require_gpu("querying nvidia-smi")
     try:
         result = subprocess.run(
             ["nvidia-smi", "-q", "-x"],

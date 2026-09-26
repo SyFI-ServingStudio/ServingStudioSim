@@ -83,6 +83,7 @@ def issue_collected(expected_specs: int | None = None) -> None:
 
     from profiling.exec import get_default_pool
     from profiling.exec.local import LocalGpuPool, find_idle_gpus
+    from profiling.gpu_policy import require_gpu
     from profiling.plan import issue, set_collector
 
     collector = set_collector(None)
@@ -111,6 +112,7 @@ def issue_collected(expected_specs: int | None = None) -> None:
         # A fill with nothing missing must not need a GPU to say so.
         logging.getLogger(__name__).info("nothing to issue: profile.db already covers the run")
         return
+    require_gpu(f"measuring {recorded} missing profile.db spec(s)")
 
     pool = get_default_pool()
     gpus = pool.gpus if isinstance(pool, LocalGpuPool) and pool.gpus else find_idle_gpus()

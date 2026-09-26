@@ -247,6 +247,15 @@ user asks, or when the fill must stay off specific cards; say why when you do.
 modeled GPU count comes from the preset's pools, and is never inferred from the
 host.)
 
+### No GPU: `--no-gpu`
+
+`--no-gpu` (or `SERVINGSTUDIO_NO_GPU=1`) guarantees the launcher uses no GPU in
+any mode. Pass it when the user asks, or when the run must stay off the host's
+GPUs. A run over a warm `profile.db` is unchanged. With missing rows, the cache
+prebuild fails before profiling and names the missing count; check coverage
+first with `--cache-report`. Report that failure; do not drop `--no-gpu`
+without asking.
+
 ## Analysis output
 
 Each finished run is auto-analyzed (best-effort — a failure never fails the run)

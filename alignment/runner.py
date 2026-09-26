@@ -26,6 +26,8 @@ import threading
 import time
 from pathlib import Path
 
+from profiling.gpu_policy import require_gpu
+
 from .load_generator import runner as load_generator
 from .nsys.parse import parse_host_timeline, parse_trace, parsed_window_ns, write_kernel_sequences
 from .nsys.parsed_io import kernel_rows_path, write_parsed
@@ -359,6 +361,8 @@ def run_profile(cfg: ProfileConfig, *, resume: bool = False) -> dict:
     manifest). The GPU capture is the expensive, non-reproducible part of this
     pipeline; a failure in extraction or parsing must never cost a re-capture.
     """
+    if not resume:
+        require_gpu(f"an alignment {cfg.profile_kind} capture (starts {cfg.engine})")
     driver, _, _ = _engine(cfg)
     if cfg.workload is not None and cfg.workload.warmup and (
         cfg.engine != "vllm"

@@ -61,9 +61,19 @@ uv run python -m launcher timing-predict presets/<config>.json
 ```
 
 Multiple configs may be passed in one call, for example the two AFD halves.
-Supported flags are `--build-type <build-type>` (default `release`) and
-`--no-analyze`. Timing-predict does not support simulation-run flags such as
-`--dry-run` or `--override`.
+Supported flags are `--build-type <build-type>` (default `release`),
+`--no-analyze`, `--dry-run`, and `--no-gpu`. There is no `--override`.
+
+Run `--dry-run` first on a new config. It builds the model, checks every case
+against it, and prints one line per kernel with the `profile.db` specs a real
+run would JIT-profile. It writes nothing and needs no GPU. `total: 0 / N specs
+missing` means the real run needs no GPU either. A rejected case fails the dry
+run with the same error the real run would give.
+
+Pass `--no-gpu` when the run must not touch a GPU: the user asks, or the host's
+GPUs are not yours to use. A missing row then fails with `GpuDisabledError`,
+naming the kernel, instead of being profiled. Report that error; do not drop
+`--no-gpu` to get past it without asking.
 
 Do not pin GPUs by default. A warm `profiling/profile.db` needs no GPU. On a cold
 cache, timing-predict asks the profiling layer to JIT-fill the rows it actually

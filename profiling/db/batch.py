@@ -21,6 +21,7 @@ from profiling.db.kind import KernelKind
 from profiling.db.registry import find_kernel_profiler_spec, resolve_spec_backend
 from profiling.db.table import ProfileRow, Table
 from profiling.gpu_catalog import resolve_gpu_spec
+from profiling.gpu_policy import require_gpu
 from profiling.instrument import span
 from profiling.runners.metrics import Metrics
 
@@ -149,6 +150,8 @@ def execute_profile_batch(
     """
 
     prepared_specs = _prepare_specs(kernel_kind, specs, gpu_count_fn)
+    if prepared_specs:
+        require_gpu(f"profiling {len(prepared_specs)} {kernel_kind} spec(s)")
 
     if pool is None:
         from profiling.exec import get_default_pool

@@ -16,6 +16,12 @@ enumeration (`--emit-backends`), and simulator wallclock profiling (`--profile`)
 paths. YAML and JSON are accepted for simulation presets, timing-predict configs,
 and alignment stage configs.
 
+`--no-gpu`, anywhere on the command line of any mode, guarantees the command
+uses no GPU: it sets `SERVINGSTUDIO_NO_GPU=1` (which has the same effect when
+set directly) and empties `CUDA_VISIBLE_DEVICES` for every child. A step that
+would need one -- profiling a missing `profile.db` row, an alignment capture --
+fails and names itself instead. See `profiling/gpu_policy.py`.
+
 Single versus batch execution is decided by the number of expanded configs.
 Sweep expansion belongs to `launcher.schema`. No `--web` / `--tui` / `--gui`
 (UI deleted per discussion.md).
@@ -65,7 +71,8 @@ def _build_argparse():
             "  python -m launcher kernel-profile "
             "{list,query,count-missing,run,measure,merge-db,audit-provenance} ...\n"
             "  python -m launcher alignment {sim,profile,timing-predict,analyze} ...\n"
-            "  python -m launcher list-params [--human]"
+            "  python -m launcher list-params [--human]\n"
+            "--no-gpu applies to every mode: see --no-gpu below."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -85,6 +92,12 @@ def _build_argparse():
         "--dry-run",
         action="store_true",
         help="Validate + expand only; do not launch subprocesses.",
+    )
+    parser.add_argument(
+        "--no-gpu",
+        action="store_true",
+        help="Guarantee no GPU is used, in any mode (also SERVINGSTUDIO_NO_GPU=1). "
+        "A missing profile.db row fails instead of being profiled.",
     )
     parser.add_argument(
         "--cache-report",
@@ -507,6 +520,17 @@ def _apply_energy_policy(
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+
+    # `--no-gpu` holds for every mode, so it is taken before dispatch; the
+    # environment carries it to every child. The variable alone gets the same
+    # hidden devices, so a child cannot see a GPU either way.
+    from profiling.gpu_policy import disable_gpus, gpu_disabled
+
+    if "--no-gpu" in argv:
+        argv = [token for token in argv if token != "--no-gpu"]
+        disable_gpus()
+    elif gpu_disabled():
+        disable_gpus()
 
     # `alignment` exposes explicit workflow stages. Its `sim` handler re-enters
     # this main function, so dispatch must short-circuit before preset parsing.
