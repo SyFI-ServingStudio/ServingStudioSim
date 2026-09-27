@@ -932,6 +932,8 @@ pub enum AttnArchSel {
     /// own KV cache and request stream. Data parallelism is the attn pool's
     /// `replicas` (= the unified arch's `ep_size / attn_tp_size`), not an arch
     /// param. Pairs with the `qwen3_ffn_moe` ffn arch.
+    #[supported(gpu = ["NVIDIA H200"], model_config = ["qwen3_235b"], fp8 = [false], attn_tp_size = [2, 4])]
+    #[supported(gpu = ["NVIDIA H200"], model_config = ["qwen3_235b_fp8"], fp8 = [true], attn_tp_size = [4])]
     Qwen3AttnTp {
         #[serde(flatten)]
         model: ModelSpec,
@@ -957,6 +959,7 @@ pub enum FfnArchSel {
     /// layout) + post_norm + router + EP MoE, plus the iteration embed / final_norm
     /// / lm_head. Mirrors the FFN-side cost of the unified `qwen3_moe_dp_attn_ep_ffn`;
     /// pairs with a `qwen3_attn` model whose `fp8` field is false.
+    #[supported(gpu = ["NVIDIA H200"], model_config = ["qwen3_235b"], fp8 = [false], attn_tp_size = [4], ep_size = [8], nvl_num_gpu = [8])]
     Qwen3FfnMoe {
         #[serde(flatten)]
         model: ModelSpec,
@@ -986,6 +989,7 @@ pub enum FfnArchSel {
     /// Native FP8 Qwen3-MoE FFN side. This is a separate provider because its
     /// pre/post projection and lm-head slots are quant+GEMM compound ops. It
     /// pairs with a `qwen3_attn` model whose `fp8` field is true.
+    #[supported(gpu = ["NVIDIA H200"], model_config = ["qwen3_235b_fp8"], fp8 = [true], attn_tp_size = [4], ep_size = [8], nvl_num_gpu = [8])]
     Qwen3Fp8FfnMoe {
         #[serde(flatten)]
         model: ModelSpec,

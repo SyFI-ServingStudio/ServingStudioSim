@@ -78,9 +78,9 @@ enum Cmd {
     /// coordinates, and which config field is the compute / KV dtype. Reads the
     /// kernel registry only (no config, GPU or profile.db).
     KernelList,
-    /// Build every `#[supported]` combination of every iter-wise arch and print
-    /// each one's cost tree (the `cost_manifest` form) as JSON. Structure only:
-    /// no config file, Python perf_api, profile.db or GPU.
+    /// Build every `#[supported]` combination of every arch, iter-wise and
+    /// layer-wise, and print each one's cost tree (the `cost_manifest` form) as
+    /// JSON. Structure only: no config file, Python perf_api, profile.db or GPU.
     SupportedCostTrees(SupportedArgs),
     /// Predict per-building-block timing offline for a batch of explicit batch
     /// shapes — NO sim/scheduler/trace. Reads a minimal config (one arch selector
@@ -216,7 +216,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::KernelQuery => simulator::introspect::run_kernel_query(),
         Cmd::KernelList => simulator::introspect::run_kernel_list(),
         Cmd::SupportedCostTrees(args) => {
-            let builds = simulator::arch::build::build_supported_iter_archs(args.kernel_configs);
+            let builds = simulator::arch::build::build_supported_archs(args.kernel_configs);
             println!("{}", serde_json::to_string(&builds)?);
             Ok(())
         }

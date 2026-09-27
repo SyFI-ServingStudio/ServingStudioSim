@@ -1783,9 +1783,12 @@ pub fn build_ffn_model(
     })
 }
 
-/// One `#[supported]` combination of an iter-wise arch, built structure-only.
+/// One `#[supported]` combination of an arch, built structure-only.
 #[derive(Debug, serde::Serialize)]
 pub struct SupportedBuild {
+    /// The arch contract, as `list-params` groups providers: `iter_wise`,
+    /// `layer_wise_attn` or `layer_wise_ffn`.
+    pub contract: &'static str,
     pub arch: &'static str,
     /// The row's GPU (the group's `gpu`, the profile.db key).
     pub gpu: String,
@@ -1802,21 +1805,79 @@ pub struct SupportedBuild {
     pub error: Option<String>,
 }
 
-/// Build every `#[supported]` combination of every iter-wise arch on its row's
-/// GPU, structure only ([`PerfApiBridge::structure_only`]: no Python, `profile.db` or
+/// Build every `#[supported]` combination of every arch on its row's GPU,
+/// structure only ([`PerfApiBridge::structure_only`]: no Python, `profile.db` or
 /// GPU). A combination that fails to parse or build (including a panicking
 /// shape assertion) is returned with its error, not raised.
-pub fn build_supported_iter_archs(kernel_configs: bool) -> Vec<SupportedBuild> {
+pub fn build_supported_archs(kernel_configs: bool) -> Vec<SupportedBuild> {
+    let schema = crate::schema::list_params();
+    let mut out = supported_builds(
+        &schema,
+        "iter_wise",
+        IterArchSel::SUPPORTED,
+        kernel_configs,
+        |selector: &IterArchSel, gpu, tag, bridge| {
+            // A speculative arch builds a different model type, with its
+            // own tree: the verify pass plus its draft passes.
+            let (gpus, manifest) = match selector {
+                IterArchSel::Glm52VllmNvfp4DsaMoeSpeculative { .. }
+                | IterArchSel::Glm53VllmNvfp4DsaMoeDflash2 { .. } => {
+                    let (model, _) = build_speculative_iter_model(selector, gpu, tag, bridge)?;
+                    (model.gpus_per_replica(), model.cost_log_manifest())
+                }
+                _ => {
+                    let model = build_iter_model(selector, gpu, tag, bridge)?;
+                    (model.gpus_per_replica(), model.cost_log_manifest())
+                }
+            };
+            Ok((
+                gpus,
+                crate::timing::CostManifestDoc::single("iter", manifest),
+            ))
+        },
+    );
+    out.extend(supported_builds(
+        &schema,
+        "layer_wise_attn",
+        AttnArchSel::SUPPORTED,
+        kernel_configs,
+        |selector: &AttnArchSel, gpu, tag, bridge| {
+            let model = build_attn_model(selector, gpu, tag, bridge)?;
+            Ok((model.gpus_per_replica(), model.cost_log_manifest()))
+        },
+    ));
+    out.extend(supported_builds(
+        &schema,
+        "layer_wise_ffn",
+        FfnArchSel::SUPPORTED,
+        kernel_configs,
+        |selector: &FfnArchSel, gpu, tag, bridge| {
+            let model = build_ffn_model(selector, gpu, tag, bridge)?;
+            Ok((model.gpus_per_replica(), model.cost_log_manifest()))
+        },
+    ));
+    out
+}
+
+/// [`build_supported_archs`] for one contract: `rows` is its selector's
+/// `SUPPORTED`, `build` turns a parsed selector into its replica width and
+/// cost tree.
+fn supported_builds<S: serde::de::DeserializeOwned>(
+    schema: &serde_json::Value,
+    contract: &'static str,
+    rows: &'static [(&'static str, &'static [crate::schema::SupportedRow])],
+    kernel_configs: bool,
+    build: impl Fn(&S, &str, &str, &PerfApiBridge) -> Result<(u16, crate::timing::CostManifestDoc)>,
+) -> Vec<SupportedBuild> {
     use serde_json::{Map, Value};
 
-    let schema = crate::schema::list_params();
     let common = schema["arch_common"]
         .as_array()
         .cloned()
         .unwrap_or_default();
     let mut out = Vec::new();
-    for (tag, rows) in IterArchSel::SUPPORTED {
-        let own = schema["providers"]["arch"]["iter_wise"][*tag]["params"]
+    for (tag, rows) in rows {
+        let own = schema["providers"]["arch"][contract][*tag]["params"]
             .as_array()
             .cloned()
             .unwrap_or_default();
@@ -1852,7 +1913,8 @@ pub fn build_supported_iter_archs(kernel_configs: bool) -> Vec<SupportedBuild> {
                     };
                     arch.insert((*name).into(), value);
                 }
-                let mut build = SupportedBuild {
+                let mut supported = SupportedBuild {
+                    contract,
                     arch: tag,
                     gpu,
                     params,
@@ -1861,11 +1923,11 @@ pub fn build_supported_iter_archs(kernel_configs: bool) -> Vec<SupportedBuild> {
                     kernel_configs: None,
                     error: None,
                 };
-                let selector: IterArchSel = match serde_json::from_value(Value::Object(arch)) {
+                let selector: S = match serde_json::from_value(Value::Object(arch)) {
                     Ok(selector) => selector,
                     Err(e) => {
-                        build.error = Some(format!("config: {e}"));
-                        out.push(build);
+                        supported.error = Some(format!("config: {e}"));
+                        out.push(supported);
                         continue;
                     }
                 };
@@ -1873,45 +1935,31 @@ pub fn build_supported_iter_archs(kernel_configs: bool) -> Vec<SupportedBuild> {
                 if kernel_configs {
                     bridge.enable_config_records();
                 }
-                // A speculative arch builds a different model type, with its
-                // own tree: the verify pass plus its draft passes.
                 let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    anyhow::Ok(match &selector {
-                        IterArchSel::Glm52VllmNvfp4DsaMoeSpeculative { .. }
-                        | IterArchSel::Glm53VllmNvfp4DsaMoeDflash2 { .. } => {
-                            let (model, _) =
-                                build_speculative_iter_model(&selector, &build.gpu, tag, &bridge)?;
-                            (model.gpus_per_replica(), model.cost_log_manifest())
-                        }
-                        _ => {
-                            let model = build_iter_model(&selector, &build.gpu, tag, &bridge)?;
-                            (model.gpus_per_replica(), model.cost_log_manifest())
-                        }
-                    })
+                    build(&selector, &supported.gpu, tag, &bridge)
                 }));
                 match built {
                     Ok(Ok((gpus_per_replica, manifest))) => {
-                        build.gpus_per_replica = Some(gpus_per_replica);
-                        build.cost_manifest =
-                            Some(crate::timing::CostManifestDoc::single("iter", manifest));
+                        supported.gpus_per_replica = Some(gpus_per_replica);
+                        supported.cost_manifest = Some(manifest);
                         if kernel_configs {
-                            build.kernel_configs =
+                            supported.kernel_configs =
                                 Some(crate::timing::bridge::config_records_document(
                                     &bridge.take_config_records(),
                                 ));
                         }
                     }
-                    Ok(Err(e)) => build.error = Some(format!("{e:#}")),
+                    Ok(Err(e)) => supported.error = Some(format!("{e:#}")),
                     Err(panic) => {
                         let message = panic
                             .downcast_ref::<String>()
                             .cloned()
                             .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
                             .unwrap_or_else(|| "build panicked".into());
-                        build.error = Some(format!("build panicked: {message}"));
+                        supported.error = Some(format!("build panicked: {message}"));
                     }
                 }
-                out.push(build);
+                out.push(supported);
             }
         }
     }
@@ -2670,11 +2718,11 @@ mod tests {
         assert_eq!(narrow_bytes, 6 * 8 * 128 * 2);
     }
 
-    /// Every `#[supported]` combination of an iter-wise arch builds its cost
+    /// Every `#[supported]` combination of an arch builds its cost
     /// tree, so a row cannot claim a deployment the arch cannot build.
     #[test]
-    fn every_supported_iter_arch_deployment_builds_its_cost_tree() {
-        let builds = build_supported_iter_archs(false);
+    fn every_supported_arch_deployment_builds_its_cost_tree() {
+        let builds = build_supported_archs(false);
         let failures: Vec<String> = builds
             .iter()
             .filter_map(|b| {
@@ -2691,7 +2739,8 @@ mod tests {
         for b in &builds {
             let doc = b.cost_manifest.as_ref().unwrap();
             assert!(
-                !doc.sections[0].manifest.slots.is_empty(),
+                !doc.sections.is_empty()
+                    && doc.sections.iter().all(|s| !s.manifest.slots.is_empty()),
                 "{}: empty cost tree",
                 b.arch
             );
@@ -2702,7 +2751,7 @@ mod tests {
     /// the document `--kernel-configs-out` writes.
     #[test]
     fn supported_builds_carry_their_kernel_configs_when_asked() {
-        for b in build_supported_iter_archs(true) {
+        for b in build_supported_archs(true) {
             let doc = b.kernel_configs.as_ref().expect("kernel_configs");
             assert_eq!(
                 doc["schema_version"],
@@ -2712,7 +2761,7 @@ mod tests {
             assert!(!configs.is_empty(), "{} {:?}: no configs", b.arch, b.params);
             assert!(configs.iter().all(|c| c["gpu_name"] == b.gpu.as_str()));
         }
-        assert!(build_supported_iter_archs(false)
+        assert!(build_supported_archs(false)
             .iter()
             .all(|b| b.kernel_configs.is_none()));
     }

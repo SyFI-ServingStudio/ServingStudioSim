@@ -12,6 +12,10 @@ qwen3_235b:
   name: Qwen3 235B-A22B
   family: Qwen
   checkpoint: Qwen/Qwen3-235B-A22B
+qwen3_235b_fp8:
+  name: Qwen3 235B-A22B FP8
+  family: Qwen
+  checkpoint: Qwen/Qwen3-235B-A22B-FP8
 qwen3_6_35b_a3b_fp8:
   name: Qwen3.6 35B-A3B FP8
   family: Qwen
