@@ -32,6 +32,9 @@ All `GET`, under `/api/public/v1`.
 | `/kernels/{kind}/rows` | Measured rows, column-oriented with a shared provenance table. Any query parameter filters a column by equality (`gpu`, `backend` or an argument); `format=csv` returns CSV |
 | `/kernels/{kind}/configs` | The kernel configs registered as reading the kind's rows (profile.db's kernel-config registry), one per config and GPU: the profile.db args every cell shares (`fixed`) and the ones the cache axes move (`swept`), the Rust config's scalar values, cache coordinates and axes, cells measured per backend, a reader's name for structured config values (`config_labels`, below), and each use (pool, role) naming entries of a shared `deployments` table and the members that ask. No identity: it can run to megabytes |
 | `/kernels/{kind}/configs/{config_hash}` | One config's grid on the simulator's cache axes: each cell's coordinates, profile.db args, whether the kernel can run it, and each backend's measured metrics there; plus the full identity, its uses, and the `deployments` entries they name. `gpu` is required only when the config is registered on more than one GPU |
+| `/archs` | Every arch tag: `name` and `summary` (`model/arch_catalog.yaml`), `contract`, the `models` (model-config stems) and `gpus` its `#[supported]` rows run, their model `families`, the `params` the rows choose between, and how many `param_sets` and `combinations` it supports; plus `models`, the catalog entries they name |
+| `/archs/{arch}` | One arch: every param (`list-params`: type, default, choices, description, and `values`, the values its rows list, null for a param no row chooses), the `query` names of its cost trees, and its supported `param_sets` |
+| `/archs/{arch}/cost-tree` | One supported parameter set's cost tree, chosen by the query: `gpu`, `model` (a model-config stem) and every param the arch's rows name, all required. The structure only: no timings |
 
 A deployment entry is one `#[supported]` row on one GPU and model config:
 `arch`, `gpu`, `model_config` (the file stem of a `model/config/` file, as
@@ -80,6 +83,88 @@ registry, read with `profiling.db.kernel_config.registered_configs`. A config's
 `identity` and `config_args` are published with every absolute file path cut to
 its file name (an expert-demand corpus under a local HF cache, say).
 
+## Archs and cost trees
+
+The Models page reads three routes. None of them costs anything: a tree says
+how leaf costs compose, and a leaf's cost depends on the batch, which only a
+prediction supplies (below).
+
+A parameter set is one `#[supported]` row on one GPU and model config, in the
+shape of a kernel's deployment entry (`arch`, `gpu`, `model_config`, `model`,
+`params`, `varies`, `label`, `members`; the same `row_entry` code builds both).
+Each member is one combination of the values the row lists and adds `label`,
+`query` (the cost-tree query that names it), `gpus_per_replica`, `error` (the
+build's, null when it built) and `counts`: `leaves`, distinct kernel `configs`,
+and how many of those profile.db's registry holds (`registered`) and has any
+measured row for (`measured`). A combination two rows cover belongs to the first.
+
+`cost-tree` rejects a query it would have to guess at: a missing param, one
+the rows do not choose (the tree takes its default; the document lists those
+under `defaults`) or a mistyped value is a 400, and a set no row covers a 404.
+Both answer `{"detail": {"message", "choices"}}`, `choices` being every valid
+query.
+
+A tree comes from `simulator supported-cost-trees`, which builds every supported
+combination structure-only with every other param at its schema default. The
+document has the set's `arch`, `name`, `gpu`, `model_config`, `model`, `params`,
+`label`, `query`, `defaults`, `gpus_per_replica`, `counts` and:
+
+- `sections`: `[{section, root}]`, one per compiled CostTree (`iter` for an
+  iter-wise arch; `attn`, or `prologue`, `pre_attn`, `post_attn`, ... for the
+  two sides of a disaggregated deployment);
+- a node is `{id, kind, label?, children}`: `kind` is `sum`, `max` (with its
+  `overlap` divisor: `max(children) / overlap`), `scale` (with its repeat `n`)
+  or `leaf`. `id` is the node's index in the flat `cost_manifest` and `label`
+  its composite line (worklet and partition) when Rust gives one. A composite's
+  `path` is the dotted role its leaves share;
+- a leaf is `{id, kind: "leaf", slot: {index, name, kind, backends,
+  config_hash}}`: the slot index (the order of a cost log's `slot_*` columns),
+  the dotted leaf name, the kernel kind (its page is `/kernels/{kind}`), the
+  backends the config may run, and the config's hash, the key of
+  `/kernels/{kind}/configs/{config_hash}`;
+- `configs`: `{config_hash: {kind, args, args_omitted, registry}}`, each leaf
+  config once (rank copies share one): its scalar identity fields, the names of
+  the structured ones, and `registry` (`{cells, infeasible, measured}` per
+  backend on this GPU) or null when the registry does not hold it;
+- `kernels`: `{kind: {documented, title, category}}` for the kinds the leaves use.
+
+A leaf's config hash is computed from the leaf's own Rust config
+(`KernelConfig::identity`: every field but `gpu_name` and `backends`, each
+`Dim` reduced to its value, then `content_hash`), so it names the same config
+the registry does; a binary-backed test checks it against the records
+`supported-cost-trees --kernel-configs` writes.
+
+The node and leaf shapes are the Analyzer's cost-tree transport
+(ServingStudioUI `artifacts/schema/costTree`: `{kind, label?, children,
+overlap | n}`, a leaf's `slot` with `name` and `kind`) without the numbers a
+prediction adds there (`base`, `stats`, and the per-node `ms` and `pct`). Two
+differences are deliberate: a leaf carries `config_hash` and `backends` instead
+of the whole `kernel_config` (its `Dim` bindings run to megabytes on the GLM
+trees; the config route has it), and every node keeps `id` and every leaf its
+slot `index`, so a prediction can return times by node and by slot without
+resending the tree.
+
+## Later: predictions
+
+The routes stay read-only now. A prediction is "this arch, these params, these
+requests": the plan is one write route that takes a supported parameter set
+(the same `query` as `cost-tree`) and a batch of requests, and answers in terms
+of the tree the reader already has.
+
+- `POST /archs/{arch}/predictions` with `{query, requests, routing}`: `requests`
+  as `timing-predict` cases (per group, `prefill_chunk_pairs` of
+  `[prefix_len, append_len]` and `decode_kv_lens`), bounded in count and
+  length. It answers `202` with a prediction id; `GET /predictions/{id}` returns the status and then, per case,
+  the iteration total and a time per node `id` and per slot `index` (with the
+  backend chosen), which the page overlays on the tree it drew.
+- MoE archs need an explicit routing (`corpus` or `popularity` with its
+  artifact); the route never defaults one to `uniform`.
+- Public predictions read measured rows only (no JIT profiling and no GPU): a
+  case that needs a row profile.db lacks is reported as not predictable, with
+  the leaves that lack it, instead of being profiled.
+- A prediction runs the release binary's `timing-predict` in a worker pool, off
+  the request path, with its own rate limit; nothing it does writes profile.db.
+
 ## Sources
 
 `public_api/kernel/library.py` joins only sources that live with the code:
@@ -90,8 +175,11 @@ its file name (an expert-demand corpus under a local HF cache, say).
   variant in `simulator/src/arch/config.rs`, and model names in `model/catalog.yaml`
   (reread when it changes, no restart);
 - compute dtype columns: `simulator kernel-list`; arch params and `#[supported]`
-  rows: `simulator list-params`; both
-  cached until the binary changes (`public_api/kernel/sources.py`);
+  rows: `simulator list-params`; every supported combination's cost tree:
+  `simulator supported-cost-trees`; all cached until the binary changes
+  (`public_api/kernel/sources.py`);
+- arch names: `model/arch_catalog.yaml`, reread when it changes
+  (`public_api/arch/library.py`);
 - GPU peaks: `gpu/spec.json`;
 - measurements: `profile.db`, aggregates cached until the file changes;
 - routing labels: the registry's `hf://` references, and `git ls-files` for the

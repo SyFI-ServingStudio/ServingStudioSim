@@ -6,7 +6,8 @@ the model catalog) is code in this checkout and is imported directly. The two
 sources here sit behind one small class so tests can replace them with fixtures:
 
 - the release simulator's introspection commands, which print JSON and need no
-  GPU, database or Python perf_api (``list-params``, ``kernel-list``);
+  GPU, database or Python perf_api (``list-params``, ``kernel-list``,
+  ``supported-cost-trees``);
 - profile.db, opened read-only for every query;
 - the files a config's routing names: which of them this checkout tracks (git).
 
@@ -84,6 +85,14 @@ class KernelSources:
         """Every Rust kernel kind with its config/input fields and dtype fields."""
 
         return self.cached_by_binary("kernel-list", lambda: self._simulator(["kernel-list"]))
+
+    def supported_cost_trees(self) -> list[dict]:
+        """``supported-cost-trees``: every ``#[supported]`` combination of every
+        arch, built structure-only, with its cost tree in the ``cost_manifest``
+        form. Not cached here: the output carries megabytes of kernel configs,
+        so the caller caches what it keeps (with :meth:`cached_by_binary`)."""
+
+        return self._simulator(["supported-cost-trees"])
 
     # -- profile.db ----------------------------------------------------------------
 

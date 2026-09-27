@@ -4,19 +4,24 @@ from __future__ import annotations
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import PlainTextResponse
 
+from public_api.arch.library import ArchLibrary, BadParams, UnknownArch, UnsupportedParams
 from public_api.kernel.library import BadQuery, KernelLibrary, UnknownConfig, UnknownKind
 
 PREFIX = "/api/public/v1"
 
 
-def create_app(kernels: KernelLibrary) -> FastAPI:
+def create_app(kernels: KernelLibrary, archs: ArchLibrary | None = None) -> FastAPI:
+    archs = archs or ArchLibrary(kernels)
     app = FastAPI(
         title="ServingStudio public API",
         docs_url=f"{PREFIX}/docs",
         openapi_url=f"{PREFIX}/openapi.json",
     )
+    # A cost tree and a config grid run to hundreds of kilobytes of JSON.
+    app.add_middleware(GZipMiddleware, minimum_size=4096)
 
     async def answer(build, *args):
         # Documents come from sqlite and simulator subprocesses: keep them off the loop.
@@ -28,6 +33,12 @@ def create_app(kernels: KernelLibrary) -> FastAPI:
             raise HTTPException(404, f"unknown kernel config {error.args[0]!r}") from None
         except BadQuery as error:
             raise HTTPException(400, str(error)) from None
+        except UnknownArch as error:
+            raise HTTPException(404, f"unknown arch {error.args[0]!r}") from None
+        except BadParams as error:
+            raise HTTPException(400, {"message": str(error), "choices": error.choices}) from None
+        except UnsupportedParams as error:
+            raise HTTPException(404, {"message": str(error), "choices": error.choices}) from None
 
     @app.get(f"{PREFIX}/health")
     async def health() -> dict:
@@ -69,5 +80,23 @@ def create_app(kernels: KernelLibrary) -> FastAPI:
         ``gpu`` is needed only when the config is registered on more than one."""
 
         return await answer(kernels.config, kind, config_hash, gpu)
+
+    @app.get(f"{PREFIX}/archs")
+    async def arch_catalog() -> dict:
+        return await answer(archs.catalog)
+
+    @app.get(f"{PREFIX}/archs/{{arch}}")
+    async def arch(arch: str) -> dict:
+        return await answer(archs.arch, arch)
+
+    @app.get(f"{PREFIX}/archs/{{arch}}/cost-tree")
+    async def cost_tree(arch: str, request: Request) -> dict:
+        """One supported parameter set's cost tree. The query names the set:
+        ``gpu``, ``model`` (a model config stem) and every param the arch's
+        ``#[supported]`` rows name (``/archs/{arch}`` lists them as ``query``).
+        A missing, unknown or mistyped param is a 400 and a set no row covers a
+        404; both list the valid ``choices``."""
+
+        return await answer(archs.cost_tree, arch, dict(request.query_params))
 
     return app

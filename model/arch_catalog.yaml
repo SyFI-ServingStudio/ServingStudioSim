@@ -1,0 +1,59 @@
+# Reader-facing identity of each arch tag, for the public site's Models page.
+#
+# The arch variants in simulator/src/arch/config.rs carry the authoritative
+# doc comments; this file only names them for a reader. Keyed by the arch tag
+# (the `type` of an arch block, as `list-params` lists it). `name` is a short
+# title; `summary` is one sentence taken from the variant's doc comment (or its
+# module doc when the variant has none). The public API reads it with
+# model/catalog.yaml and rereads it when it changes.
+qwen36_local:
+  name: Qwen3.6 FP8 on one GPU
+  summary: The text-only Qwen3.6-35B-A3B FP8 execution graph on one H200. Every expert lives on the one GPU, so there is no dispatch or combine traffic.
+llama3_dense:
+  name: Llama 3 on one GPU
+  summary: Dense Llama 3 on a single GPU, with no collectives. One layer is built and repeated over every decoder layer.
+llama3_dense_tp:
+  name: Llama 3, TP
+  summary: Megatron tensor parallelism over dense Llama 3. `tp_size` must divide the 8 KV heads.
+llama3_dp_attn_tp_ffn:
+  name: Llama 3, DP attention and TP FFN
+  summary: Attention is sharded over `attn_tp_size` ranks and replicated as `ffn_tp_size / attn_tp_size` data-parallel shards; the dense FFN is tensor parallel over the whole replica.
+qwen3_moe_dp_attn_ep_ffn:
+  name: Qwen3 MoE, DP attention and EP experts
+  summary: Attention runs as `ep_size / attn_tp_size` data-parallel shards of `attn_tp_size` ranks; the experts are spread over `ep_size` ranks with point-to-point dispatch and combine.
+qwen3_moe_fp8_dp_attn_ep_ffn:
+  name: Qwen3 MoE FP8, DP attention and EP experts
+  summary: The native FP8 recipe. Per-token and per-group quantized dense projections, DeepGEMM expert kernels, and ServingStudio Sim's point-to-point EP dispatch and combine.
+qwen3_vllm_moe_dp_attn_ep_ffn:
+  name: Qwen3 MoE FP8, vLLM path
+  summary: The vLLM execution path. FlashInfer and TensorRT-LLM block-scale expert GEMMs, then a local finalize and an EP all-reduce.
+deepseek_v4_vllm:
+  name: DeepSeek V4 Flash, vLLM
+  summary: DeepSeek-V4-Flash-0731 at vLLM's physical kernel boundaries. EP4 and local attention DP4 are fixed by the checkpoint and the deployment.
+deepseek_v4_vllm_serial_streams:
+  name: DeepSeek V4 Flash, vLLM, serialized streams
+  summary: The same kernels as the vLLM graph with each source-level parallel region run one after another. It is a counterfactual for alignment, not a runtime option.
+glm52_vllm_dsa_moe:
+  name: GLM-5.2, vLLM
+  summary: GLM-5.2's aligned vLLM execution graph, with local TP1 attention and expert parallelism across the replica.
+glm52_vllm_nvfp4_dsa_moe:
+  name: GLM-5.2 NVFP4, vLLM
+  summary: The B200 execution graph for NVIDIA's GLM-5.2 NVFP4 checkpoint. Tensor and expert parallelism share one rank group, as in vLLM.
+glm52_vllm_nvfp4_dsa_moe_speculative:
+  name: GLM-5.2 NVFP4, vLLM, MTP drafting
+  summary: The NVFP4 graph driving its MTP layer as a drafter. One verify pass over `draft_tokens + 1` rows per decode request, then `draft_tokens` draft passes.
+glm53_vllm_nvfp4_dsa_moe_dflash2:
+  name: GLM-5.3 NVFP4, vLLM, DFlash2 drafting
+  summary: The GLM target graph driven by a DFlash2 proposer, which drafts a whole block in one forward pass over `draft_tokens + 1` rows per request.
+glm52_sglang_nvfp4_tp_dsa_moe:
+  name: GLM-5.2 NVFP4, SGLang TP
+  summary: SGLang's B200 NVFP4 launch graph under pure tensor parallelism. Every rank owns all experts and shards the routed intermediate axis.
+qwen3_attn_tp:
+  name: Qwen3 MoE, disaggregated attention
+  summary: The attention side of attention-FFN disaggregation. One worker is one data-parallel shard over `attn_tp_size` head-parallel ranks, with its own KV cache.
+qwen3_ffn_moe:
+  name: Qwen3 MoE, disaggregated FFN
+  summary: The BF16 FFN side of attention-FFN disaggregation. QKV and output projections, post-norm, router and EP MoE, plus the embedding, final norm and LM head.
+qwen3_fp8_ffn_moe:
+  name: Qwen3 MoE FP8, disaggregated FFN
+  summary: The FP8 FFN side of attention-FFN disaggregation. Its projection and LM-head leaves are quantize-then-GEMM compound ops.

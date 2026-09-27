@@ -23,6 +23,8 @@ from profiling.kernels.nvfp4_fused_moe import Nvfp4FusedMoeArgs
 from profiling.kernels.single_gemm import SingleGemmArgs
 from profiling.runners.metrics import ComputeMetrics
 from public_api.app import PREFIX, create_app
+from public_api.arch import library as arch_library
+from public_api.arch.library import ArchLibrary, config_identity
 from public_api.kernel import library
 from public_api.kernel.library import PROVENANCE, KernelLibrary
 from public_api.kernel.sources import REPO_ROOT, KernelSources
@@ -95,6 +97,69 @@ SCHEMA = {
 }
 
 
+def _dim(value: int, expression: str) -> dict:
+    """A rich ``Dim`` as a slot's kernel config serializes it."""
+
+    return {"value": value, "expression": expression, "bindings": {"hidden": 4096}}
+
+
+def _gemm_config(n: dict | int) -> dict:
+    return {
+        "gpu_name": "NVIDIA H200",
+        "backends": ["torch", "torch_linear"],
+        "n": n,
+        "k": _dim(4096, "hidden"),
+        "dtype": "bf16",
+    }
+
+
+def _llama_build(tp_size: int) -> dict:
+    """``supported-cost-trees`` for one llama3_dense_tp expansion, cut down:
+    Sum(embedding, Scale{32}(Sum(Max(qkv rank 0, qkv rank 1), mlp))). Both
+    qkv ranks carry the registered qkv config (``QKV``)."""
+
+    qkv = _gemm_config(_dim(6144, "(heads+2*kv_heads)*head_dim"))
+    slots = [
+        {
+            "name": "unified.embedding",
+            "kind": "elementwise",
+            "kernel_config": {
+                "gpu_name": "NVIDIA H200",
+                "backends": ["triton"],
+                "input_bytes_per_token": 8192,
+                "output_bytes_per_token": 8192,
+            },
+        },
+        {"name": "unified.layer.attn.qkv", "kind": "single_gemm", "kernel_config": qkv},
+        {"name": "unified.layer.attn.qkv", "kind": "single_gemm", "kernel_config": qkv},
+        {"name": "unified.layer.mlp", "kind": "single_gemm", "kernel_config": _gemm_config(14336)},
+    ]
+    nodes = [
+        {"Sum": {"children": {"start": 1, "end": 3}}},
+        {"Leaf": 0},
+        {"Scale": {"n": 32, "children": {"start": 3, "end": 4}}},
+        {"Sum": {"children": {"start": 4, "end": 6}}},
+        {"Max": {"overlap": 1.0, "children": {"start": 6, "end": 8}}},
+        {"Leaf": 3},
+        {"Leaf": 1},
+        {"Leaf": 2},
+    ]
+    labels = [f"unified [dense TP (tp={tp_size})]", None, "layer", None, "attn [Max]", None, None]
+    return {
+        "contract": "iter_wise",
+        "arch": "llama3_dense_tp",
+        "gpu": "NVIDIA H200",
+        "params": {"model_config": "llama3_8b", "tp_size": tp_size},
+        "gpus_per_replica": tp_size,
+        "cost_manifest": {
+            "sections": [
+                {"section": "iter", "slots": slots, "nodes": nodes, "node_labels": [*labels, None]}
+            ]
+        },
+        "error": None,
+    }
+
+
 class FixtureSources(KernelSources):
     """Real profile.db access, canned simulator introspection."""
 
@@ -103,6 +168,9 @@ class FixtureSources(KernelSources):
 
     def kernel_list(self) -> list[dict]:
         return [{"kind": "single_gemm", "compute_dtype": "dtype", "kv_dtype": None}]
+
+    def supported_cost_trees(self) -> list[dict]:
+        return [_llama_build(1), _llama_build(4)]
 
 
 @pytest.fixture
@@ -121,6 +189,9 @@ def catalog(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     path = tmp_path / "catalog.yaml"
     path.write_text("llama3_8b: {name: Llama 3 8B, family: Llama}\n")
     monkeypatch.setattr(library, "MODEL_CATALOG", path)
+    archs = tmp_path / "arch_catalog.yaml"
+    archs.write_text("llama3_dense_tp: {name: 'Llama 3, TP', summary: Megatron TP.}\n")
+    monkeypatch.setattr(arch_library, "ARCH_CATALOG", archs)
     monkeypatch.setattr(
         library, "kernel_doc", lambda kind: GEMM_DOC if kind == "single_gemm" else None
     )
@@ -316,6 +387,9 @@ def test_the_database_is_never_written(client: TestClient, db: Path) -> None:
         "/kernels/single_gemm",
         "/kernels/single_gemm/rows",
         "/kernels/single_gemm/configs",
+        "/archs",
+        "/archs/llama3_dense_tp",
+        "/archs/llama3_dense_tp/cost-tree?gpu=NVIDIA H200&model=llama3_8b&tp_size=4",
     ):
         assert client.get(f"{PREFIX}{path}").status_code == 200
     assert (hashlib.sha256(db.read_bytes()).hexdigest(), db.stat().st_mtime_ns) == before
@@ -768,3 +842,182 @@ def test_each_config_names_its_routing(routings) -> None:
         params={"gpu": "NVIDIA B200"},
     ).json()
     assert detail["config_labels"]["expert_demand"]["label"] == TRACKED
+
+
+# -- archs -----------------------------------------------------------------------
+
+LLAMA_TP4 = {"gpu": "NVIDIA H200", "model": "llama3_8b", "tp_size": "4"}
+
+
+def test_arch_catalog_names_each_arch_and_counts_its_parameter_sets(client: TestClient) -> None:
+    catalog = client.get(f"{PREFIX}/archs").json()
+    archs = {a["arch"]: a for a in catalog["archs"]}
+    llama = archs["llama3_dense_tp"]
+    assert (llama["name"], llama["summary"]) == ("Llama 3, TP", "Megatron TP.")
+    assert (llama["contract"], llama["models"], llama["families"]) == (
+        "iter_wise",
+        ["llama3_8b"],
+        ["Llama"],
+    )
+    assert (llama["gpus"], llama["params"]) == (["NVIDIA H200"], ["tp_size"])
+    # One row, so one parameter set; it lists tp_size 1 and 4.
+    assert (llama["param_sets"], llama["combinations"]) == (1, 2)
+    # An arch without rows or catalog entry is listed, last, with nothing to pick.
+    assert catalog["archs"][-1]["arch"] == "moe_x"
+    assert (archs["moe_x"]["name"], archs["moe_x"]["combinations"]) == (None, 0)
+    assert catalog["models"] == [
+        {"model_config": "llama3_8b", "name": "Llama 3 8B", "family": "Llama"}
+    ]
+
+
+def test_arch_detail_lists_params_and_the_supported_sets(registered) -> None:
+    client, _, _ = registered
+    arch = client.get(f"{PREFIX}/archs/llama3_dense_tp").json()
+    params = {p["name"]: p for p in arch["params"]}
+    assert params["tp_size"]["default"] == 2 and params["tp_size"]["values"] == [1, 4]
+    assert params["model_config"]["values"] == ["llama3_8b"]
+    # fp8 is an arch param the rows do not choose: the trees take its default.
+    assert params["fp8"]["values"] is None
+    assert arch["query"] == ["gpu", "model", "tp_size"]
+    [param_set] = arch["param_sets"]
+    # The kernel library's deployment-entry shape.
+    assert param_set["label"] == "llama3_dense_tp, tp_size 1 · 4"
+    assert (param_set["params"], param_set["varies"]) == ({"tp_size": [1, 4]}, ["tp_size"])
+    one, four = param_set["members"]
+    assert four["query"] == {"gpu": "NVIDIA H200", "model": "llama3_8b", "tp_size": 4}
+    assert (four["label"], four["gpus_per_replica"], four["error"]) == (
+        "llama3_dense_tp, tp_size 4",
+        4,
+        None,
+    )
+    # Three distinct configs: qkv is registered and measured, the other two are not.
+    assert four["counts"] == {"leaves": 4, "configs": 3, "registered": 1, "measured": 1}
+
+
+def test_cost_tree_nests_the_manifest_in_the_analyzer_shape(registered) -> None:
+    client, (qkv, _), _ = registered
+    tree = client.get(f"{PREFIX}/archs/llama3_dense_tp/cost-tree", params=LLAMA_TP4).json()
+    assert (tree["label"], tree["params"], tree["gpus_per_replica"]) == (
+        "llama3_dense_tp, tp_size 4",
+        {"tp_size": 4},
+        4,
+    )
+    # Params no row chooses take their schema defaults; the document says which.
+    assert tree["defaults"] == {"fp8": False}
+    [section] = tree["sections"]
+    root = section["root"]
+    assert (section["section"], root["kind"], root["id"], root["path"]) == (
+        "iter",
+        "sum",
+        0,
+        "unified",
+    )
+    assert root["label"] == "unified [dense TP (tp=4)]"
+    embedding, layers = root["children"]
+    assert embedding == {
+        "id": 1,
+        "kind": "leaf",
+        "slot": {
+            "index": 0,
+            "name": "unified.embedding",
+            "kind": "elementwise",
+            "backends": ["triton"],
+            "config_hash": kernel_config.content_hash(
+                {"input_bytes_per_token": 8192, "output_bytes_per_token": 8192}
+            ),
+        },
+    }
+    assert (layers["kind"], layers["n"], layers["label"]) == ("scale", 32, "layer")
+    [layer] = layers["children"]
+    assert layer["path"] == "unified.layer"
+    ranks, mlp = layer["children"]
+    assert (ranks["kind"], ranks["overlap"], ranks["path"]) == (
+        "max",
+        1.0,
+        "unified.layer.attn.qkv",
+    )
+    # Both ranks are one config: the Dims reduce to the registered qkv identity.
+    assert [r["slot"]["config_hash"] for r in ranks["children"]] == [qkv, qkv]
+    assert [r["slot"]["index"] for r in ranks["children"]] == [1, 2]
+    assert "timing" not in str(tree) and "ms" not in tree
+    config = tree["configs"][qkv]
+    assert config == {
+        "kind": "single_gemm",
+        "args": QKV,
+        "args_omitted": [],
+        "registry": {"cells": 3, "infeasible": 1, "measured": {"torch": 2, "torch_linear": 1}},
+    }
+    assert tree["configs"][mlp["slot"]["config_hash"]]["registry"] is None
+    assert tree["kernels"]["single_gemm"] == {
+        "documented": True,
+        "title": "Dense GEMM",
+        "category": "GEMM",
+    }
+    assert tree["kernels"]["elementwise"]["documented"] is False
+
+
+@pytest.mark.parametrize(
+    ("params", "status", "message"),
+    [
+        ({"gpu": "NVIDIA H200", "model": "llama3_8b"}, 400, "needs tp_size"),
+        ({**LLAMA_TP4, "routing": "corpus"}, 400, "does not choose routing"),
+        ({**LLAMA_TP4, "tp_size": "big"}, 400, "must be an integer"),
+        ({**LLAMA_TP4, "tp_size": "2"}, 404, "no #[supported] row"),
+        ({**LLAMA_TP4, "gpu": "NVIDIA B200"}, 404, "no #[supported] row"),
+    ],
+)
+def test_a_cost_tree_query_must_name_a_supported_set(
+    client: TestClient, params: dict, status: int, message: str
+) -> None:
+    response = client.get(f"{PREFIX}/archs/llama3_dense_tp/cost-tree", params=params)
+    assert response.status_code == status
+    detail = response.json()["detail"]
+    assert message in detail["message"]
+    # Never a guess: the valid queries instead.
+    assert [c["tp_size"] for c in detail["choices"]] == [1, 4]
+
+
+def test_an_unknown_arch_is_404(client: TestClient) -> None:
+    for path in ("/archs/no_such_arch", "/archs/no_such_arch/cost-tree"):
+        assert client.get(f"{PREFIX}{path}").status_code == 404
+
+
+def test_warming_builds_every_arch_document_without_raising(registered) -> None:
+    _, _, path = registered
+    kernels = KernelLibrary(FixtureSources(db_path=path))
+    ArchLibrary(kernels).warm()
+
+
+@pytest.mark.needs_binary
+def test_a_leaf_config_hash_is_the_registry_key_of_its_config(tmp_path: Path) -> None:
+    """Every leaf the build records a config for hashes, from its own kernel
+    config, to that record's registry key."""
+
+    sources = KernelSources(db_path=tmp_path / "unused.db")
+    builds = sources._simulator(["supported-cost-trees", "--kernel-configs"])
+    checked = 0
+    for build in builds:
+        records: dict[str, set[str]] = {}
+        for record in build["kernel_configs"]["configs"]:
+            for use in record["uses"]:
+                records.setdefault(use["role"], set()).add(
+                    kernel_config.content_hash(record["identity"])
+                )
+        for section in build["cost_manifest"]["sections"]:
+            for slot in section["slots"]:
+                if slot["name"] in records:
+                    identity = config_identity(slot["kernel_config"])
+                    assert kernel_config.content_hash(identity) in records[slot["name"]]
+                    checked += 1
+    assert checked > 1000
+
+
+@pytest.mark.needs_binary
+def test_the_arch_catalog_names_every_arch_tag(tmp_path: Path) -> None:
+    import yaml
+
+    schema = KernelSources(db_path=tmp_path / "unused.db").deployment_schema()
+    tags = {tag for providers in schema["providers"]["arch"].values() for tag in providers}
+    named = yaml.safe_load((REPO_ROOT / "model" / "arch_catalog.yaml").read_text())
+    assert set(named) == tags
+    assert all(entry["name"] and entry["summary"] for entry in named.values())

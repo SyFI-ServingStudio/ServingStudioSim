@@ -162,6 +162,49 @@ def _label_text(arch: str | None, params: dict) -> str:
     return ", ".join([str(arch), *(f"{n} {text(v)}" for n, v in params.items())])
 
 
+def row_varies(row: dict) -> list[str]:
+    """The params a ``#[supported]`` row lists several values for, besides the
+    GPU and model config: what tells the row's members apart."""
+
+    return [
+        n for n, allowed in row.items() if n not in ("gpu", "model_config") and len(allowed) > 1
+    ]
+
+
+def row_members(row: dict, deployments: list[dict]) -> list[dict]:
+    """``deployments`` of one row in the row's own order of values."""
+
+    varies = row_varies(row)
+    return sorted(deployments, key=lambda d: [row[n].index(d["params"][n]) for n in varies])
+
+
+def row_entry(row: dict, deployments: list[dict]) -> dict:
+    """The deployments of one ``#[supported]`` row on one GPU and model config
+    as one entry: ``params`` holds each varying param's values in the row's
+    order, once each, and every deployment is a ``member`` holding its varying
+    values, in that order (:func:`row_members`). ``deployments`` are labeled
+    (``KernelLibrary._deployment``) and share every other param."""
+
+    varies = row_varies(row)
+    members = row_members(row, deployments)
+    listed = [{"params": {n: d["params"][n] for n in varies}} for d in members]
+    base = members[0]
+    params = {
+        n: list(dict.fromkeys(m["params"][n] for m in listed)) if n in varies else v
+        for n, v in base["params"].items()
+    }
+    return {
+        "arch": base["arch"],
+        "gpu": base["gpu"],
+        "model_config": base["model_config"],
+        "model": base["model"],
+        "params": params,
+        "varies": varies,
+        "label": _label_text(base["arch"], params),
+        "members": listed,
+    }
+
+
 def _without_local_paths(value: Any) -> Any:
     """``value`` with every absolute file path cut to its file name. A config's
     identity can name a file on the machine that built it (an expert-demand
@@ -402,11 +445,7 @@ class KernelLibrary:
                     for deployment in self._source_deployments(use.source, config.gpu_name):
                         covering = self._covering_row(deployment)
                         row = covering[1] if covering else {}
-                        varies = [
-                            name
-                            for name, allowed in row.items()
-                            if name not in ("gpu", "model_config") and len(allowed) > 1
-                        ]
+                        varies = row_varies(row)
                         shared = {n: v for n, v in deployment["params"].items() if n not in varies}
                         key = canonical_json(
                             [
@@ -417,43 +456,15 @@ class KernelLibrary:
                                 shared,
                             ]
                         )
-                        group = groups.setdefault(
-                            key, {"base": deployment, "row": row, "varies": varies, "members": {}}
-                        )
+                        group = groups.setdefault(key, {"row": row, "members": {}})
                         group["members"].setdefault(self._deployment_key(deployment), deployment)
 
             entries, index = [], {}
             for group in groups.values():
-                row, varies = group["row"], group["varies"]
-                # Members in the row's own order of values.
-                members = sorted(
-                    group["members"].items(),
-                    key=lambda item: [row[n].index(item[1]["params"][n]) for n in varies],
-                )
-                listed = []
-                for _, deployment in members:
-                    listed.append({"params": {n: deployment["params"][n] for n in varies}})
-                base = group["base"]
-                params = {
-                    n: [m["params"][n] for m in listed] if n in varies else v
-                    for n, v in base["params"].items()
-                }
-                # A param listed with several values keeps the ones present, once each.
-                for name in varies:
-                    params[name] = list(dict.fromkeys(params[name]))
-                entries.append(
-                    {
-                        "arch": base["arch"],
-                        "gpu": base["gpu"],
-                        "model_config": base["model_config"],
-                        "model": base["model"],
-                        "params": params,
-                        "varies": varies,
-                        "label": _label_text(base["arch"], params),
-                        "members": listed,
-                        "_keys": [member_key for member_key, _ in members],
-                    }
-                )
+                members = row_members(group["row"], list(group["members"].values()))
+                entry = row_entry(group["row"], members)
+                entry["_keys"] = [self._deployment_key(d) for d in members]
+                entries.append(entry)
             entries.sort(key=lambda d: (self._model_rank(d["model_config"]), d["gpu"], d["label"]))
             for entry_id, entry in enumerate(entries):
                 for member, member_key in enumerate(entry.pop("_keys")):
