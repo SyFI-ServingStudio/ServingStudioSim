@@ -486,10 +486,45 @@ def _run_timing_predict(args: argparse.Namespace) -> int:
     return _launch_timing_predict(build_result.predict_config, build_type=args.build_type)
 
 
+def _check_arrival_time_scale(manifest_path: Path) -> None:
+    """Refuse a simulation that replays the trace at another arrival scale.
+
+    Only the arrival-scale check blocks here; the rest of the request
+    population audit is reported, as the campaign metrics already do.
+    """
+    from alignment.request_population import (
+        ARRIVAL_TIME_SCALE_TOLERANCE,
+        audit_alignment_population,
+    )
+
+    if "replay_result" not in json.loads(manifest_path.read_text()):
+        return
+    try:
+        audit = audit_alignment_population(manifest_path, repo_root=REPO_ROOT)
+    except (KeyError, OSError, ValueError) as error:
+        print(f"[alignment] request population audit unavailable: {error}")
+        return
+    if not audit.get("available"):
+        return
+    if audit["checks"].get("arrival_time_scale_matches") is False:
+        measured = audit["arrival_time_scale"]
+        simulated = audit["simulated_arrival_time_scale"]
+        raise ValueError(
+            f"simulated arrival-time scale {simulated} differs from the measured replay's "
+            f"{measured} by more than {ARRIVAL_TIME_SCALE_TOLERANCE:.0%}; a trace_timed "
+            f"simulation divides trace offsets by `request_rate`, so it should be "
+            f"{1 / measured if measured else float('inf'):g}"
+        )
+    if not audit["all_ok"]:
+        failed = [name for name, ok in audit["checks"].items() if not ok]
+        print(f"[alignment] warning: request population audit failed: {failed}")
+
+
 def _run_analyze(args: argparse.Namespace) -> int:
     config = load_analyze_config(args.config)
     write_artifact_kind(config.log_dir.parent, ArtifactKind.ALIGNMENT_BUNDLE)
     manifest = _write_analysis_manifest(config)
+    _check_arrival_time_scale(manifest)
     _snapshot_config(args.config, config.log_dir, "analyze")
     print(f"[alignment] analyzer manifest: {manifest}")
     return (
