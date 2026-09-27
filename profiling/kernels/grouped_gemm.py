@@ -65,7 +65,7 @@ DOC = KernelDoc(
         "torch._grouped_mm over the stacked rows. DeepGEMM pads each nonempty "
         "expert's rows to its alignment and runs in fp8 with bf16 output."
     ),
-    category="GEMM",
+    category="MoE",
     formula=(
         "C_g[m_g, n] = A_g[m_g, k] · B_g[k, n], with m_g = per_group_batches[g]",
         "TFLOPS = 2·(Σ m_g)·n·k / time",
