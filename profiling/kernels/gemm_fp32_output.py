@@ -115,7 +115,8 @@ register(
                 "SM100/103), k % 1024 == 0 and n is 256 or 384; otherwise "
                 "linear_bf16_fp32."
             ),
-            url="https://github.com/sgl-project/sglang/blob/main/python/sglang/kernels/ops/gemm/dsv3_router_gemm.py",
+            # SGLang main replaced dsv3_router_gemm (#34693); pin the last upstream revision.
+            url="https://github.com/sgl-project/sglang/blob/ee462b5899c02db4e9d250f43c4c54d81253c4c6/python/sglang/kernels/ops/gemm/dsv3_router_gemm.py",
         ),
     )
 )
