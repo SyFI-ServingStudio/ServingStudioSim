@@ -34,7 +34,7 @@ DOC = KernelDoc(
     title="Prefill indexer top-k",
     summary="Choose the highest-scoring index-key positions for each prefill query.",
     description=(
-        "After the prefill scores, GLM-5.2's DSA indexer keeps the top_k "
+        "After the prefill scores, the DSA indexer keeps the top_k "
         "highest-scoring keys for each query; sparse attention then reads only "
         "those. The measurement uses one sequence whose last num_queries tokens"
         " are the queries, so query i has num_keys − num_queries + i + 1 valid "

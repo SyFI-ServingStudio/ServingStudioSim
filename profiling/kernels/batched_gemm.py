@@ -1,8 +1,8 @@
-"""Batched-GEMM kernel kind with GLM production-layout backend identities.
+"""Batched-GEMM kernel kind for MLA's per-head query absorption and value expansion.
 
-The backend names deliberately freeze the model-specific Q-absorption and V-up
-storage layouts instead of presenting their constants as generic batched GEMM
-behavior.
+Each backend freezes one production storage layout (vLLM's packed Q-absorption
+or V-up views) instead of presenting its constants as generic batched GEMM
+behavior; the runners accept only the measured head widths.
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ class BatchedGemmArgs(KernelArgs):
 
 DOC = KernelDoc(
     title="MLA batched GEMM",
-    summary="Multiply one activation and weight matrix pair per attention head in GLM-5.2 MLA.",
+    summary="Multiply one activation and weight matrix pair per attention head in MLA.",
     description=(
         "vLLM's MLA runs two per-head batched multiplies. Query absorption "
         "multiplies each head's query by W_UK, mapping it into the compressed KV "
@@ -59,6 +59,8 @@ DOC = KernelDoc(
     caveats=(
         "GB/s counts the logical operand elements, not the gaps in the packed "
         "storage the strided views skip.",
+        "Only k = 192, n = 512 for query absorption and k = 512, n = 256 for "
+        "value expansion are measured, at 8, 16, 32 or 64 heads.",
     ),
     reference="profiling.runners.gemm.batched_gemm_reference",
 )
@@ -67,21 +69,21 @@ DOC = KernelDoc(
 register(
     KernelProfilerSpec(
         kernel_kind=KIND,
-        backend="torch_mla_q_absorb_glm52",
+        backend="torch_mla_q_absorb",
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
             gpus=frozenset({"NVIDIA H200", "NVIDIA B200"}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.gemm.batched_gemm",
-            function_name="profile_mla_q_absorb_glm52",
+            function_name="profile_mla_q_absorb",
         ),
         table_name=KIND,
         args_schema=BatchedGemmArgs,
         metric_family=MetricFamily.COMPUTE,
         batch_outlier_policy=BatchOutlierPolicy(),
         doc=BackendDoc(
-            summary="torch.bmm for query absorption, on vLLM's packed W_UK view (GLM-5.2 shapes).",
+            summary="torch.bmm for query absorption, on vLLM's packed W_UK view.",
             url="https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/attention/mla_attention.py",
         ),
     )
@@ -90,14 +92,14 @@ register(
 register(
     KernelProfilerSpec(
         kernel_kind=KIND,
-        backend="torch_mla_v_up_glm52",
+        backend="torch_mla_v_up",
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
             gpus=frozenset({"NVIDIA H200", "NVIDIA B200"}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.gemm.batched_gemm",
-            function_name="profile_mla_v_up_glm52",
+            function_name="profile_mla_v_up",
         ),
         table_name=KIND,
         args_schema=BatchedGemmArgs,
@@ -105,8 +107,7 @@ register(
         batch_outlier_policy=BatchOutlierPolicy(),
         doc=BackendDoc(
             summary=(
-                "torch.bmm for value expansion, on vLLM's packed W_UV view and "
-                "strided output (GLM-5.2 shapes)."
+                "torch.bmm for value expansion, on vLLM's packed W_UV view and strided output."
             ),
             url="https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/attention/mla_attention.py",
         ),

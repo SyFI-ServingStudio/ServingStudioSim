@@ -36,7 +36,7 @@ DOC = KernelDoc(
     title="Indexer query RoPE and FP8 quantization",
     summary="Rotate indexer queries and quantize them to FP8 while producing per-head weights.",
     description=(
-        "The first step of GLM-5.2's DSA indexer on SGLang: before the indexer "
+        "The first step of the DSA indexer on SGLang: before the indexer "
         "scores cached keys, each query head has RoPE applied to its first "
         "rope_dim elements and is quantized to FP8, and the per-head weights "
         "are written as FP32, all in one call. The weights are read as a "

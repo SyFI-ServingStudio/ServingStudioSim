@@ -1,4 +1,4 @@
-//! DeepSeek routed-expert clamped SwiGLU activation.
+//! Routed-expert clamped SwiGLU activation.
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::CacheKind;

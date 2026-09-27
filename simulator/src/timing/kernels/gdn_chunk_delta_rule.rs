@@ -1,4 +1,4 @@
-//! Qwen Gated DeltaNet prefill chunked delta rule as ONE fused launch.
+//! Gated DeltaNet prefill chunked delta rule as ONE fused launch.
 //!
 //! Deliberately a separate kind from the six `gdn_chunk_*` kinds. Those model
 //! FLA's Triton realization, which splits the chunked gated delta rule into six

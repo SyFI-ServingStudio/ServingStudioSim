@@ -64,7 +64,7 @@ DOC = KernelDoc(
     title="vLLM MLA query RoPE",
     summary="Rotate the MLA query's positional columns and materialize the full query tensor.",
     description=(
-        "In vLLM's MLA attention (GLM-5.2), RoPE changes only the rope_dim "
+        "In vLLM's MLA attention, RoPE changes only the rope_dim "
         "columns of each query head, but the Inductor-compiled kernel reads and"
         " writes the whole query, including the qk_nope_head_dim columns it "
         "leaves unchanged, because vLLM writes the rotated slice back and then "

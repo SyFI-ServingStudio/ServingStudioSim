@@ -1,4 +1,4 @@
-"""GLM-5.2 BF16 selected sparse MLA attention kernel kind."""
+"""Sparse MLA attention kernel kind over DSA-selected cache tokens."""
 
 from __future__ import annotations
 
@@ -44,8 +44,8 @@ DOC = KernelDoc(
     title="Sparse MLA attention",
     summary="Attend to the DSA-selected cache tokens for each query head.",
     description=(
-        "GLM-5.2's sparse MLA attention: each query head attends only to the "
-        "cache tokens its DSA indexer selected. Scores use the compressed "
+        "In sparse MLA attention, each query head attends only to the cache "
+        "tokens the DSA indexer selected. Scores use the compressed "
         "latent and the rotary part; values are the latent. valid_counts sets "
         "how many of the selected_k slots each query uses, and the rest are "
         "masked. Queries and cache values are synthetic, and the selected "

@@ -1,4 +1,4 @@
-"""DeepSeek learned/hash sqrt-softplus routing as one physical CUDA kind."""
+"""Learned/hash sqrt-softplus routing as one physical CUDA kind."""
 
 from __future__ import annotations
 
@@ -34,13 +34,14 @@ DOC = KernelDoc(
         "Select experts with sqrt-softplus scores or a token hash table and produce scaled weights."
     ),
     description=(
-        "DeepSeek V4's MoE router scores each expert as √softplus(logit). In "
+        "This MoE router scores each expert as √softplus(logit). In "
         "learned mode it selects the top_k experts by score plus a correction "
         "bias; in hash mode the experts come from a table indexed by token ID. "
         "Both modes renormalize the selected scores and scale the weights by "
         "1.5, in one vLLM CUDA kernel. Logits are random fp32 values."
     ),
     category="MoE",
+    subcategory="Routing and combine",
     formula=(
         "score = √softplus(logit)",
         "weight = 1.5 · selected score / sum(selected scores)",

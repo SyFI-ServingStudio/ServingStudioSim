@@ -41,7 +41,10 @@ class Subcategory:
 
 
 #: Subcategories per category, in the order the library lists them. Attention
-#: is divided by the attention a model layer runs.
+#: is divided by the attention a model layer runs, MoE by the step of the layer
+#: and Normalization by what is normalized. In a category listed here every
+#: kind names one of its subcategories: the library shows a subdivided category
+#: only through them.
 SUBCATEGORIES: dict[str, tuple[Subcategory, ...]] = {
     "Attention": (
         Subcategory(
@@ -59,8 +62,38 @@ SUBCATEGORIES: dict[str, tuple[Subcategory, ...]] = {
             "its top-k tokens.",
         ),
         Subcategory(
+            "Compressed sparse MLA",
+            "Sparse MLA over a compressed KV cache: every few tokens are pooled into "
+            "one key, and each query attends to a sliding window of recent tokens "
+            "plus compressed keys.",
+        ),
+        Subcategory(
             "Gated DeltaNet",
             "Linear attention: a gated delta-rule state stands in for the KV cache.",
+        ),
+    ),
+    "MoE": (
+        Subcategory(
+            "Expert compute",
+            "The routed experts' matrix multiplies and the activation between them, "
+            "as fused MoE calls or grouped GEMMs.",
+        ),
+        Subcategory(
+            "Routing and combine",
+            "Choose each token's experts, group tokens by expert for the GEMMs, and "
+            "sum the expert outputs back into one row per token.",
+        ),
+    ),
+    "Normalization": (
+        Subcategory(
+            "RMSNorm",
+            "Root-mean-square normalization of hidden rows, alone or fused with a "
+            "residual add, a gate or a second input.",
+        ),
+        Subcategory(
+            "Hyper-connections",
+            "mHC: each token keeps several residual streams, mixed before and after "
+            "every block; these calls fuse the mixing with RMSNorm.",
         ),
     ),
 }

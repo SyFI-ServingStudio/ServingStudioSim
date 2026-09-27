@@ -1,4 +1,4 @@
-"""Qwen GDN chunk-local triangular-solve kernel kind.
+"""GDN chunk-local triangular-solve kernel kind.
 
 The initial ``torch`` backend measures a multi-launch semantic implementation.
 It is a correctness/performance baseline, not the production fused Triton

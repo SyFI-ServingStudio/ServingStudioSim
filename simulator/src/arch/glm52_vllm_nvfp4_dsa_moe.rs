@@ -119,8 +119,8 @@ const FP8_SINGLE_GEMM_BACKENDS: &[&str] = &["deepgemm"];
 // nsys iteration, so this is not a shape or a backend preference -- feeding the
 // dense leaves the routed curve over-predicted them ~2.05x at prefill.
 const DENSE_FP8_QUANT_BACKENDS: &[&str] = &["vllm_cuda"];
-const Q_ABSORB_BACKENDS: &[&str] = &["torch_mla_q_absorb_glm52"];
-const V_UP_BACKENDS: &[&str] = &["torch_mla_v_up_glm52"];
+const Q_ABSORB_BACKENDS: &[&str] = &["torch_mla_q_absorb"];
+const V_UP_BACKENDS: &[&str] = &["torch_mla_v_up"];
 const INDEX_CACHE_AND_TOPK_BACKENDS: &[&str] = &["vllm_cuda"];
 const INDEX_LOGITS_BACKENDS: &[&str] = &["deepgemm_fp8"];
 const SPARSE_ATTN_BACKENDS: &[&str] = &["flashinfer_trtllm_fp8"];

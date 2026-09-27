@@ -35,6 +35,7 @@ DOC = KernelDoc(
         "before expert parallelism decides which rows are local."
     ),
     category="MoE",
+    subcategory="Expert compute",
     formula=(
         "C_g[m_g, n] = A_g[m_g, k] · B_g[k, n], with m_g = per_group_batches[g]",
         "M = Σ m_g; E_active = number of experts with m_g > 0",

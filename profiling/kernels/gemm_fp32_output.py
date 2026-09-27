@@ -30,8 +30,8 @@ DOC = KernelDoc(
     title="FP32-output GEMM",
     summary="Multiply bf16 activations and weights while writing an fp32 result.",
     description=(
-        "Two call sites need an fp32 result from bf16 inputs. vLLM's DeepSeek V4 "
-        "attention computes its KV-compressor projections with torch.mm and "
+        "Two call sites need an fp32 result from bf16 inputs. vLLM computes "
+        "attention KV-compressor projections with torch.mm and "
         "out_dtype=float32, measured by torch_cublas. SGLang's MoE router computes "
         "router logits in fp32, measured by sglang_router_auto. m is the tokens; "
         "n and k are the output and input features."
@@ -78,8 +78,8 @@ register(
         subprocess_env="vllm_env",
         doc=BackendDoc(
             summary=(
-                "torch.mm with out_dtype=torch.float32, the call vLLM's DeepSeek V4 "
-                "attention makes for its KV-compressor projections."
+                "torch.mm with out_dtype=torch.float32, the call vLLM makes for "
+                "attention KV-compressor projections."
             ),
             url="https://github.com/vllm-project/vllm/blob/main/vllm/models/deepseek_v4/attention.py",
         ),
@@ -105,9 +105,9 @@ register(
         subprocess_env="sglang_env",
         doc=BackendDoc(
             summary=(
-                "SGLang's router dispatch: dsv3_router_gemm when m ≤ 16 (m ≤ 4 on "
-                "SM100/103), k % 1024 == 0 and n is 256 or 384; otherwise "
-                "linear_bf16_fp32."
+                "SGLang's router dispatch: its dedicated router GEMM kernel when "
+                "m ≤ 16 (m ≤ 4 on SM100/103), k % 1024 == 0 and n is 256 or 384; "
+                "otherwise linear_bf16_fp32."
             ),
             url="https://github.com/sgl-project/sglang/blob/main/python/sglang/kernels/ops/gemm/dsv3_router_gemm.py",
         ),

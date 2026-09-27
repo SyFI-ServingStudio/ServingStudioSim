@@ -36,7 +36,7 @@ DOC = KernelDoc(
     title="MLA RoPE and FP8 quantization",
     summary="Rotate MLA queries and keys, quantize them to FP8, and assemble each query.",
     description=(
-        "On SGLang's MLA path (GLM-5.2), one FlashInfer call applies RoPE to "
+        "On SGLang's MLA path, one FlashInfer call applies RoPE to "
         "the rope_dim columns of each query head and of the shared key, and "
         "quantizes both rotary and non-rotary parts to FP8. The query's "
         "non-rotary part is already absorbed into the latent space, so it is "

@@ -1,4 +1,4 @@
-"""Qwen GDN gated RMS normalization kernel kind.
+"""GDN gated RMS normalization kernel kind.
 
 The initial ``torch`` backend measures the complete multi-launch semantic
 reference. It is a correctness/performance baseline, not the production fused
@@ -35,13 +35,14 @@ DOC = KernelDoc(
     title="Gated DeltaNet output RMSNorm",
     summary="RMS-normalize each recurrent output row and multiply it by a SiLU gate.",
     description=(
-        "The last step of Qwen3.6's Gated DeltaNet block before the output "
+        "The last step of a Gated DeltaNet block before the output "
         "projection: each value head's output row is RMS-normalized, scaled by "
         "a learned weight and multiplied by a SiLU gate. m counts rows, one per"
         " token per value head, and hidden is the row width. Statistics and "
         "gating are computed in FP32 and the output is rounded to BF16."
     ),
     category="Normalization",
+    subcategory="RMSNorm",
     formula=(
         "y = (x / √(mean(x²) + 1e−6) · weight) · (z · sigmoid(z))",
         "FLOPs = 7·m·hidden + 2·m",

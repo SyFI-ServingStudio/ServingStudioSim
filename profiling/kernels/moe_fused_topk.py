@@ -41,6 +41,7 @@ DOC = KernelDoc(
         "tie-free bf16 values rather than model outputs."
     ),
     category="MoE",
+    subcategory="Routing and combine",
     formula=(
         "p = softmax(logits); weights = top_k(p) / sum(top_k(p))",
         "source_index(token, slot) = slot · num_tokens + token",

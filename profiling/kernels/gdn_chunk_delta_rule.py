@@ -1,4 +1,4 @@
-"""Qwen GDN prefill chunked delta rule as ONE fused launch.
+"""GDN prefill chunked delta rule as ONE fused launch.
 
 Distinct kernel kind from the six `gdn_chunk_*` kinds on purpose. Those model
 FLA's Triton realization, which splits the chunked gated delta rule into six
@@ -78,7 +78,7 @@ DOC = KernelDoc(
     title="Fused chunked delta rule",
     summary="Compute Gated DeltaNet prefill output and final recurrent states in one launch.",
     description=(
-        "The chunked gated delta rule of Qwen3.6's Gated DeltaNet prefill, "
+        "The chunked gated delta rule of Gated DeltaNet prefill, "
         "which vLLM on H200 runs as one FlashInfer CUTLASS kernel: it writes "
         "every token's output and each sequence's final state. The inputs are "
         "prepared as vLLM prepares them: queries and keys already L2-normalized"

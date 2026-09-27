@@ -1,4 +1,4 @@
-"""DeepSeek routed-expert clamped SwiGLU."""
+"""Clamped SwiGLU for routed and shared experts."""
 
 from __future__ import annotations
 
@@ -39,13 +39,14 @@ DOC = KernelDoc(
         "Clamp the gate and up projections, then multiply SiLU of the gate by the up projection."
     ),
     description=(
-        "DeepSeek V4's routed and shared experts apply this activation to the "
-        "output of their gate-up projection. Each input row holds a gate half and "
+        "Routed and shared experts apply this activation to the output of "
+        "their gate-up projection. Each input row holds a gate half and "
         "an up half, each hidden_dim wide; the gate is capped at 10 and the up "
         "half clamped to [−10, 10] before the SiLU product. The measurement uses "
         "seeded random bf16 rows."
     ),
     category="MoE",
+    subcategory="Expert compute",
     formula=(
         "y = SiLU(min(gate, 10)) · clamp(up, −10, 10)",
         "GB/s = 6 · num_rows · hidden_dim / time",

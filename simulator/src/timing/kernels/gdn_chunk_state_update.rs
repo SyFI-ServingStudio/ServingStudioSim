@@ -1,4 +1,4 @@
-//! Qwen Gated DeltaNet fused chunk-state update kernel.
+//! Gated DeltaNet fused chunk-state update kernel.
 //!
 //! Stable H200 measurements require three cache axes: `C` captures aggregate
 //! chunk work and H snapshots, `N` controls launch programs, and the normalized

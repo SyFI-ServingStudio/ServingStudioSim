@@ -1,4 +1,4 @@
-"""Qwen GDN fused-prefill post-convolution preparation kernel kind.
+"""GDN fused-prefill post-convolution preparation kernel kind.
 
 The initial ``torch`` backend measures the complete multi-launch semantic
 reference. It is a correctness/performance baseline, not the production fused
@@ -41,7 +41,7 @@ DOC = KernelDoc(
         " the log decay and beta."
     ),
     description=(
-        "After the causal convolution in Qwen3.6's Gated DeltaNet prefill, the "
+        "After the causal convolution in Gated DeltaNet prefill, the "
         "packed output is split into queries, keys and values. Queries and keys"
         " are L2-normalized per head, values are copied, and two raw gates are "
         "combined with FP32 parameters into the log decay g and the update "

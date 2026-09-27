@@ -1,4 +1,4 @@
-//! GLM-5.2 request-local to global sparse-index remapping.
+//! Request-local to global sparse-index remapping.
 //!
 //! The native Triton launch scans a fixed `selected_k` row for every query.
 //! Its variable physical work is captured by query rows, mean valid slots, and

@@ -87,7 +87,7 @@ DOC = KernelDoc(
         "Gather selected token rows and multiply them by FP8 expert weights in one Triton launch."
     ),
     description=(
-        "Qwen3.6's routed MoE runs its expert projections as two launches of "
+        "A routed MoE layer runs its expert projections as two launches of "
         "vLLM's Triton fused_moe_kernel with FP8 block scales. The gate-up "
         "launch (w13) reads one activation row per token; the down launch (w2) "
         "reads one row per token-expert pair and multiplies by the router "
@@ -96,6 +96,7 @@ DOC = KernelDoc(
         "per-expert counts."
     ),
     category="MoE",
+    subcategory="Expert compute",
     formula=(
         "rows = sum(per_group_batches)",
         "active_experts = count(per_group_batches > 0)",

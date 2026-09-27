@@ -1,4 +1,4 @@
-//! GLM-5.2 DSA index-key quantization and page-planar cache append.
+//! DSA index-key quantization and page-planar cache append.
 //!
 //! Static identity captures the index width, page and quantization block sizes,
 //! input/cache dtypes, scale encoding, and mixed cache format. Runtime is the

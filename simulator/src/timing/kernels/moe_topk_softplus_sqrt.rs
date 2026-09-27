@@ -1,4 +1,4 @@
-//! DeepSeek learned/hash sqrt-softplus router selection.
+//! Learned/hash sqrt-softplus router selection.
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::CacheKind;

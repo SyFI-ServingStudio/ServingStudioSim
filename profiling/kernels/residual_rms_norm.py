@@ -44,6 +44,7 @@ DOC = KernelDoc(
         "separate launches."
     ),
     category="Normalization",
+    subcategory="RMSNorm",
     formula=(
         "s = x + residual",
         "y = s / √(mean(s²) + ε) · weight, with ε = 1e-5",

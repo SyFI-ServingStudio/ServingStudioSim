@@ -1,4 +1,4 @@
-//! DeepSeek routed-expert reduction over the top-k expert axis.
+//! Routed-expert reduction over the top-k expert axis.
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::CacheKind;

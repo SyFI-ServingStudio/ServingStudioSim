@@ -1,4 +1,4 @@
-"""Standalone DeepSeek MHC pre block with fused RMSNorm."""
+"""Standalone mHC pre block with fused RMSNorm."""
 
 from __future__ import annotations
 
@@ -33,13 +33,14 @@ DOC = KernelDoc(
         "weights and the RMS-normalized input of the next block."
     ),
     description=(
-        "DeepSeek V4 keeps hc_mult residual streams per token (mHC) instead of "
-        "one. Before each block, one vLLM TileLang call projects the streams to"
+        "mHC keeps hc_mult residual streams per token instead of one."
+        " Before each block, one vLLM TileLang call projects the streams to"
         " three sets of mixing weights, sums the streams with the pre-mix "
         "weights into the block input, and RMS-normalizes it. The measurement "
         "uses 4 bf16 streams of 4,096 features and random residuals."
     ),
     category="Normalization",
+    subcategory="Hyper-connections",
     formula=(
         "x = the hc_mult streams concatenated; mixes = x · fnᵀ / √(mean(x²) + 1e-6)",
         "pre = σ(s₀·mixes_pre + b_pre) + 1e-6; post = 2·σ(s₁·mixes_post + b_post)",
@@ -58,7 +59,7 @@ DOC = KernelDoc(
         "TFLOPS is not computed. GB/s counts the streams and weights read "
         "once and the mixes and block input written once.",
     ),
-    reference="profiling.runners.mhc._deepseek_v4",
+    reference="profiling.runners.mhc._common",
 )
 
 

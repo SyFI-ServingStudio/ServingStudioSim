@@ -1,4 +1,4 @@
-"""Qwen GDN chunk-local scaled-dot KKT construction kernel kind.
+"""GDN chunk-local scaled-dot KKT construction kernel kind.
 
 The initial ``torch`` backend measures a multi-launch semantic implementation.
 It is a correctness/performance baseline, not the production fused Triton

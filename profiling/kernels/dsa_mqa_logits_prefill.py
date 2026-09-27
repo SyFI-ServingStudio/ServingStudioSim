@@ -38,7 +38,7 @@ DOC = KernelDoc(
     title="Prefill indexer logits",
     summary="Score each prefill query against causal index keys and reduce across indexer heads.",
     description=(
-        "In prefill, GLM-5.2's DSA indexer scores every visible key for each "
+        "In prefill, the DSA indexer scores every visible key for each "
         "query: per head, the ReLU of the query-key dot product, weighted by "
         "head and summed, then multiplied by the key's scale. The measurement "
         "uses one sequence whose last num_queries tokens are the queries, so "

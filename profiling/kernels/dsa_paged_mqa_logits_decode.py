@@ -21,7 +21,7 @@ KIND: str = "dsa_paged_mqa_logits_decode"
 @dataclass(frozen=True)
 class DsaPagedMqaLogitsDecodeArgs(KernelArgs):
     batch_size: int = arg(unit="requests", doc="Requests decoded together.")
-    context_len: int = arg(unit="tokens", doc="Cached index keys per request.")
+    context_len: int = arg(unit="tokens", doc="Index keys cached by the longest request.")
     next_n: int = arg(unit="tokens", doc="New query tokens per request.")
     max_model_len: int = arg(unit="tokens", doc="Allocated width of each score row.")
     num_heads: int = arg(unit="heads", doc="Indexer query heads scored against each key.")
@@ -34,7 +34,7 @@ class DsaPagedMqaLogitsDecodeArgs(KernelArgs):
     output_dtype: DType = arg(doc="Element type of the score matrix.")
     context_mode: str = arg(doc="Distribution of context lengths across requests.")
     page_mapping: str = arg(doc="Assignment of logical pages to physical cache pages.")
-    cache_format: str = arg(doc="Page-planar layout of cached keys and scales.")
+    cache_format: str = arg(doc="Page layout and scale format of the cached keys.")
     clean_logits: bool = arg(doc="Whether unused score positions are initialized.")
 
 
@@ -42,19 +42,23 @@ DOC = KernelDoc(
     title="Decode indexer logits",
     summary="Score decode queries against paged index keys and reduce across indexer heads.",
     description=(
-        "In decode, GLM-5.2's DSA indexer scores each request's cached keys: "
-        "per head, the ReLU of the query-key dot product, weighted by head and "
-        "summed, then multiplied by the key's scale. Keys live in scattered FP8"
-        " pages with a separate FP32 scale per key. Every request has the same "
-        "context_len and next_n new queries; max_model_len only sets the width "
-        "of the allocated score rows, and the work is counted in whole pages."
+        "In decode, the DSA indexer scores each request's cached keys: per "
+        "head, the ReLU of the query-key dot product, weighted by head and "
+        "summed, then multiplied by the key's scale. Keys are FP8 in pages "
+        "that hold their keys followed by one FP32 scale per key. Two layouts "
+        "are measured. With page_mapping unique_scattered and context_mode "
+        "uniform, every request has context_len keys in scattered pages. With "
+        "request_contiguous and max_ragged, request b has max(1, context_len − "
+        "b) keys in consecutive pages padded to a 576-byte stride. max_model_len"
+        " only sets the width of the score rows, and the work is counted in "
+        "whole pages."
     ),
     category="Attention",
     subcategory="DSA",
     formula=(
         "logit[q, k] = scale[k] · Σₕ weight[q, h] · ReLU(query[q, h] · key[k])",
-        "P = ⌈context_len / block_size⌉",
-        "C = batch_size · next_n · P · block_size",
+        "length[b] = context_len (uniform) or max(1, context_len − b) (max_ragged)",
+        "C = next_n · Σ_b block_size · ⌈length[b] / block_size⌉; P = ⌈context_len / block_size⌉",
         "TFLOPS = 2 · C · num_heads · head_dim / time",
         "B = batch_size · next_n · num_heads · head_dim "
         "+ 4 · batch_size · next_n · num_heads + (head_dim + 4) · C "
@@ -67,12 +71,14 @@ DOC = KernelDoc(
         "launches, timed with CUDA events: five warm-up calls, then a loop of "
         "back-to-back calls, taking the median of three runs. deepgemm_fp8 "
         "builds its scheduling metadata and runs once before the capture; CUPTI"
-        " then counts only fp8_paged_mqa_logits launches, with the L2 cache "
-        "flushed before each."
+        " then counts, with the L2 cache flushed before each launch, only "
+        "fp8_paged_mqa_logits launches for scattered pages and every launch of"
+        " the call for request-contiguous pages."
     ),
     caveats=(
-        "All requests have the same context length, and every logical page maps"
-        " to its own physical page.",
+        "Uniform rows give every request the same context length and every "
+        "logical page its own physical page. max_ragged rows are measured only "
+        "with next_n = 1, 64 heads and a 1,048,576-wide score row, on H200.",
         "Both backends' TFLOPS and GB/s use the page-rounded DeepGEMM schedule;"
         " GB/s excludes the scheduling metadata, torch intermediates and "
         "physical transactions.",
@@ -126,9 +132,11 @@ register(
         subprocess_env="vllm_env",
         doc=BackendDoc(
             summary=(
-                "DeepGEMM fp8_paged_mqa_logits through vLLM's deep_gemm wrapper, "
-                "reading paged FP8 keys."
+                "DeepGEMM's paged MQA logits through vLLM's deep_gemm wrapper "
+                "(fp8_paged_mqa_logits, named fp8_fp4_paged_mqa_logits in the vLLM "
+                "fork), reading paged FP8 keys."
             ),
+            url="https://github.com/deepseek-ai/DeepGEMM",
         ),
     )
 )

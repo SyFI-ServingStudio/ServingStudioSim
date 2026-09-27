@@ -1,4 +1,4 @@
-"""DeepSeek routed-expert BF16 top-k reduction."""
+"""Routed-expert BF16 top-k reduction."""
 
 from __future__ import annotations
 
@@ -30,13 +30,14 @@ DOC = KernelDoc(
     title="MoE expert sum",
     summary="Sum the routed expert output rows for each token.",
     description=(
-        "DeepSeek V4's routed experts leave top_k output rows per token; this "
+        "Routed experts leave top_k output rows per token; this "
         "step sums them into one hidden_dim-wide row. vLLM's moe_sum has "
         "dedicated kernels only for small top_k in the measured build, so top_k"
         " = 6 falls back to torch's sum over the expert dimension. The expert "
         "rows are random bf16 values."
     ),
     category="MoE",
+    subcategory="Routing and combine",
     formula=(
         "output[token, h] = Σₖ expert_output[token, k, h]",
         "TFLOPS = num_tokens · hidden_dim · (top_k − 1) / time",

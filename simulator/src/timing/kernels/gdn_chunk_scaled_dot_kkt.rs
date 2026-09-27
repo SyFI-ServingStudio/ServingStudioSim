@@ -1,4 +1,4 @@
-//! Qwen Gated DeltaNet chunk-local scaled-dot KKT kernel.
+//! Gated DeltaNet chunk-local scaled-dot KKT kernel.
 //!
 //! Public inputs remain the physical `(num_tokens, num_chunks)` caller shape,
 //! while the cache projects them to `(C, D=T/C)`: launch chunks and average

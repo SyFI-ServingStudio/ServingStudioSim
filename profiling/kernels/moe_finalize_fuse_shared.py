@@ -37,6 +37,7 @@ DOC = KernelDoc(
         "same pass. Expert rows, permutation and weights are random."
     ),
     category="MoE",
+    subcategory="Routing and combine",
     formula=(
         "output[token, h] = Σₖ weight[token, k] · expert_row[token, k, h] "
         "+ shared[token, h] when enabled",

@@ -1,4 +1,4 @@
-//! Qwen Gated DeltaNet chunk-local triangular solve kernel.
+//! Gated DeltaNet chunk-local triangular solve kernel.
 //!
 //! `max_chunk_tokens` is deliberately static configuration identity: it changes
 //! which chunk occupancies are valid, while runtime callers still provide only

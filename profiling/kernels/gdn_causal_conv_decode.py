@@ -1,4 +1,4 @@
-"""Qwen GDN causal-convolution decode kernel kind.
+"""GDN causal-convolution decode kernel kind.
 
 The initial ``torch`` backend measures the complete multi-launch semantic
 reference. It is a correctness/performance baseline, not the production fused
@@ -40,7 +40,7 @@ DOC = KernelDoc(
         "updating the convolution state."
     ),
     description=(
-        "In Qwen3.6's Gated DeltaNet layers, decode runs a short depthwise "
+        "In Gated DeltaNet layers, decode runs a short depthwise "
         "causal convolution over each channel: the request's last kernel_size −"
         " 1 samples plus the new token, weighted by that channel's filter, "
         "summed in FP32, then SiLU. The new token is shifted into the "

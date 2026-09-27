@@ -1,4 +1,4 @@
-//! Qwen Gated DeltaNet fused chunk-output kernel.
+//! Gated DeltaNet fused chunk-output kernel.
 //!
 //! The public input retains physical `(T, C)`, while the cache projects to
 //! `(C, D=T/C)`. `C` controls the launch count, and `D` captures the measured

@@ -1,4 +1,4 @@
-"""DeepSeek fused MHC post/pre block with fused RMSNorm."""
+"""Fused mHC post/pre block with fused RMSNorm."""
 
 from profiling.db.args import DType
 from profiling.db.doc import CUPTI_METHOD, BackendDoc, KernelDoc
@@ -21,7 +21,7 @@ DOC = KernelDoc(
         "next block's mixing weights and normalized input, in one call."
     ),
     description=(
-        "Between DeepSeek V4 blocks, vLLM fuses two mHC steps into one TileLang"
+        "Between consecutive blocks, vLLM fuses two mHC steps into one TileLang"
         " call. The post step mixes the finished block's output x into the "
         "residual streams with the previous post and comb weights; the pre step"
         " then derives new mixing weights from the updated streams and forms "
@@ -29,6 +29,7 @@ DOC = KernelDoc(
         "streams of 4,096 features and random activations."
     ),
     category="Normalization",
+    subcategory="Hyper-connections",
     formula=(
         "streamⱼ ← Σᵢ combᵢⱼ · streamᵢ + postⱼ · x",
         "then the mhc_pre_rms_norm computation on the updated streams: new (post, comb, input)",

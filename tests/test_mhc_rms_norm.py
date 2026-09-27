@@ -5,10 +5,10 @@ import math
 import pytest
 
 from profiling.runners.exceptions import ProfilerNotImplemented
-from profiling.runners.mhc import deepseek_v4_terminal_mhc_head_vllm_tilelang as head
 from profiling.runners.mhc import mhc_fused_post_pre_rms_norm_vllm_tilelang as fused
 from profiling.runners.mhc import mhc_pre_rms_norm_vllm_tilelang as pre
-from profiling.runners.mhc._deepseek_v4 import validate_args
+from profiling.runners.mhc import mhc_terminal_head_vllm_tilelang as head
+from profiling.runners.mhc._common import validate_args
 
 
 @pytest.mark.parametrize(

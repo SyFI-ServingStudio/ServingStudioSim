@@ -1,4 +1,4 @@
-"""Qwen Gated DeltaNet recurrent-decode kernel kind.
+"""Gated DeltaNet recurrent-decode kernel kind.
 
 The initial ``torch`` backend measures the complete multi-launch semantic
 reference. It is a correctness/performance baseline, not the production fused
@@ -39,7 +39,7 @@ DOC = KernelDoc(
     title="Recurrent decode",
     summary="Update the gated delta-rule state and read one output token per request.",
     description=(
-        "The core of Qwen3.6's Gated DeltaNet decode. Query and key heads are "
+        "The core of Gated DeltaNet decode. Query and key heads are "
         "L2-normalized and repeated to match the value heads. For each value "
         "head, a decay gate shrinks the matrix state, a delta-rule update "
         "writes the new key-value pair with strength beta, and the query reads "

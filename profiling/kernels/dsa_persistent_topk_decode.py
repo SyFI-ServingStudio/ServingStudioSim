@@ -35,34 +35,41 @@ DOC = KernelDoc(
     title="Decode indexer top-k",
     summary="Select request-local token positions from indexer logits for each DSA decode query.",
     description=(
-        "In decode, GLM-5.2's DSA indexer keeps the top_k highest-scoring "
-        "positions of each query row; sparse MLA attention then reads only "
-        "those. Each request has next_n rows whose valid lengths run from "
-        "context_len − next_n + 1 to context_len. A row no longer than top_k "
-        "returns its positions in order, padded with -1. The logits are FP32 in"
-        " rows padded to logits_row_stride, and every row holds the same "
-        "increasing sequence."
+        "In decode, the DSA indexer keeps the top_k highest-scoring positions "
+        "of each query row; sparse MLA attention then reads only those. Each "
+        "request has next_n rows. With context_mode uniform, a request's rows "
+        "have valid lengths context_len − next_n + 1 to context_len; with "
+        "max_ragged, next_n is 1 and request b has max(0, context_len − b) "
+        "valid logits. A row no longer than top_k yields only its own "
+        "positions. The logits are FP32 in rows padded to logits_row_stride; "
+        "uniform rows all hold the same increasing sequence, max_ragged rows "
+        "one seeded random template."
     ),
     category="Attention",
     subcategory="DSA",
     formula=(
-        "length[j] = context_len − next_n + 1 + (j mod next_n)",
+        "uniform: length[j] = context_len − next_n + 1 + (j mod next_n); "
+        "max_ragged: length[b] = max(0, context_len − b)",
         "output[j] = top_k positions from logits[j, :length[j]], or natural positions "
         "when length[j] ≤ top_k",
-        "logical bytes = 4·batch_size·next_n·[(2·context_len − next_n + 1)/2 + 1 + top_k]",
+        "rows = batch_size · next_n; logical bytes = 4 · Σ_j length[j] + 4 · rows "
+        "+ 4 · rows · top_k",
         "GB/s = logical bytes / time",
     ),
     default_metric="memory_bandwidth_gbps",
     method=(
         "torch is timed with CUDA events: five warm-up calls, then a loop of "
-        "back-to-back calls, taking the median of three runs. vllm_cuda uses "
-        "CUPTI kernel time with the L2 cache flushed before each call and "
-        "counts every launch, the workspace memset and the persistent kernel. "
-        "Operand construction and the output checks run before timing."
+        "back-to-back calls, taking the median of three runs. vllm_cuda and "
+        "vllm_fork_cuda use CUPTI kernel time with the L2 cache flushed before "
+        "each call and count every launch of the call, the workspace memset and"
+        " the persistent kernel. Operand construction and the output checks "
+        "run before timing."
     ),
     caveats=(
-        "The increasing test logits make the selection predictable; they do not"
-        " follow a live indexer's score distribution.",
+        "Neither the increasing uniform logits nor the random max_ragged "
+        "template follows a live indexer's score distribution.",
+        "max_ragged rows are measured only with next_n = 1 and top_k = 512, by "
+        "vllm_fork_cuda on H200; uniform rows only with top_k = 2048.",
         "On B200 the check before timing verifies that long-row selections are "
         "in range and unique, but does not compare them with the reference.",
         "GB/s counts the valid FP32 logits, one int32 length and top_k int32 "
@@ -117,6 +124,35 @@ register(
                 "vLLM's persistent_topk: the vLLM build's op on B200, and a corrected "
                 "build of the vLLM v0.23 kernel on H200."
             ),
+        ),
+    )
+)
+
+
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="vllm_fork_cuda",
+        supports=BackendSupport(
+            compute=frozenset({DType.FP32}),
+            gpus=frozenset({"NVIDIA H200"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.attention.dsa_persistent_topk_decode_fork",
+            function_name="profile_dsa_persistent_topk_decode_vllm_fork_cuda",
+        ),
+        table_name=KIND,
+        args_schema=DsaPersistentTopkDecodeArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="vllm_env",
+        doc=BackendDoc(
+            summary=(
+                "persistent_topk as built in the pinned vLLM fork: one persistent "
+                "kernel picks a histogram, medium or multi-CTA radix path by row "
+                "length, with a filtered top-k kernel above batch 32."
+            ),
+            url="https://github.com/vllm-project/vllm/blob/main/csrc/libtorch_stable/persistent_topk.cuh",
         ),
     )
 )

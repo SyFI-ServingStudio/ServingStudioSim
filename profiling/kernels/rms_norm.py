@@ -55,6 +55,7 @@ DOC = KernelDoc(
         "of hidden features; input and weight are random normal and ε is 1e-6."
     ),
     category="Normalization",
+    subcategory="RMSNorm",
     formula=(
         "y = x / √(mean(x²) + 1e-6) · weight, per token",
         "TFLOPS = 5·m·hidden / time",

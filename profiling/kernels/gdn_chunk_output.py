@@ -1,4 +1,4 @@
-"""Qwen GDN fused chunk-output kernel kind.
+"""GDN fused chunk-output kernel kind.
 
 The Torch backend is a multi-launch semantic baseline. Production simulation
 must select the fused vLLM Triton backend.

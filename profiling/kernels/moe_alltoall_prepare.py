@@ -74,7 +74,7 @@ DOC = KernelDoc(
         "Ten eager calls and two replays warm up first. Rank 0's time is kept."
     ),
     caveats=(
-        "Uniform routing reads low: the runner's notes record a skewed GLM-5.2 "
+        "Uniform routing reads low: the runner's notes record a real skewed "
         "layer at 8k tokens taking about 9% longer.",
         "GB/s counts only the expert-ID table read, 4 bytes per ID; the time is "
         "the number to compare.",

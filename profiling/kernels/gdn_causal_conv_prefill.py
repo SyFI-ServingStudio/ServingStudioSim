@@ -1,4 +1,4 @@
-"""Qwen GDN causal-convolution prefill kernel kind.
+"""GDN causal-convolution prefill kernel kind.
 
 The initial ``torch`` backend measures the complete multi-launch semantic
 reference. It is a correctness/performance baseline, not the production fused
@@ -41,7 +41,7 @@ DOC = KernelDoc(
         "their final input samples as state."
     ),
     description=(
-        "In Qwen3.6's Gated DeltaNet prefill, each new sequence runs a "
+        "In Gated DeltaNet prefill, each new sequence runs a "
         "depthwise causal convolution from a zero history: every channel has "
         "its own kernel_size-wide filter, followed by SiLU. The sequence's last"
         " kernel_size − 1 input samples, zero-padded on the left if it is "

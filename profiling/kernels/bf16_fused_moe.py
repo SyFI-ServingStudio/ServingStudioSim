@@ -52,14 +52,15 @@ DOC = KernelDoc(
     title="BF16 fused MoE",
     summary="Route tokens through BF16 experts and combine their gated MLP outputs.",
     description=(
-        "The MoE of GLM-5.2's MTP draft layer runs its routed experts as this one "
-        "FlashInfer call: routing, the gate-up projection, SwiGLU, the down "
+        "An MoE layer runs its routed experts as this one FlashInfer call: "
+        "routing, the gate-up projection, SwiGLU, the down "
         "projection and the weighted combine. per_expert_batches gives the tokens "
         "routed to every expert across all GPUs, and the first num_local_experts "
         "are this GPU's. The router logits are built so that routing selects "
         "exactly those counts."
     ),
     category="MoE",
+    subcategory="Expert compute",
     formula=(
         "local_rows = sum(per_expert_batches[:num_local_experts])",
         "active_experts = count(per_expert_batches[:num_local_experts] > 0)",

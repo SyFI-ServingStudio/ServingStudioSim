@@ -37,6 +37,7 @@ DOC = KernelDoc(
         "the num_tokens · top_k routes evenly over the experts."
     ),
     category="MoE",
+    subcategory="Routing and combine",
     formula=(
         "routes = num_tokens · top_k; padded_routes = Σₑ block_size · ⌈routesₑ / block_size⌉",
         "GB/s = 4·(routes + padded_routes + padded_routes/block_size + 1) / time",

@@ -47,6 +47,7 @@ DOC = KernelDoc(
         "grouped by local expert, as the upstream permutation leaves them."
     ),
     category="MoE",
+    subcategory="Routing and combine",
     formula=(
         "output[token, h] = Σₖ local_scale[token, k] · expert_row[token, k, h]",
         "TFLOPS = 2·local_routed_token_count·hidden_size / time",

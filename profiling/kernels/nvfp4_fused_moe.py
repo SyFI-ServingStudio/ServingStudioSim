@@ -61,7 +61,7 @@ DOC = KernelDoc(
     title="NVFP4 fused MoE",
     summary="Route NVFP4 tokens through packed expert weights and produce their MoE outputs.",
     description=(
-        "GLM-5.2's routed MoE runs as this one FlashInfer call on hidden states"
+        "A routed MoE layer runs as this one FlashInfer call on hidden states"
         " already quantized to NVFP4: routing, the gate-up projection, SwiGLU "
         "and the down projection. per_expert_batches gives the tokens routed to"
         " every expert across all GPUs, and the first num_local_experts are "
@@ -70,6 +70,7 @@ DOC = KernelDoc(
         "moe_finalize_fuse_shared."
     ),
     category="MoE",
+    subcategory="Expert compute",
     formula=(
         "local_rows = sum(per_expert_batches[:num_local_experts])",
         "active_experts = count(per_expert_batches[:num_local_experts] > 0)",

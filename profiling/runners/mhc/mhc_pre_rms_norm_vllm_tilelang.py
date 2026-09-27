@@ -8,7 +8,7 @@ from profiling.profilers.energy import Energy
 from profiling.profilers.timer import Timer
 from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
-from profiling.runners.mhc._deepseek_v4 import (
+from profiling.runners.mhc._common import (
     HC_EPS,
     POST_MULTIPLIER,
     RMS_EPS,
@@ -60,9 +60,7 @@ def _logical_bytes(num_tokens: int) -> int:
     )
 
 
-def _validate_args(
-    num_tokens: int, hidden_size: int, hc_mult: int, hidden_dtype: DType | str
-):
+def _validate_args(num_tokens: int, hidden_size: int, hc_mult: int, hidden_dtype: DType | str):
     return validate_args(_KIND, num_tokens, hidden_size, hc_mult, hidden_dtype)
 
 

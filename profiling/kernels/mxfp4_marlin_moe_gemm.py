@@ -40,7 +40,7 @@ DOC = KernelDoc(
     title="MXFP4 Marlin MoE GEMM",
     summary="Multiply routed BF16 activations by packed MXFP4 expert weights in one Marlin launch.",
     description=(
-        "DeepSeek V4's routed experts run both expert projections as this "
+        "Routed experts run both expert projections as this "
         "Marlin GEMM on MXFP4 weights. The first projection (FC1) reads each "
         "token for its six expert selections and does not apply router weights;"
         " the second (FC2) reads one row per selection and multiplies by the "
@@ -48,6 +48,7 @@ DOC = KernelDoc(
         " blocks before timing."
     ),
     category="MoE",
+    subcategory="Expert compute",
     formula=(
         "local_rows = sum(per_group_batches)",
         "active_experts = count(per_group_batches > 0)",
@@ -67,8 +68,9 @@ DOC = KernelDoc(
         "TFLOPS counts only routed rows, not work on padded expert blocks. GB/s "
         "counts logical BF16 activations and outputs, packed weights and scales, "
         "and router weights only when applied.",
-        "This backend accepts only the two DeepSeek V4 projection shapes with "
-        "64 local experts on H200.",
+        "This backend accepts only two projection shapes, with 64 local experts "
+        "on H200: FC1 with n = k = 4096 and input_top_k = 6, and FC2 with "
+        "n = 4096, k = 2048 and input_top_k = 1.",
     ),
     # The measured vLLM operation has no separate PyTorch reference module.
     reference=None,

@@ -1,4 +1,4 @@
-//! Qwen Gated DeltaNet chunk-local WY recomputation kernel.
+//! Gated DeltaNet chunk-local WY recomputation kernel.
 //!
 //! Public inputs remain the physical `(num_tokens, num_chunks)` caller shape,
 //! while the cache projects them to `(C, D=T/C)`: launched chunks and average

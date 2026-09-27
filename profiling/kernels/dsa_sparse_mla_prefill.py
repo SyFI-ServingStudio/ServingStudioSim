@@ -1,4 +1,4 @@
-"""GLM-5.2 varlen sparse-MLA prefill over one request batch."""
+"""Varlen sparse-MLA prefill over one request batch."""
 
 from __future__ import annotations
 
@@ -42,7 +42,7 @@ DOC = KernelDoc(
     title="Sparse MLA prefill",
     summary="Attend to selected compressed KV tokens for a batch of prefill queries.",
     description=(
-        "GLM-5.2's sparse MLA attention for a prefill batch on B200, where "
+        "Sparse MLA attention for a prefill batch on B200, where "
         "requests differ in new-query count and context length. Each "
         "query_context_pairs entry gives one request's query count and final "
         "context length; its query rows are the last positions of that context,"

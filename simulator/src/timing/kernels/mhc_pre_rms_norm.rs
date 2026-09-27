@@ -1,4 +1,4 @@
-//! DeepSeek MHC pre block with fused RMSNorm.
+//! mHC pre block with fused RMSNorm.
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::CacheKind;

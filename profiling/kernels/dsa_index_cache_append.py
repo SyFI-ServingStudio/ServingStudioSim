@@ -34,7 +34,7 @@ DOC = KernelDoc(
     title="Indexer key cache append",
     summary="Quantize new DSA index keys and write them into a paged FP8 cache.",
     description=(
-        "GLM-5.2's DSA indexer stores each new index key in a paged FP8 cache "
+        "The DSA indexer stores each new index key in a paged FP8 cache "
         "for later scoring. Within a page, keys and their scales sit in "
         "separate planes, and a slot mapping scatters tokens across pages. "
         "torch and vllm_cuda quantize BF16 keys as given; SGLang's fused call "
