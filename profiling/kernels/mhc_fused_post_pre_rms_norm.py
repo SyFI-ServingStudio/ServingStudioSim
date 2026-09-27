@@ -43,7 +43,9 @@ DOC = KernelDoc(
     caveats=(
         "Only hidden_size = 4096, hc_mult = 4 in bf16 on H200 is measured.",
         "The previous post and comb weights come from the pre step on the same random streams.",
-        "TFLOPS and GB/s are not computed.",
+        "TFLOPS is not computed. GB/s counts the layer output, streams, "
+        "previous mixes and weights read once and the updated streams, next "
+        "mixes and next block input written once.",
     ),
     # The check composes PyTorch post-mix and pre-mix; no separate whole-call reference exists.
     reference=None,

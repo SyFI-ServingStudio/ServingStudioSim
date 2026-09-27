@@ -15,9 +15,14 @@ from profiling.runners.mhc._deepseek_v4 import (
     SINKHORN_ITERATIONS,
     CommonInputs,
     assert_outputs_close,
+    bandwidth_gbps,
+    hidden_bytes,
+    mix_bytes,
+    pre_weight_bytes,
     prepare_common,
     reference_pre,
     require_h200,
+    residual_bytes,
     validate_args,
 )
 
@@ -43,6 +48,16 @@ class _Launch:
             norm_weight=self.inputs.norm_weight,
             norm_eps=RMS_EPS,
         )
+
+
+def _logical_bytes(num_tokens: int) -> int:
+    """Read the streams and weights once; write the mixes and the block input."""
+    return (
+        residual_bytes(num_tokens)
+        + pre_weight_bytes()
+        + mix_bytes(num_tokens)
+        + hidden_bytes(num_tokens)
+    )
 
 
 def _validate_args(
@@ -84,7 +99,7 @@ def profile_mhc_pre_rms_norm_vllm_tilelang(
     return ComputeMetrics(
         time_ms=float(time_ms),
         tflops=0.0,
-        memory_bandwidth_gbps=0.0,
+        memory_bandwidth_gbps=bandwidth_gbps(_logical_bytes(shape.num_tokens), time_ms),
         energy_j=float(energy_j),
     )
 

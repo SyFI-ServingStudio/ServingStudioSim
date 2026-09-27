@@ -55,7 +55,8 @@ DOC = KernelDoc(
     ),
     caveats=(
         "Only hidden_size = 4096, hc_mult = 4 in bf16 on H200 is measured.",
-        "TFLOPS and GB/s are not computed.",
+        "TFLOPS is not computed. GB/s counts the streams and weights read "
+        "once and the mixes and block input written once.",
     ),
     reference="profiling.runners.mhc._deepseek_v4",
 )

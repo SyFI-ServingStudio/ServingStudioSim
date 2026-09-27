@@ -12,9 +12,14 @@ from profiling.runners.mhc._deepseek_v4 import (
     HC_EPS,
     RMS_EPS,
     CommonInputs,
+    bandwidth_gbps,
+    head_weight_bytes,
+    hidden_bytes,
+    mix_bytes,
     prepare_common,
     reference_pre,
     require_h200,
+    residual_bytes,
     validate_args,
 )
 
@@ -49,6 +54,20 @@ class _Launch:
             HC_EPS,
         )
         return self.norm(hidden)
+
+
+def _logical_bytes(num_tokens: int) -> int:
+    """Read the layer output, the streams, the mixes and the head weights once;
+    write the multi-token prediction buffer and the normalized hidden state.
+    The post-block result between launches is internal and not counted."""
+    return (
+        hidden_bytes(num_tokens)
+        + residual_bytes(num_tokens)
+        + mix_bytes(num_tokens)
+        + head_weight_bytes()
+        + residual_bytes(num_tokens)
+        + hidden_bytes(num_tokens)
+    )
 
 
 def profile_deepseek_v4_terminal_mhc_head_vllm_tilelang(
@@ -125,7 +144,7 @@ def profile_deepseek_v4_terminal_mhc_head_vllm_tilelang(
     return ComputeMetrics(
         time_ms=float(time_ms),
         tflops=0.0,
-        memory_bandwidth_gbps=0.0,
+        memory_bandwidth_gbps=bandwidth_gbps(_logical_bytes(shape.num_tokens), time_ms),
         energy_j=float(energy_j),
     )
 

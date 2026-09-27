@@ -57,6 +57,9 @@ DOC = KernelDoc(
         "The copy into the multi-token prediction buffer is always included; "
         "serving copies only when that buffer exists.",
         "The final RMSNorm weight is all ones.",
+        "TFLOPS is not computed. GB/s counts the external inputs read once and "
+        "the prediction buffer and output written once; the post-block result "
+        "passed between launches is not counted.",
     ),
     # The PyTorch correctness calculation is local to the measured runner.
     reference=None,

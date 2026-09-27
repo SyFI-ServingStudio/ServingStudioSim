@@ -13,6 +13,10 @@ RMS_EPS = 1e-6
 HC_EPS = 1e-6
 POST_MULTIPLIER = 2.0
 SINKHORN_ITERATIONS = 20
+MIX_WIDTH = HC_MULT * (HC_MULT + 2)
+
+_BF16_BYTES = 2
+_FP32_BYTES = 4
 
 
 @dataclass(frozen=True)
@@ -57,15 +61,14 @@ def require_h200(torch: Any, kind: str) -> None:
 
 def prepare_common(torch: Any, shape: Shape) -> CommonInputs:
     generator = torch.Generator().manual_seed(41)
-    mix_width = HC_MULT * (HC_MULT + 2)
     residual = torch.randn(
         (shape.num_tokens, HC_MULT, HIDDEN_SIZE),
         dtype=torch.bfloat16,
         generator=generator,
     ).cuda()
-    fn = (torch.randn((mix_width, HC_MULT * HIDDEN_SIZE), generator=generator) * 0.01).cuda()
+    fn = (torch.randn((MIX_WIDTH, HC_MULT * HIDDEN_SIZE), generator=generator) * 0.01).cuda()
     hc_scale = torch.tensor([0.5, 0.5, 0.5], dtype=torch.float32).cuda()
-    hc_base = torch.zeros(mix_width, dtype=torch.float32).cuda()
+    hc_base = torch.zeros(MIX_WIDTH, dtype=torch.float32).cuda()
     norm_weight = torch.ones(HIDDEN_SIZE, dtype=torch.bfloat16).cuda()
     return CommonInputs(residual, fn, hc_scale, hc_base, norm_weight)
 
@@ -93,6 +96,37 @@ def reference_pre(torch: Any, inputs: CommonInputs) -> tuple[Any, Any, Any]:
     return post_mix, comb_mix, normalized
 
 
+def residual_bytes(num_tokens: int) -> int:
+    """The bf16 residual streams, (num_tokens, HC_MULT, HIDDEN_SIZE)."""
+    return _BF16_BYTES * num_tokens * HC_MULT * HIDDEN_SIZE
+
+
+def hidden_bytes(num_tokens: int) -> int:
+    """One bf16 hidden state per token, (num_tokens, HIDDEN_SIZE)."""
+    return _BF16_BYTES * num_tokens * HIDDEN_SIZE
+
+
+def mix_bytes(num_tokens: int) -> int:
+    """The fp32 post-mix (num_tokens, HC_MULT, 1) and comb-mix (num_tokens, HC_MULT, HC_MULT)."""
+    return _FP32_BYTES * num_tokens * (HC_MULT + HC_MULT * HC_MULT)
+
+
+def pre_weight_bytes() -> int:
+    """fn, hc_scale, hc_base and the RMSNorm weight, read once per call."""
+    fn = MIX_WIDTH * HC_MULT * HIDDEN_SIZE
+    return _FP32_BYTES * (fn + 3 + MIX_WIDTH) + _BF16_BYTES * HIDDEN_SIZE
+
+
+def head_weight_bytes() -> int:
+    """The terminal head's fn rows, scale and base, and the final RMSNorm weight."""
+    head_fn = HC_MULT * HC_MULT * HIDDEN_SIZE
+    return _FP32_BYTES * (head_fn + 1 + HC_MULT) + _BF16_BYTES * HIDDEN_SIZE
+
+
+def bandwidth_gbps(logical_bytes: int, time_ms: float) -> float:
+    return logical_bytes / (time_ms / 1000.0) / 1e9
+
+
 def assert_outputs_close(torch: Any, actual: tuple[Any, ...], expected: tuple[Any, ...]) -> None:
     if len(actual) != len(expected):
         raise AssertionError(f"expected {len(expected)} MHC outputs, got {len(actual)}")
@@ -105,13 +139,20 @@ __all__ = [
     "HC_EPS",
     "HC_MULT",
     "HIDDEN_SIZE",
+    "MIX_WIDTH",
     "POST_MULTIPLIER",
     "RMS_EPS",
     "SINKHORN_ITERATIONS",
     "Shape",
     "assert_outputs_close",
+    "bandwidth_gbps",
+    "head_weight_bytes",
+    "hidden_bytes",
+    "mix_bytes",
+    "pre_weight_bytes",
     "prepare_common",
     "reference_pre",
     "require_h200",
+    "residual_bytes",
     "validate_args",
 ]
