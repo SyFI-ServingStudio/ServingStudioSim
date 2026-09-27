@@ -7,10 +7,14 @@ Every field comes from a source that lives with the code; nothing here guesses:
   registry (argument order, backends, supported dtypes and GPUs, metric family,
   subprocess environment);
 - the models that run a kind, from the cost tree of every ``#[supported]`` arch
-  deployment on its declared GPU;
+  deployment on its declared GPU, and from every registered kernel config's uses
+  (the arch block of the preset, prediction or supported row that built it);
 - which arguments a model sweeps and which it fixes, and the profile.db columns
   each model's shape reads, from the kernel's own ``enumerate`` applied to those
-  cost tree leaves;
+  cost tree leaves and from the registered grids;
+- a deployment's model and label from its arch block: the model config's file
+  stem (as ``#[supported]`` rows spell it) named by ``model/catalog.yaml``, and
+  the arch params the arch's ``#[supported]`` rows name (``list-params``);
 - a row's precision, from the column the Rust kernel names as its compute dtype;
 - GPU peaks from ``gpu/spec.json`` and model names from ``model/catalog.yaml``;
 - measurements from profile.db, and the kernel configs that read them from its
@@ -21,6 +25,7 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 import subprocess
 import typing
 from dataclasses import asdict, fields
@@ -29,10 +34,21 @@ from typing import Any
 
 import yaml
 
+from launcher.schema.validate import supported_value
 from profiling.db.args import DType
 from profiling.db.doc import CATEGORIES, SUBCATEGORIES, arg_docs, kernel_doc
 from profiling.db.doc import METRICS as METRIC_DOCS
-from profiling.db.kernel_config import RegisteredConfig, cell_row_ids, registered_configs
+from profiling.db.kernel_config import (
+    CONFIG_TABLE,
+    SOURCE_TABLE,
+    USE_TABLE,
+    ConfigUse,
+    RegisteredConfig,
+    canonical_json,
+    cell_keys,
+    pack_cells,
+    registered_configs,
+)
 from profiling.db.registry import MetricFamily, iter_kernel_profiler_specs
 from profiling.db.table import STANDARD_COLUMNS, Table
 from profiling.gpu_catalog import GpuSpecResolution, resolve_gpu_spec
@@ -49,6 +65,8 @@ METRICS = {
     MetricFamily.COMPUTE: [f.name for f in fields(ComputeMetrics)],
     MetricFamily.COMM: [f.name for f in fields(CommMetrics)],
 }
+# Bound values per statement when matching grid cells to rows; SQLite allows 32766.
+_SQL_VARIABLES = 30000
 
 
 class UnknownKind(LookupError):
@@ -104,6 +122,59 @@ def _git_commit() -> str | None:
         ["git", "rev-parse", "HEAD"], cwd=REPO_ROOT, capture_output=True, text=True, check=False
     )
     return result.stdout.strip() or None
+
+
+def _source_via(source: dict) -> dict:
+    """What built a registered config, from the source forms the launcher writes
+    (``launcher/kernel_configs.py``): a ``#[supported]`` deployment, a
+    timing-predict config, a run of an alignment pack's cases, or a preset run."""
+
+    if "supported" in source:
+        return {"type": "supported", "ref": None}
+    if "timing_predict" in source:
+        return {"type": "timing_predict", "ref": source["timing_predict"]}
+    if source.get("alignment"):
+        alignment = source["alignment"]
+        return {
+            "type": "alignment",
+            "ref": alignment["pack"],
+            "variant": alignment.get("variant"),
+            "cases": len(alignment.get("cases") or ()),
+        }
+    return {"type": "preset", "ref": source.get("preset")}
+
+
+def _source_archs(source: dict) -> list[tuple[str, dict]]:
+    """``(gpu, arch block)`` of every arch a source names. A run's
+    deployment-level source (pool ``""``, AFD's attention-to-FFN transfer)
+    names none."""
+
+    if "supported" in source:
+        row = source["supported"]
+        return [(row["gpu"], {"type": row["arch"], **row["params"]})]
+    if "timing_predict" in source:
+        return [(source["gpu"], arch) for arch in source["arch"].values()]
+    return [(group["gpu"], group["arch"]) for group in source.get("groups") or ()]
+
+
+def _model_config(arch: dict) -> str | None:
+    """The arch's model config as ``#[supported]`` rows and ``model/catalog.yaml``
+    spell it: the file stem of a ``model/config/`` file, else the value as given."""
+
+    value = arch.get("model_config")
+    return supported_value("model_config", value) if value is not None else None
+
+
+def _axes(config: RegisteredConfig) -> list[list[float]]:
+    return [list(axis) for axis in config.grid.axes]
+
+
+def _config_args(identity: dict) -> tuple[dict, list[str]]:
+    """The identity's scalar fields, and the names of the structured ones (an
+    expert-demand table can run to megabytes); ``/configs/{hash}`` has them whole."""
+
+    scalar = {k: v for k, v in identity.items() if not isinstance(v, (dict, list))}
+    return scalar, [k for k in identity if k not in scalar]
 
 
 class KernelLibrary:
@@ -178,68 +249,214 @@ class KernelLibrary:
                 for slot in section["slots"]:
                     yield build, section, slot
 
-    def _model_name(self, model_config: str) -> str:
-        return (self.models.get(model_config) or {}).get("name", model_config)
+    # -- models and deployments ------------------------------------------------------
+
+    def _arch_provider(self, tag: str | None, contract: str | None = None) -> dict:
+        """The arch tag's ``list-params`` entry: ``params`` and ``supported`` rows.
+        ``contract`` (``iter_wise``, ``layer_wise_attn``, ...) narrows the search
+        when the caller knows it; a registry source does not say."""
+
+        contracts = self.sources.deployment_schema()["providers"]["arch"]
+        for name, providers in contracts.items():
+            if contract in (None, name) and tag in providers:
+                return providers[tag]
+        return {}
+
+    def _deployment(self, gpu: str, arch: dict, contract: str | None = None) -> dict:
+        """One arch block on one GPU as the site names it: the model it runs and
+        a label of the arch and its deployment params.
+
+        The params are the names the arch's ``#[supported]`` rows give besides
+        ``gpu`` and ``model_config`` (the sizes a supported deployment is chosen
+        by). An arch without rows yet falls back to its own params that change
+        its kernel configs (``affects_cache``) and take a number, a bool or one
+        of listed choices; free-form strings such as file paths stay out of the
+        label. A param the block leaves out takes its schema default."""
+
+        return self.sources.cached_by_binary(
+            ("deployment", canonical_json([gpu, arch, contract])),
+            lambda: self._label(gpu, arch, contract),
+        )
+
+    def _label(self, gpu: str, arch: dict, contract: str | None) -> dict:
+        tag = arch.get("type")
+        provider = self._arch_provider(tag, contract)
+        own = provider.get("params", [])
+        rows = provider.get("supported", [])
+        if rows:
+            names = [n for n in dict.fromkeys(n for row in rows for n in row)]
+            names = [n for n in names if n not in ("gpu", "model_config")]
+        else:
+            names = [
+                p["name"]
+                for p in own
+                if p.get("affects_cache") and (p["type"] in ("int", "bool") or p.get("choices"))
+            ]
+        schema = self.sources.deployment_schema()
+        defaults = {p["name"]: p.get("default") for p in (*schema["arch_common"], *own)}
+        params = {}
+        for name in names:
+            value = arch.get(name, defaults.get(name))
+            if value is not None:
+                params[name] = value
+        model_config = _model_config(arch)
+        text = (json.dumps(v) if isinstance(v, bool) else str(v) for v in params.values())
+        return {
+            "arch": tag,
+            "gpu": gpu,
+            "model_config": model_config,
+            # name, family, checkpoint; null for a model not in model/catalog.yaml
+            "model": self.models.get(model_config),
+            "params": params,
+            "label": ", ".join([tag, *(f"{n} {v}" for n, v in zip(params, text))]),
+        }
+
+    def _source_deployments(self, source: dict, gpu: str) -> list[dict]:
+        """The deployments a registry source describes on ``gpu`` (the config's
+        GPU picks the group that built it)."""
+
+        return [self._deployment(g, arch) for g, arch in _source_archs(source) if g == gpu]
+
+    @staticmethod
+    def _deployment_key(deployment: dict) -> str:
+        return canonical_json([deployment[k] for k in ("arch", "gpu", "model_config", "params")])
+
+    def _model_rank(self, model_config: str | None) -> tuple[int, str]:
+        """Catalog order first, then models the catalog does not name, by stem."""
+
+        order = list(self.models)
+        stem = model_config or ""
+        return (order.index(stem) if stem in self.models else len(order), stem)
+
+    def _registry_models(self) -> dict[str, set[str]]:
+        """``{kind: model configs}`` over every registered config's uses."""
+
+        def compute() -> dict[str, set[str]]:
+            with self.sources.connect() as conn:
+                tables = {
+                    row[0]
+                    for row in conn.execute("select name from sqlite_master where type = 'table'")
+                }
+                if not {CONFIG_TABLE, SOURCE_TABLE, USE_TABLE} <= tables:
+                    return {}
+                records = conn.execute(
+                    f"""
+                    select distinct c.profile_kind, s.source from {USE_TABLE} u
+                    join {SOURCE_TABLE} s on s.source_hash = u.source_hash
+                    join {CONFIG_TABLE} c on c.kind = u.kind and c.config_hash = u.config_hash
+                        and c.gpu_name = u.gpu_name
+                    """
+                ).fetchall()
+            kinds = {spec.table_name: kind for kind, specs in self.specs.items() for spec in specs}
+            out: dict[str, set[str]] = {}
+            for table, source in records:
+                for _, arch in _source_archs(json.loads(source)):
+                    model = _model_config(arch)
+                    if model and table in kinds:
+                        out.setdefault(kinds[table], set()).add(model)
+            return out
+
+        return self.sources.cached_by_db("registry-models", compute)
+
+    def _supported_models(self) -> dict[str, set[str]]:
+        out: dict[str, set[str]] = {}
+        for build, _, slot in self._slots():
+            out.setdefault(slot["kind"], set()).add(build["params"]["model_config"])
+        return out
 
     def _used_by(self, kind: str) -> tuple[list[dict], set[str]]:
-        """The supported deployments whose cost tree holds ``kind``, each with the
-        shapes it asks for, and the columns those leaves sweep.
+        """The deployments that run ``kind``, each with the shapes it asks for, and
+        the columns those shapes sweep.
 
-        A shape is the profile.db columns its leaf fixes (``rows``'s ``fixed``,
-        without ``backend``), plus the expression and bindings behind each config
-        value. Rank copies of one leaf share name and config and are listed once.
+        Two sources: the cost tree of every ``#[supported]`` deployment, and the
+        uses of every registered kernel config (the presets, predictions and
+        supported rows that built it). A shape is the profile.db columns one
+        leaf fixes; a supported leaf adds the expression and bindings behind each
+        config value, a registered one its ``config_hash``. Rank copies of one
+        leaf share name and config and are listed once.
         """
 
-        deployments: dict[int, dict] = {}
+        deployments: dict[str, dict] = {}
         swept: set[str] = set()
+
+        def entry(deployment: dict, source: str) -> dict:
+            key = self._deployment_key(deployment)
+            if key not in deployments:
+                deployments[key] = {
+                    **deployment,
+                    "gpus_per_replica": None,
+                    "sources": set(),
+                    "shapes": {},
+                }
+            deployments[key]["sources"].add(source)
+            return deployments[key]
+
+        def add_shape(target: dict, layer: str, section: str, db: dict, **extra) -> None:
+            shape = target["shapes"].setdefault(
+                canonical_json([layer, db]),
+                {"layer": layer, "section": section, "db": db, "why": {}, "config_hash": None},
+            )
+            shape.update({k: v for k, v in extra.items() if v})
+
         for build, section, slot in self._slots():
             if slot["kind"] != kind:
                 continue
             config = slot["kernel_config"]
             report = self.sources.rows_report(kind, config)
             swept.update(report["swept"])
-            db = {k: v for k, v in report["fixed"].items() if k != "backend"}
-            deployment = deployments.get(id(build))
-            if deployment is None:
-                params = dict(build["params"])
-                model = params.pop("model_config", None)
-                deployment = deployments[id(build)] = {
-                    "arch": build["arch"],
-                    "model_config": model,
-                    # name, family, checkpoint; null for a model not in model/catalog.yaml
-                    "model": self.models.get(model),
-                    "gpu": build["gpu"],
-                    "gpus_per_replica": build["gpus_per_replica"],
-                    "parallel": params,
-                    "shapes": {},
-                }
-            deployment["shapes"].setdefault(
-                repr((slot["name"], sorted(db.items()))),
-                {
-                    "layer": slot["name"],
-                    "section": section["section"],
-                    "db": db,
-                    "why": {
-                        k: {"expression": v["expression"], "bindings": v["bindings"]}
-                        for k, v in config.items()
-                        if isinstance(v, dict) and v.get("expression")
-                    },
+            arch = {"type": build["arch"], **build["params"]}
+            deployment = self._deployment(build["gpu"], arch, build.get("contract"))
+            target = entry(deployment, "supported")
+            target["gpus_per_replica"] = build["gpus_per_replica"]
+            add_shape(
+                target,
+                slot["name"],
+                section["section"],
+                {k: v for k, v in report["fixed"].items() if k != "backend"},
+                why={
+                    k: {"expression": v["expression"], "bindings": v["bindings"]}
+                    for k, v in config.items()
+                    if isinstance(v, dict) and v.get("expression")
                 },
             )
-        out = [{**d, "shapes": list(d["shapes"].values())} for d in deployments.values()]
+
+        for summary in self._summaries(kind):
+            config = summary["config"]
+            swept.update(summary["swept"])
+            for use in config.uses:
+                via = _source_via(use.source)["type"]
+                for deployment in self._source_deployments(use.source, config.gpu_name):
+                    add_shape(
+                        entry(deployment, via),
+                        use.role,
+                        use.pool,
+                        summary["fixed"],
+                        config_hash=config.config_hash,
+                    )
+
+        out = [
+            {**d, "sources": sorted(d["sources"]), "shapes": list(d["shapes"].values())}
+            for d in deployments.values()
+        ]
+        out.sort(key=lambda d: (self._model_rank(d["model_config"]), d["gpu"], d["label"]))
         return out, swept
 
     # -- documents -----------------------------------------------------------------
 
     def catalog(self) -> dict:
-        """Every registered kind with its coverage and the models that run it."""
+        """Every registered kind with its coverage and the models that run it.
 
-        models_by_kind: dict[str, list[str]] = {}
-        for build, _, slot in self._slots():
-            names = models_by_kind.setdefault(slot["kind"], [])
-            name = self._model_name(build["params"]["model_config"])
-            if name not in names:
-                names.append(name)
+        A kind's ``used_by`` is the model configs (keys of ``models``) of every
+        supported deployment whose cost tree holds it and of every registered
+        config that reads its rows, in ``models`` order. ``models`` is
+        ``model/catalog.yaml`` in its order, then any model a kind names that
+        the catalog does not, with ``name`` null."""
+
+        models_by_kind = self._supported_models()
+        for kind, stems in self._registry_models().items():
+            models_by_kind.setdefault(kind, set()).update(stems)
+        named = set().union(*models_by_kind.values()) if models_by_kind else set()
+        stems = sorted(set(self.models) | named, key=self._model_rank)
 
         kernels = []
         gpu_rows: dict[str, int] = {}
@@ -263,7 +480,7 @@ class KernelLibrary:
                         {k: e[k] for k in ("gpu", "backend", "precision", "rows")} for e in coverage
                     ],
                     "rows": sum(e["rows"] for e in coverage),
-                    "used_by": models_by_kind.get(kind, []),
+                    "used_by": sorted(models_by_kind.get(kind, ()), key=self._model_rank),
                 }
             )
 
@@ -288,7 +505,13 @@ class KernelLibrary:
                 {"name": gpu, "rows": rows, "peaks": self._peaks(gpu, precisions)}
                 for gpu, rows in sorted(gpu_rows.items(), key=lambda item: -item[1])
             ],
-            "models": [{"model_config": stem, **entry} for stem, entry in self.models.items()],
+            "models": [
+                {
+                    "model_config": stem,
+                    **(self.models.get(stem) or {"name": None, "family": None, "checkpoint": None}),
+                }
+                for stem in stems
+            ],
             "kernels": kernels,
         }
 
@@ -321,7 +544,8 @@ class KernelLibrary:
                 {
                     "name": name,
                     "type": _arg_type(types[name]),
-                    # Unknown until a supported deployment runs the kind.
+                    # Unknown until a supported deployment or a registered config runs
+                    # the kind.
                     "role": ("sweep" if name in swept else "config") if deployments else None,
                     # The column holding the compute dtype, which picks the throughput peak.
                     "precision": name == precision,
@@ -392,6 +616,8 @@ class KernelLibrary:
             "provenance": provenance,
         }
 
+    # -- registered kernel configs --------------------------------------------------
+
     def _registered(self, kind: str, gpu: str | None = None) -> list[RegisteredConfig]:
         """The registered configs whose grids read ``kind``'s rows (every backend's
         table, though a kind's specs share one)."""
@@ -405,60 +631,153 @@ class KernelLibrary:
             ]
 
     def _cell_rows(self, kind: str, config: RegisteredConfig) -> list[dict[str, dict]]:
-        """Per cell, the row each backend measured for it: ``{backend: row}``."""
+        """Per cell, the row each backend measured for it: ``{backend: row}``.
+
+        The same match as ``kernel_config.cell_row_ids`` (in SQL, so each column's
+        declared type converts what it compares), one statement per chunk of
+        cells instead of one per cell: the cells are a ``values`` table joined to
+        the kind's rows on the config's GPU."""
 
         spec = next(s for s in self._specs(kind) if s.table_name == config.profile_kind)
-        columns = ["id", "backend", *self._metrics(kind), "is_outlier"]
+        table = Table(spec, self.sources.db_path)
+        args = list(table.args_columns)
+        keys = cell_keys(table, config.grid.cells)
+        metrics = ["backend", *self._metrics(kind), "is_outlier"]
+        out: list[dict[str, dict]] = [{} for _ in keys]
+        width = 1 + len(args)
+        chunk = max(1, (_SQL_VARIABLES - 2) // width)
+        cell_columns = _quoted(["_cell", *args])
+        # Joining through the GPU's backends lets the (gpu_name, backend, args)
+        # unique index answer each cell with one lookup per backend.
+        backends = f'b(backend) as (select distinct backend from "{table.name}" where gpu_name = ?)'
+        on = " and ".join(
+            ["t.gpu_name = ?", "t.backend = b.backend", *(f't."{a}" = c."{a}"' for a in args)]
+        )
+        select = ", ".join(f't."{m}"' for m in metrics)
         with self.sources.connect() as conn:
-            ids = cell_row_ids(
-                conn, Table(spec, self.sources.db_path), config.gpu_name, config.grid.cells
-            )
-            wanted = sorted({i for cell in ids for i in cell})
-            rows = {}
-            for start in range(0, len(wanted), 500):
-                chunk = wanted[start : start + 500]
+            for start in range(0, len(keys), chunk):
+                part = keys[start : start + chunk]
+                values = ", ".join([f"({', '.join('?' * width)})"] * len(part))
                 query = (
-                    f'select {_quoted(columns)} from "{config.profile_kind}" '
-                    f"where id in ({', '.join('?' * len(chunk))})"
+                    f"with c({cell_columns}) as (values {values}), {backends} "
+                    f'select c."_cell", {select} from c cross join b join "{table.name}" t on {on}'
                 )
-                for record in conn.execute(query, chunk):
-                    rows[record[0]] = dict(zip(columns[1:], record[1:]))
-        return [{rows[i]["backend"]: rows[i] for i in cell} for cell in ids]
+                bound = [v for i, key in enumerate(part, start) for v in (i, *key)]
+                gpu = config.gpu_name
+                for cell, *record in conn.execute(query, [*bound, gpu, gpu]):
+                    row = dict(zip(metrics, record))
+                    out[cell][row.pop("backend")] = row
+        return out
 
-    def configs(self, kind: str) -> dict:
-        """The kernel configs registered as reading ``kind``'s rows: one per
-        config and GPU, with how many of its grid cells each backend measured and
-        the deployments or predictions that use it."""
+    def _summaries(self, kind: str) -> list[dict]:
+        """Each registered config of ``kind`` with its grid's fixed and swept
+        profile.db columns and the cells each backend measured."""
 
-        def compute() -> dict:
+        def compute() -> list[dict]:
             out = []
             for config in self._registered(kind):
+                packed = pack_cells(config.grid.cells)
                 measured: dict[str, int] = {}
                 for cell in self._cell_rows(kind, config):
                     for backend in cell:
                         measured[backend] = measured.get(backend, 0) + 1
                 out.append(
                     {
-                        "config_hash": config.config_hash,
-                        "kind": config.kind,
-                        "gpu": config.gpu_name,
-                        "identity": config.identity,
-                        "cache_coords": list(config.grid.cache_coords),
-                        "shape": [len(axis) for axis in config.grid.axes],
-                        "cells": len(config.grid.cells),
-                        "infeasible": len(config.grid.infeasible),
+                        "config": config,
+                        "fixed": packed["fixed"],
+                        "swept": list(packed["swept"]),
                         "measured": measured,
-                        "uses": [asdict(use) for use in config.uses],
                     }
                 )
-            return {"kind": kind, "configs": out}
+            return out
+
+        return self.sources.cached_by_db(("summaries", kind), compute)
+
+    @staticmethod
+    def _grid(summary: dict) -> dict:
+        """What the list and the detail both say about one config's grid."""
+
+        config = summary["config"]
+        config_args, omitted = _config_args(config.identity)
+        return {
+            "config_hash": config.config_hash,
+            "kind": config.kind,
+            "gpu": config.gpu_name,
+            "cache_coords": list(config.grid.cache_coords),
+            "shape": [len(axis) for axis in config.grid.axes],
+            "cells": len(config.grid.cells),
+            "infeasible": len(config.grid.infeasible),
+            "measured": summary["measured"],
+            # profile.db args every cell shares, and the ones the cache axes move
+            "fixed": summary["fixed"],
+            "swept": summary["swept"],
+            # the Rust config's own scalar values, some of which name no DB column
+            "config_args": config_args,
+            "config_args_omitted": omitted,
+        }
+
+    def _use(self, use: ConfigUse, gpu: str) -> dict:
+        """One use of a config: what built it, and the deployment and model."""
+
+        return {
+            "pool": use.pool,
+            "role": use.role,
+            "via": _source_via(use.source),
+            "deployments": self._source_deployments(use.source, gpu),
+        }
+
+    def configs(self, kind: str) -> dict:
+        """The kernel configs registered as reading ``kind``'s rows: one per
+        config and GPU, with its fixed and swept args, how many of its grid
+        cells each backend measured, and the uses that built it.
+
+        Uses repeat their source and deployment across configs, so each use
+        points into the ``sources`` and ``deployments`` tables; the full
+        identity and source of a config are on ``/configs/{config_hash}``."""
+
+        def compute() -> dict:
+            sources: dict[str, dict] = {}
+            deployments: dict[str, dict] = {}
+            out = []
+            for summary in self._summaries(kind):
+                config = summary["config"]
+                uses = []
+                for use in config.uses:
+                    labeled = self._use(use, config.gpu_name)
+                    source = sources.setdefault(
+                        canonical_json(labeled["via"]), {"id": len(sources), **labeled["via"]}
+                    )
+                    ids = []
+                    for deployment in labeled["deployments"]:
+                        key = self._deployment_key(deployment)
+                        ids.append(
+                            deployments.setdefault(key, {"id": len(deployments), **deployment})[
+                                "id"
+                            ]
+                        )
+                    uses.append(
+                        {
+                            "pool": use.pool,
+                            "role": use.role,
+                            "source": source["id"],
+                            "deployments": ids,
+                        }
+                    )
+                out.append({**self._grid(summary), "axes": _axes(config), "uses": uses})
+            return {
+                "kind": kind,
+                "sources": list(sources.values()),
+                "deployments": list(deployments.values()),
+                "configs": out,
+            }
 
         return self.sources.cached_by_db(("configs", kind), compute)
 
     def config(self, kind: str, config_hash: str, gpu: str | None) -> dict:
         """One registered config's grid on the Rust cache axes: every cell's
         coordinates, its profile.db args, whether the kernel can run it, and the
-        metrics each backend measured there (absent where nothing was)."""
+        metrics each backend measured there (absent where nothing was); plus
+        the full identity and each use with its source, deployment and model."""
 
         matches = [c for c in self._registered(kind, gpu) if c.config_hash == config_hash]
         if not matches:
@@ -467,6 +786,11 @@ class KernelLibrary:
             gpus = sorted(c.gpu_name for c in matches)
             raise BadQuery(f"config {config_hash} is registered on {gpus}; pass gpu")
         [config] = matches
+        [summary] = [
+            s
+            for s in self._summaries(kind)
+            if (s["config"].config_hash, s["config"].gpu_name) == (config_hash, config.gpu_name)
+        ]
         grid = config.grid
         metrics = self._metrics(kind)
         points = [
@@ -487,15 +811,14 @@ class KernelLibrary:
             )
         ]
         return {
-            "config_hash": config.config_hash,
-            "kind": config.kind,
-            "gpu": config.gpu_name,
+            **self._grid(summary),
             "identity": config.identity,
-            "cache_coords": list(grid.cache_coords),
-            "axes": [list(axis) for axis in grid.axes],
+            "axes": _axes(config),
             "metrics": metrics,
             "points": points,
-            "uses": [asdict(use) for use in config.uses],
+            "uses": [
+                {"source": use.source, **self._use(use, config.gpu_name)} for use in config.uses
+            ],
         }
 
     @staticmethod

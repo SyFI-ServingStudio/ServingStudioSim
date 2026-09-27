@@ -255,7 +255,7 @@ def _check_leaves(candidate: dict, registry: Registry, *, defer_placeholders: bo
 _MODEL_CONFIG_DIR = REPO_ROOT / "model" / "config"
 
 
-def _supported_value(name: str, value: Any) -> Any:
+def supported_value(name: str, value: Any) -> Any:
     """A config value as `#[supported]` rows spell it: a `model_config` under
     `model/config/` is its file stem (`model/config/llama3_8b.json` →
     `llama3_8b`); every other value is compared as is."""
@@ -296,7 +296,7 @@ def _check_supported(config: dict, registry: Registry) -> list[str]:
                     values[name] = group.get("gpu")
                     continue
                 pdef = next((p for p in pdefs if p["name"] == name), {})
-                values[name] = _supported_value(name, arch.get(name, pdef.get("default")))
+                values[name] = supported_value(name, arch.get(name, pdef.get("default")))
             if any(_is_placeholder(v) for v in values.values()):
                 # Raw: supplied later. Expanded: the leaf walk reports the residue.
                 continue
