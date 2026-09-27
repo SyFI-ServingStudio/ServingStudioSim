@@ -180,13 +180,23 @@ def test_kernel_detail_joins_docs_roles_and_shapes(registered) -> None:
     assert kernel["method"].startswith(CUPTI_METHOD)
     deployment = kernel["used_by"][0]
     assert deployment["model"]["name"] == "Llama 3 8B"
+    # The supported row lists tp_size [1, 4]; only tp_size 4 is registered.
     assert (deployment["params"], deployment["label"]) == (
-        {"tp_size": 4},
+        {"tp_size": [4]},
         "llama3_dense_tp, tp_size 4",
     )
-    assert deployment["sources"] == ["timing_predict"]
+    assert deployment["members"] == [
+        {"params": {"tp_size": 4}, "validated": False, "validated_against": []}
+    ]
+    assert not deployment["validated"] and "sources" not in deployment
     (shape,) = deployment["shapes"]
-    assert shape == {"layer": "unified.qkv", "pool": "main", "db": QKV, "config_hash": qkv}
+    assert shape == {
+        "layer": "unified.qkv",
+        "pool": "main",
+        "db": QKV,
+        "config_hash": qkv,
+        "members": [0],
+    }
 
 
 def _nvfp4_row(backend: str) -> ProfileRow:
@@ -424,29 +434,28 @@ def test_configs_list_is_slim_and_labels_each_use(registered) -> None:
     assert config["measured"] == {"torch": 2, "torch_linear": 1}
     assert configs[gate]["measured"] == {"torch": 1}
 
-    sources = {s["id"]: s for s in document["sources"]}
+    # What registered a config (a preset or predict path) is not published.
+    assert "sources" not in document
     deployments = {d["id"]: d for d in document["deployments"]}
     [use] = config["uses"]
     assert (use["pool"], use["role"]) == ("main", "unified.qkv")
-    assert sources[use["source"]] == {
-        "id": use["source"],
-        "type": "timing_predict",
-        "ref": "presets/predict_x.json",
-    }
-    [llama] = [deployments[i] for i in use["deployments"]]
+    assert use["deployments"] == [{"id": 0, "members": [0]}]
+    llama = deployments[0]
     # The model config path is named by its stem, as #[supported] rows and the
     # catalog spell it; the label carries the params the supported rows name.
     assert (llama["model_config"], llama["model"]["name"]) == ("llama3_8b", "Llama 3 8B")
-    assert (llama["params"], llama["label"]) == ({"tp_size": 4}, "llama3_dense_tp, tp_size 4")
+    assert (llama["params"], llama["label"]) == ({"tp_size": [4]}, "llama3_dense_tp, tp_size 4")
+    assert llama["varies"] == ["tp_size"]
 
     by_role = {u["role"]: u for u in configs[gate]["uses"]}
-    [moe] = [deployments[i] for i in by_role["unified.moe.gate"]["deployments"]]
+    [asked] = by_role["unified.moe.gate"]["deployments"]
+    moe = deployments[asked["id"]]
     # No supported rows: the scalar params that change its kernel configs,
     # defaults filled in; the popularity file path stays out of the label.
     assert (moe["model_config"], moe["model"]) == ("moe_x", None)
-    assert moe["params"] == {"ep_size": 8, "mtp_mode": "off"}
+    assert (moe["params"], moe["varies"]) == ({"ep_size": 8, "mtp_mode": "off"}, [])
     assert moe["label"] == "moe_x, ep_size 8, mtp_mode off"
-    assert sources[by_role["unified.moe.gate"]["source"]]["type"] == "preset"
+    assert moe["members"] == [{"params": {}, "validated": False, "validated_against": []}]
     # The deployment-level pool names no arch, so no deployment.
     assert by_role["unified.transfer"]["deployments"] == []
 
@@ -469,9 +478,11 @@ def test_config_joins_grid_cells_to_rows(registered) -> None:
     assert set(points[0]["measured"]) == {"torch"}
     assert points[2]["measured"] == {}
     [use] = config["uses"]
-    assert use["source"] == PREDICT
-    assert use["via"]["type"] == "timing_predict"
-    assert [d["label"] for d in use["deployments"]] == ["llama3_dense_tp, tp_size 4"]
+    assert set(use) == {"pool", "role", "deployments"}
+    [asked] = use["deployments"]
+    assert [d["label"] for d in config["deployments"] if d["id"] == asked["id"]] == [
+        "llama3_dense_tp, tp_size 4"
+    ]
     assert (hashlib.sha256(path.read_bytes()).hexdigest(), path.stat().st_mtime_ns) == before
 
 
@@ -494,7 +505,6 @@ def test_registered_configs_add_models_to_catalog_and_detail(registered) -> None
     # Catalog order, then the uncatalogued model.
     assert labels == ["llama3_dense_tp, tp_size 4", "moe_x, ep_size 8, mtp_mode off"]
     moe = kernel["used_by"][-1]
-    assert moe["sources"] == ["preset"]
     [shape] = moe["shapes"]
     assert (shape["layer"], shape["pool"], shape["config_hash"]) == (
         "unified.moe.gate",
@@ -510,3 +520,114 @@ def test_config_lookup_errors(registered) -> None:
     assert client.get(f"{base}/no_such_hash").status_code == 404
     assert client.get(f"{base}/{qkv}", params={"gpu": "NVIDIA B200"}).status_code == 404
     assert client.get(f"{PREFIX}/kernels/no_such_kind/configs").status_code == 404
+
+
+def _supported(tp_size: int) -> dict:
+    """The source ``--register-supported-kernel-configs`` writes for one
+    expansion of the llama3_dense_tp row (``tp_size`` in [1, 4])."""
+
+    return {
+        "supported": {
+            "arch": "llama3_dense_tp",
+            "gpu": "NVIDIA H200",
+            "params": {"model_config": "llama3_8b", "tp_size": tp_size},
+        }
+    }
+
+
+def _alignment(pack: str, variant: str, tp_size: int) -> dict:
+    return {
+        "alignment": {"pack": pack, "variant": variant, "cases": ["01_micro"]},
+        "deployment": "unified",
+        "pool": "main",
+        "preset": None,
+        "groups": [
+            {
+                "gpu": "NVIDIA H200",
+                "arch": {
+                    "type": "llama3_dense_tp",
+                    "model_config": "model/config/llama3_8b.json",
+                    "tp_size": tp_size,
+                },
+            }
+        ],
+    }
+
+
+def _register(path: Path, identity: dict, source: dict) -> None:
+    kernel_config.register_kernel_configs(
+        path,
+        {
+            "schema_version": kernel_config.RECORDS_SCHEMA_VERSION,
+            "configs": [_record(identity, [{"pool": "main", "role": "unified.qkv"}])],
+        },
+        {"main": source},
+    )
+
+
+@pytest.fixture
+def supported(tmp_path: Path) -> tuple[TestClient, tuple[str, str]]:
+    """Both expansions of one supported row read the qkv config; only tp_size 4
+    reads the gate config. An alignment pack in this checkout (engine sglang)
+    ran tp_size 4."""
+
+    path = tmp_path / "supported.db"
+    table = Table(next(iter_kernel_profiler_specs("single_gemm")), path)
+    table.insert([_row(1, 6144, "torch"), _row(1, 512, "torch")])
+    _register(path, QKV, _supported(1))
+    _register(path, QKV, _supported(4))
+    _register(path, GATE, _supported(4))
+    pack = "presets/alignment/glm52_nvfp4_b200_sglang_tp4"
+    _register(path, GATE, _alignment(pack, "tp4_dp1_sglang", 4))
+    client = TestClient(create_app(KernelLibrary(FixtureSources(db_path=path))))
+    return client, (kernel_config.content_hash(QKV), kernel_config.content_hash(GATE))
+
+
+def test_a_supported_row_is_one_deployment_with_its_value_list(supported) -> None:
+    client, (qkv, gate) = supported
+    document = client.get(f"{PREFIX}/kernels/single_gemm/configs").json()
+    [deployment] = document["deployments"]
+    assert deployment["label"] == "llama3_dense_tp, tp_size 1 · 4"
+    assert (deployment["params"], deployment["varies"]) == ({"tp_size": [1, 4]}, ["tp_size"])
+    assert [m["params"] for m in deployment["members"]] == [{"tp_size": 1}, {"tp_size": 4}]
+    # Each config names the members that read it: gate is tp_size 4 only.
+    asked = {c["config_hash"]: c["uses"][0]["deployments"] for c in document["configs"]}
+    assert asked == {qkv: [{"id": 0, "members": [0, 1]}], gate: [{"id": 0, "members": [1]}]}
+
+    [used] = client.get(f"{PREFIX}/kernels/single_gemm").json()["used_by"]
+    assert {s["config_hash"]: s["members"] for s in used["shapes"]} == {qkv: [0, 1], gate: [1]}
+
+
+def test_an_alignment_run_marks_its_deployment_validated(supported) -> None:
+    client, _ = supported
+    [deployment] = client.get(f"{PREFIX}/kernels/single_gemm/configs").json()["deployments"]
+    # The engine is the pack variant's, from its campaign.yaml.
+    assert [(m["validated"], m["validated_against"]) for m in deployment["members"]] == [
+        (False, []),
+        (True, ["sglang"]),
+    ]
+    assert (deployment["validated"], deployment["validated_against"]) == (True, ["sglang"])
+
+
+def test_an_alignment_pack_not_in_the_checkout_still_validates(registered) -> None:
+    client, (qkv, _), path = registered
+    _register(path, QKV, _alignment("presets/alignment/no_such_pack", "v", 4))
+    [llama, _] = client.get(f"{PREFIX}/kernels/single_gemm/configs").json()["deployments"]
+    assert (llama["validated"], llama["validated_against"]) == (True, [])
+
+
+def test_local_paths_in_a_config_identity_are_cut_to_file_names() -> None:
+    identity = {"expert_demand": {"corpus": {"data_file": "/raid/hf/hub/blobs/dfb7"}}, "n": 1}
+    assert library._without_local_paths(identity) == {
+        "expert_demand": {"corpus": {"data_file": "dfb7"}},
+        "n": 1,
+    }
+
+
+def test_public_responses_carry_no_source_paths(supported) -> None:
+    client, (qkv, gate) = supported
+    base = f"{PREFIX}/kernels/single_gemm"
+    for path in ("", "/configs", f"/configs/{qkv}", f"/configs/{gate}"):
+        text = client.get(f"{base}{path}").text
+        assert "presets/" not in text and "model/config/" not in text, path
+        assert '"source' not in text and '"via"' not in text, path

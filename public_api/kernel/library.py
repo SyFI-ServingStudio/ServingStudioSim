@@ -15,6 +15,12 @@ Every field comes from a source that lives with the code; nothing here guesses:
 - a deployment's model and label from its arch block: the model config's file
   stem (as ``#[supported]`` rows spell it) named by ``model/catalog.yaml``, and
   the arch params the arch's ``#[supported]`` rows name (``list-params``);
+- which deployments are one ``#[supported]`` row, from the rows themselves
+  (``list-params`` lists each row once, with its value lists unexpanded);
+- whether a deployment was validated against real serving, from the alignment
+  packs in the registry's sources, and the engine from the pack's
+  ``campaign.yaml``. The sources themselves (preset and pack paths) stay in
+  profile.db: they are bookkeeping, and some name a local path;
 - a row's precision, from the column the Rust kernel names as its compute dtype;
 - GPU peaks from ``gpu/spec.json`` and model names from ``model/catalog.yaml``;
 - measurements from profile.db, and the kernel configs that read them from its
@@ -34,6 +40,7 @@ from typing import Any
 
 import yaml
 
+from launcher.alignment_campaign.pack import load_pack
 from launcher.schema.validate import supported_value
 from profiling.db.args import DType
 from profiling.db.doc import CATEGORIES, SUBCATEGORIES, arg_docs, kernel_doc
@@ -124,26 +131,6 @@ def _git_commit() -> str | None:
     return result.stdout.strip() or None
 
 
-def _source_via(source: dict) -> dict:
-    """What built a registered config, from the source forms the launcher writes
-    (``launcher/kernel_configs.py``): a ``#[supported]`` deployment, a
-    timing-predict config, a run of an alignment pack's cases, or a preset run."""
-
-    if "supported" in source:
-        return {"type": "supported", "ref": None}
-    if "timing_predict" in source:
-        return {"type": "timing_predict", "ref": source["timing_predict"]}
-    if source.get("alignment"):
-        alignment = source["alignment"]
-        return {
-            "type": "alignment",
-            "ref": alignment["pack"],
-            "variant": alignment.get("variant"),
-            "cases": len(alignment.get("cases") or ()),
-        }
-    return {"type": "preset", "ref": source.get("preset")}
-
-
 def _source_archs(source: dict) -> list[tuple[str, dict]]:
     """``(gpu, arch block)`` of every arch a source names. A run's
     deployment-level source (pool ``""``, AFD's attention-to-FFN transfer)
@@ -163,6 +150,33 @@ def _model_config(arch: dict) -> str | None:
 
     value = arch.get("model_config")
     return supported_value("model_config", value) if value is not None else None
+
+
+def _label_text(arch: str | None, params: dict) -> str:
+    """``arch, name value, ...``; a param a supported row lists several values
+    for reads ``name 8192 · 65536``."""
+
+    def text(value: Any) -> str:
+        if isinstance(value, list):
+            return " · ".join(map(text, value))
+        return json.dumps(value) if isinstance(value, bool) else str(value)
+
+    return ", ".join([str(arch), *(f"{n} {text(v)}" for n, v in params.items())])
+
+
+def _without_local_paths(value: Any) -> Any:
+    """``value`` with every absolute file path cut to its file name. A config's
+    identity can name a file on the machine that built it (an expert-demand
+    corpus under a local HF cache, say); the directory is that machine's, not
+    part of what the config is."""
+
+    if isinstance(value, dict):
+        return {k: _without_local_paths(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_without_local_paths(v) for v in value]
+    if isinstance(value, str) and value.startswith("/") and "/" in value[1:]:
+        return Path(value).name
+    return value
 
 
 def _axes(config: RegisteredConfig) -> list[list[float]]:
@@ -300,14 +314,12 @@ class KernelLibrary:
             value = arch.get(name, defaults.get(name))
             if value is not None:
                 params[name] = value
-        model_config = _model_config(arch)
-        text = (json.dumps(v) if isinstance(v, bool) else str(v) for v in params.values())
         return {
             "arch": tag,
             "gpu": gpu,
-            "model_config": model_config,
+            "model_config": _model_config(arch),
             "params": params,
-            "label": ", ".join([tag, *(f"{n} {v}" for n, v in zip(params, text))]),
+            "label": _label_text(tag, params),
         }
 
     def _source_deployments(self, source: dict, gpu: str) -> list[dict]:
@@ -357,43 +369,225 @@ class KernelLibrary:
 
         return self.sources.cached_by_db("registry-models", compute)
 
-    def _used_by(self, kind: str) -> tuple[list[dict], set[str]]:
-        """The deployments that run ``kind``, each with the shapes it asks for, and
-        the columns those shapes sweep, from the kernel-config registry: every
-        registered config's uses (the presets, predictions, alignment packs and
-        ``#[supported]`` deployments that built it). A shape is the profile.db
-        columns one leaf fixes, with the config that holds them."""
+    def _covering_row(self, deployment: dict) -> tuple[int, dict] | None:
+        """The first ``#[supported]`` row of the deployment's arch that covers it,
+        with its index: every name the row lists holds one of the row's values,
+        the rule the launcher checks a config by (``_check_supported``)."""
 
-        deployments: dict[str, dict] = {}
+        rows = self._arch_provider(deployment["arch"]).get("supported", [])
+        values = {
+            "gpu": deployment["gpu"],
+            "model_config": deployment["model_config"],
+            **deployment["params"],
+        }
+        for index, row in enumerate(rows):
+            if all(values.get(name) in allowed for name, allowed in row.items()):
+                return index, row
+        return None
+
+    def _engine(self, alignment: dict) -> str | None:
+        """The serving engine an alignment source's pack variant ran, from the
+        pack's ``campaign.yaml``; None when the pack is not in this checkout."""
+
+        pack, variant = alignment.get("pack"), alignment.get("variant")
+
+        def compute() -> str | None:
+            if not isinstance(pack, str):
+                return None
+            root = (REPO_ROOT / pack).resolve()
+            if not root.is_relative_to(REPO_ROOT):
+                return None
+            try:
+                found = load_pack(root).variants.get(variant)
+            except (OSError, ValueError):
+                return None
+            return found.engine if found else None
+
+        return self.sources.cached_by_db(("engine", pack, variant), compute)
+
+    def _validated(self) -> dict[str, set[str]]:
+        """``{deployment key: engines}`` of every deployment an alignment pack
+        ran, over the whole registry: a deployment is validated whichever kernel
+        is asked about. An engine the pack does not name is left out."""
+
+        def compute() -> dict[str, set[str]]:
+            with self.sources.connect() as conn:
+                tables = {
+                    row[0]
+                    for row in conn.execute("select name from sqlite_master where type = 'table'")
+                }
+                if SOURCE_TABLE not in tables:
+                    return {}
+                records = conn.execute(f"select source from {SOURCE_TABLE}").fetchall()
+            out: dict[str, set[str]] = {}
+            for (text,) in records:
+                source = json.loads(text)
+                if not source.get("alignment"):
+                    continue
+                engine = self._engine(source["alignment"])
+                for gpu, arch in _source_archs(source):
+                    key = self._deployment_key(self._deployment(gpu, arch))
+                    engines = out.setdefault(key, set())
+                    if engine:
+                        engines.add(engine)
+            return out
+
+        return self.sources.cached_by_db("validated", compute)
+
+    def _deployment_table(self, kind: str) -> dict:
+        """The deployments that run ``kind``, one per ``#[supported]`` row.
+
+        Every deployment a registered config's use names is labeled on its own
+        (``_deployment``), then joined to the arch's first row that covers it.
+        Deployments of one row on one GPU and model config are one entry; they
+        differ only in the params the row lists more than one value for
+        (``varies``), and each is a ``member``. A deployment no row covers is an
+        entry of its own. ``index`` maps each deployment's key to its entry's
+        id and member index."""
+
+        def compute() -> dict:
+            validated = self._validated()
+            groups: dict[str, dict] = {}
+            for summary in self._summaries(kind):
+                config = summary["config"]
+                for use in config.uses:
+                    for deployment in self._source_deployments(use.source, config.gpu_name):
+                        covering = self._covering_row(deployment)
+                        row = covering[1] if covering else {}
+                        varies = [
+                            name
+                            for name, allowed in row.items()
+                            if name not in ("gpu", "model_config") and len(allowed) > 1
+                        ]
+                        shared = {n: v for n, v in deployment["params"].items() if n not in varies}
+                        key = canonical_json(
+                            [
+                                deployment["arch"],
+                                deployment["gpu"],
+                                deployment["model_config"],
+                                covering[0] if covering else None,
+                                shared,
+                            ]
+                        )
+                        group = groups.setdefault(
+                            key, {"base": deployment, "row": row, "varies": varies, "members": {}}
+                        )
+                        group["members"].setdefault(self._deployment_key(deployment), deployment)
+
+            entries, index = [], {}
+            for group in groups.values():
+                row, varies = group["row"], group["varies"]
+                # Members in the row's own order of values.
+                members = sorted(
+                    group["members"].items(),
+                    key=lambda item: [row[n].index(item[1]["params"][n]) for n in varies],
+                )
+                listed = []
+                for member_key, deployment in members:
+                    engines = validated.get(member_key)
+                    listed.append(
+                        {
+                            "params": {n: deployment["params"][n] for n in varies},
+                            "validated": engines is not None,
+                            "validated_against": sorted(engines or ()),
+                        }
+                    )
+                base = group["base"]
+                params = {
+                    n: [m["params"][n] for m in listed] if n in varies else v
+                    for n, v in base["params"].items()
+                }
+                # A param listed with several values keeps the ones present, once each.
+                for name in varies:
+                    params[name] = list(dict.fromkeys(params[name]))
+                entries.append(
+                    {
+                        "arch": base["arch"],
+                        "gpu": base["gpu"],
+                        "model_config": base["model_config"],
+                        "model": base["model"],
+                        "params": params,
+                        "varies": varies,
+                        "label": _label_text(base["arch"], params),
+                        "members": listed,
+                        "validated": any(m["validated"] for m in listed),
+                        "validated_against": sorted(
+                            {e for m in listed for e in m["validated_against"]}
+                        ),
+                        "_keys": [member_key for member_key, _ in members],
+                    }
+                )
+            entries.sort(key=lambda d: (self._model_rank(d["model_config"]), d["gpu"], d["label"]))
+            for entry_id, entry in enumerate(entries):
+                for member, member_key in enumerate(entry.pop("_keys")):
+                    index[member_key] = (entry_id, member)
+                entry["id"] = entry_id
+            return {"deployments": entries, "index": index}
+
+        return self.sources.cached_by_db(("deployments", kind), compute)
+
+    def _use_deployments(self, kind: str, uses: tuple[ConfigUse, ...], gpu: str) -> list[dict]:
+        """A config's uses, one per pool and role, each naming the deployment
+        entries that ask for it and which of their members do. Several sources
+        (a supported row, a preset, an alignment run) often register the same
+        use; they are one here."""
+
+        index = self._deployment_table(kind)["index"]
+        by_use: dict[tuple[str, str], dict[int, set[int]]] = {}
+        for use in uses:
+            asked = by_use.setdefault((use.pool, use.role), {})
+            for deployment in self._source_deployments(use.source, gpu):
+                entry, member = index[self._deployment_key(deployment)]
+                asked.setdefault(entry, set()).add(member)
+        return [
+            {
+                "pool": pool,
+                "role": role,
+                "deployments": [
+                    {"id": entry, "members": sorted(members)}
+                    for entry, members in sorted(asked.items())
+                ],
+            }
+            for (pool, role), asked in by_use.items()
+        ]
+
+    def _used_by(self, kind: str) -> tuple[list[dict], set[str]]:
+        """The deployments that run ``kind`` (``_deployment_table``), each with
+        the shapes it asks for, and the columns those shapes sweep, from the
+        kernel-config registry. A shape is the profile.db columns one leaf
+        fixes, with the config that holds them and the members that ask."""
+
+        table = self._deployment_table(kind)
+        shapes: dict[int, dict[str, dict]] = {}
         swept: set[str] = set()
         for summary in self._summaries(kind):
             config = summary["config"]
             swept.update(summary["swept"])
-            for use in config.uses:
-                via = _source_via(use.source)["type"]
-                for deployment in self._source_deployments(use.source, config.gpu_name):
-                    key = self._deployment_key(deployment)
-                    target = deployments.setdefault(
-                        key, {**deployment, "sources": set(), "shapes": {}}
-                    )
-                    target["sources"].add(via)
+            for use in self._use_deployments(kind, config.uses, config.gpu_name):
+                for asked in use["deployments"]:
                     # One leaf per role and shape: rank copies and repeat
                     # registrations of it are listed once.
-                    target["shapes"].setdefault(
-                        canonical_json([use.role, config.config_hash]),
+                    shape = shapes.setdefault(asked["id"], {}).setdefault(
+                        canonical_json([use["role"], config.config_hash]),
                         {
-                            "layer": use.role,
-                            "pool": use.pool,
+                            "layer": use["role"],
+                            "pool": use["pool"],
                             "db": summary["fixed"],
                             "config_hash": config.config_hash,
+                            "members": set(),
                         },
                     )
-
+                    shape["members"].update(asked["members"])
         out = [
-            {**d, "sources": sorted(d["sources"]), "shapes": list(d["shapes"].values())}
-            for d in deployments.values()
+            {
+                **entry,
+                "shapes": [
+                    {**shape, "members": sorted(shape["members"])}
+                    for shape in shapes.get(entry["id"], {}).values()
+                ],
+            }
+            for entry in table["deployments"]
         ]
-        out.sort(key=lambda d: (self._model_rank(d["model_config"]), d["gpu"], d["label"]))
         return out, swept
 
     # -- documents -----------------------------------------------------------------
@@ -649,7 +843,7 @@ class KernelLibrary:
         """What the list and the detail both say about one config's grid."""
 
         config = summary["config"]
-        config_args, omitted = _config_args(config.identity)
+        config_args, omitted = _config_args(_without_local_paths(config.identity))
         return {
             "config_hash": config.config_hash,
             "kind": config.kind,
@@ -667,58 +861,30 @@ class KernelLibrary:
             "config_args_omitted": omitted,
         }
 
-    def _use(self, use: ConfigUse, gpu: str) -> dict:
-        """One use of a config: what built it, and the deployment and model."""
-
-        return {
-            "pool": use.pool,
-            "role": use.role,
-            "via": _source_via(use.source),
-            "deployments": self._source_deployments(use.source, gpu),
-        }
-
     def configs(self, kind: str) -> dict:
         """The kernel configs registered as reading ``kind``'s rows: one per
         config and GPU, with its fixed and swept args, how many of its grid
-        cells each backend measured, and the uses that built it.
+        cells each backend measured, and the uses that asked for it.
 
-        Uses repeat their source and deployment across configs, so each use
-        points into the ``sources`` and ``deployments`` tables; the full
-        identity and source of a config are on ``/configs/{config_hash}``."""
+        Uses repeat their deployment across configs, so each use points into
+        the ``deployments`` table (``_deployment_table``) and names which of
+        an entry's members ask; the full identity of a config is on
+        ``/configs/{config_hash}``."""
 
         def compute() -> dict:
-            sources: dict[str, dict] = {}
-            deployments: dict[str, dict] = {}
-            out = []
-            for summary in self._summaries(kind):
-                config = summary["config"]
-                uses = []
-                for use in config.uses:
-                    labeled = self._use(use, config.gpu_name)
-                    source = sources.setdefault(
-                        canonical_json(labeled["via"]), {"id": len(sources), **labeled["via"]}
-                    )
-                    ids = []
-                    for deployment in labeled["deployments"]:
-                        key = self._deployment_key(deployment)
-                        ids.append(
-                            deployments.setdefault(key, {"id": len(deployments), **deployment})[
-                                "id"
-                            ]
-                        )
-                    uses.append(
-                        {
-                            "pool": use.pool,
-                            "role": use.role,
-                            "source": source["id"],
-                            "deployments": ids,
-                        }
-                    )
-                out.append({**self._grid(summary), "axes": _axes(config), "uses": uses})
+            out = [
+                {
+                    **self._grid(summary),
+                    "axes": _axes(summary["config"]),
+                    "uses": self._use_deployments(
+                        kind, summary["config"].uses, summary["config"].gpu_name
+                    ),
+                }
+                for summary in self._summaries(kind)
+            ]
             return {
                 "kind": kind,
-                "sources": list(sources.values()),
-                "deployments": list(deployments.values()),
+                "deployments": self._deployment_table(kind)["deployments"],
                 "configs": out,
             }
 
@@ -728,7 +894,8 @@ class KernelLibrary:
         """One registered config's grid on the Rust cache axes: every cell's
         coordinates, its profile.db args, whether the kernel can run it, and the
         metrics each backend measured there (absent where nothing was); plus
-        the full identity and each use with its source, deployment and model."""
+        the full identity, and each use with the deployment entries (in
+        ``deployments``, the same entries ``/configs`` lists) that ask."""
 
         matches = [c for c in self._registered(kind, gpu) if c.config_hash == config_hash]
         if not matches:
@@ -761,14 +928,17 @@ class KernelLibrary:
                 zip(grid.cells, self._cell_rows(kind, config), strict=True)
             )
         ]
+        uses = self._use_deployments(kind, config.uses, config.gpu_name)
+        asked = {d["id"] for use in uses for d in use["deployments"]}
         return {
             **self._grid(summary),
-            "identity": config.identity,
+            "identity": _without_local_paths(config.identity),
             "axes": _axes(config),
             "metrics": metrics,
             "points": points,
-            "uses": [
-                {"source": use.source, **self._use(use, config.gpu_name)} for use in config.uses
+            "uses": uses,
+            "deployments": [
+                d for d in self._deployment_table(kind)["deployments"] if d["id"] in asked
             ],
         }
 
