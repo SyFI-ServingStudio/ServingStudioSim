@@ -55,7 +55,8 @@ DOC = KernelDoc(
         "implementation before timing."
     ),
     caveats=(
-        "Only hidden_size = 4096, hc_mult = 4 in bf16 on H200 is measured.",
+        "Only hidden_size = 4096, hc_mult = 4 in bf16 on H200 and B200 is "
+        "measured, with ε = 1e-6; another ε runs the same launches.",
         "TFLOPS is not computed. GB/s counts the streams and weights read "
         "once and the mixes and block input written once.",
     ),
@@ -77,7 +78,7 @@ register(
         batch_outlier_policy=BatchOutlierPolicy(),
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
-            gpus=frozenset({"NVIDIA H200"}),
+            gpus=frozenset({"NVIDIA H200", "NVIDIA B200"}),
         ),
         subprocess_env="vllm_env",
         doc=BackendDoc(

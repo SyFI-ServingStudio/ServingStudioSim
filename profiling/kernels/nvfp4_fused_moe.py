@@ -1,9 +1,15 @@
-"""Whole FlashInfer TRT-LLM NVFP4 MoE callable used on B200.
+"""Whole FlashInfer TRT-LLM block-quantized MoE callable used on B200.
 
 The operation starts with already-quantized activations and contains routing,
 both expert GEMMs, SwiGLU, and finalize routing.  It is intentionally one L1
 kind: SM100 uses PDL between several physical launches, so summing independently
 profiled stages would double-count overlap and could select different tactics.
+
+Despite the kind name, `weight_format` selects the expert weight recipe: the
+NVFP4 backends take `nvfp4_e2m1` / group 16, and the FP8 block-scale backend
+(`trtllm_fp8_block_scale_moe`) takes `fp8_e4m3` / group 128: 128x128 weight
+blocks with per-token-group-128 FP8 activations. `input_dtype` is the unquantized
+activation and output precision in every backend.
 """
 
 from __future__ import annotations
@@ -34,16 +40,24 @@ class Nvfp4FusedMoeArgs(KernelArgs):
         unit="experts", doc="Routed experts whose weights reside on this GPU."
     )
     top_k: int = arg(unit="experts", doc="Experts selected for each token.")
-    input_dtype: DType = arg(doc="Element type before the hidden states are quantized to NVFP4.")
+    input_dtype: DType = arg(doc="Element type before the hidden states are quantized.")
     weight_format: DType = arg(
         doc=(
             "Packed expert weight format, and the tensor-core precision: the call"
-            " quantizes activations to it, so both GEMM operands are NVFP4."
-            " This backend requires nvfp4_e2m1."
+            " quantizes activations to it, so both GEMM operands share it."
+            " nvfp4_e2m1 for the NVFP4 backends, fp8_e4m3 for the FP8 block-scale backend."
         )
     )
-    group_size: int = arg(unit="elements", doc="Elements sharing one NVFP4 scale.")
-    routing_method: str = arg(doc="Router selection rule; this backend accepts minimax2.")
+    group_size: int = arg(
+        unit="elements",
+        doc=(
+            "Elements sharing one scale: 16 for NVFP4; 128 for FP8, per 1x128 activation"
+            " group and 128x128 weight block."
+        ),
+    )
+    routing_method: str = arg(
+        doc="Router selection rule: minimax2 for NVFP4, deepseek_v3 for FP8 block-scale."
+    )
     n_group: int = arg(unit="groups", doc="Expert groups considered by the router.")
     topk_group: int = arg(unit="groups", doc="Expert groups retained before expert selection.")
     routed_scaling_numerator: int = arg(
@@ -58,16 +72,17 @@ class Nvfp4FusedMoeArgs(KernelArgs):
 
 
 DOC = KernelDoc(
-    title="NVFP4 fused MoE",
-    summary="Route NVFP4 tokens through packed expert weights and produce their MoE outputs.",
+    title="Block-scaled fused MoE",
+    summary="Route block-quantized tokens through packed expert weights and produce their MoE outputs.",
     description=(
         "A routed MoE layer runs as this one FlashInfer call on hidden states"
-        " already quantized to NVFP4: routing, the gate-up projection, SwiGLU "
+        " already quantized to weight_format (NVFP4, or FP8 with 128-wide "
+        "block scales): routing, the gate-up projection, SwiGLU "
         "and the down projection. per_expert_batches gives the tokens routed to"
         " every expert across all GPUs, and the first num_local_experts are "
         "this GPU's. The vLLM backend also combines the expert outputs; the "
         "SGLang backend leaves the combine to a later kernel, "
-        "moe_finalize_fuse_shared."
+        "moe_finalize_fuse_shared. The FP8 block-scale backend also combines."
     ),
     category="MoE",
     subcategory="Expert compute",
@@ -84,6 +99,11 @@ DOC = KernelDoc(
         "+ hidden_size·intermediate_size/group_size)",
         "GB/s = (routing_bytes + activation_bytes + weight_bytes "
         "+ 12·active_experts + 2·hidden_size·output_rows) / time",
+        "FP8 block-scale: routing_bytes = 4·num_tokens·num_experts + 4·num_experts; "
+        "activation_bytes = local_rows·(hidden_size + 4·hidden_size/128); "
+        "weight_bytes = active_experts·(3·intermediate_size·hidden_size "
+        "+ 4·3·intermediate_size·hidden_size/128²); "
+        "GB/s = (routing_bytes + activation_bytes + weight_bytes + 2·hidden_size·num_tokens) / time",
     ),
     default_metric="time_ms",
     method=(
@@ -94,8 +114,11 @@ DOC = KernelDoc(
         "calls follow."
     ),
     caveats=(
-        "The two backends end at different points, so their times cover "
-        "different work: vLLM includes the combine, SGLang does not.",
+        "The backends end at different points, so their times cover "
+        "different work: the vLLM backends include the combine, SGLang does not.",
+        "The FP8 block-scale backend accepts only ungrouped deepseek_v3 routing "
+        "(n_group = topk_group = 1); its autotuner stops at 8192 tokens, so larger "
+        "shapes reuse the largest tuned bucket.",
         "Activation quantization is outside the call, and the router logits are synthetic.",
         "GB/s counts logical traffic for the local rows and the experts that "
         "have rows; small side outputs are left out.",
@@ -157,5 +180,32 @@ register(
             url="https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/layers/moe/moe_runner/flashinfer_trtllm.py",
         ),
         subprocess_env="sglang_env",
+    )
+)
+
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="flashinfer_trtllm_fp8_block_sm100",
+        supports=BackendSupport(
+            compute=frozenset({DType.FP8_E4M3}),
+            gpus=frozenset({"NVIDIA B200"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.moe.fp8_block_fused_moe",
+            function_name="profile_fp8_block_fused_moe_sm100",
+        ),
+        table_name=KIND,
+        args_schema=Nvfp4FusedMoeArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        doc=BackendDoc(
+            summary=(
+                "FlashInfer trtllm_fp8_block_scale_moe through vLLM's FP8 block-scale "
+                "path, including final expert combination."
+            ),
+            url="https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/fused_moe/experts/trtllm_fp8_moe.py",
+        ),
+        subprocess_env="vllm_env",
     )
 )

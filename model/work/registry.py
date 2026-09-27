@@ -14,7 +14,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from .core import Model
-from .models import glm52, llama3, qwen3_6, qwen3_6_moe, qwen3_moe
+from .models import glm52, glm53_flash, llama3, qwen3_6, qwen3_6_moe, qwen3_moe
 
 # architecture string -> builder. Add a row when you add a model file.
 REGISTRY: dict[str, Callable[[dict], Model]] = {
@@ -24,6 +24,8 @@ REGISTRY: dict[str, Callable[[dict], Model]] = {
     "Qwen3_5ForConditionalGeneration": qwen3_6.build,  # Qwen3.5/3.6 hybrid (linear+full)
     "Qwen3_5MoeForConditionalGeneration": qwen3_6_moe.build,
     "GlmMoeDsaForCausalLM": glm52.build,
+    # GLM-5.3-Flash: KDA/DSA hybrid over an mHC residual; text decoder only.
+    "Glm5NextForConditionalGeneration": glm53_flash.build,
 }
 
 

@@ -7,8 +7,8 @@ ARG CUDA_VERSION
 ARG PYTHON_VERSION=3.12
 ARG VIBESIM_REVISION=unknown
 ARG VIBESIM_SOURCE_STATE=unknown
-ARG VLLM_REVISION=0b8edfb56f5df9cd512ce4ff586e7ac2c8f31921
-ARG VLLM_BASE_REVISION=0fc695fc6d1d82e9a5ac6835ac8e4e1c83703665
+ARG VLLM_REVISION=3f667d7eb4572583f6ead3b677a55086bd2ecf3b
+ARG VLLM_BASE_REVISION=8369affa5428ca29a30f378d660fbffbad12e240
 ARG VLLM_WHEEL_VARIANT=cu130
 
 LABEL org.opencontainers.image.title="VibeSim vLLM kernel profiler" \
@@ -50,25 +50,29 @@ RUN UV_PYTHON_INSTALL_DIR=/opt/uv-python \
     && VLLM_USE_PRECOMPILED=1 \
        VLLM_PRECOMPILED_WHEEL_COMMIT="${VLLM_BASE_REVISION}" \
        VLLM_PRECOMPILED_WHEEL_VARIANT="${VLLM_WHEEL_VARIANT}" \
-       VLLM_VERSION_OVERRIDE="0.23.0+vibesim.${VLLM_REVISION}" \
+       VLLM_VERSION_OVERRIDE="0.28.1rc0+vibesim.${VLLM_REVISION}" \
        uv pip install --python .venv/bin/python -e . \
     && uv pip install --python .venv/bin/python nvtx \
     && uv pip check --python .venv/bin/python \
     && mkdir -p .venv/lib/cuda-compat
 
-# Prepare FlashInfer's package-local MoE link and its runtime lock while root;
-# profiler workers keep the package immutable and write JIT artifacts to /cache.
-RUN FLASHINFER_CUDA_ARCH_LIST=10.0 python -c \
+# FlashInfer 0.6.18 has no flashinfer-cubin wheel, and workers run with
+# --network none, so bake every cubin into the image. The default directory is
+# under HOME, which the /cache bind mount shadows at run time. Workers create
+# lock files next to the cubins, so the tree stays writable.
+ENV FLASHINFER_CUBIN_DIR=/opt/flashinfer-cubins
+RUN python -m flashinfer --download-cubin \
+    && test -f "${FLASHINFER_CUBIN_DIR}"/*/fmha/trtllm-gen/checksums.txt \
+    && FLASHINFER_CUDA_ARCH_LIST=10.0 python -c \
        "from flashinfer.jit.fused_moe import gen_trtllm_gen_fused_moe_sm100_module; gen_trtllm_gen_fused_moe_sm100_module()" \
-    && python -c \
-       "from flashinfer.jit import env; p = env.FLASHINFER_CUBIN_DIR / 'flashinfer/trtllm/batched_gemm/trtllmGen_bmm_export.lock'; p.touch(); p.chmod(0o666)"
+    && chmod -R a+rwX "${FLASHINFER_CUBIN_DIR}"
 
 COPY profiling /opt/vibesim/profiling
 COPY launcher /opt/vibesim/launcher
 COPY gpu /opt/vibesim/gpu
 
 RUN python -c "import importlib.metadata, torch; assert torch.version.cuda == '13.0'; print(importlib.metadata.version('vllm'))" \
-    && test -f alignment/profiler/vllm/vllm/_C.abi3.so \
+    && test -f alignment/profiler/vllm/vllm/_C_stable_libtorch.abi3.so \
     && python -m profiling list --json >/dev/null
 
 ENTRYPOINT ["/opt/vibesim/alignment/profiler/vllm/.venv/bin/python", "-m", "profiling.exec.local_worker"]

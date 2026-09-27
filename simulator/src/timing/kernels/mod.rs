@@ -37,6 +37,8 @@ pub mod gdn_recurrent_decode;
 pub mod gemm_fp32_output;
 pub mod grouped_gemm;
 pub mod inv_rope_fp8_quant;
+pub mod kda_chunk_prefill;
+pub mod kda_recurrent_decode;
 pub mod kv_cache_append;
 pub mod kv_compress_store;
 pub mod logits_topk;
@@ -202,6 +204,14 @@ pub use grouped_gemm::{
 pub use inv_rope_fp8_quant::{
     InvRopeFp8QuantKernel, InvRopeFp8QuantKernelConfig, InvRopeFp8QuantKernelInput,
     InvRopeFp8QuantSpec,
+};
+pub use kda_chunk_prefill::{
+    KdaChunkPrefillKernel, KdaChunkPrefillKernelConfig, KdaChunkPrefillKernelInput,
+    KdaChunkPrefillSpec,
+};
+pub use kda_recurrent_decode::{
+    KdaRecurrentDecodeKernel, KdaRecurrentDecodeKernelConfig, KdaRecurrentDecodeKernelInput,
+    KdaRecurrentDecodeSpec,
 };
 pub use kv_cache_append::{
     KvCacheAppendKernel, KvCacheAppendKernelConfig, KvCacheAppendKernelInput, KvCacheAppendSpec,

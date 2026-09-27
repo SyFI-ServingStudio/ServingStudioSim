@@ -567,6 +567,7 @@ struct WorkloadColumns<'a> {
     prefill_requests: Vec<f64>,
     prefill_stateful_requests: Vec<f64>,
     speculative_geometry: Vec<&'a BTreeMap<String, f64>>,
+    request_geometry: Vec<&'a BTreeMap<String, f64>>,
 }
 
 #[derive(Serialize)]
@@ -598,6 +599,10 @@ fn build_locked_request(
                         .iter()
                         .map(|shape| &shape.totals.speculative_geometry)
                         .collect(),
+                    request_geometry: shapes
+                        .iter()
+                        .map(|shape| &shape.totals.request_geometry)
+                        .collect(),
                 },
             };
             (format!("{pool_tag}/{worker_id}"), composition)
@@ -619,6 +624,7 @@ fn workload_json(totals: &WorkloadTotals) -> Value {
         "prefill_requests": totals.prefill_requests,
         "prefill_stateful_requests": totals.prefill_stateful_requests,
         "speculative_geometry": totals.speculative_geometry,
+        "request_geometry": totals.request_geometry,
     })
 }
 

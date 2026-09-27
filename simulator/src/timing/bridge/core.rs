@@ -6,8 +6,8 @@ use pyo3::types::{PyDict, PyList, PyModule};
 use serde_json::Value;
 
 use crate::timing::bridge::{
-    ArgsPayload, BuildError, DType, DbMetadata, KernelKind, KernelMetrics, PerfApiError,
-    ProfilerVersion, intern_backend,
+    intern_backend, ArgsPayload, BuildError, DType, DbMetadata, KernelKind, KernelMetrics,
+    PerfApiError, ProfilerVersion,
 };
 
 /// One kernel's profile-coverage line for the `dry-run` report: how many of its
@@ -833,7 +833,7 @@ fn optional_string(item: &PyAny, field: &str) -> Result<Option<String>, PerfApiE
 
 #[cfg(test)]
 mod tests {
-    use super::{ConfigGrid, PerfApiBridge, ensure_payload_backends_match, shared_backend};
+    use super::{ensure_payload_backends_match, shared_backend, ConfigGrid, PerfApiBridge};
     use crate::timing::bridge::payload::intern_backend;
     use crate::timing::bridge::{ArgsPayload, BuildError, PerfApiError};
     use serde_json::Value;
@@ -972,7 +972,7 @@ mod tests {
         assert_eq!(report[0].compute_dtype, Some(super::DType::Fp8E4m3));
         assert_eq!(report[1].compute_dtype, None); // comm is dtype-agnostic
         assert_eq!(report[1].pool, ""); // deployment-level, no active pool
-        // draining leaves an empty report while still in enumerate mode.
+                                        // draining leaves an empty report while still in enumerate mode.
         assert!(bridge.take_enum_report().is_empty());
         assert!(bridge.is_enumerate());
     }

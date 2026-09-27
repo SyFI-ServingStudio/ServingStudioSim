@@ -654,7 +654,6 @@ def test_operand_sources_do_not_scale_an_arange_with_cache_size(monkeypatch) -> 
 def test_trtllm_fp8_operands_use_production_hnd_page_layout(monkeypatch) -> None:
     from profiling.runners.attention import dsa_sparse_mla_attention as runner
 
-    monkeypatch.setattr(runner, "_SELECTED_K", 4)
     monkeypatch.setattr(runner, "_TRTLLM_WORKSPACE_BYTES", 16)
     validated = runner._ValidatedArgs(
         num_queries=2,
@@ -666,6 +665,8 @@ def test_trtllm_fp8_operands_use_production_hnd_page_layout(monkeypatch) -> None
         torch,
         validated,
         num_heads=16,
+        rope_dim=64,
+        selected_k=4,
         device=torch.device("cpu"),
     )
 
@@ -676,6 +677,7 @@ def test_trtllm_fp8_operands_use_production_hnd_page_layout(monkeypatch) -> None
     assert operands.block_tables.shape == (2, 1, 4)
     assert operands.seq_lens.tolist() == [2, 4]
     assert operands.workspace.numel() == 16
+    assert operands.top_k_lens is None
 
 
 def test_trtllm_fp8_launch_matches_vllm_flashinfer_call() -> None:
@@ -986,3 +988,67 @@ def test_flashmla_profile_preserves_typed_oom(monkeypatch) -> None:
     with pytest.raises(OOMError, match="ran out of GPU memory") as exc_info:
         runner.profile_dsa_sparse_mla_attention_vllm_flashmla_bf16(**_BASE_SPEC)
     assert isinstance(exc_info.value.__cause__, torch.OutOfMemoryError)
+
+
+_NOPE_SPEC = _BASE_SPEC | {
+    "num_queries": 2,
+    "num_cache_tokens": 8192,
+    "num_heads": 16,
+    "selected_k": 2176,
+    "rope_dim": 0,
+    "q_dtype": "fp8_e4m3",
+    "cache_dtype": "fp8_e4m3",
+    "valid_counts": "u:2051x2",
+    "cache_layout": "hnd_paged_mqa_fp8_latent",
+}
+
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    [
+        ({}, "reached the launch"),
+        ({"selected_k": 2048, "valid_counts": "u:2048x2"}, "reached the launch"),
+        ({"selected_k": 2304}, "selected_k must be 2048 or 2176"),
+        ({"cache_layout": "hnd_paged_mqa_fp8_latent_rope"}, "cache_layout must be"),
+        ({"rope_dim": 64}, "selected_k must be 2048, got 2176"),
+    ],
+)
+def test_trtllm_fp8_rope_dim_selects_the_accepted_layout(monkeypatch, overrides, match) -> None:
+    from profiling.runners.attention import dsa_sparse_mla_attention as runner
+
+    def reached(*_args, **_kwargs):
+        raise ProfilerNotImplemented("reached the launch")
+
+    monkeypatch.setattr(runner, "_require_b200", reached)
+    with pytest.raises(ProfilerNotImplemented, match=match):
+        runner.profile_dsa_sparse_mla_attention_flashinfer_trtllm_fp8(**(_NOPE_SPEC | overrides))
+
+
+def test_trtllm_fp8_rope_free_operands_and_launch_match_vllm() -> None:
+    from profiling.runners.attention import dsa_sparse_mla_attention as runner
+
+    validated = runner._ValidatedArgs(
+        num_queries=2,
+        num_cache_tokens=65,
+        valid_counts=(0, 4),
+        index_distribution="recent_contiguous",
+    )
+    operands = runner._build_trtllm_fp8_operands(
+        torch, validated, num_heads=16, rope_dim=0, selected_k=8, device=torch.device("cpu")
+    )
+    assert operands.query.shape == (2, 1, 16, 512)
+    assert operands.cache.shape == (2, 1, 64, 512)
+    assert operands.block_tables.shape == (2, 1, 8)
+    assert operands.top_k_lens.tolist() == [1, 4]
+
+    calls = []
+    runner._launch_trtllm_fp8(
+        lambda **kwargs: calls.append(kwargs),
+        operands,
+        softmax_scale=0.0625,
+        rope_dim=0,
+        selected_k=8,
+    )
+    assert calls[0]["qk_rope_head_dim"] == 0
+    assert calls[0]["max_seq_len"] == calls[0]["sparse_mla_top_k"] == 8
+    assert calls[0]["sparse_mla_top_k_lens"] is operands.top_k_lens

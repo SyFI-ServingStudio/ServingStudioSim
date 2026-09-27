@@ -251,3 +251,15 @@ of the tree the reader already has.
 - which configs read which rows: the kernel-config registry in `profile.db`
   (`profiling/db/kernel_config.py`), filled by the launcher when a run or
   prediction builds its kernel cache.
+
+## Agent skill
+
+`skills/servingstudio-kernel-performance/SKILL.md` teaches a coding agent to
+answer kernel-performance questions from these routes: find the kind, read what
+it measures and how, then filter its rows. Install it with the
+`skills` CLI, which finds every `SKILL.md` under the path it is given:
+
+    npx skills add https://github.com/SyFI-ServingStudio/ServingStudioSim/tree/main/public_api
+
+The skill reads the base URL from `SERVINGSTUDIO_API` and defaults to
+`https://servingstudio.cs.washington.edu/api/public/v1`.

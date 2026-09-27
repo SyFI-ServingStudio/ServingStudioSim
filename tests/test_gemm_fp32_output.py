@@ -32,8 +32,54 @@ def test_logical_bytes_include_fp32_output() -> None:
 
 @pytest.mark.parametrize(
     "arguments",
-    [(8, 128, 4096, "bf16"), (8, 512, 2048, "bf16"), (8, 512, 4096, "fp16")],
+    [
+        (8, 128, 4096, "bf16"),
+        (8, 512, 2048, "bf16"),
+        (8, 512, 4096, "fp16"),
+        (8, 288, 4096, "fp32"),
+        (8, 32, 4096, "bf16"),
+    ],
 )
 def test_rejects_non_production_identity(arguments: tuple[object, ...]) -> None:
     with pytest.raises(ProfilerNotImplemented):
         _validate_args(*arguments)
+
+
+def test_glm53_router_and_indexer_forms() -> None:
+    assert _validate_args(8, 288, 4096, "bf16").n == 288
+    shape = _validate_args(8, 32, 4096, "fp32")
+    assert _logical_bytes(shape) == 4 * 8 * 4096 + 4 * 32 * 4096 + 4 * 8 * 32
+
+    calls: list[tuple[object, object, dict[str, object]]] = []
+    fake_torch = SimpleNamespace(mm=lambda left, right, **kw: calls.append((left, right, kw)))
+    _Launch(fake_torch, "hidden.float()", "wp_fp32", fp32_input=True).run()
+    assert calls == [("hidden.float()", "wp_fp32", {})]
+
+
+def test_fp32_prepare_needs_highest_precision_and_caches_a_contiguous_weight() -> None:
+    from profiling.runners.gemm.gemm_fp32_output_torch_cublas import _prepare
+
+    class _Weight:
+        @property
+        def T(self):  # noqa: N802 - mirrors torch.Tensor.T
+            return SimpleNamespace(contiguous=lambda: "weight.T.contiguous()")
+
+    precision = "high"
+    fake_torch = SimpleNamespace(
+        float32="float32",
+        bfloat16="bfloat16",
+        device=lambda *args: args,
+        cuda=SimpleNamespace(current_device=lambda: 0),
+        Generator=lambda device: SimpleNamespace(manual_seed=lambda seed: None),
+        get_float32_matmul_precision=lambda: precision,
+        randn=lambda shape, **kw: "input" if shape[1] == 4096 and shape[0] == 8 else _Weight(),
+    )
+    shape = _validate_args(8, 32, 4096, "fp32")
+
+    with pytest.raises(ProfilerNotImplemented, match="highest"):
+        _prepare(fake_torch, shape)
+
+    precision = "highest"
+    launch = _prepare(fake_torch, shape)
+    assert launch.fp32_input
+    assert (launch.input_tensor, launch.weight_transposed) == ("input", "weight.T.contiguous()")

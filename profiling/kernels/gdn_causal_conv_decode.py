@@ -40,8 +40,8 @@ DOC = KernelDoc(
         "updating the convolution state."
     ),
     description=(
-        "In Gated DeltaNet layers, decode runs a short depthwise "
-        "causal convolution over each channel: the request's last kernel_size −"
+        "In Gated DeltaNet and KDA layers, decode runs a short "
+        "depthwise causal convolution over each channel: the request's last kernel_size −"
         " 1 samples plus the new token, weighted by that channel's filter, "
         "summed in FP32, then SiLU. The new token is shifted into the "
         "convolution state. Each request has its own state row; inputs are "
@@ -102,7 +102,7 @@ register(
         backend="vllm_triton",
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
-            gpus=frozenset({"NVIDIA H200"}),
+            gpus=frozenset({"NVIDIA H200", "NVIDIA B200"}),
         ),
         runner_ref=RunnerRef(
             module_name=("profiling.runners.attention.gdn_causal_conv_decode_vllm_triton"),

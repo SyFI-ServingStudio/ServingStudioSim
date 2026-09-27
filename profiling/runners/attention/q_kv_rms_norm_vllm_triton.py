@@ -1,4 +1,4 @@
-"""Profile the production DeepSeek V4 fused QR/KV RMSNorm call."""
+"""Profile vLLM's shared fused QR/KV RMSNorm call (DeepSeek V4, GLM-5.3 MLA)."""
 
 from typing import Any
 
@@ -8,15 +8,17 @@ from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerN
 from profiling.runners.metrics import ComputeMetrics
 
 _BACKEND = "q_kv_rms_norm:vllm_triton"
-_IDENTITY = (1536, 512, 1.0e-6, "bf16")
+_GPUS = frozenset({"NVIDIA H200", "NVIDIA B200"})
+# Served checkpoints use rms_eps 1e-6 or 1e-5; the scalar never changes the launch.
+_IDENTITIES = frozenset({(1536, 512, 1.0e-6, "bf16"), (1536, 512, 1.0e-5, "bf16")})
 
 
 def _validate_args(num_tokens: int, q_dim: int, kv_dim: int, rms_eps: float, dtype: object) -> None:
     if type(num_tokens) is not int or not 1 <= num_tokens <= 65_536:
         raise ValueError("num_tokens must be an integer in [1, 65536]")
     identity = (q_dim, kv_dim, rms_eps, str(dtype))
-    if identity != _IDENTITY:
-        raise ProfilerNotImplemented(f"{_BACKEND} supports {_IDENTITY}, got {identity}")
+    if identity not in _IDENTITIES:
+        raise ProfilerNotImplemented(f"{_BACKEND} supports {sorted(_IDENTITIES)}, got {identity}")
 
 
 def _reference(torch: Any, values: Any, weight: Any, eps: float) -> Any:
@@ -32,20 +34,18 @@ def profile_q_kv_rms_norm_vllm_triton(
     _validate_args(num_tokens, q_dim, kv_dim, rms_eps, dtype)
     try:
         import torch
-        from vllm.models.deepseek_v4.common.ops import fused_q_kv_rmsnorm
+        from vllm.models.common.ops import fused_q_kv_rmsnorm
     except ImportError as exc:
         raise ProfilerNotImplemented(f"{_BACKEND} requires pinned vLLM") from exc
     try:
-        if not torch.cuda.is_available() or torch.cuda.get_device_name() != "NVIDIA H200":
-            raise ProfilerNotImplemented(f"{_BACKEND} requires NVIDIA H200")
+        if not torch.cuda.is_available() or torch.cuda.get_device_name() not in _GPUS:
+            raise ProfilerNotImplemented(f"{_BACKEND} requires one of {sorted(_GPUS)}")
         device = torch.device("cuda", torch.cuda.current_device())
         generator = torch.Generator(device=device).manual_seed(43)
-        qr = torch.randn(
-            (num_tokens, q_dim), dtype=torch.bfloat16, device=device, generator=generator
-        )
-        kv = torch.randn(
-            (num_tokens, kv_dim), dtype=torch.bfloat16, device=device, generator=generator
-        )
+        # Callers pass split views of the fused q_a/kv_a projection output.
+        qr, kv = torch.randn(
+            (num_tokens, q_dim + kv_dim), dtype=torch.bfloat16, device=device, generator=generator
+        ).split([q_dim, kv_dim], dim=-1)
         q_weight = torch.randn(q_dim, dtype=torch.bfloat16, device=device, generator=generator)
         kv_weight = torch.randn(kv_dim, dtype=torch.bfloat16, device=device, generator=generator)
 

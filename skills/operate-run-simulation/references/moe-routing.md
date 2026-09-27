@@ -65,6 +65,8 @@ deployment, and workload. Today it holds:
   above;
 - `glm53_nvfp4_dflash2`: GLM-5.3 NVFP4, vLLM TP4 EP4 with DFlash2-7, body layers
   only, at commit `c09af698f8192222ee8852f8c727630789890310`.
+- `glm53_flash_fp8_tp4_ep4`: GLM-5.3-Flash FP8, vLLM TP4 EP4 without speculative
+  decoding, the 42 MoE layers, at commit `869a5d3966097154a654db4586c11cab92db046e`.
 
 Publish a new capture as a new directory, and reference it by the upload's
 commit.

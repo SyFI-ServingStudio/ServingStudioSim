@@ -48,7 +48,7 @@ DOC = KernelDoc(
     ),
     default_metric="memory_bandwidth_gbps",
     method=(f"{CUPTI_METHOD} Three warm-up calls run first; every launch of the call is counted."),
-    caveats=("Only q_dim = 1536 and kv_dim = 512 on H200 are measured.",),
+    caveats=("Only q_dim = 1536 and kv_dim = 512 on H200 and B200 are measured.",),
     reference=None,
 )
 
@@ -65,7 +65,9 @@ register(
         args_schema=QKvRmsNormArgs,
         metric_family=MetricFamily.COMPUTE,
         batch_outlier_policy=BatchOutlierPolicy(),
-        supports=BackendSupport(compute=frozenset({DType.BF16}), gpus=frozenset({"NVIDIA H200"})),
+        supports=BackendSupport(
+            compute=frozenset({DType.BF16}), gpus=frozenset({"NVIDIA H200", "NVIDIA B200"})
+        ),
         subprocess_env="vllm_env",
         doc=BackendDoc(
             summary="vLLM's fused_q_kv_rmsnorm Triton call normalizes both projections together.",

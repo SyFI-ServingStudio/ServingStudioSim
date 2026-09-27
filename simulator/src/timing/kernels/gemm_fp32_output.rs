@@ -1,4 +1,4 @@
-//! BF16 GEMM whose production callable materializes an FP32 output.
+//! GEMM (BF16 or FP32 inputs) whose production callable materializes an FP32 output.
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::CacheKind;

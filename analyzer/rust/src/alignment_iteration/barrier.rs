@@ -24,6 +24,18 @@
 //!   launches across its streams, clipped to the window. The rank with the
 //!   largest union wins the segment. The window is the same for every rank, so
 //!   this is also the rank with the least idle time.
+//! * A **PDL wait under a collective** is not busy time. A kernel launched with
+//!   programmatic dependent launch behind a collective on the same stream can
+//!   become resident while that collective still runs, and sit on
+//!   `griddepcontrol.wait` until it ends. On an early rank the collective is
+//!   spinning for a late peer, so the resident dependent would otherwise fill
+//!   the early rank's busy union and win the segment with the late rank's
+//!   launch gaps. Before the race, every non-collective launch that starts
+//!   inside a collective on its own device and stream is trimmed to start at
+//!   that collective's end. The trimmed stretch is reported as
+//!   `pdl_wait_under_collective`, off the path, and the winner's window counts
+//!   it as idle. A launch on another stream is real concurrent work and is not
+//!   trimmed.
 //!
 //! The windows and the barriers tile `[T_begin, T_end]` over every rank, so
 //!
@@ -118,6 +130,11 @@ pub(super) struct BarrierPath {
     /// leave. It is already inside `collective_ns`, so it is not subtracted again.
     pub hidden_under_collective_same_stream_ns: u64,
     pub hidden_under_collective_cross_stream_ns: u64,
+    /// Every rank's non-collective launch time that started inside a collective
+    /// on its own device and stream, up to that collective's end (a PDL
+    /// dependent resident on `griddepcontrol.wait`). Trimmed before the segment
+    /// races, so it is never busy: off the path, like `collective_skew_ns`.
+    pub pdl_wait_under_collective_ns: u64,
     pub critical_rank_switches: usize,
     pub critical_busy_ns_by_device: BTreeMap<i64, u64>,
     /// Per position, its share of the critical path. Sums to `critical_path_ns`.
@@ -322,6 +339,27 @@ fn split_by_weight<K: Clone + Ord>(
     out
 }
 
+/// Where a launch's busy time begins once any PDL wait is removed.
+///
+/// `collectives` are one device's collective launches on the launch's stream,
+/// sorted by start. A launch that starts inside one, at or after its start and
+/// before its end, can only be resident on `griddepcontrol.wait` until it ends:
+/// on one stream the dependent's own work cannot begin before its primary
+/// finishes. Back-to-back collectives are followed until the start is outside
+/// every one of them.
+fn pdl_trimmed_start(collectives: &[(u64, u64)], mut start_ns: u64) -> u64 {
+    loop {
+        let covering = collectives[..collectives.partition_point(|&(start, _)| start <= start_ns)]
+            .iter()
+            .map(|&(_, end)| end)
+            .max();
+        match covering {
+            Some(end) if end > start_ns => start_ns = end,
+            _ => return start_ns,
+        }
+    }
+}
+
 /// The lowest device holding the largest value.
 fn first_max(values: impl IntoIterator<Item = (i64, u64)>) -> Option<i64> {
     let mut best: Option<(i64, u64)> = None;
@@ -429,26 +467,60 @@ pub(super) fn barrier_path(measurement: &IterationMeasurement) -> Result<Barrier
         });
     }
 
-    // Non-collective launches per rank, for the segment races.
+    // Collective launches per device and stream, for the PDL-wait trim.
+    let mut collectives: BTreeMap<(i64, (bool, u64)), Vec<(u64, u64)>> = BTreeMap::new();
+    for (_, item) in kernels.iter().filter(|(_, item)| item.synchronizing) {
+        for launch in &item.launches {
+            collectives
+                .entry((launch.device_id, stream_key(launch)))
+                .or_default()
+                .push((launch.start_ns, launch.end_ns));
+        }
+    }
+    for intervals in collectives.values_mut() {
+        intervals.sort_unstable();
+    }
+
+    // Non-collective launches per rank, for the segment races. `raw` keeps the
+    // untrimmed launches for the under-collective report, which describes launch
+    // time inside barrier windows whatever it was doing.
     let mut by_device: BTreeMap<i64, Vec<RankLaunch>> = BTreeMap::new();
+    let mut raw_by_device: BTreeMap<i64, Vec<RankLaunch>> = BTreeMap::new();
     for (position, (_, item)) in kernels.iter().enumerate() {
         if item.synchronizing {
             continue;
         }
         for launch in &item.launches {
+            let raw = RankLaunch {
+                start_ns: launch.start_ns,
+                end_ns: launch.end_ns,
+                track_index: launch.track_index,
+                position,
+                stream: stream_key(launch),
+            };
+            raw_by_device.entry(launch.device_id).or_default().push(raw);
+            let start_ns = pdl_trimmed_start(
+                collectives
+                    .get(&(launch.device_id, raw.stream))
+                    .map_or(&[], Vec::as_slice),
+                launch.start_ns,
+            );
+            if start_ns >= launch.end_ns {
+                path.pdl_wait_under_collective_ns += launch.end_ns - launch.start_ns;
+                continue;
+            }
+            path.pdl_wait_under_collective_ns += start_ns - launch.start_ns;
             by_device
                 .entry(launch.device_id)
                 .or_default()
-                .push(RankLaunch {
-                    start_ns: launch.start_ns,
-                    end_ns: launch.end_ns,
-                    track_index: launch.track_index,
-                    position,
-                    stream: stream_key(launch),
-                });
+                .push(RankLaunch { start_ns, ..raw });
         }
     }
     let ranks: BTreeMap<i64, RankLaunches> = by_device
+        .into_iter()
+        .map(|(device, launches)| (device, RankLaunches::new(launches)))
+        .collect();
+    let raw_ranks: BTreeMap<i64, RankLaunches> = raw_by_device
         .into_iter()
         .map(|(device, launches)| (device, RankLaunches::new(launches)))
         .collect();
@@ -570,7 +642,7 @@ pub(super) fn barrier_path(measurement: &IterationMeasurement) -> Result<Barrier
                 .filter(|launch| launch.device_id == last_exit_device)
                 .map(stream_key)
                 .collect();
-            if let Some(launches) = ranks.get(&last_exit_device) {
+            if let Some(launches) = raw_ranks.get(&last_exit_device) {
                 for launch in launches.window(hi, exit_ns) {
                     let clipped = launch
                         .end_ns
@@ -877,7 +949,94 @@ mod tests {
         assert_eq!(path.collective_ns, 10);
         assert_eq!(path.hidden_under_collective_same_stream_ns, 2);
         assert_eq!(path.hidden_under_collective_cross_stream_ns, 3);
+        // Only `next` on rank 0 starts inside its own collective on its stream;
+        // `side` is on another stream and stays real work.
+        assert_eq!(path.pdl_wait_under_collective_ns, 2);
         assert_eq!(path.critical_path_ns(), 14);
+        assert_identities(&path);
+    }
+
+    #[test]
+    fn a_pdl_wait_on_an_early_rank_does_not_win_the_race_for_it() {
+        // Rank 0 arrives at its all-reduce at 2 and spins until the late rank 1
+        // arrives at 18. Its PDL successor becomes resident at 3 on the same
+        // stream and waits there until the collective ends at 20. Rank 1 spends
+        // the window launching with gaps. Untrimmed, rank 0 would "win" with 17
+        // of residency; trimmed, rank 1 wins and its gaps are idle.
+        let measured = measurement(vec![
+            position("attn", false, &[(0, 0, 2, 0), (1, 0, 4, 0)]),
+            position("attn", false, &[(1, 8, 12, 0)]),
+            position("attn", false, &[(1, 16, 18, 0)]),
+            position("ar", true, &[(0, 2, 20, 0), (1, 18, 20, 0)]),
+            position("mhc", false, &[(0, 3, 21, 0), (1, 19, 21, 0)]),
+        ]);
+        let path = barrier_path(&measured).unwrap();
+        let segment = &path.segments[0];
+        assert_eq!(segment.winner, Some(1));
+        assert_eq!(segment.busy_ns_by_device, BTreeMap::from([(0, 2), (1, 10)]));
+        assert_eq!(segment.idle_internal_ns, 8);
+        assert_eq!(segment.idle_boundary_ns, 0);
+        assert_eq!(segment.gating_device_id, Some(1));
+        assert_eq!(path.collective_ns, 2);
+        assert_eq!(path.collective_skew_ns, 16);
+        // 17 on rank 0 (3..20) and 1 on rank 1 (19..20).
+        assert_eq!(path.pdl_wait_under_collective_ns, 18);
+        assert_eq!(path.critical_busy_ns, 11);
+        assert_eq!(path.idle_internal_ns, 8);
+        assert_eq!(path.kernel_critical_ns, vec![4, 4, 2, 2, 1]);
+        assert_eq!(path.wall_ns, 21);
+        assert_identities(&path);
+        // The per-launch diagnostic still sees the successor under the collective.
+        let overlaps = launch_overlaps(&measured);
+        assert_eq!(overlaps[4][0].same_stream_ns, 17);
+        assert_eq!(overlaps[4][0].partners, vec![(3, 17)]);
+    }
+
+    #[test]
+    fn a_successor_that_starts_after_the_collective_is_untouched() {
+        let path = barrier_path(&measurement(vec![
+            position("attn", false, &[(0, 0, 4, 0), (1, 0, 10, 0)]),
+            position("ar", true, &[(0, 4, 13, 0), (1, 10, 13, 0)]),
+            position("moe", false, &[(0, 13, 25, 0), (1, 14, 16, 0)]),
+        ]))
+        .unwrap();
+        assert_eq!(path.pdl_wait_under_collective_ns, 0);
+        assert_eq!(path.segments[0].winner, Some(1));
+        assert_eq!(path.critical_busy_ns, 22);
+        assert_eq!(path.collective_ns, 3);
+        assert_identities(&path);
+    }
+
+    #[test]
+    fn a_wait_across_back_to_back_collectives_is_trimmed_to_the_last_one() {
+        // The successor starts inside the first of two collectives on its
+        // stream; one launch lies entirely inside the second and is not busy.
+        let path = barrier_path(&measurement(vec![
+            position("ar", true, &[(0, 0, 10, 0), (1, 0, 10, 0)]),
+            position("norm", true, &[(0, 10, 12, 0), (1, 10, 12, 0)]),
+            position("inside", false, &[(0, 10, 11, 0)]),
+            position("next", false, &[(0, 5, 16, 0), (1, 12, 16, 0)]),
+        ]))
+        .unwrap();
+        assert_eq!(path.pdl_wait_under_collective_ns, 1 + 7);
+        assert_eq!(path.critical_busy_ns, 4);
+        assert_eq!(path.collective_ns, 12);
+        assert_identities(&path);
+    }
+
+    #[test]
+    fn trimming_keeps_every_identity_on_a_multi_rank_pdl_chain() {
+        let path = barrier_path(&measurement(vec![
+            position("a", false, &[(0, 0, 3, 0), (1, 0, 9, 0), (2, 0, 6, 1)]),
+            position("ar", true, &[(0, 3, 12, 0), (1, 9, 12, 0), (2, 6, 12, 1)]),
+            position("post", false, &[(0, 4, 13, 0), (1, 10, 13, 0), (2, 7, 13, 1)]),
+            position("side", false, &[(0, 5, 8, 1)]),
+            position("b", false, &[(0, 13, 20, 0), (1, 14, 18, 0), (2, 13, 22, 1)]),
+            position("ar2", true, &[(0, 20, 25, 0), (1, 18, 25, 0), (2, 22, 25, 1)]),
+        ]))
+        .unwrap();
+        // 8 + 2 + 5 of residency; `side` runs on another stream and is kept.
+        assert_eq!(path.pdl_wait_under_collective_ns, 15);
         assert_identities(&path);
     }
 

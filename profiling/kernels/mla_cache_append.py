@@ -27,7 +27,7 @@ KIND: str = "mla_cache_append"
 class MlaCacheAppendArgs(KernelArgs):
     num_tokens: int = arg(unit="tokens", doc="Token rows appended to the cache.")
     kv_lora_rank: int = arg(unit="elements", doc="Width of each compressed KV latent.")
-    rope_dim: int = arg(unit="elements", doc="Width of each rotary key part.")
+    rope_dim: int = arg(unit="elements", doc="Width of each rotary key part; 0 when there is none.")
     block_size: int = arg(unit="tokens", doc="Token positions in each cache page.")
     input_dtype: DType = arg(doc="Element type of the source rows.")
     kv_dtype: DType = arg(doc="Element type of the cache entries.")
@@ -42,7 +42,8 @@ DOC = KernelDoc(
         "kv_lora_rank-wide latent and a rope_dim-wide rotary key into one paged"
         " cache entry. The measurement scatters the rows to distinct random "
         "slots. The supported shape is 512 latent elements, 64 rotary elements "
-        "and 64-token pages."
+        "and 64-token pages; vllm_cuda also accepts rope_dim = 0, a latent "
+        "without a rotary key, which it writes alone."
     ),
     category="Attention",
     subcategory="MLA",
@@ -56,8 +57,9 @@ DOC = KernelDoc(
         "back-to-back calls, taking the median of three runs, so the gap "
         "between its two launches is included. vllm_cuda and sglang_cuda use "
         "CUPTI kernel time with the L2 cache flushed before each launch: "
-        "vllm_cuda counts only concat_and_cache_mla_kernel, and sglang_cuda "
-        "counts every launch of its call after one setup call."
+        "vllm_cuda counts only concat_and_cache_mla_kernel, after checking that"
+        " every slot holds its row, and sglang_cuda counts every launch of its "
+        "call after one setup call."
     ),
     caveats=(
         "torch rows are warm-cache elapsed time and CUPTI rows are cold-cache "

@@ -284,7 +284,12 @@ def test_kernel_detail_joins_docs_roles_and_shapes(registered) -> None:
     }
 
 
+# The FP8 block-scale backend of this kind takes FP8 weights in 128-wide blocks.
+_FP8_BLOCK_BACKEND = "flashinfer_trtllm_fp8_block_sm100"
+
+
 def _nvfp4_row(backend: str) -> ProfileRow:
+    fp8 = backend == _FP8_BLOCK_BACKEND
     return ProfileRow(
         args=Nvfp4FusedMoeArgs(
             num_tokens=16,
@@ -294,9 +299,9 @@ def _nvfp4_row(backend: str) -> ProfileRow:
             num_local_experts=4,
             top_k=2,
             input_dtype=DType.BF16,
-            weight_format=DType.NVFP4_E2M1,
-            group_size=16,
-            routing_method="minimax2",
+            weight_format=DType.FP8_E4M3 if fp8 else DType.NVFP4_E2M1,
+            group_size=128 if fp8 else 16,
+            routing_method="deepseek_v3" if fp8 else "minimax2",
             n_group=1,
             topk_group=1,
             routed_scaling_numerator=5,
@@ -320,7 +325,7 @@ class Nvfp4Sources(FixtureSources):
         return [{"kind": "nvfp4_fused_moe", "compute_dtype": "weight_format", "kv_dtype": None}]
 
 
-def test_nvfp4_fused_moe_precision_is_its_nvfp4_compute_dtype(tmp_path: Path) -> None:
+def test_nvfp4_fused_moe_precision_is_each_backends_weight_format(tmp_path: Path) -> None:
     path = tmp_path / "nvfp4.db"
     for spec in iter_kernel_profiler_specs("nvfp4_fused_moe"):
         Table(spec, path).insert([_nvfp4_row(spec.backend)])
@@ -329,16 +334,24 @@ def test_nvfp4_fused_moe_precision_is_its_nvfp4_compute_dtype(tmp_path: Path) ->
     catalog = client.get(f"{PREFIX}/kernels").json()
     kernel = next(k for k in catalog["kernels"] if k["kind"] == "nvfp4_fused_moe")
     # Not bf16: that is input_dtype, the activation before in-kernel quantization.
-    assert kernel["precisions"] == ["nvfp4_e2m1"]
-    assert catalog["precisions"] == ["nvfp4_e2m1"]
+    assert kernel["precisions"] == ["fp8_e4m3", "nvfp4_e2m1"]
+    assert catalog["precisions"] == ["fp8_e4m3", "nvfp4_e2m1"]
     (b200,) = catalog["gpus"]
-    assert b200["peaks"]["tflops"] == {"by_dtype": {"nvfp4_e2m1": 9000.0}, "note": "dense"}
+    assert b200["peaks"]["tflops"] == {
+        "by_dtype": {"fp8_e4m3": 4500.0, "nvfp4_e2m1": 9000.0},
+        "note": "dense",
+    }
 
     detail = client.get(f"{PREFIX}/kernels/nvfp4_fused_moe").json()
     assert [a["name"] for a in detail["args"] if a["precision"]] == ["weight_format"]
     types = {a["name"]: a["type"] for a in detail["args"]}
     assert types["weight_format"] == types["input_dtype"] == "dtype"
-    assert {b["supports"]["compute"][0] for b in detail["backends"].values()} == {"nvfp4_e2m1"}
+    assert {
+        name: backend["supports"]["compute"] for name, backend in detail["backends"].items()
+    } == {
+        name: ["fp8_e4m3"] if name == _FP8_BLOCK_BACKEND else ["nvfp4_e2m1"]
+        for name in detail["backends"]
+    }
 
 
 @pytest.mark.needs_binary

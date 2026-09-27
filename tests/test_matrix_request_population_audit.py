@@ -81,3 +81,101 @@ def test_dense_ids_are_resolved_before_population_comparison(tmp_path, mutation)
         sidecar.write_text(json.dumps({"output_trace_sha256": "stale"}))
         stale = measure_case(tmp_path)
         assert any("manifest does not match" in issue for issue in stale.issues)
+
+
+def _write_population(tmp_path, arrivals, replay_arrivals, simulated_arrivals=None):
+    rows = [
+        {"id": f"r{index}", "input_len": 8, "output_len": 4, "arrival_time": arrival}
+        for index, arrival in enumerate(arrivals)
+    ]
+    trace = tmp_path / "trace.csv"
+    with trace.open("w", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+    replay = tmp_path / "replay.jsonl"
+    replay.write_text("\n".join(json.dumps({
+        "source": {"data": {"id": row["id"], "input_len": 8, "output_len_target": 4,
+                            "arrival_time_ms": measured}},
+        "outcome": {"status": "SUCCESS", "output_len_actual": 4},
+    }) for row, measured in zip(rows, replay_arrivals)))
+    slo = tmp_path / "request_slo.parquet"
+    simulated = [
+        {"request_id": index, "completed": True, "fresh_prompt_tokens": 8, "num_output_tokens": 4}
+        for index in range(len(rows))
+    ]
+    if simulated_arrivals is not None:
+        for row, arrival in zip(simulated, simulated_arrivals):
+            row["arrival_time_ms"] = arrival
+    pq.write_table(pa.Table.from_pylist(simulated), slo)
+    return {"trace_path": trace, "replay_path": replay, "slo_path": slo}
+
+
+def test_a_rate_rescaled_replay_passes_with_one_arrival_scale(tmp_path):
+    # req-frontend `--rate 2.7` over a 1 req/s trace scales every offset by 1/2.7.
+    arrivals = [0.0, 1000.0, 2000.0, 3000.0]
+    paths = _write_population(tmp_path, arrivals, [a / 2.7 for a in arrivals])
+    result = audit_request_population(**paths)
+    assert result["all_ok"]
+    assert result["arrival_time_scale"] == pytest.approx(1 / 2.7)
+
+
+def test_an_arrival_off_the_common_scale_is_rejected(tmp_path):
+    arrivals = [0.0, 1000.0, 2000.0, 3000.0]
+    replayed = [a / 2.7 for a in arrivals]
+    replayed[1] += 5.0
+    with pytest.raises(ValueError, match="arrival or completion differ: r1"):
+        audit_request_population(**_write_population(tmp_path, arrivals, replayed))
+
+
+@pytest.mark.parametrize(
+    ("simulated_factor", "agrees"),
+    [(1.0, True), (1.09, True), (0.91, True), (1.11, False), (0.1, False)],
+)
+def test_a_trace_timed_simulation_must_replay_at_the_measured_arrival_scale(
+    tmp_path, simulated_factor, agrees
+):
+    arrivals = [0.0, 1263.25, 3555.27, 114912.47]
+    paths = _write_population(
+        tmp_path, arrivals, arrivals, [a * simulated_factor for a in arrivals]
+    )
+    result = audit_request_population(**paths, simulated_arrival_mode="trace_timed")
+    assert result["checks"]["arrival_time_scale_matches"] == agrees
+    assert result["all_ok"] == agrees
+    assert result["simulated_arrival_time_scale"] == pytest.approx(simulated_factor)
+
+
+def test_a_saturated_simulation_skips_the_arrival_scale_check(tmp_path):
+    arrivals = [0.0, 1000.0, 2000.0]
+    paths = _write_population(tmp_path, arrivals, arrivals, [0.0, 0.0, 0.0])
+    result = audit_request_population(**paths, simulated_arrival_mode="saturated")
+    assert "arrival_time_scale_matches" not in result["checks"]
+    assert result["all_ok"]
+
+
+def test_alignment_analyze_refuses_a_simulation_at_another_arrival_scale(tmp_path):
+    from launcher.alignment import _check_arrival_time_scale
+
+    # The default `request_rate: 10.0` compresses trace_timed arrivals tenfold.
+    arrivals = [0.0, 1263.25, 3555.27]
+    paths = _write_population(tmp_path, arrivals, arrivals, [a / 10 for a in arrivals])
+    raw = tmp_path / "simulation/raw"
+    raw.mkdir(parents=True)
+    paths["slo_path"].rename(raw / "request_slo.parquet")
+    (raw / "params.json").write_text(json.dumps({"workload": {
+        "session_dependency": "independent", "arrival_mode": "trace_timed",
+        "trace_files": [str(paths["trace_path"])],
+    }}))
+    manifest = tmp_path / "alignment_manifest.json"
+    manifest.write_text(json.dumps({
+        "simulation_log_dir": str(raw.parent), "replay_result": str(paths["replay_path"]),
+    }))
+    with pytest.raises(ValueError, match="request_rate.*should be 1"):
+        _check_arrival_time_scale(manifest)
+
+    pq.write_table(pa.Table.from_pylist([
+        {"request_id": index, "completed": True, "fresh_prompt_tokens": 8,
+         "num_output_tokens": 4, "arrival_time_ms": arrival}
+        for index, arrival in enumerate(arrivals)
+    ]), raw / "request_slo.parquet")
+    _check_arrival_time_scale(manifest)

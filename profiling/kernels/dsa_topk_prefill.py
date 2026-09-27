@@ -58,8 +58,8 @@ DOC = KernelDoc(
         "before each."
     ),
     caveats=(
-        "Only one sequence with top_k = 2048 is measured, on scores that are "
-        "deterministic and free of ties.",
+        "Only one sequence is measured, on scores that are deterministic and "
+        "free of ties. top_k is 2048, and vllm_cuda also accepts 512 or 1024.",
         "GB/s counts valid scores, row bounds and output indices, not padding "
         "or torch intermediates; SGLang also counts its page-table output.",
     ),

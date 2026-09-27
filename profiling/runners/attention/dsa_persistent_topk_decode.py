@@ -5,7 +5,9 @@ production backend packages a corrected vLLM v0.23-derived
 ``persistent_topk``: lengths through ``top_k`` retain the pinned natural-index
 writer, while every longer row uses the bundled cooperative radix path. Its
 workspace memset and one persistent kernel write all ``top_k`` slots. The
-indexer's separate outer global index-buffer fill remains excluded.
+indexer's separate outer global index-buffer fill remains excluded. On B200 the
+backend calls the image vLLM's own ``persistent_topk`` (3f667d7eb), whose
+buffered selection paths have a known tie-overflow bug (``_overflow_buffer``).
 """
 
 from __future__ import annotations
@@ -27,6 +29,8 @@ _INDEX_DTYPE = "int32"
 _CONTEXT_MODE = "uniform"
 _REQUIRED_GPU = "NVIDIA H200"
 _VLLM_SUPPORTED_GPUS = ("NVIDIA H200", "NVIDIA B200")
+# The callable's K instantiations; GLM-5.3-Flash's kpool indexer selects 2048 / 4.
+_VLLM_TOP_K = frozenset({512, 1024, 2048})
 _WORKSPACE_BYTES = 1024 * 1024
 
 
@@ -62,6 +66,7 @@ def _validate_args(
     logits_dtype: DType | str,
     index_dtype: str,
     context_mode: str,
+    allowed_top_k: frozenset[int] = frozenset({_TOP_K}),
 ) -> tuple[int, int, int, int, int, int, DType, str, str]:
     batch_size = int(batch_size)
     context_len = int(context_len)
@@ -97,8 +102,9 @@ def _validate_args(
         raise ValueError(
             f"context_len must be <= max_model_len, got {context_len} and {max_model_len}"
         )
-    if top_k != _TOP_K:
-        raise ValueError(f"dsa_persistent_topk_decode requires top_k=2048, got {top_k}")
+    if top_k not in allowed_top_k:
+        required = " or ".join(f"top_k={value}" for value in sorted(allowed_top_k))
+        raise ValueError(f"dsa_persistent_topk_decode requires {required}, got {top_k}")
     if logits_row_stride <= 0 or logits_row_stride < max_model_len:
         raise ValueError(
             "logits_row_stride must be positive and >= max_model_len, "
@@ -365,6 +371,59 @@ def _native_call(
     )
 
 
+def _fp16_key_bin(torch: Any, values: Any, shift: int) -> Any:
+    """The kernel's fp16 sign-magnitude key, keeping its top ``16 - shift`` bits."""
+    bits = values.to(torch.float16).view(torch.int16).to(torch.int32) & 0xFFFF
+    key = torch.where((bits & 0x8000) != 0, (~bits) & 0xFFFF, bits | 0x8000)
+    return key >> shift
+
+
+def _overflow_buffer(num_rows: int, length: int, top_k: int) -> tuple[int, int] | None:
+    """``(bin shift, buffered items)`` of the B200 kernel path a row takes, if it buffers.
+
+    Each buffered path keeps at most that many threshold-bin candidates and
+    silently drops the rest, so its top-k is wrong when the bin overflows
+    (captures 20260925_0 and _4). The timing is still the production kernel's.
+    """
+    if num_rows > 32:
+        # FilteredTopK: >32K rows bin by 8 bits into FILTERED_TOPK_SMEM_INPUT_SIZE;
+        # the <=32K short path bins by 12 bits and keeps top_k ties.
+        return (8, 16384) if length > 32768 else (4, top_k)
+    if length <= 8192:
+        return 5, 3708  # decode path: 11-bit bins, DBUF items
+    if length <= 32768:
+        return 8, 4096  # medium histogram_256_topk: MAX_BUFFERED_ITEMS
+    return None  # cooperative radix path buffers nothing
+
+
+def _medium_overflow_explains(
+    torch: Any,
+    row_logits: Any,
+    actual_indices: Any,
+    expected_values: Any,
+    num_rows: int = 1,
+) -> bool:
+    """Return whether a threshold-bin buffer overflow accounts for one bad row.
+
+    The row must take a buffering path, its threshold bin (the bin of the
+    reference k-th value) must hold more candidates than that path buffers, and
+    the kernel must still have selected every element strictly above that bin
+    and nothing below it -- only the threshold-bin tie-break may differ.
+    """
+    path = _overflow_buffer(num_rows, int(row_logits.numel()), int(actual_indices.numel()))
+    if path is None:
+        return False
+    shift, buffered_items = path
+    bins = _fp16_key_bin(torch, row_logits, shift)
+    threshold = int(_fp16_key_bin(torch, expected_values.min().reshape(1), shift)[0])
+    if int((bins == threshold).sum()) <= buffered_items:
+        return False
+    selected_bins = bins.index_select(0, actual_indices)
+    if bool((selected_bins < threshold).any()):
+        return False
+    return int((selected_bins > threshold).sum()) == int((bins > threshold).sum())
+
+
 def _validate_native_semantics(
     torch: Any,
     op: Any,
@@ -372,9 +431,13 @@ def _validate_native_semantics(
     *,
     top_k: int,
     max_seq_len: int,
-    strict_reference: bool = True,
+    overflow_allowed: bool = False,
 ) -> None:
-    """Compare corrected native output with the committed semantic reference."""
+    """Compare native output with the committed semantic reference.
+
+    ``overflow_allowed`` accepts a mismatching long row only when a buffer
+    overflow fully explains it (``_medium_overflow_explains``).
+    """
     from profiling.runners.attention.dsa_persistent_topk_decode_reference import (
         dsa_persistent_topk_decode_reference,
     )
@@ -418,19 +481,25 @@ def _validate_native_semantics(
             raise RuntimeError("persistent CUDA returned an out-of-range long-row index")
         if bool((actual_long.sort(dim=1).values.diff(dim=1) == 0).any()):
             raise RuntimeError("persistent CUDA returned duplicate long-row indices")
-        if strict_reference and not torch.equal(
-            actual_long.sort(dim=1).values,
-            expected_long.sort(dim=1).values,
-        ):
-            raise RuntimeError("pinned CUDA disagrees with long-row reference selections")
         long_logits = operands.logits.index_select(0, long_rows)
         actual_values = long_logits.gather(1, actual_long)
         expected_values = long_logits.gather(1, expected_long)
-        if strict_reference and not torch.equal(
-            actual_values.sort(dim=1).values,
-            expected_values.sort(dim=1).values,
-        ):
-            raise RuntimeError("pinned CUDA disagrees with long-row reference values")
+        selection_rows = (actual_long.sort(1).values != expected_long.sort(1).values).any(1)
+        value_rows = (actual_values.sort(1).values != expected_values.sort(1).values).any(1)
+        for position in torch.nonzero(selection_rows | value_rows).flatten().tolist():
+            length = int(operands.flat_lengths[long_rows[position]])
+            if not (
+                overflow_allowed
+                and _medium_overflow_explains(
+                    torch,
+                    long_logits[position, :length],
+                    actual_long[position],
+                    expected_values[position],
+                    num_rows=int(operands.flat_lengths.numel()),
+                )
+            ):
+                kind = "values" if bool(value_rows[position]) else "selections"
+                raise RuntimeError(f"pinned CUDA disagrees with long-row reference {kind}")
 
     if returned is not None:
         raise RuntimeError("pinned persistent_topk must return None")
@@ -590,7 +659,13 @@ def profile_dsa_persistent_topk_decode_vllm_cuda(
     index_dtype: str,
     context_mode: str,
 ) -> ComputeMetrics:
-    """Profile the complete corrected v0.23-derived persistent callable."""
+    """Profile the complete persistent callable (pinned v0.23 on H200, image vLLM on B200).
+
+    For GLM-5.3-Flash kpool (``top_k`` 512), ``context_len`` is the row's pool
+    count and ``max_model_len`` the token-wide logits width. The call passes
+    ``max_seq_len = context_len``; production passes the batch's token maximum,
+    which only gates the <=32-row cooperative radix setup (``> 32768``).
+    """
     (
         batch_size,
         context_len,
@@ -611,6 +686,7 @@ def profile_dsa_persistent_topk_decode_vllm_cuda(
         logits_dtype,
         index_dtype,
         context_mode,
+        allowed_top_k=_VLLM_TOP_K,
     )
     try:
         import torch
@@ -639,7 +715,7 @@ def profile_dsa_persistent_topk_decode_vllm_cuda(
             operands,
             top_k=top_k,
             max_seq_len=context_len,
-            strict_reference=gpu_name != "NVIDIA B200",
+            overflow_allowed=gpu_name == "NVIDIA B200",
         )
 
         def kernel() -> None:

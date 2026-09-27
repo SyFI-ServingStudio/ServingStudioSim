@@ -80,10 +80,22 @@ impl KernelSpec for DsaPersistentTopkDecodeSpec {
                 1, 2, 4, 8, 12, 15, 16, 17, 23, 24, 31, 32, 33, 39, 46, 48, 64, 65, 66, 67, 92, 96,
                 127, 128, 129, 130, 131, 132, 133, 197, 198, 199, 255, 256,
             ]),
-            Axis::values([
-                0, 1, 2, 128, 256, 512, 1024, 2046, 2047, 2048, 2049, 2050, 2897, 4096, 5792, 8191,
-                8192, 8193, 16384, 32767, 32768, 32769, 65536, 131072, 262144, 524288, 1048576,
-            ]),
+            if config.top_k == 512 {
+                // GLM-5.3-Flash kpool: 512 pools selected, `context_len` in pools.
+                // Long-row time dips 13-15% at powers of two and sits on a lower
+                // plateau at 3600..5000 pools (B200 job 1134), so the axis skips
+                // powers of two past the short-row bracket and brackets the plateau.
+                Axis::values([
+                    0, 128, 511, 512, 513, 600, 1100, 1700, 2500, 3300, 3800, 4800, 6500, 8192,
+                    16384, 32767, 32768, 32769, 65536, 131072, 262144, 524288, 1048576,
+                ])
+            } else {
+                Axis::values([
+                    0, 1, 2, 128, 256, 512, 1024, 2046, 2047, 2048, 2049, 2050, 2897, 4096, 5792,
+                    8191, 8192, 8193, 16384, 32767, 32768, 32769, 65536, 131072, 262144, 524288,
+                    1048576,
+                ])
+            },
         ])
     }
 
@@ -495,6 +507,23 @@ mod tests {
         assert_eq!(fields.get("index_dtype"), Some(&Value::from("int32")));
         assert_eq!(fields.get("context_mode"), Some(&Value::from("uniform")));
         assert_eq!(payload.backend(), Some(VLLM_BACKEND));
+    }
+
+    /// GLM-5.3-Flash kpool decode (512 pools, token-wide 8192 logits rows) gets
+    /// its own context axis with the 511/512/513 short-row bracket.
+    #[test]
+    fn kpool_top_k_512_uses_the_pooled_context_axis() {
+        let mut cfg = config(1);
+        cfg.top_k = 512;
+        cfg.max_model_len = Dim::param("max_model_len", 8192);
+        cfg.logits_row_stride = Dim::param("max_model_len", 8192);
+        let grid = DsaPersistentTopkDecodeSpec::sweep_grid(&cfg);
+        assert!(grid.axes()[1].windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(grid.axes()[1]
+            .windows(3)
+            .any(|w| w == [511.0, 512.0, 513.0]));
+        let mask = DsaPersistentTopkDecodeSpec::infeasible_mask(&cfg, &grid);
+        assert_eq!(mask.iter().filter(|&&masked| !masked).count(), 34 * 14);
     }
 
     #[test]

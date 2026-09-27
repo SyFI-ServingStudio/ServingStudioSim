@@ -818,7 +818,7 @@ fn ensure_has_backends(
 
 #[cfg(test)]
 mod tests {
-    use super::{KernelConfig, KernelSpec, ensure_has_backends};
+    use super::{ensure_has_backends, KernelConfig, KernelSpec};
     use crate::timing::bridge::{ArgsPayload, KernelKind};
     use crate::timing::cache::{CacheKind, Extrapolation};
     use crate::timing::{BuildError, Coords, SweepCoords, SweepGrid};

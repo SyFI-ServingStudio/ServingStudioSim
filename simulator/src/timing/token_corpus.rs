@@ -288,12 +288,20 @@ impl TokenCorpus {
 
     /// Candidate `draw` of [`Self::sample_and_fold`]. Each draw has its own
     /// seed, so candidates are independent and can be drawn in any order.
-    pub(super) fn candidate(&self, num_tokens: u32, experts_per_rank: usize, draw: u32) -> Vec<u32> {
+    pub(super) fn candidate(
+        &self,
+        num_tokens: u32,
+        experts_per_rank: usize,
+        draw: u32,
+    ) -> Vec<u32> {
         let seed = self
             .config
             .seed
             .wrapping_add(u64::from(draw).wrapping_mul(CANDIDATE_STRIDE));
-        fold_layerwise_expert_counts(&self.sample_layer_counts(num_tokens, seed), experts_per_rank)
+        fold_layerwise_expert_counts(
+            &self.sample_layer_counts(num_tokens, seed),
+            experts_per_rank,
+        )
     }
 }
 

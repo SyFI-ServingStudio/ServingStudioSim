@@ -2,8 +2,8 @@
 set -euo pipefail
 
 repo_root=$(git rev-parse --show-toplevel)
-image=${VIBESIM_PROFILER_IMAGE:-vibesim-profiler-vllm:cu130}
-expected_vllm_revision=0b8edfb56f5df9cd512ce4ff586e7ac2c8f31921
+image=${VIBESIM_PROFILER_IMAGE:-vibesim-profiler-vllm:cu130-3f667d7e}
+expected_vllm_revision=3f667d7eb4572583f6ead3b677a55086bd2ecf3b
 vllm_revision=$(git -C "$repo_root/alignment/profiler/vllm" rev-parse HEAD)
 
 if [[ "$vllm_revision" != "$expected_vllm_revision" ]]; then

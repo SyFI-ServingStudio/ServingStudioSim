@@ -45,8 +45,10 @@ DOC = KernelDoc(
         "attention needs them as slots in the paged KV cache or, for prefill, "
         "in a workspace. Decode rows go through the block table; prefill rows "
         "add their local position to the request's workspace start. Invalid "
-        "slots stay -1. The measurement builds the rows, indices and page table"
-        " from the encoded counts and distribution patterns in the arguments."
+        "slots stay -1; when valid counts are returned, each row's valid slots "
+        "are packed to the front in no fixed order. The measurement builds the "
+        "rows, indices and page table from the encoded counts and distribution "
+        "patterns in the arguments."
     ),
     category="Attention",
     subcategory="DSA",
@@ -71,6 +73,8 @@ DOC = KernelDoc(
         "path skips both.",
         "Page tables and local indices follow the chosen patterns; they are not"
         " captured from serving.",
+        "Only 64-token blocks are accepted, with selected_k = 2048 for torch "
+        "and 2048 or 2176 for vllm_triton.",
     ),
     reference="profiling.runners.attention.dsa_sparse_index_remap_reference",
 )

@@ -84,6 +84,13 @@ class ServerConfig:
     # fork; absent on stock vLLM 0.19.1 — leave False there and rely on request
     # completion + a drain wait for idle.
     enable_server_load_tracking: bool = False
+    # vLLM HTTP API processes (`--api-server-count`). One process parses every
+    # request and drains every stream on one event loop; under a burst of
+    # concurrent requests it admits them into EngineCore serially, so
+    # EngineCore's own TTFT clock starts late and client TTFT inflates. None
+    # takes the vLLM driver's default (`DEFAULT_API_SERVER_COUNT`); SGLang has
+    # no such knob and rejects a value.
+    api_server_count: int | None = None
     extra_args: list[str] = field(default_factory=list)
 
 

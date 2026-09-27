@@ -44,6 +44,12 @@ _TRTLLM_KERNEL_NAME = "fmhaSm100"
 _TRTLLM_SUPPORTED_NUM_HEADS = frozenset({8, 16})
 _TRTLLM_WORKSPACE_BYTES = 128 * 1024 * 1024
 _TRTLLM_PAGE_SIZE = 64
+# GLM-5.3-Flash's rope-free MLA (rope_dim 0; FlashInfer >= 0.6.18
+# `nope_mla_dimensions`, 512-byte latent-only cache rows). Its page table is
+# `selected_k` wide: 2048, or vLLM's kpool buffer
+# round_up(index_topk + index_kpool - 1, 128) = 2176.
+_TRTLLM_FP8_NOPE_CACHE_LAYOUT = "hnd_paged_mqa_fp8_latent"
+_TRTLLM_FP8_NOPE_SELECTED_K = frozenset({2048, 2176})
 
 _UINT = r"(?:0|[1-9][0-9]*)"
 _UNIFORM_RE = re.compile(rf"u:({_UINT})x({_UINT})\Z")
@@ -83,6 +89,7 @@ class _TrtllmFp8Operands:
     block_tables: Any
     seq_lens: Any
     workspace: Any
+    top_k_lens: Any = None
 
 
 def _encode_valid_counts(counts: Sequence[int], *, selected_k: int, num_cache_tokens: int) -> str:
@@ -208,6 +215,8 @@ def _validate_args(
     expected_cache_dtype: DType = DType.BF16,
     expected_output_dtype: DType = DType.BF16,
     expected_cache_layout: str = _CACHE_LAYOUT,
+    expected_rope_dim: int = _ROPE_DIM,
+    allowed_selected_k: frozenset[int] = frozenset({_SELECTED_K}),
 ) -> _ValidatedArgs:
     integers = {
         "num_queries": num_queries,
@@ -233,11 +242,13 @@ def _validate_args(
         raise ProfilerNotImplemented(f"num_cache_tokens must be >= 1, got {num_cache_tokens}")
     expected = {
         "num_kv_heads": (num_kv_heads, _NUM_KV_HEADS),
-        "selected_k": (selected_k, _SELECTED_K),
         "latent_dim": (latent_dim, _LATENT_DIM),
-        "rope_dim": (rope_dim, _ROPE_DIM),
+        "rope_dim": (rope_dim, expected_rope_dim),
         "value_dim": (value_dim, _VALUE_DIM),
     }
+    if selected_k not in allowed_selected_k:
+        required_k = " or ".join(str(value) for value in sorted(allowed_selected_k))
+        raise ProfilerNotImplemented(f"selected_k must be {required_k}, got {selected_k}")
     for name, (actual, required) in expected.items():
         if actual != required:
             raise ProfilerNotImplemented(f"{name} must be {required}, got {actual}")
@@ -636,8 +647,10 @@ def _check_flashmla_correctness(
         raise AssertionError("FlashMLA output aliases an input")
 
 
-def _logical_flops(*, num_queries: int, num_heads: int, selected_k: int) -> int:
-    return 2 * num_queries * num_heads * selected_k * (_SCORE_DIM + _VALUE_DIM)
+def _logical_flops(
+    *, num_queries: int, num_heads: int, selected_k: int, score_dim: int = _SCORE_DIM
+) -> int:
+    return 2 * num_queries * num_heads * selected_k * (score_dim + _VALUE_DIM)
 
 
 def _logical_bytes(
@@ -649,10 +662,11 @@ def _logical_bytes(
     q_bytes: int = 2,
     cache_bytes: int = 2,
     output_bytes: int = 2,
+    score_dim: int = _SCORE_DIM,
 ) -> int:
-    q_read = q_bytes * num_queries * num_heads * _SCORE_DIM
+    q_read = q_bytes * num_queries * num_heads * score_dim
     index_read = 4 * num_queries * selected_k
-    cache_read = cache_bytes * sum(valid_counts) * _SCORE_DIM
+    cache_read = cache_bytes * sum(valid_counts) * score_dim
     output_write = output_bytes * num_queries * num_heads * _VALUE_DIM
     max_lse_write = 8 * num_queries * num_heads
     return q_read + index_read + cache_read + output_write + max_lse_write
@@ -745,30 +759,33 @@ def _build_trtllm_fp8_operands(
     validated: _ValidatedArgs,
     *,
     num_heads: int,
+    rope_dim: int,
+    selected_k: int,
     device: Any,
 ) -> _TrtllmFp8Operands:
     fp8 = torch.float8_e4m3fn
+    score_dim = _LATENT_DIM + rope_dim
     query = torch.empty(
-        (validated.num_queries, 1, num_heads, _SCORE_DIM),
+        (validated.num_queries, 1, num_heads, score_dim),
         dtype=fp8,
         device=device,
     )
     query.copy_(
-        torch.linspace(-0.75, 0.75, _SCORE_DIM, device=device)
-        .view(1, 1, 1, _SCORE_DIM)
+        torch.linspace(-0.75, 0.75, score_dim, device=device)
+        .view(1, 1, 1, score_dim)
         .expand_as(query)
     )
 
     num_pages = math.ceil(validated.num_cache_tokens / _TRTLLM_PAGE_SIZE)
     cache = torch.empty(
-        (num_pages, 1, _TRTLLM_PAGE_SIZE, _SCORE_DIM),
+        (num_pages, 1, _TRTLLM_PAGE_SIZE, score_dim),
         dtype=fp8,
         device=device,
     )
-    cache.copy_(torch.linspace(-0.5, 0.5, _SCORE_DIM, device=device).view(1, 1, 1, _SCORE_DIM))
+    cache.copy_(torch.linspace(-0.5, 0.5, score_dim, device=device).view(1, 1, 1, score_dim))
 
     block_tables = torch.zeros(
-        (validated.num_queries, 1, _SELECTED_K),
+        (validated.num_queries, 1, selected_k),
         dtype=torch.int32,
         device=device,
     )
@@ -783,12 +800,16 @@ def _build_trtllm_fp8_operands(
         )
         block_tables[row, 0, :count].copy_(indices.to(torch.int32))
 
+    seq_lens = torch.tensor(validated.valid_counts, dtype=torch.int32, device=device)
     return _TrtllmFp8Operands(
         query=query,
         cache=cache,
         block_tables=block_tables,
-        seq_lens=torch.tensor(validated.valid_counts, dtype=torch.int32, device=device),
+        seq_lens=seq_lens,
         workspace=torch.zeros(_TRTLLM_WORKSPACE_BYTES, dtype=torch.uint8, device=device),
+        # vLLM's rope-free call passes per-row active lengths; the kernel
+        # rejects zero, so empty rows get length 1 on the zero-filled slot 0.
+        top_k_lens=None if rope_dim else seq_lens.clamp(min=1),
     )
 
 
@@ -797,20 +818,24 @@ def _launch_trtllm_fp8(
     operands: _TrtllmFp8Operands,
     *,
     softmax_scale: float,
+    rope_dim: int = _ROPE_DIM,
+    selected_k: int = _SELECTED_K,
 ) -> Any:
+    extra = {} if rope_dim else {"sparse_mla_top_k_lens": operands.top_k_lens}
     return callable_(
         query=operands.query,
         kv_cache=operands.cache,
         workspace_buffer=operands.workspace,
         qk_nope_head_dim=_LATENT_DIM,
         kv_lora_rank=_LATENT_DIM,
-        qk_rope_head_dim=_ROPE_DIM,
+        qk_rope_head_dim=rope_dim,
         block_tables=operands.block_tables,
         seq_lens=operands.seq_lens,
-        max_seq_len=_SELECTED_K,
+        max_seq_len=selected_k,
         bmm1_scale=softmax_scale,
         bmm2_scale=1.0,
-        sparse_mla_top_k=_SELECTED_K,
+        sparse_mla_top_k=selected_k,
+        **extra,
     )
 
 
@@ -833,7 +858,12 @@ def profile_dsa_sparse_mla_attention_flashinfer_trtllm_fp8(
     index_distribution: str,
     cache_layout: str,
 ) -> ComputeMetrics:
-    """Profile vLLM's one-launch B200 FlashInfer sparse-MLA callable."""
+    """Profile vLLM's one-launch B200 FlashInfer sparse-MLA callable.
+
+    rope_dim 64 is GLM-5.2's latent+rope layout; rope_dim 0 is GLM-5.3-Flash's
+    rope-free layout with its own cache_layout and selected_k widths.
+    """
+    nope = rope_dim == 0
     if num_heads not in _TRTLLM_SUPPORTED_NUM_HEADS:
         raise ProfilerNotImplemented(
             f"{_TRTLLM_FP8_BACKEND} supports num_heads in "
@@ -859,7 +889,9 @@ def profile_dsa_sparse_mla_attention_flashinfer_trtllm_fp8(
         expected_num_heads=num_heads,
         expected_q_dtype=DType.FP8_E4M3,
         expected_cache_dtype=DType.FP8_E4M3,
-        expected_cache_layout=_TRTLLM_FP8_CACHE_LAYOUT,
+        expected_cache_layout=_TRTLLM_FP8_NOPE_CACHE_LAYOUT if nope else _TRTLLM_FP8_CACHE_LAYOUT,
+        expected_rope_dim=0 if nope else _ROPE_DIM,
+        allowed_selected_k=_TRTLLM_FP8_NOPE_SELECTED_K if nope else frozenset({_SELECTED_K}),
     )
 
     try:
@@ -877,6 +909,8 @@ def profile_dsa_sparse_mla_attention_flashinfer_trtllm_fp8(
             torch,
             validated,
             num_heads=num_heads,
+            rope_dim=rope_dim,
+            selected_k=selected_k,
             device=device,
         )
 
@@ -885,6 +919,8 @@ def profile_dsa_sparse_mla_attention_flashinfer_trtllm_fp8(
                 trtllm_batch_decode_with_kv_cache_mla,
                 operands,
                 softmax_scale=float(softmax_scale),
+                rope_dim=rope_dim,
+                selected_k=selected_k,
             )
 
         output = kernel()
@@ -911,6 +947,7 @@ def profile_dsa_sparse_mla_attention_flashinfer_trtllm_fp8(
         num_queries=num_queries,
         num_heads=num_heads,
         selected_k=selected_k,
+        score_dim=_LATENT_DIM + rope_dim,
     )
     logical_bytes = _logical_bytes(
         num_queries=num_queries,
@@ -919,6 +956,7 @@ def profile_dsa_sparse_mla_attention_flashinfer_trtllm_fp8(
         valid_counts=validated.valid_counts,
         q_bytes=1,
         cache_bytes=1,
+        score_dim=_LATENT_DIM + rope_dim,
     )
     seconds = time_ms / 1000.0
     return ComputeMetrics(
