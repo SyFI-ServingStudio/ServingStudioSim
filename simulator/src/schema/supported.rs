@@ -34,6 +34,7 @@ use serde::Serialize;
 pub enum SupportedValues {
     Int(&'static [i64]),
     Str(&'static [&'static str]),
+    Bool(&'static [bool]),
 }
 
 impl Serialize for SupportedValues {
@@ -41,6 +42,7 @@ impl Serialize for SupportedValues {
         match *self {
             SupportedValues::Int(v) => v.serialize(ser),
             SupportedValues::Str(v) => v.serialize(ser),
+            SupportedValues::Bool(v) => v.serialize(ser),
         }
     }
 }
@@ -68,6 +70,7 @@ impl SupportedRow {
             let options: Vec<serde_json::Value> = match values {
                 SupportedValues::Int(v) => v.iter().map(|x| (*x).into()).collect(),
                 SupportedValues::Str(v) => v.iter().map(|x| (*x).into()).collect(),
+                SupportedValues::Bool(v) => v.iter().map(|x| (*x).into()).collect(),
             };
             out = out
                 .into_iter()

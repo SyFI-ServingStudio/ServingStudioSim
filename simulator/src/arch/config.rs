@@ -134,6 +134,7 @@ pub enum IterArchSel {
     /// the grouped GEMM's dependence on how many tokens each expert draws: skew
     /// leaves the total token-expert selections unchanged while redistributing
     /// them into fuller and emptier groups.
+    #[supported(gpu = ["NVIDIA H200"], model_config = ["qwen3_6_35b_a3b_fp8"], fp8 = [true])]
     Qwen36Local {
         #[serde(flatten)]
         model: ModelSpec,
@@ -146,6 +147,7 @@ pub enum IterArchSel {
         #[param(cache_key)]
         expert_popularity_file: Option<String>,
     },
+    #[supported(gpu = ["NVIDIA H200"], model_config = ["llama3_8b"])]
     Llama3Dense {
         #[serde(flatten)]
         model: ModelSpec,
@@ -171,6 +173,7 @@ pub enum IterArchSel {
         #[param(default = 8, cache_key)]
         ffn_tp_size: u16,
     },
+    #[supported(gpu = ["NVIDIA H200"], model_config = ["qwen3_235b"], attn_tp_size = [4], ep_size = [8, 32], hp_size = [1], nvl_num_gpu = [8])]
     Qwen3MoeDpAttnEpFfn {
         #[serde(flatten)]
         model: ModelSpec,
@@ -258,6 +261,7 @@ pub enum IterArchSel {
     },
     /// DeepSeek-V4-Flash-0731 at vLLM's physical kernel boundaries. EP4 and
     /// local attention DP4 are checkpoint/deployment invariants.
+    #[supported(gpu = ["NVIDIA H200"], model_config = ["deepseek_v4_flash_0731"], fp8 = [true])]
     DeepseekV4Vllm {
         #[serde(flatten)]
         model: ModelSpec,
@@ -273,6 +277,7 @@ pub enum IterArchSel {
     /// The same physical DeepSeek kernels with each source-level parallel
     /// region serialized. This is an explicit alignment counterfactual, not a
     /// hidden runtime knob on the production selector.
+    #[supported(gpu = ["NVIDIA H200"], model_config = ["deepseek_v4_flash_0731"], fp8 = [true])]
     DeepseekV4VllmSerialStreams {
         #[serde(flatten)]
         model: ModelSpec,
@@ -287,6 +292,7 @@ pub enum IterArchSel {
     },
     /// GLM-5.2's aligned vLLM execution graph with local TP1 attention and
     /// expert parallelism across the replica.
+    #[supported(gpu = ["NVIDIA H200"], model_config = ["glm52_fp8"], fp8 = [true], ep_size = [8], nvl_num_gpu = [8])]
     Glm52VllmDsaMoe {
         #[serde(flatten)]
         model: ModelSpec,
@@ -318,6 +324,8 @@ pub enum IterArchSel {
     },
     /// B200 execution graph for NVIDIA's GLM-5.2 NVFP4 checkpoint. Tensor and
     /// expert parallelism share one rank group, as observed in vLLM.
+    #[supported(gpu = ["NVIDIA B200"], model_config = ["glm52_nvfp4"], ep_size = [4], nvl_num_gpu = [4])]
+    #[supported(gpu = ["NVIDIA B200"], model_config = ["glm52_nvfp4"], ep_size = [8], nvl_num_gpu = [8])]
     Glm52VllmNvfp4DsaMoe {
         #[serde(flatten)]
         model: ModelSpec,
@@ -359,6 +367,8 @@ pub enum IterArchSel {
     /// same one with speculation switched on — the two compile different cost
     /// trees, so nothing can read one's cost log as the other's. It pairs only
     /// with the `speculative` worker.
+    #[supported(gpu = ["NVIDIA B200"], model_config = ["glm52_nvfp4"], ep_size = [4], nvl_num_gpu = [4])]
+    #[supported(gpu = ["NVIDIA B200"], model_config = ["glm52_nvfp4"], ep_size = [8], nvl_num_gpu = [8])]
     Glm52VllmNvfp4DsaMoeSpeculative {
         #[serde(flatten)]
         model: ModelSpec,
@@ -408,6 +418,7 @@ pub enum IterArchSel {
     /// recurrence to fold and the draft forwards `draft_tokens + 1` rows per
     /// request rather than one. It also carries its own dense checkpoint, so it
     /// routes nothing and has no `mtp_mode`.
+    #[supported(gpu = ["NVIDIA B200"], model_config = ["glm53_nvfp4"], ep_size = [4], nvl_num_gpu = [4])]
     Glm53VllmNvfp4DsaMoeDflash2 {
         #[serde(flatten)]
         model: ModelSpec,
@@ -452,6 +463,7 @@ pub enum IterArchSel {
     /// SGLang's B200 NVFP4 launch graph under pure tensor parallelism. Every
     /// rank owns all experts (EP1) and shards the routed intermediate axis by
     /// TP, so there is no expert-parallel or NVLink-domain selector.
+    #[supported(gpu = ["NVIDIA B200"], model_config = ["glm52_nvfp4"], tp_size = [4], max_model_len = [8192, 65536, 131072, 262144, 524288])]
     Glm52SglangNvfp4TpDsaMoe {
         #[serde(flatten)]
         model: ModelSpec,

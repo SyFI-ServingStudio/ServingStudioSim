@@ -1873,16 +1873,27 @@ pub fn build_supported_iter_archs(kernel_configs: bool) -> Vec<SupportedBuild> {
                 if kernel_configs {
                     bridge.enable_config_records();
                 }
+                // A speculative arch builds a different model type, with its
+                // own tree: the verify pass plus its draft passes.
                 let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    build_iter_model(&selector, &build.gpu, tag, &bridge)
+                    anyhow::Ok(match &selector {
+                        IterArchSel::Glm52VllmNvfp4DsaMoeSpeculative { .. }
+                        | IterArchSel::Glm53VllmNvfp4DsaMoeDflash2 { .. } => {
+                            let (model, _) =
+                                build_speculative_iter_model(&selector, &build.gpu, tag, &bridge)?;
+                            (model.gpus_per_replica(), model.cost_log_manifest())
+                        }
+                        _ => {
+                            let model = build_iter_model(&selector, &build.gpu, tag, &bridge)?;
+                            (model.gpus_per_replica(), model.cost_log_manifest())
+                        }
+                    })
                 }));
                 match built {
-                    Ok(Ok(model)) => {
-                        build.gpus_per_replica = Some(model.gpus_per_replica());
-                        build.cost_manifest = Some(crate::timing::CostManifestDoc::single(
-                            "iter",
-                            model.cost_log_manifest(),
-                        ));
+                    Ok(Ok((gpus_per_replica, manifest))) => {
+                        build.gpus_per_replica = Some(gpus_per_replica);
+                        build.cost_manifest =
+                            Some(crate::timing::CostManifestDoc::single("iter", manifest));
                         if kernel_configs {
                             build.kernel_configs =
                                 Some(crate::timing::bridge::config_records_document(

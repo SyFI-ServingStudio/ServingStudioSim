@@ -152,7 +152,7 @@ pub fn derive_provider_schema(input: TokenStream) -> TokenStream {
 // ── `#[supported(...)]` rows on a variant ───────────────────────────────────
 
 /// Each `#[supported(name = [lit, ...], ...)]` attribute → one `SupportedRow`.
-/// A list holds only integer or only string literals. Whether each name is a
+/// A list holds literals of one kind: integers, strings or bools. Whether each name is a
 /// param of the arch is checked by a test over the emitted schema, since the
 /// flattened `ModelSpec` fields are not visible here.
 fn supported_rows(attrs: &[Attribute]) -> syn::Result<Vec<proc_macro2::TokenStream>> {
@@ -193,6 +193,7 @@ fn supported_rows(attrs: &[Attribute]) -> syn::Result<Vec<proc_macro2::TokenStre
             };
             let mut ints = Vec::new();
             let mut strs = Vec::new();
+            let mut bools = Vec::new();
             for e in &array.elems {
                 match e {
                     Expr::Lit(ExprLit {
@@ -201,28 +202,34 @@ fn supported_rows(attrs: &[Attribute]) -> syn::Result<Vec<proc_macro2::TokenStre
                     Expr::Lit(ExprLit {
                         lit: Lit::Str(s), ..
                     }) => strs.push(s.clone()),
+                    Expr::Lit(ExprLit {
+                        lit: Lit::Bool(b), ..
+                    }) => bools.push(b.clone()),
                     other => {
                         return Err(syn::Error::new(
                             other.span(),
-                            "supported: values must be integer or string literals",
+                            "supported: values must be integer, string or bool literals",
                         ))
                     }
                 }
             }
-            let values = match (ints.is_empty(), strs.is_empty()) {
-                (false, true) => {
+            let values = match (ints.is_empty(), strs.is_empty(), bools.is_empty()) {
+                (false, true, true) => {
                     quote! { ::simulator::schema::SupportedValues::Int(&[ #( #ints ),* ]) }
                 }
-                (true, false) => {
+                (true, false, true) => {
                     quote! { ::simulator::schema::SupportedValues::Str(&[ #( #strs ),* ]) }
                 }
-                (true, true) => {
+                (true, true, false) => {
+                    quote! { ::simulator::schema::SupportedValues::Bool(&[ #( #bools ),* ]) }
+                }
+                (true, true, true) => {
                     return Err(syn::Error::new(array.span(), "supported: empty value list"))
                 }
-                (false, false) => {
+                _ => {
                     return Err(syn::Error::new(
                         array.span(),
-                        "supported: mixes integer and string values",
+                        "supported: mixes integer, string and bool values",
                     ))
                 }
             };

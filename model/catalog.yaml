@@ -8,3 +8,27 @@ llama3_8b:
   name: Llama 3 8B
   family: Llama
   checkpoint: meta-llama/Meta-Llama-3-8B
+qwen3_235b:
+  name: Qwen3 235B-A22B
+  family: Qwen
+  checkpoint: Qwen/Qwen3-235B-A22B
+qwen3_6_35b_a3b_fp8:
+  name: Qwen3.6 35B-A3B FP8
+  family: Qwen
+  checkpoint: Qwen/Qwen3.6-35B-A3B-FP8
+deepseek_v4_flash_0731:
+  name: DeepSeek V4 Flash 0731
+  family: DeepSeek
+  checkpoint: deepseek-ai/DeepSeek-V4-Flash-0731
+glm52_fp8:
+  name: GLM-5.2 FP8
+  family: GLM
+  checkpoint: zai-org/GLM-5.2-FP8
+glm52_nvfp4:
+  name: GLM-5.2 NVFP4
+  family: GLM
+  checkpoint: nvidia/GLM-5.2-NVFP4
+glm53_nvfp4:
+  name: GLM-5.3 NVFP4
+  family: GLM
+  checkpoint: incoai/GLM-5.3-NVFP4
