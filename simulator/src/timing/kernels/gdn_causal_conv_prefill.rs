@@ -1,4 +1,4 @@
-//! Qwen Gated DeltaNet fused causal-convolution fresh-prefill kernel.
+//! Gated DeltaNet fused causal-convolution fresh-prefill kernel.
 //!
 //! The cache uses the physical `(batch_size, sequence_length)` caller shape.
 //! Power-of-two sequence lengths retain every previously accepted profile row,

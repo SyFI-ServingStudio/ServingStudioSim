@@ -13,6 +13,10 @@ a built config would silently reprice every profiled shape rather than fail.
 Resolution runs during expansion, including under `--dry-run`. A dry-run's job
 is to prove the run is valid, and a corpus that cannot be fetched is exactly
 the kind of invalidity worth catching before a GPU is allocated.
+
+The local path is for the binary only. A record of what built a run (the
+kernel-config registry's sources) names the reference instead, through
+`restore_hf_references`, so it reads the same on every machine.
 """
 
 from __future__ import annotations
@@ -24,6 +28,10 @@ from pathlib import Path
 HF_SCHEME = "hf://"
 
 _REFERENCE = re.compile(r"^hf://(?P<repo>[^@/]+/[^@/]+)@(?P<revision>[0-9a-f]{7,40})/(?P<path>.+)$")
+
+
+# The reference each local path this process resolved came from.
+_RESOLVED: dict[str, str] = {}
 
 
 class CorpusError(RuntimeError):
@@ -69,6 +77,7 @@ def resolve_reference(reference: str) -> str:
                     f"{reference}: the hub placed {data_file} at {payload}, "
                     f"not where its manifest in {local.parent} names it"
                 )
+    _RESOLVED[str(local)] = reference
     return str(local)
 
 
@@ -85,4 +94,16 @@ def resolve_hf_references(config):
         return [resolve_hf_references(value) for value in config]
     if isinstance(config, str) and config.startswith(HF_SCHEME):
         return resolve_reference(config)
+    return config
+
+
+def restore_hf_references(config):
+    """The config as its preset wrote it: every string leaf that is a path this
+    process resolved a reference to becomes that reference again."""
+    if isinstance(config, dict):
+        return {key: restore_hf_references(value) for key, value in config.items()}
+    if isinstance(config, list):
+        return [restore_hf_references(value) for value in config]
+    if isinstance(config, str):
+        return _RESOLVED.get(config, config)
     return config

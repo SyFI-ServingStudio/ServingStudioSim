@@ -12,7 +12,7 @@ from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerN
 from profiling.runners.metrics import ComputeMetrics
 from profiling.runners.moe.exact_topk import exact_topk_ids
 
-WEIGHT_FORMAT = "nvfp4_e2m1"
+WEIGHT_FORMAT = DType.NVFP4_E2M1
 GROUP_SIZE = 16
 ROUTING_METHODS = {"minimax2": 7}
 _PREPARED_WEIGHT_CACHE: dict[tuple[str, int, int, int, int], tuple[Any, Any, Any, Any]] = {}
@@ -256,7 +256,7 @@ def _profile_nvfp4_fused_moe_sm100(
     num_local_experts: int,
     top_k: int,
     input_dtype: DType | str,
-    weight_format: str,
+    weight_format: DType | str,
     group_size: int,
     routing_method: str,
     n_group: int,

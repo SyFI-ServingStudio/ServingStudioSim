@@ -48,6 +48,22 @@ def test_a_manifest_reference_also_fetches_the_payload_beside_it(hub):
     ]
 
 
+def test_a_run_source_names_the_reference_not_the_local_file(hub):
+    from launcher.kernel_configs import run_sources
+
+    reference = f"hf://uw/corpora@{SHA}/glm53/manifest.json"
+    arch = {"type": "moe", "routing": "corpus", "token_corpus_file": reference}
+    config = resolve_hf_references(
+        {"deployment": "d", "pools": {"main": {"groups": [{"gpu": "B200", "arch": arch}]}}}
+    )
+    assert config["pools"]["main"]["groups"][0]["arch"]["token_corpus_file"] != reference
+
+    # The registry keeps what built a config; a path only this machine has
+    # would name it for nobody else.
+    source = run_sources(config, preset=None)["main"]
+    assert source["groups"][0]["arch"] == arch
+
+
 def test_everything_that_is_not_a_reference_is_left_alone(hub):
     config = {
         "arch": {"expert_popularity_file": "presets/alignment/x/expert_popularity.json"},

@@ -30,7 +30,7 @@ def _spec(**overrides: object) -> dict:
         "num_local_experts": 72,
         "top_k": 8,
         "input_dtype": "bf16",
-        "weight_format": "fp8_e4m3_block",
+        "weight_format": "fp8_e4m3",
         "group_size": 128,
         "routing_method": "deepseek_v3",
         "n_group": 1,
@@ -68,7 +68,7 @@ def test_forced_logits_make_deepseek_v3_routing_realize_the_histogram() -> None:
     ("override", "message"),
     [
         ({"n_group": 8, "topk_group": 4}, "ungrouped"),
-        ({"weight_format": "nvfp4_e2m1", "group_size": 16}, "fp8_e4m3_block"),
+        ({"weight_format": "nvfp4_e2m1", "group_size": 16}, "fp8_e4m3"),
         ({"routing_method": "minimax2"}, "routing method"),
         ({"input_dtype": "fp16"}, "BF16"),
     ],

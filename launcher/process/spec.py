@@ -13,7 +13,9 @@ class ProcessSpec:
 
     ``log_path`` and ``capture_output`` are mutually exclusive.  Both use a
     regular file, never a pipe, so an inherited descriptor cannot delay root
-    process completion.
+    process completion.  A captured process writes stderr into ``output`` too,
+    unless ``separate_stderr`` gives it its own file: set it whenever ``output``
+    is parsed, so a diagnostic line cannot corrupt the data.
     """
 
     argv: Sequence[str]
@@ -22,6 +24,7 @@ class ProcessSpec:
     log_path: Path | None = None
     append_log: bool = False
     capture_output: bool = False
+    separate_stderr: bool = False
     input_bytes: bytes | None = None
     timeout_seconds: float | None = None
     name: str = "process"
@@ -31,6 +34,8 @@ class ProcessSpec:
             raise ValueError("process argv must not be empty")
         if self.log_path is not None and self.capture_output:
             raise ValueError("log_path and capture_output are mutually exclusive")
+        if self.separate_stderr and not self.capture_output:
+            raise ValueError("separate_stderr requires capture_output")
         if self.timeout_seconds is not None and self.timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
 
@@ -45,6 +50,7 @@ class ProcessResult:
     exit_code: int
     elapsed_seconds: float
     output: str = ""
+    stderr: str = ""
     leaked_descendants: bool = False
     termination_reason: str | None = None
 

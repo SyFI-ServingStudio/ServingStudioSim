@@ -17,9 +17,11 @@ from launcher.backends import (
     Role,
     _merge_role_variants,
     _parse_shape,
+    _structure_key,
     dedup_roles,
     render_skeleton,
     validate_backend_map,
+    validate_backends_for_candidates,
 )
 from profiling.db.args import DType
 
@@ -387,3 +389,70 @@ def test_fa2_bf16_query_fp8_kv_is_valid():
     # cudnn is bf16-only on the KV axis → rejected for fp8 KV.
     errs = validate_backend_map({"attn": {"afd.attn.prefill": ["cudnn"]}}, roles)
     assert any("unsupported for flashinfer_attn_prefill" in e for e in errs)
+
+
+def _candidate(log_dir: str, *, threshold: int, trace: str) -> dict:
+    return {
+        "deployment": "unified",
+        "workload": {"trace_files": [trace]},
+        "io": {"log_dir": log_dir},
+        "pools": {"main": {"migration_threshold": threshold}},
+        "backends": {"main": {"unified.attn": ["fa3"]}},
+        "_env": {"trace": trace},
+    }
+
+
+def test_workload_io_and_backend_sweeps_share_one_structure():
+    base = _candidate("logs/a", threshold=8, trace="a.jsonl")
+    same = _candidate("logs/b", threshold=8, trace="b.jsonl")
+    same["backends"] = {"main": {"unified.attn": ["fa2"]}}
+    other_pool = _candidate("logs/c", threshold=16, trace="a.jsonl")
+
+    assert _structure_key(base) == _structure_key(same)
+    assert _structure_key(base) != _structure_key(other_pool)
+
+
+def test_validation_enumerates_each_structure_once(monkeypatch):
+    candidates = [
+        _candidate(f"logs/{threshold}_{trace}", threshold=threshold, trace=trace)
+        for threshold in (8, 16)
+        for trace in ("a.jsonl", "b.jsonl", "c.jsonl")
+    ]
+    enumerated: list[int] = []
+
+    def enumerate_kernels(config, _build_type):
+        threshold = config["pools"]["main"]["migration_threshold"]
+        enumerated.append(threshold)
+        return [_rec("main", f"role_{threshold}", "rms_norm", {}, ["fa3"])]
+
+    checked: dict[str, list[str]] = {}
+
+    def validate(_backends, roles, *_args, **_kwargs):
+        return [role.name for role in roles]
+
+    monkeypatch.setattr("launcher.backends.enumerate_kernels", enumerate_kernels)
+    monkeypatch.setattr("launcher.backends.validate_backend_map", validate)
+
+    for error in validate_backends_for_candidates(candidates):
+        log_dir, role = error.split(": ")
+        checked.setdefault(log_dir, []).append(role)
+
+    assert sorted(enumerated) == [8, 16]
+    assert checked == {
+        f"logs/{threshold}_{trace}": [f"role_{threshold}"]
+        for threshold in (8, 16)
+        for trace in ("a.jsonl", "b.jsonl", "c.jsonl")
+    }
+
+
+@pytest.mark.needs_binary
+def test_emit_backends_reads_the_real_binary(tmp_path):
+    """The binary logs its cost tree to stderr while stdout carries the JSON; the
+    launcher must parse stdout alone."""
+    from launcher.__main__ import main as launcher_main
+    from launcher.exec import REPO_ROOT
+
+    skeleton = tmp_path / "backends.yaml"
+    preset = REPO_ROOT / "presets" / "unified_smoke.yaml"
+    assert launcher_main(["--emit-backends", str(skeleton), str(preset)]) == 0
+    assert "main/unified.pre_attn.qkv_proj" in skeleton.read_text()

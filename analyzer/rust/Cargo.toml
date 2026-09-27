@@ -37,6 +37,9 @@ axum = "0.8"
 # it and it is meaningfully smaller on the large analysis payloads; gzip stays
 # for anything that does not ask for br.
 tower-http = { version = "0.6", features = ["compression-br", "compression-gzip"] }
+# Per-iteration alignment shards are one zstd frame per record (12x smaller on
+# a large capture); already in the tree through parquet.
+zstd = "0.13"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 sha2 = "0.10"
 # Pure-Rust linear algebra — used only by `src/pca.rs` for the symmetric

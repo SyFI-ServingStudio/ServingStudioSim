@@ -103,6 +103,14 @@ timing-predict-only milestone — the arch still predicts; only a real run bails
 - `arch/config.rs` — extend the `model()` `|`-chain to include the new variant
   (compiler-forced). Confirm the variant's `#[param(cache_key)]` flags are right
   (model identity / dtype / any param that changes which kernels are needed).
+  Declare what the arch runs with `#[supported(...)]` on the variant: the GPUs
+  (profile.db keys), `model/config/` stems and parallel sizes it builds, e.g.
+  `#[supported(gpu = ["NVIDIA H200"], model_config = ["llama3_8b"], tp_size = [1, 2, 4, 8])]`. A row
+  allows every combination of its values; add rows for sizes that must move
+  together or for a model with a smaller set. Give each new model a
+  `model/catalog.yaml` entry. The launcher rejects configs no row covers, and
+  `every_supported_iter_arch_deployment_builds_its_cost_tree` fails on a row the
+  arch cannot build.
 - deployment arm — **pave the road for the worker**: add the deployment `build`
   arm that constructs the model via your same `arch_build::<family>` concrete
   builder and pairs it with a worker. If the worker does not exist yet, `bail!`

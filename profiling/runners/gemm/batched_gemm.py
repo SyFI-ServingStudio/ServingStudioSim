@@ -1,14 +1,15 @@
-"""Production-layout Torch runners for GLM-5.2 / GLM-5.3 MLA batched GEMMs.
+"""Production-layout Torch runners for MLA batched GEMMs.
 
 Each timed callable is only its unquantized ``torch.bmm(..., out=...)`` launch.
 Q-absorption and V-up layout construction mirror vLLM v0.23.0 commit
 ``0fc695fc6d1d82e9a5ac6835ac8e4e1c83703665`` in
 ``mla_attention.py::{process_weights_after_loading,_v_up_proj}``.
 
-The ``*_glm53`` backends reuse the same construction for GLM-5.3-Flash on the
-alignment fork (``mla_attention.py:1170-1252,993-1008,1300-1332``, unchanged
-there): qk_nope 256 with no RoPE part, v_head 256, kv_lora 512, and an unpadded
-attention output (``FlashInferMLASparseImpl`` sets no ``q_pad_num_heads``).
+``torch_mla_q_absorb_no_rope`` and ``torch_mla_v_up_unpadded`` reuse the same
+construction for an MLA layout with qk_nope 256 and no RoPE part, v_head 256,
+kv_lora 512, and an unpadded attention output (the alignment fork's
+``mla_attention.py:1170-1252,993-1008,1300-1332``; ``FlashInferMLASparseImpl``
+sets no ``q_pad_num_heads``).
 """
 
 from __future__ import annotations
@@ -22,7 +23,7 @@ from profiling.profilers.timer import Timer
 from profiling.runners.exceptions import KernelLaunchFailed, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
 
-# Per-rank head counts of GLM's 64 q heads at validated TP degrees
+# Per-rank head counts of 64 q heads at validated TP degrees
 # (TP1/2/4/8). The timed op is a plain torch.bmm over the head axis, so a
 # new degree only needs its per-rank count added here.
 _SUPPORTED_HEAD_COUNTS = frozenset({8, 16, 32, 64})
@@ -38,7 +39,6 @@ _H200_PADDED_HEADS = 64
 
 @dataclass(frozen=True)
 class _MlaLayout:
-    backend: str
     q_head_width: int
     qk_nope_head_dim: int
     v_head_dim: int
@@ -47,23 +47,14 @@ class _MlaLayout:
     padded_heads: int | None
 
 
-_GLM52_LAYOUT = _MlaLayout(
-    backend="glm52",
-    q_head_width=_Q_HEAD_WIDTH,
-    qk_nope_head_dim=_QK_NOPE_HEAD_DIM,
-    v_head_dim=_V_HEAD_DIM,
-    kv_lora_rank=_KV_LORA_RANK,
-    padded_heads=_H200_PADDED_HEADS,
-)
-_GLM53_LAYOUT = _MlaLayout(
-    backend="glm53",
+_NO_ROPE_UNPADDED_LAYOUT = _MlaLayout(
     q_head_width=256,
     qk_nope_head_dim=256,
     v_head_dim=256,
     kv_lora_rank=512,
     padded_heads=None,
 )
-_GLM53_SUPPORTED_GPUS = frozenset({"NVIDIA B200"})
+_NO_ROPE_UNPADDED_GPUS = frozenset({"NVIDIA B200"})
 
 
 @dataclass(frozen=True)
@@ -106,23 +97,23 @@ def _validate_args(
         )
     if num_batches not in _SUPPORTED_HEAD_COUNTS:
         raise ValueError(
-            f"torch_mla_q_absorb_glm52 supports num_batches in {sorted(_SUPPORTED_HEAD_COUNTS)}, got {num_batches}"
+            f"torch_mla_q_absorb supports num_batches in {sorted(_SUPPORTED_HEAD_COUNTS)}, "
+            f"got {num_batches}"
         )
     if (k, n) != (_QK_NOPE_HEAD_DIM, _KV_LORA_RANK):
-        raise ValueError(f"torch_mla_q_absorb_glm52 requires (k, n) == (192, 512), got ({k}, {n})")
+        raise ValueError(f"torch_mla_q_absorb requires (k, n) == (192, 512), got ({k}, {n})")
     if dtype is not _SUPPORTED_DTYPE:
-        raise ValueError(f"torch_mla_q_absorb_glm52 supports only bf16, got {dtype.value}")
+        raise ValueError(f"torch_mla_q_absorb supports only bf16, got {dtype.value}")
     return num_batches, m, n, k, dtype
 
 
 def _validate_cuda_device(torch: Any) -> None:
     if not torch.cuda.is_available():
-        raise ProfilerNotImplemented("CUDA is required for the torch_mla_q_absorb_glm52 backend")
+        raise ProfilerNotImplemented("CUDA is required for the torch_mla_q_absorb backend")
     gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
     if gpu_name not in _SUPPORTED_GPUS:
         raise ProfilerNotImplemented(
-            "torch_mla_q_absorb_glm52 is verified only on "
-            f"{sorted(_SUPPORTED_GPUS)}, got {gpu_name}"
+            f"torch_mla_q_absorb is verified only on {sorted(_SUPPORTED_GPUS)}, got {gpu_name}"
         )
 
 
@@ -146,22 +137,23 @@ def _validate_v_up_args(
         )
     if num_batches not in _SUPPORTED_HEAD_COUNTS:
         raise ValueError(
-            f"torch_mla_v_up_glm52 supports num_batches in {sorted(_SUPPORTED_HEAD_COUNTS)}, got {num_batches}"
+            f"torch_mla_v_up supports num_batches in {sorted(_SUPPORTED_HEAD_COUNTS)}, "
+            f"got {num_batches}"
         )
     if (k, n) != (_KV_LORA_RANK, _V_HEAD_DIM):
-        raise ValueError(f"torch_mla_v_up_glm52 requires (k, n) == (512, 256), got ({k}, {n})")
+        raise ValueError(f"torch_mla_v_up requires (k, n) == (512, 256), got ({k}, {n})")
     if dtype is not _SUPPORTED_DTYPE:
-        raise ValueError(f"torch_mla_v_up_glm52 supports only bf16, got {dtype.value}")
+        raise ValueError(f"torch_mla_v_up supports only bf16, got {dtype.value}")
     return num_batches, m, n, k, dtype
 
 
 def _validate_v_up_cuda_device(torch: Any) -> None:
     if not torch.cuda.is_available():
-        raise ProfilerNotImplemented("CUDA is required for the torch_mla_v_up_glm52 backend")
+        raise ProfilerNotImplemented("CUDA is required for the torch_mla_v_up backend")
     gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
     if gpu_name not in _SUPPORTED_GPUS:
         raise ProfilerNotImplemented(
-            f"torch_mla_v_up_glm52 is verified only on {sorted(_SUPPORTED_GPUS)}, got {gpu_name}"
+            f"torch_mla_v_up is verified only on {sorted(_SUPPORTED_GPUS)}, got {gpu_name}"
         )
 
 
@@ -173,7 +165,7 @@ def _build_q_absorb_operands(
     torch_dtype: Any,
     device: str,
 ) -> _QAbsorbOperands:
-    """Allocate vLLM's packed/interleaved GLM Q-absorption operands."""
+    """Allocate vLLM's packed/interleaved Q-absorption operands."""
     q_base = torch.randn(
         (m, num_batches, _Q_HEAD_WIDTH),
         dtype=torch_dtype,
@@ -219,7 +211,7 @@ def _build_v_up_operands(
     torch_dtype: Any,
     device: str,
 ) -> _VUpOperands:
-    """Allocate vLLM's padded/interleaved GLM V-up operands."""
+    """Allocate vLLM's padded/interleaved V-up operands."""
     attention_base = torch.randn(
         (m, _H200_PADDED_HEADS, _KV_LORA_RANK),
         dtype=torch_dtype,
@@ -271,14 +263,14 @@ def _logical_elements(num_batches: int, m: int, n: int, k: int) -> int:
     return num_batches * m * k + num_batches * k * n + num_batches * m * n
 
 
-def profile_mla_q_absorb_glm52(
+def profile_mla_q_absorb(
     num_batches: int,
     m: int,
     n: int,
     k: int,
     dtype: DType | str,
 ) -> ComputeMetrics:
-    """Profile GLM-5.2 MLA Q absorption as one exact-layout Torch BMM."""
+    """Profile MLA Q absorption as one exact-layout Torch BMM."""
     num_batches, m, n, k, dtype = _validate_args(
         num_batches,
         m,
@@ -290,7 +282,7 @@ def profile_mla_q_absorb_glm52(
         import torch
     except ImportError as exc:
         raise ProfilerNotImplemented(
-            "torch is required for the torch_mla_q_absorb_glm52 backend"
+            "torch is required for the torch_mla_q_absorb backend"
         ) from exc
 
     _validate_cuda_device(torch)
@@ -330,14 +322,14 @@ def profile_mla_q_absorb_glm52(
         raise KernelLaunchFailed(str(exc)) from exc
 
 
-def profile_mla_v_up_glm52(
+def profile_mla_v_up(
     num_batches: int,
     m: int,
     n: int,
     k: int,
     dtype: DType | str,
 ) -> ComputeMetrics:
-    """Profile GLM-5.2 MLA V-up as one exact-layout Torch BMM."""
+    """Profile MLA V-up as one exact-layout Torch BMM."""
     num_batches, m, n, k, dtype = _validate_v_up_args(
         num_batches,
         m,
@@ -348,9 +340,7 @@ def profile_mla_v_up_glm52(
     try:
         import torch
     except ImportError as exc:
-        raise ProfilerNotImplemented(
-            "torch is required for the torch_mla_v_up_glm52 backend"
-        ) from exc
+        raise ProfilerNotImplemented("torch is required for the torch_mla_v_up backend") from exc
 
     _validate_v_up_cuda_device(torch)
 
@@ -478,9 +468,9 @@ def _profile_layout_bmm(
     if not torch.cuda.is_available():
         raise ProfilerNotImplemented(f"CUDA is required for the {backend} backend")
     gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
-    if gpu_name not in _GLM53_SUPPORTED_GPUS:
+    if gpu_name not in _NO_ROPE_UNPADDED_GPUS:
         raise ProfilerNotImplemented(
-            f"{backend} is verified only on {sorted(_GLM53_SUPPORTED_GPUS)}, got {gpu_name}"
+            f"{backend} is verified only on {sorted(_NO_ROPE_UNPADDED_GPUS)}, got {gpu_name}"
         )
     try:
         operands = build(
@@ -512,32 +502,32 @@ def _profile_layout_bmm(
         raise KernelLaunchFailed(str(exc)) from exc
 
 
-def profile_mla_q_absorb_glm53(
+def profile_mla_q_absorb_no_rope(
     num_batches: int,
     m: int,
     n: int,
     k: int,
     dtype: DType | str,
 ) -> ComputeMetrics:
-    """Profile GLM-5.3-Flash MLA Q absorption ([N,B,256] x [N,256,512])."""
-    backend = "torch_mla_q_absorb_glm53"
-    layout = _GLM53_LAYOUT
+    """Profile MLA Q absorption with no RoPE part ([N,B,256] x [N,256,512])."""
+    backend = "torch_mla_q_absorb_no_rope"
+    layout = _NO_ROPE_UNPADDED_LAYOUT
     args = _validate_layout_args(
         backend, (layout.qk_nope_head_dim, layout.kv_lora_rank), num_batches, m, n, k, dtype
     )
     return _profile_layout_bmm(backend, _build_layout_q_absorb_operands, layout, *args)
 
 
-def profile_mla_v_up_glm53(
+def profile_mla_v_up_unpadded(
     num_batches: int,
     m: int,
     n: int,
     k: int,
     dtype: DType | str,
 ) -> ComputeMetrics:
-    """Profile GLM-5.3-Flash MLA V-up ([N,B,512] x [N,512,256], unpadded heads)."""
-    backend = "torch_mla_v_up_glm53"
-    layout = _GLM53_LAYOUT
+    """Profile MLA V-up into an unpadded head axis ([N,B,512] x [N,512,256])."""
+    backend = "torch_mla_v_up_unpadded"
+    layout = _NO_ROPE_UNPADDED_LAYOUT
     args = _validate_layout_args(
         backend, (layout.kv_lora_rank, layout.v_head_dim), num_batches, m, n, k, dtype
     )

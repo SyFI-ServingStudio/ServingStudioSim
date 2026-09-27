@@ -17,21 +17,13 @@ from profiling.kernels import (
     batched_gemm,  # noqa: F401
     bf16_fused_moe,  # noqa: F401
     clamped_swiglu,  # noqa: F401
-    deepseek_v4_fused_inv_rope_fp8_quant,  # noqa: F401
-    deepseek_v4_fused_q_kv_rmsnorm,  # noqa: F401
-    deepseek_v4_indexer_mqa_logits_decode,  # noqa: F401
-    deepseek_v4_indexer_mqa_logits_prefill,  # noqa: F401
-    deepseek_v4_indexer_q_rope_quant,  # noqa: F401
-    deepseek_v4_indexer_topk_decode,  # noqa: F401
-    deepseek_v4_indexer_topk_prefill,  # noqa: F401
-    deepseek_v4_packed_cache_gather,  # noqa: F401
-    deepseek_v4_qnorm_rope_kv_insert,  # noqa: F401
-    deepseek_v4_sparse_attn_compress_store,  # noqa: F401
-    deepseek_v4_sparse_mla_decode,  # noqa: F401
-    deepseek_v4_sparse_mla_prefill,  # noqa: F401
-    deepseek_v4_terminal_mhc_head,  # noqa: F401
+    compressed_sparse_mla_decode,  # noqa: F401
+    compressed_sparse_mla_prefill,  # noqa: F401
+    dsa_compressed_mqa_logits_prefill,  # noqa: F401
+    dsa_compressed_topk_prefill,  # noqa: F401
     dsa_index_cache_append,  # noqa: F401
     dsa_indexer_q_rope_quant,  # noqa: F401
+    dsa_indexer_q_rope_quant_weight_fold,  # noqa: F401
     dsa_mqa_logits_prefill,  # noqa: F401
     dsa_paged_mqa_logits_decode,  # noqa: F401
     dsa_persistent_topk_decode,  # noqa: F401
@@ -49,23 +41,20 @@ from profiling.kernels import (
     gdn_causal_conv_decode,  # noqa: F401
     gdn_causal_conv_prefill,  # noqa: F401
     gdn_chunk_delta_rule,  # noqa: F401
-    gdn_chunk_local_cumsum,  # noqa: F401
-    gdn_chunk_output,  # noqa: F401
-    gdn_chunk_recompute_w_u,  # noqa: F401
-    gdn_chunk_scaled_dot_kkt,  # noqa: F401
-    gdn_chunk_solve_tril,  # noqa: F401
-    gdn_chunk_state_update,  # noqa: F401
     gdn_gated_rms_norm,  # noqa: F401
     gdn_prefill_post_conv,  # noqa: F401
     gdn_recurrent_decode,  # noqa: F401
     gemm_fp32_output,  # noqa: F401
     grouped_gemm,  # noqa: F401
+    inv_rope_fp8_quant,  # noqa: F401
     kda_chunk_prefill,  # noqa: F401
     kda_recurrent_decode,  # noqa: F401
     kv_cache_append,  # noqa: F401
+    kv_compress_store,  # noqa: F401
     logits_topk,  # noqa: F401
     mhc_fused_post_pre_rms_norm,  # noqa: F401
     mhc_pre_rms_norm,  # noqa: F401
+    mhc_terminal_head,  # noqa: F401
     mla_cache_append,  # noqa: F401
     mla_rope_quantize_fp8,  # noqa: F401
     moe_align_block_size,  # noqa: F401
@@ -83,6 +72,9 @@ from profiling.kernels import (
     nvfp4_quant,  # noqa: F401
     p2p_inter,  # noqa: F401
     p2p_intra,  # noqa: F401
+    packed_kv_cache_gather,  # noqa: F401
+    q_kv_rms_norm,  # noqa: F401
+    qnorm_rope_kv_insert,  # noqa: F401
     residual_rms_norm,  # noqa: F401
     rms_norm,  # noqa: F401
     single_gemm,  # noqa: F401

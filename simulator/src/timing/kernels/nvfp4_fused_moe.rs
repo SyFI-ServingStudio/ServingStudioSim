@@ -1,13 +1,13 @@
-//! Whole FlashInfer SM100 NVFP4 fused-MoE assembly.
+//! Whole FlashInfer SM100 block-scaled fused-MoE assembly.
 //!
 //! Routing, gate/up, down, and finalize are one measured L1 boundary because
 //! Programmatic Dependent Launch overlaps their physical kernel intervals.
 //!
 //! Despite the kind name, `weight_format` selects the expert weight recipe and
 //! the backend string selects the callable. The NVFP4 backends
-//! (`flashinfer_trtllm_sm100*`) take `nvfp4_e2m1` / group 16. The GLM-5.3-Flash
+//! (`flashinfer_trtllm_sm100*`) take `nvfp4_e2m1` / group 16. The FP8 block-scale
 //! backend `flashinfer_trtllm_fp8_block_sm100` (`trtllm_fp8_block_scale_moe`,
-//! DeepSeek-FP8) takes `fp8_e4m3_block` / group 128 (128x128 weight blocks,
+//! DeepSeek-FP8) takes `fp8_e4m3` / group 128 (128x128 weight blocks,
 //! per-token-group-128 activations) with `deepseek_v3` routing,
 //! `n_group = topk_group = 1`, and routed scaling 5/2. Its autotuner stops at
 //! 8192 tokens, so larger grid points reuse the top tactic bucket.
@@ -29,9 +29,13 @@ pub struct Nvfp4FusedMoeKernelConfig {
     pub num_experts: Dim,
     pub num_local_experts: Dim,
     pub top_k: u32,
-    #[compute_dtype]
+    /// Router and output precision, and the activation's element type before
+    /// the kernel quantizes it. Not the tensor-core precision.
     pub input_dtype: DType,
-    pub weight_format: String,
+    /// Packed expert weight format. Activations are quantized to it inside the
+    /// call, so both GEMM operands reach the tensor cores in this format.
+    #[compute_dtype]
+    pub weight_format: DType,
     pub group_size: u32,
     pub routing_method: String,
     pub n_group: u32,
@@ -81,23 +85,25 @@ impl KernelSpec for Nvfp4FusedMoeSpec {
         grid: &SweepGrid,
         backend: &'static str,
     ) -> Vec<ArgsPayload> {
-        // Resolved once: a token corpus is hundreds of megabytes on disk and
-        // the grid has tens of points. The arch builder has already proven it
-        // readable, so a failure here is a corpus that changed underneath a
-        // built config.
-        let demand = config
+        // Drawn for the whole axis at once: the draws run in parallel and are
+        // shared with every other kernel folding the same demand source. The
+        // arch builder has already proven the source readable, so a failure here
+        // is a corpus that changed underneath a built config.
+        let token_counts = grid.expand_1d(|num_tokens| num_tokens as u32);
+        let mut batches = config
             .expert_demand
-            .prepare()
-            .expect("validate_config proved this source readable");
-
-        grid.expand_1d(|num_tokens| {
-            let per_expert_batches = demand.per_expert_batches(
+            .per_expert_batches(
                 config.top_k,
-                num_tokens as u32,
+                &token_counts,
                 config.num_experts.get() as usize,
                 config.num_local_experts.get() as usize,
                 config.folded_rank_position,
-            );
+            )
+            .expect("validate_config proved this source readable")
+            .into_iter();
+
+        grid.expand_1d(|num_tokens| {
+            let per_expert_batches = batches.next().expect("one histogram per grid point");
 
             ArgsPayload::new()
                 .with("backend", backend)
@@ -140,7 +146,7 @@ mod tests {
             num_local_experts: 4.into(),
             top_k: 2,
             input_dtype: DType::Bf16,
-            weight_format: "nvfp4_e2m1".to_string(),
+            weight_format: DType::Nvfp4E2m1,
             group_size: 16,
             routing_method: "minimax2".to_string(),
             n_group: 1,
@@ -198,7 +204,7 @@ mod tests {
             num_local_experts: 72.into(),
             top_k: 8,
             input_dtype: DType::Bf16,
-            weight_format: "fp8_e4m3_block".to_string(),
+            weight_format: DType::Fp8E4m3,
             group_size: 128,
             routing_method: "deepseek_v3".to_string(),
             n_group: 1,
@@ -256,7 +262,7 @@ mod tests {
                 ("num_local_experts", Value::from(72)),
                 ("top_k", Value::from(8)),
                 ("input_dtype", Value::from("bf16")),
-                ("weight_format", Value::from("fp8_e4m3_block")),
+                ("weight_format", Value::from("fp8_e4m3")),
                 ("group_size", Value::from(128)),
                 ("routing_method", Value::from("deepseek_v3")),
                 ("n_group", Value::from(1)),
@@ -274,8 +280,15 @@ mod tests {
                 .map(|value| value.as_u64().unwrap())
                 .collect();
             assert_eq!(batches.len(), 288, "global width at T={tokens}");
-            assert_eq!(batches.iter().sum::<u64>(), tokens * 8, "assignments at T={tokens}");
-            assert!(batches.iter().all(|&rows| rows <= tokens), "top-k is distinct");
+            assert_eq!(
+                batches.iter().sum::<u64>(),
+                tokens * 8,
+                "assignments at T={tokens}"
+            );
+            assert!(
+                batches.iter().all(|&rows| rows <= tokens),
+                "top-k is distinct"
+            );
         }
     }
 
@@ -307,9 +320,38 @@ mod tests {
         let grid = SweepGrid::new(vec![tokens]);
         for backend in &config.backends {
             for payload in Nvfp4FusedMoeSpec::enumerate(&config, &grid, backend) {
-                println!("PAYLOAD {}", serde_json::to_string(payload.fields()).unwrap());
+                println!(
+                    "PAYLOAD {}",
+                    serde_json::to_string(payload.fields()).unwrap()
+                );
             }
         }
+    }
+
+    #[test]
+    fn weight_format_is_the_compute_dtype_and_keeps_its_wire_literal() {
+        // Both GEMM operands run as NVFP4; input_dtype is only the activation
+        // before the in-kernel quantization. The launcher gate and the public
+        // precision label both read this tag.
+        let cfg = config();
+        assert_eq!(cfg.compute_dtype(), Some(DType::Nvfp4E2m1));
+        assert_eq!(
+            Nvfp4FusedMoeKernelConfig::COMPUTE_DTYPE_FIELD,
+            Some("weight_format")
+        );
+        // Unchanged wire form: profile.db rows and config identities hash it.
+        let described = cfg.describe_config();
+        assert_eq!(described["weight_format"], Value::from("nvfp4_e2m1"));
+        assert_eq!(described["input_dtype"], Value::from("bf16"));
+        let payloads = Nvfp4FusedMoeSpec::enumerate(
+            &cfg,
+            &SweepGrid::new(vec![Axis::values([16])]),
+            "flashinfer_trtllm_sm100",
+        );
+        assert_eq!(
+            payloads[0].fields()["weight_format"],
+            Value::from("nvfp4_e2m1")
+        );
     }
 
     #[test]

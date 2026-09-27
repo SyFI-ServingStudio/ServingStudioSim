@@ -1,4 +1,4 @@
-"""Profilers for GLM-5.2's paged-decode DSA MQA logits.
+"""Profilers for paged-decode DSA MQA logits.
 
 The Torch backend times the complete semantic composite. The production-aligned
 backend times only DeepGEMM's fused main kernel; metadata construction and JIT
@@ -29,6 +29,8 @@ _OUTPUT_DTYPE = DType.FP32
 _CONTEXT_MODE = "uniform"
 _PAGE_MAPPING = "unique_scattered"
 _CACHE_FORMAT = "page_planar_fp8_fp32_scale"
+# Request-contiguous, 576-byte-aligned pages: see dsa_paged_mqa_logits_decode_contiguous.
+_CONTIGUOUS_CACHE_FORMAT = "fp8_e4m3_ue8m0"
 _REQUIRED_GPU = "NVIDIA H200"
 _DEEPGEMM_EXPECTED_SMS = {"NVIDIA H200": 132, "NVIDIA B200": 148}
 # DeepGEMM names the main kernel `sm90_fp8_paged_mqa_logits` on H200 and
@@ -228,13 +230,11 @@ def _load_deepgemm_backend() -> tuple[Any, Any]:
         supported = support_api()
     except (RuntimeError, OSError) as exc:
         raise ProfilerNotImplemented(
-            "DeepGEMM support could not be initialized for "
-            "dsa_paged_mqa_logits_decode:deepgemm_fp8"
+            "DeepGEMM support could not be initialized for dsa_paged_mqa_logits_decode:deepgemm_fp8"
         ) from exc
     if not supported:
         raise ProfilerNotImplemented(
-            "DeepGEMM is unavailable or unsupported for "
-            "dsa_paged_mqa_logits_decode:deepgemm_fp8"
+            "DeepGEMM is unavailable or unsupported for dsa_paged_mqa_logits_decode:deepgemm_fp8"
         )
     if not callable(getattr(deep_gemm, "get_paged_mqa_logits_metadata", None)):
         raise ProfilerNotImplemented(
@@ -801,7 +801,17 @@ def _profile_dsa_paged_mqa_logits_decode_deepgemm_fp8(
 
 
 def profile_dsa_paged_mqa_logits_decode_deepgemm_fp8(**kwargs: Any) -> ComputeMetrics:
-    """Profile the fused DeepGEMM FP8 decode callable."""
+    """Profile the fused DeepGEMM FP8 decode callable.
+
+    Both cache layouts reach the same DeepGEMM paged MQA-logits call; each keeps
+    the operand builder and timing boundary its rows were measured with.
+    """
+    if kwargs.get("cache_format") == _CONTIGUOUS_CACHE_FORMAT:
+        from profiling.runners.attention.dsa_paged_mqa_logits_decode_contiguous import (
+            profile_contiguous_deepgemm_fp8,
+        )
+
+        return profile_contiguous_deepgemm_fp8(**kwargs)
     return _profile_dsa_paged_mqa_logits_decode_deepgemm_fp8(
         _load_deepgemm_backend,
         **kwargs,

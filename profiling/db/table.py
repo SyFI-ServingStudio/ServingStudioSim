@@ -179,6 +179,34 @@ class Table:
                 for args in args_list
             ]
 
+    def rows_for(
+        self,
+        args_list: list[KernelArgs],
+        *,
+        backend: str,
+        gpu_name: str,
+    ) -> list[dict[str, Any] | None]:
+        """The stored row of each args (outliers included), or None. Read-only."""
+        conn = self._connect_read_only()
+        if conn is None:
+            return [None for _ in args_list]
+        with conn:
+            if not self._table_exists(conn):
+                return [None for _ in args_list]
+            out: list[dict[str, Any] | None] = []
+            for args in args_list:
+                where, values = self._where(args, backend, gpu_name)
+                row = conn.execute(
+                    f"SELECT * FROM {self.name} WHERE {where} LIMIT 1", values
+                ).fetchone()
+                out.append(dict(row) if row is not None else None)
+            return out
+
+    def db_key(self, args: KernelArgs) -> tuple[Any, ...]:
+        """``args`` as this table stores them, in ``args_columns`` order."""
+        values = _args_to_db(args)
+        return tuple(values[column] for column in self.args_columns)
+
     def exists(
         self,
         args_list: list[KernelArgs],

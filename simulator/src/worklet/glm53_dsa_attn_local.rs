@@ -35,16 +35,15 @@ use crate::op::attention::{
 use crate::op::Op;
 use crate::timing::bridge::DType;
 use crate::timing::kernels::{
-    BatchedGemmKernel, BatchedGemmKernelConfig, BatchedGemmKernelInput,
-    DeepseekV4FusedQKvRmsnormKernel, DeepseekV4FusedQKvRmsnormKernelConfig,
-    DeepseekV4FusedQKvRmsnormKernelInput, DsaMqaLogitsPrefillKernel,
+    BatchedGemmKernel, BatchedGemmKernelConfig, BatchedGemmKernelInput, DsaMqaLogitsPrefillKernel,
     DsaMqaLogitsPrefillKernelConfig, DsaMqaLogitsPrefillKernelInput, DsaPagedMqaLogitsDecodeKernel,
     DsaPagedMqaLogitsDecodeKernelConfig, DsaPagedMqaLogitsDecodeKernelInput,
     DsaPersistentTopkDecodeKernel, DsaPersistentTopkDecodeKernelConfig,
     DsaPersistentTopkDecodeKernelInput, DsaTopkPrefillKernel, DsaTopkPrefillKernelConfig,
     DsaTopkPrefillKernelInput, ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput,
-    GemmFp32OutputKernel, GemmFp32OutputKernelConfig, GemmFp32OutputKernelInput, SingleGemmKernel,
-    SingleGemmKernelConfig, SingleGemmKernelInput,
+    GemmFp32OutputKernel, GemmFp32OutputKernelConfig, GemmFp32OutputKernelInput, QKvRmsNormKernel,
+    QKvRmsNormKernelConfig, QKvRmsNormKernelInput, SingleGemmKernel, SingleGemmKernelConfig,
+    SingleGemmKernelInput,
 };
 use crate::timing::{BuildError, CostNode, CostTreeBuilder, Dim, Evaluator, PerfApiBridge};
 
@@ -119,7 +118,7 @@ pub struct Glm53DsaAttnLocalWorkletConfig {
 pub struct Glm53DsaAttnLocalWorkletResolved {
     pub raw_cfg: Glm53DsaAttnLocalWorkletConfig,
     pub fused_qkv_a: SingleGemmKernelConfig,
-    pub q_kv_norm: DeepseekV4FusedQKvRmsnormKernelConfig,
+    pub q_kv_norm: QKvRmsNormKernelConfig,
     pub q_b: SingleGemmKernelConfig,
     pub index_wq_b: SingleGemmKernelConfig,
     pub index_wk_weights: SingleGemmKernelConfig,
@@ -160,7 +159,7 @@ pub struct Glm53DsaAttnLocalWorkletInput {
 pub struct Glm53DsaAttnLocalWorklet {
     pub name: String,
     pub fused_qkv_a: Op<SingleGemmKernel>,
-    pub q_kv_norm: Op<DeepseekV4FusedQKvRmsnormKernel>,
+    pub q_kv_norm: Op<QKvRmsNormKernel>,
     pub q_b: Op<SingleGemmKernel>,
     pub index_wq_b: Op<SingleGemmKernel>,
     pub index_wk_weights: Op<SingleGemmKernel>,
@@ -225,7 +224,7 @@ impl Glm53DsaAttnLocalWorklet {
         let window = cfg.index_topk + kpool - 1;
         Glm53DsaAttnLocalWorkletResolved {
             fused_qkv_a: gemm(cfg.q_lora_rank.get() + latent, cfg.hidden.clone()),
-            q_kv_norm: DeepseekV4FusedQKvRmsnormKernelConfig {
+            q_kv_norm: QKvRmsNormKernelConfig {
                 backends: cfg.qkv_norm_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
                 q_dim: cfg.q_lora_rank.clone(),
@@ -387,7 +386,7 @@ impl Glm53DsaAttnLocalWorklet {
                 n,
                 "q_kv_a_norm",
                 r.q_kv_norm,
-                DeepseekV4FusedQKvRmsnormKernel::build,
+                QKvRmsNormKernel::build,
                 bridge,
             )?,
             q_b: gemm("q_b_proj", r.q_b)?,
@@ -508,7 +507,7 @@ impl Glm53DsaAttnLocalWorklet {
         push_or_zero(&self.fused_qkv_a, rows.clone(), false, ev);
         push_or_zero(
             &self.q_kv_norm,
-            DeepseekV4FusedQKvRmsnormKernelInput {
+            QKvRmsNormKernelInput {
                 num_tokens: w.total_tokens,
             },
             false,
@@ -735,8 +734,8 @@ mod tests {
             bf16_gemm_backends: vec!["torch_linear_vllm"],
             fp32_gemm_backends: vec!["torch_cublas"],
             qkv_norm_backends: vec!["vllm_triton"],
-            mla_bmm_q_absorb_backends: vec!["torch_mla_q_absorb_glm53"],
-            mla_bmm_v_up_backends: vec!["torch_mla_v_up_glm53"],
+            mla_bmm_q_absorb_backends: vec!["torch_mla_q_absorb_no_rope"],
+            mla_bmm_v_up_backends: vec!["torch_mla_v_up_unpadded"],
             mqa_logits_backends: vec!["deepgemm_fp8"],
             topk_backends: vec!["vllm_cuda"],
             mqa_logits_prefill_backends: vec!["deepgemm_fp8"],

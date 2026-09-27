@@ -1,7 +1,7 @@
-//! GLM-5.2 / GLM-5.3 request-local to global sparse-index remapping.
+//! Request-local to global sparse-index remapping.
 //!
-//! `selected_k` is the index-table width: 2048 (GLM-5.2) or 2176 (GLM-5.3
-//! kpool, `round_up(index_topk + index_kpool - 1, 128)`, at most 2051 valid).
+//! `selected_k` is the index-table width: 2048, or 2176 for a kpool table
+//! (`round_up(index_topk + index_kpool - 1, 128)`, at most 2051 valid).
 //!
 //! The native Triton launch scans a fixed `selected_k` row for every query.
 //! Its variable physical work is captured by query rows, mean valid slots, and

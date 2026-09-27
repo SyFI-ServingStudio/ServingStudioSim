@@ -183,6 +183,14 @@ EnsureCache → Simulate → ValidateRawArtifacts
 `ValidateRawArtifacts → Finalize`. BuildSimulator and BuildAnalyzer are batch
 stages before this per-run graph.
 
+`--no-plot` removes only `Render`, so `Trace → Finalize`, and the sweep skips
+its aggregate render too. Every run still gets its reports, payloads and trace,
+which the Analyzer UI reads. PNGs are the largest cost of a big grid: on a
+640-run Llama-3-8B sweep the renderer took ~22 CPU-s per run (16 forked
+matplotlib workers, 50 figures) against ~3 CPU-s for the simulation, 73% of the
+sweep's CPU, and `--no-plot` halved the sweep's wall time. Draw one run
+afterwards with `python analyzer/python render <run log_dir>`.
+
 Two concurrency mechanisms have different ownership:
 
 | Resource | Lease | Meaning |
@@ -569,6 +577,13 @@ only in non-kernel params (request rate, replicas, `log_dir`, …) collapse to o
 prebuild. `--cache-report` runs the binary's `dry-run` per key to show coverage
 without building anything.
 
+A prebuild that profiled also registers the kernel configs that asked for the
+new rows (`build-cache-only --kernel-configs-out`, then
+`kernel_configs.register_file`) in profile.db's kernel-config registry
+(`profiling/README.md`, DB shape). A timing-predict run does the same. A failed
+registration is reported and does not fail the run: the rows are already in
+profile.db, and `--register-kernel-configs` can register their configs later.
+
 ### `energy:` — measure NVML energy, or refuse rows that lack it
 
 ```yaml
@@ -654,20 +669,24 @@ silently mixing incompatible sweep geometries.
 ```
 python -m launcher <preset.yaml|json> [<preset2.yaml|json> ...]
                    [--override path=value ...]
-                   [--dry-run] [--cache-report] [--refresh]
+                   [--dry-run] [--cache-report] [--register-kernel-configs] [--refresh]
                    [--build-type <cargo-profile>] [--profile [--profile-freq HZ]]
-                   [--no-analyze] [--emit-backends [FILE]]
+                   [--no-analyze] [--no-plot] [--emit-backends [FILE]]
+python -m launcher --register-supported-kernel-configs [--build-type <cargo-profile>]
 python -m launcher timing-predict <config.yaml|json> [<config2.yaml|json> ...]
                    [--build-type <cargo-profile>] [--no-analyze]
+                   [--dry-run | --register-kernel-configs]
 python -m launcher kernel-profile {list,query,count-missing,run,measure,merge-db,audit-provenance} ...
 python -m launcher list-params [--human] [--build-type ...]
 python -m launcher alignment sim <simulation.yaml|json> [simulation options]
 python -m launcher alignment profile <profile.yaml|json> [--dry-run]
-python -m launcher alignment timing-predict <timing_predict.yaml|json> [--build-type ...]
+python -m launcher alignment timing-predict <timing_predict.yaml|json> [--build-type ...] [--dry-run]
 python -m launcher alignment analyze <analyze.yaml|json> [--build-type ...]
 python -m launcher alignment-campaign {check,render,run,label,extract,compare} ...
 python -m launcher migrate-artifact-kinds (--check|--apply) [--registry PATH]
 ```
+
+`--no-gpu` may be added anywhere to any of these commands.
 
 - Simulation presets, timing-predict configs, and all alignment stage inputs
   accept YAML (`.yaml` / `.yml`) or JSON.
@@ -678,10 +697,25 @@ python -m launcher migrate-artifact-kinds (--check|--apply) [--registry PATH]
   when possible, else kept as a bare string.
 - `--dry-run` validates + expands + prints the resolved configs; spawns nothing.
 - `--cache-report` reports profile.db coverage per unique cache key, then exits.
+- `--register-kernel-configs` registers the kernel configs each unique cache key
+  asks profile.db for, with their grids, in the kernel-config registry, then
+  exits. It runs the binary's `dry-run` (no GPU); `timing-predict
+  --register-kernel-configs` does the same for predict configs, and
+  `--register-supported-kernel-configs` for every `#[supported]` arch deployment
+  (`simulator supported-cost-trees --kernel-configs`), recorded with its
+  `#[supported]` row as the source.
 - `--emit-backends [FILE]` enumerates the distinct kernels (structural, no GPU) and
   writes the annotated `backends:` skeleton (stdout, or `FILE`), then exits — the
   starting point for a `backends_file` (see the `backends` section above).
 - `--profile` wraps a single run with `perf record` (skill `operate-profile-sim-speed`).
+- `--no-gpu` (any mode, or `SERVINGSTUDIO_NO_GPU=1`) guarantees the command uses
+  no GPU. The launcher sets the variable and empties `CUDA_VISIBLE_DEVICES` for
+  itself and every child. Each GPU entry point in `profiling/` and
+  `alignment/runner.py` checks it (`profiling/gpu_policy.py`), so a step that
+  needs a GPU fails and names itself: a cache prebuild with missing rows
+  (before any builder starts), a timing-predict JIT fill, `kernel-profile
+  run`/`measure`, and an `alignment profile` capture (`--resume` still works).
+  A run over a warm `profile.db` is unaffected.
 - `timing-predict` evaluates explicit batch shapes without a workload, scheduler,
   clock, or discrete-event simulation; its config is not a deployment preset.
   The launcher snapshots a private `raw/params.json` model/GPU projection so the
@@ -690,6 +724,12 @@ python -m launcher migrate-artifact-kinds (--check|--apply) [--registry PATH]
   `raw/prediction_provenance.json` from the concrete L4 model, and the launcher
   uses its authoritative `gpus_per_replica()` value in `prediction.meta.json`;
   timing-predict does not create simulation `run_meta.json`.
+- `timing-predict --dry-run` builds the model on the simulator's dry-run bridge,
+  checks every case against it, and prints the `profile.db` specs a real run
+  would JIT. It costs nothing, writes nothing under `log_dir`, announces no job,
+  and needs no GPU. `alignment timing-predict --dry-run` builds the measured
+  cases in a scratch directory and runs the same check. A real run also checks
+  every case before costing the first, so a bad case writes no rows.
 - Every first-class output root gets `artifact.meta.json` with one explicit kind:
   `simulation_run`, `simulation_sweep`, `timing_prediction`, `alignment_bundle`,
   `kernel_profile`, or `kernel_measurement`. Analyzer uses this marker as its only
@@ -719,8 +759,9 @@ It exposes four explicit stages with four independent configs:
   normalized `parsed.json`.
 - `alignment timing-predict` pairs those completed artifacts, generates exact
   predictor cases, and runs the offline predictor. Its arch, GPU, and complete
-  per-role backend policy come from the simulation run's normalized
-  `raw/params.json`, not the source preset.
+  per-role backend policy come from the simulation preset, normalized exactly as
+  `launcher sim` normalizes it: `backends_file` folded in and schema defaults
+  filled. No completed simulation is needed, and the preset must expand to one run.
 - `alignment analyze` assembles the analyzer manifest from completed artifact
   directories and invokes only the enabled top-level alignment subjects.
 

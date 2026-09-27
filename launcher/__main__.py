@@ -16,6 +16,12 @@ enumeration (`--emit-backends`), and simulator wallclock profiling (`--profile`)
 paths. YAML and JSON are accepted for simulation presets, timing-predict configs,
 and alignment stage configs.
 
+`--no-gpu`, anywhere on the command line of any mode, guarantees the command
+uses no GPU: it sets `SERVINGSTUDIO_NO_GPU=1` (which has the same effect when
+set directly) and empties `CUDA_VISIBLE_DEVICES` for every child. A step that
+would need one -- profiling a missing `profile.db` row, an alignment capture --
+fails and names itself instead. See `profiling/gpu_policy.py`.
+
 Single versus batch execution is decided by the number of expanded configs.
 Sweep expansion belongs to `launcher.schema`. No `--web` / `--tui` / `--gui`
 (UI deleted per discussion.md).
@@ -65,7 +71,8 @@ def _build_argparse():
             "  python -m launcher kernel-profile "
             "{list,query,count-missing,run,measure,merge-db,audit-provenance} ...\n"
             "  python -m launcher alignment {sim,profile,timing-predict,analyze} ...\n"
-            "  python -m launcher list-params [--human]"
+            "  python -m launcher list-params [--human]\n"
+            "--no-gpu applies to every mode: see --no-gpu below."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -87,11 +94,32 @@ def _build_argparse():
         help="Validate + expand only; do not launch subprocesses.",
     )
     parser.add_argument(
+        "--no-gpu",
+        action="store_true",
+        help="Guarantee no GPU is used, in any mode (also SERVINGSTUDIO_NO_GPU=1). "
+        "A missing profile.db row fails instead of being profiled.",
+    )
+    parser.add_argument(
         "--cache-report",
         action="store_true",
         help="Report profile.db coverage — how many kernel specs are missing "
         "(would be JIT-profiled) per kernel, for each unique cache key — then "
         "exit without building caches or running.",
+    )
+    parser.add_argument(
+        "--register-kernel-configs",
+        action="store_true",
+        help="Register the kernel configs each run asks profile.db for (and the "
+        "grid of rows each one reads) in profile.db's kernel-config registry, "
+        "then exit. Runs the simulator's dry-run only: no GPU, no profiling. "
+        "For rows measured before the registry existed.",
+    )
+    parser.add_argument(
+        "--register-supported-kernel-configs",
+        action="store_true",
+        help="Register the kernel configs of every `#[supported]` arch deployment "
+        "(`simulator supported-cost-trees`) the way --register-kernel-configs does "
+        "for presets, then exit. Takes no preset.",
     )
     parser.add_argument(
         "--refresh",
@@ -139,6 +167,14 @@ def _build_argparse():
         action="store_true",
         help="Skip the per-run analyzer (Rust SLO compute + Python plots) that "
         "otherwise runs after each successful run.",
+    )
+    parser.add_argument(
+        "--no-plot",
+        action="store_true",
+        help="Run the analyzer but render no PNGs (per run or for the sweep). "
+        "Reports, payloads and traces are still written, so the Analyzer UI works; "
+        "on a large sweep the PNGs cost more CPU than the simulations. Draw one run "
+        "later with `python analyzer/python render <log_dir>`.",
     )
     parser.add_argument(
         "--emit-backends",
@@ -500,6 +536,17 @@ def _apply_energy_policy(
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
 
+    # `--no-gpu` holds for every mode, so it is taken before dispatch; the
+    # environment carries it to every child. The variable alone gets the same
+    # hidden devices, so a child cannot see a GPU either way.
+    from profiling.gpu_policy import disable_gpus, gpu_disabled
+
+    if "--no-gpu" in argv:
+        argv = [token for token in argv if token != "--no-gpu"]
+        disable_gpus()
+    elif gpu_disabled():
+        disable_gpus()
+
     # `alignment` exposes explicit workflow stages. Its `sim` handler re-enters
     # this main function, so dispatch must short-circuit before preset parsing.
     if argv and argv[0] == "alignment":
@@ -553,7 +600,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     args = _build_argparse().parse_args(argv)
-    if not args.presets:
+    if args.register_supported_kernel_configs and args.presets:
+        sys.exit("--register-supported-kernel-configs takes no preset")
+    if not args.presets and not args.register_supported_kernel_configs:
         sys.exit(
             "no preset given; usage: python -m launcher PRESET.yaml|json [...] "
             "(or choose timing-predict, kernel-profile, alignment, or list-params)"
@@ -569,6 +618,11 @@ def main(argv: list[str] | None = None) -> int:
     if not cargo_build(args.build_type, build_analyzer=not args.no_analyze):
         sys.exit("launcher preparation failed (see stage-specific error above)")
 
+    if args.register_supported_kernel_configs:
+        from .kernel_configs import register_supported_configs
+
+        return register_supported_configs(args.build_type)
+
     try:
         schema = load_schema(args.build_type)
     except SchemaNotFound as exc:
@@ -578,6 +632,8 @@ def main(argv: list[str] | None = None) -> int:
         return _emit_backends(args, schema)
 
     all_candidates: list[dict] = []
+    # The preset (or variants manifest) each candidate came from, in order.
+    candidate_presets: list[str] = []
     last_preset: dict = {}
     analyze_subjects: list[str] | None = None
     preset_energy: list[bool | None] = []
@@ -616,6 +672,7 @@ def main(argv: list[str] | None = None) -> int:
         if cands is None:
             return 2
         all_candidates.extend(cands)
+        candidate_presets.extend(preset_path for _ in cands)
 
     if not _apply_energy_policy(args.energy, preset_energy, args.presets):
         return 2
@@ -666,6 +723,21 @@ def main(argv: list[str] | None = None) -> int:
 
         return report_cache_coverage(all_candidates, schema, args.build_type)
 
+    if args.register_kernel_configs:
+        from .cache_build import unique_by_cache_key
+        from .kernel_configs import register_run_configs
+
+        # Runs that differ only in non-kernel params build the same configs.
+        candidates = [
+            (preset, config)
+            for preset in dict.fromkeys(candidate_presets)
+            for config in unique_by_cache_key(
+                [c for p, c in zip(candidate_presets, all_candidates, strict=True) if p == preset],
+                schema,
+            )
+        ]
+        return register_run_configs(candidates, args.build_type)
+
     if args.profile:
         from .exec import perf_available
 
@@ -686,6 +758,7 @@ def main(argv: list[str] | None = None) -> int:
             profile_freq=args.profile_freq,
             analyze=not args.no_analyze,
             analyze_subjects=analyze_subjects,
+            plot=not args.no_plot,
         )
         return 0 if ok else 1
     return run_sweep(
@@ -696,6 +769,7 @@ def main(argv: list[str] | None = None) -> int:
         refresh=args.refresh,
         analyze=not args.no_analyze,
         analyze_subjects=analyze_subjects,
+        plot=not args.no_plot,
     )
 
 

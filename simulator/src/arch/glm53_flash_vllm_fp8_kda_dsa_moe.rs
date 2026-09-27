@@ -98,8 +98,8 @@ const RMS_NORM_BACKENDS: &[&str] = &["vllm_cuda"];
 const KDA_BACKENDS: &[&str] = &["vllm_triton"];
 const CONV_BACKENDS: &[&str] = &["vllm_triton"];
 const QKV_NORM_BACKENDS: &[&str] = &["vllm_triton"];
-const Q_ABSORB_BACKENDS: &[&str] = &["torch_mla_q_absorb_glm53"];
-const V_UP_BACKENDS: &[&str] = &["torch_mla_v_up_glm53"];
+const Q_ABSORB_BACKENDS: &[&str] = &["torch_mla_q_absorb_no_rope"];
+const V_UP_BACKENDS: &[&str] = &["torch_mla_v_up_unpadded"];
 const MQA_LOGITS_BACKENDS: &[&str] = &["deepgemm_fp8"];
 const TOPK_BACKENDS: &[&str] = &["vllm_cuda"];
 /// The fork's `fp8_fp4_mqa_logits` is DeepGEMM's `sm100_mqa_logits`; the

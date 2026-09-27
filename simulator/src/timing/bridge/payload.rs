@@ -28,6 +28,9 @@ pub enum DType {
     Fp8E5m2,
     Int8,
     Int4,
+    /// NVFP4: packed e2m1 elements with one fp8 scale per 16-element group, the
+    /// operand format of Blackwell FP4 tensor cores.
+    Nvfp4E2m1,
 }
 
 impl DType {
@@ -40,17 +43,19 @@ impl DType {
             DType::Fp8E5m2 => "fp8_e5m2",
             DType::Int8 => "int8",
             DType::Int4 => "int4",
+            DType::Nvfp4E2m1 => "nvfp4_e2m1",
         }
     }
 
     /// Bytes per element. Used by L3 worklets to size byte-keyed kernels (e.g.
-    /// the elementwise activation's per-token I/O footprint). Int4 is sub-byte;
-    /// it rounds up to 1 (no current model uses Int4 on a byte-keyed path).
+    /// the elementwise activation's per-token I/O footprint). Int4 and NVFP4 are
+    /// sub-byte; they round up to 1 (no current model uses either on a
+    /// byte-keyed path).
     pub fn size_bytes(self) -> u32 {
         match self {
             DType::Fp32 => 4,
             DType::Fp16 | DType::Bf16 => 2,
-            DType::Fp8E4m3 | DType::Fp8E5m2 | DType::Int8 | DType::Int4 => 1,
+            DType::Fp8E4m3 | DType::Fp8E5m2 | DType::Int8 | DType::Int4 | DType::Nvfp4E2m1 => 1,
         }
     }
 
@@ -66,6 +71,7 @@ impl DType {
             "fp8_e5m2" => DType::Fp8E5m2,
             "int8" => DType::Int8,
             "int4" => DType::Int4,
+            "nvfp4_e2m1" => DType::Nvfp4E2m1,
             _ => return None,
         })
     }
@@ -82,7 +88,7 @@ impl<'de> Deserialize<'de> for DType {
         let s = String::deserialize(d)?;
         DType::from_wire(&s).ok_or_else(|| {
             serde::de::Error::custom(format!(
-                "unknown dtype {s:?} (expected fp16/bf16/fp32/fp8_e4m3/fp8_e5m2/int8/int4)"
+                "unknown dtype {s:?} (expected fp16/bf16/fp32/fp8_e4m3/fp8_e5m2/int8/int4/nvfp4_e2m1)"
             ))
         })
     }
@@ -289,6 +295,7 @@ mod tests {
             DType::Fp8E5m2,
             DType::Int8,
             DType::Int4,
+            DType::Nvfp4E2m1,
         ] {
             assert_eq!(DType::from_wire(dt.as_str()), Some(dt));
             // serde goes through the same path: "bf16" not "Bf16".
@@ -298,6 +305,8 @@ mod tests {
             );
         }
         assert_eq!(DType::from_wire("Bf16"), None);
+        // The profile.db `weight_format` literal of nvfp4_fused_moe rows.
+        assert_eq!(DType::Nvfp4E2m1.as_str(), "nvfp4_e2m1");
     }
 
     #[test]

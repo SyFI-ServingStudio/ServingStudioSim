@@ -31,6 +31,7 @@ pools:
         arch:
           type: qwen36_local
           model_config: model/config/qwen3_6_35b_a3b_fp8.json
+          fp8: true
         worker:
           type: barebone
           attn_gpu_memory_gb: 40.0

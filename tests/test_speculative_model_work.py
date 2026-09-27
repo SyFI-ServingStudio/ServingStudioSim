@@ -99,7 +99,13 @@ def test_floor_handoff_and_exact_semantic_coverage(tmp_path, mode, depth, map_na
     assert len(mapped) == len(set(mapped))
     assert set(mapped) == {s["name"] for s in result["segments"]}
     locked = floors.compute_locked_compositions(
-        tmp_path, {"main/0": [{"occurrences": 3, "totals": shape}]}
+        tmp_path,
+        {
+            "main/0": {
+                "occurrences": [3],
+                "totals": {name: [value] for name, value in shape.items()},
+            }
+        },
     )["main/0"]
     assert "error" not in locked, locked
     assert locked["necessary"] == pytest.approx(3 * result["necessary"])

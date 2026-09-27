@@ -195,7 +195,7 @@ impl Glm53RoutedMoeLocalWorklet {
                 num_local_experts: local_experts.into(),
                 top_k: cfg.top_k,
                 input_dtype: cfg.activation_dtype,
-                weight_format: "fp8_e4m3_block".to_string(),
+                weight_format: DType::Fp8E4m3,
                 group_size: QUANT_GROUP_SIZE,
                 routing_method: "deepseek_v3".to_string(),
                 n_group: cfg.n_group,
@@ -304,7 +304,7 @@ mod tests {
     fn routed_path_is_the_fp8_block_trtllm_moe_with_row_major_input_quant() {
         let r = Glm53RoutedMoeLocalWorklet::resolve_config(&cfg());
         assert_eq!(r.fused_moe.num_local_experts.get(), 72);
-        assert_eq!(r.fused_moe.weight_format, "fp8_e4m3_block");
+        assert_eq!(r.fused_moe.weight_format, DType::Fp8E4m3);
         assert_eq!(r.fused_moe.routing_method, "deepseek_v3");
         assert_eq!(r.input_quant.scale_format, ROW_MAJOR_SCALE_FORMAT);
     }

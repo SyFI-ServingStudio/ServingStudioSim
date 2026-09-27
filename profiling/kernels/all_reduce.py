@@ -21,6 +21,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from profiling.db.args import DType, KernelArgs
+from profiling.db.doc import BackendDoc, KernelDoc, arg
 from profiling.db.outlier import BatchOutlierPolicy
 from profiling.db.registry import (
     BackendSupport,
@@ -35,15 +36,70 @@ KIND: str = "all_reduce"
 
 @dataclass(frozen=True)
 class AllReduceArgs(KernelArgs):
-    num_gpus: int
+    num_gpus: int = arg(unit="GPUs", doc="GPUs in the group, one rank each.")
     # FULL buffer each rank all-reduces (the whole tensor handed to
     # dist.all_reduce), NOT a reduce-scatter shard. The ring 2(N-1)/N movement is
     # captured in the measured time, so callers pass the complete output size.
-    message_size_bytes: int
-    dtype: DType
+    message_size_bytes: int = arg(
+        unit="bytes",
+        doc="Full buffer each GPU contributes and receives, not a per-GPU shard.",
+    )
+    dtype: DType = arg(doc="Element type of the buffer. The simulator profiles bf16 only.")
     # Network fabric token (matches Rust `Fabric` serde wire form, e.g.
     # "nvlink"). A row/cache key only — the runner body does not use it.
-    fabric: str
+    fabric: str = arg(
+        doc=(
+            "Interconnect label, such as nvlink. It keys the row; the run uses "
+            "whatever links the reserved GPUs have."
+        )
+    )
+
+
+DOC = KernelDoc(
+    title="All-reduce",
+    summary="Sum one buffer across the GPUs of a tensor-parallel group.",
+    description=(
+        "Tensor-parallel attention and MLP blocks end with an all-reduce of the "
+        "row-parallel projection's output, so every GPU holds the full sum. "
+        "message_size_bytes is the full buffer each GPU contributes, not a shard. "
+        "Measured on the GPUs of one node, over whatever links connect them "
+        "(NVLink so far)."
+    ),
+    category="Communication",
+    formula=(
+        "algbw = message_size_bytes / time",
+        "busbw = algbw · 2(N − 1) / N, for N = num_gpus",
+    ),
+    default_metric="busbw_gbps",
+    caveats=(
+        "busbw is the number to compare with the link: it scales algbw by the "
+        "2(N − 1)/N traffic of a ring all-reduce. The NVLink figure in the GPU "
+        "catalog counts both directions.",
+        "Cost is keyed by bytes, not dtype: rows are measured at bf16, and the "
+        "simulator reads an fp8 payload as fewer bytes on the same curve.",
+    ),
+    method=(
+        "Wall time between two CUDA events around repeated calls. Each size runs 50 "
+        "warm-up all-reduces, a barrier, then 100 timed calls back to back in the "
+        "same live process group; the time is rank 0's mean per call. Energy is not "
+        "measured for collectives."
+    ),
+    reference=None,
+)
+
+_BACKEND_DOCS = {
+    "nccl": BackendDoc(
+        summary="torch.distributed.all_reduce with sum, on the NCCL backend.",
+        url="https://github.com/NVIDIA/nccl",
+    ),
+    "nvshmem": BackendDoc(
+        summary=(
+            "nvshmem4py reduce with sum over TEAM_WORLD, on symmetric-memory "
+            "buffers, so every GPU receives the sum."
+        ),
+        url="https://github.com/NVIDIA/nvshmem",
+    ),
+}
 
 
 def _spec(backend: str, module_name: str) -> KernelProfilerSpec:
@@ -62,6 +118,7 @@ def _spec(backend: str, module_name: str) -> KernelProfilerSpec:
         batch_outlier_policy=BatchOutlierPolicy(),
         gpu_count_fn=lambda spec: int(spec["num_gpus"]),
         list_native=True,
+        doc=_BACKEND_DOCS[backend],
     )
 
 

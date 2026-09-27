@@ -29,7 +29,9 @@ from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerN
 from profiling.runners.metrics import ComputeMetrics
 from profiling.runners.moe.exact_topk import exact_topk_ids
 
-WEIGHT_FORMAT = "fp8_e4m3_block"
+# FP8 E4M3 weights with one scale per 128x128 block, and activations with one
+# scale per 1x128 group; group_size is the 128 edge.
+WEIGHT_FORMAT = DType.FP8_E4M3
 GROUP_SIZE = 128
 # flashinfer.fused_moe.RoutingMethodType; vLLM selects DeepSeekV3 for
 # sigmoid scoring + correction bias + renormalize + num_expert_group > 0
@@ -93,9 +95,12 @@ def _validate_args(**kwargs: Any) -> dict[str, Any]:
     args["per_expert_batches"] = tuple(int(value) for value in args["per_expert_batches"])
     if DType.from_value(args["input_dtype"]) is not DType.BF16:
         raise ValueError("FP8 block-scale fused MoE requires BF16 activation/output precision")
-    if args["weight_format"] != WEIGHT_FORMAT or args["group_size"] != GROUP_SIZE:
+    if (
+        DType.from_value(args["weight_format"]) is not WEIGHT_FORMAT
+        or args["group_size"] != GROUP_SIZE
+    ):
         raise ValueError(
-            f"FP8 block-scale fused MoE requires {WEIGHT_FORMAT} weights with "
+            f"FP8 block-scale fused MoE requires {WEIGHT_FORMAT.value} weights with "
             f"group_size={GROUP_SIZE}"
         )
     if args["routing_method"] not in ROUTING_METHODS:
@@ -315,7 +320,7 @@ def profile_fp8_block_fused_moe_sm100(
     num_local_experts: int,
     top_k: int,
     input_dtype: DType | str,
-    weight_format: str,
+    weight_format: DType | str,
     group_size: int,
     routing_method: str,
     n_group: int,

@@ -252,7 +252,7 @@ Current catalog:
 | `request-state` | concurrency | `request_slo.parquet` stage-transition lists + `run_meta.json` stage vocab/worker roster | exact category/pending peaks and means / 200-bin cluster and request-owner-worker open-category stacks plus owner-pool aggregate/average/worker pending series; execution-only pools (AFD FFN) are omitted; unavailable when stage logging is off |
 | `workload-conservation` | conservation | `cost_log` actuals + `request_slo.parquet` immutable fresh/declared input and runtime hit/computed/output observations | run-wide prefix token balance, cache-aware causal-prefill/cold-equivalent/decode-KV, and prefill/decode/FFN accounting, pass/fail / `workload_conservation_checks` |
 | `kv-occupancy` | kv | `kv_snapshot` stream + `run_meta.json` capacity | per-pool KV occupancy (active total / retained-prefix component / projected-peak / promised tokens, and as a fraction of capacity) over time; old streams remain readable with the missing prefix breakdown marked unavailable / `kv_occupancy_series` |
-| `alignment-timeline` | alignment-iteration | the same inputs as `alignment-iteration`, but keeping every rank's per-kernel `(start_ns, end_ns)`, plus the optional host sidecar (`host_timeline` in the alignment manifest) | EVERY iteration, as an index plus a byte-range-addressed `alignment_timeline_iterations.jsonl`: raw measured intervals, per-slot UNIT sim times, the cost manifest verbatim, and — when the sidecar is present — per-thread NVTX and CUDA-runtime host lanes, so a client can draw the GPU, the sim and the CPU on ONE time axis. At most 32 iterations carry a distinguishing `selected_as`; the report writes up those. / reference-rank per-phase span/busy/idle + largest gaps named by the operations either side |
+| `alignment-timeline` | alignment-iteration | the same inputs as `alignment-iteration`, but keeping every rank's per-kernel `(start_ns, end_ns)`, plus the optional host sidecar (`host_timeline` in the alignment manifest) | EVERY iteration, as an index plus a byte-range-addressed `alignment_timeline_iterations.jsonl.zst`: raw measured intervals, per-slot UNIT sim times, the cost manifest verbatim, and — when the sidecar is present — per-thread NVTX and CUDA-runtime host lanes, so a client can draw the GPU, the sim and the CPU on ONE time axis. At most 32 iterations carry a distinguishing `selected_as`; the report writes up those. / reference-rank per-phase span/busy/idle + largest gaps named by the operations either side |
 | `alignment-iteration` | alignment-iteration | normalized NSYS exact sequence rows + predict cost log/manifest + user mapping (no simulation) | per-iteration distributions, duration-weighted stage/all signed and absolute error, semantic operations ranked by absolute-error impact, mapping audit, and self-derived `recommended_gpu_time_multiplier` (`Σ measured_gpu_cycle_ms / Σ measured_ms`) / separate kernel-busy and GPU-cycle overviews + byte-range-queryable per-iteration critical-device stream stacks |
 | `alignment-e2e` | alignment-e2e | full-run req-frontend replay JSONL + optional engine-core request timing JSONL + sim `request_slo.parquet` | independent client-TTFT/sim, optional server-TTFT/sim, client-TPOT/sim, optional server-TPOT/sim, E2E stats, and client-completion throughput / available raw latency CDF overlays + client/sim completion series annotated with aggregate rates |
 | `alignment-workload` | alignment-workload | full-run EngineCore iteration metrics + recorded replay monotonic window + sim `cost_log.groups`/`wall_start_ms` | per-side workload summaries / fine prefill-token, decode-batch-size, scheduled-KV-workload, and actual iteration-cycle series by iteration id, plus decode batch size by elapsed time |
@@ -268,6 +268,21 @@ byte range of each iteration inside it. A reader seeks; it never loads the file.
 On the reference capture that is 544 MB -> 2.96 MB for
 `alignment_iteration_series.json` and 2.0 MB of index beside a 249 MB seekable
 shard for `alignment_timeline.json`.
+
+Each record of the two per-iteration shards (`alignment_iteration_breakdowns`
+and `alignment_timeline_iterations`) is its own zstd frame, so the shard is a
+`.jsonl.zst`. The detail section says `"encoding": "zstd-frames"`; `byte_ranges`
+stays `[offset, length]` into the compressed file, now naming one frame, and
+`decoded_lengths` gives each frame's decoded size (the JSON line plus its
+newline). A reader still seeks to one iteration and decodes only that frame,
+and `zstd -d` turns the whole shard back into the plain JSONL. On a
+4,169-iteration GLM-5.3 TP4 capture the two shards went from 11.7 GB + 7.7 GB
+to 571 MB + 1.03 GB, and the analysis from 58.8 s to 43.7 s wall, because the
+serial writer now hashes and writes 12x fewer bytes. `analyze serve` decodes
+before it answers, so a client receives the same JSON object as before. A
+detail section without `encoding` is a plain `.jsonl` from an older analyzer,
+and every reader still accepts it. The two inventories below stay plain: they
+are small.
 
 The two per-iteration shards are published as immutable, content-addressed
 generations (the SHA-256 is part of the filename), and the payload names the

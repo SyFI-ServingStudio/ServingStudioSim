@@ -666,6 +666,38 @@ def test_plan_skips_a_complete_phase_and_refresh_reselects_it(pack, tmp_path):
     assert plan.state == "ready"
 
 
+def test_a_schema_six_parse_without_its_kernel_rows_is_not_complete(pack, tmp_path):
+    case = pack.cases[0]
+    variant = pack.variant_of(case)
+    phase = next(
+        name
+        for name in phase_names(variant)
+        if (variant.pass_named(name) is not None and variant.pass_named(name).kind == "nsys")
+    )
+    host = check_module.host_for(pack, None)
+    render_case(pack, case, host, tmp_path, REPO_ROOT)
+    artifacts = tmp_path / case.slug / phase
+    artifacts.mkdir(parents=True)
+    for name in execute._artifacts_for(variant, phase):
+        (artifacts / name).write_text("{}")
+    mark_complete(artifacts)
+
+    # A capture from before schema 6 names no kernel-row sibling and stays complete.
+    (plan,) = execute.plan_phase(pack, tmp_path, phase, cases=[case])
+    assert plan.state == "complete"
+
+    # A schema-6 capture recorded one; without it the parse is unreadable. The
+    # recorded path is absolute from wherever the profile ran.
+    rows = "/elsewhere/profile/parsed.kernels.parquet"
+    (artifacts / "profile_result.json").write_text(json.dumps({"parsed_kernel_rows": rows}))
+    (plan,) = execute.plan_phase(pack, tmp_path, phase, cases=[case])
+    assert plan.state == "ready"
+
+    (artifacts / "parsed.kernels.parquet").write_bytes(b"PAR1")
+    (plan,) = execute.plan_phase(pack, tmp_path, phase, cases=[case])
+    assert plan.state == "complete"
+
+
 def test_a_marker_without_artifacts_does_not_suppress_the_rerun(pack, tmp_path):
     """INV-5's marker claims a zero exit, not a finished artifact set. An
     interrupted phase that left a marker must still be re-run."""

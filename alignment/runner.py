@@ -26,8 +26,11 @@ import threading
 import time
 from pathlib import Path
 
+from profiling.gpu_policy import require_gpu
+
 from .load_generator import runner as load_generator
 from .nsys.parse import parse_host_timeline, parse_trace, parsed_window_ns, write_kernel_sequences
+from .nsys.parsed_io import kernel_rows_path, write_parsed
 from .profiler import (
     nsys_capture,
     record_extraction,
@@ -358,6 +361,8 @@ def run_profile(cfg: ProfileConfig, *, resume: bool = False) -> dict:
     manifest). The GPU capture is the expensive, non-reproducible part of this
     pipeline; a failure in extraction or parsing must never cost a re-capture.
     """
+    if not resume:
+        require_gpu(f"an alignment {cfg.profile_kind} capture (starts {cfg.engine})")
     driver, _, _ = _engine(cfg)
     if cfg.workload is not None and cfg.workload.warmup and (
         cfg.engine != "vllm"
@@ -844,7 +849,7 @@ def _finalize_profile(
             "normalized NSYS DP-rank population does not match server parallelism: "
             f"dp_ranks={observed_dp_ranks} dp_size={cfg.server.dp_size}"
         )
-    parsed_path.write_text(json.dumps(parsed, indent=2))
+    write_parsed(parsed_path, parsed)
     kernel_sequences_path = log_dir / "kernel_sequences.json"
     write_kernel_sequences(kernel_sequences_path, parsed, parsed_path)
     print(
@@ -877,6 +882,9 @@ def _finalize_profile(
         "request_timings_jsonl": str(request_timings_jsonl),
         "request_timing_count": n_request_timings,
         "parsed_nsys": str(parsed_path),
+        # The schema-6 sibling `parsed.json` cannot be read without; recorded so a
+        # completion check can require it (`launcher.alignment_campaign.execute`).
+        "parsed_kernel_rows": str(kernel_rows_path(parsed_path)),
         "kernel_sequences": str(kernel_sequences_path),
         "host_timeline": str(host_timeline_path),
         "server_log": str(server_log),

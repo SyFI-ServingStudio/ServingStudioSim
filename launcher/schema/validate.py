@@ -16,6 +16,8 @@ Layers of checks, against the Rust-authoritative `Registry`:
 - **type / value**: every present, non-placeholder leaf has a value of its
   ParamDef type (TE) and, for closed sets, an allowed value; required leaves are
   present;
+- **supported deployment**: an arch that declares `#[supported]` rows gets a
+  combination of values (GPU, model, parallel sizes) one of the rows covers;
 - **control-flow (sweep / derived / constraints)**: expression grammar +
   free-variable resolution (V1–V6); no partial `${...}` interpolation (R1); no
   dead sweep dim (R2) or dead derived name (R3); no empty sweep dim (R4); every
@@ -50,11 +52,12 @@ from __future__ import annotations
 import copy
 import re
 import string
+from pathlib import Path
 from typing import Any
 
 from .expand import _sweep_dim_options, collect_placeholders
 from .expr import _check_expr_grammar, _expr_names
-from .loader import CONTROL_KEYS, Registry, iter_slots, unknown_keys
+from .loader import CONTROL_KEYS, REPO_ROOT, Registry, iter_slots, unknown_keys
 
 _PLACEHOLDER_RE = re.compile(r"^\$\{(\w+)\}$")
 
@@ -188,6 +191,7 @@ def _walk_schema(config: dict, registry: Registry, *, defer_placeholders: bool) 
         errors.append(f"unknown key {path!r} for deployment {deployment!r}")
     _check_structure(errors, config, registry, deployment)
     errors.extend(_check_leaves(config, registry, defer_placeholders=defer_placeholders))
+    errors.extend(_check_supported(config, registry))
     return errors
 
 
@@ -245,6 +249,68 @@ def _check_leaves(candidate: dict, registry: Registry, *, defer_placeholders: bo
             has_default = "default" in slot.pdef
             if required and not has_default:
                 errors.append(f"missing required param {path!r}")
+    return errors
+
+
+_MODEL_CONFIG_DIR = REPO_ROOT / "model" / "config"
+
+
+def supported_value(name: str, value: Any) -> Any:
+    """A config value as `#[supported]` rows spell it: a `model_config` under
+    `model/config/` is its file stem (`model/config/llama3_8b.json` →
+    `llama3_8b`); every other value is compared as is."""
+    if name == "model_config" and isinstance(value, str) and value.endswith(".json"):
+        path = Path(value) if Path(value).is_absolute() else REPO_ROOT / value
+        if path.resolve().parent == _MODEL_CONFIG_DIR.resolve():
+            return path.stem
+    return value
+
+
+def _check_supported(config: dict, registry: Registry) -> list[str]:
+    """Each group whose arch declares `#[supported]` rows is covered by one row.
+
+    The rows come from the Rust arch variant (`schema::supported`); an arch with
+    none is not checked. `gpu` is read from the group, every other name from the
+    arch; an arch param the group leaves out takes its schema default.
+    A group is skipped while any value a row names is still `${...}`."""
+    errors: list[str] = []
+    deployment = config.get("deployment")
+    pools = config.get("pools")
+    if not isinstance(pools, dict):
+        return errors
+    for role, contract in registry.roles(deployment).items():
+        pool = pools.get(role)
+        groups = pool.get("groups") if isinstance(pool, dict) else None
+        for gi, group in enumerate(groups if isinstance(groups, list) else []):
+            arch = group.get("arch") if isinstance(group, dict) else None
+            if not isinstance(arch, dict):
+                continue
+            rows = registry.arch_supported(contract, arch.get("type"))
+            if not rows:
+                continue
+            pdefs = registry.arch_common + registry.arch_params(contract, arch.get("type"))
+            names = sorted({name for row in rows for name in row})
+            values = {}
+            for name in names:
+                if name == "gpu":  # a group field, not an arch param
+                    values[name] = group.get("gpu")
+                    continue
+                pdef = next((p for p in pdefs if p["name"] == name), {})
+                values[name] = supported_value(name, arch.get(name, pdef.get("default")))
+            if any(_is_placeholder(v) for v in values.values()):
+                # Raw: supplied later. Expanded: the leaf walk reports the residue.
+                continue
+            if any(all(values[n] in allowed for n, allowed in row.items()) for row in rows):
+                continue
+            got = ", ".join(f"{n}={values[n]!r}" for n in names)
+            options = "; ".join(
+                " × ".join(f"{n} in {allowed}" for n, allowed in row.items()) for row in rows
+            )
+            errors.append(
+                f"pools.{role}.groups[{gi}].arch: {arch.get('type')} does not support {got}; "
+                f"it supports {options} (the #[supported] rows on the arch in "
+                "simulator/src/arch/config.rs)"
+            )
     return errors
 
 

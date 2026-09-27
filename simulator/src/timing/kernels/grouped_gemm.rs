@@ -121,6 +121,19 @@ mod tests {
     }
 
     #[test]
+    fn identity_drops_gpu_backends_and_dim_provenance() {
+        let mut derived = config();
+        derived.n = crate::timing::Dim::param("hidden", 2048) * 2;
+        derived.backends = vec!["torch", "triton"];
+        derived.gpu_name = "NVIDIA H200".to_string();
+        let expected = serde_json::json!({
+            "n": 4096, "k": 8192, "dtype": "bf16", "local_ppm": [300000, 200000],
+        });
+        assert_eq!(derived.identity(), expected);
+        assert_eq!(config().identity(), expected);
+    }
+
+    #[test]
     fn describe_config_renders_every_field_in_order() {
         assert_eq!(
             config().describe_config(),

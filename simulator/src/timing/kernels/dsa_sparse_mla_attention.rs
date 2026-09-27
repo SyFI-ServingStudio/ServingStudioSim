@@ -1,4 +1,4 @@
-//! GLM-5.2 DSA sparse MLA attention kernel.
+//! DSA sparse MLA attention kernel.
 //!
 //! The cache uses physical `(num_queries, num_cache_tokens)` coordinates. The
 //! static `valid_counts_pattern` deterministically derives Python's canonical
@@ -22,9 +22,9 @@
 //! so decode derives `u:min(ctx, index_topk + index_kpool - 1)` instead of
 //! clipping at the page-table width, and sweeps its own smaller grid.
 
-use crate::timing::bridge::{ArgsPayload, DType, KernelKind, de_backends};
+use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::{CacheKind, Extrapolation};
-use crate::timing::kernels::engine::{KernelSpec, register_kernel};
+use crate::timing::kernels::engine::{register_kernel, KernelSpec};
 use crate::timing::sweep::{Axis, SweepGrid};
 use crate::timing::{Dim, KernelConfig, SweepCoords};
 
@@ -490,10 +490,10 @@ register_kernel!(DsaSparseMlaAttentionKernel, DsaSparseMlaAttentionSpec);
 mod tests {
     use super::ValidCountsPattern;
     use super::{
-        CAUSAL_CACHE_AXIS, CAUSAL_QUERY_AXIS, DsaSparseMlaAttentionKernelConfig,
-        DsaSparseMlaAttentionKernelInput, DsaSparseMlaAttentionSpec, SPECULATIVE_CACHE_AXIS,
-        SPECULATIVE_QUERY_AXIS, UNIFORM_CACHE_AXIS, UNIFORM_QUERY_AXIS, canonical_valid_counts,
-        speculative_cache_axis, speculative_query_axis,
+        canonical_valid_counts, speculative_cache_axis, speculative_query_axis,
+        DsaSparseMlaAttentionKernelConfig, DsaSparseMlaAttentionKernelInput,
+        DsaSparseMlaAttentionSpec, CAUSAL_CACHE_AXIS, CAUSAL_QUERY_AXIS, SPECULATIVE_CACHE_AXIS,
+        SPECULATIVE_QUERY_AXIS, UNIFORM_CACHE_AXIS, UNIFORM_QUERY_AXIS,
     };
     use crate::timing::bridge::{ArgsPayload, DType};
     use crate::timing::cache::{CacheKind, Extrapolation};
@@ -647,11 +647,9 @@ mod tests {
             DsaSparseMlaAttentionSpec::sweep_grid(&config(ValidCountsPattern::SpeculativeGroups {
                 group_size: 2,
             }));
-        assert!(
-            speculative.axes()[0]
-                .iter()
-                .all(|query| *query as u32 % 2 == 0)
-        );
+        assert!(speculative.axes()[0]
+            .iter()
+            .all(|query| *query as u32 % 2 == 0));
         assert_contiguous(&speculative.axes()[0], &[128, 132, 134]);
         assert_contiguous(&speculative.axes()[0], &[256, 264, 266]);
         assert_contiguous(&speculative.axes()[1], &[16, 23, 32, 45, 63]);

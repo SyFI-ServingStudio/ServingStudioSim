@@ -12,8 +12,8 @@ pub use dsa_sparse_mla::{
     DsaSparseMlaAttentionConfig, DsaSparseMlaAttentionInput, DsaSparseMlaAttentionOp,
     DsaSparseMlaExactVarlenConfig, DsaSparseMlaLaunchGraph,
 };
+pub use flashinfer::{FlashInferAttentionConfig, FlashInferAttentionInput, FlashInferAttentionOp};
 pub use glm53_kpool_sparse_mla::{
     Glm53KpoolSparseMlaConfig, Glm53KpoolSparseMlaInput, Glm53KpoolSparseMlaOp,
     Glm53KpoolSparseMlaResolved,
 };
-pub use flashinfer::{FlashInferAttentionConfig, FlashInferAttentionInput, FlashInferAttentionOp};

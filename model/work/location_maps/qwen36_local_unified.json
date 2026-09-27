@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "mapping_id": "qwen36-local-unified-v2",
+  "mapping_id": "qwen36-local-unified-v3",
   "arch_types": [
     "qwen36_local"
   ],
@@ -17,12 +17,7 @@
     {"location": "unified.gdn.state_zero", "semantics": []},
     {"location": "unified.gdn.prefill.causal_conv", "semantics": ["gdn.conv1d", "gdn.conv_state.prefill_read", "gdn.conv_state.prefill_write"]},
     {"location": "unified.gdn.prefill.post_conv", "semantics": ["gdn.a_log", "gdn.dt_bias"]},
-    {"location": "unified.gdn.prefill.cumsum", "semantics": []},
-    {"location": "unified.gdn.prefill.kkt", "semantics": []},
-    {"location": "unified.gdn.prefill.solve", "semantics": []},
-    {"location": "unified.gdn.prefill.recompute_w_u", "semantics": []},
-    {"location": "unified.gdn.prefill.state_update", "semantics": ["gdn.attn.prefill"]},
-    {"location": "unified.gdn.prefill.output", "semantics": []},
+    {"location": "unified.gdn.prefill.chunk_delta_rule", "semantics": ["gdn.attn.prefill"]},
     {"location": "unified.gdn.state_scatter", "semantics": ["gdn.recurrent_state.prefill_write"]},
     {"location": "unified.gdn.decode.causal_conv", "semantics": ["gdn.conv_state.decode_read", "gdn.conv_state.decode_write"]},
     {"location": "unified.gdn.decode.recurrent", "semantics": ["gdn.attn.decode", "gdn.recurrent_state.decode_read", "gdn.recurrent_state.decode_write"]},
@@ -45,6 +40,7 @@
     {"location": "unified.shared_expert.down.input_quant", "semantics": []},
     {"location": "unified.shared_expert.down.gemm", "semantics": ["gdn.shared_down", "gated_gqa.shared_down"]},
     {"location": "unified.shared_expert.shared_gate", "semantics": ["gdn.shared_gate", "gated_gqa.shared_gate"]},
+    {"location": "unified.shared_expert.shared_gate_sigmoid", "semantics": []},
     {"location": "unified.shared_expert.apply_shared_gate", "semantics": []},
     {"location": "unified.finalize.finalize", "semantics": []},
     {"location": "unified.finalize.shared_routed_add", "semantics": []},
