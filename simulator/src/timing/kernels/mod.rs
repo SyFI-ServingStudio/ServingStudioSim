@@ -31,12 +31,6 @@ pub mod fp8_per_token_group_quant;
 pub mod gdn_causal_conv_decode;
 pub mod gdn_causal_conv_prefill;
 pub mod gdn_chunk_delta_rule;
-pub mod gdn_chunk_local_cumsum;
-pub mod gdn_chunk_output;
-pub mod gdn_chunk_recompute_w_u;
-pub mod gdn_chunk_scaled_dot_kkt;
-pub mod gdn_chunk_solve_tril;
-pub mod gdn_chunk_state_update;
 pub mod gdn_gated_rms_norm;
 pub mod gdn_prefill_post_conv;
 pub mod gdn_recurrent_decode;
@@ -186,29 +180,6 @@ pub use gdn_causal_conv_prefill::{
 pub use gdn_chunk_delta_rule::{
     GdnChunkDeltaRuleKernel, GdnChunkDeltaRuleKernelConfig, GdnChunkDeltaRuleKernelInput,
     GdnChunkDeltaRuleSpec,
-};
-pub use gdn_chunk_local_cumsum::{
-    GdnChunkLocalCumsumKernel, GdnChunkLocalCumsumKernelConfig, GdnChunkLocalCumsumKernelInput,
-    GdnChunkLocalCumsumSpec,
-};
-pub use gdn_chunk_output::{
-    GdnChunkOutputKernel, GdnChunkOutputKernelConfig, GdnChunkOutputKernelInput, GdnChunkOutputSpec,
-};
-pub use gdn_chunk_recompute_w_u::{
-    GdnChunkRecomputeWUKernel, GdnChunkRecomputeWUKernelConfig, GdnChunkRecomputeWUKernelInput,
-    GdnChunkRecomputeWUSpec,
-};
-pub use gdn_chunk_scaled_dot_kkt::{
-    GdnChunkScaledDotKktKernel, GdnChunkScaledDotKktKernelConfig, GdnChunkScaledDotKktKernelInput,
-    GdnChunkScaledDotKktSpec,
-};
-pub use gdn_chunk_solve_tril::{
-    GdnChunkSolveTrilKernel, GdnChunkSolveTrilKernelConfig, GdnChunkSolveTrilKernelInput,
-    GdnChunkSolveTrilSpec,
-};
-pub use gdn_chunk_state_update::{
-    GdnChunkStateUpdateKernel, GdnChunkStateUpdateKernelConfig, GdnChunkStateUpdateKernelInput,
-    GdnChunkStateUpdateSpec,
 };
 pub use gdn_gated_rms_norm::{
     GdnGatedRmsNormKernel, GdnGatedRmsNormKernelConfig, GdnGatedRmsNormKernelInput,

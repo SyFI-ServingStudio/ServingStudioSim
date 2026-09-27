@@ -12,12 +12,6 @@ from profiling.runners.exceptions import ProfilerNotImplemented
 _VLLM_GDN_RUNNER_MODULES = (
     "profiling.runners.attention.gdn_causal_conv_decode_vllm_triton",
     "profiling.runners.attention.gdn_causal_conv_prefill_vllm_triton",
-    "profiling.runners.attention.gdn_chunk_local_cumsum_vllm_triton",
-    "profiling.runners.attention.gdn_chunk_output_vllm_triton",
-    "profiling.runners.attention.gdn_chunk_recompute_w_u_vllm_triton",
-    "profiling.runners.attention.gdn_chunk_scaled_dot_kkt_vllm_triton",
-    "profiling.runners.attention.gdn_chunk_solve_tril_vllm_triton",
-    "profiling.runners.attention.gdn_chunk_state_update_vllm_triton",
     "profiling.runners.attention.gdn_gated_rms_norm_vllm_triton",
     "profiling.runners.attention.gdn_prefill_post_conv_vllm_triton",
     "profiling.runners.attention.gdn_recurrent_decode_vllm_triton",

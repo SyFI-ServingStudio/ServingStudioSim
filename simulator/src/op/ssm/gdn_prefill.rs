@@ -10,8 +10,8 @@
 //! CUTLASS launch; the six-launch FLA Triton decomposition this operation used
 //! to model over-predicted the measured operation by 110% on a
 //! Qwen3.6-35B-A3B-FP8 H200 capture, because it round-trips h/w/u/A through HBM
-//! five extra times. The `gdn_chunk_*` kinds stay registered for a deployment
-//! that really does select the Triton path.
+//! five extra times. No deployment selects the Triton path, so its six kernel
+//! kinds have been removed.
 
 use std::sync::Arc;
 

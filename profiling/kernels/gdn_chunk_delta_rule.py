@@ -1,13 +1,12 @@
 """GDN prefill chunked delta rule as ONE fused launch.
 
-Distinct kernel kind from the six `gdn_chunk_*` kinds on purpose. Those model
-FLA's Triton realization, which splits the chunked gated delta rule into six
-launches (local cumsum, scaled dot K·Kᵀ, triangular solve, w/u recompute,
-inter-chunk state scan, output). This kind models the realization vLLM actually
-selects on Hopper and Blackwell: FlashInfer's `flashinfer.gdn_prefill.
+FLA's Triton realization splits the chunked gated delta rule into six launches
+(local cumsum, scaled dot K·Kᵀ, triangular solve, w/u recompute, inter-chunk
+state scan, output). This kind models the realization vLLM actually selects on
+Hopper and Blackwell instead: FlashInfer's `flashinfer.gdn_prefill.
 chunk_gated_delta_rule`, a single CUTLASS TMA warp-specialized kernel
 (`flat::kernel::FlatKernelTmaWarpSpecializedDeltaRule`) that keeps every
-intermediate on chip.
+intermediate on chip. The simulator has no kinds for the six Triton launches.
 
 The choice is not a tuning detail. `ChunkGatedDeltaRule._resolve_gdn_prefill_backend`
 picks `flashinfer` for the default `auto` request on any SM90 part with no
@@ -21,8 +20,8 @@ in ``simulator/src/timing/kernels/gdn_chunk_delta_rule.rs`` and the facade stem
 ``get_gdn_chunk_delta_rule_times`` / ``count_missing_gdn_chunk_delta_rule``.
 
 Chunking is deliberately NOT in the args schema: FlashInfer owns its own chunk
-size internally, so unlike the FLA kinds there is no `num_chunks` the caller
-can choose.
+size internally, so unlike FLA's Triton path there is no `num_chunks` the
+caller can choose.
 
 The second axis is `max_sequence_length`, NOT a sequence count. The inter-chunk
 recurrence is sequential *within* a sequence and independent *across* sequences,

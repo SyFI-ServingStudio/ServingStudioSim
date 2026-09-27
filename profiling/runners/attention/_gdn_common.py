@@ -10,12 +10,9 @@ vLLM module at import time.
 from __future__ import annotations
 
 from collections.abc import Callable
-from itertools import accumulate
 from typing import Any
 
 from profiling.runners.exceptions import ProfilerNotImplemented
-
-_GDN_CHUNK_SIZE = 64
 
 
 def exact_int(name: str, value: object) -> int:
@@ -60,34 +57,3 @@ def load_required_callable(
         message = missing_message or f"{backend} requires {module_name}.{callable_name}"
         raise ProfilerNotImplemented(message)
     return required_callable
-
-
-def canonical_balanced_chunk_lengths(
-    num_tokens: int,
-    num_chunks: int,
-) -> tuple[int, ...]:
-    """Build the audited one-chunk-per-sequence GDN partition."""
-    quotient, remainder = divmod(int(num_tokens), int(num_chunks))
-    lengths = (quotient + 1,) * remainder + (quotient,) * (num_chunks - remainder)
-    if (
-        len(lengths) != num_chunks
-        or sum(lengths) != num_tokens
-        or any(length < 1 or length > _GDN_CHUNK_SIZE for length in lengths)
-    ):
-        raise ValueError(
-            "canonical partition requires ceil(num_tokens/64) <= num_chunks <= num_tokens"
-        )
-    return lengths
-
-
-def canonical_balanced_chunk_boundaries(
-    num_tokens: int,
-    num_chunks: int,
-) -> tuple[int, ...]:
-    """Return cumulative boundaries for the canonical balanced partition."""
-    return (0, *accumulate(canonical_balanced_chunk_lengths(num_tokens, num_chunks)))
-
-
-def canonical_single_chunk_index_pairs(num_chunks: int) -> tuple[tuple[int, int], ...]:
-    """Map every canonical sequence to its single local chunk."""
-    return tuple((sequence_index, 0) for sequence_index in range(num_chunks))

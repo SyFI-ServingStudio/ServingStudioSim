@@ -1,14 +1,14 @@
 //! Gated DeltaNet prefill chunked delta rule as ONE fused launch.
 //!
-//! Deliberately a separate kind from the six `gdn_chunk_*` kinds. Those model
-//! FLA's Triton realization, which splits the chunked gated delta rule into six
+//! FLA's Triton realization splits the chunked gated delta rule into six
 //! launches (local cumsum, K.Kt, triangular solve, w/u recompute, inter-chunk
 //! state scan, output). This kind models the realization vLLM actually selects
-//! on Hopper: FlashInfer's `chunk_gated_delta_rule`, a single CUTLASS TMA
+//! on Hopper instead: FlashInfer's `chunk_gated_delta_rule`, a single CUTLASS TMA
 //! warp-specialized kernel (`flat::kernel::FlatKernelTmaWarpSpecializedDeltaRule`)
 //! that keeps every intermediate on chip. `_resolve_gdn_prefill_backend` picks
 //! it for the default `auto` request on any SM90 part, so an H200 capture never
-//! launches the six Triton kernels at all.
+//! launches the six Triton kernels at all, and the simulator has no kinds for
+//! them.
 //!
 //! The cache axes are `(L, N)` = longest sequence and `T/L`, NOT `(T, N)`.
 //! The inter-chunk recurrence is sequential *within* a sequence and independent
@@ -35,7 +35,7 @@ use crate::timing::{Coords, Dim, KernelConfig, SweepCoords};
 
 /// Ceiling on `T = N*L`. A row allocates 28,800 bytes per token plus 4 MiB per
 /// recurrent state, so 65,536 tokens is ~1.9 GiB of operands -- profilable
-/// beside a resident serving job, unlike the 262,144 the FLA kinds sweep.
+/// beside a resident serving job.
 const MAX_TOKENS: u64 = 65_536;
 
 #[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Serialize, serde::Deserialize)]

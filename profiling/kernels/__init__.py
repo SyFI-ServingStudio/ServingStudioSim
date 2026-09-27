@@ -41,12 +41,6 @@ from profiling.kernels import (
     gdn_causal_conv_decode,  # noqa: F401
     gdn_causal_conv_prefill,  # noqa: F401
     gdn_chunk_delta_rule,  # noqa: F401
-    gdn_chunk_local_cumsum,  # noqa: F401
-    gdn_chunk_output,  # noqa: F401
-    gdn_chunk_recompute_w_u,  # noqa: F401
-    gdn_chunk_scaled_dot_kkt,  # noqa: F401
-    gdn_chunk_solve_tril,  # noqa: F401
-    gdn_chunk_state_update,  # noqa: F401
     gdn_gated_rms_norm,  # noqa: F401
     gdn_prefill_post_conv,  # noqa: F401
     gdn_recurrent_decode,  # noqa: F401
