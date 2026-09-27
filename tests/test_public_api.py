@@ -418,6 +418,19 @@ def registered(tmp_path: Path) -> tuple[TestClient, tuple[str, str], Path]:
     return client, hashes, path
 
 
+def test_a_new_registration_shows_after_the_detail_was_cached(registered) -> None:
+    client, _, path = registered
+    before = client.get(f"{PREFIX}/kernels/single_gemm").json()["used_by"]
+    _register(path, {"n": 256, "k": 4096, "dtype": "bf16"}, _supported(4))
+    after = client.get(f"{PREFIX}/kernels/single_gemm").json()["used_by"]
+    assert after != before
+
+
+def test_warming_builds_every_document_without_raising(registered) -> None:
+    _, _, path = registered
+    KernelLibrary(FixtureSources(db_path=path)).warm()
+
+
 def test_configs_list_is_slim_and_labels_each_use(registered) -> None:
     client, (qkv, gate), _ = registered
     document = client.get(f"{PREFIX}/kernels/single_gemm/configs").json()

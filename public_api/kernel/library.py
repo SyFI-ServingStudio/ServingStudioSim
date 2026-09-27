@@ -491,8 +491,17 @@ class KernelLibrary:
         """The deployments that run ``kind`` (``_deployment_table``), each with
         the shapes it asks for, and the columns those shapes sweep, from the
         kernel-config registry. A shape is the profile.db columns one leaf
-        fixes, with the config that holds them and the members that ask."""
+        fixes, with the config that holds them and the members that ask.
 
+        Joining every use to its deployment is most of a detail request, so the
+        result is kept until profile.db, the model catalog or the binary (whose
+        ``list-params`` labels the deployments) changes."""
+
+        return self.sources.cached_by_db_and_binary(
+            ("used_by", kind), lambda: self._join_used_by(kind)
+        )
+
+    def _join_used_by(self, kind: str) -> tuple[list[dict], set[str]]:
         table = self._deployment_table(kind)
         shapes: dict[int, dict[str, dict]] = {}
         swept: set[str] = set()
@@ -527,6 +536,19 @@ class KernelLibrary:
         return out, swept
 
     # -- documents -----------------------------------------------------------------
+
+    def warm(self) -> None:
+        """Build the catalog and every kind's detail and config list once, so the
+        first visitor after a start does not wait for the registry join. A kind
+        that fails here fails the same way when asked for, so it is skipped."""
+
+        self.catalog()
+        for kind in sorted(self.specs):
+            for build in (self.kernel, self.configs):
+                try:
+                    build(kind)
+                except Exception:  # noqa: BLE001 - reported again on request
+                    continue
 
     def catalog(self) -> dict:
         """Every registered kind with its coverage and the models that run it.

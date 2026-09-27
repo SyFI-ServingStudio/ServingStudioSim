@@ -116,3 +116,11 @@ class KernelSources:
         with self._lock:
             self._db_cache[key] = value
         return value
+
+    def cached_by_db_and_binary(self, key: Any, compute: Callable[[], Any]) -> Any:
+        """``compute()``, reused until profile.db, a watched file or the simulator
+        binary changes: for a result that joins profile.db to the binary's
+        introspection."""
+
+        binary = self.binary.stat().st_mtime if self.binary.exists() else None
+        return self.cached_by_db((key, binary), compute)

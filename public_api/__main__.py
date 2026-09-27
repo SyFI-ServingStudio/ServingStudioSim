@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import threading
 from pathlib import Path
 
 from profiling.perf_api import DB_PATH
@@ -37,7 +38,10 @@ def main(argv: list[str] | None = None) -> int:
         )
     if not args.db.exists():
         parser.error(f"{args.db} does not exist")
-    uvicorn.run(create_app(KernelLibrary(sources)), host=args.bind, port=args.port)
+    library = KernelLibrary(sources)
+    # Answer requests while the caches fill; a request that comes first builds its own.
+    threading.Thread(target=library.warm, name="warm", daemon=True).start()
+    uvicorn.run(create_app(library), host=args.bind, port=args.port)
     return 0
 
 
