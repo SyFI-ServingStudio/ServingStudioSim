@@ -193,8 +193,8 @@ register(
         batch_outlier_policy=BatchOutlierPolicy(),
         doc=BackendDoc(
             summary=(
-                "SGLang's full fused-A dispatch: its dedicated fused-A GEMM kernel "
-                "when 1 ≤ m ≤ 16, n % 16 == 0 and k % 256 == 0; otherwise cutedsl_bf16_gemm when "
+                "SGLang's full fused-A dispatch: dsv3_fused_a_gemm when 1 ≤ m ≤ 16, "
+                "n % 16 == 0 and k % 256 == 0; otherwise cutedsl_bf16_gemm when "
                 "use_cutedsl_bf16_gemm(m, n, k) accepts the shape; otherwise F.linear. "
                 "SM100 only."
             ),
