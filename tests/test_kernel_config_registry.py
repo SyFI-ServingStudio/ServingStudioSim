@@ -358,3 +358,39 @@ def test_supported_deployments_register_with_their_row_as_source(
         }
     }
     assert (use.pool, use.role) == ("", "llama3_dense_tp.attn_block.qkv_proj")
+
+
+def test_a_prebuild_with_every_row_present_still_registers_its_configs(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Rows filled by `kernel-profile run` leave nothing to build; the run's
+    configs are registered from the coverage probe's records all the same."""
+    import asyncio
+
+    from launcher import cache_build
+
+    probes, registered = [], []
+
+    async def probe(argv, *args, **kwargs):
+        probes.append(argv)
+        return 0
+
+    async def no_process(*args, **kwargs):
+        pytest.fail("a cache builder started with no missing rows")
+
+    monkeypatch.setattr(cache_build, "unique_by_cache_key", lambda params, registry: params)
+    monkeypatch.setattr(cache_build, "_prebuild_log_dir", lambda base, config: tmp_path)
+    monkeypatch.setattr(cache_build, "build_cli_command", lambda *args, **kwargs: ["build"])
+    monkeypatch.setattr(cache_build, "_probe_missing", probe)
+    monkeypatch.setattr(cache_build._PROCESS_SUPERVISOR, "run", no_process)
+    monkeypatch.setattr(
+        cache_build,
+        "_register_kernel_configs",
+        lambda records, config, cfg_dir, journal: registered.append(records),
+    )
+
+    assert asyncio.run(cache_build.prebuild_caches([{}], None, base_dir=tmp_path))
+
+    records = tmp_path / "kernel_configs.json"
+    assert probes[0][-2:] == ["--kernel-configs-out", str(records)]
+    assert registered == [records]

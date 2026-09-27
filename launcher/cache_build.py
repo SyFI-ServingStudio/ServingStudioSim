@@ -158,9 +158,11 @@ async def prebuild_caches(
 
             # Recheck under the exclusive cross-launcher lease. A second launcher
             # waiting on the same cache observes the first launcher's committed DB
-            # rows and skips the GPU/JIT stage entirely.
+            # rows and skips the GPU/JIT stage entirely. The probe also records the
+            # run's kernel configs, so a run whose rows were measured elsewhere
+            # (`kernel-profile run`, another launcher) still registers them.
             missing_before = await _probe_missing(
-                probe_argv,
+                probe_argv + ["--kernel-configs-out", str(kernel_configs)],
                 cfg_dir,
                 env,
                 journal,
@@ -174,6 +176,7 @@ async def prebuild_caches(
                     StageState.SUCCEEDED,
                     resources=["profile-db:exclusive"],
                 )
+                _register_kernel_configs(kernel_configs, config, cfg_dir, journal)
                 continue
             try:
                 require_gpu(f"filling {missing_before} missing profile.db spec(s)")
