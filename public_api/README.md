@@ -33,7 +33,7 @@ All `GET`, under `/api/public/v1`.
 | `/kernels/{kind}/configs` | The kernel configs registered as reading the kind's rows (profile.db's kernel-config registry), one per config and GPU: the profile.db args every cell shares (`fixed`) and the ones the cache axes move (`swept`), the Rust config's scalar values, cache coordinates and axes, cells measured per backend, a reader's name for structured config values (`config_labels`, below), and each use (pool, role) naming entries of a shared `deployments` table and the members that ask. No identity: it can run to megabytes |
 | `/kernels/{kind}/configs/{config_hash}` | One config's grid on the simulator's cache axes: each cell's coordinates, profile.db args, whether the kernel can run it, and each backend's measured metrics there; plus the full identity, its uses, and the `deployments` entries they name. `gpu` is required only when the config is registered on more than one GPU |
 | `/archs` | Every arch tag: `name` and `summary` (`model/arch_catalog.yaml`), `contract`, the `models` (model-config stems) and `gpus` its `#[supported]` rows run, their model `families`, the `params` the rows choose between, and how many `param_sets` and `combinations` it supports; plus `models`, the catalog entries they name |
-| `/archs/{arch}` | One arch: every param (`list-params`: type, default, choices, description, and `values`, the values its rows list, null for a param no row chooses), the `query` names of its cost trees, and its supported `param_sets` |
+| `/archs/{arch}` | One arch: every param (`list-params`: type, default, choices, description, `set_when_predicting` on a traffic param, and `values`, the values its rows list, null for a param no row chooses), the `query` names of its cost trees, and its supported `param_sets` |
 | `/archs/{arch}/cost-tree` | One supported parameter set's cost tree, chosen by the query: `gpu`, `model` (a model-config stem) and every param the arch's rows name, all required. The structure only: no timings |
 
 A deployment entry is one `#[supported]` row on one GPU and model config:
@@ -100,14 +100,25 @@ measured row for (`measured`). A combination two rows cover belongs to the first
 
 `cost-tree` rejects a query it would have to guess at: a missing param, one
 the rows do not choose (the tree takes its default; the document lists those
-under `defaults`) or a mistyped value is a 400, and a set no row covers a 404.
+under `defaults` or `set_when_predicting`) or a mistyped value is a 400, and a
+set no row covers a 404.
 Both answer `{"detail": {"message", "choices"}}`, `choices` being every valid
 query.
 
 A tree comes from `simulator supported-cost-trees`, which builds every supported
 combination structure-only with every other param at its schema default. The
 document has the set's `arch`, `name`, `gpu`, `model_config`, `model`, `params`,
-`label`, `query`, `defaults`, `gpus_per_replica`, `counts` and:
+`label`, `query`, `defaults`, `set_when_predicting`, `gpus_per_replica`, `counts` and:
+
+- `defaults`: `{name: default}` for each param the rows leave open, and
+  `set_when_predicting`: the names of those that `list-params` marks
+  `set_when_predicting` (`#[param(set_when_predicting)]` in Rust). Such a param
+  describes the traffic, not the deployment: MoE `routing`, whose `uniform`
+  default only lets a config omit it and is no choice for a prediction
+  (`skills/operate-run-simulation/references/moe-routing.md`), so it is not
+  listed as a default. The build still used that default, so a MoE tree's
+  fused-MoE leaves name uniform-demand configs (`expert_demand`) until a
+  prediction sets the routing;
 
 - `sections`: `[{section, root}]`, one per compiled CostTree (`iter` for an
   iter-wise arch; `attn`, or `prologue`, `pre_attn`, `post_attn`, ... for the

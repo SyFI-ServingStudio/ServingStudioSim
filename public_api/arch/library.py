@@ -418,21 +418,21 @@ class ArchLibrary:
 
         names = [GPU, MODEL, *self._row_names(arch)]
         choices = self._choices(arch)
+        schema = self.sources.deployment_schema()
+        params = (*schema["arch_common"], *self._provider(arch)[1].get("params", ()))
         unknown = [n for n in query if n not in names]
         if unknown:
+            predicting = [p["name"] for p in params if p.get("set_when_predicting")]
             raise BadParams(
                 f"{arch} does not choose {', '.join(unknown)}: its supported sets are chosen by "
-                f"{', '.join(names)}; every other param takes its default",
+                f"{', '.join(names)}; every other param takes its default"
+                + (f", except {', '.join(predicting)}, set when predicting" if predicting else ""),
                 choices,
             )
         missing = [n for n in names if n not in query]
         if missing:
             raise BadParams(f"{arch} needs {', '.join(missing)}", choices)
-        schema = self.sources.deployment_schema()
-        types = {
-            p["name"]: p["type"]
-            for p in (*schema["arch_common"], *self._provider(arch)[1].get("params", ()))
-        }
+        types = {p["name"]: p["type"] for p in params}
         out: dict[str, Any] = {}
         for name in names:
             text, kind = query[name], types.get(name, "string")
@@ -485,11 +485,20 @@ class ArchLibrary:
             )
             build = self._builds().get(self.kernels._deployment_key(deployment))
             schema = self.sources.deployment_schema()
+            # A param the rows leave open takes its schema default, except a
+            # traffic param (MoE routing): its default is no real choice, so
+            # the document names it as set when predicting instead.
+            unchosen = [
+                p
+                for p in (*schema["arch_common"], *provider.get("params", ()))
+                if p["name"] not in deployment["params"]
+            ]
             defaults = {
                 p["name"]: p["default"]
-                for p in (*schema["arch_common"], *provider.get("params", ()))
-                if "default" in p and p["name"] not in deployment["params"]
+                for p in unchosen
+                if "default" in p and not p.get("set_when_predicting")
             }
+            predicting = [p["name"] for p in unchosen if p.get("set_when_predicting")]
             configs, kernels = {}, {}
             status = self._config_status(build, gpu) if build else {}
             for config_hash, config in (build or {"configs": {}})["configs"].items():
@@ -520,6 +529,7 @@ class ArchLibrary:
                 "label": deployment["label"],
                 "query": listed["query"],
                 "defaults": defaults,
+                "set_when_predicting": predicting,
                 "gpus_per_replica": listed["gpus_per_replica"],
                 "error": listed["error"],
                 "counts": listed["counts"],

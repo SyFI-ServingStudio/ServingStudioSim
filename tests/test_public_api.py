@@ -6,6 +6,7 @@ fixtures; the profiling registry and a small profile.db are real.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import sqlite3
 from dataclasses import asdict
@@ -79,6 +80,7 @@ SCHEMA = {
                             "name": "routing",
                             "type": "string",
                             "default": "uniform",
+                            "set_when_predicting": True,
                             "choices": ["uniform", "popularity", "corpus"],
                         },
                         {
@@ -903,7 +905,7 @@ def test_cost_tree_nests_the_manifest_in_the_analyzer_shape(registered) -> None:
         4,
     )
     # Params no row chooses take their schema defaults; the document says which.
-    assert tree["defaults"] == {"fp8": False}
+    assert (tree["defaults"], tree["set_when_predicting"]) == ({"fp8": False}, [])
     [section] = tree["sections"]
     root = section["root"]
     assert (section["section"], root["kind"], root["id"], root["path"]) == (
@@ -975,6 +977,35 @@ def test_a_cost_tree_query_must_name_a_supported_set(
     assert message in detail["message"]
     # Never a guess: the valid queries instead.
     assert [c["tp_size"] for c in detail["choices"]] == [1, 4]
+
+
+class RoutedSources(FixtureSources):
+    """``moe_x`` with a ``#[supported]`` row (and no build), so it has a tree."""
+
+    def deployment_schema(self) -> dict:
+        schema = copy.deepcopy(SCHEMA)
+        moe = schema["providers"]["arch"]["iter_wise"]["moe_x"]
+        moe["supported"] = [{"gpu": ["NVIDIA B200"], "model_config": ["moe_m"], "ep_size": [4]}]
+        return schema
+
+
+def test_a_traffic_param_is_set_when_predicting_not_defaulted(db: Path) -> None:
+    client = TestClient(create_app(KernelLibrary(RoutedSources(db_path=db))))
+    query = {"gpu": "NVIDIA B200", "model": "moe_m", "ep_size": "4"}
+    tree = client.get(f"{PREFIX}/archs/moe_x/cost-tree", params=query).json()
+    # The schema marks routing as traffic: its `uniform` default is no choice,
+    # so the tree names it instead of listing it among the defaults.
+    assert tree["defaults"] == {"fp8": False, "mtp_mode": "off"}
+    assert tree["set_when_predicting"] == ["routing"]
+    params = {p["name"]: p for p in client.get(f"{PREFIX}/archs/moe_x").json()["params"]}
+    assert params["routing"]["set_when_predicting"] is True
+    assert "set_when_predicting" not in params["mtp_mode"]
+    # A tree query cannot pick it either, and the refusal does not call it a default.
+    response = client.get(f"{PREFIX}/archs/moe_x/cost-tree", params={**query, "routing": "corpus"})
+    assert response.status_code == 400
+    assert response.json()["detail"]["message"].endswith(
+        "every other param takes its default, except routing, set when predicting"
+    )
 
 
 def test_an_unknown_arch_is_404(client: TestClient) -> None:
