@@ -23,6 +23,9 @@ _BACKEND = "dsa_sparse_index_remap:torch"
 _VLLM_BACKEND = "dsa_sparse_index_remap:vllm_triton"
 _REQUIRED_GPU = "NVIDIA H200"
 _SELECTED_K = 2048
+# The vLLM wrapper also serves a kpool indexer's round_up(index_topk +
+# index_kpool - 1, 128) = 2176-wide table (<= 2051 active entries per row).
+_VLLM_SELECTED_K = frozenset({2048, 2176})
 _BLOCK_SIZE = 64
 _MAX_BLOCKS_PER_REQUEST = 16384
 _MAX_LOCAL_SPAN = _BLOCK_SIZE * _MAX_BLOCKS_PER_REQUEST
@@ -254,6 +257,7 @@ def _validate_args(
     workspace_partition: str,
     return_valid_counts: bool,
     index_dtype: str,
+    supported_selected_k: frozenset[int] = frozenset({_SELECTED_K}),
 ) -> _ValidatedArgs:
     integers = {
         "num_queries": num_queries,
@@ -279,12 +283,11 @@ def _validate_args(
         raise ProfilerNotImplemented(f"num_queries must be in 1..{_MAX_QUERIES}")
     if not 1 <= num_requests <= min(num_queries, 256):
         raise ProfilerNotImplemented("num_requests must be in 1..min(num_queries, 256)")
-    for name, actual, required in (
-        ("selected_k", selected_k, _SELECTED_K),
-        ("block_size", block_size, _BLOCK_SIZE),
-    ):
-        if actual != required:
-            raise ProfilerNotImplemented(f"{name} must be {required}, got {actual}")
+    if selected_k not in supported_selected_k:
+        allowed = " or ".join(str(value) for value in sorted(supported_selected_k))
+        raise ProfilerNotImplemented(f"selected_k must be {allowed}, got {selected_k}")
+    if block_size != _BLOCK_SIZE:
+        raise ProfilerNotImplemented(f"block_size must be {_BLOCK_SIZE}, got {block_size}")
     if not 1 <= max_blocks_per_request <= _MAX_BLOCKS_PER_REQUEST:
         raise ProfilerNotImplemented(
             f"max_blocks_per_request must be in 1..{_MAX_BLOCKS_PER_REQUEST}, "
@@ -932,6 +935,21 @@ def _check_vllm_triton_correctness(
     expected_values = expected if isinstance(expected, tuple) else (expected,)
     if len(actual_values) != len(expected_values):
         raise KernelLaunchFailed(f"{_VLLM_BACKEND} returned the wrong output variant")
+    if validated.return_valid_counts:
+        # With valid counts the wrapper scatters each row's valid slots to a
+        # prefix [0, count) in an unspecified order and leaves the tail at -1.
+        (actual_out, actual_counts), (expected_out, expected_counts) = actual_values, expected_values
+        if not torch.equal(actual_counts, expected_counts):
+            raise KernelLaunchFailed(f"{_VLLM_BACKEND} valid counts disagree")
+        expected_sorted = torch.sort(expected_out, dim=1, descending=True).values
+        actual_sorted = torch.sort(actual_out, dim=1, descending=True).values
+        prefix = torch.arange(actual_out.shape[1], device=actual_out.device)[None, :]
+        in_prefix = prefix < actual_counts[:, None].long()
+        if not torch.equal(actual_sorted, expected_sorted) or bool(
+            ((actual_out >= 0) != in_prefix).any()
+        ):
+            raise KernelLaunchFailed(f"{_VLLM_BACKEND} disagrees with the reference")
+        return
     for actual_value, expected_value in zip(actual_values, expected_values, strict=True):
         if not torch.equal(actual_value, expected_value):
             raise KernelLaunchFailed(f"{_VLLM_BACKEND} disagrees with the reference")
@@ -968,6 +986,7 @@ def profile_dsa_sparse_index_remap_vllm_triton(
         workspace_partition=workspace_partition,
         return_valid_counts=return_valid_counts,
         index_dtype=index_dtype,
+        supported_selected_k=_VLLM_SELECTED_K,
     )
     try:
         import torch

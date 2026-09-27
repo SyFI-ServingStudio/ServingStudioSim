@@ -59,8 +59,8 @@ DOC = KernelDoc(
     caveats=(
         "GB/s counts the logical operand elements, not the gaps in the packed "
         "storage the strided views skip.",
-        "Only k = 192, n = 512 for query absorption and k = 512, n = 256 for "
-        "value expansion are measured, at 8, 16, 32 or 64 heads.",
+        "Only k = 192 or 256, n = 512 for query absorption and k = 512, n = 256 "
+        "for value expansion are measured, at 8, 16, 32 or 64 heads.",
     ),
     reference="profiling.runners.gemm.batched_gemm_reference",
 )
@@ -113,3 +113,42 @@ register(
         ),
     )
 )
+
+
+# An MLA layout with qk_nope 256 and no RoPE part, v_head 256, kv_lora 512 and an
+# unpadded attention output. Same torch.bmm call as the two backends above.
+_MLA_URL = "https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/attention/mla_attention.py"
+for _backend, _function, _summary in (
+    (
+        "torch_mla_q_absorb_no_rope",
+        "profile_mla_q_absorb_no_rope",
+        "torch.bmm for query absorption when the query head has no RoPE part, "
+        "on vLLM's packed W_UK view.",
+    ),
+    (
+        "torch_mla_v_up_unpadded",
+        "profile_mla_v_up_unpadded",
+        "torch.bmm for value expansion from an attention output with no head "
+        "padding, on vLLM's packed W_UV view.",
+    ),
+):
+    register(
+        KernelProfilerSpec(
+            kernel_kind=KIND,
+            backend=_backend,
+            supports=BackendSupport(
+                compute=frozenset({DType.BF16}),
+                gpus=frozenset({"NVIDIA B200"}),
+            ),
+            runner_ref=RunnerRef(
+                module_name="profiling.runners.gemm.batched_gemm",
+                function_name=_function,
+            ),
+            table_name=KIND,
+            args_schema=BatchedGemmArgs,
+            metric_family=MetricFamily.COMPUTE,
+            batch_outlier_policy=BatchOutlierPolicy(),
+            subprocess_env="vllm_env",
+            doc=BackendDoc(summary=_summary, url=_MLA_URL),
+        )
+    )

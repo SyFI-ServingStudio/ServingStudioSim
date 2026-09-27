@@ -69,9 +69,12 @@ DOC = KernelDoc(
         "Neither the increasing uniform logits nor the random max_ragged "
         "template follows a live indexer's score distribution.",
         "max_ragged rows are measured only with next_n = 1 and top_k = 512, by "
-        "vllm_fork_cuda on H200; uniform rows only with top_k = 2048.",
-        "On B200 the check before timing verifies that long-row selections are "
-        "in range and unique, but does not compare them with the reference.",
+        "vllm_fork_cuda on H200; uniform rows with top_k = 2048, and with "
+        "top_k = 512 by vllm_cuda on B200.",
+        "On B200 the check before timing accepts a long row that differs from "
+        "the reference only when the kernel's known threshold-bin buffer "
+        "overflow explains the difference; such a row's timing is the "
+        "production kernel's, but its selection is wrong.",
         "GB/s counts the valid FP32 logits, one int32 length and top_k int32 "
         "outputs per row, not padding, scratch space or physical transactions.",
     ),

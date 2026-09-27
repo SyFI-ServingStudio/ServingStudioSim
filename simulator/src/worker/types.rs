@@ -459,6 +459,9 @@ pub struct WorkerConfig {
     /// selector; passed to `CostBuffers`, applied where a segment's wall time is
     /// returned (cost_log stays pre-scale).
     pub gpu_time_multiplier: f64,
+    /// Multiplier for prefill-bearing iterations (from the chunked-prefill
+    /// selector). `None` applies `gpu_time_multiplier` to every iteration.
+    pub prefill_gpu_time_multiplier: Option<f64>,
     /// Optional per-iteration prefill token budget (from the worker selector).
     /// `Some(n)`: admission reserves the budget for live decodes (1 tok/req)
     /// then fills the remainder with whole prefills, force-admitting one
@@ -507,6 +510,7 @@ impl Default for WorkerConfig {
             log_stage_transitions: true,
             kv_log_stride: 8,
             gpu_time_multiplier: 1.0,
+            prefill_gpu_time_multiplier: None,
             max_batch_tokens: None,
             pending_order: crate::worker::admission::PendingOrderKind::default(),
             batch_policy: crate::worker::config::BatchPolicy::Mix,

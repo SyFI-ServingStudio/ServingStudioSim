@@ -479,7 +479,7 @@ def test_rejects_unsupported_args_before_allocation(monkeypatch, overrides, matc
         ({"next_n": 0}, "next_n > 0"),
         ({"context_len": -1}, "context_len must be >= 0"),
         ({"max_model_len": 0}, "max_model_len must be > 0"),
-        ({"top_k": 1024}, "top_k=2048"),
+        ({"top_k": 256}, "top_k=512 or top_k=1024 or top_k=2048"),
         ({"logits_dtype": DType.BF16}, "logits_dtype=fp32"),
         ({"index_dtype": "int64"}, "index_dtype='int32'"),
         ({"context_mode": "mixed"}, "context_mode='uniform'"),
@@ -741,6 +741,50 @@ def test_composite_long_rows_select_local_top_values() -> None:
     actual = _torch_composite(operands)
     assert actual[0].tolist() == [1, 3, 5]
     assert operands.logits[0, actual[0].long()].tolist() == [7.0, 6.0, 5.0]
+
+
+def test_native_accepts_kpool_top_k_while_torch_keeps_2048() -> None:
+    from profiling.runners.attention import dsa_persistent_topk_decode as runner
+
+    # GLM-5.3-Flash kpool: 2048 pools of an 8192-token request, token-wide rows.
+    kpool = _BASE_SPEC | {"context_len": 2048, "max_model_len": 8192, "top_k": 512}
+    kpool["logits_row_stride"] = 8192
+    assert runner._validate_args(**kpool, allowed_top_k=runner._VLLM_TOP_K)[4] == 512
+    with pytest.raises(ValueError, match="requires top_k=2048, got 512"):
+        runner._validate_args(**kpool)
+
+
+def test_overflow_exemption_follows_the_path_each_row_takes() -> None:
+    from profiling.runners.attention.dsa_persistent_topk_decode import (
+        _medium_overflow_explains,
+    )
+
+    # The stride-524288 linspace template crowds a short prefix into a few
+    # coarse bins, overflowing whichever buffered path the row takes.
+    template = torch.linspace(-1.0, 1.0, 524288)
+    top_k = 512
+    for length, kept_start, rows_that_buffer, rows_that_do_not in (
+        (65536, 52000, 33, 1),  # FilteredTopK long path vs cooperative radix
+        (16384, 1000, 4, 64),  # medium histogram_256_topk vs FilteredTopK short
+        (8192, 7168, 4, None),  # decode path (<=32 rows)
+        (8192, 7168, 64, None),  # FilteredTopK short path (>32 rows)
+    ):
+        row = template[:length]
+        expected = row[torch.arange(length - top_k, length)]
+        kept = torch.arange(kept_start, kept_start + top_k)
+        assert _medium_overflow_explains(torch, row, kept, expected, num_rows=rows_that_buffer)
+        if rows_that_do_not is not None:
+            assert not _medium_overflow_explains(
+                torch, row, kept, expected, num_rows=rows_that_do_not
+            )
+        # A selection below the threshold bin (index 0 is -1.0) is not an overflow.
+        below = torch.cat([torch.arange(1), kept[1:]])
+        assert not _medium_overflow_explains(torch, row, below, expected, num_rows=rows_that_buffer)
+    # A spread-out row fills no buffer, so a wrong selection stays a failure.
+    spread = torch.linspace(-1.0, 1.0, 8192)
+    spread_expected = spread[torch.arange(8192 - top_k, 8192)]
+    kept = torch.arange(7168, 7168 + top_k)
+    assert not _medium_overflow_explains(torch, spread, kept, spread_expected, num_rows=4)
 
 
 def test_logical_bytes_accounts_only_valid_prefixes_lengths_and_output() -> None:

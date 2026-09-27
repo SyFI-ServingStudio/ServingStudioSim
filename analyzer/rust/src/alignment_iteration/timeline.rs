@@ -98,6 +98,7 @@ struct IterationSummary {
     measured_ms: f64,
     simulated_ms: f64,
     relative_diff_pct: f64,
+    pdl_wait_under_collective_ms: f64,
 }
 
 impl IterationSummary {
@@ -254,10 +255,9 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
                 )
             })?;
             let measurement = measure_iteration(measured_iter, &inventory, &kernel_names)?;
-            let measured_ms = barrier::barrier_path(&measurement)
-                .with_context(|| format!("measured iteration {}", measured_iter.iteration))?
-                .critical_path_ns() as f64
-                / 1e6;
+            let path = barrier::barrier_path(&measurement)
+                .with_context(|| format!("measured iteration {}", measured_iter.iteration))?;
+            let measured_ms = path.critical_path_ns() as f64 / 1e6;
             let sample = DutyCycleSample {
                 iteration: measured_iter.iteration,
                 stage: joined.stage.clone(),
@@ -279,6 +279,7 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
                 measured_ms,
                 simulated_ms: sim.total_ms,
                 relative_diff_pct: relative_pct(sim.total_ms - measured_ms, measured_ms),
+                pdl_wait_under_collective_ms: path.pdl_wait_under_collective_ns as f64 / 1e6,
             };
             let logical_names = measurement
                 .kernels
@@ -485,6 +486,10 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
         "duty_cycle_available": gpu_time_multiplier.is_some(),
         "duty_cycle_unavailable_reason": duty_cycle_unavailable_reason,
         "multiplier_excluded_iterations": multiplier_excluded_iterations,
+        "pdl_wait_under_collective_ms": summaries
+            .iter()
+            .map(|summary| summary.pdl_wait_under_collective_ms)
+            .sum::<f64>(),
         "iterations_available": summaries.len(),
         // Two different counts on purpose: the payload indexes every iteration,
         // the report writes up the distinguished ones.
@@ -1387,6 +1392,7 @@ mod tests {
             measured_ms: 1.0,
             simulated_ms: 1.0 + relative / 100.0,
             relative_diff_pct: relative,
+            pdl_wait_under_collective_ms: 0.0,
         }
     }
 

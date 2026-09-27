@@ -70,10 +70,12 @@ DOC = KernelDoc(
         "torch gathers the pages and runs the math in FP32 as separate "
         "launches, timed with CUDA events: five warm-up calls, then a loop of "
         "back-to-back calls, taking the median of three runs. deepgemm_fp8 "
-        "builds its scheduling metadata and runs once before the capture; CUPTI"
-        " then counts, with the L2 cache flushed before each launch, only "
-        "fp8_paged_mqa_logits launches for scattered pages and every launch of"
-        " the call for request-contiguous pages."
+        "builds its scheduling metadata and runs once before the capture; for "
+        "scattered pages that run's first request is checked against the torch"
+        " composite. CUPTI then counts, with the L2 cache flushed before each "
+        "launch, only the paged_mqa_logits kernel (sm90_fp8_paged_mqa_logits on"
+        " H200, sm100_paged_mqa_logits on B200) for scattered pages and every "
+        "launch of the call for request-contiguous pages."
     ),
     caveats=(
         "Uniform rows give every request the same context length and every "

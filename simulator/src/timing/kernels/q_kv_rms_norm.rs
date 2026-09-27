@@ -33,7 +33,9 @@ impl KernelSpec for QKvRmsNormSpec {
     fn sweep_grid(config: &Self::Config) -> SweepGrid {
         assert_eq!(config.q_dim.get(), 1536);
         assert_eq!(config.kv_dim.get(), 512);
-        assert_eq!(f64::from_bits(config.rms_eps_bits), 1.0e-6);
+        // DeepSeek V4 uses 1e-6, GLM-5.3 1e-5; the scalar never changes the launch.
+        let eps = f64::from_bits(config.rms_eps_bits);
+        assert!(eps == 1.0e-6 || eps == 1.0e-5, "unsupported rms_eps {eps}");
         let mut tokens = Axis::chain([Axis::pow2(0, 4), Axis::token_axis()]);
         tokens.sort_by(f64::total_cmp);
         tokens.dedup();

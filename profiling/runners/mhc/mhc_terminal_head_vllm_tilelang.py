@@ -11,6 +11,7 @@ from profiling.runners.metrics import ComputeMetrics
 from profiling.runners.mhc._common import (
     HC_EPS,
     RMS_EPS,
+    TERMINAL_HEAD_GPUS,
     CommonInputs,
     bandwidth_gbps,
     head_weight_bytes,
@@ -18,7 +19,7 @@ from profiling.runners.mhc._common import (
     mix_bytes,
     prepare_common,
     reference_pre,
-    require_h200,
+    require_gpu,
     residual_bytes,
     validate_args,
 )
@@ -88,7 +89,7 @@ def profile_mhc_terminal_head_vllm_tilelang(
         raise ProfilerNotImplemented(f"{_KIND} requires pinned vLLM and TileLang") from exc
 
     try:
-        require_h200(torch, _KIND)
+        require_gpu(torch, _KIND, TERMINAL_HEAD_GPUS)
         inputs = prepare_common(torch, shape)
         x = torch.randn((shape.num_tokens, hidden_size), dtype=torch.bfloat16, device="cuda")
         post_mix, comb_mix, _ = reference_pre(torch, inputs)

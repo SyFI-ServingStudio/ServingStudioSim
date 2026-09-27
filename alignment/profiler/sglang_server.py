@@ -147,6 +147,11 @@ def build_server_argv(fork_python: str, cfg: ServerConfig) -> list[str]:
             "tokens. Drop the field for engine: sglang and, if a decode-graph "
             "ceiling is wanted, pass --cuda-graph-max-bs-decode in server.extra_args."
         )
+    if cfg.api_server_count is not None:
+        raise ValueError(
+            "server.api_server_count selects vLLM HTTP API processes and has no "
+            "SGLang equivalent; drop the field for engine: sglang."
+        )
     if cfg.served_model_name:
         argv += ["--served-model-name", cfg.served_model_name]
     argv += list(cfg.extra_args)
@@ -326,7 +331,11 @@ def extract_worker_device_ranks(server_log: Path) -> dict[int, int]:
     return {}
 
 
-def wait_for_idle(base_url: str, idle: IdleWaitConfig) -> bool:
+def verify_server_started(server_log: Path, cfg: ServerConfig) -> None:
+    """SGLang has one HTTP frontend; nothing to confirm."""
+
+
+def wait_for_idle(base_url: str, idle: IdleWaitConfig, cfg: ServerConfig | None = None) -> bool:
     """Poll /v1/loads until every DP rank reports no running or waiting request."""
     if not idle.enabled:
         return True

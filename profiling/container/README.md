@@ -3,6 +3,8 @@
 This image is the dependency boundary for ServingStudio Sim kernels registered with
 `subprocess_env="vllm_env"`. It pins CUDA 13.0, the instrumented vLLM checkout,
 the matching cu130 native wheel, Torch, FlashInfer, and the CUPTI build tools.
+Workers run with `--network none`, so the build also downloads every FlashInfer
+cubin into `/opt/flashinfer-cubins`.
 
 By default, profiling workers overlay the current worktree's `profiling/`,
 `launcher/`, and `gpu/` directories read-only. This development mode lets newly
@@ -54,7 +56,7 @@ built from a clean tree. Record both the immutable image digest and the labels
 reported by:
 
 ```bash
-docker image inspect vibesim-profiler-vllm:cu130
+docker image inspect vibesim-profiler-vllm:cu130-3f667d7e
 ```
 
 The container does not virtualize the GPU driver. Validate the target GPU,

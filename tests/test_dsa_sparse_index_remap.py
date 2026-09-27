@@ -1081,3 +1081,26 @@ def test_profile_preserves_typed_unavailable_oom_and_execution_failures(
     with pytest.raises(KernelLaunchFailed, match="semantic composite failed") as launch_info:
         runner.profile_dsa_sparse_index_remap_torch(**_BASE_SPEC)
     assert isinstance(launch_info.value.__cause__, RuntimeError)
+
+
+def test_only_the_vllm_backend_admits_the_kpool_table_width(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from profiling.runners.attention import dsa_sparse_index_remap as runner
+
+    kpool = _BASE_SPEC | {"selected_k": 2176}
+    with pytest.raises(ProfilerNotImplemented, match="selected_k must be 2048, got 2176"):
+        runner._validate_args(**kpool)
+    validated = runner._validate_args(**kpool, supported_selected_k=runner._VLLM_SELECTED_K)
+    assert validated.selected_k == 2176
+
+    seen: dict[str, Any] = {}
+
+    def stop_after_validation(**kwargs: Any) -> Any:
+        seen.update(kwargs)
+        raise RuntimeError("validated")
+
+    monkeypatch.setattr(runner, "_validate_args", stop_after_validation)
+    with pytest.raises(RuntimeError, match="validated"):
+        runner.profile_dsa_sparse_index_remap_vllm_triton(**kpool)
+    assert seen["supported_selected_k"] == frozenset({2048, 2176})

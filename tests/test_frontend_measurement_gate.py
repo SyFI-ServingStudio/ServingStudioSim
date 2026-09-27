@@ -122,6 +122,7 @@ def test_profiler_and_counters_start_only_at_frontend_measurement_boundary(tmp_p
     monkeypatch.setattr(driver, "build_server_env", lambda *a, **k: {})
     monkeypatch.setattr(driver, "write_launch_metadata", lambda *a: None)
     monkeypatch.setattr(driver, "wait_for_ready", lambda *a: None)
+    monkeypatch.setattr(driver, "verify_server_started", lambda *a: None)
     monkeypatch.setattr(driver, "wait_for_idle", lambda *a: True)
     monkeypatch.setattr(driver, "speculative_decode_enabled", lambda _: True)
     monkeypatch.setattr(driver, "set_cuda_profile", lambda *a, active: events.append(active))

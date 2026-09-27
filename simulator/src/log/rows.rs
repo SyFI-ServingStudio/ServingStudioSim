@@ -166,6 +166,9 @@ pub struct GroupInputLog {
     pub decode_query_rows: u32,
     /// Raw speculative request geometry, absent for ordinary execution.
     pub speculative_geometry: Option<SpeculativeGeometryLog>,
+    /// Per decode request KV length, logged only for models that opt in
+    /// ([`IterwiseUnifiedModel::logs_decode_kv_lens`](crate::arch::IterwiseUnifiedModel::logs_decode_kv_lens)).
+    pub decode_kv_lens: Option<Vec<u32>>,
 }
 
 /// Keep serialization on the writer thread, like the surrounding Arrow fields.
@@ -300,6 +303,7 @@ fn build_groups_column(entries: &[CostLogEntry], group_logs: &[GroupInputLog]) -
                 Box::new(ListBuilder::new(UInt32Builder::new()).with_field(u32_item())),
                 Box::new(UInt32Builder::new()),
                 Box::new(StringBuilder::new()),
+                Box::new(ListBuilder::new(UInt32Builder::new()).with_field(u32_item())),
             ],
         )
     };
@@ -351,6 +355,16 @@ fn build_groups_column(entries: &[CostLogEntry], group_logs: &[GroupInputLog]) -
             sb.field_builder::<StringBuilder>(7)
                 .unwrap()
                 .append_option(geometry.as_deref());
+            {
+                let kv_b = sb.field_builder::<ListBuilder<UInt32Builder>>(8).unwrap();
+                match &g.decode_kv_lens {
+                    Some(lens) => {
+                        kv_b.values().append_slice(lens);
+                        kv_b.append(true);
+                    }
+                    None => kv_b.append(false),
+                }
+            }
             sb.append(true);
         }
         group_cursor = group_end;
@@ -1019,6 +1033,7 @@ mod tests {
                     max_model_len: 8192,
                     decode: vec![(106, 6)],
                 }),
+                decode_kv_lens: None,
             },
             // row 0, group 1: pure decode (no prefill pairs).
             GroupInputLog {
@@ -1029,6 +1044,7 @@ mod tests {
                 prefill_chunk_pairs: vec![],
                 decode_query_rows: 3,
                 speculative_geometry: None,
+                decode_kv_lens: Some(vec![10, 20, 30]),
             },
             // row 1, group 0.
             GroupInputLog {
@@ -1039,6 +1055,7 @@ mod tests {
                 prefill_chunk_pairs: vec![(0, 5)],
                 decode_query_rows: 0,
                 speculative_geometry: None,
+                decode_kv_lens: None,
             },
         ];
         let batch = cost_to_record_batch(&CostLogChunk {
@@ -1142,6 +1159,17 @@ mod tests {
         assert_eq!(append0.values(), &[8, 10]);
         // group 1 of row 0 is pure decode: empty prefill lists.
         assert_eq!(prefix_lists.value(1).len(), 0);
+        // decode_kv_lens is opt-in per model: null unless the source kept them.
+        let kv_lens = g0
+            .column_by_name("decode_kv_lens")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        assert!(kv_lens.is_null(0));
+        let kv_lens1 = kv_lens.value(1);
+        let kv_lens1 = kv_lens1.as_any().downcast_ref::<UInt32Array>().unwrap();
+        assert_eq!(kv_lens1.values(), &[10, 20, 30]);
 
         let row1 = groups_col.value(1);
         let g1 = row1.as_any().downcast_ref::<StructArray>().unwrap();

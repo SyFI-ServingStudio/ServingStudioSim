@@ -41,7 +41,7 @@ DOC = KernelDoc(
         "their final input samples as state."
     ),
     description=(
-        "In Gated DeltaNet prefill, each new sequence runs a "
+        "In Gated DeltaNet and KDA prefill, each new sequence runs a "
         "depthwise causal convolution from a zero history: every channel has "
         "its own kernel_size-wide filter, followed by SiLU. The sequence's last"
         " kernel_size − 1 input samples, zero-padded on the left if it is "
@@ -106,7 +106,7 @@ register(
         backend="vllm_triton",
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
-            gpus=frozenset({"NVIDIA H200"}),
+            gpus=frozenset({"NVIDIA H200", "NVIDIA B200"}),
         ),
         runner_ref=RunnerRef(
             module_name=("profiling.runners.attention.gdn_causal_conv_prefill_vllm_triton"),

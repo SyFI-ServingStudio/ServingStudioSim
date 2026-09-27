@@ -48,3 +48,7 @@ glm53_nvfp4:
   name: GLM-5.3 NVFP4
   family: GLM
   checkpoint: incoai/GLM-5.3-NVFP4
+glm53_flash:
+  name: GLM-5.3-Flash
+  family: GLM
+  checkpoint: zai-org/GLM-5.3-Flash

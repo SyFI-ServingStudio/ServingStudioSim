@@ -22,17 +22,19 @@ use crate::arch::model_cfg::ModelCfg;
 use crate::arch::moe_model_cfg::MoeModelCfg;
 use crate::arch::{
     deepseek_v4_vllm, glm52_sglang_nvfp4_tp_dsa_moe, glm52_vllm_dsa_moe, glm52_vllm_nvfp4_dsa_moe,
-    glm53_vllm_nvfp4_dsa_moe_dflash2, llama3_dense, llama3_dense_tp, llama3_dp_attn_tp_ffn,
-    qwen36_local, qwen3_attn_layerwise, qwen3_ffn_moe_layerwise, qwen3_fp8_ffn_moe_layerwise,
-    qwen3_moe_dp_attn_ep_ffn, qwen3_moe_fp8_dp_attn_ep_ffn, qwen3_vllm_moe_dp_attn_ep_ffn,
-    AttnLayerwiseModel, DeepseekV4ModelCfg, DeepseekV4VllmModel, DeepseekV4VllmParallel,
-    DenseParallel, DenseTpParallel, Dflash2DraftResolved, DpAttnTpFfnParallel, FfnLayerwiseModel,
-    Glm52ModelCfg, Glm52MtpMode, Glm52SglangNvfp4TpDsaMoeModel, Glm52SglangNvfp4TpDsaMoeParallel,
+    glm53_flash_vllm_fp8_kda_dsa_moe, glm53_vllm_nvfp4_dsa_moe_dflash2, llama3_dense,
+    llama3_dense_tp, llama3_dp_attn_tp_ffn, qwen36_local, qwen3_attn_layerwise,
+    qwen3_ffn_moe_layerwise, qwen3_fp8_ffn_moe_layerwise, qwen3_moe_dp_attn_ep_ffn,
+    qwen3_moe_fp8_dp_attn_ep_ffn, qwen3_vllm_moe_dp_attn_ep_ffn, AttnLayerwiseModel,
+    DeepseekV4ModelCfg, DeepseekV4VllmModel, DeepseekV4VllmParallel, DenseParallel,
+    DenseTpParallel, Dflash2DraftResolved, DpAttnTpFfnParallel, FfnLayerwiseModel, Glm52ModelCfg,
+    Glm52MtpMode, Glm52SglangNvfp4TpDsaMoeModel, Glm52SglangNvfp4TpDsaMoeParallel,
     Glm52VllmDsaMoeModel, Glm52VllmDsaMoeParallel, Glm52VllmNvfp4DsaMoeModel,
-    Glm52VllmNvfp4DsaMoeParallel, Glm52VllmNvfp4DsaMoeSpeculativeModel,
-    Glm53VllmNvfp4DsaMoeDflash2Model, IterwiseUnifiedModel, Llama3DenseModel, Llama3DenseTpModel,
-    Llama3DpAttnTpFfnModel, Qwen36LocalModel, Qwen36LocalParallel, Qwen36ModelCfg,
-    Qwen3AttnLayerwiseModel, Qwen3AttnParallel, Qwen3FfnMoeLayerwiseModel, Qwen3FfnMoeParallel,
+    Glm52VllmNvfp4DsaMoeParallel, Glm52VllmNvfp4DsaMoeSpeculativeModel, Glm53FlashModelCfg,
+    Glm53FlashVllmModel, Glm53FlashVllmParallel, Glm53VllmNvfp4DsaMoeDflash2Model,
+    IterwiseUnifiedModel, Llama3DenseModel, Llama3DenseTpModel, Llama3DpAttnTpFfnModel,
+    Qwen36LocalModel, Qwen36LocalParallel, Qwen36ModelCfg, Qwen3AttnLayerwiseModel,
+    Qwen3AttnParallel, Qwen3FfnMoeLayerwiseModel, Qwen3FfnMoeParallel,
     Qwen3Fp8FfnMoeLayerwiseModel, Qwen3Fp8FfnMoeParallel, Qwen3MoeDpAttnEpFfnModel,
     Qwen3MoeFp8DpAttnEpFfnModel, Qwen3MoeFp8Parallel, Qwen3MoeParallel,
     Qwen3VllmMoeDpAttnEpFfnModel, Qwen3VllmMoeParallel,
@@ -1155,6 +1157,62 @@ pub fn glm52_vllm_nvfp4_dsa_moe_speculative(
         .context("building speculative B200 GLM-5.2 NVFP4 model (often a missing profile.db row)")
 }
 
+/// Build the B200 GLM-5.3-Flash FP8 KDA/DSA/MoE model (vLLM fork, TP = EP).
+///
+/// The checkpoint's layer schedule is exact, so layer-count overrides are
+/// rejected. Routing is resolved over the 42 routed layers; a corpus captured
+/// with MTP off records exactly those.
+#[allow(clippy::too_many_arguments)]
+pub fn glm53_flash_vllm_fp8_kda_dsa_moe(
+    model_spec: &ModelSpec,
+    tp_size: u16,
+    max_model_len: u32,
+    routing_kind: RoutingKind,
+    routing_seed: Option<u64>,
+    expert_popularity_file: Option<&str>,
+    token_corpus_file: Option<&str>,
+    cudagraph_capture_sizes: &[u32],
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<Glm53FlashVllmModel> {
+    if model_spec.num_layers.is_some() || model_spec.sim_num_layers.is_some() {
+        bail!(
+            "GLM-5.3-Flash architecture rejects num_layers/sim_num_layers overrides; the exact hybrid 45-layer schedule is required"
+        );
+    }
+    anyhow::ensure!(
+        model_spec.fp8,
+        "GLM-5.3-Flash is modeled for its FP8 block checkpoint; set fp8: true"
+    );
+    let model_cfg = Glm53FlashModelCfg::from_json(Path::new(&model_spec.model_config))
+        .context("loading GLM-5.3-Flash config")?;
+    let routed_layers = model_cfg.num_moe_layers();
+    let source = ExpertDemandSource {
+        kind: routing_kind,
+        seed: routing_seed,
+        num_experts: model_cfg.n_routed_experts,
+        experts_per_token: model_cfg.num_experts_per_tok,
+        ep_size: tp_size,
+        expert_popularity_file,
+        token_corpus_file,
+        num_routed_layers: routed_layers,
+    };
+    // Ordinary decode: one row per request, so a verify block is one token.
+    let demand = source.demand(0..routed_layers as usize, 1)?;
+    let parallel = Glm53FlashVllmParallel {
+        tp_size,
+        max_model_len,
+        gpu_name: gpu.to_string(),
+        cudagraph_capture_sizes: cudagraph_capture_sizes.to_vec(),
+    };
+    let configs = glm53_flash_vllm_fp8_kda_dsa_moe::build_configs(&model_cfg, &parallel, &demand)
+        .context("expanding GLM-5.3-Flash architecture configs")?;
+    let resolved = glm53_flash_vllm_fp8_kda_dsa_moe::resolve_configs(&configs);
+    glm53_flash_vllm_fp8_kda_dsa_moe::build(name.to_string(), resolved, bridge)
+        .context("building GLM-5.3-Flash model (often a missing profile.db row)")
+}
+
 /// Build the GLM target graph driven by a DFlash2 block-parallel proposer.
 ///
 /// The draft is a separate dense checkpoint, so its dimensions come from that
@@ -1633,6 +1691,28 @@ pub fn build_iter_model(
             *mtp_mode,
             expert_popularity_file.as_deref(),
             token_corpus_file.as_deref(),
+            gpu,
+            name,
+            bridge,
+        )?),
+        IterArchSel::Glm53FlashVllmFp8KdaDsaMoe {
+            model,
+            tp_size,
+            max_model_len,
+            routing,
+            routing_seed,
+            expert_popularity_file,
+            token_corpus_file,
+            cudagraph_capture_sizes,
+        } => Box::new(glm53_flash_vllm_fp8_kda_dsa_moe(
+            model,
+            *tp_size,
+            *max_model_len,
+            *routing,
+            *routing_seed,
+            expert_popularity_file.as_deref(),
+            token_corpus_file.as_deref(),
+            cudagraph_capture_sizes,
             gpu,
             name,
             bridge,

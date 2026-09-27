@@ -123,11 +123,12 @@ ENV_REGISTRY: dict[str, ProfileEnv | ContainerProfileEnv] = {
         _SGLANG_PYTHON,
         additional_python_paths=(_SGLANG_PYTHON_ROOT,),
     ),
-    # vLLM runners execute in the pinned image; host source and Python packages
+    # vLLM runners execute in the pinned image (the alignment fork's vLLM
+    # commit, profiling/container/build.sh); host source and Python packages
     # are deliberately outside this environment boundary.
     "vllm_env": ContainerProfileEnv(
         "vllm_env",
-        os.environ.get("VIBESIM_VLLM_PROFILE_IMAGE", "vibesim-profiler-vllm:cu130"),
+        os.environ.get("VIBESIM_VLLM_PROFILE_IMAGE", "vibesim-profiler-vllm:cu130-3f667d7e"),
     ),
 }
 

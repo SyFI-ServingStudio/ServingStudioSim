@@ -9,7 +9,7 @@ transactions or Torch intermediates.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from profiling.db.args import DType
@@ -33,7 +33,10 @@ _CACHE_FORMAT = "page_planar_fp8_fp32_scale"
 _CONTIGUOUS_CACHE_FORMAT = "fp8_e4m3_ue8m0"
 _REQUIRED_GPU = "NVIDIA H200"
 _DEEPGEMM_EXPECTED_SMS = {"NVIDIA H200": 132, "NVIDIA B200": 148}
-_DEEPGEMM_KERNEL_NAME = "fp8_paged_mqa_logits"
+# DeepGEMM names the main kernel `sm90_fp8_paged_mqa_logits` on H200 and
+# `sm100_paged_mqa_logits` on B200.
+_DEEPGEMM_KERNEL_NAME = "paged_mqa_logits"
+_CHECK_TOLERANCE = 1e-3
 
 
 @dataclass(frozen=True)
@@ -646,6 +649,34 @@ def profile_dsa_paged_mqa_logits_decode_torch(
         raise KernelLaunchFailed(str(exc)) from exc
 
 
+def _check_first_request(
+    torch: Any,
+    operands: _DsaPagedMqaLogitsDecodeOperands,
+    output: Any,
+    *,
+    context_len: int,
+    max_model_len: int,
+) -> None:
+    """Compare request 0's logits rows with the Torch composite on the valid columns."""
+    next_n = operands.q.shape[1]
+    first = replace(
+        operands,
+        q=operands.q[:1],
+        weights=operands.weights[:next_n],
+        context_lens=operands.context_lens[:1],
+        block_table=operands.block_table[:1],
+    )
+    expected = _torch_composite(first, context_len=context_len, max_model_len=max_model_len)
+    expected = expected[:, :context_len]
+    actual = output[:next_n, :context_len].float()
+    if not torch.allclose(actual, expected, rtol=_CHECK_TOLERANCE, atol=_CHECK_TOLERANCE):
+        max_abs = float((actual - expected).abs().max())
+        raise KernelLaunchFailed(
+            "dsa_paged_mqa_logits_decode:deepgemm_fp8 disagrees with the Torch "
+            f"composite: max abs error {max_abs:.6f}"
+        )
+
+
 def _profile_dsa_paged_mqa_logits_decode_deepgemm_fp8(
     load_backend: Any,
     batch_size: int,
@@ -724,8 +755,10 @@ def _profile_dsa_paged_mqa_logits_decode_deepgemm_fp8(
             max_model_len=max_model_len,
         )
 
-        # Compile and initialize the exact shape before formal CUPTI timing.
-        kernel()
+        # Compile, initialize, and check the exact shape before formal CUPTI timing.
+        _check_first_request(
+            torch, operands, kernel(), context_len=context_len, max_model_len=max_model_len
+        )
         torch.cuda.synchronize()
         time_ms = Timer.cupti(
             kernel,
