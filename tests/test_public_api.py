@@ -185,10 +185,8 @@ def test_kernel_detail_joins_docs_roles_and_shapes(registered) -> None:
         {"tp_size": [4]},
         "llama3_dense_tp, tp_size 4",
     )
-    assert deployment["members"] == [
-        {"params": {"tp_size": 4}, "validated": False, "validated_against": []}
-    ]
-    assert not deployment["validated"] and "sources" not in deployment
+    assert deployment["members"] == [{"params": {"tp_size": 4}}]
+    assert "validated" not in deployment and "sources" not in deployment
     (shape,) = deployment["shapes"]
     assert shape == {
         "layer": "unified.qkv",
@@ -455,7 +453,7 @@ def test_configs_list_is_slim_and_labels_each_use(registered) -> None:
     assert (moe["model_config"], moe["model"]) == ("moe_x", None)
     assert (moe["params"], moe["varies"]) == ({"ep_size": 8, "mtp_mode": "off"}, [])
     assert moe["label"] == "moe_x, ep_size 8, mtp_mode off"
-    assert moe["members"] == [{"params": {}, "validated": False, "validated_against": []}]
+    assert moe["members"] == [{"params": {}}]
     # The deployment-level pool names no arch, so no deployment.
     assert by_role["unified.transfer"]["deployments"] == []
 
@@ -568,8 +566,8 @@ def _register(path: Path, identity: dict, source: dict) -> None:
 @pytest.fixture
 def supported(tmp_path: Path) -> tuple[TestClient, tuple[str, str]]:
     """Both expansions of one supported row read the qkv config; only tp_size 4
-    reads the gate config. An alignment pack in this checkout (engine sglang)
-    ran tp_size 4."""
+    reads the gate config. An alignment run of tp_size 4 names that deployment
+    again, and stays one member of it."""
 
     path = tmp_path / "supported.db"
     table = Table(next(iter_kernel_profiler_specs("single_gemm")), path)
@@ -596,24 +594,6 @@ def test_a_supported_row_is_one_deployment_with_its_value_list(supported) -> Non
 
     [used] = client.get(f"{PREFIX}/kernels/single_gemm").json()["used_by"]
     assert {s["config_hash"]: s["members"] for s in used["shapes"]} == {qkv: [0, 1], gate: [1]}
-
-
-def test_an_alignment_run_marks_its_deployment_validated(supported) -> None:
-    client, _ = supported
-    [deployment] = client.get(f"{PREFIX}/kernels/single_gemm/configs").json()["deployments"]
-    # The engine is the pack variant's, from its campaign.yaml.
-    assert [(m["validated"], m["validated_against"]) for m in deployment["members"]] == [
-        (False, []),
-        (True, ["sglang"]),
-    ]
-    assert (deployment["validated"], deployment["validated_against"]) == (True, ["sglang"])
-
-
-def test_an_alignment_pack_not_in_the_checkout_still_validates(registered) -> None:
-    client, (qkv, _), path = registered
-    _register(path, QKV, _alignment("presets/alignment/no_such_pack", "v", 4))
-    [llama, _] = client.get(f"{PREFIX}/kernels/single_gemm/configs").json()["deployments"]
-    assert (llama["validated"], llama["validated_against"]) == (True, [])
 
 
 def test_local_paths_in_a_config_identity_are_cut_to_file_names() -> None:

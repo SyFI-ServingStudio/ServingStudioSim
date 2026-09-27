@@ -17,10 +17,8 @@ Every field comes from a source that lives with the code; nothing here guesses:
   the arch params the arch's ``#[supported]`` rows name (``list-params``);
 - which deployments are one ``#[supported]`` row, from the rows themselves
   (``list-params`` lists each row once, with its value lists unexpanded);
-- whether a deployment was validated against real serving, from the alignment
-  packs in the registry's sources, and the engine from the pack's
-  ``campaign.yaml``. The sources themselves (preset and pack paths) stay in
-  profile.db: they are bookkeeping, and some name a local path;
+- not what registered a config: the registry's sources (preset and pack paths)
+  stay in profile.db; they are bookkeeping, and some name a local path;
 - a row's precision, from the column the Rust kernel names as its compute dtype;
 - GPU peaks from ``gpu/spec.json`` and model names from ``model/catalog.yaml``;
 - measurements from profile.db, and the kernel configs that read them from its
@@ -40,7 +38,6 @@ from typing import Any
 
 import yaml
 
-from launcher.alignment_campaign.pack import load_pack
 from launcher.schema.validate import supported_value
 from profiling.db.args import DType
 from profiling.db.doc import CATEGORIES, SUBCATEGORIES, arg_docs, kernel_doc
@@ -385,55 +382,6 @@ class KernelLibrary:
                 return index, row
         return None
 
-    def _engine(self, alignment: dict) -> str | None:
-        """The serving engine an alignment source's pack variant ran, from the
-        pack's ``campaign.yaml``; None when the pack is not in this checkout."""
-
-        pack, variant = alignment.get("pack"), alignment.get("variant")
-
-        def compute() -> str | None:
-            if not isinstance(pack, str):
-                return None
-            root = (REPO_ROOT / pack).resolve()
-            if not root.is_relative_to(REPO_ROOT):
-                return None
-            try:
-                found = load_pack(root).variants.get(variant)
-            except (OSError, ValueError):
-                return None
-            return found.engine if found else None
-
-        return self.sources.cached_by_db(("engine", pack, variant), compute)
-
-    def _validated(self) -> dict[str, set[str]]:
-        """``{deployment key: engines}`` of every deployment an alignment pack
-        ran, over the whole registry: a deployment is validated whichever kernel
-        is asked about. An engine the pack does not name is left out."""
-
-        def compute() -> dict[str, set[str]]:
-            with self.sources.connect() as conn:
-                tables = {
-                    row[0]
-                    for row in conn.execute("select name from sqlite_master where type = 'table'")
-                }
-                if SOURCE_TABLE not in tables:
-                    return {}
-                records = conn.execute(f"select source from {SOURCE_TABLE}").fetchall()
-            out: dict[str, set[str]] = {}
-            for (text,) in records:
-                source = json.loads(text)
-                if not source.get("alignment"):
-                    continue
-                engine = self._engine(source["alignment"])
-                for gpu, arch in _source_archs(source):
-                    key = self._deployment_key(self._deployment(gpu, arch))
-                    engines = out.setdefault(key, set())
-                    if engine:
-                        engines.add(engine)
-            return out
-
-        return self.sources.cached_by_db("validated", compute)
-
     def _deployment_table(self, kind: str) -> dict:
         """The deployments that run ``kind``, one per ``#[supported]`` row.
 
@@ -446,7 +394,6 @@ class KernelLibrary:
         id and member index."""
 
         def compute() -> dict:
-            validated = self._validated()
             groups: dict[str, dict] = {}
             for summary in self._summaries(kind):
                 config = summary["config"]
@@ -483,15 +430,8 @@ class KernelLibrary:
                     key=lambda item: [row[n].index(item[1]["params"][n]) for n in varies],
                 )
                 listed = []
-                for member_key, deployment in members:
-                    engines = validated.get(member_key)
-                    listed.append(
-                        {
-                            "params": {n: deployment["params"][n] for n in varies},
-                            "validated": engines is not None,
-                            "validated_against": sorted(engines or ()),
-                        }
-                    )
+                for _, deployment in members:
+                    listed.append({"params": {n: deployment["params"][n] for n in varies}})
                 base = group["base"]
                 params = {
                     n: [m["params"][n] for m in listed] if n in varies else v
@@ -510,10 +450,6 @@ class KernelLibrary:
                         "varies": varies,
                         "label": _label_text(base["arch"], params),
                         "members": listed,
-                        "validated": any(m["validated"] for m in listed),
-                        "validated_against": sorted(
-                            {e for m in listed for e in m["validated_against"]}
-                        ),
                         "_keys": [member_key for member_key, _ in members],
                     }
                 )
