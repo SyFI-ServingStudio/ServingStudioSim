@@ -16,6 +16,14 @@ qwen3_235b_fp8:
   name: Qwen3 235B-A22B FP8
   family: Qwen
   checkpoint: Qwen/Qwen3-235B-A22B-FP8
+qwen3_235b_thinking_2507_fp8:
+  name: Qwen3 235B-A22B Thinking 2507 FP8
+  family: Qwen
+  checkpoint: Qwen/Qwen3-235B-A22B-Thinking-2507-FP8
+qwen3_coder_480b:
+  name: Qwen3 Coder 480B-A35B
+  family: Qwen
+  checkpoint: Qwen/Qwen3-Coder-480B-A35B-Instruct
 qwen3_6_35b_a3b_fp8:
   name: Qwen3.6 35B-A3B FP8
   family: Qwen
@@ -24,6 +32,10 @@ deepseek_v4_flash_0731:
   name: DeepSeek V4 Flash 0731
   family: DeepSeek
   checkpoint: deepseek-ai/DeepSeek-V4-Flash-0731
+glm52:
+  name: GLM-5.2
+  family: GLM
+  checkpoint: zai-org/GLM-5.2
 glm52_fp8:
   name: GLM-5.2 FP8
   family: GLM

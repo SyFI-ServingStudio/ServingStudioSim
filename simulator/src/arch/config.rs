@@ -161,6 +161,7 @@ pub enum IterArchSel {
         #[param(default = 2, cache_key)]
         tp_size: u16,
     },
+    #[supported(gpu = ["NVIDIA H200"], model_config = ["llama3_8b"], attn_tp_size = [4], ffn_tp_size = [8])]
     Llama3DpAttnTpFfn {
         #[serde(flatten)]
         model: ModelSpec,
@@ -215,6 +216,9 @@ pub enum IterArchSel {
     },
     /// Native FP8 Qwen recipe: per-token/group quantized dense projections,
     /// DeepGEMM expert kernels, and ServingStudioSim's P2P EP dispatch/combine graph.
+    #[supported(gpu = ["NVIDIA H200"], model_config = ["qwen3_235b_fp8"], fp8 = [true], attn_tp_size = [1, 2, 4], ep_size = [8], hp_size = [1], nvl_num_gpu = [8])]
+    #[supported(gpu = ["NVIDIA H200"], model_config = ["qwen3_235b_fp8"], fp8 = [true], attn_tp_size = [1, 4], ep_size = [4], hp_size = [1], nvl_num_gpu = [4])]
+    #[supported(gpu = ["NVIDIA H200"], model_config = ["qwen3_235b_thinking_2507_fp8"], fp8 = [true], attn_tp_size = [4], ep_size = [4], hp_size = [1], nvl_num_gpu = [4])]
     Qwen3MoeFp8DpAttnEpFfn {
         #[serde(flatten)]
         model: ModelSpec,
@@ -239,6 +243,7 @@ pub enum IterArchSel {
     /// FlashInfer/TensorRT-LLM block-scale expert GEMMs plus local finalize and
     /// an EP all-reduce. The generic Qwen tag above intentionally retains
     /// ServingStudioSim's original DeepGEMM + P2P communication recipe.
+    #[supported(gpu = ["NVIDIA H200"], model_config = ["qwen3_235b_fp8", "qwen3_235b_thinking_2507_fp8"], fp8 = [true], attn_tp_size = [4], ep_size = [4], hp_size = [1], nvl_num_gpu = [4])]
     Qwen3VllmMoeDpAttnEpFfn {
         #[serde(flatten)]
         model: ModelSpec,
@@ -293,6 +298,7 @@ pub enum IterArchSel {
     /// GLM-5.2's aligned vLLM execution graph with local TP1 attention and
     /// expert parallelism across the replica.
     #[supported(gpu = ["NVIDIA H200"], model_config = ["glm52_fp8"], fp8 = [true], ep_size = [8], nvl_num_gpu = [8])]
+    #[supported(gpu = ["NVIDIA H200"], model_config = ["glm52"], fp8 = [false], ep_size = [8], nvl_num_gpu = [8])]
     Glm52VllmDsaMoe {
         #[serde(flatten)]
         model: ModelSpec,
@@ -933,7 +939,8 @@ pub enum AttnArchSel {
     /// `replicas` (= the unified arch's `ep_size / attn_tp_size`), not an arch
     /// param. Pairs with the `qwen3_ffn_moe` ffn arch.
     #[supported(gpu = ["NVIDIA H200"], model_config = ["qwen3_235b"], fp8 = [false], attn_tp_size = [2, 4])]
-    #[supported(gpu = ["NVIDIA H200"], model_config = ["qwen3_235b_fp8"], fp8 = [true], attn_tp_size = [4])]
+    #[supported(gpu = ["NVIDIA H200"], model_config = ["qwen3_235b_fp8"], fp8 = [true], attn_tp_size = [2, 4])]
+    #[supported(gpu = ["NVIDIA H200"], model_config = ["qwen3_coder_480b"], fp8 = [true], attn_tp_size = [4])]
     Qwen3AttnTp {
         #[serde(flatten)]
         model: ModelSpec,
@@ -989,7 +996,9 @@ pub enum FfnArchSel {
     /// Native FP8 Qwen3-MoE FFN side. This is a separate provider because its
     /// pre/post projection and lm-head slots are quant+GEMM compound ops. It
     /// pairs with a `qwen3_attn` model whose `fp8` field is true.
-    #[supported(gpu = ["NVIDIA H200"], model_config = ["qwen3_235b_fp8"], fp8 = [true], attn_tp_size = [4], ep_size = [8], nvl_num_gpu = [8])]
+    #[supported(gpu = ["NVIDIA H200"], model_config = ["qwen3_235b_fp8"], fp8 = [true], attn_tp_size = [2, 4], ep_size = [8], nvl_num_gpu = [8])]
+    #[supported(gpu = ["NVIDIA H200"], model_config = ["qwen3_235b_fp8"], fp8 = [true], attn_tp_size = [4], ep_size = [4], nvl_num_gpu = [4])]
+    #[supported(gpu = ["NVIDIA H200"], model_config = ["qwen3_coder_480b"], fp8 = [true], attn_tp_size = [1, 4], ep_size = [8], nvl_num_gpu = [8])]
     Qwen3Fp8FfnMoe {
         #[serde(flatten)]
         model: ModelSpec,
