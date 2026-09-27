@@ -6,10 +6,13 @@ declared through ``arg``, and a ``BackendDoc`` on every backend.
 
 from __future__ import annotations
 
+import json
+import subprocess
 from dataclasses import fields
 
 import pytest
 
+from launcher.exec import _build_subprocess_env
 from profiling.db import doc as kernel_docs
 from profiling.db.args import DType
 from profiling.db.doc import CATEGORIES, SUBCATEGORIES, arg_docs, kernel_doc
@@ -93,3 +96,40 @@ def test_subdivided_category_names_a_subcategory(kind: str) -> None:
     doc = kernel_doc(kind)
     if doc.category in SUBCATEGORIES:
         assert doc.subcategory is not None, f"{kind} has no {doc.category} subcategory"
+
+
+VIEWED = [kind for kind in DOCUMENTED_NOW if kernel_doc(kind).view is not None]
+
+
+@pytest.fixture(scope="module")
+def rust_kernels(sim_bin) -> list[dict]:
+    """``simulator kernel-list``: every Rust kernel kind with its config fields."""
+
+    result = subprocess.run(
+        [str(sim_bin), "kernel-list"],
+        capture_output=True,
+        text=True,
+        env=_build_subprocess_env(),
+        check=True,
+    )
+    return json.loads(result.stdout)
+
+
+def test_some_kind_declares_a_view() -> None:
+    assert VIEWED
+
+
+@pytest.mark.needs_binary
+@pytest.mark.parametrize("kind", VIEWED)
+def test_view_fields_are_rust_config_fields(kind: str, rust_kernels: list[dict]) -> None:
+    # A view is drawn by config values the registry records, so each field it
+    # names must be a field of every Rust config that reads the kind's rows.
+    tables = {spec.table_name for spec in KINDS[kind]}
+    configs = [e["config"] for e in rust_kernels if e["profile_kind"] in tables]
+    assert configs, f"no Rust kernel reads {kind}'s rows"
+    view = kernel_doc(kind).view
+    for view_field in (view.series, view.workload):
+        for config in configs:
+            assert view_field.field in config, f"{kind}: {view_field.field} is not a config field"
+        assert view_field.label.strip() and view_field.doc.strip()
+    assert view.title.strip() and view.summary.strip()

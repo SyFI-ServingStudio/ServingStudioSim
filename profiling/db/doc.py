@@ -160,13 +160,81 @@ CUPTI_METHOD = (
 
 
 @dataclass(frozen=True)
+class ViewField:
+    """One Rust config field a :class:`ConfigView` is drawn by.
+
+    ``field`` is the name ``simulator kernel-list`` gives it among the kind's
+    config fields; ``label`` is what the page calls it; ``doc`` says what its
+    values mean.
+    """
+
+    field: str
+    label: str
+    doc: str
+
+
+@dataclass(frozen=True)
+class ConfigView:
+    """A chart drawn from several registered configs of a kind at once.
+
+    The configs a deployment builds for one leaf that differ only in
+    ``series`` are one chart: one line per config, over the config's sweep
+    axis. ``series`` values are positions in an order, 0 first; line ``n``
+    reads ``label n+1`` and position 0, which leads the order, is drawn
+    strongest. ``workload`` is picked with a selector; the public API names
+    each config's value (``config_labels``). The page knows only these roles,
+    never the kind.
+    """
+
+    title: str
+    summary: str
+    series: ViewField
+    workload: ViewField
+
+
+#: Expert compute split over expert-parallel ranks. The simulator folds each
+#: step's routed demand onto the EP ranks and orders the ranks by active
+#: experts, then routed rows (``fold_layerwise_expert_counts`` in
+#: ``simulator/src/timing/routing.rs``); it builds one config per position in
+#: that order (``folded_rank_position``), all from one ``expert_demand``.
+EP_RANKS_BY_LOAD = ConfigView(
+    title="EP ranks by load",
+    summary=(
+        "One line per expert-parallel rank of one routing. The simulator draws "
+        "each step's routed tokens from the routing, folds them onto the ranks and "
+        "orders the ranks by load, so a line is a position in that order, not a "
+        "physical GPU."
+    ),
+    series=ViewField(
+        field="folded_rank_position",
+        label="Load rank",
+        doc=(
+            "Load rank 1 holds the most active experts, ties going to the most "
+            "routed rows; the fold orders each layer's ranks this way and "
+            "averages the layers position by position."
+        ),
+    ),
+    workload=ViewField(
+        field="expert_demand",
+        label="Routing",
+        doc=(
+            "Where the routed demand comes from: a recorded token corpus, an "
+            "expert-popularity file, or synthetic uniform or random routing."
+        ),
+    ),
+)
+
+
+@dataclass(frozen=True)
 class KernelDoc:
     """What one kernel kind computes and how to read its numbers.
 
     ``method`` says how the kind's runners time it. A CUPTI-timed kind opens
     with :data:`CUPTI_METHOD` and adds only what is particular to it.
     ``reference`` is the module path of a PyTorch reference implementation, or
-    None when a measured backend is itself the reference.
+    None when a measured backend is itself the reference. ``view`` declares a
+    chart over several of the kind's configs (:class:`ConfigView`), for a kind
+    whose Rust config carries both of its fields.
     """
 
     title: str
@@ -179,6 +247,7 @@ class KernelDoc:
     subcategory: str | None = None
     caveats: tuple[str, ...] = ()
     reference: str | None = None
+    view: ConfigView | None = None
 
 
 def kernel_doc(kernel_kind: str) -> KernelDoc | None:

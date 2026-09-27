@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from profiling.db.args import DType, KernelArgs
-from profiling.db.doc import CUPTI_METHOD, BackendDoc, KernelDoc, arg
+from profiling.db.doc import CUPTI_METHOD, EP_RANKS_BY_LOAD, BackendDoc, KernelDoc, arg
 from profiling.db.outlier import BatchOutlierPolicy
 from profiling.db.registry import (
     BackendSupport,
@@ -85,6 +85,7 @@ DOC = KernelDoc(
     ),
     # The PyTorch check is private to this measured runner, not a separate reference module.
     reference=None,
+    view=EP_RANKS_BY_LOAD,
 )
 
 

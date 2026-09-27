@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import sqlite3
+from dataclasses import asdict
 from pathlib import Path
 
 import pytest
@@ -15,7 +16,7 @@ from fastapi.testclient import TestClient
 
 from profiling.db import kernel_config
 from profiling.db.args import DType
-from profiling.db.doc import CUPTI_METHOD, KernelDoc, arg_docs
+from profiling.db.doc import CUPTI_METHOD, KernelDoc, arg_docs, kernel_doc
 from profiling.db.registry import iter_kernel_profiler_specs
 from profiling.db.table import ProfileRow, Table
 from profiling.kernels.nvfp4_fused_moe import Nvfp4FusedMoeArgs
@@ -24,7 +25,7 @@ from profiling.runners.metrics import ComputeMetrics
 from public_api.app import PREFIX, create_app
 from public_api.kernel import library
 from public_api.kernel.library import PROVENANCE, KernelLibrary
-from public_api.kernel.sources import KernelSources
+from public_api.kernel.sources import REPO_ROOT, KernelSources
 
 GEMM_COLUMNS = (
     "gpu_name TEXT, backend TEXT, m INTEGER, n INTEGER, k INTEGER, dtype TEXT, "
@@ -72,7 +73,12 @@ SCHEMA = {
                 "moe_x": {
                     "params": [
                         {"name": "ep_size", "type": "int", "default": 4, "affects_cache": True},
-                        {"name": "routing", "type": "string", "choices": ["uniform", "popularity"]},
+                        {
+                            "name": "routing",
+                            "type": "string",
+                            "default": "uniform",
+                            "choices": ["uniform", "popularity", "corpus"],
+                        },
                         {
                             "name": "mtp_mode",
                             "type": "string",
@@ -624,3 +630,147 @@ def test_public_responses_carry_no_source_paths(supported) -> None:
         text = client.get(f"{base}{path}").text
         assert "presets/" not in text and "model/config/" not in text, path
         assert '"source' not in text and '"via"' not in text, path
+
+
+# The routed demand of five nvfp4_fused_moe configs and the arch blocks that
+# built each: the name comes from the blocks, the fingerprint from the demand.
+TRACKED = "presets/alignment/glm52_nvfp4_b200/expert_popularity.json"
+HUB_MANIFEST = "/hub/models--o--corpora/snapshots/abc/run1/manifest.json"
+HUB_REFERENCE = "hf://o/corpora@abc/run1/manifest.json"
+
+
+def _popularity(share: int) -> dict:
+    return {"popularity": {"layerwise_global_ppm": [[share, 1_000_000 - share, 0, 0]]}}
+
+
+CORPUS = {
+    "corpus": {
+        "schema_version": 1,
+        "data_file": "/hub/models--o--corpora/blobs/f00d",
+        "num_tokens": 64,
+        "num_layers": 2,
+        "num_experts": 4,
+        "top_k": 2,
+        "checksum_fnv1a64": 0xABC,
+        "group_size": 6,
+        "layer_start": 0,
+        "layer_end": 1,
+        "seed": 1,
+        "sampling_candidates": 16,
+    }
+}
+
+
+def _moe_run(**routing) -> dict:
+    return {**RUN, "groups": [{"gpu": "NVIDIA B200", "arch": {**MOE_ARCH, **routing}}]}
+
+
+def _nvfp4_record(demand: dict, position: int) -> dict:
+    row = _nvfp4_row("flashinfer_trtllm_sm100").args
+    cell = {**asdict(row), "input_dtype": "bf16", "weight_format": "nvfp4_e2m1"}
+    cell["per_expert_batches"] = list(cell["per_expert_batches"])
+    identity = {
+        **{k: v for k, v in cell.items() if k not in ("num_tokens", "per_expert_batches")},
+        "expert_demand": demand,
+        "folded_rank_position": position,
+    }
+    return {
+        "kind": "nvfp4_fused_moe",
+        "profile_kind": "nvfp4_fused_moe",
+        "gpu_name": "NVIDIA B200",
+        "identity": identity,
+        "grid": {
+            "cache_coords": ["num_tokens"],
+            "axes": [[16.0]],
+            "cells": [cell],
+            "infeasible": [],
+        },
+        "uses": [{"pool": "main", "role": "unified.moe.fused_moe"}],
+    }
+
+
+class HubSources(Nvfp4Sources):
+    def hub_references(self) -> dict[str, str]:
+        return {HUB_MANIFEST: HUB_REFERENCE}
+
+
+@pytest.fixture
+def routings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[TestClient, dict]:
+    monkeypatch.setattr(library, "kernel_doc", kernel_doc)
+    path = tmp_path / "routings.db"
+    for spec in iter_kernel_profiler_specs("nvfp4_fused_moe"):
+        Table(spec, path).insert([_nvfp4_row(spec.backend)])
+    built = {
+        "uniform": (_popularity(250_000), _moe_run(routing="uniform")),
+        "tracked": (_popularity(400_000), _moe_run(expert_popularity_file=TRACKED)),
+        "absolute": (
+            _popularity(500_000),
+            _moe_run(expert_popularity_file=str(REPO_ROOT / TRACKED)),
+        ),
+        "outside": (
+            _popularity(600_000),
+            _moe_run(expert_popularity_file="/elsewhere/run/expert_popularity.json"),
+        ),
+        "corpus": (CORPUS, _moe_run(routing="corpus", token_corpus_file=HUB_MANIFEST)),
+    }
+    hashes = {}
+    for name, (demand, source) in built.items():
+        records = [_nvfp4_record(demand, position) for position in (0, 1)]
+        kernel_config.register_kernel_configs(
+            path,
+            {"schema_version": kernel_config.RECORDS_SCHEMA_VERSION, "configs": records},
+            {"main": source},
+        )
+        hashes[name] = kernel_config.content_hash(records[0]["identity"])
+    client = TestClient(create_app(KernelLibrary(HubSources(db_path=path))))
+    return client, hashes
+
+
+def test_a_kind_doc_declares_its_view(routings) -> None:
+    routed, _ = routings
+    view = routed.get(f"{PREFIX}/kernels/nvfp4_fused_moe").json()["view"]
+    assert view == asdict(kernel_doc("nvfp4_fused_moe").view)
+    assert (view["series"]["field"], view["workload"]["field"]) == (
+        "folded_rank_position",
+        "expert_demand",
+    )
+    assert routed.get(f"{PREFIX}/kernels/moe_finalize_routing").json()["view"] is None
+
+
+def test_each_config_names_its_routing(routings) -> None:
+    client, hashes = routings
+    document = client.get(f"{PREFIX}/kernels/nvfp4_fused_moe/configs").json()
+    names = {
+        c["config_hash"]: c["config_labels"]["expert_demand"]
+        for c in document["configs"]
+        if c["config_args"]["folded_rank_position"] == 0
+    }
+    label = {name: names[h]["label"] for name, h in hashes.items()}
+    assert label["uniform"] == "uniform"
+    # A file this checkout tracks, named relative or absolute: its repo path.
+    assert label["tracked"] == label["absolute"] == TRACKED
+    assert names[hashes["tracked"]]["reference"] == TRACKED
+    # A hub cache file: the reference that fetches it.
+    assert label["corpus"] == names[hashes["corpus"]]["reference"] == HUB_REFERENCE
+    # Any other file: its name and the demand's fingerprint, no path.
+    outside = names[hashes["outside"]]
+    assert outside["reference"] is None
+    assert outside["label"] == f"expert_popularity.json · {outside['fingerprint']}"
+    assert outside["fingerprint"].startswith("sha256:")
+    assert names[hashes["corpus"]]["fingerprint"] == "fnv1a64:0000000000000abc"
+    assert names[hashes["corpus"]]["binding"] == {
+        "group_size": 6,
+        "layer_start": 0,
+        "layer_end": 1,
+    }
+    assert names[hashes["uniform"]]["binding"] == {"layers": 1}
+    # A measured routing is preferred, a corpus first; uniform never leads.
+    order = sorted(names.values(), key=lambda n: n["preference"])
+    assert (order[0]["routing"], order[-1]["routing"]) == ("corpus", "uniform")
+    assert "/elsewhere" not in client.get(f"{PREFIX}/kernels/nvfp4_fused_moe/configs").text
+
+    detail = client.get(
+        f"{PREFIX}/kernels/nvfp4_fused_moe/configs/{hashes['tracked']}",
+        params={"gpu": "NVIDIA B200"},
+    ).json()
+    assert detail["config_labels"]["expert_demand"]["label"] == TRACKED

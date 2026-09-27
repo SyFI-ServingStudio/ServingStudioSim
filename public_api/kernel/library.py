@@ -57,6 +57,7 @@ from profiling.db.registry import MetricFamily, iter_kernel_profiler_specs
 from profiling.db.table import STANDARD_COLUMNS, Table
 from profiling.gpu_catalog import GpuSpecResolution, resolve_gpu_spec
 from profiling.runners.metrics import CommMetrics, ComputeMetrics
+from public_api.kernel import demand
 from public_api.kernel.sources import KernelSources
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -635,6 +636,7 @@ class KernelLibrary:
         types = typing.get_type_hints(schema)
         prose = asdict(doc) if doc else {}
         reference = prose.pop("reference", None)
+        view = prose.pop("view", None)
 
         return {
             "kind": kind,
@@ -669,6 +671,8 @@ class KernelLibrary:
                 for spec in specs
             },
             "reference": self._reference(reference),
+            # a chart over several configs, declared by the kind (ConfigView)
+            "view": view,
             "used_by": deployments,
         }
 
@@ -796,8 +800,49 @@ class KernelLibrary:
 
         return self.sources.cached_by_db(("summaries", kind), compute)
 
-    @staticmethod
-    def _grid(summary: dict) -> dict:
+    def _config_labels(self, kind: str) -> dict[tuple[str, str], dict]:
+        """``{(config_hash, gpu): {field: name}}``: a reader's name for each
+        structured config value the library can name, now the routing
+        (``expert_demand``, :mod:`public_api.kernel.demand`), from the arch
+        blocks of the config's uses on its GPU. Joins profile.db, the binary's
+        arch defaults (``list-params``), git and the local hub cache, so it is
+        kept until profile.db or the binary changes."""
+
+        def routing_default(tag: str | None) -> str | None:
+            params = self._arch_provider(tag).get("params", [])
+            return next((p.get("default") for p in params if p["name"] == demand.PARAM), None)
+
+        def compute() -> dict[tuple[str, str], dict]:
+            named = []
+            for summary in self._summaries(kind):
+                config = summary["config"]
+                if demand.FIELD not in config.identity:
+                    continue
+                archs = [
+                    arch
+                    for use in config.uses
+                    for gpu, arch in _source_archs(use.source)
+                    if gpu == config.gpu_name
+                ]
+                named.append((config, archs))
+            if not named:
+                return {}
+            every = [arch for _, archs in named for arch in archs]
+            tracked = self.sources.tracked(demand.artifact_paths(every))
+            # Scanning the hub cache is for files outside the checkout only.
+            hub = self.sources.hub_references() if demand.names_local_files(every) else {}
+            out = {}
+            for config, archs in named:
+                name = demand.demand_name(
+                    config.identity[demand.FIELD], archs, routing_default, tracked, hub
+                )
+                if name is not None:
+                    out[(config.config_hash, config.gpu_name)] = {demand.FIELD: name}
+            return out
+
+        return self.sources.cached_by_db_and_binary(("config-labels", kind), compute)
+
+    def _grid(self, kind: str, summary: dict) -> dict:
         """What the list and the detail both say about one config's grid."""
 
         config = summary["config"]
@@ -817,6 +862,10 @@ class KernelLibrary:
             # the Rust config's own scalar values, some of which name no DB column
             "config_args": config_args,
             "config_args_omitted": omitted,
+            # a reader's name for structured config values, the routing now
+            "config_labels": self._config_labels(kind).get(
+                (config.config_hash, config.gpu_name), {}
+            ),
         }
 
     def configs(self, kind: str) -> dict:
@@ -832,7 +881,7 @@ class KernelLibrary:
         def compute() -> dict:
             out = [
                 {
-                    **self._grid(summary),
+                    **self._grid(kind, summary),
                     "axes": _axes(summary["config"]),
                     "uses": self._use_deployments(
                         kind, summary["config"].uses, summary["config"].gpu_name
@@ -846,7 +895,7 @@ class KernelLibrary:
                 "configs": out,
             }
 
-        return self.sources.cached_by_db(("configs", kind), compute)
+        return self.sources.cached_by_db_and_binary(("configs", kind), compute)
 
     def config(self, kind: str, config_hash: str, gpu: str | None) -> dict:
         """One registered config's grid on the Rust cache axes: every cell's
@@ -889,7 +938,7 @@ class KernelLibrary:
         uses = self._use_deployments(kind, config.uses, config.gpu_name)
         asked = {d["id"] for use in uses for d in use["deployments"]}
         return {
-            **self._grid(summary),
+            **self._grid(kind, summary),
             "identity": _without_local_paths(config.identity),
             "axes": _axes(config),
             "metrics": metrics,

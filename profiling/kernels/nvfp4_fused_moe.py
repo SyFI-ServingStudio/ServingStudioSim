@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from profiling.db.args import DType, KernelArgs
-from profiling.db.doc import CUPTI_METHOD, BackendDoc, KernelDoc, arg
+from profiling.db.doc import CUPTI_METHOD, EP_RANKS_BY_LOAD, BackendDoc, KernelDoc, arg
 from profiling.db.outlier import BatchOutlierPolicy
 from profiling.db.registry import (
     BackendSupport,
@@ -102,6 +102,7 @@ DOC = KernelDoc(
     ),
     # No separate PyTorch reference module exists for this fused call.
     reference=None,
+    view=EP_RANKS_BY_LOAD,
 )
 
 

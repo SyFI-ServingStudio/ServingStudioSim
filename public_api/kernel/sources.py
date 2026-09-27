@@ -7,7 +7,9 @@ sources here sit behind one small class so tests can replace them with fixtures:
 
 - the release simulator's introspection commands, which print JSON and need no
   GPU, database or Python perf_api (``list-params``, ``kernel-list``);
-- profile.db, opened read-only for every query.
+- profile.db, opened read-only for every query;
+- the files a config's routing names: which of them this checkout tracks (git),
+  and which come from the local Hugging Face hub cache (``scan_cache_dir``).
 
 Introspection answers depend only on the binary, so they are cached until the
 binary changes. Database aggregates are cached until the file, or a file the
@@ -26,6 +28,8 @@ from pathlib import Path
 from typing import Any
 
 from launcher.exec import _build_subprocess_env, binary_path
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 class KernelSources:
@@ -124,3 +128,51 @@ class KernelSources:
 
         binary = self.binary.stat().st_mtime if self.binary.exists() else None
         return self.cached_by_db((key, binary), compute)
+
+    # -- files a config names ----------------------------------------------------
+
+    def tracked(self, paths: list[str]) -> set[str]:
+        """The repo-relative ``paths`` this checkout's git tracks: files a reader
+        of the repository can open at that path. Empty when git cannot say (no
+        checkout)."""
+
+        if not paths:
+            return set()
+        result = subprocess.run(
+            ["git", "ls-files", "-z", "--", *paths],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return set(result.stdout.split("\0")) - {""} if result.returncode == 0 else set()
+
+    def hub_references(self) -> dict[str, str]:
+        """``{local path: hf://<repo>@<revision>/<path>}`` for every model-repo file
+        in the local Hugging Face hub cache, the reference form
+        ``launcher/corpus.py`` resolves to that path. Read with
+        ``huggingface_hub.scan_cache_dir``, once per profile.db change: a new
+        corpus reaches the cache when a run that registers configs fetches it.
+        Empty when there is no cache."""
+
+        def compute() -> dict[str, str]:
+            from huggingface_hub import scan_cache_dir
+            from huggingface_hub.errors import CacheNotFound
+
+            try:
+                cache = scan_cache_dir()
+            except CacheNotFound:
+                return {}
+            out = {}
+            for repo in cache.repos:
+                if repo.repo_type != "model":
+                    continue
+                for revision in repo.revisions:
+                    for file in revision.files:
+                        path = file.file_path.relative_to(revision.snapshot_path).as_posix()
+                        out[str(file.file_path)] = (
+                            f"hf://{repo.repo_id}@{revision.commit_hash}/{path}"
+                        )
+            return out
+
+        return self.cached_by_db("hub-references", compute)
