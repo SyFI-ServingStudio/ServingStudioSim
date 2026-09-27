@@ -28,7 +28,10 @@ it against a fifteen-case campaign.
   - vLLM launches through `vllm serve` with 4 API server processes by
     default, verified from the startup log;
   - the `glm53_flash_fp8_b200_tp4_ep4` campaign pack with 138 label rules;
-  - an analyzer fix for PDL waits parked under a same-stream collective.
+  - an analyzer fix for PDL waits parked under a same-stream collective;
+  - the request-population audit refuses a `trace_timed` simulation whose
+    arrival-time scale differs from the measured replay's by more than 10%.
+    `alignment analyze` exits on it and names the `request_rate` to use.
 
 ## Test Plan
 
@@ -56,9 +59,12 @@ through `compare --markdown`.
 ## Test Result
 
 - Simulator lib: 1143 passed, 8 ignored.
-- Pytest CPU tier: 3896 passed, 6 skipped.
+- Pytest CPU tier: 3904 passed, 5 skipped.
 - Analyzer: 274 passed.
 - Campaign: all 15 cases complete, and all 15 request-population audits pass.
+  - Re-audited with the arrival-scale check: case 09, the one `trace_timed`
+    case, replays at 0.370 on both sides (`--rate 2.7`). The other 14 are
+    saturated, so the check does not apply.
   - Kernel absolute error is 1.15-5.41%. Only case 11 exceeds the 5% tolerance.
   - E2E is within 7% for 14 of 15 cases. Case 11 is -9.99%.
   - TTFT is within 12% for 14 of 15 cases. Case 08 is +15.8%.
