@@ -13,6 +13,13 @@ it against a fifteen-case campaign.
     prefill top-k at the kpool width 512, index remap);
   - mHC on B200, fused q/kv RMSNorm, FP8 group quant, DeepGEMM and cuBLAS
     GEMMs.
+- **One profiling stack, no fork backends.** The existing backends admit the
+  GLM-5.3-Flash shapes: kpool top-k 512, index-table width 2176, rope-free
+  sparse MLA, UE8M0 scale layouts and FP32-input GEMM. `vllm_env` now builds
+  from the fork's vLLM (`3f667d7`, 0.28.1rc0, FlashInfer 0.6.18) as
+  `vibesim-profiler-vllm:cu130-3f667d7e`, replacing the v0.23.0 image. The
+  build bakes every FlashInfer cubin into the image, because workers run with
+  `--network none` and 0.6.18 ships no cubin wheel.
 - **Worklets, ops and the `glm53_flash_vllm_fp8_kda_dsa_moe` arch**:
   - kernels outside the attention graph break run on CUDA-graph-padded rows;
   - the aux-stream shared expert contends with its routed slice;
@@ -32,6 +39,17 @@ it against a fifteen-case campaign.
   - the request-population audit refuses a `trace_timed` simulation whose
     arrival-time scale differs from the measured replay's by more than 10%.
     `alignment analyze` exits on it and names the `request_rate` to use.
+- **Kernel Library (merged from `main`, #53).** GLM-5.3-Flash is a catalog model
+  (`glm53_flash`) with a `#[supported]` row on B200: FP8, TP4, `max_model_len`
+  8192 to 524288. Every kind it runs has a `DOC`, argument docs and a
+  `BackendDoc`, and the registry holds its supported and alignment configs.
+  The alignment sources name the routing corpus on the hub
+  (`hf://UW-SyFI/servingstudio-corpora@869a5d39/glm53_flash_fp8_tp4_ep4`).
+  The merge renamed three kinds and backends to name their mechanism:
+  `deepseek_v4_fused_q_kv_rmsnorm` became `q_kv_rms_norm`, and
+  `torch_mla_{q_absorb,v_up}_glm53` became `torch_mla_q_absorb_no_rope` and
+  `torch_mla_v_up_unpadded`. The FP8 block-scale MoE backend's
+  `weight_format` is now `fp8_e4m3`, which is also its precision.
 
 ## Test Plan
 
@@ -58,6 +76,25 @@ through `compare --markdown`.
 
 ## Test Result
 
+After merging `main` (head `e708af5`):
+
+- `just test-cpu`: simulator lib 1119 passed, 8 ignored; pytest 3535 passed,
+  6 skipped.
+- All 15 campaign cases rerun, on this branch before and after the merge:
+  throughput, SLO, batch, KV, time-share and input-distribution reports are
+  identical, after renaming. Only kernel throughput and optimality differ:
+  main's mHC kinds report bytes, so nine mHC locations gain GB/s and a
+  bandwidth floor. The merged analyzer run on the pre-merge output
+  reproduces the pre-merge optimality exactly.
+
+- Profiling image: `profiling run --fresh` on B200 with the new image
+  reproduces the stored GLM-5.3-Flash rows for all 11 kinds it runs. Large
+  shapes are within about 3%; a few microsecond-scale shapes differ by 4-13%.
+  Rows from GLM-5.2 on v0.23 differ more: rope-64 sparse MLA reads
+  0.82-1.12x on 8 us shapes (see the mixed-version gap below).
+
+Before the merge:
+
 - Simulator lib: 1143 passed, 8 ignored.
 - Pytest CPU tier: 3904 passed, 5 skipped.
 - Analyzer: 274 passed.
@@ -75,20 +112,40 @@ See [the generated matrix](alignment_matrix.md) and
 [the evidence notes and known gaps](README.md). This is review evidence, not an
 accepted baseline, and no golden is recorded.
 
+### Known gap: paged MQA logits decode reads the v0.23 rows
+
+`dsa_paged_mqa_logits_decode` on B200 has 1583 rows measured with the vLLM
+fork's DeepGEMM 2.6.1. They are stored as `deepgemm_fp8_vllm_fork`, a backend
+that is no longer registered. Their keys collide with older `deepgemm_fp8`
+rows measured with vLLM v0.23's DeepGEMM for GLM-5.2. The rename kept the
+older rows, so GLM-5.3-Flash reads v0.23 timings for this kernel. The fork's
+rows are slower: 1.055x at the median, 1.12x at p95 and 1.58x at the maximum.
+180 keys differ by more than 10%. This kernel is likely predicted about 5% too
+fast. Both sides of the before/after comparison read the same rows, so the
+comparison cannot show it.
+
+The follow-up profiling cleanup separates rows by vLLM version with a version
+guard. That lets GLM-5.2 keep the v0.23 rows and GLM-5.3-Flash read the fork's
+rows.
+
+### Known gap: `vllm_env` backends mix vLLM v0.23 and v0.28 rows
+
+The GLM-5.2 and DeepSeek rows in `vllm_env` backends were measured on the
+v0.23.0 image and are not re-profiled here. They sit next to the v0.28
+GLM-5.3-Flash rows in the same backends, told apart only by
+`backend_version`, which lookups ignore. Re-profiling them on the new image is
+follow-up work, along with the version guard above.
+
 ## Dependencies
 
 - vLLM fork `3f667d7` (`servingstudio-alignment`) and req-frontend `e3a400f`;
   unchanged from `main`.
-- **Profiling image upgrade.** `vllm_env` now builds from the same vLLM commit
-  (`3f667d7`, 0.28.1rc0 line; FlashInfer 0.6.18) as
-  `vibesim-profiler-vllm:cu130-3f667d7e`, replacing the v0.23.0 image. The
-  GLM-5.3 kernels use the existing backend names; no fork-specific backend or
-  environment is added.
-- `profiling/profile.db` gains B200 rows for these kernels under those
-  canonical backends (commit `data(profiling): B200 rows for GLM-5.3-Flash
-  FP8`). Existing v0.23 rows are **not** re-profiled, so some backends now mix
-  both vLLM versions, distinguishable only by `backend_version`. Re-profiling
-  them and a version guard are follow-up work.
+- Profiling image `vibesim-profiler-vllm:cu130-3f667d7e`, built by
+  `profiling/container/build.sh` from the same vLLM commit.
+- `profiling/profile.db` gains 12,261 B200 rows for these kernels, all
+  additions (`7a20220`). `592bfd6` moves them from the fork backends to the
+  canonical backend names. It is now 91 MiB, close to GitHub's 100 MiB
+  per-file limit.
 
 ## Contribution licensing
 
