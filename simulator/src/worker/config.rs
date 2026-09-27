@@ -257,6 +257,10 @@ pub enum IterWorkerSel {
         /// by a pure full-attention arch, which has no recurrent state.
         #[serde(default)]
         ssm_checkpoint_interval_tokens: Option<u32>,
+        /// Multiplier (≥ 1.0) for iterations that schedule any prefill tokens.
+        /// See [`IterWorkerSel::ChunkedPrefill`]'s field of the same name.
+        #[serde(default)]
+        prefill_gpu_time_multiplier: Option<f64>,
     },
     /// Multi-group HP/DP worker: maintains one KV partition state per attention
     /// DP shard (count comes from the arch's `num_attn_dp_groups`). Pairs with a
@@ -295,6 +299,10 @@ pub enum IterWorkerSel {
         /// dynamically available attention KV slack.
         #[serde(default)]
         prefix_cache_max_gpu_memory_gb: Option<f64>,
+        /// Multiplier (≥ 1.0) for iterations that schedule any prefill tokens.
+        /// See [`IterWorkerSel::ChunkedPrefill`]'s field of the same name.
+        #[serde(default)]
+        prefill_gpu_time_multiplier: Option<f64>,
     },
     ChunkedPrefill {
         /// GPU memory for the worker (GB; primarily KV cache budget).
@@ -368,6 +376,10 @@ pub enum IterWorkerSel {
         #[serde(default = "default_gpu_time_multiplier")]
         #[param(default = 1.0)]
         gpu_time_multiplier: f64,
+        /// Multiplier (≥ 1.0) for iterations that schedule any prefill tokens.
+        /// See [`IterWorkerSel::ChunkedPrefill`]'s field of the same name.
+        #[serde(default)]
+        prefill_gpu_time_multiplier: Option<f64>,
     },
     /// PD prefill half: prefills then hands off to a decode pool (no local decode).
     PdPrefill {

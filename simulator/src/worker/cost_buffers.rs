@@ -380,11 +380,8 @@ impl CostBuffers {
         // One batch per iteration today; AFD/TBO emit several batches sharing an
         // iter_id with distinct batch_id via `run_section` instead.
         // `run_section_scaled` applies the stage's multiplier and returns wall Time.
-        let multiplier = if arch_input.groups.iter().any(|g| g.prefill_tokens > 0) {
-            self.prefill_gpu_time_multiplier
-        } else {
-            self.gpu_time_multiplier
-        };
+        let multiplier =
+            self.iter_multiplier(arch_input.groups.iter().any(|g| g.prefill_tokens > 0));
         let eval = |slots: &mut Vec<LeafMetrics>,
                     scratch: &mut Vec<LeafMetrics>,
                     inputs: Option<&mut Vec<SlotInput>>| match inputs {
@@ -412,10 +409,20 @@ impl CostBuffers {
         }
     }
 
+    /// The wall-time multiplier of one whole iteration: the prefill one when it
+    /// schedules any prefill tokens, `gpu_time_multiplier` otherwise.
+    fn iter_multiplier(&self, schedules_prefill: bool) -> f64 {
+        if schedules_prefill {
+            self.prefill_gpu_time_multiplier
+        } else {
+            self.gpu_time_multiplier
+        }
+    }
+
     /// [`run_iter`](Self::run_iter) for a speculating model. Same one fused
-    /// `iter` section, evaluated through the speculative face and logged through
-    /// [`SpeculativeGroupLog`] so the row separates decode query rows from
-    /// decode request count.
+    /// `iter` section and stage multiplier, evaluated through the speculative
+    /// face and logged through [`SpeculativeGroupLog`] so the row separates
+    /// decode query rows from decode request count.
     pub fn run_speculative_iter<M: SpeculativeUnifiedModel + ?Sized>(
         &mut self,
         model: &M,
@@ -423,7 +430,9 @@ impl CostBuffers {
         iter_id: u64,
         now: Time,
     ) -> Time {
-        self.run_section(
+        let multiplier =
+            self.iter_multiplier(arch_input.groups.iter().any(|g| g.prefill_tokens > 0));
+        self.run_section_scaled(
             "iter",
             -1,
             iter_id,
@@ -435,6 +444,7 @@ impl CostBuffers {
             },
             None, // one fused eval per iteration — nothing to memoize
             now,
+            multiplier,
             |slots, scratch, inputs| match inputs {
                 Some(i) => model.eval_speculative_iter_with_inputs(arch_input, slots, scratch, i),
                 None => model.eval_speculative_iter(arch_input, slots, scratch),
@@ -763,6 +773,65 @@ mod tests {
             .with_prefill_gpu_time_multiplier(None);
         assert_eq!(single.run_iter(&model, &decode, 0, now).as_ms(), 2.5);
         assert_eq!(single.run_iter(&model, &mixed, 1, now).as_ms(), 2.5);
+    }
+
+    /// The speculative face picks its multiplier by the same prefill test.
+    #[test]
+    fn prefill_multiplier_scales_prefill_bearing_verify_passes() {
+        struct TwoMsSpeculativeModel;
+        impl SpeculativeUnifiedModel for TwoMsSpeculativeModel {
+            fn eval_speculative_iter(
+                &self,
+                _batch: &SpeculativeArchInput,
+                _slots: &mut Vec<LeafMetrics>,
+                _scratch: &mut Vec<LeafMetrics>,
+            ) -> LeafMetrics {
+                LeafMetrics {
+                    m: Metrics4 {
+                        time_ms: 2.0,
+                        flops: 0.0,
+                        bytes: 0.0,
+                        energy_j: 0.0,
+                    },
+                    coverage: CoverageFlags::EMPTY,
+                    backend_index: LeafMetrics::NO_BACKEND,
+                }
+            }
+            fn total_kv_bytes_per_token(&self) -> u64 {
+                1
+            }
+            fn max_model_len(&self) -> u32 {
+                4096
+            }
+            fn gpus_per_replica(&self) -> u16 {
+                1
+            }
+        }
+        let decode = SpeculativeArchInput {
+            draft_tokens: 3,
+            groups: vec![SpeculativeArchGroupInput {
+                batch_tokens: 4,
+                decode_tokens: 4,
+                ..Default::default()
+            }],
+            tokens_per_source_rank: Vec::new(),
+        };
+        let mut mixed = decode.clone();
+        mixed.groups[0].prefill_tokens = 512;
+        mixed.groups[0].batch_tokens += 512;
+        let now = Time::from_ms(0.0);
+
+        let mut staged = CostBuffers::new(None, "iter", WorkerId(0), &trivial_manifest(), 1.25)
+            .with_prefill_gpu_time_multiplier(Some(1.5));
+        let model = TwoMsSpeculativeModel;
+        assert_eq!(
+            staged.run_speculative_iter(&model, &decode, 0, now).as_ms(),
+            2.5
+        );
+        assert_eq!(
+            staged.run_speculative_iter(&model, &mixed, 1, now).as_ms(),
+            3.0
+        );
     }
 
     /// With a logger attached, every call still emits one `cost_log` row (a hit does

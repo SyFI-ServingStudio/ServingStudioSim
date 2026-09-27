@@ -94,8 +94,9 @@ impl Deployment for UnifiedDeployment {
                 prefix_cache_mode,
                 prefix_cache_policy,
                 prefix_cache_max_gpu_memory_gb,
-                // Hybrid-only; read separately so the two arms keep the same
-                // bindings. See `ssm_checkpoint_interval_tokens` below.
+                // Read by `ssm_checkpoint_interval_tokens` and
+                // `prefill_gpu_time_multiplier` below, so the two arms keep the
+                // same bindings.
                 ..
             }
             | IterWorkerSel::HpUnified {
@@ -106,6 +107,7 @@ impl Deployment for UnifiedDeployment {
                 prefix_cache_mode,
                 prefix_cache_policy,
                 prefix_cache_max_gpu_memory_gb,
+                ..
             } => (
                 *attn_gpu_memory_gb,
                 *gpu_time_multiplier,
@@ -729,21 +731,36 @@ fn ssm_checkpoint_interval_tokens(worker: &IterWorkerSel) -> Option<u32> {
     }
 }
 
-/// Prefill-iteration multiplier, carried by the `chunked_prefill` selector only.
+/// Prefill-iteration multiplier of any co-located selector. The PD selectors do
+/// not carry it: every PD prefill iteration schedules prefill and no PD decode
+/// iteration does, so `gpu_time_multiplier` already expresses either stage.
 fn prefill_gpu_time_multiplier(worker: &IterWorkerSel) -> anyhow::Result<Option<f64>> {
-    match worker {
-        IterWorkerSel::ChunkedPrefill {
-            prefill_gpu_time_multiplier: Some(multiplier),
+    let multiplier = match worker {
+        IterWorkerSel::Barebone {
+            prefill_gpu_time_multiplier,
             ..
-        } => {
-            ensure!(
-                multiplier.is_finite() && *multiplier >= 1.0,
-                "unified: prefill_gpu_time_multiplier must be a finite value >= 1.0 (got {multiplier})"
-            );
-            Ok(Some(*multiplier))
         }
-        _ => Ok(None),
+        | IterWorkerSel::HpUnified {
+            prefill_gpu_time_multiplier,
+            ..
+        }
+        | IterWorkerSel::ChunkedPrefill {
+            prefill_gpu_time_multiplier,
+            ..
+        }
+        | IterWorkerSel::Speculative {
+            prefill_gpu_time_multiplier,
+            ..
+        } => *prefill_gpu_time_multiplier,
+        IterWorkerSel::PdPrefill { .. } | IterWorkerSel::PdDecode { .. } => None,
+    };
+    if let Some(multiplier) = multiplier {
+        ensure!(
+            multiplier.is_finite() && multiplier >= 1.0,
+            "unified: prefill_gpu_time_multiplier must be a finite value >= 1.0 (got {multiplier})"
+        );
     }
+    Ok(multiplier)
 }
 
 /// Draft candidate count, carried by the `speculative` selector only. Every other
@@ -898,6 +915,7 @@ mod tests {
             prefix_cache_mode: crate::worker::PrefixCacheMode::Opportunistic,
             prefix_cache_policy: crate::worker::PrefixCachePolicy::Lru,
             prefix_cache_max_gpu_memory_gb: None,
+            prefill_gpu_time_multiplier: None,
         }
     }
 
@@ -911,6 +929,7 @@ mod tests {
             prefix_cache_policy: crate::worker::PrefixCachePolicy::Lru,
             prefix_cache_max_gpu_memory_gb: None,
             ssm_checkpoint_interval_tokens: None,
+            prefill_gpu_time_multiplier: None,
         }
     }
 
@@ -999,43 +1018,51 @@ mod tests {
             prefix_cache_policy,
             prefix_cache_max_gpu_memory_gb,
             ssm_checkpoint_interval_tokens: Some(528),
+            prefill_gpu_time_multiplier: None,
         };
         assert_eq!(ssm_checkpoint_interval_tokens(&overridden), Some(528));
     }
 
     #[test]
-    fn the_prefill_multiplier_is_chunked_prefill_only_and_at_least_one() {
-        assert_eq!(
-            prefill_gpu_time_multiplier(&chunked_prefill_worker()).unwrap(),
-            None
-        );
-        assert_eq!(prefill_gpu_time_multiplier(&hp_worker()).unwrap(), None);
-        let with = |multiplier: f64| {
-            let IterWorkerSel::ChunkedPrefill {
-                attn_gpu_memory_gb,
-                max_batch_tokens,
-                batch_policy,
-                kv_admission,
-                gpu_time_multiplier,
-                ..
-            } = chunked_prefill_worker()
-            else {
-                unreachable!()
-            };
-            IterWorkerSel::ChunkedPrefill {
-                attn_gpu_memory_gb,
-                max_batch_tokens,
-                batch_policy,
-                kv_admission,
-                gpu_time_multiplier,
-                prefill_gpu_time_multiplier: Some(multiplier),
+    fn every_co_located_selector_carries_a_prefill_multiplier_of_at_least_one() {
+        let with = |mut worker: IterWorkerSel, multiplier: f64| {
+            match &mut worker {
+                IterWorkerSel::Barebone {
+                    prefill_gpu_time_multiplier,
+                    ..
+                }
+                | IterWorkerSel::HpUnified {
+                    prefill_gpu_time_multiplier,
+                    ..
+                }
+                | IterWorkerSel::ChunkedPrefill {
+                    prefill_gpu_time_multiplier,
+                    ..
+                }
+                | IterWorkerSel::Speculative {
+                    prefill_gpu_time_multiplier,
+                    ..
+                } => *prefill_gpu_time_multiplier = Some(multiplier),
+                other => panic!("not a co-located selector: {other:?}"),
             }
+            worker
         };
-        assert_eq!(prefill_gpu_time_multiplier(&with(1.2)).unwrap(), Some(1.2));
-        let error = prefill_gpu_time_multiplier(&with(0.9))
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("prefill_gpu_time_multiplier must be a finite value >= 1.0"));
+        for worker in [
+            barebone_worker(),
+            hp_worker(),
+            chunked_prefill_worker(),
+            speculative_worker(3),
+        ] {
+            assert_eq!(prefill_gpu_time_multiplier(&worker).unwrap(), None);
+            assert_eq!(
+                prefill_gpu_time_multiplier(&with(worker.clone(), 1.2)).unwrap(),
+                Some(1.2)
+            );
+            let error = prefill_gpu_time_multiplier(&with(worker, 0.9))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("prefill_gpu_time_multiplier must be a finite value >= 1.0"));
+        }
     }
 
     #[test]
@@ -1112,6 +1139,7 @@ pools:
             batch_policy: BatchPolicy::Mix,
             kv_admission: Default::default(),
             gpu_time_multiplier: 1.0,
+            prefill_gpu_time_multiplier: None,
         }
     }
 
