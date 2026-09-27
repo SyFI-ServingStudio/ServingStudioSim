@@ -1,4 +1,4 @@
-"""GLM-5.3-Flash KDA (Kimi Delta Attention) recurrent decode as one public call.
+"""KDA (Kimi Delta Attention) recurrent decode as one public call.
 
 Wire string: ``"kda_recurrent_decode"``. The facade stem is
 ``get_kda_recurrent_decode_times`` / ``count_missing_kda_recurrent_decode``.
@@ -39,6 +39,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from profiling.db.args import DType, KernelArgs
+from profiling.db.doc import CUPTI_METHOD, BackendDoc, KernelDoc, arg
 from profiling.db.outlier import BatchOutlierPolicy
 from profiling.db.registry import (
     BackendSupport,
@@ -53,10 +54,53 @@ KIND: str = "kda_recurrent_decode"
 
 @dataclass(frozen=True)
 class KdaRecurrentDecodeArgs(KernelArgs):
-    batch_size: int
-    num_heads: int
-    head_dim: int
-    dtype: DType
+    batch_size: int = arg(unit="requests", doc="Requests decoded together, one token each.")
+    num_heads: int = arg(unit="heads", doc="Heads, each with its own query, key, value and state.")
+    head_dim: int = arg(unit="elements", doc="Features in each query, key and value head.")
+    dtype: DType = arg(doc="Element type of the activations, gate input and output.")
+
+
+DOC = KernelDoc(
+    title="KDA recurrent decode",
+    summary="Update each request's KDA state, gated per key channel, and read one output token.",
+    description=(
+        "The core of KDA decode. KDA is a gated delta rule like Gated DeltaNet, "
+        "but its decay gate has one value per key channel instead of one per "
+        "head. vLLM's fused_recurrent_kda call first copies q, k, v and beta out"
+        " of the merged input projection, as four copy launches. One Triton "
+        "kernel then computes the gate from the raw projection, applies the "
+        "beta sigmoid and the q and k L2 norms, updates each request's FP32 "
+        "state in place in a slot-indexed state pool, and writes the output. "
+        "Activations are BF16."
+    ),
+    category="Attention",
+    subcategory="Gated DeltaNet",
+    formula=(
+        "decay = exp(−5·sigmoid(exp(A_log)·(raw_g + dt_bias))), per head and key channel",
+        "q, k = L2Norm(q, k); q = q·head_dim⁻¹ᐟ²; beta = sigmoid(b)",
+        "S′ = diag(decay)·S + k·(beta·(v − kᵀ(diag(decay)·S)))ᵀ; y = qᵀS′",
+        "FLOPs = 7·batch_size·num_heads·head_dim²",
+        "bytes = 10·batch_size·num_heads·head_dim + 2·batch_size·num_heads + "
+        "8·batch_size·num_heads·head_dim²",
+        "TFLOPS = FLOPs / time",
+        "GB/s = bytes / time",
+    ),
+    default_metric="memory_bandwidth_gbps",
+    method=(
+        f"{CUPTI_METHOD} Five warm-up calls run first; the four copies and the "
+        "recurrent kernel are all counted. Every call advances the states in "
+        "place, as vLLM does. Before timing, one call is checked against a "
+        "single-step PyTorch reference and the states are restored."
+    ),
+    caveats=(
+        "Only num_heads = 16 and head_dim = 128 on B200 are measured; the runner "
+        "accepts only head_dim = 128.",
+        "Only a plain decode step is measured, one token per request and no speculative decoding.",
+        "The short causal convolution before the call is a separate kind, gdn_causal_conv_decode.",
+        "GB/s counts each input once and leaves out the copies' extra reads and writes.",
+    ),
+    reference="profiling.runners.attention.kda_recurrent_decode_reference",
+)
 
 
 register(
@@ -76,6 +120,13 @@ register(
         metric_family=MetricFamily.COMPUTE,
         batch_outlier_policy=BatchOutlierPolicy(),
         subprocess_env="vllm_env",
+        doc=BackendDoc(
+            summary=(
+                "vLLM's fused_recurrent_kda: four input copies, then one Triton "
+                "kernel that gates, normalizes and updates the indexed FP32 states."
+            ),
+            url="https://github.com/vllm-project/vllm/blob/main/vllm/models/glm5next/nvidia/ops/third_party/kda/kernels.py",
+        ),
         # vLLM defaults TRITON_CACHE_AUTOTUNING=1, which would let the first
         # shape tuned in a TRITON_CACHE_DIR fix the configs of every later row
         # and process. The runner instead tunes at a documented anchor per

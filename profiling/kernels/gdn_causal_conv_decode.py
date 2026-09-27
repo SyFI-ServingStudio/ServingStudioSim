@@ -40,8 +40,8 @@ DOC = KernelDoc(
         "updating the convolution state."
     ),
     description=(
-        "In Gated DeltaNet layers, decode runs a short depthwise "
-        "causal convolution over each channel: the request's last kernel_size −"
+        "In Gated DeltaNet and KDA layers, decode runs a short "
+        "depthwise causal convolution over each channel: the request's last kernel_size −"
         " 1 samples plus the new token, weighted by that channel's filter, "
         "summed in FP32, then SiLU. The new token is shifted into the "
         "convolution state. Each request has its own state row; inputs are "

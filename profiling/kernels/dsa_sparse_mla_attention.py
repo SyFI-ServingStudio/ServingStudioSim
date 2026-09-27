@@ -28,7 +28,9 @@ class DsaSparseMlaAttentionArgs(KernelArgs):
     num_kv_heads: int = arg(unit="heads", doc="KV heads shared by the query heads.")
     selected_k: int = arg(unit="tokens", doc="Selected index slots per query.")
     latent_dim: int = arg(unit="elements", doc="Compressed KV latent width.")
-    rope_dim: int = arg(unit="elements", doc="Rotary-position width appended to the latent.")
+    rope_dim: int = arg(
+        unit="elements", doc="Rotary-position width appended to the latent; 0 when there is none."
+    )
     value_dim: int = arg(unit="elements", doc="Value and output width per head.")
     softmax_scale: float = arg(unit="multiplier", doc="Multiplier applied to attention scores.")
     q_dtype: DType = arg(doc="Query element type.")
@@ -46,7 +48,7 @@ DOC = KernelDoc(
     description=(
         "In sparse MLA attention, each query head attends only to the cache "
         "tokens the DSA indexer selected. Scores use the compressed "
-        "latent and the rotary part; values are the latent. valid_counts sets "
+        "latent and the rotary part, if any; values are the latent. valid_counts sets "
         "how many of the selected_k slots each query uses, and the rest are "
         "masked. Queries and cache values are synthetic, and the selected "
         "indices follow index_distribution."
@@ -71,6 +73,9 @@ DOC = KernelDoc(
         "Selected positions and tensor values are constructed, not taken from "
         "an indexer or a serving KV cache.",
         "TFLOPS counts all selected_k slots even when fewer are valid.",
+        "torch and vllm_flashmla_bf16 accept only rope_dim = 64 with "
+        "selected_k = 2048; flashinfer_trtllm_fp8 also accepts rope_dim = 0, "
+        "with its own cache layout and selected_k = 2048 or 2176.",
         "GB/s includes 8 bytes per query head for the max-logit and log-sum-exp"
         " outputs, even for backends that return only the attention output.",
     ),

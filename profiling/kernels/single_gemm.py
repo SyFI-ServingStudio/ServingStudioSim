@@ -65,6 +65,7 @@ DOC = KernelDoc(
         "C[m, n] = A[m, k] · B[k, n]",
         "TFLOPS = 2·m·n·k / time",
         "GB/s = (m·k + k·n + m·n) · bytes per element / time",
+        "deepgemm (fp8 in, bf16 out): GB/s = (m·k + k·n + 2·m·n) / time",
     ),
     default_metric="tflops",
     caveats=(
@@ -223,7 +224,9 @@ register(
         doc=BackendDoc(
             summary=(
                 "DeepGEMM fp8_gemm_nt: fp8 A with one scale per token per 128 "
-                "k-elements, fp8 B with one scale per 128×128 block, bf16 output."
+                "k-elements, fp8 B with one scale per 128×128 block, bf16 output. "
+                "On Blackwell the scales are UE8M0, packed into DeepGEMM's layout "
+                "before timing, as vLLM passes them."
             ),
             url="https://github.com/deepseek-ai/DeepGEMM",
         ),

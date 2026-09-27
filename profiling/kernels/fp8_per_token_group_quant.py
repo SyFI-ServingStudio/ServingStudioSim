@@ -41,19 +41,30 @@ DOC = KernelDoc(
         "vLLM's blockwise FP8 path quantizes activations before dense "
         "projections and before the MoE gate/up GEMM. Each row is split into "
         "group_size-element groups, and each group gets one scale rounded up to"
-        " a power of two (UE8M0), stored as FP32 in a column-major [token, "
-        "group] layout that the FP8 GEMM reads."
+        " a power of two (UE8M0). scale_format picks the layout the consuming "
+        "kernel reads: ue8m0_column_major stores FP32 scales in a column-major "
+        "[token, group] layout for Hopper DeepGEMM, ue8m0_row_major stores them"
+        " row-major for the Blackwell FP8 block-scale MoE, and "
+        "ue8m0_packed_int32 packs four one-byte scales per int32 for Blackwell "
+        "DeepGEMM."
     ),
     category="Quantization",
     formula=(
+        "G = hidden_size / group_size; ue8m0_packed_int32: G = ⌈hidden_size / group_size / 4⌉",
         "GB/s = (num_tokens · hidden_size · (BF16 bytes + FP8 bytes) + "
-        "num_tokens · hidden_size / group_size · 4 scale bytes) / time",
+        "num_tokens · G · 4 scale bytes) / time",
     ),
     default_metric="memory_bandwidth_gbps",
-    method=(f"{CUPTI_METHOD} Only per_token_group_quant_8bit_kernel launches are counted."),
+    method=(
+        f"{CUPTI_METHOD} Only the quantization kernel is counted: "
+        "per_token_group_quant_8bit_packed_register_kernel for "
+        "ue8m0_packed_int32, per_token_group_quant_8bit_kernel otherwise."
+    ),
     caveats=(
-        "Only group_size = 128 with UE8M0 column-major scales is measured, on H100 and H200.",
-        "GB/s counts logical BF16 input, FP8 output and FP32 scale bytes, not "
+        "The runner accepts only group_size = 128, with ue8m0_column_major "
+        "scales on H100 and H200 and ue8m0_row_major or ue8m0_packed_int32 "
+        "scales on B200.",
+        "GB/s counts logical BF16 input, FP8 output and scale bytes, not "
         "physical memory transactions.",
     ),
     # No separate PyTorch reference implementation exists for this kind.
@@ -80,7 +91,8 @@ register(
         subprocess_env="vllm_env",
         doc=BackendDoc(
             summary=(
-                "vLLM's per_token_group_fp8_quant CUDA op with UE8M0 scales in column-major layout."
+                "vLLM's per_token_group_fp8_quant CUDA op with UE8M0 scales, or "
+                "per_token_group_fp8_quant_packed for the packed int32 layout."
             ),
             url="https://github.com/vllm-project/vllm/blob/main/csrc/libtorch_stable/quantization/w8a8/fp8/per_token_group_quant.cu",
         ),
