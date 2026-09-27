@@ -474,6 +474,7 @@ pub enum IterArchSel {
     /// GLM-5.3-Flash FP8 block checkpoint on B200 through the vLLM fork: 34 KDA
     /// + 11 DSA (kpool indexer) layers, 3 dense + 42 MoE FFNs, 4-wide mHC. One
     /// TP = EP rank group; MTP is not run.
+    #[supported(gpu = ["NVIDIA B200"], model_config = ["glm53_flash"], fp8 = [true], tp_size = [4], max_model_len = [8192, 65536, 131072, 262144, 524288])]
     Glm53FlashVllmFp8KdaDsaMoe {
         #[serde(flatten)]
         model: ModelSpec,
