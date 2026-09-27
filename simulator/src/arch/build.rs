@@ -1805,6 +1805,12 @@ pub struct SupportedBuild {
     pub error: Option<String>,
 }
 
+/// The dotted-leaf prefix a deployment gives its model, which starts every leaf
+/// name and kernel-config role. Supported builds use the deployment's own, as
+/// `timing-predict` does, so their leaves are named as a real run's are.
+const UNIFIED_MODEL_NAME: &str = "unified";
+const AFD_MODEL_NAME: &str = "afd";
+
 /// Build every `#[supported]` combination of every arch on its row's GPU,
 /// structure only ([`PerfApiBridge::structure_only`]: no Python, `profile.db` or
 /// GPU). A combination that fails to parse or build (including a panicking
@@ -1816,17 +1822,18 @@ pub fn build_supported_archs(kernel_configs: bool) -> Vec<SupportedBuild> {
         "iter_wise",
         IterArchSel::SUPPORTED,
         kernel_configs,
-        |selector: &IterArchSel, gpu, tag, bridge| {
+        |selector: &IterArchSel, gpu, bridge| {
             // A speculative arch builds a different model type, with its
             // own tree: the verify pass plus its draft passes.
             let (gpus, manifest) = match selector {
                 IterArchSel::Glm52VllmNvfp4DsaMoeSpeculative { .. }
                 | IterArchSel::Glm53VllmNvfp4DsaMoeDflash2 { .. } => {
-                    let (model, _) = build_speculative_iter_model(selector, gpu, tag, bridge)?;
+                    let (model, _) =
+                        build_speculative_iter_model(selector, gpu, UNIFIED_MODEL_NAME, bridge)?;
                     (model.gpus_per_replica(), model.cost_log_manifest())
                 }
                 _ => {
-                    let model = build_iter_model(selector, gpu, tag, bridge)?;
+                    let model = build_iter_model(selector, gpu, UNIFIED_MODEL_NAME, bridge)?;
                     (model.gpus_per_replica(), model.cost_log_manifest())
                 }
             };
@@ -1841,8 +1848,8 @@ pub fn build_supported_archs(kernel_configs: bool) -> Vec<SupportedBuild> {
         "layer_wise_attn",
         AttnArchSel::SUPPORTED,
         kernel_configs,
-        |selector: &AttnArchSel, gpu, tag, bridge| {
-            let model = build_attn_model(selector, gpu, tag, bridge)?;
+        |selector: &AttnArchSel, gpu, bridge| {
+            let model = build_attn_model(selector, gpu, AFD_MODEL_NAME, bridge)?;
             Ok((model.gpus_per_replica(), model.cost_log_manifest()))
         },
     ));
@@ -1851,8 +1858,8 @@ pub fn build_supported_archs(kernel_configs: bool) -> Vec<SupportedBuild> {
         "layer_wise_ffn",
         FfnArchSel::SUPPORTED,
         kernel_configs,
-        |selector: &FfnArchSel, gpu, tag, bridge| {
-            let model = build_ffn_model(selector, gpu, tag, bridge)?;
+        |selector: &FfnArchSel, gpu, bridge| {
+            let model = build_ffn_model(selector, gpu, AFD_MODEL_NAME, bridge)?;
             Ok((model.gpus_per_replica(), model.cost_log_manifest()))
         },
     ));
@@ -1867,7 +1874,7 @@ fn supported_builds<S: serde::de::DeserializeOwned>(
     contract: &'static str,
     rows: &'static [(&'static str, &'static [crate::schema::SupportedRow])],
     kernel_configs: bool,
-    build: impl Fn(&S, &str, &str, &PerfApiBridge) -> Result<(u16, crate::timing::CostManifestDoc)>,
+    build: impl Fn(&S, &str, &PerfApiBridge) -> Result<(u16, crate::timing::CostManifestDoc)>,
 ) -> Vec<SupportedBuild> {
     use serde_json::{Map, Value};
 
@@ -1936,7 +1943,7 @@ fn supported_builds<S: serde::de::DeserializeOwned>(
                     bridge.enable_config_records();
                 }
                 let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    build(&selector, &supported.gpu, tag, &bridge)
+                    build(&selector, &supported.gpu, &bridge)
                 }));
                 match built {
                     Ok(Ok((gpus_per_replica, manifest))) => {
@@ -2744,6 +2751,24 @@ mod tests {
                 "{}: empty cost tree",
                 b.arch
             );
+        }
+    }
+
+    /// A supported build names its leaves as a run of its deployment does, so
+    /// its kernel-config roles match the ones runs register.
+    #[test]
+    fn supported_builds_name_leaves_like_their_deployment() {
+        for b in build_supported_archs(false) {
+            let prefix = if b.contract == "iter_wise" {
+                "unified."
+            } else {
+                "afd."
+            };
+            for section in &b.cost_manifest.as_ref().unwrap().sections {
+                for slot in &section.manifest.slots {
+                    assert!(slot.name.starts_with(prefix), "{}: {}", b.arch, slot.name);
+                }
+            }
         }
     }
 
