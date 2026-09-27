@@ -8,6 +8,8 @@ from profiling.profilers.timer import Timer
 from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
 
+_K3_MERGED_FRONT_WIDTH = 15_984
+
 
 def profile_k3_situ_and_mul_prefill(
     num_tokens: int,
@@ -40,12 +42,13 @@ def profile_k3_situ_and_mul_prefill(
 
     try:
         generator = torch.Generator(device="cuda").manual_seed(31)
-        input_tensor = torch.randn(
-            (num_tokens, 2 * hidden_size),
+        merged_front = torch.randn(
+            (num_tokens, max(_K3_MERGED_FRONT_WIDTH, 2 * hidden_size)),
             dtype=torch.float32,
             device="cuda",
             generator=generator,
         )
+        input_tensor = merged_front[:, : 2 * hidden_size]
         output = torch.empty((num_tokens, hidden_size), dtype=torch.bfloat16, device="cuda")
 
         def run_once():

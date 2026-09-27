@@ -29,6 +29,8 @@ class MlaPrefillAttentionArgs(KernelArgs):
     batch_size: int
     q_len: int
     kv_len: int
+    prefix_len: int
+    num_prefix_chunks: int
 
 
 register(

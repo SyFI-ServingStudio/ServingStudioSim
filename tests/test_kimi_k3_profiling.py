@@ -53,6 +53,7 @@ def test_k3_kinds_and_backends_are_registered_without_runner_imports():
 def test_k3_argument_field_order_is_the_db_contract():
     from profiling.kernels.kda_recurrent_decode import KdaRecurrentDecodeArgs
     from profiling.kernels.mla_decode_attention import MlaDecodeAttentionArgs
+    from profiling.kernels.mla_prefill_attention import MlaPrefillAttentionArgs
     from profiling.kernels.mxfp4_fused_moe import Mxfp4FusedMoeArgs
 
     assert [field.name for field in fields(KdaRecurrentDecodeArgs)] == [
@@ -79,6 +80,13 @@ def test_k3_argument_field_order_is_the_db_contract():
         "gemm1_alpha",
         "gemm1_clamp_limit",
         "per_expert_batches",
+    ]
+    assert [field.name for field in fields(MlaPrefillAttentionArgs)][-5:] == [
+        "batch_size",
+        "q_len",
+        "kv_len",
+        "prefix_len",
+        "num_prefix_chunks",
     ]
 
 
@@ -148,6 +156,16 @@ def test_k3_specs_coerce_representative_json_shapes():
         },
     )
     assert moe.per_expert_batches[:16] == (16,) * 16
+
+
+def test_mla_prefill_chunk_contract_covers_a_short_remainder():
+    from profiling.runners.attention.kimi_k3_prefill import _prefix_chunk_lengths
+
+    assert _prefix_chunk_lengths(131_072, 131_072, 1) == (131_072,)
+    assert _prefix_chunk_lengths(245_760, 131_072, 2) == (131_072, 114_688)
+    assert _prefix_chunk_lengths(0, 16_384, 0) == (16_384,)
+    with pytest.raises(ValueError, match="num_prefix_chunks"):
+        _prefix_chunk_lengths(245_760, 131_072, 1)
 
 
 @pytest.mark.parametrize(

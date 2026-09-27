@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
+import tempfile
 from collections.abc import Callable
+from pathlib import Path
 
 from profiling.db.args import DType
 from profiling.profilers.energy import Energy
@@ -11,6 +14,58 @@ from profiling.runners.exceptions import KernelLaunchFailed, ProfilerNotImplemen
 from profiling.runners.metrics import ComputeMetrics
 
 _FUSED_A_MAX_TOKENS = 16
+_K3_BF16_GEMM_INITIALIZED = False
+
+
+def _initialize_k3_bf16_gemm() -> None:
+    """Match the scheduler's ``auto -> cutedsl`` BF16 GEMM initialization.
+
+    Standalone L1 workers do not normally have SGLang's process-wide
+    ``ServerArgs`` context. Publish a minimal valid context, then invoke the
+    same public initializer as the production scheduler.
+    """
+    global _K3_BF16_GEMM_INITIALIZED
+    if _K3_BF16_GEMM_INITIALIZED:
+        return
+
+    from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
+    from sglang.srt.runtime_context import get_exec
+
+    try:
+        get_exec().kernel.bf16_gemm_backend
+    except (AttributeError, KeyError, ValueError):
+        from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+
+        config = {
+            "architectures": ["LlamaForCausalLM"],
+            "model_type": "llama",
+            "hidden_size": 4096,
+            "intermediate_size": 11008,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 32,
+            "vocab_size": 32000,
+            "max_position_embeddings": 4096,
+            "rms_norm_eps": 1e-5,
+            "torch_dtype": "bfloat16",
+        }
+        with tempfile.TemporaryDirectory(prefix="vibesim-sglang-k3-") as config_dir:
+            Path(config_dir, "config.json").write_text(json.dumps(config), encoding="utf-8")
+            set_global_server_args_for_scheduler(
+                ServerArgs(
+                    model_path=config_dir,
+                    dtype="bfloat16",
+                    device="cuda",
+                    tp_size=1,
+                    load_format="dummy",
+                    bf16_gemm_backend="auto",
+                    disable_cuda_graph=True,
+                    disable_radix_cache=True,
+                )
+            )
+
+    initialize_bf16_gemm_config()
+    _K3_BF16_GEMM_INITIALIZED = True
 
 
 def _validate_shape(m: int, n: int, k: int) -> None:
@@ -69,7 +124,6 @@ def profile_single_gemm_sglang_bf16(
 
     try:
         import torch
-        import torch.nn.functional as functional
         import torch.nn.functional as functional
         from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import (
             cutedsl_bf16_gemm,
@@ -155,10 +209,9 @@ def profile_single_gemm_sglang_k3_raw_bf16(
 ) -> ComputeMetrics:
     """Profile K3's eager raw BF16 module-projection path.
 
-    K3's chunked-prefill path deliberately bypasses the module GEMM dispatcher
-    for several merged and deferred projections.  This backend keeps that
-    eager path separate from the decode CuTe-DSL backend while retaining the
-    shared ``single_gemm`` cache schema.
+    K3's chunked-prefill path calls the same raw projection helper as the
+    eager layer. Initialize SGLang's production BF16 dispatcher in this
+    standalone worker while retaining the separate prefill cache backend.
     """
     _validate_shape(m, n, k)
     dtype = DType.from_value(dtype)
@@ -168,20 +221,24 @@ def profile_single_gemm_sglang_k3_raw_bf16(
     try:
         import torch
         import torch.nn.functional as functional
+        from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import (
+            cutedsl_bf16_gemm,
+            use_cutedsl_bf16_gemm,
+        )
     except ImportError as exc:
         raise ProfilerNotImplemented("the SGLang environment is required") from exc
 
     _require_sm100("sglang_k3_raw_bf16")
     try:
+        _initialize_k3_bf16_gemm()
         generator = torch.Generator(device="cuda").manual_seed(31)
         activations = torch.randn(m, k, dtype=torch.bfloat16, device="cuda", generator=generator)
         weight = torch.randn(n, k, dtype=torch.bfloat16, device="cuda", generator=generator)
+        use_cutedsl = use_cutedsl_bf16_gemm(m, n, k)
 
         def kernel():
-            # K3's module projections use F.linear when the production
-            # dispatcher is not initialized for CuTe-DSL. Its cuBLAS
-            # heuristic/layout differs from torch.mm(..., out=...), so keep
-            # the isolated leaf on the same callable.
+            if use_cutedsl:
+                return cutedsl_bf16_gemm(activations, weight, None)
             return functional.linear(activations, weight)
 
         return _measure(

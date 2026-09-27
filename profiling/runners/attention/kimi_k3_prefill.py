@@ -340,12 +340,16 @@ def _build_mla_inputs(
     kv_len: int,
     num_heads: int,
     device: Any,
+    query: Any | None = None,
 ) -> tuple[Any, Any, Any, Any, Any, Any, Any]:
     if min(batch_size, q_len, kv_len) <= 0:
         raise ValueError("MLA batch and lengths must be positive")
-    q = torch.randn(
-        (batch_size * q_len, num_heads, _K3_QK_DIM), dtype=torch.bfloat16, device=device
-    ).to(torch.float8_e4m3fn)
+    if query is None:
+        q = torch.randn(
+            (batch_size * q_len, num_heads, _K3_QK_DIM), dtype=torch.bfloat16, device=device
+        ).to(torch.float8_e4m3fn)
+    else:
+        q = query
     k = torch.randn(
         (batch_size * kv_len, num_heads, _K3_QK_DIM),
         dtype=torch.bfloat16,
@@ -365,6 +369,32 @@ def _build_mla_inputs(
     return q, k, v, cum_q, cum_kv, seq_lens, out
 
 
+def _prefix_chunk_lengths(
+    prefix_len: int, chunk_len: int, num_prefix_chunks: int
+) -> tuple[int, ...]:
+    if prefix_len < 0 or chunk_len <= 0 or num_prefix_chunks < 0:
+        raise ValueError("MLA prefix lengths and chunk count must be non-negative")
+    if prefix_len == 0:
+        if num_prefix_chunks != 0:
+            raise ValueError("a causal MLA row must have num_prefix_chunks=0")
+        return (chunk_len,)
+    expected_chunks = (prefix_len + chunk_len - 1) // chunk_len
+    if num_prefix_chunks != expected_chunks:
+        raise ValueError(
+            "num_prefix_chunks must equal ceil(prefix_len / kv_len): "
+            f"got {num_prefix_chunks}, expected {expected_chunks}"
+        )
+    lengths = []
+    remaining = prefix_len
+    for _ in range(num_prefix_chunks):
+        current = min(chunk_len, remaining)
+        lengths.append(current)
+        remaining -= current
+    if remaining:
+        raise AssertionError("MLA prefix chunks did not cover prefix_len")
+    return tuple(lengths)
+
+
 def profile_mla_prefill_attention_sglang_trtllm(
     num_heads: int,
     qk_head_dim: int,
@@ -376,6 +406,8 @@ def profile_mla_prefill_attention_sglang_trtllm(
     batch_size: int,
     q_len: int,
     kv_len: int,
+    prefix_len: int,
+    num_prefix_chunks: int,
 ) -> ComputeMetrics:
     q_dtype = DType.from_value(q_dtype)
     kv_dtype = DType.from_value(kv_dtype)
@@ -397,52 +429,78 @@ def profile_mla_prefill_attention_sglang_trtllm(
     except ImportError as exc:
         raise ProfilerNotImplemented("FlashInfer is required for K3 MLA prefill") from exc
     device = _require_b200(torch, "mla_prefill_attention")
+    batch_size = int(batch_size)
+    q_len = int(q_len)
+    kv_len = int(kv_len)
+    prefix_len = int(prefix_len)
+    num_prefix_chunks = int(num_prefix_chunks)
+    if causal and prefix_len != 0:
+        raise ValueError("causal MLA attention cannot have a cached prefix")
+    if not causal and prefix_len == 0:
+        raise ValueError("prefix MLA attention requires prefix_len > 0")
+    chunk_lengths = _prefix_chunk_lengths(prefix_len, kv_len, num_prefix_chunks)
     q, k, v, cum_q, cum_kv, seq_lens, out = _build_mla_inputs(
         torch,
-        batch_size=int(batch_size),
-        q_len=int(q_len),
-        kv_len=int(kv_len),
+        batch_size=batch_size,
+        q_len=q_len,
+        kv_len=chunk_lengths[0],
         num_heads=int(num_heads),
         device=device,
     )
+    launches = [(k, v, cum_q, cum_kv, seq_lens, out, chunk_lengths[0])]
+    for chunk_len in chunk_lengths[1:]:
+        _, k, v, cum_q, cum_kv, seq_lens, out = _build_mla_inputs(
+            torch,
+            batch_size=batch_size,
+            q_len=q_len,
+            kv_len=chunk_len,
+            num_heads=int(num_heads),
+            device=device,
+            query=q,
+        )
+        launches.append((k, v, cum_q, cum_kv, seq_lens, out, chunk_len))
     workspace = _common.make_workspace()
 
     def kernel() -> Any:
-        return flashinfer.prefill.trtllm_ragged_attention_deepseek(
-            query=q,
-            key=k,
-            value=v,
-            workspace_buffer=workspace,
-            batch_size=int(batch_size),
-            window_left=-1,
-            enable_pdl=False,
-            max_q_len=int(q_len),
-            bmm1_scale=_K3_QK_DIM**-0.5,
-            bmm2_scale=1.0,
-            cum_seq_lens_q=cum_q,
-            cum_seq_lens_kv=cum_kv,
-            seq_lens=seq_lens,
-            max_kv_len=int(kv_len),
-            is_causal=bool(causal),
-            # The chunked-prefix handler requests LSE for both its prefix and
-            # causal passes; the causal leaf is shared with the no-prefix path.
-            return_lse=True,
-            o_sf_scale=-1.0 if not causal else 1.0,
-            out=out,
-            skip_softmax_threshold_scale_factor=0,
-        )
+        result = None
+        for k, v, cum_q, cum_kv, seq_lens, out, chunk_len in launches:
+            result = flashinfer.prefill.trtllm_ragged_attention_deepseek(
+                query=q,
+                key=k,
+                value=v,
+                workspace_buffer=workspace,
+                batch_size=batch_size,
+                window_left=-1,
+                enable_pdl=False,
+                max_q_len=q_len,
+                bmm1_scale=_K3_QK_DIM**-0.5,
+                bmm2_scale=1.0,
+                cum_seq_lens_q=cum_q,
+                cum_seq_lens_kv=cum_kv,
+                seq_lens=seq_lens,
+                max_kv_len=chunk_len,
+                is_causal=bool(causal),
+                # The chunked-prefix handler requests LSE for both its prefix and
+                # causal passes; the causal leaf is shared with the no-prefix path.
+                return_lse=True,
+                o_sf_scale=-1.0 if not causal else 1.0,
+                out=out,
+                skip_softmax_threshold_scale_factor=0,
+            )
+        return result
 
     kernel()
     torch.cuda.synchronize(device)
-    work = int(batch_size) * int(q_len) * int(kv_len)
+    work = sum(batch_size * q_len * chunk_len for chunk_len in chunk_lengths)
     if causal:
-        work = int(batch_size) * int(q_len) * (2 * int(kv_len) - int(q_len)) // 2
+        work = batch_size * q_len * (2 * chunk_lengths[0] - q_len) // 2
     flops = 2 * work * int(num_heads) * (int(qk_head_dim) + int(v_head_dim))
-    bytes_accessed = (
+    bytes_accessed = sum(
         q.numel() * q.element_size()
         + k.numel() * k.element_size()
         + v.numel() * v.element_size()
         + out.numel() * out.element_size()
+        for k, v, _cum_q, _cum_kv, _seq_lens, out, _chunk_len in launches
     )
     return _measure(kernel, flops=flops, bytes_accessed=bytes_accessed)
 

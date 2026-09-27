@@ -703,6 +703,7 @@ struct PrefillSummary {
     q_len: u32,
     prefix_len: u32,
     prefix_chunk_tokens: u32,
+    num_prefix_chunks: u32,
 }
 
 fn prefill_summary(input: &KimiK3MlaLocalWorkletInput) -> Option<PrefillSummary> {
@@ -732,12 +733,18 @@ fn prefill_summary(input: &KimiK3MlaLocalWorkletInput) -> Option<PrefillSummary>
     } else {
         prefix_len.min(MAX_KV_CHUNK_CAPACITY / batch_size.max(1))
     };
+    let num_prefix_chunks = if prefix_chunk_tokens == 0 {
+        0
+    } else {
+        (prefix_len + prefix_chunk_tokens - 1) / prefix_chunk_tokens
+    };
     Some(PrefillSummary {
         batch_size,
         num_tokens,
         q_len,
         prefix_len,
         prefix_chunk_tokens,
+        num_prefix_chunks,
     })
 }
 
@@ -778,6 +785,8 @@ fn eval_prefill(
                 batch_size: 0,
                 q_len: 0,
                 kv_len: 0,
+                prefix_len: 0,
+                num_prefix_chunks: 0,
             },
             true,
             evaluator,
@@ -788,6 +797,8 @@ fn eval_prefill(
                 batch_size: 0,
                 q_len: 0,
                 kv_len: 0,
+                prefix_len: 0,
+                num_prefix_chunks: 0,
             },
             true,
             evaluator,
@@ -825,6 +836,8 @@ fn eval_prefill(
             batch_size: summary.batch_size,
             q_len: summary.q_len,
             kv_len: summary.prefix_chunk_tokens,
+            prefix_len: summary.prefix_len,
+            num_prefix_chunks: summary.num_prefix_chunks,
         },
         summary.prefix_chunk_tokens == 0,
         evaluator,
@@ -835,6 +848,8 @@ fn eval_prefill(
             batch_size: summary.batch_size,
             q_len: summary.q_len,
             kv_len: summary.q_len,
+            prefix_len: 0,
+            num_prefix_chunks: 0,
         },
         false,
         evaluator,
@@ -986,6 +1001,16 @@ mod tests {
         assert_eq!(summary.num_tokens, 16_384);
         assert_eq!(summary.q_len, 16_384);
         assert_eq!(summary.prefix_chunk_tokens, 49_152);
+        assert_eq!(summary.num_prefix_chunks, 1);
+
+        let input = KimiK3MlaLocalWorkletInput {
+            batch_tokens: 16_384,
+            decode_kv_lens: Vec::new(),
+            prefill_chunk_pairs: vec![(245_760, 16_384)],
+        };
+        let summary = prefill_summary(&input).unwrap();
+        assert_eq!(summary.prefix_chunk_tokens, 131_072);
+        assert_eq!(summary.num_prefix_chunks, 2);
 
         let input = KimiK3MlaLocalWorkletInput {
             batch_tokens: 16_384,
@@ -997,5 +1022,6 @@ mod tests {
         assert_eq!(summary.num_tokens, 16_384);
         assert_eq!(summary.q_len, 4_096);
         assert_eq!(summary.prefix_chunk_tokens, 0);
+        assert_eq!(summary.num_prefix_chunks, 0);
     }
 }

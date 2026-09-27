@@ -30,6 +30,8 @@ def profile_gemm_fp32_output_sglang_k3(
             use_cutedsl_bf16_gemm,
         )
         from sglang.srt.layers.quantization.unquant import get_bf16_gemm_backend
+
+        from profiling.runners.gemm.sglang import _initialize_k3_bf16_gemm
     except ImportError as exc:
         raise ProfilerNotImplemented("the SGLang environment is required") from exc
     if not torch.cuda.is_available():
@@ -38,6 +40,7 @@ def profile_gemm_fp32_output_sglang_k3(
         raise ProfilerNotImplemented(f"{_BACKEND} requires SM100")
 
     try:
+        _initialize_k3_bf16_gemm()
         generator = torch.Generator(device="cuda").manual_seed(31)
         hidden = torch.randn((m, k), dtype=torch.bfloat16, device="cuda", generator=generator)
         weight = torch.randn((n, k), dtype=torch.bfloat16, device="cuda", generator=generator)

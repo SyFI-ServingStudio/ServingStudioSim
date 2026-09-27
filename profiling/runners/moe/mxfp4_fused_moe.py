@@ -23,6 +23,8 @@ _SUPPORTED_NUM_EXPERTS = frozenset({_NUM_LOCAL_EXPERTS, _GLOBAL_NUM_EXPERTS})
 _TOP_K = 16
 _RANK_LOCAL_TOP_K = 2
 _EPILOGUE_TILE_M = 128
+_K3_MERGED_FRONT_WIDTH = 15_984
+_K3_MERGED_FRONT_GATE_UP_WIDTH = 12_288
 
 
 def _validate_args(**kwargs: Any) -> dict[str, Any]:
@@ -273,11 +275,19 @@ def _profile_mxfp4_fused_moe(
             dtype=torch.float32,
             device=device,
         )
-        hidden_states = torch.randn(
-            (args["num_tokens"], args["hidden_size"]),
-            dtype=torch.bfloat16,
+        # K3's fused front emits one FP32 [gate_up | router | latent] buffer.
+        # The routed slice remains strided until production MXFP8 preparation;
+        # a contiguous BF16 tensor selects a different prefill tactic.
+        front = torch.randn(
+            (args["num_tokens"], _K3_MERGED_FRONT_WIDTH),
+            dtype=torch.float32,
             device=device,
         )
+        hidden_states = front[
+            :,
+            _K3_MERGED_FRONT_GATE_UP_WIDTH : _K3_MERGED_FRONT_GATE_UP_WIDTH
+            + args["hidden_size"],
+        ]
         hidden_states, hidden_states_scale = per_token_group_quant(
             hidden_states, group_size=_GROUP_SIZE, scale_ue8m0=True
         )
