@@ -90,7 +90,11 @@ def test_the_launcher_hides_every_device_for_its_children(monkeypatch, flag):
 
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1")
     if flag:
-        monkeypatch.delenv(NO_GPU_ENV, raising=False)
+        # setenv first so teardown restores the variable the launcher sets; a
+        # delenv of an unset variable records nothing and the "1" would leak
+        # into later tests on this worker.
+        monkeypatch.setenv(NO_GPU_ENV, "0")
+        monkeypatch.delenv(NO_GPU_ENV)
     else:
         monkeypatch.setenv(NO_GPU_ENV, "1")
     seen = []
