@@ -27,6 +27,9 @@ class DType(StrEnum):
     FP8_E5M2 = "fp8_e5m2"
     INT8 = "int8"
     INT4 = "int4"
+    # Packed e2m1 elements with one fp8 scale per 16-element group: the operand
+    # format of Blackwell FP4 tensor cores. No torch dtype holds it unpacked.
+    NVFP4_E2M1 = "nvfp4_e2m1"
 
     @classmethod
     def from_value(cls, value: Any) -> DType:
@@ -55,6 +58,7 @@ class DType(StrEnum):
             DType.FP8_E5M2: 1,
             DType.INT8: 1,
             DType.INT4: 0.5,
+            DType.NVFP4_E2M1: 0.5,
         }[self]
 
     # Keep framework conversions lazy so importing DB schemas does not import

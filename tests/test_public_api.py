@@ -18,6 +18,7 @@ from profiling.db.args import DType
 from profiling.db.doc import CUPTI_METHOD, KernelDoc, arg_docs
 from profiling.db.registry import iter_kernel_profiler_specs
 from profiling.db.table import ProfileRow, Table
+from profiling.kernels.nvfp4_fused_moe import Nvfp4FusedMoeArgs
 from profiling.kernels.single_gemm import SingleGemmArgs
 from profiling.runners.metrics import ComputeMetrics
 from public_api.app import PREFIX, create_app
@@ -186,6 +187,70 @@ def test_kernel_detail_joins_docs_roles_and_shapes(registered) -> None:
     assert deployment["sources"] == ["timing_predict"]
     (shape,) = deployment["shapes"]
     assert shape == {"layer": "unified.qkv", "pool": "main", "db": QKV, "config_hash": qkv}
+
+
+def _nvfp4_row(backend: str) -> ProfileRow:
+    return ProfileRow(
+        args=Nvfp4FusedMoeArgs(
+            num_tokens=16,
+            hidden_size=6144,
+            intermediate_size=2048,
+            num_experts=4,
+            num_local_experts=4,
+            top_k=2,
+            input_dtype=DType.BF16,
+            weight_format=DType.NVFP4_E2M1,
+            group_size=16,
+            routing_method="minimax2",
+            n_group=1,
+            topk_group=1,
+            routed_scaling_numerator=5,
+            routed_scaling_denominator=2,
+            per_expert_batches=(8, 8, 8, 8),
+        ),
+        metrics=ComputeMetrics(time_ms=0.05, tflops=100.0, memory_bandwidth_gbps=1.0),
+        gpu_name="NVIDIA B200",
+        backend=backend,
+        profiler_git_hash="abc",
+        profiler_run_at="2026-09-26T00:00:00+00:00",
+    )
+
+
+class Nvfp4Sources(FixtureSources):
+    """The kind's compute dtype is the field Rust tags `#[compute_dtype]`
+    (`Nvfp4FusedMoeKernelConfig::COMPUTE_DTYPE_FIELD`, pinned in Rust and
+    against the binary below)."""
+
+    def kernel_list(self) -> list[dict]:
+        return [{"kind": "nvfp4_fused_moe", "compute_dtype": "weight_format", "kv_dtype": None}]
+
+
+def test_nvfp4_fused_moe_precision_is_its_nvfp4_compute_dtype(tmp_path: Path) -> None:
+    path = tmp_path / "nvfp4.db"
+    for spec in iter_kernel_profiler_specs("nvfp4_fused_moe"):
+        Table(spec, path).insert([_nvfp4_row(spec.backend)])
+    client = TestClient(create_app(KernelLibrary(Nvfp4Sources(db_path=path))))
+
+    catalog = client.get(f"{PREFIX}/kernels").json()
+    kernel = next(k for k in catalog["kernels"] if k["kind"] == "nvfp4_fused_moe")
+    # Not bf16: that is input_dtype, the activation before in-kernel quantization.
+    assert kernel["precisions"] == ["nvfp4_e2m1"]
+    assert catalog["precisions"] == ["nvfp4_e2m1"]
+    (b200,) = catalog["gpus"]
+    assert b200["peaks"]["tflops"] == {"by_dtype": {"nvfp4_e2m1": 9000.0}, "note": "dense"}
+
+    detail = client.get(f"{PREFIX}/kernels/nvfp4_fused_moe").json()
+    assert [a["name"] for a in detail["args"] if a["precision"]] == ["weight_format"]
+    types = {a["name"]: a["type"] for a in detail["args"]}
+    assert types["weight_format"] == types["input_dtype"] == "dtype"
+    assert {b["supports"]["compute"][0] for b in detail["backends"].values()} == {"nvfp4_e2m1"}
+
+
+@pytest.mark.needs_binary
+def test_the_binary_tags_nvfp4_weight_format_as_the_compute_dtype(tmp_path: Path) -> None:
+    entries = KernelSources(db_path=tmp_path / "unused.db").kernel_list()
+    (entry,) = [e for e in entries if e["kind"] == "nvfp4_fused_moe"]
+    assert entry["compute_dtype"] == "weight_format"
 
 
 def test_kernel_without_a_registered_config_has_unknown_roles(client: TestClient) -> None:

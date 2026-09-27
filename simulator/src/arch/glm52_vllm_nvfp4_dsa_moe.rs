@@ -571,7 +571,7 @@ fn build_configs_for_decode(
             gpu_name: gpu.clone(),
             quant_backends: NVFP4_QUANT_BACKENDS.to_vec(),
             moe_backends: NVFP4_FUSED_MOE_BACKENDS.to_vec(),
-            weight_format: "nvfp4_e2m1".to_string(),
+            weight_format: DType::Nvfp4E2m1,
             group_size: 16,
             routing_method: "minimax2".to_string(),
             n_group: 1,
@@ -2672,7 +2672,7 @@ mod tests {
         for rank in &cfg.nvfp4_moe {
             assert_eq!(rank.quant_backends, vec!["vllm_cuda"]);
             assert_eq!(rank.moe_backends, vec!["flashinfer_trtllm_sm100"]);
-            assert_eq!(rank.weight_format, "nvfp4_e2m1");
+            assert_eq!(rank.weight_format, DType::Nvfp4E2m1);
             assert_eq!(rank.group_size, 16);
             assert_eq!(rank.routing_method, "minimax2");
         }

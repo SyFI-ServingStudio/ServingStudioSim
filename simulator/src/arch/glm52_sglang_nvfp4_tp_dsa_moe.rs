@@ -337,7 +337,7 @@ pub fn build_configs(
             gpu_name: gpu.clone(),
             quant_backends: NVFP4_QUANT_BACKENDS.to_vec(),
             moe_backends: NVFP4_MOE_BACKENDS.to_vec(),
-            weight_format: "nvfp4_e2m1".to_string(),
+            weight_format: DType::Nvfp4E2m1,
             group_size: 16,
             routing_method: "minimax2".to_string(),
             n_group: 1,

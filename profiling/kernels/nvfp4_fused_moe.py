@@ -35,7 +35,13 @@ class Nvfp4FusedMoeArgs(KernelArgs):
     )
     top_k: int = arg(unit="experts", doc="Experts selected for each token.")
     input_dtype: DType = arg(doc="Element type before the hidden states are quantized to NVFP4.")
-    weight_format: str = arg(doc="Packed expert weight format; this backend requires nvfp4_e2m1.")
+    weight_format: DType = arg(
+        doc=(
+            "Packed expert weight format, and the tensor-core precision: the call"
+            " quantizes activations to it, so both GEMM operands are NVFP4."
+            " This backend requires nvfp4_e2m1."
+        )
+    )
     group_size: int = arg(unit="elements", doc="Elements sharing one NVFP4 scale.")
     routing_method: str = arg(doc="Router selection rule; this backend accepts minimax2.")
     n_group: int = arg(unit="groups", doc="Expert groups considered by the router.")
@@ -103,7 +109,7 @@ register(
         kernel_kind=KIND,
         backend="flashinfer_trtllm_sm100",
         supports=BackendSupport(
-            compute=frozenset({DType.BF16}),
+            compute=frozenset({DType.NVFP4_E2M1}),
             gpus=frozenset({"NVIDIA B200"}),
         ),
         runner_ref=RunnerRef(
@@ -130,7 +136,7 @@ register(
         kernel_kind=KIND,
         backend="flashinfer_trtllm_sm100_deferred_finalize",
         supports=BackendSupport(
-            compute=frozenset({DType.BF16}),
+            compute=frozenset({DType.NVFP4_E2M1}),
             gpus=frozenset({"NVIDIA B200"}),
         ),
         runner_ref=RunnerRef(

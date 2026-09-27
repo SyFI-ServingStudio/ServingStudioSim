@@ -217,7 +217,7 @@ mod tests {
                 num_local_experts: Dim::param("num_local_experts", NUM_LOCAL_EXPERTS),
                 top_k: TOP_K,
                 input_dtype: DType::Bf16,
-                weight_format: "nvfp4_e2m1".to_string(),
+                weight_format: DType::Nvfp4E2m1,
                 group_size: 16,
                 routing_method: "minimax2".to_string(),
                 n_group: 1,

@@ -55,6 +55,8 @@ class GpuSpecResolution:
     fp16_tflops: float | None = None
     bf16_tflops: float | None = None
     fp8_tflops: float | None = None
+    # Optional in the catalog: only FP4-capable GPUs (Blackwell) declare it.
+    fp4_tflops: float | None = None
     fp32_tflops: float | None = None
     int8_tops: float | None = None
     interconnect: str | None = None
@@ -72,6 +74,10 @@ class GpuSpecResolution:
         is unrecognized or the GPU lacks that dtype — callers must not draw a fake
         line for ``None``."""
         normalized = dtype.strip().lower()
+        # Before the fp8 tokens: NVFP4 carries fp8 group scales, and its compute
+        # dtype must never read as fp8.
+        if any(token in normalized for token in ("nvfp4", "e2m1", "fp4")):
+            return self.fp4_tflops
         if any(token in normalized for token in ("fp8", "e4m3", "e5m2")):
             return self.fp8_tflops
         if normalized in ("int8",):
@@ -126,6 +132,7 @@ def resolve_gpu_spec(name: str, root: Path | None = None) -> GpuSpecResolution |
             fp16_tflops=_number(gpu, "fp16_tflops"),
             bf16_tflops=_number(gpu, "bf16_tflops"),
             fp8_tflops=_number(gpu, "fp8_tflops"),
+            fp4_tflops=_number(gpu, "fp4_tflops"),
             fp32_tflops=_number(gpu, "fp32_tflops"),
             int8_tops=_number(gpu, "int8_tops"),
             interconnect=_string_or_none(gpu, "interconnect"),
