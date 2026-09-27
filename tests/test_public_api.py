@@ -38,28 +38,6 @@ GEMM_ROWS = [
     ("NVIDIA H200", "torch", 8, 4096, 4096, "bf16", 0.02, 13.0, 150.0, None, *PROV),
     ("NVIDIA B200", "torch_linear", 8, 6144, 4096, "fp16", 0.01, 40.0, 300.0, None, *PROV),
 ]
-QKV_CONFIG = {"n": {"value": 6144, "expression": "qkv", "bindings": {"tp": 1}}, "k": 4096}
-BUILD = {
-    "arch": "llama3_dense_tp",
-    "gpu": "NVIDIA H200",
-    "params": {"model_config": "llama3_8b", "tp_size": 1},
-    "gpus_per_replica": 1,
-    "error": None,
-    "cost_manifest": {
-        "sections": [
-            {
-                "section": "iter",
-                "slots": [
-                    {"name": "attn.qkv_proj", "kind": "single_gemm", "kernel_config": QKV_CONFIG},
-                    # A rank copy of the same leaf is listed once.
-                    {"name": "attn.qkv_proj", "kind": "single_gemm", "kernel_config": QKV_CONFIG},
-                ],
-            }
-        ]
-    },
-}
-
-
 GEMM_DOC = KernelDoc(
     title="Dense GEMM",
     summary="One matrix multiply.",
@@ -90,13 +68,6 @@ SCHEMA = {
                         {"gpu": ["NVIDIA H200"], "model_config": ["llama3_8b"], "tp_size": [1, 4]}
                     ],
                 },
-                # The same tag under another contract: a build's `contract` picks.
-                "attn_x": {
-                    "params": [
-                        {"name": "ep_size", "type": "int", "default": 1, "affects_cache": True}
-                    ],
-                    "supported": [{"gpu": ["NVIDIA H200"], "ep_size": [1]}],
-                },
                 "moe_x": {
                     "params": [
                         {"name": "ep_size", "type": "int", "default": 4, "affects_cache": True},
@@ -112,16 +83,6 @@ SCHEMA = {
                     ]
                 },
             },
-            "layer_wise_attn": {
-                "attn_x": {
-                    "params": [
-                        {"name": "tp_size", "type": "int", "default": 1, "affects_cache": True}
-                    ],
-                    "supported": [
-                        {"gpu": ["NVIDIA H200"], "model_config": ["llama3_8b"], "tp_size": [2]}
-                    ],
-                }
-            },
         }
     },
 }
@@ -130,21 +91,11 @@ SCHEMA = {
 class FixtureSources(KernelSources):
     """Real profile.db access, canned simulator introspection."""
 
-    def supported_builds(self) -> list[dict]:
-        return [BUILD]
-
     def deployment_schema(self) -> dict:
         return SCHEMA
 
     def kernel_list(self) -> list[dict]:
         return [{"kind": "single_gemm", "compute_dtype": "dtype", "kv_dtype": None}]
-
-    def rows_report(self, kind: str, config: dict) -> dict:
-        assert (kind, config) == ("single_gemm", QKV_CONFIG)
-        return {
-            "fixed": {"backend": "torch", "n": 6144, "k": 4096, "dtype": "bf16"},
-            "swept": ["m"],
-        }
 
 
 @pytest.fixture
@@ -183,8 +134,9 @@ def test_catalog_lists_every_kind_with_coverage_and_models(client: TestClient) -
     assert {"gpu": "NVIDIA B200", "backend": "torch_linear", "precision": "fp16", "rows": 1} in (
         gemm["coverage"]
     )
-    assert gemm["used_by"] == ["llama3_8b"]
-    # A kind with no table and no supported deployment is still listed.
+    # No registered config reads its rows yet.
+    assert gemm["used_by"] == []
+    # A kind with no table and no registered config is still listed.
     assert kernels["rms_norm"]["rows"] == 0 and kernels["rms_norm"]["used_by"] == []
     assert [g["name"] for g in catalog["gpus"]] == ["NVIDIA H200", "NVIDIA B200"]
     peaks = catalog["gpus"][0]["peaks"]
@@ -196,10 +148,11 @@ def test_catalog_lists_every_kind_with_coverage_and_models(client: TestClient) -
     assert catalog["models"][0]["model_config"] == "llama3_8b"
 
 
-def test_a_catalog_edit_shows_without_a_restart(client: TestClient) -> None:
+def test_a_catalog_edit_shows_without_a_restart(registered) -> None:
+    client, _, _ = registered
+
     def model(document: dict) -> dict:
-        [deployment] = document["used_by"]
-        return deployment["model"]
+        return document["used_by"][0]["model"]
 
     assert model(client.get(f"{PREFIX}/kernels/single_gemm").json())["name"] == "Llama 3 8B"
     library.MODEL_CATALOG.write_text("llama3_8b: {name: Llama 3 8B Base, family: Llama}\n")
@@ -208,7 +161,8 @@ def test_a_catalog_edit_shows_without_a_restart(client: TestClient) -> None:
     assert models[0]["name"] == "Llama 3 8B Base"
 
 
-def test_kernel_detail_joins_docs_roles_and_shapes(client: TestClient) -> None:
+def test_kernel_detail_joins_docs_roles_and_shapes(registered) -> None:
+    client, (qkv, _), _ = registered
     kernel = client.get(f"{PREFIX}/kernels/single_gemm").json()
     roles = {a["name"]: a["role"] for a in kernel["args"]}
     assert roles == {"m": "sweep", "n": "config", "k": "config", "dtype": "config"}
@@ -223,53 +177,18 @@ def test_kernel_detail_joins_docs_roles_and_shapes(client: TestClient) -> None:
     assert kernel["metrics"][1] == {"name": "tflops", "label": "Throughput", "unit": "TFLOPS"}
     assert set(kernel["backends"]["torch"]) >= {"summary", "url", "supports", "env"}
     assert kernel["method"].startswith(CUPTI_METHOD)
-    (deployment,) = kernel["used_by"]
+    deployment = kernel["used_by"][0]
     assert deployment["model"]["name"] == "Llama 3 8B"
-    assert deployment["params"] == {"tp_size": 1}
-    assert deployment["label"] == "llama3_dense_tp, tp_size 1"
-    assert (deployment["sources"], deployment["gpus_per_replica"]) == (["supported"], 1)
+    assert (deployment["params"], deployment["label"]) == (
+        {"tp_size": 4},
+        "llama3_dense_tp, tp_size 4",
+    )
+    assert deployment["sources"] == ["timing_predict"]
     (shape,) = deployment["shapes"]
-    assert shape["db"] == {"n": 6144, "k": 4096, "dtype": "bf16"}
-    assert shape["why"] == {"n": {"expression": "qkv", "bindings": {"tp": 1}}}
-    assert shape["config_hash"] is None
+    assert shape == {"layer": "unified.qkv", "pool": "main", "db": QKV, "config_hash": qkv}
 
 
-class LayerWiseSources(FixtureSources):
-    """A layer-wise supported build: its cost manifest has several sections."""
-
-    def supported_builds(self) -> list[dict]:
-        slot = {"kind": "single_gemm", "kernel_config": QKV_CONFIG}
-        return [
-            {
-                "arch": "attn_x",
-                "contract": "layer_wise_attn",
-                "gpu": "NVIDIA H200",
-                "params": {"model_config": "llama3_8b", "tp_size": 2},
-                "gpus_per_replica": 2,
-                "error": None,
-                "cost_manifest": {
-                    "sections": [
-                        {"section": "attn", "slots": [{"name": "attn.qkv_proj", **slot}]},
-                        {"section": "post_attn", "slots": [{"name": "attn.o_proj", **slot}]},
-                    ]
-                },
-            }
-        ]
-
-
-def test_layer_wise_builds_read_every_section_under_their_contract(db: Path) -> None:
-    client = TestClient(create_app(KernelLibrary(LayerWiseSources(db_path=db))))
-    (deployment,) = client.get(f"{PREFIX}/kernels/single_gemm").json()["used_by"]
-    # The layer-wise attn_x's supported rows name tp_size; the iter-wise tag of
-    # the same name would have named ep_size.
-    assert deployment["label"] == "attn_x, tp_size 2"
-    assert [(s["section"], s["layer"]) for s in deployment["shapes"]] == [
-        ("attn", "attn.qkv_proj"),
-        ("post_attn", "attn.o_proj"),
-    ]
-
-
-def test_kernel_without_a_supported_deployment_has_unknown_roles(client: TestClient) -> None:
+def test_kernel_without_a_registered_config_has_unknown_roles(client: TestClient) -> None:
     kernel = client.get(f"{PREFIX}/kernels/rms_norm").json()
     assert kernel["used_by"] == []
     assert {a["role"] for a in kernel["args"]} == {None}
@@ -495,8 +414,7 @@ def test_registered_configs_add_models_to_catalog_and_detail(registered) -> None
     client, (_, gate), _ = registered
     catalog = client.get(f"{PREFIX}/kernels").json()
     gemm = next(k for k in catalog["kernels"] if k["kind"] == "single_gemm")
-    # The supported Llama deployment, then the registry's MoE model the catalog
-    # does not name.
+    # The catalog's Llama, then the MoE model the catalog does not name.
     assert gemm["used_by"] == ["llama3_8b", "moe_x"]
     assert catalog["models"][-1] == {
         "model_config": "moe_x",
@@ -509,15 +427,11 @@ def test_registered_configs_add_models_to_catalog_and_detail(registered) -> None
     assert {a["name"]: a["role"] for a in kernel["args"]}["m"] == "sweep"
     labels = [d["label"] for d in kernel["used_by"]]
     # Catalog order, then the uncatalogued model.
-    assert labels == [
-        "llama3_dense_tp, tp_size 1",
-        "llama3_dense_tp, tp_size 4",
-        "moe_x, ep_size 8, mtp_mode off",
-    ]
+    assert labels == ["llama3_dense_tp, tp_size 4", "moe_x, ep_size 8, mtp_mode off"]
     moe = kernel["used_by"][-1]
     assert moe["sources"] == ["preset"]
     [shape] = moe["shapes"]
-    assert (shape["layer"], shape["section"], shape["config_hash"]) == (
+    assert (shape["layer"], shape["pool"], shape["config_hash"]) == (
         "unified.moe.gate",
         "main",
         gate,

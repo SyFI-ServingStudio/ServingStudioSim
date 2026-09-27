@@ -247,30 +247,19 @@ class KernelLibrary:
 
         return self.sources.cached_by_db(("coverage", kind), compute)
 
-    def _slots(self):
-        """``(build, section, slot)`` for every leaf of every supported cost tree."""
-
-        for build in self.sources.supported_builds():
-            if build["error"]:
-                raise RuntimeError(f"{build['arch']} {build['params']}: {build['error']}")
-            for section in build["cost_manifest"]["sections"]:
-                for slot in section["slots"]:
-                    yield build, section, slot
-
     # -- models and deployments ------------------------------------------------------
 
-    def _arch_provider(self, tag: str | None, contract: str | None = None) -> dict:
+    def _arch_provider(self, tag: str | None) -> dict:
         """The arch tag's ``list-params`` entry: ``params`` and ``supported`` rows.
-        ``contract`` (``iter_wise``, ``layer_wise_attn``, ...) narrows the search
-        when the caller knows it; a registry source does not say."""
+        A registry source names the tag but not its contract (``iter_wise``,
+        ``layer_wise_attn``, ...), and each tag lives under one contract."""
 
-        contracts = self.sources.deployment_schema()["providers"]["arch"]
-        for name, providers in contracts.items():
-            if contract in (None, name) and tag in providers:
+        for providers in self.sources.deployment_schema()["providers"]["arch"].values():
+            if tag in providers:
                 return providers[tag]
         return {}
 
-    def _deployment(self, gpu: str, arch: dict, contract: str | None = None) -> dict:
+    def _deployment(self, gpu: str, arch: dict) -> dict:
         """One arch block on one GPU as the site names it: the model it runs and
         a label of the arch and its deployment params.
 
@@ -282,17 +271,17 @@ class KernelLibrary:
         label. A param the block leaves out takes its schema default."""
 
         deployment = self.sources.cached_by_binary(
-            ("deployment", canonical_json([gpu, arch, contract])),
-            lambda: self._label(gpu, arch, contract),
+            ("deployment", canonical_json([gpu, arch])),
+            lambda: self._label(gpu, arch),
         )
         # name, family, checkpoint; null for a model not in model/catalog.yaml.
         # Looked up here, not in the binary-keyed label: the catalog changes on
         # its own.
         return {**deployment, "model": self.models.get(deployment["model_config"])}
 
-    def _label(self, gpu: str, arch: dict, contract: str | None) -> dict:
+    def _label(self, gpu: str, arch: dict) -> dict:
         tag = arch.get("type")
-        provider = self._arch_provider(tag, contract)
+        provider = self._arch_provider(tag)
         own = provider.get("params", [])
         rows = provider.get("supported", [])
         if rows:
@@ -368,80 +357,36 @@ class KernelLibrary:
 
         return self.sources.cached_by_db("registry-models", compute)
 
-    def _supported_models(self) -> dict[str, set[str]]:
-        out: dict[str, set[str]] = {}
-        for build, _, slot in self._slots():
-            out.setdefault(slot["kind"], set()).add(build["params"]["model_config"])
-        return out
-
     def _used_by(self, kind: str) -> tuple[list[dict], set[str]]:
         """The deployments that run ``kind``, each with the shapes it asks for, and
-        the columns those shapes sweep.
-
-        Two sources: the cost tree of every ``#[supported]`` deployment, and the
-        uses of every registered kernel config (the presets, predictions and
-        supported rows that built it). A shape is the profile.db columns one
-        leaf fixes; a supported leaf adds the expression and bindings behind each
-        config value, a registered one its ``config_hash``. Rank copies of one
-        leaf share name and config and are listed once.
-        """
+        the columns those shapes sweep, from the kernel-config registry: every
+        registered config's uses (the presets, predictions, alignment packs and
+        ``#[supported]`` deployments that built it). A shape is the profile.db
+        columns one leaf fixes, with the config that holds them."""
 
         deployments: dict[str, dict] = {}
         swept: set[str] = set()
-
-        def entry(deployment: dict, source: str) -> dict:
-            key = self._deployment_key(deployment)
-            if key not in deployments:
-                deployments[key] = {
-                    **deployment,
-                    "gpus_per_replica": None,
-                    "sources": set(),
-                    "shapes": {},
-                }
-            deployments[key]["sources"].add(source)
-            return deployments[key]
-
-        def add_shape(target: dict, layer: str, section: str, db: dict, **extra) -> None:
-            shape = target["shapes"].setdefault(
-                canonical_json([layer, db]),
-                {"layer": layer, "section": section, "db": db, "why": {}, "config_hash": None},
-            )
-            shape.update({k: v for k, v in extra.items() if v})
-
-        for build, section, slot in self._slots():
-            if slot["kind"] != kind:
-                continue
-            config = slot["kernel_config"]
-            report = self.sources.rows_report(kind, config)
-            swept.update(report["swept"])
-            arch = {"type": build["arch"], **build["params"]}
-            deployment = self._deployment(build["gpu"], arch, build.get("contract"))
-            target = entry(deployment, "supported")
-            target["gpus_per_replica"] = build["gpus_per_replica"]
-            add_shape(
-                target,
-                slot["name"],
-                section["section"],
-                {k: v for k, v in report["fixed"].items() if k != "backend"},
-                why={
-                    k: {"expression": v["expression"], "bindings": v["bindings"]}
-                    for k, v in config.items()
-                    if isinstance(v, dict) and v.get("expression")
-                },
-            )
-
         for summary in self._summaries(kind):
             config = summary["config"]
             swept.update(summary["swept"])
             for use in config.uses:
                 via = _source_via(use.source)["type"]
                 for deployment in self._source_deployments(use.source, config.gpu_name):
-                    add_shape(
-                        entry(deployment, via),
-                        use.role,
-                        use.pool,
-                        summary["fixed"],
-                        config_hash=config.config_hash,
+                    key = self._deployment_key(deployment)
+                    target = deployments.setdefault(
+                        key, {**deployment, "sources": set(), "shapes": {}}
+                    )
+                    target["sources"].add(via)
+                    # One leaf per role and shape: rank copies and repeat
+                    # registrations of it are listed once.
+                    target["shapes"].setdefault(
+                        canonical_json([use.role, config.config_hash]),
+                        {
+                            "layer": use.role,
+                            "pool": use.pool,
+                            "db": summary["fixed"],
+                            "config_hash": config.config_hash,
+                        },
                     )
 
         out = [
@@ -457,14 +402,11 @@ class KernelLibrary:
         """Every registered kind with its coverage and the models that run it.
 
         A kind's ``used_by`` is the model configs (keys of ``models``) of every
-        supported deployment whose cost tree holds it and of every registered
-        config that reads its rows, in ``models`` order. ``models`` is
+        registered config that reads its rows, in ``models`` order. ``models`` is
         ``model/catalog.yaml`` in its order, then any model a kind names that
         the catalog does not, with ``name`` null."""
 
-        models_by_kind = self._supported_models()
-        for kind, stems in self._registry_models().items():
-            models_by_kind.setdefault(kind, set()).update(stems)
+        models_by_kind = self._registry_models()
         named = set().union(*models_by_kind.values()) if models_by_kind else set()
         stems = sorted(set(self.models) | named, key=self._model_rank)
 
@@ -554,8 +496,7 @@ class KernelLibrary:
                 {
                     "name": name,
                     "type": _arg_type(types[name]),
-                    # Unknown until a supported deployment or a registered config runs
-                    # the kind.
+                    # Unknown until a registered config runs the kind.
                     "role": ("sweep" if name in swept else "config") if deployments else None,
                     # The column holding the compute dtype, which picks the throughput peak.
                     "precision": name == precision,

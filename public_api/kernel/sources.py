@@ -6,8 +6,7 @@ the model catalog) is code in this checkout and is imported directly. The two
 sources here sit behind one small class so tests can replace them with fixtures:
 
 - the release simulator's introspection commands, which print JSON and need no
-  GPU, database or Python perf_api (``supported-cost-trees``, ``list-params``,
-  ``kernel-list``, ``kernel-query`` op ``rows``);
+  GPU, database or Python perf_api (``list-params``, ``kernel-list``);
 - profile.db, opened read-only for every query.
 
 Introspection answers depend only on the binary, so they are cached until the
@@ -72,13 +71,6 @@ class KernelSources:
             self._binary_cache[key] = value
         return value
 
-    def supported_builds(self) -> list[dict]:
-        """Every ``#[supported]`` arch deployment with its cost manifest."""
-
-        return self.cached_by_binary(
-            "supported-cost-trees", lambda: self._simulator(["supported-cost-trees"])
-        )
-
     def deployment_schema(self) -> dict:
         """``list-params``: every arch tag's params (type, default, whether it
         affects the kernel cache) and its ``#[supported]`` rows."""
@@ -89,15 +81,6 @@ class KernelSources:
         """Every Rust kernel kind with its config/input fields and dtype fields."""
 
         return self.cached_by_binary("kernel-list", lambda: self._simulator(["kernel-list"]))
-
-    def rows_report(self, kind: str, config: dict) -> dict:
-        """``kernel-query`` op ``rows`` for one cost tree leaf config: which
-        profile.db columns it fixes and which it sweeps."""
-
-        request = json.dumps({"op": "rows", "kind": kind, "config": config}, sort_keys=True)
-        return self.cached_by_binary(
-            ("rows", request), lambda: self._simulator(["kernel-query"], stdin=request)
-        )
 
     # -- profile.db ----------------------------------------------------------------
 

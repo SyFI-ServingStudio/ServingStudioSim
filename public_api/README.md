@@ -28,7 +28,7 @@ All `GET`, under `/api/public/v1`.
 | --- | --- |
 | `/health` | `status` and the Sim commit served |
 | `/kernels` | Catalog: every registered kind with its docs summary, backends, precisions, row coverage per GPU/backend/precision, and the models that run it (`used_by`, model-config stems); plus categories, GPUs with spec-sheet peaks, and models (the model catalog in its order, then any model a kind names that the catalog does not, with `name` null) |
-| `/kernels/{kind}` | One kind: docs, measuring method, arguments with role (swept or fixed by the model) and unit, backends, torch reference, and each deployment that runs it (from the supported cost trees and the registered configs' uses) with its model, label, sources and the shapes it asks for |
+| `/kernels/{kind}` | One kind: docs, measuring method, arguments with role (swept or fixed by the model) and unit, backends, torch reference, and each deployment that runs it (from the registered configs' uses, which include every `#[supported]` deployment once registered) with its model, label, sources and the shapes it asks for (the role, pool, fixed columns and config of each leaf) |
 | `/kernels/{kind}/rows` | Measured rows, column-oriented with a shared provenance table. Any query parameter filters a column by equality (`gpu`, `backend` or an argument); `format=csv` returns CSV |
 | `/kernels/{kind}/configs` | The kernel configs registered as reading the kind's rows (profile.db's kernel-config registry), one per config and GPU: the profile.db args every cell shares (`fixed`) and the ones the cache axes move (`swept`), the Rust config's scalar values, cache coordinates and axes, cells measured per backend, and each use (pool, role) pointing into shared `sources` and `deployments` tables. No identity: it can run to megabytes |
 | `/kernels/{kind}/configs/{config_hash}` | One config's grid on the simulator's cache axes: each cell's coordinates, profile.db args, whether the kernel can run it, and each backend's measured metrics there; plus the full identity and each use with its source, deployments and model. `gpu` is required only when the config is registered on more than one GPU |
@@ -51,9 +51,8 @@ of listed choices (file paths stay out). A source is what built a config:
 - which GPUs, models and parallel sizes an arch runs: `#[supported(...)]` on the arch
   variant in `simulator/src/arch/config.rs`, and model names in `model/catalog.yaml`
   (reread when it changes, no restart);
-- cost trees, compute dtype columns and swept/fixed columns: `simulator
-  supported-cost-trees`, `simulator kernel-list` and `simulator kernel-query` (op
-  `rows`), and arch params and `#[supported]` rows: `simulator list-params`, all
+- compute dtype columns: `simulator kernel-list`; arch params and `#[supported]`
+  rows: `simulator list-params`; both
   cached until the binary changes (`public_api/kernel/sources.py`);
 - GPU peaks: `gpu/spec.json`;
 - measurements: `profile.db`, aggregates cached until the file changes;
