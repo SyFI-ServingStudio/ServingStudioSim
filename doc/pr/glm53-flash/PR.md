@@ -23,7 +23,7 @@ it against a fifteen-case campaign.
   `HybridGdnKv` store for Qwen3.6 local and GLM-5.3-Flash. It carries vLLM's
   Mamba `align` chunk-end quantum.
 - **`prefill_gpu_time_multiplier`** for iterations that schedule prefill
-  tokens. It is a calibration knob.
+  tokens, on every co-located worker selector. It is a calibration knob.
 - **Alignment infrastructure:**
   - vLLM launches through `vllm serve` with 4 API server processes by
     default, verified from the startup log;
