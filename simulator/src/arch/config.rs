@@ -488,7 +488,7 @@ pub enum IterArchSel {
         #[param(default = 8192, cache_key)]
         max_model_len: u32,
         #[serde(default)]
-        #[param(string, default = "uniform", choices = ROUTING_KINDS)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS, set_when_predicting)]
         routing: RoutingKind,
         #[serde(default)]
         routing_seed: Option<u64>,
@@ -989,7 +989,7 @@ mod iter_tests {
                 );
             }
         }
-        assert_eq!(routed, 13);
+        assert_eq!(routed, 14);
     }
 }
 // ── layer-wise attn / ffn contract (AFD)────────────────────────────────────
