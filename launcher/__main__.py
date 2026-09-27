@@ -523,6 +523,12 @@ def main(argv: list[str] | None = None) -> int:
 
         return migrate_artifact_kinds(argv[1:])
 
+    # POC: M*-Sim experiment manifests (see launcher/mstar_experiment/cli.py).
+    if argv and argv[0] == "mstar-experiment":
+        from .mstar_experiment.cli import main as run_mstar_experiment
+
+        return run_mstar_experiment(argv[1:])
+
     # `list-params` subcommand short-circuits before any preset handling.
     if argv and argv[0] == "list-params":
         human = "--human" in argv[1:]
