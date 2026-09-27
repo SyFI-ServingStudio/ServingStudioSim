@@ -11,7 +11,8 @@ sources here sit behind one small class so tests can replace them with fixtures:
 - profile.db, opened read-only for every query.
 
 Introspection answers depend only on the binary, so they are cached until the
-binary changes. Database aggregates are cached until the file changes.
+binary changes. Database aggregates are cached until the file, or a file the
+library registers with :meth:`KernelSources.watch` (the model catalog), changes.
 """
 
 from __future__ import annotations
@@ -38,7 +39,8 @@ class KernelSources:
         self._binary_cache: dict[Any, Any] = {}
         self._binary_stamp: float | None = None
         self._db_cache: dict[Any, Any] = {}
-        self._db_stamp: tuple[float, int] | None = None
+        self._db_stamp: tuple | None = None
+        self._watched: list[Path] = []
 
     # -- simulator introspection -------------------------------------------------
 
@@ -110,11 +112,17 @@ class KernelSources:
         finally:
             conn.close()
 
-    def cached_by_db(self, key: Any, compute: Callable[[], Any]) -> Any:
-        """``compute()``, reused until profile.db changes."""
+    def watch(self, path: Path) -> None:
+        """Also drop the :meth:`cached_by_db` results when ``path`` changes."""
 
-        stat = self.db_path.stat()
-        stamp = (stat.st_mtime, stat.st_size)
+        self._watched.append(Path(path))
+
+    def cached_by_db(self, key: Any, compute: Callable[[], Any]) -> Any:
+        """``compute()``, reused until profile.db or a watched file changes."""
+
+        stamp = tuple(
+            (st.st_mtime, st.st_size) for st in map(Path.stat, [self.db_path, *self._watched])
+        )
         with self._lock:
             if stamp != self._db_stamp:
                 self._db_cache.clear()

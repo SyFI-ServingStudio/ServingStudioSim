@@ -49,7 +49,8 @@ of listed choices (file paths stay out). A source is what built a config:
 - kernel prose: `DOC`, `arg(...)` and `BackendDoc` in `profiling/kernels/<kind>.py`
   (`profiling/db/doc.py`), and the profiling registry;
 - which GPUs, models and parallel sizes an arch runs: `#[supported(...)]` on the arch
-  variant in `simulator/src/arch/config.rs`, and model names in `model/catalog.yaml`;
+  variant in `simulator/src/arch/config.rs`, and model names in `model/catalog.yaml`
+  (reread when it changes, no restart);
 - cost trees, compute dtype columns and swept/fixed columns: `simulator
   supported-cost-trees`, `simulator kernel-list` and `simulator kernel-query` (op
   `rows`), and arch params and `#[supported]` rows: `simulator list-params`, all

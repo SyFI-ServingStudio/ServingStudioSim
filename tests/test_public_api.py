@@ -196,6 +196,18 @@ def test_catalog_lists_every_kind_with_coverage_and_models(client: TestClient) -
     assert catalog["models"][0]["model_config"] == "llama3_8b"
 
 
+def test_a_catalog_edit_shows_without_a_restart(client: TestClient) -> None:
+    def model(document: dict) -> dict:
+        [deployment] = document["used_by"]
+        return deployment["model"]
+
+    assert model(client.get(f"{PREFIX}/kernels/single_gemm").json())["name"] == "Llama 3 8B"
+    library.MODEL_CATALOG.write_text("llama3_8b: {name: Llama 3 8B Base, family: Llama}\n")
+    assert model(client.get(f"{PREFIX}/kernels/single_gemm").json())["name"] == "Llama 3 8B Base"
+    models = client.get(f"{PREFIX}/kernels").json()["models"]
+    assert models[0]["name"] == "Llama 3 8B Base"
+
+
 def test_kernel_detail_joins_docs_roles_and_shapes(client: TestClient) -> None:
     kernel = client.get(f"{PREFIX}/kernels/single_gemm").json()
     roles = {a["name"]: a["role"] for a in kernel["args"]}

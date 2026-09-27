@@ -185,8 +185,16 @@ class KernelLibrary:
         self.specs: dict[str, list] = {}
         for spec in iter_kernel_profiler_specs():
             self.specs.setdefault(spec.kernel_kind, []).append(spec)
-        self.models = yaml.safe_load(MODEL_CATALOG.read_text()) or {}
+        sources.watch(MODEL_CATALOG)
         self.sim_commit = _git_commit()
+
+    @property
+    def models(self) -> dict[str, dict]:
+        """``model/catalog.yaml``, reread when it changes."""
+
+        return self.sources.cached_by_db(
+            "model-catalog", lambda: yaml.safe_load(MODEL_CATALOG.read_text()) or {}
+        )
 
     # -- per-kind facts ------------------------------------------------------------
 
@@ -273,10 +281,14 @@ class KernelLibrary:
         of listed choices; free-form strings such as file paths stay out of the
         label. A param the block leaves out takes its schema default."""
 
-        return self.sources.cached_by_binary(
+        deployment = self.sources.cached_by_binary(
             ("deployment", canonical_json([gpu, arch, contract])),
             lambda: self._label(gpu, arch, contract),
         )
+        # name, family, checkpoint; null for a model not in model/catalog.yaml.
+        # Looked up here, not in the binary-keyed label: the catalog changes on
+        # its own.
+        return {**deployment, "model": self.models.get(deployment["model_config"])}
 
     def _label(self, gpu: str, arch: dict, contract: str | None) -> dict:
         tag = arch.get("type")
@@ -305,8 +317,6 @@ class KernelLibrary:
             "arch": tag,
             "gpu": gpu,
             "model_config": model_config,
-            # name, family, checkpoint; null for a model not in model/catalog.yaml
-            "model": self.models.get(model_config),
             "params": params,
             "label": ", ".join([tag, *(f"{n} {v}" for n, v in zip(params, text))]),
         }
