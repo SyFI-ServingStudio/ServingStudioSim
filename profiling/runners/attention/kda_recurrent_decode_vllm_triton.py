@@ -285,7 +285,7 @@ def profile_kda_recurrent_decode_vllm_triton(
             backend=_BACKEND,
             module_name=_MODULE,
             callable_name=_CALLABLE,
-            environment_label="the vllm_fork_env (alignment vLLM fork)",
+            environment_label="vllm_env",
         )
         device = torch.device("cuda", torch.cuda.current_device())
         pin_autotune(torch, callable_, shape, device=device)

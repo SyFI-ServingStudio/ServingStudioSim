@@ -79,7 +79,7 @@ register(
         args_schema=AllReduceFusionArgs,
         metric_family=MetricFamily.COMM,
         batch_outlier_policy=BatchOutlierPolicy(),
-        subprocess_env="vllm_fork_env",
+        subprocess_env="vllm_env",
         gpu_count_fn=lambda spec: int(spec["num_gpus"]),
         list_native=True,
     )

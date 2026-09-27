@@ -41,4 +41,3 @@ Every number is read from a completed Analyzer report by the formula table in
 - `ep4_tp4_dp1/11_long_prefill_ladder_c1` **iteration_cycle_mean_pct** -9.99% exceeds 8
 - `ep4_tp4_dp1/11_long_prefill_ladder_c1` **e2e_mean_pct** -9.99% exceeds 7
 - `ep4_tp4_dp1/11_long_prefill_ladder_c1` **output_tps_pct** +11.12% exceeds 8
-

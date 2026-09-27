@@ -88,28 +88,28 @@ const SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: u32 = 256;
 const SHARED_EXPERTS_STREAM_OVERLAP: f32 = 0.9;
 
 const BF16_GEMM_BACKENDS: &[&str] = &["torch_linear_vllm"];
-const FP8_GEMM_BACKENDS: &[&str] = &["deepgemm_vllm_fork"];
-const FP8_QUANT_BACKENDS: &[&str] = &["vllm_fork_cuda"];
+const FP8_GEMM_BACKENDS: &[&str] = &["deepgemm"];
+const FP8_QUANT_BACKENDS: &[&str] = &["vllm_cuda"];
 const ROUTER_GEMM_BACKENDS: &[&str] = &["torch_cublas"];
-const FP32_GEMM_BACKENDS: &[&str] = &["torch_cublas_vllm_fork"];
+const FP32_GEMM_BACKENDS: &[&str] = &["torch_cublas"];
 const ELEMENTWISE_BACKENDS: &[&str] = &["triton"];
 const MHC_BACKENDS: &[&str] = &["vllm_tilelang"];
 const RMS_NORM_BACKENDS: &[&str] = &["vllm_cuda"];
 const KDA_BACKENDS: &[&str] = &["vllm_triton"];
 const CONV_BACKENDS: &[&str] = &["vllm_triton"];
-const QKV_NORM_BACKENDS: &[&str] = &["vllm_fork_triton"];
+const QKV_NORM_BACKENDS: &[&str] = &["vllm_triton"];
 const Q_ABSORB_BACKENDS: &[&str] = &["torch_mla_q_absorb_glm53"];
 const V_UP_BACKENDS: &[&str] = &["torch_mla_v_up_glm53"];
-const MQA_LOGITS_BACKENDS: &[&str] = &["deepgemm_fp8_vllm_fork"];
-const TOPK_BACKENDS: &[&str] = &["vllm_fork_cuda"];
+const MQA_LOGITS_BACKENDS: &[&str] = &["deepgemm_fp8"];
+const TOPK_BACKENDS: &[&str] = &["vllm_cuda"];
 /// The fork's `fp8_fp4_mqa_logits` is DeepGEMM's `sm100_mqa_logits`; the
 /// packaged `deepgemm_fp8` rows time the same kernel (0.573 ms at 2048 x 65536
 /// against 0.55 ms measured at a 261K-token context in capture 20260925_4).
 const MQA_LOGITS_PREFILL_BACKENDS: &[&str] = &["deepgemm_fp8"];
-const TOPK_PREFILL_BACKENDS: &[&str] = &["vllm_fork_cuda"];
-const SPARSE_ATTN_BACKENDS: &[&str] = &["flashinfer_trtllm_fp8_vllm_fork"];
+const TOPK_PREFILL_BACKENDS: &[&str] = &["vllm_cuda"];
+const SPARSE_ATTN_BACKENDS: &[&str] = &["flashinfer_trtllm_fp8"];
 const MLA_APPEND_BACKENDS: &[&str] = &["vllm_cuda"];
-const INDEX_REMAP_BACKENDS: &[&str] = &["vllm_fork_triton"];
+const INDEX_REMAP_BACKENDS: &[&str] = &["vllm_triton"];
 const FUSED_MOE_BACKENDS: &[&str] = &["flashinfer_trtllm_fp8_block_sm100"];
 const ALL_REDUCE_BACKENDS: &[&str] = &["flashinfer_mnnvl"];
 

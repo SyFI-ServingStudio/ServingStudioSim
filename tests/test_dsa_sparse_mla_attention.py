@@ -94,7 +94,6 @@ def test_registration_support_family_environment_and_facades() -> None:
     assert known_backends(KIND) == [
         "torch",
         "flashinfer_trtllm_fp8",
-        "flashinfer_trtllm_fp8_vllm_fork",
         "vllm_flashmla_bf16",
     ]
     for spec in (torch_spec, flashmla_spec):
@@ -655,7 +654,6 @@ def test_operand_sources_do_not_scale_an_arange_with_cache_size(monkeypatch) -> 
 def test_trtllm_fp8_operands_use_production_hnd_page_layout(monkeypatch) -> None:
     from profiling.runners.attention import dsa_sparse_mla_attention as runner
 
-    monkeypatch.setattr(runner, "_SELECTED_K", 4)
     monkeypatch.setattr(runner, "_TRTLLM_WORKSPACE_BYTES", 16)
     validated = runner._ValidatedArgs(
         num_queries=2,
@@ -667,6 +665,8 @@ def test_trtllm_fp8_operands_use_production_hnd_page_layout(monkeypatch) -> None
         torch,
         validated,
         num_heads=16,
+        rope_dim=64,
+        selected_k=4,
         device=torch.device("cpu"),
     )
 
@@ -677,6 +677,7 @@ def test_trtllm_fp8_operands_use_production_hnd_page_layout(monkeypatch) -> None
     assert operands.block_tables.shape == (2, 1, 4)
     assert operands.seq_lens.tolist() == [2, 4]
     assert operands.workspace.numel() == 16
+    assert operands.top_k_lens is None
 
 
 def test_trtllm_fp8_launch_matches_vllm_flashinfer_call() -> None:
@@ -1002,155 +1003,52 @@ _NOPE_SPEC = _BASE_SPEC | {
 }
 
 
-def _validate_nope(**overrides):
-    from profiling.runners.attention import dsa_sparse_mla_attention as runner
-
-    return runner._validate_args(
-        **(_NOPE_SPEC | overrides),
-        expected_num_heads=(_NOPE_SPEC | overrides)["num_heads"],
-        expected_q_dtype=DType.FP8_E4M3,
-        expected_cache_dtype=DType.FP8_E4M3,
-        expected_cache_layout=runner._TRTLLM_NOPE_CACHE_LAYOUT,
-        allowed_selected_k=runner._TRTLLM_FORK_SELECTED_K,
-        expected_rope_dim=runner._TRTLLM_NOPE_ROPE_DIM,
-    )
-
-
-def test_vllm_fork_registration_runs_on_b200_in_the_fork_env() -> None:
-    spec = find_kernel_profiler_spec(KIND, "flashinfer_trtllm_fp8_vllm_fork")
-
-    assert spec.args_schema is DsaSparseMlaAttentionArgs
-    assert spec.table_name == KIND
-    assert spec.subprocess_env == "vllm_fork_env"
-    assert spec.supports.allows(DType.FP8_E4M3, DType.FP8_E4M3, gpu="NVIDIA B200")
-    assert not spec.supports.allows(DType.FP8_E4M3, DType.FP8_E4M3, gpu="NVIDIA H200")
-    assert spec.runner_ref.function_name == (
-        "profile_dsa_sparse_mla_attention_flashinfer_trtllm_fp8_vllm_fork"
-    )
-
-
-def test_nope_validation_accepts_the_kpool_page_table_width_and_rope_free_cache() -> None:
-    validated = _validate_nope()
-    assert validated.valid_counts == (2051, 2051)
-    assert _validate_nope(selected_k=2048, valid_counts="u:2048x2").valid_counts == (2048, 2048)
-
-
 @pytest.mark.parametrize(
     ("overrides", "match"),
     [
-        ({"rope_dim": 64}, "rope_dim must be 0"),
+        ({}, "reached the launch"),
+        ({"selected_k": 2048, "valid_counts": "u:2048x2"}, "reached the launch"),
         ({"selected_k": 2304}, "selected_k must be 2048 or 2176"),
         ({"cache_layout": "hnd_paged_mqa_fp8_latent_rope"}, "cache_layout must be"),
-        ({"valid_counts": "u:2177x2"}, "valid_counts"),
+        ({"rope_dim": 64}, "selected_k must be 2048, got 2176"),
     ],
 )
-def test_nope_validation_rejects_other_layouts(overrides, match) -> None:
-    with pytest.raises((ProfilerNotImplemented, ValueError), match=match):
-        _validate_nope(**overrides)
+def test_trtllm_fp8_rope_dim_selects_the_accepted_layout(monkeypatch, overrides, match) -> None:
+    from profiling.runners.attention import dsa_sparse_mla_attention as runner
+
+    def reached(*_args, **_kwargs):
+        raise ProfilerNotImplemented("reached the launch")
+
+    monkeypatch.setattr(runner, "_require_b200", reached)
+    with pytest.raises(ProfilerNotImplemented, match=match):
+        runner.profile_dsa_sparse_mla_attention_flashinfer_trtllm_fp8(**(_NOPE_SPEC | overrides))
 
 
-def test_glm52_trtllm_backend_still_rejects_the_kpool_width() -> None:
-    with pytest.raises(ProfilerNotImplemented, match="selected_k must be 2048"):
-        from profiling.runners.attention.dsa_sparse_mla_attention import _validate_args
-
-        _validate_args(
-            **(_NOPE_SPEC | {"rope_dim": 64, "cache_layout": "hnd_paged_mqa_fp8_latent_rope"}),
-            expected_num_heads=16,
-            expected_q_dtype=DType.FP8_E4M3,
-            expected_cache_dtype=DType.FP8_E4M3,
-            expected_cache_layout="hnd_paged_mqa_fp8_latent_rope",
-        )
-
-
-def test_nope_operands_use_a_512_wide_latent_page_and_selected_k_page_table() -> None:
+def test_trtllm_fp8_rope_free_operands_and_launch_match_vllm() -> None:
     from profiling.runners.attention import dsa_sparse_mla_attention as runner
 
     validated = runner._ValidatedArgs(
         num_queries=2,
         num_cache_tokens=65,
-        valid_counts=(2, 4),
+        valid_counts=(0, 4),
         index_distribution="recent_contiguous",
     )
-    operands = runner._build_trtllm_nope_operands(
-        torch, validated, num_heads=16, selected_k=8, device=torch.device("cpu")
+    operands = runner._build_trtllm_fp8_operands(
+        torch, validated, num_heads=16, rope_dim=0, selected_k=8, device=torch.device("cpu")
     )
-
     assert operands.query.shape == (2, 1, 16, 512)
-    assert operands.query.dtype is torch.float8_e4m3fn
     assert operands.cache.shape == (2, 1, 64, 512)
-    assert operands.cache.dtype is torch.float8_e4m3fn
     assert operands.block_tables.shape == (2, 1, 8)
-    assert operands.block_tables[0, 0, 2:].tolist() == [0] * 6
-    assert operands.seq_lens.tolist() == [2, 4]
+    assert operands.top_k_lens.tolist() == [1, 4]
 
-
-def test_nope_launch_matches_vllm_forward_mqa_for_rope_free_mla() -> None:
-    from profiling.runners.attention import dsa_sparse_mla_attention as runner
-
-    operands = runner._TrtllmFp8Operands(
-        query=object(),
-        cache=object(),
-        block_tables=object(),
-        seq_lens=object(),
-        workspace=object(),
-    )
-    top_k_lens = object()
     calls = []
-    runner._launch_trtllm_nope(
+    runner._launch_trtllm_fp8(
         lambda **kwargs: calls.append(kwargs),
         operands,
         softmax_scale=0.0625,
-        selected_k=2176,
-        top_k_lens=top_k_lens,
+        rope_dim=0,
+        selected_k=8,
     )
-    assert calls == [
-        {
-            "query": operands.query,
-            "kv_cache": operands.cache,
-            "workspace_buffer": operands.workspace,
-            "qk_nope_head_dim": 256,
-            "kv_lora_rank": 512,
-            "qk_rope_head_dim": 0,
-            "block_tables": operands.block_tables,
-            "seq_lens": operands.seq_lens,
-            "max_seq_len": 2176,
-            "bmm1_scale": 0.0625,
-            "bmm2_scale": 1.0,
-            "sparse_mla_top_k": 2176,
-            "sparse_mla_top_k_lens": top_k_lens,
-        }
-    ]
-
-
-def test_nope_correctness_check_accepts_the_reference_and_rejects_noise() -> None:
-    from profiling.runners.attention import dsa_sparse_mla_attention as runner
-
-    validated = runner._ValidatedArgs(
-        num_queries=3,
-        num_cache_tokens=128,
-        valid_counts=(0, 5, 17),
-        index_distribution="unique_scattered_pages",
-    )
-    operands = runner._build_trtllm_nope_operands(
-        torch, validated, num_heads=2, selected_k=32, device=torch.device("cpu")
-    )
-    indices = operands.block_tables.clone()
-    positions = torch.arange(32)
-    indices.masked_fill_(positions[None, None, :] >= operands.seq_lens[:, None, None], -1)
-    expected = dsa_sparse_mla_attention_reference(
-        operands.query[:, 0].to(torch.bfloat16),
-        operands.cache.reshape(-1, 1, 512).to(torch.bfloat16),
-        indices,
-        softmax_scale=0.0625,
-    ).unsqueeze(1)
-    runner._check_trtllm_nope_correctness(
-        torch, operands, expected, valid_counts=(0, 5, 17), softmax_scale=0.0625
-    )
-    with pytest.raises(KernelLaunchFailed, match="disagrees with the Torch reference"):
-        runner._check_trtllm_nope_correctness(
-            torch,
-            operands,
-            torch.randn_like(expected.float()).to(torch.bfloat16),
-            valid_counts=(0, 5, 17),
-            softmax_scale=0.0625,
-        )
+    assert calls[0]["qk_rope_head_dim"] == 0
+    assert calls[0]["max_seq_len"] == calls[0]["sparse_mla_top_k"] == 8
+    assert calls[0]["sparse_mla_top_k_lens"] is operands.top_k_lens

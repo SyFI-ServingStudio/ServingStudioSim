@@ -185,8 +185,8 @@ mod tests {
             intermediate: intermediate.into(),
             activation_dtype: DType::Bf16,
             gpu_name: "NVIDIA B200".into(),
-            quant_backends: vec!["vllm_fork_cuda"],
-            fp8_gemm_backends: vec!["deepgemm_vllm_fork"],
+            quant_backends: vec!["vllm_cuda"],
+            fp8_gemm_backends: vec!["deepgemm"],
             elementwise_backends: vec!["triton"],
         }
     }

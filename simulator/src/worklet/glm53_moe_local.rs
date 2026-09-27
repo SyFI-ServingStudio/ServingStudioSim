@@ -293,7 +293,7 @@ mod tests {
             routed_scaling_denominator: 2,
             activation_dtype: DType::Bf16,
             gpu_name: "NVIDIA B200".into(),
-            quant_backends: vec!["vllm_fork_cuda"],
+            quant_backends: vec!["vllm_cuda"],
             fused_moe_backends: vec!["flashinfer_trtllm_fp8_block_sm100"],
             expert_demand: ExpertDemand::popularity(&RoutingDistribution::uniform(288), 1),
             folded_rank_position: 0,

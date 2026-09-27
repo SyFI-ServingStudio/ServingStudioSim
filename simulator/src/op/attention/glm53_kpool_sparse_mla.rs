@@ -347,8 +347,8 @@ fn combined_causal_query(valid_counts: &[u32], cap: u32) -> DsaSparseMlaAttentio
         }
     }
     let above = causal_tail_slots(num_queries, lo, cap).abs_diff(target);
-    let below = (lo > num_queries)
-        .then(|| causal_tail_slots(num_queries, lo - 1, cap).abs_diff(target));
+    let below =
+        (lo > num_queries).then(|| causal_tail_slots(num_queries, lo - 1, cap).abs_diff(target));
     let num_cache_tokens = match below {
         Some(below) if below < above => lo - 1,
         _ => lo,
@@ -446,9 +446,9 @@ mod tests {
 
     pub(crate) fn cfg() -> Glm53KpoolSparseMlaConfig {
         Glm53KpoolSparseMlaConfig {
-            sparse_attention_backends: vec!["flashinfer_trtllm_fp8_vllm_fork"],
+            sparse_attention_backends: vec!["flashinfer_trtllm_fp8"],
             mla_cache_append_backends: vec!["vllm_cuda"],
-            index_remap_backends: vec!["vllm_fork_triton"],
+            index_remap_backends: vec!["vllm_triton"],
             gpu_name: "NVIDIA B200".to_string(),
             num_heads: Dim::param("local_attention_heads", 16),
             latent_dim: Dim::param("kv_lora_rank", 512),
@@ -545,8 +545,14 @@ mod tests {
             prefill_query_cache_pairs: vec![(1000, 1500)],
             decode_context_lens: Vec::new(),
         };
-        let prefill = derive_shape(&input, 2048, 4, 2176).unwrap().prefill.unwrap();
-        assert_eq!((prefill.num_queries, prefill.num_cache_tokens), (1000, 1500));
+        let prefill = derive_shape(&input, 2048, 4, 2176)
+            .unwrap()
+            .prefill
+            .unwrap();
+        assert_eq!(
+            (prefill.num_queries, prefill.num_cache_tokens),
+            (1000, 1500)
+        );
     }
 
     #[test]

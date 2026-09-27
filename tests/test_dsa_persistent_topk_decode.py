@@ -79,7 +79,7 @@ def test_registration_support_policy_and_facades() -> None:
     native_spec = find_kernel_profiler_spec(KIND, _NATIVE_BACKEND)
 
     assert KIND == "dsa_persistent_topk_decode"
-    assert known_backends(KIND) == [_TORCH_BACKEND, _NATIVE_BACKEND, "vllm_fork_cuda"]
+    assert known_backends(KIND) == [_TORCH_BACKEND, _NATIVE_BACKEND]
     for spec in (torch_spec, native_spec):
         assert spec.kernel_kind == spec.table_name == KIND
         assert spec.args_schema is DsaPersistentTopkDecodeArgs
@@ -476,7 +476,7 @@ def test_rejects_unsupported_args_before_allocation(monkeypatch, overrides, matc
         ({"next_n": 0}, "next_n > 0"),
         ({"context_len": -1}, "context_len must be >= 0"),
         ({"max_model_len": 0}, "max_model_len must be > 0"),
-        ({"top_k": 1024}, "top_k=2048"),
+        ({"top_k": 256}, "top_k=512 or top_k=1024 or top_k=2048"),
         ({"logits_dtype": DType.BF16}, "logits_dtype=fp32"),
         ({"index_dtype": "int64"}, "index_dtype='int32'"),
         ({"context_mode": "mixed"}, "context_mode='uniform'"),
@@ -740,56 +740,47 @@ def test_composite_long_rows_select_local_top_values() -> None:
     assert operands.logits[0, actual[0].long()].tolist() == [7.0, 6.0, 5.0]
 
 
-def test_overflow_exemption_follows_the_fork_path_each_row_takes() -> None:
+def test_native_accepts_kpool_top_k_while_torch_keeps_2048() -> None:
+    from profiling.runners.attention import dsa_persistent_topk_decode as runner
+
+    # GLM-5.3-Flash kpool: 2048 pools of an 8192-token request, token-wide rows.
+    kpool = _BASE_SPEC | {"context_len": 2048, "max_model_len": 8192, "top_k": 512}
+    kpool["logits_row_stride"] = 8192
+    assert runner._validate_args(**kpool, allowed_top_k=runner._VLLM_TOP_K)[4] == 512
+    with pytest.raises(ValueError, match="requires top_k=2048, got 512"):
+        runner._validate_args(**kpool)
+
+
+def test_overflow_exemption_follows_the_path_each_row_takes() -> None:
     from profiling.runners.attention.dsa_persistent_topk_decode import (
         _medium_overflow_explains,
     )
 
-    # The linspace template at stride 524288 leaves a 64K row in [-1, -0.75],
-    # so its top coarse bin, (-0.875, -0.75], holds ~32K candidates and
-    # overflows the >32-row long path's 16K buffer.
-    length, top_k = 65536, 512
+    # The stride-524288 linspace template crowds a short prefix into a few
+    # coarse bins, overflowing whichever buffered path the row takes.
     template = torch.linspace(-1.0, 1.0, 524288)
-    row = template[:length]
-    expected_values = row[torch.arange(length - top_k, length)]
-    # A kernel that kept the wrong threshold-bin members after the drop.
-    kept_early = torch.arange(52000, 52000 + top_k)
-    assert _medium_overflow_explains(torch, row, kept_early, expected_values, num_rows=33)
-    # One row takes the cooperative radix path, which buffers nothing.
-    assert not _medium_overflow_explains(torch, row, kept_early, expected_values, num_rows=1)
-    # A selection below the threshold bin (index 0 is -1.0) is not an overflow.
-    below = torch.cat([torch.arange(1), kept_early[1:]])
-    assert not _medium_overflow_explains(torch, row, below, expected_values, num_rows=33)
-    # The medium path keeps its own 8K-32K window and 4096-item buffer.
-    medium = template[:16384]
-    medium_expected = medium[torch.arange(16384 - top_k, 16384)]
-    medium_kept = torch.arange(1000, 1000 + top_k)
-    assert _medium_overflow_explains(torch, medium, medium_kept, medium_expected, num_rows=4)
-    assert not _medium_overflow_explains(torch, medium, medium_kept, medium_expected, num_rows=64)
-
-
-def test_overflow_exemption_covers_the_decode_and_short_paths() -> None:
-    from profiling.runners.attention.dsa_persistent_topk_decode import (
-        _medium_overflow_explains,
-    )
-
-    # An 8K row of the stride-524288 template spans [-1, -0.97]: about two
-    # 11-bit decode bins of ~4K items (DBUF holds 3708) and four 12-bit short
-    # bins of ~2K items (the short path keeps top_k ties).
-    length, top_k = 8192, 512
-    row = torch.linspace(-1.0, 1.0, 524288)[:length]
-    expected_values = row[torch.arange(length - top_k, length)]
-    kept = torch.arange(length - 1024, length - 1024 + top_k)
-    # <=32 rows: the decode path; >32 rows: the short path.
-    assert _medium_overflow_explains(torch, row, kept, expected_values, num_rows=4)
-    assert _medium_overflow_explains(torch, row, kept, expected_values, num_rows=64)
-    # Index 0 lies below the threshold bin on either path.
-    below = torch.cat([torch.arange(1), kept[1:]])
-    assert not _medium_overflow_explains(torch, row, below, expected_values, num_rows=4)
-    assert not _medium_overflow_explains(torch, row, below, expected_values, num_rows=64)
+    top_k = 512
+    for length, kept_start, rows_that_buffer, rows_that_do_not in (
+        (65536, 52000, 33, 1),  # FilteredTopK long path vs cooperative radix
+        (16384, 1000, 4, 64),  # medium histogram_256_topk vs FilteredTopK short
+        (8192, 7168, 4, None),  # decode path (<=32 rows)
+        (8192, 7168, 64, None),  # FilteredTopK short path (>32 rows)
+    ):
+        row = template[:length]
+        expected = row[torch.arange(length - top_k, length)]
+        kept = torch.arange(kept_start, kept_start + top_k)
+        assert _medium_overflow_explains(torch, row, kept, expected, num_rows=rows_that_buffer)
+        if rows_that_do_not is not None:
+            assert not _medium_overflow_explains(
+                torch, row, kept, expected, num_rows=rows_that_do_not
+            )
+        # A selection below the threshold bin (index 0 is -1.0) is not an overflow.
+        below = torch.cat([torch.arange(1), kept[1:]])
+        assert not _medium_overflow_explains(torch, row, below, expected, num_rows=rows_that_buffer)
     # A spread-out row fills no buffer, so a wrong selection stays a failure.
-    spread = torch.linspace(-1.0, 1.0, length)
-    spread_expected = spread[torch.arange(length - top_k, length)]
+    spread = torch.linspace(-1.0, 1.0, 8192)
+    spread_expected = spread[torch.arange(8192 - top_k, 8192)]
+    kept = torch.arange(7168, 7168 + top_k)
     assert not _medium_overflow_explains(torch, spread, kept, spread_expected, num_rows=4)
 
 
@@ -1053,43 +1044,3 @@ def test_native_profile_translates_op_runtime_failure(monkeypatch) -> None:
         runner.profile_dsa_persistent_topk_decode_vllm_cuda(
             **(_BASE_SPEC | {"batch_size": 1, "context_len": 3, "next_n": 1})
         )
-
-
-def test_vllm_fork_registration_runs_on_b200_in_the_fork_env() -> None:
-    spec = find_kernel_profiler_spec(KIND, "vllm_fork_cuda")
-
-    assert spec.args_schema is DsaPersistentTopkDecodeArgs
-    assert spec.table_name == KIND
-    assert spec.subprocess_env == "vllm_fork_env"
-    assert spec.supports.allows(DType.FP32, gpu="NVIDIA B200")
-    assert not spec.supports.allows(DType.FP32, gpu="NVIDIA H200")
-    assert spec.runner_ref.function_name == "profile_dsa_persistent_topk_decode_vllm_fork_cuda"
-
-
-def test_vllm_fork_accepts_kpool_top_k_while_v023_backend_keeps_2048() -> None:
-    from profiling.runners.attention import dsa_persistent_topk_decode as runner
-
-    # GLM-5.3-Flash kpool: 2048 pools of an 8192-token request, token-wide rows.
-    kpool = _BASE_SPEC | {"context_len": 2048, "max_model_len": 8192, "top_k": 512}
-    kpool["logits_row_stride"] = 8192
-    validated = runner._validate_args(**kpool, allowed_top_k=runner._FORK_TOP_K)
-    assert validated[1] == 2048 and validated[4] == 512
-    with pytest.raises(ValueError, match="requires top_k=2048, got 512"):
-        runner._validate_args(**kpool)
-
-
-def test_vllm_fork_entry_forwards_its_backend_and_top_k_set(monkeypatch) -> None:
-    from profiling.runners.attention import dsa_persistent_topk_decode as runner
-
-    calls = []
-    monkeypatch.setattr(
-        runner,
-        "_profile_native_persistent_topk",
-        lambda *args: calls.append(args) or "metrics",
-    )
-    spec = _BASE_SPEC | {"top_k": 512}
-    assert runner.profile_dsa_persistent_topk_decode_vllm_fork_cuda(**spec) == "metrics"
-    assert runner.profile_dsa_persistent_topk_decode_vllm_cuda(**_BASE_SPEC) == "metrics"
-    assert calls[0][:2] == ("vllm_fork_cuda", frozenset({512, 1024, 2048}))
-    assert calls[0][2:] == tuple(spec.values())
-    assert calls[1][:2] == ("vllm_cuda", frozenset({2048}))

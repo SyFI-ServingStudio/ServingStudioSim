@@ -9,7 +9,7 @@ it against a fifteen-case campaign.
 - **L1 kinds and profiling backends** for the serving stack's kernels:
   - KDA chunked prefill and plain decode;
   - FlashInfer MNNVL all-reduce and FP8 block-scale fused MoE;
-  - the fork's DSA kernels (sparse MLA, paged MQA logits, persistent and
+  - vLLM's DSA kernels (sparse MLA, paged MQA logits, persistent and
     prefill top-k at the kpool width 512, index remap);
   - mHC on B200, fused q/kv RMSNorm, FP8 group quant, DeepGEMM and cuBLAS
     GEMMs.
@@ -79,9 +79,16 @@ accepted baseline, and no golden is recorded.
 
 - vLLM fork `3f667d7` (`servingstudio-alignment`) and req-frontend `e3a400f`;
   unchanged from `main`.
-- `profiling/profile.db` gains 12,261 B200 rows for these kernels, all
-  additions (commit `data(profiling): B200 rows for GLM-5.3-Flash FP8 on the
-  vLLM fork`).
+- **Profiling image upgrade.** `vllm_env` now builds from the same vLLM commit
+  (`3f667d7`, 0.28.1rc0 line; FlashInfer 0.6.18) as
+  `vibesim-profiler-vllm:cu130-3f667d7e`, replacing the v0.23.0 image. The
+  GLM-5.3 kernels use the existing backend names; no fork-specific backend or
+  environment is added.
+- `profiling/profile.db` gains B200 rows for these kernels under those
+  canonical backends (commit `data(profiling): B200 rows for GLM-5.3-Flash
+  FP8`). Existing v0.23 rows are **not** re-profiled, so some backends now mix
+  both vLLM versions, distinguishable only by `backend_version`. Re-profiling
+  them and a version guard are follow-up work.
 
 ## Contribution licensing
 

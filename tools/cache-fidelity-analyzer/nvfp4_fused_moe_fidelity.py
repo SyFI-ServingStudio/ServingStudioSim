@@ -89,10 +89,7 @@ def main() -> None:
     cf.perf_api.enable_jit_profiling()
     fn = getattr(cf.perf_api, f"get_{KIND}_times")
 
-    # Pre-fill the grid rows from this process. `kernel-query eval` would JIT
-    # them through the PyO3 bridge, but that process's PYTHONPATH carries the
-    # project venv's site-packages into the worker, which shadows the vLLM
-    # fork's own Torch for `vllm_fork_env` backends.
+    # Pre-fill the grid rows from this process before `kernel-query eval`.
     for backend in config["backends"]:
         fn([{k: v for k, v in p.items() if k != "backend"}
             for p in grid_payloads if p["backend"] == backend],

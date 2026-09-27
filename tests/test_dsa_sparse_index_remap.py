@@ -116,7 +116,7 @@ def test_registration_support_family_environment_runner_ref_and_facades() -> Non
     vllm_spec = find_kernel_profiler_spec(KIND, "vllm_triton")
 
     assert KIND == "dsa_sparse_index_remap"
-    assert known_backends(KIND) == ["torch", "vllm_triton", "vllm_fork_triton"]
+    assert known_backends(KIND) == ["torch", "vllm_triton"]
     assert spec.kernel_kind == spec.table_name == KIND
     assert spec.args_schema is DsaSparseIndexRemapArgs
     assert spec.metric_family is MetricFamily.COMPUTE
@@ -134,12 +134,6 @@ def test_registration_support_family_environment_runner_ref_and_facades() -> Non
     assert vllm_spec.supports.gpus == frozenset({"NVIDIA B200"})
     assert vllm_spec.subprocess_env == "vllm_env"
     assert vllm_spec.runner_ref.function_name == ("profile_dsa_sparse_index_remap_vllm_triton")
-    fork_spec = find_kernel_profiler_spec(KIND, "vllm_fork_triton")
-    assert fork_spec.supports.gpus == frozenset({"NVIDIA B200"})
-    assert fork_spec.subprocess_env == "vllm_fork_env"
-    assert fork_spec.runner_ref.function_name == (
-        "profile_dsa_sparse_index_remap_vllm_fork_triton"
-    )
     assert hasattr(perf_api, "get_dsa_sparse_index_remap_times")
     assert hasattr(perf_api, "count_missing_dsa_sparse_index_remap")
 
@@ -1089,25 +1083,24 @@ def test_profile_preserves_typed_unavailable_oom_and_execution_failures(
     assert isinstance(launch_info.value.__cause__, RuntimeError)
 
 
-def test_only_the_fork_backend_admits_the_kpool_2176_table_width() -> None:
-    """GLM-5.3 kpool rows are 2176 wide; the GLM-5.2 backends must keep rejecting that width."""
+def test_only_the_vllm_backend_admits_the_kpool_table_width(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from profiling.runners.attention import dsa_sparse_index_remap as runner
 
-    arguments = dict(
-        num_queries=2,
-        num_requests=2,
-        selected_k=2176,
-        block_size=64,
-        max_blocks_per_request=64,
-        request_row_counts="u:1x2",
-        local_span_lengths="u:3000x2",
-        valid_counts="u:2048x2",
-        index_distribution="unique_scattered_blocks",
-        page_table_mapping="interleaved_requests",
-        workspace_partition="none",
-        return_valid_counts=True,
-        index_dtype="int32",
-    )
-    assert runner._validate_args(**arguments, supported_selected_k=runner._FORK_SELECTED_K)
-    with pytest.raises(runner.ProfilerNotImplemented, match="selected_k must be 2048"):
-        runner._validate_args(**arguments)
+    kpool = _BASE_SPEC | {"selected_k": 2176}
+    with pytest.raises(ProfilerNotImplemented, match="selected_k must be 2048, got 2176"):
+        runner._validate_args(**kpool)
+    validated = runner._validate_args(**kpool, supported_selected_k=runner._VLLM_SELECTED_K)
+    assert validated.selected_k == 2176
+
+    seen: dict[str, Any] = {}
+
+    def stop_after_validation(**kwargs: Any) -> Any:
+        seen.update(kwargs)
+        raise RuntimeError("validated")
+
+    monkeypatch.setattr(runner, "_validate_args", stop_after_validation)
+    with pytest.raises(RuntimeError, match="validated"):
+        runner.profile_dsa_sparse_index_remap_vllm_triton(**kpool)
+    assert seen["supported_selected_k"] == frozenset({2048, 2176})

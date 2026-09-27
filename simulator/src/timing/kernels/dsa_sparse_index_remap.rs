@@ -378,10 +378,10 @@ mod tests {
     #[test]
     fn kpool_table_width_enumerates_2176_and_admits_tail_counts() {
         let mut config = config();
-        config.backends = vec!["vllm_fork_triton"];
+        config.backends = vec!["vllm_triton"];
         config.selected_k = 2176;
         let grid = DsaSparseIndexRemapSpec::sweep_grid(&config);
-        let payloads = DsaSparseIndexRemapSpec::enumerate(&config, &grid, "vllm_fork_triton");
+        let payloads = DsaSparseIndexRemapSpec::enumerate(&config, &grid, "vllm_triton");
         assert!(payloads
             .iter()
             .all(|payload| payload.fields().get("selected_k") == Some(&Value::from(2176_u32))));

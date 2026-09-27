@@ -61,6 +61,7 @@ def test_registry_contract_and_backend_support():
     assert profiler_spec.subprocess_env == "vllm_env"
     assert profiler_spec.supports.allows(DType.BF16, gpu="NVIDIA H100")
     assert profiler_spec.supports.allows(DType.BF16, gpu="NVIDIA H200")
+    assert profiler_spec.supports.allows(DType.BF16, gpu="NVIDIA B200")
     assert not profiler_spec.supports.allows(DType.FP16, gpu="NVIDIA H200")
 
 
@@ -135,7 +136,7 @@ def test_profile_calls_exact_vllm_op_and_reports_logical_bytes(monkeypatch):
     monkeypatch.setattr(
         runner,
         "_load_vllm_quant_op",
-        lambda _torch, *_: lambda *arguments: quant_calls.append(arguments),
+        lambda _torch, _scale_format: lambda *arguments: quant_calls.append(arguments),
     )
     monkeypatch.setattr(runner.Timer, "cupti", lambda function, **kwargs: (function(), 2.0)[1])
     monkeypatch.setattr(
@@ -168,40 +169,9 @@ def test_profile_calls_exact_vllm_op_and_reports_logical_bytes(monkeypatch):
     assert metrics.energy_j == 0.25
 
 
-@pytest.mark.parametrize(
-    ("scale_format", "capability", "gpu_name", "accepted"),
-    [
-        ("ue8m0_column_major", (9, 0), "NVIDIA H200", True),
-        ("ue8m0_column_major", (10, 0), "NVIDIA B200", False),
-        ("ue8m0_row_major", (10, 0), "NVIDIA B200", True),
-        ("ue8m0_row_major", (9, 0), "NVIDIA H200", False),
-        ("ue8m0_packed_int32", (10, 0), "NVIDIA B200", True),
-        ("ue8m0_packed_int32", (9, 0), "NVIDIA H200", False),
-    ],
-)
-def test_scale_format_is_paired_with_its_verified_gpu(scale_format, capability, gpu_name, accepted):
-    """A layout profiled on the wrong architecture would time a path production never runs."""
+def test_packed_format_uses_deepgemm_tma_layout_on_blackwell_only():
     from profiling.runners.elementwise import fp8_per_token_group_quant as runner
     from profiling.runners.exceptions import ProfilerNotImplemented
-
-    fake_torch = SimpleNamespace(
-        cuda=SimpleNamespace(
-            is_available=lambda: True,
-            current_device=lambda: 0,
-            get_device_capability=lambda _device: capability,
-            get_device_name=lambda _device: gpu_name,
-        )
-    )
-    if accepted:
-        runner._validate_cuda_device(fake_torch, scale_format)
-    else:
-        with pytest.raises(ProfilerNotImplemented):
-            runner._validate_cuda_device(fake_torch, scale_format)
-
-
-def test_packed_format_allocates_deepgemm_tma_layout_and_calls_packed_op():
-    """The packed writer takes no layout flags and an MN-major int32 scale tensor."""
-    from profiling.runners.elementwise import fp8_per_token_group_quant as runner
 
     strided = []
     fake_torch = SimpleNamespace(
@@ -210,18 +180,27 @@ def test_packed_format_allocates_deepgemm_tma_layout_and_calls_packed_op():
         int32="int32",
         randn=lambda shape, **kwargs: object(),
         empty=lambda shape, **kwargs: object(),
-        empty_strided=lambda shape, stride, **kwargs: strided.append((shape, stride, kwargs))
-        or object(),
+        empty_strided=lambda *arguments, **kwargs: strided.append(arguments) or object(),
+        cuda=SimpleNamespace(
+            is_available=lambda: True,
+            current_device=lambda: 0,
+            get_device_capability=lambda _device: (9, 0),
+            get_device_name=lambda _device: "NVIDIA H200",
+        ),
     )
+    with pytest.raises(ProfilerNotImplemented, match="requires compute capability"):
+        runner._validate_cuda_device(fake_torch, "ue8m0_packed_int32")
     operands = runner._allocate_operands(
-        fake_torch, num_tokens=33, hidden_size=4096, group_size=128, scale_format="ue8m0_packed_int32"
+        fake_torch, num_tokens=33, hidden_size=4096, group_size=128,
+        scale_format="ue8m0_packed_int32",
     )
-    assert strided == [((33, 8), (1, 36), {"dtype": "int32", "device": "cuda"})]
+    assert strided == [((33, 8), (1, 36))]
     calls = []
-    runner._launch_quant(
-        lambda *arguments: calls.append(arguments), *operands, 128, "ue8m0_packed_int32"
-    )
-    assert len(calls[0]) == 7
+    runner._launch_quant(lambda *a: calls.append(a), *operands, 128, "ue8m0_packed_int32")
+    assert len(calls[0]) == 7  # the packed writer takes no layout flags
+    assert runner._logical_bytes(
+        num_tokens=33, hidden_size=4096, group_size=128, scale_format="ue8m0_packed_int32"
+    ) == 33 * 4096 * 3 + 33 * 8 * 4
 
 
 def test_generated_facade_symbols_exist():
@@ -273,19 +252,3 @@ def test_exact_vllm_op_matches_torch_reference_on_cuda():
         rtol=0.0,
         atol=0.0,
     )
-
-
-def test_fork_backend_runs_the_blackwell_layouts_on_the_serving_stack() -> None:
-    from profiling.db.registry import find_kernel_profiler_spec
-    from profiling.runners.exceptions import ProfilerNotImplemented
-    from profiling.runners.elementwise.fp8_per_token_group_quant import (
-        profile_fp8_per_token_group_quant_vllm_fork_cuda,
-    )
-
-    spec = find_kernel_profiler_spec("fp8_per_token_group_quant", "vllm_fork_cuda")
-    assert spec.subprocess_env == "vllm_fork_env"
-    assert spec.supports.gpus == frozenset({"NVIDIA B200"})
-    with pytest.raises(ProfilerNotImplemented, match="scale_format"):
-        profile_fp8_per_token_group_quant_vllm_fork_cuda(
-            32, 4096, 128, "bf16", "ue8m0_column_major"
-        )

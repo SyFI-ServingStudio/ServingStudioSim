@@ -78,11 +78,11 @@ lists and makes paths relative to the repository root.
   - Suspected sources, from the capture: a blocking device-to-host copy in the
     KDA chunk-prefill setup and ~1150 eager launches per mixed forward.
   - Modeling this interval is follow-up work.
-- **Prefill top-k timing template.** The `vllm_fork_cuda` `dsa_topk_prefill`
+- **Prefill top-k timing template.** The `vllm_cuda` `dsa_topk_prefill`
   rows use a linspace logits template. At 2048 rows x 65K pools they read
   0.33 ms, against ~0.21 ms per layer measured.
 - **Decode top-k.** The measured `topk_decode` runs 9-19% slower than its
-  stride-ramp rows. That is the other direction from the fork's overflow
+  stride-ramp rows. That is the other direction from the medium-path overflow
   exemption, so the rows stay.
 - **Scheduler population, cases 01/02.** 2.7-2.9% fewer iterations with
   correspondingly larger batches. The pack's 1% workload tolerance is not

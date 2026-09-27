@@ -92,6 +92,6 @@ for _backend, _function in (
             args_schema=BatchedGemmArgs,
             metric_family=MetricFamily.COMPUTE,
             batch_outlier_policy=BatchOutlierPolicy(),
-            subprocess_env="vllm_fork_env",
+            subprocess_env="vllm_env",
         )
     )

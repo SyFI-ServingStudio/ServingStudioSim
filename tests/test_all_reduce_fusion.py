@@ -54,7 +54,7 @@ def test_mnnvl_registry_row_runs_in_production_flashinfer_env():
     # Catches the row silently falling back to the project venv's older FlashInfer.
     spec = find_kernel_profiler_spec(KIND, "flashinfer_mnnvl")
     assert spec.args_schema is AllReduceFusionArgs
-    assert spec.subprocess_env == "vllm_fork_env"
+    assert spec.subprocess_env == "vllm_env"
     assert spec.list_native is True
     assert spec.gpu_count_fn({"num_gpus": 4}) == 4
     assert spec.supports.allows(DType.BF16, gpu="NVIDIA B200")

@@ -68,8 +68,6 @@ const POOLED_CACHE_AXIS: [u32; 21] = [
     1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 768, 1024, 1536, 4096, 8192, 16384, 32768, 65536,
     131072, 262144, 1048576,
 ];
-/// Backends whose TRTLLM-gen launch rejects more than 32,768 query rows.
-const TRTLLM_BACKENDS: [&str; 2] = ["flashinfer_trtllm_fp8", "flashinfer_trtllm_fp8_vllm_fork"];
 
 /// Which valid-slot-count shape a config sweeps.
 ///
@@ -217,10 +215,7 @@ impl KernelSpec for DsaSparseMlaAttentionSpec {
         // one iteration far below that, so 32,768 remains a generous measured
         // extrapolation guard without requiring an unsupported launch.
         let trtllm_query_too_large = |num_queries: f64| {
-            TRTLLM_BACKENDS
-                .iter()
-                .any(|backend| config.backends.contains(backend))
-                && num_queries > 32_768.0
+            config.backends.contains(&"flashinfer_trtllm_fp8") && num_queries > 32_768.0
         };
         match config.valid_counts_pattern {
             ValidCountsPattern::UniformFull | ValidCountsPattern::PooledUniformFull { .. } => {
@@ -714,12 +709,12 @@ mod tests {
         assert!(masked(&mask, &grid, 65536, 1_048_576));
     }
 
-    const FORK_BACKEND: &str = "flashinfer_trtllm_fp8_vllm_fork";
+    const TRTLLM_BACKEND: &str = "flashinfer_trtllm_fp8";
 
     /// GLM-5.3-Flash TP4 decode on B200, the exact values of b2-dsa 5.1.
-    fn pooled_fork_config() -> DsaSparseMlaAttentionKernelConfig {
+    fn pooled_config() -> DsaSparseMlaAttentionKernelConfig {
         DsaSparseMlaAttentionKernelConfig {
-            backends: vec![FORK_BACKEND],
+            backends: vec![TRTLLM_BACKEND],
             gpu_name: "NVIDIA B200".to_string(),
             num_heads: Dim::param("num_attention_heads", 16),
             num_kv_heads: Dim::param("num_kv_heads", 1),
@@ -742,12 +737,12 @@ mod tests {
     }
 
     /// Catches a pooled decode clipping at the 2176-wide page table (up to 125
-    /// phantom active slots per row) or any drift from the fork runner's args.
+    /// phantom active slots per row) or any drift from the rope-free runner args.
     #[test]
-    fn pooled_fork_payloads_cap_at_topk_plus_kpool_minus_one() {
-        let cfg = pooled_fork_config();
+    fn pooled_payloads_cap_at_topk_plus_kpool_minus_one() {
+        let cfg = pooled_config();
         let grid = DsaSparseMlaAttentionSpec::sweep_grid(&cfg);
-        let payloads = DsaSparseMlaAttentionSpec::enumerate(&cfg, &grid, FORK_BACKEND);
+        let payloads = DsaSparseMlaAttentionSpec::enumerate(&cfg, &grid, TRTLLM_BACKEND);
 
         // Past index_topk the rows spread over the four tail phases (job 1141).
         for (q, s, expected) in [
@@ -771,7 +766,7 @@ mod tests {
         assert_eq!(
             serde_json::to_value(fields).unwrap(),
             serde_json::json!({
-                "backend": FORK_BACKEND,
+                "backend": TRTLLM_BACKEND,
                 "num_queries": 1,
                 "num_cache_tokens": 1_048_576,
                 "num_heads": 16,
@@ -798,7 +793,7 @@ mod tests {
     /// the 500-feasible-coordinate ceiling.
     #[test]
     fn pooled_grid_brackets_saturation_within_the_coordinate_ceiling() {
-        let cfg = pooled_fork_config();
+        let cfg = pooled_config();
         let grid = DsaSparseMlaAttentionSpec::sweep_grid(&cfg);
         assert_contiguous(&grid.axes()[1], &[1024, 1536, 2048, 2051, 4096]);
         assert_eq!(grid.axes()[0].last(), Some(&32768.0));
@@ -810,22 +805,15 @@ mod tests {
     #[test]
     #[should_panic(expected = "exceeds selected_k")]
     fn pooled_cap_must_fit_the_page_table() {
-        let mut cfg = pooled_fork_config();
+        let mut cfg = pooled_config();
         cfg.selected_k = 2048;
         DsaSparseMlaAttentionSpec::sweep_grid(&cfg);
     }
 
-    /// Catches the fork backend escaping the TRTLLM >32,768-query guard.
+    /// Catches the pooled pattern escaping the TRTLLM >32,768-query guard.
     #[test]
-    fn fork_backend_shares_the_trtllm_query_guard() {
-        let mut cfg = config(ValidCountsPattern::UniformFull);
-        cfg.backends = vec![FORK_BACKEND];
-        let grid = DsaSparseMlaAttentionSpec::sweep_grid(&cfg);
-        let mask = DsaSparseMlaAttentionSpec::infeasible_mask(&cfg, &grid);
-        assert!(!masked(&mask, &grid, 32768, 1_048_576));
-        assert!(masked(&mask, &grid, 65536, 1));
-
-        let pooled = pooled_fork_config();
+    fn pooled_pattern_keeps_the_trtllm_query_guard() {
+        let pooled = pooled_config();
         let synthetic = crate::timing::sweep::SweepGrid::new(vec![
             crate::timing::sweep::Axis::values([32768, 65536]),
             crate::timing::sweep::Axis::values([2051]),
