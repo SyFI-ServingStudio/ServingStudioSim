@@ -482,6 +482,8 @@ QWEN36_LOCAL_MAP = (
     / "location_maps"
     / "qwen36_local_unified.json"
 )
+# The set is checked against the compiled tree by the Rust test
+# `arch::qwen36_local::tests::necessary_work_map_covers_the_compiled_locations`.
 QWEN36_LOCAL_LOCATIONS = [
     "unified.embedding",
     "unified.gdn.input_add_rms_norm",
@@ -495,12 +497,7 @@ QWEN36_LOCAL_LOCATIONS = [
     "unified.gdn.state_zero",
     "unified.gdn.prefill.causal_conv",
     "unified.gdn.prefill.post_conv",
-    "unified.gdn.prefill.cumsum",
-    "unified.gdn.prefill.kkt",
-    "unified.gdn.prefill.solve",
-    "unified.gdn.prefill.recompute_w_u",
-    "unified.gdn.prefill.state_update",
-    "unified.gdn.prefill.output",
+    "unified.gdn.prefill.chunk_delta_rule",
     "unified.gdn.state_scatter",
     "unified.gdn.decode.causal_conv",
     "unified.gdn.decode.recurrent",
@@ -523,6 +520,7 @@ QWEN36_LOCAL_LOCATIONS = [
     "unified.shared_expert.down.input_quant",
     "unified.shared_expert.down.gemm",
     "unified.shared_expert.shared_gate",
+    "unified.shared_expert.shared_gate_sigmoid",
     "unified.shared_expert.apply_shared_gate",
     "unified.finalize.finalize",
     "unified.finalize.shared_routed_add",
@@ -1329,10 +1327,10 @@ def test_qwen36_local_location_map_identity_order_and_locality():
     location_map = json.loads(QWEN36_LOCAL_MAP.read_text())
     locations = [row["location"] for row in location_map["locations"]]
     assert location_map["schema_version"] == 1
-    assert location_map["mapping_id"] == "qwen36-local-unified-v2"
+    assert location_map["mapping_id"] == "qwen36-local-unified-v3"
     assert location_map["arch_types"] == ["qwen36_local"]
     assert locations == QWEN36_LOCAL_LOCATIONS
-    assert len(locations) == len(set(locations)) == 58
+    assert len(locations) == len(set(locations)) == 54
     assert not any(
         component in location
         for location in locations
@@ -1391,6 +1389,8 @@ def test_qwen36_local_location_map_shared_rows_and_scale_multiplicity(qwen36_moe
         "gdn.shared_gate",
         "gated_gqa.shared_gate",
     ]
+    # FlashInfer's fused chunked delta rule is the one GDN prefill launch.
+    assert semantics["unified.gdn.prefill.chunk_delta_rule"] == ["gdn.attn.prefill"]
     assert [(stack.tag, stack.count) for stack in qwen36_moe.layers] == [
         ("gdn", 30),
         ("gated_gqa", 10),
@@ -1415,11 +1415,6 @@ def test_qwen36_local_location_map_empty_fusion_placeholders_are_exact():
         "unified.gdn.split_a",
         "unified.gdn.core_output_zero",
         "unified.gdn.state_zero",
-        "unified.gdn.prefill.cumsum",
-        "unified.gdn.prefill.kkt",
-        "unified.gdn.prefill.solve",
-        "unified.gdn.prefill.recompute_w_u",
-        "unified.gdn.prefill.output",
         "unified.gdn.core_output_copy",
         "unified.gdn.out_proj.input_quant",
         "unified.router.topk",
@@ -1430,6 +1425,7 @@ def test_qwen36_local_location_map_empty_fusion_placeholders_are_exact():
         "unified.shared_expert.gate_up.input_quant",
         "unified.shared_expert.silu_and_mul",
         "unified.shared_expert.down.input_quant",
+        "unified.shared_expert.shared_gate_sigmoid",
         "unified.shared_expert.apply_shared_gate",
         "unified.finalize.finalize",
         "unified.finalize.shared_routed_add",
@@ -1438,7 +1434,7 @@ def test_qwen36_local_location_map_empty_fusion_placeholders_are_exact():
         "unified.gated_gqa.output_gate",
         "unified.gated_gqa.out_proj.input_quant",
     }
-    assert len(empty) == 27
+    assert len(empty) == 23
 
 
 def test_moe_shared_scalar_gate_is_opt_in():

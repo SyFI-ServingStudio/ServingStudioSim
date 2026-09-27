@@ -7,6 +7,8 @@
 //!   - `dry-run <config>`          — report missing profile.db rows, no sim
 //!   - `emit-backends <config>`    — enumerate distinct kernels (JSON), no sim
 //!   - `list-params`               — emit the param-schema registry JSON
+//!   - `kernel-list`               — every kernel kind's config / sweep fields
+//!   - `supported-cost-trees`      — each arch's `#[supported]` cost trees, no sim
 //!
 //! All three run-like subcommands share one parse (`load_config`) → `RunConfig`
 //! (a serde enum tagged by `deployment`) → `deployment::build_flow` dispatch.
@@ -26,6 +28,7 @@ use simulator::sim::{
     run_sim, ArrivalSchedule, CapacityLimit, InputFileFormat, InputFileSchema, LoadedTrace,
     SessionDependency, TickCfg, TraceTag,
 };
+use simulator::timing::bridge::write_config_records;
 use simulator::timing::PerfApiBridge;
 use simulator::timing_predict::PredictMode;
 
@@ -53,10 +56,10 @@ enum Cmd {
     /// Run one simulation.
     Run(RunArgs),
     /// Prebuild the profile.db kernel cache, then exit without simulating.
-    BuildCacheOnly(RunArgs),
+    BuildCacheOnly(CacheArgs),
     /// Report how many kernel specs are missing from profile.db (the JIT work a
     /// cache build would do), per kernel, then exit without building or running.
-    DryRun(RunArgs),
+    DryRun(CacheArgs),
     /// Print the deployment schema JSON consumed by the launcher (§1.2.7).
     ListParams,
     /// Enumerate the distinct kernels this config touches — one JSON record per
@@ -70,6 +73,15 @@ enum Cmd {
     /// kernel by `{kind, config, query_points}`; writes the interpolated
     /// best-of-N metrics per point + the fitted grid axes on stdout.
     KernelQuery,
+    /// Print every registered kernel kind as JSON: the config fields that fix
+    /// one instance, the input fields its profile.db rows sweep, the cache
+    /// coordinates, and which config field is the compute / KV dtype. Reads the
+    /// kernel registry only (no config, GPU or profile.db).
+    KernelList,
+    /// Build every `#[supported]` combination of every arch, iter-wise and
+    /// layer-wise, and print each one's cost tree (the `cost_manifest` form) as
+    /// JSON. Structure only: no config file, Python perf_api, profile.db or GPU.
+    SupportedCostTrees(SupportedArgs),
     /// Predict per-building-block timing offline for a batch of explicit batch
     /// shapes — NO sim/scheduler/trace. Reads a minimal config (one arch selector
     /// `{iter|attn|ffn}` + gpu + a cases_file) and writes the standard
@@ -89,6 +101,32 @@ struct PredictArgs {
     /// Validate and report missing `profile.db` specs; cost and write nothing.
     #[arg(long)]
     dry_run: bool,
+    /// See [`CacheArgs::kernel_configs_out`].
+    #[arg(long, value_name = "FILE")]
+    kernel_configs_out: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct SupportedArgs {
+    /// Also give each build's kernel configs (with the grid of args each one
+    /// reads) under `kernel_configs`, as the document `--kernel-configs-out`
+    /// writes. The launcher registers them in profile.db's kernel-config
+    /// registry.
+    #[arg(long)]
+    kernel_configs: bool,
+}
+
+/// `build-cache-only` / `dry-run`: a run config, and where to write the kernel
+/// configs the build asks profile.db for.
+#[derive(Args)]
+struct CacheArgs {
+    /// Path to the structured run config (`.yaml` / `.yml` / `.json`).
+    config: PathBuf,
+    /// Write every kernel config the build asks profile.db for, with the grid
+    /// of args each one reads, to this JSON file once the command succeeds. The
+    /// launcher registers it in profile.db's kernel-config registry.
+    #[arg(long, value_name = "FILE")]
+    kernel_configs_out: Option<PathBuf>,
 }
 
 /// Shared payload for `run` / `build-cache-only` / `dry-run`: a path to one
@@ -162,8 +200,10 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Run(args) => cmd_run(&args.config),
-        Cmd::BuildCacheOnly(args) => cmd_build_cache(&args.config),
-        Cmd::DryRun(args) => cmd_dry_run(&args.config),
+        Cmd::BuildCacheOnly(args) => {
+            cmd_build_cache(&args.config, args.kernel_configs_out.as_deref())
+        }
+        Cmd::DryRun(args) => cmd_dry_run(&args.config, args.kernel_configs_out.as_deref()),
         Cmd::EmitBackends(args) => cmd_emit_backends(&args.config),
         Cmd::ListParams => {
             // serde_json::Value serializes infallibly; pretty for `list-params`.
@@ -174,6 +214,12 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::KernelQuery => simulator::introspect::run_kernel_query(),
+        Cmd::KernelList => simulator::introspect::run_kernel_list(),
+        Cmd::SupportedCostTrees(args) => {
+            let builds = simulator::arch::build::build_supported_archs(args.kernel_configs);
+            println!("{}", serde_json::to_string(&builds)?);
+            Ok(())
+        }
         Cmd::TimingPredict(args) => simulator::timing_predict::run_timing_predict(
             &args.config,
             if args.dry_run {
@@ -181,6 +227,7 @@ fn main() -> anyhow::Result<()> {
             } else {
                 PredictMode::Run
             },
+            args.kernel_configs_out.as_deref(),
         ),
     }
 }
@@ -261,10 +308,13 @@ fn cmd_run(config: &Path) -> anyhow::Result<()> {
 /// `count_missing` and never fits, so no kernel time is needed to discover what
 /// is missing. JIT stays off throughout: nothing is profiled on demand, and
 /// `issue_collected` does all the measuring.
-fn cmd_build_cache(config: &Path) -> anyhow::Result<()> {
+fn cmd_build_cache(config: &Path, kernel_configs_out: Option<&Path>) -> anyhow::Result<()> {
     let cfg = load_config(config)?;
     let bridge = PerfApiBridge::new().context("starting the PyO3 perf_api bridge")?;
     bridge.enable_dry_run();
+    if kernel_configs_out.is_some() {
+        bridge.enable_config_records();
+    }
     bridge
         .begin_collect()
         .context("starting the profiling collect pass")?;
@@ -294,6 +344,9 @@ fn cmd_build_cache(config: &Path) -> anyhow::Result<()> {
         .issue_collected(total_missing)
         .context("measuring the collected profiling work")?;
     tracing::info!("cache build complete: profile.db populated");
+    if let Some(path) = kernel_configs_out {
+        write_config_records(path, &bridge.take_config_records())?;
+    }
     Ok(())
 }
 
@@ -302,10 +355,13 @@ fn cmd_build_cache(config: &Path) -> anyhow::Result<()> {
 /// how many of its specs are absent from `profile.db` (the JIT work a real cache
 /// build would do). Exits before the tick loop. JIT stays off so nothing is
 /// profiled — this is a read-only coverage probe.
-fn cmd_dry_run(config: &Path) -> anyhow::Result<()> {
+fn cmd_dry_run(config: &Path, kernel_configs_out: Option<&Path>) -> anyhow::Result<()> {
     let cfg = load_config(config)?;
     let bridge = PerfApiBridge::new().context("starting the PyO3 perf_api bridge")?;
     bridge.enable_dry_run();
+    if kernel_configs_out.is_some() {
+        bridge.enable_config_records();
+    }
     let store: SharedRequests = Rc::new(RefCell::new(RequestStore::new()));
     let _flow = build_flow(&cfg, &bridge, store)?;
 
@@ -323,6 +379,9 @@ fn cmd_dry_run(config: &Path) -> anyhow::Result<()> {
         "total: {total_missing} / {total_specs} specs missing across {} kernels to JIT",
         report.len()
     );
+    if let Some(path) = kernel_configs_out {
+        write_config_records(path, &bridge.take_config_records())?;
+    }
     Ok(())
 }
 

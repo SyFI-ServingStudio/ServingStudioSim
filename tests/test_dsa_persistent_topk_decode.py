@@ -32,6 +32,7 @@ from profiling.runners.exceptions import KernelLaunchFailed, ProfilerNotImplemen
 
 _TORCH_BACKEND = "torch"
 _NATIVE_BACKEND = "vllm_cuda"
+_FORK_BACKEND = "vllm_fork_cuda"
 _BASE_SPEC = {
     "batch_size": 16,
     "context_len": 8192,
@@ -79,7 +80,9 @@ def test_registration_support_policy_and_facades() -> None:
     native_spec = find_kernel_profiler_spec(KIND, _NATIVE_BACKEND)
 
     assert KIND == "dsa_persistent_topk_decode"
-    assert known_backends(KIND) == [_TORCH_BACKEND, _NATIVE_BACKEND]
+    # The fork build is its own backend; tests/test_dsa_persistent_topk_decode_fork.py
+    # covers its registration.
+    assert known_backends(KIND) == [_TORCH_BACKEND, _NATIVE_BACKEND, _FORK_BACKEND]
     for spec in (torch_spec, native_spec):
         assert spec.kernel_kind == spec.table_name == KIND
         assert spec.args_schema is DsaPersistentTopkDecodeArgs

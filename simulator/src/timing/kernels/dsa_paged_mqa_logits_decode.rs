@@ -1,4 +1,4 @@
-//! GLM-5.2 DSA paged decode MQA-logits kernel.
+//! DSA paged decode MQA-logits kernel.
 //!
 //! The first cache stays on the physical `(batch_size, context_len)` coordinates.
 //! Its boundary points bracket the block-64 page seams, the 256-token DeepGEMM

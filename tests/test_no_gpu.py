@@ -90,7 +90,11 @@ def test_the_launcher_hides_every_device_for_its_children(monkeypatch, flag):
 
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1")
     if flag:
-        monkeypatch.delenv(NO_GPU_ENV, raising=False)
+        # setenv first so teardown restores the variable the launcher sets; a
+        # delenv of an unset variable records nothing and the "1" would leak
+        # into later tests on this worker.
+        monkeypatch.setenv(NO_GPU_ENV, "0")
+        monkeypatch.delenv(NO_GPU_ENV)
     else:
         monkeypatch.setenv(NO_GPU_ENV, "1")
     seen = []
@@ -112,7 +116,7 @@ def test_a_cache_prebuild_with_missing_rows_fails_without_starting_a_builder(
     async def probe(*args, **kwargs):
         return 7
 
-    monkeypatch.setattr(cache_build, "_unique_by_cache_key", lambda params, registry: params)
+    monkeypatch.setattr(cache_build, "unique_by_cache_key", lambda params, registry: params)
     monkeypatch.setattr(cache_build, "_prebuild_log_dir", lambda base, config: tmp_path)
     monkeypatch.setattr(cache_build, "build_cli_command", lambda *args, **kwargs: ["build"])
     monkeypatch.setattr(cache_build, "_probe_missing", probe)

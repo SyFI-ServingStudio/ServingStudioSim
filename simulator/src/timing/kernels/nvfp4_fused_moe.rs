@@ -20,9 +20,13 @@ pub struct Nvfp4FusedMoeKernelConfig {
     pub num_experts: Dim,
     pub num_local_experts: Dim,
     pub top_k: u32,
-    #[compute_dtype]
+    /// Router and output precision, and the activation's element type before
+    /// the kernel quantizes it to NVFP4. Not the tensor-core precision.
     pub input_dtype: DType,
-    pub weight_format: String,
+    /// Packed expert weight format. Activations are quantized to it inside the
+    /// call, so both GEMM operands reach the tensor cores as NVFP4.
+    #[compute_dtype]
+    pub weight_format: DType,
     pub group_size: u32,
     pub routing_method: String,
     pub n_group: u32,
@@ -133,7 +137,7 @@ mod tests {
             num_local_experts: 4.into(),
             top_k: 2,
             input_dtype: DType::Bf16,
-            weight_format: "nvfp4_e2m1".to_string(),
+            weight_format: DType::Nvfp4E2m1,
             group_size: 16,
             routing_method: "minimax2".to_string(),
             n_group: 1,
@@ -178,6 +182,32 @@ mod tests {
         assert!(!fields.contains_key("ep_rank"));
         assert!(!fields.contains_key("local_expert_offset"));
         assert!(!fields.contains_key("launch_role"));
+    }
+
+    #[test]
+    fn weight_format_is_the_compute_dtype_and_keeps_its_wire_literal() {
+        // Both GEMM operands run as NVFP4; input_dtype is only the activation
+        // before the in-kernel quantization. The launcher gate and the public
+        // precision label both read this tag.
+        let cfg = config();
+        assert_eq!(cfg.compute_dtype(), Some(DType::Nvfp4E2m1));
+        assert_eq!(
+            Nvfp4FusedMoeKernelConfig::COMPUTE_DTYPE_FIELD,
+            Some("weight_format")
+        );
+        // Unchanged wire form: profile.db rows and config identities hash it.
+        let described = cfg.describe_config();
+        assert_eq!(described["weight_format"], Value::from("nvfp4_e2m1"));
+        assert_eq!(described["input_dtype"], Value::from("bf16"));
+        let payloads = Nvfp4FusedMoeSpec::enumerate(
+            &cfg,
+            &SweepGrid::new(vec![Axis::values([16])]),
+            "flashinfer_trtllm_sm100",
+        );
+        assert_eq!(
+            payloads[0].fields()["weight_format"],
+            Value::from("nvfp4_e2m1")
+        );
     }
 
     #[test]

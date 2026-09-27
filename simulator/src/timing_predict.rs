@@ -54,6 +54,7 @@ use crate::arch::contract::{
 use crate::arch::{AttnArchSel, FfnArchSel, IterArchSel};
 use crate::common::{Time, WorkerId};
 use crate::deployment::BackendOverrides;
+use crate::timing::bridge::write_config_records;
 use crate::timing::{CostManifestDoc, PerfApiBridge};
 use crate::worker::CostBuffers;
 
@@ -340,7 +341,15 @@ pub enum PredictMode {
 ///
 /// Every case is lowered and checked against the model before the first one is
 /// costed, so a bad case fails the run before any row is written.
-pub fn run_timing_predict(config_path: &Path, mode: PredictMode) -> Result<()> {
+///
+/// `kernel_configs_out` names a file to write, on success, every kernel config
+/// the model asks profile.db for (see `simulator build-cache-only
+/// --kernel-configs-out`).
+pub fn run_timing_predict(
+    config_path: &Path,
+    mode: PredictMode,
+    kernel_configs_out: Option<&Path>,
+) -> Result<()> {
     let cfg: PredictConfig = parse_config_file(config_path)?;
     let bridge = match mode {
         PredictMode::Run => predict_bridge()?,
@@ -350,6 +359,9 @@ pub fn run_timing_predict(config_path: &Path, mode: PredictMode) -> Result<()> {
             bridge
         }
     };
+    if kernel_configs_out.is_some() {
+        bridge.enable_config_records();
+    }
     let run = mode == PredictMode::Run;
 
     // Cases are loaded per arch family — each arch owns its own case type, so we do
@@ -405,6 +417,9 @@ pub fn run_timing_predict(config_path: &Path, mode: PredictMode) -> Result<()> {
             (n, model.gpus_per_replica())
         }
     };
+    if let Some(path) = kernel_configs_out {
+        write_config_records(path, &bridge.take_config_records())?;
+    }
     if !run {
         print_dry_run(&bridge, num_cases, gpu_count);
         return Ok(());

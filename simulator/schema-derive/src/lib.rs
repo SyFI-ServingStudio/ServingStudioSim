@@ -8,7 +8,9 @@
 //!     (`ModelSpec`, `GroupSpec`, `PoolSpec`, `WorkloadSpec`, `IoSpec`).
 //!   - `#[derive(ProviderSchema)]` on a `#[serde(tag = "type")]` enum →
 //!     `pub const SCHEMA: &[(&str, &[ParamDef])]`, one row per variant: the
-//!     serde-snake_case tag plus that variant's own (non-flatten) field params.
+//!     serde-snake_case tag plus that variant's own (non-flatten) field params;
+//!     and `pub const SUPPORTED: &[(&str, &[SupportedRow])]`, the variant's
+//!     `#[supported(param = [values], ...)]` rows (`schema::supported`).
 //!
 //! Name + wire type are inferred from the field's Rust type; the description is
 //! the field's `///` doc comment. Everything serde/clap cannot express rides on
@@ -98,7 +100,7 @@ pub fn derive_param_struct(input: TokenStream) -> TokenStream {
 
 // ── enum derive → `SCHEMA` ──────────────────────────────────────────────────
 
-#[proc_macro_derive(ProviderSchema, attributes(param))]
+#[proc_macro_derive(ProviderSchema, attributes(param, supported))]
 pub fn derive_provider_schema(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     let name = &input.ident;
@@ -110,8 +112,13 @@ pub fn derive_provider_schema(input: TokenStream) -> TokenStream {
 
     let mut errors = Vec::new();
     let mut rows = Vec::new();
+    let mut supported = Vec::new();
     for v in variants {
         let tag = snake_case(&v.ident.to_string());
+        match supported_rows(&v.attrs) {
+            Ok(r) => supported.push(quote! { ( #tag, &[ #( #r ),* ] ) }),
+            Err(e) => errors.push(e),
+        }
         let fields = match &v.fields {
             Fields::Named(named) => named.named.iter().collect::<Vec<_>>(),
             Fields::Unit => Vec::new(),
@@ -135,9 +142,106 @@ pub fn derive_provider_schema(input: TokenStream) -> TokenStream {
         impl #impl_generics #name #ty_generics #where_clause {
             pub const SCHEMA: &'static [(&'static str, &'static [::simulator::schema::ParamDef])] =
                 &[ #( #rows ),* ];
+            pub const SUPPORTED: &'static [(&'static str, &'static [::simulator::schema::SupportedRow])] =
+                &[ #( #supported ),* ];
         }
     }
     .into()
+}
+
+// ── `#[supported(...)]` rows on a variant ───────────────────────────────────
+
+/// Each `#[supported(name = [lit, ...], ...)]` attribute → one `SupportedRow`.
+/// A list holds literals of one kind: integers, strings or bools. Whether each name is a
+/// param of the arch is checked by a test over the emitted schema, since the
+/// flattened `ModelSpec` fields are not visible here.
+fn supported_rows(attrs: &[Attribute]) -> syn::Result<Vec<proc_macro2::TokenStream>> {
+    let mut rows = Vec::new();
+    for a in attrs {
+        if !a.path().is_ident("supported") {
+            continue;
+        }
+        let nested = a.parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated)?;
+        let mut names = Vec::new();
+        let mut entries = Vec::new();
+        for m in nested {
+            let nv = match m {
+                Meta::NameValue(nv) => nv,
+                other => {
+                    return Err(syn::Error::new(
+                        other.span(),
+                        "supported: expected `param = [values]`",
+                    ))
+                }
+            };
+            let name = nv
+                .path
+                .get_ident()
+                .ok_or_else(|| syn::Error::new(nv.path.span(), "supported: expected a param name"))?
+                .to_string();
+            if names.contains(&name) {
+                return Err(syn::Error::new(
+                    nv.path.span(),
+                    "supported: param listed twice",
+                ));
+            }
+            let Expr::Array(array) = &nv.value else {
+                return Err(syn::Error::new(
+                    nv.value.span(),
+                    "supported: values must be a `[...]` list",
+                ));
+            };
+            let mut ints = Vec::new();
+            let mut strs = Vec::new();
+            let mut bools = Vec::new();
+            for e in &array.elems {
+                match e {
+                    Expr::Lit(ExprLit {
+                        lit: Lit::Int(i), ..
+                    }) => ints.push(i.clone()),
+                    Expr::Lit(ExprLit {
+                        lit: Lit::Str(s), ..
+                    }) => strs.push(s.clone()),
+                    Expr::Lit(ExprLit {
+                        lit: Lit::Bool(b), ..
+                    }) => bools.push(b.clone()),
+                    other => {
+                        return Err(syn::Error::new(
+                            other.span(),
+                            "supported: values must be integer, string or bool literals",
+                        ))
+                    }
+                }
+            }
+            let values = match (ints.is_empty(), strs.is_empty(), bools.is_empty()) {
+                (false, true, true) => {
+                    quote! { ::simulator::schema::SupportedValues::Int(&[ #( #ints ),* ]) }
+                }
+                (true, false, true) => {
+                    quote! { ::simulator::schema::SupportedValues::Str(&[ #( #strs ),* ]) }
+                }
+                (true, true, false) => {
+                    quote! { ::simulator::schema::SupportedValues::Bool(&[ #( #bools ),* ]) }
+                }
+                (true, true, true) => {
+                    return Err(syn::Error::new(array.span(), "supported: empty value list"))
+                }
+                _ => {
+                    return Err(syn::Error::new(
+                        array.span(),
+                        "supported: mixes integer, string and bool values",
+                    ))
+                }
+            };
+            entries.push(quote! { ( #name, #values ) });
+            names.push(name);
+        }
+        if entries.is_empty() {
+            return Err(syn::Error::new(a.span(), "supported: empty row"));
+        }
+        rows.push(quote! { ::simulator::schema::SupportedRow(&[ #( #entries ),* ]) });
+    }
+    Ok(rows)
 }
 
 // ── shared: one field → a `ParamDef` builder chain ──────────────────────────

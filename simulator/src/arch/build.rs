@@ -1783,6 +1783,196 @@ pub fn build_ffn_model(
     })
 }
 
+/// One `#[supported]` combination of an arch, built structure-only.
+#[derive(Debug, serde::Serialize)]
+pub struct SupportedBuild {
+    /// The arch contract, as `list-params` groups providers: `iter_wise`,
+    /// `layer_wise_attn` or `layer_wise_ffn`.
+    pub contract: &'static str,
+    pub arch: &'static str,
+    /// The row's GPU (the group's `gpu`, the profile.db key).
+    pub gpu: String,
+    /// The row's arch params (`model_config` a `model/config/` stem). Params the
+    /// row leaves out took their schema defaults.
+    pub params: serde_json::Map<String, serde_json::Value>,
+    pub gpus_per_replica: Option<u16>,
+    /// The cost tree, in the `cost_manifest/*.json` form; `None` on error.
+    pub cost_manifest: Option<crate::timing::CostManifestDoc>,
+    /// The kernel configs the build asks profile.db for, as the document
+    /// `--kernel-configs-out` writes; only when asked for, and `None` on error.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kernel_configs: Option<serde_json::Value>,
+    pub error: Option<String>,
+}
+
+/// The dotted-leaf prefix a deployment gives its model, which starts every leaf
+/// name and kernel-config role. Supported builds use the deployment's own, as
+/// `timing-predict` does, so their leaves are named as a real run's are.
+const UNIFIED_MODEL_NAME: &str = "unified";
+const AFD_MODEL_NAME: &str = "afd";
+
+/// Build every `#[supported]` combination of every arch on its row's GPU,
+/// structure only ([`PerfApiBridge::structure_only`]: no Python, `profile.db` or
+/// GPU). A combination that fails to parse or build (including a panicking
+/// shape assertion) is returned with its error, not raised.
+pub fn build_supported_archs(kernel_configs: bool) -> Vec<SupportedBuild> {
+    let schema = crate::schema::list_params();
+    let mut out = supported_builds(
+        &schema,
+        "iter_wise",
+        IterArchSel::SUPPORTED,
+        kernel_configs,
+        |selector: &IterArchSel, gpu, bridge| {
+            // A speculative arch builds a different model type, with its
+            // own tree: the verify pass plus its draft passes.
+            let (gpus, manifest) = match selector {
+                IterArchSel::Glm52VllmNvfp4DsaMoeSpeculative { .. }
+                | IterArchSel::Glm53VllmNvfp4DsaMoeDflash2 { .. } => {
+                    let (model, _) =
+                        build_speculative_iter_model(selector, gpu, UNIFIED_MODEL_NAME, bridge)?;
+                    (model.gpus_per_replica(), model.cost_log_manifest())
+                }
+                _ => {
+                    let model = build_iter_model(selector, gpu, UNIFIED_MODEL_NAME, bridge)?;
+                    (model.gpus_per_replica(), model.cost_log_manifest())
+                }
+            };
+            Ok((
+                gpus,
+                crate::timing::CostManifestDoc::single("iter", manifest),
+            ))
+        },
+    );
+    out.extend(supported_builds(
+        &schema,
+        "layer_wise_attn",
+        AttnArchSel::SUPPORTED,
+        kernel_configs,
+        |selector: &AttnArchSel, gpu, bridge| {
+            let model = build_attn_model(selector, gpu, AFD_MODEL_NAME, bridge)?;
+            Ok((model.gpus_per_replica(), model.cost_log_manifest()))
+        },
+    ));
+    out.extend(supported_builds(
+        &schema,
+        "layer_wise_ffn",
+        FfnArchSel::SUPPORTED,
+        kernel_configs,
+        |selector: &FfnArchSel, gpu, bridge| {
+            let model = build_ffn_model(selector, gpu, AFD_MODEL_NAME, bridge)?;
+            Ok((model.gpus_per_replica(), model.cost_log_manifest()))
+        },
+    ));
+    out
+}
+
+/// [`build_supported_archs`] for one contract: `rows` is its selector's
+/// `SUPPORTED`, `build` turns a parsed selector into its replica width and
+/// cost tree.
+fn supported_builds<S: serde::de::DeserializeOwned>(
+    schema: &serde_json::Value,
+    contract: &'static str,
+    rows: &'static [(&'static str, &'static [crate::schema::SupportedRow])],
+    kernel_configs: bool,
+    build: impl Fn(&S, &str, &PerfApiBridge) -> Result<(u16, crate::timing::CostManifestDoc)>,
+) -> Vec<SupportedBuild> {
+    use serde_json::{Map, Value};
+
+    let common = schema["arch_common"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    for (tag, rows) in rows {
+        let own = schema["providers"]["arch"][contract][*tag]["params"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        for row in *rows {
+            for combo in row.combinations() {
+                let mut arch = Map::new();
+                arch.insert("type".into(), (*tag).into());
+                for param in common.iter().chain(&own) {
+                    if let Some(default) = param.get("default") {
+                        arch.insert(
+                            param["name"].as_str().unwrap_or_default().into(),
+                            default.clone(),
+                        );
+                    }
+                }
+                let mut gpu = String::new();
+                let mut params = Map::new();
+                for (name, value) in &combo {
+                    if *name == "gpu" {
+                        gpu = value.as_str().unwrap_or_default().to_string();
+                        continue;
+                    }
+                    params.insert((*name).into(), value.clone());
+                    let value = match (*name, value) {
+                        ("model_config", Value::String(model)) => {
+                            Path::new(env!("CARGO_MANIFEST_DIR"))
+                                .join(format!("model/config/{model}.json"))
+                                .to_string_lossy()
+                                .into_owned()
+                                .into()
+                        }
+                        _ => value.clone(),
+                    };
+                    arch.insert((*name).into(), value);
+                }
+                let mut supported = SupportedBuild {
+                    contract,
+                    arch: tag,
+                    gpu,
+                    params,
+                    gpus_per_replica: None,
+                    cost_manifest: None,
+                    kernel_configs: None,
+                    error: None,
+                };
+                let selector: S = match serde_json::from_value(Value::Object(arch)) {
+                    Ok(selector) => selector,
+                    Err(e) => {
+                        supported.error = Some(format!("config: {e}"));
+                        out.push(supported);
+                        continue;
+                    }
+                };
+                let bridge = PerfApiBridge::structure_only();
+                if kernel_configs {
+                    bridge.enable_config_records();
+                }
+                let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    build(&selector, &supported.gpu, &bridge)
+                }));
+                match built {
+                    Ok(Ok((gpus_per_replica, manifest))) => {
+                        supported.gpus_per_replica = Some(gpus_per_replica);
+                        supported.cost_manifest = Some(manifest);
+                        if kernel_configs {
+                            supported.kernel_configs =
+                                Some(crate::timing::bridge::config_records_document(
+                                    &bridge.take_config_records(),
+                                ));
+                        }
+                    }
+                    Ok(Err(e)) => supported.error = Some(format!("{e:#}")),
+                    Err(panic) => {
+                        let message = panic
+                            .downcast_ref::<String>()
+                            .cloned()
+                            .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
+                            .unwrap_or_else(|| "build panicked".into());
+                        supported.error = Some(format!("build panicked: {message}"));
+                    }
+                }
+                out.push(supported);
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Write;
@@ -2533,5 +2723,71 @@ mod tests {
         // 6 layers * 8 KV heads * 128 * 2 (K and V) * 1 byte, summed over the
         // four attention ranks the heads are sharded across.
         assert_eq!(narrow_bytes, 6 * 8 * 128 * 2);
+    }
+
+    /// Every `#[supported]` combination of an arch builds its cost
+    /// tree, so a row cannot claim a deployment the arch cannot build.
+    #[test]
+    fn every_supported_arch_deployment_builds_its_cost_tree() {
+        let builds = build_supported_archs(false);
+        let failures: Vec<String> = builds
+            .iter()
+            .filter_map(|b| {
+                b.error
+                    .as_ref()
+                    .map(|e| format!("{} {:?}: {e}", b.arch, b.params))
+            })
+            .collect();
+        assert!(
+            failures.is_empty(),
+            "unbuildable #[supported] rows:\n{}",
+            failures.join("\n")
+        );
+        for b in &builds {
+            let doc = b.cost_manifest.as_ref().unwrap();
+            assert!(
+                !doc.sections.is_empty()
+                    && doc.sections.iter().all(|s| !s.manifest.slots.is_empty()),
+                "{}: empty cost tree",
+                b.arch
+            );
+        }
+    }
+
+    /// A supported build names its leaves as a run of its deployment does, so
+    /// its kernel-config roles match the ones runs register.
+    #[test]
+    fn supported_builds_name_leaves_like_their_deployment() {
+        for b in build_supported_archs(false) {
+            let prefix = if b.contract == "iter_wise" {
+                "unified."
+            } else {
+                "afd."
+            };
+            for section in &b.cost_manifest.as_ref().unwrap().sections {
+                for slot in &section.manifest.slots {
+                    assert!(slot.name.starts_with(prefix), "{}: {}", b.arch, slot.name);
+                }
+            }
+        }
+    }
+
+    /// Asked for, each supported build carries the kernel configs it builds, in
+    /// the document `--kernel-configs-out` writes.
+    #[test]
+    fn supported_builds_carry_their_kernel_configs_when_asked() {
+        for b in build_supported_archs(true) {
+            let doc = b.kernel_configs.as_ref().expect("kernel_configs");
+            assert_eq!(
+                doc["schema_version"],
+                crate::timing::bridge::CONFIG_RECORDS_SCHEMA_VERSION
+            );
+            let configs = doc["configs"].as_array().unwrap();
+            assert!(!configs.is_empty(), "{} {:?}: no configs", b.arch, b.params);
+            assert!(configs.iter().all(|c| c["gpu_name"] == b.gpu.as_str()));
+        }
+        assert!(build_supported_archs(false)
+            .iter()
+            .all(|b| b.kernel_configs.is_none()));
     }
 }

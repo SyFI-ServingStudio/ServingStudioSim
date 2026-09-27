@@ -24,7 +24,7 @@ use serde_json::{json, Map, Value};
 use crate::arch::config::{AttnArchSel, FfnArchSel, IterArchSel, ModelSpec};
 use crate::deployment::config::{IoSpec, WorkloadSpec};
 use crate::orchestrator::config::{GroupSpec, PoolSpec};
-use crate::schema::ParamDef;
+use crate::schema::{ParamDef, SupportedRow};
 use crate::worker::config::{AttnWorkerSel, FfnWorkerSel, IterWorkerSel, KvAdmissionSpec};
 
 /// Serialize a `const PARAMS` slice to a JSON array of ParamDef objects.
@@ -56,6 +56,19 @@ fn providers_with_flattened(
     Value::Object(m)
 }
 
+/// An arch layer's providers, each tag with `#[supported]` rows also carrying
+/// `"supported": [{param: [values]}, ...]`.
+fn arch_providers(schema: &[(&str, &[ParamDef])], supported: &[(&str, &[SupportedRow])]) -> Value {
+    let mut out = providers(schema);
+    for (tag, rows) in supported {
+        if !rows.is_empty() {
+            out[*tag]["supported"] =
+                serde_json::to_value(rows).expect("SupportedRow is infallibly Serialize");
+        }
+    }
+    out
+}
+
 /// Build the full `list-params` registry JSON.
 pub fn list_params() -> Value {
     json!({
@@ -66,9 +79,9 @@ pub fn list_params() -> Value {
         },
         "providers": {
             "arch": {
-                "iter_wise":       providers(IterArchSel::SCHEMA),
-                "layer_wise_attn": providers(AttnArchSel::SCHEMA),
-                "layer_wise_ffn":  providers(FfnArchSel::SCHEMA),
+                "iter_wise":       arch_providers(IterArchSel::SCHEMA, IterArchSel::SUPPORTED),
+                "layer_wise_attn": arch_providers(AttnArchSel::SCHEMA, AttnArchSel::SUPPORTED),
+                "layer_wise_ffn":  arch_providers(FfnArchSel::SCHEMA, FfnArchSel::SUPPORTED),
             },
             "worker": {
                 "iter_wise":       providers_with_flattened(
@@ -114,6 +127,85 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn dense_tp_publishes_its_supported_deployments() {
+        let schema = list_params();
+        let arch = &schema["providers"]["arch"]["iter_wise"];
+        assert_eq!(
+            arch["llama3_dense_tp"]["supported"],
+            json!([{"gpu": ["NVIDIA H200"], "model_config": ["llama3_8b"], "tp_size": [1, 2, 4, 8]}])
+        );
+    }
+
+    /// Every `#[supported]` row names a `gpu` and a `model_config`, and each other
+    /// param is a param of that arch: its own, or a model field every arch carries.
+    #[test]
+    fn supported_rows_name_only_params_of_their_arch() {
+        let schema = list_params();
+        let common: Vec<&str> = schema["arch_common"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["name"].as_str().unwrap())
+            .collect();
+        for (layer, providers) in schema["providers"]["arch"].as_object().unwrap() {
+            for (tag, provider) in providers.as_object().unwrap() {
+                let own: Vec<&str> = provider["params"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|p| p["name"].as_str().unwrap())
+                    .collect();
+                for row in provider["supported"].as_array().into_iter().flatten() {
+                    let row = row.as_object().unwrap();
+                    for required in ["gpu", "model_config"] {
+                        assert!(
+                            row.contains_key(required),
+                            "{layer}.{tag}: a #[supported] row names no {required}"
+                        );
+                    }
+                    for name in row.keys() {
+                        assert!(
+                            name == "gpu"
+                                || own.contains(&name.as_str())
+                                || common.contains(&name.as_str()),
+                            "{layer}.{tag}: #[supported] names {name}, not a param of the arch"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Every model a `#[supported]` row names is a `model/config/<stem>.json`
+    /// and has a `model/catalog.yaml` entry (its name on the Kernel Library).
+    #[test]
+    fn supported_models_have_a_config_and_a_catalog_entry() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let catalog: serde_yaml::Mapping = serde_yaml::from_str(
+            &std::fs::read_to_string(root.join("model/catalog.yaml")).unwrap(),
+        )
+        .unwrap();
+        let schema = list_params();
+        for providers in schema["providers"]["arch"].as_object().unwrap().values() {
+            for (tag, provider) in providers.as_object().unwrap() {
+                for row in provider["supported"].as_array().into_iter().flatten() {
+                    for model in row["model_config"].as_array().into_iter().flatten() {
+                        let model = model.as_str().unwrap();
+                        assert!(
+                            root.join(format!("model/config/{model}.json")).exists(),
+                            "{tag}: model/config/{model}.json does not exist"
+                        );
+                        assert!(
+                            catalog.contains_key(model),
+                            "{tag}: {model} has no model/catalog.yaml entry"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

@@ -14,8 +14,7 @@ would measure a kernel production never launches here.
 
 CUPTI selects only the CUTLASS delta-rule kernel; operand construction and the
 output/state allocations sit outside the measured window. Reported FLOPs and
-bytes are semantic logical counts, not physical CUTLASS instructions or traffic,
-matching the sibling `gdn_chunk_*` runners.
+bytes are semantic logical counts, not physical CUTLASS instructions or traffic.
 """
 
 from __future__ import annotations

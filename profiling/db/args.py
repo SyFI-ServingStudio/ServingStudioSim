@@ -14,6 +14,8 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
+from profiling.db.doc import arg
+
 
 class DType(StrEnum):
     """Canonical dtype strings used by profile DB rows and runner kwargs."""
@@ -25,6 +27,9 @@ class DType(StrEnum):
     FP8_E5M2 = "fp8_e5m2"
     INT8 = "int8"
     INT4 = "int4"
+    # Packed e2m1 elements with one fp8 scale per 16-element group: the operand
+    # format of Blackwell FP4 tensor cores. No torch dtype holds it unpacked.
+    NVFP4_E2M1 = "nvfp4_e2m1"
 
     @classmethod
     def from_value(cls, value: Any) -> DType:
@@ -53,6 +58,7 @@ class DType(StrEnum):
             DType.FP8_E5M2: 1,
             DType.INT8: 1,
             DType.INT4: 0.5,
+            DType.NVFP4_E2M1: 0.5,
         }[self]
 
     # Keep framework conversions lazy so importing DB schemas does not import
@@ -98,22 +104,24 @@ class Fp8BlockscaleGroupedGemmArgs(KernelArgs):
     ``num_input_tokens * experts_per_token`` capacity.
     """
 
-    n: int
-    k: int
-    dtype: DType
-    num_local_experts: int
-    num_input_tokens: int
-    experts_per_token: int
-    per_group_batches: tuple[int, ...]
+    n: int = arg(unit="elements", doc="Output features in each expert weight.")
+    k: int = arg(unit="elements", doc="Input features in each expert weight.")
+    dtype: DType = arg(doc="Element type of activations and weights; output is bf16.")
+    num_local_experts: int = arg(unit="experts", doc="Experts assigned to this GPU.")
+    num_input_tokens: int = arg(unit="tokens", doc="Input tokens before top-k expert selection.")
+    experts_per_token: int = arg(unit="experts", doc="Experts selected for each input token.")
+    per_group_batches: tuple[int, ...] = arg(
+        unit="tokens", doc="Routed token rows assigned to each local expert, in expert order."
+    )
 
 
 @dataclass(frozen=True)
 class KvCacheAppendArgs(KernelArgs):
-    num_kv_heads: int
-    head_dim: int
-    block_size: int
-    input_dtype: DType
-    kv_dtype: DType
-    cache_layout: str
-    scale_granularity: str
-    num_tokens: int
+    num_kv_heads: int = arg(unit="heads", doc="KV heads written for each token.")
+    head_dim: int = arg(unit="elements", doc="Elements in each key or value head.")
+    block_size: int = arg(unit="tokens", doc="Token slots in each cache page.")
+    input_dtype: DType = arg(doc="Element type of the new keys and values.")
+    kv_dtype: DType = arg(doc="Element type stored in the KV cache.")
+    cache_layout: str = arg(doc="Physical cache layout, NHD or HND.")
+    scale_granularity: str = arg(doc="FP8 scale granularity, tensor or head.")
+    num_tokens: int = arg(unit="tokens", doc="New tokens whose keys and values are written.")

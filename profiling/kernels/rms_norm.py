@@ -23,6 +23,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from profiling.db.args import DType, KernelArgs
+from profiling.db.doc import CUPTI_METHOD, BackendDoc, KernelDoc, arg
 from profiling.db.outlier import BatchOutlierPolicy
 from profiling.db.registry import (
     BackendSupport,
@@ -37,9 +38,38 @@ KIND: str = "rms_norm"
 
 @dataclass(frozen=True)
 class RmsNormArgs(KernelArgs):
-    m: int
-    hidden: int
-    dtype: DType
+    m: int = arg(unit="tokens", doc="Tokens in the batch.")
+    hidden: int = arg(unit="elements", doc="Features normalized per token.")
+    dtype: DType = arg(doc="Element type of the input and weight.")
+
+
+DOC = KernelDoc(
+    title="RMSNorm",
+    summary=(
+        "Normalize each token's hidden vector by its root mean square and scale it by a weight."
+    ),
+    description=(
+        "RMSNorm on its own, without the residual add that residual_rms_norm "
+        "fuses in. Models use it wherever a tensor is normalized alone, for "
+        "example before the attention projections. The input has m token rows "
+        "of hidden features; input and weight are random normal and ε is 1e-6."
+    ),
+    category="Normalization",
+    subcategory="RMSNorm",
+    formula=(
+        "y = x / √(mean(x²) + 1e-6) · weight, per token",
+        "TFLOPS = 5·m·hidden / time",
+        "GB/s = 2·m·hidden·bytes per element / time",
+    ),
+    default_metric="memory_bandwidth_gbps",
+    method=f"{CUPTI_METHOD} Only launches named RMSNormKernel are counted.",
+    caveats=(
+        "GB/s counts one read of x and one write of y; the weight read is left out.",
+        "TFLOPS assumes 5 operations per element.",
+    ),
+    # No separate PyTorch reference implementation exists for this kind.
+    reference=None,
+)
 
 
 register(
@@ -56,5 +86,9 @@ register(
         args_schema=RmsNormArgs,
         metric_family=MetricFamily.COMPUTE,
         batch_outlier_policy=BatchOutlierPolicy(),
+        doc=BackendDoc(
+            summary="FlashInfer's norm.rmsnorm.",
+            url="https://github.com/flashinfer-ai/flashinfer/blob/main/flashinfer/norm/__init__.py",
+        ),
     )
 )

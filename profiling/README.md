@@ -142,6 +142,8 @@ db/                L1b core: cache, registry, schema, scheduling.
   outlier.py         `BatchOutlierPolicy` — the per-spec `batch_outlier_policy`
                      field carried by every `KernelProfilerSpec` (placeholder).
   migrate.py         Schema version/hash + `_db_metadata`.
+  kernel_config.py   Kernel-config registry: which simulator configs asked for
+                     which rows (see DB shape).
   metadata.py        Read-only DB metadata + per-op profiler git hashes.
 
 kernels/           One file per kernel kind. Each declares KIND + <Kind>Args and
@@ -265,6 +267,27 @@ contract chosen by `metric_family`:
   (`message_size_bytes` is an **args/cache-key** column, not a measured result —
   the simulator derives moved bytes from `busbw × time`.)
 
+A row's args are one grid cell of one simulator kernel config, but the row does
+not say which. Three tables starting with `_` (so they are not kind tables)
+record it, written by the builds that ask for the rows:
+
+- `_kernel_config`, keyed `(kind, config_hash, gpu_name)`: the Rust
+  `KernelConfig::identity` (no `gpu_name` or `backends`, `Dim` values only;
+  `config_hash` is the SHA-256 of its sorted-key JSON), the profile table, the
+  cache coordinate names, the grid axes, and each cell's args without `backend`,
+  stored by column as zlib-compressed JSON (list-valued args make cells the
+  bulk). The grid is stored because it cannot always be recomputed: a
+  corpus-routed MoE config names a payload file.
+- `_kernel_config_source`, keyed `source_hash`: what built configs — the preset,
+  timing-predict config or `#[supported]` row, pool, GPU and arch block.
+- `_kernel_config_use`: which `(pool, role)` of which source built which config.
+
+The launcher registers them after a cache prebuild that profiled and after a
+timing-predict run; `--register-kernel-configs` registers a preset's or predict
+config's configs with a dry-run (no GPU), for rows measured earlier, and
+`--register-supported-kernel-configs` those of every `#[supported]` deployment.
+Registration writes nothing when every config, source and use is known.
+
 ## Adding a kernel
 
 Normally one new file: `kernels/<kind>.py` declaring `KIND`, a frozen
@@ -314,7 +337,9 @@ telemetry.
 
 `merge-db` reads both inputs without modifying them. It copies rows and whole
 tables found on only one side and deduplicates rows whose declared
-`UNIQUE(gpu_name, backend, <args...>)` identity and payload agree. If the same
+`UNIQUE(gpu_name, backend, <args...>)` identity and payload agree. The
+kernel-config registry tables merge the same way on their own content-hash keys;
+a config registered on both sides with different grids is a conflict. If the same
 identity has different measurement, provenance, or outlier state, no output DB
 is published: the command returns `1` and writes both versions to
 `<output>.merge-report.json` for explicit resolution. Surrogate `id` and

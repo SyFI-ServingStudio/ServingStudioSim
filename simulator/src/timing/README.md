@@ -175,3 +175,17 @@ The compose/aggregate machinery (`CostNode`, `FlatCostNode`, `CostTree`,
 profile mid-simulation. Only the `build-cache-only` entry point re-enables JIT.
 `enable_dry_run()` switches build to count-missing-only (no cache fit), feeding
 the launcher's `--cache-report`.
+
+## Kernel-config records
+
+profile.db rows carry the args of one grid cell, but not which config or which
+cell asked for them, and `enumerate` only runs forward. `enable_config_records()`
+makes `Kernel::build` record, in any bridge mode, each config it builds:
+`KernelConfig::identity` (every field but `gpu_name` and `backends`, with `Dim`
+values only), the GPU, the sweep grid with the args of each cell (without
+`backend`, which must be the only column that differs between a config's
+backends), the infeasible cells, and every `(pool, role)` that built it.
+`build-cache-only`, `dry-run` and `timing-predict` write them with
+`--kernel-configs-out FILE`, `supported-cost-trees --kernel-configs` gives each
+supported deployment's under `kernel_configs`, and the launcher registers them
+in profile.db (`profiling/db/kernel_config.py`).

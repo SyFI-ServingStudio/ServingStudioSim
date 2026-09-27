@@ -1,4 +1,4 @@
-//! GLM-5.2 production-layout batched GEMMs: one cached perf model per
+//! MLA production-layout batched GEMMs: one cached perf model per
 //! `(num_batches, n, k, dtype)` config.
 //!
 //! Q absorption and V-up use separate kernel instances with singleton backend
@@ -72,8 +72,8 @@ mod tests {
     use crate::timing::{Dim, SlotInput, SweepCoords};
     use serde_json::Value;
 
-    const Q_BACKEND: &str = "torch_mla_q_absorb_glm52";
-    const V_BACKEND: &str = "torch_mla_v_up_glm52";
+    const Q_BACKEND: &str = "torch_mla_q_absorb";
+    const V_BACKEND: &str = "torch_mla_v_up";
 
     fn local_heads() -> Dim {
         Dim::param("num_attention_heads", 64) / Dim::param("attn_tp", 1)

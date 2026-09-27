@@ -1,4 +1,4 @@
-//! GLM-5.2 DSA prefill MQA-logits kernel.
+//! DSA prefill MQA-logits kernel.
 //!
 //! The cache stays on the physical `(num_queries, num_keys)` coordinates for
 //! the first implementation. The measured R.4 gate missed at `(363, 363)`

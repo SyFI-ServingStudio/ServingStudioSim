@@ -463,10 +463,6 @@ struct WorkInputs {
     post_attention_add_rms_norm: ResidualRmsNormKernelInput,
     num_prefill: u32,
     num_fresh: u32,
-    #[cfg(test)]
-    num_chunks: u32,
-    #[cfg(test)]
-    max_chunks: u32,
 }
 
 fn derive_work(input: &Qwen36GdnLocalWorkletInput) -> Result<WorkInputs, String> {
@@ -474,8 +470,6 @@ fn derive_work(input: &Qwen36GdnLocalWorkletInput) -> Result<WorkInputs, String>
         return Err("prefill lengths and initial-state flags must have equal length".into());
     }
     let mut prefill_tokens = 0_u64;
-    let mut chunks = 0_u64;
-    let mut max_chunks = 0_u64;
     for &length in &input.prefill_sequence_lengths {
         if length == 0 {
             return Err("prefill sequence lengths must be positive".into());
@@ -483,14 +477,6 @@ fn derive_work(input: &Qwen36GdnLocalWorkletInput) -> Result<WorkInputs, String>
         prefill_tokens = prefill_tokens
             .checked_add(u64::from(length))
             .ok_or("prefill token sum overflow")?;
-        let count = u64::from(length)
-            .checked_add(63)
-            .ok_or("chunk rounding overflow")?
-            / 64;
-        chunks = chunks
-            .checked_add(count)
-            .ok_or("chunk-count sum overflow")?;
-        max_chunks = max_chunks.max(count);
     }
     let total = prefill_tokens
         .checked_add(u64::from(input.decode_batch_size))
@@ -556,10 +542,6 @@ fn derive_work(input: &Qwen36GdnLocalWorkletInput) -> Result<WorkInputs, String>
         post_attention_add_rms_norm: ResidualRmsNormKernelInput { m: total },
         num_prefill,
         num_fresh,
-        #[cfg(test)]
-        num_chunks: u32::try_from(chunks).map_err(|_| "chunk count exceeds u32")?,
-        #[cfg(test)]
-        max_chunks: u32::try_from(max_chunks).map_err(|_| "maximum chunk count exceeds u32")?,
     })
 }
 
@@ -790,13 +772,8 @@ mod tests {
         })
         .unwrap();
         assert_eq!(
-            (
-                prefill.qkvz.num_tokens,
-                prefill.num_chunks,
-                prefill.max_chunks,
-                prefill.core_output_copy.num_tokens
-            ),
-            (128, 2, 2, 128)
+            (prefill.qkvz.num_tokens, prefill.core_output_copy.num_tokens),
+            (128, 128)
         );
         assert_eq!(
             (
@@ -816,11 +793,9 @@ mod tests {
             (
                 mixed.prefill.sequence_lengths.iter().sum::<u32>(),
                 mixed.num_prefill,
-                mixed.num_fresh,
-                mixed.num_chunks,
-                mixed.max_chunks
+                mixed.num_fresh
             ),
-            (70, 3, 2, 4, 2)
+            (70, 3, 2)
         );
         assert_eq!(
             (

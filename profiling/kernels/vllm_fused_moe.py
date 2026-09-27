@@ -33,6 +33,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from profiling.db.args import DType, KernelArgs
+from profiling.db.doc import CUPTI_METHOD, BackendDoc, KernelDoc, arg
 from profiling.db.outlier import BatchOutlierPolicy
 from profiling.db.registry import (
     BackendSupport,
@@ -67,15 +68,59 @@ class VllmFusedMoeArgs(KernelArgs):
     pick it exactly as production does.
     """
 
-    n: int
-    k: int
-    dtype: DType
-    num_local_experts: int
-    num_tokens: int
-    experts_per_token: int
-    launch_role: str
-    block_size: int
-    per_group_batches: tuple[int, ...]
+    n: int = arg(unit="elements", doc="Output features of this expert projection.")
+    k: int = arg(unit="elements", doc="Input features of this expert projection.")
+    dtype: DType = arg(doc="Element type of the FP8 activation and weight.")
+    num_local_experts: int = arg(unit="experts", doc="Experts whose weights reside on this GPU.")
+    num_tokens: int = arg(unit="tokens", doc="Tokens entering the routed MoE layer.")
+    experts_per_token: int = arg(unit="experts", doc="Experts selected for each token.")
+    launch_role: str = arg(doc="Projection role: w13 for gate/up or w2 for down.")
+    block_size: int = arg(unit="elements", doc="FP8 activation and weight scale granularity.")
+    per_group_batches: tuple[int, ...] = arg(
+        unit="tokens", doc="Selected token count for each local expert, in expert order."
+    )
+
+
+DOC = KernelDoc(
+    title="vLLM fused MoE GEMM",
+    summary=(
+        "Gather selected token rows and multiply them by FP8 expert weights in one Triton launch."
+    ),
+    description=(
+        "A routed MoE layer runs its expert projections as two launches of "
+        "vLLM's Triton fused_moe_kernel with FP8 block scales. The gate-up "
+        "launch (w13) reads one activation row per token; the down launch (w2) "
+        "reads one row per token-expert pair and multiplies by the router "
+        "weight. Each measured launch uses the tile sizes from vLLM's tuned "
+        "tables and the expert alignment vLLM would choose for the given "
+        "per-expert counts."
+    ),
+    category="MoE",
+    subcategory="Expert compute",
+    formula=(
+        "rows = sum(per_group_batches)",
+        "active_experts = count(per_group_batches > 0)",
+        "TFLOPS = 2·rows·n·k / time",
+        "logical_bytes = rows·k + 4·rows·⌈k/block_size⌉ "
+        "+ active_experts·n·k + 4·active_experts·⌈n/block_size⌉·⌈k/block_size⌉ "
+        "+ 2·rows·n",
+        "GB/s = logical_bytes / time",
+    ),
+    default_metric="tflops",
+    method=(
+        f"{CUPTI_METHOD} "
+        "Only the Triton launch is timed; expert alignment and one compiling "
+        "call run before it."
+    ),
+    caveats=(
+        "TFLOPS and GB/s count routed rows and active experts without the padded "
+        "tile work performed by the kernel.",
+        "Routing, alignment, activation quantization and final expert reduction "
+        "are outside the timed launch.",
+    ),
+    # No separate PyTorch reference module exists for this launch.
+    reference=None,
+)
 
 
 register(
@@ -94,6 +139,13 @@ register(
         args_schema=VllmFusedMoeArgs,
         metric_family=MetricFamily.COMPUTE,
         batch_outlier_policy=BatchOutlierPolicy(),
+        doc=BackendDoc(
+            summary=(
+                "vLLM invoke_fused_moe_triton_kernel with FP8 block scales "
+                "and its tuned expert alignment."
+            ),
+            url="https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/fused_moe/fused_moe.py",
+        ),
         subprocess_env="vllm_env",
     )
 )

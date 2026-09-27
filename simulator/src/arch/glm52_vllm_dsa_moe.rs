@@ -137,8 +137,8 @@ const FP8_SINGLE_GEMM_BACKENDS: &[&str] = &["deepgemm"];
 // dense leaves the routed curve over-predicted them ~2.05x at prefill.
 const DENSE_FP8_QUANT_BACKENDS: &[&str] = &["vllm_cuda"];
 const ROUTED_FP8_QUANT_BACKENDS: &[&str] = &["flashinfer_trtllm"];
-const Q_ABSORB_BACKENDS: &[&str] = &["torch_mla_q_absorb_glm52"];
-const V_UP_BACKENDS: &[&str] = &["torch_mla_v_up_glm52"];
+const Q_ABSORB_BACKENDS: &[&str] = &["torch_mla_q_absorb"];
+const V_UP_BACKENDS: &[&str] = &["torch_mla_v_up"];
 const INDEX_CACHE_AND_TOPK_BACKENDS: &[&str] = &["vllm_cuda"];
 const INDEX_LOGITS_BACKENDS: &[&str] = &["deepgemm_fp8"];
 const SPARSE_ATTN_BACKENDS: &[&str] = &["vllm_flashmla_bf16"];
@@ -2029,11 +2029,11 @@ mod tests {
         assert_eq!(cfg.dense_full_index_attention.gemm_dtype, DType::Bf16);
         assert_eq!(
             cfg.dense_full_index_attention.q_absorb_backends,
-            vec!["torch_mla_q_absorb_glm52"]
+            vec!["torch_mla_q_absorb"]
         );
         assert_eq!(
             cfg.dense_full_index_attention.v_up_backends,
-            vec!["torch_mla_v_up_glm52"]
+            vec!["torch_mla_v_up"]
         );
         assert_eq!(
             cfg.dense_full_index_attention.sparse_attention_backends,
@@ -2136,11 +2136,8 @@ mod tests {
             assert_eq!(attention.indexer_gemm_backends, vec!["deepgemm"]);
             assert_eq!(attention.gemm_dtype, DType::Fp8E4m3);
             assert_eq!(attention.base_dtype, DType::Bf16);
-            assert_eq!(
-                attention.q_absorb_backends,
-                vec!["torch_mla_q_absorb_glm52"]
-            );
-            assert_eq!(attention.v_up_backends, vec!["torch_mla_v_up_glm52"]);
+            assert_eq!(attention.q_absorb_backends, vec!["torch_mla_q_absorb"]);
+            assert_eq!(attention.v_up_backends, vec!["torch_mla_v_up"]);
         }
 
         let resolved = resolve_configs(&cfg);

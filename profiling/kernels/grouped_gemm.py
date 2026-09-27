@@ -28,6 +28,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from profiling.db.args import DType, KernelArgs
+from profiling.db.doc import CUPTI_METHOD, BackendDoc, KernelDoc, arg
 from profiling.db.outlier import BatchOutlierPolicy
 from profiling.db.registry import (
     BackendSupport,
@@ -42,13 +43,49 @@ KIND: str = "grouped_gemm"
 
 @dataclass(frozen=True)
 class GroupedGemmArgs(KernelArgs):
-    n: int
-    k: int
-    dtype: DType
-    num_local_experts: int
+    n: int = arg(unit="elements", doc="Output features in each expert weight.")
+    k: int = arg(unit="elements", doc="Input features in each expert weight.")
+    dtype: DType = arg(doc="Element type of the multiply; fp8_e4m3 writes bf16 output.")
+    num_local_experts: int = arg(unit="experts", doc="Experts assigned to this GPU.")
     # Actual batch per local expert; len == num_local_experts. A tuple so the
     # frozen args stay hashable; stored as a JSON-text DB column (§2.1 default).
-    per_group_batches: tuple[int, ...]
+    per_group_batches: tuple[int, ...] = arg(
+        unit="tokens", doc="Token rows assigned to each local expert, in expert order."
+    )
+
+
+DOC = KernelDoc(
+    title="Grouped GEMM",
+    summary="Multiply routed token batches by their respective MoE expert weights.",
+    description=(
+        "A MoE layer's expert projections run as one grouped GEMM: each local "
+        "expert multiplies its own token rows by its own weight. per_group_batches "
+        "lists the rows per expert, zeros included, so one total can be spread "
+        "evenly or skewed across experts. The torch backend runs one "
+        "torch._grouped_mm over the stacked rows. DeepGEMM pads each nonempty "
+        "expert's rows to its alignment and runs in fp8 with bf16 output."
+    ),
+    category="MoE",
+    subcategory="Expert compute",
+    formula=(
+        "C_g[m_g, n] = A_g[m_g, k] · B_g[k, n], with m_g = per_group_batches[g]",
+        "TFLOPS = 2·(Σ m_g)·n·k / time",
+        "torch GB/s = [(Σ m_g)·(k + n) + E_active·k·n]·bytes per element / time",
+        "deepgemm GB/s = [(Σ aligned(m_g))·(k + 2·n) + E_active·k·n] / time",
+        "E_active = number of experts with m_g > 0; aligned(0) = 0",
+    ),
+    default_metric="tflops",
+    method=(
+        f"{CUPTI_METHOD} DeepGEMM runs once before timing; the fp8 casts, padding "
+        "and expert-index construction are not timed."
+    ),
+    caveats=(
+        "GB/s counts only the weights of experts that have tokens.",
+        "For deepgemm, GB/s counts the padded rows and TFLOPS only the real ones.",
+    ),
+    # Neither measured backend has a separate PyTorch reference module.
+    reference=None,
+)
 
 
 register(
@@ -64,6 +101,11 @@ register(
         args_schema=GroupedGemmArgs,
         metric_family=MetricFamily.COMPUTE,
         batch_outlier_policy=BatchOutlierPolicy(),
+        doc=BackendDoc(
+            summary=(
+                "torch._grouped_mm with cumulative token offsets and one weight matrix per expert."
+            )
+        ),
     )
 )
 
@@ -83,5 +125,11 @@ register(
         args_schema=GroupedGemmArgs,
         metric_family=MetricFamily.COMPUTE,
         batch_outlier_policy=BatchOutlierPolicy(),
+        doc=BackendDoc(
+            summary=(
+                "DeepGEMM m_grouped_fp8_gemm_nt_contiguous with per-token activation "
+                "scales, per-block weight scales, and bf16 output."
+            ),
+        ),
     )
 )

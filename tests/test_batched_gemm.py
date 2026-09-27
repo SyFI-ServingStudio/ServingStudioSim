@@ -17,8 +17,8 @@ from profiling.db.registry import MetricFamily, find_kernel_profiler_spec, known
 from profiling.kernels.batched_gemm import KIND, BatchedGemmArgs
 from profiling.runners.exceptions import ProfilerNotImplemented
 
-_Q_BACKEND = "torch_mla_q_absorb_glm52"
-_V_UP_BACKEND = "torch_mla_v_up_glm52"
+_Q_BACKEND = "torch_mla_q_absorb"
+_V_UP_BACKEND = "torch_mla_v_up"
 
 
 def test_args_field_order_and_dtype_coercion():
@@ -62,7 +62,7 @@ def test_kind_table_backend_and_runner_ref_contract():
     assert spec.metric_family is MetricFamily.COMPUTE
     assert spec.subprocess_env is None
     assert spec.runner_ref.module_name == "profiling.runners.gemm.batched_gemm"
-    assert spec.runner_ref.function_name == "profile_mla_q_absorb_glm52"
+    assert spec.runner_ref.function_name == "profile_mla_q_absorb"
 
 
 def test_v_up_registration_reuses_kind_table_args_and_facade():
@@ -75,7 +75,7 @@ def test_v_up_registration_reuses_kind_table_args_and_facade():
     assert v_spec.metric_family is q_spec.metric_family is MetricFamily.COMPUTE
     assert v_spec.subprocess_env is None
     assert v_spec.runner_ref.module_name == "profiling.runners.gemm.batched_gemm"
-    assert v_spec.runner_ref.function_name == "profile_mla_v_up_glm52"
+    assert v_spec.runner_ref.function_name == "profile_mla_v_up"
 
 
 @pytest.mark.parametrize("backend", [_Q_BACKEND, _V_UP_BACKEND])
@@ -116,9 +116,9 @@ def test_runner_ref_resolves_without_importing_torch():
                 "import sys; "
                 "from profiling.db.registry import find_kernel_profiler_spec; "
                 "runner = find_kernel_profiler_spec("
-                "'batched_gemm', 'torch_mla_q_absorb_glm52').runner_ref.load(); "
+                "'batched_gemm', 'torch_mla_q_absorb').runner_ref.load(); "
                 "v_runner = find_kernel_profiler_spec("
-                "'batched_gemm', 'torch_mla_v_up_glm52').runner_ref.load(); "
+                "'batched_gemm', 'torch_mla_v_up').runner_ref.load(); "
                 "print(runner.__module__); "
                 "print(runner.__name__); "
                 "print(v_runner.__module__); "
@@ -132,9 +132,9 @@ def test_runner_ref_resolves_without_importing_torch():
     )
     assert completed.stdout.splitlines() == [
         "profiling.runners.gemm.batched_gemm",
-        "profile_mla_q_absorb_glm52",
+        "profile_mla_q_absorb",
         "profiling.runners.gemm.batched_gemm",
-        "profile_mla_v_up_glm52",
+        "profile_mla_v_up",
         "False",
     ]
 

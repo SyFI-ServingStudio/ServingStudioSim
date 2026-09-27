@@ -32,6 +32,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from profiling.db.args import DType, KernelArgs
+from profiling.db.doc import BackendDoc, KernelDoc, arg
 from profiling.db.outlier import BatchOutlierPolicy
 from profiling.db.registry import (
     BackendSupport,
@@ -46,17 +47,59 @@ KIND: str = "vllm_mla_rope"
 
 @dataclass(frozen=True)
 class VllmMlaRopeArgs(KernelArgs):
-    num_tokens: int
-    num_heads: int
-    qk_nope_head_dim: int
-    rope_dim: int
+    num_tokens: int = arg(unit="tokens", doc="Query token rows transformed together.")
+    num_heads: int = arg(unit="heads", doc="Query heads on this GPU.")
+    qk_nope_head_dim: int = arg(unit="elements", doc="Non-rotary columns in each query head.")
+    rope_dim: int = arg(unit="elements", doc="Rotary columns in each query head.")
     # The cos/sin table is gathered per token with an indirect index, so its
     # row count is a real cost axis rather than a value-only detail: it decides
     # whether the gather hits cache. `rope_theta` is deliberately absent -- it
     # only changes the table's values, never its shape or access pattern.
-    max_position: int
-    is_neox_style: bool
-    input_dtype: DType
+    max_position: int = arg(unit="positions", doc="Rows in the rotary lookup table.")
+    is_neox_style: bool = arg(doc="Whether the rotary dimensions use NeoX pairing.")
+    input_dtype: DType = arg(doc="Element type of the query and key inputs.")
+
+
+DOC = KernelDoc(
+    title="vLLM MLA query RoPE",
+    summary="Rotate the MLA query's positional columns and materialize the full query tensor.",
+    description=(
+        "In vLLM's MLA attention, RoPE changes only the rope_dim "
+        "columns of each query head, but the Inductor-compiled kernel reads and"
+        " writes the whole query, including the qk_nope_head_dim columns it "
+        "leaves unchanged, because vLLM writes the rotated slice back and then "
+        "passes the whole query to attention. The measurement compiles the same"
+        " block for one fixed shape, with sequential positions, and checks it "
+        "against an eager run before timing."
+    ),
+    category="Attention",
+    subcategory="MLA",
+    formula=(
+        "output query = [q_nope, RoPE(q_rope)]",
+        "GB/s = 2 · num_tokens · num_heads · (qk_nope_head_dim + rope_dim) · input bytes / time",
+    ),
+    default_metric="memory_bandwidth_gbps",
+    method=(
+        "GPU kernel time from CUPTI activity records, averaged over repeated "
+        "launches with the L2 cache flushed before each. The triton_poi_fused "
+        "launch is counted when Inductor emits it; for shapes where Inductor "
+        "declines the fusion, the union of all GPU busy intervals is taken "
+        "instead."
+    ),
+    caveats=(
+        "GB/s counts one full read and one full write of the query; the "
+        "rotary-table gather and the second read of the rotary columns are "
+        "excluded.",
+        "At decode-scale token counts the measurement is slower than serving, "
+        "where vLLM compiles a variant per CUDA-graph size; trust the prefill "
+        "range.",
+        "Once a worker process has compiled more shapes than dynamo's cache "
+        "limit, later shapes run a slower dynamic kernel, so rows filled in "
+        "large batches can read up to 5.5x slower.",
+    ),
+    # The eager comparison is local to the runner, not a separate reference module.
+    reference=None,
+)
 
 
 register(
@@ -76,5 +119,11 @@ register(
         metric_family=MetricFamily.COMPUTE,
         batch_outlier_policy=BatchOutlierPolicy(),
         subprocess_env="vllm_env",
+        doc=BackendDoc(
+            summary=(
+                "vLLM's native rotary embedding compiled by Inductor into one "
+                "full-query Triton kernel."
+            ),
+        ),
     )
 )

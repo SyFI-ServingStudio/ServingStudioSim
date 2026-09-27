@@ -33,6 +33,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from profiling.db.args import KernelArgs
+from profiling.db.doc import CUPTI_METHOD, BackendDoc, KernelDoc, arg
 from profiling.db.outlier import BatchOutlierPolicy
 from profiling.db.registry import (
     BackendSupport,
@@ -47,8 +48,43 @@ KIND: str = "elementwise"
 
 @dataclass(frozen=True)
 class ElementwiseArgs(KernelArgs):
-    input_size_bytes: int
-    output_size_bytes: int
+    input_size_bytes: int = arg(unit="bytes", doc="Total input bytes for the operation.")
+    output_size_bytes: int = arg(unit="bytes", doc="Total output bytes for the operation.")
+
+
+DOC = KernelDoc(
+    title="Elementwise byte pass",
+    summary=("Read a whole multiple of the output size, or nothing, and write the output."),
+    description=(
+        "The simulator prices small memory-bound steps by their bytes alone: a "
+        "MoE activation reads 2N bytes and writes N, a reduction over k inputs "
+        "reads kN, a copy reads N, and a zero fill reads nothing. The byte counts "
+        "cover the whole batch. Both backends work on uint8 buffers and round the "
+        "input-to-output ratio to a whole fan-in."
+    ),
+    category="Other",
+    formula=(
+        "fan-in = max(1, ⌊input_size_bytes / output_size_bytes + 0.5⌋), or 0 for zero-fill",
+        "GB/s = (input_size_bytes + output_size_bytes) / time",
+    ),
+    default_metric="memory_bandwidth_gbps",
+    method=(
+        f"{CUPTI_METHOD} Both backends run five warm-ups before timing. Triton "
+        "counts only the elementwise_fan_kernel or elementwise_zero_kernel launch; "
+        "torch counts every launch of its selected PyTorch operation."
+    ),
+    caveats=(
+        "The backends match byte counts, not values: Triton sums each fan-in, "
+        "while torch uses bitwise_not for one input or amax for multiple inputs.",
+        "GB/s uses the requested input bytes, although the rounded fan-in can "
+        "make the buffer actually read larger or smaller.",
+        "The Triton kernel picks its block size by autotuning once in each "
+        "profiling process, so rows measured in different processes can use "
+        "different configurations.",
+    ),
+    # Neither backend uses a separate PyTorch reference implementation.
+    reference=None,
+)
 
 
 
@@ -77,5 +113,14 @@ for _backend, _runner_module in (
             args_schema=ElementwiseArgs,
             metric_family=MetricFamily.COMPUTE,
             batch_outlier_policy=BatchOutlierPolicy(),
+            doc=BackendDoc(
+                summary=(
+                    "Triton kernels: elementwise_fan_kernel sums the fan-in uint8 "
+                    "inputs, elementwise_zero_kernel fills zeros."
+                    if _backend == "triton"
+                    else "Eager PyTorch: bitwise_not for fan-in 1, amax over the "
+                    "inputs for more, zero_ for a fill."
+                ),
+            ),
         )
     )
