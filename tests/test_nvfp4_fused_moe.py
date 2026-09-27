@@ -112,12 +112,16 @@ def test_weight_format_coerces_to_the_nvfp4_dtype() -> None:
     assert args.input_dtype is DType.BF16
 
 
-def test_backends_gate_on_nvfp4_compute_not_the_bf16_input() -> None:
+_FP8_BLOCK_BACKEND = "flashinfer_trtllm_fp8_block_sm100"
+
+
+def test_backends_gate_on_the_weight_format_not_the_bf16_input() -> None:
     """The Rust config tags weight_format as the compute dtype, so the launcher
-    asks for backends at nvfp4_e2m1. input_dtype (bf16) is only the activation
-    before the in-kernel quantization."""
-    both = sorted(known_backends(KIND))
-    assert sorted(supported_backends(KIND, DType.NVFP4_E2M1, None, "NVIDIA B200")) == both
+    asks for backends at nvfp4_e2m1 (or fp8_e4m3 for the FP8 block-scale
+    backend). input_dtype (bf16) is only the activation before quantization."""
+    nvfp4 = sorted(set(known_backends(KIND)) - {_FP8_BLOCK_BACKEND})
+    assert sorted(supported_backends(KIND, DType.NVFP4_E2M1, None, "NVIDIA B200")) == nvfp4
+    assert supported_backends(KIND, DType.FP8_E4M3, None, "NVIDIA B200") == [_FP8_BLOCK_BACKEND]
     assert supported_backends(KIND, DType.BF16, None, "NVIDIA B200") == []
     assert supported_backends(KIND, DType.NVFP4_E2M1, None, "NVIDIA H200") == []
     # A backend declared at bf16, as these were before, fails the gate.
@@ -138,7 +142,7 @@ def test_launcher_validation_accepts_nvfp4_roles_and_rejects_bf16_ones() -> None
     }
     (role,) = dedup_roles([record])
     assert role.compute is DType.NVFP4_E2M1
-    assert set(role.options) == set(known_backends(KIND))
+    assert set(role.options) == set(known_backends(KIND)) - {_FP8_BLOCK_BACKEND}
     backend_map = {"main": {"unified.moe.experts": ["flashinfer_trtllm_sm100"]}}
     assert validate_backend_map(backend_map, [role]) == []
     (bf16_role,) = dedup_roles([{**record, "compute_dtype": "bf16"}])

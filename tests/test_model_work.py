@@ -2311,7 +2311,7 @@ def test_glm53_locked_floor_uses_the_served_fp8_mla_cache(tmp_path):
         {"occurrences": 2, "totals": _g53_geometry_totals([], [2048] * 32)},
         {"occurrences": 1, "totals": _g53_geometry_totals([(0, 2048)], [])},
     ]
-    result = work_floors.compute_locked_compositions(tmp_path, {"main/0": shapes})["main/0"]
+    result = work_floors.compute_locked_compositions(tmp_path, {"main/0": _columns(shapes)})["main/0"]
     assert "error" not in result, result
     assert result["composition"]["affine_bases"] == 0
     rows = {segment["name"]: segment for segment in result["segments"]}

@@ -10,8 +10,6 @@ import pytest
 from profiling.runners.exceptions import ProfilerNotImplemented
 
 _VLLM_GDN_RUNNER_MODULES = (
-    "profiling.runners.attention.gdn_causal_conv_decode_vllm_triton",
-    "profiling.runners.attention.gdn_causal_conv_prefill_vllm_triton",
     "profiling.runners.attention.gdn_gated_rms_norm_vllm_triton",
     "profiling.runners.attention.gdn_prefill_post_conv_vllm_triton",
     "profiling.runners.attention.gdn_recurrent_decode_vllm_triton",
