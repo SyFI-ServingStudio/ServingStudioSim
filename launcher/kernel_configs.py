@@ -32,6 +32,7 @@ from typing import Any
 from profiling.db.kernel_config import RegisterReport, register_kernel_configs
 from profiling.perf_api import DB_PATH
 
+from .corpus import restore_hf_references
 from .exec import REPO_ROOT, _build_subprocess_env, binary_path
 from .process import ProcessSpec, ProcessSupervisor
 from .process.leases import LauncherLeases
@@ -44,7 +45,10 @@ _LAUNCHER_LEASES = LauncherLeases(REPO_ROOT)
 def run_sources(config: Mapping[str, Any], preset: str | None) -> dict[str, dict[str, Any]]:
     """What built each pool of a run config: the preset, and the pool's GPU and
     arch per group. Pool `""` is the deployment itself, for kernels built
-    outside any pool (AFD's attention-to-FFN transfer)."""
+    outside any pool (AFD's attention-to-FFN transfer). An artifact the preset
+    names by `hf://` reference is recorded by that reference, not by the local
+    file it resolved to."""
+    config = restore_hf_references(config)
     base = {"preset": _repo_relative(preset), "deployment": config["deployment"]}
     sources: dict[str, dict[str, Any]] = {"": {**base, "pool": None}}
     for pool, body in config["pools"].items():

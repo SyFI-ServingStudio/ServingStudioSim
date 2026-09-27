@@ -61,10 +61,10 @@ simulator's order of EP ranks by load) and `expert_demand` (the routing).
 which the configs list otherwise leaves out, as `{routing, label, reference,
 fingerprint, binding, preference}`. The routing and its file come from the arch
 blocks of the config's uses (`routing`, with its `list-params` default, and the
-file field `ROUTING_ARTIFACTS` gives it). A file this checkout tracks is labeled
-by its repo-relative path, a file in the local Hugging Face hub cache by its
-`hf://<repo>@<revision>/<path>` reference, any other file by its file name and
-the `fingerprint`; a synthetic routing by its name (`uniform`). `reference` is
+file field `ROUTING_ARTIFACTS` gives it). A hub artifact is labeled by the
+`hf://<repo>@<revision>/<path>` reference its preset wrote, which the launcher
+records instead of the file it fetched; a file this checkout tracks by its
+repo-relative path; any other file by its file name and the `fingerprint`; a synthetic routing by its name (`uniform`). `reference` is
 the path or `hf://` reference, null otherwise. The fingerprint is the demand's
 content: a corpus manifest's payload checksum, or a hash of the popularity table.
 `binding` is how the config reads it (a corpus's `group_size` and layer slice, a
@@ -94,8 +94,8 @@ its file name (an expert-demand corpus under a local HF cache, say).
   cached until the binary changes (`public_api/kernel/sources.py`);
 - GPU peaks: `gpu/spec.json`;
 - measurements: `profile.db`, aggregates cached until the file changes;
-- routing labels: `git ls-files` for the files this checkout tracks, and
-  `huggingface_hub.scan_cache_dir` for the local hub cache (`sources.py`);
+- routing labels: the registry's `hf://` references, and `git ls-files` for the
+  files this checkout tracks (`sources.py`);
 - which configs read which rows: the kernel-config registry in `profile.db`
   (`profiling/db/kernel_config.py`), filled by the launcher when a run or
   prediction builds its kernel cache.

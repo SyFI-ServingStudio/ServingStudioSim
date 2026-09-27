@@ -10,10 +10,11 @@ sources, which name the routing and its artifact:
 - ``routing``, the arch param (its ``list-params`` default where a block leaves it
   out), names a synthetic routing (``uniform``, ``random``) by itself;
 - a measured routing reads the arch field ``ROUTING_ARTIFACTS`` gives it
-  (``launcher/alignment_campaign/check.py``). A file this checkout tracks is named
-  by its repo-relative path, a file in the local Hugging Face hub cache by the
-  ``hf://`` reference that fetches it, any other file by its file name and the
-  fingerprint of the demand it produced.
+  (``launcher/alignment_campaign/check.py``). A hub artifact is named by the
+  ``hf://`` reference the preset wrote, which the launcher records in place of
+  the file it fetched (``launcher/corpus.py``); a file this checkout tracks by its
+  repo-relative path; any other file by its file name and the fingerprint of the
+  demand it produced.
 
 Every name carries that fingerprint: the corpus manifest's payload checksum, or
 a hash of the popularity table the config folds. ``binding`` holds how the config
@@ -28,6 +29,7 @@ from pathlib import Path
 from typing import Any
 
 from launcher.alignment_campaign.check import ROUTING_ARTIFACTS
+from launcher.corpus import HF_SCHEME
 from profiling.db.kernel_config import content_hash
 from public_api.kernel.sources import REPO_ROOT
 
@@ -64,20 +66,14 @@ def artifact_paths(archs: Iterable[dict]) -> list[str]:
     for arch in archs:
         for key, _ in ROUTING_ARTIFACTS.values():
             path = arch.get(key)
-            if isinstance(path, str) and path and (relative := _repo_relative(path)):
+            if (
+                isinstance(path, str)
+                and path
+                and not path.startswith(HF_SCHEME)
+                and (relative := _repo_relative(path))
+            ):
                 out.append(relative)
     return out
-
-
-def names_local_files(archs: Iterable[dict]) -> bool:
-    """Whether an arch block names an artifact outside the checkout (a hub
-    cache file, say)."""
-
-    return any(
-        isinstance(path := arch.get(key), str) and path and _repo_relative(path) is None
-        for arch in archs
-        for key, _ in ROUTING_ARTIFACTS.values()
-    )
 
 
 def _repo_relative(path: str) -> str | None:
@@ -89,15 +85,14 @@ def _repo_relative(path: str) -> str | None:
     return local.as_posix()
 
 
-def _artifact_name(
-    path: str, fingerprint: str, tracked: set[str], hub: dict[str, str]
-) -> tuple[str, str | None]:
-    """``(label, reference)`` of one artifact path as an arch block gave it
-    (repo-relative, or absolute). The reference is what a reader fetches or
-    opens it by; a file only the building machine had has none."""
+def _artifact_name(path: str, fingerprint: str, tracked: set[str]) -> tuple[str, str | None]:
+    """``(label, reference)`` of one artifact as an arch block gave it (an
+    ``hf://`` reference, a repo-relative path, or an absolute one). The
+    reference is what a reader fetches or opens it by; a file only the building
+    machine had has none."""
 
-    if path in hub:
-        return hub[path], hub[path]
+    if path.startswith(HF_SCHEME):
+        return path, path
     relative = _repo_relative(path)
     if relative in tracked:
         return relative, relative
@@ -109,14 +104,12 @@ def demand_name(
     archs: Iterable[dict],
     routing_default: Callable[[str | None], str | None],
     tracked: set[str],
-    hub: dict[str, str],
 ) -> dict | None:
     """The name of one config's ``expert_demand`` from the arch blocks that
     built it, or None when none names a routing (a deployment-level source).
 
     ``routing_default(arch_tag)`` is the arch's ``routing`` default; ``tracked``
-    holds the :func:`artifact_paths` git tracks, and ``hub`` maps hub-cache
-    files to their references (``KernelSources.hub_references``). Arch blocks
+    holds the :func:`artifact_paths` git tracks. Arch blocks
     that name the same demand differently (two files of equal content) are
     listed in ``label`` in turn."""
 
@@ -129,7 +122,7 @@ def demand_name(
         key = ROUTING_ARTIFACTS.get(routing, (None,))[0]
         path = arch.get(key) if key else None
         if isinstance(path, str) and path:
-            label, reference = _artifact_name(path, fingerprint, tracked, hub)
+            label, reference = _artifact_name(path, fingerprint, tracked)
         else:
             seed = arch.get("routing_seed")
             label = routing if seed is None else f"{routing}, seed {seed}"

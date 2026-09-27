@@ -635,7 +635,6 @@ def test_public_responses_carry_no_source_paths(supported) -> None:
 # The routed demand of five nvfp4_fused_moe configs and the arch blocks that
 # built each: the name comes from the blocks, the fingerprint from the demand.
 TRACKED = "presets/alignment/glm52_nvfp4_b200/expert_popularity.json"
-HUB_MANIFEST = "/hub/models--o--corpora/snapshots/abc/run1/manifest.json"
 HUB_REFERENCE = "hf://o/corpora@abc/run1/manifest.json"
 
 
@@ -689,11 +688,6 @@ def _nvfp4_record(demand: dict, position: int) -> dict:
     }
 
 
-class HubSources(Nvfp4Sources):
-    def hub_references(self) -> dict[str, str]:
-        return {HUB_MANIFEST: HUB_REFERENCE}
-
-
 @pytest.fixture
 def routings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[TestClient, dict]:
     monkeypatch.setattr(library, "kernel_doc", kernel_doc)
@@ -711,7 +705,7 @@ def routings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[TestClien
             _popularity(600_000),
             _moe_run(expert_popularity_file="/elsewhere/run/expert_popularity.json"),
         ),
-        "corpus": (CORPUS, _moe_run(routing="corpus", token_corpus_file=HUB_MANIFEST)),
+        "corpus": (CORPUS, _moe_run(routing="corpus", token_corpus_file=HUB_REFERENCE)),
     }
     hashes = {}
     for name, (demand, source) in built.items():
@@ -722,7 +716,7 @@ def routings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[TestClien
             {"main": source},
         )
         hashes[name] = kernel_config.content_hash(records[0]["identity"])
-    client = TestClient(create_app(KernelLibrary(HubSources(db_path=path))))
+    client = TestClient(create_app(KernelLibrary(Nvfp4Sources(db_path=path))))
     return client, hashes
 
 
@@ -750,7 +744,7 @@ def test_each_config_names_its_routing(routings) -> None:
     # A file this checkout tracks, named relative or absolute: its repo path.
     assert label["tracked"] == label["absolute"] == TRACKED
     assert names[hashes["tracked"]]["reference"] == TRACKED
-    # A hub cache file: the reference that fetches it.
+    # A hub artifact: the reference the preset wrote, as the launcher records it.
     assert label["corpus"] == names[hashes["corpus"]]["reference"] == HUB_REFERENCE
     # Any other file: its name and the demand's fingerprint, no path.
     outside = names[hashes["outside"]]
