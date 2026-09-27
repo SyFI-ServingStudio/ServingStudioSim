@@ -21,6 +21,8 @@ from profiling.db.doc import CUPTI_METHOD, KernelDoc, arg_docs, kernel_doc
 from profiling.db.registry import iter_kernel_profiler_specs
 from profiling.db.table import ProfileRow, Table
 from profiling.kernels.nvfp4_fused_moe import Nvfp4FusedMoeArgs
+from profiling.kernels.residual_rms_norm import ResidualRmsNormArgs
+from profiling.kernels.rms_norm import RmsNormArgs
 from profiling.kernels.single_gemm import SingleGemmArgs
 from profiling.runners.metrics import ComputeMetrics
 from public_api.app import PREFIX, create_app
@@ -446,10 +448,10 @@ def _row(m: int, n: int, backend: str) -> ProfileRow:
     )
 
 
-def _record(identity: dict, uses: list[dict]) -> dict:
+def _record(identity: dict, uses: list[dict], kind: str = "single_gemm") -> dict:
     return {
-        "kind": "single_gemm",
-        "profile_kind": "single_gemm",
+        "kind": kind,
+        "profile_kind": kind,
         "gpu_name": "NVIDIA H200",
         "identity": identity,
         "grid": {
@@ -922,6 +924,9 @@ def test_cost_tree_nests_the_manifest_in_the_analyzer_shape(registered) -> None:
     )
     assert root["label"] == "unified [dense TP (tp=4)]"
     embedding, layers = root["children"]
+    embedding_hash = kernel_config.content_hash(
+        {"input_bytes_per_token": 8192, "output_bytes_per_token": 8192}
+    )
     assert embedding == {
         "id": 1,
         "kind": "leaf",
@@ -930,9 +935,8 @@ def test_cost_tree_nests_the_manifest_in_the_analyzer_shape(registered) -> None:
             "name": "unified.embedding",
             "kind": "elementwise",
             "backends": ["triton"],
-            "config_hash": kernel_config.content_hash(
-                {"input_bytes_per_token": 8192, "output_bytes_per_token": 8192}
-            ),
+            "config_hash": embedding_hash,
+            "config_key": f"elementwise:{embedding_hash}",
         },
     }
     assert (layers["kind"], layers["n"], layers["label"]) == ("scale", 32, "layer")
@@ -949,20 +953,95 @@ def test_cost_tree_nests_the_manifest_in_the_analyzer_shape(registered) -> None:
     assert [r["slot"]["index"] for r in ranks["children"]] == [1, 2]
     # Structure only: no time anywhere in the tree.
     assert "timing" not in str(tree["sections"]) and "ms" not in tree
-    config = tree["configs"][qkv]
+    assert [r["slot"]["config_key"] for r in ranks["children"]] == [f"single_gemm:{qkv}"] * 2
+    config = tree["configs"][f"single_gemm:{qkv}"]
     assert config == {
         "kind": "single_gemm",
+        "config_hash": qkv,
         "args": QKV,
         "args_omitted": [],
         "registry": {"cells": 3, "infeasible": 1, "measured": {"torch": 2, "torch_linear": 1}},
     }
-    assert tree["configs"][mlp["slot"]["config_hash"]]["registry"] is None
+    assert tree["configs"][mlp["slot"]["config_key"]]["registry"] is None
     assert tree["kernels"]["single_gemm"] == {
         "documented": True,
         "title": "Dense GEMM",
         "category": "GEMM",
     }
     assert tree["kernels"]["elementwise"]["documented"] is False
+
+
+NORM = {"hidden": 4096, "dtype": "bf16"}
+
+
+class NormSources(FixtureSources):
+    """llama3_dense_tp whose tp_size 4 tree is two norm leaves of one shape:
+    ``rms_norm`` and ``residual_rms_norm``, whose identities are equal."""
+
+    def supported_cost_trees(self) -> list[dict]:
+        config = {"gpu_name": "NVIDIA H200", "backends": ["torch"], **NORM}
+        build = _llama_build(4)
+        build["cost_manifest"]["sections"][0] = {
+            "section": "iter",
+            "slots": [
+                {"name": f"unified.{kind}", "kind": kind, "kernel_config": config}
+                for kind in ("rms_norm", "residual_rms_norm")
+            ],
+            "nodes": [{"Sum": {"children": {"start": 1, "end": 3}}}, {"Leaf": 0}, {"Leaf": 1}],
+            "node_labels": [None] * 3,
+        }
+        return [_llama_build(1), build]
+
+
+def test_two_kinds_of_one_identity_are_two_configs(tmp_path: Path) -> None:
+    """A config hash leaves the kind out, so both norms hash alike; the tree
+    keys a config by kind and hash, as the registry does, and counts both."""
+
+    path = tmp_path / "norms.db"
+    # rms_norm has a row of the shape; residual_rms_norm only one of another.
+    for kind, args, backend in (
+        ("rms_norm", RmsNormArgs(m=1, hidden=4096, dtype=DType.BF16), "flashinfer"),
+        ("residual_rms_norm", ResidualRmsNormArgs(m=1, hidden=8192, dtype=DType.BF16), "torch"),
+    ):
+        Table(next(iter_kernel_profiler_specs(kind)), path).insert(
+            [
+                ProfileRow(
+                    args=args,
+                    metrics=ComputeMetrics(time_ms=0.01, tflops=1.0, memory_bandwidth_gbps=1.0),
+                    gpu_name="NVIDIA H200",
+                    backend=backend,
+                    profiler_git_hash="abc",
+                    profiler_run_at="2026-09-26T00:00:00+00:00",
+                )
+            ]
+        )
+    for kind in ("rms_norm", "residual_rms_norm"):
+        kernel_config.register_kernel_configs(
+            path,
+            {
+                "schema_version": kernel_config.RECORDS_SCHEMA_VERSION,
+                "configs": [_record(NORM, [{"pool": "main", "role": f"unified.{kind}"}], kind)],
+            },
+            {"main": _supported(4)},
+        )
+    client = TestClient(create_app(KernelLibrary(NormSources(db_path=path))))
+    tree = client.get(f"{PREFIX}/archs/llama3_dense_tp/cost-tree", params=LLAMA_TP4).json()
+    norm = kernel_config.content_hash(NORM)
+    slots = [leaf["slot"] for leaf in tree["sections"][0]["root"]["children"]]
+    assert [s["config_hash"] for s in slots] == [norm, norm]
+    assert [s["config_key"] for s in slots] == [f"rms_norm:{norm}", f"residual_rms_norm:{norm}"]
+    configs = tree["configs"]
+    assert set(configs) == {s["config_key"] for s in slots}
+    assert [configs[s["config_key"]]["kind"] for s in slots] == ["rms_norm", "residual_rms_norm"]
+    assert configs[f"rms_norm:{norm}"]["registry"]["measured"] == {"flashinfer": 1}
+    assert configs[f"residual_rms_norm:{norm}"]["registry"]["measured"] == {}
+    assert tree["counts"] == {"leaves": 2, "configs": 2, "registered": 2, "measured": 1}
+    [param_set] = client.get(f"{PREFIX}/archs/llama3_dense_tp").json()["param_sets"]
+    assert param_set["members"][1]["counts"] == tree["counts"]
+    # The kernel library reads each kind's registry on its own already.
+    for kind in ("rms_norm", "residual_rms_norm"):
+        config = client.get(f"{PREFIX}/kernels/{kind}/configs/{norm}").json()
+        assert (config["kind"], config["config_hash"]) == (kind, norm)
 
 
 @pytest.mark.parametrize(

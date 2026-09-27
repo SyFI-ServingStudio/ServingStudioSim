@@ -94,11 +94,12 @@ shape of a kernel's deployment entry (`arch`, `gpu`, `model_config`, `model`,
 `params`, `varies`, `label`, `members`; the same `row_entry` code builds both).
 Each member is one combination of the values the row lists and adds `label`,
 `query` (the cost-tree query that names it), `gpus_per_replica`, `error` (the
-build's, null when it built) and `counts`: `leaves`, distinct kernel `configs`,
-and how many of those profile.db's registry holds (`registered`) and has any
-measured row for (`measured`), and `run`: which registered run the counts are
-of (`basis` `registry`, with its `params`, source names and how many distinct
-runs the set has) or `defaults`. A combination two rows cover belongs to the first.
+build's, null when it built) and `counts`: `leaves`, distinct kernel `configs`
+(each kind and config hash once), and how many of those profile.db's registry
+holds (`registered`) and has any measured row for (`measured`), and `run`:
+which registered run the counts are of (`basis` `registry`, with its
+`params`, source names and how many distinct runs the set has) or `defaults`.
+A combination two rows cover belongs to the first.
 
 ### Which run a tree is built as
 
@@ -175,31 +176,36 @@ The document has the set's `arch`, `name`, `gpu`, `model_config`, `model`, `para
   its composite line (worklet and partition) when Rust gives one. A composite's
   `path` is the dotted role its leaves share;
 - a leaf is `{id, kind: "leaf", slot: {index, name, kind, backends,
-  config_hash}}`: the slot index (the order of a cost log's `slot_*` columns),
-  the dotted leaf name, the kernel kind (its page is `/kernels/{kind}`), the
-  backends the config may run, and the config's hash, the key of
-  `/kernels/{kind}/configs/{config_hash}`;
-- `configs`: `{config_hash: {kind, args, args_omitted, registry}}`, each leaf
-  config once (rank copies share one): its scalar identity fields, the names of
-  the structured ones, and `registry` (`{cells, infeasible, measured}` per
-  backend on this GPU) or null when the registry does not hold it;
+  config_hash, config_key}}`: the slot index (the order of a cost log's
+  `slot_*` columns), the dotted leaf name, the kernel kind (its page is
+  `/kernels/{kind}`), the backends the config may run, the config's hash (with
+  the kind, the key of `/kernels/{kind}/configs/{config_hash}`), and
+  `config_key`, `"<kind>:<config_hash>"`, its entry in `configs`;
+- `configs`: `{config_key: {kind, config_hash, args, args_omitted, registry}}`,
+  each leaf config once (rank copies share one): its scalar identity fields,
+  the names of the structured ones, and `registry` (`{cells, infeasible,
+  measured}` per backend on this GPU) or null when the registry does not hold
+  it. A config is keyed by kind and hash, as the registry keys it: the hash is
+  of the identity, which leaves the kind out, so two kinds of one shape (a
+  prefill and a decode attention, `rms_norm` and `residual_rms_norm`) share a
+  hash and are two configs;
 - `kernels`: `{kind: {documented, title, category}}` for the kinds the leaves use.
 
 A leaf's config hash is computed from the leaf's own Rust config
 (`KernelConfig::identity`: every field but `gpu_name` and `backends`, each
-`Dim` reduced to its value, then `content_hash`), so it names the same config
-the registry does; a binary-backed test checks it against the records
-`supported-cost-trees --kernel-configs` writes.
+`Dim` reduced to its value, then `content_hash`), so with its kind it names
+the same config the registry does; a binary-backed test checks it against the
+records `supported-cost-trees --kernel-configs` writes.
 
 The node and leaf shapes are the Analyzer's cost-tree transport
 (ServingStudioUI `artifacts/schema/costTree`: `{kind, label?, children,
 overlap | n}`, a leaf's `slot` with `name` and `kind`) without the numbers a
 prediction adds there (`base`, `stats`, and the per-node `ms` and `pct`). Two
-differences are deliberate: a leaf carries `config_hash` and `backends` instead
-of the whole `kernel_config` (its `Dim` bindings run to megabytes on the GLM
-trees; the config route has it), and every node keeps `id` and every leaf its
-slot `index`, so a prediction can return times by node and by slot without
-resending the tree.
+differences are deliberate: a leaf carries `config_hash`, `config_key` and
+`backends` instead of the whole `kernel_config` (its `Dim` bindings run to
+megabytes on the GLM trees; the config route has it), and every node keeps
+`id` and every leaf its slot `index`, so a prediction can return times by node
+and by slot without resending the tree.
 
 ## Later: predictions
 

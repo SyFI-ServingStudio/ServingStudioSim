@@ -15,7 +15,8 @@ Every field comes from a source that lives with the code:
   a set no registered run matches falls back to ``supported-cost-trees``, which
   builds it with every other param at its schema default;
 - a leaf's kernel config hash: the leaf's Rust config reduced to its identity,
-  the same ``content_hash`` profile.db's kernel-config registry keys configs by;
+  the same ``content_hash`` profile.db's kernel-config registry keys configs by
+  with their kind; a tree keys a config by both (:func:`config_key`);
 - whether a leaf's config is measured: the registry and the rows it reads
   (``KernelLibrary._summaries``);
 - names: ``model/arch_catalog.yaml`` for archs, ``model/catalog.yaml`` for
@@ -184,6 +185,14 @@ def config_identity(kernel_config: dict) -> dict:
     return identity
 
 
+def config_key(kind: str, config_hash: str) -> str:
+    """A tree's key for a leaf config, ``<kind>:<config_hash>``. The registry
+    keys a config by kind and hash: an identity leaves the kind out, so two
+    kinds of one shape (a prefill and a decode attention) share a hash."""
+
+    return f"{kind}:{config_hash}"
+
+
 def _common_path(paths: list[str | None]) -> str | None:
     """The longest dotted prefix every path shares: the role a composite covers."""
 
@@ -204,7 +213,8 @@ def _section_tree(manifest: dict, configs: dict[str, dict]) -> dict:
     its ``overlap`` divisor and ``scale`` with its repeat ``n``. Every node
     keeps its flat index as ``id`` and each leaf its slot ``index``, the orders
     a cost log and a prediction report use. A composite's ``path`` is the
-    dotted role its leaves share. Adds each leaf's config to ``configs``."""
+    dotted role its leaves share. Adds each leaf's config to ``configs`` under
+    its :func:`config_key`, which the leaf's slot names."""
 
     slots, nodes, labels = manifest["slots"], manifest["nodes"], manifest["node_labels"]
 
@@ -214,7 +224,10 @@ def _section_tree(manifest: dict, configs: dict[str, dict]) -> dict:
             slot = slots[body]
             identity = config_identity(slot["kernel_config"])
             config_hash = content_hash(identity)
-            configs.setdefault(config_hash, {"kind": slot["kind"], "identity": identity})
+            key = config_key(slot["kind"], config_hash)
+            configs.setdefault(
+                key, {"kind": slot["kind"], "config_hash": config_hash, "identity": identity}
+            )
             node = {
                 "id": i,
                 "kind": "leaf",
@@ -224,6 +237,7 @@ def _section_tree(manifest: dict, configs: dict[str, dict]) -> dict:
                     "kind": slot["kind"],
                     "backends": list(slot["kernel_config"].get("backends") or ()),
                     "config_hash": config_hash,
+                    "config_key": key,
                 },
             }
             path = slot["name"]
@@ -318,16 +332,16 @@ class ArchLibrary:
         return self.sources.cached_by_db(("arch-registered", kind), compute)
 
     def _config_status(self, build: dict, gpu: str) -> dict[str, dict | None]:
-        """Each of a build's configs' registry status on ``gpu``, or None when
-        the registry does not hold it."""
+        """Each of a build's configs' registry status on ``gpu``, by its
+        :func:`config_key`, or None when the registry does not hold it."""
 
         return {
-            config_hash: (
-                self._registered(config["kind"]).get((config_hash, gpu))
+            key: (
+                self._registered(config["kind"]).get((config["config_hash"], gpu))
                 if config["kind"] in self.kernels.specs
                 else None
             )
-            for config_hash, config in build["configs"].items()
+            for key, config in build["configs"].items()
         }
 
     # -- parameter sets ------------------------------------------------------------
@@ -902,15 +916,16 @@ class ArchLibrary:
                 status = self._member_status(build, gpu)
             configs, kernels = {}, {}
             config_status = self._config_status(build, gpu) if build else {}
-            for config_hash, config in (build or {"configs": {}})["configs"].items():
+            for ref, config in (build or {"configs": {}})["configs"].items():
                 args, omitted = kernel_library._config_args(
                     kernel_library._without_local_paths(config["identity"])
                 )
-                configs[config_hash] = {
+                configs[ref] = {
                     "kind": config["kind"],
+                    "config_hash": config["config_hash"],
                     "args": args,
                     "args_omitted": omitted,
-                    "registry": config_status.get(config_hash),
+                    "registry": config_status.get(ref),
                 }
                 if config["kind"] not in kernels:
                     doc = kernel_library.kernel_doc(config["kind"])
