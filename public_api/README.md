@@ -34,7 +34,7 @@ All `GET`, under `/api/public/v1`.
 | `/kernels/{kind}/configs/{config_hash}` | One config's grid on the simulator's cache axes: each cell's coordinates, profile.db args, whether the kernel can run it, and each backend's measured metrics there; plus the full identity, its uses, and the `deployments` entries they name. `gpu` is required only when the config is registered on more than one GPU |
 | `/archs` | Every arch tag: `name` and `summary` (`model/arch_catalog.yaml`), `contract`, the `models` (model-config stems) and `gpus` its `#[supported]` rows run, their model `families`, the `params` the rows choose between, and how many `param_sets` and `combinations` it supports; plus `models`, the catalog entries they name |
 | `/archs/{arch}` | One arch: every param (`list-params`: type, default, choices, description, `set_when_predicting` on a traffic param, and `values`, the values its rows list, null for a param no row chooses), the `query` names of its cost trees, and its supported `param_sets` |
-| `/archs/{arch}/cost-tree` | One supported parameter set's cost tree, chosen by the query: `gpu`, `model` (a model-config stem) and every param the arch's rows name, all required. The structure only: no timings |
+| `/archs/{arch}/cost-tree` | One supported parameter set's cost tree, chosen by the query: `gpu`, `model` (a model-config stem) and every param the arch's rows name, all required, and optionally the run params of one of the set's registered runs (below). The structure only: no timings |
 
 A deployment entry is one `#[supported]` row on one GPU and model config:
 `arch`, `gpu`, `model_config` (the file stem of a `model/config/` file, as
@@ -96,29 +96,75 @@ Each member is one combination of the values the row lists and adds `label`,
 `query` (the cost-tree query that names it), `gpus_per_replica`, `error` (the
 build's, null when it built) and `counts`: `leaves`, distinct kernel `configs`,
 and how many of those profile.db's registry holds (`registered`) and has any
-measured row for (`measured`). A combination two rows cover belongs to the first.
+measured row for (`measured`), and `run`: which registered run the counts are
+of (`basis` `registry`, with its `params`, source names and how many distinct
+runs the set has) or `defaults`. A combination two rows cover belongs to the first.
 
-`cost-tree` rejects a query it would have to guess at: a missing param, one
-the rows do not choose (the tree takes its default; the document lists those
-under `defaults` or `set_when_predicting`) or a mistyped value is a 400, and a
-set no row covers a 404.
-Both answer `{"detail": {"message", "choices"}}`, `choices` being every valid
-query.
+### Which run a tree is built as
 
-A tree comes from `simulator supported-cost-trees`, which builds every supported
-combination structure-only with every other param at its schema default. The
-document has the set's `arch`, `name`, `gpu`, `model_config`, `model`, `params`,
+The params a set leaves open (`max_model_len`, MoE `routing` and its file,
+`draft_tokens`, ...) change the tree, and their schema defaults are no run
+anyone made: `max_model_len` 1,048,576, routing `uniform`. So a tree is built
+as a real run of the set, read from the kernel-config registry in profile.db:
+
+- a run is the arch block of one `_kernel_config_source` group (a preset's
+  pool, an alignment case, a `timing_predict` config) whose arch, GPU, model
+  config and set params equal the set's (`KernelLibrary._deployment`, defaults
+  filled). A `supported` source is not a run: it records the defaults tree;
+- a run's params are its block's params besides the set's, each it leaves out
+  at its default. A run that leaves out a `set_when_predicting` param (MoE
+  `routing`) built uniform demand without choosing it, so it is skipped:
+  uniform routing is offered only where a run named it;
+- each distinct run is built structure-only with its own block by `simulator
+  supported-cost-trees --archs -` (a JSON list of `{gpu, arch}` on stdin),
+  its model config and routing files as local paths. An `hf://` corpus is used
+  only when the local hub cache holds it (`resolve_reference(local_only=True)`:
+  nothing is downloaded); a run naming a file this machine lacks is skipped;
+- each is counted as the defaults tree is, and the set's runs are ordered best
+  first: most configs measured, then the higher measured share, then a preset
+  over an alignment case over a prediction, then registration order. A run's
+  registered config count is no denominator: registration skips configs with
+  no measured row;
+- a set no run matches (or whose runs were all skipped) is built at its
+  defaults by `supported-cost-trees`, as before.
+
+The runs of every set of an arch are built together, in parallel processes,
+and kept until profile.db or the binary changes; the server's warm-up thread
+builds every arch's.
+
+`cost-tree` rejects a query it would have to guess at: a missing param, a
+name neither the rows nor the set's registered runs choose, or a mistyped value
+is a 400; a set no row covers, or run params no registered run of the set used,
+a 404. Both answer `{"detail": {"message", "choices"}}`, `choices` being every
+valid query (for run params, the full query of each run). Run params in the
+query need not name every one: the best run holding the given values is built.
+
+The document has the set's `arch`, `name`, `gpu`, `model_config`, `model`, `params`,
 `label`, `query`, `defaults`, `set_when_predicting`, `gpus_per_replica`, `counts` and:
 
-- `defaults`: `{name: default}` for each param the rows leave open, and
+- `run`: `basis` (`registry` or `defaults`); `params`, the run params the tree
+  was built with, a routing file named as a reader names it (the `hf://`
+  reference, the repo path when git tracks it, else its file name and the
+  demand's fingerprint; never another machine's path); `sources`, the registry
+  sources that recorded that run (`{id, kind, path, name}`, an alignment case
+  also `variant` and `cases`; `path` only when this checkout tracks it);
+  `routing`, its routing's name as `/kernels/.../configs` gives it; `query`,
+  the full cost-tree query of the run; `pickers`, one per run param (the
+  routing and its file as one) with `options`: the values the set's runs used,
+  each `selected`, `compatible` (a run has it and every other picker's
+  selection) and the `counts` of the run choosing it lands on, and `fixed`
+  when there is one option; `combinations`, how many runs; and `skipped`, the
+  runs not built here with the reason;
+- `defaults`: with a registered run, `{name: default}` for each run param its
+  block left out; at the defaults, for each param the rows leave open, and
   `set_when_predicting`: the names of those that `list-params` marks
   `set_when_predicting` (`#[param(set_when_predicting)]` in Rust). Such a param
   describes the traffic, not the deployment: MoE `routing`, whose `uniform`
   default only lets a config omit it and is no choice for a prediction
   (`skills/operate-run-simulation/references/moe-routing.md`), so it is not
-  listed as a default. The build still used that default, so a MoE tree's
+  listed as a default. The defaults build still used it, so such a tree's
   fused-MoE leaves name uniform-demand configs (`expert_demand`) until a
-  prediction sets the routing;
+  prediction sets the routing. A registered run recorded it, so its list is empty;
 
 - `sections`: `[{section, root}]`, one per compiled CostTree (`iter` for an
   iter-wise arch; `attn`, or `prologue`, `pre_attn`, `post_attn`, ... for the
@@ -187,7 +233,8 @@ of the tree the reader already has.
   (reread when it changes, no restart);
 - compute dtype columns: `simulator kernel-list`; arch params and `#[supported]`
   rows: `simulator list-params`; every supported combination's cost tree:
-  `simulator supported-cost-trees`; all cached until the binary changes
+  `simulator supported-cost-trees`, and a registered run's with `--archs`;
+  all cached until the binary changes
   (`public_api/kernel/sources.py`);
 - arch names: `model/arch_catalog.yaml`, reread when it changes
   (`public_api/arch/library.py`);

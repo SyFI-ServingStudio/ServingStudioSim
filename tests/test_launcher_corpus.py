@@ -235,3 +235,27 @@ def test_the_resolved_copy_is_written_only_under_the_run_directory_lease(
 
     assert seen_before_lease == [False]
     assert copy.is_file()
+
+
+def test_a_local_only_reference_reads_the_hub_cache_and_never_downloads(tmp_path, monkeypatch):
+    from huggingface_hub import constants
+
+    def no_download(*args):
+        raise AssertionError("local_only must not reach the network")
+
+    monkeypatch.setattr(corpus_module, "_download", no_download)
+    monkeypatch.setattr(constants, "HF_HUB_CACHE", str(tmp_path / "hub"))
+    reference = f"hf://uw/corpora@{SHA}/glm53/manifest.json"
+    with pytest.raises(CorpusError, match="not in the local hub cache"):
+        corpus_module.resolve_reference(reference, local_only=True)
+
+    # The same snapshot, laid out in the cache the way a download leaves it.
+    snapshot = tmp_path / "hub" / "models--uw--corpora" / "snapshots" / SHA / "glm53"
+    snapshot.mkdir(parents=True)
+    (snapshot / "manifest.json").write_text(json.dumps({"data_file": "routes.u16"}))
+    with pytest.raises(CorpusError, match="routes.u16"):
+        corpus_module.resolve_reference(reference, local_only=True)
+    (snapshot / "routes.u16").write_bytes(b"\x00\x01")
+    assert corpus_module.resolve_reference(reference, local_only=True) == str(
+        snapshot / "manifest.json"
+    )

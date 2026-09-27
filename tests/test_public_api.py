@@ -174,6 +174,12 @@ class FixtureSources(KernelSources):
     def supported_cost_trees(self) -> list[dict]:
         return [_llama_build(1), _llama_build(4)]
 
+    def arch_cost_trees(self, blocks: list[dict]) -> list[dict]:
+        """``supported-cost-trees --archs``: a Llama block builds as its row's
+        combination does."""
+
+        return [_llama_build(block["arch"]["tp_size"]) for block in blocks]
+
 
 @pytest.fixture
 def db(tmp_path: Path) -> Path:
@@ -941,7 +947,8 @@ def test_cost_tree_nests_the_manifest_in_the_analyzer_shape(registered) -> None:
     # Both ranks are one config: the Dims reduce to the registered qkv identity.
     assert [r["slot"]["config_hash"] for r in ranks["children"]] == [qkv, qkv]
     assert [r["slot"]["index"] for r in ranks["children"]] == [1, 2]
-    assert "timing" not in str(tree) and "ms" not in tree
+    # Structure only: no time anywhere in the tree.
+    assert "timing" not in str(tree["sections"]) and "ms" not in tree
     config = tree["configs"][qkv]
     assert config == {
         "kind": "single_gemm",
@@ -1052,3 +1059,244 @@ def test_the_arch_catalog_names_every_arch_tag(tmp_path: Path) -> None:
     named = yaml.safe_load((REPO_ROOT / "model" / "arch_catalog.yaml").read_text())
     assert set(named) == tags
     assert all(entry["name"] and entry["summary"] for entry in named.values())
+
+
+# -- trees built as registered runs ------------------------------------------------
+
+GATE_ON = {"n": 256, "k": 4096, "dtype": "bf16"}
+MOE_QUERY = {"gpu": "NVIDIA H200", "model": "moe_m", "ep_size": "4"}
+MOE_TREE = f"{PREFIX}/archs/moe_x/cost-tree"
+POPULARITY = "presets/popularity.json"
+PACK = "presets/alignment/moe_x"
+
+
+def _moe_block(**params) -> dict:
+    return {"type": "moe_x", "model_config": "model/config/moe_m.json", "ep_size": 4, **params}
+
+
+def _moe_source(block: dict, *, preset: str | None = None, cases: list[str] | None = None) -> dict:
+    source = {
+        "deployment": "unified",
+        "pool": "main",
+        "preset": preset,
+        "groups": [{"gpu": "NVIDIA H200", "arch": block}],
+    }
+    if cases is not None:
+        source["alignment"] = {"pack": PACK, "variant": "ep4", "cases": cases}
+    return source
+
+
+def _moe_build(block: dict) -> dict:
+    """A moe_x tree: qkv (always measured), the gate (measured only with
+    ``mtp_mode`` off) and the experts, whose config carries the routed demand
+    the block's routing gives (``uniform`` where the block names none, as the
+    binary defaults it)."""
+
+    gate = GATE if block.get("mtp_mode", "off") == "off" else GATE_ON
+    share = 250_000 if block.get("routing", "uniform") == "uniform" else 400_000
+    config = {"gpu_name": "NVIDIA H200", "backends": ["torch"]}
+    slots = [
+        {"name": "unified.qkv", "kind": "single_gemm", "kernel_config": {**config, **QKV}},
+        {"name": "unified.moe.gate", "kind": "single_gemm", "kernel_config": {**config, **gate}},
+        {
+            "name": "unified.moe.experts",
+            "kind": "moe_experts",
+            "kernel_config": {**config, "expert_demand": _popularity(share)},
+        },
+    ]
+    nodes = [{"Sum": {"children": {"start": 1, "end": 4}}}, {"Leaf": 0}, {"Leaf": 1}, {"Leaf": 2}]
+    return {
+        "contract": "iter_wise",
+        "arch": "moe_x",
+        "gpu": "NVIDIA H200",
+        "params": {k: v for k, v in block.items() if k != "type"},
+        "gpus_per_replica": 4,
+        "cost_manifest": {
+            "sections": [
+                {"section": "iter", "slots": slots, "nodes": nodes, "node_labels": [None] * 4}
+            ]
+        },
+        "error": None,
+    }
+
+
+class RunSources(FixtureSources):
+    """``moe_x`` with one ``#[supported]`` row on the H200 and the routing
+    files a run names; the binary builds a block with :func:`_moe_build`,
+    and git tracks the preset, the pack and the popularity file."""
+
+    built: list[dict]
+
+    def deployment_schema(self) -> dict:
+        schema = copy.deepcopy(SCHEMA)
+        moe = schema["providers"]["arch"]["iter_wise"]["moe_x"]
+        moe["supported"] = [{"gpu": ["NVIDIA H200"], "model_config": ["moe_m"], "ep_size": [4]}]
+        moe["params"] = [p for p in moe["params"] if p["name"] != "popularity_file"] + [
+            {"name": "expert_popularity_file", "type": "string", "affects_cache": True},
+            {"name": "token_corpus_file", "type": "string", "affects_cache": True},
+        ]
+        return schema
+
+    def supported_cost_trees(self) -> list[dict]:
+        # The defaults tree: every param at its default, routing uniform.
+        build = _moe_build(_moe_block())
+        build["params"] = {"model_config": "moe_m", "ep_size": 4}
+        return [build]
+
+    def arch_cost_trees(self, blocks: list[dict]) -> list[dict]:
+        self.built = [*getattr(self, "built", []), *blocks]
+        return [_moe_build(block["arch"]) for block in blocks]
+
+    def tracked(self, paths: list[str]) -> set[str]:
+        return {p for p in paths if p in ("presets/moe_x.yaml", POPULARITY, PACK)}
+
+
+@pytest.fixture
+def runs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Registered runs of the moe_x set, in registration order:
+
+    - an alignment case, popularity routing, ``mtp_mode`` off: 2 of 3 measured;
+    - a preset with the same params: the same run, recorded twice;
+    - an alignment case with ``mtp_mode`` on: 1 of 3;
+    - a preset with ``popularity2.json``, ``mtp_mode`` off: 2 of 3, as the first;
+    - a run that did not record its routing (built uniform), and one naming a
+      hub corpus this machine does not hold: both skipped;
+    - the ``supported`` source, which registers the defaults tree: never a run.
+    """
+
+    root = tmp_path / "repo"
+    (root / "model" / "config").mkdir(parents=True)
+    (root / "model" / "config" / "moe_m.json").write_text("{}")
+    (root / "presets").mkdir()
+    (root / POPULARITY).write_text("{}")
+    (root / "presets" / "popularity2.json").write_text("{}")
+    monkeypatch.setattr(arch_library, "REPO_ROOT", root)
+
+    from launcher import corpus
+
+    def no_download(*args):
+        raise AssertionError("the public API never downloads")
+
+    monkeypatch.setattr(corpus, "_download", no_download)
+    monkeypatch.setattr(corpus, "_cached", lambda *a: (_ for _ in ()).throw(FileNotFoundError()))
+
+    path = tmp_path / "runs.db"
+    table = Table(next(iter_kernel_profiler_specs("single_gemm")), path)
+    table.insert([_row(1, 6144, "torch"), _row(1, 512, "torch")])
+    popular = {"routing": "popularity", "expert_popularity_file": POPULARITY, "mtp_mode": "off"}
+    _register(path, QKV, _moe_source(_moe_block(**popular), cases=["01_micro"]))
+    _register(path, GATE, _moe_source(_moe_block(**popular), preset="presets/moe_x.yaml"))
+    _register(path, GATE_ON, _moe_source(_moe_block(**{**popular, "mtp_mode": "on"}), cases=["02"]))
+    second = {**popular, "expert_popularity_file": "presets/popularity2.json"}
+    _register(path, QKV, _moe_source(_moe_block(**second), preset="presets/moe_y.yaml"))
+    _register(path, QKV, _moe_source(_moe_block(mtp_mode="off"), preset="presets/old.yaml"))
+    corpus_run = {"routing": "corpus", "token_corpus_file": "hf://o/c@abc1234/r/manifest.json"}
+    _register(path, QKV, _moe_source(_moe_block(**corpus_run), preset="presets/moe_x.yaml"))
+    supported = {"arch": "moe_x", "gpu": "NVIDIA H200", "params": {"model_config": "moe_m"}}
+    _register(
+        path, QKV, {"supported": {**supported, "params": {**supported["params"], "ep_size": 4}}}
+    )
+    sources = RunSources(db_path=path)
+    return TestClient(create_app(KernelLibrary(sources))), sources
+
+
+def test_a_tree_is_built_as_its_best_measured_registered_run(runs) -> None:
+    client, sources = runs
+    tree = client.get(MOE_TREE, params=MOE_QUERY).json()
+    run = tree["run"]
+    assert run["basis"] == "registry"
+    assert tree["counts"] == {"leaves": 3, "configs": 3, "registered": 2, "measured": 2}
+    assert run["params"] == {
+        "fp8": False,
+        "routing": "popularity",
+        "mtp_mode": "off",
+        "expert_popularity_file": POPULARITY,
+    }
+    # Two sources recorded that run: the preset leads the alignment case, and
+    # it beats the equally measured popularity2 run, a preset registered later.
+    assert [(s["kind"], s["name"]) for s in run["sources"]] == [
+        ("preset", "presets/moe_x.yaml"),
+        ("alignment", PACK),
+    ]
+    assert run["sources"][1]["cases"] == ["01_micro"]
+    assert run["routing"]["routing"] == "popularity"
+    assert run["routing"]["label"] == POPULARITY
+    assert run["query"] == {**{k: v for k, v in MOE_QUERY.items()}, "ep_size": 4, **run["params"]}
+    # Built with the run's own params; no default stands in for routing.
+    assert (tree["defaults"], tree["set_when_predicting"]) == ({"fp8": False}, [])
+    # The binary got local paths, and no build of a run that names no routing.
+    assert all(b["arch"].get("routing") == "popularity" for b in sources.built)
+    assert all(Path(b["arch"]["model_config"]).is_file() for b in sources.built)
+    assert {Path(b["arch"]["expert_popularity_file"]).name for b in sources.built} == {
+        "popularity.json",
+        "popularity2.json",
+    }
+    # The arch's set lists the same counts and run.
+    [member] = client.get(f"{PREFIX}/archs/moe_x").json()["param_sets"][0]["members"]
+    assert member["counts"] == tree["counts"]
+    assert member["run"]["sources"] == ["presets/moe_x.yaml", PACK]
+
+
+def test_the_pickers_offer_only_values_a_registered_run_used(runs) -> None:
+    client, _ = runs
+    run = client.get(MOE_TREE, params=MOE_QUERY).json()["run"]
+    pickers = {p["name"]: p for p in run["pickers"]}
+    assert list(pickers) == ["fp8", "routing", "mtp_mode"]
+    assert pickers["fp8"]["fixed"] and not pickers["mtp_mode"]["fixed"]
+    assert pickers["routing"]["keys"] == ["routing", "expert_popularity_file"]
+    mtp = {o["value"]["mtp_mode"]: o for o in pickers["mtp_mode"]["options"]}
+    assert (mtp["off"]["selected"], mtp["on"]["selected"]) == (True, False)
+    assert mtp["on"]["compatible"] and mtp["on"]["counts"]["measured"] == 1
+    # A tracked file by its repo path; another by its name and demand fingerprint.
+    files = [o["value"]["expert_popularity_file"] for o in pickers["routing"]["options"]]
+    assert files[1] == POPULARITY and files[0].startswith("popularity2.json · sha256:")
+    # Picking another value builds that run's tree.
+    other = client.get(MOE_TREE, params={**MOE_QUERY, "mtp_mode": "on"}).json()
+    assert other["run"]["params"]["mtp_mode"] == "on"
+    assert other["counts"]["measured"] == 1
+    assert [s["kind"] for s in other["run"]["sources"]] == ["alignment"]
+    on = {p["name"]: p for p in other["run"]["pickers"]}["routing"]["options"]
+    # Only the first popularity file was run with mtp_mode on.
+    assert [o["compatible"] for o in on] == [
+        o["value"]["expert_popularity_file"] == POPULARITY for o in on
+    ]
+
+
+def test_a_run_param_no_registered_run_used_is_refused(runs) -> None:
+    client, _ = runs
+    response = client.get(MOE_TREE, params={**MOE_QUERY, "mtp_mode": "sometimes"})
+    assert response.status_code == 404
+    detail = response.json()["detail"]
+    assert "no registered run" in detail["message"]
+    assert sorted(c["mtp_mode"] for c in detail["choices"]) == ["off", "off", "on"]
+    # A routing no run recorded: uniform was never chosen, so it is no value.
+    assert client.get(MOE_TREE, params={**MOE_QUERY, "routing": "uniform"}).status_code == 404
+    response = client.get(MOE_TREE, params={**MOE_QUERY, "draft_tokens": "3"})
+    assert response.status_code == 400
+    assert "registered runs of this set also choose" in response.json()["detail"]["message"]
+
+
+def test_runs_that_did_not_record_their_routing_or_lack_a_file_are_skipped(runs) -> None:
+    client, sources = runs
+    run = client.get(MOE_TREE, params=MOE_QUERY).json()["run"]
+    skipped = {s["sources"][0]["name"]: s for s in run["skipped"]}
+    assert set(skipped) == {"old.yaml", "presets/moe_x.yaml"}
+    assert skipped["old.yaml"]["error"] == "the run did not record its routing"
+    assert "routing" not in skipped["old.yaml"]["params"]
+    assert "not in this machine's hub cache" in skipped["presets/moe_x.yaml"]["error"]
+    assert not any(b["arch"].get("routing", "uniform") == "uniform" for b in sources.built)
+    assert run["combinations"] == 3
+
+
+def test_a_set_no_registered_run_matches_is_built_at_its_defaults(runs, db: Path) -> None:
+    client = TestClient(create_app(KernelLibrary(RunSources(db_path=db))))
+    tree = client.get(MOE_TREE, params=MOE_QUERY).json()
+    assert tree["run"]["basis"] == "defaults"
+    assert (tree["run"]["pickers"], tree["run"]["sources"]) == ([], [])
+    assert tree["set_when_predicting"] == ["routing"]
+    assert "routing" not in tree["defaults"]
+    response = client.get(MOE_TREE, params={**MOE_QUERY, "mtp_mode": "on"})
+    assert response.status_code == 400
+    assert response.json()["detail"]["message"].endswith(
+        "every other param takes its default, except routing, set when predicting"
+    )
