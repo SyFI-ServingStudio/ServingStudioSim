@@ -1,4 +1,4 @@
-"""`presets/alignment/routings.yaml` names every measured routing a run used.
+"""`presets/alignment/routings.yaml` names every measured routing a preset or run uses.
 
 A reader picks a routing by its name (``public_api.kernel.demand``), so a
 registered run whose routing the table does not name would show a path, or
@@ -10,11 +10,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
+import subprocess
 from pathlib import Path
 
 import yaml
 
+from launcher.corpus import CorpusError, resolve_reference
 from profiling.db import storage
 from public_api.kernel import demand
 
@@ -31,6 +34,49 @@ def test_the_table_loads_and_its_files_are_what_it_names() -> None:
         assert hashlib.sha256(path.read_bytes()).hexdigest() == entry["sha256"], entry["file"]
     for entry in table["corpus"]:
         assert entry["file"].startswith("hf://"), entry["file"]
+        # The checksum is the manifest's, when this machine's hub cache has it.
+        try:
+            manifest = Path(resolve_reference(entry["file"], local_only=True))
+        except CorpusError:
+            continue
+        checksum = json.loads(manifest.read_text())["checksum_fnv1a64"]
+        assert f"{checksum:016x}" == entry["checksum_fnv1a64"], entry["file"]
+
+
+# A routing file field and its value, in a YAML or JSON preset.
+_REFERENCE = re.compile(
+    r"""["']?(expert_popularity_file|token_corpus_file)["']?\s*:\s*["']?([^"',\s}]+)"""
+)
+
+
+def test_every_routing_a_tracked_preset_names_is_named() -> None:
+    """Before any run registers it: a preset that names a routing file names
+    one the table names. A relative path resolves against the repository, or
+    against the preset's own directory (an alignment pack's files)."""
+
+    names = demand.load_names()
+    table = yaml.safe_load(demand.NAMES.read_text())
+    hub = {entry["file"] for entry in table["corpus"]}
+    listed = subprocess.run(
+        ["git", "ls-files", "-z", "presets"], cwd=REPO_ROOT, capture_output=True, text=True
+    ).stdout
+    presets = [REPO_ROOT / p for p in listed.split("\0") if p.endswith((".yaml", ".json"))]
+    seen, unnamed = 0, []
+    for preset in presets:
+        for field, value in _REFERENCE.findall(preset.read_text()):
+            seen += 1
+            where = f"{preset.relative_to(REPO_ROOT)}: {value}"
+            if value.startswith("hf://"):
+                if value not in hub:
+                    unnamed.append(where)
+                continue
+            candidates = [REPO_ROOT / value, preset.parent / value]
+            local = next((c for c in candidates if c.is_file()), None)
+            assert local is not None, f"{where}: no such file"
+            if demand.file_key(str(local.resolve())) not in names:
+                unnamed.append(where)
+    assert seen, "no tracked preset names a routing file"
+    assert not unnamed, f"routings.yaml does not name {unnamed}"
 
 
 def _repo_copies() -> dict[str, str]:
