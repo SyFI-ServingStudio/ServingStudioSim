@@ -189,9 +189,7 @@ def compose_pythonpath(profile_env: ProfileEnv, existing: str | None) -> str:
     ]
     if existing and profile_env.isolated_site_packages:
         entries.extend(
-            entry
-            for entry in existing.split(os.pathsep)
-            if entry and not _is_site_packages(entry)
+            entry for entry in existing.split(os.pathsep) if entry and not _is_site_packages(entry)
         )
     elif existing:
         entries.append(existing)

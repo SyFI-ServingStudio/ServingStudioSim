@@ -4,7 +4,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from profiling.db.args import DType
 from profiling.runners.exceptions import ProfilerNotImplemented
 from profiling.runners.gemm.gemm_fp32_output_torch_cublas import (
     _Launch,

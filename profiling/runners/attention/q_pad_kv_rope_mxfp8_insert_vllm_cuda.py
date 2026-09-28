@@ -81,7 +81,9 @@ def _validate_args(
 
 def reference_q(torch: Any, q_std: Any, padded_heads: int) -> Any:
     """Expected Q output: live heads unchanged, zero pad, chunk-interleaved."""
-    from profiling.runners.attention.compressed_sparse_mla_rope_cast_reference import q_to_fused_layout
+    from profiling.runners.attention.compressed_sparse_mla_rope_cast_reference import (
+        q_to_fused_layout,
+    )
 
     tokens, heads, dim = q_std.shape
     padded = torch.zeros((tokens, padded_heads, dim), dtype=q_std.dtype, device=q_std.device)
@@ -158,7 +160,9 @@ def check_outputs(
 
 def build_inputs(torch: Any, device: Any, num_tokens: int, num_insert_tokens: int, heads: int):
     from profiling.runners.attention.compressed_sparse_mla_rope_cast import _cos_sin
-    from profiling.runners.attention.compressed_sparse_mla_rope_cast_reference import q_to_fused_layout
+    from profiling.runners.attention.compressed_sparse_mla_rope_cast_reference import (
+        q_to_fused_layout,
+    )
 
     generator = torch.Generator().manual_seed(0x41C5)
     q_std = torch.randn((num_tokens, heads, _HEAD_DIM), generator=generator).to(torch.bfloat16)
@@ -201,7 +205,9 @@ def profile_q_pad_kv_rope_mxfp8_insert_vllm_cuda(
         import torch
         import vllm._C_stable_libtorch  # noqa: F401
     except ImportError as exc:
-        raise ProfilerNotImplemented(f"{_BACKEND} requires the upstream-rebased vLLM fork (vllm_upstream_fork_env)") from exc
+        raise ProfilerNotImplemented(
+            f"{_BACKEND} requires the upstream-rebased vLLM fork (vllm_upstream_fork_env)"
+        ) from exc
     try:
         if not torch.cuda.is_available():
             raise ProfilerNotImplemented(f"{_BACKEND} requires CUDA")

@@ -519,7 +519,9 @@ def build_flashmla_mega(torch: Any, shape: _Shape, device: Any) -> tuple[_Worklo
             is_workspace_manager_initialized,
         )
     except ImportError as exc:
-        raise ProfilerNotImplemented(f"{KIND}:flashmla_mega requires the upstream-rebased vLLM fork (vllm_upstream_fork_env)") from exc
+        raise ProfilerNotImplemented(
+            f"{KIND}:flashmla_mega requires the upstream-rebased vLLM fork (vllm_upstream_fork_env)"
+        ) from exc
     supported, reason = is_flashmla_mega_attn_supported()
     if not supported:
         raise ProfilerNotImplemented(f"{KIND}:flashmla_mega unavailable: {reason}")
@@ -607,7 +609,9 @@ def build_flashmla_mega(torch: Any, shape: _Shape, device: Any) -> tuple[_Worklo
 
 
 def _q_fused(q: Any) -> Any:
-    from profiling.runners.attention.compressed_sparse_mla_rope_cast_reference import q_to_fused_layout
+    from profiling.runners.attention.compressed_sparse_mla_rope_cast_reference import (
+        q_to_fused_layout,
+    )
 
     return q_to_fused_layout(q).contiguous()
 

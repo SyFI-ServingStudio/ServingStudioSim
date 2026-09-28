@@ -48,7 +48,7 @@ class SingleGemmArgs(KernelArgs):
     m: int = arg(unit="tokens", doc="Rows of the activation: tokens in the batch.")
     n: int = arg(unit="elements", doc="Output features of the weight.")
     k: int = arg(unit="elements", doc="Input features, the reduction dimension.")
-    dtype: DType = arg(doc="Element type of A and B. fp8_e4m3 writes bf16 output.")
+    dtype: DType = arg(doc="Element type of A and B. fp8_e4m3 and mxfp8_e4m3 write bf16 output.")
 
 
 DOC = KernelDoc(
@@ -74,11 +74,15 @@ DOC = KernelDoc(
         "sparsity are not measured.",
         "torch and torch_linear compute the same product. They are separate rows "
         "because the weight layout changes which cuBLAS kernel runs.",
+        "flashinfer_mxfp8 takes bf16 activations and includes their MXFP8 "
+        "quantization in the time; its GB/s adds the bf16 read and the "
+        "quantized write of the activation.",
     ),
     method=(
         f"{CUPTI_METHOD} The torch and SGLang backends count overlapping launches "
         "once, by the time the GPU is busy, because Blackwell can split one logical "
-        "GEMM into several; deepgemm sums its launches."
+        "GEMM into several; deepgemm and flashinfer_mxfp8 sum their launches "
+        "(flashinfer_mxfp8 autotunes the call once before timing)."
     ),
     # torch.mm is its own reference: the torch backend measures exactly it.
     reference=None,
@@ -234,8 +238,8 @@ register(
     )
 )
 
-# vLLM-fork MXFP8 dense linear (DeepSeek-V4.1): one slot = the swizzled MXFP8
-# activation quant + FlashInfer CuTe-DSL block-scaled GEMM that
+# MXFP8 dense linear: one slot = the swizzled MXFP8 activation quant +
+# FlashInfer CuTe-DSL block-scaled GEMM that
 # FlashInferCutedslMxfp8LinearKernel.apply_weights issues, bf16 out.
 register(
     KernelProfilerSpec(
@@ -254,5 +258,13 @@ register(
         metric_family=MetricFamily.COMPUTE,
         batch_outlier_policy=BatchOutlierPolicy(),
         subprocess_env="vllm_upstream_fork_env",
+        doc=BackendDoc(
+            summary=(
+                "vLLM's FlashInferCutedslMxfp8LinearKernel: FlashInfer MXFP8 "
+                "quantization of the bf16 activation (UE8M0 per 32, swizzled) and "
+                "the CuTe-DSL block-scaled GEMM mm_mxfp8, bf16 output."
+            ),
+            url="https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/kernels/linear/mxfp8/flashinfer.py",
+        ),
     )
 )

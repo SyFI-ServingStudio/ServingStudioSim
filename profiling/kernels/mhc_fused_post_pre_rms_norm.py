@@ -26,7 +26,11 @@ DOC = KernelDoc(
         "residual streams with the previous post and comb weights; the pre step"
         " then derives new mixing weights from the updated streams and forms "
         "the next block's RMS-normalized input. The measurement uses 4 bf16 "
-        "streams of 4,096 features and random activations."
+        "streams of 4,096 features and random activations. The deepgemm_mega "
+        "backend does the same per-token work in one persistent DeepGEMM "
+        "launch, but collapses the streams with the pre mix carried from the "
+        'previous block ("shifted") and returns this call\'s pre mix for the '
+        "next block."
     ),
     category="Normalization",
     subcategory="Hyper-connections",
@@ -37,13 +41,18 @@ DOC = KernelDoc(
     default_metric="time_ms",
     method=(
         f"{CUPTI_METHOD} "
-        "Three warm-up calls run first, and every launch of the TileLang call "
-        "is counted. The outputs are checked against vLLM's PyTorch "
-        "implementation before timing."
+        "Three warm-up calls run first, and every launch of the call is "
+        "counted. The outputs are checked against a PyTorch implementation "
+        "before timing."
     ),
     caveats=(
-        "Only hidden_size = 4096, hc_mult = 4 in bf16 on H200 and B200 is "
-        "measured, with ε = 1e-6; another ε runs the same launches.",
+        "vllm_tilelang is measured only at hidden_size = 4096, hc_mult = 4 in "
+        "bf16 on H200 and B200, with ε = 1e-6; another ε runs the same launches.",
+        "deepgemm_mega is measured only at hidden_size = 5120, hc_mult = 4 in "
+        "bf16 on B200, up to 2^20 tokens. DeepGEMM picks its K-split count from "
+        "num_tokens (40, 27, 20, then 16 splits), and the time steps at each "
+        "switch and at each extra wave of the 16-split launch. Its rows report "
+        "no GB/s.",
         "The previous post and comb weights come from the pre step on the same random streams.",
         "TFLOPS is not computed. GB/s counts the layer output, streams, "
         "previous mixes and weights read once and the updated streams, next "
@@ -94,6 +103,14 @@ register(
             gpus=frozenset({"NVIDIA B200"}),
         ),
         subprocess_env="vllm_upstream_fork_env",
+        doc=BackendDoc(
+            summary=(
+                "One DeepGEMM mega_mhc launch (shifted post, TF32 pre GEMM, "
+                "Sinkhorn mixes, collapse and RMSNorm), as vLLM's "
+                "mhc_shifted_post_pre_deep_gemm calls it."
+            ),
+            url="https://github.com/deepseek-ai/DeepGEMM",
+        ),
     )
 )
 
