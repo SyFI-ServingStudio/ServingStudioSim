@@ -46,6 +46,7 @@ from profiling.db.kernel_config import (
     CONFIG_TABLE,
     SOURCE_TABLE,
     USE_TABLE,
+    USES_SQL,
     ConfigUse,
     RegisteredConfig,
     canonical_json,
@@ -54,6 +55,7 @@ from profiling.db.kernel_config import (
     registered_configs,
 )
 from profiling.db.registry import MetricFamily, iter_kernel_profiler_specs
+from profiling.db.storage import CREATED_AT_FORMAT, RUN_AT_FORMAT, RUN_TABLE, iso_sql
 from profiling.db.table import STANDARD_COLUMNS, Table
 from profiling.gpu_catalog import GpuSpecResolution, resolve_gpu_spec
 from profiling.runners.metrics import CommMetrics, ComputeMetrics
@@ -289,8 +291,9 @@ class KernelLibrary:
                 return []
             precision = self._precision_column(kind)
             precision_sql = f'"{precision}"' if precision else "null"
+            last = iso_sql("max(profiler_run_at)", RUN_AT_FORMAT)
             query = (
-                f"select gpu_name, backend, {precision_sql}, count(*), max(profiler_run_at) "
+                f"select gpu_name, backend, {precision_sql}, count(*), {last} "
                 f'from "{kind}" group by 1, 2, 3 order by 1, 2, 3'
             )
             with self.sources.connect() as conn:
@@ -391,14 +394,10 @@ class KernelLibrary:
                 }
                 if not {CONFIG_TABLE, SOURCE_TABLE, USE_TABLE} <= tables:
                     return {}
-                records = conn.execute(
-                    f"""
-                    select distinct c.profile_kind, s.source from {USE_TABLE} u
-                    join {SOURCE_TABLE} s on s.source_hash = u.source_hash
-                    join {CONFIG_TABLE} c on c.kind = u.kind and c.config_hash = u.config_hash
-                        and c.gpu_name = u.gpu_name
-                    """
-                ).fetchall()
+                records = {
+                    (profile_kind, source)
+                    for _, _, _, profile_kind, _, source, *_ in conn.execute(USES_SQL)
+                }
             kinds = {spec.table_name: kind for kind, specs in self.specs.items() for spec in specs}
             out: dict[str, set[str]] = {}
             for table, source in records:
@@ -706,17 +705,26 @@ class KernelLibrary:
             column = "gpu_name" if name == "gpu" else name
             if name not in ("gpu", "backend", *args):
                 raise BadQuery(f"{kind} has no column {name!r}")
-            where.append(f'"{column}" = ?')
+            where.append(f't."{column}" = ?')
             params.append(self._typed(name, value, types.get(column, "")))
-        columns = ["gpu_name", "backend", *args, *metrics, *PROVENANCE]
+        keyed = ["gpu_name", "backend", *args]
+        stored = {
+            "profiler_run_at": iso_sql("t.profiler_run_at", RUN_AT_FORMAT),
+            "created_at": iso_sql("t.created_at", CREATED_AT_FORMAT),
+        }
+        select = [
+            *(f't."{c}"' for c in [*keyed, *metrics]),
+            *(stored.get(c, f'r."{c}"') for c in PROVENANCE),
+        ]
         index: dict[tuple, int] = {}
         provenance: list[dict] = []
         rows = []
         if types:
             query = (
-                f'select {_quoted(columns)} from "{kind}"'
+                f'select {", ".join(select)} from "{kind}" t '
+                f"join {RUN_TABLE} r on r.run_key = t.run_key"
                 + (f" where {' and '.join(where)}" if where else "")
-                + f" order by {_quoted(columns[: 2 + len(args)])}"
+                + f" order by {', '.join(select[: len(keyed)])}"
             )
             with self.sources.connect() as conn:
                 records = conn.execute(query, params).fetchall()
@@ -762,14 +770,20 @@ class KernelLibrary:
         keys = cell_keys(table, config.grid.cells)
         metrics = ["backend", *self._metrics(kind), "is_outlier"]
         out: list[dict[str, dict]] = [{} for _ in keys]
-        width = 1 + len(args)
+        width = 2 + len(args)
         chunk = max(1, (_SQL_VARIABLES - 2) // width)
-        cell_columns = _quoted(["_cell", *args])
-        # Joining through the GPU's backends lets the (gpu_name, backend, args)
-        # unique index answer each cell with one lookup per backend.
+        cell_columns = _quoted(["_cell", "_hash", *args])
+        # Joining through the GPU's backends lets the (gpu_name, backend,
+        # args_hash) unique index answer each cell with one lookup per backend;
+        # the args columns then confirm the row.
         backends = f'b(backend) as (select distinct backend from "{table.name}" where gpu_name = ?)'
         on = " and ".join(
-            ["t.gpu_name = ?", "t.backend = b.backend", *(f't."{a}" = c."{a}"' for a in args)]
+            [
+                "t.gpu_name = ?",
+                "t.backend = b.backend",
+                't.args_hash = c."_hash"',
+                *(f't."{a}" = c."{a}"' for a in args),
+            ]
         )
         select = ", ".join(f't."{m}"' for m in metrics)
         with self.sources.connect() as conn:
@@ -780,7 +794,9 @@ class KernelLibrary:
                     f"with c({cell_columns}) as (values {values}), {backends} "
                     f'select c."_cell", {select} from c cross join b join "{table.name}" t on {on}'
                 )
-                bound = [v for i, key in enumerate(part, start) for v in (i, *key)]
+                bound = [
+                    v for i, key in enumerate(part, start) for v in (i, table.args_hash(key), *key)
+                ]
                 gpu = config.gpu_name
                 for cell, *record in conn.execute(query, [*bound, gpu, gpu]):
                     row = dict(zip(metrics, record))

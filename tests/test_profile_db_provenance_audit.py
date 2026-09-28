@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 import profiling.db.provenance as provenance
+from profiling.db import storage
 from profiling.db.provenance import audit_profile_provenance
 
 
@@ -40,24 +41,29 @@ def _repo_with_kernel(
 
 
 def _db(tmp_path: Path, table: str, rows: list[tuple[str, str]]) -> Path:
+    """A v3 kind table: each row's stamp lives in the `_profile_run` it keys."""
     path = tmp_path / "profile.db"
     quoted = '"' + table.replace('"', '""') + '"'
     with sqlite3.connect(path) as conn:
+        conn.execute(storage.RUN_SCHEMA)
         conn.execute(
             f"""
             CREATE TABLE {quoted} (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 gpu_name TEXT NOT NULL,
                 backend TEXT NOT NULL,
-                profiler_git_hash TEXT NOT NULL,
+                run_key INTEGER NOT NULL,
                 time_ms REAL NOT NULL
             )
             """
         )
         conn.executemany(
-            f"INSERT INTO {quoted} (gpu_name, backend, profiler_git_hash, time_ms)"
+            f"INSERT INTO {quoted} (gpu_name, backend, run_key, time_ms)"
             " VALUES ('NVIDIA B200', ?, ?, 1.0)",
-            rows,
+            [
+                (backend, storage.run_key(conn, (stamp, None, None, None)))
+                for backend, stamp in rows
+            ],
         )
     return path
 
@@ -65,7 +71,13 @@ def _db(tmp_path: Path, table: str, rows: list[tuple[str, str]]) -> Path:
 def _stamps(path: Path, table: str) -> list[str]:
     quoted = '"' + table.replace('"', '""') + '"'
     with sqlite3.connect(path) as conn:
-        return [row[0] for row in conn.execute(f"SELECT profiler_git_hash FROM {quoted}")]
+        return [
+            row[0]
+            for row in conn.execute(
+                f"SELECT r.profiler_git_hash FROM {quoted} t "
+                f"JOIN {storage.RUN_TABLE} r ON r.run_key = t.run_key ORDER BY t.id"
+            )
+        ]
 
 
 def test_backend_not_directly_registered_is_a_read_only_candidate(tmp_path: Path) -> None:

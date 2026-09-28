@@ -7,8 +7,10 @@ cell. That mapping only runs forward (config -> grid -> args), so it cannot be
 recovered from the rows. This registry keeps it, written by the same builds
 that ask for the rows.
 
-Three tables, keyed by content hashes so that ``profiling.db.merge`` can merge
-them between databases the way it merges kind tables:
+Keyed by content hashes so that ``profiling.db.merge`` can merge them between
+databases the way it merges kind tables (``profiling.db.storage`` has the
+stored layout: the use table names configs, sources and roles by content key,
+and large identity arrays live once in ``_kernel_config_blob``):
 
 - ``_kernel_config``: one config's grid on one GPU. ``identity`` is the Rust
   ``KernelConfig::identity`` (no ``gpu_name`` or ``backends``; those are row
@@ -21,6 +23,8 @@ them between databases the way it merges kind tables:
 - ``_kernel_config_source``: what built configs, as the launcher describes it
   (preset or timing-predict config, pool, GPU and arch block).
 - ``_kernel_config_use``: which role of which source built which config.
+- ``_kernel_config_role`` and ``_kernel_config_blob``: each role path and each
+  large identity array, stored once.
 
 The simulator writes the records (``--kernel-configs-out``) and the launcher
 registers them with :func:`register_kernel_configs`. Registration writes only
@@ -39,70 +43,33 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from profiling.db import storage
 from profiling.db.batch import coerce_args
-from profiling.db.migrate import migrate_connection
+from profiling.db.migrate import migrate_connection, require_current
 from profiling.db.registry import KernelProfilerSpec, iter_kernel_profiler_specs
+from profiling.db.storage import (
+    BLOB_TABLE,
+    CONFIG_TABLE,
+    ROLE_TABLE,
+    SOURCE_TABLE,
+    USE_TABLE,
+    canonical_json,
+)
 from profiling.db.table import Table
 
-CONFIG_TABLE = "_kernel_config"
-SOURCE_TABLE = "_kernel_config_source"
-USE_TABLE = "_kernel_config_use"
-# Semantic key of each registry table, for `profiling.db.merge`.
-REGISTRY_KEYS = {
-    CONFIG_TABLE: ("kind", "config_hash", "gpu_name"),
-    SOURCE_TABLE: ("source_hash",),
-    USE_TABLE: ("kind", "config_hash", "gpu_name", "source_hash", "pool", "role"),
-}
+# The registry's use rows with their references resolved: what readers join.
+USES_SQL = f"""
+    SELECT c.kind, c.config_hash, c.gpu_name, c.profile_kind, s.source_hash, s.source,
+        u.pool, r.role, u.id
+    FROM {USE_TABLE} u
+    JOIN {CONFIG_TABLE} c ON c.config_key = u.config_key
+    JOIN {SOURCE_TABLE} s ON s.source_key = u.source_key
+    JOIN {ROLE_TABLE} r ON r.role_key = u.role_key
+"""
 # Version of the document `simulator ... --kernel-configs-out` writes
 # (`CONFIG_RECORDS_SCHEMA_VERSION` in simulator/src/timing/bridge/core.rs).
 RECORDS_SCHEMA_VERSION = 1
 _WRITE_LOCK_TIMEOUT_S = 120.0
-
-_SCHEMA = (
-    f"""
-    CREATE TABLE IF NOT EXISTS {CONFIG_TABLE} (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        kind TEXT NOT NULL,
-        config_hash TEXT NOT NULL,
-        gpu_name TEXT NOT NULL,
-        profile_kind TEXT NOT NULL,
-        identity TEXT NOT NULL,
-        cache_coords TEXT NOT NULL,
-        grid_axes TEXT NOT NULL,
-        cells BLOB NOT NULL,
-        infeasible TEXT NOT NULL,
-        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE(kind, config_hash, gpu_name)
-    )
-    """,
-    f"""
-    CREATE TABLE IF NOT EXISTS {SOURCE_TABLE} (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        source_hash TEXT NOT NULL,
-        source TEXT NOT NULL,
-        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE(source_hash)
-    )
-    """,
-    f"""
-    CREATE TABLE IF NOT EXISTS {USE_TABLE} (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        kind TEXT NOT NULL,
-        config_hash TEXT NOT NULL,
-        gpu_name TEXT NOT NULL,
-        source_hash TEXT NOT NULL,
-        pool TEXT NOT NULL,
-        role TEXT NOT NULL,
-        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE(kind, config_hash, gpu_name, source_hash, pool, role)
-    )
-    """,
-)
-
-
-def canonical_json(value: Any) -> str:
-    """The one JSON text a value hashes as: sorted keys, no whitespace."""
-    return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
 
 def content_hash(value: Any) -> str:
@@ -224,36 +191,46 @@ def register_kernel_configs(
         conn.executemany(
             f"""
             INSERT INTO {CONFIG_TABLE}
-                (kind, config_hash, gpu_name, profile_kind, identity, cache_coords,
+                (config_key, kind, config_hash, gpu_name, profile_kind, identity, cache_coords,
                  grid_axes, cells, infeasible)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(kind, config_hash, gpu_name) DO UPDATE SET
                 profile_kind = excluded.profile_kind,
                 cache_coords = excluded.cache_coords,
                 grid_axes = excluded.grid_axes,
                 cells = excluded.cells,
                 infeasible = excluded.infeasible,
-                created_at = CURRENT_TIMESTAMP
+                created_at = unixepoch()
             """,
-            [record.config_row() for record in (*plan.new_configs, *plan.regridded)],
-        )
-        conn.executemany(
-            f"INSERT OR IGNORE INTO {SOURCE_TABLE} (source_hash, source) VALUES (?, ?)",
-            plan.new_sources,
+            [record.config_row(conn) for record in (*plan.new_configs, *plan.regridded)],
         )
         conn.executemany(
             f"""
-            INSERT OR IGNORE INTO {USE_TABLE}
-                (kind, config_hash, gpu_name, source_hash, pool, role)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT OR IGNORE INTO {SOURCE_TABLE} (source_key, source_hash, source)
+            VALUES (?, ?, ?)
             """,
-            plan.new_uses,
+            [(storage.source_key(h), h, source) for h, source in plan.new_sources],
+        )
+        conn.executemany(
+            f"""
+            INSERT OR IGNORE INTO {USE_TABLE} (config_key, source_key, pool, role_key)
+            VALUES (?, ?, ?, ?)
+            """,
+            [
+                (
+                    storage.config_key(kind, config_hash, gpu_name),
+                    storage.source_key(source_hash),
+                    pool,
+                    storage.ensure_role(conn, role),
+                )
+                for kind, config_hash, gpu_name, source_hash, pool, role in plan.new_uses
+            ],
         )
     return report
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
-    for statement in _SCHEMA:
+    for statement in storage.REGISTRY_SCHEMA:
         conn.execute(statement)
 
 
@@ -266,6 +243,7 @@ def registered_configs(
     """Every registered config whose grid reads rows of ``profile_kind``."""
     if not _has_registry(conn):
         return []
+    require_current(conn, "profile DB")
     where = "profile_kind = ?"
     values: list[Any] = [profile_kind]
     if gpu_name is not None:
@@ -280,13 +258,14 @@ def registered_configs(
         values,
     ).fetchall()
     uses = _uses(conn, profile_kind)
+    blobs = storage.load_blobs(conn)
     return [
         RegisteredConfig(
             kind=kind,
             profile_kind=table,
             config_hash=config_hash,
             gpu_name=gpu,
-            identity=json.loads(identity),
+            identity=storage.unpack_identity(identity, blobs),
             grid=ConfigGrid(
                 cache_coords=tuple(json.loads(cache_coords)),
                 axes=tuple(tuple(axis) for axis in json.loads(grid_axes)),
@@ -373,15 +352,33 @@ def cell_row_ids(
 ) -> list[list[int]]:
     """The ids of the rows (any backend) each cell's args match on ``gpu_name``.
 
-    Matched in SQL, not in Python: a column's declared type converts what is
-    stored (a bool arg in a TEXT column is stored as ``'0'``), and SQLite
-    applies the same conversion when it compares.
+    The args columns are compared in SQL, not in Python: a column's declared
+    type converts what is stored (a bool arg in a TEXT column is stored as
+    ``'0'``), and SQLite applies the same conversion when it compares. Joining
+    through the GPU's backends lets the ``(gpu_name, backend, args_hash)``
+    unique index answer each cell with one lookup per backend.
     """
-    where = " AND ".join(["gpu_name = ?", *(f"{column} = ?" for column in table.args_columns)])
-    query = f"SELECT id FROM {table.name} WHERE {where}"
-    return [
-        [row[0] for row in conn.execute(query, (gpu_name, *key))] for key in cell_keys(table, cells)
+    backends = [
+        row[0]
+        for row in conn.execute(
+            f"SELECT DISTINCT backend FROM {table.name} WHERE gpu_name = ?", (gpu_name,)
+        )
     ]
+    query = (
+        f"SELECT id FROM {table.name} WHERE gpu_name = ? AND backend = ? "
+        f"AND {table.args_match_sql()}"
+    )
+    out: list[list[int]] = []
+    for key in cell_keys(table, cells):
+        bound = (table.args_hash(key), *key)
+        out.append(
+            [
+                row[0]
+                for backend in backends
+                for row in conn.execute(query, (gpu_name, backend, *bound))
+            ]
+        )
+    return out
 
 
 def coverage(
@@ -464,13 +461,14 @@ class _Record:
             and _decode_cells(cells) == self.cells
         )
 
-    def config_row(self) -> tuple[Any, ...]:
+    def config_row(self, conn: sqlite3.Connection) -> tuple[Any, ...]:
         return (
+            storage.config_key(*self.key),
             self.kind,
             self.config_hash,
             self.gpu_name,
             self.profile_kind,
-            canonical_json(self.identity),
+            storage.pack_identity(conn, self.identity),
             *self.grid_columns(),
         )
 
@@ -490,6 +488,8 @@ def _plan(
 ) -> _Plan:
     plan = _Plan([], [], [], [])
     registry = conn is not None and _has_registry(conn)
+    if registry:
+        require_current(conn, "profile DB")
     seen: set[tuple[str, str, str]] = set()
     for record in records:
         if record.key in seen:
@@ -517,10 +517,15 @@ def _plan(
                 registry
                 and conn.execute(
                     f"""
-                SELECT 1 FROM {USE_TABLE} WHERE kind = ? AND config_hash = ? AND gpu_name = ?
-                    AND source_hash = ? AND pool = ? AND role = ?
+                SELECT 1 FROM {USE_TABLE}
+                WHERE config_key = ? AND source_key = ? AND pool = ? AND role_key = ?
                 """,
-                    row,
+                    (
+                        storage.config_key(*record.key),
+                        storage.source_key(source_hash),
+                        use["pool"],
+                        storage.role_key(use["role"]),
+                    ),
                 ).fetchone()
             )
             if not known:
@@ -541,19 +546,10 @@ def _uses(
     conn: sqlite3.Connection, profile_kind: str
 ) -> dict[tuple[str, str, str], list[ConfigUse]]:
     rows = conn.execute(
-        f"""
-        SELECT u.kind, u.config_hash, u.gpu_name, s.source, u.pool, u.role
-        FROM {USE_TABLE} u
-        JOIN {SOURCE_TABLE} s ON s.source_hash = u.source_hash
-        JOIN {CONFIG_TABLE} c
-            ON c.kind = u.kind AND c.config_hash = u.config_hash AND c.gpu_name = u.gpu_name
-        WHERE c.profile_kind = ?
-        ORDER BY u.id
-        """,
-        (profile_kind,),
+        f"{USES_SQL} WHERE c.profile_kind = ? ORDER BY u.id", (profile_kind,)
     ).fetchall()
     out: dict[tuple[str, str, str], list[ConfigUse]] = {}
-    for kind, config_hash, gpu_name, source, pool, role in rows:
+    for kind, config_hash, gpu_name, _, _, source, pool, role, _ in rows:
         out.setdefault((kind, config_hash, gpu_name), []).append(
             ConfigUse(source=json.loads(source), pool=pool, role=role)
         )
@@ -576,11 +572,11 @@ def _has_registry(conn: sqlite3.Connection) -> bool:
     names = {
         row[0]
         for row in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (?, ?, ?)",
-            (CONFIG_TABLE, SOURCE_TABLE, USE_TABLE),
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (?, ?, ?, ?, ?)",
+            (CONFIG_TABLE, SOURCE_TABLE, ROLE_TABLE, USE_TABLE, BLOB_TABLE),
         )
     }
-    return len(names) == 3
+    return len(names) == 5
 
 
 def _profiler_spec(profile_kind: str) -> KernelProfilerSpec:

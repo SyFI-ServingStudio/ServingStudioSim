@@ -6,8 +6,9 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
-from profiling.db.migrate import SCHEMA_HASH, SCHEMA_VERSION
+from profiling.db.migrate import SCHEMA_HASH, SCHEMA_VERSION, require_current
 from profiling.db.registry import iter_kernel_profiler_specs
+from profiling.db.storage import RUN_TABLE
 
 
 @dataclass(frozen=True)
@@ -50,22 +51,23 @@ def get_profiler_versions(
     selected = set(used_op_families or [])
     versions: set[tuple[str, str]] = set()
     with conn:
+        require_current(conn, str(db_path))
         for profiler_spec in iter_kernel_profiler_specs():
             op_family = profiler_spec.kernel_kind
             if selected and op_family not in selected and profiler_spec.table_name not in selected:
                 continue
             if not _table_exists(conn, profiler_spec.table_name):
                 continue
-            if not _column_exists(conn, profiler_spec.table_name, "profiler_git_hash"):
+            if not _column_exists(conn, profiler_spec.table_name, "run_key"):
                 continue
             # Table._row_values populates profiler_git_hash from ProfileRow or
             # the current profiler repo commit; this helper only reads it for
             # manifest/repro reporting.
             rows = conn.execute(
                 f"""
-                SELECT DISTINCT profiler_git_hash
-                FROM {profiler_spec.table_name}
-                WHERE profiler_git_hash IS NOT NULL AND profiler_git_hash != ''
+                SELECT DISTINCT r.profiler_git_hash
+                FROM {profiler_spec.table_name} t JOIN {RUN_TABLE} r ON r.run_key = t.run_key
+                WHERE r.profiler_git_hash != ''
                 """
             ).fetchall()
             for (profiler_git_hash,) in rows:
