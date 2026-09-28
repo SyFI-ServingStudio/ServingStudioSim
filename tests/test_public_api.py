@@ -1474,6 +1474,22 @@ def test_a_run_recorded_with_a_file_the_repo_holds_a_copy_of_reads_as_the_copy(r
     assert run["combinations"] == 3
 
 
+def test_a_null_for_a_param_with_no_default_is_the_run_that_leaves_it_out(runs) -> None:
+    """A config recorded as written can name ``token_corpus_file: null``;
+    the binary reads that as the param left out, so it is the same run as a
+    block that omits it, not a second choice."""
+
+    client, sources = runs
+    popular = {"routing": "popularity", "expert_popularity_file": POPULARITY, "mtp_mode": "off"}
+    block = _moe_block(**popular, token_corpus_file=None)
+    _register(sources.db_path, QKV, _moe_source(block, preset="presets/moe_z.yaml"))
+
+    run = client.get(MOE_TREE, params=MOE_QUERY).json()["run"]
+    assert "token_corpus_file" not in run["params"]
+    assert [s["name"] for s in run["sources"]] == ["presets/moe_x.yaml", "moe_z.yaml", PACK]
+    assert run["combinations"] == 3
+
+
 def test_a_set_no_registered_run_matches_is_built_at_its_defaults(runs, db: Path) -> None:
     client = TestClient(create_app(KernelLibrary(RunSources(db_path=db))))
     tree = client.get(MOE_TREE, params=MOE_QUERY).json()

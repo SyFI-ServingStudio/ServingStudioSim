@@ -589,20 +589,26 @@ class ArchLibrary:
         """A run block's params besides its type, model config and the set's
         params, in schema order: each schema param the block names, else its
         default, except a param set when predicting (MoE routing), which a
-        block that leaves it out did not record. A name the schema no longer
-        has is kept; the build then rejects the block."""
+        block that leaves it out did not record. A null for a param with no
+        default is left out, as the binary reads it: a config recorded as
+        written names ``num_layers: null`` where another leaves it out, and
+        both are one run. A name the schema no longer has is kept; the build
+        then rejects the block."""
 
         chosen = {"type", "model_config", *self._row_names(arch)}
+        unset = set()
         out: dict[str, Any] = {}
         for param in self._arch_params(arch):
             name = param["name"]
             if name in chosen:
                 continue
-            if name in block:
+            if block.get(name) is None and "default" not in param:
+                unset.add(name)
+            elif name in block:
                 out[name] = block[name]
             elif "default" in param and not param.get("set_when_predicting"):
                 out[name] = param["default"]
-        out.update({n: v for n, v in block.items() if n not in chosen and n not in out})
+        out.update({n: v for n, v in block.items() if n not in chosen | unset and n not in out})
         return out
 
     @staticmethod
