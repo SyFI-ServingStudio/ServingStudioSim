@@ -519,7 +519,7 @@ def build_flashmla_mega(torch: Any, shape: _Shape, device: Any) -> tuple[_Worklo
             is_workspace_manager_initialized,
         )
     except ImportError as exc:
-        raise ProfilerNotImplemented(f"{KIND}:flashmla_mega requires the V4.1 vLLM fork") from exc
+        raise ProfilerNotImplemented(f"{KIND}:flashmla_mega requires the upstream-rebased vLLM fork (vllm_upstream_fork_env)") from exc
     supported, reason = is_flashmla_mega_attn_supported()
     if not supported:
         raise ProfilerNotImplemented(f"{KIND}:flashmla_mega unavailable: {reason}")

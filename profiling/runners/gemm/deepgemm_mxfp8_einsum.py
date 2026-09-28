@@ -100,7 +100,7 @@ def _load_runtime() -> tuple[Any, Any, Any, Any]:
         from vllm.utils.deep_gemm import fp8_einsum
     except ImportError as exc:
         raise ProfilerNotImplemented(
-            f"{BACKEND} requires the vLLM fork environment (vllm_fork_env)"
+            f"{BACKEND} requires the upstream-rebased vLLM fork (vllm_upstream_fork_env)"
         ) from exc
     supported, reason = DeepGemmMxfp8BmmLinearKernel.is_supported()
     if not supported:

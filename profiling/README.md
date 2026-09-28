@@ -69,6 +69,15 @@ library used by the matching alignment run. Environment validation fails before
 acquiring a GPU when the link is absent; the execution layer prepends it to
 `LD_LIBRARY_PATH` before Torch's libraries.
 
+`vllm_upstream_fork_env` is a host env: the alignment checkout
+`alignment/profiler/vllm` (or `$VIBESIM_VLLM_FORK_ROOT`) and its own `.venv`. It
+serves the backends that need that checkout rebased onto upstream vLLM (its
+models and newer FlashInfer, DeepGEMM and FlashMLA builds), which the
+`vllm_env` image, built from fork commit 3f667d7, lacks. The worker drops
+inherited site-packages from `PYTHONPATH`, so the project Torch cannot shadow
+the venv's own build. Once the container is rebuilt from the rebased checkout,
+move those backends to `vllm_env` and remove this env.
+
 `Timer.cupti`'s duration path is a two-pass GPU-active-time measurement. It
 first records 10 real callable launches, computes
 `ceil(min_duration_ms / estimate_mean_ms)`, then records exactly that many

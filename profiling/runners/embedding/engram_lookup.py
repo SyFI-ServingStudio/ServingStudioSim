@@ -255,7 +255,7 @@ def profile_engram_lookup_vllm_triton(
         import vllm._C_stable_libtorch  # noqa: F401  (get_cuda_view_from_cpu_tensor)
         from vllm.models.deepseek_v41.common.engram import ParallelEngramEmbedding
     except ImportError as exc:
-        raise ProfilerNotImplemented(f"{_BACKEND} requires the V4.1 vLLM fork") from exc
+        raise ProfilerNotImplemented(f"{_BACKEND} requires the upstream-rebased vLLM fork (vllm_upstream_fork_env)") from exc
     try:
         if not torch.cuda.is_available():
             raise ProfilerNotImplemented(f"{_BACKEND} requires CUDA")

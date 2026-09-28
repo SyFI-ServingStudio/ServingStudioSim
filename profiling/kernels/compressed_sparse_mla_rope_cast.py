@@ -104,7 +104,7 @@ register(
         metric_family=MetricFamily.COMPUTE,
         batch_outlier_policy=BatchOutlierPolicy(),
         supports=_SUPPORT,
-        subprocess_env="vllm_fork_env",
+        subprocess_env="vllm_upstream_fork_env",
     )
 )
 

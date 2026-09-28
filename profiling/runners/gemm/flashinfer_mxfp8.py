@@ -79,7 +79,7 @@ def _load_runtime() -> tuple[Any, Any, Any, Any]:
         )
     except ImportError as exc:
         raise ProfilerNotImplemented(
-            "flashinfer_mxfp8 requires the vLLM fork environment (vllm_fork_env)"
+            "flashinfer_mxfp8 requires the upstream-rebased vLLM fork (vllm_upstream_fork_env)"
         ) from exc
     supported, reason = FlashInferCutedslMxfp8LinearKernel.is_supported()
     if not supported:

@@ -211,7 +211,7 @@ def profile_mhc_fused_post_pre_rms_norm_deepgemm_mega(
         )
     except ImportError as exc:
         raise ProfilerNotImplemented(
-            f"{_KIND} requires the DeepSeek-V4.1 vLLM fork (vllm_fork_env)"
+            f"{_KIND} requires the upstream-rebased vLLM fork (vllm_upstream_fork_env)"
         ) from exc
 
     try:

@@ -7,7 +7,7 @@ so it would omit `num_insert_tokens`. This caller adds it to every ground-truth
 spec and places probes around the op's ReducedGrid cutoff (1024 tokens).
 
 Pre-fill the grid rows first with `launcher kernel-profile run` (the
-`vllm_fork_env` backend should be profiled from a Python process, not JIT-filled
+`vllm_upstream_fork_env` backend should be profiled from a Python process, not JIT-filled
 through the `kernel-query` bridge). Then, on a B200:
 
     uv run python tools/cache-fidelity-analyzer/q_pad_kv_rope_mxfp8_insert_fidelity.py \

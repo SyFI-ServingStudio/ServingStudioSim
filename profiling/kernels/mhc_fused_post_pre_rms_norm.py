@@ -93,7 +93,7 @@ register(
             compute=frozenset({DType.BF16}),
             gpus=frozenset({"NVIDIA B200"}),
         ),
-        subprocess_env="vllm_fork_env",
+        subprocess_env="vllm_upstream_fork_env",
     )
 )
 

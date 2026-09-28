@@ -201,7 +201,7 @@ def profile_q_pad_kv_rope_mxfp8_insert_vllm_cuda(
         import torch
         import vllm._C_stable_libtorch  # noqa: F401
     except ImportError as exc:
-        raise ProfilerNotImplemented(f"{_BACKEND} requires the V4.1 vLLM fork") from exc
+        raise ProfilerNotImplemented(f"{_BACKEND} requires the upstream-rebased vLLM fork (vllm_upstream_fork_env)") from exc
     try:
         if not torch.cuda.is_available():
             raise ProfilerNotImplemented(f"{_BACKEND} requires CUDA")
