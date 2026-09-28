@@ -1,0 +1,22 @@
+{
+  "arch": {
+    "iter": {
+      "type": "kimi_k3_sglang",
+      "model_config": "model/config/kimi_k3.json",
+      "fp8": false,
+      "attn_tp_size": 1,
+      "ep_size": 1,
+      "pp_size": 1,
+      "dcp_size": 1,
+      "heads_per_rank": 12,
+      "local_experts": 112,
+      "local_top_k": 2,
+      "sim_kda_layers": 1,
+      "sim_mla_layers": 0,
+      "kda_state_dtype": "bf16"
+    }
+  },
+  "gpu": "NVIDIA B200",
+  "log_dir": "logs/predict_kimi_k3_b200_rank1_layer_kda_mixed",
+  "cases_file": "predict_kimi_k3_b200_rank1_layer_kda_mixed_cases.json"
+}
