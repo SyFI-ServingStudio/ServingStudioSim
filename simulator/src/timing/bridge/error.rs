@@ -51,6 +51,11 @@ pub enum BuildError {
     #[error("cache fit failed for {kind}: {reason}")]
     FitFailed { kind: KernelKind, reason: String },
 
+    /// A kernel-data bridge has no usable document for this config: none at
+    /// all, one whose grid is not the kernel's, or one missing a measured row.
+    #[error("kernel data for {kind}: {reason}")]
+    KernelData { kind: KernelKind, reason: String },
+
     /// A config's grid cells map to different profile.db args under two of its
     /// backends in a column other than `backend`. The kernel-config registry
     /// stores one set of args per cell, so this would record the wrong rows.

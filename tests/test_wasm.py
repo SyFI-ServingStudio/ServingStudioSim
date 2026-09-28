@@ -1,13 +1,14 @@
-"""The browser timing-predict module against native `simulator timing-predict`.
+"""The wasm32 simulator against the native one.
 
-Native runs a predict config on the Python bridge (profile.db) and records the
-rows it read with `--samples-out`; the wasm module (`just build-wasm`,
-run by `tests/wasm/run_predict.mjs` under Node) costs the same cases from those
-rows and the arch block's files passed in memory. Every total, slot and the
-cost tree must match bit for bit: the browser has no other oracle.
+Native runs on the Python bridge (profile.db). The wasm module reads what a
+browser gets from the public API instead: the config document
+(`GET /kernels/{kind}/configs/{hash}`) of every kernel config the run builds,
+made here by the same `KernelLibrary.config` the API serves, and the files the
+arch block names, passed in memory. Results must match bit for bit: the browser
+has no other oracle.
 
-Skips unless the release binary, `target/wasm-pkg/` and `node` are all
-present and profile.db holds every row the config reads.
+Skips unless the release binary, the wasm module and `node` are all present and
+profile.db holds every row the config reads.
 """
 
 from __future__ import annotations
@@ -23,6 +24,9 @@ import pyarrow.parquet as pq
 import pytest
 
 from launcher.exec import _build_subprocess_env
+from profiling.db.kernel_config import content_hash
+from public_api.kernel.library import KernelLibrary
+from public_api.kernel.sources import KernelSources
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PKG_DIR = REPO_ROOT / "target" / "wasm-pkg"
@@ -78,12 +82,25 @@ def _arch_files(arch: dict) -> dict[str, str]:
 def _simulator(sim_bin: Path, *args: str) -> subprocess.CompletedProcess:
     env = _build_subprocess_env() | {"SERVINGSTUDIO_NO_GPU": "1", "RUST_LOG": "warn"}
     return subprocess.run(
-        [str(sim_bin), "timing-predict", *args],
+        [str(sim_bin), *args],
         cwd=REPO_ROOT,
         env=env,
         capture_output=True,
         text=True,
     )
+
+
+def _kernel_data(records: Path, out: Path) -> None:
+    """The config document of every kernel config in `records` (what
+    `--kernel-configs-out` writes), as the kernel API serves each."""
+
+    library = KernelLibrary(KernelSources(db_path=REPO_ROOT / "profiling" / "profile.db"))
+    documents = {}
+    for record in json.loads(records.read_text())["configs"]:
+        key = (record["kind"], content_hash(record["identity"]), record["gpu_name"])
+        if key not in documents:
+            documents[key] = library.config(*key)
+    out.write_text(json.dumps({"configs": list(documents.values())}))
 
 
 @pytest.fixture(scope="module")
@@ -112,14 +129,18 @@ def test_wasm_matches_native_timing_predict(name, sim_bin, node, tmp_path):
         )
     )
 
-    dry = _simulator(sim_bin, "--dry-run", str(config))
+    records = tmp_path / "records.json"
+    dry = _simulator(
+        sim_bin, "timing-predict", "--dry-run", "--kernel-configs-out", str(records), str(config)
+    )
     assert dry.returncode == 0, dry.stderr
     missing = re.search(r"total: (\d+) / \d+ specs missing", dry.stdout)
     if missing is None or int(missing.group(1)):
         pytest.skip(f"profile.db lacks rows for {name}")
+    kernel_data = tmp_path / "kernel_data.json"
+    _kernel_data(records, kernel_data)
 
-    samples = tmp_path / "samples.json"
-    native = _simulator(sim_bin, str(config), "--samples-out", str(samples))
+    native = _simulator(sim_bin, "timing-predict", str(config))
     assert native.returncode == 0, native.stderr
     raw = tmp_path / "logs" / "raw"
     table = pq.read_table(raw / "cost_log" / "worker_predict_0.parquet")
@@ -132,7 +153,7 @@ def test_wasm_matches_native_timing_predict(name, sim_bin, node, tmp_path):
         json.dumps(
             {
                 "config": {"arch": arch, "gpu": gpu},
-                "samples_file": str(samples),
+                "kernel_data_file": str(kernel_data),
                 "files": _arch_files(arch),
                 "cases": MIXED_CASES,
             }
@@ -144,7 +165,7 @@ def test_wasm_matches_native_timing_predict(name, sim_bin, node, tmp_path):
     assert run.returncode == 0, run.stderr
     out = json.loads(run.stdout)
 
-    assert out["version"]["sample_format"] == 1
+    assert out["version"]["kernel_data_format"] == 1
     [block] = arch.values()
     assert out["info"] == {
         "selector": "iter",

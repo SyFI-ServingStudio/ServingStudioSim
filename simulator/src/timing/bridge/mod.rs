@@ -3,8 +3,8 @@
 pub mod core;
 pub mod error;
 pub mod payload;
+pub mod kernel_data;
 mod python;
-pub mod replay;
 
 pub use core::{
     config_records_document, write_config_records, BackendOverrideGuard, ConfigGrid, ConfigUse,
@@ -13,4 +13,4 @@ pub use core::{
 pub use error::{BuildError, PerfApiError};
 pub(crate) use payload::{de_backends, intern_backend};
 pub use payload::{ArgsPayload, DType, DbMetadata, KernelKind, KernelMetrics, ProfilerVersion};
-pub use replay::{write_samples, ReplaySamples, SampleMetrics, SampleRow, SAMPLE_FORMAT};
+pub use kernel_data::{ConfigDocument, KernelData, KERNEL_DATA_FORMAT};

@@ -3,12 +3,12 @@
 //   node tests/wasm/run_predict.mjs <pkg-dir> <input.json>
 //
 // input.json: {"config": <predict config: arch, gpu, backends?>,
-//              "samples_file": <sample array path>,
+//              "kernel_data_file": <kernel API config documents path>,
 //              "files": {<path the arch block names>: <file to read it from>},
 //              "cases": <cases array>}
 // Prints {"version", "info", "manifest", "cases"} as JSON on stdout. On a
 // failure prints the error (and the panic, if one trapped) and exits 1.
-// tests/test_wasm_predict.py compares the output with native timing-predict.
+// tests/test_wasm.py compares the output with native timing-predict.
 
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -25,7 +25,7 @@ const files = Object.fromEntries(
 try {
   const predictor = new wasm.Predictor(
     JSON.stringify(input.config),
-    readFileSync(input.samples_file, "utf8"),
+    readFileSync(input.kernel_data_file, "utf8"),
     JSON.stringify(files),
   );
   const out = {

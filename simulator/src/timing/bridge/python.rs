@@ -1,6 +1,6 @@
 //! The PyO3 calls into Python `profiling.perf_api`, behind the `python` cargo
 //! feature. [`PerfApiBridge`](super::PerfApiBridge) routes every perf_api call
-//! through these functions (or answers it from replay samples first), so the
+//! through these functions (unless its kernels read config documents), so the
 //! rest of the crate builds without PyO3 — the wasm32 build turns the feature
 //! off and gets the stub module below, whose calls all fail.
 
@@ -292,7 +292,7 @@ mod disabled {
 
     fn unavailable() -> PerfApiError {
         PerfApiError::Python(
-            "built without the `python` feature: no perf_api; use PerfApiBridge::replay"
+            "built without the `python` feature: no perf_api; use PerfApiBridge::kernel_data"
                 .to_string(),
         )
     }

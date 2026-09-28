@@ -106,6 +106,6 @@ build-wasm:
     "$bindgen" --target web --no-typescript --out-dir "$out" target/wasm32-unknown-unknown/wasm/simulator_wasm.wasm
     "$wasm_opt" -Oz --enable-bulk-memory --enable-multivalue --enable-mutable-globals --enable-nontrapping-float-to-int --enable-reference-types --enable-sign-ext \
         "$out/simulator_wasm_bg.wasm" -o "$out/simulator_wasm_bg.wasm"
-    printf '{"sim_commit": "%s", "sample_format": %s}\n' "$commit" \
-        "$(sed -n 's/^pub const SAMPLE_FORMAT: u32 = \([0-9]*\);$/\1/p' simulator/src/timing/bridge/replay.rs)" > "$out/version.json"
+    printf '{"sim_commit": "%s", "kernel_data_format": %s}\n' "$commit" \
+        "$(sed -n 's/^pub const KERNEL_DATA_FORMAT: u32 = \([0-9]*\);$/\1/p' simulator/src/timing/bridge/kernel_data.rs)" > "$out/version.json"
     ls -l "$out"

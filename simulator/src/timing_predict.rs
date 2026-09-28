@@ -54,7 +54,7 @@ use crate::arch::contract::{
 use crate::arch::{AttnArchSel, FfnArchSel, IterArchSel};
 use crate::common::{Time, WorkerId};
 use crate::deployment::BackendOverrides;
-use crate::timing::bridge::{write_config_records, write_samples, ReplaySamples};
+use crate::timing::bridge::{write_config_records, KernelData};
 use crate::timing::{
     CostManifest, CostManifestDoc, CostTree, FlatCostNode, LeafMetrics, PerfApiBridge,
 };
@@ -350,28 +350,26 @@ pub struct PredictOutputs<'a> {
     /// Every kernel config the model asks profile.db for (see `simulator
     /// build-cache-only --kernel-configs-out`).
     pub kernel_configs: Option<&'a Path>,
-    /// Every row the run read, as the replay samples a [`Predictor`] on a
-    /// replay bridge needs. A real run only: a dry run reads no rows.
-    pub samples: Option<&'a Path>,
 }
 
-/// `replay_samples` names a samples array to answer every lookup from instead
-/// of profile.db (see [`PerfApiBridge::replay`]).
+/// Kernel API config documents from `path` (see [`KernelData::from_json`]).
+pub fn read_kernel_data(path: &Path) -> Result<KernelData> {
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("reading kernel data {}", path.display()))?;
+    KernelData::from_json(&text).with_context(|| format!("parsing kernel data {}", path.display()))
+}
+
+/// `kernel_data` names the kernel API config documents to fit every cache from
+/// instead of profile.db (see [`PerfApiBridge::kernel_data`]).
 pub fn run_timing_predict(
     config_path: &Path,
     mode: PredictMode,
     outputs: &PredictOutputs,
-    replay_samples: Option<&Path>,
+    kernel_data: Option<&Path>,
 ) -> Result<()> {
     let cfg: PredictConfig = parse_config_file(config_path)?;
-    let bridge = match (replay_samples, mode) {
-        (Some(path), _) => {
-            let text = fs::read_to_string(path)
-                .with_context(|| format!("reading replay samples {}", path.display()))?;
-            let samples = ReplaySamples::from_json(&text)
-                .with_context(|| format!("parsing replay samples {}", path.display()))?;
-            PerfApiBridge::replay(std::sync::Arc::new(samples))
-        }
+    let bridge = match (kernel_data, mode) {
+        (Some(path), _) => PerfApiBridge::kernel_data(std::sync::Arc::new(read_kernel_data(path)?)),
         (None, PredictMode::Run) => predict_bridge()?,
         (None, PredictMode::DryRun) => {
             PerfApiBridge::new().context("starting the PyO3 perf_api bridge")?
@@ -381,16 +379,8 @@ pub fn run_timing_predict(
         bridge.enable_dry_run();
     }
     let kernel_configs_out = outputs.kernel_configs;
-    let samples_out = outputs.samples;
     if kernel_configs_out.is_some() {
         bridge.enable_config_records();
-    }
-    if samples_out.is_some() {
-        ensure!(
-            mode == PredictMode::Run,
-            "--samples-out records a real run's reads; a dry run reads none"
-        );
-        bridge.enable_sample_records();
     }
     let run = mode == PredictMode::Run;
 
@@ -450,9 +440,6 @@ pub fn run_timing_predict(
     if let Some(path) = kernel_configs_out {
         write_config_records(path, &bridge.take_config_records())?;
     }
-    if let Some(path) = samples_out {
-        write_samples(path, &bridge.take_sample_records())?;
-    }
     if !run {
         print_dry_run(&bridge, num_cases, gpu_count);
         return Ok(());
@@ -510,7 +497,7 @@ enum PredictModel {
 
 /// A predict config's arch built once, costing cases in memory: the
 /// `timing-predict` iter and speculative paths without files, parquet or
-/// artifacts. Built on any bridge, a replay one included (the wasm32 entry).
+/// artifacts. Built on any bridge, a kernel-data one included (the wasm32 entry).
 pub struct Predictor {
     model: PredictModel,
     manifest: CostManifest,
@@ -1230,8 +1217,8 @@ mod tests {
     }
 
     #[test]
-    fn a_replay_predictor_fails_on_a_row_the_samples_lack() {
-        let bridge = PerfApiBridge::replay(std::sync::Arc::new(ReplaySamples::from_rows(vec![])));
+    fn a_kernel_data_predictor_fails_on_a_config_without_a_document() {
+        let bridge = PerfApiBridge::kernel_data(std::sync::Arc::new(KernelData::default()));
         let arch = serde_json::json!({"iter": {
             "type": "llama3_dense_tp",
             "model_config": "model/config/llama3_8b.json",
@@ -1240,8 +1227,8 @@ mod tests {
         }});
         let err = Predictor::build(arch, "NVIDIA H200", None, &bridge)
             .err()
-            .expect("an empty sample set answers no kernel");
-        assert!(format!("{err:#}").contains("missing"), "{err:#}");
+            .expect("no documents build no kernel");
+        assert!(format!("{err:#}").contains("no config document"), "{err:#}");
     }
 
     #[test]

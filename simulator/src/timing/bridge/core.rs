@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
+use super::kernel_data::KernelData;
 use super::python;
-use super::replay::{ReplaySamples, SampleRow};
 
 use crate::timing::bridge::{
     intern_backend, ArgsPayload, BuildError, DType, DbMetadata, KernelKind, KernelMetrics,
@@ -177,12 +177,10 @@ pub struct PerfApiBridge {
     /// mode, for profile.db's kernel-config registry (see
     /// [`enable_config_records`](Self::enable_config_records)).
     config_records: RefCell<Option<ConfigRecords>>,
-    /// `Some(..)` answers every perf_api call from these measured rows instead
-    /// of Python (see [`replay`](Self::replay)): no profile.db, no JIT, no GPU.
-    replay: Option<Arc<ReplaySamples>>,
-    /// `Some(..)` records every row `get_times` returns, keyed as a replay
-    /// bridge looks it up (see [`enable_sample_records`](Self::enable_sample_records)).
-    sample_records: RefCell<Option<BTreeMap<String, SampleRow>>>,
+    /// `Some(..)` makes `Kernel::build` fit every cache from these config
+    /// documents instead of asking Python (see [`kernel_data`](Self::kernel_data)):
+    /// no profile.db, no JIT, no GPU.
+    kernel_data: Option<Arc<KernelData>>,
 }
 
 impl PerfApiBridge {
@@ -192,15 +190,20 @@ impl PerfApiBridge {
         Ok(bridge)
     }
 
-    /// A bridge that answers `get_times` from `samples` alone, like a strict
-    /// (no-JIT) perf_api over a profile.db holding exactly those rows: a spec
-    /// with no sample is a `MissingEntry`. Needs no Python, so it is the bridge
+    /// A bridge whose kernels read their measured grids from `data`, the
+    /// kernel API's config documents, and nothing else: a config without a
+    /// complete document fails to build. Needs no Python, so it is the bridge
     /// of a build without the `python` feature (wasm32).
-    pub fn replay(samples: Arc<ReplaySamples>) -> Self {
+    pub fn kernel_data(data: Arc<KernelData>) -> Self {
         Self {
-            replay: Some(samples),
+            kernel_data: Some(data),
             ..Self::inert()
         }
+    }
+
+    /// The config documents a [`kernel_data`](Self::kernel_data) bridge reads.
+    pub fn documents(&self) -> Option<&KernelData> {
+        self.kernel_data.as_deref()
     }
 
     /// A bridge that can only build structure: enumerate mode, and no Python
@@ -221,8 +224,7 @@ impl PerfApiBridge {
             active_pool: RefCell::new(None),
             enumerate: RefCell::new(None),
             config_records: RefCell::new(None),
-            replay: None,
-            sample_records: RefCell::new(None),
+            kernel_data: None,
         }
     }
 
@@ -452,29 +454,12 @@ impl PerfApiBridge {
         }
     }
 
-    // ── sample records (replay samples) ──────────────────────────────────────
-
-    /// Record every row subsequent `get_times` calls return, as the replay
-    /// samples that reproduce this build and its evaluations without
-    /// profile.db. Drain with [`take_sample_records`](Self::take_sample_records).
-    pub fn enable_sample_records(&self) {
-        *self.sample_records.borrow_mut() = Some(BTreeMap::new());
-    }
-
-    /// The recorded rows, one per distinct lookup, in key order.
-    pub fn take_sample_records(&self) -> Vec<SampleRow> {
-        match self.sample_records.borrow_mut().as_mut() {
-            Some(records) => std::mem::take(records).into_values().collect(),
-            None => Vec::new(),
-        }
-    }
-
     /// Lock the perf_api into "sim-runtime-safe" mode: any spec that's not
     /// already cached in the profile DB will raise `MissingEntry` rather than
     /// kicking off a JIT profile. Called from `new()`; the Python side is
-    /// idempotent so repeated calls are safe. A replay bridge is always strict.
+    /// idempotent so repeated calls are safe. A kernel-data bridge is always strict.
     pub fn disable_jit_profiling(&self) -> Result<(), PerfApiError> {
-        if self.replay.is_some() {
+        if self.kernel_data.is_some() {
             return Ok(());
         }
         python::call_perf_api_void("disable_jit_profiling")
@@ -483,10 +468,10 @@ impl PerfApiBridge {
     /// Re-enable JIT profiling. Used by the `--build-cache-only` entry point
     /// (L1 design.md §7.2): Rust main flips this back on *before* calling any
     /// `*Kernel::build`, so missing specs are profiled into the DB on demand
-    /// instead of erroring out. A no-op on a replay bridge, which cannot
-    /// profile: a missing sample stays a `MissingEntry`.
+    /// instead of erroring out. A no-op on a kernel-data bridge, which cannot
+    /// profile: a missing sample stays an error.
     pub fn enable_jit_profiling(&self) -> Result<(), PerfApiError> {
-        if self.replay.is_some() {
+        if self.kernel_data.is_some() {
             return Ok(());
         }
         python::call_perf_api_void("enable_jit_profiling")
@@ -529,17 +514,7 @@ impl PerfApiBridge {
             return Ok(Vec::new());
         }
         let backend = shared_backend(&payloads)?;
-        if let Some(replay) = &self.replay {
-            return replay.get_times(&payloads, kind, backend, gpu_name);
-        }
-        let metrics = python::get_times(&payloads, kind, backend, gpu_name)?;
-        if let Some(records) = self.sample_records.borrow_mut().as_mut() {
-            for (payload, metrics) in payloads.iter().zip(&metrics) {
-                let row = SampleRow::answer(kind, backend, gpu_name, payload, metrics);
-                records.insert(row.key(), row);
-            }
-        }
-        Ok(metrics)
+        python::get_times(&payloads, kind, backend, gpu_name)
     }
 
     /// Count cache-miss specs for `kind` against the given backend's profile.
@@ -555,9 +530,6 @@ impl PerfApiBridge {
             return Ok(0);
         }
         ensure_payload_backends_match(&payloads, backend)?;
-        if let Some(replay) = &self.replay {
-            return Ok(replay.count_missing(&payloads, kind, backend, gpu_name));
-        }
         python::count_missing(&payloads, kind, backend, gpu_name)
     }
 

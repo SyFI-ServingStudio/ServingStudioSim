@@ -1,15 +1,17 @@
 //! `timing-predict` as a wasm32 module, for predicting in a browser.
 //!
-//! Measured kernel rows arrive as replay samples and the files an arch block
-//! names (model config, routing artifact) as strings, so nothing reads a file,
-//! a database or Python. The public API's predict bundle supplies all three.
+//! Measured kernel grids arrive as the kernel API's config documents and the
+//! files an arch block names (model config, routing artifact) as strings, so
+//! nothing reads a file, a database or Python.
 //!
 //! JS surface (wasm-bindgen; every JSON value is passed as a string):
-//! - `version()` -> `{"sim_commit", "sample_format"}`: the checkout this module
-//!   was built from and the sample wire format it reads.
-//! - `new Predictor(config, samples, files)` builds the model (the kernel cost
-//!   caches) once. `config` is a predict config (`{"arch", "gpu", "backends"?}`),
-//!   `samples` a sample array, `files` `{path: contents}`.
+//! - `version()` -> `{"sim_commit", "kernel_data_format"}`: the checkout this
+//!   module was built from and the kernel data it reads.
+//! - `new Predictor(config, kernel_data, files)` builds the model (the kernel
+//!   cost caches) once. `config` is a predict config (`{"arch", "gpu",
+//!   "backends"?}`), `kernel_data` the config documents
+//!   (`GET /kernels/{kind}/configs/{hash}` responses, as an array or under
+//!   `configs`), `files` `{path: contents}`.
 //! - `predictor.info()`, `predictor.manifest()`: the case shape and the cost tree.
 //! - `predictor.predict(cases)` -> `{"cases": [{total_time_ms, slot_time_ms,
 //!   node_time_ms}]}`; an invalid case throws `case N: <reason>` before any is costed.
@@ -25,7 +27,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use serde_json::Value;
 use simulator::common::input_files;
-use simulator::timing::bridge::{PerfApiBridge, ReplaySamples, SAMPLE_FORMAT};
+use simulator::timing::bridge::{KernelData, PerfApiBridge, KERNEL_DATA_FORMAT};
 use simulator::timing_predict::Predictor as Inner;
 use wasm_bindgen::prelude::*;
 
@@ -49,7 +51,7 @@ pub fn last_panic() -> Option<String> {
 pub fn version() -> String {
     serde_json::json!({
         "sim_commit": option_env!("SERVINGSTUDIO_SIM_COMMIT"),
-        "sample_format": SAMPLE_FORMAT,
+        "kernel_data_format": KERNEL_DATA_FORMAT,
     })
     .to_string()
 }
@@ -70,9 +72,9 @@ pub struct Predictor {
 #[wasm_bindgen]
 impl Predictor {
     #[wasm_bindgen(constructor)]
-    pub fn new(config: &str, samples: &str, files: &str) -> Result<Predictor, JsError> {
+    pub fn new(config: &str, kernel_data: &str, files: &str) -> Result<Predictor, JsError> {
         install_panic_hook();
-        build(config, samples, files).map_err(js_err)
+        build(config, kernel_data, files).map_err(js_err)
     }
 
     pub fn info(&self) -> String {
@@ -92,7 +94,7 @@ impl Predictor {
     }
 }
 
-fn build(config: &str, samples: &str, files: &str) -> anyhow::Result<Predictor> {
+fn build(config: &str, kernel_data: &str, files: &str) -> anyhow::Result<Predictor> {
     let mut config: Value = serde_json::from_str(config).context("parsing config")?;
     let config = config.as_object_mut().context("config must be an object")?;
     let arch = config.remove("arch").context("config.arch is required")?;
@@ -101,13 +103,13 @@ fn build(config: &str, samples: &str, files: &str) -> anyhow::Result<Predictor> 
         .and_then(|g| g.as_str().map(str::to_string))
         .context("config.gpu is required")?;
     let backends = config.remove("backends");
-    let samples = ReplaySamples::from_json(samples).context("parsing samples")?;
+    let data = KernelData::from_json(kernel_data).context("parsing kernel data")?;
     let files: HashMap<PathBuf, String> = serde_json::from_str::<HashMap<String, String>>(files)
         .context("parsing files")?
         .into_iter()
         .map(|(path, text)| (PathBuf::from(path), text))
         .collect();
-    let bridge = PerfApiBridge::replay(Arc::new(samples));
+    let bridge = PerfApiBridge::kernel_data(Arc::new(data));
     let inner = input_files::with_files(files, || Inner::build(arch, &gpu, backends, &bridge))?;
     Ok(Predictor { inner })
 }

@@ -272,6 +272,62 @@ impl<S: KernelSpec> Kernel<S> {
                 .collect()
         };
 
+        // Kernel-data bridge: the config's document holds the measured grid, so
+        // the cache fits from it directly, with no args and no profile.db.
+        if let Some(data) = bridge.documents() {
+            let identity = config.identity();
+            let doc = data
+                .config(
+                    S::KIND,
+                    config.gpu_name(),
+                    &identity,
+                    sweep_grid.axes(),
+                    &infeasible,
+                )
+                .map_err(|reason| BuildError::KernelData {
+                    kind: S::KIND,
+                    reason,
+                })?;
+            if bridge.is_dry_run() {
+                let (missing, total) = backends
+                    .iter()
+                    .map(|backend| doc.missing(backend))
+                    .fold((0, 0), |(m, t), (dm, dt)| (m + dm, t + dt));
+                bridge.record_missing(name, S::KIND, missing, total);
+                return Ok(Self {
+                    config,
+                    outlier_warnings: Vec::new(),
+                    backend_caches: Vec::new(),
+                    _spec: PhantomData,
+                });
+            }
+            let mut backend_caches = Vec::with_capacity(backends.len());
+            let mut outlier_warnings = Vec::new();
+            for &backend in backends {
+                let samples = doc
+                    .samples(backend)
+                    .map_err(|reason| BuildError::KernelData {
+                        kind: S::KIND,
+                        reason,
+                    })?;
+                let (cache, warnings) = BackendCache::fit(
+                    S::KIND,
+                    backend,
+                    S::cache_kind(backend),
+                    &sweep_grid,
+                    &samples,
+                )?;
+                backend_caches.push(cache);
+                outlier_warnings.extend(warnings);
+            }
+            return Ok(Self {
+                config,
+                outlier_warnings,
+                backend_caches,
+                _spec: PhantomData,
+            });
+        }
+
         // Dry-run mode: don't fit caches — just tally how many specs are missing
         // from profile.db (the JIT work a real build would do) and report one line
         // for this kernel. The returned `Kernel` has empty caches; dry-run exits

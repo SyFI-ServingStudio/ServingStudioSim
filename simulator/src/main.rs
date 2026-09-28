@@ -105,15 +105,11 @@ struct PredictArgs {
     /// See [`CacheArgs::kernel_configs_out`].
     #[arg(long, value_name = "FILE")]
     kernel_configs_out: Option<PathBuf>,
-    /// Write every profile.db row the prediction read, as a replay samples
-    /// array (the input a wasm build predicts from), to this JSON file.
-    #[arg(long, value_name = "FILE", conflicts_with = "dry_run")]
-    samples_out: Option<PathBuf>,
-    /// Read measured rows from this replay samples array (what
-    /// `--samples-out` writes) instead of profile.db: no Python perf_api, no
-    /// JIT; a spec it lacks fails the run.
-    #[arg(long, value_name = "FILE", conflicts_with = "samples_out")]
-    replay_samples: Option<PathBuf>,
+    /// Fit every kernel cache from these kernel API config documents (a JSON
+    /// array, or an object with `configs`) instead of profile.db: no Python
+    /// perf_api, no JIT; a config without a complete document fails the run.
+    #[arg(long, value_name = "FILE")]
+    kernel_data: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -259,9 +255,8 @@ fn main() -> anyhow::Result<()> {
             },
             &simulator::timing_predict::PredictOutputs {
                 kernel_configs: args.kernel_configs_out.as_deref(),
-                samples: args.samples_out.as_deref(),
             },
-            args.replay_samples.as_deref(),
+            args.kernel_data.as_deref(),
         ),
     }
 }
