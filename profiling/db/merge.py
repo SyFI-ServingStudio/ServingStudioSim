@@ -18,8 +18,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from profiling.db.kernel_config import REGISTRY_KEYS
 from profiling.db.migrate import SCHEMA_HASH, SCHEMA_VERSION
+from profiling.db.storage import LOOKUP_KEYS, RUN_COLUMNS, RUN_TABLE
 
 _METADATA_TABLE = "_db_metadata"
 _IGNORED_EQUALITY_COLUMNS = frozenset({"created_at"})
@@ -240,8 +240,8 @@ def _merge_common_table(
                 table=contract.name,
                 key={column: _json_value(right_row[column]) for column in contract.semantic_key},
                 differing_columns=differing,
-                left=_report_row(existing, contract),
-                right=_report_row(right_row, contract),
+                left=_report_row(output_conn, existing, contract),
+                right=_report_row(right_conn, right_row, contract),
             )
         )
 
@@ -349,9 +349,9 @@ def _table_contract(conn: sqlite3.Connection, table_name: str) -> _TableContract
 
 def _semantic_key(conn: sqlite3.Connection, table_name: str) -> tuple[str, ...]:
     table = _quote_identifier(table_name)
-    # The kernel-config registry keys its rows by content hashes, not by
-    # (gpu_name, backend); each of its tables declares exactly that key.
-    registry_key = REGISTRY_KEYS.get(table_name)
+    # The kernel-config registry and the lookup tables key their rows by
+    # content, not by (gpu_name, backend); each declares exactly that key.
+    registry_key = LOOKUP_KEYS.get(table_name)
     candidates: list[tuple[str, ...]] = []
     for index_row in conn.execute(f"PRAGMA index_list({table})").fetchall():
         if not int(index_row["unique"]) or int(index_row["partial"]):
@@ -412,8 +412,19 @@ def _insert_row(conn: sqlite3.Connection, contract: _TableContract, row: sqlite3
     )
 
 
-def _report_row(row: sqlite3.Row, contract: _TableContract) -> dict[str, Any]:
-    return {column: _json_value(row[column]) for column in contract.insert_columns}
+def _report_row(
+    conn: sqlite3.Connection, row: sqlite3.Row, contract: _TableContract
+) -> dict[str, Any]:
+    out = {column: _json_value(row[column]) for column in contract.insert_columns}
+    if "run_key" in out:
+        # A run key means nothing to whoever resolves the conflict.
+        run = conn.execute(
+            f"SELECT {', '.join(RUN_COLUMNS)} FROM {RUN_TABLE} WHERE run_key = ?",
+            (row["run_key"],),
+        ).fetchone()
+        if run is not None:
+            out.update(zip(RUN_COLUMNS, tuple(run), strict=True))
+    return out
 
 
 def _json_value(value: Any) -> Any:

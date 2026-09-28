@@ -44,9 +44,11 @@ from profiling.db.kernel_config import (
     CONFIG_TABLE,
     SOURCE_TABLE,
     USE_TABLE,
+    USES_SQL,
     canonical_json,
     content_hash,
 )
+from profiling.db.storage import load_blobs, unpack_identity
 from public_api.kernel import demand
 from public_api.kernel import library as kernel_library
 from public_api.kernel.library import (
@@ -562,19 +564,23 @@ class ArchLibrary:
                 }
                 if not {CONFIG_TABLE, USE_TABLE} <= tables:
                     return {}
-                records = conn.execute(
-                    f"""
-                    select distinct u.source_hash, u.kind, u.config_hash, u.gpu_name, c.identity
-                    from {USE_TABLE} u join {CONFIG_TABLE} c
-                      on c.kind = u.kind and c.config_hash = u.config_hash
-                     and c.gpu_name = u.gpu_name
-                    """
-                ).fetchall()
+                identities = {
+                    (kind, config_hash, gpu): text
+                    for kind, config_hash, gpu, text in conn.execute(
+                        f"select kind, config_hash, gpu_name, identity from {CONFIG_TABLE}"
+                    )
+                }
+                blobs = load_blobs(conn)
+                records = {
+                    (source_hash, kind, config_hash, gpu)
+                    for kind, config_hash, gpu, _, source_hash, *_ in conn.execute(USES_SQL)
+                }
             out: dict[str, dict] = {}
-            for source_hash, kind, config_hash, gpu, identity in records:
+            for source_hash, kind, config_hash, gpu in records:
                 entry = out.setdefault(source_hash, {"configs": set(), "routed": False})
                 entry["configs"].add((kind, config_hash, gpu))
-                entry["routed"] = entry["routed"] or demand.FIELD in json.loads(identity)
+                identity = unpack_identity(identities[kind, config_hash, gpu], blobs)
+                entry["routed"] = entry["routed"] or demand.FIELD in identity
             return out
 
         return self.sources.cached_by_db("arch-source-configs", compute)

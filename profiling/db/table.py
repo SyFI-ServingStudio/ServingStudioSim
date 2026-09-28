@@ -15,9 +15,10 @@ from importlib import metadata as importlib_metadata
 from pathlib import Path
 from typing import Any, get_origin, get_type_hints
 
+from profiling.db import storage
 from profiling.db.args import KernelArgs
 from profiling.db.kind import KernelKind
-from profiling.db.migrate import SCHEMA_HASH, migrate_connection
+from profiling.db.migrate import SCHEMA_HASH, migrate_connection, require_current
 from profiling.db.registry import KernelProfilerSpec, MetricFamily
 from profiling.runners.metrics import CommMetrics, ComputeMetrics, Metrics
 
@@ -135,19 +136,22 @@ class Table:
             "gpu_name",
             "backend",
             *self.args_columns,
-            *STANDARD_COLUMNS[2:],
+            "args_hash",
+            "run_key",
+            "profiler_run_at",
+            "verified",
             *metric_columns,
         ]
         placeholders = ", ".join("?" for _ in columns)
         # Replacement policy: same (gpu_name, backend, args) overwrites the
         # measurement/provenance columns and marks the row as freshly
         # verified/non-outlier. Key columns are not updated.
-        replace_columns = [*STANDARD_COLUMNS[2:], *metric_columns]
+        replace_columns = ["run_key", "profiler_run_at", "verified", *metric_columns]
         updates = ", ".join(f"{column}=excluded.{column}" for column in replace_columns)
         sql = f"""
             INSERT INTO {self.name} ({", ".join(columns)})
             VALUES ({placeholders})
-            ON CONFLICT(gpu_name, backend, {", ".join(self.args_columns)})
+            ON CONFLICT(gpu_name, backend, args_hash)
             DO UPDATE SET {updates}, is_outlier=0, retry_count=0, outlier_reason=NULL
         """
         default_git_hash = (
@@ -156,7 +160,7 @@ class Table:
         with self._write_transaction() as conn:
             conn.executemany(
                 sql,
-                [self._row_values(row, metric_columns, default_git_hash) for row in rows],
+                [self._row_values(conn, row, metric_columns, default_git_hash) for row in rows],
             )
 
     def query(
@@ -193,12 +197,11 @@ class Table:
         with conn:
             if not self._table_exists(conn):
                 return [None for _ in args_list]
+            select = storage.logical_select(conn, self.name)
             out: list[dict[str, Any] | None] = []
             for args in args_list:
                 where, values = self._where(args, backend, gpu_name)
-                row = conn.execute(
-                    f"SELECT * FROM {self.name} WHERE {where} LIMIT 1", values
-                ).fetchone()
+                row = conn.execute(f"{select} WHERE {where} LIMIT 1", values).fetchone()
                 out.append(dict(row) if row is not None else None)
             return out
 
@@ -206,6 +209,28 @@ class Table:
         """``args`` as this table stores them, in ``args_columns`` order."""
         values = _args_to_db(args)
         return tuple(values[column] for column in self.args_columns)
+
+    def args_hash(self, key: tuple[Any, ...]) -> bytes:
+        """The ``args_hash`` column of a row whose args are ``key`` (:meth:`db_key`)."""
+        return storage.args_hash(
+            dict(zip(self.args_columns, key, strict=True)), self._declared_types()
+        )
+
+    def args_match_sql(self, alias: str = "") -> str:
+        """``args_hash = ? AND <each args column> = ?`` over ``alias``'s columns;
+        bind :meth:`args_hash` then the :meth:`db_key` values. The hash finds the
+        row through the unique index; the columns confirm it."""
+        prefix = f"{alias}." if alias else ""
+        return " AND ".join(
+            [f"{prefix}args_hash = ?", *(f"{prefix}{column} = ?" for column in self.args_columns)]
+        )
+
+    def _declared_types(self) -> dict[str, str]:
+        type_hints = get_type_hints(self.profiler_spec.args_schema)
+        return {
+            field.name: _sqlite_type(type_hints[field.name])
+            for field in fields(self.profiler_spec.args_schema)
+        }
 
     def exists(
         self,
@@ -233,10 +258,10 @@ class Table:
             row = conn.execute(f"SELECT COUNT(*) AS n FROM {self.name}").fetchone()
             hashes = conn.execute(
                 f"""
-                SELECT DISTINCT profiler_git_hash
-                FROM {self.name}
-                WHERE profiler_git_hash IS NOT NULL AND profiler_git_hash != ''
-                ORDER BY profiler_git_hash
+                SELECT DISTINCT r.profiler_git_hash
+                FROM {self.name} t JOIN {storage.RUN_TABLE} r ON r.run_key = t.run_key
+                WHERE r.profiler_git_hash != ''
+                ORDER BY r.profiler_git_hash
                 """
             ).fetchall()
         return TableMetadata(
@@ -272,42 +297,25 @@ class Table:
         conn = sqlite3.connect(f"{self.db_path.resolve().as_uri()}?mode=ro", uri=True)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA query_only = ON")
+        require_current(conn, str(self.db_path))
         return conn
 
     def _ensure_schema(self, conn: sqlite3.Connection) -> None:
         """Prepare this table inside an already-open write transaction."""
-        type_hints = get_type_hints(self.profiler_spec.args_schema)
-        arg_defs = ",\n                ".join(
-            f"{field.name} {_sqlite_type(type_hints[field.name])} NOT NULL"
-            for field in fields(self.profiler_spec.args_schema)
-        )
-        metric_defs = ",\n                    ".join(
-            f"{column} {column_def}" for column, column_def in self._metric_create_defs().items()
-        )
-        unique_args = ", ".join(self.args_columns)
+        conn.execute(storage.RUN_SCHEMA)
         conn.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {self.name} (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                gpu_name TEXT NOT NULL,
-                backend TEXT NOT NULL,
-                {arg_defs},
-                profiler_git_hash TEXT NOT NULL,
-                profiler_run_at TEXT NOT NULL,
-                cuda_version TEXT,
-                driver_version TEXT,
-                backend_version TEXT,
-                verified INTEGER NOT NULL DEFAULT 0,
-                {metric_defs},
-                is_outlier INTEGER NOT NULL DEFAULT 0,
-                retry_count INTEGER NOT NULL DEFAULT 0,
-                outlier_reason TEXT,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(gpu_name, backend, {unique_args})
+            storage.kind_table_schema(
+                self.name,
+                [
+                    f"{column} {declared} NOT NULL"
+                    for column, declared in self._declared_types().items()
+                ],
+                [
+                    f"{column} {column_def}"
+                    for column, column_def in self._metric_create_defs().items()
+                ],
             )
-            """
         )
-        self._ensure_standard_columns(conn)
         self._ensure_metric_columns(conn)
 
     def _table_exists(self, conn: sqlite3.Connection) -> bool:
@@ -337,22 +345,6 @@ class Table:
             gpu_name=gpu_name,
             args=args,
         )
-
-    def _ensure_standard_columns(self, conn: sqlite3.Connection) -> None:
-        existing = {
-            row["name"] for row in conn.execute(f"PRAGMA table_info({self.name})").fetchall()
-        }
-        alter_defs = {
-            "profiler_git_hash": "TEXT DEFAULT 'unknown'",
-            "profiler_run_at": "TEXT",
-            "cuda_version": "TEXT",
-            "driver_version": "TEXT",
-            "backend_version": "TEXT",
-            "verified": "INTEGER NOT NULL DEFAULT 0",
-        }
-        for column, column_def in alter_defs.items():
-            if column not in existing:
-                conn.execute(f"ALTER TABLE {self.name} ADD COLUMN {column} {column_def}")
 
     def _ensure_metric_columns(self, conn: sqlite3.Connection) -> None:
         existing = {
@@ -399,28 +391,34 @@ class Table:
         return row is not None
 
     def _where(self, args: KernelArgs, backend: str, gpu_name: str) -> tuple[str, list[Any]]:
-        arg_values = _args_to_db(args)
-        where = ["gpu_name = ?", "backend = ?", *(f"{column} = ?" for column in self.args_columns)]
-        values = [gpu_name, backend, *(arg_values[column] for column in self.args_columns)]
-        return " AND ".join(where), values
+        """Unqualified columns: the caller's FROM names this table once (the
+        logical select aliases it ``t``, whose columns these still resolve to)."""
+        key = self.db_key(args)
+        where = f"gpu_name = ? AND backend = ? AND {self.args_match_sql()}"
+        return where, [gpu_name, backend, self.args_hash(key), *key]
 
     def _row_values(
         self,
+        conn: sqlite3.Connection,
         row: ProfileRow,
         metric_columns: list[str],
         default_git_hash: str,
     ) -> list[Any]:
-        arg_values = _args_to_db(row.args)
+        key = self.db_key(row.args)
         metric_values = _metrics_to_db(row.metrics)
-        return [
-            row.gpu_name,
-            row.backend,
-            *(arg_values[column] for column in self.args_columns),
+        provenance = (
             row.profiler_git_hash or default_git_hash,
-            row.profiler_run_at or _utc_now(),
             row.cuda_version or _cuda_version(),
             row.driver_version or _driver_version(),
             row.backend_version or _backend_version(row.backend),
+        )
+        return [
+            row.gpu_name,
+            row.backend,
+            *key,
+            self.args_hash(key),
+            storage.run_key(conn, provenance),
+            storage.epoch(row.profiler_run_at or _utc_now()),
             int(row.verified),
             *(metric_values[column] for column in metric_columns),
         ]

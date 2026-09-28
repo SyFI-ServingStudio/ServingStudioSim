@@ -257,19 +257,36 @@ schema and are passed as separate kwargs / DB columns.
 
 ## DB shape
 
-One table per args schema, keyed `UNIQUE(gpu_name, backend, <args...>)`. Re-profiling
-the same key overwrites the measurement + provenance columns (and clears the
-outlier flag); key columns are never updated. Metric columns are a table-level
-contract chosen by `metric_family`:
+One table per args schema, keyed `UNIQUE(gpu_name, backend, args_hash)`: `args_hash`
+is an 8-byte hash of the args columns as SQLite stores them, and the args stay in
+their own columns. Re-profiling the same key overwrites the measurement +
+provenance columns (and clears the outlier flag); key columns are never updated.
+Metric columns are a table-level contract chosen by `metric_family`:
 
 - **compute** → `time_ms, tflops, memory_bandwidth_gbps, energy_j`
 - **comm** → `time_ms, algbw_gbps, busbw_gbps, energy_j`
   (`message_size_bytes` is an **args/cache-key** column, not a measured result —
   the simulator derives moved bytes from `busbw × time`.)
 
+profile.db is tracked in git, so it stores each repeated value once (schema v3,
+`profiling/db/storage.py`). A row's provenance — profiler git hash, CUDA, driver
+and backend versions — is a `run_key` into `_profile_run`; `profiler_run_at` and
+`created_at` are epoch seconds. Readers still get the v2 columns: `Table.rows_for`
+and `storage.logical_select(conn, table)` join the run and render the timestamps.
+Ad-hoc SQL does the same:
+
+```sql
+SELECT t.*, r.profiler_git_hash, datetime(t.profiler_run_at, 'unixepoch')
+FROM single_gemm t JOIN _profile_run r USING (run_key)
+```
+
+A DB an older checkout wrote (schema v2) is refused by readers until
+`python -m launcher kernel-profile migrate-db <path>` upgrades it in place; the
+upgrade keeps every row and id and then VACUUMs the file.
+
 A row's args are one grid cell of one simulator kernel config, but the row does
-not say which. Three tables starting with `_` (so they are not kind tables)
-record it, written by the builds that ask for the rows:
+not say which. Tables starting with `_` (so they are not kind tables) record it,
+written by the builds that ask for the rows:
 
 - `_kernel_config`, keyed `(kind, config_hash, gpu_name)`: the Rust
   `KernelConfig::identity` (no `gpu_name` or `backends`, `Dim` values only;
@@ -280,7 +297,13 @@ record it, written by the builds that ask for the rows:
   corpus-routed MoE config names a payload file.
 - `_kernel_config_source`, keyed `source_hash`: what built configs — the preset,
   timing-predict config or `#[supported]` row, pool, GPU and arch block.
-- `_kernel_config_use`: which `(pool, role)` of which source built which config.
+- `_kernel_config_use`: which `(pool, role)` of which source built which config,
+  naming the config, source and role by content key (`config_key`, `source_key`,
+  `role_key` into `_kernel_config_role`).
+- `_kernel_config_blob`: each identity array of at least 1 KiB (an MoE routing's
+  per-layer popularity), stored once; the identity holds `{"$blob": "<key>"}` in
+  its place. `registered_configs` returns identities with the arrays restored, so
+  `config_hash` is still the hash of the full identity.
 
 The launcher registers them after a cache prebuild that profiled and after a
 timing-predict run; `--register-kernel-configs` registers a preset's or predict
@@ -314,6 +337,7 @@ python -m launcher kernel-profile count-missing <table> --backend <b> ...
 python -m launcher kernel-profile run           <table> --backend <b> [--force | --fresh] ...
 python -m launcher kernel-profile measure       <table> --backend <b> --spec '{...}' [--output-dir DIR] [--duration-s 10] [--telemetry-hz 20] [--no-clear-l2]
 python -m launcher kernel-profile merge-db LEFT.db RIGHT.db --output MERGED.db [--report REPORT.json]
+python -m launcher kernel-profile migrate-db profile.db
 python -m launcher kernel-profile audit-provenance [--db profile.db] [--json]
 ```
 
@@ -337,8 +361,11 @@ telemetry.
 
 `merge-db` reads both inputs without modifying them. It copies rows and whole
 tables found on only one side and deduplicates rows whose declared
-`UNIQUE(gpu_name, backend, <args...>)` identity and payload agree. The
-kernel-config registry tables merge the same way on their own content-hash keys;
+`UNIQUE(gpu_name, backend, args_hash)` identity and payload agree. The
+kernel-config registry and lookup tables merge the same way on their own
+content-hash keys; every reference between tables is such a key, never an `id`,
+so nothing is remapped. Both inputs must be at this checkout's schema (run
+`migrate-db` on an older one first);
 a config registered on both sides with different grids is a conflict. If the same
 identity has different measurement, provenance, or outlier state, no output DB
 is published: the command returns `1` and writes both versions to

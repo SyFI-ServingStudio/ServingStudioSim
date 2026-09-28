@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from profiling.db import kernel_config
+from profiling.db import kernel_config, storage
 from profiling.db.args import DType
 from profiling.db.doc import CUPTI_METHOD, KernelDoc, arg_docs, kernel_doc
 from profiling.db.registry import iter_kernel_profiler_specs
@@ -33,12 +33,7 @@ from public_api.kernel import library
 from public_api.kernel.library import PROVENANCE, KernelLibrary
 from public_api.kernel.sources import REPO_ROOT, KernelSources
 
-GEMM_COLUMNS = (
-    "gpu_name TEXT, backend TEXT, m INTEGER, n INTEGER, k INTEGER, dtype TEXT, "
-    "time_ms REAL, tflops REAL, memory_bandwidth_gbps REAL, energy_j REAL, "
-    "profiler_git_hash TEXT, profiler_run_at TEXT, cuda_version TEXT, "
-    "driver_version TEXT, backend_version TEXT"
-)
+GEMM_ARGS = {"m": "INTEGER", "n": "INTEGER", "k": "INTEGER", "dtype": "TEXT"}
 PROV = ("abc123", "2026-09-01T00:00:00+00:00", "12.9", "580", None)
 GEMM_ROWS = [
     ("NVIDIA H200", "torch", 1, 6144, 4096, "bf16", 0.01, 5.0, 100.0, None, *PROV),
@@ -188,8 +183,31 @@ class FixtureSources(KernelSources):
 def db(tmp_path: Path) -> Path:
     path = tmp_path / "profile.db"
     conn = sqlite3.connect(path)
-    conn.execute(f"create table single_gemm ({GEMM_COLUMNS})")
-    conn.executemany(f"insert into single_gemm values ({', '.join('?' * 15)})", GEMM_ROWS)
+    conn.execute(storage.RUN_SCHEMA)
+    conn.execute(
+        storage.kind_table_schema(
+            "single_gemm",
+            [f"{c} {t} NOT NULL" for c, t in GEMM_ARGS.items()],
+            ["time_ms REAL", "tflops REAL", "memory_bandwidth_gbps REAL", "energy_j REAL"],
+        )
+    )
+    for gpu, backend, *rest in GEMM_ROWS:
+        args = dict(zip(GEMM_ARGS, rest[:4], strict=True))
+        metrics, (git_hash, run_at, *versions) = rest[4:8], rest[8:]
+        conn.execute(
+            "insert into single_gemm (gpu_name, backend, m, n, k, dtype, args_hash, run_key, "
+            "profiler_run_at, time_ms, tflops, memory_bandwidth_gbps, energy_j) "
+            f"values ({', '.join('?' * 13)})",
+            (
+                gpu,
+                backend,
+                *args.values(),
+                storage.args_hash(args, GEMM_ARGS),
+                storage.run_key(conn, (git_hash, *versions)),
+                storage.epoch(run_at),
+                *metrics,
+            ),
+        )
     conn.commit()
     conn.close()
     return path

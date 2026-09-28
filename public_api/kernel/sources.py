@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any
 
 from launcher.exec import _build_subprocess_env, binary_path
+from profiling.db.migrate import require_current
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -130,6 +131,7 @@ class KernelSources:
         conn = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True)
         try:
             conn.execute("pragma query_only = on")
+            require_current(conn, str(self.db_path))
             yield conn
         finally:
             conn.close()

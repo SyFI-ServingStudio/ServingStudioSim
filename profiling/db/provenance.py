@@ -23,6 +23,9 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from profiling.db.migrate import require_current
+from profiling.db.storage import RUN_TABLE
+
 _DIRTY_SUFFIX = "-dirty"
 _UNKNOWN_HASH = "unknown"
 _COMMIT_RE = re.compile(r"[0-9a-fA-F]{7,64}\Z")
@@ -76,7 +79,7 @@ def _tables_with_provenance(conn: sqlite3.Connection) -> list[str]:
         columns = {
             str(row[1]) for row in conn.execute(f"PRAGMA table_info({_quote_identifier(name)})")
         }
-        if {"backend", "profiler_git_hash"} <= columns:
+        if {"backend", "run_key"} <= columns:
             tables.append(name)
     return sorted(tables)
 
@@ -299,14 +302,15 @@ def audit_profile_provenance(
     unverifiable_rows = 0
 
     with closing(_connect(db_path)) as conn:
+        require_current(conn, str(db_path))
         for table in _tables_with_provenance(conn):
             quoted_table = _quote_identifier(table)
             groups = conn.execute(
                 f"""
-                SELECT backend, profiler_git_hash, COUNT(*)
-                FROM {quoted_table}
-                WHERE profiler_git_hash IS NOT NULL AND profiler_git_hash != ''
-                GROUP BY backend, profiler_git_hash
+                SELECT t.backend, r.profiler_git_hash, COUNT(*)
+                FROM {quoted_table} t JOIN {RUN_TABLE} r ON r.run_key = t.run_key
+                WHERE r.profiler_git_hash != ''
+                GROUP BY t.backend, r.profiler_git_hash
                 """
             ).fetchall()
             for backend_value, stamp_value, row_count_value in groups:
