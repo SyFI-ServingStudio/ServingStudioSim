@@ -52,3 +52,7 @@ glm53_flash:
   name: GLM-5.3-Flash
   family: GLM
   checkpoint: zai-org/GLM-5.3-Flash
+deepseek_v41_flash:
+  name: DeepSeek V4.1 Flash
+  family: DeepSeek
+  checkpoint: deepseek-ai/DeepSeek-V4.1-Flash

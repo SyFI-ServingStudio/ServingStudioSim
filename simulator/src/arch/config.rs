@@ -310,13 +310,15 @@ pub enum IterArchSel {
     /// attention and EP4 experts over the same four ranks (deployment
     /// invariants). Routed demand normally comes from the capture's token
     /// corpus (`routing = corpus`), the demand its MoE rows were profiled on.
+    #[supported(gpu = ["NVIDIA B200"], model_config = ["deepseek_v41_flash"], fp8 = [true])]
     DeepseekV41Vllm {
         #[serde(flatten)]
         model: ModelSpec,
         #[serde(default)]
-        #[param(string, default = "uniform", choices = ROUTING_KINDS)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS, set_when_predicting, cache_key)]
         routing: RoutingKind,
         #[serde(default)]
+        #[param(cache_key)]
         routing_seed: Option<u64>,
         #[serde(default)]
         #[param(cache_key)]
@@ -338,13 +340,15 @@ pub enum IterArchSel {
     /// input projections, the compressor aux stream, the shared expert)
     /// serialized; the Engram lookups keep racing the main path. An explicit
     /// alignment counterfactual, not a runtime knob on the production selector.
+    #[supported(gpu = ["NVIDIA B200"], model_config = ["deepseek_v41_flash"], fp8 = [true])]
     DeepseekV41VllmSerialStreams {
         #[serde(flatten)]
         model: ModelSpec,
         #[serde(default)]
-        #[param(string, default = "uniform", choices = ROUTING_KINDS)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS, set_when_predicting, cache_key)]
         routing: RoutingKind,
         #[serde(default)]
+        #[param(cache_key)]
         routing_seed: Option<u64>,
         #[serde(default)]
         #[param(cache_key)]
@@ -1056,7 +1060,7 @@ mod iter_tests {
                 );
             }
         }
-        assert_eq!(routed, 14);
+        assert_eq!(routed, 16);
     }
 }
 // ── layer-wise attn / ffn contract (AFD)────────────────────────────────────

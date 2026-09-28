@@ -33,6 +33,12 @@ deepseek_v4_vllm:
 deepseek_v4_vllm_serial_streams:
   name: DeepSeek V4 Flash, vLLM, serialized streams
   summary: The same kernels as the vLLM graph with each source-level parallel region run one after another. It is a counterfactual for alignment, not a runtime option.
+deepseek_v41_vllm:
+  name: DeepSeek V4.1 Flash, vLLM
+  summary: DeepSeek-V4.1-Flash at vLLM's physical kernel boundaries on B200. Attention is TP4 and the experts EP4 over the same four ranks.
+deepseek_v41_vllm_serial_streams:
+  name: DeepSeek V4.1 Flash, vLLM, serialized streams
+  summary: The same kernels with the gated side streams run one after another, while the Engram lookups still race the main path. It is a counterfactual for alignment, not a runtime option.
 glm52_vllm_dsa_moe:
   name: GLM-5.2, vLLM
   summary: GLM-5.2's aligned vLLM execution graph, with local TP1 attention and expert parallelism across the replica.
