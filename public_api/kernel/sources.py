@@ -6,7 +6,8 @@ the model catalog) is code in this checkout and is imported directly. The two
 sources here sit behind one small class so tests can replace them with fixtures:
 
 - the release simulator's introspection commands, which print JSON and need no
-  GPU, database or Python perf_api (``list-params``, ``kernel-list``);
+  GPU, database or Python perf_api (``list-params``, ``kernel-list``,
+  ``supported-cost-trees``, also for given arch blocks);
 - profile.db, opened read-only for every query;
 - the files a config's routing names: which of them this checkout tracks (git).
 
@@ -22,6 +23,7 @@ import sqlite3
 import subprocess
 import threading
 from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -29,6 +31,9 @@ from typing import Any
 from launcher.exec import _build_subprocess_env, binary_path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+#: Simulator processes one :meth:`KernelSources.arch_cost_trees` call runs at once.
+BUILD_PROCESSES = 8
 
 
 class KernelSources:
@@ -84,6 +89,37 @@ class KernelSources:
         """Every Rust kernel kind with its config/input fields and dtype fields."""
 
         return self.cached_by_binary("kernel-list", lambda: self._simulator(["kernel-list"]))
+
+    def supported_cost_trees(self) -> list[dict]:
+        """``supported-cost-trees``: every ``#[supported]`` combination of every
+        arch, built structure-only, with its cost tree in the ``cost_manifest``
+        form. Not cached here: the output carries megabytes of kernel configs,
+        so the caller caches what it keeps (with :meth:`cached_by_binary`)."""
+
+        return self._simulator(["supported-cost-trees"])
+
+    def arch_cost_trees(self, blocks: list[dict]) -> list[dict]:
+        """``supported-cost-trees --archs -``: each ``{gpu, arch}`` block built
+        structure-only as a supported combination is (a param a block leaves
+        out takes its schema default), in the same output form and order. The
+        binary builds one block at a time, so the blocks are split across up
+        to :data:`BUILD_PROCESSES` processes. Not cached, as
+        :meth:`supported_cost_trees`."""
+
+        if not blocks:
+            return []
+        chunks = [blocks[i::BUILD_PROCESSES] for i in range(min(BUILD_PROCESSES, len(blocks)))]
+        with ThreadPoolExecutor(len(chunks)) as pool:
+            built = list(
+                pool.map(
+                    lambda chunk: self._simulator(
+                        ["supported-cost-trees", "--archs", "-"], json.dumps(chunk)
+                    ),
+                    chunks,
+                )
+            )
+        # Chunk i holds blocks i, i + n, i + 2n, ...: interleave them back.
+        return [built[i % len(chunks)][i // len(chunks)] for i in range(len(blocks))]
 
     # -- profile.db ----------------------------------------------------------------
 

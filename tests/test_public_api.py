@@ -6,6 +6,7 @@ fixtures; the profiling registry and a small profile.db are real.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import sqlite3
 from dataclasses import asdict
@@ -20,9 +21,13 @@ from profiling.db.doc import CUPTI_METHOD, KernelDoc, arg_docs, kernel_doc
 from profiling.db.registry import iter_kernel_profiler_specs
 from profiling.db.table import ProfileRow, Table
 from profiling.kernels.nvfp4_fused_moe import Nvfp4FusedMoeArgs
+from profiling.kernels.residual_rms_norm import ResidualRmsNormArgs
+from profiling.kernels.rms_norm import RmsNormArgs
 from profiling.kernels.single_gemm import SingleGemmArgs
 from profiling.runners.metrics import ComputeMetrics
 from public_api.app import PREFIX, create_app
+from public_api.arch import library as arch_library
+from public_api.arch.library import ArchLibrary, config_identity
 from public_api.kernel import library
 from public_api.kernel.library import PROVENANCE, KernelLibrary
 from public_api.kernel.sources import REPO_ROOT, KernelSources
@@ -77,6 +82,7 @@ SCHEMA = {
                             "name": "routing",
                             "type": "string",
                             "default": "uniform",
+                            "set_when_predicting": True,
                             "choices": ["uniform", "popularity", "corpus"],
                         },
                         {
@@ -95,6 +101,69 @@ SCHEMA = {
 }
 
 
+def _dim(value: int, expression: str) -> dict:
+    """A rich ``Dim`` as a slot's kernel config serializes it."""
+
+    return {"value": value, "expression": expression, "bindings": {"hidden": 4096}}
+
+
+def _gemm_config(n: dict | int) -> dict:
+    return {
+        "gpu_name": "NVIDIA H200",
+        "backends": ["torch", "torch_linear"],
+        "n": n,
+        "k": _dim(4096, "hidden"),
+        "dtype": "bf16",
+    }
+
+
+def _llama_build(tp_size: int) -> dict:
+    """``supported-cost-trees`` for one llama3_dense_tp expansion, cut down:
+    Sum(embedding, Scale{32}(Sum(Max(qkv rank 0, qkv rank 1), mlp))). Both
+    qkv ranks carry the registered qkv config (``QKV``)."""
+
+    qkv = _gemm_config(_dim(6144, "(heads+2*kv_heads)*head_dim"))
+    slots = [
+        {
+            "name": "unified.embedding",
+            "kind": "elementwise",
+            "kernel_config": {
+                "gpu_name": "NVIDIA H200",
+                "backends": ["triton"],
+                "input_bytes_per_token": 8192,
+                "output_bytes_per_token": 8192,
+            },
+        },
+        {"name": "unified.layer.attn.qkv", "kind": "single_gemm", "kernel_config": qkv},
+        {"name": "unified.layer.attn.qkv", "kind": "single_gemm", "kernel_config": qkv},
+        {"name": "unified.layer.mlp", "kind": "single_gemm", "kernel_config": _gemm_config(14336)},
+    ]
+    nodes = [
+        {"Sum": {"children": {"start": 1, "end": 3}}},
+        {"Leaf": 0},
+        {"Scale": {"n": 32, "children": {"start": 3, "end": 4}}},
+        {"Sum": {"children": {"start": 4, "end": 6}}},
+        {"Max": {"overlap": 1.0, "children": {"start": 6, "end": 8}}},
+        {"Leaf": 3},
+        {"Leaf": 1},
+        {"Leaf": 2},
+    ]
+    labels = [f"unified [dense TP (tp={tp_size})]", None, "layer", None, "attn [Max]", None, None]
+    return {
+        "contract": "iter_wise",
+        "arch": "llama3_dense_tp",
+        "gpu": "NVIDIA H200",
+        "params": {"model_config": "llama3_8b", "tp_size": tp_size},
+        "gpus_per_replica": tp_size,
+        "cost_manifest": {
+            "sections": [
+                {"section": "iter", "slots": slots, "nodes": nodes, "node_labels": [*labels, None]}
+            ]
+        },
+        "error": None,
+    }
+
+
 class FixtureSources(KernelSources):
     """Real profile.db access, canned simulator introspection."""
 
@@ -103,6 +172,15 @@ class FixtureSources(KernelSources):
 
     def kernel_list(self) -> list[dict]:
         return [{"kind": "single_gemm", "compute_dtype": "dtype", "kv_dtype": None}]
+
+    def supported_cost_trees(self) -> list[dict]:
+        return [_llama_build(1), _llama_build(4)]
+
+    def arch_cost_trees(self, blocks: list[dict]) -> list[dict]:
+        """``supported-cost-trees --archs``: a Llama block builds as its row's
+        combination does."""
+
+        return [_llama_build(block["arch"]["tp_size"]) for block in blocks]
 
 
 @pytest.fixture
@@ -121,6 +199,9 @@ def catalog(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     path = tmp_path / "catalog.yaml"
     path.write_text("llama3_8b: {name: Llama 3 8B, family: Llama}\n")
     monkeypatch.setattr(library, "MODEL_CATALOG", path)
+    archs = tmp_path / "arch_catalog.yaml"
+    archs.write_text("llama3_dense_tp: {name: 'Llama 3, TP', summary: Megatron TP.}\n")
+    monkeypatch.setattr(arch_library, "ARCH_CATALOG", archs)
     monkeypatch.setattr(
         library, "kernel_doc", lambda kind: GEMM_DOC if kind == "single_gemm" else None
     )
@@ -329,6 +410,9 @@ def test_the_database_is_never_written(client: TestClient, db: Path) -> None:
         "/kernels/single_gemm",
         "/kernels/single_gemm/rows",
         "/kernels/single_gemm/configs",
+        "/archs",
+        "/archs/llama3_dense_tp",
+        "/archs/llama3_dense_tp/cost-tree?gpu=NVIDIA H200&model=llama3_8b&tp_size=4",
     ):
         assert client.get(f"{PREFIX}{path}").status_code == 200
     assert (hashlib.sha256(db.read_bytes()).hexdigest(), db.stat().st_mtime_ns) == before
@@ -377,10 +461,10 @@ def _row(m: int, n: int, backend: str) -> ProfileRow:
     )
 
 
-def _record(identity: dict, uses: list[dict]) -> dict:
+def _record(identity: dict, uses: list[dict], kind: str = "single_gemm") -> dict:
     return {
-        "kind": "single_gemm",
-        "profile_kind": "single_gemm",
+        "kind": kind,
+        "profile_kind": kind,
         "gpu_name": "NVIDIA H200",
         "identity": identity,
         "grid": {
@@ -781,3 +865,530 @@ def test_each_config_names_its_routing(routings) -> None:
         params={"gpu": "NVIDIA B200"},
     ).json()
     assert detail["config_labels"]["expert_demand"]["label"] == TRACKED
+
+
+# -- archs -----------------------------------------------------------------------
+
+LLAMA_TP4 = {"gpu": "NVIDIA H200", "model": "llama3_8b", "tp_size": "4"}
+
+
+def test_arch_catalog_names_each_arch_and_counts_its_parameter_sets(client: TestClient) -> None:
+    catalog = client.get(f"{PREFIX}/archs").json()
+    archs = {a["arch"]: a for a in catalog["archs"]}
+    llama = archs["llama3_dense_tp"]
+    assert (llama["name"], llama["summary"]) == ("Llama 3, TP", "Megatron TP.")
+    assert (llama["contract"], llama["models"], llama["families"]) == (
+        "iter_wise",
+        ["llama3_8b"],
+        ["Llama"],
+    )
+    assert (llama["gpus"], llama["params"]) == (["NVIDIA H200"], ["tp_size"])
+    # One row, so one parameter set; it lists tp_size 1 and 4.
+    assert (llama["param_sets"], llama["combinations"]) == (1, 2)
+    # An arch without rows or catalog entry is listed, last, with nothing to pick.
+    assert catalog["archs"][-1]["arch"] == "moe_x"
+    assert (archs["moe_x"]["name"], archs["moe_x"]["combinations"]) == (None, 0)
+    assert catalog["models"] == [
+        {"model_config": "llama3_8b", "name": "Llama 3 8B", "family": "Llama"}
+    ]
+
+
+def test_arch_detail_lists_params_and_the_supported_sets(registered) -> None:
+    client, _, _ = registered
+    arch = client.get(f"{PREFIX}/archs/llama3_dense_tp").json()
+    params = {p["name"]: p for p in arch["params"]}
+    assert params["tp_size"]["default"] == 2 and params["tp_size"]["values"] == [1, 4]
+    assert params["model_config"]["values"] == ["llama3_8b"]
+    # fp8 is an arch param the rows do not choose: the trees take its default.
+    assert params["fp8"]["values"] is None
+    assert arch["query"] == ["gpu", "model", "tp_size"]
+    [param_set] = arch["param_sets"]
+    # The kernel library's deployment-entry shape.
+    assert param_set["label"] == "llama3_dense_tp, tp_size 1 · 4"
+    assert (param_set["params"], param_set["varies"]) == ({"tp_size": [1, 4]}, ["tp_size"])
+    one, four = param_set["members"]
+    assert four["query"] == {"gpu": "NVIDIA H200", "model": "llama3_8b", "tp_size": 4}
+    assert (four["label"], four["gpus_per_replica"], four["error"]) == (
+        "llama3_dense_tp, tp_size 4",
+        4,
+        None,
+    )
+    # Three distinct configs: qkv is registered and measured, the other two are not.
+    assert four["counts"] == {"leaves": 4, "configs": 3, "registered": 1, "measured": 1}
+
+
+def test_cost_tree_nests_the_manifest_in_the_analyzer_shape(registered) -> None:
+    client, (qkv, _), _ = registered
+    tree = client.get(f"{PREFIX}/archs/llama3_dense_tp/cost-tree", params=LLAMA_TP4).json()
+    assert (tree["label"], tree["params"], tree["gpus_per_replica"]) == (
+        "llama3_dense_tp, tp_size 4",
+        {"tp_size": 4},
+        4,
+    )
+    # Params no row chooses take their schema defaults; the document says which.
+    assert (tree["defaults"], tree["set_when_predicting"]) == ({"fp8": False}, [])
+    [section] = tree["sections"]
+    root = section["root"]
+    assert (section["section"], root["kind"], root["id"], root["path"]) == (
+        "iter",
+        "sum",
+        0,
+        "unified",
+    )
+    assert root["label"] == "unified [dense TP (tp=4)]"
+    embedding, layers = root["children"]
+    embedding_hash = kernel_config.content_hash(
+        {"input_bytes_per_token": 8192, "output_bytes_per_token": 8192}
+    )
+    assert embedding == {
+        "id": 1,
+        "kind": "leaf",
+        "slot": {
+            "index": 0,
+            "name": "unified.embedding",
+            "kind": "elementwise",
+            "backends": ["triton"],
+            "config_hash": embedding_hash,
+            "config_key": f"elementwise:{embedding_hash}",
+        },
+    }
+    assert (layers["kind"], layers["n"], layers["label"]) == ("scale", 32, "layer")
+    [layer] = layers["children"]
+    assert layer["path"] == "unified.layer"
+    ranks, mlp = layer["children"]
+    assert (ranks["kind"], ranks["overlap"], ranks["path"]) == (
+        "max",
+        1.0,
+        "unified.layer.attn.qkv",
+    )
+    # Both ranks are one config: the Dims reduce to the registered qkv identity.
+    assert [r["slot"]["config_hash"] for r in ranks["children"]] == [qkv, qkv]
+    assert [r["slot"]["index"] for r in ranks["children"]] == [1, 2]
+    # Structure only: no time anywhere in the tree.
+    assert "timing" not in str(tree["sections"]) and "ms" not in tree
+    assert [r["slot"]["config_key"] for r in ranks["children"]] == [f"single_gemm:{qkv}"] * 2
+    config = tree["configs"][f"single_gemm:{qkv}"]
+    assert config == {
+        "kind": "single_gemm",
+        "config_hash": qkv,
+        "args": QKV,
+        "args_omitted": [],
+        "registry": {"cells": 3, "infeasible": 1, "measured": {"torch": 2, "torch_linear": 1}},
+    }
+    assert tree["configs"][mlp["slot"]["config_key"]]["registry"] is None
+    assert tree["kernels"]["single_gemm"] == {
+        "documented": True,
+        "title": "Dense GEMM",
+        "category": "GEMM",
+    }
+    assert tree["kernels"]["elementwise"]["documented"] is False
+
+
+NORM = {"hidden": 4096, "dtype": "bf16"}
+
+
+class NormSources(FixtureSources):
+    """llama3_dense_tp whose tp_size 4 tree is two norm leaves of one shape:
+    ``rms_norm`` and ``residual_rms_norm``, whose identities are equal."""
+
+    def supported_cost_trees(self) -> list[dict]:
+        config = {"gpu_name": "NVIDIA H200", "backends": ["torch"], **NORM}
+        build = _llama_build(4)
+        build["cost_manifest"]["sections"][0] = {
+            "section": "iter",
+            "slots": [
+                {"name": f"unified.{kind}", "kind": kind, "kernel_config": config}
+                for kind in ("rms_norm", "residual_rms_norm")
+            ],
+            "nodes": [{"Sum": {"children": {"start": 1, "end": 3}}}, {"Leaf": 0}, {"Leaf": 1}],
+            "node_labels": [None] * 3,
+        }
+        return [_llama_build(1), build]
+
+
+def test_two_kinds_of_one_identity_are_two_configs(tmp_path: Path) -> None:
+    """A config hash leaves the kind out, so both norms hash alike; the tree
+    keys a config by kind and hash, as the registry does, and counts both."""
+
+    path = tmp_path / "norms.db"
+    # rms_norm has a row of the shape; residual_rms_norm only one of another.
+    for kind, args, backend in (
+        ("rms_norm", RmsNormArgs(m=1, hidden=4096, dtype=DType.BF16), "flashinfer"),
+        ("residual_rms_norm", ResidualRmsNormArgs(m=1, hidden=8192, dtype=DType.BF16), "torch"),
+    ):
+        Table(next(iter_kernel_profiler_specs(kind)), path).insert(
+            [
+                ProfileRow(
+                    args=args,
+                    metrics=ComputeMetrics(time_ms=0.01, tflops=1.0, memory_bandwidth_gbps=1.0),
+                    gpu_name="NVIDIA H200",
+                    backend=backend,
+                    profiler_git_hash="abc",
+                    profiler_run_at="2026-09-26T00:00:00+00:00",
+                )
+            ]
+        )
+    for kind in ("rms_norm", "residual_rms_norm"):
+        kernel_config.register_kernel_configs(
+            path,
+            {
+                "schema_version": kernel_config.RECORDS_SCHEMA_VERSION,
+                "configs": [_record(NORM, [{"pool": "main", "role": f"unified.{kind}"}], kind)],
+            },
+            {"main": _supported(4)},
+        )
+    client = TestClient(create_app(KernelLibrary(NormSources(db_path=path))))
+    tree = client.get(f"{PREFIX}/archs/llama3_dense_tp/cost-tree", params=LLAMA_TP4).json()
+    norm = kernel_config.content_hash(NORM)
+    slots = [leaf["slot"] for leaf in tree["sections"][0]["root"]["children"]]
+    assert [s["config_hash"] for s in slots] == [norm, norm]
+    assert [s["config_key"] for s in slots] == [f"rms_norm:{norm}", f"residual_rms_norm:{norm}"]
+    configs = tree["configs"]
+    assert set(configs) == {s["config_key"] for s in slots}
+    assert [configs[s["config_key"]]["kind"] for s in slots] == ["rms_norm", "residual_rms_norm"]
+    assert configs[f"rms_norm:{norm}"]["registry"]["measured"] == {"flashinfer": 1}
+    assert configs[f"residual_rms_norm:{norm}"]["registry"]["measured"] == {}
+    assert tree["counts"] == {"leaves": 2, "configs": 2, "registered": 2, "measured": 1}
+    [param_set] = client.get(f"{PREFIX}/archs/llama3_dense_tp").json()["param_sets"]
+    assert param_set["members"][1]["counts"] == tree["counts"]
+    # The kernel library reads each kind's registry on its own already.
+    for kind in ("rms_norm", "residual_rms_norm"):
+        config = client.get(f"{PREFIX}/kernels/{kind}/configs/{norm}").json()
+        assert (config["kind"], config["config_hash"]) == (kind, norm)
+
+
+@pytest.mark.parametrize(
+    ("params", "status", "message"),
+    [
+        ({"gpu": "NVIDIA H200", "model": "llama3_8b"}, 400, "needs tp_size"),
+        ({**LLAMA_TP4, "routing": "corpus"}, 400, "does not choose routing"),
+        ({**LLAMA_TP4, "tp_size": "big"}, 400, "must be an integer"),
+        ({**LLAMA_TP4, "tp_size": "2"}, 404, "no #[supported] row"),
+        ({**LLAMA_TP4, "gpu": "NVIDIA B200"}, 404, "no #[supported] row"),
+    ],
+)
+def test_a_cost_tree_query_must_name_a_supported_set(
+    client: TestClient, params: dict, status: int, message: str
+) -> None:
+    response = client.get(f"{PREFIX}/archs/llama3_dense_tp/cost-tree", params=params)
+    assert response.status_code == status
+    detail = response.json()["detail"]
+    assert message in detail["message"]
+    # Never a guess: the valid queries instead.
+    assert [c["tp_size"] for c in detail["choices"]] == [1, 4]
+
+
+class RoutedSources(FixtureSources):
+    """``moe_x`` with a ``#[supported]`` row (and no build), so it has a tree."""
+
+    def deployment_schema(self) -> dict:
+        schema = copy.deepcopy(SCHEMA)
+        moe = schema["providers"]["arch"]["iter_wise"]["moe_x"]
+        moe["supported"] = [{"gpu": ["NVIDIA B200"], "model_config": ["moe_m"], "ep_size": [4]}]
+        return schema
+
+
+def test_a_traffic_param_is_set_when_predicting_not_defaulted(db: Path) -> None:
+    client = TestClient(create_app(KernelLibrary(RoutedSources(db_path=db))))
+    query = {"gpu": "NVIDIA B200", "model": "moe_m", "ep_size": "4"}
+    tree = client.get(f"{PREFIX}/archs/moe_x/cost-tree", params=query).json()
+    # The schema marks routing as traffic: its `uniform` default is no choice,
+    # so the tree names it instead of listing it among the defaults.
+    assert tree["defaults"] == {"fp8": False, "mtp_mode": "off"}
+    assert tree["set_when_predicting"] == ["routing"]
+    params = {p["name"]: p for p in client.get(f"{PREFIX}/archs/moe_x").json()["params"]}
+    assert params["routing"]["set_when_predicting"] is True
+    assert "set_when_predicting" not in params["mtp_mode"]
+    # A tree query cannot pick it either, and the refusal does not call it a default.
+    response = client.get(f"{PREFIX}/archs/moe_x/cost-tree", params={**query, "routing": "corpus"})
+    assert response.status_code == 400
+    assert response.json()["detail"]["message"].endswith(
+        "every other param takes its default, except routing, set when predicting"
+    )
+
+
+def test_an_unknown_arch_is_404(client: TestClient) -> None:
+    for path in ("/archs/no_such_arch", "/archs/no_such_arch/cost-tree"):
+        assert client.get(f"{PREFIX}{path}").status_code == 404
+
+
+def test_warming_builds_every_arch_document_without_raising(registered) -> None:
+    _, _, path = registered
+    kernels = KernelLibrary(FixtureSources(db_path=path))
+    ArchLibrary(kernels).warm()
+
+
+@pytest.mark.needs_binary
+def test_a_leaf_config_hash_is_the_registry_key_of_its_config(tmp_path: Path) -> None:
+    """Every leaf the build records a config for hashes, from its own kernel
+    config, to that record's registry key."""
+
+    sources = KernelSources(db_path=tmp_path / "unused.db")
+    builds = sources._simulator(["supported-cost-trees", "--kernel-configs"])
+    checked = 0
+    for build in builds:
+        records: dict[str, set[str]] = {}
+        for record in build["kernel_configs"]["configs"]:
+            for use in record["uses"]:
+                records.setdefault(use["role"], set()).add(
+                    kernel_config.content_hash(record["identity"])
+                )
+        for section in build["cost_manifest"]["sections"]:
+            for slot in section["slots"]:
+                if slot["name"] in records:
+                    identity = config_identity(slot["kernel_config"])
+                    assert kernel_config.content_hash(identity) in records[slot["name"]]
+                    checked += 1
+    assert checked > 1000
+
+
+@pytest.mark.needs_binary
+def test_the_arch_catalog_names_every_arch_tag(tmp_path: Path) -> None:
+    import yaml
+
+    schema = KernelSources(db_path=tmp_path / "unused.db").deployment_schema()
+    tags = {tag for providers in schema["providers"]["arch"].values() for tag in providers}
+    named = yaml.safe_load((REPO_ROOT / "model" / "arch_catalog.yaml").read_text())
+    assert set(named) == tags
+    assert all(entry["name"] and entry["summary"] for entry in named.values())
+
+
+# -- trees built as registered runs ------------------------------------------------
+
+GATE_ON = {"n": 256, "k": 4096, "dtype": "bf16"}
+MOE_QUERY = {"gpu": "NVIDIA H200", "model": "moe_m", "ep_size": "4"}
+MOE_TREE = f"{PREFIX}/archs/moe_x/cost-tree"
+POPULARITY = "presets/popularity.json"
+PACK = "presets/alignment/moe_x"
+
+
+def _moe_block(**params) -> dict:
+    return {"type": "moe_x", "model_config": "model/config/moe_m.json", "ep_size": 4, **params}
+
+
+def _moe_source(block: dict, *, preset: str | None = None, cases: list[str] | None = None) -> dict:
+    source = {
+        "deployment": "unified",
+        "pool": "main",
+        "preset": preset,
+        "groups": [{"gpu": "NVIDIA H200", "arch": block}],
+    }
+    if cases is not None:
+        source["alignment"] = {"pack": PACK, "variant": "ep4", "cases": cases}
+    return source
+
+
+def _moe_build(block: dict) -> dict:
+    """A moe_x tree: qkv (always measured), the gate (measured only with
+    ``mtp_mode`` off) and the experts, whose config carries the routed demand
+    the block's routing gives (``uniform`` where the block names none, as the
+    binary defaults it)."""
+
+    gate = GATE if block.get("mtp_mode", "off") == "off" else GATE_ON
+    share = 250_000 if block.get("routing", "uniform") == "uniform" else 400_000
+    config = {"gpu_name": "NVIDIA H200", "backends": ["torch"]}
+    slots = [
+        {"name": "unified.qkv", "kind": "single_gemm", "kernel_config": {**config, **QKV}},
+        {"name": "unified.moe.gate", "kind": "single_gemm", "kernel_config": {**config, **gate}},
+        {
+            "name": "unified.moe.experts",
+            "kind": "moe_experts",
+            "kernel_config": {**config, "expert_demand": _popularity(share)},
+        },
+    ]
+    nodes = [{"Sum": {"children": {"start": 1, "end": 4}}}, {"Leaf": 0}, {"Leaf": 1}, {"Leaf": 2}]
+    return {
+        "contract": "iter_wise",
+        "arch": "moe_x",
+        "gpu": "NVIDIA H200",
+        "params": {k: v for k, v in block.items() if k != "type"},
+        "gpus_per_replica": 4,
+        "cost_manifest": {
+            "sections": [
+                {"section": "iter", "slots": slots, "nodes": nodes, "node_labels": [None] * 4}
+            ]
+        },
+        "error": None,
+    }
+
+
+class RunSources(FixtureSources):
+    """``moe_x`` with one ``#[supported]`` row on the H200 and the routing
+    files a run names; the binary builds a block with :func:`_moe_build`,
+    and git tracks the preset, the pack and the popularity file."""
+
+    built: list[dict]
+
+    def deployment_schema(self) -> dict:
+        schema = copy.deepcopy(SCHEMA)
+        moe = schema["providers"]["arch"]["iter_wise"]["moe_x"]
+        moe["supported"] = [{"gpu": ["NVIDIA H200"], "model_config": ["moe_m"], "ep_size": [4]}]
+        moe["params"] = [p for p in moe["params"] if p["name"] != "popularity_file"] + [
+            {"name": "expert_popularity_file", "type": "string", "affects_cache": True},
+            {"name": "token_corpus_file", "type": "string", "affects_cache": True},
+        ]
+        return schema
+
+    def supported_cost_trees(self) -> list[dict]:
+        # The defaults tree: every param at its default, routing uniform.
+        build = _moe_build(_moe_block())
+        build["params"] = {"model_config": "moe_m", "ep_size": 4}
+        return [build]
+
+    def arch_cost_trees(self, blocks: list[dict]) -> list[dict]:
+        self.built = [*getattr(self, "built", []), *blocks]
+        return [_moe_build(block["arch"]) for block in blocks]
+
+    def tracked(self, paths: list[str]) -> set[str]:
+        return {p for p in paths if p in ("presets/moe_x.yaml", POPULARITY, PACK)}
+
+
+@pytest.fixture
+def runs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Registered runs of the moe_x set, in registration order:
+
+    - an alignment case, popularity routing, ``mtp_mode`` off: 2 of 3 measured;
+    - a preset with the same params: the same run, recorded twice;
+    - an alignment case with ``mtp_mode`` on: 1 of 3;
+    - a preset with ``popularity2.json``, ``mtp_mode`` off: 2 of 3, as the first;
+    - a run that did not record its routing (built uniform), and one naming a
+      hub corpus this machine does not hold: both skipped;
+    - the ``supported`` source, which registers the defaults tree: never a run.
+    """
+
+    root = tmp_path / "repo"
+    (root / "model" / "config").mkdir(parents=True)
+    (root / "model" / "config" / "moe_m.json").write_text("{}")
+    (root / "presets").mkdir()
+    (root / POPULARITY).write_text("{}")
+    (root / "presets" / "popularity2.json").write_text("{}")
+    monkeypatch.setattr(arch_library, "REPO_ROOT", root)
+
+    from launcher import corpus
+
+    def no_download(*args):
+        raise AssertionError("the public API never downloads")
+
+    monkeypatch.setattr(corpus, "_download", no_download)
+    monkeypatch.setattr(corpus, "_cached", lambda *a: (_ for _ in ()).throw(FileNotFoundError()))
+
+    path = tmp_path / "runs.db"
+    table = Table(next(iter_kernel_profiler_specs("single_gemm")), path)
+    table.insert([_row(1, 6144, "torch"), _row(1, 512, "torch")])
+    popular = {"routing": "popularity", "expert_popularity_file": POPULARITY, "mtp_mode": "off"}
+    _register(path, QKV, _moe_source(_moe_block(**popular), cases=["01_micro"]))
+    _register(path, GATE, _moe_source(_moe_block(**popular), preset="presets/moe_x.yaml"))
+    _register(path, GATE_ON, _moe_source(_moe_block(**{**popular, "mtp_mode": "on"}), cases=["02"]))
+    second = {**popular, "expert_popularity_file": "presets/popularity2.json"}
+    _register(path, QKV, _moe_source(_moe_block(**second), preset="presets/moe_y.yaml"))
+    _register(path, QKV, _moe_source(_moe_block(mtp_mode="off"), preset="presets/old.yaml"))
+    corpus_run = {"routing": "corpus", "token_corpus_file": "hf://o/c@abc1234/r/manifest.json"}
+    _register(path, QKV, _moe_source(_moe_block(**corpus_run), preset="presets/moe_x.yaml"))
+    supported = {"arch": "moe_x", "gpu": "NVIDIA H200", "params": {"model_config": "moe_m"}}
+    _register(
+        path, QKV, {"supported": {**supported, "params": {**supported["params"], "ep_size": 4}}}
+    )
+    sources = RunSources(db_path=path)
+    return TestClient(create_app(KernelLibrary(sources))), sources
+
+
+def test_a_tree_is_built_as_its_best_measured_registered_run(runs) -> None:
+    client, sources = runs
+    tree = client.get(MOE_TREE, params=MOE_QUERY).json()
+    run = tree["run"]
+    assert run["basis"] == "registry"
+    assert tree["counts"] == {"leaves": 3, "configs": 3, "registered": 2, "measured": 2}
+    assert run["params"] == {
+        "fp8": False,
+        "routing": "popularity",
+        "mtp_mode": "off",
+        "expert_popularity_file": POPULARITY,
+    }
+    # Two sources recorded that run: the preset leads the alignment case, and
+    # it beats the equally measured popularity2 run, a preset registered later.
+    assert [(s["kind"], s["name"]) for s in run["sources"]] == [
+        ("preset", "presets/moe_x.yaml"),
+        ("alignment", PACK),
+    ]
+    assert run["sources"][1]["cases"] == ["01_micro"]
+    assert run["routing"]["routing"] == "popularity"
+    assert run["routing"]["label"] == POPULARITY
+    assert run["query"] == {**{k: v for k, v in MOE_QUERY.items()}, "ep_size": 4, **run["params"]}
+    # Built with the run's own params; no default stands in for routing.
+    assert (tree["defaults"], tree["set_when_predicting"]) == ({"fp8": False}, [])
+    # The binary got local paths, and no build of a run that names no routing.
+    assert all(b["arch"].get("routing") == "popularity" for b in sources.built)
+    assert all(Path(b["arch"]["model_config"]).is_file() for b in sources.built)
+    assert {Path(b["arch"]["expert_popularity_file"]).name for b in sources.built} == {
+        "popularity.json",
+        "popularity2.json",
+    }
+    # The arch's set lists the same counts and run.
+    [member] = client.get(f"{PREFIX}/archs/moe_x").json()["param_sets"][0]["members"]
+    assert member["counts"] == tree["counts"]
+    assert member["run"]["sources"] == ["presets/moe_x.yaml", PACK]
+
+
+def test_the_pickers_offer_only_values_a_registered_run_used(runs) -> None:
+    client, _ = runs
+    run = client.get(MOE_TREE, params=MOE_QUERY).json()["run"]
+    pickers = {p["name"]: p for p in run["pickers"]}
+    assert list(pickers) == ["fp8", "routing", "mtp_mode"]
+    assert pickers["fp8"]["fixed"] and not pickers["mtp_mode"]["fixed"]
+    assert pickers["routing"]["keys"] == ["routing", "expert_popularity_file"]
+    mtp = {o["value"]["mtp_mode"]: o for o in pickers["mtp_mode"]["options"]}
+    assert (mtp["off"]["selected"], mtp["on"]["selected"]) == (True, False)
+    assert mtp["on"]["compatible"] and mtp["on"]["counts"]["measured"] == 1
+    # A tracked file by its repo path; another by its name and demand fingerprint.
+    files = [o["value"]["expert_popularity_file"] for o in pickers["routing"]["options"]]
+    assert files[1] == POPULARITY and files[0].startswith("popularity2.json · sha256:")
+    # Picking another value builds that run's tree.
+    other = client.get(MOE_TREE, params={**MOE_QUERY, "mtp_mode": "on"}).json()
+    assert other["run"]["params"]["mtp_mode"] == "on"
+    assert other["counts"]["measured"] == 1
+    assert [s["kind"] for s in other["run"]["sources"]] == ["alignment"]
+    on = {p["name"]: p for p in other["run"]["pickers"]}["routing"]["options"]
+    # Only the first popularity file was run with mtp_mode on.
+    assert [o["compatible"] for o in on] == [
+        o["value"]["expert_popularity_file"] == POPULARITY for o in on
+    ]
+
+
+def test_a_run_param_no_registered_run_used_is_refused(runs) -> None:
+    client, _ = runs
+    response = client.get(MOE_TREE, params={**MOE_QUERY, "mtp_mode": "sometimes"})
+    assert response.status_code == 404
+    detail = response.json()["detail"]
+    assert "no registered run" in detail["message"]
+    assert sorted(c["mtp_mode"] for c in detail["choices"]) == ["off", "off", "on"]
+    # A routing no run recorded: uniform was never chosen, so it is no value.
+    assert client.get(MOE_TREE, params={**MOE_QUERY, "routing": "uniform"}).status_code == 404
+    response = client.get(MOE_TREE, params={**MOE_QUERY, "draft_tokens": "3"})
+    assert response.status_code == 400
+    assert "registered runs of this set also choose" in response.json()["detail"]["message"]
+
+
+def test_runs_that_did_not_record_their_routing_or_lack_a_file_are_skipped(runs) -> None:
+    client, sources = runs
+    run = client.get(MOE_TREE, params=MOE_QUERY).json()["run"]
+    skipped = {s["sources"][0]["name"]: s for s in run["skipped"]}
+    assert set(skipped) == {"old.yaml", "presets/moe_x.yaml"}
+    assert skipped["old.yaml"]["error"] == "the run did not record its routing"
+    assert "routing" not in skipped["old.yaml"]["params"]
+    assert "not in this machine's hub cache" in skipped["presets/moe_x.yaml"]["error"]
+    assert not any(b["arch"].get("routing", "uniform") == "uniform" for b in sources.built)
+    assert run["combinations"] == 3
+
+
+def test_a_set_no_registered_run_matches_is_built_at_its_defaults(runs, db: Path) -> None:
+    client = TestClient(create_app(KernelLibrary(RunSources(db_path=db))))
+    tree = client.get(MOE_TREE, params=MOE_QUERY).json()
+    assert tree["run"]["basis"] == "defaults"
+    assert (tree["run"]["pickers"], tree["run"]["sources"]) == ([], [])
+    assert tree["set_when_predicting"] == ["routing"]
+    assert "routing" not in tree["defaults"]
+    response = client.get(MOE_TREE, params={**MOE_QUERY, "mtp_mode": "on"})
+    assert response.status_code == 400
+    assert response.json()["detail"]["message"].endswith(
+        "every other param takes its default, except routing, set when predicting"
+    )

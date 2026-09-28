@@ -44,12 +44,25 @@ def _download(repo: str, revision: str, path: str) -> Path:
     return Path(hf_hub_download(repo_id=repo, filename=path, revision=revision))
 
 
-def resolve_reference(reference: str) -> str:
+def _cached(repo: str, revision: str, path: str) -> Path:
+    """`_download` without the network: the file the local hub cache holds."""
+    from huggingface_hub import try_to_load_from_cache
+
+    local = try_to_load_from_cache(repo_id=repo, filename=path, revision=revision)
+    if not isinstance(local, str):
+        raise FileNotFoundError(f"{repo}@{revision}/{path} is not in the local hub cache")
+    return Path(local)
+
+
+def resolve_reference(reference: str, *, local_only: bool = False) -> str:
     """Fetch one `hf://` reference and return the local path it resolved to.
 
     A token corpus manifest names its payload in `data_file`, relative to
     itself, so that file is fetched too -- the hub's snapshot layout mirrors the
     repository, which puts the two back in one directory.
+
+    `local_only` never reaches the network: a reference whose files the local
+    hub cache does not already hold raises `CorpusError`.
     """
     match = _REFERENCE.match(reference)
     if not match:
@@ -58,8 +71,9 @@ def resolve_reference(reference: str) -> str:
             "a revision is required and must be a commit sha, not a branch or tag"
         )
     repo, revision, path = match["repo"], match["revision"], match["path"]
+    fetch = _cached if local_only else _download
     try:
-        local = _download(repo, revision, path)
+        local = fetch(repo, revision, path)
     except Exception as exc:  # noqa: BLE001 — the hub raises a wide family
         raise CorpusError(f"fetching {reference}: {exc}") from exc
 
@@ -69,7 +83,10 @@ def resolve_reference(reference: str) -> str:
         except json.JSONDecodeError as exc:
             raise CorpusError(f"{reference} is not readable JSON: {exc}") from exc
         if isinstance(data_file, str) and data_file:
-            payload = _download(repo, revision, str(Path(path).parent / data_file))
+            try:
+                payload = fetch(repo, revision, str(Path(path).parent / data_file))
+            except Exception as exc:  # noqa: BLE001 — as above
+                raise CorpusError(f"fetching {reference}'s {data_file}: {exc}") from exc
             # The loader resolves `data_file` against the manifest's directory,
             # so that is where the hub must have put it -- a subdirectory too.
             if payload != local.parent / data_file:

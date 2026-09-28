@@ -144,7 +144,7 @@ pub enum IterArchSel {
         #[serde(flatten)]
         model: ModelSpec,
         #[serde(default)]
-        #[param(string, default = "uniform", choices = MARGINAL_ROUTING_KINDS)]
+        #[param(string, default = "uniform", choices = MARGINAL_ROUTING_KINDS, set_when_predicting)]
         routing: RoutingKind,
         #[serde(default)]
         routing_seed: Option<u64>,
@@ -204,7 +204,7 @@ pub enum IterArchSel {
         /// Drives the L2 MoE dispatch/combine `BottleneckCurve`
         /// and the L3 grouped-GEMM `local_ppm` shards. Omitted → `uniform`.
         #[serde(default)]
-        #[param(string, default = "uniform", choices = MARGINAL_ROUTING_KINDS)]
+        #[param(string, default = "uniform", choices = MARGINAL_ROUTING_KINDS, set_when_predicting)]
         routing: RoutingKind,
         /// Seed for `routing = random` (ignored for `uniform`). Fixed so a run is
         /// reproducible (the throughput golden is bit-identical); vary it to
@@ -236,7 +236,7 @@ pub enum IterArchSel {
         #[param(default = 8, cache_key)]
         nvl_num_gpu: u16,
         #[serde(default)]
-        #[param(string, default = "uniform", choices = MARGINAL_ROUTING_KINDS)]
+        #[param(string, default = "uniform", choices = MARGINAL_ROUTING_KINDS, set_when_predicting)]
         routing: RoutingKind,
         #[serde(default)]
         routing_seed: Option<u64>,
@@ -261,7 +261,7 @@ pub enum IterArchSel {
         #[param(default = 8, cache_key)]
         nvl_num_gpu: u16,
         #[serde(default)]
-        #[param(string, default = "uniform", choices = MARGINAL_ROUTING_KINDS)]
+        #[param(string, default = "uniform", choices = MARGINAL_ROUTING_KINDS, set_when_predicting)]
         routing: RoutingKind,
         #[serde(default)]
         routing_seed: Option<u64>,
@@ -276,7 +276,7 @@ pub enum IterArchSel {
         #[serde(flatten)]
         model: ModelSpec,
         #[serde(default)]
-        #[param(string, default = "uniform", choices = MARGINAL_ROUTING_KINDS)]
+        #[param(string, default = "uniform", choices = MARGINAL_ROUTING_KINDS, set_when_predicting)]
         routing: RoutingKind,
         #[serde(default)]
         routing_seed: Option<u64>,
@@ -292,7 +292,7 @@ pub enum IterArchSel {
         #[serde(flatten)]
         model: ModelSpec,
         #[serde(default)]
-        #[param(string, default = "uniform", choices = MARGINAL_ROUTING_KINDS)]
+        #[param(string, default = "uniform", choices = MARGINAL_ROUTING_KINDS, set_when_predicting)]
         routing: RoutingKind,
         #[serde(default)]
         routing_seed: Option<u64>,
@@ -317,7 +317,7 @@ pub enum IterArchSel {
         nvl_num_gpu: u16,
         /// Expert routing distribution used by dispatch/combine.
         #[serde(default)]
-        #[param(string, default = "uniform", choices = MARGINAL_ROUTING_KINDS)]
+        #[param(string, default = "uniform", choices = MARGINAL_ROUTING_KINDS, set_when_predicting)]
         routing: RoutingKind,
         /// Seed for `routing = random`; ignored for uniform routing.
         #[serde(default)]
@@ -352,7 +352,7 @@ pub enum IterArchSel {
         #[param(default = 1048576, cache_key)]
         max_model_len: u32,
         #[serde(default)]
-        #[param(string, default = "uniform", choices = ROUTING_KINDS)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS, set_when_predicting)]
         routing: RoutingKind,
         #[serde(default)]
         routing_seed: Option<u64>,
@@ -395,7 +395,7 @@ pub enum IterArchSel {
         #[param(default = 1048576, cache_key)]
         max_model_len: u32,
         #[serde(default)]
-        #[param(string, default = "uniform", choices = ROUTING_KINDS)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS, set_when_predicting)]
         routing: RoutingKind,
         #[serde(default)]
         routing_seed: Option<u64>,
@@ -445,7 +445,7 @@ pub enum IterArchSel {
         #[param(default = 1048576, cache_key)]
         max_model_len: u32,
         #[serde(default)]
-        #[param(string, default = "uniform", choices = ROUTING_KINDS)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS, set_when_predicting)]
         routing: RoutingKind,
         #[serde(default)]
         routing_seed: Option<u64>,
@@ -488,7 +488,7 @@ pub enum IterArchSel {
         #[param(default = 8192, cache_key)]
         max_model_len: u32,
         #[serde(default)]
-        #[param(string, default = "uniform", choices = ROUTING_KINDS)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS, set_when_predicting)]
         routing: RoutingKind,
         #[serde(default)]
         routing_seed: Option<u64>,
@@ -520,7 +520,7 @@ pub enum IterArchSel {
         #[param(cache_key)]
         max_model_len: u32,
         #[serde(default)]
-        #[param(string, default = "uniform", choices = ROUTING_KINDS)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS, set_when_predicting)]
         routing: RoutingKind,
         #[serde(default)]
         routing_seed: Option<u64>,
@@ -969,8 +969,30 @@ mod iter_tests {
             r#"{"type":"glm52_dsa_moe","model_config":"model/config/glm52.json","fp8":false}"#;
         assert!(serde_json::from_str::<IterArchSel>(raw).is_err());
     }
+
+    /// Expert routing describes the traffic, not the deployment, so its
+    /// `uniform` default is no choice at all: every selector that publishes it
+    /// must say it is set when predicting, and nothing else says so.
+    #[test]
+    fn routing_is_the_only_param_set_when_predicting() {
+        let schemas = [IterArchSel::SCHEMA, AttnArchSel::SCHEMA, FfnArchSel::SCHEMA];
+        let mut routed = 0;
+        for (tag, params) in schemas.iter().flat_map(|schema| schema.iter()) {
+            for param in params.iter() {
+                let routing = param.name == "routing";
+                assert_eq!(param.set_when_predicting, routing, "{tag}.{}", param.name);
+                routed += usize::from(routing);
+                let published = serde_json::to_value(param).unwrap();
+                assert_eq!(
+                    published.get("set_when_predicting"),
+                    routing.then_some(&serde_json::Value::Bool(true)),
+                );
+            }
+        }
+        assert_eq!(routed, 14);
+    }
 }
-// ── layer-wise attn / ffn contract (AFD) ────────────────────────────────────
+// ── layer-wise attn / ffn contract (AFD)────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize, ProviderSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -1029,7 +1051,7 @@ pub enum FfnArchSel {
         /// Expert routing distribution: `uniform` (default) or `random` (seeded by
         /// `routing_seed`). Drives the L2 MoE dispatch/combine simulation.
         #[serde(default)]
-        #[param(string, default = "uniform", choices = SYNTHETIC_ROUTING_KINDS)]
+        #[param(string, default = "uniform", choices = SYNTHETIC_ROUTING_KINDS, set_when_predicting)]
         routing: RoutingKind,
         /// Seed for `routing = random` (ignored for `uniform`).
         #[serde(default)]
@@ -1051,7 +1073,7 @@ pub enum FfnArchSel {
         #[param(default = 8, cache_key)]
         nvl_num_gpu: u16,
         #[serde(default)]
-        #[param(string, default = "uniform", choices = SYNTHETIC_ROUTING_KINDS)]
+        #[param(string, default = "uniform", choices = SYNTHETIC_ROUTING_KINDS, set_when_predicting)]
         routing: RoutingKind,
         #[serde(default)]
         routing_seed: Option<u64>,

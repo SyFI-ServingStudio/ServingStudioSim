@@ -19,6 +19,9 @@
 //!                                     sub-trees: `groups`, `arch`, `worker`).
 //!   - `#[param(default = LIT)]`    → `.default_<kind>(LIT)`.
 //!   - `#[param(cache_key)]`        → `.cache_key()`.
+//!   - `#[param(set_when_predicting)]` → `.set_when_predicting()` (a traffic
+//!                                     param such as MoE `routing`, whose
+//!                                     default is not a representative choice).
 //!   - `#[param(choices = CONST)]`  → `.choices(&CONST)`.
 //!   - `#[param(string)]`           → treat the field as a `string` param even
 //!                                     though its Rust type is a foreign enum
@@ -64,6 +67,7 @@ struct ParamAttr {
     skip: bool,
     force_string: bool,
     cache_key: bool,
+    set_when_predicting: bool,
     default: Option<Lit>,
     choices: Option<Expr>,
 }
@@ -321,6 +325,9 @@ fn param_defs<'a>(
         if attr.cache_key {
             chain = quote! { #chain.cache_key() };
         }
+        if attr.set_when_predicting {
+            chain = quote! { #chain.set_when_predicting() };
+        }
         let desc = doc_string(&f.attrs);
         chain = quote! { #chain.desc(#desc) };
         defs.push(chain);
@@ -474,6 +481,9 @@ fn parse_param_attr(attrs: &[Attribute]) -> syn::Result<ParamAttr> {
                 Meta::Path(p) if p.is_ident("skip") => out.skip = true,
                 Meta::Path(p) if p.is_ident("string") => out.force_string = true,
                 Meta::Path(p) if p.is_ident("cache_key") => out.cache_key = true,
+                Meta::Path(p) if p.is_ident("set_when_predicting") => {
+                    out.set_when_predicting = true
+                }
                 Meta::NameValue(nv) if nv.path.is_ident("default") => {
                     if let Expr::Lit(ExprLit { lit, .. }) = nv.value {
                         out.default = Some(lit);
