@@ -1063,6 +1063,10 @@ impl IterwiseUnifiedModel for Glm53FlashVllmModel {
         normalize_input(batch, self.max_model_len).map(|_| ())
     }
 
+    fn max_model_len(&self) -> Option<u32> {
+        Some(self.max_model_len)
+    }
+
     fn total_kv_bytes_per_token(&self) -> u64 {
         self.total_kv_bytes_per_token
     }

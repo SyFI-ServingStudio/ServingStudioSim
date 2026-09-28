@@ -484,8 +484,11 @@ pub struct PredictorInfo {
     pub selector: &'static str,
     pub num_attn_dp_groups: u16,
     pub gpus_per_replica: u16,
-    /// The timing kernels' context bound, when the model declares one.
+    /// The longest request context a case may carry, when the model bounds it.
     pub max_model_len: Option<u32>,
+    /// `speculative_iter` only: draft tokens per step, so a decode request's
+    /// query is `draft_tokens + 1` rows.
+    pub draft_tokens: Option<u32>,
 }
 
 /// The cost tree a [`Predictor`] costs, without the per-slot `kernel_config`
@@ -573,13 +576,18 @@ impl Predictor {
                 selector: "iter",
                 num_attn_dp_groups: model.num_attn_dp_groups(),
                 gpus_per_replica: model.gpus_per_replica(),
-                max_model_len: None,
+                max_model_len: model.max_model_len(),
+                draft_tokens: None,
             },
-            PredictModel::Speculative { model, .. } => PredictorInfo {
+            PredictModel::Speculative {
+                model,
+                draft_tokens,
+            } => PredictorInfo {
                 selector: "speculative_iter",
                 num_attn_dp_groups: model.num_attn_dp_groups(),
                 gpus_per_replica: model.gpus_per_replica(),
                 max_model_len: Some(model.max_model_len()),
+                draft_tokens: Some(*draft_tokens),
             },
         }
     }

@@ -145,7 +145,14 @@ def test_wasm_matches_native_timing_predict(name, sim_bin, node, tmp_path):
     out = json.loads(run.stdout)
 
     assert out["version"]["sample_format"] == 1
-    assert out["info"]["selector"] == "iter"
+    [block] = arch.values()
+    assert out["info"] == {
+        "selector": "iter",
+        "num_attn_dp_groups": out["info"]["num_attn_dp_groups"],
+        "gpus_per_replica": out["info"]["gpus_per_replica"],
+        "max_model_len": block.get("max_model_len"),
+        "draft_tokens": None,
+    }
     manifest = out["manifest"]
     assert manifest["slots"] == [slot["name"] for slot in section["slots"]]
     assert manifest["nodes"] == section["nodes"]

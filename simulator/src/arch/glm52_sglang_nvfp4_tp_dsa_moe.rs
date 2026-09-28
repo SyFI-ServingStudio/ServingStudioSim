@@ -1145,6 +1145,10 @@ impl IterwiseUnifiedModel for Glm52SglangNvfp4TpDsaMoeModel {
         normalize_input(batch, self.max_model_len).map(|_| ())
     }
 
+    fn max_model_len(&self) -> Option<u32> {
+        Some(self.max_model_len)
+    }
+
     fn total_kv_bytes_per_token(&self) -> u64 {
         self.total_state_bytes_per_token
     }

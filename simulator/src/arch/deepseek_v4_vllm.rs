@@ -761,6 +761,12 @@ impl IterwiseUnifiedModel for DeepseekV4VllmModel {
             .try_for_each(|layer| layer.attention.check_input(&input.attention))
     }
 
+    fn max_model_len(&self) -> Option<u32> {
+        self.layers
+            .first()
+            .map(|layer| layer.attention.max_model_len())
+    }
+
     fn eval_iter(
         &self,
         batch: &UnifiedArchInput,
