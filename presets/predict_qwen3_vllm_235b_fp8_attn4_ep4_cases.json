@@ -1,0 +1,22 @@
+[
+ {
+  "groups": [
+   {
+    "decode_count": 32,
+    "average_decode_length": 2048
+   }
+  ]
+ },
+ {
+  "groups": [
+   {
+    "prefill_chunk_pairs": [
+     [
+      0,
+      4096
+     ]
+    ]
+   }
+  ]
+ }
+]
