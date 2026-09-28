@@ -49,6 +49,7 @@ pub struct PoolSpec<Arch, Worker> {
 #[serde(deny_unknown_fields)]
 pub struct GroupSpec<Arch, Worker> {
     /// GPU type this group runs on (profile.db key).
+    #[param(cache_key)]
     pub gpu: String,
     /// Data-parallel replica count for this group.
     #[param(default = 1)]

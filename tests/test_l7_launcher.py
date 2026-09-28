@@ -1549,6 +1549,15 @@ def test_cache_key_distinguishes_tp(schema):
     assert cache_key(a, schema) != cache_key(b, schema)
 
 
+def test_cache_key_distinguishes_arch_type(schema):
+    # Provider tags are not ParamDefs; two arch tags with the same params build
+    # different kernels.
+    a = normalize_params(_base(arch={"type": "llama3_dense_tp", "tp_size": 4}), schema)
+    b = normalize_params(_base(arch={"type": "llama3_dense_tp", "tp_size": 4}), schema)
+    b["pools"]["main"]["groups"][0]["arch"]["type"] = "llama3_dense"
+    assert cache_key(a, schema) != cache_key(b, schema)
+
+
 def test_cache_key_from_real_schema():
     try:
         real = load_schema("debug")
@@ -1564,6 +1573,8 @@ def test_cache_key_from_real_schema():
     keys = {path for path, _ in cache_key(cfg, real)}
     assert any(k.endswith("arch.model_config") for k in keys)
     assert any(k.endswith("arch.tp_size") for k in keys)
+    # the group's GPU is the profile.db key
+    assert any(k.endswith("groups.0.gpu") for k in keys)
     assert not any("request_rate" in k or "log_dir" in k for k in keys)
 
 
