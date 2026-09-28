@@ -1,6 +1,8 @@
 {
-  "captured_from": "wt-glm52-spec5 logs/20260830_0_glm52_diverse100_nospec/profile_popularity/expert_popularity.json",
+  "copied_from": [
+    "/raid/kanzhu/ServingStudio/wt-glm52-spec5/logs/20260830_0_glm52_diverse100_nospec/profile_popularity/expert_popularity.json"
+  ],
+  "sha256": "d344a1217bfe8b0a7a1a777d54a90616a0b5e3d0d7d4a285b82b22185ee4522c",
   "checkpoint": "nvidia/GLM-5.2-NVFP4@aec724e8c7b8ee9db3b48c01c320f63f9cdaf8aa",
-  "workload": "trace/diverse_100.csv, trace-timed, max_model_len 131072, no speculative decoding, EP4 on B200",
-  "sha256": "d344a1217bfe8b0a7a1a777d54a90616a0b5e3d0d7d4a285b82b22185ee4522c"
+  "workload": "trace/diverse_100.csv, trace-timed, max_model_len 131072, no speculative decoding, EP4 on B200"
 }

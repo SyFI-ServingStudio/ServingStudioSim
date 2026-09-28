@@ -1,7 +1,9 @@
 {
-  "captured_from": "coriander main logs/20260803_1_qwen3_235b_fp8_tp4_ep4_alignment_ctx8k_out1k_c64/profile_expert_popularity/expert_popularity.json",
+  "copied_from": [
+    "coriander:/m-coriander/coriander/kanzhu/MLSim_workspace/main/logs/20260803_1_qwen3_235b_fp8_tp4_ep4_alignment_ctx8k_out1k_c64/profile_expert_popularity/expert_popularity.json"
+  ],
+  "sha256": "de17636d4d1eb66f349ff2d7f92f36e664c4348928327259ef2acc93dc5feb2d",
   "checkpoint": "Qwen/Qwen3-235B-A22B-Thinking-2507-FP8@f07f63f2bbd7540917118ebdf3812696ef303b03",
   "workload": "ctx 8k, output 1k, concurrency 64, attention TP4 and EP4 on H200",
-  "sha256": "de17636d4d1eb66f349ff2d7f92f36e664c4348928327259ef2acc93dc5feb2d",
   "note": "The runs that read this file simulate model/config/qwen3_235b.json, as they were registered, while the capture served the Thinking-2507 FP8 checkpoint. Both have the same MoE layout (94 layers, 128 experts, 8 per token)."
 }

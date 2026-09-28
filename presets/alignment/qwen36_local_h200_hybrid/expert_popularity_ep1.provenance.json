@@ -1,4 +1,8 @@
 {
+  "copied_from": [
+    "coriander:/m-coriander/coriander/kanzhu/MLSim_workspace/tmp/past_trees/wt-qwen36-local-gdn/logs/20260818_0_qwen36_local_hybrid_alignment/profile_popularity/expert_popularity_ep1.json"
+  ],
+  "sha256": "d55d1bc2cf4ed883fb6e4dc66b68718ee9ea696d1d0cfc45eb2d956f45e31898",
   "derived_artifact": "expert_popularity_ep1.json",
   "derived_from": "profile_popularity/expert_popularity.json",
   "source_sha256": "a323741c4d3f42f34009c828768fe9900a3cefaa272d0477dcbb0b9f7277b1ed",
