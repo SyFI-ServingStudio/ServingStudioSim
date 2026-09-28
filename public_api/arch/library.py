@@ -29,6 +29,7 @@ leaf depends on the batch, which a prediction supplies.
 from __future__ import annotations
 
 import copy
+import hashlib
 import itertools
 import json
 import re
@@ -39,7 +40,13 @@ import yaml
 
 from launcher.alignment_campaign.check import ROUTING_ARTIFACTS
 from launcher.corpus import HF_SCHEME, CorpusError, resolve_reference
-from profiling.db.kernel_config import SOURCE_TABLE, canonical_json, content_hash
+from profiling.db.kernel_config import (
+    CONFIG_TABLE,
+    SOURCE_TABLE,
+    USE_TABLE,
+    canonical_json,
+    content_hash,
+)
 from public_api.kernel import demand
 from public_api.kernel import library as kernel_library
 from public_api.kernel.library import (
@@ -516,6 +523,62 @@ class ArchLibrary:
 
         return self.sources.cached_by_db_and_binary("arch-run-blocks", compute)
 
+    def _repo_copies(self) -> dict[str, str]:
+        """``{path a run recorded: repo path}``: the routing files this
+        checkout holds a copy of, so that a run registered from another
+        machine's log builds, and reads as the run the copy's preset records.
+        A copy's provenance sidecar (``<name>.provenance.json`` beside it)
+        names the paths it was copied from, ``copied_from``, and its
+        ``sha256``; a file whose content no longer matches is no copy."""
+
+        def compute() -> dict[str, str]:
+            out: dict[str, str] = {}
+            for sidecar in sorted((REPO_ROOT / "presets").rglob("*.provenance.json")):
+                try:
+                    meta = json.loads(sidecar.read_text())
+                except ValueError:
+                    continue
+                copied = meta.get("copied_from") if isinstance(meta, dict) else None
+                target = sidecar.with_name(sidecar.name.removesuffix(".provenance.json") + ".json")
+                if not copied or not target.is_file():
+                    continue
+                if hashlib.sha256(target.read_bytes()).hexdigest() != meta.get("sha256"):
+                    continue
+                out.update({path: str(target.relative_to(REPO_ROOT)) for path in copied})
+            return out
+
+        return self.sources.cached_by_db_and_binary("arch-repo-copies", compute)
+
+    def _source_configs(self) -> dict[str, dict]:
+        """``{source hash: {configs, routed}}``: the ``(kind, config hash,
+        GPU)`` of every config each registry source asked for, and whether one
+        of them folds an MoE routing (its identity names ``expert_demand``)."""
+
+        def compute() -> dict[str, dict]:
+            with self.sources.connect() as conn:
+                tables = {
+                    row[0]
+                    for row in conn.execute("select name from sqlite_master where type = 'table'")
+                }
+                if not {CONFIG_TABLE, USE_TABLE} <= tables:
+                    return {}
+                records = conn.execute(
+                    f"""
+                    select distinct u.source_hash, u.kind, u.config_hash, u.gpu_name, c.identity
+                    from {USE_TABLE} u join {CONFIG_TABLE} c
+                      on c.kind = u.kind and c.config_hash = u.config_hash
+                     and c.gpu_name = u.gpu_name
+                    """
+                ).fetchall()
+            out: dict[str, dict] = {}
+            for source_hash, kind, config_hash, gpu, identity in records:
+                entry = out.setdefault(source_hash, {"configs": set(), "routed": False})
+                entry["configs"].add((kind, config_hash, gpu))
+                entry["routed"] = entry["routed"] or demand.FIELD in json.loads(identity)
+            return out
+
+        return self.sources.cached_by_db("arch-source-configs", compute)
+
     def _run_params(self, arch: str, block: dict) -> dict:
         """A run block's params besides its type, model config and the set's
         params, in schema order: each schema param the block names, else its
@@ -579,6 +642,7 @@ class ArchLibrary:
 
         def compute() -> dict[str, dict]:
             index = self._run_blocks()
+            copies = self._repo_copies()
             members: dict[str, tuple[str, dict]] = {}
             for entry in self._sets(arch):
                 for member in entry["members"]:
@@ -586,10 +650,14 @@ class ArchLibrary:
                     members[key] = (entry["gpu"], {})
             for key, (gpu, combos) in members.items():
                 for record in index.get(key, ()):
-                    run = self._run_params(arch, record["arch"])
+                    block = {
+                        n: copies.get(v, v) if n in ARTIFACT_KEYS and isinstance(v, str) else v
+                        for n, v in record["arch"].items()
+                    }
+                    run = self._run_params(arch, block)
                     combo = combos.setdefault(
                         canonical_json(run),
-                        {"run": run, "block": record["arch"], "gpu": gpu, "records": []},
+                        {"run": run, "block": block, "gpu": gpu, "records": []},
                     )
                     combo["records"].append(record)
             every = [c for _, combos in members.values() for c in combos.values()]
@@ -609,6 +677,7 @@ class ArchLibrary:
                 # default (uniform), which is no routing a run chose.
                 unrecorded = [n for n in predicting if n not in combo["run"]]
                 if unrecorded:
+                    combo["unrecorded"] = unrecorded
                     combo["error"] = f"the run did not record its {', '.join(unrecorded)}"
                     continue
                 try:
@@ -638,11 +707,50 @@ class ArchLibrary:
                         )
                         merged[canonical_json(doc["params"])] = keep
                 built_here = sorted((d for d in merged.values() if not d["error"]), key=_rank)
-                skipped = [d for d in merged.values() if d["error"]]
+                skipped = []
+                for doc in (d for d in merged.values() if d["error"]):
+                    left = []
+                    for source in doc["sources"]:
+                        same = (
+                            None
+                            if doc["_unrecorded"]
+                            else self._recorded_again(source, built_here, gpu)
+                        )
+                        if same is None:
+                            left.append(source)
+                            continue
+                        same["sources"] = sorted(
+                            {s["id"]: s for s in [*same["sources"], source]}.values(),
+                            key=lambda s: (SOURCE_KINDS.index(s["kind"]), s["_order"]),
+                        )
+                    if left:
+                        skipped.append({**doc, "sources": left})
+                built_here.sort(key=_rank)
                 out[key] = {"combinations": built_here, "skipped": skipped}
             return out
 
         return self.sources.cached_by_db_and_binary(("arch-runs", arch), compute)
+
+    def _recorded_again(self, source: dict, built: list[dict], gpu: str) -> dict | None:
+        """The best built run that ``source``, a record of a run this machine
+        cannot build, is a second record of, or None. It is when the registry
+        shows the record asked for nothing that run's tree lacks, and for at
+        least one config folding an MoE routing: a config's hash covers the
+        routing it folds, so the two ran the same routing. That is how a run
+        registered again from the repository, after it named a file in
+        another machine's logs or recorded a value its YAML read another way,
+        shows as the one run it is. A record whose routed configs were not
+        measured, and so not registered, cannot be told apart and stays
+        skipped."""
+
+        record = self._source_configs().get(source["_hash"])
+        if record is None or not record["routed"]:
+            return None
+        for run in built:
+            tree = {(c["kind"], c["config_hash"], gpu) for c in run["_build"]["configs"].values()}
+            if record["configs"] <= tree:
+                return run
+        return None
 
     def _combination(self, arch: str, combo: dict, built: list[dict], tracked: set[str]) -> dict:
         """One distinct run of a set as the documents give it: its params as a
@@ -673,7 +781,7 @@ class ArchLibrary:
         }
         sources = sorted(
             {
-                r["hash"]: {**_source_entry(r, tracked), "_order": r["order"]}
+                r["hash"]: {**_source_entry(r, tracked), "_order": r["order"], "_hash": r["hash"]}
                 for r in combo["records"]
             }.values(),
             key=lambda s: (SOURCE_KINDS.index(s["kind"]), s["_order"]),
@@ -692,6 +800,7 @@ class ArchLibrary:
             "gpus_per_replica": build["gpus_per_replica"] if build and not error else None,
             "counts": self._counts(build, combo["gpu"]) if build and not error else None,
             "error": error,
+            "_unrecorded": "unrecorded" in combo,
             "_build": build if not error else None,
         }
 

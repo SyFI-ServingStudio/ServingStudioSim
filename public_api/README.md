@@ -121,6 +121,19 @@ as a real run of the set, read from the kernel-config registry in profile.db:
   its model config and routing files as local paths. An `hf://` corpus is used
   only when the local hub cache holds it (`resolve_reference(local_only=True)`:
   nothing is downloaded); a run naming a file this machine lacks is skipped;
+- a run registered from another machine's log names its routing file by that
+  path. When the repo holds a copy, the copy's provenance sidecar
+  (`<name>.provenance.json` beside it) lists the paths it was `copied_from`
+  and its `sha256`, and the run is read as naming the copy: it builds, and is
+  the same run as the copy's preset records. A copy whose content no longer
+  has that sha256 names nothing;
+- a record of a run this machine still cannot build is folded into a built
+  run when the registry shows it is that run recorded again: every config it
+  asked for is in the built run's tree, one of them folding an MoE routing (a
+  config's hash covers its routing). Its source joins that run's `sources`,
+  and it is no skipped run. This covers a record whose values its YAML read
+  another way (`mtp_mode: off` read as `false`); an arch whose configs fold
+  no routing cannot be told apart this way;
 - each is counted as the defaults tree is, and the set's runs are ordered best
   first: most configs measured, then the higher measured share, then a preset
   over an alignment case over a prediction, then registration order. A run's

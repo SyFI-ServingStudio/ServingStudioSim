@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
 import sqlite3
 from dataclasses import asdict
 from pathlib import Path
@@ -1377,6 +1378,81 @@ def test_runs_that_did_not_record_their_routing_or_lack_a_file_are_skipped(runs)
     assert "routing" not in skipped["old.yaml"]["params"]
     assert "not in this machine's hub cache" in skipped["presets/moe_x.yaml"]["error"]
     assert not any(b["arch"].get("routing", "uniform") == "uniform" for b in sources.built)
+    assert run["combinations"] == 3
+
+
+def _register_routed(path: Path, share: int, source: dict, *, qkv: bool = True) -> None:
+    """Register a run that asked for the qkv config and, unless ``share`` is
+    None, the experts config folding that routed share."""
+
+    config = {"gpu_name": "NVIDIA H200", "backends": ["torch"]}
+    records = [_record(QKV, [{"pool": "main", "role": "unified.qkv"}])] if qkv else []
+    if share is not None:
+        experts = config_identity({**config, "expert_demand": _popularity(share)})
+        uses = [{"pool": "main", "role": "unified.moe.experts"}]
+        records.append(_record(experts, uses, kind="moe_experts"))
+    kernel_config.register_kernel_configs(
+        path,
+        {"schema_version": kernel_config.RECORDS_SCHEMA_VERSION, "configs": records},
+        {"main": source},
+    )
+
+
+def test_a_record_of_a_built_run_this_machine_cannot_build_joins_that_run(runs) -> None:
+    """The same popularity run recorded from another machine's log: its file
+    is missing here, but every config it asked for, the routed experts
+    included, is in the built run's tree, so it is that run's source and no
+    skipped run. Records whose routing the registry cannot pin stay skipped:
+    one that registered no routed config, and one whose routed config no
+    built run's tree has."""
+
+    client, sources = runs
+    elsewhere = "coriander:/logs/profile_popularity/popularity.json"
+    popular = {"routing": "popularity", "mtp_mode": "off"}
+    block = _moe_block(**popular, expert_popularity_file=elsewhere)
+    _register_routed(sources.db_path, 400_000, _moe_source(block, preset="coriander:/logs/a.yaml"))
+    unpinned = _moe_block(**popular, expert_popularity_file="coriander:/logs/b/popularity.json")
+    _register_routed(sources.db_path, None, _moe_source(unpinned, preset="coriander:/logs/b.yaml"))
+    other = _moe_block(**popular, expert_popularity_file="coriander:/logs/c/popularity.json")
+    _register_routed(sources.db_path, 123_456, _moe_source(other, preset="coriander:/logs/c.yaml"))
+
+    run = client.get(MOE_TREE, params=MOE_QUERY).json()["run"]
+    assert [s["name"] for s in run["sources"]] == ["presets/moe_x.yaml", "a.yaml", PACK]
+    # The three name one file alike, so they were one skipped run: only the
+    # record the registry pins leaves it.
+    skipped = {s["sources"][0]["name"]: s for s in run["skipped"]}
+    assert set(skipped) == {"old.yaml", "presets/moe_x.yaml", "b.yaml"}
+    assert [s["name"] for s in skipped["b.yaml"]["sources"]] == ["b.yaml", "c.yaml"]
+    assert skipped["b.yaml"]["error"] == (
+        "expert_popularity_file popularity.json is not on this machine"
+    )
+    assert run["combinations"] == 3
+
+
+def test_a_run_recorded_with_a_file_the_repo_holds_a_copy_of_reads_as_the_copy(runs) -> None:
+    """A run registered from another machine's log names its routing file by
+    that path. The repo copy's provenance sidecar names the path and the
+    copy's sha256, so the run builds with the copy and is the copy's run;
+    a sidecar whose sha256 the file no longer has names no copy."""
+
+    client, sources = runs
+    root = arch_library.REPO_ROOT
+    logged = "coriander:/logs/profile_popularity/popularity.json"
+    digest = hashlib.sha256((root / POPULARITY).read_bytes()).hexdigest()
+    sidecar = {"copied_from": [logged], "sha256": digest}
+    (root / "presets" / "popularity.provenance.json").write_text(json.dumps(sidecar))
+    stale = {"copied_from": ["coriander:/logs/2/popularity2.json"], "sha256": "0" * 64}
+    (root / "presets" / "popularity2.provenance.json").write_text(json.dumps(stale))
+    popular = {"routing": "popularity", "mtp_mode": "off"}
+    for path, name in [(logged, "a.yaml"), ("coriander:/logs/2/popularity2.json", "b.yaml")]:
+        block = _moe_block(**popular, expert_popularity_file=path)
+        _register_routed(sources.db_path, None, _moe_source(block, preset=f"coriander:/{name}"))
+
+    run = client.get(MOE_TREE, params=MOE_QUERY).json()["run"]
+    assert run["params"]["expert_popularity_file"] == POPULARITY
+    assert [s["name"] for s in run["sources"]] == ["presets/moe_x.yaml", "a.yaml", PACK]
+    skipped = {s["sources"][0]["name"]: s["error"] for s in run["skipped"]}
+    assert skipped["b.yaml"] == "expert_popularity_file popularity2.json is not on this machine"
     assert run["combinations"] == 3
 
 
