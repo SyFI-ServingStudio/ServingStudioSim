@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import shutil
 import sqlite3
 import sys
@@ -60,14 +61,35 @@ PREDICTION_PROVENANCE_FILE = "prediction_provenance.json"
 
 
 def _load_config(path: Path) -> dict:
-    """Parse the minimal predict config (JSON or YAML) — only `log_dir` /
-    `cases_file` are needed launcher-side; the binary re-parses the whole thing."""
+    """Parse the predict config (JSON or YAML) as the binary does. The binary
+    re-parses the whole thing, and the kernel-config registry records the
+    launcher's copy as the run's source, so the two must read alike."""
     text = path.read_text()
     if path.suffix == ".json":
         return json.loads(text)
     import yaml
 
-    return yaml.safe_load(text)
+    return yaml.load(text, Loader=_binary_yaml_loader(yaml))
+
+
+def _binary_yaml_loader(yaml):
+    """A safe loader that reads booleans as the binary's serde_yaml (YAML 1.2)
+    does: only true and false. PyYAML's YAML 1.1 also reads on, off, yes and
+    no as booleans, which turned `mtp_mode: off` into `false` in the record."""
+
+    bool_tag = "tag:yaml.org,2002:bool"
+
+    class Loader(yaml.SafeLoader):
+        pass
+
+    Loader.yaml_implicit_resolvers = {
+        first: [(tag, regexp) for tag, regexp in resolvers if tag != bool_tag]
+        for first, resolvers in yaml.SafeLoader.yaml_implicit_resolvers.items()
+    }
+    Loader.add_implicit_resolver(
+        bool_tag, re.compile(r"^(?:true|True|TRUE|false|False|FALSE)$"), list("tTfF")
+    )
+    return Loader
 
 
 def _prediction_labeler_params(cfg: dict) -> dict | None:

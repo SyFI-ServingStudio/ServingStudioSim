@@ -85,3 +85,19 @@ def test_a_rejected_case_fails_the_dry_run(tmp_path, launcher):
     launcher.exit_code = 1
 
     assert timing_predict.main(["--dry-run", str(_config(tmp_path))]) == 1
+
+
+def test_a_yaml_config_reads_booleans_as_the_binary_does(tmp_path):
+    """The registry records the launcher's copy of a predict config as the
+    run's source, so it must read what the binary's serde_yaml reads: `off`
+    is the string an enum param names, and only true and false are booleans."""
+
+    config = tmp_path / "predict.yaml"
+    fields = ["mtp_mode: off", "tag: yes", "fp8: false", "x: True"]
+    config.write_text("arch:\n  iter:\n" + "".join(f"    {f}\n" for f in fields))
+    assert timing_predict._load_config(config)["arch"]["iter"] == {
+        "mtp_mode": "off",
+        "tag": "yes",
+        "fp8": False,
+        "x": True,
+    }
