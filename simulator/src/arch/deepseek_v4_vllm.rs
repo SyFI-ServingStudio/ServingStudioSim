@@ -754,6 +754,13 @@ impl DeepseekV4VllmModel {
 }
 
 impl IterwiseUnifiedModel for DeepseekV4VllmModel {
+    fn check_input(&self, batch: &UnifiedArchInput) -> Result<(), String> {
+        let input = normalize_input(batch)?;
+        self.layers
+            .iter()
+            .try_for_each(|layer| layer.attention.check_input(&input.attention))
+    }
+
     fn eval_iter(
         &self,
         batch: &UnifiedArchInput,

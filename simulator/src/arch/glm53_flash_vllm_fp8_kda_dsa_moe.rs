@@ -1059,6 +1059,10 @@ impl Glm53FlashVllmModel {
 }
 
 impl IterwiseUnifiedModel for Glm53FlashVllmModel {
+    fn check_input(&self, batch: &UnifiedArchInput) -> Result<(), String> {
+        normalize_input(batch, self.max_model_len).map(|_| ())
+    }
+
     fn total_kv_bytes_per_token(&self) -> u64 {
         self.total_kv_bytes_per_token
     }
@@ -1151,7 +1155,7 @@ fn normalize_input(
             .ok_or_else(|| format!("prefill request {request} context overflows u32"))?;
         if context > max_model_len {
             return Err(format!(
-                "prefill request {request} context {context} exceeds timing cap {max_model_len}"
+                "prefill request {request} context {context} exceeds max_model_len {max_model_len}"
             ));
         }
         prefill_tokens = prefill_tokens

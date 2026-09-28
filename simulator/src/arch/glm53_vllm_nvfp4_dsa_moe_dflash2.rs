@@ -335,6 +335,10 @@ impl Glm53VllmNvfp4DsaMoeDflash2Model {
 }
 
 impl SpeculativeUnifiedModel for Glm53VllmNvfp4DsaMoeDflash2Model {
+    fn check_input(&self, batch: &SpeculativeArchInput) -> Result<(), String> {
+        normalize_speculative_input(batch, self.draft_tokens, self.max_model_len).map(|_| ())
+    }
+
     fn total_kv_bytes_per_token(&self) -> u64 {
         self.total_state_bytes_per_token
     }

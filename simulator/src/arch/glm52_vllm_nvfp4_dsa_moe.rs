@@ -1932,6 +1932,10 @@ impl Glm52VllmNvfp4DsaMoeModel {
 }
 
 impl IterwiseUnifiedModel for Glm52VllmNvfp4DsaMoeModel {
+    fn check_input(&self, batch: &UnifiedArchInput) -> Result<(), String> {
+        normalize_input(batch, self.target.ep_size, self.max_model_len).map(|_| ())
+    }
+
     fn total_kv_bytes_per_token(&self) -> u64 {
         self.total_state_bytes_per_token
     }
@@ -2040,6 +2044,10 @@ impl Glm52VllmNvfp4DsaMoeSpeculativeModel {
 }
 
 impl SpeculativeUnifiedModel for Glm52VllmNvfp4DsaMoeSpeculativeModel {
+    fn check_input(&self, batch: &SpeculativeArchInput) -> Result<(), String> {
+        normalize_speculative_input(batch, self.draft_tokens, self.max_model_len).map(|_| ())
+    }
+
     fn total_kv_bytes_per_token(&self) -> u64 {
         self.total_state_bytes_per_token
     }
@@ -2205,7 +2213,7 @@ fn normalize_input(
             })?;
             if cache_tokens > max_model_len {
                 return Err(format!(
-                    "group {group_index} prefill request {request_index} context {cache_tokens} exceeds timing cap {max_model_len}"
+                    "group {group_index} prefill request {request_index} context {cache_tokens} exceeds max_model_len {max_model_len}"
                 ));
             }
             prefill_tokens = prefill_tokens
@@ -2320,7 +2328,7 @@ pub(crate) fn normalize_speculative_input(
             })?;
             if cache_tokens > max_model_len {
                 return Err(format!(
-                    "group {group_index} prefill request {request_index} context {cache_tokens} exceeds timing cap {max_model_len}"
+                    "group {group_index} prefill request {request_index} context {cache_tokens} exceeds max_model_len {max_model_len}"
                 ));
             }
             prefill_tokens = prefill_tokens

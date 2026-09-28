@@ -19,8 +19,8 @@ const SUPPORTED_SELECTED_K: [u32; 2] = [2048, 2176];
 const MAX_SELECTED_K: u32 = 2176;
 const REQUIRED_BLOCK_SIZE: u32 = 64;
 const MAX_BLOCKS_PER_REQUEST: u32 = 16384;
-pub(crate) const MAX_QUERIES: u32 = 16384;
-const MAX_REQUESTS: usize = 256;
+/// The profiler's grid bound; evaluation past it extrapolates like any 3D cache.
+const MAX_QUERIES: u32 = 16384;
 const MAX_LOCAL_SPAN: u32 = REQUIRED_BLOCK_SIZE * MAX_BLOCKS_PER_REQUEST;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -54,11 +54,10 @@ pub struct DsaSparseIndexRemapKernelInput {
 impl DsaSparseIndexRemapKernelInput {
     fn work(&self) -> (u32, f64, u32) {
         assert!(!self.request_row_counts.is_empty());
-        assert!(self.request_row_counts.len() <= MAX_REQUESTS);
         assert!(self.request_row_counts.iter().all(|&rows| rows > 0));
 
         let num_queries = self.request_row_counts.iter().copied().sum::<u32>();
-        assert!((1..=MAX_QUERIES).contains(&num_queries));
+        assert!(num_queries > 0);
         assert_eq!(self.local_span_lengths.len(), num_queries as usize);
         assert_eq!(self.valid_counts.len(), num_queries as usize);
         assert!(self
@@ -315,6 +314,19 @@ mod tests {
         assert_eq!(input.coords()[0], 24.0);
         assert!((input.coords()[1] - 213.333_333_333_333_34).abs() < 1e-12);
         assert_eq!(input.coords()[2], 16.0);
+    }
+
+    #[test]
+    fn coords_admit_any_request_count_and_rows_past_the_grid() {
+        let rows = MAX_QUERIES + 64;
+        let input = DsaSparseIndexRemapKernelInput {
+            request_row_counts: vec![1; rows as usize],
+            local_span_lengths: vec![4096; rows as usize],
+            valid_counts: vec![2048; rows as usize],
+            workspace_partition: None,
+        };
+        assert_eq!(input.coords()[0], f64::from(rows));
+        assert_eq!(input.coords()[1], 2048.0);
     }
 
     #[test]

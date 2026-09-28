@@ -978,6 +978,10 @@ impl Qwen36LocalModel {
 }
 
 impl IterwiseUnifiedModel for Qwen36LocalModel {
+    fn check_input(&self, batch: &UnifiedArchInput) -> Result<(), String> {
+        normalize_input(batch).map(|_| ())
+    }
+
     fn eval_iter(
         &self,
         batch: &UnifiedArchInput,
