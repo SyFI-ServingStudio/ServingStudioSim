@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from pathlib import Path
@@ -16,8 +17,8 @@ from profiling.db.storage import (
     quote,
 )
 
-SCHEMA_VERSION = 3
-SCHEMA_HASH = "l1-compact-keys-v3"
+SCHEMA_VERSION = 4
+SCHEMA_HASH = "l1-identity-no-local-paths-v4"
 
 _METRIC_COLUMNS = frozenset(
     {"time_ms", "tflops", "memory_bandwidth_gbps", "algbw_gbps", "busbw_gbps", "energy_j"}
@@ -54,7 +55,7 @@ def migrate_connection(
 
     Table writes use this form so schema preparation and row persistence share
     one transaction. Read paths never receive a writable connection and cannot
-    invoke migration as a side effect. Returns whether a v2 table was upgraded.
+    invoke migration as a side effect. Returns whether any table was rewritten.
     """
     if target_version != SCHEMA_VERSION:
         raise ValueError(f"unsupported profile DB schema version {target_version}")
@@ -71,6 +72,7 @@ def migrate_connection(
         """
     )
     upgraded = _upgrade_v2(conn)
+    upgraded = _drop_identity_paths(conn) or upgraded
     conn.executemany(
         """
         INSERT INTO _db_metadata(key, value)
@@ -295,3 +297,80 @@ def _upgrade_registry(conn: sqlite3.Connection) -> None:
         )
     for table in (CONFIG_TABLE, SOURCE_TABLE, USE_TABLE):
         conn.execute(f"DROP TABLE _v2{table}")
+
+
+# ── v3 → v4 ──────────────────────────────────────────────────────────────────
+
+
+def _drop_identity_paths(conn: sqlite3.Connection) -> bool:
+    """Take the payload path out of every corpus-routed config's identity.
+
+    A token corpus binding named its payload by the absolute path the building
+    machine resolved (``expert_demand.corpus.data_file``), so the config hash --
+    a hash of the identity -- differed from machine to machine for the same
+    corpus. The checksum and dimensions name the bytes; the simulator now leaves
+    the path out of an identity, and this rewrites the configs stored before:
+    the identity, its hash and key, and the uses that reference the key. Rows
+    are keyed by their args, not by a config, so none moves.
+    """
+    if CONFIG_TABLE not in _user_tables(conn):
+        return False
+    blobs = storage.load_blobs(conn)
+    rows = conn.execute(
+        f"SELECT id, config_key, kind, gpu_name, identity FROM {CONFIG_TABLE} ORDER BY id"
+    ).fetchall()
+    changed = False
+    for id_, old_key, kind, gpu_name, text in rows:
+        identity = storage.unpack_identity(text, blobs)
+        if not _strip_corpus_paths(identity):
+            continue
+        changed = True
+        config_hash = hashlib.sha256(storage.canonical_json(identity).encode()).hexdigest()
+        new_key = storage.config_key(kind, config_hash, gpu_name)
+        grid = "cache_coords, grid_axes, cells, infeasible"
+        twin = conn.execute(
+            f"SELECT id, {grid} FROM {CONFIG_TABLE} WHERE config_key = ?", (new_key,)
+        ).fetchone()
+        if twin is not None:
+            # The same config registered from two machines: one record.
+            mine = conn.execute(
+                f"SELECT {grid} FROM {CONFIG_TABLE} WHERE id = ?", (id_,)
+            ).fetchone()
+            if tuple(twin[1:]) != tuple(mine):
+                raise ValueError(
+                    f"{kind} config {config_hash} on {gpu_name} was registered with two grids"
+                )
+            conn.execute(f"DELETE FROM {CONFIG_TABLE} WHERE id = ?", (id_,))
+        else:
+            conn.execute(
+                f"""
+                UPDATE {CONFIG_TABLE} SET config_key = ?, config_hash = ?, identity = ?
+                WHERE id = ?
+                """,
+                (new_key, config_hash, storage.pack_identity(conn, identity), id_),
+            )
+        conn.execute(
+            f"UPDATE OR IGNORE {USE_TABLE} SET config_key = ? WHERE config_key = ?",
+            (new_key, old_key),
+        )
+        conn.execute(f"DELETE FROM {USE_TABLE} WHERE config_key = ?", (old_key,))
+    if changed:
+        storage.prune_blobs(conn)
+    return changed
+
+
+def _strip_corpus_paths(value: object) -> bool:
+    """Drop ``data_file`` from every token-corpus binding inside ``value``, in
+    place; whether one was dropped."""
+    dropped = False
+    if isinstance(value, dict):
+        corpus = value.get("corpus")
+        if isinstance(corpus, dict) and "data_file" in corpus:
+            del corpus["data_file"]
+            dropped = True
+        for item in value.values():
+            dropped = _strip_corpus_paths(item) or dropped
+    elif isinstance(value, list):
+        for item in value:
+            dropped = _strip_corpus_paths(item) or dropped
+    return dropped

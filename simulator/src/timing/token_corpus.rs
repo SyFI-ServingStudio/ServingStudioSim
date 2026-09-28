@@ -19,6 +19,12 @@ use super::routing::fold_layerwise_expert_counts;
 #[derive(Clone, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenCorpusConfig {
     pub schema_version: u32,
+    /// Where this machine reads the payload: the manifest's `data_file`,
+    /// absolute once [`Self::from_manifest`] resolves it. It locates the bytes
+    /// rather than naming them (the checksum and dimensions do), so an identity
+    /// leaves it out and a config means the same corpus on every machine; a
+    /// cost manifest keeps it, for `kernel-query` to rebuild the kernel here.
+    #[serde(default, skip_serializing_if = "locates_input")]
     pub data_file: String,
     pub num_tokens: usize,
     pub num_layers: usize,
@@ -47,6 +53,10 @@ pub struct TokenCorpusConfig {
     /// the active-group count the same way assuming balanced routing does.
     #[serde(default = "default_candidates")]
     pub sampling_candidates: u32,
+}
+
+fn locates_input(_: &String) -> bool {
+    crate::timing::dims::serializing_identity()
 }
 
 fn default_candidates() -> u32 {

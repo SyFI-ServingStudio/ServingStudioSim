@@ -1,5 +1,5 @@
-"""profile.db's compact v3 storage: args keys, provenance runs, identity blobs,
-and the lossless upgrade from v2."""
+"""profile.db's compact storage: args keys, provenance runs, identity blobs,
+the lossless upgrade from v2, and v4's path-free corpus identities."""
 
 from __future__ import annotations
 
@@ -391,3 +391,49 @@ def test_a_conflict_report_names_the_runs_by_their_provenance(tmp_path: Path) ->
         "other",
     )
     assert json.dumps(report.to_dict())
+
+
+def _corpus_identity(data_file: str) -> dict:
+    corpus = {"schema_version": 1, "data_file": data_file, "checksum_fnv1a64": 0xABC}
+    return {"n": 1, "expert_demand": {"corpus": corpus}}
+
+
+def test_upgrade_drops_the_corpus_path_and_joins_what_two_machines_registered(
+    tmp_path: Path,
+) -> None:
+    # Before v4 the resolved payload path was part of the identity, so one
+    # corpus registered from two machines made two configs.
+    db = tmp_path / "profile.db"
+    _register(
+        db,
+        _record(_corpus_identity("/raid/hf/hub/blobs/f00d"), "a"),
+        _record(_corpus_identity("/home/u/.cache/hf/blobs/f00d"), "b"),
+    )
+    with closing(sqlite3.connect(db)) as conn:
+        assert len(kc.registered_configs(conn, "single_gemm")) == 2
+
+    assert migrate(db)
+    assert not migrate(db)
+
+    with closing(sqlite3.connect(db)) as conn:
+        [config] = kc.registered_configs(conn, "single_gemm")
+        orphans = conn.execute(
+            f"SELECT COUNT(*) FROM {storage.USE_TABLE} u LEFT JOIN {storage.CONFIG_TABLE} c"
+            " ON c.config_key = u.config_key WHERE c.id IS NULL"
+        ).fetchone()[0]
+    assert "data_file" not in config.identity["expert_demand"]["corpus"]
+    assert kc.content_hash(config.identity) == config.config_hash
+    assert config.config_hash == kc.content_hash(
+        {"n": 1, "expert_demand": {"corpus": {"schema_version": 1, "checksum_fnv1a64": 0xABC}}}
+    )
+    assert sorted(use.role for use in config.uses) == ["a", "b"]
+    assert orphans == 0
+
+
+def test_upgrade_refuses_one_corpus_registered_with_two_grids(tmp_path: Path) -> None:
+    db = tmp_path / "profile.db"
+    other = _record(_corpus_identity("/home/u/blobs/f00d"), "b")
+    other["grid"] = {**other["grid"], "axes": [[2.0]]}
+    _register(db, _record(_corpus_identity("/raid/blobs/f00d"), "a"), other)
+    with pytest.raises(ValueError, match="registered with two grids"):
+        migrate(db)

@@ -1,4 +1,4 @@
-"""How profile.db stores rows compactly (schema v3).
+"""How profile.db stores rows compactly (schema v3; v4 changed only identities).
 
 profile.db is tracked in git, so every byte of it is paid again in each
 committed version. Three things made v2 large, and v3 stores each once:

@@ -381,6 +381,43 @@ mod tests {
     }
 
     #[test]
+    fn a_corpus_identity_names_the_bytes_not_where_this_machine_keeps_them() {
+        let corpus = |data_file: &str| {
+            let mut cfg = config();
+            cfg.expert_demand = crate::timing::expert_demand::ExpertDemand::Corpus(
+                crate::timing::token_corpus::TokenCorpusConfig {
+                    schema_version: 1,
+                    data_file: data_file.into(),
+                    num_tokens: 128,
+                    num_layers: 4,
+                    num_experts: 64,
+                    top_k: 8,
+                    checksum_fnv1a64: 7,
+                    group_size: 8,
+                    layer_start: 0,
+                    layer_end: 4,
+                    seed: 0,
+                    sampling_candidates: 16,
+                },
+            );
+            cfg
+        };
+        let here = corpus("/raid/hf/hub/blobs/3bdb");
+        let there = corpus("/home/x/.cache/huggingface/hub/blobs/3bdb");
+
+        assert_eq!(here.identity(), there.identity());
+        assert!(here.identity()["expert_demand"]["corpus"]
+            .get("data_file")
+            .is_none());
+        // A cost manifest keeps the path: `kernel-query` rebuilds the kernel from it.
+        let described = serde_json::to_value(&here).unwrap();
+        assert_eq!(
+            described["expert_demand"]["corpus"]["data_file"],
+            Value::from("/raid/hf/hub/blobs/3bdb")
+        );
+    }
+
+    #[test]
     fn ranked_positions_select_distinct_local_histograms_without_rank_args() {
         let grid = SweepGrid::new(vec![Axis::values([16])]);
         let first = Nvfp4FusedMoeSpec::enumerate(&config(), &grid, "flashinfer_trtllm_sm100");

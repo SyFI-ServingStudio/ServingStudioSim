@@ -207,21 +207,6 @@ def row_entry(row: dict, deployments: list[dict]) -> dict:
     }
 
 
-def _without_local_paths(value: Any) -> Any:
-    """``value`` with every absolute file path cut to its file name. A config's
-    identity can name a file on the machine that built it (an expert-demand
-    corpus under a local HF cache, say); the directory is that machine's, not
-    part of what the config is."""
-
-    if isinstance(value, dict):
-        return {k: _without_local_paths(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_without_local_paths(v) for v in value]
-    if isinstance(value, str) and value.startswith("/") and "/" in value[1:]:
-        return Path(value).name
-    return value
-
-
 def _axes(config: RegisteredConfig) -> list[list[float]]:
     return [list(axis) for axis in config.grid.axes]
 
@@ -871,7 +856,7 @@ class KernelLibrary:
         """What the list and the detail both say about one config's grid."""
 
         config = summary["config"]
-        config_args, omitted = _config_args(_without_local_paths(config.identity))
+        config_args, omitted = _config_args(config.identity)
         return {
             "config_hash": config.config_hash,
             "kind": config.kind,
@@ -964,7 +949,7 @@ class KernelLibrary:
         asked = {d["id"] for use in uses for d in use["deployments"]}
         return {
             **self._grid(kind, summary),
-            "identity": _without_local_paths(config.identity),
+            "identity": config.identity,
             "axes": _axes(config),
             "metrics": metrics,
             "points": points,

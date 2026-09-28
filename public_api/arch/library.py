@@ -1038,9 +1038,7 @@ class ArchLibrary:
             configs, kernels = {}, {}
             config_status = self._config_status(build, gpu) if build else {}
             for ref, config in (build or {"configs": {}})["configs"].items():
-                args, omitted = kernel_library._config_args(
-                    kernel_library._without_local_paths(config["identity"])
-                )
+                args, omitted = kernel_library._config_args(config["identity"])
                 configs[ref] = {
                     "kind": config["kind"],
                     "config_hash": config["config_hash"],
