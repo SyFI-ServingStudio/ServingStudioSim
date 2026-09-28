@@ -786,7 +786,9 @@ class ArchLibrary:
                 None,
             )
             if routed is not None:
-                name = demand.demand_name(routed, [block], self._routing_default, tracked)
+                name = demand.demand_name(
+                    routed, [block], self._routing_default, tracked, self.kernels.routing_names()
+                )
         params = {
             n: _artifact_value(v, name, tracked) if n in ARTIFACT_KEYS and isinstance(v, str) else v
             for n, v in combo["run"].items()
@@ -1198,7 +1200,8 @@ def _option_order(group: list[str], option: dict) -> tuple:
     value = option["value"]
     if group[0] == demand.PARAM:
         routing = option["routing"] or {}
-        return (demand._preference(value.get(demand.PARAM, "")), routing.get("label", ""))
+        label = routing.get("label")
+        return (demand._preference(value.get(demand.PARAM, "")), label is None, label or "")
     scalar = value.get(group[0])
     if isinstance(scalar, (bool, int, float)):
         return (0, float(scalar), "")
@@ -1206,16 +1209,22 @@ def _option_order(group: list[str], option: dict) -> tuple:
 
 
 def _rank(run: dict) -> tuple:
-    """A registered run's place among its set's: most configs measured, then
-    the higher measured share, then how it was recorded, then registration."""
+    """A registered run's place among its set's: its routing's category
+    (``demand.PREFERENCE``: measured before synthetic, so uniform never leads
+    a routed arch), then most configs measured, then the higher measured
+    share, then how it was recorded, then registration."""
 
     counts = run["counts"]
     kind = min(SOURCE_KINDS.index(s["kind"]) for s in run["sources"])
     order = min(s["_order"] for s in run["sources"])
     if counts is None:
-        return (1, 0, 0, kind, order)
+        return (1, 0, 0, 0, kind, order)
+    # The run's own routing param: a kernel that folds no `expert_demand` (an
+    # FFN pool routing uniformly or at random) still ran one.
+    chosen = run["params"].get(demand.PARAM)
+    routing = demand._preference(chosen) if isinstance(chosen, str) else 0
     share = counts["measured"] / counts["configs"] if counts["configs"] else 0.0
-    return (0, -counts["measured"], -share, kind, order)
+    return (0, routing, -counts["measured"], -share, kind, order)
 
 
 def _leaf_count(node: dict) -> int:
