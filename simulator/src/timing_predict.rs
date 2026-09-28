@@ -55,9 +55,9 @@ use crate::arch::{AttnArchSel, FfnArchSel, IterArchSel};
 use crate::common::{Time, WorkerId};
 use crate::deployment::BackendOverrides;
 use crate::timing::bridge::{write_config_records, KernelData};
-use crate::timing::{
-    CostManifest, CostManifestDoc, CostTree, FlatCostNode, LeafMetrics, PerfApiBridge,
-};
+use crate::timing::SlotInput;
+use crate::timing::{CostManifestDoc, CostTree, FlatCostNode, LeafMetrics, PerfApiBridge};
+use crate::worker::cost_buffers::GroupLogSource;
 use crate::worker::CostBuffers;
 
 /// The AFD deployment's dotted-leaf prefix (see `deployment/afd.rs`). Predicting
@@ -457,19 +457,34 @@ pub fn run_timing_predict(
 /// `slot_time_ms`, plus `node_time_ms[i]` for flat node `i` of
 /// [`Predictor::manifest`] (inside a `Scale{n}` subtree a node holds one
 /// repeat; the `Scale` node holds all `n`).
+/// One costed section of a case: a row of the native cost_log.
 #[derive(Debug, Serialize)]
-pub struct CaseTimes {
+pub struct SectionTimes {
+    /// The [`PredictorManifest`] section whose slots and nodes the times index.
+    pub section: &'static str,
+    /// The layer the section was costed at; `-1` for once-per-iteration ones.
+    pub layer: i16,
     pub total_time_ms: f64,
     pub slot_time_ms: Vec<f32>,
     pub node_time_ms: Vec<f32>,
 }
 
+/// A case's sections, in the order `timing-predict` writes their rows: one
+/// `iter` section for the iter and speculative selectors, `attn` for attn, and
+/// `prologue` .. `epilogue` for ffn (see [`ffn_sections`]).
+#[derive(Debug, Serialize)]
+pub struct CaseTimes {
+    pub sections: Vec<SectionTimes>,
+}
+
 /// What a caller needs to shape cases for a [`Predictor`].
 #[derive(Debug, Serialize)]
 pub struct PredictorInfo {
-    /// `iter` or `speculative_iter`: which case shape [`Predictor::predict`] takes.
+    /// `iter`, `speculative_iter`, `attn` or `ffn`: which case shape
+    /// [`Predictor::predict`] takes.
     pub selector: &'static str,
-    pub num_attn_dp_groups: u16,
+    /// The groups a case carries (`groups`, or ffn's `tokens_per_group`).
+    pub num_groups: u16,
     pub gpus_per_replica: u16,
     /// The longest request context a case may carry, when the model bounds it.
     pub max_model_len: Option<u32>,
@@ -478,10 +493,16 @@ pub struct PredictorInfo {
     pub draft_tokens: Option<u32>,
 }
 
-/// The cost tree a [`Predictor`] costs, without the per-slot `kernel_config`
-/// (what a caller needs to lay [`CaseTimes`] onto the tree).
+/// The cost trees a [`Predictor`] costs, one per section, without the
+/// per-slot `kernel_config` (what a caller needs to lay [`CaseTimes`] onto them).
 #[derive(Debug, Serialize)]
 pub struct PredictorManifest {
+    pub sections: Vec<SectionManifest>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SectionManifest {
+    pub section: String,
     pub slots: Vec<String>,
     pub nodes: Vec<FlatCostNode>,
     pub node_labels: Vec<Option<String>>,
@@ -493,22 +514,80 @@ enum PredictModel {
         model: Box<dyn SpeculativeUnifiedModel>,
         draft_tokens: u32,
     },
+    Attn(Box<dyn AttnLayerwiseModel>),
+    Ffn(Box<dyn FfnLayerwiseModel>),
 }
 
 /// A predict config's arch built once, costing cases in memory: the
-/// `timing-predict` iter and speculative paths without files, parquet or
-/// artifacts. Built on any bridge, a kernel-data one included (the wasm32 entry).
+/// `timing-predict` paths without files, parquet or artifacts. Built on any
+/// bridge, a kernel-data one included (the wasm32 entry).
 pub struct Predictor {
     model: PredictModel,
-    manifest: CostManifest,
+    manifest: CostManifestDoc,
+    buffers: SectionBuffers,
+}
+
+/// The scratch a section is costed into, reused across cases.
+#[derive(Default)]
+struct SectionBuffers {
     slots: Vec<LeafMetrics>,
     scratch: Vec<LeafMetrics>,
     nodes: Vec<LeafMetrics>,
 }
 
+impl SectionBuffers {
+    fn times(
+        &mut self,
+        manifest: &CostManifestDoc,
+        section: &'static str,
+        layer: i16,
+        total: LeafMetrics,
+    ) -> SectionTimes {
+        let tree = &manifest
+            .sections
+            .iter()
+            .find(|s| s.section == section)
+            .unwrap_or_else(|| panic!("the model's cost manifest has no {section} section"))
+            .manifest;
+        CostTree::aggregate(&tree.nodes, &self.slots, &mut self.nodes);
+        SectionTimes {
+            section,
+            layer,
+            total_time_ms: total.m.time_ms as f64,
+            slot_time_ms: self.slots.iter().map(|leaf| leaf.m.time_ms).collect(),
+            node_time_ms: self.nodes.iter().map(|node| node.m.time_ms).collect(),
+        }
+    }
+}
+
+/// Sections as in-memory times: a [`Predictor`]'s [`SectionSink`].
+struct TimesSink<'a> {
+    manifest: &'a CostManifestDoc,
+    buffers: &'a mut SectionBuffers,
+    sections: Vec<SectionTimes>,
+}
+
+impl SectionSink for TimesSink<'_> {
+    fn section<G, F>(&mut self, section: &'static str, layer: i16, _groups: &G, eval: F)
+    where
+        G: GroupLogSource,
+        F: FnOnce(
+            &mut Vec<LeafMetrics>,
+            &mut Vec<LeafMetrics>,
+            Option<&mut Vec<SlotInput>>,
+        ) -> LeafMetrics,
+    {
+        let buffers = &mut *self.buffers;
+        let total = eval(&mut buffers.slots, &mut buffers.scratch, None);
+        let times = buffers.times(self.manifest, section, layer, total);
+        self.sections.push(times);
+    }
+}
+
 impl Predictor {
-    /// Build from a predict config's `arch` value (`{"iter": {...}}` or
-    /// `{"speculative_iter": {...}}`), its GPU and optional `backends`.
+    /// Build from a predict config's `arch` value (`{"iter": {...}}`,
+    /// `{"speculative_iter": {...}}`, `{"attn": {...}}` or `{"ffn": {...}}`),
+    /// its GPU and optional `backends`.
     pub fn build(
         arch: serde_json::Value,
         gpu: &str,
@@ -521,13 +600,16 @@ impl Predictor {
             Some(value) => serde_json::from_value(value).context("parsing backends")?,
             None => BackendOverrides::default(),
         };
-        let _scope = bridge.with_backend_overrides("main", backends.get("main"));
         let model = match &sel {
-            PredictArchSel::Iter(sel) => PredictModel::Iter(
-                build_iter_model(sel, gpu, UNIFIED_MODEL_NAME, bridge)
-                    .context("building the iter-wise arch model")?,
-            ),
+            PredictArchSel::Iter(sel) => {
+                let _scope = bridge.with_backend_overrides("main", backends.get("main"));
+                PredictModel::Iter(
+                    build_iter_model(sel, gpu, UNIFIED_MODEL_NAME, bridge)
+                        .context("building the iter-wise arch model")?,
+                )
+            }
             PredictArchSel::SpeculativeIter(sel) => {
+                let _scope = bridge.with_backend_overrides("main", backends.get("main"));
                 let (model, draft_tokens) =
                     build_speculative_iter_model(sel, gpu, UNIFIED_MODEL_NAME, bridge)
                         .context("building the speculative iter-wise model")?;
@@ -536,8 +618,13 @@ impl Predictor {
                     draft_tokens,
                 }
             }
-            PredictArchSel::Attn(_) | PredictArchSel::Ffn(_) => {
-                bail!("in-memory prediction takes the iter or speculative_iter selector")
+            PredictArchSel::Attn(sel) => {
+                let _scope = bridge.with_backend_overrides("attn", backends.get("attn"));
+                PredictModel::Attn(build_attn_model(sel, gpu, AFD_MODEL_NAME, bridge)?)
+            }
+            PredictArchSel::Ffn(sel) => {
+                let _scope = bridge.with_backend_overrides("ffn", backends.get("ffn"));
+                PredictModel::Ffn(build_ffn_model(sel, gpu, AFD_MODEL_NAME, bridge)?)
             }
         };
         Ok(Self::from_model(model))
@@ -545,15 +632,17 @@ impl Predictor {
 
     fn from_model(model: PredictModel) -> Self {
         let manifest = match &model {
-            PredictModel::Iter(model) => model.cost_log_manifest(),
-            PredictModel::Speculative { model, .. } => model.cost_log_manifest(),
+            PredictModel::Iter(model) => CostManifestDoc::single("iter", model.cost_log_manifest()),
+            PredictModel::Speculative { model, .. } => {
+                CostManifestDoc::single("iter", model.cost_log_manifest())
+            }
+            PredictModel::Attn(model) => model.cost_log_manifest(),
+            PredictModel::Ffn(model) => model.cost_log_manifest(),
         };
         Self {
             model,
             manifest,
-            slots: Vec::new(),
-            scratch: Vec::new(),
-            nodes: Vec::new(),
+            buffers: SectionBuffers::default(),
         }
     }
 
@@ -561,7 +650,7 @@ impl Predictor {
         match &self.model {
             PredictModel::Iter(model) => PredictorInfo {
                 selector: "iter",
-                num_attn_dp_groups: model.num_attn_dp_groups(),
+                num_groups: model.num_attn_dp_groups(),
                 gpus_per_replica: model.gpus_per_replica(),
                 max_model_len: model.max_model_len(),
                 draft_tokens: None,
@@ -571,24 +660,46 @@ impl Predictor {
                 draft_tokens,
             } => PredictorInfo {
                 selector: "speculative_iter",
-                num_attn_dp_groups: model.num_attn_dp_groups(),
+                num_groups: model.num_attn_dp_groups(),
                 gpus_per_replica: model.gpus_per_replica(),
                 max_model_len: Some(model.max_model_len()),
                 draft_tokens: Some(*draft_tokens),
+            },
+            PredictModel::Attn(model) => PredictorInfo {
+                selector: "attn",
+                num_groups: model.num_attn_dp_groups(),
+                gpus_per_replica: model.gpus_per_replica(),
+                max_model_len: None,
+                draft_tokens: None,
+            },
+            PredictModel::Ffn(model) => PredictorInfo {
+                selector: "ffn",
+                num_groups: model.num_dp_groups(),
+                gpus_per_replica: model.gpus_per_replica(),
+                max_model_len: None,
+                draft_tokens: None,
             },
         }
     }
 
     pub fn manifest(&self) -> PredictorManifest {
         PredictorManifest {
-            slots: self
+            sections: self
                 .manifest
-                .slots
+                .sections
                 .iter()
-                .map(|leaf| leaf.name.clone())
+                .map(|s| SectionManifest {
+                    section: s.section.clone(),
+                    slots: s
+                        .manifest
+                        .slots
+                        .iter()
+                        .map(|leaf| leaf.name.clone())
+                        .collect(),
+                    nodes: s.manifest.nodes.clone(),
+                    node_labels: s.manifest.node_labels.clone(),
+                })
                 .collect(),
-            nodes: self.manifest.nodes.clone(),
-            node_labels: self.manifest.node_labels.clone(),
         }
     }
 
@@ -596,6 +707,11 @@ impl Predictor {
     /// Every case is lowered and checked before the first is costed, as the
     /// file path does, so an invalid one fails as `case N: <reason>`.
     pub fn predict(&mut self, cases: serde_json::Value) -> Result<Vec<CaseTimes>> {
+        let (manifest, buffers) = (&self.manifest, &mut self.buffers);
+        // An iteration is one `iter` row, at no particular layer (`-1`).
+        let one = |section: &'static str, buffers: &mut SectionBuffers, total| CaseTimes {
+            sections: vec![buffers.times(manifest, section, -1, total)],
+        };
         match &self.model {
             PredictModel::Iter(model) => {
                 let cases: Vec<PredictCase> =
@@ -604,8 +720,9 @@ impl Predictor {
                 Ok(inputs
                     .iter()
                     .map(|input| {
-                        let total = model.eval_iter(input, &mut self.slots, &mut self.scratch);
-                        case_times(total, &self.manifest, &self.slots, &mut self.nodes)
+                        let total =
+                            model.eval_iter(input, &mut buffers.slots, &mut buffers.scratch);
+                        one("iter", buffers, total)
                     })
                     .collect())
             }
@@ -619,27 +736,54 @@ impl Predictor {
                 Ok(inputs
                     .iter()
                     .map(|input| {
-                        let total =
-                            model.eval_speculative_iter(input, &mut self.slots, &mut self.scratch);
-                        case_times(total, &self.manifest, &self.slots, &mut self.nodes)
+                        let total = model.eval_speculative_iter(
+                            input,
+                            &mut buffers.slots,
+                            &mut buffers.scratch,
+                        );
+                        one("iter", buffers, total)
+                    })
+                    .collect())
+            }
+            PredictModel::Attn(model) => {
+                let cases: Vec<PredictCase> =
+                    serde_json::from_value(cases).context("parsing cases")?;
+                let inputs = attn_inputs(&**model, cases)?;
+                Ok(inputs
+                    .iter()
+                    .map(|input| {
+                        let mut sink = TimesSink {
+                            manifest,
+                            buffers: &mut *buffers,
+                            sections: Vec::new(),
+                        };
+                        attn_sections(&**model, input, &mut sink);
+                        CaseTimes {
+                            sections: sink.sections,
+                        }
+                    })
+                    .collect())
+            }
+            PredictModel::Ffn(model) => {
+                let cases: Vec<FfnArchInput> =
+                    serde_json::from_value(cases).context("parsing cases")?;
+                check_ffn_cases(&**model, &cases)?;
+                Ok(cases
+                    .iter()
+                    .map(|input| {
+                        let mut sink = TimesSink {
+                            manifest,
+                            buffers: &mut *buffers,
+                            sections: Vec::new(),
+                        };
+                        ffn_sections(&**model, input, &mut sink);
+                        CaseTimes {
+                            sections: sink.sections,
+                        }
                     })
                     .collect())
             }
         }
-    }
-}
-
-fn case_times(
-    total: LeafMetrics,
-    manifest: &CostManifest,
-    slots: &[LeafMetrics],
-    nodes: &mut Vec<LeafMetrics>,
-) -> CaseTimes {
-    CostTree::aggregate(&manifest.nodes, slots, nodes);
-    CaseTimes {
-        total_time_ms: total.m.time_ms as f64,
-        slot_time_ms: slots.iter().map(|leaf| leaf.m.time_ms).collect(),
-        node_time_ms: nodes.iter().map(|node| node.m.time_ms).collect(),
     }
 }
 
@@ -855,151 +999,183 @@ fn attn_inputs(
         .collect()
 }
 
-/// Run the AFD attn-side cases: one `attn_cost` per case (`section = "attn"`,
-/// `layer = 0` — every layer sees the same batch within an iteration, so the
-/// per-layer cost is homogeneous). One model instance = one DP shard, so each
-/// case carries exactly one group.
-fn run_attn_cases(model: &dyn AttnLayerwiseModel, inputs: Vec<AttnArchInput>, log_dir: &Path) {
-    let manifest = model.cost_log_manifest();
-    let mut cost = CostBuffers::new(
-        Some(log_dir.to_path_buf()),
-        PREDICT_POOL_TAG,
-        WorkerId(0),
-        &manifest,
-        1.0, // predict = pure building-block cost; no inter-kernel overhead
-    );
-    let mut now = Time::from_ms(0.0);
-    for (idx, input) in inputs.iter().enumerate() {
-        let seg = cost.run_section(
-            "attn",
-            0,
-            idx as u64,
-            0,
-            &input.groups,
-            None,
-            now,
-            |slots, scratch, inputs| match inputs {
-                Some(i) => model.attn_cost_with_inputs(0, input, slots, scratch, i),
-                None => model.attn_cost(0, input, slots, scratch),
-            },
-        );
-        now += seg;
-    }
-    drop(cost);
+/// Where the sections of predict cases go: `timing-predict` writes each as a
+/// cost_log row ([`CostLogSink`]); a [`Predictor`] keeps their times. One
+/// description of a case's sections ([`attn_sections`], [`ffn_sections`])
+/// serves both, so the rows cannot drift apart.
+trait SectionSink {
+    fn section<G, F>(&mut self, section: &'static str, layer: i16, groups: &G, eval: F)
+    where
+        G: GroupLogSource,
+        F: FnOnce(
+            &mut Vec<LeafMetrics>,
+            &mut Vec<LeafMetrics>,
+            Option<&mut Vec<SlotInput>>,
+        ) -> LeafMetrics;
 }
 
-/// Run the AFD ffn-side cases: emit the per-section building blocks of one
-/// iteration, each as one row. The repeating per-mid-layer `post_attn` cost is
-/// homogeneous, so a single representative mid layer stands for all of them; the
-/// terminal layer (`post_attn_last`, post-only) is emitted once. `prologue` and
-/// `epilogue` are the once-per-iteration embed / lm_head, `layer = -1`.
+/// Sections as cost_log rows: case `iter_id`'s, one after another from `now`.
+struct CostLogSink {
+    cost: CostBuffers,
+    iter_id: u64,
+    now: Time,
+}
+
+impl CostLogSink {
+    fn new(log_dir: &Path, manifest: &CostManifestDoc) -> Self {
+        Self {
+            cost: CostBuffers::new(
+                Some(log_dir.to_path_buf()),
+                PREDICT_POOL_TAG,
+                WorkerId(0),
+                manifest,
+                1.0, // predict = pure building-block cost; no inter-kernel overhead
+            ),
+            iter_id: 0,
+            now: Time::from_ms(0.0),
+        }
+    }
+}
+
+impl SectionSink for CostLogSink {
+    fn section<G, F>(&mut self, section: &'static str, layer: i16, groups: &G, eval: F)
+    where
+        G: GroupLogSource,
+        F: FnOnce(
+            &mut Vec<LeafMetrics>,
+            &mut Vec<LeafMetrics>,
+            Option<&mut Vec<SlotInput>>,
+        ) -> LeafMetrics,
+    {
+        self.now += self.cost.run_section(
+            section,
+            layer,
+            self.iter_id,
+            0,
+            groups,
+            None,
+            self.now,
+            eval,
+        );
+    }
+}
+
+/// An AFD attn-side case's one section: `attn_cost` (`section = "attn"`,
+/// `layer = 0` -- every layer sees the same batch within an iteration, so the
+/// per-layer cost is homogeneous). One model instance = one DP shard, so each
+/// case carries exactly one group.
+fn attn_sections<S: SectionSink>(
+    model: &dyn AttnLayerwiseModel,
+    input: &AttnArchInput,
+    sink: &mut S,
+) {
+    sink.section(
+        "attn",
+        0,
+        &input.groups,
+        |slots, scratch, inputs| match inputs {
+            Some(i) => model.attn_cost_with_inputs(0, input, slots, scratch, i),
+            None => model.attn_cost(0, input, slots, scratch),
+        },
+    );
+}
+
+/// An AFD ffn-side case's sections: the per-section building blocks of one
+/// iteration. The repeating per-mid-layer `post_attn` cost is homogeneous, so a
+/// single representative mid layer stands for all of them; the terminal layer
+/// (`post_attn_last`, post-only) is costed once. `prologue` and `epilogue` are
+/// the once-per-iteration embed / lm_head, `layer = -1`.
 ///
 /// The ffn case IS its input: [`FfnArchInput`] deserializes straight from the cases
 /// file (a list of `{ "tokens_per_group": [...] }`), so there is no separate case
 /// type and no lowering — the ffn cost reads the token counts directly. This is the
 /// deliberate counterpoint to the iter/attn drivers' shared attention-shaped case:
 /// each arch's case→input matches the shape its cost actually depends on.
-fn run_ffn_cases(model: &dyn FfnLayerwiseModel, cases: Vec<FfnArchInput>, log_dir: &Path) {
+fn ffn_sections<S: SectionSink>(model: &dyn FfnLayerwiseModel, input: &FfnArchInput, sink: &mut S) {
     let num_layers = model.num_layers();
     let last = num_layers.saturating_sub(1) as usize;
-    let manifest = model.cost_log_manifest();
-    let mut cost = CostBuffers::new(
-        Some(log_dir.to_path_buf()),
-        PREDICT_POOL_TAG,
-        WorkerId(0),
-        &manifest,
-        1.0, // predict = pure building-block cost; no inter-kernel overhead
+    let groups = &input.tokens_per_group;
+
+    // prologue (embedding), once per iteration.
+    sink.section(
+        "prologue",
+        -1,
+        groups,
+        |slots, scratch, inputs| match inputs {
+            Some(i) => model.prologue_cost_with_inputs(input, slots, scratch, i),
+            None => model.prologue_cost(input, slots, scratch),
+        },
     );
-    let mut now = Time::from_ms(0.0);
-    for (idx, input) in cases.into_iter().enumerate() {
-        let iid = idx as u64;
 
-        // prologue (embedding), once per iteration.
-        let seg = cost.run_section(
-            "prologue",
-            -1,
-            iid,
-            0,
-            &input.tokens_per_group,
-            None,
-            now,
+    // pre_attn bootstrap: layer-0 qkv (layers > 0 are fused into the prior
+    // layer's post_attn, so only layer 0 has a standalone pre cost).
+    sink.section(
+        "pre_attn",
+        0,
+        groups,
+        |slots, scratch, inputs| match inputs {
+            Some(i) => model.pre_attn_cost_with_inputs(0, input, slots, scratch, i),
+            None => model.pre_attn_cost(0, input, slots, scratch),
+        },
+    );
+
+    // post_attn for a representative mid layer (Bridge: post(L) + fused pre(L+1)),
+    // standing for every layer in [0, last). Only when there IS a mid layer.
+    if num_layers >= 2 {
+        let mid = (num_layers as usize - 1) / 2; // clearly < last for num_layers >= 2
+        sink.section(
+            "post_attn",
+            mid as i16,
+            groups,
             |slots, scratch, inputs| match inputs {
-                Some(i) => model.prologue_cost_with_inputs(&input, slots, scratch, i),
-                None => model.prologue_cost(&input, slots, scratch),
+                Some(i) => model.post_attn_cost_with_inputs(mid, input, slots, scratch, i),
+                None => model.post_attn_cost(mid, input, slots, scratch),
             },
         );
-        now += seg;
-
-        // pre_attn bootstrap: layer-0 qkv (layers > 0 are fused into the prior
-        // layer's post_attn, so only layer 0 has a standalone pre cost).
-        let seg = cost.run_section(
-            "pre_attn",
-            0,
-            iid,
-            0,
-            &input.tokens_per_group,
-            None,
-            now,
-            |slots, scratch, inputs| match inputs {
-                Some(i) => model.pre_attn_cost_with_inputs(0, &input, slots, scratch, i),
-                None => model.pre_attn_cost(0, &input, slots, scratch),
-            },
-        );
-        now += seg;
-
-        // post_attn for a representative mid layer (Bridge: post(L) + fused pre(L+1)),
-        // standing for every layer in [0, last). Only when there IS a mid layer.
-        if num_layers >= 2 {
-            let mid = (num_layers as usize - 1) / 2; // clearly < last for num_layers >= 2
-            let seg = cost.run_section(
-                "post_attn",
-                mid as i16,
-                iid,
-                0,
-                &input.tokens_per_group,
-                None,
-                now,
-                |slots, scratch, inputs| match inputs {
-                    Some(i) => model.post_attn_cost_with_inputs(mid, &input, slots, scratch, i),
-                    None => model.post_attn_cost(mid, &input, slots, scratch),
-                },
-            );
-            now += seg;
-        }
-
-        // post_attn terminal (last layer, post-only).
-        let seg = cost.run_section(
-            "post_attn_last",
-            last as i16,
-            iid,
-            0,
-            &input.tokens_per_group,
-            None,
-            now,
-            |slots, scratch, inputs| match inputs {
-                Some(i) => model.post_attn_cost_with_inputs(last, &input, slots, scratch, i),
-                None => model.post_attn_cost(last, &input, slots, scratch),
-            },
-        );
-        now += seg;
-
-        // epilogue (final_norm + lm_head), once per iteration.
-        let seg = cost.run_section(
-            "epilogue",
-            -1,
-            iid,
-            0,
-            &input.tokens_per_group,
-            None,
-            now,
-            |slots, scratch, inputs| match inputs {
-                Some(i) => model.epilogue_cost_with_inputs(&input, slots, scratch, i),
-                None => model.epilogue_cost(&input, slots, scratch),
-            },
-        );
-        now += seg;
     }
-    drop(cost);
+
+    // post_attn terminal (last layer, post-only).
+    sink.section(
+        "post_attn_last",
+        last as i16,
+        groups,
+        |slots, scratch, inputs| match inputs {
+            Some(i) => model.post_attn_cost_with_inputs(last, input, slots, scratch, i),
+            None => model.post_attn_cost(last, input, slots, scratch),
+        },
+    );
+
+    // epilogue (final_norm + lm_head), once per iteration.
+    sink.section(
+        "epilogue",
+        -1,
+        groups,
+        |slots, scratch, inputs| match inputs {
+            Some(i) => model.epilogue_cost_with_inputs(input, slots, scratch, i),
+            None => model.epilogue_cost(input, slots, scratch),
+        },
+    );
+}
+
+/// Run the AFD attn-side cases, one cost_log row each (see [`attn_sections`]).
+fn run_attn_cases(model: &dyn AttnLayerwiseModel, inputs: Vec<AttnArchInput>, log_dir: &Path) {
+    let mut sink = CostLogSink::new(log_dir, &model.cost_log_manifest());
+    for (idx, input) in inputs.iter().enumerate() {
+        sink.iter_id = idx as u64;
+        attn_sections(model, input, &mut sink);
+    }
+    // Flush the writer's tail + join (`CostLogger`'s `Drop`).
+    drop(sink);
+}
+
+/// Run the AFD ffn-side cases, one cost_log row per section (see [`ffn_sections`]).
+fn run_ffn_cases(model: &dyn FfnLayerwiseModel, cases: Vec<FfnArchInput>, log_dir: &Path) {
+    let mut sink = CostLogSink::new(log_dir, &model.cost_log_manifest());
+    for (idx, input) in cases.iter().enumerate() {
+        sink.iter_id = idx as u64;
+        ffn_sections(model, input, &mut sink);
+    }
+    drop(sink);
 }
 
 /// Check each ffn case's group count against the model.

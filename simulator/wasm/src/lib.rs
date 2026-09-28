@@ -12,9 +12,15 @@
 //!   "backends"?}`), `kernel_data` the config documents
 //!   (`GET /kernels/{kind}/configs/{hash}` responses, as an array or under
 //!   `configs`), `files` `{path: contents}`.
-//! - `predictor.info()`, `predictor.manifest()`: the case shape and the cost tree.
-//! - `predictor.predict(cases)` -> `{"cases": [{total_time_ms, slot_time_ms,
-//!   node_time_ms}]}`; an invalid case throws `case N: <reason>` before any is costed.
+//!   Every selector is accepted: `iter`, `speculative_iter`, `attn`, `ffn`.
+//! - `predictor.info()`: the case shape (selector, groups per case, context
+//!   bound, draft tokens). `predictor.manifest()`: `{"sections": [{section,
+//!   slots, nodes, node_labels}]}`, one cost tree per section.
+//! - `predictor.predict(cases)` -> `{"cases": [{"sections": [{section, layer,
+//!   total_time_ms, slot_time_ms, node_time_ms}]}]}`: per case, the rows native
+//!   `timing-predict` writes to its cost_log (one `iter` row for the iter
+//!   selectors, `attn` for attn, `prologue` .. `epilogue` for ffn). An invalid
+//!   case throws `case N: <reason>` before any is costed.
 //! - `last_panic()`: the message of the panic that trapped the last call. A
 //!   panic aborts (wasm32 has no unwinding): the call throws
 //!   `RuntimeError: unreachable`, and the instance must be discarded.

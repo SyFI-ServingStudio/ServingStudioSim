@@ -60,9 +60,30 @@ MIXED_CASES = [
     {"groups": [{"prefill_chunk_pairs": [[1024, 3000]]}]},
 ]
 
+# The AFD layer-wise pair, as registered (presets/predict_afd_*.json). The only
+# registered ffn data set routes uniformly: synthetic, but every cell measured.
+QWEN3_ATTN_TP4 = json.loads((REPO_ROOT / "presets" / "predict_afd_attn.json").read_text())
+QWEN3_FFN_EP8 = json.loads((REPO_ROOT / "presets" / "predict_afd_ffn.json").read_text())
+
+
+def _preset_cases(preset: dict) -> list:
+    return json.loads((REPO_ROOT / "presets" / preset["cases_file"]).read_text())
+
+
+# name -> (arch, gpu, cases)
 CONFIGS = {
-    "glm52_nvfp4_b200_ep4_popularity": (GLM52_B200_EP4, "NVIDIA B200"),
-    "llama3_8b_h200_tp1": (LLAMA3_8B_TP1, "NVIDIA H200"),
+    "glm52_nvfp4_b200_ep4_popularity": (GLM52_B200_EP4, "NVIDIA B200", MIXED_CASES),
+    "llama3_8b_h200_tp1": (LLAMA3_8B_TP1, "NVIDIA H200", MIXED_CASES),
+    "qwen3_235b_h200_attn_tp4": (
+        QWEN3_ATTN_TP4["arch"],
+        QWEN3_ATTN_TP4["gpu"],
+        _preset_cases(QWEN3_ATTN_TP4),
+    ),
+    "qwen3_235b_h200_ffn_ep8_uniform": (
+        QWEN3_FFN_EP8["arch"],
+        QWEN3_FFN_EP8["gpu"],
+        _preset_cases(QWEN3_FFN_EP8),
+    ),
 }
 
 pytestmark = [pytest.mark.needs_binary, pytest.mark.needs_db]
@@ -115,8 +136,8 @@ def node() -> str:
 
 @pytest.mark.parametrize("name", CONFIGS)
 def test_wasm_matches_native_timing_predict(name, sim_bin, node, tmp_path):
-    arch, gpu = CONFIGS[name]
-    (tmp_path / "cases.json").write_text(json.dumps(MIXED_CASES))
+    arch, gpu, cases = CONFIGS[name]
+    (tmp_path / "cases.json").write_text(json.dumps(cases))
     config = tmp_path / "predict.json"
     config.write_text(
         json.dumps(
@@ -143,10 +164,8 @@ def test_wasm_matches_native_timing_predict(name, sim_bin, node, tmp_path):
     native = _simulator(sim_bin, "timing-predict", str(config))
     assert native.returncode == 0, native.stderr
     raw = tmp_path / "logs" / "raw"
-    table = pq.read_table(raw / "cost_log" / "worker_predict_0.parquet")
-    [section] = json.loads((raw / "cost_manifest" / "worker_predict_0.json").read_text())[
-        "sections"
-    ]
+    rows = pq.read_table(raw / "cost_log" / "worker_predict_0.parquet").to_pylist()
+    doc = json.loads((raw / "cost_manifest" / "worker_predict_0.json").read_text())
 
     request = tmp_path / "wasm_input.json"
     request.write_text(
@@ -155,7 +174,7 @@ def test_wasm_matches_native_timing_predict(name, sim_bin, node, tmp_path):
                 "config": {"arch": arch, "gpu": gpu},
                 "kernel_data_file": str(kernel_data),
                 "files": _arch_files(arch),
-                "cases": MIXED_CASES,
+                "cases": cases,
             }
         )
     )
@@ -166,25 +185,29 @@ def test_wasm_matches_native_timing_predict(name, sim_bin, node, tmp_path):
     out = json.loads(run.stdout)
 
     assert out["version"]["kernel_data_format"] == 1
-    [block] = arch.values()
-    assert out["info"] == {
-        "selector": "iter",
-        "num_attn_dp_groups": out["info"]["num_attn_dp_groups"],
-        "gpus_per_replica": out["info"]["gpus_per_replica"],
-        "max_model_len": block.get("max_model_len"),
-        "draft_tokens": None,
-    }
-    manifest = out["manifest"]
-    assert manifest["slots"] == [slot["name"] for slot in section["slots"]]
-    assert manifest["nodes"] == section["nodes"]
-    assert manifest["node_labels"] == section["node_labels"]
+    [(selector, block)] = arch.items()
+    assert out["info"]["selector"] == selector
+    assert out["info"]["max_model_len"] == block.get("max_model_len")
+    assert out["info"]["draft_tokens"] is None
+    assert out["manifest"]["sections"] == [
+        {
+            "section": section["section"],
+            "slots": [slot["name"] for slot in section["slots"]],
+            "nodes": section["nodes"],
+            "node_labels": section["node_labels"],
+        }
+        for section in doc["sections"]
+    ]
 
-    totals = table["total_time_ms"].to_pylist()
-    slots = table["slot_time_ms"].to_pylist()
-    assert len(out["cases"]) == len(totals) == len(MIXED_CASES)
-    for case, total, native_slots in zip(out["cases"], totals, slots, strict=True):
-        assert case["total_time_ms"] == total
+    # Every case's sections, in order, are native's cost_log rows.
+    assert len(out["cases"]) == len(cases)
+    predicted = [section for case in out["cases"] for section in case["sections"]]
+    assert len(predicted) == len(rows)
+    for got, row in zip(predicted, rows, strict=True):
+        assert (got["section"], got["layer"]) == (row["section"], row["layer"])
+        assert got["total_time_ms"] == row["total_time_ms"]
         # f32 on both sides; wasm prints the shortest decimal that reads back as it.
-        np.testing.assert_array_equal(np.float32(case["slot_time_ms"]), np.float32(native_slots))
-        assert np.float32(case["node_time_ms"][0]) == np.float32(total)
-        assert len(case["node_time_ms"]) == len(section["nodes"])
+        np.testing.assert_array_equal(
+            np.float32(got["slot_time_ms"]), np.float32(row["slot_time_ms"])
+        )
+        assert np.float32(got["node_time_ms"][0]) == np.float32(row["total_time_ms"])
