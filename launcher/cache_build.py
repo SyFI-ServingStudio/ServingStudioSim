@@ -16,7 +16,9 @@ Rust schema tags with `affects_cache` (keyed by dotted path). When Rust adds a
 kernel-shaping param it
 tags it, and the launcher picks it up with no Python edit. See `param_def.rs`
 for the safe-direction rule (when unsure, tag it — over-tagging only costs extra
-prebuild passes; under-tagging reintroduces the contention bug).
+prebuild passes; under-tagging reintroduces the contention bug). The one
+exception is the provider tags (the deployment, and each group's arch and worker
+`type`): they are no ParamDefs, so `cache_key` keys them itself.
 """
 
 from __future__ import annotations
@@ -45,14 +47,24 @@ def cache_key(config: dict, registry: Registry) -> tuple:
     """The kernel-determining subset of a config tree, hashable for dedup. Walks
     the tree and collects every leaf whose ParamDef is tagged `affects_cache`
     (Rust-authoritative), keyed by its dotted path so two configs that differ
-    only in non-kernel params (rate, replicas, log_dir, ...) collapse."""
-    items: list[tuple[str, object]] = []
+    only in non-kernel params (rate, replicas, log_dir, ...) collapse.
+
+    The deployment and each group's arch and worker `type` are keyed too: they
+    are provider tags, not ParamDefs, and they pick the kernels the params feed
+    (two Qwen arch tags take the same params and build different kernels)."""
+    items: list[tuple[str, object]] = [("deployment", config.get("deployment"))]
     for slot in iter_slots(registry, config):
         if slot.pdef.get("affects_cache") and slot.present:
             value = slot.value
             if isinstance(value, list):
                 value = tuple(value)
             items.append((".".join(slot.path), value))
+    for role, pool in (config.get("pools") or {}).items():
+        for gi, group in enumerate(pool.get("groups") or () if isinstance(pool, dict) else ()):
+            for block in ("arch", "worker"):
+                provider = group.get(block) if isinstance(group, dict) else None
+                if isinstance(provider, dict) and "type" in provider:
+                    items.append((f"pools.{role}.groups.{gi}.{block}.type", provider["type"]))
     return tuple(sorted(items))
 
 

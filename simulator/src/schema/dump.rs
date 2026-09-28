@@ -109,6 +109,29 @@ pub fn list_params() -> Value {
 mod tests {
     use super::*;
 
+    /// The group's GPU and an arch's routing pick kernels, so the launcher's
+    /// cache-key dedup must tell configs apart by them.
+    #[test]
+    fn gpu_and_routing_affect_the_kernel_cache() {
+        let schema = list_params();
+        let gpu = schema["group_common"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == "gpu")
+            .expect("gpu in group_common");
+        assert_eq!(gpu["affects_cache"], true);
+        for providers in schema["providers"]["arch"].as_object().unwrap().values() {
+            for (tag, provider) in providers.as_object().unwrap() {
+                for param in provider["params"].as_array().unwrap() {
+                    if matches!(param["name"].as_str(), Some("routing" | "routing_seed")) {
+                        assert_eq!(param["affects_cache"], true, "{tag}.{}", param["name"]);
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn registry_advertises_tp_size_on_dense_tp() {
         let schema = list_params();
