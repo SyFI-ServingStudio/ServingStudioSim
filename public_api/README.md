@@ -20,6 +20,29 @@ uv run python -m public_api serve --bind 127.0.0.1 --port <port> [--db <profile.
 range first. `--db` defaults to the profiler's database (`VIBESIM_PROFILE_DB` or
 `profiling/profile.db`). Interactive API docs are at `/api/public/v1/docs`.
 
+### In Docker
+
+For a long-running service, `public_api/docker/run.sh BIND PORT` runs it in a
+container that Docker restarts on failure and when the host reboots
+(`--restart unless-stopped`):
+
+```bash
+uv run cargo build --release -p simulator
+public_api/docker/run.sh 10.158.48.50 5220
+docker logs -f servingstudio-public-api
+```
+
+The image holds only the Python environment, installed from `uv.lock`'s
+`public-api` and `launcher` groups, so it is rebuilt only when the lock changes.
+The container runs as the calling user and mounts the checkout read-only at the
+same path, with its git directory (a worktree's lies outside it). It serves
+that checkout's code, `profiling/profile.db` and `target/release/simulator`, and
+reads Hugging Face corpora from the local hub cache (`$HF_HOME/hub`, also
+read-only, offline). To serve new code or data,
+update the checkout, rebuild the simulator and rerun `run.sh`, which replaces
+the container. `PUBLIC_API_CONTAINER` and `PUBLIC_API_IMAGE` override the
+container and image names.
+
 ## Routes
 
 All `GET`, under `/api/public/v1`.
