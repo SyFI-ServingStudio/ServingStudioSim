@@ -180,6 +180,27 @@ def get_db_metadata() -> DbMetadata:
     return _get_db_metadata(DB_PATH)
 
 
+def get_config_document(kind: str, gpu_name: str, identity_json: str) -> str | None:
+    """The registry's config document (``profiling.db.kernel_data``) of the
+    ``kind`` config with this identity on ``gpu_name``, as JSON; None when it
+    is not registered. What a simulator kernel-data bridge reads from profile.db."""
+
+    import json
+    import sqlite3
+
+    from profiling.db.kernel_config import content_hash
+    from profiling.db.kernel_data import config_document
+
+    conn = sqlite3.connect(f"{DB_PATH.resolve().as_uri()}?mode=ro", uri=True)
+    try:
+        document = config_document(
+            conn, DB_PATH, kind, content_hash(json.loads(identity_json)), gpu_name
+        )
+    finally:
+        conn.close()
+    return None if document is None else json.dumps(document)
+
+
 def get_profiler_versions(
     used_op_families: list[str] | None = None,
 ) -> list[ProfilerVersion]:

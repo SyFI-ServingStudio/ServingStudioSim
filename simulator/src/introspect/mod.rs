@@ -15,13 +15,19 @@
 //!     which columns it sweeps, which it fixes) and, for each physical `Input`,
 //!     its cache coordinates and the grid rows around it. No bridge/GPU/DB.
 //!   - **`eval`** → best-of-N interpolated metrics at physical `Input` values.
+//!     Like `eval_coords` and `peak`, it builds the kernel from the config's
+//!     registry document (the grid and rows profile.db registered for it, the
+//!     same data the kernel API serves), so it reads no args and no corpus
+//!     payload; a config profile.db does not register fails. With `"jit":
+//!     true` it builds through perf_api instead, JIT-profiling missing grid
+//!     rows: the fidelity harness's mode, for configs no run registered.
 //!   - **`eval_coords`** → the same cache evaluated directly in coordinate
 //!     space. Analyzer uses this for declared-grid inspection because ragged or
 //!     re-axis kernels do not have one scalar Input field per cache axis.
 //!   - **`peak`** → the fitted grid's peak achieved compute/BW rates (the
 //!     per-config "best batching" ceiling the optimality analyzer divides work
 //!     by). Builds the kernel like `eval`, then reads the peak straight off the
-//!     cache cells — no query points, no coords remap. Needs the bridge.
+//!     cache cells — no query points, no coords remap.
 //!
 //! Division of labor: Python (`tools/cache-fidelity-analyzer/cache_fidelity.py`)
 //! owns the one config and
@@ -37,6 +43,7 @@ use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::timing::bridge::KernelData;
 use crate::timing::kernels::engine::KernelQueryEntry;
 use crate::timing::PerfApiBridge;
 
@@ -55,19 +62,28 @@ enum KernelQueryRequest {
         /// Each a JSON object of the kernel's own `Input` fields
         /// (e.g. `{"prefix_len":0,"append_len":192}`).
         query_points: Vec<Value>,
+        /// Build through perf_api, JIT-profiling missing rows (see the module doc).
+        #[serde(default)]
+        jit: bool,
     },
     /// Interpolate directly in the fitted cache's coordinate space.
     EvalCoords {
         kind: String,
         config: Value,
         query_points: Vec<Vec<f64>>,
+        #[serde(default)]
+        jit: bool,
     },
     /// Report each config's fitted-grid peak achieved compute/BW rates (the
     /// per-config batching ceiling). A **batch** so the optimality sidecar amortizes
     /// the one-time PyO3/bridge import across every unique run config in a single
     /// subprocess. Builds each kernel like `eval`, then reads the cache cells
     /// directly — no query points, no coords remap.
-    Peak { requests: Vec<PeakRequestItem> },
+    Peak {
+        requests: Vec<PeakRequestItem>,
+        #[serde(default)]
+        jit: bool,
+    },
     /// The profile.db rows one config measures (which columns it sweeps and
     /// which it fixes), and the rows each runtime input reads. Uses the
     /// kernel's own `enumerate` and `cache_coords`; no bridge, DB or GPU.
@@ -166,6 +182,21 @@ fn lookup(kind: &str) -> anyhow::Result<&'static KernelQueryEntry> {
         })
 }
 
+/// The bridge `eval`, `eval_coords` and `peak` build on: profile.db's
+/// registry documents, or with `jit` the perf_api bridge with JIT profiling on.
+fn query_bridge(jit: bool) -> anyhow::Result<PerfApiBridge> {
+    if !jit {
+        return Ok(PerfApiBridge::kernel_data(std::sync::Arc::new(
+            KernelData::registry(),
+        )));
+    }
+    let bridge = PerfApiBridge::new().context("starting the PyO3 perf_api bridge")?;
+    bridge
+        .enable_jit_profiling()
+        .context("enabling JIT profiling for the kernel build")?;
+    Ok(bridge)
+}
+
 /// Entry point for `simulator kernel-query` (stdin JSON → stdout JSON).
 pub fn run_kernel_query() -> anyhow::Result<()> {
     let mut buf = String::new();
@@ -198,19 +229,16 @@ pub fn run_kernel_query() -> anyhow::Result<()> {
                 .with_context(|| format!("listing '{kind}' rows"))?;
             serde_json::to_string_pretty(&report)?
         }
-        // eval: build the kernel (JIT-profiles missing grid rows), interpolate.
+        // eval: build the kernel, interpolate.
         KernelQueryRequest::Eval {
             kind,
             config,
             query_points,
+            jit,
         } => {
-            let bridge = PerfApiBridge::new().context("starting the PyO3 perf_api bridge")?;
-            bridge
-                .enable_jit_profiling()
-                .context("enabling JIT profiling for the fidelity grid build")?;
-            let probe = (lookup(&kind)?.build)(config, &bridge).with_context(|| {
-                format!("building '{kind}' kernel (often a missing profile.db row)")
-            })?;
+            let bridge = query_bridge(jit)?;
+            let probe = (lookup(&kind)?.build)(config, &bridge)
+                .with_context(|| format!("building '{kind}' kernel"))?;
 
             let mut results = Vec::with_capacity(query_points.len());
             for point in &query_points {
@@ -233,14 +261,11 @@ pub fn run_kernel_query() -> anyhow::Result<()> {
             kind,
             config,
             query_points,
+            jit,
         } => {
-            let bridge = PerfApiBridge::new().context("starting the PyO3 perf_api bridge")?;
-            bridge
-                .enable_jit_profiling()
-                .context("enabling JIT profiling for the fidelity grid build")?;
-            let probe = (lookup(&kind)?.build)(config, &bridge).with_context(|| {
-                format!("building '{kind}' kernel (often a missing profile.db row)")
-            })?;
+            let bridge = query_bridge(jit)?;
+            let probe = (lookup(&kind)?.build)(config, &bridge)
+                .with_context(|| format!("building '{kind}' kernel"))?;
 
             let mut results = Vec::with_capacity(query_points.len());
             for coordinates in &query_points {
@@ -263,11 +288,8 @@ pub fn run_kernel_query() -> anyhow::Result<()> {
         // read its fitted grid's peak achieved rates straight off the cache cells
         // (best over backends). No query points, no coords remap — correct for
         // re-axis kernels. A per-item build failure is reported, not fatal.
-        KernelQueryRequest::Peak { requests } => {
-            let bridge = PerfApiBridge::new().context("starting the PyO3 perf_api bridge")?;
-            bridge
-                .enable_jit_profiling()
-                .context("enabling JIT profiling for the peak grid build")?;
+        KernelQueryRequest::Peak { requests, jit } => {
+            let bridge = query_bridge(jit)?;
             let mut results = Vec::with_capacity(requests.len());
             for item in requests {
                 let entry = match lookup(&item.kind) {
@@ -300,9 +322,7 @@ pub fn run_kernel_query() -> anyhow::Result<()> {
                         peak_tflops: 0.0,
                         peak_gbps: 0.0,
                         max_arithmetic_intensity_flops_per_byte: 0.0,
-                        error: Some(format!(
-                            "build failed (often a missing profile.db row): {e:#}"
-                        )),
+                        error: Some(format!("build failed: {e:#}")),
                     }),
                 }
             }

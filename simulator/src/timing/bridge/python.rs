@@ -94,6 +94,23 @@ mod enabled {
         })
     }
 
+    /// The registry's config document of `(kind, gpu_name, identity)` as
+    /// JSON, or `None` when profile.db does not register that config.
+    pub(crate) fn get_config_document(
+        kind: &str,
+        gpu_name: &str,
+        identity: &Value,
+    ) -> Result<Option<String>, PerfApiError> {
+        Python::with_gil(|py| {
+            let perf_api = PyModule::import(py, "profiling.perf_api").py_err()?;
+            perf_api
+                .getattr("get_config_document")
+                .and_then(|func| func.call1((kind, gpu_name, identity.to_string())))
+                .and_then(|value| value.extract::<Option<String>>())
+                .py_err()
+        })
+    }
+
     pub(crate) fn get_db_metadata() -> Result<DbMetadata, PerfApiError> {
         Python::with_gil(|py| {
             let perf_api = PyModule::import(py, "profiling.perf_api").py_err()?;
@@ -320,6 +337,13 @@ mod disabled {
         Err(unavailable())
     }
     pub(crate) fn get_current_gpu_name() -> Result<String, PerfApiError> {
+        Err(unavailable())
+    }
+    pub(crate) fn get_config_document(
+        _kind: &str,
+        _gpu_name: &str,
+        _identity: &serde_json::Value,
+    ) -> Result<Option<String>, PerfApiError> {
         Err(unavailable())
     }
     pub(crate) fn get_db_metadata() -> Result<DbMetadata, PerfApiError> {

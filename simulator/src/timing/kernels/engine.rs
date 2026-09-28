@@ -773,7 +773,10 @@ where
 {
     let config: S::Config = serde_json::from_value(config)
         .map_err(|e| anyhow::anyhow!("config does not match {} KernelConfig: {e}", S::KIND))?;
-    S::validate_config(&config)?;
+    // A build from config documents never enumerates, so it has no file to prove.
+    if bridge.documents().is_none() {
+        S::validate_config(&config)?;
+    }
     let kernel = Kernel::<S>::build(S::KIND.to_string(), config, bridge)?;
     Ok(Box::new(kernel))
 }
@@ -791,7 +794,7 @@ where
 {
     let config: S::Config = serde_json::from_value(config)
         .map_err(|e| anyhow::anyhow!("config does not match {} KernelConfig: {e}", S::KIND))?;
-    S::validate_config(&config)?;
+    // No `validate_config`: the grid is the config's alone, and never enumerates.
     let grid_axes = S::sweep_grid(&config).axes().to_vec();
     Ok((
         config.describe_config(),

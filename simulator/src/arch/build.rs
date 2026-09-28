@@ -639,6 +639,11 @@ struct ExpertDemandSource<'a> {
     ep_size: u16,
     expert_popularity_file: Option<&'a str>,
     token_corpus_file: Option<&'a str>,
+    /// Whether this build folds the corpus itself. A build whose kernels are
+    /// fitted from config documents never folds a grid point, so it binds the
+    /// corpus by its manifest alone -- which is all a host without a file
+    /// system (the wasm32 build) can offer.
+    reads_payload: bool,
     /// The body's routed layers — the axis an expert-popularity profile is
     /// validated against, and the boundary past which one has no evidence.
     num_routed_layers: u32,
@@ -660,7 +665,11 @@ impl ExpertDemandSource<'_> {
             let path = self
                 .token_corpus_file
                 .context("routing=corpus requires token_corpus_file on an arch that supports it")?;
-            let demand = ExpertDemand::corpus(path, group_size, layers)?;
+            let demand = if self.reads_payload {
+                ExpertDemand::corpus(path, group_size, layers)?
+            } else {
+                ExpertDemand::corpus_manifest(path, group_size, layers)?
+            };
             let ExpertDemand::Corpus(config) = &demand else {
                 unreachable!("ExpertDemand::corpus returns the corpus arm")
             };
@@ -1059,6 +1068,7 @@ pub fn glm52_vllm_nvfp4_dsa_moe(
         ep_size,
         expert_popularity_file,
         token_corpus_file,
+        reads_payload: bridge.documents().is_none(),
         num_routed_layers: num_sparse_layers(&model_cfg),
     };
     // Ordinary decode submits one row per request, so a verify block is one
@@ -1121,6 +1131,7 @@ pub fn glm52_vllm_nvfp4_dsa_moe_speculative(
         ep_size,
         expert_popularity_file,
         token_corpus_file,
+        reads_payload: bridge.documents().is_none(),
         num_routed_layers: num_sparse_layers(&model_cfg),
     };
     // The target verifies the drafted positions plus the token they extend, so
@@ -1195,6 +1206,7 @@ pub fn glm53_flash_vllm_fp8_kda_dsa_moe(
         ep_size: tp_size,
         expert_popularity_file,
         token_corpus_file,
+        reads_payload: bridge.documents().is_none(),
         num_routed_layers: routed_layers,
     };
     // Ordinary decode: one row per request, so a verify block is one token.
@@ -1242,6 +1254,7 @@ pub fn glm53_vllm_nvfp4_dsa_moe_dflash2(
         ep_size,
         expert_popularity_file,
         token_corpus_file,
+        reads_payload: bridge.documents().is_none(),
         num_routed_layers: num_sparse_layers(&model_cfg),
     };
     let verify_width = draft_tokens
@@ -1389,6 +1402,7 @@ pub fn glm52_sglang_nvfp4_tp_dsa_moe(
         ep_size: 1,
         expert_popularity_file,
         token_corpus_file,
+        reads_payload: bridge.documents().is_none(),
         num_routed_layers: num_sparse_layers(&model_cfg),
     };
     let demand = source.demand(0..num_sparse_layers(&model_cfg) as usize, 1)?;
@@ -2189,6 +2203,7 @@ mod tests {
             ep_size: 2,
             expert_popularity_file: None,
             token_corpus_file: Some(&corpus.data_file.replace("routes.u16", "manifest.json")),
+            reads_payload: true,
             num_routed_layers: 7,
         };
         let body = source.demand(0..7, 6).unwrap();
@@ -2225,6 +2240,7 @@ mod tests {
             ep_size: 2,
             expert_popularity_file: popularity,
             token_corpus_file: token_corpus,
+            reads_payload: true,
             num_routed_layers: 7,
         };
         let demand = |s: ExpertDemandSource<'_>| s.demand(0..7, 6);
@@ -2297,6 +2313,7 @@ mod tests {
             ep_size: 2,
             expert_popularity_file: profile.path().to_str(),
             token_corpus_file: None,
+            reads_payload: true,
             num_routed_layers: 2,
         };
         let ppm = |demand| match demand {

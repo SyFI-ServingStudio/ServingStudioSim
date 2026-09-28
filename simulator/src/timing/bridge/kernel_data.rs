@@ -11,6 +11,10 @@
 //! straight off the points; the args a cell was measured at are not consulted,
 //! since the cache needs only the grid and the samples.
 //!
+//! A [`KernelData::registry`] holds no documents up front: it fetches each
+//! one from profile.db through perf_api the first time a kernel asks, which is
+//! how `kernel-query` builds a kernel from the registry rather than from args.
+//!
 //! The document is the source of truth. A kernel whose grid disagrees with its
 //! document (other axes, another infeasible set), or whose document lacks a
 //! measured, non-outlier row at a feasible cell, fails to build: the fix is in
@@ -18,6 +22,7 @@
 //! never returns them.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex};
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -87,10 +92,14 @@ impl MeasuredRow {
     }
 }
 
+type Key = (String, String, String);
+
 /// Config documents keyed by `(kind, gpu, identity)`.
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 pub struct KernelData {
-    configs: HashMap<(String, String, String), ConfigDocument>,
+    configs: Mutex<HashMap<Key, Arc<ConfigDocument>>>,
+    /// Fetch a document it does not hold from profile.db's registry.
+    registry: bool,
 }
 
 #[derive(Deserialize)]
@@ -112,17 +121,61 @@ impl KernelData {
     pub fn from_documents(documents: impl IntoIterator<Item = ConfigDocument>) -> Self {
         let configs = documents
             .into_iter()
-            .map(|doc| (key(&doc.kind, &doc.gpu, &doc.identity), doc))
+            .map(|doc| (key(&doc.kind, &doc.gpu, &doc.identity), Arc::new(doc)))
             .collect();
-        Self { configs }
+        Self {
+            configs: Mutex::new(configs),
+            registry: false,
+        }
     }
 
+    /// Documents read from profile.db's kernel-config registry (through
+    /// perf_api, so only with the `python` feature) as kernels ask for them.
+    /// A config the registry does not hold fails to build, as a missing
+    /// document does: register it by running what builds it.
+    pub fn registry() -> Self {
+        Self {
+            registry: true,
+            ..Self::default()
+        }
+    }
+
+    /// How many documents it holds.
     pub fn len(&self) -> usize {
-        self.configs.len()
+        self.configs.lock().expect("kernel data").len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.configs.is_empty()
+        self.len() == 0
+    }
+
+    fn document(
+        &self,
+        kind: KernelKind,
+        gpu_name: &str,
+        identity: &Value,
+    ) -> Result<Arc<ConfigDocument>, String> {
+        let key = key(kind, gpu_name, identity);
+        if let Some(doc) = self.configs.lock().expect("kernel data").get(&key) {
+            return Ok(Arc::clone(doc));
+        }
+        let missing = || {
+            format!("no config document for this {kind} config on {gpu_name} (identity {identity})")
+        };
+        if !self.registry {
+            return Err(missing());
+        }
+        let text = super::python::get_config_document(kind, gpu_name, identity)
+            .map_err(|e| format!("reading the {kind} config document from profile.db: {e}"))?
+            .ok_or_else(|| format!("{}: profile.db registers no such config", missing()))?;
+        let doc: ConfigDocument = serde_json::from_str(&text)
+            .map_err(|e| format!("parsing the {kind} config document: {e}"))?;
+        let doc = Arc::new(doc);
+        self.configs
+            .lock()
+            .expect("kernel data")
+            .insert(key, Arc::clone(&doc));
+        Ok(doc)
     }
 
     /// The document of the config `(kind, gpu_name, identity)`, checked against
@@ -135,16 +188,8 @@ impl KernelData {
         identity: &Value,
         axes: &[Vec<f64>],
         infeasible: &[bool],
-    ) -> Result<&ConfigDocument, String> {
-        let doc = self
-            .configs
-            .get(&key(kind, gpu_name, identity))
-            .ok_or_else(|| {
-                format!(
-                    "no config document for this {kind} config on {gpu_name} \
-                     (identity {identity})"
-                )
-            })?;
+    ) -> Result<Arc<ConfigDocument>, String> {
+        let doc = self.document(kind, gpu_name, identity)?;
         if doc.axes != axes {
             return Err(format!(
                 "config {} has grid axes {:?}, but the kernel builds {:?}",

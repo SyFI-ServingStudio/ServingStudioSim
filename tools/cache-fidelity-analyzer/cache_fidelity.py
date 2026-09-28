@@ -8,7 +8,8 @@ kernel-agnostic interfaces — no per-kernel Rust or Python wiring:
     interpolation + grid metadata:
       * `grid` op  → `{describe_config, input_fields, grid_axes}` (bridge-free).
       * `eval` op  → best-of-N interpolated metrics at a batch of `query_points`
-        (builds the kernel, JIT-profiling missing grid rows).
+        (with `"jit": true`: builds the kernel through perf_api, JIT-profiling
+        missing grid rows, since the probed config need not be registered).
   - **Python `perf_api.get_{kind}_times(specs, backend=, gpu_name=)`** ground
     truth (the facade name is `get_{KIND}_times` by convention).
 
@@ -76,7 +77,7 @@ _NON_DIM_KEYS = ("backends", "gpu_name")
 
 def kernel_query(sim_bin: str, req: dict) -> dict:
     """Invoke `simulator kernel-query` under the PyO3 env; return parsed JSON.
-    `req` is `{"op": "grid"|"eval", "kind": ..., "config": ..., [query_points]}`."""
+    `req` is `{"op": "grid"|"eval", "kind": ..., "config": ..., [query_points, jit]}`."""
     proc = subprocess.run(
         [sim_bin, "kernel-query"],
         input=json.dumps(req),
@@ -105,7 +106,7 @@ def eval_kind(sim_bin: str, kind: str, config: dict,
     `{input, time_ms, flops, bytes, energy_j, coverage}` (coverage bits:
     EXTRAPOLATED=1, JIT=2, NO_COVERAGE=4)."""
     resp = kernel_query(sim_bin, {"op": "eval", "kind": kind, "config": config,
-                                  "query_points": query_points})
+                                  "query_points": query_points, "jit": True})
     return resp["results"]
 
 

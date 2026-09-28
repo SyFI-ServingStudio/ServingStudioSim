@@ -4,8 +4,8 @@ Native runs on the Python bridge (profile.db). The wasm module reads what a
 browser gets from the public API instead: the config document
 (`GET /kernels/{kind}/configs/{hash}`) of every kernel config the run builds,
 made here by the same `KernelLibrary.config` the API serves, and the files the
-arch block names, passed in memory. Results must match bit for bit: the browser
-has no other oracle.
+arch block names (a token corpus's manifest, never its payload), passed in
+memory. Results must match bit for bit: the browser has no other oracle.
 
 Skips unless the release binary, the wasm module and `node` are all present and
 profile.db holds every row the config reads.
@@ -22,7 +22,9 @@ from pathlib import Path
 import numpy as np
 import pyarrow.parquet as pq
 import pytest
+import yaml
 
+from launcher.corpus import resolve_hf_references
 from launcher.exec import _build_subprocess_env
 from profiling.db.kernel_config import content_hash
 from public_api.kernel.library import KernelLibrary
@@ -70,7 +72,28 @@ def _preset_cases(preset: dict) -> list:
     return json.loads((REPO_ROOT / "presets" / preset["cases_file"]).read_text())
 
 
-# name -> (arch, gpu, cases)
+# GLM-5.2 NVFP4 drafting MTP-5 on B200 EP4, routed by the recorded token corpus
+# of that deployment: a corpus binds by its manifest alone in wasm.
+SPEC5_CORPUS_PRESET = "presets/glm52_nvfp4_b200_ep4_speculative.yaml"
+SPEC5_CASES = [
+    {"groups": [{"decode_requests": [[4096, 6]] * 64}]},
+    {"groups": [{"prefill_chunk_pairs": [[0, 512]] * 4, "decode_requests": [[2048, 6]] * 100}]},
+    {"groups": [{"prefill_chunk_pairs": [[1024, 3000]]}]},
+]
+
+
+def _spec5_corpus_arch() -> dict:
+    """The preset's arch block with its corpus reference fetched (hub cache)."""
+
+    preset = yaml.safe_load((REPO_ROOT / SPEC5_CORPUS_PRESET).read_text())
+    [group] = preset["pools"]["main"]["groups"]
+    try:
+        return {"speculative_iter": resolve_hf_references(group["arch"])}
+    except Exception as error:  # no hub access and nothing cached
+        pytest.skip(f"token corpus unavailable: {error}")
+
+
+# name -> (arch, gpu, cases); an arch that must be resolved first is a callable.
 CONFIGS = {
     "glm52_nvfp4_b200_ep4_popularity": (GLM52_B200_EP4, "NVIDIA B200", MIXED_CASES),
     "llama3_8b_h200_tp1": (LLAMA3_8B_TP1, "NVIDIA H200", MIXED_CASES),
@@ -84,7 +107,10 @@ CONFIGS = {
         QWEN3_FFN_EP8["gpu"],
         _preset_cases(QWEN3_FFN_EP8),
     ),
+    "glm52_nvfp4_b200_ep4_spec5_corpus": (_spec5_corpus_arch, "NVIDIA B200", SPEC5_CASES),
 }
+# Arch fields that name a file the simulator reads.
+FILE_FIELDS = ("model_config", "expert_popularity_file", "token_corpus_file")
 
 pytestmark = [pytest.mark.needs_binary, pytest.mark.needs_db]
 
@@ -93,11 +119,7 @@ def _arch_files(arch: dict) -> dict[str, str]:
     """The repo files an arch block names, as the browser receives them."""
 
     [block] = arch.values()
-    return {
-        block[key]: str(REPO_ROOT / block[key])
-        for key in ("model_config", "expert_popularity_file")
-        if key in block
-    }
+    return {block[key]: str(REPO_ROOT / block[key]) for key in FILE_FIELDS if key in block}
 
 
 def _simulator(sim_bin: Path, *args: str) -> subprocess.CompletedProcess:
@@ -137,6 +159,7 @@ def node() -> str:
 @pytest.mark.parametrize("name", CONFIGS)
 def test_wasm_matches_native_timing_predict(name, sim_bin, node, tmp_path):
     arch, gpu, cases = CONFIGS[name]
+    arch = arch() if callable(arch) else arch
     (tmp_path / "cases.json").write_text(json.dumps(cases))
     config = tmp_path / "predict.json"
     config.write_text(
@@ -188,7 +211,7 @@ def test_wasm_matches_native_timing_predict(name, sim_bin, node, tmp_path):
     [(selector, block)] = arch.items()
     assert out["info"]["selector"] == selector
     assert out["info"]["max_model_len"] == block.get("max_model_len")
-    assert out["info"]["draft_tokens"] is None
+    assert out["info"]["draft_tokens"] == block.get("draft_tokens")
     assert out["manifest"]["sections"] == [
         {
             "section": section["section"],
