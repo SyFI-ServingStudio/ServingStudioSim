@@ -431,6 +431,7 @@ def test_vllm_runner_maps_fp8_cache_to_torch_storage_dtype(monkeypatch):
     monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
     monkeypatch.setattr(runner, "_validate_vllm_cuda_device", lambda _torch: None)
     monkeypatch.setattr(runner, "_build_operands", build_operands)
+    monkeypatch.setattr(runner, "_verify_vllm_launch", lambda *_args: None)
     monkeypatch.setattr(torch, "ones", lambda *args, **kwargs: object())
     monkeypatch.setattr(
         runner.Timer,
@@ -589,3 +590,13 @@ def test_logical_traffic_is_2312_bytes_per_glm_token():
 def test_generated_facades_are_available():
     assert hasattr(perf_api, "get_mla_cache_append_times")
     assert hasattr(perf_api, "count_missing_mla_cache_append")
+
+
+def test_only_vllm_runner_admits_zero_rope_latent_rows():
+    """GLM-5.3-Flash writes a 512-wide latent with no RoPE key; only vLLM's op was checked for it."""
+    from profiling.runners.attention.mla_cache_append import _validate_args
+
+    args = (8, 512, 0, 64, DType.BF16, DType.FP8_E4M3, "plain")
+    assert _validate_args(*args, allow_fp8_cache=True, allow_zero_rope=True)[2] == 0
+    with pytest.raises(ValueError, match="rope_dim >= 1"):
+        _validate_args(*args, allow_fp8_cache=True)

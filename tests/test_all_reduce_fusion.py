@@ -54,7 +54,7 @@ def test_mnnvl_registry_row_runs_in_production_flashinfer_env():
     # Catches the row silently falling back to the project venv's older FlashInfer.
     spec = find_kernel_profiler_spec(KIND, "flashinfer_mnnvl")
     assert spec.args_schema is AllReduceFusionArgs
-    assert spec.subprocess_env == "vllm_fork_env"
+    assert spec.subprocess_env == "vllm_env"
     assert spec.list_native is True
     assert spec.gpu_count_fn({"num_gpus": 4}) == 4
     assert spec.supports.allows(DType.BF16, gpu="NVIDIA B200")
@@ -69,8 +69,8 @@ def test_mnnvl_oneshot_rule_matches_flashinfer_threshold():
     assert not uses_oneshot(4, 33, 4096, DType.BF16)
     assert uses_oneshot(8, 16, 4096, DType.BF16)
     assert not uses_oneshot(8, 17, 4096, DType.BF16)
-    # DeepSeek-V4.1-Flash (hidden 5120, TP4): one-shot through T=25, so its
-    # captured decode (T=48) runs twoshotAllreduceKernel.
+    # Hidden 5120 at TP4: one-shot through T=25, so a
+    # T=48 decode runs twoshotAllreduceKernel.
     assert uses_oneshot(4, 25, 5120, DType.BF16)
     assert not uses_oneshot(4, 26, 5120, DType.BF16)
 

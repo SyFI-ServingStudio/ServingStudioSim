@@ -978,6 +978,10 @@ impl Qwen36LocalModel {
 }
 
 impl IterwiseUnifiedModel for Qwen36LocalModel {
+    fn check_input(&self, batch: &UnifiedArchInput) -> Result<(), String> {
+        normalize_input(batch).map(|_| ())
+    }
+
     fn eval_iter(
         &self,
         batch: &UnifiedArchInput,
@@ -1611,5 +1615,35 @@ mod tests {
         let manifest = model.cost_log_manifest();
         assert_eq!(manifest.slots.len(), 72);
         assert_eq!(model.cost_tree().n_slots(), 72);
+    }
+
+    /// The Analyzer selects a location map only when its location set equals the
+    /// manifest's non-communication locations exactly, so a leaf renamed here
+    /// without the map drops every qwen36 R6/R7 attribution. One local GPU has no
+    /// communication leaves, so the whole manifest must be mapped.
+    #[test]
+    fn necessary_work_map_covers_the_compiled_locations() {
+        use std::collections::BTreeSet;
+        let bridge = PerfApiBridge::new_uninit_for_test();
+        bridge.enable_enumerate();
+        let model = build("unified".into(), resolve_configs(&cfgs(40)), &bridge).unwrap();
+        let actual: BTreeSet<String> = model
+            .cost_log_manifest()
+            .slots
+            .into_iter()
+            .map(|slot| slot.name)
+            .collect();
+        let map: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../model/work/location_maps/qwen36_local_unified.json"
+        ))
+        .unwrap();
+        let mapped: BTreeSet<String> = map["locations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["location"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(actual.len(), 54);
+        assert_eq!(actual, mapped);
     }
 }

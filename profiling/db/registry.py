@@ -17,6 +17,7 @@ from enum import StrEnum
 from typing import Any
 
 from profiling.db.args import DType, KernelArgs
+from profiling.db.doc import BackendDoc
 from profiling.db.kind import KernelKind
 from profiling.db.outlier import BatchOutlierPolicy
 from profiling.runners.metrics import Metrics, RunnerResult
@@ -136,6 +137,21 @@ class KernelProfilerSpec:
     # spec. When False (the default) the single-spec runner is wrapped by
     # ``batched`` to satisfy the same contract.
     list_native: bool = False
+    # Environment variables the execution backend sets on this row's worker
+    # process, on top of the inherited environment. For measurement policy that
+    # must hold before the framework is imported and that a runner therefore
+    # cannot set itself -- e.g. ``TRITON_CACHE_AUTOTUNING=0``, so a Triton
+    # ``@autotune`` selection never leaks between worker processes through
+    # ``TRITON_CACHE_DIR``. Runners must not mutate ``os.environ`` for this.
+    worker_env: tuple[tuple[str, str], ...] = ()
+    # Optional lazy ``(**schema_kwargs) -> str | None`` called in the worker
+    # right after the chunk runs, once per successful spec. A returned note is
+    # appended to the row's ``backend_version`` so worker-process state that
+    # changes the number (e.g. the pinned autotune configs) is recorded with it.
+    row_provenance_ref: RunnerRef | None = None
+    # Reader-facing description of this backend for the Kernel Library. None
+    # until the kind is documented; see profiling/db/doc.py.
+    doc: BackendDoc | None = None
 
     @property
     def runner_module(self) -> str:
@@ -152,6 +168,9 @@ class KernelProfilerSpec:
 
         runner = self.runner_ref.load(self.runner_module)
         return runner if self.list_native else batched(runner)
+
+    def load_row_provenance(self) -> Callable[..., str | None] | None:
+        return None if self.row_provenance_ref is None else self.row_provenance_ref.load()
 
 
 @dataclass(frozen=True)
@@ -259,6 +278,8 @@ def _validate_registry(registry: list[KernelProfilerSpec]) -> None:
                     "compute_gpu_pairs GPU outside its gpus axis"
                 )
 
+        _validate_worker_env(profiler_spec)
+
         expected_contract = table_contracts.get(profiler_spec.table_name)
         actual_contract = _TableContract(
             kernel_kind=profiler_spec.kernel_kind,
@@ -273,6 +294,23 @@ def _validate_registry(registry: list[KernelProfilerSpec]) -> None:
                 f"conflicting table contract for {profiler_spec.table_name}: "
                 f"{expected_contract} vs {actual_contract}"
             )
+
+
+# The execution backend composes these itself (GPU selection, the env's import
+# and library paths); a row overriding them would silently undo that.
+_BACKEND_OWNED_WORKER_ENV = frozenset({"CUDA_VISIBLE_DEVICES", "PYTHONPATH", "LD_LIBRARY_PATH"})
+
+
+def _validate_worker_env(profiler_spec: KernelProfilerSpec) -> None:
+    label = f"{profiler_spec.kernel_kind}:{profiler_spec.backend}"
+    names = [name for name, _value in profiler_spec.worker_env]
+    if len(set(names)) != len(names):
+        raise ValueError(f"{label} sets a worker_env variable twice: {names}")
+    for name, value in profiler_spec.worker_env:
+        if not name or not isinstance(value, str):
+            raise ValueError(f"{label} worker_env entries must be (name, str value) pairs")
+        if name in _BACKEND_OWNED_WORKER_ENV:
+            raise ValueError(f"{label} worker_env must not set {name}; the backend owns it")
 
 
 def iter_kernel_profiler_specs(

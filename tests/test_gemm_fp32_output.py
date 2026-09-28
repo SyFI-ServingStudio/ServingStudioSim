@@ -49,63 +49,50 @@ def test_rejects_non_production_identity(arguments: tuple[object, ...]) -> None:
         _validate_args(*arguments)
 
 
-def test_fp32_launch_uses_the_cached_contiguous_weight_without_out_dtype() -> None:
-    """GLM-5.3's indexer head-weights mm is fp32 x fp32; forcing out_dtype would change the op."""
+def test_glm53_router_and_indexer_forms() -> None:
+    assert _validate_args(8, 288, 4096, "bf16").n == 288
+    shape = _validate_args(8, 32, 4096, "fp32")
+    assert _logical_bytes(shape) == 4 * 8 * 4096 + 4 * 32 * 4096 + 4 * 8 * 32
+
     calls: list[tuple[object, object, dict[str, object]]] = []
-    fake_torch = SimpleNamespace(
-        float32=object(),
-        mm=lambda left, right, **kwargs: calls.append((left, right, kwargs)),
-    )
-
+    fake_torch = SimpleNamespace(mm=lambda left, right, **kw: calls.append((left, right, kw)))
     _Launch(fake_torch, "hidden.float()", "wp_fp32", fp32_input=True).run()
-
     assert calls == [("hidden.float()", "wp_fp32", {})]
 
 
-def _fork_args(*arguments: object):
-    return _validate_args(
-        *arguments,
-        backend="gemm_fp32_output:torch_cublas_vllm_fork",
-        supported_dtypes=frozenset({DType.BF16, DType.FP32}),
+def test_fp32_prepare_needs_highest_precision_and_caches_a_contiguous_weight() -> None:
+    from profiling.runners.gemm.gemm_fp32_output_torch_cublas import _prepare
+
+    class _Weight:
+        @property
+        def T(self):  # noqa: N802 - mirrors torch.Tensor.T
+            return SimpleNamespace(contiguous=lambda: "weight.T.contiguous()")
+
+    precision = "high"
+    fake_torch = SimpleNamespace(
+        float32="float32",
+        bfloat16="bfloat16",
+        device=lambda *args: args,
+        cuda=SimpleNamespace(current_device=lambda: 0),
+        Generator=lambda device: SimpleNamespace(manual_seed=lambda seed: None),
+        get_float32_matmul_precision=lambda: precision,
+        randn=lambda shape, **kw: "input" if shape[1] == 4096 and shape[0] == 8 else _Weight(),
     )
+    shape = _validate_args(8, 32, 4096, "fp32")
 
+    with pytest.raises(ProfilerNotImplemented, match="highest"):
+        _prepare(fake_torch, shape)
 
-def test_container_backend_rejects_fp32_input() -> None:
-    """The container cuBLAS picks a non-production SGEMM for the fp32 form on B200."""
-    with pytest.raises(ProfilerNotImplemented, match="input_dtype in"):
-        _validate_args(8, 32, 4096, "fp32")
-
-
-def test_fork_backend_accepts_both_input_dtypes() -> None:
-    assert _fork_args(8, 32, 4096, "fp32").input_dtype is DType.FP32
-    assert _fork_args(8, 288, 4096, "bf16").input_dtype is DType.BF16
-    with pytest.raises(ProfilerNotImplemented):
-        _fork_args(8, 288, 4096, "fp32")
-
-
-def test_fork_backend_is_registered_on_the_serving_stack() -> None:
-    from profiling.db.registry import find_kernel_profiler_spec as get_spec
-
-    spec = get_spec("gemm_fp32_output", "torch_cublas_vllm_fork")
-    assert spec.subprocess_env == "vllm_fork_env"
-    assert spec.supports.compute == frozenset({DType.BF16, DType.FP32})
-    assert get_spec("gemm_fp32_output", "torch_cublas").supports.compute == frozenset({DType.BF16})
-
-
-def test_logical_bytes_use_four_byte_operands_for_fp32_input() -> None:
-    shape = _fork_args(8, 32, 4096, "fp32")
-
-    assert _logical_bytes(shape) == 4 * 8 * 4096 + 4 * 32 * 4096 + 4 * 8 * 32
-
-
-def test_router_width_is_accepted() -> None:
-    assert _validate_args(32, 288, 4096, "bf16").n == 288
+    precision = "highest"
+    launch = _prepare(fake_torch, shape)
+    assert launch.fp32_input
+    assert (launch.input_tensor, launch.weight_transposed) == ("input", "weight.T.contiguous()")
 
 
 @pytest.mark.parametrize("n", [384, 512, 1024])
-def test_deepseek_v41_router_and_compressor_widths_carry_k(n: int) -> None:
-    """V4.1 router (384) and compressors (512/1024) use k=5120; a fixed k would mis-time them."""
-    shape = _fork_args(48, n, 5120, "bf16")
+def test_k5120_router_and_compressor_widths_carry_k(n: int) -> None:
+    """The k=5120 router (384) and compressors (512/1024); a fixed k would mis-time them."""
+    shape = _validate_args(48, n, 5120, "bf16")
 
     assert (shape.k, shape.n) == (5120, n)
     assert _logical_bytes(shape) == 2 * 48 * 5120 + 2 * n * 5120 + 4 * 48 * n

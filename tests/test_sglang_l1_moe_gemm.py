@@ -35,7 +35,9 @@ def test_sglang_registry_rows_reuse_existing_schemas_and_env() -> None:
         assert spec.table_name == kind
         assert spec.args_schema is schema
         assert spec.subprocess_env == "sglang_env"
-        assert spec.supports.compute == frozenset({DType.BF16})
+        # The fused MoE computes on NVFP4 tensor cores; the rest are bf16.
+        compute = DType.NVFP4_E2M1 if kind == "nvfp4_fused_moe" else DType.BF16
+        assert spec.supports.compute == frozenset({compute})
         assert spec.supports.gpus == frozenset({"NVIDIA B200"})
 
 

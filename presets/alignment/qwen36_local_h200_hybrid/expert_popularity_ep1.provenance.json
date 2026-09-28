@@ -1,0 +1,16 @@
+{
+  "copied_from": [
+    "coriander:/m-coriander/coriander/kanzhu/MLSim_workspace/tmp/past_trees/wt-qwen36-local-gdn/logs/20260818_0_qwen36_local_hybrid_alignment/profile_popularity/expert_popularity_ep1.json"
+  ],
+  "sha256": "d55d1bc2cf4ed883fb6e4dc66b68718ee9ea696d1d0cfc45eb2d956f45e31898",
+  "derived_artifact": "expert_popularity_ep1.json",
+  "derived_from": "profile_popularity/expert_popularity.json",
+  "source_sha256": "a323741c4d3f42f34009c828768fe9900a3cefaa272d0477dcbb0b9f7277b1ed",
+  "source_expert_parallel_size": 2,
+  "source_experts_per_rank": 128,
+  "derived_expert_parallel_size": 1,
+  "derived_experts_per_rank": 256,
+  "tensors_modified": [],
+  "why": "The capture ran at TP2/EP2 because vLLM refuses --enable-eplb below tensor_parallel_size * data_parallel_size > 1 (vllm/config/parallel.py:467), and EPLB is the only emitter of the machine-readable routing record (vllm/distributed/eplb/eplb_state.py:582). The simulated arch qwen36_local is TP1/EP1, so simulator/src/arch/build.rs:359 rejects the captured ep_size. counts_by_layer[layer][logical_expert] is logical demand AFTER physical->logical remapping and EP-group reduction, i.e. before EP placement, and which experts a token selects depends on its hidden state rather than on sharding -- so the tensor is topology-invariant and is reused unchanged. Only the partition metadata is restated for the EP=1 consumer.",
+  "do_not_use_for": "Per-step temporal structure. TP2 batches differently, so the eplb_step series is NOT the TP1 iteration series. This artifact is aggregate demand only, and it is not timing evidence of any kind."
+}

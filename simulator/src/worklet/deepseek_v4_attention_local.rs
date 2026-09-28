@@ -8,27 +8,24 @@ use std::sync::Arc;
 use crate::op::Op;
 use crate::timing::bridge::DType;
 use crate::timing::kernels::{
-    DeepseekV4FusedInvRopeFp8QuantKernel, DeepseekV4FusedInvRopeFp8QuantKernelConfig,
-    DeepseekV4FusedInvRopeFp8QuantKernelInput, DeepseekV4FusedQKvRmsnormKernel,
-    DeepseekV4FusedQKvRmsnormKernelConfig, DeepseekV4FusedQKvRmsnormKernelInput,
-    DeepseekV4IndexerMqaLogitsDecodeKernel, DeepseekV4IndexerMqaLogitsDecodeKernelConfig,
-    DeepseekV4IndexerMqaLogitsDecodeKernelInput, DeepseekV4IndexerMqaLogitsPrefillKernel,
-    DeepseekV4IndexerMqaLogitsPrefillKernelConfig, DeepseekV4IndexerPrefillKernelInput,
-    DeepseekV4IndexerQRopeQuantKernel, DeepseekV4IndexerQRopeQuantKernelConfig,
-    DeepseekV4IndexerQRopeQuantKernelInput, DeepseekV4IndexerTopkDecodeKernel,
-    DeepseekV4IndexerTopkDecodeKernelConfig, DeepseekV4IndexerTopkDecodeKernelInput,
-    DeepseekV4IndexerTopkPrefillKernel, DeepseekV4IndexerTopkPrefillKernelConfig,
-    DeepseekV4QnormRopeKvInsertKernel, DeepseekV4QnormRopeKvInsertKernelConfig,
-    DeepseekV4QnormRopeKvInsertKernelInput, DeepseekV4SparseAttnCompressStoreKernel,
-    DeepseekV4SparseAttnCompressStoreKernelConfig, DeepseekV4SparseAttnCompressStoreKernelInput,
-    DeepseekV4SparseMlaDecodeKernel, DeepseekV4SparseMlaDecodeKernelConfig,
-    DeepseekV4SparseMlaDecodeKernelInput, DeepseekV4SparseMlaPrefillKernel,
-    DeepseekV4SparseMlaPrefillKernelConfig, DeepseekV4SparseMlaPrefillKernelInput,
+    CompressedSparseMlaDecodeKernel, CompressedSparseMlaDecodeKernelConfig,
+    CompressedSparseMlaDecodeKernelInput, CompressedSparseMlaPrefillKernel,
+    CompressedSparseMlaPrefillKernelConfig, CompressedSparseMlaPrefillKernelInput,
+    DsaCompressedMqaLogitsPrefillKernel, DsaCompressedMqaLogitsPrefillKernelConfig,
+    DsaCompressedPrefillKernelInput, DsaCompressedTopkPrefillKernel,
+    DsaCompressedTopkPrefillKernelConfig, DsaIndexerQRopeQuantWeightFoldKernel,
+    DsaIndexerQRopeQuantWeightFoldKernelConfig, DsaIndexerQRopeQuantWeightFoldKernelInput,
+    DsaPagedMqaLogitsDecodeKernel, DsaPagedMqaLogitsDecodeKernelConfig,
+    DsaPagedMqaLogitsDecodeKernelInput, DsaPersistentTopkDecodeKernel,
+    DsaPersistentTopkDecodeKernelConfig, DsaPersistentTopkDecodeKernelInput,
     Fp8PerTokenGroupQuantKernel, Fp8PerTokenGroupQuantKernelConfig,
     Fp8PerTokenGroupQuantKernelInput, GemmFp32OutputKernel, GemmFp32OutputKernelConfig,
-    GemmFp32OutputKernelInput, MhcFusedPostPreRmsNormKernel, MhcPreRmsNormKernel,
-    MhcRmsNormKernelConfig, MhcRmsNormKernelInput, SingleGemmKernel, SingleGemmKernelConfig,
-    SingleGemmKernelInput,
+    GemmFp32OutputKernelInput, InvRopeFp8QuantKernel, InvRopeFp8QuantKernelConfig,
+    InvRopeFp8QuantKernelInput, KvCompressStoreKernel, KvCompressStoreKernelConfig,
+    KvCompressStoreKernelInput, MhcFusedPostPreRmsNormKernel, MhcPreRmsNormKernel,
+    MhcRmsNormKernelConfig, MhcRmsNormKernelInput, QKvRmsNormKernel, QKvRmsNormKernelConfig,
+    QKvRmsNormKernelInput, QnormRopeKvInsertKernel, QnormRopeKvInsertKernelConfig,
+    QnormRopeKvInsertKernelInput, SingleGemmKernel, SingleGemmKernelConfig, SingleGemmKernelInput,
 };
 use crate::timing::{
     BuildError, CostNode, CostTreeBuilder, Dim, Evaluator, LeafMetrics, PerfApiBridge, Probe,
@@ -104,25 +101,25 @@ pub struct DeepseekV4AttentionLocalWorkletResolved {
     pub entry: MhcRmsNormKernelConfig,
     pub fused_qkv_input_quant: Fp8PerTokenGroupQuantKernelConfig,
     pub fused_qkv: SingleGemmKernelConfig,
-    pub fused_q_kv_rmsnorm: DeepseekV4FusedQKvRmsnormKernelConfig,
+    pub fused_q_kv_rmsnorm: QKvRmsNormKernelConfig,
     pub outer_compressor_proj: Option<GemmFp32OutputKernelConfig>,
     pub indexer_weights_proj: Option<SingleGemmKernelConfig>,
     pub indexer_compressor_proj: Option<GemmFp32OutputKernelConfig>,
     pub q_b_input_quant: Fp8PerTokenGroupQuantKernelConfig,
     pub q_b: SingleGemmKernelConfig,
-    pub qnorm_rope_kv_insert: DeepseekV4QnormRopeKvInsertKernelConfig,
-    pub compressor_store: Option<DeepseekV4SparseAttnCompressStoreKernelConfig>,
-    pub indexer_compressor_store: Option<DeepseekV4SparseAttnCompressStoreKernelConfig>,
+    pub qnorm_rope_kv_insert: QnormRopeKvInsertKernelConfig,
+    pub compressor_store: Option<KvCompressStoreKernelConfig>,
+    pub indexer_compressor_store: Option<KvCompressStoreKernelConfig>,
     pub indexer_q_input_quant: Option<Fp8PerTokenGroupQuantKernelConfig>,
     pub indexer_q: Option<SingleGemmKernelConfig>,
-    pub indexer_q_rope_quant: Option<DeepseekV4IndexerQRopeQuantKernelConfig>,
-    pub indexer_prefill_logits: Option<DeepseekV4IndexerMqaLogitsPrefillKernelConfig>,
-    pub indexer_prefill_topk: Option<DeepseekV4IndexerTopkPrefillKernelConfig>,
-    pub indexer_decode_logits: Option<DeepseekV4IndexerMqaLogitsDecodeKernelConfig>,
-    pub indexer_decode_topk: Option<DeepseekV4IndexerTopkDecodeKernelConfig>,
-    pub sparse_prefill: DeepseekV4SparseMlaPrefillKernelConfig,
-    pub sparse_decode: DeepseekV4SparseMlaDecodeKernelConfig,
-    pub inverse_rope_quant: DeepseekV4FusedInvRopeFp8QuantKernelConfig,
+    pub indexer_q_rope_quant: Option<DsaIndexerQRopeQuantWeightFoldKernelConfig>,
+    pub indexer_prefill_logits: Option<DsaCompressedMqaLogitsPrefillKernelConfig>,
+    pub indexer_prefill_topk: Option<DsaCompressedTopkPrefillKernelConfig>,
+    pub indexer_decode_logits: Option<DsaPagedMqaLogitsDecodeKernelConfig>,
+    pub indexer_decode_topk: Option<DsaPersistentTopkDecodeKernelConfig>,
+    pub sparse_prefill: CompressedSparseMlaPrefillKernelConfig,
+    pub sparse_decode: CompressedSparseMlaDecodeKernelConfig,
+    pub inverse_rope_quant: InvRopeFp8QuantKernelConfig,
     pub wo_a: SingleGemmKernelConfig,
     pub wo_b_input_quant: Fp8PerTokenGroupQuantKernelConfig,
     pub wo_b: SingleGemmKernelConfig,
@@ -145,25 +142,25 @@ pub struct DeepseekV4AttentionLocalWorklet {
     pub entry_fused: Option<Op<MhcFusedPostPreRmsNormKernel>>,
     pub fused_qkv_input_quant: Op<Fp8PerTokenGroupQuantKernel>,
     pub fused_qkv: Op<SingleGemmKernel>,
-    pub fused_q_kv_rmsnorm: Op<DeepseekV4FusedQKvRmsnormKernel>,
+    pub fused_q_kv_rmsnorm: Op<QKvRmsNormKernel>,
     pub outer_compressor_proj: Option<Op<GemmFp32OutputKernel>>,
     pub indexer_weights_proj: Option<Op<SingleGemmKernel>>,
     pub indexer_compressor_proj: Option<Op<GemmFp32OutputKernel>>,
     pub q_b_input_quant: Op<Fp8PerTokenGroupQuantKernel>,
     pub q_b: Op<SingleGemmKernel>,
-    pub qnorm_rope_kv_insert: Op<DeepseekV4QnormRopeKvInsertKernel>,
-    pub compressor_store: Option<Op<DeepseekV4SparseAttnCompressStoreKernel>>,
-    pub indexer_compressor_store: Option<Op<DeepseekV4SparseAttnCompressStoreKernel>>,
+    pub qnorm_rope_kv_insert: Op<QnormRopeKvInsertKernel>,
+    pub compressor_store: Option<Op<KvCompressStoreKernel>>,
+    pub indexer_compressor_store: Option<Op<KvCompressStoreKernel>>,
     pub indexer_q_input_quant: Option<Op<Fp8PerTokenGroupQuantKernel>>,
     pub indexer_q: Option<Op<SingleGemmKernel>>,
-    pub indexer_q_rope_quant: Option<Op<DeepseekV4IndexerQRopeQuantKernel>>,
-    pub indexer_prefill_logits: Option<Op<DeepseekV4IndexerMqaLogitsPrefillKernel>>,
-    pub indexer_prefill_topk: Option<Op<DeepseekV4IndexerTopkPrefillKernel>>,
-    pub indexer_decode_logits: Option<Op<DeepseekV4IndexerMqaLogitsDecodeKernel>>,
-    pub indexer_decode_topk: Option<Op<DeepseekV4IndexerTopkDecodeKernel>>,
-    pub sparse_prefill: Op<DeepseekV4SparseMlaPrefillKernel>,
-    pub sparse_decode: Op<DeepseekV4SparseMlaDecodeKernel>,
-    pub inverse_rope_quant: Op<DeepseekV4FusedInvRopeFp8QuantKernel>,
+    pub indexer_q_rope_quant: Option<Op<DsaIndexerQRopeQuantWeightFoldKernel>>,
+    pub indexer_prefill_logits: Option<Op<DsaCompressedMqaLogitsPrefillKernel>>,
+    pub indexer_prefill_topk: Option<Op<DsaCompressedTopkPrefillKernel>>,
+    pub indexer_decode_logits: Option<Op<DsaPagedMqaLogitsDecodeKernel>>,
+    pub indexer_decode_topk: Option<Op<DsaPersistentTopkDecodeKernel>>,
+    pub sparse_prefill: Op<CompressedSparseMlaPrefillKernel>,
+    pub sparse_decode: Op<CompressedSparseMlaDecodeKernel>,
+    pub inverse_rope_quant: Op<InvRopeFp8QuantKernel>,
     pub wo_a: Op<SingleGemmKernel>,
     pub wo_b_input_quant: Op<Fp8PerTokenGroupQuantKernel>,
     pub wo_b: Op<SingleGemmKernel>,
@@ -225,7 +222,7 @@ impl DeepseekV4AttentionLocalWorklet {
                 config.q_lora_rank.clone() + config.head_dim.clone(),
                 config.hidden_size.clone(),
             ),
-            fused_q_kv_rmsnorm: DeepseekV4FusedQKvRmsnormKernelConfig {
+            fused_q_kv_rmsnorm: QKvRmsNormKernelConfig {
                 backends: config.fused_q_kv_rmsnorm_backends.clone(),
                 gpu_name: config.gpu_name.clone(),
                 q_dim: (config.q_lora_rank.clone() + config.head_dim.clone()),
@@ -240,7 +237,7 @@ impl DeepseekV4AttentionLocalWorklet {
             indexer_compressor_proj: c4.then(|| fp32_gemm(config.index_head_dim.clone() * 4)),
             q_b_input_quant: quant(config.q_lora_rank.clone()),
             q_b: gemm(head_width.clone(), config.q_lora_rank.clone()),
-            qnorm_rope_kv_insert: DeepseekV4QnormRopeKvInsertKernelConfig {
+            qnorm_rope_kv_insert: QnormRopeKvInsertKernelConfig {
                 backends: config.qnorm_rope_kv_insert_backends.clone(),
                 gpu_name: config.gpu_name.clone(),
                 num_heads: config.num_attention_heads.get(),
@@ -255,7 +252,7 @@ impl DeepseekV4AttentionLocalWorklet {
                 cache_layout: "block_segregated_data_then_scales".to_string(),
                 scale_format: "ue8m0".to_string(),
             },
-            compressor_store: compressed.then(|| DeepseekV4SparseAttnCompressStoreKernelConfig {
+            compressor_store: compressed.then(|| KvCompressStoreKernelConfig {
                 backends: config.compressor_store_backends.clone(),
                 gpu_name: config.gpu_name.clone(),
                 compress_ratio: config.compress_ratio,
@@ -270,7 +267,7 @@ impl DeepseekV4AttentionLocalWorklet {
                 cache_layout: "block_segregated_data_then_scales".to_string(),
                 scale_format: "ue8m0".to_string(),
             }),
-            indexer_compressor_store: c4.then(|| DeepseekV4SparseAttnCompressStoreKernelConfig {
+            indexer_compressor_store: c4.then(|| KvCompressStoreKernelConfig {
                 backends: config.indexer_compressor_store_backends.clone(),
                 gpu_name: config.gpu_name.clone(),
                 compress_ratio: 4,
@@ -292,7 +289,7 @@ impl DeepseekV4AttentionLocalWorklet {
                     config.q_lora_rank.clone(),
                 )
             }),
-            indexer_q_rope_quant: c4.then(|| DeepseekV4IndexerQRopeQuantKernelConfig {
+            indexer_q_rope_quant: c4.then(|| DsaIndexerQRopeQuantWeightFoldKernelConfig {
                 backends: config.indexer_q_rope_quant_backends.clone(),
                 gpu_name: config.gpu_name.clone(),
                 num_heads: config.index_num_heads.clone(),
@@ -309,7 +306,7 @@ impl DeepseekV4AttentionLocalWorklet {
                 rope_style: "gptj_interleaved_trailing".to_string(),
                 quant_mode: "per_token_head_fp8_pow2_ceil_folded_weight".to_string(),
             }),
-            indexer_prefill_logits: c4.then(|| DeepseekV4IndexerMqaLogitsPrefillKernelConfig {
+            indexer_prefill_logits: c4.then(|| DsaCompressedMqaLogitsPrefillKernelConfig {
                 backends: config.indexer_prefill_logits_backends.clone(),
                 gpu_name: config.gpu_name.clone(),
                 max_model_len: config.max_model_len,
@@ -325,7 +322,7 @@ impl DeepseekV4AttentionLocalWorklet {
                 output_dtype: DType::Fp32,
                 clean_logits: false,
             }),
-            indexer_prefill_topk: c4.then(|| DeepseekV4IndexerTopkPrefillKernelConfig {
+            indexer_prefill_topk: c4.then(|| DsaCompressedTopkPrefillKernelConfig {
                 backends: config.indexer_prefill_topk_backends.clone(),
                 gpu_name: config.gpu_name.clone(),
                 max_model_len: config.max_model_len,
@@ -336,7 +333,7 @@ impl DeepseekV4AttentionLocalWorklet {
                 logits_dtype: DType::Fp32,
                 index_dtype: "int32".to_string(),
             }),
-            indexer_decode_logits: c4.then(|| DeepseekV4IndexerMqaLogitsDecodeKernelConfig {
+            indexer_decode_logits: c4.then(|| DsaPagedMqaLogitsDecodeKernelConfig {
                 backends: config.indexer_decode_logits_backends.clone(),
                 gpu_name: config.gpu_name.clone(),
                 next_n: 1,
@@ -354,7 +351,7 @@ impl DeepseekV4AttentionLocalWorklet {
                 cache_format: "fp8_e4m3_ue8m0".to_string(),
                 clean_logits: false,
             }),
-            indexer_decode_topk: c4.then(|| DeepseekV4IndexerTopkDecodeKernelConfig {
+            indexer_decode_topk: c4.then(|| DsaPersistentTopkDecodeKernelConfig {
                 backends: config.indexer_decode_topk_backends.clone(),
                 gpu_name: config.gpu_name.clone(),
                 next_n: 1,
@@ -365,7 +362,7 @@ impl DeepseekV4AttentionLocalWorklet {
                 index_dtype: "int32".to_string(),
                 context_mode: "max_ragged".to_string(),
             }),
-            sparse_prefill: DeepseekV4SparseMlaPrefillKernelConfig {
+            sparse_prefill: CompressedSparseMlaPrefillKernelConfig {
                 backends: config.sparse_prefill_backends.clone(),
                 gpu_name: config.gpu_name.clone(),
                 max_model_len: config.max_model_len,
@@ -389,7 +386,7 @@ impl DeepseekV4AttentionLocalWorklet {
                 output_dtype: config.activation_dtype,
                 cache_layout: "request_slot_major_flat_mqa_bf16_d512".to_string(),
             },
-            sparse_decode: DeepseekV4SparseMlaDecodeKernelConfig {
+            sparse_decode: CompressedSparseMlaDecodeKernelConfig {
                 backends: config.sparse_decode_backends.clone(),
                 gpu_name: config.gpu_name.clone(),
                 num_heads: config.num_attention_heads.clone(),
@@ -404,7 +401,7 @@ impl DeepseekV4AttentionLocalWorklet {
                 output_dtype: config.activation_dtype,
                 planner_mode: config.planner_mode.clone(),
             },
-            inverse_rope_quant: DeepseekV4FusedInvRopeFp8QuantKernelConfig {
+            inverse_rope_quant: InvRopeFp8QuantKernelConfig {
                 backends: config.inverse_rope_quant_backends.clone(),
                 gpu_name: config.gpu_name.clone(),
             },
@@ -469,7 +466,7 @@ impl DeepseekV4AttentionLocalWorklet {
             fused_qkv: build_op!(fused_qkv, SingleGemmKernel, "input.fused_qkv_proj"),
             fused_q_kv_rmsnorm: build_op!(
                 fused_q_kv_rmsnorm,
-                DeepseekV4FusedQKvRmsnormKernel,
+                QKvRmsNormKernel,
                 "main.fused_q_kv_rmsnorm"
             ),
             outer_compressor_proj: build_optional!(
@@ -495,17 +492,17 @@ impl DeepseekV4AttentionLocalWorklet {
             q_b: build_op!(q_b, SingleGemmKernel, "main.q_b_projection"),
             qnorm_rope_kv_insert: build_op!(
                 qnorm_rope_kv_insert,
-                DeepseekV4QnormRopeKvInsertKernel,
+                QnormRopeKvInsertKernel,
                 "main.qnorm_rope_kv_insert"
             ),
             compressor_store: build_optional!(
                 compressor_store,
-                DeepseekV4SparseAttnCompressStoreKernel,
+                KvCompressStoreKernel,
                 "compressor.sparse_attn_compress_store"
             ),
             indexer_compressor_store: build_optional!(
                 indexer_compressor_store,
-                DeepseekV4SparseAttnCompressStoreKernel,
+                KvCompressStoreKernel,
                 "indexer.compressor.sparse_attn_compress_store"
             ),
             indexer_q_input_quant: build_optional!(
@@ -516,42 +513,42 @@ impl DeepseekV4AttentionLocalWorklet {
             indexer_q: build_optional!(indexer_q, SingleGemmKernel, "indexer.q_projection"),
             indexer_q_rope_quant: build_optional!(
                 indexer_q_rope_quant,
-                DeepseekV4IndexerQRopeQuantKernel,
+                DsaIndexerQRopeQuantWeightFoldKernel,
                 "indexer.q_rope_quant"
             ),
             indexer_prefill_logits: build_optional!(
                 indexer_prefill_logits,
-                DeepseekV4IndexerMqaLogitsPrefillKernel,
+                DsaCompressedMqaLogitsPrefillKernel,
                 "indexer.prefill_mqa_logits"
             ),
             indexer_prefill_topk: build_optional!(
                 indexer_prefill_topk,
-                DeepseekV4IndexerTopkPrefillKernel,
+                DsaCompressedTopkPrefillKernel,
                 "indexer.prefill_topk"
             ),
             indexer_decode_logits: build_optional!(
                 indexer_decode_logits,
-                DeepseekV4IndexerMqaLogitsDecodeKernel,
+                DsaPagedMqaLogitsDecodeKernel,
                 "indexer.decode_mqa_logits"
             ),
             indexer_decode_topk: build_optional!(
                 indexer_decode_topk,
-                DeepseekV4IndexerTopkDecodeKernel,
+                DsaPersistentTopkDecodeKernel,
                 "indexer.decode_topk"
             ),
             sparse_prefill: build_op!(
                 sparse_prefill,
-                DeepseekV4SparseMlaPrefillKernel,
+                CompressedSparseMlaPrefillKernel,
                 "attention.prefill_sparse_mla"
             ),
             sparse_decode: build_op!(
                 sparse_decode,
-                DeepseekV4SparseMlaDecodeKernel,
+                CompressedSparseMlaDecodeKernel,
                 "attention.decode_sparse_mla"
             ),
             inverse_rope_quant: build_op!(
                 inverse_rope_quant,
-                DeepseekV4FusedInvRopeFp8QuantKernel,
+                InvRopeFp8QuantKernel,
                 "output.inverse_rope_quant"
             ),
             wo_a: build_op!(wo_a, SingleGemmKernel, "output.wo_a_projection"),
@@ -655,6 +652,11 @@ impl DeepseekV4AttentionLocalWorklet {
                 self.wo_b.compile(builder),
             ])),
         }
+    }
+
+    /// The reason [`Self::eval`] would reject `input`, if any.
+    pub fn check_input(&self, input: &DeepseekV4AttentionLocalWorkletInput) -> Result<(), String> {
+        normalize_input(input, &self.resolved.raw_cfg).map(|_| ())
     }
 
     pub fn eval(&self, input: &DeepseekV4AttentionLocalWorkletInput, evaluator: &mut Evaluator) {
@@ -796,16 +798,16 @@ struct NormalizedInput {
     quant: Fp8PerTokenGroupQuantKernelInput,
     gemm: SingleGemmKernelInput,
     fp32_gemm: GemmFp32OutputKernelInput,
-    fused_rmsnorm: DeepseekV4FusedQKvRmsnormKernelInput,
-    qnorm_insert: DeepseekV4QnormRopeKvInsertKernelInput,
-    compressor: DeepseekV4SparseAttnCompressStoreKernelInput,
-    indexer_q: DeepseekV4IndexerQRopeQuantKernelInput,
-    indexer_prefill: DeepseekV4IndexerPrefillKernelInput,
-    indexer_decode_logits: DeepseekV4IndexerMqaLogitsDecodeKernelInput,
-    indexer_decode_topk: DeepseekV4IndexerTopkDecodeKernelInput,
-    sparse_prefill: DeepseekV4SparseMlaPrefillKernelInput,
-    sparse_decode: DeepseekV4SparseMlaDecodeKernelInput,
-    inverse_rope: DeepseekV4FusedInvRopeFp8QuantKernelInput,
+    fused_rmsnorm: QKvRmsNormKernelInput,
+    qnorm_insert: QnormRopeKvInsertKernelInput,
+    compressor: KvCompressStoreKernelInput,
+    indexer_q: DsaIndexerQRopeQuantWeightFoldKernelInput,
+    indexer_prefill: DsaCompressedPrefillKernelInput,
+    indexer_decode_logits: DsaPagedMqaLogitsDecodeKernelInput,
+    indexer_decode_topk: DsaPersistentTopkDecodeKernelInput,
+    sparse_prefill: CompressedSparseMlaPrefillKernelInput,
+    sparse_decode: CompressedSparseMlaDecodeKernelInput,
+    inverse_rope: InvRopeFp8QuantKernelInput,
     wo_a: SingleGemmKernelInput,
 }
 
@@ -868,9 +870,6 @@ fn normalize_input(
             input.num_insert_tokens, input.num_tokens
         ));
     }
-    if row_request_ids.iter().copied().max().unwrap_or(0) >= 64 {
-        return Err("compressor topology supports at most 64 requests".to_string());
-    }
     let logical_block_size = if config.compress_ratio == 4 { 4 } else { 8 };
     let state_block_table_width = row_positions
         .iter()
@@ -883,36 +882,36 @@ fn normalize_input(
         quant: Fp8PerTokenGroupQuantKernelInput { num_tokens: rows },
         gemm: SingleGemmKernelInput { m: rows },
         fp32_gemm: GemmFp32OutputKernelInput { m: rows },
-        fused_rmsnorm: DeepseekV4FusedQKvRmsnormKernelInput { num_tokens: rows },
-        qnorm_insert: DeepseekV4QnormRopeKvInsertKernelInput {
+        fused_rmsnorm: QKvRmsNormKernelInput { num_tokens: rows },
+        qnorm_insert: QnormRopeKvInsertKernelInput {
             num_tokens: rows,
             num_insert_tokens: input.num_insert_tokens,
         },
-        compressor: DeepseekV4SparseAttnCompressStoreKernelInput {
+        compressor: KvCompressStoreKernelInput {
             row_positions,
             row_request_ids,
             state_block_table_width,
         },
-        indexer_q: DeepseekV4IndexerQRopeQuantKernelInput { num_tokens: rows },
-        indexer_prefill: DeepseekV4IndexerPrefillKernelInput {
+        indexer_q: DsaIndexerQRopeQuantWeightFoldKernelInput { num_tokens: rows },
+        indexer_prefill: DsaCompressedPrefillKernelInput {
             query_context_pairs: input.prefill_query_context_pairs.clone(),
         },
-        indexer_decode_logits: DeepseekV4IndexerMqaLogitsDecodeKernelInput {
+        indexer_decode_logits: DsaPagedMqaLogitsDecodeKernelInput {
             batch_size: input.decode_kv_lens.len() as u32,
             context_len: index_context_len,
         },
-        indexer_decode_topk: DeepseekV4IndexerTopkDecodeKernelInput {
+        indexer_decode_topk: DsaPersistentTopkDecodeKernelInput {
             batch_size: input.decode_kv_lens.len() as u32,
             context_len: index_context_len,
         },
-        sparse_prefill: DeepseekV4SparseMlaPrefillKernelInput {
+        sparse_prefill: CompressedSparseMlaPrefillKernelInput {
             query_context_pairs: input.prefill_query_context_pairs.clone(),
         },
-        sparse_decode: DeepseekV4SparseMlaDecodeKernelInput {
+        sparse_decode: CompressedSparseMlaDecodeKernelInput {
             swa_valid_counts,
             extra_valid_counts,
         },
-        inverse_rope: DeepseekV4FusedInvRopeFp8QuantKernelInput { num_tokens: rows },
+        inverse_rope: InvRopeFp8QuantKernelInput { num_tokens: rows },
         wo_a: SingleGemmKernelInput {
             m: rows
                 .checked_mul(config.o_groups.get())
@@ -1037,8 +1036,8 @@ mod tests {
             fp32_gemm_backends: vec!["torch_cublas"],
             fused_q_kv_rmsnorm_backends: vec!["vllm_triton"],
             qnorm_rope_kv_insert_backends: vec!["vllm_cuda"],
-            compressor_store_backends: vec!["vllm_deepseek_v4_cutedsl"],
-            indexer_compressor_store_backends: vec!["vllm_deepseek_v4_triton"],
+            compressor_store_backends: vec!["vllm_cutedsl"],
+            indexer_compressor_store_backends: vec!["vllm_triton"],
             sparse_prefill_backends: vec!["vllm_flashmla_bf16"],
             sparse_decode_backends: vec!["vllm_flashmla_fp8_cudagraph"],
             inverse_rope_quant_backends: vec!["vllm_triton"],

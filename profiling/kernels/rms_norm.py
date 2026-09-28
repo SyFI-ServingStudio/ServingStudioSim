@@ -23,6 +23,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from profiling.db.args import DType, KernelArgs
+from profiling.db.doc import CUPTI_METHOD, BackendDoc, KernelDoc, arg
 from profiling.db.outlier import BatchOutlierPolicy
 from profiling.db.registry import (
     BackendSupport,
@@ -37,9 +38,45 @@ KIND: str = "rms_norm"
 
 @dataclass(frozen=True)
 class RmsNormArgs(KernelArgs):
-    m: int
-    hidden: int
-    dtype: DType
+    m: int = arg(unit="tokens", doc="Tokens in the batch.")
+    hidden: int = arg(unit="elements", doc="Features normalized per token.")
+    dtype: DType = arg(doc="Element type of the input and weight.")
+
+
+DOC = KernelDoc(
+    title="RMSNorm",
+    summary=(
+        "Normalize each token's hidden vector by its root mean square and scale it by a weight."
+    ),
+    description=(
+        "RMSNorm on its own, without the residual add that residual_rms_norm "
+        "fuses in. Models use it wherever a tensor is normalized alone, for "
+        "example before the attention projections. The input has m token rows "
+        "of hidden features; input and weight are random normal. ε is 1e-6 "
+        "for flashinfer and 1e-5 for vllm_cuda."
+    ),
+    category="Normalization",
+    subcategory="RMSNorm",
+    formula=(
+        "y = x / √(mean(x²) + ε) · weight, per token",
+        "flashinfer: TFLOPS = 5·m·hidden / time; GB/s = 2·m·hidden·bytes per element / time",
+        "vllm_cuda: TFLOPS = (4·m·hidden + 2·m) / time; "
+        "GB/s = (2·m·hidden + hidden)·bytes per element / time",
+    ),
+    default_metric="memory_bandwidth_gbps",
+    method=(
+        f"{CUPTI_METHOD} Only the norm kernel is counted: RMSNormKernel for "
+        "flashinfer, rms_norm_kernel for vllm_cuda. vllm_cuda checks one output "
+        "against a PyTorch RMSNorm before timing."
+    ),
+    caveats=(
+        "The backends count work differently: flashinfer's GB/s leaves out the "
+        "weight read and its TFLOPS assumes 5 operations per element; vllm_cuda "
+        "counts the weight read and 4 operations per element plus 2 per row.",
+    ),
+    # No separate PyTorch reference implementation exists for this kind.
+    reference=None,
+)
 
 
 register(
@@ -56,5 +93,37 @@ register(
         args_schema=RmsNormArgs,
         metric_family=MetricFamily.COMPUTE,
         batch_outlier_policy=BatchOutlierPolicy(),
+        doc=BackendDoc(
+            summary="FlashInfer's norm.rmsnorm.",
+            url="https://github.com/flashinfer-ai/flashinfer/blob/main/flashinfer/norm/__init__.py",
+        ),
+    )
+)
+
+# vLLM's own CUDA op (``RMSNorm.forward_cuda`` without residual), run in the
+# pinned vLLM image; ``csrc/layernorm_kernels.cu`` is identical in the fork.
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="vllm_cuda",
+        supports=BackendSupport(
+            compute=frozenset({DType.BF16}),
+            gpus=frozenset({"NVIDIA B200"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.norm.rms_norm_vllm_cuda",
+            function_name="profile_rms_norm_vllm_cuda",
+        ),
+        table_name=KIND,
+        args_schema=RmsNormArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="vllm_env",
+        doc=BackendDoc(
+            summary=(
+                "vLLM's rms_norm CUDA op, as RMSNorm.forward_cuda launches it without a residual."
+            ),
+            url="https://github.com/vllm-project/vllm/blob/main/csrc/libtorch_stable/layernorm_kernels.cu",
+        ),
     )
 )

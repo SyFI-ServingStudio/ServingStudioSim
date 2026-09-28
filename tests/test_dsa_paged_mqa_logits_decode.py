@@ -382,7 +382,33 @@ def test_deepgemm_cupti_filter_is_architecture_agnostic():
         _DEEPGEMM_KERNEL_NAME,
     )
 
-    assert _DEEPGEMM_KERNEL_NAME == "fp8_paged_mqa_logits"
+    # Substring of sm90_fp8_paged_mqa_logits (H200) and sm100_paged_mqa_logits (B200).
+    assert _DEEPGEMM_KERNEL_NAME == "paged_mqa_logits"
+
+
+def test_deepgemm_check_accepts_matching_and_rejects_wrong_logits():
+    from profiling.runners.attention.dsa_paged_mqa_logits_decode import (
+        _build_operands,
+        _check_first_request,
+        _torch_composite,
+    )
+
+    shape = {"context_len": 65, "max_model_len": 128}
+    operands = _build_operands(
+        torch,
+        batch_size=2,
+        next_n=1,
+        num_heads=32,
+        head_dim=128,
+        block_size=64,
+        device="cpu",
+        **shape,
+    )
+    expected = _torch_composite(operands, **shape)
+    _check_first_request(torch, operands, expected, **shape)
+    expected[0, 3] += 1.0
+    with pytest.raises(KernelLaunchFailed, match="disagrees with the Torch composite"):
+        _check_first_request(torch, operands, expected, **shape)
 
 
 def test_deepgemm_entry_rejects_invalid_args_before_framework_loading(monkeypatch):

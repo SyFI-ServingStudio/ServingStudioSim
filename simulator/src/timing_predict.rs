@@ -39,7 +39,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -54,6 +54,7 @@ use crate::arch::contract::{
 use crate::arch::{AttnArchSel, FfnArchSel, IterArchSel};
 use crate::common::{Time, WorkerId};
 use crate::deployment::BackendOverrides;
+use crate::timing::bridge::write_config_records;
 use crate::timing::{CostManifestDoc, PerfApiBridge};
 use crate::worker::CostBuffers;
 
@@ -322,13 +323,46 @@ impl SpeculativePredictGroup {
     }
 }
 
+/// How `run_timing_predict` treats the cases once they are validated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PredictMode {
+    /// Cost every case, JIT-profiling missing rows, and write the artifacts.
+    Run,
+    /// Build the model on the dry-run bridge and validate every case, then report
+    /// the `profile.db` specs a real run would JIT. Evaluates nothing and writes
+    /// nothing, so it needs no GPU.
+    DryRun,
+}
+
 /// Entry point for `simulator timing-predict <config>` — the generalized tool.
 /// Dispatches on the arch kind: `iter` drives [`CostBuffers::run_iter`];
 /// `attn` / `ffn` build the AFD layer-wise model and drive the per-section evals
 /// through [`CostBuffers::run_section`].
-pub fn run_timing_predict(config_path: &Path) -> Result<()> {
+///
+/// Every case is lowered and checked against the model before the first one is
+/// costed, so a bad case fails the run before any row is written.
+///
+/// `kernel_configs_out` names a file to write, on success, every kernel config
+/// the model asks profile.db for (see `simulator build-cache-only
+/// --kernel-configs-out`).
+pub fn run_timing_predict(
+    config_path: &Path,
+    mode: PredictMode,
+    kernel_configs_out: Option<&Path>,
+) -> Result<()> {
     let cfg: PredictConfig = parse_config_file(config_path)?;
-    let bridge = predict_bridge()?;
+    let bridge = match mode {
+        PredictMode::Run => predict_bridge()?,
+        PredictMode::DryRun => {
+            let bridge = PerfApiBridge::new().context("starting the PyO3 perf_api bridge")?;
+            bridge.enable_dry_run();
+            bridge
+        }
+    };
+    if kernel_configs_out.is_some() {
+        bridge.enable_config_records();
+    }
+    let run = mode == PredictMode::Run;
 
     // Cases are loaded per arch family — each arch owns its own case type, so we do
     // not assume a shared shape: iter/attn take the attention-shaped [`PredictCase`];
@@ -340,8 +374,11 @@ pub fn run_timing_predict(config_path: &Path) -> Result<()> {
             let model = build_iter_model(sel, &cfg.gpu, UNIFIED_MODEL_NAME, &bridge)
                 .context("building the iter-wise arch model")?;
             let cases: Vec<PredictCase> = load_cases(&cfg.cases_file, config_path)?;
-            let n = cases.len();
-            run_iter_cases(&*model, cases, &cfg.log_dir)?;
+            let inputs = iter_inputs(&*model, cases)?;
+            let n = inputs.len();
+            if run {
+                run_iter_cases(&*model, inputs, &cfg.log_dir);
+            }
             (n, model.gpus_per_replica())
         }
         PredictArchSel::SpeculativeIter(sel) => {
@@ -350,27 +387,43 @@ pub fn run_timing_predict(config_path: &Path) -> Result<()> {
                 build_speculative_iter_model(sel, &cfg.gpu, UNIFIED_MODEL_NAME, &bridge)
                     .context("building the speculative iter-wise model")?;
             let cases: Vec<SpeculativePredictCase> = load_cases(&cfg.cases_file, config_path)?;
-            let n = cases.len();
-            run_speculative_iter_cases(&*model, draft_tokens, cases, &cfg.log_dir)?;
+            let inputs = speculative_iter_inputs(&*model, draft_tokens, cases)?;
+            let n = inputs.len();
+            if run {
+                run_speculative_iter_cases(&*model, inputs, &cfg.log_dir);
+            }
             (n, model.gpus_per_replica())
         }
         PredictArchSel::Attn(sel) => {
             let _scope = bridge.with_backend_overrides("attn", cfg.backends.get("attn"));
             let model = build_attn_model(sel, &cfg.gpu, AFD_MODEL_NAME, &bridge)?;
             let cases: Vec<PredictCase> = load_cases(&cfg.cases_file, config_path)?;
-            let n = cases.len();
-            run_attn_cases(&*model, cases, &cfg.log_dir)?;
+            let inputs = attn_inputs(&*model, cases)?;
+            let n = inputs.len();
+            if run {
+                run_attn_cases(&*model, inputs, &cfg.log_dir);
+            }
             (n, model.gpus_per_replica())
         }
         PredictArchSel::Ffn(sel) => {
             let _scope = bridge.with_backend_overrides("ffn", cfg.backends.get("ffn"));
             let model = build_ffn_model(sel, &cfg.gpu, AFD_MODEL_NAME, &bridge)?;
             let cases: Vec<FfnArchInput> = load_cases(&cfg.cases_file, config_path)?;
+            check_ffn_cases(&*model, &cases)?;
             let n = cases.len();
-            run_ffn_cases(&*model, cases, &cfg.log_dir)?;
+            if run {
+                run_ffn_cases(&*model, cases, &cfg.log_dir);
+            }
             (n, model.gpus_per_replica())
         }
     };
+    if let Some(path) = kernel_configs_out {
+        write_config_records(path, &bridge.take_config_records())?;
+    }
+    if !run {
+        print_dry_run(&bridge, num_cases, gpu_count);
+        return Ok(());
+    }
     write_prediction_provenance(&cfg.log_dir, &cfg.gpu, gpu_count)?;
 
     tracing::info!(
@@ -378,6 +431,25 @@ pub fn run_timing_predict(config_path: &Path) -> Result<()> {
         "timing-predict wrote {num_cases} case(s)"
     );
     Ok(())
+}
+
+/// The dry-run report: the cases that validated, then one line per kernel with
+/// the specs `profile.db` lacks (what a real run would JIT-profile).
+fn print_dry_run(bridge: &PerfApiBridge, num_cases: usize, gpu_count: u16) {
+    let report = bridge.take_dry_run_report();
+    let total_missing: usize = report.iter().map(|k| k.missing).sum();
+    let total_specs: usize = report.iter().map(|k| k.total).sum();
+    println!("timing-predict dry run: {num_cases} case(s) valid, {gpu_count} GPU(s) per replica");
+    for k in &report {
+        println!(
+            "  {:<40} ({:<16}) {:>8} / {:<8} missing",
+            k.name, k.kind, k.missing, k.total
+        );
+    }
+    println!(
+        "total: {total_missing} / {total_specs} specs missing across {} kernels to JIT",
+        report.len()
+    );
 }
 
 fn write_prediction_provenance(log_dir: &Path, gpu_name: &str, gpu_count: u16) -> Result<()> {
@@ -404,7 +476,7 @@ mod provenance_tests {
     use serde_json::Value;
     use tempfile::tempdir;
 
-    use super::{PREDICTION_PROVENANCE_FILE, write_prediction_provenance};
+    use super::{write_prediction_provenance, PREDICTION_PROVENANCE_FILE};
 
     #[test]
     fn prediction_provenance_preserves_l4_gpu_extent() {
@@ -441,14 +513,41 @@ fn predict_bridge() -> Result<PerfApiBridge> {
     Ok(bridge)
 }
 
-/// Run the iter-wise cases: one [`CostBuffers::run_iter`] per case (one parquet row
-/// each, `section = "iter"`). Lays cases back-to-back on the wall-clock axis.
-fn run_iter_cases(
+/// Lower the iter-wise cases to the model's input, checking each against it.
+fn iter_inputs(
     model: &dyn IterwiseUnifiedModel,
     cases: Vec<PredictCase>,
-    log_dir: &Path,
-) -> Result<()> {
+) -> Result<Vec<UnifiedArchInput>> {
     let expected_groups = model.num_attn_dp_groups() as usize;
+    cases
+        .into_iter()
+        .enumerate()
+        .map(|(idx, case)| {
+            // Mirror `UnifiedIterExecution`: exact ragged EP source sizes are a
+            // model-declared input capability, derived from the same DP groups.
+            let groups = case
+                .into_groups(expected_groups)
+                .with_context(|| format!("case {idx}"))?;
+            let tokens_per_source_rank = if groups.len() > 1 {
+                groups.iter().map(|group| group.batch_tokens).collect()
+            } else {
+                Vec::new()
+            };
+            let input = UnifiedArchInput {
+                groups,
+                tokens_per_source_rank,
+            };
+            model
+                .check_input(&input)
+                .map_err(|reason| anyhow!("case {idx}: {reason}"))?;
+            Ok(input)
+        })
+        .collect()
+}
+
+/// Run the iter-wise cases: one [`CostBuffers::run_iter`] per case (one parquet row
+/// each, `section = "iter"`). Lays cases back-to-back on the wall-clock axis.
+fn run_iter_cases(model: &dyn IterwiseUnifiedModel, inputs: Vec<UnifiedArchInput>, log_dir: &Path) {
     // The shared `CostBuffers` bundle every iter-wise worker carries: it owns the
     // eval scratch + the cost_log writer (pool_tag "predict", worker 0) and per
     // case runs `eval_iter_with_inputs` and writes one byte-identical parquet row.
@@ -460,38 +559,60 @@ fn run_iter_cases(
         1.0, // predict = pure building-block cost; no inter-kernel overhead
     );
     let mut now = Time::from_ms(0.0);
-    for (idx, case) in cases.into_iter().enumerate() {
-        // Mirror `UnifiedIterExecution`: exact ragged EP source sizes are a
-        // model-declared input capability, derived from the same DP groups.
-        let groups = case
-            .into_groups(expected_groups)
-            .with_context(|| format!("case {idx}"))?;
-        let tokens_per_source_rank = if groups.len() > 1 {
-            groups.iter().map(|group| group.batch_tokens).collect()
-        } else {
-            Vec::new()
-        };
-        let arch_input = UnifiedArchInput {
-            groups,
-            tokens_per_source_rank,
-        };
-        now += cost.run_iter(model, &arch_input, idx as u64, now);
+    for (idx, arch_input) in inputs.iter().enumerate() {
+        now += cost.run_iter(model, arch_input, idx as u64, now);
     }
     // Flush the writer's tail + join on drop (`CostLogger`'s `Drop`), same as a
     // worker at sim end; force it before reporting success.
     drop(cost);
-    Ok(())
+}
+
+/// Lower the draft/verify cases to the model's input, checking each against it.
+fn speculative_iter_inputs(
+    model: &dyn SpeculativeUnifiedModel,
+    draft_tokens: u32,
+    cases: Vec<SpeculativePredictCase>,
+) -> Result<Vec<SpeculativeArchInput>> {
+    let query_width = draft_tokens
+        .checked_add(1)
+        .context("verify width overflows u32")?;
+    cases
+        .into_iter()
+        .enumerate()
+        .map(|(index, case)| {
+            ensure!(
+                case.groups.len() == usize::from(model.num_attn_dp_groups()),
+                "case {index}: group count does not match speculative model"
+            );
+            let groups: Vec<_> = case
+                .groups
+                .into_iter()
+                .map(|group| group.into_arch_group(query_width, model.max_model_len()))
+                .collect::<Result<_>>()
+                .with_context(|| format!("case {index}"))?;
+            let tokens_per_source_rank = if groups.len() > 1 {
+                groups.iter().map(|group| group.batch_tokens).collect()
+            } else {
+                Vec::new()
+            };
+            let input = SpeculativeArchInput {
+                draft_tokens,
+                groups,
+                tokens_per_source_rank,
+            };
+            model
+                .check_input(&input)
+                .map_err(|reason| anyhow!("case {index}: {reason}"))?;
+            Ok(input)
+        })
+        .collect()
 }
 
 fn run_speculative_iter_cases(
     model: &dyn SpeculativeUnifiedModel,
-    draft_tokens: u32,
-    cases: Vec<SpeculativePredictCase>,
+    inputs: Vec<SpeculativeArchInput>,
     log_dir: &Path,
-) -> Result<()> {
-    let query_width = draft_tokens
-        .checked_add(1)
-        .context("verify width overflows u32")?;
+) {
     let mut cost = CostBuffers::new(
         Some(log_dir.to_path_buf()),
         PREDICT_POOL_TAG,
@@ -500,43 +621,35 @@ fn run_speculative_iter_cases(
         1.0,
     );
     let mut now = Time::from_ms(0.0);
-    for (index, case) in cases.into_iter().enumerate() {
-        ensure!(
-            case.groups.len() == usize::from(model.num_attn_dp_groups()),
-            "case {index}: group count does not match speculative model"
-        );
-        let groups: Vec<_> = case
-            .groups
-            .into_iter()
-            .map(|group| group.into_arch_group(query_width, model.max_model_len()))
-            .collect::<Result<_>>()
-            .with_context(|| format!("case {index}"))?;
-        let tokens_per_source_rank = if groups.len() > 1 {
-            groups.iter().map(|group| group.batch_tokens).collect()
-        } else {
-            Vec::new()
-        };
-        let input = SpeculativeArchInput {
-            draft_tokens,
-            groups,
-            tokens_per_source_rank,
-        };
-        now += cost.run_speculative_iter(model, &input, index as u64, now);
+    for (index, input) in inputs.iter().enumerate() {
+        now += cost.run_speculative_iter(model, input, index as u64, now);
     }
     drop(cost);
-    Ok(())
+}
+
+/// Lower the AFD attn-side cases to the model's input, checking each against it.
+fn attn_inputs(
+    model: &dyn AttnLayerwiseModel,
+    cases: Vec<PredictCase>,
+) -> Result<Vec<AttnArchInput>> {
+    let expected_groups = model.num_attn_dp_groups() as usize;
+    cases
+        .into_iter()
+        .enumerate()
+        .map(|(idx, case)| {
+            let groups = case
+                .into_groups(expected_groups)
+                .with_context(|| format!("case {idx}"))?;
+            Ok(AttnArchInput { groups })
+        })
+        .collect()
 }
 
 /// Run the AFD attn-side cases: one `attn_cost` per case (`section = "attn"`,
 /// `layer = 0` — every layer sees the same batch within an iteration, so the
 /// per-layer cost is homogeneous). One model instance = one DP shard, so each
 /// case carries exactly one group.
-fn run_attn_cases(
-    model: &dyn AttnLayerwiseModel,
-    cases: Vec<PredictCase>,
-    log_dir: &Path,
-) -> Result<()> {
-    let expected_groups = model.num_attn_dp_groups() as usize;
+fn run_attn_cases(model: &dyn AttnLayerwiseModel, inputs: Vec<AttnArchInput>, log_dir: &Path) {
     let manifest = model.cost_log_manifest();
     let mut cost = CostBuffers::new(
         Some(log_dir.to_path_buf()),
@@ -546,11 +659,7 @@ fn run_attn_cases(
         1.0, // predict = pure building-block cost; no inter-kernel overhead
     );
     let mut now = Time::from_ms(0.0);
-    for (idx, case) in cases.into_iter().enumerate() {
-        let groups = case
-            .into_groups(expected_groups)
-            .with_context(|| format!("case {idx}"))?;
-        let input = AttnArchInput { groups };
+    for (idx, input) in inputs.iter().enumerate() {
         let seg = cost.run_section(
             "attn",
             0,
@@ -560,14 +669,13 @@ fn run_attn_cases(
             None,
             now,
             |slots, scratch, inputs| match inputs {
-                Some(i) => model.attn_cost_with_inputs(0, &input, slots, scratch, i),
-                None => model.attn_cost(0, &input, slots, scratch),
+                Some(i) => model.attn_cost_with_inputs(0, input, slots, scratch, i),
+                None => model.attn_cost(0, input, slots, scratch),
             },
         );
         now += seg;
     }
     drop(cost);
-    Ok(())
 }
 
 /// Run the AFD ffn-side cases: emit the per-section building blocks of one
@@ -581,12 +689,7 @@ fn run_attn_cases(
 /// type and no lowering — the ffn cost reads the token counts directly. This is the
 /// deliberate counterpoint to the iter/attn drivers' shared attention-shaped case:
 /// each arch's case→input matches the shape its cost actually depends on.
-fn run_ffn_cases(
-    model: &dyn FfnLayerwiseModel,
-    cases: Vec<FfnArchInput>,
-    log_dir: &Path,
-) -> Result<()> {
-    let expected_groups = model.num_dp_groups() as usize;
+fn run_ffn_cases(model: &dyn FfnLayerwiseModel, cases: Vec<FfnArchInput>, log_dir: &Path) {
     let num_layers = model.num_layers();
     let last = num_layers.saturating_sub(1) as usize;
     let manifest = model.cost_log_manifest();
@@ -599,11 +702,6 @@ fn run_ffn_cases(
     );
     let mut now = Time::from_ms(0.0);
     for (idx, input) in cases.into_iter().enumerate() {
-        ensure!(
-            input.tokens_per_group.len() == expected_groups,
-            "ffn case {idx} has {} group(s) but the model expects {expected_groups} (num_dp_groups)",
-            input.tokens_per_group.len(),
-        );
         let iid = idx as u64;
 
         // prologue (embedding), once per iteration.
@@ -692,6 +790,18 @@ fn run_ffn_cases(
         now += seg;
     }
     drop(cost);
+}
+
+/// Check each ffn case's group count against the model.
+fn check_ffn_cases(model: &dyn FfnLayerwiseModel, cases: &[FfnArchInput]) -> Result<()> {
+    let expected_groups = model.num_dp_groups() as usize;
+    for (idx, input) in cases.iter().enumerate() {
+        ensure!(
+            input.tokens_per_group.len() == expected_groups,
+            "ffn case {idx} has {} group(s) but the model expects {expected_groups} (num_dp_groups)",
+            input.tokens_per_group.len(),
+        );
+    }
     Ok(())
 }
 
@@ -841,6 +951,48 @@ mod tests {
         // Model expects 2 DP shards but the case gave 1.
         let err = case.into_groups(2).unwrap_err().to_string();
         assert!(err.contains("expects 2"), "got: {err}");
+    }
+
+    #[test]
+    fn model_rejection_names_the_case_before_any_eval() {
+        use crate::timing::LeafMetrics;
+
+        struct ContextCapped(crate::test_helpers::FakeModel);
+        impl IterwiseUnifiedModel for ContextCapped {
+            fn check_input(&self, batch: &UnifiedArchInput) -> Result<(), String> {
+                match batch.groups[0].decode_kv_lens.iter().max() {
+                    Some(&context) if context > 8192 => {
+                        Err(format!("context {context} exceeds max_model_len 8192"))
+                    }
+                    _ => Ok(()),
+                }
+            }
+            fn eval_iter(
+                &self,
+                _batch: &UnifiedArchInput,
+                _slots: &mut Vec<LeafMetrics>,
+                _scratch: &mut Vec<LeafMetrics>,
+            ) -> LeafMetrics {
+                unreachable!("a rejected case must not be costed")
+            }
+            fn total_kv_bytes_per_token(&self) -> u64 {
+                self.0.total_kv_bytes_per_token()
+            }
+            fn gpus_per_replica(&self) -> u16 {
+                self.0.gpus_per_replica()
+            }
+            fn num_attn_dp_groups(&self) -> u16 {
+                self.0.num_attn_dp_groups()
+            }
+        }
+        let cases: Vec<PredictCase> = serde_json::from_str(
+            r#"[{"groups": [{"decode_kv_lens": [8192]}]},
+                {"groups": [{"decode_kv_lens": [16384]}]}]"#,
+        )
+        .unwrap();
+        let model = ContextCapped(crate::test_helpers::FakeModel::for_ms(1.0));
+        let err = iter_inputs(&model, cases).unwrap_err().to_string();
+        assert_eq!(err, "case 1: context 16384 exceeds max_model_len 8192");
     }
 
     #[test]

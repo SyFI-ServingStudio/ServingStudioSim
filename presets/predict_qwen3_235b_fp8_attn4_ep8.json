@@ -1,0 +1,16 @@
+{
+  "arch": {
+    "iter": {
+      "attn_tp_size": 4,
+      "ep_size": 8,
+      "fp8": true,
+      "hp_size": 1,
+      "model_config": "model/config/qwen3_235b_fp8.json",
+      "nvl_num_gpu": 8,
+      "type": "qwen3_moe_fp8_dp_attn_ep_ffn"
+    }
+  },
+  "gpu": "NVIDIA H200",
+  "log_dir": "logs/predict_qwen3_235b_fp8_attn4_ep8",
+  "cases_file": "predict_qwen3_235b_fp8_attn4_ep8_cases.json"
+}

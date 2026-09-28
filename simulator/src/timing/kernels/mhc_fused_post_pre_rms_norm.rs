@@ -1,8 +1,8 @@
-//! DeepSeek fused MHC post/pre block with fused RMSNorm.
+//! Fused mHC post/pre block with fused RMSNorm.
 //!
 //! Backends share the args and the per-token work (see the Python kind):
-//! `vllm_tilelang` is DeepSeek V4's TileLang call, and `deepgemm_mega` is
-//! DeepSeek-V4.1's one-launch DeepGEMM `mega_mhc` with the shifted collapse.
+//! `vllm_tilelang` is vLLM's TileLang call, and `deepgemm_mega` is the
+//! one-launch DeepGEMM `mega_mhc` with the shifted collapse.
 //!
 //! `deepgemm_mega` picks its K-split count on the host from `num_tokens`. On
 //! B200 at hidden 5120 it measured 40 splits up to T=192, 27 up to T=320, 20 up
@@ -27,6 +27,22 @@ use crate::timing::kernels::mhc_pre_rms_norm::{
 };
 use crate::timing::sweep::{Axis, SweepGrid};
 
+/// Grid for the fused boundary: the shared mHC token grid plus T=17.
+///
+/// vLLM's `mhc_fused_post_pre_tilelang` switches launch path at
+/// `num_tokens <= 16` (2 launches: small-FMA fused + big_fuse) versus
+/// T > 16 (3 launches: post + tf32 prenorm GEMM + big_fuse). The switch is a
+/// ~+2.2 us step (B200: 10.25 us at T=16, 12.46 us at T=17). Without T=17 the
+/// 1D linear cache interpolates 17..31 across the step and under-predicts
+/// T=17 by ~17%. T=16 and T=17 bracket the step exactly.
+fn tilelang_sweep_grid() -> SweepGrid {
+    SweepGrid::new(vec![Axis::chain([
+        Axis::pow2(0, 4),
+        Axis::values([17]),
+        Axis::token_axis(),
+    ])])
+}
+
 const DEEPGEMM_MEGA: &str = "deepgemm_mega";
 
 /// Last token count of each `mega_mhc` K-split specialization (40/27/20), the
@@ -44,10 +60,11 @@ const DEEPGEMM_MEGA_WAVE_POINTS: [u32; 14] = [
 
 /// The shared MHC token grid, plus the K-split and wave points when
 /// `deepgemm_mega` is a candidate. Only that backend's configs get the extra
-/// rows; `vllm_tilelang` runs on H200 only and never shares a config with it.
+/// rows. Other backends use `tilelang_sweep_grid`. The `deepgemm_mega` rows were
+/// measured on the shared mHC grid, without the TileLang T=17 point.
 fn fused_sweep_grid(config: &MhcRmsNormKernelConfig) -> SweepGrid {
     if !config.backends.contains(&DEEPGEMM_MEGA) {
-        return sweep_grid();
+        return tilelang_sweep_grid();
     }
     let base = sweep_grid();
     let mut axis = Axis::chain([
@@ -91,7 +108,7 @@ mod tests {
     use super::MhcFusedPostPreRmsNormSpec;
     use crate::timing::bridge::DType;
     use crate::timing::kernels::engine::KernelSpec;
-    use crate::timing::kernels::mhc_pre_rms_norm::{sweep_grid, MhcRmsNormKernelConfig};
+    use crate::timing::kernels::mhc_pre_rms_norm::MhcRmsNormKernelConfig;
 
     fn config(backend: &'static str, gpu: &str, hidden: u32) -> MhcRmsNormKernelConfig {
         MhcRmsNormKernelConfig {
@@ -140,11 +157,34 @@ mod tests {
         assert_eq!(p.fields()["hidden_size"], 5120);
     }
 
-    /// Catches the K-split points leaking into DeepSeek V4's TileLang config,
-    /// whose profiled rows would then read as missing.
+    /// Catches the K-split points leaking into the TileLang config, whose
+    /// profiled rows would then read as missing.
     #[test]
-    fn vllm_tilelang_keeps_the_shared_grid() {
+    fn vllm_tilelang_keeps_its_own_grid() {
         let cfg = config("vllm_tilelang", "NVIDIA H200", 4096);
-        assert_eq!(MhcFusedPostPreRmsNormSpec::sweep_grid(&cfg), sweep_grid());
+        assert_eq!(
+            MhcFusedPostPreRmsNormSpec::sweep_grid(&cfg),
+            super::tilelang_sweep_grid()
+        );
+    }
+
+    /// Catches losing the grid points that bracket the T<=16 / T>16 launch
+    /// path switch, which would make the cache interpolate across the step.
+    #[test]
+    fn sweep_brackets_the_small_fma_path_switch() {
+        let config = config("vllm_tilelang", "NVIDIA B200", 4096);
+        let payloads = MhcFusedPostPreRmsNormSpec::enumerate(
+            &config,
+            &MhcFusedPostPreRmsNormSpec::sweep_grid(&config),
+            "vllm_tilelang",
+        );
+        let tokens: Vec<u64> = payloads
+            .iter()
+            .map(|p| p.fields()["num_tokens"].as_u64().unwrap())
+            .collect();
+        let i16 = tokens.iter().position(|&t| t == 16).unwrap();
+        assert_eq!(tokens[i16 + 1], 17);
+        assert_eq!(tokens[i16 + 2], 32);
+        assert!(tokens.windows(2).all(|w| w[0] < w[1]));
     }
 }

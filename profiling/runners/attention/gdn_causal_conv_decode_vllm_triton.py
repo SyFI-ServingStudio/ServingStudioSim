@@ -15,7 +15,7 @@ from typing import Any
 from profiling.db.args import DType
 from profiling.profilers.energy import Energy
 from profiling.profilers.timer import Timer
-from profiling.runners.attention._gdn_common import load_required_callable, require_exact_gpu
+from profiling.runners.attention._gdn_common import load_required_callable, require_supported_gpu
 from profiling.runners.attention.gdn_causal_conv_decode_torch import (
     _logical_bytes,
     _semantic_flops,
@@ -31,7 +31,7 @@ _BACKEND = "gdn_causal_conv_decode:vllm_triton"
 _CALLABLE_MODULE = "vllm.model_executor.layers.mamba.ops.causal_conv1d"
 _CALLABLE_NAME = "causal_conv1d_update"
 _KERNEL_NAME = "_causal_conv1d_update_kernel"
-_REQUIRED_GPU = "NVIDIA H200"
+_SUPPORTED_GPUS = frozenset({"NVIDIA H200", "NVIDIA B200"})
 _SUPPORTED_KERNEL_SIZES = frozenset(range(2, 7))
 _OUTPUT_ATOL = 1e-2
 _OUTPUT_RTOL = 1e-2
@@ -115,8 +115,8 @@ def _valid_slot_indices(batch_size: int) -> tuple[int, ...]:
     return tuple(range(1, batch_size + 1))
 
 
-def _require_h200(torch: Any) -> None:
-    require_exact_gpu(torch, backend=_BACKEND, required_gpu=_REQUIRED_GPU)
+def _require_supported_gpu(torch: Any) -> None:
+    require_supported_gpu(torch, backend=_BACKEND, supported_gpus=_SUPPORTED_GPUS)
 
 
 def _load_fused_callable() -> Any:
@@ -241,7 +241,7 @@ def profile_gdn_causal_conv_decode_vllm_triton(
     dtype: DType | str,
     state_dtype: DType | str,
 ) -> ComputeMetrics:
-    """Profile vLLM's fused causal-convolution decode on an NVIDIA H200."""
+    """Profile vLLM's fused causal-convolution decode on NVIDIA H200 or B200."""
     args = _validate_args(batch_size, channels, kernel_size, dtype, state_dtype)
     try:
         import torch
@@ -249,7 +249,7 @@ def profile_gdn_causal_conv_decode_vllm_triton(
         raise ProfilerNotImplemented(f"PyTorch is required for {_BACKEND}") from exc
 
     try:
-        _require_h200(torch)
+        _require_supported_gpu(torch)
         fused_callable = _load_fused_callable()
         device = torch.device("cuda", torch.cuda.current_device())
         operands = _build_operands(torch, args, device=device)

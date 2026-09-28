@@ -7,7 +7,8 @@
       "ep_size": 4,
       "nvl_num_gpu": 4,
       "max_model_len": 8192,
-      "routing": "uniform",
+      "routing": "popularity",
+      "expert_popularity_file": "presets/alignment/glm52_nvfp4_b200/expert_popularity.json",
       "mtp_mode": "off"
     }
   },

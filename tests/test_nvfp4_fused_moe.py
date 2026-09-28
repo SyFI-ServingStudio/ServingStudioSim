@@ -2,8 +2,13 @@ from __future__ import annotations
 
 import pytest
 
+from launcher.backends import dedup_roles, validate_backend_map
+from profiling.db.args import DType
+from profiling.db.batch import coerce_args
+from profiling.db.registry import BackendSupport, known_backends, supported_backends
+from profiling.kernels.nvfp4_fused_moe import KIND, Nvfp4FusedMoeArgs
 from profiling.runners.moe.exact_topk import exact_topk_ids
-from profiling.runners.moe.nvfp4_fused_moe import _logical_bytes
+from profiling.runners.moe.nvfp4_fused_moe import _logical_bytes, _validate_args
 
 
 def test_exact_topk_ids_realize_distinct_expert_counts() -> None:
@@ -75,3 +80,91 @@ def test_logical_bytes_charge_weights_only_for_active_local_experts() -> None:
     assert sum(dense["per_expert_batches"][: dense["num_local_experts"]]) == 128
     extra = _logical_bytes(dense, do_finalize=True) - _logical_bytes(args, do_finalize=True)
     assert extra == 16 * (per_expert_weights + 3 * 4)
+
+
+def test_nvfp4_dtype_round_trips_and_has_no_torch_dtype() -> None:
+    # The wire literal is the profile.db `weight_format` value, unchanged.
+    assert DType("nvfp4_e2m1") is DType.NVFP4_E2M1
+    assert DType.from_value("nvfp4_e2m1") is DType.NVFP4_E2M1
+    assert DType.from_value(DType.NVFP4_E2M1).value == "nvfp4_e2m1"
+    assert DType.NVFP4_E2M1.size_bytes() == 0.5
+    pytest.importorskip("torch")
+    with pytest.raises(ValueError, match="nvfp4_e2m1 is not supported by the torch runner"):
+        DType.NVFP4_E2M1.torch()
+
+
+def test_weight_format_coerces_to_the_nvfp4_dtype() -> None:
+    args = coerce_args(
+        Nvfp4FusedMoeArgs,
+        {
+            **_args(),
+            "input_dtype": "bf16",
+            "weight_format": "nvfp4_e2m1",
+            "group_size": 16,
+            "routing_method": "minimax2",
+            "n_group": 1,
+            "topk_group": 1,
+            "routed_scaling_numerator": 5,
+            "routed_scaling_denominator": 2,
+        },
+    )
+    assert args.weight_format is DType.NVFP4_E2M1
+    assert args.input_dtype is DType.BF16
+
+
+_FP8_BLOCK_BACKEND = "flashinfer_trtllm_fp8_block_sm100"
+_MXFP4_BACKEND = "flashinfer_trtllm_sm100_mxfp4"
+
+
+def test_backends_gate_on_the_weight_format_not_the_bf16_input() -> None:
+    """The Rust config tags weight_format as the compute dtype, so the launcher
+    asks for backends at nvfp4_e2m1 (or fp8_e4m3 for the FP8 block-scale
+    backend, mxfp4_e2m1 for the MXFP4 one). input_dtype (bf16) is only the
+    activation before quantization."""
+    nvfp4 = sorted(set(known_backends(KIND)) - {_FP8_BLOCK_BACKEND, _MXFP4_BACKEND})
+    assert sorted(supported_backends(KIND, DType.NVFP4_E2M1, None, "NVIDIA B200")) == nvfp4
+    assert supported_backends(KIND, DType.FP8_E4M3, None, "NVIDIA B200") == [_FP8_BLOCK_BACKEND]
+    assert supported_backends(KIND, DType.MXFP4_E2M1, None, "NVIDIA B200") == [_MXFP4_BACKEND]
+    assert supported_backends(KIND, DType.BF16, None, "NVIDIA B200") == []
+    assert supported_backends(KIND, DType.NVFP4_E2M1, None, "NVIDIA H200") == []
+    # A backend declared at bf16, as these were before, fails the gate.
+    bf16_only = BackendSupport(compute=frozenset({DType.BF16}), gpus=frozenset({"NVIDIA B200"}))
+    assert not bf16_only.allows(DType.NVFP4_E2M1, None, "NVIDIA B200")
+
+
+def test_launcher_validation_accepts_nvfp4_roles_and_rejects_bf16_ones() -> None:
+    record = {
+        "pool": "main",
+        "name": "unified.moe.experts",
+        "kind": KIND,
+        "gpu": "NVIDIA B200",
+        "compute_dtype": "nvfp4_e2m1",
+        "kv_dtype": None,
+        "config": {},
+        "backends": ["flashinfer_trtllm_sm100"],
+    }
+    (role,) = dedup_roles([record])
+    assert role.compute is DType.NVFP4_E2M1
+    assert set(role.options) == set(known_backends(KIND)) - {_FP8_BLOCK_BACKEND, _MXFP4_BACKEND}
+    backend_map = {"main": {"unified.moe.experts": ["flashinfer_trtllm_sm100"]}}
+    assert validate_backend_map(backend_map, [role]) == []
+    (bf16_role,) = dedup_roles([{**record, "compute_dtype": "bf16"}])
+    errors = validate_backend_map(backend_map, [bf16_role])
+    assert any("unsupported for nvfp4_fused_moe at dtype=bf16" in e for e in errors)
+
+
+def test_runner_accepts_the_nvfp4_weight_format_as_dtype_or_wire_string() -> None:
+    spec = {
+        **_args(),
+        "input_dtype": DType.BF16,
+        "group_size": 16,
+        "routing_method": "minimax2",
+        "n_group": 1,
+        "topk_group": 1,
+        "routed_scaling_numerator": 5,
+        "routed_scaling_denominator": 2,
+    }
+    for weight_format in (DType.NVFP4_E2M1, "nvfp4_e2m1"):
+        assert _validate_args(**spec, weight_format=weight_format)["weight_format"] == "nvfp4_e2m1"
+    with pytest.raises(ValueError, match="nvfp4_e2m1 weights"):
+        _validate_args(**spec, weight_format="int4")

@@ -20,6 +20,9 @@ from profiling.runners.metrics import ComputeMetrics
 
 _NUM_SEQUENCES = 1
 _TOP_K = 2048
+# `top_k_per_row_prefill` instantiates these widths; a kpool indexer selects
+# index_topk / index_kpool pools per row (512 at 2048 / 4).
+_VLLM_TOP_K = frozenset({512, 1024, 2048})
 _LOGITS_DTYPE = DType.FP32
 _INDEX_DTYPE = "int32"
 _SPAN_MODE = "single_causal_tail"
@@ -51,6 +54,7 @@ def _validate_args(
     logits_dtype: DType | str,
     index_dtype: str,
     span_mode: str,
+    allowed_top_k: frozenset[int] = frozenset({_TOP_K}),
 ) -> tuple[int, int, int, int, int, DType, str, str]:
     num_queries = int(num_queries)
     num_keys = int(num_keys)
@@ -67,8 +71,8 @@ def _validate_args(
         raise ValueError(f"num_queries must be <= num_keys, got {num_queries} and {num_keys}")
     if num_sequences != _NUM_SEQUENCES:
         raise ValueError(f"dsa_topk_prefill requires num_sequences=1, got {num_sequences}")
-    if top_k != _TOP_K:
-        raise ValueError(f"dsa_topk_prefill requires top_k=2048, got {top_k}")
+    if top_k not in allowed_top_k:
+        raise ValueError(f"dsa_topk_prefill requires top_k in {sorted(allowed_top_k)}, got {top_k}")
     if logits_row_stride <= 0 or logits_row_stride < num_keys:
         raise ValueError(
             "logits_row_stride must be positive and >= num_keys, "
@@ -130,6 +134,7 @@ def _validate_vllm_args(
         logits_dtype,
         index_dtype,
         span_mode,
+        _VLLM_TOP_K,
     )
     return validated
 

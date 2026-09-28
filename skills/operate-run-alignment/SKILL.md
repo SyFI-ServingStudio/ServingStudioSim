@@ -163,6 +163,13 @@ single-config path below when there is one workload and no matrix.
    emitted CostTree leaf slots before mapping. A cold profile DB may JIT-fill and
    need the matching GPU.
 
+   Preview with `alignment timing-predict <timing_predict.yaml> --dry-run`. It
+   builds the measured cases in a scratch directory, checks each against the
+   model, and prints the `profile.db` specs a real run would JIT. It writes
+   nothing into the bundle. Under `--no-gpu`, `alignment profile` is refused
+   before the engine starts (a `--resume` still runs), and a timing-predict with
+   missing rows fails instead of profiling.
+
    **Do not manually pre-fill the cache for an alignment campaign.** Run
    timing-predict or simulation on the real case inputs and let their ordinary
    `perf_api` lookups JIT-fill the exact demanded shapes. Never invent a broad
@@ -250,13 +257,19 @@ operation.
 | Question | Artifact and field |
 |---|---|
 | Per-iteration total error | `payloads/alignment_iteration_series.json` → `iterations[].delta_ms` / `relative_diff_pct` |
-| Per-iteration, per-operation error | `payloads/alignment_iteration_breakdowns.jsonl` → one iteration record's `operation_summary[]` |
+| Per-iteration, per-operation error | `payloads/alignment_iteration_breakdowns.<sha256>.jsonl.zst` → one iteration record's `operation_summary[]` |
 | Measured physical-kernel detail | The same breakdown record's `measured_kernels[]` |
 | Simulated CostTree-leaf detail | The same breakdown record's `simulated_kernels[]` |
 | Directional mapping gaps | The same breakdown record's `unmapped_measured_ms` / `unmapped_simulated_ms` |
-| Per-stream intervals and reduced occurrences | `payloads/alignment_timeline_iterations.jsonl` |
+| Per-stream intervals and reduced occurrences | `payloads/alignment_timeline_iterations.<sha256>.jsonl.zst` |
 | Mapping decisions and unresolved measured rows | `kernel_sequences_labeled.json` |
 | Whole-analysis aggregates and recommended multiplier | `reports/alignment_iteration_report.json` |
+
+The two `.jsonl.zst` shards hold one zstd frame per iteration. To read one
+iteration, use its `byte_ranges[id]` from the payload's `breakdown_detail` or
+`iteration_detail` and decode that frame; `analyzer/python/common/layout.py`
+`read_sharded_records` does this. To read all of them, `zstd -dc <shard>`
+streams the plain JSONL.
 
 `operation_summary[]` is the direct measured-versus-simulated comparison: it
 contains `measured_ms`, `simulated_ms`, `delta_ms`, and `relative_diff_pct` for
@@ -447,6 +460,7 @@ Terms of the identities:
 | `hidden_same_stream_ms` | Part of the on-path kernel sum covered by an earlier launch on the **same stream** (PDL). This can be `griddepcontrol.wait` residency, i.e. launch latency hidden rather than compute overlapped. |
 | `hidden_cross_stream_ms` | Part covered by a launch on **another stream** (multi-stream overlap). Each hidden stretch is charged to the launch holding the running maximum end, bucketed by that launch's stream (`stream_id`, else track). |
 | `hidden_under_collective_{same,cross}_stream_ms` | Non-synchronizing launch time inside barrier windows on the last-exit rank. It is already inside `collective_ms`, so it is reported and **never subtracted**. Together with the two segment buckets this forms a 2×2 grid: same/cross stream × hidden under compute/collective. |
+| `pdl_wait_under_collective_ms` | Every rank's non-synchronizing launch time that started inside a collective on the **same stream** and before that collective ended: PDL `griddepcontrol.wait` residency behind the all-reduce. Each such launch's start is trimmed to the collective's end (a fully covered launch is dropped) **before** the segment races, so the wait is never busy and cannot make an early rank win a segment. Off the path and not additive, like `collective_skew_ms`. Cross-stream overlap is not trimmed. `hidden_under_collective_*` and the per-kernel `overlap` diagnostic still use the untrimmed launches. |
 | `all_rank_kernel_sum_ms` | Every non-synchronizing launch on every rank. It gives scale only and is not part of any identity. |
 
 Per operation and per kernel:

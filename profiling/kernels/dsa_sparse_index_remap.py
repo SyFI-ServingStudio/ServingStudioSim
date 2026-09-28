@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from profiling.db.args import KernelArgs
+from profiling.db.doc import CUPTI_METHOD, BackendDoc, KernelDoc, arg
 from profiling.db.outlier import BatchOutlierPolicy
 from profiling.db.registry import (
     BackendSupport,
@@ -19,19 +20,64 @@ KIND: str = "dsa_sparse_index_remap"
 
 @dataclass(frozen=True)
 class DsaSparseIndexRemapArgs(KernelArgs):
-    num_queries: int
-    num_requests: int
-    selected_k: int
-    block_size: int
-    max_blocks_per_request: int
-    request_row_counts: str
-    local_span_lengths: str
-    valid_counts: str
-    index_distribution: str
-    page_table_mapping: str
-    workspace_partition: str
-    return_valid_counts: bool
-    index_dtype: str
+    num_queries: int = arg(unit="tokens", doc="Query rows with selected indices.")
+    num_requests: int = arg(unit="requests", doc="Requests represented by the query rows.")
+    selected_k: int = arg(unit="tokens", doc="Index slots scanned per query row.")
+    block_size: int = arg(unit="tokens", doc="Tokens in each KV cache block.")
+    max_blocks_per_request: int = arg(
+        unit="blocks", doc="Block-table entries reserved for each request."
+    )
+    request_row_counts: str = arg(doc="Encoded query-row count for each request.")
+    local_span_lengths: str = arg(doc="Encoded local token span of each query row.")
+    valid_counts: str = arg(doc="Encoded number of valid index slots in each query row.")
+    index_distribution: str = arg(doc="Pattern used to construct local selected indices.")
+    page_table_mapping: str = arg(doc="Pattern used to assign physical cache blocks.")
+    workspace_partition: str = arg(doc="Decode and prefill request split for workspace mapping.")
+    return_valid_counts: bool = arg(doc="Whether to return valid index counts with mapped indices.")
+    index_dtype: str = arg(doc="Element type of local and mapped indices.")
+
+
+DOC = KernelDoc(
+    title="Sparse index remap",
+    summary="Map DSA-selected request-local token indices to cache or prefill-workspace positions.",
+    description=(
+        "The DSA indexer selects positions local to each request; sparse MLA "
+        "attention needs them as slots in the paged KV cache or, for prefill, "
+        "in a workspace. Decode rows go through the block table; prefill rows "
+        "add their local position to the request's workspace start. Invalid "
+        "slots stay -1; when valid counts are returned, each row's valid slots "
+        "are packed to the front in no fixed order. The measurement builds the "
+        "rows, indices and page table from the encoded counts and distribution "
+        "patterns in the arguments."
+    ),
+    category="Attention",
+    subcategory="DSA",
+    formula=(
+        "global = block_table[request, ⌊local / block_size⌋]·block_size + local mod block_size",
+        "workspace = workspace_start + local; invalid slots remain -1",
+        "Q = num_queries; K = selected_k; T = Q·K/128; G = valid decode slots; W = workspace rows",
+        "I_w = 1 if workspace exists, else 0; I_c = 1 if counts are returned, else 0",
+        "logical bytes = 8·Q·K + 4·T + 4·G + I_w·(4·T + 4·W·K/128) + I_c·(4·Q + 8·T)",
+        "GB/s = logical bytes / time",
+    ),
+    default_metric="memory_bandwidth_gbps",
+    method=(
+        f"{CUPTI_METHOD} "
+        "torch counts every launch of its row-chunked composite; vllm_triton "
+        "counts the union of GPU busy intervals, so overlapping launches count "
+        "once. Operand construction and output checks run before timing."
+    ),
+    caveats=(
+        "GB/s assumes 128-slot tiles and includes count-buffer initialization "
+        "and atomic updates when counts are returned; the single-tile native "
+        "path skips both.",
+        "Page tables and local indices follow the chosen patterns; they are not"
+        " captured from serving.",
+        "Only 64-token blocks are accepted, with selected_k = 2048 for torch "
+        "and 2048 or 2176 for vllm_triton.",
+    ),
+    reference="profiling.runners.attention.dsa_sparse_index_remap_reference",
+)
 
 
 register(
@@ -50,6 +96,12 @@ register(
         args_schema=DsaSparseIndexRemapArgs,
         metric_family=MetricFamily.COMPUTE,
         batch_outlier_policy=BatchOutlierPolicy(),
+        doc=BackendDoc(
+            summary=(
+                "A row-chunked PyTorch composite that writes mapped indices into "
+                "preallocated output."
+            )
+        ),
     )
 )
 
@@ -71,5 +123,12 @@ register(
         metric_family=MetricFamily.COMPUTE,
         batch_outlier_policy=BatchOutlierPolicy(),
         subprocess_env="vllm_env",
+        doc=BackendDoc(
+            summary=(
+                "vLLM's triton_convert_req_index_to_global_index wrapper, with "
+                "optional valid-count output."
+            ),
+            url="https://github.com/vllm-project/vllm/blob/main/vllm/v1/attention/backends/mla/sparse_utils.py",
+        ),
     )
 )

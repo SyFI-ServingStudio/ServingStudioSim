@@ -190,6 +190,13 @@ def build_parser(*, prog: str = "python -m profiling") -> argparse.ArgumentParse
     merge_parser.add_argument("--json", action="store_true", help="Emit the report as JSON.")
     merge_parser.set_defaults(command_fn=_cmd_merge_db)
 
+    migrate_parser = subparsers.add_parser(
+        "migrate-db",
+        help="Upgrade a profile.db to this checkout's schema in place, then VACUUM it.",
+    )
+    migrate_parser.add_argument("db", type=Path, help="profile.db to upgrade.")
+    migrate_parser.set_defaults(command_fn=_cmd_migrate_db)
+
     provenance_parser = subparsers.add_parser(
         "audit-provenance",
         help="Find rows whose backend lacks a direct literal registration at its stamp.",
@@ -225,6 +232,17 @@ def _add_common_profile_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--gpu-name", help="DB gpu_name key. Defaults to CUDA device 0 name.")
     parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
+
+
+def _cmd_migrate_db(args: argparse.Namespace) -> int:
+    from profiling.db.migrate import SCHEMA_VERSION, migrate
+
+    before = args.db.stat().st_size
+    upgraded = migrate(args.db)
+    after = args.db.stat().st_size
+    state = "upgraded" if upgraded else "already current"
+    print(f"{args.db}: {state} (schema v{SCHEMA_VERSION}), {before:,} -> {after:,} bytes")
+    return 0
 
 
 def _cmd_merge_db(args: argparse.Namespace) -> int:

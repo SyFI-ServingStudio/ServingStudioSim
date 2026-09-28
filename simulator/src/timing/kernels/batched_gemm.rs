@@ -1,7 +1,7 @@
 //! Production-layout batched GEMMs: one cached perf model per
 //! `(num_batches, n, k, dtype)` config.
 //!
-//! GLM-5.2 Q absorption and V-up use separate kernel instances with singleton
+//! MLA Q absorption and V-up use separate kernel instances with singleton
 //! backend lists and different static `(n, k)` dimensions. DeepSeek-V4.1 `wo_a`
 //! (`deepgemm_mxfp8_einsum_dsv41_wo_a`) is one DeepGEMM MXFP8 grouped einsum
 //! with `num_batches` = local `wo_a` groups, `(n, k) = (1024, 4096)` and
@@ -75,9 +75,9 @@ mod tests {
     use crate::timing::{Dim, SlotInput, SweepCoords};
     use serde_json::Value;
 
-    const Q_BACKEND: &str = "torch_mla_q_absorb_glm52";
+    const Q_BACKEND: &str = "torch_mla_q_absorb";
     const WO_A_BACKEND: &str = "deepgemm_mxfp8_einsum_dsv41_wo_a";
-    const V_BACKEND: &str = "torch_mla_v_up_glm52";
+    const V_BACKEND: &str = "torch_mla_v_up";
 
     fn local_heads() -> Dim {
         Dim::param("num_attention_heads", 64) / Dim::param("attn_tp", 1)

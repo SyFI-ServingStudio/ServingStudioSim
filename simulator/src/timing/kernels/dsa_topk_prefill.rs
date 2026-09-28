@@ -1,4 +1,4 @@
-//! GLM-5.2 DSA prefill top-k kernel.
+//! DSA prefill top-k kernel.
 //!
 //! The cache stays on physical `(num_queries, num_keys)` coordinates and
 //! brackets the observed row-wave, work-tile, and semantic top-k boundaries.

@@ -22,21 +22,22 @@ use crate::arch::model_cfg::ModelCfg;
 use crate::arch::moe_model_cfg::MoeModelCfg;
 use crate::arch::{
     deepseek_v41_vllm, deepseek_v4_vllm, glm52_sglang_nvfp4_tp_dsa_moe, glm52_vllm_dsa_moe,
-    glm52_vllm_nvfp4_dsa_moe, glm53_vllm_nvfp4_dsa_moe_dflash2, llama3_dense, llama3_dense_tp,
-    llama3_dp_attn_tp_ffn, qwen36_local, qwen3_attn_layerwise, qwen3_ffn_moe_layerwise,
-    qwen3_fp8_ffn_moe_layerwise, qwen3_moe_dp_attn_ep_ffn, qwen3_moe_fp8_dp_attn_ep_ffn,
-    qwen3_vllm_moe_dp_attn_ep_ffn, AttnLayerwiseModel, DeepseekV41ModelCfg, DeepseekV41VllmModel,
-    DeepseekV41VllmParallel, DeepseekV4ModelCfg, DeepseekV4VllmModel, DeepseekV4VllmParallel,
-    DenseParallel, DenseTpParallel, Dflash2DraftResolved, DpAttnTpFfnParallel, FfnLayerwiseModel,
-    Glm52ModelCfg, Glm52MtpMode, Glm52SglangNvfp4TpDsaMoeModel, Glm52SglangNvfp4TpDsaMoeParallel,
-    Glm52VllmDsaMoeModel, Glm52VllmDsaMoeParallel, Glm52VllmNvfp4DsaMoeModel,
-    Glm52VllmNvfp4DsaMoeParallel, Glm52VllmNvfp4DsaMoeSpeculativeModel,
-    Glm53VllmNvfp4DsaMoeDflash2Model, IterwiseUnifiedModel, Llama3DenseModel, Llama3DenseTpModel,
-    Llama3DpAttnTpFfnModel, Qwen36LocalModel, Qwen36LocalParallel, Qwen36ModelCfg,
-    Qwen3AttnLayerwiseModel, Qwen3AttnParallel, Qwen3FfnMoeLayerwiseModel, Qwen3FfnMoeParallel,
-    Qwen3Fp8FfnMoeLayerwiseModel, Qwen3Fp8FfnMoeParallel, Qwen3MoeDpAttnEpFfnModel,
-    Qwen3MoeFp8DpAttnEpFfnModel, Qwen3MoeFp8Parallel, Qwen3MoeParallel,
-    Qwen3VllmMoeDpAttnEpFfnModel, Qwen3VllmMoeParallel,
+    glm52_vllm_nvfp4_dsa_moe, glm53_flash_vllm_fp8_kda_dsa_moe, glm53_vllm_nvfp4_dsa_moe_dflash2,
+    llama3_dense, llama3_dense_tp, llama3_dp_attn_tp_ffn, qwen36_local, qwen3_attn_layerwise,
+    qwen3_ffn_moe_layerwise, qwen3_fp8_ffn_moe_layerwise, qwen3_moe_dp_attn_ep_ffn,
+    qwen3_moe_fp8_dp_attn_ep_ffn, qwen3_vllm_moe_dp_attn_ep_ffn, AttnLayerwiseModel,
+    DeepseekV41ModelCfg, DeepseekV41VllmModel, DeepseekV41VllmParallel, DeepseekV4ModelCfg,
+    DeepseekV4VllmModel, DeepseekV4VllmParallel, DenseParallel, DenseTpParallel,
+    Dflash2DraftResolved, DpAttnTpFfnParallel, FfnLayerwiseModel, Glm52ModelCfg, Glm52MtpMode,
+    Glm52SglangNvfp4TpDsaMoeModel, Glm52SglangNvfp4TpDsaMoeParallel, Glm52VllmDsaMoeModel,
+    Glm52VllmDsaMoeParallel, Glm52VllmNvfp4DsaMoeModel, Glm52VllmNvfp4DsaMoeParallel,
+    Glm52VllmNvfp4DsaMoeSpeculativeModel, Glm53FlashModelCfg, Glm53FlashVllmModel,
+    Glm53FlashVllmParallel, Glm53VllmNvfp4DsaMoeDflash2Model, IterwiseUnifiedModel,
+    Llama3DenseModel, Llama3DenseTpModel, Llama3DpAttnTpFfnModel, Qwen36LocalModel,
+    Qwen36LocalParallel, Qwen36ModelCfg, Qwen3AttnLayerwiseModel, Qwen3AttnParallel,
+    Qwen3FfnMoeLayerwiseModel, Qwen3FfnMoeParallel, Qwen3Fp8FfnMoeLayerwiseModel,
+    Qwen3Fp8FfnMoeParallel, Qwen3MoeDpAttnEpFfnModel, Qwen3MoeFp8DpAttnEpFfnModel,
+    Qwen3MoeFp8Parallel, Qwen3MoeParallel, Qwen3VllmMoeDpAttnEpFfnModel, Qwen3VllmMoeParallel,
 };
 use crate::common::Fabric;
 use crate::timing::bridge::DType;
@@ -1203,6 +1204,62 @@ pub fn glm52_vllm_nvfp4_dsa_moe_speculative(
         .context("building speculative B200 GLM-5.2 NVFP4 model (often a missing profile.db row)")
 }
 
+/// Build the B200 GLM-5.3-Flash FP8 KDA/DSA/MoE model (vLLM fork, TP = EP).
+///
+/// The checkpoint's layer schedule is exact, so layer-count overrides are
+/// rejected. Routing is resolved over the 42 routed layers; a corpus captured
+/// with MTP off records exactly those.
+#[allow(clippy::too_many_arguments)]
+pub fn glm53_flash_vllm_fp8_kda_dsa_moe(
+    model_spec: &ModelSpec,
+    tp_size: u16,
+    max_model_len: u32,
+    routing_kind: RoutingKind,
+    routing_seed: Option<u64>,
+    expert_popularity_file: Option<&str>,
+    token_corpus_file: Option<&str>,
+    cudagraph_capture_sizes: &[u32],
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<Glm53FlashVllmModel> {
+    if model_spec.num_layers.is_some() || model_spec.sim_num_layers.is_some() {
+        bail!(
+            "GLM-5.3-Flash architecture rejects num_layers/sim_num_layers overrides; the exact hybrid 45-layer schedule is required"
+        );
+    }
+    anyhow::ensure!(
+        model_spec.fp8,
+        "GLM-5.3-Flash is modeled for its FP8 block checkpoint; set fp8: true"
+    );
+    let model_cfg = Glm53FlashModelCfg::from_json(Path::new(&model_spec.model_config))
+        .context("loading GLM-5.3-Flash config")?;
+    let routed_layers = model_cfg.num_moe_layers();
+    let source = ExpertDemandSource {
+        kind: routing_kind,
+        seed: routing_seed,
+        num_experts: model_cfg.n_routed_experts,
+        experts_per_token: model_cfg.num_experts_per_tok,
+        ep_size: tp_size,
+        expert_popularity_file,
+        token_corpus_file,
+        num_routed_layers: routed_layers,
+    };
+    // Ordinary decode: one row per request, so a verify block is one token.
+    let demand = source.demand(0..routed_layers as usize, 1)?;
+    let parallel = Glm53FlashVllmParallel {
+        tp_size,
+        max_model_len,
+        gpu_name: gpu.to_string(),
+        cudagraph_capture_sizes: cudagraph_capture_sizes.to_vec(),
+    };
+    let configs = glm53_flash_vllm_fp8_kda_dsa_moe::build_configs(&model_cfg, &parallel, &demand)
+        .context("expanding GLM-5.3-Flash architecture configs")?;
+    let resolved = glm53_flash_vllm_fp8_kda_dsa_moe::resolve_configs(&configs);
+    glm53_flash_vllm_fp8_kda_dsa_moe::build(name.to_string(), resolved, bridge)
+        .context("building GLM-5.3-Flash model (often a missing profile.db row)")
+}
+
 /// Build the GLM target graph driven by a DFlash2 block-parallel proposer.
 ///
 /// The draft is a separate dense checkpoint, so its dimensions come from that
@@ -1723,6 +1780,28 @@ pub fn build_iter_model(
             name,
             bridge,
         )?),
+        IterArchSel::Glm53FlashVllmFp8KdaDsaMoe {
+            model,
+            tp_size,
+            max_model_len,
+            routing,
+            routing_seed,
+            expert_popularity_file,
+            token_corpus_file,
+            cudagraph_capture_sizes,
+        } => Box::new(glm53_flash_vllm_fp8_kda_dsa_moe(
+            model,
+            *tp_size,
+            *max_model_len,
+            *routing,
+            *routing_seed,
+            expert_popularity_file.as_deref(),
+            token_corpus_file.as_deref(),
+            cudagraph_capture_sizes,
+            gpu,
+            name,
+            bridge,
+        )?),
         IterArchSel::Glm52VllmNvfp4DsaMoeSpeculative { .. }
         | IterArchSel::Glm53VllmNvfp4DsaMoeDflash2 { .. } => {
             bail!("timing-predict: use arch.speculative_iter for a speculative model")
@@ -1867,6 +1946,286 @@ pub fn build_ffn_model(
             bridge,
         )?),
     })
+}
+
+/// One `#[supported]` combination of an arch, built structure-only.
+#[derive(Debug, serde::Serialize)]
+pub struct SupportedBuild {
+    /// The arch contract, as `list-params` groups providers: `iter_wise`,
+    /// `layer_wise_attn` or `layer_wise_ffn`.
+    pub contract: &'static str,
+    pub arch: String,
+    /// The row's GPU (the group's `gpu`, the profile.db key).
+    pub gpu: String,
+    /// The row's arch params (`model_config` a `model/config/` stem). Params the
+    /// row leaves out took their schema defaults.
+    pub params: serde_json::Map<String, serde_json::Value>,
+    pub gpus_per_replica: Option<u16>,
+    /// The cost tree, in the `cost_manifest/*.json` form; `None` on error.
+    pub cost_manifest: Option<crate::timing::CostManifestDoc>,
+    /// The kernel configs the build asks profile.db for, as the document
+    /// `--kernel-configs-out` writes; only when asked for, and `None` on error.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kernel_configs: Option<serde_json::Value>,
+    pub error: Option<String>,
+}
+
+/// The dotted-leaf prefix a deployment gives its model, which starts every leaf
+/// name and kernel-config role. Supported builds use the deployment's own, as
+/// `timing-predict` does, so their leaves are named as a real run's are.
+const UNIFIED_MODEL_NAME: &str = "unified";
+const AFD_MODEL_NAME: &str = "afd";
+
+/// Build every `#[supported]` combination of every arch on its row's GPU,
+/// structure only ([`PerfApiBridge::structure_only`]: no Python, `profile.db` or
+/// GPU). A combination that fails to parse or build (including a panicking
+/// shape assertion) is returned with its error, not raised.
+pub fn build_supported_archs(kernel_configs: bool) -> Vec<SupportedBuild> {
+    use serde_json::{Map, Value};
+
+    let schema = crate::schema::list_params();
+    let mut out = Vec::new();
+    for (contract, rows) in [
+        ("iter_wise", IterArchSel::SUPPORTED),
+        ("layer_wise_attn", AttnArchSel::SUPPORTED),
+        ("layer_wise_ffn", FfnArchSel::SUPPORTED),
+    ] {
+        for (tag, rows) in rows {
+            for row in *rows {
+                for combo in row.combinations() {
+                    let mut gpu = String::new();
+                    let mut params = Map::new();
+                    for (name, value) in &combo {
+                        if *name == "gpu" {
+                            gpu = value.as_str().unwrap_or_default().to_string();
+                        } else {
+                            params.insert((*name).into(), value.clone());
+                        }
+                    }
+                    // A row names a model config by its `model/config/` stem.
+                    let mut block = params.clone();
+                    if let Some(Value::String(model)) = params.get("model_config") {
+                        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                            .join(format!("model/config/{model}.json"));
+                        block.insert(
+                            "model_config".into(),
+                            path.to_string_lossy().into_owned().into(),
+                        );
+                    }
+                    block.insert("type".into(), (*tag).into());
+                    out.push(build_arch(
+                        &schema,
+                        contract,
+                        tag,
+                        gpu,
+                        params,
+                        block,
+                        kernel_configs,
+                    ));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// One arch block on one GPU, as a run's pool group gives it: the form the
+/// kernel-config registry records each source's groups in.
+/// `supported-cost-trees --archs FILE` reads a list of them.
+#[derive(Debug, Deserialize)]
+pub struct ArchBlock {
+    pub gpu: String,
+    /// `type` and the arch's params, file paths as this process opens them.
+    pub arch: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Build each block structure only, as [`build_supported_archs`] builds a
+/// row's combination: a param the block leaves out takes its schema default.
+/// Each result's `params` is its block without `type`. A block whose tag no
+/// contract provides, or that fails to parse or build, is returned with its
+/// error, not raised.
+pub fn build_arch_blocks(blocks: &[ArchBlock], kernel_configs: bool) -> Vec<SupportedBuild> {
+    let schema = crate::schema::list_params();
+    blocks
+        .iter()
+        .map(|block| {
+            let tag = block
+                .arch
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let mut params = block.arch.clone();
+            params.remove("type");
+            let contract = ["iter_wise", "layer_wise_attn", "layer_wise_ffn"]
+                .into_iter()
+                .find(|c| schema["providers"]["arch"][*c].get(tag).is_some());
+            match contract {
+                Some(contract) => build_arch(
+                    &schema,
+                    contract,
+                    tag,
+                    block.gpu.clone(),
+                    params,
+                    block.arch.clone(),
+                    kernel_configs,
+                ),
+                None => SupportedBuild {
+                    contract: "",
+                    arch: tag.to_string(),
+                    gpu: block.gpu.clone(),
+                    params,
+                    gpus_per_replica: None,
+                    cost_manifest: None,
+                    kernel_configs: None,
+                    error: Some(format!("no arch contract provides {tag:?}")),
+                },
+            }
+        })
+        .collect()
+}
+
+/// Build one arch block of `contract` on `gpu`, every param the block leaves
+/// out at its schema default. `params` is what the result reports.
+fn build_arch(
+    schema: &serde_json::Value,
+    contract: &'static str,
+    tag: &str,
+    gpu: String,
+    params: serde_json::Map<String, serde_json::Value>,
+    block: serde_json::Map<String, serde_json::Value>,
+    kernel_configs: bool,
+) -> SupportedBuild {
+    let mut arch = serde_json::Map::new();
+    let common = schema["arch_common"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let own = schema["providers"]["arch"][contract][tag]["params"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    for param in common.iter().chain(&own) {
+        if let Some(default) = param.get("default") {
+            arch.insert(
+                param["name"].as_str().unwrap_or_default().into(),
+                default.clone(),
+            );
+        }
+    }
+    arch.extend(block);
+    let built = match contract {
+        "iter_wise" => build_selector(
+            arch,
+            &gpu,
+            kernel_configs,
+            |selector: &IterArchSel, gpu, bridge| {
+                // A speculative arch builds a different model type, with its
+                // own tree: the verify pass plus its draft passes.
+                let (gpus, manifest) = match selector {
+                    IterArchSel::Glm52VllmNvfp4DsaMoeSpeculative { .. }
+                    | IterArchSel::Glm53VllmNvfp4DsaMoeDflash2 { .. } => {
+                        let (model, _) = build_speculative_iter_model(
+                            selector,
+                            gpu,
+                            UNIFIED_MODEL_NAME,
+                            bridge,
+                        )?;
+                        (model.gpus_per_replica(), model.cost_log_manifest())
+                    }
+                    _ => {
+                        let model = build_iter_model(selector, gpu, UNIFIED_MODEL_NAME, bridge)?;
+                        (model.gpus_per_replica(), model.cost_log_manifest())
+                    }
+                };
+                Ok((
+                    gpus,
+                    crate::timing::CostManifestDoc::single("iter", manifest),
+                ))
+            },
+        ),
+        "layer_wise_attn" => build_selector(
+            arch,
+            &gpu,
+            kernel_configs,
+            |selector: &AttnArchSel, gpu, bridge| {
+                let model = build_attn_model(selector, gpu, AFD_MODEL_NAME, bridge)?;
+                Ok((model.gpus_per_replica(), model.cost_log_manifest()))
+            },
+        ),
+        _ => build_selector(
+            arch,
+            &gpu,
+            kernel_configs,
+            |selector: &FfnArchSel, gpu, bridge| {
+                let model = build_ffn_model(selector, gpu, AFD_MODEL_NAME, bridge)?;
+                Ok((model.gpus_per_replica(), model.cost_log_manifest()))
+            },
+        ),
+    };
+    let mut supported = SupportedBuild {
+        contract,
+        arch: tag.to_string(),
+        gpu,
+        params,
+        gpus_per_replica: None,
+        cost_manifest: None,
+        kernel_configs: None,
+        error: None,
+    };
+    match built {
+        Ok((gpus_per_replica, manifest, configs)) => {
+            supported.gpus_per_replica = Some(gpus_per_replica);
+            supported.cost_manifest = Some(manifest);
+            supported.kernel_configs = configs;
+        }
+        Err(error) => supported.error = Some(error),
+    }
+    supported
+}
+
+/// Parse `arch` as selector `S` and `build` it on `gpu` with a structure-only
+/// bridge: the replica width, the cost tree and, when asked, the kernel-config
+/// records document. A parse error, build error or panic is the error text.
+fn build_selector<S: serde::de::DeserializeOwned>(
+    arch: serde_json::Map<String, serde_json::Value>,
+    gpu: &str,
+    kernel_configs: bool,
+    build: impl Fn(&S, &str, &PerfApiBridge) -> Result<(u16, crate::timing::CostManifestDoc)>,
+) -> std::result::Result<
+    (
+        u16,
+        crate::timing::CostManifestDoc,
+        Option<serde_json::Value>,
+    ),
+    String,
+> {
+    let selector: S = serde_json::from_value(serde_json::Value::Object(arch))
+        .map_err(|e| format!("config: {e}"))?;
+    let bridge = PerfApiBridge::structure_only();
+    if kernel_configs {
+        bridge.enable_config_records();
+    }
+    let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        build(&selector, gpu, &bridge)
+    }));
+    match built {
+        Ok(Ok((gpus_per_replica, manifest))) => Ok((
+            gpus_per_replica,
+            manifest,
+            kernel_configs.then(|| {
+                crate::timing::bridge::config_records_document(&bridge.take_config_records())
+            }),
+        )),
+        Ok(Err(e)) => Err(format!("{e:#}")),
+        Err(panic) => Err(panic
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
+            .map_or_else(
+                || "build panicked".into(),
+                |message| format!("build panicked: {message}"),
+            )),
+    }
 }
 
 #[cfg(test)]
@@ -2619,5 +2978,120 @@ mod tests {
         // 6 layers * 8 KV heads * 128 * 2 (K and V) * 1 byte, summed over the
         // four attention ranks the heads are sharded across.
         assert_eq!(narrow_bytes, 6 * 8 * 128 * 2);
+    }
+
+    /// Every `#[supported]` combination of an arch builds its cost
+    /// tree, so a row cannot claim a deployment the arch cannot build.
+    #[test]
+    fn every_supported_arch_deployment_builds_its_cost_tree() {
+        let builds = build_supported_archs(false);
+        let failures: Vec<String> = builds
+            .iter()
+            .filter_map(|b| {
+                b.error
+                    .as_ref()
+                    .map(|e| format!("{} {:?}: {e}", b.arch, b.params))
+            })
+            .collect();
+        assert!(
+            failures.is_empty(),
+            "unbuildable #[supported] rows:\n{}",
+            failures.join("\n")
+        );
+        for b in &builds {
+            let doc = b.cost_manifest.as_ref().unwrap();
+            assert!(
+                !doc.sections.is_empty()
+                    && doc.sections.iter().all(|s| !s.manifest.slots.is_empty()),
+                "{}: empty cost tree",
+                b.arch
+            );
+        }
+    }
+
+    /// A supported build names its leaves as a run of its deployment does, so
+    /// its kernel-config roles match the ones runs register.
+    #[test]
+    fn supported_builds_name_leaves_like_their_deployment() {
+        for b in build_supported_archs(false) {
+            let prefix = if b.contract == "iter_wise" {
+                "unified."
+            } else {
+                "afd."
+            };
+            for section in &b.cost_manifest.as_ref().unwrap().sections {
+                for slot in &section.manifest.slots {
+                    assert!(slot.name.starts_with(prefix), "{}: {}", b.arch, slot.name);
+                }
+            }
+        }
+    }
+
+    /// Asked for, each supported build carries the kernel configs it builds, in
+    /// the document `--kernel-configs-out` writes.
+    #[test]
+    fn supported_builds_carry_their_kernel_configs_when_asked() {
+        for b in build_supported_archs(true) {
+            let doc = b.kernel_configs.as_ref().expect("kernel_configs");
+            assert_eq!(
+                doc["schema_version"],
+                crate::timing::bridge::CONFIG_RECORDS_SCHEMA_VERSION
+            );
+            let configs = doc["configs"].as_array().unwrap();
+            assert!(!configs.is_empty(), "{} {:?}: no configs", b.arch, b.params);
+            assert!(configs.iter().all(|c| c["gpu_name"] == b.gpu.as_str()));
+        }
+        assert!(build_supported_archs(false)
+            .iter()
+            .all(|b| b.kernel_configs.is_none()));
+    }
+
+    /// An arch block builds the tree its `#[supported]` combination builds when
+    /// it names the same params, and a param it sets changes the tree: how the
+    /// public API builds a registered run's tree.
+    #[test]
+    fn arch_blocks_build_like_their_supported_combination() {
+        let supported = build_supported_archs(false);
+        let row = supported
+            .iter()
+            .find(|b| b.arch == "glm53_vllm_nvfp4_dsa_moe_dflash2")
+            .expect("a dflash2 row");
+        let mut arch = row.params.clone();
+        let model = arch["model_config"].as_str().unwrap().to_string();
+        arch.insert(
+            "model_config".into(),
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(format!("model/config/{model}.json"))
+                .to_string_lossy()
+                .into_owned()
+                .into(),
+        );
+        arch.insert("type".into(), row.arch.clone().into());
+        let mut short = arch.clone();
+        short.insert("max_model_len".into(), 8192.into());
+        let blocks = [
+            ArchBlock {
+                gpu: row.gpu.clone(),
+                arch: arch.clone(),
+            },
+            ArchBlock {
+                gpu: row.gpu.clone(),
+                arch: short,
+            },
+            ArchBlock {
+                gpu: row.gpu.clone(),
+                arch: [("type".to_string(), "no_such_arch".into())]
+                    .into_iter()
+                    .collect(),
+            },
+        ];
+        let built = build_arch_blocks(&blocks, false);
+        let json = |b: &SupportedBuild| serde_json::to_value(b.cost_manifest.as_ref()).unwrap();
+        assert_eq!(built[0].error, None);
+        assert_eq!(built[0].contract, "iter_wise");
+        assert_eq!(json(&built[0]), json(row));
+        assert_eq!(built[1].params["max_model_len"], 8192);
+        assert_ne!(json(&built[1]), json(row));
+        assert!(built[2].error.as_deref().unwrap().contains("no_such_arch"));
     }
 }

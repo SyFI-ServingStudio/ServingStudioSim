@@ -16,6 +16,7 @@ import sys
 from collections import defaultdict
 from contextlib import closing
 from dataclasses import dataclass
+from functools import cache
 from pathlib import Path
 from typing import Any
 
@@ -117,8 +118,13 @@ def merge_duration_ns(intervals: list[tuple[int, int]]) -> int:
     return total + current_end - current_start
 
 
+@cache
 def kernel_category(name: str) -> str:
-    """Classify one demangled kernel name into the shared coarse taxonomy."""
+    """Classify one demangled kernel name into the shared coarse taxonomy.
+
+    Cached: a capture has ~100 distinct names but millions of launches, and the
+    substring scan per launch was 9% of a 9M-kernel parse.
+    """
     lowered = name.lower()
     if "multimem_all_reduce" in lowered or "cross_device_reduce" in lowered:
         return "multimem_all_reduce"

@@ -1,4 +1,4 @@
-//! GLM-5.2 varlen sparse-MLA prefill over one complete request batch.
+//! Varlen sparse-MLA prefill over one complete request batch.
 //!
 //! Production issues one FlashInfer decode launch for the whole ragged batch.
 //! Keep every request's `(query_rows, context_len)` pair in `Input` and in the

@@ -258,7 +258,9 @@ formed by vLLM from those parallel ranks. Do not hide DP in `extra_args` because
 the device/rank population is part of artifact provenance.
 
 The NSYS pass writes the replay log, server log, NSYS report/SQLite,
-`parsed.json`, the folded label-ready `kernel_sequences.json`, the full-run
+`parsed.json` with its kernel rows in the sibling `parsed.kernels.parquet`
+(schema 6; `alignment/nsys/parsed_io.py` owns the layout and `read_parsed`
+reads any schema), the folded label-ready `kernel_sequences.json`, the full-run
 structured scheduler timeline in `vllm/<name>_metrics.jsonl`, engine-core
 per-request TTFT/TPOT in `vllm/<name>_request_timings.jsonl`, and
 `profile_result.json` beneath `profile/`. `profile_result.replay_result`
@@ -357,7 +359,9 @@ ordinary `engine_text` and its legacy `vllm_text` alias remain unchanged.
 
 Timing prediction is kernel-only, so it reads the simulation **preset**
 (`simulation_preset`), not a completed run — it takes the gpu, arch, and backend
-policy straight from `simulation.yaml`. This lets it run independently of the simulation. The
+policy from `simulation.yaml`, normalized as `launcher sim` normalizes it
+(`backends_file` folded in, schema defaults such as `fp8` filled). This lets it
+run independently of the simulation. The
 builder writes `timing_predict_cases.json`, `timing_predict_case_map.json`,
 `timing_predict_config.json`, and `timing_predict_input_manifest.json`, then the
 launcher invokes the generic timing-predict command. The generated predictor
@@ -532,7 +536,8 @@ totals for `all` and each observed stage:
 `operations` uses the same totals and is ordered by descending absolute-error
 milliseconds. These rows join by semantic operation because measured CUDA
 kernels and simulated L1 slots are not generally one-to-one. The detailed
-physical rows remain in `payloads/alignment_iteration_breakdowns.jsonl`.
+physical rows remain in `payloads/alignment_iteration_breakdowns.<sha256>.jsonl.zst`,
+one zstd frame per iteration (see `analyzer/README.md`).
 
 Compare two completed kernel-align results without reopening either capture:
 
@@ -561,12 +566,21 @@ and cannot override the preset. When adopting a recommendation, record its sourc
 and any cross-workload approximation in the experiment notes and set the value
 in the preset before running. Previously used report-source CLI flags are removed.
 
+A co-located worker (`barebone`, `hp_unified`, `chunked_prefill`,
+`speculative`) may also set `prefill_gpu_time_multiplier` (>= 1.0): iterations
+that carry prefill tokens use it instead of `gpu_time_multiplier`,
+which then applies to decode-only iterations. It is a calibration like the
+main multiplier; the kernel-align pass does not recommend it, so record its
+source with the value (see the GLM-5.3-Flash pack's variant `worker`).
+
 Standalone NSYS normalization remains available as:
 
 ```bash
 uv run python -m alignment parse --sqlite capture.sqlite --metrics metrics.jsonl \
   --iteration-start 24 --iteration-end 48 --output parsed.json
 ```
+
+`--output parsed.json` also writes `parsed.kernels.parquet` beside it.
 
 For concurrency diagnosis, parse only a bounded iteration window directly from
 the SQLite export and decompose raw kernel residency into same-stream PDL
@@ -737,6 +751,12 @@ time is split exactly into `hidden_same_stream_ms` and `hidden_cross_stream_ms`
 by which launch covered it. Every measured kernel row also reports its own
 `overlap` with other launches on the same device (any, same-stream, other-stream),
 and the timeline payload names the overlapping partners per launch.
+A non-synchronizing launch that starts inside a collective on its own stream
+(a PDL dependent parked on `griddepcontrol.wait` while its rank spins in the
+all-reduce) has its start trimmed to that collective's end before the segment
+race. The trimmed residency is `pdl_wait_under_collective_ms`: off the path, like
+`collective_skew_ms`, so an early rank's wait cannot win a segment from the late
+rank. Cross-stream overlap with a collective is real compute and is not trimmed.
 
 **This is measurement, not a cost-model instruction.** It must not be turned into
 a `CostNode::Max`: every `Max` in the simulator

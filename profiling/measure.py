@@ -34,6 +34,7 @@ from profiling.exec.env import (
     resolve_profile_env,
 )
 from profiling.exec.local import _container_worker_command, find_idle_gpus
+from profiling.gpu_policy import require_gpu
 
 
 class MeasureError(RuntimeError):
@@ -71,6 +72,7 @@ def measure_kernel(
     resolved_output_dir = Path(output_dir).resolve()
     resolved_output_dir.mkdir(parents=True, exist_ok=True)
 
+    require_gpu(f"measuring {kernel_kind}:{resolved_backend}")
     idle_gpus = find_idle_gpus()
     if not idle_gpus:
         raise MeasureError("no idle GPU found for measure")
@@ -84,6 +86,7 @@ def measure_kernel(
         spec=spec,
         gpu_index=gpu_index,
         profiler_env=profiler_env,
+        worker_env=dict(profiler_spec.worker_env),
         measure_block={
             "output_dir": str(resolved_output_dir),
             "duration_s": duration_s,
@@ -127,6 +130,7 @@ def _run_worker(
     gpu_index: int,
     profiler_env: ProfileEnv | ContainerProfileEnv,
     measure_block: dict[str, Any],
+    worker_env: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     with tempfile.TemporaryDirectory(prefix="vibesim-measure-") as tmp:
         input_path = Path(tmp) / "input.json"
@@ -148,9 +152,11 @@ def _run_worker(
                 [gpu_index],
                 Path(tmp),
                 additional_volumes=((output_dir, output_dir),),
+                worker_env=worker_env,
             )
         else:
             env = os.environ.copy()
+            env.update(worker_env or {})
             env["CUDA_VISIBLE_DEVICES"] = str(gpu_index)
             env["PYTHONPATH"] = compose_pythonpath(
                 profiler_env,

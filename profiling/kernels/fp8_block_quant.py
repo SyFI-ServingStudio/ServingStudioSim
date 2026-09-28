@@ -18,6 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from profiling.db.args import DType, KernelArgs
+from profiling.db.doc import CUPTI_METHOD, BackendDoc, KernelDoc, arg
 from profiling.db.outlier import BatchOutlierPolicy
 from profiling.db.registry import (
     BackendSupport,
@@ -32,10 +33,46 @@ KIND: str = "fp8_block_quant"
 
 @dataclass(frozen=True)
 class Fp8BlockQuantArgs(KernelArgs):
-    num_tokens: int
-    hidden_size: int
-    num_problems: int
-    input_dtype: DType
+    num_tokens: int = arg(unit="tokens", doc="Routed token rows on this GPU.")
+    hidden_size: int = arg(unit="elements", doc="Elements in each token row.")
+    num_problems: int = arg(unit="experts", doc="Local expert segments in the grouped input.")
+    input_dtype: DType = arg(doc="Element type of the input rows.")
+
+
+DOC = KernelDoc(
+    title="FP8 block quantization",
+    summary="Quantize BF16 expert inputs to FP8 E4M3 in 128-element blocks.",
+    description=(
+        "The input step of the FP8 blockscale grouped GEMM "
+        "(fp8_blockscale_grouped_gemm): each routed row is split into "
+        "128-element blocks, and each block is scaled to FP8 E4M3 with one FP32"
+        " scale. The kernel walks the rows expert by expert, so the measurement"
+        " splits num_tokens into num_problems contiguous segments of near-equal"
+        " size."
+    ),
+    category="Quantization",
+    formula=(
+        "scale = max(abs(block)) / 448, or 1 for an all-zero block",
+        "FP8 block = FP8_E4M3(block / scale)",
+        "GB/s = num_tokens · (hidden_size · (BF16 bytes + FP8 bytes) + "
+        "hidden_size / 128 · FP32 bytes) / time",
+    ),
+    default_metric="memory_bandwidth_gbps",
+    method=(
+        f"{CUPTI_METHOD} "
+        "Only the grouped scale_1x128_kernel launch is counted. FlashInfer does"
+        " not expose this launch on its own, so a local binding launches the "
+        "vendored TensorRT-LLM template directly."
+    ),
+    caveats=(
+        "Segments are near-equal; real routing gives uneven segments for the "
+        "same num_tokens and num_problems.",
+        "GB/s counts logical input, output and scale bytes, without the padding"
+        " of the grouped scale layout.",
+    ),
+    # No separate PyTorch reference implementation exists for this kind.
+    reference=None,
+)
 
 
 register(
@@ -55,5 +92,11 @@ register(
         metric_family=MetricFamily.COMPUTE,
         batch_outlier_policy=BatchOutlierPolicy(),
         subprocess_env="flashinfer_pip_env",
+        doc=BackendDoc(
+            summary=(
+                "TensorRT-LLM's grouped scale_1x128_kernel from the FlashInfer wheel, "
+                "launched alone."
+            ),
+        ),
     )
 )

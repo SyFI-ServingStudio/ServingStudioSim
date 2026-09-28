@@ -1,0 +1,41 @@
+[
+  {
+    "groups": [
+      {
+        "prefill_chunk_pairs": [
+          [
+            0,
+            16384
+          ]
+        ],
+        "decode_kv_lens": []
+      }
+    ]
+  },
+  {
+    "groups": [
+      {
+        "prefill_chunk_pairs": [
+          [
+            0,
+            16384
+          ]
+        ],
+        "decode_kv_lens": []
+      }
+    ]
+  },
+  {
+    "groups": [
+      {
+        "prefill_chunk_pairs": [
+          [
+            0,
+            16384
+          ]
+        ],
+        "decode_kv_lens": []
+      }
+    ]
+  }
+]

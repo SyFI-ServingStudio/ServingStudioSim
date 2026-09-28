@@ -99,6 +99,11 @@ const fn default_glm52_nvfp4_max_model_len() -> u32 {
     1_048_576
 }
 
+/// The captured GLM-5.3-Flash deployment's `--max-model-len`.
+const fn default_glm53_flash_max_model_len() -> u32 {
+    8192
+}
+
 /// A speculative GLM must actually run its MTP layer, so unlike the ordinary
 /// selector it cannot default to `off`.
 const fn default_glm52_speculative_mtp_mode() -> Glm52MtpMode {
@@ -134,22 +139,27 @@ pub enum IterArchSel {
     /// the grouped GEMM's dependence on how many tokens each expert draws: skew
     /// leaves the total token-expert selections unchanged while redistributing
     /// them into fuller and emptier groups.
+    #[supported(gpu = ["NVIDIA H200"], model_config = ["qwen3_6_35b_a3b_fp8"], fp8 = [true])]
     Qwen36Local {
         #[serde(flatten)]
         model: ModelSpec,
         #[serde(default)]
-        #[param(string, default = "uniform", choices = MARGINAL_ROUTING_KINDS)]
+        #[param(string, default = "uniform", choices = MARGINAL_ROUTING_KINDS, set_when_predicting, cache_key)]
         routing: RoutingKind,
         #[serde(default)]
+        #[param(cache_key)]
         routing_seed: Option<u64>,
         #[serde(default)]
         #[param(cache_key)]
         expert_popularity_file: Option<String>,
     },
+    #[supported(gpu = ["NVIDIA H200"], model_config = ["llama3_8b"])]
     Llama3Dense {
         #[serde(flatten)]
         model: ModelSpec,
     },
+    /// Megatron TP over dense Llama 3. `tp_size` must divide the KV heads (8).
+    #[supported(gpu = ["NVIDIA H200"], model_config = ["llama3_8b"], tp_size = [1, 2, 4, 8])]
     Llama3DenseTp {
         #[serde(flatten)]
         model: ModelSpec,
@@ -157,6 +167,7 @@ pub enum IterArchSel {
         #[param(default = 2, cache_key)]
         tp_size: u16,
     },
+    #[supported(gpu = ["NVIDIA H200"], model_config = ["llama3_8b"], attn_tp_size = [4], ffn_tp_size = [8])]
     Llama3DpAttnTpFfn {
         #[serde(flatten)]
         model: ModelSpec,
@@ -169,6 +180,7 @@ pub enum IterArchSel {
         #[param(default = 8, cache_key)]
         ffn_tp_size: u16,
     },
+    #[supported(gpu = ["NVIDIA H200"], model_config = ["qwen3_235b"], attn_tp_size = [4], ep_size = [8, 32], hp_size = [1], nvl_num_gpu = [8])]
     Qwen3MoeDpAttnEpFfn {
         #[serde(flatten)]
         model: ModelSpec,
@@ -193,12 +205,13 @@ pub enum IterArchSel {
         /// Drives the L2 MoE dispatch/combine `BottleneckCurve`
         /// and the L3 grouped-GEMM `local_ppm` shards. Omitted → `uniform`.
         #[serde(default)]
-        #[param(string, default = "uniform", choices = MARGINAL_ROUTING_KINDS)]
+        #[param(string, default = "uniform", choices = MARGINAL_ROUTING_KINDS, set_when_predicting, cache_key)]
         routing: RoutingKind,
         /// Seed for `routing = random` (ignored for `uniform`). Fixed so a run is
         /// reproducible (the throughput golden is bit-identical); vary it to
         /// sample a different random skew.
         #[serde(default)]
+        #[param(cache_key)]
         routing_seed: Option<u64>,
         /// Optional measured expert-popularity JSON. Its all-layer expert
         /// totals replace the synthetic routing distribution and are split
@@ -210,6 +223,9 @@ pub enum IterArchSel {
     },
     /// Native FP8 Qwen recipe: per-token/group quantized dense projections,
     /// DeepGEMM expert kernels, and ServingStudioSim's P2P EP dispatch/combine graph.
+    #[supported(gpu = ["NVIDIA H200"], model_config = ["qwen3_235b_fp8"], fp8 = [true], attn_tp_size = [1, 2, 4], ep_size = [8], hp_size = [1], nvl_num_gpu = [8])]
+    #[supported(gpu = ["NVIDIA H200"], model_config = ["qwen3_235b_fp8"], fp8 = [true], attn_tp_size = [1, 4], ep_size = [4], hp_size = [1], nvl_num_gpu = [4])]
+    #[supported(gpu = ["NVIDIA H200"], model_config = ["qwen3_235b_thinking_2507_fp8"], fp8 = [true], attn_tp_size = [4], ep_size = [4], hp_size = [1], nvl_num_gpu = [4])]
     Qwen3MoeFp8DpAttnEpFfn {
         #[serde(flatten)]
         model: ModelSpec,
@@ -222,9 +238,10 @@ pub enum IterArchSel {
         #[param(default = 8, cache_key)]
         nvl_num_gpu: u16,
         #[serde(default)]
-        #[param(string, default = "uniform", choices = MARGINAL_ROUTING_KINDS)]
+        #[param(string, default = "uniform", choices = MARGINAL_ROUTING_KINDS, set_when_predicting, cache_key)]
         routing: RoutingKind,
         #[serde(default)]
+        #[param(cache_key)]
         routing_seed: Option<u64>,
         #[serde(default)]
         #[param(cache_key)]
@@ -234,6 +251,7 @@ pub enum IterArchSel {
     /// FlashInfer/TensorRT-LLM block-scale expert GEMMs plus local finalize and
     /// an EP all-reduce. The generic Qwen tag above intentionally retains
     /// ServingStudioSim's original DeepGEMM + P2P communication recipe.
+    #[supported(gpu = ["NVIDIA H200"], model_config = ["qwen3_235b_fp8", "qwen3_235b_thinking_2507_fp8"], fp8 = [true], attn_tp_size = [4], ep_size = [4], hp_size = [1], nvl_num_gpu = [4])]
     Qwen3VllmMoeDpAttnEpFfn {
         #[serde(flatten)]
         model: ModelSpec,
@@ -246,9 +264,10 @@ pub enum IterArchSel {
         #[param(default = 8, cache_key)]
         nvl_num_gpu: u16,
         #[serde(default)]
-        #[param(string, default = "uniform", choices = MARGINAL_ROUTING_KINDS)]
+        #[param(string, default = "uniform", choices = MARGINAL_ROUTING_KINDS, set_when_predicting, cache_key)]
         routing: RoutingKind,
         #[serde(default)]
+        #[param(cache_key)]
         routing_seed: Option<u64>,
         #[serde(default)]
         #[param(cache_key)]
@@ -256,13 +275,15 @@ pub enum IterArchSel {
     },
     /// DeepSeek-V4-Flash-0731 at vLLM's physical kernel boundaries. EP4 and
     /// local attention DP4 are checkpoint/deployment invariants.
+    #[supported(gpu = ["NVIDIA H200"], model_config = ["deepseek_v4_flash_0731"], fp8 = [true])]
     DeepseekV4Vllm {
         #[serde(flatten)]
         model: ModelSpec,
         #[serde(default)]
-        #[param(string, default = "uniform", choices = MARGINAL_ROUTING_KINDS)]
+        #[param(string, default = "uniform", choices = MARGINAL_ROUTING_KINDS, set_when_predicting, cache_key)]
         routing: RoutingKind,
         #[serde(default)]
+        #[param(cache_key)]
         routing_seed: Option<u64>,
         #[serde(default)]
         #[param(cache_key)]
@@ -271,13 +292,15 @@ pub enum IterArchSel {
     /// The same physical DeepSeek kernels with each source-level parallel
     /// region serialized. This is an explicit alignment counterfactual, not a
     /// hidden runtime knob on the production selector.
+    #[supported(gpu = ["NVIDIA H200"], model_config = ["deepseek_v4_flash_0731"], fp8 = [true])]
     DeepseekV4VllmSerialStreams {
         #[serde(flatten)]
         model: ModelSpec,
         #[serde(default)]
-        #[param(string, default = "uniform", choices = MARGINAL_ROUTING_KINDS)]
+        #[param(string, default = "uniform", choices = MARGINAL_ROUTING_KINDS, set_when_predicting, cache_key)]
         routing: RoutingKind,
         #[serde(default)]
+        #[param(cache_key)]
         routing_seed: Option<u64>,
         #[serde(default)]
         #[param(cache_key)]
@@ -338,6 +361,8 @@ pub enum IterArchSel {
     },
     /// GLM-5.2's aligned vLLM execution graph with local TP1 attention and
     /// expert parallelism across the replica.
+    #[supported(gpu = ["NVIDIA H200"], model_config = ["glm52_fp8"], fp8 = [true], ep_size = [8], nvl_num_gpu = [8])]
+    #[supported(gpu = ["NVIDIA H200"], model_config = ["glm52"], fp8 = [false], ep_size = [8], nvl_num_gpu = [8])]
     Glm52VllmDsaMoe {
         #[serde(flatten)]
         model: ModelSpec,
@@ -351,10 +376,11 @@ pub enum IterArchSel {
         nvl_num_gpu: u16,
         /// Expert routing distribution used by dispatch/combine.
         #[serde(default)]
-        #[param(string, default = "uniform", choices = MARGINAL_ROUTING_KINDS)]
+        #[param(string, default = "uniform", choices = MARGINAL_ROUTING_KINDS, set_when_predicting, cache_key)]
         routing: RoutingKind,
         /// Seed for `routing = random`; ignored for uniform routing.
         #[serde(default)]
+        #[param(cache_key)]
         routing_seed: Option<u64>,
         /// Optional MTP proposer work: off, full-index step 0, or a later
         /// IndexShare step.
@@ -369,6 +395,8 @@ pub enum IterArchSel {
     },
     /// B200 execution graph for NVIDIA's GLM-5.2 NVFP4 checkpoint. Tensor and
     /// expert parallelism share one rank group, as observed in vLLM.
+    #[supported(gpu = ["NVIDIA B200"], model_config = ["glm52_nvfp4"], ep_size = [4], nvl_num_gpu = [4])]
+    #[supported(gpu = ["NVIDIA B200"], model_config = ["glm52_nvfp4"], ep_size = [8], nvl_num_gpu = [8])]
     Glm52VllmNvfp4DsaMoe {
         #[serde(flatten)]
         model: ModelSpec,
@@ -384,9 +412,10 @@ pub enum IterArchSel {
         #[param(default = 1048576, cache_key)]
         max_model_len: u32,
         #[serde(default)]
-        #[param(string, default = "uniform", choices = ROUTING_KINDS)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS, set_when_predicting, cache_key)]
         routing: RoutingKind,
         #[serde(default)]
+        #[param(cache_key)]
         routing_seed: Option<u64>,
         #[serde(default)]
         #[param(string, default = "off", choices = GLM52_MTP_MODES, cache_key)]
@@ -410,6 +439,8 @@ pub enum IterArchSel {
     /// same one with speculation switched on — the two compile different cost
     /// trees, so nothing can read one's cost log as the other's. It pairs only
     /// with the `speculative` worker.
+    #[supported(gpu = ["NVIDIA B200"], model_config = ["glm52_nvfp4"], ep_size = [4], nvl_num_gpu = [4])]
+    #[supported(gpu = ["NVIDIA B200"], model_config = ["glm52_nvfp4"], ep_size = [8], nvl_num_gpu = [8])]
     Glm52VllmNvfp4DsaMoeSpeculative {
         #[serde(flatten)]
         model: ModelSpec,
@@ -425,9 +456,10 @@ pub enum IterArchSel {
         #[param(default = 1048576, cache_key)]
         max_model_len: u32,
         #[serde(default)]
-        #[param(string, default = "uniform", choices = ROUTING_KINDS)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS, set_when_predicting, cache_key)]
         routing: RoutingKind,
         #[serde(default)]
+        #[param(cache_key)]
         routing_seed: Option<u64>,
         /// The draft layer's own execution mode. `off` is rejected here: a
         /// speculative arch with no MTP layer has nothing to draft with.
@@ -459,6 +491,7 @@ pub enum IterArchSel {
     /// recurrence to fold and the draft forwards `draft_tokens + 1` rows per
     /// request rather than one. It also carries its own dense checkpoint, so it
     /// routes nothing and has no `mtp_mode`.
+    #[supported(gpu = ["NVIDIA B200"], model_config = ["glm53_nvfp4"], ep_size = [4], nvl_num_gpu = [4])]
     Glm53VllmNvfp4DsaMoeDflash2 {
         #[serde(flatten)]
         model: ModelSpec,
@@ -474,9 +507,10 @@ pub enum IterArchSel {
         #[param(default = 1048576, cache_key)]
         max_model_len: u32,
         #[serde(default)]
-        #[param(string, default = "uniform", choices = ROUTING_KINDS)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS, set_when_predicting, cache_key)]
         routing: RoutingKind,
         #[serde(default)]
+        #[param(cache_key)]
         routing_seed: Option<u64>,
         /// Candidate positions drafted per request per iteration. Fixes the
         /// verify width at `draft_tokens + 1`, which selects a profiled kernel
@@ -500,9 +534,47 @@ pub enum IterArchSel {
         #[param(cache_key)]
         token_corpus_file: Option<String>,
     },
+    /// GLM-5.3-Flash FP8 block checkpoint on B200 through the vLLM fork: 34 KDA
+    /// + 11 DSA (kpool indexer) layers, 3 dense + 42 MoE FFNs, 4-wide mHC. One
+    /// TP = EP rank group; MTP is not run.
+    #[supported(gpu = ["NVIDIA B200"], model_config = ["glm53_flash"], fp8 = [true], tp_size = [4], max_model_len = [8192, 65536, 131072, 262144, 524288])]
+    Glm53FlashVllmFp8KdaDsaMoe {
+        #[serde(flatten)]
+        model: ModelSpec,
+        /// Shared tensor/expert-parallel rank count.
+        #[serde(default = "default_glm52_nvfp4_parallel_size")]
+        #[param(default = 4, cache_key)]
+        tp_size: u16,
+        /// Configured context cap: the indexer's logits row stride and the
+        /// sparse-index page-table extent.
+        #[serde(default = "default_glm53_flash_max_model_len")]
+        #[param(default = 8192, cache_key)]
+        max_model_len: u32,
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS, set_when_predicting, cache_key)]
+        routing: RoutingKind,
+        #[serde(default)]
+        #[param(cache_key)]
+        routing_seed: Option<u64>,
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+        /// Recorded per-token expert routes from a `token_corpus` pass, as a
+        /// manifest path. Requires `routing = corpus`.
+        #[serde(default)]
+        #[param(cache_key)]
+        token_corpus_file: Option<String>,
+        /// vLLM `--cudagraph-capture-sizes`. The engine pads an iteration's
+        /// token count up to the next captured size, and every kernel outside
+        /// the attention graph break runs on the padded rows. Empty: no
+        /// padding (eager).
+        #[serde(default)]
+        cudagraph_capture_sizes: Vec<u32>,
+    },
     /// SGLang's B200 NVFP4 launch graph under pure tensor parallelism. Every
     /// rank owns all experts (EP1) and shards the routed intermediate axis by
     /// TP, so there is no expert-parallel or NVLink-domain selector.
+    #[supported(gpu = ["NVIDIA B200"], model_config = ["glm52_nvfp4"], tp_size = [4], max_model_len = [8192, 65536, 131072, 262144, 524288])]
     Glm52SglangNvfp4TpDsaMoe {
         #[serde(flatten)]
         model: ModelSpec,
@@ -512,9 +584,10 @@ pub enum IterArchSel {
         #[param(cache_key)]
         max_model_len: u32,
         #[serde(default)]
-        #[param(string, default = "uniform", choices = ROUTING_KINDS)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS, set_when_predicting, cache_key)]
         routing: RoutingKind,
         #[serde(default)]
+        #[param(cache_key)]
         routing_seed: Option<u64>,
         #[serde(default)]
         #[param(string, default = "off", choices = GLM52_MTP_MODES, cache_key)]
@@ -551,6 +624,7 @@ impl IterArchSel {
             | Self::Glm52VllmNvfp4DsaMoe { model, .. }
             | Self::Glm52VllmNvfp4DsaMoeSpeculative { model, .. }
             | Self::Glm53VllmNvfp4DsaMoeDflash2 { model, .. }
+            | Self::Glm53FlashVllmFp8KdaDsaMoe { model, .. }
             | Self::Glm52SglangNvfp4TpDsaMoe { model, .. } => model,
         }
     }
@@ -962,8 +1036,30 @@ mod iter_tests {
             r#"{"type":"glm52_dsa_moe","model_config":"model/config/glm52.json","fp8":false}"#;
         assert!(serde_json::from_str::<IterArchSel>(raw).is_err());
     }
+
+    /// Expert routing describes the traffic, not the deployment, so its
+    /// `uniform` default is no choice at all: every selector that publishes it
+    /// must say it is set when predicting, and nothing else says so.
+    #[test]
+    fn routing_is_the_only_param_set_when_predicting() {
+        let schemas = [IterArchSel::SCHEMA, AttnArchSel::SCHEMA, FfnArchSel::SCHEMA];
+        let mut routed = 0;
+        for (tag, params) in schemas.iter().flat_map(|schema| schema.iter()) {
+            for param in params.iter() {
+                let routing = param.name == "routing";
+                assert_eq!(param.set_when_predicting, routing, "{tag}.{}", param.name);
+                routed += usize::from(routing);
+                let published = serde_json::to_value(param).unwrap();
+                assert_eq!(
+                    published.get("set_when_predicting"),
+                    routing.then_some(&serde_json::Value::Bool(true)),
+                );
+            }
+        }
+        assert_eq!(routed, 14);
+    }
 }
-// ── layer-wise attn / ffn contract (AFD) ────────────────────────────────────
+// ── layer-wise attn / ffn contract (AFD)────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize, ProviderSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -973,6 +1069,9 @@ pub enum AttnArchSel {
     /// own KV cache and request stream. Data parallelism is the attn pool's
     /// `replicas` (= the unified arch's `ep_size / attn_tp_size`), not an arch
     /// param. Pairs with the `qwen3_ffn_moe` ffn arch.
+    #[supported(gpu = ["NVIDIA H200"], model_config = ["qwen3_235b"], fp8 = [false], attn_tp_size = [2, 4])]
+    #[supported(gpu = ["NVIDIA H200"], model_config = ["qwen3_235b_fp8"], fp8 = [true], attn_tp_size = [2, 4])]
+    #[supported(gpu = ["NVIDIA H200"], model_config = ["qwen3_coder_480b"], fp8 = [true], attn_tp_size = [4])]
     Qwen3AttnTp {
         #[serde(flatten)]
         model: ModelSpec,
@@ -998,6 +1097,7 @@ pub enum FfnArchSel {
     /// layout) + post_norm + router + EP MoE, plus the iteration embed / final_norm
     /// / lm_head. Mirrors the FFN-side cost of the unified `qwen3_moe_dp_attn_ep_ffn`;
     /// pairs with a `qwen3_attn` model whose `fp8` field is false.
+    #[supported(gpu = ["NVIDIA H200"], model_config = ["qwen3_235b"], fp8 = [false], attn_tp_size = [4], ep_size = [8], nvl_num_gpu = [8])]
     Qwen3FfnMoe {
         #[serde(flatten)]
         model: ModelSpec,
@@ -1018,15 +1118,19 @@ pub enum FfnArchSel {
         /// Expert routing distribution: `uniform` (default) or `random` (seeded by
         /// `routing_seed`). Drives the L2 MoE dispatch/combine simulation.
         #[serde(default)]
-        #[param(string, default = "uniform", choices = SYNTHETIC_ROUTING_KINDS)]
+        #[param(string, default = "uniform", choices = SYNTHETIC_ROUTING_KINDS, set_when_predicting, cache_key)]
         routing: RoutingKind,
         /// Seed for `routing = random` (ignored for `uniform`).
         #[serde(default)]
+        #[param(cache_key)]
         routing_seed: Option<u64>,
     },
     /// Native FP8 Qwen3-MoE FFN side. This is a separate provider because its
     /// pre/post projection and lm-head slots are quant+GEMM compound ops. It
     /// pairs with a `qwen3_attn` model whose `fp8` field is true.
+    #[supported(gpu = ["NVIDIA H200"], model_config = ["qwen3_235b_fp8"], fp8 = [true], attn_tp_size = [2, 4], ep_size = [8], nvl_num_gpu = [8])]
+    #[supported(gpu = ["NVIDIA H200"], model_config = ["qwen3_235b_fp8"], fp8 = [true], attn_tp_size = [4], ep_size = [4], nvl_num_gpu = [4])]
+    #[supported(gpu = ["NVIDIA H200"], model_config = ["qwen3_coder_480b"], fp8 = [true], attn_tp_size = [1, 4], ep_size = [8], nvl_num_gpu = [8])]
     Qwen3Fp8FfnMoe {
         #[serde(flatten)]
         model: ModelSpec,
@@ -1037,9 +1141,10 @@ pub enum FfnArchSel {
         #[param(default = 8, cache_key)]
         nvl_num_gpu: u16,
         #[serde(default)]
-        #[param(string, default = "uniform", choices = SYNTHETIC_ROUTING_KINDS)]
+        #[param(string, default = "uniform", choices = SYNTHETIC_ROUTING_KINDS, set_when_predicting, cache_key)]
         routing: RoutingKind,
         #[serde(default)]
+        #[param(cache_key)]
         routing_seed: Option<u64>,
     },
 }

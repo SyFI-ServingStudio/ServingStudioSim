@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from ..nsys.parsed_io import read_parsed
 from .engine_text import build_cases
 
 INPUT_MANIFEST_NAME = "timing_predict_input_manifest.json"
@@ -106,9 +107,9 @@ def build_inputs(request: BuildRequest) -> BuildResult:
         or request.arch["draft_tokens"] != draft_tokens
     ):
         raise ValueError("input_builder.draft_tokens must match explicit arch.draft_tokens")
-    parsed = json.loads(request.parsed_nsys.read_text())
-    if not isinstance(parsed, dict):
-        raise ValueError(f"parsed NSYS root must be a JSON object: {request.parsed_nsys}")
+    # Iteration metrics only: the kernel rows are the bulk of a capture and the
+    # builder never reads one.
+    parsed = read_parsed(request.parsed_nsys, kernels=False)
     cases, case_map, excluded = build_cases(
         parsed,
         request.input_spec.measured_phase,

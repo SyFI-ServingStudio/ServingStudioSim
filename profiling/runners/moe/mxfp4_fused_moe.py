@@ -41,7 +41,7 @@ from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerN
 from profiling.runners.metrics import ComputeMetrics
 from profiling.runners.moe.exact_topk import exact_topk_ids
 
-WEIGHT_FORMAT = "mxfp4_ue8m0"
+WEIGHT_FORMAT = DType.MXFP4_E2M1
 GROUP_SIZE = 32
 ROUTING_METHODS = ("precomputed_dsv4",)
 # flashinfer RoutingMethodType.Renormalize: what vLLM passes for pre-routed ids.
@@ -344,7 +344,7 @@ def profile_mxfp4_fused_moe_sm100(
     num_local_experts: int,
     top_k: int,
     input_dtype: DType | str,
-    weight_format: str,
+    weight_format: DType | str,
     group_size: int,
     routing_method: str,
     n_group: int,

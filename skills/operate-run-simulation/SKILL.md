@@ -75,7 +75,8 @@ If the user did not give a name, ask for one before proceeding.
    explicitly requests an analyzer subset, remove any inherited
    `analyze_subjects` key from the copied preset or variants manifest so the
    launcher runs every applicable analyzer subject. Do not add `--no-analyze`
-   to the launch command by default.
+   to the launch command by default. `--no-plot` is also opt-in; see
+   "Plots and `--no-plot`" below.
    For MoE models, select the routing source using the MoE rule below before
    the dry run.
 8. **Dry-run first** — validate + expand without launching, and inspect the run
@@ -246,6 +247,15 @@ user asks, or when the fill must stay off specific cards; say why when you do.
 modeled GPU count comes from the preset's pools, and is never inferred from the
 host.)
 
+### No GPU: `--no-gpu`
+
+`--no-gpu` (or `SERVINGSTUDIO_NO_GPU=1`) guarantees the launcher uses no GPU in
+any mode. Pass it when the user asks, or when the run must stay off the host's
+GPUs. A run over a warm `profile.db` is unchanged. With missing rows, the cache
+prebuild fails before profiling and names the missing count; check coverage
+first with `--cache-report`. Report that failure; do not drop `--no-gpu`
+without asking.
+
 ## Analysis output
 
 Each finished run is auto-analyzed (best-effort — a failure never fails the run)
@@ -254,6 +264,26 @@ its `log_dir`. The full list of analysis **subjects** a run produces and what ea
 one reads and emits is the canonical Subjects catalog in
 `analyzer/README.md` — point there instead of guessing metric names. Selection is
 the optional preset key `analyze_subjects`.
+
+### Plots and `--no-plot`
+
+By default the launcher also renders PNGs: each run's `plots/`, and a sweep's
+aggregate figures in the experiment root's `plots/`. `--no-plot` runs the
+same analysis and writes the same `reports/`, `payloads/` and trace, but
+renders no PNGs at all. The Analyzer UI and `operate-use-analyzer` read
+reports and payloads, not PNGs, so nothing downstream breaks.
+
+Rendering is the most expensive post-run step. On a 640-run Llama-3-8B sweep
+it took ~22 CPU-s per run against ~3 CPU-s for the simulation, and
+`--no-plot` cut the sweep from 200 s to 92 s. Keep the default for a single
+run or a small sweep. Pass `--no-plot` when the user asks for speed or says
+they do not need figures. For a large sweep (hundreds of runs), suggest
+`--no-plot` to the user before launching, rather than choosing it for them.
+With either flag, you can later render one run's figures with
+`uv run python analyzer/python render <run log_dir>`.
+
+`--no-plot` is not `--no-analyze`: `--no-analyze` skips the analyzer, so no
+reports, payloads, trace or PNGs are written.
 
 **Default invariant: run all applicable subjects.** Omit `analyze_subjects`
 (preferred; an empty list has the same launcher meaning) and do not pass
@@ -274,7 +304,8 @@ After setup and launch, report:
 - the `--dry-run` plan summary (run count)
 - exact launcher command used
 - MoE routing source: the selected corpus or popularity file, or the reason for uniform fallback
-- analysis selection (`all applicable` by default, or the user-requested subset)
+- analysis selection (`all applicable` by default, or the user-requested subset),
+  and whether PNGs were rendered (`--no-plot`)
 - any analyzer subjects that failed best-effort post-run analysis
 
 When the result reaches `ready`, switch to

@@ -1,0 +1,7 @@
+{
+  "copied_from": [
+    "coriander:/m-coriander/coriander/kanzhu/MLSim_workspace/wt-deepseek/logs/20260822_1_deepseek_v4_serial_vllm_alignment_c64_128/profile_expert_popularity/expert_popularity.json",
+    "coriander:/m-coriander/coriander/kanzhu/MLSim_workspace/wt-deepseek-pf-clean/logs/20260824_4_deepseek_v4_serial_vllm_alignment_pf_clean/inputs/expert_popularity.json"
+  ],
+  "sha256": "0e27c808ade0f5a7db769a6c1643756c88cf60bed71c72ded02e9a234e963865"
+}

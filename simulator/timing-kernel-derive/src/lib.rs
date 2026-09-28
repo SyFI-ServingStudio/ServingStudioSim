@@ -143,10 +143,23 @@ pub fn derive_kernel_config(input: TokenStream) -> TokenStream {
         }
     });
 
+    let dtype_field_const = |attr: &str, konst: &str| {
+        let konst = syn::Ident::new(konst, proc_macro2::Span::call_site());
+        find_dtype_field(attr).map(|field| {
+            let field = field.to_string();
+            quote! { const #konst: ::core::option::Option<&'static str> = ::core::option::Option::Some(#field); }
+        })
+    };
+    let compute_dtype_field = dtype_field_const("compute_dtype", "COMPUTE_DTYPE_FIELD");
+    let kv_dtype_field = dtype_field_const("kv_dtype", "KV_DTYPE_FIELD");
+
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
 
     let expanded = quote! {
         impl #impl_generics ::simulator::timing::KernelConfig for #name #ty_generics #where_clause {
+            #compute_dtype_field
+            #kv_dtype_field
+
             fn backends(&self) -> &[&'static str] {
                 &self.backends
             }

@@ -17,8 +17,8 @@ from profiling.db.registry import MetricFamily, find_kernel_profiler_spec, known
 from profiling.kernels.batched_gemm import KIND, BatchedGemmArgs
 from profiling.runners.exceptions import ProfilerNotImplemented
 
-_Q_BACKEND = "torch_mla_q_absorb_glm52"
-_V_UP_BACKEND = "torch_mla_v_up_glm52"
+_Q_BACKEND = "torch_mla_q_absorb"
+_V_UP_BACKEND = "torch_mla_v_up"
 _WO_A_BACKEND = "deepgemm_mxfp8_einsum_dsv41_wo_a"
 
 
@@ -55,7 +55,13 @@ def test_kind_table_backend_and_runner_ref_contract():
     spec = find_kernel_profiler_spec(KIND, _Q_BACKEND)
 
     assert KIND == "batched_gemm"
-    assert known_backends(KIND) == [_Q_BACKEND, _V_UP_BACKEND, _WO_A_BACKEND]
+    assert known_backends(KIND) == [
+        _Q_BACKEND,
+        _V_UP_BACKEND,
+        "torch_mla_q_absorb_no_rope",
+        "torch_mla_v_up_unpadded",
+        _WO_A_BACKEND,
+    ]
     assert spec.kernel_kind == KIND
     assert spec.table_name == KIND
     assert spec.backend == _Q_BACKEND
@@ -63,7 +69,7 @@ def test_kind_table_backend_and_runner_ref_contract():
     assert spec.metric_family is MetricFamily.COMPUTE
     assert spec.subprocess_env is None
     assert spec.runner_ref.module_name == "profiling.runners.gemm.batched_gemm"
-    assert spec.runner_ref.function_name == "profile_mla_q_absorb_glm52"
+    assert spec.runner_ref.function_name == "profile_mla_q_absorb"
 
 
 def test_v_up_registration_reuses_kind_table_args_and_facade():
@@ -76,7 +82,7 @@ def test_v_up_registration_reuses_kind_table_args_and_facade():
     assert v_spec.metric_family is q_spec.metric_family is MetricFamily.COMPUTE
     assert v_spec.subprocess_env is None
     assert v_spec.runner_ref.module_name == "profiling.runners.gemm.batched_gemm"
-    assert v_spec.runner_ref.function_name == "profile_mla_v_up_glm52"
+    assert v_spec.runner_ref.function_name == "profile_mla_v_up"
 
 
 @pytest.mark.parametrize("backend", [_Q_BACKEND, _V_UP_BACKEND])
@@ -117,9 +123,9 @@ def test_runner_ref_resolves_without_importing_torch():
                 "import sys; "
                 "from profiling.db.registry import find_kernel_profiler_spec; "
                 "runner = find_kernel_profiler_spec("
-                "'batched_gemm', 'torch_mla_q_absorb_glm52').runner_ref.load(); "
+                "'batched_gemm', 'torch_mla_q_absorb').runner_ref.load(); "
                 "v_runner = find_kernel_profiler_spec("
-                "'batched_gemm', 'torch_mla_v_up_glm52').runner_ref.load(); "
+                "'batched_gemm', 'torch_mla_v_up').runner_ref.load(); "
                 "print(runner.__module__); "
                 "print(runner.__name__); "
                 "print(v_runner.__module__); "
@@ -133,9 +139,9 @@ def test_runner_ref_resolves_without_importing_torch():
     )
     assert completed.stdout.splitlines() == [
         "profiling.runners.gemm.batched_gemm",
-        "profile_mla_q_absorb_glm52",
+        "profile_mla_q_absorb",
         "profiling.runners.gemm.batched_gemm",
-        "profile_mla_v_up_glm52",
+        "profile_mla_v_up",
         "False",
     ]
 
@@ -375,3 +381,23 @@ def test_logical_traffic_excludes_packed_gaps():
 def test_generated_facades_are_available():
     assert hasattr(perf_api, "get_batched_gemm_times")
     assert hasattr(perf_api, "count_missing_batched_gemm")
+
+
+def test_no_rope_unpadded_layout_has_no_rope_split_and_no_head_padding():
+    """The no-RoPE layout absorbs the full 256-wide q head and writes an unpadded V-up input."""
+    from profiling.runners.gemm import batched_gemm as runner
+
+    q = runner._build_layout_q_absorb_operands(
+        torch, runner._NO_ROPE_UNPADDED_LAYOUT, num_batches=16, m=3, torch_dtype=torch.float32, device="cpu"
+    )
+    assert tuple(q.lhs.shape) == (16, 3, 256)
+    assert q.lhs.stride() == (256, 16 * 256, 1)
+    assert tuple(q.rhs.shape) == (16, 256, 512)
+    v = runner._build_layout_v_up_operands(
+        torch, runner._NO_ROPE_UNPADDED_LAYOUT, num_batches=16, m=3, torch_dtype=torch.float32, device="cpu"
+    )
+    assert tuple(v.attention_base.shape) == (3, 16, 512)
+    assert tuple(v.rhs.shape) == (16, 512, 256)
+    assert tuple(v.out.shape) == (16, 3, 256)
+    with pytest.raises(ValueError, match=r"\(256, 512\)"):
+        runner._validate_layout_args("torch_mla_q_absorb_no_rope", (256, 512), 16, 3, 512, 192, "bf16")

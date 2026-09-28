@@ -988,8 +988,8 @@ mod tests {
             rms_norm_backends: vec!["flashinfer"],
             single_gemm_backends: vec!["torch"],
             main_rope_backends: vec!["vllm_inductor"],
-            q_absorb_backends: vec!["torch_mla_q_absorb_glm52"],
-            v_up_backends: vec!["torch_mla_v_up_glm52"],
+            q_absorb_backends: vec!["torch_mla_q_absorb"],
+            v_up_backends: vec!["torch_mla_v_up"],
             indexer_gemm_backends: vec!["torch_indexer"],
             indexer_elementwise_backends: vec!["triton_indexer"],
             index_cache_append_backends: vec!["vllm_cuda"],
@@ -1204,8 +1204,8 @@ mod tests {
         assert_eq!(r.q_a_rms_norm.backends, vec!["flashinfer"]);
         assert_eq!(r.fused_qkv_a_proj.backends, vec!["torch"]);
         assert_eq!(r.main_rope.backends, vec!["vllm_inductor"]);
-        assert_eq!(r.q_absorb.backends, vec!["torch_mla_q_absorb_glm52"]);
-        assert_eq!(r.v_up.backends, vec!["torch_mla_v_up_glm52"]);
+        assert_eq!(r.q_absorb.backends, vec!["torch_mla_q_absorb"]);
+        assert_eq!(r.v_up.backends, vec!["torch_mla_v_up"]);
         assert_eq!(r.sparse_mla.elementwise_backends, vec!["triton_sparse"]);
         assert_eq!(
             r.sparse_mla.sparse_attention_backends,

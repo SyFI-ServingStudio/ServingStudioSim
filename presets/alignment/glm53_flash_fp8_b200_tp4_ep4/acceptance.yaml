@@ -1,0 +1,65 @@
+# Acceptance policy for the GLM-5.3-Flash FP8 B200 TP4/EP4 matrix.
+#
+# Tolerances only. The formulas that produce the numbers live in
+# `launcher/alignment_campaign/metrics.py`: they depend on the Analyzer report
+# schema, not on the model, so copying them into each pack would create N copies
+# to keep in sync.
+#
+# Tolerances are also deliberately NOT in the golden store. Re-recording measured
+# values is routine; moving the standard those values are judged against should
+# be a reviewed edit to a tracked file. Sharing one store would let `--record`
+# quietly change the goalposts along with the numbers.
+schema_version: 1
+
+# The report schemas these tolerances were written against. `compare` refuses to
+# record a golden when a run's reports disagree, because a duration-weighted
+# kernel error (schema 2+) and an unweighted per-iteration mean (schema 1) are
+# different statistics, and schema 3 measures the barrier critical path rather
+# than one device's; either way they would otherwise share a key.
+analyzer_schema:
+  iteration: 3
+  e2e: 1
+  workload: 1
+
+# Fraction of a tolerance a value may consume before it is WARN rather than OK.
+# One knob rather than a second threshold per metric: "close to the declared
+# edge" is the actionable signal, and nobody has data to set fifteen warn bands.
+warn_fraction: 0.8
+
+tolerances:
+  default:
+    # Check 1 — kernel timing (tightest, most diagnostic).
+    kernel_abs_pct: 5.0
+    kernel_signed_pct: 5.0
+    # A floor, not a bound: mapping coverage below this means a large measured
+    # kernel has no simulated counterpart, which invalidates the timing above it.
+    map_coverage_pct: 97.0
+    # Check 2 — duty cycle. A ceiling: a large multiplier means big host bubbles
+    # that deserve an explanation rather than silent absorption.
+    gpu_time_multiplier: 1.5
+    iteration_cycle_mean_pct: 8.0
+    # Workload structure. These compare the two sides' scheduler behaviour on the
+    # same trace. Where scheduling agrees they are near-exact (cases 11-15 are at
+    # 0.000-0.129%), so the default stays tight on purpose: a breach says the
+    # simulation executed a different iteration population, not that it mistimed
+    # the one it ran, and per `skills/top-align-with-framework` that difference
+    # must be reported rather than folded into the timing conclusion. The cases
+    # that do diverge carry an explicit exception below.
+    iterations_pct: 1.0
+    prefill_tokens_mean_pct: 1.0
+    decode_batch_mean_pct: 1.0
+    scheduled_kv_mean_pct: 1.0
+    # Check 3 — end to end (loosest). TTFT is expected to run a little fast in
+    # the simulator: vLLM's async scheduler adds first-token latency that is not
+    # modelled, so a small sim-faster gap is expected and is not a defect.
+    output_tps_pct: 8.0
+    server_ttft_mean_pct: 12.0
+    server_tpot_mean_pct: 11.0
+    e2e_mean_pct: 7.0
+
+  # Every exception states why. A loosened threshold with no reason on it is
+  # indistinguishable from a silently accepted regression, which is why `check`
+  # rejects one without a rationale.
+  # No per-case exceptions yet: the GLM-5.2 ones describe that model's run and
+  # must be re-earned from this matrix's own evidence, each with a rationale.
+  per_case: {}

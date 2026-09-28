@@ -13,6 +13,10 @@ a built config would silently reprice every profiled shape rather than fail.
 Resolution runs during expansion, including under `--dry-run`. A dry-run's job
 is to prove the run is valid, and a corpus that cannot be fetched is exactly
 the kind of invalidity worth catching before a GPU is allocated.
+
+The local path is for the binary only. A record of what built a run (the
+kernel-config registry's sources) names the reference instead, through
+`restore_hf_references`, so it reads the same on every machine.
 """
 
 from __future__ import annotations
@@ -26,6 +30,10 @@ HF_SCHEME = "hf://"
 _REFERENCE = re.compile(r"^hf://(?P<repo>[^@/]+/[^@/]+)@(?P<revision>[0-9a-f]{7,40})/(?P<path>.+)$")
 
 
+# The reference each local path this process resolved came from.
+_RESOLVED: dict[str, str] = {}
+
+
 class CorpusError(RuntimeError):
     """A reference that cannot be parsed or fetched."""
 
@@ -36,12 +44,25 @@ def _download(repo: str, revision: str, path: str) -> Path:
     return Path(hf_hub_download(repo_id=repo, filename=path, revision=revision))
 
 
-def resolve_reference(reference: str) -> str:
+def _cached(repo: str, revision: str, path: str) -> Path:
+    """`_download` without the network: the file the local hub cache holds."""
+    from huggingface_hub import try_to_load_from_cache
+
+    local = try_to_load_from_cache(repo_id=repo, filename=path, revision=revision)
+    if not isinstance(local, str):
+        raise FileNotFoundError(f"{repo}@{revision}/{path} is not in the local hub cache")
+    return Path(local)
+
+
+def resolve_reference(reference: str, *, local_only: bool = False) -> str:
     """Fetch one `hf://` reference and return the local path it resolved to.
 
     A token corpus manifest names its payload in `data_file`, relative to
     itself, so that file is fetched too -- the hub's snapshot layout mirrors the
     repository, which puts the two back in one directory.
+
+    `local_only` never reaches the network: a reference whose files the local
+    hub cache does not already hold raises `CorpusError`.
     """
     match = _REFERENCE.match(reference)
     if not match:
@@ -50,8 +71,9 @@ def resolve_reference(reference: str) -> str:
             "a revision is required and must be a commit sha, not a branch or tag"
         )
     repo, revision, path = match["repo"], match["revision"], match["path"]
+    fetch = _cached if local_only else _download
     try:
-        local = _download(repo, revision, path)
+        local = fetch(repo, revision, path)
     except Exception as exc:  # noqa: BLE001 — the hub raises a wide family
         raise CorpusError(f"fetching {reference}: {exc}") from exc
 
@@ -61,7 +83,10 @@ def resolve_reference(reference: str) -> str:
         except json.JSONDecodeError as exc:
             raise CorpusError(f"{reference} is not readable JSON: {exc}") from exc
         if isinstance(data_file, str) and data_file:
-            payload = _download(repo, revision, str(Path(path).parent / data_file))
+            try:
+                payload = fetch(repo, revision, str(Path(path).parent / data_file))
+            except Exception as exc:  # noqa: BLE001 — as above
+                raise CorpusError(f"fetching {reference}'s {data_file}: {exc}") from exc
             # The loader resolves `data_file` against the manifest's directory,
             # so that is where the hub must have put it -- a subdirectory too.
             if payload != local.parent / data_file:
@@ -69,6 +94,7 @@ def resolve_reference(reference: str) -> str:
                     f"{reference}: the hub placed {data_file} at {payload}, "
                     f"not where its manifest in {local.parent} names it"
                 )
+    _RESOLVED[str(local)] = reference
     return str(local)
 
 
@@ -85,4 +111,16 @@ def resolve_hf_references(config):
         return [resolve_hf_references(value) for value in config]
     if isinstance(config, str) and config.startswith(HF_SCHEME):
         return resolve_reference(config)
+    return config
+
+
+def restore_hf_references(config):
+    """The config as its preset wrote it: every string leaf that is a path this
+    process resolved a reference to becomes that reference again."""
+    if isinstance(config, dict):
+        return {key: restore_hf_references(value) for key, value in config.items()}
+    if isinstance(config, list):
+        return [restore_hf_references(value) for value in config]
+    if isinstance(config, str):
+        return _RESOLVED.get(config, config)
     return config

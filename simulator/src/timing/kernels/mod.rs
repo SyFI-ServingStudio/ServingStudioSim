@@ -6,23 +6,15 @@ pub mod all_reduce_residual_rms_norm;
 pub mod batched_gemm;
 pub mod bf16_fused_moe;
 pub mod clamped_swiglu;
+pub mod compressed_sparse_mla_decode;
+pub mod compressed_sparse_mla_prefill;
 pub mod deepseek_v41_mega_attn;
 pub mod deepseek_v41_qnorm_rope_kv_insert;
-pub mod deepseek_v4_fused_inv_rope_fp8_quant;
-pub mod deepseek_v4_fused_q_kv_rmsnorm;
-pub mod deepseek_v4_indexer_mqa_logits_decode;
-pub mod deepseek_v4_indexer_mqa_logits_prefill;
-pub mod deepseek_v4_indexer_q_rope_quant;
-pub mod deepseek_v4_indexer_topk_decode;
-pub mod deepseek_v4_indexer_topk_prefill;
-pub mod deepseek_v4_packed_cache_gather;
-pub mod deepseek_v4_qnorm_rope_kv_insert;
-pub mod deepseek_v4_sparse_attn_compress_store;
-pub mod deepseek_v4_sparse_mla_decode;
-pub mod deepseek_v4_sparse_mla_prefill;
-pub mod deepseek_v4_terminal_mhc_head;
+pub mod dsa_compressed_mqa_logits_prefill;
+pub mod dsa_compressed_topk_prefill;
 pub mod dsa_index_cache_append;
 pub mod dsa_indexer_q_rope_quant;
+pub mod dsa_indexer_q_rope_quant_weight_fold;
 pub mod dsa_mqa_logits_prefill;
 pub mod dsa_paged_mqa_logits_decode;
 pub mod dsa_persistent_topk_decode;
@@ -42,21 +34,20 @@ pub mod fp8_per_token_group_quant;
 pub mod gdn_causal_conv_decode;
 pub mod gdn_causal_conv_prefill;
 pub mod gdn_chunk_delta_rule;
-pub mod gdn_chunk_local_cumsum;
-pub mod gdn_chunk_output;
-pub mod gdn_chunk_recompute_w_u;
-pub mod gdn_chunk_scaled_dot_kkt;
-pub mod gdn_chunk_solve_tril;
-pub mod gdn_chunk_state_update;
 pub mod gdn_gated_rms_norm;
 pub mod gdn_prefill_post_conv;
 pub mod gdn_recurrent_decode;
 pub mod gemm_fp32_output;
 pub mod grouped_gemm;
+pub mod inv_rope_fp8_quant;
+pub mod kda_chunk_prefill;
+pub mod kda_recurrent_decode;
 pub mod kv_cache_append;
+pub mod kv_compress_store;
 pub mod logits_topk;
 pub mod mhc_fused_post_pre_rms_norm;
 pub mod mhc_pre_rms_norm;
+pub mod mhc_terminal_head;
 pub mod mla_cache_append;
 pub mod mla_rope_quantize_fp8;
 pub mod moe_align_block_size;
@@ -74,6 +65,9 @@ pub mod nvfp4_fused_moe;
 pub mod nvfp4_quant;
 pub mod p2p_inter;
 pub mod p2p_intra;
+pub mod packed_kv_cache_gather;
+pub mod q_kv_rms_norm;
+pub mod qnorm_rope_kv_insert;
 pub mod residual_rms_norm;
 pub mod rms_norm;
 pub mod single_gemm;
@@ -98,6 +92,14 @@ pub use bf16_fused_moe::{
 pub use clamped_swiglu::{
     ClampedSwigluKernel, ClampedSwigluKernelConfig, ClampedSwigluKernelInput, ClampedSwigluSpec,
 };
+pub use compressed_sparse_mla_decode::{
+    CompressedSparseMlaDecodeKernel, CompressedSparseMlaDecodeKernelConfig,
+    CompressedSparseMlaDecodeKernelInput, CompressedSparseMlaDecodeSpec,
+};
+pub use compressed_sparse_mla_prefill::{
+    CompressedSparseMlaPrefillKernel, CompressedSparseMlaPrefillKernelConfig,
+    CompressedSparseMlaPrefillKernelInput, CompressedSparseMlaPrefillSpec,
+};
 pub use deepseek_v41_mega_attn::{
     DeepseekV41MegaAttnKernel, DeepseekV41MegaAttnKernelConfig, DeepseekV41MegaAttnKernelInput,
     DeepseekV41MegaAttnSpec,
@@ -106,57 +108,13 @@ pub use deepseek_v41_qnorm_rope_kv_insert::{
     DeepseekV41QnormRopeKvInsertKernel, DeepseekV41QnormRopeKvInsertKernelConfig,
     DeepseekV41QnormRopeKvInsertKernelInput, DeepseekV41QnormRopeKvInsertSpec,
 };
-pub use deepseek_v4_fused_inv_rope_fp8_quant::{
-    DeepseekV4FusedInvRopeFp8QuantKernel, DeepseekV4FusedInvRopeFp8QuantKernelConfig,
-    DeepseekV4FusedInvRopeFp8QuantKernelInput, DeepseekV4FusedInvRopeFp8QuantSpec,
+pub use dsa_compressed_mqa_logits_prefill::{
+    DsaCompressedMqaLogitsPrefillKernel, DsaCompressedMqaLogitsPrefillKernelConfig,
+    DsaCompressedMqaLogitsPrefillSpec, DsaCompressedPrefillKernelInput,
 };
-pub use deepseek_v4_fused_q_kv_rmsnorm::{
-    DeepseekV4FusedQKvRmsnormKernel, DeepseekV4FusedQKvRmsnormKernelConfig,
-    DeepseekV4FusedQKvRmsnormKernelInput, DeepseekV4FusedQKvRmsnormSpec,
-};
-pub use deepseek_v4_indexer_mqa_logits_decode::{
-    DeepseekV4IndexerMqaLogitsDecodeKernel, DeepseekV4IndexerMqaLogitsDecodeKernelConfig,
-    DeepseekV4IndexerMqaLogitsDecodeKernelInput, DeepseekV4IndexerMqaLogitsDecodeSpec,
-};
-pub use deepseek_v4_indexer_mqa_logits_prefill::{
-    DeepseekV4IndexerMqaLogitsPrefillKernel, DeepseekV4IndexerMqaLogitsPrefillKernelConfig,
-    DeepseekV4IndexerMqaLogitsPrefillSpec, DeepseekV4IndexerPrefillKernelInput,
-};
-pub use deepseek_v4_indexer_q_rope_quant::{
-    DeepseekV4IndexerQRopeQuantKernel, DeepseekV4IndexerQRopeQuantKernelConfig,
-    DeepseekV4IndexerQRopeQuantKernelInput, DeepseekV4IndexerQRopeQuantSpec,
-};
-pub use deepseek_v4_indexer_topk_decode::{
-    DeepseekV4IndexerTopkDecodeKernel, DeepseekV4IndexerTopkDecodeKernelConfig,
-    DeepseekV4IndexerTopkDecodeKernelInput, DeepseekV4IndexerTopkDecodeSpec,
-};
-pub use deepseek_v4_indexer_topk_prefill::{
-    DeepseekV4IndexerTopkPrefillKernel, DeepseekV4IndexerTopkPrefillKernelConfig,
-    DeepseekV4IndexerTopkPrefillSpec,
-};
-pub use deepseek_v4_packed_cache_gather::{
-    DeepseekV4PackedCacheGatherKernel, DeepseekV4PackedCacheGatherKernelConfig,
-    DeepseekV4PackedCacheGatherKernelInput, DeepseekV4PackedCacheGatherMode,
-    DeepseekV4PackedCacheGatherSpec,
-};
-pub use deepseek_v4_qnorm_rope_kv_insert::{
-    DeepseekV4QnormRopeKvInsertKernel, DeepseekV4QnormRopeKvInsertKernelConfig,
-    DeepseekV4QnormRopeKvInsertKernelInput, DeepseekV4QnormRopeKvInsertSpec,
-};
-pub use deepseek_v4_sparse_attn_compress_store::{
-    DeepseekV4SparseAttnCompressStoreKernel, DeepseekV4SparseAttnCompressStoreKernelConfig,
-    DeepseekV4SparseAttnCompressStoreKernelInput, DeepseekV4SparseAttnCompressStoreSpec,
-};
-pub use deepseek_v4_sparse_mla_decode::{
-    DeepseekV4SparseMlaDecodeKernel, DeepseekV4SparseMlaDecodeKernelConfig,
-    DeepseekV4SparseMlaDecodeKernelInput, DeepseekV4SparseMlaDecodeSpec,
-};
-pub use deepseek_v4_sparse_mla_prefill::{
-    DeepseekV4SparseMlaPrefillKernel, DeepseekV4SparseMlaPrefillKernelConfig,
-    DeepseekV4SparseMlaPrefillKernelInput, DeepseekV4SparseMlaPrefillSpec,
-};
-pub use deepseek_v4_terminal_mhc_head::{
-    DeepseekV4TerminalMhcHeadKernel, DeepseekV4TerminalMhcHeadSpec,
+pub use dsa_compressed_topk_prefill::{
+    DsaCompressedTopkPrefillKernel, DsaCompressedTopkPrefillKernelConfig,
+    DsaCompressedTopkPrefillSpec,
 };
 pub use dsa_index_cache_append::{
     DsaIndexCacheAppendKernel, DsaIndexCacheAppendKernelConfig, DsaIndexCacheAppendKernelInput,
@@ -165,6 +123,10 @@ pub use dsa_index_cache_append::{
 pub use dsa_indexer_q_rope_quant::{
     DsaIndexerQRopeQuantKernel, DsaIndexerQRopeQuantKernelConfig, DsaIndexerQRopeQuantKernelInput,
     DsaIndexerQRopeQuantSpec,
+};
+pub use dsa_indexer_q_rope_quant_weight_fold::{
+    DsaIndexerQRopeQuantWeightFoldKernel, DsaIndexerQRopeQuantWeightFoldKernelConfig,
+    DsaIndexerQRopeQuantWeightFoldKernelInput, DsaIndexerQRopeQuantWeightFoldSpec,
 };
 pub use dsa_mqa_logits_prefill::{
     DsaMqaLogitsPrefillKernel, DsaMqaLogitsPrefillKernelConfig, DsaMqaLogitsPrefillKernelInput,
@@ -235,29 +197,6 @@ pub use gdn_chunk_delta_rule::{
     GdnChunkDeltaRuleKernel, GdnChunkDeltaRuleKernelConfig, GdnChunkDeltaRuleKernelInput,
     GdnChunkDeltaRuleSpec,
 };
-pub use gdn_chunk_local_cumsum::{
-    GdnChunkLocalCumsumKernel, GdnChunkLocalCumsumKernelConfig, GdnChunkLocalCumsumKernelInput,
-    GdnChunkLocalCumsumSpec,
-};
-pub use gdn_chunk_output::{
-    GdnChunkOutputKernel, GdnChunkOutputKernelConfig, GdnChunkOutputKernelInput, GdnChunkOutputSpec,
-};
-pub use gdn_chunk_recompute_w_u::{
-    GdnChunkRecomputeWUKernel, GdnChunkRecomputeWUKernelConfig, GdnChunkRecomputeWUKernelInput,
-    GdnChunkRecomputeWUSpec,
-};
-pub use gdn_chunk_scaled_dot_kkt::{
-    GdnChunkScaledDotKktKernel, GdnChunkScaledDotKktKernelConfig, GdnChunkScaledDotKktKernelInput,
-    GdnChunkScaledDotKktSpec,
-};
-pub use gdn_chunk_solve_tril::{
-    GdnChunkSolveTrilKernel, GdnChunkSolveTrilKernelConfig, GdnChunkSolveTrilKernelInput,
-    GdnChunkSolveTrilSpec,
-};
-pub use gdn_chunk_state_update::{
-    GdnChunkStateUpdateKernel, GdnChunkStateUpdateKernelConfig, GdnChunkStateUpdateKernelInput,
-    GdnChunkStateUpdateSpec,
-};
 pub use gdn_gated_rms_norm::{
     GdnGatedRmsNormKernel, GdnGatedRmsNormKernelConfig, GdnGatedRmsNormKernelInput,
     GdnGatedRmsNormSpec,
@@ -276,8 +215,24 @@ pub use gemm_fp32_output::{
 pub use grouped_gemm::{
     GroupedGemmKernel, GroupedGemmKernelConfig, GroupedGemmKernelInput, GroupedGemmSpec,
 };
+pub use inv_rope_fp8_quant::{
+    InvRopeFp8QuantKernel, InvRopeFp8QuantKernelConfig, InvRopeFp8QuantKernelInput,
+    InvRopeFp8QuantSpec,
+};
+pub use kda_chunk_prefill::{
+    KdaChunkPrefillKernel, KdaChunkPrefillKernelConfig, KdaChunkPrefillKernelInput,
+    KdaChunkPrefillSpec,
+};
+pub use kda_recurrent_decode::{
+    KdaRecurrentDecodeKernel, KdaRecurrentDecodeKernelConfig, KdaRecurrentDecodeKernelInput,
+    KdaRecurrentDecodeSpec,
+};
 pub use kv_cache_append::{
     KvCacheAppendKernel, KvCacheAppendKernelConfig, KvCacheAppendKernelInput, KvCacheAppendSpec,
+};
+pub use kv_compress_store::{
+    KvCompressStoreKernel, KvCompressStoreKernelConfig, KvCompressStoreKernelInput,
+    KvCompressStoreSpec,
 };
 pub use logits_topk::{
     LogitsTopkKernel, LogitsTopkKernelConfig, LogitsTopkKernelInput, LogitsTopkSpec,
@@ -286,6 +241,7 @@ pub use mhc_fused_post_pre_rms_norm::{MhcFusedPostPreRmsNormKernel, MhcFusedPost
 pub use mhc_pre_rms_norm::{
     MhcPreRmsNormKernel, MhcPreRmsNormSpec, MhcRmsNormKernelConfig, MhcRmsNormKernelInput,
 };
+pub use mhc_terminal_head::{MhcTerminalHeadKernel, MhcTerminalHeadSpec};
 pub use mla_cache_append::{
     MlaCacheAppendKernel, MlaCacheAppendKernelConfig, MlaCacheAppendKernelInput, MlaCacheAppendSpec,
 };
@@ -340,6 +296,17 @@ pub use nvfp4_quant::{
 };
 pub use p2p_inter::{P2pInterKernel, P2pInterKernelConfig, P2pInterKernelInput, P2pInterSpec};
 pub use p2p_intra::{P2pIntraKernel, P2pIntraKernelConfig, P2pIntraKernelInput, P2pIntraSpec};
+pub use packed_kv_cache_gather::{
+    PackedKvCacheGatherKernel, PackedKvCacheGatherKernelConfig, PackedKvCacheGatherKernelInput,
+    PackedKvCacheGatherMode, PackedKvCacheGatherSpec,
+};
+pub use q_kv_rms_norm::{
+    QKvRmsNormKernel, QKvRmsNormKernelConfig, QKvRmsNormKernelInput, QKvRmsNormSpec,
+};
+pub use qnorm_rope_kv_insert::{
+    QnormRopeKvInsertKernel, QnormRopeKvInsertKernelConfig, QnormRopeKvInsertKernelInput,
+    QnormRopeKvInsertSpec,
+};
 pub use residual_rms_norm::{
     ResidualRmsNormKernel, ResidualRmsNormKernelConfig, ResidualRmsNormKernelInput,
     ResidualRmsNormSpec,

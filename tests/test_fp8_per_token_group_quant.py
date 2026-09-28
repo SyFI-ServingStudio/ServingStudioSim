@@ -61,6 +61,7 @@ def test_registry_contract_and_backend_support():
     assert profiler_spec.subprocess_env == "vllm_env"
     assert profiler_spec.supports.allows(DType.BF16, gpu="NVIDIA H100")
     assert profiler_spec.supports.allows(DType.BF16, gpu="NVIDIA H200")
+    assert profiler_spec.supports.allows(DType.BF16, gpu="NVIDIA B200")
     assert not profiler_spec.supports.allows(DType.FP16, gpu="NVIDIA H200")
 
 
@@ -135,7 +136,7 @@ def test_profile_calls_exact_vllm_op_and_reports_logical_bytes(monkeypatch):
     monkeypatch.setattr(
         runner,
         "_load_vllm_quant_op",
-        lambda _torch: lambda *arguments: quant_calls.append(arguments),
+        lambda _torch, _scale_format: lambda *arguments: quant_calls.append(arguments),
     )
     monkeypatch.setattr(runner.Timer, "cupti", lambda function, **kwargs: (function(), 2.0)[1])
     monkeypatch.setattr(
@@ -166,6 +167,40 @@ def test_profile_calls_exact_vllm_op_and_reports_logical_bytes(monkeypatch):
     assert metrics.tflops == 0.0
     assert metrics.memory_bandwidth_gbps == pytest.approx((expected_bytes / 0.002) / 1e9)
     assert metrics.energy_j == 0.25
+
+
+def test_packed_format_uses_deepgemm_tma_layout_on_blackwell_only():
+    from profiling.runners.elementwise import fp8_per_token_group_quant as runner
+    from profiling.runners.exceptions import ProfilerNotImplemented
+
+    strided = []
+    fake_torch = SimpleNamespace(
+        bfloat16="bfloat16",
+        float8_e4m3fn="float8_e4m3fn",
+        int32="int32",
+        randn=lambda shape, **kwargs: object(),
+        empty=lambda shape, **kwargs: object(),
+        empty_strided=lambda *arguments, **kwargs: strided.append(arguments) or object(),
+        cuda=SimpleNamespace(
+            is_available=lambda: True,
+            current_device=lambda: 0,
+            get_device_capability=lambda _device: (9, 0),
+            get_device_name=lambda _device: "NVIDIA H200",
+        ),
+    )
+    with pytest.raises(ProfilerNotImplemented, match="requires compute capability"):
+        runner._validate_cuda_device(fake_torch, "ue8m0_packed_int32")
+    operands = runner._allocate_operands(
+        fake_torch, num_tokens=33, hidden_size=4096, group_size=128,
+        scale_format="ue8m0_packed_int32",
+    )
+    assert strided == [((33, 8), (1, 36))]
+    calls = []
+    runner._launch_quant(lambda *a: calls.append(a), *operands, 128, "ue8m0_packed_int32")
+    assert len(calls[0]) == 7  # the packed writer takes no layout flags
+    assert runner._logical_bytes(
+        num_tokens=33, hidden_size=4096, group_size=128, scale_format="ue8m0_packed_int32"
+    ) == 33 * 4096 * 3 + 33 * 8 * 4
 
 
 def test_generated_facade_symbols_exist():

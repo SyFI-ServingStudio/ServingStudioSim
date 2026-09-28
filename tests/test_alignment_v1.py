@@ -1534,10 +1534,20 @@ def test_alignment_analyzer_and_renderer_end_to_end(tmp_path):
     assert iteration_report["iterations"][1]["measured_gpu_cycle_ms"] is None
     # Per-iteration detail lives in a byte-range-addressed shard so a client can
     # read one iteration without parsing the rest; the payload carries the index.
+    # Each range is one zstd frame of the JSON line and its newline.
     detail = iteration_payload["breakdown_detail"]
+    assert detail["encoding"] == "zstd-frames"
     shard = (analysis / "payloads" / detail["file"]).read_bytes()
-    offset, length = detail["byte_ranges"][str(iteration_report["iterations"][0]["iteration_id"])]
-    breakdown = json.loads(shard[offset : offset + length])
+    iteration_id = str(iteration_report["iterations"][0]["iteration_id"])
+    offset, length = detail["byte_ranges"][iteration_id]
+    line = pa.decompress(
+        shard[offset : offset + length],
+        decompressed_size=detail["decoded_lengths"][iteration_id],
+        codec="zstd",
+        asbytes=True,
+    )
+    assert line.endswith(b"\n")
+    breakdown = json.loads(line)
     assert "operations" not in breakdown
     assert [kernel["name"] for kernel in breakdown["measured_kernels"]] == [
         "nvjet_qkv",

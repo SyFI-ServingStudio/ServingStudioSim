@@ -1,0 +1,748 @@
+{
+  "schema_version": 1,
+  "mapping_id": "glm53-flash-vllm-fp8-kda-dsa-moe-unified-v1",
+  "arch_types": [
+    "glm53_flash_vllm_fp8_kda_dsa_moe"
+  ],
+  "locations": [
+    {
+      "location": "unified.dsa_moe.attn_mhc_post_pre",
+      "semantics": [
+        "dsa_moe.mhc.attn_fn",
+        "dsa_moe.mhc.attn_base",
+        "dsa_moe.mhc.attn_scale",
+        "dsa_moe.mhc.attn_boundary",
+        "dsa_moe.input_norm"
+      ]
+    },
+    {
+      "location": "unified.dsa_moe.dsa.fused_qkv_a",
+      "semantics": [
+        "dsa_moe.q_a_proj",
+        "dsa_moe.kv_a_proj"
+      ]
+    },
+    {
+      "location": "unified.dsa_moe.dsa.glue",
+      "semantics": []
+    },
+    {
+      "location": "unified.dsa_moe.dsa.indexer.expand_pools",
+      "semantics": []
+    },
+    {
+      "location": "unified.dsa_moe.dsa.indexer.head_weights",
+      "semantics": []
+    },
+    {
+      "location": "unified.dsa_moe.dsa.indexer.k_norm",
+      "semantics": []
+    },
+    {
+      "location": "unified.dsa_moe.dsa.indexer.kpool_decode_update",
+      "semantics": [
+        "dsa_moe.index_cache_append",
+        "dsa_moe.indexer.kpool_ape"
+      ]
+    },
+    {
+      "location": "unified.dsa_moe.dsa.indexer.kpool_gate_score",
+      "semantics": [
+        "dsa_moe.indexer.kpool_gate"
+      ]
+    },
+    {
+      "location": "unified.dsa_moe.dsa.indexer.kpool_prefill_write",
+      "semantics": []
+    },
+    {
+      "location": "unified.dsa_moe.dsa.indexer.kpool_tail_seed",
+      "semantics": []
+    },
+    {
+      "location": "unified.dsa_moe.dsa.indexer.mqa_logits_decode",
+      "semantics": [
+        "dsa_moe.indexer.decode"
+      ]
+    },
+    {
+      "location": "unified.dsa_moe.dsa.indexer.mqa_logits_prefill",
+      "semantics": [
+        "dsa_moe.indexer.prefill"
+      ]
+    },
+    {
+      "location": "unified.dsa_moe.dsa.indexer.prefill_gather",
+      "semantics": []
+    },
+    {
+      "location": "unified.dsa_moe.dsa.indexer.q_fwht_quant",
+      "semantics": []
+    },
+    {
+      "location": "unified.dsa_moe.dsa.indexer.topk_decode",
+      "semantics": []
+    },
+    {
+      "location": "unified.dsa_moe.dsa.indexer.topk_prefill",
+      "semantics": []
+    },
+    {
+      "location": "unified.dsa_moe.dsa.indexer.weight_scale",
+      "semantics": []
+    },
+    {
+      "location": "unified.dsa_moe.dsa.indexer.wk_weights",
+      "semantics": [
+        "dsa_moe.indexer.wk",
+        "dsa_moe.indexer.weights_proj",
+        "dsa_moe.indexer.k_norm"
+      ]
+    },
+    {
+      "location": "unified.dsa_moe.dsa.indexer.wq_b",
+      "semantics": [
+        "dsa_moe.indexer.wq_b"
+      ]
+    },
+    {
+      "location": "unified.dsa_moe.dsa.o_proj",
+      "semantics": [
+        "dsa_moe.o_proj"
+      ]
+    },
+    {
+      "location": "unified.dsa_moe.dsa.output_copy",
+      "semantics": []
+    },
+    {
+      "location": "unified.dsa_moe.dsa.prefill_glue",
+      "semantics": []
+    },
+    {
+      "location": "unified.dsa_moe.dsa.q_absorb",
+      "semantics": [
+        "dsa_moe.q_absorb"
+      ]
+    },
+    {
+      "location": "unified.dsa_moe.dsa.q_b_proj",
+      "semantics": [
+        "dsa_moe.q_b_proj"
+      ]
+    },
+    {
+      "location": "unified.dsa_moe.dsa.q_concat",
+      "semantics": []
+    },
+    {
+      "location": "unified.dsa_moe.dsa.q_fp8_quant",
+      "semantics": []
+    },
+    {
+      "location": "unified.dsa_moe.dsa.q_kv_a_norm",
+      "semantics": [
+        "dsa_moe.q_a_norm",
+        "dsa_moe.kv_a_norm"
+      ]
+    },
+    {
+      "location": "unified.dsa_moe.dsa.sparse_mla.decode",
+      "semantics": [
+        "dsa_moe.attn.decode"
+      ]
+    },
+    {
+      "location": "unified.dsa_moe.dsa.sparse_mla.index_remap",
+      "semantics": []
+    },
+    {
+      "location": "unified.dsa_moe.dsa.sparse_mla.mla_cache_append",
+      "semantics": [
+        "dsa_moe.mla_cache_append"
+      ]
+    },
+    {
+      "location": "unified.dsa_moe.dsa.sparse_mla.prefill",
+      "semantics": [
+        "dsa_moe.attn.prefill"
+      ]
+    },
+    {
+      "location": "unified.dsa_moe.dsa.v_up",
+      "semantics": [
+        "dsa_moe.v_up"
+      ]
+    },
+    {
+      "location": "unified.dsa_moe.ffn_mhc_post_pre",
+      "semantics": [
+        "dsa_moe.mhc.ffn_fn",
+        "dsa_moe.mhc.ffn_base",
+        "dsa_moe.mhc.ffn_scale",
+        "dsa_moe.mhc.ffn_boundary",
+        "dsa_moe.post_norm"
+      ]
+    },
+    {
+      "location": "unified.dsa_moe.moe.combine_glue",
+      "semantics": []
+    },
+    {
+      "location": "unified.dsa_moe.moe.input_glue",
+      "semantics": []
+    },
+    {
+      "location": "unified.dsa_moe.moe.routed_rank0.fused_moe",
+      "semantics": [
+        "dsa_moe.expert_gate_up",
+        "dsa_moe.expert_down"
+      ]
+    },
+    {
+      "location": "unified.dsa_moe.moe.routed_rank0.input_quant",
+      "semantics": []
+    },
+    {
+      "location": "unified.dsa_moe.moe.routed_rank1.fused_moe",
+      "semantics": []
+    },
+    {
+      "location": "unified.dsa_moe.moe.routed_rank1.input_quant",
+      "semantics": []
+    },
+    {
+      "location": "unified.dsa_moe.moe.routed_rank2.fused_moe",
+      "semantics": []
+    },
+    {
+      "location": "unified.dsa_moe.moe.routed_rank2.input_quant",
+      "semantics": []
+    },
+    {
+      "location": "unified.dsa_moe.moe.routed_rank3.fused_moe",
+      "semantics": []
+    },
+    {
+      "location": "unified.dsa_moe.moe.routed_rank3.input_quant",
+      "semantics": []
+    },
+    {
+      "location": "unified.dsa_moe.moe.router.gate",
+      "semantics": [
+        "dsa_moe.router",
+        "dsa_moe.router_bias"
+      ]
+    },
+    {
+      "location": "unified.dsa_moe.moe.router.gate_recompute",
+      "semantics": []
+    },
+    {
+      "location": "unified.dsa_moe.moe.shared_expert.act_and_mul",
+      "semantics": []
+    },
+    {
+      "location": "unified.dsa_moe.moe.shared_expert.down",
+      "semantics": [
+        "dsa_moe.shared_down"
+      ]
+    },
+    {
+      "location": "unified.dsa_moe.moe.shared_expert.down_input_quant",
+      "semantics": []
+    },
+    {
+      "location": "unified.dsa_moe.moe.shared_expert.gate_up",
+      "semantics": [
+        "dsa_moe.shared_gate_up"
+      ]
+    },
+    {
+      "location": "unified.dsa_moe.moe.shared_expert.gate_up_input_quant",
+      "semantics": []
+    },
+    {
+      "location": "unified.embedding",
+      "semantics": [
+        "embedding"
+      ]
+    },
+    {
+      "location": "unified.final_mhc_post",
+      "semantics": [
+        "mhc.final_post"
+      ]
+    },
+    {
+      "location": "unified.final_norm",
+      "semantics": [
+        "final_norm"
+      ]
+    },
+    {
+      "location": "unified.first_kda_dense.attn_mhc_pre",
+      "semantics": [
+        "first_kda_dense.mhc.attn_fn",
+        "first_kda_dense.mhc.attn_base",
+        "first_kda_dense.mhc.attn_scale",
+        "first_kda_dense.mhc.attn_boundary",
+        "first_kda_dense.input_norm"
+      ]
+    },
+    {
+      "location": "unified.first_kda_dense.dense_ffn.act_and_mul",
+      "semantics": []
+    },
+    {
+      "location": "unified.first_kda_dense.dense_ffn.down",
+      "semantics": [
+        "first_kda_dense.down"
+      ]
+    },
+    {
+      "location": "unified.first_kda_dense.dense_ffn.down_input_quant",
+      "semantics": []
+    },
+    {
+      "location": "unified.first_kda_dense.dense_ffn.gate_up",
+      "semantics": [
+        "first_kda_dense.gate_up"
+      ]
+    },
+    {
+      "location": "unified.first_kda_dense.dense_ffn.gate_up_input_quant",
+      "semantics": []
+    },
+    {
+      "location": "unified.first_kda_dense.ffn_mhc_post_pre",
+      "semantics": [
+        "first_kda_dense.mhc.ffn_fn",
+        "first_kda_dense.mhc.ffn_base",
+        "first_kda_dense.mhc.ffn_scale",
+        "first_kda_dense.mhc.ffn_boundary",
+        "first_kda_dense.post_norm"
+      ]
+    },
+    {
+      "location": "unified.first_kda_dense.kda.chunk_prefill",
+      "semantics": [
+        "first_kda_dense.attn.prefill",
+        "first_kda_dense.a_log",
+        "first_kda_dense.dt_bias"
+      ]
+    },
+    {
+      "location": "unified.first_kda_dense.kda.f_b_proj",
+      "semantics": [
+        "first_kda_dense.f_b_proj"
+      ]
+    },
+    {
+      "location": "unified.first_kda_dense.kda.g_b_proj",
+      "semantics": [
+        "first_kda_dense.g_b_proj"
+      ]
+    },
+    {
+      "location": "unified.first_kda_dense.kda.gated_norm",
+      "semantics": [
+        "first_kda_dense.o_norm"
+      ]
+    },
+    {
+      "location": "unified.first_kda_dense.kda.in_proj",
+      "semantics": [
+        "first_kda_dense.q_proj",
+        "first_kda_dense.k_proj",
+        "first_kda_dense.v_proj",
+        "first_kda_dense.b_proj",
+        "first_kda_dense.f_a_proj",
+        "first_kda_dense.g_a_proj"
+      ]
+    },
+    {
+      "location": "unified.first_kda_dense.kda.o_proj",
+      "semantics": [
+        "first_kda_dense.o_proj"
+      ]
+    },
+    {
+      "location": "unified.first_kda_dense.kda.prefill_glue",
+      "semantics": []
+    },
+    {
+      "location": "unified.first_kda_dense.kda.prefill_qkv_copy",
+      "semantics": []
+    },
+    {
+      "location": "unified.first_kda_dense.kda.recurrent_decode",
+      "semantics": [
+        "first_kda_dense.attn.decode",
+        "first_kda_dense.recurrent_state.decode_read",
+        "first_kda_dense.recurrent_state.decode_write"
+      ]
+    },
+    {
+      "location": "unified.first_kda_dense.kda.short_conv_decode",
+      "semantics": [
+        "first_kda_dense.conv_state.decode_read",
+        "first_kda_dense.conv_state.decode_write"
+      ]
+    },
+    {
+      "location": "unified.first_kda_dense.kda.short_conv_prefill",
+      "semantics": [
+        "first_kda_dense.q_conv1d",
+        "first_kda_dense.k_conv1d",
+        "first_kda_dense.v_conv1d",
+        "first_kda_dense.conv_state.prefill_read",
+        "first_kda_dense.conv_state.prefill_write"
+      ]
+    },
+    {
+      "location": "unified.first_kda_dense.kda.state_gather",
+      "semantics": [
+        "first_kda_dense.recurrent_state.prefill_read"
+      ]
+    },
+    {
+      "location": "unified.first_kda_dense.kda.state_scatter",
+      "semantics": [
+        "first_kda_dense.recurrent_state.prefill_write"
+      ]
+    },
+    {
+      "location": "unified.hc_contract_mean",
+      "semantics": []
+    },
+    {
+      "location": "unified.hc_expand",
+      "semantics": []
+    },
+    {
+      "location": "unified.kda_dense.attn_mhc_post_pre",
+      "semantics": [
+        "kda_dense.mhc.attn_fn",
+        "kda_dense.mhc.attn_base",
+        "kda_dense.mhc.attn_scale",
+        "kda_dense.mhc.attn_boundary",
+        "kda_dense.input_norm"
+      ]
+    },
+    {
+      "location": "unified.kda_dense.dense_ffn.act_and_mul",
+      "semantics": []
+    },
+    {
+      "location": "unified.kda_dense.dense_ffn.down",
+      "semantics": [
+        "kda_dense.down"
+      ]
+    },
+    {
+      "location": "unified.kda_dense.dense_ffn.down_input_quant",
+      "semantics": []
+    },
+    {
+      "location": "unified.kda_dense.dense_ffn.gate_up",
+      "semantics": [
+        "kda_dense.gate_up"
+      ]
+    },
+    {
+      "location": "unified.kda_dense.dense_ffn.gate_up_input_quant",
+      "semantics": []
+    },
+    {
+      "location": "unified.kda_dense.ffn_mhc_post_pre",
+      "semantics": [
+        "kda_dense.mhc.ffn_fn",
+        "kda_dense.mhc.ffn_base",
+        "kda_dense.mhc.ffn_scale",
+        "kda_dense.mhc.ffn_boundary",
+        "kda_dense.post_norm"
+      ]
+    },
+    {
+      "location": "unified.kda_dense.kda.chunk_prefill",
+      "semantics": [
+        "kda_dense.attn.prefill",
+        "kda_dense.a_log",
+        "kda_dense.dt_bias"
+      ]
+    },
+    {
+      "location": "unified.kda_dense.kda.f_b_proj",
+      "semantics": [
+        "kda_dense.f_b_proj"
+      ]
+    },
+    {
+      "location": "unified.kda_dense.kda.g_b_proj",
+      "semantics": [
+        "kda_dense.g_b_proj"
+      ]
+    },
+    {
+      "location": "unified.kda_dense.kda.gated_norm",
+      "semantics": [
+        "kda_dense.o_norm"
+      ]
+    },
+    {
+      "location": "unified.kda_dense.kda.in_proj",
+      "semantics": [
+        "kda_dense.q_proj",
+        "kda_dense.k_proj",
+        "kda_dense.v_proj",
+        "kda_dense.b_proj",
+        "kda_dense.f_a_proj",
+        "kda_dense.g_a_proj"
+      ]
+    },
+    {
+      "location": "unified.kda_dense.kda.o_proj",
+      "semantics": [
+        "kda_dense.o_proj"
+      ]
+    },
+    {
+      "location": "unified.kda_dense.kda.prefill_glue",
+      "semantics": []
+    },
+    {
+      "location": "unified.kda_dense.kda.prefill_qkv_copy",
+      "semantics": []
+    },
+    {
+      "location": "unified.kda_dense.kda.recurrent_decode",
+      "semantics": [
+        "kda_dense.attn.decode",
+        "kda_dense.recurrent_state.decode_read",
+        "kda_dense.recurrent_state.decode_write"
+      ]
+    },
+    {
+      "location": "unified.kda_dense.kda.short_conv_decode",
+      "semantics": [
+        "kda_dense.conv_state.decode_read",
+        "kda_dense.conv_state.decode_write"
+      ]
+    },
+    {
+      "location": "unified.kda_dense.kda.short_conv_prefill",
+      "semantics": [
+        "kda_dense.q_conv1d",
+        "kda_dense.k_conv1d",
+        "kda_dense.v_conv1d",
+        "kda_dense.conv_state.prefill_read",
+        "kda_dense.conv_state.prefill_write"
+      ]
+    },
+    {
+      "location": "unified.kda_dense.kda.state_gather",
+      "semantics": [
+        "kda_dense.recurrent_state.prefill_read"
+      ]
+    },
+    {
+      "location": "unified.kda_dense.kda.state_scatter",
+      "semantics": [
+        "kda_dense.recurrent_state.prefill_write"
+      ]
+    },
+    {
+      "location": "unified.kda_moe.attn_mhc_post_pre",
+      "semantics": [
+        "kda_moe.mhc.attn_fn",
+        "kda_moe.mhc.attn_base",
+        "kda_moe.mhc.attn_scale",
+        "kda_moe.mhc.attn_boundary",
+        "kda_moe.input_norm"
+      ]
+    },
+    {
+      "location": "unified.kda_moe.ffn_mhc_post_pre",
+      "semantics": [
+        "kda_moe.mhc.ffn_fn",
+        "kda_moe.mhc.ffn_base",
+        "kda_moe.mhc.ffn_scale",
+        "kda_moe.mhc.ffn_boundary",
+        "kda_moe.post_norm"
+      ]
+    },
+    {
+      "location": "unified.kda_moe.kda.chunk_prefill",
+      "semantics": [
+        "kda_moe.attn.prefill",
+        "kda_moe.a_log",
+        "kda_moe.dt_bias"
+      ]
+    },
+    {
+      "location": "unified.kda_moe.kda.f_b_proj",
+      "semantics": [
+        "kda_moe.f_b_proj"
+      ]
+    },
+    {
+      "location": "unified.kda_moe.kda.g_b_proj",
+      "semantics": [
+        "kda_moe.g_b_proj"
+      ]
+    },
+    {
+      "location": "unified.kda_moe.kda.gated_norm",
+      "semantics": [
+        "kda_moe.o_norm"
+      ]
+    },
+    {
+      "location": "unified.kda_moe.kda.in_proj",
+      "semantics": [
+        "kda_moe.q_proj",
+        "kda_moe.k_proj",
+        "kda_moe.v_proj",
+        "kda_moe.b_proj",
+        "kda_moe.f_a_proj",
+        "kda_moe.g_a_proj"
+      ]
+    },
+    {
+      "location": "unified.kda_moe.kda.o_proj",
+      "semantics": [
+        "kda_moe.o_proj"
+      ]
+    },
+    {
+      "location": "unified.kda_moe.kda.prefill_glue",
+      "semantics": []
+    },
+    {
+      "location": "unified.kda_moe.kda.prefill_qkv_copy",
+      "semantics": []
+    },
+    {
+      "location": "unified.kda_moe.kda.recurrent_decode",
+      "semantics": [
+        "kda_moe.attn.decode",
+        "kda_moe.recurrent_state.decode_read",
+        "kda_moe.recurrent_state.decode_write"
+      ]
+    },
+    {
+      "location": "unified.kda_moe.kda.short_conv_decode",
+      "semantics": [
+        "kda_moe.conv_state.decode_read",
+        "kda_moe.conv_state.decode_write"
+      ]
+    },
+    {
+      "location": "unified.kda_moe.kda.short_conv_prefill",
+      "semantics": [
+        "kda_moe.q_conv1d",
+        "kda_moe.k_conv1d",
+        "kda_moe.v_conv1d",
+        "kda_moe.conv_state.prefill_read",
+        "kda_moe.conv_state.prefill_write"
+      ]
+    },
+    {
+      "location": "unified.kda_moe.kda.state_gather",
+      "semantics": [
+        "kda_moe.recurrent_state.prefill_read"
+      ]
+    },
+    {
+      "location": "unified.kda_moe.kda.state_scatter",
+      "semantics": [
+        "kda_moe.recurrent_state.prefill_write"
+      ]
+    },
+    {
+      "location": "unified.kda_moe.moe.combine_glue",
+      "semantics": []
+    },
+    {
+      "location": "unified.kda_moe.moe.input_glue",
+      "semantics": []
+    },
+    {
+      "location": "unified.kda_moe.moe.routed_rank0.fused_moe",
+      "semantics": [
+        "kda_moe.expert_gate_up",
+        "kda_moe.expert_down"
+      ]
+    },
+    {
+      "location": "unified.kda_moe.moe.routed_rank0.input_quant",
+      "semantics": []
+    },
+    {
+      "location": "unified.kda_moe.moe.routed_rank1.fused_moe",
+      "semantics": []
+    },
+    {
+      "location": "unified.kda_moe.moe.routed_rank1.input_quant",
+      "semantics": []
+    },
+    {
+      "location": "unified.kda_moe.moe.routed_rank2.fused_moe",
+      "semantics": []
+    },
+    {
+      "location": "unified.kda_moe.moe.routed_rank2.input_quant",
+      "semantics": []
+    },
+    {
+      "location": "unified.kda_moe.moe.routed_rank3.fused_moe",
+      "semantics": []
+    },
+    {
+      "location": "unified.kda_moe.moe.routed_rank3.input_quant",
+      "semantics": []
+    },
+    {
+      "location": "unified.kda_moe.moe.router.gate",
+      "semantics": [
+        "kda_moe.router",
+        "kda_moe.router_bias"
+      ]
+    },
+    {
+      "location": "unified.kda_moe.moe.router.gate_recompute",
+      "semantics": []
+    },
+    {
+      "location": "unified.kda_moe.moe.shared_expert.act_and_mul",
+      "semantics": []
+    },
+    {
+      "location": "unified.kda_moe.moe.shared_expert.down",
+      "semantics": [
+        "kda_moe.shared_down"
+      ]
+    },
+    {
+      "location": "unified.kda_moe.moe.shared_expert.down_input_quant",
+      "semantics": []
+    },
+    {
+      "location": "unified.kda_moe.moe.shared_expert.gate_up",
+      "semantics": [
+        "kda_moe.shared_gate_up"
+      ]
+    },
+    {
+      "location": "unified.kda_moe.moe.shared_expert.gate_up_input_quant",
+      "semantics": []
+    },
+    {
+      "location": "unified.lm_head",
+      "semantics": [
+        "lm_head"
+      ]
+    }
+  ]
+}

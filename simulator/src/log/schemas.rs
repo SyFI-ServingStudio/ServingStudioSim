@@ -40,7 +40,7 @@ pub fn cost_log_envelope_schema() -> Arc<Schema> {
 /// kept at full per-request fidelity (the two parallel `prefill_*_lens` lists);
 /// decode is aggregated to two scalars (`decode_request_count` / `decode_kv_total`)
 /// — the per-decode-request KV-length list is the size driver (re-logged every
-/// step) and is intentionally dropped. `prefill_request_count` is the list length,
+/// step) and is dropped unless the model opts in (`decode_kv_lens`). `prefill_request_count` is the list length,
 /// so it is not a separate field. `decode_query_rows` is the query-row count,
 /// which equals `decode_request_count` for an ordinary engine and exceeds it by
 /// the verify width under speculative decoding.
@@ -57,6 +57,9 @@ pub(crate) fn group_input_fields() -> Fields {
         // first five fields by position.
         Field::new("decode_query_rows", DataType::UInt32, false),
         Field::new("speculative_geometry", DataType::Utf8, true),
+        // Null unless the model opts in (`logs_decode_kv_lens`): per-request decode
+        // context for labelers whose necessary work is not linear in the KV total.
+        Field::new("decode_kv_lens", DataType::List(u32_item()), true),
     ])
 }
 

@@ -22,6 +22,7 @@ from alignment.profiler import (
     vllm_server,
 )
 from alignment.profiler.config import (
+    IdleWaitConfig,
     ProfileConfig,
     PythonPackageArtifact,
     PythonRuntimeConfig,
@@ -33,6 +34,7 @@ from launcher import alignment_config as alignment_config_module
 from launcher import exec as launcher_exec
 from launcher import timing_predict as timing_predict_launcher
 from launcher.alignment_config import load_analyze_config, load_profile_config
+from launcher.schema.loader import schema_from_dict
 
 
 def _write_config(path: Path, config: dict) -> None:
@@ -1048,6 +1050,65 @@ def test_profile_server_argv_enables_prompt_token_details_once():
     assert "--trust-remote-code" in server_argv
 
 
+def test_vllm_server_launches_through_serve_with_four_api_servers_by_default():
+    argv = vllm_server.build_server_argv("fork-python", ServerConfig(model_path="model"))
+    # Only the CLI `serve` entry honors --api-server-count; the deprecated
+    # openai.api_server module parses the flag and still runs one process.
+    assert argv[1:5] == ["-m", "vllm.entrypoints.cli.main", "serve", "model"]
+    assert "vllm.entrypoints.openai.api_server" not in argv
+    assert argv[argv.index("--api-server-count") + 1] == "4"
+
+    one = vllm_server.build_server_argv(
+        "fork-python", ServerConfig(model_path="model", api_server_count=1)
+    )
+    assert one[one.index("--api-server-count") + 1] == "1"
+
+    with pytest.raises(ValueError, match="server.api_server_count"):
+        vllm_server.build_server_argv(
+            "fork-python",
+            ServerConfig(model_path="model", extra_args=["--api-server-count=8"]),
+        )
+    with pytest.raises(ValueError, match="positive integer"):
+        vllm_server.build_server_argv(
+            "fork-python", ServerConfig(model_path="model", api_server_count=0)
+        )
+
+
+def test_vllm_server_start_requires_the_announced_api_process_count(tmp_path):
+    log = tmp_path / "server.log"
+    log.write_text("(APIServer pid=1) INFO [utils.py:241] Started 4 API server processes\n")
+    vllm_server.verify_server_started(log, ServerConfig(model_path="model"))
+
+    log.write_text("(APIServer pid=1) INFO single-process startup\n")
+    with pytest.raises(RuntimeError, match="requested 4 vLLM API server processes"):
+        vllm_server.verify_server_started(log, ServerConfig(model_path="model"))
+    # One process announces nothing, so there is nothing to require.
+    vllm_server.verify_server_started(log, ServerConfig(model_path="model", api_server_count=1))
+
+
+def test_vllm_idle_needs_consecutive_zero_reads_across_api_processes(monkeypatch):
+    # Four processes; one still holds a request until the fifth read.
+    reads = iter([0, 0, 0, 1] + [0] * 16)
+    calls = []
+
+    def fake_get(url, timeout=5.0):
+        calls.append(url)
+        return 200, json.dumps({"server_load": next(reads)}).encode()
+
+    monkeypatch.setattr(vllm_server, "_get", fake_get)
+    monkeypatch.setattr(vllm_server.time, "sleep", lambda _: None)
+    idle = IdleWaitConfig(timeout=60.0, poll_interval=0.0)
+    assert vllm_server.wait_for_idle("http://x", idle, ServerConfig(model_path="model"))
+    assert len(calls) == 4 + 16
+
+
+def test_sglang_server_argv_refuses_the_vllm_api_server_count():
+    with pytest.raises(ValueError, match="no SGLang equivalent"):
+        sglang_server.build_server_argv(
+            "fork-python", ServerConfig(model_path="model", api_server_count=4)
+        )
+
+
 def test_sglang_server_argv_refuses_the_vllm_token_cudagraph_ceiling():
     base = dict(model_path="model", tp_size=4, chunk_size=2048)
     argv = sglang_server.build_server_argv("fork-python", ServerConfig(**base))
@@ -1584,7 +1645,50 @@ def test_analyze_rejects_mixing_kernel_align_and_e2e_phases(tmp_path):
         load_analyze_config(paths["analyze_kernel"])
 
 
-def test_timing_predict_uses_one_phase_config_and_no_labeled_inventory(tmp_path, monkeypatch):
+# The slice of `list-params` the `_phase_configs` simulation preset touches.
+# `fp8` carries a default, as it does in the real schema, so a preset may omit it.
+_SIMULATION_SCHEMA = {
+    "deployments": {"unified": {"pools": {"main": "iter_wise"}}},
+    "providers": {
+        "arch": {"iter_wise": {"llama3_dense": {"params": []}}},
+        "worker": {"iter_wise": {"barebone": {"params": []}}},
+    },
+    "arch_common": [
+        {"name": "model_config", "type": "string", "required": True, "description": ""},
+        {"name": "fp8", "type": "bool", "default": False, "description": ""},
+    ],
+    "group_common": [
+        {"name": "gpu", "type": "string", "required": True, "description": ""},
+        {"name": "replicas", "type": "int", "default": 1, "description": ""},
+    ],
+    "pool_common": [],
+    "common": {
+        "workload": [
+            {"name": "trace_files", "type": "path_list", "required": True, "description": ""},
+            {"name": "arrival_mode", "type": "string", "required": True, "description": ""},
+            {"name": "session_dependency", "type": "string", "required": True, "description": ""},
+        ],
+        "io": [{"name": "log_dir", "type": "path", "default": "logs", "description": ""}],
+    },
+}
+
+
+@pytest.fixture
+def simulation_schema(monkeypatch):
+    """Normalize the simulation preset against `_SIMULATION_SCHEMA`, not a build."""
+    monkeypatch.setattr(launcher_exec, "cargo_build", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        alignment_launcher, "load_schema", lambda build_type: schema_from_dict(_SIMULATION_SCHEMA)
+    )
+
+
+def _predict_config(tmp_path: Path) -> dict:
+    return json.loads((tmp_path / "timing_predict_run" / "timing_predict_config.json").read_text())
+
+
+def test_timing_predict_uses_one_phase_config_and_no_labeled_inventory(
+    tmp_path, monkeypatch, simulation_schema
+):
     paths = _phase_configs(tmp_path)
     _write_completed_inputs(tmp_path)
     launched = []
@@ -1603,6 +1707,42 @@ def test_timing_predict_uses_one_phase_config_and_no_labeled_inventory(tmp_path,
     assert not (output / "kernel_sequences_labeled.json").exists()
 
 
+def test_timing_predict_dry_run_builds_cases_in_scratch_and_writes_nothing(
+    tmp_path, monkeypatch, simulation_schema
+):
+    paths = _phase_configs(tmp_path)
+    _write_completed_inputs(tmp_path)
+    seen = []
+
+    def launch(path, **kwargs):
+        # The predictor sees real cases while the scratch directory still exists.
+        seen.append((json.loads(path.read_text()), kwargs))
+        assert json.loads(Path(seen[0][0]["cases_file"]).read_text())
+        return 0
+
+    monkeypatch.setattr(alignment_launcher, "_launch_timing_predict", launch)
+    before = sorted(tmp_path.rglob("*"))
+
+    assert alignment_launcher.main(["timing-predict", str(paths["timing"]), "--dry-run"]) == 0
+    [(predict_config, kwargs)] = seen
+    assert kwargs == {"build_type": "release", "dry_run": True}
+    assert not Path(predict_config["log_dir"]).exists()
+    assert sorted(tmp_path.rglob("*")) == before
+
+
+def test_timing_predict_dry_run_is_forwarded_to_the_predictor(tmp_path, monkeypatch):
+    config_path = tmp_path / "timing_predict_config.json"
+    config_path.write_text("{}")
+    launched = []
+    monkeypatch.setattr(timing_predict_launcher, "main", lambda argv: launched.append(argv) or 0)
+
+    assert (
+        alignment_launcher._launch_timing_predict(config_path, build_type="release", dry_run=True)
+        == 0
+    )
+    assert launched == [[str(config_path), "--build-type", "release", "--dry-run"]]
+
+
 def test_timing_predict_launcher_keeps_post_run_analysis_enabled(tmp_path, monkeypatch):
     config_path = tmp_path / "timing_predict_config.json"
     config_path.write_text("{}")
@@ -1617,7 +1757,9 @@ def test_timing_predict_launcher_keeps_post_run_analysis_enabled(tmp_path, monke
     assert launched == [[str(config_path), "--build-type", "release"]]
 
 
-def test_timing_predict_preserves_simulation_backend_policy(tmp_path, monkeypatch):
+def test_timing_predict_preserves_simulation_backend_policy(
+    tmp_path, monkeypatch, simulation_schema
+):
     paths = _phase_configs(tmp_path)
     _write_completed_inputs(tmp_path)
     # The preset carries backends in the flat "pool/role" form; timing-predict
@@ -1629,13 +1771,68 @@ def test_timing_predict_preserves_simulation_backend_policy(tmp_path, monkeypatc
     monkeypatch.setattr(alignment_launcher, "_launch_timing_predict", lambda *args, **kwargs: 0)
 
     assert alignment_launcher.main(["timing-predict", str(paths["timing"])]) == 0
-    predict_config = json.loads(
-        (tmp_path / "timing_predict_run" / "timing_predict_config.json").read_text()
+    assert _predict_config(tmp_path)["backends"] == {
+        "main": {"unified.pre_attn.qkv_proj": ["torch_linear"]}
+    }
+
+
+def test_timing_predict_reads_the_backends_file(tmp_path, monkeypatch, simulation_schema):
+    paths = _phase_configs(tmp_path)
+    _write_completed_inputs(tmp_path)
+    # `launcher sim` folds `backends_file` into the policy, so the prediction must
+    # too; the inline block loses to the file on a shared key, as it does there.
+    _write_config(
+        tmp_path / "backends.yaml",
+        {"backends": {"main/unified.pre_attn.qkv_proj": ["torch_linear"]}},
     )
-    assert predict_config["backends"] == {"main": {"unified.pre_attn.qkv_proj": ["torch_linear"]}}
+    preset = yaml.safe_load(paths["simulation"].read_text())
+    preset["backends_file"] = "./backends.yaml"
+    preset["backends"] = {
+        "main/unified.pre_attn.qkv_proj": ["cublas"],
+        "main/unified.post_attn.o_proj": ["cublas"],
+    }
+    paths["simulation"].write_text(yaml.safe_dump(preset))
+    monkeypatch.setattr(alignment_launcher, "_launch_timing_predict", lambda *args, **kwargs: 0)
+
+    assert alignment_launcher.main(["timing-predict", str(paths["timing"])]) == 0
+    assert _predict_config(tmp_path)["backends"] == {
+        "main": {
+            "unified.pre_attn.qkv_proj": ["torch_linear"],
+            "unified.post_attn.o_proj": ["cublas"],
+        }
+    }
 
 
-def test_timing_predict_warns_on_trace_mismatch(tmp_path, monkeypatch, capsys):
+def test_timing_predict_fills_arch_defaults(tmp_path, monkeypatch, simulation_schema):
+    paths = _phase_configs(tmp_path)
+    _write_completed_inputs(tmp_path)
+    # The `_phase_configs` preset omits `fp8`; the predictor's arch has no
+    # defaults, so the launcher must supply the schema's.
+    preset = yaml.safe_load(paths["simulation"].read_text())
+    assert "fp8" not in preset["pools"]["main"]["groups"][0]["arch"]
+    monkeypatch.setattr(alignment_launcher, "_launch_timing_predict", lambda *args, **kwargs: 0)
+
+    assert alignment_launcher.main(["timing-predict", str(paths["timing"])]) == 0
+    assert _predict_config(tmp_path)["arch"]["iter"]["fp8"] is False
+
+
+def test_timing_predict_rejects_a_preset_that_expands_to_several_runs(
+    tmp_path, monkeypatch, capsys, simulation_schema
+):
+    paths = _phase_configs(tmp_path)
+    _write_completed_inputs(tmp_path)
+    preset = yaml.safe_load(paths["simulation"].read_text())
+    preset["sweep"] = {"gpu": ["NVIDIA H200", "NVIDIA B200"]}
+    preset["pools"]["main"]["groups"][0]["gpu"] = "${gpu}"
+    preset["io"]["log_dir"] = str(tmp_path / "simulation_run_{gpu}")
+    paths["simulation"].write_text(yaml.safe_dump(preset))
+    monkeypatch.setattr(alignment_launcher, "_launch_timing_predict", lambda *args, **kwargs: 0)
+
+    assert alignment_launcher.main(["timing-predict", str(paths["timing"])]) == 2
+    assert "expands to 2 runs" in capsys.readouterr().err
+
+
+def test_timing_predict_warns_on_trace_mismatch(tmp_path, monkeypatch, capsys, simulation_schema):
     paths = _phase_configs(tmp_path)
     _write_completed_inputs(tmp_path)
     result_path = tmp_path / "profile_run" / "profile_result.json"

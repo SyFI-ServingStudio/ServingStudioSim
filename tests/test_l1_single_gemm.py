@@ -1548,7 +1548,7 @@ def test_documented_profile_env_registry_complete():
     )
     vllm_env = ENV_REGISTRY["vllm_env"]
     assert isinstance(vllm_env, ContainerProfileEnv)
-    assert vllm_env.image == "vibesim-profiler-vllm:cu130"
+    assert vllm_env.image == "vibesim-profiler-vllm:cu130-3f667d7e"
     vllm_env.validate()
     # The fork env resolves Torch's CUDA runtime from its own venv first.
     fork_env = ENV_REGISTRY["vllm_fork_env"]

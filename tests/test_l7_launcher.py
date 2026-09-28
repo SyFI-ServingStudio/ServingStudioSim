@@ -12,6 +12,7 @@ metadata, and the sweep aggregator contract.
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import sys
 
@@ -23,11 +24,13 @@ from launcher.cache_build import cache_key
 from launcher.exec import (
     _build_subprocess_env,
     _cargo_build_env,
+    _launcher_python,
     _run_capture,
     binary_path,
     run_analysis,
     run_iter_breakdown,
     run_logged_process,
+    run_sweep_analysis,
 )
 from launcher.process import ProcessResult
 from launcher.process.artifacts import ArtifactValidation
@@ -42,7 +45,7 @@ from launcher.schema import (
     validate_params,
     validate_unique_log_dirs,
 )
-from launcher.schema.loader import SchemaNotFound, load_schema, schema_from_dict
+from launcher.schema.loader import REPO_ROOT, SchemaNotFound, load_schema, schema_from_dict
 from launcher.sweep import (
     COMPLETE_MARKER,
     _aggregate,
@@ -270,6 +273,115 @@ def test_run_analysis_delegates_both_optimality_modes_to_analyzer(monkeypatch, t
         command for command in captured_commands if len(command) > 1 and command[1] == "run"
     ]
     assert analyzer_run_commands == [[str(analyzer_path), "run", str(log_dir), "optimality"]]
+
+
+@pytest.mark.parametrize("render", [True, False])
+def test_run_analysis_renders_only_when_asked(monkeypatch, tmp_path, render):
+    analyzer_path = tmp_path / "analyze"
+    analyzer_path.write_text("")
+    log_dir = tmp_path / "run"
+    log_dir.mkdir()
+    (log_dir / "stdout.log").write_text("")
+    stages: list[str] = []
+
+    async def supervise(spec):
+        stages.append(spec.name)
+        return ProcessResult(
+            argv=tuple(str(argument) for argument in spec.argv),
+            pid=1,
+            process_group_id=1,
+            exit_code=0,
+            elapsed_seconds=0.0,
+        )
+
+    monkeypatch.setattr("launcher.exec.analyzer_binary_path", lambda _build_type: analyzer_path)
+    monkeypatch.setattr("launcher.exec._PROCESS_SUPERVISOR.run", supervise)
+    for validator in (
+        "validate_json_outputs",
+        "validate_render_artifacts",
+        "validate_trace_artifacts",
+    ):
+        monkeypatch.setattr(f"launcher.exec.{validator}", lambda _path: ArtifactValidation(()))
+
+    asyncio.run(run_analysis(log_dir, render=render))
+
+    assert sorted(stages) == sorted(["analyze_compute", "trace", *(["render"] if render else [])])
+
+
+def _analysis_harness(monkeypatch, tmp_path, supervise):
+    analyzer_path = tmp_path / "analyze"
+    analyzer_path.write_text("")
+    log_dir = tmp_path / "run"
+    log_dir.mkdir()
+    (log_dir / "stdout.log").write_text("")
+    monkeypatch.setattr("launcher.exec.analyzer_binary_path", lambda _build_type: analyzer_path)
+    monkeypatch.setattr("launcher.exec._PROCESS_SUPERVISOR.run", supervise)
+    for validator in (
+        "validate_json_outputs",
+        "validate_render_artifacts",
+        "validate_trace_artifacts",
+    ):
+        monkeypatch.setattr(f"launcher.exec.{validator}", lambda _path: ArtifactValidation(()))
+    return log_dir
+
+
+def _succeeded(spec):
+    return ProcessResult(
+        argv=tuple(str(argument) for argument in spec.argv),
+        pid=1,
+        process_group_id=1,
+        exit_code=0,
+        elapsed_seconds=0.0,
+    )
+
+
+def test_render_only_skips_compute_and_trace(monkeypatch, tmp_path):
+    stages: list[str] = []
+
+    async def supervise(spec):
+        stages.append(spec.name)
+        return _succeeded(spec)
+
+    log_dir = _analysis_harness(monkeypatch, tmp_path, supervise)
+    asyncio.run(run_analysis(log_dir, render_only=True))
+
+    assert stages == ["render"]
+
+
+def test_a_render_that_cannot_start_waits_for_the_trace(monkeypatch, tmp_path):
+    finished: list[str] = []
+
+    async def supervise(spec):
+        if spec.name == "render":
+            raise OSError("cannot spawn the renderer")
+        await asyncio.sleep(0.05)
+        finished.append(spec.name)
+        return _succeeded(spec)
+
+    log_dir = _analysis_harness(monkeypatch, tmp_path, supervise)
+    with pytest.raises(OSError, match="cannot spawn"):
+        asyncio.run(run_analysis(log_dir))
+
+    assert finished == ["analyze_compute", "trace"]
+
+
+@pytest.mark.parametrize("render", [True, False])
+def test_sweep_analysis_renders_only_when_asked(monkeypatch, tmp_path, render):
+    analyzer_path = tmp_path / "analyze"
+    analyzer_path.write_text("")
+    commands: list[list[str]] = []
+
+    def capture(argv):
+        commands.append([str(argument) for argument in argv])
+        return 0, ""
+
+    monkeypatch.setattr("launcher.exec.analyzer_binary_path", lambda _build_type: analyzer_path)
+    monkeypatch.setattr("launcher.exec._run_capture_sync", capture)
+
+    run_sweep_analysis(tmp_path, render=render)
+
+    assert [command[1] for command in commands if command[0] == str(analyzer_path)] == ["sweep"]
+    assert any("render" in command for command in commands) == render
 
 
 def test_run_capture_avoids_asyncio_subprocess_transport(monkeypatch):
@@ -704,6 +816,74 @@ def test_validate_expanded_rejects_bad_type(schema):
     cand = _base(arch={"type": "llama3_dense_tp", "tp_size": 4})
     _arch(cand)["fp8"] = "false"  # str, not bool — would coerce to True
     assert any("not a valid bool" in e for e in validate_expanded(cand, schema))
+
+
+def _supported_schema():
+    """The fixture with `llama3_dense_tp` declaring one `#[supported]` row."""
+    raw = copy.deepcopy(_FIXTURE)
+    raw["providers"]["arch"]["iter_wise"]["llama3_dense_tp"]["supported"] = [
+        {"gpu": ["H200"], "model_config": ["llama3_8b"], "tp_size": [1, 2, 4, 8]}
+    ]
+    return schema_from_dict(raw)
+
+
+def _dense_tp(tp_size, model_config="model/config/llama3_8b.json"):
+    return _base(
+        arch={"type": "llama3_dense_tp", "model_config": model_config, "tp_size": tp_size}
+    )
+
+
+def test_supported_accepts_a_declared_deployment():
+    schema = _supported_schema()
+    assert validate_expanded(_dense_tp(4), schema) == []
+    # An omitted param takes its default (tp_size 2), which a row covers.
+    cand = _dense_tp(4)
+    del _arch(cand)["tp_size"]
+    assert validate_expanded(cand, schema) == []
+
+
+def test_supported_rejects_an_undeclared_parallel_size_and_names_the_rows():
+    errors = validate_expanded(_dense_tp(3), _supported_schema())
+    assert len(errors) == 1
+    assert (
+        "llama3_dense_tp does not support gpu='H200', model_config='llama3_8b', tp_size=3"
+        in errors[0]
+    )
+    assert "tp_size in [1, 2, 4, 8]" in errors[0]
+
+
+def test_supported_rejects_an_undeclared_model():
+    errors = validate_expanded(_dense_tp(4, "model/config/qwen3_235b.json"), _supported_schema())
+    assert any("model_config='qwen3_235b'" in e for e in errors)
+
+
+def test_supported_reads_the_gpu_from_the_group():
+    cand = _dense_tp(4)
+    cand["pools"]["main"]["groups"][0]["gpu"] = "B200"
+    errors = validate_expanded(cand, _supported_schema())
+    assert any("gpu='B200'" in e for e in errors)
+
+
+def test_supported_matches_a_model_config_by_its_file_in_model_config():
+    schema = _supported_schema()
+    absolute = str(REPO_ROOT / "model" / "config" / "llama3_8b.json")
+    assert validate_expanded(_dense_tp(4, absolute), schema) == []
+    assert validate_expanded(_dense_tp(4, "./model/config/llama3_8b.json"), schema) == []
+    # Same stem elsewhere is a different file.
+    assert validate_expanded(_dense_tp(4, "other/llama3_8b.json"), schema) != []
+
+
+def test_supported_is_checked_raw_for_literals_and_deferred_for_placeholders():
+    schema = _supported_schema()
+    assert any("does not support" in e for e in validate_params(_dense_tp(16), schema))
+    preset = _dense_tp("${ptp}")
+    preset["sweep"] = {"ptp": [2, 4]}
+    assert not any("does not support" in e for e in validate_params(preset, schema))
+
+
+def test_supported_leaves_an_arch_without_rows_unchecked():
+    # llama3_dense declares no rows; any model passes this check.
+    assert validate_expanded(_base(), _supported_schema()) == []
 
 
 def test_r7_constant_derived_rejected(schema):
@@ -1369,6 +1549,15 @@ def test_cache_key_distinguishes_tp(schema):
     assert cache_key(a, schema) != cache_key(b, schema)
 
 
+def test_cache_key_distinguishes_arch_type(schema):
+    # Provider tags are not ParamDefs; two arch tags with the same params build
+    # different kernels.
+    a = normalize_params(_base(arch={"type": "llama3_dense_tp", "tp_size": 4}), schema)
+    b = normalize_params(_base(arch={"type": "llama3_dense_tp", "tp_size": 4}), schema)
+    b["pools"]["main"]["groups"][0]["arch"]["type"] = "llama3_dense"
+    assert cache_key(a, schema) != cache_key(b, schema)
+
+
 def test_cache_key_from_real_schema():
     try:
         real = load_schema("debug")
@@ -1384,6 +1573,8 @@ def test_cache_key_from_real_schema():
     keys = {path for path, _ in cache_key(cfg, real)}
     assert any(k.endswith("arch.model_config") for k in keys)
     assert any(k.endswith("arch.tp_size") for k in keys)
+    # the group's GPU is the profile.db key
+    assert any(k.endswith("groups.0.gpu") for k in keys)
     assert not any("request_rate" in k or "log_dir" in k for k in keys)
 
 
@@ -1595,12 +1786,15 @@ def test_aggregate_calls_rust_sweep_pipeline(monkeypatch, tmp_path):
 
     monkeypatch.setattr(
         "launcher.sweep.run_sweep_analysis",
-        lambda experiment_dir, build_type: calls.append((experiment_dir, build_type)),
+        lambda experiment_dir, build_type, *, render: calls.append(
+            (experiment_dir, build_type, render)
+        ),
     )
 
     _aggregate(tmp_path, "release")
+    _aggregate(tmp_path, "release", plot=False)
 
-    assert calls == [(tmp_path, "release")]
+    assert calls == [(tmp_path, "release", True), (tmp_path, "release", False)]
 
 
 # ── real subprocess plumbing (uses the built binary) ────────────────────────
@@ -1614,10 +1808,27 @@ def test_cargo_build_env_pins_launcher_python_and_drops_runtime_paths(
 
     env = _cargo_build_env()
 
-    assert env["PYTHON"] == sys.executable
-    assert env["PYO3_PYTHON"] == sys.executable
+    assert env["PYTHON"] == _launcher_python()
+    assert env["PYO3_PYTHON"] == _launcher_python()
     assert "PYTHONHOME" not in env
     assert "PYTHONPATH" not in env
+
+
+def test_launcher_python_collapses_venv_spellings_without_leaving_the_venv(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+):
+    base = tmp_path / "base" / "python3.12"
+    base.parent.mkdir()
+    base.write_text("")
+    bin_dir = tmp_path / "venv" / "bin"
+    bin_dir.mkdir(parents=True)
+    (bin_dir / "python").symlink_to(base)
+    (bin_dir / "python3").symlink_to("python")
+    (bin_dir / "python3.12").symlink_to("python")
+
+    for spelling in ("python", "python3", "python3.12"):
+        monkeypatch.setattr(sys, "executable", str(bin_dir / spelling))
+        assert _launcher_python() == str(bin_dir / "python")
 
 
 def test_logged_process_captures_stdout(tmp_path):
@@ -1698,6 +1909,30 @@ def test_resume_skips_completed_run(tmp_path, schema, monkeypatch):
     )
     params = normalize_params(_base(log_dir=str(log_dir)), schema)
     assert asyncio.run(_run_single_async(params, None, schema, "debug")) is True
+
+
+@pytest.mark.parametrize("plot", [True, False])
+def test_resume_renders_a_run_finished_without_plots(tmp_path, schema, monkeypatch, plot):
+    log_dir = tmp_path / "run"
+    (log_dir / "payloads").mkdir(parents=True)
+    (log_dir / "payloads" / "slo_general_cdf.json").write_text("{}")
+    _mark_complete(log_dir)
+    monkeypatch.setattr(
+        "launcher.sweep.validate_simulation_artifacts",
+        lambda _log_dir: ArtifactValidation(()),
+    )
+    calls: list[dict] = []
+
+    async def analysis(_log_dir, _build_type, _subjects, **options):
+        calls.append(options)
+
+    monkeypatch.setattr("launcher.sweep.run_analysis", analysis)
+    params = normalize_params(_base(log_dir=str(log_dir)), schema)
+
+    assert asyncio.run(_launch_one(params, "debug", render=plot)) is True
+    assert asyncio.run(_run_single_async(params, None, schema, "debug", plot=plot)) is True
+
+    assert calls == ([{"render_only": True}] * 2 if plot else [])
 
 
 def test_public_run_entrypoints_require_explicit_schema():

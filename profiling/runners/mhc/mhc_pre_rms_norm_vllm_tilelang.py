@@ -8,16 +8,22 @@ from profiling.profilers.energy import Energy
 from profiling.profilers.timer import Timer
 from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
-from profiling.runners.mhc._deepseek_v4 import (
+from profiling.runners.mhc._common import (
+    BOUNDARY_GPUS,
     HC_EPS,
     POST_MULTIPLIER,
     RMS_EPS,
     SINKHORN_ITERATIONS,
     CommonInputs,
     assert_outputs_close,
+    bandwidth_gbps,
+    hidden_bytes,
+    mix_bytes,
+    pre_weight_bytes,
     prepare_common,
     reference_pre,
-    require_h200,
+    require_gpu,
+    residual_bytes,
     validate_args,
 )
 
@@ -45,9 +51,17 @@ class _Launch:
         )
 
 
-def _validate_args(
-    num_tokens: int, hidden_size: int, hc_mult: int, hidden_dtype: DType | str
-):
+def _logical_bytes(num_tokens: int) -> int:
+    """Read the streams and weights once; write the mixes and the block input."""
+    return (
+        residual_bytes(num_tokens)
+        + pre_weight_bytes()
+        + mix_bytes(num_tokens)
+        + hidden_bytes(num_tokens)
+    )
+
+
+def _validate_args(num_tokens: int, hidden_size: int, hc_mult: int, hidden_dtype: DType | str):
     return validate_args(_KIND, num_tokens, hidden_size, hc_mult, hidden_dtype)
 
 
@@ -65,7 +79,7 @@ def profile_mhc_pre_rms_norm_vllm_tilelang(
         raise ProfilerNotImplemented(f"{_KIND} requires pinned vLLM and TileLang") from exc
 
     try:
-        require_h200(torch, _KIND)
+        require_gpu(torch, _KIND, BOUNDARY_GPUS)
         inputs = prepare_common(torch, shape)
         launch = _Launch(mhc_pre_tilelang, inputs)
         expected = reference_pre(torch, inputs)
@@ -84,7 +98,7 @@ def profile_mhc_pre_rms_norm_vllm_tilelang(
     return ComputeMetrics(
         time_ms=float(time_ms),
         tflops=0.0,
-        memory_bandwidth_gbps=0.0,
+        memory_bandwidth_gbps=bandwidth_gbps(_logical_bytes(shape.num_tokens), time_ms),
         energy_j=float(energy_j),
     )
 

@@ -14,6 +14,7 @@ kernel identity because each can select a different implementation branch.
 from __future__ import annotations
 
 from profiling.db.args import DType, KvCacheAppendArgs
+from profiling.db.doc import BackendDoc, KernelDoc
 from profiling.db.outlier import BatchOutlierPolicy
 from profiling.db.registry import (
     BackendSupport,
@@ -25,6 +26,42 @@ from profiling.db.registry import (
 
 KIND: str = "kv_cache_append"
 _RUNNER_MODULE = "profiling.runners.attention.kv_cache_append"
+
+DOC = KernelDoc(
+    title="Paged KV cache append",
+    summary=("Write the keys and values of new tokens into their slots in a paged KV cache."),
+    description=(
+        "After the K and V projections, each new token's key and value are "
+        "stored in the paged cache for later attention. A slot mapping names "
+        "one cache slot per token, and block_size is the tokens per page. The "
+        "measurement writes num_tokens tokens into distinct random slots of a "
+        "cache with at least 256 pages."
+    ),
+    category="Attention",
+    subcategory="MHA / GQA",
+    formula=(
+        "key_cache[slot[t]] ← key[t], value_cache[slot[t]] ← value[t], for each new token t",
+        "GB/s = [2 · num_tokens · num_kv_heads · head_dim · (bytes(input_dtype)"
+        " + bytes(kv_dtype)) + 8 · num_tokens] / time",
+    ),
+    default_metric="memory_bandwidth_gbps",
+    method=(
+        "vllm_cuda: GPU kernel time from CUPTI, averaged over repeated launches"
+        " of reshape_and_cache_flash_kernel after five warm-ups, with the L2 "
+        "cache flushed before each launch. torch: CUDA-event time around a loop"
+        " of calls after five warm-ups, the median of three loops; the cache is"
+        " not flushed, and the time includes the gap between its two launches."
+    ),
+    caveats=(
+        "The two backends are timed differently, cold kernel time against a "
+        "warm loop, so their numbers are not directly comparable.",
+        "The torch backend only covers matching input and cache dtypes with one scale per tensor.",
+        "vllm_cuda uses K and V scales of 1.",
+        "GB/s counts the K and V reads and writes and the int64 slot map, not the scales.",
+    ),
+    # The torch backend is the PyTorch reference; it lives in the runner module.
+    reference=None,
+)
 
 
 register(
@@ -46,6 +83,7 @@ register(
         args_schema=KvCacheAppendArgs,
         metric_family=MetricFamily.COMPUTE,
         batch_outlier_policy=BatchOutlierPolicy(),
+        doc=BackendDoc(summary="PyTorch indexed assignment writes K and V in two launches."),
     )
 )
 
@@ -66,5 +104,11 @@ register(
         metric_family=MetricFamily.COMPUTE,
         batch_outlier_policy=BatchOutlierPolicy(),
         subprocess_env="vllm_env",
+        doc=BackendDoc(
+            summary=(
+                "vLLM's reshape_and_cache_flash CUDA kernel writes both K and V to mapped slots."
+            ),
+            url="https://github.com/vllm-project/vllm/blob/main/csrc/libtorch_stable/cache_kernels.cu",
+        ),
     )
 )

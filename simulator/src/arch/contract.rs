@@ -84,6 +84,13 @@ pub struct UnifiedArchInput {
 /// iteration (embedding → layers → lm_head). `&UnifiedArchInput` is concrete on
 /// the signature (no `dyn`); L5 binds via `<M: IterwiseUnifiedModel>` generic.
 pub trait IterwiseUnifiedModel: Send + Sync + 'static {
+    /// Reject a batch this model cannot cost, with the reason, before any
+    /// eval. `eval_iter` panics on the same batches; callers that take input
+    /// from outside the simulator (timing-predict) check first.
+    fn check_input(&self, _batch: &UnifiedArchInput) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Per-iter cost of the whole iteration (embedding → layers → lm_head) via the
     /// compiled CostTree path: stream each leaf's [`LeafMetrics`] into `slots`
     /// (the caller's reused buffer — cleared + refilled to the manifest length),
@@ -161,6 +168,17 @@ pub trait IterwiseUnifiedModel: Send + Sync + 'static {
     /// (the default), which is what keeps every dense arch untouched.
     fn recurrent_state_bytes_per_request(&self) -> u64 {
         0
+    }
+
+    /// Whether the `cost_log` must keep each decode request's KV length.
+    ///
+    /// The default logs decode as a request count plus a KV total, which is all a
+    /// model whose necessary work is linear in context needs. A sparse-attention
+    /// model with a per-request top-k cap (GLM-5.3's kpool DSA) cannot recover its
+    /// minimum work from the total, so it opts in; the independent labeler then
+    /// reconstructs each request's exact causal interaction.
+    fn logs_decode_kv_lens(&self) -> bool {
+        false
     }
 
     /// Token interval at which a checkpoint of [`Self::recurrent_state_bytes_per_request`]
@@ -305,6 +323,13 @@ pub struct SpeculativeArchInput {
 /// addition to, the ordinary trait: the two walk different compiled trees, so a
 /// type that offered both would be two models wearing one name.
 pub trait SpeculativeUnifiedModel: Send + Sync + 'static {
+    /// Reject a batch this model cannot cost, with the reason, before any
+    /// eval. `eval_speculative_iter` panics on the same batches; callers that take input
+    /// from outside the simulator (timing-predict) check first.
+    fn check_input(&self, _batch: &SpeculativeArchInput) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Per-iter cost of one whole speculative iteration: the target verify pass
     /// over `k + 1` rows per decode request, then the `k` draft passes. Same
     /// `(slots, scratch) -> LeafMetrics` protocol as

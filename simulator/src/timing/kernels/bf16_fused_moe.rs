@@ -80,23 +80,25 @@ impl KernelSpec for Bf16FusedMoeSpec {
         grid: &SweepGrid,
         backend: &'static str,
     ) -> Vec<ArgsPayload> {
-        // Resolved once: a token corpus is hundreds of megabytes on disk and
-        // the grid has tens of points. The arch builder has already proven it
-        // readable, so a failure here is a corpus that changed underneath a
-        // built config.
-        let demand = config
+        // Drawn for the whole axis at once: the draws run in parallel and are
+        // shared with every other kernel folding the same demand source. The
+        // arch builder has already proven the source readable, so a failure here
+        // is a corpus that changed underneath a built config.
+        let token_counts = grid.expand_1d(|num_tokens| num_tokens as u32);
+        let mut batches = config
             .expert_demand
-            .prepare()
-            .expect("validate_config proved this source readable");
-
-        grid.expand_1d(|num_tokens| {
-            let per_expert_batches = demand.per_expert_batches(
+            .per_expert_batches(
                 config.top_k,
-                num_tokens as u32,
+                &token_counts,
                 config.num_experts.get() as usize,
                 config.num_local_experts.get() as usize,
                 config.folded_rank_position,
-            );
+            )
+            .expect("validate_config proved this source readable")
+            .into_iter();
+
+        grid.expand_1d(|num_tokens| {
+            let per_expert_batches = batches.next().expect("one histogram per grid point");
 
             ArgsPayload::new()
                 .with("backend", backend)
@@ -215,7 +217,7 @@ mod tests {
                 num_local_experts: Dim::param("num_local_experts", NUM_LOCAL_EXPERTS),
                 top_k: TOP_K,
                 input_dtype: DType::Bf16,
-                weight_format: "nvfp4_e2m1".to_string(),
+                weight_format: DType::Nvfp4E2m1,
                 group_size: 16,
                 routing_method: "minimax2".to_string(),
                 n_group: 1,

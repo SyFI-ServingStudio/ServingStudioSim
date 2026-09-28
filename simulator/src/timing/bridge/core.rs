@@ -1,13 +1,13 @@
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyModule};
 use serde_json::Value;
 
 use crate::timing::bridge::{
-    ArgsPayload, DType, DbMetadata, KernelKind, KernelMetrics, PerfApiError, ProfilerVersion,
-    intern_backend,
+    intern_backend, ArgsPayload, BuildError, DType, DbMetadata, KernelKind, KernelMetrics,
+    PerfApiError, ProfilerVersion,
 };
 
 /// One kernel's profile-coverage line for the `dry-run` report: how many of its
@@ -52,6 +52,80 @@ pub struct KernelEnum {
     pub kv_dtype: Option<DType>,
     pub config: Value,
     pub backends: Vec<String>,
+}
+
+/// One kernel config a build asked profile.db for, as profile.db's kernel-config
+/// registry stores it: the config's identity, the GPU, the cache grid and the
+/// DB args behind each grid cell. Every role that builds the same
+/// `(kind, gpu_name, identity)` shares one record and is listed in `uses`.
+///
+/// The grid is recorded rather than recomputed later from `identity` because
+/// recomputing is not always possible: a corpus-routed MoE config names a
+/// payload file that the reader may not have.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct KernelConfigRecord {
+    /// The kernel's `KernelSpec::KIND`: what `kernel-query` deserializes the
+    /// identity as.
+    pub kind: KernelKind,
+    /// The profile.db table the grid's args are rows of (`profile_kind`).
+    pub profile_kind: KernelKind,
+    pub gpu_name: String,
+    /// [`KernelConfig::identity`](crate::timing::KernelConfig::identity).
+    pub identity: Value,
+    pub grid: ConfigGrid,
+    pub uses: Vec<ConfigUse>,
+}
+
+/// A config's sweep grid and the profile.db args of each cell.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct ConfigGrid {
+    /// One name per axis: the kernel input's `SweepCoords::coord_field_names`.
+    pub cache_coords: &'static [&'static str],
+    pub axes: Vec<Vec<f64>>,
+    /// Row-major over `axes`, one entry per cell: the profile.db args columns of
+    /// that cell's row. `backend` is left out because it is the only column that
+    /// differs between the config's backends.
+    pub cells: Vec<BTreeMap<String, Value>>,
+    /// Cells the kernel marks physically infeasible; they are never profiled.
+    pub infeasible: Vec<usize>,
+}
+
+/// Where a config was built: the pool and the kernel's dotted role name.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct ConfigUse {
+    pub pool: String,
+    pub role: String,
+}
+
+/// Version of the document [`config_records_document`] builds.
+pub const CONFIG_RECORDS_SCHEMA_VERSION: u32 = 1;
+
+/// `records` as the JSON document the launcher registers into profile.db's
+/// kernel-config registry (`profiling/db/kernel_config.py`).
+pub fn config_records_document(records: &[KernelConfigRecord]) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": CONFIG_RECORDS_SCHEMA_VERSION,
+        "configs": records,
+    })
+}
+
+/// Write [`config_records_document`] of `records` to `path`.
+pub fn write_config_records(
+    path: &std::path::Path,
+    records: &[KernelConfigRecord],
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+    let text =
+        serde_json::to_string(&config_records_document(records)).expect("config records serialize");
+    std::fs::write(path, text)
+        .with_context(|| format!("writing kernel config records {}", path.display()))
+}
+
+#[derive(Clone, Debug, Default)]
+struct ConfigRecords {
+    records: Vec<KernelConfigRecord>,
+    /// `(kind, gpu_name, identity JSON)` -> index into `records`.
+    index: HashMap<(KernelKind, String, String), usize>,
 }
 
 /// Convert `Result<T, pyo3::PyErr>` to `Result<T, PerfApiError>` by flattening
@@ -113,6 +187,10 @@ pub struct PerfApiBridge {
     /// (no GPU, no profiling) — the `emit-backends` structural walk. Distinct from
     /// `dry_run`, which still calls `count_missing`.
     enumerate: RefCell<Option<Vec<KernelEnum>>>,
+    /// `Some(..)` makes `Kernel::build` record each config it builds, in any
+    /// mode, for profile.db's kernel-config registry (see
+    /// [`enable_config_records`](Self::enable_config_records)).
+    config_records: RefCell<Option<ConfigRecords>>,
 }
 
 impl PerfApiBridge {
@@ -122,9 +200,23 @@ impl PerfApiBridge {
             backend_overrides: RefCell::new(None),
             active_pool: RefCell::new(None),
             enumerate: RefCell::new(None),
+            config_records: RefCell::new(None),
         };
         bridge.disable_jit_profiling()?;
         Ok(bridge)
+    }
+
+    /// A bridge that can only build structure: enumerate mode, and no Python
+    /// perf_api at all, so nothing can reach `profile.db` or a GPU. For
+    /// commands that need a model's cost tree and nothing measured.
+    pub fn structure_only() -> Self {
+        Self {
+            dry_run: RefCell::new(None),
+            backend_overrides: RefCell::new(None),
+            active_pool: RefCell::new(None),
+            enumerate: RefCell::new(Some(Vec::new())),
+            config_records: RefCell::new(None),
+        }
     }
 
     /// Switch the bridge into dry-run mode: subsequent `Kernel::build` calls only
@@ -282,6 +374,73 @@ impl PerfApiBridge {
     pub fn take_enum_report(&self) -> Vec<KernelEnum> {
         match self.enumerate.borrow_mut().as_mut() {
             Some(report) => std::mem::take(report),
+            None => Vec::new(),
+        }
+    }
+
+    // ── kernel-config records (profile.db registry) ──────────────────────────
+
+    /// Record every kernel config subsequent `Kernel::build` calls build, in any
+    /// bridge mode. Drain with [`take_config_records`](Self::take_config_records).
+    pub fn enable_config_records(&self) {
+        *self.config_records.borrow_mut() = Some(ConfigRecords::default());
+    }
+
+    /// Whether `Kernel::build` should record its config.
+    pub fn records_configs(&self) -> bool {
+        self.config_records.borrow().is_some()
+    }
+
+    /// Record that role `role` of the active pool built the config with this
+    /// `identity` on `gpu_name`. `grid` runs only for the first role that builds
+    /// a given `(kind, gpu_name, identity)`; later roles are added to its uses.
+    /// No-op when records are not enabled.
+    pub fn record_config(
+        &self,
+        role: &str,
+        kind: KernelKind,
+        profile_kind: KernelKind,
+        gpu_name: &str,
+        identity: Value,
+        grid: impl FnOnce() -> Result<ConfigGrid, BuildError>,
+    ) -> Result<(), BuildError> {
+        let mut state = self.config_records.borrow_mut();
+        let Some(records) = state.as_mut() else {
+            return Ok(());
+        };
+        let config_use = ConfigUse {
+            pool: self.active_pool.borrow().clone().unwrap_or_default(),
+            role: role.to_string(),
+        };
+        let key = (
+            kind,
+            gpu_name.to_string(),
+            serde_json::to_string(&identity).expect("a config identity is JSON"),
+        );
+        if let Some(&i) = records.index.get(&key) {
+            let uses = &mut records.records[i].uses;
+            if !uses.contains(&config_use) {
+                uses.push(config_use);
+            }
+            return Ok(());
+        }
+        records.records.push(KernelConfigRecord {
+            kind,
+            profile_kind,
+            gpu_name: gpu_name.to_string(),
+            identity,
+            grid: grid()?,
+            uses: vec![config_use],
+        });
+        records.index.insert(key, records.records.len() - 1);
+        Ok(())
+    }
+
+    /// Take the recorded configs in first-built order, leaving recording on
+    /// with nothing recorded. Empty if records were never enabled.
+    pub fn take_config_records(&self) -> Vec<KernelConfigRecord> {
+        match self.config_records.borrow_mut().as_mut() {
+            Some(records) => std::mem::take(records).records,
             None => Vec::new(),
         }
     }
@@ -496,6 +655,7 @@ impl PerfApiBridge {
             backend_overrides: RefCell::new(None),
             active_pool: RefCell::new(None),
             enumerate: RefCell::new(None),
+            config_records: RefCell::new(None),
         }
     }
 }
@@ -673,11 +833,11 @@ fn optional_string(item: &PyAny, field: &str) -> Result<Option<String>, PerfApiE
 
 #[cfg(test)]
 mod tests {
-    use super::{PerfApiBridge, ensure_payload_backends_match, shared_backend};
+    use super::{ensure_payload_backends_match, shared_backend, ConfigGrid, PerfApiBridge};
     use crate::timing::bridge::payload::intern_backend;
-    use crate::timing::bridge::{ArgsPayload, PerfApiError};
+    use crate::timing::bridge::{ArgsPayload, BuildError, PerfApiError};
     use serde_json::Value;
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
 
     fn submap(pairs: &[(&str, &[&str])]) -> HashMap<String, Vec<String>> {
         pairs
@@ -812,7 +972,7 @@ mod tests {
         assert_eq!(report[0].compute_dtype, Some(super::DType::Fp8E4m3));
         assert_eq!(report[1].compute_dtype, None); // comm is dtype-agnostic
         assert_eq!(report[1].pool, ""); // deployment-level, no active pool
-        // draining leaves an empty report while still in enumerate mode.
+                                        // draining leaves an empty report while still in enumerate mode.
         assert!(bridge.take_enum_report().is_empty());
         assert!(bridge.is_enumerate());
     }
@@ -884,6 +1044,81 @@ mod tests {
         let batch = vec![payload(None)];
         let err = ensure_payload_backends_match(&batch, "torch").unwrap_err();
         assert!(matches!(err, PerfApiError::InvalidRequest(_)));
+    }
+
+    fn grid() -> ConfigGrid {
+        ConfigGrid {
+            cache_coords: &["m"],
+            axes: vec![vec![1.0]],
+            cells: vec![BTreeMap::from([("m".to_string(), Value::from(1))])],
+            infeasible: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn record_config_shares_one_record_per_identity_and_gpu() {
+        let bridge = PerfApiBridge::structure_only();
+        let identity = serde_json::json!({"n": 1});
+        // Off until enabled: nothing is recorded and the grid is never built.
+        bridge
+            .record_config(
+                "a",
+                "single_gemm",
+                "single_gemm",
+                "B200",
+                identity.clone(),
+                || panic!("grid built while records are off"),
+            )
+            .unwrap();
+        bridge.enable_config_records();
+        assert!(bridge.records_configs());
+
+        let _scope = bridge.with_backend_overrides("main", None);
+        let mut built = 0;
+        for (role, gpu) in [("a", "B200"), ("b", "B200"), ("a", "B200"), ("a", "H200")] {
+            bridge
+                .record_config(
+                    role,
+                    "single_gemm",
+                    "single_gemm",
+                    gpu,
+                    identity.clone(),
+                    || {
+                        built += 1;
+                        Ok(grid())
+                    },
+                )
+                .unwrap();
+        }
+
+        assert_eq!(built, 2);
+        let records = bridge.take_config_records();
+        assert_eq!(records.len(), 2);
+        let roles: Vec<_> = records[0]
+            .uses
+            .iter()
+            .map(|u| (u.pool.as_str(), u.role.as_str()))
+            .collect();
+        assert_eq!(roles, vec![("main", "a"), ("main", "b")]);
+        assert_eq!(records[1].gpu_name, "H200");
+        assert!(bridge.take_config_records().is_empty());
+    }
+
+    #[test]
+    fn record_config_propagates_a_grid_error() {
+        let bridge = PerfApiBridge::structure_only();
+        bridge.enable_config_records();
+        let err = bridge
+            .record_config("a", "k", "k", "B200", serde_json::json!({}), || {
+                Err(BuildError::BackendDependentArgs {
+                    kind: "k",
+                    first: "x",
+                    other: "y",
+                })
+            })
+            .unwrap_err();
+        assert!(matches!(err, BuildError::BackendDependentArgs { .. }));
+        assert!(bridge.take_config_records().is_empty());
     }
 
     #[test]

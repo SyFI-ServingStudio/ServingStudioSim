@@ -23,11 +23,14 @@ scope-fused floor), and emits the two roofline floors in **GPU·seconds** on std
     {"levels": {"<level_key>": {"necessary": s, "segmented": s}, ...},
      "meta": {...}}
 
-For batch-locked run analysis, Rust instead sends deduplicated iteration shapes::
+For batch-locked run analysis, Rust instead sends deduplicated iteration shapes,
+one array per field (element ``i`` of every array is shape ``i``)::
 
-    {"locked_compositions": {"<worker_key>": [
-        {"occurrences": 3, "totals": {...}}, ...
-    ]}}
+    {"locked_compositions": {"<worker_key>": {
+        "occurrences": [3, ...],
+        "totals": {"matmul_tokens": [...], ..., "speculative_geometry": [{...}, ...],
+                   "request_geometry": [{...}, ...]},
+    }}}
 
 Each fixed-batch roofline is evaluated before occurrence weighting. Dense affine
 bases vectorize the common path; every basis is independently checked against one
@@ -50,13 +53,17 @@ decode ``mask="full"`` interaction (``pairs() = q·k`` with ``q=1``,
 ``k=Σpairs``) reproduce the GQA work exactly without a 1.7-billion-element list.
 ``attention_step_count`` separately preserves the original state-transaction
 count required by recurrent linear attention.
+
+A model whose work is not linear in those sums (GLM-5.3's kpool DSA caps every
+query at its own top-k) has its simulator log each request; its totals then also
+carry ``request_geometry`` (``"prefill:<prefix>:<append>"`` / ``"decode:<kv_len>"``
+-> count), which becomes exact causal interactions checked against the scalars.
 """
 
 from __future__ import annotations
 
 import json
 import sys
-from collections import defaultdict
 from functools import cache
 from pathlib import Path
 
@@ -77,8 +84,27 @@ def _model(config_path: str):
     return load_model(config_path)
 
 
+#: Arch types whose served deployment fixes the MLA latent cache at FP8
+#: (``--kv-cache-dtype fp8_e4m3``), a serving choice the checkpoint config omits.
+_FP8_MLA_CACHE_ARCHS = frozenset({"glm53_flash_vllm_fp8_kda_dsa_moe"})
+
+
+def _with_fp8_mla_cache(model):
+    from dataclasses import replace
+
+    layers = [
+        replace(stack, attn=replace(stack.attn, mla_cache_dtype_bytes=1.0))
+        if hasattr(stack.attn, "mla_cache_dtype_bytes")
+        else stack
+        for stack in model.layers
+    ]
+    return replace(model, layers=layers)
+
+
 def _model_for_spec(spec: dict):
     model = _model(spec["config"])
+    if spec.get("arch_type") in _FP8_MLA_CACHE_ARCHS:
+        return _with_fp8_mla_cache(model)
     if spec.get("arch_type") != "glm52_vllm_nvfp4_dsa_moe_speculative":
         return model
     mode = spec.get("mtp_mode", "index_share")
@@ -241,7 +267,9 @@ def _aggregate_workload(totals: dict) -> Workload:
     sampled = int(totals["decode_passes"]) + int(totals["prefill_requests"])
     attn: list[AttnInteraction] = []
     prefill_pairs = int(totals["prefill_pairs"])
-    if prefill_pairs > 0:
+    if totals.get("request_geometry"):
+        attn = _request_interactions(totals)
+    elif prefill_pairs > 0:
         attn.append(
             AttnInteraction(
                 1,
@@ -252,7 +280,7 @@ def _aggregate_workload(totals: dict) -> Workload:
             )
         )
     decode_kv = int(totals["decode_kv"])
-    if decode_kv > 0:
+    if decode_kv > 0 and not totals.get("request_geometry"):
         attn.append(AttnInteraction(1, decode_kv, decode_kv, "full", phase="decode"))
     prefill_tokens = int(totals["prefill_tokens"])
     decode_passes = int(totals["decode_passes"])
@@ -283,6 +311,60 @@ def _aggregate_workload(totals: dict) -> Workload:
         },
         prefill_stateful_requests=prefill_stateful_requests,
     )
+
+
+def _exact_count(value, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a number")
+    if not float(value).is_integer() or value <= 0:
+        raise ValueError(f"{name} must be a positive exact integer, got {value}")
+    return int(value)
+
+
+def _request_interactions(totals: dict) -> list[AttnInteraction]:
+    """Exact causal interactions from logged per-request geometry.
+
+    A decode ``kv_len`` counts the new token (the simulator's context is ``>= 1``),
+    so the query attends ``kv_len`` keys of which ``kv_len - 1`` are cached — the
+    same ``Σ kv_len`` pairs the scalar ``decode_kv`` carries. Every scalar the
+    geometry determines must agree with it; a partially logged workload is refused.
+    """
+    interactions: list[AttnInteraction] = []
+    decode_passes = decode_kv = 0
+    prefill_requests = prefill_pairs = prefill_cached = 0
+    for encoded, raw_count in sorted(totals["request_geometry"].items()):
+        count = _exact_count(raw_count, f"request_geometry[{encoded!r}]")
+        kind, *lengths = encoded.split(":")
+        values = [int(length) for length in lengths]
+        if kind == "decode" and len(values) == 1 and values[0] >= 1:
+            (kv_len,) = values
+            interactions.append(AttnInteraction(1, kv_len, kv_len - 1, "causal", "decode", count))
+            decode_passes += count
+            decode_kv += count * kv_len
+        elif kind == "prefill" and len(values) == 2 and values[1] >= 1:
+            prefix, append = values
+            interactions.append(
+                AttnInteraction(append, prefix + append, prefix, "causal", "prefill", count)
+            )
+            prefill_requests += count
+            prefill_pairs += count * (append * prefix + append * (append + 1) // 2)
+            prefill_cached += count * prefix
+        else:
+            raise ValueError(f"malformed request_geometry key {encoded!r}")
+    derived = {
+        "decode_passes": decode_passes,
+        "decode_kv": decode_kv,
+        "prefill_requests": prefill_requests,
+        "prefill_pairs": prefill_pairs,
+        "prefill_cached": prefill_cached,
+    }
+    for name, value in derived.items():
+        if int(totals.get(name, 0)) != value:
+            raise ValueError(
+                f"request_geometry gives {name}={value} but the workload carries "
+                f"{int(totals.get(name, 0))}; per-request geometry must cover every group"
+            )
+    return interactions
 
 
 def _peak_resolver(spec: dict):
@@ -548,7 +630,47 @@ def _segment_work_matches(
     return True
 
 
-def _validation_shapes(weighted_shapes: list[dict]) -> list[dict]:
+class _ShapeColumns:
+    """One worker's deduplicated shapes, as the parallel arrays Rust sends.
+
+    Element `i` of every column is shape `i`. The vectorized paths read `counts`,
+    one int64 array per workload field; the per-shape paths call `totals(row)`,
+    which rebuilds exactly the row object the wire used to carry, so `model.label`
+    sees the same values either way. A 2000 s PD run sends 1.6M shapes; a Python
+    dict per shape spent more time in bookkeeping than the labeler spent on math.
+    """
+
+    def __init__(self, composition: dict):
+        self.occurrences = np.asarray(composition["occurrences"], dtype=np.int64)
+        self._columns = composition["totals"]
+        size = len(self.occurrences)
+        for field_name, column in self._columns.items():
+            if len(column) != size:
+                raise ValueError(
+                    f"column {field_name!r} has {len(column)} rows, occurrences has {size}"
+                )
+        # Older analyzer payloads predate optional workload axes such as
+        # `prefill_stateful_requests`; their wire default is zero.
+        self.counts = {
+            field_name: (
+                np.asarray(self._columns[field_name]).astype(np.int64)
+                if field_name in self._columns
+                else np.zeros(size, dtype=np.int64)
+            )
+            for field_name in _WORKLOAD_FIELDS
+        }
+
+    def __len__(self) -> int:
+        return len(self.occurrences)
+
+    def totals(self, row: int) -> dict:
+        return {field_name: column[row] for field_name, column in self._columns.items()}
+
+    def carries_speculative_geometry(self) -> bool:
+        return any(self._columns.get("speculative_geometry", ()))
+
+
+def _validation_rows(shapes: _ShapeColumns, rows: np.ndarray) -> list[int]:
     """The group members a basis must reproduce exactly to be accepted.
 
     The first member, plus the argmin and argmax of every workload field. A basis
@@ -557,14 +679,12 @@ def _validation_shapes(weighted_shapes: list[dict]) -> list[dict]:
     accepting the basis for the interior defensible. Any member may still be
     checked cheaply later; the corners are the ones that must be.
     """
-    selected = {id(weighted_shapes[0]): weighted_shapes[0]}
+    selected = {int(rows[0]): None}
     for field_name in _WORKLOAD_FIELDS:
-        # Older analyzer payloads predate optional workload axes such as
-        # `prefill_stateful_requests`; their wire default is zero.
-        axis = lambda shape: int(shape["totals"].get(field_name, 0))  # noqa: B023,E731
-        for extreme in (min(weighted_shapes, key=axis), max(weighted_shapes, key=axis)):
-            selected.setdefault(id(extreme), extreme)
-    return list(selected.values())
+        axis = shapes.counts[field_name][rows]
+        for extreme in (np.argmin(axis), np.argmax(axis)):
+            selected.setdefault(int(rows[extreme]), None)
+    return list(selected)
 
 
 #: Below this many members, fitting a basis costs more labels than it saves.
@@ -578,15 +698,22 @@ _MIN_BASIS_GROUP = 24
 
 def _validated_basis(
     model,
-    weighted_shapes: list[dict],
+    shapes: _ShapeColumns,
+    rows: np.ndarray,
     has_routed_matmul: bool,
     basis_cache: dict[_BasisKey, dict | None],
     default_dtype: str,
 ) -> dict | None:
     """Build and independently validate one basis before any batch reduction."""
-    totals = weighted_shapes[0]["totals"]
+    totals = shapes.totals(int(rows[0]))
     basis_key = _basis_key(model, totals, has_routed_matmul)
-    if totals.get("speculative_geometry") or len(weighted_shapes) < _MIN_BASIS_GROUP:
+    # Per-request geometry exists exactly because the work is not affine in the
+    # scalars, so such shapes are always reduced directly.
+    if (
+        totals.get("speculative_geometry")
+        or totals.get("request_geometry")
+        or len(rows) < _MIN_BASIS_GROUP
+    ):
         # Counted with the validation failures: both mean "this group was reduced
         # one shape at a time".
         basis_cache[basis_key] = None
@@ -594,10 +721,10 @@ def _validated_basis(
         candidate = _workload_basis(model, totals, has_routed_matmul)
         matches = all(
             _segment_work_matches(
-                _reconstruct_segment_work(candidate, shape["totals"]),
-                _segment_work(model, shape["totals"]),
+                _reconstruct_segment_work(candidate, shapes.totals(row)),
+                _segment_work(model, shapes.totals(row)),
             )
-            for shape in _validation_shapes(weighted_shapes)
+            for row in _validation_rows(shapes, rows)
         )
         if matches:
             # Validation just proved the basis spans exactly the direct label's
@@ -611,7 +738,8 @@ def _validated_basis(
 
 def _reduce_affine_group(
     basis: dict,
-    weighted_shapes: list[dict],
+    shapes: _ShapeColumns,
+    rows: np.ndarray,
     peak,
     bandwidth_gbps: float,
 ) -> tuple[float, float, dict[str, dict]]:
@@ -643,20 +771,12 @@ def _reduce_affine_group(
         ],
         dtype=np.float64,
     )
-    workload_deltas = np.asarray(
-        [
-            [
-                int(weighted_shape["totals"].get(field_name, 0)) - basis["origin"][field_name]
-                for field_name in field_names
-            ]
-            for weighted_shape in weighted_shapes
-        ],
-        dtype=np.float64,
-    )
-    occurrences = np.asarray(
-        [int(weighted_shape["occurrences"]) for weighted_shape in weighted_shapes],
-        dtype=np.float64,
-    )
+    workload_deltas = np.empty((len(rows), len(field_names)), dtype=np.float64)
+    for column_index, field_name in enumerate(field_names):
+        workload_deltas[:, column_index] = (
+            shapes.counts[field_name][rows] - basis["origin"][field_name]
+        )
+    occurrences = shapes.occurrences[rows].astype(np.float64)
     # One peak per segment: a mixed-precision checkpoint runs some rows on the FP8
     # tensor cores and others (router, sparse MLA) at the master dtype.
     segment_peaks = np.asarray(
@@ -694,7 +814,7 @@ def _reduce_affine_group(
 
 
 def _reduce_direct_group(
-    model, weighted_shapes: list[dict], spec: dict, peak, bandwidth_gbps: float
+    model, shapes: _ShapeColumns, rows: np.ndarray, spec: dict, peak, bandwidth_gbps: float
 ) -> tuple[float, float, dict[str, dict]]:
     """Correct fallback for a model whose work is not affine in a basis.
 
@@ -706,9 +826,9 @@ def _reduce_direct_group(
     segmented_seconds = 0.0
     segments_by_name: dict[str, dict] = {}
     default_dtype = spec["dtype"]
-    for weighted_shape in weighted_shapes:
-        occurrences = int(weighted_shape["occurrences"])
-        label = model.label(_aggregate_workload(weighted_shape["totals"]))
+    for row in rows:
+        occurrences = int(shapes.occurrences[row])
+        label = model.label(_aggregate_workload(shapes.totals(int(row))))
         payload = _payload_from_segment_work(
             {
                 segment.name: (segment.flops_total, segment.bytes_total)
@@ -778,7 +898,32 @@ def compute_floors(log_dir: Path, levels: dict[str, dict]) -> dict[str, dict]:
     return out
 
 
-def compute_locked_compositions(log_dir: Path, compositions: dict[str, list[dict]]) -> dict:
+def _rows_by_basis(model, shapes: _ShapeColumns, has_routed_matmul: bool) -> list[np.ndarray]:
+    """Shape rows grouped by `_basis_key`, groups in first-appearance order.
+
+    Rows keep their input order inside a group, so every reduction sums in the
+    same order as a per-shape loop would.
+    """
+    counts = shapes.counts
+    matmul_tokens = counts["matmul_tokens"]
+    prefill_present = (counts["prefill_pairs"] > 0) | (counts["prefill_tokens"] > 0)
+    decode_present = (counts["decode_passes"] > 0) | (counts["decode_kv"] > 0)
+    # One integer per `_basis_key` tuple: the routed token count (or 0), then the
+    # three flags in the low bits.
+    key = (
+        (matmul_tokens if has_routed_matmul else np.zeros_like(matmul_tokens)) * 8
+        + (matmul_tokens >= model.vocab) * 4
+        + prefill_present * 2
+        + decode_present
+    )
+    _unique, first_rows, group_of_row = np.unique(key, return_index=True, return_inverse=True)
+    group_of_row = group_of_row.reshape(-1)
+    rows_in_group_order = np.argsort(group_of_row, kind="stable")
+    groups = np.split(rows_in_group_order, np.cumsum(np.bincount(group_of_row))[:-1])
+    return [groups[group] for group in np.argsort(first_rows, kind="stable")]
+
+
+def compute_locked_compositions(log_dir: Path, compositions: dict[str, dict]) -> dict:
     """Compose fixed-batch labels without fusing work across iteration boundaries.
 
     Rust deduplicates equal workloads. Each row here is one distinct shape plus its
@@ -788,45 +933,52 @@ def compute_locked_compositions(log_dir: Path, compositions: dict[str, list[dict
     """
     pool_specs = _pool_specs(log_dir)
     out: dict[str, dict] = {}
-    for level_key, weighted_shapes in compositions.items():
+    for level_key, composition in compositions.items():
         try:
             spec = _spec_for_level(level_key, pool_specs)
             model = _model_for_spec(spec)
             _check_precision(model, spec)
-            if not weighted_shapes:
+            shapes = _ShapeColumns(composition)
+            if not len(shapes):
                 _validate_speculative_totals(spec, {})
+            nonpositive = np.flatnonzero(shapes.occurrences <= 0)
+            first_nonpositive = int(nonpositive[0]) if len(nonpositive) else len(shapes)
+            if (
+                spec.get("arch_type") == "glm52_vllm_nvfp4_dsa_moe_speculative"
+                or shapes.carries_speculative_geometry()
+            ):
+                # Up to and including the first bad count, so the error a caller
+                # sees is the first bad row's, whichever check it fails.
+                for row in range(min(first_nonpositive + 1, len(shapes))):
+                    _validate_speculative_totals(spec, shapes.totals(row))
+            if first_nonpositive < len(shapes):
+                raise ValueError(
+                    f"occurrences must be positive, got {shapes.occurrences[first_nonpositive]}"
+                )
             fused_seconds = 0.0
             segmented_seconds = 0.0
             segments_by_name: dict[str, dict] = {}
-            iteration_count = sum(int(shape["occurrences"]) for shape in weighted_shapes)
+            iteration_count = int(shapes.occurrences.sum())
             has_routed_matmul = _has_routed_matmul(model)
             basis_cache: dict[_BasisKey, dict | None] = {}
-            shapes_by_basis: dict[_BasisKey, list[dict]] = defaultdict(list)
-            for weighted_shape in weighted_shapes:
-                _validate_speculative_totals(spec, weighted_shape["totals"])
-                occurrences = int(weighted_shape["occurrences"])
-                if occurrences <= 0:
-                    raise ValueError(f"occurrences must be positive, got {occurrences}")
-                shapes_by_basis[
-                    _basis_key(model, weighted_shape["totals"], has_routed_matmul)
-                ].append(weighted_shape)
             peak = _peak_resolver(spec)
             bandwidth_gbps = gpu_mem_bandwidth_gbps(spec["gpu"])
-            for basis_shapes in shapes_by_basis.values():
+            for rows in _rows_by_basis(model, shapes, has_routed_matmul):
                 basis = _validated_basis(
                     model,
-                    basis_shapes,
+                    shapes,
+                    rows,
                     has_routed_matmul,
                     basis_cache,
                     spec["dtype"],
                 )
                 if basis is None:
                     group_fused, group_segmented, group_segments = _reduce_direct_group(
-                        model, basis_shapes, spec, peak, bandwidth_gbps
+                        model, shapes, rows, spec, peak, bandwidth_gbps
                     )
                 else:
                     group_fused, group_segmented, group_segments = _reduce_affine_group(
-                        basis, basis_shapes, peak, bandwidth_gbps
+                        basis, shapes, rows, peak, bandwidth_gbps
                     )
                 fused_seconds += group_fused
                 segmented_seconds += group_segmented
@@ -836,7 +988,7 @@ def compute_locked_compositions(log_dir: Path, compositions: dict[str, list[dict
                 "segmented": segmented_seconds,
                 "segments": [segments_by_name[name] for name in sorted(segments_by_name)],
                 "composition": {
-                    "unique_shapes": len(weighted_shapes),
+                    "unique_shapes": len(shapes),
                     "iterations": iteration_count,
                     "affine_bases": sum(basis is not None for basis in basis_cache.values()),
                     "direct_fallback_bases": sum(basis is None for basis in basis_cache.values()),

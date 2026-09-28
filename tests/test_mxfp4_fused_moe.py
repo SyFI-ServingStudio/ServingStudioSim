@@ -25,7 +25,7 @@ def _spec(**overrides: object) -> dict:
         "num_local_experts": 96,
         "top_k": 6,
         "input_dtype": "bf16",
-        "weight_format": "mxfp4_ue8m0",
+        "weight_format": "mxfp4_e2m1",
         "group_size": 32,
         "routing_method": "precomputed_dsv4",
         "n_group": 1,
@@ -43,7 +43,7 @@ def _spec(**overrides: object) -> dict:
     [
         ({"n_group": 8, "topk_group": 4}, "n_group=topk_group=1"),
         ({"routed_scaling_numerator": 5, "routed_scaling_denominator": 2}, "routed scale"),
-        ({"weight_format": "nvfp4_e2m1", "group_size": 16}, "mxfp4_ue8m0"),
+        ({"weight_format": "nvfp4_e2m1", "group_size": 16}, "mxfp4_e2m1"),
         ({"routing_method": "deepseek_v3"}, "routing method"),
         ({"intermediate_size": 2240}, "multiple of 128"),
         ({"input_dtype": "fp16"}, "BF16"),

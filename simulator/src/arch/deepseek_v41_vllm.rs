@@ -845,7 +845,7 @@ fn layer_config(
             all_reduce_backends: ALL_REDUCE_BACKENDS.to_vec(),
             elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
             moe_input_dtype: DType::Bf16,
-            weight_format: "mxfp4_ue8m0".into(),
+            weight_format: DType::Mxfp4E2m1,
             group_size: 32,
             // Finished top-k ids come in; the router already applied the
             // routed scaling, so the kernel sees 1/1 and no grouping.

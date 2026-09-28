@@ -10,6 +10,7 @@
 pub mod attention;
 pub mod comm;
 pub mod gemm;
+pub mod mhc;
 pub mod moe;
 pub mod ssm;
 

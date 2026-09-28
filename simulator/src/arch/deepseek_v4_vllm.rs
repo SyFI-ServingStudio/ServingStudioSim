@@ -16,11 +16,10 @@ use crate::arch::config::ModelSpec;
 use crate::arch::contract::{IterwiseUnifiedModel, UnifiedArchInput};
 use crate::op::Op;
 use crate::timing::kernels::{
-    DeepseekV4TerminalMhcHeadKernel, ElementwiseKernel, ElementwiseKernelConfig,
-    ElementwiseKernelInput, MhcRmsNormKernelConfig, MhcRmsNormKernelInput, MoeEpAllGatherKernel,
-    MoeEpAllGatherKernelConfig, MoeEpCollectiveKernelInput, MoeEpReduceScatterKernel,
-    MoeEpReduceScatterKernelConfig, SingleGemmKernel, SingleGemmKernelConfig,
-    SingleGemmKernelInput,
+    ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput, MhcRmsNormKernelConfig,
+    MhcRmsNormKernelInput, MhcTerminalHeadKernel, MoeEpAllGatherKernel, MoeEpAllGatherKernelConfig,
+    MoeEpCollectiveKernelInput, MoeEpReduceScatterKernel, MoeEpReduceScatterKernelConfig,
+    SingleGemmKernel, SingleGemmKernelConfig, SingleGemmKernelInput,
 };
 use crate::timing::routing::RoutingDistribution;
 use crate::timing::{
@@ -419,16 +418,16 @@ fn layer_config(
             fp32_gemm_backends: FP32_GEMM_BACKENDS.to_vec(),
             fused_q_kv_rmsnorm_backends: vec!["vllm_triton"],
             qnorm_rope_kv_insert_backends: vec!["vllm_cuda"],
-            compressor_store_backends: vec!["vllm_deepseek_v4_cutedsl"],
-            indexer_compressor_store_backends: vec!["vllm_deepseek_v4_triton"],
+            compressor_store_backends: vec!["vllm_cutedsl"],
+            indexer_compressor_store_backends: vec!["vllm_triton"],
             sparse_prefill_backends: vec!["vllm_flashmla_bf16"],
             sparse_decode_backends: vec!["vllm_flashmla_fp8_cudagraph"],
             inverse_rope_quant_backends: vec!["vllm_triton"],
             indexer_q_rope_quant_backends: vec!["vllm_cutedsl_fp8"],
             indexer_prefill_logits_backends: vec!["vllm_deepgemm_fp8"],
             indexer_prefill_topk_backends: vec!["vllm_cuda"],
-            indexer_decode_logits_backends: vec!["vllm_deepgemm_fp8"],
-            indexer_decode_topk_backends: vec!["vllm_cuda"],
+            indexer_decode_logits_backends: vec!["deepgemm_fp8"],
+            indexer_decode_topk_backends: vec!["vllm_fork_cuda"],
         },
         router: DeepseekV4MoeRouterLocalWorkletConfig {
             hidden_size: model.hidden_size.clone(),
@@ -652,7 +651,7 @@ impl DeepseekV4LayerBody {
 pub struct DeepseekV4VllmModel {
     name: String,
     layers: Vec<DeepseekV4LayerBody>,
-    terminal_mhc_head: Op<DeepseekV4TerminalMhcHeadKernel>,
+    terminal_mhc_head: Op<MhcTerminalHeadKernel>,
     lm_head: Op<SingleGemmKernel>,
     total_kv_bytes_per_token: u64,
     cost_flat: Vec<FlatCostNode>,
@@ -678,7 +677,7 @@ pub fn build(
         layers,
         terminal_mhc_head: Op::new(
             terminal_name.clone(),
-            Arc::new(DeepseekV4TerminalMhcHeadKernel::build(
+            Arc::new(MhcTerminalHeadKernel::build(
                 terminal_name,
                 resolved.terminal_mhc_head,
                 bridge,
@@ -755,6 +754,13 @@ impl DeepseekV4VllmModel {
 }
 
 impl IterwiseUnifiedModel for DeepseekV4VllmModel {
+    fn check_input(&self, batch: &UnifiedArchInput) -> Result<(), String> {
+        let input = normalize_input(batch)?;
+        self.layers
+            .iter()
+            .try_for_each(|layer| layer.attention.check_input(&input.attention))
+    }
+
     fn eval_iter(
         &self,
         batch: &UnifiedArchInput,

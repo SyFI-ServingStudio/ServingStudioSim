@@ -16,14 +16,20 @@ Rust schema tags with `affects_cache` (keyed by dotted path). When Rust adds a
 kernel-shaping param it
 tags it, and the launcher picks it up with no Python edit. See `param_def.rs`
 for the safe-direction rule (when unsure, tag it — over-tagging only costs extra
-prebuild passes; under-tagging reintroduces the contention bug).
+prebuild passes; under-tagging reintroduces the contention bug). The one
+exception is the provider tags (the deployment, and each group's arch and worker
+`type`): they are no ParamDefs, so `cache_key` keys them itself.
 """
 
 from __future__ import annotations
 
 import asyncio
 import re
+import sqlite3
+import sys
 from pathlib import Path
+
+from profiling.gpu_policy import GpuDisabledError, require_gpu
 
 from .exec import REPO_ROOT, _build_subprocess_env, binary_path
 from .process import ProcessSpec, ProcessSupervisor
@@ -41,18 +47,28 @@ def cache_key(config: dict, registry: Registry) -> tuple:
     """The kernel-determining subset of a config tree, hashable for dedup. Walks
     the tree and collects every leaf whose ParamDef is tagged `affects_cache`
     (Rust-authoritative), keyed by its dotted path so two configs that differ
-    only in non-kernel params (rate, replicas, log_dir, ...) collapse."""
-    items: list[tuple[str, object]] = []
+    only in non-kernel params (rate, replicas, log_dir, ...) collapse.
+
+    The deployment and each group's arch and worker `type` are keyed too: they
+    are provider tags, not ParamDefs, and they pick the kernels the params feed
+    (two Qwen arch tags take the same params and build different kernels)."""
+    items: list[tuple[str, object]] = [("deployment", config.get("deployment"))]
     for slot in iter_slots(registry, config):
         if slot.pdef.get("affects_cache") and slot.present:
             value = slot.value
             if isinstance(value, list):
                 value = tuple(value)
             items.append((".".join(slot.path), value))
+    for role, pool in (config.get("pools") or {}).items():
+        for gi, group in enumerate(pool.get("groups") or () if isinstance(pool, dict) else ()):
+            for block in ("arch", "worker"):
+                provider = group.get(block) if isinstance(group, dict) else None
+                if isinstance(provider, dict) and "type" in provider:
+                    items.append((f"pools.{role}.groups.{gi}.{block}.type", provider["type"]))
     return tuple(sorted(items))
 
 
-def _unique_by_cache_key(param_sets: list[dict], registry: Registry) -> list[dict]:
+def unique_by_cache_key(param_sets: list[dict], registry: Registry) -> list[dict]:
     """One representative config per distinct cache key — the dedup shared by the
     cache prebuild and the coverage report. Key leaves are Rust-tagged
     (`affects_cache`), so runs differing only in non-kernel params collapse."""
@@ -77,7 +93,7 @@ def report_cache_coverage(
     env = _build_subprocess_env()
     rc = 0
     with _LAUNCHER_LEASES.profile_database(write=False):
-        for config in _unique_by_cache_key(param_sets, registry):
+        for config in unique_by_cache_key(param_sets, registry):
             cfg_dir = _prebuild_log_dir(_cache_report_base(param_sets), config)
             argv = build_cli_command(
                 config, binary, cfg_dir / "run_config.yaml", subcommand="dry-run"
@@ -142,20 +158,23 @@ async def prebuild_caches(
     env = _build_subprocess_env()
 
     async with _LAUNCHER_LEASES.profile_database(write=True):
-        for config in _unique_by_cache_key(param_sets, registry):
+        for config in unique_by_cache_key(param_sets, registry):
             cfg_dir = _prebuild_log_dir(base_dir, config)
             config_path = cfg_dir / "run_config.yaml"
+            kernel_configs = cfg_dir / "kernel_configs.json"
             build_argv = build_cli_command(
                 config, binary, config_path, subcommand="build-cache-only"
-            )
+            ) + ["--kernel-configs-out", str(kernel_configs)]
             probe_argv = [str(binary), "dry-run", str(config_path)]
             journal = RunJournal(cfg_dir)
 
             # Recheck under the exclusive cross-launcher lease. A second launcher
             # waiting on the same cache observes the first launcher's committed DB
-            # rows and skips the GPU/JIT stage entirely.
+            # rows and skips the GPU/JIT stage entirely. The probe also records the
+            # run's kernel configs, so a run whose rows were measured elsewhere
+            # (`kernel-profile run`, another launcher) still registers them.
             missing_before = await _probe_missing(
-                probe_argv,
+                probe_argv + ["--kernel-configs-out", str(kernel_configs)],
                 cfg_dir,
                 env,
                 journal,
@@ -169,7 +188,15 @@ async def prebuild_caches(
                     StageState.SUCCEEDED,
                     resources=["profile-db:exclusive"],
                 )
+                _register_kernel_configs(kernel_configs, config, cfg_dir, journal)
                 continue
+            try:
+                require_gpu(f"filling {missing_before} missing profile.db spec(s)")
+            except GpuDisabledError as error:
+                # Say so here rather than start a cache builder that can only fail.
+                print(f"[no-gpu] {cfg_dir}: {error}", file=sys.stderr)
+                journal.update("ensure_cache", StageState.FAILED, error=str(error))
+                return False
 
             build_spec = ProcessSpec(
                 argv=build_argv,
@@ -233,7 +260,27 @@ async def prebuild_caches(
                 result=build_result,
                 resources=["profile-db:exclusive"],
             )
+            # The rows just measured, and the configs that asked for them.
+            _register_kernel_configs(kernel_configs, config, cfg_dir, journal)
     return True
+
+
+def _register_kernel_configs(
+    records: Path, config: dict, cfg_dir: Path, journal: RunJournal
+) -> None:
+    """Register a prebuild's kernel configs. A failure is reported, not fatal:
+    the measured rows are already in profile.db, and `--register-kernel-configs`
+    can register their configs later without a GPU."""
+    from .kernel_configs import describe, register_file, run_sources
+
+    try:
+        report = register_file(records, run_sources(config, preset=None))
+    except (OSError, ValueError, sqlite3.Error) as error:
+        print(f"[kernel-configs] {cfg_dir}: registration failed: {error}", file=sys.stderr)
+        journal.update("register_kernel_configs", StageState.FAILED, error=str(error))
+        return
+    print(f"[kernel-configs] {cfg_dir}: {describe(report)}")
+    journal.update("register_kernel_configs", StageState.SUCCEEDED)
 
 
 async def _probe_missing(

@@ -90,8 +90,8 @@ const LM_HEAD_BACKENDS: &[&str] = &["torch_linear"];
 const ROUTER_BACKENDS: &[&str] = &["sglang_router_auto"];
 const ELEMENTWISE_BACKENDS: &[&str] = &["triton"];
 const MAIN_ROPE_BACKENDS: &[&str] = &["flashinfer"];
-const Q_ABSORB_BACKENDS: &[&str] = &["torch_mla_q_absorb_glm52"];
-const V_UP_BACKENDS: &[&str] = &["torch_mla_v_up_glm52"];
+const Q_ABSORB_BACKENDS: &[&str] = &["torch_mla_q_absorb"];
+const V_UP_BACKENDS: &[&str] = &["torch_mla_v_up"];
 const INDEXER_Q_ROPE_BACKENDS: &[&str] = &["sglang_cuda"];
 const INDEX_CACHE_BACKENDS: &[&str] = &["sglang_fused_norm_rope_store"];
 const INDEX_LOGITS_BACKENDS: &[&str] = &["deepgemm_fp8"];
@@ -337,7 +337,7 @@ pub fn build_configs(
             gpu_name: gpu.clone(),
             quant_backends: NVFP4_QUANT_BACKENDS.to_vec(),
             moe_backends: NVFP4_MOE_BACKENDS.to_vec(),
-            weight_format: "nvfp4_e2m1".to_string(),
+            weight_format: DType::Nvfp4E2m1,
             group_size: 16,
             routing_method: "minimax2".to_string(),
             n_group: 1,
@@ -1141,6 +1141,10 @@ impl Glm52SglangNvfp4TpDsaMoeModel {
 }
 
 impl IterwiseUnifiedModel for Glm52SglangNvfp4TpDsaMoeModel {
+    fn check_input(&self, batch: &UnifiedArchInput) -> Result<(), String> {
+        normalize_input(batch, self.max_model_len).map(|_| ())
+    }
+
     fn total_kv_bytes_per_token(&self) -> u64 {
         self.total_state_bytes_per_token
     }

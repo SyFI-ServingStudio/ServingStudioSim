@@ -119,8 +119,8 @@ const FP8_SINGLE_GEMM_BACKENDS: &[&str] = &["deepgemm"];
 // nsys iteration, so this is not a shape or a backend preference -- feeding the
 // dense leaves the routed curve over-predicted them ~2.05x at prefill.
 const DENSE_FP8_QUANT_BACKENDS: &[&str] = &["vllm_cuda"];
-const Q_ABSORB_BACKENDS: &[&str] = &["torch_mla_q_absorb_glm52"];
-const V_UP_BACKENDS: &[&str] = &["torch_mla_v_up_glm52"];
+const Q_ABSORB_BACKENDS: &[&str] = &["torch_mla_q_absorb"];
+const V_UP_BACKENDS: &[&str] = &["torch_mla_v_up"];
 const INDEX_CACHE_AND_TOPK_BACKENDS: &[&str] = &["vllm_cuda"];
 const INDEX_LOGITS_BACKENDS: &[&str] = &["deepgemm_fp8"];
 const SPARSE_ATTN_BACKENDS: &[&str] = &["flashinfer_trtllm_fp8"];
@@ -571,7 +571,7 @@ fn build_configs_for_decode(
             gpu_name: gpu.clone(),
             quant_backends: NVFP4_QUANT_BACKENDS.to_vec(),
             moe_backends: NVFP4_FUSED_MOE_BACKENDS.to_vec(),
-            weight_format: "nvfp4_e2m1".to_string(),
+            weight_format: DType::Nvfp4E2m1,
             group_size: 16,
             routing_method: "minimax2".to_string(),
             n_group: 1,
@@ -1932,6 +1932,10 @@ impl Glm52VllmNvfp4DsaMoeModel {
 }
 
 impl IterwiseUnifiedModel for Glm52VllmNvfp4DsaMoeModel {
+    fn check_input(&self, batch: &UnifiedArchInput) -> Result<(), String> {
+        normalize_input(batch, self.target.ep_size, self.max_model_len).map(|_| ())
+    }
+
     fn total_kv_bytes_per_token(&self) -> u64 {
         self.total_state_bytes_per_token
     }
@@ -2040,6 +2044,10 @@ impl Glm52VllmNvfp4DsaMoeSpeculativeModel {
 }
 
 impl SpeculativeUnifiedModel for Glm52VllmNvfp4DsaMoeSpeculativeModel {
+    fn check_input(&self, batch: &SpeculativeArchInput) -> Result<(), String> {
+        normalize_speculative_input(batch, self.draft_tokens, self.max_model_len).map(|_| ())
+    }
+
     fn total_kv_bytes_per_token(&self) -> u64 {
         self.total_state_bytes_per_token
     }
@@ -2205,7 +2213,7 @@ fn normalize_input(
             })?;
             if cache_tokens > max_model_len {
                 return Err(format!(
-                    "group {group_index} prefill request {request_index} context {cache_tokens} exceeds timing cap {max_model_len}"
+                    "group {group_index} prefill request {request_index} context {cache_tokens} exceeds max_model_len {max_model_len}"
                 ));
             }
             prefill_tokens = prefill_tokens
@@ -2320,7 +2328,7 @@ pub(crate) fn normalize_speculative_input(
             })?;
             if cache_tokens > max_model_len {
                 return Err(format!(
-                    "group {group_index} prefill request {request_index} context {cache_tokens} exceeds timing cap {max_model_len}"
+                    "group {group_index} prefill request {request_index} context {cache_tokens} exceeds max_model_len {max_model_len}"
                 ));
             }
             prefill_tokens = prefill_tokens
@@ -2672,7 +2680,7 @@ mod tests {
         for rank in &cfg.nvfp4_moe {
             assert_eq!(rank.quant_backends, vec!["vllm_cuda"]);
             assert_eq!(rank.moe_backends, vec!["flashinfer_trtllm_sm100"]);
-            assert_eq!(rank.weight_format, "nvfp4_e2m1");
+            assert_eq!(rank.weight_format, DType::Nvfp4E2m1);
             assert_eq!(rank.group_size, 16);
             assert_eq!(rank.routing_method, "minimax2");
         }
