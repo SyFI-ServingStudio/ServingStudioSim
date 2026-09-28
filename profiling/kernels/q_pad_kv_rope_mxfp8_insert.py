@@ -43,11 +43,11 @@ from profiling.db.registry import (
     register,
 )
 
-KIND = "deepseek_v41_qnorm_rope_kv_insert"
+KIND = "q_pad_kv_rope_mxfp8_insert"
 
 
 @dataclass(frozen=True)
-class DeepseekV41QnormRopeKvInsertArgs(KernelArgs):
+class QPadKvRopeMxfp8InsertArgs(KernelArgs):
     num_tokens: int
     num_insert_tokens: int
     num_heads: int
@@ -62,11 +62,11 @@ register(
         kernel_kind=KIND,
         backend="vllm_cuda",
         runner_ref=RunnerRef(
-            module_name="profiling.runners.attention.deepseek_v41_qnorm_rope_kv_insert",
-            function_name="profile_deepseek_v41_qnorm_rope_kv_insert_vllm_cuda",
+            module_name="profiling.runners.attention.q_pad_kv_rope_mxfp8_insert_vllm_cuda",
+            function_name="profile_q_pad_kv_rope_mxfp8_insert_vllm_cuda",
         ),
         table_name=KIND,
-        args_schema=DeepseekV41QnormRopeKvInsertArgs,
+        args_schema=QPadKvRopeMxfp8InsertArgs,
         metric_family=MetricFamily.COMPUTE,
         batch_outlier_policy=BatchOutlierPolicy(),
         supports=BackendSupport(
@@ -78,4 +78,4 @@ register(
     )
 )
 
-__all__ = ["DeepseekV41QnormRopeKvInsertArgs", "KIND"]
+__all__ = ["QPadKvRopeMxfp8InsertArgs", "KIND"]

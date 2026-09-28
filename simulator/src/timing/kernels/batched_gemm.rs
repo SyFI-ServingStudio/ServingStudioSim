@@ -3,7 +3,7 @@
 //!
 //! MLA Q absorption and V-up use separate kernel instances with singleton
 //! backend lists and different static `(n, k)` dimensions. DeepSeek-V4.1 `wo_a`
-//! (`deepgemm_mxfp8_einsum_dsv41_wo_a`) is one DeepGEMM MXFP8 grouped einsum
+//! (`deepgemm_mxfp8_einsum_grouped_o_proj`) is one DeepGEMM MXFP8 grouped einsum
 //! with `num_batches` = local `wo_a` groups, `(n, k) = (1024, 4096)` and
 //! `dtype = mxfp8_e4m3` (both operands). This kind owns its Python profile
 //! table and does not reuse `single_gemm` through `profile_kind()`.
@@ -76,7 +76,7 @@ mod tests {
     use serde_json::Value;
 
     const Q_BACKEND: &str = "torch_mla_q_absorb";
-    const WO_A_BACKEND: &str = "deepgemm_mxfp8_einsum_dsv41_wo_a";
+    const WO_A_BACKEND: &str = "deepgemm_mxfp8_einsum_grouped_o_proj";
     const V_BACKEND: &str = "torch_mla_v_up";
 
     fn local_heads() -> Dim {

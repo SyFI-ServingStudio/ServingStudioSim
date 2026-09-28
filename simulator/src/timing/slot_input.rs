@@ -41,8 +41,8 @@ use crate::timing::kernels::{
     VllmMlaRopeKernelInput,
 };
 
-use crate::timing::kernels::DeepseekV41MegaAttnKernelInput;
-use crate::timing::kernels::DeepseekV41QnormRopeKvInsertKernelInput;
+use crate::timing::kernels::CompressedSparseMlaRopeCastKernelInput;
+use crate::timing::kernels::QPadKvRopeMxfp8InsertKernelInput;
 use crate::timing::kernels::EngramLookupKernelInput;
 
 /// The prefill aggregating leaf's input: the full `(prefix_len, append_len)`
@@ -152,8 +152,8 @@ log_inputs! {
     KvCompressStore => KvCompressStoreKernelInput,
     CompressedSparseMlaDecode => CompressedSparseMlaDecodeKernelInput,
     CompressedSparseMlaPrefill => CompressedSparseMlaPrefillKernelInput,
-    DeepseekV41MegaAttn => DeepseekV41MegaAttnKernelInput,
-    DeepseekV41QnormRopeKvInsert => DeepseekV41QnormRopeKvInsertKernelInput,
+    CompressedSparseMlaRopeCast => CompressedSparseMlaRopeCastKernelInput,
+    QPadKvRopeMxfp8Insert => QPadKvRopeMxfp8InsertKernelInput,
     EngramLookup => EngramLookupKernelInput,
     MoeTopkSoftplusSqrt => MoeTopkSoftplusSqrtKernelInput,
     GemmFp32Output => GemmFp32OutputKernelInput,

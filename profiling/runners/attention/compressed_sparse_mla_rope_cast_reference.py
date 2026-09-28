@@ -31,7 +31,7 @@ import torch
 __all__ = [
     "RECORD_BYTES",
     "decode_records",
-    "deepseek_v41_mega_attn_reference",
+    "compressed_sparse_mla_rope_cast_reference",
     "encode_records",
     "output_from_fused_layout",
     "q_to_fused_layout",
@@ -127,7 +127,7 @@ def _rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor
     return torch.cat((x[..., :NOPE_DIM], rotated.flatten(-2)), dim=-1)
 
 
-def deepseek_v41_mega_attn_reference(
+def compressed_sparse_mla_rope_cast_reference(
     q: torch.Tensor,
     positions: torch.Tensor,
     cos_sin_cache: torch.Tensor,

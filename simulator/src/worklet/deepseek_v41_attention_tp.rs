@@ -58,8 +58,8 @@ use crate::timing::bridge::DType;
 use crate::timing::kernels::{
     AllReduceFusionKernel, AllReduceFusionKernelConfig, AllReduceFusionKernelInput,
     BatchedGemmKernel, BatchedGemmKernelConfig, BatchedGemmKernelInput,
-    DeepseekV41QnormRopeKvInsertKernel, DeepseekV41QnormRopeKvInsertKernelConfig,
-    DeepseekV41QnormRopeKvInsertKernelInput, ElementwiseKernel, ElementwiseKernelConfig,
+    QPadKvRopeMxfp8InsertKernel, QPadKvRopeMxfp8InsertKernelConfig,
+    QPadKvRopeMxfp8InsertKernelInput, ElementwiseKernel, ElementwiseKernelConfig,
     ElementwiseKernelInput, GemmFp32OutputKernel, GemmFp32OutputKernelConfig,
     GemmFp32OutputKernelInput, MhcFusedPostPreRmsNormKernel, MhcRmsNormKernelConfig,
     MhcRmsNormKernelInput, SingleGemmKernel, SingleGemmKernelConfig, SingleGemmKernelInput,
@@ -199,7 +199,7 @@ pub struct DeepseekV41AttentionTpWorkletResolved {
     pub indexer_weights_proj: Option<ElementwiseKernelConfig>,
     pub qk_rmsnorm: ElementwiseKernelConfig,
     pub wq_b: SingleGemmKernelConfig,
-    pub kv_insert: DeepseekV41QnormRopeKvInsertKernelConfig,
+    pub kv_insert: QPadKvRopeMxfp8InsertKernelConfig,
     pub compressor_norm: Option<ElementwiseKernelConfig>,
     pub indexer_wk: Option<ElementwiseKernelConfig>,
     pub indexer_k_store: Option<ElementwiseKernelConfig>,
@@ -236,7 +236,7 @@ pub struct DeepseekV41AttentionTpWorklet {
     pub indexer_weights_proj: Option<Op<ElementwiseKernel>>,
     pub qk_rmsnorm: Op<ElementwiseKernel>,
     pub wq_b: Op<SingleGemmKernel>,
-    pub kv_insert: Op<DeepseekV41QnormRopeKvInsertKernel>,
+    pub kv_insert: Op<QPadKvRopeMxfp8InsertKernel>,
     pub compressor_norm: Option<Op<ElementwiseKernel>>,
     pub indexer_wk: Option<Op<ElementwiseKernel>>,
     pub indexer_k_store: Option<Op<ElementwiseKernel>>,
@@ -354,7 +354,7 @@ impl DeepseekV41AttentionTpWorklet {
                 cfg.head_dim.clone() * heads_per_rank,
                 cfg.q_lora_rank.clone(),
             ),
-            kv_insert: DeepseekV41QnormRopeKvInsertKernelConfig {
+            kv_insert: QPadKvRopeMxfp8InsertKernelConfig {
                 backends: cfg.kv_insert_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
                 num_heads: heads_per_rank,
@@ -497,7 +497,7 @@ impl DeepseekV41AttentionTpWorklet {
             ),
             qk_rmsnorm: op!(ElementwiseKernel, r.qk_rmsnorm, "main.qk_rmsnorm"),
             wq_b: op!(SingleGemmKernel, r.wq_b, "main.wq_b"),
-            kv_insert: op!(DeepseekV41QnormRopeKvInsertKernel, r.kv_insert, "main.kv_insert"),
+            kv_insert: op!(QPadKvRopeMxfp8InsertKernel, r.kv_insert, "main.kv_insert"),
             compressor_norm: maybe!(
                 ElementwiseKernel,
                 r.compressor_norm,
@@ -655,7 +655,7 @@ impl DeepseekV41AttentionTpWorklet {
         eval_or_zero(&self.wq_b, gemm.clone(), zero, ev);
         eval_or_zero(
             &self.kv_insert,
-            DeepseekV41QnormRopeKvInsertKernelInput { num_tokens: rows },
+            QPadKvRopeMxfp8InsertKernelInput { num_tokens: rows },
             zero,
             ev,
         );
@@ -785,10 +785,10 @@ pub(crate) mod tests {
             gpu_name: "NVIDIA B200".into(),
             mhc_backends: vec!["deepgemm_mega"],
             gemm_backends: vec!["flashinfer_mxfp8"],
-            fp32_gemm_backends: vec!["torch_cublas_vllm_fork"],
+            fp32_gemm_backends: vec!["torch_cublas"],
             kv_insert_backends: vec!["vllm_cuda"],
             mega_attn_backends: vec!["flashmla_mega"],
-            wo_a_backends: vec!["deepgemm_mxfp8_einsum_dsv41_wo_a"],
+            wo_a_backends: vec!["deepgemm_mxfp8_einsum_grouped_o_proj"],
             all_reduce_backends: vec!["flashinfer_mnnvl"],
             index_logits_prefill_backends: vec!["deepgemm_fp8"],
             index_logits_decode_backends: vec!["deepgemm_fp8"],

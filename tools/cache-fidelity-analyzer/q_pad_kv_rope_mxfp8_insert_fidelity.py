@@ -1,4 +1,4 @@
-"""`deepseek_v41_qnorm_rope_kv_insert` cache fidelity: a Recipe-B caller of `cache_fidelity.py`.
+"""`q_pad_kv_rope_mxfp8_insert` cache fidelity: a Recipe-B caller of `cache_fidelity.py`.
 
 Why a dedicated caller: the Rust Input is `num_tokens` alone, and `enumerate`
 derives `num_insert_tokens = num_tokens` (production passes one slot per row).
@@ -10,7 +10,7 @@ Pre-fill the grid rows first with `launcher kernel-profile run` (the
 `vllm_fork_env` backend should be profiled from a Python process, not JIT-filled
 through the `kernel-query` bridge). Then, on a B200:
 
-    uv run python tools/cache-fidelity-analyzer/deepseek_v41_qnorm_rope_kv_insert_fidelity.py \
+    uv run python tools/cache-fidelity-analyzer/q_pad_kv_rope_mxfp8_insert_fidelity.py \
         --config cfg.json --log-dir logs/<dated>/fidelity
 """
 
@@ -22,7 +22,7 @@ from pathlib import Path
 
 import cache_fidelity as cf  # the generic core (sibling file)
 
-KIND = "deepseek_v41_qnorm_rope_kv_insert"
+KIND = "q_pad_kv_rope_mxfp8_insert"
 
 
 def probes(grid_axis: list[float]) -> list[tuple[tuple, str]]:

@@ -3,10 +3,10 @@ import math
 import pytest
 import torch
 
-from profiling.runners.attention import deepseek_v41_mega_attn as runner
-from profiling.runners.attention.deepseek_v41_mega_attn_reference import (
+from profiling.runners.attention import compressed_sparse_mla_rope_cast as runner
+from profiling.runners.attention.compressed_sparse_mla_rope_cast_reference import (
     decode_records,
-    deepseek_v41_mega_attn_reference,
+    compressed_sparse_mla_rope_cast_reference,
     encode_records,
     output_from_fused_layout,
     q_to_fused_layout,
@@ -60,7 +60,7 @@ def test_reference_single_key_with_sink_is_scaled_inverse_roped_key():
     positions = torch.tensor([5])
     cos_sin = _cos_sin(8)
     sink = torch.tensor([0.25, float("-inf")])
-    out = deepseek_v41_mega_attn_reference(
+    out = compressed_sparse_mla_rope_cast_reference(
         q, positions, cos_sin, sink, 512**-0.5, cache, torch.tensor([[37, -1]])
     )
     cos, sin = cos_sin[5, :32], cos_sin[5, 32:]
@@ -92,7 +92,7 @@ def test_reference_attends_swa_and_compressed_keys_as_one_softmax():
         attn_sink=torch.tensor([float("-inf")]),
         softmax_scale=0.05,
     )
-    out = deepseek_v41_mega_attn_reference(
+    out = compressed_sparse_mla_rope_cast_reference(
         q,
         swa_cache=swa,
         swa_slots=torch.tensor([[0, 1, 2, -1]]),

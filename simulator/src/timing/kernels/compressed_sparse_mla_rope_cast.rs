@@ -55,7 +55,7 @@ const MAX_DECODE_ROWS: u32 = 2048;
 const B200_SMS: u32 = 148;
 
 #[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct DeepseekV41MegaAttnKernelConfig {
+pub struct CompressedSparseMlaRopeCastKernelConfig {
     #[serde(deserialize_with = "de_backends")]
     pub backends: Vec<&'static str>,
     pub gpu_name: String,
@@ -83,11 +83,11 @@ pub struct DeepseekV41MegaAttnKernelConfig {
 /// One segment's requests as `(query_len, context_len)`, context including the
 /// query. Decode flattens every query token into its own row.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct DeepseekV41MegaAttnKernelInput {
+pub struct CompressedSparseMlaRopeCastKernelInput {
     pub query_context_pairs: Vec<(u32, u32)>,
 }
 
-impl SweepCoords for DeepseekV41MegaAttnKernelInput {
+impl SweepCoords for CompressedSparseMlaRopeCastKernelInput {
     fn coords(&self) -> Coords {
         // The key and gather coordinates depend on the Config's mode and ratio;
         // `cache_coords` owns the real projection.
@@ -178,7 +178,7 @@ fn wave_keys(pairs: &[(u32, u32)], ratio: u32, per_wave: usize) -> (u32, f64) {
     (rows, total / maxima.len() as f64)
 }
 
-fn validate_config(config: &DeepseekV41MegaAttnKernelConfig) {
+fn validate_config(config: &CompressedSparseMlaRopeCastKernelConfig) {
     assert!(
         matches!(config.mode.as_str(), "decode" | "prefill"),
         "mode must be decode or prefill, got {:?}",
@@ -208,18 +208,18 @@ fn validate_config(config: &DeepseekV41MegaAttnKernelConfig) {
     assert!(config.max_num_batched_tokens >= 1 && config.max_model_len >= 1);
 }
 
-fn is_decode(config: &DeepseekV41MegaAttnKernelConfig) -> bool {
+fn is_decode(config: &CompressedSparseMlaRopeCastKernelConfig) -> bool {
     config.mode == "decode"
 }
 
 /// Decode rows per CTA wave: one CTA per row and 64 heads.
-fn rows_per_wave(config: &DeepseekV41MegaAttnKernelConfig) -> u32 {
+fn rows_per_wave(config: &CompressedSparseMlaRopeCastKernelConfig) -> u32 {
     B200_SMS * 64 / config.num_heads.get()
 }
 
 /// The padded compressed-gather area of the fork's prefill chunk plan:
 /// `sum(chunk requests * max compressed rows)`.
-fn gather_area(pairs: &[(u32, u32)], config: &DeepseekV41MegaAttnKernelConfig) -> u64 {
+fn gather_area(pairs: &[(u32, u32)], config: &CompressedSparseMlaRopeCastKernelConfig) -> u64 {
     let ratio = config.compress_ratio;
     if ratio == 0 {
         return 0;
@@ -259,7 +259,7 @@ fn area_floor(tokens: u32, ratio: u32) -> f64 {
 }
 
 /// `(tokens, keys, excess gather rows)` under this config.
-fn project(pairs: &[(u32, u32)], config: &DeepseekV41MegaAttnKernelConfig) -> [f64; 3] {
+fn project(pairs: &[(u32, u32)], config: &CompressedSparseMlaRopeCastKernelConfig) -> [f64; 3] {
     let ratio = config.compress_ratio;
     if is_decode(config) {
         let (rows, keys) = wave_keys(pairs, ratio, rows_per_wave(config) as usize);
@@ -333,7 +333,7 @@ fn uniform_for_keys(
 }
 
 /// Whether `pairs` project onto `point` within tolerance.
-fn on_point(pairs: &[(u32, u32)], point: &[f64], config: &DeepseekV41MegaAttnKernelConfig) -> bool {
+fn on_point(pairs: &[(u32, u32)], point: &[f64], config: &CompressedSparseMlaRopeCastKernelConfig) -> bool {
     let projected = project(pairs, config);
     let floor = if is_decode(config) || config.compress_ratio == 0 {
         0.0
@@ -350,7 +350,7 @@ fn on_point(pairs: &[(u32, u32)], point: &[f64], config: &DeepseekV41MegaAttnKer
 /// A decode batch of `rows` flattened rows over at most 256 requests.
 fn canonical_decode(
     point: &[f64],
-    config: &DeepseekV41MegaAttnKernelConfig,
+    config: &CompressedSparseMlaRopeCastKernelConfig,
 ) -> Option<Vec<(u32, u32)>> {
     let rows = point[0] as u32;
     if rows > MAX_DECODE_ROWS {
@@ -373,7 +373,7 @@ fn canonical_decode(
 /// tokens); otherwise it appends one single-token request with a long context.
 fn canonical_prefill(
     point: &[f64],
-    config: &DeepseekV41MegaAttnKernelConfig,
+    config: &CompressedSparseMlaRopeCastKernelConfig,
 ) -> Option<Vec<(u32, u32)>> {
     let (tokens, keys) = (point[0] as u32, point[1]);
     let ratio = config.compress_ratio;
@@ -413,7 +413,7 @@ fn with_filler(
     point: &[f64],
     count: u32,
     target: f64,
-    config: &DeepseekV41MegaAttnKernelConfig,
+    config: &CompressedSparseMlaRopeCastKernelConfig,
 ) -> Option<Vec<(u32, u32)>> {
     let (tokens, keys) = (point[0] as u32, point[1]);
     if tokens < 2 || count > tokens - 1 {
@@ -440,7 +440,7 @@ fn with_filler(
     on_point(&pairs, point, config).then_some(pairs)
 }
 
-fn token_axis(config: &DeepseekV41MegaAttnKernelConfig) -> Vec<f64> {
+fn token_axis(config: &CompressedSparseMlaRopeCastKernelConfig) -> Vec<f64> {
     if is_decode(config) {
         // The decode time steps one wave at a time: bracket every wave edge.
         let wave = rows_per_wave(config);
@@ -465,7 +465,7 @@ fn token_axis(config: &DeepseekV41MegaAttnKernelConfig) -> Vec<f64> {
         .collect()
 }
 
-fn key_axis(config: &DeepseekV41MegaAttnKernelConfig) -> Vec<f64> {
+fn key_axis(config: &CompressedSparseMlaRopeCastKernelConfig) -> Vec<f64> {
     match (is_decode(config), config.compress_ratio) {
         (_, 0) => Axis::values([1, 16, 32, 64, 96, 128]),
         (true, 1) => Axis::values([2, 64, 128, 256, 384, 512, 640]),
@@ -475,7 +475,7 @@ fn key_axis(config: &DeepseekV41MegaAttnKernelConfig) -> Vec<f64> {
     }
 }
 
-fn excess_axis(config: &DeepseekV41MegaAttnKernelConfig) -> Vec<f64> {
+fn excess_axis(config: &CompressedSparseMlaRopeCastKernelConfig) -> Vec<f64> {
     if is_decode(config) || config.compress_ratio == 0 {
         return vec![0.0];
     }
@@ -493,7 +493,7 @@ fn excess_axis(config: &DeepseekV41MegaAttnKernelConfig) -> Vec<f64> {
 }
 
 fn canonical_pairs(
-    config: &DeepseekV41MegaAttnKernelConfig,
+    config: &CompressedSparseMlaRopeCastKernelConfig,
     point: &[f64],
 ) -> Option<Vec<(u32, u32)>> {
     if is_decode(config) {
@@ -503,13 +503,13 @@ fn canonical_pairs(
     }
 }
 
-pub struct DeepseekV41MegaAttnSpec;
+pub struct CompressedSparseMlaRopeCastSpec;
 
-impl KernelSpec for DeepseekV41MegaAttnSpec {
-    type Config = DeepseekV41MegaAttnKernelConfig;
-    type Input = DeepseekV41MegaAttnKernelInput;
+impl KernelSpec for CompressedSparseMlaRopeCastSpec {
+    type Config = CompressedSparseMlaRopeCastKernelConfig;
+    type Input = CompressedSparseMlaRopeCastKernelInput;
 
-    const KIND: KernelKind = "deepseek_v41_mega_attn";
+    const KIND: KernelKind = "compressed_sparse_mla_rope_cast";
 
     fn sweep_grid(config: &Self::Config) -> SweepGrid {
         validate_config(config);
@@ -564,17 +564,17 @@ impl KernelSpec for DeepseekV41MegaAttnSpec {
     }
 }
 
-register_kernel!(DeepseekV41MegaAttnKernel, DeepseekV41MegaAttnSpec);
+register_kernel!(CompressedSparseMlaRopeCastKernel, CompressedSparseMlaRopeCastSpec);
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn config(mode: &str, ratio: u32) -> DeepseekV41MegaAttnKernelConfig {
+    fn config(mode: &str, ratio: u32) -> CompressedSparseMlaRopeCastKernelConfig {
         config_with_heads(mode, ratio, 64)
     }
 
-    fn config_with_heads(mode: &str, ratio: u32, heads: u32) -> DeepseekV41MegaAttnKernelConfig {
+    fn config_with_heads(mode: &str, ratio: u32, heads: u32) -> CompressedSparseMlaRopeCastKernelConfig {
         serde_json::from_value(serde_json::json!({
             "backends": ["flashmla_mega"],
             "gpu_name": "NVIDIA B200",
@@ -597,10 +597,10 @@ mod tests {
     }
 
     fn coords(mode: &str, ratio: u32, pairs: &[(u32, u32)]) -> Coords {
-        let input = DeepseekV41MegaAttnKernelInput {
+        let input = CompressedSparseMlaRopeCastKernelInput {
             query_context_pairs: pairs.to_vec(),
         };
-        DeepseekV41MegaAttnSpec::cache_coords(&config(mode, ratio), &input)
+        CompressedSparseMlaRopeCastSpec::cache_coords(&config(mode, ratio), &input)
     }
 
     /// Catches a closed-form key count that drifts from the runner's per-token
@@ -655,8 +655,8 @@ mod tests {
         for (mode, heads) in [("decode", 64), ("decode", 128), ("prefill", 64)] {
             for ratio in 0..=2 {
                 let config = config_with_heads(mode, ratio, heads);
-                let grid = DeepseekV41MegaAttnSpec::sweep_grid(&config);
-                let mask = DeepseekV41MegaAttnSpec::infeasible_mask(&config, &grid);
+                let grid = CompressedSparseMlaRopeCastSpec::sweep_grid(&config);
+                let mask = CompressedSparseMlaRopeCastSpec::infeasible_mask(&config, &grid);
                 let feasible = mask.iter().filter(|&&drop| !drop).count();
                 assert!(
                     feasible > 0 && feasible <= 500,
@@ -673,6 +673,6 @@ mod tests {
     fn swa_only_layer_rejects_compressed_cache() {
         let mut config = config("decode", 0);
         config.compressed_cache_format = "nvfp4".into();
-        DeepseekV41MegaAttnSpec::sweep_grid(&config);
+        CompressedSparseMlaRopeCastSpec::sweep_grid(&config);
     }
 }

@@ -115,10 +115,10 @@ const ENGRAM_WKV_OUT: u32 = 25_600;
 
 const MHC_BACKENDS: &[&str] = &["deepgemm_mega"];
 const MXFP8_GEMM_BACKENDS: &[&str] = &["flashinfer_mxfp8"];
-const FP32_GEMM_BACKENDS: &[&str] = &["torch_cublas_vllm_fork"];
+const FP32_GEMM_BACKENDS: &[&str] = &["torch_cublas"];
 const KV_INSERT_BACKENDS: &[&str] = &["vllm_cuda"];
 const MEGA_ATTN_BACKENDS: &[&str] = &["flashmla_mega"];
-const WO_A_BACKENDS: &[&str] = &["deepgemm_mxfp8_einsum_dsv41_wo_a"];
+const WO_A_BACKENDS: &[&str] = &["deepgemm_mxfp8_einsum_grouped_o_proj"];
 const ALL_REDUCE_BACKENDS: &[&str] = &["flashinfer_mnnvl"];
 const ALL_GATHER_PROXY_BACKENDS: &[&str] = &["nccl"];
 const INDEX_LOGITS_BACKENDS: &[&str] = &["deepgemm_fp8"];
@@ -1534,7 +1534,7 @@ mod tests {
         assert_eq!(named("compressor.save_compress_norm"), 4);
         assert_eq!(named("compressor.nvfp4_insert"), 4);
         assert_eq!(count("engram_lookup"), 2);
-        assert_eq!(count("deepseek_v41_qnorm_rope_kv_insert"), 40);
+        assert_eq!(count("q_pad_kv_rope_mxfp8_insert"), 40);
         assert_eq!(named("mega_attn.decode"), 40);
         assert_eq!(named("mega_attn.prefill"), 40);
         assert_eq!(count("nvfp4_fused_moe"), 40);

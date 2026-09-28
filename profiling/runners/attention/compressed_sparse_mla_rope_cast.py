@@ -14,7 +14,7 @@ compressed cache holding ``context // ratio`` rows per request, with up to
   ``combine_topk_swa_indices`` and one ``fused_norm_rope_attn_rope_cast_fwd``.
   Outside the timed region, the output is checked against the Torch reference.
 - ``torch`` times the independent Torch composite from
-  ``deepseek_v41_mega_attn_reference``: cache decode, RoPE, sparse attention
+  ``compressed_sparse_mla_rope_cast_reference``: cache decode, RoPE, sparse attention
   with sink, inverse RoPE and FP8 cast.
 
 Top-k selections are stratified: exactly ``min((pos + 1) // ratio, index_topk)``
@@ -33,7 +33,7 @@ from profiling.profilers.timer import Timer
 from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
 
-KIND = "deepseek_v41_mega_attn"
+KIND = "compressed_sparse_mla_rope_cast"
 _GPU_NAME = "NVIDIA B200"
 _MODES = ("decode", "prefill")
 _HEAD_DIM = 512
@@ -377,12 +377,12 @@ def _metrics(shape: _Shape, work: _Workload, time_ms: float, energy_j: float) ->
 
 
 def _reference(torch: Any, shape: _Shape, work: _Workload, rows: Any | None = None) -> Any:
-    from profiling.runners.attention.deepseek_v41_mega_attn_reference import (
-        deepseek_v41_mega_attn_reference,
+    from profiling.runners.attention.compressed_sparse_mla_rope_cast_reference import (
+        compressed_sparse_mla_rope_cast_reference,
     )
 
     select = slice(None) if rows is None else rows
-    return deepseek_v41_mega_attn_reference(
+    return compressed_sparse_mla_rope_cast_reference(
         work.q[select],
         work.positions[select],
         work.cos_sin,
@@ -399,7 +399,7 @@ def _reference(torch: Any, shape: _Shape, work: _Workload, rows: Any | None = No
 def _torch_writer(
     cache: Any, _role: str, fmt: str, slots: Any, rows: Any, _positions: Any, _cs: Any
 ) -> None:
-    from profiling.runners.attention.deepseek_v41_mega_attn_reference import write_records
+    from profiling.runners.attention.compressed_sparse_mla_rope_cast_reference import write_records
 
     write_records(cache, slots, rows, fmt)
 
@@ -424,12 +424,12 @@ def _profile(shape: _Shape, backend: str, build_and_check: Any) -> ComputeMetric
         raise KernelLaunchFailed(f"{KIND}:{backend} failed: {exc}") from exc
 
 
-def profile_deepseek_v41_mega_attn_torch(**kwargs: Any) -> ComputeMetrics:
+def profile_compressed_sparse_mla_rope_cast_torch(**kwargs: Any) -> ComputeMetrics:
     """Time the Torch semantic composite, including the reference FP8 cast."""
     shape = _validate_args(**kwargs)
 
     def build(torch: Any, device: Any) -> tuple[_Workload, Any]:
-        from profiling.runners.attention.deepseek_v41_mega_attn_reference import (
+        from profiling.runners.attention.compressed_sparse_mla_rope_cast_reference import (
             quantize_output,
         )
 
@@ -480,7 +480,7 @@ def check_against_reference(torch: Any, shape: _Shape, work: _Workload, out: Any
     relative L2 error within ``_REL_TOL``. The FP8 cast alone gives about
     0.03 (a 3-bit mantissa).
     """
-    from profiling.runners.attention.deepseek_v41_mega_attn_reference import (
+    from profiling.runners.attention.compressed_sparse_mla_rope_cast_reference import (
         dequantize_output,
         output_from_fused_layout,
         quantize_output,
@@ -607,12 +607,12 @@ def build_flashmla_mega(torch: Any, shape: _Shape, device: Any) -> tuple[_Worklo
 
 
 def _q_fused(q: Any) -> Any:
-    from profiling.runners.attention.deepseek_v41_mega_attn_reference import q_to_fused_layout
+    from profiling.runners.attention.compressed_sparse_mla_rope_cast_reference import q_to_fused_layout
 
     return q_to_fused_layout(q).contiguous()
 
 
-def profile_deepseek_v41_mega_attn_flashmla_mega(**kwargs: Any) -> ComputeMetrics:
+def profile_compressed_sparse_mla_rope_cast_flashmla_mega(**kwargs: Any) -> ComputeMetrics:
     """Time the fork's mega-attention decode or prefill segment on a B200."""
     shape = _validate_args(**kwargs)
 
@@ -627,6 +627,6 @@ def profile_deepseek_v41_mega_attn_flashmla_mega(**kwargs: Any) -> ComputeMetric
 
 
 __all__ = [
-    "profile_deepseek_v41_mega_attn_flashmla_mega",
-    "profile_deepseek_v41_mega_attn_torch",
+    "profile_compressed_sparse_mla_rope_cast_flashmla_mega",
+    "profile_compressed_sparse_mla_rope_cast_torch",
 ]

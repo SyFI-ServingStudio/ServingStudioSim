@@ -1,5 +1,5 @@
 """DeepSeek-V4.1 ``wo_a`` grouped MXFP8 einsum — the
-``deepgemm_mxfp8_einsum_dsv41_wo_a`` backend of ``batched_gemm``.
+``deepgemm_mxfp8_einsum_grouped_o_proj`` backend of ``batched_gemm``.
 
 Source: alignment fork ``servingstudio-alignment-v41``.
 ``DeepseekV4MegaAttnAttention._o_proj``
@@ -45,7 +45,7 @@ from profiling.profilers.timer import Timer
 from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
 
-BACKEND = "deepgemm_mxfp8_einsum_dsv41_wo_a"
+BACKEND = "deepgemm_mxfp8_einsum_grouped_o_proj"
 MXFP8_BLOCK = 32
 RECIPE = (1, 1, MXFP8_BLOCK)
 # 8 heads per wo_a group times the 512-wide V head.
@@ -155,7 +155,7 @@ def check_against_dequantized_reference(
     return err
 
 
-def profile_batched_gemm_deepgemm_mxfp8_einsum_dsv41_wo_a(
+def profile_batched_gemm_deepgemm_mxfp8_einsum_grouped_o_proj(
     num_batches: int,
     m: int,
     n: int,
@@ -229,6 +229,6 @@ def profile_batched_gemm_deepgemm_mxfp8_einsum_dsv41_wo_a(
 __all__ = [
     "check_against_dequantized_reference",
     "dequantize_mxfp8",
-    "profile_batched_gemm_deepgemm_mxfp8_einsum_dsv41_wo_a",
+    "profile_batched_gemm_deepgemm_mxfp8_einsum_grouped_o_proj",
     "quantize_mxfp8",
 ]

@@ -322,7 +322,7 @@ pub(crate) mod tests {
             shared_intermediate_size: 2304.into(),
             gpu_name: "NVIDIA B200".into(),
             mhc_backends: vec!["deepgemm_mega"],
-            router_backends: vec!["torch_cublas_vllm_fork"],
+            router_backends: vec!["torch_cublas"],
             gemm_backends: vec!["flashinfer_mxfp8"],
             moe_backends: vec!["flashinfer_trtllm_sm100_mxfp4"],
             all_reduce_backends: vec!["flashinfer_mnnvl"],

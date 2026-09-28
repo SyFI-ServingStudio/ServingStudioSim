@@ -7,7 +7,7 @@
 //! `fused_norm_rope_attn_rope_cast_fwd` launches per layer, decode-only ones
 //! carry one. Both segments share the layer's caches and the op boundary, so
 //! they are one compound op with two fixed leaves (prefill, decode) over the
-//! `deepseek_v41_mega_attn` kind, which is keyed by `mode`.
+//! `compressed_sparse_mla_rope_cast` kind, which is keyed by `mode`.
 //!
 //! The prefill leaf is the whole chunk loop of the fork (compressed-cache
 //! dequant/gather, SWA gather, `combine_topk_swa_indices`, one fused launch per
@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use crate::timing::bridge::DType;
 use crate::timing::kernels::{
-    DeepseekV41MegaAttnKernel, DeepseekV41MegaAttnKernelConfig, DeepseekV41MegaAttnKernelInput,
+    CompressedSparseMlaRopeCastKernel, CompressedSparseMlaRopeCastKernelConfig, CompressedSparseMlaRopeCastKernelInput,
 };
 use crate::timing::{
     BuildError, CostNode, CostTreeBuilder, Dim, Evaluator, LeafMetrics, PerfApiBridge, Probe,
@@ -60,8 +60,8 @@ pub struct DeepseekV41MegaAttnOpInput {
 
 pub struct DeepseekV41MegaAttnOp {
     pub name: String,
-    pub prefill: Arc<DeepseekV41MegaAttnKernel>,
-    pub decode: Arc<DeepseekV41MegaAttnKernel>,
+    pub prefill: Arc<CompressedSparseMlaRopeCastKernel>,
+    pub decode: Arc<CompressedSparseMlaRopeCastKernel>,
 }
 
 impl DeepseekV41MegaAttnOp {
@@ -73,12 +73,12 @@ impl DeepseekV41MegaAttnOp {
         let prefill_name = format!("{name}.prefill");
         let decode_name = format!("{name}.decode");
         Ok(Self {
-            prefill: Arc::new(DeepseekV41MegaAttnKernel::build(
+            prefill: Arc::new(CompressedSparseMlaRopeCastKernel::build(
                 prefill_name,
                 kernel_config(&cfg, "prefill"),
                 bridge,
             )?),
-            decode: Arc::new(DeepseekV41MegaAttnKernel::build(
+            decode: Arc::new(CompressedSparseMlaRopeCastKernel::build(
                 decode_name,
                 kernel_config(&cfg, "decode"),
                 bridge,
@@ -110,8 +110,8 @@ impl DeepseekV41MegaAttnOp {
 }
 
 fn push_segment(
-    kernel: &DeepseekV41MegaAttnKernel,
-    segment: DeepseekV41MegaAttnKernelInput,
+    kernel: &CompressedSparseMlaRopeCastKernel,
+    segment: CompressedSparseMlaRopeCastKernelInput,
     ev: &mut Evaluator,
 ) {
     let metrics = if segment.query_context_pairs.is_empty() {
@@ -126,8 +126,8 @@ fn push_segment(
 pub(crate) fn kernel_config(
     cfg: &DeepseekV41MegaAttnOpConfig,
     mode: &str,
-) -> DeepseekV41MegaAttnKernelConfig {
-    DeepseekV41MegaAttnKernelConfig {
+) -> CompressedSparseMlaRopeCastKernelConfig {
+    CompressedSparseMlaRopeCastKernelConfig {
         backends: cfg.backends.clone(),
         gpu_name: cfg.gpu_name.clone(),
         mode: mode.to_string(),
@@ -155,11 +155,11 @@ pub(crate) fn kernel_config(
 /// its own `(1, kv + 1)` request, as the decode segment flattens them.
 pub(crate) fn split_input(
     input: &DeepseekV41MegaAttnOpInput,
-) -> (DeepseekV41MegaAttnKernelInput, DeepseekV41MegaAttnKernelInput) {
-    let prefill = DeepseekV41MegaAttnKernelInput {
+) -> (CompressedSparseMlaRopeCastKernelInput, CompressedSparseMlaRopeCastKernelInput) {
+    let prefill = CompressedSparseMlaRopeCastKernelInput {
         query_context_pairs: input.prefill_query_context_pairs.clone(),
     };
-    let decode = DeepseekV41MegaAttnKernelInput {
+    let decode = CompressedSparseMlaRopeCastKernelInput {
         query_context_pairs: input
             .decode_kv_lens
             .iter()

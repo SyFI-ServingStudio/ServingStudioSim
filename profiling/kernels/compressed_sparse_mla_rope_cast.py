@@ -47,11 +47,11 @@ from profiling.db.registry import (
     register,
 )
 
-KIND = "deepseek_v41_mega_attn"
+KIND = "compressed_sparse_mla_rope_cast"
 
 
 @dataclass(frozen=True)
-class DeepseekV41MegaAttnArgs(KernelArgs):
+class CompressedSparseMlaRopeCastArgs(KernelArgs):
     mode: str
     query_context_pairs: tuple[tuple[int, int], ...]
     compress_ratio: int
@@ -80,11 +80,11 @@ register(
         kernel_kind=KIND,
         backend="torch",
         runner_ref=RunnerRef(
-            module_name="profiling.runners.attention.deepseek_v41_mega_attn",
-            function_name="profile_deepseek_v41_mega_attn_torch",
+            module_name="profiling.runners.attention.compressed_sparse_mla_rope_cast",
+            function_name="profile_compressed_sparse_mla_rope_cast_torch",
         ),
         table_name=KIND,
-        args_schema=DeepseekV41MegaAttnArgs,
+        args_schema=CompressedSparseMlaRopeCastArgs,
         metric_family=MetricFamily.COMPUTE,
         batch_outlier_policy=BatchOutlierPolicy(),
         supports=_SUPPORT,
@@ -96,11 +96,11 @@ register(
         kernel_kind=KIND,
         backend="flashmla_mega",
         runner_ref=RunnerRef(
-            module_name="profiling.runners.attention.deepseek_v41_mega_attn",
-            function_name="profile_deepseek_v41_mega_attn_flashmla_mega",
+            module_name="profiling.runners.attention.compressed_sparse_mla_rope_cast",
+            function_name="profile_compressed_sparse_mla_rope_cast_flashmla_mega",
         ),
         table_name=KIND,
-        args_schema=DeepseekV41MegaAttnArgs,
+        args_schema=CompressedSparseMlaRopeCastArgs,
         metric_family=MetricFamily.COMPUTE,
         batch_outlier_policy=BatchOutlierPolicy(),
         supports=_SUPPORT,
@@ -108,4 +108,4 @@ register(
     )
 )
 
-__all__ = ["DeepseekV41MegaAttnArgs", "KIND"]
+__all__ = ["CompressedSparseMlaRopeCastArgs", "KIND"]

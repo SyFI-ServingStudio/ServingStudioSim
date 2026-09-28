@@ -1,4 +1,4 @@
-"""CPU checks for the ``batched_gemm`` ``deepgemm_mxfp8_einsum_dsv41_wo_a`` backend.
+"""CPU checks for the ``batched_gemm`` ``deepgemm_mxfp8_einsum_grouped_o_proj`` backend.
 
 GPU timing and the check of the production DeepGEMM output against the
 dequantized reference run in the public ``python -m profiling run`` smoke on a
@@ -14,7 +14,7 @@ from profiling.db.registry import find_kernel_profiler_spec
 from profiling.runners.gemm.deepgemm_mxfp8_einsum import (
     BACKEND,
     dequantize_mxfp8,
-    profile_batched_gemm_deepgemm_mxfp8_einsum_dsv41_wo_a,
+    profile_batched_gemm_deepgemm_mxfp8_einsum_grouped_o_proj,
     quantize_mxfp8,
 )
 
@@ -46,7 +46,7 @@ def test_support_is_mxfp8_on_b200_only():
 def test_runner_rejects_specs_outside_the_frozen_wo_a_layout(override, message):
     # Rejection must happen before any CUDA or fork import.
     with pytest.raises(ValueError, match=message):
-        profile_batched_gemm_deepgemm_mxfp8_einsum_dsv41_wo_a(**{**_OK, **override})
+        profile_batched_gemm_deepgemm_mxfp8_einsum_grouped_o_proj(**{**_OK, **override})
 
 
 def test_mxfp8_quantizer_is_power_of_two_per_32_block_and_round_trips():

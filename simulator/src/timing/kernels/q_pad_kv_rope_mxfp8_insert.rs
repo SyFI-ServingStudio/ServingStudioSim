@@ -30,7 +30,7 @@ const LIVE_HEADS: [u32; 5] = [8, 16, 32, 64, 128];
 const BLOCK_SIZE: u32 = 32;
 
 #[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct DeepseekV41QnormRopeKvInsertKernelConfig {
+pub struct QPadKvRopeMxfp8InsertKernelConfig {
     #[serde(deserialize_with = "de_backends")]
     pub backends: Vec<&'static str>,
     pub gpu_name: String,
@@ -45,13 +45,13 @@ pub struct DeepseekV41QnormRopeKvInsertKernelConfig {
 }
 
 #[derive(SweepCoords, Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct DeepseekV41QnormRopeKvInsertKernelInput {
+pub struct QPadKvRopeMxfp8InsertKernelInput {
     pub num_tokens: u32,
 }
 
-pub struct DeepseekV41QnormRopeKvInsertSpec;
+pub struct QPadKvRopeMxfp8InsertSpec;
 
-fn validate_config(config: &DeepseekV41QnormRopeKvInsertKernelConfig) {
+fn validate_config(config: &QPadKvRopeMxfp8InsertKernelConfig) {
     assert!(
         LIVE_HEADS.contains(&config.num_heads),
         "num_heads must be one of {LIVE_HEADS:?}, got {}",
@@ -71,10 +71,10 @@ fn validate_config(config: &DeepseekV41QnormRopeKvInsertKernelConfig) {
     assert_eq!(config.swa_cache_format, "mxfp8", "only the mxfp8 SWA record");
 }
 
-impl KernelSpec for DeepseekV41QnormRopeKvInsertSpec {
-    type Config = DeepseekV41QnormRopeKvInsertKernelConfig;
-    type Input = DeepseekV41QnormRopeKvInsertKernelInput;
-    const KIND: KernelKind = "deepseek_v41_qnorm_rope_kv_insert";
+impl KernelSpec for QPadKvRopeMxfp8InsertSpec {
+    type Config = QPadKvRopeMxfp8InsertKernelConfig;
+    type Input = QPadKvRopeMxfp8InsertKernelInput;
+    const KIND: KernelKind = "q_pad_kv_rope_mxfp8_insert";
 
     fn sweep_grid(config: &Self::Config) -> SweepGrid {
         validate_config(config);
@@ -109,16 +109,16 @@ impl KernelSpec for DeepseekV41QnormRopeKvInsertSpec {
 }
 
 register_kernel!(
-    DeepseekV41QnormRopeKvInsertKernel,
-    DeepseekV41QnormRopeKvInsertSpec
+    QPadKvRopeMxfp8InsertKernel,
+    QPadKvRopeMxfp8InsertSpec
 );
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn config(num_heads: u32, padded_heads: u32) -> DeepseekV41QnormRopeKvInsertKernelConfig {
-        DeepseekV41QnormRopeKvInsertKernelConfig {
+    fn config(num_heads: u32, padded_heads: u32) -> QPadKvRopeMxfp8InsertKernelConfig {
+        QPadKvRopeMxfp8InsertKernelConfig {
             backends: vec!["vllm_cuda"],
             gpu_name: "NVIDIA B200".to_string(),
             num_heads,
@@ -133,7 +133,7 @@ mod tests {
     /// interpolation would blend one variant's sample into the other's range.
     #[test]
     fn grid_brackets_the_reduced_grid_cutoff_with_adjacent_points() {
-        let grid = DeepseekV41QnormRopeKvInsertSpec::sweep_grid(&config(16, 64));
+        let grid = QPadKvRopeMxfp8InsertSpec::sweep_grid(&config(16, 64));
         let axis = &grid.axes()[0];
         let i = axis.iter().position(|&t| t == 1023.0).unwrap();
         assert_eq!(axis[i + 1], 1024.0);
@@ -145,8 +145,8 @@ mod tests {
     #[test]
     fn payload_derives_insert_tokens_and_matches_python_args() {
         let cfg = config(16, 64);
-        let grid = DeepseekV41QnormRopeKvInsertSpec::sweep_grid(&cfg);
-        let payloads = DeepseekV41QnormRopeKvInsertSpec::enumerate(&cfg, &grid, "vllm_cuda");
+        let grid = QPadKvRopeMxfp8InsertSpec::sweep_grid(&cfg);
+        let payloads = QPadKvRopeMxfp8InsertSpec::enumerate(&cfg, &grid, "vllm_cuda");
         let fields = payloads[15].fields();
         let keys: Vec<_> = fields.keys().map(String::as_str).collect();
         assert_eq!(
@@ -170,6 +170,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "padded_heads")]
     fn rejects_kv_only_for_a_narrow_shard() {
-        DeepseekV41QnormRopeKvInsertSpec::sweep_grid(&config(16, 0));
+        QPadKvRopeMxfp8InsertSpec::sweep_grid(&config(16, 0));
     }
 }

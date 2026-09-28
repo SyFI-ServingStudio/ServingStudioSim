@@ -158,14 +158,14 @@ for _backend, _function, _summary in (
 register(
     KernelProfilerSpec(
         kernel_kind=KIND,
-        backend="deepgemm_mxfp8_einsum_dsv41_wo_a",
+        backend="deepgemm_mxfp8_einsum_grouped_o_proj",
         supports=BackendSupport(
             compute=frozenset({DType.MXFP8_E4M3}),
             gpus=frozenset({"NVIDIA B200"}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.gemm.deepgemm_mxfp8_einsum",
-            function_name="profile_batched_gemm_deepgemm_mxfp8_einsum_dsv41_wo_a",
+            function_name="profile_batched_gemm_deepgemm_mxfp8_einsum_grouped_o_proj",
         ),
         table_name=KIND,
         args_schema=BatchedGemmArgs,

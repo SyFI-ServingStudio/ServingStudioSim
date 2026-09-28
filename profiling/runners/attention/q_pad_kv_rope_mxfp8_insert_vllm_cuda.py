@@ -25,7 +25,7 @@ from profiling.profilers.timer import Timer
 from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
 
-KIND = "deepseek_v41_qnorm_rope_kv_insert"
+KIND = "q_pad_kv_rope_mxfp8_insert"
 _BACKEND = f"{KIND}:vllm_cuda"
 _GPU_NAME = "NVIDIA B200"
 _HEAD_DIM = 512
@@ -81,7 +81,7 @@ def _validate_args(
 
 def reference_q(torch: Any, q_std: Any, padded_heads: int) -> Any:
     """Expected Q output: live heads unchanged, zero pad, chunk-interleaved."""
-    from profiling.runners.attention.deepseek_v41_mega_attn_reference import q_to_fused_layout
+    from profiling.runners.attention.compressed_sparse_mla_rope_cast_reference import q_to_fused_layout
 
     tokens, heads, dim = q_std.shape
     padded = torch.zeros((tokens, padded_heads, dim), dtype=q_std.dtype, device=q_std.device)
@@ -112,7 +112,7 @@ def check_outputs(
     slots: Any,
 ) -> dict:
     """Compare the op's Q output and written cache records against Torch."""
-    from profiling.runners.attention.deepseek_v41_mega_attn_reference import (
+    from profiling.runners.attention.compressed_sparse_mla_rope_cast_reference import (
         decode_records,
         encode_records,
     )
@@ -157,8 +157,8 @@ def check_outputs(
 
 
 def build_inputs(torch: Any, device: Any, num_tokens: int, num_insert_tokens: int, heads: int):
-    from profiling.runners.attention.deepseek_v41_mega_attn import _cos_sin
-    from profiling.runners.attention.deepseek_v41_mega_attn_reference import q_to_fused_layout
+    from profiling.runners.attention.compressed_sparse_mla_rope_cast import _cos_sin
+    from profiling.runners.attention.compressed_sparse_mla_rope_cast_reference import q_to_fused_layout
 
     generator = torch.Generator().manual_seed(0x41C5)
     q_std = torch.randn((num_tokens, heads, _HEAD_DIM), generator=generator).to(torch.bfloat16)
@@ -178,7 +178,7 @@ def build_inputs(torch: Any, device: Any, num_tokens: int, num_insert_tokens: in
     )
 
 
-def profile_deepseek_v41_qnorm_rope_kv_insert_vllm_cuda(
+def profile_q_pad_kv_rope_mxfp8_insert_vllm_cuda(
     num_tokens: int,
     num_insert_tokens: int,
     num_heads: int,
@@ -263,7 +263,7 @@ def logical_bytes(num_tokens: int, num_insert: int, num_heads: int, padded_heads
 
 __all__ = [
     "check_outputs",
-    "profile_deepseek_v41_qnorm_rope_kv_insert_vllm_cuda",
+    "profile_q_pad_kv_rope_mxfp8_insert_vllm_cuda",
     "reference_kv_rows",
     "reference_q",
 ]

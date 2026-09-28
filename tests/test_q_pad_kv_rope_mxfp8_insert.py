@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from profiling.runners.attention import deepseek_v41_qnorm_rope_kv_insert as runner
+from profiling.runners.attention import q_pad_kv_rope_mxfp8_insert_vllm_cuda as runner
 from profiling.runners.exceptions import ProfilerNotImplemented
 
 _ARGS = dict(

@@ -107,7 +107,7 @@ fn one_iteration_has_the_captured_launch_counts() {
     assert_eq!(named("compressor.save_compress_norm"), 4);
     assert_eq!(named("compressor.nvfp4_insert"), 4);
     assert_eq!(count("engram_lookup"), 2);
-    assert_eq!(count("deepseek_v41_qnorm_rope_kv_insert"), 40);
+    assert_eq!(count("q_pad_kv_rope_mxfp8_insert"), 40);
     assert_eq!(named("mega_attn.decode"), 40);
     assert_eq!(named("mega_attn.prefill"), 40);
     assert_eq!(count("nvfp4_fused_moe"), 40);
