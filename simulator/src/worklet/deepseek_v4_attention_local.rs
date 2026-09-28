@@ -654,6 +654,11 @@ impl DeepseekV4AttentionLocalWorklet {
         }
     }
 
+    /// The reason [`Self::eval`] would reject `input`, if any.
+    pub fn check_input(&self, input: &DeepseekV4AttentionLocalWorkletInput) -> Result<(), String> {
+        normalize_input(input, &self.resolved.raw_cfg).map(|_| ())
+    }
+
     pub fn eval(&self, input: &DeepseekV4AttentionLocalWorkletInput, evaluator: &mut Evaluator) {
         let work = normalize_input(input, &self.resolved.raw_cfg).unwrap_or_else(|reason| {
             panic!("invalid DeepseekV4AttentionLocalWorkletInput: {reason}")
@@ -864,9 +869,6 @@ fn normalize_input(
             "phase rows {active_rows}, num_insert_tokens {}, num_tokens {} disagree",
             input.num_insert_tokens, input.num_tokens
         ));
-    }
-    if row_request_ids.iter().copied().max().unwrap_or(0) >= 64 {
-        return Err("compressor topology supports at most 64 requests".to_string());
     }
     let logical_block_size = if config.compress_ratio == 4 { 4 } else { 8 };
     let state_block_table_width = row_positions

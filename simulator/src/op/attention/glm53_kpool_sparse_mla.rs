@@ -46,8 +46,6 @@ use crate::timing::{
 
 const OP_KIND: &str = "glm53_kpool_sparse_mla";
 const SLOT_SUFFIXES: [&str; 4] = ["mla_cache_append", "index_remap", "prefill", "decode"];
-/// vLLM's remap wrapper handles at most this many requests per launch.
-const MAX_REMAP_REQUESTS: usize = 256;
 
 /// Static identity expanded into the four L1 kernel configurations.
 #[derive(Clone, Debug)]
@@ -396,18 +394,6 @@ fn derive_shape(
     }
     let num_rows = u32::try_from(local_span_lengths.len())
         .map_err(|_| "query-row count exceeds u32".to_string())?;
-    if request_row_counts.len() > MAX_REMAP_REQUESTS {
-        return Err(format!(
-            "index remap supports at most {MAX_REMAP_REQUESTS} requests, got {}",
-            request_row_counts.len()
-        ));
-    }
-    let max_queries = crate::timing::kernels::dsa_sparse_index_remap::MAX_QUERIES;
-    if num_rows > max_queries {
-        return Err(format!(
-            "index remap supports at most {max_queries} query rows, got {num_rows}"
-        ));
-    }
     let prefill_bearing = !input.prefill_query_cache_pairs.is_empty();
     let prefill = prefill_bearing.then(|| combined_causal_query(&valid_counts, selected_k));
     let decode = input

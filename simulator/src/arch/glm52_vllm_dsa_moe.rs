@@ -1439,6 +1439,10 @@ impl Glm52VllmDsaMoeModel {
 }
 
 impl IterwiseUnifiedModel for Glm52VllmDsaMoeModel {
+    fn check_input(&self, batch: &UnifiedArchInput) -> Result<(), String> {
+        normalize_input(batch, self.ep_size).map(|_| ())
+    }
+
     fn total_kv_bytes_per_token(&self) -> u64 {
         self.total_state_bytes_per_token
     }

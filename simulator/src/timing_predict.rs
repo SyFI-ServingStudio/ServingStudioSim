@@ -39,7 +39,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -533,10 +533,14 @@ fn iter_inputs(
             } else {
                 Vec::new()
             };
-            Ok(UnifiedArchInput {
+            let input = UnifiedArchInput {
                 groups,
                 tokens_per_source_rank,
-            })
+            };
+            model
+                .check_input(&input)
+                .map_err(|reason| anyhow!("case {idx}: {reason}"))?;
+            Ok(input)
         })
         .collect()
 }
@@ -591,11 +595,15 @@ fn speculative_iter_inputs(
             } else {
                 Vec::new()
             };
-            Ok(SpeculativeArchInput {
+            let input = SpeculativeArchInput {
                 draft_tokens,
                 groups,
                 tokens_per_source_rank,
-            })
+            };
+            model
+                .check_input(&input)
+                .map_err(|reason| anyhow!("case {index}: {reason}"))?;
+            Ok(input)
         })
         .collect()
 }
@@ -943,6 +951,48 @@ mod tests {
         // Model expects 2 DP shards but the case gave 1.
         let err = case.into_groups(2).unwrap_err().to_string();
         assert!(err.contains("expects 2"), "got: {err}");
+    }
+
+    #[test]
+    fn model_rejection_names_the_case_before_any_eval() {
+        use crate::timing::LeafMetrics;
+
+        struct ContextCapped(crate::test_helpers::FakeModel);
+        impl IterwiseUnifiedModel for ContextCapped {
+            fn check_input(&self, batch: &UnifiedArchInput) -> Result<(), String> {
+                match batch.groups[0].decode_kv_lens.iter().max() {
+                    Some(&context) if context > 8192 => {
+                        Err(format!("context {context} exceeds max_model_len 8192"))
+                    }
+                    _ => Ok(()),
+                }
+            }
+            fn eval_iter(
+                &self,
+                _batch: &UnifiedArchInput,
+                _slots: &mut Vec<LeafMetrics>,
+                _scratch: &mut Vec<LeafMetrics>,
+            ) -> LeafMetrics {
+                unreachable!("a rejected case must not be costed")
+            }
+            fn total_kv_bytes_per_token(&self) -> u64 {
+                self.0.total_kv_bytes_per_token()
+            }
+            fn gpus_per_replica(&self) -> u16 {
+                self.0.gpus_per_replica()
+            }
+            fn num_attn_dp_groups(&self) -> u16 {
+                self.0.num_attn_dp_groups()
+            }
+        }
+        let cases: Vec<PredictCase> = serde_json::from_str(
+            r#"[{"groups": [{"decode_kv_lens": [8192]}]},
+                {"groups": [{"decode_kv_lens": [16384]}]}]"#,
+        )
+        .unwrap();
+        let model = ContextCapped(crate::test_helpers::FakeModel::for_ms(1.0));
+        let err = iter_inputs(&model, cases).unwrap_err().to_string();
+        assert_eq!(err, "case 1: context 16384 exceeds max_model_len 8192");
     }
 
     #[test]

@@ -1141,6 +1141,10 @@ impl Glm52SglangNvfp4TpDsaMoeModel {
 }
 
 impl IterwiseUnifiedModel for Glm52SglangNvfp4TpDsaMoeModel {
+    fn check_input(&self, batch: &UnifiedArchInput) -> Result<(), String> {
+        normalize_input(batch, self.max_model_len).map(|_| ())
+    }
+
     fn total_kv_bytes_per_token(&self) -> u64 {
         self.total_state_bytes_per_token
     }
