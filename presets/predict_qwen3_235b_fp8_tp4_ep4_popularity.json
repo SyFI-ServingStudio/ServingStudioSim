@@ -1,0 +1,18 @@
+{
+  "arch": {
+    "iter": {
+      "attn_tp_size": 4,
+      "ep_size": 4,
+      "expert_popularity_file": "presets/alignment/qwen3_235b_thinking_fp8_h200_tp4_ep4/expert_popularity.json",
+      "fp8": true,
+      "hp_size": 1,
+      "model_config": "model/config/qwen3_235b.json",
+      "nvl_num_gpu": 4,
+      "routing": "popularity",
+      "type": "qwen3_moe_fp8_dp_attn_ep_ffn"
+    }
+  },
+  "gpu": "NVIDIA H200",
+  "log_dir": "logs/predict_qwen3_235b_fp8_tp4_ep4_popularity",
+  "cases_file": "predict_qwen3_235b_fp8_tp4_ep4_popularity_cases.json"
+}
