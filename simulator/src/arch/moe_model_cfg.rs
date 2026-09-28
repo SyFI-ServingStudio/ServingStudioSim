@@ -60,7 +60,7 @@ impl MoeModelCfg {
     /// MoE keys (`num_experts`, `num_experts_per_tok`, `moe_intermediate_size`)
     /// are required.
     pub fn from_json(path: &Path) -> Result<Self> {
-        let text = std::fs::read_to_string(path)
+        let text = crate::common::input_files::read_to_string(path)
             .with_context(|| format!("reading model config {}", path.display()))?;
         let raw: JsonMoeModelConfig = serde_json::from_str(&text)
             .with_context(|| format!("parsing MoE model config {}", path.display()))?;

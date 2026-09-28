@@ -346,7 +346,8 @@ fn parallel_by_cost<T: Send>(costs: &[u64], f: impl Fn(usize) -> T + Sync) -> Ve
         .map_or(1, usize::from)
         .min(MAX_SAMPLING_THREADS)
         .min(costs.len());
-    if threads <= 1 {
+    // A browser's wasm32 module cannot spawn threads.
+    if threads <= 1 || cfg!(target_family = "wasm") {
         return (0..costs.len()).map(f).collect();
     }
     let mut order: Vec<usize> = (0..costs.len()).collect();

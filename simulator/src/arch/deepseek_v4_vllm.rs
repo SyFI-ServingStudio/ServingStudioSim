@@ -121,7 +121,7 @@ impl DeepseekV4ModelCfg {
             spec.num_layers.is_none() && spec.sim_num_layers.is_none(),
             "{ARCH_KIND} requires the exact heterogeneous 43-layer schedule"
         );
-        let text = std::fs::read_to_string(path)
+        let text = crate::common::input_files::read_to_string(path)
             .with_context(|| format!("reading DeepSeek V4 config {}", path.display()))?;
         let raw: JsonDeepseekV4Config = serde_json::from_str(&text).context("parsing JSON")?;
         ensure!(raw.architectures == ["DeepseekV4ForCausalLM"]);

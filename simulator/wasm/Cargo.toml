@@ -1,0 +1,17 @@
+[package]
+name = "simulator-wasm"
+version = "0.1.0"
+edition = "2021"
+license-file = "../../LICENSE"
+publish = false
+description = "timing-predict for a browser: wasm32, replay samples in place of profile.db"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+simulator = { path = "../..", default-features = false }
+serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
+anyhow = "1"
+serde = "1"
+wasm-bindgen = "=0.2.129"

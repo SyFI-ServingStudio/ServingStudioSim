@@ -4,6 +4,7 @@
 
 pub mod fabric;
 pub mod id;
+pub mod input_files;
 pub mod request;
 pub mod request_family;
 pub mod request_stage;

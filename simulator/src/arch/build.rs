@@ -10,7 +10,6 @@
 //! caller supplies `name` — the model's dotted-leaf prefix (`"unified"` / `"pd"`)
 //! — so each deployment's cost manifests read naturally.
 
-use std::fs::File;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
@@ -313,9 +312,9 @@ fn load_expert_popularity(
     expected_num_moe_layers: u32,
     expected_experts_per_token: u32,
 ) -> Result<RoutingDistribution> {
-    let profile_file =
-        File::open(path).with_context(|| format!("opening expert popularity profile {path}"))?;
-    let profile_value: serde_json::Value = serde_json::from_reader(profile_file)
+    let profile_text = crate::common::input_files::read_to_string(Path::new(path))
+        .with_context(|| format!("opening expert popularity profile {path}"))?;
+    let profile_value: serde_json::Value = serde_json::from_str(&profile_text)
         .with_context(|| format!("parsing expert popularity profile {path}"))?;
     let version: ExpertPopularityVersion = serde_json::from_value(profile_value.clone())
         .with_context(|| format!("reading expert popularity schema_version from {path}"))?;

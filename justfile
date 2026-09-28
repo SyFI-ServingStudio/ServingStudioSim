@@ -83,3 +83,29 @@ alignment-compare pack runs out="/tmp/alignment_metrics.json":
 # first: this is the only writer of tests/golden/alignment_<pack>/.
 alignment-record pack out="/tmp/alignment_metrics.json" *flags:
     uv run --no-sync python -m launcher alignment-campaign compare --pack {{pack}} --measured {{out}} --record {{flags}}
+
+# Browser timing-predict module (simulator/wasm) -> target/wasm-pkg/:
+# simulator_wasm.js + simulator_wasm_bg.wasm + version.json. ServingStudioIntro's
+# build-predict-payload copies this directory into its static site. Needs the
+# wasm32-unknown-unknown target, wasm-bindgen-cli matching the crate's pinned
+# wasm-bindgen, and binaryen's wasm-opt; point WASM_BINDGEN / WASM_OPT at them
+# when they are not on PATH.
+build-wasm:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    bindgen="${WASM_BINDGEN:-wasm-bindgen}"
+    wasm_opt="${WASM_OPT:-wasm-opt}"
+    want="$(sed -n 's/^wasm-bindgen = "=\(.*\)"$/\1/p' simulator/wasm/Cargo.toml)"
+    have="$("$bindgen" --version | awk '{print $2}')"
+    [ "$have" = "$want" ] || { echo "wasm-bindgen-cli $have != crate's $want (cargo install wasm-bindgen-cli --version $want)" >&2; exit 1; }
+    commit="$(git rev-parse HEAD)"
+    if ! git diff --quiet HEAD -- simulator Cargo.toml Cargo.lock; then commit="$commit-dirty"; fi
+    SERVINGSTUDIO_SIM_COMMIT="$commit" cargo build -p simulator-wasm --target wasm32-unknown-unknown --profile wasm
+    out=target/wasm-pkg
+    rm -rf "$out" && mkdir -p "$out"
+    "$bindgen" --target web --no-typescript --out-dir "$out" target/wasm32-unknown-unknown/wasm/simulator_wasm.wasm
+    "$wasm_opt" -Oz --enable-bulk-memory --enable-multivalue --enable-mutable-globals --enable-nontrapping-float-to-int --enable-reference-types --enable-sign-ext \
+        "$out/simulator_wasm_bg.wasm" -o "$out/simulator_wasm_bg.wasm"
+    printf '{"sim_commit": "%s", "sample_format": %s}\n' "$commit" \
+        "$(sed -n 's/^pub const SAMPLE_FORMAT: u32 = \([0-9]*\);$/\1/p' simulator/src/timing/bridge/replay.rs)" > "$out/version.json"
+    ls -l "$out"

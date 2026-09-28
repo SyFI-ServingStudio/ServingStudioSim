@@ -1,9 +1,12 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PyModule};
+use std::sync::Arc;
+
 use serde_json::Value;
+
+use super::python;
+use super::replay::{ReplaySamples, SampleRow};
 
 use crate::timing::bridge::{
     intern_backend, ArgsPayload, BuildError, DType, DbMetadata, KernelKind, KernelMetrics,
@@ -128,23 +131,6 @@ struct ConfigRecords {
     index: HashMap<(KernelKind, String, String), usize>,
 }
 
-/// Convert `Result<T, pyo3::PyErr>` to `Result<T, PerfApiError>` by flattening
-/// the PyO3 exception into `PerfApiError::Python(message)`. Defined as a
-/// trait so the PyO3-heavy code below reads as `.py_err()?` instead of
-/// `.py_err()?` at every step.
-/// Loss of structural Python exception type is intentional at this boundary —
-/// downstream callers reason in `PerfApiError` variants, not Python exception
-/// classes.
-trait PyErrExt<T> {
-    fn py_err(self) -> Result<T, PerfApiError>;
-}
-
-impl<T> PyErrExt<T> for Result<T, pyo3::PyErr> {
-    fn py_err(self) -> Result<T, PerfApiError> {
-        self.map_err(|err| PerfApiError::Python(err.to_string()))
-    }
-}
-
 /// Bridge to the Python `profiling.perf_api` facade.
 ///
 /// Construct via `new()`, which calls `disable_jit_profiling` so a
@@ -191,19 +177,30 @@ pub struct PerfApiBridge {
     /// mode, for profile.db's kernel-config registry (see
     /// [`enable_config_records`](Self::enable_config_records)).
     config_records: RefCell<Option<ConfigRecords>>,
+    /// `Some(..)` answers every perf_api call from these measured rows instead
+    /// of Python (see [`replay`](Self::replay)): no profile.db, no JIT, no GPU.
+    replay: Option<Arc<ReplaySamples>>,
+    /// `Some(..)` records every row `get_times` returns, keyed as a replay
+    /// bridge looks it up (see [`enable_sample_records`](Self::enable_sample_records)).
+    sample_records: RefCell<Option<BTreeMap<String, SampleRow>>>,
 }
 
 impl PerfApiBridge {
     pub fn new() -> Result<Self, PerfApiError> {
-        let bridge = Self {
-            dry_run: RefCell::new(None),
-            backend_overrides: RefCell::new(None),
-            active_pool: RefCell::new(None),
-            enumerate: RefCell::new(None),
-            config_records: RefCell::new(None),
-        };
+        let bridge = Self::inert();
         bridge.disable_jit_profiling()?;
         Ok(bridge)
+    }
+
+    /// A bridge that answers `get_times` from `samples` alone, like a strict
+    /// (no-JIT) perf_api over a profile.db holding exactly those rows: a spec
+    /// with no sample is a `MissingEntry`. Needs no Python, so it is the bridge
+    /// of a build without the `python` feature (wasm32).
+    pub fn replay(samples: Arc<ReplaySamples>) -> Self {
+        Self {
+            replay: Some(samples),
+            ..Self::inert()
+        }
     }
 
     /// A bridge that can only build structure: enumerate mode, and no Python
@@ -211,11 +208,21 @@ impl PerfApiBridge {
     /// commands that need a model's cost tree and nothing measured.
     pub fn structure_only() -> Self {
         Self {
+            enumerate: RefCell::new(Some(Vec::new())),
+            ..Self::inert()
+        }
+    }
+
+    /// Every mode off and no perf_api attached; each constructor starts here.
+    fn inert() -> Self {
+        Self {
             dry_run: RefCell::new(None),
             backend_overrides: RefCell::new(None),
             active_pool: RefCell::new(None),
-            enumerate: RefCell::new(Some(Vec::new())),
+            enumerate: RefCell::new(None),
             config_records: RefCell::new(None),
+            replay: None,
+            sample_records: RefCell::new(None),
         }
     }
 
@@ -445,27 +452,51 @@ impl PerfApiBridge {
         }
     }
 
+    // ── sample records (replay samples) ──────────────────────────────────────
+
+    /// Record every row subsequent `get_times` calls return, as the replay
+    /// samples that reproduce this build and its evaluations without
+    /// profile.db. Drain with [`take_sample_records`](Self::take_sample_records).
+    pub fn enable_sample_records(&self) {
+        *self.sample_records.borrow_mut() = Some(BTreeMap::new());
+    }
+
+    /// The recorded rows, one per distinct lookup, in key order.
+    pub fn take_sample_records(&self) -> Vec<SampleRow> {
+        match self.sample_records.borrow_mut().as_mut() {
+            Some(records) => std::mem::take(records).into_values().collect(),
+            None => Vec::new(),
+        }
+    }
+
     /// Lock the perf_api into "sim-runtime-safe" mode: any spec that's not
     /// already cached in the profile DB will raise `MissingEntry` rather than
     /// kicking off a JIT profile. Called from `new()`; the Python side is
-    /// idempotent so repeated calls are safe.
+    /// idempotent so repeated calls are safe. A replay bridge is always strict.
     pub fn disable_jit_profiling(&self) -> Result<(), PerfApiError> {
-        self.call_perf_api_void("disable_jit_profiling")
+        if self.replay.is_some() {
+            return Ok(());
+        }
+        python::call_perf_api_void("disable_jit_profiling")
     }
 
     /// Re-enable JIT profiling. Used by the `--build-cache-only` entry point
     /// (L1 design.md §7.2): Rust main flips this back on *before* calling any
     /// `*Kernel::build`, so missing specs are profiled into the DB on demand
-    /// instead of erroring out.
+    /// instead of erroring out. A no-op on a replay bridge, which cannot
+    /// profile: a missing sample stays a `MissingEntry`.
     pub fn enable_jit_profiling(&self) -> Result<(), PerfApiError> {
-        self.call_perf_api_void("enable_jit_profiling")
+        if self.replay.is_some() {
+            return Ok(());
+        }
+        python::call_perf_api_void("enable_jit_profiling")
     }
 
     /// Start the collect pass: `count_missing` records what is absent instead of
     /// only counting it. Pair with [`issue_collected`](Self::issue_collected),
     /// and run the build cascade in dry-run mode in between.
     pub fn begin_collect(&self) -> Result<(), PerfApiError> {
-        self.call_perf_api_void("begin_collect")
+        python::call_perf_api_void("begin_collect")
     }
 
     /// Measure everything the collect pass recorded, one whole `(kind, backend)`
@@ -477,25 +508,7 @@ impl PerfApiBridge {
     /// across lets a disagreement fail here rather than resurface as a
     /// kernel-at-a-time JIT during the next real run.
     pub fn issue_collected(&self, expected_specs: usize) -> Result<(), PerfApiError> {
-        Python::with_gil(|py| {
-            let perf_api = PyModule::import(py, "profiling.perf_api").py_err()?;
-            perf_api
-                .getattr("issue_collected")
-                .and_then(|func| func.call1((expected_specs,)))
-                .py_err()?;
-            Ok(())
-        })
-    }
-
-    fn call_perf_api_void(&self, attr: &str) -> Result<(), PerfApiError> {
-        Python::with_gil(|py| {
-            let perf_api = PyModule::import(py, "profiling.perf_api").py_err()?;
-            perf_api
-                .getattr(attr)
-                .and_then(|func| func.call0())
-                .py_err()?;
-            Ok(())
-        })
+        python::issue_collected(expected_specs)
     }
 
     /// Look up profiled times for a batch of per-kernel specs.
@@ -516,19 +529,17 @@ impl PerfApiBridge {
             return Ok(Vec::new());
         }
         let backend = shared_backend(&payloads)?;
-        Python::with_gil(|py| {
-            let perf_api = PyModule::import(py, "profiling.perf_api").py_err()?;
-            let py_specs = payloads_to_py_list(py, &payloads)?;
-            let kwargs = PyDict::new(py);
-            kwargs.set_item("backend", backend).py_err()?;
-            kwargs.set_item("gpu_name", gpu_name).py_err()?;
-            let fn_name = format!("get_{kind}_times");
-            let results = perf_api
-                .getattr(fn_name.as_str())
-                .and_then(|func| func.call((py_specs,), Some(kwargs)))
-                .py_err()?;
-            py_results_to_metrics(kind, backend, &payloads, results)
-        })
+        if let Some(replay) = &self.replay {
+            return replay.get_times(&payloads, kind, backend, gpu_name);
+        }
+        let metrics = python::get_times(&payloads, kind, backend, gpu_name)?;
+        if let Some(records) = self.sample_records.borrow_mut().as_mut() {
+            for (payload, metrics) in payloads.iter().zip(&metrics) {
+                let row = SampleRow::answer(kind, backend, gpu_name, payload, metrics);
+                records.insert(row.key(), row);
+            }
+        }
+        Ok(metrics)
     }
 
     /// Count cache-miss specs for `kind` against the given backend's profile.
@@ -544,19 +555,10 @@ impl PerfApiBridge {
             return Ok(0);
         }
         ensure_payload_backends_match(&payloads, backend)?;
-        Python::with_gil(|py| {
-            let perf_api = PyModule::import(py, "profiling.perf_api").py_err()?;
-            let py_specs = payloads_to_py_list(py, &payloads)?;
-            let kwargs = PyDict::new(py);
-            kwargs.set_item("backend", backend).py_err()?;
-            kwargs.set_item("gpu_name", gpu_name).py_err()?;
-            let fn_name = format!("count_missing_{kind}");
-            perf_api
-                .getattr(fn_name.as_str())
-                .and_then(|func| func.call((py_specs,), Some(kwargs)))
-                .and_then(|value| value.extract::<usize>())
-                .py_err()
-        })
+        if let Some(replay) = &self.replay {
+            return Ok(replay.count_missing(&payloads, kind, backend, gpu_name));
+        }
+        python::count_missing(&payloads, kind, backend, gpu_name)
     }
 
     /// Resolve the current CUDA device's DB `gpu_name` key via the Python
@@ -564,65 +566,18 @@ impl PerfApiBridge {
     /// / kernel inputs (L3 INV-13); callers targeting a non-current or remote
     /// GPU should supply the name explicitly rather than calling this.
     pub fn get_current_gpu_name(&self) -> Result<String, PerfApiError> {
-        Python::with_gil(|py| {
-            let perf_api = PyModule::import(py, "profiling.perf_api").py_err()?;
-            perf_api
-                .getattr("get_current_gpu_name")
-                .and_then(|func| func.call0())
-                .and_then(|value| value.extract::<String>())
-                .py_err()
-        })
+        python::get_current_gpu_name()
     }
 
     pub fn get_db_metadata(&self) -> Result<DbMetadata, PerfApiError> {
-        Python::with_gil(|py| {
-            let perf_api = PyModule::import(py, "profiling.perf_api").py_err()?;
-            let value = perf_api
-                .getattr("get_db_metadata")
-                .and_then(|func| func.call0())
-                .py_err()?;
-            Ok(DbMetadata {
-                schema_version: value
-                    .getattr("schema_version")
-                    .and_then(|attr| attr.extract::<u32>())
-                    .py_err()?,
-                schema_hash: value
-                    .getattr("schema_hash")
-                    .and_then(|attr| attr.extract::<String>())
-                    .py_err()?,
-                created_at: optional_string(value, "created_at")?,
-                last_migrated_at: optional_string(value, "last_migrated_at")?,
-            })
-        })
+        python::get_db_metadata()
     }
 
     pub fn get_profiler_versions(
         &self,
         op_families: Vec<&str>,
     ) -> Result<Vec<ProfilerVersion>, PerfApiError> {
-        Python::with_gil(|py| {
-            let perf_api = PyModule::import(py, "profiling.perf_api").py_err()?;
-            let families = PyList::new(py, op_families);
-            let values = perf_api
-                .getattr("get_profiler_versions")
-                .and_then(|func| func.call1((families,)))
-                .py_err()?;
-            let mut versions = Vec::new();
-            for item in values.iter().py_err()? {
-                let item = item.py_err()?;
-                versions.push(ProfilerVersion {
-                    op_family: item
-                        .getattr("op_family")
-                        .and_then(|attr| attr.extract::<String>())
-                        .py_err()?,
-                    profiler_git_hash: item
-                        .getattr("profiler_git_hash")
-                        .and_then(|attr| attr.extract::<String>())
-                        .py_err()?,
-                });
-            }
-            Ok(versions)
-        })
+        python::get_profiler_versions(op_families)
     }
 }
 
@@ -650,105 +605,8 @@ impl PerfApiBridge {
     /// (which imports `profiling.perf_api`). Lets the backend-override unit tests
     /// exercise pure bridge state with no live perf_api / GIL.
     pub(crate) fn new_uninit_for_test() -> Self {
-        Self {
-            dry_run: RefCell::new(None),
-            backend_overrides: RefCell::new(None),
-            active_pool: RefCell::new(None),
-            enumerate: RefCell::new(None),
-            config_records: RefCell::new(None),
-        }
+        Self::inert()
     }
-}
-
-fn payloads_to_py_list<'py>(
-    py: Python<'py>,
-    payloads: &[ArgsPayload],
-) -> Result<&'py PyList, PerfApiError> {
-    let list = PyList::empty(py);
-    for payload in payloads {
-        let dict = PyDict::new(py);
-        for (key, value) in payload.fields() {
-            dict.set_item(key, json_value_to_py(py, value)?).py_err()?;
-        }
-        list.append(dict).py_err()?;
-    }
-    Ok(list)
-}
-
-fn json_value_to_py(py: Python<'_>, value: &Value) -> Result<PyObject, PerfApiError> {
-    match value {
-        Value::Null => Ok(py.None()),
-        Value::Bool(value) => Ok(value.into_py(py)),
-        Value::Number(value) => {
-            if let Some(value) = value.as_i64() {
-                Ok(value.into_py(py))
-            } else if let Some(value) = value.as_u64() {
-                Ok(value.into_py(py))
-            } else if let Some(value) = value.as_f64() {
-                Ok(value.into_py(py))
-            } else {
-                Err(PerfApiError::InvalidRequest(
-                    "unsupported JSON number".to_string(),
-                ))
-            }
-        }
-        Value::String(value) => Ok(value.into_py(py)),
-        Value::Array(values) => {
-            let list = PyList::empty(py);
-            for item in values {
-                list.append(json_value_to_py(py, item)?).py_err()?;
-            }
-            Ok(list.into_py(py))
-        }
-        Value::Object(_) => Err(PerfApiError::InvalidRequest(
-            "nested object payloads are not supported yet".to_string(),
-        )),
-    }
-}
-
-fn py_results_to_metrics(
-    kind: KernelKind,
-    backend: &str,
-    specs: &[ArgsPayload],
-    results: &PyAny,
-) -> Result<Vec<KernelMetrics>, PerfApiError> {
-    let result_len = results.len().py_err()?;
-    if result_len != specs.len() {
-        return Err(PerfApiError::TypeMismatch(format!(
-            "perf_api returned {result_len} result(s) for {} spec(s)",
-            specs.len()
-        )));
-    }
-
-    let mut metrics = Vec::new();
-    for (idx, item) in results.iter().py_err()?.enumerate() {
-        let item = item.py_err()?;
-        let class_name = item
-            .getattr("__class__")
-            .and_then(|class| class.getattr("__name__"))
-            .and_then(|name| name.extract::<String>())
-            .py_err()?;
-        if class_name == "MissingEntry" {
-            return Err(PerfApiError::MissingEntry {
-                kind,
-                backend: backend.to_string(),
-                spec: specs[idx].clone(),
-            });
-        }
-        metrics.push(KernelMetrics {
-            time_ms: extract_f64(item, "time_ms")?,
-            tflops: optional_f64(item, "tflops")?,
-            memory_bandwidth_gbps: optional_f64(item, "memory_bandwidth_gbps")?,
-            algbw_gbps: optional_f64(item, "algbw_gbps")?,
-            busbw_gbps: optional_f64(item, "busbw_gbps")?,
-            // `KernelMetrics::energy_j` is a required f64 (not `Option`);
-            // profilers that don't measure energy report 0.0 via this default.
-            // `is_finite` validates the resulting value, so a missing field is
-            // semantically "zero energy" and does not bypass NaN/Inf checks.
-            energy_j: optional_f64(item, "energy_j")?.unwrap_or(0.0),
-        });
-    }
-    Ok(metrics)
 }
 
 fn shared_backend(payloads: &[ArgsPayload]) -> Result<&str, PerfApiError> {
@@ -798,37 +656,6 @@ fn ensure_payload_backends_match(
         }
     }
     Ok(())
-}
-
-fn extract_f64(item: &PyAny, field: &str) -> Result<f64, PerfApiError> {
-    item.getattr(field)
-        .and_then(|attr| attr.extract::<f64>())
-        .py_err()
-}
-
-// `optional_*` helpers below intentionally collapse `Err(AttributeError)` and
-// `Ok(None)` into the same `Ok(None)` result. This is *not* leniency by
-// accident: Python `ComputeMetrics` and `CommMetrics` are separate dataclasses
-// with disjoint optional fields (`tflops` lives only on compute,
-// `algbw_gbps`/`busbw_gbps` only on comm). When this
-// bridge reads a row from either family, the cross-family fields legitimately
-// don't exist on the Python object, and `AttributeError` is the expected
-// signal. The cost is that a future field rename on the Python side will
-// silently drop the value rather than fail loudly — guarded against by the
-// `KernelMetrics::is_finite` invariant + integration tests on perf_api.
-
-fn optional_f64(item: &PyAny, field: &str) -> Result<Option<f64>, PerfApiError> {
-    match item.getattr(field) {
-        Ok(value) if !value.is_none() => value.extract::<f64>().map(Some).py_err(),
-        _ => Ok(None),
-    }
-}
-
-fn optional_string(item: &PyAny, field: &str) -> Result<Option<String>, PerfApiError> {
-    match item.getattr(field) {
-        Ok(value) if !value.is_none() => value.extract::<String>().map(Some).py_err(),
-        _ => Ok(None),
-    }
 }
 
 #[cfg(test)]

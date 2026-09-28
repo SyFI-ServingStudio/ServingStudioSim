@@ -12,6 +12,14 @@ use std::process::Command;
 fn main() {
     println!("cargo:rerun-if-env-changed=PYO3_PYTHON");
 
+    // No libpython to find without the PyO3 bridge (the wasm build), and a
+    // `-Wl,-rpath` link arg would break a non-ELF link.
+    if std::env::var_os("CARGO_FEATURE_PYTHON").is_none()
+        || std::env::var("CARGO_CFG_TARGET_FAMILY").as_deref() == Ok("wasm")
+    {
+        return;
+    }
+
     // Prefer the interpreter PyO3 itself uses (PYO3_PYTHON), else `python3` on
     // PATH — under `uv run` that resolves to the project venv.
     let python = std::env::var("PYO3_PYTHON").unwrap_or_else(|_| "python3".to_string());

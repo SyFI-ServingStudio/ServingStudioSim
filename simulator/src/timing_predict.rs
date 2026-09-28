@@ -54,8 +54,10 @@ use crate::arch::contract::{
 use crate::arch::{AttnArchSel, FfnArchSel, IterArchSel};
 use crate::common::{Time, WorkerId};
 use crate::deployment::BackendOverrides;
-use crate::timing::bridge::write_config_records;
-use crate::timing::{CostManifestDoc, PerfApiBridge};
+use crate::timing::bridge::{write_config_records, write_samples, ReplaySamples};
+use crate::timing::{
+    CostManifest, CostManifestDoc, CostTree, FlatCostNode, LeafMetrics, PerfApiBridge,
+};
 use crate::worker::CostBuffers;
 
 /// The AFD deployment's dotted-leaf prefix (see `deployment/afd.rs`). Predicting
@@ -342,25 +344,53 @@ pub enum PredictMode {
 /// Every case is lowered and checked against the model before the first one is
 /// costed, so a bad case fails the run before any row is written.
 ///
-/// `kernel_configs_out` names a file to write, on success, every kernel config
-/// the model asks profile.db for (see `simulator build-cache-only
-/// --kernel-configs-out`).
+/// Files `run_timing_predict` writes besides the prediction, on success.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PredictOutputs<'a> {
+    /// Every kernel config the model asks profile.db for (see `simulator
+    /// build-cache-only --kernel-configs-out`).
+    pub kernel_configs: Option<&'a Path>,
+    /// Every row the run read, as the replay samples a [`Predictor`] on a
+    /// replay bridge needs. A real run only: a dry run reads no rows.
+    pub samples: Option<&'a Path>,
+}
+
+/// `replay_samples` names a samples array to answer every lookup from instead
+/// of profile.db (see [`PerfApiBridge::replay`]).
 pub fn run_timing_predict(
     config_path: &Path,
     mode: PredictMode,
-    kernel_configs_out: Option<&Path>,
+    outputs: &PredictOutputs,
+    replay_samples: Option<&Path>,
 ) -> Result<()> {
     let cfg: PredictConfig = parse_config_file(config_path)?;
-    let bridge = match mode {
-        PredictMode::Run => predict_bridge()?,
-        PredictMode::DryRun => {
-            let bridge = PerfApiBridge::new().context("starting the PyO3 perf_api bridge")?;
-            bridge.enable_dry_run();
-            bridge
+    let bridge = match (replay_samples, mode) {
+        (Some(path), _) => {
+            let text = fs::read_to_string(path)
+                .with_context(|| format!("reading replay samples {}", path.display()))?;
+            let samples = ReplaySamples::from_json(&text)
+                .with_context(|| format!("parsing replay samples {}", path.display()))?;
+            PerfApiBridge::replay(std::sync::Arc::new(samples))
+        }
+        (None, PredictMode::Run) => predict_bridge()?,
+        (None, PredictMode::DryRun) => {
+            PerfApiBridge::new().context("starting the PyO3 perf_api bridge")?
         }
     };
+    if mode == PredictMode::DryRun {
+        bridge.enable_dry_run();
+    }
+    let kernel_configs_out = outputs.kernel_configs;
+    let samples_out = outputs.samples;
     if kernel_configs_out.is_some() {
         bridge.enable_config_records();
+    }
+    if samples_out.is_some() {
+        ensure!(
+            mode == PredictMode::Run,
+            "--samples-out records a real run's reads; a dry run reads none"
+        );
+        bridge.enable_sample_records();
     }
     let run = mode == PredictMode::Run;
 
@@ -420,6 +450,9 @@ pub fn run_timing_predict(
     if let Some(path) = kernel_configs_out {
         write_config_records(path, &bridge.take_config_records())?;
     }
+    if let Some(path) = samples_out {
+        write_samples(path, &bridge.take_sample_records())?;
+    }
     if !run {
         print_dry_run(&bridge, num_cases, gpu_count);
         return Ok(());
@@ -431,6 +464,188 @@ pub fn run_timing_predict(
         "timing-predict wrote {num_cases} case(s)"
     );
     Ok(())
+}
+
+/// One case's predicted times: the `cost_log` row's `total_time_ms` and
+/// `slot_time_ms`, plus `node_time_ms[i]` for flat node `i` of
+/// [`Predictor::manifest`] (inside a `Scale{n}` subtree a node holds one
+/// repeat; the `Scale` node holds all `n`).
+#[derive(Debug, Serialize)]
+pub struct CaseTimes {
+    pub total_time_ms: f64,
+    pub slot_time_ms: Vec<f32>,
+    pub node_time_ms: Vec<f32>,
+}
+
+/// What a caller needs to shape cases for a [`Predictor`].
+#[derive(Debug, Serialize)]
+pub struct PredictorInfo {
+    /// `iter` or `speculative_iter`: which case shape [`Predictor::predict`] takes.
+    pub selector: &'static str,
+    pub num_attn_dp_groups: u16,
+    pub gpus_per_replica: u16,
+    /// The timing kernels' context bound, when the model declares one.
+    pub max_model_len: Option<u32>,
+}
+
+/// The cost tree a [`Predictor`] costs, without the per-slot `kernel_config`
+/// (what a caller needs to lay [`CaseTimes`] onto the tree).
+#[derive(Debug, Serialize)]
+pub struct PredictorManifest {
+    pub slots: Vec<String>,
+    pub nodes: Vec<FlatCostNode>,
+    pub node_labels: Vec<Option<String>>,
+}
+
+enum PredictModel {
+    Iter(Box<dyn IterwiseUnifiedModel>),
+    Speculative {
+        model: Box<dyn SpeculativeUnifiedModel>,
+        draft_tokens: u32,
+    },
+}
+
+/// A predict config's arch built once, costing cases in memory: the
+/// `timing-predict` iter and speculative paths without files, parquet or
+/// artifacts. Built on any bridge, a replay one included (the wasm32 entry).
+pub struct Predictor {
+    model: PredictModel,
+    manifest: CostManifest,
+    slots: Vec<LeafMetrics>,
+    scratch: Vec<LeafMetrics>,
+    nodes: Vec<LeafMetrics>,
+}
+
+impl Predictor {
+    /// Build from a predict config's `arch` value (`{"iter": {...}}` or
+    /// `{"speculative_iter": {...}}`), its GPU and optional `backends`.
+    pub fn build(
+        arch: serde_json::Value,
+        gpu: &str,
+        backends: Option<serde_json::Value>,
+        bridge: &PerfApiBridge,
+    ) -> Result<Self> {
+        let sel: PredictArchSel =
+            serde_json::from_value(arch).context("parsing the predict arch selector")?;
+        let backends: BackendOverrides = match backends {
+            Some(value) => serde_json::from_value(value).context("parsing backends")?,
+            None => BackendOverrides::default(),
+        };
+        let _scope = bridge.with_backend_overrides("main", backends.get("main"));
+        let model = match &sel {
+            PredictArchSel::Iter(sel) => PredictModel::Iter(
+                build_iter_model(sel, gpu, UNIFIED_MODEL_NAME, bridge)
+                    .context("building the iter-wise arch model")?,
+            ),
+            PredictArchSel::SpeculativeIter(sel) => {
+                let (model, draft_tokens) =
+                    build_speculative_iter_model(sel, gpu, UNIFIED_MODEL_NAME, bridge)
+                        .context("building the speculative iter-wise model")?;
+                PredictModel::Speculative {
+                    model,
+                    draft_tokens,
+                }
+            }
+            PredictArchSel::Attn(_) | PredictArchSel::Ffn(_) => {
+                bail!("in-memory prediction takes the iter or speculative_iter selector")
+            }
+        };
+        Ok(Self::from_model(model))
+    }
+
+    fn from_model(model: PredictModel) -> Self {
+        let manifest = match &model {
+            PredictModel::Iter(model) => model.cost_log_manifest(),
+            PredictModel::Speculative { model, .. } => model.cost_log_manifest(),
+        };
+        Self {
+            model,
+            manifest,
+            slots: Vec::new(),
+            scratch: Vec::new(),
+            nodes: Vec::new(),
+        }
+    }
+
+    pub fn info(&self) -> PredictorInfo {
+        match &self.model {
+            PredictModel::Iter(model) => PredictorInfo {
+                selector: "iter",
+                num_attn_dp_groups: model.num_attn_dp_groups(),
+                gpus_per_replica: model.gpus_per_replica(),
+                max_model_len: None,
+            },
+            PredictModel::Speculative { model, .. } => PredictorInfo {
+                selector: "speculative_iter",
+                num_attn_dp_groups: model.num_attn_dp_groups(),
+                gpus_per_replica: model.gpus_per_replica(),
+                max_model_len: Some(model.max_model_len()),
+            },
+        }
+    }
+
+    pub fn manifest(&self) -> PredictorManifest {
+        PredictorManifest {
+            slots: self
+                .manifest
+                .slots
+                .iter()
+                .map(|leaf| leaf.name.clone())
+                .collect(),
+            nodes: self.manifest.nodes.clone(),
+            node_labels: self.manifest.node_labels.clone(),
+        }
+    }
+
+    /// Cost `cases` (a `timing-predict` cases array of the selector's shape).
+    /// Every case is lowered and checked before the first is costed, as the
+    /// file path does, so an invalid one fails as `case N: <reason>`.
+    pub fn predict(&mut self, cases: serde_json::Value) -> Result<Vec<CaseTimes>> {
+        match &self.model {
+            PredictModel::Iter(model) => {
+                let cases: Vec<PredictCase> =
+                    serde_json::from_value(cases).context("parsing cases")?;
+                let inputs = iter_inputs(&**model, cases)?;
+                Ok(inputs
+                    .iter()
+                    .map(|input| {
+                        let total = model.eval_iter(input, &mut self.slots, &mut self.scratch);
+                        case_times(total, &self.manifest, &self.slots, &mut self.nodes)
+                    })
+                    .collect())
+            }
+            PredictModel::Speculative {
+                model,
+                draft_tokens,
+            } => {
+                let cases: Vec<SpeculativePredictCase> =
+                    serde_json::from_value(cases).context("parsing cases")?;
+                let inputs = speculative_iter_inputs(&**model, *draft_tokens, cases)?;
+                Ok(inputs
+                    .iter()
+                    .map(|input| {
+                        let total =
+                            model.eval_speculative_iter(input, &mut self.slots, &mut self.scratch);
+                        case_times(total, &self.manifest, &self.slots, &mut self.nodes)
+                    })
+                    .collect())
+            }
+        }
+    }
+}
+
+fn case_times(
+    total: LeafMetrics,
+    manifest: &CostManifest,
+    slots: &[LeafMetrics],
+    nodes: &mut Vec<LeafMetrics>,
+) -> CaseTimes {
+    CostTree::aggregate(&manifest.nodes, slots, nodes);
+    CaseTimes {
+        total_time_ms: total.m.time_ms as f64,
+        slot_time_ms: slots.iter().map(|leaf| leaf.m.time_ms).collect(),
+        node_time_ms: nodes.iter().map(|node| node.m.time_ms).collect(),
+    }
 }
 
 /// The dry-run report: the cases that validated, then one line per kernel with
@@ -993,6 +1208,32 @@ mod tests {
         let model = ContextCapped(crate::test_helpers::FakeModel::for_ms(1.0));
         let err = iter_inputs(&model, cases).unwrap_err().to_string();
         assert_eq!(err, "case 1: context 16384 exceeds max_model_len 8192");
+
+        // The in-memory predictor lowers through the same check.
+        let mut predictor = Predictor::from_model(PredictModel::Iter(Box::new(ContextCapped(
+            crate::test_helpers::FakeModel::for_ms(1.0),
+        ))));
+        let cases = serde_json::json!([
+            {"groups": [{"decode_kv_lens": [8192]}]},
+            {"groups": [{"decode_kv_lens": [16384]}]},
+        ]);
+        let err = predictor.predict(cases).unwrap_err().to_string();
+        assert_eq!(err, "case 1: context 16384 exceeds max_model_len 8192");
+    }
+
+    #[test]
+    fn a_replay_predictor_fails_on_a_row_the_samples_lack() {
+        let bridge = PerfApiBridge::replay(std::sync::Arc::new(ReplaySamples::from_rows(vec![])));
+        let arch = serde_json::json!({"iter": {
+            "type": "llama3_dense_tp",
+            "model_config": "model/config/llama3_8b.json",
+            "fp8": false,
+            "tp_size": 1,
+        }});
+        let err = Predictor::build(arch, "NVIDIA H200", None, &bridge)
+            .err()
+            .expect("an empty sample set answers no kernel");
+        assert!(format!("{err:#}").contains("missing"), "{err:#}");
     }
 
     #[test]

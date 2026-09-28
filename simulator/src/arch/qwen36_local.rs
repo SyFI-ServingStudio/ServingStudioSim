@@ -130,7 +130,7 @@ pub struct Qwen36ModelCfg {
 impl Qwen36ModelCfg {
     pub fn from_json(path: &Path, spec: &ModelSpec) -> Result<Self> {
         ensure!(spec.fp8, "qwen36_local requires fp8=true");
-        let text = std::fs::read_to_string(path)
+        let text = crate::common::input_files::read_to_string(path)
             .with_context(|| format!("reading Qwen3.6 config {}", path.display()))?;
         parse_model_json(&text, spec.num_layers, spec.sim_num_layers)
             .with_context(|| format!("validating Qwen3.6 config {}", path.display()))
