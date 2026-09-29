@@ -234,3 +234,102 @@ def test_wasm_matches_native_timing_predict(name, sim_bin, node, tmp_path):
             np.float32(got["slot_time_ms"]), np.float32(row["slot_time_ms"])
         )
         assert np.float32(got["node_time_ms"][0]) == np.float32(row["total_time_ms"])
+
+
+# A registered run as the Models page predicts it: `run.predict` of its cost
+# tree, each file through `/files`, the configs through `kernel-data`.
+# name -> (arch, cost-tree query, cases)
+API_RUNS = {
+    "glm52_nvfp4_b200_ep4_spec5_corpus": (
+        "glm52_vllm_nvfp4_dsa_moe_speculative",
+        {"gpu": "NVIDIA B200", "model": "glm52_nvfp4", "ep_size": 4, "nvl_num_gpu": 4},
+        SPEC5_CASES,
+    ),
+    "glm52_nvfp4_b200_ep4_popularity": (
+        "glm52_vllm_nvfp4_dsa_moe",
+        {"gpu": "NVIDIA B200", "model": "glm52_nvfp4", "ep_size": 4, "nvl_num_gpu": 4},
+        MIXED_CASES,
+    ),
+    "llama3_8b_h200_tp1": (
+        "llama3_dense_tp",
+        {"gpu": "NVIDIA H200", "model": "llama3_8b", "tp_size": 1},
+        MIXED_CASES,
+    ),
+}
+
+
+@pytest.fixture(scope="module")
+def api():
+    from fastapi.testclient import TestClient
+
+    from public_api.app import PREFIX, create_app
+
+    library = KernelLibrary(KernelSources(db_path=REPO_ROOT / "profiling" / "profile.db"))
+    client = TestClient(create_app(library))
+    return lambda route, **params: client.get(f"{PREFIX}/{route}", params=params)
+
+
+@pytest.mark.parametrize("name", API_RUNS)
+def test_a_public_api_run_predicts_in_wasm_as_natively(name, api, sim_bin, node, tmp_path):
+    arch, query, cases = API_RUNS[name]
+    tree = api(f"archs/{arch}/cost-tree", **query)
+    assert tree.status_code == 200, tree.text
+    predict = tree.json()["run"]["predict"]
+    assert predict["complete"] and predict["error"] is None, predict
+
+    files = {}
+    for i, path in enumerate(predict["files"]):
+        served = api("files", path=path)
+        if served.status_code == 404 and path.startswith("hf://"):
+            pytest.skip(f"{path}: not in this machine's hub cache")
+        assert served.status_code == 200, served.text
+        (tmp_path / f"file{i}").write_text(served.text)
+        files[path] = str(tmp_path / f"file{i}")
+    data = api(f"archs/{arch}/kernel-data", **query)
+    assert data.status_code == 200, data.text
+    kernel_data = data.json()
+    assert kernel_data["missing"] == [] and kernel_data["gpu"] == predict["gpu"]
+    (tmp_path / "kernel_data.json").write_text(data.text)
+    request = tmp_path / "wasm_input.json"
+    request.write_text(
+        json.dumps(
+            {
+                "config": {"arch": predict["arch"], "gpu": predict["gpu"]},
+                "kernel_data_file": str(tmp_path / "kernel_data.json"),
+                "files": files,
+                "cases": cases,
+            }
+        )
+    )
+    run = subprocess.run(
+        [node, str(RUNNER), str(PKG_DIR), str(request)], capture_output=True, text=True
+    )
+    assert run.returncode == 0, run.stderr
+    out = json.loads(run.stdout)
+    assert out["info"]["draft_tokens"] == predict["arch"].get("draft_tokens")
+
+    # Native reads the same block, its hub references fetched to local paths.
+    (tmp_path / "cases.json").write_text(json.dumps(cases))
+    config = tmp_path / "predict.json"
+    config.write_text(
+        json.dumps(
+            {
+                "arch": resolve_hf_references(predict["arch"]),
+                "gpu": predict["gpu"],
+                "log_dir": str(tmp_path / "logs"),
+                "cases_file": "cases.json",
+            }
+        )
+    )
+    native = _simulator(sim_bin, "timing-predict", str(config))
+    assert native.returncode == 0, native.stderr
+    raw = tmp_path / "logs" / "raw"
+    rows = pq.read_table(raw / "cost_log" / "worker_predict_0.parquet").to_pylist()
+    predicted = [section for case in out["cases"] for section in case["sections"]]
+    assert len(predicted) == len(rows)
+    for got, row in zip(predicted, rows, strict=True):
+        assert (got["section"], got["layer"]) == (row["section"], row["layer"])
+        assert got["total_time_ms"] == row["total_time_ms"]
+        np.testing.assert_array_equal(
+            np.float32(got["slot_time_ms"]), np.float32(row["slot_time_ms"])
+        )

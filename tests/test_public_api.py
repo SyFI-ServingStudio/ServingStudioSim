@@ -750,13 +750,17 @@ def _names(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, corpus=(), popularit
     """Serve a routing-name table naming ``corpus`` (``(checksum, name)``) and
     ``popularity`` (``(file, name)``) instead of the repository's."""
 
+    def entry(f: Path, name: str) -> dict:
+        out = {"name": name, "sha256": hashlib.sha256(Path(f).read_bytes()).hexdigest()}
+        # Where the repository keeps it, when it is under the repository.
+        if Path(f).is_relative_to(arch_library.REPO_ROOT):
+            out["file"] = str(Path(f).relative_to(arch_library.REPO_ROOT))
+        return out
+
     table = {
         "schema_version": 1,
         "corpus": [{"name": n, "checksum_fnv1a64": f"{c:016x}"} for c, n in corpus],
-        "popularity": [
-            {"name": n, "sha256": hashlib.sha256(Path(f).read_bytes()).hexdigest()}
-            for f, n in popularity
-        ],
+        "popularity": [entry(f, n) for f, n in popularity],
     }
     path = tmp_path / "routings.yaml"
     path.write_text(json.dumps(table))
@@ -951,7 +955,13 @@ def test_arch_detail_lists_params_and_the_supported_sets(registered) -> None:
         None,
     )
     # Three distinct configs: qkv is registered and measured, the other two are not.
-    assert four["counts"] == {"leaves": 4, "configs": 3, "registered": 1, "measured": 1}
+    assert four["counts"] == {
+        "leaves": 4,
+        "configs": 3,
+        "registered": 1,
+        "measured": 1,
+        "predictable": 0,
+    }
 
 
 def test_cost_tree_nests_the_manifest_in_the_analyzer_shape(registered) -> None:
@@ -1010,8 +1020,17 @@ def test_cost_tree_nests_the_manifest_in_the_analyzer_shape(registered) -> None:
         "config_hash": qkv,
         "args": QKV,
         "args_omitted": [],
-        "registry": {"cells": 3, "infeasible": 1, "measured": {"torch": 2, "torch_linear": 1}},
+        "registry": {
+            "cells": 3,
+            "infeasible": 1,
+            "measured": {"torch": 2, "torch_linear": 1},
+            "usable": {"torch": 2, "torch_linear": 1},
+        },
     }
+    # The leaves run torch and torch_linear: torch has both feasible cells,
+    # torch_linear one, so a prediction could not fit this config.
+    assert [r["slot"]["backends"] for r in ranks["children"]] == [["torch", "torch_linear"]] * 2
+    assert tree["counts"]["predictable"] == 0
     assert tree["configs"][mlp["slot"]["config_key"]]["registry"] is None
     assert tree["kernels"]["single_gemm"] == {
         "documented": True,
@@ -1085,7 +1104,13 @@ def test_two_kinds_of_one_identity_are_two_configs(tmp_path: Path) -> None:
     assert [configs[s["config_key"]]["kind"] for s in slots] == ["rms_norm", "residual_rms_norm"]
     assert configs[f"rms_norm:{norm}"]["registry"]["measured"] == {"flashinfer": 1}
     assert configs[f"residual_rms_norm:{norm}"]["registry"]["measured"] == {}
-    assert tree["counts"] == {"leaves": 2, "configs": 2, "registered": 2, "measured": 1}
+    assert tree["counts"] == {
+        "leaves": 2,
+        "configs": 2,
+        "registered": 2,
+        "measured": 1,
+        "predictable": 0,
+    }
     [param_set] = client.get(f"{PREFIX}/archs/llama3_dense_tp").json()["param_sets"]
     assert param_set["members"][1]["counts"] == tree["counts"]
     # The kernel library reads each kind's registry on its own already.
@@ -1197,6 +1222,7 @@ MOE_QUERY = {"gpu": "NVIDIA H200", "model": "moe_m", "ep_size": "4"}
 MOE_TREE = f"{PREFIX}/archs/moe_x/cost-tree"
 POPULARITY = "presets/popularity.json"
 PACK = "presets/alignment/moe_x"
+MOE_CONFIG = "model/config/moe_m.json"
 
 
 def _moe_block(**params) -> dict:
@@ -1277,7 +1303,7 @@ class RunSources(FixtureSources):
         return [_moe_build(block["arch"]) for block in blocks]
 
     def tracked(self, paths: list[str]) -> set[str]:
-        return {p for p in paths if p in ("presets/moe_x.yaml", POPULARITY, PACK)}
+        return {p for p in paths if p in ("presets/moe_x.yaml", POPULARITY, PACK, MOE_CONFIG)}
 
 
 @pytest.fixture
@@ -1337,7 +1363,13 @@ def test_a_tree_is_built_as_its_best_measured_registered_run(runs) -> None:
     tree = client.get(MOE_TREE, params=MOE_QUERY).json()
     run = tree["run"]
     assert run["basis"] == "registry"
-    assert tree["counts"] == {"leaves": 3, "configs": 3, "registered": 2, "measured": 2}
+    assert tree["counts"] == {
+        "leaves": 3,
+        "configs": 3,
+        "registered": 2,
+        "measured": 2,
+        "predictable": 0,
+    }
     assert run["params"] == {
         "fp8": False,
         "routing": "popularity",
@@ -1515,6 +1547,47 @@ def test_a_null_for_a_param_with_no_default_is_the_run_that_leaves_it_out(runs) 
     assert run["combinations"] == 3
 
 
+def test_a_run_carries_what_the_browser_predicts_it_from(runs) -> None:
+    """``run.predict``: the run's arch block, its GPU, and the files it reads,
+    each served by ``/files``; nothing else is served."""
+
+    client, _ = runs
+    predict = client.get(MOE_TREE, params=MOE_QUERY).json()["run"]["predict"]
+    assert predict["arch"] == {
+        "type": "moe_x",
+        "model_config": MOE_CONFIG,
+        "ep_size": 4,
+        "fp8": False,
+        "routing": "popularity",
+        "mtp_mode": "off",
+        "expert_popularity_file": POPULARITY,
+    }
+    assert predict["gpu"] == "NVIDIA H200"
+    assert predict["files"] == [MOE_CONFIG, POPULARITY]
+    # 2 of the tree's 3 configs are measured.
+    assert (predict["complete"], predict["error"]) == (False, None)
+    for path in predict["files"]:
+        served = client.get(f"{PREFIX}/files", params={"path": path})
+        assert (served.status_code, served.text) == (200, "{}")
+    # An unnamed routing file, an untracked or unrelated file, a path out of
+    # the repository: none is served.
+    for path in ("presets/popularity2.json", "presets/moe_x.yaml", "../runs.db", "/etc/passwd"):
+        assert client.get(f"{PREFIX}/files", params={"path": path}).status_code == 404, path
+
+
+def test_kernel_data_is_each_config_document_the_tree_reads(runs) -> None:
+    client, _ = runs
+    tree = client.get(MOE_TREE, params=MOE_QUERY).json()
+    data = client.get(f"{PREFIX}/archs/moe_x/kernel-data", params=MOE_QUERY).json()
+    assert (data["format"], data["gpu"]) == (1, "NVIDIA H200")
+    registered = {(c["kind"], c["config_hash"]) for c in tree["configs"].values() if c["registry"]}
+    assert {(d["kind"], d["config_hash"]) for d in data["configs"]} == registered
+    assert len(data["missing"]) == len(tree["configs"]) - len(registered)
+    for document in data["configs"]:
+        assert set(document) == {"kind", "gpu", "config_hash", "identity", "axes", "points"}
+        assert all(set(p) == {"feasible", "measured"} for p in document["points"])
+
+
 def test_a_set_no_registered_run_matches_is_built_at_its_defaults(runs, db: Path) -> None:
     client = TestClient(create_app(KernelLibrary(RunSources(db_path=db))))
     tree = client.get(MOE_TREE, params=MOE_QUERY).json()
@@ -1530,11 +1603,11 @@ def test_a_set_no_registered_run_matches_is_built_at_its_defaults(runs, db: Path
 
 
 def test_a_run_ranks_by_its_routing_category_before_its_coverage() -> None:
-    def run(routing: str | None, measured: int) -> dict:
+    def run(routing: str | None, measured: int, predictable: int = 0) -> dict:
         params = {} if routing is None else {"routing": routing}
         return {
             "params": params,
-            "counts": {"configs": 4, "measured": measured},
+            "counts": {"configs": 4, "measured": measured, "predictable": predictable},
             "sources": [{"kind": "preset", "_order": 0}],
         }
 
@@ -1548,5 +1621,7 @@ def test_a_run_ranks_by_its_routing_category_before_its_coverage() -> None:
     # the order is the params', not the routing name's.
     ranked = sorted(runs, key=lambda name: arch_library._rank(runs[name]))
     assert ranked == ["corpus", "popularity", "random", "uniform"]
-    # Within a category, coverage decides.
+    # Within a category, coverage decides: first what a prediction can fit
+    # from, then any measured row.
     assert arch_library._rank(run("popularity", 3)) < arch_library._rank(run("popularity", 1))
+    assert arch_library._rank(run("popularity", 2, 2)) < arch_library._rank(run("popularity", 4))

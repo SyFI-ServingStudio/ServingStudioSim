@@ -745,22 +745,29 @@ class KernelLibrary:
 
     def _summaries(self, kind: str) -> list[dict]:
         """Each registered config of ``kind`` with its grid's fixed and swept
-        profile.db columns and the cells each backend measured."""
+        profile.db columns, the cells each backend measured, and the feasible
+        cells where that row is one a simulator fits from (``usable``: timed
+        and not an outlier, as ``MeasuredRow::metrics`` reads it)."""
 
         def compute() -> list[dict]:
             out = []
             for config in self._registered(kind):
                 packed = pack_cells(config.grid.cells)
                 measured: dict[str, int] = {}
-                for cell in self._cell_rows(kind, config):
-                    for backend in cell:
+                usable: dict[str, int] = {}
+                for i, cell in enumerate(self._cell_rows(kind, config)):
+                    for backend, row in cell.items():
                         measured[backend] = measured.get(backend, 0) + 1
+                        fits = row["time_ms"] is not None and not row["is_outlier"]
+                        if fits and i not in config.grid.infeasible:
+                            usable[backend] = usable.get(backend, 0) + 1
                 out.append(
                     {
                         "config": config,
                         "fixed": packed["fixed"],
                         "swept": list(packed["swept"]),
                         "measured": measured,
+                        "usable": usable,
                     }
                 )
             return out

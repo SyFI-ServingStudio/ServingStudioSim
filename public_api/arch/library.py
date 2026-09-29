@@ -40,6 +40,7 @@ import yaml
 
 from launcher.alignment_campaign.check import ROUTING_ARTIFACTS
 from launcher.corpus import HF_SCHEME, CorpusError, resolve_reference
+from profiling.db import kernel_data
 from profiling.db.kernel_config import (
     CONFIG_TABLE,
     SOURCE_TABLE,
@@ -97,6 +98,10 @@ class UnsupportedParams(LookupError):
     def __init__(self, message: str, choices: list[dict]) -> None:
         super().__init__(message)
         self.choices = choices
+
+
+class UnknownFile(LookupError):
+    """No input file a prediction reads has this path."""
 
 
 class _Unavailable(Exception):
@@ -234,9 +239,20 @@ def _section_tree(manifest: dict, configs: dict[str, dict]) -> dict:
             identity = config_identity(slot["kernel_config"])
             config_hash = content_hash(identity)
             key = config_key(slot["kind"], config_hash)
-            configs.setdefault(
-                key, {"kind": slot["kind"], "config_hash": config_hash, "identity": identity}
+            config = configs.setdefault(
+                key,
+                {
+                    "kind": slot["kind"],
+                    "config_hash": config_hash,
+                    "identity": identity,
+                    "backends": [],
+                },
             )
+            # Leaves of one config may run different backends: the simulator
+            # fits every one a leaf names.
+            for backend in slot["kernel_config"].get("backends") or ():
+                if backend not in config["backends"]:
+                    config["backends"].append(backend)
             node = {
                 "id": i,
                 "kind": "leaf",
@@ -325,8 +341,9 @@ class ArchLibrary:
         return self.sources.cached_by_binary("arch-builds", compute)
 
     def _registered(self, kind: str) -> dict[tuple[str, str], dict]:
-        """``{(config_hash, gpu): {cells, infeasible, measured}}`` over the
-        registry's configs of ``kind``: how much of each grid profile.db holds."""
+        """``{(config_hash, gpu): {cells, infeasible, measured, usable}}`` over
+        the registry's configs of ``kind``: how much of each grid profile.db
+        holds, per backend (``KernelLibrary._summaries``)."""
 
         def compute() -> dict[tuple[str, str], dict]:
             return {
@@ -334,6 +351,7 @@ class ArchLibrary:
                     "cells": len(s["config"].grid.cells),
                     "infeasible": len(s["config"].grid.infeasible),
                     "measured": s["measured"],
+                    "usable": s["usable"],
                 }
                 for s in self.kernels._summaries(kind)
             }
@@ -466,12 +484,27 @@ class ArchLibrary:
         }
 
     def _counts(self, build: dict, gpu: str) -> dict:
+        """How many of a build's configs the registry holds, has any row for
+        (``measured``), and could predict from (``predictable``: every
+        backend its leaves run has a usable row at every feasible cell, as a
+        kernel-data bridge fits it)."""
+
         status = self._config_status(build, gpu)
+
+        def predictable(key: str) -> bool:
+            s = status[key]
+            if s is None:
+                return False
+            feasible = s["cells"] - s["infeasible"]
+            backends = build["configs"][key]["backends"]
+            return all(s["usable"].get(b, 0) == feasible for b in backends)
+
         return {
             "leaves": build["leaves"],
             "configs": len(status),
             "registered": sum(s is not None for s in status.values()),
             "measured": sum(bool(s and any(s["measured"].values())) for s in status.values()),
+            "predictable": sum(predictable(key) for key in status),
         }
 
     # -- registered runs -------------------------------------------------------------
@@ -1068,7 +1101,10 @@ class ArchLibrary:
                 "defaults": defaults,
                 "set_when_predicting": predicting,
                 **status,
-                "run": self._run_document(wanted, runs, chosen),
+                "run": {
+                    **self._run_document(wanted, runs, chosen),
+                    "predict": self._predict_input(arch, wanted, chosen),
+                },
                 "sections": build["sections"] if build else [],
                 "configs": configs,
                 "kernels": kernels,
@@ -1077,6 +1113,105 @@ class ArchLibrary:
         return self.sources.cached_by_db_and_binary(
             ("arch-cost-tree", arch, canonical_json(wanted), canonical_json(run_query)), compute
         )
+
+    def _predict_input(self, arch: str, wanted: dict, chosen: dict | None) -> dict | None:
+        """``run.predict``: what the in-browser simulator needs to predict this
+        run, or None for a tree built at the defaults (no registered run, so no
+        data set). ``arch`` is the run's arch block as a run config carries it
+        (the predictor picks its contract from ``type``), ``gpu`` its GPU,
+        ``files`` the paths ``/files`` serves for it (the model config and a
+        named routing's file), ``complete`` whether profile.db measured every
+        config the tree reads, and ``error`` why it cannot be predicted."""
+
+        if chosen is None:
+            return None
+        block = {
+            "type": arch,
+            "model_config": f"model/config/{wanted[MODEL]}.json",
+            **{n: v for n, v in wanted.items() if n not in (GPU, MODEL)},
+            **chosen["params"],
+        }
+        files, error = [block["model_config"]], None
+        named = self._routing_files()
+        for key in ARTIFACT_KEYS:
+            value = block.get(key)
+            if not isinstance(value, str):
+                continue
+            if value in named:
+                files.append(value)
+            else:
+                error = f"its {key} is no named routing this repository holds"
+        counts = chosen["counts"]
+        return {
+            "arch": block,
+            "gpu": wanted[GPU],
+            "files": files,
+            "complete": bool(counts) and counts["predictable"] == counts["configs"],
+            "error": error or chosen["error"],
+        }
+
+    def _routing_files(self) -> set[str]:
+        """The ``file`` of every routing ``routings.yaml`` names: tracked
+        popularity paths and hub corpus references."""
+
+        def compute() -> set[str]:
+            table = yaml.safe_load(demand.NAMES.read_text()) or {}
+            return {
+                entry["file"]
+                for kind in ("corpus", "popularity")
+                for entry in table.get(kind) or ()
+                if entry.get("file")
+            }
+
+        return self.sources.cached_by_db("routing-files", compute)
+
+    def input_file(self, path: str) -> str:
+        """The text of one file a prediction reads (``run.predict.files``): a
+        model config this repository tracks, or a named routing's file, a hub
+        corpus's manifest from this machine's hub cache (never its payload, and
+        nothing is downloaded). Raises :class:`UnknownFile` for anything else."""
+
+        if path in self._routing_files():
+            if path.startswith(HF_SCHEME):
+                try:
+                    return Path(resolve_reference(path, local_only=True)).read_text()
+                except CorpusError:
+                    raise UnknownFile(path) from None
+            return (REPO_ROOT / path).read_text()
+        stem = re.fullmatch(r"model/config/([\w.-]+)\.json", path)
+        if stem and path in self.sources.tracked([path]):
+            return (REPO_ROOT / path).read_text()
+        raise UnknownFile(path)
+
+    def kernel_data(self, arch: str, query: dict[str, str]) -> dict:
+        """The registry's config document (``profiling.db.kernel_data``) of
+        every config the cost tree of ``query`` reads, as a simulator
+        kernel-data bridge reads them: ``{format, gpu, configs, missing}``.
+        ``missing`` lists the configs profile.db does not register."""
+
+        tree = self.cost_tree(arch, query)
+        gpu = tree["gpu"]
+
+        def compute() -> dict:
+            documents, missing = [], []
+            with self.sources.connect() as conn:
+                for ref, config in sorted(tree["configs"].items()):
+                    document = kernel_data.config_document(
+                        conn, self.sources.db_path, config["kind"], config["config_hash"], gpu
+                    )
+                    if document is None:
+                        missing.append(ref)
+                    else:
+                        documents.append(document)
+            return {
+                "format": kernel_data.FORMAT,
+                "gpu": gpu,
+                "configs": documents,
+                "missing": missing,
+            }
+
+        refs = canonical_json(sorted(tree["configs"]))
+        return self.sources.cached_by_db(("arch-kernel-data", gpu, refs), compute)
 
     def _run_document(self, wanted: dict, runs: dict, chosen: dict | None) -> dict:
         """``run``: which registered run a tree is built as and how to pick
@@ -1211,20 +1346,21 @@ def _option_order(group: list[str], option: dict) -> tuple:
 def _rank(run: dict) -> tuple:
     """A registered run's place among its set's: its routing's category
     (``demand.PREFERENCE``: measured before synthetic, so uniform never leads
-    a routed arch), then most configs measured, then the higher measured
-    share, then how it was recorded, then registration."""
+    a routed arch), then most configs a browser can predict from, then most
+    measured, then the higher measured share, then how it was recorded, then
+    registration."""
 
     counts = run["counts"]
     kind = min(SOURCE_KINDS.index(s["kind"]) for s in run["sources"])
     order = min(s["_order"] for s in run["sources"])
     if counts is None:
-        return (1, 0, 0, 0, kind, order)
+        return (1, 0, 0, 0, 0, kind, order)
     # The run's own routing param: a kernel that folds no `expert_demand` (an
     # FFN pool routing uniformly or at random) still ran one.
     chosen = run["params"].get(demand.PARAM)
     routing = demand._preference(chosen) if isinstance(chosen, str) else 0
     share = counts["measured"] / counts["configs"] if counts["configs"] else 0.0
-    return (0, routing, -counts["measured"], -share, kind, order)
+    return (0, routing, -counts["predictable"], -counts["measured"], -share, kind, order)
 
 
 def _leaf_count(node: dict) -> int:
