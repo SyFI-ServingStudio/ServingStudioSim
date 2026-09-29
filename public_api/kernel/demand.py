@@ -10,13 +10,18 @@ sources, which name the routing and its artifact:
 - ``routing``, the arch param (its ``list-params`` default where a block leaves it
   out), names a synthetic routing (``uniform``, ``random``) by itself;
 - a measured routing reads the arch field ``ROUTING_ARTIFACTS`` gives it
-  (``launcher/alignment_campaign/check.py``). A hub artifact is named by the
-  ``hf://`` reference the preset wrote, which the launcher records in place of
-  the file it fetched (``launcher/corpus.py``); a file this checkout tracks by its
-  repo-relative path; any other file by its file name and the fingerprint of the
-  demand it produced.
+  (``launcher/alignment_campaign/check.py``). Its ``reference`` is the ``hf://``
+  reference the preset wrote, which the launcher records in place of the file
+  it fetched (``launcher/corpus.py``), or the repo-relative path of a file this
+  checkout tracks; any other file has none.
 
-Every name carries that fingerprint: the corpus manifest's payload checksum, or
+A measured routing's ``label`` is its name in ``presets/alignment/routings.yaml``
+(:func:`load_names`), which names the artifact by content: a corpus by its
+payload checksum, a popularity file by its sha256. One the table does not name
+has no label; a synthetic routing's label is its kind and seed. ``routing`` is
+the category a reader sees first, ordered by ``preference``.
+
+Every name carries a fingerprint: the corpus manifest's payload checksum, or
 a hash of the popularity table the config folds. ``binding`` holds how the config
 reads the artifact (a corpus's verify width and layer slice, a table's layer
 count), which tells apart configs of one routing built for different layers.
@@ -24,9 +29,13 @@ count), which tells apart configs of one routing built for different layers.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+import hashlib
+from collections.abc import Callable, Iterable, Mapping
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
+
+import yaml
 
 from launcher.alignment_campaign.check import ROUTING_ARTIFACTS
 from launcher.corpus import HF_SCHEME
@@ -37,10 +46,51 @@ from public_api.kernel.sources import REPO_ROOT
 FIELD = "expert_demand"
 PARAM = "routing"
 
-#: Measured routings first, a token corpus before a popularity marginal, as
-#: ``skills/operate-run-simulation/references/moe-routing.md`` prefers them; a
-#: synthetic routing is never the page's default pick.
-PREFERENCE = ("corpus", "popularity")
+#: The categories a reader sees, in order: measured routings first, a token
+#: corpus before a popularity marginal, as
+#: ``skills/operate-run-simulation/references/moe-routing.md`` prefers them;
+#: then the synthetic ones, which are never the page's default pick.
+PREFERENCE = ("corpus", "popularity", "random", "uniform")
+#: The measured routings' names.
+NAMES = REPO_ROOT / "presets" / "alignment" / "routings.yaml"
+
+
+def load_names(path: Path | None = None) -> dict[str, str]:
+    """``{key: name}`` from a routing-name table (default :data:`NAMES`):
+    ``fnv1a64:<hex>`` for a corpus (the form :func:`_fingerprint` gives it),
+    ``sha256:<hex>`` for a popularity file's bytes."""
+
+    path = NAMES if path is None else path
+    table = yaml.safe_load(path.read_text()) or {}
+    if table.get("schema_version") != 1:
+        raise ValueError(f"{path}: unsupported schema_version {table.get('schema_version')!r}")
+    names = {}
+    for kind, field in (("corpus", "checksum_fnv1a64"), ("popularity", "sha256")):
+        for entry in table.get(kind) or ():
+            prefix = "fnv1a64" if kind == "corpus" else "sha256"
+            key = f"{prefix}:{str(entry[field]).lower()}"
+            if key in names:
+                raise ValueError(f"{path}: {key} is named twice")
+            names[key] = entry["name"]
+    return names
+
+
+@lru_cache(maxsize=256)
+def _file_sha256(path: str, mtime_ns: int, size: int) -> str:
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def file_key(path: str) -> str | None:
+    """``sha256:<hex>`` of the file an arch block names (absolute, or relative
+    to the repository), or None when this machine does not have it."""
+
+    local = Path(path)
+    if not local.is_absolute():
+        local = REPO_ROOT / local
+    if not local.is_file():
+        return None
+    stat = local.stat()
+    return f"sha256:{_file_sha256(str(local), stat.st_mtime_ns, stat.st_size)}"
 
 
 def _fingerprint(demand: dict) -> str:
@@ -85,18 +135,16 @@ def _repo_relative(path: str) -> str | None:
     return local.as_posix()
 
 
-def _artifact_name(path: str, fingerprint: str, tracked: set[str]) -> tuple[str, str | None]:
-    """``(label, reference)`` of one artifact as an arch block gave it (an
-    ``hf://`` reference, a repo-relative path, or an absolute one). The
-    reference is what a reader fetches or opens it by; a file only the building
-    machine had has none."""
+def _artifact_reference(path: str, tracked: set[str]) -> str | None:
+    """What a reader fetches or opens an artifact by, as an arch block gave it
+    (an ``hf://`` reference, a repo-relative path, or an absolute one): the
+    reference, or the repo path git tracks. A file only the building machine
+    had has none."""
 
     if path.startswith(HF_SCHEME):
-        return path, path
+        return path
     relative = _repo_relative(path)
-    if relative in tracked:
-        return relative, relative
-    return f"{Path(path).name} · {fingerprint}", None
+    return relative if relative in tracked else None
 
 
 def demand_name(
@@ -104,17 +152,19 @@ def demand_name(
     archs: Iterable[dict],
     routing_default: Callable[[str | None], str | None],
     tracked: set[str],
+    names: Mapping[str, str],
 ) -> dict | None:
     """The name of one config's ``expert_demand`` from the arch blocks that
     built it, or None when none names a routing (a deployment-level source).
 
     ``routing_default(arch_tag)`` is the arch's ``routing`` default; ``tracked``
-    holds the :func:`artifact_paths` git tracks. Arch blocks
-    that name the same demand differently (two files of equal content) are
-    listed in ``label`` in turn."""
+    holds the :func:`artifact_paths` git tracks; ``names`` is
+    :func:`load_names`. Arch blocks that name the same demand differently (two
+    files of equal content) share a ``label``; their ``reference`` is the
+    first."""
 
     fingerprint = _fingerprint(demand)
-    names: dict[tuple[str, str], str | None] = {}
+    found: dict[tuple[str, str], str | None] = {}
     for arch in archs:
         routing = arch.get(PARAM, routing_default(arch.get("type")))
         if routing is None:
@@ -122,20 +172,23 @@ def demand_name(
         key = ROUTING_ARTIFACTS.get(routing, (None,))[0]
         path = arch.get(key) if key else None
         if isinstance(path, str) and path:
-            label, reference = _artifact_name(path, fingerprint, tracked)
+            content = fingerprint if routing == "corpus" else file_key(path)
+            label = names.get(content) if content else None
+            reference = _artifact_reference(path, tracked)
         else:
             seed = arch.get("routing_seed")
             label = routing if seed is None else f"{routing}, seed {seed}"
             reference = None
-        names.setdefault((routing, label), reference)
-    if not names:
+        found.setdefault((routing, label or ""), reference)
+    if not found:
         return None
-    ordered = sorted(names, key=lambda n: (_preference(n[0]), n[1]))
+    ordered = sorted(found, key=lambda n: (_preference(n[0]), n[1]))
     routing = ordered[0][0]
+    labels = [label for r, label in ordered if r == routing and label]
     return {
         "routing": routing,
-        "label": " | ".join(label for _, label in ordered),
-        "reference": names[ordered[0]],
+        "label": " | ".join(dict.fromkeys(labels)) or None,
+        "reference": found[ordered[0]],
         "fingerprint": fingerprint,
         "binding": _binding(demand),
         "preference": _preference(routing),

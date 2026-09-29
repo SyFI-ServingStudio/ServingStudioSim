@@ -1,0 +1,61 @@
+# Names of the measured MoE routings registered runs used, as readers see them.
+#
+# An entry names a routing by its content, not by where a run found it: a token
+# corpus by its payload checksum (`checksum_fnv1a64` in its manifest), an
+# expert-popularity file by the sha256 of its bytes. `file` says where this
+# repository keeps it. A name is for readers only -- no kernel-config identity
+# or hash contains it -- so renaming one changes no registered config.
+#
+# A reader sees routings by category first: corpus, popularity, random,
+# uniform. Synthetic routings (random, uniform) are named by their kind and
+# seed and have no entry. `tests/test_routing_names.py` checks that every
+# measured routing profile.db registers has one.
+schema_version: 1
+
+corpus:
+  - name: enwik9
+    checksum_fnv1a64: "125e246444cb1433"
+    file: hf://UW-SyFI/servingstudio-corpora@43eda3dceb647df4802da27fb4fef3afc8a68fda/glm52_nvfp4_mtp5/manifest.json
+  - name: enwik9
+    checksum_fnv1a64: "290c6c9ffc210e04"
+    file: hf://UW-SyFI/servingstudio-corpora@869a5d3966097154a654db4586c11cab92db046e/glm53_flash_fp8_tp4_ep4/manifest.json
+  - name: enwik9
+    checksum_fnv1a64: "89e79cef64198ca1"
+    file: hf://UW-SyFI/servingstudio-corpora@c09af698f8192222ee8852f8c727630789890310/glm53_nvfp4_dflash2/manifest.json
+
+popularity:
+  - name: enwik9
+    sha256: "0e27c808ade0f5a7db769a6c1643756c88cf60bed71c72ded02e9a234e963865"
+    file: presets/alignment/deepseek_v4_h200_serial_c64_128/expert_popularity.json
+  - name: enwik9
+    sha256: "177b2642cf42ec77195a714cb69929c5b8dfe7e48bcb96bea17b4f1af507e668"
+    file: presets/alignment/glm52_nvfp4_b200_sglang_tp4/expert_popularity.json
+  - name: enwik9
+    sha256: "93a8576879da566c50de5aeac8f589b5b2c67fe43cadf60ee7d89004bf3b8d95"
+    file: presets/alignment/glm52_fp8_h200_dp8_ep8/expert_popularity.json
+  # The same deployment (GLM-5.2 NVFP4, B200 EP4) also has the diverse_100
+  # capture below; this one ran the 8k-context alignment campaign.
+  - name: enwik9_short
+    sha256: "7733337ca2fb18d31ebe1eda2b9e9bb30e38c9a19c9a394a0fe3677ee55c87c0"
+    file: presets/alignment/glm52_nvfp4_b200/expert_popularity.json
+  - name: enwik9
+    sha256: "d344a1217bfe8b0a7a1a777d54a90616a0b5e3d0d7d4a285b82b22185ee4522c"
+    file: presets/alignment/glm52_nvfp4_b200_diverse100/expert_popularity.json
+  - name: enwik9
+    sha256: "07017612b2d6e963a57f6ac85bef8f906d6a7fe5bd9759d5059c9f4d6a5b5f25"
+    file: presets/alignment/glm52_nvfp4_b200_tp8/expert_popularity.json
+  - name: enwik9
+    sha256: "8559ff257035a3e39c937f5e519196a0248e42ebb48cf31226d6448bae94a488"
+    file: presets/alignment/glm52_nvfp4_b200_spec5/expert_popularity.json
+  - name: enwik9
+    sha256: "b2c67b8a5b34baddffe139be5662d0c67d5b8e544bd3d3b20a8789d0575f4c62"
+    file: presets/alignment/glm52_nvfp4_b200_spec5_reproduction/tp8_target_popularity.json
+  - name: enwik9
+    sha256: "d55d1bc2cf4ed883fb6e4dc66b68718ee9ea696d1d0cfc45eb2d956f45e31898"
+    file: presets/alignment/qwen36_local_h200_hybrid/expert_popularity_ep1.json
+  - name: enwik9
+    sha256: "de17636d4d1eb66f349ff2d7f92f36e664c4348928327259ef2acc93dc5feb2d"
+    file: presets/alignment/qwen3_235b_thinking_fp8_h200_tp4_ep4/expert_popularity.json
+  - name: enwik9
+    sha256: "8721bc99ecdf2a66b924bb86a49e2a8d42db42afedb91a0f1ebce7a0cef9d7cf"
+    file: presets/alignment/qwen3_235b_thinking_fp8_h200_repetitive_16k/expert_popularity.json

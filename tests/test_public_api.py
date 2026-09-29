@@ -29,7 +29,7 @@ from profiling.runners.metrics import ComputeMetrics
 from public_api.app import PREFIX, create_app
 from public_api.arch import library as arch_library
 from public_api.arch.library import ArchLibrary, config_identity
-from public_api.kernel import library
+from public_api.kernel import demand, library
 from public_api.kernel.library import PROVENANCE, KernelLibrary
 from public_api.kernel.sources import REPO_ROOT, KernelSources
 
@@ -746,6 +746,23 @@ TRACKED = "presets/alignment/glm52_nvfp4_b200/expert_popularity.json"
 HUB_REFERENCE = "hf://o/corpora@abc/run1/manifest.json"
 
 
+def _names(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, corpus=(), popularity=()) -> None:
+    """Serve a routing-name table naming ``corpus`` (``(checksum, name)``) and
+    ``popularity`` (``(file, name)``) instead of the repository's."""
+
+    table = {
+        "schema_version": 1,
+        "corpus": [{"name": n, "checksum_fnv1a64": f"{c:016x}"} for c, n in corpus],
+        "popularity": [
+            {"name": n, "sha256": hashlib.sha256(Path(f).read_bytes()).hexdigest()}
+            for f, n in popularity
+        ],
+    }
+    path = tmp_path / "routings.yaml"
+    path.write_text(json.dumps(table))
+    monkeypatch.setattr(demand, "NAMES", path)
+
+
 def _popularity(share: int) -> dict:
     return {"popularity": {"layerwise_global_ppm": [[share, 1_000_000 - share, 0, 0]]}}
 
@@ -798,6 +815,12 @@ def _nvfp4_record(demand: dict, position: int) -> dict:
 @pytest.fixture
 def routings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[TestClient, dict]:
     monkeypatch.setattr(library, "kernel_doc", kernel_doc)
+    _names(
+        tmp_path,
+        monkeypatch,
+        corpus=[(0xABC, "enwik9")],
+        popularity=[(REPO_ROOT / TRACKED, "enwik9_short")],
+    )
     path = tmp_path / "routings.db"
     for spec in iter_kernel_profiler_specs("nvfp4_fused_moe"):
         Table(spec, path).insert([_nvfp4_row(spec.backend)])
@@ -815,8 +838,8 @@ def routings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[TestClien
         "corpus": (CORPUS, _moe_run(routing="corpus", token_corpus_file=HUB_REFERENCE)),
     }
     hashes = {}
-    for name, (demand, source) in built.items():
-        records = [_nvfp4_record(demand, position) for position in (0, 1)]
+    for name, (routed, source) in built.items():
+        records = [_nvfp4_record(routed, position) for position in (0, 1)]
         kernel_config.register_kernel_configs(
             path,
             {"schema_version": kernel_config.RECORDS_SCHEMA_VERSION, "configs": records},
@@ -847,16 +870,20 @@ def test_each_config_names_its_routing(routings) -> None:
         if c["config_args"]["folded_rank_position"] == 0
     }
     label = {name: names[h]["label"] for name, h in hashes.items()}
+    # A synthetic routing is named by its kind.
     assert label["uniform"] == "uniform"
-    # A file this checkout tracks, named relative or absolute: its repo path.
-    assert label["tracked"] == label["absolute"] == TRACKED
+    # A measured one by the name table, by content, however a block names the
+    # file; its reference is the repo path git tracks.
+    assert label["tracked"] == label["absolute"] == "enwik9_short"
     assert names[hashes["tracked"]]["reference"] == TRACKED
-    # A hub artifact: the reference the preset wrote, as the launcher records it.
-    assert label["corpus"] == names[hashes["corpus"]]["reference"] == HUB_REFERENCE
-    # Any other file: its name and the demand's fingerprint, no path.
+    # A hub corpus by its checksum; the reference the preset wrote, as the
+    # launcher records it.
+    assert label["corpus"] == "enwik9"
+    assert names[hashes["corpus"]]["reference"] == HUB_REFERENCE
+    # A file this machine lacks has no name and no reference; it keeps the
+    # demand's fingerprint, and no path.
     outside = names[hashes["outside"]]
-    assert outside["reference"] is None
-    assert outside["label"] == f"expert_popularity.json · {outside['fingerprint']}"
+    assert (outside["label"], outside["reference"]) == (None, None)
     assert outside["fingerprint"].startswith("sha256:")
     assert names[hashes["corpus"]]["fingerprint"] == "fnv1a64:0000000000000abc"
     assert names[hashes["corpus"]]["binding"] == {
@@ -874,7 +901,7 @@ def test_each_config_names_its_routing(routings) -> None:
         f"{PREFIX}/kernels/nvfp4_fused_moe/configs/{hashes['tracked']}",
         params={"gpu": "NVIDIA B200"},
     ).json()
-    assert detail["config_labels"]["expert_demand"]["label"] == TRACKED
+    assert detail["config_labels"]["expert_demand"]["label"] == "enwik9_short"
 
 
 # -- archs -----------------------------------------------------------------------
@@ -1271,8 +1298,11 @@ def runs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     (root / "model" / "config" / "moe_m.json").write_text("{}")
     (root / "presets").mkdir()
     (root / POPULARITY).write_text("{}")
-    (root / "presets" / "popularity2.json").write_text("{}")
+    (root / "presets" / "popularity2.json").write_text('{"another": "capture"}')
     monkeypatch.setattr(arch_library, "REPO_ROOT", root)
+    monkeypatch.setattr(demand, "REPO_ROOT", root)
+    # The first popularity file is named; the second is not.
+    _names(tmp_path, monkeypatch, popularity=[(root / POPULARITY, "enwik9")])
 
     from launcher import corpus
 
@@ -1322,7 +1352,8 @@ def test_a_tree_is_built_as_its_best_measured_registered_run(runs) -> None:
     ]
     assert run["sources"][1]["cases"] == ["01_micro"]
     assert run["routing"]["routing"] == "popularity"
-    assert run["routing"]["label"] == POPULARITY
+    assert run["routing"]["label"] == "enwik9"
+    assert run["routing"]["reference"] == POPULARITY
     assert run["query"] == {**{k: v for k, v in MOE_QUERY.items()}, "ep_size": 4, **run["params"]}
     # Built with the run's own params; no default stands in for routing.
     assert (tree["defaults"], tree["set_when_predicting"]) == ({"fp8": False}, [])
@@ -1349,9 +1380,12 @@ def test_the_pickers_offer_only_values_a_registered_run_used(runs) -> None:
     mtp = {o["value"]["mtp_mode"]: o for o in pickers["mtp_mode"]["options"]}
     assert (mtp["off"]["selected"], mtp["on"]["selected"]) == (True, False)
     assert mtp["on"]["compatible"] and mtp["on"]["counts"]["measured"] == 1
-    # A tracked file by its repo path; another by its name and demand fingerprint.
-    files = [o["value"]["expert_popularity_file"] for o in pickers["routing"]["options"]]
-    assert files[1] == POPULARITY and files[0].startswith("popularity2.json · sha256:")
+    # A tracked file by its repo path; another by its name and demand
+    # fingerprint. A named routing leads an unnamed one of its category.
+    options = pickers["routing"]["options"]
+    files = [o["value"]["expert_popularity_file"] for o in options]
+    assert files[0] == POPULARITY and files[1].startswith("popularity2.json · sha256:")
+    assert [o["routing"]["label"] for o in options] == ["enwik9", None]
     # Picking another value builds that run's tree.
     other = client.get(MOE_TREE, params={**MOE_QUERY, "mtp_mode": "on"}).json()
     assert other["run"]["params"]["mtp_mode"] == "on"
@@ -1493,3 +1527,26 @@ def test_a_set_no_registered_run_matches_is_built_at_its_defaults(runs, db: Path
     assert response.json()["detail"]["message"].endswith(
         "every other param takes its default, except routing, set when predicting"
     )
+
+
+def test_a_run_ranks_by_its_routing_category_before_its_coverage() -> None:
+    def run(routing: str | None, measured: int) -> dict:
+        params = {} if routing is None else {"routing": routing}
+        return {
+            "params": params,
+            "counts": {"configs": 4, "measured": measured},
+            "sources": [{"kind": "preset", "_order": 0}],
+        }
+
+    runs = {
+        "uniform": run("uniform", 4),
+        "random": run("random", 2),
+        "popularity": run("popularity", 1),
+        "corpus": run("corpus", 1),
+    }
+    # A kernel that folds no expert demand (an FFN pool) still ran its routing:
+    # the order is the params', not the routing name's.
+    ranked = sorted(runs, key=lambda name: arch_library._rank(runs[name]))
+    assert ranked == ["corpus", "popularity", "random", "uniform"]
+    # Within a category, coverage decides.
+    assert arch_library._rank(run("popularity", 3)) < arch_library._rank(run("popularity", 1))

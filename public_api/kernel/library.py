@@ -217,6 +217,7 @@ class KernelLibrary:
         for spec in iter_kernel_profiler_specs():
             self.specs.setdefault(spec.kernel_kind, []).append(spec)
         sources.watch(MODEL_CATALOG)
+        sources.watch(demand.NAMES)
         self.sim_commit = _git_commit()
 
     @property
@@ -226,6 +227,12 @@ class KernelLibrary:
         return self.sources.cached_by_db(
             "model-catalog", lambda: yaml.safe_load(MODEL_CATALOG.read_text()) or {}
         )
+
+    def routing_names(self) -> dict[str, str]:
+        """The measured routings' names (``demand.load_names``), reread when
+        the table changes."""
+
+        return self.sources.cached_by_db("routing-names", demand.load_names)
 
     # -- per-kind facts ------------------------------------------------------------
 
@@ -789,10 +796,11 @@ class KernelLibrary:
                 return {}
             every = [arch for _, archs in named for arch in archs]
             tracked = self.sources.tracked(demand.artifact_paths(every))
+            names = self.routing_names()
             out = {}
             for config, archs in named:
                 name = demand.demand_name(
-                    config.identity[demand.FIELD], archs, routing_default, tracked
+                    config.identity[demand.FIELD], archs, routing_default, tracked, names
                 )
                 if name is not None:
                     out[(config.config_hash, config.gpu_name)] = {demand.FIELD: name}

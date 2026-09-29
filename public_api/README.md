@@ -87,21 +87,26 @@ simulator's order of EP ranks by load) and `expert_demand` (the routing).
 which the configs list otherwise leaves out, as `{routing, label, reference,
 fingerprint, binding, preference}`. The routing and its file come from the arch
 blocks of the config's uses (`routing`, with its `list-params` default, and the
-file field `ROUTING_ARTIFACTS` gives it). A hub artifact is labeled by the
-`hf://<repo>@<revision>/<path>` reference its preset wrote, which the launcher
-records instead of the file it fetched; a file this checkout tracks by its
-repo-relative path; any other file by its file name and the `fingerprint`; a synthetic routing by its name (`uniform`). `reference` is
-the path or `hf://` reference, null otherwise. The fingerprint is the demand's
-content: a corpus manifest's payload checksum, or a hash of the popularity table.
-`binding` is how the config reads it (a corpus's `group_size` and layer slice, a
-table's layer count); `preference` orders measured routings first, a corpus
-before a popularity file, for a page's default pick.
+file field `ROUTING_ARTIFACTS` gives it). `routing` is the category a reader
+sees first: `corpus`, `popularity`, `random`, `uniform`, in that order
+(`preference`). A measured routing's `label` is its name in
+`presets/alignment/routings.yaml`, which names content: a corpus by its payload
+checksum, a popularity file by the sha256 of its bytes, however a run named the
+file. A name is for readers only and in no config hash. A measured routing the
+table does not name has a null label (`tests/test_routing_names.py` keeps every
+registered one named); a synthetic routing's label is its kind and seed
+(`uniform`, `random, seed 1`). `reference` is the `hf://<repo>@<revision>/<path>`
+reference a preset wrote (which the launcher records instead of the file it
+fetched) or the repo path git tracks, null otherwise. The fingerprint is the
+demand's content: a corpus manifest's payload checksum, or a hash of the
+popularity table. `binding` is how the config reads it (a corpus's `group_size`
+and layer slice, a table's layer count).
 
 What registered a config (a `#[supported]` row, a
 preset, a prediction or an alignment pack, with its path) is not published:
 those records name local paths and are bookkeeping. A routing label is not a
-registry record: it names the demand the config holds, and only by a tracked
-repo path or a hub reference, never by a local path. They stay in profile.db's
+registry record: it names the demand the config holds, by the name table,
+never by a local path. They stay in profile.db's
 registry, read with `profiling.db.kernel_config.registered_configs`. A config's
 `identity` and `config_args` are published with every absolute file path cut to
 its file name (an expert-demand corpus under a local HF cache, say).
@@ -158,7 +163,9 @@ as a real run of the set, read from the kernel-config registry in profile.db:
   another way (`mtp_mode: off` read as `false`); an arch whose configs fold
   no routing cannot be told apart this way;
 - each is counted as the defaults tree is, and the set's runs are ordered best
-  first: most configs measured, then the higher measured share, then a preset
+  first: the routing's category (`corpus`, `popularity`, `random`, `uniform`:
+  uniform never leads a routed set), then most configs measured, then the
+  higher measured share, then a preset
   over an alignment case over a prediction, then registration order. A run's
   registered config count is no denominator: registration skips configs with
   no measured row;
@@ -185,7 +192,9 @@ The document has the set's `arch`, `name`, `gpu`, `model_config`, `model`, `para
   demand's fingerprint; never another machine's path); `sources`, the registry
   sources that recorded that run (`{id, kind, path, name}`, an alignment case
   also `variant` and `cases`; `path` only when this checkout tracks it);
-  `routing`, its routing's name as `/kernels/.../configs` gives it; `query`,
+  `routing`, its routing's name as `/kernels/.../configs` gives it (the
+  routing picker orders its options by category, then a named routing before
+  an unnamed one, then by name); `query`,
   the full cost-tree query of the run; `pickers`, one per run param (the
   routing and its file as one) with `options`: the values the set's runs used,
   each `selected`, `compatible` (a run has it and every other picker's

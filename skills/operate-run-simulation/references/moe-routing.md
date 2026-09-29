@@ -62,14 +62,25 @@ the `UW-SyFI` organization. Its `README.md` records each capture's model,
 deployment, and workload. Today it holds:
 
 - `glm52_nvfp4_mtp5`: GLM-5.2 NVFP4, vLLM TP4 EP4 with MTP-5, the reference
-  above;
+  above; named `enwik9`;
 - `glm53_nvfp4_dflash2`: GLM-5.3 NVFP4, vLLM TP4 EP4 with DFlash2-7, body layers
-  only, at commit `c09af698f8192222ee8852f8c727630789890310`.
+  only, at commit `c09af698f8192222ee8852f8c727630789890310`; named `enwik9`;
 - `glm53_flash_fp8_tp4_ep4`: GLM-5.3-Flash FP8, vLLM TP4 EP4 without speculative
-  decoding, the 42 MoE layers, at commit `869a5d3966097154a654db4586c11cab92db046e`.
+  decoding, the 42 MoE layers, at commit `869a5d3966097154a654db4586c11cab92db046e`;
+  named `enwik9`.
 
 Publish a new capture as a new directory, and reference it by the upload's
 commit.
+
+Every measured routing a preset or a registered run uses has a reader-facing
+name in `presets/alignment/routings.yaml`: a corpus keyed by its manifest's
+`checksum_fnv1a64` (as 16 hex digits), a popularity file by the sha256 of its
+bytes. The name is the user's choice, not derived: today every capture is
+`enwik9`, and `glm52_nvfp4_b200/expert_popularity.json` is `enwik9_short`,
+because it shares GLM-5.2 NVFP4 B200 EP4 with the diverse_100 capture. Ask for
+the name when a new corpus or popularity file enters the repository, and add
+the entry in the same change; `tests/test_routing_names.py` fails otherwise.
+The name is in no config hash, so renaming one is safe.
 
 Both artifacts come from one capture: `profile_kind: token_corpus` in
 `operate-run-alignment`, which writes the corpus and, when the expert topology
