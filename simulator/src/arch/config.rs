@@ -553,6 +553,15 @@ pub enum IterArchSel {
 }
 
 impl IterArchSel {
+    /// Whether this arch drafts: its iteration is a verify pass plus draft
+    /// passes, predicted through the `speculative_iter` contract.
+    pub fn is_speculative(&self) -> bool {
+        matches!(
+            self,
+            Self::Glm52VllmNvfp4DsaMoeSpeculative { .. } | Self::Glm53VllmNvfp4DsaMoeDflash2 { .. }
+        )
+    }
+
     /// The model identity/dims this arch operates on (every variant carries it).
     pub fn model(&self) -> &ModelSpec {
         match self {

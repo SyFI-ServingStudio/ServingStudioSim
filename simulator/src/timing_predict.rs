@@ -83,7 +83,9 @@ struct PredictionProvenance<'a> {
 }
 
 /// Which arch to predict. The wire representation is the same single-key map in
-/// JSON and YAML: `{ iter: {...} } | { attn: {...} } | { ffn: {...} }`.
+/// JSON and YAML: `{ iter: {...} } | { attn: {...} } | { ffn: {...} }`, or the
+/// arch block alone (`{type: ..., ...}`, as a run config's group carries it),
+/// whose type decides the selector.
 /// `serde_yaml` otherwise encodes an externally tagged enum as `!iter`, which
 /// Python's safe YAML loader deliberately rejects. The explicit map adapter
 /// keeps the launcher and simulator on one portable, tag-free document shape.
@@ -130,6 +132,34 @@ enum PredictArchWire {
     SpeculativeIter(SpeculativePredictArch),
     Attn(AttnPredictArch),
     Ffn(FfnPredictArch),
+    Block(serde_json::Value),
+}
+
+impl PredictArchSel {
+    /// The selector an arch block's type implies: its contract, and for an
+    /// iter-wise arch whether it drafts. A type every contract rejects as
+    /// unknown is reported as such; a known type with bad fields reports why.
+    fn from_block(block: serde_json::Value) -> std::result::Result<Self, String> {
+        let unknown = |e: &serde_json::Error| e.to_string().starts_with("unknown variant");
+        let iter = match IterArchSel::deserialize(&block) {
+            Ok(sel) if sel.is_speculative() => return Ok(Self::SpeculativeIter(sel)),
+            Ok(sel) => return Ok(Self::Iter(sel)),
+            Err(e) => e,
+        };
+        let attn = match AttnArchSel::deserialize(&block) {
+            Ok(sel) => return Ok(Self::Attn(sel)),
+            Err(e) => e,
+        };
+        let ffn = match FfnArchSel::deserialize(&block) {
+            Ok(sel) => return Ok(Self::Ffn(sel)),
+            Err(e) => e,
+        };
+        let known = [iter, attn, ffn].into_iter().find(|e| !unknown(e));
+        Err(match known {
+            Some(error) => format!("arch block: {error}"),
+            None => format!("arch block: no contract knows type {}", block["type"]),
+        })
+    }
 }
 
 impl<'de> Deserialize<'de> for PredictArchSel {
@@ -144,6 +174,9 @@ impl<'de> Deserialize<'de> for PredictArchSel {
             }
             PredictArchWire::Attn(value) => Self::Attn(value.attn),
             PredictArchWire::Ffn(value) => Self::Ffn(value.ffn),
+            PredictArchWire::Block(block) => {
+                Self::from_block(block).map_err(serde::de::Error::custom)?
+            }
         })
     }
 }
@@ -1459,6 +1492,38 @@ iter:
         )
         .expect("tag-free YAML iter selector parses");
         assert!(matches!(iter, PredictArchSel::Iter(_)));
+    }
+
+    #[test]
+    fn an_arch_block_alone_selects_its_contract_by_type() {
+        let parse = |block: &str| serde_json::from_str::<PredictArchSel>(block);
+        let iter = parse(r#"{"type": "llama3_dense", "model_config": "m.json", "fp8": false}"#);
+        assert!(matches!(iter, Ok(PredictArchSel::Iter(_))));
+        let spec = parse(
+            r#"{"type": "glm52_vllm_nvfp4_dsa_moe_speculative", "model_config": "m.json",
+                "ep_size": 4, "nvl_num_gpu": 4, "max_model_len": 8192, "fp8": false,
+                "draft_tokens": 5}"#,
+        );
+        assert!(matches!(spec, Ok(PredictArchSel::SpeculativeIter(_))));
+        let attn = parse(
+            r#"{"type": "qwen3_attn_tp", "model_config": "m.json", "attn_tp_size": 4, "fp8": false}"#,
+        );
+        assert!(matches!(attn, Ok(PredictArchSel::Attn(_))));
+        let ffn = parse(
+            r#"{"type": "qwen3_ffn_moe", "model_config": "m.json", "attn_tp_size": 4,
+                "ep_size": 8, "nvl_num_gpu": 8, "routing": "uniform", "fp8": false}"#,
+        );
+        assert!(matches!(ffn, Ok(PredictArchSel::Ffn(_))));
+
+        let unknown = parse(r#"{"type": "no_such_arch"}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(unknown.contains("no contract knows type"), "{unknown}");
+        // A known type with a bad field says what is wrong with it.
+        let bad = parse(r#"{"type": "llama3_dense", "model_config": "m.json"}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(bad.contains("fp8"), "{bad}");
     }
 
     #[test]
