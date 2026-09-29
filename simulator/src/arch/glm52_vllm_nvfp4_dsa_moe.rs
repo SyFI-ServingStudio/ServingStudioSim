@@ -38,7 +38,7 @@ use crate::timing::kernels::{
     AllReduceResidualRmsNormKernelInput, AllReduceResidualRmsNormSpec, ElementwiseKernel,
     ElementwiseKernelConfig, ElementwiseKernelInput, ResidualRmsNormKernel,
     ResidualRmsNormKernelConfig, ResidualRmsNormKernelInput, SingleGemmKernel,
-    SingleGemmKernelConfig, SingleGemmKernelInput,
+    SingleGemmKernelConfig, SingleGemmKernelInput, MAX_LAUNCH_QUERY_ROWS,
 };
 use crate::timing::{
     BuildError, CostManifest, CostNode, CostTree, CostTreeBuilder, Dim, Evaluator, FlatCostNode,
@@ -2260,6 +2260,7 @@ fn normalize_input(
                 group.batch_tokens
             ));
         }
+        check_sparse_attention_rows(group_index, batch_tokens)?;
         let request_count =
             u32::try_from(group.prefill_chunk_pairs.len() + group.decode_kv_lens.len())
                 .map_err(|_| format!("group {group_index} request count exceeds u32"))?;
@@ -2289,6 +2290,18 @@ fn normalize_input(
         groups,
         total_tokens,
     })
+}
+
+/// vLLM runs sparse attention as one FlashInfer launch over every token row of
+/// the batch, prefill and decode alike, so the batch fits that launch or the
+/// iteration fails.
+fn check_sparse_attention_rows(group_index: usize, rows: u32) -> std::result::Result<(), String> {
+    if rows > MAX_LAUNCH_QUERY_ROWS {
+        return Err(format!(
+            "group {group_index} has {rows} token rows; the sparse attention launch takes at most {MAX_LAUNCH_QUERY_ROWS}"
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn normalize_speculative_input(
@@ -2394,6 +2407,7 @@ pub(crate) fn normalize_speculative_input(
                 group.batch_tokens
             ));
         }
+        check_sparse_attention_rows(group_index, batch_tokens)?;
         let prefill_request_count = u32::try_from(group.prefill_chunk_pairs.len())
             .map_err(|_| format!("group {group_index} prefill request count exceeds u32"))?;
         let request_count = prefill_request_count
@@ -3623,5 +3637,22 @@ mod tests {
             tokens_per_source_rank: Vec::new(),
         };
         assert!(normalize_input(&too_long, 4, 8_192).is_err());
+    }
+
+    #[test]
+    fn a_batch_fits_one_sparse_attention_launch_or_is_rejected() {
+        // 65535 rows run: one prefill of 65000 plus 535 decodes.
+        let fits = UnifiedArchInput {
+            groups: vec![group(65_000, vec![100_000; 535], vec![(0, 65_000)])],
+            tokens_per_source_rank: Vec::new(),
+        };
+        assert!(normalize_input(&fits, 4, 202_752).is_ok());
+
+        let over = UnifiedArchInput {
+            groups: vec![group(65_000, vec![100_000; 536], vec![(0, 65_000)])],
+            tokens_per_source_rank: Vec::new(),
+        };
+        let reason = normalize_input(&over, 4, 202_752).unwrap_err();
+        assert!(reason.contains("65536 token rows"), "{reason}");
     }
 }

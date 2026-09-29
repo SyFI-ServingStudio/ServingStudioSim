@@ -1,8 +1,9 @@
 //! DSA indexer-prefill MQA logits over compressed keys, for one complete request batch.
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
-use crate::timing::cache::CacheKind;
-use crate::timing::kernels::engine::{register_kernel, KernelSpec};
+use crate::timing::cache::{CacheKind, RateWork};
+use crate::timing::kernels::causal_rows;
+use crate::timing::kernels::engine::{register_kernel, KernelSpec, OffGrid};
 use crate::timing::sweep::{Axis, Coords, SweepGrid};
 use crate::timing::{Dim, KernelConfig, SweepCoords};
 
@@ -14,7 +15,6 @@ pub struct DsaCompressedPrefillKernelInput {
 impl DsaCompressedPrefillKernelInput {
     fn work(&self) -> (u32, f64, u32) {
         assert!(!self.query_context_pairs.is_empty());
-        assert!(self.query_context_pairs.len() <= 64);
         let mut num_queries = 0_u32;
         let mut total_context = 0_u64;
         for &(queries, context) in &self.query_context_pairs {
@@ -24,7 +24,6 @@ impl DsaCompressedPrefillKernelInput {
                 .expect("query total must fit u32");
             total_context += u64::from(context);
         }
-        assert!(num_queries <= 8192);
         (
             num_queries,
             total_context as f64 / self.query_context_pairs.len() as f64,
@@ -113,6 +112,27 @@ pub struct DsaCompressedMqaLogitsPrefillKernelConfig {
     pub clean_logits: bool,
 }
 
+/// The profiler's logical bytes: q, each (query, compressed key) pair's key,
+/// key scale and logit, and each query's head weights and row bounds.
+fn logical_bytes(
+    config: &DsaCompressedMqaLogitsPrefillKernelConfig,
+    input: &DsaCompressedPrefillKernelInput,
+) -> f64 {
+    let heads = f64::from(config.num_heads.get());
+    let head_dim = f64::from(config.head_dim.get());
+    let (mut queries, mut pairs) = (0.0, 0.0);
+    for &(request_queries, context) in &input.query_context_pairs {
+        queries += f64::from(request_queries);
+        pairs += causal_rows::compressed(request_queries, context, config.compress_ratio, None);
+    }
+    let size = |dtype: DType| f64::from(dtype.size_bytes());
+    queries * (size(config.q_dtype) * heads * head_dim + size(config.weight_dtype) * heads + 8.0)
+        + pairs
+            * (size(config.k_dtype) * head_dim
+                + size(config.k_scale_dtype)
+                + size(config.output_dtype))
+}
+
 pub struct DsaCompressedMqaLogitsPrefillSpec;
 
 impl KernelSpec for DsaCompressedMqaLogitsPrefillSpec {
@@ -134,6 +154,18 @@ impl KernelSpec for DsaCompressedMqaLogitsPrefillSpec {
 
     fn infeasible_mask(_config: &Self::Config, grid: &SweepGrid) -> Vec<bool> {
         infeasible_mask(grid)
+    }
+
+    /// Past the grid the launches hold their bandwidth. On H200 the largest
+    /// measured points sit closer to their neighbor's bandwidth than to its
+    /// TFLOPS, and the 64-request edge already runs in the chunked regime
+    /// that more requests stay in.
+    fn off_grid(
+        config: &Self::Config,
+        input: &Self::Input,
+        _backend: &'static str,
+    ) -> OffGrid<Self::Input> {
+        OffGrid::Rate(RateWork::Bytes(logical_bytes(config, input)))
     }
 
     fn enumerate(
@@ -174,7 +206,7 @@ register_kernel!(
 
 #[cfg(test)]
 mod tests {
-    use super::DsaCompressedPrefillKernelInput;
+    use super::*;
     use crate::timing::SweepCoords;
 
     #[test]
@@ -183,5 +215,17 @@ mod tests {
             query_context_pairs: vec![(8192, 1_048_576)],
         };
         assert_eq!(&*input.coords(), &[8192.0, 1_048_576.0, 1.0]);
+    }
+
+    #[test]
+    fn logical_bytes_match_a_measured_row() {
+        // A profiled H200 row's logged bandwidth x time.
+        let config: DsaCompressedMqaLogitsPrefillKernelConfig =
+            serde_json::from_value(serde_json::json!({"gpu_name": "NVIDIA H200", "max_model_len": 1048576, "max_num_batched_tokens": 8192, "max_logits_bytes": 536870912, "compress_ratio": 4, "num_heads": 64, "head_dim": 128, "q_dtype": "fp8_e4m3", "k_dtype": "fp8_e4m3", "k_scale_dtype": "fp32", "weight_dtype": "fp32", "output_dtype": "fp32", "clean_logits": false, "backends": ["vllm_deepgemm_fp8"]}))
+            .unwrap();
+        let input = DsaCompressedPrefillKernelInput {
+            query_context_pairs: vec![(4, 512); 4],
+        };
+        assert_eq!(logical_bytes(&config, &input), 412_192.0);
     }
 }

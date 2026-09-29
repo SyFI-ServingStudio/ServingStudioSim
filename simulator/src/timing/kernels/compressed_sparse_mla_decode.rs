@@ -1,8 +1,8 @@
 //! Compressed sparse FP8 MLA decode graph replay.
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
-use crate::timing::cache::{CacheKind, Extrapolation};
-use crate::timing::kernels::engine::{register_kernel, KernelSpec};
+use crate::timing::cache::{CacheKind, Extrapolation, RateWork};
+use crate::timing::kernels::engine::{register_kernel, KernelSpec, OffGrid};
 use crate::timing::sweep::{Axis, Coords, SweepGrid};
 use crate::timing::{Dim, KernelConfig, SweepCoords};
 
@@ -36,7 +36,6 @@ impl CompressedSparseMlaDecodeKernelInput {
     fn work(&self) -> (u32, f64) {
         assert!(!self.swa_valid_counts.is_empty());
         assert_eq!(self.swa_valid_counts.len(), self.extra_valid_counts.len());
-        assert!(self.swa_valid_counts.len() <= 256);
         let total = self
             .swa_valid_counts
             .iter()
@@ -101,6 +100,35 @@ fn canonical_counts(
     )
 }
 
+/// Bytes of one selected `fp8_ds_mla` cache row: 448 fp8 values, 64 bf16 rope
+/// values and 8 scale bytes.
+const CACHE_ROW_BYTES: f64 = 584.0;
+
+/// The profiler's logical bytes: q, each selected cache row and its index, the
+/// per-request valid counts, the output and lse, and the head sinks.
+fn logical_bytes(
+    config: &CompressedSparseMlaDecodeKernelConfig,
+    input: &CompressedSparseMlaDecodeKernelInput,
+) -> f64 {
+    let heads = f64::from(config.num_heads.get());
+    let batch = input.swa_valid_counts.len() as f64;
+    let selected: f64 = input
+        .swa_valid_counts
+        .iter()
+        .chain(&input.extra_valid_counts)
+        .map(|&count| f64::from(count))
+        .sum();
+    let count_arrays = if config.compress_ratio > 1 { 2.0 } else { 1.0 };
+    batch * heads * f64::from(config.head_dim.get()) * f64::from(config.q_dtype.size_bytes())
+        + selected * (CACHE_ROW_BYTES + 4.0)
+        + batch * 4.0 * count_arrays
+        + batch
+            * heads
+            * (f64::from(config.value_dim.get()) * f64::from(config.output_dtype.size_bytes())
+                + 4.0)
+        + heads * 4.0
+}
+
 pub struct CompressedSparseMlaDecodeSpec;
 
 impl KernelSpec for CompressedSparseMlaDecodeSpec {
@@ -119,6 +147,17 @@ impl KernelSpec for CompressedSparseMlaDecodeSpec {
 
     fn cache_kind(_backend: &'static str) -> CacheKind {
         CacheKind::Cache2DLinear(Extrapolation::Product)
+    }
+
+    /// Past the grid the launch holds its bandwidth: on H200 the last measured
+    /// step along the selected-row axis sits within 21% of its neighbor's
+    /// bandwidth and up to 29% off its TFLOPS; along batch the two agree.
+    fn off_grid(
+        config: &Self::Config,
+        input: &Self::Input,
+        _backend: &'static str,
+    ) -> OffGrid<Self::Input> {
+        OffGrid::Rate(RateWork::Bytes(logical_bytes(config, input)))
     }
 
     fn enumerate(
@@ -158,7 +197,7 @@ register_kernel!(
 
 #[cfg(test)]
 mod tests {
-    use super::CompressedSparseMlaDecodeKernelInput;
+    use super::*;
     use crate::timing::SweepCoords;
 
     #[test]
@@ -168,5 +207,18 @@ mod tests {
             extra_valid_counts: vec![256, 128, 64, 32],
         };
         assert_eq!(&*input.coords(), &[4.0, 180.0]);
+    }
+
+    #[test]
+    fn logical_bytes_match_a_measured_row() {
+        // A profiled H200 row's logged bandwidth x time.
+        let config: CompressedSparseMlaDecodeKernelConfig =
+            serde_json::from_value(serde_json::json!({"gpu_name": "NVIDIA H200", "num_heads": 64, "num_kv_heads": 1, "head_dim": 512, "value_dim": 512, "swa_window": 128, "extra_index_capacity": 512, "compress_ratio": 4, "q_dtype": "bf16", "cache_dtype": "fp8_e4m3", "output_dtype": "bf16", "planner_mode": "planned", "backends": ["vllm_flashmla_fp8_cudagraph"]}))
+            .unwrap();
+        let input = CompressedSparseMlaDecodeKernelInput {
+            swa_valid_counts: vec![128, 128],
+            extra_valid_counts: vec![0, 0],
+        };
+        assert!((logical_bytes(&config, &input) - 413_456.0).abs() < 1e-6);
     }
 }
