@@ -239,9 +239,20 @@ def _section_tree(manifest: dict, configs: dict[str, dict]) -> dict:
             identity = config_identity(slot["kernel_config"])
             config_hash = content_hash(identity)
             key = config_key(slot["kind"], config_hash)
-            configs.setdefault(
-                key, {"kind": slot["kind"], "config_hash": config_hash, "identity": identity}
+            config = configs.setdefault(
+                key,
+                {
+                    "kind": slot["kind"],
+                    "config_hash": config_hash,
+                    "identity": identity,
+                    "backends": [],
+                },
             )
+            # Leaves of one config may run different backends: the simulator
+            # fits every one a leaf names.
+            for backend in slot["kernel_config"].get("backends") or ():
+                if backend not in config["backends"]:
+                    config["backends"].append(backend)
             node = {
                 "id": i,
                 "kind": "leaf",
@@ -330,8 +341,9 @@ class ArchLibrary:
         return self.sources.cached_by_binary("arch-builds", compute)
 
     def _registered(self, kind: str) -> dict[tuple[str, str], dict]:
-        """``{(config_hash, gpu): {cells, infeasible, measured}}`` over the
-        registry's configs of ``kind``: how much of each grid profile.db holds."""
+        """``{(config_hash, gpu): {cells, infeasible, measured, usable}}`` over
+        the registry's configs of ``kind``: how much of each grid profile.db
+        holds, per backend (``KernelLibrary._summaries``)."""
 
         def compute() -> dict[tuple[str, str], dict]:
             return {
@@ -339,6 +351,7 @@ class ArchLibrary:
                     "cells": len(s["config"].grid.cells),
                     "infeasible": len(s["config"].grid.infeasible),
                     "measured": s["measured"],
+                    "usable": s["usable"],
                 }
                 for s in self.kernels._summaries(kind)
             }
@@ -471,12 +484,27 @@ class ArchLibrary:
         }
 
     def _counts(self, build: dict, gpu: str) -> dict:
+        """How many of a build's configs the registry holds, has any row for
+        (``measured``), and could predict from (``predictable``: every
+        backend its leaves run has a usable row at every feasible cell, as a
+        kernel-data bridge fits it)."""
+
         status = self._config_status(build, gpu)
+
+        def predictable(key: str) -> bool:
+            s = status[key]
+            if s is None:
+                return False
+            feasible = s["cells"] - s["infeasible"]
+            backends = build["configs"][key]["backends"]
+            return all(s["usable"].get(b, 0) == feasible for b in backends)
+
         return {
             "leaves": build["leaves"],
             "configs": len(status),
             "registered": sum(s is not None for s in status.values()),
             "measured": sum(bool(s and any(s["measured"].values())) for s in status.values()),
+            "predictable": sum(predictable(key) for key in status),
         }
 
     # -- registered runs -------------------------------------------------------------
@@ -1118,7 +1146,7 @@ class ArchLibrary:
             "arch": block,
             "gpu": wanted[GPU],
             "files": files,
-            "complete": bool(counts) and counts["measured"] == counts["configs"],
+            "complete": bool(counts) and counts["predictable"] == counts["configs"],
             "error": error or chosen["error"],
         }
 
@@ -1318,20 +1346,21 @@ def _option_order(group: list[str], option: dict) -> tuple:
 def _rank(run: dict) -> tuple:
     """A registered run's place among its set's: its routing's category
     (``demand.PREFERENCE``: measured before synthetic, so uniform never leads
-    a routed arch), then most configs measured, then the higher measured
-    share, then how it was recorded, then registration."""
+    a routed arch), then most configs a browser can predict from, then most
+    measured, then the higher measured share, then how it was recorded, then
+    registration."""
 
     counts = run["counts"]
     kind = min(SOURCE_KINDS.index(s["kind"]) for s in run["sources"])
     order = min(s["_order"] for s in run["sources"])
     if counts is None:
-        return (1, 0, 0, 0, kind, order)
+        return (1, 0, 0, 0, 0, kind, order)
     # The run's own routing param: a kernel that folds no `expert_demand` (an
     # FFN pool routing uniformly or at random) still ran one.
     chosen = run["params"].get(demand.PARAM)
     routing = demand._preference(chosen) if isinstance(chosen, str) else 0
     share = counts["measured"] / counts["configs"] if counts["configs"] else 0.0
-    return (0, routing, -counts["measured"], -share, kind, order)
+    return (0, routing, -counts["predictable"], -counts["measured"], -share, kind, order)
 
 
 def _leaf_count(node: dict) -> int:

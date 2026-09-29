@@ -126,7 +126,9 @@ Each member is one combination of the values the row lists and adds `label`,
 `query` (the cost-tree query that names it), `gpus_per_replica`, `error` (the
 build's, null when it built) and `counts`: `leaves`, distinct kernel `configs`
 (each kind and config hash once), and how many of those profile.db's registry
-holds (`registered`) and has any measured row for (`measured`), and `run`:
+holds (`registered`), has any measured row for (`measured`), and has what a
+prediction fits from (`predictable`: every backend the config's leaves run
+has a timed, non-outlier row at every feasible cell of its grid), and `run`:
 which registered run the counts are of (`basis` `registry`, with its
 `params`, source names and how many distinct runs the set has) or `defaults`.
 A combination two rows cover belongs to the first.
@@ -166,8 +168,8 @@ as a real run of the set, read from the kernel-config registry in profile.db:
   no routing cannot be told apart this way;
 - each is counted as the defaults tree is, and the set's runs are ordered best
   first: the routing's category (`corpus`, `popularity`, `random`, `uniform`:
-  uniform never leads a routed set), then most configs measured, then the
-  higher measured share, then a preset
+  uniform never leads a routed set), then most configs predictable, then most
+  measured, then the higher measured share, then a preset
   over an alignment case over a prediction, then registration order. A run's
   registered config count is no denominator: registration skips configs with
   no measured row;
@@ -232,7 +234,8 @@ The document has the set's `arch`, `name`, `gpu`, `model_config`, `model`, `para
 - `configs`: `{config_key: {kind, config_hash, args, args_omitted, registry}}`,
   each leaf config once (rank copies share one): its scalar identity fields,
   the names of the structured ones, and `registry` (`{cells, infeasible,
-  measured}` per backend on this GPU) or null when the registry does not hold
+  measured, usable}`, the last two per backend on this GPU: cells with a row,
+  and feasible cells whose row is timed and no outlier) or null when the registry does not hold
   it. A config is keyed by kind and hash, as the registry keys it: the hash is
   of the identity, which leaves the kind out, so two kinds of one shape (a
   prefill and a decode attention, `rms_norm` and `residual_rms_norm`) share a
@@ -265,8 +268,9 @@ browser, with Sim's timing-predict compiled to wasm (`just build-wasm`,
   carries it (`type`, `model_config` as `model/config/<stem>.json`, the set's
   params and the run's; the predictor picks its contract, iter, speculative,
   attn or ffn, from `type`); `gpu`; `files`, the paths the block names that
-  `/files` serves; `complete`, whether profile.db measured every config the
-  tree reads (a reader greys out a run that is not); and `error`, why it
+  `/files` serves; `complete`, whether every config the tree reads is
+  `predictable` (a reader greys out a run that is not: the gap is filled by
+  measuring it, not by the predictor); and `error`, why it
   cannot be predicted (a routing file `routings.yaml` does not name, say).
 - `/files?path=` for each of `files`: the predictor reads them from memory,
   by the path the block names. A token corpus binds by its manifest alone.

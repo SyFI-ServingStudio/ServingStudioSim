@@ -955,7 +955,13 @@ def test_arch_detail_lists_params_and_the_supported_sets(registered) -> None:
         None,
     )
     # Three distinct configs: qkv is registered and measured, the other two are not.
-    assert four["counts"] == {"leaves": 4, "configs": 3, "registered": 1, "measured": 1}
+    assert four["counts"] == {
+        "leaves": 4,
+        "configs": 3,
+        "registered": 1,
+        "measured": 1,
+        "predictable": 0,
+    }
 
 
 def test_cost_tree_nests_the_manifest_in_the_analyzer_shape(registered) -> None:
@@ -1014,8 +1020,17 @@ def test_cost_tree_nests_the_manifest_in_the_analyzer_shape(registered) -> None:
         "config_hash": qkv,
         "args": QKV,
         "args_omitted": [],
-        "registry": {"cells": 3, "infeasible": 1, "measured": {"torch": 2, "torch_linear": 1}},
+        "registry": {
+            "cells": 3,
+            "infeasible": 1,
+            "measured": {"torch": 2, "torch_linear": 1},
+            "usable": {"torch": 2, "torch_linear": 1},
+        },
     }
+    # The leaves run torch and torch_linear: torch has both feasible cells,
+    # torch_linear one, so a prediction could not fit this config.
+    assert [r["slot"]["backends"] for r in ranks["children"]] == [["torch", "torch_linear"]] * 2
+    assert tree["counts"]["predictable"] == 0
     assert tree["configs"][mlp["slot"]["config_key"]]["registry"] is None
     assert tree["kernels"]["single_gemm"] == {
         "documented": True,
@@ -1089,7 +1104,13 @@ def test_two_kinds_of_one_identity_are_two_configs(tmp_path: Path) -> None:
     assert [configs[s["config_key"]]["kind"] for s in slots] == ["rms_norm", "residual_rms_norm"]
     assert configs[f"rms_norm:{norm}"]["registry"]["measured"] == {"flashinfer": 1}
     assert configs[f"residual_rms_norm:{norm}"]["registry"]["measured"] == {}
-    assert tree["counts"] == {"leaves": 2, "configs": 2, "registered": 2, "measured": 1}
+    assert tree["counts"] == {
+        "leaves": 2,
+        "configs": 2,
+        "registered": 2,
+        "measured": 1,
+        "predictable": 0,
+    }
     [param_set] = client.get(f"{PREFIX}/archs/llama3_dense_tp").json()["param_sets"]
     assert param_set["members"][1]["counts"] == tree["counts"]
     # The kernel library reads each kind's registry on its own already.
@@ -1342,7 +1363,13 @@ def test_a_tree_is_built_as_its_best_measured_registered_run(runs) -> None:
     tree = client.get(MOE_TREE, params=MOE_QUERY).json()
     run = tree["run"]
     assert run["basis"] == "registry"
-    assert tree["counts"] == {"leaves": 3, "configs": 3, "registered": 2, "measured": 2}
+    assert tree["counts"] == {
+        "leaves": 3,
+        "configs": 3,
+        "registered": 2,
+        "measured": 2,
+        "predictable": 0,
+    }
     assert run["params"] == {
         "fp8": False,
         "routing": "popularity",
@@ -1576,11 +1603,11 @@ def test_a_set_no_registered_run_matches_is_built_at_its_defaults(runs, db: Path
 
 
 def test_a_run_ranks_by_its_routing_category_before_its_coverage() -> None:
-    def run(routing: str | None, measured: int) -> dict:
+    def run(routing: str | None, measured: int, predictable: int = 0) -> dict:
         params = {} if routing is None else {"routing": routing}
         return {
             "params": params,
-            "counts": {"configs": 4, "measured": measured},
+            "counts": {"configs": 4, "measured": measured, "predictable": predictable},
             "sources": [{"kind": "preset", "_order": 0}],
         }
 
@@ -1594,5 +1621,7 @@ def test_a_run_ranks_by_its_routing_category_before_its_coverage() -> None:
     # the order is the params', not the routing name's.
     ranked = sorted(runs, key=lambda name: arch_library._rank(runs[name]))
     assert ranked == ["corpus", "popularity", "random", "uniform"]
-    # Within a category, coverage decides.
+    # Within a category, coverage decides: first what a prediction can fit
+    # from, then any measured row.
     assert arch_library._rank(run("popularity", 3)) < arch_library._rank(run("popularity", 1))
+    assert arch_library._rank(run("popularity", 2, 2)) < arch_library._rank(run("popularity", 4))
