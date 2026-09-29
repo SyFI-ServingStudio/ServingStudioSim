@@ -6,14 +6,26 @@
 //! from the abstract `Cache` trait and its variants in `cache/mod.rs`.
 
 use crate::timing::bridge::{BuildError, KernelKind, KernelMetrics};
-use crate::timing::cache::interp::LeafMetrics;
+use crate::timing::cache::interp::{CoverageFlags, LeafMetrics};
 use crate::timing::cache::{build_cache, Cache, CacheKind, OutlierWarning, PeakRates};
 use crate::timing::sweep::SweepGrid;
 
-/// Per-backend cache wrapper: a fitted `Box<dyn Cache>`. `*Kernel` runs
-/// best-of-N over a `Vec<BackendCache>` via `eval`.
+/// The work an input does, in the units its backend's profiler reports, for a
+/// past-the-grid answer that holds a rate: the achieved FLOP rate or the
+/// achieved bandwidth of the nearest grid point.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum RateWork {
+    /// Logical FLOPs; time follows at the edge's TFLOPS.
+    Flops(f64),
+    /// Logical bytes; time follows at the edge's bandwidth.
+    Bytes(f64),
+}
+
+/// Per-backend cache wrapper: a fitted `Box<dyn Cache>` and the range of each
+/// grid axis. `*Kernel` runs best-of-N over a `Vec<BackendCache>` via `eval`.
 pub(crate) struct BackendCache {
     cache: Box<dyn Cache>,
+    bounds: Vec<(f64, f64)>,
 }
 
 impl BackendCache {
@@ -25,7 +37,50 @@ impl BackendCache {
         samples: &[KernelMetrics],
     ) -> Result<(Self, Vec<OutlierWarning>), BuildError> {
         let (cache, warnings) = build_cache(kernel_kind, cache_kind, sweep_grid, samples)?;
-        Ok((Self { cache }, warnings))
+        let bounds = sweep_grid
+            .axes()
+            .iter()
+            .map(|axis| {
+                axis.iter()
+                    .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &x| {
+                        (lo.min(x), hi.max(x))
+                    })
+            })
+            .collect();
+        Ok((Self { cache, bounds }, warnings))
+    }
+
+    /// Whether `sweep` lies within every axis's profiled range.
+    pub(crate) fn contains(&self, sweep: &[f64]) -> bool {
+        sweep
+            .iter()
+            .zip(&self.bounds)
+            .all(|(&x, &(lo, hi))| (lo..=hi).contains(&x))
+    }
+
+    /// The answer past the grid that holds the nearest grid point's rate:
+    /// clamp `sweep` into the grid, read that point, and scale all its metrics
+    /// by `work` over the point's own work (its logical FLOPs or bytes), so the
+    /// input runs at the edge's TFLOPS or bandwidth. Flagged `EXTRAPOLATED`.
+    /// Falls back to the cache's own extrapolation when the edge reports no
+    /// work of that kind.
+    pub(crate) fn eval_at_edge_rate(&self, sweep: &[f64], work: RateWork) -> LeafMetrics {
+        let clamped: Vec<f64> = sweep
+            .iter()
+            .zip(&self.bounds)
+            .map(|(&x, &(lo, hi))| x.clamp(lo, hi))
+            .collect();
+        let mut edge = self.cache.eval(&clamped);
+        let (work, edge_work) = match work {
+            RateWork::Flops(flops) => (flops, f64::from(edge.m.flops)),
+            RateWork::Bytes(bytes) => (bytes, f64::from(edge.m.bytes)),
+        };
+        if !(edge_work > 0.0 && edge_work.is_finite() && work.is_finite() && work >= 0.0) {
+            return self.cache.eval(sweep);
+        }
+        edge.m.scale((work / edge_work) as f32);
+        edge.coverage |= CoverageFlags::EXTRAPOLATED;
+        edge
     }
 
     /// Metrics fast path for CostTree eval — the caller (`Kernel::eval`)
@@ -43,8 +98,9 @@ impl BackendCache {
 
 #[cfg(test)]
 mod tests {
-    use super::BackendCache;
+    use super::{BackendCache, RateWork};
     use crate::timing::bridge::KernelMetrics;
+    use crate::timing::cache::interp::CoverageFlags;
     use crate::timing::cache::CacheKind;
     use crate::timing::sweep::SweepGrid;
 
@@ -74,5 +130,31 @@ mod tests {
         // Midpoint between the two profiled times (1.0, 3.0) → 2.0 ms.
         let leaf = cache.eval(&[1.5]);
         assert_eq!(leaf.m.time_ms, 2.0);
+    }
+
+    #[test]
+    fn past_the_grid_holds_the_edge_rate() {
+        let grid = SweepGrid::new(vec![vec![1.0, 2.0]]);
+        let (cache, _warnings) = BackendCache::fit(
+            "single_gemm",
+            "torch",
+            CacheKind::Cache1DLinear,
+            &grid,
+            &[sample(1.0), sample(3.0)],
+        )
+        .expect("fit must succeed for a finite 1D batch");
+        assert!(cache.contains(&[2.0]));
+        assert!(!cache.contains(&[10.0]));
+
+        // The edge (x=2) runs 3 ms at 2 GB/s and 1 TFLOPS: 6e6 bytes, 3e9 FLOPs.
+        // The cache's own line would give 19 ms at x=10.
+        let at_bandwidth = cache.eval_at_edge_rate(&[10.0], RateWork::Bytes(2e7));
+        assert!((at_bandwidth.m.time_ms - 10.0).abs() < 1e-4);
+        assert!((at_bandwidth.m.energy_j - 10.0 / 3.0).abs() < 1e-4);
+        assert!(at_bandwidth.coverage.contains(CoverageFlags::EXTRAPOLATED));
+
+        let at_tflops = cache.eval_at_edge_rate(&[10.0], RateWork::Flops(6e9));
+        assert!((at_tflops.m.time_ms - 6.0).abs() < 1e-4);
+        assert!((at_tflops.m.bytes - 1.2e7).abs() < 1.0);
     }
 }

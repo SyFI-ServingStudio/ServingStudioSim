@@ -10,13 +10,21 @@
 //! `context - queries + 1 ..= context` rather than all seeing the endpoint.
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
-use crate::timing::cache::CacheKind;
-use crate::timing::kernels::engine::{register_kernel, KernelSpec};
+use crate::timing::cache::{CacheKind, RateWork};
+use crate::timing::kernels::causal_rows;
+use crate::timing::kernels::engine::{register_kernel, KernelSpec, OffGrid};
 use crate::timing::sweep::{Axis, Coords, SweepGrid};
 use crate::timing::{Dim, KernelConfig, SweepCoords};
 
-const MAX_BATCHED_QUERY_ROWS: u32 = 16384;
+/// The most requests a profiled canonical batch splits into. The production
+/// launch has no request dimension (one row per query token), so this bounds
+/// only the grid; past it the launch holds the edge's bandwidth (`off_grid`).
 const MAX_REQUESTS: usize = 64;
+
+/// The most query rows one launch takes: the kernel puts one CTA row per query
+/// row on the grid's z dimension, which CUDA caps at 65535. More rows fail the
+/// launch.
+pub const MAX_LAUNCH_QUERY_ROWS: u32 = 65_535;
 
 #[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct DsaSparseMlaPrefillKernelConfig {
@@ -49,7 +57,6 @@ pub struct DsaSparseMlaPrefillKernelInput {
 impl DsaSparseMlaPrefillKernelInput {
     fn work(&self) -> (u32, u32, f64) {
         assert!(!self.query_context_pairs.is_empty());
-        assert!(self.query_context_pairs.len() <= MAX_REQUESTS);
 
         let mut num_queries = 0_u32;
         let mut causal_context_sum = 0_f64;
@@ -61,7 +68,6 @@ impl DsaSparseMlaPrefillKernelInput {
             let mean_causal_context = f64::from(context) - f64::from(queries - 1) / 2.0;
             causal_context_sum += f64::from(queries) * mean_causal_context;
         }
-        assert!(num_queries <= MAX_BATCHED_QUERY_ROWS);
 
         let num_requests = self.query_context_pairs.len() as u32;
         let mean_causal_context = causal_context_sum / f64::from(num_queries);
@@ -101,6 +107,28 @@ fn canonical_pairs(num_queries: u32, num_requests: u32, context: u32) -> Option<
         .then_some(pairs)
 }
 
+/// The profiler's logical bytes for this launch: q, the per-row top-k
+/// indices, the cache rows each query row reads, the output, and the max/lse
+/// rows. Every term but the cache read scales with query rows.
+fn logical_bytes(
+    config: &DsaSparseMlaPrefillKernelConfig,
+    input: &DsaSparseMlaPrefillKernelInput,
+) -> f64 {
+    let heads = f64::from(config.num_heads.get());
+    let score_dim = f64::from(config.latent_dim.get() + config.rope_dim.get());
+    let value_dim = f64::from(config.value_dim.get());
+    let (mut queries, mut cache_rows) = (0.0, 0.0);
+    for &(request_queries, context) in &input.query_context_pairs {
+        queries += f64::from(request_queries);
+        cache_rows += causal_rows::capped(request_queries, context, config.selected_k);
+    }
+    let per_query = f64::from(config.q_dtype.size_bytes()) * heads * score_dim
+        + 4.0 * f64::from(config.selected_k)
+        + f64::from(config.output_dtype.size_bytes()) * heads * value_dim
+        + 8.0 * heads;
+    queries * per_query + f64::from(config.cache_dtype.size_bytes()) * cache_rows * score_dim
+}
+
 pub struct DsaSparseMlaPrefillSpec;
 
 impl KernelSpec for DsaSparseMlaPrefillSpec {
@@ -132,6 +160,18 @@ impl KernelSpec for DsaSparseMlaPrefillSpec {
         grid.expand_3d(|num_queries, num_requests, context| {
             canonical_pairs(num_queries as u32, num_requests as u32, context as u32).is_none()
         })
+    }
+
+    /// Past the grid the launch holds its bandwidth: one row per query token
+    /// with no request dimension, it streams the cache rows each row selects,
+    /// and B200 measurements up to 65535 rows and 512 requests stay within 7%
+    /// of the edge's logical bandwidth while its TFLOPS moves by 30%.
+    fn off_grid(
+        config: &Self::Config,
+        input: &Self::Input,
+        _backend: &'static str,
+    ) -> OffGrid<Self::Input> {
+        OffGrid::Rate(RateWork::Bytes(logical_bytes(config, input)))
     }
 
     fn enumerate(
@@ -255,6 +295,20 @@ mod tests {
                 1.0, 32.0, 128.0, 192.0, 256.0, 512.0, 1024.0, 2048.0, 4096.0, 8192.0, 65536.0,
                 1048576.0
             ]
+        );
+    }
+
+    #[test]
+    fn logical_bytes_match_the_profiler() {
+        // profiling/runners/attention/dsa_sparse_mla_attention.py `_logical_bytes`
+        // with q_bytes=1, cache_bytes=1, 16 heads, one (2, 3) request:
+        // 1*2*16*576 + 4*2*2048 + (2+3)*576 + 2*2*16*512 + 8*2*16.
+        let input = DsaSparseMlaPrefillKernelInput {
+            query_context_pairs: vec![(2, 3)],
+        };
+        assert_eq!(
+            logical_bytes(&config(), &input),
+            18432.0 + 16384.0 + 2880.0 + 32768.0 + 256.0
         );
     }
 

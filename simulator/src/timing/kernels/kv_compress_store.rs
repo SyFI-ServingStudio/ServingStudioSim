@@ -3,8 +3,8 @@
 use std::collections::BTreeSet;
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
-use crate::timing::cache::{CacheKind, Extrapolation};
-use crate::timing::kernels::engine::{register_kernel, KernelSpec};
+use crate::timing::cache::{CacheKind, Extrapolation, RateWork};
+use crate::timing::kernels::engine::{register_kernel, KernelSpec, OffGrid};
 use crate::timing::sweep::{Axis, Coords, SweepGrid};
 use crate::timing::{Dim, KernelConfig, SweepCoords};
 
@@ -39,10 +39,8 @@ impl KvCompressStoreKernelInput {
     fn work(&self, compress_ratio: u32) -> (u32, u32) {
         assert!(!self.row_positions.is_empty());
         assert_eq!(self.row_positions.len(), self.row_request_ids.len());
-        assert!(self.row_positions.len() <= 8192);
         assert!(self.state_block_table_width > 0);
         let request_count = self.row_request_ids.iter().copied().max().unwrap() + 1;
-        assert!(request_count <= 64);
         assert_eq!(
             self.row_request_ids
                 .iter()
@@ -97,6 +95,25 @@ fn canonical_input(
         row_request_ids,
         state_block_table_width,
     }
+}
+
+/// The profiler's logical bytes: each active row's window of fp32 state pairs
+/// and its stored cache row, and every row's metadata and saved partial state.
+fn logical_bytes(config: &KvCompressStoreKernelConfig, input: &KvCompressStoreKernelInput) -> f64 {
+    let ratio = config.compress_ratio;
+    let head_dim = config.head_dim.get();
+    // (compression window, state width, cache row bytes), as the runners set them.
+    let (window, state_width, row_bytes) = match (head_dim, ratio) {
+        (512, 4) => (8, 1024, 584),
+        (512, _) => (ratio, 512, 584),
+        _ => (8, 512, 132),
+    };
+    let (rows, active) = input.work(ratio);
+    let (rows, active) = (f64::from(rows), f64::from(active));
+    active * f64::from(window * head_dim * 2 * 4)
+        + active * f64::from(row_bytes)
+        + rows * 28.0
+        + rows * f64::from(state_width * 20 + 16)
 }
 
 pub struct KvCompressStoreSpec;
@@ -159,6 +176,17 @@ impl KernelSpec for KvCompressStoreSpec {
         grid.expand_2d(|num_tokens, num_active_tokens| num_active_tokens > num_tokens)
     }
 
+    /// Past the grid the kernel holds its bandwidth: on H200 the largest
+    /// measured points sit within 35% of their neighbor's bandwidth and up to
+    /// 87% off its TFLOPS.
+    fn off_grid(
+        config: &Self::Config,
+        input: &Self::Input,
+        _backend: &'static str,
+    ) -> OffGrid<Self::Input> {
+        OffGrid::Rate(RateWork::Bytes(logical_bytes(config, input)))
+    }
+
     fn enumerate(
         config: &Self::Config,
         grid: &SweepGrid,
@@ -194,7 +222,7 @@ register_kernel!(KvCompressStoreKernel, KvCompressStoreSpec);
 
 #[cfg(test)]
 mod tests {
-    use super::canonical_input;
+    use super::*;
 
     #[test]
     fn canonical_topology_has_the_requested_boundary_count() {
@@ -213,6 +241,29 @@ mod tests {
                     .collect::<Vec<_>>();
                 assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
             }
+        }
+    }
+
+    #[test]
+    fn logical_bytes_match_measured_rows() {
+        // Profiled H200 rows' logged bandwidth x time, one per backend.
+        let input = KvCompressStoreKernelInput {
+            row_positions: vec![3, 0, 0, 0],
+            row_request_ids: vec![0, 1, 2, 3],
+            state_block_table_width: 1,
+        };
+        for (config, expected) in [
+            (
+                serde_json::json!({"gpu_name": "NVIDIA H200", "compress_ratio": 4, "num_kv_heads": 1, "head_dim": 512, "rope_head_dim": 64, "logical_block_size": 256, "state_dtype": "fp32", "norm_dtype": "bf16", "cache_dtype": "fp8_ds_mla", "cache_layout": "block_segregated_data_then_scales", "scale_format": "ue8m0", "backends": ["vllm_cutedsl"], "kv_dtype": "fp8_e4m3"}),
+                115_448.0,
+            ),
+            (
+                serde_json::json!({"gpu_name": "NVIDIA H200", "compress_ratio": 4, "num_kv_heads": 1, "head_dim": 128, "rope_head_dim": 64, "logical_block_size": 256, "state_dtype": "fp32", "norm_dtype": "bf16", "cache_dtype": "fp8_indexer", "cache_layout": "block_segregated_data_then_scales", "scale_format": "fp32_per_token", "backends": ["vllm_triton"], "kv_dtype": "fp8_e4m3"}),
+                49_460.0,
+            ),
+        ] {
+            let config: KvCompressStoreKernelConfig = serde_json::from_value(config).unwrap();
+            assert_eq!(logical_bytes(&config, &input), expected);
         }
     }
 }

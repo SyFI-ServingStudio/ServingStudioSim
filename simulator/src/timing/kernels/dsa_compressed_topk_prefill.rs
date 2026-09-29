@@ -1,11 +1,12 @@
 //! DSA indexer-prefill top-k over compressed keys, for one complete request batch.
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
-use crate::timing::cache::CacheKind;
+use crate::timing::cache::{CacheKind, RateWork};
+use crate::timing::kernels::causal_rows;
 use crate::timing::kernels::dsa_compressed_mqa_logits_prefill::{
     canonical_pairs, infeasible_mask, sweep_grid, DsaCompressedPrefillKernelInput,
 };
-use crate::timing::kernels::engine::{register_kernel, KernelSpec};
+use crate::timing::kernels::engine::{register_kernel, KernelSpec, OffGrid};
 use crate::timing::sweep::SweepGrid;
 use crate::timing::KernelConfig;
 
@@ -22,6 +23,22 @@ pub struct DsaCompressedTopkPrefillKernelConfig {
     #[compute_dtype]
     pub logits_dtype: DType,
     pub index_dtype: String,
+}
+
+/// The profiler's logical bytes: each (query, compressed key) logit read, each
+/// query's row bounds, and its top-k indices written.
+fn logical_bytes(
+    config: &DsaCompressedTopkPrefillKernelConfig,
+    input: &DsaCompressedPrefillKernelInput,
+) -> f64 {
+    let (mut queries, mut pairs) = (0.0, 0.0);
+    for &(request_queries, context) in &input.query_context_pairs {
+        queries += f64::from(request_queries);
+        pairs += causal_rows::compressed(request_queries, context, config.compress_ratio, None);
+    }
+    f64::from(config.logits_dtype.size_bytes()) * pairs
+        + 8.0 * queries
+        + 4.0 * queries * f64::from(config.top_k)
 }
 
 pub struct DsaCompressedTopkPrefillSpec;
@@ -45,6 +62,18 @@ impl KernelSpec for DsaCompressedTopkPrefillSpec {
 
     fn infeasible_mask(_config: &Self::Config, grid: &SweepGrid) -> Vec<bool> {
         infeasible_mask(grid)
+    }
+
+    /// Past the grid the top-k holds its bandwidth, the only rate the profiler
+    /// reports for it. On H200 that predicts the largest measured points from
+    /// their neighbors better than extending the cache does (median 6% vs 8%
+    /// along queries, 18% vs 43% along requests).
+    fn off_grid(
+        config: &Self::Config,
+        input: &Self::Input,
+        _backend: &'static str,
+    ) -> OffGrid<Self::Input> {
+        OffGrid::Rate(RateWork::Bytes(logical_bytes(config, input)))
     }
 
     fn enumerate(
@@ -74,3 +103,33 @@ impl KernelSpec for DsaCompressedTopkPrefillSpec {
 }
 
 register_kernel!(DsaCompressedTopkPrefillKernel, DsaCompressedTopkPrefillSpec);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn logical_bytes_match_the_profiler() {
+        // profiling/runners/attention/dsa_compressed_topk_prefill_cuda.py:
+        // 4 * valid_key_pairs + 8 * queries + 4 * queries * top_k. Four (4, 512)
+        // requests read 127 + 127 + 127 + 128 C4 keys each.
+        let config = DsaCompressedTopkPrefillKernelConfig {
+            backends: vec!["vllm_cuda"],
+            gpu_name: "NVIDIA H200".to_string(),
+            max_model_len: 1_048_576,
+            max_num_batched_tokens: 8192,
+            max_logits_bytes: 512 * 1024 * 1024,
+            compress_ratio: 4,
+            top_k: 512,
+            logits_dtype: DType::Fp32,
+            index_dtype: "int32".to_string(),
+        };
+        let input = DsaCompressedPrefillKernelInput {
+            query_context_pairs: vec![(4, 512); 4],
+        };
+        assert_eq!(
+            logical_bytes(&config, &input),
+            4.0 * 2036.0 + 8.0 * 16.0 + 4.0 * 16.0 * 512.0
+        );
+    }
+}
