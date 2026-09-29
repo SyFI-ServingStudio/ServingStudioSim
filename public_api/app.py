@@ -7,7 +7,13 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import PlainTextResponse
 
-from public_api.arch.library import ArchLibrary, BadParams, UnknownArch, UnsupportedParams
+from public_api.arch.library import (
+    ArchLibrary,
+    BadParams,
+    UnknownArch,
+    UnknownFile,
+    UnsupportedParams,
+)
 from public_api.kernel.library import BadQuery, KernelLibrary, UnknownConfig, UnknownKind
 
 PREFIX = "/api/public/v1"
@@ -35,6 +41,8 @@ def create_app(kernels: KernelLibrary, archs: ArchLibrary | None = None) -> Fast
             raise HTTPException(400, str(error)) from None
         except UnknownArch as error:
             raise HTTPException(404, f"unknown arch {error.args[0]!r}") from None
+        except UnknownFile as error:
+            raise HTTPException(404, f"no input file {error.args[0]!r}") from None
         except BadParams as error:
             raise HTTPException(400, {"message": str(error), "choices": error.choices}) from None
         except UnsupportedParams as error:
@@ -98,5 +106,20 @@ def create_app(kernels: KernelLibrary, archs: ArchLibrary | None = None) -> Fast
         404; both list the valid ``choices``."""
 
         return await answer(archs.cost_tree, arch, dict(request.query_params))
+
+    @app.get(f"{PREFIX}/archs/{{arch}}/kernel-data")
+    async def arch_kernel_data(arch: str, request: Request) -> dict:
+        """The config document of every kernel config the cost tree of the same
+        query reads (``/kernels/{kind}/configs/{hash}`` points, cut to what the
+        simulator's kernel-data bridge reads), for predicting that run."""
+
+        return await answer(archs.kernel_data, arch, dict(request.query_params))
+
+    @app.get(f"{PREFIX}/files")
+    async def input_file(path: str) -> PlainTextResponse:
+        """One file a prediction reads, by the path ``run.predict.files`` gives."""
+
+        text = await answer(archs.input_file, path)
+        return PlainTextResponse(text, media_type="application/json")
 
     return app

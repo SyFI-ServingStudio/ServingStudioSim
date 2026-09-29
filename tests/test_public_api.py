@@ -750,13 +750,17 @@ def _names(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, corpus=(), popularit
     """Serve a routing-name table naming ``corpus`` (``(checksum, name)``) and
     ``popularity`` (``(file, name)``) instead of the repository's."""
 
+    def entry(f: Path, name: str) -> dict:
+        out = {"name": name, "sha256": hashlib.sha256(Path(f).read_bytes()).hexdigest()}
+        # Where the repository keeps it, when it is under the repository.
+        if Path(f).is_relative_to(arch_library.REPO_ROOT):
+            out["file"] = str(Path(f).relative_to(arch_library.REPO_ROOT))
+        return out
+
     table = {
         "schema_version": 1,
         "corpus": [{"name": n, "checksum_fnv1a64": f"{c:016x}"} for c, n in corpus],
-        "popularity": [
-            {"name": n, "sha256": hashlib.sha256(Path(f).read_bytes()).hexdigest()}
-            for f, n in popularity
-        ],
+        "popularity": [entry(f, n) for f, n in popularity],
     }
     path = tmp_path / "routings.yaml"
     path.write_text(json.dumps(table))
@@ -1197,6 +1201,7 @@ MOE_QUERY = {"gpu": "NVIDIA H200", "model": "moe_m", "ep_size": "4"}
 MOE_TREE = f"{PREFIX}/archs/moe_x/cost-tree"
 POPULARITY = "presets/popularity.json"
 PACK = "presets/alignment/moe_x"
+MOE_CONFIG = "model/config/moe_m.json"
 
 
 def _moe_block(**params) -> dict:
@@ -1277,7 +1282,7 @@ class RunSources(FixtureSources):
         return [_moe_build(block["arch"]) for block in blocks]
 
     def tracked(self, paths: list[str]) -> set[str]:
-        return {p for p in paths if p in ("presets/moe_x.yaml", POPULARITY, PACK)}
+        return {p for p in paths if p in ("presets/moe_x.yaml", POPULARITY, PACK, MOE_CONFIG)}
 
 
 @pytest.fixture
@@ -1513,6 +1518,47 @@ def test_a_null_for_a_param_with_no_default_is_the_run_that_leaves_it_out(runs) 
     assert "token_corpus_file" not in run["params"]
     assert [s["name"] for s in run["sources"]] == ["presets/moe_x.yaml", "moe_z.yaml", PACK]
     assert run["combinations"] == 3
+
+
+def test_a_run_carries_what_the_browser_predicts_it_from(runs) -> None:
+    """``run.predict``: the run's arch block, its GPU, and the files it reads,
+    each served by ``/files``; nothing else is served."""
+
+    client, _ = runs
+    predict = client.get(MOE_TREE, params=MOE_QUERY).json()["run"]["predict"]
+    assert predict["arch"] == {
+        "type": "moe_x",
+        "model_config": MOE_CONFIG,
+        "ep_size": 4,
+        "fp8": False,
+        "routing": "popularity",
+        "mtp_mode": "off",
+        "expert_popularity_file": POPULARITY,
+    }
+    assert predict["gpu"] == "NVIDIA H200"
+    assert predict["files"] == [MOE_CONFIG, POPULARITY]
+    # 2 of the tree's 3 configs are measured.
+    assert (predict["complete"], predict["error"]) == (False, None)
+    for path in predict["files"]:
+        served = client.get(f"{PREFIX}/files", params={"path": path})
+        assert (served.status_code, served.text) == (200, "{}")
+    # An unnamed routing file, an untracked or unrelated file, a path out of
+    # the repository: none is served.
+    for path in ("presets/popularity2.json", "presets/moe_x.yaml", "../runs.db", "/etc/passwd"):
+        assert client.get(f"{PREFIX}/files", params={"path": path}).status_code == 404, path
+
+
+def test_kernel_data_is_each_config_document_the_tree_reads(runs) -> None:
+    client, _ = runs
+    tree = client.get(MOE_TREE, params=MOE_QUERY).json()
+    data = client.get(f"{PREFIX}/archs/moe_x/kernel-data", params=MOE_QUERY).json()
+    assert (data["format"], data["gpu"]) == (1, "NVIDIA H200")
+    registered = {(c["kind"], c["config_hash"]) for c in tree["configs"].values() if c["registry"]}
+    assert {(d["kind"], d["config_hash"]) for d in data["configs"]} == registered
+    assert len(data["missing"]) == len(tree["configs"]) - len(registered)
+    for document in data["configs"]:
+        assert set(document) == {"kind", "gpu", "config_hash", "identity", "axes", "points"}
+        assert all(set(p) == {"feasible", "measured"} for p in document["points"])
 
 
 def test_a_set_no_registered_run_matches_is_built_at_its_defaults(runs, db: Path) -> None:

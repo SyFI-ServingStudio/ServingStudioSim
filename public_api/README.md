@@ -58,6 +58,8 @@ All `GET`, under `/api/public/v1`.
 | `/archs` | Every arch tag: `name` and `summary` (`model/arch_catalog.yaml`), `contract`, the `models` (model-config stems) and `gpus` its `#[supported]` rows run, their model `families`, the `params` the rows choose between, and how many `param_sets` and `combinations` it supports; plus `models`, the catalog entries they name |
 | `/archs/{arch}` | One arch: every param (`list-params`: type, default, choices, description, `set_when_predicting` on a traffic param, and `values`, the values its rows list, null for a param no row chooses), the `query` names of its cost trees, and its supported `param_sets` |
 | `/archs/{arch}/cost-tree` | One supported parameter set's cost tree, chosen by the query: `gpu`, `model` (a model-config stem) and every param the arch's rows name, all required, and optionally the run params of one of the set's registered runs (below). The structure only: no timings |
+| `/archs/{arch}/kernel-data` | For the same query, the registry's config document of every config the tree reads, as a simulator kernel-data bridge reads them (below): `format`, `gpu`, `configs` and `missing` (the `config_key`s the registry does not hold) |
+| `/files?path=` | The text of one file a prediction reads (`run.predict.files`): a model config git tracks, or the file of a routing `presets/alignment/routings.yaml` names (a hub corpus's manifest from this machine's hub cache, never its payload). 404 for any other path |
 
 A deployment entry is one `#[supported]` row on one GPU and model config:
 `arch`, `gpu`, `model_config` (the file stem of a `model/config/` file, as
@@ -200,7 +202,8 @@ The document has the set's `arch`, `name`, `gpu`, `model_config`, `model`, `para
   each `selected`, `compatible` (a run has it and every other picker's
   selection) and the `counts` of the run choosing it lands on, and `fixed`
   when there is one option; `combinations`, how many runs; and `skipped`, the
-  runs not built here with the reason;
+  runs not built here with the reason; and `predict`, what a browser predicts
+  the run from (below), null at the defaults;
 - `defaults`: with a registered run, `{name: default}` for each run param its
   block left out; at the defaults, for each param the rows leave open, and
   `set_when_predicting`: the names of those that `list-params` marks
@@ -252,26 +255,32 @@ megabytes on the GLM trees; the config route has it), and every node keeps
 `id` and every leaf its slot `index`, so a prediction can return times by node
 and by slot without resending the tree.
 
-## Later: predictions
+## Predicting in the browser
 
-The routes stay read-only now. A prediction is "this arch, these params, these
-requests": the plan is one write route that takes a supported parameter set
-(the same `query` as `cost-tree`) and a batch of requests, and answers in terms
-of the tree the reader already has.
+The routes stay read-only: the Models page predicts a run in the reader's
+browser, with Sim's timing-predict compiled to wasm (`just build-wasm`,
+`simulator/wasm/`), from three reads.
 
-- `POST /archs/{arch}/predictions` with `{query, requests, routing}`: `requests`
-  as `timing-predict` cases (per group, `prefill_chunk_pairs` of
-  `[prefix_len, append_len]` and `decode_kv_lens`), bounded in count and
-  length. It answers `202` with a prediction id; `GET /predictions/{id}` returns the status and then, per case,
-  the iteration total and a time per node `id` and per slot `index` (with the
-  backend chosen), which the page overlays on the tree it drew.
-- MoE archs need an explicit routing (`corpus` or `popularity` with its
-  artifact); the route never defaults one to `uniform`.
-- Public predictions read measured rows only (no JIT profiling and no GPU): a
-  case that needs a row profile.db lacks is reported as not predictable, with
-  the leaves that lack it, instead of being profiled.
-- A prediction runs the release binary's `timing-predict` in a worker pool, off
-  the request path, with its own rate limit; nothing it does writes profile.db.
+- `run.predict` of the cost tree: `arch`, the run's arch block as a run config
+  carries it (`type`, `model_config` as `model/config/<stem>.json`, the set's
+  params and the run's; the predictor picks its contract, iter, speculative,
+  attn or ffn, from `type`); `gpu`; `files`, the paths the block names that
+  `/files` serves; `complete`, whether profile.db measured every config the
+  tree reads (a reader greys out a run that is not); and `error`, why it
+  cannot be predicted (a routing file `routings.yaml` does not name, say).
+- `/files?path=` for each of `files`: the predictor reads them from memory,
+  by the path the block names. A token corpus binds by its manifest alone.
+- `/archs/{arch}/kernel-data`, with the tree's query: per config, the
+  registry's grid (`axes`) and, per cell, row-major, `feasible` and the row
+  each backend `measured` there (the kind's metrics and `outlier`)
+  (`profiling/db/kernel_data.py`, format 1). The predictor fits every kernel's
+  cache from these and asks nothing else; a config the registry lacks is a
+  gap to fill at the source (register the run), not something to guess.
+
+`/health`'s `sim_commit` and the predictor's `version()` must agree, and the
+documents' `format` must be the one the predictor reads, or the page shows no
+number. A server-side `POST /archs/{arch}/predictions` stays possible later
+behind the same inputs; nothing here writes profile.db.
 
 ## Sources
 

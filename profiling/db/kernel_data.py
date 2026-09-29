@@ -23,6 +23,10 @@ from profiling.db.registry import MetricFamily, iter_kernel_profiler_specs
 from profiling.db.table import Table
 from profiling.runners.metrics import CommMetrics, ComputeMetrics
 
+# The document shape a simulator kernel-data bridge reads
+# (`KERNEL_DATA_FORMAT` in simulator/src/timing/bridge/kernel_data.rs).
+FORMAT = 1
+
 METRICS = {
     MetricFamily.COMPUTE: [f.name for f in fields(ComputeMetrics)],
     MetricFamily.COMM: [f.name for f in fields(CommMetrics)],
@@ -105,19 +109,15 @@ def points(
     metrics there (absent where nothing was), with an ``outlier`` flag."""
 
     grid = config.grid
-    names = metrics(kind)
     return [
         {
             "coords": list(grid.coords(i)),
             "feasible": i not in grid.infeasible,
             "args": cell,
-            "measured": {
-                backend: {**{m: row[m] for m in names}, "outlier": bool(row["is_outlier"])}
-                for backend, row in measured.items()
-            },
+            "measured": measured,
         }
         for i, (cell, measured) in enumerate(
-            zip(grid.cells, cell_rows(conn, db_path, kind, config), strict=True)
+            zip(grid.cells, _measured(conn, db_path, kind, config), strict=True)
         )
     ]
 
@@ -126,7 +126,9 @@ def config_document(
     conn: sqlite3.Connection, db_path: Any, kind: str, config_hash: str, gpu_name: str
 ) -> dict | None:
     """The config document of ``(kind, config_hash)`` on ``gpu_name``, or None
-    when the registry holds no such config."""
+    when the registry holds no such config. Each point carries only what a
+    kernel-data bridge reads, its feasibility and measured rows; the public
+    kernel API's ``/configs/{hash}`` adds each cell's coordinates and args."""
 
     tables = dict.fromkeys(
         s.table_name for s in iter_kernel_profiler_specs() if s.kernel_kind == kind
@@ -146,5 +148,21 @@ def config_document(
         "config_hash": config.config_hash,
         "identity": config.identity,
         "axes": [list(axis) for axis in config.grid.axes],
-        "points": points(conn, db_path, kind, config),
+        "points": [
+            {"feasible": i not in config.grid.infeasible, "measured": measured}
+            for i, measured in enumerate(_measured(conn, db_path, kind, config))
+        ],
     }
+
+
+def _measured(
+    conn: sqlite3.Connection, db_path: Any, kind: str, config: RegisteredConfig
+) -> list[dict]:
+    names = metrics(kind)
+    return [
+        {
+            backend: {**{m: row[m] for m in names}, "outlier": bool(row["is_outlier"])}
+            for backend, row in measured.items()
+        }
+        for measured in cell_rows(conn, db_path, kind, config)
+    ]
