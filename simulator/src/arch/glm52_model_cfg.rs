@@ -70,7 +70,7 @@ pub struct Glm52ModelCfg {
 
 impl Glm52ModelCfg {
     pub fn from_json(path: &Path) -> Result<Self> {
-        let text = std::fs::read_to_string(path)
+        let text = crate::common::input_files::read_to_string(path)
             .with_context(|| format!("reading GLM-5.2 config {}", path.display()))?;
         parse_model_json(&text)
             .with_context(|| format!("validating GLM-5.2 config {}", path.display()))

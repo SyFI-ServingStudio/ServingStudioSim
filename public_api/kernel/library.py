@@ -39,6 +39,7 @@ from typing import Any
 import yaml
 
 from launcher.schema.validate import supported_value
+from profiling.db import kernel_data
 from profiling.db.args import DType
 from profiling.db.doc import CATEGORIES, SUBCATEGORIES, arg_docs, kernel_doc
 from profiling.db.doc import METRICS as METRIC_DOCS
@@ -50,15 +51,13 @@ from profiling.db.kernel_config import (
     ConfigUse,
     RegisteredConfig,
     canonical_json,
-    cell_keys,
     pack_cells,
     registered_configs,
 )
-from profiling.db.registry import MetricFamily, iter_kernel_profiler_specs
+from profiling.db.registry import iter_kernel_profiler_specs
 from profiling.db.storage import CREATED_AT_FORMAT, RUN_AT_FORMAT, RUN_TABLE, iso_sql
-from profiling.db.table import STANDARD_COLUMNS, Table
+from profiling.db.table import STANDARD_COLUMNS
 from profiling.gpu_catalog import GpuSpecResolution, resolve_gpu_spec
-from profiling.runners.metrics import CommMetrics, ComputeMetrics
 from public_api.kernel import demand
 from public_api.kernel.sources import KernelSources
 
@@ -68,12 +67,6 @@ MODEL_CATALOG = REPO_ROOT / "model" / "catalog.yaml"
 # What each row records about the run that measured it: every standard column
 # but the row's key (GPU, backend) and the outlier check's flag.
 PROVENANCE = tuple(c for c in STANDARD_COLUMNS if c not in ("gpu_name", "backend", "verified"))
-METRICS = {
-    MetricFamily.COMPUTE: [f.name for f in fields(ComputeMetrics)],
-    MetricFamily.COMM: [f.name for f in fields(CommMetrics)],
-}
-# Bound values per statement when matching grid cells to rows; SQLite allows 32766.
-_SQL_VARIABLES = 30000
 
 
 class UnknownKind(LookupError):
@@ -118,10 +111,6 @@ def _peaks(spec: GpuSpecResolution, dtypes: list[str]) -> dict[str, dict]:
             "note": f"{spec.interconnect}, one direction",
         }
     return out
-
-
-def _quoted(columns: list[str]) -> str:
-    return ", ".join(f'"{c}"' for c in columns)
 
 
 def _git_commit() -> str | None:
@@ -249,7 +238,7 @@ class KernelLibrary:
         return [f.name for f in fields(self._specs(kind)[0].args_schema)]
 
     def _metrics(self, kind: str) -> list[str]:
-        return METRICS[self._specs(kind)[0].metric_family]
+        return kernel_data.METRICS[self._specs(kind)[0].metric_family]
 
     def _precision_column(self, kind: str) -> str | None:
         """The profile.db column holding the kernel's compute dtype, if it has one."""
@@ -742,51 +731,10 @@ class KernelLibrary:
             ]
 
     def _cell_rows(self, kind: str, config: RegisteredConfig) -> list[dict[str, dict]]:
-        """Per cell, the row each backend measured for it: ``{backend: row}``.
+        """Per cell, the row each backend measured for it: ``{backend: row}``."""
 
-        The same match as ``kernel_config.cell_row_ids`` (in SQL, so each column's
-        declared type converts what it compares), one statement per chunk of
-        cells instead of one per cell: the cells are a ``values`` table joined to
-        the kind's rows on the config's GPU."""
-
-        spec = next(s for s in self._specs(kind) if s.table_name == config.profile_kind)
-        table = Table(spec, self.sources.db_path)
-        args = list(table.args_columns)
-        keys = cell_keys(table, config.grid.cells)
-        metrics = ["backend", *self._metrics(kind), "is_outlier"]
-        out: list[dict[str, dict]] = [{} for _ in keys]
-        width = 2 + len(args)
-        chunk = max(1, (_SQL_VARIABLES - 2) // width)
-        cell_columns = _quoted(["_cell", "_hash", *args])
-        # Joining through the GPU's backends lets the (gpu_name, backend,
-        # args_hash) unique index answer each cell with one lookup per backend;
-        # the args columns then confirm the row.
-        backends = f'b(backend) as (select distinct backend from "{table.name}" where gpu_name = ?)'
-        on = " and ".join(
-            [
-                "t.gpu_name = ?",
-                "t.backend = b.backend",
-                't.args_hash = c."_hash"',
-                *(f't."{a}" = c."{a}"' for a in args),
-            ]
-        )
-        select = ", ".join(f't."{m}"' for m in metrics)
         with self.sources.connect() as conn:
-            for start in range(0, len(keys), chunk):
-                part = keys[start : start + chunk]
-                values = ", ".join([f"({', '.join('?' * width)})"] * len(part))
-                query = (
-                    f"with c({cell_columns}) as (values {values}), {backends} "
-                    f'select c."_cell", {select} from c cross join b join "{table.name}" t on {on}'
-                )
-                bound = [
-                    v for i, key in enumerate(part, start) for v in (i, table.args_hash(key), *key)
-                ]
-                gpu = config.gpu_name
-                for cell, *record in conn.execute(query, [*bound, gpu, gpu]):
-                    row = dict(zip(metrics, record))
-                    out[cell][row.pop("backend")] = row
-        return out
+            return kernel_data.cell_rows(conn, self.sources.db_path, kind, config)
 
     def _summaries(self, kind: str) -> list[dict]:
         """Each registered config of ``kind`` with its grid's fixed and swept
@@ -926,25 +874,9 @@ class KernelLibrary:
             for s in self._summaries(kind)
             if (s["config"].config_hash, s["config"].gpu_name) == (config_hash, config.gpu_name)
         ]
-        grid = config.grid
         metrics = self._metrics(kind)
-        points = [
-            {
-                "coords": list(grid.coords(i)),
-                "feasible": i not in grid.infeasible,
-                "args": cell,
-                "measured": {
-                    backend: {
-                        **{m: row[m] for m in metrics},
-                        "outlier": bool(row["is_outlier"]),
-                    }
-                    for backend, row in measured.items()
-                },
-            }
-            for i, (cell, measured) in enumerate(
-                zip(grid.cells, self._cell_rows(kind, config), strict=True)
-            )
-        ]
+        with self.sources.connect() as conn:
+            points = kernel_data.points(conn, self.sources.db_path, kind, config)
         uses = self._use_deployments(kind, config.uses, config.gpu_name)
         asked = {d["id"] for use in uses for d in use["deployments"]}
         return {

@@ -126,7 +126,7 @@ and, if its input reaches a leaf, one line in `slot_input.rs`. Full end-to-end
 procedure: skill `top-add-kernel`; the Rust timing/cache wiring alone is skill
 `impl-wire-kernel-to-rust`, and its cache-fidelity check is `impl-validate-kernel-cache`.
 
-Two optional `KernelSpec` hooks (default no-ops, but load-bearing when needed):
+Three optional `KernelSpec` hooks (default no-ops, but load-bearing when needed):
 
 - **`profile_kind()`** — the profiler facade / `profile.db` table the specs are
   profiled against (`get_{profile_kind}_times`); defaults to `KIND`. Override when
@@ -138,6 +138,16 @@ Two optional `KernelSpec` hooks (default no-ops, but load-bearing when needed):
   the cache drops + renormalizes instead of fabricating a value. `flashinfer_attn_prefill`
   is the shipped example: its `(A,B)` re-axis grid has an unreachable `A < B/2`
   corner that the mask strips.
+- **`off_grid()`** — how each backend answers an input past the profiled grid.
+  The default extends the cache's interpolant. `OffGrid::Rate` holds the nearest
+  grid point's achieved rate instead: the input's logical FLOPs (`RateWork::Flops`)
+  or bytes (`RateWork::Bytes`), counted as the backend's profiler counts them,
+  over that point's own. `OffGrid::Launches` splits an input the kernel runs as
+  independent sequential launches and sums them. Pick the rate that measured
+  flattest across the kernel's largest shapes; a missing grid point is never a
+  reason to reject a shape the production kernel runs. `dsa_sparse_mla_prefill`
+  (bandwidth) and `compressed_sparse_mla_prefill` (64-request launches, then
+  bandwidth) are the shipped examples.
 
 ## Cross-language identity (must stay equal)
 

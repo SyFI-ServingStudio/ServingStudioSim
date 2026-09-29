@@ -21,10 +21,10 @@ pub struct TokenCorpusConfig {
     pub schema_version: u32,
     /// Where this machine reads the payload: the manifest's `data_file`,
     /// absolute once [`Self::from_manifest`] resolves it. It locates the bytes
-    /// rather than naming them (the checksum and dimensions do), so an identity
-    /// leaves it out and a config means the same corpus on every machine; a
-    /// cost manifest keeps it, for `kernel-query` to rebuild the kernel here.
-    #[serde(default, skip_serializing_if = "locates_input")]
+    /// rather than naming them (the checksum and dimensions do), so it is never
+    /// written out: an identity, a cost manifest and a kernel-config record
+    /// mean the same corpus on every machine. Empty when nothing located it.
+    #[serde(default, skip_serializing)]
     pub data_file: String,
     pub num_tokens: usize,
     pub num_layers: usize,
@@ -53,10 +53,6 @@ pub struct TokenCorpusConfig {
     /// the active-group count the same way assuming balanced routing does.
     #[serde(default = "default_candidates")]
     pub sampling_candidates: u32,
-}
-
-fn locates_input(_: &String) -> bool {
-    crate::timing::dims::serializing_identity()
 }
 
 fn default_candidates() -> u32 {
@@ -107,6 +103,7 @@ impl TokenCorpusConfig {
         seed: u64,
         layers: std::ops::Range<usize>,
     ) -> Result<Self> {
+        let mut config = Self::read_manifest(path, group_size, seed, layers)?;
         let path = Path::new(path);
         // The manifest's own directory, canonicalized *without* resolving the
         // manifest itself. A hub snapshot links `snapshots/<sha>/manifest.json`
@@ -120,16 +117,30 @@ impl TokenCorpusConfig {
         }
         .canonicalize()
         .with_context(|| format!("locating token corpus manifest directory for {path:?}"))?;
-        let mut config: Self = serde_json::from_slice(
-            &std::fs::read(path)
-                .with_context(|| format!("reading token corpus manifest {path:?}"))?,
-        )
-        .context("parsing token corpus manifest")?;
         let data = base
             .join(&config.data_file)
             .canonicalize()
             .with_context(|| format!("locating token corpus data {:?}", config.data_file))?;
         config.data_file = data.to_string_lossy().into_owned();
+        Ok(config)
+    }
+
+    /// [`Self::from_manifest`] without locating the payload: `data_file` stays
+    /// as the manifest wrote it. Everything an identity names -- checksum,
+    /// dimensions, sampling parameters -- is in the manifest, so this is the
+    /// whole binding for a build that never reads the payload. The manifest is
+    /// read through `input_files`, so a host with no file system can supply it.
+    pub fn read_manifest(
+        path: &str,
+        group_size: u32,
+        seed: u64,
+        layers: std::ops::Range<usize>,
+    ) -> Result<Self> {
+        let path = Path::new(path);
+        let text = crate::common::input_files::read_to_string(path)
+            .with_context(|| format!("reading token corpus manifest {path:?}"))?;
+        let mut config: Self =
+            serde_json::from_str(&text).context("parsing token corpus manifest")?;
         config.group_size = group_size;
         config.seed = seed;
         config.layer_start = layers.start;
@@ -179,6 +190,12 @@ impl TokenCorpusConfig {
     /// rather than silently shifting every profiled shape.
     pub fn load(&self) -> Result<TokenCorpus> {
         self.validate()?;
+        ensure!(
+            !self.data_file.is_empty(),
+            "token corpus {:016x} has no payload located: a config bound from its manifest \
+             alone, or read back from JSON, names the corpus but not where its bytes are",
+            self.checksum_fnv1a64
+        );
         let bytes = std::fs::read(&self.data_file).context("reading token corpus data")?;
         let expected = self
             .num_tokens

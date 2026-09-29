@@ -316,6 +316,16 @@ config's configs with a dry-run (no GPU), for rows measured earlier, and
 `--register-supported-kernel-configs` those of every `#[supported]` deployment.
 Registration writes nothing when every config, source and use is known.
 
+A registered config's grid plus the rows measured at each cell is its *config
+document* (`profiling/db/kernel_data.py`): the identity, the grid axes, and per
+cell, row-major, its feasibility and each backend's metrics with an outlier flag.
+A simulator kernel-data bridge fits kernel caches from documents alone, without
+args or a corpus payload. The public kernel API serves them
+(`/kernels/{kind}/configs/{hash}`), the wasm simulator reads them, and
+`simulator kernel-query` `eval`/`eval_coords`/`peak` fetch them from here through
+`perf_api.get_config_document` (a config nothing registered fails there; the
+fidelity harness passes `"jit": true` to build through perf_api instead).
+
 ## Adding a kernel
 
 Normally one new file: `kernels/<kind>.py` declaring `KIND`, a frozen

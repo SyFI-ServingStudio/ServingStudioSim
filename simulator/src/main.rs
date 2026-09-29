@@ -105,6 +105,11 @@ struct PredictArgs {
     /// See [`CacheArgs::kernel_configs_out`].
     #[arg(long, value_name = "FILE")]
     kernel_configs_out: Option<PathBuf>,
+    /// Fit every kernel cache from these kernel API config documents (a JSON
+    /// array, or an object with `configs`) instead of profile.db: no Python
+    /// perf_api, no JIT; a config without a complete document fails the run.
+    #[arg(long, value_name = "FILE")]
+    kernel_data: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -248,7 +253,10 @@ fn main() -> anyhow::Result<()> {
             } else {
                 PredictMode::Run
             },
-            args.kernel_configs_out.as_deref(),
+            &simulator::timing_predict::PredictOutputs {
+                kernel_configs: args.kernel_configs_out.as_deref(),
+            },
+            args.kernel_data.as_deref(),
         ),
     }
 }

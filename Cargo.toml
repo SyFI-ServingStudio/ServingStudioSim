@@ -14,6 +14,7 @@ publish = false
 [[bin]]
 name = "simulator"
 path = "simulator/src/main.rs"
+required-features = ["python"]
 
 [lib]
 path = "simulator/src/lib.rs"
@@ -27,14 +28,16 @@ serde = { version = "1", features = ["derive", "rc"] }
 # IndexMap instead of the default BTreeMap). Needed so `list-params` emits the
 # `pool_fragments` block in declaration order (Model→Parallelism→Workload→Io),
 # which `list-params --human` prints verbatim as its group headings.
-serde_json = { version = "1", features = ["preserve_order"] }
+serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
 # Structured run-config input (YAML is a JSON superset → one loader path). Note:
 # serde_yaml is archived upstream but stable; it is the JSON-superset parser the
 # launcher writes configs for (L7 design).
 serde_yaml = "0.9"
 anyhow = "1"
 thiserror = "2"
-pyo3 = { version = "0.20", features = ["auto-initialize"] }
+# Optional so the timing-predict library can build for wasm32 with a replay
+# bridge (`PerfApiBridge::replay`) instead of Python perf_api. On by default.
+pyo3 = { version = "0.20", features = ["auto-initialize"], optional = true }
 
 # Complete input-file formats, typed row loaders, and orthogonal trace tags.
 # Shared with the replay client rather than reimplemented here -- a measured run
@@ -77,6 +80,10 @@ timing-kernel-derive = { path = "simulator/timing-kernel-derive" }
 schema-derive = { path = "simulator/schema-derive" }
 
 [features]
+default = ["python"]
+# The PyO3 bridge to Python `profiling.perf_api` (profile.db, JIT profiling).
+# Off for the wasm build, whose kernels fit from kernel API config documents.
+python = ["dep:pyo3"]
 # Turn on the dhat heap profiler (global allocator + JSON dump on exit).
 dhat-heap = ["dep:dhat"]
 
@@ -112,6 +119,15 @@ lto = true
 codegen-units = 1
 split-debuginfo = "off"
 
+# `wasm` builds the simulator's browser module (`just build-wasm`):
+# fat LTO and no debuginfo, since the download size is the cost that matters.
+[profile.wasm]
+inherits = "release"
+lto = true
+codegen-units = 1
+debug = false
+split-debuginfo = "off"
+
 # `profiling` is for trustworthy `perf` call-graphs: LTO off (no cross-crate
 # inlining to confuse the unwinder). Still optimized (inherits release
 # opt-level) so the profile stays representative. Frame pointers don't help
@@ -131,7 +147,7 @@ debug = true
 opt-level = 2
 
 [workspace]
-members = ["simulator/timing-kernel-derive", "simulator/schema-derive", "analyzer/rust"]
+members = ["simulator/timing-kernel-derive", "simulator/schema-derive", "analyzer/rust", "simulator/wasm"]
 # req-frontend declares its own workspace so it can also be built standalone.
 # Nested workspace roots are an error unless the outer one excludes them; the
 # path dependency above still resolves.

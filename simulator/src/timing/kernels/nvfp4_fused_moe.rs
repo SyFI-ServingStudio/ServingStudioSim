@@ -356,8 +356,8 @@ mod tests {
 
     #[test]
     fn a_corpus_that_moved_is_reported_rather_than_panicking_the_query() {
-        // `kernel-query` deserializes a config nothing built, so the file it
-        // names may be gone. `enumerate` cannot say so; this is where it is said.
+        // A config built here names where it read its corpus, and the file
+        // may be gone by the time something enumerates it. `enumerate` cannot say so; this is where it is said.
         let mut moved = config();
         moved.expert_demand = crate::timing::expert_demand::ExpertDemand::Corpus(
             crate::timing::token_corpus::TokenCorpusConfig {
@@ -409,11 +409,18 @@ mod tests {
         assert!(here.identity()["expert_demand"]["corpus"]
             .get("data_file")
             .is_none());
-        // A cost manifest keeps the path: `kernel-query` rebuilds the kernel from it.
+        // Nor does anything else written out, a cost manifest included: a
+        // config read back names the corpus, and says it located no payload.
         let described = serde_json::to_value(&here).unwrap();
-        assert_eq!(
-            described["expert_demand"]["corpus"]["data_file"],
-            Value::from("/raid/hf/hub/blobs/3bdb")
+        assert!(described["expert_demand"]["corpus"]
+            .get("data_file")
+            .is_none());
+        let back: Nvfp4FusedMoeKernelConfig = serde_json::from_value(described).unwrap();
+        assert_eq!(back.identity(), here.identity());
+        let error = Nvfp4FusedMoeSpec::validate_config(&back).expect_err("no payload located");
+        assert!(
+            format!("{error:#}").contains("no payload located"),
+            "{error:#}"
         );
     }
 

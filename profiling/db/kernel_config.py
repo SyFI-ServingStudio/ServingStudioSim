@@ -239,8 +239,10 @@ def registered_configs(
     profile_kind: str,
     *,
     gpu_name: str | None = None,
+    config_hash: str | None = None,
 ) -> list[RegisteredConfig]:
-    """Every registered config whose grid reads rows of ``profile_kind``."""
+    """Every registered config whose grid reads rows of ``profile_kind``
+    (on ``gpu_name``, with ``config_hash``, when given)."""
     if not _has_registry(conn):
         return []
     require_current(conn, "profile DB")
@@ -249,6 +251,9 @@ def registered_configs(
     if gpu_name is not None:
         where += " AND gpu_name = ?"
         values.append(gpu_name)
+    if config_hash is not None:
+        where += " AND config_hash = ?"
+        values.append(config_hash)
     rows = conn.execute(
         f"""
         SELECT kind, profile_kind, config_hash, gpu_name, identity, cache_coords, grid_axes,

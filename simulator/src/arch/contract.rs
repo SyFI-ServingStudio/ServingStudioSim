@@ -91,6 +91,12 @@ pub trait IterwiseUnifiedModel: Send + Sync + 'static {
         Ok(())
     }
 
+    /// The longest request context [`Self::check_input`] accepts, when the
+    /// model bounds it; `None` when it does not.
+    fn max_model_len(&self) -> Option<u32> {
+        None
+    }
+
     /// Per-iter cost of the whole iteration (embedding → layers → lm_head) via the
     /// compiled CostTree path: stream each leaf's [`LeafMetrics`] into `slots`
     /// (the caller's reused buffer — cleared + refilled to the manifest length),

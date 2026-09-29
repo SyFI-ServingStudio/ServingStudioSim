@@ -655,6 +655,11 @@ impl DeepseekV4AttentionLocalWorklet {
     }
 
     /// The reason [`Self::eval`] would reject `input`, if any.
+    /// The longest decode context [`Self::check_input`] accepts.
+    pub fn max_model_len(&self) -> u32 {
+        self.resolved.raw_cfg.max_model_len
+    }
+
     pub fn check_input(&self, input: &DeepseekV4AttentionLocalWorkletInput) -> Result<(), String> {
         normalize_input(input, &self.resolved.raw_cfg).map(|_| ())
     }

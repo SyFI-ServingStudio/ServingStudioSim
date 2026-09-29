@@ -120,6 +120,21 @@ impl ExpertDemand {
         Ok(Self::Corpus(config))
     }
 
+    /// [`Self::corpus`] from the manifest alone, for a build whose kernels are
+    /// fitted from config documents: it never folds a grid point, so it has no
+    /// use for the payload, and the manifest carries every field the kernel
+    /// identity names. A later [`Self::prepare`] on it fails, since the payload
+    /// was never located.
+    pub fn corpus_manifest(
+        manifest: &str,
+        group_size: u32,
+        layers: std::ops::Range<usize>,
+    ) -> anyhow::Result<Self> {
+        let mut config = TokenCorpusConfig::read_manifest(manifest, group_size, FOLD_SEED, layers)?;
+        config.data_file.clear();
+        Ok(Self::Corpus(config))
+    }
+
     /// Expert count this source produces histograms over, so a consumer can
     /// check it against the model without knowing which source it holds.
     pub fn num_experts(&self) -> usize {
@@ -346,7 +361,8 @@ fn parallel_by_cost<T: Send>(costs: &[u64], f: impl Fn(usize) -> T + Sync) -> Ve
         .map_or(1, usize::from)
         .min(MAX_SAMPLING_THREADS)
         .min(costs.len());
-    if threads <= 1 {
+    // A browser's wasm32 module cannot spawn threads.
+    if threads <= 1 || cfg!(target_family = "wasm") {
         return (0..costs.len()).map(f).collect();
     }
     let mut order: Vec<usize> = (0..costs.len()).collect();

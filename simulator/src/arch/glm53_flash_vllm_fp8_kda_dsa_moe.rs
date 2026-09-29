@@ -148,7 +148,7 @@ pub struct Glm53FlashModelCfg {
 
 impl Glm53FlashModelCfg {
     pub fn from_json(path: &Path) -> Result<Self> {
-        let text = std::fs::read_to_string(path)
+        let text = crate::common::input_files::read_to_string(path)
             .with_context(|| format!("reading GLM-5.3-Flash config {}", path.display()))?;
         let root: Value = serde_json::from_str(&text)
             .with_context(|| format!("parsing GLM-5.3-Flash config {}", path.display()))?;
@@ -1061,6 +1061,10 @@ impl Glm53FlashVllmModel {
 impl IterwiseUnifiedModel for Glm53FlashVllmModel {
     fn check_input(&self, batch: &UnifiedArchInput) -> Result<(), String> {
         normalize_input(batch, self.max_model_len).map(|_| ())
+    }
+
+    fn max_model_len(&self) -> Option<u32> {
+        Some(self.max_model_len)
     }
 
     fn total_kv_bytes_per_token(&self) -> u64 {

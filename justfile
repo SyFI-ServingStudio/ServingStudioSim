@@ -83,3 +83,77 @@ alignment-compare pack runs out="/tmp/alignment_metrics.json":
 # first: this is the only writer of tests/golden/alignment_<pack>/.
 alignment-record pack out="/tmp/alignment_metrics.json" *flags:
     uv run --no-sync python -m launcher alignment-campaign compare --pack {{pack}} --measured {{out}} --record {{flags}}
+
+# binaryen release `setup-wasm` installs and `build-wasm` requires.
+binaryen_version := "132"
+
+# Writes simulator_wasm.js, simulator_wasm_bg.wasm and version.json, which
+# ServingStudioIntro's build-predict-payload copies into its static site. Rebuild
+# after every simulator change: the site checks version.json's sim_commit against
+# the public API's. WASM_BINDGEN / WASM_OPT override the setup-wasm tools.
+# Build the simulator for a browser (simulator/wasm) into target/wasm-pkg/.
+build-wasm:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    tools="${WASM_TOOLS_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/servingstudio-wasm}"
+    want="$(sed -n 's/^wasm-bindgen = "=\(.*\)"$/\1/p' simulator/wasm/Cargo.toml)"
+    bindgen="${WASM_BINDGEN:-$tools/wasm-bindgen-$want/bin/wasm-bindgen}"
+    wasm_opt="${WASM_OPT:-$tools/binaryen-version_{{binaryen_version}}/bin/wasm-opt}"
+    for tool in "$bindgen" "$wasm_opt"; do
+        command -v "$tool" >/dev/null || { echo "$tool not found: run just setup-wasm" >&2; exit 1; }
+    done
+    have="$("$bindgen" --version | awk '{print $2}')"
+    [ "$have" = "$want" ] || { echo "wasm-bindgen-cli $have != crate's $want: run just setup-wasm" >&2; exit 1; }
+    "$wasm_opt" --version | grep -q "(version_{{binaryen_version}})" \
+        || { echo "$("$wasm_opt" --version) != binaryen version_{{binaryen_version}}: run just setup-wasm" >&2; exit 1; }
+    commit="$(git rev-parse HEAD)"
+    if ! git diff --quiet HEAD -- simulator Cargo.toml Cargo.lock; then commit="$commit-dirty"; fi
+    SERVINGSTUDIO_SIM_COMMIT="$commit" cargo build -p simulator-wasm --target wasm32-unknown-unknown --profile wasm
+    out=target/wasm-pkg
+    rm -rf "$out" && mkdir -p "$out"
+    "$bindgen" --target web --no-typescript --out-dir "$out" target/wasm32-unknown-unknown/wasm/simulator_wasm.wasm
+    "$wasm_opt" -Oz --enable-bulk-memory --enable-multivalue --enable-mutable-globals --enable-nontrapping-float-to-int --enable-reference-types --enable-sign-ext \
+        "$out/simulator_wasm_bg.wasm" -o "$out/simulator_wasm_bg.wasm"
+    printf '{"sim_commit": "%s", "kernel_data_format": %s}\n' "$commit" \
+        "$(sed -n 's/^pub const KERNEL_DATA_FORMAT: u32 = \([0-9]*\);$/\1/p' simulator/src/timing/bridge/kernel_data.rs)" > "$out/version.json"
+    ls -l "$out"
+
+# One directory every checkout shares (WASM_TOOLS_DIR, default
+# ~/.cache/servingstudio-wasm) holds the wasm32 target's tools: wasm-bindgen-cli
+# at the crate's wasm-bindgen pin and binaryen's wasm-opt at `binaryen_version`.
+# Rerun when either pin moves.
+# Install the pinned tools build-wasm uses.
+setup-wasm:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    tools="${WASM_TOOLS_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/servingstudio-wasm}"
+    rustup target add wasm32-unknown-unknown
+    want="$(sed -n 's/^wasm-bindgen = "=\(.*\)"$/\1/p' simulator/wasm/Cargo.toml)"
+    bindgen="$tools/wasm-bindgen-$want"
+    [ -x "$bindgen/bin/wasm-bindgen" ] \
+        || cargo install --locked --root "$bindgen" wasm-bindgen-cli --version "$want"
+    binaryen="$tools/binaryen-version_{{binaryen_version}}"
+    if [ ! -x "$binaryen/bin/wasm-opt" ]; then
+        case "$(uname -s)-$(uname -m)" in
+            Linux-x86_64) platform=x86_64-linux ;;
+            Linux-aarch64) platform=aarch64-linux ;;
+            Darwin-arm64) platform=arm64-macos ;;
+            Darwin-x86_64) platform=x86_64-macos ;;
+            *) echo "no binaryen release for $(uname -sm)" >&2; exit 1 ;;
+        esac
+        release="binaryen-version_{{binaryen_version}}"
+        url="https://github.com/WebAssembly/binaryen/releases/download/version_{{binaryen_version}}/$release-$platform.tar.gz"
+        tmp="$(mktemp -d)"
+        trap 'rm -rf "$tmp"' EXIT
+        curl -fsSL -o "$tmp/binaryen.tar.gz" "$url"
+        expected="$(curl -fsSL "$url.sha256" | awk '{print $1}')"
+        actual="$({ sha256sum || shasum -a 256; } < "$tmp/binaryen.tar.gz" 2>/dev/null | awk '{print $1}')"
+        [ "$actual" = "$expected" ] || { echo "$url: sha256 $actual != $expected" >&2; exit 1; }
+        tar xzf "$tmp/binaryen.tar.gz" -C "$tmp"
+        # wasm-opt is static on Linux; the macOS build links lib/libbinaryen.dylib.
+        mkdir -p "$binaryen/bin" "$binaryen/lib"
+        cp "$tmp/$release/bin/wasm-opt" "$binaryen/bin/"
+        cp "$tmp/$release"/lib/*.dylib "$binaryen/lib/" 2>/dev/null || true
+    fi
+    "$bindgen/bin/wasm-bindgen" --version
+    "$binaryen/bin/wasm-opt" --version

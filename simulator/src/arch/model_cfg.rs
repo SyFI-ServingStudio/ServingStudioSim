@@ -40,7 +40,7 @@ impl ModelCfg {
     /// `hidden_size / num_attention_heads` when absent; `kv_dtype` mirrors
     /// `torch_dtype`.
     pub fn from_json(path: &Path) -> Result<Self> {
-        let text = std::fs::read_to_string(path)
+        let text = crate::common::input_files::read_to_string(path)
             .with_context(|| format!("reading model config {}", path.display()))?;
         let raw: JsonModelConfig = serde_json::from_str(&text)
             .with_context(|| format!("parsing model config {}", path.display()))?;
