@@ -82,7 +82,7 @@ schema-derive = { path = "simulator/schema-derive" }
 [features]
 default = ["python"]
 # The PyO3 bridge to Python `profiling.perf_api` (profile.db, JIT profiling).
-# Off for the wasm build, which answers `get_times` from in-memory samples.
+# Off for the wasm build, whose kernels fit from kernel API config documents.
 python = ["dep:pyo3"]
 # Turn on the dhat heap profiler (global allocator + JSON dump on exit).
 dhat-heap = ["dep:dhat"]
@@ -119,7 +119,7 @@ lto = true
 codegen-units = 1
 split-debuginfo = "off"
 
-# `wasm` builds the browser timing-predict module (`just build-wasm`):
+# `wasm` builds the simulator's browser module (`just build-wasm`):
 # fat LTO and no debuginfo, since the download size is the cost that matters.
 [profile.wasm]
 inherits = "release"

@@ -152,7 +152,7 @@ def node() -> str:
     if path is None:
         pytest.skip("node not on PATH")
     if not (PKG_DIR / "simulator_wasm_bg.wasm").is_file():
-        pytest.skip("wasm module not built (just build-wasm)")
+        pytest.skip("wasm module not built (just setup-wasm, then just build-wasm)")
     return path
 
 

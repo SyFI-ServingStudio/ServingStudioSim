@@ -1,4 +1,4 @@
-// Run the browser timing-predict module (`just build-wasm`) under Node.
+// Run the timing predictor of the browser module (`just build-wasm`) under Node.
 //
 //   node tests/wasm/run_predict.mjs <pkg-dir> <input.json>
 //

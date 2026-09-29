@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license-file = "../../LICENSE"
 publish = false
-description = "timing-predict for a browser: wasm32, replay samples in place of profile.db"
+description = "The simulator for a browser: timing-predict on wasm32, from kernel API config documents"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
