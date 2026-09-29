@@ -731,14 +731,6 @@ def test_a_supported_row_is_one_deployment_with_its_value_list(supported) -> Non
     assert {s["config_hash"]: s["members"] for s in used["shapes"]} == {qkv: [0, 1], gate: [1]}
 
 
-def test_local_paths_in_a_config_identity_are_cut_to_file_names() -> None:
-    identity = {"expert_demand": {"corpus": {"data_file": "/raid/hf/hub/blobs/dfb7"}}, "n": 1}
-    assert library._without_local_paths(identity) == {
-        "expert_demand": {"corpus": {"data_file": "dfb7"}},
-        "n": 1,
-    }
-
-
 def test_public_responses_carry_no_source_paths(supported) -> None:
     client, (qkv, gate) = supported
     base = f"{PREFIX}/kernels/single_gemm"
@@ -761,7 +753,6 @@ def _popularity(share: int) -> dict:
 CORPUS = {
     "corpus": {
         "schema_version": 1,
-        "data_file": "/hub/models--o--corpora/blobs/f00d",
         "num_tokens": 64,
         "num_layers": 2,
         "num_experts": 4,

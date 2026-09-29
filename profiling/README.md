@@ -268,7 +268,7 @@ Metric columns are a table-level contract chosen by `metric_family`:
   (`message_size_bytes` is an **args/cache-key** column, not a measured result —
   the simulator derives moved bytes from `busbw × time`.)
 
-profile.db is tracked in git, so it stores each repeated value once (schema v3,
+profile.db is tracked in git, so it stores each repeated value once (schema v4,
 `profiling/db/storage.py`). A row's provenance — profiler git hash, CUDA, driver
 and backend versions — is a `run_key` into `_profile_run`; `profiler_run_at` and
 `created_at` are epoch seconds. Readers still get the v2 columns: `Table.rows_for`
@@ -280,16 +280,21 @@ SELECT t.*, r.profiler_git_hash, datetime(t.profiler_run_at, 'unixepoch')
 FROM single_gemm t JOIN _profile_run r USING (run_key)
 ```
 
-A DB an older checkout wrote (schema v2) is refused by readers until
+A DB an older checkout wrote (schema v2 or v3) is refused by readers until
 `python -m launcher kernel-profile migrate-db <path>` upgrades it in place; the
-upgrade keeps every row and id and then VACUUMs the file.
+upgrade keeps every row and id and then VACUUMs the file. v3 → v4 only rewrites
+registry identities: v3 kept a corpus-routed config's payload path
+(`expert_demand.corpus.data_file`, absolute on the machine that built it), so one
+corpus hashed differently per machine; v4 drops it, and configs two machines
+registered for one corpus become one.
 
 A row's args are one grid cell of one simulator kernel config, but the row does
 not say which. Tables starting with `_` (so they are not kind tables) record it,
 written by the builds that ask for the rows:
 
 - `_kernel_config`, keyed `(kind, config_hash, gpu_name)`: the Rust
-  `KernelConfig::identity` (no `gpu_name` or `backends`, `Dim` values only;
+  `KernelConfig::identity` (no `gpu_name` or `backends`, `Dim` values only, no
+  local file paths — a corpus is named by its checksum and dimensions;
   `config_hash` is the SHA-256 of its sorted-key JSON), the profile table, the
   cache coordinate names, the grid axes, and each cell's args without `backend`,
   stored by column as zlib-compressed JSON (list-valued args make cells the

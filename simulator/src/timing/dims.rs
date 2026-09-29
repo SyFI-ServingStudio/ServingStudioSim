@@ -303,9 +303,16 @@ pub fn values_only<T>(f: impl FnOnce() -> T) -> T {
     f()
 }
 
+/// Whether this thread is inside [`values_only`]: serializing an identity. A
+/// field that locates an input on this machine (not what the config is) leaves
+/// itself out then.
+pub fn serializing_identity() -> bool {
+    VALUES_ONLY.with(Cell::get)
+}
+
 impl Serialize for Dim {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        if VALUES_ONLY.with(Cell::get) {
+        if serializing_identity() {
             return s.serialize_u32(self.get());
         }
         let mut state = s.serialize_struct("Dim", 3)?;
