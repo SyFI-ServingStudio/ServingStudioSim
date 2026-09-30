@@ -106,7 +106,8 @@ impl IterationLabel {
 pub(super) struct RunLabels {
     pub(super) floors: FloorsByLevel,
     pub(super) workers: HashMap<(String, u16), WorkerComposition>,
-    pub(super) errors: HashMap<String, String>,
+    /// By level key, in order: the report lists one caveat per error.
+    pub(super) errors: BTreeMap<String, String>,
     /// Distinct shapes in the *sample* that was labeled.
     pub(super) batch_locked_unique_shapes: Option<usize>,
     /// Iterations the floors describe: the exact run total the sample is anchored to.
@@ -120,7 +121,7 @@ pub(super) struct RunLabels {
 
 struct ParsedLabels {
     labels: HashMap<String, IterationLabel>,
-    errors: HashMap<String, String>,
+    errors: BTreeMap<String, String>,
     composition_stats: HashMap<String, CompositionStats>,
 }
 
@@ -377,7 +378,7 @@ fn parse_labels(response: &Value) -> Result<ParsedLabels> {
         .and_then(Value::as_object)
         .context("labeler output missing `levels` object")?;
     let mut labels = HashMap::new();
-    let mut errors = HashMap::new();
+    let mut errors = BTreeMap::new();
     let mut composition_stats = HashMap::new();
     for (key, level) in levels {
         if let Some(error) = level.get("error").and_then(Value::as_str) {
