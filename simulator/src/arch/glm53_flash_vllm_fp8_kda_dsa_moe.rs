@@ -975,9 +975,18 @@ pub fn build(
     }
     let model_cfg = &cfg.model;
     let tp = u64::from(cfg.parallel.tp_size);
-    // Per rank and DSA layer: the fp8 MLA latent (no rope part) plus the kpool
+    // Per rank and DSA layer: the MLA latent (no rope part) plus the kpool
     // index cache, one 128-byte fp8 key and a 4-byte scale per 4-token pool.
-    let dsa_bytes_per_token = u64::from(model_cfg.kv_lora_rank)
+    // The latent is fp8 (1 byte/elem) on NVIDIA, but MI300X runs the rope-free
+    // Triton sparse-MLA kernel, which requires a non-fp8 cache, so its latent is
+    // bf16 (2 bytes/elem) -> ~1024 vs 512 bytes/token (decision #32). Additive
+    // and gpu-gated; B200 is unchanged.
+    let latent_bytes_per_elem = if is_mi300x(&cfg.parallel.gpu_name) {
+        u64::from(DType::Bf16.size_bytes())
+    } else {
+        u64::from(DType::Fp8E4m3.size_bytes())
+    };
+    let dsa_bytes_per_token = u64::from(model_cfg.kv_lora_rank) * latent_bytes_per_elem
         + u64::from(model_cfg.index_head_dim + 4) / u64::from(model_cfg.index_kpool);
     let total_kv_bytes_per_token = tp * u64::from(model_cfg.num_dsa_layers()) * dsa_bytes_per_token;
     let kda_layers = model_cfg.kda_layers.len() as u64;
