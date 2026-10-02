@@ -124,6 +124,12 @@ _DISPATCHES_PER_LAUNCH: int | None = 5
 # of aiter.fmoe_fp8_blockscale_g1u1 / QuantType per_1x128); the sorting/scatter
 # kernel is `aiter::opus_moe_sorting_entry<aiter::MoeSortingKernel<...>>`.
 _AITER_KERNEL_SUBSTR: str | None = "GridwiseMoeGemmBlockScale"
+# At small per-expert batch sizes AITER's fused_moe keeps control (its own
+# moe_sorting + per-group quant) but dispatches the 1-stage ASM block-scale
+# g1u1 GEMM (`aiter::fmoe_..._blockscaleFp8_g1u1_...`) rather than the CK
+# 2-stage `GridwiseMoeGemmBlockScale` realization. Both are the real AITER
+# fp8 block-scale MoE GEMM, so either one counts as "AITER ran".
+_AITER_ASM_GEMM_SUBSTR: str = "blockscaleFp8_g1u1"
 _SORTING_KERNEL_SUBSTR: str | None = "moe_sorting"
 # The Triton FP8-MoE kernel that MUST be absent (silent-fallback guard): the
 # `@triton.jit def fused_moe_kernel` in vLLM's fused_moe.py.
@@ -491,7 +497,7 @@ def _spec_from_args(args: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _assert_aiter_path(spec: dict[str, Any]) -> None:
+def _assert_aiter_path(spec: dict[str, Any]) -> int:
     """Prove AITER ran (and Triton did not) from the captured kernel-name set.
 
     A standalone rocprofv3 capture of the same launch driver, read for its kernel
@@ -527,15 +533,40 @@ def _assert_aiter_path(spec: dict[str, Any]) -> None:
         if not db_files:
             raise KernelLaunchFailed(f"{_BACKEND} path-assertion produced no rocpd database")
         names = [n for n in _captured_names(str(db_files[0])) if n]
-    has_aiter = any(_AITER_KERNEL_SUBSTR in n for n in names)
+    has_ck_gemm = any(_AITER_KERNEL_SUBSTR in n for n in names)
+    has_asm_gemm = any(_AITER_ASM_GEMM_SUBSTR in n for n in names)
+    has_aiter_gemm = has_ck_gemm or has_asm_gemm
     has_sorting = any(_SORTING_KERNEL_SUBSTR in n for n in names)
     has_triton = any(_TRITON_KERNEL_SUBSTR in n for n in names)
-    if not (has_aiter and has_sorting) or has_triton:
+    # AITER must own the call: its fused-MoE GEMM ran (CK 2-stage or ASM
+    # 1-stage) AND its sorting ran, and no Triton fused-MoE fallback leaked in.
+    if not (has_aiter_gemm and has_sorting) or has_triton:
         raise KernelLaunchFailed(
-            f"{_BACKEND} is NOT on the AITER path: aiter_gemm={has_aiter} "
-            f"aiter_sorting={has_sorting} triton_fallback={has_triton}. "
-            "Refusing to mislabel a Triton run as AITER."
+            f"{_BACKEND} is NOT on the AITER path: aiter_gemm={has_aiter_gemm} "
+            f"(ck={has_ck_gemm} asm={has_asm_gemm}) aiter_sorting={has_sorting} "
+            f"triton_fallback={has_triton}. Refusing to mislabel a non-AITER run as AITER."
         )
+    # Steady-state dispatches-per-launch D for the trailing-mean timing fold.
+    # CK 2-stage keeps the pinned D (path unchanged). The ASM 1-stage tiny-M
+    # path issues a different, smaller D (sorting + per-group quant + the single
+    # g1u1 GEMM); recover it from this capture, which is
+    #   [small one-time prefix] + (warmup+rep)*D,
+    # exact while the prefix is smaller than one sweep of launches.
+    if has_ck_gemm:
+        if _DISPATCHES_PER_LAUNCH is None:
+            raise ProfilerNotImplemented(
+                f"{_BACKEND}: CK per-launch dispatch count D not yet pinned (Q7)"
+            )
+        return int(_DISPATCHES_PER_LAUNCH)
+    launches = _WARMUP + _REP
+    d = len(names) // launches
+    prefix = len(names) - d * launches
+    if d < 1 or prefix >= launches:
+        raise KernelLaunchFailed(
+            f"{_BACKEND} ASM path: cannot recover dispatches-per-launch from "
+            f"{len(names)} dispatches over {launches} launches (d={d} prefix={prefix})."
+        )
+    return d
 
 
 def _logical_bytes(args: dict[str, Any]) -> int:
@@ -587,14 +618,11 @@ def profile_rocm_aiter_fp8_block_fused_moe(
         _check_correctness(torch, built, args)
 
         spec = _spec_from_args(args)
-        # Mandatory silent-fallback guard: prove AITER (not Triton) ran.
-        _assert_aiter_path(spec)
+        # Mandatory silent-fallback guard: prove AITER (not Triton) ran. Returns
+        # the steady-state dispatches-per-launch D for the timing fold (CK keeps
+        # the pinned D; the ASM 1-stage tiny-M path recovers its smaller D).
+        dispatches_per_launch = _assert_aiter_path(spec)
 
-        if _DISPATCHES_PER_LAUNCH is None:
-            raise ProfilerNotImplemented(
-                f"{_BACKEND}: per-launch dispatch count D not yet pinned (Q7); "
-                "read it off the first MI300X rocpd capture before timing"
-            )
         time_ms = measure_registered_via_rocprofv3(
             kind=_KIND,
             backend=_BACKEND,
@@ -602,7 +630,7 @@ def profile_rocm_aiter_fp8_block_fused_moe(
             kernel_name_contains=None,
             warmup=_WARMUP,
             rep=_REP,
-            dispatches_per_launch=_DISPATCHES_PER_LAUNCH,
+            dispatches_per_launch=dispatches_per_launch,
         )
     except ProfilerNotImplemented:
         raise
