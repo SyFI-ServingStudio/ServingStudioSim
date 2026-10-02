@@ -96,6 +96,30 @@ def _q_kv_rms_norm_torch_rocm_builder(spec: dict[str, Any]) -> dict[str, Any]:
     )
 
 
+def _rocm_aiter_fp8_block_fused_moe_builder(spec: dict[str, Any]) -> dict[str, Any]:
+    from profiling.runners.moe.rocm_aiter_fp8_block_fused_moe import (
+        build_rocm_aiter_fp8_block_fused_moe_kernel,
+    )
+
+    return build_rocm_aiter_fp8_block_fused_moe_kernel(
+        spec["num_tokens"],
+        spec["hidden_size"],
+        spec["intermediate_size"],
+        spec["num_experts"],
+        spec["num_local_experts"],
+        spec["top_k"],
+        spec["input_dtype"],
+        spec["weight_format"],
+        spec["group_size"],
+        spec["routing_method"],
+        spec["n_group"],
+        spec["topk_group"],
+        spec["routed_scaling_numerator"],
+        spec["routed_scaling_denominator"],
+        tuple(spec["per_expert_batches"]),
+    )
+
+
 # (kind, backend) -> builder returning at least {"torch", "kernel"}.
 _BUILDERS: dict[tuple[str, str], Callable[[dict[str, Any]], dict[str, Any]]] = {
     ("rms_norm", "torch_rocm"): _rms_norm_torch_rocm_builder,
@@ -104,6 +128,7 @@ _BUILDERS: dict[tuple[str, str], Callable[[dict[str, Any]], dict[str, Any]]] = {
     ("gdn_causal_conv_decode", "torch_rocm"): _gdn_causal_conv_decode_torch_rocm_builder,
     ("gdn_causal_conv_prefill", "torch_rocm"): _gdn_causal_conv_prefill_torch_rocm_builder,
     ("q_kv_rms_norm", "torch_rocm"): _q_kv_rms_norm_torch_rocm_builder,
+    ("nvfp4_fused_moe", "rocm_aiter_fp8_block"): _rocm_aiter_fp8_block_fused_moe_builder,
 }
 
 
