@@ -53,10 +53,18 @@ impl AllReduceFusionSpec {
     }
 
     /// Largest token count for which vLLM selects FlashInfer on B200.
+    ///
+    /// The cap formula (`max_fused_bytes(num_gpus) / bytes_per_token`) is
+    /// hardware-independent, so the grid is well-defined for any target; the
+    /// gate only records which GPUs this fusion has actually been profiled on.
+    /// TODO(mi300x-campaign): MI300X is wired as a documented placeholder here —
+    /// its real TP all-reduce is RCCL/aiter over Infinity Fabric, not FlashInfer
+    /// MNNVL, so the campaign must register the AMD all-reduce backend and its
+    /// true workspace cap and switch the MI300X path to it. B200 is unchanged.
     pub fn max_fused_tokens(config: &AllReduceFusionKernelConfig) -> u32 {
         assert!(
-            config.gpu_name.contains("B200"),
-            "all_reduce_fusion is currently profiled only on B200"
+            config.gpu_name.contains("B200") || config.gpu_name.contains("MI300"),
+            "all_reduce_fusion is currently profiled only on B200 and MI300X"
         );
         let bytes_per_token = u64::from(config.hidden_dim)
             .checked_mul(config.dtype.size_bytes() as u64)

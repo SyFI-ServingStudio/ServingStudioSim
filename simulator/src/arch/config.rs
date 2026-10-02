@@ -481,10 +481,15 @@ pub enum IterArchSel {
         #[param(cache_key)]
         token_corpus_file: Option<String>,
     },
-    /// GLM-5.3-Flash FP8 block checkpoint on B200 through the vLLM fork: 34 KDA
-    /// + 11 DSA (kpool indexer) layers, 3 dense + 42 MoE FFNs, 4-wide mHC. One
-    /// TP = EP rank group; MTP is not run.
-    #[supported(gpu = ["NVIDIA B200"], model_config = ["glm53_flash"], fp8 = [true], tp_size = [4], max_model_len = [8192, 65536, 131072, 262144, 524288])]
+    /// GLM-5.3-Flash FP8 block checkpoint through the vLLM fork: 34 KDA + 11 DSA
+    /// (kpool indexer) layers, 3 dense + 42 MoE FFNs, 4-wide mHC. One TP = EP
+    /// rank group; MTP is not run. Hardware is selected by the `gpu` key, which
+    /// is threaded into every kernel config and the all-reduce fabric: "NVIDIA
+    /// B200" (NVLink) or "MI300X" (8x MI300X, Infinity Fabric). The MI300X path
+    /// reuses the NVIDIA kernel-backend names as documented placeholders until
+    /// the MI300X profiling campaign registers the ROCm backends and fills
+    /// profile.db — see the `TODO(mi300x-campaign)` block in the arch file.
+    #[supported(gpu = ["NVIDIA B200", "MI300X"], model_config = ["glm53_flash"], fp8 = [true], tp_size = [4], max_model_len = [8192, 65536, 131072, 262144, 524288])]
     Glm53FlashVllmFp8KdaDsaMoe {
         #[serde(flatten)]
         model: ModelSpec,

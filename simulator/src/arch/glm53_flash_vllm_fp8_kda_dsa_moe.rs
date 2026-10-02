@@ -87,6 +87,56 @@ const SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: u32 = 256;
 /// bs 1-24, graph-padded) -> 1/0.9.
 const SHARED_EXPERTS_STREAM_OVERLAP: f32 = 0.9;
 
+/// The canonical `gpu/spec.json` name of the AMD MI300X target and its spec
+/// aliases. A `gpu_name` in this set drives the AMD fabric below; everything
+/// else keeps the NVIDIA defaults, so B200 stays byte-identical.
+const MI300X_GPU_NAMES: &[&str] = &["MI300X", "AMD MI300X", "MI300"];
+
+/// True when this arch is targeting an AMD MI300X (8x MI300X / `mi3008x`).
+fn is_mi300x(gpu_name: &str) -> bool {
+    MI300X_GPU_NAMES.contains(&gpu_name)
+}
+
+/// The intra-node all-reduce fabric for the target GPU. NVIDIA parts ride
+/// NVLink; MI300X rides AMD Infinity Fabric (xGMI), 896 GB/s bidirectional per
+/// `gpu/spec.json`'s MI300X `interconnect_bandwidth_gbps`. Defaulting to NVLink
+/// keeps every existing NVIDIA target byte-identical (additive).
+fn intra_node_fabric(gpu_name: &str) -> Fabric {
+    if is_mi300x(gpu_name) {
+        Fabric::InfinityFabric
+    } else {
+        Fabric::Nvlink
+    }
+}
+
+// ============================ L1 kernel-backend pins ========================
+//
+// Each `*_BACKENDS` constant names the profile.db backend key for one kernel
+// kind. These names are the NVIDIA/vLLM-fork backends measured on B200.
+//
+// TODO(mi300x-campaign): the MI300X path currently REUSES these NVIDIA names as
+// documented placeholders so the arch compiles and is selectable. They are NOT
+// the AMD kernels: Phase 0 found vLLM-ROCm dispatches the model differently
+// (separate aiter / ROCm-Triton launches, not the FlashInfer/TRT-LLM fusion).
+// The parallel MI300X profiling campaign OWNS the real AMD backend names; it
+// must, per kernel kind, either (a) register a ROCm backend under these same
+// names and fill MI300X rows, or (b) introduce new AMD backend names and switch
+// the MI300X path to them (e.g. gpu-conditional on `is_mi300x`). Until then,
+// `timing-predict` on MI300X stays red (no MI300X profile.db rows). The exact
+// pins the campaign must resolve, in priority order of iteration-time share:
+//   * FUSED_MOE_BACKENDS        — routed MoE (B200: flashinfer_trtllm_fp8_block_sm100)
+//   * SPARSE_ATTN_BACKENDS      — DSA sparse attention (B200: flashinfer_trtllm_fp8)
+//   * FP8_GEMM_BACKENDS         — dense/shared FP8 GEMM (B200: deepgemm)
+//   * MQA_LOGITS_BACKENDS /
+//     MQA_LOGITS_PREFILL_BACKENDS — indexer logits (B200: deepgemm_fp8)
+//   * FP8_QUANT_BACKENDS        — fp8 activation quant (B200: vllm_cuda)
+//   * KDA_BACKENDS / CONV_BACKENDS / QKV_NORM_BACKENDS / INDEX_REMAP_BACKENDS
+//                               — KDA + indexer Triton kernels (B200: vllm_triton)
+//   * ALL_REDUCE_BACKENDS       — TP all-reduce (B200: flashinfer_mnnvl; AMD is
+//                                 RCCL/aiter over Infinity Fabric, not MNNVL)
+//   * BF16_GEMM / ROUTER_GEMM / FP32_GEMM / MHC / RMS_NORM / Q_ABSORB /
+//     V_UP / TOPK / TOPK_PREFILL / MLA_APPEND / ELEMENTWISE — the remainder.
+// Everything NAME-INDEPENDENT (gpu_name, fabric) is already wired below.
 const BF16_GEMM_BACKENDS: &[&str] = &["torch_linear_vllm"];
 const FP8_GEMM_BACKENDS: &[&str] = &["deepgemm"];
 const FP8_QUANT_BACKENDS: &[&str] = &["vllm_cuda"];
@@ -501,7 +551,9 @@ pub fn build_configs(
             num_gpus: tp,
             hidden_dim: model.hidden,
             dtype: ACTIVATION_DTYPE,
-            fabric: Fabric::Nvlink,
+            // Name-independent hardware pin: NVLink for NVIDIA, Infinity Fabric
+            // for MI300X. B200 keeps `Fabric::Nvlink` unchanged.
+            fabric: intra_node_fabric(&gpu),
         },
         moe_input_glue: ew(hidden_bytes, hidden_bytes),
         moe_combine_glue: ew(2 * hidden_bytes, hidden_bytes),
@@ -1262,6 +1314,21 @@ mod tests {
             gpu_name: "NVIDIA B200".into(),
             cudagraph_capture_sizes: Vec::new(),
         }
+    }
+
+    #[test]
+    fn fabric_follows_the_target_gpu_and_b200_stays_nvlink() {
+        let demand = ExpertDemand::popularity(&RoutingDistribution::uniform(288), 42);
+        // B200 is unchanged.
+        let b200 = build_configs(&model_cfg(), &parallel(), &demand).unwrap();
+        assert_eq!(b200.all_reduce.fabric, Fabric::Nvlink);
+        // MI300X flips only the name-independent fabric pin.
+        let mut amd = parallel();
+        amd.gpu_name = "MI300X".into();
+        let mi300x = build_configs(&model_cfg(), &amd, &demand).unwrap();
+        assert_eq!(mi300x.all_reduce.fabric, Fabric::InfinityFabric);
+        assert_eq!(mi300x.all_reduce.gpu_name, "MI300X");
+        assert!(is_mi300x("AMD MI300X") && !is_mi300x("NVIDIA B200"));
     }
 
     #[test]
