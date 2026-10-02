@@ -418,18 +418,19 @@ def measure_registered_via_rocprofv3(
     burst would corrupt), the caller passes the known ``D`` and this folds only
     the *trailing* ``rep`` launches: the last ``rep*D`` dispatches, which are all
     steady-state. That skips the leading device-init + autotune-burst prefix
-    whatever its size. It requires ``kernel_name_contains=None`` and is mutually
-    exclusive with ``fold_per_launch``.
+    whatever its size. It is mutually exclusive with ``fold_per_launch``. It may
+    be paired with ``kernel_name_contains``, in which case ``D`` is the number of
+    *matching* dispatches per launch (e.g. ``D=1`` for a call whose single named
+    Triton kernel ``@autotune``s on the first launch): the trailing fold then
+    isolates the ``rep`` steady-state launches of that kernel past the autotune
+    burst, which shares the kernel's name and so would otherwise inflate the
+    front-dropping mean.
     """
     if fold_per_launch and kernel_name_contains is not None:
         raise ValueError("fold_per_launch counts every dispatch; kernel_name_contains must be None")
     if dispatches_per_launch is not None:
         if fold_per_launch:
             raise ValueError("dispatches_per_launch and fold_per_launch are mutually exclusive")
-        if kernel_name_contains is not None:
-            raise ValueError(
-                "dispatches_per_launch counts every dispatch; kernel_name_contains must be None"
-            )
         if dispatches_per_launch < 1:
             raise ValueError("dispatches_per_launch must be >= 1")
 

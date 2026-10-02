@@ -122,3 +122,38 @@ register(
         subprocess_env="vllm_env",
     )
 )
+
+
+# The AMD/ROCm path. GLM-5.3-Flash's glm5next plugin imports causal_conv1d_update
+# straight from the generic mamba ops with no is_rocm()/aiter branch (common/
+# kda.py:554), so the ROCm decode conv is the SAME Triton kernel as the NVIDIA
+# vllm_triton backend, only built for CDNA3. Measured on MI300X in the
+# vllm_rocm_env image, timed kernel-only via rocprofv3 filtered to
+# _causal_conv1d_update_kernel. NVIDIA rows are untouched.
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="torch_rocm",
+        supports=BackendSupport(
+            compute=frozenset({DType.BF16}),
+            gpus=frozenset({"MI300X"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name=("profiling.runners.attention.gdn_causal_conv_decode_torch_rocm"),
+            function_name="profile_gdn_causal_conv_decode_torch_rocm",
+        ),
+        table_name=KIND,
+        args_schema=GdnCausalConvDecodeArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="vllm_rocm_env",
+        doc=BackendDoc(
+            summary=(
+                "AMD/ROCm: vLLM's generic Triton causal_conv1d_update "
+                "(_causal_conv1d_update_kernel) on CDNA3, the same fused "
+                "convolution, SiLU and in-place state update as the NVIDIA path."
+            ),
+            url="https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/mamba/ops/causal_conv1d.py",
+        ),
+    )
+)

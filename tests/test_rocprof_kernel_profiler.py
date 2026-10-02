@@ -331,20 +331,17 @@ def test_measure_registered_rejects_dispatches_per_launch_with_fold():
         )
 
 
-def test_measure_registered_rejects_dispatches_per_launch_with_name_filter():
-    # dispatches_per_launch counts every dispatch; a name filter would contradict it.
-    from profiling.profilers.rocprof_kernel_profiler import measure_registered_via_rocprofv3
+def test_fold_trailing_mean_with_d_one_takes_last_rep_matches():
+    # A single named kernel per call that autotunes on the first launch: the
+    # autotune burst shares the kernel's name, so dropping from the front would
+    # count benchmarked configs as real calls. D=1 trailing fold takes the last
+    # rep matching dispatches, past the burst.
+    from profiling.profilers.rocprof_kernel_profiler import _fold_trailing_mean
 
-    with pytest.raises(ValueError):
-        measure_registered_via_rocprofv3(
-            kind="kda_chunk_prefill",
-            backend="torch_rocm",
-            spec={},
-            kernel_name_contains="something",
-            warmup=1,
-            rep=1,
-            dispatches_per_launch=15,
-        )
+    autotune_and_warmup = [7.0] * 11  # benchmarked configs + warmup, same name
+    steady = [0.5, 0.5, 0.5]  # three real calls
+    got = _fold_trailing_mean(autotune_and_warmup + steady, rep=3, per_launch=1)
+    assert got == pytest.approx(0.5)
 
 
 def test_rocprof_run_builder_registry_has_kda_chunk_prefill():

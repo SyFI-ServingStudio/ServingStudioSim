@@ -53,11 +53,42 @@ def _kda_chunk_prefill_torch_rocm_builder(spec: dict[str, Any]) -> dict[str, Any
     )
 
 
+def _gdn_causal_conv_decode_torch_rocm_builder(spec: dict[str, Any]) -> dict[str, Any]:
+    from profiling.runners.attention.gdn_causal_conv_decode_torch_rocm import (
+        build_gdn_causal_conv_decode_kernel,
+    )
+
+    return build_gdn_causal_conv_decode_kernel(
+        spec["batch_size"],
+        spec["channels"],
+        spec["kernel_size"],
+        spec["dtype"],
+        spec["state_dtype"],
+    )
+
+
+def _gdn_causal_conv_prefill_torch_rocm_builder(spec: dict[str, Any]) -> dict[str, Any]:
+    from profiling.runners.attention.gdn_causal_conv_prefill_torch_rocm import (
+        build_gdn_causal_conv_prefill_kernel,
+    )
+
+    return build_gdn_causal_conv_prefill_kernel(
+        spec["batch_size"],
+        spec["sequence_length"],
+        spec["channels"],
+        spec["kernel_size"],
+        spec["dtype"],
+        spec["state_dtype"],
+    )
+
+
 # (kind, backend) -> builder returning at least {"torch", "kernel"}.
 _BUILDERS: dict[tuple[str, str], Callable[[dict[str, Any]], dict[str, Any]]] = {
     ("rms_norm", "torch_rocm"): _rms_norm_torch_rocm_builder,
     ("kda_recurrent_decode", "torch_rocm"): _kda_recurrent_decode_torch_rocm_builder,
     ("kda_chunk_prefill", "torch_rocm"): _kda_chunk_prefill_torch_rocm_builder,
+    ("gdn_causal_conv_decode", "torch_rocm"): _gdn_causal_conv_decode_torch_rocm_builder,
+    ("gdn_causal_conv_prefill", "torch_rocm"): _gdn_causal_conv_prefill_torch_rocm_builder,
 }
 
 
