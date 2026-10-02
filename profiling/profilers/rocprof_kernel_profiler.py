@@ -383,6 +383,7 @@ def measure_registered_via_rocprofv3(
     kernel_name_contains: str | None,
     warmup: int,
     rep: int,
+    fold_per_launch: bool = False,
 ) -> float:
     """Measure a registered kernel's per-launch ms via a whole-process rocprofv3 capture.
 
@@ -395,7 +396,20 @@ def measure_registered_via_rocprofv3(
     launches, and returns the mean of the remaining ``rep`` kernel-dispatch
     durations. This runs inside the ROCm image where the worker already executes,
     so no nested container is involved.
+
+    ``fold_per_launch`` handles a compound call that launches several GPU
+    dispatches per logical launch (e.g. KDA's four input copies plus the
+    recurrent kernel). The driver must then build its operands so setup emits no
+    kernel dispatches (host tensors moved to the device with ``.to()``), so the
+    only dispatches captured are the ``warmup + rep`` launches' own, a constant
+    ``D`` per launch. The per-launch time is the sum of that launch's ``D``
+    dispatches (matching the CUPTI path's ``kernel_name=None`` per-launch sum),
+    and the returned value is the mean over the ``rep`` launches after the
+    ``warmup`` ones are dropped. ``kernel_name_contains`` must be ``None`` in this
+    mode, since every one of the call's dispatches is counted.
     """
+    if fold_per_launch and kernel_name_contains is not None:
+        raise ValueError("fold_per_launch counts every dispatch; kernel_name_contains must be None")
 
     rocprofv3 = _find_rocprofv3()
     with tempfile.TemporaryDirectory(prefix="vibesim-rocprof-") as tmp:
@@ -442,6 +456,8 @@ def measure_registered_via_rocprofv3(
         durations_ms = kernel_dispatch_durations_from_rocpd(
             str(db_files[0]), kernel_name_contains=kernel_name_contains
         )
+    if fold_per_launch:
+        return _fold_per_launch_mean(durations_ms, warmup=warmup, rep=rep)
     if len(durations_ms) < warmup + 1:
         raise KernelLaunchFailed(
             f"captured {len(durations_ms)} '{kernel_name_contains}' dispatches, "
@@ -449,6 +465,33 @@ def measure_registered_via_rocprofv3(
         )
     measured = durations_ms[warmup:]
     return fmean(measured)
+
+
+def _fold_per_launch_mean(durations_ms: list[float], *, warmup: int, rep: int) -> float:
+    """Mean per-launch ms when each launch issues a constant ``D`` dispatches.
+
+    The trace holds ``(warmup + rep) * D`` dispatches and nothing else (the driver
+    builds operands without launching kernels). ``D`` is recovered by division;
+    the trailing ``rep * D`` dispatches are the timed launches, folded into ``rep``
+    groups of ``D`` and summed per group. A count that is not a clean multiple of
+    ``warmup + rep`` means an unexpected dispatch leaked in (stray setup kernel or
+    autotune), so this raises rather than guess a split -- no fabricated number.
+    """
+    launches = warmup + rep
+    total = len(durations_ms)
+    if launches <= 0 or total == 0:
+        raise KernelLaunchFailed("rocprofv3 captured no dispatches to fold")
+    if total % launches != 0:
+        raise KernelLaunchFailed(
+            f"captured {total} dispatches, not a multiple of warmup+rep={launches}; "
+            "cannot resolve a constant per-launch dispatch count (stray setup or "
+            "autotune dispatches leaked into the trace)"
+        )
+    per_launch = total // launches
+    measured = durations_ms[warmup * per_launch :]
+    return fmean(
+        [sum(measured[i * per_launch : (i + 1) * per_launch]) for i in range(rep)]
+    )
 
 
 def profile_kernel(

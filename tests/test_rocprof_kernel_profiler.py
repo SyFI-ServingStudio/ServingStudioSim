@@ -250,6 +250,49 @@ def test_rocprof_run_builder_registry_has_rms_norm():
     assert ("rms_norm", "torch_rocm") in rr._BUILDERS
 
 
+def test_rocprof_run_builder_registry_has_kda_recurrent_decode():
+    # The KDA decode torch_rocm backend must be driveable under rocprofv3.
+    import profiling.profilers.rocprof_run as rr
+
+    assert ("kda_recurrent_decode", "torch_rocm") in rr._BUILDERS
+
+
+def test_fold_per_launch_mean_sums_constant_dispatches():
+    # 3 dispatches per launch, warmup=2, rep=3 -> 15 dispatches. The 6 warmup
+    # dispatches are dropped; each timed launch's 3 dispatches are summed.
+    from profiling.profilers.rocprof_kernel_profiler import _fold_per_launch_mean
+
+    warmup_block = [9.0] * 6  # dropped
+    timed = [1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 1.0, 2.0, 3.0]  # three launches of 6.0 ms
+    assert _fold_per_launch_mean(warmup_block + timed, warmup=2, rep=3) == pytest.approx(6.0)
+
+
+def test_fold_per_launch_mean_rejects_non_multiple():
+    # A count that is not (warmup+rep)*D means a stray dispatch leaked in; refuse
+    # to guess a split rather than report a fabricated number.
+    from profiling.profilers.rocprof_kernel_profiler import _fold_per_launch_mean
+    from profiling.runners.exceptions import KernelLaunchFailed
+
+    with pytest.raises(KernelLaunchFailed):
+        _fold_per_launch_mean([1.0] * 16, warmup=2, rep=3)  # 16 not divisible by 5
+
+
+def test_measure_registered_rejects_fold_with_name_filter():
+    # fold_per_launch counts every dispatch; a name filter would contradict it.
+    from profiling.profilers.rocprof_kernel_profiler import measure_registered_via_rocprofv3
+
+    with pytest.raises(ValueError):
+        measure_registered_via_rocprofv3(
+            kind="kda_recurrent_decode",
+            backend="torch_rocm",
+            spec={},
+            kernel_name_contains="something",
+            warmup=1,
+            rep=1,
+            fold_per_launch=True,
+        )
+
+
 def test_rocprof_run_import_does_not_eager_import_torch():
     # Importing the driver must not pull in torch (built lazily per spec).
     command = [
