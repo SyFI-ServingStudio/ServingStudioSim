@@ -202,16 +202,22 @@ const BATCHED_GEMM_BACKENDS_MI300X: &[&str] = &["torch_rocm"];
 // kinds route onto as the MI300X campaign proceeds. B200 keeps `triton`.
 const ELEMENTWISE_BACKENDS_MI300X: &[&str] = &["torch_rocm"];
 
-// Elementwise byte-placeholder floor pins (GLM-5.3-Flash MI300X port, decision
-// #37 "mechanism B"). Each of these kinds carries a negligible predicted share
-// of iteration time (Phase-4 ranking, decision #38) and has no MI300X-native
-// backend yet, so on MI300X its cost is floored onto the measured `elementwise`
-// torch_rocm byte-mover via a per-kind `elementwise_floor` backend registered in
-// `profiling/kernels/<kind>.py` (`gpus={MI300X}`, compute-agnostic). The pin is
-// what makes the arch SELECT that backend on MI300X so a real `timing-predict`
-// resolves the kind instead of rejecting its NVIDIA-only default. B200 and every
-// other NVIDIA target keep the constant above, so they stay byte-identical. When
-// the campaign measures a real ROCm backend for one of these, swap its pin here.
+// Analytic memory-roofline floor pins (GLM-5.3-Flash MI300X port, decision #37
+// "mechanism B", converted to closed-form by decision #49). Each of these kinds
+// carries a negligible predicted share of iteration time (Phase-4 ranking,
+// decision #38) and has no MI300X-native backend yet, so on MI300X its cost is a
+// closed-form memory roofline over the kind's HBM byte footprint
+// (t = launch_latency + (read+write bytes) / effective MI300X HBM bandwidth),
+// via a per-kind `elementwise_floor` backend registered in
+// `profiling/kernels/<kind>.py` (`gpus={MI300X}`, compute-agnostic). It is
+// DERIVED, not timed: no per-cell allocation and no rocprofv3, so a cell whose
+// footprint exceeds 192 GB HBM (e.g. the DSA prefill indexer logits) yields a
+// finite time instead of OOM-ing, like the `rocm_fabric_roofline` all-reduce. The
+// pin is what makes the arch SELECT that backend on MI300X so a real
+// `timing-predict` resolves the kind instead of rejecting its NVIDIA-only
+// default. B200 and every other NVIDIA target keep the constant above, so they
+// stay byte-identical. When the campaign measures a real ROCm backend for one of
+// these, swap its pin here.
 const FP8_QUANT_BACKENDS_MI300X: &[&str] = &["elementwise_floor"];
 const FP32_GEMM_BACKENDS_MI300X: &[&str] = &["elementwise_floor"];
 const ROUTER_GEMM_BACKENDS_MI300X: &[&str] = &["elementwise_floor"];
