@@ -291,6 +291,69 @@ def test_fold_per_launch_mean_rejects_too_few_dispatches():
         _fold_per_launch_mean([1.0] * 3, warmup=2, rep=3)  # 3 < 5 launches
 
 
+def test_fold_trailing_mean_skips_variable_autotune_prefix():
+    # A call whose kernels autotune on the first launch carries a large, variable
+    # leading burst (device init + benchmarked configs). With D=3, rep=3 the last
+    # rep*D=9 dispatches are the steady-state launches; the prefix drops whatever
+    # its size, and each trailing launch's 3 dispatches are summed.
+    from profiling.profilers.rocprof_kernel_profiler import _fold_trailing_mean
+
+    autotune_burst = [50.0] * 37  # arbitrary, variable; must not be counted
+    timed = [1.0, 2.0, 3.0] * 3  # three launches of 6.0 ms
+    got = _fold_trailing_mean(autotune_burst + timed, rep=3, per_launch=3)
+    assert got == pytest.approx(6.0)
+
+
+def test_fold_trailing_mean_rejects_too_few_dispatches():
+    # Fewer than rep*D dispatches means D is wrong or the autotuner never warmed;
+    # refuse to guess rather than report a fabricated number.
+    from profiling.profilers.rocprof_kernel_profiler import _fold_trailing_mean
+    from profiling.runners.exceptions import KernelLaunchFailed
+
+    with pytest.raises(KernelLaunchFailed):
+        _fold_trailing_mean([1.0] * 5, rep=3, per_launch=3)  # need 9, have 5
+
+
+def test_measure_registered_rejects_dispatches_per_launch_with_fold():
+    # The two fold modes are mutually exclusive.
+    from profiling.profilers.rocprof_kernel_profiler import measure_registered_via_rocprofv3
+
+    with pytest.raises(ValueError):
+        measure_registered_via_rocprofv3(
+            kind="kda_chunk_prefill",
+            backend="torch_rocm",
+            spec={},
+            kernel_name_contains=None,
+            warmup=1,
+            rep=1,
+            fold_per_launch=True,
+            dispatches_per_launch=15,
+        )
+
+
+def test_measure_registered_rejects_dispatches_per_launch_with_name_filter():
+    # dispatches_per_launch counts every dispatch; a name filter would contradict it.
+    from profiling.profilers.rocprof_kernel_profiler import measure_registered_via_rocprofv3
+
+    with pytest.raises(ValueError):
+        measure_registered_via_rocprofv3(
+            kind="kda_chunk_prefill",
+            backend="torch_rocm",
+            spec={},
+            kernel_name_contains="something",
+            warmup=1,
+            rep=1,
+            dispatches_per_launch=15,
+        )
+
+
+def test_rocprof_run_builder_registry_has_kda_chunk_prefill():
+    # The KDA chunked-prefill torch_rocm backend must be driveable under rocprofv3.
+    import profiling.profilers.rocprof_run as rr
+
+    assert ("kda_chunk_prefill", "torch_rocm") in rr._BUILDERS
+
+
 def test_measure_registered_rejects_fold_with_name_filter():
     # fold_per_launch counts every dispatch; a name filter would contradict it.
     from profiling.profilers.rocprof_kernel_profiler import measure_registered_via_rocprofv3

@@ -384,6 +384,7 @@ def measure_registered_via_rocprofv3(
     warmup: int,
     rep: int,
     fold_per_launch: bool = False,
+    dispatches_per_launch: int | None = None,
 ) -> float:
     """Measure a registered kernel's per-launch ms via a whole-process rocprofv3 capture.
 
@@ -407,9 +408,30 @@ def measure_registered_via_rocprofv3(
     and the returned value is the mean over the ``rep`` launches after the
     ``warmup`` ones are dropped. ``kernel_name_contains`` must be ``None`` in this
     mode, since every one of the call's dispatches is counted.
+
+    ``dispatches_per_launch`` is the autotune-robust variant of ``fold_per_launch``
+    for a compound call whose kernels ``@autotune`` on the first launch (e.g. KDA
+    chunked prefill's FLA chunk kernels). The autotuner benchmarks candidate
+    configs on that first call -- a variable burst of extra dispatches -- then
+    caches its winner in-process, so every later launch issues a constant ``D``
+    dispatches. Rather than recover ``D`` by dividing the whole stream (which the
+    burst would corrupt), the caller passes the known ``D`` and this folds only
+    the *trailing* ``rep`` launches: the last ``rep*D`` dispatches, which are all
+    steady-state. That skips the leading device-init + autotune-burst prefix
+    whatever its size. It requires ``kernel_name_contains=None`` and is mutually
+    exclusive with ``fold_per_launch``.
     """
     if fold_per_launch and kernel_name_contains is not None:
         raise ValueError("fold_per_launch counts every dispatch; kernel_name_contains must be None")
+    if dispatches_per_launch is not None:
+        if fold_per_launch:
+            raise ValueError("dispatches_per_launch and fold_per_launch are mutually exclusive")
+        if kernel_name_contains is not None:
+            raise ValueError(
+                "dispatches_per_launch counts every dispatch; kernel_name_contains must be None"
+            )
+        if dispatches_per_launch < 1:
+            raise ValueError("dispatches_per_launch must be >= 1")
 
     rocprofv3 = _find_rocprofv3()
     with tempfile.TemporaryDirectory(prefix="vibesim-rocprof-") as tmp:
@@ -456,6 +478,8 @@ def measure_registered_via_rocprofv3(
         durations_ms = kernel_dispatch_durations_from_rocpd(
             str(db_files[0]), kernel_name_contains=kernel_name_contains
         )
+    if dispatches_per_launch is not None:
+        return _fold_trailing_mean(durations_ms, rep=rep, per_launch=dispatches_per_launch)
     if fold_per_launch:
         return _fold_per_launch_mean(durations_ms, warmup=warmup, rep=rep)
     if len(durations_ms) < warmup + 1:
@@ -497,6 +521,35 @@ def _fold_per_launch_mean(durations_ms: list[float], *, warmup: int, rep: int) -
     measured = uniform[warmup * per_launch :]
     return fmean(
         [sum(measured[i * per_launch : (i + 1) * per_launch]) for i in range(rep)]
+    )
+
+
+def _fold_trailing_mean(durations_ms: list[float], *, rep: int, per_launch: int) -> float:
+    """Mean per-launch ms over the trailing ``rep`` launches of a constant-``D`` call.
+
+    For a compound call whose kernels ``@autotune`` on their first launch, the
+    stream is ``[device-init + autotune burst] + ... + rep * D`` with a leading
+    prefix of unknown, variable size. The trailing ``rep`` launches are always
+    steady-state (the autotuner has cached its winner by then), so the last
+    ``rep * D`` dispatches are exactly those launches. Fold them into ``rep``
+    groups of ``D`` and sum each group, matching the CUPTI path's
+    ``kernel_name=None`` per-launch sum. A capture with fewer than ``rep * D``
+    dispatches is an honest failure (``D`` wrong or the autotuner never warmed),
+    not a guessed split.
+    """
+    need = rep * per_launch
+    total = len(durations_ms)
+    if rep <= 0 or total == 0:
+        raise KernelLaunchFailed("rocprofv3 captured no dispatches to fold")
+    if total < need:
+        raise KernelLaunchFailed(
+            f"captured {total} dispatches, need at least rep*dispatches_per_launch="
+            f"{rep}*{per_launch}={need}; dispatches_per_launch may be wrong or the "
+            "autotuner never warmed"
+        )
+    tail = durations_ms[total - need :]
+    return fmean(
+        [sum(tail[i * per_launch : (i + 1) * per_launch]) for i in range(rep)]
     )
 
 
