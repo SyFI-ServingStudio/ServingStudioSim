@@ -132,10 +132,13 @@ register(
 # "mechanism B"): this kind carries a negligible predicted share of iteration
 # time and has no MI300X-native backend yet, so instead of leaving it pinned to
 # an NVIDIA-only backend -- which a real MI300X ``timing-predict`` rejects at
-# ``BackendSupport.allows`` -- its MI300X cost is floored onto the *measured*
-# ``elementwise`` ``torch_rocm`` byte-mover: the runner derives this kind's
-# memory-bound byte footprint from its shape args and times that many bytes
-# (``profiling.runners.elementwise.floor``). MI300X-gated and compute-agnostic,
+# ``BackendSupport.allows`` -- its MI300X cost is a closed-form analytic memory
+# roofline (decision #49): the runner derives this kind's memory-bound byte
+# footprint from its shape args and converts it to a time arithmetically,
+# t = launch_latency + (read+write bytes) / effective MI300X HBM bandwidth
+# (``profiling.runners.elementwise.floor``) -- no allocation, no rocprofv3, so a
+# cell whose footprint exceeds 192 GB HBM yields a finite time instead of OOM.
+# MI300X-gated and compute-agnostic,
 # so every NVIDIA target -- B200 included -- stays byte-identical.
 register(
     KernelProfilerSpec(
@@ -153,10 +156,10 @@ register(
         subprocess_env="vllm_rocm_env",
         doc=BackendDoc(
             summary=(
-                "Elementwise byte-placeholder floor: times the measured MI300X "
-                "``elementwise`` ``torch_rocm`` byte-mover for this kind's "
-                "shape-derived memory-bound footprint. A negligible-share floor "
-                "for the GLM-5.3-Flash MI300X port, not a native kernel."
+                "Analytic memory-roofline floor: t = launch_latency + "
+                "(read+write bytes) / effective MI300X HBM bandwidth, over this "
+                "kind's shape-derived footprint. A derived negligible-share floor "
+                "for the GLM-5.3-Flash MI300X port, not a measured native kernel."
             ),
         ),
     )
