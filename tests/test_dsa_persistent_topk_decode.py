@@ -33,6 +33,8 @@ from profiling.runners.exceptions import KernelLaunchFailed, ProfilerNotImplemen
 _TORCH_BACKEND = "torch"
 _NATIVE_BACKEND = "vllm_cuda"
 _FORK_BACKEND = "vllm_fork_cuda"
+# MI300X elementwise byte-placeholder floor (GLM-5.3-Flash port, decision #37).
+_FLOOR_BACKEND = "elementwise_floor"
 _BASE_SPEC = {
     "batch_size": 16,
     "context_len": 8192,
@@ -82,7 +84,7 @@ def test_registration_support_policy_and_facades() -> None:
     assert KIND == "dsa_persistent_topk_decode"
     # The fork build is its own backend; tests/test_dsa_persistent_topk_decode_fork.py
     # covers its registration.
-    assert known_backends(KIND) == [_TORCH_BACKEND, _NATIVE_BACKEND, _FORK_BACKEND]
+    assert known_backends(KIND) == [_TORCH_BACKEND, _NATIVE_BACKEND, _FORK_BACKEND, _FLOOR_BACKEND]
     for spec in (torch_spec, native_spec):
         assert spec.kernel_kind == spec.table_name == KIND
         assert spec.args_schema is DsaPersistentTopkDecodeArgs

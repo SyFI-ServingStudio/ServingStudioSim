@@ -148,3 +148,38 @@ register(
         ),
     )
 )
+
+
+# MI300X elementwise byte-placeholder floor (GLM-5.3-Flash port, decision #37
+# "mechanism B"): this kind carries a negligible predicted share of iteration
+# time and has no MI300X-native backend yet, so instead of leaving it pinned to
+# an NVIDIA-only backend -- which a real MI300X ``timing-predict`` rejects at
+# ``BackendSupport.allows`` -- its MI300X cost is floored onto the *measured*
+# ``elementwise`` ``torch_rocm`` byte-mover: the runner derives this kind's
+# memory-bound byte footprint from its shape args and times that many bytes
+# (``profiling.runners.elementwise.floor``). MI300X-gated and compute-agnostic,
+# so every NVIDIA target -- B200 included -- stays byte-identical.
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="elementwise_floor",
+        supports=BackendSupport(compute=None, gpus=frozenset({"MI300X"})),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.elementwise.floor",
+            function_name="profile_mla_cache_append_floor",
+        ),
+        table_name=KIND,
+        args_schema=MlaCacheAppendArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="vllm_rocm_env",
+        doc=BackendDoc(
+            summary=(
+                "Elementwise byte-placeholder floor: times the measured MI300X "
+                "``elementwise`` ``torch_rocm`` byte-mover for this kind's "
+                "shape-derived memory-bound footprint. A negligible-share floor "
+                "for the GLM-5.3-Flash MI300X port, not a native kernel."
+            ),
+        ),
+    )
+)

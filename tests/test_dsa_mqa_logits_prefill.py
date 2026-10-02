@@ -27,6 +27,8 @@ from profiling.runners.exceptions import KernelLaunchFailed, ProfilerNotImplemen
 
 _BACKEND = "torch"
 _DEEPGEMM_BACKEND = "deepgemm_fp8"
+# MI300X elementwise byte-placeholder floor (GLM-5.3-Flash port, decision #37).
+_FLOOR_BACKEND = "elementwise_floor"
 _BASE_SPEC = {
     "num_queries": 16,
     "num_keys": 4096,
@@ -79,7 +81,7 @@ def test_registration_support_and_facades():
     spec = find_kernel_profiler_spec(KIND, _BACKEND)
 
     assert KIND == "dsa_mqa_logits_prefill"
-    assert known_backends(KIND) == [_BACKEND, _DEEPGEMM_BACKEND]
+    assert known_backends(KIND) == [_BACKEND, _DEEPGEMM_BACKEND, _FLOOR_BACKEND]
     assert spec.kernel_kind == spec.table_name == KIND
     assert spec.args_schema is DsaMqaLogitsPrefillArgs
     assert spec.metric_family is MetricFamily.COMPUTE
