@@ -234,6 +234,27 @@ const MHC_BACKENDS_MI300X: &[&str] = &["elementwise_floor"];
 // not a compute floor; B200 keeps the NVIDIA `flashinfer_mnnvl` above.
 const ALL_REDUCE_BACKENDS_MI300X: &[&str] = &["rocm_fabric_roofline"];
 
+// Sparse-MLA attention (`dsa_sparse_mla_attention`) latent coordinate. The
+// backend pin above (SPARSE_ATTN_BACKENDS*) chooses the kernel; this coordinate
+// must match what that backend's `_validate` accepts, for BOTH the prefill and
+// decode leaves of the `glm53_kpool_sparse_mla` op.
+//
+// B200's `flashinfer_trtllm_fp8` is fp8 by construction: an fp8 query against an
+// fp8 paged latent (`hnd_paged_mqa_fp8_latent`, 512 B/token). MI300X's
+// `rocm_triton_mla_sparse` is BF16 by construction: its `_validate` (via
+// `_rocm_triton_mla_sparse_common`) pins q, cache and output to BF16 and the
+// layout to `token_major_mqa_bf16_latent`, a rope-free 512-wide BF16 latent
+// (1024 B/token). The cache dtype also sizes the MLA cache-append byte floor, so
+// pinning it to BF16 keeps the whole MI300X sparse-MLA path internally
+// consistent at the bf16 latent size. output_dtype is BF16 on both and is not
+// gated. B200 keeps the fp8 coordinate below, so it stays byte-identical.
+const SPARSE_MLA_Q_DTYPE: DType = DType::Fp8E4m3;
+const SPARSE_MLA_Q_DTYPE_MI300X: DType = DType::Bf16;
+const SPARSE_MLA_CACHE_DTYPE: DType = DType::Fp8E4m3;
+const SPARSE_MLA_CACHE_DTYPE_MI300X: DType = DType::Bf16;
+const SPARSE_MLA_CACHE_LAYOUT: &str = "hnd_paged_mqa_fp8_latent";
+const SPARSE_MLA_CACHE_LAYOUT_MI300X: &str = "token_major_mqa_bf16_latent";
+
 /// Pick the MI300X backend list for an MI300X target, else the default
 /// (NVIDIA) list. Additive and gpu-gated — the same shape as
 /// `intra_node_fabric`, so no NVIDIA path changes.
@@ -246,6 +267,26 @@ fn pin_mi300x(
         mi300x.to_vec()
     } else {
         default.to_vec()
+    }
+}
+
+/// `pin_mi300x` for a scalar `DType` coordinate field (e.g. the sparse-MLA
+/// query/cache dtype). Gpu-gated and additive; B200 keeps `default`.
+fn pin_mi300x_dtype(gpu_name: &str, mi300x: DType, default: DType) -> DType {
+    if is_mi300x(gpu_name) {
+        mi300x
+    } else {
+        default
+    }
+}
+
+/// `pin_mi300x` for a static-string coordinate field (e.g. the sparse-MLA cache
+/// layout). Gpu-gated and additive; B200 keeps `default`.
+fn pin_mi300x_str(gpu_name: &str, mi300x: &'static str, default: &'static str) -> &'static str {
+    if is_mi300x(gpu_name) {
+        mi300x
+    } else {
+        default
     }
 }
 
@@ -593,6 +634,17 @@ pub fn build_configs(
             max_model_len: parallel.max_model_len,
             cache_block_size: CACHE_BLOCK_SIZE,
             rms_eps: model.rms_norm_eps,
+            sparse_mla_q_dtype: pin_mi300x_dtype(&gpu, SPARSE_MLA_Q_DTYPE_MI300X, SPARSE_MLA_Q_DTYPE),
+            sparse_mla_cache_dtype: pin_mi300x_dtype(
+                &gpu,
+                SPARSE_MLA_CACHE_DTYPE_MI300X,
+                SPARSE_MLA_CACHE_DTYPE,
+            ),
+            sparse_mla_cache_layout: pin_mi300x_str(
+                &gpu,
+                SPARSE_MLA_CACHE_LAYOUT_MI300X,
+                SPARSE_MLA_CACHE_LAYOUT,
+            ),
             gpu_name: gpu.clone(),
             bf16_gemm_backends: pin_mi300x(&gpu, BF16_GEMM_BACKENDS_MI300X, BF16_GEMM_BACKENDS),
             fp32_gemm_backends: pin_mi300x(&gpu, FP32_GEMM_BACKENDS_MI300X, FP32_GEMM_BACKENDS),
