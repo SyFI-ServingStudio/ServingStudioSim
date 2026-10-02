@@ -53,7 +53,7 @@ def _validate(**kwargs: Any) -> Any:
         expected_num_heads=None,
         expected_rope_dim=common.ROPE_HEAD_DIM,
         expected_cache_layout=common.CACHE_LAYOUT,
-        allowed_selected_k=frozenset({common.SELECTED_K}),
+        allowed_selected_k=common.ALLOWED_SELECTED_K,
         **kwargs,
     )
 

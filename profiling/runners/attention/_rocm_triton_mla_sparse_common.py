@@ -55,14 +55,28 @@ from profiling.runners.exceptions import ProfilerNotImplemented
 
 # The rope-free MLA geometry GLM-5.3-Flash uses on ROCm: a 512-wide BF16 latent
 # carrying the whole head (no separate RoPE part), value width 512, one MQA KV
-# head, selected_k 2048 (index_topk). These are the coordinate the MI300X arch
-# branch composes; they must line up with the kind's reused args struct.
+# head. These are the coordinate the MI300X arch branch composes; they must line
+# up with the kind's reused args struct.
+#
+# selected_k is the width of the sparse page table the attention call indexes
+# into. It is NOT the raw index top-k: the model's index_topk is 2048, but vLLM
+# allocates a kpool buffer round_up(index_topk + index_kpool - 1, 128) wide, so
+# with index_kpool=4 the page table is round_up(2051, 128) = 2176. The arch
+# (simulator/src/arch/glm53_flash_vllm_fp8_kda_dsa_moe.rs `SELECTED_K`) composes
+# the 2176 page-table width, so that is what the sweep grid enumerates. We accept
+# both the raw 2048 (index_topk, used by other DSA layouts) and the 2176 kpool
+# page-table width, matching the B200 runner's `_TRTLLM_FP8_NOPE_SELECTED_K`. The
+# padded width only sizes the host-side -1-padded index buffer; the Triton ragged
+# kernel consumes the packed valid indices, so a wider table adds padding, not a
+# tile constraint.
 HEAD_DIM = 512
 NOPE_HEAD_DIM = 512
 ROPE_HEAD_DIM = 0
 VALUE_DIM = 512
 NUM_KV_HEADS = 1
+# Raw index top-k, kept for provenance; `ALLOWED_SELECTED_K` is what validators use.
 SELECTED_K = 2048
+ALLOWED_SELECTED_K = frozenset({2048, 2176})
 SOFTMAX_SCALE = 0.0625
 # A rope-free latent-only cache row; distinct from the B200 fp8 layouts and from
 # the H200 BF16 latent+rope layout, so a MI300X row never collides with them.

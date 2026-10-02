@@ -80,19 +80,28 @@ def _validate(
     cache_layout: str,
 ) -> tuple[tuple[tuple[int, int], ...], tuple[int, ...]]:
     pairs = _normalize_pairs(query_context_pairs)
-    identity = (num_heads, num_kv_heads, selected_k, latent_dim, rope_dim, value_dim)
+    # selected_k is checked against the allowed page-table widths separately: the
+    # arch composes the 2176 kpool page-table width while 2048 is the raw
+    # index_topk, so both are valid coordinates (see common.ALLOWED_SELECTED_K).
+    identity = (num_heads, num_kv_heads, latent_dim, rope_dim, value_dim)
     expected = (
         num_heads,
         common.NUM_KV_HEADS,
-        common.SELECTED_K,
         common.NOPE_HEAD_DIM,
         common.ROPE_HEAD_DIM,
         common.VALUE_DIM,
     )
-    if num_heads not in _SUPPORTED_NUM_HEADS or identity[1:] != expected[1:]:
+    if (
+        num_heads not in _SUPPORTED_NUM_HEADS
+        or selected_k not in common.ALLOWED_SELECTED_K
+        or identity[1:] != expected[1:]
+    ):
         raise ProfilerNotImplemented(
-            f"{_FULL} requires model identity {expected} (num_heads in "
-            f"{sorted(_SUPPORTED_NUM_HEADS)}), got {identity}"
+            f"{_FULL} requires model identity num_heads in "
+            f"{sorted(_SUPPORTED_NUM_HEADS)}, selected_k in "
+            f"{sorted(common.ALLOWED_SELECTED_K)}, and "
+            f"(num_kv_heads, latent_dim, rope_dim, value_dim)={expected[1:]}, "
+            f"got num_heads={num_heads}, selected_k={selected_k}, rest={identity[1:]}"
         )
     if type(softmax_scale) not in {int, float} or isinstance(softmax_scale, bool):
         raise TypeError("softmax_scale must be a real number")
