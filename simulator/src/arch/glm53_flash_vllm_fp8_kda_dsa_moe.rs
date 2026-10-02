@@ -138,14 +138,16 @@ fn intra_node_fabric(gpu_name: &str) -> Fabric {
 // pinned to its `elementwise_floor` backend via a `*_BACKENDS_MI300X` constant
 // below; see those constants and `profiling/runners/elementwise/floor.py`.
 //
-// TODO(mi300x-campaign): one kind still REUSES its NVIDIA name on MI300X:
-//   * ALL_REDUCE_BACKENDS  — TP all-reduce: a multi-GPU COMM collective, so it
-//     is NOT floorable onto the single-GPU `elementwise` byte-mover (metric
-//     family mismatch). It needs a real AMD RCCL/aiter backend
-//     (`AiterCustomAllreduce.custom_all_reduce` over Infinity Fabric, a separate
-//     Tier-A kernel, not MNNVL). The fabric pin below is already MI300X-correct;
-//     only the backend string remains NVIDIA until that kernel is measured.
-// Everything NAME-INDEPENDENT (gpu_name, fabric) is already wired below.
+// The TP all-reduce (ALL_REDUCE_BACKENDS, the `all_reduce_fusion` kind) is a
+// multi-GPU COMM collective, so it is NOT floorable onto the single-GPU
+// `elementwise` byte-mover (metric-family mismatch). vLLM-ROCm runs an RCCL /
+// aiter custom all-reduce over Infinity Fabric, not FlashInfer MNNVL (NVLink
+// multicast only), and a MEASURED RCCL all-reduce needs a 4+ GPU Infinity-Fabric
+// group. So on MI300X this kind resolves to `rocm_fabric_roofline`: an analytic
+// ring all-reduce roofline derived from the Infinity-Fabric bandwidth
+// (`profiling/runners/comm/fabric_roofline.py`, decision #42), a COMM-family
+// backend (not a compute floor). The fabric pin below already selects Infinity
+// Fabric; the backend pin selects the roofline. B200 keeps flashinfer_mnnvl.
 const BF16_GEMM_BACKENDS: &[&str] = &["torch_linear_vllm"];
 const FP8_GEMM_BACKENDS: &[&str] = &["deepgemm"];
 const FP8_QUANT_BACKENDS: &[&str] = &["vllm_cuda"];
@@ -220,6 +222,11 @@ const TOPK_PREFILL_BACKENDS_MI300X: &[&str] = &["elementwise_floor"];
 const MLA_APPEND_BACKENDS_MI300X: &[&str] = &["elementwise_floor"];
 const INDEX_REMAP_BACKENDS_MI300X: &[&str] = &["elementwise_floor"];
 const MHC_BACKENDS_MI300X: &[&str] = &["elementwise_floor"];
+// TP all-reduce on MI300X: the analytic Infinity-Fabric ring roofline, a
+// COMM-family backend derived from the fabric bandwidth (decision #42,
+// `profiling/runners/comm/fabric_roofline.py`). Not a measured multi-GPU row and
+// not a compute floor; B200 keeps the NVIDIA `flashinfer_mnnvl` above.
+const ALL_REDUCE_BACKENDS_MI300X: &[&str] = &["rocm_fabric_roofline"];
 
 /// Pick the MI300X backend list for an MI300X target, else the default
 /// (NVIDIA) list. Additive and gpu-gated — the same shape as
@@ -631,7 +638,7 @@ pub fn build_configs(
             hidden_dtype: ACTIVATION_DTYPE,
         },
         all_reduce: AllReduceFusionKernelConfig {
-            backends: ALL_REDUCE_BACKENDS.to_vec(),
+            backends: pin_mi300x(&gpu, ALL_REDUCE_BACKENDS_MI300X, ALL_REDUCE_BACKENDS),
             gpu_name: gpu.clone(),
             num_gpus: tp,
             hidden_dim: model.hidden,
@@ -1420,12 +1427,16 @@ mod tests {
         // B200 is unchanged.
         let b200 = build_configs(&model_cfg(), &parallel(), &demand).unwrap();
         assert_eq!(b200.all_reduce.fabric, Fabric::Nvlink);
-        // MI300X flips only the name-independent fabric pin.
+        // B200 keeps the NVIDIA-only MNNVL all-reduce backend.
+        assert_eq!(b200.all_reduce.backends, vec!["flashinfer_mnnvl"]);
+        // MI300X flips the name-independent fabric pin and the backend pin: the
+        // analytic Infinity-Fabric roofline instead of NVIDIA-only MNNVL.
         let mut amd = parallel();
         amd.gpu_name = "MI300X".into();
         let mi300x = build_configs(&model_cfg(), &amd, &demand).unwrap();
         assert_eq!(mi300x.all_reduce.fabric, Fabric::InfinityFabric);
         assert_eq!(mi300x.all_reduce.gpu_name, "MI300X");
+        assert_eq!(mi300x.all_reduce.backends, vec!["rocm_fabric_roofline"]);
         assert!(is_mi300x("AMD MI300X") && !is_mi300x("NVIDIA B200"));
     }
 

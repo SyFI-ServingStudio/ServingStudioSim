@@ -57,10 +57,12 @@ impl AllReduceFusionSpec {
     /// The cap formula (`max_fused_bytes(num_gpus) / bytes_per_token`) is
     /// hardware-independent, so the grid is well-defined for any target; the
     /// gate only records which GPUs this fusion has actually been profiled on.
-    /// TODO(mi300x-campaign): MI300X is wired as a documented placeholder here —
-    /// its real TP all-reduce is RCCL/aiter over Infinity Fabric, not FlashInfer
-    /// MNNVL, so the campaign must register the AMD all-reduce backend and its
-    /// true workspace cap and switch the MI300X path to it. B200 is unchanged.
+    /// On MI300X the backend is `rocm_fabric_roofline`, the analytic
+    /// Infinity-Fabric ring all-reduce (`profiling/runners/comm/fabric_roofline.py`,
+    /// decision #42), not FlashInfer MNNVL. That roofline is linear in num_tokens,
+    /// so this FlashInfer-derived cap only bounds the sweep's upper token count;
+    /// `Cache1DLinear` interpolates within it and extrapolates linearly above,
+    /// which is exact for the roofline. B200 is unchanged.
     pub fn max_fused_tokens(config: &AllReduceFusionKernelConfig) -> u32 {
         assert!(
             config.gpu_name.contains("B200") || config.gpu_name.contains("MI300"),
