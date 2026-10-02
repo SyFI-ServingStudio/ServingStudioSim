@@ -267,14 +267,28 @@ def test_fold_per_launch_mean_sums_constant_dispatches():
     assert _fold_per_launch_mean(warmup_block + timed, warmup=2, rep=3) == pytest.approx(6.0)
 
 
-def test_fold_per_launch_mean_rejects_non_multiple():
-    # A count that is not (warmup+rep)*D means a stray dispatch leaked in; refuse
-    # to guess a split rather than report a fabricated number.
+def test_fold_per_launch_mean_drops_one_time_init_prefix():
+    # Real captures carry a small fixed prefix of device-init dispatches before
+    # the first launch (seen: 4 on the MI300X image). With D=5, warmup=5, rep=20,
+    # a 129-dispatch stream is prefix(4) + 125 uniform; the four prefix and the
+    # 25 warmup dispatches drop, and each timed launch's 5 dispatches are summed.
+    from profiling.profilers.rocprof_kernel_profiler import _fold_per_launch_mean
+
+    prefix = [99.0] * 4
+    launch = [1.0, 1.0, 1.0, 1.0, 1.0]  # each launch sums to 5.0 ms
+    stream = prefix + launch * 25  # 4 + 125 = 129
+    assert len(stream) == 129
+    assert _fold_per_launch_mean(stream, warmup=5, rep=20) == pytest.approx(5.0)
+
+
+def test_fold_per_launch_mean_rejects_too_few_dispatches():
+    # Fewer dispatches than launches means no clean per-launch count; refuse to
+    # guess rather than report a fabricated number.
     from profiling.profilers.rocprof_kernel_profiler import _fold_per_launch_mean
     from profiling.runners.exceptions import KernelLaunchFailed
 
     with pytest.raises(KernelLaunchFailed):
-        _fold_per_launch_mean([1.0] * 16, warmup=2, rep=3)  # 16 not divisible by 5
+        _fold_per_launch_mean([1.0] * 3, warmup=2, rep=3)  # 3 < 5 launches
 
 
 def test_measure_registered_rejects_fold_with_name_filter():

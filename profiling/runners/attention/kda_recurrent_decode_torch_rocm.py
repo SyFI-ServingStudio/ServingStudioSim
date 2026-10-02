@@ -35,7 +35,6 @@ import importlib
 from typing import Any
 
 from profiling.db.args import DType
-from profiling.runners.attention._gdn_common import require_supported_gpu
 from profiling.runners.attention.kda_recurrent_decode_vllm_triton import (
     LOWER_BOUND,
     OUTPUT_RMSE_RATIO_TOL,
@@ -59,8 +58,10 @@ _KIND = "kda_recurrent_decode"
 # here; the NVIDIA backend uses the parallel ``nvidia`` subtree.
 _MODULE = "vllm.models.glm5next.amd.ops.third_party.kda"
 _CALLABLE = "fused_recurrent_kda"
-# gpu/spec.json canonical SKU + the names torch's ROCm build reports for it.
-_SUPPORTED_GPUS = frozenset({"MI300X", "AMD MI300X", "AMD Instinct MI300X"})
+# torch's ROCm build reports MI300X as some "...MI300X..." marketing string
+# ("AMD Instinct MI300X" on the pinned image); match the SKU token rather than
+# an exact name so an OAM/VF suffix does not spuriously reject the verified GPU.
+_GPU_SKU_TOKEN = "MI300X"
 _WARMUP = 5
 _REP = 20
 
@@ -100,6 +101,37 @@ def build_kda_recurrent_decode_kernel(
         "warmup": _WARMUP,
         "rep": _REP,
     }
+
+
+def _device_name(torch: Any) -> str:
+    try:
+        return str(torch.cuda.get_device_name(torch.cuda.current_device()))
+    except Exception:
+        return ""
+
+
+def _device_arch(torch: Any) -> str:
+    # torch's ROCm build exposes the CDNA ISA as gcnArchName (e.g. "gfx942" for
+    # the MI300 series). Under ROCR_VISIBLE_DEVICES pinning get_device_name can
+    # return an empty string, so the arch is the reliable identity fallback.
+    try:
+        return str(getattr(torch.cuda.get_device_properties(0), "gcnArchName", ""))
+    except Exception:
+        return ""
+
+
+def _is_mi300_series(torch: Any) -> bool:
+    import os
+
+    name = _device_name(torch)
+    if _GPU_SKU_TOKEN in name:
+        return True
+    # On this image torch masks the device name under ROCR_VISIBLE_DEVICES; the
+    # CDNA3 ISA (gfx942) is the reliable fallback, and the caller may also pass
+    # the authoritative rocminfo Marketing Name through VIBESIM_OBSERVED_GPU.
+    if _device_arch(torch).split(":")[0] == "gfx942":
+        return True
+    return _GPU_SKU_TOKEN in os.environ.get("VIBESIM_OBSERVED_GPU", "")
 
 
 def _load_amd_callable(torch: Any) -> Any:
@@ -245,7 +277,15 @@ def profile_kda_recurrent_decode_torch_rocm(
     except ImportError as exc:
         raise ProfilerNotImplemented(f"PyTorch is required for {_BACKEND}") from exc
     try:
-        require_supported_gpu(torch, backend=_BACKEND, supported_gpus=_SUPPORTED_GPUS)
+        if not torch.cuda.is_available():
+            raise ProfilerNotImplemented(f"a ROCm device is required for {_BACKEND}")
+        if getattr(torch.version, "hip", None) is None:
+            raise ProfilerNotImplemented(f"{_BACKEND} requires a ROCm (HIP) torch build")
+        if not _is_mi300_series(torch):
+            raise ProfilerNotImplemented(
+                f"{_BACKEND} is verified only on {_GPU_SKU_TOKEN} (CDNA3 gfx942), got "
+                f"name={_device_name(torch)!r} arch={_device_arch(torch)!r}"
+            )
         from profiling.profilers.rocprof_kernel_profiler import measure_registered_via_rocprofv3
 
         built = build_kda_recurrent_decode_kernel(batch_size, num_heads, head_dim, dtype)

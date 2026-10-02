@@ -470,25 +470,31 @@ def measure_registered_via_rocprofv3(
 def _fold_per_launch_mean(durations_ms: list[float], *, warmup: int, rep: int) -> float:
     """Mean per-launch ms when each launch issues a constant ``D`` dispatches.
 
-    The trace holds ``(warmup + rep) * D`` dispatches and nothing else (the driver
-    builds operands without launching kernels). ``D`` is recovered by division;
-    the trailing ``rep * D`` dispatches are the timed launches, folded into ``rep``
-    groups of ``D`` and summed per group. A count that is not a clean multiple of
-    ``warmup + rep`` means an unexpected dispatch leaked in (stray setup kernel or
-    autotune), so this raises rather than guess a split -- no fabricated number.
+    The call launches a fixed ``D`` dispatches (e.g. KDA's four input copies plus
+    the recurrent kernel), repeated ``warmup + rep`` times. A real capture also
+    carries a small fixed prefix of one-time device-init dispatches before the
+    first launch (seen: 4 on the pinned MI300X image), so the stream is
+    ``[prefix] + (warmup + rep) * D``. ``D`` is recovered as ``total //
+    (warmup + rep)``, which is exact as long as the prefix is smaller than one
+    sweep of launches (``prefix < warmup + rep``); the leading ``prefix``
+    dispatches are then dropped, the ``warmup`` launches after them dropped, and
+    the trailing ``rep`` launches folded into groups of ``D`` and summed per group
+    (matching the CUPTI path's ``kernel_name=None`` per-launch sum). A ``D < 1``
+    (fewer dispatches than launches) is an honest failure, not a guessed split.
     """
     launches = warmup + rep
     total = len(durations_ms)
     if launches <= 0 or total == 0:
         raise KernelLaunchFailed("rocprofv3 captured no dispatches to fold")
-    if total % launches != 0:
-        raise KernelLaunchFailed(
-            f"captured {total} dispatches, not a multiple of warmup+rep={launches}; "
-            "cannot resolve a constant per-launch dispatch count (stray setup or "
-            "autotune dispatches leaked into the trace)"
-        )
     per_launch = total // launches
-    measured = durations_ms[warmup * per_launch :]
+    if per_launch < 1:
+        raise KernelLaunchFailed(
+            f"captured {total} dispatches for {launches} launches (warmup={warmup}, "
+            f"rep={rep}); fewer than one dispatch per launch, cannot fold"
+        )
+    prefix = total - launches * per_launch  # one-time device-init dispatches
+    uniform = durations_ms[prefix:]
+    measured = uniform[warmup * per_launch :]
     return fmean(
         [sum(measured[i * per_launch : (i + 1) * per_launch]) for i in range(rep)]
     )
