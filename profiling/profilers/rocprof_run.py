@@ -82,6 +82,20 @@ def _gdn_causal_conv_prefill_torch_rocm_builder(spec: dict[str, Any]) -> dict[st
     )
 
 
+def _q_kv_rms_norm_torch_rocm_builder(spec: dict[str, Any]) -> dict[str, Any]:
+    from profiling.runners.attention.q_kv_rms_norm_torch_rocm import (
+        build_q_kv_rms_norm_kernel,
+    )
+
+    return build_q_kv_rms_norm_kernel(
+        spec["num_tokens"],
+        spec["q_dim"],
+        spec["kv_dim"],
+        spec["rms_eps"],
+        spec["dtype"],
+    )
+
+
 # (kind, backend) -> builder returning at least {"torch", "kernel"}.
 _BUILDERS: dict[tuple[str, str], Callable[[dict[str, Any]], dict[str, Any]]] = {
     ("rms_norm", "torch_rocm"): _rms_norm_torch_rocm_builder,
@@ -89,6 +103,7 @@ _BUILDERS: dict[tuple[str, str], Callable[[dict[str, Any]], dict[str, Any]]] = {
     ("kda_chunk_prefill", "torch_rocm"): _kda_chunk_prefill_torch_rocm_builder,
     ("gdn_causal_conv_decode", "torch_rocm"): _gdn_causal_conv_decode_torch_rocm_builder,
     ("gdn_causal_conv_prefill", "torch_rocm"): _gdn_causal_conv_prefill_torch_rocm_builder,
+    ("q_kv_rms_norm", "torch_rocm"): _q_kv_rms_norm_torch_rocm_builder,
 }
 
 
