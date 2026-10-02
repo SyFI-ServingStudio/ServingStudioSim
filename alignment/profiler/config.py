@@ -166,6 +166,59 @@ class NsysConfig:
             )
 
 
+@dataclass
+class RocprofConfig:
+    """rocprofv3 capture knobs — the AMD analog of :class:`NsysConfig`.
+
+    rocprofv3 runs the annotated server *inside* the profiler and writes a rocpd
+    SQLite database. ``--kernel-trace`` records the GPU dispatches the alignment
+    producer attributes, and ``--marker-trace`` records the roctx iteration ranges
+    the :mod:`alignment.profiler.roctx_shim` shim emits; both are required for a
+    trace the offline ``alignment/rocpd`` producer can consume. ``--output-format
+    rocpd`` is the SQLite form ``profiling.profilers.rocprof_kernel_profiler``
+    reads. ``hip_trace`` adds the host HIP API stream (host runtime correlation),
+    which the eager timestamp-containment join does not need and is off by default.
+    """
+
+    # Exact executable path. When omitted, the runner requires ROCPROF_BIN. It
+    # never guesses from PATH, so the profiler version is part of run provenance.
+    executable: str | None = None
+    output_format: str = "rocpd"
+    kernel_trace: bool = True
+    marker_trace: bool = True  # roctx iteration ranges
+    hip_trace: bool = False
+    # Extra rocprofv3 flags, appended verbatim before the wrapped command.
+    extra_args: list[str] = field(default_factory=list)
+    # Analysis window [start, end] over the forward index; open bounds analyze the
+    # whole capture. Mirrors NsysConfig so the parse step reads one place.
+    analyze_iteration_start: int | None = None
+    analyze_iteration_end: int | None = None
+
+    def validate(self) -> None:
+        allowed = {"rocpd"}
+        if self.output_format not in allowed:
+            raise ValueError(
+                f"rocprof.output_format must be one of {sorted(allowed)} for the "
+                f"offline alignment producer, got {self.output_format!r}"
+            )
+        if not self.kernel_trace:
+            raise ValueError("rocprof.kernel_trace is required: no dispatch rows to attribute")
+        if not self.marker_trace:
+            raise ValueError(
+                "rocprof.marker_trace is required: without roctx ranges the dispatches "
+                "cannot be attributed to vllm_iteration(N) windows"
+            )
+        if (
+            self.analyze_iteration_start is not None
+            and self.analyze_iteration_end is not None
+            and self.analyze_iteration_start > self.analyze_iteration_end
+        ):
+            raise ValueError(
+                "rocprof.analyze_iteration_start must not exceed analyze_iteration_end; "
+                "omit both to analyze the whole capture"
+            )
+
+
 #: Every `profile_kind` a profile config may name.
 PROFILE_KINDS = frozenset({"nsys", "workload_metrics", "expert_popularity", "token_corpus"})
 
