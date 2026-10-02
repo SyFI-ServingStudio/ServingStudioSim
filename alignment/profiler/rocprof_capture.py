@@ -39,6 +39,7 @@ from typing import Callable
 from ..rocpd import parse as rocpd_parse
 from ..rocpd.evidence import iteration_regions
 from .config import RocprofConfig
+from .roctx_shim import ROCTX_SCOPES_ENV
 
 try:  # the readers live in the profiling package (C0)
     from profiling.profilers.rocprof_kernel_profiler import (
@@ -131,6 +132,29 @@ def build_rocprof_prefix(
     prefix += list(config.extra_args)
     prefix.append("--")
     return prefix
+
+
+def build_capture_server_env(base_env: dict[str, str] | None = None) -> dict[str, str]:
+    """The env for the launched server that guarantees the roctx shim fires.
+
+    The AMD analog of what ``vllm_server.build_server_env`` does for NVTX: the
+    capture driver — not the operator — turns the iteration annotation on, so a
+    capture cannot silently record kernel dispatches with no
+    ``vllm_iteration(N)`` roctx ranges to own them.
+
+    vLLM already discovers and calls this package's ``vllm.general_plugins``
+    entry point (:func:`roctx_shim.install_vllm_roctx_shim`) in every worker
+    process; the plugin, however, no-ops unless :data:`ROCTX_SCOPES_ENV` is
+    ``"1"``. Setting it here is the one thing that makes a real capture actually
+    bracket each served forward. ``VLLM_PLUGINS`` is intentionally left untouched:
+    stock vLLM loads all general plugins by default, so narrowing it would only
+    risk disabling unrelated plugins. When a caller does set ``VLLM_PLUGINS`` in
+    ``base_env``, it must already include
+    :data:`roctx_shim.ROCTX_PLUGIN_ENTRY_POINT_NAME`.
+    """
+    env = dict(os.environ if base_env is None else base_env)
+    env[ROCTX_SCOPES_ENV] = "1"
+    return env
 
 
 def build_capture_argv(
@@ -318,7 +342,13 @@ def main(
         analyze_iteration_end=args.iteration_end,
     )
     db_path = run_capture(
-        executable, config, server_argv, args.output_dir, args.output_name, runner=runner
+        executable,
+        config,
+        server_argv,
+        args.output_dir,
+        args.output_name,
+        env=build_capture_server_env(),
+        runner=runner,
     )
     report = validate_rocpd(db_path)
     print(json.dumps({"rocpd": str(db_path), "validation": report}, separators=(",", ":")))

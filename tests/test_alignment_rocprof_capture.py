@@ -28,10 +28,12 @@ from alignment.profiler.config import RocprofConfig
 from alignment.profiler.rocprof_capture import (
     ResolvedRocprofExecutable,
     build_capture_argv,
+    build_capture_server_env,
     locate_rocpd,
     resolve_rocprof_executable,
     validate_rocpd,
 )
+from alignment.profiler.roctx_shim import ROCTX_SCOPES_ENV
 
 _GUID = "0000b1c7_c35b_735b_96a7_f0a02ff013cc"
 _PID = 4242
@@ -241,6 +243,55 @@ def test_cli_capture_then_parse_end_to_end(tmp_path):
     for name in _KERNEL_SCHEMA.names:
         assert table.column(name).null_count == 0
     assert sequences_out.exists()
+
+
+def test_capture_server_env_sets_roctx_flag():
+    """The driver turns the roctx annotation on, preserving the rest of the env."""
+    built = build_capture_server_env({"PATH": "/usr/bin", "HOME": "/home/x"})
+    assert built[ROCTX_SCOPES_ENV] == "1"
+    assert built["PATH"] == "/usr/bin" and built["HOME"] == "/home/x"
+    # A pre-existing (stale) value is overridden to the timing-on setting.
+    assert build_capture_server_env({ROCTX_SCOPES_ENV: "0"})[ROCTX_SCOPES_ENV] == "1"
+
+
+def test_cli_injects_roctx_flag_into_launched_server_env(tmp_path):
+    """The rocpd-capture CLI passes the roctx-on env to the server it launches.
+
+    Without this the capture would run the real `install_vllm_roctx_shim` plugin
+    but leave it no-opping, recording kernels with no iteration ranges to own them.
+    """
+    seen = {}
+
+    def fake_runner(argv, env=None, check=True):
+        seen["env"] = env
+        db_dir = argv[argv.index("-d") + 1]
+        name = argv[argv.index("-o") + 1]
+        from pathlib import Path
+
+        Path(db_dir).mkdir(parents=True, exist_ok=True)
+        _complete_fixture(Path(db_dir) / f"{name}_results.db")
+        return subprocess.CompletedProcess(argv, 0)
+
+    rc = rocprof_capture.main(
+        [
+            "--output-dir",
+            str(tmp_path / "cap"),
+            "--output-name",
+            "rank0",
+            "--no-parse",
+            "--",
+            "python",
+            "-m",
+            "vllm.entrypoints.cli.main",
+            "serve",
+            "model",
+        ],
+        resolver=lambda _p: _fake_exe(tmp_path),
+        runner=fake_runner,
+    )
+    assert rc == 0
+    assert seen["env"] is not None
+    assert seen["env"][ROCTX_SCOPES_ENV] == "1"
 
 
 def test_cli_requires_double_dash():

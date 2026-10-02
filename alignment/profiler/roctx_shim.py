@@ -48,6 +48,15 @@ from typing import Callable, Iterator, Protocol, runtime_checkable
 #: annotation off entirely (a pass that must not carry instrumentation).
 ROCTX_SCOPES_ENV = "VLLM_ROCTX_SCOPES_FOR_PROFILING"
 
+#: The ``vllm.general_plugins`` entry-point name this package registers for
+#: :func:`install_vllm_roctx_shim` (see ``pyproject.toml``). vLLM auto-loads and
+#: calls every entry point in that group in each worker process unless
+#: ``VLLM_PLUGINS`` narrows the set; when it does, it must include this name.
+#: Where the NVIDIA path bakes the NVTX scopes into the vLLM fork's own source,
+#: the AMD path has no fork and instead injects the identical annotation through
+#: this stock-vLLM plugin seam.
+ROCTX_PLUGIN_ENTRY_POINT_NAME = "vibesim_roctx_shim"
+
 #: The marker family the rocpd/nsys parsers recognize. The default engine prefix
 #: is ``vllm``; ``sglang`` is the other value ``ITER_RE`` accepts.
 DEFAULT_ENGINE_PREFIX = "vllm"

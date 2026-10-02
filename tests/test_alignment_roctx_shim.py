@@ -17,21 +17,28 @@ and parse code are the real thing.
 
 from __future__ import annotations
 
+import importlib
 import json
 import sqlite3
+import tomllib
+from pathlib import Path
 
 from alignment.nsys.parse import ITER_RE
 from alignment.profiler import roctx_shim
 from alignment.profiler.roctx_shim import (
     ITERATION_RECORD_TAG,
+    ROCTX_PLUGIN_ENTRY_POINT_NAME,
     IterationAnnotator,
     RecordingBackend,
+    install_vllm_roctx_shim,
     iteration_label,
     iteration_record_marker,
     roctx_scopes_enabled,
     select_backend,
 )
 from alignment.rocpd.evidence import build_ranges_from_rocpd
+
+_PYPROJECT = Path(__file__).resolve().parents[1] / "pyproject.toml"
 
 _GUID = "0000b1c7_c35b_735b_96a7_f0a02ff013cc"
 _PID = 4242
@@ -78,6 +85,33 @@ def test_annotator_counts_and_emits_record_before_range():
     assert ops[1] == ("push", "vllm_iteration(0): forward")
     assert ops[2][0] == "pop"
     assert ops[4] == ("push", "vllm_iteration(1): forward")
+
+
+def test_registered_plugin_entry_point_resolves_to_installer():
+    """The ``vllm.general_plugins`` entry point points at a real importable callable.
+
+    This is the mechanism vLLM actually uses to run the shim inside a serving
+    worker (the AMD analog of baking the NVTX scopes into the fork). The test
+    reads the declared ``module:attr`` from ``pyproject.toml``, imports it, and
+    asserts it is exactly :func:`install_vllm_roctx_shim` — so the registration
+    cannot drift from the callable or name a dead path.
+    """
+    data = tomllib.loads(_PYPROJECT.read_text())
+    group = data["project"]["entry-points"]["vllm.general_plugins"]
+    assert ROCTX_PLUGIN_ENTRY_POINT_NAME in group
+    module_name, _, attr = group[ROCTX_PLUGIN_ENTRY_POINT_NAME].partition(":")
+    resolved = getattr(importlib.import_module(module_name), attr)
+    assert resolved is install_vllm_roctx_shim
+
+
+def test_plugin_is_a_noop_when_flag_unset():
+    """Called as vLLM would call it, the plugin patches nothing unless gated on.
+
+    vLLM invokes the loaded entry point with no arguments. With the env gate off
+    the shim must return ``False`` and touch neither vLLM (not importable here)
+    nor a GPU, so a non-timing server launch is never silently instrumented.
+    """
+    assert install_vllm_roctx_shim(environ={}) is False
 
 
 def test_disabled_annotator_is_a_noop():
