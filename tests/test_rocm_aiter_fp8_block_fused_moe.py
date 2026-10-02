@@ -117,11 +117,13 @@ def test_torch_operands_are_amd_native_and_match_histogram() -> None:
     assert torch.allclose(rowsum, torch.full_like(rowsum, 2.5), atol=1e-5)
 
 
-def test_first_run_pins_are_declared() -> None:
-    # The timed path refuses to fabricate a number: D and the AITER HIP symbols
-    # start unpinned (None) and are filled from the first MI300X capture (Q6/Q7).
-    # The Triton fallback symbol to forbid is a fixed constant.
-    assert rocm._DISPATCHES_PER_LAUNCH is None or rocm._DISPATCHES_PER_LAUNCH >= 1
+def test_first_run_pins_are_set_from_the_mi300x_capture() -> None:
+    # Pinned from the first real MI300X rocpd capture (Q6/Q7): the whole fused
+    # call issues D=5 dispatches; the AITER block-scale GEMM and sorting HIP
+    # strings are the path-assertion anchors; the Triton kernel must be forbidden.
+    assert rocm._DISPATCHES_PER_LAUNCH == 5
+    assert rocm._AITER_KERNEL_SUBSTR == "GridwiseMoeGemmBlockScale"
+    assert rocm._SORTING_KERNEL_SUBSTR == "moe_sorting"
     assert rocm._TRITON_KERNEL_SUBSTR == "fused_moe_kernel"
 
 

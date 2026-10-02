@@ -109,16 +109,22 @@ _W2_SCALE = (0.005, 0.015)
 _MODULE = "vllm.model_executor.layers.fused_moe.experts.rocm_aiter_moe"
 _CALLABLE = "rocm_aiter_fused_experts"
 
-# --- First-real-run pins (Q6/Q7). Fill from the first MI300X capture. -------
+# --- Pinned from the first real MI300X capture (gfx942, aiter v0.1.21.x,
+# vLLM 0.3.1.dev190; inspect_aiter_fp8_moe.py). ------------------------------
 # Steady-state GPU-dispatch count of one rocm_aiter_fused_experts call once the
-# AITER/CK autotuners have cached their winners (every launch from warm-up #2
-# onward). The trailing fold sums the last rep*D dispatches. None until measured.
-_DISPATCHES_PER_LAUNCH: int | None = None
-# Substring of the emitted AITER block-scale MoE HIP kernel string (the CK/ASM
-# symbol for `fmoe_fp8_blockscale_g1u1`) and of the AITER sorting kernel, read
-# off the first rocpd capture. Used for the path-selection assertion.
-_AITER_KERNEL_SUBSTR: str | None = None
-_SORTING_KERNEL_SUBSTR: str | None = None
+# AITER/CK kernels are built/cached (every launch from warm-up #2 onward): the
+# whole fused call issues D=5 dispatches (sorting + the two block-scale grouped
+# GEMMs + the scatter/finalize helpers), constant across the trailing reps
+# (period-5 tail, 134 total = 4-dispatch build/shuffle prefix + 26 launches*5).
+# The trailing fold sums the last rep*D dispatches, skipping the prefix.
+_DISPATCHES_PER_LAUNCH: int | None = 5
+# The emitted AITER FP8 block-scale MoE grouped-GEMM HIP kernel string is
+# `void ck::kernel_moe_gemm<ck::GridwiseMoeGemmBlockScale<... ck::f8_fnuz_t,
+# ck::f8_fnuz_t, ... MulABScaleExpertWeightA8W8blkscale ...>>` (the CK realization
+# of aiter.fmoe_fp8_blockscale_g1u1 / QuantType per_1x128); the sorting/scatter
+# kernel is `aiter::opus_moe_sorting_entry<aiter::MoeSortingKernel<...>>`.
+_AITER_KERNEL_SUBSTR: str | None = "GridwiseMoeGemmBlockScale"
+_SORTING_KERNEL_SUBSTR: str | None = "moe_sorting"
 # The Triton FP8-MoE kernel that MUST be absent (silent-fallback guard): the
 # `@triton.jit def fused_moe_kernel` in vLLM's fused_moe.py.
 _TRITON_KERNEL_SUBSTR = "fused_moe_kernel"
@@ -161,9 +167,30 @@ def _load_runtime() -> tuple[Any, Any, Any, Any]:
     return torch, fused_experts, shuffle_weight, module
 
 
-def _random_fp8(torch: Any, shape: tuple[int, ...], generator: Any, *, device: Any) -> Any:
+def _fp8_dtype(torch: Any, device: Any) -> Any:
+    """The FP8 E4M3 variant for this device.
+
+    CDNA3 (gfx942) uses ``float8_e4m3fnuz`` (what ``aiter`` and vLLM's quant
+    config expect via ``current_platform.fp8_dtype()``); the OCP ``float8_e4m3fn``
+    NVIDIA uses is unsupported by aiter's quant bindings there. On CPU (the
+    registration test) there is no platform, so fall back to the OCP dtype.
+    """
+
+    if getattr(device, "type", None) == "cuda":
+        try:
+            from vllm.platforms import current_platform
+
+            return current_platform.fp8_dtype()
+        except Exception:
+            pass
+    return torch.float8_e4m3fn
+
+
+def _random_fp8(
+    torch: Any, shape: tuple[int, ...], generator: Any, *, device: Any, fp8_dtype: Any
+) -> Any:
     values = torch.randn(shape, generator=generator, dtype=torch.float32).to(torch.bfloat16)
-    return values.to(torch.float8_e4m3fn).to(device)
+    return values.to(fp8_dtype).to(device)
 
 
 def _random_scales(
@@ -198,10 +225,11 @@ def build_torch_operands(args: dict[str, Any], *, device: Any) -> dict[str, Any]
     top_k = args["top_k"]
 
     gen = torch.Generator(device="cpu").manual_seed(_SEED)
+    fp8_dtype = _fp8_dtype(torch, device)
     # Checkpoint order: w13 is [2*inter, hidden] per expert ([gate; up]); w2 is
     # [hidden, inter]. shuffle_weight needs K % 128 == 0 and N % 16 == 0.
-    w13 = _random_fp8(torch, (experts, 2 * inter, hidden), gen, device=device)
-    w2 = _random_fp8(torch, (experts, hidden, inter), gen, device=device)
+    w13 = _random_fp8(torch, (experts, 2 * inter, hidden), gen, device=device, fp8_dtype=fp8_dtype)
+    w2 = _random_fp8(torch, (experts, hidden, inter), gen, device=device, fp8_dtype=fp8_dtype)
     w13_scale = _random_scales(
         torch, (experts, 2 * inter // _GROUP_SIZE, hidden // _GROUP_SIZE), _W13_SCALE, gen,
         device=device,
@@ -280,10 +308,8 @@ def _build_case(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def _silu_activation() -> Any:
-    from vllm.model_executor.layers.fused_moe.config import FusedMoEActivationFormat  # noqa: F401
-
-    # vLLM exposes the Silu selector as MoEActivation.SILU on the AITER path.
-    from vllm.model_executor.layers.fused_moe.rocm_aiter_fused_moe import MoEActivation
+    # MoEActivation lives in the activation module (pinned on the real image).
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 
     return MoEActivation.SILU
 
@@ -291,25 +317,52 @@ def _silu_activation() -> Any:
 def _build_moe_config(torch: Any, args: dict[str, Any]) -> Any:
     """Construct the FusedMoEConfig the AITER expert call consumes.
 
-    The exact field set of ``FusedMoEConfig`` is pinned on the first real MI300X
-    run against the installed vLLM-ROCm (``v0.3.1.dev190``); the dims below are
-    the GLM MoE coordinates. Kept GPU-only so CPU import stays clean.
+    Pinned against the installed vLLM-ROCm (``v0.3.1.dev190``) by mirroring
+    vLLM's own construction in ``fused_moe/layer.py`` and the CI/testing
+    ``FusedMoEParallelConfig`` (single rank, ``use_ep=False``). For this
+    standalone single-rank measurement the config's expert count is the rank's
+    local experts (the synthetic ``w1``/``w2`` carry ``num_local_experts`` and
+    ``topk_ids`` index into them), which is exactly the per-rank grouped GEMM.
     """
 
-    from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm.model_executor.layers.fused_moe.config import (
+        FusedMoEConfig,
+        FusedMoEParallelConfig,
+        RoutingMethodType,
+    )
 
+    local = args["num_local_experts"]
+    parallel = FusedMoEParallelConfig(
+        tp_size=1, pcp_size=1, dp_size=1, ep_size=1,
+        tp_rank=0, pcp_rank=0, dp_rank=0, ep_rank=0,
+        sp_size=1, use_ep=False,
+        all2all_backend="allgather_reducescatter", enable_eplb=False,
+    )
     return FusedMoEConfig(
-        num_experts=args["num_experts"],
+        num_experts=local,
         experts_per_token=args["top_k"],
         hidden_dim=args["hidden_size"],
-        num_local_experts=args["num_local_experts"],
-        moe_parallel_config=None,
+        intermediate_size=args["intermediate_size"],
+        num_local_experts=local,
+        num_logical_experts=local,
+        activation=MoEActivation.SILU,
+        device=torch.device("cuda", torch.cuda.current_device()),
+        routing_method=RoutingMethodType.DeepSeekV3,
+        moe_parallel_config=parallel,
         in_dtype=torch.bfloat16,
+        intermediate_size_per_partition=args["intermediate_size"],
+        swiglu_limit=_SWIGLU_LIMIT,
     )
 
 
 def _build_quant_config(args: dict[str, Any], w13_scale: Any, w2_scale: Any) -> Any:
-    """FP8 w8a8 block-scale quant config: plain FP32 128x128 weight scales."""
+    """FP8 w8a8 block-scale quant config: plain FP32 128x128 weight scales.
+
+    Mirrors vLLM's fp8 "normal" block-scale branch (``fp8.py``): w1/w2 scales +
+    ``block_shape=[128,128]``, activations quantized per-token-group-128 inside
+    the call, and the GLM SwiGLU clamp forwarded as ``gemm1_clamp_limit``.
+    """
 
     from vllm.model_executor.layers.fused_moe.config import fp8_w8a8_moe_quant_config
 
@@ -319,6 +372,7 @@ def _build_quant_config(args: dict[str, Any], w13_scale: Any, w2_scale: Any) -> 
         a1_scale=None,
         a2_scale=None,
         block_shape=[_GROUP_SIZE, _GROUP_SIZE],
+        gemm1_clamp_limit=_SWIGLU_LIMIT,
     )
 
 
@@ -357,7 +411,8 @@ def _reference_output(
 
     x = dequantize_token_groups(
         torch,
-        *_quantize_hidden(torch, operands["hidden_states"]),
+        *_quantize_hidden(torch, operands["hidden_states"],
+                          fp8_dtype=_fp8_dtype(torch, operands["hidden_states"].device)),
     )
     ids = operands["topk_ids"]
     weights = operands["topk_weights"]
@@ -380,13 +435,13 @@ def _reference_output(
     return output
 
 
-def _quantize_hidden(torch: Any, hidden: Any) -> tuple[Any, Any]:
+def _quantize_hidden(torch: Any, hidden: Any, *, fp8_dtype: Any) -> tuple[Any, Any]:
     """Round-trip BF16 hidden to FP8 with per-token-group-128 FP32 scales."""
 
     rows, cols = hidden.shape
     grouped = hidden.float().reshape(rows, cols // _GROUP_SIZE, _GROUP_SIZE)
     scale = grouped.abs().amax(dim=-1, keepdim=True).clamp(min=1e-10) / 448.0
-    q = (grouped / scale).to(torch.float8_e4m3fn).reshape(rows, cols)
+    q = (grouped / scale).to(fp8_dtype).reshape(rows, cols)
     return q, scale.squeeze(-1)
 
 
