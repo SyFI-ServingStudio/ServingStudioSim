@@ -130,6 +130,29 @@ ENV_REGISTRY: dict[str, ProfileEnv | ContainerProfileEnv] = {
         "vllm_env",
         os.environ.get("VIBESIM_VLLM_PROFILE_IMAGE", "vibesim-profiler-vllm:cu130-3f667d7e"),
     ),
+    # ROCm/MI300X counterpart of ``vllm_env``: the AMD cluster's vLLM-ROCm image
+    # (vLLM 0.3.1.dev190, torch 2.12, ROCm 7.2, aiter), where ``current_platform``
+    # is ``rocm`` and the GLM-5.3-Flash kernels run on CDNA3. Kept parallel to the
+    # CUDA env so a ``(kernel, backend)`` row can declare its ROCm dependency the
+    # same way a CUDA row declares ``vllm_env`` -- the image is the dependency
+    # boundary, not ``nvidia/cuda``.
+    #
+    # Runtime fork (flagged for an owner decision; see worktree notes): the AMD
+    # cluster serves this image as an apptainer/singularity SIF, not a docker
+    # image, and ``exec/local.py:_container_worker_command`` addresses GPUs with
+    # the NVIDIA-only ``docker run --gpus device=<uuid>`` form. A ROCm docker host
+    # would instead need ``--device=/dev/kfd --device=/dev/dri``; the cluster path
+    # bypasses ``LocalGpuPool`` entirely and runs ``profiling.exec.local_worker``
+    # inside the SIF via ``amd-hpc``/singularity. This registry entry names the
+    # dependency image; wiring a ROCm container runtime into the local exec
+    # backend is deliberately left as a separate, GPU-tested step.
+    "vllm_rocm_env": ContainerProfileEnv(
+        "vllm_rocm_env",
+        os.environ.get(
+            "VIBESIM_VLLM_ROCM_PROFILE_IMAGE",
+            "vibesim-profiler-vllm-rocm:v0.3.1.dev190",
+        ),
+    ),
 }
 
 

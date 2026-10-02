@@ -98,6 +98,17 @@ pub struct Glm53DsaAttnLocalWorkletConfig {
     pub max_model_len: u32,
     pub cache_block_size: u32,
     pub rms_eps: f64,
+    /// Sparse-MLA attention latent coordinate. B200 runs the FlashInfer fp8
+    /// paged kernel (`flashinfer_trtllm_fp8`), so the query, the cache, and the
+    /// paged layout are all fp8. MI300X runs the rope-free BF16 token-major
+    /// Triton kernel (`rocm_triton_mla_sparse`), whose `_validate` pins q, cache
+    /// and output to BF16 and the layout to `token_major_mqa_bf16_latent`; the
+    /// cache dtype also drives the MLA cache-append byte footprint (a bf16
+    /// latent is 1024 B/token vs the fp8 512). The arch gpu-gates these so B200
+    /// keeps its fp8 coordinate byte-identical.
+    pub sparse_mla_q_dtype: DType,
+    pub sparse_mla_cache_dtype: DType,
+    pub sparse_mla_cache_layout: &'static str,
     pub gpu_name: String,
     pub bf16_gemm_backends: Vec<&'static str>,
     pub fp32_gemm_backends: Vec<&'static str>,
@@ -342,12 +353,12 @@ impl Glm53DsaAttnLocalWorklet {
                 index_kpool: kpool,
                 softmax_scale_denominator: integer_sqrt(cfg.qk_nope_head_dim.get()),
                 activation_dtype: bf16,
-                q_dtype: DType::Fp8E4m3,
-                cache_dtype: DType::Fp8E4m3,
+                q_dtype: cfg.sparse_mla_q_dtype,
+                cache_dtype: cfg.sparse_mla_cache_dtype,
                 output_dtype: bf16,
                 index_dtype: "int32".into(),
                 index_distribution: "unique_scattered_pages".into(),
-                cache_layout: "hnd_paged_mqa_fp8_latent".into(),
+                cache_layout: cfg.sparse_mla_cache_layout.into(),
                 mla_cache_block_size: cfg.cache_block_size,
                 mla_cache_format: "plain".into(),
                 page_table_mapping: "interleaved_requests".into(),
@@ -730,6 +741,9 @@ mod tests {
             max_model_len: 8192,
             cache_block_size: 64,
             rms_eps: 1e-5,
+            sparse_mla_q_dtype: DType::Fp8E4m3,
+            sparse_mla_cache_dtype: DType::Fp8E4m3,
+            sparse_mla_cache_layout: "hnd_paged_mqa_fp8_latent",
             gpu_name: "NVIDIA B200".into(),
             bf16_gemm_backends: vec!["torch_linear_vllm"],
             fp32_gemm_backends: vec!["torch_cublas"],

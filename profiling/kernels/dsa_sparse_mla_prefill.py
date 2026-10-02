@@ -108,4 +108,33 @@ register(
     )
 )
 
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="rocm_triton_mla_sparse",
+        supports=BackendSupport(
+            compute=frozenset({DType.BF16}),
+            kv=frozenset({DType.BF16}),
+            gpus=frozenset({"MI300X"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.attention.dsa_sparse_mla_prefill_rocm_triton",
+            function_name="profile_dsa_sparse_mla_prefill_rocm_triton",
+        ),
+        table_name=KIND,
+        args_schema=DsaSparseMlaPrefillArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="vllm_rocm_env",
+        doc=BackendDoc(
+            summary=(
+                "vLLM's rope-free Triton ragged sparse-MLA kernel "
+                "(rocm_sparse_attn_prefill, head_dim=512 nope=512 rope=0) over a BF16 "
+                "ragged prefill batch, the GLM-5.3-Flash DSA prefill path on MI300X."
+            ),
+            url="https://github.com/vllm-project/vllm/blob/main/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py",
+        ),
+    )
+)
+
 __all__ = ["DsaSparseMlaPrefillArgs", "KIND"]

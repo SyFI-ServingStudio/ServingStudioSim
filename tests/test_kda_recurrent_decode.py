@@ -145,3 +145,38 @@ def test_oracle_decays_per_key_channel_and_sigmoids_raw_beta() -> None:
     decay = kda_safe_gate(raw_g, a_log, dt_bias, -5.0).exp()  # [B, H, K]
     for seq, slot in enumerate(slots.tolist()):
         torch.testing.assert_close(updated[slot], pool[slot] * decay[seq][:, None, :])
+
+
+def test_torch_rocm_backend_registered_for_mi300x() -> None:
+    # The MI300X AMD path is a separate backend of the same kind, gated to
+    # MI300X and routed to the vllm_rocm_env image. The NVIDIA B200 vllm_triton
+    # row must be left untouched.
+    from profiling.db.registry import find_kernel_profiler_spec
+
+    rocm = find_kernel_profiler_spec("kda_recurrent_decode", "torch_rocm")
+    assert rocm.supports.gpus == frozenset({"MI300X"})
+    assert rocm.subprocess_env == "vllm_rocm_env"
+    assert rocm.runner_ref.function_name == "profile_kda_recurrent_decode_torch_rocm"
+
+    nvidia = find_kernel_profiler_spec("kda_recurrent_decode", "vllm_triton")
+    assert nvidia.supports.gpus == frozenset({"NVIDIA B200"})
+
+
+def test_torch_rocm_runner_is_import_light() -> None:
+    # Importing the ROCm runner must not eager-import torch or vllm; both are
+    # built lazily only when a measurement runs on the ROCm host.
+    import subprocess
+    import sys
+
+    out = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; import profiling.runners.attention.kda_recurrent_decode_torch_rocm as r; "
+            "print('torch' in sys.modules, 'vllm' in sys.modules)",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert out.stdout.strip() == "False False"

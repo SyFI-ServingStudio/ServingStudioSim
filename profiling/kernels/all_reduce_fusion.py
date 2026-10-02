@@ -152,3 +152,42 @@ register(
         ),
     )
 )
+
+# MI300X analytic Infinity-Fabric all-reduce roofline (GLM-5.3-Flash port,
+# decision #42). vLLM-ROCm runs an RCCL / aiter custom all-reduce over Infinity
+# Fabric, not FlashInfer MNNVL (NVLink-multicast only); a *measured* RCCL
+# all-reduce needs a 4+ GPU Infinity-Fabric group. Where that measurement is
+# unavailable, this backend supplies a principled ring all-reduce roofline derived
+# from the MI300X Infinity-Fabric bandwidth (``profiling.runners.comm.fabric_roofline``)
+# so a real MI300X ``timing-predict`` resolves the kind instead of rejecting the
+# NVIDIA-only MNNVL default at ``BackendSupport.allows``. The cost is DERIVED, not
+# timed: no rank group (``gpu_count`` defaults to 1), and it is MI300X /
+# InfinityFabric-gated, so every NVIDIA target -- B200 included -- keeps
+# flashinfer_mnnvl and stays byte-identical.
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="rocm_fabric_roofline",
+        supports=BackendSupport(
+            compute=frozenset({DType.BF16}),
+            gpus=frozenset({"MI300X"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.comm.fabric_roofline",
+            function_name="profile_all_reduce_fusion_fabric_roofline",
+        ),
+        table_name=KIND,
+        args_schema=AllReduceFusionArgs,
+        metric_family=MetricFamily.COMM,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="vllm_rocm_env",
+        doc=BackendDoc(
+            summary=(
+                "Analytic Infinity-Fabric all-reduce roofline: the ring "
+                "all-reduce data-movement law 2(N-1)/N · bytes / 896 GB/s (the "
+                "MI300X Infinity-Fabric bandwidth). A derived fabric cost for the "
+                "GLM-5.3-Flash MI300X port, not a measured multi-GPU row."
+            ),
+        ),
+    )
+)

@@ -76,4 +76,34 @@ register(
     )
 )
 
+
+# The AMD/ROCm path. fused_q_kv_rmsnorm is plain vLLM common code with no
+# is_rocm()/aiter branch (verified on the pinned MI300X image), so the ROCm path
+# is the same callable built for CDNA3. Measured on MI300X in the vllm_rocm_env
+# image, timed kernel-only via rocprofv3 (ROCm counterpart of the CUPTI path).
+# NVIDIA H200/B200 rows are untouched.
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="torch_rocm",
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.attention.q_kv_rms_norm_torch_rocm",
+            function_name="profile_q_kv_rms_norm_torch_rocm",
+        ),
+        table_name=KIND,
+        args_schema=QKvRmsNormArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        supports=BackendSupport(compute=frozenset({DType.BF16}), gpus=frozenset({"MI300X"})),
+        subprocess_env="vllm_rocm_env",
+        doc=BackendDoc(
+            summary=(
+                "AMD/ROCm: vLLM's fused_q_kv_rmsnorm on CDNA3, the same fused "
+                "query+KV RMSNorm as the NVIDIA path, one fused kernel per call."
+            ),
+            url="https://github.com/vllm-project/vllm/blob/main/vllm/models/common/ops/fused_qk_rmsnorm.py",
+        ),
+    )
+)
+
 __all__ = ["QKvRmsNormArgs", "KIND"]

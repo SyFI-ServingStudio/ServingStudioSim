@@ -196,8 +196,8 @@ def db(tmp_path: Path) -> Path:
         metrics, (git_hash, run_at, *versions) = rest[4:8], rest[8:]
         conn.execute(
             "insert into single_gemm (gpu_name, backend, m, n, k, dtype, args_hash, run_key, "
-            "profiler_run_at, time_ms, tflops, memory_bandwidth_gbps, energy_j) "
-            f"values ({', '.join('?' * 13)})",
+            "profiler_run_at, time_ms, tflops, memory_bandwidth_gbps, energy_j, created_at) "
+            f"values ({', '.join('?' * 14)})",
             (
                 gpu,
                 backend,
@@ -206,6 +206,7 @@ def db(tmp_path: Path) -> Path:
                 storage.run_key(conn, (git_hash, *versions)),
                 storage.epoch(run_at),
                 *metrics,
+                storage.now_epoch(),
             ),
         )
     conn.commit()
@@ -303,12 +304,15 @@ def test_kernel_detail_joins_docs_roles_and_shapes(registered) -> None:
     }
 
 
-# The FP8 block-scale backend of this kind takes FP8 weights in 128-wide blocks.
-_FP8_BLOCK_BACKEND = "flashinfer_trtllm_fp8_block_sm100"
+# The FP8 block-scale backends of this kind take FP8 weights in 128-wide blocks:
+# the B200 FlashInfer path and the MI300X AITER path.
+_FP8_BLOCK_BACKENDS = frozenset(
+    {"flashinfer_trtllm_fp8_block_sm100", "rocm_aiter_fp8_block"}
+)
 
 
 def _nvfp4_row(backend: str) -> ProfileRow:
-    fp8 = backend == _FP8_BLOCK_BACKEND
+    fp8 = backend in _FP8_BLOCK_BACKENDS
     return ProfileRow(
         args=Nvfp4FusedMoeArgs(
             num_tokens=16,
@@ -368,7 +372,7 @@ def test_nvfp4_fused_moe_precision_is_each_backends_weight_format(tmp_path: Path
     assert {
         name: backend["supports"]["compute"] for name, backend in detail["backends"].items()
     } == {
-        name: ["fp8_e4m3"] if name == _FP8_BLOCK_BACKEND else ["nvfp4_e2m1"]
+        name: ["fp8_e4m3"] if name in _FP8_BLOCK_BACKENDS else ["nvfp4_e2m1"]
         for name in detail["backends"]
     }
 

@@ -188,33 +188,40 @@ def register_kernel_configs(
     with closing(sqlite3.connect(path, timeout=_WRITE_LOCK_TIMEOUT_S)) as conn, conn:
         migrate_connection(conn)
         ensure_schema(conn)
+        # created_at is supplied from Python (storage.now_epoch) rather than
+        # SQLite's unixepoch(), which is absent before SQLite 3.38 (e.g. the
+        # vLLM-ROCm container). A regrid refreshes created_at via excluded.
+        created_at = storage.now_epoch()
         conn.executemany(
             f"""
             INSERT INTO {CONFIG_TABLE}
                 (config_key, kind, config_hash, gpu_name, profile_kind, identity, cache_coords,
-                 grid_axes, cells, infeasible)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 grid_axes, cells, infeasible, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(kind, config_hash, gpu_name) DO UPDATE SET
                 profile_kind = excluded.profile_kind,
                 cache_coords = excluded.cache_coords,
                 grid_axes = excluded.grid_axes,
                 cells = excluded.cells,
                 infeasible = excluded.infeasible,
-                created_at = unixepoch()
+                created_at = excluded.created_at
             """,
-            [record.config_row(conn) for record in (*plan.new_configs, *plan.regridded)],
+            [
+                record.config_row(conn, created_at)
+                for record in (*plan.new_configs, *plan.regridded)
+            ],
         )
         conn.executemany(
             f"""
-            INSERT OR IGNORE INTO {SOURCE_TABLE} (source_key, source_hash, source)
-            VALUES (?, ?, ?)
-            """,
-            [(storage.source_key(h), h, source) for h, source in plan.new_sources],
-        )
-        conn.executemany(
-            f"""
-            INSERT OR IGNORE INTO {USE_TABLE} (config_key, source_key, pool, role_key)
+            INSERT OR IGNORE INTO {SOURCE_TABLE} (source_key, source_hash, source, created_at)
             VALUES (?, ?, ?, ?)
+            """,
+            [(storage.source_key(h), h, source, created_at) for h, source in plan.new_sources],
+        )
+        conn.executemany(
+            f"""
+            INSERT OR IGNORE INTO {USE_TABLE} (config_key, source_key, pool, role_key, created_at)
+            VALUES (?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -222,6 +229,7 @@ def register_kernel_configs(
                     storage.source_key(source_hash),
                     pool,
                     storage.ensure_role(conn, role),
+                    created_at,
                 )
                 for kind, config_hash, gpu_name, source_hash, pool, role in plan.new_uses
             ],
@@ -461,7 +469,7 @@ class _Record:
             and _decode_cells(cells) == self.cells
         )
 
-    def config_row(self, conn: sqlite3.Connection) -> tuple[Any, ...]:
+    def config_row(self, conn: sqlite3.Connection, created_at: int) -> tuple[Any, ...]:
         return (
             storage.config_key(*self.key),
             self.kind,
@@ -470,6 +478,7 @@ class _Record:
             self.profile_kind,
             storage.pack_identity(conn, self.identity),
             *self.grid_columns(),
+            created_at,
         )
 
 

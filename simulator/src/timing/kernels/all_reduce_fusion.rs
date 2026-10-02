@@ -53,10 +53,20 @@ impl AllReduceFusionSpec {
     }
 
     /// Largest token count for which vLLM selects FlashInfer on B200.
+    ///
+    /// The cap formula (`max_fused_bytes(num_gpus) / bytes_per_token`) is
+    /// hardware-independent, so the grid is well-defined for any target; the
+    /// gate only records which GPUs this fusion has actually been profiled on.
+    /// On MI300X the backend is `rocm_fabric_roofline`, the analytic
+    /// Infinity-Fabric ring all-reduce (`profiling/runners/comm/fabric_roofline.py`,
+    /// decision #42), not FlashInfer MNNVL. That roofline is linear in num_tokens,
+    /// so this FlashInfer-derived cap only bounds the sweep's upper token count;
+    /// `Cache1DLinear` interpolates within it and extrapolates linearly above,
+    /// which is exact for the roofline. B200 is unchanged.
     pub fn max_fused_tokens(config: &AllReduceFusionKernelConfig) -> u32 {
         assert!(
-            config.gpu_name.contains("B200"),
-            "all_reduce_fusion is currently profiled only on B200"
+            config.gpu_name.contains("B200") || config.gpu_name.contains("MI300"),
+            "all_reduce_fusion is currently profiled only on B200 and MI300X"
         );
         let bytes_per_token = u64::from(config.hidden_dim)
             .checked_mul(config.dtype.size_bytes() as u64)

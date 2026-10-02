@@ -440,6 +440,43 @@ class Timer:
         return mean_ms
 
 
+    @staticmethod
+    def rocprof(
+        fn: Callable[[], object],
+        *,
+        warmup: int = 10,
+        rep: int = 50,
+        kernel_name: str | None = None,
+    ) -> float:
+        """Return average kernel-only runtime in milliseconds using rocprof(v3).
+
+        The ROCm counterpart of ``Timer.cupti``: on NVIDIA the kernel-only time
+        comes from CUPTI kernel records, on ROCm it comes from rocprofv3's
+        kernel-dispatch durations in a rocpd database (end - start per dispatch,
+        summed per logical launch). ``kernel_name`` filters to dispatches whose
+        kernel name contains the substring -- a single-launch callable may filter,
+        a compound callable passes ``None`` to count every dispatch in its fixed
+        sequence, exactly as on the CUPTI side.
+
+        Fixed-count by design: rocprofv3 traces a bounded launch loop, so the
+        caller fixes ``rep`` rather than the adaptive active-time budget CUPTI
+        uses. This keeps the launch count identical across ranks, which a
+        collective or multi-GPU run needs for a comparable loop.
+        """
+
+        _validate_warmup("Timer.rocprof", warmup)
+        if rep <= 0:
+            raise ValueError("Timer.rocprof rep must be >= 1")
+        rocprof = _load_rocprof_module()
+        summary: Any = rocprof.profile_kernel(
+            fn,
+            num_warmup=warmup,
+            num_iter=rep,
+            kernel_name_contains=kernel_name,
+        )
+        return float(summary.mean_ms)
+
+
 def _drifted(per_iter_ms: Sequence[float] | None) -> bool:
     """Did the kernel slow down inside the probe window?
 
@@ -708,6 +745,18 @@ def _try_cuda_synchronize() -> None:
     cuda = getattr(torch, "cuda", None)
     if cuda is not None and cuda.is_available():
         cuda.synchronize()
+
+
+def _load_rocprof_module() -> Any:
+    try:
+        return cast(
+            Any,
+            importlib.import_module("profiling.profilers.rocprof_kernel_profiler"),
+        )
+    except ImportError as exc:
+        raise ProfilerNotImplemented(
+            "Timer.rocprof requires the rocprof kernel profiler module"
+        ) from exc
 
 
 def _load_cupti_module() -> Any:
