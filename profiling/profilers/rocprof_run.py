@@ -136,8 +136,15 @@ def _dsa_sparse_mla_prefill_rocm_triton_builder(spec: dict[str, Any]) -> dict[st
     return build_dsa_sparse_mla_prefill_rocm_triton_kernel(**spec)
 
 
+def _elementwise_torch_rocm_builder(spec: dict[str, Any]) -> dict[str, Any]:
+    from profiling.runners.elementwise.torch_rocm import build_elementwise_kernel
+
+    return build_elementwise_kernel(spec["input_size_bytes"], spec["output_size_bytes"])
+
+
 # (kind, backend) -> builder returning at least {"torch", "kernel"}.
 _BUILDERS: dict[tuple[str, str], Callable[[dict[str, Any]], dict[str, Any]]] = {
+    ("elementwise", "torch_rocm"): _elementwise_torch_rocm_builder,
     ("rms_norm", "torch_rocm"): _rms_norm_torch_rocm_builder,
     ("kda_recurrent_decode", "torch_rocm"): _kda_recurrent_decode_torch_rocm_builder,
     ("kda_chunk_prefill", "torch_rocm"): _kda_chunk_prefill_torch_rocm_builder,
