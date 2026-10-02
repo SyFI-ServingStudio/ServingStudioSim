@@ -128,24 +128,23 @@ fn intra_node_fabric(gpu_name: &str) -> Fabric {
 //   * QKV_NORM_BACKENDS    (q_kv_rms_norm)                   -> torch_rocm
 //   * RMS_NORM_BACKENDS    (rms_norm)                        -> torch_rocm
 //
-// TODO(mi300x-campaign): the kinds below still REUSE the NVIDIA names on MI300X
-// as documented placeholders, so `timing-predict` on MI300X stays red for them
-// until the campaign measures a ROCm backend and adds its `*_BACKENDS_MI300X`
-// pin here. Each needs, by share:
-//   * ALL_REDUCE_BACKENDS  — TP all-reduce: AMD RCCL/aiter
-//     `AiterCustomAllreduce.custom_all_reduce` over Infinity Fabric (a separate
-//     Tier-A kernel, not MNNVL); the gate is already relaxed as a placeholder.
-//   * FP8_GEMM_BACKENDS    — dense/shared FP8 GEMM (batched_gemm): a ROCm fp8
-//     GEMM (aiter / hipBLASLt), not deepgemm.
-//   * FP32_GEMM_BACKENDS   — gemm_fp32_output: a ROCm fp32-output GEMM.
-//   * MQA_LOGITS_BACKENDS / MQA_LOGITS_PREFILL_BACKENDS — indexer logits: a ROCm
-//     mqa-logits kernel, not deepgemm_fp8.
-//   * FP8_QUANT_BACKENDS   — fp8_per_token_group_quant: a ROCm quant kernel.
-//   * INDEX_REMAP_BACKENDS — dsa_sparse_index_remap: a ROCm Triton remap.
-//   * MLA_APPEND_BACKENDS  — mla_cache_append: a ROCm cache-append kernel.
-//   * ELEMENTWISE_BACKENDS — elementwise glue: a ROCm elementwise backend.
-//   * BF16_GEMM / ROUTER_GEMM / MHC / Q_ABSORB / V_UP / TOPK / TOPK_PREFILL —
-//     the low-share tail, still NVIDIA placeholders.
+// The negligible-share tail (Phase-4 ranking, decision #38) now resolves on
+// MI300X through the `elementwise` byte-placeholder floor instead of an
+// NVIDIA-only backend: `fp8_per_token_group_quant`, `gemm_fp32_output` (the DSA
+// index-head weights AND the MoE router GEMM), the DSA indexer logits + top-k
+// pairs (`dsa_{paged_mqa_logits,persistent_topk}_decode`,
+// `dsa_{mqa_logits,topk}_prefill`), `mla_cache_append`, `dsa_sparse_index_remap`,
+// and the mHC norms (`mhc_pre_rms_norm`, `mhc_fused_post_pre_rms_norm`). Each is
+// pinned to its `elementwise_floor` backend via a `*_BACKENDS_MI300X` constant
+// below; see those constants and `profiling/runners/elementwise/floor.py`.
+//
+// TODO(mi300x-campaign): one kind still REUSES its NVIDIA name on MI300X:
+//   * ALL_REDUCE_BACKENDS  — TP all-reduce: a multi-GPU COMM collective, so it
+//     is NOT floorable onto the single-GPU `elementwise` byte-mover (metric
+//     family mismatch). It needs a real AMD RCCL/aiter backend
+//     (`AiterCustomAllreduce.custom_all_reduce` over Infinity Fabric, a separate
+//     Tier-A kernel, not MNNVL). The fabric pin below is already MI300X-correct;
+//     only the backend string remains NVIDIA until that kernel is measured.
 // Everything NAME-INDEPENDENT (gpu_name, fabric) is already wired below.
 const BF16_GEMM_BACKENDS: &[&str] = &["torch_linear_vllm"];
 const FP8_GEMM_BACKENDS: &[&str] = &["deepgemm"];
@@ -200,6 +199,27 @@ const BATCHED_GEMM_BACKENDS_MI300X: &[&str] = &["torch_rocm"];
 // instead. This is also the designed floor the mHC/GEMM/quant/indexer composed
 // kinds route onto as the MI300X campaign proceeds. B200 keeps `triton`.
 const ELEMENTWISE_BACKENDS_MI300X: &[&str] = &["torch_rocm"];
+
+// Elementwise byte-placeholder floor pins (GLM-5.3-Flash MI300X port, decision
+// #37 "mechanism B"). Each of these kinds carries a negligible predicted share
+// of iteration time (Phase-4 ranking, decision #38) and has no MI300X-native
+// backend yet, so on MI300X its cost is floored onto the measured `elementwise`
+// torch_rocm byte-mover via a per-kind `elementwise_floor` backend registered in
+// `profiling/kernels/<kind>.py` (`gpus={MI300X}`, compute-agnostic). The pin is
+// what makes the arch SELECT that backend on MI300X so a real `timing-predict`
+// resolves the kind instead of rejecting its NVIDIA-only default. B200 and every
+// other NVIDIA target keep the constant above, so they stay byte-identical. When
+// the campaign measures a real ROCm backend for one of these, swap its pin here.
+const FP8_QUANT_BACKENDS_MI300X: &[&str] = &["elementwise_floor"];
+const FP32_GEMM_BACKENDS_MI300X: &[&str] = &["elementwise_floor"];
+const ROUTER_GEMM_BACKENDS_MI300X: &[&str] = &["elementwise_floor"];
+const MQA_LOGITS_BACKENDS_MI300X: &[&str] = &["elementwise_floor"];
+const TOPK_BACKENDS_MI300X: &[&str] = &["elementwise_floor"];
+const MQA_LOGITS_PREFILL_BACKENDS_MI300X: &[&str] = &["elementwise_floor"];
+const TOPK_PREFILL_BACKENDS_MI300X: &[&str] = &["elementwise_floor"];
+const MLA_APPEND_BACKENDS_MI300X: &[&str] = &["elementwise_floor"];
+const INDEX_REMAP_BACKENDS_MI300X: &[&str] = &["elementwise_floor"];
+const MHC_BACKENDS_MI300X: &[&str] = &["elementwise_floor"];
 
 /// Pick the MI300X backend list for an MI300X target, else the default
 /// (NVIDIA) list. Additive and gpu-gated — the same shape as
@@ -503,7 +523,7 @@ pub fn build_configs(
         intermediate: intermediate.into(),
         activation_dtype: ACTIVATION_DTYPE,
         gpu_name: gpu.clone(),
-        quant_backends: FP8_QUANT_BACKENDS.to_vec(),
+        quant_backends: pin_mi300x(&gpu, FP8_QUANT_BACKENDS_MI300X, FP8_QUANT_BACKENDS),
         fp8_gemm_backends: pin_mi300x(&gpu, FP8_GEMM_BACKENDS_MI300X, FP8_GEMM_BACKENDS),
         elementwise_backends: pin_mi300x(&gpu, ELEMENTWISE_BACKENDS_MI300X, ELEMENTWISE_BACKENDS),
     };
@@ -524,7 +544,7 @@ pub fn build_configs(
         routed_scaling_denominator: model.routed_scaling.1,
         activation_dtype: ACTIVATION_DTYPE,
         gpu_name: gpu.clone(),
-        quant_backends: FP8_QUANT_BACKENDS.to_vec(),
+        quant_backends: pin_mi300x(&gpu, FP8_QUANT_BACKENDS_MI300X, FP8_QUANT_BACKENDS),
         fused_moe_backends: pin_mi300x(&gpu, FUSED_MOE_BACKENDS_MI300X, FUSED_MOE_BACKENDS),
         expert_demand: demand.clone(),
         folded_rank_position: 0,
@@ -562,7 +582,7 @@ pub fn build_configs(
             rms_eps: model.rms_norm_eps,
             gpu_name: gpu.clone(),
             bf16_gemm_backends: pin_mi300x(&gpu, BF16_GEMM_BACKENDS_MI300X, BF16_GEMM_BACKENDS),
-            fp32_gemm_backends: FP32_GEMM_BACKENDS.to_vec(),
+            fp32_gemm_backends: pin_mi300x(&gpu, FP32_GEMM_BACKENDS_MI300X, FP32_GEMM_BACKENDS),
             qkv_norm_backends: pin_mi300x(&gpu, QKV_NORM_BACKENDS_MI300X, QKV_NORM_BACKENDS),
             mla_bmm_q_absorb_backends: pin_mi300x(
                 &gpu,
@@ -570,17 +590,21 @@ pub fn build_configs(
                 Q_ABSORB_BACKENDS,
             ),
             mla_bmm_v_up_backends: pin_mi300x(&gpu, BATCHED_GEMM_BACKENDS_MI300X, V_UP_BACKENDS),
-            mqa_logits_backends: MQA_LOGITS_BACKENDS.to_vec(),
-            topk_backends: TOPK_BACKENDS.to_vec(),
-            mqa_logits_prefill_backends: MQA_LOGITS_PREFILL_BACKENDS.to_vec(),
-            topk_prefill_backends: TOPK_PREFILL_BACKENDS.to_vec(),
+            mqa_logits_backends: pin_mi300x(&gpu, MQA_LOGITS_BACKENDS_MI300X, MQA_LOGITS_BACKENDS),
+            topk_backends: pin_mi300x(&gpu, TOPK_BACKENDS_MI300X, TOPK_BACKENDS),
+            mqa_logits_prefill_backends: pin_mi300x(
+                &gpu,
+                MQA_LOGITS_PREFILL_BACKENDS_MI300X,
+                MQA_LOGITS_PREFILL_BACKENDS,
+            ),
+            topk_prefill_backends: pin_mi300x(&gpu, TOPK_PREFILL_BACKENDS_MI300X, TOPK_PREFILL_BACKENDS),
             sparse_attention_backends: pin_mi300x(
                 &gpu,
                 SPARSE_ATTN_BACKENDS_MI300X,
                 SPARSE_ATTN_BACKENDS,
             ),
-            mla_cache_append_backends: MLA_APPEND_BACKENDS.to_vec(),
-            index_remap_backends: INDEX_REMAP_BACKENDS.to_vec(),
+            mla_cache_append_backends: pin_mi300x(&gpu, MLA_APPEND_BACKENDS_MI300X, MLA_APPEND_BACKENDS),
+            index_remap_backends: pin_mi300x(&gpu, INDEX_REMAP_BACKENDS_MI300X, INDEX_REMAP_BACKENDS),
             elementwise_backends: pin_mi300x(&gpu, ELEMENTWISE_BACKENDS_MI300X, ELEMENTWISE_BACKENDS),
         },
         dense_ffn: mlp(divide("intermediate_size", model.intermediate_size)?),
@@ -593,14 +617,14 @@ pub fn build_configs(
             num_experts: model.n_routed_experts.into(),
             activation_dtype: ACTIVATION_DTYPE,
             gpu_name: gpu.clone(),
-            gemm_backends: ROUTER_GEMM_BACKENDS.to_vec(),
+            gemm_backends: pin_mi300x(&gpu, ROUTER_GEMM_BACKENDS_MI300X, ROUTER_GEMM_BACKENDS),
         },
         routed: Glm53RoutedMoeLocalWorkletConfig::split_for_ep(routed_template, demand.clone()),
         // Row gather: reads and writes one hidden row per token.
         embedding: ew(hidden_bytes, hidden_bytes),
         hc_expand: ew(hidden_bytes, stream_bytes),
         mhc: MhcRmsNormKernelConfig {
-            backends: MHC_BACKENDS.to_vec(),
+            backends: pin_mi300x(&gpu, MHC_BACKENDS_MI300X, MHC_BACKENDS),
             gpu_name: gpu.clone(),
             hidden_size: model.hidden.into(),
             hc_mult: model.hc_mult,
@@ -1044,8 +1068,12 @@ pub fn build(
             format!("{n}.final_mhc_post"),
             MhcTerminalPostConfig {
                 mhc: cfg.mhc.clone(),
-                pre_backends: MHC_BACKENDS.to_vec(),
-                fused_backends: MHC_BACKENDS.to_vec(),
+                pre_backends: pin_mi300x(&cfg.parallel.gpu_name, MHC_BACKENDS_MI300X, MHC_BACKENDS),
+                fused_backends: pin_mi300x(
+                    &cfg.parallel.gpu_name,
+                    MHC_BACKENDS_MI300X,
+                    MHC_BACKENDS,
+                ),
             },
             bridge,
         )?,
