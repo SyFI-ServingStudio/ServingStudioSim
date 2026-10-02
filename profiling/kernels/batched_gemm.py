@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from profiling.db.args import DType, KernelArgs
-from profiling.db.doc import CUPTI_METHOD, BackendDoc, KernelDoc, arg
+from profiling.db.doc import CUPTI_METHOD, ROCPROF_METHOD, BackendDoc, KernelDoc, arg
 from profiling.db.outlier import BatchOutlierPolicy
 from profiling.db.registry import (
     BackendSupport,
@@ -152,3 +152,36 @@ for _backend, _function, _summary in (
             doc=BackendDoc(summary=_summary, url=_MLA_URL),
         )
     )
+
+
+# ---- MI300X (ROCm) backend -------------------------------------------------
+# The AMD counterpart of the NVIDIA torch_mla_* bmm backends: the same two MLA
+# per-head multiplies (query absorption, value expansion) through torch.bmm on
+# ROCm. bf16, matching the kind's dtype; MI300X-gated so B200 stays
+# byte-identical. One torch.bmm dispatch per call, timed with rocprofv3.
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="torch_rocm",
+        supports=BackendSupport(
+            compute=frozenset({DType.BF16}),
+            gpus=frozenset({"MI300X"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.gemm.torch_rocm",
+            function_name="profile_batched_gemm_torch_rocm",
+        ),
+        table_name=KIND,
+        args_schema=BatchedGemmArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="vllm_rocm_env",
+        doc=BackendDoc(
+            summary=(
+                "torch.bmm (bf16) for MLA query absorption and value expansion on "
+                f"ROCm/MI300X, timed with rocprofv3. {ROCPROF_METHOD}"
+            ),
+            url="https://pytorch.org/docs/stable/generated/torch.bmm.html",
+        ),
+    )
+)

@@ -120,6 +120,26 @@ def _rocm_aiter_fp8_block_fused_moe_builder(spec: dict[str, Any]) -> dict[str, A
     )
 
 
+def _single_gemm_rocm_scaled_mm_builder(spec: dict[str, Any]) -> dict[str, Any]:
+    from profiling.runners.gemm.rocm_scaled_mm import build_single_gemm_scaled_mm_kernel
+
+    return build_single_gemm_scaled_mm_kernel(spec["m"], spec["n"], spec["k"], spec["dtype"])
+
+
+def _single_gemm_torch_rocm_builder(spec: dict[str, Any]) -> dict[str, Any]:
+    from profiling.runners.gemm.torch_rocm import build_single_gemm_torch_rocm_kernel
+
+    return build_single_gemm_torch_rocm_kernel(spec["m"], spec["n"], spec["k"], spec["dtype"])
+
+
+def _batched_gemm_torch_rocm_builder(spec: dict[str, Any]) -> dict[str, Any]:
+    from profiling.runners.gemm.torch_rocm import build_batched_gemm_torch_rocm_kernel
+
+    return build_batched_gemm_torch_rocm_kernel(
+        spec["num_batches"], spec["m"], spec["n"], spec["k"], spec["dtype"]
+    )
+
+
 def _dsa_sparse_mla_attention_rocm_triton_builder(spec: dict[str, Any]) -> dict[str, Any]:
     from profiling.runners.attention.dsa_sparse_mla_attention_rocm_triton import (
         build_dsa_sparse_mla_attention_rocm_triton_kernel,
@@ -151,6 +171,9 @@ _BUILDERS: dict[tuple[str, str], Callable[[dict[str, Any]], dict[str, Any]]] = {
     ("gdn_causal_conv_decode", "torch_rocm"): _gdn_causal_conv_decode_torch_rocm_builder,
     ("gdn_causal_conv_prefill", "torch_rocm"): _gdn_causal_conv_prefill_torch_rocm_builder,
     ("q_kv_rms_norm", "torch_rocm"): _q_kv_rms_norm_torch_rocm_builder,
+    ("single_gemm", "rocm_scaled_mm"): _single_gemm_rocm_scaled_mm_builder,
+    ("single_gemm", "torch_rocm"): _single_gemm_torch_rocm_builder,
+    ("batched_gemm", "torch_rocm"): _batched_gemm_torch_rocm_builder,
     ("nvfp4_fused_moe", "rocm_aiter_fp8_block"): _rocm_aiter_fp8_block_fused_moe_builder,
     (
         "dsa_sparse_mla_attention",
