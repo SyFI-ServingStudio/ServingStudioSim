@@ -1538,6 +1538,7 @@ def test_documented_profile_env_registry_complete():
         "flashinfer_local",
         "sglang_env",
         "vllm_env",
+        "vllm_rocm_env",
     }
     assert set(ENV_REGISTRY) == expected_envs
     assert (
