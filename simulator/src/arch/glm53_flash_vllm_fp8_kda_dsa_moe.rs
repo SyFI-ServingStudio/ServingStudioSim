@@ -182,6 +182,16 @@ const CONV_BACKENDS_MI300X: &[&str] = &["torch_rocm"];
 const QKV_NORM_BACKENDS_MI300X: &[&str] = &["torch_rocm"];
 const SPARSE_ATTN_BACKENDS_MI300X: &[&str] = &["rocm_triton_mla_sparse"];
 const FUSED_MOE_BACKENDS_MI300X: &[&str] = &["rocm_aiter_fp8_block"];
+// Dense/shared FP8 single-GEMM on MI300X: the ROCm `torch._scaled_mm` path
+// (`profiling/kernels/single_gemm.py` `rocm_scaled_mm`), the CDNA3 replacement
+// for the B200 `deepgemm` fp8 GEMM.
+const FP8_GEMM_BACKENDS_MI300X: &[&str] = &["rocm_scaled_mm"];
+// Dense BF16 single-GEMM on MI300X: the ROCm eager F.linear path
+// (`profiling/kernels/single_gemm.py` `torch_rocm`).
+const BF16_GEMM_BACKENDS_MI300X: &[&str] = &["torch_rocm"];
+// Batched BF16 GEMM (MLA q-absorb / v-up) on MI300X: the ROCm batched path
+// (`profiling/kernels/batched_gemm.py` `torch_rocm`).
+const BATCHED_GEMM_BACKENDS_MI300X: &[&str] = &["torch_rocm"];
 // Elementwise byte-mover floor on MI300X: the eager-PyTorch ROCm backend
 // (`profiling/kernels/elementwise.py` `torch_rocm`, timed with rocprofv3). The
 // NVIDIA `triton`/`torch` elementwise rows are CUPTI-measured and carry no
@@ -494,7 +504,7 @@ pub fn build_configs(
         activation_dtype: ACTIVATION_DTYPE,
         gpu_name: gpu.clone(),
         quant_backends: FP8_QUANT_BACKENDS.to_vec(),
-        fp8_gemm_backends: FP8_GEMM_BACKENDS.to_vec(),
+        fp8_gemm_backends: pin_mi300x(&gpu, FP8_GEMM_BACKENDS_MI300X, FP8_GEMM_BACKENDS),
         elementwise_backends: pin_mi300x(&gpu, ELEMENTWISE_BACKENDS_MI300X, ELEMENTWISE_BACKENDS),
     };
     if model.index_topk + model.index_kpool - 1 > SELECTED_K {
@@ -530,7 +540,7 @@ pub fn build_configs(
             conv_kernel_size: model.short_conv_kernel_size.into(),
             activation_dtype: ACTIVATION_DTYPE,
             gpu_name: gpu.clone(),
-            bf16_gemm_backends: BF16_GEMM_BACKENDS.to_vec(),
+            bf16_gemm_backends: pin_mi300x(&gpu, BF16_GEMM_BACKENDS_MI300X, BF16_GEMM_BACKENDS),
             conv_backends: pin_mi300x(&gpu, CONV_BACKENDS_MI300X, CONV_BACKENDS),
             core_backends: pin_mi300x(&gpu, KDA_BACKENDS_MI300X, KDA_BACKENDS),
             elementwise_backends: pin_mi300x(&gpu, ELEMENTWISE_BACKENDS_MI300X, ELEMENTWISE_BACKENDS),
@@ -551,11 +561,15 @@ pub fn build_configs(
             cache_block_size: CACHE_BLOCK_SIZE,
             rms_eps: model.rms_norm_eps,
             gpu_name: gpu.clone(),
-            bf16_gemm_backends: BF16_GEMM_BACKENDS.to_vec(),
+            bf16_gemm_backends: pin_mi300x(&gpu, BF16_GEMM_BACKENDS_MI300X, BF16_GEMM_BACKENDS),
             fp32_gemm_backends: FP32_GEMM_BACKENDS.to_vec(),
             qkv_norm_backends: pin_mi300x(&gpu, QKV_NORM_BACKENDS_MI300X, QKV_NORM_BACKENDS),
-            mla_bmm_q_absorb_backends: Q_ABSORB_BACKENDS.to_vec(),
-            mla_bmm_v_up_backends: V_UP_BACKENDS.to_vec(),
+            mla_bmm_q_absorb_backends: pin_mi300x(
+                &gpu,
+                BATCHED_GEMM_BACKENDS_MI300X,
+                Q_ABSORB_BACKENDS,
+            ),
+            mla_bmm_v_up_backends: pin_mi300x(&gpu, BATCHED_GEMM_BACKENDS_MI300X, V_UP_BACKENDS),
             mqa_logits_backends: MQA_LOGITS_BACKENDS.to_vec(),
             topk_backends: TOPK_BACKENDS.to_vec(),
             mqa_logits_prefill_backends: MQA_LOGITS_PREFILL_BACKENDS.to_vec(),
@@ -612,7 +626,7 @@ pub fn build_configs(
             dtype: ACTIVATION_DTYPE,
         },
         lm_head: SingleGemmKernelConfig {
-            backends: BF16_GEMM_BACKENDS.to_vec(),
+            backends: pin_mi300x(&gpu, BF16_GEMM_BACKENDS_MI300X, BF16_GEMM_BACKENDS),
             gpu_name: gpu,
             n: Dim::param("vocab_per_rank", divide("vocab_size", model.vocab_size)?),
             k: model.hidden.into(),
