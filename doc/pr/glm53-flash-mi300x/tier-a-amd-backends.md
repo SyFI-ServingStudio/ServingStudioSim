@@ -297,3 +297,175 @@ backend needs no `token_corpus`; the arch's MoE composition needs realistic
 8. **all_reduce / collective.** Out of scope here but adjacent: these two kernels
    are measured standalone; their composed cost still rides the arch's AMD
    Infinity-Fabric all-reduce, a separate Tier-A item.
+
+---
+
+## Open questions — resolved (2026-10-02)
+
+Resolved by static introspection (import + `inspect.signature` + source read) of
+the real `aiter` and `vllm.models.glm5next` packages inside the vLLM-ROCm image
+(`current_platform.is_rocm() == True`; vLLM `0.3.1.dev190`, torch 2.12, ROCm 7.2,
+aiter v0.1.21.x). Run in-container on a login node — no GPU kernels launched, so
+no GPU allocation spent. The one thing these static answers cannot settle (which
+HIP kernel string a dispatch actually emits, and that the per-launch dispatch set
+is constant) is called out under Q6/Q7 as a first-real-run check.
+
+**Headline corrections to the scope above.** Two module paths named in the body
+were guesses and are wrong; the real ones are below. And the sparse-MLA attention
+is *not* an AITER-ASM MLA kernel — on both AMD and the CUDA fork it is a
+vLLM-shipped **Triton** kernel, so it follows the proven torch/Triton-on-ROCm
+pattern (like `rms_norm`/KDA), not a from-scratch AITER backend. That lowers the
+risk and effort on Kernel 1.
+
+### Q1 — Sparse-MLA exact callable + signature  *(RESOLVED)*
+
+`rocm_aiter_mla_sparse` is a **module**, not a callable:
+`vllm.v1.attention.ops.rocm_aiter_mla_sparse`. The sparse-MLA **attention** this
+backend wraps is two Triton entry points in it (decode + prefill), both returning
+`None` and writing into `output`:
+
+```
+rocm_sparse_attn_decode(q, kv_cache, swa_k_cache, swa_only, topk_indices,
+    topk_lens, swa_indices, swa_lens, swa_ragged_indices, swa_ragged_indptr,
+    topk_ragged_indices, topk_ragged_indptr, attn_sink, scale, head_dim,
+    nope_head_dim, rope_head_dim, output, extra_cache_nan_free=False,
+    adaptive_splits=False) -> None
+
+rocm_sparse_attn_prefill(q, kv, indices, topk_length, scale, head_dim,
+    nope_head_dim, rope_head_dim, attn_sink, output,
+    ragged_indices=None, ragged_indptr=None) -> None
+```
+
+These are DSV4/DSA sparse Triton kernels (gfx-agnostic; a gfx950-only AITER "OPUS"
+prefill fast-path exists with a Triton fallback on gfx942). The decode kernel
+asserts `swa_k_cache.dtype == torch.uint8` (uint8-packed `fp8_ds_mla` cache).
+
+The indexer (a separate kernel kind, not this one) lives in the same module:
+`rocm_fp8_mqa_logits(...)` / `rocm_fp8_paged_mqa_logits(q_fp8, kv_cache_fp8,
+weights, context_lens, block_tables, schedule_metadata, max_model_len, *,
+compress_ratio=1)`, plus `indexer_k_quant_and_cache_triton` /
+`cp_gather_indexer_k_quant_cache_triton`.
+
+The AITER MLA callable the body speculated about — `aiter.mla.mla_decode_fwd` —
+is the **dense** (non-sparse) MLA decode used by vLLM's standard
+`rocm_aiter_mla` backend, not the GLM sparse path. For reference its signature is
+`mla_decode_fwd(q, kv_buffer, o, qo_indptr, kv_indptr, kv_indices,
+kv_last_page_lens, max_seqlen_q, page_size=1, nhead_kv=1, sm_scale=None, ...,
+q_scale=None, kv_scale=None, ..., causal=True)`. Wrap the Triton
+`rocm_sparse_attn_decode`/`_prefill`, not this.
+
+### Q2 — Sparse-MLA FP8 vs BF16  *(RESOLVED: FP8 supported)*
+
+FP8 E4M3 is supported on MI300X (gfx942); no dtype change is forced on the DSA
+path. The Triton sparse decode kernel consumes an FP8 cache packed as `uint8`
+(`fp8_ds_mla`), and the indexer's `rocm_fp8_paged_mqa_logits` runs an fp8→fp8 MFMA
+path whose kernel is commented "bit-identical on gfx942". Backend `compute` set =
+`{FP8_E4M3}`. (Separately, the AITER *dense* `aiter.mla.mla_decode_fwd` also has
+explicit gfx942 fp8/fp8 branches for `nhead==128` and for `nhead∈{16,32,64}` with
+`nhead*max_seqlen_q==128`; the dedicated DSA-v3.2 kernel `mla_decode_fwd_ds32`
+is `assert gfx950`-only, i.e. MI350-class, but the GLM sparse path does not use
+it.)
+
+### Q3 — Sparse-MLA cache layout + rope  *(RESOLVED: different from flashinfer)*
+
+The AMD cache layout differs from the NVIDIA `flashinfer_trtllm_fp8` pin. The
+synthetic operands must be built as: a `uint8`-packed `fp8_ds_mla` KV cache (not a
+plain FP8 paged latent buffer), with the NoPE and RoPE parts addressed by
+**separate** `nope_head_dim` / `rope_head_dim` arguments, and a dual index
+structure — a sliding-window set (`swa_indices`/`swa_lens`) plus the DSA top-k set
+(`topk_indices`/`topk_lens`), both also accepted in ragged
+(`*_ragged_indices`/`*_ragged_indptr`) form. RoPE is passed explicitly as
+`rope_head_dim`; for GLM-5.3-Flash `qk_rope_head_dim == 0` (the arch already
+asserts this), so `rope_head_dim=0` and the NoPE latent carries the whole head.
+`selected_k = 2176` maps to the top-k index width. This is a genuinely different
+synthetic cache from the B200 runner's.
+
+### Q4 — MoE AITER vs Triton for the GLM dims  *(RESOLVED: AITER runs, not Triton)*
+
+For Silu + FP8 block-scale (`block_shape=[128,128]`, per-token-group-128
+activations) the engine dispatches the **AITER** kernel
+`aiter.fmoe_fp8_blockscale_g1u1`, not the Triton FP8-MoE. The selection chain is
+deterministic from the dims, not shape-gated, so 288/72/top-8/4096/2048/group-128
+is covered:
+
+- `vllm.model_executor.layers.fused_moe.experts.rocm_aiter_moe.rocm_aiter_fused_experts`
+  sets `quant_method = QuantMethod.BLOCK_128x128` **iff**
+  `quant_config.block_shape is not None and quant_config.use_fp8_w8a8` (the GLM
+  case), then calls `rocm_aiter_ops.fused_moe(...)`.
+- vLLM `QuantMethod.BLOCK_128x128` ↔ AITER `QuantType.per_1x128` (`BLOCK_1X128=4`).
+- `aiter.fused_moe.fused_moe` with `quant_type == per_1x128` and fp8 activations
+  binds `fmoe_func = functools.partial(aiter.fmoe_fp8_blockscale_g1u1,
+  fc_scale_blkn=128, ...)`. Its dispatch table row
+  `(Silu, per_1x128, bf16-act, fp8-w, fp8-w, True) : fmoe_fp8_blockscale_g1u1`
+  confirms coverage.
+
+So **AITER is production for this MoE** and is the backend to build. Triton
+fallback is only hit if AITER is disabled or the quant/activation combo falls off
+that table. The symbol `aiter.fmoe_fp8_blockscale_g1u1` is present in the image.
+
+**Path-name correction:** the body's
+`...fused_moe.rocm_aiter_fused_moe.rocm_aiter_fused_experts(..., use_fp8_w8a8=True,
+block_shape=[128,128])` is wrong on both the module and the call shape. Real
+module: `...fused_moe.experts.rocm_aiter_moe`. Real signature takes a
+`FusedMoEConfig moe_config` and a `FusedMoEQuantConfig quant_config` (the
+`use_fp8_w8a8` / `block_shape` / `w1_scale` / `w2_scale` live **on**
+`quant_config`), not loose kwargs:
+`rocm_aiter_fused_experts(hidden_states, w1, w2, topk_weights, topk_ids,
+moe_config, activation=MoEActivation.SILU, ..., quant_config=..., a1q_scale=None,
+...)`.
+
+### Q5 — AITER weight-prep + block-scale API  *(RESOLVED)*
+
+- Weight shuffle: `aiter.ops.shuffle.shuffle_weight(x, layout=(16,16),
+  use_int4=False, is_guinterleave=False, gate_up=False, pad_k_to=0)`. vLLM wraps
+  it as `rocm_aiter_ops.shuffle_weight(tensor, layout=(16,16))` and
+  `shuffle_weights(*tensors, layout=(16,16))`; the FP8 MoE prep path shuffles
+  `w13` (gate-up, stacked) and `w2` each with `layout=(16,16)` (see
+  `quark_moe.py` and `deepseek_v4/amd/model.py`, which also note the shape
+  constraints `K % 128 == 0` and `N % 16 == 0`). A per-expert variant
+  `moe_shuffle_weight(src, experts_cnt=None, is_guinterleave=False,
+  gate_up=False, layout=(16,16))` exists if shuffling the stacked expert tensor
+  directly.
+- Block scales: plain FP32 128×128 weight block scales (`w1_scale`/`w2_scale` on
+  `quant_config`) and per-token-group-128 FP32 activation scales — the
+  `fc_scale_blkn=128` partial above. No FlashInfer BlockMajorK / UE8M0 packing.
+  The impl builds these natively, exactly as the body anticipated.
+
+### Q6 — AITER-vs-Triton symbol signal  *(RESOLVED, with a first-run confirm)*
+
+Assert **AITER ran** by requiring the captured dispatch set to contain the AITER
+block-scale MoE kernel and the AITER MoE-sorting kernel, and to **not** contain
+the Triton MoE kernel:
+
+- AITER (expected): Python symbol `aiter.fmoe_fp8_blockscale_g1u1`, plus
+  `aiter.moe_sorting_fwd` (sorting/scatter). The emitted **HIP kernel string** is
+  a CK/ASM symbol that must be read off the first real rocpd capture and then
+  pinned as the `kernel_name_contains` filter — substring `fmoe` + `g1u1` /
+  `blockscale` is the anchor to look for.
+- Triton fallback (must be absent): `fused_moe_kernel` (the `@triton.jit def
+  fused_moe_kernel` in
+  `vllm.model_executor.layers.fused_moe.fused_moe`), launched via
+  `invoke_fused_moe_triton_kernel`.
+
+### Q7 — rocprofv3 in-process fold exactness  *(still open — impl concern, as scoped)*
+
+Unchanged: no static answer possible. On the first real MI300X run the impl must
+confirm the per-launch dispatch set is constant so `fold_per_launch=True` sums it
+correctly, and pin the AITER MoE HIP kernel string (Q6) from that same capture.
+
+### Q8 — All-reduce Tier-A item  *(RESOLVED: RCCL/aiter over Infinity Fabric, not MNNVL)*
+
+AMD all-reduce is AITER custom all-reduce over Infinity Fabric / XGMI with an RCCL
+collective fallback — there is no MNNVL path. Callables:
+
+- AITER custom all-reduce: `vllm.distributed.device_communicators.aiter_custom_all_reduce.AiterCustomAllreduce.custom_all_reduce(inp)`,
+  which wraps `aiter.dist.device_communicators.custom_all_reduce.CustomAllreduce`.
+  Selected by `CudaCommunicator` when `VLLM_ROCM_USE_AITER_CUSTOM_AR` (default
+  True) and `rocm_aiter_ops.is_custom_all_reduce_enabled()`. Underlying aiter
+  symbols: `aiter.all_reduce` and `aiter.qr_all_reduce` (quick-reduce, quantized).
+- Quantized quick all-reduce (MI300-series only): `QuickAllReduce` (Q8/Q6/Q4/Q3).
+- RCCL collective fallback: `PyNcclCommunicator.all_reduce` (vLLM's NCCL/RCCL
+  wrapper).
+
+So the placeholder gate in `all_reduce_fusion.rs` should resolve to an
+Infinity-Fabric RCCL/aiter all-reduce, not an MNNVL/NVLink-domain collective.
