@@ -31,8 +31,11 @@ _KIND = "dsa_sparse_mla_prefill"
 _BACKEND = "rocm_triton_mla_sparse"
 _FULL = f"{_KIND}:{_BACKEND}"
 _SUPPORTED_NUM_HEADS = frozenset({8, 16})
-# Pinned from the first real MI300X rocpd capture; None until then.
-_DISPATCHES_PER_LAUNCH: int | None = None
+# The ragged attention kernel ``_sparse_attn_prefill_ragged_kernel`` plus the one
+# ``__amd_rocclr_copyBuffer`` the path issues per launch. Pinned from the first
+# real MI300X rocpd capture (lease 448076, gfx942); same callable as the decode
+# backend, so the same steady-state count.
+_DISPATCHES_PER_LAUNCH: int | None = 2
 
 
 def _normalize_pairs(query_context_pairs: Any) -> tuple[tuple[int, int], ...]:

@@ -39,9 +39,13 @@ _KIND = "dsa_sparse_mla_attention"
 _BACKEND = "rocm_triton_mla_sparse"
 _FULL = f"{_KIND}:{_BACKEND}"
 # Per-call GPU-dispatch count of rocm_sparse_attn_prefill on the rope-free Triton
-# path, once its kernels' autotuners have cached a winner. Pinned from the first
-# real MI300X rocpd capture; None until then (the profiler refuses to guess).
-_DISPATCHES_PER_LAUNCH: int | None = None
+# path: the ragged attention kernel ``_sparse_attn_prefill_ragged_kernel`` plus
+# the one ``__amd_rocclr_copyBuffer`` the path issues to stage its output chunk.
+# Pinned from the first real MI300X rocpd capture (job on lease 448076, gfx942);
+# the trailing fold sums the last rep*D dispatches, so a one-time device-init /
+# ragged-index-build prefix is skipped. None would make the profiler refuse to
+# guess a time.
+_DISPATCHES_PER_LAUNCH: int | None = 2
 
 
 def _validate(**kwargs: Any) -> Any:
