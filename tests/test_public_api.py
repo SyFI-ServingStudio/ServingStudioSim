@@ -196,8 +196,8 @@ def db(tmp_path: Path) -> Path:
         metrics, (git_hash, run_at, *versions) = rest[4:8], rest[8:]
         conn.execute(
             "insert into single_gemm (gpu_name, backend, m, n, k, dtype, args_hash, run_key, "
-            "profiler_run_at, time_ms, tflops, memory_bandwidth_gbps, energy_j) "
-            f"values ({', '.join('?' * 13)})",
+            "profiler_run_at, time_ms, tflops, memory_bandwidth_gbps, energy_j, created_at) "
+            f"values ({', '.join('?' * 14)})",
             (
                 gpu,
                 backend,
@@ -206,6 +206,7 @@ def db(tmp_path: Path) -> Path:
                 storage.run_key(conn, (git_hash, *versions)),
                 storage.epoch(run_at),
                 *metrics,
+                storage.now_epoch(),
             ),
         )
     conn.commit()
