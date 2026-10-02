@@ -486,9 +486,10 @@ pub enum IterArchSel {
     /// rank group; MTP is not run. Hardware is selected by the `gpu` key, which
     /// is threaded into every kernel config and the all-reduce fabric: "NVIDIA
     /// B200" (NVLink) or "MI300X" (8x MI300X, Infinity Fabric). The MI300X path
-    /// reuses the NVIDIA kernel-backend names as documented placeholders until
-    /// the MI300X profiling campaign registers the ROCm backends and fills
-    /// profile.db — see the `TODO(mi300x-campaign)` block in the arch file.
+    /// pins the measured ROCm backends for the kernels the profiling campaign
+    /// has filled (fused MoE, sparse MLA, KDA, conv, q/kv-norm, rms-norm) and
+    /// reuses the NVIDIA names as documented placeholders for the rest — see the
+    /// `TODO(mi300x-campaign)` block in the arch file.
     #[supported(gpu = ["NVIDIA B200", "MI300X"], model_config = ["glm53_flash"], fp8 = [true], tp_size = [4], max_model_len = [8192, 65536, 131072, 262144, 524288])]
     Glm53FlashVllmFp8KdaDsaMoe {
         #[serde(flatten)]

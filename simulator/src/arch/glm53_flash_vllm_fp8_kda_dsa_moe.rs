@@ -112,30 +112,40 @@ fn intra_node_fabric(gpu_name: &str) -> Fabric {
 // ============================ L1 kernel-backend pins ========================
 //
 // Each `*_BACKENDS` constant names the profile.db backend key for one kernel
-// kind. These names are the NVIDIA/vLLM-fork backends measured on B200.
+// kind. These names are the NVIDIA/vLLM-fork backends measured on B200 and are
+// the default for every non-MI300X target.
 //
-// TODO(mi300x-campaign): the MI300X path currently REUSES these NVIDIA names as
-// documented placeholders so the arch compiles and is selectable. They are NOT
-// the AMD kernels: Phase 0 found vLLM-ROCm dispatches the model differently
-// (separate aiter / ROCm-Triton launches, not the FlashInfer/TRT-LLM fusion).
-// The parallel MI300X profiling campaign OWNS the real AMD backend names; it
-// must, per kernel kind, either (a) register a ROCm backend under these same
-// names and fill MI300X rows, or (b) introduce new AMD backend names and switch
-// the MI300X path to them (e.g. gpu-conditional on `is_mi300x`). Until then,
-// `timing-predict` on MI300X stays red (no MI300X profile.db rows). The exact
-// pins the campaign must resolve, in priority order of iteration-time share:
-//   * FUSED_MOE_BACKENDS        — routed MoE (B200: flashinfer_trtllm_fp8_block_sm100)
-//   * SPARSE_ATTN_BACKENDS      — DSA sparse attention (B200: flashinfer_trtllm_fp8)
-//   * FP8_GEMM_BACKENDS         — dense/shared FP8 GEMM (B200: deepgemm)
-//   * MQA_LOGITS_BACKENDS /
-//     MQA_LOGITS_PREFILL_BACKENDS — indexer logits (B200: deepgemm_fp8)
-//   * FP8_QUANT_BACKENDS        — fp8 activation quant (B200: vllm_cuda)
-//   * KDA_BACKENDS / CONV_BACKENDS / QKV_NORM_BACKENDS / INDEX_REMAP_BACKENDS
-//                               — KDA + indexer Triton kernels (B200: vllm_triton)
-//   * ALL_REDUCE_BACKENDS       — TP all-reduce (B200: flashinfer_mnnvl; AMD is
-//                                 RCCL/aiter over Infinity Fabric, not MNNVL)
-//   * BF16_GEMM / ROUTER_GEMM / FP32_GEMM / MHC / RMS_NORM / Q_ABSORB /
-//     V_UP / TOPK / TOPK_PREFILL / MLA_APPEND / ELEMENTWISE — the remainder.
+// MI300X diverges because vLLM-ROCm dispatches the model through separate aiter
+// / ROCm-Triton launches, not the FlashInfer/TRT-LLM fusion (Phase 0). Where
+// the MI300X profiling campaign has MEASURED a ROCm backend (rows registered in
+// `profiling/kernels/`), a `*_BACKENDS_MI300X` constant pins it and
+// `pin_mi300x` selects it when `gpu_name` is MI300X; B200 keeps the NVIDIA
+// name, so it stays byte-identical. Pinned so far, by iteration-time share:
+//   * FUSED_MOE_BACKENDS   (nvfp4_fused_moe)                 -> rocm_aiter_fp8_block
+//   * SPARSE_ATTN_BACKENDS (dsa_sparse_mla)                  -> rocm_triton_mla_sparse
+//   * KDA_BACKENDS         (kda_recurrent_decode/chunk_prefill) -> torch_rocm
+//   * CONV_BACKENDS        (gdn_causal_conv decode+prefill)  -> torch_rocm
+//   * QKV_NORM_BACKENDS    (q_kv_rms_norm)                   -> torch_rocm
+//   * RMS_NORM_BACKENDS    (rms_norm)                        -> torch_rocm
+//
+// TODO(mi300x-campaign): the kinds below still REUSE the NVIDIA names on MI300X
+// as documented placeholders, so `timing-predict` on MI300X stays red for them
+// until the campaign measures a ROCm backend and adds its `*_BACKENDS_MI300X`
+// pin here. Each needs, by share:
+//   * ALL_REDUCE_BACKENDS  — TP all-reduce: AMD RCCL/aiter
+//     `AiterCustomAllreduce.custom_all_reduce` over Infinity Fabric (a separate
+//     Tier-A kernel, not MNNVL); the gate is already relaxed as a placeholder.
+//   * FP8_GEMM_BACKENDS    — dense/shared FP8 GEMM (batched_gemm): a ROCm fp8
+//     GEMM (aiter / hipBLASLt), not deepgemm.
+//   * FP32_GEMM_BACKENDS   — gemm_fp32_output: a ROCm fp32-output GEMM.
+//   * MQA_LOGITS_BACKENDS / MQA_LOGITS_PREFILL_BACKENDS — indexer logits: a ROCm
+//     mqa-logits kernel, not deepgemm_fp8.
+//   * FP8_QUANT_BACKENDS   — fp8_per_token_group_quant: a ROCm quant kernel.
+//   * INDEX_REMAP_BACKENDS — dsa_sparse_index_remap: a ROCm Triton remap.
+//   * MLA_APPEND_BACKENDS  — mla_cache_append: a ROCm cache-append kernel.
+//   * ELEMENTWISE_BACKENDS — elementwise glue: a ROCm elementwise backend.
+//   * BF16_GEMM / ROUTER_GEMM / MHC / Q_ABSORB / V_UP / TOPK / TOPK_PREFILL —
+//     the low-share tail, still NVIDIA placeholders.
 // Everything NAME-INDEPENDENT (gpu_name, fabric) is already wired below.
 const BF16_GEMM_BACKENDS: &[&str] = &["torch_linear_vllm"];
 const FP8_GEMM_BACKENDS: &[&str] = &["deepgemm"];
@@ -162,6 +172,31 @@ const MLA_APPEND_BACKENDS: &[&str] = &["vllm_cuda"];
 const INDEX_REMAP_BACKENDS: &[&str] = &["vllm_triton"];
 const FUSED_MOE_BACKENDS: &[&str] = &["flashinfer_trtllm_fp8_block_sm100"];
 const ALL_REDUCE_BACKENDS: &[&str] = &["flashinfer_mnnvl"];
+
+// Measured MI300X (ROCm) backend pins. `pin_mi300x` selects one of these when
+// `gpu_name` is MI300X; every other GPU keeps the NVIDIA constant above, so
+// B200 is byte-identical. All names are registered in `profiling/kernels/`.
+const RMS_NORM_BACKENDS_MI300X: &[&str] = &["torch_rocm"];
+const KDA_BACKENDS_MI300X: &[&str] = &["torch_rocm"];
+const CONV_BACKENDS_MI300X: &[&str] = &["torch_rocm"];
+const QKV_NORM_BACKENDS_MI300X: &[&str] = &["torch_rocm"];
+const SPARSE_ATTN_BACKENDS_MI300X: &[&str] = &["rocm_triton_mla_sparse"];
+const FUSED_MOE_BACKENDS_MI300X: &[&str] = &["rocm_aiter_fp8_block"];
+
+/// Pick the MI300X backend list for an MI300X target, else the default
+/// (NVIDIA) list. Additive and gpu-gated — the same shape as
+/// `intra_node_fabric`, so no NVIDIA path changes.
+fn pin_mi300x(
+    gpu_name: &str,
+    mi300x: &[&'static str],
+    default: &[&'static str],
+) -> Vec<&'static str> {
+    if is_mi300x(gpu_name) {
+        mi300x.to_vec()
+    } else {
+        default.to_vec()
+    }
+}
 
 /// The checkpoint's dimensions, read strictly from its `config.json`.
 #[derive(Clone, Debug, PartialEq)]
@@ -472,7 +507,7 @@ pub fn build_configs(
         activation_dtype: ACTIVATION_DTYPE,
         gpu_name: gpu.clone(),
         quant_backends: FP8_QUANT_BACKENDS.to_vec(),
-        fused_moe_backends: FUSED_MOE_BACKENDS.to_vec(),
+        fused_moe_backends: pin_mi300x(&gpu, FUSED_MOE_BACKENDS_MI300X, FUSED_MOE_BACKENDS),
         expert_demand: demand.clone(),
         folded_rank_position: 0,
     };
@@ -488,8 +523,8 @@ pub fn build_configs(
             activation_dtype: ACTIVATION_DTYPE,
             gpu_name: gpu.clone(),
             bf16_gemm_backends: BF16_GEMM_BACKENDS.to_vec(),
-            conv_backends: CONV_BACKENDS.to_vec(),
-            core_backends: KDA_BACKENDS.to_vec(),
+            conv_backends: pin_mi300x(&gpu, CONV_BACKENDS_MI300X, CONV_BACKENDS),
+            core_backends: pin_mi300x(&gpu, KDA_BACKENDS_MI300X, KDA_BACKENDS),
             elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
         },
         dsa: Glm53DsaAttnLocalWorkletConfig {
@@ -510,14 +545,18 @@ pub fn build_configs(
             gpu_name: gpu.clone(),
             bf16_gemm_backends: BF16_GEMM_BACKENDS.to_vec(),
             fp32_gemm_backends: FP32_GEMM_BACKENDS.to_vec(),
-            qkv_norm_backends: QKV_NORM_BACKENDS.to_vec(),
+            qkv_norm_backends: pin_mi300x(&gpu, QKV_NORM_BACKENDS_MI300X, QKV_NORM_BACKENDS),
             mla_bmm_q_absorb_backends: Q_ABSORB_BACKENDS.to_vec(),
             mla_bmm_v_up_backends: V_UP_BACKENDS.to_vec(),
             mqa_logits_backends: MQA_LOGITS_BACKENDS.to_vec(),
             topk_backends: TOPK_BACKENDS.to_vec(),
             mqa_logits_prefill_backends: MQA_LOGITS_PREFILL_BACKENDS.to_vec(),
             topk_prefill_backends: TOPK_PREFILL_BACKENDS.to_vec(),
-            sparse_attention_backends: SPARSE_ATTN_BACKENDS.to_vec(),
+            sparse_attention_backends: pin_mi300x(
+                &gpu,
+                SPARSE_ATTN_BACKENDS_MI300X,
+                SPARSE_ATTN_BACKENDS,
+            ),
             mla_cache_append_backends: MLA_APPEND_BACKENDS.to_vec(),
             index_remap_backends: INDEX_REMAP_BACKENDS.to_vec(),
             elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
@@ -559,7 +598,7 @@ pub fn build_configs(
         moe_combine_glue: ew(2 * hidden_bytes, hidden_bytes),
         hc_contract_mean: ew(stream_bytes, hidden_bytes),
         final_norm: RmsNormKernelConfig {
-            backends: RMS_NORM_BACKENDS.to_vec(),
+            backends: pin_mi300x(&gpu, RMS_NORM_BACKENDS_MI300X, RMS_NORM_BACKENDS),
             gpu_name: gpu.clone(),
             hidden: model.hidden.into(),
             dtype: ACTIVATION_DTYPE,
