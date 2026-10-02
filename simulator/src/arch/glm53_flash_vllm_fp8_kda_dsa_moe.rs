@@ -182,6 +182,14 @@ const CONV_BACKENDS_MI300X: &[&str] = &["torch_rocm"];
 const QKV_NORM_BACKENDS_MI300X: &[&str] = &["torch_rocm"];
 const SPARSE_ATTN_BACKENDS_MI300X: &[&str] = &["rocm_triton_mla_sparse"];
 const FUSED_MOE_BACKENDS_MI300X: &[&str] = &["rocm_aiter_fp8_block"];
+// Elementwise byte-mover floor on MI300X: the eager-PyTorch ROCm backend
+// (`profiling/kernels/elementwise.py` `torch_rocm`, timed with rocprofv3). The
+// NVIDIA `triton`/`torch` elementwise rows are CUPTI-measured and carry no
+// MI300X data, so the arch's byte-sized glue slots (embedding gather, mHC stream
+// expand/contract, MoE input/combine copies) read this measured MI300X curve
+// instead. This is also the designed floor the mHC/GEMM/quant/indexer composed
+// kinds route onto as the MI300X campaign proceeds. B200 keeps `triton`.
+const ELEMENTWISE_BACKENDS_MI300X: &[&str] = &["torch_rocm"];
 
 /// Pick the MI300X backend list for an MI300X target, else the default
 /// (NVIDIA) list. Additive and gpu-gated — the same shape as
@@ -475,7 +483,7 @@ pub fn build_configs(
     let hidden_bytes = model.hidden * ACTIVATION_DTYPE.size_bytes();
     let stream_bytes = model.hc_mult * hidden_bytes;
     let ew = |input: u32, output: u32| ElementwiseKernelConfig {
-        backends: ELEMENTWISE_BACKENDS.to_vec(),
+        backends: pin_mi300x(&gpu, ELEMENTWISE_BACKENDS_MI300X, ELEMENTWISE_BACKENDS),
         gpu_name: gpu.clone(),
         input_bytes_per_token: input.into(),
         output_bytes_per_token: output.into(),
@@ -487,7 +495,7 @@ pub fn build_configs(
         gpu_name: gpu.clone(),
         quant_backends: FP8_QUANT_BACKENDS.to_vec(),
         fp8_gemm_backends: FP8_GEMM_BACKENDS.to_vec(),
-        elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
+        elementwise_backends: pin_mi300x(&gpu, ELEMENTWISE_BACKENDS_MI300X, ELEMENTWISE_BACKENDS),
     };
     if model.index_topk + model.index_kpool - 1 > SELECTED_K {
         return Err(fit_failed(
@@ -525,7 +533,7 @@ pub fn build_configs(
             bf16_gemm_backends: BF16_GEMM_BACKENDS.to_vec(),
             conv_backends: pin_mi300x(&gpu, CONV_BACKENDS_MI300X, CONV_BACKENDS),
             core_backends: pin_mi300x(&gpu, KDA_BACKENDS_MI300X, KDA_BACKENDS),
-            elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
+            elementwise_backends: pin_mi300x(&gpu, ELEMENTWISE_BACKENDS_MI300X, ELEMENTWISE_BACKENDS),
         },
         dsa: Glm53DsaAttnLocalWorkletConfig {
             hidden: model.hidden.into(),
@@ -559,7 +567,7 @@ pub fn build_configs(
             ),
             mla_cache_append_backends: MLA_APPEND_BACKENDS.to_vec(),
             index_remap_backends: INDEX_REMAP_BACKENDS.to_vec(),
-            elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
+            elementwise_backends: pin_mi300x(&gpu, ELEMENTWISE_BACKENDS_MI300X, ELEMENTWISE_BACKENDS),
         },
         dense_ffn: mlp(divide("intermediate_size", model.intermediate_size)?),
         shared_expert: mlp(divide(
