@@ -7,9 +7,9 @@ registration and image-override behavior without needing docker or a GPU.
 
 from __future__ import annotations
 
-import importlib
+import subprocess
+import sys
 
-import profiling.exec.env as env_module
 from profiling.exec.env import ContainerProfileEnv, resolve_profile_env
 
 
@@ -30,11 +30,28 @@ def test_rocm_env_parallel_to_cuda_env():
     assert cuda_env.image != rocm_env.image
 
 
-def test_rocm_image_respects_env_override(monkeypatch):
-    monkeypatch.setenv("VIBESIM_VLLM_ROCM_PROFILE_IMAGE", "my-registry/vllm-rocm:test")
-    reloaded = importlib.reload(env_module)
-    try:
-        assert reloaded.resolve_profile_env("vllm_rocm_env").image == "my-registry/vllm-rocm:test"
-    finally:
-        monkeypatch.delenv("VIBESIM_VLLM_ROCM_PROFILE_IMAGE", raising=False)
-        importlib.reload(env_module)
+def test_rocm_image_respects_env_override():
+    # The registry reads the image at import time, so test the override in a
+    # fresh interpreter rather than reloading the module in-process (which would
+    # rebind ProfileEnv and break identity for other tests sharing this module).
+    env = dict(**{k: v for k, v in _os_environ().items()})
+    env["VIBESIM_VLLM_ROCM_PROFILE_IMAGE"] = "my-registry/vllm-rocm:test"
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from profiling.exec.env import resolve_profile_env; "
+            "print(resolve_profile_env('vllm_rocm_env').image)",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+        env=env,
+    )
+    assert completed.stdout.strip() == "my-registry/vllm-rocm:test"
+
+
+def _os_environ():
+    import os
+
+    return os.environ
