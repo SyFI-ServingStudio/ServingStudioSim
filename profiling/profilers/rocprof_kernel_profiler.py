@@ -40,13 +40,19 @@ is a debuggable value rather than a silent miss.
 
 from __future__ import annotations
 
+import json
+import os
+import shutil
 import sqlite3
+import subprocess
+import tempfile
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 from statistics import fmean, median
 from typing import Any
 
-from profiling.runners.exceptions import ProfilerNotImplemented
+from profiling.runners.exceptions import KernelLaunchFailed, ProfilerNotImplemented
 
 _NS_PER_MS = 1_000_000.0
 
@@ -344,6 +350,105 @@ def _fold_launches(durations_ms: list[float], num_iter: int) -> list[float]:
             for i in range(num_iter)
         ]
     return list(durations_ms)
+
+
+def _find_rocprofv3() -> str:
+    """Locate the rocprofv3 executable, honoring ROCM_HOME / ROCM_PATH.
+
+    rocprofv3 ships with ROCm; inside the vLLM-ROCm image it is on PATH at
+    /opt/rocm/bin. Raise cleanly when absent so a non-ROCm host reports a missing
+    tracer rather than a confusing subprocess error.
+    """
+
+    found = shutil.which("rocprofv3")
+    if found:
+        return found
+    for root_env in ("ROCM_HOME", "ROCM_PATH"):
+        root = os.environ.get(root_env)
+        if root and (Path(root) / "bin" / "rocprofv3").exists():
+            return str(Path(root) / "bin" / "rocprofv3")
+    default = Path("/opt/rocm/bin/rocprofv3")
+    if default.exists():
+        return str(default)
+    raise ProfilerNotImplemented(
+        "rocprofv3 not found (set ROCM_HOME or run inside the ROCm image)"
+    )
+
+
+def measure_registered_via_rocprofv3(
+    *,
+    kind: str,
+    backend: str,
+    spec: dict[str, Any],
+    kernel_name_contains: str | None,
+    warmup: int,
+    rep: int,
+) -> float:
+    """Measure a registered kernel's per-launch ms via a whole-process rocprofv3 capture.
+
+    rocprofv3's rocpd output is finalized at process exit, so a kernel cannot be
+    traced by a synchronous in-process timer the way CUPTI is. Instead this spawns
+    the launch driver ``profiling.profilers.rocprof_run`` -- which rebuilds the
+    identical kernel from ``(kind, backend, spec)`` and runs ``warmup + rep``
+    launches -- under ``rocprofv3 --kernel-trace --output-format rocpd``, then
+    reads the rocpd, filters to ``kernel_name_contains``, drops the ``warmup``
+    launches, and returns the mean of the remaining ``rep`` kernel-dispatch
+    durations. This runs inside the ROCm image where the worker already executes,
+    so no nested container is involved.
+    """
+
+    rocprofv3 = _find_rocprofv3()
+    with tempfile.TemporaryDirectory(prefix="vibesim-rocprof-") as tmp:
+        rocpd_dir = Path(tmp) / "rocpd"
+        driver = [
+            "python3",
+            "-m",
+            "profiling.profilers.rocprof_run",
+            "--kind",
+            kind,
+            "--backend",
+            backend,
+            "--spec",
+            json.dumps(spec),
+            "--warmup",
+            str(warmup),
+            "--rep",
+            str(rep),
+        ]
+        cmd = [
+            rocprofv3,
+            "--kernel-trace",
+            "--output-format",
+            "rocpd",
+            "-d",
+            str(rocpd_dir),
+            "-o",
+            "run",
+            "--",
+            *driver,
+        ]
+        completed = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if completed.returncode != 0:
+            tail = (completed.stderr or completed.stdout or "")[-1500:]
+            raise KernelLaunchFailed(
+                f"rocprofv3 capture of {kind}:{backend} exited {completed.returncode}: {tail}"
+            )
+        db_files = sorted(rocpd_dir.rglob("*.db"))
+        if not db_files:
+            raise KernelLaunchFailed(
+                f"rocprofv3 produced no rocpd database under {rocpd_dir}; "
+                f"stdout tail: {(completed.stdout or '')[-800:]}"
+            )
+        durations_ms = kernel_dispatch_durations_from_rocpd(
+            str(db_files[0]), kernel_name_contains=kernel_name_contains
+        )
+    if len(durations_ms) < warmup + 1:
+        raise KernelLaunchFailed(
+            f"captured {len(durations_ms)} '{kernel_name_contains}' dispatches, "
+            f"need more than warmup={warmup}"
+        )
+    measured = durations_ms[warmup:]
+    return fmean(measured)
 
 
 def profile_kernel(

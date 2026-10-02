@@ -9,6 +9,8 @@ name, and folding multi-dispatch launches. No GPU and no rocprofiler-sdk needed.
 from __future__ import annotations
 
 import sqlite3
+import subprocess
+import sys
 
 import pytest
 
@@ -225,3 +227,35 @@ def test_profile_kernel_without_sdk_raises():
         from profiling.profilers.rocprof_kernel_profiler import profile_kernel
 
         profile_kernel(lambda: None, num_iter=4)
+
+
+def test_find_rocprofv3_absent_raises(monkeypatch):
+    # The whole-process capture must report a missing tracer clearly rather than
+    # fail deep in a subprocess call.
+    import profiling.profilers.rocprof_kernel_profiler as mod
+
+    monkeypatch.setattr(mod.shutil, "which", lambda _name: None)
+    monkeypatch.delenv("ROCM_HOME", raising=False)
+    monkeypatch.delenv("ROCM_PATH", raising=False)
+    monkeypatch.setattr(mod.Path, "exists", lambda self: False)
+    with pytest.raises(ProfilerNotImplemented, match="rocprofv3 not found"):
+        mod._find_rocprofv3()
+
+
+def test_rocprof_run_builder_registry_has_rms_norm():
+    # The launch driver must know how to rebuild the one wired kernel from its
+    # (kind, backend) spec.
+    import profiling.profilers.rocprof_run as rr
+
+    assert ("rms_norm", "torch_rocm") in rr._BUILDERS
+
+
+def test_rocprof_run_import_does_not_eager_import_torch():
+    # Importing the driver must not pull in torch (built lazily per spec).
+    command = [
+        sys.executable,
+        "-c",
+        "import sys; import profiling.profilers.rocprof_run; print('torch' in sys.modules)",
+    ]
+    completed = subprocess.run(command, capture_output=True, text=True, check=True)
+    assert completed.stdout.strip() == "False"

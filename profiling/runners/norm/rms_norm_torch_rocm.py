@@ -16,15 +16,19 @@ from typing import Any
 
 from profiling.db.args import DType
 from profiling.profilers.energy import Energy
-from profiling.profilers.timer import Timer
 from profiling.runners.exceptions import KernelLaunchFailed, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
 
 _EPS = 1e-6
-# Count every dispatch of the one logical rms_norm call rather than filtering a
-# device kernel name: the fused ROCm kernel name is release-dependent, and the
-# call issues a single logical launch, so summing its dispatches is exact.
-_KERNEL_NAME: str | None = None
+# torch.nn.functional.rms_norm dispatches to the vectorized layer-norm kernel on
+# ROCm (verified on MI210 / torch 2.12+rocm: display_name
+# "vectorized_layer_norm_kernel<c10::BFloat16, float, true>"). rocprofv3 traces
+# the whole process, so the measured launches are isolated from the input-setup
+# kernels (randn) by this substring; it is the stable device-kernel family name,
+# not release-pinned template args.
+_KERNEL_NAME = "vectorized_layer_norm_kernel"
+_WARMUP = 5
+_REP = 20
 _SUPPORTED_COMPUTE = frozenset({DType.BF16, DType.FP16})
 
 
@@ -53,42 +57,78 @@ def _validate_rocm_device(torch: Any) -> None:
         raise ProfilerNotImplemented("a ROCm device is required for the torch_rocm backend")
 
 
+def build_rms_norm_kernel(m: int, hidden: int, dtype: DType | str) -> dict[str, Any]:
+    """Construct the timed callable + fixed inputs, shared by the runner and the
+    rocprofv3 launch driver (``profiling.profilers.rocprof_run``).
+
+    Returning the pieces (not just the callable) lets the runner run its
+    correctness check and lets the under-rocprofv3 driver replay the identical
+    kernel from the same spec with the same fixed seed, so the captured
+    dispatches are the exact launches the runner would have timed.
+    """
+    m, hidden, dtype = _validate_args(m, hidden, dtype)
+    import torch
+    import torch.nn.functional as F
+
+    _validate_rocm_device(torch)
+    torch_dtype = dtype.torch()
+    generator = torch.Generator(device="cuda").manual_seed(17)
+    input_tensor = torch.randn((m, hidden), dtype=torch_dtype, device="cuda", generator=generator)
+    weight = torch.randn((hidden,), dtype=torch_dtype, device="cuda", generator=generator)
+
+    def kernel() -> Any:
+        return F.rms_norm(input_tensor, (hidden,), weight, _EPS)
+
+    return {
+        "torch": torch,
+        "kernel": kernel,
+        "input_tensor": input_tensor,
+        "weight": weight,
+        "torch_dtype": torch_dtype,
+        "warmup": _WARMUP,
+        "rep": _REP,
+        "kernel_name": _KERNEL_NAME,
+    }
+
+
 def profile_rms_norm_torch_rocm(m: int, hidden: int, dtype: DType | str) -> ComputeMetrics:
-    """Profile PyTorch's fused RMSNorm on a ROCm device."""
+    """Profile PyTorch's fused RMSNorm on a ROCm device via rocprofv3."""
     m, hidden, dtype = _validate_args(m, hidden, dtype)
     try:
-        import torch
-        import torch.nn.functional as F
+        import torch  # noqa: F401
     except ImportError as exc:
         raise ProfilerNotImplemented(
             "torch is required for the rms_norm torch_rocm backend"
         ) from exc
 
-    _validate_rocm_device(torch)
-
     try:
-        torch_dtype = dtype.torch()
-        generator = torch.Generator(device="cuda").manual_seed(17)
-        input_tensor = torch.randn(
-            (m, hidden), dtype=torch_dtype, device="cuda", generator=generator
-        )
-        weight = torch.randn((hidden,), dtype=torch_dtype, device="cuda", generator=generator)
+        from profiling.profilers.rocprof_kernel_profiler import measure_registered_via_rocprofv3
 
-        def kernel() -> Any:
-            return F.rms_norm(input_tensor, (hidden,), weight, _EPS)
-
+        built = build_rms_norm_kernel(m, hidden, dtype)
+        torch = built["torch"]
+        kernel = built["kernel"]
         output = kernel()
         torch.cuda.synchronize()
-        values = input_tensor.float()
+        values = built["input_tensor"].float()
         expected = values * torch.rsqrt(values.square().mean(-1, keepdim=True) + _EPS)
         torch.testing.assert_close(
             output.float(),
-            (expected * weight.float()).to(torch_dtype).float(),
+            (expected * built["weight"].float()).to(built["torch_dtype"]).float(),
             rtol=2e-2,
             atol=2e-2,
         )
 
-        time_ms = Timer.rocprof(kernel, kernel_name=_KERNEL_NAME)
+        # Whole-process rocprofv3 capture of the identical kernel, replayed from
+        # the same spec under the tracer; kernel-only time from rocpd dispatch
+        # durations with warmup launches dropped.
+        time_ms = measure_registered_via_rocprofv3(
+            kind="rms_norm",
+            backend="torch_rocm",
+            spec={"m": m, "hidden": hidden, "dtype": dtype.value},
+            kernel_name_contains=_KERNEL_NAME,
+            warmup=_WARMUP,
+            rep=_REP,
+        )
         energy_j = Energy.perf(kernel, warmup=5, per_iter_time_ms=time_ms)
 
         # Logical traffic: read input and weight, write output.
