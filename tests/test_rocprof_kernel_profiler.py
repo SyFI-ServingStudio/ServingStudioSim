@@ -153,6 +153,71 @@ def test_not_a_dispatch_db_raises(tmp_path):
         kernel_dispatch_durations_from_rocpd(str(db))
 
 
+def _write_real_shape_rocpd(path, dispatches):
+    """Reproduce the real rocprofv3 1.3.2 / ROCm 7.2 rocpd shape.
+
+    Verified against a live MI210 capture: GUID-suffixed table names, a
+    ``rocpd_kernel_dispatch_<guid>`` table with ``start``/``end`` BIGINT and a
+    ``kernel_id`` FK into ``rocpd_info_kernel_symbol_<guid>`` (``display_name``),
+    plus the ``region_name_id`` integer column that must NOT be mistaken for the
+    kernel name. ``dispatches`` is ``(start_ns, end_ns, display_name)``.
+    """
+    guid = "0000b253_e83e_783e_9413_8df416218653"
+    sym = f"rocpd_info_kernel_symbol_{guid}"
+    disp = f"rocpd_kernel_dispatch_{guid}"
+    conn = sqlite3.connect(path)
+    conn.execute(f"CREATE TABLE {sym} (id INTEGER PRIMARY KEY, kernel_name TEXT, display_name TEXT)")
+    conn.execute(
+        f"CREATE TABLE {disp} (id INTEGER PRIMARY KEY, kernel_id INTEGER, "
+        "queue_id INTEGER, stream_id INTEGER, start BIGINT, end BIGINT, "
+        "region_name_id INTEGER, event_id INTEGER)"
+    )
+    conn.execute(f"CREATE TABLE rocpd_string_{guid} (id INTEGER PRIMARY KEY, string TEXT)")
+    ids = {}
+    for _s, _e, name in dispatches:
+        if name not in ids:
+            ids[name] = len(ids) + 1
+            conn.execute(
+                f"INSERT INTO {sym} (id, kernel_name, display_name) VALUES (?, ?, ?)",
+                (ids[name], f"_mangled_{name}", name),
+            )
+    for i, (start, end, name) in enumerate(dispatches, start=1):
+        conn.execute(
+            f"INSERT INTO {disp} (id, kernel_id, queue_id, stream_id, start, end, "
+            "region_name_id, event_id) VALUES (?, ?, 1, 0, ?, ?, ?, ?)",
+            (i, ids[name], start, end, i, i),
+        )
+    conn.commit()
+    conn.close()
+
+
+def test_real_rocpd_shape_resolves_display_name_via_join(tmp_path):
+    # The region_name_id decoy must NOT be picked as the name column; resolution
+    # must join to the kernel-symbol table and read display_name.
+    db = tmp_path / "real.db"
+    _write_real_shape_rocpd(
+        db,
+        [
+            (0, 42_000, "distribution_elementwise_grid_stride_kernel"),
+            (100_000, 111_200, "vectorized_layer_norm_kernel<c10::BFloat16>"),
+            (200_000, 211_200, "vectorized_layer_norm_kernel<c10::BFloat16>"),
+        ],
+    )
+    conn = sqlite3.connect(db)
+    try:
+        schema = resolve_rocpd_schema(conn)
+    finally:
+        conn.close()
+    assert "rocpd_kernel_dispatch_" in schema.dispatch_table
+    assert (schema.start_column, schema.end_column) == ("start", "end")
+    assert schema.name_table is not None and "kernel_symbol" in schema.name_table
+    assert schema.name_column == "display_name"
+    norm = kernel_dispatch_durations_from_rocpd(
+        str(db), kernel_name_contains="vectorized_layer_norm_kernel"
+    )
+    assert norm == pytest.approx([0.0112, 0.0112])
+
+
 def test_profile_kernel_without_sdk_raises():
     # On a CPU host rocprofiler-sdk is absent, so the in-process collector must
     # fail honestly rather than fabricate a time.

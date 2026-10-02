@@ -53,21 +53,28 @@ _NS_PER_MS = 1_000_000.0
 # Candidate rocpd table names, most-specific first. Discovery prefers a name
 # containing "kernel_dispatch", then "dispatch", then the older generic op table.
 _DISPATCH_TABLE_HINTS = ("kernel_dispatch", "dispatch", "rocpd_op", "_op")
-# Candidate name/string tables carrying the kernel symbol text.
+# Candidate name/string tables carrying the kernel symbol text. The kernel
+# symbol table is preferred over the generic string table because rocpd links a
+# dispatch to it directly by kernel_id (verified on ROCm 7.2 / rocprofv3 1.3.2).
 _NAME_TABLE_HINTS = ("kernel_symbol", "kernel_name", "string")
 # Known start/end timestamp column aliases, checked in order.
 _START_COLUMN_HINTS = ("start", "start_timestamp", "begin_ns", "start_ns", "begin")
 _END_COLUMN_HINTS = ("end", "end_timestamp", "end_ns", "finish_ns", "finish")
-# Known kernel-name column aliases on either the dispatch row or the name table.
+# Known kernel-name column aliases. display_name (demangled) is preferred over
+# the mangled kernel_name so a substring filter matches human-readable text.
 _NAME_COLUMN_HINTS = (
-    "kernel_name",
-    "formatted_kernel_name",
     "display_name",
+    "formatted_kernel_name",
     "demangled_name",
+    "kernel_name",
     "name",
     "string",
     "value",
 )
+# Foreign-key column on the dispatch row pointing at the kernel-symbol table.
+_NAME_FK_HINTS = ("kernel_id", "symbol_id", "name_id", "string_id")
+# Primary-key column on the kernel-symbol / string table.
+_NAME_PK_HINTS = ("id", "kernel_id", "symbol_id")
 
 
 @dataclass(frozen=True)
@@ -164,22 +171,34 @@ def resolve_rocpd_schema(conn: sqlite3.Connection) -> RocpdResolvedSchema:
             f"timestamp columns; columns={columns}"
         )
 
-    # Kernel name may live on the dispatch row itself (CSV-equivalent shape) or
-    # on a joined symbol/string table keyed by a *_id column.
-    name_table: str | None = None
-    name_column = _first_column_matching(columns, _NAME_COLUMN_HINTS)
-    if name_column is None:
-        name_table = _first_table_matching(tables, _NAME_TABLE_HINTS)
-        if name_table is not None:
-            name_column = _first_column_matching(
-                _column_names(conn, name_table), _NAME_COLUMN_HINTS
+    # Kernel name: real rocpd keeps it on a joined kernel-symbol table addressed
+    # by the dispatch's kernel_id, so prefer that join. Only fall back to a name
+    # column on the dispatch row itself when no symbol table + FK exists -- and
+    # when doing so, ignore *_id columns, which are integer foreign keys (e.g.
+    # rocpd's ``region_name_id``), not the kernel name text.
+    name_table = _first_table_matching(tables, _NAME_TABLE_HINTS)
+    fk_column = _first_column_matching(columns, _NAME_FK_HINTS)
+    if name_table is not None and fk_column is not None:
+        name_column = _first_column_matching(
+            _column_names(conn, name_table), _NAME_COLUMN_HINTS
+        )
+        if name_column is not None:
+            return RocpdResolvedSchema(
+                dispatch_table=dispatch_table,
+                start_column=start_column,
+                end_column=end_column,
+                name_table=name_table,
+                name_column=name_column,
             )
+
+    text_columns = [column for column in columns if not column.lower().endswith("_id")]
+    direct_name = _first_column_matching(text_columns, _NAME_COLUMN_HINTS)
     return RocpdResolvedSchema(
         dispatch_table=dispatch_table,
         start_column=start_column,
         end_column=end_column,
-        name_table=name_table if name_column is not None else None,
-        name_column=name_column,
+        name_table=None,
+        name_column=direct_name,
     )
 
 
@@ -199,11 +218,9 @@ def _dispatch_rows(
         # Join the dispatch's *_id column to the name table's id. rocpd uses a
         # ``*kernel*id`` foreign key; discover it rather than hard-coding.
         dispatch_columns = _column_names(conn, dispatch)
-        fk = _first_column_matching(
-            dispatch_columns, ("kernel_id", "symbol_id", "name_id", "string_id")
-        )
+        fk = _first_column_matching(dispatch_columns, _NAME_FK_HINTS)
         name_columns = _column_names(conn, schema.name_table)
-        pk = _first_column_matching(name_columns, ("id", "kernel_id", "symbol_id"))
+        pk = _first_column_matching(name_columns, _NAME_PK_HINTS)
         if fk is not None and pk is not None:
             sql = (
                 f'SELECT (d."{end}" - d."{start}") AS dur, n."{schema.name_column}" '
