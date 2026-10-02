@@ -120,6 +120,22 @@ def _rocm_aiter_fp8_block_fused_moe_builder(spec: dict[str, Any]) -> dict[str, A
     )
 
 
+def _dsa_sparse_mla_attention_rocm_triton_builder(spec: dict[str, Any]) -> dict[str, Any]:
+    from profiling.runners.attention.dsa_sparse_mla_attention_rocm_triton import (
+        build_dsa_sparse_mla_attention_rocm_triton_kernel,
+    )
+
+    return build_dsa_sparse_mla_attention_rocm_triton_kernel(**spec)
+
+
+def _dsa_sparse_mla_prefill_rocm_triton_builder(spec: dict[str, Any]) -> dict[str, Any]:
+    from profiling.runners.attention.dsa_sparse_mla_prefill_rocm_triton import (
+        build_dsa_sparse_mla_prefill_rocm_triton_kernel,
+    )
+
+    return build_dsa_sparse_mla_prefill_rocm_triton_kernel(**spec)
+
+
 # (kind, backend) -> builder returning at least {"torch", "kernel"}.
 _BUILDERS: dict[tuple[str, str], Callable[[dict[str, Any]], dict[str, Any]]] = {
     ("rms_norm", "torch_rocm"): _rms_norm_torch_rocm_builder,
@@ -129,6 +145,14 @@ _BUILDERS: dict[tuple[str, str], Callable[[dict[str, Any]], dict[str, Any]]] = {
     ("gdn_causal_conv_prefill", "torch_rocm"): _gdn_causal_conv_prefill_torch_rocm_builder,
     ("q_kv_rms_norm", "torch_rocm"): _q_kv_rms_norm_torch_rocm_builder,
     ("nvfp4_fused_moe", "rocm_aiter_fp8_block"): _rocm_aiter_fp8_block_fused_moe_builder,
+    (
+        "dsa_sparse_mla_attention",
+        "rocm_triton_mla_sparse",
+    ): _dsa_sparse_mla_attention_rocm_triton_builder,
+    (
+        "dsa_sparse_mla_prefill",
+        "rocm_triton_mla_sparse",
+    ): _dsa_sparse_mla_prefill_rocm_triton_builder,
 }
 
 

@@ -94,6 +94,7 @@ def test_registration_support_family_environment_and_facades() -> None:
     assert known_backends(KIND) == [
         "torch",
         "flashinfer_trtllm_fp8",
+        "rocm_triton_mla_sparse",
         "vllm_flashmla_bf16",
     ]
     for spec in (torch_spec, flashmla_spec):
