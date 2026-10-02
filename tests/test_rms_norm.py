@@ -102,3 +102,35 @@ def test_vllm_cuda_backend_runs_vllms_own_op_in_the_vllm_image():
     assert _validate_args(32, 4096, "bf16")[:2] == (32, 4096)
     with pytest.raises(ValueError, match="bf16"):
         _validate_args(32, 4096, "fp16")
+
+
+def test_torch_rocm_backend_is_mi300x_gated_and_runs_in_rocm_image():
+    # The MI300X backend is additive: it declares MI300X support, selects the
+    # ROCm image, and leaves the NVIDIA rows untouched.
+    from profiling.db.registry import find_kernel_profiler_spec
+    from profiling.runners.norm.rms_norm_torch_rocm import _validate_args
+
+    spec = find_kernel_profiler_spec("rms_norm", "torch_rocm")
+    assert spec.subprocess_env == "vllm_rocm_env"
+    assert spec.supports.gpus == frozenset({"MI300X"})
+    assert spec.runner_ref.function_name == "profile_rms_norm_torch_rocm"
+    assert spec.runner_ref.module_name == "profiling.runners.norm.rms_norm_torch_rocm"
+    # bf16 and fp16 are supported activation precisions; fp8 is not.
+    assert _validate_args(32, 4096, "bf16")[:2] == (32, 4096)
+    assert _validate_args(32, 4096, "fp16")[:2] == (32, 4096)
+    with pytest.raises(ValueError, match="supports"):
+        _validate_args(32, 4096, "fp8_e4m3")
+
+
+def test_backend_gating_allows_mi300x_and_preserves_nvidia():
+    # allows() must pass for the MI300X backend at MI300X and reject it on an
+    # NVIDIA SKU, while the NVIDIA vllm_cuda row stays MI300X-rejecting.
+    from profiling.db.registry import find_kernel_profiler_spec
+
+    rocm = find_kernel_profiler_spec("rms_norm", "torch_rocm").supports
+    assert rocm.allows(DType.BF16, gpu="MI300X") is True
+    assert rocm.allows(DType.BF16, gpu="NVIDIA B200") is False
+
+    nvidia = find_kernel_profiler_spec("rms_norm", "vllm_cuda").supports
+    assert nvidia.allows(DType.BF16, gpu="NVIDIA B200") is True
+    assert nvidia.allows(DType.BF16, gpu="MI300X") is False
