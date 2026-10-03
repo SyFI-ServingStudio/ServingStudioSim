@@ -69,14 +69,14 @@ use crate::worklet::{
 };
 
 const ARCH_KIND: &str = "glm53_flash_vllm_fp8_kda_dsa_moe";
-const ACTIVATION_DTYPE: DType = DType::Bf16;
+pub(crate) const ACTIVATION_DTYPE: DType = DType::Bf16;
 /// Sparse page-table width: `round_up(index_topk + index_kpool - 1, 128)`.
 const SELECTED_K: u32 = 2176;
 const CACHE_BLOCK_SIZE: u32 = 64;
 /// vLLM's hybrid block size for this deployment ("attention block size 2176"
 /// in the capture's server log): the token interval at which the KDA state is
 /// checkpointed and a prefix-cache hit can resume.
-const HYBRID_BLOCK_SIZE: u32 = 2176;
+pub(crate) const HYBRID_BLOCK_SIZE: u32 = 2176;
 /// vLLM runs the shared expert on an aux stream at or below this batch size.
 const SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: u32 = 256;
 /// `Max{overlap}` of the aux-stream shared expert against its routed slice.
@@ -93,7 +93,7 @@ const FP8_QUANT_BACKENDS: &[&str] = &["vllm_cuda"];
 const ROUTER_GEMM_BACKENDS: &[&str] = &["torch_cublas"];
 const FP32_GEMM_BACKENDS: &[&str] = &["torch_cublas"];
 const ELEMENTWISE_BACKENDS: &[&str] = &["triton"];
-const MHC_BACKENDS: &[&str] = &["vllm_tilelang"];
+pub(crate) const MHC_BACKENDS: &[&str] = &["vllm_tilelang"];
 const RMS_NORM_BACKENDS: &[&str] = &["vllm_cuda"];
 const KDA_BACKENDS: &[&str] = &["vllm_triton"];
 const CONV_BACKENDS: &[&str] = &["vllm_triton"];
@@ -673,57 +673,77 @@ enum Ffn {
     Moe(MoeBlock),
 }
 
-struct LayerGroup {
+/// One built layer group: the leaves of a single layer of its shape. The
+/// `Scale` over its layer count is the caller's, so a pipeline stage can fold
+/// the same built group over only the layers it owns.
+pub(crate) struct LayerGroup {
     label: String,
     layers: Vec<u32>,
     attn_boundary: Boundary,
     attn: Attention,
-    attn_all_reduce: Op<AllReduceFusionKernel>,
+    /// `None` on one GPU: a TP1 sublayer reduces nothing.
+    attn_all_reduce: Option<Op<AllReduceFusionKernel>>,
     ffn_boundary: Op<MhcFusedPostPreRmsNormKernel>,
     ffn: Ffn,
-    ffn_all_reduce: Op<AllReduceFusionKernel>,
+    ffn_all_reduce: Option<Op<AllReduceFusionKernel>>,
 }
 
 impl LayerGroup {
+    pub(crate) fn label(&self) -> &str {
+        &self.label
+    }
+
+    /// Every model layer of this shape, in layer order.
+    pub(crate) fn layers(&self) -> &[u32] {
+        &self.layers
+    }
+
     fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
+        CostNode::Labeled {
+            label: format!("{} layers {:?}", self.label, self.layers),
+            child: Box::new(CostNode::Scale {
+                n: self.layers.len() as u32,
+                child: Box::new(self.compile_layer(builder)),
+            }),
+        }
+    }
+
+    /// One layer's leaves, unscaled.
+    pub(crate) fn compile_layer(&self, builder: &mut CostTreeBuilder) -> CostNode {
         // Compile in eval push order (INV-2): the boundary's leaf precedes
         // the attention leaves.
-        let body = CostNode::Sum(vec![
+        let mut children = vec![
             self.attn_boundary.compile(builder),
             match &self.attn {
                 Attention::Kda(worklet) => worklet.compile(builder),
                 Attention::Dsa(worklet) => worklet.compile(builder),
             },
-            self.attn_all_reduce.compile(builder),
-            self.ffn_boundary.compile(builder),
-            match &self.ffn {
-                Ffn::Dense(worklet) => worklet.compile(builder),
-                Ffn::Moe(block) => block.compile(builder),
-            },
-            self.ffn_all_reduce.compile(builder),
-        ]);
-        CostNode::Labeled {
-            label: format!("{} layers {:?}", self.label, self.layers),
-            child: Box::new(CostNode::Scale {
-                n: self.layers.len() as u32,
-                child: Box::new(body),
-            }),
-        }
+        ];
+        children.extend(self.attn_all_reduce.as_ref().map(|op| op.compile(builder)));
+        children.push(self.ffn_boundary.compile(builder));
+        children.push(match &self.ffn {
+            Ffn::Dense(worklet) => worklet.compile(builder),
+            Ffn::Moe(block) => block.compile(builder),
+        });
+        children.extend(self.ffn_all_reduce.as_ref().map(|op| op.compile(builder)));
+        CostNode::Sum(children)
     }
 
     /// `tokens` is the graph-padded row count every kernel outside the
     /// attention graph break runs on; attention reads the real rows in `batch`.
-    fn eval(&self, batch: &NormalizedBatch, tokens: u32, ev: &mut Evaluator) {
+    pub(crate) fn eval(&self, batch: &NormalizedBatch, tokens: u32, ev: &mut Evaluator) {
         self.attn_boundary.eval(tokens, ev);
         match &self.attn {
             Attention::Kda(worklet) => worklet.eval(&batch.kda, ev),
             Attention::Dsa(worklet) => worklet.eval(&batch.dsa, ev),
         }
-        push(
-            &self.attn_all_reduce,
-            AllReduceFusionKernelInput { num_tokens: tokens },
-            ev,
-        );
+        if let Some(all_reduce) = &self.attn_all_reduce {
+            push(
+                all_reduce,
+                AllReduceFusionKernelInput { num_tokens: tokens },
+                ev,
+            );
+        }
         push(
             &self.ffn_boundary,
             MhcRmsNormKernelInput { num_tokens: tokens },
@@ -735,12 +755,136 @@ impl LayerGroup {
             }
             Ffn::Moe(block) => block.eval(tokens, ev),
         }
-        push(
-            &self.ffn_all_reduce,
-            AllReduceFusionKernelInput { num_tokens: tokens },
-            ev,
-        );
+        if let Some(all_reduce) = &self.ffn_all_reduce {
+            push(
+                all_reduce,
+                AllReduceFusionKernelInput { num_tokens: tokens },
+                ev,
+            );
+        }
     }
+}
+
+/// Build one layer group's leaves, named `{name}.{group label}.*`.
+/// `all_reduce` adds the TP all-reduce that closes each sublayer.
+pub(crate) fn build_layer_group(
+    name: &str,
+    group: &Glm53FlashLayerGroup,
+    resolved: &Glm53FlashVllmResolved,
+    all_reduce: bool,
+    bridge: &PerfApiBridge,
+) -> std::result::Result<LayerGroup, BuildError> {
+    let cfg = &resolved.raw_cfg;
+    let prefix = format!("{name}.{}", group.label);
+    let p = prefix.as_str();
+    let attn_boundary = if group.opens_stream {
+        Boundary::Pre(atomic(
+            p,
+            "attn_mhc_pre",
+            cfg.mhc.clone(),
+            MhcPreRmsNormKernel::build,
+            bridge,
+        )?)
+    } else {
+        Boundary::Fused(atomic(
+            p,
+            "attn_mhc_post_pre",
+            cfg.mhc.clone(),
+            MhcFusedPostPreRmsNormKernel::build,
+            bridge,
+        )?)
+    };
+    let attn = match group.attn {
+        AttnKind::Kda => Attention::Kda(Glm53KdaAttnLocalWorklet::build(
+            format!("{p}.kda"),
+            resolved.kda.clone(),
+            bridge,
+        )?),
+        AttnKind::Dsa => Attention::Dsa(Glm53DsaAttnLocalWorklet::build(
+            format!("{p}.dsa"),
+            resolved.dsa.clone(),
+            bridge,
+        )?),
+    };
+    let ffn = match group.ffn {
+        FfnKind::Dense => Ffn::Dense(Glm53Fp8MlpLocalWorklet::build(
+            format!("{p}.dense_ffn"),
+            resolved.dense_ffn.clone(),
+            bridge,
+        )?),
+        FfnKind::Moe => {
+            let moe = format!("{p}.moe");
+            let m = moe.as_str();
+            Ffn::Moe(MoeBlock {
+                router: Glm53MoeRouterLocalWorklet::build(
+                    format!("{m}.router"),
+                    Glm53MoeRouterLocalWorklet::resolve_config(&cfg.router),
+                    bridge,
+                )?,
+                input_glue: atomic(
+                    m,
+                    "input_glue",
+                    cfg.moe_input_glue.clone(),
+                    ElementwiseKernel::build,
+                    bridge,
+                )?,
+                shared_expert: Glm53Fp8MlpLocalWorklet::build(
+                    format!("{m}.shared_expert"),
+                    resolved.shared_expert.clone(),
+                    bridge,
+                )?,
+                routed: resolved
+                    .routed
+                    .iter()
+                    .enumerate()
+                    .map(|(rank, routed)| {
+                        Glm53RoutedMoeLocalWorklet::build(
+                            format!("{m}.routed_rank{rank}"),
+                            routed.clone(),
+                            bridge,
+                        )
+                    })
+                    .collect::<std::result::Result<_, _>>()?,
+                combine_glue: atomic(
+                    m,
+                    "combine_glue",
+                    cfg.moe_combine_glue.clone(),
+                    ElementwiseKernel::build,
+                    bridge,
+                )?,
+                name: moe,
+            })
+        }
+    };
+    let reduce = |suffix: &str| {
+        all_reduce
+            .then(|| {
+                atomic(
+                    p,
+                    suffix,
+                    cfg.all_reduce.clone(),
+                    AllReduceFusionKernel::build,
+                    bridge,
+                )
+            })
+            .transpose()
+    };
+    Ok(LayerGroup {
+        label: group.label.clone(),
+        layers: group.layers.clone(),
+        attn_boundary,
+        attn,
+        attn_all_reduce: reduce("attn_all_reduce")?,
+        ffn_boundary: atomic(
+            p,
+            "ffn_mhc_post_pre",
+            cfg.mhc.clone(),
+            MhcFusedPostPreRmsNormKernel::build,
+            bridge,
+        )?,
+        ffn,
+        ffn_all_reduce: reduce("ffn_all_reduce")?,
+    })
 }
 
 pub struct Glm53FlashVllmModel {
@@ -770,131 +914,18 @@ pub fn build(
 ) -> std::result::Result<Glm53FlashVllmModel, BuildError> {
     let cfg = &resolved.raw_cfg;
     let n = name.as_str();
-    let mut groups = Vec::with_capacity(cfg.groups.len());
-    for group in &cfg.groups {
-        let prefix = format!("{n}.{}", group.label);
-        let p = prefix.as_str();
-        let attn_boundary = if group.opens_stream {
-            Boundary::Pre(atomic(
-                p,
-                "attn_mhc_pre",
-                cfg.mhc.clone(),
-                MhcPreRmsNormKernel::build,
-                bridge,
-            )?)
-        } else {
-            Boundary::Fused(atomic(
-                p,
-                "attn_mhc_post_pre",
-                cfg.mhc.clone(),
-                MhcFusedPostPreRmsNormKernel::build,
-                bridge,
-            )?)
-        };
-        let attn = match group.attn {
-            AttnKind::Kda => Attention::Kda(Glm53KdaAttnLocalWorklet::build(
-                format!("{p}.kda"),
-                resolved.kda.clone(),
-                bridge,
-            )?),
-            AttnKind::Dsa => Attention::Dsa(Glm53DsaAttnLocalWorklet::build(
-                format!("{p}.dsa"),
-                resolved.dsa.clone(),
-                bridge,
-            )?),
-        };
-        let ffn = match group.ffn {
-            FfnKind::Dense => Ffn::Dense(Glm53Fp8MlpLocalWorklet::build(
-                format!("{p}.dense_ffn"),
-                resolved.dense_ffn.clone(),
-                bridge,
-            )?),
-            FfnKind::Moe => {
-                let moe = format!("{p}.moe");
-                let m = moe.as_str();
-                Ffn::Moe(MoeBlock {
-                    router: Glm53MoeRouterLocalWorklet::build(
-                        format!("{m}.router"),
-                        Glm53MoeRouterLocalWorklet::resolve_config(&cfg.router),
-                        bridge,
-                    )?,
-                    input_glue: atomic(
-                        m,
-                        "input_glue",
-                        cfg.moe_input_glue.clone(),
-                        ElementwiseKernel::build,
-                        bridge,
-                    )?,
-                    shared_expert: Glm53Fp8MlpLocalWorklet::build(
-                        format!("{m}.shared_expert"),
-                        resolved.shared_expert.clone(),
-                        bridge,
-                    )?,
-                    routed: resolved
-                        .routed
-                        .iter()
-                        .enumerate()
-                        .map(|(rank, routed)| {
-                            Glm53RoutedMoeLocalWorklet::build(
-                                format!("{m}.routed_rank{rank}"),
-                                routed.clone(),
-                                bridge,
-                            )
-                        })
-                        .collect::<std::result::Result<_, _>>()?,
-                    combine_glue: atomic(
-                        m,
-                        "combine_glue",
-                        cfg.moe_combine_glue.clone(),
-                        ElementwiseKernel::build,
-                        bridge,
-                    )?,
-                    name: moe,
-                })
-            }
-        };
-        groups.push(LayerGroup {
-            label: group.label.clone(),
-            layers: group.layers.clone(),
-            attn_boundary,
-            attn,
-            attn_all_reduce: atomic(
-                p,
-                "attn_all_reduce",
-                cfg.all_reduce.clone(),
-                AllReduceFusionKernel::build,
-                bridge,
-            )?,
-            ffn_boundary: atomic(
-                p,
-                "ffn_mhc_post_pre",
-                cfg.mhc.clone(),
-                MhcFusedPostPreRmsNormKernel::build,
-                bridge,
-            )?,
-            ffn,
-            ffn_all_reduce: atomic(
-                p,
-                "ffn_all_reduce",
-                cfg.all_reduce.clone(),
-                AllReduceFusionKernel::build,
-                bridge,
-            )?,
-        });
-    }
+    let groups = cfg
+        .groups
+        .iter()
+        .map(|group| build_layer_group(n, group, &resolved, true, bridge))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
     let model_cfg = &cfg.model;
     let tp = u64::from(cfg.parallel.tp_size);
-    // Per rank and DSA layer: the fp8 MLA latent (no rope part) plus the kpool
-    // index cache, one 128-byte fp8 key and a 4-byte scale per 4-token pool.
-    let dsa_bytes_per_token = u64::from(model_cfg.kv_lora_rank)
-        + u64::from(model_cfg.index_head_dim + 4) / u64::from(model_cfg.index_kpool);
-    let total_kv_bytes_per_token = tp * u64::from(model_cfg.num_dsa_layers()) * dsa_bytes_per_token;
+    let total_kv_bytes_per_token =
+        tp * u64::from(model_cfg.num_dsa_layers()) * dsa_layer_bytes_per_token(model_cfg);
     let kda_layers = model_cfg.kda_layers.len() as u64;
-    let recurrent_state_bytes_per_request = tp
-        * kda_layers
-        * u64::from(
-            resolved.kda.ssm_state_bytes_per_request + resolved.kda.conv_state_bytes_per_request,
-        );
+    let recurrent_state_bytes_per_request =
+        tp * kda_layers * kda_layer_state_bytes_per_request(&resolved);
     let mut model = Glm53FlashVllmModel {
         embedding: atomic(
             n,
@@ -966,6 +997,32 @@ pub fn build(
     model.cost_flat = tree.flatten();
     model.n_slots = tree.n_slots();
     Ok(model)
+}
+
+/// One rank's cache bytes per token of one DSA layer: the fp8 MLA latent (no
+/// rope part) plus the kpool index cache, one 128-byte fp8 key and a 4-byte
+/// scale per 4-token pool.
+pub(crate) fn dsa_layer_bytes_per_token(model: &Glm53FlashModelCfg) -> u64 {
+    u64::from(model.kv_lora_rank)
+        + u64::from(model.index_head_dim + 4) / u64::from(model.index_kpool)
+}
+
+/// One rank's recurrent state of one KDA layer for one request: the fp32 SSM
+/// state plus the causal-conv window.
+pub(crate) fn kda_layer_state_bytes_per_request(resolved: &Glm53FlashVllmResolved) -> u64 {
+    u64::from(resolved.kda.ssm_state_bytes_per_request + resolved.kda.conv_state_bytes_per_request)
+}
+
+/// vLLM's hybrid attention block size (`platforms/interface.py`
+/// `_align_hybrid_block_size`, prefix caching on): the smallest multiple of the
+/// 128-token kernel alignment whose MLA page (`mla_bytes_per_token` per token)
+/// holds one KDA layer's state page. The KDA page is then padded to it. TP4
+/// gives the 2176 of [`HYBRID_BLOCK_SIZE`]; TP1 gives 8576.
+pub(crate) fn hybrid_block_tokens(kda_state_page_bytes: u64, mla_bytes_per_token: u64) -> u32 {
+    const KERNEL_ALIGNMENT_TOKENS: u64 = 128;
+    let aligned_page = KERNEL_ALIGNMENT_TOKENS * mla_bytes_per_token.max(1);
+    let blocks = kda_state_page_bytes.div_ceil(aligned_page).max(1);
+    u32::try_from(KERNEL_ALIGNMENT_TOKENS * blocks).expect("hybrid block size exceeds u32")
 }
 
 impl Glm53FlashVllmModel {
@@ -1120,7 +1177,7 @@ impl IterwiseUnifiedModel for Glm53FlashVllmModel {
 
 /// The row count vLLM runs a CUDA-graph replay on: the smallest captured size
 /// that holds `tokens`, or `tokens` itself above the largest (eager).
-fn graph_padded_tokens(sorted_sizes: &[u32], tokens: u32) -> u32 {
+pub(crate) fn graph_padded_tokens(sorted_sizes: &[u32], tokens: u32) -> u32 {
     match sorted_sizes.binary_search(&tokens) {
         Ok(_) => tokens,
         Err(index) => sorted_sizes.get(index).copied().unwrap_or(tokens),
@@ -1128,14 +1185,14 @@ fn graph_padded_tokens(sorted_sizes: &[u32], tokens: u32) -> u32 {
 }
 
 /// One iteration, as every layer sees it (one TP group, no attention DP).
-struct NormalizedBatch {
-    total_tokens: u32,
-    request_count: u32,
+pub(crate) struct NormalizedBatch {
+    pub(crate) total_tokens: u32,
+    pub(crate) request_count: u32,
     kda: Glm53KdaAttnLocalWorkletInput,
     dsa: Glm53DsaAttnLocalWorkletInput,
 }
 
-fn normalize_input(
+pub(crate) fn normalize_input(
     input: &UnifiedArchInput,
     max_model_len: u32,
 ) -> std::result::Result<NormalizedBatch, String> {
@@ -1210,7 +1267,7 @@ fn normalize_input(
     })
 }
 
-fn atomic<K, C, F>(
+pub(crate) fn atomic<K, C, F>(
     prefix: &str,
     suffix: &str,
     config: C,
@@ -1228,7 +1285,7 @@ where
     ))
 }
 
-fn push<K>(op: &Op<K>, input: K::Input, ev: &mut Evaluator)
+pub(crate) fn push<K>(op: &Op<K>, input: K::Input, ev: &mut Evaluator)
 where
     K: Probe,
     K::Input: Clone + Into<SlotInput>,
@@ -1326,6 +1383,25 @@ mod tests {
         );
         assert_eq!(model.recurrent_checkpoint_interval_tokens(), 2176);
         assert_eq!((model.gpus_per_replica(), model.num_attn_shards()), (4, 4));
+    }
+
+    #[test]
+    fn hybrid_block_size_follows_vllms_alignment_at_each_tp() {
+        let cfgs = build_configs(
+            &model_cfg(),
+            &parallel(),
+            &ExpertDemand::popularity(&RoutingDistribution::uniform(288), 42),
+        )
+        .unwrap();
+        let resolved = resolve_configs(&cfgs);
+        assert_eq!(
+            hybrid_block_tokens(kda_layer_state_bytes_per_request(&resolved), 512),
+            HYBRID_BLOCK_SIZE
+        );
+        // TP1 / TP2 / TP8 KDA pages, as the fork's server log derives them.
+        assert_eq!(hybrid_block_tokens(4_341_760, 512), 8_576);
+        assert_eq!(hybrid_block_tokens(4_341_760 / 2, 512), 4_352);
+        assert_eq!(hybrid_block_tokens(4_341_760 / 8, 512), 1_152);
     }
 
     #[test]
