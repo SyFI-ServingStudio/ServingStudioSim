@@ -4,6 +4,9 @@
                                 [--iteration-start N --iteration-end M]
     python -m alignment rocpd-parse --db T.db [--output parsed.json] \
                                 [--sequences-output kernel_sequences.json]
+    python -m alignment rocpd-merge-ranks --parsed parsed.rank0.json ... \
+                                --sequences kernel_sequences.rank0.json ... \
+                                --output parsed.json --sequences-output kernel_sequences.json
     python -m alignment rocpd-capture --output-dir D --output-name N \
                                 [--parsed-output parsed.json] -- <server argv>
     python -m alignment overlap --sqlite T.sqlite --metrics M.jsonl \
@@ -30,6 +33,7 @@ from .nsys import evidence as nsys_evidence
 from .nsys import overlap as nsys_overlap
 from .nsys import parse as nsys_parse
 from .profiler import rocprof_capture
+from .rocpd import merge as rocpd_merge
 from .rocpd import parse as rocpd_parse
 
 
@@ -49,6 +53,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if cmd == "rocpd-parse":
         return rocpd_parse.main(rest)
+
+    if cmd == "rocpd-merge-ranks":
+        return rocpd_merge.main(rest)
 
     if cmd == "rocpd-capture":
         return rocprof_capture.main(rest)
