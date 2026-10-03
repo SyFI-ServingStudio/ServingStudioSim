@@ -502,6 +502,7 @@ pub fn build_configs(
             hidden_dim: model.hidden,
             dtype: ACTIVATION_DTYPE,
             fabric: Fabric::Nvlink,
+            fused_token_limit: None,
         },
         moe_input_glue: ew(hidden_bytes, hidden_bytes),
         moe_combine_glue: ew(2 * hidden_bytes, hidden_bytes),

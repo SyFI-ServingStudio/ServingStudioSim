@@ -695,6 +695,7 @@ fn build_configs_for_decode(
             hidden_dim: model.hidden_dim.get(),
             dtype: DType::Bf16,
             fabric: Fabric::Nvlink,
+            fused_token_limit: None,
         },
         tp_allreduce_fused: AllReduceResidualRmsNormKernelConfig {
             backends: FUSED_ALLREDUCE_BACKENDS.to_vec(),
@@ -706,6 +707,7 @@ fn build_configs_for_decode(
             strategy: "auto".to_string(),
             launch_with_pdl: true,
             fp32_acc: true,
+            fused_token_limit: None,
         },
         embedding: ElementwiseKernelConfig {
             backends: ELEMENTWISE_BACKENDS.to_vec(),

@@ -79,6 +79,11 @@ const NUM_MTP_LAYERS: u32 = 1;
 const CACHE_BLOCK_SIZE: u32 = 64;
 const QUANT_BLOCK_SIZE: u32 = 128;
 const SOFTMAX_SCALE_DENOMINATOR: u32 = 16;
+/// SGLang runs the FlashInfer fused all-reduce for any batch of at most this
+/// many tokens, with no byte limit (`FUSE_ALLREDUCE_MAX_BATCH_SIZE`,
+/// `layers/communicator.py:162-179`); the workspace is pre-sized for it
+/// (`model_executor/runner/base_runner.py:265-276`). vLLM's byte cap (1 MiB =
+/// 85 tokens at TP8) does not apply to SGLang.
 const SGLANG_MAX_FUSED_TOKENS: u32 = 2_048;
 const FULL_INDEX_LAYERS: [u32; 21] = [
     0, 1, 2, 6, 10, 14, 18, 22, 26, 30, 34, 38, 42, 46, 50, 54, 58, 62, 66, 70, 74,
@@ -167,10 +172,6 @@ fn fit_failed(reason: impl Into<String>) -> BuildError {
         kind: ARCH_KIND,
         reason: reason.into(),
     }
-}
-
-fn sglang_fusion_cap(spec_cap: u32) -> u32 {
-    spec_cap.min(SGLANG_MAX_FUSED_TOKENS)
 }
 
 fn attention_config(
@@ -422,6 +423,7 @@ pub fn build_configs(
             hidden_dim: HIDDEN_DIM,
             dtype: DType::Bf16,
             fabric: Fabric::Nvlink,
+            fused_token_limit: Some(SGLANG_MAX_FUSED_TOKENS),
         },
         tp_allreduce_fused_norm: AllReduceResidualRmsNormKernelConfig {
             backends: FUSED_ALLREDUCE_BACKENDS.to_vec(),
@@ -433,6 +435,7 @@ pub fn build_configs(
             strategy: "auto".to_string(),
             launch_with_pdl: true,
             fp32_acc: true,
+            fused_token_limit: Some(SGLANG_MAX_FUSED_TOKENS),
         },
         embedding: ElementwiseKernelConfig {
             backends: ELEMENTWISE_BACKENDS.to_vec(),
@@ -668,9 +671,8 @@ impl SparseBody {
             AllReduceResidualRmsNormKernel::build,
             bridge,
         )?;
-        let fusion_cap = sglang_fusion_cap(AllReduceResidualRmsNormSpec::max_fused_tokens(
-            &common.tp_allreduce_fused_norm,
-        ));
+        let fusion_cap =
+            AllReduceResidualRmsNormSpec::max_fused_tokens(&common.tp_allreduce_fused_norm);
         Ok(Self {
             name,
             attention,
@@ -930,9 +932,8 @@ pub fn build(
         }),
         _ => return Err(fit_failed("MTP sections must be all present or all absent")),
     };
-    let residual_fusion_cap = sglang_fusion_cap(AllReduceResidualRmsNormSpec::max_fused_tokens(
-        &resolved.tp_allreduce_fused_norm,
-    ));
+    let residual_fusion_cap =
+        AllReduceResidualRmsNormSpec::max_fused_tokens(&resolved.tp_allreduce_fused_norm);
     let mut model = Glm52SglangNvfp4TpDsaMoeModel {
         name,
         mtp_mode,
@@ -942,9 +943,7 @@ pub fn build(
         embedding,
         embedding_allreduce,
         embedding_allreduce_fusion,
-        embedding_fusion_cap: sglang_fusion_cap(AllReduceFusionSpec::max_fused_tokens(
-            &resolved.tp_allreduce_fusion,
-        )),
+        embedding_fusion_cap: AllReduceFusionSpec::max_fused_tokens(&resolved.tp_allreduce_fusion),
         dense_attention,
         dense_ffn,
         dense_attention_allreduce,
@@ -1509,6 +1508,28 @@ mod tests {
             &bridge,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn tp8_fuses_the_all_reduce_up_to_sglang_batch_limit_not_vllm_bytes() {
+        // vLLM's 1 MiB TP8 cap would be 85 tokens at hidden 6144; SGLang
+        // fuses every batch of at most 2048 tokens.
+        let cfg = build_configs(
+            &model(),
+            &parallel(8),
+            &ExpertDemand::popularity(&RoutingDistribution::uniform(NUM_EXPERTS), 1),
+            false,
+            Glm52MtpMode::Off,
+        )
+        .unwrap();
+        let bridge = PerfApiBridge::new_uninit_for_test();
+        bridge.enable_enumerate();
+        let model = build("unified".to_string(), resolve_configs(&cfg), &bridge).unwrap();
+        assert_eq!(model.embedding_fusion_cap, 2048);
+        assert_eq!(model.dense_attention_fusion_cap, 2048);
+        assert_eq!(model.dense_ffn_fusion_cap, 2048);
+        assert_eq!(model.initial_shared_sparse.attention_fusion_cap, 2048);
+        assert_eq!(model.initial_shared_sparse.ffn_fusion_cap, 2048);
     }
 
     #[test]
