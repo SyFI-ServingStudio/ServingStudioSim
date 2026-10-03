@@ -39,9 +39,10 @@ _FLASHMLA_COSINE_LIMIT = 7e-6
 _TRTLLM_FP8_BACKEND = "dsa_sparse_mla_attention:flashinfer_trtllm_fp8"
 _TRTLLM_FP8_CACHE_LAYOUT = "hnd_paged_mqa_fp8_latent_rope"
 _TRTLLM_KERNEL_NAME = "fmhaSm100"
-# Per-rank q-head counts of GLM's 64 heads at validated TP degrees (TP8, TP4);
-# operands, output check and metrics are parametric in num_heads.
-_TRTLLM_SUPPORTED_NUM_HEADS = frozenset({8, 16})
+# Per-rank q-head counts of GLM's 64 heads at TP8, TP4 and TP1 (one pipeline
+# stage); vLLM picks this backend for fp8 KV at any head count. Operands, output
+# check and metrics are parametric in num_heads.
+_TRTLLM_SUPPORTED_NUM_HEADS = frozenset({8, 16, 64})
 _TRTLLM_WORKSPACE_BYTES = 128 * 1024 * 1024
 _TRTLLM_PAGE_SIZE = 64
 # GLM-5.3-Flash's rope-free MLA (rope_dim 0; FlashInfer >= 0.6.18

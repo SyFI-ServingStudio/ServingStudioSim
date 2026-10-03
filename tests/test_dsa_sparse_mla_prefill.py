@@ -74,7 +74,7 @@ def test_validation_retains_boundaries_valid_counts_and_page_offsets():
         ({"query_context_pairs": ((0, 1),)}, ValueError, "0 < query <= context"),
         ({"query_context_pairs": ((2, 1),)}, ValueError, "0 < query <= context"),
         ({"query_context_pairs": ([1, 1],)}, TypeError, "integer.*pairs"),
-        ({"num_heads": 64}, ProfilerNotImplemented, "model identity"),
+        ({"num_heads": 32}, ProfilerNotImplemented, "model identity"),
         ({"selected_k": 1024}, ProfilerNotImplemented, "model identity"),
         ({"q_dtype": "bf16"}, ProfilerNotImplemented, "storage identity"),
         ({"cache_layout": "token_major"}, ProfilerNotImplemented, "storage identity"),

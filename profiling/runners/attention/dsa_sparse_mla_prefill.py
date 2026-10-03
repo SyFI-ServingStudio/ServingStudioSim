@@ -31,9 +31,9 @@ from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerN
 from profiling.runners.metrics import ComputeMetrics
 
 _BACKEND = "dsa_sparse_mla_prefill:flashinfer_trtllm_fp8"
-# Per-rank q-head counts of GLM's 64 heads at validated TP degrees (TP8, TP4).
-# The kernel launch, output check and metrics are parametric in num_heads.
-_SUPPORTED_NUM_HEADS = frozenset({8, 16})
+# Per-rank q-head counts of GLM's 64 heads at TP8, TP4 and TP1 (one pipeline
+# stage). The kernel launch, output check and metrics are parametric in num_heads.
+_SUPPORTED_NUM_HEADS = frozenset({8, 16, 64})
 _NUM_KV_HEADS = 1
 _SOFTMAX_SCALE = 0.0625
 
