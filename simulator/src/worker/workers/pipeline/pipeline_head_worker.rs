@@ -504,6 +504,84 @@ mod tests {
         assert_eq!(record.telemetry.prefix_cache_hit_tokens, Some(100));
     }
 
+    fn hybrid_head(
+        store: SharedRequests,
+        max_batch_tokens: u32,
+        attn_kv_bytes: u64,
+    ) -> crate::worker::workers::pipeline::HybridPipelineHead<FakeModel> {
+        use crate::worker::kv::{PrefixCacheConfig, PrefixCachePolicy};
+        use crate::worker::workers::pipeline::{
+            build_hybrid_pipeline_head_worker, PipelineHybridState,
+        };
+        build_hybrid_pipeline_head_worker(
+            WorkerId(0),
+            "stage",
+            Arc::new(FakeModel::for_ms(1.0)),
+            PipelineLayout { depth: 3, ..LAYOUT },
+            // 4-token blocks of 2 x 4 = 8 bytes; 2 fixed blocks per request.
+            PipelineHybridState {
+                block_tokens: 4,
+                state_blocks_per_request: 2,
+            },
+            store,
+            WorkerConfig {
+                max_batch_tokens: Some(max_batch_tokens),
+                attn_kv_bytes,
+                prefix_cache: PrefixCacheConfig::Opportunistic {
+                    policy: PrefixCachePolicy::Lru,
+                    max_retained_bytes: None,
+                },
+                ..WorkerConfig::default()
+            },
+            None,
+            PoolId(0),
+            "test-gpu",
+            test_cluster(),
+        )
+    }
+
+    #[test]
+    fn a_hybrid_head_sizes_one_block_pool_and_charges_fixed_state() {
+        use crate::worker::workers::pipeline::PipelineHybridState;
+        let hybrid = PipelineHybridState {
+            block_tokens: 4,
+            state_blocks_per_request: 2,
+        };
+        // 80 bytes / 8 per block = 10 blocks, less vLLM's null block.
+        assert_eq!(hybrid.capacity_tokens(&LAYOUT, 80), 36);
+        assert_eq!(hybrid.state_tokens_per_request(), 8);
+
+        // Each 12-token prompt costs 12 + 8: one fits in 36 tokens, two do not.
+        let store = shared_with(&[(0, 12, 1), (1, 12, 1)]);
+        let mut worker = hybrid_head(Rc::clone(&store), 16, 80);
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(1)));
+        let mut events = Vec::new();
+        for step in 0..3 {
+            worker.tick(Time::from_ms(step as f64), &mut events);
+        }
+        assert_eq!(launched(&events), vec![(1, 12, Time::from_ms(1.0))]);
+        assert_eq!(worker.status().queued_requests, 1);
+    }
+
+    #[test]
+    fn a_hybrid_head_ends_non_final_chunks_on_checkpoint_boundaries() {
+        // Budget 6, blocks of 4: the first chunk floors to 4, the second stops
+        // at the prompt's last boundary (8), the tail runs alone.
+        let store = shared_with(&[(0, 10, 1)]);
+        let mut worker = hybrid_head(Rc::clone(&store), 6, 1_000);
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
+        let mut events = Vec::new();
+        for step in 0..6 {
+            worker.tick(Time::from_ms(step as f64), &mut events);
+        }
+        let chunks: Vec<u64> = launched(&events)
+            .into_iter()
+            .map(|(_, tokens, _)| tokens)
+            .collect();
+        assert_eq!(chunks, [4, 4, 2]);
+    }
+
     #[test]
     #[should_panic(expected = "models prefill only")]
     fn a_decode_request_is_rejected_at_enqueue() {
