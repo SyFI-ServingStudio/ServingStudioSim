@@ -383,7 +383,7 @@ pub enum IterArchSel {
     /// layer range (vLLM's `get_pp_indices`) at EP1: every head and expert is
     /// local, so a stage has no collective. MTP is not run. GLM-5.3 NVFP4 is
     /// the same graph. Runs only under deployment `pp`.
-    #[supported(gpu = ["NVIDIA B200"], model_config = ["glm52_nvfp4", "glm53_nvfp4"], pp_size = [4, 8])]
+    #[supported(gpu = ["NVIDIA B200"], model_config = ["glm52_nvfp4", "glm53_nvfp4"], pp_size = [4, 8, 13, 16, 26, 39, 78])]
     Glm52VllmNvfp4PpDsaMoe {
         #[serde(flatten)]
         model: ModelSpec,
