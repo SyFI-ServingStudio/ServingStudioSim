@@ -709,6 +709,18 @@ mod tests {
         store: SharedRequests,
         chunk_end_quantum: Option<u32>,
     ) -> HybridChunkedPrefillWorker<FakeModel> {
+        hybrid_chunked_worker_aligned(
+            store,
+            chunk_end_quantum,
+            crate::worker::config::PrefillChunkAlignment::Checkpoint,
+        )
+    }
+
+    fn hybrid_chunked_worker_aligned(
+        store: SharedRequests,
+        chunk_end_quantum: Option<u32>,
+        prefill_chunk_alignment: crate::worker::config::PrefillChunkAlignment,
+    ) -> HybridChunkedPrefillWorker<FakeModel> {
         build_hybrid_chunked_prefill_worker(
             WorkerId(0),
             "main",
@@ -717,6 +729,7 @@ mod tests {
             WorkerConfig {
                 max_batch_tokens: Some(10),
                 ssm_checkpoint_interval_tokens: chunk_end_quantum,
+                prefill_chunk_alignment,
                 ..WorkerConfig::default()
             },
             None,
@@ -783,6 +796,26 @@ mod tests {
             .telemetry
             .first_output_time
             .is_some());
+    }
+
+    #[test]
+    fn plain_alignment_ignores_the_checkpoint_interval() {
+        let store = shared_with(&[(0, 20, 2), (1, 2, 1)]);
+        let mut worker = hybrid_chunked_worker_aligned(
+            Rc::clone(&store),
+            Some(4),
+            crate::worker::config::PrefillChunkAlignment::Plain,
+        );
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(0)));
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(1)));
+
+        // Same interval as the checkpoint-aligned case, but the chunk spends
+        // the whole budget instead of stopping on boundary 8.
+        assert_eq!(hybrid_chunk_pairs(&mut worker, Time::ZERO), [(0, 10)]);
+        assert_eq!(
+            hybrid_chunk_pairs(&mut worker, Time::from_ms(1.0)),
+            [(10, 10)]
+        );
     }
 
     #[test]
