@@ -48,6 +48,8 @@ use crate::worklet::{
 
 const ARCH_KIND: &str = "glm52_sglang_nvfp4_tp_dsa_moe";
 const NUM_LAYERS: u32 = 78;
+/// TP sizes with a B200 deployment: one node of 4 or 8 GPUs.
+const SUPPORTED_TP_SIZES: [u16; 2] = [4, 8];
 const NUM_DENSE_LAYERS: u32 = 3;
 const NUM_INITIAL_SHARED_LAYERS: u32 = 3;
 const NUM_SPARSE_CYCLES: u32 = 18;
@@ -258,9 +260,9 @@ pub fn build_configs(
     mtp_mode: Glm52MtpMode,
 ) -> Result<Glm52SglangNvfp4TpDsaMoeConfigs, BuildError> {
     validate_model_cfg(model).map_err(fit_failed)?;
-    if parallel.tp_size != 4 {
+    if !SUPPORTED_TP_SIZES.contains(&parallel.tp_size) {
         return Err(fit_failed(format!(
-            "only the profiled TP4 deployment is runtime-ready; got tp_size {}",
+            "tp_size {} is not a supported deployment; expected one of {SUPPORTED_TP_SIZES:?}",
             parallel.tp_size
         )));
     }
@@ -1791,9 +1793,21 @@ mod tests {
     }
 
     #[test]
+    fn tp8_shards_every_tp_axis_across_eight_ranks() {
+        let routing = ExpertDemand::popularity(&RoutingDistribution::uniform(NUM_EXPERTS), 1);
+        let cfg = build_configs(&model(), &parallel(8), &routing, false, Glm52MtpMode::Off)
+            .expect("TP8 is a supported deployment");
+        assert_eq!(cfg.cycle_full_attention.tp_size, 8);
+        assert_eq!(cfg.dense_ffn.tp_size, 8);
+        assert_eq!(cfg.shared_expert.tp_size, 8);
+        assert_eq!(cfg.nvfp4_moe.ep_size, 1);
+        assert_eq!(cfg.nvfp4_moe.tp_size, 8);
+    }
+
+    #[test]
     fn invalid_parallel_and_batch_contracts_fail_closed() {
         let routing = ExpertDemand::popularity(&RoutingDistribution::uniform(NUM_EXPERTS), 1);
-        for tp_size in [0, 1, 2, 3, 6, 8, 16] {
+        for tp_size in [0, 1, 2, 3, 6, 16] {
             assert!(build_configs(
                 &model(),
                 &parallel(tp_size),
