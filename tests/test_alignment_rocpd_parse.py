@@ -321,7 +321,8 @@ def test_label_recovered_from_event_extdata_not_name_id(tmp_path):
 
 def test_no_iteration_markers_raises(tmp_path):
     # The upstream (uninstrumented) capture has dispatches but no roctx iteration
-    # ranges; the producer must refuse rather than emit an empty alignment.
+    # ranges and no sentinel marker kernels; the producer must refuse rather than
+    # emit an empty alignment.
     import pytest
 
     db = tmp_path / "bare.db"
@@ -332,3 +333,170 @@ def test_no_iteration_markers_raises(tmp_path):
     )
     with pytest.raises(ValueError, match="no .*iteration"):
         build_ranges_from_rocpd(str(db))
+
+
+# --- Option B: sentinel-kernel iteration boundaries (no roctx regions) ---------
+
+from alignment.profiler.roctx_shim import (  # noqa: E402
+    SENTINEL_GRID_Y_OFFSET,
+    SENTINEL_KERNEL_NAME,
+)
+from alignment.rocpd.evidence import is_sentinel_dispatch  # noqa: E402
+from profiling.profilers.rocprof_kernel_profiler import (  # noqa: E402
+    kernel_dispatch_records_from_rocpd,
+)
+
+_SENTINEL_DISPLAY_NAME = f"{SENTINEL_KERNEL_NAME}_0d1d"  # a Triton-mangled JIT name
+
+
+def _write_sentinel_rocpd(path, dispatches):
+    """Write a rocpd db mirroring a REAL rocprofv3-1.3.2 ``--kernel-trace`` capture
+    with sentinel marker kernels and NO roctx region table (the Option-B stack).
+
+    ``dispatches`` is ``(start, end, name, grid_y)``. Sentinel rows carry the
+    ``vibesim_sentinel`` display_name and encode their iteration index in
+    ``grid_size_y`` (= iteration + SENTINEL_GRID_Y_OFFSET); ordinary kernel rows
+    carry ``grid_size_y == 1`` like real torch/aiter kernels. The kernel_dispatch
+    table has the full ROCm-7.x grid columns and the name lives on the joined
+    kernel-symbol table, exactly as the real schema stores it.
+    """
+    conn = sqlite3.connect(path)
+    conn.execute(f"CREATE TABLE rocpd_string_{_GUID} (id INTEGER PRIMARY KEY, string TEXT)")
+    conn.execute(
+        f"CREATE TABLE rocpd_info_kernel_symbol_{_GUID} "
+        "(id INTEGER PRIMARY KEY, kernel_name TEXT, display_name TEXT)"
+    )
+    conn.execute(
+        f"CREATE TABLE rocpd_kernel_dispatch_{_GUID} "
+        "(id INTEGER PRIMARY KEY, pid INTEGER, tid INTEGER, agent_id INTEGER, "
+        "kernel_id INTEGER, dispatch_id INTEGER, queue_id INTEGER, stream_id INTEGER, "
+        "start BIGINT, end BIGINT, "
+        "grid_size_x INTEGER, grid_size_y INTEGER, grid_size_z INTEGER, "
+        "workgroup_size_x INTEGER, workgroup_size_y INTEGER, workgroup_size_z INTEGER, "
+        "region_name_id INTEGER)"
+    )
+    symbols: dict[str, int] = {}
+    for _s, _e, name, _gy in dispatches:
+        if name not in symbols:
+            symbols[name] = len(symbols) + 1
+            conn.execute(
+                f"INSERT INTO rocpd_info_kernel_symbol_{_GUID} (id, kernel_name, display_name) "
+                "VALUES (?, ?, ?)",
+                (symbols[name], f"_mangled_{name}", name),
+            )
+    for i, (start, end, name, grid_y) in enumerate(dispatches, start=1):
+        conn.execute(
+            f"INSERT INTO rocpd_kernel_dispatch_{_GUID} "
+            "(id, pid, tid, agent_id, kernel_id, dispatch_id, queue_id, stream_id, "
+            "start, end, grid_size_x, grid_size_y, grid_size_z, "
+            "workgroup_size_x, workgroup_size_y, workgroup_size_z, region_name_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (i, _PID, _TID, _AGENT, symbols[name], i, 0, 0, start, end,
+             64, grid_y, 1, 64, 1, 1, 0),
+        )
+    conn.commit()
+    conn.close()
+
+
+def _three_iteration_sentinel_fixture(path):
+    """Three forwards marked by sentinels, model kernels interleaved between them.
+
+    sentinel 0 @100 | gemm, attn (iter 0) | sentinel 1 @1100 | gemm (iter 1) |
+    sentinel 2 @2100 | attn, silu (iter 2) | ... plus one warm-up kernel before
+    the first sentinel (must be dropped). Sentinels encode iteration in grid_y.
+    """
+    def sentinel(start, iteration):
+        return (start, start + 20, _SENTINEL_DISPLAY_NAME, iteration + SENTINEL_GRID_Y_OFFSET)
+
+    _write_sentinel_rocpd(
+        path,
+        dispatches=[
+            (50, 90, "warmup_fill_kernel", 1),  # BEFORE sentinel 0 -> dropped
+            sentinel(100, 0),
+            (200, 400, "hipblaslt_gemm_f16", 1),
+            (500, 900, "flash_fwd_attn_kernel", 1),
+            sentinel(1_100, 1),
+            (1_300, 1_700, "hipblaslt_gemm_f16", 1),
+            sentinel(2_100, 2),
+            (2_300, 2_500, "flash_fwd_attn_kernel", 1),
+            (2_600, 2_800, "silu_and_mul_kernel", 1),
+        ],
+    )
+
+
+def test_sentinels_identified_and_excluded_from_reader(tmp_path):
+    db = tmp_path / "sentinel.db"
+    _three_iteration_sentinel_fixture(db)
+    records = kernel_dispatch_records_from_rocpd(str(db))
+    sentinels = [d for d in records if is_sentinel_dispatch(d)]
+    # Three sentinels, each carrying its iteration index in grid_size_y.
+    assert len(sentinels) == 3
+    assert [d.grid_size_y - SENTINEL_GRID_Y_OFFSET for d in sentinels] == [0, 1, 2]
+    # A real kernel is never a sentinel.
+    assert not any(is_sentinel_dispatch(d) for d in records if "gemm" in (d.name or ""))
+
+
+def test_sentinel_reconstruction_recovers_iterations_and_excludes_markers(tmp_path):
+    db = tmp_path / "sentinel.db"
+    _three_iteration_sentinel_fixture(db)
+    ranges = build_ranges_from_rocpd(str(db))
+    by_iter = {item.iteration: item for item in ranges}
+    # Iterations recovered from the sentinel grid-y encoding.
+    assert set(by_iter) == {0, 1, 2}
+    assert all(item.phase == "forward" for item in ranges)
+    assert by_iter[0].kernel_count == 2  # gemm + attn
+    assert by_iter[1].kernel_count == 1  # gemm
+    assert by_iter[2].kernel_count == 2  # attn + silu
+    # The sentinel marker kernels and the warm-up are NOT in the attributed set.
+    attributed = {e.name for item in ranges for e in item.kernel_events}
+    assert SENTINEL_KERNEL_NAME not in " ".join(attributed)
+    assert "warmup_fill_kernel" not in attributed
+    assert attributed == {"hipblaslt_gemm_f16", "flash_fwd_attn_kernel", "silu_and_mul_kernel"}
+
+
+def test_sentinel_path_produces_three_nonempty_artifacts(tmp_path):
+    db = tmp_path / "sentinel.db"
+    _three_iteration_sentinel_fixture(db)
+    parsed_out = tmp_path / "parsed.json"
+    sequences_out = tmp_path / "kernel_sequences.json"
+    assert (
+        rocpd_main(
+            ["--db", str(db), "--output", str(parsed_out), "--sequences-output", str(sequences_out)]
+        )
+        == 0
+    )
+    rows_path = kernel_rows_path(parsed_out)
+    # All three artifacts exist and are non-empty.
+    for artifact in (parsed_out, rows_path, sequences_out):
+        assert artifact.exists() and artifact.stat().st_size > 0
+
+    # Parquet schema parity with the nsys producer, every column non-null.
+    table = pq.read_table(rows_path)
+    assert table.schema.names == _KERNEL_SCHEMA.names
+    for name in _KERNEL_SCHEMA.names:
+        assert table.column(name).null_count == 0
+
+    parsed = read_parsed(parsed_out)
+    assert parsed["iterations"] == [0, 1, 2]
+    assert parsed["source"] == "rocpd"
+    # The sentinel marker kernel never enters the compared kernel-name index.
+    assert not any(SENTINEL_KERNEL_NAME in n for n in parsed["kernel_names"])
+    # Row count equals the model kernels only (5), excluding the 3 sentinels.
+    assert table.num_rows == 5
+
+
+def test_sentinel_path_passes_the_label_stage(tmp_path):
+    db = tmp_path / "sentinel.db"
+    _three_iteration_sentinel_fixture(db)
+    parsed_out = tmp_path / "parsed.json"
+    sequences_out = tmp_path / "kernel_sequences.json"
+    assert (
+        rocpd_main(
+            ["--db", str(db), "--output", str(parsed_out), "--sequences-output", str(sequences_out)]
+        )
+        == 0
+    )
+    labeled = tmp_path / "kernel_sequences_labeled.json"
+    assert labeling_cli.main(["initialize", str(sequences_out), str(labeled)]) == 0
+    assert labeling_cli.main(["walk", str(labeled)]) == 0
+    assert labeling_cli.main(["check", str(labeled)]) == 0

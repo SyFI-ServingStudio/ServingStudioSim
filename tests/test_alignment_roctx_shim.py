@@ -119,11 +119,91 @@ def test_plugin_is_a_noop_when_flag_unset():
 
 def test_disabled_annotator_is_a_noop():
     backend = RecordingBackend()
-    annotator = IterationAnnotator(backend, enabled=False)
+    sentinel = roctx_shim.RecordingSentinelLauncher()
+    annotator = IterationAnnotator(backend, enabled=False, sentinel=sentinel)
     with annotator.forward(record={"x": 1}):
         pass
     annotator.emit_iteration_record({"x": 1}, iteration=0)
     assert backend.events == []
+    # A disabled annotator launches no sentinel either.
+    assert sentinel.iterations == []
+
+
+def test_annotator_launches_one_sentinel_per_forward_in_order():
+    backend = RecordingBackend()
+    sentinel = roctx_shim.RecordingSentinelLauncher()
+    annotator = IterationAnnotator(backend, enabled=True, sentinel=sentinel)
+    for _ in range(3):
+        with annotator.forward(record={"total_num_scheduled_tokens": 2}):
+            pass
+    # One sentinel per forward, carrying the forward's iteration index in order.
+    assert sentinel.iterations == [0, 1, 2]
+
+
+def test_select_sentinel_launcher_record_and_null():
+    name, launcher = roctx_shim.select_sentinel_launcher("record")
+    assert name == "record" and isinstance(launcher, roctx_shim.RecordingSentinelLauncher)
+    name, launcher = roctx_shim.select_sentinel_launcher("null")
+    assert name == "null" and isinstance(launcher, roctx_shim.NullSentinelLauncher)
+    # Unknown names are rejected like the roctx backend selector.
+    with pytest.raises(ValueError, match="unknown sentinel launcher"):
+        roctx_shim.select_sentinel_launcher("bogus")
+
+
+def test_recorded_sentinels_feed_the_real_sentinel_reconstruction(tmp_path):
+    """End-to-end: the ordinals the shim asks the launcher to mark, written as
+    sentinel ``kernel_dispatch`` rows (grid-y encoding), reconstruct iteration
+    ranges through the real ``alignment/rocpd`` sentinel path — the roctx-free
+    Option-B flow a real ``--kernel-trace`` capture produces.
+    """
+    sentinel = roctx_shim.RecordingSentinelLauncher()
+    annotator = IterationAnnotator(RecordingBackend(), enabled=True, sentinel=sentinel)
+    for _ in range(2):
+        with annotator.forward(record={"total_num_scheduled_tokens": 2}):
+            pass
+
+    db = tmp_path / "sentinel.db"
+    conn = sqlite3.connect(db)
+    conn.execute(f"CREATE TABLE rocpd_info_kernel_symbol_{_GUID} "
+                 "(id INTEGER PRIMARY KEY, kernel_name TEXT, display_name TEXT)")
+    conn.execute(
+        f"CREATE TABLE rocpd_kernel_dispatch_{_GUID} "
+        "(id INTEGER PRIMARY KEY, pid INTEGER, agent_id INTEGER, kernel_id INTEGER, "
+        "dispatch_id INTEGER, stream_id INTEGER, start BIGINT, end BIGINT, "
+        "grid_size_x INTEGER, grid_size_y INTEGER, grid_size_z INTEGER)"
+    )
+    rows = []
+    symbols: dict[str, int] = {}
+
+    def add(start, end, name, grid_y):
+        if name not in symbols:
+            symbols[name] = len(symbols) + 1
+            conn.execute(
+                f"INSERT INTO rocpd_info_kernel_symbol_{_GUID} (id, kernel_name, display_name) "
+                "VALUES (?, ?, ?)", (symbols[name], f"_m_{name}", name))
+        rows.append((start, end, symbols[name], grid_y))
+
+    # Two sentinels (one per recorded forward) with a model kernel inside each.
+    base = 1_000
+    for ordinal, iteration in enumerate(sentinel.iterations):
+        s = base + ordinal * 10_000
+        grid_y = iteration + roctx_shim.SENTINEL_GRID_Y_OFFSET
+        add(s, s + 20, roctx_shim.SENTINEL_KERNEL_NAME, grid_y)
+        add(s + 100, s + 500, "hipblaslt_gemm_f16", 1)
+    for i, (start, end, kid, grid_y) in enumerate(rows, start=1):
+        conn.execute(
+            f"INSERT INTO rocpd_kernel_dispatch_{_GUID} "
+            "(id, pid, agent_id, kernel_id, dispatch_id, stream_id, start, end, "
+            "grid_size_x, grid_size_y, grid_size_z) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (i, _PID, _AGENT, kid, i, 0, start, end, 64, grid_y, 1))
+    conn.commit()
+    conn.close()
+
+    ranges = build_ranges_from_rocpd(str(db))
+    by_iter = {item.iteration: item for item in ranges}
+    assert set(by_iter) == {0, 1}
+    assert all(item.kernel_count == 1 for item in ranges)
+    assert {e.name for item in ranges for e in item.kernel_events} == {"hipblaslt_gemm_f16"}
 
 
 def test_env_gate_and_select_backend_record():
