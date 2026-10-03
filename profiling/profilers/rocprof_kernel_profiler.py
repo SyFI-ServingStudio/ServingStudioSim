@@ -102,6 +102,16 @@ _PID_COLUMN_HINTS = ("pid",)
 # The OS thread that opened a roctx region, matched against the launching
 # thread so a dispatch is attributed to the region its own thread was inside.
 _TID_COLUMN_HINTS = ("tid", "thread_id", "global_tid")
+# The launch grid dimensions rocpd records per dispatch (ROCm 7.x shape:
+# ``grid_size_x``/``_y``/``_z``). The alignment producer uses them to recognize
+# the ``vibesim_sentinel`` marker kernels the roctx shim launches at each forward
+# boundary and to decode the iteration ordinal those sentinels carry in the
+# y-grid dimension (see ``alignment/rocpd/evidence.py`` and the Option-B sentinel
+# contract in ``alignment/profiler/roctx_shim.py``). They are optional: a schema
+# that omits them resolves to ``None`` and the reader fills 0 (no grid signal).
+_GRID_X_COLUMN_HINTS = ("grid_size_x",)
+_GRID_Y_COLUMN_HINTS = ("grid_size_y",)
+_GRID_Z_COLUMN_HINTS = ("grid_size_z",)
 
 # roctx region table discovery. rocpd records every roctx push/pop range in a
 # ``rocpd_region`` table. Its ``name_id`` FK resolves (via the string table) only
@@ -338,6 +348,13 @@ class RocpdDispatch:
     correlation_id: int
     device_id: int
     pid: int
+    #: The launch grid dimensions (``grid_size_x``/``_y``/``_z``). 0 when a
+    #: reduced capture omits the columns. The alignment producer reads these to
+    #: identify ``vibesim_sentinel`` marker kernels and decode the iteration
+    #: ordinal they carry in the y-grid dimension (Option-B sentinel capture).
+    grid_size_x: int = 0
+    grid_size_y: int = 0
+    grid_size_z: int = 0
 
     @property
     def duration_ns(self) -> int:
@@ -383,6 +400,9 @@ def kernel_dispatch_records_from_rocpd(db_path: str) -> list[RocpdDispatch]:
         correlation_col = _first_column_matching(columns, _CORRELATION_COLUMN_HINTS)
         device_col = _first_column_matching(columns, _DEVICE_COLUMN_HINTS)
         pid_col = _first_column_matching(columns, _PID_COLUMN_HINTS)
+        grid_x_col = _first_column_matching(columns, _GRID_X_COLUMN_HINTS)
+        grid_y_col = _first_column_matching(columns, _GRID_Y_COLUMN_HINTS)
+        grid_z_col = _first_column_matching(columns, _GRID_Z_COLUMN_HINTS)
 
         def qualified(column: str | None) -> str:
             return f'd."{column}"' if column else "NULL"
@@ -404,7 +424,8 @@ def kernel_dispatch_records_from_rocpd(db_path: str) -> list[RocpdDispatch]:
         sql = (
             f'SELECT d."{schema.start_column}", d."{schema.end_column}", {name_select}, '
             f"{qualified(stream_col)}, {qualified(correlation_col)}, "
-            f"{qualified(device_col)}, {qualified(pid_col)} "
+            f"{qualified(device_col)}, {qualified(pid_col)}, "
+            f"{qualified(grid_x_col)}, {qualified(grid_y_col)}, {qualified(grid_z_col)} "
             f'FROM "{dispatch}" d {join} ORDER BY d."{schema.start_column}"'
         )
         rows = conn.execute(sql).fetchall()
@@ -412,7 +433,18 @@ def kernel_dispatch_records_from_rocpd(db_path: str) -> list[RocpdDispatch]:
         conn.close()
 
     records: list[RocpdDispatch] = []
-    for ordinal, (start, end, name, stream, correlation, device, pid) in enumerate(rows, start=1):
+    for ordinal, (
+        start,
+        end,
+        name,
+        stream,
+        correlation,
+        device,
+        pid,
+        grid_x,
+        grid_y,
+        grid_z,
+    ) in enumerate(rows, start=1):
         records.append(
             RocpdDispatch(
                 start_ns=int(start),
@@ -422,6 +454,9 @@ def kernel_dispatch_records_from_rocpd(db_path: str) -> list[RocpdDispatch]:
                 correlation_id=int(correlation) if correlation is not None else ordinal,
                 device_id=int(device) if device is not None else 0,
                 pid=int(pid) if pid is not None else 0,
+                grid_size_x=int(grid_x) if grid_x is not None else 0,
+                grid_size_y=int(grid_y) if grid_y is not None else 0,
+                grid_size_z=int(grid_z) if grid_z is not None else 0,
             )
         )
     return records

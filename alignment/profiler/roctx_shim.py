@@ -76,6 +76,34 @@ ITERATION_RECORD_TAG = "VibeSimAlignmentIteration"
 #: payload; bumped only when the payload shape changes.
 ITERATION_RECORD_SCHEMA_VERSION = 1
 
+#: Option B — sentinel-kernel iteration boundaries. On the pinned ROCm-7.2 /
+#: rocprofv3-1.3.2 stack the SDK MARKER (roctx) service never registers in a
+#: torch-loaded process, so ``--marker-trace`` records zero regions, while
+#: ``--kernel-trace`` records every GPU dispatch reliably. So the shim ALSO
+#: launches a uniquely-identifiable no-op GPU kernel at each forward boundary; it
+#: shows up in rocpd's ``kernel_dispatch`` table and the reader reconstructs
+#: iteration ranges from the sentinel dispatches. The roctx push is kept too, so
+#: the capture still works on a stack that does record roctx.
+#:
+#: The sentinel is a tiny Triton kernel whose Python function name is recorded
+#: verbatim in rocpd's kernel-symbol table. This substring is the collision-free
+#: identity the reader keys off — no torch/aiter kernel carries it.
+SENTINEL_KERNEL_NAME = "vibesim_sentinel"
+
+#: The sentinel encodes its iteration ordinal in the launch's y-grid dimension:
+#: ``grid_size_y == iteration + SENTINEL_GRID_Y_OFFSET``. rocpd records
+#: ``grid_size_y`` per dispatch, so the reader recovers the absolute iteration
+#: index as ``grid_size_y - SENTINEL_GRID_Y_OFFSET`` for a sentinel dispatch.
+#:
+#: y (not x) carries it for two reasons: a real kernel's ``grid_size_y`` is ~1
+#: while its x-grid is routinely huge, so y is the quiet dimension; and the index
+#: stays tiny (one per forward, dozens per capture) so it never approaches the
+#: HIP 65535 block-count ceiling that applies to the y/z grid dimensions but not
+#: to x. The ordinal is only *decoded* for dispatches already identified as
+#: sentinels by name, so a real kernel that happens to have ``grid_size_y > 1`` is
+#: never misread as a sentinel.
+SENTINEL_GRID_Y_OFFSET = 1
+
 
 def iteration_label(iteration: int, phase: str, *, prefix: str = DEFAULT_ENGINE_PREFIX) -> str:
     """The canonical ``<prefix>_iteration(N): <phase>`` roctx range label.
@@ -327,6 +355,143 @@ def select_backend(name: str = "auto") -> tuple[str, RoctxBackend]:
     raise ValueError(f"unknown roctx backend {name!r}; use auto|roctracer|torch|record")
 
 
+@runtime_checkable
+class SentinelLauncher(Protocol):
+    """The GPU-touching seam that launches one sentinel marker kernel per forward.
+
+    Injectable so the annotator is testable with a recording launcher and no GPU
+    (:class:`RecordingSentinelLauncher`), exactly like the roctx backend.
+    """
+
+    def launch(self, iteration: int) -> None: ...
+
+
+@dataclass
+class RecordingSentinelLauncher:
+    """A GPU-free launcher that records the iteration ordinals it was asked to mark.
+
+    The recorded ordinals are what a real capture would land as sentinel
+    ``kernel_dispatch`` rows (one per forward, grid-y encoding the index), so a
+    test can synthesize those rows and run the real ``alignment/rocpd`` sentinel
+    reconstruction over them.
+    """
+
+    iterations: list[int] = field(default_factory=list)
+
+    def launch(self, iteration: int) -> None:
+        self.iterations.append(iteration)
+
+
+class NullSentinelLauncher:
+    """A launcher that does nothing — the safe default when no GPU op is available.
+
+    Used so a forward never crashes just because neither Triton nor torch could
+    build a sentinel; the roctx push still happens and, on a stack that records
+    roctx, alignment proceeds via the marker path.
+    """
+
+    def launch(self, iteration: int) -> None:
+        return None
+
+
+class TritonSentinelLauncher:
+    """Launch a uniquely-named no-op Triton kernel per forward as a rocpd sentinel.
+
+    This is the preferred Option-B emitter: Triton is in the vLLM ROCm container,
+    and rocprofv3 records a Triton JIT kernel's Python function name
+    (``vibesim_sentinel``) in the rocpd kernel-symbol table, giving a collision-
+    free marker. The kernel is a side-effect-free store from its first program
+    (so the launch is a real, recordable dispatch that touches only a private
+    1-element scratch buffer, never model state). The iteration ordinal rides in
+    the y-grid dimension (``grid_size_y == iteration + SENTINEL_GRID_Y_OFFSET``);
+    ``num_warps=1`` keeps the launch tiny.
+
+    torch and triton are imported at construction so this module stays importable
+    without them (the GPU-free unit tests use the recording launcher instead).
+    """
+
+    def __init__(self) -> None:
+        import torch  # noqa: PLC0415 — deferred so the module imports without torch
+        import triton  # noqa: PLC0415
+        import triton.language as tl  # noqa: PLC0415
+
+        # The JIT function name IS the marker: it is interned verbatim in rocpd's
+        # kernel-symbol table, so it must contain SENTINEL_KERNEL_NAME.
+        @triton.jit
+        def vibesim_sentinel(scratch_ptr):  # noqa: ANN001, ANN202
+            if tl.program_id(axis=1) == 0:
+                tl.store(scratch_ptr, 0)
+
+        assert SENTINEL_KERNEL_NAME in vibesim_sentinel.__name__
+        self._torch = torch
+        self._kernel = vibesim_sentinel
+        self._scratch = torch.zeros(1, dtype=torch.int32, device="cuda")
+
+    def launch(self, iteration: int) -> None:
+        grid = (1, iteration + SENTINEL_GRID_Y_OFFSET, 1)
+        self._kernel[grid](self._scratch, num_warps=1)
+
+
+class TorchSentinelLauncher:
+    """Fallback sentinel when Triton is unavailable: a plain torch GPU op.
+
+    It keeps the forward path alive and preserves the roctx push, but unlike the
+    Triton sentinel it carries NEITHER a collision-free kernel name NOR a
+    grid-encoded ordinal — a torch op's recorded kernel name and launch grid are
+    not ours to set, and HIP caps the y/z grid dimensions at 65535 blocks so a
+    torch tensor cannot be shaped into a reserved grid band either. So the offline
+    reader cannot reconstruct iterations from this fallback; prefer Triton, which
+    is present in the vLLM ROCm container. This exists only so a missing Triton
+    does not break serving under the profiling gate.
+    """
+
+    def __init__(self) -> None:
+        import torch  # noqa: PLC0415 — deferred so the module imports without torch
+
+        self._torch = torch
+        self._scratch = torch.zeros(1, device="cuda")
+
+    def launch(self, iteration: int) -> None:
+        self._scratch.add_(1.0)
+
+
+#: Sentinel-launcher selection order for ``select_sentinel_launcher("auto")``:
+#: the reconstructable Triton marker first, then the torch liveness fallback.
+_AUTO_SENTINEL_ORDER: tuple[tuple[str, Callable[[], SentinelLauncher]], ...] = (
+    ("triton", TritonSentinelLauncher),
+    ("torch", TorchSentinelLauncher),
+)
+
+
+def select_sentinel_launcher(name: str = "auto") -> tuple[str, SentinelLauncher]:
+    """Resolve a sentinel launcher by name, returning ``(resolved_name, launcher)``.
+
+    ``"auto"`` tries each real launcher in :data:`_AUTO_SENTINEL_ORDER` and returns
+    the first that constructs, falling back to :class:`NullSentinelLauncher` so a
+    forward never crashes when no GPU op is buildable. ``"triton"`` / ``"torch"``
+    force one, ``"null"`` disables sentinel emission, and ``"record"`` returns a
+    :class:`RecordingSentinelLauncher` (GPU-free; for tests and dry runs).
+    """
+    if name == "record":
+        return "record", RecordingSentinelLauncher()
+    if name == "null":
+        return "null", NullSentinelLauncher()
+    if name == "triton":
+        return "triton", TritonSentinelLauncher()
+    if name == "torch":
+        return "torch", TorchSentinelLauncher()
+    if name == "auto":
+        for resolved, factory in _AUTO_SENTINEL_ORDER:
+            try:
+                return resolved, factory()
+            except Exception:  # noqa: BLE001 — try the next real launcher, else null
+                continue
+        return "null", NullSentinelLauncher()
+    raise ValueError(
+        f"unknown sentinel launcher {name!r}; use auto|triton|torch|null|record"
+    )
+
+
 class IterationAnnotator:
     """Emit the canonical ``vllm_iteration(N)`` roctx ranges and boundary records.
 
@@ -344,11 +509,16 @@ class IterationAnnotator:
         prefix: str = DEFAULT_ENGINE_PREFIX,
         enabled: bool = True,
         start_index: int = 0,
+        sentinel: SentinelLauncher | None = None,
     ) -> None:
         self._backend = backend
         self._prefix = prefix
         self._enabled = enabled
         self._next = start_index
+        #: Optional Option-B sentinel emitter. When set, each forward launches a
+        #: uniquely-named marker kernel at the boundary so the reader can recover
+        #: iteration ranges from kernel dispatches even when roctx records nothing.
+        self._sentinel = sentinel
 
     @property
     def enabled(self) -> bool:
@@ -386,6 +556,12 @@ class IterationAnnotator:
         if self._enabled and record is not None:
             self.emit_iteration_record(record, iteration=index)
         with self.phase("forward", index):
+            # Launch the sentinel marker kernel as the first GPU work of this
+            # forward, so the model's own kernels for iteration N fall between
+            # sentinel N and sentinel N+1 on the stream. Done inside the roctx
+            # range so the two boundary mechanisms agree.
+            if self._enabled and self._sentinel is not None:
+                self._sentinel.launch(index)
             yield index
 
     def emit_iteration_record(self, payload: dict, *, iteration: int | None = None) -> None:
@@ -404,6 +580,7 @@ def roctx_scopes_enabled(environ: dict[str, str] | None = None) -> bool:
 def install_vllm_roctx_shim(
     *,
     backend_name: str = "auto",
+    sentinel_name: str = "auto",
     environ: dict[str, str] | None = None,
 ) -> bool:
     """Wrap the vLLM V1 GPU model runner's ``execute_model`` with roctx ranges.
@@ -413,7 +590,10 @@ def install_vllm_roctx_shim(
     gate is off it returns ``False`` and patches nothing. Otherwise it monkeypatches
     ``vllm.v1.worker.gpu_model_runner.GPUModelRunner.execute_model`` so every
     served forward is bracketed by ``vllm_iteration(N): forward`` and preceded by a
-    ``VibeSimAlignmentIteration`` record carrying the batch's token/KV shape.
+    ``VibeSimAlignmentIteration`` record carrying the batch's token/KV shape. It
+    also launches a ``vibesim_sentinel`` marker kernel per forward (Option B), so
+    the reader can recover iteration ranges from the reliable ``--kernel-trace``
+    dispatch rows on a stack where roctx marker recording is broken.
 
     Imports vLLM lazily so this module stays importable (and unit-testable) without
     vLLM or a GPU; raises a clear error only if called in an environment that gates
@@ -425,7 +605,12 @@ def install_vllm_roctx_shim(
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner  # noqa: PLC0415
 
     _, backend = select_backend(backend_name)
-    annotator = IterationAnnotator(backend, enabled=True)
+    # Option B: also launch a sentinel marker kernel per forward so iteration
+    # ranges are recoverable from the (reliable) kernel-dispatch trace even when
+    # roctx records nothing. Constructed lazily on the GPU worker; "auto" falls
+    # back to a no-op launcher rather than failing the forward.
+    _, sentinel = select_sentinel_launcher(sentinel_name)
+    annotator = IterationAnnotator(backend, enabled=True, sentinel=sentinel)
     original_execute_model = GPUModelRunner.execute_model
 
     def execute_model(self, scheduler_output, *args, **kwargs):  # type: ignore[no-untyped-def]

@@ -39,7 +39,11 @@ from pathlib import Path
 from typing import Callable
 
 from ..rocpd import parse as rocpd_parse
-from ..rocpd.evidence import iteration_regions
+from ..rocpd.evidence import (
+    is_sentinel_dispatch,
+    iteration_regions,
+    sentinel_iteration_regions,
+)
 from .config import RocprofConfig
 from .roctx_shim import ROCTX_SCOPES_ENV
 
@@ -367,12 +371,16 @@ def validate_rocpd(db_path: Path) -> dict:
     Mirrors ``nsys_capture.validate_export``: catch the two failure modes before a
     confusing empty alignment —
 
-    - no ``(vllm|sglang)_iteration(N)`` roctx ranges → the shim did not run (env
-      gate off / ``--marker-trace`` missing / plugin not installed);
+    - no iteration markers → the shim did not run (env gate off / plugin not
+      installed), OR both marker sources are missing;
     - no kernel dispatch rows → ``--kernel-trace`` never recorded GPU work.
 
-    Uses the real C0 readers, so a passing validation means the same rows the
-    offline producer will attribute are present.
+    Iteration markers come from either source the producer accepts, roctx-first:
+    the ``(vllm|sglang)_iteration(N)`` roctx ranges, or — when the stack does not
+    record roctx (the Option-B case) — the ``vibesim_sentinel`` marker kernels in
+    the dispatch trace. ``iteration_source`` records which one was found. Uses the
+    real C0 readers, so a passing validation means the same rows the offline
+    producer will attribute are present.
     """
     if roctx_regions_from_rocpd is None or kernel_dispatch_records_from_rocpd is None:
         raise RuntimeError(
@@ -381,12 +389,23 @@ def validate_rocpd(db_path: Path) -> dict:
         )
     regions = roctx_regions_from_rocpd(str(db_path))
     iters = iteration_regions(regions)
-    dispatches = kernel_dispatch_records_from_rocpd(str(db_path))
+    all_dispatches = kernel_dispatch_records_from_rocpd(str(db_path))
+    sentinels = [d for d in all_dispatches if is_sentinel_dispatch(d)]
+    dispatches = [d for d in all_dispatches if not is_sentinel_dispatch(d)]
+    if iters:
+        iteration_source = "roctx"
+    elif sentinels:
+        iters = sentinel_iteration_regions(sentinels, dispatches)
+        iteration_source = "sentinel"
+    else:
+        iteration_source = "none"
     starts = [region.start_ns for _, _, region in iters]
     ends = [region.end_ns for _, _, region in iters]
     span_ms = ((max(ends) - min(starts)) / 1e6) if iters else 0.0
     return {
         "iteration_ranges": len(iters),
+        "iteration_source": iteration_source,
+        "sentinel_kernels": len(sentinels),
         "kernel_rows": len(dispatches),
         "iteration_span_ms": span_ms,
         "ok": bool(iters) and bool(dispatches),
