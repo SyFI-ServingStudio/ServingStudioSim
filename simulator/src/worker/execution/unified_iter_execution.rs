@@ -9,7 +9,7 @@ use std::sync::Arc;
 use crate::arch::contract::{ArchGroupInput, IterwiseUnifiedModel, UnifiedArchInput};
 use crate::common::{SharedRequests, Time};
 use crate::worker::cost_buffers::CostBuffers;
-use crate::worker::execution::{IterModelExecution, ModelKvLayout};
+use crate::worker::execution::{IterModelExecution, ModelKvLayout, PipelineStageExecution};
 use crate::worker::kv::{IterWorkerKv, PrefixKv};
 use crate::worker::types::IterBatchPlan;
 
@@ -101,5 +101,11 @@ where
 
     fn evaluate_iteration(&mut self, input: &Self::Input, iteration: u64, now: Time) -> Time {
         UnifiedIterExecution::evaluate_iteration(self, input, iteration, now)
+    }
+}
+
+impl<M: IterwiseUnifiedModel> PipelineStageExecution for UnifiedIterExecution<M> {
+    fn evaluate_stage(&mut self, input: &UnifiedArchInput, microbatch: u64, start: Time) -> Time {
+        UnifiedIterExecution::evaluate_iteration(self, input, microbatch, start)
     }
 }
