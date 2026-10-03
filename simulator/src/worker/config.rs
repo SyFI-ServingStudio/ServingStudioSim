@@ -207,6 +207,12 @@ const PREFIX_CACHE_MODE_CHOICES: [&str; 2] = ["disabled", "opportunistic"];
 
 // ── iter-wise contract (unified, pd) ────────────────────────────────────────
 
+/// serde/param fallback for `chunked_prefill`'s `hybrid_block_aligned_chunks`:
+/// vLLM's behavior.
+fn default_hybrid_block_aligned_chunks() -> bool {
+    true
+}
+
 /// serde/param fallback for every worker selector's `gpu_time_multiplier`: 1.0
 /// = no inter-kernel overhead (kernel-folded time IS the wall time), so presets
 /// that omit the field keep their prior behavior. A worker scales the wall time
@@ -354,6 +360,13 @@ pub enum IterWorkerSel {
         #[serde(default)]
         #[param(string, default = "round-robin", choices = DP_PLACEMENT_CHOICES)]
         dp_placement: DpPlacement,
+        /// Hybrid (recurrent-state) archs with prefix caching on: end every
+        /// non-final chunk on a state-block boundary, as vLLM's Mamba `align`
+        /// mode does (`_mamba_block_aligned_split`). `false` chunks plainly,
+        /// `min(remaining, budget)`. Attention-only archs ignore it.
+        #[serde(default = "default_hybrid_block_aligned_chunks")]
+        #[param(default = true)]
+        hybrid_block_aligned_chunks: bool,
     },
     /// Chunked prefill with a speculating decode engine: one verify pass per
     /// iteration submits `draft_tokens + 1` rows per resident decode and retires

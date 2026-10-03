@@ -191,6 +191,13 @@ impl Deployment for UnifiedDeployment {
                 IterWorkerSel::ChunkedPrefill { dp_placement, .. } => *dp_placement,
                 _ => DpPlacement::RoundRobin,
             },
+            hybrid_block_aligned_chunks: !matches!(
+                g.worker,
+                IterWorkerSel::ChunkedPrefill {
+                    hybrid_block_aligned_chunks: false,
+                    ..
+                }
+            ),
             ..WorkerConfig::default()
         };
 
@@ -993,6 +1000,7 @@ mod tests {
             gpu_time_multiplier: 1.0,
             prefill_gpu_time_multiplier: None,
             dp_placement: DpPlacement::RoundRobin,
+            hybrid_block_aligned_chunks: true,
         }
     }
 

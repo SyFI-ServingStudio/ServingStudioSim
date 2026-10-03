@@ -566,6 +566,10 @@ pub struct WorkerConfig {
     /// Attention-DP partition placement (from the chunked-prefill selector).
     /// Only multi-partition chunked-prefill workers read it.
     pub dp_placement: crate::worker::config::DpPlacement,
+    /// With prefix caching on, a hybrid worker ends every non-final chunk on
+    /// the arch's state-checkpoint boundary (vLLM's Mamba `align` split).
+    /// `false` chunks plainly. From the chunked-prefill selector.
+    pub hybrid_block_aligned_chunks: bool,
 }
 
 impl Default for WorkerConfig {
@@ -587,6 +591,7 @@ impl Default for WorkerConfig {
             speculative_draft_tokens: 0,
             speculative_acceptance_seed: None,
             dp_placement: crate::worker::config::DpPlacement::RoundRobin,
+            hybrid_block_aligned_chunks: true,
         }
     }
 }

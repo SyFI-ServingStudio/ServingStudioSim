@@ -337,7 +337,10 @@ does not replay an observed DP rank or rewrite request shapes. An optional
 chunk-end quantum (`with_chunk_end_quantum`) ports vLLM's Mamba `align` split:
 non-final chunks end on recurrent-state checkpoint boundaries, and the budget
 a clipped chunk leaves may start further prompts. Only the hybrid recipe sets
-it, from the arch's checkpoint interval, when prefix caching is on.
+it, from the arch's checkpoint interval, when prefix caching is on and
+`chunked_prefill`'s `hybrid_block_aligned_chunks` is true (the default);
+`false` gives plain `min(remaining, budget)` chunks. The hybrid recipe honours
+`dp_placement` like the full-attention one.
 
 With several attention partitions (an attention-DP arch), `dp_placement`
 chooses where a cold request lands. `round-robin` (default) rotates blindly;
