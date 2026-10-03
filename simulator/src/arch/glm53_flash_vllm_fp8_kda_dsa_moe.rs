@@ -73,10 +73,11 @@ const ACTIVATION_DTYPE: DType = DType::Bf16;
 /// Sparse page-table width: `round_up(index_topk + index_kpool - 1, 128)`.
 const SELECTED_K: u32 = 2176;
 const CACHE_BLOCK_SIZE: u32 = 64;
-/// vLLM's hybrid block size for this deployment ("attention block size 2176"
-/// in the capture's server log): the token interval at which the KDA state is
-/// checkpointed and a prefix-cache hit can resume.
-const HYBRID_BLOCK_SIZE: u32 = 2176;
+/// vLLM's hybrid block-size alignment for MLA: TRT-LLM/FlashInfer MLA decode
+/// needs the manager block to be a multiple of 128 tokens
+/// (`platforms/interface.py:893-906`), which also covers the kpool indexer's
+/// `index_kpool * min(PAGED_MQA_PAGE_SIZES)` = 4 * 32 (`platforms/cuda.py:414-431`).
+const HYBRID_BLOCK_ALIGNMENT: u32 = 128;
 /// vLLM runs the shared expert on an aux stream at or below this batch size.
 const SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: u32 = 256;
 /// `Max{overlap}` of the aux-stream shared expert against its routed slice.
@@ -759,6 +760,9 @@ pub struct Glm53FlashVllmModel {
     lm_head: Op<SingleGemmKernel>,
     total_kv_bytes_per_token: u64,
     recurrent_state_bytes_per_request: u64,
+    /// vLLM's hybrid block size: the token interval at which the KDA state is
+    /// checkpointed and a prefix-cache hit can resume.
+    hybrid_block_size: u32,
     cost_flat: Vec<FlatCostNode>,
     n_slots: usize,
 }
@@ -890,11 +894,14 @@ pub fn build(
         + u64::from(model_cfg.index_head_dim + 4) / u64::from(model_cfg.index_kpool);
     let total_kv_bytes_per_token = tp * u64::from(model_cfg.num_dsa_layers()) * dsa_bytes_per_token;
     let kda_layers = model_cfg.kda_layers.len() as u64;
-    let recurrent_state_bytes_per_request = tp
-        * kda_layers
-        * u64::from(
-            resolved.kda.ssm_state_bytes_per_request + resolved.kda.conv_state_bytes_per_request,
-        );
+    let hybrid_block_size = hybrid_block_size(
+        resolved.kda.ssm_state_bytes_per_request + resolved.kda.conv_state_bytes_per_request,
+        model_cfg.kv_lora_rank,
+    );
+    // vLLM pads each KDA layer's mamba page up to one attention page ("Padding
+    // mamba page size by 2.64%" at TP4), so that is what a request holds.
+    let recurrent_state_bytes_per_request =
+        tp * kda_layers * u64::from(hybrid_block_size) * u64::from(model_cfg.kv_lora_rank);
     let mut model = Glm53FlashVllmModel {
         embedding: atomic(
             n,
@@ -958,6 +965,7 @@ pub fn build(
         },
         total_kv_bytes_per_token,
         recurrent_state_bytes_per_request,
+        hybrid_block_size,
         cost_flat: Vec::new(),
         n_slots: 0,
         name,
@@ -1072,7 +1080,7 @@ impl IterwiseUnifiedModel for Glm53FlashVllmModel {
     }
 
     fn recurrent_checkpoint_interval_tokens(&self) -> u32 {
-        HYBRID_BLOCK_SIZE
+        self.hybrid_block_size
     }
 
     /// The kpool DSA's top-k cap makes necessary work per-request in context.
@@ -1116,6 +1124,17 @@ impl IterwiseUnifiedModel for Glm53FlashVllmModel {
         );
         total
     }
+}
+
+/// vLLM's hybrid attention block size (`platforms/interface.py:919-927`): the
+/// smallest 128-aligned token count whose per-layer attention page covers one
+/// per-rank KDA mamba page (SSM + conv). The fp8 MLA latent is one byte per
+/// element and is not split by TP, while the KDA heads are, so the block halves
+/// from TP4 (2176, the capture's "Setting attention block size to 2176
+/// tokens") to TP8 (1152).
+fn hybrid_block_size(mamba_page_bytes: u32, attn_page_bytes_per_token: u32) -> u32 {
+    let quantum = HYBRID_BLOCK_ALIGNMENT * attn_page_bytes_per_token;
+    HYBRID_BLOCK_ALIGNMENT * mamba_page_bytes.div_ceil(quantum)
 }
 
 /// The row count vLLM runs a CUDA-graph replay on: the smallest captured size
@@ -1320,11 +1339,16 @@ mod tests {
     fn kv_and_recurrent_state_bytes_are_whole_model_totals() {
         let model = built();
         assert_eq!(model.total_kv_bytes_per_token(), 4 * 11 * (512 + 33));
+        // The true state is (1 << 20) + 6144 * 3 * 2 bytes per rank and layer;
+        // vLLM pads it to one 2176-token attention page, 2.64% more.
+        assert_eq!(model.recurrent_checkpoint_interval_tokens(), 2176);
         assert_eq!(
             model.recurrent_state_bytes_per_request(),
-            4 * 34 * ((1 << 20) + 6144 * 3 * 2)
+            4 * 34 * 2176 * 512
         );
-        assert_eq!(model.recurrent_checkpoint_interval_tokens(), 2176);
+        let true_state = (1u64 << 20) + 6144 * 3 * 2;
+        let padding = (2176 * 512) as f64 / true_state as f64 - 1.0;
+        assert!((padding - 0.0264).abs() < 5e-5, "{padding}");
         assert_eq!((model.gpus_per_replica(), model.num_attn_shards()), (4, 4));
     }
 
