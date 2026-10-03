@@ -630,6 +630,11 @@ impl Deployment for UnifiedDeployment {
             IterArchSel::Glm52VllmNvfp4PpDsaMoe { .. } => {
                 bail!("unified: glm52_vllm_nvfp4_pp_dsa_moe runs only under deployment `pp`")
             }
+            IterArchSel::Glm53FlashVllmFp8PpKdaDsaMoe { .. } => {
+                bail!(
+                    "unified: glm53_flash_vllm_fp8_pp_kda_dsa_moe runs only under deployment `pp`"
+                )
+            }
             IterArchSel::Glm52SglangNvfp4TpDsaMoe {
                 tp_size,
                 max_model_len,

@@ -37,6 +37,7 @@ the graph that produced them.
 | `glm52_vllm_nvfp4_pp_dsa_moe` | the vLLM NVFP4 graph's kernels under pure pipeline parallelism; GLM-5.2 and GLM-5.3 NVFP4 | `pp_size` one-GPU stages at EP1 (vLLM `get_pp_indices` split); no collectives, no MTP; deployment `pp` only | distinct parallel topology and per-stage worker contract |
 | `glm53_vllm_nvfp4_dsa_moe_dflash2` | the same NVFP4 target, run without its MTP layer, plus one DFlash2 block-parallel draft pass | same TP/EP topology; the draft is TP-sharded over the same ranks | distinct proposer checkpoint and cost tree |
 | `glm53_flash_vllm_fp8_kda_dsa_moe` | vLLM-fork-aligned GLM-5.3-Flash FP8 block hybrid KDA/DSA (kpool)/MoE with mHC | shared TP/EP rank group (TP4/EP4 profiled), one attention group; `barebone` worker with hybrid KV | only KDA + kpool-DSA graph |
+| `glm53_flash_vllm_fp8_pp_kda_dsa_moe` | the GLM-5.3-Flash FP8 graph's kernels under pure pipeline parallelism | `pp_size` one-GPU stages at TP1/EP1 (vLLM `get_pp_indices` split); per-stage KDA state and DSA cache; no collectives, no MTP; deployment `pp` only | distinct parallel topology and per-stage hybrid cache |
 | `glm52_sglang_nvfp4_tp_dsa_moe` | SGLang-aligned NVFP4 DSA/MoE | pure TP with EP1; every rank owns all experts | covers a topology the vLLM graph cannot represent |
 | `qwen36_local` | heterogeneous local FP8 graph | fixed TP1/EP1 | only Qwen3.6 graph |
 

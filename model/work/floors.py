@@ -86,7 +86,9 @@ def _model(config_path: str):
 
 #: Arch types whose served deployment fixes the MLA latent cache at FP8
 #: (``--kv-cache-dtype fp8_e4m3``), a serving choice the checkpoint config omits.
-_FP8_MLA_CACHE_ARCHS = frozenset({"glm53_flash_vllm_fp8_kda_dsa_moe"})
+_FP8_MLA_CACHE_ARCHS = frozenset(
+    {"glm53_flash_vllm_fp8_kda_dsa_moe", "glm53_flash_vllm_fp8_pp_kda_dsa_moe"}
+)
 
 
 def _with_fp8_mla_cache(model):
