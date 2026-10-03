@@ -86,7 +86,7 @@ pub struct Glm53FlashDpAttnEpParallel {
     pub cudagraph_capture_sizes: Vec<u32>,
 }
 
-/// vLLM's hybrid block size in align mode (`platforms/interface.py`): the
+/// vLLM's hybrid block size in align mode (`platforms/interface.py:893-927`): the
 /// smallest 128-aligned attention block whose page holds one layer's KDA state
 /// (recurrent + conv). The fp8 MLA latent is one byte per element, so one
 /// token's page is `kv_lora_rank` bytes. It is also the prefix-hit granularity.
@@ -445,6 +445,12 @@ pub fn build(
         resolved.local.kda.ssm_state_bytes_per_request
             + resolved.local.kda.conv_state_bytes_per_request,
     );
+    let hybrid_block_size = hybrid_block_size(state_bytes_per_layer, model_cfg.kv_lora_rank);
+    // vLLM pads each KDA layer's mamba page up to one attention page (block x
+    // 512 B; +1.1% at TP1), so that is what a request holds on its rank.
+    let recurrent_state_bytes_per_request = model_cfg.kda_layers.len() as u64
+        * u64::from(hybrid_block_size)
+        * u64::from(model_cfg.kv_lora_rank);
     let mut model = Glm53FlashDpAttnEpModel {
         embedding: atomic(
             n,
@@ -500,9 +506,8 @@ pub fn build(
             sizes
         },
         total_kv_bytes_per_token: u64::from(model_cfg.num_dsa_layers()) * dsa_bytes_per_token,
-        recurrent_state_bytes_per_request: model_cfg.kda_layers.len() as u64
-            * state_bytes_per_layer,
-        hybrid_block_size: hybrid_block_size(state_bytes_per_layer, model_cfg.kv_lora_rank),
+        recurrent_state_bytes_per_request,
+        hybrid_block_size,
         cost_flat: Vec::new(),
         n_slots: 0,
         name,
@@ -1053,10 +1058,6 @@ mod tests {
     fn hybrid_block_size_reproduces_vllm_at_tp4_and_tp1() {
         // TP4: 16 heads -> 1 MiB recurrent + 6144x3x2 conv; vLLM logged 2176.
         assert_eq!(hybrid_block_size((1 << 20) + 6144 * 3 * 2, 512), 2176);
-        assert_eq!(
-            hybrid_block_size((1 << 20) + 6144 * 3 * 2, 512),
-            tp_arch::HYBRID_BLOCK_SIZE
-        );
         // TP1: all 64 heads on one rank.
         assert_eq!(hybrid_block_size((4 << 20) + 24576 * 3 * 2, 512), 8576);
         assert_eq!(built(4).recurrent_checkpoint_interval_tokens(), 8576);
@@ -1067,10 +1068,9 @@ mod tests {
         for dp in [4, 8] {
             let model = built(dp);
             assert_eq!(model.total_kv_bytes_per_token(), 11 * (512 + 33));
-            assert_eq!(
-                model.recurrent_state_bytes_per_request(),
-                34 * ((4 << 20) + 24576 * 3 * 2)
-            );
+            // The true state is (4 << 20) + 24576 * 3 * 2 bytes per layer;
+            // vLLM pads it to one 8576-token attention page.
+            assert_eq!(model.recurrent_state_bytes_per_request(), 34 * 8576 * 512);
             assert_eq!(model.gpus_per_replica(), dp);
             assert_eq!(model.num_attn_dp_groups(), dp);
             assert_eq!(model.num_attn_shards(), 1);

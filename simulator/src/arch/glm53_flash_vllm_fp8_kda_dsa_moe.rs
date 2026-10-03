@@ -76,7 +76,7 @@ pub(crate) const CACHE_BLOCK_SIZE: u32 = 64;
 /// vLLM's hybrid block size for this deployment ("attention block size 2176"
 /// in the capture's server log): the token interval at which the KDA state is
 /// checkpointed and a prefix-cache hit can resume.
-pub(crate) const HYBRID_BLOCK_SIZE: u32 = 2176;
+const HYBRID_BLOCK_SIZE: u32 = 2176;
 /// vLLM runs the shared expert on an aux stream at or below this batch size.
 pub(crate) const SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: u32 = 256;
 /// `Max{overlap}` of the aux-stream shared expert against its routed slice.
