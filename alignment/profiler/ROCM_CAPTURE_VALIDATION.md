@@ -37,20 +37,34 @@ is the trace shape, not the model.
    its entry-point metadata is present) and re-run the check. No source edit to
    vLLM is needed — discovery is entirely through this entry point.
 
-2. **A roctx backend must be loadable.** The shim prefers the rocprofiler-sdk
-   roctx C API (`librocprofiler-sdk-roctx.so.1`) and falls back, in order, to
-   legacy `libroctx64` then ROCm PyTorch's roctx-retargeted `torch.cuda.nvtx`. On
-   the pinned rocprofv3-1.3.2 stack `--marker-trace` records roctx ranges **only**
-   from `librocprofiler-sdk-roctx`, so that soname is tried first (see
-   `roctx_shim.RoctracerBackend`). **Open risk to confirm on this lease:** the
-   in-full-vLLM-process MARKER registration ordering. If legacy `libroctx64` is
-   also resolvable in the serving process and wins `roctx*` symbol resolution
-   before rocprofv3's SDK interception registers, `--marker-trace` can record
-   nothing even though the shim pushed ranges. Confirm which roctx library the
-   serving process actually loaded and that query (a) below returns the labels; if
-   it is empty while the shim ran, this ordering is the suspect. Do **not** force
-   the roctx lib via `LD_PRELOAD` — that bypasses the SDK interception and is not
-   the supported path; the shim loads the lib itself with `ctypes`.
+2. **A roctx backend must be loadable, and the SDK roctx lib must win the load
+   order.** The shim prefers the rocprofiler-sdk roctx C API
+   (`librocprofiler-sdk-roctx.so.1`) and falls back, in order, to legacy
+   `libroctx64` then ROCm PyTorch's roctx-retargeted `torch.cuda.nvtx`. On the
+   pinned ROCm-7 / rocprofv3-1.3.2 stack `--marker-trace` records roctx ranges
+   **only** from `librocprofiler-sdk-roctx`, so that soname is tried first (see
+   `roctx_shim.RoctracerBackend`).
+
+   The confirmed GPU failure mode: vLLM's `torch`/`aiter` load legacy
+   `libroctx64.so` on import, and that resident legacy library preempts
+   rocprofv3's SDK MARKER service, so `--marker-trace` records **zero**
+   `vllm_iteration(N)` ranges (kernel capture via `--kernel-trace` is unaffected —
+   it recorded 23,711 rows). The fix is a **load-order** one: rocprofv3 registers
+   its MARKER service by intercepting the `dlopen` of `librocprofiler-sdk-roctx.so.1`
+   *inside the already-wrapped process*, so the SDK lib must be `dlopen`ed — from
+   inside that process — **before** torch imports `libroctx64`. The capture driver
+   now does exactly that: `build_capture_server_env` prepends a generated
+   `sitecustomize.py` dir to the launched server's `PYTHONPATH`, and
+   `sitecustomize` (imported automatically at interpreter startup, before any
+   user/torch import) calls `alignment.profiler._roctx_preload.preload_sdk_roctx`,
+   which does `ctypes.CDLL("librocprofiler-sdk-roctx.so.1", mode=RTLD_GLOBAL)`. That
+   runtime load is intercepted by rocprofv3 (MARKER registers) and, being
+   `RTLD_GLOBAL` and first, wins `roctx*` symbol resolution over torch's later
+   `libroctx64`. The shim's `RoctracerBackend` then reuses that resident handle, so
+   its `roctx*` calls resolve to the SDK lib. Do **not** force the roctx lib via
+   `LD_PRELOAD` — that loads it before rocprofv3's interception is active, so the
+   MARKER never registers (confirmed failure); the preload must happen in-process,
+   which is why it is driven from `sitecustomize`, not `LD_PRELOAD`.
 
 ## Capture command
 
@@ -75,9 +89,14 @@ uv run --no-sync python -m alignment rocpd-capture \
 
 Notes:
 - `rocpd-capture` **also** injects `VLLM_ROCTX_SCOPES_FOR_PROFILING=1` into the
-  launched server's environment itself (that is the fix this validates), so the
-  leading env assignment above is belt-and-suspenders — it makes the intent
-  explicit and covers a manually invoked server. Do **not** set `VLLM_PLUGINS`;
+  launched server's environment itself, so the leading env assignment above is
+  belt-and-suspenders — it makes the intent explicit and covers a manually invoked
+  server. It further prepends a generated `sitecustomize.py` dir to the launched
+  server's `PYTHONPATH` so the SDK roctx library is `RTLD_GLOBAL`-loaded before
+  torch (the load-order fix this validates; see Precondition 2). A manually invoked
+  server must reproduce **both**: set the env flag *and* put the preload on
+  `PYTHONPATH` (e.g. `PYTHONPATH=$(python -c 'import alignment.profiler.rocprof_capture as c; print(c.write_roctx_sitecustomize_dir())'):$PYTHONPATH`).
+  Do **not** set `VLLM_PLUGINS`;
   leaving it unset lets vLLM load all general plugins including ours. If your
   environment already sets `VLLM_PLUGINS`, it must include `vibesim_roctx_shim`.
 - `--enforce-eager` keeps every kernel a normal launch (no HIP graphs); the
@@ -190,12 +209,33 @@ capture plumbing — report that distinction rather than re-running the capture.
 This 1-GPU check fixes capture plumbing that is confirmable on-host; two facts
 remain GPU-only and must be confirmed on the next lease.
 
-1. **roctx MARKER registration ordering (Gap 2, TP1 is enough).** Confirm the
-   serving process loads `librocprofiler-sdk-roctx` (not legacy `libroctx64`) and
-   that `--marker-trace` records the labels — i.e. query (a) is non-empty while
-   the shim ran. If both roctx libraries are resolvable and the legacy one
-   preempts the SDK's symbol/MARKER registration, `--marker-trace` records nothing
-   even though the shim pushed ranges.
+1. **roctx MARKER registration ordering — load-order fix landed (Gap 2, TP1 is
+   enough).** The earlier capture recorded zero `vllm_iteration(N)` ranges because
+   torch's legacy `libroctx64` preempted rocprofv3's SDK MARKER service. The fix
+   (sitecustomize `RTLD_GLOBAL` preload of `librocprofiler-sdk-roctx.so.1` before
+   torch; see Precondition 2) is implemented on-host but its effect is GPU-only.
+
+   **Exact 1-GPU re-test** — serve `Qwen/Qwen2.5-0.5B-Instruct` on one MI300X with
+   the capture command above (the driver injects the preload automatically), drive
+   a short completion workload, then confirm **all three**:
+   - the rocprofv3 **capture log shows `MARKER (ROCTx) ... initialized`** (the SDK
+     MARKER service registered in-process) — and, as a cross-check, the serving
+     log shows the preloader resolved `librocprofiler-sdk-roctx.so.1`
+     (`VIBESIM_ROCTX_SONAME_RESOLVED` set / the `preloaded SDK roctx ...` log line);
+   - **`validate_rocpd` returns `iteration_ranges>0` and `ok:true`** (the printed
+     JSON line) — i.e. query (a) is now non-empty while `--kernel-trace` still
+     records dispatch rows;
+   - **`rocpd-parse` emits the 3 artifacts** non-empty: `parsed.json`,
+     `parsed.kernels.parquet`, `kernel_sequences.json` (per the success criterion
+     above).
+
+   If `iteration_ranges` is still 0 after this fix, the preload did not win the
+   load order (confirm `VIBESIM_ROCTX_SONAME_RESOLVED` and that `sitecustomize` ran
+   before torch) — only then fall back to **Option B** (sentinel-kernel iteration
+   boundaries: bracket each forward with a tiny uniquely-named marker kernel via
+   `--kernel-trace`, and derive iteration windows from those dispatch rows instead
+   of roctx ranges). Option B is the documented fallback only; it is **not**
+   implemented, because it should be unnecessary once the SDK lib loads first.
 
 2. **Per-rank capture for TP>1 (Gap 3, needs TP4/EP4).** The driver now templates
    a per-rank rocprofv3 output name for `--tp-size > 1` (`-o <name>_rank%q{RANK}%`,
