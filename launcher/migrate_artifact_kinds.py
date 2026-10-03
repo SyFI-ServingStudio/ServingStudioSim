@@ -78,7 +78,7 @@ def _is_prediction(directory: Path) -> bool:
 
 def _is_simulation_run(directory: Path) -> bool:
     params = _read_json(directory / "raw/params.json")
-    return isinstance(params, dict) and params.get("deployment") in {"unified", "pd", "afd"}
+    return isinstance(params, dict) and params.get("deployment") in {"unified", "pd", "afd", "pp"}
 
 
 def _is_sweep(directory: Path) -> bool:

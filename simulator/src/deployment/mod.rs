@@ -11,10 +11,12 @@
 pub mod afd;
 pub mod config;
 pub mod pd;
+pub mod pp;
 pub mod unified;
 
 pub use config::{
-    AfdConfig, BackendOverrides, IoSpec, LogLevel, PdConfig, RunConfig, UnifiedConfig, WorkloadSpec,
+    AfdConfig, BackendOverrides, IoSpec, LogLevel, PdConfig, PpConfig, RunConfig, UnifiedConfig,
+    WorkloadSpec,
 };
 
 use crate::common::SharedRequests;
@@ -22,8 +24,8 @@ use crate::orchestrator::Flow;
 use crate::timing::PerfApiBridge;
 
 /// Dispatch a deserialized `RunConfig` to its deployment's `build`. The single
-/// place the `deployment` tag routes to a concrete topology. `unified`, `pd`, and
-/// `afd` are all wired.
+/// place the `deployment` tag routes to a concrete topology. `unified`, `pd`,
+/// `afd`, and `pp` are all wired.
 pub fn build_flow(
     cfg: &RunConfig,
     bridge: &PerfApiBridge,
@@ -33,6 +35,7 @@ pub fn build_flow(
         RunConfig::Unified(c) => unified::UnifiedDeployment::build(c, bridge, store),
         RunConfig::Pd(c) => pd::PdDeployment::build(c, bridge, store),
         RunConfig::Afd(c) => afd::AfdDeployment::build(c, bridge, store),
+        RunConfig::Pp(c) => pp::PpDeployment::build(c, bridge, store),
     }
 }
 

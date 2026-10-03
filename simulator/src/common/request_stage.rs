@@ -91,6 +91,18 @@ impl UnifiedStage {
     };
 }
 
+/// Pipeline-parallel lifecycle. Requests are located on their pipeline's head
+/// stage, which runs the unified lifecycle, so `pp` stamps [`UnifiedStage`] codes
+/// and only the deployment name differs. Follower stages stamp nothing.
+pub struct PpStage;
+
+impl PpStage {
+    pub const VOCAB: StageVocab = StageVocab {
+        deployment: "pp",
+        names: UnifiedStage::NAMES,
+    };
+}
+
 /// PD lifecycle: separate prefill and decode pools bridged by a KV handoff.
 #[repr(u16)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -191,7 +203,12 @@ mod tests {
 
     #[test]
     fn names_are_category_detail() {
-        for vocab in [UnifiedStage::VOCAB, PdStage::VOCAB, AfdStage::VOCAB] {
+        for vocab in [
+            UnifiedStage::VOCAB,
+            PdStage::VOCAB,
+            AfdStage::VOCAB,
+            PpStage::VOCAB,
+        ] {
             assert_category_detail(vocab.names);
         }
     }

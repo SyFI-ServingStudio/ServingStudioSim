@@ -76,6 +76,7 @@ pub fn list_params() -> Value {
             "unified": { "pools": { "main": "iter_wise" } },
             "pd":      { "pools": { "prefill": "iter_wise", "decode": "iter_wise" } },
             "afd":     { "pools": { "attn": "layer_wise_attn", "ffn": "layer_wise_ffn" } },
+            "pp":      { "pools": { "stage": "iter_wise" } },
         },
         "providers": {
             "arch": {
