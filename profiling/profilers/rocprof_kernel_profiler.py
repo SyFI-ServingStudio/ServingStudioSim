@@ -104,7 +104,9 @@ _PID_COLUMN_HINTS = ("pid",)
 _TID_COLUMN_HINTS = ("tid", "thread_id", "global_tid")
 
 # roctx region table discovery. rocpd records every roctx push/pop range in a
-# ``rocpd_region`` table with a ``name_id`` FK into the shared string table.
+# ``rocpd_region`` table. Its ``name_id`` FK resolves (via the string table) only
+# to the API op name (``roctxThreadRangeA``); the range's real message text is on
+# the joined event row's ``extdata`` JSON (see ``_EVENT_TABLE_HINTS`` below).
 _REGION_TABLE_HINTS = ("rocpd_region", "roctx_region", "region")
 _REGION_START_HINTS = ("start", "start_timestamp", "start_ns", "begin")
 _REGION_END_HINTS = ("end", "end_timestamp", "end_ns", "finish")
@@ -114,6 +116,44 @@ _REGION_NAME_FK_HINTS = ("name_id", "region_name_id", "string_id")
 _STRING_TABLE_HINTS = ("rocpd_string", "string")
 _STRING_PK_HINTS = ("id", "string_id")
 _STRING_VALUE_HINTS = ("string", "value", "name")
+
+# The real roctx label does NOT live in the region's ``name_id`` string: on a
+# rocprofv3 1.3.2 / rocprofiler-sdk capture that column resolves to the API op
+# name ``roctxThreadRangeA`` (category ``MARKER_CORE_RANGE_API``), the same for
+# every roctx range. The instrumented label text (``vllm_iteration(N): forward``,
+# ``VibeSimAlignmentIteration {json}``) is carried as JSON in the *event* row the
+# region points at via ``event_id``: ``rocpd_event.extdata`` = ``{"message": ...}``
+# (also surfaced as the ``extdata`` column of rocprofv3's ``regions`` view). So
+# the reader joins region -> event and reads the ``message`` field, falling back
+# to the ``name_id`` string only when no extdata message is present (older
+# captures, or a synthetic db that interns the label directly as the region name).
+_EVENT_TABLE_HINTS = ("rocpd_event", "event")
+# FK on the region row pointing at the event table (``rocpd_region.event_id``).
+_REGION_EVENT_FK_HINTS = ("event_id",)
+_EVENT_PK_HINTS = ("id", "event_id")
+# The JSON blob column on the event row carrying ``{"message": "<roctx label>"}``.
+_EVENT_EXTDATA_HINTS = ("extdata",)
+
+
+def _roctx_message_from_extdata(extdata: object) -> str | None:
+    """Pull the roctx label out of a rocpd event's ``extdata`` JSON blob.
+
+    rocprofv3 stores the roctx range's actual message as ``{"message": "..."}``
+    in ``rocpd_event.extdata``; an unannotated range carries ``{}`` (or NULL).
+    Returns the message string when present and non-empty, else ``None`` so the
+    caller can fall back to the region's interned ``name_id`` string.
+    """
+    if not extdata:
+        return None
+    try:
+        payload = json.loads(extdata)
+    except (TypeError, ValueError):
+        return None
+    if isinstance(payload, dict):
+        message = payload.get("message")
+        if isinstance(message, str) and message:
+            return message
+    return None
 
 
 @dataclass(frozen=True)
@@ -308,9 +348,10 @@ class RocpdDispatch:
 class RoctxRegion:
     """One roctx push/pop range: an instrumented marker like ``vllm_iteration(3): forward``.
 
-    rocpd stores every roctx range in its region table with the message text
-    interned in the shared string table. These are the windows the alignment
-    ownership join tests a dispatch's launch time against. ``pid``/``tid`` are the
+    rocpd stores every roctx range in its region table; the message text lives
+    on the joined event row's ``extdata`` JSON (the region's own ``name_id`` only
+    gives the API op name). These are the windows the alignment ownership join
+    tests a dispatch's launch time against. ``pid``/``tid`` are the
     process and thread that opened the range (``None`` when the schema omits them).
     """
 
@@ -415,6 +456,11 @@ def roctx_regions_from_rocpd(db_path: str) -> list[RoctxRegion]:
         def qualified(column: str | None) -> str:
             return f'r."{column}"' if column else "NULL"
 
+        # Fallback label source: the region's interned ``name_id`` string. On a
+        # real rocprofv3 capture this is only ``roctxThreadRangeA`` (the API op
+        # name), so it is the fallback; the true label comes from the event join
+        # below. A synthetic db that interns the label directly still resolves
+        # here, which is why this is kept.
         string_table = _first_table_matching(tables, _STRING_TABLE_HINTS)
         join = ""
         name_select = f'r."{name_fk}"'
@@ -426,18 +472,40 @@ def roctx_regions_from_rocpd(db_path: str) -> list[RoctxRegion]:
                 join = f'LEFT JOIN "{string_table}" s ON r."{name_fk}" = s."{string_pk}"'
                 name_select = f's."{string_value}"'
 
+        # Primary label source: the event row the region points at via
+        # ``event_id``, whose ``extdata`` JSON carries ``{"message": "<label>"}``.
+        event_table = _first_table_matching(tables, _EVENT_TABLE_HINTS)
+        event_fk = _first_column_matching(columns, _REGION_EVENT_FK_HINTS)
+        event_join = ""
+        extdata_select = "NULL"
+        if event_table is not None and event_fk is not None:
+            event_columns = _column_names(conn, event_table)
+            event_pk = _first_column_matching(event_columns, _EVENT_PK_HINTS)
+            event_extdata = _first_column_matching(event_columns, _EVENT_EXTDATA_HINTS)
+            if event_pk is not None and event_extdata is not None:
+                event_join = (
+                    f'LEFT JOIN "{event_table}" e ON r."{event_fk}" = e."{event_pk}"'
+                )
+                extdata_select = f'e."{event_extdata}"'
+
         sql = (
-            f'SELECT r."{start_col}", r."{end_col}", {name_select}, '
+            f'SELECT r."{start_col}", r."{end_col}", {name_select}, {extdata_select}, '
             f"{qualified(tid_col)}, {qualified(pid_col)} "
-            f'FROM "{region_table}" r {join} ORDER BY r."{start_col}"'
+            f'FROM "{region_table}" r {join} {event_join} ORDER BY r."{start_col}"'
         )
         rows = conn.execute(sql).fetchall()
     finally:
         conn.close()
 
     regions: list[RoctxRegion] = []
-    for start, end, name, tid, pid in rows:
-        if name is None:
+    for start, end, fallback_name, extdata, tid, pid in rows:
+        # Prefer the real roctx label from the event's extdata JSON; only when it
+        # is absent does the interned region name (``roctxThreadRangeA`` on a real
+        # capture) stand in. A range with neither is not an instrumented marker.
+        label = _roctx_message_from_extdata(extdata)
+        if label is None and fallback_name is not None:
+            label = str(fallback_name)
+        if label is None:
             continue
         regions.append(
             RoctxRegion(
@@ -445,7 +513,7 @@ def roctx_regions_from_rocpd(db_path: str) -> list[RoctxRegion]:
                 end_ns=int(end),
                 tid=None if tid is None else int(tid),
                 pid=None if pid is None else int(pid),
-                name=str(name),
+                name=label,
             )
         )
     return regions

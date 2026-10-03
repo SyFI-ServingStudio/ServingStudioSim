@@ -19,6 +19,7 @@ No GPU and no rocprofiler-sdk needed; the fixture is a plain sqlite file.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 
 import pyarrow.parquet as pq
@@ -29,6 +30,7 @@ from alignment.nsys.sequence import expand_sequence
 from alignment.rocpd.evidence import build_ranges_from_rocpd
 from alignment.rocpd.parse import main as rocpd_main
 from alignment.rocpd.parse import parse_trace
+from profiling.profilers.rocprof_kernel_profiler import roctx_regions_from_rocpd
 
 _GUID = "0000b1c7_c35b_735b_96a7_f0a02ff013cc"
 _PID = 4242
@@ -203,6 +205,118 @@ def test_produced_files_pass_the_label_stage(tmp_path):
     # error-severity defect in a freshly produced, consistently-categorized file.
     assert labeling_cli.main(["walk", str(labeled)]) == 0
     assert labeling_cli.main(["check", str(labeled)]) == 0
+
+
+def _write_real_label_schema_rocpd(path, regions, dispatches):
+    """Write a rocpd db mirroring a REAL rocprofv3-1.3.2 capture's label layout.
+
+    The difference from ``_write_synthetic_rocpd`` is where the roctx label lives.
+    On a real capture the region's ``name_id`` resolves (via ``rocpd_string``) only
+    to the API op name ``roctxThreadRangeA`` — identical for every range — while
+    the actual ``vllm_iteration(N): <phase>`` text is JSON in the event row the
+    region points at via ``event_id``: ``rocpd_event.extdata`` = ``{"message": ...}``.
+    This fixture reproduces that exactly: every region's ``name_id`` points at the
+    decoy op-name string, and the real label is only in the joined event's extdata.
+
+    ``regions`` is ``(start, end, label)``; ``dispatches`` is ``(start, end, name)``.
+    """
+    conn = sqlite3.connect(path)
+    conn.execute(f"CREATE TABLE rocpd_string_{_GUID} (id INTEGER PRIMARY KEY, string TEXT)")
+    conn.execute(
+        f"CREATE TABLE rocpd_info_kernel_symbol_{_GUID} "
+        "(id INTEGER PRIMARY KEY, kernel_name TEXT, display_name TEXT)"
+    )
+    conn.execute(
+        f"CREATE TABLE rocpd_kernel_dispatch_{_GUID} "
+        "(id INTEGER PRIMARY KEY, pid INTEGER, tid INTEGER, agent_id INTEGER, "
+        "kernel_id INTEGER, dispatch_id INTEGER, queue_id INTEGER, stream_id INTEGER, "
+        "start BIGINT, end BIGINT, region_name_id INTEGER)"
+    )
+    # The real region carries an ``event_id`` FK; the event row holds ``extdata``.
+    conn.execute(
+        f"CREATE TABLE rocpd_region_{_GUID} "
+        "(id INTEGER PRIMARY KEY, pid INTEGER, tid INTEGER, start BIGINT, end BIGINT, "
+        "name_id INTEGER, event_id INTEGER, extdata TEXT)"
+    )
+    conn.execute(
+        f"CREATE TABLE rocpd_event_{_GUID} "
+        "(id INTEGER PRIMARY KEY, category_id INTEGER, extdata TEXT)"
+    )
+    # The single decoy op-name string every region's name_id points at.
+    decoy_id = 1
+    conn.execute(
+        f"INSERT INTO rocpd_string_{_GUID} (id, string) VALUES (?, ?)",
+        (decoy_id, "roctxThreadRangeA"),
+    )
+
+    symbols: dict[str, int] = {}
+    for _s, _e, name in dispatches:
+        if name not in symbols:
+            symbols[name] = len(symbols) + 1
+            conn.execute(
+                f"INSERT INTO rocpd_info_kernel_symbol_{_GUID} (id, kernel_name, display_name) "
+                "VALUES (?, ?, ?)",
+                (symbols[name], f"_mangled_{name}", name),
+            )
+    for i, (start, end, name) in enumerate(dispatches, start=1):
+        conn.execute(
+            f"INSERT INTO rocpd_kernel_dispatch_{_GUID} "
+            "(id, pid, tid, agent_id, kernel_id, dispatch_id, queue_id, stream_id, "
+            "start, end, region_name_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (i, _PID, _TID, _AGENT, symbols[name], i, 0, 0, start, end, 0),
+        )
+    for i, (start, end, label) in enumerate(regions, start=1):
+        conn.execute(
+            f"INSERT INTO rocpd_event_{_GUID} (id, category_id, extdata) VALUES (?, ?, ?)",
+            (i, 39, json.dumps({"message": label})),
+        )
+        conn.execute(
+            f"INSERT INTO rocpd_region_{_GUID} "
+            "(id, pid, tid, start, end, name_id, event_id, extdata) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (i, _PID, _TID, start, end, decoy_id, i, "{}"),
+        )
+    conn.commit()
+    conn.close()
+
+
+def test_label_recovered_from_event_extdata_not_name_id(tmp_path):
+    """Gap 1 regression: the roctx label comes from event.extdata.message.
+
+    A real rocprofv3 capture interns only ``roctxThreadRangeA`` in the region's
+    ``name_id``; the true ``vllm_iteration(N)`` text is in the joined event's
+    ``extdata`` JSON. The reader must recover the markers from extdata — a reader
+    that reads ``name_id`` would see every range as ``roctxThreadRangeA`` and match
+    no iteration, producing an empty alignment.
+    """
+    db = tmp_path / "real_label.db"
+    _write_real_label_schema_rocpd(
+        db,
+        regions=[
+            (1_000, 5_000, "vllm_iteration(0): forward"),
+            (6_000, 10_000, "vllm_iteration(1): forward"),
+        ],
+        dispatches=[
+            (500, 900, "warmup_fill_kernel"),  # before iter 0 -> dropped
+            (1_500, 2_000, "hipblaslt_gemm_f16"),  # inside iter 0
+            (6_500, 7_000, "flash_fwd_attn_kernel"),  # inside iter 1
+        ],
+    )
+
+    # The reader surfaces the extdata message, NOT the decoy op name.
+    names = {region.name for region in roctx_regions_from_rocpd(str(db))}
+    assert names == {"vllm_iteration(0): forward", "vllm_iteration(1): forward"}
+    assert "roctxThreadRangeA" not in names
+
+    # ...and the full ownership join attributes dispatches to those iterations.
+    ranges = build_ranges_from_rocpd(str(db))
+    by_iter = {item.iteration: item for item in ranges}
+    assert set(by_iter) == {0, 1}
+    assert by_iter[0].kernel_count == 1 and by_iter[1].kernel_count == 1
+    assert {e.name for item in ranges for e in item.kernel_events} == {
+        "hipblaslt_gemm_f16",
+        "flash_fwd_attn_kernel",
+    }
 
 
 def test_no_iteration_markers_raises(tmp_path):
