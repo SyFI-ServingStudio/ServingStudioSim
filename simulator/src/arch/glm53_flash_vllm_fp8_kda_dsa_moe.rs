@@ -7,8 +7,9 @@
 //! `--enable-expert-parallel`: on, each rank owns 288 / tp whole experts (EP4
 //! is the captured deployment); off, every rank owns all 288 experts sliced to
 //! 2048 / tp on the intermediate axis (MoE TP). Every sublayer ends in a plain
-//! TP all-reduce (`flashinfer_comm.allreduce_fusion`, kAllReduce, MNNVL), 91
-//! per iteration: embedding + 45 attention + 3 dense + 42 MoE; the MoE combine
+//! TP all-reduce (`flashinfer_comm.allreduce_fusion`, kAllReduce, MNNVL, up to
+//! FlashInfer's workspace cap; NCCL above it, see `TpAllReduce`), 91 per
+//! iteration: embedding + 45 attention + 3 dense + 42 MoE; the MoE combine
 //! is the same all-reduce in both modes (vLLM `moe_runner.py:504-509` reduces
 //! when `tp_size > 1 or ep_size > 1`).
 //!
@@ -65,6 +66,7 @@ use crate::timing::bridge::DType;
 use crate::timing::expert_demand::ExpertDemand;
 use crate::timing::kernels::{
     AllReduceFusionKernel, AllReduceFusionKernelConfig, AllReduceFusionKernelInput,
+    AllReduceFusionSpec, AllReduceKernel, AllReduceKernelConfig, AllReduceKernelInput,
     ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput,
     MhcFusedPostPreRmsNormKernel, MhcPreRmsNormKernel, MhcRmsNormKernelConfig,
     MhcRmsNormKernelInput, RmsNormKernel, RmsNormKernelConfig, RmsNormKernelInput,
@@ -129,6 +131,13 @@ const MLA_APPEND_BACKENDS: &[&str] = &["vllm_cuda"];
 const INDEX_REMAP_BACKENDS: &[&str] = &["vllm_triton"];
 const FUSED_MOE_BACKENDS: &[&str] = &["flashinfer_trtllm_fp8_block_sm100"];
 const ALL_REDUCE_BACKENDS: &[&str] = &["flashinfer_mnnvl"];
+/// TP8 stand-in for MNNVL below the 128-token cap. The MNNVL workspace fails
+/// on the profiling host since 2026-10-03 (`cuMulticastAddDevice` returns
+/// CUDA_ERROR_ILLEGAL_STATE at 4 and 8 GPUs; jobs 3410, 3413), so the TP8 rows
+/// cannot be measured; TRT-LLM IPC is what vLLM's `auto` backend falls back to
+/// on a single node when that workspace fails (`flashinfer_all_reduce.py:137-160`).
+const TP8_ALL_REDUCE_BACKENDS: &[&str] = &["flashinfer_trtllm"];
+const LARGE_ALL_REDUCE_BACKENDS: &[&str] = &["nccl"];
 
 /// The checkpoint's dimensions, read strictly from its `config.json`.
 #[derive(Clone, Debug, PartialEq)]
@@ -387,6 +396,8 @@ pub struct Glm53FlashVllmConfigs {
     pub hc_expand: ElementwiseKernelConfig,
     pub mhc: MhcRmsNormKernelConfig,
     pub all_reduce: AllReduceFusionKernelConfig,
+    /// The all-reduce vLLM falls back to above FlashInfer's workspace cap.
+    pub large_all_reduce: AllReduceKernelConfig,
     /// Routed-input copy ahead of routing, and the shared + routed combine.
     pub moe_input_glue: ElementwiseKernelConfig,
     pub moe_combine_glue: ElementwiseKernelConfig,
@@ -525,11 +536,21 @@ pub fn build_configs(
             hidden_dtype: ACTIVATION_DTYPE,
         },
         all_reduce: AllReduceFusionKernelConfig {
-            backends: ALL_REDUCE_BACKENDS.to_vec(),
+            backends: if tp == 8 {
+                TP8_ALL_REDUCE_BACKENDS.to_vec()
+            } else {
+                ALL_REDUCE_BACKENDS.to_vec()
+            },
             gpu_name: gpu.clone(),
             num_gpus: tp,
             hidden_dim: model.hidden,
             dtype: ACTIVATION_DTYPE,
+            fabric: Fabric::Nvlink,
+        },
+        large_all_reduce: AllReduceKernelConfig {
+            backends: LARGE_ALL_REDUCE_BACKENDS.to_vec(),
+            gpu_name: gpu.clone(),
+            num_gpus: tp,
             fabric: Fabric::Nvlink,
         },
         moe_input_glue: ew(hidden_bytes, hidden_bytes),
@@ -701,15 +722,81 @@ enum Ffn {
     Moe(MoeBlock),
 }
 
+/// One TP all-reduce boundary. vLLM's `CudaCommunicator.all_reduce` takes
+/// FlashInfer while the `[tokens, hidden]` input fits its workspace
+/// (`should_use_fi_ar`, `flashinfer_all_reduce.py:441-450`; 32 MiB at TP4 and
+/// 1 MiB at TP8 on SM100, `allreduce_rms_fusion.py:104-116`) and a different
+/// all-reduce above it (`cuda_communicator.py:305-370`): custom AR stops at
+/// 2 MiB / 1 MiB on SM100 (`all_reduce_utils.py:38-43`), so at TP4 that is
+/// pynccl, and at TP8 torch symmetric memory up to 128 MiB, for which the
+/// measured NCCL curve stands in. Both slots are compiled and the inactive one
+/// is pushed as zero, so the slot layout does not depend on the batch.
+struct TpAllReduce {
+    fused: Op<AllReduceFusionKernel>,
+    large: Op<AllReduceKernel>,
+    max_fused_tokens: u32,
+    bytes_per_token: u64,
+}
+
+impl TpAllReduce {
+    fn build(
+        prefix: &str,
+        suffix: &str,
+        cfg: &Glm53FlashVllmConfigs,
+        bridge: &PerfApiBridge,
+    ) -> std::result::Result<Self, BuildError> {
+        Ok(Self {
+            fused: atomic(
+                prefix,
+                suffix,
+                cfg.all_reduce.clone(),
+                AllReduceFusionKernel::build,
+                bridge,
+            )?,
+            large: atomic(
+                prefix,
+                &format!("{suffix}_large"),
+                cfg.large_all_reduce.clone(),
+                AllReduceKernel::build,
+                bridge,
+            )?,
+            max_fused_tokens: AllReduceFusionSpec::max_fused_tokens(&cfg.all_reduce),
+            bytes_per_token: u64::from(cfg.all_reduce.hidden_dim)
+                * u64::from(cfg.all_reduce.dtype.size_bytes()),
+        })
+    }
+
+    fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
+        CostNode::Sum(vec![
+            self.fused.compile(builder),
+            self.large.compile(builder),
+        ])
+    }
+
+    fn eval(&self, tokens: u32, ev: &mut Evaluator) {
+        let fused_input = AllReduceFusionKernelInput { num_tokens: tokens };
+        let large_input = AllReduceKernelInput {
+            message_size_bytes: u64::from(tokens) * self.bytes_per_token,
+        };
+        if tokens <= self.max_fused_tokens {
+            push(&self.fused, fused_input, ev);
+            ev.push(LeafMetrics::ZERO, || large_input.into());
+        } else {
+            ev.push(LeafMetrics::ZERO, || fused_input.into());
+            push(&self.large, large_input, ev);
+        }
+    }
+}
+
 struct LayerGroup {
     label: String,
     layers: Vec<u32>,
     attn_boundary: Boundary,
     attn: Attention,
-    attn_all_reduce: Op<AllReduceFusionKernel>,
+    attn_all_reduce: TpAllReduce,
     ffn_boundary: Op<MhcFusedPostPreRmsNormKernel>,
     ffn: Ffn,
-    ffn_all_reduce: Op<AllReduceFusionKernel>,
+    ffn_all_reduce: TpAllReduce,
 }
 
 impl LayerGroup {
@@ -747,11 +834,7 @@ impl LayerGroup {
             Attention::Kda(worklet) => worklet.eval(&batch.kda, ev),
             Attention::Dsa(worklet) => worklet.eval(&batch.dsa, ev),
         }
-        push(
-            &self.attn_all_reduce,
-            AllReduceFusionKernelInput { num_tokens: tokens },
-            ev,
-        );
+        self.attn_all_reduce.eval(tokens, ev);
         push(
             &self.ffn_boundary,
             MhcRmsNormKernelInput { num_tokens: tokens },
@@ -763,11 +846,7 @@ impl LayerGroup {
             }
             Ffn::Moe(block) => block.eval(tokens, ev),
         }
-        push(
-            &self.ffn_all_reduce,
-            AllReduceFusionKernelInput { num_tokens: tokens },
-            ev,
-        );
+        self.ffn_all_reduce.eval(tokens, ev);
     }
 }
 
@@ -779,7 +858,7 @@ pub struct Glm53FlashVllmModel {
     /// Sorted, deduplicated capture sizes (see `Glm53FlashVllmParallel`).
     cudagraph_capture_sizes: Vec<u32>,
     embedding: Op<ElementwiseKernel>,
-    embedding_all_reduce: Op<AllReduceFusionKernel>,
+    embedding_all_reduce: TpAllReduce,
     hc_expand: Op<ElementwiseKernel>,
     groups: Vec<LayerGroup>,
     terminal_post: MhcTerminalPostOp,
@@ -890,13 +969,7 @@ pub fn build(
             layers: group.layers.clone(),
             attn_boundary,
             attn,
-            attn_all_reduce: atomic(
-                p,
-                "attn_all_reduce",
-                cfg.all_reduce.clone(),
-                AllReduceFusionKernel::build,
-                bridge,
-            )?,
+            attn_all_reduce: TpAllReduce::build(p, "attn_all_reduce", cfg, bridge)?,
             ffn_boundary: atomic(
                 p,
                 "ffn_mhc_post_pre",
@@ -905,13 +978,7 @@ pub fn build(
                 bridge,
             )?,
             ffn,
-            ffn_all_reduce: atomic(
-                p,
-                "ffn_all_reduce",
-                cfg.all_reduce.clone(),
-                AllReduceFusionKernel::build,
-                bridge,
-            )?,
+            ffn_all_reduce: TpAllReduce::build(p, "ffn_all_reduce", cfg, bridge)?,
         });
     }
     let model_cfg = &cfg.model;
@@ -938,13 +1005,7 @@ pub fn build(
             ElementwiseKernel::build,
             bridge,
         )?,
-        embedding_all_reduce: atomic(
-            n,
-            "embedding_all_reduce",
-            cfg.all_reduce.clone(),
-            AllReduceFusionKernel::build,
-            bridge,
-        )?,
+        embedding_all_reduce: TpAllReduce::build(n, "embedding_all_reduce", cfg, bridge)?,
         hc_expand: atomic(
             n,
             "hc_expand",
@@ -1046,11 +1107,7 @@ impl Glm53FlashVllmModel {
             ElementwiseKernelInput { num_tokens: tokens },
             ev,
         );
-        push(
-            &self.embedding_all_reduce,
-            AllReduceFusionKernelInput { num_tokens: tokens },
-            ev,
-        );
+        self.embedding_all_reduce.eval(tokens, ev);
         push(
             &self.hc_expand,
             ElementwiseKernelInput { num_tokens: tokens },
@@ -1333,11 +1390,14 @@ mod tests {
         built_with(parallel())
     }
 
+    fn demand() -> ExpertDemand {
+        ExpertDemand::popularity(&RoutingDistribution::uniform(288), 42)
+    }
+
     fn built_with(parallel: Glm53FlashVllmParallel) -> Glm53FlashVllmModel {
         let bridge = PerfApiBridge::new_uninit_for_test();
         bridge.enable_enumerate();
-        let demand = ExpertDemand::popularity(&RoutingDistribution::uniform(288), 42);
-        let configs = build_configs(&model_cfg(), &parallel, &demand).unwrap();
+        let configs = build_configs(&model_cfg(), &parallel, &demand()).unwrap();
         build("unified".into(), resolve_configs(&configs), &bridge).unwrap()
     }
 
@@ -1382,6 +1442,28 @@ mod tests {
     }
 
     #[test]
+    fn all_reduce_leaves_flashinfer_at_its_workspace_cap() {
+        // 32 MiB at TP4 and 1 MiB at TP8 over 4096 bf16 hidden values per token.
+        for (tp, cap) in [(4, 4096), (8, 128)] {
+            let model = built_with(layout(tp, true));
+            let backend = if tp == 8 {
+                "flashinfer_trtllm"
+            } else {
+                "flashinfer_mnnvl"
+            };
+            let configs = build_configs(&model_cfg(), &layout(tp, true), &demand()).unwrap();
+            assert_eq!(configs.all_reduce.backends, [backend]);
+            assert_eq!(configs.large_all_reduce.backends, ["nccl"]);
+            assert_eq!(model.embedding_all_reduce.max_fused_tokens, cap);
+            assert_eq!(model.embedding_all_reduce.bytes_per_token, 8192);
+            for group in &model.groups {
+                assert_eq!(group.attn_all_reduce.max_fused_tokens, cap);
+                assert_eq!(group.ffn_all_reduce.max_fused_tokens, cap);
+            }
+        }
+    }
+
+    #[test]
     fn eight_ranks_keep_whole_model_state_and_grow_the_routed_rank_fan_out() {
         let ep8 = built_with(layout(8, true));
         // Every rank keeps the whole MLA latent, so per-token bytes scale with
@@ -1393,8 +1475,8 @@ mod tests {
         assert_eq!(ep8.recurrent_state_bytes_per_request(), 8 * 34 * 1152 * 512);
         assert_eq!((ep8.gpus_per_replica(), ep8.num_attn_shards()), (8, 8));
         let moe = |ranks: usize| 2 + 2 + ranks * 14;
-        let kda_dense = 4 + 13 + 5;
-        let total = |ranks| 3 + 2 * kda_dense + (4 + 31 + moe(ranks)) + (4 + 13 + moe(ranks)) + 4;
+        let kda_dense = 6 + 13 + 5;
+        let total = |ranks| 4 + 2 * kda_dense + (6 + 31 + moe(ranks)) + (6 + 13 + moe(ranks)) + 4;
         assert_eq!(ep8.n_slots, total(8));
         assert_eq!(built_with(layout(4, false)).n_slots, total(1));
         assert_eq!(built_with(layout(8, false)).n_slots, total(1));
@@ -1453,13 +1535,14 @@ mod tests {
     #[test]
     fn compiled_tree_has_a_fixed_slot_count() {
         let model = built();
-        // Prologue 3; per group: 2 boundaries + 2 all-reduces + attention
-        // (KDA 13, DSA 31) + FFN (dense 5; MoE 2 router + 2 glue + 4 ranks x
-        // (concurrent 5 + 2, serial 2 + 5)); epilogue 4.
-        let kda_dense = 4 + 13 + 5;
-        let dsa_moe = 4 + 31 + 60;
-        let kda_moe = 4 + 13 + 60;
-        assert_eq!(model.n_slots, 3 + 2 * kda_dense + dsa_moe + kda_moe + 4);
+        // Prologue 4 (the all-reduce is a fused + large pair); per group:
+        // 2 boundaries + 2 all-reduce pairs + attention (KDA 13, DSA 31) +
+        // FFN (dense 5; MoE 2 router + 2 glue + 4 ranks x (concurrent 5 + 2,
+        // serial 2 + 5)); epilogue 4.
+        let kda_dense = 6 + 13 + 5;
+        let dsa_moe = 6 + 31 + 60;
+        let kda_moe = 6 + 13 + 60;
+        assert_eq!(model.n_slots, 4 + 2 * kda_dense + dsa_moe + kda_moe + 4);
         assert_eq!(model.cost_log_manifest().slots.len(), model.n_slots);
     }
 
@@ -1504,7 +1587,7 @@ mod tests {
             let actual: BTreeSet<_> = manifest
                 .slots
                 .iter()
-                .filter(|slot| slot.kind != "all_reduce_fusion")
+                .filter(|slot| !matches!(slot.kind.as_str(), "all_reduce_fusion" | "all_reduce"))
                 .map(|slot| slot.name.as_str())
                 .collect();
             let map: serde_json::Value = serde_json::from_str(map).unwrap();
