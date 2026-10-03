@@ -280,7 +280,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::common::{PoolId, SharedRequests, UnifiedStage};
+    use crate::common::{PoolId, SessionInput, SharedRequests, UnifiedStage};
     use crate::test_helpers::{shared_with, test_cluster, FakeModel};
     use crate::worker::admission::{FifoOrder, PipelinedPrefillAdmission};
     use crate::worker::execution::UnifiedIterExecution;
@@ -454,6 +454,54 @@ mod tests {
         }
         assert_eq!(completed(&events), vec![RequestId(0)]);
         assert_eq!(launched(&events), vec![(2, 12, Time::from_ms(6.0))]);
+    }
+
+    #[test]
+    fn a_pinned_prefix_is_context_for_every_chunk_but_never_computed() {
+        // 2 KV bytes per token: 120 tokens of capacity. The pinned request needs
+        // 100 + 10 + 1 of them, so the 12-token standalone prompt queued behind
+        // it waits for its exit.
+        let store = shared_with(&[(0, 10, 1), (1, 12, 1)]);
+        store.borrow_mut()[RequestId(0)].request.definition.session =
+            SessionInput::PinnedPrefix { prefix_tokens: 100 };
+        let mut worker = head(Rc::clone(&store), 4, 240);
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(1)));
+        let mut events = Vec::new();
+        let mut chunk_pairs = Vec::new();
+        let collect = |events: &[PipelineHeadEvent], chunk_pairs: &mut Vec<(u32, u32)>| {
+            for event in events {
+                if let PipelineHeadEvent::MicrobatchLaunched { microbatch, .. } = event {
+                    chunk_pairs.extend(microbatch.input.groups[0].prefill_chunk_pairs.iter());
+                }
+            }
+        };
+        for step in 0..5 {
+            worker.tick(Time::from_ms(step as f64), &mut events);
+        }
+        for (microbatch, at) in [(1, 5.0), (2, 6.0)] {
+            worker.enqueue(PipelineHeadMsg::MicrobatchExit {
+                microbatch,
+                at: Time::from_ms(at),
+            });
+            worker.tick(Time::from_ms(at), &mut events);
+        }
+        collect(&events, &mut chunk_pairs);
+        assert_eq!(chunk_pairs, [(100, 4), (104, 4), (108, 2)]);
+        assert!(!store.borrow()[RequestId(1)].lifecycle.admitted);
+
+        events.clear();
+        worker.enqueue(PipelineHeadMsg::MicrobatchExit {
+            microbatch: 3,
+            at: Time::from_ms(8.0),
+        });
+        worker.tick(Time::from_ms(8.0), &mut events);
+        assert_eq!(completed(&events), vec![RequestId(0)]);
+        assert!(store.borrow()[RequestId(1)].lifecycle.admitted);
+        let requests = store.borrow();
+        let record = &requests[RequestId(0)];
+        assert_eq!(record.progress.prefill_tokens_processed, 10);
+        assert_eq!(record.telemetry.prefix_cache_hit_tokens, Some(100));
     }
 
     #[test]

@@ -292,13 +292,15 @@ impl IterWorkerKv for HybridGdnKv {
 
 impl PrefixKv for HybridGdnKv {
     fn retained_prefix_partition(&self, session_input: SessionInput) -> Option<PartitionId> {
-        let SessionInput::Session {
-            session_id,
-            declared_prefix_tokens,
-            ..
-        } = session_input
-        else {
-            return None;
+        let (session_id, declared_prefix_tokens) = match session_input {
+            // A pinned prefix is resident on every partition, so it creates no
+            // placement affinity.
+            SessionInput::Standalone | SessionInput::PinnedPrefix { .. } => return None,
+            SessionInput::Session {
+                session_id,
+                declared_prefix_tokens,
+                ..
+            } => (session_id, declared_prefix_tokens),
         };
 
         let mut best_partition = None;
@@ -324,6 +326,9 @@ impl PrefixKv for HybridGdnKv {
     ) -> ResolvedPrefillContext {
         let resident_prefix_tokens = match session_input {
             SessionInput::Standalone => 0,
+            // Declared resident on arrival: a hit regardless of this
+            // partition's cache. Admission reserves it with the request.
+            SessionInput::PinnedPrefix { prefix_tokens } => prefix_tokens,
             SessionInput::Session {
                 session_id,
                 declared_prefix_tokens,
@@ -819,6 +824,36 @@ mod tests {
 
         kv_store.release(RequestId(0), 0);
         assert_eq!(kv_store.partitions[0].resident_tokens(), 0);
+    }
+
+    #[test]
+    fn a_pinned_prefix_is_resident_unquantized_and_never_retained() {
+        let mut kv_store = store(100_000, STATE_TOKENS, CHECKPOINT_INTERVAL);
+        // Not a checkpoint multiple: the trace declares this prefix resident,
+        // so it is not rounded down to a snapshot boundary.
+        let pinned = SessionInput::PinnedPrefix {
+            prefix_tokens: CHECKPOINT_INTERVAL + 7,
+        };
+        assert_eq!(kv_store.retained_prefix_partition(pinned), None);
+        let resolved = kv_store.preview_prefill_context(0, 5_000, pinned);
+        assert_eq!(resolved.resident_prefix_tokens(), CHECKPOINT_INTERVAL + 7);
+        assert_eq!(resolved.prefill_tokens_to_compute(), 5_000);
+        let context = resolved.post_prefill_context_tokens();
+        assert_eq!(context, 5_007 + CHECKPOINT_INTERVAL);
+
+        let footprint = kv_store.footprint(RequestId(0), context, 1);
+        kv_store.reserve_chunked_prefill_context(RequestId(0), 0, resolved, footprint, Time::ZERO);
+        kv_store.drain_ready();
+        assert_eq!(
+            kv_store.ledger.partition_promised(0),
+            u64::from(context) + 1 + STATE_TOKENS
+        );
+        kv_store.schedule_prefill_chunk(RequestId(0), 0, 5_000);
+        kv_store.complete_prefill_chunk(RequestId(0));
+        kv_store.finish_chunked_prefill(RequestId(0), 0, 0);
+        kv_store.release_retaining_prefix(RequestId(0), 0, Time::from_ms(1.0));
+        assert_eq!(kv_store.partitions[0].resident_tokens(), 0);
+        assert_eq!(kv_store.prefix_caches[0].used_tokens(), 0);
     }
 
     #[test]

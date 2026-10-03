@@ -326,13 +326,15 @@ impl ChunkedPrefillKv for FullAttnKv {
 
 impl PrefixKv for FullAttnKv {
     fn retained_prefix_partition(&self, session_input: SessionInput) -> Option<PartitionId> {
-        let SessionInput::Session {
-            session_id,
-            declared_prefix_tokens,
-            ..
-        } = session_input
-        else {
-            return None;
+        let (session_id, declared_prefix_tokens) = match session_input {
+            // A pinned prefix is resident on every partition, so it creates no
+            // placement affinity.
+            SessionInput::Standalone | SessionInput::PinnedPrefix { .. } => return None,
+            SessionInput::Session {
+                session_id,
+                declared_prefix_tokens,
+                ..
+            } => (session_id, declared_prefix_tokens),
         };
 
         let mut best_partition = None;
@@ -358,6 +360,9 @@ impl PrefixKv for FullAttnKv {
     ) -> ResolvedPrefillContext {
         let resident_prefix_tokens = match session_input {
             SessionInput::Standalone => 0,
+            // Declared resident on arrival: a hit regardless of this
+            // partition's cache. Admission reserves it with the request.
+            SessionInput::PinnedPrefix { prefix_tokens } => prefix_tokens,
             SessionInput::Session {
                 session_id,
                 declared_prefix_tokens,
@@ -1031,6 +1036,108 @@ mod tests {
             .unwrap();
         assert_eq!(cache_used_before.values(), &[0, 0, 80]);
         assert_eq!(cache_used_after.values(), &[0, 80, 0]);
+    }
+
+    #[test]
+    fn pinned_prefix_is_resident_whatever_the_cache_holds() {
+        let pinned = SessionInput::PinnedPrefix { prefix_tokens: 300 };
+        let disabled = FullAttnKv::without_prefix_cache(2, 1_000, None);
+        let mut warm = FullAttnKv::with_prefix_cache(
+            2,
+            1_000,
+            capped_prefix_cache(1_000, PrefixCachePolicy::Lru),
+            None,
+            None,
+        );
+        warm.prefix_caches[1].insert(7, 500, 1_000, None);
+
+        for kv_store in [&disabled, &warm] {
+            assert_eq!(
+                kv_store.retained_prefix_partition(pinned),
+                None,
+                "a pinned prefix is no placement affinity"
+            );
+            assert_eq!(kv_store.resident_prefix_tokens(40, pinned), 300);
+            for partition in 0..2 {
+                let resolved_prefill = kv_store.preview_prefill_context(partition, 40, pinned);
+                assert_eq!(resolved_prefill.declared_prefix_tokens(), 300);
+                assert_eq!(resolved_prefill.resident_prefix_tokens(), 300);
+                assert_eq!(resolved_prefill.prefill_tokens_to_compute(), 40);
+                assert_eq!(resolved_prefill.post_prefill_context_tokens(), 340);
+                assert_eq!(resolved_prefill.active_chunk(), (300, 40));
+            }
+        }
+    }
+
+    #[test]
+    fn pinned_prefix_is_reserved_with_the_request_and_released_without_retention() {
+        let log_directory = tempdir().unwrap();
+        let prefix_cache_logger =
+            PrefixCacheLogger::open(log_directory.path(), "main", crate::common::WorkerId(0))
+                .unwrap();
+        let mut kv_store = FullAttnKv::with_prefix_cache(
+            1,
+            400,
+            capped_prefix_cache(400, PrefixCachePolicy::Lru),
+            None,
+            Some(prefix_cache_logger),
+        );
+        kv_store.prefix_caches[0].insert(7, 100, 400, None);
+        let pinned = SessionInput::PinnedPrefix { prefix_tokens: 300 };
+        let resolved_prefill = kv_store.preview_prefill_context(0, 40, pinned);
+
+        // The prefix counts toward capacity: 300 + 40 + 70 > 400.
+        let too_large = kv_store.footprint(RequestId(0), 340, 70);
+        assert!(!kv_store.fits(0, &too_large));
+        let footprint = kv_store.footprint(
+            RequestId(0),
+            resolved_prefill.post_prefill_context_tokens(),
+            10,
+        );
+        assert!(kv_store.fits(0, &footprint));
+        kv_store.reserve_prefill_context(RequestId(0), 0, resolved_prefill, footprint, Time::ZERO);
+        assert_eq!(kv_store.ledger.partition_promised(0), 350);
+        assert_eq!(
+            kv_store.prefix_caches[0].used_tokens(),
+            0,
+            "the pinned reservation evicts retained entries like any active KV"
+        );
+
+        kv_store.drain_ready();
+        kv_store.clear_prefill_admits(0);
+        kv_store.commit_resident(RequestId(0), 0, 340, 10);
+        assert_eq!(kv_store.partitions[0].resident_tokens(), 340);
+        kv_store.release_retaining_prefix(RequestId(0), 0, Time::from_ms(1.0));
+        assert_eq!(kv_store.partitions[0].resident_tokens(), 0);
+        assert_eq!(
+            kv_store.prefix_caches[0].used_tokens(),
+            0,
+            "a pinned prefix is never returned to the shared cache"
+        );
+        drop(kv_store);
+
+        // Only the eviction made room for the request; a pinned prefix neither
+        // activates nor retains a cache entry.
+        let path = log_directory
+            .path()
+            .join("raw/prefix_cache_event/worker_main_0.parquet");
+        let mut reader = ParquetRecordBatchReaderBuilder::try_new(File::open(path).unwrap())
+            .unwrap()
+            .build()
+            .unwrap();
+        let batch = reader.next().unwrap().unwrap();
+        let operations = batch
+            .column_by_name("operation")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(
+            (0..batch.num_rows())
+                .map(|row| operations.value(row))
+                .collect::<Vec<_>>(),
+            ["evict"]
+        );
     }
 
     #[test]
