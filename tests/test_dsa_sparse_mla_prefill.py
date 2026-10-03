@@ -67,6 +67,13 @@ def test_validation_retains_boundaries_valid_counts_and_page_offsets():
     assert shape.num_queries == 3
 
 
+@pytest.mark.parametrize("num_heads", [1, 8, 16, 32, 64, 128])
+def test_validation_accepts_any_positive_head_count(num_heads):
+    from profiling.runners.attention.dsa_sparse_mla_prefill import _validate_args
+
+    assert _validate_args(**(_BASE_SPEC | {"num_heads": num_heads})).num_heads == num_heads
+
+
 @pytest.mark.parametrize(
     ("overrides", "error", "match"),
     [
@@ -74,7 +81,8 @@ def test_validation_retains_boundaries_valid_counts_and_page_offsets():
         ({"query_context_pairs": ((0, 1),)}, ValueError, "0 < query <= context"),
         ({"query_context_pairs": ((2, 1),)}, ValueError, "0 < query <= context"),
         ({"query_context_pairs": ([1, 1],)}, TypeError, "integer.*pairs"),
-        ({"num_heads": 32}, ProfilerNotImplemented, "model identity"),
+        ({"num_heads": 0}, ValueError, "num_heads must be >= 1"),
+        ({"num_heads": 16.0}, TypeError, "num_heads must be an integer"),
         ({"selected_k": 1024}, ProfilerNotImplemented, "model identity"),
         ({"q_dtype": "bf16"}, ProfilerNotImplemented, "storage identity"),
         ({"cache_layout": "token_major"}, ProfilerNotImplemented, "storage identity"),

@@ -1011,6 +1011,9 @@ _NOPE_SPEC = _BASE_SPEC | {
         ({"selected_k": 2304}, "selected_k must be 2048 or 2176"),
         ({"cache_layout": "hnd_paged_mqa_fp8_latent_rope"}, "cache_layout must be"),
         ({"rope_dim": 64}, "selected_k must be 2048, got 2176"),
+        ({"num_heads": 32}, "reached the launch"),
+        ({"num_heads": 128}, "reached the launch"),
+        ({"num_heads": 0}, "num_heads must be >= 1"),
     ],
 )
 def test_trtllm_fp8_rope_dim_selects_the_accepted_layout(monkeypatch, overrides, match) -> None:

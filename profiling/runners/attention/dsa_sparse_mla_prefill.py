@@ -31,9 +31,6 @@ from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerN
 from profiling.runners.metrics import ComputeMetrics
 
 _BACKEND = "dsa_sparse_mla_prefill:flashinfer_trtllm_fp8"
-# Per-rank q-head counts of GLM's 64 heads at TP8, TP4 and TP1 (one pipeline
-# stage). The kernel launch, output check and metrics are parametric in num_heads.
-_SUPPORTED_NUM_HEADS = frozenset({8, 16, 64})
 _NUM_KV_HEADS = 1
 _SOFTMAX_SCALE = 0.0625
 
@@ -93,8 +90,14 @@ def _validate_args(
             min(position + 1, _SELECTED_K) for position in range(first_query_position, context_len)
         )
 
+    # num_heads is the per-rank q-head count (GLM's 64 heads over TP); the
+    # kernel launch, output check and metrics are parametric in it. The other
+    # fields fix the FlashInfer cache layout and page-table width.
+    if type(num_heads) is not int:
+        raise TypeError("num_heads must be an integer")
+    if num_heads < 1:
+        raise ValueError(f"num_heads must be >= 1, got {num_heads}")
     model_identity = (
-        num_heads,
         num_kv_heads,
         selected_k,
         latent_dim,
@@ -102,14 +105,13 @@ def _validate_args(
         value_dim,
     )
     expected_model_identity = (
-        sorted(_SUPPORTED_NUM_HEADS),
         _NUM_KV_HEADS,
         _SELECTED_K,
         _LATENT_DIM,
         _ROPE_DIM,
         _VALUE_DIM,
     )
-    if num_heads not in _SUPPORTED_NUM_HEADS or model_identity[1:] != expected_model_identity[1:]:
+    if model_identity != expected_model_identity:
         raise ProfilerNotImplemented(
             f"{_BACKEND} requires model identity {expected_model_identity}, got {model_identity}"
         )
