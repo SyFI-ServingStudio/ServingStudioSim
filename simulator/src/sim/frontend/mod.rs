@@ -7,6 +7,7 @@
 //! families cannot leak into the current text-only L5 workers.
 
 mod arrival;
+mod pinned_prefix;
 mod release;
 mod schema;
 
@@ -1289,6 +1290,151 @@ mod tests {
             Some(Time::from_ms(4.0)),
             "replay release time must not rewrite the trace-declared session start"
         );
+    }
+
+    // ---- optional pinned prefix ---------------------------------------------
+
+    /// `prefix_len` pins a resident prefix in front of the fresh `input_len`;
+    /// zero or blank leaves the request exactly as the four-column file would.
+    #[test]
+    fn prefix_len_column_pins_a_prefix_and_zero_or_blank_is_standalone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_csv(
+            dir.path(),
+            "pinned.csv",
+            "id,input_len,output_len,arrival_time,prefix_len
+             a,4096,1,0.0,32768
+             b,4096,1,0.0,0
+             c,4096,1,0.0,
+",
+        );
+        let fe = load_text(&[path], 1.0).unwrap();
+        let sessions: Vec<_> = fe
+            .scheduled_requests
+            .iter()
+            .map(|scheduled| {
+                assert_eq!(scheduled.definition.prompt_tokens, 4096);
+                scheduled.definition.session
+            })
+            .collect();
+        assert_eq!(
+            sessions,
+            [
+                SessionInput::PinnedPrefix {
+                    prefix_tokens: 32768
+                },
+                SessionInput::Standalone,
+                SessionInput::Standalone,
+            ]
+        );
+        assert_eq!(fe.scheduled_requests[0].release.session, None);
+        assert_eq!(
+            fe.plan_rows()
+                .iter()
+                .map(|row| row.prefix_len)
+                .collect::<Vec<_>>(),
+            [32768, 0, 0]
+        );
+    }
+
+    /// The column can sit anywhere and combines with declared tags; every other
+    /// header rule (undeclared or missing columns) still applies.
+    #[test]
+    fn prefix_len_column_keeps_the_declared_header_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        let tagged = write_csv(
+            dir.path(),
+            "tagged.csv",
+            "prefix_len,id,input_len,output_len,arrival_time,priority
+             16,0,8,2,0.0,3
+",
+        );
+        let fe = TraceFrontend::load(
+            &[tagged],
+            &declare("text_generation", &["priority"]),
+            open_loop(1.0),
+            uncapped(),
+            SessionDependency::Independent,
+        )
+        .unwrap();
+        assert_eq!(
+            fe.scheduled_requests[0].definition.session,
+            SessionInput::PinnedPrefix { prefix_tokens: 16 }
+        );
+        assert_eq!(
+            fe.scheduled_requests[0].scheduling,
+            SchedulingDeclaration { priority: 3 }
+        );
+
+        let undeclared = write_csv(
+            dir.path(),
+            "undeclared.csv",
+            "id,input_len,output_len,arrival_time,prefix_len,priority
+0,8,2,0.0,16,3
+",
+        );
+        let error = load_text(&[undeclared], 1.0).unwrap_err().to_string();
+        assert!(error.contains("priority"), "{error}");
+
+        let missing = write_csv(
+            dir.path(),
+            "missing.csv",
+            "id,input_len,arrival_time,prefix_len
+0,8,0.0,16
+",
+        );
+        let error = load_text(&[missing], 1.0).unwrap_err().to_string();
+        assert!(error.contains("output_len"), "{error}");
+    }
+
+    #[test]
+    fn prefix_len_column_rejects_bad_values_and_session_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, body, expected) in [
+            (
+                "negative.csv",
+                "id,input_len,output_len,arrival_time,prefix_len
+0,8,2,0.0,-1
+",
+                "line 2: prefix_len",
+            ),
+            (
+                "zero_input.csv",
+                "id,input_len,output_len,arrival_time,prefix_len
+0,0,2,0.0,16
+",
+                "input_len must be greater than zero",
+            ),
+            (
+                "overflow.csv",
+                "id,input_len,output_len,arrival_time,prefix_len
+0,8,2,0.0,4294967295
+",
+                "exceeds the u32",
+            ),
+        ] {
+            let path = write_csv(dir.path(), name, body);
+            let error = format!("{:#}", load_text(&[path], 1.0).unwrap_err());
+            assert!(error.contains(expected), "{name}: {error}");
+        }
+
+        let session = write_csv(
+            dir.path(),
+            "session.csv",
+            "id,input_len,output_len,arrival_time,session_id,prefix_kv,tool_wait_after_ms,prefix_len
+             0,8,2,0.0,s,0,0,16
+",
+        );
+        let error = TraceFrontend::load(
+            &[session],
+            &declare("text_generation", &["session"]),
+            open_loop(1.0),
+            uncapped(),
+            SessionDependency::Independent,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("prefix_kv"), "{error}");
     }
 
     #[test]
