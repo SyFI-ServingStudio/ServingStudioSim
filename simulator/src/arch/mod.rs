@@ -12,6 +12,7 @@ pub mod glm52_model_cfg;
 pub mod glm52_sglang_nvfp4_tp_dsa_moe;
 pub mod glm52_vllm_dsa_moe;
 pub mod glm52_vllm_nvfp4_dsa_moe;
+pub mod glm52_vllm_nvfp4_pp_dsa_moe;
 pub mod glm53_flash_vllm_fp8_kda_dsa_moe;
 pub mod glm53_vllm_nvfp4_dsa_moe_dflash2;
 pub mod llama3_dense;
@@ -48,6 +49,10 @@ pub use glm52_vllm_dsa_moe::{
 pub use glm52_vllm_nvfp4_dsa_moe::{
     Glm52VllmNvfp4DsaMoeConfigs, Glm52VllmNvfp4DsaMoeModel, Glm52VllmNvfp4DsaMoeParallel,
     Glm52VllmNvfp4DsaMoeResolved, Glm52VllmNvfp4DsaMoeSpeculativeModel,
+};
+pub use glm52_vllm_nvfp4_pp_dsa_moe::{
+    Glm52VllmNvfp4PpConfigs, Glm52VllmNvfp4PpDsaMoeModel, Glm52VllmNvfp4PpParallel,
+    Glm52VllmNvfp4PpResolved, Glm52VllmNvfp4PpStageModel,
 };
 pub use glm53_flash_vllm_fp8_kda_dsa_moe::{
     Glm53FlashModelCfg, Glm53FlashVllmModel, Glm53FlashVllmParallel,
