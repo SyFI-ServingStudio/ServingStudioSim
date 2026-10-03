@@ -42,6 +42,9 @@ glm52_vllm_nvfp4_dsa_moe:
 glm52_vllm_nvfp4_dsa_moe_speculative:
   name: GLM-5.2 NVFP4, vLLM, MTP drafting
   summary: The NVFP4 graph driving its MTP layer as a drafter. One verify pass over `draft_tokens + 1` rows per decode request, then `draft_tokens` draft passes.
+glm52_vllm_nvfp4_dp_attn_dsa_moe:
+  name: GLM-5.2/5.3 NVFP4, vLLM, DP attention + EP
+  summary: The NVFP4 graph's kernels with every GPU its own data-parallel attention rank at TP1, sharing only the routed experts through an NVFP4 all-gather and a bf16 reduce-scatter.
 glm52_vllm_nvfp4_pp_dsa_moe:
   name: GLM-5.2/5.3 NVFP4, vLLM, PP
   summary: The NVFP4 graph's kernels under pure pipeline parallelism. Each of `pp_size` stages is one GPU running a contiguous layer range with every head and expert local, so a stage has no collective.

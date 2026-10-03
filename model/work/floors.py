@@ -174,6 +174,7 @@ def _pool_specs(log_dir: Path) -> dict[str, dict]:
                 "glm52_vllm_nvfp4_dsa_moe",
                 "glm52_vllm_nvfp4_dsa_moe_speculative",
                 "glm52_vllm_nvfp4_pp_dsa_moe",
+                "glm52_vllm_nvfp4_dp_attn_dsa_moe",
             )
             else None
         )
