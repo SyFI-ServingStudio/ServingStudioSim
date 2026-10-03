@@ -751,7 +751,7 @@ impl IterwiseUnifiedModel for Glm52VllmNvfp4PpDsaMoeModel {
 
 /// Fill `slots` through `fill` and aggregate the compiled tree, capturing slot
 /// inputs when `inputs` is given.
-fn eval_compiled(
+pub(crate) fn eval_compiled(
     cost_flat: &[FlatCostNode],
     n_slots: usize,
     slots: &mut Vec<LeafMetrics>,
