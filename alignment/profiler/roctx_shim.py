@@ -19,8 +19,10 @@ as a **non-fork, importable shim** rather than a patched vLLM checkout:
   and sequencing.
 - The *roctx backend* is the one GPU-touching seam. On ROCm, PyTorch's
   ``torch.cuda.nvtx.range_push/range_pop/mark`` is retargeted onto roctx, and the
-  ``roctracer``/``libroctx64`` C API is the direct route; either lands the range
-  in the rocpd ``region`` table that ``roctx_regions_from_rocpd`` reads. The
+  roctx C API (``librocprofiler-sdk-roctx.so.1`` on the pinned rocprofv3-1.3.2
+  stack, legacy ``libroctx64`` on old roctracer stacks) is the direct route;
+  either lands the range in the rocpd ``region`` table that
+  ``roctx_regions_from_rocpd`` reads. The
   backend is injectable so the annotator is testable with a recording backend and
   no GPU — the recorded labels are what a real capture would store, which a test
   then feeds through the real ``alignment/rocpd`` join.
@@ -186,29 +188,68 @@ class TorchRoctxBackend:
 
 
 class RoctracerBackend:
-    """Backend over the ``libroctx64`` C API (``roctxRangePush``/``Pop``/``Mark``).
+    """Backend over the roctx C API (``roctxRangePushA``/``Pop``/``MarkA``).
 
     The most direct route into the rocpd marker table: rocprofv3's
     ``--marker-trace`` records exactly these roctx ranges. ``ctypes`` loads the
     shared object at construction so module import never requires ROCm present.
+
+    Which shared object matters on the pinned rocprofiler-sdk / rocprofv3-1.3.2
+    (gfx942) stack. There, ``--marker-trace`` records roctx ranges ONLY from the
+    rocprofiler-sdk roctx library, ``librocprofiler-sdk-roctx.so.1``, which
+    rocprofv3 lazily ``dlopen``'s while the tool is live and intercepts in-process.
+    The legacy ``libroctx64`` (roctracer) library is NOT the one rocprofiler-sdk's
+    marker interception hooks, so ranges pushed through it may never land in the
+    rocpd region table on this stack. So the SDK soname is tried first and legacy
+    ``libroctx64`` is kept only as a fallback for old roctracer stacks.
+
+    Two hazards, documented here because they are GPU-only facts the on-host unit
+    test cannot catch:
+
+    - LD_PRELOAD bypasses interception. rocprofv3's marker capture works by being
+      the one that loads/dlopens the roctx library inside the traced process; it
+      does not rely on an LD_PRELOAD of the roctx lib. Forcing the roctx library
+      in via LD_PRELOAD is not the supported path and can leave the SDK's
+      interception seeing no ranges. This shim therefore loads the lib itself with
+      ``ctypes`` rather than depending on any preload.
+    - Legacy libroctx64 can preempt the SDK MARKER registration. If both
+      ``libroctx64`` and ``librocprofiler-sdk-roctx`` are resolvable in the same
+      process and the legacy one wins the ``roctx*`` symbol resolution first, the
+      MARKER_CORE_RANGE records can be registered against the roctracer path
+      instead of the SDK path, and ``--marker-trace`` records nothing. Preferring
+      the SDK soname here reduces that risk, but the authoritative check is the
+      in-full-vLLM-process ordering on a real GPU (see ROCM_CAPTURE_VALIDATION.md).
     """
 
-    _CANDIDATE_SONAMES = ("libroctx64.so", "libroctx64.so.4", "libroctx64.so.1")
+    # Most-preferred first: the rocprofiler-sdk roctx library that rocprofv3-1.3.2
+    # --marker-trace actually records, then legacy libroctx64 for old stacks.
+    _CANDIDATE_SONAMES = (
+        "librocprofiler-sdk-roctx.so.1",
+        "librocprofiler-sdk-roctx.so",
+        "libroctx64.so",
+        "libroctx64.so.4",
+        "libroctx64.so.1",
+    )
 
     def __init__(self, soname: str | None = None) -> None:
         names = (soname,) if soname else self._CANDIDATE_SONAMES
         last_error: OSError | None = None
         lib = None
+        loaded_soname: str | None = None
         for candidate in names:
             if candidate is None:
                 continue
             try:
                 lib = ctypes.CDLL(candidate)
+                loaded_soname = candidate
                 break
             except OSError as error:  # not present / not loadable
                 last_error = error
         if lib is None:
-            raise OSError(f"could not load a libroctx64 shared object: {last_error}")
+            raise OSError(
+                "could not load a roctx shared object "
+                f"(tried {list(names)}): {last_error}"
+            )
         lib.roctxRangePushA.argtypes = [ctypes.c_char_p]
         lib.roctxRangePushA.restype = ctypes.c_int
         lib.roctxRangePop.argtypes = []
@@ -216,6 +257,8 @@ class RoctracerBackend:
         lib.roctxMarkA.argtypes = [ctypes.c_char_p]
         lib.roctxMarkA.restype = None
         self._lib = lib
+        #: The soname actually loaded, so the selection order is observable.
+        self.soname = loaded_soname
 
     def range_push(self, message: str) -> None:
         self._lib.roctxRangePushA(message.encode("utf-8"))
@@ -228,8 +271,9 @@ class RoctracerBackend:
 
 
 #: Backend selection order for ``select_backend("auto")``. The direct roctx C API
-#: is tried first (it is the one rocprofv3 ``--marker-trace`` is documented to
-#: record), then torch's roctx-retargeted nvtx.
+#: is tried first (the ``librocprofiler-sdk-roctx.so.1`` the rocprofv3-1.3.2
+#: ``--marker-trace`` records, else legacy ``libroctx64``), then torch's
+#: roctx-retargeted nvtx.
 _AUTO_BACKEND_ORDER: tuple[tuple[str, Callable[[], RoctxBackend]], ...] = (
     ("roctracer", RoctracerBackend),
     ("torch", TorchRoctxBackend),

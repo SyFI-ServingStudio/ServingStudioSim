@@ -37,9 +37,20 @@ is the trace shape, not the model.
    its entry-point metadata is present) and re-run the check. No source edit to
    vLLM is needed — discovery is entirely through this entry point.
 
-2. **A roctx backend must be loadable.** The shim prefers the `libroctx64` C API
-   and falls back to ROCm PyTorch's roctx-retargeted `torch.cuda.nvtx`. Either is
-   fine; `--marker-trace` records what it pushes.
+2. **A roctx backend must be loadable.** The shim prefers the rocprofiler-sdk
+   roctx C API (`librocprofiler-sdk-roctx.so.1`) and falls back, in order, to
+   legacy `libroctx64` then ROCm PyTorch's roctx-retargeted `torch.cuda.nvtx`. On
+   the pinned rocprofv3-1.3.2 stack `--marker-trace` records roctx ranges **only**
+   from `librocprofiler-sdk-roctx`, so that soname is tried first (see
+   `roctx_shim.RoctracerBackend`). **Open risk to confirm on this lease:** the
+   in-full-vLLM-process MARKER registration ordering. If legacy `libroctx64` is
+   also resolvable in the serving process and wins `roctx*` symbol resolution
+   before rocprofv3's SDK interception registers, `--marker-trace` can record
+   nothing even though the shim pushed ranges. Confirm which roctx library the
+   serving process actually loaded and that query (a) below returns the labels; if
+   it is empty while the shim ran, this ordering is the suspect. Do **not** force
+   the roctx lib via `LD_PRELOAD` — that bypasses the SDK interception and is not
+   the supported path; the shim loads the lib itself with `ctypes`.
 
 ## Capture command
 
@@ -106,16 +117,23 @@ SELECT name FROM sqlite_master WHERE type IN ('table','view')
 ```
 
 (a) **Iteration roctx ranges exist with the label text intact** — expect one row
-per captured forward, each `vllm_iteration(N): forward`:
+per captured forward, each `vllm_iteration(N): forward`. The label is JSON in the
+joined **event** row's `extdata` (`{"message": "..."}`), NOT in `r.name_id` — on a
+real capture `name_id` resolves (via `rocpd_string`) only to the API op name
+`roctxThreadRangeA`, identical for every range. This query mirrors what the reader
+(`roctx_regions_from_rocpd`) does:
 
 ```sql
-SELECT s.string AS region_name, r.start, r.end
+SELECT json_extract(e.extdata, '$.message') AS region_name, r.start, r.end
 FROM rocpd_region r
-JOIN rocpd_string s ON s.id = r.name_id
-WHERE s.string LIKE 'vllm\_iteration(%): %' ESCAPE '\'
+JOIN rocpd_event e ON e.id = r.event_id
+WHERE json_extract(e.extdata, '$.message') LIKE 'vllm\_iteration(%): %' ESCAPE '\'
 ORDER BY r.start
 LIMIT 25;
 ```
+
+(Joining `rocpd_string` on `r.name_id` instead returns only `roctxThreadRangeA`;
+that is the bug the reader fix corrected, so use the event-extdata query here.)
 
 (b) **Kernel-dispatch rows exist** — expect a non-zero count and recognizable
 ROCm kernel names (hipBLASLt GEMMs, flash-attention, rmsnorm, SiLU, elementwise):

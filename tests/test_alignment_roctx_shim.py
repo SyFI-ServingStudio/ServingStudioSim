@@ -22,6 +22,9 @@ import json
 import sqlite3
 import tomllib
 from pathlib import Path
+from unittest.mock import MagicMock
+
+import pytest
 
 from alignment.nsys.parse import ITER_RE
 from alignment.profiler import roctx_shim
@@ -129,6 +132,86 @@ def test_env_gate_and_select_backend_record():
     name, backend = select_backend("record")
     assert name == "record"
     assert isinstance(backend, RecordingBackend)
+
+
+def _fake_cdll(present, attempts):
+    """A ``ctypes.CDLL`` stand-in that loads only sonames in ``present``.
+
+    Records every attempted soname in ``attempts`` (so the try-order is
+    observable) and returns a ``MagicMock`` lib for a present one — the backend
+    sets ``argtypes``/``restype`` on its roctx symbols, which a MagicMock accepts.
+    """
+
+    def fake(name):
+        attempts.append(name)
+        if name in present:
+            return MagicMock()
+        raise OSError(f"no such shared object: {name}")
+
+    return fake
+
+
+def test_roctracer_backend_prefers_sdk_over_legacy(monkeypatch):
+    """With both present, the rocprofiler-sdk roctx library is chosen first.
+
+    On rocprofv3-1.3.2 ``--marker-trace`` records roctx ranges only from
+    ``librocprofiler-sdk-roctx``; legacy ``libroctx64`` is the fallback. The
+    selection must therefore try the SDK soname first and stop there.
+    """
+    from alignment.profiler.roctx_shim import RoctracerBackend
+
+    attempts: list[str] = []
+    monkeypatch.setattr(
+        roctx_shim.ctypes,
+        "CDLL",
+        _fake_cdll({"librocprofiler-sdk-roctx.so.1", "libroctx64.so"}, attempts),
+    )
+    backend = RoctracerBackend()
+    assert backend.soname == "librocprofiler-sdk-roctx.so.1"
+    # SDK soname is first in the order, so the legacy one is never even tried.
+    assert attempts == ["librocprofiler-sdk-roctx.so.1"]
+
+
+def test_roctracer_backend_falls_back_to_legacy_libroctx64(monkeypatch):
+    """When only legacy ``libroctx64`` is present it is used (old roctracer stack).
+
+    The SDK sonames are tried and fail first, proving they are preferred, then the
+    first resolvable legacy soname wins.
+    """
+    from alignment.profiler.roctx_shim import RoctracerBackend
+
+    attempts: list[str] = []
+    monkeypatch.setattr(
+        roctx_shim.ctypes, "CDLL", _fake_cdll({"libroctx64.so"}, attempts)
+    )
+    backend = RoctracerBackend()
+    assert backend.soname == "libroctx64.so"
+    # The SDK sonames were attempted (and failed) before the legacy fallback.
+    assert attempts.index("librocprofiler-sdk-roctx.so.1") < attempts.index("libroctx64.so")
+
+
+def test_roctracer_backend_raises_when_no_roctx_lib(monkeypatch):
+    from alignment.profiler.roctx_shim import RoctracerBackend
+
+    attempts: list[str] = []
+    monkeypatch.setattr(roctx_shim.ctypes, "CDLL", _fake_cdll(set(), attempts))
+    with pytest.raises(OSError, match="roctx shared object"):
+        RoctracerBackend()
+    # Every candidate was tried before giving up.
+    assert "librocprofiler-sdk-roctx.so.1" in attempts and "libroctx64.so" in attempts
+
+
+def test_roctracer_backend_explicit_soname_forces_one(monkeypatch):
+    """An explicit soname bypasses the preference order and loads exactly that."""
+    from alignment.profiler.roctx_shim import RoctracerBackend
+
+    attempts: list[str] = []
+    monkeypatch.setattr(
+        roctx_shim.ctypes, "CDLL", _fake_cdll({"libroctx64.so.1"}, attempts)
+    )
+    backend = RoctracerBackend(soname="libroctx64.so.1")
+    assert backend.soname == "libroctx64.so.1"
+    assert attempts == ["libroctx64.so.1"]
 
 
 def _write_rocpd_from_regions(path, regions, dispatches):
