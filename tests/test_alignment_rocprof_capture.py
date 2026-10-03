@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import sqlite3
 import subprocess
+from pathlib import Path
 
 import pyarrow.parquet as pq
 import pytest
@@ -26,10 +27,15 @@ from alignment.nsys.parsed_io import _KERNEL_SCHEMA, kernel_rows_path
 from alignment.profiler import rocprof_capture
 from alignment.profiler.config import RocprofConfig
 from alignment.profiler.rocprof_capture import (
+    OUTPUT_RANK_ENV_DEFAULT,
+    VLLM_V1_MULTIPROCESSING_ENV,
     ResolvedRocprofExecutable,
     build_capture_argv,
     build_capture_server_env,
     locate_rocpd,
+    locate_rocpd_per_rank,
+    per_rank_output_name,
+    rank_from_rocpd_path,
     resolve_rocprof_executable,
     validate_rocpd,
 )
@@ -252,6 +258,123 @@ def test_capture_server_env_sets_roctx_flag():
     assert built["PATH"] == "/usr/bin" and built["HOME"] == "/home/x"
     # A pre-existing (stale) value is overridden to the timing-on setting.
     assert build_capture_server_env({ROCTX_SCOPES_ENV: "0"})[ROCTX_SCOPES_ENV] == "1"
+
+
+def test_capture_server_env_defaults_v1_multiprocessing_off_but_overridable():
+    """The driver puts the V1 engine in-process by default, overridably.
+
+    vLLM runs EngineCore in a separate process by default, so a capture that wraps
+    only the launcher sees no kernel dispatches. The driver defaults
+    VLLM_ENABLE_V1_MULTIPROCESSING=0 to pull the engine in-process -- but as a
+    DEFAULT, so an operator tracing the multiprocessing engine per-rank keeps their
+    own value.
+    """
+    built = build_capture_server_env({"PATH": "/usr/bin"})
+    assert built[VLLM_V1_MULTIPROCESSING_ENV] == "0"
+    # An explicit operator value is preserved (overridable default).
+    kept = build_capture_server_env({VLLM_V1_MULTIPROCESSING_ENV: "1"})
+    assert kept[VLLM_V1_MULTIPROCESSING_ENV] == "1"
+
+
+def test_per_rank_output_name_and_rank_parsing():
+    """The per-rank -o template carries a rocprofv3 %q{ENV}% key; filenames round-trip."""
+    templated = per_rank_output_name("trace")
+    assert templated == f"trace_rank%q{{{OUTPUT_RANK_ENV_DEFAULT}}}%"
+    assert per_rank_output_name("trace", "LOCAL_RANK") == "trace_rank%q{LOCAL_RANK}%"
+    # Ranks are recovered from both the current and legacy rocpd spellings.
+    from pathlib import Path
+
+    assert rank_from_rocpd_path(Path("trace_rank0_results.db")) == 0
+    assert rank_from_rocpd_path(Path("trace_rank3.db")) == 3
+    assert rank_from_rocpd_path(Path("trace_results.db")) is None
+
+
+def test_per_rank_argv_carries_templated_output_name(tmp_path):
+    """build_capture_argv emits the templated -o so each worker writes its own db."""
+    from alignment.profiler.config import RocprofConfig
+
+    argv = build_capture_argv(
+        _fake_exe(tmp_path),
+        RocprofConfig(tp_size=4),
+        ["python", "-m", "vllm.entrypoints.cli.main", "serve", "model"],
+        tmp_path / "out",
+        per_rank_output_name("rank"),
+    )
+    assert argv[argv.index("-o") + 1] == f"rank_rank%q{{{OUTPUT_RANK_ENV_DEFAULT}}}%"
+
+
+def test_locate_rocpd_per_rank_collects_in_rank_order(tmp_path):
+    for r in (2, 0, 1):  # written out of order on purpose
+        (tmp_path / f"trace_rank{r}_results.db").write_text("")
+    found = locate_rocpd_per_rank(tmp_path, "trace")
+    assert [p.name for p in found] == [
+        "trace_rank0_results.db",
+        "trace_rank1_results.db",
+        "trace_rank2_results.db",
+    ]
+    with pytest.raises(FileNotFoundError):
+        locate_rocpd_per_rank(tmp_path, "missing")
+
+
+def test_config_rejects_bad_tp_size():
+    with pytest.raises(ValueError, match="tp_size"):
+        RocprofConfig(tp_size=0).validate()
+
+
+def test_cli_per_rank_capture_parses_every_worker(tmp_path):
+    """--tp-size>1 drives a per-rank capture: each worker db is parsed separately."""
+    out_dir = tmp_path / "cap"
+    parsed_out = tmp_path / "parsed.json"
+    sequences_out = tmp_path / "kernel_sequences.json"
+    seen = {}
+
+    def fake_runner(argv, env=None, check=True):
+        seen["argv"] = argv
+        seen["env"] = env
+        db_dir = Path(argv[argv.index("-d") + 1])
+        name = argv[argv.index("-o") + 1]  # templated: "<base>_rank%q{RANK}%"
+        base = name.split("_rank")[0]
+        db_dir.mkdir(parents=True, exist_ok=True)
+        # Stand in for rocprofv3 expanding %q{RANK}% in each of two worker procs.
+        for rank in (0, 1):
+            _complete_fixture(db_dir / f"{base}_rank{rank}_results.db")
+        return subprocess.CompletedProcess(argv, 0)
+
+    rc = rocprof_capture.main(
+        [
+            "--output-dir",
+            str(out_dir),
+            "--output-name",
+            "trace",
+            "--tp-size",
+            "2",
+            "--parsed-output",
+            str(parsed_out),
+            "--sequences-output",
+            str(sequences_out),
+            "--",
+            "python",
+            "-m",
+            "vllm.entrypoints.cli.main",
+            "serve",
+            "model",
+        ],
+        resolver=lambda _p: _fake_exe(out_dir),
+        runner=fake_runner,
+    )
+    assert rc == 0
+    # The -o carried the per-rank template.
+    assert "_rank%q{" in seen["argv"][seen["argv"].index("-o") + 1]
+    # Each worker's parse landed in its own rank-suffixed file.
+    for rank in (0, 1):
+        rank_parsed = tmp_path / f"parsed.rank{rank}.json"
+        assert rank_parsed.exists()
+        rows = kernel_rows_path(rank_parsed)
+        assert rows.exists()
+        table = pq.read_table(rows)
+        for col in _KERNEL_SCHEMA.names:
+            assert table.column(col).null_count == 0
+        assert (tmp_path / f"kernel_sequences.rank{rank}.json").exists()
 
 
 def test_cli_injects_roctx_flag_into_launched_server_env(tmp_path):

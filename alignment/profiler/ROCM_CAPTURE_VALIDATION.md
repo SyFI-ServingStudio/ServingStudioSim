@@ -184,3 +184,31 @@ uv run --no-sync python -m alignment rocpd-parse \
 If the queries in (a)/(b) returned rows but the parse produces empty sequences,
 the problem is in attribution (timestamp containment / thread matching), not in
 capture plumbing — report that distinction rather than re-running the capture.
+
+## Deferred to the 8-GPU TP4/EP4 run
+
+This 1-GPU check fixes capture plumbing that is confirmable on-host; two facts
+remain GPU-only and must be confirmed on the next lease.
+
+1. **roctx MARKER registration ordering (Gap 2, TP1 is enough).** Confirm the
+   serving process loads `librocprofiler-sdk-roctx` (not legacy `libroctx64`) and
+   that `--marker-trace` records the labels — i.e. query (a) is non-empty while
+   the shim ran. If both roctx libraries are resolvable and the legacy one
+   preempts the SDK's symbol/MARKER registration, `--marker-trace` records nothing
+   even though the shim pushed ranges.
+
+2. **Per-rank capture for TP>1 (Gap 3, needs TP4/EP4).** The driver now templates
+   a per-rank rocprofv3 output name for `--tp-size > 1` (`-o <name>_rank%q{RANK}%`,
+   `--rank-env` to pick the env var), so each of the N worker processes writes its
+   own `<name>_rank<N>_results.db` and each is validated and parsed to a
+   `parsed.rank<N>.json`. The TP4/EP4 run must pass:
+   - all 4 per-rank databases are written and `locate_rocpd_per_rank` finds them;
+   - each carries both `vllm_iteration(N)` roctx ranges (query (a)) and kernel
+     dispatch rows (query (b)) — i.e. every worker, not just the launcher, was
+     traced;
+   - the exact env var the traced worker carries its rank in is confirmed (default
+     `RANK`; `LOCAL_RANK` is the per-node alternative) so `%q{...}%` expands to a
+     distinct value per worker rather than collapsing all workers onto one file;
+   - whether `VLLM_ENABLE_V1_MULTIPROCESSING=0` (defaulted by the driver for the
+     in-process TP1 engine) must be *overridden back on* for TP>1 so the workers
+     spawn as traceable processes — set it in the capture env if so.

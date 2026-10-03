@@ -187,6 +187,12 @@ class RocprofConfig:
     kernel_trace: bool = True
     marker_trace: bool = True  # roctx iteration ranges
     hip_trace: bool = False
+    # Number of tensor-parallel ranks the wrapped server spawns. 1 traces the
+    # single in-process engine; >1 makes the capture driver template a per-rank
+    # rocprofv3 output name so each of the N worker processes writes its own rocpd
+    # database. The real TP>1 capture is confirmed on the 8-GPU lease; on-host this
+    # only drives the per-rank argv/output assembly.
+    tp_size: int = 1
     # Extra rocprofv3 flags, appended verbatim before the wrapped command.
     extra_args: list[str] = field(default_factory=list)
     # Analysis window [start, end] over the forward index; open bounds analyze the
@@ -208,6 +214,8 @@ class RocprofConfig:
                 "rocprof.marker_trace is required: without roctx ranges the dispatches "
                 "cannot be attributed to vllm_iteration(N) windows"
             )
+        if self.tp_size < 1:
+            raise ValueError(f"rocprof.tp_size must be >= 1, got {self.tp_size}")
         if (
             self.analyze_iteration_start is not None
             and self.analyze_iteration_end is not None

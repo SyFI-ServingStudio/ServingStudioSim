@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -55,7 +56,49 @@ except Exception:  # pragma: no cover - import shape guarded; validate() re-rais
 #: accepts either so a version bump does not silently break discovery.
 _ROCPD_SUFFIXES = ("_results.db", ".db")
 
+#: vLLM runs the V1 engine (and the model) in a SEPARATE ``EngineCore`` process by
+#: default, so a rocprofv3 capture that wraps only the launcher traces the launcher
+#: and never sees the engine's kernel dispatches. Setting this to ``"0"`` puts the
+#: engine in-process with the launcher, so the single wrapped process carries the
+#: GPU work -- the fix that let the 1-GPU validation capture any dispatches at all.
+#: It is a DEFAULT (``setdefault``), so an operator who needs the multiprocessing
+#: engine (and per-rank tracing instead) can still override it in the base env.
+VLLM_V1_MULTIPROCESSING_ENV = "VLLM_ENABLE_V1_MULTIPROCESSING"
+
+#: The env var each worker process carries its rank in, used to template a
+#: per-rank rocprofv3 output name for TP>1. vLLM sets ``RANK`` (global) and
+#: ``LOCAL_RANK`` (per-node) on every worker; ``RANK`` is the default so each of
+#: the N worker processes writes a distinct ``<name>_rank<N>_results.db``. The
+#: exact var that is populated in the traced worker must be confirmed on the
+#: 8-GPU TP run (see the runbook); it is configurable for that reason.
+OUTPUT_RANK_ENV_DEFAULT = "RANK"
+
+#: Recovers the integer rank from a per-rank rocpd filename written by the
+#: templated ``-o`` (``<name>_rank<N>_results.db`` / ``<name>_rank<N>.db``).
+_RANK_FROM_FILENAME_RE = re.compile(r"_rank(\d+)(?:_results)?\.db$")
+
 Runner = Callable[[list[str]], subprocess.CompletedProcess]
+
+
+def per_rank_output_name(
+    output_name: str, rank_env: str = OUTPUT_RANK_ENV_DEFAULT
+) -> str:
+    """Template a per-rank rocprofv3 ``-o`` name for a TP>1 capture.
+
+    rocprofv3 expands a ``%q{ENV}%`` key in the output name to that environment
+    variable's value *in each traced process*, so one wrapped launch of an N-way
+    tensor-parallel server yields one rocpd database per worker:
+    ``<name>_rank0_results.db`` ... ``<name>_rank{N-1}_results.db``. This is the
+    ``-o rank{n}`` style the runbook anticipates, expressed through the rocprofv3
+    placeholder so the tool -- not this driver -- stamps each worker's own rank.
+    """
+    return f"{output_name}_rank%q{{{rank_env}}}%"
+
+
+def rank_from_rocpd_path(db_path: Path) -> int | None:
+    """Parse the worker rank out of a per-rank rocpd filename, or ``None``."""
+    match = _RANK_FROM_FILENAME_RE.search(db_path.name)
+    return int(match.group(1)) if match else None
 
 
 @dataclass(frozen=True)
@@ -154,6 +197,10 @@ def build_capture_server_env(base_env: dict[str, str] | None = None) -> dict[str
     """
     env = dict(os.environ if base_env is None else base_env)
     env[ROCTX_SCOPES_ENV] = "1"
+    # Put the V1 engine in-process so the wrapped process carries the GPU work.
+    # setdefault, not assignment: an operator tracing the multiprocessing engine
+    # per-rank (TP>1) can still override it in the base env.
+    env.setdefault(VLLM_V1_MULTIPROCESSING_ENV, "0")
     return env
 
 
@@ -190,6 +237,59 @@ def locate_rocpd(output_dir: Path, output_name: str) -> Path:
         f"no rocpd database for output name {output_name!r} under {output_dir} "
         f"(looked for {_ROCPD_SUFFIXES} and nested *.db)"
     )
+
+
+def locate_rocpd_per_rank(output_dir: Path, output_name: str) -> list[Path]:
+    """Find every per-rank rocpd database a TP>1 capture wrote, in rank order.
+
+    The templated ``-o`` (see :func:`per_rank_output_name`) makes rocprofv3 stamp
+    each worker's rank into its filename, so an N-way capture leaves
+    ``<name>_rank0_results.db`` ... ``<name>_rank{N-1}_results.db`` under
+    ``output_dir``. Returns them sorted by the parsed rank; raises when none exist
+    so a capture that traced no worker is not mistaken for an empty trace.
+    """
+    found: list[tuple[int, Path]] = []
+    for suffix in _ROCPD_SUFFIXES:
+        for candidate in output_dir.glob(f"{output_name}_rank*{suffix}"):
+            rank = rank_from_rocpd_path(candidate)
+            if rank is not None and candidate not in (p for _, p in found):
+                found.append((rank, candidate))
+    if not found:
+        raise FileNotFoundError(
+            f"no per-rank rocpd databases for output name {output_name!r} under "
+            f"{output_dir} (looked for {output_name}_rank<N>{_ROCPD_SUFFIXES})"
+        )
+    found.sort(key=lambda item: item[0])
+    return [path for _, path in found]
+
+
+def run_capture_per_rank(
+    executable: ResolvedRocprofExecutable,
+    config: RocprofConfig,
+    server_argv: list[str],
+    output_dir: Path,
+    output_name: str,
+    *,
+    rank_env: str = OUTPUT_RANK_ENV_DEFAULT,
+    env: dict[str, str] | None = None,
+    runner: Runner = subprocess.run,
+) -> list[Path]:
+    """Run a TP>1 server under rocprofv3 and return every per-rank rocpd path.
+
+    One wrapped launch traces the whole worker-process tree; the per-rank
+    ``%q{ENV}%`` output template makes each worker write its own database, which
+    :func:`locate_rocpd_per_rank` then collects. ``runner`` is injectable exactly
+    as in :func:`run_capture` so the per-rank argv assembly and output discovery
+    are unit-testable on-host without rocprofv3 or multiple GPUs.
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    templated_name = per_rank_output_name(output_name, rank_env)
+    argv = build_capture_argv(executable, config, server_argv, output_dir, templated_name)
+    completed = runner(argv, env=env, check=True)  # type: ignore[call-arg]
+    if getattr(completed, "returncode", 0) not in (0, None):
+        raise RuntimeError(f"rocprofv3 exited with code {completed.returncode}")
+    return locate_rocpd_per_rank(output_dir, output_name)
 
 
 def validate_rocpd(db_path: Path) -> dict:
@@ -270,6 +370,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--hip-trace", action="store_true", help="also collect the HIP API stream")
     parser.add_argument(
+        "--tp-size",
+        type=int,
+        default=1,
+        help=(
+            "tensor-parallel ranks the server spawns; >1 captures each worker "
+            "process to its own per-rank rocpd database (-o <name>_rank<N>)"
+        ),
+    )
+    parser.add_argument(
+        "--rank-env",
+        default=OUTPUT_RANK_ENV_DEFAULT,
+        help="env var each worker carries its rank in, for the per-rank -o template",
+    )
+    parser.add_argument(
         "--rocprof-arg",
         dest="rocprof_args",
         action="append",
@@ -337,17 +451,58 @@ def main(
     config = RocprofConfig(
         executable=str(executable.path),
         hip_trace=args.hip_trace,
+        tp_size=args.tp_size,
         extra_args=list(args.rocprof_args),
         analyze_iteration_start=args.iteration_start,
         analyze_iteration_end=args.iteration_end,
     )
+    capture_env = build_capture_server_env()
+
+    if config.tp_size > 1:
+        db_paths = run_capture_per_rank(
+            executable,
+            config,
+            server_argv,
+            args.output_dir,
+            args.output_name,
+            rank_env=args.rank_env,
+            env=capture_env,
+            runner=runner,
+        )
+        overall = 0
+        for db_path in db_paths:
+            rank = rank_from_rocpd_path(db_path)
+            report = validate_rocpd(db_path)
+            print(
+                json.dumps(
+                    {"rank": rank, "rocpd": str(db_path), "validation": report},
+                    separators=(",", ":"),
+                )
+            )
+            if not report["ok"]:
+                print(
+                    f"rocpd capture for rank {rank} incomplete: need both iteration "
+                    "roctx ranges and kernel dispatch rows (see validation above)",
+                    file=sys.stderr,
+                )
+                overall = 1
+                continue
+            if args.no_parse:
+                continue
+            rc = rocpd_parse.main(
+                _parse_argv_for(args, db_path, _rank_suffixed(args.parsed_output, rank),
+                                _rank_suffixed(args.sequences_output, rank))
+            )
+            overall = overall or rc
+        return overall
+
     db_path = run_capture(
         executable,
         config,
         server_argv,
         args.output_dir,
         args.output_name,
-        env=build_capture_server_env(),
+        env=capture_env,
         runner=runner,
     )
     report = validate_rocpd(db_path)
@@ -362,16 +517,39 @@ def main(
     if args.no_parse:
         return 0
 
+    return rocpd_parse.main(
+        _parse_argv_for(args, db_path, args.parsed_output, args.sequences_output)
+    )
+
+
+def _rank_suffixed(path: Path | None, rank: int | None) -> Path | None:
+    """Insert ``.rank<N>`` before the suffix of a per-rank output path.
+
+    ``parsed.json`` -> ``parsed.rank0.json`` so each TP worker's parse lands in a
+    distinct file. ``None`` (no such output requested) stays ``None``.
+    """
+    if path is None or rank is None:
+        return path
+    return path.with_suffix(f".rank{rank}{path.suffix}")
+
+
+def _parse_argv_for(
+    args: argparse.Namespace,
+    db_path: Path,
+    parsed_output: Path | None,
+    sequences_output: Path | None,
+) -> list[str]:
+    """Assemble the ``rocpd-parse`` argv for one captured database."""
     parse_argv = ["--db", str(db_path), "--default-stage", args.default_stage]
     if args.iteration_start is not None:
         parse_argv += ["--iteration-start", str(args.iteration_start)]
     if args.iteration_end is not None:
         parse_argv += ["--iteration-end", str(args.iteration_end)]
-    if args.parsed_output is not None:
-        parse_argv += ["--output", str(args.parsed_output)]
-    if args.sequences_output is not None:
-        parse_argv += ["--sequences-output", str(args.sequences_output)]
-    return rocpd_parse.main(parse_argv)
+    if parsed_output is not None:
+        parse_argv += ["--output", str(parsed_output)]
+    if sequences_output is not None:
+        parse_argv += ["--sequences-output", str(sequences_output)]
+    return parse_argv
 
 
 if __name__ == "__main__":
