@@ -23,7 +23,7 @@ pub use admission::{
 };
 pub(crate) use config::resolve_prefix_cache_config;
 pub use config::{
-    AttnWorkerSel, BatchPolicy, DecodeRetractionPolicy, FfnWorkerSel, IterWorkerSel,
+    AttnWorkerSel, BatchPolicy, DecodeRetractionPolicy, DpPlacement, FfnWorkerSel, IterWorkerSel,
     KvAdmissionConfig, KvAdmissionPolicy,
 };
 pub use cost_buffers::CostBuffers;

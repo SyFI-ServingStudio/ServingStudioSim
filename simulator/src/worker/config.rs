@@ -30,6 +30,18 @@ pub enum BatchPolicy {
 
 const BATCH_POLICY_CHOICES: [&str; 2] = ["mix", "separate-prefill-priority"];
 
+/// How a multi-partition worker places a fresh request on an attention DP
+/// partition. See [`crate::worker::admission::LoadBalance`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DpPlacement {
+    #[default]
+    RoundRobin,
+    VllmLeastLoaded,
+}
+
+const DP_PLACEMENT_CHOICES: [&str; 2] = ["round-robin", "vllm-least-loaded"];
+
 /// KV-capacity rule paired with chunked prefill. `FullFootprint` preserves the
 /// historical no-retraction lifecycle. `BoundedFuture` uses an explicit
 /// future-token estimate and therefore requires decode retraction.
@@ -334,6 +346,14 @@ pub enum IterWorkerSel {
         /// every iteration.
         #[serde(default)]
         prefill_gpu_time_multiplier: Option<f64>,
+        /// How new requests are spread across the arch's attention DP
+        /// partitions when it has more than one (`num_attn_dp_groups`).
+        /// `round-robin` rotates blindly; `vllm-least-loaded` is vLLM's DP load
+        /// balancer (fewest waiting + running, waiting penalised under KV
+        /// pressure). Retained-prefix affinity overrides either.
+        #[serde(default)]
+        #[param(string, default = "round-robin", choices = DP_PLACEMENT_CHOICES)]
+        dp_placement: DpPlacement,
     },
     /// Chunked prefill with a speculating decode engine: one verify pass per
     /// iteration submits `draft_tokens + 1` rows per resident decode and retires
