@@ -428,8 +428,10 @@ def test_measure_worker_uses_selected_python_and_composed_pythonpath(
         (first_import_root, second_import_root),
         (library_root,),
     )
-    existing_pythonpath = os.pathsep.join(["/existing/first", "/existing/second"])
-    monkeypatch.setenv("PYTHONPATH", existing_pythonpath)
+    # The caller's interpreter paths name the project venv; an env with its own
+    # interpreter must not inherit them.
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join(["/project/site-packages", "/existing"]))
+    monkeypatch.setenv("PYTHONHOME", "/project/python-home")
     monkeypatch.setenv("LD_LIBRARY_PATH", "/existing/lib")
     captured = {}
 
@@ -466,9 +468,9 @@ def test_measure_worker_uses_selected_python_and_composed_pythonpath(
             str(Path(__file__).parents[1]),
             str(first_import_root),
             str(second_import_root),
-            existing_pythonpath,
         ]
     )
+    assert "PYTHONHOME" not in captured_env
     assert captured_env["LD_LIBRARY_PATH"] == os.pathsep.join([str(library_root), "/existing/lib"])
     assert response["measure"]["consumed"] is True
 
