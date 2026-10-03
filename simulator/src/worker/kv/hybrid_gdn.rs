@@ -255,6 +255,15 @@ impl IterWorkerKv for HybridGdnKv {
             + self.partitions[partition as usize].prefill_admit_count()
     }
 
+    fn kv_usage(&self, partition: PartitionId) -> f64 {
+        let partition_state = &self.partitions[partition as usize];
+        let used = partition_state.resident_tokens()
+            + self.clamped_live_checkpoint_charge(partition)
+            + self.ledger.partition_held(partition)
+            + self.ledger.partition_promised(partition);
+        used as f64 / partition_state.capacity_tokens().max(1) as f64
+    }
+
     fn release_external(&mut self, request: RequestId, current_kv: u64) -> Option<PartitionId> {
         let Some(partition) = self.ledger.forget_placement(request) else {
             self.ledger.take_held(request);

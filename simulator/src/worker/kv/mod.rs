@@ -294,6 +294,10 @@ pub trait IterWorkerKv: KvStore {
     fn live_decode_count(&self, partition: PartitionId) -> u32;
     fn has_prefill_admit(&self, partition: PartitionId) -> bool;
     fn status_active(&self, partition: PartitionId) -> u32;
+    /// Fraction of the partition's KV capacity that running requests hold or
+    /// have reserved (retained prefix KV is reclaimable, so it does not count),
+    /// the analogue of vLLM's per-engine `kv_cache_usage`.
+    fn kv_usage(&self, partition: PartitionId) -> f64;
     fn release_external(&mut self, request: RequestId, current_kv: u64) -> Option<PartitionId>;
 
     /// Static-dispatch iteration over this iteration's fresh prefills.

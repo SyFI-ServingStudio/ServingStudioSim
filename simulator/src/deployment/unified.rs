@@ -40,8 +40,8 @@ use crate::timing::PerfApiBridge;
 use crate::worker::{
     build_barebone_worker, build_chunked_prefill_worker, build_hp_worker,
     build_hybrid_chunked_prefill_worker, build_qwen36_hybrid_worker, build_speculative_worker,
-    resolve_prefix_cache_config, BatchPolicy, IterWorker, IterWorkerSel, KvAdmissionConfig,
-    PendingOrderKind, PrefixCacheMode, PrefixCachePolicy, WorkerConfig,
+    resolve_prefix_cache_config, BatchPolicy, DpPlacement, IterWorker, IterWorkerSel,
+    KvAdmissionConfig, PendingOrderKind, PrefixCacheMode, PrefixCachePolicy, WorkerConfig,
 };
 
 use super::Deployment;
@@ -187,6 +187,10 @@ impl Deployment for UnifiedDeployment {
             ssm_checkpoint_interval_tokens: ssm_checkpoint_interval_tokens(&g.worker),
             speculative_draft_tokens: speculative_draft_tokens(&g.worker),
             speculative_acceptance_seed: speculative_acceptance_seed(&g.worker),
+            dp_placement: match &g.worker {
+                IterWorkerSel::ChunkedPrefill { dp_placement, .. } => *dp_placement,
+                _ => DpPlacement::RoundRobin,
+            },
             ..WorkerConfig::default()
         };
 
@@ -988,6 +992,7 @@ mod tests {
             kv_admission: crate::worker::config::KvAdmissionSpec::default(),
             gpu_time_multiplier: 1.0,
             prefill_gpu_time_multiplier: None,
+            dp_placement: DpPlacement::RoundRobin,
         }
     }
 

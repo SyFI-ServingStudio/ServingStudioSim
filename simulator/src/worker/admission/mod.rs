@@ -22,6 +22,7 @@ pub use fresh_request_slot_admission::FreshRequestSlotAdmission;
 pub use local_prefill_decode_admission::LocalPrefillDecodeAdmission;
 pub use pipelined_prefill_admission::PipelinedPrefillAdmission;
 pub use placement::LoadBalance;
+pub(crate) use placement::PartitionLoad;
 pub(crate) use policy::EnqueueSequence;
 pub use policy::{
     AdmissionCandidate, FifoOrder, LongestPrefixMatch, PendingOrder, PendingOrderKind,

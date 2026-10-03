@@ -563,6 +563,9 @@ pub struct WorkerConfig {
     /// draw must be reproducible run-to-run like every other modeled quantity,
     /// so this selects *which* deterministic stream, never whether there is one.
     pub speculative_acceptance_seed: Option<u64>,
+    /// Attention-DP partition placement (from the chunked-prefill selector).
+    /// Only multi-partition chunked-prefill workers read it.
+    pub dp_placement: crate::worker::config::DpPlacement,
 }
 
 impl Default for WorkerConfig {
@@ -583,6 +586,7 @@ impl Default for WorkerConfig {
             ssm_checkpoint_interval_tokens: None,
             speculative_draft_tokens: 0,
             speculative_acceptance_seed: None,
+            dp_placement: crate::worker::config::DpPlacement::RoundRobin,
         }
     }
 }
