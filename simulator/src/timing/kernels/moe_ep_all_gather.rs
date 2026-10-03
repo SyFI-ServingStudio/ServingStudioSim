@@ -1,4 +1,8 @@
 //! Ragged hidden-state plus router-logit all-gatherv for naive DP/EP MoE.
+//!
+//! `hidden_dtype` bf16 gathers the unquantized hidden states. `fp8_e4m3` is
+//! vLLM's block-FP8 prepare (`naive_dp_ep.py`): fp8 activations plus their fp32
+//! per-128-element scales as the extra tensor, alongside the fp32 router logits.
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::{CacheKind, Extrapolation};
@@ -35,6 +39,10 @@ pub struct MoeEpAllGatherKernelConfig {
     pub hidden_dtype: DType,
     pub router_dtype: DType,
     pub fabric: String,
+    /// Largest token count summed over the group, which bounds the grid's
+    /// total-token axis. One rank's scheduler budget times num_gpus when every
+    /// rank can fill its batch.
+    pub max_total_tokens: u32,
 }
 
 pub struct MoeEpAllGatherSpec;
@@ -45,8 +53,8 @@ impl KernelSpec for MoeEpAllGatherSpec {
 
     const KIND: KernelKind = "moe_ep_all_gather";
 
-    fn sweep_grid(_config: &Self::Config) -> SweepGrid {
-        collective_grid(8192)
+    fn sweep_grid(config: &Self::Config) -> SweepGrid {
+        collective_grid(config.max_total_tokens)
     }
 
     fn cache_kind(_backend: &'static str) -> CacheKind {
@@ -123,7 +131,7 @@ pub(crate) fn canonical_tokens(
 
 fn validate_config(config: &MoeEpAllGatherKernelConfig) {
     assert!(matches!(config.num_gpus, 2 | 4 | 8));
-    assert_eq!(config.hidden_dtype, DType::Bf16);
+    assert!(matches!(config.hidden_dtype, DType::Bf16 | DType::Fp8E4m3));
     assert_eq!(config.router_dtype, DType::Fp32);
     assert_eq!(config.fabric, "nvlink");
 }
