@@ -214,6 +214,100 @@ def test_roctracer_backend_explicit_soname_forces_one(monkeypatch):
     assert attempts == ["libroctx64.so.1"]
 
 
+def _fake_cdll_with_mode(present, calls):
+    """A ``ctypes.CDLL`` stand-in that records ``(name, mode)`` of each attempt.
+
+    Loads only sonames in ``present`` (returns a ``MagicMock``), else raises
+    ``OSError`` — so the preloader's gating, try-order, and RTLD_GLOBAL mode are
+    observable without a real roctx stack.
+    """
+
+    def fake(name, mode=0):
+        calls.append((name, mode))
+        if name in present:
+            return MagicMock()
+        raise OSError(f"no such shared object: {name}")
+
+    return fake
+
+
+@pytest.fixture
+def _reset_preload():
+    """Clear the preload module globals before and after a test uses them."""
+    from alignment.profiler import _roctx_preload
+
+    saved = (_roctx_preload._PRELOADED_HANDLE, _roctx_preload._PRELOADED_SONAME)
+    _roctx_preload._PRELOADED_HANDLE = None
+    _roctx_preload._PRELOADED_SONAME = None
+    yield _roctx_preload
+    _roctx_preload._PRELOADED_HANDLE, _roctx_preload._PRELOADED_SONAME = saved
+
+
+def test_preload_is_a_noop_when_flag_unset(monkeypatch, _reset_preload):
+    """Gated off: the preloader loads nothing and records nothing."""
+    calls: list[tuple[str, int]] = []
+    monkeypatch.setattr(_reset_preload.ctypes, "CDLL", _fake_cdll_with_mode(set(), calls))
+    env: dict[str, str] = {}
+    assert _reset_preload.preload_sdk_roctx(environ=env) is None
+    assert calls == []  # CDLL never touched when the flag is off
+    assert _reset_preload.preloaded_handle() is None
+    assert _reset_preload.ROCTX_SONAME_RESOLVED_ENV not in env
+
+
+def test_preload_loads_sdk_roctx_rtld_global_when_flag_set(monkeypatch, _reset_preload):
+    """Gated on: the SDK soname is loaded RTLD_GLOBAL and recorded for the shim."""
+    import ctypes as _ctypes
+
+    calls: list[tuple[str, int]] = []
+    monkeypatch.setattr(
+        _reset_preload.ctypes,
+        "CDLL",
+        _fake_cdll_with_mode({"librocprofiler-sdk-roctx.so.1"}, calls),
+    )
+    env = {roctx_shim.ROCTX_SCOPES_ENV: "1"}
+    resolved = _reset_preload.preload_sdk_roctx(environ=env)
+    assert resolved == "librocprofiler-sdk-roctx.so.1"
+    # Loaded with RTLD_GLOBAL so its roctx* symbols win global resolution.
+    assert calls == [("librocprofiler-sdk-roctx.so.1", _ctypes.RTLD_GLOBAL)]
+    assert _reset_preload.preloaded_handle() is not None
+    assert env[_reset_preload.ROCTX_SONAME_RESOLVED_ENV] == "librocprofiler-sdk-roctx.so.1"
+
+
+def test_preload_tolerates_absent_library(monkeypatch, _reset_preload):
+    """Gated on but no SDK lib present: logs + returns None, never raises."""
+    calls: list[tuple[str, int]] = []
+    monkeypatch.setattr(
+        _reset_preload.ctypes, "CDLL", _fake_cdll_with_mode(set(), calls)
+    )
+    env = {roctx_shim.ROCTX_SCOPES_ENV: "1"}
+    assert _reset_preload.preload_sdk_roctx(environ=env) is None
+    # Every SDK candidate was tried before giving up, and no crash.
+    assert [name for name, _ in calls] == list(_reset_preload.SDK_SONAMES)
+    assert _reset_preload.preloaded_handle() is None
+
+
+def test_roctracer_backend_prefers_preloaded_sdk_handle(monkeypatch, _reset_preload):
+    """The shim reuses the preloaded RTLD_GLOBAL SDK handle instead of dlopening again.
+
+    This is what makes the shim's ``roctx*`` calls resolve to the SDK library
+    rocprofv3's MARKER service registered against, not torch's legacy libroctx64.
+    """
+    from alignment.profiler.roctx_shim import RoctracerBackend
+
+    sentinel = MagicMock()
+    _reset_preload._PRELOADED_HANDLE = sentinel
+    _reset_preload._PRELOADED_SONAME = "librocprofiler-sdk-roctx.so.1"
+
+    # If the backend tried to dlopen itself, this would record a call and fail.
+    attempts: list[str] = []
+    monkeypatch.setattr(roctx_shim.ctypes, "CDLL", _fake_cdll(set(), attempts))
+
+    backend = RoctracerBackend()
+    assert backend.soname == "librocprofiler-sdk-roctx.so.1"
+    assert backend._lib is sentinel
+    assert attempts == []  # the resident handle was reused, no fresh dlopen
+
+
 def _write_rocpd_from_regions(path, regions, dispatches):
     """Write a synthetic rocpd db from ``(label, start, end)`` regions + dispatches.
 

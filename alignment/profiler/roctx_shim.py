@@ -232,24 +232,37 @@ class RoctracerBackend:
     )
 
     def __init__(self, soname: str | None = None) -> None:
-        names = (soname,) if soname else self._CANDIDATE_SONAMES
-        last_error: OSError | None = None
         lib = None
         loaded_soname: str | None = None
-        for candidate in names:
-            if candidate is None:
-                continue
-            try:
-                lib = ctypes.CDLL(candidate)
-                loaded_soname = candidate
-                break
-            except OSError as error:  # not present / not loadable
-                last_error = error
+        # Prefer the SDK roctx library the sitecustomize preloader already mapped
+        # RTLD_GLOBAL before torch (the Gap-2 load-order fix). Reusing that exact
+        # handle guarantees our roctx* calls resolve to the SDK lib rocprofv3's
+        # MARKER service registered against, not torch's later legacy libroctx64.
+        # Skipped when an explicit soname is forced (tests / operator override).
+        if soname is None:
+            from ._roctx_preload import preloaded_handle, preloaded_soname  # noqa: PLC0415
+
+            handle = preloaded_handle()
+            if handle is not None:
+                lib = handle
+                loaded_soname = preloaded_soname()
         if lib is None:
-            raise OSError(
-                "could not load a roctx shared object "
-                f"(tried {list(names)}): {last_error}"
-            )
+            names = (soname,) if soname else self._CANDIDATE_SONAMES
+            last_error: OSError | None = None
+            for candidate in names:
+                if candidate is None:
+                    continue
+                try:
+                    lib = ctypes.CDLL(candidate)
+                    loaded_soname = candidate
+                    break
+                except OSError as error:  # not present / not loadable
+                    last_error = error
+            if lib is None:
+                raise OSError(
+                    "could not load a roctx shared object "
+                    f"(tried {list(names)}): {last_error}"
+                )
         lib.roctxRangePushA.argtypes = [ctypes.c_char_p]
         lib.roctxRangePushA.restype = ctypes.c_int
         lib.roctxRangePop.argtypes = []
@@ -259,6 +272,13 @@ class RoctracerBackend:
         self._lib = lib
         #: The soname actually loaded, so the selection order is observable.
         self.soname = loaded_soname
+        # Stamp the resolved soname so it is consistent with (and confirms) what
+        # the preloader recorded, whether the handle came from the preloader or a
+        # fresh dlopen here.
+        if loaded_soname is not None:
+            from ._roctx_preload import ROCTX_SONAME_RESOLVED_ENV  # noqa: PLC0415
+
+            os.environ[ROCTX_SONAME_RESOLVED_ENV] = loaded_soname
 
     def range_push(self, message: str) -> None:
         self._lib.roctxRangePushA(message.encode("utf-8"))
