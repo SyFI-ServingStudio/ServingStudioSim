@@ -221,17 +221,19 @@ pub fn build(
         ));
     }
     let pp_size = resolved.parallel.pp_size;
-    let stages = pp_indices(recipe.model.num_layers, pp_size)
+    let ranges = pp_indices(recipe.model.num_layers, pp_size);
+    let sections = StageSections::build(&name, &resolved.stage, bridge)?;
+    let stages = ranges
         .into_iter()
         .enumerate()
         .map(|(index, layers)| {
             Glm52VllmNvfp4PpStageModel::build(
                 &name,
                 &resolved.stage,
+                &sections,
                 index as u16,
                 pp_size,
                 layers,
-                bridge,
             )
             .map(Arc::new)
         })
@@ -262,50 +264,41 @@ struct OutputHead {
     lm_head: Op<SingleGemmKernel>,
 }
 
-/// One pipeline stage: one GPU and its contiguous layer range.
-///
-/// Each section exists only when the stage runs it, so a stage mints no slot
-/// for work it never does.
-pub struct Glm52VllmNvfp4PpStageModel {
-    name: String,
-    stage_index: u16,
-    num_stages: u16,
-    layer_range: (u32, u32),
-    counts: StageLayerCounts,
-    embedding: Option<Op<ElementwiseKernel>>,
-    dense: Option<DenseLayer>,
-    initial_shared: Option<Glm52SparseBody>,
-    cycle_full: Option<Glm52SparseBody>,
-    cycle_shared: Option<Glm52SparseBody>,
-    head: Option<OutputHead>,
-    max_model_len: u32,
-    kv_bytes_per_token: u64,
-    cost_flat: Vec<FlatCostNode>,
-    n_slots: usize,
+/// Every section of the graph, built once and shared by the stages that run
+/// it. A section's kernels do not depend on which stage runs it, so building
+/// them per stage only repeated the same profile lookups `pp_size` times.
+struct StageSections {
+    embedding: Arc<Op<ElementwiseKernel>>,
+    dense: Arc<DenseLayer>,
+    initial_shared: Arc<Glm52SparseBody>,
+    cycle_full: Arc<Glm52SparseBody>,
+    cycle_shared: Arc<Glm52SparseBody>,
+    head: Arc<OutputHead>,
 }
 
-impl Glm52VllmNvfp4PpStageModel {
+impl StageSections {
     fn build(
         name: &str,
         resolved: &Glm52VllmNvfp4DsaMoeResolved,
-        stage_index: u16,
-        num_stages: u16,
-        layer_range: (u32, u32),
         bridge: &PerfApiBridge,
     ) -> Result<Self, BuildError> {
-        let counts = StageLayerCounts::of(layer_range);
-        let embedding = if stage_index == 0 {
-            Some(build_atomic(
+        let sparse = |section: &str, attention: &_| {
+            Glm52SparseBody::build_rank_local(
+                format!("{name}.body.{section}"),
+                Clone::clone(attention),
+                resolved,
+                bridge,
+            )
+            .map(Arc::new)
+        };
+        Ok(Self {
+            embedding: Arc::new(build_atomic(
                 format!("{name}.main.embedding"),
                 resolved.embedding.clone(),
                 ElementwiseKernel::build,
                 bridge,
-            )?)
-        } else {
-            None
-        };
-        let dense = if counts.dense > 0 {
-            Some(DenseLayer {
+            )?),
+            dense: Arc::new(DenseLayer {
                 attention: VllmGlm52DsaAttnLocalWorklet::build(
                     format!("{name}.body.dense_full_index.attention"),
                     resolved.dense_full_index_attention.clone(),
@@ -316,39 +309,14 @@ impl Glm52VllmNvfp4PpStageModel {
                     resolved.dense_ffn.clone(),
                     bridge,
                 )?,
-            })
-        } else {
-            None
-        };
-        let sparse = |count: u32, section: &str, attention: &_| {
-            if count == 0 {
-                return Ok(None);
-            }
-            Glm52SparseBody::build_rank_local(
-                format!("{name}.body.{section}"),
-                Clone::clone(attention),
-                resolved,
-                bridge,
-            )
-            .map(Some)
-        };
-        let initial_shared = sparse(
-            counts.initial_shared,
-            "sparse_initial_index_share",
-            &resolved.initial_shared_attention,
-        )?;
-        let cycle_full = sparse(
-            counts.cycle_full,
-            "sparse_cycle_full_index",
-            &resolved.cycle_full_attention,
-        )?;
-        let cycle_shared = sparse(
-            counts.cycle_shared,
-            "sparse_cycle_index_share",
-            &resolved.cycle_shared_attention,
-        )?;
-        let head = if stage_index + 1 == num_stages {
-            Some(OutputHead {
+            }),
+            initial_shared: sparse(
+                "sparse_initial_index_share",
+                &resolved.initial_shared_attention,
+            )?,
+            cycle_full: sparse("sparse_cycle_full_index", &resolved.cycle_full_attention)?,
+            cycle_shared: sparse("sparse_cycle_index_share", &resolved.cycle_shared_attention)?,
+            head: Arc::new(OutputHead {
                 final_norm: build_atomic(
                     format!("{name}.main.final_residual_rms_norm"),
                     resolved.final_norm.clone(),
@@ -361,10 +329,51 @@ impl Glm52VllmNvfp4PpStageModel {
                     SingleGemmKernel::build,
                     bridge,
                 )?,
-            })
-        } else {
-            None
-        };
+            }),
+        })
+    }
+}
+
+/// One pipeline stage: one GPU and its contiguous layer range.
+///
+/// Each section exists only when the stage runs it, so a stage mints no slot
+/// for work it never does.
+pub struct Glm52VllmNvfp4PpStageModel {
+    name: String,
+    stage_index: u16,
+    num_stages: u16,
+    layer_range: (u32, u32),
+    counts: StageLayerCounts,
+    embedding: Option<Arc<Op<ElementwiseKernel>>>,
+    dense: Option<Arc<DenseLayer>>,
+    initial_shared: Option<Arc<Glm52SparseBody>>,
+    cycle_full: Option<Arc<Glm52SparseBody>>,
+    cycle_shared: Option<Arc<Glm52SparseBody>>,
+    head: Option<Arc<OutputHead>>,
+    max_model_len: u32,
+    kv_bytes_per_token: u64,
+    cost_flat: Vec<FlatCostNode>,
+    n_slots: usize,
+}
+
+impl Glm52VllmNvfp4PpStageModel {
+    fn build(
+        name: &str,
+        resolved: &Glm52VllmNvfp4DsaMoeResolved,
+        sections: &StageSections,
+        stage_index: u16,
+        num_stages: u16,
+        layer_range: (u32, u32),
+    ) -> Result<Self, BuildError> {
+        let counts = StageLayerCounts::of(layer_range);
+        let pick =
+            |count: u32, section: &Arc<Glm52SparseBody>| (count > 0).then(|| Arc::clone(section));
+        let embedding = (stage_index == 0).then(|| Arc::clone(&sections.embedding));
+        let dense = (counts.dense > 0).then(|| Arc::clone(&sections.dense));
+        let initial_shared = pick(counts.initial_shared, &sections.initial_shared);
+        let cycle_full = pick(counts.cycle_full, &sections.cycle_full);
+        let cycle_shared = pick(counts.cycle_shared, &sections.cycle_shared);
+        let head = (stage_index + 1 == num_stages).then(|| Arc::clone(&sections.head));
         // vLLM allocates cache only for the layers a stage owns.
         let kv_bytes_per_token = u64::from(counts.total())
             .checked_mul(decoder_layer_state_bytes_per_token())
