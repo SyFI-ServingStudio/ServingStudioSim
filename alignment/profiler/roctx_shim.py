@@ -588,21 +588,34 @@ def install_vllm_roctx_shim(
     This is the non-fork entry point: register it as a ``vllm.general_plugins``
     callable, or call it once from the server process before serving. When the env
     gate is off it returns ``False`` and patches nothing. Otherwise it monkeypatches
-    ``vllm.v1.worker.gpu_model_runner.GPUModelRunner.execute_model`` so every
-    served forward is bracketed by ``vllm_iteration(N): forward`` and preceded by a
-    ``VibeSimAlignmentIteration`` record carrying the batch's token/KV shape. It
-    also launches a ``vibesim_sentinel`` marker kernel per forward (Option B), so
-    the reader can recover iteration ranges from the reliable ``--kernel-trace``
-    dispatch rows on a stack where roctx marker recording is broken.
+    the V1 GPU model runner's ``execute_model`` so every served forward is bracketed
+    by ``vllm_iteration(N): forward`` and preceded by a ``VibeSimAlignmentIteration``
+    record carrying the batch's token/KV shape. It also launches a
+    ``vibesim_sentinel`` marker kernel per forward (Option B), so the reader can
+    recover iteration ranges from the reliable ``--kernel-trace`` dispatch rows on a
+    stack where roctx marker recording is broken.
+
+    vLLM V1 ships **two** GPU model-runner implementations and picks one per worker
+    process via ``use_v2_model_runner``: the legacy runner at
+    ``vllm.v1.worker.gpu_model_runner.GPUModelRunner`` (V1) and the newer one at
+    ``vllm.v1.worker.gpu.model_runner.GPUModelRunner`` (V2). On the pinned ROCm
+    build (v0.3.1.dev190) V2 is the default for most architectures, and it is V2's
+    ``execute_model`` — not the V1 class's — that vLLM invokes once per forward
+    (empirically: with only the V1 class patched the wrapper fires 0 times while V2
+    fires once per forward). The two classes do not share an inheritance edge, so we
+    wrap ``execute_model`` on every runner class that is importable here. Only the
+    selected class is ever instantiated, so at most one wrapper fires per forward and
+    the shared annotator still sees exactly one forward per model step, with a single
+    monotonic iteration counter regardless of which runner the process chose.
 
     Imports vLLM lazily so this module stays importable (and unit-testable) without
     vLLM or a GPU; raises a clear error only if called in an environment that gates
-    the shim on but cannot provide the runner.
+    the shim on but cannot provide a runner class to patch.
     """
     if not roctx_scopes_enabled(environ):
         return False
 
-    from vllm.v1.worker.gpu_model_runner import GPUModelRunner  # noqa: PLC0415
+    from importlib import import_module  # noqa: PLC0415
 
     _, backend = select_backend(backend_name)
     # Option B: also launch a sentinel marker kernel per forward so iteration
@@ -611,14 +624,40 @@ def install_vllm_roctx_shim(
     # back to a no-op launcher rather than failing the forward.
     _, sentinel = select_sentinel_launcher(sentinel_name)
     annotator = IterationAnnotator(backend, enabled=True, sentinel=sentinel)
-    original_execute_model = GPUModelRunner.execute_model
 
-    def execute_model(self, scheduler_output, *args, **kwargs):  # type: ignore[no-untyped-def]
-        record = _forward_record_from_scheduler_output(scheduler_output)
-        with annotator.forward(record=record):
-            return original_execute_model(self, scheduler_output, *args, **kwargs)
+    def _wrap_execute_model(runner_cls: type) -> None:
+        original_execute_model = runner_cls.execute_model
 
-    GPUModelRunner.execute_model = execute_model  # type: ignore[method-assign]
+        def execute_model(self, scheduler_output, *args, **kwargs):  # type: ignore[no-untyped-def]
+            record = _forward_record_from_scheduler_output(scheduler_output)
+            with annotator.forward(record=record):
+                return original_execute_model(self, scheduler_output, *args, **kwargs)
+
+        runner_cls.execute_model = execute_model  # type: ignore[method-assign]
+
+    # V2 first (the default on this build), then legacy V1; both are independent
+    # classes so patching both is safe and future/back-compatible.
+    patched = False
+    for module_path in (
+        "vllm.v1.worker.gpu.model_runner",
+        "vllm.v1.worker.gpu_model_runner",
+    ):
+        try:
+            module = import_module(module_path)
+        except ImportError:
+            continue
+        runner_cls = getattr(module, "GPUModelRunner", None)
+        if runner_cls is None:
+            continue
+        _wrap_execute_model(runner_cls)
+        patched = True
+
+    if not patched:
+        raise ImportError(
+            "install_vllm_roctx_shim: no vLLM V1 GPU model-runner class found to "
+            "patch (tried vllm.v1.worker.gpu.model_runner and "
+            "vllm.v1.worker.gpu_model_runner)"
+        )
     return True
 
 
