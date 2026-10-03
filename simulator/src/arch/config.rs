@@ -592,6 +592,10 @@ pub enum IterArchSel {
         /// no padding (eager).
         #[serde(default)]
         cudagraph_capture_sizes: Vec<u32>,
+        /// vLLM `VLLM_PP_LAYER_PARTITION`: layers per stage, `pp_size` counts
+        /// summing to 45. Empty: vLLM's default `get_pp_indices` split.
+        #[serde(default)]
+        layer_partition: Vec<u32>,
     },
     /// SGLang's B200 NVFP4 launch graph under pure tensor parallelism. Every
     /// rank owns all experts (EP1) and shards the routed intermediate axis by

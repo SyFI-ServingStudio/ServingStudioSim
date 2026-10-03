@@ -9,7 +9,9 @@
 //! stage's identity lives only in the `Labeled` node that wraps it.
 //!
 //! The layer split follows vLLM's `get_pp_indices`
-//! ([`crate::arch::glm52_vllm_nvfp4_pp_dsa_moe::pp_indices`]). The layer types
+//! ([`crate::arch::glm52_vllm_nvfp4_pp_dsa_moe::pp_indices`]) unless
+//! `layer_partition` gives the per-stage layer counts, as vLLM's
+//! `VLLM_PP_LAYER_PARTITION` does. The layer types
 //! differ per stage: which of the 34 KDA and 11 DSA layers, and whether the
 //! three dense-FFN layers, fall in a stage's range set its cost and its cache.
 //! Stage 0 also runs the token embedding and the mHC expand; the last stage
@@ -78,6 +80,40 @@ pub struct Glm53FlashVllmFp8PpParallel {
     pub gpu_name: String,
     /// vLLM `--cudagraph-capture-sizes`; empty runs eager (no padding).
     pub cudagraph_capture_sizes: Vec<u32>,
+    /// vLLM `VLLM_PP_LAYER_PARTITION`: layers per stage, in stage order.
+    /// Empty: vLLM's default `get_pp_indices` split.
+    pub layer_partition: Vec<u32>,
+}
+
+/// Each stage's `[start, end)` layer range: `layer_partition` when given,
+/// else vLLM's `get_pp_indices`.
+pub fn stage_ranges(
+    num_layers: u32,
+    parallel: &Glm53FlashVllmFp8PpParallel,
+) -> Result<Vec<(u32, u32)>, BuildError> {
+    validate_pp_size(parallel.pp_size, num_layers)?;
+    let partition = &parallel.layer_partition;
+    if partition.is_empty() {
+        return Ok(pp_indices(num_layers, parallel.pp_size));
+    }
+    if partition.len() != usize::from(parallel.pp_size)
+        || partition.contains(&0)
+        || partition.iter().sum::<u32>() != num_layers
+    {
+        return Err(fit_failed(format!(
+            "layer_partition {partition:?} must give {} positive layer counts summing to {num_layers}",
+            parallel.pp_size
+        )));
+    }
+    let mut start = 0;
+    Ok(partition
+        .iter()
+        .map(|&layers| {
+            let range = (start, start + layers);
+            start += layers;
+            range
+        })
+        .collect())
 }
 
 /// The pipeline's layout plus the TP1 recipe every stage builds from.
@@ -101,8 +137,7 @@ pub fn build_configs(
     parallel: &Glm53FlashVllmFp8PpParallel,
     demand: &ExpertDemand,
 ) -> Result<Glm53FlashVllmFp8PpConfigs, BuildError> {
-    validate_pp_size(parallel.pp_size, model.num_layers)?;
-    kda_group_count(model, parallel.pp_size)?;
+    kda_group_count(model, &stage_ranges(model.num_layers, parallel)?)?;
     if parallel.max_model_len == 0 {
         return Err(fit_failed("max_model_len must be positive"));
     }
@@ -142,13 +177,14 @@ fn validate_pp_size(pp_size: u16, num_layers: u32) -> Result<(), BuildError> {
 /// KDA group stores one layer per stage inside one of that stage's DSA tensors,
 /// so every stage needs `G >= ceil(kda / dsa)`, and a stage with KDA layers but
 /// no DSA layer has nowhere to put them.
-pub fn kda_group_count(model: &Glm53FlashModelCfg, pp_size: u16) -> Result<u32, BuildError> {
+pub fn kda_group_count(
+    model: &Glm53FlashModelCfg,
+    stage_ranges: &[(u32, u32)],
+) -> Result<u32, BuildError> {
+    let pp_size = stage_ranges.len();
     let whole = StageLayerCounts::of(model, (0, model.num_layers));
     let mut groups = whole.kda.div_ceil(whole.dsa.max(1));
-    for (stage, range) in pp_indices(model.num_layers, pp_size)
-        .into_iter()
-        .enumerate()
-    {
+    for (stage, &range) in stage_ranges.iter().enumerate() {
         let counts = StageLayerCounts::of(model, range);
         if counts.kda == 0 {
             continue;
@@ -172,7 +208,7 @@ pub fn build(
     bridge: &PerfApiBridge,
 ) -> Result<Glm53FlashVllmFp8PpModel, BuildError> {
     let recipe = &resolved.stage.raw_cfg;
-    validate_pp_size(resolved.parallel.pp_size, recipe.model.num_layers)?;
+    let ranges = stage_ranges(recipe.model.num_layers, &resolved.parallel)?;
     if recipe.parallel.tp_size != 1 || recipe.routed.len() != 1 {
         return Err(fit_failed(format!(
             "every pipeline stage runs at TP1 / EP1 on one GPU, got tp_size {} and {} routed ranks",
@@ -181,13 +217,13 @@ pub fn build(
         )));
     }
     let pp_size = resolved.parallel.pp_size;
-    let kda_groups = kda_group_count(&recipe.model, pp_size)?;
+    let kda_groups = kda_group_count(&recipe.model, &ranges)?;
     let block_tokens = hybrid_block_tokens(
         kda_layer_state_bytes_per_request(&resolved.stage),
         u64::from(recipe.model.kv_lora_rank),
     );
     let sections = StageSections::build(&name, &resolved.stage, bridge)?;
-    let stages = pp_indices(recipe.model.num_layers, pp_size)
+    let stages = ranges
         .into_iter()
         .enumerate()
         .map(|(index, layers)| {
@@ -791,6 +827,7 @@ mod tests {
             max_model_len: 131_072,
             gpu_name: "NVIDIA B200".to_string(),
             cudagraph_capture_sizes: Vec::new(),
+            layer_partition: Vec::new(),
         }
     }
 
@@ -945,7 +982,7 @@ mod tests {
         let model = model_cfg();
         let groups: Vec<_> = [2_u16, 3, 4, 5, 8, 9, 11]
             .into_iter()
-            .map(|pp_size| kda_group_count(&model, pp_size).unwrap())
+            .map(|pp_size| kda_group_count(&model, &pp_indices(45, pp_size)).unwrap())
             .collect();
         assert_eq!(groups, [4, 4, 5, 4, 5, 4, 4]);
         let pp4 = built(4);
@@ -957,6 +994,28 @@ mod tests {
             assert_eq!(stage.recurrent_checkpoint_interval_tokens(), 8_576);
         }
         assert_eq!(built(8).pipeline_kv_bytes_per_token(), 2 * 545);
+    }
+
+    #[test]
+    fn layer_partition_overrides_the_default_split() {
+        let mut balanced = parallel(4);
+        balanced.layer_partition = vec![12, 11, 11, 11];
+        assert_eq!(
+            stage_ranges(45, &balanced).unwrap(),
+            [(0, 12), (12, 23), (23, 34), (34, 45)]
+        );
+        assert_eq!(stage_ranges(45, &parallel(4)).unwrap(), pp_indices(45, 4));
+        for bad in [vec![12, 11, 11], vec![12, 11, 11, 12], vec![0, 15, 15, 15]] {
+            let mut wrong = parallel(4);
+            wrong.layer_partition = bad;
+            let error = stage_ranges(45, &wrong).unwrap_err();
+            assert!(error.to_string().contains("layer_partition"), "{error}");
+        }
+        // A stage of only dense KDA layers has no DSA layer to hold their state.
+        let mut no_dsa = parallel(4);
+        no_dsa.layer_partition = vec![3, 14, 14, 14];
+        let error = build_configs(&model_cfg(), &no_dsa, &uniform()).unwrap_err();
+        assert!(error.to_string().contains("no DSA layer"), "{error}");
     }
 
     #[test]

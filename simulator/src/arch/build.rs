@@ -1307,6 +1307,7 @@ pub fn glm53_flash_vllm_fp8_pp_kda_dsa_moe(
     expert_popularity_file: Option<&str>,
     token_corpus_file: Option<&str>,
     cudagraph_capture_sizes: &[u32],
+    layer_partition: &[u32],
     gpu: &str,
     name: &str,
     bridge: &PerfApiBridge,
@@ -1324,6 +1325,7 @@ pub fn glm53_flash_vllm_fp8_pp_kda_dsa_moe(
         max_model_len,
         gpu_name: gpu.to_string(),
         cudagraph_capture_sizes: cudagraph_capture_sizes.to_vec(),
+        layer_partition: layer_partition.to_vec(),
     };
     let configs =
         glm53_flash_vllm_fp8_pp_kda_dsa_moe::build_configs(&model_cfg, &parallel, &demand)
@@ -1866,6 +1868,7 @@ pub fn build_iter_model(
             expert_popularity_file,
             token_corpus_file,
             cudagraph_capture_sizes,
+            layer_partition,
         } => Box::new(glm53_flash_vllm_fp8_pp_kda_dsa_moe(
             model,
             *pp_size,
@@ -1875,6 +1878,7 @@ pub fn build_iter_model(
             expert_popularity_file.as_deref(),
             token_corpus_file.as_deref(),
             cudagraph_capture_sizes,
+            layer_partition,
             gpu,
             name,
             bridge,

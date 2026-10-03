@@ -134,6 +134,7 @@ impl Deployment for PpDeployment {
                 expert_popularity_file,
                 token_corpus_file,
                 cudagraph_capture_sizes,
+                layer_partition,
                 ..
             } => {
                 let pipeline = arch_build::glm53_flash_vllm_fp8_pp_kda_dsa_moe(
@@ -145,6 +146,7 @@ impl Deployment for PpDeployment {
                     expert_popularity_file.as_deref(),
                     token_corpus_file.as_deref(),
                     cudagraph_capture_sizes,
+                    layer_partition,
                     &gpu_name,
                     MODEL_NAME,
                     bridge,
