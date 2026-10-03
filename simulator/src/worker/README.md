@@ -118,9 +118,11 @@ token gate belong to admission (`admission/placement.rs` and
 `admission/token_budget.rs`); there is no mixed `admission_helpers` module or
 one-variant capacity-policy seam.
 
-`SessionInput` remains one closed immutable request declaration: either
-`Standalone`, or a session id plus its first trace arrival and declared reusable
-prefix. Admission asks
+`SessionInput` remains one closed immutable request declaration: `Standalone`;
+`PinnedPrefix`, a standalone request whose trace declares its prefix resident on
+arrival (resolved by every prefix-capable KV as a full hit on any partition,
+reserved and released with the request, never retained or evicted); or a
+session id plus its first trace arrival and declared reusable prefix. Admission asks
 `PrefixKv` to locate the best retained match before fallback placement, resolve
 that partition's hit, gate the actual compute
 `fresh + declared - resident`, and reserve the post-prefill context

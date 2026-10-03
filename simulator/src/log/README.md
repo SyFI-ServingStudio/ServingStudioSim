@@ -93,6 +93,9 @@ the immutable new suffix, while `prefill_processed` records work actually done.
 Once a request has produced its first output token, conservation therefore has
 the exact request-level invariant
 `prefix_cache_hit_tokens + prefill_processed = fresh_prompt_tokens + declared_prefix_tokens`.
+A pinned prefix (the independent format's `prefix_len` column) is declared and
+always hit: `declared_prefix_tokens = prefix_cache_hit_tokens = prefix_len`. It
+writes no `prefix_cache_event` row because it never enters the shared cache.
 
 The nullable `declared_ttft_slo_ms`, `declared_tpot_slo_ms`, and
 `declared_e2e_slo_ms` columns preserve the trace's per-request obligations.

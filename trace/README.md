@@ -7,7 +7,37 @@ independent-request CSV schema:
 id,input_len,output_len,arrival_time
 ```
 
-`arrival_time` is measured in milliseconds. Generate a deterministic fixed-shape
+`arrival_time` is measured in milliseconds.
+
+### Optional `prefix_len`: a pinned prefix hit
+
+ServingStudio Sim also accepts one optional column, `prefix_len`, in any position:
+
+```text
+id,input_len,output_len,arrival_time,prefix_len
+r0,4096,1,0,32768
+r1,4096,1,0,0
+```
+
+`prefix_len` is the number of tokens before this request's prompt that are
+already resident in the prefix cache when it arrives. `input_len` stays the
+fresh tokens to compute, as in the session schema's `prefix_len,input_len`
+pair, so the request's context after prefill is `prefix_len + input_len`.
+
+The hit is forced. It does not depend on cache state, eviction, the prefix
+cache mode, sessions, or which worker or partition the request lands on. The
+prefix KV is reserved with the request (it counts toward capacity), is released
+when the request completes, and is never retained as a shared cache entry.
+`request_slo` records `declared_prefix_tokens = prefix_cache_hit_tokens =
+prefix_len` and `prefill_processed = input_len`. A missing column, a blank cell,
+or `0` loads exactly as the four-column file does. A row that also declares a
+`session_id` through the `session` tag must use `prefix_kv` instead.
+
+req-frontend does not declare `prefix_len` yet: its replay client rejects a file
+that carries the column (`header does not match ... unexpected: ["prefix_len"]`).
+Keep pinned-prefix traces to the simulator until the client models the hit.
+
+Generate a deterministic fixed-shape
 capacity workload with:
 
 ```bash

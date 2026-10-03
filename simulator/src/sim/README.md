@@ -53,7 +53,10 @@ For the layer overview see `doc/detailed_design/L7.md`.
 
   The drain loop lives here so a caller can't under-drain by polling once per
   tick. The text schema remains the four legacy columns and is declared as
-  `input_file_format: text-generation-independent`. `RequestStore::reserve_slots` creates empty
+  `input_file_format: text-generation-independent`. An optional `prefix_len`
+  column pins a resident prefix (`SessionInput::PinnedPrefix`); req-frontend
+  does not declare it yet, so `frontend/pinned_prefix.rs` reads that format
+  itself when the column is present and defers to req-frontend otherwise. `RequestStore::reserve_slots` creates empty
   `Option` slots; requests are inserted only when the scheduler releases them.
   Compact arrived/admitted id indexes keep lifecycle scans proportional to the
   relevant live set rather than the full reserved trace.
