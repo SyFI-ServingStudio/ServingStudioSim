@@ -249,6 +249,12 @@ def profile_vllm_mla_rope_vllm_inductor(
         is_neox_style=is_neox_style,
         torch_dtype=torch_dtype,
     )
+    # Every spec compiles the same block code object. Without a reset, dynamo
+    # counts each earlier spec in this worker toward its recompile limit (8) and
+    # past it stops specialising, so a row's time depended on how many shapes
+    # the worker profiled before it (2-5.5x on B200). Reset so every row is
+    # measured on its own shape-specialised kernel.
+    torch._dynamo.reset()
     compiled_block = torch.compile(_build_block(torch, rotary_emb, qk_nope_head_dim), dynamic=False)
     operands = _allocate_operands(
         torch,
