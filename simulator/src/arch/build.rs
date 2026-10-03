@@ -1110,6 +1110,7 @@ pub fn glm52_vllm_nvfp4_dp_attn_dsa_moe(
     routing_seed: Option<u64>,
     expert_popularity_file: Option<&str>,
     token_corpus_file: Option<&str>,
+    cudagraph_capture_sizes: &[u32],
     gpu: &str,
     name: &str,
     bridge: &PerfApiBridge,
@@ -1131,6 +1132,12 @@ pub fn glm52_vllm_nvfp4_dp_attn_dsa_moe(
         nvl_num_gpu,
         max_model_len,
         gpu_name: gpu.to_string(),
+        cudagraph_capture_sizes: {
+            let mut sizes = cudagraph_capture_sizes.to_vec();
+            sizes.sort_unstable();
+            sizes.dedup();
+            sizes
+        },
     };
     let configs = glm52_vllm_nvfp4_dp_attn_dsa_moe::build_configs(
         &model_cfg,
@@ -1786,6 +1793,7 @@ pub fn build_iter_model(
             routing_seed,
             expert_popularity_file,
             token_corpus_file,
+            cudagraph_capture_sizes,
         } => Box::new(glm52_vllm_nvfp4_dp_attn_dsa_moe(
             model,
             *ep_size,
@@ -1795,6 +1803,7 @@ pub fn build_iter_model(
             *routing_seed,
             expert_popularity_file.as_deref(),
             token_corpus_file.as_deref(),
+            cudagraph_capture_sizes,
             gpu,
             name,
             bridge,

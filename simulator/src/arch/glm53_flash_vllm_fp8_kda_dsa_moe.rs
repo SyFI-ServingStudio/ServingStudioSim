@@ -1120,7 +1120,7 @@ impl IterwiseUnifiedModel for Glm53FlashVllmModel {
 
 /// The row count vLLM runs a CUDA-graph replay on: the smallest captured size
 /// that holds `tokens`, or `tokens` itself above the largest (eager).
-fn graph_padded_tokens(sorted_sizes: &[u32], tokens: u32) -> u32 {
+pub(crate) fn graph_padded_tokens(sorted_sizes: &[u32], tokens: u32) -> u32 {
     match sorted_sizes.binary_search(&tokens) {
         Ok(_) => tokens,
         Err(index) => sorted_sizes.get(index).copied().unwrap_or(tokens),

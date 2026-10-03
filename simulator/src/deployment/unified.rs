@@ -637,6 +637,7 @@ impl Deployment for UnifiedDeployment {
                 routing_seed,
                 expert_popularity_file,
                 token_corpus_file,
+                cudagraph_capture_sizes,
                 ..
             } => {
                 ensure_hp_or_chunked_worker("GLM-5.2 NVFP4 DP attention", &g.worker)?;
@@ -649,6 +650,7 @@ impl Deployment for UnifiedDeployment {
                     *routing_seed,
                     expert_popularity_file.as_deref(),
                     token_corpus_file.as_deref(),
+                    cudagraph_capture_sizes,
                     &gpu_name,
                     MODEL_NAME,
                     bridge,

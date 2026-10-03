@@ -36,11 +36,17 @@
 //! output head are `Max` over ranks per section, which is exact when the
 //! ranks carry similar batches and an upper bound otherwise.
 //!
-//! In eager prefill steps vLLM does not pad the DP ranks to a common size, so
-//! the collectives see the real per-rank counts. A rank with nothing scheduled
-//! runs a one-token dummy batch to join the collectives; its compute is billed
-//! as zero (it hides under the busy ranks' `Max`) and its dummy token rides the
-//! gather, the routed experts and the scatter.
+//! A rank with nothing scheduled runs vLLM's one-token dummy batch to join the
+//! collectives. The ranks then agree on a step size
+//! (`vllm/v1/worker/dp_utils.py` `_synchronize_dp_ranks`): when the busiest
+//! rank's count fits a captured CUDA graph, every rank, the dummy ones
+//! included, pads to that graph's size, so the gather carries `ep_size` times
+//! the padded count; when it does not, the step runs eager and the
+//! collectives see the real per-rank counts, with one token from each idle
+//! rank. Under padding every kernel outside the attention graph break runs on
+//! the padded rows; attention and the lm_head (on the sampled rows only) keep
+//! the real counts. With no capture sizes every step is eager, and an idle
+//! rank's compute is billed as zero (it hides under the busy ranks' `Max`).
 
 use std::sync::Arc;
 
@@ -52,6 +58,7 @@ use crate::arch::glm52_vllm_nvfp4_dsa_moe::{
     NormalizedGroup, CHECKPOINT_MAX_CONTEXT, NUM_DENSE_LAYERS, NUM_INITIAL_SHARED_LAYERS,
 };
 use crate::arch::glm52_vllm_nvfp4_pp_dsa_moe::eval_compiled;
+use crate::arch::glm53_flash_vllm_fp8_kda_dsa_moe::graph_padded_tokens;
 use crate::op::Op;
 use crate::timing::bridge::DType;
 use crate::timing::expert_demand::ExpertDemand;
@@ -101,6 +108,9 @@ pub struct Glm52VllmNvfp4DpAttnParallel {
     pub nvl_num_gpu: u16,
     pub max_model_len: u32,
     pub gpu_name: String,
+    /// vLLM's CUDA-graph capture sizes, ascending and deduplicated. Empty:
+    /// every step runs eager.
+    pub cudagraph_capture_sizes: Vec<u32>,
 }
 
 /// The EP1 recipe every GPU's non-expert work builds from, plus the expert
@@ -154,6 +164,12 @@ pub fn build_configs(
         return Err(fit_failed(format!(
             "max_model_len {} must be in 1..={CHECKPOINT_MAX_CONTEXT}",
             parallel.max_model_len
+        )));
+    }
+    let sizes = &parallel.cudagraph_capture_sizes;
+    if sizes.first() == Some(&0) || sizes.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(fit_failed(format!(
+            "cudagraph_capture_sizes {sizes:?} must be positive, ascending and distinct"
         )));
     }
     let mut local = ep_graph::build_configs(
@@ -370,38 +386,30 @@ impl DpSparseLayer {
     }
 
     fn eval(&self, batch: &DpBatch, ev: &mut Evaluator) {
-        for group in &batch.groups {
+        for (group, &rows) in batch.groups.iter().zip(&batch.rows) {
             self.attention.eval(&group.attention_input, ev);
             // No all-reduce owns the post-attention residual RMSNorm at TP1.
             self.router.eval_with_post_attn_norm(
-                &Glm52MoeRouterLocalWorkletInput {
-                    batch_tokens: group.batch_tokens,
-                },
+                &Glm52MoeRouterLocalWorkletInput { batch_tokens: rows },
                 true,
                 ev,
             );
             self.shared_expert.eval_or_zero(
-                &Glm52SharedExpertLocalWorkletInput {
-                    batch_tokens: group.batch_tokens,
-                },
-                shares_aux_stream(group.batch_tokens),
+                &Glm52SharedExpertLocalWorkletInput { batch_tokens: rows },
+                shares_aux_stream(rows),
                 ev,
             );
             eval_atomic_or_zero(
                 &self.input_quant,
-                Nvfp4QuantKernelInput {
-                    num_tokens: group.batch_tokens,
-                },
-                group.batch_tokens == 0,
+                Nvfp4QuantKernelInput { num_tokens: rows },
+                rows == 0,
                 ev,
             );
         }
-        for group in &batch.groups {
+        for &rows in &batch.rows {
             self.shared_expert.eval_or_zero(
-                &Glm52SharedExpertLocalWorkletInput {
-                    batch_tokens: group.batch_tokens,
-                },
-                !shares_aux_stream(group.batch_tokens),
+                &Glm52SharedExpertLocalWorkletInput { batch_tokens: rows },
+                !shares_aux_stream(rows),
                 ev,
             );
         }
@@ -454,18 +462,36 @@ fn labeled_max(label: String, children: Vec<CostNode>) -> CostNode {
 /// exchange sees of them.
 struct DpBatch {
     groups: Vec<NormalizedGroup>,
+    /// Rows each rank's kernels outside attention run on: the shared CUDA
+    /// graph size when the step replays graphs, else the rank's own batch
+    /// (zero on an idle rank, whose dummy compute is not billed).
+    rows: Vec<u32>,
     /// Tokens each rank contributes to the gather and receives from the
-    /// scatter: its batch, or vLLM's one-token dummy batch when it has none.
+    /// scatter: the shared graph size when padded, else its batch, or vLLM's
+    /// one-token dummy batch when it has none.
     collective_tokens: Vec<u32>,
     /// Every token the routed experts see on each rank; zero only when no
     /// rank has work.
     gathered_tokens: u32,
 }
 
+/// vLLM's DP step agreement (`vllm/v1/worker/dp_utils.py`
+/// `_synchronize_dp_ranks`): each rank, an idle one with its one-token dummy
+/// batch, dispatches a CUDA graph only if its count fits the largest captured
+/// size; the ranks keep the minimum mode, and pad to the largest padded count
+/// unless that minimum is eager. Padding is monotone, so the shared size is
+/// the busiest rank's graph. `None`: the step runs eager and ragged.
+fn dp_graph_rows(sorted_capture_sizes: &[u32], collective_tokens: &[u32]) -> Option<u32> {
+    let busiest = collective_tokens.iter().copied().max()?;
+    let largest = sorted_capture_sizes.last().copied()?;
+    (busiest > 0 && busiest <= largest).then(|| graph_padded_tokens(sorted_capture_sizes, busiest))
+}
+
 fn normalize_input(
     input: &UnifiedArchInput,
     ep_size: u16,
     max_model_len: u32,
+    sorted_capture_sizes: &[u32],
 ) -> Result<DpBatch, String> {
     let ranks = usize::from(ep_size);
     if input.groups.len() != ranks {
@@ -490,7 +516,7 @@ fn normalize_input(
         }
     }
     let any_work = groups.iter().any(|group| group.batch_tokens > 0);
-    let collective_tokens: Vec<u32> = groups
+    let mut collective_tokens: Vec<u32> = groups
         .iter()
         .map(|group| match (any_work, group.batch_tokens) {
             (false, _) => 0,
@@ -498,12 +524,20 @@ fn normalize_input(
             (true, tokens) => tokens,
         })
         .collect();
+    let rows = match dp_graph_rows(sorted_capture_sizes, &collective_tokens) {
+        Some(padded) => {
+            collective_tokens.fill(padded);
+            vec![padded; ranks]
+        }
+        None => groups.iter().map(|group| group.batch_tokens).collect(),
+    };
     let gathered_tokens = collective_tokens
         .iter()
         .try_fold(0_u32, |sum, &tokens| sum.checked_add(tokens))
         .ok_or_else(|| "gathered token sum overflows u32".to_string())?;
     Ok(DpBatch {
         groups,
+        rows,
         collective_tokens,
         gathered_tokens,
     })
@@ -524,6 +558,7 @@ pub struct Glm52VllmNvfp4DpAttnDsaMoeModel {
     /// Full vocabulary: a TP1 `ParallelLMHead` shards nothing.
     lm_head: Op<SingleGemmKernel>,
     kv_bytes_per_token: u64,
+    cudagraph_capture_sizes: Vec<u32>,
     cost_flat: Vec<FlatCostNode>,
     n_slots: usize,
 }
@@ -606,6 +641,7 @@ pub fn build(
         name,
         ep_size,
         max_model_len: recipe.parallel.max_model_len,
+        cudagraph_capture_sizes: resolved.parallel.cudagraph_capture_sizes.clone(),
         cost_flat: Vec::new(),
         n_slots: 0,
     };
@@ -698,28 +734,28 @@ impl Glm52VllmNvfp4DpAttnDsaMoeModel {
     }
 
     fn normalize(&self, input: &UnifiedArchInput) -> DpBatch {
-        normalize_input(input, self.ep_size, self.max_model_len).unwrap_or_else(|reason| {
-            panic!("invalid Glm52VllmNvfp4DpAttnDsaMoeModel input: {reason}")
-        })
+        normalize_input(
+            input,
+            self.ep_size,
+            self.max_model_len,
+            &self.cudagraph_capture_sizes,
+        )
+        .unwrap_or_else(|reason| panic!("invalid Glm52VllmNvfp4DpAttnDsaMoeModel input: {reason}"))
     }
 
     fn eval_normalized(&self, batch: &DpBatch, ev: &mut Evaluator) {
-        for group in &batch.groups {
+        for &rows in &batch.rows {
             eval_atomic_or_zero(
                 &self.embedding,
-                ElementwiseKernelInput {
-                    num_tokens: group.batch_tokens,
-                },
-                group.batch_tokens == 0,
+                ElementwiseKernelInput { num_tokens: rows },
+                rows == 0,
                 ev,
             );
         }
-        for group in &batch.groups {
+        for (group, &rows) in batch.groups.iter().zip(&batch.rows) {
             self.dense_attention.eval(&group.attention_input, ev);
             self.dense_ffn.eval_with_post_attn_norm(
-                &Glm52DenseFfnLocalWorkletInput {
-                    batch_tokens: group.batch_tokens,
-                },
+                &Glm52DenseFfnLocalWorkletInput { batch_tokens: rows },
                 true,
                 ev,
             );
@@ -727,15 +763,14 @@ impl Glm52VllmNvfp4DpAttnDsaMoeModel {
         self.initial_shared.eval(batch, ev);
         self.cycle_full.eval(batch, ev);
         self.cycle_shared.eval(batch, ev);
-        for group in &batch.groups {
+        for (group, &rows) in batch.groups.iter().zip(&batch.rows) {
             eval_atomic_or_zero(
                 &self.final_norm,
-                ResidualRmsNormKernelInput {
-                    m: group.batch_tokens,
-                },
-                group.batch_tokens == 0,
+                ResidualRmsNormKernelInput { m: rows },
+                rows == 0,
                 ev,
             );
+            // vLLM computes logits outside the graph, on the sampled rows.
             eval_atomic_or_zero(
                 &self.lm_head,
                 SingleGemmKernelInput {
@@ -750,7 +785,13 @@ impl Glm52VllmNvfp4DpAttnDsaMoeModel {
 
 impl IterwiseUnifiedModel for Glm52VllmNvfp4DpAttnDsaMoeModel {
     fn check_input(&self, batch: &UnifiedArchInput) -> Result<(), String> {
-        normalize_input(batch, self.ep_size, self.max_model_len).map(|_| ())
+        normalize_input(
+            batch,
+            self.ep_size,
+            self.max_model_len,
+            &self.cudagraph_capture_sizes,
+        )
+        .map(|_| ())
     }
 
     /// One token's cache, which one rank holds whole: 78 layers of MLA latent
@@ -863,7 +904,19 @@ mod tests {
             nvl_num_gpu: ep_size,
             max_model_len: 131_072,
             gpu_name: "NVIDIA B200".to_string(),
+            cudagraph_capture_sizes: Vec::new(),
         }
+    }
+
+    /// vLLM's default capture grid up to `max`
+    /// (`vllm/config/vllm.py` `_set_cudagraph_sizes`).
+    fn vllm_capture_sizes(max: u32) -> Vec<u32> {
+        [1, 2, 4]
+            .into_iter()
+            .chain((8..256.min(max + 1)).step_by(8))
+            .chain((256..=max).step_by(16))
+            .filter(|&size| size <= max)
+            .collect()
     }
 
     // Structure-only tests: the routing law does not change the graph.
@@ -1063,14 +1116,76 @@ mod tests {
             ]),
             4,
             131_072,
+            &[],
         )
         .unwrap();
         assert_eq!(busy.collective_tokens, vec![4_096, 1, 2_050, 1]);
+        assert_eq!(busy.rows, vec![4_096, 0, 2_050, 0]);
         assert_eq!(busy.gathered_tokens, 6_148);
         assert_eq!(busy.groups[2].batch_tokens, 2_050);
 
-        let idle = normalize_input(&input(vec![group(&[], &[]); 4]), 4, 131_072).unwrap();
+        let idle = normalize_input(&input(vec![group(&[], &[]); 4]), 4, 131_072, &[]).unwrap();
         assert_eq!(idle.collective_tokens, vec![0; 4]);
+        assert_eq!(idle.gathered_tokens, 0);
+    }
+
+    #[test]
+    fn graph_steps_pad_every_rank_to_the_busiest_ranks_graph() {
+        let sizes = vllm_capture_sizes(2_048);
+        assert_eq!(sizes.len(), 147);
+        assert_eq!(sizes[..5], [1, 2, 4, 8, 16]);
+        assert_eq!(sizes.last(), Some(&2_048));
+        let step = |groups: Vec<ArchGroupInput>| {
+            normalize_input(&input(groups), 4, 131_072, &sizes).unwrap()
+        };
+
+        // One 1000-token prompt: the busy rank's graph is 1008, and the three
+        // idle ranks' dummy batches pad to it too.
+        let one = step(vec![
+            group(&[(0, 1_000)], &[]),
+            group(&[], &[]),
+            group(&[], &[]),
+            group(&[], &[]),
+        ]);
+        assert_eq!(one.rows, vec![1_008; 4]);
+        assert_eq!(one.collective_tokens, vec![1_008; 4]);
+        assert_eq!(one.gathered_tokens, 4_032);
+        assert_eq!(one.groups[0].batch_tokens, 1_000);
+        assert_eq!(one.groups[1].batch_tokens, 0);
+
+        // Small decode batches pad to the busiest rank's bucket.
+        let decode = step(vec![
+            group(&[], &[100, 200, 300]),
+            group(&[], &[400]),
+            group(&[], &[]),
+            group(&[], &[50; 9]),
+        ]);
+        assert_eq!(decode.rows, vec![16; 4]);
+        assert_eq!(decode.gathered_tokens, 64);
+
+        // The largest captured size itself still replays a graph.
+        let edge = step(vec![
+            group(&[(0, 2_048)], &[]),
+            group(&[(0, 8)], &[]),
+            group(&[], &[]),
+            group(&[], &[]),
+        ]);
+        assert_eq!(edge.collective_tokens, vec![2_048; 4]);
+
+        // Past the largest graph the busy rank runs eager, so every rank does
+        // and the counts stay ragged.
+        let eager = step(vec![
+            group(&[(0, 2_049)], &[]),
+            group(&[(0, 8)], &[]),
+            group(&[], &[]),
+            group(&[], &[]),
+        ]);
+        assert_eq!(eager.rows, vec![2_049, 8, 0, 0]);
+        assert_eq!(eager.collective_tokens, vec![2_049, 8, 1, 1]);
+        assert_eq!(eager.gathered_tokens, 2_059);
+
+        let idle = step(vec![group(&[], &[]); 4]);
+        assert_eq!(idle.rows, vec![0; 4]);
         assert_eq!(idle.gathered_tokens, 0);
     }
 
@@ -1118,5 +1233,10 @@ mod tests {
         too_long.max_model_len = CHECKPOINT_MAX_CONTEXT + 1;
         assert!(build_configs(&model, &too_long, &demand(), false).is_err());
         assert!(build_configs(&model, &parallel(4), &demand(), true).is_err());
+        for sizes in [vec![0, 8], vec![16, 8], vec![8, 8]] {
+            let mut p = parallel(4);
+            p.cudagraph_capture_sizes = sizes;
+            assert!(build_configs(&model, &p, &demand(), false).is_err());
+        }
     }
 }

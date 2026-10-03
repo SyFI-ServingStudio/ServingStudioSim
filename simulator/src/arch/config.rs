@@ -419,6 +419,12 @@ pub enum IterArchSel {
         #[serde(default)]
         #[param(cache_key)]
         token_corpus_file: Option<String>,
+        /// vLLM's CUDA-graph capture sizes. When the busiest DP rank's tokens
+        /// fit a captured size, every rank pads to that graph and every
+        /// kernel outside the attention graph break runs on the padded rows.
+        /// Empty: every step runs eager, unpadded.
+        #[serde(default)]
+        cudagraph_capture_sizes: Vec<u32>,
     },
     /// [`Self::Glm52VllmNvfp4DsaMoe`]'s kernels under pure pipeline
     /// parallelism. Each of `pp_size` stages is one GPU running a contiguous
