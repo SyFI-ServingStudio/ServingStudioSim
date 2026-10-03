@@ -250,6 +250,7 @@ impl Deployment for UnifiedDeployment {
             // hp_unified recipes would leave the KDA state invisible.
             IterArchSel::Glm53FlashVllmFp8KdaDsaMoe {
                 tp_size,
+                enable_expert_parallel,
                 max_model_len,
                 routing,
                 routing_seed,
@@ -262,6 +263,7 @@ impl Deployment for UnifiedDeployment {
                 let model = Arc::new(arch_build::glm53_flash_vllm_fp8_kda_dsa_moe(
                     model_spec,
                     *tp_size,
+                    *enable_expert_parallel,
                     *max_model_len,
                     *routing,
                     *routing_seed,

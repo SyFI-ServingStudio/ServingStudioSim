@@ -104,6 +104,11 @@ const fn default_glm53_flash_max_model_len() -> u32 {
     8192
 }
 
+/// The captured GLM-5.3-Flash deployment ran `--enable-expert-parallel`.
+const fn default_glm53_flash_enable_expert_parallel() -> bool {
+    true
+}
+
 /// A speculative GLM must actually run its MTP layer, so unlike the ordinary
 /// selector it cannot default to `off`.
 const fn default_glm52_speculative_mtp_mode() -> Glm52MtpMode {
@@ -517,15 +522,24 @@ pub enum IterArchSel {
     },
     /// GLM-5.3-Flash FP8 block checkpoint on B200 through the vLLM fork: 34 KDA
     /// + 11 DSA (kpool indexer) layers, 3 dense + 42 MoE FFNs, 4-wide mHC. One
-    /// TP = EP rank group; MTP is not run.
-    #[supported(gpu = ["NVIDIA B200"], model_config = ["glm53_flash"], fp8 = [true], tp_size = [4], max_model_len = [8192, 65536, 131072, 262144, 524288])]
+    /// tensor-parallel rank group whose routed experts are either expert- or
+    /// tensor-parallel; MTP is not run.
+    #[supported(gpu = ["NVIDIA B200"], model_config = ["glm53_flash"], fp8 = [true], tp_size = [4, 8], enable_expert_parallel = [true, false], max_model_len = [8192, 65536, 131072, 262144, 524288])]
     Glm53FlashVllmFp8KdaDsaMoe {
         #[serde(flatten)]
         model: ModelSpec,
-        /// Shared tensor/expert-parallel rank count.
+        /// Tensor-parallel rank count: attention heads, the dense FFN and the
+        /// shared expert are split over it, and so are the routed experts.
         #[serde(default = "default_glm52_nvfp4_parallel_size")]
         #[param(default = 4, cache_key)]
         tp_size: u16,
+        /// vLLM `--enable-expert-parallel`. On, each rank owns
+        /// `n_routed_experts / tp_size` whole experts (EP = TP). Off, each rank
+        /// owns every expert, sliced to `moe_intermediate_size / tp_size` on
+        /// the intermediate axis (MoE TP).
+        #[serde(default = "default_glm53_flash_enable_expert_parallel")]
+        #[param(default = true, cache_key)]
+        enable_expert_parallel: bool,
         /// Configured context cap: the indexer's logits row stride and the
         /// sparse-index page-table extent.
         #[serde(default = "default_glm53_flash_max_model_len")]

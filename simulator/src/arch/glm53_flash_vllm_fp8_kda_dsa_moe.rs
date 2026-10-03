@@ -1,11 +1,27 @@
 //! GLM-5.3-Flash (`Glm5NextForConditionalGeneration`) FP8 block checkpoint on
 //! B200, aligned to the vLLM fork's TP4 / EP4 deployment (MTP off).
 //!
-//! One rank group: attention and the dense FFN are tensor-parallel (16 local
-//! KDA heads, 16 local MLA heads, the indexer's 32 heads replicated), the
-//! routed experts expert-parallel (72 of 288 per rank). Every sublayer ends in
-//! a plain TP all-reduce (`flashinfer_comm.allreduce_fusion`, kAllReduce,
-//! MNNVL), 91 per iteration: embedding + 45 attention + 3 dense + 42 MoE.
+//! One rank group of `tp_size` ranks: attention, the dense FFN and the shared
+//! expert are tensor-parallel (64 KDA and 64 MLA heads split over the ranks,
+//! the indexer's 32 heads replicated). The routed experts follow vLLM's
+//! `--enable-expert-parallel`: on, each rank owns 288 / tp whole experts (EP4
+//! is the captured deployment); off, every rank owns all 288 experts sliced to
+//! 2048 / tp on the intermediate axis (MoE TP). Every sublayer ends in a plain
+//! TP all-reduce (`flashinfer_comm.allreduce_fusion`, kAllReduce, MNNVL), 91
+//! per iteration: embedding + 45 attention + 3 dense + 42 MoE; the MoE combine
+//! is the same all-reduce in both modes (vLLM `moe_runner.py:504-509` reduces
+//! when `tp_size > 1 or ep_size > 1`).
+//!
+//! MoE TP runs the same callable as EP: vLLM's FP8 oracle tries
+//! FLASHINFER_TRTLLM first on SM100 (`fused_moe/oracle/fp8.py:81-96`), whose
+//! parallel check admits plain TP (`experts/trtllm_fp8_moe.py:186-193`), and
+//! the monolithic `trtllm_fp8_block_scale_moe` call takes
+//! `intermediate_size_per_partition` and `local_num_experts`
+//! (`trtllm_fp8_moe.py:497-501`). Without EP, `FusedMoEParallelConfig.make`
+//! keeps `tp_size` and sets `ep_size = 1` (`fused_moe/config.py:1225-1238`), so
+//! the slice is `2048 // tp` (`config.py:1350`): 512 at TP4, 256 at TP8, both
+//! multiples of the 128x128 weight block, so no block refinement applies
+//! (`oracle/fp8.py:295-298`).
 //!
 //! The 45 layers are hybrid: `linear_attn_config.kda_layers` are Kimi Delta
 //! Attention, the rest (every 4th, 3..43) DeepSeek sparse attention with the
@@ -270,10 +286,13 @@ impl Glm53FlashModelCfg {
     }
 }
 
-/// Deployment layout: one TP = EP rank group.
+/// Deployment layout: one tensor-parallel rank group.
 #[derive(Clone, Debug)]
 pub struct Glm53FlashVllmParallel {
     pub tp_size: u16,
+    /// vLLM `--enable-expert-parallel`: routed experts EP = TP when on, sliced
+    /// on the intermediate axis over the TP ranks when off.
+    pub enable_expert_parallel: bool,
     pub max_model_len: u32,
     pub gpu_name: String,
     /// vLLM `--cudagraph-capture-sizes`; empty runs eager (no padding).
@@ -361,7 +380,8 @@ pub struct Glm53FlashVllmConfigs {
     pub dense_ffn: Glm53Fp8MlpLocalWorkletConfig,
     pub shared_expert: Glm53Fp8MlpLocalWorkletConfig,
     pub router: Glm53MoeRouterLocalWorkletConfig,
-    /// One per EP rank, ranked by routed workload.
+    /// One per EP rank, ranked by routed workload; a single config under MoE
+    /// TP, where every rank runs the same slice of every expert.
     pub routed: Vec<Glm53RoutedMoeLocalWorkletConfig>,
     pub embedding: ElementwiseKernelConfig,
     pub hc_expand: ElementwiseKernelConfig,
@@ -410,11 +430,20 @@ pub fn build_configs(
             "pooled indexer window exceeds the 2176-wide page table",
         ));
     }
+    let (ep_size, routed_intermediate) = if parallel.enable_expert_parallel {
+        divide("n_routed_experts", model.n_routed_experts)?;
+        (parallel.tp_size, model.moe_intermediate_size)
+    } else {
+        (
+            1,
+            divide("moe_intermediate_size", model.moe_intermediate_size)?,
+        )
+    };
     let routed_template = Glm53RoutedMoeLocalWorkletConfig {
         hidden: model.hidden.into(),
-        moe_intermediate: model.moe_intermediate_size.into(),
+        moe_intermediate: routed_intermediate.into(),
         num_experts: model.n_routed_experts.into(),
-        ep_size: parallel.tp_size,
+        ep_size,
         top_k: model.num_experts_per_tok,
         n_group: model.n_group,
         topk_group: model.topk_group,
@@ -427,7 +456,6 @@ pub fn build_configs(
         expert_demand: demand.clone(),
         folded_rank_position: 0,
     };
-    divide("n_routed_experts", model.n_routed_experts)?;
     Ok(Glm53FlashVllmConfigs {
         groups: layer_groups(model),
         kda: Glm53KdaAttnLocalWorkletConfig {
@@ -592,6 +620,7 @@ impl MoeBlock {
     /// batches too large for the aux stream. One of the two pairs is filled
     /// per iteration; INV-1 fixes the shape.
     fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
+        let ep = self.routed.len();
         let router = self.router.compile(builder);
         let input_glue = self.input_glue.compile(builder);
         let ranks = self
@@ -613,10 +642,8 @@ impl MoeBlock {
         let combine_glue = self.combine_glue.compile(builder);
         CostNode::Labeled {
             label: format!(
-                "{} (MoE) [EP{} ranked ranks; shared expert overlaps routed at T<={}]",
-                self.name,
-                self.routed.len(),
-                SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD
+                "{} (MoE) [EP{ep} ranked ranks; shared expert overlaps routed at T<={}]",
+                self.name, SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD
             ),
             child: Box::new(CostNode::Sum(vec![
                 router,
@@ -747,6 +774,7 @@ impl LayerGroup {
 pub struct Glm53FlashVllmModel {
     pub name: String,
     pub tp_size: u16,
+    pub enable_expert_parallel: bool,
     pub max_model_len: u32,
     /// Sorted, deduplicated capture sizes (see `Glm53FlashVllmParallel`).
     cudagraph_capture_sizes: Vec<u32>,
@@ -956,6 +984,7 @@ pub fn build(
             bridge,
         )?,
         tp_size: cfg.parallel.tp_size,
+        enable_expert_parallel: cfg.parallel.enable_expert_parallel,
         max_model_len: cfg.parallel.max_model_len,
         cudagraph_capture_sizes: {
             let mut sizes = cfg.parallel.cudagraph_capture_sizes.clone();
@@ -993,10 +1022,15 @@ impl Glm53FlashVllmModel {
             self.final_norm.compile(&mut builder),
             self.lm_head.compile(&mut builder),
         ]);
+        let layout = if self.enable_expert_parallel {
+            format!("TP=EP{}", self.tp_size)
+        } else {
+            format!("TP{} with MoE TP{}", self.tp_size, self.tp_size)
+        };
         let root = CostNode::Labeled {
             label: format!(
-                "{} (Glm53FlashVllmModel) [TP=EP{}; timing_context<={}]",
-                self.name, self.tp_size, self.max_model_len
+                "{} (Glm53FlashVllmModel) [{layout}; timing_context<={}]",
+                self.name, self.max_model_len
             ),
             child: Box::new(CostNode::Sum(children)),
         };
@@ -1277,6 +1311,7 @@ mod tests {
     fn parallel() -> Glm53FlashVllmParallel {
         Glm53FlashVllmParallel {
             tp_size: 4,
+            enable_expert_parallel: true,
             max_model_len: 8192,
             gpu_name: "NVIDIA B200".into(),
             cudagraph_capture_sizes: Vec::new(),
@@ -1295,11 +1330,74 @@ mod tests {
     }
 
     fn built() -> Glm53FlashVllmModel {
+        built_with(parallel())
+    }
+
+    fn built_with(parallel: Glm53FlashVllmParallel) -> Glm53FlashVllmModel {
         let bridge = PerfApiBridge::new_uninit_for_test();
         bridge.enable_enumerate();
         let demand = ExpertDemand::popularity(&RoutingDistribution::uniform(288), 42);
-        let configs = build_configs(&model_cfg(), &parallel(), &demand).unwrap();
+        let configs = build_configs(&model_cfg(), &parallel, &demand).unwrap();
         build("unified".into(), resolve_configs(&configs), &bridge).unwrap()
+    }
+
+    fn layout(tp_size: u16, enable_expert_parallel: bool) -> Glm53FlashVllmParallel {
+        Glm53FlashVllmParallel {
+            tp_size,
+            enable_expert_parallel,
+            ..parallel()
+        }
+    }
+
+    #[test]
+    fn expert_parallel_splits_whole_experts_and_moe_tp_slices_every_expert() {
+        let demand = ExpertDemand::popularity(&RoutingDistribution::uniform(288), 42);
+        // (tp, EP?) -> (routed configs, local experts, intermediate, heads).
+        for (tp, ep, ranks, local, intermediate, heads) in [
+            (4, true, 4, 72, 2048, 16),
+            (8, true, 8, 36, 2048, 8),
+            (4, false, 1, 288, 512, 16),
+            (8, false, 1, 288, 256, 8),
+        ] {
+            let configs = build_configs(&model_cfg(), &layout(tp, ep), &demand).unwrap();
+            let resolved = resolve_configs(&configs);
+            assert_eq!(resolved.routed.len(), ranks, "tp {tp} ep {ep}");
+            for routed in &resolved.routed {
+                assert_eq!(routed.fused_moe.num_local_experts.get(), local);
+                assert_eq!(routed.fused_moe.intermediate_size.get(), intermediate);
+                assert_eq!(routed.fused_moe.num_experts.get(), 288);
+            }
+            assert_eq!(configs.kda.num_heads.get(), heads);
+            assert_eq!(configs.dsa.num_heads.get(), heads);
+            // The indexer's heads are replicated on every rank.
+            assert_eq!(configs.dsa.index_num_heads.get(), 32);
+            // Dense FFN and shared expert are TP-sliced in both MoE modes.
+            assert_eq!(configs.dense_ffn.intermediate.get(), 12288 / u32::from(tp));
+            assert_eq!(
+                configs.shared_expert.intermediate.get(),
+                2048 / u32::from(tp)
+            );
+            assert_eq!(configs.all_reduce.num_gpus, u32::from(tp));
+        }
+    }
+
+    #[test]
+    fn eight_ranks_keep_whole_model_state_and_grow_the_routed_rank_fan_out() {
+        let ep8 = built_with(layout(8, true));
+        // Every rank keeps the whole MLA latent, so per-token bytes scale with
+        // TP; the KDA heads split, so the per-request state only changes by
+        // its padding to the hybrid block.
+        assert_eq!(ep8.total_kv_bytes_per_token(), 8 * 11 * (512 + 33));
+        // Half the KDA heads per rank: a 1152-token hybrid block (9 x 128).
+        assert_eq!(ep8.recurrent_checkpoint_interval_tokens(), 1152);
+        assert_eq!(ep8.recurrent_state_bytes_per_request(), 8 * 34 * 1152 * 512);
+        assert_eq!((ep8.gpus_per_replica(), ep8.num_attn_shards()), (8, 8));
+        let moe = |ranks: usize| 2 + 2 + ranks * 14;
+        let kda_dense = 4 + 13 + 5;
+        let total = |ranks| 3 + 2 * kda_dense + (4 + 31 + moe(ranks)) + (4 + 13 + moe(ranks)) + 4;
+        assert_eq!(ep8.n_slots, total(8));
+        assert_eq!(built_with(layout(4, false)).n_slots, total(1));
+        assert_eq!(built_with(layout(8, false)).n_slots, total(1));
     }
 
     #[test]
@@ -1368,29 +1466,58 @@ mod tests {
     #[test]
     fn necessary_work_map_covers_the_compiled_locations() {
         use std::collections::BTreeSet;
-        let model = built();
         // Kpool DSA work is per-request in context, so the labeler needs each KV length.
-        assert!(model.logs_decode_kv_lens());
-        let manifest = model.cost_log_manifest();
-        let actual: BTreeSet<_> = manifest
-            .slots
-            .iter()
-            .filter(|slot| slot.kind != "all_reduce_fusion")
-            .map(|slot| slot.name.as_str())
-            .collect();
-        let map: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../model/work/location_maps/glm53_flash_vllm_fp8_kda_dsa_moe_unified.json"
-        ))
-        .unwrap();
-        assert_eq!(map["arch_types"], serde_json::json!([ARCH_KIND]));
-        let mapped: BTreeSet<_> = map["locations"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|row| row["location"].as_str().unwrap())
-            .collect();
-        assert_eq!(actual, mapped);
-        assert_eq!(mapped.len(), 128);
+        assert!(built().logs_decode_kv_lens());
+        // The analyzer picks the map whose locations equal the manifest's, so
+        // each routed-rank fan-out has its own. MoE TP4 and TP8 share one.
+        for (parallel, map, locations) in [
+            (
+                layout(4, true),
+                include_str!(
+                    "../../../model/work/location_maps/glm53_flash_vllm_fp8_kda_dsa_moe_unified.json"
+                ),
+                128,
+            ),
+            (
+                layout(8, true),
+                include_str!(
+                    "../../../model/work/location_maps/glm53_flash_vllm_fp8_kda_dsa_moe_unified_ep8.json"
+                ),
+                144,
+            ),
+            (
+                layout(4, false),
+                include_str!(
+                    "../../../model/work/location_maps/glm53_flash_vllm_fp8_kda_dsa_moe_unified_moe_tp.json"
+                ),
+                116,
+            ),
+            (
+                layout(8, false),
+                include_str!(
+                    "../../../model/work/location_maps/glm53_flash_vllm_fp8_kda_dsa_moe_unified_moe_tp.json"
+                ),
+                116,
+            ),
+        ] {
+            let manifest = built_with(parallel).cost_log_manifest();
+            let actual: BTreeSet<_> = manifest
+                .slots
+                .iter()
+                .filter(|slot| slot.kind != "all_reduce_fusion")
+                .map(|slot| slot.name.as_str())
+                .collect();
+            let map: serde_json::Value = serde_json::from_str(map).unwrap();
+            assert_eq!(map["arch_types"], serde_json::json!([ARCH_KIND]));
+            let mapped: BTreeSet<_> = map["locations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["location"].as_str().unwrap())
+                .collect();
+            assert_eq!(actual, mapped);
+            assert_eq!(mapped.len(), locations);
+        }
     }
 
     fn leaf_order(node: &CostNode, out: &mut Vec<usize>) {
