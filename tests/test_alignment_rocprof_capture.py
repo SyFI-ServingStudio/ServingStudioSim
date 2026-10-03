@@ -260,6 +260,38 @@ def test_capture_server_env_sets_roctx_flag():
     assert build_capture_server_env({ROCTX_SCOPES_ENV: "0"})[ROCTX_SCOPES_ENV] == "1"
 
 
+def test_capture_server_env_injects_sitecustomize_preload_on_pythonpath(tmp_path):
+    """The driver prepends a roctx-preload sitecustomize dir to the server PYTHONPATH.
+
+    Python imports ``sitecustomize`` before torch, so this is what RTLD_GLOBAL-loads
+    the SDK roctx library ahead of torch's legacy libroctx64 (the Gap-2 fix). The
+    generated file must call the preloader; an existing server PYTHONPATH is kept
+    after the injected dir; the driver's own PYTHONPATH is never touched.
+    """
+    import os
+
+    sc_dir = tmp_path / "sc"
+    built = build_capture_server_env(
+        {"PATH": "/usr/bin", "PYTHONPATH": "/existing/a"}, sitecustomize_dir=sc_dir
+    )
+    entries = built["PYTHONPATH"].split(os.pathsep)
+    assert entries[0] == str(sc_dir)  # prepended, wins import order
+    assert "/existing/a" in entries  # pre-existing server PYTHONPATH preserved
+    body = (sc_dir / "sitecustomize.py").read_text()
+    assert "preload_sdk_roctx" in body
+    # With no pre-existing PYTHONPATH the injected dir is the whole value.
+    only = build_capture_server_env({"PATH": "/usr/bin"}, sitecustomize_dir=sc_dir)
+    assert only["PYTHONPATH"] == str(sc_dir)
+
+
+def test_write_roctx_sitecustomize_dir_body_is_gated_and_error_tolerant(tmp_path):
+    """The generated sitecustomize guards its preload call so startup can't crash."""
+    sc_dir = rocprof_capture.write_roctx_sitecustomize_dir(tmp_path / "root")
+    body = (sc_dir / "sitecustomize.py").read_text()
+    assert "preload_sdk_roctx()" in body
+    assert "except Exception" in body  # a failed preload never takes down the server
+
+
 def test_capture_server_env_defaults_v1_multiprocessing_off_but_overridable():
     """The driver puts the V1 engine in-process by default, overridably.
 
