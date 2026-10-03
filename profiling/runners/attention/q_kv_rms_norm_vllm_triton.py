@@ -1,7 +1,9 @@
 """Profile vLLM's shared fused QR/KV RMSNorm call (DeepSeek V4, GLM-5.3 MLA)."""
 
+import math
 from typing import Any
 
+from profiling.db.args import DType
 from profiling.profilers.energy import Energy
 from profiling.profilers.timer import Timer
 from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerNotImplemented
@@ -9,16 +11,22 @@ from profiling.runners.metrics import ComputeMetrics
 
 _BACKEND = "q_kv_rms_norm:vllm_triton"
 _GPUS = frozenset({"NVIDIA H200", "NVIDIA B200"})
-# Served checkpoints use rms_eps 1e-6 or 1e-5; the scalar never changes the launch.
-_IDENTITIES = frozenset({(1536, 512, 1.0e-6, "bf16"), (1536, 512, 1.0e-5, "bf16")})
 
 
 def _validate_args(num_tokens: int, q_dim: int, kv_dim: int, rms_eps: float, dtype: object) -> None:
     if type(num_tokens) is not int or not 1 <= num_tokens <= 65_536:
         raise ValueError("num_tokens must be an integer in [1, 65536]")
-    identity = (q_dim, kv_dim, rms_eps, str(dtype))
-    if identity not in _IDENTITIES:
-        raise ProfilerNotImplemented(f"{_BACKEND} supports {sorted(_IDENTITIES)}, got {identity}")
+    # fused_q_kv_rmsnorm only asserts 2-D, row-major views with matching token
+    # counts; row widths are constexpr block sizes, so any q_dim/kv_dim launches.
+    for name, value in (("q_dim", q_dim), ("kv_dim", kv_dim)):
+        if type(value) is not int or value <= 0:
+            raise ValueError(f"{name} must be a positive integer, got {value!r}")
+    # rms_eps is a runtime scalar; it never changes the launch.
+    if type(rms_eps) not in {int, float} or not math.isfinite(rms_eps) or rms_eps <= 0:
+        raise ValueError(f"rms_eps must be a positive finite number, got {rms_eps!r}")
+    # The operands below are built in bf16.
+    if DType.from_value(dtype) is not DType.BF16:
+        raise ProfilerNotImplemented(f"{_BACKEND} requires dtype=bf16, got {dtype}")
 
 
 def _reference(torch: Any, values: Any, weight: Any, eps: float) -> Any:

@@ -9,10 +9,26 @@ from profiling.runners.attention.qnorm_rope_kv_insert_vllm_cuda import (
 from profiling.runners.exceptions import ProfilerNotImplemented
 
 
-def test_fused_rmsnorm_accepts_only_the_production_identity():
-    validate_fused_rmsnorm(128, 1536, 512, 1.0e-6, "bf16")
-    with pytest.raises(ProfilerNotImplemented, match="supports"):
-        validate_fused_rmsnorm(128, 1024, 512, 1.0e-6, "bf16")
+@pytest.mark.parametrize(
+    ("q_dim", "kv_dim", "rms_eps"),
+    [(1536, 512, 1.0e-6), (1536, 512, 1.0e-5), (1024, 512, 1.0e-6), (2048, 576, 1.0e-6)],
+)
+def test_fused_rmsnorm_accepts_any_row_widths(q_dim, kv_dim, rms_eps):
+    validate_fused_rmsnorm(128, q_dim, kv_dim, rms_eps, "bf16")
+
+
+@pytest.mark.parametrize(
+    ("args", "error", "match"),
+    [
+        ((128, 0, 512, 1.0e-6, "bf16"), ValueError, "q_dim"),
+        ((128, 1536, -1, 1.0e-6, "bf16"), ValueError, "kv_dim"),
+        ((128, 1536, 512, 0.0, "bf16"), ValueError, "rms_eps"),
+        ((128, 1536, 512, 1.0e-6, "fp16"), ProfilerNotImplemented, "bf16"),
+    ],
+)
+def test_fused_rmsnorm_rejects_invalid_shapes(args, error, match):
+    with pytest.raises(error, match=match):
+        validate_fused_rmsnorm(*args)
 
 
 def test_qnorm_insert_preserves_dp_padding_and_physical_identity():
