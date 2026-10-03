@@ -10,6 +10,7 @@ from profiling.db.registry import MetricFamily, find_kernel_profiler_spec
 from profiling.kernels.moe_ep_all_gather import MoeEpAllGatherArgs
 from profiling.kernels.moe_ep_reduce_scatter import MoeEpReduceScatterArgs
 from profiling.runners.comm import moe_ep_collectives_vllm_pynccl as runner
+from profiling.runners.exceptions import ProfilerNotImplemented
 
 
 def test_registry_preserves_the_observed_per_rank_topology():
@@ -51,6 +52,14 @@ def test_ragged_and_zero_rank_work_are_valid_but_shape_collisions_are_not():
         runner._validate_topology(4, (128, 96), 4096, "nvlink")
     with pytest.raises(ValueError, match="non-negative"):
         runner._validate_topology(4, (128, -1, 96, 32), 4096, "nvlink")
+
+
+def test_any_multi_rank_world_size_is_valid():
+    assert runner._validate_topology(3, (64, 0, 32), 4096, "nvlink")[0] == 3
+    assert runner._validate_topology(6, (16,) * 6, 7168, "nvlink")[0] == 6
+
+    with pytest.raises(ProfilerNotImplemented, match="num_gpus >= 2"):
+        runner._validate_topology(1, (128,), 4096, "nvlink")
 
 
 def test_metrics_use_the_slowest_rank_and_physical_wire_bytes():

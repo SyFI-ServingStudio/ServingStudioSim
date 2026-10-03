@@ -11,7 +11,6 @@ from profiling.runners.exceptions import KernelLaunchFailed, ProfilerNotImplemen
 from profiling.runners.metrics import RunnerResult
 
 _GPU_NAME = "NVIDIA H200"
-_SUPPORTED_NUM_GPUS = frozenset({2, 4, 8})
 _MAX_TOTAL_TOKENS = 8192
 
 
@@ -46,10 +45,10 @@ def _validate_topology(
     hidden_size: int,
     fabric: str,
 ) -> tuple[int, tuple[int, ...], int]:
-    if num_gpus not in _SUPPORTED_NUM_GPUS:
-        raise ProfilerNotImplemented(
-            f"vllm_pynccl supports num_gpus in {sorted(_SUPPORTED_NUM_GPUS)}, got {num_gpus}"
-        )
+    # PyNcclCommunicator takes any world size but disables itself at one rank,
+    # where these collectives would not run.
+    if not isinstance(num_gpus, int) or isinstance(num_gpus, bool) or num_gpus < 2:
+        raise ProfilerNotImplemented(f"vllm_pynccl needs num_gpus >= 2, got {num_gpus}")
     token_counts = tuple(per_rank_tokens)
     if len(token_counts) != num_gpus:
         raise ValueError(
