@@ -17,8 +17,8 @@ from profiling.exec.env import (
     ContainerProfileEnv,
     ProfileEnv,
     compose_library_path,
-    compose_pythonpath,
     resolve_profile_env,
+    set_worker_python_env,
 )
 from profiling.exec.payload import chunk_result_from_payload, resolve_chunk_backend
 from profiling.exec.pool import ChunkResult, GpuChunk, GpuPool
@@ -171,7 +171,7 @@ def _host_worker_command(
     # inherited environment; the backend-owned variables below win over both.
     env.update(worker_env or {})
     env["CUDA_VISIBLE_DEVICES"] = ",".join(str(gpu) for gpu in gpus)
-    env["PYTHONPATH"] = compose_pythonpath(profiler_env, env.get("PYTHONPATH"))
+    set_worker_python_env(profiler_env, env)
     if profiler_env.additional_library_paths:
         env["LD_LIBRARY_PATH"] = compose_library_path(profiler_env, env.get("LD_LIBRARY_PATH"))
     return (
