@@ -283,6 +283,43 @@ impl Deployment for UnifiedDeployment {
                     &g.worker,
                 )
             }
+            // Same hybrid KV as the TP arch, held per DP rank: each rank's
+            // partition charges its own requests' MLA/kpool KV and KDA state.
+            IterArchSel::Glm53FlashVllmFp8DpAttnEpMoe {
+                ep_size,
+                max_model_len,
+                routing,
+                routing_seed,
+                expert_popularity_file,
+                token_corpus_file,
+                cudagraph_capture_sizes,
+                ..
+            } => {
+                ensure_hybrid_worker("GLM-5.3-Flash vLLM FP8 DP-attention/EP", &g.worker)?;
+                let model = Arc::new(arch_build::glm53_flash_vllm_fp8_dp_attn_ep_moe(
+                    model_spec,
+                    *ep_size,
+                    *max_model_len,
+                    *routing,
+                    *routing_seed,
+                    expert_popularity_file.as_deref(),
+                    token_corpus_file.as_deref(),
+                    cudagraph_capture_sizes,
+                    &gpu_name,
+                    MODEL_NAME,
+                    bridge,
+                )?);
+                assemble_hybrid_flow(
+                    "GLM-5.3-Flash vLLM FP8 DP-attention/EP",
+                    model,
+                    store,
+                    worker_config,
+                    log_dir,
+                    gpu_name,
+                    dp_cfg,
+                    &g.worker,
+                )
+            }
             IterArchSel::Llama3Dense { .. } => {
                 ensure_barebone(&g.worker)?;
                 let model = Arc::new(arch_build::dense(

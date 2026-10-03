@@ -552,6 +552,48 @@ pub enum IterArchSel {
         #[serde(default)]
         cudagraph_capture_sizes: Vec<u32>,
     },
+    /// [`Self::Glm53FlashVllmFp8KdaDsaMoe`]'s kernels under data-parallel
+    /// attention and expert-parallel MoE (vLLM `--data-parallel-size ep_size
+    /// --enable-expert-parallel`, TP1). Every GPU is its own engine with its
+    /// own batch, KV and KDA state; attention, dense FFN, shared expert and
+    /// lm_head run whole on each GPU's tokens, and only the routed experts are
+    /// sharded, behind an FP8 all-gather and a bf16 reduce-scatter.
+    #[supported(gpu = ["NVIDIA B200"], model_config = ["glm53_flash"], fp8 = [true], ep_size = [4, 8], max_model_len = [8192, 65536, 131072, 262144, 524288])]
+    Glm53FlashVllmFp8DpAttnEpMoe {
+        #[serde(flatten)]
+        model: ModelSpec,
+        /// Data-parallel attention ranks, which are also the expert-parallel
+        /// group: one GPU each.
+        #[serde(default = "default_glm52_nvfp4_parallel_size")]
+        #[param(default = 4, cache_key)]
+        ep_size: u16,
+        /// Configured context cap: the indexer's logits row stride and the
+        /// sparse-index page-table extent.
+        #[serde(default = "default_glm53_flash_max_model_len")]
+        #[param(default = 8192, cache_key)]
+        max_model_len: u32,
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS, set_when_predicting, cache_key)]
+        routing: RoutingKind,
+        #[serde(default)]
+        #[param(cache_key)]
+        routing_seed: Option<u64>,
+        /// Measured per-expert popularity captured at the same
+        /// `expert_parallel_size`. Requires `routing = popularity`.
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+        /// Recorded per-token expert routes from a `token_corpus` pass, as a
+        /// manifest path. Requires `routing = corpus`.
+        #[serde(default)]
+        #[param(cache_key)]
+        token_corpus_file: Option<String>,
+        /// vLLM `--cudagraph-capture-sizes`. When every rank's batch fits a
+        /// captured size, all ranks pad to the busiest rank's graph; otherwise
+        /// they run eager on their own rows. Empty: always eager.
+        #[serde(default)]
+        cudagraph_capture_sizes: Vec<u32>,
+    },
     /// SGLang's B200 NVFP4 launch graph under pure tensor parallelism. Every
     /// rank owns all experts (EP1) and shards the routed intermediate axis by
     /// TP, so there is no expert-parallel or NVLink-domain selector.
@@ -605,6 +647,7 @@ impl IterArchSel {
             | Self::Glm52VllmNvfp4DsaMoeSpeculative { model, .. }
             | Self::Glm53VllmNvfp4DsaMoeDflash2 { model, .. }
             | Self::Glm53FlashVllmFp8KdaDsaMoe { model, .. }
+            | Self::Glm53FlashVllmFp8DpAttnEpMoe { model, .. }
             | Self::Glm52SglangNvfp4TpDsaMoe { model, .. } => model,
         }
     }
@@ -1036,7 +1079,7 @@ mod iter_tests {
                 );
             }
         }
-        assert_eq!(routed, 15);
+        assert_eq!(routed, 16);
     }
 }
 // ── layer-wise attn / ffn contract (AFD)────────────────────────────────────

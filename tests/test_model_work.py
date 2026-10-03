@@ -2365,3 +2365,32 @@ def test_glm53_location_map_consumes_every_semantic_row_once():
     assert rules["unified.first_kda_dense.attn_mhc_pre"][0] == "first_kda_dense.mhc.attn_fn"
     assert rules["unified.final_mhc_post"] == ["mhc.final_post"]
     assert rules["unified.hc_expand"] == rules["unified.hc_contract_mean"] == []
+
+
+def test_glm53_dp_attn_ep_location_maps_consume_every_semantic_row_once():
+    """DP4/EP4 and DP8/EP8 maps reuse the TP map's semantics; collectives map to ``[]``."""
+    tp_rules = {
+        row["location"]: row["semantics"]
+        for row in json.loads(G53_LOCATION_MAP.read_text())["locations"]
+    }
+    model = work_floors._model_for_spec(
+        {"arch_type": "glm53_flash_vllm_fp8_dp_attn_ep_moe", "config": str(GLM53)}
+    )
+    workload = work_floors._aggregate_workload(_g53_geometry_totals([(0, 2048)], [3000]))
+    expected = {segment.name for segment in model.label(workload).segments}
+    for ep in (4, 8):
+        path = G53_LOCATION_MAP.with_name(f"glm53_flash_vllm_fp8_dp_attn_ep_moe_ep{ep}.json")
+        mapping = json.loads(path.read_text())
+        assert mapping["arch_types"] == ["glm53_flash_vllm_fp8_dp_attn_ep_moe"]
+        rules = {row["location"]: row["semantics"] for row in mapping["locations"]}
+        mapped = [semantic for semantics in rules.values() for semantic in semantics]
+        assert len(mapped) == len(set(mapped))
+        assert set(mapped) == expected
+        for tag in ("dsa_moe", "kda_moe"):
+            for op in ("dispatch_quant", "dispatch_all_gather", "combine_reduce_scatter"):
+                assert rules[f"unified.{tag}.moe.{op}"] == []
+            for rank in range(1, ep):
+                assert rules[f"unified.{tag}.moe.routed_rank{rank}.fused_moe"] == []
+        for location, semantics in rules.items():
+            if location in tp_rules:
+                assert semantics == tp_rules[location], location
