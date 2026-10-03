@@ -1,12 +1,60 @@
 # ROCm rocpd capture — 1-GPU plumbing validation
 
 Goal: confirm, on **one** MI300X with a **small** model, that the AMD alignment
-capture path is wired end to end — that a rocprofv3 run records the
-`vllm_iteration(N): <phase>` roctx ranges emitted by the iteration shim *and* the
-GPU kernel dispatches, and that the offline producer turns that rocpd database
-into the normalized Check-1 artifacts. This validates plumbing only; it is not a
-timing or accuracy result, and it is deliberately not GLM (GLM-5.3-Flash needs
-tensor parallelism `TP >= 2`, which this single-GPU check avoids).
+capture path is wired end to end — that a rocprofv3 run records the iteration
+boundaries emitted by the iteration shim *and* the GPU kernel dispatches, and
+that the offline producer turns that rocpd database into the normalized Check-1
+artifacts. This validates plumbing only; it is not a timing or accuracy result,
+and it is deliberately not GLM (GLM-5.3-Flash needs tensor parallelism
+`TP >= 2`, which this single-GPU check avoids).
+
+## Iteration-boundary mechanism — Option B (sentinel kernels) is now primary
+
+Two mechanisms mark iteration boundaries in the rocpd capture; the reader accepts
+either, **roctx-first**:
+
+1. **roctx ranges** (`vllm_iteration(N): <phase>`) via `--marker-trace`. This is
+   the NVIDIA-parity path and stays primary *when it records*.
+2. **Sentinel kernels** (Option B) via `--kernel-trace`. The shim launches a tiny,
+   uniquely-named no-op Triton kernel — `vibesim_sentinel` — as the first GPU work
+   of each forward. It lands in rocpd's `rocpd_kernel_dispatch` table, and the
+   reader reconstructs iteration ranges from the sentinel dispatches' timestamps
+   (sentinel `N`'s launch starts iteration `N`; the next sentinel ends it).
+
+**Why Option B is the mechanism now.** On the pinned ROCm-7.2 / rocprofv3-1.3.2
+stack, roctx **marker** recording is confirmed broken: the SDK MARKER service
+never registers inside a torch-loaded process (two independent load-order
+attempts — the `sitecustomize` `RTLD_GLOBAL` SDK-roctx preload, and forcing the
+soname — both yielded **0** `region` rows). Kernel-dispatch capture via
+`--kernel-trace` is 100% reliable (23,711 rows every run). So the sentinel kernel
+is the dependable boundary signal on this stack. The roctx push is kept too: it is
+harmless and lets the same code align on a stack that *does* record roctx (the
+reader uses roctx when present, sentinels otherwise).
+
+**Sentinel identity and iteration encoding (how the reader finds and orders
+them).** rocpd stores a Triton JIT kernel's Python function name verbatim in the
+`rocpd_info_kernel_symbol` table (`display_name` / `kernel_name`), joined to each
+dispatch by `kernel_id`. The reader (`alignment/rocpd/evidence.py::is_sentinel_
+dispatch`) marks a dispatch as a sentinel iff that name contains `vibesim_sentinel`
+— a string no torch/aiter kernel carries, so it cannot collide. The absolute
+iteration index rides in the dispatch's **`grid_size_y`** column: the shim launches
+the sentinel with grid `(1, iteration + 1, 1)` and `num_warps=1`, so
+`grid_size_y == iteration + 1` while every real kernel's `grid_size_y` is ~1. The
+reader recovers `iteration = grid_size_y - 1` when that encoding is present and
+strictly increasing, and otherwise falls back to the sentinel's ordinal position
+in the dispatch stream (always correct for consecutive forwards). `grid_size_y`
+(not `x`) carries it because the x-grid is routinely huge on real kernels and the
+index stays tiny — well under the HIP 65535 y/z block-count ceiling. **Sentinel
+dispatches are markers, not model work: the producer excludes them from the
+attributed and compared kernel set in both the roctx and sentinel paths**, so they
+never appear in `parsed.kernels.parquet` or `kernel_sequences.json`.
+
+If Triton is somehow unavailable in the serving venv, the shim falls back to a
+plain torch GPU op to keep the forward alive and still push roctx, but that
+fallback carries neither the collision-free name nor the grid-encoded ordinal (a
+torch op's kernel name and launch grid are not ours to set, and HIP caps the y/z
+grid dims at 65535 blocks), so it is **not** offline-reconstructable — prefer
+Triton, which is present in the vLLM ROCm container.
 
 All cluster-specific values are placeholders: `<rocprofv3>` (absolute path to the
 rocprofv3 binary), `<FORK_PYTHON>` (absolute path to the ROCm vLLM venv's
@@ -167,6 +215,24 @@ ORDER BY d.start
 LIMIT 10;
 ```
 
+(a2) **Sentinel marker kernels exist (Option B)** — expect one `vibesim_sentinel`
+dispatch per captured forward, its `grid_size_y` carrying `iteration + 1` in
+dispatch (start) order. This is the boundary signal when query (a) is empty:
+
+```sql
+SELECT k.display_name, d.grid_size_y, d.grid_size_y - 1 AS iteration, d.start
+FROM rocpd_kernel_dispatch d
+JOIN rocpd_info_kernel_symbol k ON k.id = d.kernel_id
+WHERE k.display_name LIKE '%vibesim_sentinel%' OR k.kernel_name LIKE '%vibesim_sentinel%'
+ORDER BY d.start
+LIMIT 25;
+```
+
+A non-empty result here with query (a) empty is the expected Option-B state on the
+ROCm-7.2 stack: `validate_rocpd` reports `iteration_source:"sentinel"` and
+`iteration_ranges > 0`, and `rocpd-parse` attributes the between-sentinel
+dispatches to the recovered iterations.
+
 (c) **The actual rocpd filename rocprofv3 wrote** — confirm the on-disk name so a
 version bump in the `_results.db` vs `.db` spelling is caught:
 
@@ -209,33 +275,43 @@ capture plumbing — report that distinction rather than re-running the capture.
 This 1-GPU check fixes capture plumbing that is confirmable on-host; two facts
 remain GPU-only and must be confirmed on the next lease.
 
-1. **roctx MARKER registration ordering — load-order fix landed (Gap 2, TP1 is
-   enough).** The earlier capture recorded zero `vllm_iteration(N)` ranges because
-   torch's legacy `libroctx64` preempted rocprofv3's SDK MARKER service. The fix
-   (sitecustomize `RTLD_GLOBAL` preload of `librocprofiler-sdk-roctx.so.1` before
-   torch; see Precondition 2) is implemented on-host but its effect is GPU-only.
+1. **Sentinel-kernel iteration boundaries — Option B landed, needs 1-GPU
+   confirmation (Gap 2, TP1 is enough).** roctx MARKER recording is confirmed
+   broken on this stack (SDK MARKER never registers in a torch-loaded process; two
+   load-order attempts both yielded 0 regions). Option B — launching a
+   `vibesim_sentinel` kernel per forward and reconstructing iterations from the
+   reliable `--kernel-trace` dispatch rows — is now implemented on-host (shim
+   emitter + reader + offline test), but sentinel **emission on a real GPU** is
+   GPU-only and must be confirmed on the next lease.
 
    **Exact 1-GPU re-test** — serve `Qwen/Qwen2.5-0.5B-Instruct` on one MI300X with
-   the capture command above (the driver injects the preload automatically), drive
-   a short completion workload, then confirm **all three**:
-   - the rocprofv3 **capture log shows `MARKER (ROCTx) ... initialized`** (the SDK
-     MARKER service registered in-process) — and, as a cross-check, the serving
-     log shows the preloader resolved `librocprofiler-sdk-roctx.so.1`
-     (`VIBESIM_ROCTX_SONAME_RESOLVED` set / the `preloaded SDK roctx ...` log line);
-   - **`validate_rocpd` returns `iteration_ranges>0` and `ok:true`** (the printed
-     JSON line) — i.e. query (a) is now non-empty while `--kernel-trace` still
-     records dispatch rows;
-   - **`rocpd-parse` emits the 3 artifacts** non-empty: `parsed.json`,
-     `parsed.kernels.parquet`, `kernel_sequences.json` (per the success criterion
-     above).
+   the capture command above (unchanged; the shim auto-launches the sentinel under
+   the existing `VLLM_ROCTX_SCOPES_FOR_PROFILING=1` gate), drive a short completion
+   workload (a few dozen decode iterations), then confirm **all four**:
+   - **the sentinel kernels appear in the dispatch table** — query (a2) returns one
+     `vibesim_sentinel` row per forward, each with `grid_size_y == iteration + 1` in
+     start order (confirms Triton was used and the grid-y ordinal encoding survived
+     the real launch — the one grid-units assumption this on-host work could not
+     verify);
+   - **`validate_rocpd` recovers iterations via sentinels** — the printed JSON line
+     shows `iteration_source:"sentinel"`, `iteration_ranges>0`, `sentinel_kernels>0`
+     and `ok:true` (roctx query (a) may be empty — that is expected on this stack);
+   - **`rocpd-parse` emits the 3 artifacts** non-empty — `parsed.json`,
+     `parsed.kernels.parquet`, `kernel_sequences.json` — with the
+     `vibesim_sentinel` kernel **absent** from the parquet / sequences (markers are
+     excluded from the compared set);
+   - the `parsed.json` iteration indices match the sentinels' decoded
+     `grid_size_y - 1` (and the warm-up kernels before the first sentinel are
+     dropped).
 
-   If `iteration_ranges` is still 0 after this fix, the preload did not win the
-   load order (confirm `VIBESIM_ROCTX_SONAME_RESOLVED` and that `sitecustomize` ran
-   before torch) — only then fall back to **Option B** (sentinel-kernel iteration
-   boundaries: bracket each forward with a tiny uniquely-named marker kernel via
-   `--kernel-trace`, and derive iteration windows from those dispatch rows instead
-   of roctx ranges). Option B is the documented fallback only; it is **not**
-   implemented, because it should be unnecessary once the SDK lib loads first.
+   If query (a2) is empty, the sentinel did not fire: check the plugin is
+   discovered in the serving venv (Precondition 1), the env gate is on, and Triton
+   is importable in that venv (if Triton is missing the shim falls back to a
+   non-reconstructable torch op — install Triton, which ships in the ROCm vLLM
+   container). If (a2) has rows but `grid_size_y` does not encode `iteration + 1`
+   (e.g. the real launch multiplied the y-grid by a non-unit workgroup-y), the
+   reader still recovers correct *consecutive* iterations by sentinel ordinal;
+   report the observed `grid_size_y` values so the decode offset can be corrected.
 
 2. **Per-rank capture for TP>1 (Gap 3, needs TP4/EP4).** The driver now templates
    a per-rank rocprofv3 output name for `--tp-size > 1` (`-o <name>_rank%q{RANK}%`,
