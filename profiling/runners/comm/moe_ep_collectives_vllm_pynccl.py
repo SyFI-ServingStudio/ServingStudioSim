@@ -10,12 +10,20 @@ from profiling.runners.comm._launcher import VllmLauncher
 from profiling.runners.exceptions import KernelLaunchFailed, ProfilerNotImplemented
 from profiling.runners.metrics import RunnerResult
 
-_GPU_NAME = "NVIDIA H200"
-_MAX_TOTAL_TOKENS = 8192
+_GPU_NAMES = frozenset({"NVIDIA H200", "NVIDIA B200"})
+_NVFP4_SCALE_GROUP = 16
+# A DP/EP group gathers every rank's scheduler batch: 8 ranks x 8192 tokens.
+_MAX_TOTAL_TOKENS = 65536
 
 
 def profile_moe_ep_all_gather_batch(kwargs_list: list[dict]) -> list[RunnerResult]:
     return _profile_batch(kwargs_list, _all_gather_per_rank_batch, _validate_all_gather)
+
+
+def profile_moe_ep_quantized_all_gather_batch(kwargs_list: list[dict]) -> list[RunnerResult]:
+    return _profile_batch(
+        kwargs_list, _quantized_all_gather_per_rank_batch, _validate_quantized_all_gather
+    )
 
 
 def profile_moe_ep_reduce_scatter_batch(kwargs_list: list[dict]) -> list[RunnerResult]:
@@ -33,7 +41,7 @@ def _profile_batch(kwargs_list: list[dict], per_rank_fn, validator) -> list[Runn
     except Exception as exc:  # noqa: BLE001 - validation maps one bad group to one batch error
         return all_error(len(kwargs_list), str(exc))
     return run_comm_batch(
-        VllmLauncher(num_gpus, required_gpu_name=_GPU_NAME),
+        VllmLauncher(num_gpus, required_gpu_names=_GPU_NAMES),
         per_rank_fn,
         kwargs_list,
     )
@@ -88,6 +96,34 @@ def _validate_all_gather(
     if DType.from_value(router_dtype) is not DType.FP32:
         raise ProfilerNotImplemented("grouped MoE all-gather requires router_dtype=fp32")
     return num_gpus, token_counts, hidden_size, num_experts
+
+
+def _validate_quantized_all_gather(
+    num_gpus: int,
+    per_rank_tokens: tuple[int, ...] | list[int],
+    hidden_size: int,
+    top_k: int,
+    activation_dtype: DType | str,
+    fabric: str,
+) -> tuple[int, tuple[int, ...], int, int]:
+    num_gpus, token_counts, hidden_size = _validate_topology(
+        num_gpus, per_rank_tokens, hidden_size, fabric
+    )
+    if hidden_size % _NVFP4_SCALE_GROUP:
+        raise ValueError(f"hidden_size must be a multiple of {_NVFP4_SCALE_GROUP}")
+    if not isinstance(top_k, int) or isinstance(top_k, bool) or top_k <= 0:
+        raise ValueError("top_k must be a positive integer")
+    if DType.from_value(activation_dtype) is not DType.NVFP4_E2M1:
+        raise ProfilerNotImplemented(
+            "quantized MoE all-gather requires activation_dtype=nvfp4_e2m1"
+        )
+    return num_gpus, token_counts, hidden_size, top_k
+
+
+def quantized_all_gather_token_bytes(hidden_size: int, top_k: int) -> int:
+    """Bytes one token adds to the gather: packed e2m1 pairs, one e4m3 scale per
+    16 elements, then fp32 weights and int32 IDs for each selected expert."""
+    return hidden_size // 2 + hidden_size // _NVFP4_SCALE_GROUP + top_k * (4 + 4)
 
 
 def _validate_reduce_scatter(
@@ -166,6 +202,96 @@ def _all_gather_per_rank_batch(
         rank_times = _gather_rank_times(dist, rank, world_size, rank_time_ms)
         if rank == 0:
             local_payloads = [count * (hidden_size * 2 + num_experts * 4) for count in token_counts]
+            results.append(
+                _metric_payload(
+                    rank_times,
+                    sum(local_payloads) / world_size,
+                    sum(local_payloads) - min(local_payloads),
+                )
+            )
+    return results if rank == 0 else None
+
+
+def _quantized_all_gather_per_rank_batch(
+    *,
+    rank: int,
+    world_size: int,
+    communicator: Any,
+    specs: list[dict],
+    warmup: int,
+    rep: int,
+) -> list[dict] | None:
+    import torch
+    import torch.distributed as dist
+
+    results = []
+    for spec in specs:
+        _, token_counts, hidden_size, top_k = _validate_quantized_all_gather(**spec)
+        total_tokens = sum(token_counts)
+        # vLLM's AgRsAll2AllManager.dispatch gathers [hidden_states, topk_weights,
+        # topk_ids] followed by the extra block-scale tensor, in this order.
+        columns_and_dtypes = (
+            (hidden_size // 2, torch.uint8),
+            (top_k, torch.float32),
+            (top_k, torch.int32),
+            (hidden_size // _NVFP4_SCALE_GROUP, torch.uint8),
+        )
+
+        def rank_inputs(source_rank: int, rows: int) -> list[Any]:
+            tensors = [
+                _rank_tensor(
+                    torch,
+                    rows,
+                    columns,
+                    source_rank,
+                    torch.int32 if dtype is torch.uint8 else dtype,
+                )
+                for columns, dtype in columns_and_dtypes
+            ]
+            # Map signed test values onto bytes for the packed operands.
+            tensors[0] = (tensors[0] + 8).to(torch.uint8)
+            tensors[3] = (tensors[3] + 8).to(torch.uint8)
+            return tensors
+
+        inputs = rank_inputs(rank, token_counts[rank])
+        # The block scales travel as float8_e4m3fn; the byte view is what NCCL moves.
+        inputs[3] = inputs[3].view(torch.float8_e4m3fn)
+        outputs = [
+            torch.empty((total_tokens, columns), dtype=dtype, device="cuda")
+            for columns, dtype in columns_and_dtypes
+        ]
+        outputs[3] = outputs[3].view(torch.float8_e4m3fn)
+
+        def launch() -> None:
+            communicator.group_start()
+            for output, tensor in zip(outputs, inputs, strict=True):
+                if len(set(token_counts)) == 1:
+                    communicator.all_gather(output, tensor)
+                else:
+                    communicator.all_gatherv(output, tensor, sizes=list(token_counts))
+            communicator.group_end()
+
+        launch()
+        torch.cuda.synchronize()
+        expected = [
+            torch.cat(parts)
+            for parts in zip(
+                *(rank_inputs(source, count) for source, count in enumerate(token_counts)),
+                strict=True,
+            )
+        ]
+        actual = list(outputs)
+        actual[3] = actual[3].view(torch.uint8)
+        if not all(torch.equal(got, want) for got, want in zip(actual, expected, strict=True)):
+            raise KernelLaunchFailed(
+                "grouped PyNCCL quantized all-gather failed the Torch reference"
+            )
+
+        rank_time_ms = _time_launch(torch, dist, launch, warmup, rep)
+        rank_times = _gather_rank_times(dist, rank, world_size, rank_time_ms)
+        if rank == 0:
+            token_bytes = quantized_all_gather_token_bytes(hidden_size, top_k)
+            local_payloads = [count * token_bytes for count in token_counts]
             results.append(
                 _metric_payload(
                     rank_times,

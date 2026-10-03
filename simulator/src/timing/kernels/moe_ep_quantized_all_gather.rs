@@ -1,4 +1,5 @@
-//! Ragged reduce-scatterv that combines naive DP/EP MoE outputs.
+//! Ragged all-gatherv of NVFP4 activations, their block scales and top-k
+//! routing for naive DP/EP MoE that quantizes and routes before dispatch.
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::{CacheKind, Extrapolation};
@@ -10,28 +11,27 @@ use crate::timing::sweep::SweepGrid;
 use crate::timing::{Dim, KernelConfig};
 
 #[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct MoeEpReduceScatterKernelConfig {
+pub struct MoeEpQuantizedAllGatherKernelConfig {
     #[serde(deserialize_with = "de_backends")]
     pub backends: Vec<&'static str>,
     pub gpu_name: String,
     pub num_gpus: u32,
     pub hidden_size: Dim,
+    pub top_k: Dim,
     #[compute_dtype]
-    pub dtype: DType,
+    pub activation_dtype: DType,
     pub fabric: String,
-    /// Largest token count summed over the group, which bounds the grid's
-    /// total-token axis. One rank's scheduler budget times num_gpus when every
-    /// rank can fill its batch.
+    /// Largest token count summed over the group; bounds the total-token axis.
     pub max_total_tokens: u32,
 }
 
-pub struct MoeEpReduceScatterSpec;
+pub struct MoeEpQuantizedAllGatherSpec;
 
-impl KernelSpec for MoeEpReduceScatterSpec {
-    type Config = MoeEpReduceScatterKernelConfig;
+impl KernelSpec for MoeEpQuantizedAllGatherSpec {
+    type Config = MoeEpQuantizedAllGatherKernelConfig;
     type Input = MoeEpCollectiveKernelInput;
 
-    const KIND: KernelKind = "moe_ep_reduce_scatter";
+    const KIND: KernelKind = "moe_ep_quantized_all_gather";
 
     fn sweep_grid(config: &Self::Config) -> SweepGrid {
         collective_grid(config.max_total_tokens)
@@ -53,7 +53,7 @@ impl KernelSpec for MoeEpReduceScatterSpec {
         backend: &'static str,
     ) -> Vec<ArgsPayload> {
         assert!(matches!(config.num_gpus, 2 | 4 | 8));
-        assert_eq!(config.dtype, DType::Bf16);
+        assert_eq!(config.activation_dtype, DType::Nvfp4E2m1);
         assert_eq!(config.fabric, "nvlink");
         grid.expand_2d(|total, maximum| {
             let per_rank_tokens = canonical_tokens(config.num_gpus, total as u32, maximum as u32)
@@ -63,10 +63,11 @@ impl KernelSpec for MoeEpReduceScatterSpec {
                 .with("num_gpus", config.num_gpus)
                 .with("per_rank_tokens", per_rank_tokens)
                 .with("hidden_size", config.hidden_size.get())
-                .with("dtype", config.dtype.as_str())
+                .with("top_k", config.top_k.get())
+                .with("activation_dtype", config.activation_dtype.as_str())
                 .with("fabric", config.fabric.clone())
         })
     }
 }
 
-register_kernel!(MoeEpReduceScatterKernel, MoeEpReduceScatterSpec);
+register_kernel!(MoeEpQuantizedAllGatherKernel, MoeEpQuantizedAllGatherSpec);

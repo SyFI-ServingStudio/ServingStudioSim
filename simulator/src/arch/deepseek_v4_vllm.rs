@@ -486,6 +486,7 @@ fn layer_config(
             hidden_size: model.hidden_size.clone(),
             dtype: DType::Bf16,
             fabric: "nvlink".into(),
+            max_total_tokens: 8192,
         },
         finalize: ElementwiseKernelConfig {
             backends: vec!["torch"],

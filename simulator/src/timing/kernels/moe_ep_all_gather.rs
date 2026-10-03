@@ -46,8 +46,7 @@ impl KernelSpec for MoeEpAllGatherSpec {
     const KIND: KernelKind = "moe_ep_all_gather";
 
     fn sweep_grid(_config: &Self::Config) -> SweepGrid {
-        let axis = Axis::values([1, 4, 16, 64, 256, 1024, 4096, 8192]);
-        SweepGrid::new(vec![axis.clone(), axis])
+        collective_grid(8192)
     }
 
     fn cache_kind(_backend: &'static str) -> CacheKind {
@@ -80,6 +79,21 @@ impl KernelSpec for MoeEpAllGatherSpec {
                 .with("fabric", config.fabric.clone())
         })
     }
+}
+
+/// Points of the largest per-rank batch, the second grid axis.
+const RANK_TOKEN_POINTS: [u32; 8] = [1, 4, 16, 64, 256, 1024, 4096, 8192];
+/// Extra total-token points for groups whose ranks together exceed 8192 tokens.
+const LARGE_TOTAL_TOKEN_POINTS: [u32; 3] = [16384, 32768, 65536];
+
+/// The (total tokens, largest rank tokens) grid shared by the naive DP/EP MoE
+/// collectives. The total axis stops at `max_total_tokens`.
+pub(crate) fn collective_grid(max_total_tokens: u32) -> SweepGrid {
+    let totals = RANK_TOKEN_POINTS
+        .into_iter()
+        .chain(LARGE_TOTAL_TOKEN_POINTS)
+        .filter(|&tokens| tokens <= max_total_tokens);
+    SweepGrid::new(vec![Axis::values(totals), Axis::values(RANK_TOKEN_POINTS)])
 }
 
 pub(crate) fn canonical_tokens(
@@ -128,5 +142,14 @@ mod tests {
         assert_eq!(&*input.coords(), &[256.0, 128.0]);
         assert_eq!(canonical_tokens(4, 256, 128), Some(vec![128, 43, 43, 42]));
         assert_eq!(canonical_tokens(4, 256, 32), None);
+    }
+
+    #[test]
+    fn collective_grid_extends_totals_only_to_the_requested_bound() {
+        let small = collective_grid(8192);
+        assert_eq!(small.axes()[0].last(), Some(&8192.0));
+        let large = collective_grid(65536);
+        assert_eq!(large.axes()[0].last(), Some(&65536.0));
+        assert_eq!(large.axes()[1].last(), Some(&8192.0));
     }
 }
