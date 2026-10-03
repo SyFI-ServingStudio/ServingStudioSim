@@ -508,6 +508,7 @@ mod tests {
         store: SharedRequests,
         max_batch_tokens: u32,
         attn_kv_bytes: u64,
+        block_aligned_chunks: bool,
     ) -> crate::worker::workers::pipeline::HybridPipelineHead<FakeModel> {
         use crate::worker::kv::{PrefixCacheConfig, PrefixCachePolicy};
         use crate::worker::workers::pipeline::{
@@ -522,6 +523,7 @@ mod tests {
             PipelineHybridState {
                 block_tokens: 4,
                 state_blocks_per_request: 2,
+                block_aligned_chunks,
             },
             store,
             WorkerConfig {
@@ -546,6 +548,7 @@ mod tests {
         let hybrid = PipelineHybridState {
             block_tokens: 4,
             state_blocks_per_request: 2,
+            block_aligned_chunks: true,
         };
         // 80 bytes / 8 per block = 10 blocks, less vLLM's null block.
         assert_eq!(hybrid.capacity_tokens(&LAYOUT, 80), 36);
@@ -553,7 +556,7 @@ mod tests {
 
         // Each 12-token prompt costs 12 + 8: one fits in 36 tokens, two do not.
         let store = shared_with(&[(0, 12, 1), (1, 12, 1)]);
-        let mut worker = hybrid_head(Rc::clone(&store), 16, 80);
+        let mut worker = hybrid_head(Rc::clone(&store), 16, 80, true);
         worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
         worker.enqueue(PipelineHeadMsg::Request(RequestId(1)));
         let mut events = Vec::new();
@@ -568,18 +571,29 @@ mod tests {
     fn a_hybrid_head_ends_non_final_chunks_on_checkpoint_boundaries() {
         // Budget 6, blocks of 4: the first chunk floors to 4, the second stops
         // at the prompt's last boundary (8), the tail runs alone.
+        assert_eq!(hybrid_chunks(true), [4, 4, 2]);
+    }
+
+    #[test]
+    fn a_hybrid_head_without_block_alignment_chunks_plainly() {
+        // Same prompt and budget: each chunk is min(remaining, budget).
+        assert_eq!(hybrid_chunks(false), [6, 4]);
+    }
+
+    /// Chunk sizes a hybrid head launches for one 10-token prompt at budget 6
+    /// with 4-token blocks.
+    fn hybrid_chunks(block_aligned_chunks: bool) -> Vec<u64> {
         let store = shared_with(&[(0, 10, 1)]);
-        let mut worker = hybrid_head(Rc::clone(&store), 6, 1_000);
+        let mut worker = hybrid_head(Rc::clone(&store), 6, 1_000, block_aligned_chunks);
         worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
         let mut events = Vec::new();
         for step in 0..6 {
             worker.tick(Time::from_ms(step as f64), &mut events);
         }
-        let chunks: Vec<u64> = launched(&events)
+        launched(&events)
             .into_iter()
             .map(|(_, tokens, _)| tokens)
-            .collect();
-        assert_eq!(chunks, [4, 4, 2]);
+            .collect()
     }
 
     #[test]

@@ -102,6 +102,9 @@ pub(crate) fn build_pipeline_head_worker<M: IterwiseUnifiedModel>(
 pub struct PipelineHybridState {
     pub block_tokens: u32,
     pub state_blocks_per_request: u32,
+    /// With prefix caching on, end every non-final chunk on a `block_tokens`
+    /// boundary (vLLM's Mamba `align` mode). `false` chunks plainly.
+    pub block_aligned_chunks: bool,
 }
 
 impl PipelineHybridState {
@@ -119,9 +122,9 @@ impl PipelineHybridState {
 }
 
 /// [`build_pipeline_head_worker`] for a hybrid model: `HybridGdnKv` charges
-/// each request its fixed state blocks on top of its context, and with prefix
-/// caching on (vLLM's Mamba `align` mode) every non-final chunk ends on a
-/// `block_tokens` boundary.
+/// each request its fixed state blocks on top of its context. With prefix
+/// caching on and `hybrid.block_aligned_chunks` set (vLLM's Mamba `align`
+/// mode), every non-final chunk ends on a `block_tokens` boundary.
 ///
 /// Context is charged by the token, not rounded up to whole blocks, so a
 /// request's charge is low by less than one block.
@@ -154,8 +157,9 @@ pub(crate) fn build_hybrid_pipeline_head_worker<M: IterwiseUnifiedModel>(
     let prefix_cache_logger = PrefixCacheLogger::open_opt(cost_log_dir.as_deref(), pool_tag, id);
     let kv_capacity = hybrid.capacity_tokens(&layout, config.attn_kv_bytes);
     let state_tokens_per_request = hybrid.state_tokens_per_request();
-    let chunk_end_quantum = (!matches!(config.prefix_cache, PrefixCacheConfig::Disabled))
-        .then_some(hybrid.block_tokens);
+    let chunk_end_quantum = (hybrid.block_aligned_chunks
+        && !matches!(config.prefix_cache, PrefixCacheConfig::Disabled))
+    .then_some(hybrid.block_tokens);
     tracing::info!(
         worker = id.0,
         pool_tag,

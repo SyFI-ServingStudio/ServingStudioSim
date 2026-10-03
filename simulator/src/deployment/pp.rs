@@ -157,6 +157,13 @@ impl Deployment for PpDeployment {
                 let hybrid = PipelineHybridState {
                     block_tokens: pipeline.block_tokens(),
                     state_blocks_per_request: pipeline.state_blocks_per_request(),
+                    block_aligned_chunks: matches!(
+                        g.worker,
+                        IterWorkerSel::PipelineChunkedPrefill {
+                            hybrid_block_aligned_chunks: true,
+                            ..
+                        }
+                    ),
                 };
                 let head_model = Arc::clone(&pipeline.stages()[0]);
                 let head_store = std::rc::Rc::clone(&store);
@@ -201,6 +208,7 @@ fn worker_config(cfg: &PpConfig, worker: &IterWorkerSel) -> anyhow::Result<Worke
         attn_gpu_memory_gb,
         max_batch_tokens,
         gpu_time_multiplier,
+        ..
     } = worker
     else {
         bail!("pp: the stage pool requires worker `pipeline_chunked_prefill`, got {worker:?}");
