@@ -169,7 +169,12 @@ def _pool_specs(log_dir: Path) -> dict[str, dict]:
         arch_type = arch.get("type", "")
         arch_quant_dtype = (
             "fp4"
-            if arch_type in ("glm52_vllm_nvfp4_dsa_moe", "glm52_vllm_nvfp4_dsa_moe_speculative")
+            if arch_type
+            in (
+                "glm52_vllm_nvfp4_dsa_moe",
+                "glm52_vllm_nvfp4_dsa_moe_speculative",
+                "glm52_vllm_nvfp4_pp_dsa_moe",
+            )
             else None
         )
         if arch.get("fp8"):
