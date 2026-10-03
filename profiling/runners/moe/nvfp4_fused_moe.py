@@ -163,6 +163,35 @@ def _call_trtllm_fp4_moe(
     fn(**call_kwargs)
 
 
+def routed_tune_max_num_tokens(num_tokens: int) -> int:
+    """FlashInfer's tuning bound for vLLM's precomputed-routing call.
+
+    vLLM passes min(max(max_num_batched_tokens * dp_size, 8192), chunk size).
+    The DP size is not a kernel argument, so use the smallest power of two that
+    covers this call and is at least 8192; the bucket chosen for num_tokens is
+    the same for any bound at or above it.
+    """
+    return max(8192, 1 << (num_tokens - 1).bit_length())
+
+
+def _precomputed_routing_kwargs(torch: Any, ids: Any, args: dict[str, Any]) -> dict[str, Any]:
+    """Routing arguments of vLLM's TrtLlmNvFp4ExpertsModular call: fp32 weights
+    and int32 IDs selected before dispatch, with the kernel's routing stage idle
+    (trtllm_nvfp4_moe.py `_invoke_kernel`)."""
+    topk_ids = torch.tensor(ids, dtype=torch.int32, device="cuda")
+    topk_weights = torch.full(
+        topk_ids.shape, 1.0 / args["top_k"], dtype=torch.float32, device="cuda"
+    )
+    return {
+        "topk_ids": (topk_ids, topk_weights),
+        "routing_bias": None,
+        "n_group": 0,
+        "topk_group": 0,
+        "routed_scaling_factor": None,
+        "routing_method_type": 1,
+    }
+
+
 def _validate_args(**kwargs: Any) -> dict[str, Any]:
     args = dict(kwargs)
     for name in (
@@ -202,7 +231,9 @@ def _validate_args(**kwargs: Any) -> dict[str, Any]:
     return args
 
 
-def _logical_bytes(args: dict[str, Any], *, do_finalize: bool) -> int:
+def _logical_bytes(
+    args: dict[str, Any], *, do_finalize: bool, precomputed_routing: bool = False
+) -> int:
     """Return useful algorithmic traffic for this rank's fused MoE call.
 
     Routed activations are counted once per local expert assignment and expert
@@ -227,8 +258,10 @@ def _logical_bytes(args: dict[str, Any], *, do_finalize: bool) -> int:
     intermediate = args["intermediate_size"]
     experts = args["num_experts"]
 
-    # BF16 router logits + bias.
-    routing = 2 * tokens * experts + 2 * experts
+    # BF16 router logits + bias, or fp32 weights + int32 IDs already selected.
+    routing = (
+        8 * tokens * args["top_k"] if precomputed_routing else 2 * tokens * experts + 2 * experts
+    )
     # Packed FP4 routed activations + one FP8 scale per group of GROUP_SIZE.
     activations = local_rows * (hidden // 2 + hidden // GROUP_SIZE)
     # W13 and W2 packed FP4 weights and their FP8 group scales. W13 is the fused
@@ -249,6 +282,7 @@ def _profile_nvfp4_fused_moe_sm100(
     *,
     stack: str,
     do_finalize: bool,
+    precomputed_routing: bool = False,
     num_tokens: int,
     hidden_size: int,
     intermediate_size: int,
@@ -268,6 +302,7 @@ def _profile_nvfp4_fused_moe_sm100(
     spec = dict(locals())
     spec.pop("stack")
     spec.pop("do_finalize")
+    spec.pop("precomputed_routing")
     args = _validate_args(**spec)
     try:
         import flashinfer
@@ -319,15 +354,29 @@ def _profile_nvfp4_fused_moe_sm100(
             if stack == "sglang"
             else {"enable_pdl": True}
         )
+        if precomputed_routing:
+            routing_kwargs = _precomputed_routing_kwargs(torch, ids, args)
+            # vLLM's modular call leaves enable_pdl at FlashInfer's default.
+            stack_kwargs = {"tune_max_num_tokens": routed_tune_max_num_tokens(args["num_tokens"])}
+            fused_moe_fn = flashinfer.fused_moe.trtllm_fp4_block_scale_routed_moe
+        else:
+            routing_kwargs = {
+                "routing_logits": routing_logits,
+                "routing_bias": routing_bias,
+                "n_group": args["n_group"],
+                "topk_group": args["topk_group"],
+                "routed_scaling_factor": routed_scale,
+                "routing_method_type": ROUTING_METHODS[args["routing_method"]],
+            }
+            fused_moe_fn = flashinfer.fused_moe.trtllm_fp4_block_scale_moe
 
         def run_once() -> None:
             _call_trtllm_fp4_moe(
-                flashinfer.fused_moe.trtllm_fp4_block_scale_moe,
+                fused_moe_fn,
                 stack=stack,
                 per_token_scale=per_token_scale,
                 kwargs={
-                    "routing_logits": routing_logits,
-                    "routing_bias": routing_bias,
+                    **routing_kwargs,
                     "hidden_states": hidden,
                     "hidden_states_scale": hidden_scale,
                     "gemm1_weights": w1,
@@ -344,13 +393,9 @@ def _profile_nvfp4_fused_moe_sm100(
                     "output2_scale_scalar": expert_scale,
                     "num_experts": args["num_experts"],
                     "top_k": args["top_k"],
-                    "n_group": args["n_group"],
-                    "topk_group": args["topk_group"],
                     "intermediate_size": args["intermediate_size"],
                     "local_expert_offset": 0,
                     "local_num_experts": args["num_local_experts"],
-                    "routed_scaling_factor": routed_scale,
-                    "routing_method_type": ROUTING_METHODS[args["routing_method"]],
                     "do_finalize": do_finalize,
                     "activation_type": 3,
                     "output": output,
@@ -362,7 +407,8 @@ def _profile_nvfp4_fused_moe_sm100(
         # signature, so timing an extra autotune here would select a tactic its
         # production invocation does not use.
         if stack != "sglang":
-            with autotune_cached(autotune, f"nvfp4_fused_moe.{stack}"):
+            tuning_label = f"nvfp4_fused_moe.{stack}" + (".routed" if precomputed_routing else "")
+            with autotune_cached(autotune, tuning_label):
                 run_once()
         else:
             run_once()
@@ -383,7 +429,11 @@ def _profile_nvfp4_fused_moe_sm100(
     return ComputeMetrics(
         time_ms=time_ms,
         tflops=flops / elapsed_s / 1e12,
-        memory_bandwidth_gbps=_logical_bytes(args, do_finalize=do_finalize) / elapsed_s / 1e9,
+        memory_bandwidth_gbps=_logical_bytes(
+            args, do_finalize=do_finalize, precomputed_routing=precomputed_routing
+        )
+        / elapsed_s
+        / 1e9,
         energy_j=energy_j,
     )
 
@@ -392,11 +442,18 @@ def profile_nvfp4_fused_moe_sm100(**kwargs: Any) -> ComputeMetrics:
     return _profile_nvfp4_fused_moe_sm100(stack="vllm", do_finalize=True, **kwargs)
 
 
+def profile_nvfp4_fused_moe_routed_sm100(**kwargs: Any) -> ComputeMetrics:
+    return _profile_nvfp4_fused_moe_sm100(
+        stack="vllm", do_finalize=True, precomputed_routing=True, **kwargs
+    )
+
+
 def profile_nvfp4_fused_moe_deferred_finalize_sm100(**kwargs: Any) -> ComputeMetrics:
     return _profile_nvfp4_fused_moe_sm100(stack="sglang", do_finalize=False, **kwargs)
 
 
 __all__ = [
     "profile_nvfp4_fused_moe_deferred_finalize_sm100",
+    "profile_nvfp4_fused_moe_routed_sm100",
     "profile_nvfp4_fused_moe_sm100",
 ]

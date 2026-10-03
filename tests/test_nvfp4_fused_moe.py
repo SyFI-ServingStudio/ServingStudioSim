@@ -8,7 +8,11 @@ from profiling.db.batch import coerce_args
 from profiling.db.registry import BackendSupport, known_backends, supported_backends
 from profiling.kernels.nvfp4_fused_moe import KIND, Nvfp4FusedMoeArgs
 from profiling.runners.moe.exact_topk import exact_topk_ids
-from profiling.runners.moe.nvfp4_fused_moe import _logical_bytes, _validate_args
+from profiling.runners.moe.nvfp4_fused_moe import (
+    _logical_bytes,
+    _validate_args,
+    routed_tune_max_num_tokens,
+)
 
 
 def test_exact_topk_ids_realize_distinct_expert_counts() -> None:
@@ -57,6 +61,21 @@ def test_logical_bytes_follow_the_finalize_mode_of_the_dispatch() -> None:
     hidden = args["hidden_size"]
     assert deferred - finalized == 2 * hidden * (local_rows - args["num_tokens"])
     assert finalized != deferred
+
+
+def test_precomputed_routing_bills_selected_ids_and_weights_not_logits() -> None:
+    args = _args()
+    routed = _logical_bytes(args, do_finalize=True, precomputed_routing=True)
+    logits = _logical_bytes(args, do_finalize=True)
+    tokens, experts, top_k = args["num_tokens"], args["num_experts"], args["top_k"]
+    assert logits - routed == 2 * tokens * experts + 2 * experts - 8 * tokens * top_k
+
+
+def test_routed_tuning_bound_covers_the_dp_gathered_batch() -> None:
+    assert routed_tune_max_num_tokens(1) == 8192
+    assert routed_tune_max_num_tokens(8192) == 8192
+    assert routed_tune_max_num_tokens(8193) == 16384
+    assert routed_tune_max_num_tokens(65536) == 65536
 
 
 def test_logical_bytes_charge_weights_only_for_active_local_experts() -> None:
