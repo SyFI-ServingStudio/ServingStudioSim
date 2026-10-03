@@ -126,13 +126,33 @@ def kernel_category(name: str) -> str:
     substring scan per launch was 9% of a 9M-kernel parse.
     """
     lowered = name.lower()
+    # AMD substrings are added ADDITIVELY alongside the NVIDIA ones so the shared
+    # taxonomy classifies ROCm kernels (ROCm's rocBLAS/hipBLASLt GEMM, Composable
+    # Kernel `ck_*`, AITER fused-MoE, flash/paged attention) into the same coarse
+    # buckets instead of collapsing them all to "other". None of the AMD tokens
+    # occur in NVIDIA kernel names, so the NVIDIA classification is unchanged. The
+    # bucket order matters: a Composable-Kernel MoE (`ck_moe`) or attention
+    # (`ck_attn`) is caught by its specific branch before the broad `ck_` GEMM
+    # fallback below.
     if "multimem_all_reduce" in lowered or "cross_device_reduce" in lowered:
         return "multimem_all_reduce"
-    if "nccl" in lowered:
+    if "nccl" in lowered or "rccl" in lowered:
         return "nccl_collective"
-    if "fused_moe_kernel" in lowered:
+    if (
+        "fused_moe_kernel" in lowered
+        or "fused_moe" in lowered
+        or "ck_moe" in lowered
+        or "moe_gemm" in lowered
+    ):
         return "fused_moe"
-    if "flashattn" in lowered or "flash" in lowered:
+    if (
+        "flashattn" in lowered
+        or "flash" in lowered
+        or "_attn_" in lowered
+        or "fmha" in lowered
+        or "paged_attention" in lowered
+        or "ck_attn" in lowered
+    ):
         return "attention"
     if "act_and_mul" in lowered or "silu" in lowered:
         return "activation"
@@ -152,7 +172,15 @@ def kernel_category(name: str) -> str:
         or "triton_red" in lowered
     ):
         return "norm_reduce"
-    if "nvjet" in lowered or "cutlass" in lowered:
+    if (
+        "nvjet" in lowered
+        or "cutlass" in lowered
+        or "hipblaslt" in lowered
+        or "hipblas" in lowered
+        or "rocblas" in lowered
+        or "ck_gemm" in lowered
+        or "ck_" in lowered
+    ):
         return "gemm_or_cutlass"
     if "memcpy" in lowered or "copy" in lowered:
         return "copy_other"

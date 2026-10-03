@@ -82,6 +82,89 @@ _NAME_FK_HINTS = ("kernel_id", "symbol_id", "name_id", "string_id")
 # Primary-key column on the kernel-symbol / string table.
 _NAME_PK_HINTS = ("id", "kernel_id", "symbol_id")
 
+# Columns a full dispatch row carries beyond start/end/name. These feed the
+# offline alignment producer (``alignment/rocpd``), not the per-kernel timer, so
+# they are resolved by a separate discovery that leaves the timing path above
+# untouched. All are optional: a column the schema omits resolves to ``None``
+# and the reader fills a neutral default (and synthesizes correlation ids).
+# The GPU stream the dispatch ran on. rocpd names it ``stream_id``; older
+# shapes only have the hardware ``queue_id``, which is the same ownership key.
+_STREAM_COLUMN_HINTS = ("stream_id", "queue_id")
+# A per-launch identity. rocpd's ``dispatch_id`` is the monotonic launch counter
+# that plays the role CUPTI's ``correlationId`` does; a kernel-only trace may
+# carry neither, in which case the reader synthesizes one (see below).
+_CORRELATION_COLUMN_HINTS = ("correlation_id", "dispatch_id")
+# The GPU the dispatch ran on. rocpd keys it as ``agent_id`` (an FK into
+# ``rocpd_info_agent``); the integer value itself is the device identity we need.
+_DEVICE_COLUMN_HINTS = ("agent_id", "device_id", "gpu_id")
+# The OS process that launched the dispatch.
+_PID_COLUMN_HINTS = ("pid",)
+# The OS thread that opened a roctx region, matched against the launching
+# thread so a dispatch is attributed to the region its own thread was inside.
+_TID_COLUMN_HINTS = ("tid", "thread_id", "global_tid")
+# The launch grid dimensions rocpd records per dispatch (ROCm 7.x shape:
+# ``grid_size_x``/``_y``/``_z``). The alignment producer uses them to recognize
+# the ``vibesim_sentinel`` marker kernels the roctx shim launches at each forward
+# boundary and to decode the iteration ordinal those sentinels carry in the
+# y-grid dimension (see ``alignment/rocpd/evidence.py`` and the Option-B sentinel
+# contract in ``alignment/profiler/roctx_shim.py``). They are optional: a schema
+# that omits them resolves to ``None`` and the reader fills 0 (no grid signal).
+_GRID_X_COLUMN_HINTS = ("grid_size_x",)
+_GRID_Y_COLUMN_HINTS = ("grid_size_y",)
+_GRID_Z_COLUMN_HINTS = ("grid_size_z",)
+
+# roctx region table discovery. rocpd records every roctx push/pop range in a
+# ``rocpd_region`` table. Its ``name_id`` FK resolves (via the string table) only
+# to the API op name (``roctxThreadRangeA``); the range's real message text is on
+# the joined event row's ``extdata`` JSON (see ``_EVENT_TABLE_HINTS`` below).
+_REGION_TABLE_HINTS = ("rocpd_region", "roctx_region", "region")
+_REGION_START_HINTS = ("start", "start_timestamp", "start_ns", "begin")
+_REGION_END_HINTS = ("end", "end_timestamp", "end_ns", "finish")
+# FK on the region row to the string table carrying the roctx message text.
+_REGION_NAME_FK_HINTS = ("name_id", "region_name_id", "string_id")
+# The shared interned-string table (``rocpd_string``: id -> string).
+_STRING_TABLE_HINTS = ("rocpd_string", "string")
+_STRING_PK_HINTS = ("id", "string_id")
+_STRING_VALUE_HINTS = ("string", "value", "name")
+
+# The real roctx label does NOT live in the region's ``name_id`` string: on a
+# rocprofv3 1.3.2 / rocprofiler-sdk capture that column resolves to the API op
+# name ``roctxThreadRangeA`` (category ``MARKER_CORE_RANGE_API``), the same for
+# every roctx range. The instrumented label text (``vllm_iteration(N): forward``,
+# ``VibeSimAlignmentIteration {json}``) is carried as JSON in the *event* row the
+# region points at via ``event_id``: ``rocpd_event.extdata`` = ``{"message": ...}``
+# (also surfaced as the ``extdata`` column of rocprofv3's ``regions`` view). So
+# the reader joins region -> event and reads the ``message`` field, falling back
+# to the ``name_id`` string only when no extdata message is present (older
+# captures, or a synthetic db that interns the label directly as the region name).
+_EVENT_TABLE_HINTS = ("rocpd_event", "event")
+# FK on the region row pointing at the event table (``rocpd_region.event_id``).
+_REGION_EVENT_FK_HINTS = ("event_id",)
+_EVENT_PK_HINTS = ("id", "event_id")
+# The JSON blob column on the event row carrying ``{"message": "<roctx label>"}``.
+_EVENT_EXTDATA_HINTS = ("extdata",)
+
+
+def _roctx_message_from_extdata(extdata: object) -> str | None:
+    """Pull the roctx label out of a rocpd event's ``extdata`` JSON blob.
+
+    rocprofv3 stores the roctx range's actual message as ``{"message": "..."}``
+    in ``rocpd_event.extdata``; an unannotated range carries ``{}`` (or NULL).
+    Returns the message string when present and non-empty, else ``None`` so the
+    caller can fall back to the region's interned ``name_id`` string.
+    """
+    if not extdata:
+        return None
+    try:
+        payload = json.loads(extdata)
+    except (TypeError, ValueError):
+        return None
+    if isinstance(payload, dict):
+        message = payload.get("message")
+        if isinstance(message, str) and message:
+            return message
+    return None
+
 
 @dataclass(frozen=True)
 class RocpdResolvedSchema:
@@ -242,6 +325,233 @@ def _dispatch_rows(
         f'FROM "{dispatch}" ORDER BY "{start}"'
     )
     return [(float(row[0]), row[1]) for row in conn.execute(sql).fetchall()]
+
+
+@dataclass(frozen=True)
+class RocpdDispatch:
+    """One kernel dispatch with the full set of fields alignment attribution needs.
+
+    This is the richer sibling of the ``(duration_ns, name)`` row the timing path
+    reads: the timer only needs how long a launch took, while the offline
+    alignment producer must also know WHICH stream, process, device, and launch a
+    dispatch belongs to so it can place it in a roctx iteration window and emit
+    the normalized ``parsed.kernels.parquet`` row. ``correlation_id`` is the
+    monotonic launch identity (rocpd's ``dispatch_id`` when present, else a
+    synthesized 1-based counter in start order); ``stream_id``/``device_id``/
+    ``pid`` default to 0 when a reduced capture omits the column.
+    """
+
+    start_ns: int
+    end_ns: int
+    name: str | None
+    stream_id: int
+    correlation_id: int
+    device_id: int
+    pid: int
+    #: The launch grid dimensions (``grid_size_x``/``_y``/``_z``). 0 when a
+    #: reduced capture omits the columns. The alignment producer reads these to
+    #: identify ``vibesim_sentinel`` marker kernels and decode the iteration
+    #: ordinal they carry in the y-grid dimension (Option-B sentinel capture).
+    grid_size_x: int = 0
+    grid_size_y: int = 0
+    grid_size_z: int = 0
+
+    @property
+    def duration_ns(self) -> int:
+        return self.end_ns - self.start_ns
+
+
+@dataclass(frozen=True)
+class RoctxRegion:
+    """One roctx push/pop range: an instrumented marker like ``vllm_iteration(3): forward``.
+
+    rocpd stores every roctx range in its region table; the message text lives
+    on the joined event row's ``extdata`` JSON (the region's own ``name_id`` only
+    gives the API op name). These are the windows the alignment ownership join
+    tests a dispatch's launch time against. ``pid``/``tid`` are the
+    process and thread that opened the range (``None`` when the schema omits them).
+    """
+
+    start_ns: int
+    end_ns: int
+    tid: int | None
+    pid: int | None
+    name: str
+
+
+def kernel_dispatch_records_from_rocpd(db_path: str) -> list[RocpdDispatch]:
+    """Read every kernel dispatch as a full :class:`RocpdDispatch`, in start order.
+
+    The timing path (:func:`kernel_dispatch_durations_from_rocpd`) reuses
+    :func:`resolve_rocpd_schema` for the dispatch table + start/end + name join;
+    this adds a separate discovery for the stream/correlation/device/pid columns
+    so that path is left byte-for-byte unchanged. Any of those columns the schema
+    omits resolves to ``None`` and is filled with a neutral default. When the
+    capture carries no per-launch id at all (a pure kernel trace), a monotonic
+    1-based ``correlation_id`` is synthesized in start order so the downstream
+    non-null ``correlation_id`` parquet column is always satisfiable.
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        schema = resolve_rocpd_schema(conn)
+        dispatch = schema.dispatch_table
+        columns = _column_names(conn, dispatch)
+        stream_col = _first_column_matching(columns, _STREAM_COLUMN_HINTS)
+        correlation_col = _first_column_matching(columns, _CORRELATION_COLUMN_HINTS)
+        device_col = _first_column_matching(columns, _DEVICE_COLUMN_HINTS)
+        pid_col = _first_column_matching(columns, _PID_COLUMN_HINTS)
+        grid_x_col = _first_column_matching(columns, _GRID_X_COLUMN_HINTS)
+        grid_y_col = _first_column_matching(columns, _GRID_Y_COLUMN_HINTS)
+        grid_z_col = _first_column_matching(columns, _GRID_Z_COLUMN_HINTS)
+
+        def qualified(column: str | None) -> str:
+            return f'd."{column}"' if column else "NULL"
+
+        join = ""
+        if schema.name_table is not None and schema.name_column is not None:
+            fk = _first_column_matching(columns, _NAME_FK_HINTS)
+            pk = _first_column_matching(_column_names(conn, schema.name_table), _NAME_PK_HINTS)
+            if fk is not None and pk is not None:
+                join = f'LEFT JOIN "{schema.name_table}" n ON d."{fk}" = n."{pk}"'
+                name_select = f'n."{schema.name_column}"'
+            else:
+                name_select = "NULL"
+        elif schema.name_column is not None:
+            name_select = f'd."{schema.name_column}"'
+        else:
+            name_select = "NULL"
+
+        sql = (
+            f'SELECT d."{schema.start_column}", d."{schema.end_column}", {name_select}, '
+            f"{qualified(stream_col)}, {qualified(correlation_col)}, "
+            f"{qualified(device_col)}, {qualified(pid_col)}, "
+            f"{qualified(grid_x_col)}, {qualified(grid_y_col)}, {qualified(grid_z_col)} "
+            f'FROM "{dispatch}" d {join} ORDER BY d."{schema.start_column}"'
+        )
+        rows = conn.execute(sql).fetchall()
+    finally:
+        conn.close()
+
+    records: list[RocpdDispatch] = []
+    for ordinal, (
+        start,
+        end,
+        name,
+        stream,
+        correlation,
+        device,
+        pid,
+        grid_x,
+        grid_y,
+        grid_z,
+    ) in enumerate(rows, start=1):
+        records.append(
+            RocpdDispatch(
+                start_ns=int(start),
+                end_ns=int(end),
+                name=None if name is None else str(name),
+                stream_id=int(stream) if stream is not None else 0,
+                correlation_id=int(correlation) if correlation is not None else ordinal,
+                device_id=int(device) if device is not None else 0,
+                pid=int(pid) if pid is not None else 0,
+                grid_size_x=int(grid_x) if grid_x is not None else 0,
+                grid_size_y=int(grid_y) if grid_y is not None else 0,
+                grid_size_z=int(grid_z) if grid_z is not None else 0,
+            )
+        )
+    return records
+
+
+def roctx_regions_from_rocpd(db_path: str) -> list[RoctxRegion]:
+    """Read every roctx range as a :class:`RoctxRegion`, in start order.
+
+    Returns an empty list when the capture has no region table (a kernel-only
+    trace, such as the upstream vLLM MI210 capture) -- absence of markers is a
+    real state the ownership join handles, not an error. Raises ``ValueError``
+    only when a region table exists but lacks a resolvable start/end/name.
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        tables = _table_names(conn)
+        region_table = _first_table_matching(tables, _REGION_TABLE_HINTS)
+        if region_table is None:
+            return []
+        columns = _column_names(conn, region_table)
+        start_col = _first_column_matching(columns, _REGION_START_HINTS)
+        end_col = _first_column_matching(columns, _REGION_END_HINTS)
+        name_fk = _first_column_matching(columns, _REGION_NAME_FK_HINTS)
+        if start_col is None or end_col is None or name_fk is None:
+            raise ValueError(
+                f"rocpd region table {region_table!r} lacks a resolvable "
+                f"start/end/name column; columns={columns}"
+            )
+        tid_col = _first_column_matching(columns, _TID_COLUMN_HINTS)
+        pid_col = _first_column_matching(columns, _PID_COLUMN_HINTS)
+
+        def qualified(column: str | None) -> str:
+            return f'r."{column}"' if column else "NULL"
+
+        # Fallback label source: the region's interned ``name_id`` string. On a
+        # real rocprofv3 capture this is only ``roctxThreadRangeA`` (the API op
+        # name), so it is the fallback; the true label comes from the event join
+        # below. A synthetic db that interns the label directly still resolves
+        # here, which is why this is kept.
+        string_table = _first_table_matching(tables, _STRING_TABLE_HINTS)
+        join = ""
+        name_select = f'r."{name_fk}"'
+        if string_table is not None:
+            string_columns = _column_names(conn, string_table)
+            string_pk = _first_column_matching(string_columns, _STRING_PK_HINTS)
+            string_value = _first_column_matching(string_columns, _STRING_VALUE_HINTS)
+            if string_pk is not None and string_value is not None:
+                join = f'LEFT JOIN "{string_table}" s ON r."{name_fk}" = s."{string_pk}"'
+                name_select = f's."{string_value}"'
+
+        # Primary label source: the event row the region points at via
+        # ``event_id``, whose ``extdata`` JSON carries ``{"message": "<label>"}``.
+        event_table = _first_table_matching(tables, _EVENT_TABLE_HINTS)
+        event_fk = _first_column_matching(columns, _REGION_EVENT_FK_HINTS)
+        event_join = ""
+        extdata_select = "NULL"
+        if event_table is not None and event_fk is not None:
+            event_columns = _column_names(conn, event_table)
+            event_pk = _first_column_matching(event_columns, _EVENT_PK_HINTS)
+            event_extdata = _first_column_matching(event_columns, _EVENT_EXTDATA_HINTS)
+            if event_pk is not None and event_extdata is not None:
+                event_join = (
+                    f'LEFT JOIN "{event_table}" e ON r."{event_fk}" = e."{event_pk}"'
+                )
+                extdata_select = f'e."{event_extdata}"'
+
+        sql = (
+            f'SELECT r."{start_col}", r."{end_col}", {name_select}, {extdata_select}, '
+            f"{qualified(tid_col)}, {qualified(pid_col)} "
+            f'FROM "{region_table}" r {join} {event_join} ORDER BY r."{start_col}"'
+        )
+        rows = conn.execute(sql).fetchall()
+    finally:
+        conn.close()
+
+    regions: list[RoctxRegion] = []
+    for start, end, fallback_name, extdata, tid, pid in rows:
+        # Prefer the real roctx label from the event's extdata JSON; only when it
+        # is absent does the interned region name (``roctxThreadRangeA`` on a real
+        # capture) stand in. A range with neither is not an instrumented marker.
+        label = _roctx_message_from_extdata(extdata)
+        if label is None and fallback_name is not None:
+            label = str(fallback_name)
+        if label is None:
+            continue
+        regions.append(
+            RoctxRegion(
+                start_ns=int(start),
+                end_ns=int(end),
+                tid=None if tid is None else int(tid),
+                pid=None if pid is None else int(pid),
+                name=label,
+            )
+        )
+    return regions
 
 
 def kernel_dispatch_durations_from_rocpd(
