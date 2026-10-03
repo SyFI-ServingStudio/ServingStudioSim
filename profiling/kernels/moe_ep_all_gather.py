@@ -56,6 +56,7 @@ DOC = KernelDoc(
         "built before timing."
     ),
     caveats=(
+        "Measured with NCCL_NVLS_ENABLE=0: NVLS multicast is unavailable on the profiling host.",
         "The measurement gathers only hidden states and router logits; "
         "the production call can include extra tensors.",
         "The two gathers are timed together, so their individual costs are not reported.",
@@ -82,6 +83,12 @@ register(
         metric_family=MetricFamily.COMM,
         batch_outlier_policy=BatchOutlierPolicy(),
         subprocess_env="vllm_env",
+        # NCCL cannot bind NVLS multicast memory on the B200 host (CUDA error
+        # 401 at communicator setup, NCCL 2.29.7; logs/20261003_4_dp_attn_ep/
+        # debug/3416.out), and the collective then fails as "unhandled cuda
+        # error". With NVLS off NCCL runs its NVLink ring/tree algorithms.
+        # all_gatherv is grouped broadcasts, which never use NVLS anyway.
+        worker_env=(("NCCL_NVLS_ENABLE", "0"),),
         gpu_count_fn=lambda spec: int(spec["num_gpus"]),
         list_native=True,
         doc=BackendDoc(
