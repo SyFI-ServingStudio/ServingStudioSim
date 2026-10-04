@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import subprocess
+import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, fields
@@ -37,6 +39,8 @@ STANDARD_COLUMNS = [
 _WRITE_LOCK_TIMEOUT_S = 120.0
 # Bound parameters per lookup statement; SQLite allows 32766. See `Table._match_rows`.
 _SQL_VARIABLES = 30000
+# Each thread's last read-only connection. See `Table._connect_read_only`.
+_read_only = threading.local()
 
 COMPUTE_METRIC_COLUMNS = ["time_ms", "tflops", "memory_bandwidth_gbps", "energy_j"]
 # message_size for comm kernels is an args/cache-key column, NOT a measured
@@ -292,13 +296,26 @@ class Table:
             yield conn
 
     def _connect_read_only(self) -> sqlite3.Connection | None:
-        """Open a physically read-only connection without creating the DB."""
+        """A physically read-only connection, without creating the DB.
+
+        A build queries once per kernel, and a new connection parses the whole
+        schema before its first statement. So each thread reuses its last
+        connection while the file is the same one, unchanged on disk; any write,
+        replacement or fork opens (and ``require_current`` checks) a new one.
+        """
         if not self.db_path.is_file():
             return None
-        conn = sqlite3.connect(f"{self.db_path.resolve().as_uri()}?mode=ro", uri=True)
+        path = self.db_path.resolve()
+        stat = path.stat()
+        identity = (path, stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, os.getpid())
+        cached = getattr(_read_only, "connection", None)
+        if cached is not None and cached[0] == identity:
+            return cached[1]
+        conn = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA query_only = ON")
         require_current(conn, str(self.db_path))
+        _read_only.connection = (identity, conn)
         return conn
 
     def _ensure_schema(self, conn: sqlite3.Connection) -> None:
