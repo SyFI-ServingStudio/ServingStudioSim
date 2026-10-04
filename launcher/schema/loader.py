@@ -334,16 +334,21 @@ def iter_slots(registry: Registry, config: dict, *, create: bool = False) -> Ite
                     yield Slot(group, fld, pdef, base + (fld,))
             arch = _child(group, "arch")
             if arch is not None:
-                arch_type = arch.get("type")
-                for pdef in registry.arch_common:
-                    yield Slot(arch, pdef["name"], pdef, base + ("arch", pdef["name"]))
-                for pdef in registry.arch_params(contract, arch_type):
-                    yield Slot(arch, pdef["name"], pdef, base + ("arch", pdef["name"]))
+                yield from iter_arch_slots(registry, contract, arch, base + ("arch",))
             worker = _child(group, "worker")
             if worker is not None:
                 worker_type = worker.get("type")
                 for pdef in registry.worker_params(contract, worker_type):
                     yield Slot(worker, pdef["name"], pdef, base + ("worker", pdef["name"]))
+
+
+def iter_arch_slots(
+    registry: Registry, contract: str, arch: dict, path: tuple[str, ...] = ("arch",)
+) -> Iterator[Slot]:
+    """Yield one `Slot` per expected param of one arch block of `contract`:
+    the params every arch carries, then its type's own."""
+    for pdef in [*registry.arch_common, *registry.arch_params(contract, arch.get("type"))]:
+        yield Slot(arch, pdef["name"], pdef, path + (pdef["name"],))
 
 
 def unknown_keys(registry: Registry, config: dict) -> list[str]:
