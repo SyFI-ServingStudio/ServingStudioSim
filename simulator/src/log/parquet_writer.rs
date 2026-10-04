@@ -203,7 +203,7 @@ mod tests {
     //! reader — so we exercise the real on-disk encode/decode path, not just
     //! the in-memory `RecordBatch` construction that `rows.rs` tests cover.
     use super::*;
-    use crate::log::rows::{cost_to_record_batch, CostLogChunk, CostLogEntry, GroupInputLog};
+    use crate::log::rows::{cost_to_record_batches, CostLogChunk, CostLogEntry, GroupInputLog};
     use crate::log::schemas::cost_log_schema;
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use std::fs::File;
@@ -266,8 +266,9 @@ mod tests {
         for i in 0..8192u64 {
             push_row(&mut chunk, 0, i, 4);
         }
-        let rb = cost_to_record_batch(&chunk).unwrap();
-        writer.write(&rb).unwrap();
+        for rb in cost_to_record_batches(&chunk).unwrap() {
+            writer.write(&rb).unwrap();
+        }
         writer.close().unwrap();
         assert_eq!(count_rows(&path).unwrap(), 8192);
     }
@@ -287,8 +288,9 @@ mod tests {
             for i in 0..8192u64 {
                 push_row(&mut chunk, 0, batch_idx * 8192 + i, 4);
             }
-            let rb = cost_to_record_batch(&chunk).unwrap();
-            writer.write(&rb).unwrap();
+            for rb in cost_to_record_batches(&chunk).unwrap() {
+                writer.write(&rb).unwrap();
+            }
         }
         writer.close().unwrap();
         assert_eq!(count_rows(&path).unwrap(), 16384);
