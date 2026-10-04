@@ -8,7 +8,9 @@ Every field comes from a source that lives with the code; nothing here guesses:
   subprocess environment);
 - a row's precision, from the column the Rust kernel names as its compute dtype;
 - GPU peaks from ``gpu/spec.json`` and model names from ``model/catalog.yaml``;
-- measurements from profile.db.
+- measurements from profile.db;
+- the kernel configs, from the public deployments (:mod:`public_api.deployments`):
+  each config a public member asks profile.db for, its grid, and who asks.
 """
 
 from __future__ import annotations
@@ -28,12 +30,13 @@ from profiling.db.doc import CATEGORIES, SUBCATEGORIES, arg_docs, kernel_doc
 from profiling.db.doc import METRICS as METRIC_DOCS
 from profiling.db.registry import MetricFamily, iter_kernel_profiler_specs
 from profiling.db.storage import CREATED_AT_FORMAT, RUN_AT_FORMAT, RUN_TABLE, iso_sql
-from profiling.db.table import STANDARD_COLUMNS
+from profiling.db.table import STANDARD_COLUMNS, Table
 from profiling.gpu_catalog import GpuSpecResolution, resolve_gpu_spec
 from profiling.runners.metrics import CommMetrics, ComputeMetrics
-from public_api.kernel.sources import KernelSources
+from public_api.deployments import Config, DeploymentIndex, scalar_identity
+from public_api.sources import Sources
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[1]
 MODEL_CATALOG = REPO_ROOT / "model" / "catalog.yaml"
 
 # What each row records about the run that measured it: every standard column
@@ -47,6 +50,10 @@ METRICS = {
 
 class UnknownKind(LookupError):
     """No registered kernel kind has this name."""
+
+
+class UnknownConfig(LookupError):
+    """No public deployment asks for a config with this id."""
 
 
 class BadQuery(ValueError):
@@ -85,7 +92,7 @@ def _peaks(spec: GpuSpecResolution, dtypes: list[str]) -> dict[str, dict]:
     return out
 
 
-def _git_commit() -> str | None:
+def git_commit() -> str | None:
     result = subprocess.run(
         ["git", "rev-parse", "HEAD"], cwd=REPO_ROOT, capture_output=True, text=True, check=False
     )
@@ -93,15 +100,16 @@ def _git_commit() -> str | None:
 
 
 class KernelLibrary:
-    """Builds the kernel library documents from :class:`KernelSources`."""
+    """Builds the kernel library documents from :class:`Sources`."""
 
-    def __init__(self, sources: KernelSources) -> None:
+    def __init__(self, sources: Sources, index: DeploymentIndex) -> None:
         self.sources = sources
+        self.index = index
         self.specs: dict[str, list] = {}
         for spec in iter_kernel_profiler_specs():
             self.specs.setdefault(spec.kernel_kind, []).append(spec)
         sources.watch(MODEL_CATALOG)
-        self.sim_commit = _git_commit()
+        self.sim_commit = git_commit()
 
     @property
     def models(self) -> dict[str, dict]:
@@ -325,6 +333,119 @@ class KernelLibrary:
             "columns": ["gpu", "backend", *args, *metrics, "provenance"],
             "rows": rows,
             "provenance": provenance,
+        }
+
+    # -- kernel configs ------------------------------------------------------------
+
+    def _measured(self, kind: str, profile_kind: str, gpu: str) -> dict[bytes, dict[str, dict]]:
+        """``{args_hash: {backend: metrics}}`` of a table's rows on one GPU."""
+
+        def compute() -> dict[bytes, dict[str, dict]]:
+            metrics = self._metrics(kind)
+            select = ", ".join(f'"{m}"' for m in metrics)
+            out: dict[bytes, dict[str, dict]] = {}
+            with self.sources.connect() as conn:
+                if not conn.execute(
+                    "select 1 from sqlite_master where type = 'table' and name = ?", [profile_kind]
+                ).fetchone():
+                    return out
+                query = (
+                    f'select args_hash, backend, is_outlier, {select} from "{profile_kind}" '
+                    "where gpu_name = ?"
+                )
+                for args_hash, backend, outlier, *values in conn.execute(query, [gpu]):
+                    out.setdefault(args_hash, {})[backend] = {
+                        **dict(zip(metrics, values, strict=True)),
+                        "outlier": bool(outlier),
+                    }
+            return out
+
+        return self.sources.cached_by_db(("measured", profile_kind, gpu), compute)
+
+    def _cell_rows(self, config: Config) -> list[dict[str, dict]]:
+        """Per grid cell, the row each backend measured there."""
+
+        spec = next(s for s in self._specs(config.kind) if s.table_name == config.profile_kind)
+        table = Table(spec, self.sources.db_path)
+        measured = self._measured(config.kind, config.profile_kind, config.gpu)
+        return [
+            measured.get(table.args_hash(table.db_key(spec.args_schema(**cell))), {})
+            for cell in config.grid["cells"]
+        ]
+
+    def _summary(self, config: Config) -> dict:
+        """What the list and the detail both say about one config."""
+
+        cells = config.grid["cells"]
+        columns = list(cells[0]) if cells else []
+        fixed = {c: cells[0][c] for c in columns if all(cell[c] == cells[0][c] for cell in cells)}
+        counts: dict[str, int] = {}
+        for backends in self._cell_rows(config):
+            for backend in backends:
+                counts[backend] = counts.get(backend, 0) + 1
+        scalars, structured = scalar_identity(config.identity)
+        return {
+            "id": config.id,
+            "kind": config.kind,
+            "gpu": config.gpu,
+            "cache_coords": config.grid["cache_coords"],
+            "axes": config.grid["axes"],
+            "shape": [len(axis) for axis in config.grid["axes"]],
+            "cells": len(cells),
+            "infeasible": len(config.grid["infeasible"]),
+            # cells each backend measured
+            "measured": counts,
+            # profile.db args every cell shares, and the ones the cache axes move
+            "fixed": fixed,
+            "swept": [c for c in columns if c not in fixed],
+            # the Rust config's scalar fields, and the names of its structured ones
+            "identity": scalars,
+            "structured": structured,
+            "uses": self.index.uses(config),
+        }
+
+    def configs(self, kind: str) -> dict:
+        """Every config a public deployment asks ``kind``'s rows for."""
+
+        self._specs(kind)
+        return {
+            "kind": kind,
+            "configs": [self._summary(config) for config in self.index.kind_configs(kind)],
+        }
+
+    def config(self, kind: str, config_id: str) -> dict:
+        """One config's grid on the simulator's cache axes: each cell's coordinates,
+        profile.db args, whether the kernel can run it and what each backend
+        measured there; plus the whole identity."""
+
+        config = self.index.configs.get(config_id)
+        if config is None or config.kind != kind:
+            raise UnknownConfig(config_id)
+        axes = config.grid["axes"]
+        infeasible = set(config.grid["infeasible"])
+
+        def coords(index: int) -> list[float]:
+            out = []
+            for axis in reversed(axes):
+                index, at = divmod(index, len(axis))
+                out.append(axis[at])
+            return out[::-1]
+
+        return {
+            **self._summary(config),
+            "identity": config.identity,
+            "metrics": self._metrics(kind),
+            "points": [
+                {
+                    "coords": coords(i),
+                    "feasible": i not in infeasible,
+                    "args": cell,
+                    "measured": measured,
+                }
+                for i, (cell, measured) in enumerate(
+                    zip(config.grid["cells"], self._cell_rows(config), strict=True)
+                )
+            ],
         }
 
     @staticmethod

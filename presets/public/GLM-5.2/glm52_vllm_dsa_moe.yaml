@@ -13,3 +13,6 @@ compound:
     ctx8k_out1k:
       routing: popularity
       expert_popularity_file: hf://datasets/UW-SyFI/servingstudio-workload@9498d838a0cb1793980d8bf90998eb7f9722fb2d/glm52_fp8/vllm/ctx8k_out1k/capture/20260803/popularity.json
+    uniform:
+      routing: uniform
+      expert_popularity_file: null

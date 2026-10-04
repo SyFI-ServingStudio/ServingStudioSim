@@ -1,4 +1,4 @@
-# Routing: uniform; this arch reads no capture.
+# Routing: synthetic; this arch reads no capture.
 checkpoint: Qwen/Qwen3-235B-A22B
 gpu: NVIDIA H200
 arch:
@@ -7,4 +7,13 @@ arch:
   attn_tp_size: 4
   ep_size: 8
   nvl_num_gpu: 8
-  routing: uniform
+  routing: ${routing}
+  routing_seed: ${routing_seed}
+compound:
+  workload:
+    uniform:
+      routing: uniform
+      routing_seed: null
+    random:
+      routing: random
+      routing_seed: 1

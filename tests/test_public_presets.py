@@ -8,7 +8,11 @@ import subprocess
 
 import pytest
 
+from profiling.perf_api import DB_PATH
+from public_api import predict
 from public_api import preset as public_preset
+from public_api.deployments import DeploymentIndex
+from public_api.sources import Sources
 
 PRESETS = public_preset.preset_paths()
 CAPTURE = re.compile(
@@ -16,6 +20,7 @@ CAPTURE = re.compile(
     r"[a-z0-9_]+/[a-z0-9_]+/[a-z0-9_]+/capture/\d{8}/(popularity|manifest)\.json$"
 )
 CAPTURE_FIELDS = ("expert_popularity_file", "token_corpus_file")
+SYNTHETIC = ("uniform", "random")
 
 
 def _ids(paths):
@@ -50,13 +55,21 @@ def test_a_public_preset_loads_and_expands(path):
 
 @pytest.mark.parametrize("path", PRESETS, ids=_ids(PRESETS))
 def test_a_workload_names_its_routing_and_a_pinned_capture(path):
+    """A workload is a capture, or a synthetic routing named after itself; a
+    synthetic one is never the default (first) row unless there is no capture."""
     preset = public_preset.load(path)
     rows = preset.get("compound", {}).get(public_preset.WORKLOAD, {})
     assert set(preset.get("compound", {})) <= {public_preset.WORKLOAD}
+    captured = [name for name, row in rows.items() if row["routing"] not in SYNTHETIC]
+    if captured:
+        assert next(iter(rows)) == captured[0], "a synthetic workload is the default"
 
     for name, row in rows.items():
         assert re.fullmatch(r"[a-z0-9_]+", name)
         captures = {field: row.get(field) for field in CAPTURE_FIELDS if row.get(field)}
+        if row["routing"] in SYNTHETIC:
+            assert name == row["routing"] and not captures, name
+            continue
         assert row["routing"] in ("popularity", "corpus"), name
         expected = (
             "expert_popularity_file" if row["routing"] == "popularity" else "token_corpus_file"
@@ -79,28 +92,36 @@ def test_every_moe_member_states_its_routing(sim_bin):
                 assert not any(arch.get(field) for field in CAPTURE_FIELDS), path
 
 
-@pytest.mark.needs_binary
-def test_every_member_builds(sim_bin):
-    """Structure only: routing reads its capture at run time, not here."""
-    blocks, names = [], []
-    for path in PRESETS:
-        for member in public_preset.members(public_preset.load(path)):
-            arch = {k: v for k, v in member["arch"].items() if k not in CAPTURE_FIELDS}
-            if "routing" in arch:
-                arch["routing"] = "uniform"
-            blocks.append({"gpu": member["gpu"], "arch": arch})
-            names.append(f"{path.parent.name}/{path.stem} {member['labels']}")
+@pytest.fixture(scope="module")
+def index(sim_bin) -> DeploymentIndex:
+    sources = Sources(db_path=DB_PATH)
+    index = DeploymentIndex.build(sources.cost_trees, sources.list_params(), sim_commit=None)
+    index.check(lambda member: predict.missing_specs(member))
+    return index
 
-    out = subprocess.run(
-        [sim_bin, "cost-trees", "-"],
-        input=json.dumps(blocks),
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    errors = [
-        (name, built["error"])
-        for name, built in zip(names, json.loads(out.stdout), strict=True)
-        if built.get("error")
+
+@pytest.mark.needs_binary
+@pytest.mark.needs_db
+def test_every_leaf_names_a_published_config(index):
+    """A tree's leaf finds its config from its own Rust config, in identity
+    form, so the Kernels page and the tree name one config."""
+    for preset in index.presets.values():
+        for member in preset.members:
+            for section in member.sections:
+                for slot in section["slots"]:
+                    assert slot["config"] in index.configs, (preset.id, member.params, slot)
+
+
+@pytest.mark.needs_binary
+@pytest.mark.needs_db
+def test_every_member_is_measured(index):
+    """Each member, with its captures, builds and finds every profile.db row its
+    kernels read in the shipped profile.db: the site offers only deployments it
+    can predict from measurements."""
+    unmeasured = [
+        (preset.id, member.params, member.error or member.missing)
+        for preset in index.presets.values()
+        for member in preset.members
+        if member.error or member.missing
     ]
-    assert not errors
+    assert not unmeasured

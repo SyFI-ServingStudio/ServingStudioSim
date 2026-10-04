@@ -8,7 +8,7 @@ arch:
   routing: ${routing}
   expert_popularity_file: ${expert_popularity_file}
 sweep:
-  max_model_len: [8192, 65536, 131072, 262144, 524288]
+  max_model_len: [8192, 65536, 131072, 262144, 524288, 1048576]
 compound:
   workload:
     diverse_100:

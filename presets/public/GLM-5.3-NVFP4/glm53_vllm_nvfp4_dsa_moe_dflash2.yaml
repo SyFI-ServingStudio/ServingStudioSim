@@ -5,8 +5,13 @@ arch:
   fp8: false
   ep_size: 4
   nvl_num_gpu: 4
+  max_model_len: ${max_model_len}
+  draft_tokens: 7
+  draft_sliding_window: 2048
   routing: ${routing}
   token_corpus_file: ${token_corpus_file}
+sweep:
+  max_model_len: [8192, 16384, 131072, 1048576]
 compound:
   workload:
     diverse_100:

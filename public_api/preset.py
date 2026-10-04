@@ -31,7 +31,8 @@ from pathlib import Path
 
 import yaml
 
-from launcher.schema.expand import expand_sweep_params
+from launcher.schema.expand import expand_sweep_params, normalize_arch
+from launcher.schema.loader import Registry
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PRESET_ROOT = REPO_ROOT / "presets" / "public"
@@ -76,11 +77,14 @@ def load(path: Path, catalog: dict | None = None) -> dict:
     return preset | {"_config": entry["config"]}
 
 
-def members(preset: dict) -> list[dict]:
+def members(preset: dict, registry: Registry | None = None) -> list[dict]:
     """Every deployment the preset supports, as ``{gpu, arch, labels}``.
 
     ``labels`` names the member by its swept values (a compound group by its
-    row label), so ``workload`` is the workload's name.
+    row label), so ``workload`` is the workload's name. Given the schema
+    (``simulator list-params``), each arch is complete, as the launcher writes
+    a run's: every param typed and each one the preset leaves out at its
+    default, so ``cost-trees`` and ``timing-predict`` read the same block.
     """
     tree = {key: preset[key] for key in ("gpu", "arch")}
     tree["arch"] = {
@@ -96,7 +100,9 @@ def members(preset: dict) -> list[dict]:
         out.append(
             {
                 "gpu": candidate["gpu"],
-                "arch": candidate["arch"],
+                "arch": (
+                    normalize_arch(candidate["arch"], registry) if registry else candidate["arch"]
+                ),
                 "labels": {name: labels.get(name, env[name]) for name in swept},
             }
         )

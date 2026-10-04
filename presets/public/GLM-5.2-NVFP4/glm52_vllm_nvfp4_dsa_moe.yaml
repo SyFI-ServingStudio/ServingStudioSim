@@ -5,10 +5,13 @@ arch:
   fp8: false
   ep_size: ${ep_size}
   nvl_num_gpu: ${ep_size}
+  max_model_len: ${max_model_len}
+  mtp_mode: 'off'
   routing: ${routing}
   expert_popularity_file: ${expert_popularity_file}
 sweep:
   ep_size: [4, 8]
+  max_model_len: [8192, 65536, 131072, 262144, 524288, 1048576]
 compound:
   workload:
     c32_long:

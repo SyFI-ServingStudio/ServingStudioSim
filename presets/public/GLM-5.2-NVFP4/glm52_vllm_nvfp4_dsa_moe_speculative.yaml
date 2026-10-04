@@ -5,11 +5,17 @@ arch:
   fp8: false
   ep_size: ${ep_size}
   nvl_num_gpu: ${ep_size}
+  max_model_len: ${max_model_len}
+  mtp_mode: ${mtp_mode}
+  draft_tokens: 5
   routing: ${routing}
   expert_popularity_file: ${expert_popularity_file}
   token_corpus_file: ${token_corpus_file}
 sweep:
   ep_size: [4, 8]
+  max_model_len: [8192, 16384, 65536, 131072, 262144, 524288, 1048576]
+  mtp_mode: [full_index, index_share]
+constraints: [ep_size == 4 or max_model_len == 131072, mtp_mode == 'full_index' or (ep_size == 4 and max_model_len == 8192)]
 compound:
   workload:
     diverse_100:

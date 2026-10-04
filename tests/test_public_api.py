@@ -23,10 +23,11 @@ from profiling.db.table import ProfileRow, Table
 from profiling.kernels.nvfp4_fused_moe import Nvfp4FusedMoeArgs
 from profiling.kernels.single_gemm import SingleGemmArgs
 from profiling.runners.metrics import ComputeMetrics
+from public_api import kernels as library
 from public_api.app import PREFIX, create_app
-from public_api.kernel import library
-from public_api.kernel.library import PROVENANCE, REPO_ROOT, KernelLibrary
-from public_api.kernel.sources import KernelSources
+from public_api.deployments import Config, DeploymentIndex, Member, Preset, config_id
+from public_api.kernels import PROVENANCE, REPO_ROOT, KernelLibrary
+from public_api.sources import Sources
 
 GEMM_ARGS = {"m": "INTEGER", "n": "INTEGER", "k": "INTEGER", "dtype": "TEXT"}
 PROV = ("abc123", "2026-09-01T00:00:00+00:00", "12.9", "580", None)
@@ -47,7 +48,7 @@ GEMM_DOC = KernelDoc(
 )
 
 
-class FixtureSources(KernelSources):
+class FixtureSources(Sources):
     """Real profile.db access, canned simulator introspection."""
 
     def kernel_list(self) -> list[dict]:
@@ -100,9 +101,72 @@ def catalog(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
+CHECKPOINT = "meta-llama/Meta-Llama-3-8B"
+PRESET = "Meta-Llama-3-8B/dense"
+GEMM_IDENTITY = {"n": 6144, "k": 4096, "dtype": "bf16"}
+GEMM_CELLS = [{"m": m, **GEMM_IDENTITY} for m in (1, 8, 16)]
+GEMM_CONFIG = config_id("single_gemm", "NVIDIA H200", GEMM_IDENTITY)
+
+
+def _member(tp_size: int, **state) -> Member:
+    return Member(
+        preset=PRESET,
+        params={"tp_size": tp_size},
+        gpu="NVIDIA H200",
+        arch={"type": "dense", "tp_size": tp_size},
+        block={},
+        predict={"cases": "fields"},
+        sections=[
+            {
+                "section": "layer",
+                "nodes": [{"kind": "leaf", "slot": 0}],
+                "slots": [
+                    {
+                        "name": "qkv",
+                        "kernel": "single_gemm",
+                        "config": GEMM_CONFIG,
+                        "backends": ["torch"],
+                    }
+                ],
+            }
+        ],
+        **state,
+    )
+
+
+def _index() -> DeploymentIndex:
+    """One preset of two members over one gemm config, three cells of which
+    the fixture database measured two on the H200."""
+    index = DeploymentIndex(None, {"prefill": ["input_len"]}, {CHECKPOINT: {"name": "Llama 3 8B"}})
+    members = [_member(1, missing={}), _member(2, missing={"single_gemm": 1})]
+    index.presets[PRESET] = Preset(
+        id=PRESET,
+        checkpoint=CHECKPOINT,
+        arch="dense",
+        gpu="NVIDIA H200",
+        axes=[{"name": "tp_size", "values": [1, 2]}],
+        members=members,
+    )
+    index.configs[GEMM_CONFIG] = Config(
+        id=GEMM_CONFIG,
+        kind="single_gemm",
+        profile_kind="single_gemm",
+        gpu="NVIDIA H200",
+        identity=GEMM_IDENTITY,
+        grid={
+            "cache_coords": ["m"],
+            "axes": [[1.0, 8.0, 16.0]],
+            "cells": GEMM_CELLS,
+            "infeasible": [2],
+        },
+        uses={(PRESET, 0): ["layer.qkv"], (PRESET, 1): ["layer.qkv"]},
+    )
+    return index
+
+
 @pytest.fixture
-def client(db: Path) -> TestClient:
-    return TestClient(create_app(KernelLibrary(FixtureSources(db_path=db))))
+def client(db: Path, tmp_path: Path) -> TestClient:
+    return TestClient(create_app(KernelLibrary(FixtureSources(db_path=db), _index()), tmp_path))
 
 
 def test_catalog_lists_every_kind_with_coverage_and_the_models(client: TestClient) -> None:
@@ -206,7 +270,7 @@ def test_nvfp4_fused_moe_precision_is_each_backends_weight_format(tmp_path: Path
     path = tmp_path / "nvfp4.db"
     for spec in iter_kernel_profiler_specs("nvfp4_fused_moe"):
         Table(spec, path).insert([_nvfp4_row(spec.backend)])
-    client = TestClient(create_app(KernelLibrary(Nvfp4Sources(db_path=path))))
+    client = TestClient(create_app(KernelLibrary(Nvfp4Sources(db_path=path), _index())))
 
     catalog = client.get(f"{PREFIX}/kernels").json()
     kernel = next(k for k in catalog["kernels"] if k["kind"] == "nvfp4_fused_moe")
@@ -233,7 +297,7 @@ def test_nvfp4_fused_moe_precision_is_each_backends_weight_format(tmp_path: Path
 
 @pytest.mark.needs_binary
 def test_the_binary_tags_nvfp4_weight_format_as_the_compute_dtype(tmp_path: Path) -> None:
-    entries = KernelSources(db_path=tmp_path / "unused.db").kernel_list()
+    entries = Sources(db_path=tmp_path / "unused.db").kernel_list()
     (entry,) = [e for e in entries if e["kind"] == "nvfp4_fused_moe"]
     assert entry["compute_dtype"] == "weight_format"
 
@@ -290,7 +354,7 @@ def test_the_database_is_never_written(client: TestClient, db: Path) -> None:
 
 def test_a_kind_doc_declares_its_view(db: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(library, "kernel_doc", kernel_doc)
-    client = TestClient(create_app(KernelLibrary(FixtureSources(db_path=db))))
+    client = TestClient(create_app(KernelLibrary(FixtureSources(db_path=db), _index())))
     view = client.get(f"{PREFIX}/kernels/nvfp4_fused_moe").json()["view"]
     assert view == asdict(kernel_doc("nvfp4_fused_moe").view)
     assert (view["series"]["field"], view["workload"]["field"]) == (
@@ -306,3 +370,77 @@ def test_every_checkpoint_in_the_catalog_names_a_config_file() -> None:
         assert "/" in checkpoint, f"{checkpoint}: key a checkpoint by its Hugging Face repo"
         assert {"name", "family", "config"} <= set(entry), checkpoint
         assert (REPO_ROOT / "model" / "config" / f"{entry['config']}.json").is_file(), checkpoint
+
+
+def test_a_configs_grid_joins_the_rows_measured_on_its_gpu(client: TestClient) -> None:
+    [listed] = client.get(f"{PREFIX}/kernels/single_gemm/configs").json()["configs"]
+    assert listed["id"] == GEMM_CONFIG
+    assert listed["measured"] == {"torch": 2}
+    assert (listed["fixed"], listed["swept"]) == (GEMM_IDENTITY, ["m"])
+    assert listed["uses"] == [
+        {"preset": PRESET, "params": {"tp_size": 1}, "roles": ["layer.qkv"]},
+        {"preset": PRESET, "params": {"tp_size": 2}, "roles": ["layer.qkv"]},
+    ]
+
+    detail = client.get(f"{PREFIX}/kernels/single_gemm/configs/{GEMM_CONFIG}").json()
+    assert detail["identity"] == GEMM_IDENTITY
+    assert [p["coords"] for p in detail["points"]] == [[1.0], [8.0], [16.0]]
+    assert [p["feasible"] for p in detail["points"]] == [True, True, False]
+    # The B200 row of the same args belongs to another GPU's config.
+    assert [p["measured"] for p in detail["points"]] == [
+        {
+            "torch": {
+                "time_ms": 0.01,
+                "tflops": 5.0,
+                "memory_bandwidth_gbps": 100.0,
+                "energy_j": None,
+                "outlier": False,
+            }
+        },
+        {
+            "torch": {
+                "time_ms": 0.02,
+                "tflops": 20.0,
+                "memory_bandwidth_gbps": 200.0,
+                "energy_j": None,
+                "outlier": False,
+            }
+        },
+        {},
+    ]
+    assert client.get(f"{PREFIX}/kernels/single_gemm/configs/0000000000000000").status_code == 404
+    assert client.get(f"{PREFIX}/kernels/nvfp4_fused_moe/configs/{GEMM_CONFIG}").status_code == 404
+
+
+def test_models_list_presets_and_a_tree_is_named_by_its_axes(client: TestClient) -> None:
+    [checkpoint] = client.get(f"{PREFIX}/models").json()["checkpoints"]
+    [preset] = checkpoint["presets"]
+    assert preset["id"] == PRESET
+    assert [m["missing"] for m in preset["members"]] == [{}, {"single_gemm": 1}]
+
+    tree = client.get(f"{PREFIX}/models/{PRESET}/tree", params={"tp_size": 1}).json()
+    assert tree["configs"][GEMM_CONFIG]["identity"] == GEMM_IDENTITY
+    bad = client.get(f"{PREFIX}/models/{PRESET}/tree", params={"tp_size": 4})
+    assert bad.status_code == 400
+    assert bad.json()["detail"]["choices"] == [{"tp_size": 1}, {"tp_size": 2}]
+    assert client.get(f"{PREFIX}/models/Nope/dense/tree").status_code == 404
+
+
+def test_predict_refuses_what_it_cannot_cost(client: TestClient) -> None:
+    def post(tp_size: int, cases: list) -> object:
+        return client.post(
+            f"{PREFIX}/predict",
+            json={"preset": PRESET, "params": {"tp_size": tp_size}, "cases": cases},
+        )
+
+    lacking = post(2, [{"prefill": []}])
+    assert lacking.status_code == 409
+    assert "lacks profile.db rows: single_gemm 1" in lacking.json()["detail"]
+    assert post(1, []).status_code == 400
+    assert client.post(f"{PREFIX}/predict", json={"preset": PRESET}).status_code == 422
+
+
+def test_only_a_predictions_routes_are_forwarded(client: TestClient) -> None:
+    # This service runs no Analyzer; a route outside a prediction is no route.
+    assert client.get(f"{PREFIX}/analyzer/predictions/abc/descriptor").status_code == 503
+    assert client.get(f"{PREFIX}/analyzer/runs").status_code == 404

@@ -1,17 +1,19 @@
-"""Read-only access to what the kernel library joins: simulator introspection and
-profile.db.
+"""Read-only access to the two sources the service's documents read besides its
+own code: simulator introspection and profile.db.
 
-Everything else the library shows (the profiling registry, kind docs, GPU specs,
-the model catalog) is code in this checkout and is imported directly. The two
-sources here sit behind one small class so tests can replace them with fixtures:
+Everything else (the profiling registry, kind docs, GPU specs, the model
+catalog, the public presets) is code in this checkout and is imported directly.
+The two sources here sit behind one small class so tests can replace them with
+fixtures:
 
 - the release simulator's introspection commands, which print JSON and need no
-  GPU, database or Python perf_api (``kernel-list``);
+  GPU, database or Python perf_api (``kernel-list``, ``list-params``,
+  ``cost-trees``);
 - profile.db, opened read-only for every query.
 
 Introspection answers depend only on the binary, so they are cached until the
-binary changes. Database aggregates are cached until the file, or a file the
-library registers with :meth:`KernelSources.watch` (the model catalog), changes.
+binary changes. Database aggregates are cached until the file, or a file a
+document builder registers with :meth:`Sources.watch` (the model catalog), changes.
 """
 
 from __future__ import annotations
@@ -29,11 +31,12 @@ from launcher.exec import _build_subprocess_env, binary_path
 from profiling.db.migrate import require_current
 
 
-class KernelSources:
-    """The simulator binary and profile.db behind the kernel library."""
+class Sources:
+    """The simulator binary and profile.db behind every document the service builds."""
 
     def __init__(self, *, db_path: Path, build_type: str = "release") -> None:
-        self.db_path = Path(db_path)
+        self.db_path = Path(db_path).resolve()
+        self.build_type = build_type
         self.binary = binary_path(build_type)
         self._lock = threading.Lock()
         self._binary_cache: dict[Any, Any] = {}
@@ -44,9 +47,10 @@ class KernelSources:
 
     # -- simulator introspection -------------------------------------------------
 
-    def _simulator(self, args: list[str]) -> Any:
+    def _simulator(self, args: list[str], stdin: str | None = None) -> Any:
         result = subprocess.run(
             [str(self.binary), *args],
+            input=stdin,
             capture_output=True,
             text=True,
             env=_build_subprocess_env(),
@@ -75,6 +79,17 @@ class KernelSources:
         """Every Rust kernel kind with its config/input fields and dtype fields."""
 
         return self.cached_by_binary("kernel-list", lambda: self._simulator(["kernel-list"]))
+
+    def list_params(self) -> dict:
+        """The param schema: every arch's params and the ``timing-predict`` case fields."""
+
+        return self.cached_by_binary("list-params", lambda: self._simulator(["list-params"]))
+
+    def cost_trees(self, blocks: list[dict]) -> list[dict]:
+        """``simulator cost-trees --kernel-configs`` of ``{gpu, arch}`` blocks:
+        each one's cost tree, prediction case shape and kernel configs."""
+
+        return self._simulator(["cost-trees", "-", "--kernel-configs"], json.dumps(blocks))
 
     # -- profile.db ----------------------------------------------------------------
 

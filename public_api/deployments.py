@@ -1,0 +1,420 @@
+"""The public deployments, built once when the service starts.
+
+A deployment is one member of a public preset (:mod:`public_api.preset`): the
+preset's id (``<checkpoint>/<arch type>``, its path under ``presets/public``)
+and one value of each axis it sweeps. Every member is built structure-only by
+``simulator cost-trees --kernel-configs``, one call per preset, in parallel,
+with its capture references (``hf://...``) resolved to the local Hugging Face
+cache. The index keeps, per member, its cost tree and the shape of a
+``timing-predict`` case, and per kernel config any member asks profile.db for,
+its grid and the members and roles that ask.
+
+The documents name a config by ``id``: a hash of its kind, GPU and identity
+(``KernelConfig::identity``: every field but ``gpu_name`` and ``backends``,
+each ``Dim`` at its value). A leaf's config is found from the leaf's own Rust
+config the same way, so a tree's leaf and the Kernels page name one config.
+"""
+
+from __future__ import annotations
+
+import hashlib
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+from launcher.corpus import resolve_hf_references
+from launcher.schema.loader import schema_from_dict
+from profiling.db.storage import canonical_json
+from public_api import preset as public_preset
+
+REPO_ROOT = public_preset.REPO_ROOT
+
+# How a `Dim` serializes in a manifest's `kernel_config`.
+_DIM = frozenset({"value", "expression", "bindings"})
+_COVERAGE_FLAGS = (("extrapolated", 1 << 0), ("jit", 1 << 1), ("no_coverage", 1 << 2))
+
+
+class UnknownDeployment(LookupError):
+    """No public preset has this id."""
+
+
+class BadMember(ValueError):
+    """Axis values that name no member of the preset: ``choices`` lists those that do."""
+
+    def __init__(self, message: str, choices: list[dict]) -> None:
+        super().__init__(message)
+        self.choices = choices
+
+
+def _hub_repo_path(path: str) -> str:
+    """``<cache>/datasets--<owner>--<repo>/snapshots/<revision>/<path>`` -> ``<path>``,
+    as ``TokenCorpusConfig`` names a hub capture in an identity."""
+    parts = path.split("/")
+    for at in range(len(parts) - 3):
+        if parts[at].startswith("datasets--") and parts[at + 1] == "snapshots":
+            return "/".join(parts[at + 3 :])
+    return path
+
+
+def _values(value: Any) -> Any:
+    """A manifest ``kernel_config`` in its identity form (``KernelConfig::identity``):
+    each ``Dim`` reduced to its value, a corpus named by its path in its repo."""
+    if isinstance(value, dict):
+        if set(value) == _DIM:
+            return value["value"]
+        if "data_file" in value and "checksum_fnv1a64" in value:
+            return {**value, "data_file": _hub_repo_path(value["data_file"])}
+        return {key: _values(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_values(item) for item in value]
+    return value
+
+
+def config_id(kind: str, gpu: str, identity: dict) -> str:
+    """The id a config is published under."""
+    text = canonical_json({"kind": kind, "gpu": gpu, "identity": identity})
+    return hashlib.sha256(text.encode()).hexdigest()[:16]
+
+
+def leaf_config_id(kind: str, kernel_config: dict) -> str:
+    """:func:`config_id` of a manifest slot's ``kernel_config``."""
+    identity = {k: v for k, v in kernel_config.items() if k not in ("gpu_name", "backends")}
+    return config_id(kind, kernel_config["gpu_name"], _values(identity))
+
+
+def scalar_identity(identity: dict) -> tuple[dict, list[str]]:
+    """The scalar fields of an identity, and the names of the structured ones
+    (an MoE config's expert demand runs to a hundred kilobytes)."""
+    scalars, structured = {}, []
+    for name, value in identity.items():
+        if isinstance(value, (dict, list)):
+            structured.append(name)
+        else:
+            scalars[name] = value
+    return scalars, structured
+
+
+def coverage_flags(bits: int) -> list[str]:
+    """``CoverageFlags`` (simulator ``timing``) as names."""
+    return [name for name, bit in _COVERAGE_FLAGS if bits & bit]
+
+
+def _text(value: Any) -> str:
+    """How an axis value is spelled in a query string."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def _repo_path(value: Any) -> Any:
+    """A path under this checkout as a repo-relative path; anything else as is."""
+    if isinstance(value, str) and value.startswith(str(REPO_ROOT) + "/"):
+        return value[len(str(REPO_ROOT)) + 1 :]
+    return value
+
+
+@dataclass
+class Member:
+    """One deployment: a preset's member, built."""
+
+    preset: str
+    params: dict[str, Any]
+    gpu: str
+    # As the preset writes it, every param filled: capture references stay
+    # `hf://`, the model config is repo-relative.
+    arch: dict[str, Any]
+    # As the binary reads it: captures resolved to local files.
+    block: dict[str, Any]
+    contract: str | None = None
+    gpus_per_replica: int | None = None
+    predict: dict | None = None
+    sections: list[dict] = field(default_factory=list)
+    error: str | None = None
+    # profile.db rows its kernels lack, {kind: count} (:meth:`DeploymentIndex.check`);
+    # None until checked.
+    missing: dict[str, int] | None = None
+
+    def summary(self) -> dict:
+        slots = [slot for section in self.sections for slot in section["slots"]]
+        return {
+            "params": self.params,
+            "gpus_per_replica": self.gpus_per_replica,
+            "predict": self.predict,
+            "leaves": len(slots),
+            "configs": len({slot["config"] for slot in slots}),
+            "error": self.error,
+            "missing": self.missing,
+        }
+
+
+@dataclass
+class Config:
+    """One kernel config some member asks profile.db for."""
+
+    id: str
+    kind: str
+    profile_kind: str
+    gpu: str
+    identity: dict
+    grid: dict
+    # {(preset, member index): sorted roles}
+    uses: dict[tuple[str, int], list[str]] = field(default_factory=dict)
+
+
+@dataclass
+class Preset:
+    id: str
+    checkpoint: str
+    arch: str
+    gpu: str
+    axes: list[dict]
+    members: list[Member]
+
+
+def _axes(preset: dict) -> list[dict]:
+    """The axes a preset sweeps, in its order: ``{name, values}``, and for a
+    compound group the fields each row binds (its nulls left out)."""
+    axes = [
+        {"name": name, "values": list(values)} for name, values in preset.get("sweep", {}).items()
+    ]
+    for name, rows in preset.get("compound", {}).items():
+        axes.append(
+            {
+                "name": name,
+                "values": list(rows),
+                "rows": {
+                    label: {k: v for k, v in row.items() if v is not None}
+                    for label, row in rows.items()
+                },
+            }
+        )
+    return axes
+
+
+def _tree(section: dict) -> dict:
+    """One manifest section as ``{section, nodes, slots}``: node ``i`` is the
+    flat manifest's node ``i`` (0 the root), each with its children's ids."""
+    nodes = []
+    for index, raw in enumerate(section["nodes"]):
+        ((kind, body),) = raw.items()
+        node: dict[str, Any] = {"kind": kind.lower()}
+        if kind == "Leaf":
+            node["slot"] = body
+        else:
+            node["children"] = list(range(body["children"]["start"], body["children"]["end"]))
+            if kind == "Max":
+                node["overlap"] = body["overlap"]
+            elif kind == "Scale":
+                node["n"] = body["n"]
+        label = section["node_labels"][index]
+        if label:
+            node["label"] = label
+        nodes.append(node)
+    slots = [
+        {
+            "name": slot["name"],
+            "kernel": slot["kind"],
+            "config": leaf_config_id(slot["kind"], slot["kernel_config"]),
+            "backends": slot["kernel_config"].get("backends", []),
+        }
+        for slot in section["slots"]
+    ]
+    return {"section": section["section"], "nodes": nodes, "slots": slots}
+
+
+class DeploymentIndex:
+    """Every public deployment and kernel config, built from the presets."""
+
+    def __init__(self, sim_commit: str | None, case_fields: dict, models: dict) -> None:
+        self.sim_commit = sim_commit
+        self.case_fields = case_fields
+        self.models = models
+        self.presets: dict[str, Preset] = {}
+        self.configs: dict[str, Config] = {}
+
+    # -- building ------------------------------------------------------------------
+
+    @classmethod
+    def build(
+        cls,
+        cost_trees: Callable[[list[dict]], list[dict]],
+        list_params: dict,
+        *,
+        sim_commit: str | None,
+        paths: list[Path] | None = None,
+        jobs: int = 8,
+    ) -> DeploymentIndex:
+        """Load each preset, expand and complete its members against the schema,
+        resolve their captures and build them, one ``cost_trees`` call per preset."""
+        catalog = yaml.safe_load(public_preset.MODEL_CATALOG.read_text())
+        registry = schema_from_dict(list_params)
+        index = cls(sim_commit, list_params.get("predict_cases", {}), catalog)
+        for path in public_preset.preset_paths() if paths is None else paths:
+            preset = public_preset.load(path, catalog)
+            preset_id = f"{path.parent.name}/{path.stem}"
+            members = [
+                Member(
+                    preset=preset_id,
+                    params=member["labels"],
+                    gpu=member["gpu"],
+                    arch={k: _repo_path(v) for k, v in member["arch"].items()},
+                    block={"gpu": member["gpu"], "arch": resolve_hf_references(member["arch"])},
+                )
+                for member in public_preset.members(preset, registry)
+            ]
+            index.presets[preset_id] = Preset(
+                id=preset_id,
+                checkpoint=preset["checkpoint"],
+                arch=preset["arch"]["type"],
+                gpu=preset["gpu"],
+                axes=_axes(preset),
+                members=members,
+            )
+        presets = list(index.presets.values())
+        with ThreadPoolExecutor(max_workers=jobs) as pool:
+            builds = pool.map(lambda p: cost_trees([m.block for m in p.members]), presets)
+            for preset, built in zip(presets, builds, strict=True):
+                for position, (member, result) in enumerate(
+                    zip(preset.members, built, strict=True)
+                ):
+                    index._add(preset.id, position, member, result)
+        return index
+
+    def check(self, missing_specs: Callable[[Member], dict[str, int]], *, jobs: int = 8) -> None:
+        """Ask profile.db, per built member, which rows its kernels lack."""
+        members = [m for p in self.presets.values() for m in p.members if not m.error]
+        with ThreadPoolExecutor(max_workers=jobs) as pool:
+            for member, missing in zip(members, pool.map(missing_specs, members), strict=True):
+                member.missing = missing
+
+    def _add(self, preset_id: str, position: int, member: Member, built: dict) -> None:
+        member.contract = built["contract"] or None
+        member.error = built["error"]
+        if member.error:
+            return
+        member.gpus_per_replica = built["gpus_per_replica"]
+        member.predict = built["predict"]
+        member.sections = [_tree(section) for section in built["cost_manifest"]["sections"]]
+        roles: dict[str, set[str]] = {}
+        for record in built["kernel_configs"]["configs"]:
+            cid = config_id(record["kind"], record["gpu_name"], record["identity"])
+            config = self.configs.setdefault(
+                cid,
+                Config(
+                    id=cid,
+                    kind=record["kind"],
+                    profile_kind=record["profile_kind"],
+                    gpu=record["gpu_name"],
+                    identity=record["identity"],
+                    grid=record["grid"],
+                ),
+            )
+            roles.setdefault(cid, set()).update(use["role"] for use in record["uses"])
+            config.uses[(preset_id, position)] = sorted(roles[cid])
+
+    # -- lookups -------------------------------------------------------------------
+
+    def preset(self, preset_id: str) -> Preset:
+        if preset_id not in self.presets:
+            raise UnknownDeployment(preset_id)
+        return self.presets[preset_id]
+
+    def member(self, preset_id: str, params: dict[str, Any]) -> tuple[int, Member]:
+        """The member whose axis values are ``params``: each axis, no other
+        name, compared as a query string spells them."""
+        preset = self.preset(preset_id)
+        names = [axis["name"] for axis in preset.axes]
+        choices = [m.params for m in preset.members]
+        given = {name: _text(value) for name, value in params.items()}
+        missing = [name for name in names if name not in given]
+        unknown = sorted(set(given) - set(names))
+        if missing or unknown:
+            raise BadMember(
+                f"{preset_id} takes exactly its axes {names}"
+                + (f"; missing {missing}" if missing else "")
+                + (f"; unknown {unknown}" if unknown else ""),
+                choices,
+            )
+        for position, member in enumerate(preset.members):
+            if all(_text(member.params[name]) == given[name] for name in names):
+                return position, member
+        raise BadMember(f"{preset_id} has no member {given}", choices)
+
+    # -- documents -----------------------------------------------------------------
+
+    def catalog(self) -> dict:
+        """Every checkpoint, in the model catalog's order, with its presets."""
+        by_checkpoint: dict[str, list[Preset]] = {}
+        for preset in self.presets.values():
+            by_checkpoint.setdefault(preset.checkpoint, []).append(preset)
+        return {
+            "sim_commit": self.sim_commit,
+            "case_fields": self.case_fields,
+            "checkpoints": [
+                {
+                    "checkpoint": checkpoint,
+                    **entry,
+                    "presets": [
+                        {
+                            "id": preset.id,
+                            "arch": preset.arch,
+                            "contract": next(
+                                (m.contract for m in preset.members if m.contract), None
+                            ),
+                            "gpu": preset.gpu,
+                            "axes": preset.axes,
+                            "members": [m.summary() for m in preset.members],
+                        }
+                        for preset in by_checkpoint.get(checkpoint, [])
+                    ],
+                }
+                for checkpoint, entry in self.models.items()
+            ],
+        }
+
+    def tree(self, preset_id: str, params: dict[str, Any]) -> dict:
+        """One member's cost tree: structure only. A prediction's times are by
+        this document's node ids and slot indices."""
+        _, member = self.member(preset_id, params)
+        configs = {}
+        for section in member.sections:
+            for slot in section["slots"]:
+                config = self.configs[slot["config"]]
+                scalars, structured = scalar_identity(config.identity)
+                configs[config.id] = {
+                    "kind": config.kind,
+                    "identity": scalars,
+                    "structured": structured,
+                }
+        return {
+            "sim_commit": self.sim_commit,
+            "preset": preset_id,
+            "params": member.params,
+            "gpu": member.gpu,
+            "arch": member.arch,
+            "contract": member.contract,
+            "gpus_per_replica": member.gpus_per_replica,
+            "predict": member.predict,
+            "error": member.error,
+            "missing": member.missing,
+            "sections": member.sections,
+            "configs": configs,
+        }
+
+    def kind_configs(self, kind: str) -> list[Config]:
+        return [config for config in self.configs.values() if config.kind == kind]
+
+    def uses(self, config: Config) -> list[dict]:
+        """Who asks for a config: ``{preset, params, roles}`` per member."""
+        return [
+            {
+                "preset": preset_id,
+                "params": self.presets[preset_id].members[position].params,
+                "roles": roles,
+            }
+            for (preset_id, position), roles in config.uses.items()
+        ]
