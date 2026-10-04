@@ -559,7 +559,7 @@ pub enum IterArchSel {
     /// its own KDA (per request) and DSA (per token) layers; from PP12 a stage
     /// has KDA layers but no DSA layer, which vLLM's hybrid cache rejects. MTP
     /// is not run. Runs only under deployment `pp`.
-    #[supported(gpu = ["NVIDIA B200"], model_config = ["glm53_flash"], fp8 = [true], pp_size = [4, 5, 8, 9, 11], max_model_len = [131072])]
+    #[supported(gpu = ["NVIDIA B200"], model_config = ["glm53_flash"], fp8 = [true], pp_size = [4, 5, 8, 9, 11], max_model_len = [131072, 1048576])]
     Glm53FlashVllmFp8PpKdaDsaMoe {
         #[serde(flatten)]
         model: ModelSpec,
