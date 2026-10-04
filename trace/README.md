@@ -137,3 +137,23 @@ cargo run --release --bin tracegen -- coding-session \
 Step 3 also invents the arrival timeline — the corpus has no session arrival
 times — at a default `poisson`, 1 session/s, seed 0. The manifest records all
 three, so the timeline is reproducible rather than merely plausible.
+
+### Prefill-only replay
+
+`session_to_prefill_only.py` turns either session trace into an independent
+trace for prefill studies. Every round becomes one request: its fresh tokens
+are `input_len`, its planned prefix is a pinned `prefix_len` hit, and
+`output_len` is 1. Sessions, tool waits, and the session timeline are dropped.
+
+```bash
+uv run python trace/session_to_prefill_only.py trace/tracelab_preserving.csv \
+  "$TMPDIR/prefill_5k.csv" --requests 5000 --seed 0
+```
+
+`--requests` takes a seeded uniform sample of rounds in random order, and
+arrivals are Poisson at 1 request/s, so a preset's `workload.request_rate`
+sweeps the offered load. With the same seed, the two policies sample the same
+rounds at the same arrival times and differ only in the prefix/fresh split.
+Contexts reach 999,888 tokens, so runs need `max_model_len: 1048576`. The
+pinned prefix is reserved only while its request runs, so this replay measures
+prefill compute, not prefix-cache capacity.
