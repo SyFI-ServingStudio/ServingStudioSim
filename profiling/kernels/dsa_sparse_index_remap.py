@@ -73,8 +73,10 @@ DOC = KernelDoc(
         "path skips both.",
         "Page tables and local indices follow the chosen patterns; they are not"
         " captured from serving.",
-        "Only 64-token blocks are accepted, with selected_k = 2048 for torch "
-        "and 2048 or 2176 for vllm_triton.",
+        "selected_k must be a positive multiple of 128, the tile width vLLM's "
+        "Triton wrapper asserts; any block size works while the slot ids fit "
+        "in int32. Measured rows use 64-token blocks with selected_k = 2048 "
+        "or 2176.",
     ),
     reference="profiling.runners.attention.dsa_sparse_index_remap_reference",
 )
@@ -86,7 +88,6 @@ register(
         backend="torch",
         supports=BackendSupport(
             compute=None,
-            gpus=frozenset({"NVIDIA H200"}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.attention.dsa_sparse_index_remap",
@@ -112,7 +113,6 @@ register(
         backend="vllm_triton",
         supports=BackendSupport(
             compute=None,
-            gpus=frozenset({"NVIDIA B200"}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.attention.dsa_sparse_index_remap",

@@ -84,7 +84,6 @@ register(
         batch_outlier_policy=BatchOutlierPolicy(),
         supports=BackendSupport(
             compute=frozenset({DType.FP32}),
-            gpus=frozenset({"NVIDIA H200"}),
         ),
         subprocess_env="vllm_env",
         doc=BackendDoc(

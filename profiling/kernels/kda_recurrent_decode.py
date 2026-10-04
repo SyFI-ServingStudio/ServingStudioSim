@@ -93,8 +93,8 @@ DOC = KernelDoc(
         "single-step PyTorch reference and the states are restored."
     ),
     caveats=(
-        "Only num_heads = 16 and head_dim = 128 on B200 are measured; the runner "
-        "accepts only head_dim = 128.",
+        "Only num_heads = 16 and head_dim = 128 on B200 are measured; the kernel "
+        "takes any head_dim.",
         "Only a plain decode step is measured, one token per request and no speculative decoding.",
         "The short causal convolution before the call is a separate kind, gdn_causal_conv_decode.",
         "GB/s counts each input once and leaves out the copies' extra reads and writes.",
@@ -109,7 +109,6 @@ register(
         backend="vllm_triton",
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
-            gpus=frozenset({"NVIDIA B200"}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.attention.kda_recurrent_decode_vllm_triton",

@@ -95,7 +95,7 @@ register(
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
             kv=frozenset({DType.BF16}),
-            gpus=frozenset({"NVIDIA H200"}),
+            sm_targets=frozenset({"sm_90a", "sm_100f"}),
         ),
         subprocess_env="vllm_env",
         doc=BackendDoc(

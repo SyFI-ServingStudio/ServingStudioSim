@@ -29,6 +29,7 @@ peak-TFLOPS figures. So:
 |---|---|---|
 | `name` | Catalog label incl. form factor + memory (`H100-SXM5-80GB`) | Distinct from a preset's `gpu:` string |
 | `vendor` / `architecture` / `year` | NVIDIA/AMD/Intel; uarch; launch year | — |
+| `compute_capability` | CUDA `"major.minor"` (H200 `"9.0"`, B300 `"10.3"`) | `null` off NVIDIA. Backend validation reads it (`BackendSupport` sm targets / minimum), so a wrong value rejects or admits backends |
 | `mem_size_gb` | HBM/GDDR capacity, GB | Per **GPU** (except GB200, see below) |
 | `mem_type` | HBM2/HBM3/HBM3e/GDDR6 | — |
 | `mem_bandwidth_gbps` | Memory bandwidth, **GB/s** (bytes) | GB/s not Gb/s; H200 = 4.8 TB/s = `4800` |

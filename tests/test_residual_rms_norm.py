@@ -75,16 +75,16 @@ def test_vllm_cuda_registration_reuses_kind_table_and_args():
     assert spec.runner_ref.function_name == "profile_residual_rms_norm_vllm_cuda"
 
 
-def test_vllm_cuda_support_preserves_h200_dtypes_and_adds_only_b200_bf16():
+def test_vllm_cuda_support_is_bf16_and_fp16_on_any_gpu():
     support = find_kernel_profiler_spec(KIND, "vllm_cuda").supports
 
     assert support.allows(DType.BF16, gpu="NVIDIA H200")
     assert support.allows(DType.FP16, gpu="NVIDIA H200")
     assert not support.allows(DType.FP32, gpu="NVIDIA H200")
     assert not support.allows(DType.FP8_E4M3, gpu="NVIDIA H200")
-    assert not support.allows(DType.BF16, gpu="NVIDIA H100")
+    assert support.allows(DType.BF16, gpu="NVIDIA H100")
     assert support.allows(DType.BF16, gpu="NVIDIA B200")
-    assert not support.allows(DType.FP16, gpu="NVIDIA B200")
+    assert support.allows(DType.FP16, gpu="NVIDIA B200")
 
 
 def test_registry_barrel_does_not_import_frameworks_or_runners():

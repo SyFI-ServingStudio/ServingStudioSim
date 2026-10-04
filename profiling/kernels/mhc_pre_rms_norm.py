@@ -36,8 +36,9 @@ DOC = KernelDoc(
         "mHC keeps hc_mult residual streams per token instead of one."
         " Before each block, one vLLM TileLang call projects the streams to"
         " three sets of mixing weights, sums the streams with the pre-mix "
-        "weights into the block input, and RMS-normalizes it. The measurement "
-        "uses 4 bf16 streams of 4,096 features and random residuals."
+        "weights into the block input, and RMS-normalizes it. TileLang compiles "
+        "the call for each hidden_size and hc_mult; the measurement uses random "
+        "residuals."
     ),
     category="Normalization",
     subcategory="Hyper-connections",
@@ -78,7 +79,6 @@ register(
         batch_outlier_policy=BatchOutlierPolicy(),
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
-            gpus=frozenset({"NVIDIA H200", "NVIDIA B200"}),
         ),
         subprocess_env="vllm_env",
         doc=BackendDoc(

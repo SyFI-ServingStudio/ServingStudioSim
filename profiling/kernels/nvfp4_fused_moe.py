@@ -135,7 +135,7 @@ register(
         backend="flashinfer_trtllm_sm100",
         supports=BackendSupport(
             compute=frozenset({DType.NVFP4_E2M1}),
-            gpus=frozenset({"NVIDIA B200"}),
+            sm_targets=frozenset({"sm_100f"}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.moe.nvfp4_fused_moe",
@@ -162,7 +162,7 @@ register(
         backend="flashinfer_trtllm_sm100_deferred_finalize",
         supports=BackendSupport(
             compute=frozenset({DType.NVFP4_E2M1}),
-            gpus=frozenset({"NVIDIA B200"}),
+            sm_targets=frozenset({"sm_100f"}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.moe.nvfp4_fused_moe",
@@ -189,7 +189,7 @@ register(
         backend="flashinfer_trtllm_fp8_block_sm100",
         supports=BackendSupport(
             compute=frozenset({DType.FP8_E4M3}),
-            gpus=frozenset({"NVIDIA B200"}),
+            sm_targets=frozenset({"sm_100f"}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.moe.fp8_block_fused_moe",

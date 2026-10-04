@@ -65,9 +65,7 @@ register(
         args_schema=QKvRmsNormArgs,
         metric_family=MetricFamily.COMPUTE,
         batch_outlier_policy=BatchOutlierPolicy(),
-        supports=BackendSupport(
-            compute=frozenset({DType.BF16}), gpus=frozenset({"NVIDIA H200", "NVIDIA B200"})
-        ),
+        supports=BackendSupport(compute=frozenset({DType.BF16})),
         subprocess_env="vllm_env",
         doc=BackendDoc(
             summary="vLLM's fused_q_kv_rmsnorm Triton call normalizes both projections together.",

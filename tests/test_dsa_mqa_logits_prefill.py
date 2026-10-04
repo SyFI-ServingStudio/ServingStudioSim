@@ -102,12 +102,12 @@ def test_registration_support_and_facades():
         kv_dtype=DType.BF16,
         gpu="NVIDIA H200",
     )
-    assert not spec.supports.allows(
+    assert spec.supports.allows(
         DType.FP8_E4M3,
         kv_dtype=DType.FP8_E4M3,
         gpu="NVIDIA H100",
     )
-    assert not spec.supports.allows(
+    assert spec.supports.allows(
         DType.FP8_E4M3,
         kv_dtype=DType.FP8_E4M3,
         gpu="NVIDIA B200",
@@ -181,7 +181,7 @@ def test_deepgemm_callable_forwarding_is_provider_neutral():
     ]
 
 
-def test_deepgemm_support_is_fp8_e4m3_on_h200_and_b200():
+def test_deepgemm_support_is_fp8_e4m3_on_its_arch_builds():
     support = find_kernel_profiler_spec(KIND, _DEEPGEMM_BACKEND).supports
 
     assert support.allows(
@@ -204,10 +204,16 @@ def test_deepgemm_support_is_fp8_e4m3_on_h200_and_b200():
         kv_dtype=DType.BF16,
         gpu="NVIDIA H200",
     )
-    assert not support.allows(
+    assert support.allows(
         DType.FP8_E4M3,
         kv_dtype=DType.FP8_E4M3,
         gpu="NVIDIA H100",
+    )
+    # DeepGEMM builds sm90a, sm100f and sm120f kernels only.
+    assert not support.allows(
+        DType.FP8_E4M3,
+        kv_dtype=DType.FP8_E4M3,
+        gpu="NVIDIA L40S",
     )
 
 

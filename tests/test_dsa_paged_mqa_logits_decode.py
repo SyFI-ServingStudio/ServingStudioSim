@@ -117,12 +117,12 @@ def test_registration_support_and_facades():
         kv_dtype=DType.BF16,
         gpu="NVIDIA H200",
     )
-    assert not spec.supports.allows(
+    assert spec.supports.allows(
         DType.FP8_E4M3,
         kv_dtype=DType.FP8_E4M3,
         gpu="NVIDIA H100",
     )
-    assert not spec.supports.allows(
+    assert spec.supports.allows(
         DType.FP8_E4M3,
         kv_dtype=DType.FP8_E4M3,
         gpu="NVIDIA B200",

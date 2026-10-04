@@ -43,7 +43,7 @@ def test_args_registry_support_environment_and_facades() -> None:
     assert torch_spec.runner_ref.module_name.endswith("moe_fused_topk_torch")
     assert torch_spec.runner_ref.function_name == "profile_moe_fused_topk"
     assert cuda_spec.subprocess_env == "vllm_env"
-    assert cuda_spec.supports.gpus == frozenset({"NVIDIA H200"})
+    assert cuda_spec.supports.gpus is None
     assert cuda_spec.runner_ref.module_name.endswith("moe_fused_topk_vllm_cuda")
     assert cuda_spec.runner_ref.function_name == "profile_moe_fused_topk_vllm_cuda"
     assert hasattr(perf_api, "get_moe_fused_topk_times")

@@ -81,7 +81,6 @@ register(
         supports=BackendSupport(
             compute=frozenset({DType.FP8_E4M3}),
             kv=frozenset({DType.FP8_E4M3}),
-            gpus=frozenset({"NVIDIA H200"}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.attention.dsa_mqa_logits_prefill",
@@ -107,7 +106,7 @@ register(
         supports=BackendSupport(
             compute=frozenset({DType.FP8_E4M3}),
             kv=frozenset({DType.FP8_E4M3}),
-            gpus=frozenset({"NVIDIA H200", "NVIDIA B200"}),
+            sm_targets=frozenset({"sm_90a", "sm_100f", "sm_120f"}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.attention.dsa_mqa_logits_prefill",

@@ -123,15 +123,15 @@ def test_registration_support_family_environment_runner_ref_and_facades() -> Non
     assert spec.batch_outlier_policy == BatchOutlierPolicy()
     assert spec.supports.compute is None
     assert spec.supports.kv is None
-    assert spec.supports.gpus == frozenset({"NVIDIA H200"})
+    assert spec.supports.gpus is None
     assert spec.supports.allows(DType.FP16, gpu="NVIDIA H200")
     assert spec.supports.allows(DType.FP32, DType.FP8_E4M3, gpu="NVIDIA H200")
-    assert not spec.supports.allows(DType.FP32, gpu="NVIDIA H100")
+    assert spec.supports.allows(DType.FP32, gpu="NVIDIA H100")
     assert spec.subprocess_env is None
     assert spec.runner_ref.module_name == ("profiling.runners.attention.dsa_sparse_index_remap")
     assert spec.runner_ref.function_name == "profile_dsa_sparse_index_remap_torch"
     assert vllm_spec.supports.compute is None
-    assert vllm_spec.supports.gpus == frozenset({"NVIDIA B200"})
+    assert vllm_spec.supports.gpus is None
     assert vllm_spec.subprocess_env == "vllm_env"
     assert vllm_spec.runner_ref.function_name == ("profile_dsa_sparse_index_remap_vllm_triton")
     assert hasattr(perf_api, "get_dsa_sparse_index_remap_times")

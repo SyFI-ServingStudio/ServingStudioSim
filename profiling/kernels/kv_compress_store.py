@@ -99,7 +99,7 @@ register(
         supports=BackendSupport(
             compute=frozenset({DType.BF16, DType.FP32}),
             kv=frozenset({DType.FP8_E4M3}),
-            gpus=frozenset({"NVIDIA H200"}),
+            min_compute_capability=(8, 9),
         ),
         subprocess_env="vllm_env",
         doc=BackendDoc(
@@ -128,7 +128,7 @@ register(
         supports=BackendSupport(
             compute=frozenset({DType.BF16, DType.FP32}),
             kv=frozenset({DType.FP8_E4M3}),
-            gpus=frozenset({"NVIDIA H200"}),
+            min_compute_capability=(8, 9),
         ),
         subprocess_env="vllm_env",
         doc=BackendDoc(

@@ -108,7 +108,6 @@ register(
         backend="vllm_cuda",
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
-            gpus=frozenset({"NVIDIA B200"}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.norm.rms_norm_vllm_cuda",

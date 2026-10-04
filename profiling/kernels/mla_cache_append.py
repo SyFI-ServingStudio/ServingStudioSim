@@ -41,9 +41,9 @@ DOC = KernelDoc(
         "After the MLA projections and RoPE, each token writes a "
         "kv_lora_rank-wide latent and a rope_dim-wide rotary key into one paged"
         " cache entry. The measurement scatters the rows to distinct random "
-        "slots. The supported shape is 512 latent elements, 64 rotary elements "
-        "and 64-token pages; vllm_cuda also accepts rope_dim = 0, a latent "
-        "without a rotary key, which it writes alone."
+        "slots. The plain cache format takes any kv_lora_rank, rope_dim and "
+        "page size; vllm_cuda also accepts rope_dim = 0, a latent without a "
+        "rotary key, which it writes alone."
     ),
     category="Attention",
     subcategory="MLA",
@@ -80,7 +80,6 @@ register(
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
             kv=frozenset({DType.BF16}),
-            gpus=frozenset({"NVIDIA H200"}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.attention.mla_cache_append",
@@ -101,7 +100,6 @@ register(
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
             kv=frozenset({DType.BF16, DType.FP8_E4M3}),
-            gpus=frozenset({"NVIDIA H200", "NVIDIA B200"}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.attention.mla_cache_append",
@@ -129,7 +127,6 @@ register(
         supports=BackendSupport(
             compute=frozenset({DType.FP8_E4M3}),
             kv=frozenset({DType.FP8_E4M3}),
-            gpus=frozenset({"NVIDIA B200"}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.attention.mla_cache_append",

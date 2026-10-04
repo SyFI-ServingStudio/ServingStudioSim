@@ -68,7 +68,7 @@ register(
         args_schema=MoeAlignBlockSizeArgs,
         metric_family=MetricFamily.COMPUTE,
         batch_outlier_policy=BatchOutlierPolicy(),
-        supports=BackendSupport(compute=None, gpus=frozenset({"NVIDIA H200"})),
+        supports=BackendSupport(compute=None),
         subprocess_env="vllm_env",
         doc=BackendDoc(
             summary="vLLM moe_align_block_size CUDA operator with preallocated alignment outputs.",

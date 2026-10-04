@@ -129,7 +129,7 @@ register(
         backend="vllm_triton",
         supports=BackendSupport(
             compute=frozenset({DType.FP8_E4M3}),
-            gpus=frozenset({"NVIDIA H200"}),
+            min_compute_capability=(8, 9),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.moe.vllm_fused_moe_triton",

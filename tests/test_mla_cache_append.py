@@ -88,7 +88,7 @@ def test_kind_table_backend_runner_and_support_contract():
         kv_dtype=DType.FP16,
         gpu="NVIDIA H200",
     )
-    assert not spec.supports.allows(
+    assert spec.supports.allows(
         DType.BF16,
         kv_dtype=DType.BF16,
         gpu="NVIDIA H100",
@@ -114,7 +114,7 @@ def test_vllm_cuda_registration_reuses_kind_table_args_and_facades():
     assert vllm_spec.runner_ref.function_name == "profile_mla_cache_append_vllm_cuda"
 
 
-def test_vllm_cuda_supports_bf16_and_fp8_cache_on_h200_and_b200():
+def test_vllm_cuda_supports_bf16_and_fp8_cache_on_any_gpu():
     support = find_kernel_profiler_spec(KIND, _VLLM_BACKEND).supports
 
     assert support.allows(
@@ -142,7 +142,7 @@ def test_vllm_cuda_supports_bf16_and_fp8_cache_on_h200_and_b200():
         kv_dtype=DType.FP16,
         gpu="NVIDIA H200",
     )
-    assert not support.allows(
+    assert support.allows(
         DType.BF16,
         kv_dtype=DType.BF16,
         gpu="NVIDIA H100",

@@ -104,11 +104,11 @@ def test_registration_support_family_environment_and_facades() -> None:
         assert spec.supports.allows(DType.BF16, DType.BF16, gpu="NVIDIA H200")
         assert not spec.supports.allows(DType.FP32, DType.BF16, gpu="NVIDIA H200")
         assert not spec.supports.allows(DType.BF16, DType.FP32, gpu="NVIDIA H200")
-        assert not spec.supports.allows(DType.BF16, DType.BF16, gpu="NVIDIA H100")
+        assert spec.supports.allows(DType.BF16, DType.BF16, gpu="NVIDIA H100")
         assert spec.runner_ref.module_name == (
             "profiling.runners.attention.dsa_sparse_mla_attention"
         )
-        assert not spec.supports.allows(DType.BF16, DType.BF16, gpu="NVIDIA B200")
+        assert spec.supports.allows(DType.BF16, DType.BF16, gpu="NVIDIA B200")
     assert trtllm_spec.supports.allows(DType.FP8_E4M3, DType.FP8_E4M3, gpu="NVIDIA B200")
     assert not trtllm_spec.supports.allows(DType.FP8_E4M3, DType.FP8_E4M3, gpu="NVIDIA H200")
     assert trtllm_spec.subprocess_env == "vllm_env"
@@ -117,6 +117,10 @@ def test_registration_support_family_environment_and_facades() -> None:
     )
     assert torch_spec.subprocess_env is None
     assert torch_spec.runner_ref.function_name == "profile_dsa_sparse_mla_attention_torch"
+    # FlashMLA builds sm90a and sm100f kernels; the torch composite runs anywhere.
+    assert flashmla_spec.supports.sm_targets == frozenset({"sm_90a", "sm_100f"})
+    assert not flashmla_spec.supports.allows(DType.BF16, DType.BF16, gpu="NVIDIA A100")
+    assert torch_spec.supports.allows(DType.BF16, DType.BF16, gpu="NVIDIA A100")
     assert flashmla_spec.subprocess_env == "vllm_env"
     assert flashmla_spec.runner_ref.function_name == (
         "profile_dsa_sparse_mla_attention_vllm_flashmla_bf16"

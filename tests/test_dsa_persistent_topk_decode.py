@@ -91,11 +91,11 @@ def test_registration_support_policy_and_facades() -> None:
         assert spec.supports.kv is None
         assert spec.supports.allows(DType.FP32, gpu="NVIDIA H200")
         assert not spec.supports.allows(DType.BF16, gpu="NVIDIA H200")
-        assert not spec.supports.allows(DType.FP32, gpu="NVIDIA H100")
+        assert spec.supports.allows(DType.FP32, gpu="NVIDIA H100")
         assert spec.runner_ref.module_name == (
             "profiling.runners.attention.dsa_persistent_topk_decode"
         )
-    assert not torch_spec.supports.allows(DType.FP32, gpu="NVIDIA B200")
+    assert torch_spec.supports.allows(DType.FP32, gpu="NVIDIA B200")
     assert native_spec.supports.allows(DType.FP32, gpu="NVIDIA B200")
     assert torch_spec.subprocess_env is None
     assert torch_spec.runner_ref.function_name == ("profile_dsa_persistent_topk_decode_torch")

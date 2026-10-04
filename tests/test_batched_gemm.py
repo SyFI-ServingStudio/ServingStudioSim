@@ -84,13 +84,14 @@ def test_v_up_registration_reuses_kind_table_args_and_facade():
 
 
 @pytest.mark.parametrize("backend", [_Q_BACKEND, _V_UP_BACKEND])
-def test_backend_support_is_bf16_h200_and_b200(backend):
+def test_backend_support_is_bf16_on_any_gpu(backend):
     support = find_kernel_profiler_spec(KIND, backend).supports
 
+    # A plain torch.bmm: bf16 only, and no GPU restriction.
     assert support.allows(DType.BF16, gpu="NVIDIA H200")
     assert not support.allows(DType.FP16, gpu="NVIDIA H200")
     assert not support.allows(DType.FP32, gpu="NVIDIA H200")
-    assert not support.allows(DType.BF16, gpu="NVIDIA H100")
+    assert support.allows(DType.BF16, gpu="NVIDIA H100")
     assert support.allows(DType.BF16, gpu="NVIDIA B200")
 
 

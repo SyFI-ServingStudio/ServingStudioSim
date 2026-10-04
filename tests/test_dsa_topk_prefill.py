@@ -100,8 +100,8 @@ def test_registration_support_and_facades() -> None:
     assert spec.supports.kv is None
     assert spec.supports.allows(DType.FP32, gpu="NVIDIA H200")
     assert not spec.supports.allows(DType.BF16, gpu="NVIDIA H200")
-    assert not spec.supports.allows(DType.FP32, gpu="NVIDIA H100")
-    assert not spec.supports.allows(DType.FP32, gpu="NVIDIA B200")
+    assert spec.supports.allows(DType.FP32, gpu="NVIDIA H100")
+    assert spec.supports.allows(DType.FP32, gpu="NVIDIA B200")
     assert spec.runner_ref.module_name == ("profiling.runners.attention.dsa_topk_prefill")
     assert spec.runner_ref.function_name == "profile_dsa_topk_prefill_torch"
     assert hasattr(perf_api, "get_dsa_topk_prefill_times")
@@ -124,7 +124,7 @@ def test_vllm_registration_reuses_schema_table_family_support_and_facades() -> N
     assert vllm_spec.supports.allows(DType.FP32, gpu="NVIDIA H200")
     assert vllm_spec.supports.allows(DType.FP32, gpu="NVIDIA B200")
     assert not vllm_spec.supports.allows(DType.BF16, gpu="NVIDIA H200")
-    assert not vllm_spec.supports.allows(DType.FP32, gpu="NVIDIA H100")
+    assert vllm_spec.supports.allows(DType.FP32, gpu="NVIDIA H100")
     assert vllm_spec.runner_ref.module_name == ("profiling.runners.attention.dsa_topk_prefill")
     assert vllm_spec.runner_ref.function_name == ("profile_dsa_topk_prefill_vllm_cuda")
     assert hasattr(perf_api, "get_dsa_topk_prefill_times")

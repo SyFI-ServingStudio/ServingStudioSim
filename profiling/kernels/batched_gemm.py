@@ -2,7 +2,8 @@
 
 Each backend freezes one production storage layout (vLLM's packed Q-absorption
 or V-up views) instead of presenting its constants as generic batched GEMM
-behavior; the runners accept only the measured head widths.
+behavior. Any per-rank head count launches, except that the padded V-up layout
+holds at most 64 heads.
 """
 
 from __future__ import annotations
@@ -59,8 +60,11 @@ DOC = KernelDoc(
     caveats=(
         "GB/s counts the logical operand elements, not the gaps in the packed "
         "storage the strided views skip.",
-        "Only k = 192 or 256, n = 512 for query absorption and k = 512, n = 256 "
-        "for value expansion are measured, at 8, 16, 32 or 64 heads.",
+        "Each backend fixes k and n to its layout: k = 192 or 256, n = 512 for "
+        "query absorption and k = 512, n = 256 for value expansion. Measured rows "
+        "use 8, 16, 32 or 64 heads.",
+        "torch_mla_v_up reads an attention output padded to 64 heads, so it takes "
+        "at most 64 heads.",
     ),
     reference="profiling.runners.gemm.batched_gemm_reference",
 )
@@ -72,7 +76,6 @@ register(
         backend="torch_mla_q_absorb",
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
-            gpus=frozenset({"NVIDIA H200", "NVIDIA B200"}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.gemm.batched_gemm",
@@ -95,7 +98,6 @@ register(
         backend="torch_mla_v_up",
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
-            gpus=frozenset({"NVIDIA H200", "NVIDIA B200"}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.gemm.batched_gemm",
@@ -138,7 +140,6 @@ for _backend, _function, _summary in (
             backend=_backend,
             supports=BackendSupport(
                 compute=frozenset({DType.BF16}),
-                gpus=frozenset({"NVIDIA B200"}),
             ),
             runner_ref=RunnerRef(
                 module_name="profiling.runners.gemm.batched_gemm",

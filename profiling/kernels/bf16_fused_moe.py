@@ -95,7 +95,7 @@ register(
         backend="flashinfer_trtllm_sm100",
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
-            gpus=frozenset({"NVIDIA B200"}),
+            sm_targets=frozenset({"sm_100f"}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.moe.bf16_fused_moe",
