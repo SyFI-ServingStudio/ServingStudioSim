@@ -666,7 +666,7 @@ python -m launcher <preset.yaml|json> [<preset2.yaml|json> ...]
                    [--build-type <cargo-profile>] [--profile [--profile-freq HZ]]
                    [--no-analyze] [--no-plot] [--emit-backends [FILE]]
 python -m launcher timing-predict <config.yaml|json> [<config2.yaml|json> ...]
-                   [--build-type <cargo-profile>] [--no-analyze] [--dry-run]
+                   [--build-type <cargo-profile>] [--no-analyze] [--no-plot] [--dry-run]
 python -m launcher kernel-profile {list,query,count-missing,run,measure,merge-db,audit-provenance} ...
 python -m launcher list-params [--human] [--build-type ...]
 python -m launcher alignment sim <simulation.yaml|json> [simulation options]

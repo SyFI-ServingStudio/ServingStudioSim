@@ -31,6 +31,8 @@ import tempfile
 import uuid
 from pathlib import Path
 
+from profiling.gpu_policy import gpu_disabled
+
 from .artifact_kind import ArtifactKind, write_artifact_kind
 from .corpus import CorpusError, resolve_hf_references
 from .exec import (
@@ -335,8 +337,11 @@ def _binary_config(config_path: Path, resolved: dict | None, log_dir: Path) -> P
     return copy
 
 
-async def run_one(config_path: Path, build_type: str, analyze: bool) -> bool:
-    """Run one already-built predictor config.
+async def run_one(
+    config_path: Path, build_type: str, analyze: bool, *, render: bool = True
+) -> bool:
+    """Run one already-built predictor config. ``render=False`` (``--no-plot``)
+    keeps the analysis but draws no PNGs.
 
     Public so the alignment timing-predict stage can reuse the exact predictor
     execution/snapshot path.
@@ -371,11 +376,14 @@ async def run_one(config_path: Path, build_type: str, analyze: bool) -> bool:
         binary = binary_path(build_type)
         argv = [str(binary), "timing-predict", str(binary_config)]
         journal = RunJournal(log_dir)
-        async with _LAUNCHER_LEASES.profile_database(write=True):
+        # The predictor writes profile.db only to JIT-profile a missing row, which
+        # it refuses to do without a GPU: then predictions share the database.
+        write = not gpu_disabled()
+        async with _LAUNCHER_LEASES.profile_database(write=write):
             journal.update(
                 "timing_predict",
                 StageState.RUNNING,
-                resources=["profile-db:exclusive"],
+                resources=[f"profile-db:{'exclusive' if write else 'shared'}"],
             )
             try:
                 result = await run_logged_process(
@@ -429,7 +437,7 @@ async def run_one(config_path: Path, build_type: str, analyze: bool) -> bool:
                 managed_job.report("analysis_running")
             # Best-effort: `analyze trace` (the Perfetto tree) + `analyze run`. Cost
             # subjects apply; request/throughput subjects self-skip on a predict dir.
-            await run_analysis(log_dir, build_type)
+            await run_analysis(log_dir, build_type, render=render)
             # Predict-only: the human-readable cost tree (reports/iter_breakdown.ans).
             # Not in the shared run_analysis — a real run's thousands of iters would
             # make that file enormous; a predict dir has only a few cases.
@@ -468,10 +476,18 @@ def _report_failure(log_dir: Path) -> None:
 
 
 def dry_run_one(config_path: Path, build_type: str) -> bool:
-    """Validate one predictor config without running it.
+    """Validate one predictor config without running it, printing its report."""
+    succeeded, output = dry_run_report(config_path, build_type)
+    print(output, end="" if output.endswith("\n") else "\n")
+    return succeeded
+
+
+def dry_run_report(config_path: Path, build_type: str) -> tuple[bool, str]:
+    """Validate one predictor config without running it: whether it is valid,
+    and the binary's report.
 
     The binary builds the model on its dry-run bridge, lowers every case against
-    it, and prints the `profile.db` specs a real run would JIT-profile. Nothing is
+    it, and reports the `profile.db` specs a real run would JIT-profile. Nothing is
     costed or written under `log_dir`, no job is announced, and no GPU is used.
     """
     cfg = _load_config(config_path)
@@ -497,13 +513,13 @@ def dry_run_one(config_path: Path, build_type: str) -> bool:
                     name="timing-predict-dry-run",
                 )
             )
-    print(result.output, end="" if result.output.endswith("\n") else "\n")
-    return result.succeeded
+    return result.succeeded, result.output
 
 
 def main(argv: list[str]) -> int:
     build_type = "release"
     analyze = True
+    render = True
     dry_run = False
     configs: list[str] = []
     it = iter(argv)
@@ -514,6 +530,8 @@ def main(argv: list[str]) -> int:
                 sys.exit("timing-predict: --build-type needs a value")
         elif tok == "--no-analyze":
             analyze = False
+        elif tok == "--no-plot":
+            render = False
         elif tok == "--dry-run":
             dry_run = True
         elif tok.startswith("-"):
@@ -543,7 +561,7 @@ def main(argv: list[str]) -> int:
                 print(f"[dry-run] {c}")
                 succeeded = dry_run_one(config_path, build_type)
             else:
-                succeeded = asyncio.run(run_one(config_path, build_type, analyze))
+                succeeded = asyncio.run(run_one(config_path, build_type, analyze, render=render))
         except ValueError as exc:
             # Only the dry run reports a config error this way; a real run's
             # ValueError is raised after launch and keeps its traceback.
