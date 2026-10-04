@@ -109,6 +109,8 @@ sweep.rs          SweepGrid + Axis presets (e.g. token_axis, a profiler↔sim
 cost_tree.rs      CostNode/FlatCostNode/CostTree/CostManifest + Evaluator +
                   aggregate(). The compile-once-eval-many structure.
 slot_input.rs     SlotInput: closed enum of leaf inputs, captured for cost_log.
+run_encoded.rs    serde `with` module: run-encodes per-row Vec<u32> input fields
+                  (ramps, caps, repeated blocks) so they stay small in cost_log.
 result.rs         Probe (typed per-leaf eval) + CacheProbe (dyn, JSON, for
                   the kernel-query introspection subcommand).
 routing.rs        RoutingDistribution: MoE expert ppm + Hamilton apportionment.

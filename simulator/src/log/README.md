@@ -31,9 +31,13 @@ first error. Files are created **lazily** on the first non-empty write, so a
 stream that never produces a row leaves no file behind.
 
 `cost_log` chunks are cut by rows, but their `slot_input` JSON is not bounded by
-rows: on long-context EP runs 8,192 rows passed the 2 GiB an Arrow `Utf8` column
-can index. The writer therefore converts one chunk into as many record batches as
-keep each batch's `slot_input` under 1 GiB (`MAX_SLOT_INPUT_BYTES_PER_BATCH`).
+rows. Readers decode by row count too, so a `slot_input` column must stay small
+per row, not just per write: inputs that carry one value per query row (the
+sparse-index remap's span and valid-count vectors) serialize run-encoded
+(`timing/run_encoded.rs`), which took a 1M-context EP run from 1.5 MB to 12 KB
+per row. As a writer-side guard the writer still converts one chunk into as many
+record batches as keep each batch's `slot_input` under 1 GiB
+(`MAX_SLOT_INPUT_BYTES_PER_BATCH`).
 A `CostLogger` never stops the sim, but a failed writer deletes its partial
 parquet and leaves `cost_log/worker_<pool_tag>_<worker_id>.error`; `main` and
 timing-predict drop the workers, read those markers (`cost_log_failures`) and exit
