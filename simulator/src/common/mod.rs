@@ -3,6 +3,7 @@
 //! See `doc/architecture.md` (the `common/` cross-cutting module).
 
 pub mod fabric;
+pub mod gpu;
 pub mod id;
 pub mod request;
 pub mod request_family;

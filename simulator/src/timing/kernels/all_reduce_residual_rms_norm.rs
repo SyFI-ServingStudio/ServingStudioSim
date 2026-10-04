@@ -10,6 +10,7 @@
 use crate::common::Fabric;
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::CacheKind;
+use crate::timing::kernels::all_reduce_fusion::flashinfer_fusion_max_bytes;
 use crate::timing::kernels::engine::{register_kernel, KernelSpec};
 use crate::timing::sweep::{Axis, SweepGrid};
 use crate::timing::{KernelConfig, SweepCoords};
@@ -37,28 +38,14 @@ pub struct AllReduceResidualRmsNormKernelInput {
 pub struct AllReduceResidualRmsNormSpec;
 
 impl AllReduceResidualRmsNormSpec {
-    /// vLLM's default FlashInfer fusion workspace by CUDA architecture and TP.
-    /// SM100 raises TP4 from 2 MiB to 32 MiB; this is why B200 continues using
-    /// the fused kernel for 2,048-token GLM-5.2 mixed iterations.
-    fn max_fused_bytes(gpu_name: &str, num_gpus: u32) -> u64 {
-        let mib = match (gpu_name.contains("B200"), num_gpus) {
-            (_, 2) => 64,
-            (true, 4) => 32,
-            (false, 4) => 2,
-            (_, 8) => 1,
-            (_, _) => panic!("FlashInfer fused all-reduce supports TP 2/4/8"),
-        };
-        mib * 1024 * 1024
-    }
-
-    /// Largest token count for which vLLM selects the fused SM90 recipe.
+    /// Largest token count for which vLLM selects the fused recipe.
     ///
     /// L3 uses the same policy to choose between this fused leaf and the
     /// unfused all-reduce + RMSNorm fallback. Keeping the threshold here makes
     /// the runtime branch and this kernel's profiling grid share one owner.
     pub fn max_fused_tokens(config: &AllReduceResidualRmsNormKernelConfig) -> u32 {
         let bytes_per_token = (config.hidden_dim as u64) * (config.dtype.size_bytes() as u64);
-        (Self::max_fused_bytes(&config.gpu_name, config.num_gpus) / bytes_per_token) as u32
+        (flashinfer_fusion_max_bytes(&config.gpu_name, config.num_gpus) / bytes_per_token) as u32
     }
 }
 

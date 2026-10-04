@@ -14,6 +14,7 @@
 //! extrapolates linearly from the last two-shot segment and is flagged
 //! `EXTRAPOLATED` rather than silently pinned to the cap time.
 
+use crate::common::gpu::compute_capability;
 use crate::common::Fabric;
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::CacheKind;
@@ -40,30 +41,41 @@ pub struct AllReduceFusionKernelInput {
 
 pub struct AllReduceFusionSpec;
 
-impl AllReduceFusionSpec {
-    /// vLLM's default FlashInfer workspace cap by CUDA architecture and TP
-    /// (`FI_ALLREDUCE_FUSION_MAX_SIZE_MB` in
-    /// `vllm/compilation/passes/fusion/allreduce_rms_fusion.py`): SM100 for
-    /// B200, SM90 otherwise, as `AllReduceResidualRmsNormSpec` keys it.
-    fn max_fused_bytes(gpu_name: &str, num_gpus: u32) -> u64 {
-        const KIB: u64 = 1024;
-        let kib = match (gpu_name.contains("B200"), num_gpus) {
-            (_, 2) => 64 * 1024,
-            (true, 4) => 32 * 1024,
-            (false, 4) => 2 * 1024,
-            (true, 8) => 1024,
-            (false, 8) => 512,
-            (_, _) => panic!("FlashInfer all-reduce fusion supports TP 2/4/8"),
-        };
-        kib * KIB
-    }
+/// vLLM's default FlashInfer fused all-reduce workspace, in bytes, by the GPU's
+/// compute capability and TP (`FI_ALLREDUCE_FUSION_MAX_SIZE_MB` in
+/// `vllm/compilation/passes/fusion/allreduce_rms_fusion.py`). vLLM keys it by
+/// the exact capability, so SM103 (B300) is not SM100 (B200, GB200). Both
+/// fused all-reduce kinds read it.
+pub(crate) fn flashinfer_fusion_max_bytes(gpu_name: &str, num_gpus: u32) -> u64 {
+    let capability = compute_capability(gpu_name)
+        .unwrap_or_else(|| panic!("{gpu_name} has no compute capability in gpu/spec.json"));
+    let kib: u64 = match (capability, num_gpus) {
+        ((9, 0), 2) => 64 * 1024,
+        ((9, 0), 4) => 2 * 1024,
+        ((9, 0), 8) => 512,
+        ((10, 0), 2) => 64 * 1024,
+        ((10, 0), 4) => 32 * 1024,
+        ((10, 0), 8) => 1024,
+        ((10, 0), 16) => 64 * 1024,
+        ((10, 3), 2 | 4 | 16) => 64 * 1024,
+        ((10, 3), 8) => 4 * 1024,
+        ((10, 7), 2 | 4) => 64 * 1024,
+        ((10, 7), 8) => 2 * 1024,
+        ((major, minor), tp) => panic!(
+            "vLLM has no FlashInfer all-reduce fusion workspace for {gpu_name} \
+             (SM{major}{minor}) at TP {tp}"
+        ),
+    };
+    kib * 1024
+}
 
+impl AllReduceFusionSpec {
     /// Largest token count for which vLLM selects FlashInfer.
     pub fn max_fused_tokens(config: &AllReduceFusionKernelConfig) -> u32 {
         let bytes_per_token = u64::from(config.hidden_dim)
             .checked_mul(config.dtype.size_bytes() as u64)
             .expect("all-reduce bytes per token overflow");
-        (Self::max_fused_bytes(&config.gpu_name, config.num_gpus) / bytes_per_token) as u32
+        (flashinfer_fusion_max_bytes(&config.gpu_name, config.num_gpus) / bytes_per_token) as u32
     }
 
     /// FlashInfer `MNNVL_ONE_SHOT_THRESHOLD` (`trtllm_mnnvl_ar.py`): one-shot
@@ -159,6 +171,23 @@ mod tests {
             AllReduceFusionKernelInput::coord_field_names(),
             &["num_tokens"]
         );
+    }
+
+    #[test]
+    fn workspace_follows_vllm_by_exact_compute_capability() {
+        const MIB: u64 = 1024 * 1024;
+        // SM100 (B200, GB200) and SM103 (B300) are separate vLLM rows.
+        assert_eq!(flashinfer_fusion_max_bytes("NVIDIA B200", 4), 32 * MIB);
+        assert_eq!(flashinfer_fusion_max_bytes("NVIDIA GB200", 8), MIB);
+        assert_eq!(flashinfer_fusion_max_bytes("NVIDIA B300", 4), 64 * MIB);
+        assert_eq!(flashinfer_fusion_max_bytes("NVIDIA B300", 8), 4 * MIB);
+        assert_eq!(flashinfer_fusion_max_bytes("NVIDIA H200", 8), MIB / 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "no FlashInfer all-reduce fusion workspace")]
+    fn a_gpu_vllm_does_not_fuse_on_has_no_workspace() {
+        flashinfer_fusion_max_bytes("NVIDIA A100", 4);
     }
 
     #[test]
