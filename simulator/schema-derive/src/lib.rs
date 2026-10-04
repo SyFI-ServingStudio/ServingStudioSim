@@ -29,7 +29,7 @@
 //! also carries `#[serde(default)]` — in that case (and for any other type
 //! tagged `#[serde(default)]`) the param is marked `.optional()`, matching
 //! serde's "absent = Default::default()" semantics (e.g. `Vec<f32>` defaults to
-//! the empty list).
+//! the empty list). A `Vec<[int; 2]>` is an `int_pair_list`.
 
 use proc_macro::TokenStream;
 use quote::{quote, ToTokens};
@@ -232,6 +232,21 @@ fn classify(ty: &Type) -> syn::Result<Classified> {
         return Ok(c);
     }
     if let Some(inner) = generic_inner(ty, "Vec") {
+        // `Vec<[int; 2]>`: a list of pairs.
+        if let Type::Array(pair) = inner {
+            if is_len_two(&pair.len) && matches!(scalar_kind(&pair.elem), Ok(Scalar::Int)) {
+                return Ok(Classified {
+                    ctor: "int_pair_list",
+                    default_method: "",
+                    optional: false,
+                    is_bool: false,
+                });
+            }
+            return Err(syn::Error::new(
+                ty.span(),
+                "param: the only array element a list takes is `[int; 2]`",
+            ));
+        }
         return Ok(Classified {
             ctor: list_ctor(scalar_kind(inner)?, inner)?,
             default_method: "",
@@ -300,6 +315,10 @@ fn list_ctor(s: Scalar, ty: &Type) -> syn::Result<&'static str> {
             "param: no bool_list ParamType (Vec<bool> unsupported)",
         )),
     }
+}
+
+fn is_len_two(len: &Expr) -> bool {
+    matches!(len, Expr::Lit(ExprLit { lit: Lit::Int(n), .. }) if n.base10_digits() == "2")
 }
 
 fn last_ident(ty: &Type) -> Option<String> {

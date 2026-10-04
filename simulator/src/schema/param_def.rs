@@ -60,6 +60,8 @@ pub enum ParamType {
     FloatList,
     StringList,
     PathList,
+    /// A list of two-int pairs (`Vec<[u32; 2]>`), e.g. `[[prefix_len, append_len], ...]`.
+    IntPairList,
 }
 
 /// Default value carried inline on a `ParamDef`. Serializes as a **bare**
@@ -177,6 +179,10 @@ impl ParamDef {
 
     pub const fn path_list(name: &'static str) -> Self {
         Self::bare(name, ParamType::PathList)
+    }
+
+    pub const fn int_pair_list(name: &'static str) -> Self {
+        Self::bare(name, ParamType::IntPairList)
     }
 
     pub const fn default_int(mut self, v: i64) -> Self {

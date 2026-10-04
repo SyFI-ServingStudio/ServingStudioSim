@@ -40,6 +40,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
+use schema_derive::ParamStruct;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -177,15 +178,24 @@ struct PredictCase {
 /// `[prefix_len, append_len]` list (a fresh prefill has `prefix_len = 0`); decode
 /// is EITHER the exact per-request KV-length list (`decode_kv_lens`) OR the
 /// uniform shorthand (`decode_count` + `average_decode_length`) — never both.
-#[derive(Debug, Deserialize)]
+/// Its fields are published by `list-params` (`predict_cases`).
+#[derive(Debug, Deserialize, ParamStruct)]
 #[serde(deny_unknown_fields)]
-struct PredictGroup {
+pub(crate) struct PredictGroup {
+    /// Prefill requests, one `[prefix_len, append_len]` each: the tokens already
+    /// in the KV cache and the tokens this iteration computes (`prefix_len` 0
+    /// for a fresh prompt).
     #[serde(default)]
     prefill_chunk_pairs: Vec<[u32; 2]>,
+    /// Decode requests, one KV length each: the context its new token attends
+    /// to. Give this or `decode_count`, not both.
     #[serde(default)]
     decode_kv_lens: Vec<u32>,
+    /// Shorthand for `decode_kv_lens`: this many decode requests, each
+    /// `average_decode_length` long.
     #[serde(default)]
     decode_count: Option<u32>,
+    /// The KV length of each `decode_count` request; required with it.
     #[serde(default)]
     average_decode_length: Option<u32>,
 }
@@ -264,11 +274,18 @@ struct SpeculativePredictCase {
 
 /// Decode pairs are [final verify-row KV length, query width]. Ordinary decode
 /// shorthand is deliberately absent: it loses request/query cardinality.
-#[derive(Debug, Deserialize)]
+/// Its fields are published by `list-params` (`predict_cases`).
+#[derive(Debug, Deserialize, ParamStruct)]
 #[serde(deny_unknown_fields)]
-struct SpeculativePredictGroup {
+pub(crate) struct SpeculativePredictGroup {
+    /// Prefill requests, one `[prefix_len, append_len]` each: the tokens already
+    /// in the KV cache and the tokens this iteration computes. Their sum is at
+    /// most `max_model_len`.
     #[serde(default)]
     prefill_chunk_pairs: Vec<[u32; 2]>,
+    /// Decode (verify) requests, one `[kv_len, query_len]` each: the KV length
+    /// once the verify step has run, and its query width, which is
+    /// `draft_tokens + 1`.
     #[serde(default)]
     decode_requests: Vec<[u32; 2]>,
 }

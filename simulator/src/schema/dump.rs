@@ -9,7 +9,11 @@
 //!   - `arch_common`: the model fields every arch tag carries;
 //!   - `group_common`: the flat fields every group carries (gpu / replicas);
 //!   - `pool_common`: the flat fields every pool carries (placement);
-//!   - `common`: run-global workload / io params.
+//!   - `common`: run-global workload / io params;
+//!   - `predict_cases`: per `timing-predict` arch selector, the fields of one
+//!     case. `groups`: a case is `{groups: [...]}`, each group these fields;
+//!     `case`: a case is an object of these fields. How many groups a model
+//!     takes is the model's (`cost-trees` gives it as `predict.groups`).
 //!
 //! This module only *arranges* — every param's defaults / choices / cache-key
 //! flag is *derived from the config types themselves*: `#[derive(ParamStruct)]`
@@ -22,9 +26,11 @@
 use serde_json::{json, Map, Value};
 
 use crate::arch::config::{AttnArchSel, FfnArchSel, IterArchSel, ModelSpec};
+use crate::arch::contract::FfnArchInput;
 use crate::deployment::config::{IoSpec, WorkloadSpec};
 use crate::orchestrator::config::{GroupSpec, PoolSpec};
 use crate::schema::ParamDef;
+use crate::timing_predict::{PredictGroup, SpeculativePredictGroup};
 use crate::worker::config::{AttnWorkerSel, FfnWorkerSel, IterWorkerSel, KvAdmissionSpec};
 
 /// Serialize a `const PARAMS` slice to a JSON array of ParamDef objects.
@@ -89,12 +95,58 @@ pub fn list_params() -> Value {
             "workload": params(WorkloadSpec::PARAMS),
             "io":       params(IoSpec::PARAMS),
         },
+        "predict_cases": {
+            "iter":             {"groups": params(PredictGroup::PARAMS)},
+            "speculative_iter": {"groups": params(SpeculativePredictGroup::PARAMS)},
+            "attn":             {"groups": params(PredictGroup::PARAMS)},
+            "ffn":              {"case": params(FfnArchInput::PARAMS)},
+        },
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each `timing-predict` selector publishes its case fields, typed as the
+    /// case structs deserialize them: `[a, b]` pairs as `int_pair_list`.
+    #[test]
+    fn predict_cases_list_each_selectors_case_fields() {
+        let cases = &list_params()["predict_cases"];
+        let fields = |selector: &str, key: &str| -> Vec<(String, String)> {
+            cases[selector][key]
+                .as_array()
+                .unwrap_or_else(|| panic!("{selector}.{key}"))
+                .iter()
+                .map(|p| {
+                    (
+                        p["name"].as_str().unwrap().into(),
+                        p["type"].as_str().unwrap().into(),
+                    )
+                })
+                .collect()
+        };
+        let pair = |n: &str, t: &str| (n.to_string(), t.to_string());
+        let group = vec![
+            pair("prefill_chunk_pairs", "int_pair_list"),
+            pair("decode_kv_lens", "int_list"),
+            pair("decode_count", "int"),
+            pair("average_decode_length", "int"),
+        ];
+        assert_eq!(fields("iter", "groups"), group);
+        assert_eq!(fields("attn", "groups"), group);
+        assert_eq!(
+            fields("speculative_iter", "groups"),
+            [
+                pair("prefill_chunk_pairs", "int_pair_list"),
+                pair("decode_requests", "int_pair_list"),
+            ]
+        );
+        assert_eq!(
+            fields("ffn", "case"),
+            [pair("tokens_per_group", "int_list")]
+        );
+    }
 
     /// The group's GPU and an arch's routing pick kernels, so the launcher's
     /// cache-key dedup must tell configs apart by them.

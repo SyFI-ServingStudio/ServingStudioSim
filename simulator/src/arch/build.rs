@@ -1871,6 +1871,8 @@ pub struct ArchBuild {
     /// took their schema defaults.
     pub params: serde_json::Map<String, serde_json::Value>,
     pub gpus_per_replica: Option<u16>,
+    /// What a `timing-predict` case for this build looks like; `None` on error.
+    pub predict: Option<PredictShape>,
     /// The cost tree, in the `cost_manifest/*.json` form; `None` on error.
     pub cost_manifest: Option<crate::timing::CostManifestDoc>,
     /// The kernel configs the build asks profile.db for, as the document
@@ -1879,6 +1881,39 @@ pub struct ArchBuild {
     pub kernel_configs: Option<serde_json::Value>,
     pub error: Option<String>,
 }
+
+/// The `timing-predict` case shape of a built arch: the arch selector the
+/// predict config names it under, and what each case must hold.
+#[derive(Debug, serde::Serialize)]
+pub struct PredictShape {
+    /// `iter`, `speculative_iter`, `attn` or `ffn`.
+    pub selector: &'static str,
+    /// The groups each case lists (`groups`, or an ffn case's
+    /// `tokens_per_group`): the model's attention DP shards.
+    pub groups: u16,
+    /// A speculative arch's verify width, `draft_tokens + 1`: every decode
+    /// request's query length.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query_width: Option<u32>,
+    /// A speculative arch's context limit, which no request may exceed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_model_len: Option<u32>,
+}
+
+impl PredictShape {
+    fn new(selector: &'static str, groups: u16) -> Self {
+        Self {
+            selector,
+            groups,
+            query_width: None,
+            max_model_len: None,
+        }
+    }
+}
+
+/// What a structure-only build returns: the replica width, its prediction case
+/// shape and its cost tree.
+type Built = (u16, PredictShape, crate::timing::CostManifestDoc);
 
 /// The dotted-leaf prefix a deployment gives its model, which starts every leaf
 /// name and kernel-config role. Arch builds use the deployment's own, as
@@ -1931,6 +1966,7 @@ pub fn build_arch_blocks(blocks: &[ArchBlock], kernel_configs: bool) -> Vec<Arch
                     gpu: block.gpu.clone(),
                     params,
                     gpus_per_replica: None,
+                    predict: None,
                     cost_manifest: None,
                     kernel_configs: None,
                     error: Some(format!("no arch contract provides {tag:?}")),
@@ -1977,24 +2013,31 @@ fn build_arch(
             |selector: &IterArchSel, gpu, bridge| {
                 // A speculative arch builds a different model type, with its
                 // own tree: the verify pass plus its draft passes.
-                let (gpus, manifest) = match selector {
+                let (gpus, shape, manifest) = match selector {
                     IterArchSel::Glm52VllmNvfp4DsaMoeSpeculative { .. }
                     | IterArchSel::Glm53VllmNvfp4DsaMoeDflash2 { .. } => {
-                        let (model, _) = build_speculative_iter_model(
+                        let (model, draft_tokens) = build_speculative_iter_model(
                             selector,
                             gpu,
                             UNIFIED_MODEL_NAME,
                             bridge,
                         )?;
-                        (model.gpus_per_replica(), model.cost_log_manifest())
+                        let shape = PredictShape {
+                            query_width: Some(draft_tokens + 1),
+                            max_model_len: Some(model.max_model_len()),
+                            ..PredictShape::new("speculative_iter", model.num_attn_dp_groups())
+                        };
+                        (model.gpus_per_replica(), shape, model.cost_log_manifest())
                     }
                     _ => {
                         let model = build_iter_model(selector, gpu, UNIFIED_MODEL_NAME, bridge)?;
-                        (model.gpus_per_replica(), model.cost_log_manifest())
+                        let shape = PredictShape::new("iter", model.num_attn_dp_groups());
+                        (model.gpus_per_replica(), shape, model.cost_log_manifest())
                     }
                 };
                 Ok((
                     gpus,
+                    shape,
                     crate::timing::CostManifestDoc::single("iter", manifest),
                 ))
             },
@@ -2005,7 +2048,8 @@ fn build_arch(
             kernel_configs,
             |selector: &AttnArchSel, gpu, bridge| {
                 let model = build_attn_model(selector, gpu, AFD_MODEL_NAME, bridge)?;
-                Ok((model.gpus_per_replica(), model.cost_log_manifest()))
+                let shape = PredictShape::new("attn", model.num_attn_dp_groups());
+                Ok((model.gpus_per_replica(), shape, model.cost_log_manifest()))
             },
         ),
         _ => build_selector(
@@ -2014,7 +2058,8 @@ fn build_arch(
             kernel_configs,
             |selector: &FfnArchSel, gpu, bridge| {
                 let model = build_ffn_model(selector, gpu, AFD_MODEL_NAME, bridge)?;
-                Ok((model.gpus_per_replica(), model.cost_log_manifest()))
+                let shape = PredictShape::new("ffn", model.num_dp_groups());
+                Ok((model.gpus_per_replica(), shape, model.cost_log_manifest()))
             },
         ),
     };
@@ -2024,13 +2069,15 @@ fn build_arch(
         gpu,
         params,
         gpus_per_replica: None,
+        predict: None,
         cost_manifest: None,
         kernel_configs: None,
         error: None,
     };
     match built {
-        Ok((gpus_per_replica, manifest, configs)) => {
+        Ok(((gpus_per_replica, shape, manifest), configs)) => {
             out.gpus_per_replica = Some(gpus_per_replica);
+            out.predict = Some(shape);
             out.cost_manifest = Some(manifest);
             out.kernel_configs = configs;
         }
@@ -2040,21 +2087,14 @@ fn build_arch(
 }
 
 /// Parse `arch` as selector `S` and `build` it on `gpu` with a structure-only
-/// bridge: the replica width, the cost tree and, when asked, the kernel-config
-/// records document. A parse error, build error or panic is the error text.
+/// bridge: the replica width, the prediction case shape, the cost tree and,
+/// when asked, the kernel-config records document. A parse error, build error or panic is the error text.
 fn build_selector<S: serde::de::DeserializeOwned>(
     arch: serde_json::Map<String, serde_json::Value>,
     gpu: &str,
     kernel_configs: bool,
-    build: impl Fn(&S, &str, &PerfApiBridge) -> Result<(u16, crate::timing::CostManifestDoc)>,
-) -> std::result::Result<
-    (
-        u16,
-        crate::timing::CostManifestDoc,
-        Option<serde_json::Value>,
-    ),
-    String,
-> {
+    build: impl Fn(&S, &str, &PerfApiBridge) -> Result<Built>,
+) -> std::result::Result<(Built, Option<serde_json::Value>), String> {
     let selector: S = serde_json::from_value(serde_json::Value::Object(arch))
         .map_err(|e| format!("config: {e}"))?;
     let bridge = PerfApiBridge::structure_only();
@@ -2065,9 +2105,8 @@ fn build_selector<S: serde::de::DeserializeOwned>(
         build(&selector, gpu, &bridge)
     }));
     match built {
-        Ok(Ok((gpus_per_replica, manifest))) => Ok((
-            gpus_per_replica,
-            manifest,
+        Ok(Ok(built)) => Ok((
+            built,
             kernel_configs.then(|| {
                 crate::timing::bridge::config_records_document(&bridge.take_config_records())
             }),
@@ -2934,6 +2973,49 @@ mod tests {
         assert!(build_arch_blocks(&sample_blocks(), false)
             .iter()
             .all(|b| b.kernel_configs.is_none()));
+    }
+
+    /// Each build names the `timing-predict` selector its cases go under and
+    /// how many groups a case lists: one per attention DP shard, and a
+    /// speculative arch's verify width and context limit besides.
+    #[test]
+    fn arch_blocks_give_their_prediction_case_shape() {
+        let mut blocks = sample_blocks();
+        blocks.push(arch_block(
+            "NVIDIA H200",
+            "qwen3_moe_fp8_dp_attn_ep_ffn",
+            "qwen3_235b_fp8",
+            serde_json::json!({"ep_size": 8, "attn_tp_size": 2, "nvl_num_gpu": 8, "routing": "uniform", "fp8": true}),
+        ));
+        blocks.push(arch_block(
+            "NVIDIA B200",
+            "glm52_vllm_nvfp4_dsa_moe_speculative",
+            "glm52_nvfp4",
+            serde_json::json!({"ep_size": 4, "nvl_num_gpu": 4, "draft_tokens": 5, "max_model_len": 8192}),
+        ));
+        let shapes: Vec<_> = build_arch_blocks(&blocks, false)
+            .into_iter()
+            .map(|b| {
+                let shape = b
+                    .predict
+                    .unwrap_or_else(|| panic!("{}: {:?}", b.arch, b.error));
+                (
+                    shape.selector,
+                    shape.groups,
+                    shape.query_width,
+                    shape.max_model_len,
+                )
+            })
+            .collect();
+        assert_eq!(
+            shapes,
+            [
+                ("iter", 1, None, None),
+                ("attn", 1, None, None),
+                ("iter", 4, None, None),
+                ("speculative_iter", 1, Some(6), Some(8192)),
+            ]
+        );
     }
 
     /// A param a block sets changes the tree its defaults build, and a tag no
