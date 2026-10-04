@@ -395,6 +395,15 @@ pools:
     }
 
     #[test]
+    fn a_group_with_zero_replicas_is_a_config_error() {
+        let error =
+            serde_yaml::from_str::<RunConfig>(&UNIFIED_YAML.replace("replicas: 1", "replicas: 0"))
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("replicas must be at least 1"), "{error}");
+    }
+
+    #[test]
     fn unknown_group_field_rejected() {
         // deny_unknown_fields on GroupSpec (a plain struct) catches stray keys.
         let bad = UNIFIED_YAML.replace("replicas: 1", "replicas: 1\n        bogus: 3");
