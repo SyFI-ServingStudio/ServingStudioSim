@@ -27,7 +27,8 @@ pub struct DeepseekV4MoeExpertComputeLocalWorkletConfig {
     pub top_k: u32,
     pub hash_vocab_size: u32,
     pub hidden_dtype: DType,
-    /// Popularity of this rank's contiguous 64-expert shard.
+    /// Popularity of this rank's contiguous expert shard (`num_experts / ep_size`
+    /// entries).
     pub local_ppm: Vec<u32>,
     pub gpu_name: String,
     pub selection_backends: Vec<&'static str>,
@@ -85,7 +86,11 @@ impl DeepseekV4MoeExpertComputeLocalWorklet {
             }
         );
         assert_eq!(config.hidden_dtype, DType::Bf16);
-        assert_eq!(config.local_ppm.len(), 64);
+        assert!(
+            !config.local_ppm.is_empty()
+                && config.num_experts.get() as usize % config.local_ppm.len() == 0,
+            "local_ppm must be an even shard of the experts"
+        );
         assert!(config.local_ppm.iter().any(|&mass| mass > 0));
         let marlin = |fc_role, n, k| Mxfp4MarlinMoeGemmKernelConfig {
             backends: config.marlin_backends.clone(),
@@ -194,7 +199,12 @@ impl DeepseekV4MoeExpertComputeLocalWorklet {
         input: &DeepseekV4MoeExpertComputeLocalWorkletInput,
         evaluator: &mut Evaluator,
     ) {
-        let work = derive_work(input.num_gathered_tokens, self.resolved.raw_cfg.top_k);
+        let raw = &self.resolved.raw_cfg;
+        let work = derive_work(
+            input.num_gathered_tokens,
+            raw.top_k,
+            raw.local_ppm.len() as u32,
+        );
         let zero = input.num_gathered_tokens == 0;
         eval_or_zero(&self.selection, work.selection, zero, evaluator);
         eval_or_zero(&self.align, work.align, zero, evaluator);
@@ -215,7 +225,7 @@ struct WorkInputs {
     sum: MoeSumKernelInput,
 }
 
-fn derive_work(num_gathered_tokens: u32, top_k: u32) -> WorkInputs {
+fn derive_work(num_gathered_tokens: u32, top_k: u32, num_local_experts: u32) -> WorkInputs {
     let routed_rows = num_gathered_tokens
         .checked_mul(top_k)
         .expect("num_gathered_tokens * top_k must fit u32");
@@ -225,7 +235,7 @@ fn derive_work(num_gathered_tokens: u32, top_k: u32) -> WorkInputs {
         },
         align: MoeAlignBlockSizeKernelInput {
             num_tokens: num_gathered_tokens,
-            block_size: marlin_block_size_m(num_gathered_tokens, top_k, 64),
+            block_size: marlin_block_size_m(num_gathered_tokens, top_k, num_local_experts),
         },
         marlin: Mxfp4MarlinMoeGemmKernelInput {
             num_input_tokens: num_gathered_tokens,
@@ -260,7 +270,7 @@ mod tests {
 
     #[test]
     fn gathered_tokens_drive_selection_alignment_and_routed_rows_once() {
-        let work = derive_work(128, 6);
+        let work = derive_work(128, 6, 64);
         assert_eq!(work.selection.num_tokens, 128);
         assert_eq!(work.align.num_tokens, 128);
         assert_eq!(work.align.block_size, 16);
@@ -268,5 +278,11 @@ mod tests {
         assert_eq!(work.activation.num_rows, 768);
         assert_eq!(work.fc2_output_zero.num_tokens, 128);
         assert_eq!(work.sum.num_tokens, 128);
+    }
+
+    #[test]
+    fn marlin_block_size_uses_the_local_expert_count() {
+        // 768 routed rows over 32 local experts: 768 / 32 / 16 >= 0.9 > 768 / 32 / 32.
+        assert_eq!(derive_work(128, 6, 32).align.block_size, 32);
     }
 }

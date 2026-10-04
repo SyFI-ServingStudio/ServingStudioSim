@@ -41,27 +41,29 @@ pub struct AllReduceFusionKernelInput {
 pub struct AllReduceFusionSpec;
 
 impl AllReduceFusionSpec {
-    /// vLLM's default FlashInfer workspace cap on SM100.
-    fn max_fused_bytes(num_gpus: u32) -> u64 {
-        let mib = match num_gpus {
-            2 => 64,
-            4 => 32,
-            8 => 1,
-            _ => panic!("FlashInfer all-reduce fusion supports TP 2/4/8"),
+    /// vLLM's default FlashInfer workspace cap by CUDA architecture and TP
+    /// (`FI_ALLREDUCE_FUSION_MAX_SIZE_MB` in
+    /// `vllm/compilation/passes/fusion/allreduce_rms_fusion.py`): SM100 for
+    /// B200, SM90 otherwise, as `AllReduceResidualRmsNormSpec` keys it.
+    fn max_fused_bytes(gpu_name: &str, num_gpus: u32) -> u64 {
+        const KIB: u64 = 1024;
+        let kib = match (gpu_name.contains("B200"), num_gpus) {
+            (_, 2) => 64 * 1024,
+            (true, 4) => 32 * 1024,
+            (false, 4) => 2 * 1024,
+            (true, 8) => 1024,
+            (false, 8) => 512,
+            (_, _) => panic!("FlashInfer all-reduce fusion supports TP 2/4/8"),
         };
-        mib * 1024 * 1024
+        kib * KIB
     }
 
-    /// Largest token count for which vLLM selects FlashInfer on B200.
+    /// Largest token count for which vLLM selects FlashInfer.
     pub fn max_fused_tokens(config: &AllReduceFusionKernelConfig) -> u32 {
-        assert!(
-            config.gpu_name.contains("B200"),
-            "all_reduce_fusion is currently profiled only on B200"
-        );
         let bytes_per_token = u64::from(config.hidden_dim)
             .checked_mul(config.dtype.size_bytes() as u64)
             .expect("all-reduce bytes per token overflow");
-        (Self::max_fused_bytes(config.num_gpus) / bytes_per_token) as u32
+        (Self::max_fused_bytes(&config.gpu_name, config.num_gpus) / bytes_per_token) as u32
     }
 
     /// FlashInfer `MNNVL_ONE_SHOT_THRESHOLD` (`trtllm_mnnvl_ar.py`): one-shot
@@ -168,6 +170,18 @@ mod tests {
 
         let tp8 = AllReduceFusionSpec::sweep_grid(&config(8));
         assert_eq!(tp8.axes()[0].last(), Some(&85.0));
+    }
+
+    #[test]
+    fn hopper_uses_the_sm90_workspace_cap() {
+        let h200 = |num_gpus| AllReduceFusionKernelConfig {
+            gpu_name: "NVIDIA H200".to_string(),
+            ..config(num_gpus)
+        };
+        // 2 MiB / (6144 * 2 B) and 0.5 MiB / (6144 * 2 B).
+        assert_eq!(AllReduceFusionSpec::max_fused_tokens(&h200(4)), 170);
+        assert_eq!(AllReduceFusionSpec::max_fused_tokens(&h200(8)), 42);
+        assert_eq!(AllReduceFusionSpec::max_fused_tokens(&h200(2)), 5461);
     }
 
     fn mnnvl_config(num_gpus: u32) -> AllReduceFusionKernelConfig {

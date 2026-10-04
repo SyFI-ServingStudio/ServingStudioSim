@@ -102,7 +102,6 @@ fn canonical_input(
 pub struct KvCompressStoreSpec;
 
 fn validate_config(config: &KvCompressStoreKernelConfig) {
-    assert_eq!(config.gpu_name, "NVIDIA H200");
     assert_eq!(config.num_kv_heads, 1);
     assert_eq!(config.rope_head_dim.get(), 64);
     assert_eq!(config.logical_block_size, 256);

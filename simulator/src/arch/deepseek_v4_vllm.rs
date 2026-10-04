@@ -2,7 +2,7 @@
 //!
 //! The graph keeps seven unique layer bodies and folds the final nineteen
 //! C128/C4 pairs. Attention uses the busiest DP rank, while the two EP
-//! collectives retain the exact ragged four-rank token vector. Routed expert
+//! collectives retain the exact ragged per-rank token vector. Routed expert
 //! compute uses one contiguous, highest-mass expert shard; popularity never
 //! changes collective bytes.
 
@@ -41,7 +41,6 @@ use crate::worklet::{
 const ARCH_KIND: &str = "deepseek_v4_vllm";
 const CHECKPOINT_LAYERS: u32 = 43;
 const NUM_HASH_LAYERS: u32 = 3;
-const EP_SIZE: u32 = 4;
 const HIDDEN: u32 = 4096;
 const NUM_EXPERTS: u32 = 256;
 const TOP_K: u32 = 6;
@@ -288,6 +287,7 @@ pub struct DeepseekV4LayerConfig {
 }
 
 pub struct DeepseekV4VllmConfigs {
+    ep_size: u16,
     layers: Vec<DeepseekV4LayerConfig>,
     lm_head: SingleGemmKernelConfig,
     terminal_mhc_head: MhcRmsNormKernelConfig,
@@ -305,6 +305,7 @@ pub struct DeepseekV4LayerResolved {
 }
 
 pub struct DeepseekV4VllmResolved {
+    ep_size: u16,
     layers: Vec<DeepseekV4LayerResolved>,
     lm_head: SingleGemmKernelConfig,
     terminal_mhc_head: MhcRmsNormKernelConfig,
@@ -323,18 +324,26 @@ pub fn build_configs(
     parallel: &DeepseekV4VllmParallel,
     routing: &RoutingDistribution,
 ) -> std::result::Result<DeepseekV4VllmConfigs, BuildError> {
-    if parallel.ep_size != EP_SIZE as u16
-        || parallel.nvl_num_gpu != EP_SIZE as u16
-        || parallel.gpu_name != "NVIDIA H200"
-    {
-        return Err(fit_failed(
-            "DeepSeek V4 Flash requires H200 EP4 within one NVLink domain",
-        ));
+    // Every layer runs the PyNCCL EP all-gather/reduce-scatter pair, which
+    // needs two or more ranks (PyNcclCommunicator disables itself at one).
+    if parallel.ep_size < 2 || NUM_EXPERTS % u32::from(parallel.ep_size) != 0 {
+        return Err(fit_failed(format!(
+            "ep_size {} must be >= 2 and divide the {NUM_EXPERTS} experts",
+            parallel.ep_size
+        )));
+    }
+    // The EP collectives are priced on NVLink only; the graph has no
+    // inter-node path.
+    if parallel.nvl_num_gpu != parallel.ep_size {
+        return Err(fit_failed(format!(
+            "nvl_num_gpu {} must equal ep_size {}: the EP group is one NVLink domain",
+            parallel.nvl_num_gpu, parallel.ep_size
+        )));
     }
     if routing.num_experts() != NUM_EXPERTS {
         return Err(fit_failed("routing distribution must contain 256 experts"));
     }
-    let local_ppm = critical_contiguous_shard(routing.ppm(), EP_SIZE as usize);
+    let local_ppm = critical_contiguous_shard(routing.ppm(), usize::from(parallel.ep_size));
     let layers = LAYER_RECIPES
         .iter()
         .map(|recipe| layer_config(model, parallel, recipe, local_ppm.clone()))
@@ -354,6 +363,7 @@ pub fn build_configs(
         })
         .ok_or_else(|| fit_failed("KV byte accounting overflow"))?;
     Ok(DeepseekV4VllmConfigs {
+        ep_size: parallel.ep_size,
         layers,
         lm_head: SingleGemmKernelConfig {
             backends: vec!["torch_linear"],
@@ -441,7 +451,7 @@ fn layer_config(
         dispatch: MoeEpAllGatherKernelConfig {
             backends: COLLECTIVE_BACKENDS.to_vec(),
             gpu_name: gpu.clone(),
-            num_gpus: EP_SIZE,
+            num_gpus: u32::from(parallel.ep_size),
             hidden_size: model.hidden_size.clone(),
             num_experts: model.num_experts.clone(),
             hidden_dtype: DType::Bf16,
@@ -482,7 +492,7 @@ fn layer_config(
         combine: MoeEpReduceScatterKernelConfig {
             backends: COLLECTIVE_BACKENDS.to_vec(),
             gpu_name: gpu,
-            num_gpus: EP_SIZE,
+            num_gpus: u32::from(parallel.ep_size),
             hidden_size: model.hidden_size.clone(),
             dtype: DType::Bf16,
             fabric: "nvlink".into(),
@@ -498,6 +508,7 @@ fn layer_config(
 
 pub fn resolve_configs(configs: &DeepseekV4VllmConfigs) -> DeepseekV4VllmResolved {
     DeepseekV4VllmResolved {
+        ep_size: configs.ep_size,
         layers: configs
             .layers
             .iter()
@@ -650,6 +661,7 @@ impl DeepseekV4LayerBody {
 
 pub struct DeepseekV4VllmModel {
     name: String,
+    ep_size: u16,
     layers: Vec<DeepseekV4LayerBody>,
     terminal_mhc_head: Op<MhcTerminalHeadKernel>,
     lm_head: Op<SingleGemmKernel>,
@@ -674,6 +686,7 @@ pub fn build(
     let terminal_name = format!("{name}.terminal_mhc_head");
     let mut model = DeepseekV4VllmModel {
         name,
+        ep_size: resolved.ep_size,
         layers,
         terminal_mhc_head: Op::new(
             terminal_name.clone(),
@@ -720,8 +733,8 @@ impl DeepseekV4VllmModel {
         prefix.push(self.lm_head.compile(&mut builder));
         let root = CostNode::Labeled {
             label: format!(
-                "{} (DeepseekV4VllmModel) [EP4; 5 unique layers + 19 C128/C4 cycles]",
-                self.name
+                "{} (DeepseekV4VllmModel) [EP{}; 5 unique layers + 19 C128/C4 cycles]",
+                self.name, self.ep_size
             ),
             child: Box::new(CostNode::Sum(prefix)),
         };
@@ -729,7 +742,7 @@ impl DeepseekV4VllmModel {
     }
 
     fn eval_into(&self, batch: &UnifiedArchInput, evaluator: &mut Evaluator) {
-        let input = normalize_input(batch)
+        let input = normalize_input(batch, self.ep_size)
             .unwrap_or_else(|reason| panic!("invalid DeepSeek V4 input: {reason}"));
         for layer in &self.layers {
             layer.eval(&input, evaluator);
@@ -755,7 +768,7 @@ impl DeepseekV4VllmModel {
 
 impl IterwiseUnifiedModel for DeepseekV4VllmModel {
     fn check_input(&self, batch: &UnifiedArchInput) -> Result<(), String> {
-        let input = normalize_input(batch)?;
+        let input = normalize_input(batch, self.ep_size)?;
         self.layers
             .iter()
             .try_for_each(|layer| layer.attention.check_input(&input.attention))
@@ -795,10 +808,10 @@ impl IterwiseUnifiedModel for DeepseekV4VllmModel {
         self.total_kv_bytes_per_token
     }
     fn gpus_per_replica(&self) -> u16 {
-        EP_SIZE as u16
+        self.ep_size
     }
     fn num_attn_dp_groups(&self) -> u16 {
-        EP_SIZE as u16
+        self.ep_size
     }
     fn num_attn_shards(&self) -> u16 {
         1
@@ -813,11 +826,16 @@ struct NormalizedInput {
     logits_tokens: u32,
 }
 
-fn normalize_input(input: &UnifiedArchInput) -> std::result::Result<NormalizedInput, String> {
-    if input.groups.len() != EP_SIZE as usize
-        || input.tokens_per_source_rank.len() != EP_SIZE as usize
+fn normalize_input(
+    input: &UnifiedArchInput,
+    ep_size: u16,
+) -> std::result::Result<NormalizedInput, String> {
+    if input.groups.len() != usize::from(ep_size)
+        || input.tokens_per_source_rank.len() != usize::from(ep_size)
     {
-        return Err("DeepSeek V4 requires exactly four DP/EP rank inputs".into());
+        return Err(format!(
+            "DeepSeek V4 requires exactly {ep_size} DP/EP rank inputs"
+        ));
     }
     for (rank, group) in input.groups.iter().enumerate() {
         let append_sum = group
@@ -928,10 +946,13 @@ mod tests {
                 total_kv_len: 0,
             },
         ];
-        let normalized = normalize_input(&UnifiedArchInput {
-            groups,
-            tokens_per_source_rank: vec![4, 2, 0, 3],
-        })
+        let normalized = normalize_input(
+            &UnifiedArchInput {
+                groups,
+                tokens_per_source_rank: vec![4, 2, 0, 3],
+            },
+            4,
+        )
         .unwrap();
         assert_eq!(normalized.per_rank_tokens, [4, 2, 0, 3]);
         assert_eq!(normalized.gathered_tokens, 9);
@@ -945,5 +966,59 @@ mod tests {
         ppm[128] = 100;
         ppm[191] = 50;
         assert_eq!(critical_contiguous_shard(&ppm, 4), ppm[128..192]);
+        assert_eq!(critical_contiguous_shard(&ppm, 8), ppm[128..160]);
+    }
+
+    fn model_cfg() -> DeepseekV4ModelCfg {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/model/config/deepseek_v4_flash_0731.json"
+        );
+        let spec = ModelSpec {
+            model_config: path.to_string(),
+            num_layers: None,
+            sim_num_layers: None,
+            fp8: true,
+        };
+        DeepseekV4ModelCfg::from_json(Path::new(path), &spec).unwrap()
+    }
+
+    fn parallel(ep_size: u16, gpu_name: &str) -> DeepseekV4VllmParallel {
+        DeepseekV4VllmParallel {
+            ep_size,
+            nvl_num_gpu: ep_size,
+            gpu_name: gpu_name.to_string(),
+            serialize_streams: false,
+        }
+    }
+
+    #[test]
+    fn any_ep_group_that_shards_the_experts_on_one_nvlink_domain_builds() {
+        let model = model_cfg();
+        let routing = RoutingDistribution::uniform(NUM_EXPERTS);
+        for (ep_size, gpu_name) in [(2, "NVIDIA H200"), (4, "NVIDIA H100"), (8, "NVIDIA B200")] {
+            let configs = build_configs(&model, &parallel(ep_size, gpu_name), &routing).unwrap();
+            let layer = &configs.layers[0];
+            assert_eq!(layer.dispatch.num_gpus, u32::from(ep_size));
+            assert_eq!(layer.combine.num_gpus, u32::from(ep_size));
+            assert_eq!(layer.expert.local_ppm.len(), 256 / usize::from(ep_size));
+            let bridge = PerfApiBridge::new_uninit_for_test();
+            bridge.enable_enumerate();
+            let built = build("dsv4".to_string(), resolve_configs(&configs), &bridge).unwrap();
+            assert_eq!(built.gpus_per_replica(), ep_size);
+            assert_eq!(built.num_attn_dp_groups(), ep_size);
+        }
+    }
+
+    #[test]
+    fn ep_groups_without_collectives_uneven_shards_or_off_nvlink_fail() {
+        let model = model_cfg();
+        let routing = RoutingDistribution::uniform(NUM_EXPERTS);
+        for ep_size in [0, 1, 3, 6] {
+            assert!(build_configs(&model, &parallel(ep_size, "NVIDIA H200"), &routing).is_err());
+        }
+        let mut multi_node = parallel(8, "NVIDIA H200");
+        multi_node.nvl_num_gpu = 4;
+        assert!(build_configs(&model, &multi_node, &routing).is_err());
     }
 }
