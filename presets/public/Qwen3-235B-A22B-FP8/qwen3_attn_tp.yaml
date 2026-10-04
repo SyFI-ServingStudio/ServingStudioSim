@@ -1,0 +1,8 @@
+checkpoint: Qwen/Qwen3-235B-A22B-FP8
+gpu: NVIDIA H200
+arch:
+  type: qwen3_attn_tp
+  fp8: true
+  attn_tp_size: ${attn_tp_size}
+sweep:
+  attn_tp_size: [2, 4]

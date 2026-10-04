@@ -1,0 +1,12 @@
+checkpoint: deepseek-ai/DeepSeek-V4-Flash-0731
+gpu: NVIDIA H200
+arch:
+  type: deepseek_v4_vllm
+  fp8: true
+  routing: ${routing}
+  expert_popularity_file: ${expert_popularity_file}
+compound:
+  workload:
+    shape_grid_128:
+      routing: popularity
+      expert_popularity_file: hf://datasets/UW-SyFI/servingstudio-workload@9498d838a0cb1793980d8bf90998eb7f9722fb2d/deepseek_v4_flash/vllm/shape_grid_128/capture/20260822/popularity.json

@@ -1,0 +1,26 @@
+checkpoint: nvidia/GLM-5.2-NVFP4
+gpu: NVIDIA B200
+arch:
+  type: glm52_vllm_nvfp4_dsa_moe_speculative
+  fp8: false
+  ep_size: ${ep_size}
+  nvl_num_gpu: ${ep_size}
+  routing: ${routing}
+  expert_popularity_file: ${expert_popularity_file}
+  token_corpus_file: ${token_corpus_file}
+sweep:
+  ep_size: [4, 8]
+compound:
+  workload:
+    diverse_100:
+      routing: popularity
+      expert_popularity_file: hf://datasets/UW-SyFI/servingstudio-workload@9498d838a0cb1793980d8bf90998eb7f9722fb2d/glm52_nvfp4/vllm_mtp_k5/diverse_100/capture/20260830/popularity.json
+      token_corpus_file: null
+    diverse_100_tp8:
+      routing: popularity
+      expert_popularity_file: hf://datasets/UW-SyFI/servingstudio-workload@9498d838a0cb1793980d8bf90998eb7f9722fb2d/glm52_nvfp4/vllm_mtp_k5/diverse_100/capture/20260902/popularity.json
+      token_corpus_file: null
+    quadrant_c48:
+      routing: corpus
+      expert_popularity_file: null
+      token_corpus_file: hf://datasets/UW-SyFI/servingstudio-workload@9498d838a0cb1793980d8bf90998eb7f9722fb2d/glm52_nvfp4/vllm_mtp_k5/quadrant_c48/capture/20260923/manifest.json

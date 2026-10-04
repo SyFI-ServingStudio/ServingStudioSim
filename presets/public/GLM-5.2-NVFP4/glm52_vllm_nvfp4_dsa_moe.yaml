@@ -1,0 +1,19 @@
+checkpoint: nvidia/GLM-5.2-NVFP4
+gpu: NVIDIA B200
+arch:
+  type: glm52_vllm_nvfp4_dsa_moe
+  fp8: false
+  ep_size: ${ep_size}
+  nvl_num_gpu: ${ep_size}
+  routing: ${routing}
+  expert_popularity_file: ${expert_popularity_file}
+sweep:
+  ep_size: [4, 8]
+compound:
+  workload:
+    c32_long:
+      routing: popularity
+      expert_popularity_file: hf://datasets/UW-SyFI/servingstudio-workload@9498d838a0cb1793980d8bf90998eb7f9722fb2d/glm52_nvfp4/vllm/c32_long/capture/20260824/popularity.json
+    diverse_100:
+      routing: popularity
+      expert_popularity_file: hf://datasets/UW-SyFI/servingstudio-workload@9498d838a0cb1793980d8bf90998eb7f9722fb2d/glm52_nvfp4/vllm/diverse_100/capture/20260830/popularity.json

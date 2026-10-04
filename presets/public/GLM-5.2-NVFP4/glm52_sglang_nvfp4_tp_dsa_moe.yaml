@@ -1,0 +1,16 @@
+checkpoint: nvidia/GLM-5.2-NVFP4
+gpu: NVIDIA B200
+arch:
+  type: glm52_sglang_nvfp4_tp_dsa_moe
+  fp8: false
+  tp_size: 4
+  max_model_len: ${max_model_len}
+  routing: ${routing}
+  expert_popularity_file: ${expert_popularity_file}
+sweep:
+  max_model_len: [8192, 65536, 131072, 262144, 524288]
+compound:
+  workload:
+    diverse_100:
+      routing: popularity
+      expert_popularity_file: hf://datasets/UW-SyFI/servingstudio-workload@9498d838a0cb1793980d8bf90998eb7f9722fb2d/glm52_nvfp4/sglang/diverse_100/capture/20260829/popularity.json
