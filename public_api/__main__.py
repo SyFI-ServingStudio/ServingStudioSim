@@ -36,20 +36,34 @@ def main(argv: list[str] | None = None) -> int:
         help="Where predictions are kept for Read more. Inside the checkout: the "
         "Analyzer reads a prediction with the checkout that holds it.",
     )
+    serve.add_argument(
+        "--sims-dir",
+        type=Path,
+        default=REPO_ROOT / "logs" / "public_api" / "simulations",
+        help="Where simulations run and are kept for a day. Inside the checkout, like --runs-dir.",
+    )
     # No default, as for --port; it listens on 127.0.0.1 only.
     serve.add_argument(
         "--analyzer-port", type=int, required=True, help="Port of the Analyzer it starts."
+    )
+    serve.add_argument(
+        "--forwarded-allow-ips",
+        default=None,
+        help="Proxies whose X-Forwarded-For names the client the rate limits count "
+        "(uvicorn's option; default 127.0.0.1).",
     )
     args = parser.parse_args(argv)
 
     import uvicorn
 
     from launcher.exec import analyzer_binary_path
+    from launcher.schema.loader import schema_from_dict
     from profiling.gpu_policy import disable_gpus
-    from public_api import predict
+    from public_api import predict, simulate
     from public_api.app import create_app
     from public_api.deployments import DeploymentIndex
     from public_api.kernels import KernelLibrary, git_commit
+    from public_api.sim_preset import SimIndex
     from public_api.sources import Sources
 
     # Every simulator and launcher call it makes reads this profile.db and
@@ -70,19 +84,54 @@ def main(argv: list[str] | None = None) -> int:
         sources.cost_trees, sources.list_params(), sim_commit=git_commit(), jobs=args.jobs
     )
     index.check(lambda member: predict.missing_specs(member, args.build_type), jobs=args.jobs)
+    # Each sim member is built as a run builds it, once per capture it can replay.
+    registry = schema_from_dict(sources.list_params())
+    sims = SimIndex.build(index)
+    sims.check(
+        lambda member, capture: simulate.missing_rows(
+            index, member, capture, registry, args.build_type
+        ),
+        jobs=args.jobs,
+    )
     args.runs_dir.mkdir(parents=True, exist_ok=True)
+    args.sims_dir.mkdir(parents=True, exist_ok=True)
     analyzer = analyzer_binary_path(args.build_type)
     if not analyzer.exists():
         parser.error(f"{analyzer} is missing; run `uv run cargo build --release -p analyzer`")
     bind = f"127.0.0.1:{args.analyzer_port}"
     process = subprocess.Popen(
-        [str(analyzer), "serve", "--logs-root", str(args.runs_dir.resolve()), "--bind", bind]
+        [
+            str(analyzer),
+            "serve",
+            "--logs-root",
+            str(args.runs_dir.resolve()),
+            "--logs-root",
+            str(args.sims_dir.resolve()),
+            "--bind",
+            bind,
+        ]
+    )
+    queue = simulate.Simulations(
+        args.sims_dir,
+        args.build_type,
+        run_id=lambda simulation_id: simulate.analyzer_run_id(f"http://{bind}", simulation_id),
     )
     try:
         uvicorn.run(
-            create_app(KernelLibrary(sources, index), args.runs_dir.resolve(), f"http://{bind}"),
+            create_app(
+                KernelLibrary(sources, index),
+                args.runs_dir.resolve(),
+                f"http://{bind}",
+                simulate.SimulationService(sims, registry, queue),
+            ),
             host=args.bind,
             port=args.port,
+            proxy_headers=True,
+            **(
+                {"forwarded_allow_ips": args.forwarded_allow_ips}
+                if args.forwarded_allow_ips
+                else {}
+            ),
         )
     finally:
         process.terminate()

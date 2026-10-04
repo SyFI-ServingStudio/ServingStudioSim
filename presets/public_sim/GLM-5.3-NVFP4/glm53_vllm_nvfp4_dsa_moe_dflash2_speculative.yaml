@@ -1,0 +1,36 @@
+# vLLM GLM-5.3 NVFP4 on B200, EP4 (TP4), DFlash2 drafting 7 tokens.
+# Worker: presets/alignment/glm53_nvfp4_b200_dflash2 (vLLM's KV discipline). Each
+# server row is one of its cases: max_model_len, the chunk size and the KV budget
+# measured there (cases 01, 03, 05, 07, 04).
+deployment: unified
+pools:
+  main:
+    groups:
+      - replicas: ${replicas}
+        arch:
+          preset: glm53_vllm_nvfp4_dsa_moe_dflash2
+          max_model_len: ${max_model_len}
+        worker:
+          type: speculative
+          max_batch_tokens: ${max_batch_tokens}
+          batch_policy: mix
+          draft_tokens: 7
+          acceptance_seed: 73
+          kv_admission_policy: bounded-future
+          kv_page_size: 1
+          kv_max_future_tokens: 8
+          kv_initial_new_token_ratio: 0.0
+          kv_minimum_new_token_ratio: 0.0
+          kv_new_token_ratio_decay_steps: 1
+          kv_retract_decode_steps: 1
+          decode_retraction_policy: fcfs
+          attn_gpu_memory_gb: ${attn_gpu_memory_gb}
+sweep:
+  replicas: [1, 2]
+compound:
+  server:
+    ctx8k: {max_model_len: 8192, max_batch_tokens: 2048, attn_gpu_memory_gb: 7.514121216}
+    ctx8k_chunk4k: {max_model_len: 8192, max_batch_tokens: 4096, attn_gpu_memory_gb: 6.917170176}
+    ctx16k: {max_model_len: 16384, max_batch_tokens: 4096, attn_gpu_memory_gb: 6.644811264}
+    ctx16k_chunk8k: {max_model_len: 16384, max_batch_tokens: 8192, attn_gpu_memory_gb: 5.383752192}
+    ctx128k: {max_model_len: 131072, max_batch_tokens: 8192, attn_gpu_memory_gb: 26.47104768}

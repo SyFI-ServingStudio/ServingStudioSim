@@ -1,0 +1,32 @@
+# vLLM GLM-5.2 NVFP4 on B200, EP4 (TP4), MTP drafting 5 tokens (full index).
+# Worker: presets/alignment/glm52_nvfp4_b200_spec5. Each server row is one of its
+# cases: max_model_len, the chunk size and the KV budget measured there
+# (cases 09, 05, 14, 13, 16, 15, 11).
+deployment: unified
+pools:
+  main:
+    groups:
+      - replicas: ${replicas}
+        arch:
+          preset: glm52_vllm_nvfp4_dsa_moe_speculative
+          ep_size: 4
+          max_model_len: ${max_model_len}
+          mtp_mode: full_index
+        worker:
+          type: speculative
+          max_batch_tokens: ${max_batch_tokens}
+          batch_policy: mix
+          draft_tokens: 5
+          acceptance_seed: 73
+          attn_gpu_memory_gb: ${attn_gpu_memory_gb}
+sweep:
+  replicas: [1, 2]
+compound:
+  server:
+    ctx8k: {max_model_len: 8192, max_batch_tokens: 2052, attn_gpu_memory_gb: 30.172852992}
+    ctx16k: {max_model_len: 16384, max_batch_tokens: 4098, attn_gpu_memory_gb: 9.328562688}
+    ctx64k: {max_model_len: 65536, max_batch_tokens: 4098, attn_gpu_memory_gb: 27.953471232}
+    ctx128k: {max_model_len: 131072, max_batch_tokens: 4098, attn_gpu_memory_gb: 26.54308992}
+    ctx128k_chunk8k: {max_model_len: 131072, max_batch_tokens: 8196, attn_gpu_memory_gb: 26.424961536}
+    ctx256k: {max_model_len: 262144, max_batch_tokens: 8196, attn_gpu_memory_gb: 24.542066688}
+    ctx512k: {max_model_len: 524288, max_batch_tokens: 8196, attn_gpu_memory_gb: 32.402792448}

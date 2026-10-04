@@ -1,13 +1,14 @@
 # public_api
 
-Read-only data service for the external ServingStudio site. The Intro site's
+Data and simulation service for the external ServingStudio site. The Intro site's
 pages request `/api/public/v1/...` from their own origin, and the site proxies
 those paths here: Vite's `PUBLIC_API_PROXY_TARGET` in development, the web
 server in front of the site otherwise. The Analyzer serves the internal UI and
 is a separate service.
 
-The service never runs a GPU, a profiler or a simulation, and never writes
-`profile.db`: every query opens it read-only.
+The service never runs a GPU or a profiler, and never writes `profile.db`:
+every query opens it read-only. It runs simulations only of the sim presets'
+members (below), queued, on the served `profile.db`.
 
 ## Run
 
@@ -18,8 +19,12 @@ uv run python -m public_api serve --bind 127.0.0.1 --port <port> --analyzer-port
 
 `--port` and `--analyzer-port` (the Analyzer it starts, on 127.0.0.1) have no
 default: check that each port is free and not in another user's range first.
-Kept predictions live in `--runs-dir` (default `logs/public_api/predictions`). `--db` defaults to the profiler's database (`VIBESIM_PROFILE_DB` or
-`profiling/profile.db`). Interactive API docs are at `/api/public/v1/docs`.
+Kept predictions live in `--runs-dir` (default `logs/public_api/predictions`)
+and simulations in `--sims-dir` (default `logs/public_api/simulations`); the
+Analyzer reads both. `--db` defaults to the profiler's database
+(`VIBESIM_PROFILE_DB` or `profiling/profile.db`). Behind a proxy, pass its
+address as `--forwarded-allow-ips` so the rate limits count the client that
+`X-Forwarded-For` names. Interactive API docs are at `/api/public/v1/docs`.
 
 ### In Docker
 
@@ -44,7 +49,8 @@ container and image names.
 
 ## Routes
 
-Under `/api/public/v1`; all `GET` but `POST /predict`. None writes anything.
+Under `/api/public/v1`; all `GET` but `POST /predict`, `POST /simulate` and
+`DELETE /simulations/{id}`.
 
 | Route | Returns |
 | --- | --- |
@@ -58,6 +64,11 @@ Under `/api/public/v1`; all `GET` but `POST /predict`. None writes anything.
 | `/models/{checkpoint}/{arch}/tree` | One member's cost tree, structure only; the query gives every axis of the preset. Each leaf names its config by `id`, the key of `/kernels/{kind}/configs/{id}`; `configs` gives each config's identity and the profile.db rows this member asks of it and lacks (`missing`) |
 | `POST /predict` | `{preset, params, cases, analyze?}`: each case's time on one member, per section and per tree node, from one `launcher timing-predict` run on the served profile.db. A member that lacks rows answers 409 naming them. With `analyze: true` the prediction is also analyzed (no plots) and kept for six hours, and the answer names it by `prediction_id` |
 | `/analyzer/predictions/{prediction_id}/...` | The Analyzer's routes for one kept prediction (`/api/analyzer/v1/predictions/{id}/...`: descriptor, reports, payloads), forwarded read-only to the `analyze serve` the service runs on 127.0.0.1 over its runs directory |
+| `/simulations/presets` | Every sim preset: its deployment, pools (arch preset, arch, GPU, worker), axes, the captures its members replay, and per member its params, GPUs, pools and why it cannot run a capture (`unavailable`); plus the limits and the workload's JSON schema |
+| `POST /simulate` | `{preset, params, workload}`: queues one member's simulation and answers 202 `{simulation_id, status}` (below) |
+| `/simulations/{simulation_id}` | Its status (`queued` with `queue_position`, `running`, `done`, `failed` with `error`, `timed_out`) and request; once done, `summary` and the Analyzer's `run_id` |
+| `DELETE /simulations/{simulation_id}` | Stops it if it has not finished and removes it: `{simulation_id, status: "deleted"}` |
+| `/analyzer/runs/{run_id}/...` | The Analyzer's routes for one simulation's run (`/api/analyzer/v1/runs/{id}/...`: descriptor, `subjects/<subject>/report` and `payload`), forwarded read-only. No run catalog |
 
 A config's `id` hashes its kind, GPU and identity (`KernelConfig::identity`:
 every field but `gpu_name` and `backends`, each `Dim` at its value, and a routing
@@ -73,6 +84,75 @@ values are positions in an order, 0 first, and position 0 leads. `workload` is
 picked with a selector. The fused-MoE kinds declare `EP_RANKS_BY_LOAD`:
 `folded_rank_position` (the simulator's order of EP ranks by load) and
 `expert_demand` (the routing).
+
+## Simulations
+
+A sim preset (`presets/public_sim/<checkpoint>/<name>.yaml`, `public_api/sim_preset.py`)
+is a run config without its workload, in the launcher's sweep language:
+`deployment`, and `pools` of one group each, `{replicas, arch, worker}`. A
+group's `arch` names an arch preset of the same checkpoint (`preset:`) and
+gives that preset's axes but `workload`; its GPU and complete arch block are
+that public member's. The expanded list is the support list: a combination is
+supported when a sim preset has a member for it. At startup the service builds
+every member as a run builds it (`simulator dry-run`: the deployment's
+`build_flow`) once per capture it can replay, and records the profile.db rows
+each lacks; `tests/test_public_sim_presets.py` asserts that every member builds
+and is measured.
+
+The workload is a capture: a `workload` row of the pools' arch preset, whose
+routing file the arch reads and whose `trace.csv` the run replays. An MoE
+member offers only its capture rows (never a synthetic routing). A dense
+member routes nothing and replays any published capture's trace, named by its
+directory in the dataset repo.
+
+```json
+POST /api/public/v1/simulate
+{
+  "preset": "Meta-Llama-3-8B/llama3_dense_tp_barebone",
+  "params": {"tp_size": 1, "replicas": 1},
+  "workload": {
+    "source": "capture",          // the only source today
+    "capture": null,              // a name from the preset's captures; its first by default
+    "num_requests": null,         // the trace's first N rows; all by default
+    "arrival_mode": "trace_timed",// or "saturated"
+    "request_rate": 1.0,          // arrival_time / request_rate
+    "max_concurrency": null,
+    "duration_ms": null,          // required when run_to_end is false
+    "run_to_end": true,
+    "session_dependency": "independent",
+    "accept_rate": null           // speculative workers only: one probability, or one per draft position
+  }
+}
+```
+
+Before it queues, the request is checked: the member exists (400 with
+`choices` otherwise) and builds and is measured on that capture (409), every
+request's `input_len + output_len` (plus the draft tokens for a speculative
+worker) fits each pool's `max_model_len`, a speculative worker gets
+`accept_rate` and no other worker does, a capture has no sessions to chain,
+and there are at most 2000 requests (400). The run's directory holds the trace
+it replays (`workload.csv`, with the `accept_rate` column), the concrete run
+config (`simulation.run.json`) and the record (`simulation.json`). A queued
+run is the launcher's standard single run (`launcher.sweep.run_single`,
+analyzed, no plots) in a child process (`public_api/simulate_run.py`).
+
+Once `done`, `summary` is the run's `summary.json` and the Analyzer's
+`slo-general` report:
+
+```json
+{"cause": "...", "requests": {"total": 32, "finished": 32}, "sim_ms": ..., "num_gpus": 1,
+ "throughput": {"total_tok_s": ..., "prefill_tok_s": ..., "decode_tok_s": ...,
+                "total_tok_s_per_gpu": ..., "completed_req_s": ...},
+ "ttft_ms": {"mean": ..., "p50": ..., "p90": ..., "p99": ..., "max": ..., "n": ...},
+ "tpot_ms": {...}, "e2e_ms": {...}}
+```
+
+Limits (`public_api/simulate.py`, `public_api/app.py`): two simulations run
+at once and up to 32 wait (429 past that); a run is stopped after 10 minutes
+of wall clock and marked `timed_out`; a run and its directory are removed 24
+hours after it was submitted. `POST /predict` takes 30 and `POST /simulate` 6
+requests per minute per client address (429 with `Retry-After`), counted in
+the process. A restart keeps finished runs and marks unfinished ones failed.
 
 ## Sources
 
