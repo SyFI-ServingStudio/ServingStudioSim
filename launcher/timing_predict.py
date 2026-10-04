@@ -438,10 +438,11 @@ async def run_one(
             # Best-effort: `analyze trace` (the Perfetto tree) + `analyze run`. Cost
             # subjects apply; request/throughput subjects self-skip on a predict dir.
             await run_analysis(log_dir, build_type, render=render)
-            # Predict-only: the human-readable cost tree (reports/iter_breakdown.ans).
-            # Not in the shared run_analysis — a real run's thousands of iters would
-            # make that file enormous; a predict dir has only a few cases.
-            await run_iter_breakdown(log_dir, build_type)
+        # Predict-only, analyzed or not: the cost tree per case, with each node's
+        # time and share (reports/iter_breakdown.ans and its JSON twin). Not in the
+        # shared run_analysis — a real run's thousands of iters would make that file
+        # enormous; a predict dir has only a few cases.
+        await run_iter_breakdown(log_dir, build_type)
         if managed_job is not None:
             managed_job.report("ready", summary=descriptor)
         return True

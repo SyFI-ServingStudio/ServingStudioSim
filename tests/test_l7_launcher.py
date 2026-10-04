@@ -429,7 +429,9 @@ def test_iter_breakdown_uses_shared_process_supervisor(monkeypatch, tmp_path):
 
     asyncio.run(run_iter_breakdown(log_dir))
 
-    assert captured_commands == [[str(analyzer_path), "gen-iter-breakdown", str(log_dir)]]
+    assert captured_commands == [
+        [str(analyzer_path), "gen-iter-breakdown", str(log_dir), "--max-iters", str(2**31)]
+    ]
     assert "generated" in (log_dir / "stdout.log").read_text()
 
 

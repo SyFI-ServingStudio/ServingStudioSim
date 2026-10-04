@@ -641,7 +641,10 @@ async def run_iter_breakdown(log_dir: Path, build_type: str = "debug") -> None:
     if not analyzer.exists():
         print(f"[analyze] {analyzer} not built; skipping iter-breakdown for {log_dir}")
         return
-    rc, out = await _run_capture([str(analyzer), "gen-iter-breakdown", str(log_dir)])
+    # Every row: a predict dir holds one per case and section, and its readers
+    # take each case's tree from the JSON twin.
+    argv = [str(analyzer), "gen-iter-breakdown", str(log_dir), "--max-iters", str(2**31)]
+    rc, out = await _run_capture(argv)
     stdout_log = log_dir / "stdout.log"
     if out:
         with stdout_log.open("a") as fh:

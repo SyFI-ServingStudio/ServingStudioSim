@@ -63,35 +63,6 @@ def _cause(stderr: str, *directories: Path) -> str:
     return cause
 
 
-def _node_times(nodes: list[dict], slot_ms: list[float]) -> list[float]:
-    """Each node's time, aggregated as ``CostTree::aggregate`` does."""
-    out: list[float | None] = [None] * len(nodes)
-
-    def time(index: int) -> float:
-        if out[index] is None:
-            node = nodes[index]
-            kind = next(iter(node))
-            if kind == "Leaf":
-                value = slot_ms[node["Leaf"]]
-            else:
-                body = node[kind]
-                children = [
-                    time(c) for c in range(body["children"]["start"], body["children"]["end"])
-                ]
-                if kind == "Sum":
-                    value = sum(children)
-                elif kind == "Max":
-                    value = max(children, default=0.0) / body["overlap"]
-                else:
-                    value = body["n"] * sum(children)
-            out[index] = value
-        return out[index]
-
-    for index in range(len(nodes)):
-        time(index)
-    return out
-
-
 def _write_config(member: Member, cases: list, directory: Path, log_dir: Path) -> Path:
     """A ``timing-predict`` config for ``member`` and ``cases`` in ``directory``."""
     (directory / "cases.json").write_text(json.dumps(cases))
@@ -213,12 +184,19 @@ def _read(member: Member, cases: list, log_dir: Path) -> dict:
             "layer",
             "total_time_ms",
             "energy_j",
-            "slot_time_ms",
             "slot_backend",
             "slot_coverage",
         ],
     ).to_pylist()
     sections = {s["section"]: s for s in manifest["sections"]}
+    # The Analyzer's tree per row (`analyze gen-iter-breakdown`): each node's
+    # time for one call, scaled, and its share of the row's time.
+    breakdown = {
+        (tree["iter_id"], tree["section"], tree["layer"]): tree["nodes"]
+        for tree in json.loads((log_dir / "payloads" / "iter_breakdown.json").read_text())[
+            "iterations"
+        ]
+    }
     trees = {s["section"]: s for s in member.sections}
     out: list[dict] = [{"sections": []} for _ in cases]
     for row in rows:
@@ -228,7 +206,6 @@ def _read(member: Member, cases: list, log_dir: Path) -> dict:
         # binary changed under the service.
         if [s["name"] for s in section["slots"]] != [s["name"] for s in tree["slots"]]:
             raise RuntimeError(f"{member.preset}: the predicted tree differs from the index's")
-        slot_ms = row["slot_time_ms"]
         flags: dict[str, list[int]] = {}
         for index, bits in enumerate(row["slot_coverage"]):
             for name in coverage_flags(bits):
@@ -239,8 +216,7 @@ def _read(member: Member, cases: list, log_dir: Path) -> dict:
                 "layer": row["layer"],
                 "total_ms": row["total_time_ms"],
                 "energy_j": row["energy_j"],
-                "node_ms": _node_times(section["nodes"], slot_ms),
-                "slot_ms": slot_ms,
+                "nodes": breakdown[row["iter_id"], row["section"], row["layer"]],
                 # null: the leaf did not run (`LeafMetrics::NO_BACKEND`), as an
                 # inter-node transfer on one node.
                 "slot_backend": [

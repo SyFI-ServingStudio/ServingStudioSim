@@ -188,25 +188,27 @@ The answer has `sim_commit` and `cases`, one entry per case in request order.
 Each entry's `sections` gives, per section:
 
 - `total_ms` and `energy_j`, the section's time and modeled energy;
-- `node_ms[i]`, the time of the tree's node `i` (node 0 equals `total_ms`);
-- `slot_ms[j]` and `slot_backend[j]`, each kernel leaf's time and the backend
-  chosen for it; a null backend means the leaf did not run for this case (for
-  example the prefill kernel in a decode-only batch);
+- `nodes`, the case's cost tree as the Analyzer reads it (`analyze
+  gen-iter-breakdown`), root first in display order. Each node has its tree
+  `node` id, `kind`, `depth`, `label`, `ms` (one call), `total_ms` (`ms` times
+  every enclosing `scale` node's n), `pct` (`total_ms` over the root's), and
+  `critical` (on the chain of slowest children from the root, the rows
+  `iter_breakdown.ans` marks with ▸). A leaf names its `slot`; runs of
+  identical siblings show one node with `copies` (and, under a `max`,
+  `avg_total_ms`);
+- `slot_backend[j]`, the backend chosen for kernel leaf `j`; null means the
+  leaf did not run for this case (for example the prefill kernel in a
+  decode-only batch);
 - `coverage`, the slot indices whose time did not come from inside the
   measured grid, by flag: `extrapolated` (outside the grid), `jit` or
   `no_coverage`.
 
-Join `node_ms` with the tree's labels to see where the time goes:
+Where the time goes:
 
 ```bash
-jq -r --slurpfile t tree.json '.cases[1].sections[0] as $s
-  | $t[0].sections[] | select(.section == $s.section) | .nodes | to_entries[]
-  | select(.value.label) | [($s.node_ms[.key] * 1000 | round / 1000), .value.label] | @tsv' prediction.json
+jq -r '.cases[1].sections[0].nodes[]
+  | [.ms, .total_ms, (.pct * 10 | round / 10), ("  " * .depth) + .label] | @tsv' prediction.json
 ```
-
-A node below a `scale` node reports one repeat. In this tree,
-`unified.attn_block` is one layer's attention block, and the `layer` node is
-all 32 layers.
 
 Errors carry `detail`:
 
