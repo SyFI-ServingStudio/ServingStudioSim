@@ -134,9 +134,10 @@ class Member:
     predict: dict | None = None
     sections: list[dict] = field(default_factory=list)
     error: str | None = None
-    # profile.db rows its kernels lack, {kind: count} (:meth:`DeploymentIndex.check`);
-    # None until checked.
+    # profile.db rows its kernels lack, {kind: count} and {config id: count}
+    # (:meth:`DeploymentIndex.check`); None until checked.
     missing: dict[str, int] | None = None
+    missing_configs: dict[str, int] | None = None
 
     def summary(self) -> dict:
         slots = [slot for section in self.sections for slot in section["slots"]]
@@ -285,11 +286,32 @@ class DeploymentIndex:
         return index
 
     def check(self, missing_specs: Callable[[Member], dict[str, int]], *, jobs: int = 8) -> None:
-        """Ask profile.db, per built member, which rows its kernels lack."""
-        members = [m for p in self.presets.values() for m in p.members if not m.error]
+        """Ask profile.db, per built member, which rows its kernels lack.
+        ``missing_specs`` counts them by the kernel's dotted role, the role its
+        config lists in ``uses``."""
+        built = [
+            (preset.id, position, member)
+            for preset in self.presets.values()
+            for position, member in enumerate(preset.members)
+            if not member.error
+        ]
+        role_configs: dict[tuple[str, int], dict[str, Config]] = {}
+        for config in self.configs.values():
+            for key, roles in config.uses.items():
+                role_configs.setdefault(key, {}).update(dict.fromkeys(roles, config))
         with ThreadPoolExecutor(max_workers=jobs) as pool:
-            for member, missing in zip(members, pool.map(missing_specs, members), strict=True):
-                member.missing = missing
+            reports = pool.map(missing_specs, [member for _, _, member in built])
+            for (preset_id, position, member), by_role in zip(built, reports, strict=True):
+                configs = role_configs.get((preset_id, position), {})
+                member.missing, member.missing_configs = {}, {}
+                for role, count in by_role.items():
+                    config = configs.get(role)
+                    if config is None:
+                        raise RuntimeError(f"{preset_id} {member.params}: no config uses {role}")
+                    member.missing[config.kind] = member.missing.get(config.kind, 0) + count
+                    member.missing_configs[config.id] = (
+                        member.missing_configs.get(config.id, 0) + count
+                    )
 
     def _add(self, preset_id: str, position: int, member: Member, built: dict) -> None:
         member.contract = built["contract"] or None
@@ -389,6 +411,12 @@ class DeploymentIndex:
                     "kind": config.kind,
                     "identity": scalars,
                     "structured": structured,
+                    # profile.db rows this member asks of it and lacks; None until checked.
+                    "missing": (
+                        None
+                        if member.missing_configs is None
+                        else member.missing_configs.get(config.id, 0)
+                    ),
                 }
         return {
             "sim_commit": self.sim_commit,

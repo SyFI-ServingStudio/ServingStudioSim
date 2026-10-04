@@ -108,7 +108,7 @@ GEMM_CELLS = [{"m": m, **GEMM_IDENTITY} for m in (1, 8, 16)]
 GEMM_CONFIG = config_id("single_gemm", "NVIDIA H200", GEMM_IDENTITY)
 
 
-def _member(tp_size: int, **state) -> Member:
+def _member(tp_size: int) -> Member:
     return Member(
         preset=PRESET,
         params={"tp_size": tp_size},
@@ -130,15 +130,14 @@ def _member(tp_size: int, **state) -> Member:
                 ],
             }
         ],
-        **state,
     )
 
 
 def _index() -> DeploymentIndex:
     """One preset of two members over one gemm config, three cells of which
-    the fixture database measured two on the H200."""
+    the fixture database measured two on the H200; the tp 2 member lacks one."""
     index = DeploymentIndex(None, {"prefill": ["input_len"]}, {CHECKPOINT: {"name": "Llama 3 8B"}})
-    members = [_member(1, missing={}), _member(2, missing={"single_gemm": 1})]
+    members = [_member(1), _member(2)]
     index.presets[PRESET] = Preset(
         id=PRESET,
         checkpoint=CHECKPOINT,
@@ -161,6 +160,7 @@ def _index() -> DeploymentIndex:
         },
         uses={(PRESET, 0): ["layer.qkv"], (PRESET, 1): ["layer.qkv"]},
     )
+    index.check(lambda member: {"layer.qkv": 1} if member.params["tp_size"] == 2 else {})
     return index
 
 
@@ -175,6 +175,8 @@ def test_catalog_lists_every_kind_with_coverage_and_the_models(client: TestClien
     gemm = kernels["single_gemm"]
     assert gemm["documented"] and gemm["category"] == "GEMM"
     assert gemm["rows"] == 4
+    assert gemm["used_by"] == [PRESET]
+    assert kernels["rms_norm"]["used_by"] == []
     assert gemm["precisions"] == ["bf16", "fp16"]
     assert {"gpu": "NVIDIA B200", "backend": "torch_linear", "precision": "fp16", "rows": 1} in (
         gemm["coverage"]
@@ -420,6 +422,9 @@ def test_models_list_presets_and_a_tree_is_named_by_its_axes(client: TestClient)
 
     tree = client.get(f"{PREFIX}/models/{PRESET}/tree", params={"tp_size": 1}).json()
     assert tree["configs"][GEMM_CONFIG]["identity"] == GEMM_IDENTITY
+    assert tree["configs"][GEMM_CONFIG]["missing"] == 0
+    lacking = client.get(f"{PREFIX}/models/{PRESET}/tree", params={"tp_size": 2}).json()
+    assert lacking["configs"][GEMM_CONFIG]["missing"] == 1
     bad = client.get(f"{PREFIX}/models/{PRESET}/tree", params={"tp_size": 4})
     assert bad.status_code == 400
     assert bad.json()["detail"]["choices"] == [{"tp_size": 1}, {"tp_size": 2}]

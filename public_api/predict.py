@@ -119,12 +119,13 @@ def _probe_case(shape: dict) -> dict:
 
 
 # One kernel's line of the dry-run report (`timing_predict::print_dry_run`).
-_DRY_RUN_LINE = re.compile(r"^\s+\S+\s+\((\w+)\s*\)\s+(\d+) / (\d+)\s+missing$")
+_DRY_RUN_LINE = re.compile(r"^\s+(\S+)\s+\((\w+)\s*\)\s+(\d+) / (\d+)\s+missing$")
 
 
 def missing_specs(member: Member, build_type: str = "release") -> dict[str, int]:
     """The profile.db rows ``member``'s kernels need and profile.db lacks, as
-    ``{kind: count}``; empty when every one is measured."""
+    ``{role: count}`` by the kernel's dotted role; empty when every one is
+    measured."""
     if member.error or member.predict is None:
         raise NotPredictable(f"{member.preset} {member.params} does not build: {member.error}")
     with tempfile.TemporaryDirectory(prefix="public-dry-run-") as directory:
@@ -136,8 +137,8 @@ def missing_specs(member: Member, build_type: str = "release") -> dict[str, int]
     missing: dict[str, int] = {}
     for line in stdout.splitlines():
         match = _DRY_RUN_LINE.match(line)
-        if match and int(match[2]):
-            missing[match[1]] = missing.get(match[1], 0) + int(match[2])
+        if match and int(match[3]):
+            missing[match[1]] = missing.get(match[1], 0) + int(match[3])
     if not stdout.rstrip().splitlines()[-1].startswith("total: "):
         raise RuntimeError(f"{member.preset}: unexpected dry-run report:\n{stdout[-2000:]}")
     return missing

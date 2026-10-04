@@ -199,6 +199,14 @@ class KernelLibrary:
                         {k: e[k] for k in ("gpu", "backend", "precision", "rows")} for e in coverage
                     ],
                     "rows": sum(e["rows"] for e in coverage),
+                    # The presets with a member that builds a config of this kind.
+                    "used_by": sorted(
+                        {
+                            preset
+                            for config in self.index.kind_configs(kind)
+                            for preset, _ in config.uses
+                        }
+                    ),
                 }
             )
 
