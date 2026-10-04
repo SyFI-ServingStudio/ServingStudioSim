@@ -9,7 +9,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{ensure, Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 
 use super::routing::fold_layerwise_expert_counts;
 
@@ -19,6 +19,10 @@ use super::routing::fold_layerwise_expert_counts;
 #[derive(Clone, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenCorpusConfig {
     pub schema_version: u32,
+    /// Absolute path to the payload. In an identity, a hub capture names only
+    /// its path inside the dataset repo: the checksum pins the bytes, and the
+    /// cache directory and revision say where one machine keeps them.
+    #[serde(serialize_with = "serialize_data_file")]
     pub data_file: String,
     pub num_tokens: usize,
     pub num_layers: usize,
@@ -57,6 +61,24 @@ fn one() -> u32 {
     1
 }
 
+fn serialize_data_file<S: Serializer>(path: &str, s: S) -> Result<S::Ok, S::Error> {
+    match hub_repo_path(path) {
+        Some(inside) if crate::timing::dims::serializing_values_only() => s.serialize_str(&inside),
+        _ => s.serialize_str(path),
+    }
+}
+
+/// `<cache>/datasets--<owner>--<repo>/snapshots/<revision>/<path>` -> `<path>`,
+/// the hub's cache layout for a file of a dataset repo at one revision.
+fn hub_repo_path(path: &str) -> Option<String> {
+    let parts: Vec<&str> = path.split('/').collect();
+    let repo = parts
+        .windows(2)
+        .position(|pair| pair[0].starts_with("datasets--") && pair[1] == "snapshots")?;
+    let inside = parts.get(repo + 3..).filter(|inside| !inside.is_empty())?;
+    Some(inside.join("/"))
+}
+
 /// A validated corpus with its payload resident.
 pub struct TokenCorpus {
     config: TokenCorpusConfig,
@@ -86,7 +108,8 @@ fn checksum(bytes: &[u8]) -> u64 {
 impl TokenCorpusConfig {
     /// Read a manifest and bind it to one deployment's sampling parameters.
     /// `data_file` is rewritten to an absolute path so the config stays valid
-    /// however the process later moves.
+    /// however the process later moves. It is not resolved through links, so a
+    /// hub capture keeps the path that names it in its repo.
     ///
     /// `layers` is required rather than defaulted to the whole artifact: which
     /// layers a MoE callable covers is the caller's fact, and a silent whole-
@@ -115,9 +138,8 @@ impl TokenCorpusConfig {
                 .with_context(|| format!("reading token corpus manifest {path:?}"))?,
         )
         .context("parsing token corpus manifest")?;
-        let data = base
-            .join(&config.data_file)
-            .canonicalize()
+        let data = base.join(&config.data_file);
+        std::fs::metadata(&data)
             .with_context(|| format!("locating token corpus data {:?}", config.data_file))?;
         config.data_file = data.to_string_lossy().into_owned();
         config.group_size = group_size;
@@ -442,6 +464,42 @@ pub(crate) mod tests {
         .expect("a snapshot manifest resolves its payload");
         assert_eq!(resolved.num_tokens, config.num_tokens);
         resolved.load().expect("the payload behind the link loads");
+    }
+
+    #[test]
+    fn a_hub_capture_is_identified_by_its_path_in_the_repo() {
+        let dir = temp_dir("hub-identity");
+        let blobs = dir.join("blobs");
+        let capture = dir
+            .join("datasets--owner--workload")
+            .join("snapshots")
+            .join("0123456789abcdef")
+            .join("model")
+            .join("capture");
+        std::fs::create_dir_all(&blobs).expect("blob store");
+        std::fs::create_dir_all(&capture).expect("snapshot");
+        synthetic(&blobs, 64, 8, 4, 128);
+        for name in ["routes.u16", "manifest.json"] {
+            let link = capture.join(name);
+            let _ = std::fs::remove_file(&link);
+            std::os::unix::fs::symlink(blobs.join(name), &link).expect("hub symlink");
+        }
+        let config = TokenCorpusConfig::from_manifest(
+            capture.join("manifest.json").to_str().unwrap(),
+            8,
+            0,
+            0..4,
+        )
+        .unwrap();
+
+        let identity =
+            crate::timing::dims::values_only(|| serde_json::to_value(&config).unwrap());
+        assert_eq!(identity["data_file"], "model/capture/routes.u16");
+        // The full form keeps the local path, so a round-tripped config loads.
+        let full: TokenCorpusConfig =
+            serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
+        assert!(full.data_file.ends_with("/snapshots/0123456789abcdef/model/capture/routes.u16"));
+        full.load().expect("the round-tripped config loads");
     }
 
     #[test]
