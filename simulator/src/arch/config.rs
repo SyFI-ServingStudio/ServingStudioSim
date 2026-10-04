@@ -555,7 +555,7 @@ pub enum IterArchSel {
     /// SGLang's B200 NVFP4 launch graph under pure tensor parallelism. Every
     /// rank owns all experts (EP1) and shards the routed intermediate axis by
     /// TP, so there is no expert-parallel or NVLink-domain selector.
-    #[supported(gpu = ["NVIDIA B200"], model_config = ["glm52_nvfp4"], tp_size = [4, 8], max_model_len = [8192, 65536, 131072, 262144, 524288])]
+    #[supported(gpu = ["NVIDIA B200"], model_config = ["glm52_nvfp4"], tp_size = [4, 8], max_model_len = [8192, 65536, 131072, 262144, 524288, 1048576])]
     Glm52SglangNvfp4TpDsaMoe {
         #[serde(flatten)]
         model: ModelSpec,

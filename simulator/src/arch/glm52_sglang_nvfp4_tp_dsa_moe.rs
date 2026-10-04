@@ -69,7 +69,7 @@ const PROFILE_INDEX_HEADS: u32 = 32;
 const INDEX_HEAD_DIM: u32 = 128;
 const INDEX_TOP_K: u32 = 2_048;
 const CHECKPOINT_MAX_CONTEXT: u32 = 1_048_576;
-const PROFILED_H32_CONTEXTS: [u32; 5] = [8_192, 65_536, 131_072, 262_144, 524_288];
+const PROFILED_H32_CONTEXTS: [u32; 6] = [8_192, 65_536, 131_072, 262_144, 524_288, 1_048_576];
 const NUM_EXPERTS: u32 = 256;
 const ROUTER_TOP_K: u32 = 8;
 const MOE_INTERMEDIATE_DIM: u32 = 2_048;
@@ -1845,7 +1845,7 @@ mod tests {
                 build_configs(&model(), &profiled, &routing, false, Glm52MtpMode::Off,).is_ok()
             );
         }
-        for max_model_len in [1, 32_768, 524_289, 1_048_576] {
+        for max_model_len in [1, 32_768, 524_289, 1_048_577] {
             let mut unsupported = parallel(4);
             unsupported.max_model_len = max_model_len;
             assert!(
