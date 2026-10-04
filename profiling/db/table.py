@@ -13,10 +13,10 @@ from enum import Enum
 from functools import cache, lru_cache
 from importlib import metadata as importlib_metadata
 from pathlib import Path
-from typing import Any, get_origin, get_type_hints
+from typing import Any, get_origin
 
 from profiling.db import storage
-from profiling.db.args import KernelArgs
+from profiling.db.args import KernelArgs, field_types
 from profiling.db.kind import KernelKind
 from profiling.db.migrate import SCHEMA_HASH, migrate_connection, require_current
 from profiling.db.registry import KernelProfilerSpec, MetricFamily
@@ -213,7 +213,8 @@ class Table:
     def args_hash(self, key: tuple[Any, ...]) -> bytes:
         """The ``args_hash`` column of a row whose args are ``key`` (:meth:`db_key`)."""
         return storage.args_hash(
-            dict(zip(self.args_columns, key, strict=True)), self._declared_types()
+            dict(zip(self.args_columns, key, strict=True)),
+            _declared_types(self.profiler_spec.args_schema),
         )
 
     def args_match_sql(self, alias: str = "") -> str:
@@ -224,13 +225,6 @@ class Table:
         return " AND ".join(
             [f"{prefix}args_hash = ?", *(f"{prefix}{column} = ?" for column in self.args_columns)]
         )
-
-    def _declared_types(self) -> dict[str, str]:
-        type_hints = get_type_hints(self.profiler_spec.args_schema)
-        return {
-            field.name: _sqlite_type(type_hints[field.name])
-            for field in fields(self.profiler_spec.args_schema)
-        }
 
     def exists(
         self,
@@ -308,7 +302,7 @@ class Table:
                 self.name,
                 [
                     f"{column} {declared} NOT NULL"
-                    for column, declared in self._declared_types().items()
+                    for column, declared in _declared_types(self.profiler_spec.args_schema).items()
                 ],
                 [
                     f"{column} {column_def}"
@@ -488,6 +482,12 @@ def _to_db_value(value: Any) -> Any:
     if isinstance(value, list):
         return json.dumps(value, separators=(",", ":"))
     return value
+
+
+@cache
+def _declared_types(args_schema: type[KernelArgs]) -> dict[str, str]:
+    """Each args column's declared SQLite type, in column order."""
+    return {name: _sqlite_type(annotation) for name, annotation in field_types(args_schema).items()}
 
 
 def _sqlite_type(annotation: Any) -> str:
