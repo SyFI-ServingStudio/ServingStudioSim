@@ -12,6 +12,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 import pytest
+import yaml
 from fastapi.testclient import TestClient
 
 from profiling.db import storage
@@ -24,7 +25,7 @@ from profiling.kernels.single_gemm import SingleGemmArgs
 from profiling.runners.metrics import ComputeMetrics
 from public_api.app import PREFIX, create_app
 from public_api.kernel import library
-from public_api.kernel.library import PROVENANCE, KernelLibrary
+from public_api.kernel.library import PROVENANCE, REPO_ROOT, KernelLibrary
 from public_api.kernel.sources import KernelSources
 
 GEMM_ARGS = {"m": "INTEGER", "n": "INTEGER", "k": "INTEGER", "dtype": "TEXT"}
@@ -90,7 +91,9 @@ def db(tmp_path: Path) -> Path:
 @pytest.fixture(autouse=True)
 def catalog(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     path = tmp_path / "catalog.yaml"
-    path.write_text("llama3_8b: {name: Llama 3 8B, family: Llama}\n")
+    path.write_text(
+        "meta-llama/Meta-Llama-3-8B: {name: Llama 3 8B, family: Llama, config: llama3_8b}\n"
+    )
     monkeypatch.setattr(library, "MODEL_CATALOG", path)
     monkeypatch.setattr(
         library, "kernel_doc", lambda kind: GEMM_DOC if kind == "single_gemm" else None
@@ -122,7 +125,12 @@ def test_catalog_lists_every_kind_with_coverage_and_the_models(client: TestClien
     assert set(peaks["tflops"]["by_dtype"]) == {"bf16", "fp16"}
     assert catalog["snapshot"]["last_measured_at"] == PROV[1]
     assert catalog["models"] == [
-        {"model_config": "llama3_8b", "name": "Llama 3 8B", "family": "Llama"}
+        {
+            "checkpoint": "meta-llama/Meta-Llama-3-8B",
+            "name": "Llama 3 8B",
+            "family": "Llama",
+            "config": "llama3_8b",
+        }
     ]
 
 
@@ -131,7 +139,9 @@ def test_a_catalog_edit_shows_without_a_restart(client: TestClient) -> None:
         return client.get(f"{PREFIX}/kernels").json()["models"][0]["name"]
 
     assert name() == "Llama 3 8B"
-    library.MODEL_CATALOG.write_text("llama3_8b: {name: Llama 3 8B Base, family: Llama}\n")
+    library.MODEL_CATALOG.write_text(
+        "meta-llama/Meta-Llama-3-8B: {name: Llama 3 8B Base, family: Llama, config: llama3_8b}\n"
+    )
     assert name() == "Llama 3 8B Base"
 
 
@@ -288,3 +298,11 @@ def test_a_kind_doc_declares_its_view(db: Path, monkeypatch: pytest.MonkeyPatch)
         "expert_demand",
     )
     assert client.get(f"{PREFIX}/kernels/moe_finalize_routing").json()["view"] is None
+
+
+def test_every_checkpoint_in_the_catalog_names_a_config_file() -> None:
+    catalog = yaml.safe_load((REPO_ROOT / "model" / "catalog.yaml").read_text())
+    for checkpoint, entry in catalog.items():
+        assert "/" in checkpoint, f"{checkpoint}: key a checkpoint by its Hugging Face repo"
+        assert {"name", "family", "config"} <= set(entry), checkpoint
+        assert (REPO_ROOT / "model" / "config" / f"{entry['config']}.json").is_file(), checkpoint

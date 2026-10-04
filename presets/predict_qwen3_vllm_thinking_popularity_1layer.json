@@ -6,7 +6,7 @@
       "expert_popularity_file": "presets/alignment/qwen3_235b_thinking_fp8_h200_repetitive_16k/expert_popularity.json",
       "fp8": true,
       "hp_size": 1,
-      "model_config": "model/config/qwen3_235b_thinking_2507_fp8.json",
+      "model_config": "model/config/qwen3_235b_fp8.json",
       "nvl_num_gpu": 4,
       "routing": "popularity",
       "sim_num_layers": 1,

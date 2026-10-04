@@ -48,7 +48,7 @@ All `GET`, under `/api/public/v1`.
 | Route | Returns |
 | --- | --- |
 | `/health` | `status` and the Sim commit served |
-| `/kernels` | Catalog: every registered kind with its docs summary, backends, precisions and row coverage per GPU/backend/precision; plus categories, GPUs with spec-sheet peaks, and `models`, the model catalog in its order |
+| `/kernels` | Catalog: every registered kind with its docs summary, backends, precisions and row coverage per GPU/backend/precision; plus categories, GPUs with spec-sheet peaks, and `models`: each checkpoint of `model/catalog.yaml` in its order, with its `name`, `family` and `config` (the `model/config/` stem of its structure) |
 | `/kernels/{kind}` | One kind: docs, measuring method, arguments with type and unit, backends, torch reference, and the chart over several configs the kind declares (`view`, below; null for most kinds) |
 | `/kernels/{kind}/rows` | Measured rows, column-oriented with a shared provenance table. Any query parameter filters a column by equality (`gpu`, `backend` or an argument); `format=csv` returns CSV |
 
@@ -68,7 +68,8 @@ picked with a selector. The fused-MoE kinds declare `EP_RANKS_BY_LOAD`:
   (`profiling/db/doc.py`), and the profiling registry;
 - compute dtype columns: `simulator kernel-list`, cached until the binary
   changes (`public_api/kernel/sources.py`);
-- model names: `model/catalog.yaml`, reread when it changes (no restart);
+- checkpoint names and the config each one uses: `model/catalog.yaml`, reread
+  when it changes (no restart);
 - GPU peaks: `gpu/spec.json`;
 - measurements: `profile.db`, aggregates cached until the file changes.
 

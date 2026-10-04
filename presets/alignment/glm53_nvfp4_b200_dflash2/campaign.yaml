@@ -57,7 +57,7 @@ variants:
       - '{"sparse_mla_force_mqa": true}'
     arch:
       type: glm53_vllm_nvfp4_dsa_moe_dflash2
-      model_config: model/config/glm53_nvfp4.json
+      model_config: model/config/glm52_nvfp4.json
       fp8: false
       ep_size: 4
       nvl_num_gpu: 4

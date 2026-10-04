@@ -167,7 +167,7 @@ class KernelLibrary:
 
     def catalog(self) -> dict:
         """Every registered kind with its coverage, the GPUs with their peaks, and
-        the models ``model/catalog.yaml`` names, in its order."""
+        the checkpoints ``model/catalog.yaml`` names, in its order."""
 
         kernels = []
         gpu_rows: dict[str, int] = {}
@@ -215,7 +215,7 @@ class KernelLibrary:
                 {"name": gpu, "rows": rows, "peaks": self._peaks(gpu, precisions)}
                 for gpu, rows in sorted(gpu_rows.items(), key=lambda item: -item[1])
             ],
-            "models": [{"model_config": stem, **model} for stem, model in self.models.items()],
+            "models": [{"checkpoint": name, **model} for name, model in self.models.items()],
             "kernels": kernels,
         }
 
