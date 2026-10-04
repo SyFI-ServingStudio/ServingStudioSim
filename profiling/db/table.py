@@ -7,7 +7,7 @@ import sqlite3
 import subprocess
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, fields
+from dataclasses import dataclass, fields
 from datetime import UTC, datetime
 from enum import Enum
 from functools import cache, lru_cache
@@ -35,6 +35,8 @@ STANDARD_COLUMNS = [
 # How long a writer waits for the write lock before giving up. See
 # `Table._write_transaction`.
 _WRITE_LOCK_TIMEOUT_S = 120.0
+# Bound parameters per lookup statement; SQLite allows 32766. See `Table._match_rows`.
+_SQL_VARIABLES = 30000
 
 COMPUTE_METRIC_COLUMNS = ["time_ms", "tflops", "memory_bandwidth_gbps", "energy_j"]
 # message_size for comm kernels is an args/cache-key column, NOT a measured
@@ -178,10 +180,15 @@ class Table:
         with conn:
             if not self._table_exists(conn):
                 return [self._missing_entry(args, backend, gpu_name) for args in args_list]
-            return [
-                self._query_one(conn, args, backend, gpu_name, include_outliers)
-                for args in args_list
-            ]
+            rows = self._match_rows(
+                conn, args_list, backend, gpu_name, include_outliers, select="t.*"
+            )
+        return [
+            self._missing_entry(args, backend, gpu_name)
+            if row is None
+            else _metrics_from_row(row, self.profiler_spec.metric_family)
+            for args, row in zip(args_list, rows, strict=True)
+        ]
 
     def rows_for(
         self,
@@ -207,8 +214,7 @@ class Table:
 
     def db_key(self, args: KernelArgs) -> tuple[Any, ...]:
         """``args`` as this table stores them, in ``args_columns`` order."""
-        values = _args_to_db(args)
-        return tuple(values[column] for column in self.args_columns)
+        return tuple(_to_db_value(getattr(args, column)) for column in self.args_columns)
 
     def args_hash(self, key: tuple[Any, ...]) -> bytes:
         """The ``args_hash`` column of a row whose args are ``key`` (:meth:`db_key`)."""
@@ -240,7 +246,8 @@ class Table:
         with conn:
             if not self._table_exists(conn):
                 return [False for _ in args_list]
-            return [self._exists_one(conn, args, backend, gpu_name) for args in args_list]
+            rows = self._match_rows(conn, args_list, backend, gpu_name, include_outliers=False)
+        return [row is not None for row in rows]
 
     def metadata(self) -> TableMetadata:
         conn = self._connect_read_only()
@@ -354,35 +361,53 @@ class Table:
             if column in existing and column not in metric_columns:
                 conn.execute(f"ALTER TABLE {self.name} DROP COLUMN {column}")
 
-    def _query_one(
+    def _match_rows(
         self,
         conn: sqlite3.Connection,
-        args: KernelArgs,
+        args_list: list[KernelArgs],
         backend: str,
         gpu_name: str,
         include_outliers: bool,
-    ) -> Metrics | MissingEntry:
-        where, values = self._where(args, backend, gpu_name)
-        if not include_outliers:
-            where += " AND is_outlier = 0"
-        row = conn.execute(f"SELECT * FROM {self.name} WHERE {where} LIMIT 1", values).fetchone()
-        if row is None:
-            return MissingEntry(self.profiler_spec.kernel_kind, backend, gpu_name, args)
-        return _metrics_from_row(row, self.profiler_spec.metric_family)
+        *,
+        select: str = "",
+    ) -> list[sqlite3.Row | None]:
+        """The row of each args on ``(gpu_name, backend)``, or None.
 
-    def _exists_one(
-        self,
-        conn: sqlite3.Connection,
-        args: KernelArgs,
-        backend: str,
-        gpu_name: str,
-    ) -> bool:
-        where, values = self._where(args, backend, gpu_name)
-        row = conn.execute(
-            f"SELECT 1 FROM {self.name} WHERE {where} AND is_outlier = 0 LIMIT 1",
-            values,
-        ).fetchone()
-        return row is not None
+        One statement per chunk of args rather than one per args: the chunk is a
+        ``VALUES`` table ``c`` joined to this table's rows ``t``, and ``select``
+        names further ``t`` columns to return. Each args still finds its row
+        through the ``(gpu_name, backend, args_hash)`` unique index, and its args
+        columns confirm it in SQL, where each column's declared type converts the
+        ``VALUES`` value exactly as it converts a bound ``column = ?``.
+        """
+        columns = ["_i", "_hash", *self.args_columns]
+        match = " AND ".join(
+            [
+                "t.gpu_name = ?",
+                "t.backend = ?",
+                "t.args_hash = c._hash",
+                *(f"t.{column} = c.{column}" for column in self.args_columns),
+                *([] if include_outliers else ["t.is_outlier = 0"]),
+            ]
+        )
+        found: list[sqlite3.Row | None] = [None] * len(args_list)
+        chunk = max(1, (_SQL_VARIABLES - 2) // len(columns))
+        for start in range(0, len(args_list), chunk):
+            part = args_list[start : start + chunk]
+            values = ", ".join([f"({', '.join('?' * len(columns))})"] * len(part))
+            bound: list[Any] = []
+            for index, args in enumerate(part, start):
+                key = self.db_key(args)
+                bound += [index, self.args_hash(key), *key]
+            # CROSS JOIN keeps `c` the outer loop, so `t` is probed by its index.
+            sql = (
+                f"WITH c({', '.join(columns)}) AS (VALUES {values}) "
+                f"SELECT {', '.join(['c._i AS _i', *([select] if select else [])])} "
+                f"FROM c CROSS JOIN {self.name} t WHERE {match}"
+            )
+            for row in conn.execute(sql, [*bound, gpu_name, backend]):
+                found[row["_i"]] = row
+        return found
 
     def _where(self, args: KernelArgs, backend: str, gpu_name: str) -> tuple[str, list[Any]]:
         """Unqualified columns: the caller's FROM names this table once (the
@@ -434,10 +459,6 @@ class Table:
                     f"{self.name} is a {self.profiler_spec.metric_family.value} metrics table; "
                     f"got {type(row.metrics).__name__}"
                 )
-
-
-def _args_to_db(args: KernelArgs) -> dict[str, Any]:
-    return {key: _to_db_value(value) for key, value in asdict(args).items()}
 
 
 def _metrics_to_db(metrics: Metrics) -> dict[str, Any]:
