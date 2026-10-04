@@ -8,14 +8,17 @@ MoE arch that costs routed experts, including TP-only models.
    uniform` and remove corpus/popularity-file fields from the copied config. An
    inherited preset default is not an explicit user request.
 2. Otherwise inspect any configured `token_corpus_file` or
-   `expert_popularity_file`, then search the source preset/campaign directory,
-   `presets/alignment/`, and relevant existing experiments under `logs/`
-   (including ignored artifacts). Use `rg --files --hidden --no-ignore
-   <directories>` to locate corpus manifests and popularity JSON files and
-   inspect nearby configs for referenced files with other names. Check supplied
-   artifact locations too; do not launch a new profiling campaign just to search.
+   `expert_popularity_file`, then look for a published capture: the dataset
+   repo `UW-SyFI/servingstudio-workload` (its `README.md` lists every capture)
+   and the `workload` rows of `presets/public/<checkpoint>/`. Then search
+   relevant existing experiments under `logs/` (including ignored artifacts)
+   with `rg --files --hidden --no-ignore <directories>` for corpus manifests and
+   popularity JSON files. Check supplied artifact locations too; do not launch a
+   new profiling campaign just to search.
 3. Match the checkpoint and workload where recorded, and verify expert count,
-   MoE layer count, top-k, and EP size against the selected arch. For a corpus
+   MoE layer count and top-k against the selected arch. The EP size need not
+   match: a capture counts logical experts, and the run partitions them by its
+   own `ep_size`. For a corpus
    also check that its `group_size` equals the deployment's verify width
    (`draft_tokens + 1`), and that it records one MTP slot past the body when
    the arch prices an MTP layer. Prefer the same workload/campaign when several files
@@ -42,34 +45,26 @@ block's tokens jointly select. At verify width 1 the two agree and either is
 fine. A corpus is also the only source that measures the MTP layer's own
 routing, because it keeps the layer axis a marginal has summed away.
 
-A corpus is hundreds of megabytes, so it is not in the repository.
-`token_corpus_file` accepts either a local path — what a fresh capture writes,
-under `<log_dir>/token_corpus/manifest.json` — or a hub reference that the
-launcher fetches during expansion:
+Captures are not in the repository. Both fields accept either a local path —
+what a fresh capture writes, e.g. `<log_dir>/token_corpus/manifest.json` — or a
+reference into the public dataset repo `UW-SyFI/servingstudio-workload`, which
+the launcher fetches during expansion:
 
 ```yaml
 routing: corpus
-token_corpus_file: hf://UW-SyFI/servingstudio-corpora@43eda3dceb647df4802da27fb4fef3afc8a68fda/glm52_nvfp4_mtp5/manifest.json
+token_corpus_file: hf://datasets/UW-SyFI/servingstudio-workload@9498d838a0cb1793980d8bf90998eb7f9722fb2d/glm52_nvfp4/vllm_mtp_k5/quadrant_c48/capture/20260923/manifest.json
 ```
 
-The revision must be a commit sha; a branch or tag is refused. Search for an
-existing corpus the same way as a popularity file, and record which one was
-used — two corpora of the same model are different recordings.
+Only dataset-repo references (`hf://datasets/...`) are accepted, and the
+revision must be a commit sha; a branch or tag is refused. Record which capture
+was used — two captures of the same model are different recordings.
 
-Published corpora live in the private hub repository
-`UW-SyFI/servingstudio-corpora`, which needs a Hugging Face login with access to
-the `UW-SyFI` organization. Its `README.md` records each capture's model,
-deployment, and workload. Today it holds:
-
-- `glm52_nvfp4_mtp5`: GLM-5.2 NVFP4, vLLM TP4 EP4 with MTP-5, the reference
-  above;
-- `glm53_nvfp4_dflash2`: GLM-5.3 NVFP4, vLLM TP4 EP4 with DFlash2-7, body layers
-  only, at commit `c09af698f8192222ee8852f8c727630789890310`.
-- `glm53_flash_fp8_tp4_ep4`: GLM-5.3-Flash FP8, vLLM TP4 EP4 without speculative
-  decoding, the 42 MoE layers, at commit `869a5d3966097154a654db4586c11cab92db046e`.
-
-Publish a new capture as a new directory, and reference it by the upload's
-commit.
+The repo is laid out `<model>/<engine>[_<proposer>_k<k>]/<workload>/capture/<date>/`,
+one directory per capture with its `provenance.json` (checkpoint, engine,
+workload, the deployment it ran on) and the `trace.csv` it replayed; its
+`README.md` tables every capture. Publish a new capture as a new directory
+(a second measurement of the same key is a new date beside the first), and
+reference it by the upload's commit.
 
 Both artifacts come from one capture: `profile_kind: token_corpus` in
 `operate-run-alignment`, which writes the corpus and, when the expert topology

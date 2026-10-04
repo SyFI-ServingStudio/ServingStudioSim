@@ -31,7 +31,7 @@ pools:
           max_model_len: 131072
           routing: popularity
           routing_seed: null
-          expert_popularity_file: presets/alignment/glm52_nvfp4_b200_sglang_tp4/expert_popularity.json
+          expert_popularity_file: hf://datasets/UW-SyFI/servingstudio-workload@9498d838a0cb1793980d8bf90998eb7f9722fb2d/glm52_nvfp4/sglang/diverse_100/capture/20260829/popularity.json
           mtp_mode: "off"
         worker:
           type: chunked_prefill

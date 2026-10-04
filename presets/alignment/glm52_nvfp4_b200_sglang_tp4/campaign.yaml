@@ -76,9 +76,9 @@ variants:
       # Pure tensor parallelism. SGLang's `--ep-size` defaults to 1, so this
       # config passes no expert-parallel flag at all; what it must state is the
       # resulting EP degree, because `alignment/runner.py` derives
-      # `expert_parallel_size = tp_size * dp_size` when it is left unset and
-      # `arch/build.rs:398 validate_expert_popularity` hard-checks that number
-      # against the arch's EP degree. Under EP1 every rank holds all 256 experts
+      # `expert_parallel_size = tp_size * dp_size` when it is left unset, and the
+      # popularity file records it as the EP the capture ran at. Under EP1 every
+      # rank holds all 256 experts
       # with moe_intermediate sharded 2048 -> 512, which is exactly what
       # `glm52_sglang_nvfp4_tp_dsa_moe` models.
       expert_parallel_size: 1
@@ -125,10 +125,7 @@ variants:
       #
       # `routing: popularity` loads the measured distribution from the file below.
       routing: popularity
-      # Pack-relative. `render.simulation_document` rewrites it to the
-      # repo-relative `presets/alignment/glm52_nvfp4_b200_sglang_tp4/expert_popularity.json`
-      # that the rendered simulation preset carries.
-      expert_popularity_file: expert_popularity.json
+      expert_popularity_file: hf://datasets/UW-SyFI/servingstudio-workload@9498d838a0cb1793980d8bf90998eb7f9722fb2d/glm52_nvfp4/sglang/diverse_100/capture/20260829/popularity.json
       mtp_mode: 'off'
     worker:
       type: chunked_prefill

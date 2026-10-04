@@ -62,7 +62,7 @@ variants:
       ep_size: 4
       nvl_num_gpu: 4
       routing: corpus
-      token_corpus_file: hf://UW-SyFI/servingstudio-corpora@c09af698f8192222ee8852f8c727630789890310/glm53_nvfp4_dflash2/manifest.json
+      token_corpus_file: hf://datasets/UW-SyFI/servingstudio-workload@9498d838a0cb1793980d8bf90998eb7f9722fb2d/glm53_nvfp4/vllm_dflash2_k7/diverse_100/capture/20260922/manifest.json
       draft_tokens: 7
       draft_sliding_window: 2048
     worker:

@@ -36,15 +36,15 @@ def hub(tmp_path, monkeypatch):
 
 def test_a_manifest_reference_also_fetches_the_payload_beside_it(hub):
     resolved = resolve_hf_references(
-        {"arch": {"token_corpus_file": f"hf://uw/corpora@{SHA}/glm53/manifest.json"}}
+        {"arch": {"token_corpus_file": f"hf://datasets/uw/workload@{SHA}/glm53/manifest.json"}}
     )
 
     assert resolved["arch"]["token_corpus_file"].endswith("glm53/manifest.json")
     # The simulator resolves `data_file` relative to the manifest, so fetching
     # the manifest alone would leave it pointing at nothing.
     assert hub == [
-        ("uw/corpora", SHA, "glm53/manifest.json"),
-        ("uw/corpora", SHA, "glm53/routes.u16"),
+        ("uw/workload", SHA, "glm53/manifest.json"),
+        ("uw/workload", SHA, "glm53/routes.u16"),
     ]
 
 
@@ -63,10 +63,12 @@ def test_everything_that_is_not_a_reference_is_left_alone(hub):
     [
         # A branch or tag can move, and a corpus that moved under a built config
         # reprices every profiled shape instead of failing.
-        "hf://uw/corpora@main/glm53/manifest.json",
-        "hf://uw/corpora@v1.0/glm53/manifest.json",
-        f"hf://corpora@{SHA}/glm53/manifest.json",
-        "hf://uw/corpora/glm53/manifest.json",
+        "hf://datasets/uw/workload@main/glm53/manifest.json",
+        "hf://datasets/uw/workload@v1.0/glm53/manifest.json",
+        f"hf://datasets/corpora@{SHA}/glm53/manifest.json",
+        "hf://datasets/uw/workload/glm53/manifest.json",
+        # Captures live in a dataset repo; a model-repo reference is refused.
+        f"hf://uw/corpora@{SHA}/glm53/manifest.json",
     ],
 )
 def test_a_reference_without_a_pinned_commit_is_refused(hub, reference):
@@ -87,7 +89,9 @@ def test_a_manifest_whose_payload_lands_elsewhere_is_refused(tmp_path, monkeypat
     monkeypatch.setattr(corpus_module, "_download", fake_download)
 
     with pytest.raises(CorpusError, match="not where its manifest"):
-        resolve_hf_references({"token_corpus_file": f"hf://uw/corpora@{SHA}/glm53/manifest.json"})
+        resolve_hf_references(
+            {"token_corpus_file": f"hf://datasets/uw/workload@{SHA}/glm53/manifest.json"}
+        )
 
 
 def test_a_payload_in_a_subdirectory_of_its_manifest_resolves(tmp_path, monkeypatch):
@@ -106,7 +110,7 @@ def test_a_payload_in_a_subdirectory_of_its_manifest_resolves(tmp_path, monkeypa
     monkeypatch.setattr(corpus_module, "_download", fake_download)
 
     resolved = resolve_hf_references(
-        {"token_corpus_file": f"hf://uw/corpora@{SHA}/glm53/manifest.json"}
+        {"token_corpus_file": f"hf://datasets/uw/workload@{SHA}/glm53/manifest.json"}
     )
     assert resolved == {"token_corpus_file": str(snapshot / "glm53" / "manifest.json")}
 
@@ -116,7 +120,9 @@ def _corpus_preset(tmp_path):
     raw = yaml.safe_load(Path("presets/glm52_nvfp4_b200_sglang_tp4_diverse.yaml").read_text())
     arch = raw["pools"]["main"]["groups"][0]["arch"]
     arch.pop("expert_popularity_file")
-    arch.update(routing="corpus", token_corpus_file=f"hf://uw/corpora@{SHA}/glm53/manifest.json")
+    arch.update(
+        routing="corpus", token_corpus_file=f"hf://datasets/uw/workload@{SHA}/glm53/manifest.json"
+    )
     path = tmp_path / "preset.yaml"
     path.write_text(yaml.safe_dump(raw))
     return path
@@ -151,7 +157,9 @@ def _direct_prediction(tmp_path):
     config_dir = tmp_path / "presets"
     config_dir.mkdir()
     cfg = {
-        "arch": {"iter": {"token_corpus_file": f"hf://uw/corpora@{SHA}/glm53/manifest.json"}},
+        "arch": {
+            "iter": {"token_corpus_file": f"hf://datasets/uw/workload@{SHA}/glm53/manifest.json"}
+        },
         "cases_file": "predict_cases.yaml",
     }
     return config_dir / "predict.yaml", cfg

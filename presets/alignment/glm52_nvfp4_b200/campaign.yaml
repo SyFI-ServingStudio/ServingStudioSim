@@ -51,7 +51,7 @@ variants:
       ep_size: 4
       nvl_num_gpu: 4
       routing: popularity
-      expert_popularity_file: expert_popularity.json
+      expert_popularity_file: hf://datasets/UW-SyFI/servingstudio-workload@9498d838a0cb1793980d8bf90998eb7f9722fb2d/glm52_nvfp4/vllm/c32_long/capture/20260824/popularity.json
       mtp_mode: 'off'
     worker:
       type: chunked_prefill
