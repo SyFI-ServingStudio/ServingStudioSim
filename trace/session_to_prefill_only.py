@@ -8,6 +8,10 @@ Each round of a `session-execution-v2` trace (for example
   pinned prefix hit (see `trace/README.md`);
 - `output_len` is 1, so the request is prefill only.
 
+A round whose prefix covers its whole prompt (zero fresh tokens) still computes
+its last token, as an engine does to produce logits after a full prefix hit, so
+it becomes one fresh token after a prefix one token shorter.
+
 Session chaining, tool waits, and the source timeline are dropped. Rounds are
 taken in a seeded random order, so a `--requests` subset is a uniform sample of
 all rounds and the length mix does not drift over the run. Arrivals are a
@@ -41,15 +45,24 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _read_rounds(source: Path) -> list[tuple[str, int, int]]:
+def _read_rounds(source: Path) -> tuple[list[tuple[str, int, int]], int]:
+    """The rounds as `(id, prefix, fresh)`, and how many had zero fresh tokens."""
     with source.open(newline="") as handle:
         reader = csv.DictReader(handle)
         missing = [column for column in SOURCE_COLUMNS if column not in (reader.fieldnames or [])]
         if missing:
             raise ValueError(f"{source} is not a session trace: missing columns {missing}")
-        return [
-            (row["request_id"], int(row["prefix_len"]), int(row["input_len"])) for row in reader
-        ]
+        rounds = []
+        full_prefix_rounds = 0
+        for row in reader:
+            prefix, fresh = int(row["prefix_len"]), int(row["input_len"])
+            if prefix + fresh == 0:
+                raise ValueError(f"{source}: round {row['request_id']} has an empty prompt")
+            if fresh == 0:
+                prefix, fresh = prefix - 1, 1
+                full_prefix_rounds += 1
+            rounds.append((row["request_id"], prefix, fresh))
+        return rounds, full_prefix_rounds
 
 
 def write_prefill_only_trace(
@@ -60,7 +73,7 @@ def write_prefill_only_trace(
     seed: int,
     max_context: int,
 ) -> dict:
-    rounds = _read_rounds(source)
+    rounds, full_prefix_rounds = _read_rounds(source)
     if not rounds:
         raise ValueError(f"{source} has no rounds")
     if requests is not None and not 0 < requests <= len(rounds):
@@ -94,6 +107,7 @@ def write_prefill_only_trace(
         "source_name": source.name,
         "source_sha256": _sha256(source),
         "source_rounds": len(rounds),
+        "source_full_prefix_rounds_given_one_fresh_token": full_prefix_rounds,
         "requests": len(selected),
         "selection": "seeded_uniform_sample_in_random_order",
         "seed": seed,

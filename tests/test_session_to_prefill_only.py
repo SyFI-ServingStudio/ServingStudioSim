@@ -74,3 +74,15 @@ def test_rejects_a_context_past_max_context(tmp_path):
         write_prefill_only_trace(
             source, tmp_path / "p.csv", requests=None, seed=0, max_context=1024
         )
+
+
+def test_a_full_prefix_round_recomputes_its_last_token(tmp_path):
+    source = _session_trace(tmp_path / "s.csv", [(500, 0), (0, 40)])
+    output = tmp_path / "p.csv"
+
+    manifest = write_prefill_only_trace(source, output, requests=None, seed=0, max_context=1024)
+
+    by_id = {row["id"]: (int(row["prefix_len"]), int(row["input_len"])) for row in _rows(output)}
+    assert by_id["session_0_round_000000"] == (499, 1)
+    assert by_id["session_0_round_000001"] == (0, 40)
+    assert manifest["source_full_prefix_rounds_given_one_fresh_token"] == 1
