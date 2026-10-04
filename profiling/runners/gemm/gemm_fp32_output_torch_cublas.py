@@ -16,18 +16,15 @@ from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerN
 from profiling.runners.metrics import ComputeMetrics
 
 _BACKEND = "gemm_fp32_output:torch_cublas"
-_GPU_NAMES = frozenset({"NVIDIA H200", "NVIDIA B200"})
-_K = 4096
-_SUPPORTED_N = {
-    DType.BF16: frozenset({256, 288, 512, 1024, 2048}),
-    DType.FP32: frozenset({32}),
-}
+# The two call forms below; torch.mm itself takes any m, n, k.
+_INPUT_DTYPES = frozenset({DType.BF16, DType.FP32})
 
 
 @dataclass(frozen=True)
 class _Shape:
     m: int
     n: int
+    k: int
     input_dtype: DType
 
 
@@ -56,23 +53,22 @@ def _validate_args(
     k: int,
     input_dtype: DType | str,
 ) -> _Shape:
-    if type(m) is not int or m <= 0:
-        raise ValueError("m must be a positive integer")
+    for name, value in (("m", m), ("n", n), ("k", k)):
+        if type(value) is not int or value <= 0:
+            raise ValueError(f"{name} must be a positive integer")
     dtype = DType.from_value(input_dtype)
-    supported_n = sorted(_SUPPORTED_N.get(dtype, ()))
-    if n not in supported_n or k != _K:
+    if dtype not in _INPUT_DTYPES:
         raise ProfilerNotImplemented(
-            f"{_BACKEND} requires k={_K} and n in {supported_n} for {dtype.value}"
+            f"{_BACKEND} requires input_dtype in {sorted(d.value for d in _INPUT_DTYPES)}, "
+            f"got {dtype.value}"
         )
-    return _Shape(m, n, dtype)
+    return _Shape(m, n, k, dtype)
 
 
 def _require_gpu(torch: Any) -> None:
+    # torch.mm/cuBLAS runs on any CUDA GPU; an unmeasured GPU is a data gap.
     if not torch.cuda.is_available():
         raise ProfilerNotImplemented(f"{_BACKEND} requires CUDA")
-    gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
-    if gpu_name not in _GPU_NAMES:
-        raise ProfilerNotImplemented(f"{_BACKEND} is verified only on {_GPU_NAMES}, got {gpu_name}")
 
 
 def _prepare(torch: Any, shape: _Shape) -> _Launch:
@@ -82,8 +78,8 @@ def _prepare(torch: Any, shape: _Shape) -> _Launch:
     if fp32 and torch.get_float32_matmul_precision() != "highest":
         raise ProfilerNotImplemented(f"{_BACKEND} fp32 requires matmul precision 'highest'")
     dtype = torch.float32 if fp32 else torch.bfloat16
-    input_tensor = torch.randn((shape.m, _K), dtype=dtype, device=device, generator=generator)
-    weight = torch.randn((shape.n, _K), dtype=dtype, device=device, generator=generator)
+    input_tensor = torch.randn((shape.m, shape.k), dtype=dtype, device=device, generator=generator)
+    weight = torch.randn((shape.n, shape.k), dtype=dtype, device=device, generator=generator)
     return _Launch(torch, input_tensor, weight.T.contiguous() if fp32 else weight.T, fp32)
 
 
@@ -98,7 +94,7 @@ def _check_output(torch: Any, launch: _Launch) -> None:
 
 def _logical_bytes(shape: _Shape) -> int:
     width = int(shape.input_dtype.size_bytes())
-    return width * shape.m * _K + width * shape.n * _K + 4 * shape.m * shape.n
+    return width * shape.m * shape.k + width * shape.n * shape.k + 4 * shape.m * shape.n
 
 
 def profile_gemm_fp32_output_torch_cublas(
@@ -128,7 +124,7 @@ def profile_gemm_fp32_output_torch_cublas(
         raise KernelLaunchFailed(f"{_BACKEND} failed") from exc
 
     elapsed_seconds = time_ms / 1000.0
-    flops = 2 * shape.m * shape.n * _K
+    flops = 2 * shape.m * shape.n * shape.k
     return ComputeMetrics(
         time_ms=float(time_ms),
         tflops=float(flops / elapsed_seconds / 1e12 if elapsed_seconds else 0.0),

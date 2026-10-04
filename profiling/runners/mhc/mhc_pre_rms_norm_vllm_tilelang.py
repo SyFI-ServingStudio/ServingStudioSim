@@ -9,12 +9,12 @@ from profiling.profilers.timer import Timer
 from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
 from profiling.runners.mhc._common import (
-    BOUNDARY_GPUS,
     HC_EPS,
     POST_MULTIPLIER,
     RMS_EPS,
     SINKHORN_ITERATIONS,
     CommonInputs,
+    Shape,
     assert_outputs_close,
     bandwidth_gbps,
     hidden_bytes,
@@ -22,7 +22,7 @@ from profiling.runners.mhc._common import (
     pre_weight_bytes,
     prepare_common,
     reference_pre,
-    require_gpu,
+    require_cuda,
     residual_bytes,
     validate_args,
 )
@@ -51,14 +51,9 @@ class _Launch:
         )
 
 
-def _logical_bytes(num_tokens: int) -> int:
+def _logical_bytes(shape: Shape) -> int:
     """Read the streams and weights once; write the mixes and the block input."""
-    return (
-        residual_bytes(num_tokens)
-        + pre_weight_bytes()
-        + mix_bytes(num_tokens)
-        + hidden_bytes(num_tokens)
-    )
+    return residual_bytes(shape) + pre_weight_bytes(shape) + mix_bytes(shape) + hidden_bytes(shape)
 
 
 def _validate_args(num_tokens: int, hidden_size: int, hc_mult: int, hidden_dtype: DType | str):
@@ -79,7 +74,7 @@ def profile_mhc_pre_rms_norm_vllm_tilelang(
         raise ProfilerNotImplemented(f"{_KIND} requires pinned vLLM and TileLang") from exc
 
     try:
-        require_gpu(torch, _KIND, BOUNDARY_GPUS)
+        require_cuda(torch, _KIND)
         inputs = prepare_common(torch, shape)
         launch = _Launch(mhc_pre_tilelang, inputs)
         expected = reference_pre(torch, inputs)
@@ -98,7 +93,7 @@ def profile_mhc_pre_rms_norm_vllm_tilelang(
     return ComputeMetrics(
         time_ms=float(time_ms),
         tflops=0.0,
-        memory_bandwidth_gbps=bandwidth_gbps(_logical_bytes(shape.num_tokens), time_ms),
+        memory_bandwidth_gbps=bandwidth_gbps(_logical_bytes(shape), time_ms),
         energy_j=float(energy_j),
     )
 

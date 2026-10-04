@@ -1,8 +1,10 @@
 """One-launch vLLM CUDA runner for Qwen MoE fused top-k selection.
 
-The timed callable is exactly one ``fused_topk`` wrapper invocation. CUPTI
-selects the ordinary-softmax BF16 E256/K8 ``topkGating`` specialization; router
-GEMM, token alignment, expert computation, and final weighting are excluded.
+The timed callable is exactly one ``fused_topk`` wrapper invocation, and CUPTI
+counts every kernel it launches: one ``topkGating`` specialization when vLLM
+has one for the expert count (powers of two up to 512 and 192/320/384/448/576),
+otherwise the ``moeSoftmax`` + ``moeTopK`` pair. Router GEMM, token alignment,
+expert computation, and final weighting are excluded.
 The reported FLOPs and bytes are semantic/logical and are not physical CUDA
 work or traffic. Energy includes the wrapper's three fresh output allocations.
 """
@@ -34,18 +36,9 @@ from profiling.runners.moe.moe_fused_topk_torch import (
 _BACKEND = "moe_fused_topk:vllm_cuda"
 _MODULE = "vllm.model_executor.layers.fused_moe.router.fused_topk_router"
 _CALLABLE = "fused_topk"
-_GPU = "NVIDIA H200"
-_NUM_EXPERTS = 256
-_TOP_K = 8
 _QWEN_TOKENS = 128
 _GUARD_TOKENS = 8
 _ATOL = _RTOL = 1e-5
-# Mangled prefix observed for the selected E256/K8 BF16/int32 ordinary-softmax
-# specialization. ``ScoringFuncE0`` is SCORING_SOFTMAX. This excludes the
-# softplus/sqrt and generic moeSoftmax/moeTopK implementations.
-_KERNEL_NAME = (
-    "_ZN4vllm3moe10topkGatingILi8ELi256ELi4ELi16ELi32Ei13__nv_bfloat16LNS0_11ScoringFuncE0EEEv"
-)
 
 
 @dataclass(frozen=True)
@@ -60,16 +53,13 @@ def _validate_args(
     top_k: int,
     dtype: DType | str,
 ) -> _ValidatedArgs:
-    args = _validate_semantic_args(num_tokens, num_experts, top_k, dtype)
-    if args.num_experts != _NUM_EXPERTS:
-        raise ValueError(f"{_BACKEND} requires num_experts=256")
-    if args.top_k != _TOP_K:
-        raise ValueError(f"{_BACKEND} requires top_k=8")
-    return args
+    # vLLM's topk_softmax takes any expert count (a fused specialization or a
+    # softmax + top-k fallback) and any top_k <= num_experts.
+    return _validate_semantic_args(num_tokens, num_experts, top_k, dtype)
 
 
 def _guard_args(args: _ValidatedArgs) -> _ValidatedArgs:
-    """Preserve exact Qwen; otherwise use a bounded witness with the same E/K."""
+    """Preserve 128 tokens; otherwise use a bounded witness with the same E/K."""
     if args.num_tokens == _QWEN_TOKENS:
         return args
     return replace(args, num_tokens=min(args.num_tokens, _GUARD_TOKENS))
@@ -87,9 +77,13 @@ def _operand_shapes(args: _ValidatedArgs) -> dict[str, tuple[int, ...]]:
 
 def _build_operands(torch: Any, args: _ValidatedArgs, *, device: Any) -> _Operands:
     # Bounded, non-tied BF16 logits make the correctness check deterministic.
+    # The largest logit is 8 for any expert count (the offset is 127 at E=256).
+    # Below |8| BF16 spacing is at most half the 1/16 expert step, so the 248
+    # largest logits of every row are distinct; only lower-ranked experts can tie.
+    center = float(args.num_experts - 129)
     expert = torch.arange(args.num_experts, dtype=torch.float32, device=device)
     token = torch.arange(args.num_tokens, dtype=torch.float32, device=device).unsqueeze(1)
-    logits = (expert.unsqueeze(0) - 127.0) / 16.0 - token / 512.0
+    logits = (expert.unsqueeze(0) - center) / 16.0 - token / 512.0
     logits = logits.to(torch.bfloat16).contiguous()
     hidden_states = torch.zeros(
         _operand_shapes(args)["hidden_states"], dtype=torch.bfloat16, device=device
@@ -119,12 +113,10 @@ def _validate_operands(
         raise ValueError("logits and hidden_states must share one device")
 
 
-def _require_h200(torch: Any) -> None:
+def _require_cuda(torch: Any) -> None:
+    # A vLLM _moe_C CUDA op built for every CUDA arch the wheel targets.
     if not torch.cuda.is_available():
         raise ProfilerNotImplemented(f"CUDA is required for {_BACKEND}")
-    name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
-    if name != _GPU:
-        raise ProfilerNotImplemented(f"{_BACKEND} is verified only on {_GPU}, got {name}")
 
 
 def _load_callable() -> Any:
@@ -138,11 +130,11 @@ def _load_callable() -> Any:
     return callable_
 
 
-def _invoke(torch: Any, callable_: Any, operands: _Operands) -> tuple[Any, Any, Any]:
+def _invoke(torch: Any, callable_: Any, operands: _Operands, top_k: int) -> tuple[Any, Any, Any]:
     return callable_(
         hidden_states=operands.hidden_states,
         gating_output=operands.logits,
-        topk=_TOP_K,
+        topk=top_k,
         renormalize=True,
         indices_type=torch.int32,
         scoring_func="softmax",
@@ -206,7 +198,7 @@ def _check_correctness(
     logits_before = operands.logits.clone()
     hidden_before = operands.hidden_states.clone()
     expected = moe_fused_topk_reference(logits_before.cpu(), args.top_k)
-    first = _invoke(torch, callable_, operands)
+    first = _invoke(torch, callable_, operands, args.top_k)
     (synchronize or (torch.cuda.synchronize if operands.logits.is_cuda else lambda: None))()
     _validate_outputs(torch, first, operands, args)
     torch.testing.assert_close(first[0].cpu(), expected[0], rtol=_RTOL, atol=_ATOL)
@@ -215,7 +207,7 @@ def _check_correctness(
     if not torch.equal(first[2].cpu(), expected[2]):
         raise AssertionError("vLLM source indices disagree with the semantic reference")
 
-    second = _invoke(torch, callable_, operands)
+    second = _invoke(torch, callable_, operands, args.top_k)
     (synchronize or (torch.cuda.synchronize if operands.logits.is_cuda else lambda: None))()
     _validate_outputs(torch, second, operands, args)
     torch.testing.assert_close(second[0], first[0], rtol=0, atol=0)
@@ -241,7 +233,7 @@ def profile_moe_fused_topk_vllm_cuda(
     except ImportError as exc:
         raise ProfilerNotImplemented(f"PyTorch is required for {_BACKEND}") from exc
     try:
-        _require_h200(torch)
+        _require_cuda(torch)
         callable_ = _load_callable()
         device = torch.device("cuda", torch.cuda.current_device())
         operands = _build_operands(torch, args, device=device)
@@ -253,9 +245,9 @@ def profile_moe_fused_topk_vllm_cuda(
         _check_correctness(torch, callable_, guard, guard_args)
 
         def kernel():
-            return _invoke(torch, callable_, operands)
+            return _invoke(torch, callable_, operands, args.top_k)
 
-        time_ms = Timer.cupti(kernel, kernel_name=_KERNEL_NAME)
+        time_ms = Timer.cupti(kernel, kernel_name=None)
         # Energy covers the wrapper call, including its three fresh allocations.
         energy_j = Energy.perf(kernel, warmup=5, per_iter_time_ms=time_ms)
     except torch.OutOfMemoryError as exc:

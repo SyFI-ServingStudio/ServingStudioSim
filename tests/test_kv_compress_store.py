@@ -8,19 +8,29 @@ from profiling.runners.attention.kv_compress_store_cutedsl import (
 from profiling.runners.attention.kv_compress_store_triton import (
     _validate_args as validate_indexer_args,
 )
+from profiling.runners.exceptions import ProfilerNotImplemented
 
 
-def _shape(*, positions=(3, 4, 7), requests=(0, 0, 0), ratio=4, width=2):
+def _shape(
+    *,
+    positions=(3, 4, 7),
+    requests=(0, 0, 0),
+    ratio=4,
+    width=2,
+    head_dim=512,
+    block=256,
+    eps=1.0e-6,
+):
     return _validate_args(
         positions,
         requests,
         width,
         ratio,
         1,
-        512,
+        head_dim,
         64,
-        256,
-        1.0e-6,
+        block,
+        eps,
         "fp32",
         "bf16",
         "fp8_ds_mla",
@@ -83,3 +93,38 @@ def test_indexer_backend_uses_its_real_132_byte_cache_identity():
         shape.page_alignment,
     ) == (132, 128, 4, 576)
     assert ((shape.kv_block_size * shape.cache_row_bytes + 575) // 576) * 576 == 8640
+
+
+def test_row_request_block_and_eps_limits_are_only_the_real_bounds():
+    many = _shape(positions=tuple(range(9000)), requests=(0,) * 9000, width=2250)
+    assert len(many.positions) == 9000
+    requests = _shape(positions=(3,) * 100, requests=tuple(range(100)), width=1)
+    assert max(requests.request_ids) == 99
+    assert _shape(block=512).kv_block_size == 128
+    assert _shape(eps=1.0e-5).rms_eps == 1.0e-5
+    with pytest.raises(ValueError, match="logical_block_size"):
+        _shape(block=258)
+    with pytest.raises(ValueError, match="rms_eps"):
+        _shape(eps=0.0)
+    with pytest.raises(ProfilerNotImplemented, match="head_dim"):
+        _shape(head_dim=576)
+
+
+def test_indexer_block_size_and_eps_are_runtime_values():
+    shape = validate_indexer_args(
+        (3, 7),
+        (0, 0),
+        2,
+        4,
+        1,
+        128,
+        64,
+        128,
+        1.0e-5,
+        "fp32",
+        "bf16",
+        "fp8_indexer",
+        "block_segregated_data_then_scales",
+        "fp32_per_token",
+    )
+    assert (shape.kv_block_size, shape.rms_eps) == (32, 1.0e-5)

@@ -20,36 +20,41 @@ from profiling.profilers.timer import Timer
 from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
 
-_NUM_HEADS = 64
+# The MQA latent+rope layout every backend here consumes: one KV head, a
+# 512-wide latent that doubles as the value, and a 64-wide RoPE tail (FlashMLA
+# sparse_fwd.h checks d_qk in {576, 512} and d_v == 512; the cache_layout tag
+# names this layout). rope_dim 0 is the separate TRT-LLM nope layout.
 _NUM_KV_HEADS = 1
-_SELECTED_K = 2048
 _LATENT_DIM = 512
 _ROPE_DIM = 64
 _SCORE_DIM = _LATENT_DIM + _ROPE_DIM
 _VALUE_DIM = 512
-_SOFTMAX_SCALE = 0.0625
 _CACHE_LAYOUT = "token_major_mqa_bf16_latent_rope"
 _QUERY_CHUNK_SIZE = 8
 _CACHE_TEMPLATE_ROWS = 64
 _FLASHMLA_BACKEND = "dsa_sparse_mla_attention:vllm_flashmla_bf16"
-_FLASHMLA_KERNEL_NAME = "sparse_attn_fwd_kernel"
+# Substring of every FlashMLA sparse prefill kernel: SM90/SM100
+# `sparse_attn_fwd_kernel` and SM100 `sparse_attn_fwd_for_small_topk_kernel`.
+_FLASHMLA_KERNEL_NAME = "sparse_attn_fwd"
+# FlashMLA 6bc4941 csrc/api/sparse_fwd.h: h_q is 64 or 128, and the kernel runs
+# only on sm90a (9.0) or the sm100f family (major 10).
+_FLASHMLA_NUM_HEADS = frozenset({64, 128})
+# Every kernel asserts topk % B_TOPK == 0: 2*64 on SM90 (sm90 phase1.cuh), 64 for
+# SM100 head64, 128 for SM100 head128 at d_qk 576 (sm100 fwd/*/config.h).
+_FLASHMLA_MIN_TOPK_BLOCK = 64
 _FLASHMLA_ATOL = 8e-4
 _FLASHMLA_RTOL = 3.01 / 128
 _FLASHMLA_COSINE_LIMIT = 7e-6
 _TRTLLM_FP8_BACKEND = "dsa_sparse_mla_attention:flashinfer_trtllm_fp8"
 _TRTLLM_FP8_CACHE_LAYOUT = "hnd_paged_mqa_fp8_latent_rope"
 _TRTLLM_KERNEL_NAME = "fmhaSm100"
-# Per-rank q-head counts of GLM's 64 heads at validated TP degrees (TP8, TP4);
-# operands, output check and metrics are parametric in num_heads.
-_TRTLLM_SUPPORTED_NUM_HEADS = frozenset({8, 16})
 _TRTLLM_WORKSPACE_BYTES = 128 * 1024 * 1024
 _TRTLLM_PAGE_SIZE = 64
 # GLM-5.3-Flash's rope-free MLA (rope_dim 0; FlashInfer >= 0.6.18
 # `nope_mla_dimensions`, 512-byte latent-only cache rows). Its page table is
-# `selected_k` wide: 2048, or vLLM's kpool buffer
-# round_up(index_topk + index_kpool - 1, 128) = 2176.
+# `selected_k` wide (2048, or vLLM's kpool buffer 2176); FlashInfer only checks
+# that the page table matches sparse_mla_top_k, so any positive width is valid.
 _TRTLLM_FP8_NOPE_CACHE_LAYOUT = "hnd_paged_mqa_fp8_latent"
-_TRTLLM_FP8_NOPE_SELECTED_K = frozenset({2048, 2176})
 
 _UINT = r"(?:0|[1-9][0-9]*)"
 _UNIFORM_RE = re.compile(rf"u:({_UINT})x({_UINT})\Z")
@@ -210,13 +215,13 @@ def _validate_args(
     valid_counts: str,
     index_distribution: str,
     cache_layout: str,
-    expected_num_heads: int | None = _NUM_HEADS,
+    allowed_num_heads: frozenset[int] | None = None,
     expected_q_dtype: DType = DType.BF16,
     expected_cache_dtype: DType = DType.BF16,
     expected_output_dtype: DType = DType.BF16,
     expected_cache_layout: str = _CACHE_LAYOUT,
     expected_rope_dim: int = _ROPE_DIM,
-    allowed_selected_k: frozenset[int] = frozenset({_SELECTED_K}),
+    selected_k_multiple: int = 1,
 ) -> _ValidatedArgs:
     integers = {
         "num_queries": num_queries,
@@ -246,22 +251,28 @@ def _validate_args(
         "rope_dim": (rope_dim, expected_rope_dim),
         "value_dim": (value_dim, _VALUE_DIM),
     }
-    if selected_k not in allowed_selected_k:
-        required_k = " or ".join(str(value) for value in sorted(allowed_selected_k))
-        raise ProfilerNotImplemented(f"selected_k must be {required_k}, got {selected_k}")
+    if selected_k < 1:
+        raise ProfilerNotImplemented(f"selected_k must be >= 1, got {selected_k}")
+    if selected_k % selected_k_multiple:
+        raise ProfilerNotImplemented(
+            f"selected_k must be a multiple of {selected_k_multiple}, got {selected_k}"
+        )
     for name, (actual, required) in expected.items():
         if actual != required:
             raise ProfilerNotImplemented(f"{name} must be {required}, got {actual}")
-    if expected_num_heads is None:
-        if num_heads < 1:
-            raise ProfilerNotImplemented(f"num_heads must be >= 1, got {num_heads}")
-    elif num_heads != expected_num_heads:
-        raise ProfilerNotImplemented(f"num_heads must be {expected_num_heads}, got {num_heads}")
+    if num_heads < 1:
+        raise ProfilerNotImplemented(f"num_heads must be >= 1, got {num_heads}")
+    if allowed_num_heads is not None and num_heads not in allowed_num_heads:
+        raise ProfilerNotImplemented(
+            f"num_heads must be one of {sorted(allowed_num_heads)}, got {num_heads}"
+        )
     if type(softmax_scale) not in {int, float} or isinstance(softmax_scale, bool):
         raise TypeError("softmax_scale must be a real number")
-    if float(softmax_scale) != _SOFTMAX_SCALE:
+    # A runtime scalar of every backend (bmm1_scale / sm_scale); production
+    # passes the model's 1/sqrt(qk_head_dim).
+    if not math.isfinite(float(softmax_scale)) or float(softmax_scale) <= 0.0:
         raise ProfilerNotImplemented(
-            f"softmax_scale must be exactly {_SOFTMAX_SCALE}, got {softmax_scale}"
+            f"softmax_scale must be positive and finite, got {softmax_scale}"
         )
     if DType.from_value(q_dtype) is not expected_q_dtype:
         raise ProfilerNotImplemented(f"q_dtype must be {expected_q_dtype.value}")
@@ -291,20 +302,50 @@ def _validate_args(
     )
 
 
-def _require_h200(torch: Any, *, backend: str = "dsa_sparse_mla_attention:torch") -> None:
+def _require_cuda(torch: Any, *, backend: str = "dsa_sparse_mla_attention:torch") -> None:
     if not torch.cuda.is_available():
         raise ProfilerNotImplemented(f"CUDA is required for {backend}")
-    gpu_name = torch.cuda.get_device_name(torch.cuda.current_device())
-    if gpu_name != "NVIDIA H200":
-        raise ProfilerNotImplemented(f"{backend} requires NVIDIA H200, got {gpu_name!r}")
 
 
-def _require_b200(torch: Any, *, backend: str = _TRTLLM_FP8_BACKEND) -> None:
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented(f"CUDA is required for {backend}")
-    gpu_name = torch.cuda.get_device_name(torch.cuda.current_device())
-    if gpu_name != "NVIDIA B200":
-        raise ProfilerNotImplemented(f"{backend} requires NVIDIA B200, got {gpu_name!r}")
+def _device_capability(torch: Any) -> tuple[int, int]:
+    major, minor = torch.cuda.get_device_capability(torch.cuda.current_device())
+    return int(major), int(minor)
+
+
+def _flashmla_topk_block(capability: tuple[int, int], num_heads: int) -> int | None:
+    """FlashMLA's selected-K tile for d_qk 576, or None when it has no kernel."""
+    if capability == (9, 0):
+        return 128
+    if capability[0] == 10:
+        return 64 if num_heads == 64 else 128
+    return None
+
+
+def _require_flashmla_device(torch: Any, *, num_heads: int, selected_k: int) -> None:
+    _require_cuda(torch, backend=_FLASHMLA_BACKEND)
+    capability = _device_capability(torch)
+    block = _flashmla_topk_block(capability, num_heads)
+    if block is None:
+        raise ProfilerNotImplemented(
+            f"{_FLASHMLA_BACKEND} needs sm90a (9.0) or an sm100f (10.x) device, "
+            f"got {capability[0]}.{capability[1]}"
+        )
+    if selected_k % block:
+        raise ProfilerNotImplemented(
+            f"{_FLASHMLA_BACKEND} on {capability[0]}.{capability[1]} with "
+            f"{num_heads} heads needs selected_k % {block} == 0, got {selected_k}"
+        )
+
+
+def _require_trtllm_gen_device(torch: Any, *, backend: str = _TRTLLM_FP8_BACKEND) -> None:
+    """TRTLLM-GEN sparse MLA (fmhaSm100) runs only on the SM100 family."""
+    _require_cuda(torch, backend=backend)
+    capability = _device_capability(torch)
+    if capability[0] != 10:
+        raise ProfilerNotImplemented(
+            f"{backend} needs an SM100-family (10.x) device for TRTLLM-GEN sparse MLA, "
+            f"got {capability[0]}.{capability[1]}"
+        )
 
 
 def _load_flashmla_sparse_fwd() -> Any:
@@ -368,9 +409,16 @@ def _row_indices(
     raise AssertionError("clustered index construction did not produce enough indices")
 
 
-def _build_operands(torch: Any, validated: _ValidatedArgs, *, device: Any) -> _Operands:
+def _build_operands(
+    torch: Any,
+    validated: _ValidatedArgs,
+    *,
+    num_heads: int,
+    selected_k: int,
+    device: Any,
+) -> _Operands:
     q = torch.empty(
-        (validated.num_queries, _NUM_HEADS, _SCORE_DIM),
+        (validated.num_queries, num_heads, _SCORE_DIM),
         dtype=torch.bfloat16,
         device=device,
     )
@@ -380,14 +428,16 @@ def _build_operands(torch: Any, validated: _ValidatedArgs, *, device: Any) -> _O
         device=device,
     )
     selected_indices = torch.full(
-        (validated.num_queries, _NUM_KV_HEADS, _SELECTED_K),
+        (validated.num_queries, _NUM_KV_HEADS, selected_k),
         -1,
         dtype=torch.int32,
         device=device,
     )
 
     feature = torch.linspace(-0.875, 0.875, _SCORE_DIM, device=device)
-    heads = (torch.arange(_NUM_HEADS, dtype=torch.float32, device=device) - 31.5) / 256.0
+    heads = (
+        torch.arange(num_heads, dtype=torch.float32, device=device) - (num_heads - 1) / 2.0
+    ) / 256.0
     rows = (torch.arange(_QUERY_CHUNK_SIZE, dtype=torch.float32, device=device) - 3.5) / 128.0
     q_template = (rows[:, None, None] + heads[None, :, None] + feature).to(torch.bfloat16)
     for start in range(0, validated.num_queries, _QUERY_CHUNK_SIZE):
@@ -430,13 +480,14 @@ def _torch_composite(
     outputs: list[Any] = []
     cache_2d = cache[:, 0, :]
     num_cache_tokens = cache.shape[0]
+    selected_k = selected_indices.shape[-1]
     for start in range(0, q.shape[0], query_chunk_size):
         stop = min(start + query_chunk_size, q.shape[0])
         indices = selected_indices[start:stop, 0, :].to(torch.int64)
         valid = (indices >= 0) & (indices < num_cache_tokens)
         safe = torch.where(valid, indices, torch.zeros_like(indices))
         gathered = cache_2d.index_select(0, safe.reshape(-1)).reshape(
-            stop - start, _SELECTED_K, _SCORE_DIM
+            stop - start, selected_k, _SCORE_DIM
         )
         gathered = torch.where(valid[..., None], gathered, torch.zeros_like(gathered))
 
@@ -482,7 +533,7 @@ def _check_correctness(
         softmax_scale=softmax_scale,
     )
 
-    if actual.shape != (operands.q.shape[0], _NUM_HEADS, _VALUE_DIM):
+    if actual.shape != (operands.q.shape[0], operands.q.shape[1], _VALUE_DIM):
         raise AssertionError(f"unexpected output shape {tuple(actual.shape)}")
     if actual.dtype is not torch.bfloat16 or not torch.isfinite(actual).all():
         raise AssertionError("Torch composite output must be finite BF16")
@@ -581,8 +632,8 @@ def _check_flashmla_correctness(
         operands.selected_indices,
         softmax_scale=softmax_scale,
     )
-    expected_output_shape = (operands.q.shape[0], _NUM_HEADS, _VALUE_DIM)
-    expected_diagnostic_shape = (operands.q.shape[0], _NUM_HEADS)
+    expected_output_shape = (operands.q.shape[0], operands.q.shape[1], _VALUE_DIM)
+    expected_diagnostic_shape = (operands.q.shape[0], operands.q.shape[1])
     if tuple(output.shape) != expected_output_shape or output.dtype is not torch.bfloat16:
         raise AssertionError(
             f"FlashMLA output must be BF16 {expected_output_shape}, "
@@ -691,7 +742,7 @@ def profile_dsa_sparse_mla_attention_torch(
     index_distribution: str,
     cache_layout: str,
 ) -> ComputeMetrics:
-    """Profile the complete Torch semantic composite on an NVIDIA H200."""
+    """Profile the complete Torch semantic composite on any CUDA device."""
     validated = _validate_args(
         num_queries=num_queries,
         num_cache_tokens=num_cache_tokens,
@@ -717,9 +768,11 @@ def profile_dsa_sparse_mla_attention_torch(
         raise ProfilerNotImplemented("PyTorch is unavailable") from exc
 
     try:
-        _require_h200(torch)
+        _require_cuda(torch)
         device = torch.device("cuda", torch.cuda.current_device())
-        operands = _build_operands(torch, validated, device=device)
+        operands = _build_operands(
+            torch, validated, num_heads=num_heads, selected_k=selected_k, device=device
+        )
         _check_correctness(torch, operands, softmax_scale=float(softmax_scale))
 
         def kernel() -> Any:
@@ -818,8 +871,8 @@ def _launch_trtllm_fp8(
     operands: _TrtllmFp8Operands,
     *,
     softmax_scale: float,
+    selected_k: int,
     rope_dim: int = _ROPE_DIM,
-    selected_k: int = _SELECTED_K,
 ) -> Any:
     extra = {} if rope_dim else {"sparse_mla_top_k_lens": operands.top_k_lens}
     return callable_(
@@ -858,17 +911,12 @@ def profile_dsa_sparse_mla_attention_flashinfer_trtllm_fp8(
     index_distribution: str,
     cache_layout: str,
 ) -> ComputeMetrics:
-    """Profile vLLM's one-launch B200 FlashInfer sparse-MLA callable.
+    """Profile vLLM's one-launch SM100 FlashInfer TRTLLM-GEN sparse-MLA callable.
 
     rope_dim 64 is GLM-5.2's latent+rope layout; rope_dim 0 is GLM-5.3-Flash's
     rope-free layout with its own cache_layout and selected_k widths.
     """
     nope = rope_dim == 0
-    if num_heads not in _TRTLLM_SUPPORTED_NUM_HEADS:
-        raise ProfilerNotImplemented(
-            f"{_TRTLLM_FP8_BACKEND} supports num_heads in "
-            f"{sorted(_TRTLLM_SUPPORTED_NUM_HEADS)}, got {num_heads}"
-        )
     validated = _validate_args(
         num_queries=num_queries,
         num_cache_tokens=num_cache_tokens,
@@ -886,12 +934,13 @@ def profile_dsa_sparse_mla_attention_flashinfer_trtllm_fp8(
         valid_counts=valid_counts,
         index_distribution=index_distribution,
         cache_layout=cache_layout,
-        expected_num_heads=num_heads,
+        # num_heads is the per-rank q-head count (GLM's 64 heads over TP).
+        # vLLM picks this backend for fp8 KV at any head count, and operands,
+        # output check and metrics are parametric in it, as in selected_k.
         expected_q_dtype=DType.FP8_E4M3,
         expected_cache_dtype=DType.FP8_E4M3,
         expected_cache_layout=_TRTLLM_FP8_NOPE_CACHE_LAYOUT if nope else _TRTLLM_FP8_CACHE_LAYOUT,
         expected_rope_dim=0 if nope else _ROPE_DIM,
-        allowed_selected_k=_TRTLLM_FP8_NOPE_SELECTED_K if nope else frozenset({_SELECTED_K}),
     )
 
     try:
@@ -903,7 +952,7 @@ def profile_dsa_sparse_mla_attention_flashinfer_trtllm_fp8(
         ) from exc
 
     try:
-        _require_b200(torch)
+        _require_trtllm_gen_device(torch)
         device = torch.device("cuda", torch.cuda.current_device())
         operands = _build_trtllm_fp8_operands(
             torch,
@@ -1004,6 +1053,8 @@ def profile_dsa_sparse_mla_attention_vllm_flashmla_bf16(
         valid_counts=valid_counts,
         index_distribution=index_distribution,
         cache_layout=cache_layout,
+        allowed_num_heads=_FLASHMLA_NUM_HEADS,
+        selected_k_multiple=_FLASHMLA_MIN_TOPK_BLOCK,
     )
 
     try:
@@ -1012,11 +1063,13 @@ def profile_dsa_sparse_mla_attention_vllm_flashmla_bf16(
         raise ProfilerNotImplemented(f"{_FLASHMLA_BACKEND} requires PyTorch in vllm_env") from exc
 
     try:
-        _require_h200(torch, backend=_FLASHMLA_BACKEND)
+        _require_flashmla_device(torch, num_heads=num_heads, selected_k=selected_k)
         flash_mla_sparse_fwd = _load_flashmla_sparse_fwd()
         device = torch.device("cuda", torch.cuda.current_device())
-        operands = _build_operands(torch, validated, device=device)
-        # q is consumed through SM90 TMA and cache through 16-byte cp.async;
+        operands = _build_operands(
+            torch, validated, num_heads=num_heads, selected_k=selected_k, device=device
+        )
+        # q is consumed through TMA and cache through 16-byte cp.async;
         # the profiler constructs aligned storage and never realigns in timing.
         _validate_flashmla_layouts(operands)
         _check_flashmla_correctness(

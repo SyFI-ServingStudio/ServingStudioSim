@@ -12,7 +12,6 @@ from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerN
 from profiling.runners.metrics import ComputeMetrics
 
 _BACKEND = "mla_rope_quantize_fp8:flashinfer"
-_SUPPORTED_GPUS = ("NVIDIA B200",)
 
 
 @dataclass(frozen=True)
@@ -84,13 +83,10 @@ def _validate_args(
 
 
 def _validate_device(torch: Any) -> None:
+    # FlashInfer JIT-builds rope.cu for the current device with no arch list;
+    # its PDL instructions are guarded by __CUDA_ARCH__ >= 900 in pos_enc.cuh.
     if not torch.cuda.is_available():
         raise ProfilerNotImplemented(f"{_BACKEND} requires CUDA")
-    gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
-    if gpu_name not in _SUPPORTED_GPUS:
-        raise ProfilerNotImplemented(
-            f"{_BACKEND} is verified only on {' or '.join(_SUPPORTED_GPUS)}, got {gpu_name}"
-        )
 
 
 def _prepare(

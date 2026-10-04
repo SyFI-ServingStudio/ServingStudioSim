@@ -165,12 +165,12 @@ def test_runner_rejects_nonpositive_dimensions_before_cuda(
         _validate_args(num_batches, m, n, k, DType.BF16)
 
 
-@pytest.mark.parametrize("num_batches", [1, 63, 128])
-def test_runner_rejects_unsupported_head_counts(num_batches):
+@pytest.mark.parametrize("num_batches", [1, 4, 63, 128])
+def test_runner_accepts_any_positive_head_count(num_batches):
+    # torch.bmm runs over any head axis; an unmeasured TP degree is a data gap.
     from profiling.runners.gemm.batched_gemm import _validate_args
 
-    with pytest.raises(ValueError, match=r"num_batches in \[8, 16, 32, 64\]"):
-        _validate_args(num_batches, 1, 512, 192, DType.BF16)
+    assert _validate_args(num_batches, 1, 512, 192, DType.BF16)[0] == num_batches
 
 
 @pytest.mark.parametrize(("n", "k"), [(256, 192), (512, 128), (513, 192)])
@@ -189,7 +189,7 @@ def test_runner_rejects_non_bf16_dtype(dtype):
         _validate_args(64, 1, 512, 192, dtype)
 
 
-def test_runner_rejects_missing_cuda_and_unverified_gpu():
+def test_runner_requires_cuda_but_accepts_any_gpu():
     from profiling.runners.gemm.batched_gemm import _validate_cuda_device
 
     no_cuda = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False))
@@ -203,11 +203,7 @@ def test_runner_rejects_missing_cuda_and_unverified_gpu():
             get_device_name=lambda _device: "NVIDIA H100",
         )
     )
-    with pytest.raises(
-        ProfilerNotImplemented,
-        match=r"verified only on \['NVIDIA B200', 'NVIDIA H200'\], got NVIDIA H100",
-    ):
-        _validate_cuda_device(h100)
+    _validate_cuda_device(h100)
 
 
 @pytest.mark.parametrize(
@@ -231,11 +227,19 @@ def test_v_up_rejects_nonpositive_dimensions_before_cuda(
         _validate_v_up_args(num_batches, m, n, k, DType.BF16)
 
 
-@pytest.mark.parametrize("num_batches", [1, 63, 128])
-def test_v_up_rejects_unsupported_head_counts(num_batches):
+@pytest.mark.parametrize("num_batches", [1, 4, 63, 64])
+def test_v_up_accepts_head_counts_within_the_padded_layout(num_batches):
     from profiling.runners.gemm.batched_gemm import _validate_v_up_args
 
-    with pytest.raises(ValueError, match=r"num_batches in \[8, 16, 32, 64\]"):
+    assert _validate_v_up_args(num_batches, 1, 256, 512, DType.BF16)[0] == num_batches
+
+
+@pytest.mark.parametrize("num_batches", [65, 128])
+def test_v_up_rejects_head_counts_beyond_the_padded_layout(num_batches):
+    # The attention output is allocated with a 64-head stride.
+    from profiling.runners.gemm.batched_gemm import _validate_v_up_args
+
+    with pytest.raises(ValueError, match=r"num_batches must be <= 64"):
         _validate_v_up_args(num_batches, 1, 256, 512, DType.BF16)
 
 
@@ -255,7 +259,7 @@ def test_v_up_rejects_non_bf16_dtype(dtype):
         _validate_v_up_args(64, 1, 256, 512, dtype)
 
 
-def test_v_up_rejects_missing_cuda_and_unverified_gpu():
+def test_v_up_requires_cuda_but_accepts_any_gpu():
     from profiling.runners.gemm.batched_gemm import _validate_v_up_cuda_device
 
     no_cuda = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False))
@@ -269,11 +273,7 @@ def test_v_up_rejects_missing_cuda_and_unverified_gpu():
             get_device_name=lambda _device: "NVIDIA H100",
         )
     )
-    with pytest.raises(
-        ProfilerNotImplemented,
-        match=r"verified only on \['NVIDIA B200', 'NVIDIA H200'\], got NVIDIA H100",
-    ):
-        _validate_v_up_cuda_device(h100)
+    _validate_v_up_cuda_device(h100)
 
 
 @pytest.mark.parametrize("num_batches", [64, 32, 16, 8])

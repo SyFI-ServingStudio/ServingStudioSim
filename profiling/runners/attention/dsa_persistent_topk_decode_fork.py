@@ -9,8 +9,8 @@ from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerN
 from profiling.runners.metrics import ComputeMetrics
 
 _BACKEND = "dsa_persistent_topk_decode:vllm_fork_cuda"
-_GPU_NAME = "NVIDIA H200"
-_TOP_K = 512
+# The callable's K instantiations (vLLM csrc/libtorch_stable/topk.cu dispatch).
+_TOP_K = frozenset({512, 1024, 2048})
 _WORKSPACE_BYTES = 1024 * 1024
 
 
@@ -20,10 +20,16 @@ class _Operands:
     lengths: Any
     indices: Any
     workspace: Any
+    top_k: int
 
 
-def _max_ragged_lengths(batch_size: int, context_len: int) -> tuple[int, ...]:
-    return tuple(max(0, context_len - row) for row in range(batch_size))
+def _max_ragged_lengths(batch_size: int, context_len: int, next_n: int = 1) -> tuple[int, ...]:
+    """Row lengths, request-major; a request's ``next_n`` rows end at its context."""
+    return tuple(
+        max(0, max(0, context_len - request) - next_n + 1 + token)
+        for request in range(batch_size)
+        for token in range(next_n)
+    )
 
 
 def _validate_args(
@@ -37,20 +43,24 @@ def _validate_args(
     index_dtype: str,
     context_mode: str,
 ) -> tuple[int, ...]:
-    if type(batch_size) is not int or not 1 <= batch_size <= 256:
-        raise ValueError("batch_size must be an int in [1, 256]")
+    # No row cap: topk.cu dispatches any row count and sizes its grid from the
+    # device SM count.
+    if type(batch_size) is not int or batch_size < 1:
+        raise ValueError("batch_size must be a positive int")
     if type(context_len) is not int or context_len < 0:
         raise ValueError("context_len must be a nonnegative int")
-    if next_n != 1 or top_k != _TOP_K:
-        raise ProfilerNotImplemented(f"{_BACKEND} requires next_n=1 and top_k=512")
+    if type(next_n) is not int or next_n < 1:
+        raise ValueError("next_n must be a positive int")
+    if top_k not in _TOP_K:
+        raise ProfilerNotImplemented(f"{_BACKEND} requires top_k in {sorted(_TOP_K)}, got {top_k}")
     if (
         type(max_model_len) is not int
-        or not 1 <= max_model_len <= 1_048_576
+        or max_model_len < 1
         or context_len > max_model_len
         or logits_row_stride < max_model_len
     ):
-        raise ProfilerNotImplemented(
-            f"{_BACKEND} requires context_len <= max_model_len <= 1048576 "
+        raise ValueError(
+            f"{_BACKEND} requires context_len <= max_model_len, max_model_len >= 1, "
             "and logits_row_stride >= max_model_len"
         )
     if (str(logits_dtype), index_dtype, context_mode) != (
@@ -59,7 +69,7 @@ def _validate_args(
         "max_ragged",
     ):
         raise ProfilerNotImplemented(f"{_BACKEND} requires fp32/int32 max-ragged storage identity")
-    return _max_ragged_lengths(batch_size, context_len)
+    return _max_ragged_lengths(batch_size, context_len, next_n)
 
 
 def _build_operands(
@@ -68,9 +78,10 @@ def _build_operands(
     lengths: tuple[int, ...],
     logits_row_stride: int,
     device: Any,
+    top_k: int,
 ) -> _Operands:
-    batch_size = len(lengths)
-    logits = torch.empty((batch_size, logits_row_stride), dtype=torch.float32, device=device)
+    num_rows = len(lengths)
+    logits = torch.empty((num_rows, logits_row_stride), dtype=torch.float32, device=device)
     # Use one deterministic production-like row template. A million-point
     # linspace has ~2e-6 spacing and is a pathological radix-selection input;
     # value-set comparison below already handles the rare random tie.
@@ -86,8 +97,9 @@ def _build_operands(
     return _Operands(
         logits=logits,
         lengths=torch.tensor(lengths, dtype=torch.int32, device=device),
-        indices=torch.empty((batch_size, _TOP_K), dtype=torch.int32, device=device),
+        indices=torch.empty((num_rows, top_k), dtype=torch.int32, device=device),
         workspace=torch.empty(_WORKSPACE_BYTES, dtype=torch.uint8, device=device),
+        top_k=top_k,
     )
 
 
@@ -97,7 +109,7 @@ def _launch(public_op: Any, operands: _Operands, max_seq_len: int) -> None:
         operands.lengths,
         operands.indices,
         operands.workspace,
-        _TOP_K,
+        operands.top_k,
         max_seq_len,
     )
 
@@ -106,7 +118,7 @@ def _check_output(torch: Any, operands: _Operands) -> None:
     sampled_rows = sorted({0, len(operands.lengths) // 2, len(operands.lengths) - 1})
     for row in sampled_rows:
         length = int(operands.lengths[row].item())
-        selected_count = min(length, _TOP_K)
+        selected_count = min(length, operands.top_k)
         if selected_count == 0:
             continue
         actual = operands.indices[row, :selected_count].long()
@@ -153,11 +165,13 @@ def profile_dsa_persistent_topk_decode_vllm_fork_cuda(
         if not torch.cuda.is_available():
             raise ProfilerNotImplemented(f"{_BACKEND} requires CUDA")
         device = torch.device("cuda", torch.cuda.current_device())
-        if torch.cuda.get_device_name(device) != _GPU_NAME:
-            raise ProfilerNotImplemented(f"{_BACKEND} requires {_GPU_NAME}")
         public_op = torch.ops._C.persistent_topk
         operands = _build_operands(
-            torch, lengths=lengths, logits_row_stride=logits_row_stride, device=device
+            torch,
+            lengths=lengths,
+            logits_row_stride=logits_row_stride,
+            device=device,
+            top_k=top_k,
         )
         max_seq_len = max(lengths)
 
@@ -169,7 +183,8 @@ def profile_dsa_persistent_topk_decode_vllm_fork_cuda(
         _check_output(torch, operands)
         time_ms = Timer.cupti(launch, kernel_name=None)
         energy_j = Energy.perf(launch, per_iter_time_ms=time_ms)
-        logical_bytes = 4 * sum(lengths) + 4 * batch_size + 4 * batch_size * _TOP_K
+        num_rows = len(lengths)
+        logical_bytes = 4 * sum(lengths) + 4 * num_rows + 4 * num_rows * top_k
         elapsed_seconds = time_ms / 1000.0
         return ComputeMetrics(
             time_ms=float(time_ms),

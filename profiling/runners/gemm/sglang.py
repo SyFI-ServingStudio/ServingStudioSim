@@ -24,9 +24,11 @@ def _require_sm100(backend: str) -> None:
 
     if not torch.cuda.is_available():
         raise ProfilerNotImplemented(f"CUDA is required for the {backend} backend")
-    if tuple(torch.cuda.get_device_capability()) != (10, 0):
+    # SGLang's `initialize_bf16_gemm_config` resolves `auto` to cutedsl when
+    # `is_sm100_supported()`: compute capability major 10, the whole SM10x family.
+    if torch.cuda.get_device_capability()[0] != 10:
         raise ProfilerNotImplemented(
-            "SGLang resolves `bf16_gemm_backend='auto'` to cutedsl only on SM100"
+            "SGLang resolves `bf16_gemm_backend='auto'` to cutedsl only on SM10x"
         )
 
 

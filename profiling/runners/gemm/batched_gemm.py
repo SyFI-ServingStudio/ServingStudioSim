@@ -23,18 +23,17 @@ from profiling.profilers.timer import Timer
 from profiling.runners.exceptions import KernelLaunchFailed, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
 
-# Per-rank head counts of 64 q heads at validated TP degrees
-# (TP1/2/4/8). The timed op is a plain torch.bmm over the head axis, so a
-# new degree only needs its per-rank count added here.
-_SUPPORTED_HEAD_COUNTS = frozenset({8, 16, 32, 64})
+# The timed op is a plain torch.bmm over the head axis, so any positive
+# per-rank head count launches. The padded V-up layout is the exception: it
+# slices its LHS out of an attention output allocated with a 64-head stride
+# (_PADDED_HEADS), so that layout holds at most 64 heads.
 _SUPPORTED_DTYPE = DType.BF16
-_SUPPORTED_GPUS = frozenset({"NVIDIA H200", "NVIDIA B200"})
 _Q_HEAD_WIDTH = 256
 _QK_NOPE_HEAD_DIM = 192
 _KV_LORA_RANK = 512
 _V_HEAD_DIM = 256
 _PACKED_HEAD_WIDTH = _QK_NOPE_HEAD_DIM + _V_HEAD_DIM
-_H200_PADDED_HEADS = 64
+_PADDED_HEADS = 64
 
 
 @dataclass(frozen=True)
@@ -54,7 +53,6 @@ _NO_ROPE_UNPADDED_LAYOUT = _MlaLayout(
     kv_lora_rank=512,
     padded_heads=None,
 )
-_NO_ROPE_UNPADDED_GPUS = frozenset({"NVIDIA B200"})
 
 
 @dataclass(frozen=True)
@@ -95,11 +93,6 @@ def _validate_args(
             "num_batches, m, n, and k must be > 0, got "
             f"num_batches={num_batches}, m={m}, n={n}, k={k}"
         )
-    if num_batches not in _SUPPORTED_HEAD_COUNTS:
-        raise ValueError(
-            f"torch_mla_q_absorb supports num_batches in {sorted(_SUPPORTED_HEAD_COUNTS)}, "
-            f"got {num_batches}"
-        )
     if (k, n) != (_QK_NOPE_HEAD_DIM, _KV_LORA_RANK):
         raise ValueError(f"torch_mla_q_absorb requires (k, n) == (192, 512), got ({k}, {n})")
     if dtype is not _SUPPORTED_DTYPE:
@@ -110,11 +103,6 @@ def _validate_args(
 def _validate_cuda_device(torch: Any) -> None:
     if not torch.cuda.is_available():
         raise ProfilerNotImplemented("CUDA is required for the torch_mla_q_absorb backend")
-    gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
-    if gpu_name not in _SUPPORTED_GPUS:
-        raise ProfilerNotImplemented(
-            f"torch_mla_q_absorb is verified only on {sorted(_SUPPORTED_GPUS)}, got {gpu_name}"
-        )
 
 
 def _validate_v_up_args(
@@ -135,10 +123,10 @@ def _validate_v_up_args(
             "num_batches, m, n, and k must be > 0, got "
             f"num_batches={num_batches}, m={m}, n={n}, k={k}"
         )
-    if num_batches not in _SUPPORTED_HEAD_COUNTS:
+    if num_batches > _PADDED_HEADS:
         raise ValueError(
-            f"torch_mla_v_up supports num_batches in {sorted(_SUPPORTED_HEAD_COUNTS)}, "
-            f"got {num_batches}"
+            f"torch_mla_v_up pads the attention output to {_PADDED_HEADS} heads, "
+            f"so num_batches must be <= {_PADDED_HEADS}, got {num_batches}"
         )
     if (k, n) != (_KV_LORA_RANK, _V_HEAD_DIM):
         raise ValueError(f"torch_mla_v_up requires (k, n) == (512, 256), got ({k}, {n})")
@@ -150,11 +138,6 @@ def _validate_v_up_args(
 def _validate_v_up_cuda_device(torch: Any) -> None:
     if not torch.cuda.is_available():
         raise ProfilerNotImplemented("CUDA is required for the torch_mla_v_up backend")
-    gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
-    if gpu_name not in _SUPPORTED_GPUS:
-        raise ProfilerNotImplemented(
-            f"torch_mla_v_up is verified only on {sorted(_SUPPORTED_GPUS)}, got {gpu_name}"
-        )
 
 
 def _build_q_absorb_operands(
@@ -213,7 +196,7 @@ def _build_v_up_operands(
 ) -> _VUpOperands:
     """Allocate vLLM's padded/interleaved V-up operands."""
     attention_base = torch.randn(
-        (m, _H200_PADDED_HEADS, _KV_LORA_RANK),
+        (m, _PADDED_HEADS, _KV_LORA_RANK),
         dtype=torch_dtype,
         device=device,
     )
@@ -300,7 +283,7 @@ def profile_mla_q_absorb(
             torch.bmm(operands.lhs, operands.rhs, out=operands.out)
 
         # NvJet names vary by shape, so the callable is intentionally
-        # unfiltered. On the verified Torch 2.10/H200 stack it launches one BMM.
+        # unfiltered. On the Torch 2.10/H200 stack it was observed to launch one BMM.
         time_ms = Timer.cupti(kernel)
         energy_j = Energy.perf(
             kernel,
@@ -357,7 +340,7 @@ def profile_mla_v_up(
             torch.bmm(operands.lhs, operands.rhs, out=operands.out)
 
         # The upstream head-padding copy and all metadata views are outside this
-        # callable. NvJet names vary; the verified Torch/H200 path launches one BMM.
+        # callable. NvJet names vary; the Torch/H200 path was observed to launch one BMM.
         time_ms = Timer.cupti(kernel)
         energy_j = Energy.perf(
             kernel,
@@ -440,10 +423,6 @@ def _validate_layout_args(
             "num_batches, m, n, and k must be > 0, got "
             f"num_batches={num_batches}, m={m}, n={n}, k={k}"
         )
-    if num_batches not in _SUPPORTED_HEAD_COUNTS:
-        raise ValueError(
-            f"{backend} supports num_batches in {sorted(_SUPPORTED_HEAD_COUNTS)}, got {num_batches}"
-        )
     if (k, n) != expected_kn:
         raise ValueError(f"{backend} requires (k, n) == {expected_kn}, got ({k}, {n})")
     if dtype is not _SUPPORTED_DTYPE:
@@ -467,11 +446,6 @@ def _profile_layout_bmm(
         raise ProfilerNotImplemented(f"torch is required for the {backend} backend") from exc
     if not torch.cuda.is_available():
         raise ProfilerNotImplemented(f"CUDA is required for the {backend} backend")
-    gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
-    if gpu_name not in _NO_ROPE_UNPADDED_GPUS:
-        raise ProfilerNotImplemented(
-            f"{backend} is verified only on {sorted(_NO_ROPE_UNPADDED_GPUS)}, got {gpu_name}"
-        )
     try:
         operands = build(
             torch, layout, num_batches=num_batches, m=m, torch_dtype=dtype.torch(), device="cuda"

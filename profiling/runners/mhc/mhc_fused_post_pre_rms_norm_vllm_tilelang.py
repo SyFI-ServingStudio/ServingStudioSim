@@ -9,13 +9,12 @@ from profiling.profilers.timer import Timer
 from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
 from profiling.runners.mhc._common import (
-    BOUNDARY_GPUS,
     HC_EPS,
-    HIDDEN_SIZE,
     POST_MULTIPLIER,
     RMS_EPS,
     SINKHORN_ITERATIONS,
     CommonInputs,
+    Shape,
     assert_outputs_close,
     bandwidth_gbps,
     hidden_bytes,
@@ -23,7 +22,7 @@ from profiling.runners.mhc._common import (
     pre_weight_bytes,
     prepare_common,
     reference_pre,
-    require_gpu,
+    require_cuda,
     residual_bytes,
     validate_args,
 )
@@ -60,14 +59,14 @@ class _Launch:
         )
 
 
-def _logical_bytes(num_tokens: int) -> int:
+def _logical_bytes(shape: Shape) -> int:
     """Read the layer output, the streams, the previous mixes and the weights
     once; write the updated streams, the next mixes and the next block input."""
     return (
-        2 * residual_bytes(num_tokens)
-        + 2 * mix_bytes(num_tokens)
-        + 2 * hidden_bytes(num_tokens)
-        + pre_weight_bytes()
+        2 * residual_bytes(shape)
+        + 2 * mix_bytes(shape)
+        + 2 * hidden_bytes(shape)
+        + pre_weight_bytes(shape)
     )
 
 
@@ -90,9 +89,9 @@ def profile_mhc_fused_post_pre_rms_norm_vllm_tilelang(
         raise ProfilerNotImplemented(f"{_KIND} requires pinned vLLM and TileLang") from exc
 
     try:
-        require_gpu(torch, _KIND, BOUNDARY_GPUS)
+        require_cuda(torch, _KIND)
         inputs = prepare_common(torch, shape)
-        x = torch.randn((shape.num_tokens, HIDDEN_SIZE), dtype=torch.bfloat16).cuda()
+        x = torch.randn((shape.num_tokens, shape.hidden_size), dtype=torch.bfloat16).cuda()
         post_mix, comb_mix, _ = reference_pre(torch, inputs)
         launch = _Launch(mhc_fused_post_pre_tilelang, x, post_mix, comb_mix, inputs)
         expected_residual = mhc_post_torch(x, inputs.residual, post_mix, comb_mix)
@@ -119,7 +118,7 @@ def profile_mhc_fused_post_pre_rms_norm_vllm_tilelang(
     return ComputeMetrics(
         time_ms=float(time_ms),
         tflops=0.0,
-        memory_bandwidth_gbps=bandwidth_gbps(_logical_bytes(shape.num_tokens), time_ms),
+        memory_bandwidth_gbps=bandwidth_gbps(_logical_bytes(shape), time_ms),
         energy_j=float(energy_j),
     )
 

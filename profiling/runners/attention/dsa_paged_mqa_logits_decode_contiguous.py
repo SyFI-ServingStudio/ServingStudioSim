@@ -10,12 +10,13 @@ from typing import Any
 
 from profiling.profilers.energy import Energy
 from profiling.profilers.timer import Timer
+from profiling.runners.attention.dsa_paged_mqa_logits_decode import (
+    _validate_deepgemm_cuda_device,
+)
 from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
 
 _BACKEND = "dsa_paged_mqa_logits_decode:deepgemm_fp8"
-_GPU_NAME = "NVIDIA H200"
-_MEASURED_SHAPE = (1, 64, 128, 64)
 _STORAGE_IDENTITY = (
     "fp8_e4m3",
     "fp8_e4m3",
@@ -27,9 +28,7 @@ _STORAGE_IDENTITY = (
     "fp8_e4m3_ue8m0",
     False,
 )
-_CACHE_ROW_BYTES = 132
 _PAGE_ALIGNMENT = 576
-_H200_SMS = 132
 
 
 @dataclass(frozen=True)
@@ -71,11 +70,16 @@ def _validate_args(
     cache_format: str,
     clean_logits: bool,
 ) -> tuple[int, ...]:
-    integer_identity = (next_n, num_heads, head_dim, block_size)
-    if integer_identity != _MEASURED_SHAPE:
-        raise ProfilerNotImplemented(
-            f"{_BACKEND} supports (next_n, num_heads, head_dim, block_size) = {_MEASURED_SHAPE}"
-        )
+    # Operands, reference and accounting are parametric in these; DeepGEMM's
+    # per-arch launch bounds are checked against the device.
+    for name, value in (
+        ("next_n", next_n),
+        ("num_heads", num_heads),
+        ("head_dim", head_dim),
+        ("block_size", block_size),
+    ):
+        if type(value) is not int or value < 1:
+            raise ValueError(f"{name} must be a positive int")
     storage_identity = (
         str(q_dtype),
         str(cache_dtype),
@@ -93,8 +97,8 @@ def _validate_args(
         raise ValueError("batch_size must be a positive int")
     if type(context_len) is not int or context_len < 1:
         raise ValueError("context_len must be a positive int")
-    if type(max_model_len) is not int or not context_len <= max_model_len <= 1_048_576:
-        raise ProfilerNotImplemented(f"{_BACKEND} requires context_len <= max_model_len <= 1048576")
+    if type(max_model_len) is not int or max_model_len < context_len:
+        raise ValueError("max_model_len must be an int >= context_len")
     return _max_ragged_context_lengths(batch_size, context_len)
 
 
@@ -186,7 +190,14 @@ def _build_operands(
         torch.float8_e4m3fn
     )
     weights = _stable_values(torch, (batch_size * next_n, num_heads), 9, device) / 4.0
-    context_lens = torch.tensor(context_lengths, dtype=torch.int32, device=device).unsqueeze(1)
+    # Every next_n row of a request sees the request's context, as in the
+    # uniform-layout runner.
+    context_lens = (
+        torch.tensor(context_lengths, dtype=torch.int32, device=device)
+        .unsqueeze(1)
+        .expand(batch_size, next_n)
+        .contiguous()
+    )
     return _Operands(
         q=q,
         cache=cache,
@@ -213,18 +224,22 @@ def _launch(public_op: Any, operands: _Operands, schedule_metadata: Any, max_mod
 
 
 def _expected_logits_row(torch: Any, operands: _Operands, request_index: int) -> Any:
+    """Torch logits of the request's first next_n row."""
+    _batch, next_n, _heads, head_dim = operands.q.shape
+    block_size = operands.key_view.shape[1]
     context_len = int(operands.context_lens[request_index, 0].item())
-    page_count = (context_len + 63) // 64
+    page_count = (context_len + block_size - 1) // block_size
     blocks = operands.block_table[request_index, :page_count].long()
-    keys = operands.key_view.index_select(0, blocks).reshape(-1, 128)[:context_len].float()
+    keys = operands.key_view.index_select(0, blocks).reshape(-1, head_dim)[:context_len].float()
     scales = operands.scale_view.index_select(0, blocks).reshape(-1)[:context_len]
     per_head = operands.q[request_index, 0].float() @ keys.T
-    return (per_head.relu() * operands.weights[request_index, :, None]).sum(dim=0) * scales
+    weights = operands.weights[request_index * next_n, :, None]
+    return (per_head.relu() * weights).sum(dim=0) * scales
 
 
 def _check_output(torch: Any, actual: Any, operands: _Operands, max_model_len: int) -> None:
-    batch_size = operands.q.shape[0]
-    if actual.dtype != torch.float32 or actual.shape != (batch_size, max_model_len):
+    batch_size, next_n = operands.q.shape[:2]
+    if actual.dtype != torch.float32 or actual.shape != (batch_size * next_n, max_model_len):
         raise KernelLaunchFailed(f"{_BACKEND} returned the wrong output shape or dtype")
     sampled_requests = sorted({0, batch_size // 2, batch_size - 1})
     for request_index in sampled_requests:
@@ -233,7 +248,7 @@ def _check_output(torch: Any, actual: Any, operands: _Operands, max_model_len: i
         sampled_columns = sorted({0, context_len // 2, context_len - 1})
         columns = torch.tensor(sampled_columns, dtype=torch.int64, device=actual.device)
         torch.testing.assert_close(
-            actual[request_index].index_select(0, columns),
+            actual[request_index * next_n].index_select(0, columns),
             expected.index_select(0, columns),
             atol=2e-4,
             rtol=2e-4,
@@ -288,13 +303,10 @@ def profile_contiguous_deepgemm_fp8(
     try:
         if not torch.cuda.is_available():
             raise ProfilerNotImplemented(f"{_BACKEND} requires CUDA")
+        num_sms = _validate_deepgemm_cuda_device(
+            torch, num_heads=num_heads, head_dim=head_dim, block_size=block_size, next_n=next_n
+        )
         device = torch.device("cuda", torch.cuda.current_device())
-        if (
-            torch.cuda.get_device_name(device) != _GPU_NAME
-            or tuple(torch.cuda.get_device_capability(device)) != (9, 0)
-            or torch.cuda.get_device_properties(device).multi_processor_count != _H200_SMS
-        ):
-            raise ProfilerNotImplemented(f"{_BACKEND} requires the 132-SM {_GPU_NAME}")
         operands = _build_operands(
             torch,
             context_lengths=context_lengths,
@@ -306,7 +318,7 @@ def profile_contiguous_deepgemm_fp8(
         )
         # Production builds scheduler metadata before entering the public op.
         schedule_metadata = get_paged_mqa_logits_metadata(
-            operands.context_lens, block_size=block_size, num_sms=_H200_SMS
+            operands.context_lens, block_size=block_size, num_sms=num_sms
         )
 
         def launch() -> Any:
@@ -320,14 +332,14 @@ def profile_contiguous_deepgemm_fp8(
         # DeepGEMM schedules complete cache blocks even for each ragged tail.
         # Report the same block-rounded work as the timed callable rather than
         # presenting only mathematically valid rows as the hardware workload.
-        scheduled_tokens = sum(_round_up(length, block_size) for length in context_lengths)
+        scheduled_tokens = next_n * sum(_round_up(length, block_size) for length in context_lengths)
         nominal_flops = 2 * scheduled_tokens * num_heads * head_dim
         logical_bytes = (
             batch_size * next_n * num_heads * head_dim
             + batch_size * next_n * num_heads * 4
-            + scheduled_tokens * _CACHE_ROW_BYTES
+            + scheduled_tokens * (head_dim + 4)
             + batch_size * ((context_len + block_size - 1) // block_size) * 4
-            + batch_size * 4
+            + batch_size * next_n * 4
             + scheduled_tokens * 4
         )
         elapsed_seconds = time_ms / 1000.0

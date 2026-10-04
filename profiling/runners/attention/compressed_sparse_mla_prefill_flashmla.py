@@ -10,9 +10,15 @@ from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerN
 from profiling.runners.metrics import ComputeMetrics
 
 _BACKEND = "compressed_sparse_mla_prefill:vllm_flashmla_bf16"
-_GPU_NAME = "NVIDIA H200"
-_MODEL_IDENTITY = (4, 128, 64, 1, 512, 512)
-_SOFTMAX_SCALE = 1.0 / math.sqrt(512)
+# FlashMLA sparse prefill (csrc/api/sparse_fwd.h at vLLM's pinned 6bc4941):
+# h_q 64 or 128, d_v 512, MQA indices; the bf16 d512 request-slot cache this
+# runner builds fixes d_qk = 512. SM90 asserts topk % (2 * B_TOPK) == 0 with
+# B_TOPK 64 (sm90/prefill/sparse/phase1.cuh), so the padded index width is a
+# multiple of 128. It runs only on SM90a and SM100f.
+_NUM_HEADS = frozenset({64, 128})
+_CACHE_SHAPE = (1, 512, 512)
+_DIM = 512
+_TOPK_ALIGNMENT = 128
 _STORAGE_IDENTITY = (
     "bf16",
     "bf16",
@@ -30,6 +36,10 @@ class _Shape:
     ratio: int
     selected_k: int
     padded_topk: int
+    window: int
+    chunk_requests: int
+    num_heads: int
+    softmax_scale: float
 
     @property
     def num_queries(self) -> int:
@@ -41,7 +51,7 @@ class _Shape:
 
     @property
     def request_slot_size(self) -> int:
-        return self.compressed_capacity + 128 + self.max_num_batched_tokens
+        return self.compressed_capacity + self.window + self.max_num_batched_tokens
 
 
 @dataclass(frozen=True)
@@ -51,6 +61,7 @@ class _Operands:
     indices: Any
     valid_lengths: Any
     output: Any
+    softmax_scale: float
 
 
 def _validate_args(
@@ -73,8 +84,8 @@ def _validate_args(
     output_dtype: object,
     cache_layout: str,
 ) -> _Shape:
-    if not query_context_pairs or len(query_context_pairs) > 64:
-        raise ProfilerNotImplemented(f"{_BACKEND} supports 1..64 requests")
+    if not query_context_pairs:
+        raise ValueError("query_context_pairs must hold at least one request")
     for pair in query_context_pairs:
         if (
             not isinstance(pair, tuple)
@@ -86,38 +97,42 @@ def _validate_args(
         if query <= 0 or context < query:
             raise ValueError("each pair must satisfy 0 < query <= context")
     total_queries = sum(query for query, _ in query_context_pairs)
-    if type(max_model_len) is not int or not 1 <= max_model_len <= 1_048_576:
-        raise ProfilerNotImplemented(f"{_BACKEND} supports max_model_len <= 1048576")
+    if type(max_model_len) is not int or max_model_len <= 0:
+        raise ValueError("max_model_len must be a positive integer")
     if max(context for _, context in query_context_pairs) > max_model_len:
         raise ValueError("context length exceeds max_model_len")
-    if (
-        type(max_num_batched_tokens) is not int
-        or not total_queries <= max_num_batched_tokens <= 32768
+    if type(max_num_batched_tokens) is not int or max_num_batched_tokens < total_queries:
+        raise ValueError("max_num_batched_tokens must cover all query tokens")
+    for name, value in (
+        ("prefill_chunk_size", prefill_chunk_size),
+        ("window_size", window_size),
+        ("compress_ratio", compress_ratio),
     ):
-        raise ValueError("max_num_batched_tokens must cover all query tokens and be <=32768")
-    model_identity = (
-        prefill_chunk_size,
-        window_size,
-        num_heads,
-        num_kv_heads,
-        head_dim,
-        value_dim,
-    )
-    if model_identity != _MODEL_IDENTITY:
+        if type(value) is not int or value <= 0:
+            raise ValueError(f"{name} must be a positive integer, got {value!r}")
+    if num_heads not in _NUM_HEADS:
         raise ProfilerNotImplemented(
-            f"{_BACKEND} supports model identity {_MODEL_IDENTITY}, got {model_identity}"
+            f"{_BACKEND} needs num_heads in {sorted(_NUM_HEADS)}, got {num_heads}"
         )
-    if not math.isclose(softmax_scale, _SOFTMAX_SCALE, rel_tol=0.0, abs_tol=1e-15):
+    cache_shape = (num_kv_heads, head_dim, value_dim)
+    if cache_shape != _CACHE_SHAPE:
         raise ProfilerNotImplemented(
-            f"{_BACKEND} requires softmax_scale={_SOFTMAX_SCALE}, got {softmax_scale}"
+            f"{_BACKEND} needs (num_kv_heads, head_dim, value_dim) == {_CACHE_SHAPE}, "
+            f"got {cache_shape}"
         )
-    if compress_ratio not in (1, 4, 128):
-        raise ProfilerNotImplemented(f"{_BACKEND} supports compress_ratio=1/4/128")
-    expected_selected_k = 0 if compress_ratio == 1 else 512
-    if selected_k != expected_selected_k:
-        raise ProfilerNotImplemented(
-            f"{_BACKEND} requires selected_k={expected_selected_k} for C{compress_ratio}"
-        )
+    # softmax_scale is a runtime scalar; it never changes the launch.
+    if (
+        type(softmax_scale) not in {int, float}
+        or not math.isfinite(softmax_scale)
+        or softmax_scale <= 0
+    ):
+        raise ValueError(f"softmax_scale must be a positive finite number, got {softmax_scale!r}")
+    # An SWA-only layer (C1) has no compressed top-k; a compressed layer has one.
+    if compress_ratio == 1:
+        if selected_k != 0:
+            raise ValueError("compress_ratio=1 requires selected_k=0")
+    elif type(selected_k) is not int or selected_k <= 0:
+        raise ValueError(f"C{compress_ratio} needs a positive selected_k, got {selected_k!r}")
     if selected_index_pattern != "request_local_topk_plus_swa":
         raise ProfilerNotImplemented(
             f"{_BACKEND} supports request_local_topk_plus_swa selected indices"
@@ -133,7 +148,9 @@ def _validate_args(
         raise ProfilerNotImplemented(
             f"{_BACKEND} supports storage identity {_STORAGE_IDENTITY}, got {storage_identity}"
         )
-    padded_topk = 128 if compress_ratio == 1 else 640
+    # vLLM's index width (vllm/models/deepseek_v4/nvidia/flashmla.py):
+    # round_up(top_k + window_size, 128), 128 or 640 for DeepSeek V4.
+    padded_topk = -(-(selected_k + window_size) // _TOPK_ALIGNMENT) * _TOPK_ALIGNMENT
     return _Shape(
         query_context_pairs,
         max_model_len,
@@ -141,20 +158,28 @@ def _validate_args(
         compress_ratio,
         selected_k,
         padded_topk,
+        window_size,
+        prefill_chunk_size,
+        num_heads,
+        float(softmax_scale),
     )
 
 
 def _chunks(shape: _Shape) -> tuple[_Shape, ...]:
     return tuple(
         _Shape(
-            shape.pairs[start : start + 4],
+            shape.pairs[start : start + shape.chunk_requests],
             shape.max_model_len,
             shape.max_num_batched_tokens,
             shape.ratio,
             shape.selected_k,
             shape.padded_topk,
+            shape.window,
+            shape.chunk_requests,
+            shape.num_heads,
+            shape.softmax_scale,
         )
-        for start in range(0, len(shape.pairs), 4)
+        for start in range(0, len(shape.pairs), shape.chunk_requests)
     )
 
 
@@ -171,7 +196,7 @@ def _build_indices(torch: Any, shape: _Shape, device: Any) -> tuple[Any, Any]:
             compressed_available,
             torch.full_like(compressed_available, shape.selected_k),
         )
-        swa_lengths = torch.minimum(positions + 1, torch.full_like(positions, 128))
+        swa_lengths = torch.minimum(positions + 1, torch.full_like(positions, shape.window))
         rows = indices[query_base : query_base + query_count]
         request_offset = request * shape.request_slot_size
         if shape.selected_k:
@@ -189,9 +214,9 @@ def _build_indices(torch: Any, shape: _Shape, device: Any) -> tuple[Any, Any]:
                     -1,
                 ).to(torch.int32)
             )
-        gather_len = query_count + min(context - query_count, 127)
+        gather_len = query_count + min(context - query_count, shape.window - 1)
         gather_start = context - gather_len
-        offsets = torch.arange(128, dtype=torch.int64, device=device)
+        offsets = torch.arange(shape.window, dtype=torch.int64, device=device)
         columns = compressed_lengths[:, None] + offsets[None, :]
         swa_values = (
             request_offset
@@ -216,20 +241,24 @@ def _build_indices(torch: Any, shape: _Shape, device: Any) -> tuple[Any, Any]:
 
 def _build_operands(torch: Any, shape: _Shape, device: Any) -> _Operands:
     indices, valid_lengths = _build_indices(torch, shape, device)
-    feature = torch.linspace(-0.5, 0.5, 512, dtype=torch.float32, device=device)
+    feature = torch.linspace(-0.5, 0.5, _DIM, dtype=torch.float32, device=device)
     query_rows = torch.arange(shape.num_queries, dtype=torch.float32, device=device)
-    heads = torch.arange(64, dtype=torch.float32, device=device)
+    heads = torch.arange(shape.num_heads, dtype=torch.float32, device=device)
     q = (
         feature[None, None, :] + query_rows[:, None, None] / 8192.0 + heads[None, :, None] / 2048.0
     ).to(torch.bfloat16)
-    cache = torch.zeros((4 * shape.request_slot_size, 1, 512), dtype=torch.bfloat16, device=device)
+    cache = torch.zeros(
+        (shape.chunk_requests * shape.request_slot_size, 1, _DIM),
+        dtype=torch.bfloat16,
+        device=device,
+    )
     selected_rows = torch.unique(indices[indices >= 0].to(torch.int64))
     for start in range(0, selected_rows.numel(), 4096):
         rows = selected_rows[start : start + 4096]
         values = feature[None, :] + rows.float().remainder(257)[:, None] / 512.0
         cache[rows, 0] = values.to(torch.bfloat16)
     output = torch.empty_like(q)
-    return _Operands(q, cache, indices, valid_lengths, output)
+    return _Operands(q, cache, indices, valid_lengths, output, shape.softmax_scale)
 
 
 def _launch(flash_mla_sparse_fwd: Any, operands: _Operands) -> Any:
@@ -237,8 +266,8 @@ def _launch(flash_mla_sparse_fwd: Any, operands: _Operands) -> Any:
         q=operands.q,
         kv=operands.cache,
         indices=operands.indices,
-        sm_scale=512**-0.5,
-        d_v=512,
+        sm_scale=operands.softmax_scale,
+        d_v=_DIM,
         attn_sink=None,
         topk_length=operands.valid_lengths,
         out=operands.output,
@@ -252,7 +281,7 @@ def _reference_rows(torch: Any, operands: _Operands, rows: tuple[int, ...]) -> A
         selected = operands.indices[row, 0, :length].to(torch.int64)
         cache = operands.cache[selected, 0].float()
         scores = torch.einsum("hd,kd->hk", operands.q[row].float(), cache)
-        probabilities = torch.softmax(scores * (512**-0.5), dim=-1)
+        probabilities = torch.softmax(scores * operands.softmax_scale, dim=-1)
         expected.append(torch.einsum("hk,kd->hd", probabilities, cache).to(torch.bfloat16))
     return torch.stack(expected)
 
@@ -278,14 +307,16 @@ def _logical_work(operands: tuple[_Operands, ...]) -> tuple[int, int]:
     queries = sum(chunk.q.shape[0] for chunk in operands)
     valid_pairs = sum(int(chunk.valid_lengths.sum().item()) for chunk in operands)
     padded_pairs = sum(chunk.indices.shape[0] * chunk.indices.shape[-1] for chunk in operands)
-    flops = 2 * 64 * valid_pairs * (512 + 512)
+    query_heads = sum(chunk.q.shape[0] * chunk.q.shape[1] for chunk in operands)
+    head_pairs = sum(int(chunk.valid_lengths.sum().item()) * chunk.q.shape[1] for chunk in operands)
+    flops = 2 * head_pairs * (_DIM + _DIM)
     logical_bytes = (
-        2 * queries * 64 * 512
+        2 * query_heads * _DIM
         + 4 * padded_pairs
         + 4 * queries
-        + 2 * valid_pairs * 512
-        + 2 * queries * 64 * 512
-        + 8 * queries * 64
+        + 2 * valid_pairs * _DIM
+        + 2 * query_heads * _DIM
+        + 8 * query_heads
     )
     return flops, logical_bytes
 
@@ -339,10 +370,10 @@ def profile_compressed_sparse_mla_prefill_flashmla(
         if not torch.cuda.is_available():
             raise ProfilerNotImplemented(f"{_BACKEND} requires CUDA")
         device = torch.device("cuda", torch.cuda.current_device())
-        if str(torch.cuda.get_device_name(device)) != _GPU_NAME or tuple(
-            torch.cuda.get_device_capability(device)
-        ) != (9, 0):
-            raise ProfilerNotImplemented(f"{_BACKEND} requires {_GPU_NAME} SM90")
+        capability = tuple(torch.cuda.get_device_capability(device))
+        # FlashMLA's Arch::is_sm90a() / is_sm100f(): exactly SM90, or any SM10x.
+        if capability != (9, 0) and capability[0] != 10:
+            raise ProfilerNotImplemented(f"{_BACKEND} requires SM90a or SM100f, got SM{capability}")
         operands = tuple(_build_operands(torch, chunk, device) for chunk in _chunks(shape))
         for chunk in operands:
             _check_output(torch, flash_mla_sparse_fwd, chunk)
@@ -350,8 +381,8 @@ def profile_compressed_sparse_mla_prefill_flashmla(
         def run() -> tuple[Any, ...]:
             return tuple(_launch(flash_mla_sparse_fwd, chunk) for chunk in operands)
 
-        # One semantic prefill slot owns ceil(num_requests / 4) ordered physical
-        # FlashMLA launches, matching the public model loop.
+        # One semantic prefill slot owns ceil(num_requests / prefill_chunk_size)
+        # ordered physical FlashMLA launches, matching the public model loop.
         time_ms = Timer.cupti(run, kernel_name=None)
         energy_j = Energy.perf(run, per_iter_time_ms=time_ms)
         flops, logical_bytes = _logical_work(operands)

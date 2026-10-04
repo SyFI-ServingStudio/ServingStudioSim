@@ -1,5 +1,6 @@
 """Profile the public DeepSeek V4 indexer-compressor tail."""
 
+import math
 from types import SimpleNamespace
 from typing import Any
 
@@ -21,7 +22,23 @@ from profiling.runners.exceptions import (
 from profiling.runners.metrics import ComputeMetrics
 
 _BACKEND = "kv_compress_store:vllm_triton"
-_GPU_NAME = "NVIDIA H200"
+# compress_norm_rope_store_triton stores tl.float8e4nv, which Triton lowers
+# only on SM89+.
+_MIN_CAPABILITY = (8, 9)
+# The fp8_indexer cache row (128 fp8 + one fp32 scale) fixes the C4 indexer's
+# single 128-wide KV head with a 64-wide RoPE tail. The indexer exists only on
+# C4 layers.
+_IDENTITY = (
+    4,
+    1,
+    128,
+    64,
+    "fp32",
+    "bf16",
+    "fp8_indexer",
+    "block_segregated_data_then_scales",
+    "fp32_per_token",
+)
 
 
 def _validate_args(
@@ -42,8 +59,6 @@ def _validate_args(
 ) -> _Shape:
     if not row_positions or len(row_positions) != len(row_request_ids):
         raise ValueError("row_positions and row_request_ids must be non-empty equal tuples")
-    if len(row_positions) > 8192:
-        raise ProfilerNotImplemented(f"{_BACKEND} supports at most 8192 token rows")
     if any(type(position) is not int or position < 0 for position in row_positions):
         raise ValueError("row_positions must contain non-negative integers")
     if any(type(request) is not int or request < 0 for request in row_request_ids):
@@ -51,36 +66,25 @@ def _validate_args(
     request_count = max(row_request_ids) + 1
     if set(row_request_ids) != set(range(request_count)):
         raise ValueError("row_request_ids must densely cover [0, num_requests)")
-    if request_count > 64:
-        raise ProfilerNotImplemented(f"{_BACKEND} supports at most 64 requests")
     identity = (
         compress_ratio,
         num_kv_heads,
         head_dim,
         rope_head_dim,
-        logical_block_size,
-        rms_eps,
         str(state_dtype),
         str(norm_dtype),
         cache_dtype,
         cache_layout,
         scale_format,
     )
-    expected = (
-        4,
-        1,
-        128,
-        64,
-        256,
-        1.0e-6,
-        "fp32",
-        "bf16",
-        "fp8_indexer",
-        "block_segregated_data_then_scales",
-        "fp32_per_token",
-    )
-    if identity != expected:
-        raise ProfilerNotImplemented(f"{_BACKEND} supports identity {expected}, got {identity}")
+    if identity != _IDENTITY:
+        raise ProfilerNotImplemented(f"{_BACKEND} supports identity {_IDENTITY}, got {identity}")
+    # The store reads tokens per page from kv_cache.shape[1].
+    if type(logical_block_size) is not int or logical_block_size <= 0 or logical_block_size % 4:
+        raise ValueError("logical_block_size must be a positive multiple of compress_ratio=4")
+    # rms_eps is a runtime scalar; it never changes the launch.
+    if type(rms_eps) not in {int, float} or not math.isfinite(rms_eps) or rms_eps <= 0:
+        raise ValueError(f"rms_eps must be a positive finite number, got {rms_eps!r}")
     required_width = max(position // 4 + 1 for position in row_positions)
     if state_block_table_width < required_width:
         raise ValueError("state_block_table_width does not cover row_positions")
@@ -91,7 +95,7 @@ def _validate_args(
         4,
         512,
         4,
-        64,
+        logical_block_size // 4,
         head_dim=128,
         rope_head_dim=64,
         cache_row_bytes=132,
@@ -99,16 +103,17 @@ def _validate_args(
         scale_dim=4,
         quant_block=128,
         page_alignment=576,
+        rms_eps=float(rms_eps),
     )
 
 
-def _require_h200(torch: Any) -> Any:
+def _require_fp8_gpu(torch: Any) -> Any:
     if not torch.cuda.is_available():
         raise ProfilerNotImplemented(f"{_BACKEND} requires CUDA")
     device = torch.device("cuda", torch.cuda.current_device())
-    name = str(torch.cuda.get_device_name(device))
-    if name != _GPU_NAME or tuple(torch.cuda.get_device_capability(device)) != (9, 0):
-        raise ProfilerNotImplemented(f"{_BACKEND} requires {_GPU_NAME} SM90, got {name}")
+    capability = tuple(torch.cuda.get_device_capability(device))
+    if capability < _MIN_CAPABILITY:
+        raise ProfilerNotImplemented(f"{_BACKEND} needs FP8 e4m3 (SM89+), got SM{capability}")
     return device
 
 
@@ -144,7 +149,7 @@ def _launch(save_op: Any, compress_op: Any, operands: Any, shape: _Shape) -> Non
         overlap=True,
         use_fp4_cache=False,
         rms_norm_weight=operands.norm_weight,
-        rms_norm_eps=1.0e-6,
+        rms_norm_eps=shape.rms_eps,
         quant_block=shape.quant_block,
         token_stride=shape.token_stride,
         scale_dim=shape.scale_dim,
@@ -224,7 +229,7 @@ def profile_kv_compress_store_triton(
         )
         from vllm.models.deepseek_v4.common.ops.save_partial_states import save_partial_states
 
-        operands = _build_operands(torch, shape, _require_h200(torch))
+        operands = _build_operands(torch, shape, _require_fp8_gpu(torch))
         _check_output(torch, save_partial_states, compress_norm_rope_store_triton, operands, shape)
 
         def run() -> None:

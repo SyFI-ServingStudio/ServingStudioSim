@@ -55,7 +55,7 @@ from profiling.runners.attention._gdn_common import (
 )
 from profiling.runners.attention._gdn_common import (
     load_required_callable,
-    require_exact_gpu,
+    require_cuda,
 )
 from profiling.runners.exceptions import (
     KernelLaunchFailed,
@@ -68,8 +68,6 @@ from profiling.runners.triton_autotune_pin import AutotunePin
 _BACKEND = "kda_recurrent_decode:vllm_triton"
 _MODULE = "vllm.models.glm5next.nvidia.ops.third_party.kda"
 _CALLABLE = "fused_recurrent_kda"
-_GPU = "NVIDIA B200"
-_HEAD_DIM = 128
 # GLM-5.3-Flash `linear_attn_config.gate_lower_bound`.
 LOWER_BOUND = -5.0
 # The fork's fused_recurrent_kda-vs-naive tolerances (RMSE ratio), from
@@ -131,8 +129,10 @@ def validate_args(
         raise ValueError("batch_size must be >= 1")
     if shape.num_heads < 1:
         raise ValueError("num_heads must be >= 1")
-    if shape.head_dim != _HEAD_DIM:
-        raise ValueError(f"{_BACKEND} requires head_dim={_HEAD_DIM}")
+    # fused_recurrent_kda_fwd takes BK = next_power_of_2(K) (so NK == 1 for any
+    # K) and masks the tail; no head-dim bound beyond a positive width.
+    if shape.head_dim < 1:
+        raise ValueError("head_dim must be >= 1")
     if shape.dtype is not DType.BF16:
         raise ValueError(f"{_BACKEND} requires dtype=bf16, got {shape.dtype}")
     return shape
@@ -272,14 +272,14 @@ def profile_kda_recurrent_decode_vllm_triton(
     head_dim: int,
     dtype: DType | str,
 ) -> ComputeMetrics:
-    """Profile one GLM-5.3-Flash KDA recurrent-decode call on a B200."""
+    """Profile one GLM-5.3-Flash KDA recurrent-decode call."""
     shape = validate_args(batch_size, num_heads, head_dim, dtype)
     try:
         import torch
     except ImportError as exc:
         raise ProfilerNotImplemented(f"PyTorch is required for {_BACKEND}") from exc
     try:
-        require_exact_gpu(torch, backend=_BACKEND, required_gpu=_GPU)
+        require_cuda(torch, backend=_BACKEND)
         callable_ = load_required_callable(
             importlib.import_module,
             backend=_BACKEND,

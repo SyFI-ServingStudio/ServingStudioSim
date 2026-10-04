@@ -18,7 +18,6 @@ from profiling.runners.metrics import ComputeMetrics
 from profiling.runners.moe.exact_topk import exact_topk_ids
 
 _BACKEND = "flashinfer_trtllm_sm100"
-_GPU = "NVIDIA B200"
 _ROUTING_METHODS = {"minimax2": 7}
 _BLOCK = 128
 # TRT-LLM's MiniMax2 routing kernel caps. Exceeding either is a launch
@@ -154,15 +153,17 @@ def _logical_bytes(args: _ValidatedArgs) -> int:
     return routing + activations + weights + output
 
 
-def _require_b200(torch: Any) -> None:
+def _require_sm100_family(torch: Any) -> None:
+    # TRT-LLM-gen cubins target the SM10x family; vLLM enables this kernel on
+    # any SM10x device (TrtLlmBf16ExpertsBase: is_device_capability_family(100)).
     if not torch.cuda.is_available():
         raise ProfilerNotImplemented("BF16 fused MoE profiling requires CUDA")
     device = torch.cuda.current_device()
-    name = str(torch.cuda.get_device_name(device))
     capability = tuple(torch.cuda.get_device_capability(device))
-    if name != _GPU or capability != (10, 0):
+    if capability[0] != 10:
+        name = str(torch.cuda.get_device_name(device))
         raise ProfilerNotImplemented(
-            f"{_BACKEND} is verified only on {_GPU}/SM100, got {name}/{capability}"
+            f"{_BACKEND} requires an SM10x (Blackwell datacenter) GPU, got {name}/{capability}"
         )
 
 
@@ -425,7 +426,7 @@ def profile_bf16_fused_moe_sm100(
     args = _validate_args(**locals())
     try:
         torch, callable_, prepare_weights = _load_runtime()
-        _require_b200(torch)
+        _require_sm100_family(torch)
         _check_small_correctness(torch, callable_, prepare_weights)
         launch = _prepare_launch(torch, callable_, prepare_weights, args)
 

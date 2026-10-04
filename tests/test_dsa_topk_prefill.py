@@ -187,7 +187,7 @@ def test_runner_ref_resolves_without_importing_torch() -> None:
         ({"num_keys": 0}, "must be > 0"),
         ({"num_queries": 129, "num_keys": 128}, "must be <= num_keys"),
         ({"num_sequences": 2}, "num_sequences=1"),
-        ({"top_k": 1024}, r"top_k in \[2048\]"),
+        ({"top_k": 0}, "top_k > 0"),
         ({"logits_row_stride": 0}, "positive and >= num_keys"),
         ({"logits_row_stride": 4095}, "positive and >= num_keys"),
         ({"logits_dtype": DType.BF16}, "logits_dtype=fp32"),
@@ -212,33 +212,14 @@ def test_explicit_unpadded_and_padded_strides_are_valid() -> None:
         assert validated[4] == stride
 
 
-def test_rejects_missing_cuda_and_unverified_gpu() -> None:
-    from profiling.runners.attention.dsa_topk_prefill import _validate_cuda_device
-
-    no_cuda = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False))
-    with pytest.raises(ProfilerNotImplemented, match="CUDA is required"):
-        _validate_cuda_device(no_cuda)
-
-    h100 = SimpleNamespace(
-        cuda=SimpleNamespace(
-            is_available=lambda: True,
-            current_device=lambda: 0,
-            get_device_name=lambda _device: "NVIDIA H100",
-        )
-    )
-    with pytest.raises(ProfilerNotImplemented, match="verified only on NVIDIA H200"):
-        _validate_cuda_device(h100)
-
-
-def test_vllm_rejects_missing_cuda_and_unverified_gpu() -> None:
+def test_every_backend_requires_cuda_but_no_gpu_allowlist() -> None:
     from profiling.runners.attention.dsa_topk_prefill import (
+        _validate_cuda_device,
+        _validate_sglang_cuda_device,
         _validate_vllm_cuda_device,
     )
 
     no_cuda = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False))
-    with pytest.raises(ProfilerNotImplemented, match="CUDA is required"):
-        _validate_vllm_cuda_device(no_cuda)
-
     h100 = SimpleNamespace(
         cuda=SimpleNamespace(
             is_available=lambda: True,
@@ -246,17 +227,29 @@ def test_vllm_rejects_missing_cuda_and_unverified_gpu() -> None:
             get_device_name=lambda _device: "NVIDIA H100",
         )
     )
-    with pytest.raises(ProfilerNotImplemented, match="verified only on NVIDIA H200"):
-        _validate_vllm_cuda_device(h100)
+    for check in (_validate_cuda_device, _validate_vllm_cuda_device, _validate_sglang_cuda_device):
+        with pytest.raises(ProfilerNotImplemented, match="CUDA is required"):
+            check(no_cuda)
+        check(h100)
 
-    b200 = SimpleNamespace(
-        cuda=SimpleNamespace(
-            is_available=lambda: True,
-            current_device=lambda: 0,
-            get_device_name=lambda _device: "NVIDIA B200",
-        )
-    )
-    _validate_vllm_cuda_device(b200)
+
+@pytest.mark.parametrize("top_k", [256, 512, 1024, 2048, 4096])
+def test_runtime_top_k_backends_accept_any_positive_width(top_k) -> None:
+    from profiling.runners.attention.dsa_topk_prefill import _validate_args, _validate_vllm_args
+
+    assert _validate_args(**(_BASE_SPEC | {"top_k": top_k}))[3] == top_k
+    assert _validate_vllm_args(**(_BASE_SPEC | {"top_k": top_k}))[3] == top_k
+
+
+def test_sglang_keeps_its_compiled_2048_width(monkeypatch) -> None:
+    from profiling.runners.attention import dsa_topk_prefill as runner
+
+    def fail_if_loaded():
+        raise AssertionError("SGLang loader must not run")
+
+    monkeypatch.setattr(runner, "_load_sglang_cuda_backend", fail_if_loaded)
+    with pytest.raises(ValueError, match=r"top_k in \[2048\]"):
+        runner.profile_dsa_topk_prefill_sglang_cuda(**(_BASE_SPEC | {"top_k": 1024}))
 
 
 def test_vllm_rejects_common_and_backend_specific_args_before_loading(
@@ -277,7 +270,7 @@ def test_vllm_rejects_common_and_backend_specific_args_before_loading(
         ({"num_keys": 0}, "must be > 0"),
         ({"num_queries": 129, "num_keys": 128}, "must be <= num_keys"),
         ({"num_sequences": 2}, "num_sequences=1"),
-        ({"top_k": 256}, r"top_k in \[512, 1024, 2048\]"),
+        ({"top_k": 0}, "top_k > 0"),
         ({"logits_row_stride": 0}, "positive and >= num_keys"),
         ({"logits_row_stride": 4095}, "positive and >= num_keys"),
         ({"logits_dtype": DType.BF16}, "logits_dtype=fp32"),

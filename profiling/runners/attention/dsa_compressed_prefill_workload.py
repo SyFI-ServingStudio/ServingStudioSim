@@ -4,8 +4,9 @@ from dataclasses import dataclass
 
 from profiling.runners.exceptions import ProfilerNotImplemented
 
-_MAX_REQUESTS = 64
-_PRODUCTION_LOGITS_BYTES = 512 * 1024 * 1024
+# DeepSeek V4 builds the indexer only on C4 layers
+# (vllm/models/deepseek_v4/attention.py: `if self.compress_ratio == 4`).
+_INDEXER_COMPRESS_RATIO = 4
 
 
 @dataclass(frozen=True)
@@ -37,8 +38,8 @@ def build_indexer_prefill_chunks(
     compress_ratio: int,
 ) -> tuple[IndexerPrefillChunk, ...]:
     """Mirror vLLM's request-greedy then query-slice physical launcher."""
-    if not query_context_pairs or len(query_context_pairs) > _MAX_REQUESTS:
-        raise ProfilerNotImplemented("indexer prefill supports 1..64 requests")
+    if not query_context_pairs:
+        raise ValueError("query_context_pairs must hold at least one request")
     for pair in query_context_pairs:
         if (
             not isinstance(pair, tuple)
@@ -50,19 +51,18 @@ def build_indexer_prefill_chunks(
         if query_length <= 0 or context_length < query_length:
             raise ValueError("each pair must satisfy 0 < query <= context")
     total_queries = sum(query_length for query_length, _ in query_context_pairs)
-    if type(max_model_len) is not int or not 1 <= max_model_len <= 1_048_576:
-        raise ProfilerNotImplemented("max_model_len must be in 1..1048576")
+    if type(max_model_len) is not int or max_model_len <= 0:
+        raise ValueError("max_model_len must be a positive integer")
     if max(context_length for _, context_length in query_context_pairs) > max_model_len:
         raise ValueError("context length exceeds max_model_len")
-    if (
-        type(max_num_batched_tokens) is not int
-        or not total_queries <= max_num_batched_tokens <= 32768
-    ):
-        raise ValueError("max_num_batched_tokens must cover all queries and be <=32768")
-    if max_logits_bytes != _PRODUCTION_LOGITS_BYTES:
-        raise ProfilerNotImplemented("max_logits_bytes must be 512 MiB")
-    if compress_ratio != 4:
-        raise ProfilerNotImplemented("indexer prefill is supported only for C4 layers")
+    if type(max_num_batched_tokens) is not int or max_num_batched_tokens < total_queries:
+        raise ValueError("max_num_batched_tokens must cover all queries")
+    # vLLM reads the budget from VLLM_SPARSE_INDEXER_MAX_LOGITS_MB; the split
+    # needs room for at least one FP32 logit.
+    if type(max_logits_bytes) is not int or max_logits_bytes < 4:
+        raise ValueError("max_logits_bytes must be an integer >= 4")
+    if compress_ratio != _INDEXER_COMPRESS_RATIO:
+        raise ProfilerNotImplemented("the DSA indexer exists only on C4 layers")
 
     # The serving model allocates 40 * max_model_len / C4 gathered rows.  Use
     # the physical allocation as the safe cap even though the current metadata

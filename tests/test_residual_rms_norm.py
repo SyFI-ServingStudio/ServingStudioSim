@@ -183,7 +183,7 @@ def test_vllm_cuda_runner_rejects_invalid_args_before_importing_frameworks():
         )
 
 
-def test_vllm_cuda_runner_rejects_missing_cuda_and_unverified_gpu():
+def test_vllm_cuda_runner_requires_cuda_but_no_particular_gpu():
     from profiling.runners.norm.residual_rms_norm_vllm_cuda import (
         _validate_cuda_device,
     )
@@ -192,33 +192,20 @@ def test_vllm_cuda_runner_rejects_missing_cuda_and_unverified_gpu():
         cuda=SimpleNamespace(is_available=lambda: False),
     )
     with pytest.raises(ProfilerNotImplemented, match="CUDA is required"):
-        _validate_cuda_device(no_cuda, DType.BF16)
+        _validate_cuda_device(no_cuda)
 
-    h100 = SimpleNamespace(
-        cuda=SimpleNamespace(
-            is_available=lambda: True,
-            current_device=lambda: 0,
-            get_device_name=lambda _device: "NVIDIA H100",
-        ),
-    )
-    with pytest.raises(
-        ProfilerNotImplemented,
-        match="no verified bf16/NVIDIA H100 implementation",
-    ):
-        _validate_cuda_device(h100, DType.BF16)
-
-    b200 = SimpleNamespace(
-        cuda=SimpleNamespace(
-            is_available=lambda: True,
-            current_device=lambda: 0,
-            get_device_name=lambda _device: "NVIDIA B200",
-        ),
-    )
-    with pytest.raises(
-        ProfilerNotImplemented,
-        match="no verified fp16/NVIDIA B200 implementation",
-    ):
-        _validate_cuda_device(b200, DType.FP16)
+    # Previously refused as unverified (dtype, GPU) pairs; the dtype is
+    # validated separately and the kernel builds for every arch.
+    for gpu_name in ("NVIDIA H100", "NVIDIA B200"):
+        _validate_cuda_device(
+            SimpleNamespace(
+                cuda=SimpleNamespace(
+                    is_available=lambda: True,
+                    current_device=lambda: 0,
+                    get_device_name=lambda _device, name=gpu_name: name,
+                ),
+            )
+        )
 
 
 def test_generated_facades_are_available():

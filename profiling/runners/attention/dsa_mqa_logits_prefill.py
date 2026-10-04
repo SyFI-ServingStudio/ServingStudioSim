@@ -13,20 +13,22 @@ from typing import Any
 from profiling.db.args import DType
 from profiling.profilers.energy import Energy
 from profiling.profilers.timer import Timer
+from profiling.runners.attention.dsa_compressed_mqa_logits_prefill_deepgemm import (
+    _HEAD_DIMS as _DEEPGEMM_HEAD_DIMS,
+)
+from profiling.runners.attention.dsa_compressed_mqa_logits_prefill_deepgemm import (
+    _NUM_HEADS_BY_ARCH_MAJOR as _DEEPGEMM_NUM_HEADS_BY_ARCH_MAJOR,
+)
 from profiling.runners.exceptions import KernelLaunchFailed, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
 
 _NUM_SEQUENCES = 1
-_SUPPORTED_NUM_HEADS = (32, 64)
-_HEAD_DIM = 128
 _Q_DTYPE = DType.FP8_E4M3
 _K_DTYPE = DType.FP8_E4M3
 _K_SCALE_DTYPE = DType.FP32
 _WEIGHT_DTYPE = DType.FP32
 _OUTPUT_DTYPE = DType.FP32
 _SPAN_MODE = "single_causal_tail"
-_REQUIRED_GPU = "NVIDIA H200"
-_DEEPGEMM_SUPPORTED_GPUS = ("NVIDIA H200", "NVIDIA B200")
 _QUERY_TILE = 2
 _KEY_TILE = 256
 _DEEPGEMM_KERNEL_NAME = "fp8_mqa_logits"
@@ -56,6 +58,8 @@ def _validate_args(
     output_dtype: DType | str,
     span_mode: str,
     clean_logits: bool,
+    *,
+    backend: str = "torch",
 ) -> tuple[int, int, int, int, int, DType, DType, DType, DType, DType, str, bool]:
     num_queries = int(num_queries)
     num_keys = int(num_keys)
@@ -75,12 +79,19 @@ def _validate_args(
         raise ValueError(f"num_queries must be <= num_keys, got {num_queries} and {num_keys}")
     if num_sequences != _NUM_SEQUENCES:
         raise ValueError(f"dsa_mqa_logits_prefill requires num_sequences=1, got {num_sequences}")
-    if num_heads not in _SUPPORTED_NUM_HEADS or head_dim != _HEAD_DIM:
-        raise ValueError(
-            "dsa_mqa_logits_prefill requires "
-            f"num_heads in {list(_SUPPORTED_NUM_HEADS)} and head_dim == {_HEAD_DIM}, "
-            f"got ({num_heads}, {head_dim})"
-        )
+    if num_heads <= 0 or head_dim <= 0:
+        raise ValueError(f"num_heads and head_dim must be > 0, got ({num_heads}, {head_dim})")
+    if backend == "deepgemm_fp8":
+        # DeepGEMM instantiates fp8_mqa_logits for these head counts and dims
+        # (csrc/apis/attention.hpp at the image pin); the per-arch head check
+        # happens on the device.
+        all_head_counts = frozenset().union(*_DEEPGEMM_NUM_HEADS_BY_ARCH_MAJOR.values())
+        if num_heads not in all_head_counts or head_dim not in _DEEPGEMM_HEAD_DIMS:
+            raise ValueError(
+                "dsa_mqa_logits_prefill deepgemm_fp8 requires "
+                f"num_heads in {sorted(all_head_counts)} and head_dim in "
+                f"{sorted(_DEEPGEMM_HEAD_DIMS)}, got ({num_heads}, {head_dim})"
+            )
     if q_dtype is not _Q_DTYPE or k_dtype is not _K_DTYPE:
         raise ValueError(
             "dsa_mqa_logits_prefill requires "
@@ -128,23 +139,18 @@ def _validate_cuda_device(torch: Any) -> None:
         raise ProfilerNotImplemented(
             "CUDA is required for the torch dsa_mqa_logits_prefill backend"
         )
-    gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
-    if gpu_name != _REQUIRED_GPU:
-        raise ProfilerNotImplemented(
-            f"torch dsa_mqa_logits_prefill is verified only on {_REQUIRED_GPU}, got {gpu_name}"
-        )
 
 
-def _validate_deepgemm_cuda_device(torch: Any) -> None:
+def _validate_deepgemm_cuda_device(torch: Any, *, num_heads: int) -> None:
     if not torch.cuda.is_available():
         raise ProfilerNotImplemented(
             "CUDA is required for the dsa_mqa_logits_prefill deepgemm_fp8 backend"
         )
-    gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
-    if gpu_name not in _DEEPGEMM_SUPPORTED_GPUS:
+    arch_major = int(torch.cuda.get_device_capability(torch.cuda.current_device())[0])
+    if num_heads not in _DEEPGEMM_NUM_HEADS_BY_ARCH_MAJOR.get(arch_major, frozenset()):
         raise ProfilerNotImplemented(
-            "dsa_mqa_logits_prefill deepgemm_fp8 is verified only on "
-            f"{' or '.join(_DEEPGEMM_SUPPORTED_GPUS)}, got {gpu_name}"
+            "dsa_mqa_logits_prefill deepgemm_fp8 has no DeepGEMM FP8 MQA-logits kernel "
+            f"for num_heads={num_heads} on SM{arch_major}x"
         )
 
 
@@ -473,9 +479,10 @@ def _profile_dsa_mqa_logits_prefill_deepgemm_fp8(
         output_dtype,
         span_mode,
         clean_logits,
+        backend="deepgemm_fp8",
     )
     torch, deep_gemm = load_backend()
-    _validate_deepgemm_cuda_device(torch)
+    _validate_deepgemm_cuda_device(torch, num_heads=num_heads)
 
     try:
         operands = _build_operands(

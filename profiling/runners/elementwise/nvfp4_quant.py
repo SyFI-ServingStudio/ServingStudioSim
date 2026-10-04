@@ -46,14 +46,17 @@ def _validate_args(
 
 
 def _validate_cuda_device(torch: Any) -> None:
+    # Capability floor, not one GPU: vLLM's NVFP4 quant entry accepts SM100-SM129
+    # (nvfp4_quant_entry.cu, `nvfp4_quant_sm_supported`) and FlashInfer's
+    # cute-dsl nvfp4_quantize requires SM100+. FP4 conversion has no SM90 path.
     if not torch.cuda.is_available():
         raise ProfilerNotImplemented("NVFP4 profiling requires CUDA")
     device = torch.cuda.current_device()
     capability = tuple(torch.cuda.get_device_capability(device))
-    if capability != (10, 0):
+    if capability[0] < 10:
         gpu_name = str(torch.cuda.get_device_name(device))
         raise ProfilerNotImplemented(
-            f"NVFP4 profiling requires SM100, got {gpu_name} with SM{capability[0]}{capability[1]}"
+            f"NVFP4 profiling requires SM100+, got {gpu_name} with SM{capability[0]}{capability[1]}"
         )
 
 

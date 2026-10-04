@@ -18,9 +18,6 @@ from profiling.profilers.timer import Timer
 from profiling.runners.exceptions import KernelLaunchFailed, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
 
-_SUPPORTED_NUM_HEADS = (32, 64)
-_HEAD_DIM = 128
-_BLOCK_SIZE = 64
 _Q_DTYPE = DType.FP8_E4M3
 _CACHE_DTYPE = DType.FP8_E4M3
 _SCALE_DTYPE = DType.FP32
@@ -31,10 +28,32 @@ _PAGE_MAPPING = "unique_scattered"
 _CACHE_FORMAT = "page_planar_fp8_fp32_scale"
 # Request-contiguous, 576-byte-aligned pages: see dsa_paged_mqa_logits_decode_contiguous.
 _CONTIGUOUS_CACHE_FORMAT = "fp8_e4m3_ue8m0"
-_REQUIRED_GPU = "NVIDIA H200"
-_DEEPGEMM_EXPECTED_SMS = {"NVIDIA H200": 132, "NVIDIA B200": 148}
-# DeepGEMM names the main kernel `sm90_fp8_paged_mqa_logits` on H200 and
-# `sm100_paged_mqa_logits` on B200.
+# DeepGEMM's FP8 paged MQA-logits launch bounds per arch major, from
+# csrc/apis/attention.hpp (q heads, block_kv) and csrc/jit_kernels/impls/
+# sm{90,100,120}_*mqa_logits.hpp (head_dim, next_n) at the vLLM-pinned 8b1392b.
+# Other arch majors have no kernel.
+_DEEPGEMM_ARCH_BOUNDS = {
+    9: {
+        "num_heads": frozenset({32, 64}),
+        "head_dim": frozenset({32, 64, 128}),
+        "block_size": frozenset({32, 64}),
+        "next_n": frozenset({1, 2, 4}),
+    },
+    10: {
+        "num_heads": frozenset({8, 16, 32, 64}),
+        "head_dim": frozenset({32, 64, 128}),
+        "block_size": frozenset({32, 64, 128}),
+        "next_n": None,
+    },
+    12: {
+        "num_heads": frozenset({16, 32, 64}),
+        "head_dim": frozenset({128}),
+        "block_size": frozenset({64}),
+        "next_n": None,
+    },
+}
+# DeepGEMM names the main kernel `sm90_fp8_paged_mqa_logits` on SM90 and
+# `sm100_paged_mqa_logits` on SM100.
 _DEEPGEMM_KERNEL_NAME = "paged_mqa_logits"
 _CHECK_TOLERANCE = 1e-3
 
@@ -114,11 +133,11 @@ def _validate_args(
         )
     if next_n <= 0:
         raise ValueError(f"dsa_paged_mqa_logits_decode requires next_n > 0, got {next_n}")
-    if num_heads not in _SUPPORTED_NUM_HEADS or head_dim != _HEAD_DIM or block_size != _BLOCK_SIZE:
+    # The operands, Torch composite and accounting are parametric in these;
+    # DeepGEMM's per-arch launch bounds are checked against the device.
+    if num_heads <= 0 or head_dim <= 0 or block_size <= 0:
         raise ValueError(
-            "dsa_paged_mqa_logits_decode requires "
-            f"num_heads in {list(_SUPPORTED_NUM_HEADS)}, head_dim == {_HEAD_DIM}, "
-            f"and block_size == {_BLOCK_SIZE}, "
+            "dsa_paged_mqa_logits_decode requires num_heads, head_dim, and block_size > 0, "
             f"got ({num_heads}, {head_dim}, {block_size})"
         )
     if q_dtype is not _Q_DTYPE or cache_dtype is not _CACHE_DTYPE:
@@ -178,38 +197,50 @@ def _validate_args(
 
 
 def _validate_cuda_device(torch: Any) -> None:
+    # The Torch composite is plain tensor math; any CUDA GPU runs it.
     if not torch.cuda.is_available():
         raise ProfilerNotImplemented(
             "CUDA is required for the torch dsa_paged_mqa_logits_decode backend"
         )
-    gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
-    if gpu_name != _REQUIRED_GPU:
-        raise ProfilerNotImplemented(
-            f"torch dsa_paged_mqa_logits_decode is verified only on {_REQUIRED_GPU}, got {gpu_name}"
-        )
 
 
-def _validate_deepgemm_cuda_device(torch: Any) -> int:
-    """Validate a profiled deployment identity and return its SM schedule."""
+def _validate_deepgemm_cuda_device(
+    torch: Any,
+    *,
+    num_heads: int,
+    head_dim: int,
+    block_size: int,
+    next_n: int,
+) -> int:
+    """Check DeepGEMM's per-arch launch bounds and return the device SM count.
+
+    vLLM's indexer builds the schedule for the device's own SM count
+    (``num_compute_units``), so the runner passes the same value.
+    """
     if not torch.cuda.is_available():
         raise ProfilerNotImplemented(
             "CUDA is required for the dsa_paged_mqa_logits_decode deepgemm_fp8 backend"
         )
     device = torch.cuda.current_device()
-    gpu_name = str(torch.cuda.get_device_name(device))
-    if gpu_name not in _DEEPGEMM_EXPECTED_SMS:
+    arch_major = int(torch.cuda.get_device_capability(device)[0])
+    bounds = _DEEPGEMM_ARCH_BOUNDS.get(arch_major)
+    if bounds is None:
         raise ProfilerNotImplemented(
-            "dsa_paged_mqa_logits_decode deepgemm_fp8 is verified only on "
-            f"{' or '.join(_DEEPGEMM_EXPECTED_SMS)}, got {gpu_name}"
+            f"dsa_paged_mqa_logits_decode deepgemm_fp8 has no DeepGEMM kernel for SM{arch_major}x"
         )
-    num_sms = int(torch.cuda.get_device_properties(device).multi_processor_count)
-    expected_sms = _DEEPGEMM_EXPECTED_SMS[gpu_name]
-    if num_sms != expected_sms:
-        raise ProfilerNotImplemented(
-            "dsa_paged_mqa_logits_decode deepgemm_fp8 requires the verified "
-            f"{expected_sms}-SM {gpu_name} schedule, got {num_sms} SMs"
-        )
-    return num_sms
+    for name, value in (
+        ("num_heads", num_heads),
+        ("head_dim", head_dim),
+        ("block_size", block_size),
+        ("next_n", next_n),
+    ):
+        allowed = bounds[name]
+        if allowed is not None and value not in allowed:
+            raise ProfilerNotImplemented(
+                f"DeepGEMM paged MQA logits on SM{arch_major}x needs {name} in "
+                f"{sorted(allowed)}, got {value}"
+            )
+    return int(torch.cuda.get_device_properties(device).multi_processor_count)
 
 
 def _load_deepgemm_backend() -> tuple[Any, Any]:
@@ -733,7 +764,9 @@ def _profile_dsa_paged_mqa_logits_decode_deepgemm_fp8(
         clean_logits,
     )
     torch, deep_gemm = load_backend()
-    num_sms = _validate_deepgemm_cuda_device(torch)
+    num_sms = _validate_deepgemm_cuda_device(
+        torch, num_heads=num_heads, head_dim=head_dim, block_size=block_size, next_n=next_n
+    )
 
     try:
         operands = _build_operands(

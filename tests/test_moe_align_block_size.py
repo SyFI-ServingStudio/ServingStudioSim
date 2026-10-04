@@ -1,9 +1,11 @@
 """Behavioral tests for the MoE block-alignment input oracle."""
 
+import sys
 from collections import Counter
 
 import pytest
 
+from profiling.runners.exceptions import ProfilerNotImplemented
 from profiling.runners.moe.moe_align_block_size_reference import (
     build_topk_ids,
     expected_block_owners,
@@ -34,7 +36,7 @@ def test_padding_owners_and_logical_traffic_are_independently_derived() -> None:
     "overrides",
     [
         {"top_k": 9},
-        {"block_size": 7},
+        {"block_size": 0},
         {"num_tokens": 0},
         {"num_experts": 0},
     ],
@@ -50,3 +52,41 @@ def test_rejects_nonphysical_route_shapes(overrides: dict[str, object]) -> None:
 
     with pytest.raises(ValueError):
         validate_shape(**shape)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("block_size", [1, 7, 16, 128, 256])
+def test_any_positive_block_size_pads_parametrically(block_size: int) -> None:
+    shape = validate_shape(5, 4, 2, block_size)
+    owners = expected_block_owners(shape.expert_counts, block_size)
+
+    assert shape.padded_routes == len(owners) * block_size
+    assert all(count <= block_size * owners.count(e) for e, count in enumerate(shape.expert_counts))
+
+
+def test_vllm_runner_rejects_more_experts_than_its_block_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from profiling.runners.moe import moe_align_block_size_vllm_cuda as runner
+
+    monkeypatch.setitem(sys.modules, "torch", None)
+    with pytest.raises(ProfilerNotImplemented, match="at most 992 experts"):
+        runner.profile_moe_align_block_size_vllm_cuda(4, 993, 2, 16)
+
+
+def test_vllm_runner_needs_cuda_but_no_gpu_model() -> None:
+    from types import SimpleNamespace
+
+    from profiling.runners.moe import moe_align_block_size_vllm_cuda as runner
+
+    def fake_torch(available: bool) -> SimpleNamespace:
+        return SimpleNamespace(
+            cuda=SimpleNamespace(
+                is_available=lambda: available,
+                current_device=lambda: 0,
+                get_device_name=lambda _: "NVIDIA B200",
+            )
+        )
+
+    runner._require_cuda(fake_torch(True))
+    with pytest.raises(ProfilerNotImplemented, match="requires CUDA"):
+        runner._require_cuda(fake_torch(False))

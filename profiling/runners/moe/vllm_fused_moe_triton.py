@@ -36,7 +36,8 @@ from profiling.runners.metrics import ComputeMetrics
 
 _BACKEND = "vllm_fused_moe:vllm_triton"
 _FUSED_MOE_MODULE = "vllm.model_executor.layers.fused_moe.fused_moe"
-_GPU = "NVIDIA H200"
+# Triton lowers float8_e4m3fn (fp8e4nv) dots only on SM89 and newer.
+_FP8_E4M3_MIN_CAPABILITY = (8, 9)
 
 
 @dataclass(frozen=True)
@@ -136,12 +137,16 @@ def _validate_args(
     )
 
 
-def _require_h200(torch: Any) -> None:
+def _require_fp8_device(torch: Any) -> None:
     if not torch.cuda.is_available():
         raise ProfilerNotImplemented(f"CUDA is required for {_BACKEND}")
-    name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
-    if name != _GPU:
-        raise ProfilerNotImplemented(f"{_BACKEND} is verified only on {_GPU}, got {name}")
+    device = torch.cuda.current_device()
+    capability = tuple(torch.cuda.get_device_capability(device))
+    if capability < _FP8_E4M3_MIN_CAPABILITY:
+        name = str(torch.cuda.get_device_name(device))
+        raise ProfilerNotImplemented(
+            f"{_BACKEND} needs FP8 E4M3 (SM89+), got {name} with SM{capability[0]}{capability[1]}"
+        )
 
 
 def _load_vllm() -> tuple[Any, Any, Any, Any]:
@@ -328,7 +333,7 @@ def profile_vllm_fused_moe_triton(
     except ImportError as exc:
         raise ProfilerNotImplemented(f"PyTorch is required for {_BACKEND}") from exc
     try:
-        _require_h200(torch)
+        _require_fp8_device(torch)
         device = torch.device("cuda", torch.cuda.current_device())
         launch = _build_launch(torch, args, device=device)
         # Triton autotune/JIT compilation stays outside the timed window.

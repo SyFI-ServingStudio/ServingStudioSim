@@ -22,35 +22,28 @@ def exact_int(name: str, value: object) -> int:
     return value
 
 
-def require_exact_gpu(
+def require_cuda(torch: Any, *, backend: str) -> None:
+    """Require a CUDA device; these runners launch portable Triton/CUDA kernels."""
+    if not torch.cuda.is_available():
+        raise ProfilerNotImplemented(f"CUDA is required for {backend}")
+
+
+def require_compute_capability(
     torch: Any,
     *,
     backend: str,
-    required_gpu: str,
+    capability: tuple[int, int],
+    reason: str,
 ) -> None:
-    """Enforce the hardware boundary under which a runner was validated."""
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented(f"CUDA is required for {backend}")
-    gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
-    if gpu_name != required_gpu:
+    """Require CUDA and one compute capability for an arch-specific kernel build."""
+    require_cuda(torch, backend=backend)
+    device = torch.cuda.current_device()
+    actual = tuple(torch.cuda.get_device_capability(device))
+    if actual != capability:
+        gpu_name = str(torch.cuda.get_device_name(device))
         raise ProfilerNotImplemented(
-            f"{backend} is verified only on {required_gpu}, got {gpu_name}"
-        )
-
-
-def require_supported_gpu(
-    torch: Any,
-    *,
-    backend: str,
-    supported_gpus: frozenset[str],
-) -> None:
-    """Enforce a multi-GPU hardware boundary under which a runner was validated."""
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented(f"CUDA is required for {backend}")
-    gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
-    if gpu_name not in supported_gpus:
-        raise ProfilerNotImplemented(
-            f"{backend} is verified only on {sorted(supported_gpus)}, got {gpu_name}"
+            f"{backend} requires SM{capability[0]}{capability[1]} ({reason}), "
+            f"got {gpu_name} with SM{actual[0]}{actual[1]}"
         )
 
 

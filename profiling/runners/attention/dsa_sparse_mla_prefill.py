@@ -1,4 +1,4 @@
-"""Profile GLM-5.2's production B200 varlen sparse-MLA prefill launch."""
+"""Profile GLM-5.2's production SM100 varlen sparse-MLA prefill launch."""
 
 from __future__ import annotations
 
@@ -14,7 +14,6 @@ from profiling.runners.attention.dsa_sparse_mla_attention import (
     _LATENT_DIM,
     _ROPE_DIM,
     _SCORE_DIM,
-    _SELECTED_K,
     _TRTLLM_FP8_CACHE_LAYOUT,
     _TRTLLM_KERNEL_NAME,
     _TRTLLM_PAGE_SIZE,
@@ -23,7 +22,7 @@ from profiling.runners.attention.dsa_sparse_mla_attention import (
     _launch_trtllm_fp8,
     _logical_bytes,
     _logical_flops,
-    _require_b200,
+    _require_trtllm_gen_device,
     _row_indices,
     _TrtllmFp8Operands,
 )
@@ -31,16 +30,13 @@ from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerN
 from profiling.runners.metrics import ComputeMetrics
 
 _BACKEND = "dsa_sparse_mla_prefill:flashinfer_trtllm_fp8"
-# Per-rank q-head counts of GLM's 64 heads at validated TP degrees (TP8, TP4).
-# The kernel launch, output check and metrics are parametric in num_heads.
-_SUPPORTED_NUM_HEADS = frozenset({8, 16})
 _NUM_KV_HEADS = 1
-_SOFTMAX_SCALE = 0.0625
 
 
 @dataclass(frozen=True)
 class _Shape:
     num_heads: int
+    selected_k: int
     pairs: tuple[tuple[int, int], ...]
     valid_counts: tuple[int, ...]
     request_page_offsets: tuple[int, ...]
@@ -70,6 +66,12 @@ def _validate_args(
 ) -> _Shape:
     if not isinstance(query_context_pairs, tuple) or not query_context_pairs:
         raise ValueError("query_context_pairs must be a nonempty tuple")
+    if type(selected_k) is not int:
+        raise TypeError("selected_k must be an integer")
+    # The page table is selected_k wide; FlashInfer only checks that it matches
+    # sparse_mla_top_k, so any positive width is a launchable shape.
+    if selected_k < 1:
+        raise ValueError(f"selected_k must be >= 1, got {selected_k}")
 
     pairs: list[tuple[int, int]] = []
     valid_counts: list[int] = []
@@ -90,35 +92,37 @@ def _validate_args(
         num_pages += math.ceil(context_len / _TRTLLM_PAGE_SIZE)
         first_query_position = context_len - num_queries
         valid_counts.extend(
-            min(position + 1, _SELECTED_K) for position in range(first_query_position, context_len)
+            min(position + 1, selected_k) for position in range(first_query_position, context_len)
         )
 
+    # num_heads is the per-rank q-head count (GLM's 64 heads over TP); the
+    # kernel launch, output check and metrics are parametric in it, as in
+    # selected_k. The other fields fix the MLA latent+rope cache layout.
+    if type(num_heads) is not int:
+        raise TypeError("num_heads must be an integer")
+    if num_heads < 1:
+        raise ValueError(f"num_heads must be >= 1, got {num_heads}")
     model_identity = (
-        num_heads,
         num_kv_heads,
-        selected_k,
         latent_dim,
         rope_dim,
         value_dim,
     )
     expected_model_identity = (
-        sorted(_SUPPORTED_NUM_HEADS),
         _NUM_KV_HEADS,
-        _SELECTED_K,
         _LATENT_DIM,
         _ROPE_DIM,
         _VALUE_DIM,
     )
-    if num_heads not in _SUPPORTED_NUM_HEADS or model_identity[1:] != expected_model_identity[1:]:
+    if model_identity != expected_model_identity:
         raise ProfilerNotImplemented(
             f"{_BACKEND} requires model identity {expected_model_identity}, got {model_identity}"
         )
     if type(softmax_scale) not in {int, float} or isinstance(softmax_scale, bool):
         raise TypeError("softmax_scale must be a real number")
-    if float(softmax_scale) != _SOFTMAX_SCALE:
-        raise ProfilerNotImplemented(
-            f"{_BACKEND} requires softmax_scale={_SOFTMAX_SCALE}, got {softmax_scale}"
-        )
+    # bmm1_scale is a runtime scalar; production passes 1/sqrt(qk_head_dim).
+    if not math.isfinite(float(softmax_scale)) or float(softmax_scale) <= 0.0:
+        raise ValueError(f"softmax_scale must be positive and finite, got {softmax_scale}")
     storage_identity = (
         DType.from_value(q_dtype),
         DType.from_value(cache_dtype),
@@ -145,6 +149,7 @@ def _validate_args(
 
     return _Shape(
         num_heads=num_heads,
+        selected_k=selected_k,
         pairs=tuple(pairs),
         valid_counts=tuple(valid_counts),
         request_page_offsets=tuple(request_page_offsets),
@@ -172,7 +177,7 @@ def _build_operands(torch: Any, shape: _Shape, *, device: Any) -> _TrtllmFp8Oper
     )
     cache.copy_(torch.linspace(-0.5, 0.5, _SCORE_DIM, device=device).view(1, 1, 1, _SCORE_DIM))
     block_tables = torch.zeros(
-        (shape.num_queries, 1, _SELECTED_K),
+        (shape.num_queries, 1, shape.selected_k),
         dtype=torch.int32,
         device=device,
     )
@@ -244,7 +249,7 @@ def profile_dsa_sparse_mla_prefill_flashinfer_trtllm_fp8(
         raise ProfilerNotImplemented(f"{_BACKEND} requires the repository vllm_env") from exc
 
     try:
-        _require_b200(torch, backend=_BACKEND)
+        _require_trtllm_gen_device(torch, backend=_BACKEND)
         device = torch.device("cuda", torch.cuda.current_device())
         operands = _build_operands(torch, shape, device=device)
 
@@ -253,6 +258,7 @@ def profile_dsa_sparse_mla_prefill_flashinfer_trtllm_fp8(
                 trtllm_batch_decode_with_kv_cache_mla,
                 operands,
                 softmax_scale=float(softmax_scale),
+                selected_k=shape.selected_k,
             )
 
         output = kernel()
@@ -278,12 +284,12 @@ def profile_dsa_sparse_mla_prefill_flashinfer_trtllm_fp8(
     flops = _logical_flops(
         num_queries=shape.num_queries,
         num_heads=shape.num_heads,
-        selected_k=_SELECTED_K,
+        selected_k=shape.selected_k,
     )
     logical_bytes = _logical_bytes(
         num_queries=shape.num_queries,
         num_heads=shape.num_heads,
-        selected_k=_SELECTED_K,
+        selected_k=shape.selected_k,
         valid_counts=shape.valid_counts,
         q_bytes=1,
         cache_bytes=1,

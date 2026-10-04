@@ -549,7 +549,7 @@ def test_vllm_profile_timed_callable_is_one_fused_call(monkeypatch) -> None:
         fn()
         return 0.25
 
-    monkeypatch.setattr(runner, "_require_supported_gpu", lambda _torch: None)
+    monkeypatch.setattr(runner, "_require_cuda", lambda _torch: None)
     monkeypatch.setattr(runner, "_load_vllm_components", lambda: (fake_fused, object()))
     monkeypatch.setattr(runner, "_build_operands", fake_build)
     monkeypatch.setattr(runner, "_check_correctness", fake_guard)

@@ -286,13 +286,14 @@ def test_valid_counts_rejects_ambiguous_or_nonminimal_encodings(
         ({"num_queries": -1}, "num_queries must be >= 1"),
         ({"num_cache_tokens": 0}, "num_cache_tokens must be >= 1"),
         ({"num_cache_tokens": -1}, "num_cache_tokens must be >= 1"),
-        ({"num_heads": 63}, "num_heads must be 64"),
+        ({"num_heads": 0}, "num_heads must be >= 1"),
         ({"num_kv_heads": 2}, "num_kv_heads must be 1"),
-        ({"selected_k": 1024}, "selected_k must be 2048"),
+        ({"selected_k": 0}, "selected_k must be >= 1"),
         ({"latent_dim": 256}, "latent_dim must be 512"),
         ({"rope_dim": 32}, "rope_dim must be 64"),
         ({"value_dim": 256}, "value_dim must be 512"),
-        ({"softmax_scale": 0.1}, "softmax_scale must be exactly"),
+        ({"softmax_scale": 0.0}, "softmax_scale must be positive and finite"),
+        ({"softmax_scale": float("inf")}, "softmax_scale must be positive and finite"),
         ({"q_dtype": "fp32"}, "q_dtype must be bf16"),
         ({"cache_dtype": "fp32"}, "cache_dtype must be bf16"),
         ({"index_dtype": "int64"}, "index_dtype must be int32"),
@@ -343,7 +344,6 @@ def test_trtllm_fp8_validation_accepts_tp4_local_heads_and_fp8_storage() -> None
                 "cache_layout": "hnd_paged_mqa_fp8_latent_rope",
             }
         ),
-        expected_num_heads=16,
         expected_q_dtype=DType.FP8_E4M3,
         expected_cache_dtype=DType.FP8_E4M3,
         expected_cache_layout="hnd_paged_mqa_fp8_latent_rope",
@@ -352,27 +352,83 @@ def test_trtllm_fp8_validation_accepts_tp4_local_heads_and_fp8_storage() -> None
     assert validated.valid_counts == (2048,)
 
 
-def test_cuda_and_gpu_support_failures_are_typed() -> None:
-    from profiling.runners.attention.dsa_sparse_mla_attention import (
-        _require_b200,
-        _require_h200,
-    )
-
-    no_cuda = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False))
-    with pytest.raises(ProfilerNotImplemented, match="CUDA is required"):
-        _require_h200(no_cuda)
-
-    h100 = SimpleNamespace(
+def _fake_cuda(capability, name="NVIDIA GPU"):
+    return SimpleNamespace(
         cuda=SimpleNamespace(
             is_available=lambda: True,
             current_device=lambda: 0,
-            get_device_name=lambda _device: "NVIDIA H100",
+            get_device_name=lambda _device: name,
+            get_device_capability=lambda _device: capability,
         )
     )
-    with pytest.raises(ProfilerNotImplemented, match="requires NVIDIA H200"):
-        _require_h200(h100)
-    with pytest.raises(ProfilerNotImplemented, match="requires NVIDIA B200"):
-        _require_b200(h100)
+
+
+def test_device_checks_follow_compute_capability_not_gpu_name() -> None:
+    from profiling.runners.attention.dsa_sparse_mla_attention import (
+        _require_cuda,
+        _require_flashmla_device,
+        _require_trtllm_gen_device,
+    )
+
+    no_cuda = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False))
+    for check in (_require_cuda, _require_trtllm_gen_device):
+        with pytest.raises(ProfilerNotImplemented, match="CUDA is required"):
+            check(no_cuda)
+    with pytest.raises(ProfilerNotImplemented, match="CUDA is required"):
+        _require_flashmla_device(no_cuda, num_heads=64, selected_k=2048)
+
+    # The Torch composite runs on any CUDA device.
+    _require_cuda(_fake_cuda((8, 0), "NVIDIA A100"))
+    # FlashMLA: any sm90a part (H100 included) or the sm100f family.
+    _require_flashmla_device(_fake_cuda((9, 0), "NVIDIA H100"), num_heads=64, selected_k=2048)
+    _require_flashmla_device(_fake_cuda((10, 0), "NVIDIA B200"), num_heads=128, selected_k=1024)
+    _require_flashmla_device(_fake_cuda((10, 3)), num_heads=64, selected_k=576)
+    with pytest.raises(ProfilerNotImplemented, match="sm90a"):
+        _require_flashmla_device(_fake_cuda((8, 9)), num_heads=64, selected_k=2048)
+    with pytest.raises(ProfilerNotImplemented, match="selected_k % 128"):
+        _require_flashmla_device(_fake_cuda((9, 0)), num_heads=64, selected_k=576)
+    with pytest.raises(ProfilerNotImplemented, match="selected_k % 128"):
+        _require_flashmla_device(_fake_cuda((10, 0)), num_heads=128, selected_k=576)
+    # TRTLLM-GEN: the SM100 family only.
+    _require_trtllm_gen_device(_fake_cuda((10, 0), "NVIDIA B200"))
+    _require_trtllm_gen_device(_fake_cuda((10, 3), "NVIDIA B300"))
+    with pytest.raises(ProfilerNotImplemented, match="SM100-family"):
+        _require_trtllm_gen_device(_fake_cuda((9, 0), "NVIDIA H200"))
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"num_heads": 32},
+        {"num_heads": 128},
+        {"selected_k": 1024, "valid_counts": "u:1024x1"},
+        {"selected_k": 2176, "num_cache_tokens": 4096, "valid_counts": "u:2176x1"},
+        {"softmax_scale": 512**-0.5},
+    ],
+)
+def test_torch_validation_accepts_unmeasured_shapes(overrides) -> None:
+    from profiling.runners.attention.dsa_sparse_mla_attention import _validate_args
+
+    assert _validate_args(**(_BASE_SPEC | overrides)).num_queries == 1
+
+
+def test_flashmla_validation_keeps_the_kernel_head_set_and_topk_tile() -> None:
+    from profiling.runners.attention import dsa_sparse_mla_attention as runner
+
+    flashmla = {
+        "allowed_num_heads": runner._FLASHMLA_NUM_HEADS,
+        "selected_k_multiple": runner._FLASHMLA_MIN_TOPK_BLOCK,
+    }
+    runner._validate_args(**(_BASE_SPEC | {"num_heads": 128}), **flashmla)
+    runner._validate_args(
+        **(_BASE_SPEC | {"selected_k": 1024, "valid_counts": "u:1024x1"}), **flashmla
+    )
+    with pytest.raises(ProfilerNotImplemented, match=r"num_heads must be one of \[64, 128\]"):
+        runner._validate_args(**(_BASE_SPEC | {"num_heads": 32}), **flashmla)
+    with pytest.raises(ProfilerNotImplemented, match="multiple of 64"):
+        runner._validate_args(
+            **(_BASE_SPEC | {"selected_k": 2000, "valid_counts": "u:2000x1"}), **flashmla
+        )
 
 
 def test_flashmla_loader_is_lazy_and_typed(monkeypatch) -> None:
@@ -487,7 +543,6 @@ def test_flashmla_correctness_checks_tuple_diagnostics_and_exact_forwarding(
 ) -> None:
     from profiling.runners.attention import dsa_sparse_mla_attention as runner
 
-    monkeypatch.setattr(runner, "_NUM_HEADS", 2)
     q = torch.linspace(-0.5, 0.5, 3 * 2 * 576).reshape(3, 2, 576).to(torch.bfloat16)
     cache = torch.linspace(-0.6, 0.7, 5 * 576).reshape(5, 1, 576).to(torch.bfloat16)
     indices = torch.tensor(
@@ -516,7 +571,6 @@ def test_flashmla_correctness_checks_tuple_diagnostics_and_exact_forwarding(
 def test_flashmla_correctness_rejects_bad_all_invalid_diagnostics(monkeypatch) -> None:
     from profiling.runners.attention import dsa_sparse_mla_attention as runner
 
-    monkeypatch.setattr(runner, "_NUM_HEADS", 1)
     q = torch.zeros((1, 1, 576), dtype=torch.bfloat16)
     cache = torch.zeros((1, 1, 576), dtype=torch.bfloat16)
     indices = torch.full((1, 1, 4), -1, dtype=torch.int32)
@@ -538,7 +592,6 @@ def test_flashmla_correctness_rejects_output_input_alias(monkeypatch) -> None:
     from profiling.runners.attention import dsa_sparse_mla_attention as runner
     from profiling.runners.attention import dsa_sparse_mla_attention_reference as reference
 
-    monkeypatch.setattr(runner, "_NUM_HEADS", 1)
     q = torch.zeros((1, 1, 576), dtype=torch.bfloat16)
     cache = torch.zeros((1, 1, 576), dtype=torch.bfloat16)
     indices = torch.zeros((1, 1, 4), dtype=torch.int32)
@@ -601,15 +654,15 @@ def test_index_distributions_are_deterministic_unique_and_in_range(distribution)
 def test_operands_have_exact_layout_and_valid_then_sentinel_slots(monkeypatch) -> None:
     from profiling.runners.attention import dsa_sparse_mla_attention as runner
 
-    monkeypatch.setattr(runner, "_NUM_HEADS", 3)
-    monkeypatch.setattr(runner, "_SELECTED_K", 8)
     validated = runner._ValidatedArgs(
         num_queries=3,
         num_cache_tokens=17,
         valid_counts=(0, 3, 8),
         index_distribution="unique_scattered_pages",
     )
-    operands = runner._build_operands(torch, validated, device=torch.device("cpu"))
+    operands = runner._build_operands(
+        torch, validated, num_heads=3, selected_k=8, device=torch.device("cpu")
+    )
 
     assert operands.q.shape == (3, 3, 576)
     assert operands.cache.shape == (17, 1, 576)
@@ -630,8 +683,6 @@ def test_operands_have_exact_layout_and_valid_then_sentinel_slots(monkeypatch) -
 def test_operand_sources_do_not_scale_an_arange_with_cache_size(monkeypatch) -> None:
     from profiling.runners.attention import dsa_sparse_mla_attention as runner
 
-    monkeypatch.setattr(runner, "_NUM_HEADS", 2)
-    monkeypatch.setattr(runner, "_SELECTED_K", 8)
     seen: list[int] = []
     original_arange = torch.arange
 
@@ -647,7 +698,7 @@ def test_operand_sources_do_not_scale_an_arange_with_cache_size(monkeypatch) -> 
         valid_counts=(8, 8),
         index_distribution="uniform_stride",
     )
-    runner._build_operands(torch, validated, device=torch.device("cpu"))
+    runner._build_operands(torch, validated, num_heads=2, selected_k=8, device=torch.device("cpu"))
     assert max(seen) <= 64
 
 
@@ -696,7 +747,10 @@ def test_trtllm_fp8_launch_matches_vllm_flashinfer_call() -> None:
         calls.append(kwargs)
         return "output"
 
-    assert runner._launch_trtllm_fp8(callable_, operands, softmax_scale=0.0625) == "output"
+    assert (
+        runner._launch_trtllm_fp8(callable_, operands, softmax_scale=0.0625, selected_k=2048)
+        == "output"
+    )
     assert calls == [
         {
             "query": operands.query,
@@ -720,7 +774,6 @@ def test_vectorized_composite_matches_reference_for_empty_short_and_full_rows(
 ) -> None:
     from profiling.runners.attention import dsa_sparse_mla_attention as runner
 
-    monkeypatch.setattr(runner, "_SELECTED_K", 5)
     q = torch.linspace(-0.8, 0.9, 3 * 2 * 576).reshape(3, 2, 576).to(torch.bfloat16)
     cache = torch.linspace(-1.0, 0.7, 7 * 576).reshape(7, 1, 576).to(torch.bfloat16)
     indices = torch.tensor(
@@ -747,7 +800,6 @@ def test_vectorized_composite_matches_reference_for_empty_short_and_full_rows(
 def test_composite_is_independent_of_query_chunking(monkeypatch) -> None:
     from profiling.runners.attention import dsa_sparse_mla_attention as runner
 
-    monkeypatch.setattr(runner, "_SELECTED_K", 4)
     q = torch.linspace(-0.4, 0.6, 5 * 3 * 576).reshape(5, 3, 576).to(torch.bfloat16)
     cache = torch.linspace(-0.7, 0.5, 9 * 576).reshape(9, 1, 576).to(torch.bfloat16)
     indices = torch.tensor(
@@ -791,7 +843,7 @@ def test_profile_times_complete_composite_and_returns_compute_metrics(monkeypatc
 
     operands = runner._Operands(q=object(), cache=object(), selected_indices=object())
     calls: list[str] = []
-    monkeypatch.setattr(runner, "_require_h200", lambda _torch: None)
+    monkeypatch.setattr(runner, "_require_cuda", lambda _torch: None)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(runner, "_build_operands", lambda *_args, **_kwargs: operands)
     monkeypatch.setattr(
@@ -836,7 +888,7 @@ def test_profile_times_complete_composite_and_returns_compute_metrics(monkeypatc
 def test_profile_translates_runtime_failures(monkeypatch) -> None:
     from profiling.runners.attention import dsa_sparse_mla_attention as runner
 
-    monkeypatch.setattr(runner, "_require_h200", lambda _torch: None)
+    monkeypatch.setattr(runner, "_require_cuda", lambda _torch: None)
 
     def fail(*_args, **_kwargs):
         raise RuntimeError("allocation failed")
@@ -860,7 +912,9 @@ def test_flashmla_profile_times_only_native_callable_and_reuses_accounting(
         calls.append(("flash", args))
         return returned
 
-    monkeypatch.setattr(runner, "_require_h200", lambda *_args, **_kwargs: calls.append("gpu"))
+    monkeypatch.setattr(
+        runner, "_require_flashmla_device", lambda *_args, **_kwargs: calls.append("gpu")
+    )
     monkeypatch.setattr(
         runner, "_load_flashmla_sparse_fwd", lambda: calls.append("load") or fake_flash
     )
@@ -916,7 +970,7 @@ def test_flashmla_profile_times_only_native_callable_and_reuses_accounting(
         "correctness",
         (
             "timer",
-            "sparse_attn_fwd_kernel",
+            "sparse_attn_fwd",
         ),
     ]
     flash_calls = [entry for entry in calls if isinstance(entry, tuple) and entry[0] == "flash"]
@@ -937,7 +991,7 @@ def test_flashmla_profile_times_only_native_callable_and_reuses_accounting(
 def test_flashmla_profile_typed_failures(monkeypatch) -> None:
     from profiling.runners.attention import dsa_sparse_mla_attention as runner
 
-    monkeypatch.setattr(runner, "_require_h200", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(runner, "_require_flashmla_device", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
 
     def unavailable():
@@ -977,7 +1031,7 @@ def test_flashmla_profile_typed_failures(monkeypatch) -> None:
 def test_flashmla_profile_preserves_typed_oom(monkeypatch) -> None:
     from profiling.runners.attention import dsa_sparse_mla_attention as runner
 
-    monkeypatch.setattr(runner, "_require_h200", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(runner, "_require_flashmla_device", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(runner, "_load_flashmla_sparse_fwd", lambda: object())
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
 
@@ -1008,9 +1062,15 @@ _NOPE_SPEC = _BASE_SPEC | {
     [
         ({}, "reached the launch"),
         ({"selected_k": 2048, "valid_counts": "u:2048x2"}, "reached the launch"),
-        ({"selected_k": 2304}, "selected_k must be 2048 or 2176"),
+        ({"selected_k": 2304}, "reached the launch"),
+        ({"selected_k": 0}, "selected_k must be >= 1"),
         ({"cache_layout": "hnd_paged_mqa_fp8_latent_rope"}, "cache_layout must be"),
-        ({"rope_dim": 64}, "selected_k must be 2048, got 2176"),
+        ({"rope_dim": 64}, "cache_layout must be"),
+        ({"rope_dim": 64, "cache_layout": "hnd_paged_mqa_fp8_latent_rope"}, "reached the launch"),
+        ({"softmax_scale": 512**-0.5}, "reached the launch"),
+        ({"num_heads": 32}, "reached the launch"),
+        ({"num_heads": 128}, "reached the launch"),
+        ({"num_heads": 0}, "num_heads must be >= 1"),
     ],
 )
 def test_trtllm_fp8_rope_dim_selects_the_accepted_layout(monkeypatch, overrides, match) -> None:
@@ -1019,7 +1079,7 @@ def test_trtllm_fp8_rope_dim_selects_the_accepted_layout(monkeypatch, overrides,
     def reached(*_args, **_kwargs):
         raise ProfilerNotImplemented("reached the launch")
 
-    monkeypatch.setattr(runner, "_require_b200", reached)
+    monkeypatch.setattr(runner, "_require_trtllm_gen_device", reached)
     with pytest.raises(ProfilerNotImplemented, match=match):
         runner.profile_dsa_sparse_mla_attention_flashinfer_trtllm_fp8(**(_NOPE_SPEC | overrides))
 

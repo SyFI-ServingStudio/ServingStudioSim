@@ -1,11 +1,13 @@
 """Behavioral tests for DeepSeek's clamped routed-expert activation."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 from profiling.runners.exceptions import ProfilerNotImplemented
 from profiling.runners.moe.clamped_swiglu_reference import clamped_swiglu_reference
-from profiling.runners.moe.clamped_swiglu_vllm_inductor import _validate_args
+from profiling.runners.moe.clamped_swiglu_vllm_inductor import _require_cuda, _validate_args
 
 
 def test_reference_applies_the_asymmetric_gate_and_up_clamps() -> None:
@@ -17,9 +19,33 @@ def test_reference_applies_the_asymmetric_gate_and_up_clamps() -> None:
     torch.testing.assert_close(result, expected, atol=0.1, rtol=0.01)
 
 
-@pytest.mark.parametrize(("hidden_dim", "dtype"), [(1024, "bf16"), (2048, "fp16")])
-def test_runner_rejects_shapes_outside_the_measured_deepseek_path(
-    hidden_dim: int, dtype: str
+@pytest.mark.parametrize(
+    ("hidden_dim", "dtype", "error"),
+    [(2048, "fp16", ProfilerNotImplemented), (0, "bf16", ValueError)],
+)
+def test_runner_rejects_unbuilt_dtype_and_empty_rows(
+    hidden_dim: int, dtype: str, error: type[Exception]
 ) -> None:
-    with pytest.raises(ProfilerNotImplemented):
+    with pytest.raises(error):
         _validate_args(128, hidden_dim, dtype)
+
+
+@pytest.mark.parametrize("hidden_dim", [1024, 2048, 3072, 1001])
+def test_runner_accepts_any_positive_hidden_dim(hidden_dim: int) -> None:
+    assert _validate_args(128, hidden_dim, "bf16") == (128, hidden_dim)
+
+
+@pytest.mark.parametrize("gpu_name", ["NVIDIA H200", "NVIDIA B200", "NVIDIA A100-SXM4-80GB"])
+def test_runner_needs_cuda_but_no_particular_gpu(gpu_name: str) -> None:
+    def fake_torch(available: bool) -> SimpleNamespace:
+        return SimpleNamespace(
+            cuda=SimpleNamespace(
+                is_available=lambda: available,
+                current_device=lambda: 0,
+                get_device_name=lambda _: gpu_name,
+            )
+        )
+
+    _require_cuda(fake_torch(True))
+    with pytest.raises(ProfilerNotImplemented, match="requires CUDA"):
+        _require_cuda(fake_torch(False))

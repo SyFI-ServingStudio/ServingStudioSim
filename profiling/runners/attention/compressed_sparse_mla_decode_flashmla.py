@@ -10,10 +10,17 @@ from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerN
 from profiling.runners.metrics import ComputeMetrics
 
 _BACKEND = "compressed_sparse_mla_decode:vllm_flashmla_fp8_cudagraph"
-_GPU_NAME = "NVIDIA H200"
+# vLLM's paged layout for each DeepSeek V4 layer kind: the SWA-only layer has no
+# extra cache; C4 and C128 compressed caches page 64 and 2 rows per block.
 _PAGE_SIZE = {1: 0, 4: 64, 128: 2}
 _PLANNER_MODES = frozenset({"planned", "reused"})
-_PRODUCTION_MODEL_SHAPE = (64, 1, 512, 512, 128)
+# FlashMLA sparse decode (csrc/api/sparse_decode.h at vLLM's pinned 6bc4941):
+# h_q 64 or 128, MQA (h_kv 1), and the MODEL1 584-byte cache that this runner
+# packs needs d_qk = d_v = 512; topk and extra_topk tile by 64 (TOPK_BLOCK_SIZE
+# on SM90, B_TOPK on SM100). It runs only on SM90a and SM100f.
+_NUM_HEADS = frozenset({64, 128})
+_CACHE_SHAPE = (1, 512, 512)
+_TOPK_BLOCK = 64
 _PRODUCTION_DTYPES = ("bf16", "fp8_e4m3", "bf16")
 
 
@@ -61,15 +68,20 @@ def _validate_args(
 ) -> _Shape:
     if not swa_valid_counts or len(swa_valid_counts) != len(extra_valid_counts):
         raise ValueError("valid-count tuples must be non-empty and have equal length")
-    if len(swa_valid_counts) > 256:
-        raise ProfilerNotImplemented(f"{_BACKEND} supports at most 256 decode rows")
     if compress_ratio not in _PAGE_SIZE:
         raise ProfilerNotImplemented(f"{_BACKEND} supports compress_ratio=1/4/128")
-    model_shape = (num_heads, num_kv_heads, head_dim, value_dim, swa_window)
-    if model_shape != _PRODUCTION_MODEL_SHAPE:
+    if num_heads not in _NUM_HEADS:
         raise ProfilerNotImplemented(
-            f"{_BACKEND} supports model shape {_PRODUCTION_MODEL_SHAPE}, got {model_shape}"
+            f"{_BACKEND} needs num_heads in {sorted(_NUM_HEADS)}, got {num_heads}"
         )
+    cache_shape = (num_kv_heads, head_dim, value_dim)
+    if cache_shape != _CACHE_SHAPE:
+        raise ProfilerNotImplemented(
+            f"{_BACKEND} needs (num_kv_heads, head_dim, value_dim) == {_CACHE_SHAPE}, "
+            f"got {cache_shape}"
+        )
+    if type(swa_window) is not int or swa_window <= 0 or swa_window % _TOPK_BLOCK:
+        raise ValueError(f"swa_window must be a positive multiple of {_TOPK_BLOCK}")
     dtype_identity = tuple(str(dtype) for dtype in (q_dtype, cache_dtype, output_dtype))
     if dtype_identity != _PRODUCTION_DTYPES:
         raise ProfilerNotImplemented(
@@ -78,17 +90,16 @@ def _validate_args(
     if any(type(count) is not int or not 1 <= count <= swa_window for count in swa_valid_counts):
         raise ValueError("each SWA valid count must be an integer in [1, swa_window]")
     if compress_ratio == 1:
-        expected_extra_capacity = 0
-    elif compress_ratio == 4:
-        expected_extra_capacity = 512
-    else:
-        expected_extra_capacity = extra_index_capacity
-        if not 128 <= extra_index_capacity <= 8192 or extra_index_capacity % 128:
-            raise ValueError("C128 extra_index_capacity must be a multiple of 128 in [128, 8192]")
-    if extra_index_capacity != expected_extra_capacity:
+        if extra_index_capacity != 0:
+            raise ValueError("compress_ratio=1 requires extra_index_capacity=0")
+    elif (
+        type(extra_index_capacity) is not int
+        or extra_index_capacity <= 0
+        or extra_index_capacity % _TOPK_BLOCK
+    ):
         raise ValueError(
-            f"compress_ratio={compress_ratio} requires "
-            f"extra_index_capacity={expected_extra_capacity}"
+            f"compress_ratio={compress_ratio} needs extra_index_capacity to be a positive "
+            f"multiple of {_TOPK_BLOCK}"
         )
     if any(
         type(count) is not int or not 0 <= count <= extra_index_capacity
@@ -110,13 +121,14 @@ def _validate_args(
     )
 
 
-def _require_h200(torch: Any) -> Any:
+def _require_flashmla_gpu(torch: Any) -> Any:
     if not torch.cuda.is_available():
         raise ProfilerNotImplemented(f"{_BACKEND} requires CUDA")
     device = torch.device("cuda", torch.cuda.current_device())
-    name = str(torch.cuda.get_device_name(device))
-    if name != _GPU_NAME or tuple(torch.cuda.get_device_capability(device)) != (9, 0):
-        raise ProfilerNotImplemented(f"{_BACKEND} requires {_GPU_NAME} SM90, got {name}")
+    capability = tuple(torch.cuda.get_device_capability(device))
+    # FlashMLA's Arch::is_sm90a() / is_sm100f(): exactly SM90, or any SM10x.
+    if capability != (9, 0) and capability[0] != 10:
+        raise ProfilerNotImplemented(f"{_BACKEND} requires SM90a or SM100f, got SM{capability}")
     return device
 
 
@@ -323,7 +335,7 @@ def profile_compressed_sparse_mla_decode_flashmla(
     except ImportError as exc:
         raise ProfilerNotImplemented(f"{_BACKEND} requires pinned vLLM FlashMLA") from exc
     try:
-        device = _require_h200(torch)
+        device = _require_flashmla_gpu(torch)
         operands = _prepare(torch, shape, device)
         graph, _output, lse = _capture(
             torch, flash_mla_with_kvcache, get_mla_metadata, operands, shape

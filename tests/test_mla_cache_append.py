@@ -246,23 +246,34 @@ def test_runner_rejects_nonpositive_dimensions_before_cuda(
         (512, 64, 32),
     ],
 )
-def test_runner_rejects_unsupported_dimensions_before_cuda(
+def test_runner_accepts_unmeasured_plain_cache_dimensions(
     kv_lora_rank,
     rope_dim,
     block_size,
 ):
     from profiling.runners.attention.mla_cache_append import _validate_args
 
-    with pytest.raises(ValueError, match=r"== \(512, 64, 64\)"):
-        _validate_args(
-            1,
-            kv_lora_rank,
-            rope_dim,
-            block_size,
-            DType.BF16,
-            DType.BF16,
-            "plain",
-        )
+    validated = _validate_args(
+        1,
+        kv_lora_rank,
+        rope_dim,
+        block_size,
+        DType.BF16,
+        DType.BF16,
+        "plain",
+    )
+    assert validated[1:4] == (kv_lora_rank, rope_dim, block_size)
+
+
+@pytest.mark.parametrize(
+    ("kv_lora_rank", "rope_dim", "block_size"),
+    [(0, 64, 64), (512, 0, 64), (512, 64, 0)],
+)
+def test_runner_rejects_nonpositive_dimensions(kv_lora_rank, rope_dim, block_size):
+    from profiling.runners.attention.mla_cache_append import _validate_args
+
+    with pytest.raises(ValueError, match="must be > 0"):
+        _validate_args(1, kv_lora_rank, rope_dim, block_size, DType.BF16, DType.BF16, "plain")
 
 
 @pytest.mark.parametrize(
@@ -324,7 +335,7 @@ def test_runner_rejects_unsupported_cache_format_before_cuda(cache_format):
         )
 
 
-def test_runner_rejects_missing_cuda_and_unverified_gpu():
+def test_runner_requires_cuda_but_no_gpu_allowlist():
     from profiling.runners.attention.mla_cache_append import (
         _validate_cuda_device,
     )
@@ -340,11 +351,7 @@ def test_runner_rejects_missing_cuda_and_unverified_gpu():
             get_device_name=lambda _device: "NVIDIA H100",
         )
     )
-    with pytest.raises(
-        ProfilerNotImplemented,
-        match="verified only on NVIDIA H200, got NVIDIA H100",
-    ):
-        _validate_cuda_device(h100)
+    _validate_cuda_device(h100)
 
 
 def test_vllm_runner_rejects_invalid_args_before_framework_imports():
@@ -363,9 +370,9 @@ def test_vllm_runner_rejects_invalid_args_before_framework_imports():
     }
     invalid_cases = [
         ({"num_tokens": 0}, "must be > 0"),
-        ({"kv_lora_rank": 256}, r"== \(512, 64, 64\)"),
-        ({"rope_dim": 128}, r"== \(512, 64, 64\)"),
-        ({"block_size": 32}, r"== \(512, 64, 64\)"),
+        ({"kv_lora_rank": 0}, "must be > 0"),
+        ({"block_size": 0}, "must be > 0"),
+        ({"rope_dim": -1}, "rope_dim >= 0"),
         ({"input_dtype": DType.FP16}, "requires BF16 input"),
         ({"kv_dtype": DType.FP16}, "requires BF16 input"),
         ({"cache_format": "fp8_ds_mla"}, "cache_format='plain'"),
@@ -375,7 +382,7 @@ def test_vllm_runner_rejects_invalid_args_before_framework_imports():
             profile_mla_cache_append_vllm_cuda(**(valid | overrides))
 
 
-def test_vllm_runner_rejects_missing_cuda_and_unverified_gpu():
+def test_vllm_runner_requires_cuda_but_no_gpu_allowlist():
     from profiling.runners.attention.mla_cache_append import (
         _validate_vllm_cuda_device,
     )
@@ -391,20 +398,7 @@ def test_vllm_runner_rejects_missing_cuda_and_unverified_gpu():
             get_device_name=lambda _device: "NVIDIA H100",
         )
     )
-    with pytest.raises(
-        ProfilerNotImplemented,
-        match="verified only on NVIDIA H200 or NVIDIA B200, got NVIDIA H100",
-    ):
-        _validate_vllm_cuda_device(h100)
-
-    b200 = SimpleNamespace(
-        cuda=SimpleNamespace(
-            is_available=lambda: True,
-            current_device=lambda: 0,
-            get_device_name=lambda _device: "NVIDIA B200",
-        )
-    )
-    _validate_vllm_cuda_device(b200)
+    _validate_vllm_cuda_device(h100)
 
 
 def test_vllm_runner_maps_fp8_cache_to_torch_storage_dtype(monkeypatch):

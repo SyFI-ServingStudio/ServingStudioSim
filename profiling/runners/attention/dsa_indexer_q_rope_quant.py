@@ -12,7 +12,6 @@ from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerN
 from profiling.runners.metrics import ComputeMetrics
 
 _BACKEND = "dsa_indexer_q_rope_quant:sglang_cuda"
-_SUPPORTED_GPUS = ("NVIDIA B200",)
 _HEAD_DIM = 128
 _ROPE_DIM = 64
 _ROPE_LAYOUT = "rope_first"
@@ -78,13 +77,10 @@ def _validate_args(
 
 
 def _validate_device(torch: Any) -> None:
+    # SGLang JIT-builds main_norm_rope.cuh for the current device; the kernel
+    # has no arch-specific path (PDL is opted in only where the arch supports it).
     if not torch.cuda.is_available():
         raise ProfilerNotImplemented(f"{_BACKEND} requires CUDA")
-    gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
-    if gpu_name not in _SUPPORTED_GPUS:
-        raise ProfilerNotImplemented(
-            f"{_BACKEND} is verified only on {' or '.join(_SUPPORTED_GPUS)}, got {gpu_name}"
-        )
 
 
 def _prepare(torch: Any, callable_: Any, *, num_tokens: int, num_heads: int) -> _Launch:

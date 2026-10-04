@@ -13,8 +13,15 @@ from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerN
 from profiling.runners.metrics import ComputeMetrics
 
 _BACKEND = "dsa_compressed_mqa_logits_prefill:vllm_deepgemm_fp8"
-_GPU_NAME = "NVIDIA H200"
-_MODEL_IDENTITY = (64, 128)
+# DeepGEMM's fp8_fp4_mqa_logits host asserts (csrc/apis/attention.hpp at the
+# vLLM-pinned 8b1392b): FP8 head_dim 32/64/128 on every arch, and per-arch
+# q-head counts. Other arch majors have no kernel.
+_HEAD_DIMS = frozenset({32, 64, 128})
+_NUM_HEADS_BY_ARCH_MAJOR = {
+    9: frozenset({32, 64}),
+    10: frozenset({8, 16, 32, 64}),
+    12: frozenset({16, 32, 64}),
+}
 _STORAGE_IDENTITY = ("fp8_e4m3", "fp8_e4m3", "fp32", "fp32", "fp32", False)
 
 
@@ -43,8 +50,12 @@ def _validate_args(
     output_dtype: object,
     clean_logits: bool,
 ) -> tuple[IndexerPrefillChunk, ...]:
-    if (num_heads, head_dim) != _MODEL_IDENTITY:
-        raise ProfilerNotImplemented(f"{_BACKEND} supports model identity {_MODEL_IDENTITY}")
+    all_head_counts = frozenset().union(*_NUM_HEADS_BY_ARCH_MAJOR.values())
+    if num_heads not in all_head_counts or head_dim not in _HEAD_DIMS:
+        raise ProfilerNotImplemented(
+            f"{_BACKEND} needs num_heads in {sorted(all_head_counts)} and head_dim in "
+            f"{sorted(_HEAD_DIMS)}, got ({num_heads}, {head_dim})"
+        )
     storage_identity = (
         str(q_dtype),
         str(k_dtype),
@@ -64,14 +75,18 @@ def _validate_args(
     )
 
 
-def _build_operands(torch: Any, chunk: IndexerPrefillChunk, device: Any) -> _Operands:
-    q = torch.empty((chunk.num_queries, 64, 128), dtype=torch.float8_e4m3fn, device=device)
-    weights = torch.empty((chunk.num_queries, 64), dtype=torch.float32, device=device)
+def _build_operands(
+    torch: Any, chunk: IndexerPrefillChunk, device: Any, num_heads: int, head_dim: int
+) -> _Operands:
+    q = torch.empty(
+        (chunk.num_queries, num_heads, head_dim), dtype=torch.float8_e4m3fn, device=device
+    )
+    weights = torch.empty((chunk.num_queries, num_heads), dtype=torch.float32, device=device)
     for query_start in range(0, chunk.num_queries, 512):
         query_stop = min(query_start + 512, chunk.num_queries)
         query_rows = torch.arange(query_start, query_stop, dtype=torch.float32, device=device)
-        feature = torch.arange(128, dtype=torch.float32, device=device)
-        heads = torch.arange(64, dtype=torch.float32, device=device)
+        feature = torch.arange(head_dim, dtype=torch.float32, device=device)
+        heads = torch.arange(num_heads, dtype=torch.float32, device=device)
         q[query_start:query_stop] = (
             ((query_rows[:, None, None] + heads[None, :, None] + feature[None, None, :]) % 29)
             / 16.0
@@ -80,11 +95,11 @@ def _build_operands(torch: Any, chunk: IndexerPrefillChunk, device: Any) -> _Ope
         weights[query_start:query_stop] = (
             0.25 + query_rows[:, None] / 8192.0 + heads[None, :] / 2048.0
         )
-    k = torch.empty((chunk.num_keys, 128), dtype=torch.float8_e4m3fn, device=device)
+    k = torch.empty((chunk.num_keys, head_dim), dtype=torch.float8_e4m3fn, device=device)
     for key_start in range(0, chunk.num_keys, 4096):
         key_stop = min(key_start + 4096, chunk.num_keys)
         key_rows = torch.arange(key_start, key_stop, dtype=torch.float32, device=device)
-        feature = torch.arange(128, dtype=torch.float32, device=device)
+        feature = torch.arange(head_dim, dtype=torch.float32, device=device)
         k[key_start:key_stop] = (
             ((key_rows[:, None] * 3 + feature[None, :]) % 31) / 16.0 - 0.9375
         ).to(torch.float8_e4m3fn)
@@ -170,11 +185,15 @@ def profile_dsa_compressed_mqa_logits_prefill_deepgemm(
         if not torch.cuda.is_available():
             raise ProfilerNotImplemented(f"{_BACKEND} requires CUDA")
         device = torch.device("cuda", torch.cuda.current_device())
-        if torch.cuda.get_device_name(device) != _GPU_NAME or tuple(
-            torch.cuda.get_device_capability(device)
-        ) != (9, 0):
-            raise ProfilerNotImplemented(f"{_BACKEND} requires {_GPU_NAME} SM90")
-        operands = tuple(_build_operands(torch, chunk, device) for chunk in chunks)
+        arch_major = torch.cuda.get_device_capability(device)[0]
+        if num_heads not in _NUM_HEADS_BY_ARCH_MAJOR.get(arch_major, frozenset()):
+            raise ProfilerNotImplemented(
+                f"{_BACKEND} has no DeepGEMM FP8 MQA-logits kernel for num_heads={num_heads} "
+                f"on SM{arch_major}x"
+            )
+        operands = tuple(
+            _build_operands(torch, chunk, device, num_heads, head_dim) for chunk in chunks
+        )
         for chunk_operands in operands:
             _check_output(torch, fp8_fp4_mqa_logits, chunk_operands)
 
@@ -186,11 +205,11 @@ def profile_dsa_compressed_mqa_logits_prefill_deepgemm(
         total_queries = sum(chunk.num_queries for chunk in chunks)
         valid_key_pairs = sum(chunk.valid_key_pairs for chunk in chunks)
         logical_bytes = (
-            total_queries * 64 * 128
-            + valid_key_pairs * (128 + 4 + 4)
-            + total_queries * (64 * 4 + 8)
+            total_queries * num_heads * head_dim
+            + valid_key_pairs * (head_dim + 4 + 4)
+            + total_queries * (num_heads * 4 + 8)
         )
-        nominal_flops = 2 * valid_key_pairs * 64 * 128
+        nominal_flops = 2 * valid_key_pairs * num_heads * head_dim
         elapsed_seconds = time_ms / 1000.0
         return ComputeMetrics(
             time_ms=float(time_ms),

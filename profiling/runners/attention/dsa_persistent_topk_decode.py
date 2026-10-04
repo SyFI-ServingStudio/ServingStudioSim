@@ -5,9 +5,10 @@ production backend packages a corrected vLLM v0.23-derived
 ``persistent_topk``: lengths through ``top_k`` retain the pinned natural-index
 writer, while every longer row uses the bundled cooperative radix path. Its
 workspace memset and one persistent kernel write all ``top_k`` slots. The
-indexer's separate outer global index-buffer fill remains excluded. On B200 the
-backend calls the image vLLM's own ``persistent_topk`` (3f667d7eb), whose
-buffered selection paths have a known tie-overflow bug (``_overflow_buffer``).
+indexer's separate outer global index-buffer fill remains excluded. The
+corrected extension is compiled for ``sm_90`` only, so every other device calls
+the image vLLM's own ``persistent_topk`` (3f667d7eb), whose buffered selection
+paths have a known tie-overflow bug (``_overflow_buffer``).
 """
 
 from __future__ import annotations
@@ -22,15 +23,16 @@ from profiling.runners.exceptions import KernelLaunchFailed, ProfilerNotImplemen
 from profiling.runners.metrics import ComputeMetrics
 
 _MIN_BATCH_SIZE = 1
-_MAX_BATCH_SIZE = 256
-_TOP_K = 2048
 _LOGITS_DTYPE = DType.FP32
 _INDEX_DTYPE = "int32"
 _CONTEXT_MODE = "uniform"
-_REQUIRED_GPU = "NVIDIA H200"
-_VLLM_SUPPORTED_GPUS = ("NVIDIA H200", "NVIDIA B200")
-# The callable's K instantiations; GLM-5.3-Flash's kpool indexer selects 2048 / 4.
+# The callable's K instantiations (vLLM csrc/libtorch_stable/topk.cu dispatch);
+# GLM-5.3-Flash's kpool indexer selects 2048 / 4. The Torch composite is checked
+# against the same reference, so both backends share the bound.
 _VLLM_TOP_K = frozenset({512, 1024, 2048})
+# The corrected extension builds SASS for sm_90 only
+# (dsa_persistent_topk_native/loader.py `_CUDA_CFLAGS`).
+_NATIVE_EXTENSION_CAPABILITY = (9, 0)
 _WORKSPACE_BYTES = 1024 * 1024
 
 
@@ -66,7 +68,7 @@ def _validate_args(
     logits_dtype: DType | str,
     index_dtype: str,
     context_mode: str,
-    allowed_top_k: frozenset[int] = frozenset({_TOP_K}),
+    allowed_top_k: frozenset[int] = _VLLM_TOP_K,
 ) -> tuple[int, int, int, int, int, int, DType, str, str]:
     batch_size = int(batch_size)
     context_len = int(context_len)
@@ -78,10 +80,10 @@ def _validate_args(
     index_dtype = str(index_dtype)
     context_mode = str(context_mode)
 
-    if not _MIN_BATCH_SIZE <= batch_size <= _MAX_BATCH_SIZE:
-        raise ValueError(
-            f"dsa_persistent_topk_decode requires 1 <= batch_size <= 256, got {batch_size}"
-        )
+    # No row cap: topk.cu dispatches any row count (<=4, <=8, >32 filtered, else
+    # persistent) and sizes its grid from the device SM count.
+    if batch_size < _MIN_BATCH_SIZE:
+        raise ValueError(f"dsa_persistent_topk_decode requires batch_size >= 1, got {batch_size}")
     if next_n <= 0:
         raise ValueError(f"dsa_persistent_topk_decode requires next_n > 0, got {next_n}")
     if context_len < 0:
@@ -135,19 +137,17 @@ def _validate_args(
     )
 
 
-def _validate_cuda_device(torch: Any, *, backend: str = "torch") -> str:
+def _validate_cuda_device(torch: Any, *, backend: str = "torch") -> None:
     if not torch.cuda.is_available():
         raise ProfilerNotImplemented(
             f"CUDA is required for the {backend} dsa_persistent_topk_decode backend"
         )
-    gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
-    supported_gpus = _VLLM_SUPPORTED_GPUS if backend == "vllm_cuda" else (_REQUIRED_GPU,)
-    if gpu_name not in supported_gpus:
-        raise ProfilerNotImplemented(
-            f"{backend} dsa_persistent_topk_decode is verified only on "
-            f"{' or '.join(supported_gpus)}, got {gpu_name}"
-        )
-    return gpu_name
+
+
+def _uses_native_extension(torch: Any) -> bool:
+    """True when the device can run the corrected sm_90 extension."""
+    capability = tuple(torch.cuda.get_device_capability(torch.cuda.current_device()))
+    return capability == _NATIVE_EXTENSION_CAPABILITY
 
 
 def _build_common_operands(
@@ -379,7 +379,7 @@ def _fp16_key_bin(torch: Any, values: Any, shift: int) -> Any:
 
 
 def _overflow_buffer(num_rows: int, length: int, top_k: int) -> tuple[int, int] | None:
-    """``(bin shift, buffered items)`` of the B200 kernel path a row takes, if it buffers.
+    """``(bin shift, buffered items)`` of the image vLLM kernel path a row takes, if it buffers.
 
     Each buffered path keeps at most that many threshold-bin candidates and
     silently drops the rest, so its top-k is wrong when the bin overflows
@@ -623,13 +623,13 @@ def profile_dsa_persistent_topk_decode_torch(
 
 
 def _load_native_op(torch: Any) -> Any:
-    gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
-    if gpu_name == "NVIDIA B200":
+    if not _uses_native_extension(torch):
         try:
             from vllm import _custom_ops  # noqa: F401
         except ImportError as exc:
             raise ProfilerNotImplemented(
-                "the instrumented vLLM extension is required for B200 persistent top-k"
+                "the image vLLM extension is required for persistent top-k on devices "
+                "other than sm_90, where the corrected extension is not built"
             ) from exc
         return torch.ops._C.persistent_topk
 
@@ -659,7 +659,7 @@ def profile_dsa_persistent_topk_decode_vllm_cuda(
     index_dtype: str,
     context_mode: str,
 ) -> ComputeMetrics:
-    """Profile the complete persistent callable (pinned v0.23 on H200, image vLLM on B200).
+    """Profile the persistent callable (corrected v0.23 on sm_90, image vLLM elsewhere).
 
     For GLM-5.3-Flash kpool (``top_k`` 512), ``context_len`` is the row's pool
     count and ``max_model_len`` the token-wide logits width. The call passes
@@ -695,7 +695,10 @@ def profile_dsa_persistent_topk_decode_vllm_cuda(
             "torch is required for the vllm_cuda dsa_persistent_topk_decode backend"
         ) from exc
 
-    gpu_name = _validate_cuda_device(torch, backend="vllm_cuda")
+    _validate_cuda_device(torch, backend="vllm_cuda")
+    # The image vLLM op carries the known buffered-path overflow bug; the
+    # corrected sm_90 extension does not, so only the former is tolerated.
+    overflow_allowed = not _uses_native_extension(torch)
     op = _load_native_op(torch)
 
     try:
@@ -715,7 +718,7 @@ def profile_dsa_persistent_topk_decode_vllm_cuda(
             operands,
             top_k=top_k,
             max_seq_len=context_len,
-            overflow_allowed=gpu_name == "NVIDIA B200",
+            overflow_allowed=overflow_allowed,
         )
 
         def kernel() -> None:

@@ -238,32 +238,63 @@ def test_runner_rejects_nonpositive_dimensions_before_cuda(
         )
 
 
-@pytest.mark.parametrize(
-    ("index_dim", "block_size", "quant_block_size"),
-    [
-        (256, 64, 128),
-        (128, 32, 128),
-        (128, 64, 64),
-    ],
-)
-def test_runner_rejects_unsupported_dimensions_before_cuda(
-    index_dim,
-    block_size,
-    quant_block_size,
-):
+def _dims(index_dim, block_size, quant_block_size, *, backend="torch", scale="ue8m0"):
     from profiling.runners.attention.dsa_index_cache_append import _validate_args
 
-    with pytest.raises(ValueError, match=r"== \(128, 64, 128\)"):
-        _validate_args(
-            1,
-            index_dim,
-            block_size,
-            quant_block_size,
-            DType.BF16,
-            DType.FP8_E4M3,
-            "ue8m0",
-            _CACHE_FORMAT,
-        )
+    return _validate_args(
+        1,
+        index_dim,
+        block_size,
+        quant_block_size,
+        DType.BF16,
+        DType.FP8_E4M3,
+        scale,
+        _CACHE_FORMAT,
+        expected_scale_format=scale,
+        backend=backend,
+    )
+
+
+@pytest.mark.parametrize(
+    ("index_dim", "block_size", "quant_block_size", "backend"),
+    [
+        (256, 64, 128, "torch"),
+        (128, 32, 128, "torch"),
+        (128, 64, 64, "torch"),
+        (128, 48, 32, "torch"),
+        (256, 64, 128, "vllm_cuda"),
+        (128, 32, 128, "vllm_cuda"),
+        (128, 1, 128, "vllm_cuda"),
+        (128, 32, 128, "sglang"),
+        (128, 128, 128, "sglang"),
+    ],
+)
+def test_runner_accepts_unmeasured_but_launchable_dimensions(
+    index_dim, block_size, quant_block_size, backend
+):
+    scale = "fp32" if backend == "sglang" else "ue8m0"
+    assert _dims(index_dim, block_size, quant_block_size, backend=backend, scale=scale)[1:4] == (
+        index_dim,
+        block_size,
+        quant_block_size,
+    )
+
+
+@pytest.mark.parametrize(
+    ("index_dim", "block_size", "quant_block_size", "backend", "match"),
+    [
+        (192, 64, 128, "torch", "multiple of quant_block_size"),
+        (128, 64, 64, "vllm_cuda", "quant_block_size=128"),
+        (256, 64, 128, "sglang", "index_dim=quant_block_size=128"),
+        (128, 48, 128, "sglang", "power-of-two block_size"),
+    ],
+)
+def test_runner_rejects_dimensions_the_kernels_cannot_run(
+    index_dim, block_size, quant_block_size, backend, match
+):
+    scale = "fp32" if backend == "sglang" else "ue8m0"
+    with pytest.raises(ValueError, match=match):
+        _dims(index_dim, block_size, quant_block_size, backend=backend, scale=scale)
 
 
 @pytest.mark.parametrize(
@@ -334,14 +365,17 @@ def test_runner_rejects_unsupported_cache_format_before_cuda(cache_format):
         )
 
 
-def test_runner_rejects_missing_cuda_and_unverified_gpu():
+def test_runner_requires_cuda_but_no_gpu_allowlist():
     from profiling.runners.attention.dsa_index_cache_append import (
         _validate_cuda_device,
+        _validate_sglang_device,
     )
 
     no_cuda = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False))
     with pytest.raises(ProfilerNotImplemented, match="CUDA is required"):
         _validate_cuda_device(no_cuda)
+    with pytest.raises(ProfilerNotImplemented, match="CUDA is required"):
+        _validate_sglang_device(no_cuda)
 
     h100 = SimpleNamespace(
         cuda=SimpleNamespace(
@@ -350,11 +384,8 @@ def test_runner_rejects_missing_cuda_and_unverified_gpu():
             get_device_name=lambda _device: "NVIDIA H100",
         )
     )
-    with pytest.raises(
-        ProfilerNotImplemented,
-        match="verified only on NVIDIA H200, got NVIDIA H100",
-    ):
-        _validate_cuda_device(h100)
+    _validate_cuda_device(h100)
+    _validate_sglang_device(h100)
 
 
 def test_profile_entry_rejects_invalid_args_before_torch_import():
@@ -374,9 +405,7 @@ def test_profile_entry_rejects_invalid_args_before_torch_import():
     }
     invalid_cases = [
         ({"num_tokens": 0}, "must be > 0"),
-        ({"index_dim": 256}, r"== \(128, 64, 128\)"),
-        ({"block_size": 32}, r"== \(128, 64, 128\)"),
-        ({"quant_block_size": 64}, r"== \(128, 64, 128\)"),
+        ({"index_dim": 192}, "multiple of quant_block_size"),
         ({"input_dtype": DType.FP16}, "input_dtype=bf16"),
         ({"cache_dtype": DType.FP16}, "cache_dtype=fp8_e4m3"),
         ({"scale_format": "float32"}, "scale_format='ue8m0'"),
@@ -404,9 +433,8 @@ def test_vllm_profile_entry_rejects_invalid_args_before_framework_imports():
     }
     invalid_cases = [
         ({"num_tokens": 0}, "must be > 0"),
-        ({"index_dim": 256}, r"== \(128, 64, 128\)"),
-        ({"block_size": 32}, r"== \(128, 64, 128\)"),
-        ({"quant_block_size": 64}, r"== \(128, 64, 128\)"),
+        ({"index_dim": 192}, "multiple of quant_block_size"),
+        ({"quant_block_size": 64}, "quant_block_size=128"),
         ({"input_dtype": DType.FP16}, "input_dtype=bf16"),
         ({"cache_dtype": DType.FP16}, "cache_dtype=fp8_e4m3"),
         ({"scale_format": "float32"}, "scale_format='ue8m0'"),
@@ -417,7 +445,7 @@ def test_vllm_profile_entry_rejects_invalid_args_before_framework_imports():
             profile_dsa_index_cache_append_vllm_cuda(**(valid | overrides))
 
 
-def test_vllm_runner_rejects_missing_cuda_and_unverified_gpu():
+def test_vllm_runner_requires_cuda_but_no_gpu_allowlist():
     from profiling.runners.attention.dsa_index_cache_append import (
         _validate_vllm_cuda_device,
     )
@@ -433,20 +461,7 @@ def test_vllm_runner_rejects_missing_cuda_and_unverified_gpu():
             get_device_name=lambda _device: "NVIDIA H100",
         )
     )
-    with pytest.raises(
-        ProfilerNotImplemented,
-        match="verified only on NVIDIA H200 or NVIDIA B200, got NVIDIA H100",
-    ):
-        _validate_vllm_cuda_device(h100)
-
-    b200 = SimpleNamespace(
-        cuda=SimpleNamespace(
-            is_available=lambda: True,
-            current_device=lambda: 0,
-            get_device_name=lambda _device: "NVIDIA B200",
-        )
-    )
-    _validate_vllm_cuda_device(b200)
+    _validate_vllm_cuda_device(h100)
 
 
 def test_operand_constructor_matches_glm_page_planar_layout():

@@ -20,7 +20,10 @@ from profiling.runners.moe.moe_align_block_size_reference import (
 )
 
 _BACKEND = "moe_align_block_size:vllm_cuda"
-_GPU_NAME = "NVIDIA H200"
+# vLLM's moe_align_block_size scans experts with one thread each in a
+# 1024-thread block and checks round_up(num_experts, 32) < 1024
+# (csrc/libtorch_stable/moe/moe_align_sum_kernels.cu, moe_align_block_size).
+_MAX_NUM_EXPERTS = 992
 
 
 @dataclass
@@ -99,12 +102,11 @@ def _check_outputs(torch: Any, launch: _Launch, shape: AlignmentShape) -> None:
             raise AssertionError(f"routes for local expert {expert} differ")
 
 
-def _require_h200(torch: Any) -> None:
+def _require_cuda(torch: Any) -> None:
+    # A vLLM _C CUDA op built for every CUDA arch the wheel targets; no GPU
+    # model or capability floor beyond CUDA itself.
     if not torch.cuda.is_available():
         raise ProfilerNotImplemented(f"{_BACKEND} requires CUDA")
-    gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
-    if gpu_name != _GPU_NAME:
-        raise ProfilerNotImplemented(f"{_BACKEND} is verified only on {_GPU_NAME}, got {gpu_name}")
 
 
 def profile_moe_align_block_size_vllm_cuda(
@@ -114,6 +116,10 @@ def profile_moe_align_block_size_vllm_cuda(
     block_size: int,
 ) -> ComputeMetrics:
     shape = validate_shape(num_tokens, num_experts, top_k, block_size)
+    if shape.num_experts > _MAX_NUM_EXPERTS:
+        raise ProfilerNotImplemented(
+            f"{_BACKEND} supports at most {_MAX_NUM_EXPERTS} experts, got {shape.num_experts}"
+        )
     try:
         import torch
     except ImportError as exc:
@@ -124,7 +130,7 @@ def profile_moe_align_block_size_vllm_cuda(
         raise ProfilerNotImplemented(f"{_BACKEND} requires the pinned vLLM checkout") from exc
 
     try:
-        _require_h200(torch)
+        _require_cuda(torch)
         launch = _prepare(torch, _custom_ops.moe_align_block_size, shape)
         _check_outputs(torch, launch, shape)
         time_ms = Timer.cupti(launch.run, warmup=5, kernel_name=None)

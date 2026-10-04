@@ -435,8 +435,7 @@ def test_native_corrected_cache_builds_once_and_reuses_marker(monkeypatch, tmp_p
 @pytest.mark.parametrize(
     ("overrides", "match"),
     [
-        ({"batch_size": 0}, "1 <= batch_size <= 256"),
-        ({"batch_size": 257}, "1 <= batch_size <= 256"),
+        ({"batch_size": 0}, "batch_size >= 1"),
         ({"next_n": 0}, "next_n > 0"),
         ({"next_n": -1}, "next_n > 0"),
         ({"context_len": -1}, "context_len must be >= 0"),
@@ -446,7 +445,7 @@ def test_native_corrected_cache_builds_once_and_reuses_marker(monkeypatch, tmp_p
         ),
         ({"max_model_len": 0}, "max_model_len must be > 0"),
         ({"context_len": 1048577}, "context_len must be <= max_model_len"),
-        ({"top_k": 1024}, "top_k=2048"),
+        ({"top_k": 256}, "top_k=512 or top_k=1024 or top_k=2048"),
         ({"logits_row_stride": 0}, "positive and >= max_model_len"),
         ({"logits_row_stride": 1048575}, "positive and >= max_model_len"),
         ({"logits_dtype": DType.BF16}, "logits_dtype=fp32"),
@@ -475,7 +474,7 @@ def test_rejects_unsupported_args_before_allocation(monkeypatch, overrides, matc
 @pytest.mark.parametrize(
     ("overrides", "match"),
     [
-        ({"batch_size": 0}, "1 <= batch_size <= 256"),
+        ({"batch_size": 0}, "batch_size >= 1"),
         ({"next_n": 0}, "next_n > 0"),
         ({"context_len": -1}, "context_len must be >= 0"),
         ({"max_model_len": 0}, "max_model_len must be > 0"),
@@ -515,7 +514,18 @@ def test_validate_accepts_ordinary_speculative_and_zero_context() -> None:
     assert speculative[:3] == (16, 8192, 2)
 
 
-def test_rejects_missing_cuda_and_unverified_gpu() -> None:
+def _fake_cuda(capability, name="NVIDIA GPU"):
+    return SimpleNamespace(
+        cuda=SimpleNamespace(
+            is_available=lambda: True,
+            current_device=lambda: 0,
+            get_device_name=lambda _device: name,
+            get_device_capability=lambda _device: capability,
+        )
+    )
+
+
+def test_requires_cuda_but_no_gpu_allowlist() -> None:
     from profiling.runners.attention.dsa_persistent_topk_decode import (
         _validate_cuda_device,
     )
@@ -523,25 +533,27 @@ def test_rejects_missing_cuda_and_unverified_gpu() -> None:
     no_cuda = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False))
     with pytest.raises(ProfilerNotImplemented, match="CUDA is required"):
         _validate_cuda_device(no_cuda)
+    for name, capability in (("NVIDIA H100", (9, 0)), ("NVIDIA A100", (8, 0))):
+        _validate_cuda_device(_fake_cuda(capability, name))
+        _validate_cuda_device(_fake_cuda(capability, name), backend="vllm_cuda")
 
-    h100 = SimpleNamespace(
-        cuda=SimpleNamespace(
-            is_available=lambda: True,
-            current_device=lambda: 0,
-            get_device_name=lambda _device: "NVIDIA H100",
-        )
-    )
-    with pytest.raises(ProfilerNotImplemented, match="verified only on NVIDIA H200"):
-        _validate_cuda_device(h100)
 
-    b200 = SimpleNamespace(
-        cuda=SimpleNamespace(
-            is_available=lambda: True,
-            current_device=lambda: 0,
-            get_device_name=lambda _device: "NVIDIA B200",
-        )
-    )
-    assert _validate_cuda_device(b200, backend="vllm_cuda") == "NVIDIA B200"
+def test_path_choice_follows_compute_capability_not_gpu_name() -> None:
+    from profiling.runners.attention.dsa_persistent_topk_decode import _uses_native_extension
+
+    # Any sm_90 part runs the corrected extension (built for sm_90 only).
+    assert _uses_native_extension(_fake_cuda((9, 0), "NVIDIA H100"))
+    assert _uses_native_extension(_fake_cuda((9, 0), "NVIDIA H200"))
+    # Everything else uses the image vLLM op, with the overflow tolerance.
+    assert not _uses_native_extension(_fake_cuda((10, 0), "NVIDIA B200"))
+    assert not _uses_native_extension(_fake_cuda((12, 0), "NVIDIA RTX PRO 6000"))
+
+
+def test_large_batches_are_accepted() -> None:
+    from profiling.runners.attention.dsa_persistent_topk_decode import _validate_args
+
+    assert _validate_args(**(_BASE_SPEC | {"batch_size": 257}))[0] == 257
+    assert _validate_args(**(_BASE_SPEC | {"batch_size": 4096}))[0] == 4096
 
 
 def test_operand_layout_and_rank_two_length_ramp() -> None:
@@ -743,15 +755,17 @@ def test_composite_long_rows_select_local_top_values() -> None:
     assert operands.logits[0, actual[0].long()].tolist() == [7.0, 6.0, 5.0]
 
 
-def test_native_accepts_kpool_top_k_while_torch_keeps_2048() -> None:
+def test_both_backends_accept_every_kernel_top_k() -> None:
     from profiling.runners.attention import dsa_persistent_topk_decode as runner
 
     # GLM-5.3-Flash kpool: 2048 pools of an 8192-token request, token-wide rows.
     kpool = _BASE_SPEC | {"context_len": 2048, "max_model_len": 8192, "top_k": 512}
     kpool["logits_row_stride"] = 8192
     assert runner._validate_args(**kpool, allowed_top_k=runner._VLLM_TOP_K)[4] == 512
-    with pytest.raises(ValueError, match="requires top_k=2048, got 512"):
-        runner._validate_args(**kpool)
+    assert runner._validate_args(**kpool)[4] == 512
+    assert runner._validate_args(**(kpool | {"top_k": 1024}))[4] == 1024
+    with pytest.raises(ValueError, match="top_k=512 or top_k=1024 or top_k=2048, got 256"):
+        runner._validate_args(**(kpool | {"top_k": 256}))
 
 
 def test_overflow_exemption_follows_the_path_each_row_takes() -> None:
@@ -965,7 +979,7 @@ def test_native_loader_failures_translate_to_typed_profiler_errors(
 
     monkeypatch.setattr(native, "load_persistent_topk_op", fail)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
-    monkeypatch.setattr(torch.cuda, "get_device_name", lambda _device: "NVIDIA H200")
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (9, 0))
     with pytest.raises(expected_type, match="synthetic native failure"):
         runner._load_native_op(torch)
 
@@ -990,7 +1004,8 @@ def test_native_profile_times_only_complete_op_and_returns_metrics(monkeypatch, 
         events.append(("op", args))
         return None
 
-    monkeypatch.setattr(runner, "_validate_cuda_device", lambda *args, **kwargs: "NVIDIA H200")
+    monkeypatch.setattr(runner, "_validate_cuda_device", lambda *args, **kwargs: None)
+    monkeypatch.setattr(runner, "_uses_native_extension", lambda _torch: True)
     monkeypatch.setattr(runner, "_load_native_op", lambda _torch: fake_op)
     monkeypatch.setattr(runner, "_build_native_operands", lambda *args, **kwargs: operands)
     monkeypatch.setattr(runner, "_validate_native_semantics", lambda *args, **kwargs: None)
@@ -1037,7 +1052,8 @@ def test_native_profile_translates_op_runtime_failure(monkeypatch) -> None:
     def fail_op(*args):
         raise RuntimeError("synthetic pinned op failure")
 
-    monkeypatch.setattr(runner, "_validate_cuda_device", lambda *args, **kwargs: "NVIDIA H200")
+    monkeypatch.setattr(runner, "_validate_cuda_device", lambda *args, **kwargs: None)
+    monkeypatch.setattr(runner, "_uses_native_extension", lambda _torch: True)
     monkeypatch.setattr(runner, "_load_native_op", lambda _torch: fail_op)
     monkeypatch.setattr(runner, "_build_native_operands", lambda *args, **kwargs: operands)
     monkeypatch.setattr(runner, "_validate_native_semantics", lambda *args, **kwargs: None)

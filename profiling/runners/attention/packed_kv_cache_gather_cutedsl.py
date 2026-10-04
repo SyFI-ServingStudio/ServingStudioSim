@@ -10,7 +10,9 @@ from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerN
 from profiling.runners.metrics import ComputeMetrics
 
 _BACKEND = "packed_kv_cache_gather:vllm_cutedsl"
-_GPU_NAME = "NVIDIA H200"
+# The kernel dequantizes with cvt.rn.f16x2.e4m3x2 (vllm/cute_utils/cvt.py), PTX
+# that exists only on SM89+.
+_MIN_CAPABILITY = (8, 9)
 _MODEL_IDENTITY = (1, 512, 448, 64)
 _STORAGE_IDENTITY = (
     "fp8_ds_mla",
@@ -72,8 +74,10 @@ def _validate_args(
         raise ValueError("offset must be a non-negative integer")
     if type(workspace_rows) is not int or workspace_rows < offset + max(gathered):
         raise ValueError("workspace_rows must cover offset plus the largest gather")
-    if block_size not in (2, 64):
-        raise ProfilerNotImplemented(f"{_BACKEND} supports block_size=2/64")
+    # DequantGatherKCacheKernel compiles per block_size (vLLM pages C4 at 64
+    # and C128 at 2 rows); the packed cache below is built from it.
+    if type(block_size) is not int or block_size <= 0:
+        raise ValueError(f"block_size must be a positive integer, got {block_size!r}")
     required_width = max(math.ceil(length / block_size) for length in seq_lens)
     if type(block_table_width) is not int or block_table_width < required_width:
         raise ValueError("block_table_width is too small for seq_lens")
@@ -102,13 +106,13 @@ def _validate_args(
     )
 
 
-def _require_h200_cutedsl(torch: Any, has_cutedsl: Any) -> Any:
+def _require_cutedsl_gpu(torch: Any, has_cutedsl: Any) -> Any:
     if not torch.cuda.is_available():
         raise ProfilerNotImplemented(f"{_BACKEND} requires CUDA")
     device = torch.device("cuda", torch.cuda.current_device())
-    name = str(torch.cuda.get_device_name(device))
-    if name != _GPU_NAME or tuple(torch.cuda.get_device_capability(device)) != (9, 0):
-        raise ProfilerNotImplemented(f"{_BACKEND} requires {_GPU_NAME} SM90, got {name}")
+    capability = tuple(torch.cuda.get_device_capability(device))
+    if capability < _MIN_CAPABILITY:
+        raise ProfilerNotImplemented(f"{_BACKEND} needs FP8 e4m3 (SM89+), got SM{capability}")
     if not has_cutedsl():
         raise ProfilerNotImplemented(f"{_BACKEND} requires the production Cutlass DSL path")
     return device
@@ -264,7 +268,7 @@ def profile_packed_kv_cache_gather_cutedsl(
     except ImportError as exc:
         raise ProfilerNotImplemented(f"{_BACKEND} requires pinned vLLM") from exc
     try:
-        device = _require_h200_cutedsl(torch, has_cutedsl)
+        device = _require_cutedsl_gpu(torch, has_cutedsl)
         operands = _prepare(torch, shape, device)
 
         def launch():

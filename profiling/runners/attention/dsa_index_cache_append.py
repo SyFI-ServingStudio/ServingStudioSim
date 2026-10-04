@@ -12,17 +12,18 @@ from profiling.profilers.timer import Timer
 from profiling.runners.exceptions import KernelLaunchFailed, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
 
-_INDEX_DIM = 128
-_BLOCK_SIZE = 64
-_QUANT_BLOCK_SIZE = 128
+# vLLM indexer_k_quant_and_cache_kernel reduces each scale's amax across one
+# 32-lane warp of 4-element vectors (csrc/libtorch_stable/cache_kernels.cu:620,
+# 640), so its quantization group is 128 elements whatever the argument says.
+_VLLM_QUANT_BLOCK_SIZE = 128
+# SGLang FusedKIndexerNormRopeStoreKernel fixes kHeadDim=128 (one 128-element
+# scale group) and requires a power-of-two page (jit/csrc/deepseek_v32/indexer_k.cuh).
+_SGLANG_INDEX_DIM = 128
 _INPUT_DTYPE = DType.BF16
 _CACHE_DTYPE = DType.FP8_E4M3
 _SCALE_FORMAT = "ue8m0"
 _CACHE_FORMAT = "page_planar_fp8_fp32_scale"
-_REQUIRED_GPU = "NVIDIA H200"
-_VLLM_SUPPORTED_GPUS = ("NVIDIA H200", "NVIDIA B200")
 _VLLM_KERNEL_NAME = "indexer_k_quant_and_cache_kernel"
-_SGLANG_SUPPORTED_GPUS = ("NVIDIA B200",)
 _SGLANG_SCALE_FORMAT = "fp32"
 _SGLANG_ROPE_DIM = 64
 _SGLANG_ROPE_TABLE_ROWS = 131_072
@@ -54,6 +55,7 @@ def _validate_args(
     cache_format: str,
     *,
     expected_scale_format: str = _SCALE_FORMAT,
+    backend: str = "torch",
 ) -> tuple[int, int, int, int, DType, DType, str, str]:
     num_tokens = int(num_tokens)
     index_dim = int(index_dim)
@@ -69,14 +71,25 @@ def _validate_args(
             "num_tokens, index_dim, block_size, and quant_block_size must be > 0, "
             f"got {num_tokens}, {index_dim}, {block_size}, and {quant_block_size}"
         )
-    if (index_dim, block_size, quant_block_size) != (
-        _INDEX_DIM,
-        _BLOCK_SIZE,
-        _QUANT_BLOCK_SIZE,
+    # The page-planar layout needs whole scale groups per key.
+    if index_dim % quant_block_size:
+        raise ValueError(
+            "dsa_index_cache_append requires index_dim to be a multiple of "
+            f"quant_block_size, got {index_dim} and {quant_block_size}"
+        )
+    if backend == "vllm_cuda" and quant_block_size != _VLLM_QUANT_BLOCK_SIZE:
+        raise ValueError(
+            "dsa_index_cache_append vllm_cuda requires quant_block_size=128 "
+            f"(one warp-reduced scale group), got {quant_block_size}"
+        )
+    if backend == "sglang" and (
+        index_dim != _SGLANG_INDEX_DIM
+        or quant_block_size != _SGLANG_INDEX_DIM
+        or block_size & (block_size - 1)
     ):
         raise ValueError(
-            "torch dsa_index_cache_append requires "
-            "(index_dim, block_size, quant_block_size) == (128, 64, 128), "
+            "dsa_index_cache_append sglang requires index_dim=quant_block_size=128 "
+            "and a power-of-two block_size, "
             f"got ({index_dim}, {block_size}, {quant_block_size})"
         )
     if input_dtype is not _INPUT_DTYPE or cache_dtype is not _CACHE_DTYPE:
@@ -113,23 +126,12 @@ def _validate_cuda_device(torch: Any) -> None:
         raise ProfilerNotImplemented(
             "CUDA is required for the torch dsa_index_cache_append backend"
         )
-    gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
-    if gpu_name != _REQUIRED_GPU:
-        raise ProfilerNotImplemented(
-            f"torch dsa_index_cache_append is verified only on {_REQUIRED_GPU}, got {gpu_name}"
-        )
 
 
 def _validate_vllm_cuda_device(torch: Any) -> None:
     if not torch.cuda.is_available():
         raise ProfilerNotImplemented(
             "CUDA is required for the dsa_index_cache_append vllm_cuda backend"
-        )
-    gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
-    if gpu_name not in _VLLM_SUPPORTED_GPUS:
-        raise ProfilerNotImplemented(
-            "dsa_index_cache_append vllm_cuda is verified only on "
-            f"{' or '.join(_VLLM_SUPPORTED_GPUS)}, got {gpu_name}"
         )
 
 
@@ -333,12 +335,6 @@ def _validate_sglang_device(torch: Any) -> None:
         raise ProfilerNotImplemented(
             "CUDA is required for dsa_index_cache_append:sglang_fused_norm_rope_store"
         )
-    gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
-    if gpu_name not in _SGLANG_SUPPORTED_GPUS:
-        raise ProfilerNotImplemented(
-            "dsa_index_cache_append:sglang_fused_norm_rope_store is verified only on "
-            f"{' or '.join(_SGLANG_SUPPORTED_GPUS)}, got {gpu_name}"
-        )
 
 
 def profile_dsa_index_cache_append_sglang_fused_norm_rope_store(
@@ -371,6 +367,7 @@ def profile_dsa_index_cache_append_sglang_fused_norm_rope_store(
         scale_format,
         cache_format,
         expected_scale_format=_SGLANG_SCALE_FORMAT,
+        backend="sglang",
     )
     try:
         import torch
@@ -490,6 +487,7 @@ def profile_dsa_index_cache_append_vllm_cuda(
         cache_dtype,
         scale_format,
         cache_format,
+        backend="vllm_cuda",
     )
     try:
         import torch

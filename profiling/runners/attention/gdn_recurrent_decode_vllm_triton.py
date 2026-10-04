@@ -16,7 +16,7 @@ from typing import Any
 from profiling.db.args import DType
 from profiling.profilers.energy import Energy
 from profiling.profilers.timer import Timer
-from profiling.runners.attention._gdn_common import load_required_callable, require_exact_gpu
+from profiling.runners.attention._gdn_common import load_required_callable, require_cuda
 from profiling.runners.attention.gdn_recurrent_decode_torch import (
     _logical_bytes,
     _semantic_flops,
@@ -32,7 +32,6 @@ _BACKEND = "gdn_recurrent_decode:vllm_triton"
 _CALLABLE_MODULE = "vllm.model_executor.layers.fla.ops.fused_recurrent"
 _CALLABLE_NAME = "fused_recurrent_gated_delta_rule_packed_decode"
 _KERNEL_NAME = "fused_recurrent_gated_delta_rule_packed_decode_kernel"
-_REQUIRED_GPU = "NVIDIA H200"
 _OUTPUT_ATOL = 1e-2
 _OUTPUT_RTOL = 1e-2
 _STATE_ATOL = 2e-5
@@ -144,8 +143,8 @@ def _valid_slot_indices(batch_size: int) -> tuple[int, ...]:
     return tuple(range(1, batch_size + 1))
 
 
-def _require_h200(torch: Any) -> None:
-    require_exact_gpu(torch, backend=_BACKEND, required_gpu=_REQUIRED_GPU)
+def _require_cuda(torch: Any) -> None:
+    require_cuda(torch, backend=_BACKEND)
 
 
 def _load_fused_callable() -> Any:
@@ -307,7 +306,7 @@ def profile_gdn_recurrent_decode_vllm_triton(
     dtype: DType | str,
     state_dtype: DType | str,
 ) -> ComputeMetrics:
-    """Profile vLLM's fused packed recurrent decode on an NVIDIA H200."""
+    """Profile vLLM's fused packed recurrent decode."""
     args = _validate_args(
         batch_size,
         num_qk_heads,
@@ -323,7 +322,7 @@ def profile_gdn_recurrent_decode_vllm_triton(
         raise ProfilerNotImplemented(f"PyTorch is required for {_BACKEND}") from exc
 
     try:
-        _require_h200(torch)
+        _require_cuda(torch)
         fused_callable = _load_fused_callable()
         device = torch.device("cuda", torch.cuda.current_device())
         operands = _build_operands(torch, args, device=device)

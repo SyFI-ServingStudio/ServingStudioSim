@@ -50,7 +50,7 @@ def test_logical_work_uses_only_gathered_rows():
         ((3,), (4,), 4, 1, 64, 0, *_IDENTITY),
         ((65,), (), 65, 1, 64, 0, *_IDENTITY),
         ((3,), (), 2, 1, 64, 0, *_IDENTITY),
-        ((3,), (), 3, 1, 4, 0, *_IDENTITY),
+        ((3,), (), 3, 1, 0, 0, *_IDENTITY),
     ],
 )
 def test_invalid_physical_shapes_are_rejected(args):
@@ -61,3 +61,9 @@ def test_invalid_physical_shapes_are_rejected(args):
 def test_other_model_identity_is_not_silently_reused():
     with pytest.raises(ProfilerNotImplemented, match="supports model identity"):
         _validate_args((1,), (), 1, 1, 64, 0, 2, *_IDENTITY[1:])
+
+
+@pytest.mark.parametrize("block_size", [4, 16, 128])
+def test_any_page_size_the_kernel_compiles_is_accepted(block_size):
+    shape = _validate_args((300,), (), 300, -(-300 // block_size), block_size, 0, *_IDENTITY)
+    assert shape.block_size == block_size

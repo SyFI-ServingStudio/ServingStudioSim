@@ -59,7 +59,7 @@ def test_public_runner_times_only_the_production_callable(monkeypatch):
 
     torch = SimpleNamespace(cuda=SimpleNamespace(synchronize=lambda: events.append("sync")))
     monkeypatch.setattr(runner, "_load_runtime", lambda: (torch, production, None))
-    monkeypatch.setattr(runner, "_require_b200", lambda _: events.append("device"))
+    monkeypatch.setattr(runner, "_require_sm100_family", lambda _: events.append("device"))
     monkeypatch.setattr(
         runner, "_check_small_correctness", lambda *args: events.append("correctness")
     )
@@ -132,3 +132,29 @@ def test_public_runner_times_only_the_production_callable(monkeypatch):
 def test_no_local_assignments_charge_only_router_and_output():
     args = runner._validate_args(**_args(per_expert_batches=(0, 0, 0, 0, 2, 2, 2, 2)))
     assert runner._logical_bytes(args) == 80 + 1024
+
+
+def _fake_cuda(name, capability):
+    return SimpleNamespace(
+        cuda=SimpleNamespace(
+            is_available=lambda: True,
+            current_device=lambda: 0,
+            get_device_name=lambda _device: name,
+            get_device_capability=lambda _device: capability,
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    ("name", "capability"), [("NVIDIA B200", (10, 0)), ("NVIDIA B300", (10, 3))]
+)
+def test_any_sm10x_device_runs_the_trtllm_cubins(name, capability):
+    runner._require_sm100_family(_fake_cuda(name, capability))
+
+
+@pytest.mark.parametrize(
+    ("name", "capability"), [("NVIDIA H200", (9, 0)), ("RTX PRO 6000", (12, 0))]
+)
+def test_non_sm10x_devices_are_rejected_by_capability(name, capability):
+    with pytest.raises(runner.ProfilerNotImplemented, match="SM10x"):
+        runner._require_sm100_family(_fake_cuda(name, capability))

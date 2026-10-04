@@ -31,18 +31,26 @@ def test_logical_bytes_include_fp32_output() -> None:
 
 
 @pytest.mark.parametrize(
-    "arguments",
+    ("arguments", "error"),
     [
-        (8, 128, 4096, "bf16"),
-        (8, 512, 2048, "bf16"),
-        (8, 512, 4096, "fp16"),
-        (8, 288, 4096, "fp32"),
-        (8, 32, 4096, "bf16"),
+        ((8, 512, 4096, "fp16"), ProfilerNotImplemented),
+        ((0, 512, 4096, "bf16"), ValueError),
+        ((8, 0, 4096, "bf16"), ValueError),
+        ((8, 512, -1, "fp32"), ValueError),
     ],
 )
-def test_rejects_non_production_identity(arguments: tuple[object, ...]) -> None:
-    with pytest.raises(ProfilerNotImplemented):
+def test_rejects_unbuilt_dtype_and_empty_shapes(arguments: tuple[object, ...], error) -> None:
+    with pytest.raises(error):
         _validate_args(*arguments)
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [(8, 128, 4096, "bf16"), (8, 512, 2048, "bf16"), (8, 288, 4096, "fp32"), (8, 32, 7168, "bf16")],
+)
+def test_accepts_any_positive_shape(arguments: tuple[object, ...]) -> None:
+    shape = _validate_args(*arguments)
+    assert (shape.m, shape.n, shape.k) == arguments[:3]
 
 
 def test_glm53_router_and_indexer_forms() -> None:
@@ -83,3 +91,21 @@ def test_fp32_prepare_needs_highest_precision_and_caches_a_contiguous_weight() -
     launch = _prepare(fake_torch, shape)
     assert launch.fp32_input
     assert (launch.input_tensor, launch.weight_transposed) == ("input", "weight.T.contiguous()")
+
+
+def test_requires_cuda_but_no_particular_gpu() -> None:
+    # torch.mm/cuBLAS runs on any CUDA GPU; an unmeasured GPU is a data gap.
+    from profiling.runners.gemm.gemm_fp32_output_torch_cublas import _require_gpu
+
+    with pytest.raises(ProfilerNotImplemented, match="requires CUDA"):
+        _require_gpu(SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False)))
+    for gpu_name in ("NVIDIA H200", "NVIDIA H100 80GB HBM3", "NVIDIA A100-SXM4-80GB"):
+        _require_gpu(
+            SimpleNamespace(
+                cuda=SimpleNamespace(
+                    is_available=lambda: True,
+                    current_device=lambda: 0,
+                    get_device_name=lambda _device, name=gpu_name: name,
+                )
+            )
+        )
