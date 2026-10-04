@@ -425,6 +425,13 @@ pub fn run_timing_predict(
         return Ok(());
     }
     write_prediction_provenance(&cfg.log_dir, &cfg.gpu, gpu_count)?;
+    // Each `run_*_cases` dropped its `CostBuffers`, flushing and joining the writer.
+    let failures = crate::log::cost_log_failures(&cfg.log_dir)?;
+    ensure!(
+        failures.is_empty(),
+        "cost_log writer failed: {}",
+        failures.join("; ")
+    );
 
     tracing::info!(
         log_dir = %cfg.log_dir.display(),
