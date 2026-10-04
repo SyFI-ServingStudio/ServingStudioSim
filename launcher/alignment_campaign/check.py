@@ -390,7 +390,7 @@ def _check_label_rules(pack: Pack) -> list[Finding]:
 #: Each measured routing kind, the arch field naming its artifact, and the
 #: schema versions this simulator reads. `check` exists to fail a pack before it
 #: reaches a GPU, so both kinds are validated, not only the older one.
-ROUTING_ARTIFACTS = {
+_ROUTING_ARTIFACTS = {
     "popularity": ("expert_popularity_file", (2, 3, 4)),
     "corpus": ("token_corpus_file", (1,)),
 }
@@ -400,8 +400,8 @@ def _check_expert_popularity(pack: Pack) -> list[Finding]:
     findings: list[Finding] = []
     for name, variant in pack.variants.items():
         routing = variant.arch.get("routing", "uniform")
-        expected_key, versions = ROUTING_ARTIFACTS.get(routing, (None, ()))
-        for key, _ in ROUTING_ARTIFACTS.values():
+        expected_key, versions = _ROUTING_ARTIFACTS.get(routing, (None, ()))
+        for key, _ in _ROUTING_ARTIFACTS.values():
             reference = variant.arch.get(key)
             where = f"variants.{name}.arch.{key}"
             if key == expected_key:

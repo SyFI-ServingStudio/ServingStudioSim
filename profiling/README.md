@@ -142,8 +142,6 @@ db/                L1b core: cache, registry, schema, scheduling.
   outlier.py         `BatchOutlierPolicy` — the per-spec `batch_outlier_policy`
                      field carried by every `KernelProfilerSpec` (placeholder).
   migrate.py         Schema version/hash + `_db_metadata`.
-  kernel_config.py   Kernel-config registry: which simulator configs asked for
-                     which rows (see DB shape).
   metadata.py        Read-only DB metadata + per-op profiler git hashes.
 
 kernels/           One file per kernel kind. Each declares KIND + <Kind>Args and
@@ -284,33 +282,6 @@ A DB an older checkout wrote (schema v2) is refused by readers until
 `python -m launcher kernel-profile migrate-db <path>` upgrades it in place; the
 upgrade keeps every row and id and then VACUUMs the file.
 
-A row's args are one grid cell of one simulator kernel config, but the row does
-not say which. Tables starting with `_` (so they are not kind tables) record it,
-written by the builds that ask for the rows:
-
-- `_kernel_config`, keyed `(kind, config_hash, gpu_name)`: the Rust
-  `KernelConfig::identity` (no `gpu_name` or `backends`, `Dim` values only;
-  `config_hash` is the SHA-256 of its sorted-key JSON), the profile table, the
-  cache coordinate names, the grid axes, and each cell's args without `backend`,
-  stored by column as zlib-compressed JSON (list-valued args make cells the
-  bulk). The grid is stored because it cannot always be recomputed: a
-  corpus-routed MoE config names a payload file.
-- `_kernel_config_source`, keyed `source_hash`: what built configs — the preset,
-  timing-predict config or `#[supported]` row, pool, GPU and arch block.
-- `_kernel_config_use`: which `(pool, role)` of which source built which config,
-  naming the config, source and role by content key (`config_key`, `source_key`,
-  `role_key` into `_kernel_config_role`).
-- `_kernel_config_blob`: each identity array of at least 1 KiB (an MoE routing's
-  per-layer popularity), stored once; the identity holds `{"$blob": "<key>"}` in
-  its place. `registered_configs` returns identities with the arrays restored, so
-  `config_hash` is still the hash of the full identity.
-
-The launcher registers them after a cache prebuild that profiled and after a
-timing-predict run; `--register-kernel-configs` registers a preset's or predict
-config's configs with a dry-run (no GPU), for rows measured earlier, and
-`--register-supported-kernel-configs` those of every `#[supported]` deployment.
-Registration writes nothing when every config, source and use is known.
-
 ## Adding a kernel
 
 Normally one new file: `kernels/<kind>.py` declaring `KIND`, a frozen
@@ -362,11 +333,10 @@ telemetry.
 `merge-db` reads both inputs without modifying them. It copies rows and whole
 tables found on only one side and deduplicates rows whose declared
 `UNIQUE(gpu_name, backend, args_hash)` identity and payload agree. The
-kernel-config registry and lookup tables merge the same way on their own
-content-hash keys; every reference between tables is such a key, never an `id`,
-so nothing is remapped. Both inputs must be at this checkout's schema (run
-`migrate-db` on an older one first);
-a config registered on both sides with different grids is a conflict. If the same
+`_profile_run` lookup table merges the same way on its content-hash `run_key`;
+rows reference it by that key, never by `id`, so nothing is remapped. Both
+inputs must be at this checkout's schema (run `migrate-db` on an older one
+first). If the same
 identity has different measurement, provenance, or outlier state, no output DB
 is published: the command returns `1` and writes both versions to
 `<output>.merge-report.json` for explicit resolution. Surrogate `id` and

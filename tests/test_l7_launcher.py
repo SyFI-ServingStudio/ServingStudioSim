@@ -12,7 +12,6 @@ metadata, and the sweep aggregator contract.
 from __future__ import annotations
 
 import asyncio
-import copy
 import json
 import sys
 
@@ -45,7 +44,7 @@ from launcher.schema import (
     validate_params,
     validate_unique_log_dirs,
 )
-from launcher.schema.loader import REPO_ROOT, SchemaNotFound, load_schema, schema_from_dict
+from launcher.schema.loader import SchemaNotFound, load_schema, schema_from_dict
 from launcher.sweep import (
     COMPLETE_MARKER,
     _aggregate,
@@ -816,74 +815,6 @@ def test_validate_expanded_rejects_bad_type(schema):
     cand = _base(arch={"type": "llama3_dense_tp", "tp_size": 4})
     _arch(cand)["fp8"] = "false"  # str, not bool — would coerce to True
     assert any("not a valid bool" in e for e in validate_expanded(cand, schema))
-
-
-def _supported_schema():
-    """The fixture with `llama3_dense_tp` declaring one `#[supported]` row."""
-    raw = copy.deepcopy(_FIXTURE)
-    raw["providers"]["arch"]["iter_wise"]["llama3_dense_tp"]["supported"] = [
-        {"gpu": ["H200"], "model_config": ["llama3_8b"], "tp_size": [1, 2, 4, 8]}
-    ]
-    return schema_from_dict(raw)
-
-
-def _dense_tp(tp_size, model_config="model/config/llama3_8b.json"):
-    return _base(
-        arch={"type": "llama3_dense_tp", "model_config": model_config, "tp_size": tp_size}
-    )
-
-
-def test_supported_accepts_a_declared_deployment():
-    schema = _supported_schema()
-    assert validate_expanded(_dense_tp(4), schema) == []
-    # An omitted param takes its default (tp_size 2), which a row covers.
-    cand = _dense_tp(4)
-    del _arch(cand)["tp_size"]
-    assert validate_expanded(cand, schema) == []
-
-
-def test_supported_rejects_an_undeclared_parallel_size_and_names_the_rows():
-    errors = validate_expanded(_dense_tp(3), _supported_schema())
-    assert len(errors) == 1
-    assert (
-        "llama3_dense_tp does not support gpu='H200', model_config='llama3_8b', tp_size=3"
-        in errors[0]
-    )
-    assert "tp_size in [1, 2, 4, 8]" in errors[0]
-
-
-def test_supported_rejects_an_undeclared_model():
-    errors = validate_expanded(_dense_tp(4, "model/config/qwen3_235b.json"), _supported_schema())
-    assert any("model_config='qwen3_235b'" in e for e in errors)
-
-
-def test_supported_reads_the_gpu_from_the_group():
-    cand = _dense_tp(4)
-    cand["pools"]["main"]["groups"][0]["gpu"] = "B200"
-    errors = validate_expanded(cand, _supported_schema())
-    assert any("gpu='B200'" in e for e in errors)
-
-
-def test_supported_matches_a_model_config_by_its_file_in_model_config():
-    schema = _supported_schema()
-    absolute = str(REPO_ROOT / "model" / "config" / "llama3_8b.json")
-    assert validate_expanded(_dense_tp(4, absolute), schema) == []
-    assert validate_expanded(_dense_tp(4, "./model/config/llama3_8b.json"), schema) == []
-    # Same stem elsewhere is a different file.
-    assert validate_expanded(_dense_tp(4, "other/llama3_8b.json"), schema) != []
-
-
-def test_supported_is_checked_raw_for_literals_and_deferred_for_placeholders():
-    schema = _supported_schema()
-    assert any("does not support" in e for e in validate_params(_dense_tp(16), schema))
-    preset = _dense_tp("${ptp}")
-    preset["sweep"] = {"ptp": [2, 4]}
-    assert not any("does not support" in e for e in validate_params(preset, schema))
-
-
-def test_supported_leaves_an_arch_without_rows_unchecked():
-    # llama3_dense declares no rows; any model passes this check.
-    assert validate_expanded(_base(), _supported_schema()) == []
 
 
 def test_r7_constant_derived_rejected(schema):

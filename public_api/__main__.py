@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import threading
 from pathlib import Path
 
 from profiling.perf_api import DB_PATH
@@ -28,7 +27,6 @@ def main(argv: list[str] | None = None) -> int:
     import uvicorn
 
     from public_api.app import create_app
-    from public_api.arch.library import ArchLibrary
     from public_api.kernel.library import KernelLibrary
     from public_api.kernel.sources import KernelSources
 
@@ -39,16 +37,7 @@ def main(argv: list[str] | None = None) -> int:
         )
     if not args.db.exists():
         parser.error(f"{args.db} does not exist")
-    library = KernelLibrary(sources)
-    archs = ArchLibrary(library)
-
-    def warm() -> None:
-        library.warm()
-        archs.warm()
-
-    # Answer requests while the caches fill; a request that comes first builds its own.
-    threading.Thread(target=warm, name="warm", daemon=True).start()
-    uvicorn.run(create_app(library, archs), host=args.bind, port=args.port)
+    uvicorn.run(create_app(KernelLibrary(sources)), host=args.bind, port=args.port)
     return 0
 
 

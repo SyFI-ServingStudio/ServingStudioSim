@@ -88,9 +88,10 @@ def test_a_rejected_case_fails_the_dry_run(tmp_path, launcher):
 
 
 def test_a_yaml_config_reads_booleans_as_the_binary_does(tmp_path):
-    """The registry records the launcher's copy of a predict config as the
-    run's source, so it must read what the binary's serde_yaml reads: `off`
-    is the string an enum param names, and only true and false are booleans."""
+    """A config with `hf://` references reaches the binary as the launcher's
+    resolved JSON copy, so the launcher must read what the binary's serde_yaml
+    reads: `off` is the string an enum param names, and only true and false
+    are booleans."""
 
     config = tmp_path / "predict.yaml"
     fields = ["mtp_mode: off", "tag: yes", "fp8: false", "x: True"]

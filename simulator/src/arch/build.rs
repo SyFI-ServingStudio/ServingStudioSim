@@ -1863,17 +1863,17 @@ pub fn build_ffn_model(
     })
 }
 
-/// One `#[supported]` combination of an arch, built structure-only.
+/// One arch block on one GPU, built structure-only.
 #[derive(Debug, serde::Serialize)]
-pub struct SupportedBuild {
+pub struct ArchBuild {
     /// The arch contract, as `list-params` groups providers: `iter_wise`,
     /// `layer_wise_attn` or `layer_wise_ffn`.
     pub contract: &'static str,
     pub arch: String,
-    /// The row's GPU (the group's `gpu`, the profile.db key).
+    /// The group's `gpu`, the profile.db key.
     pub gpu: String,
-    /// The row's arch params (`model_config` a `model/config/` stem). Params the
-    /// row leaves out took their schema defaults.
+    /// The block's arch params, without `type`. Params the block leaves out
+    /// took their schema defaults.
     pub params: serde_json::Map<String, serde_json::Value>,
     pub gpus_per_replica: Option<u16>,
     /// The cost tree, in the `cost_manifest/*.json` form; `None` on error.
@@ -1886,67 +1886,13 @@ pub struct SupportedBuild {
 }
 
 /// The dotted-leaf prefix a deployment gives its model, which starts every leaf
-/// name and kernel-config role. Supported builds use the deployment's own, as
+/// name and kernel-config role. Arch builds use the deployment's own, as
 /// `timing-predict` does, so their leaves are named as a real run's are.
 const UNIFIED_MODEL_NAME: &str = "unified";
 const AFD_MODEL_NAME: &str = "afd";
 
-/// Build every `#[supported]` combination of every arch on its row's GPU,
-/// structure only ([`PerfApiBridge::structure_only`]: no Python, `profile.db` or
-/// GPU). A combination that fails to parse or build (including a panicking
-/// shape assertion) is returned with its error, not raised.
-pub fn build_supported_archs(kernel_configs: bool) -> Vec<SupportedBuild> {
-    use serde_json::{Map, Value};
-
-    let schema = crate::schema::list_params();
-    let mut out = Vec::new();
-    for (contract, rows) in [
-        ("iter_wise", IterArchSel::SUPPORTED),
-        ("layer_wise_attn", AttnArchSel::SUPPORTED),
-        ("layer_wise_ffn", FfnArchSel::SUPPORTED),
-    ] {
-        for (tag, rows) in rows {
-            for row in *rows {
-                for combo in row.combinations() {
-                    let mut gpu = String::new();
-                    let mut params = Map::new();
-                    for (name, value) in &combo {
-                        if *name == "gpu" {
-                            gpu = value.as_str().unwrap_or_default().to_string();
-                        } else {
-                            params.insert((*name).into(), value.clone());
-                        }
-                    }
-                    // A row names a model config by its `model/config/` stem.
-                    let mut block = params.clone();
-                    if let Some(Value::String(model)) = params.get("model_config") {
-                        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-                            .join(format!("model/config/{model}.json"));
-                        block.insert(
-                            "model_config".into(),
-                            path.to_string_lossy().into_owned().into(),
-                        );
-                    }
-                    block.insert("type".into(), (*tag).into());
-                    out.push(build_arch(
-                        &schema,
-                        contract,
-                        tag,
-                        gpu,
-                        params,
-                        block,
-                        kernel_configs,
-                    ));
-                }
-            }
-        }
-    }
-    out
-}
-
-/// One arch block on one GPU, as a run's pool group gives it: the form the
-/// kernel-config registry records each source's groups in.
-/// `supported-cost-trees --archs FILE` reads a list of them.
+/// One arch block on one GPU, as a run's pool group gives it.
+/// `cost-trees FILE` reads a list of them.
 #[derive(Debug, Deserialize)]
 pub struct ArchBlock {
     pub gpu: String,
@@ -1954,12 +1900,12 @@ pub struct ArchBlock {
     pub arch: serde_json::Map<String, serde_json::Value>,
 }
 
-/// Build each block structure only, as [`build_supported_archs`] builds a
-/// row's combination: a param the block leaves out takes its schema default.
-/// Each result's `params` is its block without `type`. A block whose tag no
-/// contract provides, or that fails to parse or build, is returned with its
-/// error, not raised.
-pub fn build_arch_blocks(blocks: &[ArchBlock], kernel_configs: bool) -> Vec<SupportedBuild> {
+/// Build each block on its GPU structure only ([`PerfApiBridge::structure_only`]:
+/// no Python, `profile.db` or GPU): a param the block leaves out takes its
+/// schema default. Each result's `params` is its block without `type`. A block
+/// whose tag no contract provides, or that fails to parse or build (including
+/// a panicking shape assertion), is returned with its error, not raised.
+pub fn build_arch_blocks(blocks: &[ArchBlock], kernel_configs: bool) -> Vec<ArchBuild> {
     let schema = crate::schema::list_params();
     blocks
         .iter()
@@ -1984,7 +1930,7 @@ pub fn build_arch_blocks(blocks: &[ArchBlock], kernel_configs: bool) -> Vec<Supp
                     block.arch.clone(),
                     kernel_configs,
                 ),
-                None => SupportedBuild {
+                None => ArchBuild {
                     contract: "",
                     arch: tag.to_string(),
                     gpu: block.gpu.clone(),
@@ -2009,7 +1955,7 @@ fn build_arch(
     params: serde_json::Map<String, serde_json::Value>,
     block: serde_json::Map<String, serde_json::Value>,
     kernel_configs: bool,
-) -> SupportedBuild {
+) -> ArchBuild {
     let mut arch = serde_json::Map::new();
     let common = schema["arch_common"]
         .as_array()
@@ -2077,7 +2023,7 @@ fn build_arch(
             },
         ),
     };
-    let mut supported = SupportedBuild {
+    let mut out = ArchBuild {
         contract,
         arch: tag.to_string(),
         gpu,
@@ -2089,13 +2035,13 @@ fn build_arch(
     };
     match built {
         Ok((gpus_per_replica, manifest, configs)) => {
-            supported.gpus_per_replica = Some(gpus_per_replica);
-            supported.cost_manifest = Some(manifest);
-            supported.kernel_configs = configs;
+            out.gpus_per_replica = Some(gpus_per_replica);
+            out.cost_manifest = Some(manifest);
+            out.kernel_configs = configs;
         }
-        Err(error) => supported.error = Some(error),
+        Err(error) => out.error = Some(error),
     }
-    supported
+    out
 }
 
 /// Parse `arch` as selector `S` and `build` it on `gpu` with a structure-only
@@ -2895,25 +2841,56 @@ mod tests {
         assert_eq!(narrow_bytes, 6 * 8 * 128 * 2);
     }
 
-    /// Every `#[supported]` combination of an arch builds its cost
-    /// tree, so a row cannot claim a deployment the arch cannot build.
-    #[test]
-    fn every_supported_arch_deployment_builds_its_cost_tree() {
-        let builds = build_supported_archs(false);
-        let failures: Vec<String> = builds
-            .iter()
-            .filter_map(|b| {
-                b.error
-                    .as_ref()
-                    .map(|e| format!("{} {:?}: {e}", b.arch, b.params))
-            })
-            .collect();
-        assert!(
-            failures.is_empty(),
-            "unbuildable #[supported] rows:\n{}",
-            failures.join("\n")
+    /// An arch block on `gpu` with `params`, its model config a `model/config/`
+    /// file named by stem.
+    fn arch_block(gpu: &str, tag: &str, model: &str, params: serde_json::Value) -> ArchBlock {
+        let mut arch = params.as_object().cloned().unwrap_or_default();
+        arch.insert("type".into(), tag.into());
+        arch.insert(
+            "model_config".into(),
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(format!("model/config/{model}.json"))
+                .to_string_lossy()
+                .into_owned()
+                .into(),
         );
-        for b in &builds {
+        ArchBlock {
+            gpu: gpu.into(),
+            arch,
+        }
+    }
+
+    /// An iter-wise block (GLM-5.2 NVFP4 at EP4) and an AFD attention block
+    /// (Qwen3-235B attention at TP4).
+    fn sample_blocks() -> Vec<ArchBlock> {
+        vec![
+            arch_block(
+                "NVIDIA B200",
+                "glm52_vllm_nvfp4_dsa_moe",
+                "glm52_nvfp4",
+                serde_json::json!({"ep_size": 4, "nvl_num_gpu": 4}),
+            ),
+            arch_block(
+                "NVIDIA H200",
+                "qwen3_attn_tp",
+                "qwen3_235b",
+                serde_json::json!({"attn_tp_size": 4}),
+            ),
+        ]
+    }
+
+    /// Each block builds a non-empty cost tree under its contract, its leaves
+    /// named as a run of its deployment names them, so its kernel-config roles
+    /// match a run's.
+    #[test]
+    fn arch_blocks_build_their_cost_trees_named_like_a_run() {
+        let built = build_arch_blocks(&sample_blocks(), false);
+        for (b, (contract, prefix)) in built
+            .iter()
+            .zip([("iter_wise", "unified."), ("layer_wise_attn", "afd.")])
+        {
+            assert_eq!(b.error, None, "{}", b.arch);
+            assert_eq!(b.contract, contract);
             let doc = b.cost_manifest.as_ref().unwrap();
             assert!(
                 !doc.sections.is_empty()
@@ -2921,20 +2898,7 @@ mod tests {
                 "{}: empty cost tree",
                 b.arch
             );
-        }
-    }
-
-    /// A supported build names its leaves as a run of its deployment does, so
-    /// its kernel-config roles match the ones runs register.
-    #[test]
-    fn supported_builds_name_leaves_like_their_deployment() {
-        for b in build_supported_archs(false) {
-            let prefix = if b.contract == "iter_wise" {
-                "unified."
-            } else {
-                "afd."
-            };
-            for section in &b.cost_manifest.as_ref().unwrap().sections {
+            for section in &doc.sections {
                 for slot in &section.manifest.slots {
                     assert!(slot.name.starts_with(prefix), "{}: {}", b.arch, slot.name);
                 }
@@ -2942,11 +2906,11 @@ mod tests {
         }
     }
 
-    /// Asked for, each supported build carries the kernel configs it builds, in
-    /// the document `--kernel-configs-out` writes.
+    /// Asked for, each build carries the kernel configs it builds, in the
+    /// document `--kernel-configs-out` writes; otherwise none.
     #[test]
-    fn supported_builds_carry_their_kernel_configs_when_asked() {
-        for b in build_supported_archs(true) {
+    fn arch_blocks_carry_their_kernel_configs_when_asked() {
+        for b in build_arch_blocks(&sample_blocks(), true) {
             let doc = b.kernel_configs.as_ref().expect("kernel_configs");
             assert_eq!(
                 doc["schema_version"],
@@ -2956,57 +2920,36 @@ mod tests {
             assert!(!configs.is_empty(), "{} {:?}: no configs", b.arch, b.params);
             assert!(configs.iter().all(|c| c["gpu_name"] == b.gpu.as_str()));
         }
-        assert!(build_supported_archs(false)
+        assert!(build_arch_blocks(&sample_blocks(), false)
             .iter()
             .all(|b| b.kernel_configs.is_none()));
     }
 
-    /// An arch block builds the tree its `#[supported]` combination builds when
-    /// it names the same params, and a param it sets changes the tree: how the
-    /// public API builds a registered run's tree.
+    /// A param a block sets changes the tree its defaults build, and a tag no
+    /// contract provides is an error, not a panic.
     #[test]
-    fn arch_blocks_build_like_their_supported_combination() {
-        let supported = build_supported_archs(false);
-        let row = supported
-            .iter()
-            .find(|b| b.arch == "glm53_vllm_nvfp4_dsa_moe_dflash2")
-            .expect("a dflash2 row");
-        let mut arch = row.params.clone();
-        let model = arch["model_config"].as_str().unwrap().to_string();
-        arch.insert(
-            "model_config".into(),
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join(format!("model/config/{model}.json"))
-                .to_string_lossy()
-                .into_owned()
-                .into(),
-        );
-        arch.insert("type".into(), row.arch.clone().into());
-        let mut short = arch.clone();
+    fn a_block_param_changes_the_tree_and_an_unknown_tag_is_an_error() {
+        let [base, _] = <[ArchBlock; 2]>::try_from(sample_blocks()).unwrap();
+        let mut short = base.arch.clone();
         short.insert("max_model_len".into(), 8192.into());
         let blocks = [
             ArchBlock {
-                gpu: row.gpu.clone(),
-                arch: arch.clone(),
-            },
-            ArchBlock {
-                gpu: row.gpu.clone(),
+                gpu: base.gpu.clone(),
                 arch: short,
             },
             ArchBlock {
-                gpu: row.gpu.clone(),
+                gpu: base.gpu.clone(),
                 arch: [("type".to_string(), "no_such_arch".into())]
                     .into_iter()
                     .collect(),
             },
+            base,
         ];
         let built = build_arch_blocks(&blocks, false);
-        let json = |b: &SupportedBuild| serde_json::to_value(b.cost_manifest.as_ref()).unwrap();
+        let json = |b: &ArchBuild| serde_json::to_value(b.cost_manifest.as_ref()).unwrap();
         assert_eq!(built[0].error, None);
-        assert_eq!(built[0].contract, "iter_wise");
-        assert_eq!(json(&built[0]), json(row));
-        assert_eq!(built[1].params["max_model_len"], 8192);
-        assert_ne!(json(&built[1]), json(row));
-        assert!(built[2].error.as_deref().unwrap().contains("no_such_arch"));
+        assert_eq!(built[0].params["max_model_len"], 8192);
+        assert_ne!(json(&built[0]), json(&built[2]));
+        assert!(built[1].error.as_deref().unwrap().contains("no_such_arch"));
     }
 }

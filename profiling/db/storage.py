@@ -1,7 +1,7 @@
 """How profile.db stores rows compactly (schema v3).
 
 profile.db is tracked in git, so every byte of it is paid again in each
-committed version. Three things made v2 large, and v3 stores each once:
+committed version. Two things made v2 large, and v3 stores each once:
 
 - **Row keys.** A kind table's unique key was ``(gpu_name, backend, *args)``.
   SQLite keeps a copy of the whole key in its unique index, and list-valued
@@ -14,20 +14,14 @@ committed version. Three things made v2 large, and v3 stores each once:
   backend versions: 172 distinct tuples over 113k rows. v3 keeps each tuple
   once in ``_profile_run`` and a row holds its ``run_key``. Timestamps are
   epoch seconds (v2 stored second-precision UTC text).
-- **Registry strings.** ``_kernel_config_use`` repeated three 64-character
-  hashes and a dotted role path per row; v3 references configs, sources and
-  roles by content key. Large arrays inside a config's identity (an MoE
-  routing's per-layer popularity) are shared between configs: v3 keeps each
-  once in ``_kernel_config_blob`` and the identity names it by
-  ``{"$blob": "<key>"}``.
 
-Every reference is a *content key* (:func:`content_key`, a hash of what it
-names), never a surrogate ``id``. Two databases that store the same run, role
-or blob therefore give it the same key, and ``profiling.db.merge`` merges them
-by their unique keys without remapping references.
+A row references its run by a *content key* (:func:`content_key`, a hash of
+what it names), never a surrogate ``id``. Two databases that store the same run
+therefore give it the same key, and ``profiling.db.merge`` merges them by their
+unique keys without remapping references.
 
-Readers never see keys or epoch seconds: :func:`logical_select` and the
-registry readers in ``profiling.db.kernel_config`` return the v2 columns.
+Readers never see keys or epoch seconds: :func:`logical_select` returns the v2
+columns.
 """
 
 from __future__ import annotations
@@ -40,11 +34,6 @@ from datetime import UTC, datetime
 from typing import Any
 
 RUN_TABLE = "_profile_run"
-CONFIG_TABLE = "_kernel_config"
-SOURCE_TABLE = "_kernel_config_source"
-ROLE_TABLE = "_kernel_config_role"
-USE_TABLE = "_kernel_config_use"
-BLOB_TABLE = "_kernel_config_blob"
 
 # The provenance a run tuple holds, in `_profile_run` column order.
 RUN_COLUMNS = ("profiler_git_hash", "cuda_version", "driver_version", "backend_version")
@@ -71,10 +60,6 @@ NON_ARG_COLUMNS = frozenset(
         "created_at",
     }
 )
-# An identity array whose canonical JSON reaches this many bytes is stored once
-# in `_kernel_config_blob`. Below it a reference would not be much smaller.
-BLOB_MIN_BYTES = 1024
-BLOB_REF = "$blob"
 
 # The v2 text forms, which readers still receive.
 RUN_AT_FORMAT = "%Y-%m-%dT%H:%M:%S+00:00"
@@ -227,168 +212,8 @@ def iso_sql(expression: str, fmt: str) -> str:
     return f"strftime('{fmt}', {expression}, 'unixepoch')"
 
 
-# ── kernel-config registry ───────────────────────────────────────────────────
-
-REGISTRY_SCHEMA = (
-    f"""
-    CREATE TABLE IF NOT EXISTS {CONFIG_TABLE} (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        config_key INTEGER NOT NULL,
-        kind TEXT NOT NULL,
-        config_hash TEXT NOT NULL,
-        gpu_name TEXT NOT NULL,
-        profile_kind TEXT NOT NULL,
-        identity TEXT NOT NULL,
-        cache_coords TEXT NOT NULL,
-        grid_axes TEXT NOT NULL,
-        cells BLOB NOT NULL,
-        infeasible TEXT NOT NULL,
-        created_at INTEGER NOT NULL DEFAULT (unixepoch()),
-        UNIQUE(kind, config_hash, gpu_name),
-        UNIQUE(config_key)
-    )
-    """,
-    f"""
-    CREATE TABLE IF NOT EXISTS {SOURCE_TABLE} (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        source_key INTEGER NOT NULL,
-        source_hash TEXT NOT NULL,
-        source TEXT NOT NULL,
-        created_at INTEGER NOT NULL DEFAULT (unixepoch()),
-        UNIQUE(source_hash),
-        UNIQUE(source_key)
-    )
-    """,
-    f"""
-    CREATE TABLE IF NOT EXISTS {ROLE_TABLE} (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        role_key INTEGER NOT NULL,
-        role TEXT NOT NULL,
-        UNIQUE(role_key)
-    )
-    """,
-    f"""
-    CREATE TABLE IF NOT EXISTS {USE_TABLE} (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        config_key INTEGER NOT NULL,
-        source_key INTEGER NOT NULL,
-        pool TEXT NOT NULL,
-        role_key INTEGER NOT NULL,
-        created_at INTEGER NOT NULL DEFAULT (unixepoch()),
-        UNIQUE(config_key, source_key, pool, role_key)
-    )
-    """,
-    f"""
-    CREATE TABLE IF NOT EXISTS {BLOB_TABLE} (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        blob_key INTEGER NOT NULL,
-        body TEXT NOT NULL,
-        UNIQUE(blob_key)
-    )
-    """,
-)
-# Semantic key of each registry and lookup table, for `profiling.db.merge`.
-LOOKUP_KEYS = {
-    RUN_TABLE: ("run_key",),
-    CONFIG_TABLE: ("kind", "config_hash", "gpu_name"),
-    SOURCE_TABLE: ("source_hash",),
-    ROLE_TABLE: ("role_key",),
-    USE_TABLE: ("config_key", "source_key", "pool", "role_key"),
-    BLOB_TABLE: ("blob_key",),
-}
-
-
-def config_key(kind: str, config_hash: str, gpu_name: str) -> int:
-    return content_key(kind, config_hash, gpu_name)
-
-
-def source_key(source_hash: str) -> int:
-    return content_key(source_hash)
-
-
-def role_key(role: str) -> int:
-    return content_key(role)
-
-
-def ensure_role(conn: sqlite3.Connection, role: str) -> int:
-    key = role_key(role)
-    stored = conn.execute(f"SELECT role FROM {ROLE_TABLE} WHERE role_key = ?", (key,)).fetchone()
-    if stored is None:
-        conn.execute(f"INSERT INTO {ROLE_TABLE} (role_key, role) VALUES (?, ?)", (key, role))
-    elif stored[0] != role:
-        raise ValueError(f"role key {key} names both {stored[0]!r} and {role!r}")
-    return key
-
-
-def pack_identity(conn: sqlite3.Connection, identity: Any) -> str:
-    """``identity``'s stored text: each large array moved to ``_kernel_config_blob``."""
-
-    def pack(value: Any) -> Any:
-        if isinstance(value, dict):
-            return {key: pack(item) for key, item in value.items()}
-        if isinstance(value, list):
-            body = canonical_json(value)
-            if len(body) >= BLOB_MIN_BYTES:
-                return {BLOB_REF: _store_blob(conn, body)}
-        return value
-
-    return canonical_json(pack(identity))
-
-
-def unpack_identity(text: str, blobs: Mapping[str, Any]) -> Any:
-    """Inverse of :func:`pack_identity`; ``blobs`` is :func:`load_blobs`."""
-
-    def unpack(value: Any) -> Any:
-        if isinstance(value, dict):
-            if set(value) == {BLOB_REF}:
-                return blobs[value[BLOB_REF]]
-            return {key: unpack(item) for key, item in value.items()}
-        return value
-
-    return unpack(json.loads(text))
-
-
-def load_blobs(conn: sqlite3.Connection) -> dict[str, Any]:
-    """Every stored blob, by the reference an identity names it with."""
-    return {
-        _blob_ref(key): json.loads(body)
-        for key, body in conn.execute(f"SELECT blob_key, body FROM {BLOB_TABLE}")
-    }
-
-
-def prune_blobs(conn: sqlite3.Connection) -> None:
-    """Drop blobs no stored identity references (after configs are deleted)."""
-    referenced: set[str] = set()
-
-    def walk(value: Any) -> None:
-        if isinstance(value, dict):
-            if set(value) == {BLOB_REF}:
-                referenced.add(value[BLOB_REF])
-            for item in value.values():
-                walk(item)
-
-    for (text,) in conn.execute(f"SELECT identity FROM {CONFIG_TABLE}"):
-        walk(json.loads(text))
-    stale = [
-        (key,)
-        for (key,) in conn.execute(f"SELECT blob_key FROM {BLOB_TABLE}")
-        if _blob_ref(key) not in referenced
-    ]
-    conn.executemany(f"DELETE FROM {BLOB_TABLE} WHERE blob_key = ?", stale)
-
-
-def _store_blob(conn: sqlite3.Connection, body: str) -> str:
-    key = content_key(body)
-    stored = conn.execute(f"SELECT body FROM {BLOB_TABLE} WHERE blob_key = ?", (key,)).fetchone()
-    if stored is None:
-        conn.execute(f"INSERT INTO {BLOB_TABLE} (blob_key, body) VALUES (?, ?)", (key, body))
-    elif stored[0] != body:
-        raise ValueError(f"blob key {key} names two different arrays")
-    return _blob_ref(key)
-
-
-def _blob_ref(key: int) -> str:
-    return f"{key & 0xFFFFFFFFFFFFFFFF:016x}"
+# Semantic key of each lookup table, for `profiling.db.merge`.
+LOOKUP_KEYS = {RUN_TABLE: ("run_key",)}
 
 
 def quote(identifier: str) -> str:

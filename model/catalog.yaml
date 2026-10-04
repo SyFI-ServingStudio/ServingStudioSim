@@ -1,9 +1,9 @@
 # Reader-facing identity of each model config, for the Kernel Library.
 #
 # model/config/*.json mirror the checkpoints' Hugging Face configs and carry no
-# display name, so this file names them. Keyed like `#[supported]` rows: the
-# file stem in model/config/. `family` groups models on the site; `checkpoint`
-# is the Hugging Face repository the config was taken from.
+# display name, so this file names them. Keyed by the file stem in
+# model/config/. `family` groups models on the site; `checkpoint` is the
+# Hugging Face repository the config was taken from.
 llama3_8b:
   name: Llama 3 8B
   family: Llama

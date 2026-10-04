@@ -40,14 +40,6 @@
 //!   the launcher treat two runs needing different kernels as one group, so the
 //!   second JIT-profiles on the GPU concurrently — the exact SQLite/contention
 //!   bug §1.2.2 prevents.
-//! - `.set_when_predicting()` marks a param that describes the traffic a
-//!   prediction is for rather than the deployment: MoE expert routing, which
-//!   is a property of the token stream, not of the sharding. Its `default`
-//!   only lets a config omit it and is not a representative choice, so a
-//!   caller sets it for each run or prediction
-//!   (`skills/operate-run-simulation/references/moe-routing.md`) and a display
-//!   lists it as set when predicting, never as a default (emitted as
-//!   `"set_when_predicting": true`).
 //! - Round-trip is one-way (Rust → JSON → Python launcher); the Rust binary
 //!   never reads the JSON back, so no `Deserialize` impls live here.
 
@@ -113,9 +105,6 @@ pub struct ParamDef {
     /// needs — i.e. part of the launcher's cache-grouping key (design §1.2.2).
     /// See module docs for the safe-direction rule.
     pub affects_cache: bool,
-    /// Marks a traffic param (MoE routing) whose default is not a real
-    /// choice: callers set it per prediction. See module docs.
-    pub set_when_predicting: bool,
     /// Closed set of allowed string values. Empty means unrestricted.
     pub choices: &'static [&'static str],
     pub description: &'static str,
@@ -133,9 +122,6 @@ impl Serialize for ParamDef {
         if self.affects_cache {
             m.serialize_entry("affects_cache", &true)?;
         }
-        if self.set_when_predicting {
-            m.serialize_entry("set_when_predicting", &true)?;
-        }
         if !self.choices.is_empty() {
             m.serialize_entry("choices", &self.choices)?;
         }
@@ -152,7 +138,6 @@ impl ParamDef {
             default: None,
             optional: false,
             affects_cache: false,
-            set_when_predicting: false,
             choices: &[],
             description: "",
         }
@@ -237,14 +222,6 @@ impl ParamDef {
     /// (when unsure, tag it).
     pub const fn cache_key(mut self) -> Self {
         self.affects_cache = true;
-        self
-    }
-
-    /// Mark this param as describing the traffic, not the deployment (MoE
-    /// routing): its default only makes it omittable, and a display names it
-    /// as set when predicting instead of listing the default. See module docs.
-    pub const fn set_when_predicting(mut self) -> Self {
-        self.set_when_predicting = true;
         self
     }
 

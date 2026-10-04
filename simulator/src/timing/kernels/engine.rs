@@ -68,7 +68,7 @@ pub trait KernelConfig:
         serde_json::to_value(self).expect("KernelConfig must serialize to JSON")
     }
 
-    /// The config's identity in profile.db's kernel-config registry: every
+    /// The config's identity in its kernel-config record: every
     /// field except `gpu_name` and `backends`, which profile.db rows key in
     /// their own columns, with each `Dim` reduced to its value. Two configs
     /// that fold to the same shape share one identity however their dims were
@@ -213,7 +213,7 @@ impl<S: KernelSpec> Kernel<S> {
             LeafMetrics::NO_BACKEND,
         );
 
-        // Kernel-config registry: record the config and the grid it asks for,
+        // Kernel-config records: record the config and the grid it asks for,
         // whatever the mode. Recording enumerates the grid itself, so it does not
         // depend on which of the paths below runs.
         if bridge.records_configs() {

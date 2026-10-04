@@ -19,7 +19,6 @@ port=$2
 name=${PUBLIC_API_CONTAINER:-servingstudio-public-api}
 image=${PUBLIC_API_IMAGE:-servingstudio-public-api}
 repo=$(cd "$(dirname "$0")/../.." && pwd -P)
-hf_home=${HF_HOME:-$HOME/.cache/huggingface}
 
 for path in "$repo/target/release/simulator" "$repo/profiling/profile.db"; do
   [[ -e $path ]] || { echo "$path is missing" >&2; exit 1; }
@@ -32,16 +31,14 @@ cp "$repo/public_api/docker/Dockerfile" "$repo/pyproject.toml" "$repo/uv.lock" "
 docker build -q -t "$image" "$context" >/dev/null
 
 docker rm -f "$name" >/dev/null 2>&1 || true
-# The service asks git for the commit it serves and the files it tracks. A
-# worktree's git directory lies outside the checkout, so it is mounted too.
-# Hub corpora are read from the local cache only, so the cache is mounted too.
+# The service asks git for the commit it serves. A worktree's git directory
+# lies outside the checkout, so it is mounted too.
 mounts=(-v "$repo:$repo:ro")
 git_dir=$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir)
 [[ $git_dir == "$repo"/* ]] || mounts+=(-v "$git_dir:$git_dir:ro")
-[[ -d $hf_home/hub ]] && mounts+=(-v "$hf_home/hub:$hf_home/hub:ro")
 docker run -d --name "$name" --restart unless-stopped \
   --user "$(id -u):$(id -g)" \
-  "${mounts[@]}" -e HF_HOME="$hf_home" -e HF_HUB_OFFLINE=1 \
+  "${mounts[@]}" \
   -w "$repo" -p "$bind:$port:$port" \
   "$image" \
   python -m public_api serve --bind 0.0.0.0 --port "$port" \

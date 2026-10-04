@@ -2,8 +2,8 @@
 name: servingstudio-kernel-performance
 description: >-
   Look up measured GPU kernel performance for LLM serving (GEMM, attention, MoE,
-  normalization, communication) from the ServingStudio Kernel Library API, and
-  find which shapes a model deployment runs. Not for end-to-end serving latency.
+  normalization, communication) from the ServingStudio Kernel Library API. Not
+  for end-to-end serving latency.
 ---
 
 # ServingStudio Kernel Performance
@@ -13,8 +13,7 @@ ServingStudio simulator uses to predict LLM serving performance. Each kernel
 kind, such as `single_gemm` or `nvfp4_fused_moe`, has a table of rows, one per
 combination of argument values, GPU and backend. Use this skill to answer
 questions such as "how long does a bf16 GEMM with m=64, n=6144, k=4096 take on
-H200?" or "which attention kernels does GLM-5.2 run on B200, and at what
-shapes?"
+H200?"
 
 The API is read-only JSON over HTTPS. Set the base URL once:
 
@@ -28,17 +27,14 @@ URL; do not guess another host.
 
 ## 1. Find the kernel kind
 
-The catalog lists every kind with its title, category, backends, precisions,
-row count and the models that use it.
+The catalog lists every kind with its title, category, backends, precisions
+and row count.
 
 ```bash
 curl -s "$API/kernels" | jq -r '.kernels[] | [.kind, .category, .title] | @tsv'
-curl -s "$API/kernels" | jq '.kernels[] | select(.used_by | index("glm52_nvfp4")) | .kind'
 ```
 
-`used_by` holds model-config stems; `.models[]` in the same response maps each
-stem to its display name and Hugging Face checkpoint. `.gpus[]` gives each GPU's
-spec-sheet peaks (dense `peaks.tflops.by_dtype`, `peaks.memory_bandwidth_gbps`),
+`.gpus[]` in the same response gives each GPU's spec-sheet peaks (dense `peaks.tflops.by_dtype`, `peaks.memory_bandwidth_gbps`),
 which put a measured number in context.
 
 ## 2. Read what the kind measures
@@ -48,25 +44,13 @@ curl -s "$API/kernels/single_gemm" | jq '{title, description, formula, method, c
 ```
 
 Read `args` before filtering rows. Each entry gives the argument's `unit` and
-meaning (`doc`). Its `role` says whether a model fixes the value (`config`) or
-the value grows with the batch (`sweep`); `role` is null when no supported
-deployment runs the kind.
+meaning (`doc`).
 
 The other fields explain the numbers. `formula` defines the FLOPs and bytes
 behind the throughput metrics, `method` states how time was measured, and
 `caveats` lists what the measurement leaves out. `backends` describes each
 implementation (for example `torch`, `deepgemm`, `flashinfer_trtllm_sm100`)
 with a link to its source.
-
-To see the shapes a model actually runs, read `used_by`. Each deployment names
-its `model_config` and `gpu` and lists `shapes[]`, where `layer` names the model
-layer and `db` holds the fixed argument values to filter rows by.
-
-```bash
-curl -s "$API/kernels/single_gemm" \
-  | jq '.used_by[] | select(.model_config == "llama3_8b" and .gpu == "NVIDIA H200")
-      | .shapes[] | {layer, db}'
-```
 
 ## 3. Get the rows
 
@@ -109,10 +93,3 @@ every row instead.
   give the nearest rows; label any interpolation as your own estimate.
 - When you answer, name the kind, GPU, backend, argument values, the metric with
   its unit, and `profiler_run_at`.
-
-## Kernel configs (optional)
-
-`/kernels/{kind}/configs` lists the grids the simulator reads for each
-deployment, and `/kernels/{kind}/configs/{config_hash}` returns one grid with
-every cell's measured metrics per backend. Use these only when the user asks
-how the simulator uses the data; rows answer most performance questions.

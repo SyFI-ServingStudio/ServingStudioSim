@@ -8,8 +8,7 @@
 //!   - `emit-backends <config>`    — enumerate distinct kernels (JSON), no sim
 //!   - `list-params`               — emit the param-schema registry JSON
 //!   - `kernel-list`               — every kernel kind's config / sweep fields
-//!   - `supported-cost-trees`      — each arch's `#[supported]` cost trees (or given
-//!                                   arch blocks' trees), no sim
+//!   - `cost-trees <blocks>`       — given arch blocks' cost trees, no sim
 //!
 //! All three run-like subcommands share one parse (`load_config`) → `RunConfig`
 //! (a serde enum tagged by `deployment`) → `deployment::build_flow` dispatch.
@@ -79,10 +78,10 @@ enum Cmd {
     /// coordinates, and which config field is the compute / KV dtype. Reads the
     /// kernel registry only (no config, GPU or profile.db).
     KernelList,
-    /// Build every `#[supported]` combination of every arch, iter-wise and
-    /// layer-wise, and print each one's cost tree (the `cost_manifest` form) as
-    /// JSON. Structure only: no config file, Python perf_api, profile.db or GPU.
-    SupportedCostTrees(SupportedArgs),
+    /// Build each given arch block on its GPU, iter-wise or layer-wise, and
+    /// print each one's cost tree (the `cost_manifest` form) as JSON. Structure
+    /// only: no run config, Python perf_api, profile.db or GPU.
+    CostTrees(CostTreeArgs),
     /// Predict per-building-block timing offline for a batch of explicit batch
     /// shapes — NO sim/scheduler/trace. Reads a minimal config (one arch selector
     /// `{iter|attn|ffn}` + gpu + a cases_file) and writes the standard
@@ -108,20 +107,17 @@ struct PredictArgs {
 }
 
 #[derive(Args)]
-struct SupportedArgs {
+struct CostTreeArgs {
+    /// The arch blocks to build: a JSON list of `{gpu, arch}` (`arch` holds
+    /// `type` and the params, file paths as this process opens them), `-` for
+    /// stdin. A param a block leaves out takes its schema default.
+    #[arg(value_name = "FILE")]
+    archs: PathBuf,
     /// Also give each build's kernel configs (with the grid of args each one
     /// reads) under `kernel_configs`, as the document `--kernel-configs-out`
-    /// writes. The launcher registers them in profile.db's kernel-config
-    /// registry.
+    /// writes.
     #[arg(long)]
     kernel_configs: bool,
-    /// Build these arch blocks instead of the `#[supported]` rows: a JSON list
-    /// of `{gpu, arch}` (`arch` holds `type` and the params, file paths as this
-    /// process opens them), `-` for stdin. A param a block leaves out takes its
-    /// schema default. The public API builds the arch blocks of the runs the
-    /// kernel-config registry records this way.
-    #[arg(long, value_name = "FILE")]
-    archs: Option<PathBuf>,
 }
 
 /// `build-cache-only` / `dry-run`: a run config, and where to write the kernel
@@ -131,8 +127,7 @@ struct CacheArgs {
     /// Path to the structured run config (`.yaml` / `.yml` / `.json`).
     config: PathBuf,
     /// Write every kernel config the build asks profile.db for, with the grid
-    /// of args each one reads, to this JSON file once the command succeeds. The
-    /// launcher registers it in profile.db's kernel-config registry.
+    /// of args each one reads, to this JSON file once the command succeeds.
     #[arg(long, value_name = "FILE")]
     kernel_configs_out: Option<PathBuf>,
 }
@@ -223,21 +218,17 @@ fn main() -> anyhow::Result<()> {
         }
         Cmd::KernelQuery => simulator::introspect::run_kernel_query(),
         Cmd::KernelList => simulator::introspect::run_kernel_list(),
-        Cmd::SupportedCostTrees(args) => {
-            let builds = match &args.archs {
-                None => simulator::arch::build::build_supported_archs(args.kernel_configs),
-                Some(path) => {
-                    let text = if path.as_os_str() == "-" {
-                        std::io::read_to_string(std::io::stdin()).context("reading stdin")?
-                    } else {
-                        std::fs::read_to_string(path)
-                            .with_context(|| format!("reading {}", path.display()))?
-                    };
-                    let blocks: Vec<simulator::arch::build::ArchBlock> =
-                        serde_json::from_str(&text).context("parsing the arch blocks")?;
-                    simulator::arch::build::build_arch_blocks(&blocks, args.kernel_configs)
-                }
+        Cmd::CostTrees(args) => {
+            let path = &args.archs;
+            let text = if path.as_os_str() == "-" {
+                std::io::read_to_string(std::io::stdin()).context("reading stdin")?
+            } else {
+                std::fs::read_to_string(path)
+                    .with_context(|| format!("reading {}", path.display()))?
             };
+            let blocks: Vec<simulator::arch::build::ArchBlock> =
+                serde_json::from_str(&text).context("parsing the arch blocks")?;
+            let builds = simulator::arch::build::build_arch_blocks(&blocks, args.kernel_configs);
             println!("{}", serde_json::to_string(&builds)?);
             Ok(())
         }

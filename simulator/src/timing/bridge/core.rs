@@ -54,10 +54,10 @@ pub struct KernelEnum {
     pub backends: Vec<String>,
 }
 
-/// One kernel config a build asked profile.db for, as profile.db's kernel-config
-/// registry stores it: the config's identity, the GPU, the cache grid and the
-/// DB args behind each grid cell. Every role that builds the same
-/// `(kind, gpu_name, identity)` shares one record and is listed in `uses`.
+/// One kernel config a build asked profile.db for: the config's identity, the
+/// GPU, the cache grid and the DB args behind each grid cell. Every role that
+/// builds the same `(kind, gpu_name, identity)` shares one record and is listed
+/// in `uses`.
 ///
 /// The grid is recorded rather than recomputed later from `identity` because
 /// recomputing is not always possible: a corpus-routed MoE config names a
@@ -100,8 +100,7 @@ pub struct ConfigUse {
 /// Version of the document [`config_records_document`] builds.
 pub const CONFIG_RECORDS_SCHEMA_VERSION: u32 = 1;
 
-/// `records` as the JSON document the launcher registers into profile.db's
-/// kernel-config registry (`profiling/db/kernel_config.py`).
+/// `records` as the JSON document `--kernel-configs-out` writes.
 pub fn config_records_document(records: &[KernelConfigRecord]) -> serde_json::Value {
     serde_json::json!({
         "schema_version": CONFIG_RECORDS_SCHEMA_VERSION,
@@ -188,8 +187,7 @@ pub struct PerfApiBridge {
     /// `dry_run`, which still calls `count_missing`.
     enumerate: RefCell<Option<Vec<KernelEnum>>>,
     /// `Some(..)` makes `Kernel::build` record each config it builds, in any
-    /// mode, for profile.db's kernel-config registry (see
-    /// [`enable_config_records`](Self::enable_config_records)).
+    /// mode (see [`enable_config_records`](Self::enable_config_records)).
     config_records: RefCell<Option<ConfigRecords>>,
 }
 
@@ -378,7 +376,7 @@ impl PerfApiBridge {
         }
     }
 
-    // ── kernel-config records (profile.db registry) ──────────────────────────
+    // ── kernel-config records ────────────────────────────────────────────────
 
     /// Record every kernel config subsequent `Kernel::build` calls build, in any
     /// bridge mode. Drain with [`take_config_records`](Self::take_config_records).

@@ -211,8 +211,7 @@ class Registry:
     # deployment name -> {"pools": {role -> contract class}}
     # (e.g. {"pools": {"main": "iter_wise"}}).
     deployments: dict[str, dict[str, dict[str, str]]]
-    # contract -> arch tag -> {"params": [ParamDef], "supported"?: [row]}; same
-    # for workers (no "supported"). A row maps param -> allowed values.
+    # contract -> arch tag -> {"params": [ParamDef]}; same for workers.
     arch_providers: dict[str, dict[str, dict[str, list[dict]]]]
     worker_providers: dict[str, dict[str, dict[str, list[dict]]]]
     # ParamDefs every arch tag / group / pool / the run-global blocks carry.
@@ -228,10 +227,6 @@ class Registry:
 
     def arch_params(self, contract: str, arch_type: str | None) -> list[dict]:
         return self.arch_providers.get(contract, {}).get(arch_type or "", {}).get("params", [])
-
-    def arch_supported(self, contract: str, arch_type: str | None) -> list[dict]:
-        """The arch's `#[supported]` rows; empty when it declares none."""
-        return self.arch_providers.get(contract, {}).get(arch_type or "", {}).get("supported", [])
 
     def worker_params(self, contract: str, worker_type: str | None) -> list[dict]:
         return self.worker_providers.get(contract, {}).get(worker_type or "", {}).get("params", [])
