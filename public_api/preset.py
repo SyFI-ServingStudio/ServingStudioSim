@@ -37,6 +37,8 @@ from launcher.schema.loader import Registry
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PRESET_ROOT = REPO_ROOT / "presets" / "public"
 MODEL_CATALOG = REPO_ROOT / "model" / "catalog.yaml"
+# The reader-facing name of each arch type, `{type: {name}}`.
+ARCH_CATALOG = REPO_ROOT / "model" / "arch_catalog.yaml"
 WORKLOAD = "workload"
 
 _CONTROL = ("sweep", "compound", "derived", "constraints")

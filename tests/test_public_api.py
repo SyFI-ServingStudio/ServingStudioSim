@@ -138,7 +138,9 @@ def _member(tp_size: int) -> Member:
 def _index() -> DeploymentIndex:
     """One preset of two members over one gemm config, three cells of which
     the fixture database measured two on the H200; the tp 2 member lacks one."""
-    index = DeploymentIndex(None, {"prefill": ["input_len"]}, {CHECKPOINT: {"name": "Llama 3 8B"}})
+    index = DeploymentIndex(
+        None, {"prefill": ["input_len"]}, {CHECKPOINT: {"name": "Llama 3 8B"}}, {"dense": "TP"}
+    )
     members = [_member(1), _member(2)]
     index.presets[PRESET] = Preset(
         id=PRESET,
@@ -432,6 +434,7 @@ def test_models_list_presets_and_a_tree_is_named_by_its_axes(client: TestClient)
     [checkpoint] = client.get(f"{PREFIX}/models").json()["checkpoints"]
     [preset] = checkpoint["presets"]
     assert preset["id"] == PRESET
+    assert preset["arch_name"] == "TP"
     assert [m["missing"] for m in preset["members"]] == [{}, {"single_gemm": 1}]
 
     tree = client.get(f"{PREFIX}/models/{PRESET}/tree", params={"tp_size": 1}).json()

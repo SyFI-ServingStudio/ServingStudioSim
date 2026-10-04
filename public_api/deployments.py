@@ -230,10 +230,18 @@ def _tree(section: dict) -> dict:
 class DeploymentIndex:
     """Every public deployment and kernel config, built from the presets."""
 
-    def __init__(self, sim_commit: str | None, case_fields: dict, models: dict) -> None:
+    def __init__(
+        self,
+        sim_commit: str | None,
+        case_fields: dict,
+        models: dict,
+        arch_names: dict[str, str] | None = None,
+    ) -> None:
         self.sim_commit = sim_commit
         self.case_fields = case_fields
         self.models = models
+        # Each arch type's reader-facing name (model/arch_catalog.yaml).
+        self.arch_names = arch_names or {}
         self.presets: dict[str, Preset] = {}
         self.configs: dict[str, Config] = {}
 
@@ -253,7 +261,9 @@ class DeploymentIndex:
         resolve their captures and build them, one ``cost_trees`` call per preset."""
         catalog = yaml.safe_load(public_preset.MODEL_CATALOG.read_text())
         registry = schema_from_dict(list_params)
-        index = cls(sim_commit, list_params.get("predict_cases", {}), catalog)
+        arch_catalog = yaml.safe_load(public_preset.ARCH_CATALOG.read_text()) or {}
+        arch_names = {arch: entry["name"] for arch, entry in arch_catalog.items()}
+        index = cls(sim_commit, list_params.get("predict_cases", {}), catalog, arch_names)
         for path in public_preset.preset_paths() if paths is None else paths:
             preset = public_preset.load(path, catalog)
             preset_id = f"{path.parent.name}/{path.stem}"
@@ -267,6 +277,11 @@ class DeploymentIndex:
                 )
                 for member in public_preset.members(preset, registry)
             ]
+            if preset["arch"]["type"] not in arch_names:
+                raise ValueError(
+                    f"{path}: arch {preset['arch']['type']!r} has no name in "
+                    f"{public_preset.ARCH_CATALOG.name}"
+                )
             index.presets[preset_id] = Preset(
                 id=preset_id,
                 checkpoint=preset["checkpoint"],
@@ -384,6 +399,7 @@ class DeploymentIndex:
                         {
                             "id": preset.id,
                             "arch": preset.arch,
+                            "arch_name": self.arch_names.get(preset.arch),
                             "contract": next(
                                 (m.contract for m in preset.members if m.contract), None
                             ),
@@ -424,6 +440,7 @@ class DeploymentIndex:
             "params": member.params,
             "gpu": member.gpu,
             "arch": member.arch,
+            "arch_name": self.arch_names.get(self.presets[preset_id].arch),
             "contract": member.contract,
             "gpus_per_replica": member.gpus_per_replica,
             "predict": member.predict,

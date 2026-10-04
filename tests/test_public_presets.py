@@ -7,6 +7,7 @@ import re
 import subprocess
 
 import pytest
+import yaml
 
 from profiling.perf_api import DB_PATH
 from public_api import predict
@@ -90,6 +91,21 @@ def test_every_moe_member_states_its_routing(sim_bin):
             assert arch.get("routing") in ("uniform", "random", "popularity", "corpus"), path
             if arch["routing"] in ("uniform", "random"):
                 assert not any(arch.get(field) for field in CAPTURE_FIELDS), path
+
+
+@pytest.mark.needs_binary
+def test_every_named_arch_is_one_the_simulator_has(sim_bin):
+    """model/arch_catalog.yaml names real arch types, each with a name; the
+    index refuses a preset whose arch has none."""
+    params = json.loads(
+        subprocess.run([sim_bin, "list-params"], capture_output=True, text=True, check=True).stdout
+    )
+    tags = {tag for tags in params["providers"]["arch"].values() for tag in tags}
+    catalog = yaml.safe_load(public_preset.ARCH_CATALOG.read_text())
+    assert set(catalog) <= tags
+    assert all(isinstance(entry.get("name"), str) and entry["name"] for entry in catalog.values())
+    used = {public_preset.load(path)["arch"]["type"] for path in PRESETS}
+    assert used <= set(catalog), used - set(catalog)
 
 
 @pytest.fixture(scope="module")

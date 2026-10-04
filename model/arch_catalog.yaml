@@ -1,0 +1,41 @@
+# Reader-facing name of each arch type a public preset uses, for the public
+# site. The name says how the model is deployed (engine, parallelism, decoding);
+# the checkpoint, its precision and the GPU are named elsewhere on the page.
+# Keyed by the arch's `type` tag (`simulator list-params`); every arch a public
+# preset uses needs one (tests/test_public_presets.py).
+llama3_dense:
+  name: "Single GPU"
+llama3_dense_tp:
+  name: "TP"
+llama3_dp_attn_tp_ffn:
+  name: "DP attention, TP FFN"
+qwen36_local:
+  name: "Single GPU"
+qwen3_moe_dp_attn_ep_ffn:
+  name: "DP attention, EP MoE"
+qwen3_moe_fp8_dp_attn_ep_ffn:
+  name: "DP attention, EP MoE, DeepGEMM experts"
+qwen3_vllm_moe_dp_attn_ep_ffn:
+  name: "vLLM, DP attention, EP MoE"
+qwen3_attn_tp:
+  name: "Attention side of an attention–FFN split"
+qwen3_ffn_moe:
+  name: "FFN side of an attention–FFN split"
+qwen3_fp8_ffn_moe:
+  name: "FFN side of an attention–FFN split"
+deepseek_v4_vllm:
+  name: "vLLM, DP attention, EP"
+deepseek_v4_vllm_serial_streams:
+  name: "vLLM, DP attention, EP, parallel streams serialized"
+glm52_vllm_dsa_moe:
+  name: "vLLM, DP attention, EP"
+glm52_vllm_nvfp4_dsa_moe:
+  name: "vLLM, TP and EP"
+glm52_vllm_nvfp4_dsa_moe_speculative:
+  name: "vLLM, TP and EP, MTP speculative decoding"
+glm53_vllm_nvfp4_dsa_moe_dflash2:
+  name: "vLLM, TP and EP, DFlash speculative decoding"
+glm52_sglang_nvfp4_tp_dsa_moe:
+  name: "SGLang, TP"
+glm53_flash_vllm_fp8_kda_dsa_moe:
+  name: "vLLM, TP and EP"
