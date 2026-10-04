@@ -30,6 +30,16 @@ sends the buffer tails, closes the channel, and joins the writer, propagating it
 first error. Files are created **lazily** on the first non-empty write, so a
 stream that never produces a row leaves no file behind.
 
+`cost_log` chunks are cut by rows, but their `slot_input` JSON is not bounded by
+rows: on long-context EP runs 8,192 rows passed the 2 GiB an Arrow `Utf8` column
+can index. The writer therefore converts one chunk into as many record batches as
+keep each batch's `slot_input` under 1 GiB (`MAX_SLOT_INPUT_BYTES_PER_BATCH`).
+A `CostLogger` never stops the sim, but a failed writer deletes its partial
+parquet and leaves `cost_log/worker_<pool_tag>_<worker_id>.error`; `main` and
+timing-predict drop the workers, read those markers (`cost_log_failures`) and exit
+with an error, so a run can't succeed with an incomplete `cost_log`. Opening a
+stream first deletes the previous run's parquet and marker in that `log_dir`.
+
 ## Directory map
 
 Speculative iterations append nullable `groups.speculative_geometry` JSON with
