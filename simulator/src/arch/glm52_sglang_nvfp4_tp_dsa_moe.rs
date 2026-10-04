@@ -48,6 +48,10 @@ use crate::worklet::{
 
 const ARCH_KIND: &str = "glm52_sglang_nvfp4_tp_dsa_moe";
 const NUM_LAYERS: u32 = 78;
+/// Every TP boundary in this graph is FlashInfer's fused all-reduce, whose
+/// workspace policy covers TP 2/4/8 only. TP1 has no TP boundary, so this graph
+/// does not describe it.
+const FUSED_ALLREDUCE_TP_SIZES: [u16; 3] = [2, 4, 8];
 const NUM_DENSE_LAYERS: u32 = 3;
 const NUM_INITIAL_SHARED_LAYERS: u32 = 3;
 const NUM_SPARSE_CYCLES: u32 = 18;
@@ -67,7 +71,6 @@ const PROFILE_INDEX_HEADS: u32 = 32;
 const INDEX_HEAD_DIM: u32 = 128;
 const INDEX_TOP_K: u32 = 2_048;
 const CHECKPOINT_MAX_CONTEXT: u32 = 1_048_576;
-const PROFILED_H32_CONTEXTS: [u32; 5] = [8_192, 65_536, 131_072, 262_144, 524_288];
 const NUM_EXPERTS: u32 = 256;
 const ROUTER_TOP_K: u32 = 8;
 const MOE_INTERMEDIATE_DIM: u32 = 2_048;
@@ -258,9 +261,9 @@ pub fn build_configs(
     mtp_mode: Glm52MtpMode,
 ) -> Result<Glm52SglangNvfp4TpDsaMoeConfigs, BuildError> {
     validate_model_cfg(model).map_err(fit_failed)?;
-    if parallel.tp_size != 4 {
+    if !FUSED_ALLREDUCE_TP_SIZES.contains(&parallel.tp_size) {
         return Err(fit_failed(format!(
-            "only the profiled TP4 deployment is runtime-ready; got tp_size {}",
+            "tp_size {} has no FlashInfer fused all-reduce; expected one of {FUSED_ALLREDUCE_TP_SIZES:?}",
             parallel.tp_size
         )));
     }
@@ -270,10 +273,10 @@ pub fn build_configs(
             parallel.tp_size
         )));
     }
-    if !PROFILED_H32_CONTEXTS.contains(&parallel.max_model_len) {
+    if !(1..=CHECKPOINT_MAX_CONTEXT).contains(&parallel.max_model_len) {
         return Err(fit_failed(format!(
-            "max_model_len {} is not a profiled H32 config identity; expected one of {PROFILED_H32_CONTEXTS:?}",
-            parallel.max_model_len,
+            "max_model_len {} must be in 1..={CHECKPOINT_MAX_CONTEXT}",
+            parallel.max_model_len
         )));
     }
     if demand.num_experts() != NUM_EXPERTS as usize {
@@ -1791,9 +1794,43 @@ mod tests {
     }
 
     #[test]
+    fn tp2_and_unprofiled_contexts_build_the_full_graph() {
+        let routing = ExpertDemand::popularity(&RoutingDistribution::uniform(NUM_EXPERTS), 1);
+        for (tp_size, max_model_len) in [(2, 8_192), (4, 32_768), (8, CHECKPOINT_MAX_CONTEXT)] {
+            let mut parallel = parallel(tp_size);
+            parallel.max_model_len = max_model_len;
+            let cfg = build_configs(
+                &model(),
+                &parallel,
+                &routing,
+                false,
+                Glm52MtpMode::FullIndex,
+            )
+            .unwrap();
+            let bridge = PerfApiBridge::new_uninit_for_test();
+            bridge.enable_enumerate();
+            let model = build("unified".to_string(), resolve_configs(&cfg), &bridge).unwrap();
+            assert_eq!(model.tp_size, tp_size);
+            assert_eq!(model.max_model_len, max_model_len);
+        }
+    }
+
+    #[test]
     fn invalid_parallel_and_batch_contracts_fail_closed() {
         let routing = ExpertDemand::popularity(&RoutingDistribution::uniform(NUM_EXPERTS), 1);
-        for tp_size in [0, 1, 2, 3, 6, 8, 16] {
+        // Any TP with a fused all-reduce builds; others have no TP boundary
+        // kernel (0, 1, 16) or do not divide the head and FFN widths (3, 6).
+        for tp_size in FUSED_ALLREDUCE_TP_SIZES {
+            assert!(build_configs(
+                &model(),
+                &parallel(tp_size),
+                &routing,
+                false,
+                Glm52MtpMode::Off,
+            )
+            .is_ok());
+        }
+        for tp_size in [0, 1, 3, 6, 16] {
             assert!(build_configs(
                 &model(),
                 &parallel(tp_size),
@@ -1803,14 +1840,14 @@ mod tests {
             )
             .is_err());
         }
-        for max_model_len in PROFILED_H32_CONTEXTS {
-            let mut profiled = parallel(4);
-            profiled.max_model_len = max_model_len;
-            assert!(
-                build_configs(&model(), &profiled, &routing, false, Glm52MtpMode::Off,).is_ok()
-            );
+        // max_model_len is a parametric kernel config field, bounded only by
+        // the checkpoint's context.
+        for max_model_len in [1, 8_192, 32_768, 524_289, CHECKPOINT_MAX_CONTEXT] {
+            let mut sized = parallel(4);
+            sized.max_model_len = max_model_len;
+            assert!(build_configs(&model(), &sized, &routing, false, Glm52MtpMode::Off,).is_ok());
         }
-        for max_model_len in [1, 32_768, 524_289, 1_048_576] {
+        for max_model_len in [0, CHECKPOINT_MAX_CONTEXT + 1] {
             let mut unsupported = parallel(4);
             unsupported.max_model_len = max_model_len;
             assert!(
