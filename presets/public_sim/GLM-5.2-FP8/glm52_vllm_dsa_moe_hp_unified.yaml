@@ -1,0 +1,14 @@
+# vLLM GLM-5.2 FP8 on H200, EP8 (TP8), the hp_unified worker.
+# Worker: presets/glm52_ep8_tracelab_preserving.yaml.
+deployment: unified
+pools:
+  main:
+    groups:
+      - replicas: ${replicas}
+        arch:
+          preset: glm52_vllm_dsa_moe
+        worker:
+          type: hp_unified
+          attn_gpu_memory_gb: 95.0
+sweep:
+  replicas: [1, 2]
