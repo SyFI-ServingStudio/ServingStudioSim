@@ -87,14 +87,20 @@ picked with a selector. The fused-MoE kinds declare `EP_RANKS_BY_LOAD`:
 - GPU peaks: `gpu/spec.json`;
 - measurements: `profile.db`, aggregates cached until the file changes.
 
-## Agent skill
+## Agent skills
 
-`skills/servingstudio-kernel-performance/SKILL.md` teaches a coding agent to
-answer kernel-performance questions from these routes: find the kind, read what
-it measures and how, then filter its rows. Install it with the
-`skills` CLI, which finds every `SKILL.md` under the path it is given:
+Two skills teach a coding agent to use these routes:
+
+- `skills/servingstudio-kernel-performance/SKILL.md` answers kernel-performance
+  questions: find the kind, read what it measures and how, then filter its rows.
+- `skills/servingstudio-timing-predict/SKILL.md` predicts iteration times: pick
+  a member from `/models`, read its tree, build cases from its `predict` shape,
+  then `POST /predict`.
+
+Install them with the `skills` CLI, which finds every `SKILL.md` under the path
+it is given:
 
     npx skills add https://github.com/SyFI-ServingStudio/ServingStudioSim/tree/main/public_api
 
-The skill reads the base URL from `SERVINGSTUDIO_API` and defaults to
+Each skill reads the base URL from `SERVINGSTUDIO_API` and defaults to
 `https://servingstudio.cs.washington.edu/api/public/v1`.
