@@ -151,6 +151,8 @@ struct ExpertPopularityProfile {
     model_role: Option<String>,
     num_moe_layers: u32,
     num_logical_experts: u32,
+    /// The EP the capture ran at, kept as provenance. The counts are of logical
+    /// experts, so a run at any EP partitions them by its own `ep_size`.
     expert_parallel_size: u16,
     experts_per_rank: u32,
     experts_per_token: u32,
@@ -367,7 +369,6 @@ fn load_expert_popularity(
             validate_expert_popularity(
                 &profile,
                 expected_num_experts,
-                ep_size,
                 expected_num_moe_layers,
                 expected_experts_per_token,
                 path,
@@ -421,7 +422,6 @@ fn load_expert_popularity(
 fn validate_expert_popularity(
     profile: &ExpertPopularityProfile,
     expected_num_experts: u32,
-    expected_ep_size: u16,
     expected_num_moe_layers: u32,
     expected_experts_per_token: u32,
     path: &str,
@@ -451,11 +451,6 @@ fn validate_expert_popularity(
         profile.num_moe_layers == expected_num_moe_layers,
         "expert popularity profile {path} has {} MoE layers, model requires {expected_num_moe_layers}",
         profile.num_moe_layers
-    );
-    anyhow::ensure!(
-        profile.expert_parallel_size == expected_ep_size,
-        "expert popularity profile {path} has ep_size {}, run requires {expected_ep_size}",
-        profile.expert_parallel_size
     );
     anyhow::ensure!(
         profile.experts_per_rank * u32::from(profile.expert_parallel_size)
@@ -2422,6 +2417,22 @@ mod tests {
         .unwrap();
         assert_eq!(routing.ppm(), &[375_000, 250_000, 218_750, 156_250]);
         assert_eq!(routing.layer_ppm().len(), 2);
+
+        // Captured at EP2, the counts are of logical experts, so a run at any EP
+        // partitions them: at EP1 and EP4 each layer sorts all four experts.
+        for ep_size in [1, 4] {
+            let other_ep = resolve_routing_source(
+                RoutingKind::Popularity,
+                None,
+                4,
+                ep_size,
+                2,
+                2,
+                Some(profile_path),
+            )
+            .unwrap();
+            assert_eq!(other_ep.ppm(), &[375_000, 343_750, 156_250, 125_000]);
+        }
 
         let mut infeasible_profile = profile.clone();
         infeasible_profile["counts_by_layer"][0] = serde_json::json!([9, 2, 3, 2]);
