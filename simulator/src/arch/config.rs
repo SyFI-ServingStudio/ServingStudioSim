@@ -524,7 +524,7 @@ pub enum IterArchSel {
     /// + 11 DSA (kpool indexer) layers, 3 dense + 42 MoE FFNs, 4-wide mHC. One
     /// tensor-parallel rank group whose routed experts are either expert- or
     /// tensor-parallel; MTP is not run.
-    #[supported(gpu = ["NVIDIA B200"], model_config = ["glm53_flash"], fp8 = [true], tp_size = [4, 8], enable_expert_parallel = [true, false], max_model_len = [8192, 65536, 131072, 262144, 524288])]
+    #[supported(gpu = ["NVIDIA B200"], model_config = ["glm53_flash"], fp8 = [true], tp_size = [4, 8], enable_expert_parallel = [true, false], max_model_len = [8192, 65536, 131072, 262144, 524288, 1048576])]
     Glm53FlashVllmFp8KdaDsaMoe {
         #[serde(flatten)]
         model: ModelSpec,
