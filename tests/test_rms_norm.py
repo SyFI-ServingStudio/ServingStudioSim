@@ -97,7 +97,6 @@ def test_vllm_cuda_backend_runs_vllms_own_op_in_the_vllm_image():
 
     spec = find_kernel_profiler_spec("rms_norm", "vllm_cuda")
     assert spec.subprocess_env == "vllm_env"
-    assert spec.supports.gpus is None
     assert spec.runner_ref.function_name == "profile_rms_norm_vllm_cuda"
     assert _validate_args(32, 4096, "bf16")[:2] == (32, 4096)
     with pytest.raises(ValueError, match="bf16"):

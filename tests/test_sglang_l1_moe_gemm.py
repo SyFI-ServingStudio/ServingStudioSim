@@ -38,7 +38,6 @@ def test_sglang_registry_rows_reuse_existing_schemas_and_env() -> None:
         # The fused MoE computes on NVFP4 tensor cores; the rest are bf16.
         compute = DType.NVFP4_E2M1 if kind == "nvfp4_fused_moe" else DType.BF16
         assert spec.supports.compute == frozenset({compute})
-        assert spec.supports.gpus is None
         # The TRT-LLM-gen MoE and SGLang's cutedsl bf16 GEMM exist for the SM10x
         # family only; the router GEMM and the finalize run on any CUDA GPU.
         sm10x_only = kind in ("nvfp4_fused_moe", "single_gemm")

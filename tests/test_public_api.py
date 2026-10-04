@@ -18,7 +18,7 @@ from fastapi.testclient import TestClient
 from profiling.db import storage
 from profiling.db.args import DType
 from profiling.db.doc import CUPTI_METHOD, KernelDoc, arg_docs, kernel_doc
-from profiling.db.registry import iter_kernel_profiler_specs
+from profiling.db.registry import BackendSupport, iter_kernel_profiler_specs
 from profiling.db.table import ProfileRow, Table
 from profiling.kernels.nvfp4_fused_moe import Nvfp4FusedMoeArgs
 from profiling.kernels.single_gemm import SingleGemmArgs
@@ -223,8 +223,20 @@ def test_kernel_detail_joins_docs_args_and_backends(client: TestClient) -> None:
     ]
     assert kernel["metrics"][1] == {"name": "tflops", "label": "Throughput", "unit": "TFLOPS"}
     assert set(kernel["backends"]["torch"]) >= {"summary", "url", "supports", "env"}
+    # torch has no device requirement: any CUDA GPU.
+    assert kernel["backends"]["torch"]["supports"]["gpus"] is None
     assert kernel["method"].startswith(CUPTI_METHOD)
     assert kernel["view"] is None
+
+
+def test_a_backends_gpus_follow_its_compute_capability() -> None:
+    sm10x = library._supports(BackendSupport(compute=None, sm_targets=frozenset({"sm_100f"})))
+    assert sm10x["sm_targets"] == ["sm_100f"]
+    assert "H200-SXM-141GB" not in sm10x["gpus"]
+    assert {"B200-SXM-180GB", "B300-SXM-288GB"} <= set(sm10x["gpus"])
+    fp8 = library._supports(BackendSupport(compute=None, min_compute_capability=(8, 9)))
+    assert fp8["min_compute_capability"] == "8.9"
+    assert "L40S" in fp8["gpus"] and not any(gpu.startswith("A100") for gpu in fp8["gpus"])
 
 
 # The FP8 block-scale backend of this kind takes FP8 weights in 128-wide blocks.

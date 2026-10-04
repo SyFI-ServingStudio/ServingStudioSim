@@ -79,7 +79,6 @@ def test_registration_table_kind_runner_and_support_contract() -> None:
 
     assert spec.supports.compute == frozenset({DType.BF16})
     assert spec.supports.kv is None
-    assert spec.supports.gpus is None
     assert spec.supports.allows(DType.BF16, gpu="NVIDIA H200")
     assert spec.supports.allows(DType.BF16, gpu="NVIDIA B200")
     assert not spec.supports.allows(DType.FP16, gpu="NVIDIA H200")
@@ -102,7 +101,6 @@ def test_vllm_triton_registration_reuses_schema_table_and_runs_on_any_gpu() -> N
 
     assert spec.supports.compute == frozenset({DType.BF16})
     assert spec.supports.kv is None
-    assert spec.supports.gpus is None
     assert spec.supports.allows(DType.BF16, gpu="NVIDIA H200")
     assert spec.supports.allows(DType.BF16, gpu="NVIDIA H100")
     assert spec.supports.allows(DType.BF16, gpu="NVIDIA B200")

@@ -20,6 +20,7 @@ import io
 import subprocess
 import typing
 from dataclasses import asdict, fields
+from functools import cache
 from pathlib import Path
 from typing import Any
 
@@ -28,10 +29,10 @@ import yaml
 from profiling.db.args import DType
 from profiling.db.doc import CATEGORIES, SUBCATEGORIES, arg_docs, kernel_doc
 from profiling.db.doc import METRICS as METRIC_DOCS
-from profiling.db.registry import MetricFamily, iter_kernel_profiler_specs
+from profiling.db.registry import BackendSupport, MetricFamily, iter_kernel_profiler_specs
 from profiling.db.storage import CREATED_AT_FORMAT, RUN_AT_FORMAT, RUN_TABLE, iso_sql
 from profiling.db.table import STANDARD_COLUMNS, Table
-from profiling.gpu_catalog import GpuSpecResolution, resolve_gpu_spec
+from profiling.gpu_catalog import GpuSpecResolution, load_gpu_catalog, resolve_gpu_spec
 from profiling.runners.metrics import CommMetrics, ComputeMetrics
 from public_api.deployments import Config, DeploymentIndex, scalar_identity
 from public_api.sources import Sources
@@ -58,6 +59,34 @@ class UnknownConfig(LookupError):
 
 class BadQuery(ValueError):
     """A rows filter names an unknown column or a value of the wrong type."""
+
+
+def _supports(supports: BackendSupport) -> dict:
+    """A backend's dtypes and device requirement. ``gpus`` names the catalog's
+    NVIDIA GPUs whose compute capability meets the requirement; None when the
+    backend has none (any CUDA GPU)."""
+    capability = supports.min_compute_capability
+    device = capability is not None or supports.sm_targets is not None
+    return {
+        "compute": sorted(supports.compute) if supports.compute else None,
+        "kv": sorted(supports.kv) if supports.kv else None,
+        "min_compute_capability": ".".join(map(str, capability)) if capability else None,
+        "sm_targets": sorted(supports.sm_targets) if supports.sm_targets else None,
+        "gpus": [
+            gpu.canonical_name
+            for gpu in _nvidia_gpus()
+            if supports.allows_compute_capability(gpu.compute_capability)
+        ]
+        if device
+        else None,
+    }
+
+
+@cache
+def _nvidia_gpus() -> list[GpuSpecResolution]:
+    """The GPUs of ``gpu/spec.json`` that have a compute capability, in its order."""
+    gpus = (resolve_gpu_spec(gpu["name"]) for gpu in load_gpu_catalog())
+    return [gpu for gpu in gpus if gpu is not None and gpu.compute_capability is not None]
 
 
 def _arg_type(annotation: Any) -> str:
@@ -273,11 +302,7 @@ class KernelLibrary:
             "backends": {
                 spec.backend: {
                     **(asdict(spec.doc) if spec.doc else {"summary": None, "url": None}),
-                    "supports": {
-                        "compute": sorted(spec.supports.compute) if spec.supports.compute else None,
-                        "kv": sorted(spec.supports.kv) if spec.supports.kv else None,
-                        "gpus": sorted(spec.supports.gpus) if spec.supports.gpus else None,
-                    },
+                    "supports": _supports(spec.supports),
                     "env": spec.subprocess_env or "default",
                 }
                 for spec in specs

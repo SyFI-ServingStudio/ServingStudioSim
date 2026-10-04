@@ -104,9 +104,6 @@ class BackendSupport:
     - ``sm_targets`` — the arch-specific builds the kernel exists for, as NVIDIA
       target names: ``sm_90a`` = exactly SM90, ``sm_100f`` = the SM10x family.
       The device must match one of them.
-    - ``gpus`` — an exact ``gpu_name`` allowlist. No backend sets it; it stays
-      only because the public kernel catalog still reports it. Use the
-      compute-capability fields for a real arch requirement.
 
     A GPU name resolves to its compute capability through ``gpu/spec.json``
     (``profiling.gpu_catalog``). A GPU the catalog does not know, or a call
@@ -123,7 +120,6 @@ class BackendSupport:
     kv: frozenset[DType] | None = None
     min_compute_capability: tuple[int, int] | None = None
     sm_targets: frozenset[str] | None = None
-    gpus: frozenset[str] | None = None
 
     def allows(
         self,
@@ -137,8 +133,6 @@ class BackendSupport:
             return False
         if gpu is None:
             return True
-        if self.gpus is not None and gpu not in self.gpus:
-            return False
         return self.allows_compute_capability(gpu_compute_capability(gpu))
 
     def allows_compute_capability(self, capability: tuple[int, int] | None) -> bool:

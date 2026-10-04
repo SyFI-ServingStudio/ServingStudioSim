@@ -132,7 +132,7 @@ def test_backends_gate_on_the_weight_format_not_the_bf16_input() -> None:
     assert supported_backends(KIND, DType.BF16, None, "NVIDIA B200") == []
     assert supported_backends(KIND, DType.NVFP4_E2M1, None, "NVIDIA H200") == []
     # A backend declared at bf16, as these were before, fails the gate.
-    bf16_only = BackendSupport(compute=frozenset({DType.BF16}), gpus=frozenset({"NVIDIA B200"}))
+    bf16_only = BackendSupport(compute=frozenset({DType.BF16}), sm_targets=frozenset({"sm_100f"}))
     assert not bf16_only.allows(DType.NVFP4_E2M1, None, "NVIDIA B200")
 
 

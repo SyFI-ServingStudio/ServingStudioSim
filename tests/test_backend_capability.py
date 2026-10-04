@@ -128,15 +128,6 @@ def test_vllm_mla_rope_is_bf16_on_sm80_and_newer():
     )
 
 
-def test_backend_support_allows_gpu_restriction():
-    only_b200 = BackendSupport(compute=frozenset({DType.FP8_E4M3}), gpus=frozenset({"NVIDIA B200"}))
-    assert only_b200.allows(DType.FP8_E4M3, gpu="NVIDIA B200")
-    assert not only_b200.allows(DType.FP8_E4M3, gpu="NVIDIA H200")
-    assert not only_b200.allows(DType.BF16, gpu="NVIDIA B200")
-    # gpu=None means "don't check the gpu axis".
-    assert only_b200.allows(DType.FP8_E4M3, gpu=None)
-
-
 def test_sm_targets_match_arch_specific_and_family_builds():
     hopper_or_sm10x = BackendSupport(compute=None, sm_targets=frozenset({"sm_90a", "sm_100f"}))
     # sm_90a is exactly SM90; sm_100f is every SM10x part.
@@ -177,19 +168,6 @@ def test_catalog_aliases_resolve_to_compute_capability():
     assert gpu_compute_capability("NVIDIA L40S") == (8, 9)
     assert gpu_compute_capability("AMD MI300X") is None
     assert gpu_compute_capability("Some Future GPU") is None
-
-
-def test_no_backend_restricts_by_gpu_name():
-    """A missing profile row is a data gap, not a reason to refuse a backend; real
-    arch requirements are compute-capability fields, never GPU-name sets."""
-    from profiling.db.registry import iter_kernel_profiler_specs
-
-    named = [
-        f"{spec.kernel_kind}:{spec.backend}"
-        for spec in iter_kernel_profiler_specs()
-        if spec.supports.gpus is not None
-    ]
-    assert named == []
 
 
 def test_validate_registry_rejects_unknown_sm_target():
