@@ -492,13 +492,14 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        let identity =
-            crate::timing::dims::values_only(|| serde_json::to_value(&config).unwrap());
+        let identity = crate::timing::dims::values_only(|| serde_json::to_value(&config).unwrap());
         assert_eq!(identity["data_file"], "model/capture/routes.u16");
         // The full form keeps the local path, so a round-tripped config loads.
         let full: TokenCorpusConfig =
             serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
-        assert!(full.data_file.ends_with("/snapshots/0123456789abcdef/model/capture/routes.u16"));
+        assert!(full
+            .data_file
+            .ends_with("/snapshots/0123456789abcdef/model/capture/routes.u16"));
         full.load().expect("the round-tripped config loads");
     }
 
