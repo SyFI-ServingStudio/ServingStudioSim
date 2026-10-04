@@ -49,6 +49,12 @@ def create_app(
     the service answers neither."""
     index = kernels.index
     sources = kernels.sources
+    # The runs directory as the Analyzer may spell it, with its separator.
+    hidden_roots = (
+        sorted({f"{root}/".encode() for root in (runs_dir, runs_dir.resolve())}, key=len)[::-1]
+        if runs_dir is not None
+        else []
+    )
     app = FastAPI(
         title="ServingStudio public API",
         docs_url=f"{PREFIX}/docs",
@@ -155,8 +161,13 @@ def create_app(
         url = f"{analyzer}/api/analyzer/v1/predictions/{prediction_id}/{subject}"
         async with httpx.AsyncClient(timeout=120) as client:
             answer = await client.get(url, params=request.query_params)
+        content = answer.content
+        # Some reports name the prediction's directory; keep only its own name,
+        # not where this host keeps predictions.
+        for root in hidden_roots:
+            content = content.replace(root, b"")
         return Response(
-            answer.content,
+            content,
             status_code=answer.status_code,
             media_type=answer.headers.get("content-type"),
         )

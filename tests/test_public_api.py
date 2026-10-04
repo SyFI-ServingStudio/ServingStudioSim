@@ -11,6 +11,7 @@ import sqlite3
 from dataclasses import asdict
 from pathlib import Path
 
+import httpx
 import pytest
 import yaml
 from fastapi.testclient import TestClient
@@ -24,6 +25,7 @@ from profiling.kernels.nvfp4_fused_moe import Nvfp4FusedMoeArgs
 from profiling.kernels.single_gemm import SingleGemmArgs
 from profiling.runners.metrics import ComputeMetrics
 from public_api import kernels as library
+from public_api import predict
 from public_api.app import PREFIX, create_app
 from public_api.deployments import Config, DeploymentIndex, Member, Preset, config_id
 from public_api.kernels import PROVENANCE, REPO_ROOT, KernelLibrary
@@ -461,3 +463,34 @@ def test_only_a_predictions_routes_are_forwarded(client: TestClient) -> None:
     # This service runs no Analyzer; a route outside a prediction is no route.
     assert client.get(f"{PREFIX}/analyzer/predictions/abc/descriptor").status_code == 503
     assert client.get(f"{PREFIX}/analyzer/runs").status_code == 404
+
+
+def test_a_forwarded_report_names_its_prediction_not_the_host_path(
+    db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from public_api import app as app_module
+
+    log_dir = tmp_path.resolve() / "72dd8769"
+
+    def analyzer(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"log_dir": str(log_dir)})
+
+    real = httpx.AsyncClient
+    monkeypatch.setattr(
+        app_module.httpx,
+        "AsyncClient",
+        lambda **kwargs: real(transport=httpx.MockTransport(analyzer), **kwargs),
+    )
+    kernels = KernelLibrary(FixtureSources(db_path=db), _index())
+    client = TestClient(create_app(kernels, tmp_path, "http://analyzer"))
+    answer = client.get(f"{PREFIX}/analyzer/predictions/p_1/subjects/scoped-optimality/report")
+    assert answer.json() == {"log_dir": "72dd8769"}
+
+
+def test_a_failed_run_names_no_host_path(tmp_path: Path) -> None:
+    scratch, log_dir = tmp_path / "scratch", tmp_path / "runs" / "abc"
+    stdout = f"Error: parsing JSON cases file {scratch}/cases.json: unknown field\n"
+    assert (
+        predict._cause(stdout, scratch, log_dir)
+        == "parsing JSON cases file cases.json: unknown field"
+    )

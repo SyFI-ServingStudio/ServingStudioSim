@@ -47,9 +47,9 @@ class NotPredictable(RuntimeError):
     """The member or a case needs profile.db rows that are not measured."""
 
 
-def _cause(stderr: str, scratch: Path) -> str:
+def _cause(stderr: str, *directories: Path) -> str:
     """anyhow's error chain (``Error: a`` / ``Caused by:`` / ``0: b``) as one
-    line, with the scratch directory's paths cut out."""
+    line, with the paths under ``directories`` (the run's own) cut out."""
     lines = []
     for line in stderr.splitlines():
         text = line.strip()
@@ -57,7 +57,10 @@ def _cause(stderr: str, scratch: Path) -> str:
             lines = [text.removeprefix("Error: ")]
         elif lines and text and text != "Caused by:":
             lines.append(text.split(": ", 1)[1] if text[:1].isdigit() else text)
-    return ": ".join(lines).replace(f"{scratch}/", "") or stderr.strip()[-2000:]
+    cause = ": ".join(lines) or stderr.strip()[-2000:]
+    for directory in directories:
+        cause = cause.replace(f"{directory}/", "")
+    return cause
 
 
 def _node_times(nodes: list[dict], slot_ms: list[float]) -> list[float]:
@@ -183,7 +186,8 @@ def predict(
             run = launcher.run_one(config, build_type, analyze=analyze, render=False)
             if not asyncio.run(run):
                 log = log_dir / "stdout.log"
-                cause = _cause(log.read_text(errors="replace") if log.exists() else "", log_dir)
+                text = log.read_text(errors="replace") if log.exists() else ""
+                cause = _cause(text, scratch, log_dir)
                 if "needs a GPU" in cause:
                     raise NotPredictable(cause)
                 raise BadCases(cause)
