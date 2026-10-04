@@ -8,6 +8,7 @@ pub mod expert_demand;
 pub mod kernels;
 pub mod result;
 pub mod routing;
+pub mod run_encoded;
 pub mod slot_input;
 pub mod sweep;
 pub mod token_corpus;

@@ -7,7 +7,8 @@
 //! Its variable physical work is captured by query rows, mean valid slots, and
 //! the number of rows routed into the prefill workspace. Request boundaries and
 //! all per-row vectors remain typed in `Input` and in the cost log even though
-//! they are intentionally not independent cache dimensions.
+//! they are intentionally not independent cache dimensions; the log carries them
+//! run-encoded (`timing::run_encoded`), since they are one value per query row.
 
 use crate::timing::bridge::{de_backends, ArgsPayload, KernelKind};
 use crate::timing::cache::CacheKind;
@@ -45,8 +46,11 @@ pub struct DsaSparseIndexRemapKernelConfig {
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct DsaSparseIndexRemapKernelInput {
+    #[serde(with = "crate::timing::run_encoded")]
     pub request_row_counts: Vec<u32>,
+    #[serde(with = "crate::timing::run_encoded")]
     pub local_span_lengths: Vec<u32>,
+    #[serde(with = "crate::timing::run_encoded")]
     pub valid_counts: Vec<u32>,
     pub workspace_partition: Option<DsaSparseIndexRemapWorkspacePartition>,
 }
@@ -314,6 +318,32 @@ mod tests {
         assert_eq!(input.coords()[0], 24.0);
         assert!((input.coords()[1] - 213.333_333_333_333_34).abs() < 1e-12);
         assert_eq!(input.coords()[2], 16.0);
+    }
+
+    #[test]
+    fn long_context_rows_serialize_as_runs_and_round_trip() {
+        // One decode row, then two causal prefill chunks deep into a 1M context.
+        let pairs = [(4096_u32, 323_318_u32), (4096, 1_000_000)];
+        let mut input = DsaSparseIndexRemapKernelInput {
+            request_row_counts: vec![1],
+            local_span_lengths: vec![70_001],
+            valid_counts: vec![2048],
+            workspace_partition: None,
+        };
+        for (rows, context) in pairs {
+            input.request_row_counts.push(rows);
+            for span in context - rows + 1..=context {
+                input.local_span_lengths.push(span);
+                input.valid_counts.push(span.min(2048));
+            }
+        }
+        let text = serde_json::to_string(&input).unwrap();
+        assert!(text.len() < 200, "{text}");
+        let back: DsaSparseIndexRemapKernelInput = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.request_row_counts, input.request_row_counts);
+        assert_eq!(back.local_span_lengths, input.local_span_lengths);
+        assert_eq!(back.valid_counts, input.valid_counts);
+        assert_eq!(back.coords()[..], input.coords()[..]);
     }
 
     #[test]
