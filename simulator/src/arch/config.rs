@@ -558,7 +558,7 @@ pub enum IterArchSel {
     /// own batch, KV and KDA state; attention, dense FFN, shared expert and
     /// lm_head run whole on each GPU's tokens, and only the routed experts are
     /// sharded, behind an FP8 all-gather and a bf16 reduce-scatter.
-    #[supported(gpu = ["NVIDIA B200"], model_config = ["glm53_flash"], fp8 = [true], ep_size = [4, 8], max_model_len = [8192, 65536, 131072, 262144, 524288])]
+    #[supported(gpu = ["NVIDIA B200"], model_config = ["glm53_flash"], fp8 = [true], ep_size = [4, 8], max_model_len = [8192, 65536, 131072, 262144, 524288, 1048576])]
     Glm53FlashVllmFp8DpAttnEpMoe {
         #[serde(flatten)]
         model: ModelSpec,
