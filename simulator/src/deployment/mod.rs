@@ -28,44 +28,18 @@ use crate::worker::IterWorkerSel;
 
 /// Dispatch a deserialized `RunConfig` to its deployment's `build`. The single
 /// place the `deployment` tag routes to a concrete topology. `unified`, `pd`, and
-/// `afd` are all wired. What every deployment requires of its run config is
-/// checked here first, once.
+/// `afd` are all wired. What a pool requires of the trace it serves is checked
+/// by [`check_trace`], before a run builds anything.
 pub fn build_flow(
     cfg: &RunConfig,
     bridge: &PerfApiBridge,
     store: SharedRequests,
 ) -> anyhow::Result<Box<dyn Flow>> {
-    ensure_speculative_trace(cfg)?;
     match cfg {
         RunConfig::Unified(c) => unified::UnifiedDeployment::build(c, bridge, store),
         RunConfig::Pd(c) => pd::PdDeployment::build(c, bridge, store),
         RunConfig::Afd(c) => afd::AfdDeployment::build(c, bridge, store),
     }
-}
-
-/// A speculative worker draws each request's accepted draft length from the
-/// request's own `accept_rate`, which only a `speculative`-tagged trace carries
-/// (the tag makes the column required on every row). Without the tag every
-/// request is a standard one, which the worker cannot serve and would panic on
-/// at its first decode; refuse the pairing before anything is built, for a
-/// speculative worker in any pool.
-fn ensure_speculative_trace(cfg: &RunConfig) -> anyhow::Result<()> {
-    if cfg
-        .workload()
-        .input_file_tags
-        .iter()
-        .any(|tag| tag == "speculative")
-    {
-        return Ok(());
-    }
-    for (role, worker) in cfg.iter_workers() {
-        ensure!(
-            !matches!(worker, IterWorkerSel::Speculative { .. }),
-            "pool {role}: the speculative worker needs each request's accept_rate; tag the \
-             trace `speculative` (workload.input_file_tags) and give every row an accept_rate"
-        );
-    }
-    Ok(())
 }
 
 /// One pool group's bound on the requests it serves: the pool's role, its
@@ -126,6 +100,10 @@ pub fn pool_bounds(cfg: &RunConfig) -> anyhow::Result<Vec<PoolBound>> {
 /// Refuse a trace a pool cannot serve, before anything runs, rather than fail
 /// mid-run on its first such request:
 ///
+/// - a speculative worker draws each request's accepted draft length from the
+///   request's own `accept_rate`, which only a `speculative`-tagged trace
+///   carries (the tag makes the column required on every row); an untagged
+///   trace's standard requests would panic the worker at its first decode;
 /// - every request's whole context (its declared prefix, its input and its
 ///   output; a speculative worker's last verify reads `draft_tokens` beyond
 ///   that) must fit each pool's [`IterArchSel::max_model_len`];
@@ -139,7 +117,18 @@ pub fn pool_bounds(cfg: &RunConfig) -> anyhow::Result<Vec<PoolBound>> {
 pub fn check_trace(cfg: &RunConfig, trace: &TraceFrontend) -> anyhow::Result<()> {
     const SHOWN: usize = 5;
     let total = trace.expected_count();
+    let speculative = cfg
+        .workload()
+        .input_file_tags
+        .iter()
+        .any(|tag| tag == "speculative");
     for pool in pool_bounds(cfg)? {
+        let role = pool.role;
+        ensure!(
+            speculative || pool.draft_tokens.is_none(),
+            "pool {role}: the speculative worker needs each request's accept_rate; tag the \
+             trace `speculative` (workload.input_file_tags) and give every row an accept_rate"
+        );
         let draft = pool.draft_tokens.unwrap_or(0);
         let (mut long, mut long_ids) = (0usize, Vec::new());
         let (mut misfit, mut misfit_ids) = (0usize, Vec::new());
@@ -169,7 +158,6 @@ pub fn check_trace(cfg: &RunConfig, trace: &TraceFrontend) -> anyhow::Result<()>
                 }
             }
         }
-        let role = pool.role;
         if long > 0 {
             let fit = if draft > 0 {
                 format!("prefix_len + input_len + output_len + {draft} draft tokens")
@@ -226,7 +214,12 @@ mod tests {
         input_file_tags: [TAGS] }\n";
     const IO: &str = "io: { log_dir: logs, log_level: info, quiet: true, \
         force_cache_build: false, log_output_token_times: false }\n";
-    const ARCH: &str = "{type: llama3_dense_tp, model_config: m.json, fp8: false, tp_size: 1}";
+    /// A Llama 3 8B arch (`max_position_embeddings` 131072).
+    const ARCH: &str = concat!(
+        "{type: llama3_dense_tp, model_config: ",
+        env!("CARGO_MANIFEST_DIR"),
+        "/model/config/llama3_8b.json, fp8: false, tp_size: 1}"
+    );
     const SPECULATIVE: &str = "{type: speculative, attn_gpu_memory_gb: 80.0, \
         max_batch_tokens: 8192, draft_tokens: 3}";
 
@@ -242,37 +235,12 @@ mod tests {
         )
     }
 
-    #[test]
-    fn a_speculative_worker_in_any_pool_refuses_a_trace_without_acceptance() {
-        let unified = format!("deployment: unified\npools:\n{}", pool("main", SPECULATIVE));
-        let pd = format!(
-            "deployment: pd\npools:\n{}{}",
-            pool("prefill", "{type: pd_prefill, attn_gpu_memory_gb: 80.0}"),
-            pool("decode", SPECULATIVE),
-        );
-        for (pools, role) in [(&unified, "main"), (&pd, "decode")] {
-            let error = ensure_speculative_trace(&config("", pools))
-                .unwrap_err()
-                .to_string();
-            assert!(error.contains(&format!("pool {role}")), "{error}");
-            assert!(error.contains("accept_rate"), "{error}");
-            ensure_speculative_trace(&config("speculative", pools))
-                .expect("a speculative trace carries acceptance");
-        }
-        // Other workers read no acceptance, tagged or not.
-        let barebone = format!(
-            "deployment: unified\npools:\n{}",
-            pool("main", "{type: barebone, attn_gpu_memory_gb: 80.0}")
-        );
-        ensure_speculative_trace(&config("", &barebone)).expect("not speculative");
-    }
-
-    /// A Llama 3 8B pool (`max_position_embeddings` 131072) with `worker`.
+    /// A unified pool with `worker`.
     fn llama_config(tags: &str, worker: &str) -> RunConfig {
-        let model = concat!(env!("CARGO_MANIFEST_DIR"), "/model/config/llama3_8b.json");
-        let pools = format!("deployment: unified\npools:\n{}", pool("main", worker))
-            .replace("model_config: m.json", &format!("model_config: {model}"));
-        config(tags, &pools)
+        config(
+            tags,
+            &format!("deployment: unified\npools:\n{}", pool("main", worker)),
+        )
     }
 
     fn trace(dir: &std::path::Path, tags: &[&str], rows: &str) -> TraceFrontend {
@@ -304,6 +272,31 @@ mod tests {
             CapacityLimit::parse(None).unwrap(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn a_speculative_worker_in_any_pool_refuses_a_trace_without_acceptance() {
+        let dir = tempfile::tempdir().unwrap();
+        let unified = format!("deployment: unified\npools:\n{}", pool("main", SPECULATIVE));
+        let pd = format!(
+            "deployment: pd\npools:\n{}{}",
+            pool("prefill", "{type: pd_prefill, attn_gpu_memory_gb: 80.0}"),
+            pool("decode", SPECULATIVE),
+        );
+        let standard = trace(dir.path(), &[], "a,8,4,0.0\n");
+        let speculative = trace(dir.path(), &["speculative"], "a,8,4,0.0,0.7\n");
+        for (pools, role) in [(&unified, "main"), (&pd, "decode")] {
+            let error = check_trace(&config("", pools), &standard)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(&format!("pool {role}")), "{error}");
+            assert!(error.contains("accept_rate"), "{error}");
+            check_trace(&config("speculative", pools), &speculative)
+                .expect("a speculative trace carries acceptance");
+        }
+        // Other workers read no acceptance.
+        let barebone = llama_config("", "{type: barebone, attn_gpu_memory_gb: 80.0}");
+        check_trace(&barebone, &standard).expect("not speculative");
     }
 
     #[test]
