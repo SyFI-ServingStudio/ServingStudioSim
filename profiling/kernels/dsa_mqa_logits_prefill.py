@@ -61,7 +61,7 @@ DOC = KernelDoc(
         "torch runs the math in FP32 as separate launches and is timed with "
         "CUDA events: five warm-up calls, then a loop of back-to-back calls, "
         "taking the median of three runs. deepgemm_fp8 runs once for setup, "
-        "then CUPTI counts only fp8_mqa_logits launches, with the L2 cache "
+        "then CUPTI counts only the MQA-logits kernel launches, with the L2 cache "
         "flushed before each."
     ),
     caveats=(

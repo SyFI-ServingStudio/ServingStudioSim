@@ -30,7 +30,10 @@ _DEEPGEMM_LABEL = "dsa_mqa_logits_prefill deepgemm_fp8"
 _SPAN_MODE = "single_causal_tail"
 _QUERY_TILE = 2
 _KEY_TILE = 256
-_DEEPGEMM_KERNEL_NAME = "fp8_mqa_logits"
+# The CUPTI name filter. DeepGEMM names the kernel per arch: sm90_fp8_mqa_logits
+# on Hopper, sm100_mqa_logits on Blackwell (the fp8/fp4 kernel vLLM's
+# fp8_fp4_mqa_logits launches). This call launches no other *_mqa_logits kernel.
+_DEEPGEMM_KERNEL_NAME = "_mqa_logits"
 
 
 @dataclass(frozen=True)

@@ -382,7 +382,10 @@ def test_deepgemm_cupti_filter_is_architecture_agnostic():
         _DEEPGEMM_KERNEL_NAME,
     )
 
-    assert _DEEPGEMM_KERNEL_NAME == "fp8_mqa_logits"
+    # Matches both arch names: sm90_fp8_mqa_logits and sm100_mqa_logits.
+    assert all(
+        _DEEPGEMM_KERNEL_NAME in name for name in ("sm90_fp8_mqa_logits", "sm100_mqa_logits")
+    )
 
 
 def test_deepgemm_entry_rejects_invalid_args_before_framework_loading(monkeypatch):
