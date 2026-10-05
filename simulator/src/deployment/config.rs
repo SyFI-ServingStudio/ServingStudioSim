@@ -195,6 +195,21 @@ impl RunConfig {
         }
     }
 
+    /// Every iteration-level worker selector with its pool role, in pool
+    /// order. The layer-wise (`afd`) pools take attn/ffn workers, a contract
+    /// with no iteration-level worker.
+    pub fn iter_workers(&self) -> Vec<(&'static str, &IterWorkerSel)> {
+        let pools: Vec<(&'static str, &PoolSpec<IterArchSel, IterWorkerSel>)> = match self {
+            RunConfig::Unified(c) => vec![("main", &c.pools.main)],
+            RunConfig::Pd(c) => vec![("prefill", &c.pools.prefill), ("decode", &c.pools.decode)],
+            RunConfig::Afd(_) => Vec::new(),
+        };
+        pools
+            .into_iter()
+            .flat_map(|(role, pool)| pool.groups.iter().map(move |group| (role, &group.worker)))
+            .collect()
+    }
+
     /// The per-deployment stage vocabulary (`code → "category:detail"` names) written
     /// into `run_meta.json` so the analyzer can decode the `request_slo`
     /// stage-transition codes. Barebone and HP unified share `UnifiedStage`.

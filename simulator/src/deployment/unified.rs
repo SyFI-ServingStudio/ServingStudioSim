@@ -65,7 +65,6 @@ impl Deployment for UnifiedDeployment {
             pool.groups.len()
         );
         let g = &pool.groups[0];
-        ensure_speculative_trace(&g.worker, &cfg.workload.input_file_tags)?;
 
         // Model dims load from JSON (arch-independent, §4); `sim_num_layers` /
         // `num_layers` truncation must apply BEFORE build_configs. Loaded per-arm
@@ -802,25 +801,6 @@ fn ensure_speculative(worker: &IterWorkerSel, arch_draft_tokens: u32) -> anyhow:
     }
 }
 
-/// A speculative worker draws each request's accepted draft length from the
-/// request's own `accept_rate`, which only a `speculative`-tagged trace carries
-/// (the tag makes the column required on every row). Without the tag every
-/// request is a standard one, which the worker cannot serve and would panic on
-/// at its first decode; refuse the pairing before anything runs.
-fn ensure_speculative_trace(
-    worker: &IterWorkerSel,
-    input_file_tags: &[String],
-) -> anyhow::Result<()> {
-    if matches!(worker, IterWorkerSel::Speculative { .. }) {
-        ensure!(
-            input_file_tags.iter().any(|tag| tag == "speculative"),
-            "unified: the speculative worker needs each request's accept_rate; tag the \
-             trace `speculative` (workload.input_file_tags) and give every row an accept_rate"
-        );
-    }
-    Ok(())
-}
-
 /// DP-attention and MoE archs run on the multi-group hp_unified worker.
 fn ensure_hp_unified(worker: &IterWorkerSel) -> anyhow::Result<()> {
     match worker {
@@ -1239,18 +1219,6 @@ pools:
         ensure_speculative(&group.worker, *draft_tokens).expect("the pair is accepted");
         assert_eq!(speculative_draft_tokens(&group.worker), 3);
         assert_eq!(speculative_acceptance_seed(&group.worker), None);
-    }
-
-    #[test]
-    fn a_speculative_worker_refuses_a_trace_without_acceptance() {
-        let error = ensure_speculative_trace(&speculative_worker(5), &[])
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("accept_rate"), "{error}");
-        ensure_speculative_trace(&speculative_worker(5), &["speculative".to_string()])
-            .expect("a speculative trace carries acceptance");
-        // Other workers read no acceptance, tagged or not.
-        ensure_speculative_trace(&chunked_prefill_worker(), &[]).expect("not speculative");
     }
 
     #[test]
