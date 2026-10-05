@@ -47,28 +47,9 @@ impl SweepCoords for DsaCompressedPrefillKernelInput {
     }
 }
 
-/// Queries in one step: the kernel's measured points `base`, cut at the most
-/// a step runs (`max_num_batched_tokens`), which ends the axis when it is
-/// below the last point. A step budget past `base` (an unchunked worker's
-/// max_model_len) keeps `base`: a longer step is answered past the grid
-/// (`off_grid`), not measured.
-pub(crate) fn query_axis(base: &[u32], max_num_batched_tokens: u32) -> Vec<f64> {
-    let mut values: Vec<u32> = base
-        .iter()
-        .copied()
-        .filter(|&queries| queries < max_num_batched_tokens)
-        .collect();
-    if values.len() < base.len() {
-        values.push(max_num_batched_tokens);
-    }
-    Axis::values(values)
-}
-
-const PREFILL_QUERIES: [u32; 11] = [1, 4, 16, 64, 128, 256, 512, 1024, 2048, 4096, 8192];
-
 pub(crate) fn sweep_grid(max_model_len: u32, max_num_batched_tokens: u32) -> SweepGrid {
     SweepGrid::new(vec![
-        query_axis(&PREFILL_QUERIES, max_num_batched_tokens),
+        causal_rows::query_axis(&causal_rows::PREFILL_QUERIES, max_num_batched_tokens),
         Axis::values([4, 32, 128, 512, 2048, 8192, 32768, 65536, 262144, 1048576])
             .into_iter()
             .filter(|&context| context <= f64::from(max_model_len))
@@ -226,26 +207,6 @@ register_kernel!(
 mod tests {
     use super::*;
     use crate::timing::SweepCoords;
-
-    #[test]
-    fn the_query_axis_ends_at_the_most_a_step_runs() {
-        // An 8192-token chunk keeps the grid its rows were measured on.
-        assert_eq!(
-            query_axis(&PREFILL_QUERIES, 8192),
-            Axis::values(PREFILL_QUERIES)
-        );
-        // A smaller chunk stops there, an odd one included.
-        assert_eq!(
-            query_axis(&PREFILL_QUERIES, 2052),
-            Axis::values([1, 4, 16, 64, 128, 256, 512, 1024, 2048, 2052])
-        );
-        // An unchunked step keeps the measured points; a longer one is
-        // answered past the grid.
-        assert_eq!(
-            query_axis(&PREFILL_QUERIES, 1_048_576),
-            Axis::values(PREFILL_QUERIES)
-        );
-    }
 
     #[test]
     fn one_large_request_stays_one_semantic_input() {

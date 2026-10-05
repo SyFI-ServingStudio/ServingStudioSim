@@ -2,7 +2,7 @@
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::CacheKind;
-use crate::timing::kernels::dsa_compressed_mqa_logits_prefill::query_axis;
+use crate::timing::kernels::causal_rows::query_axis;
 use crate::timing::kernels::engine::{register_kernel, KernelSpec};
 use crate::timing::sweep::SweepGrid;
 use crate::timing::{Dim, KernelConfig, SweepCoords};
