@@ -36,14 +36,24 @@ from pathlib import Path
 import pyarrow.parquet as pq
 
 from launcher import timing_predict as launcher
-from launcher.exec import ERROR_JSON, binary_error
+from launcher.exec import ERROR_JSON, binary_error, binary_too_long
 from public_api.deployments import Member
 
 MAX_CASES = 64
 
 
-class BadCases(ValueError):
-    """Cases the simulator rejects; the message is its own."""
+class Refused(ValueError):
+    """Input the simulator refuses; the message is its own. ``too_long`` is
+    the limit and counts it gives for a request too long for its pool or arch
+    (:func:`launcher.exec.binary_too_long`), else None."""
+
+    def __init__(self, message: str, too_long: dict | None = None):
+        super().__init__(message)
+        self.too_long = too_long
+
+
+class BadCases(Refused):
+    """Cases the simulator rejects."""
 
 
 class NotPredictable(RuntimeError):
@@ -156,11 +166,11 @@ def predict(
             if not asyncio.run(run):
                 log = log_dir / "stdout.log"
                 text = log.read_text(errors="replace") if log.exists() else ""
-                error = binary_error(log_dir / "raw" / ERROR_JSON)
-                cause = _cause(error, text, scratch, log_dir)
+                error = log_dir / "raw" / ERROR_JSON
+                cause = _cause(binary_error(error), text, scratch, log_dir)
                 if "needs a GPU" in cause:
                     raise NotPredictable(cause)
-                raise BadCases(cause)
+                raise BadCases(cause, binary_too_long(error))
             prediction = _read(member, cases, log_dir)
         except BaseException:
             shutil.rmtree(log_dir, ignore_errors=True)

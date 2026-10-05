@@ -23,7 +23,7 @@ use std::rc::Rc;
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 
-use simulator::common::{RequestStore, SharedRequests};
+use simulator::common::{RequestStore, SharedRequests, TooLong};
 use simulator::deployment::{build_flow, check_trace, RunConfig, WorkloadSpec};
 use simulator::log::LoggerSession;
 use simulator::schema::list_params;
@@ -266,7 +266,15 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let result = dispatch(cli.cmd);
     if let (Err(error), Some(path)) = (&result, &cli.error_json) {
-        let text = serde_json::json!({"schema_version": 1, "error": format!("{error:#}")});
+        // A request too long for its pool or arch also gives its limit and counts.
+        let too_long = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<TooLong>());
+        let text = serde_json::json!({
+            "schema_version": 1,
+            "error": format!("{error:#}"),
+            "too_long": too_long,
+        });
         if let Err(write) = std::fs::write(path, text.to_string()) {
             tracing::error!("writing {}: {write}", path.display());
         }

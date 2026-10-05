@@ -33,8 +33,14 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from alignment.load_generator.runner import TRACEGEN
-from launcher.exec import ERROR_JSON, _build_subprocess_env, binary_error, binary_path
-from public_api.predict import _cause
+from launcher.exec import (
+    ERROR_JSON,
+    _build_subprocess_env,
+    binary_error,
+    binary_path,
+    binary_too_long,
+)
+from public_api.predict import Refused, _cause
 
 # The generators the service runs: `coding-session` materializes a corpus file
 # from this host, which a reader cannot name.
@@ -51,7 +57,7 @@ _RECORD = "upload.json"
 _TRACE = "trace.csv"
 
 
-class BadWorkload(ValueError):
+class BadWorkload(Refused):
     """A workload this member cannot run; the message says why."""
 
 
@@ -85,7 +91,8 @@ def _workload_plan(flags: list[str], document: dict, block: dict, build_type: st
         result = _simulator(args, build_type)
         if result.returncode:
             traces = {Path(trace).parent for trace in block["trace_files"]}
-            raise BadWorkload(_cause(binary_error(error), result.stderr, scratch, *traces))
+            cause = _cause(binary_error(error), result.stderr, scratch, *traces)
+            raise BadWorkload(cause, binary_too_long(error))
     return json.loads(result.stdout)["requests"]
 
 

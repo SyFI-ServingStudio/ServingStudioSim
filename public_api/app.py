@@ -134,12 +134,13 @@ def create_app(
             raise HTTPException(404, f"no public preset {error.args[0]!r}") from None
         except BadMember as error:
             raise HTTPException(400, {"message": str(error), "choices": error.choices}) from None
-        except (BadQuery, timing.BadCases) as error:
-            raise HTTPException(400, str(error)) from None
+        except (BadQuery, timing.BadCases, workloads.BadWorkload) as error:
+            # A request too long for its pool or arch also gives the limit.
+            too_long = getattr(error, "too_long", None)
+            detail = {"message": str(error), "too_long": too_long} if too_long else str(error)
+            raise HTTPException(400, detail) from None
         except (timing.NotPredictable, simulate.NotRunnable) as error:
             raise HTTPException(409, str(error)) from None
-        except workloads.BadWorkload as error:
-            raise HTTPException(400, str(error)) from None
         except simulate.UnknownSimulation as error:
             raise HTTPException(404, f"no simulation {error.args[0]!r}") from None
         except simulate.QueueFull as error:

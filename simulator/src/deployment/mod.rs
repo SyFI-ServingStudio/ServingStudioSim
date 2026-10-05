@@ -20,7 +20,7 @@ pub use config::{
 use anyhow::{bail, ensure, Context};
 
 use crate::arch::IterArchSel;
-use crate::common::{AcceptanceProfile, DecodingStrategy, SharedRequests};
+use crate::common::{AcceptanceProfile, DecodingStrategy, SharedRequests, TooLong};
 use crate::orchestrator::{Flow, PoolSpec};
 use crate::sim::TraceFrontend;
 use crate::timing::PerfApiBridge;
@@ -171,11 +171,17 @@ pub fn check_trace(cfg: &RunConfig, trace: &TraceFrontend) -> anyhow::Result<()>
             } else {
                 "prefix_len + input_len + output_len".to_string()
             };
-            bail!(
-                "{long} of {total} requests exceed pool {role}'s max_model_len {} ({fit}), \
-                 first ids {long_ids:?}",
-                pool.max_model_len
-            );
+            return Err(TooLong {
+                max_model_len: pool.max_model_len,
+                requests: Some(long),
+                total: Some(total),
+                message: format!(
+                    "{long} of {total} requests exceed pool {role}'s max_model_len {} ({fit}), \
+                     first ids {long_ids:?}",
+                    pool.max_model_len
+                ),
+            }
+            .into());
         }
         if misfit > 0 {
             bail!(
@@ -307,11 +313,16 @@ mod tests {
             &[],
             "a,100,10,0.0\nb,131000,200,0.0\nc,131000,73,0.0\nd,131000,72,0.0\n",
         );
-        let error = check_trace(&barebone, &long).unwrap_err().to_string();
+        let error = check_trace(&barebone, &long).unwrap_err();
         assert_eq!(
-            error,
+            error.to_string(),
             "2 of 4 requests exceed pool main's max_model_len 131072 \
              (prefix_len + input_len + output_len), first ids [\"b\", \"c\"]"
+        );
+        let too_long = error.downcast_ref::<TooLong>().expect("a TooLong refusal");
+        assert_eq!(
+            (too_long.max_model_len, too_long.requests, too_long.total),
+            (131072, Some(2), Some(4))
         );
     }
 

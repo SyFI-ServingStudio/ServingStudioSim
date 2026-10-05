@@ -53,7 +53,7 @@ use crate::arch::contract::{
     SpeculativeUnifiedModel, UnifiedArchInput,
 };
 use crate::arch::{AttnArchSel, FfnArchSel, IterArchSel};
-use crate::common::{Time, WorkerId};
+use crate::common::{Time, TooLong, WorkerId};
 use crate::deployment::BackendOverrides;
 use crate::timing::bridge::{print_dry_run, write_config_records, write_dry_run_report};
 use crate::timing::{CostManifestDoc, PerfApiBridge};
@@ -352,10 +352,15 @@ impl SpeculativePredictGroup {
 /// `max_model_len` is the selector's [`IterArchSel::max_model_len`] (or
 /// [`AttnArchSel::max_model_len`]).
 fn ensure_fits(what: &str, context: u32, max_model_len: u32) -> Result<()> {
-    ensure!(
-        context <= max_model_len,
-        "{what} {context} exceeds max_model_len {max_model_len}"
-    );
+    if context > max_model_len {
+        return Err(TooLong {
+            max_model_len,
+            requests: None,
+            total: None,
+            message: format!("{what} {context} exceeds max_model_len {max_model_len}"),
+        }
+        .into());
+    }
     Ok(())
 }
 
@@ -942,9 +947,13 @@ mod tests {
     fn a_request_longer_than_max_model_len_is_refused_like_a_speculative_one() {
         let decode = group(r#"{"decode_kv_lens": [100, 8193]}"#)
             .into_arch_group(8192)
-            .unwrap_err()
-            .to_string();
-        assert_eq!(decode, "decode KV length 8193 exceeds max_model_len 8192");
+            .unwrap_err();
+        let too_long = decode.downcast_ref::<TooLong>().expect("a TooLong refusal");
+        assert_eq!((too_long.max_model_len, too_long.requests), (8192, None));
+        assert_eq!(
+            decode.to_string(),
+            "decode KV length 8193 exceeds max_model_len 8192"
+        );
         let prefill = group(r#"{"prefill_chunk_pairs": [[8000, 193]]}"#)
             .into_arch_group(8192)
             .unwrap_err()

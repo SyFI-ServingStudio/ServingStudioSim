@@ -31,7 +31,6 @@ from __future__ import annotations
 import csv
 import json
 import os
-import re
 import shutil
 import signal
 import subprocess
@@ -248,11 +247,6 @@ def missing_rows(
         return missing_by_role(json.loads(report.read_text()))
 
 
-# The simulator's refusal of requests longer than a pool's context
-# (`deployment::check_trace`).
-_TOO_LONG = re.compile(r"(\d+) of (\d+) requests exceed pool \S+ max_model_len (\d+)")
-
-
 def misfit(
     index: DeploymentIndex,
     member: SimMember,
@@ -280,11 +274,7 @@ def misfit(
         try:
             plan_run(config, build_type)
         except BadWorkload as refusal:
-            reason = str(refusal)
-            long = _TOO_LONG.search(reason)
-            names = ("requests", "total", "max_model_len")
-            counts = dict(zip(names, map(int, long.groups()))) if long else {}
-            return {"reason": reason, **counts}
+            return {"reason": str(refusal), **(refusal.too_long or {})}
     return None
 
 

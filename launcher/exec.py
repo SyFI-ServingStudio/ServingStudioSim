@@ -45,13 +45,26 @@ def binary_path(build_type: str = "debug") -> Path:
     return REPO_ROOT / "target" / build_type / "simulator"
 
 
+def _error_document(path: Path) -> dict:
+    """What the simulator's ``--error-json`` wrote to ``path``; empty when it
+    wrote nothing (it succeeded or panicked)."""
+    try:
+        return json.loads(path.read_text())
+    except FileNotFoundError:
+        return {}
+
+
 def binary_error(path: Path) -> str | None:
     """The simulator's error as its ``--error-json`` wrote it to ``path``: the
     cause chain on one line. None when it wrote none (it succeeded or panicked)."""
-    try:
-        return json.loads(path.read_text())["error"]
-    except FileNotFoundError:
-        return None
+    return _error_document(path).get("error")
+
+
+def binary_too_long(path: Path) -> dict | None:
+    """The limit and counts of a request too long for its pool or arch, as the
+    simulator's ``--error-json`` wrote them to ``path`` (``max_model_len``, and
+    for a trace ``requests`` too long of ``total``). None for any other error."""
+    return _error_document(path).get("too_long")
 
 
 def analyzer_binary_path(build_type: str = "debug") -> Path:
