@@ -34,7 +34,9 @@ from profiling.runners.metrics import RunnerResult
 # ``vllm/compilation/passes/fusion/allreduce_rms_fusion.py``). SM100 has no
 # ``FI_MNNVL_ALLREDUCE_MAX_SIZE_MB`` override, so this budget both sizes the
 # workspace and bounds the tensors vLLM dispatches to FlashInfer; larger
-# tensors fall through to another all-reduce backend.
+# tensors fall through to another all-reduce backend. The one statement of the
+# budget on the Python side: the kernel DOC and the backend's ``sm_100a`` gate
+# refer to it rather than repeat it.
 SM100_MAX_SIZE_MB: dict[int, float] = {2: 64, 4: 32, 8: 1}
 MIB = 1024 * 1024
 # vLLM ``PDL_ADVANCE_LAUNCH_TOKENS``; FlashInfer ignores it on MNNVL but the
@@ -64,7 +66,8 @@ def spec_error(spec: dict) -> str | None:
     """Reason vLLM would not route ``spec`` to the MNNVL all-reduce, else None."""
     num_gpus = int(spec["num_gpus"])
     if num_gpus not in SM100_MAX_SIZE_MB:
-        return f"vLLM FlashInfer all-reduce supports TP 2/4/8 on SM100, got {num_gpus}"
+        sizes = "/".join(str(size) for size in sorted(SM100_MAX_SIZE_MB))
+        return f"vLLM FlashInfer all-reduce supports TP {sizes} on SM100, got {num_gpus}"
     if spec["fabric"] != "nvlink":
         return f"FlashInfer MNNVL all-reduce needs NVLink multicast, got fabric={spec['fabric']!r}"
     dtype = DType.from_value(spec["dtype"])
