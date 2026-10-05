@@ -99,6 +99,17 @@ _FP4_ARCHS = frozenset(
     }
 )
 
+#: Speculative arch types: their cost log carries per-stage request geometry.
+_SPECULATIVE_ARCHS = frozenset(
+    {"glm52_vllm_nvfp4_dsa_moe_speculative", "glm53_vllm_nvfp4_dsa_moe_dflash2"}
+)
+
+#: The proposer of a speculative arch that ships as its own checkpoint, by the
+#: draft's ``config.json`` under the repo root. The run's params name only the
+#: target's config; the draft is fixed by the arch.
+_DRAFT_CONFIGS = {"glm53_vllm_nvfp4_dsa_moe_dflash2": "model/config/glm53_dflash2.json"}
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
 
 def _with_fp8_mla_cache(model):
     from dataclasses import replace
@@ -112,11 +123,36 @@ def _with_fp8_mla_cache(model):
     return replace(model, layers=layers)
 
 
+@cache
+def _dflash2_model(config_path: str, draft_config_path: str, sliding_window: int | None):
+    from .models import dflash2
+
+    draft = json.loads(Path(draft_config_path).read_text())
+    if sliding_window is not None and sliding_window != dflash2.draft_sliding_window(draft):
+        raise ValueError(
+            f"arch draft_sliding_window {sliding_window} disagrees with the draft "
+            f"checkpoint's {dflash2.draft_sliding_window(draft)}"
+        )
+    target = _model(config_path)
+    # vLLM's KV-cache dtype is engine-wide, so the draft's layers use the
+    # target checkpoint's declared cache dtype.
+    stacks = [stack.attn for stack in target.layers if hasattr(stack.attn, "mla_cache_dtype_bytes")]
+    kv_bytes = stacks[0].mla_cache_dtype_bytes if stacks else target.weight_dtype_bytes
+    return dflash2.attach(target, draft, kv_dtype_bytes=kv_bytes)
+
+
 def _model_for_spec(spec: dict):
+    arch_type = spec.get("arch_type")
+    if arch_type in _DRAFT_CONFIGS:
+        return _dflash2_model(
+            spec["config"],
+            str(_REPO_ROOT / _DRAFT_CONFIGS[arch_type]),
+            spec.get("draft_sliding_window"),
+        )
     model = _model(spec["config"])
-    if spec.get("arch_type") in _FP8_MLA_CACHE_ARCHS:
+    if arch_type in _FP8_MLA_CACHE_ARCHS:
         return _with_fp8_mla_cache(model)
-    if spec.get("arch_type") != "glm52_vllm_nvfp4_dsa_moe_speculative":
+    if arch_type != "glm52_vllm_nvfp4_dsa_moe_speculative":
         return model
     mode = spec.get("mtp_mode", "index_share")
     if mode not in ("index_share", "full_index"):
@@ -151,7 +187,7 @@ def _model_for_spec(spec: dict):
 
 
 def _validate_speculative_totals(spec: dict, totals: dict) -> None:
-    if spec.get("arch_type") != "glm52_vllm_nvfp4_dsa_moe_speculative":
+    if spec.get("arch_type") not in _SPECULATIVE_ARCHS:
         if totals.get("speculative_geometry"):
             raise ValueError("speculative geometry requires a speculative architecture")
         return
@@ -185,6 +221,7 @@ def _pool_specs(log_dir: Path) -> dict[str, dict]:
             "arch_type": arch_type,
             "mtp_mode": arch.get("mtp_mode", "index_share"),
             "draft_tokens": arch.get("draft_tokens", 5),
+            "draft_sliding_window": arch.get("draft_sliding_window"),
             "config": arch["model_config"],
             # `gpu` is a group-level field (the arch block carries model/tp/fp8).
             "gpu": group["gpu"],
@@ -244,6 +281,7 @@ def _spec_for_level(level_key: str, pool_specs: dict[str, dict]) -> dict:
                 s.get("arch_type"),
                 s.get("mtp_mode"),
                 s.get("draft_tokens"),
+                s.get("draft_sliding_window"),
             )
             for s in pool_specs.values()
         }
@@ -257,7 +295,7 @@ def _spec_for_level(level_key: str, pool_specs: dict[str, dict]) -> dict:
     return spec
 
 
-def _aggregate_workload(totals: dict) -> Workload:
+def _aggregate_workload(totals: dict, model=None) -> Workload:
     """Assemble one giant-batch Workload from a level's pre-summed scalars.
 
     Prefill and decode attention each collapse to a single ``mask="full"``
@@ -267,9 +305,12 @@ def _aggregate_workload(totals: dict) -> Workload:
     ``+1`` per step is negligible and omitted.
     """
     if totals.get("speculative_geometry"):
-        from .speculative import aggregate_workload
+        from .speculative import aggregate_workload, proposer_for
 
-        return aggregate_workload(totals)
+        if model is None:
+            return aggregate_workload(totals)
+        stages = {stack.stage for stack in model.layers if stack.stage is not None}
+        return aggregate_workload(totals, proposer_for(stages))
     matmul_tokens = int(totals["matmul_tokens"])
     sampled = int(totals["decode_passes"]) + int(totals["prefill_requests"])
     attn: list[AttnInteraction] = []
@@ -394,7 +435,7 @@ def _peak_resolver(spec: dict):
 def _segment_dtypes(model, totals: dict, default_dtype: str) -> dict[str, str]:
     """Segment name -> compute dtype. Independent of workload size, but the set of
     segment names is not, so it is resolved for the same totals as the work."""
-    label = model.label(_aggregate_workload(totals))
+    label = model.label(_aggregate_workload(totals, model))
     return {segment.name: segment.compute_dtype or default_dtype for segment in label.segments}
 
 
@@ -402,7 +443,7 @@ def _label_payload(model, totals: dict, spec: dict) -> dict:
     """Serialize one workload label, including each semantic's own roofline."""
     peak = _peak_resolver(spec)
     bandwidth_gbps = gpu_mem_bandwidth_gbps(spec["gpu"])
-    label = model.label(_aggregate_workload(totals))
+    label = model.label(_aggregate_workload(totals, model))
     segment_work = {
         segment.name: (segment.flops_total, segment.bytes_total) for segment in label.segments
     }
@@ -507,7 +548,7 @@ def _field_is_present(field_name: str, prefill_present: bool, decode_present: bo
 
 
 def _segment_work(model, totals: dict) -> dict[str, tuple[float, float]]:
-    label = model.label(_aggregate_workload(totals))
+    label = model.label(_aggregate_workload(totals, model))
     return {segment.name: (segment.flops_total, segment.bytes_total) for segment in label.segments}
 
 
@@ -835,7 +876,7 @@ def _reduce_direct_group(
     default_dtype = spec["dtype"]
     for row in rows:
         occurrences = int(shapes.occurrences[row])
-        label = model.label(_aggregate_workload(shapes.totals(int(row))))
+        label = model.label(_aggregate_workload(shapes.totals(int(row)), model))
         payload = _payload_from_segment_work(
             {
                 segment.name: (segment.flops_total, segment.bytes_total)
@@ -950,10 +991,7 @@ def compute_locked_compositions(log_dir: Path, compositions: dict[str, dict]) ->
                 _validate_speculative_totals(spec, {})
             nonpositive = np.flatnonzero(shapes.occurrences <= 0)
             first_nonpositive = int(nonpositive[0]) if len(nonpositive) else len(shapes)
-            if (
-                spec.get("arch_type") == "glm52_vllm_nvfp4_dsa_moe_speculative"
-                or shapes.carries_speculative_geometry()
-            ):
+            if spec.get("arch_type") in _SPECULATIVE_ARCHS or shapes.carries_speculative_geometry():
                 # Up to and including the first bad count, so the error a caller
                 # sees is the first bad row's, whichever check it fails.
                 for row in range(min(first_nonpositive + 1, len(shapes))):

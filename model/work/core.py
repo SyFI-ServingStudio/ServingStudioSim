@@ -609,6 +609,11 @@ class LearnedWeightGroup:
     #: Same meaning as :attr:`LayerStack.stage`: a group naming a stage the
     #: workload does not run is not read, so it is not billed.
     stage: str | None = None
+    #: A table read by row gather (a codebook, like the embedding): its
+    #: parameters count, but its compulsory traffic is only the rows a batch
+    #: touches, which the owning spec reports in its own semantic rows. Only
+    #: honored for a stack component's groups.
+    gathered: bool = False
 
 
 # Existing builders use the more specific historical name.
@@ -772,17 +777,18 @@ class Model:
                 if component is None:
                     continue
                 for weight in getattr(component, "learned_weight_groups", lambda: [])():
-                    segments.append(
-                        Segment(
-                            name=f"{prefix}{weight.name}",
-                            bucket="embedding",
-                            byte_kind="weights",
-                            flops=0.0,
-                            bytes=weight.elements * self.weight_dtype_bytes,
-                            count=stack.count,
-                            compute_dtype=self.master_dtype,
+                    if not weight.gathered:
+                        segments.append(
+                            Segment(
+                                name=f"{prefix}{weight.name}",
+                                bucket="embedding",
+                                byte_kind="weights",
+                                flops=0.0,
+                                bytes=weight.elements * self.weight_dtype_bytes,
+                                count=stack.count,
+                                compute_dtype=self.master_dtype,
+                            )
                         )
-                    )
                     params = weight.elements * stack.distinct_instances
                     activated_params += params
                     total_params += params
