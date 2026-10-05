@@ -57,8 +57,10 @@ impl<Definition: RequestDefinition> TraceFrontend<Definition> {
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct PlanRow {
     pub request_id: String,
-    pub session_id: String,
-    pub round_idx: usize,
+    /// The row's session and its round in it; `None` for a row of a trace
+    /// without sessions, which stands alone (and has no predecessor).
+    pub session_id: Option<String>,
+    pub round_idx: Option<usize>,
     pub session_arrival_time_ms: String,
     pub predecessor_request_id: Option<String>,
     pub prefix_len: u32,
@@ -81,31 +83,34 @@ impl TraceFrontend<TextGenerationDefinition> {
         let mut rows = Vec::with_capacity(self.scheduled_requests.len());
         for request in &self.scheduled_requests {
             let release = &request.release;
-            let session_id = release
-                .session
-                .map(|session| session.session_id)
-                .unwrap_or(u32::MAX);
-            let round_idx = *rounds_seen
-                .entry(session_id)
-                .and_modify(|count| *count += 1)
-                .or_insert(0);
-            let source_session_id = self
-                .source_identities
-                .session_source_ids()
-                .get(session_id as usize)
-                .cloned()
-                .unwrap_or_else(|| session_id.to_string());
             let source_request_id = self
                 .source_identities
                 .request_source_ids()
                 .get(release.request_id.0 as usize)
                 .cloned()
                 .unwrap_or_else(|| release.request_id.0.to_string());
-            let predecessor_request_id =
-                previous_request_by_session.insert(session_id, source_request_id.clone());
+            let (session_id, round_idx, predecessor_request_id) = match release.session {
+                Some(session) => {
+                    let id = session.session_id;
+                    let round = *rounds_seen
+                        .entry(id)
+                        .and_modify(|count| *count += 1)
+                        .or_insert(0);
+                    let source_session_id = self
+                        .source_identities
+                        .session_source_ids()
+                        .get(id as usize)
+                        .cloned()
+                        .unwrap_or_else(|| id.to_string());
+                    let predecessor =
+                        previous_request_by_session.insert(id, source_request_id.clone());
+                    (Some(source_session_id), Some(round), predecessor)
+                }
+                None => (None, None, None),
+            };
             rows.push(PlanRow {
                 request_id: source_request_id,
-                session_id: source_session_id,
+                session_id,
                 round_idx,
                 session_arrival_time_ms: format!("{:.6}", release.trace_arrival_time_ms),
                 predecessor_request_id,
@@ -447,6 +452,25 @@ mod tests {
         );
     }
 
+    /// A trace without sessions plans each row on its own: no session, no
+    /// round, no predecessor.
+    #[test]
+    fn a_row_without_a_session_plans_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_csv(
+            dir.path(),
+            "plain.csv",
+            "id,input_len,output_len,arrival_time\na,8,2,0.0\nb,16,4,5.0\n",
+        );
+        let plan = load_text(&[path], 1.0).unwrap().plan_rows();
+        assert_eq!(plan.len(), 2);
+        for row in &plan {
+            assert_eq!((row.session_id.as_deref(), row.round_idx), (None, None));
+            assert_eq!(row.predecessor_request_id, None);
+        }
+        assert_eq!((plan[1].request_id.as_str(), plan[1].input_len), ("b", 16));
+    }
+
     #[test]
     fn execution_v2_feeds_prefix_and_fresh_input_straight_into_the_request() {
         let dir = tempfile::tempdir().unwrap();
@@ -468,7 +492,7 @@ mod tests {
             plan[1].predecessor_request_id.as_deref(),
             Some("session_b_round_000000")
         );
-        assert_eq!(plan[2].session_id, "a");
+        assert_eq!(plan[2].session_id.as_deref(), Some("a"));
         assert_eq!(plan[2].session_arrival_time_ms, "250.000000");
         assert_eq!(plan[2].predecessor_request_id, None);
     }

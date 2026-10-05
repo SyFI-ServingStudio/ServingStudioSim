@@ -100,8 +100,8 @@ enum Cmd {
     TimingPredict(PredictArgs),
     /// Load a workload block's trace files exactly as `run` does (format, tags,
     /// replay settings, row checks) and print its requests as JSON: the
-    /// normalized plan, one row per request in the trace's own ids (rows of a
-    /// trace without sessions read as rounds of one placeholder session).
+    /// normalized plan, one row per request in the trace's own ids (a row of a
+    /// trace without sessions has no session, round or predecessor).
     /// Reads no profile.db and builds no model.
     WorkloadPlan(WorkloadArgs),
     /// Print the input file formats a run reads and the tags each can add, with

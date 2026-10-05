@@ -73,8 +73,12 @@ fn simulator_plan_matches_tracelab_plan_for_the_same_canonical_trace() {
         .into_iter()
         .map(|row| ExpectedPlanRow {
             request_id: row.request_id,
-            session_id: row.session_id,
-            round_idx: row.round_idx,
+            session_id: row
+                .session_id
+                .expect("every row of a session trace has a session"),
+            round_idx: row
+                .round_idx
+                .expect("every row of a session trace has a round"),
             session_arrival_time_ms: row.session_arrival_time_ms,
             predecessor_request_id: row.predecessor_request_id,
             prefix_len: row.prefix_len,
