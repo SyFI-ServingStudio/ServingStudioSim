@@ -1882,6 +1882,24 @@ def test_floors_refuses_a_run_whose_arch_precision_contradicts_its_config():
         )
 
 
+def test_every_public_arch_on_an_fp4_checkpoint_is_labeled_fp4():
+    """A public preset whose checkpoint declares FP4 compute runs an FP4 arch;
+    an arch missing from the floors' FP4 set is refused as a precision clash,
+    which drops its exact necessary work."""
+    import yaml
+
+    root = Path(__file__).resolve().parents[1]
+    catalog = yaml.safe_load((root / "model" / "catalog.yaml").read_text())
+    for path in sorted((root / "presets" / "public").glob("*/*.yaml")):
+        preset = yaml.safe_load(path.read_text())
+        if "arch" not in preset or "checkpoint" not in preset:
+            continue
+        config = root / "model" / "config" / f"{catalog[preset['checkpoint']]['config']}.json"
+        quant = parse_quantization_config(json.loads(config.read_text()))
+        fp4 = quant is not None and quant.compute_dtype == "fp4"
+        assert (preset["arch"]["type"] in work_floors._FP4_ARCHS) == fp4, path.name
+
+
 def test_vllm_location_map_covers_every_non_communication_leaf():
     """Same semantic rows as the native map, over vLLM's finer leaf decomposition."""
     names = {

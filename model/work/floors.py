@@ -88,6 +88,17 @@ def _model(config_path: str):
 #: (``--kv-cache-dtype fp8_e4m3``), a serving choice the checkpoint config omits.
 _FP8_MLA_CACHE_ARCHS = frozenset({"glm53_flash_vllm_fp8_kda_dsa_moe"})
 
+#: Arch types that run an NVFP4 checkpoint's FP4 path; their model config must
+#: declare the matching ``quantization_config`` (:func:`_check_precision`).
+_FP4_ARCHS = frozenset(
+    {
+        "glm52_vllm_nvfp4_dsa_moe",
+        "glm52_vllm_nvfp4_dsa_moe_speculative",
+        "glm52_sglang_nvfp4_tp_dsa_moe",
+        "glm53_vllm_nvfp4_dsa_moe_dflash2",
+    }
+)
+
 
 def _with_fp8_mla_cache(model):
     from dataclasses import replace
@@ -167,11 +178,7 @@ def _pool_specs(log_dir: Path) -> dict[str, dict]:
         group = pool["groups"][0]
         arch = group["arch"]
         arch_type = arch.get("type", "")
-        arch_quant_dtype = (
-            "fp4"
-            if arch_type in ("glm52_vllm_nvfp4_dsa_moe", "glm52_vllm_nvfp4_dsa_moe_speculative")
-            else None
-        )
+        arch_quant_dtype = "fp4" if arch_type in _FP4_ARCHS else None
         if arch.get("fp8"):
             arch_quant_dtype = "fp8"
         specs[pool_tag] = {
