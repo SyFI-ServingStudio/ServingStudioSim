@@ -455,32 +455,8 @@ fn compile_plans(
             .or_default()
             .insert(*worker_id, worker_index);
         for section in &doc.sections {
-            let slot_position_ids = section
-                .manifest
-                .slots
-                .iter()
-                .map(|leaf| {
-                    if let Some(&position_id) = position_ids.get(&leaf.name) {
-                        if positions[position_id].kind != leaf.kind {
-                            bail!(
-                                "leaf position {:?} has conflicting kinds {:?} and {:?}",
-                                leaf.name,
-                                positions[position_id].kind,
-                                leaf.kind
-                            );
-                        }
-                        Ok(position_id)
-                    } else {
-                        let position_id = positions.len();
-                        position_ids.insert(leaf.name.clone(), position_id);
-                        positions.push(Position {
-                            name: leaf.name.clone(),
-                            kind: leaf.kind.clone(),
-                        });
-                        Ok(position_id)
-                    }
-                })
-                .collect::<Result<Vec<_>>>()?;
+            let slot_position_ids =
+                slot_positions(&section.manifest, &mut positions, &mut position_ids)?;
             let plan_index = plans.len();
             plans.push(SectionPlan::new(&section.manifest, slot_position_ids)?);
             let old = plan_ids
@@ -519,6 +495,69 @@ fn compile_plans(
         })
         .collect();
     Ok((positions, plans, plan_ids, worker_ids, workers))
+}
+
+/// Each slot's position id, registering positions not seen before. A position
+/// is a leaf's full semantic name, so slots sharing a name pool into one.
+fn slot_positions(
+    manifest: &Manifest,
+    positions: &mut Vec<Position>,
+    position_ids: &mut HashMap<String, usize>,
+) -> Result<Vec<usize>> {
+    manifest
+        .slots
+        .iter()
+        .map(|leaf| {
+            if let Some(&position_id) = position_ids.get(&leaf.name) {
+                if positions[position_id].kind != leaf.kind {
+                    bail!(
+                        "leaf position {:?} has conflicting kinds {:?} and {:?}",
+                        leaf.name,
+                        positions[position_id].kind,
+                        leaf.kind
+                    );
+                }
+                Ok(position_id)
+            } else {
+                let position_id = positions.len();
+                position_ids.insert(leaf.name.clone(), position_id);
+                positions.push(Position {
+                    name: leaf.name.clone(),
+                    kind: leaf.kind.clone(),
+                });
+                Ok(position_id)
+            }
+        })
+        .collect()
+}
+
+/// One cost-log row's composition, for the exact CostTree reader: the same
+/// critical-path attribution and the same `{kernel_time_ms, segments, kinds}`
+/// shape as each scope of this subject, with the row's logged `total_time_ms`
+/// as the root.
+pub(crate) fn row_composition(
+    manifest: &Manifest,
+    slot_time_ms: &[f32],
+    total_time_ms: f64,
+) -> Result<Value> {
+    if !total_time_ms.is_finite() || total_time_ms < 0.0 {
+        bail!("cost-log row has invalid root time {total_time_ms}");
+    }
+    let mut positions = Vec::new();
+    let slot_position_ids = slot_positions(manifest, &mut positions, &mut HashMap::new())?;
+    let mut plan = SectionPlan::new(manifest, slot_position_ids)?;
+    let mut totals = ScopeTotals::with_positions(positions.len());
+    totals.kernel_time_ms = total_time_ms;
+    for &(position_id, share) in plan.position_shares(slot_time_ms)? {
+        totals.position_time_ms[position_id] += total_time_ms * share;
+    }
+    let mut position_order: Vec<usize> = (0..positions.len()).collect();
+    position_order.sort_by(|&a, &b| {
+        totals.position_time_ms[b]
+            .total_cmp(&totals.position_time_ms[a])
+            .then_with(|| positions[a].name.cmp(&positions[b].name))
+    });
+    Ok(composition_json(&totals, &positions, &position_order))
 }
 
 fn sampling_filter(worker_scans: &BTreeMap<(String, u16), WorkerScan>) -> String {
@@ -849,6 +888,21 @@ mod tests {
         assert!((shares.iter().find(|(id, _)| *id == 0).unwrap().1 - 4.0 / 14.0).abs() < 1e-12);
         assert!((shares.iter().find(|(id, _)| *id == 2).unwrap().1 - 10.0 / 14.0).abs() < 1e-12);
         assert!((shares.iter().map(|(_, share)| share).sum::<f64>() - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn row_composition_attributes_one_row_like_a_scope() {
+        let composition = row_composition(&mixed_manifest(), &[4.0, 6.0, 10.0], 14.0).unwrap();
+        assert_eq!(composition["kernel_time_ms"], json!(14.0));
+        let segments = composition["segments"].as_array().unwrap();
+        // c owns the Max (10 of 14), a the Sum's other child; b is off the path.
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0]["position"], "m.c");
+        assert!((segments[0]["kernel_time_ms"].as_f64().unwrap() - 10.0).abs() < 1e-12);
+        assert_eq!(segments[1]["position"], "m.a");
+        assert!((segments[1]["share_pct"].as_f64().unwrap() - 400.0 / 14.0).abs() < 1e-9);
+        assert_eq!(composition["kinds"][0]["kind"], "k");
+        assert_eq!(composition["kinds"][0]["positions"], 2);
     }
 
     #[test]

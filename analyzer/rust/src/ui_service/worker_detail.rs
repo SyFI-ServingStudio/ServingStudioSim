@@ -20,6 +20,7 @@ use futures_util::StreamExt;
 use serde_json::{json, Value};
 use tokio::sync::Mutex as AsyncMutex;
 
+use crate::breakdown::kernel_time_share::row_composition;
 use crate::io::{read_cost_manifests, resolve_artifact_path};
 use crate::session::{
     build_session, col, collect, column_f64, register_if_exists, require_columns, value_f32_list,
@@ -810,6 +811,10 @@ async fn exact_source_cost_tree(
         .section(&row.section)
         .with_context(|| format!("worker manifest has no section {:?}", row.section))?;
     let tree = tree_json(manifest, row, 0)?;
+    // f64 here only because the reader widened the logged f32 list; narrowing
+    // back is exact.
+    let slot_time_ms: Vec<f32> = row.slot_time_ms.iter().map(|&time| time as f32).collect();
+    let time_share = row_composition(manifest, &slot_time_ms, row.total_time_ms)?;
     let identity = public_identity
         .as_object_mut()
         .context("cost-tree public identity must be an object")?;
@@ -825,6 +830,7 @@ async fn exact_source_cost_tree(
             "groups": row.groups,
         }],
         "tree": tree,
+        "time_share": time_share,
     });
     prof(request_id, "cost_tree event=tree_and_json", tree_started);
     prof(request_id, "cost_tree event=complete", started);

@@ -460,7 +460,9 @@ The read-only protocol is:
 - `GET /api/analyzer/v1/predictions/{prediction_id}/subjects/cases/payload?offset=&limit=` pages the
   snapshotted case inputs together with their exact operation summaries.
 - `GET /api/analyzer/v1/predictions/{prediction_id}/cases/{case_id}/operations/{operation_id}/subjects/cost-tree/payload`
-  reconstructs one exact tree.
+  reconstructs one exact tree, with `time_share`: the operation's critical-path
+  composition (`kernel_time_ms`, `segments`, `kinds`), attributed as
+  `kernel-time-share` attributes each row.
 - Kernel-throughput and exact-iteration optimality routes hang below the same
   selected case/operation identity. Prediction-level kernel-input-distribution
   remains a bounded Analyzer subject.

@@ -246,7 +246,7 @@ in a case's `operations`, one per section: `0` for `iter`, `0` to `4` for the
 | Route | Gives |
 | --- | --- |
 | `subjects/cases/payload` | each case's input, sections (`operations`) and total |
-| `cases/{case}/operations/{op}/subjects/cost-tree/payload` | the section's tree with each leaf's kernel config, backend, exact input, time, FLOPs, bytes and achieved TFLOPS or GB/s |
+| `cases/{case}/operations/{op}/subjects/cost-tree/payload` | the section's tree with each leaf's kernel config, backend, exact input, time, FLOPs, bytes and achieved TFLOPS or GB/s; `time_share` gives each kernel position's share of the section's time on its critical path |
 | `cases/{case}/operations/{op}/leaves/{leaf}/subjects/kernel-throughput-analysis/payload` | one leaf's measured grid points around its exact input; `{leaf}` counts the cost-tree payload's nodes in preorder, root 0 |
 | `cases/{case}/subjects/optimality-waterfall/payload` | the case's GPU-seconds (time × GPUs) split into necessary hardware work and the gaps: batching, communication, imbalance, hardware gap |
 | `cases/{case}/subjects/optimality-kernel-ladder/payload` | the same rungs per kernel position |
