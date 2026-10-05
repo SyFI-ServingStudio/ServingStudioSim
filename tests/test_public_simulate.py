@@ -405,6 +405,9 @@ def test_presets_list_members_captures_and_what_cannot_run(client: TestClient) -
     assert len(members) == 4
     lacking = members[json.dumps({"replicas": 2, "tp_size": 2})]
     assert lacking["gpus"] == 4
+    # `arch_params` leave the limit to the model; the pool still states it.
+    assert "max_model_len" not in lacking["pools"]["main"]["arch_params"]
+    assert lacking["pools"]["main"]["max_model_len"] == 131072
     assert lacking["unavailable"] == {DENSE_TRACE: {"missing": {"layer.qkv": 1}}}
     assert members[json.dumps({"replicas": 1, "tp_size": 1})]["unavailable"] == {}
 

@@ -48,6 +48,12 @@ def main(argv: list[str] | None = None) -> int:
         default=REPO_ROOT / "logs" / "public_api" / "workloads",
         help="Where uploaded workloads are kept for a day.",
     )
+    serve.add_argument(
+        "--access-log-dir",
+        type=Path,
+        default=REPO_ROOT / "logs" / "public_api" / "access",
+        help="Where every request is recorded, one JSON line each, a file per UTC day.",
+    )
     # No default, as for --port; it listens on 127.0.0.1 only.
     serve.add_argument(
         "--analyzer-port", type=int, required=True, help="Port of the Analyzer it starts."
@@ -67,6 +73,7 @@ def main(argv: list[str] | None = None) -> int:
     from launcher.schema.loader import schema_from_dict
     from profiling.gpu_policy import disable_gpus
     from public_api import predict, simulate, workloads
+    from public_api.access_log import AccessLog
     from public_api.app import create_app
     from public_api.deployments import DeploymentIndex
     from public_api.kernels import KernelLibrary, git_commit
@@ -137,6 +144,7 @@ def main(argv: list[str] | None = None) -> int:
                 simulate.SimulationService(
                     sims, registry, queue, workloads.Workloads(args.workloads_dir, args.build_type)
                 ),
+                access_log=AccessLog(args.access_log_dir),
             ),
             host=args.bind,
             port=args.port,

@@ -18,3 +18,7 @@ RUN cd /opt/servingstudio \
     && rm -rf /root/.cache/uv
 # The checkout is mounted read-only, so Python must not write bytecode into it.
 ENV PATH=/opt/venv/bin:$PATH PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+# The Analyzer runs its kernel queries and optimality floors through `uv run`.
+# The container's user has no home and does not own /opt/venv, so uv keeps its
+# cache in /tmp and runs the environment as built instead of syncing it.
+ENV UV_CACHE_DIR=/tmp/uv-cache UV_NO_SYNC=1

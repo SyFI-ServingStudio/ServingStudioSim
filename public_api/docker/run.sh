@@ -8,9 +8,12 @@
 # path and serves its profiling/profile.db with its target/release/simulator
 # and analyze, so build those first. Predictions are kept for Read more in
 # logs/public_api/predictions, simulations run in logs/public_api/simulations and
-# uploaded workloads are kept in logs/public_api/workloads: the three writable
-# mounts. To serve new code or data, update the checkout, rebuild the binaries
-# and run this again.
+# uploaded workloads are kept in logs/public_api/workloads and every request is
+# recorded in logs/public_api/access: the four writable mounts. The access log
+# lives in the checkout, not in the container, so it survives this script
+# replacing the container; Docker's own log of the process is capped. To serve
+# new code or data, update the checkout, rebuild the binaries and run this
+# again.
 #
 # The service is reached through the CSE web host's proxy (the Intro site's
 # public/.htaccess), so the rate limits must count the client its
@@ -34,7 +37,8 @@ hf_home=${HF_HOME:-$HOME/.cache/huggingface}
 runs=$repo/logs/public_api/predictions
 sims=$repo/logs/public_api/simulations
 uploads=$repo/logs/public_api/workloads
-mkdir -p "$runs" "$sims" "$uploads"
+access=$repo/logs/public_api/access
+mkdir -p "$runs" "$sims" "$uploads" "$access"
 
 tracegen=$repo/alignment/load_generator/req-frontend/target/release/tracegen
 for path in "$repo/target/release/simulator" "$repo/target/release/analyze" "$tracegen" "$repo/profiling/profile.db"; do
@@ -52,17 +56,19 @@ docker rm -f "$name" >/dev/null 2>&1 || true
 # lies outside the checkout, so it is mounted too. The presets' routing
 # captures are read from the local hub cache only, so the cache is mounted too.
 # The Analyzer listens on the container's own loopback, beside the service.
-mounts=(-v "$repo:$repo:ro" -v "$runs:$runs" -v "$sims:$sims" -v "$uploads:$uploads")
+mounts=(-v "$repo:$repo:ro" -v "$runs:$runs" -v "$sims:$sims" -v "$uploads:$uploads" -v "$access:$access")
 git_dir=$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir)
 [[ $git_dir == "$repo"/* ]] || mounts+=(-v "$git_dir:$git_dir:ro")
 [[ -d $hf_home/hub ]] && mounts+=(-v "$hf_home/hub:$hf_home/hub:ro")
 docker run -d --name "$name" --restart unless-stopped \
+  --log-opt max-size=50m --log-opt max-file=4 \
   --user "$(id -u):$(id -g)" \
   "${mounts[@]}" -e HF_HOME="$hf_home" -e HF_HUB_OFFLINE=1 \
   -w "$repo" -p "$bind:$port:$port" \
   "$image" \
   python -m public_api serve --bind 0.0.0.0 --port "$port" \
   --db "$repo/profiling/profile.db" --build-type release \
-  --runs-dir "$runs" --sims-dir "$sims" --workloads-dir "$uploads" --analyzer-port "$((port + 1))" \
+  --runs-dir "$runs" --sims-dir "$sims" --workloads-dir "$uploads" --access-log-dir "$access" \
+  --analyzer-port "$((port + 1))" \
   --forwarded-allow-ips "$forwarded_allow_ips" >/dev/null
 echo "$name serving $repo on $bind:$port"

@@ -23,8 +23,9 @@ from pydantic import BaseModel, Field
 
 from public_api import predict as timing
 from public_api import simulate, workloads
+from public_api.access_log import AccessLog
 from public_api.deployments import BadMember, UnknownDeployment
-from public_api.kernels import BadQuery, KernelLibrary, UnknownConfig, UnknownKind
+from public_api.kernels import REPO_ROOT, BadQuery, KernelLibrary, UnknownConfig, UnknownKind
 from public_api.limits import RateLimiter
 
 PREFIX = "/api/public/v1"
@@ -70,24 +71,33 @@ def create_app(
     predict_limit: RateLimiter | None = None,
     simulate_limit: RateLimiter | None = None,
     upload_limit: RateLimiter | None = None,
+    access_log: AccessLog | None = None,
 ) -> FastAPI:
     """``runs_dir`` holds the predictions ``POST /predict`` leaves, and
     ``analyzer`` is the base URL of an ``analyze serve`` over it and over the
     simulations' directory; without them the service answers neither.
     ``simulations`` serves the sim presets, runs and workloads; without it the
-    ``/simulat*`` and ``/workloads`` routes answer 503."""
+    ``/simulat*`` and ``/workloads`` routes answer 503. ``access_log``, if
+    given, records every request."""
     index = kernels.index
     sources = kernels.sources
-    # Where this host keeps predictions and simulations, as the Analyzer may
-    # spell them, with the separator: forwarded reports drop it.
-    roots = [runs_dir] if runs_dir is not None else []
+    # Where this host keeps predictions and simulations, and the checkout the
+    # service runs, as a message may spell them, with the separator: answers
+    # drop it, so a run reads by its own name and a file by its repo path.
+    roots = [REPO_ROOT, *([runs_dir] if runs_dir is not None else [])]
     if simulations is not None:
         roots.append(simulations.queue.runs_dir)
     hidden_roots = sorted(
-        {f"{spelled}/".encode() for root in roots for spelled in (root, root.resolve())},
+        {f"{spelled}/" for root in roots for spelled in (root, root.resolve())},
         key=len,
         reverse=True,
     )
+
+    def hide(text: str) -> str:
+        for root in hidden_roots:
+            text = text.replace(root, "")
+        return text
+
     predict_limit = predict_limit or RateLimiter(PREDICT_PER_MINUTE, 60.0)
     simulate_limit = simulate_limit or RateLimiter(SIMULATE_PER_MINUTE, 60.0)
     upload_limit = upload_limit or RateLimiter(UPLOAD_PER_MINUTE, 60.0)
@@ -119,6 +129,8 @@ def create_app(
     )
     # A kind's rows run to hundreds of kilobytes of JSON.
     app.add_middleware(GZipMiddleware, minimum_size=4096)
+    if access_log is not None:
+        access_log.install(app)
 
     async def answer(build, *args):
         # Documents come from sqlite and simulator subprocesses: keep them off the loop.
@@ -137,10 +149,11 @@ def create_app(
         except (BadQuery, timing.BadCases, workloads.BadWorkload) as error:
             # A request too long for its pool or arch also gives the limit.
             too_long = getattr(error, "too_long", None)
-            detail = {"message": str(error), "too_long": too_long} if too_long else str(error)
+            message = hide(str(error))
+            detail = {"message": message, "too_long": too_long} if too_long else message
             raise HTTPException(400, detail) from None
         except (timing.NotPredictable, simulate.NotRunnable) as error:
-            raise HTTPException(409, str(error)) from None
+            raise HTTPException(409, hide(str(error))) from None
         except simulate.UnknownSimulation as error:
             raise HTTPException(404, f"no simulation {error.args[0]!r}") from None
         except simulate.QueueFull as error:
@@ -165,6 +178,12 @@ def create_app(
     async def predict(body: PredictRequest, request: Request) -> dict:
         """Each case's time on one member, per section and per tree node."""
 
+        request.state.note = {
+            "preset": body.preset,
+            "params": body.params,
+            "cases": len(body.cases),
+            "analyze": body.analyze,
+        }
         if runs_dir is None:
             raise HTTPException(503, "this service keeps no runs directory")
 
@@ -228,9 +247,16 @@ def create_app(
     @app.post(f"{PREFIX}/simulate", status_code=202)
     async def start_simulation(body: SimulateRequest, request: Request) -> dict:
         """Queue one simulation; read it with ``GET /simulations/{id}``."""
+        request.state.note = {
+            "preset": body.preset,
+            "params": body.params,
+            "source": body.workload.source,
+        }
         service = need_simulations()
         with limited(simulate_limit, request):
-            return await answer(service.start, body.preset, body.params, body.workload)
+            started = await answer(service.start, body.preset, body.params, body.workload)
+        request.state.note["simulation_id"] = started.get("simulation_id")
+        return started
 
     @app.get(f"{PREFIX}/workloads")
     async def workload_sources() -> dict:
@@ -256,13 +282,20 @@ def create_app(
                     raise HTTPException(
                         413, f"an upload is at most {workloads.MAX_UPLOAD_BYTES} bytes"
                     )
+            request.state.note = {"bytes": len(body), "format": input_file_format}
             names = None if tags is None else [tag for tag in tags.split(",") if tag]
-            return await answer(service.workloads.upload, bytes(body), input_file_format, names)
+            kept = await answer(service.workloads.upload, bytes(body), input_file_format, names)
+        request.state.note["workload_id"] = kept.get("workload_id")
+        return kept
 
     @app.get(f"{PREFIX}/simulations/{{simulation_id}}")
     async def simulation(simulation_id: str) -> dict:
         """Its status; once done, its summary and the Analyzer's run id."""
-        return await answer(need_simulations().queue.get, simulation_id)
+        record = await answer(need_simulations().queue.get, simulation_id)
+        # A failed run's error quotes the simulator's output, paths included.
+        if record.get("error"):
+            record["error"] = hide(record["error"])
+        return record
 
     @app.delete(f"{PREFIX}/simulations/{{simulation_id}}")
     async def delete_simulation(simulation_id: str) -> dict:
@@ -278,12 +311,9 @@ def create_app(
         url = f"{analyzer}/api/analyzer/v1/{kind}/{resource_id}/{subject}"
         async with httpx.AsyncClient(timeout=120) as client:
             answer = await client.get(url, params=request.query_params)
-        content = answer.content
-        # Some reports name the run's directory; keep only its own name.
-        for root in hidden_roots:
-            content = content.replace(root, b"")
+        # Some reports name the run's directory or a repo file.
         return Response(
-            content,
+            hide(answer.text),
             status_code=answer.status_code,
             media_type=answer.headers.get("content-type"),
         )
