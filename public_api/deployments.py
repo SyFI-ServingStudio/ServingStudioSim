@@ -34,7 +34,6 @@ from public_api import preset as public_preset
 REPO_ROOT = public_preset.REPO_ROOT
 
 # How a `Dim` serializes in a manifest's `kernel_config`.
-_DIM = frozenset({"value", "expression", "bindings"})
 _COVERAGE_FLAGS = (("extrapolated", 1 << 0), ("jit", 1 << 1), ("no_coverage", 1 << 2))
 
 
@@ -50,40 +49,10 @@ class BadMember(ValueError):
         self.choices = choices
 
 
-def _hub_repo_path(path: str) -> str:
-    """``<cache>/datasets--<owner>--<repo>/snapshots/<revision>/<path>`` -> ``<path>``,
-    as ``TokenCorpusConfig`` names a hub capture in an identity."""
-    parts = path.split("/")
-    for at in range(len(parts) - 3):
-        if parts[at].startswith("datasets--") and parts[at + 1] == "snapshots":
-            return "/".join(parts[at + 3 :])
-    return path
-
-
-def _values(value: Any) -> Any:
-    """A manifest ``kernel_config`` in its identity form (``KernelConfig::identity``):
-    each ``Dim`` reduced to its value, a corpus named by its path in its repo."""
-    if isinstance(value, dict):
-        if set(value) == _DIM:
-            return value["value"]
-        if "data_file" in value and "checksum_fnv1a64" in value:
-            return {**value, "data_file": _hub_repo_path(value["data_file"])}
-        return {key: _values(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_values(item) for item in value]
-    return value
-
-
 def config_id(kind: str, gpu: str, identity: dict) -> str:
     """The id a config is published under."""
     text = canonical_json({"kind": kind, "gpu": gpu, "identity": identity})
     return hashlib.sha256(text.encode()).hexdigest()[:16]
-
-
-def leaf_config_id(kind: str, kernel_config: dict) -> str:
-    """:func:`config_id` of a manifest slot's ``kernel_config``."""
-    identity = {k: v for k, v in kernel_config.items() if k not in ("gpu_name", "backends")}
-    return config_id(kind, kernel_config["gpu_name"], _values(identity))
 
 
 def scalar_identity(identity: dict) -> tuple[dict, list[str]]:
@@ -196,9 +165,10 @@ def _axes(preset: dict) -> list[dict]:
     return axes
 
 
-def _tree(section: dict) -> dict:
+def _tree(section: dict, configs: list[str | None]) -> dict:
     """One manifest section as ``{section, nodes, slots}``: node ``i`` is the
-    flat manifest's node ``i`` (0 the root), each with its children's ids."""
+    flat manifest's node ``i`` (0 the root), each with its children's ids.
+    ``configs`` is each slot's config id."""
     nodes = []
     for index, raw in enumerate(section["nodes"]):
         ((kind, body),) = raw.items()
@@ -219,10 +189,10 @@ def _tree(section: dict) -> dict:
         {
             "name": slot["name"],
             "kernel": slot["kind"],
-            "config": leaf_config_id(slot["kind"], slot["kernel_config"]),
+            "config": config,
             "backends": slot["kernel_config"].get("backends", []),
         }
-        for slot in section["slots"]
+        for slot, config in zip(section["slots"], configs, strict=True)
     ]
     return {"section": section["section"], "nodes": nodes, "slots": slots}
 
@@ -335,10 +305,19 @@ class DeploymentIndex:
             return
         member.gpus_per_replica = built["gpus_per_replica"]
         member.predict = built["predict"]
-        member.sections = [_tree(section) for section in built["cost_manifest"]["sections"]]
+        ids = [
+            config_id(record["kind"], record["gpu_name"], record["identity"])
+            for record in built["kernel_configs"]["configs"]
+        ]
+        # The simulator names the record each slot's kernel reads.
+        member.sections = [
+            _tree(section, [None if i is None else ids[i] for i in slots])
+            for section, slots in zip(
+                built["cost_manifest"]["sections"], built["slot_configs"], strict=True
+            )
+        ]
         roles: dict[str, set[str]] = {}
-        for record in built["kernel_configs"]["configs"]:
-            cid = config_id(record["kind"], record["gpu_name"], record["identity"])
+        for cid, record in zip(ids, built["kernel_configs"]["configs"], strict=True):
             config = self.configs.setdefault(
                 cid,
                 Config(

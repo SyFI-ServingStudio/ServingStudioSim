@@ -1879,6 +1879,12 @@ pub struct ArchBuild {
     /// `--kernel-configs-out` writes; only when asked for, and `None` on error.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kernel_configs: Option<serde_json::Value>,
+    /// Per `cost_manifest` section, per slot: the index in `kernel_configs`'
+    /// `configs` of the config the slot's kernel reads, matched by kind, GPU
+    /// and [`KernelConfig::identity`](crate::timing::KernelConfig::identity);
+    /// null when none matches. Only with `kernel_configs`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slot_configs: Option<Vec<Vec<Option<usize>>>>,
     pub error: Option<String>,
 }
 
@@ -1969,6 +1975,7 @@ pub fn build_arch_blocks(blocks: &[ArchBlock], kernel_configs: bool) -> Vec<Arch
                     predict: None,
                     cost_manifest: None,
                     kernel_configs: None,
+                    slot_configs: None,
                     error: Some(format!("no arch contract provides {tag:?}")),
                 },
             }
@@ -2072,29 +2079,37 @@ fn build_arch(
         predict: None,
         cost_manifest: None,
         kernel_configs: None,
+        slot_configs: None,
         error: None,
     };
     match built {
         Ok(((gpus_per_replica, shape, manifest), configs)) => {
             out.gpus_per_replica = Some(gpus_per_replica);
             out.predict = Some(shape);
+            if let Some((document, slots)) = configs {
+                out.kernel_configs = Some(document);
+                out.slot_configs = Some(slots);
+            }
             out.cost_manifest = Some(manifest);
-            out.kernel_configs = configs;
         }
         Err(error) => out.error = Some(error),
     }
     out
 }
 
+/// The kernel-config records document and, per manifest section and slot, the
+/// record its kernel reads ([`ArchBuild::slot_configs`]).
+type Configs = (serde_json::Value, Vec<Vec<Option<usize>>>);
+
 /// Parse `arch` as selector `S` and `build` it on `gpu` with a structure-only
 /// bridge: the replica width, the prediction case shape, the cost tree and,
-/// when asked, the kernel-config records document. A parse error, build error or panic is the error text.
+/// when asked, the kernel-config records with each slot's. A parse error, build error or panic is the error text.
 fn build_selector<S: serde::de::DeserializeOwned>(
     arch: serde_json::Map<String, serde_json::Value>,
     gpu: &str,
     kernel_configs: bool,
     build: impl Fn(&S, &str, &PerfApiBridge) -> Result<Built>,
-) -> std::result::Result<(Built, Option<serde_json::Value>), String> {
+) -> std::result::Result<(Built, Option<Configs>), String> {
     let selector: S = serde_json::from_value(serde_json::Value::Object(arch))
         .map_err(|e| format!("config: {e}"))?;
     let bridge = PerfApiBridge::structure_only();
@@ -2105,12 +2120,19 @@ fn build_selector<S: serde::de::DeserializeOwned>(
         build(&selector, gpu, &bridge)
     }));
     match built {
-        Ok(Ok(built)) => Ok((
-            built,
-            kernel_configs.then(|| {
-                crate::timing::bridge::config_records_document(&bridge.take_config_records())
-            }),
-        )),
+        Ok(Ok(built)) => {
+            let configs = if kernel_configs {
+                let records = bridge.take_config_records();
+                let slots = slot_configs(&built.2, &records).map_err(|e| format!("{e:#}"))?;
+                Some((
+                    crate::timing::bridge::config_records_document(&records),
+                    slots,
+                ))
+            } else {
+                None
+            };
+            Ok((built, configs))
+        }
         Ok(Err(e)) => Err(format!("{e:#}")),
         Err(panic) => Err(panic
             .downcast_ref::<String>()
@@ -2121,6 +2143,42 @@ fn build_selector<S: serde::de::DeserializeOwned>(
                 |message| format!("build panicked: {message}"),
             )),
     }
+}
+
+/// Per section and slot of `manifest`, the index in `records` of the config
+/// the slot's kernel reads: the record with its kind, GPU and identity.
+fn slot_configs(
+    manifest: &crate::timing::CostManifestDoc,
+    records: &[crate::timing::bridge::KernelConfigRecord],
+) -> Result<Vec<Vec<Option<usize>>>> {
+    let key = |kind: &str, gpu: &str, identity: &serde_json::Value| {
+        serde_json::to_string(&(kind, gpu, identity)).expect("an identity serializes")
+    };
+    let index: std::collections::HashMap<String, usize> = records
+        .iter()
+        .enumerate()
+        .map(|(i, r)| (key(&r.kind, &r.gpu_name, &r.identity), i))
+        .collect();
+    manifest
+        .sections
+        .iter()
+        .map(|section| {
+            section
+                .manifest
+                .slots
+                .iter()
+                .map(|slot| {
+                    let gpu = slot.kernel_config["gpu_name"].as_str().unwrap_or_default();
+                    let identity = crate::timing::kernels::engine::config_identity(
+                        &slot.kind,
+                        slot.kernel_config.clone(),
+                    )
+                    .with_context(|| format!("slot {}", slot.name))?;
+                    Ok(index.get(&key(&slot.kind, gpu, &identity)).copied())
+                })
+                .collect()
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -2969,10 +3027,21 @@ mod tests {
             let configs = doc["configs"].as_array().unwrap();
             assert!(!configs.is_empty(), "{} {:?}: no configs", b.arch, b.params);
             assert!(configs.iter().all(|c| c["gpu_name"] == b.gpu.as_str()));
+            // Every slot names the record of the config its kernel reads.
+            let manifest = b.cost_manifest.as_ref().unwrap();
+            let slots = b.slot_configs.as_ref().expect("slot_configs");
+            assert_eq!(slots.len(), manifest.sections.len());
+            for (section, indices) in manifest.sections.iter().zip(slots) {
+                assert_eq!(indices.len(), section.manifest.slots.len());
+                for (slot, index) in section.manifest.slots.iter().zip(indices) {
+                    let record = &configs[index.expect("a slot with no record")];
+                    assert_eq!(record["kind"], slot.kind.as_str(), "{}", slot.name);
+                }
+            }
         }
         assert!(build_arch_blocks(&sample_blocks(), false)
             .iter()
-            .all(|b| b.kernel_configs.is_none()));
+            .all(|b| b.kernel_configs.is_none() && b.slot_configs.is_none()));
     }
 
     /// Each build names the `timing-predict` selector its cases go under and

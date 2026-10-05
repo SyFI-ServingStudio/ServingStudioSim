@@ -119,8 +119,8 @@ def index(sim_bin) -> DeploymentIndex:
 @pytest.mark.needs_binary
 @pytest.mark.needs_db
 def test_every_leaf_names_a_published_config(index):
-    """A tree's leaf finds its config from its own Rust config, in identity
-    form, so the Kernels page and the tree name one config."""
+    """Every leaf names a published config: the simulator matches each slot to
+    the record its kernel reads, so the Kernels page and the tree name one."""
     for preset in index.presets.values():
         for member in preset.members:
             for section in member.sections:

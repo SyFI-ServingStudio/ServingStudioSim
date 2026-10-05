@@ -502,6 +502,9 @@ pub(crate) struct KernelQueryEntry {
         serde_json::Value,
     )
         -> anyhow::Result<(serde_json::Value, Vec<Vec<f64>>, &'static [&'static str])>,
+    /// `identity` path: deserialize a config (a manifest slot's
+    /// `kernel_config`) and give [`KernelConfig::identity`].
+    pub identity: fn(serde_json::Value) -> anyhow::Result<serde_json::Value>,
 }
 
 inventory::collect!(KernelQueryEntry);
@@ -527,6 +530,7 @@ impl KernelQueryEntry {
             rows: rows_from_json::<S>,
             build: build_probe_from_json::<S>,
             describe: describe_from_json::<S>,
+            identity: identity_from_json::<S>,
         }
     }
 }
@@ -742,6 +746,30 @@ where
         grid_axes,
         <S::Input as SweepCoords>::coord_field_names(),
     ))
+}
+
+/// [`KernelConfig::identity`] of a serialized `S::Config`.
+fn identity_from_json<S>(config: serde_json::Value) -> anyhow::Result<serde_json::Value>
+where
+    S: KernelSpec,
+    S::Config: serde::de::DeserializeOwned,
+{
+    let config: S::Config = serde_json::from_value(config)
+        .map_err(|e| anyhow::anyhow!("config does not match {} KernelConfig: {e}", S::KIND))?;
+    Ok(config.identity())
+}
+
+/// [`KernelConfig::identity`] of a config of kernel `kind`, given as JSON (a
+/// manifest slot's `kernel_config`).
+pub(crate) fn config_identity(
+    kind: &str,
+    config: serde_json::Value,
+) -> anyhow::Result<serde_json::Value> {
+    let entry = inventory::iter::<KernelQueryEntry>
+        .into_iter()
+        .find(|e| e.kind == kind)
+        .ok_or_else(|| anyhow::anyhow!("no kernel kind {kind:?}"))?;
+    (entry.identity)(config)
 }
 
 /// Declare a kernel's public `Kernel<S>` type alias AND register it for
