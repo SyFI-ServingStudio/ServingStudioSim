@@ -4,6 +4,7 @@ import math
 from dataclasses import dataclass
 from typing import Any
 
+from profiling.kernels.kv_compress_store import FP8_DS_MLA_ROW_BYTES
 from profiling.profilers.energy import Energy
 from profiling.profilers.timer import Timer
 from profiling.runners.device import require_cutedsl
@@ -126,7 +127,7 @@ def _block_table(torch: Any, shape: _Shape, device: Any) -> tuple[Any, int]:
 
 
 def _block_stride(block_size: int) -> int:
-    return math.ceil(block_size * 584 / 32) * 32
+    return math.ceil(block_size * FP8_DS_MLA_ROW_BYTES / 32) * 32
 
 
 def _packed_cache(torch: Any, block_count: int, block_size: int, device: Any) -> Any:
@@ -134,8 +135,8 @@ def _packed_cache(torch: Any, block_count: int, block_size: int, device: Any) ->
     storage = torch.empty(block_count * block_stride, dtype=torch.uint8, device=device)
     cache = torch.as_strided(
         storage,
-        size=(block_count, block_size, 584),
-        stride=(block_stride, 584, 1),
+        size=(block_count, block_size, FP8_DS_MLA_ROW_BYTES),
+        stride=(block_stride, FP8_DS_MLA_ROW_BYTES, 1),
     )
     physical_rows = block_count * block_size
     values = torch.arange(physical_rows, dtype=torch.int32, device=device) % 4 * 2 + 1
@@ -213,7 +214,7 @@ def _logical_work(shape: _Shape) -> tuple[int, int]:
     gathered = sum(shape.gather_lens or shape.seq_lens)
     flops = gathered * 448
     length_bytes = len(shape.seq_lens) * 4 * (2 if shape.gather_lens is not None else 1)
-    logical_bytes = gathered * (584 + 4 + 512 * 2) + length_bytes
+    logical_bytes = gathered * (FP8_DS_MLA_ROW_BYTES + 4 + 512 * 2) + length_bytes
     return flops, logical_bytes
 
 

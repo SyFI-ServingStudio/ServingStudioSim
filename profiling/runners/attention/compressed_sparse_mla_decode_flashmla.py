@@ -4,6 +4,7 @@ import math
 from dataclasses import dataclass
 from typing import Any
 
+from profiling.kernels.kv_compress_store import FP8_DS_MLA_ROW_BYTES
 from profiling.profilers.energy import Energy
 from profiling.profilers.timer import Timer
 from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerNotImplemented
@@ -15,7 +16,7 @@ _BACKEND = "compressed_sparse_mla_decode:vllm_flashmla_fp8_cudagraph"
 _PAGE_SIZE = {1: 0, 4: 64, 128: 2}
 _PLANNER_MODES = frozenset({"planned", "reused"})
 # FlashMLA sparse decode (csrc/api/sparse_decode.h at vLLM's pinned 6bc4941):
-# h_q 64 or 128, MQA (h_kv 1), and the MODEL1 584-byte cache that this runner
+# h_q 64 or 128, MQA (h_kv 1), and the MODEL1 fp8_ds_mla cache that this runner
 # packs needs d_qk = d_v = 512; topk and extra_topk tile by 64 (TOPK_BLOCK_SIZE
 # on SM90, B_TOPK on SM100).
 _NUM_HEADS = frozenset({64, 128})
@@ -125,7 +126,9 @@ def _patterned_cache(
     torch: Any, rows: int, page_size: int, value_base: int, device: Any
 ) -> tuple[Any, tuple[float, ...]]:
     block_count = max(1, math.ceil(max(1, rows) / page_size))
-    cache = torch.empty((block_count, page_size, 1, 584), dtype=torch.uint8, device=device)
+    cache = torch.empty(
+        (block_count, page_size, 1, FP8_DS_MLA_ROW_BYTES), dtype=torch.uint8, device=device
+    )
     physical_rows = block_count * page_size
     values = tuple(float(value_base + 2 * (row % 4)) for row in range(physical_rows))
     value_tensor = torch.tensor(values, dtype=torch.float32, device=device)
@@ -278,7 +281,7 @@ def _logical_work(shape: _Shape) -> tuple[int, int]:
     flops = 2 * shape.num_heads * (shape.head_dim + shape.value_dim) * selected
     batch_size = len(shape.swa_counts)
     q_read = batch_size * shape.num_heads * shape.head_dim * 2
-    cache_and_indices = selected * (584 + 4)
+    cache_and_indices = selected * (FP8_DS_MLA_ROW_BYTES + 4)
     count_reads = batch_size * 4 * (2 if shape.compress_ratio > 1 else 1)
     output_write = batch_size * shape.num_heads * (shape.value_dim * 2 + 4)
     sink_read = shape.num_heads * 4

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
 
+from profiling.kernels.kv_compress_store import FP8_DS_MLA_ROW_BYTES
 from profiling.profilers.energy import Energy
 from profiling.profilers.timer import Timer
 from profiling.runners.device import require_cutedsl
@@ -24,7 +25,6 @@ _STORAGE_IDENTITY = (
     "block_segregated_data_then_scales",
     "ue8m0",
 )
-_CACHE_ROW_BYTES = 584
 _TOKEN_STRIDE = 576
 _SCALE_DIM = 8
 _QUANT_BLOCK = 64
@@ -42,7 +42,7 @@ class _Shape:
     kv_block_size: int
     head_dim: int = 512
     rope_head_dim: int = 64
-    cache_row_bytes: int = _CACHE_ROW_BYTES
+    cache_row_bytes: int = FP8_DS_MLA_ROW_BYTES
     token_stride: int = _TOKEN_STRIDE
     scale_dim: int = _SCALE_DIM
     quant_block: int = _QUANT_BLOCK
@@ -154,7 +154,7 @@ def _validate_args(
 
 def _padded_stride(row_count: int) -> int:
     # The production fp8_ds_mla cache spec pads every page to a 576-byte boundary.
-    return math.ceil(row_count * _CACHE_ROW_BYTES / 576) * 576
+    return math.ceil(row_count * FP8_DS_MLA_ROW_BYTES / 576) * 576
 
 
 def _build_operands(torch: Any, shape: _Shape, device: Any) -> _Operands:

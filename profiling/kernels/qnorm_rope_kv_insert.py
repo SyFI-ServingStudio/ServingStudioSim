@@ -14,6 +14,7 @@ from profiling.db.registry import (
     RunnerRef,
     register,
 )
+from profiling.kernels.kv_compress_store import FP8_DS_MLA_ROW_BYTES
 
 KIND = "qnorm_rope_kv_insert"
 
@@ -59,7 +60,7 @@ DOC = KernelDoc(
         "KV cache receives 448 FP8 bytes, 128 bf16 bytes and 8 scale bytes per inserted row",
         "GB/s = (2 · num_tokens · (num_heads · head_dim + head_dim + "
         "padded_heads · head_dim) + 8 · (num_tokens + num_insert_tokens) + "
-        "4 · num_tokens · rope_dim + 584 · num_insert_tokens) / time",
+        f"4 · num_tokens · rope_dim + {FP8_DS_MLA_ROW_BYTES} · num_insert_tokens) / time",
     ),
     default_metric="memory_bandwidth_gbps",
     method=(

@@ -3,6 +3,7 @@
 import math
 from typing import Any
 
+from profiling.kernels.kv_compress_store import FP8_DS_MLA_ROW_BYTES
 from profiling.profilers.energy import Energy
 from profiling.profilers.timer import Timer
 from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerNotImplemented
@@ -164,7 +165,9 @@ def profile_qnorm_rope_kv_insert_vllm_cuda(
         cos_sin_cache = torch.cat((angles.cos(), angles.sin()), 1)
         slots = torch.arange(num_insert_tokens, dtype=torch.int64, device=device)
         blocks = max(1, math.ceil(max(1, num_insert_tokens) / block_size))
-        packed = torch.full((blocks, block_size * 584), 0xA5, dtype=torch.uint8, device=device)
+        packed = torch.full(
+            (blocks, block_size * FP8_DS_MLA_ROW_BYTES), 0xA5, dtype=torch.uint8, device=device
+        )
 
         def launch():
             return torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
@@ -197,7 +200,7 @@ def profile_qnorm_rope_kv_insert_vllm_cuda(
         2 * num_tokens * (num_heads * head_dim + head_dim + padded_heads * head_dim)
         + 8 * (num_tokens + num_insert_tokens)
         + 4 * num_tokens * rope_dim
-        + 584 * num_insert_tokens
+        + FP8_DS_MLA_ROW_BYTES * num_insert_tokens
     )
     seconds = time_ms / 1000.0
     return ComputeMetrics(float(time_ms), 0.0, logical_bytes / seconds / 1e9, float(energy_j))
