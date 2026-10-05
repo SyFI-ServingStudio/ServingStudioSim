@@ -1,24 +1,36 @@
-//! Prefill-only chunked lifecycle for a pipeline-parallel head stage.
+//! Chunked prefill and decode lifecycle for a pipeline-parallel head stage.
 //!
 //! This follows vLLM V1 under pipeline parallelism. The scheduler advances a
 //! request's computed-token count when it schedules a chunk, not when the
 //! chunk's outputs return, so the next microbatch can carry the same prompt's
 //! following chunk while the previous one is still on a later stage. A token is
-//! emitted, and the request finishes, only when the microbatch holding its last
-//! chunk leaves the last stage.
+//! emitted only when the microbatch holding it leaves the last stage.
+//!
+//! Decode needs that token as its next input, so a running request has at most
+//! one step in flight: vLLM finds no new tokens to schedule for it until the
+//! output returns (`num_new_tokens == 0`), or with async scheduling holds it
+//! `pp_size` steps (`next_decode_eligible_step`). A microbatch therefore takes
+//! the ready decodes, one query row each, then started prompts, then fresh
+//! prompts, under one token budget. Scheduling is greedy: nothing balances
+//! decodes across the in-flight microbatches.
 //!
 //! The pending policy owns fresh requests. A prompt that has started and still
 //! has unscheduled prefill tokens stays in `started_prefills`, in start order,
 //! and keeps priority over fresh prompts. A request whose last chunk is in flight
-//! is in neither list; its ticket is in the shell's in-flight queue.
+//! is in neither list; its ticket is in the shell's in-flight queue. It joins KV's
+//! decode membership when that chunk exits, and a decode step's request is in
+//! `in_flight_decodes` until its microbatch exits.
 //!
 //! KV reserves the full request footprint once at admission and releases it at
-//! completion. One attention partition only. Decode is out of scope: a request
-//! that wants more than one output token fails at enqueue.
+//! completion. One attention partition only.
+
+use std::collections::HashSet;
 
 use crate::common::{RequestId, Time, UnifiedStage};
 use crate::worker::kv::ChunkedPrefillKv;
+use crate::worker::shared::advance_scope::AdvanceScope;
 use crate::worker::shared::context::WorkerContext;
+use crate::worker::types::IterBatchPlan;
 
 use super::chunked_prefill_admission::next_chunk_tokens;
 use super::{AdmissionCandidate, EnqueueSequence, MicrobatchAdmission, PendingOrderPolicy};
@@ -26,7 +38,7 @@ use super::{AdmissionCandidate, EnqueueSequence, MicrobatchAdmission, PendingOrd
 /// The only attention partition of a pipeline head.
 const PARTITION: u16 = 0;
 
-pub struct PipelinedPrefillAdmission<P: PendingOrderPolicy> {
+pub struct PipelinedChunkedPrefillAdmission<P: PendingOrderPolicy> {
     policy: P,
     policy_context: P::Context,
     enqueue_sequence: EnqueueSequence,
@@ -34,6 +46,10 @@ pub struct PipelinedPrefillAdmission<P: PendingOrderPolicy> {
     /// Prompts that have started and still have prefill tokens to schedule, in
     /// start order.
     started_prefills: Vec<AdmissionCandidate>,
+    /// Running requests whose decode step is in a microbatch still in flight.
+    in_flight_decodes: HashSet<RequestId>,
+    /// The decodes the microbatch being formed carries, until it is committed.
+    scheduled_decodes: Vec<RequestId>,
 }
 
 /// One request's chunk in one microbatch, snapshotted when it was committed.
@@ -45,13 +61,15 @@ pub struct PrefillChunk {
     finishes_prefill: bool,
 }
 
-/// Every chunk one microbatch carries.
+/// Every prefill chunk and decode step one microbatch carries.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct PrefillChunkTicket {
+pub struct MicrobatchTicket {
     chunks: Vec<PrefillChunk>,
+    decodes: Vec<RequestId>,
 }
 
-impl PrefillChunkTicket {
+impl MicrobatchTicket {
+    /// Prefill tokens the microbatch carries.
     pub fn tokens(&self) -> u64 {
         self.chunks
             .iter()
@@ -60,7 +78,7 @@ impl PrefillChunkTicket {
     }
 }
 
-impl<P: PendingOrderPolicy> PipelinedPrefillAdmission<P> {
+impl<P: PendingOrderPolicy> PipelinedChunkedPrefillAdmission<P> {
     pub(crate) fn new(policy: P, policy_context: P::Context, max_batch_tokens: u32) -> Self {
         assert!(
             max_batch_tokens > 0,
@@ -72,6 +90,8 @@ impl<P: PendingOrderPolicy> PipelinedPrefillAdmission<P> {
             enqueue_sequence: EnqueueSequence::default(),
             max_batch_tokens,
             started_prefills: Vec::new(),
+            in_flight_decodes: HashSet::new(),
+            scheduled_decodes: Vec::new(),
         }
     }
 
@@ -138,12 +158,12 @@ impl<P: PendingOrderPolicy> PipelinedPrefillAdmission<P> {
     }
 }
 
-impl<P, K> MicrobatchAdmission<K> for PipelinedPrefillAdmission<P>
+impl<P, K> MicrobatchAdmission<K> for PipelinedChunkedPrefillAdmission<P>
 where
     P: PendingOrderPolicy,
     K: ChunkedPrefillKv,
 {
-    type Ticket = PrefillChunkTicket;
+    type Ticket = MicrobatchTicket;
 
     fn accept_request(&mut self, kv_store: &mut K, request: RequestId, context: &WorkerContext) {
         debug_assert_eq!(kv_store.num_partitions(), 1);
@@ -163,12 +183,6 @@ where
                     .session_start_or(arrival_time),
             )
         };
-        assert!(
-            target_output_tokens <= 1,
-            "request {} wants {target_output_tokens} output tokens; the pipeline head \
-             models prefill only (output_len <= 1)",
-            request.0,
-        );
         let candidate = self.enqueue_sequence.freeze(
             request,
             fresh_prompt_tokens,
@@ -181,9 +195,28 @@ where
         self.policy.push(candidate, &mut self.policy_context);
     }
 
-    fn form_microbatch(&mut self, kv_store: &mut K, context: &WorkerContext, now: Time) -> bool {
+    fn form_microbatch(
+        &mut self,
+        kv_store: &mut K,
+        context: &WorkerContext,
+        batch_plan: &mut IterBatchPlan,
+        now: Time,
+    ) -> bool {
         let max_batch_tokens = self.max_batch_tokens;
         let mut remaining_budget = max_batch_tokens;
+        // Running decodes first, as vLLM schedules its running queue before
+        // waiting prompts. One whose previous step has not returned sits out.
+        let (in_flight_decodes, scheduled_decodes) =
+            (&self.in_flight_decodes, &mut self.scheduled_decodes);
+        scheduled_decodes.clear();
+        kv_store.visit_decode_members(PARTITION, |request, _| {
+            if remaining_budget > 0 && !in_flight_decodes.contains(&request) {
+                scheduled_decodes.push(request);
+                remaining_budget -= 1;
+            }
+        });
+        batch_plan.reset_decode_participation(1, false);
+        batch_plan.select_partition_decodes(PARTITION, self.scheduled_decodes.clone());
         // Started prompts keep start order. One that cannot run keeps its place.
         self.started_prefills.retain(|candidate| {
             let resolved_prefill = kv_store.resolved_prefill_context(candidate.request_id);
@@ -197,11 +230,16 @@ where
             chunk_tokens < resolved_prefill.remaining_prefill_tokens()
         });
         self.admit_fresh_prompts(kv_store, context, remaining_budget, now);
-        kv_store.has_prefill_admit(PARTITION)
+        kv_store.has_prefill_admit(PARTITION) || !self.scheduled_decodes.is_empty()
     }
 
-    fn commit_microbatch(&mut self, kv_store: &mut K, now: Time) -> PrefillChunkTicket {
-        let mut ticket = PrefillChunkTicket::default();
+    fn commit_microbatch(&mut self, kv_store: &mut K, now: Time) -> MicrobatchTicket {
+        let mut ticket = MicrobatchTicket {
+            decodes: std::mem::take(&mut self.scheduled_decodes),
+            ..MicrobatchTicket::default()
+        };
+        self.in_flight_decodes
+            .extend(ticket.decodes.iter().copied());
         kv_store.visit_prefill_admits(PARTITION, |request| {
             ticket.chunks.push(PrefillChunk {
                 request,
@@ -229,12 +267,42 @@ where
         &mut self,
         kv_store: &mut K,
         context: &WorkerContext,
-        ticket: PrefillChunkTicket,
+        ticket: MicrobatchTicket,
         completed: &mut Vec<RequestId>,
         at: Time,
     ) {
-        for chunk in ticket.chunks {
-            {
+        let MicrobatchTicket { chunks, decodes } = ticket;
+        let mut finished_decodes = Vec::new();
+        {
+            let mut store = context.requests.borrow_mut();
+            for &request in &decodes {
+                let record = &mut store[request];
+                record.record_token(at, context.log_tokens());
+                if record.is_complete() {
+                    context.stamp_stage(record, at, UnifiedStage::Done as u16);
+                    finished_decodes.push(request);
+                }
+            }
+        }
+        if !decodes.is_empty() {
+            kv_store.advance(
+                AdvanceScope::RequestSubset {
+                    partition: PARTITION,
+                    request_ids: &decodes,
+                },
+                1,
+            );
+        }
+        for request in &decodes {
+            self.in_flight_decodes.remove(request);
+        }
+        for request in finished_decodes {
+            kv_store.release_retaining_prefix(request, PARTITION, at);
+            completed.push(request);
+        }
+
+        for chunk in chunks {
+            let remaining_output_tokens = {
                 let mut store = context.requests.borrow_mut();
                 let record = &mut store[chunk.request];
                 record.progress.prefill_tokens_processed = record
@@ -246,12 +314,23 @@ where
                     continue;
                 }
                 record.record_first_token(at, context.log_tokens());
-                debug_assert!(record.is_complete());
-                context.stamp_stage(record, at, UnifiedStage::Done as u16);
+                let stage = if record.is_complete() {
+                    UnifiedStage::Done
+                } else {
+                    UnifiedStage::Decode
+                };
+                context.stamp_stage(record, at, stage as u16);
+                record
+                    .request
+                    .definition
+                    .target_output_tokens
+                    .saturating_sub(record.progress.output_tokens_emitted)
+            };
+            kv_store.finish_chunked_prefill(chunk.request, PARTITION, remaining_output_tokens);
+            if remaining_output_tokens == 0 {
+                kv_store.release_retaining_prefix(chunk.request, PARTITION, at);
+                completed.push(chunk.request);
             }
-            kv_store.finish_chunked_prefill(chunk.request, PARTITION, 0);
-            kv_store.release_retaining_prefix(chunk.request, PARTITION, at);
-            completed.push(chunk.request);
         }
         kv_store.sample_submit(PARTITION, at);
     }

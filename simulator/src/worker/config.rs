@@ -385,8 +385,9 @@ pub enum IterWorkerSel {
     /// requests and owns the pipeline's KV, later stages pull activations and
     /// compute. vLLM V1 chunked prefill under pipeline parallelism: a prompt's
     /// next chunk may be scheduled while its previous chunk is still on a later
-    /// stage, and at most one microbatch per stage is in flight. Prefill only:
-    /// every request must want at most one output token.
+    /// stage, and at most one microbatch per stage is in flight. A running
+    /// request decodes one step at a time: its next step waits for the previous
+    /// step's microbatch to leave the last stage.
     PipelineChunkedPrefill {
         /// GPU memory for each stage (GB; primarily KV cache budget). Every stage
         /// holds the same tokens, so the stage with the most KV bytes per token

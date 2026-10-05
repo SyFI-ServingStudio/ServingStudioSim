@@ -39,10 +39,15 @@ pub struct BatchFsmState {
 /// KV membership remains authoritative in the KV axis. This plan only states
 /// whether each partition's resident decode requests participate in the
 /// current iteration, so a prefill-only scheduler can leave those requests
-/// resident without charging or advancing them.
+/// resident without charging or advancing them. A pipeline head narrows that
+/// to a selected subset: requests whose previous step is still in flight on a
+/// later stage stay resident but sit the microbatch out.
 #[derive(Clone, Debug, Default)]
 pub struct IterBatchPlan {
     decode_participation: Vec<bool>,
+    /// Per partition, sorted: the only resident decodes that run when the
+    /// partition participates. `None` means all of them.
+    selected_decodes: Vec<Option<Vec<RequestId>>>,
 }
 
 impl IterBatchPlan {
@@ -50,6 +55,8 @@ impl IterBatchPlan {
         self.decode_participation.clear();
         self.decode_participation
             .resize(num_partitions, participates);
+        self.selected_decodes.clear();
+        self.selected_decodes.resize(num_partitions, None);
     }
 
     pub(crate) fn set_partition_runs_decode(&mut self, partition: u16, runs_decode: bool) {
@@ -60,11 +67,30 @@ impl IterBatchPlan {
         *entry = runs_decode;
     }
 
+    /// Run only `requests` among the partition's resident decodes.
+    pub(crate) fn select_partition_decodes(
+        &mut self,
+        partition: u16,
+        mut requests: Vec<RequestId>,
+    ) {
+        self.set_partition_runs_decode(partition, !requests.is_empty());
+        requests.sort_unstable();
+        self.selected_decodes[usize::from(partition)] = Some(requests);
+    }
+
     pub(crate) fn partition_runs_decode(&self, partition: u16) -> bool {
         self.decode_participation
             .get(usize::from(partition))
             .copied()
             .expect("batch plan partition must exist")
+    }
+
+    /// Whether resident decode `request` runs, given its partition participates.
+    pub(crate) fn decode_member_runs(&self, partition: u16, request: RequestId) -> bool {
+        match &self.selected_decodes[usize::from(partition)] {
+            None => true,
+            Some(selected) => selected.binary_search(&request).is_ok(),
+        }
     }
 }
 

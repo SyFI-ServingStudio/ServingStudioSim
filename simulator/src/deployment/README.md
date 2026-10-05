@@ -28,7 +28,7 @@ the deserialized config to its deployment's `build`:
 | `unified` | **wired** — `UnifiedDeployment::build` |
 | `pd` | **wired** — `PdDeployment::build` for the supported prefill/decode arch pairings |
 | `afd` | **wired** — `AfdDeployment::build` for Qwen3 attention/FFN disaggregation |
-| `pp` | **wired** — `PpDeployment::build` for `glm52_vllm_nvfp4_pp_dsa_moe` + `pipeline_chunked_prefill` (prefill only): one `stage` pool whose workers are the stages of `replicas` pipelines |
+| `pp` | **wired** — `PpDeployment::build` for `glm52_vllm_nvfp4_pp_dsa_moe` + `pipeline_chunked_prefill` (chunked prefill + decode): one `stage` pool whose workers are the stages of `replicas` pipelines |
 
 ## The config shape (`config.rs`)
 

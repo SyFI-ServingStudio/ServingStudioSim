@@ -7,16 +7,20 @@
 //!
 //! Cadence. Stage 0 runs one microbatch at a time. It forms the next one when it
 //! is idle and fewer than `pipeline_depth` microbatches are in flight, so at most
-//! one microbatch per stage exists, as in vLLM's batch queue. When stage 0
-//! finishes, the shell emits `MicrobatchLaunched` and L6 hands the microbatch to
-//! stage 1. When the last stage finishes, L6 sends `MicrobatchExit` back here.
+//! one microbatch per stage exists, as in vLLM's batch queue. A microbatch may mix
+//! prefill chunks and decode steps; admission writes which resident decodes it
+//! carries into the batch plan. When stage 0 finishes, the shell emits
+//! `MicrobatchLaunched` and L6 hands the microbatch to stage 1. When the last
+//! stage finishes, L6 sends `MicrobatchExit` back here.
 //!
 //! Invariants:
 //! - `in_flight` holds one ticket per formed microbatch, in formation order,
 //!   including the one stage 0 is computing. Exits arrive in the same order,
 //!   because every stage is FIFO.
-//! - KV progress is committed at formation. Token emission, the Done stage, and
-//!   KV release happen at exit, stamped with the exact exit time.
+//! - Prefill progress is committed at formation. Token emission, decode KV
+//!   advance, the Done stage, and KV release happen at exit, stamped with the
+//!   exact exit time. A request has at most one microbatch in flight once its
+//!   prompt is fully scheduled.
 //! - A head blocked on the in-flight window or on KV has no wakeup: only an exit
 //!   or a new request can unblock it, and L6 ticks it on every message.
 //!
@@ -68,7 +72,7 @@ where
     layout: PipelineLayout,
     /// Communication group the next stage pulls stage 0's output from.
     send_gid: u16,
-    /// Pipeline heads never run decode; the plan says so to input lowering.
+    /// The decodes the microbatch being formed carries, for input lowering.
     batch_plan: IterBatchPlan,
     next_microbatch: u64,
     computing: Option<ComputingMicrobatch>,
@@ -194,9 +198,12 @@ where
             }
             if self.computing.is_none()
                 && self.in_flight.len() < usize::from(self.layout.depth)
-                && self
-                    .admission
-                    .form_microbatch(&mut self.kv_store, &self.context, now)
+                && self.admission.form_microbatch(
+                    &mut self.kv_store,
+                    &self.context,
+                    &mut self.batch_plan,
+                    now,
+                )
             {
                 self.computing = Some(self.launch_microbatch(now));
                 progressed = true;
@@ -236,7 +243,7 @@ where
         }
     }
 
-    /// Lower the scheduled chunks, commit their progress, and start stage 0.
+    /// Lower the scheduled chunks and decodes, commit them, and start stage 0.
     fn launch_microbatch(&mut self, now: Time) -> ComputingMicrobatch {
         let mut input = UnifiedArchInput::default();
         self.execution.build_iteration_input(
@@ -282,7 +289,7 @@ mod tests {
     use super::*;
     use crate::common::{PoolId, SessionInput, SharedRequests, UnifiedStage};
     use crate::test_helpers::{shared_with, test_cluster, FakeModel};
-    use crate::worker::admission::{FifoOrder, PipelinedPrefillAdmission};
+    use crate::worker::admission::{FifoOrder, PipelinedChunkedPrefillAdmission};
     use crate::worker::execution::UnifiedIterExecution;
     use crate::worker::kv::FullAttnKv;
     use crate::worker::types::WorkerConfig;
@@ -295,7 +302,7 @@ mod tests {
         assert_iter_worker::<
             PipelineHeadWorker<
                 FullAttnKv,
-                PipelinedPrefillAdmission<FifoOrder>,
+                PipelinedChunkedPrefillAdmission<FifoOrder>,
                 UnifiedIterExecution<FakeModel>,
             >,
         >();
@@ -504,11 +511,116 @@ mod tests {
         assert_eq!(record.telemetry.prefix_cache_hit_tokens, Some(100));
     }
 
+    fn launched_decode_kv(events: &[PipelineHeadEvent]) -> Vec<(u64, Vec<u32>)> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                PipelineHeadEvent::MicrobatchLaunched { microbatch, .. } => Some((
+                    microbatch.id,
+                    microbatch.input.groups[0].decode_kv_lens.clone(),
+                )),
+                PipelineHeadEvent::RequestComplete { .. } => None,
+            })
+            .collect()
+    }
+
     #[test]
-    #[should_panic(expected = "models prefill only")]
-    fn a_decode_request_is_rejected_at_enqueue() {
-        let store = shared_with(&[(0, 4, 2)]);
-        let mut worker = head(store, 8, 1_000);
+    fn a_decode_step_waits_for_the_previous_step_to_leave_the_pipeline() {
+        // Prompt 4, three output tokens: the first comes with the prompt's exit,
+        // each later one needs the previous token, so no two of this request's
+        // steps are ever in flight together even though the depth allows two.
+        let store = shared_with(&[(0, 4, 3)]);
+        let mut worker = head(Rc::clone(&store), 8, 1_000);
         worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
+        let mut events = Vec::new();
+        worker.tick(Time::ZERO, &mut events);
+        worker.tick(Time::from_ms(1.0), &mut events);
+        assert_eq!(launched(&events), vec![(1, 4, Time::from_ms(1.0))]);
+        assert_eq!(worker.tick(Time::from_ms(1.5), &mut events), None);
+
+        let mut decode_kv = Vec::new();
+        for (microbatch, exit_ms) in [(1, 2.0), (2, 4.0), (3, 6.0)] {
+            worker.enqueue(PipelineHeadMsg::MicrobatchExit {
+                microbatch,
+                at: Time::from_ms(exit_ms),
+            });
+            events.clear();
+            worker.tick(Time::from_ms(exit_ms), &mut events);
+            worker.tick(Time::from_ms(exit_ms + 1.0), &mut events);
+            decode_kv.extend(launched_decode_kv(&events));
+            assert!(
+                worker.in_flight.len() <= 1,
+                "one request, one step in flight"
+            );
+            if microbatch == 3 {
+                assert_eq!(completed(&events), vec![RequestId(0)]);
+            } else {
+                assert!(completed(&events).is_empty());
+            }
+        }
+        // Two decode steps, each over one more resident token than the last.
+        assert_eq!(decode_kv.len(), 2);
+        assert_eq!(decode_kv[1].1[0], decode_kv[0].1[0] + 1);
+
+        let requests = store.borrow();
+        let record = &requests[RequestId(0)];
+        assert_eq!(record.progress.output_tokens_emitted, 3);
+        assert_eq!(record.telemetry.first_output_time, Some(Time::from_ms(2.0)));
+        assert_eq!(
+            record.lifecycle.current_stage.code,
+            UnifiedStage::Done as u16
+        );
+        drop(requests);
+        assert_eq!(worker.status().active_requests, 0);
+    }
+
+    #[test]
+    fn requests_ready_at_different_exits_decode_in_different_microbatches() {
+        // A 2-token budget puts each prompt in its own microbatch, so the two
+        // requests become ready at different exits and then alternate: each
+        // decode microbatch carries only the request whose step returned.
+        let store = shared_with(&[(0, 2, 3), (1, 2, 3)]);
+        let mut worker = head(Rc::clone(&store), 2, 1_000);
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(1)));
+        let mut events = Vec::new();
+        worker.tick(Time::ZERO, &mut events);
+        worker.tick(Time::from_ms(1.0), &mut events);
+        worker.tick(Time::from_ms(2.0), &mut events);
+        assert_eq!(worker.in_flight.len(), 2);
+
+        let mut decode_rows = Vec::new();
+        let mut done = Vec::new();
+        let mut now = 2.0;
+        for microbatch in 1..=6 {
+            now += 1.0;
+            worker.enqueue(PipelineHeadMsg::MicrobatchExit {
+                microbatch,
+                at: Time::from_ms(now),
+            });
+            events.clear();
+            worker.tick(Time::from_ms(now), &mut events);
+            decode_rows.extend(
+                launched_decode_kv(&events)
+                    .into_iter()
+                    .map(|(_, kv)| kv.len()),
+            );
+            done.extend(completed(&events));
+            if microbatch < 6 {
+                // Each exit is followed by the head's next launch.
+                worker.tick(Time::from_ms(now + 1.0), &mut events);
+                decode_rows.extend(
+                    launched_decode_kv(&events)
+                        .into_iter()
+                        .map(|(_, kv)| kv.len()),
+                );
+            }
+        }
+        assert!(decode_rows.iter().all(|&rows| rows <= 1), "{decode_rows:?}");
+        assert_eq!(done, vec![RequestId(0), RequestId(1)]);
+        let requests = store.borrow();
+        for request in [RequestId(0), RequestId(1)] {
+            assert_eq!(requests[request].progress.output_tokens_emitted, 3);
+        }
     }
 }
