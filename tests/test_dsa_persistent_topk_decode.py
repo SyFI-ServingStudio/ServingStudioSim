@@ -446,7 +446,6 @@ def test_native_corrected_cache_builds_once_and_reuses_marker(monkeypatch, tmp_p
         ),
         ({"max_model_len": 0}, "max_model_len must be > 0"),
         ({"context_len": 1048577}, "context_len must be <= max_model_len"),
-        ({"top_k": 256}, "top_k=512 or top_k=1024 or top_k=2048"),
         ({"logits_row_stride": 0}, "positive and >= max_model_len"),
         ({"logits_row_stride": 1048575}, "positive and >= max_model_len"),
         ({"logits_dtype": DType.BF16}, "logits_dtype=fp32"),
@@ -479,7 +478,6 @@ def test_rejects_unsupported_args_before_allocation(monkeypatch, overrides, matc
         ({"next_n": 0}, "next_n > 0"),
         ({"context_len": -1}, "context_len must be >= 0"),
         ({"max_model_len": 0}, "max_model_len must be > 0"),
-        ({"top_k": 256}, "top_k=512 or top_k=1024 or top_k=2048"),
         ({"logits_dtype": DType.BF16}, "logits_dtype=fp32"),
         ({"index_dtype": "int64"}, "index_dtype='int32'"),
         ({"context_mode": "mixed"}, "context_mode='uniform'"),
@@ -740,8 +738,12 @@ def test_both_backends_accept_every_kernel_top_k() -> None:
     kpool["logits_row_stride"] = 8192
     assert runner._validate_args(**kpool)[4] == 512
     assert runner._validate_args(**(kpool | {"top_k": 1024}))[4] == 1024
-    with pytest.raises(ValueError, match="top_k=512 or top_k=1024 or top_k=2048, got 256"):
-        runner._validate_args(**(kpool | {"top_k": 256}))
+    for profile in (
+        runner.profile_dsa_persistent_topk_decode_torch,
+        runner.profile_dsa_persistent_topk_decode_vllm_cuda,
+    ):
+        with pytest.raises(ProfilerNotImplemented, match=r"top_k in \[512, 1024, 2048\], got 256"):
+            profile(**(kpool | {"top_k": 256}))
 
 
 def test_overflow_exemption_follows_the_path_each_row_takes() -> None:

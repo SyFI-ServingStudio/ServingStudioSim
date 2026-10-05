@@ -5,7 +5,10 @@ from typing import Any
 
 from profiling.profilers.energy import Energy
 from profiling.profilers.timer import Timer
-from profiling.runners.attention.dsa_persistent_topk_decode import VLLM_TOP_K, WORKSPACE_BYTES
+from profiling.runners.attention.dsa_persistent_topk_decode import (
+    WORKSPACE_BYTES,
+    require_vllm_top_k,
+)
 from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
 
@@ -49,10 +52,7 @@ def _validate_args(
         raise ValueError("context_len must be a nonnegative int")
     if type(next_n) is not int or next_n < 1:
         raise ValueError("next_n must be a positive int")
-    if top_k not in VLLM_TOP_K:
-        raise ProfilerNotImplemented(
-            f"{_BACKEND} requires top_k in {sorted(VLLM_TOP_K)}, got {top_k}"
-        )
+    require_vllm_top_k(_BACKEND, top_k)
     if (
         type(max_model_len) is not int
         or max_model_len < 1

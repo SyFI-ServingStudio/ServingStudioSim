@@ -37,6 +37,16 @@ _NATIVE_EXTENSION_CAPABILITY = (9, 0)
 WORKSPACE_BYTES = 1024 * 1024
 
 
+def require_vllm_top_k(label: str, top_k: int) -> None:
+    """Refuse a top_k the persistent_topk callable has no instantiation for.
+
+    The spec is valid; the backend has no kernel for it, so this is
+    ProfilerNotImplemented, not ValueError.
+    """
+    if top_k not in VLLM_TOP_K:
+        raise ProfilerNotImplemented(f"{label} requires top_k in {sorted(VLLM_TOP_K)}, got {top_k}")
+
+
 @dataclass(frozen=True)
 class _DsaPersistentTopkDecodeOperands:
     logits_backing: Any
@@ -104,9 +114,7 @@ def _validate_args(
         raise ValueError(
             f"context_len must be <= max_model_len, got {context_len} and {max_model_len}"
         )
-    if top_k not in VLLM_TOP_K:
-        required = " or ".join(f"top_k={value}" for value in sorted(VLLM_TOP_K))
-        raise ValueError(f"dsa_persistent_topk_decode requires {required}, got {top_k}")
+    require_vllm_top_k("dsa_persistent_topk_decode", top_k)
     if logits_row_stride <= 0 or logits_row_stride < max_model_len:
         raise ValueError(
             "logits_row_stride must be positive and >= max_model_len, "
