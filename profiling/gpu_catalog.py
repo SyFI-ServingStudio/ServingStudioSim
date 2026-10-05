@@ -9,16 +9,20 @@ a default SKU.
 The profiling artifact path uses this to (a) verify that a measured job's
 requested DB cache key and the worker-observed physical GPU resolve to the same
 canonical SKU — the job fails otherwise — and (b) stamp the resolved canonical
-name into resource metadata. ``gpu/spec.json`` is explicitly NOT on the timing
-path: ``profile.db`` rows are keyed by the requested ``gpu_name`` string and the
-simulator never reads peak TLOPs.
+name into resource metadata. Backend-capability validation
+(``profiling.db.registry.BackendSupport``) also reads a GPU's CUDA compute
+capability from it. Of the catalog, only ``compute_capability`` reaches the
+timing path: the simulator reads it too (``simulator/src/common/gpu.rs``), for
+capability-keyed rules such as vLLM's FlashInfer all-reduce workspace budget.
+Kernel times themselves come from ``profile.db`` rows keyed by the requested
+``gpu_name`` string; the simulator never reads peak TFLOPs.
 """
 
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import cache, lru_cache
 from pathlib import Path
 
 # `profiling/` sits one level below the git root, which owns `gpu/spec.json`.
@@ -61,6 +65,8 @@ class GpuSpecResolution:
     int8_tops: float | None = None
     interconnect: str | None = None
     interconnect_bandwidth_gbps: float | None = None
+    # CUDA ``(major, minor)``; ``None`` for a non-NVIDIA part.
+    compute_capability: tuple[int, int] | None = None
 
     @property
     def interconnect_one_way_gbps(self) -> float | None:
@@ -137,8 +143,18 @@ def resolve_gpu_spec(name: str, root: Path | None = None) -> GpuSpecResolution |
             int8_tops=_number(gpu, "int8_tops"),
             interconnect=_string_or_none(gpu, "interconnect"),
             interconnect_bandwidth_gbps=_number(gpu, "interconnect_bandwidth_gbps"),
+            compute_capability=_compute_capability(gpu),
         )
     return None
+
+
+@cache
+def gpu_compute_capability(name: str) -> tuple[int, int] | None:
+    """CUDA compute capability of a GPU named by catalog name or alias (e.g.
+    ``"NVIDIA H200"`` -> ``(9, 0)``). ``None`` when the name is not in the
+    catalog or the part has no CUDA compute capability."""
+    spec = resolve_gpu_spec(name)
+    return spec.compute_capability if spec is not None else None
 
 
 def same_canonical_sku(left: str, right: str, root: Path | None = None) -> bool:
@@ -156,6 +172,18 @@ def same_canonical_sku(left: str, right: str, root: Path | None = None) -> bool:
 def _number(gpu: dict, key: str) -> float | None:
     value = gpu.get(key)
     return float(value) if isinstance(value, (int, float)) else None
+
+
+def _compute_capability(gpu: dict) -> tuple[int, int] | None:
+    value = gpu.get("compute_capability")
+    if not isinstance(value, str):
+        return None
+    major, _, minor = value.partition(".")
+    if not (major.isdigit() and minor.isdigit()):
+        raise ValueError(
+            f"{gpu.get('name')}: compute_capability must be 'major.minor', got {value!r}"
+        )
+    return int(major), int(minor)
 
 
 def _string_or_none(gpu: dict, key: str) -> str | None:

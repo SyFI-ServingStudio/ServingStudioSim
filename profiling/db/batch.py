@@ -12,11 +12,10 @@ from collections import Counter, defaultdict
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, fields
-from functools import cache
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, get_args, get_origin, get_type_hints
+from typing import TYPE_CHECKING, Any, get_args, get_origin
 
-from profiling.db.args import DType, KernelArgs
+from profiling.db.args import DType, KernelArgs, field_types
 from profiling.db.kind import KernelKind
 from profiling.db.registry import find_kernel_profiler_spec, resolve_spec_backend
 from profiling.db.table import ProfileRow, Table
@@ -426,19 +425,6 @@ def _run_chunk_assignment(
     return list(zip(chunk_assignment.assigned_specs, chunk_results, strict=True))
 
 
-@cache
-def _schema_field_types(args_schema: type[KernelArgs]) -> dict[str, Any]:
-    """Resolved field types of an args dataclass, in field order.
-
-    ``get_type_hints`` re-evaluates every string annotation on each call, and a
-    build coerces thousands of specs against a few dozen schemas; resolved once
-    per schema, it drops from about half of the profile.db query time to nothing.
-    """
-
-    type_hints = get_type_hints(args_schema)
-    return {field.name: type_hints[field.name] for field in fields(args_schema)}
-
-
 def coerce_args(args_schema: type[KernelArgs], spec: dict[str, Any]) -> KernelArgs:
     """Validate a public spec dict against a ``KernelArgs`` dataclass.
 
@@ -447,13 +433,13 @@ def coerce_args(args_schema: type[KernelArgs], spec: dict[str, Any]) -> KernelAr
     first; every remaining extra key should fail before a runner is invoked.
     """
 
-    field_types = _schema_field_types(args_schema)
+    schema_types = field_types(args_schema)
     values = {}
-    for name, field_type in field_types.items():
+    for name, field_type in schema_types.items():
         if name not in spec:
             raise ValueError(f"missing required spec field {name!r}")
         values[name] = _coerce_value(field_type, spec[name])
-    extra = set(spec) - field_types.keys()
+    extra = set(spec) - schema_types.keys()
     if extra:
         raise ValueError(f"unexpected spec fields for {args_schema.__name__}: {sorted(extra)}")
     return args_schema(**values)

@@ -30,7 +30,7 @@ def test_registry_contract_and_capability_gate():
     assert spec.gpu_count_fn({"num_gpus": 4}) == 4
     assert spec.supports.allows(DType.BF16, gpu="NVIDIA B200")
     assert not spec.supports.allows(DType.FP16, gpu="NVIDIA B200")
-    assert not spec.supports.allows(DType.BF16, gpu="NVIDIA H200")
+    assert spec.supports.allows(DType.BF16, gpu="NVIDIA H200")
 
 
 def test_kernel_import_is_lazy():
@@ -59,6 +59,10 @@ def test_mnnvl_registry_row_runs_in_production_flashinfer_env():
     assert spec.gpu_count_fn({"num_gpus": 4}) == 4
     assert spec.supports.allows(DType.BF16, gpu="NVIDIA B200")
     assert not spec.supports.allows(DType.FP16, gpu="NVIDIA B200")
+    # The runner carries only vLLM's SM100 budget, which vLLM keys by the exact
+    # capability: measuring B300 or H200 under it would size the wrong workspace.
+    assert not spec.supports.allows(DType.BF16, gpu="NVIDIA B300")
+    assert not spec.supports.allows(DType.BF16, gpu="NVIDIA H200")
 
 
 def test_mnnvl_oneshot_rule_matches_flashinfer_threshold():

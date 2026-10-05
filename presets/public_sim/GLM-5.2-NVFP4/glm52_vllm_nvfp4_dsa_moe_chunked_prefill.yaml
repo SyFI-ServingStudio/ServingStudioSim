@@ -1,0 +1,32 @@
+# vLLM GLM-5.2 NVFP4 on B200, EP4 (TP4) or EP8 (TP8), chunked prefill at 2048 tokens.
+# Worker: presets/alignment/glm52_nvfp4_b200 (EP4) and glm52_nvfp4_b200_tp8 (EP8).
+# attn_gpu_memory_gb is the KV budget each pack measured at that max_model_len:
+# cases 09 (8K), 14 (64K), 13 (128K), 15 (256K) and 11 (512K).
+deployment: unified
+pools:
+  main:
+    groups:
+      - replicas: ${replicas}
+        arch:
+          preset: glm52_vllm_nvfp4_dsa_moe
+          ep_size: ${ep_size}
+          max_model_len: ${max_model_len}
+        worker:
+          type: chunked_prefill
+          max_batch_tokens: 2048
+          batch_policy: mix
+          attn_gpu_memory_gb: ${attn_gpu_memory_gb}
+sweep:
+  replicas: [1, 2]
+compound:
+  server:
+    ep4_ctx8k: {ep_size: 4, max_model_len: 8192, attn_gpu_memory_gb: 37.990577664}
+    ep4_ctx64k: {ep_size: 4, max_model_len: 65536, attn_gpu_memory_gb: 37.686624768}
+    ep4_ctx128k: {ep_size: 4, max_model_len: 131072, attn_gpu_memory_gb: 37.34025984}
+    ep4_ctx256k: {ep_size: 4, max_model_len: 262144, attn_gpu_memory_gb: 35.933594112}
+    ep4_ctx512k: {ep_size: 4, max_model_len: 524288, attn_gpu_memory_gb: 32.402792448}
+    ep8_ctx8k: {ep_size: 8, max_model_len: 8192, attn_gpu_memory_gb: 95.1407908}
+    ep8_ctx64k: {ep_size: 8, max_model_len: 65536, attn_gpu_memory_gb: 93.8048118}
+    ep8_ctx128k: {ep_size: 8, max_model_len: 131072, attn_gpu_memory_gb: 93.4584468}
+    ep8_ctx256k: {ep_size: 8, max_model_len: 262144, attn_gpu_memory_gb: 91.5357681}
+    ep8_ctx512k: {ep_size: 8, max_model_len: 524288, attn_gpu_memory_gb: 88.0014321}

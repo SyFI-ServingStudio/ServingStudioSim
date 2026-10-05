@@ -61,7 +61,7 @@ DOC = KernelDoc(
         "torch runs the math in FP32 as separate launches and is timed with "
         "CUDA events: five warm-up calls, then a loop of back-to-back calls, "
         "taking the median of three runs. deepgemm_fp8 runs once for setup, "
-        "then CUPTI counts only fp8_mqa_logits launches, with the L2 cache "
+        "then CUPTI counts only the MQA-logits kernel launches, with the L2 cache "
         "flushed before each."
     ),
     caveats=(
@@ -81,7 +81,6 @@ register(
         supports=BackendSupport(
             compute=frozenset({DType.FP8_E4M3}),
             kv=frozenset({DType.FP8_E4M3}),
-            gpus=frozenset({"NVIDIA H200"}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.attention.dsa_mqa_logits_prefill",
@@ -107,7 +106,7 @@ register(
         supports=BackendSupport(
             compute=frozenset({DType.FP8_E4M3}),
             kv=frozenset({DType.FP8_E4M3}),
-            gpus=frozenset({"NVIDIA H200", "NVIDIA B200"}),
+            sm_targets=frozenset({"sm_90a", "sm_100f", "sm_120f"}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.attention.dsa_mqa_logits_prefill",

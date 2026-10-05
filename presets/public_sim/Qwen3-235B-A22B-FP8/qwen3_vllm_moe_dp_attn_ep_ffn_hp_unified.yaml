@@ -1,0 +1,18 @@
+# Qwen3-235B-A22B FP8 on H200, TP4 attention with EP4 experts, the hp_unified
+# worker, at the TP4/EP4 server of the Thinking-2507 FP8 ctx8k_out1k capture
+# (20260803_1_qwen3_235b_fp8_tp4_ep4_alignment_ctx8k_out1k_c64), the layout
+# whose KV budget a server measured. attn_gpu_memory_gb is that server's
+# `Available KV cache memory: 64.99 GiB` per rank, in decimal GB.
+deployment: unified
+pools:
+  main:
+    groups:
+      - replicas: ${replicas}
+        arch:
+          preset: qwen3_vllm_moe_dp_attn_ep_ffn
+        worker:
+          type: hp_unified
+          max_batch_tokens: 8192
+          attn_gpu_memory_gb: 69.78
+sweep:
+  replicas: [1, 2]

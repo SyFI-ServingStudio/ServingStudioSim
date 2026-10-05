@@ -25,11 +25,11 @@ DOC = KernelDoc(
         " call. The post step mixes the finished block's output x into the "
         "residual streams with the previous post and comb weights; the pre step"
         " then derives new mixing weights from the updated streams and forms "
-        "the next block's RMS-normalized input. The measurement uses 4 bf16 "
-        "streams of 4,096 features and random activations. The deepgemm_mega "
-        "backend does the same per-token work in one persistent DeepGEMM "
-        "launch, but collapses the streams with the pre mix carried from the "
-        'previous block ("shifted") and returns this call\'s pre mix for the '
+        "the next block's RMS-normalized input. TileLang compiles the call for "
+        "each hidden_size and hc_mult; the measurement uses random activations. "
+        "The deepgemm_mega backend does the same per-token work in one persistent "
+        "DeepGEMM launch, but collapses the streams with the pre mix carried from "
+        'the previous block ("shifted") and returns this call\'s pre mix for the '
         "next block."
     ),
     category="Normalization",
@@ -46,13 +46,10 @@ DOC = KernelDoc(
         "before timing."
     ),
     caveats=(
-        "vllm_tilelang is measured only at hidden_size = 4096, hc_mult = 4 in "
-        "bf16 on H200 and B200, with ε = 1e-6; another ε runs the same launches.",
-        "deepgemm_mega is measured only at hidden_size = 5120, hc_mult = 4 in "
-        "bf16 on B200, up to 2^20 tokens. DeepGEMM picks its K-split count from "
-        "num_tokens (40, 27, 20, then 16 splits), and the time steps at each "
-        "switch and at each extra wave of the 16-split launch. Its rows report "
-        "no GB/s.",
+        "The runner uses ε = 1e-6; another ε runs the same launches.",
+        "deepgemm_mega picks its K-split count from num_tokens (40, 27, 20, then "
+        "16 splits), and the time steps at each switch and at each extra wave of "
+        "the 16-split launch. Its rows report no GB/s.",
         "The previous post and comb weights come from the pre step on the same random streams.",
         "TFLOPS is not computed. GB/s counts the layer output, streams, "
         "previous mixes and weights read once and the updated streams, next "
@@ -76,7 +73,6 @@ register(
         batch_outlier_policy=BatchOutlierPolicy(),
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
-            gpus=frozenset({"NVIDIA H200", "NVIDIA B200"}),
         ),
         subprocess_env="vllm_env",
         doc=BackendDoc(
@@ -98,9 +94,11 @@ register(
         args_schema=MhcRmsNormArgs,
         metric_family=MetricFamily.COMPUTE,
         batch_outlier_policy=BatchOutlierPolicy(),
+        # vLLM's is_mega_mhc_supported(): DeepGEMM's mega_mhc on
+        # is_device_capability_family(100), the SM10x family.
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
-            gpus=frozenset({"NVIDIA B200"}),
+            sm_targets=frozenset({"sm_100f"}),
         ),
         subprocess_env="vllm_upstream_fork_env",
         doc=BackendDoc(

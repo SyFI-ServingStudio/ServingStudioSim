@@ -459,8 +459,14 @@ The read-only protocol is:
   architecture/GPU provenance, lifecycle, and detail hrefs.
 - `GET /api/analyzer/v1/predictions/{prediction_id}/subjects/cases/payload?offset=&limit=` pages the
   snapshotted case inputs together with their exact operation summaries.
+- `GET /api/analyzer/v1/predictions/{prediction_id}/subjects/{subject}/{report,payload}` returns any
+  other subject's report or payload as `analyze run` wrote it into the
+  prediction's directory, named by the subject registry: `available: false`
+  for a subject that does not apply to a prediction, 404 for one that did not run.
 - `GET /api/analyzer/v1/predictions/{prediction_id}/cases/{case_id}/operations/{operation_id}/subjects/cost-tree/payload`
-  reconstructs one exact tree.
+  reconstructs one exact tree, with `time_share`: the operation's critical-path
+  composition (`kernel_time_ms`, `segments`, `kinds`), attributed as
+  `kernel-time-share` attributes each row.
 - Kernel-throughput and exact-iteration optimality routes hang below the same
   selected case/operation identity. Prediction-level kernel-input-distribution
   remains a bounded Analyzer subject.
@@ -511,6 +517,9 @@ logs roots. The service reloads it for discovery, scans only active workspaces,
 and publishes `workspace_id` on every run/sweep catalog entry and payload.
 Opaque `run_id` and `sweep_id` are therefore interpreted only together with
 their workspace id; clients must not resolve an id against another workspace.
+Static `--logs-root` roots are named `w_root_0`, `w_root_1`, ... in flag order,
+the same `w_*` form a registry id must take, so a client addresses either kind
+of workspace the same way.
 
 A managed Launcher run writes `experiment.meta.json` at the experiment root:
 
@@ -571,6 +580,9 @@ peer to runs, sweeps, and timing predictions. The read-only protocol is:
   declared image. The plot path accepts exactly one normal component and only a name
   the resource declares, so traversal and undeclared files are impossible.
 - `GET /api/analyzer/v1/hardware/gpus?name=<gpu_name>` resolves the GPU spec catalog.
+- `GET /api/analyzer/v1/kernel-kinds` serves each kernel kind's `title` and `category`
+  from its DOC (`profiling.db.doc.kind_vocabulary`) and the categories in order. The UI
+  names and groups kernels by it and keeps no kind table of its own.
 
 The Python profiling artifact path owns the metadata and never depends on a
 conversation backend (direct development runs also write resource identity).
@@ -596,8 +608,9 @@ without fabricating an observed GPU.
 
 `gpu/spec.json` is the only source, matched by exact case-insensitive `name` /
 `aliases` — no fuzzy lookup, no web fallback, and unknown GPUs are explicitly
-`unmatched`/`unavailable`, never defaulted to a SKU. It is NOT on the timing
-path. Bandwidths are bytes/s and `interconnect_bandwidth_gbps` is
+`unmatched`/`unavailable`, never defaulted to a SKU. Only its
+`compute_capability` reaches the timing path (capability-keyed rules such as
+vLLM's FlashInfer all-reduce budget); kernel times come from `profile.db`. Bandwidths are bytes/s and `interconnect_bandwidth_gbps` is
 BIDIRECTIONAL; the derived one-way rate is exactly half. TFLOPS are DENSE (no
 2:4 sparsity). H200 BF16 resolves to dense 990 TFLOP/s, HBM 4800 GB/s, NVLink
 4.0 900 GB/s bidirectional and 450 GB/s one-way.

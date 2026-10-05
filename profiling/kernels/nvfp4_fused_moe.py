@@ -152,9 +152,11 @@ register(
     KernelProfilerSpec(
         kernel_kind=KIND,
         backend="flashinfer_trtllm_sm100",
+        # TRT-LLM-gen cubins target the SM10x family, where vLLM enables this kernel
+        # (TrtLlmNvFp4ExpertsBase: is_device_capability_family(100)).
         supports=BackendSupport(
             compute=frozenset({DType.NVFP4_E2M1}),
-            gpus=frozenset({"NVIDIA B200"}),
+            sm_targets=frozenset({"sm_100f"}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.moe.nvfp4_fused_moe",
@@ -179,9 +181,10 @@ register(
     KernelProfilerSpec(
         kernel_kind=KIND,
         backend="flashinfer_trtllm_sm100_deferred_finalize",
+        # Same SM10x TRT-LLM-gen cubins as flashinfer_trtllm_sm100.
         supports=BackendSupport(
             compute=frozenset({DType.NVFP4_E2M1}),
-            gpus=frozenset({"NVIDIA B200"}),
+            sm_targets=frozenset({"sm_100f"}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.moe.nvfp4_fused_moe",
@@ -206,9 +209,11 @@ register(
     KernelProfilerSpec(
         kernel_kind=KIND,
         backend="flashinfer_trtllm_fp8_block_sm100",
+        # TRT-LLM-gen cubins target the SM10x family, where vLLM enables this kernel
+        # (TrtLlmFp8ExpertsBase: is_device_capability_family(100)).
         supports=BackendSupport(
             compute=frozenset({DType.FP8_E4M3}),
-            gpus=frozenset({"NVIDIA B200"}),
+            sm_targets=frozenset({"sm_100f"}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.moe.fp8_block_fused_moe",
@@ -233,9 +238,11 @@ register(
     KernelProfilerSpec(
         kernel_kind=KIND,
         backend="flashinfer_trtllm_sm100_mxfp4",
+        # TRT-LLM-gen cubins target the SM10x family, where vLLM enables this kernel
+        # (TrtLlmMxfp4ExpertsBase: is_device_capability_family(100)).
         supports=BackendSupport(
             compute=frozenset({DType.MXFP4_E2M1}),
-            gpus=frozenset({"NVIDIA B200"}),
+            sm_targets=frozenset({"sm_100f"}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.moe.mxfp4_fused_moe",

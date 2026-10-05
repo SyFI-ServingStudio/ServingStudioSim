@@ -31,21 +31,26 @@ def test_logical_bytes_include_fp32_output() -> None:
 
 
 @pytest.mark.parametrize(
-    "arguments",
+    ("arguments", "error"),
     [
-        (8, 128, 4096, "bf16"),
-        (8, 512, 2048, "bf16"),
-        (8, 512, 4096, "fp16"),
-        (8, 288, 4096, "fp32"),
-        (8, 32, 4096, "bf16"),
-        # k and n are validated as a production pair, not as independent sets.
-        (8, 288, 5120, "bf16"),
-        (8, 384, 4096, "bf16"),
+        ((8, 512, 4096, "fp16"), ProfilerNotImplemented),
+        ((0, 512, 4096, "bf16"), ValueError),
+        ((8, 0, 4096, "bf16"), ValueError),
+        ((8, 512, -1, "fp32"), ValueError),
     ],
 )
-def test_rejects_non_production_identity(arguments: tuple[object, ...]) -> None:
-    with pytest.raises(ProfilerNotImplemented):
+def test_rejects_unbuilt_dtype_and_empty_shapes(arguments: tuple[object, ...], error) -> None:
+    with pytest.raises(error):
         _validate_args(*arguments)
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [(8, 128, 4096, "bf16"), (8, 512, 2048, "bf16"), (8, 288, 4096, "fp32"), (8, 32, 7168, "bf16")],
+)
+def test_accepts_any_positive_shape(arguments: tuple[object, ...]) -> None:
+    shape = _validate_args(*arguments)
+    assert (shape.m, shape.n, shape.k) == arguments[:3]
 
 
 def test_glm53_router_and_indexer_forms() -> None:
@@ -86,12 +91,3 @@ def test_fp32_prepare_needs_highest_precision_and_caches_a_contiguous_weight() -
     launch = _prepare(fake_torch, shape)
     assert launch.fp32_input
     assert (launch.input_tensor, launch.weight_transposed) == ("input", "weight.T.contiguous()")
-
-
-@pytest.mark.parametrize("n", [384, 512, 1024])
-def test_k5120_router_and_compressor_widths_carry_k(n: int) -> None:
-    """The k=5120 router (384) and compressors (512/1024); a fixed k would mis-time them."""
-    shape = _validate_args(48, n, 5120, "bf16")
-
-    assert (shape.k, shape.n) == (5120, n)
-    assert _logical_bytes(shape) == 2 * 48 * 5120 + 2 * n * 5120 + 4 * 48 * n

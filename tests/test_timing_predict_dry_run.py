@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -21,6 +22,9 @@ def launcher(monkeypatch):
 
     def run_sync(spec):
         calls.processes.append(spec)
+        if calls.exit_code == 0:
+            report = spec.argv[spec.argv.index("--report-json") + 1]
+            Path(report).write_text(json.dumps({"kernels": [], "missing": 0, "total": 0}))
         return SimpleNamespace(
             output="timing-predict dry run: 1 case(s) valid\n",
             succeeded=calls.exit_code == 0,
@@ -55,7 +59,8 @@ def test_dry_run_asks_the_binary_to_validate_and_writes_nothing(tmp_path, launch
     assert timing_predict.main(["--dry-run", str(config)]) == 0
 
     [spec] = launcher.processes
-    assert spec.argv[1:] == ["timing-predict", "--dry-run", str(config)]
+    assert spec.argv[1:4] == ["timing-predict", "--dry-run", str(config)]
+    assert spec.argv[4::2] == ["--report-json", "--error-json"]
     assert spec.env["RUST_LOG"] == "warn"
     assert launcher.builds == [False]
     assert launcher.jobs == []
@@ -88,9 +93,10 @@ def test_a_rejected_case_fails_the_dry_run(tmp_path, launcher):
 
 
 def test_a_yaml_config_reads_booleans_as_the_binary_does(tmp_path):
-    """The registry records the launcher's copy of a predict config as the
-    run's source, so it must read what the binary's serde_yaml reads: `off`
-    is the string an enum param names, and only true and false are booleans."""
+    """A config with `hf://` references reaches the binary as the launcher's
+    resolved JSON copy, so the launcher must read what the binary's serde_yaml
+    reads: `off` is the string an enum param names, and only true and false
+    are booleans."""
 
     config = tmp_path / "predict.yaml"
     fields = ["mtp_mode: off", "tag: yes", "fp8: false", "x: True"]

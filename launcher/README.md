@@ -226,7 +226,6 @@ workload:                        # run-global workload params
   trace_files: ["trace/smoke.csv"]
   input_file_format: text-generation-independent
   arrival_mode: trace_timed
-  session_dependency: independent
 io:                              # run-global output + logging
   log_dir: "logs/tp{tensor_parallel}"   # {name} drops a sweep value into the path
 pools:
@@ -378,7 +377,6 @@ workload:
     - trace/aime_long.csv
   input_file_format: text-generation-independent
   arrival_mode: trace_timed
-  session_dependency: independent
   duration_ms: 20000.0
   run_to_end: true
   request_rate: 12.0
@@ -577,13 +575,6 @@ only in non-kernel params (request rate, replicas, `log_dir`, …) collapse to o
 prebuild. `--cache-report` runs the binary's `dry-run` per key to show coverage
 without building anything.
 
-A prebuild that profiled also registers the kernel configs that asked for the
-new rows (`build-cache-only --kernel-configs-out`, then
-`kernel_configs.register_file`) in profile.db's kernel-config registry
-(`profiling/README.md`, DB shape). A timing-predict run does the same. A failed
-registration is reported and does not fail the run: the rows are already in
-profile.db, and `--register-kernel-configs` can register their configs later.
-
 ### `energy:` — measure NVML energy, or refuse rows that lack it
 
 ```yaml
@@ -669,13 +660,13 @@ silently mixing incompatible sweep geometries.
 ```
 python -m launcher <preset.yaml|json> [<preset2.yaml|json> ...]
                    [--override path=value ...]
-                   [--dry-run] [--cache-report] [--register-kernel-configs] [--refresh]
+                   [--dry-run] [--cache-report] [--refresh]
                    [--build-type <cargo-profile>] [--profile [--profile-freq HZ]]
+                   [--energy | --no-energy]
                    [--no-analyze] [--no-plot] [--emit-backends [FILE]]
-python -m launcher --register-supported-kernel-configs [--build-type <cargo-profile>]
 python -m launcher timing-predict <config.yaml|json> [<config2.yaml|json> ...]
-                   [--build-type <cargo-profile>] [--no-analyze]
-                   [--dry-run | --register-kernel-configs]
+                   [--build-type <cargo-profile>]
+                   [--no-analyze | --analyzer-essential-only] [--no-plot] [--dry-run]
 python -m launcher kernel-profile {list,query,count-missing,run,measure,merge-db,audit-provenance} ...
 python -m launcher list-params [--human] [--build-type ...]
 python -m launcher alignment sim <simulation.yaml|json> [simulation options]
@@ -697,13 +688,6 @@ python -m launcher migrate-artifact-kinds (--check|--apply) [--registry PATH]
   when possible, else kept as a bare string.
 - `--dry-run` validates + expands + prints the resolved configs; spawns nothing.
 - `--cache-report` reports profile.db coverage per unique cache key, then exits.
-- `--register-kernel-configs` registers the kernel configs each unique cache key
-  asks profile.db for, with their grids, in the kernel-config registry, then
-  exits. It runs the binary's `dry-run` (no GPU); `timing-predict
-  --register-kernel-configs` does the same for predict configs, and
-  `--register-supported-kernel-configs` for every `#[supported]` arch deployment
-  (`simulator supported-cost-trees --kernel-configs`), recorded with its
-  `#[supported]` row as the source.
 - `--emit-backends [FILE]` enumerates the distinct kernels (structural, no GPU) and
   writes the annotated `backends:` skeleton (stdout, or `FILE`), then exits — the
   starting point for a `backends_file` (see the `backends` section above).

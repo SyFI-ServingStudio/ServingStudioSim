@@ -7,8 +7,6 @@ nominal FLOPs describe the semantic operation, not undocumented device traffic.
 
 from __future__ import annotations
 
-from typing import Any
-
 from profiling.db.args import DType
 from profiling.profilers.energy import Energy
 from profiling.profilers.timer import Timer
@@ -18,13 +16,6 @@ from profiling.runners.metrics import ComputeMetrics
 _EPS = 1e-5
 _KERNEL_NAME = "fused_add_rms_norm_kernel"
 _SUPPORTED_DTYPES = frozenset({DType.BF16, DType.FP16})
-_SUPPORTED_COMPUTE_GPU_PAIRS = frozenset(
-    {
-        (DType.BF16, "NVIDIA H200"),
-        (DType.FP16, "NVIDIA H200"),
-        (DType.BF16, "NVIDIA B200"),
-    }
-)
 
 
 def _validate_args(
@@ -44,16 +35,6 @@ def _validate_args(
     return m, hidden, dtype
 
 
-def _validate_cuda_device(torch: Any, dtype: DType) -> None:
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented("CUDA is required for the residual_rms_norm vllm_cuda backend")
-    gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
-    if (dtype, gpu_name) not in _SUPPORTED_COMPUTE_GPU_PAIRS:
-        raise ProfilerNotImplemented(
-            f"residual_rms_norm vllm_cuda has no verified {dtype.value}/{gpu_name} implementation"
-        )
-
-
 def profile_residual_rms_norm_vllm_cuda(
     m: int,
     hidden: int,
@@ -69,8 +50,6 @@ def profile_residual_rms_norm_vllm_cuda(
             "the instrumented vLLM environment is required for "
             "the residual_rms_norm vllm_cuda backend"
         ) from exc
-
-    _validate_cuda_device(torch, dtype)
 
     try:
         torch_dtype = dtype.torch()

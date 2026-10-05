@@ -123,7 +123,6 @@ workload:
   trace_files: [trace/requests.csv]
   input_file_format: text-generation-independent
   arrival_mode: trace_timed
-  session_dependency: independent
 io:
   log_dir: logs/<experiment>/simulation
 pools: ...

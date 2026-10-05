@@ -1,0 +1,6 @@
+checkpoint: Qwen/Qwen3-Coder-480B-A35B-Instruct
+gpu: NVIDIA H200
+arch:
+  type: qwen3_attn_tp
+  fp8: true
+  attn_tp_size: 4

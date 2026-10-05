@@ -13,6 +13,7 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
+use super::ArtifactNotFound;
 use crate::kernel_query::{run_kernel_query, simulator_binary};
 
 const MAX_GRID_POINTS: usize = 16_384;
@@ -33,11 +34,11 @@ pub(super) fn analyze_kernel_throughput(
     let tree = cost_tree_detail
         .get("tree")
         .context("cost-tree detail has no tree")?;
+    // A node id past the tree, or one naming an inner node, is not a leaf
+    // here: the caller asked for something that does not exist (404).
     let leaf = find_preorder_node(tree, leaf_id)
-        .with_context(|| format!("cost-tree node {leaf_id} is absent"))?;
-    if leaf.get("kind").and_then(Value::as_str) != Some("leaf") {
-        bail!("cost-tree node {leaf_id} is not a kernel leaf");
-    }
+        .filter(|node| node.get("kind").and_then(Value::as_str) == Some("leaf"))
+        .ok_or(ArtifactNotFound)?;
     let slot = leaf
         .get("slot")
         .and_then(Value::as_object)
@@ -214,6 +215,19 @@ fn json_coord(value: f64) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_inner_node_or_one_past_the_tree_is_not_found() {
+        let detail = json!({"tree": {"kind": "sum", "children": [{"kind": "leaf"}]}});
+        for leaf_id in [0, 2] {
+            let error = analyze_kernel_throughput(Path::new("."), detail.clone(), leaf_id)
+                .expect_err("not a leaf");
+            assert!(
+                error.downcast_ref::<ArtifactNotFound>().is_some(),
+                "{error:#}"
+            );
+        }
+    }
 
     #[test]
     fn expands_grid_in_row_major_order() {

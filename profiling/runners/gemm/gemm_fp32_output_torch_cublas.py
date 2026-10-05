@@ -1,10 +1,7 @@
-"""Profile the exact FP32-output ``torch.mm`` calls of DeepSeek V4/V4.1 and GLM-5.3.
+"""Profile the exact FP32-output ``torch.mm`` calls of DeepSeek V4 and GLM-5.3.
 
 ``bf16`` is ``torch.mm(x, weight.T, out_dtype=torch.float32)`` (DeepSeek V4
-attention closures, GLM-5.3 router n=288; at k=5120 DeepSeek-V4.1-Flash's MoE
-router ``GateLinear`` Tier 4, n=384, and its kv-source compressor
-``fused_wkv_wgate`` closure, n=1024 at compress ratio 2 and n=512 at ratio 1).
-``fp32`` is GLM-5.3's DSA indexer
+attention closures, GLM-5.3 router n=288). ``fp32`` is GLM-5.3's DSA indexer
 head weights, ``torch.mm(x.float(), w)`` over a cached contiguous ``[k, n]``
 FP32 weight; the ``x.float()`` cast is a separate launch outside this boundary.
 """
@@ -19,16 +16,8 @@ from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerN
 from profiling.runners.metrics import ComputeMetrics
 
 _BACKEND = "gemm_fp32_output:torch_cublas"
-_GPU_NAMES = frozenset({"NVIDIA H200", "NVIDIA B200"})
-# Verified production (k, n) identities per input dtype.
-_SUPPORTED_KN = {
-    DType.BF16: frozenset(
-        {(4096, n) for n in (256, 288, 512, 1024, 2048)}
-        # DeepSeek-V4.1-Flash router (384) and compressors (512, 1024).
-        | {(5120, n) for n in (384, 512, 1024)}
-    ),
-    DType.FP32: frozenset({(4096, 32)}),
-}
+# The two call forms below; torch.mm itself takes any m, n, k.
+_INPUT_DTYPES = frozenset({DType.BF16, DType.FP32})
 
 
 @dataclass(frozen=True)
@@ -50,7 +39,7 @@ class _Launch:
         if self.fp32_input:
             return self.torch.mm(self.input_tensor, self.weight_transposed)
         # Keep the allocation and argument form identical to the production
-        # closures in vllm.models.deepseek_v4.attention and GateLinear Tier 4.
+        # closures in vllm.models.deepseek_v4.attention.
         return self.torch.mm(
             self.input_tensor,
             self.weight_transposed,
@@ -64,23 +53,16 @@ def _validate_args(
     k: int,
     input_dtype: DType | str,
 ) -> _Shape:
-    if type(m) is not int or m <= 0:
-        raise ValueError("m must be a positive integer")
+    for name, value in (("m", m), ("n", n), ("k", k)):
+        if type(value) is not int or value <= 0:
+            raise ValueError(f"{name} must be a positive integer")
     dtype = DType.from_value(input_dtype)
-    supported_kn = sorted(_SUPPORTED_KN.get(dtype, ()))
-    if (k, n) not in supported_kn:
+    if dtype not in _INPUT_DTYPES:
         raise ProfilerNotImplemented(
-            f"{_BACKEND} requires (k, n) in {supported_kn} for {dtype.value}"
+            f"{_BACKEND} requires input_dtype in {sorted(d.value for d in _INPUT_DTYPES)}, "
+            f"got {dtype.value}"
         )
     return _Shape(m, n, k, dtype)
-
-
-def _require_gpu(torch: Any) -> None:
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented(f"{_BACKEND} requires CUDA")
-    gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
-    if gpu_name not in _GPU_NAMES:
-        raise ProfilerNotImplemented(f"{_BACKEND} is verified only on {_GPU_NAMES}, got {gpu_name}")
 
 
 def _prepare(torch: Any, shape: _Shape) -> _Launch:
@@ -122,7 +104,6 @@ def profile_gemm_fp32_output_torch_cublas(
         raise ProfilerNotImplemented(f"{_BACKEND} requires Torch") from exc
 
     try:
-        _require_gpu(torch)
         launch = _prepare(torch, shape)
         _check_output(torch, launch)
         # A logical call may be one NvJet kernel or an ordered split-K pair.

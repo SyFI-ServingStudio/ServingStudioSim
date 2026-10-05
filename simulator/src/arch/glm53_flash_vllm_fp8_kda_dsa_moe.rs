@@ -47,6 +47,7 @@ use crate::op::mhc::{MhcTerminalPostConfig, MhcTerminalPostInput, MhcTerminalPos
 use crate::op::Op;
 use crate::timing::bridge::DType;
 use crate::timing::expert_demand::ExpertDemand;
+use crate::timing::kernels::all_reduce_fusion::fused_all_reduce_refusal;
 use crate::timing::kernels::{
     AllReduceFusionKernel, AllReduceFusionKernelConfig, AllReduceFusionKernelInput,
     ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput,
@@ -380,6 +381,9 @@ pub fn build_configs(
     demand: &ExpertDemand,
 ) -> std::result::Result<Glm53FlashVllmConfigs, BuildError> {
     let tp = u32::from(parallel.tp_size);
+    if let Some(reason) = fused_all_reduce_refusal(ALL_REDUCE_BACKENDS, &parallel.gpu_name, tp) {
+        return Err(fit_failed(format!("tp_size {tp}: {reason}")));
+    }
     let divide = |what: &str, value: u32| -> std::result::Result<u32, BuildError> {
         if tp == 0 || value % tp != 0 {
             return Err(fit_failed(format!("{what} {value} must divide by TP {tp}")));

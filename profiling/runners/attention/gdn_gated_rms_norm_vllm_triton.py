@@ -15,7 +15,7 @@ from typing import Any
 from profiling.db.args import DType
 from profiling.profilers.energy import Energy
 from profiling.profilers.timer import Timer
-from profiling.runners.attention._gdn_common import load_required_callable, require_exact_gpu
+from profiling.runners.attention._gdn_common import load_required_callable
 from profiling.runners.attention.gdn_gated_rms_norm_torch import (
     _logical_bytes,
     _semantic_flops,
@@ -31,7 +31,6 @@ _BACKEND = "gdn_gated_rms_norm:vllm_triton"
 _CALLABLE_MODULE = "vllm.model_executor.layers.fla.ops.layernorm_guard"
 _CALLABLE_NAME = "rmsnorm_fn"
 _KERNEL_NAME = "layer_norm_fwd_kernel"
-_REQUIRED_GPU = "NVIDIA H200"
 _MAX_BF16_HIDDEN = 32768
 _GUARD_MAX_ROWS = 512
 _GUARD_MAX_ELEMENTS = 65536
@@ -98,10 +97,6 @@ def _correctness_guard_args(args: _ValidatedArgs) -> _ValidatedArgs:
     max_rows_for_elements = max(1, _GUARD_MAX_ELEMENTS // args.hidden)
     guard_m = min(args.m, _GUARD_MAX_ROWS, max_rows_for_elements)
     return _ValidatedArgs(m=guard_m, hidden=args.hidden, dtype=args.dtype)
-
-
-def _require_h200(torch: Any) -> None:
-    require_exact_gpu(torch, backend=_BACKEND, required_gpu=_REQUIRED_GPU)
 
 
 def _load_fused_callable() -> Any:
@@ -205,7 +200,7 @@ def profile_gdn_gated_rms_norm_vllm_triton(
     hidden: int,
     dtype: DType | str,
 ) -> ComputeMetrics:
-    """Profile vLLM's fused gated RMSNorm on an NVIDIA H200."""
+    """Profile vLLM's fused gated RMSNorm."""
     args = _validate_args(m=m, hidden=hidden, dtype=dtype)
     try:
         import torch
@@ -213,7 +208,6 @@ def profile_gdn_gated_rms_norm_vllm_triton(
         raise ProfilerNotImplemented(f"PyTorch is required for {_BACKEND}") from exc
 
     try:
-        _require_h200(torch)
         fused_callable = _load_fused_callable()
         device = torch.device("cuda", torch.cuda.current_device())
         operands = _build_operands(torch, args, device=device)

@@ -10,10 +10,6 @@ from profiling.runners.comm._launcher import VllmLauncher
 from profiling.runners.exceptions import KernelLaunchFailed, ProfilerNotImplemented
 from profiling.runners.metrics import RunnerResult
 
-_GPU_NAME = "NVIDIA H200"
-_SUPPORTED_NUM_GPUS = frozenset({2, 4, 8})
-_MAX_TOTAL_TOKENS = 8192
-
 
 def profile_moe_ep_all_gather_batch(kwargs_list: list[dict]) -> list[RunnerResult]:
     return _profile_batch(kwargs_list, _all_gather_per_rank_batch, _validate_all_gather)
@@ -34,7 +30,7 @@ def _profile_batch(kwargs_list: list[dict], per_rank_fn, validator) -> list[Runn
     except Exception as exc:  # noqa: BLE001 - validation maps one bad group to one batch error
         return all_error(len(kwargs_list), str(exc))
     return run_comm_batch(
-        VllmLauncher(num_gpus, required_gpu_name=_GPU_NAME),
+        VllmLauncher(num_gpus),
         per_rank_fn,
         kwargs_list,
     )
@@ -46,10 +42,10 @@ def _validate_topology(
     hidden_size: int,
     fabric: str,
 ) -> tuple[int, tuple[int, ...], int]:
-    if num_gpus not in _SUPPORTED_NUM_GPUS:
-        raise ProfilerNotImplemented(
-            f"vllm_pynccl supports num_gpus in {sorted(_SUPPORTED_NUM_GPUS)}, got {num_gpus}"
-        )
+    # PyNcclCommunicator takes any world size but disables itself at one rank,
+    # where these collectives would not run.
+    if not isinstance(num_gpus, int) or isinstance(num_gpus, bool) or num_gpus < 2:
+        raise ProfilerNotImplemented(f"vllm_pynccl needs num_gpus >= 2, got {num_gpus}")
     token_counts = tuple(per_rank_tokens)
     if len(token_counts) != num_gpus:
         raise ValueError(
@@ -59,10 +55,9 @@ def _validate_topology(
         not isinstance(count, int) or isinstance(count, bool) or count < 0 for count in token_counts
     ):
         raise ValueError("per_rank_tokens must contain non-negative integers")
-    if not 0 < sum(token_counts) <= _MAX_TOTAL_TOKENS:
-        raise ProfilerNotImplemented(
-            f"total tokens must be in 1..={_MAX_TOTAL_TOKENS}, got {sum(token_counts)}"
-        )
+    # Any total works for PyNCCL; an all-empty group has nothing to move.
+    if sum(token_counts) <= 0:
+        raise ValueError("per_rank_tokens must move at least one token")
     if not isinstance(hidden_size, int) or isinstance(hidden_size, bool) or hidden_size <= 0:
         raise ValueError("hidden_size must be a positive integer")
     if fabric != "nvlink":

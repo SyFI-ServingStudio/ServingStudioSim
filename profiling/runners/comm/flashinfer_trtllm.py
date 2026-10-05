@@ -18,16 +18,25 @@ from profiling.runners.comm._launcher import TorchMpLauncher
 from profiling.runners.exceptions import KernelLaunchFailed, ProfilerNotImplemented
 from profiling.runners.metrics import RunnerResult
 
+# The TP sizes the TRT-LLM IPC workspace runs: one node's NVLink domain. The
+# simulator's fused all-reduce archs admit exactly these (a Rust test in
+# simulator/src/timing/kernels/all_reduce_fusion.rs reads this set).
+SUPPORTED_TP_SIZES: frozenset[int] = frozenset({2, 4, 8})
+
+
+def _tp_error(num_gpus: int, what: str) -> str | None:
+    if num_gpus in SUPPORTED_TP_SIZES:
+        return None
+    sizes = "/".join(str(size) for size in sorted(SUPPORTED_TP_SIZES))
+    return f"FlashInfer TRT-LLM {what} supports TP {sizes}, got {num_gpus}"
+
 
 def profile_all_reduce_fusion_batch(kwargs_list: list[dict]) -> list[RunnerResult]:
     if not kwargs_list:
         return []
     num_gpus = int(kwargs_list[0]["num_gpus"])
-    if num_gpus not in {2, 4, 8}:
-        return all_error(
-            len(kwargs_list),
-            f"FlashInfer TRT-LLM all-reduce supports TP 2/4/8, got {num_gpus}",
-        )
+    if (error := _tp_error(num_gpus, "all-reduce")) is not None:
+        return all_error(len(kwargs_list), error)
     return run_comm_batch(
         TorchMpLauncher(num_gpus, backend="nccl"),
         _all_reduce_per_rank_batch,
@@ -149,11 +158,8 @@ def profile_all_reduce_residual_rms_norm_batch(
     if not kwargs_list:
         return []
     num_gpus = int(kwargs_list[0]["num_gpus"])
-    if num_gpus not in {2, 4, 8}:
-        return all_error(
-            len(kwargs_list),
-            f"FlashInfer TRT-LLM fused all-reduce supports TP 2/4/8, got {num_gpus}",
-        )
+    if (error := _tp_error(num_gpus, "fused all-reduce")) is not None:
+        return all_error(len(kwargs_list), error)
     return run_comm_batch(
         TorchMpLauncher(num_gpus, backend="nccl"),
         _fused_per_rank_batch,

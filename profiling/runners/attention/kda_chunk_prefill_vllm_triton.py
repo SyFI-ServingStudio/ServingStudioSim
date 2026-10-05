@@ -54,10 +54,7 @@ from profiling.profilers.timer import Timer
 from profiling.runners.attention._gdn_common import (
     exact_int as _exact_int,
 )
-from profiling.runners.attention._gdn_common import (
-    load_required_callable,
-    require_exact_gpu,
-)
+from profiling.runners.attention._gdn_common import load_required_callable
 from profiling.runners.exceptions import (
     KernelLaunchFailed,
     OOMError,
@@ -69,8 +66,9 @@ from profiling.runners.triton_autotune_pin import AutotunePin
 _BACKEND = "kda_chunk_prefill:vllm_triton"
 _MODULE = "vllm.models.glm5next.nvidia.ops.third_party.kda"
 _CALLABLE = "chunk_kda_with_fused_gate"
-_GPU = "NVIDIA B200"
-_HEAD_DIM = 128
+# Kernel limit: FLA's chunk kernels assert K <= 256 (chunk_delta_h.py
+# `chunk_gated_delta_rule_fwd_h`, and the fork's kda/kernels.py kkt helper).
+_MAX_HEAD_DIM = 256
 # FLA_CHUNK_SIZE: the callable hard-codes it. Here it only sizes the semantic
 # FLOP estimate and `num_chunks`; it never reaches the call.
 CHUNK_SIZE = 64
@@ -158,8 +156,8 @@ def validate_args(
         )
     if shape.num_heads < 1:
         raise ValueError("num_heads must be >= 1")
-    if shape.head_dim != _HEAD_DIM:
-        raise ValueError(f"{_BACKEND} requires head_dim={_HEAD_DIM}")
+    if not 1 <= shape.head_dim <= _MAX_HEAD_DIM:
+        raise ValueError(f"{_BACKEND} requires 1 <= head_dim <= {_MAX_HEAD_DIM}")
     if shape.dtype is not DType.BF16:
         raise ValueError(f"{_BACKEND} requires dtype=bf16, got {shape.dtype}")
     return shape
@@ -314,7 +312,7 @@ def profile_kda_chunk_prefill_vllm_triton(
     head_dim: int,
     dtype: DType | str,
 ) -> ComputeMetrics:
-    """Profile one GLM-5.3-Flash KDA chunked-prefill call on a B200."""
+    """Profile one GLM-5.3-Flash KDA chunked-prefill call."""
     shape = validate_args(
         num_tokens, max_sequence_length, num_decode_sequences, num_heads, head_dim, dtype
     )
@@ -323,7 +321,6 @@ def profile_kda_chunk_prefill_vllm_triton(
     except ImportError as exc:
         raise ProfilerNotImplemented(f"PyTorch is required for {_BACKEND}") from exc
     try:
-        require_exact_gpu(torch, backend=_BACKEND, required_gpu=_GPU)
         callable_ = load_required_callable(
             importlib.import_module,
             backend=_BACKEND,

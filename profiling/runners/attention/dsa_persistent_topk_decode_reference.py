@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-_SUPPORTED_TOP_K = frozenset({512, 1024, 2048})
+from profiling.runners.attention.dsa_persistent_topk_decode import VLLM_TOP_K
 
 
 def dsa_persistent_topk_decode_reference(
@@ -88,8 +88,8 @@ def _validate(
 
     if type(top_k) is not int:
         raise TypeError("top_k must be a Python int")
-    if top_k not in _SUPPORTED_TOP_K:
-        raise ValueError(f"top_k must be one of {sorted(_SUPPORTED_TOP_K)}, got {top_k}")
+    if top_k not in VLLM_TOP_K:
+        raise ValueError(f"top_k must be one of {sorted(VLLM_TOP_K)}, got {top_k}")
     if type(max_seq_len) is not int:
         raise TypeError("max_seq_len must be a Python int")
     if max_seq_len < 0:

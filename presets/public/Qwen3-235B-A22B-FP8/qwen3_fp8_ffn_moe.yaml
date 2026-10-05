@@ -1,0 +1,14 @@
+# Routing: uniform; this arch reads no capture.
+checkpoint: Qwen/Qwen3-235B-A22B-FP8
+gpu: NVIDIA H200
+arch:
+  type: qwen3_fp8_ffn_moe
+  fp8: true
+  attn_tp_size: ${attn_tp_size}
+  ep_size: ${ep_size}
+  nvl_num_gpu: ${ep_size}
+  routing: uniform
+sweep:
+  attn_tp_size: [2, 4]
+  ep_size: [4, 8]
+constraints: [ep_size == 8 or attn_tp_size == 4]

@@ -13,8 +13,6 @@ from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerN
 from profiling.runners.metrics import ComputeMetrics
 
 _BACKEND = "dsa_compressed_topk_prefill:vllm_cuda"
-_GPU_NAME = "NVIDIA H200"
-_TOP_K = 512
 
 
 @dataclass(frozen=True)
@@ -23,6 +21,7 @@ class _Operands:
     row_starts: Any
     row_ends: Any
     output: Any
+    top_k: int
 
 
 def _required_logits_row_stride(num_keys: int) -> int:
@@ -39,8 +38,10 @@ def _validate_args(
     logits_dtype: object,
     index_dtype: str,
 ) -> tuple[IndexerPrefillChunk, ...]:
-    if top_k != _TOP_K:
-        raise ProfilerNotImplemented(f"{_BACKEND} requires top_k={_TOP_K}")
+    # top_k_per_row_prefill takes top_k at runtime (it sizes the dynamic shared
+    # memory and the output rows), so any positive width launches.
+    if type(top_k) is not int or top_k <= 0:
+        raise ValueError(f"top_k must be a positive integer, got {top_k!r}")
     if (str(logits_dtype), index_dtype) != ("fp32", "int32"):
         raise ProfilerNotImplemented(f"{_BACKEND} requires FP32 logits and int32 indices")
     return build_indexer_prefill_chunks(
@@ -52,7 +53,7 @@ def _validate_args(
     )
 
 
-def _build_operands(torch: Any, chunk: IndexerPrefillChunk, device: Any) -> _Operands:
+def _build_operands(torch: Any, chunk: IndexerPrefillChunk, device: Any, top_k: int) -> _Operands:
     row_stride = _required_logits_row_stride(chunk.num_keys)
     backing = torch.empty((chunk.num_queries, row_stride), dtype=torch.float32, device=device)
     columns = torch.arange(row_stride, dtype=torch.float32, device=device)
@@ -64,7 +65,8 @@ def _build_operands(torch: Any, chunk: IndexerPrefillChunk, device: Any) -> _Ope
         backing[:, : chunk.num_keys],
         torch.tensor(chunk.row_starts, dtype=torch.int32, device=device),
         torch.tensor(chunk.row_ends, dtype=torch.int32, device=device),
-        torch.full((chunk.num_queries, _TOP_K), -1, dtype=torch.int32, device=device),
+        torch.full((chunk.num_queries, top_k), -1, dtype=torch.int32, device=device),
+        top_k,
     )
 
 
@@ -77,20 +79,21 @@ def _launch(public_op: Any, operands: _Operands) -> None:
         operands.logits.shape[0],
         operands.logits.stride(0),
         operands.logits.stride(1),
-        _TOP_K,
+        operands.top_k,
     )
 
 
 def _check_output(torch: Any, public_op: Any, operands: _Operands) -> None:
     _launch(public_op, operands)
     torch.cuda.synchronize(operands.logits.device)
+    top_k = operands.top_k
     sampled_rows = sorted({0, operands.logits.shape[0] // 2, operands.logits.shape[0] - 1})
     for row_index in sampled_rows:
         start = int(operands.row_starts[row_index].item())
         stop = int(operands.row_ends[row_index].item())
         span_length = stop - start
         actual = operands.output[row_index]
-        if span_length <= _TOP_K:
+        if span_length <= top_k:
             expected = torch.full_like(actual, -1)
             expected[:span_length] = torch.arange(
                 span_length, dtype=torch.int32, device=actual.device
@@ -101,10 +104,10 @@ def _check_output(torch: Any, public_op: Any, operands: _Operands) -> None:
         indices = actual.to(torch.int64)
         if bool(((indices < 0) | (indices >= span_length)).any().item()):
             raise KernelLaunchFailed(f"{_BACKEND} returned an out-of-span local index")
-        if indices.unique().numel() != _TOP_K:
+        if indices.unique().numel() != top_k:
             raise KernelLaunchFailed(f"{_BACKEND} returned duplicate indices")
         selected = operands.logits[row_index, start:stop].index_select(0, indices).sort().values
-        expected = operands.logits[row_index, stop - _TOP_K : stop].sort().values
+        expected = operands.logits[row_index, stop - top_k : stop].sort().values
         if not torch.equal(selected, expected):
             raise KernelLaunchFailed(f"{_BACKEND} selected the wrong value set")
 
@@ -135,14 +138,10 @@ def profile_dsa_compressed_topk_prefill_cuda(
     except ImportError as exc:
         raise ProfilerNotImplemented(f"{_BACKEND} requires pinned vLLM") from exc
     try:
-        if not torch.cuda.is_available():
-            raise ProfilerNotImplemented(f"{_BACKEND} requires CUDA")
+        # top_k_per_row_prefill (csrc/libtorch_stable/sampler.cu) is a generic
+        # CUDA kernel with no arch-specific path.
         device = torch.device("cuda", torch.cuda.current_device())
-        if torch.cuda.get_device_name(device) != _GPU_NAME or tuple(
-            torch.cuda.get_device_capability(device)
-        ) != (9, 0):
-            raise ProfilerNotImplemented(f"{_BACKEND} requires {_GPU_NAME} SM90")
-        operands = tuple(_build_operands(torch, chunk, device) for chunk in chunks)
+        operands = tuple(_build_operands(torch, chunk, device, top_k) for chunk in chunks)
         for chunk_operands in operands:
             _check_output(torch, ops.top_k_per_row_prefill, chunk_operands)
 
@@ -154,7 +153,7 @@ def profile_dsa_compressed_topk_prefill_cuda(
         energy_j = Energy.perf(run, per_iter_time_ms=time_ms)
         total_queries = sum(chunk.num_queries for chunk in chunks)
         valid_key_pairs = sum(chunk.valid_key_pairs for chunk in chunks)
-        logical_bytes = 4 * valid_key_pairs + 8 * total_queries + 4 * total_queries * _TOP_K
+        logical_bytes = 4 * valid_key_pairs + 8 * total_queries + 4 * total_queries * top_k
         elapsed_seconds = time_ms / 1000.0
         return ComputeMetrics(
             time_ms=float(time_ms),

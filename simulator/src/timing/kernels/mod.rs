@@ -5,6 +5,7 @@ pub mod all_reduce_fusion;
 pub mod all_reduce_residual_rms_norm;
 pub mod batched_gemm;
 pub mod bf16_fused_moe;
+mod causal_rows;
 pub mod clamped_swiglu;
 pub mod compressed_sparse_mla_decode;
 pub mod compressed_sparse_mla_prefill;
@@ -146,7 +147,7 @@ pub use dsa_sparse_mla_attention::{
 };
 pub use dsa_sparse_mla_prefill::{
     DsaSparseMlaPrefillKernel, DsaSparseMlaPrefillKernelConfig, DsaSparseMlaPrefillKernelInput,
-    DsaSparseMlaPrefillSpec,
+    DsaSparseMlaPrefillSpec, MAX_LAUNCH_QUERY_ROWS,
 };
 pub use dsa_topk_prefill::{
     DsaTopkPrefillKernel, DsaTopkPrefillKernelConfig, DsaTopkPrefillKernelInput, DsaTopkPrefillSpec,
@@ -154,7 +155,7 @@ pub use dsa_topk_prefill::{
 pub use elementwise::{
     ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput, ElementwiseSpec,
 };
-pub use engine::{Kernel, KernelConfig, KernelSpec};
+pub use engine::{Kernel, KernelConfig, KernelSpec, OffGrid};
 pub use engram_lookup::{
     EngramLookupKernel, EngramLookupKernelConfig, EngramLookupKernelInput, EngramLookupSpec,
 };

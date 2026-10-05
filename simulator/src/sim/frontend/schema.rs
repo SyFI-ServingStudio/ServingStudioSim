@@ -596,6 +596,23 @@ impl SourceIdentities {
     pub fn request_source_ids(&self) -> &[String] {
         &self.requests
     }
+
+    /// Dense request `id` in the trace's own name (its ordinal if unnamed).
+    pub fn request_source_id(&self, id: RequestId) -> String {
+        source_or_ordinal(&self.requests, id.0)
+    }
+
+    /// Dense session `id` in the trace's own name (its ordinal if unnamed).
+    pub fn session_source_id(&self, id: u32) -> String {
+        source_or_ordinal(&self.session_order, id)
+    }
+}
+
+fn source_or_ordinal(source_ids: &[String], dense: u32) -> String {
+    source_ids
+        .get(dense as usize)
+        .cloned()
+        .unwrap_or_else(|| dense.to_string())
 }
 
 pub(super) fn load_file<Definition: TraceDefinition>(

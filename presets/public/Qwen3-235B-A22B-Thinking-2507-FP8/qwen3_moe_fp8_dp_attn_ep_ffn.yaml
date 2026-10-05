@@ -1,0 +1,19 @@
+checkpoint: Qwen/Qwen3-235B-A22B-Thinking-2507-FP8
+gpu: NVIDIA H200
+arch:
+  type: qwen3_moe_fp8_dp_attn_ep_ffn
+  fp8: true
+  attn_tp_size: 4
+  ep_size: 4
+  hp_size: 1
+  nvl_num_gpu: 4
+  routing: ${routing}
+  expert_popularity_file: ${expert_popularity_file}
+compound:
+  workload:
+    ctx8k_out1k:
+      routing: popularity
+      expert_popularity_file: hf://datasets/UW-SyFI/servingstudio-workload@c3f5ecaab0bbff757c64864bf2ec24f5e1f76b5c/qwen3_235b_thinking_fp8/vllm/ctx8k_out1k/capture/20260803/popularity.json
+    uniform:
+      routing: uniform
+      expert_popularity_file: null

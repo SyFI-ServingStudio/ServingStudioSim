@@ -37,32 +37,29 @@ pub struct Mxfp4MarlinMoeGemmKernelInput {
     pub num_input_tokens: u32,
 }
 
+/// Returns the number of local experts (`E = w1.size(0)` in vLLM's
+/// `fused_marlin_moe`), one per `local_ppm` entry.
 fn validate_config(config: &Mxfp4MarlinMoeGemmKernelConfig) -> u32 {
     assert_eq!(
         config.dtype,
         DType::Bf16,
         "Marlin activation dtype must be bf16"
     );
-    assert_eq!(config.routing_top_k, 6, "DeepSeek V4 routes to six experts");
-    assert_eq!(
-        config.local_ppm.len(),
-        64,
-        "DeepSeek V4 EP4 has 64 local experts"
+    assert!(config.routing_top_k > 0, "routing_top_k must be positive");
+    assert!(
+        config.n.get() > 0 && config.k.get() > 0,
+        "Marlin n and k must be positive"
+    );
+    assert!(
+        !config.local_ppm.is_empty(),
+        "local_ppm must hold one entry per local expert"
     );
     let total_ppm: u64 = config.local_ppm.iter().map(|&value| u64::from(value)).sum();
     assert!(
         (1..=1_000_000).contains(&total_ppm),
         "local ppm mass must be valid"
     );
-    match config.fc_role {
-        Mxfp4MarlinMoeFcRole::Fc1 => {
-            assert_eq!((config.n.get(), config.k.get()), (4096, 4096));
-        }
-        Mxfp4MarlinMoeFcRole::Fc2 => {
-            assert_eq!((config.n.get(), config.k.get()), (4096, 2048));
-        }
-    }
-    64
+    u32::try_from(config.local_ppm.len()).expect("local expert count must fit u32")
 }
 
 pub(crate) fn marlin_block_size_m(
@@ -219,5 +216,26 @@ mod tests {
         assert_eq!(payload.fields()["m"], 768);
         assert_eq!(payload.fields()["input_top_k"], 1);
         assert_eq!(payload.fields()["mul_topk_weights"], true);
+    }
+
+    #[test]
+    fn local_expert_count_follows_the_shard_width() {
+        // An EP8 shard of 256 experts holds 32; block size uses E = 32.
+        let config = Mxfp4MarlinMoeGemmKernelConfig {
+            local_ppm: vec![7_812; 32],
+            ..config(Mxfp4MarlinMoeFcRole::Fc1)
+        };
+        let grid = SweepGrid::new(vec![vec![128.0]]);
+        let payload = &Mxfp4MarlinMoeGemmSpec::enumerate(&config, &grid, "vllm_marlin")[0];
+        let batches = payload.fields()["per_group_batches"].as_array().unwrap();
+        assert_eq!(batches.len(), 32);
+        assert_eq!(
+            payload.fields()["block_size_m"],
+            marlin_block_size_m(128, 6, 32)
+        );
+        let grid = Mxfp4MarlinMoeGemmSpec::sweep_grid(&config);
+        let axis = &grid.axes()[0];
+        // 0.9 * 32 * 8 / 6 = 38.4: the 8 -> 16 transition sits at 39 tokens.
+        assert!(axis.contains(&38.0) && axis.contains(&39.0));
     }
 }

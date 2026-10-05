@@ -5,7 +5,6 @@ from __future__ import annotations
 import subprocess
 import sys
 from dataclasses import fields
-from types import SimpleNamespace
 
 import pytest
 
@@ -19,7 +18,6 @@ from profiling.kernels.gdn_causal_conv_decode import (
     KIND,
     GdnCausalConvDecodeArgs,
 )
-from profiling.runners.exceptions import ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
 
 _SPEC = {
@@ -79,14 +77,13 @@ def test_registration_table_kind_runner_and_support_contract() -> None:
 
     assert spec.supports.compute == frozenset({DType.BF16})
     assert spec.supports.kv is None
-    assert spec.supports.gpus is None
     assert spec.supports.allows(DType.BF16, gpu="NVIDIA H200")
     assert spec.supports.allows(DType.BF16, gpu="NVIDIA B200")
     assert not spec.supports.allows(DType.FP16, gpu="NVIDIA H200")
     assert not spec.supports.allows(DType.FP32, gpu="NVIDIA H200")
 
 
-def test_vllm_triton_registration_reuses_schema_table_and_is_h200_b200_only() -> None:
+def test_vllm_triton_registration_reuses_schema_table_and_runs_on_any_gpu() -> None:
     spec = find_kernel_profiler_spec(KIND, "vllm_triton")
 
     assert spec.kernel_kind == spec.table_name == KIND
@@ -102,9 +99,8 @@ def test_vllm_triton_registration_reuses_schema_table_and_is_h200_b200_only() ->
 
     assert spec.supports.compute == frozenset({DType.BF16})
     assert spec.supports.kv is None
-    assert spec.supports.gpus == frozenset({"NVIDIA H200", "NVIDIA B200"})
     assert spec.supports.allows(DType.BF16, gpu="NVIDIA H200")
-    assert not spec.supports.allows(DType.BF16, gpu="NVIDIA H100")
+    assert spec.supports.allows(DType.BF16, gpu="NVIDIA H100")
     assert spec.supports.allows(DType.BF16, gpu="NVIDIA B200")
     assert not spec.supports.allows(DType.FP16, gpu="NVIDIA H200")
 
@@ -387,16 +383,6 @@ def test_vllm_correctness_guard_checks_aliases_and_restores_cpu_operands() -> No
     assert torch.equal(operands.slot_indices, indices_before)
 
 
-def test_runner_reports_missing_cuda_as_typed_unsupported() -> None:
-    from profiling.runners.attention.gdn_causal_conv_decode_torch import (
-        _validate_cuda_device,
-    )
-
-    no_cuda = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False))
-    with pytest.raises(ProfilerNotImplemented, match="CUDA is required"):
-        _validate_cuda_device(no_cuda)
-
-
 def test_vllm_profile_timed_callable_is_one_fused_call(
     monkeypatch,
 ) -> None:
@@ -446,7 +432,6 @@ def test_vllm_profile_timed_callable_is_one_fused_call(
         assert per_iter_time_ms == 0.5
         return 0.25
 
-    monkeypatch.setattr(runner, "_require_supported_gpu", lambda _torch: None)
     monkeypatch.setattr(runner, "_load_fused_callable", lambda: fake_fused)
     monkeypatch.setattr(runner, "_build_operands", lambda *_args, **_kwargs: operands)
     monkeypatch.setattr(runner, "_check_correctness", fake_guard)

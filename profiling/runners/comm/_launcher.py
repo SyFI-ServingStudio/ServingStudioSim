@@ -140,12 +140,10 @@ class VllmLauncher(MultiGpuLauncher):
         self,
         num_gpus: int,
         *,
-        required_gpu_name: str,
         master_addr: str = "127.0.0.1",
         master_port: int | None = None,
     ):
         super().__init__(num_gpus)
-        self.required_gpu_name = required_gpu_name
         self.master_addr = master_addr
         self.master_port = master_port or _find_free_port()
 
@@ -162,7 +160,6 @@ class VllmLauncher(MultiGpuLauncher):
                 _vllm_mp_entry,
                 args=(
                     self.num_gpus,
-                    self.required_gpu_name,
                     self.master_addr,
                     self.master_port,
                     per_rank_fn,
@@ -282,7 +279,6 @@ def _nvshmem_mp_entry(
 def _vllm_mp_entry(
     rank: int,
     world_size: int,
-    required_gpu_name: str,
     master_addr: str,
     master_port: int,
     per_rank_fn: Callable[..., Any],
@@ -304,14 +300,10 @@ def _vllm_mp_entry(
         import torch.distributed as dist
         from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
 
+        # PyNCCL wraps the NCCL library, which runs on any CUDA GPU.
         if not torch.cuda.is_available():
             raise ProfilerNotImplemented("CUDA is required for vLLM PyNCCL")
         torch.cuda.set_device(rank)
-        gpu_name = str(torch.cuda.get_device_name(rank))
-        if gpu_name != required_gpu_name:
-            raise ProfilerNotImplemented(
-                f"vLLM PyNCCL is verified only on {required_gpu_name}, got {gpu_name}"
-            )
 
         dist.init_process_group("gloo", rank=rank, world_size=world_size)
         communicator = PyNcclCommunicator(dist.group.WORLD, torch.device(f"cuda:{rank}"))

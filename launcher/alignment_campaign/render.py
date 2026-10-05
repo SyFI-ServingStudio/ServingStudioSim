@@ -57,6 +57,7 @@ import yaml
 
 from alignment.load_generator.config import IndependentFrontendConfig, routes_backend
 
+from ..corpus import ROUTING_FILES
 from .pack import Case, HostProfile, Pack, PackError, TraceSpec, Variant
 
 #: Trace file names inside a rendered case directory. Fixed rather than derived
@@ -447,7 +448,6 @@ def simulation_document(
         workload["max_concurrency"] = case.max_concurrency
     if case.rate is not None:
         workload["request_rate"] = case.rate.value
-    workload["session_dependency"] = "independent"
     workload["run_to_end"] = True
 
     arch = dict(variant.arch)
@@ -460,7 +460,7 @@ def simulation_document(
     # must reach the simulator as paths it can resolve from the repository root.
     # A corpus manifest is resolved relative to the process, so leaving it
     # pack-relative fails the build after the capture has already run.
-    for key in ("expert_popularity_file", "token_corpus_file"):
+    for key in ROUTING_FILES.values():
         reference = arch.get(key)
         if isinstance(reference, str) and reference and not reference.startswith("hf://"):
             arch[key] = _preset_path(pack.root / reference, repo_root)

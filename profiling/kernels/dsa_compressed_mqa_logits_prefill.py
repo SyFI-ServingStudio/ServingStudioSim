@@ -73,8 +73,6 @@ DOC = KernelDoc(
     caveats=(
         "Queries and keys are deterministic FP8 values; projection, "
         "quantization and key gathering are not included.",
-        "Only compress_ratio 4, 64 heads of 128 elements and a 512 MiB logits "
-        "buffer on H200 are measured.",
         "GB/s counts logical bytes for the valid query-key pairs, not physical "
         "memory transactions.",
     ),
@@ -97,7 +95,7 @@ register(
         supports=BackendSupport(
             compute=frozenset({DType.FP8_E4M3}),
             kv=frozenset({DType.FP8_E4M3}),
-            gpus=frozenset({"NVIDIA H200"}),
+            sm_targets=frozenset({"sm_90a", "sm_100f", "sm_120f"}),
         ),
         subprocess_env="vllm_env",
         doc=BackendDoc(

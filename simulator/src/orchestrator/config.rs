@@ -42,6 +42,20 @@ pub struct PoolSpec<Arch, Worker> {
     pub groups: Vec<GroupSpec<Arch, Worker>>,
 }
 
+/// `replicas: 0` describes a pool with no worker, which the flow builders
+/// reject by panicking; refuse it as a config error when the file is read.
+fn at_least_one_replica<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<u16, D::Error> {
+    let replicas = u16::deserialize(deserializer)?;
+    if replicas == 0 {
+        return Err(serde::de::Error::custom(
+            "replicas must be at least 1: a group with no replica serves nothing",
+        ));
+    }
+    Ok(replicas)
+}
+
 /// One homogeneous group: a GPU type, a replica count (= DP fan-out), and the
 /// arch (L4) + worker (L5) providers — both tagged enums constrained to the
 /// pool's contract class.
@@ -51,8 +65,9 @@ pub struct GroupSpec<Arch, Worker> {
     /// GPU type this group runs on (profile.db key).
     #[param(cache_key)]
     pub gpu: String,
-    /// Data-parallel replica count for this group.
+    /// Data-parallel replica count for this group, at least 1.
     #[param(default = 1)]
+    #[serde(deserialize_with = "at_least_one_replica")]
     pub replicas: u16,
     #[param(skip)]
     pub arch: Arch,

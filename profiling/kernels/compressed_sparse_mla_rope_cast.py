@@ -148,10 +148,17 @@ DOC = KernelDoc(
 )
 
 
-_SUPPORT = BackendSupport(
+# No capability rule: the Torch reference runs on any CUDA device.
+_TORCH_SUPPORT = BackendSupport(
     compute=frozenset({DType.BF16}),
     kv=frozenset({DType.FP8_E4M3}),
-    gpus=frozenset({"NVIDIA B200"}),
+)
+# FlashMLA's mega-attention kernel has only an SM100 build; vLLM gates the
+# layer on is_device_capability_family(100) (flash_mla_mega_attn.py).
+_MEGA_SUPPORT = BackendSupport(
+    compute=frozenset({DType.BF16}),
+    kv=frozenset({DType.FP8_E4M3}),
+    sm_targets=frozenset({"sm_100f"}),
 )
 
 register(
@@ -166,7 +173,7 @@ register(
         args_schema=CompressedSparseMlaRopeCastArgs,
         metric_family=MetricFamily.COMPUTE,
         batch_outlier_policy=BatchOutlierPolicy(),
-        supports=_SUPPORT,
+        supports=_TORCH_SUPPORT,
         doc=BackendDoc(
             summary=(
                 "Unfused PyTorch composite of the same math (cache decode, RoPE, "
@@ -189,7 +196,7 @@ register(
         args_schema=CompressedSparseMlaRopeCastArgs,
         metric_family=MetricFamily.COMPUTE,
         batch_outlier_policy=BatchOutlierPolicy(),
-        supports=_SUPPORT,
+        supports=_MEGA_SUPPORT,
         subprocess_env="vllm_upstream_fork_env",
         doc=BackendDoc(
             summary=(

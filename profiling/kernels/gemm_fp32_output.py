@@ -51,9 +51,6 @@ DOC = KernelDoc(
         "the time the GPU is busy."
     ),
     caveats=(
-        "torch_cublas accepts only k = 4096, with n in {256, 288, 512, 1024, 2048}"
-        " for bf16 and n = 32 for fp32, plus k = 5120 with n in {384, 512, 1024}"
-        " for bf16, on H200 and B200.",
         "The fp32 form runs at float32 matmul precision highest; the cast of "
         "the activation to fp32 is a separate launch, not timed here.",
         "Outside its dedicated shapes, sglang_router_auto calls linear_bf16_fp32, "
@@ -77,9 +74,9 @@ register(
         args_schema=GemmFp32OutputArgs,
         metric_family=MetricFamily.COMPUTE,
         batch_outlier_policy=BatchOutlierPolicy(),
+        # No capability rule: torch.mm/cuBLAS runs on any CUDA GPU.
         supports=BackendSupport(
             compute=frozenset({DType.BF16, DType.FP32}),
-            gpus=frozenset({"NVIDIA H200", "NVIDIA B200"}),
         ),
         subprocess_env="vllm_env",
         doc=BackendDoc(
@@ -107,7 +104,6 @@ register(
         batch_outlier_policy=BatchOutlierPolicy(),
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
-            gpus=frozenset({"NVIDIA B200"}),
         ),
         subprocess_env="sglang_env",
         doc=BackendDoc(

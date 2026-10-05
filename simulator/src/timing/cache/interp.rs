@@ -103,6 +103,9 @@ impl CoverageFlags {
     pub const EXTRAPOLATED: Self = Self(1 << 0);
     pub const JIT: Self = Self(1 << 1);
     pub const NO_COVERAGE: Self = Self(1 << 2);
+    /// Each flag's name by bit: bit `i` is `NAMES[i]`. The cost log's
+    /// `slot_coverage` column carries them, so a reader names the bits from it.
+    pub const NAMES: [&'static str; 3] = ["extrapolated", "jit", "no_coverage"];
 
     pub fn is_empty(self) -> bool {
         self.0 == 0
@@ -254,6 +257,19 @@ pub(crate) fn locate(xs: &[f32], x: f32) -> (usize, usize, f32, bool) {
 #[cfg(test)]
 mod tests {
     use super::{CoverageFlags, LeafMetrics, Metrics4};
+
+    #[test]
+    fn each_coverage_flag_is_named_by_its_bit() {
+        let flags = [
+            CoverageFlags::EXTRAPOLATED,
+            CoverageFlags::JIT,
+            CoverageFlags::NO_COVERAGE,
+        ];
+        assert_eq!(flags.len(), CoverageFlags::NAMES.len());
+        for (bit, flag) in flags.iter().enumerate() {
+            assert_eq!(flag.bits(), 1 << bit);
+        }
+    }
 
     fn leaf(time_ms: f32, backend: u8) -> LeafMetrics {
         LeafMetrics {

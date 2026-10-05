@@ -57,12 +57,12 @@ variants:
       - '{"sparse_mla_force_mqa": true}'
     arch:
       type: glm53_vllm_nvfp4_dsa_moe_dflash2
-      model_config: model/config/glm53_nvfp4.json
+      model_config: model/config/glm52_nvfp4.json
       fp8: false
       ep_size: 4
       nvl_num_gpu: 4
       routing: corpus
-      token_corpus_file: hf://UW-SyFI/servingstudio-corpora@c09af698f8192222ee8852f8c727630789890310/glm53_nvfp4_dflash2/manifest.json
+      token_corpus_file: hf://datasets/UW-SyFI/servingstudio-workload@c3f5ecaab0bbff757c64864bf2ec24f5e1f76b5c/glm53_nvfp4/vllm_dflash2_k7/diverse_100/capture/20260922/manifest.json
       draft_tokens: 7
       draft_sliding_window: 2048
     worker:

@@ -22,38 +22,6 @@ def exact_int(name: str, value: object) -> int:
     return value
 
 
-def require_exact_gpu(
-    torch: Any,
-    *,
-    backend: str,
-    required_gpu: str,
-) -> None:
-    """Enforce the hardware boundary under which a runner was validated."""
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented(f"CUDA is required for {backend}")
-    gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
-    if gpu_name != required_gpu:
-        raise ProfilerNotImplemented(
-            f"{backend} is verified only on {required_gpu}, got {gpu_name}"
-        )
-
-
-def require_supported_gpu(
-    torch: Any,
-    *,
-    backend: str,
-    supported_gpus: frozenset[str],
-) -> None:
-    """Enforce a multi-GPU hardware boundary under which a runner was validated."""
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented(f"CUDA is required for {backend}")
-    gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
-    if gpu_name not in supported_gpus:
-        raise ProfilerNotImplemented(
-            f"{backend} is verified only on {sorted(supported_gpus)}, got {gpu_name}"
-        )
-
-
 def load_required_callable(
     import_module: Callable[[str], Any],
     *,

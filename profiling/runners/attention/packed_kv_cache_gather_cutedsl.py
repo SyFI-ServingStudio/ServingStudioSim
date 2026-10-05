@@ -4,13 +4,16 @@ import math
 from dataclasses import dataclass
 from typing import Any
 
+from profiling.kernels.kv_compress_store import FP8_DS_MLA_ROW_BYTES
 from profiling.profilers.energy import Energy
 from profiling.profilers.timer import Timer
+from profiling.runners.device import require_cutedsl
 from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
 
 _BACKEND = "packed_kv_cache_gather:vllm_cutedsl"
-_GPU_NAME = "NVIDIA H200"
+# The kernel dequantizes with cvt.rn.f16x2.e4m3x2 (vllm/cute_utils/cvt.py), PTX
+# that exists only on SM89+.
 _MODEL_IDENTITY = (1, 512, 448, 64)
 _STORAGE_IDENTITY = (
     "fp8_ds_mla",
@@ -72,8 +75,10 @@ def _validate_args(
         raise ValueError("offset must be a non-negative integer")
     if type(workspace_rows) is not int or workspace_rows < offset + max(gathered):
         raise ValueError("workspace_rows must cover offset plus the largest gather")
-    if block_size not in (2, 64):
-        raise ProfilerNotImplemented(f"{_BACKEND} supports block_size=2/64")
+    # DequantGatherKCacheKernel compiles per block_size (vLLM pages C4 at 64
+    # and C128 at 2 rows); the packed cache below is built from it.
+    if type(block_size) is not int or block_size <= 0:
+        raise ValueError(f"block_size must be a positive integer, got {block_size!r}")
     required_width = max(math.ceil(length / block_size) for length in seq_lens)
     if type(block_table_width) is not int or block_table_width < required_width:
         raise ValueError("block_table_width is too small for seq_lens")
@@ -102,18 +107,6 @@ def _validate_args(
     )
 
 
-def _require_h200_cutedsl(torch: Any, has_cutedsl: Any) -> Any:
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented(f"{_BACKEND} requires CUDA")
-    device = torch.device("cuda", torch.cuda.current_device())
-    name = str(torch.cuda.get_device_name(device))
-    if name != _GPU_NAME or tuple(torch.cuda.get_device_capability(device)) != (9, 0):
-        raise ProfilerNotImplemented(f"{_BACKEND} requires {_GPU_NAME} SM90, got {name}")
-    if not has_cutedsl():
-        raise ProfilerNotImplemented(f"{_BACKEND} requires the production Cutlass DSL path")
-    return device
-
-
 def _block_table(torch: Any, shape: _Shape, device: Any) -> tuple[Any, int]:
     blocks_per_request = tuple(math.ceil(length / shape.block_size) for length in shape.seq_lens)
     total_blocks = sum(blocks_per_request)
@@ -134,7 +127,7 @@ def _block_table(torch: Any, shape: _Shape, device: Any) -> tuple[Any, int]:
 
 
 def _block_stride(block_size: int) -> int:
-    return math.ceil(block_size * 584 / 32) * 32
+    return math.ceil(block_size * FP8_DS_MLA_ROW_BYTES / 32) * 32
 
 
 def _packed_cache(torch: Any, block_count: int, block_size: int, device: Any) -> Any:
@@ -142,8 +135,8 @@ def _packed_cache(torch: Any, block_count: int, block_size: int, device: Any) ->
     storage = torch.empty(block_count * block_stride, dtype=torch.uint8, device=device)
     cache = torch.as_strided(
         storage,
-        size=(block_count, block_size, 584),
-        stride=(block_stride, 584, 1),
+        size=(block_count, block_size, FP8_DS_MLA_ROW_BYTES),
+        stride=(block_stride, FP8_DS_MLA_ROW_BYTES, 1),
     )
     physical_rows = block_count * block_size
     values = torch.arange(physical_rows, dtype=torch.int32, device=device) % 4 * 2 + 1
@@ -221,7 +214,7 @@ def _logical_work(shape: _Shape) -> tuple[int, int]:
     gathered = sum(shape.gather_lens or shape.seq_lens)
     flops = gathered * 448
     length_bytes = len(shape.seq_lens) * 4 * (2 if shape.gather_lens is not None else 1)
-    logical_bytes = gathered * (584 + 4 + 512 * 2) + length_bytes
+    logical_bytes = gathered * (FP8_DS_MLA_ROW_BYTES + 4 + 512 * 2) + length_bytes
     return flops, logical_bytes
 
 
@@ -260,11 +253,11 @@ def profile_packed_kv_cache_gather_cutedsl(
     try:
         import torch
         from vllm.models.deepseek_v4.common.ops import dequantize_and_gather_k_cache
-        from vllm.utils.import_utils import has_cutedsl
     except ImportError as exc:
         raise ProfilerNotImplemented(f"{_BACKEND} requires pinned vLLM") from exc
     try:
-        device = _require_h200_cutedsl(torch, has_cutedsl)
+        require_cutedsl(_BACKEND)
+        device = torch.device("cuda", torch.cuda.current_device())
         operands = _prepare(torch, shape, device)
 
         def launch():

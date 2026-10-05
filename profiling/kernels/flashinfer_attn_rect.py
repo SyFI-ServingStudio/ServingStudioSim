@@ -23,8 +23,8 @@ Backends ``{fa2, fa3, trt, cudnn}`` are ServingStudioSim backend strings, not ki
 registers its own spec -> the same ``args_schema`` and table, routing to its own
 ``profile_flashinfer_attn_rect_<backend>`` entry. Unsupported combos raise
 ``ProfilerNotImplemented`` at profile time: ``cudnn+fp8``, and ``trt`` entirely
-(trtllm-gen has no ragged kernel and is B200-only — kept registered for a future
-paged/B200 path).
+(trtllm-gen has no ragged kernel and is SM10x-only — kept registered for a future
+paged SM10x path).
 
 Shape split: static Config = ``(num_qo_heads, num_kv_heads, head_dim, q_dtype,
 kv_dtype, o_dtype)``; runtime 2D sweep Input = ``(q_len, kv_len)``.
@@ -71,7 +71,7 @@ _SUPPORTS = {
     "trt": BackendSupport(
         compute=frozenset({DType.FP8_E4M3}),
         kv=frozenset({DType.FP8_E4M3}),
-        gpus=frozenset({"NVIDIA B200"}),  # trtllm-gen kernels are Blackwell-only
+        sm_targets=frozenset({"sm_100f"}),
     ),
 }
 

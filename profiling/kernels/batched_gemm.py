@@ -4,7 +4,8 @@ expansion, and a grouped attention output projection.
 Each backend freezes one production storage layout (vLLM's packed Q-absorption
 or V-up views, or the padded group-slot attention output a DeepGEMM MXFP8
 einsum reads) instead of presenting its constants as generic batched GEMM
-behavior; the runners accept only the measured widths.
+behavior. Any per-rank head count launches, except that the padded V-up layout
+holds at most 64 heads.
 """
 
 from __future__ import annotations
@@ -78,12 +79,13 @@ DOC = KernelDoc(
     caveats=(
         "GB/s counts the logical operand elements, not the gaps in the packed "
         "storage the strided views skip.",
-        "Only k = 192 or 256, n = 512 for query absorption and k = 512, n = 256 "
-        "for value expansion are measured, at 8, 16, 32 or 64 heads.",
-        "The grouped output projection is measured only at k = 4096, n = 1024 and "
-        "1 to 8 groups, on B200. Its activation is the FP8 attention output with "
-        "UE8M0 scales, stored in 8 padded group slots of which the call reads the "
-        "first num_batches. Its GB/s counts one byte per input element plus one "
+        "Each backend fixes k and n to its layout: k = 192 or 256, n = 512 for "
+        "query absorption and k = 512, n = 256 for value expansion.",
+        "torch_mla_v_up reads an attention output padded to 64 heads, so it takes "
+        "at most 64 heads.",
+        "The grouped output projection's activation is the FP8 attention output "
+        "with UE8M0 scales, stored in 8 padded group slots of which the call reads "
+        "the first num_batches. Its GB/s counts one byte per input element plus one "
         "scale byte per 32, and two bytes per output element.",
     ),
     reference="profiling.runners.gemm.batched_gemm_reference",
@@ -96,7 +98,6 @@ register(
         backend="torch_mla_q_absorb",
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
-            gpus=frozenset({"NVIDIA H200", "NVIDIA B200"}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.gemm.batched_gemm",
@@ -119,7 +120,6 @@ register(
         backend="torch_mla_v_up",
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
-            gpus=frozenset({"NVIDIA H200", "NVIDIA B200"}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.gemm.batched_gemm",
@@ -162,7 +162,6 @@ for _backend, _function, _summary in (
             backend=_backend,
             supports=BackendSupport(
                 compute=frozenset({DType.BF16}),
-                gpus=frozenset({"NVIDIA B200"}),
             ),
             runner_ref=RunnerRef(
                 module_name="profiling.runners.gemm.batched_gemm",
@@ -183,9 +182,11 @@ register(
     KernelProfilerSpec(
         kernel_kind=KIND,
         backend="deepgemm_mxfp8_einsum_grouped_o_proj",
+        # vLLM's DeepGemmMxfp8BmmLinearKernel.is_supported():
+        # is_device_capability_family(100), the SM10x family.
         supports=BackendSupport(
             compute=frozenset({DType.MXFP8_E4M3}),
-            gpus=frozenset({"NVIDIA B200"}),
+            sm_targets=frozenset({"sm_100f"}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.gemm.deepgemm_mxfp8_einsum",

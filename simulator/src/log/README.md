@@ -89,7 +89,9 @@ observation copied at successful admission. A null hit means the request never
 reached prefix resolution; zero is a resolved cache miss. Consumers derive miss
 tokens as `declared - hit` and the hit rate from those two counts rather than
 depending on another redundant column. `fresh_prompt_tokens` separately records
-the immutable new suffix, while `prefill_processed` records work actually done.
+the immutable new suffix, while `prefill_processed` records work actually done;
+`target_output_tokens` is the output length the request asks for, and
+`num_output_tokens` what it produced.
 Once a request has produced its first output token, conservation therefore has
 the exact request-level invariant
 `prefix_cache_hit_tokens + prefill_processed = fresh_prompt_tokens + declared_prefix_tokens`.

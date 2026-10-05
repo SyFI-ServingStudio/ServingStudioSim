@@ -11,7 +11,11 @@ from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerN
 from profiling.runners.metrics import ComputeMetrics
 
 _BACKEND = "gemm_fp32_output:sglang_router_auto"
-_SUPPORTED_N = frozenset({256, 384})
+# SGLang's own router dispatch, not a measured set: the dedicated
+# dsv3_router_gemm kernel serves only n in {256, 384} (python/sglang/srt/models/
+# deepseek_v2.py, MoEGate.forward); every other shape takes linear_bf16_fp32.
+_DEDICATED_N = frozenset({256, 384})
+_DEDICATED_MIN_SM = 90
 
 
 def _device_sm(torch: Any) -> int:
@@ -45,18 +49,19 @@ def profile_gemm_fp32_output_sglang_router(
     except ImportError as exc:
         raise ProfilerNotImplemented(f"{_BACKEND} requires the SGLang environment") from exc
 
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented(f"{_BACKEND} requires CUDA")
     sm = _device_sm(torch)
-    if sm < 90:
-        raise ProfilerNotImplemented(f"{_BACKEND} requires SM90+, got sm{sm}")
 
     try:
         device = torch.device("cuda", torch.cuda.current_device())
         generator = torch.Generator(device=device).manual_seed(31)
         hidden = torch.randn((m, k), dtype=torch.bfloat16, device=device, generator=generator)
         weight = torch.randn((n, k), dtype=torch.bfloat16, device=device, generator=generator)
-        use_dedicated = m <= _max_router_gemm_tokens(sm) and k % 1024 == 0 and n in _SUPPORTED_N
+        use_dedicated = (
+            m <= _max_router_gemm_tokens(sm)
+            and k % 1024 == 0
+            and n in _DEDICATED_N
+            and sm >= _DEDICATED_MIN_SM
+        )
         if use_dedicated:
 
             def launch():

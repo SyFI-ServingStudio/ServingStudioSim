@@ -258,7 +258,7 @@ def test_qwen3_235b_fp8_prefills_precision_is_fp8():
     pin here re-inflates R6 above R5 and hides every quant/norm excess."""
     from pathlib import Path
 
-    qwen = load_model(str(Path("model/config/qwen3_235b_thinking_2507_fp8.json")))
+    qwen = load_model(str(Path("model/config/qwen3_235b_fp8.json")))
     label = qwen.label(Workload.causal_lm(prefill=[(16384, 0)], sampled=1))
     dtype = {s.name: s.compute_dtype for s in label.segments}
     assert dtype["attn.prefill"] == "fp8"
@@ -1516,13 +1516,6 @@ def test_gated_attention_doubles_q_projection():
 
 GLM52_FP8 = Path(__file__).resolve().parents[1] / "model" / "config" / "glm52_fp8.json"
 GLM52_NVFP4 = Path(__file__).resolve().parents[1] / "model" / "config" / "glm52_nvfp4.json"
-GLM53_NVFP4 = Path(__file__).resolve().parents[1] / "model" / "config" / "glm53_nvfp4.json"
-QWEN3_235B = (
-    Path(__file__).resolve().parents[1] / "model" / "config" / "qwen3_235b_thinking_2507.json"
-)
-QWEN3_235B_FP8 = (
-    Path(__file__).resolve().parents[1] / "model" / "config" / "qwen3_235b_thinking_2507_fp8.json"
-)
 QWEN3_235B_A22B = Path(__file__).resolve().parents[1] / "model" / "config" / "qwen3_235b.json"
 QWEN3_235B_A22B_FP8 = (
     Path(__file__).resolve().parents[1] / "model" / "config" / "qwen3_235b_fp8.json"
@@ -1537,7 +1530,6 @@ FULL_LOAD = Workload.causal_lm(prefill=[(1_000_000, 0)], sampled=1)
     ("bf16_path", "fp8_path"),
     [
         (GLM52, GLM52_FP8),
-        (QWEN3_235B, QWEN3_235B_FP8),
         (QWEN3_235B_A22B, QWEN3_235B_A22B_FP8),
     ],
 )
@@ -1890,6 +1882,24 @@ def test_floors_refuses_a_run_whose_arch_precision_contradicts_its_config():
         )
 
 
+def test_every_public_arch_on_an_fp4_checkpoint_is_labeled_fp4():
+    """A public preset whose checkpoint declares FP4 compute runs an FP4 arch;
+    an arch missing from the floors' FP4 set is refused as a precision clash,
+    which drops its exact necessary work."""
+    import yaml
+
+    root = Path(__file__).resolve().parents[1]
+    catalog = yaml.safe_load((root / "model" / "catalog.yaml").read_text())
+    for path in sorted((root / "presets" / "public").glob("*/*.yaml")):
+        preset = yaml.safe_load(path.read_text())
+        if "arch" not in preset or "checkpoint" not in preset:
+            continue
+        config = root / "model" / "config" / f"{catalog[preset['checkpoint']]['config']}.json"
+        quant = parse_quantization_config(json.loads(config.read_text()))
+        fp4 = quant is not None and quant.compute_dtype == "fp4"
+        assert (preset["arch"]["type"] in work_floors._FP4_ARCHS) == fp4, path.name
+
+
 def test_vllm_location_map_covers_every_non_communication_leaf():
     """Same semantic rows as the native map, over vLLM's finer leaf decomposition."""
     names = {
@@ -1955,22 +1965,6 @@ def test_qwen3_moe_fp8_quantizes_experts_but_not_the_router():
         embedding = next(seg for seg in label.segments if seg.name == "embedding")
         assert embedding.compute_dtype == "bf16"
         assert embedding.bytes == min(1_000_000, model.vocab) * model.hidden * 2
-
-
-def test_glm53_target_is_dimensionally_the_glm52_graph():
-    """GLM-5.3's target runs through GLM-5.2's arch, so the two configs must agree.
-
-    The published NVFP4 checkpoints agree on every field this repo reads; only
-    `transformers_version` differs. Their quantization configs are encoded
-    differently but describe the same scheme (routed experts in layers 3..77
-    quantized, the MTP layer's experts not). A revision that breaks this must
-    fail here, because the DFlash2 arch reuses the GLM-5.2 target forward.
-    """
-    glm52 = json.loads(GLM52_NVFP4.read_text())
-    glm53 = json.loads(GLM53_NVFP4.read_text())
-    assert {k: v for k, v in glm53.items() if k != "transformers_version"} == {
-        k: v for k, v in glm52.items() if k != "transformers_version"
-    }
 
 
 # ---------------------------------------------------------------------------

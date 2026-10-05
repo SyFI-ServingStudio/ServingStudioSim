@@ -35,11 +35,12 @@ import itertools
 import json
 import re
 import sys
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
 from .expr import _eval, _make_evaluator
-from .loader import CONTROL_KEYS, Registry, iter_slots, log_dir_of
+from .loader import CONTROL_KEYS, Registry, Slot, iter_arch_slots, iter_slots, log_dir_of
 
 _SWEEP_LABELS_KEY = "_sweep_labels"
 _ENV_KEY = "_env"
@@ -232,13 +233,31 @@ def normalize_params(candidate: dict, registry: Registry) -> dict:
     """Coerce every present leaf to its schema type and fill defaults, walking
     the config tree. Operates on a copy; preserves launcher-internal keys."""
     out = copy.deepcopy(candidate)
-    for slot in iter_slots(registry, out, create=True):
+    _normalize_slots(iter_slots(registry, out, create=True))
+    return out
+
+
+def normalize_arch(arch: dict, registry: Registry) -> dict:
+    """`normalize_params` for one arch block outside a run config (a public
+    preset's member, a `timing-predict` arch): its contract is the one that
+    provides its `type`. Operates on a copy."""
+    contract = next(
+        (c for c, tags in registry.arch_providers.items() if arch.get("type") in tags), None
+    )
+    if contract is None:
+        raise ValueError(f"no arch contract provides {arch.get('type')!r}")
+    out = copy.deepcopy(arch)
+    _normalize_slots(iter_arch_slots(registry, contract, out))
+    return out
+
+
+def _normalize_slots(slots: Iterable[Slot]) -> None:
+    for slot in slots:
         ptype = slot.pdef["type"]
         if slot.present:
             slot.container[slot.key] = _coerce(slot.value, ptype)
         elif "default" in slot.pdef:
             slot.container[slot.key] = slot.pdef["default"]
-    return out
 
 
 # ── log_dir templating (`{name}` over the resolved sweep/derived env) ────────

@@ -63,9 +63,11 @@ register(
     KernelProfilerSpec(
         kernel_kind=KIND,
         backend="vllm_cuda",
+        # vLLM's NVFP4 quant entry accepts SM100-SM129 (nvfp4_quant_entry.cu,
+        # nvfp4_quant_sm_supported); FP4 conversion has no SM90 path.
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
-            gpus=frozenset({"NVIDIA B200"}),
+            min_compute_capability=(10, 0),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.elementwise.nvfp4_quant",
@@ -87,9 +89,10 @@ register(
     KernelProfilerSpec(
         kernel_kind=KIND,
         backend="flashinfer_cutedsl",
+        # FlashInfer's CuTe DSL nvfp4_quantize requires SM100+.
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
-            gpus=frozenset({"NVIDIA B200"}),
+            min_compute_capability=(10, 0),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.elementwise.nvfp4_quant",

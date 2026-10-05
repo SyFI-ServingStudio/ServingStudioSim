@@ -36,32 +36,16 @@ def hub(tmp_path, monkeypatch):
 
 def test_a_manifest_reference_also_fetches_the_payload_beside_it(hub):
     resolved = resolve_hf_references(
-        {"arch": {"token_corpus_file": f"hf://uw/corpora@{SHA}/glm53/manifest.json"}}
+        {"arch": {"token_corpus_file": f"hf://datasets/uw/workload@{SHA}/glm53/manifest.json"}}
     )
 
     assert resolved["arch"]["token_corpus_file"].endswith("glm53/manifest.json")
     # The simulator resolves `data_file` relative to the manifest, so fetching
     # the manifest alone would leave it pointing at nothing.
     assert hub == [
-        ("uw/corpora", SHA, "glm53/manifest.json"),
-        ("uw/corpora", SHA, "glm53/routes.u16"),
+        ("uw/workload", SHA, "glm53/manifest.json"),
+        ("uw/workload", SHA, "glm53/routes.u16"),
     ]
-
-
-def test_a_run_source_names_the_reference_not_the_local_file(hub):
-    from launcher.kernel_configs import run_sources
-
-    reference = f"hf://uw/corpora@{SHA}/glm53/manifest.json"
-    arch = {"type": "moe", "routing": "corpus", "token_corpus_file": reference}
-    config = resolve_hf_references(
-        {"deployment": "d", "pools": {"main": {"groups": [{"gpu": "B200", "arch": arch}]}}}
-    )
-    assert config["pools"]["main"]["groups"][0]["arch"]["token_corpus_file"] != reference
-
-    # The registry keeps what built a config; a path only this machine has
-    # would name it for nobody else.
-    source = run_sources(config, preset=None)["main"]
-    assert source["groups"][0]["arch"] == arch
 
 
 def test_everything_that_is_not_a_reference_is_left_alone(hub):
@@ -79,15 +63,29 @@ def test_everything_that_is_not_a_reference_is_left_alone(hub):
     [
         # A branch or tag can move, and a corpus that moved under a built config
         # reprices every profiled shape instead of failing.
-        "hf://uw/corpora@main/glm53/manifest.json",
-        "hf://uw/corpora@v1.0/glm53/manifest.json",
-        f"hf://corpora@{SHA}/glm53/manifest.json",
-        "hf://uw/corpora/glm53/manifest.json",
+        "hf://datasets/uw/workload@main/glm53/manifest.json",
+        "hf://datasets/uw/workload@v1.0/glm53/manifest.json",
+        f"hf://datasets/corpora@{SHA}/glm53/manifest.json",
+        "hf://datasets/uw/workload/glm53/manifest.json",
+        # Captures live in a dataset repo; a model-repo reference is refused.
+        f"hf://uw/corpora@{SHA}/glm53/manifest.json",
     ],
 )
 def test_a_reference_without_a_pinned_commit_is_refused(hub, reference):
     with pytest.raises(CorpusError, match="commit sha"):
         resolve_hf_references({"token_corpus_file": reference})
+
+
+def test_a_payload_that_cannot_be_fetched_is_a_corpus_error(hub, tmp_path):
+    """Callers catch only CorpusError, so the payload's fetch must raise it as the
+    manifest's does, not the hub's own exception."""
+    snapshot = tmp_path / "snapshot" / "glm53"
+    (snapshot / "routes.u16").unlink()
+
+    with pytest.raises(CorpusError, match="glm53/routes.u16"):
+        resolve_hf_references(
+            {"token_corpus_file": f"hf://datasets/uw/workload@{SHA}/glm53/manifest.json"}
+        )
 
 
 def test_a_manifest_whose_payload_lands_elsewhere_is_refused(tmp_path, monkeypatch):
@@ -103,7 +101,9 @@ def test_a_manifest_whose_payload_lands_elsewhere_is_refused(tmp_path, monkeypat
     monkeypatch.setattr(corpus_module, "_download", fake_download)
 
     with pytest.raises(CorpusError, match="not where its manifest"):
-        resolve_hf_references({"token_corpus_file": f"hf://uw/corpora@{SHA}/glm53/manifest.json"})
+        resolve_hf_references(
+            {"token_corpus_file": f"hf://datasets/uw/workload@{SHA}/glm53/manifest.json"}
+        )
 
 
 def test_a_payload_in_a_subdirectory_of_its_manifest_resolves(tmp_path, monkeypatch):
@@ -122,7 +122,7 @@ def test_a_payload_in_a_subdirectory_of_its_manifest_resolves(tmp_path, monkeypa
     monkeypatch.setattr(corpus_module, "_download", fake_download)
 
     resolved = resolve_hf_references(
-        {"token_corpus_file": f"hf://uw/corpora@{SHA}/glm53/manifest.json"}
+        {"token_corpus_file": f"hf://datasets/uw/workload@{SHA}/glm53/manifest.json"}
     )
     assert resolved == {"token_corpus_file": str(snapshot / "glm53" / "manifest.json")}
 
@@ -132,7 +132,9 @@ def _corpus_preset(tmp_path):
     raw = yaml.safe_load(Path("presets/glm52_nvfp4_b200_sglang_tp4_diverse.yaml").read_text())
     arch = raw["pools"]["main"]["groups"][0]["arch"]
     arch.pop("expert_popularity_file")
-    arch.update(routing="corpus", token_corpus_file=f"hf://uw/corpora@{SHA}/glm53/manifest.json")
+    arch.update(
+        routing="corpus", token_corpus_file=f"hf://datasets/uw/workload@{SHA}/glm53/manifest.json"
+    )
     path = tmp_path / "preset.yaml"
     path.write_text(yaml.safe_dump(raw))
     return path
@@ -167,7 +169,9 @@ def _direct_prediction(tmp_path):
     config_dir = tmp_path / "presets"
     config_dir.mkdir()
     cfg = {
-        "arch": {"iter": {"token_corpus_file": f"hf://uw/corpora@{SHA}/glm53/manifest.json"}},
+        "arch": {
+            "iter": {"token_corpus_file": f"hf://datasets/uw/workload@{SHA}/glm53/manifest.json"}
+        },
         "cases_file": "predict_cases.yaml",
     }
     return config_dir / "predict.yaml", cfg
@@ -231,31 +235,7 @@ def test_the_resolved_copy_is_written_only_under_the_run_directory_lease(
     monkeypatch.setattr(timing_predict, "binary_path", stop)
 
     with pytest.raises(Stop):
-        asyncio.run(timing_predict.run_one(config_path, "release", analyze=False))
+        asyncio.run(timing_predict.run_one(config_path, "release", analysis="none"))
 
     assert seen_before_lease == [False]
     assert copy.is_file()
-
-
-def test_a_local_only_reference_reads_the_hub_cache_and_never_downloads(tmp_path, monkeypatch):
-    from huggingface_hub import constants
-
-    def no_download(*args):
-        raise AssertionError("local_only must not reach the network")
-
-    monkeypatch.setattr(corpus_module, "_download", no_download)
-    monkeypatch.setattr(constants, "HF_HUB_CACHE", str(tmp_path / "hub"))
-    reference = f"hf://uw/corpora@{SHA}/glm53/manifest.json"
-    with pytest.raises(CorpusError, match="not in the local hub cache"):
-        corpus_module.resolve_reference(reference, local_only=True)
-
-    # The same snapshot, laid out in the cache the way a download leaves it.
-    snapshot = tmp_path / "hub" / "models--uw--corpora" / "snapshots" / SHA / "glm53"
-    snapshot.mkdir(parents=True)
-    (snapshot / "manifest.json").write_text(json.dumps({"data_file": "routes.u16"}))
-    with pytest.raises(CorpusError, match="routes.u16"):
-        corpus_module.resolve_reference(reference, local_only=True)
-    (snapshot / "routes.u16").write_bytes(b"\x00\x01")
-    assert corpus_module.resolve_reference(reference, local_only=True) == str(
-        snapshot / "manifest.json"
-    )

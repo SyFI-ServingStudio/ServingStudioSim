@@ -123,9 +123,11 @@ register(
         args_schema=EngramLookupArgs,
         metric_family=MetricFamily.COMPUTE,
         batch_outlier_policy=BatchOutlierPolicy(),
+        # The Triton kernel loads tl.float8e4nv table rows, which Triton lowers
+        # only on SM89+.
         supports=BackendSupport(
             compute=frozenset({DType.FP8_E4M3}),
-            gpus=frozenset({"NVIDIA B200"}),
+            min_compute_capability=(8, 9),
         ),
         subprocess_env="vllm_upstream_fork_env",
         doc=BackendDoc(

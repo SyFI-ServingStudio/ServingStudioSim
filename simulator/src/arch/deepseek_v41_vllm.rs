@@ -85,7 +85,7 @@ const ENGRAM_LAYERS: [u32; 2] = [1, 14];
 
 // Deployment identity (capture 2 `profile.yaml` / server log).
 /// `--max-model-len 131072`.
-const MAX_MODEL_LEN: u32 = 131_072;
+pub(crate) const MAX_MODEL_LEN: u32 = 131_072;
 /// `max_num_batched_tokens` (= `chunk_size` 2048).
 const MAX_BATCHED_TOKENS: u32 = 2048;
 /// `--block-size 128`: one KV page; an index page holds `128 / ratio` keys.

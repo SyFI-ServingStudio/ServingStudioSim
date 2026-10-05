@@ -69,8 +69,10 @@ pub(super) fn configure_logs_roots(logs_roots: Vec<PathBuf>) -> Result<Vec<Confi
             anyhow::bail!("logs root is not a directory: {}", path.display());
         }
         if seen.insert(path.clone()) {
+            // The same `w_*` form a registry id must take, so a client can
+            // address a static root as it addresses a registered workspace.
             roots.push(ConfiguredRoot {
-                workspace_id: format!("root_{}", roots.len()),
+                workspace_id: format!("w_root_{}", roots.len()),
                 path,
             });
         }

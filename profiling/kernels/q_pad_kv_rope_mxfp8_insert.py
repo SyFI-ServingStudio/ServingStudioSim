@@ -125,10 +125,12 @@ register(
         args_schema=QPadKvRopeMxfp8InsertArgs,
         metric_family=MetricFamily.COMPUTE,
         batch_outlier_policy=BatchOutlierPolicy(),
+        # The same vLLM op as qnorm_rope_kv_insert, built for every CUDA arch; its
+        # host launcher refuses below SM80 (the bf16 body compiles to a no-op there).
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
             kv=frozenset({DType.FP8_E4M3}),
-            gpus=frozenset({"NVIDIA B200"}),
+            min_compute_capability=(8, 0),
         ),
         subprocess_env="vllm_upstream_fork_env",
         doc=BackendDoc(
