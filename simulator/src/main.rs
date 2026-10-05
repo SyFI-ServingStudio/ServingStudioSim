@@ -9,6 +9,8 @@
 //!   - `list-params`               — emit the param-schema registry JSON
 //!   - `kernel-list`               — every kernel kind's config / sweep fields
 //!   - `cost-trees <blocks>`       — given arch blocks' cost trees, no sim
+//!   - `workload-plan <workload>`  — a workload's requests as a run loads them (JSON)
+//!   - `trace-formats`             — the trace formats and tags a run reads (JSON)
 //!
 //! All three run-like subcommands share one parse (`load_config`) → `RunConfig`
 //! (a serde enum tagged by `deployment`) → `deployment::build_flow` dispatch.
@@ -21,12 +23,12 @@ use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 
 use simulator::common::{RequestStore, SharedRequests};
-use simulator::deployment::{build_flow, RunConfig};
+use simulator::deployment::{build_flow, RunConfig, WorkloadSpec};
 use simulator::log::LoggerSession;
 use simulator::schema::list_params;
 use simulator::sim::{
-    run_sim, ArrivalSchedule, CapacityLimit, InputFileFormat, InputFileSchema, LoadedTrace,
-    SessionDependency, TickCfg, TraceTag,
+    run_sim, trace_formats, ArrivalSchedule, CapacityLimit, InputFileFormat, InputFileSchema,
+    LoadedTrace, SessionDependency, TickCfg, TraceFrontend, TraceTag,
 };
 use simulator::timing::bridge::{print_dry_run, write_config_records, write_dry_run_report};
 use simulator::timing::PerfApiBridge;
@@ -96,6 +98,21 @@ enum Cmd {
     /// it reports the `profile.db` specs a real run would JIT, writes nothing, and
     /// needs no GPU.
     TimingPredict(PredictArgs),
+    /// Load a workload block's trace files exactly as `run` does (format, tags,
+    /// replay settings, row checks) and print its requests as JSON: the
+    /// normalized plan, one row per request in the trace's own ids (rows of a
+    /// trace without sessions read as rounds of one placeholder session).
+    /// Reads no profile.db and builds no model.
+    WorkloadPlan(WorkloadArgs),
+    /// Print the input file formats a run reads and the tags each can add, with
+    /// their columns, as JSON.
+    TraceFormats,
+}
+
+#[derive(Args)]
+struct WorkloadArgs {
+    /// A run config's `workload` block on its own (`.yaml` / `.yml` / `.json`).
+    workload: PathBuf,
 }
 
 #[derive(Args)]
@@ -160,16 +177,44 @@ struct RunArgs {
 /// Parse a structured config file. YAML is a JSON superset, so `.json` uses the
 /// JSON parser (clearer errors) and everything else uses the YAML parser.
 fn load_config(path: &Path) -> Result<RunConfig> {
+    parse_file(path, "run config")
+}
+
+fn parse_file<T: serde::de::DeserializeOwned>(path: &Path, what: &str) -> Result<T> {
     let text = std::fs::read_to_string(path)
-        .with_context(|| format!("reading run config {}", path.display()))?;
-    let cfg = if path.extension().and_then(|e| e.to_str()) == Some("json") {
+        .with_context(|| format!("reading {what} {}", path.display()))?;
+    let value = if path.extension().and_then(|e| e.to_str()) == Some("json") {
         serde_json::from_str(&text)
-            .with_context(|| format!("parsing JSON config {}", path.display()))?
+            .with_context(|| format!("parsing JSON {what} {}", path.display()))?
     } else {
         serde_yaml::from_str(&text)
-            .with_context(|| format!("parsing YAML config {}", path.display()))?
+            .with_context(|| format!("parsing YAML {what} {}", path.display()))?
     };
-    Ok(cfg)
+    Ok(value)
+}
+
+/// Load and type-check a workload's trace into the text frontend a run replays:
+/// the declared format and tags, the replay settings, then every row. Shared by
+/// `run` and `workload-plan`, so a plan is the requests a run would release.
+fn load_frontend(workload: &WorkloadSpec) -> Result<TraceFrontend> {
+    let input_file_format = InputFileFormat::parse(&workload.input_file_format)?;
+    let input_file_tags = workload
+        .input_file_tags
+        .iter()
+        .map(|tag| TraceTag::parse(tag))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let input_file_schema = InputFileSchema::new(input_file_format, input_file_tags)?;
+    let arrival = ArrivalSchedule::parse(&workload.arrival_mode, workload.request_rate)?;
+    let capacity = CapacityLimit::parse(workload.max_concurrency.map(|n| n as usize))?;
+    let session_dependency = SessionDependency::parse(&workload.session_dependency)?;
+    LoadedTrace::load(
+        &workload.trace_files,
+        &input_file_schema,
+        arrival,
+        capacity,
+        session_dependency,
+    )?
+    .into_current_text_frontend()
 }
 
 /// Compact wall-clock log timestamp: `[MM:SS.mmm]` (UTC minute-of-hour). Drops
@@ -274,6 +319,16 @@ fn dispatch(cmd: Cmd) -> Result<()> {
             args.kernel_configs_out.as_deref(),
             args.report_json.as_deref(),
         ),
+        Cmd::WorkloadPlan(args) => {
+            let workload: WorkloadSpec = parse_file(&args.workload, "workload")?;
+            let requests = load_frontend(&workload)?.plan_rows();
+            println!("{}", serde_json::json!({ "requests": requests }));
+            Ok(())
+        }
+        Cmd::TraceFormats => {
+            println!("{}", serde_json::to_string_pretty(&trace_formats())?);
+            Ok(())
+        }
     }
 }
 
@@ -285,24 +340,7 @@ fn cmd_run(config: &Path) -> anyhow::Result<()> {
     // Parse into a concrete request family and narrow to the currently
     // supported text path before starting the bridge or building L4.
     let workload = cfg.workload();
-    let input_file_format = InputFileFormat::parse(&workload.input_file_format)?;
-    let input_file_tags = workload
-        .input_file_tags
-        .iter()
-        .map(|tag| TraceTag::parse(tag))
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    let input_file_schema = InputFileSchema::new(input_file_format, input_file_tags)?;
-    let arrival = ArrivalSchedule::parse(&workload.arrival_mode, workload.request_rate)?;
-    let capacity = CapacityLimit::parse(workload.max_concurrency.map(|n| n as usize))?;
-    let session_dependency = SessionDependency::parse(&workload.session_dependency)?;
-    let loaded_trace = LoadedTrace::load(
-        &workload.trace_files,
-        &input_file_schema,
-        arrival,
-        capacity,
-        session_dependency,
-    )?;
-    let mut frontend = loaded_trace.into_current_text_frontend()?;
+    let mut frontend = load_frontend(workload)?;
     let tick_cfg = TickCfg::new(
         workload.duration_ms,
         workload.run_to_end,

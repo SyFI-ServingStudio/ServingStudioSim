@@ -293,6 +293,41 @@ impl LoadedTrace {
     }
 }
 
+/// The input file formats a run reads, each with its columns and the tags it
+/// can add, and every tag's columns: what `simulator trace-formats` prints.
+///
+/// Only the formats of the family [`LoadedTrace::into_current_text_frontend`]
+/// admits; which tags a format takes is req-frontend's [`InputFileSchema::new`].
+pub fn trace_formats() -> serde_json::Value {
+    let tags: Vec<TraceTag> = TraceTag::CHOICES
+        .iter()
+        .map(|name| TraceTag::parse(name).expect("every advertised tag parses"))
+        .collect();
+    let formats: Vec<serde_json::Value> = InputFileFormat::CHOICES
+        .iter()
+        .map(|name| InputFileFormat::parse(name).expect("every advertised format parses"))
+        .filter(|format| format.request_family() == RequestFamily::TextGeneration)
+        .map(|format| {
+            let takes: Vec<&str> = tags
+                .iter()
+                .filter(|tag| InputFileSchema::new(format, vec![**tag]).is_ok())
+                .map(|tag| tag.name())
+                .collect();
+            serde_json::json!({
+                "name": format.name(),
+                "columns": format.columns(),
+                "sessions": format.has_session_topology(),
+                "tags": takes,
+            })
+        })
+        .collect();
+    let tags: Vec<serde_json::Value> = tags
+        .iter()
+        .map(|tag| serde_json::json!({ "name": tag.name(), "columns": tag.columns() }))
+        .collect();
+    serde_json::json!({ "formats": formats, "tags": tags })
+}
+
 fn unsupported_family<Definition>(kind: &str) -> Result<Definition> {
     bail!(
         "input file format for {kind:?} parsed as its own request family, but current \
@@ -1737,6 +1772,39 @@ mod tests {
     }
 
     // ---- declaration parsing ------------------------------------------------
+
+    #[test]
+    fn trace_formats_lists_the_text_formats_with_their_columns_and_tags() {
+        let described = trace_formats();
+        let formats = described["formats"].as_array().unwrap();
+        let names: Vec<&str> = formats
+            .iter()
+            .map(|f| f["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "text-generation-independent",
+                "text-generation-session-execution-v2"
+            ]
+        );
+        assert_eq!(
+            formats[0]["columns"],
+            serde_json::json!(["id", "arrival_time", "input_len", "output_len"])
+        );
+        // A session-execution file declares its own sessions: no `session` tag.
+        assert_eq!(
+            formats[1]["tags"],
+            serde_json::json!(["slo", "priority", "speculative"])
+        );
+        let speculative = described["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tag| tag["name"] == "speculative")
+            .unwrap();
+        assert_eq!(speculative["columns"], serde_json::json!(["accept_rate"]));
+    }
 
     #[test]
     fn rejects_unknown_declaration_names() {
