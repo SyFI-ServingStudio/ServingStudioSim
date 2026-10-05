@@ -5,9 +5,9 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 
 /// The CUDA compute capability `(major, minor)` of a GPU, looked up by its
-/// catalog name or any alias (e.g. "NVIDIA B200"), trimmed and ignoring case,
-/// first catalog entry first, as `profiling.gpu_catalog.resolve_gpu_spec`
-/// matches. `None` for a GPU the catalog does not list or a non-NVIDIA part.
+/// catalog name or any alias (e.g. "NVIDIA B200"), trimmed and ignoring ASCII
+/// case, first catalog entry first, as `profiling.gpu_catalog.resolve_gpu_spec`
+/// and the Analyzer's `hardware::resolve_gpu` match. `None` for a GPU the catalog does not list or a non-NVIDIA part.
 pub fn compute_capability(gpu_name: &str) -> Option<(u32, u32)> {
     static BY_NAME: OnceLock<HashMap<String, (u32, u32)>> = OnceLock::new();
     BY_NAME.get_or_init(load).get(&key(gpu_name)).copied()
@@ -15,7 +15,7 @@ pub fn compute_capability(gpu_name: &str) -> Option<(u32, u32)> {
 
 /// The form a GPU name is matched in.
 fn key(name: &str) -> String {
-    name.trim().to_lowercase()
+    name.trim().to_ascii_lowercase()
 }
 
 fn load() -> HashMap<String, (u32, u32)> {

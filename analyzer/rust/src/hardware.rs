@@ -1,7 +1,11 @@
-//! Read-only GPU hardware catalog resolution - the single parser of `gpu/spec.json`.
+//! Read-only GPU hardware catalog resolution - the Analyzer's one parser of
+//! `gpu/spec.json`. The catalog has two other readers, which this crate cannot
+//! share code with: `profiling.gpu_catalog` (Python) and the simulator's
+//! `common/gpu.rs` (compute capability only). All three match a name the same
+//! way: trimmed, ignoring ASCII case, against the catalog `name` or an alias.
 //!
-//! This is the crate-level home of the exact, case-insensitive `name` / `aliases`
-//! lookup that both consumers share:
+//! This is the crate-level home of that `name` / `aliases` lookup, which both
+//! Analyzer consumers share:
 //!
 //! - `ui_service/hardware.rs` - the read-only `/api/analyzer/v1/hardware/gpus` endpoint
 //!   and the curve/series hardware ceilings. Unknown dtype or GPU yields `None` /
@@ -12,9 +16,10 @@
 //!
 //! All bandwidths are bytes/s; `interconnect_bandwidth_gbps` is BIDIRECTIONAL
 //! and the derived one-way rate is exactly half. TFLOPS are DENSE (no 2:4
-//! sparsity). `gpu/spec.json` is NOT on the timing path: profile.db rows are
-//! keyed by the requested `gpu_name` string and modeled timings never read these
-//! peaks.
+//! sparsity). These peaks are NOT on the timing path: profile.db rows are keyed
+//! by the requested `gpu_name` string and modeled timings never read them. (The
+//! simulator does read one catalog field, a GPU's compute capability, to pick
+//! vLLM's capability-keyed policies such as the FlashInfer all-reduce budget.)
 
 use std::path::Path;
 
@@ -79,7 +84,7 @@ impl ResolvedGpu {
 
 /// Resolve one GPU name against `gpu/spec.json`. `None` = unmatched /
 /// unavailable (file missing, unparseable, or no exact name/alias match). This is
-/// the only place the catalog file is read or parsed.
+/// the only place the Analyzer reads or parses the catalog file.
 pub fn resolve_gpu(repo_root: &Path, name: &str) -> Option<ResolvedGpu> {
     let target = name.trim().to_ascii_lowercase();
     if target.is_empty() {
