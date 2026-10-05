@@ -1,6 +1,6 @@
 ---
 name: operate-gpu-spec
-description: Use when reading, querying, verifying, or extending the GPU spec catalog at `gpu/spec.json` — the per-GPU datacenter hardware table (mem/BW, dense TFLOPS by dtype, interconnect, nvl_domain_size, dollar_per_hour). Covers how to INTERPRET each field (TFLOPS are DENSE not sparse, interconnect BW is BIDIRECTIONAL, fp32 is CUDA-core not tensor, dollar_per_hour is the getdeploying on-demand "medium" rate, nvl_domain_size is a deployment param), how to SEARCH for a value (jq/python), how to VERIFY a value is right (sparse-doubling trap, one-way vs bidir, SXM vs PCIe vs NVL form-factor distinction, GB200 combined-for-2-GPU), what to do when a GPU/field is NOT in the table (web-search the fallback and clearly tell the user it is a searched result, not catalog-backed), and how to ADD/refresh a GPU. NOT the simulator timing path — modeled timings come from measured kernels in profile.db, not from these peaks.
+description: Use when reading, querying, verifying, or extending the GPU spec catalog at `gpu/spec.json` — the per-GPU datacenter hardware table (mem/BW, dense TFLOPS by dtype, interconnect, nvl_domain_size, dollar_per_hour). Covers how to INTERPRET each field (TFLOPS are DENSE not sparse, interconnect BW is BIDIRECTIONAL, fp32 is CUDA-core not tensor, dollar_per_hour is the getdeploying on-demand "medium" rate, nvl_domain_size is a deployment param), how to SEARCH for a value (jq/python), how to VERIFY a value is right (sparse-doubling trap, one-way vs bidir, SXM vs PCIe vs NVL form-factor distinction, GB200 combined-for-2-GPU), what to do when a GPU/field is NOT in the table (web-search the fallback and clearly tell the user it is a searched result, not catalog-backed), and how to ADD/refresh a GPU. Only `compute_capability` reaches the simulator timing path (capability-keyed rules such as the FlashInfer all-reduce budget); modeled kernel timings come from measured kernels in profile.db, not from these peaks.
 ---
 
 # The GPU spec catalog — `gpu/spec.json`
@@ -10,12 +10,16 @@ a top-level `{"gpus": [ … ]}` array, one JSON object per GPU (NVIDIA / AMD /
 Intel). It is a **reference / analysis** table — roofline sanity checks, cost
 ($/token) estimates, memory-fit checks, and picking which GPU a study targets.
 
-## Read this first: it is NOT on the timing path
+## Read this first: only `compute_capability` is on the timing path
 
-Editing a number here does **not** change any simulated run. The simulator's
-kernel timings come from **measured rows in `profiling/profile.db`**, keyed by
-the GPU **name string** a preset carries (`gpu: "NVIDIA H200"`), not from these
-peak-TFLOPS figures. So:
+Editing a peak, bandwidth, or price here does **not** change any simulated run.
+The simulator's kernel timings come from **measured rows in
+`profiling/profile.db`**, keyed by the GPU **name string** a preset carries
+(`gpu: "NVIDIA H200"`), not from these peak-TFLOPS figures. The exception is
+`compute_capability`: the simulator compiles it in (`simulator/src/common/gpu.rs`)
+and uses it for capability-keyed rules, such as vLLM's FlashInfer all-reduce
+workspace budget (which bounds the token counts that take the fused kernel), and
+the profiler uses it to gate backends. Changing it can change a run. So:
 
 - The `name` field here (e.g. `H200-SXM-141GB`) is a catalog label; the preset's
   `gpu:` string (e.g. `"NVIDIA H200"`) is a separate profile.db cache identity.
@@ -29,7 +33,7 @@ peak-TFLOPS figures. So:
 |---|---|---|
 | `name` | Catalog label incl. form factor + memory (`H100-SXM5-80GB`) | Distinct from a preset's `gpu:` string |
 | `vendor` / `architecture` / `year` | NVIDIA/AMD/Intel; uarch; launch year | — |
-| `compute_capability` | CUDA `"major.minor"` (H200 `"9.0"`, B300 `"10.3"`) | `null` off NVIDIA. Backend validation reads it (`BackendSupport` sm targets / minimum), so a wrong value rejects or admits backends |
+| `compute_capability` | CUDA `"major.minor"` (H200 `"9.0"`, B300 `"10.3"`) | `null` off NVIDIA. Backend validation reads it (`BackendSupport` sm targets / minimum), and so does the simulator for capability-keyed rules, so a wrong value rejects or admits backends and can change a run |
 | `mem_size_gb` | HBM/GDDR capacity, GB | Per **GPU** (except GB200, see below) |
 | `mem_type` | HBM2/HBM3/HBM3e/GDDR6 | — |
 | `mem_bandwidth_gbps` | Memory bandwidth, **GB/s** (bytes) | GB/s not Gb/s; H200 = 4.8 TB/s = `4800` |

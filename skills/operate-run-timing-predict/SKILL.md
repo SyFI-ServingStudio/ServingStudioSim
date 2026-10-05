@@ -62,13 +62,14 @@ uv run python -m launcher timing-predict presets/<config>.json
 
 Multiple configs may be passed in one call, for example the two AFD halves.
 Supported flags are `--build-type <build-type>` (default `release`),
-`--no-analyze`, `--analyzer-essential-only`, `--dry-run`, and `--no-gpu`. There
-is no `--override`.
+`--no-analyze`, `--analyzer-essential-only`, `--no-plot`, `--dry-run`, and
+`--no-gpu`. There is no `--override`.
 
 By default the full analysis runs: every applicable Analyzer subject, the trace,
 and the per-case iteration breakdown. `--analyzer-essential-only` runs only the
 iteration breakdown and `kernel-time-share`, in milliseconds instead of about a
-second; `--no-analyze` runs neither.
+second; `--no-analyze` runs neither. `--no-plot` keeps the full analysis but
+draws no PNGs.
 
 Run `--dry-run` first on a new config. It builds the model, checks every case
 against it, and prints one line per kernel with the `profile.db` specs a real

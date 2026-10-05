@@ -604,8 +604,9 @@ without fabricating an observed GPU.
 
 `gpu/spec.json` is the only source, matched by exact case-insensitive `name` /
 `aliases` — no fuzzy lookup, no web fallback, and unknown GPUs are explicitly
-`unmatched`/`unavailable`, never defaulted to a SKU. It is NOT on the timing
-path. Bandwidths are bytes/s and `interconnect_bandwidth_gbps` is
+`unmatched`/`unavailable`, never defaulted to a SKU. Only its
+`compute_capability` reaches the timing path (capability-keyed rules such as
+vLLM's FlashInfer all-reduce budget); kernel times come from `profile.db`. Bandwidths are bytes/s and `interconnect_bandwidth_gbps` is
 BIDIRECTIONAL; the derived one-way rate is exactly half. TFLOPS are DENSE (no
 2:4 sparsity). H200 BF16 resolves to dense 990 TFLOP/s, HBM 4800 GB/s, NVLink
 4.0 900 GB/s bidirectional and 450 GB/s one-way.

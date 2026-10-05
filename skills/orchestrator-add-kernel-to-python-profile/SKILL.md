@@ -159,9 +159,9 @@ Things to verify:
 - the backend fits the existing kind's args schema without hidden backend-only
   fields;
 - backend support constraints are explicit: compute dtype, KV/cache dtype if
-  relevant, output dtype assumptions, GPU names or architecture gates, and any
-  package-version constraints;
-- unsupported dtype/GPU/shape cases are stated;
+  relevant, output dtype assumptions, the compute capability the kernel build
+  needs (never a list of GPU names), and any package-version constraints;
+- unsupported dtype/capability/shape cases are stated;
 - the plan says how the wrapper will be smoke-tested through the public
   profiling CLI.
 
@@ -193,7 +193,7 @@ Things to verify:
 - environment selection is declared through registry metadata, not ad hoc runner
   environment mutation;
 - `BackendSupport` matches the verified support matrix: compute dtype, KV/cache
-  dtype if relevant, and GPU/architecture gates;
+  dtype if relevant, and compute-capability gates;
 - `uv run python -m profiling list --json` shows the new backend under the
   existing kind;
 - the existing generated perf API symbol still resolves for that kind;
@@ -224,6 +224,6 @@ bridge code, or L2/L3/L4 consumers. End the task with a **Python-to-Rust
 handoff** section for the later role that will add the Rust `KernelSpec` /
 bridge/cache wiring. This is not Rust implementation work; it is a short list
 of facts the Python work established: `KIND` / facade stem, backend strings,
-`KernelArgs` fields and order, metric family, dtype/GPU capability axes, a
+`KernelArgs` fields and order, metric family, dtype and compute-capability axes, a
 representative smoke spec, and shape or dtype constraints discovered while
 validating the runner.

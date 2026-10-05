@@ -175,8 +175,9 @@ artifacts.py       Immutable per-job snapshots: request/results/curve/job.meta.j
 gpu_catalog.py     Read-only gpu/spec.json resolution (exact case-insensitive
                    name/aliases → canonical SKU); used to fail a measured job
                    whose requested cache key vs observed physical GPU mismatch, and
-                   to stamp resolved canonical names into metadata. NOT on the
-                   timing path.
+                   to stamp resolved canonical names into metadata, and to
+                   resolve a GPU's compute capability for BackendSupport. Kernel
+                   times never come from it.
 
 exec/              How a runner actually runs. GpuPool/GpuChunk contracts,
   pool.py            LocalGpuPool (spawns a worker subprocess per chunk),

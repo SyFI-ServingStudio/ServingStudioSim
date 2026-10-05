@@ -11,9 +11,11 @@ requested DB cache key and the worker-observed physical GPU resolve to the same
 canonical SKU — the job fails otherwise — and (b) stamp the resolved canonical
 name into resource metadata. Backend-capability validation
 (``profiling.db.registry.BackendSupport``) also reads a GPU's CUDA compute
-capability from it. ``gpu/spec.json`` is explicitly NOT on the timing
-path: ``profile.db`` rows are keyed by the requested ``gpu_name`` string and the
-simulator never reads peak TLOPs.
+capability from it. Of the catalog, only ``compute_capability`` reaches the
+timing path: the simulator reads it too (``simulator/src/common/gpu.rs``), for
+capability-keyed rules such as vLLM's FlashInfer all-reduce workspace budget.
+Kernel times themselves come from ``profile.db`` rows keyed by the requested
+``gpu_name`` string; the simulator never reads peak TFLOPs.
 """
 
 from __future__ import annotations
