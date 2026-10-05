@@ -22,8 +22,6 @@ from profiling.runners.exceptions import (
 from profiling.runners.metrics import ComputeMetrics
 
 _BACKEND = "kv_compress_store:vllm_triton"
-# compress_norm_rope_store_triton stores tl.float8e4nv, which Triton lowers
-# only on SM89+.
 # The fp8_indexer cache row (128 fp8 + one fp32 scale) fixes the C4 indexer's
 # single 128-wide KV head with a 64-wide RoPE tail. The indexer exists only on
 # C4 layers.

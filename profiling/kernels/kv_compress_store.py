@@ -126,7 +126,8 @@ register(
         args_schema=KvCompressStoreArgs,
         metric_family=MetricFamily.COMPUTE,
         batch_outlier_policy=BatchOutlierPolicy(),
-        # FP8 e4m3 conversion needs SM89+.
+        # compress_norm_rope_store_triton stores tl.float8e4nv, which Triton lowers
+        # only on SM89+.
         supports=BackendSupport(
             compute=frozenset({DType.BF16, DType.FP32}),
             kv=frozenset({DType.FP8_E4M3}),

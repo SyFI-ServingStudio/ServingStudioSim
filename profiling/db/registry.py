@@ -97,7 +97,8 @@ class BackendSupport:
     The device axis is the CUDA compute capability the kernel build genuinely
     needs, never the GPUs it happens to be measured on: a missing profile row is
     a data gap the profiler fills, not a reason to refuse a backend. Declare it
-    only with source evidence, matching the check the runner makes.
+    only with source evidence. The worker checks it against the real device
+    before it loads the runner, so a runner does not repeat it.
 
     - ``min_compute_capability`` — the oldest ``(major, minor)`` that can run the
       kernel at all, e.g. ``(8, 9)`` for a Triton FP8 e4m3 conversion.
@@ -107,7 +108,7 @@ class BackendSupport:
 
     A GPU name resolves to its compute capability through ``gpu/spec.json``
     (``profiling.gpu_catalog``). A GPU the catalog does not know, or a call
-    without a GPU, skips the device check — the runner still gates on the real
+    without a GPU, skips the device check — the worker still checks the real
     device when it profiles.
 
     The profile.db cache still keys on the full dtype tuple; this type only gates

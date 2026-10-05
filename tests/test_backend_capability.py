@@ -152,7 +152,7 @@ def test_min_compute_capability_admits_every_newer_gpu():
 def test_unknown_or_absent_gpu_skips_the_device_check():
     support = BackendSupport(compute=None, sm_targets=frozenset({"sm_100f"}))
     # No GPU, a name outside gpu/spec.json, and a non-CUDA part are not refused:
-    # the runner gates on the real device when it profiles.
+    # the worker checks the real device when it profiles.
     assert support.allows(DType.BF16, gpu=None)
     assert support.allows(DType.BF16, gpu="Some Future GPU")
     assert support.allows(DType.BF16, gpu="AMD MI300X")
