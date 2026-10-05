@@ -453,6 +453,25 @@ def test_a_capture_too_long_for_a_member_is_that_captures_misfit(sims) -> None:
     assert not any(m.misfits for m in others)
 
 
+def test_rows_a_capture_lacks_block_it_before_its_misfit(sims) -> None:
+    """The rows follow the capture's routing, so a capture that is both too
+    long and unmeasured is reported as lacking rows, which blocks a run of
+    other requests on its routing too."""
+    spec = sims.preset("GLM/spec_speculative").members[0]
+    first = spec.captures[0].name
+    too_long = {"reason": "3 of 4 requests exceed", "requests": 3, "total": 4, "max_model_len": 8}
+
+    def check(member, capture, build):
+        mine = member is spec and capture.name == first
+        if build:
+            return ({"moe": 2} if mine else {}), None, member.bounds
+        return None, too_long if mine else None, member.bounds
+
+    sims.check(check, jobs=2)
+    assert spec.summary(sims.index)["unavailable"] == {first: {"missing": {"moe": 2}}}
+    assert spec.runnable(spec.capture(first), replayed=False) == "lacks profile.db rows: moe 2"
+
+
 def test_a_dense_member_lists_each_request_list_once(monkeypatch) -> None:
     """Captures of one workload on several models often record the same
     requests: a dense member lists each list once, by its workload label (with

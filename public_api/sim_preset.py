@@ -260,15 +260,14 @@ class SimMember:
         """Why this member cannot run ``capture``: ``{"error": <the build's
         message>}``, ``{"misfit": <how its requests do not fit>}`` or
         ``{"missing": {<kernel role>: <profile.db rows it lacks>}}``; None when
-        it can. A misfit is of the capture's own requests, so it blocks only a
-        run that replays them (``replayed``), not one that takes only its
-        routing."""
+        it can. The build and its rows follow the capture's routing, so they
+        block every run of it; a misfit is of the capture's own requests, so it
+        blocks only a run that replays them (``replayed``), not one that takes
+        only its routing, and it is named only when nothing else blocks."""
         if self.error:
             return {"error": self.error}
         if capture.name in self.failures:
             return {"error": self.failures[capture.name]}
-        if replayed and capture.name in self.misfits:
-            return {"misfit": self.misfits[capture.name]}
         key = self.checked[0].name if self.dense and self.checked else capture.name
         if key in self.failures:
             return {"error": self.failures[key]}
@@ -276,6 +275,8 @@ class SimMember:
             return {"missing": self.missing[key]}
         if key not in self.missing:
             return {"error": "not checked"}
+        if replayed and capture.name in self.misfits:
+            return {"misfit": self.misfits[capture.name]}
         return None
 
     def runnable(self, capture: Capture, *, replayed: bool = True) -> str | None:
