@@ -7,6 +7,7 @@ fixtures; the profiling registry and a small profile.db are real.
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 from dataclasses import asdict
 from pathlib import Path
@@ -26,6 +27,7 @@ from profiling.kernels.single_gemm import SingleGemmArgs
 from profiling.runners.metrics import ComputeMetrics
 from public_api import kernels as library
 from public_api import predict
+from public_api.access_log import AccessLog
 from public_api.app import PREFIX, create_app
 from public_api.deployments import Config, DeploymentIndex, Member, Preset, config_id
 from public_api.kernels import PROVENANCE, REPO_ROOT, KernelLibrary
@@ -446,6 +448,39 @@ def test_predict_refuses_what_it_cannot_cost(client: TestClient) -> None:
     assert "lacks profile.db rows: single_gemm 1" in lacking.json()["detail"]
     assert post(1, []).status_code == 400
     assert client.post(f"{PREFIX}/predict", json={"preset": PRESET}).status_code == 422
+
+
+def test_every_request_is_recorded_with_what_a_prediction_ran_on(db: Path, tmp_path: Path) -> None:
+    log_dir = tmp_path / "access"
+    client = TestClient(
+        create_app(
+            KernelLibrary(FixtureSources(db_path=db), _index()),
+            tmp_path,
+            access_log=AccessLog(log_dir),
+        )
+    )
+    client.get(f"{PREFIX}/health", headers={"user-agent": "probe/1"})
+    client.get(f"{PREFIX}/kernels/no_such_kind")
+    client.post(
+        f"{PREFIX}/predict",
+        json={"preset": PRESET, "params": {"tp_size": 2}, "cases": [{"prefill": []}]},
+    )
+
+    (day,) = log_dir.iterdir()
+    lines = [json.loads(line) for line in day.read_text().splitlines()]
+    assert day.name == f"{lines[0]['ts'][:10]}.jsonl"
+    assert [(r["method"], r["path"], r["status"]) for r in lines] == [
+        ("GET", f"{PREFIX}/health", 200),
+        ("GET", f"{PREFIX}/kernels/no_such_kind", 404),
+        ("POST", f"{PREFIX}/predict", 409),
+    ]
+    assert lines[0]["ua"] == "probe/1" and lines[0]["ms"] >= 0
+    assert lines[2]["note"] == {
+        "preset": PRESET,
+        "params": {"tp_size": 2},
+        "cases": 1,
+        "analyze": False,
+    }
 
 
 def test_only_a_predictions_routes_are_forwarded(client: TestClient) -> None:

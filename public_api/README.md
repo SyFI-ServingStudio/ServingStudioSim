@@ -23,7 +23,12 @@ default: check that each port is free and not in another user's range first.
 Kept predictions live in `--runs-dir` (default `logs/public_api/predictions`)
 and simulations in `--sims-dir` (default `logs/public_api/simulations`); the
 Analyzer reads both. Uploaded workloads are kept in `--workloads-dir` (default
-`logs/public_api/workloads`). `--db` defaults to the profiler's database
+`logs/public_api/workloads`). Every request is recorded in `--access-log-dir`
+(default `logs/public_api/access`), one JSON line each in a file per UTC day:
+`ts`, `client` (the address the rate limits count), `method`, `path`, `query`,
+`status`, `ms`, `ua`, and for `POST /predict`, `/simulate` and `/workloads` a
+`note` with the preset, member params, case count or workload source, and the
+id the request left. Request bodies are not kept. `--db` defaults to the profiler's database
 (`VIBESIM_PROFILE_DB` or `profiling/profile.db`). Behind a proxy, pass its
 address as `--forwarded-allow-ips` so the rate limits count the client that
 `X-Forwarded-For` names. Interactive API docs are at `/api/public/v1/docs`.
@@ -39,6 +44,7 @@ uv run cargo build --release -p simulator -p analyzer
 cargo build --release --manifest-path alignment/load_generator/req-frontend/Cargo.toml --bin tracegen
 public_api/docker/run.sh 10.158.48.50 5220
 docker logs -f servingstudio-public-api
+tail -f logs/public_api/access/$(date -u +%F).jsonl
 ```
 
 The image holds only the Python environment, installed from `uv.lock`'s
@@ -46,9 +52,10 @@ The image holds only the Python environment, installed from `uv.lock`'s
 The container runs as the calling user and mounts the checkout read-only at the
 same path, with its git directory (a worktree's lies outside it). It serves
 that checkout's code, `profiling/profile.db`, `target/release/simulator` and
-req-frontend's `tracegen`. To
-serve new code or data, update the checkout, rebuild the simulator and rerun
-`run.sh`, which replaces the container. `PUBLIC_API_CONTAINER` and `PUBLIC_API_IMAGE` override the
+req-frontend's `tracegen`, and writes only `logs/public_api/{predictions,simulations,workloads,access}`.
+The access log is in the checkout, so it outlives the container; Docker's own
+log is capped at 4 × 50 MB. To serve new code or data, update the checkout,
+rebuild the simulator and rerun `run.sh`, which replaces the container. `PUBLIC_API_CONTAINER` and `PUBLIC_API_IMAGE` override the
 container and image names. The rate limits count the client the CSE web host's
 proxy names; `PUBLIC_API_FORWARDED_ALLOW_IPS` (`--forwarded-allow-ips`, default
 that host's address) lists the proxies trusted to name it.

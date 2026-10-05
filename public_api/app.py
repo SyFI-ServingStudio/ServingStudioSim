@@ -23,6 +23,7 @@ from pydantic import BaseModel, Field
 
 from public_api import predict as timing
 from public_api import simulate, workloads
+from public_api.access_log import AccessLog
 from public_api.deployments import BadMember, UnknownDeployment
 from public_api.kernels import BadQuery, KernelLibrary, UnknownConfig, UnknownKind
 from public_api.limits import RateLimiter
@@ -70,12 +71,14 @@ def create_app(
     predict_limit: RateLimiter | None = None,
     simulate_limit: RateLimiter | None = None,
     upload_limit: RateLimiter | None = None,
+    access_log: AccessLog | None = None,
 ) -> FastAPI:
     """``runs_dir`` holds the predictions ``POST /predict`` leaves, and
     ``analyzer`` is the base URL of an ``analyze serve`` over it and over the
     simulations' directory; without them the service answers neither.
     ``simulations`` serves the sim presets, runs and workloads; without it the
-    ``/simulat*`` and ``/workloads`` routes answer 503."""
+    ``/simulat*`` and ``/workloads`` routes answer 503. ``access_log``, if
+    given, records every request."""
     index = kernels.index
     sources = kernels.sources
     # Where this host keeps predictions and simulations, as the Analyzer may
@@ -119,6 +122,8 @@ def create_app(
     )
     # A kind's rows run to hundreds of kilobytes of JSON.
     app.add_middleware(GZipMiddleware, minimum_size=4096)
+    if access_log is not None:
+        access_log.install(app)
 
     async def answer(build, *args):
         # Documents come from sqlite and simulator subprocesses: keep them off the loop.
@@ -165,6 +170,12 @@ def create_app(
     async def predict(body: PredictRequest, request: Request) -> dict:
         """Each case's time on one member, per section and per tree node."""
 
+        request.state.note = {
+            "preset": body.preset,
+            "params": body.params,
+            "cases": len(body.cases),
+            "analyze": body.analyze,
+        }
         if runs_dir is None:
             raise HTTPException(503, "this service keeps no runs directory")
 
@@ -228,9 +239,16 @@ def create_app(
     @app.post(f"{PREFIX}/simulate", status_code=202)
     async def start_simulation(body: SimulateRequest, request: Request) -> dict:
         """Queue one simulation; read it with ``GET /simulations/{id}``."""
+        request.state.note = {
+            "preset": body.preset,
+            "params": body.params,
+            "source": body.workload.source,
+        }
         service = need_simulations()
         with limited(simulate_limit, request):
-            return await answer(service.start, body.preset, body.params, body.workload)
+            started = await answer(service.start, body.preset, body.params, body.workload)
+        request.state.note["simulation_id"] = started.get("simulation_id")
+        return started
 
     @app.get(f"{PREFIX}/workloads")
     async def workload_sources() -> dict:
@@ -256,8 +274,11 @@ def create_app(
                     raise HTTPException(
                         413, f"an upload is at most {workloads.MAX_UPLOAD_BYTES} bytes"
                     )
+            request.state.note = {"bytes": len(body), "format": input_file_format}
             names = None if tags is None else [tag for tag in tags.split(",") if tag]
-            return await answer(service.workloads.upload, bytes(body), input_file_format, names)
+            kept = await answer(service.workloads.upload, bytes(body), input_file_format, names)
+        request.state.note["workload_id"] = kept.get("workload_id")
+        return kept
 
     @app.get(f"{PREFIX}/simulations/{{simulation_id}}")
     async def simulation(simulation_id: str) -> dict:
