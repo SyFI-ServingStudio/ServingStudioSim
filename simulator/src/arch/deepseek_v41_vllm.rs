@@ -69,8 +69,10 @@ use crate::worklet::{
 };
 
 const ARCH_KIND: &str = "deepseek_v41_vllm";
-const TP_SIZE: u32 = 4;
-const EP_SIZE: u32 = 4;
+/// The one attention-TP and expert-parallel width the graph models, over the
+/// same four ranks; the selectors take neither, and the builder reads both here.
+pub(crate) const TP_SIZE: u32 = 4;
+pub(crate) const EP_SIZE: u32 = 4;
 
 // Checkpoint identity (HF text_config); `from_json` rejects anything else.
 const BODY_LAYERS: u32 = 40;

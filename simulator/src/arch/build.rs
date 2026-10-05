@@ -1015,8 +1015,8 @@ pub fn deepseek_v41_vllm(
     let model_cfg = DeepseekV41ModelCfg::from_json(Path::new(&model_spec.model_config), model_spec)
         .context("loading exact DeepSeek-V4.1-Flash model config")?;
     let parallel = DeepseekV41VllmParallel {
-        tp_size: 4,
-        ep_size: 4,
+        tp_size: deepseek_v41_vllm::TP_SIZE,
+        ep_size: deepseek_v41_vllm::EP_SIZE,
         gpu_name: gpu.to_string(),
         serialize_streams,
         decoder_swa_bounded_replay,
