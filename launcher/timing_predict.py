@@ -36,8 +36,10 @@ from profiling.gpu_policy import gpu_disabled
 from .artifact_kind import ArtifactKind, write_artifact_kind
 from .corpus import CorpusError, resolve_hf_references
 from .exec import (
+    ERROR_JSON,
     REPO_ROOT,
     _build_subprocess_env,
+    binary_error,
     binary_path,
     cargo_build,
     run_analysis,
@@ -374,7 +376,14 @@ async def run_one(
         write_artifact_kind(log_dir, ArtifactKind.TIMING_PREDICTION)
         binary_config = _binary_config(config_path, resolved, log_dir)
         binary = binary_path(build_type)
-        argv = [str(binary), "timing-predict", str(binary_config)]
+        (log_dir / "raw").mkdir(parents=True, exist_ok=True)
+        argv = [
+            str(binary),
+            "timing-predict",
+            str(binary_config),
+            "--error-json",
+            str(log_dir / "raw" / ERROR_JSON),
+        ]
         journal = RunJournal(log_dir)
         # The predictor writes profile.db only to JIT-profile a missing row, which
         # it refuses to do without a GPU: then predictions share the database.
@@ -460,17 +469,9 @@ async def run_one(
 
 
 def _report_failure(log_dir: Path) -> None:
-    """Name the failed prediction's log and its root cause on stderr.
-
-    anyhow prints the cause chain outermost first, so the last line is the root
-    (a missing row, a GPU refused under ``SERVINGSTUDIO_NO_GPU``, ...).
-    """
+    """Name the failed prediction's log and the binary's error on stderr."""
     log_path = log_dir / "stdout.log"
-    try:
-        lines = [line.strip() for line in log_path.read_text(errors="replace").splitlines()]
-    except OSError:
-        lines = []
-    cause = next((line for line in reversed(lines) if line), "")
+    cause = binary_error(log_dir / "raw" / ERROR_JSON)
     print(f"[failed] timing-predict: see {log_path}", file=sys.stderr)
     if cause:
         print(f"  {cause}", file=sys.stderr)
@@ -478,14 +479,15 @@ def _report_failure(log_dir: Path) -> None:
 
 def dry_run_one(config_path: Path, build_type: str) -> bool:
     """Validate one predictor config without running it, printing its report."""
-    succeeded, output = dry_run_report(config_path, build_type)
+    output, report, _ = dry_run_report(config_path, build_type)
     print(output, end="" if output.endswith("\n") else "\n")
-    return succeeded
+    return report is not None
 
 
-def dry_run_report(config_path: Path, build_type: str) -> tuple[bool, str]:
-    """Validate one predictor config without running it: whether it is valid,
-    and the binary's report.
+def dry_run_report(config_path: Path, build_type: str) -> tuple[str, dict | None, str | None]:
+    """Validate one predictor config without running it: the binary's printed
+    report, the report as its `--report-json` document (None when the config is
+    invalid), and the binary's error (None when it wrote none).
 
     The binary builds the model on its dry-run bridge, lowers every case against
     it, and reports the `profile.db` specs a real run would JIT-profile. Nothing is
@@ -496,12 +498,23 @@ def dry_run_report(config_path: Path, build_type: str) -> tuple[bool, str]:
         raise ValueError("timing-predict config requires log_dir")
     _resolve_cases(config_path, cfg)
     resolved = _resolved_config(config_path, cfg)
-    with tempfile.TemporaryDirectory(prefix="timing-predict-dry-run-") as scratch:
+    with tempfile.TemporaryDirectory(prefix="timing-predict-dry-run-") as directory:
+        scratch = Path(directory)
         binary_config = config_path
         if resolved is not None:
-            binary_config = Path(scratch) / "timing_predict_config.resolved.json"
+            binary_config = scratch / "timing_predict_config.resolved.json"
             binary_config.write_text(json.dumps(resolved, indent=2))
-        argv = [str(binary_path(build_type)), "timing-predict", "--dry-run", str(binary_config)]
+        report_path, error_path = scratch / "dry_run_report.json", scratch / ERROR_JSON
+        argv = [
+            str(binary_path(build_type)),
+            "timing-predict",
+            "--dry-run",
+            str(binary_config),
+            "--report-json",
+            str(report_path),
+            "--error-json",
+            str(error_path),
+        ]
         # The model build logs every cost tree at info; the report is the output.
         env = {"RUST_LOG": "warn", **_build_subprocess_env()}
         with _LAUNCHER_LEASES.profile_database(write=False):
@@ -514,7 +527,8 @@ def dry_run_report(config_path: Path, build_type: str) -> tuple[bool, str]:
                     name="timing-predict-dry-run",
                 )
             )
-    return result.succeeded, result.output
+        report = json.loads(report_path.read_text()) if result.succeeded else None
+        return result.output, report, binary_error(error_path)
 
 
 def main(argv: list[str]) -> int:

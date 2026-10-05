@@ -55,7 +55,7 @@ use crate::arch::contract::{
 use crate::arch::{AttnArchSel, FfnArchSel, IterArchSel};
 use crate::common::{Time, WorkerId};
 use crate::deployment::BackendOverrides;
-use crate::timing::bridge::write_config_records;
+use crate::timing::bridge::{print_dry_run, write_config_records, write_dry_run_report};
 use crate::timing::{CostManifestDoc, PerfApiBridge};
 use crate::worker::CostBuffers;
 
@@ -366,6 +366,7 @@ pub fn run_timing_predict(
     config_path: &Path,
     mode: PredictMode,
     kernel_configs_out: Option<&Path>,
+    report_json: Option<&Path>,
 ) -> Result<()> {
     let cfg: PredictConfig = parse_config_file(config_path)?;
     let bridge = match mode {
@@ -438,7 +439,14 @@ pub fn run_timing_predict(
         write_config_records(path, &bridge.take_config_records())?;
     }
     if !run {
-        print_dry_run(&bridge, num_cases, gpu_count);
+        let report = bridge.take_dry_run_report();
+        println!(
+            "timing-predict dry run: {num_cases} case(s) valid, {gpu_count} GPU(s) per replica"
+        );
+        print_dry_run(&report);
+        if let Some(path) = report_json {
+            write_dry_run_report(path, &report)?;
+        }
         return Ok(());
     }
     write_prediction_provenance(&cfg.log_dir, &cfg.gpu, gpu_count)?;
@@ -448,25 +456,6 @@ pub fn run_timing_predict(
         "timing-predict wrote {num_cases} case(s)"
     );
     Ok(())
-}
-
-/// The dry-run report: the cases that validated, then one line per kernel with
-/// the specs `profile.db` lacks (what a real run would JIT-profile).
-fn print_dry_run(bridge: &PerfApiBridge, num_cases: usize, gpu_count: u16) {
-    let report = bridge.take_dry_run_report();
-    let total_missing: usize = report.iter().map(|k| k.missing).sum();
-    let total_specs: usize = report.iter().map(|k| k.total).sum();
-    println!("timing-predict dry run: {num_cases} case(s) valid, {gpu_count} GPU(s) per replica");
-    for k in &report {
-        println!(
-            "  {:<40} ({:<16}) {:>8} / {:<8} missing",
-            k.name, k.kind, k.missing, k.total
-        );
-    }
-    println!(
-        "total: {total_missing} / {total_specs} specs missing across {} kernels to JIT",
-        report.len()
-    );
 }
 
 fn write_prediction_provenance(log_dir: &Path, gpu_name: &str, gpu_count: u16) -> Result<()> {

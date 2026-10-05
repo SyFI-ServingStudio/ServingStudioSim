@@ -15,12 +15,23 @@ use crate::timing::bridge::{
 /// real build). `name` is the kernel's dotted path; counts are summed over its
 /// backends. Shared profile identities count only at their first role in a
 /// dry-run report, matching the number of rows JIT would need to measure.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct KernelMissing {
     pub name: String,
     pub kind: KernelKind,
     pub missing: usize,
     pub total: usize,
+}
+
+/// The kernel's line of the printed report.
+impl std::fmt::Display for KernelMissing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "  {:<40} ({:<16}) {:>8} / {:<8} missing",
+            self.name, self.kind, self.missing, self.total
+        )
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -118,6 +129,43 @@ pub fn write_config_records(
         serde_json::to_string(&config_records_document(records)).expect("config records serialize");
     std::fs::write(path, text)
         .with_context(|| format!("writing kernel config records {}", path.display()))
+}
+
+/// Version of the document [`dry_run_document`] builds.
+pub const DRY_RUN_REPORT_SCHEMA_VERSION: u32 = 1;
+
+/// A dry run's `report` as the JSON document `--report-json` writes: each
+/// kernel's line, and the specs missing and enumerated over all of them.
+pub fn dry_run_document(report: &[KernelMissing]) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": DRY_RUN_REPORT_SCHEMA_VERSION,
+        "kernels": report,
+        "missing": report.iter().map(|k| k.missing).sum::<usize>(),
+        "total": report.iter().map(|k| k.total).sum::<usize>(),
+    })
+}
+
+/// Print a dry run's `report` for a reader: one line per kernel, then the total.
+pub fn print_dry_run(report: &[KernelMissing]) {
+    for k in report {
+        println!("{k}");
+    }
+    let missing: usize = report.iter().map(|k| k.missing).sum();
+    let total: usize = report.iter().map(|k| k.total).sum();
+    println!(
+        "total: {missing} / {total} specs missing across {} kernels to JIT",
+        report.len()
+    );
+}
+
+/// Write [`dry_run_document`] of `report` to `path`.
+pub fn write_dry_run_report(
+    path: &std::path::Path,
+    report: &[KernelMissing],
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+    let text = serde_json::to_string(&dry_run_document(report)).expect("dry-run report serializes");
+    std::fs::write(path, text).with_context(|| format!("writing dry-run report {}", path.display()))
 }
 
 #[derive(Clone, Debug, Default)]
@@ -831,11 +879,37 @@ fn optional_string(item: &PyAny, field: &str) -> Result<Option<String>, PerfApiE
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_payload_backends_match, shared_backend, ConfigGrid, PerfApiBridge};
+    use super::{
+        dry_run_document, ensure_payload_backends_match, shared_backend, ConfigGrid, KernelMissing,
+        PerfApiBridge,
+    };
     use crate::timing::bridge::payload::intern_backend;
     use crate::timing::bridge::{ArgsPayload, BuildError, PerfApiError};
     use serde_json::Value;
     use std::collections::{BTreeMap, HashMap};
+
+    #[test]
+    fn the_dry_run_document_lists_each_kernel_and_sums_them() {
+        let line = |name: &str, missing, total| KernelMissing {
+            name: name.into(),
+            kind: "single_gemm",
+            missing,
+            total,
+        };
+        let report = [line("main.attn.qkv", 3, 10), line("main.mlp.up", 0, 4)];
+        assert_eq!(
+            dry_run_document(&report),
+            serde_json::json!({
+                "schema_version": 1,
+                "kernels": [
+                    {"name": "main.attn.qkv", "kind": "single_gemm", "missing": 3, "total": 10},
+                    {"name": "main.mlp.up", "kind": "single_gemm", "missing": 0, "total": 4},
+                ],
+                "missing": 3,
+                "total": 14,
+            })
+        );
+    }
 
     fn submap(pairs: &[(&str, &[&str])]) -> HashMap<String, Vec<String>> {
         pairs

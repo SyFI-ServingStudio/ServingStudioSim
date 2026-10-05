@@ -14,6 +14,7 @@ Per design §1.2.3 / §1.2.7:
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import shutil
 import sys
@@ -36,10 +37,21 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_PARALLELISM = 200
 _PROCESS_SUPERVISOR = ProcessSupervisor()
 _LAUNCHER_LEASES = LauncherLeases(REPO_ROOT)
+# A failed run's error (`simulator --error-json`), in its `raw/`.
+ERROR_JSON = "error.json"
 
 
 def binary_path(build_type: str = "debug") -> Path:
     return REPO_ROOT / "target" / build_type / "simulator"
+
+
+def binary_error(path: Path) -> str | None:
+    """The simulator's error as its ``--error-json`` wrote it to ``path``: the
+    cause chain on one line. None when it wrote none (it succeeded or panicked)."""
+    try:
+        return json.loads(path.read_text())["error"]
+    except FileNotFoundError:
+        return None
 
 
 def analyzer_binary_path(build_type: str = "debug") -> Path:

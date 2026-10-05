@@ -40,7 +40,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 from launcher.corpus import resolve_hf_references, resolve_reference
-from launcher.exec import _build_subprocess_env, binary_path
+from launcher.exec import ERROR_JSON, _build_subprocess_env, binary_error, binary_path
 from launcher.process.leases import LauncherLeases
 from launcher.schema import (
     _format_log_dir,
@@ -52,7 +52,7 @@ from launcher.schema import (
 from launcher.schema.argv import write_config
 from launcher.schema.loader import Registry
 from public_api.deployments import DeploymentIndex
-from public_api.predict import _DRY_RUN_LINE, _cause
+from public_api.predict import _cause, missing_by_role
 from public_api.sim_preset import Capture, SimMember
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -187,29 +187,21 @@ def missing_rows(
         "run_to_end": True,
         "request_rate": 1.0,
     }
-    with tempfile.TemporaryDirectory(prefix="public-sim-check-") as scratch:
-        config = concrete(run_tree(index, member, capture, workload, Path(scratch)), registry)
-        path = write_config(config, Path(scratch) / "run_config.yaml")
+    with tempfile.TemporaryDirectory(prefix="public-sim-check-") as directory:
+        scratch = Path(directory)
+        config = concrete(run_tree(index, member, capture, workload, scratch), registry)
+        path = write_config(config, scratch / "run_config.yaml")
+        report, error = scratch / "dry_run_report.json", scratch / ERROR_JSON
+        argv = [str(binary_path(build_type)), "dry-run", str(path)]
+        argv += ["--report-json", str(report), "--error-json", str(error)]
         env = {**_build_subprocess_env(), "RUST_LOG": "warn"}
         with _LEASES.profile_database(write=False):
             result = subprocess.run(
-                [str(binary_path(build_type)), "dry-run", str(path)],
-                cwd=REPO_ROOT,
-                env=env,
-                capture_output=True,
-                text=True,
-                check=False,
+                argv, cwd=REPO_ROOT, env=env, capture_output=True, text=True, check=False
             )
         if result.returncode:
-            raise RuntimeError(_cause(result.stderr, Path(scratch)))
-    missing: dict[str, int] = {}
-    for line in result.stdout.splitlines():
-        match = _DRY_RUN_LINE.match(line)
-        if match and int(match[3]):
-            missing[match[1]] = missing.get(match[1], 0) + int(match[3])
-    if not result.stdout.rstrip().splitlines()[-1].startswith("total: "):
-        raise RuntimeError(f"unexpected dry-run report:\n{result.stdout[-2000:]}")
-    return missing
+            raise RuntimeError(_cause(binary_error(error), result.stderr, scratch))
+        return missing_by_role(json.loads(report.read_text()))
 
 
 # -- workloads -----------------------------------------------------------------
@@ -633,12 +625,11 @@ class Simulations:
 
     @staticmethod
     def _failure(directory: Path, code: int | None) -> str:
-        for log in (directory / "stdout.log", directory / "launcher.log"):
-            if log.is_file():
-                cause = _cause(log.read_text(errors="replace"), directory)
-                if cause:
-                    return cause[-2000:]
-        return f"the run exited with {code}"
+        logs = (directory / "stdout.log", directory / "launcher.log")
+        texts = (log.read_text(errors="replace").strip() for log in logs if log.is_file())
+        error = binary_error(directory / "raw" / ERROR_JSON)
+        cause = _cause(error, next((text for text in texts if text), ""), directory)
+        return cause[-2000:] if cause else f"the run exited with {code}"
 
 
 # -- the service ---------------------------------------------------------------

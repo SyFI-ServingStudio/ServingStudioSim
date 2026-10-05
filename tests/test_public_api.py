@@ -492,8 +492,10 @@ def test_a_forwarded_report_names_its_prediction_not_the_host_path(
 
 def test_a_failed_run_names_no_host_path(tmp_path: Path) -> None:
     scratch, log_dir = tmp_path / "scratch", tmp_path / "runs" / "abc"
-    stdout = f"Error: parsing JSON cases file {scratch}/cases.json: unknown field\n"
+    error = f"parsing JSON cases file {scratch}/cases.json: unknown field"
     assert (
-        predict._cause(stdout, scratch, log_dir)
+        predict._cause(error, "the whole log", scratch, log_dir)
         == "parsing JSON cases file cases.json: unknown field"
     )
+    # A panic writes no error; the end of the log stands in.
+    assert predict._cause(None, f"panicked at {log_dir}/x\n", scratch, log_dir) == "panicked at x"

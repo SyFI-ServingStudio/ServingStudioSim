@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
 import shutil
 import tempfile
 import time
@@ -32,6 +31,7 @@ from pathlib import Path
 import pyarrow.parquet as pq
 
 from launcher import timing_predict as launcher
+from launcher.exec import ERROR_JSON, binary_error
 from public_api.deployments import Member, coverage_flags
 
 MAX_CASES = 64
@@ -47,20 +47,24 @@ class NotPredictable(RuntimeError):
     """The member or a case needs profile.db rows that are not measured."""
 
 
-def _cause(stderr: str, *directories: Path) -> str:
-    """anyhow's error chain (``Error: a`` / ``Caused by:`` / ``0: b``) as one
-    line, with the paths under ``directories`` (the run's own) cut out."""
-    lines = []
-    for line in stderr.splitlines():
-        text = line.strip()
-        if text.startswith("Error: "):
-            lines = [text.removeprefix("Error: ")]
-        elif lines and text and text != "Caused by:":
-            lines.append(text.split(": ", 1)[1] if text[:1].isdigit() else text)
-    cause = ": ".join(lines) or stderr.strip()[-2000:]
+def _cause(error: str | None, log: str, *directories: Path) -> str:
+    """The binary's error (``--error-json``), or the end of its ``log`` when it
+    wrote none (a panic), with the paths under ``directories`` (the run's own)
+    cut out."""
+    cause = error or log.strip()[-2000:]
     for directory in directories:
         cause = cause.replace(f"{directory}/", "")
     return cause
+
+
+def missing_by_role(report: dict) -> dict[str, int]:
+    """A dry run's ``--report-json`` document as the rows lacking, ``{kernel
+    role: count}``; a role that lacks none is left out."""
+    missing: dict[str, int] = {}
+    for kernel in report["kernels"]:
+        if kernel["missing"]:
+            missing[kernel["name"]] = missing.get(kernel["name"], 0) + kernel["missing"]
+    return missing
 
 
 def _write_config(member: Member, cases: list, directory: Path, log_dir: Path) -> Path:
@@ -92,10 +96,6 @@ def _probe_case(shape: dict) -> dict:
     return {"groups": [{"decode_kv_lens": [1]}] * groups}
 
 
-# One kernel's line of the dry-run report (`timing_predict::print_dry_run`).
-_DRY_RUN_LINE = re.compile(r"^\s+(\S+)\s+\((\w+)\s*\)\s+(\d+) / (\d+)\s+missing$")
-
-
 def missing_specs(member: Member, build_type: str = "release") -> dict[str, int]:
     """The profile.db rows ``member``'s kernels need and profile.db lacks, as
     ``{role: count}`` by the kernel's dotted role; empty when every one is
@@ -105,17 +105,10 @@ def missing_specs(member: Member, build_type: str = "release") -> dict[str, int]
     with tempfile.TemporaryDirectory(prefix="public-dry-run-") as directory:
         scratch = Path(directory)
         config = _write_config(member, [_probe_case(member.predict)], scratch, scratch / "out")
-        succeeded, stdout = launcher.dry_run_report(config, build_type)
-    if not succeeded:
-        raise RuntimeError(f"{member.preset} {member.params}: {_cause(stdout, scratch)}")
-    missing: dict[str, int] = {}
-    for line in stdout.splitlines():
-        match = _DRY_RUN_LINE.match(line)
-        if match and int(match[3]):
-            missing[match[1]] = missing.get(match[1], 0) + int(match[3])
-    if not stdout.rstrip().splitlines()[-1].startswith("total: "):
-        raise RuntimeError(f"{member.preset}: unexpected dry-run report:\n{stdout[-2000:]}")
-    return missing
+        output, report, error = launcher.dry_run_report(config, build_type)
+    if report is None:
+        raise RuntimeError(f"{member.preset} {member.params}: {_cause(error, output, scratch)}")
+    return missing_by_role(report)
 
 
 def prune(runs_dir: Path, keep_seconds: float) -> None:
@@ -158,7 +151,8 @@ def predict(
             if not asyncio.run(run):
                 log = log_dir / "stdout.log"
                 text = log.read_text(errors="replace") if log.exists() else ""
-                cause = _cause(text, scratch, log_dir)
+                error = binary_error(log_dir / "raw" / ERROR_JSON)
+                cause = _cause(error, text, scratch, log_dir)
                 if "needs a GPU" in cause:
                     raise NotPredictable(cause)
                 raise BadCases(cause)

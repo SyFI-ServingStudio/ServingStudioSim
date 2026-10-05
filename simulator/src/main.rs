@@ -28,7 +28,7 @@ use simulator::sim::{
     run_sim, ArrivalSchedule, CapacityLimit, InputFileFormat, InputFileSchema, LoadedTrace,
     SessionDependency, TickCfg, TraceTag,
 };
-use simulator::timing::bridge::write_config_records;
+use simulator::timing::bridge::{print_dry_run, write_config_records, write_dry_run_report};
 use simulator::timing::PerfApiBridge;
 use simulator::timing_predict::PredictMode;
 
@@ -47,6 +47,10 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
     about = "ServingStudio Sim — ML serving + training simulator"
 )]
 struct Cli {
+    /// On failure, also write the error (its whole cause chain, as one line)
+    /// to this JSON file as `{"schema_version": 1, "error": ...}`.
+    #[arg(long, value_name = "FILE", global = true)]
+    error_json: Option<PathBuf>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -59,7 +63,7 @@ enum Cmd {
     BuildCacheOnly(CacheArgs),
     /// Report how many kernel specs are missing from profile.db (the JIT work a
     /// cache build would do), per kernel, then exit without building or running.
-    DryRun(CacheArgs),
+    DryRun(DryRunArgs),
     /// Print the deployment schema JSON consumed by the launcher (§1.2.7).
     ListParams,
     /// Enumerate the distinct kernels this config touches — one JSON record per
@@ -104,6 +108,9 @@ struct PredictArgs {
     /// See [`CacheArgs::kernel_configs_out`].
     #[arg(long, value_name = "FILE")]
     kernel_configs_out: Option<PathBuf>,
+    /// See [`DryRunArgs::report_json`].
+    #[arg(long, value_name = "FILE", requires = "dry_run")]
+    report_json: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -130,6 +137,16 @@ struct CacheArgs {
     /// of args each one reads, to this JSON file once the command succeeds.
     #[arg(long, value_name = "FILE")]
     kernel_configs_out: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct DryRunArgs {
+    #[command(flatten)]
+    cache: CacheArgs,
+    /// Also write the report to this JSON file: `{"schema_version": 1,
+    /// "kernels": [{name, kind, missing, total}], "missing", "total"}`.
+    #[arg(long, value_name = "FILE")]
+    report_json: Option<PathBuf>,
 }
 
 /// Shared payload for `run` / `build-cache-only` / `dry-run`: a path to one
@@ -201,12 +218,27 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    match cli.cmd {
+    let result = dispatch(cli.cmd);
+    if let (Err(error), Some(path)) = (&result, &cli.error_json) {
+        let text = serde_json::json!({"schema_version": 1, "error": format!("{error:#}")});
+        if let Err(write) = std::fs::write(path, text.to_string()) {
+            tracing::error!("writing {}: {write}", path.display());
+        }
+    }
+    result
+}
+
+fn dispatch(cmd: Cmd) -> Result<()> {
+    match cmd {
         Cmd::Run(args) => cmd_run(&args.config),
         Cmd::BuildCacheOnly(args) => {
             cmd_build_cache(&args.config, args.kernel_configs_out.as_deref())
         }
-        Cmd::DryRun(args) => cmd_dry_run(&args.config, args.kernel_configs_out.as_deref()),
+        Cmd::DryRun(args) => cmd_dry_run(
+            &args.cache.config,
+            args.cache.kernel_configs_out.as_deref(),
+            args.report_json.as_deref(),
+        ),
         Cmd::EmitBackends(args) => cmd_emit_backends(&args.config),
         Cmd::ListParams => {
             // serde_json::Value serializes infallibly; pretty for `list-params`.
@@ -240,6 +272,7 @@ fn main() -> anyhow::Result<()> {
                 PredictMode::Run
             },
             args.kernel_configs_out.as_deref(),
+            args.report_json.as_deref(),
         ),
     }
 }
@@ -345,10 +378,7 @@ fn cmd_build_cache(config: &Path, kernel_configs_out: Option<&Path>) -> anyhow::
         report.len()
     );
     for k in report.iter().filter(|k| k.missing > 0) {
-        println!(
-            "  {:<40} ({:<16}) {:>8} / {:<8} missing",
-            k.name, k.kind, k.missing, k.total
-        );
+        println!("{k}");
     }
     // Called even at zero: it clears the collector and reports the no-op, and
     // an early return here would leave the collector installed.
@@ -367,7 +397,11 @@ fn cmd_build_cache(config: &Path, kernel_configs_out: Option<&Path>) -> anyhow::
 /// how many of its specs are absent from `profile.db` (the JIT work a real cache
 /// build would do). Exits before the tick loop. JIT stays off so nothing is
 /// profiled — this is a read-only coverage probe.
-fn cmd_dry_run(config: &Path, kernel_configs_out: Option<&Path>) -> anyhow::Result<()> {
+fn cmd_dry_run(
+    config: &Path,
+    kernel_configs_out: Option<&Path>,
+    report_json: Option<&Path>,
+) -> anyhow::Result<()> {
     let cfg = load_config(config)?;
     let bridge = PerfApiBridge::new().context("starting the PyO3 perf_api bridge")?;
     bridge.enable_dry_run();
@@ -378,19 +412,11 @@ fn cmd_dry_run(config: &Path, kernel_configs_out: Option<&Path>) -> anyhow::Resu
     let _flow = build_flow(&cfg, &bridge, store)?;
 
     let report = bridge.take_dry_run_report();
-    let total_missing: usize = report.iter().map(|k| k.missing).sum();
-    let total_specs: usize = report.iter().map(|k| k.total).sum();
     println!("dry run: {} kernels", report.len());
-    for k in &report {
-        println!(
-            "  {:<40} ({:<16}) {:>8} / {:<8} missing",
-            k.name, k.kind, k.missing, k.total
-        );
+    print_dry_run(&report);
+    if let Some(path) = report_json {
+        write_dry_run_report(path, &report)?;
     }
-    println!(
-        "total: {total_missing} / {total_specs} specs missing across {} kernels to JIT",
-        report.len()
-    );
     if let Some(path) = kernel_configs_out {
         write_config_records(path, &bridge.take_config_records())?;
     }
