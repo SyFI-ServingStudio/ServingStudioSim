@@ -298,10 +298,7 @@ fn logical_bytes(
     let q_and_out = rows * heads * (2.0 * head_dim + head_dim + head_dim / 32.0);
     if is_decode(config) {
         let slots = f64::from(WINDOW + if ratio == 0 { 0 } else { INDEX_TOPK });
-        return q_and_out
-            + rows * 4.0 * slots
-            + swa_keys * swa_record
-            + extra_keys * extra_record;
+        return q_and_out + rows * 4.0 * slots + swa_keys * swa_record + extra_keys * extra_record;
     }
     let bf16_row = 2.0 * head_dim;
     q_and_out
@@ -390,7 +387,11 @@ fn uniform_for_keys(
 }
 
 /// Whether `pairs` project onto `point` within tolerance.
-fn on_point(pairs: &[(u32, u32)], point: &[f64], config: &CompressedSparseMlaRopeCastKernelConfig) -> bool {
+fn on_point(
+    pairs: &[(u32, u32)],
+    point: &[f64],
+    config: &CompressedSparseMlaRopeCastKernelConfig,
+) -> bool {
     let projected = project(pairs, config);
     let floor = if is_decode(config) || config.compress_ratio == 0 {
         0.0
@@ -634,7 +635,10 @@ impl KernelSpec for CompressedSparseMlaRopeCastSpec {
     }
 }
 
-register_kernel!(CompressedSparseMlaRopeCastKernel, CompressedSparseMlaRopeCastSpec);
+register_kernel!(
+    CompressedSparseMlaRopeCastKernel,
+    CompressedSparseMlaRopeCastSpec
+);
 
 #[cfg(test)]
 mod tests {
@@ -644,7 +648,11 @@ mod tests {
         config_with_heads(mode, ratio, 64)
     }
 
-    fn config_with_heads(mode: &str, ratio: u32, heads: u32) -> CompressedSparseMlaRopeCastKernelConfig {
+    fn config_with_heads(
+        mode: &str,
+        ratio: u32,
+        heads: u32,
+    ) -> CompressedSparseMlaRopeCastKernelConfig {
         serde_json::from_value(serde_json::json!({
             "backends": ["flashmla_mega"],
             "gpu_name": "NVIDIA B200",

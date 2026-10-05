@@ -45,6 +45,7 @@ use crate::arch::contract::{IterwiseUnifiedModel, UnifiedArchInput};
 use crate::op::attention::DeepseekV41CandidateRole;
 use crate::timing::bridge::DType;
 use crate::timing::expert_demand::ExpertDemand;
+use crate::timing::kernels::all_reduce_fusion::fused_all_reduce_refusal;
 use crate::timing::{
     BuildError, CostManifest, CostNode, CostTree, CostTreeBuilder, Evaluator, FlatCostNode,
     LeafMetrics, PerfApiBridge, SlotInput,
@@ -66,7 +67,6 @@ use crate::worklet::{
 };
 
 const ARCH_KIND: &str = "deepseek_v41_vllm";
-const GPU_NAME: &str = "NVIDIA B200";
 const TP_SIZE: u32 = 4;
 const EP_SIZE: u32 = 4;
 
@@ -640,10 +640,20 @@ pub fn build_configs(
     parallel: &DeepseekV41VllmParallel,
     demand: &ExpertDemand,
 ) -> std::result::Result<DeepseekV41VllmConfigs, BuildError> {
-    if parallel.tp_size != TP_SIZE || parallel.ep_size != EP_SIZE || parallel.gpu_name != GPU_NAME {
-        return Err(fit_failed(
-            "DeepSeek-V4.1-Flash is profiled only as B200 TP4 attention + EP4 experts",
-        ));
+    // The graph's per-rank shapes (padded heads, Engram table slices, local
+    // experts) are written for TP4 attention + EP4 experts on the same ranks.
+    if parallel.tp_size != TP_SIZE || parallel.ep_size != EP_SIZE {
+        return Err(fit_failed(format!(
+            "the DeepSeek-V4.1-Flash graph is TP{TP_SIZE} attention + EP{EP_SIZE} experts, \
+             got TP{} + EP{}",
+            parallel.tp_size, parallel.ep_size
+        )));
+    }
+    // The GPU is not pinned: a GPU without rows is a profile.db gap the
+    // cache reports. Only the fused all-reduce needs vLLM's FlashInfer budget.
+    if let Some(reason) = fused_all_reduce_refusal(ALL_REDUCE_BACKENDS, &parallel.gpu_name, TP_SIZE)
+    {
+        return Err(fit_failed(reason));
     }
     if demand.num_experts() != model.num_experts as usize {
         return Err(fit_failed(format!(
@@ -1265,9 +1275,12 @@ mod tests {
     use super::*;
     use crate::arch::contract::ArchGroupInput;
     use crate::timing::LeafDesc;
+
     use crate::worklet::deepseek_v41_attention_tp::production_layer;
     use crate::worklet::deepseek_v41_common::SERIAL_COPY_SUFFIX;
 
+    /// The GPU of the capture the profile rows were measured for.
+    const GPU_NAME: &str = "NVIDIA B200";
     const CONFIG: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/model/config/deepseek_v41_flash.json"
@@ -1457,9 +1470,13 @@ mod tests {
             6144
         );
 
-        let mut h200 = parallel();
-        h200.gpu_name = "NVIDIA H200".into();
-        assert!(build_configs(&cfg, &h200, &uniform_demand()).is_err());
+        // No GPU pin; only a GPU vLLM's FlashInfer all-reduce has no budget for.
+        let mut b300 = parallel();
+        b300.gpu_name = "NVIDIA B300".into();
+        assert!(build_configs(&cfg, &b300, &uniform_demand()).is_ok());
+        let mut a100 = parallel();
+        a100.gpu_name = "NVIDIA A100".into();
+        assert!(build_configs(&cfg, &a100, &uniform_demand()).is_err());
         let mut ep8 = parallel();
         ep8.ep_size = 8;
         assert!(build_configs(&cfg, &ep8, &uniform_demand()).is_err());
