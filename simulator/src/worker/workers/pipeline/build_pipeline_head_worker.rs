@@ -73,11 +73,14 @@ pub(crate) fn build_pipeline_head_worker<M: IterwiseUnifiedModel>(
         essentials.sampler,
         prefix_cache_logger,
     );
-    let admission = PipelinedChunkedPrefillAdmission::new(
+    let mut admission = PipelinedChunkedPrefillAdmission::new(
         PendingOrder::new(config.pending_order),
         (),
         max_batch_tokens,
     );
+    if config.balance_decode_microbatches {
+        admission = admission.with_balanced_decodes(layout.depth);
+    }
 
     PipelineHeadWorker::from_components(
         essentials.context,
@@ -206,10 +209,13 @@ pub(crate) fn build_hybrid_pipeline_head_worker<M: IterwiseUnifiedModel>(
         (),
         max_batch_tokens,
     );
-    let admission = match chunk_end_quantum {
+    let mut admission = match chunk_end_quantum {
         Some(quantum) => admission.with_chunk_end_quantum(quantum),
         None => admission,
     };
+    if config.balance_decode_microbatches {
+        admission = admission.with_balanced_decodes(layout.depth);
+    }
 
     PipelineHeadWorker::from_components(
         essentials.context,

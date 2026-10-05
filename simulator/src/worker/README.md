@@ -298,7 +298,9 @@ chunk while the previous one is on a later stage. Token emission, decode KV
 advance, `Done`, and KV release wait for the exit, stamped with the exact exit
 time. A decode step needs the previous token, so a running request has at most
 one microbatch in flight; each microbatch takes the ready decodes first, then
-started and fresh prompts, under one token budget. Admission writes the chosen
+started and fresh prompts, under one token budget. Ready decodes all join by
+default (vLLM); `balance_decode_microbatches` caps them at
+`ceil(resident decodes / depth)` per microbatch. Admission writes the chosen
 decode subset into `IterBatchPlan`, and input lowering skips the resident decodes
 outside it.
 
