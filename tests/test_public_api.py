@@ -495,9 +495,12 @@ def test_a_forwarded_report_names_its_prediction_not_the_host_path(
     from public_api import app as app_module
 
     log_dir = tmp_path.resolve() / "72dd8769"
+    config = REPO_ROOT / "model" / "config" / "glm52_nvfp4.json"
 
     def analyzer(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"log_dir": str(log_dir)})
+        return httpx.Response(
+            200, json={"log_dir": str(log_dir), "caveats": [f"{config} declares"]}
+        )
 
     real = httpx.AsyncClient
     monkeypatch.setattr(
@@ -508,7 +511,11 @@ def test_a_forwarded_report_names_its_prediction_not_the_host_path(
     kernels = KernelLibrary(FixtureSources(db_path=db), _index())
     client = TestClient(create_app(kernels, tmp_path, "http://analyzer"))
     answer = client.get(f"{PREFIX}/analyzer/predictions/p_1/subjects/scoped-optimality/report")
-    assert answer.json() == {"log_dir": "72dd8769"}
+    # A caveat that quotes a repo file names it by its repo path.
+    assert answer.json() == {
+        "log_dir": "72dd8769",
+        "caveats": ["model/config/glm52_nvfp4.json declares"],
+    }
 
 
 def test_the_kernel_kinds_are_the_docs_vocabulary(db: Path, tmp_path: Path) -> None:

@@ -25,7 +25,7 @@ from public_api import predict as timing
 from public_api import simulate, workloads
 from public_api.access_log import AccessLog
 from public_api.deployments import BadMember, UnknownDeployment
-from public_api.kernels import BadQuery, KernelLibrary, UnknownConfig, UnknownKind
+from public_api.kernels import REPO_ROOT, BadQuery, KernelLibrary, UnknownConfig, UnknownKind
 from public_api.limits import RateLimiter
 
 PREFIX = "/api/public/v1"
@@ -81,16 +81,23 @@ def create_app(
     given, records every request."""
     index = kernels.index
     sources = kernels.sources
-    # Where this host keeps predictions and simulations, as the Analyzer may
-    # spell them, with the separator: forwarded reports drop it.
-    roots = [runs_dir] if runs_dir is not None else []
+    # Where this host keeps predictions and simulations, and the checkout the
+    # service runs, as a message may spell them, with the separator: answers
+    # drop it, so a run reads by its own name and a file by its repo path.
+    roots = [REPO_ROOT, *([runs_dir] if runs_dir is not None else [])]
     if simulations is not None:
         roots.append(simulations.queue.runs_dir)
     hidden_roots = sorted(
-        {f"{spelled}/".encode() for root in roots for spelled in (root, root.resolve())},
+        {f"{spelled}/" for root in roots for spelled in (root, root.resolve())},
         key=len,
         reverse=True,
     )
+
+    def hide(text: str) -> str:
+        for root in hidden_roots:
+            text = text.replace(root, "")
+        return text
+
     predict_limit = predict_limit or RateLimiter(PREDICT_PER_MINUTE, 60.0)
     simulate_limit = simulate_limit or RateLimiter(SIMULATE_PER_MINUTE, 60.0)
     upload_limit = upload_limit or RateLimiter(UPLOAD_PER_MINUTE, 60.0)
@@ -142,10 +149,11 @@ def create_app(
         except (BadQuery, timing.BadCases, workloads.BadWorkload) as error:
             # A request too long for its pool or arch also gives the limit.
             too_long = getattr(error, "too_long", None)
-            detail = {"message": str(error), "too_long": too_long} if too_long else str(error)
+            message = hide(str(error))
+            detail = {"message": message, "too_long": too_long} if too_long else message
             raise HTTPException(400, detail) from None
         except (timing.NotPredictable, simulate.NotRunnable) as error:
-            raise HTTPException(409, str(error)) from None
+            raise HTTPException(409, hide(str(error))) from None
         except simulate.UnknownSimulation as error:
             raise HTTPException(404, f"no simulation {error.args[0]!r}") from None
         except simulate.QueueFull as error:
@@ -283,7 +291,11 @@ def create_app(
     @app.get(f"{PREFIX}/simulations/{{simulation_id}}")
     async def simulation(simulation_id: str) -> dict:
         """Its status; once done, its summary and the Analyzer's run id."""
-        return await answer(need_simulations().queue.get, simulation_id)
+        record = await answer(need_simulations().queue.get, simulation_id)
+        # A failed run's error quotes the simulator's output, paths included.
+        if record.get("error"):
+            record["error"] = hide(record["error"])
+        return record
 
     @app.delete(f"{PREFIX}/simulations/{{simulation_id}}")
     async def delete_simulation(simulation_id: str) -> dict:
@@ -299,12 +311,9 @@ def create_app(
         url = f"{analyzer}/api/analyzer/v1/{kind}/{resource_id}/{subject}"
         async with httpx.AsyncClient(timeout=120) as client:
             answer = await client.get(url, params=request.query_params)
-        content = answer.content
-        # Some reports name the run's directory; keep only its own name.
-        for root in hidden_roots:
-            content = content.replace(root, b"")
+        # Some reports name the run's directory or a repo file.
         return Response(
-            content,
+            hide(answer.text),
             status_code=answer.status_code,
             media_type=answer.headers.get("content-type"),
         )
