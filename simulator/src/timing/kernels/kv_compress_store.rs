@@ -13,6 +13,10 @@ use crate::timing::{Dim, KernelConfig, SweepCoords};
 /// bytes.
 pub const FP8_DS_MLA_ROW_BYTES: u32 = 584;
 
+/// Bytes of one `fp8_indexer` cache row, the 128-wide indexer head this kind
+/// stores on C4 layers: 128 fp8 values and one fp32 scale.
+const FP8_INDEXER_ROW_BYTES: u32 = 132;
+
 #[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct KvCompressStoreKernelConfig {
     #[serde(deserialize_with = "de_backends")]
@@ -111,7 +115,7 @@ fn logical_bytes(config: &KvCompressStoreKernelConfig, input: &KvCompressStoreKe
     let (window, state_width, row_bytes) = match (head_dim, ratio) {
         (512, 4) => (8, 1024, FP8_DS_MLA_ROW_BYTES),
         (512, _) => (ratio, 512, FP8_DS_MLA_ROW_BYTES),
-        _ => (8, 512, 132),
+        _ => (8, 512, FP8_INDEXER_ROW_BYTES),
     };
     let (rows, active) = input.work(ratio);
     let (rows, active) = (f64::from(rows), f64::from(active));
