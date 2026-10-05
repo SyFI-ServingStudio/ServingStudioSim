@@ -24,8 +24,6 @@ from functools import cache
 from pathlib import Path
 from typing import Any
 
-import yaml
-
 from profiling.db.args import DType
 from profiling.db.doc import CATEGORIES, SUBCATEGORIES, arg_docs, kernel_doc
 from profiling.db.doc import METRICS as METRIC_DOCS
@@ -38,7 +36,6 @@ from public_api.deployments import Config, DeploymentIndex, scalar_identity
 from public_api.sources import Sources
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-MODEL_CATALOG = REPO_ROOT / "model" / "catalog.yaml"
 
 # What each row records about the run that measured it: every standard column
 # but the row's key (GPU, backend) and the outlier check's flag.
@@ -137,16 +134,13 @@ class KernelLibrary:
         self.specs: dict[str, list] = {}
         for spec in iter_kernel_profiler_specs():
             self.specs.setdefault(spec.kernel_kind, []).append(spec)
-        sources.watch(MODEL_CATALOG)
         self.sim_commit = git_commit()
 
     @property
     def models(self) -> dict[str, dict]:
-        """``model/catalog.yaml``, reread when it changes."""
+        """``model/catalog.yaml``, as the deployments read it at start."""
 
-        return self.sources.cached_by_db(
-            "model-catalog", lambda: yaml.safe_load(MODEL_CATALOG.read_text()) or {}
-        )
+        return self.index.models
 
     # -- per-kind facts ------------------------------------------------------------
 

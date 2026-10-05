@@ -12,8 +12,8 @@ fixtures:
 - profile.db, opened read-only for every query.
 
 Introspection answers depend only on the binary, so they are cached until the
-binary changes. Database aggregates are cached until the file, or a file a
-document builder registers with :meth:`Sources.watch` (the model catalog), changes.
+binary changes (:func:`introspect`, which the other introspection commands the
+service runs share). Database aggregates are cached until the file changes.
 """
 
 from __future__ import annotations
@@ -31,6 +31,40 @@ from launcher.exec import _build_subprocess_env, binary_path
 from profiling.db.migrate import require_current
 
 
+def run_json(binary: Path, args: list[str], stdin: str | None = None) -> Any:
+    """``binary args`` (with ``stdin``) as the JSON it prints; raises with its
+    stderr when it fails."""
+    result = subprocess.run(
+        [str(binary), *args],
+        input=stdin,
+        capture_output=True,
+        text=True,
+        env=_build_subprocess_env(),
+        check=False,
+    )
+    if result.returncode:
+        raise RuntimeError(f"{Path(binary).name} {args[0]}: {result.stderr.strip()}")
+    return json.loads(result.stdout)
+
+
+_INTROSPECTED: dict[tuple, tuple[float, Any]] = {}
+_INTROSPECTED_LOCK = threading.Lock()
+
+
+def introspect(binary: Path, args: list[str]) -> Any:
+    """:func:`run_json` of an introspection command (``simulator list-params``,
+    ``trace-formats``, ``tracegen describe``), run again only when ``binary``
+    changes."""
+    key, stamp = (str(binary), *args), Path(binary).stat().st_mtime
+    with _INTROSPECTED_LOCK:
+        if key in _INTROSPECTED and _INTROSPECTED[key][0] == stamp:
+            return _INTROSPECTED[key][1]
+    value = run_json(binary, args)
+    with _INTROSPECTED_LOCK:
+        _INTROSPECTED[key] = (stamp, value)
+    return value
+
+
 class Sources:
     """The simulator binary and profile.db behind every document the service builds."""
 
@@ -39,57 +73,26 @@ class Sources:
         self.build_type = build_type
         self.binary = binary_path(build_type)
         self._lock = threading.Lock()
-        self._binary_cache: dict[Any, Any] = {}
-        self._binary_stamp: float | None = None
         self._db_cache: dict[Any, Any] = {}
         self._db_stamp: tuple | None = None
-        self._watched: list[Path] = []
 
     # -- simulator introspection -------------------------------------------------
-
-    def _simulator(self, args: list[str], stdin: str | None = None) -> Any:
-        result = subprocess.run(
-            [str(self.binary), *args],
-            input=stdin,
-            capture_output=True,
-            text=True,
-            env=_build_subprocess_env(),
-            check=False,
-        )
-        if result.returncode:
-            raise RuntimeError(f"simulator {args[0]}: {result.stderr.strip()}")
-        return json.loads(result.stdout)
-
-    def cached_by_binary(self, key: Any, compute: Callable[[], Any]) -> Any:
-        """``compute()``, reused until the simulator binary changes."""
-
-        stamp = self.binary.stat().st_mtime
-        with self._lock:
-            if stamp != self._binary_stamp:
-                self._binary_cache.clear()
-                self._binary_stamp = stamp
-            if key in self._binary_cache:
-                return self._binary_cache[key]
-        value = compute()
-        with self._lock:
-            self._binary_cache[key] = value
-        return value
 
     def kernel_list(self) -> list[dict]:
         """Every Rust kernel kind with its config/input fields and dtype fields."""
 
-        return self.cached_by_binary("kernel-list", lambda: self._simulator(["kernel-list"]))
+        return introspect(self.binary, ["kernel-list"])
 
     def list_params(self) -> dict:
         """The param schema: every arch's params and the ``timing-predict`` case fields."""
 
-        return self.cached_by_binary("list-params", lambda: self._simulator(["list-params"]))
+        return introspect(self.binary, ["list-params"])
 
     def cost_trees(self, blocks: list[dict]) -> list[dict]:
         """``simulator cost-trees --kernel-configs`` of ``{gpu, arch}`` blocks:
         each one's cost tree, prediction case shape and kernel configs."""
 
-        return self._simulator(["cost-trees", "-", "--kernel-configs"], json.dumps(blocks))
+        return run_json(self.binary, ["cost-trees", "-", "--kernel-configs"], json.dumps(blocks))
 
     # -- profile.db ----------------------------------------------------------------
 
@@ -105,17 +108,11 @@ class Sources:
         finally:
             conn.close()
 
-    def watch(self, path: Path) -> None:
-        """Also drop the :meth:`cached_by_db` results when ``path`` changes."""
-
-        self._watched.append(Path(path))
-
     def cached_by_db(self, key: Any, compute: Callable[[], Any]) -> Any:
-        """``compute()``, reused until profile.db or a watched file changes."""
+        """``compute()``, reused until profile.db changes."""
 
-        stamp = tuple(
-            (st.st_mtime, st.st_size) for st in map(Path.stat, [self.db_path, *self._watched])
-        )
+        st = self.db_path.stat()
+        stamp = (st.st_mtime, st.st_size)
         with self._lock:
             if stamp != self._db_stamp:
                 self._db_cache.clear()

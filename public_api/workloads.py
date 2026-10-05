@@ -26,7 +26,6 @@ import resource
 import shutil
 import subprocess
 import tempfile
-import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -41,6 +40,7 @@ from launcher.exec import (
     binary_too_long,
 )
 from public_api.predict import Refused, _cause
+from public_api.sources import introspect
 
 # The generators the service runs: `coding-session` materializes a corpus file
 # from this host, which a reader cannot name.
@@ -146,25 +146,10 @@ def trace_facts(requests: list[dict]) -> dict:
     }
 
 
-_FORMATS: dict[str, tuple[float, dict]] = {}
-_FORMATS_LOCK = threading.Lock()
-
-
 def trace_formats(build_type: str = "release") -> dict:
     """``simulator trace-formats``: every trace format, its columns and tags,
     and each tag's columns; read again when the binary changes."""
-    binary = binary_path(build_type)
-    stamp = binary.stat().st_mtime
-    with _FORMATS_LOCK:
-        if build_type in _FORMATS and _FORMATS[build_type][0] == stamp:
-            return _FORMATS[build_type][1]
-    result = _simulator(["trace-formats"], build_type)
-    if result.returncode:
-        raise RuntimeError(f"simulator trace-formats: {result.stderr.strip()}")
-    formats = json.loads(result.stdout)
-    with _FORMATS_LOCK:
-        _FORMATS[build_type] = (stamp, formats)
-    return formats
+    return introspect(binary_path(build_type), ["trace-formats"])
 
 
 def _header(path: Path) -> list[str]:
@@ -230,35 +215,13 @@ class Workloads:
         self.uploads_dir = Path(uploads_dir).resolve()
         self.uploads_dir.mkdir(parents=True, exist_ok=True)
         self.build_type = build_type
-        self._lock = threading.Lock()
-        self._cache: dict[str, tuple[float, dict]] = {}
-
-    def _cached(self, key: str, binary: Path, args: list[str]) -> dict:
-        """A JSON introspection command's answer, reused until ``binary`` changes."""
-        stamp = binary.stat().st_mtime
-        with self._lock:
-            if key in self._cache and self._cache[key][0] == stamp:
-                return self._cache[key][1]
-        result = subprocess.run(
-            [str(binary), *args],
-            capture_output=True,
-            text=True,
-            env=_build_subprocess_env(),
-            check=False,
-        )
-        if result.returncode:
-            raise RuntimeError(f"{binary.name} {args[0]}: {result.stderr.strip()}")
-        value = json.loads(result.stdout)
-        with self._lock:
-            self._cache[key] = (stamp, value)
-        return value
 
     # -- generated -------------------------------------------------------------
 
     def generators(self) -> dict:
         """``tracegen describe`` for the generators the service runs, without
         the arguments it sets itself."""
-        described = self._cached("tracegen", TRACEGEN, ["describe"])
+        described = introspect(TRACEGEN, ["describe"])
         return {
             "input_file_format": described["input_file_format"],
             "generators": [

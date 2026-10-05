@@ -55,8 +55,11 @@ replay. Each member gives:
 - `pools`: per role, `replicas`, the arch preset's `arch_params` (such as
   `max_model_len`), `gpus_per_replica` and the `worker` block.
 - `unavailable`: per capture, why the member cannot run it: `{"error": ...}`
-  when it does not build, or `{"missing": {<kernel role>: <rows>}}` when
-  profile.db lacks rows. A member can run a capture missing from this map.
+  when it does not build, `{"missing": {<kernel role>: <rows>}}` when
+  profile.db lacks rows, or `{"misfit": {"reason", "max_model_len", ...}}`
+  when the capture's requests do not fit its pools' `max_model_len` (that
+  blocks a replay only; the capture still serves as routing). A member can run
+  a capture missing from this map.
 
 ```bash
 jq '.presets[] | select(.id == "GLM-5.2-NVFP4/glm52_vllm_nvfp4_dsa_moe_chunked_prefill")

@@ -12,26 +12,19 @@ with, as ``/predict`` does.
 from __future__ import annotations
 
 import json
-import subprocess
 import sys
 from pathlib import Path
 
-from launcher.exec import _build_subprocess_env, binary_path
+from launcher.exec import binary_path
 from launcher.schema.loader import schema_from_dict
 from launcher.sweep import run_single
 from public_api.simulate import RUN_CONFIG, RUN_PRESET
+from public_api.sources import introspect
 
 
 def main(argv: list[str]) -> int:
     run_dir, build_type = Path(argv[0]), argv[1]
-    listed = subprocess.run(
-        [str(binary_path(build_type)), "list-params"],
-        capture_output=True,
-        text=True,
-        env=_build_subprocess_env(),
-        check=True,
-    )
-    schema = schema_from_dict(json.loads(listed.stdout))
+    schema = schema_from_dict(introspect(binary_path(build_type), ["list-params"]))
     config = json.loads((run_dir / RUN_CONFIG).read_text())
     preset = json.loads((run_dir / RUN_PRESET).read_text())
     ok = run_single(config, preset, schema, build_type, analyze=True, plot=False)

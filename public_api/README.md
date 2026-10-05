@@ -68,7 +68,7 @@ Under `/api/public/v1`; all `GET` but `POST /predict`, `POST /simulate`,
 | `/models/{checkpoint}/{arch}/tree` | One member's kernels: each section's leaf slots; the query gives every axis of the preset. Each slot names its config by `id`, the key of `/kernels/{kind}/configs/{id}`; `configs` gives each config's identity and the profile.db rows this member asks of it and lacks (`missing`) |
 | `POST /predict` | `{preset, params, cases, analyze?}`: each case's time on one member, per section and per node of its cost tree (as `analyze gen-iter-breakdown` reads it), from one `launcher timing-predict` run on the served profile.db. A member that lacks rows answers 409 naming them. With `analyze: true` the prediction is also analyzed (no plots) and kept for six hours, and the answer names it by `prediction_id` |
 | `/analyzer/predictions/{prediction_id}/...` | The Analyzer's routes for one kept prediction (`/api/analyzer/v1/predictions/{id}/...`: descriptor, reports, payloads), forwarded read-only to the `analyze serve` the service runs on 127.0.0.1 over its runs directory |
-| `/simulations/presets` | Every sim preset: its deployment, pools (arch preset, arch, GPU, worker), axes, the captures its members replay, and per member its params, GPUs, pools and why it cannot run a capture (`unavailable`: `{error}` or `{missing: {role: rows}}`); plus the limits and the workload's JSON schema |
+| `/simulations/presets` | Every sim preset: its deployment, pools (arch preset, arch, GPU, worker), axes, the captures its members replay, and per member its params, GPUs, pools and why it cannot run a capture (`unavailable`: `{error}`, `{missing: {role: rows}}`, or `{misfit}` when the capture's requests do not fit its pools); plus the limits and the workload's JSON schema |
 | `/workloads` | Where a simulation's requests can come from: a capture; a generated trace, with each offered tracegen generator's arguments (`tracegen describe`); an upload, with the formats and tags it may declare (`simulator trace-formats`) and its size limit |
 | `POST /workloads` | The request body, a CSV of the `format` (and comma-separated `tags`) the query gives, kept for 24 h once the simulator reads it: 201 `{workload_id, input_file_format, input_file_tags, requests, expires_at}` |
 | `POST /simulate` | `{preset, params, workload}`: queues one member's simulation and answers 202 `{simulation_id, status, routing}` (below) |
@@ -182,7 +182,9 @@ chaining a trace without sessions is refused; every request's `prefix_len +
 input_len + output_len`, plus the draft tokens for a speculative worker, fits
 each pool's `max_model_len`, which is the arch's own or else its checkpoint's
 `max_position_embeddings`; and a per-position `accept_rate` has one probability
-per draft position) (400 for each). The run's directory holds the trace
+per draft position) (400 for each; a request that does not fit answers
+`detail: {message, too_long: {max_model_len, requests, total}}`, the counts
+of the simulator's own check). The run's directory holds the trace
 it replays (`workload.csv`: the source's rows, with the `accept_rate`
 column), a generated trace as tracegen wrote it
 (`generated.csv`, `.manifest.json`, `.plan.json`), the concrete run config
@@ -228,8 +230,8 @@ finished runs and marks unfinished ones failed.
   (`profiling/db/doc.py`), and the profiling registry;
 - compute dtype columns: `simulator kernel-list`, cached until the binary
   changes (`public_api/sources.py`);
-- checkpoint names and the config each one uses: `model/catalog.yaml`, reread
-  when it changes (no restart);
+- checkpoint names and the config each one uses: `model/catalog.yaml`, read
+  at start;
 - GPU peaks: `gpu/spec.json`;
 - measurements: `profile.db`, aggregates cached until the file changes.
 

@@ -92,12 +92,7 @@ def db(tmp_path: Path) -> Path:
 
 
 @pytest.fixture(autouse=True)
-def catalog(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    path = tmp_path / "catalog.yaml"
-    path.write_text(
-        "meta-llama/Meta-Llama-3-8B: {name: Llama 3 8B, family: Llama, config: llama3_8b}\n"
-    )
-    monkeypatch.setattr(library, "MODEL_CATALOG", path)
+def docs(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         library, "kernel_doc", lambda kind: GEMM_DOC if kind == "single_gemm" else None
     )
@@ -138,7 +133,10 @@ def _index() -> DeploymentIndex:
     """One preset of two members over one gemm config, three cells of which
     the fixture database measured two on the H200; the tp 2 member lacks one."""
     index = DeploymentIndex(
-        None, {"prefill": ["input_len"]}, {CHECKPOINT: {"name": "Llama 3 8B"}}, {"dense": "TP"}
+        None,
+        {"prefill": ["input_len"]},
+        {CHECKPOINT: {"name": "Llama 3 8B", "family": "Llama", "config": "llama3_8b"}},
+        {"dense": "TP"},
     )
     members = [_member(1), _member(2)]
     index.presets[PRESET] = Preset(
@@ -201,17 +199,6 @@ def test_catalog_lists_every_kind_with_coverage_and_the_models(client: TestClien
             "config": "llama3_8b",
         }
     ]
-
-
-def test_a_catalog_edit_shows_without_a_restart(client: TestClient) -> None:
-    def name() -> str:
-        return client.get(f"{PREFIX}/kernels").json()["models"][0]["name"]
-
-    assert name() == "Llama 3 8B"
-    library.MODEL_CATALOG.write_text(
-        "meta-llama/Meta-Llama-3-8B: {name: Llama 3 8B Base, family: Llama, config: llama3_8b}\n"
-    )
-    assert name() == "Llama 3 8B Base"
 
 
 def test_kernel_detail_joins_docs_args_and_backends(client: TestClient) -> None:
