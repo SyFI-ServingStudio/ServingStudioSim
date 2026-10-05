@@ -29,12 +29,15 @@ combination is supported when a sim preset has a member for it.
 The workload is the request's (:mod:`public_api.simulate`). Today it is a
 capture: one ``workload`` row of the pools' arch preset, whose routing file the
 arch reads and whose ``trace.csv`` the run replays. An arch that routes no
-experts (a dense model) has no capture rows; its member replays the trace of
-any published capture, with nothing read from that capture's routing.
+experts (a dense model) has no capture rows; its member replays the requests
+of any published capture (each distinct trace once), with nothing read from
+that capture's routing.
 """
 
 from __future__ import annotations
 
+import hashlib
+from collections import Counter
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -43,6 +46,7 @@ from typing import Any
 
 import yaml
 
+from launcher.corpus import resolve_reference
 from launcher.schema.expand import expand_sweep_params
 from public_api import preset as public_preset
 from public_api.deployments import DeploymentIndex, Member, _axes, _text
@@ -144,7 +148,7 @@ class Capture:
     arch reads from it (none for an arch that routes no experts)."""
 
     # The arch preset's `workload` row label; for a dense member, which takes
-    # any capture, the capture's directory in the dataset repo.
+    # any capture's requests, the workload label (`_all_traces`).
     name: str
     # `hf://datasets/...@<sha>/<dir>/trace.csv`.
     trace: str
@@ -181,18 +185,40 @@ def _row_captures(rows: dict) -> list[Capture]:
     return out
 
 
+def _content(reference: str) -> str:
+    """A digest of the file ``reference`` names."""
+    return hashlib.sha256(Path(resolve_reference(reference)).read_bytes()).hexdigest()
+
+
 def _all_traces(index: DeploymentIndex) -> list[Capture]:
-    """Every published capture's trace once, for a member that routes nothing:
-    named by its directory in the dataset repo, in path order."""
-    traces = {}
+    """Every published request list once, for a member that routes nothing.
+
+    Captures of one workload on several models often record the same requests;
+    each list is kept once, named by its workload label (the directory after
+    `<model>/<backend>/`), with its first model's directory added when one label
+    has several lists. The list the most captures record comes first, the
+    default."""
+    by_content: dict[str, list[str]] = {}
     for preset in index.presets.values():
         for axis in preset.axes:
             if axis["name"] != public_preset.WORKLOAD:
                 continue
             for capture in _row_captures(axis["rows"]):
-                name = capture.trace.split("@", 1)[1].split("/", 1)[1].removesuffix("/trace.csv")
-                traces.setdefault(name, Capture(name=name, trace=capture.trace))
-    return [traces[name] for name in sorted(traces)]
+                traces = by_content.setdefault(_content(capture.trace), [])
+                if capture.trace not in traces:
+                    traces.append(capture.trace)
+
+    def path(trace: str) -> list[str]:
+        return trace.split("@", 1)[1].split("/")[1:]
+
+    lists = [sorted(traces) for traces in by_content.values()]
+    labels = Counter(path(traces[0])[2] for traces in lists)
+    captures = []
+    for traces in sorted(lists, key=lambda traces: (-len(traces), path(traces[0])[2], traces[0])):
+        model, _, label = path(traces[0])[:3]
+        name = label if labels[label] == 1 else f"{label}/{model}"
+        captures.append(Capture(name=name, trace=traces[0]))
+    return captures
 
 
 @dataclass

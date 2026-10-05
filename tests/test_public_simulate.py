@@ -22,7 +22,7 @@ from fastapi.testclient import TestClient
 
 from alignment.load_generator.runner import TRACEGEN
 from public_api import preset as public_preset
-from public_api import simulate, workloads
+from public_api import sim_preset, simulate, workloads
 from public_api.app import PREFIX, create_app
 from public_api.deployments import DeploymentIndex, Member, Preset
 from public_api.kernels import KernelLibrary
@@ -32,7 +32,8 @@ from public_api.sources import Sources
 
 HF = "hf://datasets/UW-SyFI/servingstudio-workload@" + "a" * 40
 CAPTURE_DIR = f"{HF}/glm/vllm/capa/capture/20260101"
-DENSE_TRACE = "glm/vllm/capa/capture/20260101"
+# A dense member names a capture by its workload label.
+DENSE_TRACE = "capa"
 MAX_MODEL_LEN = 1000
 # The dense checkpoint's max_position_embeddings: every capture row fits it.
 DENSE_POSITIONS = 1100
@@ -137,6 +138,8 @@ def arch_presets(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         (root / preset_id).parent.mkdir(parents=True, exist_ok=True)
         (root / f"{preset_id}.yaml").write_text("{}\n")
     monkeypatch.setattr(public_preset, "PRESET_ROOT", root)
+    # Every fixture capture is its own request list.
+    monkeypatch.setattr(sim_preset, "_content", lambda reference: reference)
     return root
 
 
@@ -341,6 +344,44 @@ def test_presets_list_members_captures_and_what_cannot_run(client: TestClient) -
     ]
     pd = presets["Llama/dense_pd"]
     assert [m["gpus"] for m in pd["members"]] == [3, 5]
+
+
+def test_a_dense_member_lists_each_request_list_once(monkeypatch) -> None:
+    """Captures of one workload on several models often record the same
+    requests: a dense member lists each list once, by its workload label (with
+    a model when a label has two lists), the one most captures record first."""
+    contents = {
+        "m1/vllm/grid/capture/1": "grid",
+        "m1/vllm/diverse/capture/1": "diverse",
+        "m2/sglang/diverse/capture/2": "diverse",
+        "m1/vllm/ctx/capture/1": "ctx-a",
+        "m2/vllm/ctx/capture/1": "ctx-b",
+    }
+    rows = {
+        f"r{n}": {"routing": "popularity", "expert_popularity_file": f"{HF}/{d}/popularity.json"}
+        for n, d in enumerate(contents)
+    }
+    index = DeploymentIndex("abc123", {}, {})
+    index.presets["M/moe"] = Preset(
+        id="M/moe",
+        checkpoint="m",
+        arch="moe",
+        gpu="NVIDIA B200",
+        axes=[{"name": "workload", "values": list(rows), "rows": rows}],
+        members=[],
+    )
+
+    def directory(trace: str) -> str:
+        return trace.removeprefix(f"{HF}/").removesuffix("/trace.csv")
+
+    monkeypatch.setattr(sim_preset, "_content", lambda reference: contents[directory(reference)])
+    captures = sim_preset._all_traces(index)
+    assert [(c.name, directory(c.trace)) for c in captures] == [
+        ("diverse", "m1/vllm/diverse/capture/1"),
+        ("ctx/m1", "m1/vllm/ctx/capture/1"),
+        ("ctx/m2", "m2/vllm/ctx/capture/1"),
+        ("grid", "m1/vllm/grid/capture/1"),
+    ]
 
 
 def test_without_a_simulation_service_the_routes_answer_503(sims) -> None:

@@ -109,8 +109,9 @@ The workload is the reader's. Its requests come from one of three `source`s
 (`public_api/workloads.py`):
 
 - `capture`: a `workload` row of the pools' arch preset, whose `trace.csv` the
-  run replays. A dense member replays any published capture's trace, named by
-  its directory in the dataset repo.
+  run replays. A dense member replays any published capture's requests: each
+  distinct `trace.csv` once, named by its workload label (with its model's
+  directory when one label has two), the one most captures record first.
 - `generated`: a trace req-frontend's `tracegen` draws (a
   `session-execution-v2` file). `generator` is `{type, <argument>: value}`,
   each argument one of `tracegen describe`'s for that generator and passed to
