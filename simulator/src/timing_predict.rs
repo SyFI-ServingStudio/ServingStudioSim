@@ -204,8 +204,9 @@ impl PredictGroup {
     /// Lower to an [`ArchGroupInput`], deriving `batch_tokens` / `prefill_tokens`
     /// / `total_kv_len` exactly as the worker does in
     /// `worker/execution/unified_iter_execution.rs::build_input`, so a predicted iteration costs
-    /// identically to the same shape inside a real run.
-    fn into_arch_group(self) -> Result<ArchGroupInput> {
+    /// identically to the same shape inside a real run. Every request must fit
+    /// the arch's `max_model_len`.
+    fn into_arch_group(self, max_model_len: u32) -> Result<ArchGroupInput> {
         // decode source: exact list xor uniform shorthand xor neither.
         let decode_kv_lens = match (self.decode_kv_lens.is_empty(), self.decode_count) {
             (false, None) => self.decode_kv_lens,
@@ -222,6 +223,12 @@ impl PredictGroup {
             (true, None) => Vec::new(), // prefill-only group
         };
 
+        for &[prefix, append] in &self.prefill_chunk_pairs {
+            ensure_prefill_fits(prefix, append, max_model_len)?;
+        }
+        for &kv_len in &decode_kv_lens {
+            ensure_fits("decode KV length", kv_len, max_model_len)?;
+        }
         let prefill_chunk_pairs: Vec<(u32, u32)> = self
             .prefill_chunk_pairs
             .iter()
@@ -252,7 +259,11 @@ impl PredictCase {
     /// side does not pass through here at all — its case is the lean [`FfnArchInput`]
     /// itself, whose token counts the ffn cost reads directly. We do not assume a
     /// future arch's input aligns with this `Vec<ArchGroupInput>` shape.
-    fn into_groups(self, expected_groups: usize) -> Result<Vec<ArchGroupInput>> {
+    fn into_groups(
+        self,
+        expected_groups: usize,
+        max_model_len: u32,
+    ) -> Result<Vec<ArchGroupInput>> {
         ensure!(
             self.groups.len() == expected_groups,
             "case has {} group(s) but the model expects {}",
@@ -261,7 +272,7 @@ impl PredictCase {
         );
         self.groups
             .into_iter()
-            .map(PredictGroup::into_arch_group)
+            .map(|group| group.into_arch_group(max_model_len))
             .collect()
     }
 }
@@ -299,12 +310,7 @@ impl SpeculativePredictGroup {
         let mut group = SpeculativeArchGroupInput::default();
         for [prefix, append] in self.prefill_chunk_pairs {
             ensure!(append > 0, "prefill append must be positive");
-            ensure!(
-                prefix
-                    .checked_add(append)
-                    .is_some_and(|length| length <= max_model_len),
-                "prefill context exceeds max_model_len"
-            );
+            ensure_prefill_fits(prefix, append, max_model_len)?;
             group.prefill_tokens = group
                 .prefill_tokens
                 .checked_add(append)
@@ -317,9 +323,10 @@ impl SpeculativePredictGroup {
                 "query_len must equal draft_tokens + 1 ({query_width})"
             );
             ensure!(
-                (query_width..=max_model_len).contains(&kv_len),
-                "final verify KV length must be within query width..=max_model_len"
+                kv_len >= query_width,
+                "final verify KV length {kv_len} is shorter than the query width {query_width}"
             );
+            ensure_fits("final verify KV length", kv_len, max_model_len)?;
             group.decode_tokens = group
                 .decode_tokens
                 .checked_add(query_len)
@@ -338,6 +345,30 @@ impl SpeculativePredictGroup {
             .context("batch token sum overflows u32")?;
         Ok(group)
     }
+}
+
+/// Refuse a case request longer than the arch serves: `what` names the
+/// request's context (a decode's KV length, a prefill's prefix plus append) and
+/// `max_model_len` is the selector's [`IterArchSel::max_model_len`] (or
+/// [`AttnArchSel::max_model_len`]).
+fn ensure_fits(what: &str, context: u32, max_model_len: u32) -> Result<()> {
+    ensure!(
+        context <= max_model_len,
+        "{what} {context} exceeds max_model_len {max_model_len}"
+    );
+    Ok(())
+}
+
+/// [`ensure_fits`] for a prefill chunk: its prefix plus the tokens it appends.
+fn ensure_prefill_fits(prefix: u32, append: u32, max_model_len: u32) -> Result<()> {
+    let context = prefix
+        .checked_add(append)
+        .context("prefill context overflows u32")?;
+    ensure_fits(
+        &format!("prefill context {prefix} + {append} ="),
+        context,
+        max_model_len,
+    )
 }
 
 /// How `run_timing_predict` treats the cases once they are validated.
@@ -392,7 +423,7 @@ pub fn run_timing_predict(
             let model = build_iter_model(sel, &cfg.gpu, UNIFIED_MODEL_NAME, &bridge)
                 .context("building the iter-wise arch model")?;
             let cases: Vec<PredictCase> = load_cases(&cfg.cases_file, config_path)?;
-            let inputs = iter_inputs(&*model, cases)?;
+            let inputs = iter_inputs(&*model, sel.max_model_len()?, cases)?;
             let n = inputs.len();
             if run {
                 run_iter_cases(&*model, inputs, &cfg.log_dir);
@@ -405,7 +436,8 @@ pub fn run_timing_predict(
                 build_speculative_iter_model(sel, &cfg.gpu, UNIFIED_MODEL_NAME, &bridge)
                     .context("building the speculative iter-wise model")?;
             let cases: Vec<SpeculativePredictCase> = load_cases(&cfg.cases_file, config_path)?;
-            let inputs = speculative_iter_inputs(&*model, draft_tokens, cases)?;
+            let inputs =
+                speculative_iter_inputs(&*model, draft_tokens, sel.max_model_len()?, cases)?;
             let n = inputs.len();
             if run {
                 run_speculative_iter_cases(&*model, inputs, &cfg.log_dir);
@@ -416,7 +448,7 @@ pub fn run_timing_predict(
             let _scope = bridge.with_backend_overrides("attn", cfg.backends.get("attn"));
             let model = build_attn_model(sel, &cfg.gpu, AFD_MODEL_NAME, &bridge)?;
             let cases: Vec<PredictCase> = load_cases(&cfg.cases_file, config_path)?;
-            let inputs = attn_inputs(&*model, cases)?;
+            let inputs = attn_inputs(&*model, sel.max_model_len()?, cases)?;
             let n = inputs.len();
             if run {
                 run_attn_cases(&*model, inputs, &cfg.log_dir);
@@ -522,6 +554,7 @@ fn predict_bridge() -> Result<PerfApiBridge> {
 /// Lower the iter-wise cases to the model's input, checking each against it.
 fn iter_inputs(
     model: &dyn IterwiseUnifiedModel,
+    max_model_len: u32,
     cases: Vec<PredictCase>,
 ) -> Result<Vec<UnifiedArchInput>> {
     let expected_groups = model.num_attn_dp_groups() as usize;
@@ -532,7 +565,7 @@ fn iter_inputs(
             // Mirror `UnifiedIterExecution`: exact ragged EP source sizes are a
             // model-declared input capability, derived from the same DP groups.
             let groups = case
-                .into_groups(expected_groups)
+                .into_groups(expected_groups, max_model_len)
                 .with_context(|| format!("case {idx}"))?;
             let tokens_per_source_rank = if groups.len() > 1 {
                 groups.iter().map(|group| group.batch_tokens).collect()
@@ -577,6 +610,7 @@ fn run_iter_cases(model: &dyn IterwiseUnifiedModel, inputs: Vec<UnifiedArchInput
 fn speculative_iter_inputs(
     model: &dyn SpeculativeUnifiedModel,
     draft_tokens: u32,
+    max_model_len: u32,
     cases: Vec<SpeculativePredictCase>,
 ) -> Result<Vec<SpeculativeArchInput>> {
     let query_width = draft_tokens
@@ -593,7 +627,7 @@ fn speculative_iter_inputs(
             let groups: Vec<_> = case
                 .groups
                 .into_iter()
-                .map(|group| group.into_arch_group(query_width, model.max_model_len()))
+                .map(|group| group.into_arch_group(query_width, max_model_len))
                 .collect::<Result<_>>()
                 .with_context(|| format!("case {index}"))?;
             let tokens_per_source_rank = if groups.len() > 1 {
@@ -636,6 +670,7 @@ fn run_speculative_iter_cases(
 /// Lower the AFD attn-side cases to the model's input, checking each against it.
 fn attn_inputs(
     model: &dyn AttnLayerwiseModel,
+    max_model_len: u32,
     cases: Vec<PredictCase>,
 ) -> Result<Vec<AttnArchInput>> {
     let expected_groups = model.num_attn_dp_groups() as usize;
@@ -644,7 +679,7 @@ fn attn_inputs(
         .enumerate()
         .map(|(idx, case)| {
             let groups = case
-                .into_groups(expected_groups)
+                .into_groups(expected_groups, max_model_len)
                 .with_context(|| format!("case {idx}"))?;
             Ok(AttnArchInput { groups })
         })
@@ -904,11 +939,59 @@ mod tests {
     }
 
     #[test]
+    fn a_request_longer_than_max_model_len_is_refused_like_a_speculative_one() {
+        let decode = group(r#"{"decode_kv_lens": [100, 8193]}"#)
+            .into_arch_group(8192)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(decode, "decode KV length 8193 exceeds max_model_len 8192");
+        let prefill = group(r#"{"prefill_chunk_pairs": [[8000, 193]]}"#)
+            .into_arch_group(8192)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            prefill,
+            "prefill context 8000 + 193 = 8193 exceeds max_model_len 8192"
+        );
+        // The same check, so the same words, on the speculative side.
+        let speculative = SpeculativePredictGroup {
+            prefill_chunk_pairs: vec![[8000, 193]],
+            decode_requests: vec![],
+        };
+        assert_eq!(
+            speculative
+                .into_arch_group(6, 8192)
+                .unwrap_err()
+                .to_string(),
+            prefill
+        );
+        // At the limit is in.
+        group(r#"{"prefill_chunk_pairs": [[8000, 192]], "decode_kv_lens": [8192]}"#)
+            .into_arch_group(8192)
+            .expect("a request of exactly max_model_len fits");
+    }
+
+    #[test]
+    fn iter_cases_name_the_case_that_does_not_fit() {
+        let cases: Vec<PredictCase> = serde_json::from_str(
+            r#"[{"groups": [{"decode_kv_lens": [131072]}]},
+                {"groups": [{"decode_kv_lens": [99999999]}]}]"#,
+        )
+        .unwrap();
+        let model = crate::test_helpers::FakeModel::for_ms(1.0);
+        let err = format!("{:#}", iter_inputs(&model, 131_072, cases).unwrap_err());
+        assert_eq!(
+            err,
+            "case 1: decode KV length 99999999 exceeds max_model_len 131072"
+        );
+    }
+
+    #[test]
     fn exact_decode_list_is_used_verbatim() {
         let g = group(
             r#"{"prefill_chunk_pairs": [[0, 1025], [1024, 8]], "decode_kv_lens": [100, 200, 300]}"#,
         )
-        .into_arch_group()
+        .into_arch_group(u32::MAX)
         .unwrap();
         // prefill_tokens = Σ append_len; decode from the explicit list.
         assert_eq!(g.prefill_tokens, 1025 + 8);
@@ -921,7 +1004,7 @@ mod tests {
     #[test]
     fn uniform_shorthand_expands_to_a_flat_decode_list() {
         let g = group(r#"{"decode_count": 4, "average_decode_length": 50}"#)
-            .into_arch_group()
+            .into_arch_group(u32::MAX)
             .unwrap();
         assert_eq!(g.decode_tokens, 4);
         assert_eq!(g.decode_kv_lens, vec![50, 50, 50, 50]);
@@ -933,7 +1016,7 @@ mod tests {
     fn both_decode_forms_is_an_error() {
         let err =
             group(r#"{"decode_kv_lens": [10], "decode_count": 1, "average_decode_length": 10}"#)
-                .into_arch_group()
+                .into_arch_group(u32::MAX)
                 .unwrap_err()
                 .to_string();
         assert!(err.contains("exactly one"), "got: {err}");
@@ -942,7 +1025,7 @@ mod tests {
     #[test]
     fn decode_count_without_average_is_an_error() {
         let err = group(r#"{"decode_count": 4}"#)
-            .into_arch_group()
+            .into_arch_group(u32::MAX)
             .unwrap_err()
             .to_string();
         assert!(err.contains("average_decode_length"), "got: {err}");
@@ -955,7 +1038,7 @@ mod tests {
         )
         .unwrap();
         // Model expects 2 DP shards but the case gave 1.
-        let err = case.into_groups(2).unwrap_err().to_string();
+        let err = case.into_groups(2, u32::MAX).unwrap_err().to_string();
         assert!(err.contains("expects 2"), "got: {err}");
     }
 
@@ -997,7 +1080,9 @@ mod tests {
         )
         .unwrap();
         let model = ContextCapped(crate::test_helpers::FakeModel::for_ms(1.0));
-        let err = iter_inputs(&model, cases).unwrap_err().to_string();
+        let err = iter_inputs(&model, u32::MAX, cases)
+            .unwrap_err()
+            .to_string();
         assert_eq!(err, "case 1: context 16384 exceeds max_model_len 8192");
     }
 
