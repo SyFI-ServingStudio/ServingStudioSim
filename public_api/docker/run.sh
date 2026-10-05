@@ -25,9 +25,11 @@ hf_home=${HF_HOME:-$HOME/.cache/huggingface}
 
 runs=$repo/logs/public_api/predictions
 sims=$repo/logs/public_api/simulations
-mkdir -p "$runs" "$sims"
+uploads=$repo/logs/public_api/workloads
+mkdir -p "$runs" "$sims" "$uploads"
 
-for path in "$repo/target/release/simulator" "$repo/target/release/analyze" "$repo/profiling/profile.db"; do
+tracegen=$repo/alignment/load_generator/req-frontend/target/release/tracegen
+for path in "$repo/target/release/simulator" "$repo/target/release/analyze" "$tracegen" "$repo/profiling/profile.db"; do
   [[ -e $path ]] || { echo "$path is missing" >&2; exit 1; }
 done
 
@@ -42,7 +44,7 @@ docker rm -f "$name" >/dev/null 2>&1 || true
 # lies outside the checkout, so it is mounted too. The presets' routing
 # captures are read from the local hub cache only, so the cache is mounted too.
 # The Analyzer listens on the container's own loopback, beside the service.
-mounts=(-v "$repo:$repo:ro" -v "$runs:$runs" -v "$sims:$sims")
+mounts=(-v "$repo:$repo:ro" -v "$runs:$runs" -v "$sims:$sims" -v "$uploads:$uploads")
 git_dir=$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir)
 [[ $git_dir == "$repo"/* ]] || mounts+=(-v "$git_dir:$git_dir:ro")
 [[ -d $hf_home/hub ]] && mounts+=(-v "$hf_home/hub:$hf_home/hub:ro")
@@ -53,5 +55,5 @@ docker run -d --name "$name" --restart unless-stopped \
   "$image" \
   python -m public_api serve --bind 0.0.0.0 --port "$port" \
   --db "$repo/profiling/profile.db" --build-type release \
-  --runs-dir "$runs" --sims-dir "$sims" --analyzer-port "$((port + 1))" >/dev/null
+  --runs-dir "$runs" --sims-dir "$sims" --workloads-dir "$uploads" --analyzer-port "$((port + 1))" >/dev/null
 echo "$name serving $repo on $bind:$port"

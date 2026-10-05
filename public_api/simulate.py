@@ -1,22 +1,27 @@
 """``POST /simulate``: one sim preset member run on a reader's workload.
 
 A request names a member of a sim preset (:mod:`public_api.sim_preset`) and a
-workload. Today the workload is a capture the member offers (its arch preset's
-``workload`` row), whose ``trace.csv`` the run replays and whose routing file
-its MoE arch reads, plus the knobs below; generated and uploaded workloads will
-be other ``source`` values.
+workload. The workload's requests come from one of three sources: a
+capture the member offers (its arch preset's ``workload`` row, whose
+``trace.csv`` the run replays), a trace req-frontend's ``tracegen`` draws, or a
+CSV the reader uploaded (:mod:`public_api.workloads`). The arrival and
+concurrency knobs below apply to all three. An MoE member's routing is always
+one of its captures, the ``capture`` the request names or its first: a
+generated or uploaded workload is labelled "requests from your workload,
+routing from capture X", and nothing defaults to a synthetic routing.
 
 The service checks the request before queueing it, so a run never starts on
-input that would fail it: the member builds and is measured, every request fits
-the arch's ``max_model_len``, a speculative worker gets an ``accept_rate``.
-Then it writes the run's directory under the service's simulations directory:
-the trace it replays (the capture's first ``num_requests`` rows, with the
-acceptance column a speculative worker reads) and the concrete run config. A
-queued run is the launcher's standard single run (``launcher.sweep.run_single``,
-analyzed, without plots) in a child process (:mod:`public_api.simulate_run`),
-at most ``max_running`` at once. The Analyzer reads the finished directory; the
-answer's summary is the run's own ``summary.json`` and the Analyzer's
-``slo-general`` report.
+input that would fail it: the member builds and is measured, the simulator
+loads the trace as the run will (``simulator workload-plan``), every request
+fits each pool's ``max_model_len``, a speculative worker gets an
+``accept_rate``. Then it writes the run's directory under the service's
+simulations directory: the trace it replays (the source's first
+``num_requests`` rows, with the acceptance column a speculative worker reads)
+and the concrete run config. A queued run is the launcher's standard single run
+(``launcher.sweep.run_single``, analyzed, without plots) in a child process
+(:mod:`public_api.simulate_run`), at most ``max_running`` at once. The Analyzer
+reads the finished directory; the answer's summary is the run's own
+``summary.json`` and the Analyzer's ``slo-general`` report.
 """
 
 from __future__ import annotations
@@ -54,6 +59,7 @@ from launcher.schema.loader import Registry
 from public_api.deployments import DeploymentIndex
 from public_api.predict import _cause, missing_by_role
 from public_api.sim_preset import Capture, SimMember
+from public_api.workloads import BadWorkload, TraceSource, Workloads, describe, plan
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -70,10 +76,11 @@ _RECORD = "simulation.json"
 _TRACE = "workload.csv"
 RUN_CONFIG = "simulation.run.json"
 RUN_PRESET = "simulation.preset.json"
-
-
-class BadWorkload(ValueError):
-    """A workload this member cannot run; the message says why."""
+# A generated workload's trace, as tracegen writes it (with its manifest and
+# plan beside it); the run replays `workload.csv`, cut from it.
+_GENERATED = "generated.csv"
+# The format of a capture's `trace.csv`.
+CAPTURE_FORMAT = "text-generation-independent"
 
 
 class NotRunnable(RuntimeError):
@@ -89,13 +96,20 @@ class UnknownSimulation(LookupError):
 
 
 class Workload(BaseModel):
-    """What a simulation replays. ``source`` says where its requests come from;
-    only ``capture`` exists today."""
+    """What a simulation replays. ``source`` says where its requests come from:
+    a capture the member offers, a trace ``generator`` draws, or an ``upload``
+    (``GET /workloads`` describes both)."""
 
-    source: Literal["capture"] = "capture"
+    source: Literal["capture", "generated", "upload"] = "capture"
     # A capture the member offers (`/simulations/presets`); its first by default.
+    # Its trace is the requests of a `capture` workload; an MoE member routes
+    # every workload as this capture does.
     capture: str | None = None
-    # The capture's first `num_requests` rows; all of them by default.
+    # `generated`: `{"type": "synthetic", <tracegen argument>: value, ...}`.
+    generator: dict[str, Any] | None = None
+    # `upload`: the `workload_id` POST /workloads answered.
+    upload: str | None = None
+    # The source's first `num_requests` rows; all of them by default.
     num_requests: int | None = Field(default=None, ge=1)
     # `trace_timed` replays each request at arrival_time / request_rate;
     # `saturated` releases every request at once.
@@ -207,13 +221,25 @@ def missing_rows(
 # -- workloads -----------------------------------------------------------------
 
 
+def _max_model_len(arch: dict) -> int | None:
+    """The longest request an arch serves: its ``max_model_len``, or for an arch
+    without one, its checkpoint's ``max_position_embeddings`` (the model config
+    the simulator reads)."""
+    if arch.get("max_model_len") is not None:
+        return int(arch["max_model_len"])
+    if arch.get("model_config") is None:
+        return None
+    limit = json.loads(Path(arch["model_config"]).read_text()).get("max_position_embeddings")
+    return None if limit is None else int(limit)
+
+
 def _max_model_lens(index: DeploymentIndex, member: SimMember, capture: Capture) -> dict:
-    """Each pool's arch ``max_model_len``, for the archs that have one."""
+    """Each pool's longest request, for the archs that bound it."""
     out = {}
     for role in member.pools:
-        limit = member.arch_member(index, role, capture).arch.get("max_model_len")
+        limit = _max_model_len(member.arch_member(index, role, capture).arch)
         if limit is not None:
-            out[role] = int(limit)
+            out[role] = limit
     return out
 
 
@@ -239,59 +265,74 @@ def _accept_rate(member: SimMember, workload: Workload) -> str | None:
 
 
 def write_trace(
-    index: DeploymentIndex,
     member: SimMember,
-    capture: Capture,
+    source: TraceSource,
     workload: Workload,
     out: Path,
-) -> int:
-    """Write the trace this run replays to ``out``: the capture's first
-    ``num_requests`` rows, with an ``accept_rate`` column for a speculative
-    worker. Returns the row count; raises :class:`BadWorkload` on a trace the
-    member cannot serve."""
-    if workload.session_dependency == "chained":
-        raise BadWorkload("session_dependency chained needs a session trace; a capture has none")
-    with open(resolve_reference(capture.trace), newline="") as stream:
-        rows = list(csv.DictReader(stream))
+) -> tuple[int, list[str]]:
+    """Write the trace this run replays to ``out``: the source's first
+    ``num_requests`` rows, every column kept, with an ``accept_rate`` column for
+    a speculative worker. Returns the row count and the trace's tags; raises
+    :class:`BadWorkload` on a trace the member cannot serve."""
+    with open(source.path, newline="") as stream:
+        reader = csv.DictReader(stream)
+        fields = list(reader.fieldnames or [])
+        rows = list(reader)
     count = len(rows) if workload.num_requests is None else workload.num_requests
     if count > len(rows):
-        raise BadWorkload(f"capture {capture.name} has {len(rows)} requests, not {count}")
+        raise BadWorkload(f"{source.name} has {len(rows)} requests, not {count}")
     if count > MAX_REQUESTS:
-        raise BadWorkload(f"at most {MAX_REQUESTS} requests per simulation")
+        raise BadWorkload(
+            f"{source.name} has {count} requests; at most {MAX_REQUESTS} per simulation "
+            "(set num_requests)"
+        )
     rows = rows[:count]
     accept = _accept_rate(member, workload)
+    tags = list(source.input_file_tags)
+    if accept:
+        fields.append("accept_rate")
+        tags.append("speculative")
+    with out.open("w", newline="") as stream:
+        writer = csv.DictWriter(stream, fields)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row | ({"accept_rate": accept} if accept else {}))
+    return count, tags
+
+
+def check_requests(
+    index: DeploymentIndex, member: SimMember, capture: Capture, requests: list[dict]
+) -> None:
+    """Refuse requests a pool cannot hold: ``requests`` are the run's, as
+    ``simulator workload-plan`` reads them (a session round's context is its
+    prefix, its fresh input and its output)."""
     # A speculative request's last verify reads up to draft_tokens past its output.
     extra = _speculative_draft(member) or 0
     for role, limit in _max_model_lens(index, member, capture).items():
         over = [
-            row["id"]
-            for row in rows
-            if int(row["input_len"]) + int(row["output_len"]) + extra > limit
+            request["request_id"]
+            for request in requests
+            if request["prefix_len"] + request["input_len"] + request["output_len"] + extra > limit
         ]
         if over:
-            fit = "input_len + output_len" + (f" + {extra} draft tokens" if extra else "")
+            fit = "prefix_len + input_len + output_len" + (
+                f" + {extra} draft tokens" if extra else ""
+            )
             raise BadWorkload(
-                f"{len(over)} of {count} requests exceed pool {role}'s max_model_len {limit} "
-                f"({fit}), first ids {over[:5]}; pick a member with a longer max_model_len "
-                "or fewer requests"
+                f"{len(over)} of {len(requests)} requests exceed pool {role}'s max_model_len "
+                f"{limit} ({fit}), first ids {over[:5]}; pick a member with a longer "
+                "max_model_len or shorter requests"
             )
-    fields = ["id", "input_len", "output_len", "arrival_time"]
-    with out.open("w", newline="") as stream:
-        writer = csv.DictWriter(stream, [*fields, *(["accept_rate"] if accept else [])])
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(
-                {name: row[name] for name in fields} | ({"accept_rate": accept} if accept else {})
-            )
-    return count
 
 
-def workload_block(member: SimMember, workload: Workload, trace: Path) -> dict:
+def workload_block(
+    workload: Workload, trace: Path, input_file_format: str, input_file_tags: list[str]
+) -> dict:
     """The run config's ``workload`` for this request."""
     block: dict[str, Any] = {
         "trace_files": [str(trace)],
-        "input_file_format": "text-generation-independent",
-        "input_file_tags": ["speculative"] if _speculative_draft(member) else [],
+        "input_file_format": input_file_format,
+        "input_file_tags": input_file_tags,
         "arrival_mode": workload.arrival_mode,
         "request_rate": workload.request_rate,
         "run_to_end": workload.run_to_end,
@@ -485,7 +526,9 @@ class Simulations:
             except (OSError, ValueError, KeyError):
                 continue
             request = {
-                key: data[key] for key in ("preset", "params", "workload", "gpus") if key in data
+                key: data[key]
+                for key in ("preset", "params", "workload", "routing", "gpus")
+                if key in data
             }
             sim = Simulation(
                 id=data["simulation_id"],
@@ -650,14 +693,29 @@ def analyzer_run_id(analyzer: str, simulation_id: str) -> str | None:
     return None
 
 
+def routing(member: SimMember, capture: Capture, source: str) -> dict:
+    """Where a simulation's requests and its expert routing come from: the
+    capture it routes as (none for a dense member), and the answer's label."""
+    requests = f"capture {capture.name}" if source == "capture" else "your workload"
+    if member.dense:
+        return {"capture": None, "label": f"requests from {requests}; the model routes no experts"}
+    if source == "capture":
+        label = f"requests and routing from capture {capture.name}"
+    else:
+        label = f"requests from your workload, routing from capture {capture.name}"
+    return {"capture": capture.name, "label": label}
+
+
 @dataclass
 class SimulationService:
-    """What ``/simulations`` and ``/simulate`` answer from: the sim presets
-    (built and checked), the simulator's schema and the queue."""
+    """What ``/simulations``, ``/simulate`` and ``/workloads`` answer from: the
+    sim presets (built and checked), the simulator's schema, the queue and the
+    generated and uploaded workloads."""
 
     sims: Any  # SimIndex
     registry: Registry
     queue: Simulations
+    workloads: Workloads
 
     def presets(self) -> dict:
         return {
@@ -666,6 +724,28 @@ class SimulationService:
             "workload": Workload.model_json_schema(),
             "presets": self.sims.catalog(),
         }
+
+    def describe_workloads(self) -> dict:
+        return describe(self.workloads, self.queue.limits(), Workload.model_json_schema())
+
+    def _source(self, workload: Workload, capture: Capture, directory: Path) -> TraceSource:
+        """The file this request's requests come from."""
+        given = {"generator": workload.generator, "upload": workload.upload}
+        stray = [name for name, value in given.items() if value is not None]
+        wanted = {"capture": [], "generated": ["generator"], "upload": ["upload"]}[workload.source]
+        if stray != wanted:
+            needs = f"needs workload.{wanted[0]}" if wanted else "takes no generator or upload"
+            article = "an" if workload.source == "upload" else "a"
+            raise BadWorkload(f"{article} {workload.source} workload {needs}")
+        if workload.source == "generated":
+            return self.workloads.generate(workload.generator, directory / _GENERATED)
+        if workload.source == "upload":
+            return self.workloads.uploaded(workload.upload)
+        return TraceSource(
+            path=Path(resolve_reference(capture.trace)),
+            input_file_format=CAPTURE_FORMAT,
+            name=f"capture {capture.name}",
+        )
 
     def start(self, preset: str, params: dict, workload: Workload) -> dict:
         """Check the request, write its run directory and queue it."""
@@ -681,23 +761,27 @@ class SimulationService:
             raise NotRunnable(f"{preset} {member.params} on {capture.name}: {reason}")
         simulation_id, directory = self.queue.new_directory()
         try:
+            source = self._source(workload, capture, directory)
             trace = directory / _TRACE
-            count = write_trace(index, member, capture, workload, trace)
-            tree = run_tree(
-                index, member, capture, workload_block(member, workload, trace), directory
-            )
+            count, tags = write_trace(member, source, workload, trace)
+            block = workload_block(workload, trace, source.input_file_format, tags)
+            tree = run_tree(index, member, capture, block, directory)
             config = concrete(tree, self.registry)
+            check_requests(index, member, capture, plan(config["workload"], self.queue.build_type))
             (directory / RUN_CONFIG).write_text(json.dumps(config, indent=1))
             (directory / RUN_PRESET).write_text(json.dumps(tree, indent=1))
+            routed = routing(member, capture, workload.source)
+            # The capture the run reads: its trace, its routing, or both.
+            used = capture.name if workload.source == "capture" else routed["capture"]
             request = {
                 "preset": preset,
                 "params": member.params,
-                "workload": workload.model_dump()
-                | {"capture": capture.name, "num_requests": count},
+                "workload": workload.model_dump() | {"capture": used, "num_requests": count},
+                "routing": routed,
                 "gpus": member.summary(index)["gpus"],
             }
             sim = self.queue.submit(simulation_id, directory, request)
         except BaseException:
             shutil.rmtree(directory, ignore_errors=True)
             raise
-        return {"simulation_id": sim.id, "status": sim.status}
+        return {"simulation_id": sim.id, "status": sim.status, "routing": routed}

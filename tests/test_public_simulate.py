@@ -1,9 +1,12 @@
-"""``/simulations`` and ``/simulate``: sim presets, request checks, the queue
-and the rate limits.
+"""``/simulations``, ``/simulate`` and ``/workloads``: sim presets, request
+checks, generated and uploaded workloads, the queue and the rate limits.
 
-The arch presets are fixtures (a dense one, and an MoE speculative one with a
-capture row and a max_model_len); the sim presets are written for each test;
-a run is a small script standing in for the launcher's child process.
+The arch presets are fixtures (a dense one whose model config bounds its
+requests, and an MoE speculative one with a capture row and a max_model_len);
+the sim presets are written for each test; a run is a small script standing in
+for the launcher's child process. The simulator's trace loading (``simulator
+workload-plan``) is stood in for by reading the trace's rows, except in the
+tests marked ``needs_binary``, which run it; tracegen runs where it is built.
 """
 
 from __future__ import annotations
@@ -17,8 +20,9 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+from alignment.load_generator.runner import TRACEGEN
 from public_api import preset as public_preset
-from public_api import simulate
+from public_api import simulate, workloads
 from public_api.app import PREFIX, create_app
 from public_api.deployments import DeploymentIndex, Member, Preset
 from public_api.kernels import KernelLibrary
@@ -30,9 +34,12 @@ HF = "hf://datasets/UW-SyFI/servingstudio-workload@" + "a" * 40
 CAPTURE_DIR = f"{HF}/glm/vllm/capa/capture/20260101"
 DENSE_TRACE = "glm/vllm/capa/capture/20260101"
 MAX_MODEL_LEN = 1000
+# The dense checkpoint's max_position_embeddings: every capture row fits it.
+DENSE_POSITIONS = 1100
 DRAFT = 3
 # id, input_len, output_len: the third request does not fit MAX_MODEL_LEN.
 TRACE_ROWS = [(0, 100, 50), (1, 200, 60), (2, 900, 200), (3, 50, 10)]
+needs_tracegen = pytest.mark.skipif(not TRACEGEN.is_file(), reason="tracegen not built")
 
 DENSE_SIM = """\
 deployment: unified
@@ -75,7 +82,7 @@ sweep:
 """
 
 
-def _arch_index() -> DeploymentIndex:
+def _arch_index(model_config: Path) -> DeploymentIndex:
     index = DeploymentIndex("abc123", {}, {})
     index.presets["Llama/dense"] = Preset(
         id="Llama/dense",
@@ -88,7 +95,7 @@ def _arch_index() -> DeploymentIndex:
                 preset="Llama/dense",
                 params={"tp_size": tp},
                 gpu="NVIDIA H200",
-                arch={"type": "dense", "tp_size": tp},
+                arch={"type": "dense", "tp_size": tp, "model_config": str(model_config)},
                 block={},
                 gpus_per_replica=tp,
             )
@@ -149,7 +156,9 @@ def sims(tmp_path: Path, arch_presets: Path) -> SimIndex:
         _write(root, "Llama/dense_pd", PD_SIM),
         _write(root, "GLM/spec_speculative", SPEC_SIM),
     ]
-    sims = SimIndex.build(_arch_index(), paths)
+    config = tmp_path / "llama.json"
+    config.write_text(json.dumps({"max_position_embeddings": DENSE_POSITIONS}))
+    sims = SimIndex.build(_arch_index(config), paths)
 
     def dry_run(member, capture):
         pool = member.pools["main"] if "main" in member.pools else None
@@ -173,6 +182,29 @@ def trace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     # The launcher's expansion against the simulator's schema is its own tests'.
     monkeypatch.setattr(simulate, "concrete", lambda tree, registry: tree)
     return path
+
+
+def _rows_plan(block: dict, build_type: str = "release") -> list[dict]:
+    """Stands in for ``simulator workload-plan``: the trace's rows, as its plan
+    names them."""
+    (path,) = block["trace_files"]
+    with open(path, newline="") as stream:
+        rows = list(csv.DictReader(stream))
+    return [
+        {
+            "request_id": row.get("request_id", row.get("id")),
+            "prefix_len": int(row.get("prefix_len", 0)),
+            "input_len": int(row["input_len"]),
+            "output_len": int(row["output_len"]),
+        }
+        for row in rows
+    ]
+
+
+@pytest.fixture
+def rows_plan(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(simulate, "plan", _rows_plan)
+    monkeypatch.setattr(workloads, "plan", _rows_plan)
 
 
 RUN = """\
@@ -214,14 +246,17 @@ def _queue(tmp_path: Path, runner: Runner, **limits) -> simulate.Simulations:
     )
 
 
-def _client(sims: SimIndex, queue: simulate.Simulations, **limits) -> TestClient:
-    service = simulate.SimulationService(sims, None, queue)
+def _client(
+    sims: SimIndex, queue: simulate.Simulations, runs_dir: Path | None = None, **limits
+) -> TestClient:
+    uploads = workloads.Workloads(queue.runs_dir.parent / "uploads")
+    service = simulate.SimulationService(sims, None, queue, uploads)
     kernels = KernelLibrary(Sources(db_path=Path("/nonexistent")), sims.index)
-    return TestClient(create_app(kernels, None, None, service, **limits))
+    return TestClient(create_app(kernels, runs_dir, None, service, **limits))
 
 
 @pytest.fixture
-def client(sims, trace, tmp_path, runner) -> TestClient:
+def client(sims, trace, rows_plan, tmp_path, runner) -> TestClient:
     return _client(sims, _queue(tmp_path, runner))
 
 
@@ -243,6 +278,32 @@ def _post(client: TestClient, preset: str, params: dict, **workload):
 
 DENSE = ("Llama/dense_barebone", {"tp_size": 1, "replicas": 1})
 SPEC = ("GLM/spec_speculative", {})
+SMALL = {
+    "type": "synthetic",
+    "sessions": 3,
+    "rounds": "1",
+    "input_len": "100",
+    "output_len": "20",
+    "seed": 1,
+}
+
+
+def _upload(client: TestClient, text: str, **query):
+    return client.post(
+        f"{PREFIX}/workloads",
+        content=text.encode(),
+        params=query,
+        headers={"content-type": "text/csv"},
+    )
+
+
+def _independent(rows) -> str:
+    lines = ["id,arrival_time,input_len,output_len"]
+    lines += [
+        f"{rid},{n * 0.5},{input_len},{output_len}"
+        for n, (rid, input_len, output_len) in enumerate(rows)
+    ]
+    return "\n".join(lines) + "\n"
 
 
 # -- presets -------------------------------------------------------------------
@@ -303,9 +364,12 @@ def test_without_a_simulation_service_the_routes_answer_503(sims) -> None:
         ("Llama/dense_barebone", {"tp_size": 4, "replicas": 1}, {}, 400, "has no member"),
         ("Llama/dense_barebone", {"tp_size": 1}, {}, 400, "missing ['replicas']"),
         (*DENSE, {"capture": "nope"}, 400, "has no capture 'nope'"),
-        (*DENSE, {"num_requests": 5}, 400, "has 4 requests, not 5"),
-        (*DENSE, {"session_dependency": "chained"}, 400, "needs a session trace"),
+        (*DENSE, {"num_requests": 5}, 400, f"capture {DENSE_TRACE} has 4 requests, not 5"),
         (*DENSE, {"run_to_end": False}, 400, "needs duration_ms"),
+        (*DENSE, {"source": "generated"}, 400, "a generated workload needs workload.generator"),
+        (*DENSE, {"source": "upload"}, 400, "an upload workload needs workload.upload"),
+        (*DENSE, {"upload": "abc"}, 400, "a capture workload takes no generator or upload"),
+        (*DENSE, {"source": "upload", "upload": "abc"}, 400, "no upload 'abc'"),
         (*DENSE, {"accept_rate": 0.5}, 400, "only to a speculative worker"),
         (*SPEC, {"num_requests": 2}, 400, "needs workload.accept_rate"),
         (*SPEC, {"num_requests": 2, "accept_rate": [0.5, 0.4]}, 400, "has 2 positions"),
@@ -335,7 +399,7 @@ def test_at_most_max_requests_per_simulation(client, monkeypatch) -> None:
     monkeypatch.setattr(simulate, "MAX_REQUESTS", 3)
     answer = _post(client, *DENSE)
     assert answer.status_code == 400
-    assert "at most 3 requests" in answer.json()["detail"]
+    assert "has 4 requests; at most 3 per simulation" in answer.json()["detail"]
     assert _post(client, *DENSE, num_requests=3).status_code == 202
 
 
@@ -347,10 +411,16 @@ def test_a_simulation_runs_reports_its_summary_and_is_deleted(client, tmp_path) 
     assert started.status_code == 202
     sim_id = started.json()["simulation_id"]
 
+    assert started.json()["routing"] == {
+        "capture": None,
+        "label": f"requests from capture {DENSE_TRACE}; the model routes no experts",
+    }
+
     answer = _wait(client, sim_id)
     assert answer["status"] == "done", answer
     assert answer["preset"] == DENSE[0] and answer["params"] == DENSE[1]
     assert answer["workload"]["capture"] == DENSE_TRACE
+    assert answer["routing"] == started.json()["routing"]
     assert answer["workload"]["num_requests"] == 2
     assert answer["gpus"] == 1
     assert answer["run_id"] == f"run-{sim_id}"
@@ -370,7 +440,7 @@ def test_a_simulation_runs_reports_its_summary_and_is_deleted(client, tmp_path) 
         {
             "gpu": "NVIDIA H200",
             "replicas": 1,
-            "arch": {"type": "dense", "tp_size": 1},
+            "arch": {"type": "dense", "tp_size": 1, "model_config": str(tmp_path / "llama.json")},
             "worker": {"type": "barebone"},
         }
     ]
@@ -389,6 +459,10 @@ def test_a_simulation_runs_reports_its_summary_and_is_deleted(client, tmp_path) 
 def test_a_speculative_run_gets_its_acceptance_and_the_capture_routing(client, tmp_path) -> None:
     started = _post(client, *SPEC, num_requests=2, accept_rate=[0.9, 0.7, 0.5])
     sim_id = started.json()["simulation_id"]
+    assert started.json()["routing"] == {
+        "capture": "capa",
+        "label": "requests and routing from capture capa",
+    }
     assert _wait(client, sim_id)["status"] == "done"
 
     run = tmp_path / "sims" / sim_id
@@ -411,7 +485,7 @@ def test_a_failed_run_reports_its_cause(client, runner) -> None:
 
 
 def test_runs_queue_past_max_running_and_a_deleted_run_is_stopped(
-    sims, trace, tmp_path, runner
+    sims, trace, rows_plan, tmp_path, runner
 ) -> None:
     runner.mode = "sleep"
     client = _client(sims, _queue(tmp_path, runner, max_running=2, max_queued=1))
@@ -431,7 +505,9 @@ def test_runs_queue_past_max_running_and_a_deleted_run_is_stopped(
         client.delete(f"{PREFIX}/simulations/{sim_id}")
 
 
-def test_a_run_past_the_wall_clock_limit_is_stopped(sims, trace, tmp_path, runner) -> None:
+def test_a_run_past_the_wall_clock_limit_is_stopped(
+    sims, trace, rows_plan, tmp_path, runner
+) -> None:
     runner.mode = "sleep"
     client = _client(sims, _queue(tmp_path, runner, timeout_s=0.5))
     started = time.monotonic()
@@ -468,25 +544,30 @@ def test_a_restart_fails_unfinished_runs_and_drops_expired_ones(tmp_path, runner
 # -- rate limits ---------------------------------------------------------------
 
 
-def test_simulate_and_predict_are_rate_limited_per_client(sims, trace, tmp_path, runner) -> None:
+def test_simulate_and_predict_are_rate_limited_per_client(
+    sims, trace, rows_plan, tmp_path, runner
+) -> None:
     client = _client(
         sims,
         _queue(tmp_path, runner),
+        tmp_path / "predictions",
         predict_limit=RateLimiter(2, 60.0),
         simulate_limit=RateLimiter(1, 60.0),
+        upload_limit=RateLimiter(1, 60.0),
     )
+    # A refused request is no work done: it does not count.
+    assert _post(client, *DENSE, num_requests=9).status_code == 400
     assert _post(client, *DENSE, num_requests=1).status_code == 202
     refused = _post(client, *DENSE, num_requests=1)
     assert refused.status_code == 429
     assert int(refused.headers["Retry-After"]) >= 1
 
-    body = {"preset": "Llama/dense", "params": {"tp_size": 1}, "cases": []}
-    # This service keeps no runs directory, but the limit is counted first.
-    assert [client.post(f"{PREFIX}/predict", json=body).status_code for _ in range(3)] == [
-        503,
-        503,
-        429,
-    ]
+    body = {"preset": "Llama/dense", "params": {"tp_size": 9}, "cases": []}
+    assert [client.post(f"{PREFIX}/predict", json=body).status_code for _ in range(3)] == [400] * 3
+
+    assert _upload(client, "not,a,trace\n", tags="speculative").status_code == 400
+    assert _upload(client, _independent(TRACE_ROWS)).status_code == 201
+    assert _upload(client, _independent(TRACE_ROWS)).status_code == 429
 
 
 def test_a_rate_limit_is_a_sliding_window_per_client() -> None:
@@ -500,6 +581,163 @@ def test_a_rate_limit_is_a_sliding_window_per_client() -> None:
     now[0] = 60.0  # the first request leaves the window
     assert limiter.admit("a") is None
     assert limiter.admit("a") == pytest.approx(30.0)
+    limiter.refund("a")  # the route rejected the latest one
+    assert limiter.admit("a") is None
+
+
+# -- generated and uploaded workloads ----------------------------------------
+
+
+@needs_tracegen
+def test_workloads_describe_the_generators_arguments(client) -> None:
+    generated = client.get(f"{PREFIX}/workloads").json()["sources"]["generated"]
+    assert generated["input_file_format"] == "text-generation-session-execution-v2"
+    (synthetic,) = generated["generators"]
+    arguments = {argument["name"]: argument for argument in synthetic["arguments"]}
+    # The service names the output itself.
+    assert "out" not in arguments
+    assert arguments["input_len"]["flag"] == "--input-len"
+    assert arguments["arrival_pattern"]["choices"] == ["poisson", "constant"]
+
+
+@needs_tracegen
+@pytest.mark.parametrize("accept_rate", [0.7, [0.9, 0.7, 0.5]])
+def test_a_generated_workload_routes_as_the_members_capture(client, tmp_path, accept_rate) -> None:
+    started = _post(client, *SPEC, source="generated", generator=SMALL, accept_rate=accept_rate)
+    assert started.status_code == 202, started.json()
+    assert started.json()["routing"] == {
+        "capture": "capa",
+        "label": "requests from your workload, routing from capture capa",
+    }
+    sim_id = started.json()["simulation_id"]
+    answer = _wait(client, sim_id)
+    assert answer["workload"]["capture"] == "capa" and answer["workload"]["num_requests"] == 3
+
+    run = tmp_path / "sims" / sim_id
+    config = json.loads((run / simulate.RUN_CONFIG).read_text())
+    workload = config["workload"]
+    assert workload["input_file_format"] == "text-generation-session-execution-v2"
+    assert workload["input_file_tags"] == ["speculative"]
+    arch = config["pools"]["main"]["groups"][0]["arch"]
+    assert arch["expert_popularity_file"] == f"{CAPTURE_DIR}/popularity.json"
+    with (run / "workload.csv").open() as stream:
+        rows = list(csv.DictReader(stream))
+    assert [row["input_len"] for row in rows] == ["100"] * 3
+    assert {row["accept_rate"] for row in rows} == {
+        json.dumps(accept_rate) if isinstance(accept_rate, list) else "0.7"
+    }
+    # tracegen's record of how it drew the trace stays with the run.
+    assert json.loads((run / "generated.manifest.json").read_text())["parameters"]["seed"] == 1
+
+
+@needs_tracegen
+@pytest.mark.parametrize(
+    ("generator", "message"),
+    [
+        ({"type": "coding-session"}, "must be one of ['synthetic']"),
+        (SMALL | {"out": "/tmp/x.csv"}, "unknown ['out']"),
+        (SMALL | {"bogus": 1}, "unknown ['bogus']"),
+        (SMALL | {"input_len": "bogus"}, "is not a distribution"),
+        (SMALL | {"sessions": 0}, "--sessions must be greater than 0"),
+        (SMALL | {"seed": [1]}, "takes one number or string"),
+        (SMALL | {"input_len": "1100"}, "3 of 3 requests exceed pool main's max_model_len 1100"),
+    ],
+)
+def test_a_generator_the_service_cannot_run_is_refused(
+    client, tmp_path, generator, message
+) -> None:
+    answer = _post(client, *DENSE, source="generated", generator=generator)
+    assert answer.status_code == 400
+    assert message in answer.json()["detail"]
+    assert not any((tmp_path / "sims").iterdir())
+
+
+def test_an_uploaded_workload_is_kept_and_simulated(client, tmp_path) -> None:
+    uploaded = _upload(client, _independent([("a", 10, 5), ("b", 20, 5)]))
+    assert uploaded.status_code == 201, uploaded.json()
+    record = uploaded.json()
+    assert record["requests"] == 2
+    assert record["input_file_format"] == "text-generation-independent"
+
+    started = _post(client, *DENSE, source="upload", upload=record["workload_id"])
+    assert started.status_code == 202, started.json()
+    assert started.json()["routing"]["label"] == (
+        "requests from your workload; the model routes no experts"
+    )
+    sim_id = started.json()["simulation_id"]
+    assert _wait(client, sim_id)["workload"]["capture"] is None
+    with (tmp_path / "sims" / sim_id / "workload.csv").open() as stream:
+        assert [row["id"] for row in csv.DictReader(stream)] == ["a", "b"]
+
+    # An MoE member routes it as its capture.
+    spec = _post(client, *SPEC, source="upload", upload=record["workload_id"], accept_rate=0.5)
+    assert spec.json()["routing"]["label"] == (
+        "requests from your workload, routing from capture capa"
+    )
+
+
+def test_an_upload_too_long_for_the_checkpoint_is_refused(client) -> None:
+    # The dense arch has no max_model_len: its checkpoint's max_position_embeddings bounds it.
+    record = _upload(client, _independent([("long", 1000, 101)])).json()
+    answer = _post(client, *DENSE, source="upload", upload=record["workload_id"])
+    assert answer.status_code == 400
+    assert f"exceed pool main's max_model_len {DENSE_POSITIONS}" in answer.json()["detail"]
+
+
+def test_an_upload_past_the_limits_is_refused(client, tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(simulate, "MAX_REQUESTS", 3)
+    answer = _upload(client, _independent(TRACE_ROWS))
+    assert answer.status_code == 400
+    assert "the upload has 4 requests; a simulation runs at most 3" in answer.json()["detail"]
+    answer = _upload(client, _independent(TRACE_ROWS), tags="speculative")
+    assert "workload.accept_rate" in answer.json()["detail"]
+    monkeypatch.setattr(workloads, "MAX_UPLOAD_BYTES", 16)
+    assert _upload(client, _independent(TRACE_ROWS)).status_code == 413
+    assert not any((tmp_path / "uploads").iterdir())
+
+
+@pytest.fixture
+def binary_client(sims, trace, tmp_path, runner) -> TestClient:
+    """Like ``client``, but the simulator itself loads every trace."""
+    return _client(sims, _queue(tmp_path, runner))
+
+
+@pytest.mark.needs_binary
+def test_the_simulator_refuses_what_a_run_would_refuse(binary_client) -> None:
+    # A capture's trace declares no sessions to chain.
+    answer = _post(binary_client, *DENSE, session_dependency="chained", duration_ms=1000.0)
+    assert answer.status_code == 400
+    assert "chained needs the `session` trace tag" in answer.json()["detail"]
+    # An upload is read as the format it declares, before it is kept.
+    answer = _upload(
+        binary_client, _independent(TRACE_ROWS), format="text-generation-session-execution-v2"
+    )
+    assert answer.status_code == 400
+    assert answer.json()["detail"].startswith("trace.csv: header does not match")
+    assert _upload(binary_client, _independent(TRACE_ROWS), tags="slo").status_code == 400
+    assert _upload(binary_client, _independent(TRACE_ROWS)).json()["requests"] == 4
+
+
+@pytest.mark.needs_binary
+@needs_tracegen
+def test_a_generated_session_trace_runs_through_the_simulators_loader(binary_client) -> None:
+    generator = SMALL | {"rounds": "2"}
+    answer = _post(
+        binary_client,
+        *SPEC,
+        source="generated",
+        generator=generator,
+        accept_rate=0.6,
+        session_dependency="chained",
+        duration_ms=1000.0,
+    )
+    assert answer.status_code == 202, answer.json()
+    formats = binary_client.get(f"{PREFIX}/workloads").json()["sources"]["upload"]["formats"]
+    assert [fmt["name"] for fmt in formats] == [
+        "text-generation-independent",
+        "text-generation-session-execution-v2",
+    ]
+    assert "speculative" not in formats[0]["tags"]
 
 
 # -- sim preset shape ----------------------------------------------------------

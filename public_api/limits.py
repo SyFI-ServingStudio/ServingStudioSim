@@ -2,7 +2,8 @@
 
 Each limited route keeps, per client address, the times of its recent requests
 in this process; a request past ``limit`` within ``window_s`` seconds is
-refused with how long to wait. Nothing is shared between processes or kept
+refused with how long to wait. Only accepted work counts: a request the route
+then rejects (a 4xx answer) is refunded. Nothing is shared between processes or kept
 across a restart, and there are no keys: the client address is the only
 identity. Behind a proxy, the address is the one uvicorn takes from
 ``X-Forwarded-For`` when the proxy is in ``--forwarded-allow-ips``.
@@ -41,3 +42,10 @@ class RateLimiter:
                 for key in [k for k, v in self._seen.items() if v[-1] <= now - self.window_s]:
                     del self._seen[key]
             return None
+
+    def refund(self, client: str) -> None:
+        """Uncount ``client``'s latest admitted request: the route rejected it."""
+        with self._lock:
+            seen = self._seen.get(client)
+            if seen:
+                seen.pop()

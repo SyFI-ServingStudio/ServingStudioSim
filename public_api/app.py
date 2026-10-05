@@ -1,25 +1,28 @@
 """The FastAPI app: routes under ``/api/public/v1``. Everything is a GET but
 ``POST /predict``, which costs the reader's cases, ``POST /simulate``, which
-queues a simulation, and ``DELETE /simulations/{id}``. The prediction or
-simulation they leave is read through the Analyzer's own routes, forwarded
-read-only under ``/analyzer``. ``/predict`` and ``/simulate`` are rate limited
-per client address."""
+queues a simulation, ``POST /workloads``, which keeps an uploaded trace, and
+``DELETE /simulations/{id}``. The prediction or simulation they leave is read
+through the Analyzer's own routes, forwarded read-only under ``/analyzer``.
+The three ``POST`` routes are rate limited per client address, counting only
+the requests they accept."""
 
 from __future__ import annotations
 
 import re
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
 from public_api import predict as timing
-from public_api import simulate
+from public_api import simulate, workloads
 from public_api.deployments import BadMember, UnknownDeployment
 from public_api.kernels import BadQuery, KernelLibrary, UnknownConfig, UnknownKind
 from public_api.limits import RateLimiter
@@ -55,6 +58,7 @@ KEEP_PREDICTIONS_S = 6 * 3600
 # Requests per client address per minute.
 PREDICT_PER_MINUTE = 30
 SIMULATE_PER_MINUTE = 6
+UPLOAD_PER_MINUTE = 6
 
 
 def create_app(
@@ -65,12 +69,13 @@ def create_app(
     *,
     predict_limit: RateLimiter | None = None,
     simulate_limit: RateLimiter | None = None,
+    upload_limit: RateLimiter | None = None,
 ) -> FastAPI:
     """``runs_dir`` holds the predictions ``POST /predict`` leaves, and
     ``analyzer`` is the base URL of an ``analyze serve`` over it and over the
     simulations' directory; without them the service answers neither.
-    ``simulations`` serves the sim presets and runs; without it the
-    ``/simulat*`` routes answer 503."""
+    ``simulations`` serves the sim presets, runs and workloads; without it the
+    ``/simulat*`` and ``/workloads`` routes answer 503."""
     index = kernels.index
     sources = kernels.sources
     # Where this host keeps predictions and simulations, as the Analyzer may
@@ -85,8 +90,12 @@ def create_app(
     )
     predict_limit = predict_limit or RateLimiter(PREDICT_PER_MINUTE, 60.0)
     simulate_limit = simulate_limit or RateLimiter(SIMULATE_PER_MINUTE, 60.0)
+    upload_limit = upload_limit or RateLimiter(UPLOAD_PER_MINUTE, 60.0)
 
-    def limited(limiter: RateLimiter, request: Request) -> None:
+    @contextmanager
+    def limited(limiter: RateLimiter, request: Request) -> Iterator[None]:
+        """Count the request against its client's limit, unless the route
+        rejects it: a 4xx answer is no work done."""
         client = request.client.host if request.client else "unknown"
         wait = limiter.admit(client)
         if wait is not None:
@@ -96,6 +105,12 @@ def create_app(
                 f"retry in {wait:.0f} s",
                 headers={"Retry-After": str(max(1, round(wait)))},
             )
+        try:
+            yield
+        except HTTPException as error:
+            if error.status_code < 500:
+                limiter.refund(client)
+            raise
 
     app = FastAPI(
         title="ServingStudio public API",
@@ -123,7 +138,7 @@ def create_app(
             raise HTTPException(400, str(error)) from None
         except (timing.NotPredictable, simulate.NotRunnable) as error:
             raise HTTPException(409, str(error)) from None
-        except simulate.BadWorkload as error:
+        except workloads.BadWorkload as error:
             raise HTTPException(400, str(error)) from None
         except simulate.UnknownSimulation as error:
             raise HTTPException(404, f"no simulation {error.args[0]!r}") from None
@@ -149,7 +164,6 @@ def create_app(
     async def predict(body: PredictRequest, request: Request) -> dict:
         """Each case's time on one member, per section and per tree node."""
 
-        limited(predict_limit, request)
         if runs_dir is None:
             raise HTTPException(503, "this service keeps no runs directory")
 
@@ -162,7 +176,8 @@ def create_app(
             )
             return {"sim_commit": index.sim_commit, **result}
 
-        return await answer(run)
+        with limited(predict_limit, request):
+            return await answer(run)
 
     @app.get(f"{PREFIX}/kernels")
     async def catalog() -> dict:
@@ -213,8 +228,34 @@ def create_app(
     async def start_simulation(body: SimulateRequest, request: Request) -> dict:
         """Queue one simulation; read it with ``GET /simulations/{id}``."""
         service = need_simulations()
-        limited(simulate_limit, request)
-        return await answer(service.start, body.preset, body.params, body.workload)
+        with limited(simulate_limit, request):
+            return await answer(service.start, body.preset, body.params, body.workload)
+
+    @app.get(f"{PREFIX}/workloads")
+    async def workload_sources() -> dict:
+        """Where a simulation's requests can come from: a capture, a generator
+        (its arguments) or an upload (the formats it may declare)."""
+        return await answer(need_simulations().describe_workloads)
+
+    @app.post(f"{PREFIX}/workloads", status_code=201)
+    async def upload_workload(
+        request: Request,
+        input_file_format: str = Query(simulate.CAPTURE_FORMAT, alias="format"),
+        tags: str = "",
+    ) -> dict:
+        """Keep an uploaded trace (the request body, a CSV) for a day; the
+        answer's ``workload_id`` is a simulation's ``workload.upload``."""
+        service = need_simulations()
+        with limited(upload_limit, request):
+            body = bytearray()
+            async for chunk in request.stream():
+                body += chunk
+                if len(body) > workloads.MAX_UPLOAD_BYTES:
+                    raise HTTPException(
+                        413, f"an upload is at most {workloads.MAX_UPLOAD_BYTES} bytes"
+                    )
+            names = [tag for tag in tags.split(",") if tag]
+            return await answer(service.workloads.upload, bytes(body), input_file_format, names)
 
     @app.get(f"{PREFIX}/simulations/{{simulation_id}}")
     async def simulation(simulation_id: str) -> dict:

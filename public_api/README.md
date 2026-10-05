@@ -14,6 +14,7 @@ members (below), queued, on the served `profile.db`.
 
 ```bash
 uv run cargo build --release -p simulator -p analyzer   # the binaries it runs
+cargo build --release --manifest-path alignment/load_generator/req-frontend/Cargo.toml --bin tracegen
 uv run python -m public_api serve --bind 127.0.0.1 --port <port> --analyzer-port <port> [--db <profile.db>]
 ```
 
@@ -21,7 +22,8 @@ uv run python -m public_api serve --bind 127.0.0.1 --port <port> --analyzer-port
 default: check that each port is free and not in another user's range first.
 Kept predictions live in `--runs-dir` (default `logs/public_api/predictions`)
 and simulations in `--sims-dir` (default `logs/public_api/simulations`); the
-Analyzer reads both. `--db` defaults to the profiler's database
+Analyzer reads both. Uploaded workloads are kept in `--workloads-dir` (default
+`logs/public_api/workloads`). `--db` defaults to the profiler's database
 (`VIBESIM_PROFILE_DB` or `profiling/profile.db`). Behind a proxy, pass its
 address as `--forwarded-allow-ips` so the rate limits count the client that
 `X-Forwarded-For` names. Interactive API docs are at `/api/public/v1/docs`.
@@ -34,6 +36,7 @@ container that Docker restarts on failure and when the host reboots
 
 ```bash
 uv run cargo build --release -p simulator -p analyzer
+cargo build --release --manifest-path alignment/load_generator/req-frontend/Cargo.toml --bin tracegen
 public_api/docker/run.sh 10.158.48.50 5220
 docker logs -f servingstudio-public-api
 ```
@@ -42,15 +45,16 @@ The image holds only the Python environment, installed from `uv.lock`'s
 `public-api` and `launcher` groups, so it is rebuilt only when the lock changes.
 The container runs as the calling user and mounts the checkout read-only at the
 same path, with its git directory (a worktree's lies outside it). It serves
-that checkout's code, `profiling/profile.db` and `target/release/simulator`. To
+that checkout's code, `profiling/profile.db`, `target/release/simulator` and
+req-frontend's `tracegen`. To
 serve new code or data, update the checkout, rebuild the simulator and rerun
 `run.sh`, which replaces the container. `PUBLIC_API_CONTAINER` and `PUBLIC_API_IMAGE` override the
 container and image names.
 
 ## Routes
 
-Under `/api/public/v1`; all `GET` but `POST /predict`, `POST /simulate` and
-`DELETE /simulations/{id}`.
+Under `/api/public/v1`; all `GET` but `POST /predict`, `POST /simulate`,
+`POST /workloads` and `DELETE /simulations/{id}`.
 
 | Route | Returns |
 | --- | --- |
@@ -65,8 +69,10 @@ Under `/api/public/v1`; all `GET` but `POST /predict`, `POST /simulate` and
 | `POST /predict` | `{preset, params, cases, analyze?}`: each case's time on one member, per section and per node of its cost tree (as `analyze gen-iter-breakdown` reads it), from one `launcher timing-predict` run on the served profile.db. A member that lacks rows answers 409 naming them. With `analyze: true` the prediction is also analyzed (no plots) and kept for six hours, and the answer names it by `prediction_id` |
 | `/analyzer/predictions/{prediction_id}/...` | The Analyzer's routes for one kept prediction (`/api/analyzer/v1/predictions/{id}/...`: descriptor, reports, payloads), forwarded read-only to the `analyze serve` the service runs on 127.0.0.1 over its runs directory |
 | `/simulations/presets` | Every sim preset: its deployment, pools (arch preset, arch, GPU, worker), axes, the captures its members replay, and per member its params, GPUs, pools and why it cannot run a capture (`unavailable`); plus the limits and the workload's JSON schema |
-| `POST /simulate` | `{preset, params, workload}`: queues one member's simulation and answers 202 `{simulation_id, status}` (below) |
-| `/simulations/{simulation_id}` | Its status (`queued` with `queue_position`, `running`, `done`, `failed` with `error`, `timed_out`) and request; once done, `summary` and the Analyzer's `run_id` |
+| `/workloads` | Where a simulation's requests can come from: a capture; a generated trace, with each offered tracegen generator's arguments (`tracegen describe`); an upload, with the formats and tags it may declare (`simulator trace-formats`) and its size limit |
+| `POST /workloads` | The request body, a CSV of the `format` (and comma-separated `tags`) the query gives, kept for 24 h once the simulator reads it: 201 `{workload_id, input_file_format, input_file_tags, requests, expires_at}` |
+| `POST /simulate` | `{preset, params, workload}`: queues one member's simulation and answers 202 `{simulation_id, status, routing}` (below) |
+| `/simulations/{simulation_id}` | Its status (`queued` with `queue_position`, `running`, `done`, `failed` with `error`, `timed_out`) and request, with its `routing`; once done, `summary` and the Analyzer's `run_id` |
 | `DELETE /simulations/{simulation_id}` | Stops it if it has not finished and removes it: `{simulation_id, status: "deleted"}` |
 | `/analyzer/runs/{run_id}/...` | The Analyzer's routes for one simulation's run (`/api/analyzer/v1/runs/{id}/...`: descriptor, `subjects/<subject>/report` and `payload`), forwarded read-only. No run catalog |
 
@@ -99,11 +105,25 @@ every member as a run builds it (`simulator dry-run`: the deployment's
 each lacks; `tests/test_public_sim_presets.py` asserts that every member builds
 and is measured.
 
-The workload is a capture: a `workload` row of the pools' arch preset, whose
-routing file the arch reads and whose `trace.csv` the run replays. An MoE
-member offers only its capture rows (never a synthetic routing). A dense
-member routes nothing and replays any published capture's trace, named by its
-directory in the dataset repo.
+The workload is the reader's. Its requests come from one of three `source`s
+(`public_api/workloads.py`):
+
+- `capture`: a `workload` row of the pools' arch preset, whose `trace.csv` the
+  run replays. A dense member replays any published capture's trace, named by
+  its directory in the dataset repo.
+- `generated`: a trace req-frontend's `tracegen` draws (a
+  `session-execution-v2` file). `generator` is `{type, <argument>: value}`,
+  each argument one of `tracegen describe`'s for that generator and passed to
+  its flag as given; tracegen checks the values. The service offers
+  `synthetic` and sets `--out` itself; a generator gets 30 s and 2 GiB.
+- `upload`: a CSV kept by `POST /workloads`, named by its `workload_id`.
+
+MoE routing is always the member's capture: an MoE member offers only its
+capture rows (never a synthetic routing), and every source routes as the
+`capture` the request names, the preset's first by default. The answer's
+`routing` says so: `{capture, label}`, the label "requests and routing from
+capture X", "requests from your workload, routing from capture X", or for a
+dense member "...; the model routes no experts".
 
 ```json
 POST /api/public/v1/simulate
@@ -111,8 +131,10 @@ POST /api/public/v1/simulate
   "preset": "Meta-Llama-3-8B/llama3_dense_tp_barebone",
   "params": {"tp_size": 1, "replicas": 1},
   "workload": {
-    "source": "capture",          // the only source today
-    "capture": null,              // a name from the preset's captures; its first by default
+    "source": "generated",        // "capture" (default), "generated" or "upload"
+    "capture": null,              // capture source: its trace; MoE: its routing. The preset's first by default
+    "generator": {"type": "synthetic", "sessions": 100, "rounds": "1", "input_len": "lognormal:1024,0.8"},
+    "upload": null,               // upload source: a workload_id from POST /workloads
     "num_requests": null,         // the trace's first N rows; all by default
     "arrival_mode": "trace_timed",// or "saturated"
     "request_rate": 1.0,          // arrival_time / request_rate
@@ -126,15 +148,28 @@ POST /api/public/v1/simulate
 ```
 
 Before it queues, the request is checked: the member exists (400 with
-`choices` otherwise) and builds and is measured on that capture (409), every
-request's `input_len + output_len` (plus the draft tokens for a speculative
-worker) fits each pool's `max_model_len`, a speculative worker gets
-`accept_rate` and no other worker does, a capture has no sessions to chain,
-and there are at most 2000 requests (400). The run's directory holds the trace
-it replays (`workload.csv`, with the `accept_rate` column), the concrete run
-config (`simulation.run.json`) and the record (`simulation.json`). A queued
-run is the launcher's standard single run (`launcher.sweep.run_single`,
-analyzed, no plots) in a child process (`public_api/simulate_run.py`).
+`choices` otherwise) and builds and is measured on that capture (409); the
+source's fields are given (`generator` for `generated`, `upload` for `upload`,
+neither for `capture`); there are at most 2000 requests; a speculative worker
+gets `accept_rate` and no other worker does; the simulator loads the trace as
+the run will (`simulator workload-plan` on the run config's `workload` block:
+format, tags, every row, the replay settings, so chaining a trace without
+sessions is refused); and every request's `prefix_len + input_len +
+output_len` (plus the draft tokens for a speculative worker) fits each pool's
+`max_model_len`, or for an arch without one, its checkpoint's
+`max_position_embeddings` (400 for each). The run's directory holds the trace
+it replays (`workload.csv`: the source's first `num_requests` rows, with the
+`accept_rate` column), a generated trace as tracegen wrote it
+(`generated.csv`, `.manifest.json`, `.plan.json`), the concrete run config
+(`simulation.run.json`) and the record (`simulation.json`). A queued run is
+the launcher's standard single run (`launcher.sweep.run_single`, analyzed, no
+plots) in a child process (`public_api/simulate_run.py`).
+
+`POST /workloads` reads the body (at most 1 MiB, 413 past it) as the declared
+`format` and `tags` with the same `simulator workload-plan` and keeps it only
+when it loads and has at most 2000 requests. It takes no `speculative` tag:
+acceptance is the simulation's `accept_rate`, which the service checks against
+the worker's draft width.
 
 Once `done`, `summary` is the run's `summary.json` and the Analyzer's
 `slo-general` report:
@@ -150,9 +185,11 @@ Once `done`, `summary` is the run's `summary.json` and the Analyzer's
 Limits (`public_api/simulate.py`, `public_api/app.py`): two simulations run
 at once and up to 32 wait (429 past that); a run is stopped after 10 minutes
 of wall clock and marked `timed_out`; a run and its directory are removed 24
-hours after it was submitted. `POST /predict` takes 30 and `POST /simulate` 6
+hours after it was submitted, and an upload 24 hours after it arrived.
+`POST /predict` takes 30, and `POST /simulate` and `POST /workloads` 6,
 requests per minute per client address (429 with `Retry-After`), counted in
-the process. A restart keeps finished runs and marks unfinished ones failed.
+the process; a request the route refuses (4xx) is not counted. A restart keeps
+finished runs and marks unfinished ones failed.
 
 ## Sources
 
@@ -169,13 +206,17 @@ the process. A restart keeps finished runs and marks unfinished ones failed.
 
 ## Agent skills
 
-Two skills teach a coding agent to use these routes:
+Three skills teach a coding agent to use these routes:
 
 - `skills/servingstudio-kernel-performance/SKILL.md` answers kernel-performance
   questions: find the kind, read what it measures and how, then filter its rows.
 - `skills/servingstudio-timing-predict/SKILL.md` predicts iteration times: pick
   a member from `/models`, read its kernels, build cases from its `predict` shape,
   then `POST /predict`.
+- `skills/servingstudio-simulate/SKILL.md` simulates a deployment on a request
+  stream: pick a member from `/simulations/presets`, choose a capture, a
+  generated trace or an upload, `POST /simulate`, then read
+  `/simulations/{id}`.
 
 Install them with the `skills` CLI, which finds every `SKILL.md` under the path
 it is given:

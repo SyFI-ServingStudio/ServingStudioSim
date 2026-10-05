@@ -42,6 +42,12 @@ def main(argv: list[str] | None = None) -> int:
         default=REPO_ROOT / "logs" / "public_api" / "simulations",
         help="Where simulations run and are kept for a day. Inside the checkout, like --runs-dir.",
     )
+    serve.add_argument(
+        "--workloads-dir",
+        type=Path,
+        default=REPO_ROOT / "logs" / "public_api" / "workloads",
+        help="Where uploaded workloads are kept for a day.",
+    )
     # No default, as for --port; it listens on 127.0.0.1 only.
     serve.add_argument(
         "--analyzer-port", type=int, required=True, help="Port of the Analyzer it starts."
@@ -56,10 +62,11 @@ def main(argv: list[str] | None = None) -> int:
 
     import uvicorn
 
+    from alignment.load_generator.runner import TRACEGEN
     from launcher.exec import analyzer_binary_path
     from launcher.schema.loader import schema_from_dict
     from profiling.gpu_policy import disable_gpus
-    from public_api import predict, simulate
+    from public_api import predict, simulate, workloads
     from public_api.app import create_app
     from public_api.deployments import DeploymentIndex
     from public_api.kernels import KernelLibrary, git_commit
@@ -77,6 +84,11 @@ def main(argv: list[str] | None = None) -> int:
         )
     if not args.db.exists():
         parser.error(f"{args.db} does not exist")
+    if not TRACEGEN.exists():
+        parser.error(
+            f"{TRACEGEN} is missing; run `cargo build --release --manifest-path "
+            "alignment/load_generator/req-frontend/Cargo.toml --bin tracegen`"
+        )
     # Built once: the presets, the binary and the captures are fixed for the
     # life of the service. Which rows each member lacks is asked of profile.db
     # now too, so a member the site offers is one it can predict.
@@ -122,7 +134,9 @@ def main(argv: list[str] | None = None) -> int:
                 KernelLibrary(sources, index),
                 args.runs_dir.resolve(),
                 f"http://{bind}",
-                simulate.SimulationService(sims, registry, queue),
+                simulate.SimulationService(
+                    sims, registry, queue, workloads.Workloads(args.workloads_dir, args.build_type)
+                ),
             ),
             host=args.bind,
             port=args.port,
