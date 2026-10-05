@@ -20,13 +20,13 @@ use crate::common::{
     SpeechGenerationDefinition, TextGenerationDefinition, Time, VideoGenerationDefinition,
     VideoTextGenerationDefinition,
 };
-use release::ReplayScheduler;
+use release::{ReplayScheduler, SessionDependency};
 use schema::TraceDefinition;
 
 pub use arrival::{
     ReleaseMetadata, ScheduledRequest, SchedulingDeclaration, SessionReleaseMetadata,
 };
-pub use release::{ArrivalMode, ArrivalSchedule, CapacityLimit, SessionDependency};
+pub use release::{ArrivalMode, ArrivalSchedule, CapacityLimit};
 pub use schema::{InputFileFormat, InputFileSchema, RequestFamily, SourceIdentities, TraceTag};
 
 /// Typed immutable requests plus a definition-blind replay scheduler.

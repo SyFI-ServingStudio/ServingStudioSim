@@ -98,7 +98,7 @@ impl CapacityLimit {
 
 /// Whether requests are causally independent or chained within each session.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SessionDependency {
+pub(crate) enum SessionDependency {
     Independent,
     Chained,
 }
@@ -109,7 +109,7 @@ impl SessionDependency {
     /// rounds), each row on its own otherwise. A session trace's later rounds
     /// carry their session's arrival, not their own, so replaying them
     /// independently would release a whole conversation at once.
-    pub fn of(schema: &InputFileSchema) -> Self {
+    pub(crate) fn of(schema: &InputFileSchema) -> Self {
         if schema.carries(TraceTag::Session) || schema.input_file_format.has_session_topology() {
             Self::Chained
         } else {
