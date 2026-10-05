@@ -25,6 +25,34 @@ _NUM_HEADS_BY_ARCH_MAJOR = {
 _STORAGE_IDENTITY = ("fp8_e4m3", "fp8_e4m3", "fp32", "fp32", "fp32", False)
 
 
+def check_deepgemm_mqa_logits_shape(label: str, num_heads: int, head_dim: int) -> None:
+    """Reject a head shape no DeepGEMM build instantiates, before anything loads.
+
+    Shared with dsa_mqa_logits_prefill's deepgemm_fp8 backend, which calls the
+    same kernel family.
+    """
+    all_head_counts = frozenset().union(*_NUM_HEADS_BY_ARCH_MAJOR.values())
+    if num_heads not in all_head_counts or head_dim not in _HEAD_DIMS:
+        raise ProfilerNotImplemented(
+            f"{label} needs num_heads in {sorted(all_head_counts)} and head_dim in "
+            f"{sorted(_HEAD_DIMS)}, got ({num_heads}, {head_dim})"
+        )
+
+
+def require_deepgemm_mqa_logits_heads(torch: Any, label: str, num_heads: int) -> None:
+    """Require this device's arch build to have a kernel for ``num_heads``.
+
+    The worker has already checked the backend's declared device rule, so CUDA
+    is present and the arch major is one DeepGEMM builds.
+    """
+    arch_major = int(torch.cuda.get_device_capability(torch.cuda.current_device())[0])
+    if num_heads not in _NUM_HEADS_BY_ARCH_MAJOR.get(arch_major, frozenset()):
+        raise ProfilerNotImplemented(
+            f"{label} has no DeepGEMM FP8 MQA-logits kernel for num_heads={num_heads} "
+            f"on SM{arch_major}x"
+        )
+
+
 @dataclass(frozen=True)
 class _Operands:
     q: Any
@@ -50,12 +78,7 @@ def _validate_args(
     output_dtype: object,
     clean_logits: bool,
 ) -> tuple[IndexerPrefillChunk, ...]:
-    all_head_counts = frozenset().union(*_NUM_HEADS_BY_ARCH_MAJOR.values())
-    if num_heads not in all_head_counts or head_dim not in _HEAD_DIMS:
-        raise ProfilerNotImplemented(
-            f"{_BACKEND} needs num_heads in {sorted(all_head_counts)} and head_dim in "
-            f"{sorted(_HEAD_DIMS)}, got ({num_heads}, {head_dim})"
-        )
+    check_deepgemm_mqa_logits_shape(_BACKEND, num_heads, head_dim)
     storage_identity = (
         str(q_dtype),
         str(k_dtype),
@@ -182,15 +205,8 @@ def profile_dsa_compressed_mqa_logits_prefill_deepgemm(
     except ImportError as exc:
         raise ProfilerNotImplemented(f"{_BACKEND} requires pinned vLLM DeepGEMM") from exc
     try:
-        if not torch.cuda.is_available():
-            raise ProfilerNotImplemented(f"{_BACKEND} requires CUDA")
+        require_deepgemm_mqa_logits_heads(torch, _BACKEND, num_heads)
         device = torch.device("cuda", torch.cuda.current_device())
-        arch_major = torch.cuda.get_device_capability(device)[0]
-        if num_heads not in _NUM_HEADS_BY_ARCH_MAJOR.get(arch_major, frozenset()):
-            raise ProfilerNotImplemented(
-                f"{_BACKEND} has no DeepGEMM FP8 MQA-logits kernel for num_heads={num_heads} "
-                f"on SM{arch_major}x"
-            )
         operands = tuple(
             _build_operands(torch, chunk, device, num_heads, head_dim) for chunk in chunks
         )

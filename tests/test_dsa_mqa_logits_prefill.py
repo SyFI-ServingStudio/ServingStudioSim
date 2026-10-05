@@ -347,7 +347,7 @@ def test_deepgemm_accepts_every_instantiated_head_shape(num_heads, head_dim):
 def test_deepgemm_rejects_uninstantiated_head_shapes(num_heads, head_dim):
     from profiling.runners.attention.dsa_mqa_logits_prefill import _validate_args
 
-    with pytest.raises(ValueError, match="num_heads in"):
+    with pytest.raises(ProfilerNotImplemented, match="num_heads in"):
         _validate_args(
             **(_BASE_SPEC | {"num_heads": num_heads, "head_dim": head_dim}),
             backend="deepgemm_fp8",
@@ -387,22 +387,16 @@ def test_torch_backend_requires_cuda_but_no_gpu_allowlist():
 
 
 def test_deepgemm_device_check_is_the_per_arch_head_set():
-    from profiling.runners.attention.dsa_mqa_logits_prefill import (
-        _validate_deepgemm_cuda_device,
+    from profiling.runners.attention.dsa_compressed_mqa_logits_prefill_deepgemm import (
+        require_deepgemm_mqa_logits_heads as require_heads,
     )
 
-    no_cuda = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False))
-    with pytest.raises(ProfilerNotImplemented, match="CUDA is required"):
-        _validate_deepgemm_cuda_device(no_cuda, num_heads=64)
-
     # Any SM90 part (H100 included) runs the SM90 kernels.
-    _validate_deepgemm_cuda_device(_fake_cuda((9, 0), "NVIDIA H100"), num_heads=32)
-    _validate_deepgemm_cuda_device(_fake_cuda((10, 0), "NVIDIA B200"), num_heads=8)
-    _validate_deepgemm_cuda_device(_fake_cuda((12, 0)), num_heads=16)
+    require_heads(_fake_cuda((9, 0), "NVIDIA H100"), "deepgemm", 32)
+    require_heads(_fake_cuda((10, 0), "NVIDIA B200"), "deepgemm", 8)
+    require_heads(_fake_cuda((12, 0)), "deepgemm", 16)
     with pytest.raises(ProfilerNotImplemented, match="num_heads=8 on SM9x"):
-        _validate_deepgemm_cuda_device(_fake_cuda((9, 0)), num_heads=8)
-    with pytest.raises(ProfilerNotImplemented, match="on SM8x"):
-        _validate_deepgemm_cuda_device(_fake_cuda((8, 0)), num_heads=64)
+        require_heads(_fake_cuda((9, 0)), "deepgemm", 8)
 
 
 def test_deepgemm_cupti_filter_is_architecture_agnostic():
@@ -429,8 +423,6 @@ def test_deepgemm_entry_rejects_invalid_args_before_framework_loading(monkeypatc
         ({"num_keys": 0}, "must be > 0"),
         ({"num_queries": 129, "num_keys": 128}, "must be <= num_keys"),
         ({"num_sequences": 2}, "num_sequences=1"),
-        ({"num_heads": 48}, r"num_heads in \[8, 16, 32, 64\]"),
-        ({"head_dim": 96}, r"head_dim in \[32, 64, 128\]"),
         ({"q_dtype": DType.BF16}, "q_dtype=k_dtype=fp8_e4m3"),
         ({"k_dtype": DType.FP16}, "q_dtype=k_dtype=fp8_e4m3"),
         ({"k_scale_dtype": DType.BF16}, "k_scale_dtype=weight_dtype"),
@@ -441,6 +433,12 @@ def test_deepgemm_entry_rejects_invalid_args_before_framework_loading(monkeypatc
     ]
     for overrides, match in invalid_cases:
         with pytest.raises(ValueError, match=match):
+            runner.profile_dsa_mqa_logits_prefill_deepgemm_fp8(**(_BASE_SPEC | overrides))
+    for overrides, match in (
+        ({"num_heads": 48}, r"num_heads in \[8, 16, 32, 64\]"),
+        ({"head_dim": 96}, r"head_dim in \[32, 64, 128\]"),
+    ):
+        with pytest.raises(ProfilerNotImplemented, match=match):
             runner.profile_dsa_mqa_logits_prefill_deepgemm_fp8(**(_BASE_SPEC | overrides))
     assert not loaded
 
