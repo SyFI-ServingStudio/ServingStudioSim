@@ -354,9 +354,11 @@ async def run_one(
     ANALYSIS_LEVELS). ``render=False`` (``--no-plot``) keeps a full analysis
     but draws no PNGs.
 
-    Public so the alignment timing-predict stage can reuse the exact predictor
-    execution/snapshot path.
+    Public so the public API's ``/predict`` runs the CLI's own execution and
+    snapshot path.
     """
+    if analysis not in ANALYSIS_LEVELS:
+        raise ValueError(f"analysis must be one of {ANALYSIS_LEVELS}, not {analysis!r}")
     cfg = _load_config(config_path)
     log_dir = Path(cfg["log_dir"])
     if not log_dir.is_absolute():

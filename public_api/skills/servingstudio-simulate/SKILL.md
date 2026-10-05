@@ -198,7 +198,7 @@ The request is checked before it queues:
 | Status | Cause | `detail` |
 | --- | --- | --- |
 | 400 | `params` miss an axis, name an unknown one, or match no member | `{message, choices}`; `choices` lists every member's `params` |
-| 400 | A bad workload: an unknown capture or upload, a generator argument tracegen rejects, a trace the simulator cannot read, more than 2000 requests, a request longer than a pool's `max_model_len` (prefix + input + output, plus the draft tokens of a speculative worker), a missing or wrong `accept_rate` (both the request's and an upload's column, or a list that is not `draft_tokens` long) | the reason, naming the request or argument |
+| 400 | A bad workload: an unknown capture or upload, a generator argument tracegen rejects, a trace the simulator cannot read, more than 2000 requests, a request longer than a pool's `max_model_len` (prefix + input + output, plus the draft tokens of a speculative worker; a capture's own requests included, which `/simulations/presets` lists as its `misfit`), a missing or wrong `accept_rate` (both the request's and an upload's column, or a list that is not `draft_tokens` long) | the reason, naming the request or argument; for a request too long, `{message, too_long: {max_model_len, requests, total}}` |
 | 404 | Unknown preset id | `no public preset '...'` |
 | 409 | The member does not build or lacks profile.db rows for that capture | the reason; pick another member or capture |
 | 413 | An upload over `max_bytes` | the limit |

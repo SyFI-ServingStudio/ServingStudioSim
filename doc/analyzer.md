@@ -459,6 +459,10 @@ The read-only protocol is:
   architecture/GPU provenance, lifecycle, and detail hrefs.
 - `GET /api/analyzer/v1/predictions/{prediction_id}/subjects/cases/payload?offset=&limit=` pages the
   snapshotted case inputs together with their exact operation summaries.
+- `GET /api/analyzer/v1/predictions/{prediction_id}/subjects/{subject}/{report,payload}` returns any
+  other subject's report or payload as `analyze run` wrote it into the
+  prediction's directory, named by the subject registry: `available: false`
+  for a subject that does not apply to a prediction, 404 for one that did not run.
 - `GET /api/analyzer/v1/predictions/{prediction_id}/cases/{case_id}/operations/{operation_id}/subjects/cost-tree/payload`
   reconstructs one exact tree, with `time_share`: the operation's critical-path
   composition (`kernel_time_ms`, `segments`, `kinds`), attributed as

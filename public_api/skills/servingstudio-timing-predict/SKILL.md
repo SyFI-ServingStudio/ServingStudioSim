@@ -46,7 +46,9 @@ Each member gives:
 - `gpus_per_replica`: the GPUs one replica of this deployment occupies.
 - `predict`: the case shape it accepts. `selector` is `iter`,
   `speculative_iter`, `attn` or `ffn`; `groups` is how many groups each case
-  must have; a speculative member also gives `query_width` and `max_model_len`.
+  must have; `max_model_len` is the longest request a case may hold (every
+  member but an FFN side, which holds no context); a speculative member also
+  gives `query_width`.
 - `missing`: profile.db rows its kernels lack, `{kind: count}`. Only a member
   with an empty `missing` can be predicted.
 - `error`: why the member does not build, or null.
@@ -161,9 +163,8 @@ once the verify step has run, and the member's `query_width` (draft tokens + 1):
 [{"tokens_per_group": [64, 64]}, {"tokens_per_group": [4096, 128]}]
 ```
 
-A member with a `max_model_len` (in `predict` for a speculative member, in
-`params` for others that sweep it) rejects a prefill whose
-`prefix_len + append_len` exceeds it, and a decode KV length above it. A
+A member rejects a prefill whose `prefix_len + append_len` exceeds its
+`predict.max_model_len`, and a decode KV length above it. A
 speculative `kv_len` must also be at least `query_width`.
 
 ## 4. Predict
@@ -212,7 +213,7 @@ Errors carry `detail`:
 | Status | Cause | `detail` |
 | --- | --- | --- |
 | 400 | `params` miss an axis, name an unknown one, or match no member | `{message, choices}`; `choices` lists every member's `params` |
-| 400 | Bad cases: empty, more than 64, wrong group count, unknown field, a length past `max_model_len`, a wrong query width | the simulator's message, naming the case |
+| 400 | Bad cases: empty, more than 64, wrong group count, unknown field, a length past `max_model_len`, a wrong query width | the simulator's message, naming the case; for a length past `max_model_len`, `{message, too_long: {max_model_len, requests: null, total: null}}` |
 | 404 | Unknown preset id | `no public preset '...'` |
 | 409 | The member does not build, lacks profile.db rows, or a case needs a row nobody measured | the build error or the missing rows; the service never profiles, so report it and pick another member or shape |
 
