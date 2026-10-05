@@ -1,6 +1,7 @@
 //! CPU handoff test: Arrow request geometry -> Python accountant -> R6/R7.
 //! Location sets are independently checked against real compiled trees by the
-//! simulator's speculative_necessary_work_maps_cover_the_compiled_locations test.
+//! simulator's speculative_necessary_work_maps_cover_the_compiled_locations and
+//! dflash2_necessary_work_map_covers_the_compiled_locations tests.
 
 use std::sync::Arc;
 
@@ -24,17 +25,29 @@ async fn speculative_exact_iteration_handoff_reconciles_r6_r7() {
     // and `tempdir_in` on a missing directory fails before the test starts.
     let logs = repo.join("logs");
     std::fs::create_dir_all(&logs).unwrap();
-    for (mode, depth, mapping) in [
-        ("index_share", 5, "index_share"),
-        ("full_index", 5, "full_index"),
-        ("index_share", 1, "single_draft"),
+    let mtp = |mode: &str, depth: u32| {
+        json!({"type":"glm52_vllm_nvfp4_dsa_moe_speculative",
+            "model_config":"model/config/glm52_nvfp4.json", "mtp_mode":mode,"draft_tokens":depth})
+    };
+    for (arch, depth, mapping) in [
+        (mtp("index_share", 5), 5, "glm52_speculative_index_share"),
+        (mtp("full_index", 5), 5, "glm52_speculative_full_index"),
+        (mtp("index_share", 1), 1, "glm52_speculative_single_draft"),
+        (
+            json!({"type":"glm53_vllm_nvfp4_dsa_moe_dflash2",
+                "model_config":"model/config/glm52_nvfp4.json",
+                "draft_tokens":7, "draft_sliding_window":2048}),
+            7,
+            "glm53_vllm_nvfp4_dsa_moe_dflash2",
+        ),
     ] {
         let dir = tempfile::tempdir_in(&logs).unwrap();
         std::fs::create_dir(dir.path().join("raw")).unwrap();
-        std::fs::write(dir.path().join("raw/params.json"), json!({"pools":{"main":{"groups":[{
-            "gpu":"NVIDIA B200", "arch":{"type":"glm52_vllm_nvfp4_dsa_moe_speculative",
-                "model_config":"model/config/glm52_nvfp4.json", "mtp_mode":mode,"draft_tokens":depth}
-        }]}}}).to_string()).unwrap();
+        std::fs::write(
+            dir.path().join("raw/params.json"),
+            json!({"pools":{"main":{"groups":[{"gpu":"NVIDIA B200", "arch":arch}]}}}).to_string(),
+        )
+        .unwrap();
         let width = depth + 1;
         let geometry = json!({"draft_tokens":depth,"max_model_len":8192,
             "prefill":[[0,8]],"decode":[[100+width,width]]});
@@ -77,10 +90,7 @@ async fn speculative_exact_iteration_handoff_reconciles_r6_r7() {
             .await
             .unwrap();
         let map: Value = serde_json::from_slice(
-            &std::fs::read(repo.join(format!(
-                "model/work/location_maps/glm52_speculative_{mapping}.json"
-            )))
-            .unwrap(),
+            &std::fs::read(repo.join(format!("model/work/location_maps/{mapping}.json"))).unwrap(),
         )
         .unwrap();
         let locations: Vec<_> = map["locations"]
