@@ -29,7 +29,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from alignment.load_generator.runner import TRACEGEN
-from launcher.exec import _build_subprocess_env, binary_path
+from launcher.exec import ERROR_JSON, _build_subprocess_env, binary_error, binary_path
+from public_api.predict import _cause
 
 # The generators the service runs: `coding-session` materializes a corpus file
 # from this host, which a reader cannot name.
@@ -74,25 +75,18 @@ def _simulator(args: list[str], build_type: str) -> subprocess.CompletedProcess:
     )
 
 
-def _error(stderr: str, *paths: Path | str) -> str:
-    """A tool's error for a reader: without its `Error: ` prefix, and each of
-    ``paths`` (this host's files) by its name only."""
-    message = stderr.strip().removeprefix("Error: ")
-    for path in sorted(map(str, paths), key=len, reverse=True):
-        message = message.replace(path, Path(path).name)
-    return message
-
-
 def plan(block: dict, build_type: str = "release") -> list[dict]:
     """The requests a run of the ``workload`` block ``block`` releases, one per
     row, as ``simulator workload-plan`` loads them; raises
     :class:`BadWorkload` with the simulator's reason when a run could not."""
-    with tempfile.TemporaryDirectory(prefix="public-workload-") as scratch:
-        path = Path(scratch) / "workload.json"
+    with tempfile.TemporaryDirectory(prefix="public-workload-") as directory:
+        scratch = Path(directory)
+        path, error = scratch / "workload.json", scratch / ERROR_JSON
         path.write_text(json.dumps(block))
-        result = _simulator(["workload-plan", str(path)], build_type)
-    if result.returncode:
-        raise BadWorkload(_error(result.stderr, *block["trace_files"], path))
+        result = _simulator(["workload-plan", str(path), "--error-json", str(error)], build_type)
+        if result.returncode:
+            traces = {Path(trace).parent for trace in block["trace_files"]}
+            raise BadWorkload(_cause(binary_error(error), result.stderr, scratch, *traces))
     return json.loads(result.stdout)["requests"]
 
 
@@ -189,7 +183,8 @@ class Workloads:
                 "ask for fewer sessions or rounds"
             ) from None
         if result.returncode:
-            message = _error(result.stderr, out).split("\n\nFor more information", 1)[0]
+            stderr = result.stderr.strip().removeprefix("Error: ")
+            message = _cause(None, stderr, out.parent).split("\n\nFor more information", 1)[0]
             if not message:  # killed at the memory limit
                 message = "it ran out of memory; ask for fewer sessions or rounds"
             raise BadWorkload(f"generator {kind}: {message}")
