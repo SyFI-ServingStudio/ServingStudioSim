@@ -141,7 +141,7 @@ def create_app(
 
     @app.get(f"{PREFIX}/models/{{checkpoint}}/{{arch}}/tree")
     async def tree(checkpoint: str, arch: str, request: Request) -> dict:
-        """One member's cost tree, structure only; the query names each axis."""
+        """One member's kernels, by section and slot; the query names each axis."""
         params = dict(request.query_params)
         return await answer(index.tree, f"{checkpoint}/{arch}", params)
 

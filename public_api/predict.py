@@ -10,9 +10,9 @@ removes it (:func:`prune`). The service sets ``SERVINGSTUDIO_NO_GPU``, so a row 
 case needs and profile.db lacks fails the request with the step that would have
 needed a GPU, instead of profiling it. Nothing writes profile.db.
 
-The answer is in terms of the member's tree (:meth:`DeploymentIndex.tree`): per
-case, per section, the total, each node's time by node id and each slot's time,
-backend and coverage by slot index.
+The answer is per case, per section: the total, the cost tree with each node's
+time as the Analyzer reads it (``analyze gen-iter-breakdown``), and each slot's
+backend and coverage by the slot index of :meth:`DeploymentIndex.tree`.
 
 :func:`missing_specs` asks the same launcher entry, as a dry run, which profile.db
 rows the member's kernels lack; a member that lacks any is not predictable.

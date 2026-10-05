@@ -69,7 +69,7 @@ selector:
 curl -s "$API/models" | jq '.case_fields'
 ```
 
-## 2. Read the member's cost tree
+## 2. Read the member's kernels
 
 The tree route takes the preset's `id` from `/models`, which has the form
 `{checkpoint directory}/{arch}`, and every axis as a query parameter:
@@ -77,18 +77,15 @@ The tree route takes the preset's `id` from `/models`, which has the form
 ```bash
 curl -s "$API/models/Meta-Llama-3-8B/llama3_dense_tp/tree?tp_size=2" > tree.json
 jq '{arch, gpu, gpus_per_replica, predict, missing}' tree.json
-jq -r '.sections[] | .section as $s | .nodes | to_entries[]
-  | select(.value.label) | [$s, .key, .value.kind, .value.label] | @tsv' tree.json
+jq -r '.sections[] | .section as $s | .slots | to_entries[]
+  | [$s, .key, .value.name, .value.kernel, .value.config] | @tsv' tree.json
 ```
 
-`sections` holds one tree per section (`iter`, `attn`, or the five `ffn`
-sections). In each, `nodes[i]` is node `i`, and node 0 is the root. A node's
-`kind` sets how its time combines its `children`: `sum` adds them, `max` takes
-the largest and divides by `overlap`, `scale` multiplies their sum by `n` (a repeat,
-such as the layers), and `leaf` is one kernel, `slots[slot]`. A slot gives its
-`name`, its `kernel` kind, the `backends` it may use, and its `config`.
-Labels name the module and its partition, such as
-`unified.attn_block (AttnBlockTpWorklet) [tp=2; ...]`.
+`sections` holds one entry per section (`iter`, `attn`, or the five `ffn`
+sections). Its `slots` are the section's kernel leaves: slot `j` gives its
+`name`, its `kernel` kind, the `backends` it may use, and its `config`. The
+tree that combines them comes with each prediction (step 4), where every leaf
+names its slot.
 
 `configs` maps each config id to its kernel `kind`, its scalar `identity`, the
 names of its `structured` fields, and `missing`, the rows this member asks of
@@ -189,8 +186,8 @@ Each entry's `sections` gives, per section:
 
 - `total_ms` and `energy_j`, the section's time and modeled energy;
 - `nodes`, the case's cost tree as the Analyzer reads it (`analyze
-  gen-iter-breakdown`), root first in display order. Each node has its tree
-  `node` id, `kind`, `depth`, `label`, `ms` (one call), `total_ms` (`ms` times
+  gen-iter-breakdown`), root first in display order. Each node has its
+  `node` id, `kind` (`sum`, `max`, `scale` or `leaf`), `depth`, `label`, `ms` (one call), `total_ms` (`ms` times
   every enclosing `scale` node's n), `pct` (`total_ms` over the root's), and
   `critical` (on the chain of slowest children from the root, the rows
   `iter_breakdown.ans` marks with ▸). A leaf names its `slot`; runs of

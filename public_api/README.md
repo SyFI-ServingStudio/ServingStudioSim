@@ -61,8 +61,8 @@ Under `/api/public/v1`; all `GET` but `POST /predict`, `POST /simulate` and
 | `/kernels/{kind}/configs` | Every kernel config a public deployment asks the kind's rows for: its `id`, GPU, cache axes, cells and how many each backend measured, the profile.db args every cell shares (`fixed`) and the ones the axes move (`swept`), the Rust config's scalar fields (`identity`; `structured` names the rest) and its `uses` (preset, member params, roles) |
 | `/kernels/{kind}/configs/{id}` | One config with its whole identity and its grid: per cell, coordinates, profile.db args, whether the kernel can run it, and each backend's measured metrics there |
 | `/models` | Every checkpoint of `model/catalog.yaml` with its public presets (`presets/public/<checkpoint>/<arch type>.yaml`): the arch's reader-facing name (`arch_name`, from `model/arch_catalog.yaml`), axes, and per member its params, GPUs per replica, prediction shape and the profile.db rows it lacks (`missing`, `{kind: count}`); plus `case_fields`, the fields of a prediction case per shape |
-| `/models/{checkpoint}/{arch}/tree` | One member's cost tree, structure only; the query gives every axis of the preset. Each leaf names its config by `id`, the key of `/kernels/{kind}/configs/{id}`; `configs` gives each config's identity and the profile.db rows this member asks of it and lacks (`missing`) |
-| `POST /predict` | `{preset, params, cases, analyze?}`: each case's time on one member, per section and per tree node, from one `launcher timing-predict` run on the served profile.db. A member that lacks rows answers 409 naming them. With `analyze: true` the prediction is also analyzed (no plots) and kept for six hours, and the answer names it by `prediction_id` |
+| `/models/{checkpoint}/{arch}/tree` | One member's kernels: each section's leaf slots; the query gives every axis of the preset. Each slot names its config by `id`, the key of `/kernels/{kind}/configs/{id}`; `configs` gives each config's identity and the profile.db rows this member asks of it and lacks (`missing`) |
+| `POST /predict` | `{preset, params, cases, analyze?}`: each case's time on one member, per section and per node of its cost tree (as `analyze gen-iter-breakdown` reads it), from one `launcher timing-predict` run on the served profile.db. A member that lacks rows answers 409 naming them. With `analyze: true` the prediction is also analyzed (no plots) and kept for six hours, and the answer names it by `prediction_id` |
 | `/analyzer/predictions/{prediction_id}/...` | The Analyzer's routes for one kept prediction (`/api/analyzer/v1/predictions/{id}/...`: descriptor, reports, payloads), forwarded read-only to the `analyze serve` the service runs on 127.0.0.1 over its runs directory |
 | `/simulations/presets` | Every sim preset: its deployment, pools (arch preset, arch, GPU, worker), axes, the captures its members replay, and per member its params, GPUs, pools and why it cannot run a capture (`unavailable`); plus the limits and the workload's JSON schema |
 | `POST /simulate` | `{preset, params, workload}`: queues one member's simulation and answers 202 `{simulation_id, status}` (below) |
@@ -174,7 +174,7 @@ Two skills teach a coding agent to use these routes:
 - `skills/servingstudio-kernel-performance/SKILL.md` answers kernel-performance
   questions: find the kind, read what it measures and how, then filter its rows.
 - `skills/servingstudio-timing-predict/SKILL.md` predicts iteration times: pick
-  a member from `/models`, read its tree, build cases from its `predict` shape,
+  a member from `/models`, read its kernels, build cases from its `predict` shape,
   then `POST /predict`.
 
 Install them with the `skills` CLI, which finds every `SKILL.md` under the path

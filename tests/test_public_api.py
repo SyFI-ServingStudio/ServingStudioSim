@@ -121,7 +121,6 @@ def _member(tp_size: int) -> Member:
         sections=[
             {
                 "section": "layer",
-                "nodes": [{"kind": "leaf", "slot": 0}],
                 "slots": [
                     {
                         "name": "qkv",

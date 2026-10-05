@@ -165,26 +165,10 @@ def _axes(preset: dict) -> list[dict]:
     return axes
 
 
-def _tree(section: dict, configs: list[str | None]) -> dict:
-    """One manifest section as ``{section, nodes, slots}``: node ``i`` is the
-    flat manifest's node ``i`` (0 the root), each with its children's ids.
-    ``configs`` is each slot's config id."""
-    nodes = []
-    for index, raw in enumerate(section["nodes"]):
-        ((kind, body),) = raw.items()
-        node: dict[str, Any] = {"kind": kind.lower()}
-        if kind == "Leaf":
-            node["slot"] = body
-        else:
-            node["children"] = list(range(body["children"]["start"], body["children"]["end"]))
-            if kind == "Max":
-                node["overlap"] = body["overlap"]
-            elif kind == "Scale":
-                node["n"] = body["n"]
-        label = section["node_labels"][index]
-        if label:
-            node["label"] = label
-        nodes.append(node)
+def _section(section: dict, configs: list[str | None]) -> dict:
+    """One manifest section's kernel slots, ``{section, slots}``; ``configs``
+    is each slot's config id. A prediction gives the tree itself, as the
+    Analyzer reads it."""
     slots = [
         {
             "name": slot["name"],
@@ -194,7 +178,7 @@ def _tree(section: dict, configs: list[str | None]) -> dict:
         }
         for slot, config in zip(section["slots"], configs, strict=True)
     ]
-    return {"section": section["section"], "nodes": nodes, "slots": slots}
+    return {"section": section["section"], "slots": slots}
 
 
 class DeploymentIndex:
@@ -311,7 +295,7 @@ class DeploymentIndex:
         ]
         # The simulator names the record each slot's kernel reads.
         member.sections = [
-            _tree(section, [None if i is None else ids[i] for i in slots])
+            _section(section, [None if i is None else ids[i] for i in slots])
             for section, slots in zip(
                 built["cost_manifest"]["sections"], built["slot_configs"], strict=True
             )
@@ -394,8 +378,8 @@ class DeploymentIndex:
         }
 
     def tree(self, preset_id: str, params: dict[str, Any]) -> dict:
-        """One member's cost tree: structure only. A prediction's times are by
-        this document's node ids and slot indices."""
+        """One member's kernels: each section's slots and the configs they
+        read. A prediction's tree names its leaves by these slot indices."""
         _, member = self.member(preset_id, params)
         configs = {}
         for section in member.sections:
