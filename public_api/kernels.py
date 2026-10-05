@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from profiling.db.args import DType
-from profiling.db.doc import CATEGORIES, SUBCATEGORIES, arg_docs, kernel_doc
+from profiling.db.doc import CATEGORIES, SUBCATEGORIES, arg_docs, kernel_doc, kind_vocabulary
 from profiling.db.doc import METRICS as METRIC_DOCS
 from profiling.db.registry import BackendSupport, MetricFamily, iter_kernel_profiler_specs
 from profiling.db.storage import CREATED_AT_FORMAT, RUN_AT_FORMAT, RUN_TABLE, iso_sql
@@ -195,6 +195,14 @@ class KernelLibrary:
         return self.sources.cached_by_db(("coverage", kind), compute)
 
     # -- documents -----------------------------------------------------------------
+
+    @staticmethod
+    def kinds() -> dict:
+        """Each kind's title and category from its DOC, as the Analyzer's
+        ``/api/analyzer/v1/kernel-kinds`` serves them
+        (:func:`profiling.db.doc.kind_vocabulary`)."""
+
+        return kind_vocabulary()
 
     def catalog(self) -> dict:
         """Every registered kind with its coverage, the GPUs with their peaks, and

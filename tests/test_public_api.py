@@ -476,27 +476,14 @@ def test_a_forwarded_report_names_its_prediction_not_the_host_path(
     assert answer.json() == {"log_dir": "72dd8769"}
 
 
-def test_the_kernel_kinds_are_forwarded(
-    db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from public_api import app as app_module
+def test_the_kernel_kinds_are_the_docs_vocabulary(db: Path, tmp_path: Path) -> None:
+    """Served from the kind DOCs in process, as the Analyzer serves them, so
+    Read more names kernels without an Analyzer round trip."""
+    from profiling.db.doc import kind_vocabulary
 
-    seen = []
-
-    def analyzer(request: httpx.Request) -> httpx.Response:
-        seen.append(request.url.path)
-        return httpx.Response(200, json={"kinds": {}})
-
-    real = httpx.AsyncClient
-    monkeypatch.setattr(
-        app_module.httpx,
-        "AsyncClient",
-        lambda **kwargs: real(transport=httpx.MockTransport(analyzer), **kwargs),
-    )
     kernels = KernelLibrary(FixtureSources(db_path=db), _index())
-    client = TestClient(create_app(kernels, tmp_path, "http://analyzer"))
-    assert client.get(f"{PREFIX}/analyzer/kernel-kinds").json() == {"kinds": {}}
-    assert seen == ["/api/analyzer/v1/kernel-kinds"]
+    client = TestClient(create_app(kernels, tmp_path, None))
+    assert client.get(f"{PREFIX}/analyzer/kernel-kinds").json() == kind_vocabulary()
 
 
 def test_a_failed_run_names_no_host_path(tmp_path: Path) -> None:

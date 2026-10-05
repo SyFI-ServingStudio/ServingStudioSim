@@ -270,14 +270,14 @@ def create_app(
         await answer(need_simulations().queue.delete, simulation_id)
         return {"simulation_id": simulation_id, "status": "deleted"}
 
-    async def relay(route: str, request: Request) -> Response:
-        """The Analyzer's answer to ``GET /api/analyzer/v1/<route>``."""
+    async def forward(kind: str, resource_id: str, subject: str, request: Request) -> Response:
         if analyzer is None:
             raise HTTPException(503, "this service runs no Analyzer")
+        if not _SUBJECT.fullmatch(subject) or ".." in subject.split("/"):
+            raise HTTPException(404, f"no {kind} route {subject!r}")
+        url = f"{analyzer}/api/analyzer/v1/{kind}/{resource_id}/{subject}"
         async with httpx.AsyncClient(timeout=120) as client:
-            answer = await client.get(
-                f"{analyzer}/api/analyzer/v1/{route}", params=request.query_params
-            )
+            answer = await client.get(url, params=request.query_params)
         content = answer.content
         # Some reports name the run's directory; keep only its own name.
         for root in hidden_roots:
@@ -287,11 +287,6 @@ def create_app(
             status_code=answer.status_code,
             media_type=answer.headers.get("content-type"),
         )
-
-    async def forward(kind: str, resource_id: str, subject: str, request: Request) -> Response:
-        if not _SUBJECT.fullmatch(subject) or ".." in subject.split("/"):
-            raise HTTPException(404, f"no {kind} route {subject!r}")
-        return await relay(f"{kind}/{resource_id}/{subject}", request)
 
     @app.get(f"{PREFIX}/analyzer/predictions/{{prediction_id}}/{{subject:path}}")
     async def prediction_subject(prediction_id: str, subject: str, request: Request) -> Response:
@@ -308,10 +303,10 @@ def create_app(
         return await forward("runs", run_id, subject, request)
 
     @app.get(f"{PREFIX}/analyzer/kernel-kinds")
-    async def kernel_kinds(request: Request) -> Response:
-        """The Analyzer's ``/api/analyzer/v1/kernel-kinds``: each kernel kind's
-        title and category from its DOC, by which a result names and groups its
-        kernels."""
-        return await relay("kernel-kinds", request)
+    async def kernel_kinds() -> dict:
+        """The Analyzer's ``/api/analyzer/v1/kernel-kinds``, read here from the
+        same DOCs: each kernel kind's title and category, by which a result
+        names and groups its kernels."""
+        return await answer(kernels.kinds)
 
     return app

@@ -77,7 +77,7 @@ Under `/api/public/v1`; all `GET` but `POST /predict`, `POST /simulate`,
 | `/simulations/{simulation_id}` | Its status (`queued` with `queue_position`, `running`, `done`, `failed` with `error`, `timed_out`) and request, with its `routing`; once done, `summary` and the Analyzer's `run_id` |
 | `DELETE /simulations/{simulation_id}` | Stops it if it has not finished and removes it: `{simulation_id, status: "deleted"}` |
 | `/analyzer/runs/{run_id}/...` | The Analyzer's routes for one simulation's run (`/api/analyzer/v1/runs/{id}/...`: descriptor, `subjects/<subject>/report` and `payload`), forwarded read-only. No run catalog |
-| `/analyzer/kernel-kinds` | The Analyzer's `/api/analyzer/v1/kernel-kinds`: each kernel kind's title and category from its DOC, by which Read more names and groups a result's kernels |
+| `/analyzer/kernel-kinds` | What the Analyzer's `/api/analyzer/v1/kernel-kinds` serves, read here from the same DOCs (`profiling.db.doc.kind_vocabulary`, no Analyzer needed): each kernel kind's title and category, by which Read more names and groups a result's kernels |
 
 A config's `id` hashes its kind, GPU and identity (`KernelConfig::identity`:
 every field but `gpu_name` and `backends`, each `Dim` at its value, and a routing

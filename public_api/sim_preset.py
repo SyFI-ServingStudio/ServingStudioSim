@@ -53,6 +53,7 @@ from public_api.deployments import DeploymentIndex, Member, _axes, find_member
 REPO_ROOT = public_preset.REPO_ROOT
 SIM_PRESET_ROOT = REPO_ROOT / "presets" / "public_sim"
 
+
 class SimPresetError(ValueError):
     """A sim preset that does not describe a supported deployment."""
 
@@ -296,8 +297,17 @@ class SimMember:
     def summary(self, index: DeploymentIndex) -> dict:
         gpus = 0
         pools = {}
+        # Its GPUs from the first capture its pools bind for; `_bind` records
+        # why one does not.
+        arch: dict[str, Member] = {}
+        for capture in self.captures if not self.error else []:
+            try:
+                arch = {role: self.arch_member(index, role, capture) for role in self.pools}
+                break
+            except Exception:  # noqa: BLE001, S112 — BadMember, UnknownDeployment
+                continue
         for role, pool in self.pools.items():
-            member = self.arch_member(index, role, self.captures[0]) if not self.error else None
+            member = arch.get(role)
             per_replica = member.gpus_per_replica if member else None
             if per_replica is not None:
                 gpus += per_replica * pool["replicas"]
@@ -408,7 +418,7 @@ class SimIndex:
             raise SimPresetError(f"{preset_id}: its pools' arch presets have different captures")
         captures = rows[0] if rows[0] is not None else _all_traces(self.index)
         if not captures:
-            # A member's first capture is its default and names its GPUs.
+            # A member's first capture is its default.
             raise SimPresetError(f"{preset_id}: no published trace to replay")
         return captures
 

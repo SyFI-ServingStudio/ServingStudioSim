@@ -147,8 +147,15 @@ class Workload(BaseModel):
 # -- run configs ---------------------------------------------------------------
 
 
+# The trace tag of a file with its own `accept_rate` column; the simulator's
+# reader takes the column only from a file tagged so.
+SPECULATIVE_TAG = "speculative"
+
+
 def _drafts(member: SimMember) -> bool:
-    """Whether one of the member's pools runs a speculative worker."""
+    """Whether one of the member's pools runs a speculative worker. Read from
+    the preset's worker type, not :attr:`SimMember.bounds`: a trace is written
+    once before the build gives the bounds (:func:`check_capture`)."""
     return any(pool["worker"]["type"] == "speculative" for pool in member.pools.values())
 
 
@@ -226,7 +233,7 @@ def check_capture(
     gives one, and its value changes neither answer."""
     source = trace_source(Path(resolve_reference(capture.trace)), capture.name, build_type)
     stand_in = None
-    if _drafts(member) and "speculative" not in source.input_file_tags:
+    if _drafts(member) and SPECULATIVE_TAG not in source.input_file_tags:
         stand_in = 1.0
     workload = Workload(source="capture", capture=capture.name, accept_rate=stand_in)
     with tempfile.TemporaryDirectory(prefix="public-sim-check-") as directory:
@@ -289,7 +296,7 @@ def _accept_rate(
         if workload.accept_rate is not None:
             raise BadWorkload("accept_rate applies only to a speculative worker")
         return None
-    own = "speculative" in source.input_file_tags
+    own = SPECULATIVE_TAG in source.input_file_tags
     rate = workload.accept_rate
     if rate is None:
         if own:
@@ -370,14 +377,14 @@ def write_trace(
     check_count(source.name, len(rows))
     accept = _accept_rate(member, workload, source, _draft_tokens(bounds))
     tags = list(source.input_file_tags)
-    if not _drafts(member) and "speculative" in tags:
-        tags.remove("speculative")
+    if not _drafts(member) and SPECULATIVE_TAG in tags:
+        tags.remove(SPECULATIVE_TAG)
         fields.remove("accept_rate")
         rows = [{k: v for k, v in row.items() if k != "accept_rate"} for row in rows]
     shortened = _fit_draft_window(bounds, rows)
     if accept:
         fields.append("accept_rate")
-        tags.append("speculative")
+        tags.append(SPECULATIVE_TAG)
     with out.open("w", newline="") as stream:
         writer = csv.DictWriter(stream, fields)
         writer.writeheader()
