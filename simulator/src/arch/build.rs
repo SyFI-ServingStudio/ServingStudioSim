@@ -945,6 +945,11 @@ pub fn qwen3_vllm_moe(
         .context("building vLLM-aligned FP8 Qwen3-MoE model")
 }
 
+/// The one expert-parallel width the DeepSeek V4 selectors model, over one
+/// NVLink domain of as many GPUs: the selectors take no `ep_size`, and routing
+/// and the parallel layout both read it from here.
+const DEEPSEEK_V4_EP_SIZE: u16 = 4;
+
 /// Build DeepSeek V4 through the same routing-profile loader used by Qwen and
 /// GLM. `serialize_streams` changes only CostTree composition; kernel inputs and
 /// profile identities remain identical. `step_tokens` is the most tokens one
@@ -968,14 +973,14 @@ pub fn deepseek_v4_vllm(
         routing_kind,
         routing_seed,
         model_cfg.num_experts.get(),
-        4,
+        DEEPSEEK_V4_EP_SIZE,
         model_cfg.num_layers,
         model_cfg.top_k,
         expert_popularity_file,
     )?;
     let parallel = DeepseekV4VllmParallel {
-        ep_size: 4,
-        nvl_num_gpu: 4,
+        ep_size: DEEPSEEK_V4_EP_SIZE,
+        nvl_num_gpu: DEEPSEEK_V4_EP_SIZE,
         gpu_name: gpu.to_string(),
         serialize_streams,
         max_num_batched_tokens: step_tokens.unwrap_or(model_cfg.max_model_len),
