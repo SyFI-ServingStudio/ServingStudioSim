@@ -31,8 +31,9 @@ class Bf16FusedMoeArgs(KernelArgs):
     dtype: DType = arg(doc="Element type of the hidden states and expert weights.")
     routing_method: str = arg(
         doc=(
-            "Router rule; only minimax2 is measured: sigmoid scores plus a "
-            "selection bias, weights renormalized."
+            "Router rule, as FlashInfer's RoutingMethodType names it; the runner "
+            "builds minimax2: sigmoid scores plus a selection bias, weights "
+            "renormalized."
         )
     )
     n_group: int = arg(unit="groups", doc="Expert groups considered by the router.")

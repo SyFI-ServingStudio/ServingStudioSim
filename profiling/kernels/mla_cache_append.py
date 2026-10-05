@@ -1,7 +1,7 @@
 """Plain MLA paged-cache append kernel kind.
 
-The first backend measures the two-write Torch semantic composite for
-GLM-5.2's 512-wide latent plus 64-wide RoPE cache entry. The production-aligned
+The first backend measures the two-write Torch semantic composite for a
+512-wide latent plus 64-wide RoPE cache entry. The production-aligned
 backend measures vLLM's fused one-launch CUDA implementation.
 """
 

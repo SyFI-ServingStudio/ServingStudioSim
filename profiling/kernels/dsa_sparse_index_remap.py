@@ -1,4 +1,4 @@
-"""GLM-5.2 request-local to global sparse-index remap kernel kind."""
+"""Request-local to global sparse-index remap kernel kind."""
 
 from __future__ import annotations
 

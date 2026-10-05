@@ -27,7 +27,7 @@ _LOGITS_DTYPE = DType.FP32
 _INDEX_DTYPE = "int32"
 _CONTEXT_MODE = "uniform"
 # The callable's K instantiations (vLLM csrc/libtorch_stable/topk.cu dispatch);
-# GLM-5.3-Flash's kpool indexer selects 2048 / 4. Every backend, the fork's and
+# an indexer over 4-token key pools selects 2048 / 4. Every backend, the fork's and
 # the Torch reference's included, shares this bound and the workspace below.
 VLLM_TOP_K = frozenset({512, 1024, 2048})
 # The corrected extension builds SASS for sm_90 only
@@ -660,7 +660,7 @@ def profile_dsa_persistent_topk_decode_vllm_cuda(
 ) -> ComputeMetrics:
     """Profile the persistent callable (corrected v0.23 on sm_90, image vLLM elsewhere).
 
-    For GLM-5.3-Flash kpool (``top_k`` 512), ``context_len`` is the row's pool
+    For an indexer over key pools (``top_k`` 512), ``context_len`` is the row's pool
     count and ``max_model_len`` the token-wide logits width. The call passes
     ``max_seq_len = context_len``; production passes the batch's token maximum,
     which only gates the <=32-row cooperative radix setup (``> 32768``).
