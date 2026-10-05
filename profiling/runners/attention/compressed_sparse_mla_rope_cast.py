@@ -1,4 +1,5 @@
-"""Profile DeepSeek V4.1 mega attention (one layer's decode or prefill segment).
+"""Profile FlashMLA mega attention: compressed sparse MLA with fused RoPE and FP8 cast
+(one layer's decode or prefill segment).
 
 Both backends build the same paged batch from ``query_context_pairs``: a
 128-token MXFP8 sliding-window cache, and for ``compress_ratio`` 1 or 2 a
@@ -34,7 +35,6 @@ from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerN
 from profiling.runners.metrics import ComputeMetrics
 
 KIND = "compressed_sparse_mla_rope_cast"
-_GPU_NAME = "NVIDIA B200"
 _MODES = ("decode", "prefill")
 _HEAD_DIM = 512
 _ROPE_DIM = 64
@@ -326,16 +326,6 @@ def _build_workload(torch: Any, shape: _Shape, device: Any, writer: Any) -> _Wor
     )
 
 
-def _require_b200(torch: Any) -> Any:
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented(f"{KIND} requires CUDA")
-    device = torch.device("cuda", torch.cuda.current_device())
-    name = str(torch.cuda.get_device_name(device))
-    if name != _GPU_NAME or torch.cuda.get_device_capability(device)[0] != 10:
-        raise ProfilerNotImplemented(f"{KIND} requires {_GPU_NAME} (SM100), got {name}")
-    return device
-
-
 def _logical_work(shape: _Shape, work: _Workload) -> tuple[float, float]:
     """FLOPs and bytes of the attention math plus, for prefill, the KV gathers.
 
@@ -410,7 +400,7 @@ def _profile(shape: _Shape, backend: str, build_and_check: Any) -> ComputeMetric
     except ImportError as exc:  # pragma: no cover - environment dependent
         raise ProfilerNotImplemented("PyTorch is unavailable") from exc
     try:
-        device = _require_b200(torch)
+        device = torch.device("cuda", torch.cuda.current_device())
         work, run = build_and_check(torch, device)
         torch.cuda.synchronize(device)
         time_ms = Timer.cupti(run, kernel_name=None)
@@ -617,7 +607,7 @@ def _q_fused(q: Any) -> Any:
 
 
 def profile_compressed_sparse_mla_rope_cast_flashmla_mega(**kwargs: Any) -> ComputeMetrics:
-    """Time the fork's mega-attention decode or prefill segment on a B200."""
+    """Time the fork's mega-attention decode or prefill segment."""
     shape = _validate_args(**kwargs)
 
     def build(torch: Any, device: Any) -> tuple[_Workload, Any]:

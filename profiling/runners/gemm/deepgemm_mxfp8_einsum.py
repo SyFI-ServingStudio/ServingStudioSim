@@ -1,5 +1,5 @@
-"""DeepSeek-V4.1 ``wo_a`` grouped MXFP8 einsum — the
-``deepgemm_mxfp8_einsum_grouped_o_proj`` backend of ``batched_gemm``.
+"""Grouped attention output projection (``wo_a``) as one DeepGEMM MXFP8
+einsum — the ``deepgemm_mxfp8_einsum_grouped_o_proj`` backend of ``batched_gemm``.
 
 Source: alignment fork ``servingstudio-alignment-v41``.
 ``DeepseekV4MegaAttnAttention._o_proj``
@@ -18,8 +18,8 @@ Operands, per rank (``h = num_batches`` local ``wo_a`` groups):
   ``alloc_mega_attn_output``. It holds all ``64 / 8 = 8`` padded head-group
   slots, and the einsum reads the first ``h``. So the A row stride is
   ``8 * K``, and the scale is packed-UE8M0 int32, MN-major (token stride 1).
-  This backend freezes that layout, the way the GLM backends of this kind
-  freeze theirs.
+  This backend freezes that layout, the way the MLA absorption backends of
+  this kind freeze theirs.
 - B ``[h, N, K]``: ``wo_a`` as MXFP8 (E4M3 data plus a UE8M0 scale per row and
   32 K elements). The checkpoint stores ``[32, 32]`` blocks, which the fork's
   ModelOpt MXFP8 path expands to per-row scales. It goes through the
@@ -83,10 +83,6 @@ def _load_runtime() -> tuple[Any, Any, Any, Any]:
         import torch
     except ImportError as exc:
         raise ProfilerNotImplemented(f"torch is required for {BACKEND}") from exc
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented(f"{BACKEND} requires CUDA")
-    if tuple(torch.cuda.get_device_capability()) != (10, 0):
-        raise ProfilerNotImplemented(f"{BACKEND} is verified on SM100 (B200) only")
     try:
         from vllm.model_executor.kernels.linear.mxfp8.deep_gemm import (
             DeepGemmMxfp8BmmLinearKernel,

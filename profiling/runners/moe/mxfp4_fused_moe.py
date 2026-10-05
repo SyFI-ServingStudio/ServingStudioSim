@@ -1,8 +1,8 @@
 """Whole FlashInfer TRT-LLM MXFP4 x MXFP8 routed MoE on SM100.
 
 The timed callable is ``flashinfer.trtllm_fp4_block_scale_routed_moe`` invoked
-exactly as vLLM's modular ``TrtLlmMxfp4ExpertsModular._invoke_kernel`` does for
-DeepSeek-V4.1-Flash (``vllm/model_executor/layers/fused_moe/experts/
+exactly as vLLM's modular ``TrtLlmMxfp4ExpertsModular._invoke_kernel`` does
+(``vllm/model_executor/layers/fused_moe/experts/
 trtllm_mxfp4_moe.py:361``, reached from ``models/deepseek_v4/nvidia/model.py``
 through ``Mxfp4MoEMethod.apply`` with the ``FLASHINFER_TRTLLM_MXFP4_MXFP8``
 backend):
@@ -15,8 +15,8 @@ backend):
 - weights: MXFP4 E2M1 + UE8M0 group-32 scales, converted by vLLM's own
   ``convert_weight_to_mxfp4_moe_kernel_format`` (W3/W1 row interleave, epilogue
   tile 128 shuffle, scale interleave);
-- routing: precomputed ``(topk_ids int32, topk_weights fp32)`` from the DSv4
-  top-k router; the call only permutes (``routingIndicesCluster``), with
+- routing: precomputed ``(topk_ids int32, topk_weights fp32)`` from an
+  upstream top-k router; the call only permutes (``routingIndicesCluster``), with
   ``routing_method_type=Renormalize`` and no routed scale (the router already
   applied it);
 - activation: SwiGLU with the ``swiglu_limit`` clamp as ``gemm1_clamp_limit``;
@@ -82,10 +82,6 @@ def _load_runtime() -> tuple[Any, Any, Any, Any]:
         )
     except ImportError as exc:
         raise ProfilerNotImplemented("FlashInfer and the vLLM fork are required") from exc
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented("MXFP4 fused MoE profiling requires CUDA")
-    if tuple(torch.cuda.get_device_capability()) != (10, 0):
-        raise ProfilerNotImplemented("MXFP4 fused MoE profiling requires SM100")
     return (
         torch,
         mxfp8_e4m3_quantize,
@@ -224,7 +220,7 @@ def _prepared_weights(
 
 
 def routing_tensors(torch: Any, ids: list[list[int]], *, seed: int, device: Any) -> tuple[Any, Any]:
-    """DSv4-router-shaped ``(int32 ids, fp32 weights)``; weights sum to 1 per row."""
+    """Top-k-router-shaped ``(int32 ids, fp32 weights)``; weights sum to 1 per row."""
 
     topk_ids = torch.tensor(ids, dtype=torch.int32, device=device)
     g = torch.Generator(device=device).manual_seed(seed)

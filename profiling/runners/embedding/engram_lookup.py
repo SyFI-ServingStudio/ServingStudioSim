@@ -1,4 +1,4 @@
-"""Profile DeepSeek V4.1's Engram row lookup (``_engram_lookup_kernel``).
+"""Profile the Engram n-gram embedding row lookup (``_engram_lookup_kernel``).
 
 ``vllm_triton`` times one call of the fork's
 ``ParallelEngramEmbedding.lookup`` (``common/engram.py``), bound to a minimal
@@ -45,7 +45,6 @@ from profiling.runners.metrics import ComputeMetrics
 
 KIND = "engram_lookup"
 _BACKEND = f"{KIND}:vllm_triton"
-_GPU_NAME = "NVIDIA B200"
 _KERNEL_NAME = "_engram_lookup_kernel"
 _HEAD_DIM = 256
 _QUANT_BLOCK = 32
@@ -246,7 +245,7 @@ def profile_engram_lookup_vllm_triton(
     residency: str,
     weight_dtype: object,
 ) -> ComputeMetrics:
-    """Time one Engram lookup launch (fork Triton kernel) on a B200."""
+    """Time one Engram lookup launch (fork Triton kernel)."""
     _validate_args(
         num_tokens, local_heads, head_dim, quant_block_size, table_rows, residency, weight_dtype
     )
@@ -259,12 +258,7 @@ def profile_engram_lookup_vllm_triton(
             f"{_BACKEND} requires the upstream-rebased vLLM fork (vllm_upstream_fork_env)"
         ) from exc
     try:
-        if not torch.cuda.is_available():
-            raise ProfilerNotImplemented(f"{_BACKEND} requires CUDA")
         device = torch.device("cuda", torch.cuda.current_device())
-        name = str(torch.cuda.get_device_name(device))
-        if name != _GPU_NAME:
-            raise ProfilerNotImplemented(f"{_BACKEND} requires {_GPU_NAME}, got {name}")
         table = _get_table(torch, device, table_rows, residency)
         module = _lookup_module(torch, device, table["views"], local_heads, table_rows)
         background = residency == "host_uva"

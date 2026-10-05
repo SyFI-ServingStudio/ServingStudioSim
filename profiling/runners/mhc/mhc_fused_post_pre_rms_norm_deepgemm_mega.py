@@ -1,4 +1,4 @@
-"""Profile DeepSeek-V4.1's DeepGEMM Mega mHC shifted post/pre/RMSNorm call.
+"""Profile DeepGEMM's Mega mHC shifted post/pre/RMSNorm call.
 
 Source: alignment fork ``servingstudio-alignment-v41``. Every mHC boundary
 between two sublayers (except layer 0's attention pre and the engram layers'
@@ -18,7 +18,7 @@ kIsShifted=true, kStoreBF16=true, ...>``). That persistent kernel fuses:
 
 "Shifted" means the layer input is collapsed with the pre-mix carried from the
 previous sublayer, and this call's pre gate is returned for the next one. The
-work per token is the same as DeepSeek V4's fused post/pre; only which pre-mix
+work per token is the same as the TileLang fused post/pre; only which pre-mix
 feeds the collapse differs, and the carried mix adds 16 bytes per token.
 
 The split count (the second template argument) is picked by DeepGEMM's host
@@ -52,8 +52,6 @@ POST_MULTIPLIER = 2.0
 SINKHORN_ITERATIONS = 20
 # ``can_use_mega_mhc`` routes larger batches to the TileLang fallback.
 MAX_TOKENS = 1 << 20
-# The capture ran on B200; SM100 is the only family the fork dispatches to.
-BACKEND_GPU = "NVIDIA B200"
 # Per-element tolerance of the existing kind's Torch check. The kernel uses a
 # TF32 GEMM for the mixes and rounds BF16 outputs.
 ATOL = 0.05
@@ -215,13 +213,6 @@ def profile_mhc_fused_post_pre_rms_norm_deepgemm_mega(
         ) from exc
 
     try:
-        if not torch.cuda.is_available():
-            raise ProfilerNotImplemented(f"{_KIND} requires CUDA")
-        gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
-        if gpu_name != BACKEND_GPU:
-            raise ProfilerNotImplemented(
-                f"{_KIND} is verified only on {BACKEND_GPU}, got {gpu_name}"
-            )
         if not is_mega_mhc_supported(HIDDEN_SIZE, HC_MULT):
             raise ProfilerNotImplemented(f"{_KIND}: the fork's DeepGEMM has no usable mega_mhc")
         inputs = _prepare(torch, num_tokens, mhc_pre_delayed_torch)

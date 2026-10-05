@@ -1,4 +1,4 @@
-"""Torch semantics for DeepSeek V4.1 FlashMLA mega attention.
+"""Torch semantics for FlashMLA mega attention (compressed sparse MLA, RoPE, FP8 cast).
 
 The contract comes from the alignment fork (``servingstudio-alignment-v41``):
 ``vllm/models/deepseek_v41/nvidia/flash_mla_mega_attn.py``, which calls

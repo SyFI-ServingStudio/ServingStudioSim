@@ -100,9 +100,9 @@ DOC = KernelDoc(
         "decode to the rotated KV row within FP8 tolerance."
     ),
     caveats=(
-        "Only head_dim 512, rope_dim 64, 32-token pages, bf16 inputs, an MXFP8 "
-        "cache (528 B per token), live heads 8 to 128 padded to 64 or 128, and up "
-        "to 65,536 tokens are measured, on B200.",
+        "The runner takes head_dim 512, rope_dim 64, 32-token pages, bf16 inputs "
+        "and an MXFP8 cache (528 B per token), with 8, 16, 32, 64 or 128 live "
+        "heads padded to 64 or 128 and at most 65,536 tokens.",
         "Positions and insert slots are random and distinct, as for decode tokens "
         "of different requests.",
         "TFLOPS is not computed. GB/s counts logical query, KV, position, "

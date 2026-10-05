@@ -23,7 +23,7 @@ window (MXFP8, 528 B/token) plus, for ``compress_ratio`` 1 or 2, up to
 ``index_topk`` indexer-selected compressed rows (NVFP4 ``nvfp4_ds_mla``,
 288 B/token). The output then gets the inverse RoPE and an FP8 E4M3 cast with
 UE8M0 per-32 scales, written in ``wo_a``'s permuted layout. The fork passes
-``enable_q_norm=False``, so the kernel does no Q RMSNorm: V4.1 norms ``qr``
+``enable_q_norm=False``, so the kernel does no Q RMSNorm: the model norms ``qr``
 before ``wq_b``. Outside the slot: the fused Q-pad/KV insert, the decode
 global top-k remap (``compute_global_topk_indices_and_lens``), and
 ``wo_a``/``wo_b``.
@@ -133,10 +133,10 @@ DOC = KernelDoc(
         "spread evenly, so no indexer runs."
     ),
     caveats=(
-        "Only head_dim 512, rope_dim 64, window_size 128, index_topk 512, "
-        "prefill_chunk_size 4, num_heads 64 or 128, compress_ratio 0, 1 or 2, bf16 "
-        "queries, an MXFP8 window cache (528 B per token) and an NVFP4 (288 B) or "
-        "MXFP8 compressed cache are measured, on B200.",
+        "The runner takes head_dim 512, rope_dim 64, window_size 128, index_topk "
+        "512, prefill_chunk_size 4, num_heads 64 or 128, compress_ratio 0, 1 or 2, "
+        "bf16 queries, an MXFP8 window cache (528 B per token) and an NVFP4 (288 B) "
+        "or MXFP8 compressed cache.",
         "num_heads is the padded head count: the kernel computes every padded "
         "head, so fewer live heads take the same time.",
         "Decode takes at most 2048 query rows and 256 requests. The global top-k "

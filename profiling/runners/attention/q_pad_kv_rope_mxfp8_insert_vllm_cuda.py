@@ -1,4 +1,4 @@
-"""Profile DeepSeek V4.1's fused Q pad and MXFP8 sliding-window KV insert.
+"""Profile the fused Q pad and MXFP8 sliding-window KV insert.
 
 ``vllm_cuda`` times one call of
 ``torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert`` with the
@@ -27,7 +27,6 @@ from profiling.runners.metrics import ComputeMetrics
 
 KIND = "q_pad_kv_rope_mxfp8_insert"
 _BACKEND = f"{KIND}:vllm_cuda"
-_GPU_NAME = "NVIDIA B200"
 _HEAD_DIM = 512
 _ROPE_DIM = 64
 _BLOCK_SIZE = 32
@@ -191,7 +190,7 @@ def profile_q_pad_kv_rope_mxfp8_insert_vllm_cuda(
     input_dtype: object,
     swa_cache_format: str,
 ) -> ComputeMetrics:
-    """Time the fork's fused Q pad + MXFP8 SWA KV insert on a B200."""
+    """Time the fork's fused Q pad + MXFP8 SWA KV insert."""
     _validate_args(
         num_tokens,
         num_insert_tokens,
@@ -209,12 +208,7 @@ def profile_q_pad_kv_rope_mxfp8_insert_vllm_cuda(
             f"{_BACKEND} requires the upstream-rebased vLLM fork (vllm_upstream_fork_env)"
         ) from exc
     try:
-        if not torch.cuda.is_available():
-            raise ProfilerNotImplemented(f"{_BACKEND} requires CUDA")
         device = torch.device("cuda", torch.cuda.current_device())
-        name = str(torch.cuda.get_device_name(device))
-        if name != _GPU_NAME or torch.cuda.get_device_capability(device)[0] != 10:
-            raise ProfilerNotImplemented(f"{_BACKEND} requires {_GPU_NAME} (SM100), got {name}")
         q_std, q_in, kv, positions, cos_sin, cache, slots = build_inputs(
             torch, device, num_tokens, num_insert_tokens, num_heads
         )

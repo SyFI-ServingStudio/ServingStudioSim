@@ -62,10 +62,6 @@ def _load_runtime() -> tuple[Any, Any, Any, Any]:
         import torch
     except ImportError as exc:
         raise ProfilerNotImplemented("torch is required for flashinfer_mxfp8") from exc
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented("flashinfer_mxfp8 requires CUDA")
-    if tuple(torch.cuda.get_device_capability()) != (10, 0):
-        raise ProfilerNotImplemented("flashinfer_mxfp8 is verified on SM100 (B200) only")
     try:
         from flashinfer.autotuner import autotune
         from vllm.model_executor.kernels.linear.mxfp8.flashinfer import (
