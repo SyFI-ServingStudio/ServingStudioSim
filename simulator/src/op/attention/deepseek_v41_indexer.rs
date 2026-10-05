@@ -269,7 +269,7 @@ impl DeepseekV41IndexerOp {
     pub fn eval(&self, input: &DeepseekV41IndexerOpInput, ev: &mut Evaluator) {
         let work = derive_work(input, self.compress_ratio);
 
-        push(&*self.prefill_k_gather, work.prefill_k_gather, ev);
+        push(&self.prefill_k_gather, work.prefill_k_gather, ev);
 
         let mut prefill_logits = LeafMetrics::ZERO;
         for shape in &work.prefill_logits {
@@ -283,7 +283,7 @@ impl DeepseekV41IndexerOp {
         );
         ev.push(prefill_logits, || logged.into());
 
-        push(&*self.prefill_topk, work.prefill_topk, ev);
+        push(&self.prefill_topk, work.prefill_topk, ev);
 
         let decode_logits = match &work.decode_logits {
             Some(shape) => self.decode_logits.eval(shape),
@@ -299,9 +299,9 @@ impl DeepseekV41IndexerOp {
         ev.push(decode_logits, || logged.into());
 
         if let Some(candidates) = &self.candidates {
-            push(&**candidates, work.candidates, ev);
+            push(candidates, work.candidates, ev);
         }
-        push(&*self.decode_topk, work.decode_topk, ev);
+        push(&self.decode_topk, work.decode_topk, ev);
     }
 }
 

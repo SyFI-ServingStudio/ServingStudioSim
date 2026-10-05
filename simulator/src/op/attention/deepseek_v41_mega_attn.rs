@@ -104,8 +104,8 @@ impl DeepseekV41MegaAttnOp {
 
     pub fn eval(&self, input: &DeepseekV41MegaAttnOpInput, ev: &mut Evaluator) {
         let (prefill, decode) = split_input(input);
-        push_segment(&*self.prefill, prefill, ev);
-        push_segment(&*self.decode, decode, ev);
+        push_segment(&self.prefill, prefill, ev);
+        push_segment(&self.decode, decode, ev);
     }
 }
 
