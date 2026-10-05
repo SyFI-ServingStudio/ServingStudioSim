@@ -23,8 +23,8 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::breakdown::kernel_time_share::row_composition;
 use crate::io::{read_cost_manifests, resolve_artifact_path};
 use crate::session::{
-    build_session, col, collect, column_f64, register_if_exists, require_columns, value_f32_list,
-    value_f64, value_groups, value_str_list, value_string,
+    build_session, col, collect, column_f64, register_if_exists, require_columns,
+    slot_backend_none, value_f32_list, value_f64, value_groups, value_str_list, value_string,
 };
 use crate::trace::manifest::{FlatCostNode, Manifest, ManifestDoc};
 
@@ -55,7 +55,8 @@ struct OptionalColumns {
     slot_input: bool,
     slot_flops: bool,
     slot_bytes: bool,
-    slot_backend: bool,
+    /// The column's not-executed value ([`slot_backend_none`]), when present.
+    slot_backend: Option<u8>,
 }
 
 const MAX_RANGE_LIMIT: usize = 384;
@@ -188,7 +189,8 @@ struct ExactRow {
     slot_input: Vec<String>,
     slot_flops: Vec<f64>,
     slot_bytes: Vec<f64>,
-    slot_backend: Vec<u8>,
+    /// Each slot's candidate index; `None` where the leaf was not executed.
+    slot_backend: Vec<Option<u8>>,
 }
 
 pub(super) fn details_descriptor(run: &DiscoveredRun) -> Option<Value> {
@@ -763,7 +765,7 @@ async fn exact_source_cost_tree(
     let (ctx, manifest_doc) = open_source(source, request_id, "cost_tree").await?;
     let require_started = Instant::now();
     require_columns(&ctx, TABLE, TREE_COLUMNS).await?;
-    let optional = optional_columns(&ctx).await?;
+    let optional = optional_columns(&ctx, source).await?;
     prof(request_id, "cost_tree event=schema", require_started);
     let mut projection = vec![
         "CAST(section AS VARCHAR) AS section",
@@ -782,7 +784,7 @@ async fn exact_source_cost_tree(
     if optional.slot_bytes {
         projection.push("slot_bytes");
     }
-    if optional.slot_backend {
+    if optional.slot_backend.is_some() {
         projection.push("slot_backend");
     }
     let sql = format!(
@@ -931,14 +933,14 @@ fn is_ffn(manifest: &ManifestDoc) -> bool {
     has_section(manifest, "prologue") && has_section(manifest, "post_attn")
 }
 
-async fn optional_columns(ctx: &SessionContext) -> Result<OptionalColumns> {
+async fn optional_columns(ctx: &SessionContext, source: &CostLogSource) -> Result<OptionalColumns> {
     let table = ctx.table(TABLE).await?;
     let has = |name: &str| table.schema().field_with_name(None, name).is_ok();
     Ok(OptionalColumns {
         slot_input: has("slot_input"),
         slot_flops: has("slot_flops"),
         slot_bytes: has("slot_bytes"),
-        slot_backend: has("slot_backend"),
+        slot_backend: slot_backend_none(&source.cost_path())?,
     })
 }
 
@@ -973,10 +975,12 @@ async fn read_exact_rows(
                 } else {
                     Vec::new()
                 },
-                slot_backend: if optional.slot_backend {
-                    value_u8_list(col(batch, "slot_backend")?, row)?
-                } else {
-                    Vec::new()
+                slot_backend: match optional.slot_backend {
+                    Some(none) => value_u8_list(col(batch, "slot_backend")?, row)?
+                        .into_iter()
+                        .map(|index| (index != none).then_some(index))
+                        .collect(),
+                    None => Vec::new(),
                 },
             });
         }
@@ -1013,7 +1017,7 @@ fn tree_json(manifest: &Manifest, row: &ExactRow, node_index: usize) -> Result<V
             let backend = row
                 .slot_backend
                 .get(*slot_index)
-                .and_then(|index| (*index != u8::MAX).then_some(*index as usize))
+                .and_then(|index| index.map(usize::from))
                 .and_then(|index| slot.backends().get(index).cloned());
             let input = row
                 .slot_input
@@ -1162,7 +1166,7 @@ mod tests {
             slot_input: vec![r#"{"m":8}"#.to_owned(), String::new()],
             slot_flops: vec![4.0e9, 0.0],
             slot_bytes: vec![0.0, 2.0e6],
-            slot_backend: vec![1, u8::MAX],
+            slot_backend: vec![Some(1), None],
         }
     }
 
