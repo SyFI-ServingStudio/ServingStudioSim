@@ -49,7 +49,9 @@ that checkout's code, `profiling/profile.db`, `target/release/simulator` and
 req-frontend's `tracegen`. To
 serve new code or data, update the checkout, rebuild the simulator and rerun
 `run.sh`, which replaces the container. `PUBLIC_API_CONTAINER` and `PUBLIC_API_IMAGE` override the
-container and image names.
+container and image names. The rate limits count the client the CSE web host's
+proxy names; `PUBLIC_API_FORWARDED_ALLOW_IPS` (`--forwarded-allow-ips`, default
+that host's address) lists the proxies trusted to name it.
 
 ## Routes
 
