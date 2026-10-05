@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from profiling.kernels.compressed_sparse_mla_rope_cast import MXFP8_RECORD_BYTES
 from profiling.profilers.energy import Energy
 from profiling.profilers.timer import Timer
 from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerNotImplemented
@@ -30,7 +31,7 @@ _BACKEND = f"{KIND}:vllm_cuda"
 _HEAD_DIM = 512
 _ROPE_DIM = 64
 _BLOCK_SIZE = 32
-_RECORD_BYTES = 528
+_RECORD_BYTES = MXFP8_RECORD_BYTES
 _DATA_BYTES = 512
 _SCALE_BYTES = 16
 _MAX_TOKENS = 65_536

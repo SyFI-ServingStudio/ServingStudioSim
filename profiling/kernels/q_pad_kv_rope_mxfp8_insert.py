@@ -46,6 +46,7 @@ from profiling.db.registry import (
     RunnerRef,
     register,
 )
+from profiling.kernels.compressed_sparse_mla_rope_cast import MXFP8_RECORD_BYTES
 
 KIND = "q_pad_kv_rope_mxfp8_insert"
 
@@ -87,9 +88,9 @@ DOC = KernelDoc(
     subcategory="Compressed sparse MLA",
     formula=(
         "q_out[:, :num_heads] = q; q_out[:, num_heads:padded_heads] = 0",
-        "cache[slot] = MXFP8(RoPE(kv)), 528 bytes per inserted row",
+        f"cache[slot] = MXFP8(RoPE(kv)), {MXFP8_RECORD_BYTES} bytes per inserted row",
         "GB/s = [(2 · 512 · num_tokens · (num_heads + padded_heads) if padded_heads > 0) "
-        "+ num_insert_tokens · (2 · 512 + 16 + 4 · 64 + 528)] / time",
+        f"+ num_insert_tokens · (2 · 512 + 16 + 4 · 64 + {MXFP8_RECORD_BYTES})] / time",
     ),
     default_metric="memory_bandwidth_gbps",
     method=(
@@ -101,7 +102,7 @@ DOC = KernelDoc(
     ),
     caveats=(
         "The runner takes head_dim 512, rope_dim 64, 32-token pages, bf16 inputs "
-        "and an MXFP8 cache (528 B per token), with 8, 16, 32, 64 or 128 live "
+        f"and an MXFP8 cache ({MXFP8_RECORD_BYTES} B per token), with 8, 16, 32, 64 or 128 live "
         "heads padded to 64 or 128 and at most 65,536 tokens.",
         "Positions and insert slots are random and distinct, as for decode tokens "
         "of different requests.",

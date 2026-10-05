@@ -5,8 +5,8 @@ import torch
 
 from profiling.runners.attention import compressed_sparse_mla_rope_cast as runner
 from profiling.runners.attention.compressed_sparse_mla_rope_cast_reference import (
-    decode_records,
     compressed_sparse_mla_rope_cast_reference,
+    decode_records,
     encode_records,
     output_from_fused_layout,
     q_to_fused_layout,
@@ -179,3 +179,18 @@ def test_invalid_shapes_fail_closed():
         _shape(num_heads=16)
     with pytest.raises(ValueError, match="query <= context"):
         _shape(query_context_pairs=((9, 8),))
+
+
+def test_record_bytes_match_the_simulators() -> None:
+    import re
+    from pathlib import Path
+
+    from profiling.kernels import compressed_sparse_mla_rope_cast as kind
+
+    rust = (
+        Path(__file__).resolve().parents[1]
+        / "simulator/src/timing/kernels/compressed_sparse_mla_rope_cast.rs"
+    ).read_text()
+    for name in ("MXFP8_RECORD_BYTES", "NVFP4_RECORD_BYTES"):
+        (value,) = re.findall(rf"const {name}: u32 = (\d+);", rust)
+        assert getattr(kind, name) == int(value), name

@@ -47,6 +47,12 @@ use crate::timing::{Dim, KernelConfig, SweepCoords};
 
 const WINDOW: u32 = 128;
 const INDEX_TOPK: u32 = 512;
+/// One `mxfp8` cache record: 512 FP8 E4M3 values, then 16 UE8M0 scales (one
+/// per 32 dims). The sliding-window cache always uses it.
+pub const MXFP8_RECORD_BYTES: u32 = 528;
+/// One `nvfp4` compressed-cache record: 512 E2M1 values packed two per byte,
+/// then 32 scale bytes.
+pub const NVFP4_RECORD_BYTES: u32 = 288;
 /// The profiler's request ceiling per call.
 const MAX_REQUESTS: u32 = 256;
 /// Decode rows the profiler accepts.
@@ -257,8 +263,8 @@ fn gather_area(pairs: &[(u32, u32)], config: &CompressedSparseMlaRopeCastKernelC
 /// cache is NVFP4 or MXFP8.
 fn record_bytes(format: &str) -> f64 {
     match format {
-        "mxfp8" => 528.0,
-        "nvfp4" => 288.0,
+        "mxfp8" => f64::from(MXFP8_RECORD_BYTES),
+        "nvfp4" => f64::from(NVFP4_RECORD_BYTES),
         other => panic!("unknown cache format {other:?}"),
     }
 }

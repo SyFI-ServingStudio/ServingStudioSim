@@ -46,6 +46,8 @@ use crate::op::attention::DeepseekV41CandidateRole;
 use crate::timing::bridge::DType;
 use crate::timing::expert_demand::ExpertDemand;
 use crate::timing::kernels::all_reduce_fusion::fused_all_reduce_refusal;
+use crate::timing::kernels::compressed_sparse_mla_rope_cast::NVFP4_RECORD_BYTES;
+use crate::timing::kernels::kv_compress_store::FP8_INDEXER_ROW_BYTES;
 use crate::timing::{
     BuildError, CostManifest, CostNode, CostTree, CostTreeBuilder, Evaluator, FlatCostNode,
     LeafMetrics, PerfApiBridge, SlotInput,
@@ -765,11 +767,11 @@ fn total_kv_bytes_per_token(model: &DeepseekV41ModelCfg, tp_size: u32) -> u64 {
             let states = BLOCK_TOKENS / u64::from(model.compress_ratios[layer as usize]);
             // Index K caches are owned by KV sources that are also index sources.
             let index = if model.index_source_layer_ids.contains(&layer) {
-                page(states, 132)
+                page(states, u64::from(FP8_INDEXER_ROW_BYTES))
             } else {
                 0
             };
-            page(states, 288) + index
+            page(states, u64::from(NVFP4_RECORD_BYTES)) + index
         })
         .sum();
     per_rank_block / BLOCK_TOKENS * u64::from(tp_size)

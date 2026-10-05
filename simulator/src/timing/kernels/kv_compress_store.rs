@@ -15,7 +15,7 @@ pub const FP8_DS_MLA_ROW_BYTES: u32 = 584;
 
 /// Bytes of one `fp8_indexer` cache row, the 128-wide indexer head this kind
 /// stores on C4 layers: 128 fp8 values and one fp32 scale.
-const FP8_INDEXER_ROW_BYTES: u32 = 132;
+pub const FP8_INDEXER_ROW_BYTES: u32 = 132;
 
 #[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct KvCompressStoreKernelConfig {

@@ -28,6 +28,8 @@ from __future__ import annotations
 
 import torch
 
+from profiling.kernels.compressed_sparse_mla_rope_cast import RECORD_BYTES
+
 __all__ = [
     "RECORD_BYTES",
     "decode_records",
@@ -45,7 +47,6 @@ OUT_GROUP = 32
 Q_CHUNK = 16
 WV_GROUP_SIZE = 8
 FP8_MAX = 448.0
-RECORD_BYTES = {"mxfp8": 528, "nvfp4": 288}
 _DATA_BYTES = {"mxfp8": 512, "nvfp4": 256}
 _SCALE_BYTES = {"mxfp8": 16, "nvfp4": 32}
 _E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)

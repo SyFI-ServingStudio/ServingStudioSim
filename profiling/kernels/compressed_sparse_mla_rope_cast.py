@@ -53,6 +53,15 @@ from profiling.db.registry import (
 )
 
 KIND = "compressed_sparse_mla_rope_cast"
+# Bytes of one cache record per format, as this kind reads them and
+# q_pad_kv_rope_mxfp8_insert writes the window cache. mxfp8: 512 FP8 E4M3
+# values, then 16 UE8M0 scales (one per 32 dims). nvfp4: 512 E2M1 values
+# packed two per byte, then 32 scale bytes. Rust:
+# timing/kernels/compressed_sparse_mla_rope_cast.rs MXFP8_RECORD_BYTES and
+# NVFP4_RECORD_BYTES.
+MXFP8_RECORD_BYTES = 512 + 16
+NVFP4_RECORD_BYTES = 256 + 32
+RECORD_BYTES = {"mxfp8": MXFP8_RECORD_BYTES, "nvfp4": NVFP4_RECORD_BYTES}
 
 
 @dataclass(frozen=True)
@@ -135,8 +144,8 @@ DOC = KernelDoc(
     caveats=(
         "The runner takes head_dim 512, rope_dim 64, window_size 128, index_topk "
         "512, prefill_chunk_size 4, num_heads 64 or 128, compress_ratio 0, 1 or 2, "
-        "bf16 queries, an MXFP8 window cache (528 B per token) and an NVFP4 (288 B) "
-        "or MXFP8 compressed cache.",
+        f"bf16 queries, an MXFP8 window cache ({MXFP8_RECORD_BYTES} B per token) and an "
+        f"NVFP4 ({NVFP4_RECORD_BYTES} B) or MXFP8 compressed cache.",
         "num_heads is the padded head count: the kernel computes every padded "
         "head, so fewer live heads take the same time.",
         "Decode takes at most 2048 query rows and 256 requests. The global top-k "

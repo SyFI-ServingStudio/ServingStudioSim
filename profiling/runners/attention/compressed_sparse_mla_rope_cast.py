@@ -29,6 +29,7 @@ import types
 from dataclasses import dataclass
 from typing import Any
 
+from profiling.kernels.compressed_sparse_mla_rope_cast import RECORD_BYTES
 from profiling.profilers.energy import Energy
 from profiling.profilers.timer import Timer
 from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerNotImplemented
@@ -46,7 +47,7 @@ _SUPPORTED_HEADS = (64, 128)
 # compressed cache splits the 128-token vLLM block by the ratio.
 _SWA_BLOCK = 32
 _KV_BLOCK = 128
-_RECORD_BYTES = {"mxfp8": 528, "nvfp4": 288}
+_RECORD_BYTES = RECORD_BYTES
 _MAX_DECODE_ROWS = 2048
 _MAX_REQUESTS = 256
 _CHECK_ROWS = 48
