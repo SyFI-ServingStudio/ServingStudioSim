@@ -38,7 +38,7 @@ def test_args_fields_are_the_runner_kwargs() -> None:
 @pytest.mark.parametrize(
     "override",
     [
-        {"head_dim": 64},
+        {"head_dim": 0},
         {"dtype": "fp16"},
         {"batch_size": 0},
         {"num_heads": 0},
@@ -49,6 +49,13 @@ def test_rejects_shapes_outside_the_verified_path(override: dict) -> None:
     # Defect: silently profiling a path production never takes.
     with pytest.raises(ValueError):
         runner.validate_args(**{**_CAPTURE, **override})
+
+
+@pytest.mark.parametrize("head_dim", [64, 96, 128, 256])
+def test_accepts_any_positive_head_dim(head_dim: int) -> None:
+    # Defect: refusing an unmeasured head dim the kernel launches (BK is
+    # next_power_of_2(K), so NK == 1 for every K).
+    assert runner.validate_args(**{**_CAPTURE, "head_dim": head_dim}).head_dim == head_dim
 
 
 @pytest.mark.parametrize("batch", [1, 7, 8, 32, 128])

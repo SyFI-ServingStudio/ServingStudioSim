@@ -47,7 +47,9 @@ impl KernelSpec for MoeEpReduceScatterSpec {
         grid: &SweepGrid,
         backend: &'static str,
     ) -> Vec<ArgsPayload> {
-        assert!(matches!(config.num_gpus, 2 | 4 | 8));
+        // PyNcclCommunicator accepts any world size but disables itself at
+        // one rank, where no collective runs.
+        assert!(config.num_gpus >= 2, "EP reduce-scatter needs >= 2 ranks");
         assert_eq!(config.dtype, DType::Bf16);
         assert_eq!(config.fabric, "nvlink");
         grid.expand_2d(|total, maximum| {

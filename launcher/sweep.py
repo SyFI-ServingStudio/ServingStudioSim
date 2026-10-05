@@ -24,6 +24,7 @@ from .artifact_kind import ArtifactKind, write_artifact_kind
 from .cache_build import prebuild_caches
 from .exec import (
     DEFAULT_PARALLELISM,
+    ERROR_JSON,
     _build_subprocess_env,
     _profile_env,
     binary_path,
@@ -146,7 +147,11 @@ async def _launch_one(
         binary = binary_path(build_type)
         # The concrete config the binary reads lives alongside the run's metadata.
         argv = build_cli_command(
-            params, binary, metadata.raw_dir(log_dir) / "run_config.yaml", subcommand="run"
+            params,
+            binary,
+            metadata.raw_dir(log_dir) / "run_config.yaml",
+            subcommand="run",
+            error_json=metadata.raw_dir(log_dir) / ERROR_JSON,
         )
 
         # INV-2: all metadata lands before the subprocess starts (record the bare

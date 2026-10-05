@@ -477,6 +477,7 @@ fn slo_entry(id: RequestId, now: Time, rec: &RequestRecord) -> RequestSloEntry {
         declared_prefix_tokens: rec.request.definition.session.declared_prefix_tokens(),
         prefix_cache_hit_tokens: rec.telemetry.prefix_cache_hit_tokens,
         fresh_prompt_tokens: rec.request.definition.prompt_tokens,
+        target_output_tokens: rec.request.definition.target_output_tokens,
         retraction_count: rec.telemetry.retraction_count,
         reprocessed_prefill_output_tokens_before: rec
             .telemetry
@@ -513,9 +514,7 @@ mod tests {
         DpPlacementPolicy, SimpleDpConfig, SimpleDpFlow, SimpleDpPoolConfig, UnifiedWorkerFactory,
     };
     use crate::sim::frontend::TraceFrontend;
-    use crate::sim::frontend::{
-        ArrivalSchedule, CapacityLimit, InputFileSchema, SessionDependency,
-    };
+    use crate::sim::frontend::{ArrivalSchedule, CapacityLimit, InputFileSchema};
     use crate::test_helpers::{text_request, FakeModel};
     use crate::worker::{build_barebone_worker, WorkerConfig};
     use std::cell::RefCell;
@@ -585,7 +584,6 @@ mod tests {
             &InputFileSchema::text_generation_independent(),
             ArrivalSchedule::trace_timed(1.0).unwrap(),
             CapacityLimit::unlimited(),
-            SessionDependency::Independent,
         )
         .unwrap();
         let mut logger = LoggerSession::open(dir.path(), true, false).unwrap();
@@ -652,7 +650,6 @@ mod tests {
             &InputFileSchema::text_generation_independent(),
             ArrivalSchedule::trace_timed(1.0).unwrap(),
             CapacityLimit::unlimited(),
-            SessionDependency::Independent,
         )
         .unwrap();
         let mut logger = LoggerSession::open(dir.path(), false, false).unwrap();

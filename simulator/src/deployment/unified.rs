@@ -457,6 +457,7 @@ impl Deployment for UnifiedDeployment {
                     *routing_seed,
                     expert_popularity_file.as_deref(),
                     serialize_streams,
+                    chunk_tokens(&g.worker),
                     &gpu_name,
                     MODEL_NAME,
                     bridge,
@@ -811,6 +812,17 @@ fn ensure_hp_unified(worker: &IterWorkerSel) -> anyhow::Result<()> {
     }
 }
 
+/// The most tokens one step of `worker` runs: its chunk under chunked
+/// prefill; None for a worker that runs each prompt whole.
+fn chunk_tokens(worker: &IterWorkerSel) -> Option<u32> {
+    match worker {
+        IterWorkerSel::ChunkedPrefill {
+            max_batch_tokens, ..
+        } => Some(*max_batch_tokens),
+        _ => None,
+    }
+}
+
 /// Whole-iteration arches with a captured chunked-prefill runtime may use the
 /// ordinary HP admission recipe or the dedicated hard-cap/chunking recipe.
 fn ensure_hp_or_chunked_worker(arch_name: &str, worker: &IterWorkerSel) -> anyhow::Result<()> {
@@ -1089,7 +1101,7 @@ mod tests {
     fn glm52_unified_config_preserves_ep8_hp_pairing() {
         let yaml = r#"
 deployment: unified
-workload: { trace_files: ["trace/smoke.csv"], input_file_format: text-generation-independent, arrival_mode: trace_timed, session_dependency: independent, duration_ms: 1000.0, run_to_end: true, request_rate: 1.0 }
+workload: { trace_files: ["trace/smoke.csv"], input_file_format: text-generation-independent, arrival_mode: trace_timed, duration_ms: 1000.0, run_to_end: true, request_rate: 1.0 }
 io: { log_dir: "logs/test", log_level: info, quiet: true, force_cache_build: false, log_output_token_times: false }
 pools:
   main:
@@ -1175,7 +1187,7 @@ pools:
         // shows up here rather than at run time.
         let yaml = r#"
 deployment: unified
-workload: { trace_files: ["trace/smoke.csv"], input_file_format: text-generation-independent, arrival_mode: trace_timed, session_dependency: independent, duration_ms: 1000.0, run_to_end: true, request_rate: 1.0 }
+workload: { trace_files: ["trace/smoke.csv"], input_file_format: text-generation-independent, arrival_mode: trace_timed, duration_ms: 1000.0, run_to_end: true, request_rate: 1.0 }
 io: { log_dir: "logs/test", log_level: info, quiet: true, force_cache_build: false, log_output_token_times: false }
 pools:
   main:

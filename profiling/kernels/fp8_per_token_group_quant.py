@@ -4,7 +4,7 @@ The vLLM FP8 block-scaled paths quantize each activation row in independent
 ``group_size`` chunks and write UE8M0 scales before the GEMM/MoE that consumes
 them.  Group size and scale layout remain explicit cache axes because both
 select kernel semantics and launch/storage behavior.  The runner lists the
-accepted ``scale_format`` values and pairs each with its verified GPUs.
+accepted ``scale_format`` values; each launches on any CUDA GPU.
 """
 
 from __future__ import annotations
@@ -61,9 +61,9 @@ DOC = KernelDoc(
         "ue8m0_packed_int32, per_token_group_quant_8bit_kernel otherwise."
     ),
     caveats=(
-        "The runner accepts only group_size = 128, with ue8m0_column_major "
-        "scales on H100 and H200 and ue8m0_row_major or ue8m0_packed_int32 "
-        "scales on B200.",
+        "ue8m0_packed_int32 needs group_size = 128: vLLM compiles its packed "
+        "kernel for that width only. The other formats take any group_size that "
+        "divides hidden_size.",
         "GB/s counts logical BF16 input, FP8 output and scale bytes, not "
         "physical memory transactions.",
     ),
@@ -76,9 +76,9 @@ register(
     KernelProfilerSpec(
         kernel_kind=KIND,
         backend="vllm_cuda",
+        # No capability rule: every scale format, packed UE8M0 included, is generic CUDA.
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
-            gpus=frozenset({"NVIDIA H100", "NVIDIA H200", "NVIDIA B200"}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.elementwise.fp8_per_token_group_quant",

@@ -108,7 +108,9 @@ pub(crate) fn canonical_tokens(
 }
 
 fn validate_config(config: &MoeEpAllGatherKernelConfig) {
-    assert!(matches!(config.num_gpus, 2 | 4 | 8));
+    // PyNcclCommunicator accepts any world size but disables itself at one
+    // rank, where no collective runs.
+    assert!(config.num_gpus >= 2, "EP all-gather needs >= 2 ranks");
     assert_eq!(config.hidden_dtype, DType::Bf16);
     assert_eq!(config.router_dtype, DType::Fp32);
     assert_eq!(config.fabric, "nvlink");

@@ -161,7 +161,6 @@ def test_vllm_torch_linear_backend_registered_sharing_table_and_args():
     assert spec.runner_ref.function_name == "profile_single_gemm_linear"
     assert spec.subprocess_env == "vllm_env"
     assert spec.supports.compute == frozenset({DType.BF16})
-    assert spec.supports.gpus == frozenset({"NVIDIA B200"})
 
 
 def test_dtype_from_value_accepts_runner_aliases():

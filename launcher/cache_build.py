@@ -24,8 +24,7 @@ exception is the provider tags (the deployment, and each group's arch and worker
 from __future__ import annotations
 
 import asyncio
-import re
-import sqlite3
+import json
 import sys
 from pathlib import Path
 
@@ -38,7 +37,6 @@ from .process.leases import LauncherLeases
 from .schema import build_cli_command, log_dir_of
 from .schema.loader import Registry, iter_slots
 
-_MISSING_TOTAL = re.compile(r"total:\s+(\d+)\s+/\s+\d+\s+specs missing")
 _PROCESS_SUPERVISOR = ProcessSupervisor()
 _LAUNCHER_LEASES = LauncherLeases(REPO_ROOT)
 
@@ -68,7 +66,7 @@ def cache_key(config: dict, registry: Registry) -> tuple:
     return tuple(sorted(items))
 
 
-def unique_by_cache_key(param_sets: list[dict], registry: Registry) -> list[dict]:
+def _unique_by_cache_key(param_sets: list[dict], registry: Registry) -> list[dict]:
     """One representative config per distinct cache key — the dedup shared by the
     cache prebuild and the coverage report. Key leaves are Rust-tagged
     (`affects_cache`), so runs differing only in non-kernel params collapse."""
@@ -93,7 +91,7 @@ def report_cache_coverage(
     env = _build_subprocess_env()
     rc = 0
     with _LAUNCHER_LEASES.profile_database(write=False):
-        for config in unique_by_cache_key(param_sets, registry):
+        for config in _unique_by_cache_key(param_sets, registry):
             cfg_dir = _prebuild_log_dir(_cache_report_base(param_sets), config)
             argv = build_cli_command(
                 config, binary, cfg_dir / "run_config.yaml", subcommand="dry-run"
@@ -158,23 +156,22 @@ async def prebuild_caches(
     env = _build_subprocess_env()
 
     async with _LAUNCHER_LEASES.profile_database(write=True):
-        for config in unique_by_cache_key(param_sets, registry):
+        for config in _unique_by_cache_key(param_sets, registry):
             cfg_dir = _prebuild_log_dir(base_dir, config)
             config_path = cfg_dir / "run_config.yaml"
-            kernel_configs = cfg_dir / "kernel_configs.json"
             build_argv = build_cli_command(
                 config, binary, config_path, subcommand="build-cache-only"
-            ) + ["--kernel-configs-out", str(kernel_configs)]
-            probe_argv = [str(binary), "dry-run", str(config_path)]
+            )
+            report = cfg_dir / "dry_run_report.json"
+            probe_argv = [str(binary), "dry-run", str(config_path), "--report-json", str(report)]
             journal = RunJournal(cfg_dir)
 
             # Recheck under the exclusive cross-launcher lease. A second launcher
             # waiting on the same cache observes the first launcher's committed DB
-            # rows and skips the GPU/JIT stage entirely. The probe also records the
-            # run's kernel configs, so a run whose rows were measured elsewhere
-            # (`kernel-profile run`, another launcher) still registers them.
+            # rows and skips the GPU/JIT stage entirely.
             missing_before = await _probe_missing(
-                probe_argv + ["--kernel-configs-out", str(kernel_configs)],
+                probe_argv,
+                report,
                 cfg_dir,
                 env,
                 journal,
@@ -188,7 +185,6 @@ async def prebuild_caches(
                     StageState.SUCCEEDED,
                     resources=["profile-db:exclusive"],
                 )
-                _register_kernel_configs(kernel_configs, config, cfg_dir, journal)
                 continue
             try:
                 require_gpu(f"filling {missing_before} missing profile.db spec(s)")
@@ -239,6 +235,7 @@ async def prebuild_caches(
 
             missing_after = await _probe_missing(
                 probe_argv,
+                report,
                 cfg_dir,
                 env,
                 journal,
@@ -260,31 +257,12 @@ async def prebuild_caches(
                 result=build_result,
                 resources=["profile-db:exclusive"],
             )
-            # The rows just measured, and the configs that asked for them.
-            _register_kernel_configs(kernel_configs, config, cfg_dir, journal)
     return True
-
-
-def _register_kernel_configs(
-    records: Path, config: dict, cfg_dir: Path, journal: RunJournal
-) -> None:
-    """Register a prebuild's kernel configs. A failure is reported, not fatal:
-    the measured rows are already in profile.db, and `--register-kernel-configs`
-    can register their configs later without a GPU."""
-    from .kernel_configs import describe, register_file, run_sources
-
-    try:
-        report = register_file(records, run_sources(config, preset=None))
-    except (OSError, ValueError, sqlite3.Error) as error:
-        print(f"[kernel-configs] {cfg_dir}: registration failed: {error}", file=sys.stderr)
-        journal.update("register_kernel_configs", StageState.FAILED, error=str(error))
-        return
-    print(f"[kernel-configs] {cfg_dir}: {describe(report)}")
-    journal.update("register_kernel_configs", StageState.SUCCEEDED)
 
 
 async def _probe_missing(
     argv: list[str],
+    report: Path,
     log_dir: Path,
     env: dict[str, str],
     journal: RunJournal,
@@ -317,16 +295,6 @@ async def _probe_missing(
             error="cache coverage probe failed or left process-group descendants",
         )
         return None
-    match = _MISSING_TOTAL.search(result.output)
-    if match is None:
-        journal.update(
-            stage,
-            StageState.FAILED,
-            spec=spec,
-            result=result,
-            error="cache coverage probe did not emit a parseable total",
-        )
-        return None
-    missing = int(match.group(1))
+    missing = json.loads(report.read_text())["missing"]
     journal.update(stage, StageState.SUCCEEDED, spec=spec, result=result)
     return missing

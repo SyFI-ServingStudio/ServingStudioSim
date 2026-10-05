@@ -25,8 +25,8 @@ DOC = KernelDoc(
         " call. The post step mixes the finished block's output x into the "
         "residual streams with the previous post and comb weights; the pre step"
         " then derives new mixing weights from the updated streams and forms "
-        "the next block's RMS-normalized input. The measurement uses 4 bf16 "
-        "streams of 4,096 features and random activations."
+        "the next block's RMS-normalized input. TileLang compiles the call for "
+        "each hidden_size and hc_mult; the measurement uses random activations."
     ),
     category="Normalization",
     subcategory="Hyper-connections",
@@ -42,8 +42,7 @@ DOC = KernelDoc(
         "implementation before timing."
     ),
     caveats=(
-        "Only hidden_size = 4096, hc_mult = 4 in bf16 on H200 and B200 is "
-        "measured, with ε = 1e-6; another ε runs the same launches.",
+        "The runner uses ε = 1e-6; another ε runs the same launches.",
         "The previous post and comb weights come from the pre step on the same random streams.",
         "TFLOPS is not computed. GB/s counts the layer output, streams, "
         "previous mixes and weights read once and the updated streams, next "
@@ -67,7 +66,6 @@ register(
         batch_outlier_policy=BatchOutlierPolicy(),
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
-            gpus=frozenset({"NVIDIA H200", "NVIDIA B200"}),
         ),
         subprocess_env="vllm_env",
         doc=BackendDoc(

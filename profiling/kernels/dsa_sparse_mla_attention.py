@@ -73,9 +73,11 @@ DOC = KernelDoc(
         "Selected positions and tensor values are constructed, not taken from "
         "an indexer or a serving KV cache.",
         "TFLOPS counts all selected_k slots even when fewer are valid.",
-        "torch and vllm_flashmla_bf16 accept only rope_dim = 64 with "
-        "selected_k = 2048; flashinfer_trtllm_fp8 also accepts rope_dim = 0, "
-        "with its own cache layout and selected_k = 2048 or 2176.",
+        "torch and vllm_flashmla_bf16 accept only rope_dim = 64; "
+        "flashinfer_trtllm_fp8 also accepts rope_dim = 0, with its own cache "
+        "layout. vllm_flashmla_bf16 needs selected_k to be a multiple of "
+        "FlashMLA's top-k tile: 128 on SM90, and 64 at 64 heads or 128 otherwise "
+        "on SM10x.",
         "GB/s includes 8 bytes per query head for the max-logit and log-sum-exp"
         " outputs, even for backends that return only the attention output.",
     ),
@@ -90,7 +92,6 @@ register(
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
             kv=frozenset({DType.BF16}),
-            gpus=frozenset({"NVIDIA H200"}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.attention.dsa_sparse_mla_attention",
@@ -111,10 +112,11 @@ register(
     KernelProfilerSpec(
         kernel_kind=KIND,
         backend="flashinfer_trtllm_fp8",
+        # TRTLLM-GEN sparse MLA (fmhaSm100) runs only on the SM10x family.
         supports=BackendSupport(
             compute=frozenset({DType.FP8_E4M3}),
             kv=frozenset({DType.FP8_E4M3}),
-            gpus=frozenset({"NVIDIA B200"}),
+            sm_targets=frozenset({"sm_100f"}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.attention.dsa_sparse_mla_attention",
@@ -140,10 +142,11 @@ register(
     KernelProfilerSpec(
         kernel_kind=KIND,
         backend="vllm_flashmla_bf16",
+        # FlashMLA's Arch::is_sm90a() / is_sm100f(): exactly SM90, or any SM10x.
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
             kv=frozenset({DType.BF16}),
-            gpus=frozenset({"NVIDIA H200"}),
+            sm_targets=frozenset({"sm_90a", "sm_100f"}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.attention.dsa_sparse_mla_attention",

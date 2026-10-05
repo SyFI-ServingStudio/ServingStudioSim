@@ -89,6 +89,18 @@ def test_invalid_or_missing_evidence_never_publishes_output(tmp_path, defect):
     assert not options["output_trace"].with_suffix(".csv.manifest.json").exists()
 
 
+@pytest.mark.parametrize("kind", ["expert_popularity", "token_corpus"])
+def test_a_routing_pass_gives_the_captures_own_acceptance(tmp_path, kind):
+    options = evidence(tmp_path)
+    path = tmp_path / "profile_result.json"
+    path.write_text(json.dumps(json.loads(path.read_text()) | {"profile_kind": kind}))
+    prepare_workload(**options)
+    with options["output_trace"].open() as stream:
+        assert [json.loads(row["accept_rate"]) for row in csv.DictReader(stream)] == [
+            [0.5, 1.0, 1.0], [0.5, 1.0, 1.0],
+        ]
+
+
 def test_prepare_workload_public_command(tmp_path):
     options = evidence(tmp_path)
     argv = ["prepare-workload"]

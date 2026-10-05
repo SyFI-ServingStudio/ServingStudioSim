@@ -124,7 +124,10 @@ error is too large, classify the failure before changing code:
 
 - interior interpolation error → consider a denser sweep grid, a different
   built-in cache kind, or an existing fitted variant;
-- extrapolation error → widen the profiled grid or narrow the supported domain;
+- extrapolation error → give the spec an `off_grid` policy (hold the edge's
+  TFLOPS or bandwidth, whichever the largest measured shapes keep flat, or split
+  independent launches), or widen the profiled grid. Do not narrow the supported
+  domain for a shape the production kernel runs;
 - direct-cache quantization error → add bucket-boundary probes, then consider
   denser buckets or a non-direct cache;
 - re-axis/domain error → verify probes are physical query points and revise the

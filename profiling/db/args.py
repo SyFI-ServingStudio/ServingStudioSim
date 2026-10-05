@@ -10,9 +10,10 @@ kernels or L1b registry/table code.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from enum import StrEnum
-from typing import Any
+from functools import cache
+from typing import Any, get_type_hints
 
 from profiling.db.doc import arg
 
@@ -91,6 +92,20 @@ class KernelArgs:
     Concrete subclasses are declared below so schema ownership stays separate
     from registry mutation.
     """
+
+
+@cache
+def field_types(args_schema: type[KernelArgs]) -> dict[str, Any]:
+    """Resolved field types of an args dataclass, in field order.
+
+    ``get_type_hints`` re-evaluates every string annotation on each call, and a
+    build coerces and keys thousands of specs against a few dozen schemas;
+    resolved once per schema, it drops from about half of the profile.db query
+    time to nothing.
+    """
+
+    type_hints = get_type_hints(args_schema)
+    return {field.name: type_hints[field.name] for field in fields(args_schema)}
 
 
 @dataclass(frozen=True)

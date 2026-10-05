@@ -7,12 +7,12 @@ from profiling.runners.attention.inv_rope_fp8_quant_vllm_triton import (
 )
 
 
-@pytest.mark.parametrize("num_tokens", [1, 8192])
-def test_token_boundary_is_supported(num_tokens):
+@pytest.mark.parametrize("num_tokens", [1, 8192, 8193, 65_536])
+def test_any_positive_token_count_is_supported(num_tokens):
     assert _validate_args(num_tokens) == num_tokens
 
 
-@pytest.mark.parametrize("num_tokens", [0, 8193, 1.0])
+@pytest.mark.parametrize("num_tokens", [0, -1, 1.0])
 def test_invalid_token_count_is_rejected(num_tokens):
     with pytest.raises(ValueError):
         _validate_args(num_tokens)

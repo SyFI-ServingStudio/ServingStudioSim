@@ -5,7 +5,11 @@ import hashlib
 import json
 from pathlib import Path
 
+from .profiler.config import ROUTING_PROFILE_KINDS
 from .request_population import read_trace, validate_replay
+
+#: The passes whose metrics record every request's decode progress.
+ACCEPTANCE_PROFILE_KINDS = frozenset({"workload_metrics", *ROUTING_PROFILE_KINDS})
 
 
 def acceptance_counts(metrics_path: Path, request_ids: set[str], *, draft_tokens: int,
@@ -40,14 +44,20 @@ def acceptance_counts(metrics_path: Path, request_ids: set[str], *, draft_tokens
 def prepare_workload(*, source_trace: Path, profile_dir: Path, output_trace: Path,
                      draft_tokens: int, missing_acceptance: str,
                      request_id_prefix: str = "") -> dict:
-    """Prepare per-request probabilities from a complete workload-metrics pass."""
+    """Prepare per-request probabilities from a complete pass that records each
+    request's decode progress: a workload_metrics pass, or a routing pass (a
+    capture), whose acceptance is the routing's own. Acceptance is what the
+    drafts produced, not how long they took, so the routing passes' logging
+    overhead does not bias it."""
     if missing_acceptance not in {"error", "run-aggregate"}:
         raise ValueError("missing_acceptance must be error or run-aggregate")
     result_path = profile_dir / "profile_result.json"
     result = json.loads(result_path.read_text())
-    if (result.get("profile_kind") != "workload_metrics"
+    if (result.get("profile_kind") not in ACCEPTANCE_PROFILE_KINDS
             or result.get("drive_summary", {}).get("reached_idle") is not True):
-        raise ValueError("a complete workload_metrics pass is required")
+        raise ValueError(
+            "a complete pass recording request progress is required: "
+            + ", ".join(sorted(ACCEPTANCE_PROFILE_KINDS)))
     fields, rows = read_trace(source_trace)
     replay_path = Path(result["replay_result"])
     metrics_path = Path(result["metrics_jsonl"])

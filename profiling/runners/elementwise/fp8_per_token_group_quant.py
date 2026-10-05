@@ -20,18 +20,21 @@ from profiling.profilers.timer import Timer
 from profiling.runners.exceptions import KernelLaunchFailed, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
 
-_GROUP_SIZE = 128
+# The packed register kernel is compiled for one group width only
+# (per_token_group_quant.cu: `STD_TORCH_CHECK(group_size == 128, ...)` and
+# `static_assert(GROUP_SIZE == 128)`); the generic kernel takes any group_size.
+_PACKED_GROUP_SIZE = 128
 _INPUT_DTYPE = DType.BF16
 _COLUMN_MAJOR = "ue8m0_column_major"
 _ROW_MAJOR = "ue8m0_row_major"
 _PACKED_INT32 = "ue8m0_packed_int32"
-_HOPPER = ((9, 0), frozenset({"NVIDIA H100", "NVIDIA H200"}))
-_BLACKWELL = ((10, 0), frozenset({"NVIDIA B200"}))
-# scale_format -> ((compute capability, verified GPUs), CUPTI kernel name).
+# scale_format -> CUPTI kernel name. Both kernels are generic CUDA built for
+# every arch vLLM ships (their sm90+ code is only optional PDL), so the GPU a
+# format is deployed on in production is not a launch constraint.
 _SCALE_FORMATS = {
-    _COLUMN_MAJOR: (_HOPPER, "per_token_group_quant_8bit_kernel"),
-    _ROW_MAJOR: (_BLACKWELL, "per_token_group_quant_8bit_kernel"),
-    _PACKED_INT32: (_BLACKWELL, "per_token_group_quant_8bit_packed_register_kernel"),
+    _COLUMN_MAJOR: "per_token_group_quant_8bit_kernel",
+    _ROW_MAJOR: "per_token_group_quant_8bit_kernel",
+    _PACKED_INT32: "per_token_group_quant_8bit_packed_register_kernel",
 }
 _FP8_E4M3_MIN = -448.0
 _FP8_E4M3_MAX = 448.0
@@ -60,11 +63,6 @@ def _validate_args(
             "group_size must be > 0 and divide hidden_size, got "
             f"hidden_size={hidden_size}, group_size={group_size}"
         )
-    if group_size != _GROUP_SIZE:
-        raise ValueError(
-            f"vllm_cuda fp8_per_token_group_quant requires group_size={_GROUP_SIZE}, "
-            f"got {group_size}"
-        )
     if input_dtype is not _INPUT_DTYPE:
         raise ValueError(
             "vllm_cuda fp8_per_token_group_quant requires input_dtype=bf16, "
@@ -75,28 +73,12 @@ def _validate_args(
             "vllm_cuda fp8_per_token_group_quant requires scale_format in "
             f"{sorted(_SCALE_FORMATS)}, got {scale_format!r}"
         )
+    if scale_format == _PACKED_INT32 and group_size != _PACKED_GROUP_SIZE:
+        raise ValueError(
+            f"vllm_cuda fp8_per_token_group_quant {_PACKED_INT32} requires "
+            f"group_size={_PACKED_GROUP_SIZE}, got {group_size}"
+        )
     return num_tokens, hidden_size, group_size, input_dtype, scale_format
-
-
-def _validate_cuda_device(torch: Any, scale_format: str = _COLUMN_MAJOR) -> None:
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented(
-            "CUDA is required for fp8_per_token_group_quant vllm_cuda"
-        )
-    (required_capability, supported_gpus), _ = _SCALE_FORMATS[scale_format]
-    device = torch.cuda.current_device()
-    capability = tuple(torch.cuda.get_device_capability(device))
-    if capability != required_capability:
-        raise ProfilerNotImplemented(
-            f"fp8_per_token_group_quant vllm_cuda {scale_format} requires compute "
-            f"capability {required_capability}, got {capability}"
-        )
-    gpu_name = str(torch.cuda.get_device_name(device))
-    if gpu_name not in supported_gpus:
-        raise ProfilerNotImplemented(
-            f"fp8_per_token_group_quant vllm_cuda {scale_format} is verified only on "
-            f"{sorted(supported_gpus)}, got {gpu_name}"
-        )
 
 
 def _load_vllm_quant_op(torch: Any, scale_format: str = _COLUMN_MAJOR) -> Any:
@@ -235,7 +217,6 @@ def profile_fp8_per_token_group_quant_vllm_cuda(
     except ImportError as exc:
         raise ProfilerNotImplemented("PyTorch is required for vllm_cuda") from exc
 
-    _validate_cuda_device(torch, scale_format)
     quant_op = _load_vllm_quant_op(torch, scale_format)
     input_tensor, output_quantized, output_scales = _allocate_operands(
         torch,
@@ -260,7 +241,7 @@ def profile_fp8_per_token_group_quant_vllm_cuda(
                 f"vLLM per-token-group FP8 quantization failed: {exc}"
             ) from exc
 
-    time_ms = Timer.cupti(kernel, kernel_name=_SCALE_FORMATS[scale_format][1])
+    time_ms = Timer.cupti(kernel, kernel_name=_SCALE_FORMATS[scale_format])
     energy_j = Energy.perf(kernel, warmup=10, per_iter_time_ms=time_ms)
     logical_bytes = _logical_bytes(
         num_tokens=num_tokens,

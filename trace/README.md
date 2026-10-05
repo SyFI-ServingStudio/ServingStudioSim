@@ -53,6 +53,24 @@ Generated once and committed as data; there is no generator script, so the table
 above is the file's only description. Regenerate it by hand if the ranges need to
 move, and update these numbers with it.
 
+## Capture workloads
+
+The routing captures in the dataset repo `UW-SyFI/servingstudio-workload` each
+replayed one of these traces; each capture's `provenance.json` names the file
+and its `trace.csv` is a byte copy of it. They carry lengths and arrivals only:
+the prompt text (enwik8 or enwik9) is recorded in the capture's provenance.
+
+| File | Requests | Shape | Arrivals |
+|---|---|---|---|
+| `diverse_100.csv` | 100 | above | Poisson |
+| `c32_long.csv` | 64 | 8 each of input {256, 1024, 2048, 4096} x output {128, 256}, round-robin | all at 0; captured saturated at concurrency 32 |
+| `balanced_c32.csv` | 256 | 32 each of the same 8 pairs, in a different order | 1 s apart; captured saturated at concurrency 32 |
+| `ctx8k_out1k.csv` | 256 | all 8192 in / 1024 out | all at 0; captured at concurrency 64 |
+| `shape_grid_128.csv` | 128 | 4 each of input {128 ... 16384} (x2) x output {32, 128, 512, 1024} | all at 0; captured at concurrency 64 |
+
+Copied from the runs that took the captures; there is no generator script. Keep
+the bytes: a reformatted file no longer matches its capture's `trace.csv`.
+
 ## Session-wise traces
 
 Multi-round coding-agent traces carry a wider schema, one row per round:

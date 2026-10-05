@@ -79,8 +79,7 @@ DOC = KernelDoc(
     ),
     caveats=(
         "Uniform rows give every request the same context length and every "
-        "logical page its own physical page. max_ragged rows are measured only "
-        "with next_n = 1, 64 heads and a 1,048,576-wide score row, on H200.",
+        "logical page its own physical page.",
         "Both backends' TFLOPS and GB/s use the page-rounded DeepGEMM schedule;"
         " GB/s excludes the scheduling metadata, torch intermediates and "
         "physical transactions.",
@@ -96,7 +95,6 @@ register(
         supports=BackendSupport(
             compute=frozenset({DType.FP8_E4M3}),
             kv=frozenset({DType.FP8_E4M3}),
-            gpus=frozenset({"NVIDIA H200"}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.attention.dsa_paged_mqa_logits_decode",
@@ -121,7 +119,7 @@ register(
         supports=BackendSupport(
             compute=frozenset({DType.FP8_E4M3}),
             kv=frozenset({DType.FP8_E4M3}),
-            gpus=frozenset({"NVIDIA H200", "NVIDIA B200"}),
+            sm_targets=frozenset({"sm_90a", "sm_100f", "sm_120f"}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.attention.dsa_paged_mqa_logits_decode",

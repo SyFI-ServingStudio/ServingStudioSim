@@ -82,7 +82,6 @@ def _phase_configs(tmp_path: Path, suffix: str = ".yaml") -> dict[str, Path]:
             "workload": {
                 "trace_files": [str(trace)],
                 "arrival_mode": "trace_timed",
-                "session_dependency": "independent",
             },
             "io": {"log_dir": str(tmp_path / "simulation_run")},
             "pools": {
@@ -210,7 +209,6 @@ def _write_completed_inputs(tmp_path: Path) -> tuple[Path, Path, dict]:
         "workload": {
             "trace_files": [str(tmp_path / "trace" / "shared.csv")],
             "arrival_mode": "trace_timed",
-            "session_dependency": "independent",
         },
         "pools": {
             "main": {
@@ -1666,7 +1664,6 @@ _SIMULATION_SCHEMA = {
         "workload": [
             {"name": "trace_files", "type": "path_list", "required": True, "description": ""},
             {"name": "arrival_mode", "type": "string", "required": True, "description": ""},
-            {"name": "session_dependency", "type": "string", "required": True, "description": ""},
         ],
         "io": [{"name": "log_dir", "type": "path", "default": "logs", "description": ""}],
     },

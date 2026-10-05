@@ -20,7 +20,6 @@ workload:
     - trace/tracelab_preserving.csv
   input_file_format: text-generation-session-execution-v2
   arrival_mode: trace_timed
-  session_dependency: chained
   max_concurrency: 16
   request_rate: 1.0
   run_to_end: false

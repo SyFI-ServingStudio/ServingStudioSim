@@ -54,9 +54,13 @@ Keep these invariants:
 - every production row declares `BackendSupport`, `MetricFamily`, and
   `BatchOutlierPolicy`;
 - `BackendSupport` must match evidence from source exploration and runnable
-  correctness checks: compute dtype, KV/cache dtype if relevant, and GPU or
-  architecture gates. Do not mark unsupported or untested dtype/GPU combinations
-  as supported.
+  correctness checks: compute dtype, KV/cache dtype if relevant, and the CUDA
+  compute capability the kernel build needs (`min_compute_capability` /
+  `sm_targets`), never the GPUs it happens to be measured on. Do not mark
+  unsupported dtype combinations or capabilities as supported. Put the source
+  evidence for the capability rule beside the registration; the worker checks
+  it against the real device before loading the runner, so the runner does not
+  repeat it and keeps only shape-dependent checks.
 - special Python environments go through `KernelProfilerSpec.subprocess_env` and
   `profiling.exec.env`, not runner-local environment mutation;
 - `perf_api.py` gets no hand-written `get_<kind>_times` or
@@ -172,9 +176,9 @@ fully verified.
 
 Return the exact files changed, the registry row(s) added, the runner entry
 function(s), commands run, smoke/test results, environment assumptions, and any
-unsupported dtype/GPU/shape cases. Also include a **Python-to-Rust handoff**
+unsupported dtype/capability/shape cases. Also include a **Python-to-Rust handoff**
 section for the later role that will add the Rust `KernelSpec` / bridge/cache
 wiring. This is not Rust implementation work; it is a short list of facts the
 Python work established: `KIND` / facade stem, backend strings, `KernelArgs`
-fields and order, metric family, dtype/GPU capability axes, a representative
+fields and order, metric family, dtype and compute-capability axes, a representative
 smoke spec, and shape or dtype constraints.

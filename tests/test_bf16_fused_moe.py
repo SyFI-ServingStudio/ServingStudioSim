@@ -59,7 +59,6 @@ def test_public_runner_times_only_the_production_callable(monkeypatch):
 
     torch = SimpleNamespace(cuda=SimpleNamespace(synchronize=lambda: events.append("sync")))
     monkeypatch.setattr(runner, "_load_runtime", lambda: (torch, production, None))
-    monkeypatch.setattr(runner, "_require_b200", lambda _: events.append("device"))
     monkeypatch.setattr(
         runner, "_check_small_correctness", lambda *args: events.append("correctness")
     )
@@ -87,7 +86,6 @@ def test_public_runner_times_only_the_production_callable(monkeypatch):
     monkeypatch.setattr(runner.Energy, "perf", energy_call)
     metrics = runner.profile_bf16_fused_moe_sm100(**_args())
     assert events == [
-        "device",
         "correctness",
         "prepare",
         "launch",

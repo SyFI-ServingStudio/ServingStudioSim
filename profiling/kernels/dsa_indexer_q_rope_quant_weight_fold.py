@@ -99,9 +99,11 @@ register(
         args_schema=DsaIndexerQRopeQuantWeightFoldArgs,
         metric_family=MetricFamily.COMPUTE,
         batch_outlier_policy=BatchOutlierPolicy(),
+        # The kernel packs e4m3 with cvt.rn.satfinite.e4m3x2.f32
+        # (vllm/cute_utils/cvt.py), PTX that exists only on SM89+.
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
-            gpus=frozenset({"NVIDIA H200"}),
+            min_compute_capability=(8, 9),
         ),
         subprocess_env="vllm_env",
         doc=BackendDoc(

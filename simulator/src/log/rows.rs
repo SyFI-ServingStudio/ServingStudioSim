@@ -93,6 +93,9 @@ pub struct RequestSloEntry {
     /// independently from runtime prefill work so conservation can verify
     /// `hit + computed = fresh + declared` instead of deriving its own input.
     pub fresh_prompt_tokens: u32,
+    /// Immutable output length the request asks for. `num_output_tokens` is
+    /// what it produced, short of this for a request the run stopped.
+    pub target_output_tokens: u32,
     pub retraction_count: u32,
     pub reprocessed_prefill_output_tokens_before: Vec<u32>,
     pub reprocessed_prefill_prefix_hit_tokens: Vec<u32>,
@@ -715,6 +718,7 @@ pub(crate) fn slo_to_record_batch(
     let prefix_cache_hit_tokens: Vec<Option<u32>> =
         entries.iter().map(|e| e.prefix_cache_hit_tokens).collect();
     let fresh_prompt_tokens: Vec<u32> = entries.iter().map(|e| e.fresh_prompt_tokens).collect();
+    let target_output_tokens: Vec<u32> = entries.iter().map(|e| e.target_output_tokens).collect();
     let retraction_count: Vec<u32> = entries.iter().map(|e| e.retraction_count).collect();
     let ttft: Vec<Option<f32>> = entries.iter().map(|e| e.ttft_ms).collect();
     let finish_decode: Vec<Option<f32>> = entries.iter().map(|e| e.finish_decode_time_ms).collect();
@@ -865,6 +869,7 @@ pub(crate) fn slo_to_record_batch(
                     })
                     .collect::<Vec<_>>(),
             )),
+            Arc::new(UInt32Array::from(target_output_tokens)),
         ],
     )?)
 }
@@ -978,6 +983,7 @@ mod tests {
             declared_prefix_tokens: 0,
             prefix_cache_hit_tokens: Some(0),
             fresh_prompt_tokens: 0,
+            target_output_tokens: 0,
             retraction_count: 0,
             reprocessed_prefill_output_tokens_before: Vec::new(),
             reprocessed_prefill_prefix_hit_tokens: Vec::new(),

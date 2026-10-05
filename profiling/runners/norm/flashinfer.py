@@ -35,9 +35,6 @@ def profile_rms_norm(
             "torch + flashinfer are required for the flashinfer RMSNorm runner"
         ) from exc
 
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented("CUDA is required for the flashinfer RMSNorm runner")
-
     try:
         torch_dtype = dtype.torch()
         x = torch.randn(m, hidden, dtype=torch_dtype, device="cuda")

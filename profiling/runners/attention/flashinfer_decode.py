@@ -118,8 +118,6 @@ def _run_decode(
         import torch
     except ImportError as exc:
         raise ProfilerNotImplemented("torch is required for attention runners") from exc
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented("CUDA is required for attention runners")
 
     if backend == "cudnn":
         return _run_cudnn_decode(

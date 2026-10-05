@@ -5,7 +5,8 @@
 //! [`CapacityLimit`] decides how many units may be *active* at once, and
 //! [`SessionDependency`] decides whether a row is independent or waits for the
 //! preceding round of its session. Keeping them separate permits every
-//! combination without growing a cross-product enum.
+//! combination without growing a cross-product enum. The last is no choice: a
+//! trace with sessions chains its rounds, and one without has none to chain.
 //!
 //! Arrival and capacity used to be one axis, which made two of the four
 //! combinations unrepresentable: a timeline replay could not be capped, and a
@@ -19,7 +20,7 @@ use anyhow::{bail, Result};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
-use super::ReleaseMetadata;
+use super::{InputFileSchema, ReleaseMetadata, TraceTag};
 use crate::common::{RequestId, Time};
 
 pub use req_frontend::release::ArrivalMode;
@@ -97,22 +98,22 @@ impl CapacityLimit {
 
 /// Whether requests are causally independent or chained within each session.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SessionDependency {
+pub(crate) enum SessionDependency {
     Independent,
     Chained,
 }
 
 impl SessionDependency {
-    pub const CHOICES: &'static [&'static str] = &["independent", "chained"];
-
-    pub fn parse(name: &str) -> Result<Self> {
-        match name {
-            "independent" => Ok(Self::Independent),
-            "chained" => Ok(Self::Chained),
-            other => bail!(
-                "unknown session_dependency {other:?} (expected one of {:?})",
-                Self::CHOICES
-            ),
+    /// What a trace declaring `schema` replays: its sessions' rounds chained
+    /// when it has sessions (the `session` tag, or a format whose rows are
+    /// rounds), each row on its own otherwise. A session trace's later rounds
+    /// carry their session's arrival, not their own, so replaying them
+    /// independently would release a whole conversation at once.
+    pub(crate) fn of(schema: &InputFileSchema) -> Self {
+        if schema.carries(TraceTag::Session) || schema.input_file_format.has_session_topology() {
+            Self::Chained
+        } else {
+            Self::Independent
         }
     }
 }

@@ -68,9 +68,7 @@ DOC = KernelDoc(
         "TFLOPS counts only routed rows, not work on padded expert blocks. GB/s "
         "counts logical BF16 activations and outputs, packed weights and scales, "
         "and router weights only when applied.",
-        "This backend accepts only two projection shapes, with 64 local experts "
-        "on H200: FC1 with n = k = 4096 and input_top_k = 6, and FC2 with "
-        "n = 4096, k = 2048 and input_top_k = 1.",
+        "Marlin's thread tiles need n % 64 = 0 and k % 128 = 0, or n % 128 = 0 and k % 64 = 0.",
     ),
     # The measured vLLM operation has no separate PyTorch reference module.
     reference=None,
@@ -95,9 +93,10 @@ register(
             ),
             url="https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py",
         ),
+        # BF16 Marlin needs SM80+.
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
-            gpus=frozenset({"NVIDIA H200"}),
+            min_compute_capability=(8, 0),
         ),
         subprocess_env="vllm_env",
     )

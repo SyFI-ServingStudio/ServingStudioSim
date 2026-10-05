@@ -90,11 +90,6 @@ def _validate_args(
     )
 
 
-def _validate_cuda_device(torch: Any) -> None:
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented("CUDA is required for the torch gdn_prefill_post_conv backend")
-
-
 def _operand_shapes(args: _ValidatedArgs) -> _OperandShapes:
     packed_width = (
         2 * args.num_qk_heads * args.key_head_dim + args.num_value_heads * args.value_head_dim
@@ -210,8 +205,6 @@ def profile_gdn_prefill_post_conv(
             "torch and the semantic reference are required for the torch "
             "gdn_prefill_post_conv backend"
         ) from exc
-
-    _validate_cuda_device(torch)
 
     try:
         operands = _build_operands(torch, args, device=torch.device("cuda"))

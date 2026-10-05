@@ -8,7 +8,10 @@ from profiling.db.batch import coerce_args
 from profiling.db.registry import BackendSupport, known_backends, supported_backends
 from profiling.kernels.nvfp4_fused_moe import KIND, Nvfp4FusedMoeArgs
 from profiling.runners.moe.exact_topk import exact_topk_ids
-from profiling.runners.moe.nvfp4_fused_moe import _logical_bytes, _validate_args
+from profiling.runners.moe.nvfp4_fused_moe import (
+    _logical_bytes,
+    _validate_args,
+)
 
 
 def test_exact_topk_ids_realize_distinct_expert_counts() -> None:
@@ -125,7 +128,7 @@ def test_backends_gate_on_the_weight_format_not_the_bf16_input() -> None:
     assert supported_backends(KIND, DType.BF16, None, "NVIDIA B200") == []
     assert supported_backends(KIND, DType.NVFP4_E2M1, None, "NVIDIA H200") == []
     # A backend declared at bf16, as these were before, fails the gate.
-    bf16_only = BackendSupport(compute=frozenset({DType.BF16}), gpus=frozenset({"NVIDIA B200"}))
+    bf16_only = BackendSupport(compute=frozenset({DType.BF16}), sm_targets=frozenset({"sm_100f"}))
     assert not bf16_only.allows(DType.NVFP4_E2M1, None, "NVIDIA B200")
 
 

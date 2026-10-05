@@ -78,3 +78,49 @@ def test_max_ragged_topology_is_request_contiguous_and_correctness_is_independen
     actual[1, 32] += 1.0
     with pytest.raises((AssertionError, KernelLaunchFailed)):
         _check_output(torch, actual, operands, max_model_len)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"next_n": 2},
+        {"num_heads": 32},
+        {"block_size": 32},
+        {"head_dim": 64},
+        {"max_model_len": 2_097_152},
+    ],
+)
+def test_runner_accepts_unmeasured_shapes_deepgemm_can_launch(overrides):
+    assert _validate_args(**{**PRODUCTION_SPEC, **overrides}) == (65, 64, 63)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    [
+        ({"next_n": 0}, "next_n"),
+        ({"num_heads": 0}, "num_heads"),
+        ({"max_model_len": 64}, "max_model_len"),
+    ],
+)
+def test_runner_rejects_non_positive_or_uncovered_shapes(overrides, match):
+    with pytest.raises(ValueError, match=match):
+        _validate_args(**{**PRODUCTION_SPEC, **overrides})
+
+
+def test_multi_token_rows_share_their_request_context():
+    operands = _build_operands(
+        torch,
+        context_lengths=(65, 64),
+        next_n=2,
+        num_heads=32,
+        head_dim=64,
+        block_size=32,
+        device="cpu",
+    )
+    assert operands.context_lens.tolist() == [[65, 65], [64, 64]]
+    max_model_len = 96
+    actual = torch.empty((4, max_model_len), dtype=torch.float32)
+    for request_index in range(2):
+        expected = _expected_logits_row(torch, operands, request_index)
+        actual[request_index * 2, : expected.numel()] = expected
+    _check_output(torch, actual, operands, max_model_len)

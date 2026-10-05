@@ -31,11 +31,14 @@ impl KernelSpec for QKvRmsNormSpec {
     const KIND: KernelKind = "q_kv_rms_norm";
 
     fn sweep_grid(config: &Self::Config) -> SweepGrid {
-        assert_eq!(config.q_dim.get(), 1536);
-        assert_eq!(config.kv_dim.get(), 512);
-        // DeepSeek V4 uses 1e-6, GLM-5.3 1e-5; the scalar never changes the launch.
+        // vLLM's fused_q_kv_rmsnorm turns the row widths into constexpr block
+        // sizes, so any widths launch; eps is a runtime scalar.
+        assert!(config.q_dim.get() > 0 && config.kv_dim.get() > 0);
         let eps = f64::from_bits(config.rms_eps_bits);
-        assert!(eps == 1.0e-6 || eps == 1.0e-5, "unsupported rms_eps {eps}");
+        assert!(
+            eps.is_finite() && eps > 0.0,
+            "rms_eps must be positive and finite, got {eps}"
+        );
         let mut tokens = Axis::chain([Axis::pow2(0, 4), Axis::token_axis()]);
         tokens.sort_by(f64::total_cmp);
         tokens.dedup();

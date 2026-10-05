@@ -25,8 +25,8 @@ Backends ``{fa2, fa2_cudagraph, fa3, trt, cudnn}``: each registers its own spec
 -> the same ``args_schema`` and table, routing to
 ``profile_flashinfer_attn_decode_<backend>``. ``fa2_cudagraph`` keeps FA2 math
 but enables FlashInfer's CUDA-graph plan, matching vLLM pure decode's split main
-+ merge launch sequence. ``trt`` is B200/sm100-only and raises
-``ProfilerNotImplemented`` here (kept registered for future B200); ``cudnn``
++ merge launch sequence. ``trt`` is SM10x-only and raises
+``ProfilerNotImplemented`` here (kept registered for a future SM10x path); ``cudnn``
 raises for fp8.
 
 Shape split: static Config = ``(num_qo_heads, num_kv_heads, head_dim, q_dtype,
@@ -78,7 +78,7 @@ _SUPPORTS = {
     "trt": BackendSupport(
         compute=frozenset({DType.FP8_E4M3}),
         kv=frozenset({DType.FP8_E4M3}),
-        gpus=frozenset({"NVIDIA B200"}),  # trtllm-gen kernels are Blackwell-only
+        sm_targets=frozenset({"sm_100f"}),
     ),
 }
 

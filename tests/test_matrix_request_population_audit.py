@@ -63,7 +63,7 @@ def test_dense_ids_are_resolved_before_population_comparison(tmp_path, mutation)
         "simulation_log_dir": str(raw.parent), "replay_result": str(replay_path),
     }))
     (raw / "params.json").write_text(json.dumps({"workload": {
-        "session_dependency": "independent",
+        "input_file_format": "text-generation-independent",
         "trace_files": [str(reuse / "trace_observed.csv")],
     }}))
     report = tmp_path / REPORT_LOCATIONS["e2e"]
@@ -163,7 +163,7 @@ def test_alignment_analyze_refuses_a_simulation_at_another_arrival_scale(tmp_pat
     raw.mkdir(parents=True)
     paths["slo_path"].rename(raw / "request_slo.parquet")
     (raw / "params.json").write_text(json.dumps({"workload": {
-        "session_dependency": "independent", "arrival_mode": "trace_timed",
+        "input_file_format": "text-generation-independent", "arrival_mode": "trace_timed",
         "trace_files": [str(paths["trace_path"])],
     }}))
     manifest = tmp_path / "alignment_manifest.json"

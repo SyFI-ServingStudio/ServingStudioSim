@@ -19,13 +19,6 @@ _PREPARED_WEIGHT_CACHE: dict[tuple[str, int, int, int, int], tuple[Any, Any, Any
 SGLANG_PDL_MAX_TOKENS = 8192
 
 
-def _require_b200(torch: Any) -> None:
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented("NVFP4 MoE profiling requires CUDA")
-    if tuple(torch.cuda.get_device_capability()) != (10, 0):
-        raise ProfilerNotImplemented("NVFP4 MoE profiling requires SM100")
-
-
 def _load_vllm_runtime() -> tuple[Any, Any, Any]:
     try:
         import torch
@@ -91,9 +84,7 @@ def _load_runtime(stack: str) -> tuple[Any, Any, Any]:
     loaders = {"vllm": _load_vllm_runtime, "sglang": _load_sglang_runtime}
     if stack not in loaders:
         raise ValueError(f"unknown serving stack: {stack}")
-    torch, quantize, prepare = loaders[stack]()
-    _require_b200(torch)
-    return torch, quantize, prepare
+    return loaders[stack]()
 
 
 def _packed_weight(torch: Any, experts: int, n: int, k: int) -> Any:

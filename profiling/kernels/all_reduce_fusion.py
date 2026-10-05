@@ -81,9 +81,9 @@ DOC = KernelDoc(
         "Host time around graph replays includes the replay launch cost, not only kernel time.",
         "The fabric argument labels the row; the run uses whatever links "
         "connect the reserved GPUs.",
-        "flashinfer_mnnvl runs only on 2, 4 or 8 GPUs with fabric nvlink, and "
-        "only for tensors within vLLM's size limit of 64, 32 or 1 MiB; vLLM "
-        "sends larger tensors to another all-reduce.",
+        "flashinfer_mnnvl is measured only where vLLM routes to it: fabric "
+        "nvlink, a TP size vLLM has a FlashInfer all-reduce budget for, and a "
+        "tensor within that budget; vLLM sends larger tensors to another all-reduce.",
     ),
     # No separate PyTorch reference implementation exists for this kind.
     reference=None,
@@ -96,7 +96,6 @@ register(
         backend="flashinfer_trtllm",
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
-            gpus=frozenset({"NVIDIA B200"}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.comm.flashinfer_trtllm",
@@ -124,13 +123,17 @@ register(
 # fork venv because production pins FlashInfer 0.6.18 there; the project venv
 # ships 0.6.11, older than the mnnvl CUDA-graph fix vLLM relies on (>= 0.6.12).
 # One-shot vs two-shot is FlashInfer's AUTO rule inside the call, not an arg.
+# vLLM sizes the workspace, and bounds the tensors it sends here, by a budget
+# keyed by the exact compute capability (SM103 is not SM100); the runner
+# reproduces SM100's (``SM100_MAX_SIZE_MB``), so the backend is SM100 only
+# until it carries another capability's budget.
 register(
     KernelProfilerSpec(
         kernel_kind=KIND,
         backend="flashinfer_mnnvl",
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
-            gpus=frozenset({"NVIDIA B200"}),
+            sm_targets=frozenset({"sm_100a"}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.comm.flashinfer_mnnvl",

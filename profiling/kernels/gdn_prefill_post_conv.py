@@ -106,7 +106,6 @@ register(
         backend="vllm_triton",
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
-            gpus=frozenset({"NVIDIA H200"}),
         ),
         runner_ref=RunnerRef(
             module_name=("profiling.runners.attention.gdn_prefill_post_conv_vllm_triton"),

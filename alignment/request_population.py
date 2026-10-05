@@ -157,7 +157,8 @@ def audit_alignment_population(manifest_path: Path, *, repo_root: Path) -> dict:
     params = json.loads((simulation / "raw/params.json").read_text())
     workload = params.get("workload", {})
     traces = workload.get("trace_files", [])
-    if (workload.get("session_dependency") != "independent" or len(traces) != 1
+    if (workload.get("input_file_format") != "text-generation-independent"
+            or "session" in workload.get("input_file_tags", []) or len(traces) != 1
             or Path(traces[0]).suffix.lower() != ".csv"):
         return {"available": False, "reason": "identity audit requires one independent CSV trace"}
     trace = Path(traces[0])

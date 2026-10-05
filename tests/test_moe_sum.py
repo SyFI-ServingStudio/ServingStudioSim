@@ -21,11 +21,20 @@ def test_reference_reduces_top_k_in_fp32_before_bf16_conversion() -> None:
 
 
 @pytest.mark.parametrize(
-    ("top_k", "hidden_dim", "dtype"),
-    [(4, 4096, "bf16"), (6, 2048, "bf16"), (6, 4096, "fp16")],
+    ("top_k", "hidden_dim", "dtype", "error"),
+    [
+        (6, 4096, "fp16", ProfilerNotImplemented),
+        (0, 4096, "bf16", ValueError),
+        (6, 0, "bf16", ValueError),
+    ],
 )
-def test_runner_rejects_shapes_outside_the_measured_deepseek_path(
-    top_k: int, hidden_dim: int, dtype: str
+def test_runner_rejects_unbuilt_dtype_and_empty_shapes(
+    top_k: int, hidden_dim: int, dtype: str, error: type[Exception]
 ) -> None:
-    with pytest.raises(ProfilerNotImplemented):
+    with pytest.raises(error):
         _validate_args(128, top_k, hidden_dim, dtype)
+
+
+@pytest.mark.parametrize(("top_k", "hidden_dim"), [(6, 4096), (4, 4096), (8, 2048), (10, 7168)])
+def test_runner_accepts_any_positive_top_k_and_hidden_dim(top_k: int, hidden_dim: int) -> None:
+    assert _validate_args(128, top_k, hidden_dim, "bf16") == (128, top_k, hidden_dim)

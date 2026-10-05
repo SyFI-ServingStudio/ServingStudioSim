@@ -78,7 +78,6 @@ register(
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
             kv=frozenset({DType.FP8_E4M3}),
-            gpus=frozenset({"NVIDIA H200"}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.attention.dsa_index_cache_append",
@@ -101,7 +100,6 @@ register(
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
             kv=frozenset({DType.FP8_E4M3}),
-            gpus=frozenset({"NVIDIA H200", "NVIDIA B200"}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.attention.dsa_index_cache_append",
@@ -129,7 +127,6 @@ register(
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
             kv=frozenset({DType.FP8_E4M3}),
-            gpus=frozenset({"NVIDIA B200"}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.attention.dsa_index_cache_append",

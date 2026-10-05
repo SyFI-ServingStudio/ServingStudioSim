@@ -110,7 +110,6 @@ register(
         backend="torch_linear_vllm",
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
-            gpus=frozenset({"NVIDIA B200"}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.gemm.torch",
@@ -152,9 +151,11 @@ register(
     KernelProfilerSpec(
         kernel_kind=KIND,
         backend="sglang_bf16_auto",
+        # SGLang's initialize_bf16_gemm_config resolves `auto` to cutedsl when
+        # is_sm100_supported(): compute capability major 10.
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
-            gpus=frozenset({"NVIDIA B200"}),
+            sm_targets=frozenset({"sm_100f"}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.gemm.sglang",
@@ -180,9 +181,11 @@ register(
     KernelProfilerSpec(
         kernel_kind=KIND,
         backend="sglang_fused_a_auto",
+        # SGLang's initialize_bf16_gemm_config resolves `auto` to cutedsl when
+        # is_sm100_supported(): compute capability major 10.
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
-            gpus=frozenset({"NVIDIA B200"}),
+            sm_targets=frozenset({"sm_100f"}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.gemm.sglang",
