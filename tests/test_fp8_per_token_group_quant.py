@@ -224,7 +224,6 @@ def test_exact_vllm_op_matches_torch_reference_on_cuda():
 
     from profiling.runners.elementwise import fp8_per_token_group_quant as runner
 
-    runner._validate_cuda_device(torch)
     quant_op = runner._load_vllm_quant_op(torch)
     input_tensor, output_quantized, output_scales = runner._allocate_operands(
         torch,
