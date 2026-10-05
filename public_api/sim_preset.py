@@ -46,16 +46,12 @@ from typing import Any
 
 import yaml
 
-from launcher.alignment_campaign.check import ROUTING_FILES
-from launcher.corpus import resolve_reference
+from launcher.corpus import ROUTING_FILES, resolve_reference
 from public_api import preset as public_preset
 from public_api.deployments import DeploymentIndex, Member, _axes, find_member
 
 REPO_ROOT = public_preset.REPO_ROOT
 SIM_PRESET_ROOT = REPO_ROOT / "presets" / "public_sim"
-
-# Routing a capture row binds; `uniform` / `random` rows are synthetic, not captures.
-
 
 class SimPresetError(ValueError):
     """A sim preset that does not describe a supported deployment."""
@@ -159,7 +155,8 @@ def _capture_dir(reference: str) -> str:
 
 
 def _row_captures(rows: dict) -> list[Capture]:
-    """An arch preset's capture rows, in its order (the first is its default)."""
+    """An arch preset's capture rows, in its order (the first is its default):
+    the rows whose routing names a capture (:data:`ROUTING_FILES`)."""
     out = []
     for label, row in rows.items():
         field_name = ROUTING_FILES.get(row.get("routing"))
@@ -409,7 +406,11 @@ class SimIndex:
             rows.append(captures)
         if any(row != rows[0] for row in rows):
             raise SimPresetError(f"{preset_id}: its pools' arch presets have different captures")
-        return rows[0] if rows[0] is not None else _all_traces(self.index)
+        captures = rows[0] if rows[0] is not None else _all_traces(self.index)
+        if not captures:
+            # A member's first capture is its default and names its GPUs.
+            raise SimPresetError(f"{preset_id}: no published trace to replay")
+        return captures
 
     def _bind(self, member: SimMember) -> str | None:
         """Find each pool's arch member for every capture. A capture whose arch

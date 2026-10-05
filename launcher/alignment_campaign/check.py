@@ -48,6 +48,7 @@ from ..alignment_config import (
     load_profile_config,
     load_timing_predict_config,
 )
+from ..corpus import ROUTING_FILES
 from .pack import Case, Finding, HostProfile, Pack, PackError
 from .render import (
     ANALYSIS_E2E_PHASE,
@@ -387,8 +388,6 @@ def _check_label_rules(pack: Pack) -> list[Finding]:
     return findings
 
 
-#: Each measured routing kind and the arch field naming its artifact.
-ROUTING_FILES = {"popularity": "expert_popularity_file", "corpus": "token_corpus_file"}
 #: The artifact schema versions this simulator reads, per routing kind. `check`
 #: exists to fail a pack before it reaches a GPU, so both kinds are validated,
 #: not only the older one.

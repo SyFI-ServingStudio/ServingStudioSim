@@ -9,7 +9,7 @@ import subprocess
 import pytest
 import yaml
 
-from launcher.alignment_campaign.check import ROUTING_FILES
+from launcher.corpus import ROUTING_FILES
 from profiling.perf_api import DB_PATH
 from public_api import predict
 from public_api import preset as public_preset

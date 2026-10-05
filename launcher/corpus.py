@@ -24,6 +24,10 @@ from pathlib import Path
 
 HF_SCHEME = "hf://"
 
+#: Each measured routing kind and the arch field naming its capture. A row of
+#: another routing (`uniform`, `random`) is synthetic and names none.
+ROUTING_FILES = {"popularity": "expert_popularity_file", "corpus": "token_corpus_file"}
+
 _REFERENCE = re.compile(
     r"^hf://datasets/(?P<repo>[^@/]+/[^@/]+)@(?P<revision>[0-9a-f]{7,40})/(?P<path>.+)$"
 )
