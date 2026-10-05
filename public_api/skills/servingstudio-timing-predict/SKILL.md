@@ -213,7 +213,7 @@ Errors carry `detail`:
 | Status | Cause | `detail` |
 | --- | --- | --- |
 | 400 | `params` miss an axis, name an unknown one, or match no member | `{message, choices}`; `choices` lists every member's `params` |
-| 400 | Bad cases: empty, more than 64, wrong group count, unknown field, a length past `max_model_len`, a wrong query width | the simulator's message, naming the case; for a length past `max_model_len`, `{message, too_long: {max_model_len, requests: null, total: null}}` |
+| 400 | Bad cases: empty, more than 64, wrong group count, unknown field, a length past `max_model_len`, a wrong query width | the simulator's message, naming the case; for a length past `max_model_len`, `{message, too_long: {max_model_len, pool: null, requests: null, total: null}}` |
 | 404 | Unknown preset id | `no public preset '...'` |
 | 409 | The member does not build, lacks profile.db rows, or a case needs a row nobody measured | the build error or the missing rows; the service never profiles, so report it and pick another member or shape |
 

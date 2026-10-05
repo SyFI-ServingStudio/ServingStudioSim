@@ -37,6 +37,7 @@ import pyarrow.parquet as pq
 
 from launcher import timing_predict as launcher
 from launcher.exec import ERROR_JSON, binary_error, binary_too_long
+from profiling.gpu_policy import GPU_DISABLED_MARKER
 from public_api.deployments import Member
 
 MAX_CASES = 64
@@ -168,7 +169,7 @@ def predict(
                 text = log.read_text(errors="replace") if log.exists() else ""
                 error = log_dir / "raw" / ERROR_JSON
                 cause = _cause(binary_error(error), text, scratch, log_dir)
-                if "needs a GPU" in cause:
+                if GPU_DISABLED_MARKER in cause:
                     raise NotPredictable(cause)
                 raise BadCases(cause, binary_too_long(error))
             prediction = _read(member, cases, log_dir)

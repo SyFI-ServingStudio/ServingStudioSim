@@ -186,7 +186,7 @@ input_len + output_len`, plus the draft tokens for a speculative worker, fits
 each pool's `max_model_len`, which is the arch's own or else its checkpoint's
 `max_position_embeddings`; and a per-position `accept_rate` has one probability
 per draft position) (400 for each; a request that does not fit answers
-`detail: {message, too_long: {max_model_len, requests, total}}`, the counts
+`detail: {message, too_long: {pool, max_model_len, requests, total}}` (`pool` the refusing pool's role), the counts
 of the simulator's own check). The run's directory holds the trace
 it replays (`workload.csv`: the source's rows, with the `accept_rate`
 column), a generated trace as tracegen wrote it
