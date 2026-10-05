@@ -47,20 +47,20 @@ impl SweepCoords for DsaCompressedPrefillKernelInput {
     }
 }
 
-/// Queries in one step, from one up to the most a step runs
-/// (`max_num_batched_tokens`): `base` below it, then doubling to it.
+/// Queries in one step: the kernel's measured points `base`, cut at the most
+/// a step runs (`max_num_batched_tokens`), which ends the axis when it is
+/// below the last point. A step budget past `base` (an unchunked worker's
+/// max_model_len) keeps `base`: a longer step is answered past the grid
+/// (`off_grid`), not measured.
 pub(crate) fn query_axis(base: &[u32], max_num_batched_tokens: u32) -> Vec<f64> {
     let mut values: Vec<u32> = base
         .iter()
         .copied()
         .filter(|&queries| queries < max_num_batched_tokens)
         .collect();
-    let mut next = values.last().map_or(1, |&last| last * 2);
-    while next < max_num_batched_tokens {
-        values.push(next);
-        next *= 2;
+    if values.len() < base.len() {
+        values.push(max_num_batched_tokens);
     }
-    values.push(max_num_batched_tokens);
     Axis::values(values)
 }
 
@@ -239,11 +239,11 @@ mod tests {
             query_axis(&PREFILL_QUERIES, 2052),
             Axis::values([1, 4, 16, 64, 128, 256, 512, 1024, 2048, 2052])
         );
-        // Unchunked steps run a whole prompt, up to max_model_len.
-        let unchunked = query_axis(&PREFILL_QUERIES, 1_048_576);
+        // An unchunked step keeps the measured points; a longer one is
+        // answered past the grid.
         assert_eq!(
-            unchunked[10..],
-            Axis::values([8192, 16384, 32768, 65536, 131072, 262144, 524288, 1_048_576])[..]
+            query_axis(&PREFILL_QUERIES, 1_048_576),
+            Axis::values(PREFILL_QUERIES)
         );
     }
 
