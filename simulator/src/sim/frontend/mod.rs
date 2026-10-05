@@ -46,6 +46,20 @@ impl<Definition: RequestDefinition> TraceFrontend<Definition> {
     pub fn source_identities(&self) -> &SourceIdentities {
         &self.source_identities
     }
+
+    /// Every request's definition with its id in the source trace, in row
+    /// order: what a check of the whole trace before the run reads.
+    pub fn source_requests(&self) -> impl Iterator<Item = (String, &Definition)> + '_ {
+        let ids = self.source_identities.request_source_ids();
+        self.scheduled_requests.iter().map(move |request| {
+            let id = request.release.request_id.0;
+            let source = ids
+                .get(id as usize)
+                .cloned()
+                .unwrap_or_else(|| id.to_string());
+            (source, &request.definition)
+        })
+    }
 }
 
 /// One row of the normalized plan, in the source's own identifiers.

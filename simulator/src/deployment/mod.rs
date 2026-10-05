@@ -17,10 +17,12 @@ pub use config::{
     AfdConfig, BackendOverrides, IoSpec, LogLevel, PdConfig, RunConfig, UnifiedConfig, WorkloadSpec,
 };
 
-use anyhow::ensure;
+use anyhow::{bail, ensure, Context};
 
-use crate::common::SharedRequests;
-use crate::orchestrator::Flow;
+use crate::arch::IterArchSel;
+use crate::common::{AcceptanceProfile, DecodingStrategy, SharedRequests};
+use crate::orchestrator::{Flow, PoolSpec};
+use crate::sim::TraceFrontend;
 use crate::timing::PerfApiBridge;
 use crate::worker::IterWorkerSel;
 
@@ -62,6 +64,126 @@ fn ensure_speculative_trace(cfg: &RunConfig) -> anyhow::Result<()> {
             "pool {role}: the speculative worker needs each request's accept_rate; tag the \
              trace `speculative` (workload.input_file_tags) and give every row an accept_rate"
         );
+    }
+    Ok(())
+}
+
+/// One pool group's bound on the requests it serves: the pool's role, its
+/// arch's longest request, and a speculative worker's draft width.
+struct PoolBound {
+    role: &'static str,
+    max_model_len: u32,
+    draft_tokens: Option<u32>,
+}
+
+fn pool_bounds(cfg: &RunConfig) -> anyhow::Result<Vec<PoolBound>> {
+    fn iter_pool(
+        role: &'static str,
+        pool: &PoolSpec<IterArchSel, IterWorkerSel>,
+        out: &mut Vec<PoolBound>,
+    ) -> anyhow::Result<()> {
+        for group in &pool.groups {
+            out.push(PoolBound {
+                role,
+                max_model_len: group
+                    .arch
+                    .max_model_len()
+                    .with_context(|| format!("pool {role}"))?,
+                draft_tokens: match group.worker {
+                    IterWorkerSel::Speculative { draft_tokens, .. } => Some(draft_tokens),
+                    _ => None,
+                },
+            });
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    match cfg {
+        RunConfig::Unified(c) => iter_pool("main", &c.pools.main, &mut out)?,
+        RunConfig::Pd(c) => {
+            iter_pool("prefill", &c.pools.prefill, &mut out)?;
+            iter_pool("decode", &c.pools.decode, &mut out)?;
+        }
+        // The ffn pool holds no request context.
+        RunConfig::Afd(c) => {
+            for group in &c.pools.attn.groups {
+                out.push(PoolBound {
+                    role: "attn",
+                    max_model_len: group.arch.max_model_len().context("pool attn")?,
+                    draft_tokens: None,
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Refuse a trace a pool cannot serve, before anything runs, rather than fail
+/// mid-run on its first such request:
+///
+/// - every request's whole context (its declared prefix, its input and its
+///   output; a speculative worker's last verify reads `draft_tokens` beyond
+///   that) must fit each pool's [`IterArchSel::max_model_len`];
+/// - a per-position `accept_rate` must have one probability per draft
+///   position of each speculative worker (a single probability fits any).
+///
+/// The message names the pool, its bound, how many requests break it and the
+/// first of their ids. `simulator run` checks before its tick loop, and
+/// `simulator workload-plan --config` with the same function, so a service can
+/// refuse the trace before queueing a run.
+pub fn check_trace(cfg: &RunConfig, trace: &TraceFrontend) -> anyhow::Result<()> {
+    const SHOWN: usize = 5;
+    let total = trace.expected_count();
+    for pool in pool_bounds(cfg)? {
+        let draft = pool.draft_tokens.unwrap_or(0);
+        let (mut long, mut long_ids) = (0usize, Vec::new());
+        let (mut misfit, mut misfit_ids) = (0usize, Vec::new());
+        for (id, request) in trace.source_requests() {
+            let context = u64::from(request.session.declared_prefix_tokens())
+                + u64::from(request.prompt_tokens)
+                + u64::from(request.target_output_tokens)
+                + u64::from(draft);
+            if context > u64::from(pool.max_model_len) {
+                long += 1;
+                if long_ids.len() < SHOWN {
+                    long_ids.push(id.clone());
+                }
+            }
+            if let (
+                Some(draft_tokens),
+                DecodingStrategy::Speculative {
+                    accept_rate: AcceptanceProfile::ByPosition(rates),
+                },
+            ) = (pool.draft_tokens, &request.decoding)
+            {
+                if rates.len() != draft_tokens as usize {
+                    misfit += 1;
+                    if misfit_ids.len() < SHOWN {
+                        misfit_ids.push(id);
+                    }
+                }
+            }
+        }
+        let role = pool.role;
+        if long > 0 {
+            let fit = if draft > 0 {
+                format!("prefix_len + input_len + output_len + {draft} draft tokens")
+            } else {
+                "prefix_len + input_len + output_len".to_string()
+            };
+            bail!(
+                "{long} of {total} requests exceed pool {role}'s max_model_len {} ({fit}), \
+                 first ids {long_ids:?}",
+                pool.max_model_len
+            );
+        }
+        if misfit > 0 {
+            bail!(
+                "{misfit} of {total} requests give pool {role}'s speculative worker, which \
+                 drafts {draft} tokens, an accept_rate vector that is not {draft} \
+                 probabilities long (one per draft position), first ids {misfit_ids:?}"
+            );
+        }
     }
     Ok(())
 }
@@ -132,5 +254,97 @@ mod tests {
             pool("main", "{type: barebone, attn_gpu_memory_gb: 80.0}")
         );
         ensure_speculative_trace(&config("", &barebone)).expect("not speculative");
+    }
+
+    /// A Llama 3 8B pool (`max_position_embeddings` 131072) with `worker`.
+    fn llama_config(tags: &str, worker: &str) -> RunConfig {
+        let model = concat!(env!("CARGO_MANIFEST_DIR"), "/model/config/llama3_8b.json");
+        let pools = format!("deployment: unified\npools:\n{}", pool("main", worker))
+            .replace("model_config: m.json", &format!("model_config: {model}"));
+        config(tags, &pools)
+    }
+
+    fn trace(dir: &std::path::Path, tags: &[&str], rows: &str) -> TraceFrontend {
+        use crate::sim::{
+            ArrivalSchedule, CapacityLimit, InputFileFormat, InputFileSchema, TraceTag,
+        };
+        let accept = if tags.contains(&"speculative") {
+            ",accept_rate"
+        } else {
+            ""
+        };
+        let path = dir.join("trace.csv");
+        std::fs::write(
+            &path,
+            format!("id,input_len,output_len,arrival_time{accept}\n{rows}"),
+        )
+        .unwrap();
+        let schema = InputFileSchema::new(
+            InputFileFormat::parse("text-generation-independent").unwrap(),
+            tags.iter()
+                .map(|tag| TraceTag::parse(tag).unwrap())
+                .collect(),
+        )
+        .unwrap();
+        TraceFrontend::load(
+            &[path],
+            &schema,
+            ArrivalSchedule::parse("trace_timed", 1.0).unwrap(),
+            CapacityLimit::parse(None).unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_request_longer_than_the_pools_max_model_len_is_refused_before_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let barebone = llama_config("", "{type: barebone, attn_gpu_memory_gb: 80.0}");
+        let fits = trace(dir.path(), &[], "a,130872,200,0.0\n");
+        check_trace(&barebone, &fits).expect("131072 tokens is the limit itself");
+
+        let long = trace(
+            dir.path(),
+            &[],
+            "a,100,10,0.0\nb,131000,200,0.0\nc,131000,73,0.0\nd,131000,72,0.0\n",
+        );
+        let error = check_trace(&barebone, &long).unwrap_err().to_string();
+        assert_eq!(
+            error,
+            "2 of 4 requests exceed pool main's max_model_len 131072 \
+             (prefix_len + input_len + output_len), first ids [\"b\", \"c\"]"
+        );
+    }
+
+    #[test]
+    fn a_speculative_worker_counts_its_draft_tokens_and_its_acceptance_width() {
+        let dir = tempfile::tempdir().unwrap();
+        let speculative = llama_config("speculative", SPECULATIVE);
+        // 131069 + 3 draft tokens fits; one more does not.
+        let fits = trace(dir.path(), &["speculative"], "a,131000,69,0.0,0.7\n");
+        check_trace(&speculative, &fits).expect("fits with its draft tokens");
+        let long = trace(dir.path(), &["speculative"], "a,131000,70,0.0,0.7\n");
+        let error = check_trace(&speculative, &long).unwrap_err().to_string();
+        assert!(
+            error.contains(
+                "max_model_len 131072 (prefix_len + input_len + output_len + 3 draft tokens)"
+            ),
+            "{error}"
+        );
+
+        // A per-position vector needs one probability per draft position; a
+        // single probability fits any width.
+        let rows = "a,8,4,0.0,0.7\nb,8,4,0.0,\"[0.9,0.8,0.7]\"\nc,8,4,0.0,\"[0.9,0.8]\"\n";
+        let error = check_trace(&speculative, &trace(dir.path(), &["speculative"], rows))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "1 of 3 requests give pool main's speculative worker, which drafts 3 tokens, \
+             an accept_rate vector that is not 3 probabilities long (one per draft \
+             position), first ids [\"c\"]"
+        );
+        let rows = "a,8,4,0.0,0.7\nb,8,4,0.0,\"[0.9,0.8,0.7]\"\n";
+        check_trace(&speculative, &trace(dir.path(), &["speculative"], rows))
+            .expect("every vector is three long");
     }
 }

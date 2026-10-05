@@ -9,7 +9,8 @@
 //!   - `list-params`               — emit the param-schema registry JSON
 //!   - `kernel-list`               — every kernel kind's config / sweep fields
 //!   - `cost-trees <blocks>`       — given arch blocks' cost trees, no sim
-//!   - `workload-plan <workload>`  — a workload's requests as a run loads them (JSON)
+//!   - `workload-plan <workload>`  — a workload's requests as a run loads them (JSON);
+//!     `workload-plan --config <config>` also checks them against the run's pools
 //!   - `trace-formats`             — the trace formats and tags a run reads (JSON)
 //!
 //! All three run-like subcommands share one parse (`load_config`) → `RunConfig`
@@ -23,7 +24,7 @@ use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 
 use simulator::common::{RequestStore, SharedRequests};
-use simulator::deployment::{build_flow, RunConfig, WorkloadSpec};
+use simulator::deployment::{build_flow, check_trace, RunConfig, WorkloadSpec};
 use simulator::log::LoggerSession;
 use simulator::schema::list_params;
 use simulator::sim::{
@@ -102,7 +103,9 @@ enum Cmd {
     /// replay settings, row checks) and print its requests as JSON: the
     /// normalized plan, one row per request in the trace's own ids (a row of a
     /// trace without sessions has no session, round or predecessor).
-    /// Reads no profile.db and builds no model.
+    /// Reads no profile.db and builds no model. Given a whole run config
+    /// (`--config`), it also refuses requests a pool cannot serve, as `run`
+    /// does before its first tick.
     WorkloadPlan(WorkloadArgs),
     /// Print the input file formats a run reads and the tags each can add, with
     /// their columns, as JSON.
@@ -112,7 +115,12 @@ enum Cmd {
 #[derive(Args)]
 struct WorkloadArgs {
     /// A run config's `workload` block on its own (`.yaml` / `.yml` / `.json`).
-    workload: PathBuf,
+    #[arg(required_unless_present = "config", conflicts_with = "config")]
+    workload: Option<PathBuf>,
+    /// A whole run config instead: its workload, checked against its pools
+    /// (`deployment::check_trace`).
+    #[arg(long, value_name = "FILE")]
+    config: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -313,8 +321,19 @@ fn dispatch(cmd: Cmd) -> Result<()> {
             args.report_json.as_deref(),
         ),
         Cmd::WorkloadPlan(args) => {
-            let workload: WorkloadSpec = parse_file(&args.workload, "workload")?;
-            let requests = load_frontend(&workload)?.plan_rows();
+            let frontend = match (&args.config, &args.workload) {
+                (Some(config), _) => {
+                    let cfg = load_config(config)?;
+                    let frontend = load_frontend(cfg.workload())?;
+                    check_trace(&cfg, &frontend)?;
+                    frontend
+                }
+                (None, Some(workload)) => {
+                    load_frontend(&parse_file::<WorkloadSpec>(workload, "workload")?)?
+                }
+                (None, None) => unreachable!("clap requires a workload or --config"),
+            };
+            let requests = frontend.plan_rows();
             println!("{}", serde_json::json!({ "requests": requests }));
             Ok(())
         }
@@ -334,6 +353,7 @@ fn cmd_run(config: &Path) -> anyhow::Result<()> {
     // supported text path before starting the bridge or building L4.
     let workload = cfg.workload();
     let mut frontend = load_frontend(workload)?;
+    check_trace(&cfg, &frontend)?;
     let tick_cfg = TickCfg::new(
         workload.duration_ms,
         workload.run_to_end,
