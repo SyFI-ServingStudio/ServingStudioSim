@@ -5,11 +5,17 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 
 /// The CUDA compute capability `(major, minor)` of a GPU, looked up by its
-/// catalog name or any alias (e.g. "NVIDIA B200"). `None` for a GPU the catalog
-/// does not list or a non-NVIDIA part.
+/// catalog name or any alias (e.g. "NVIDIA B200"), trimmed and ignoring case,
+/// first catalog entry first, as `profiling.gpu_catalog.resolve_gpu_spec`
+/// matches. `None` for a GPU the catalog does not list or a non-NVIDIA part.
 pub fn compute_capability(gpu_name: &str) -> Option<(u32, u32)> {
     static BY_NAME: OnceLock<HashMap<String, (u32, u32)>> = OnceLock::new();
-    BY_NAME.get_or_init(load).get(gpu_name).copied()
+    BY_NAME.get_or_init(load).get(&key(gpu_name)).copied()
+}
+
+/// The form a GPU name is matched in.
+fn key(name: &str) -> String {
+    name.trim().to_lowercase()
 }
 
 fn load() -> HashMap<String, (u32, u32)> {
@@ -42,7 +48,7 @@ fn load() -> HashMap<String, (u32, u32)> {
                 )
             });
         for name in std::iter::once(gpu.name).chain(gpu.aliases) {
-            by_name.insert(name, capability);
+            by_name.entry(key(&name)).or_insert(capability);
         }
     }
     by_name
@@ -57,6 +63,7 @@ mod tests {
         assert_eq!(compute_capability("NVIDIA H200"), Some((9, 0)));
         assert_eq!(compute_capability("B200-SXM-180GB"), Some((10, 0)));
         assert_eq!(compute_capability("NVIDIA B300"), Some((10, 3)));
+        assert_eq!(compute_capability("  nvidia h200 "), Some((9, 0)));
         assert_eq!(compute_capability("AMD MI300X"), None);
         assert_eq!(compute_capability("No Such GPU"), None);
     }
