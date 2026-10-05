@@ -93,6 +93,24 @@ def test_every_sim_member_builds_and_is_measured(sims):
     assert not unavailable
 
 
+@pytest.mark.needs_binary
+def test_a_capture_longer_than_the_members_context_does_not_fit(bound):
+    """A capture whose requests exceed a member's context is that capture's
+    misfit, counted as the simulator's own check counts it; a longer context
+    fits it."""
+    sims, registry = bound
+    preset = "GLM-5.3-Flash/glm53_flash_vllm_fp8_kda_dsa_moe_chunked_prefill"
+    short = sims.member(preset, {"replicas": 1, "server": "ctx8k"})
+    found = simulate.misfit(sims.index, short, short.capture("diverse_100"), registry)
+    assert {k: found[k] for k in ("requests", "total", "max_model_len")} == {
+        "requests": 46,
+        "total": 100,
+        "max_model_len": 8192,
+    }
+    long = sims.member(preset, {"replicas": 1, "server": "ctx128k"})
+    assert simulate.misfit(sims.index, long, long.capture("diverse_100"), registry) is None
+
+
 def _plan_run(bound, tmp_path, preset: str, params: dict, rows: str, tags: list[str]) -> list:
     """``workloads.plan_run`` of a run of ``preset`` ``params`` on its first
     capture's routing, replaying ``rows`` (an independent trace)."""
