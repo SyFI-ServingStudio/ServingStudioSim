@@ -15,6 +15,7 @@ use serde::Deserialize;
 use crate::arch::config::ModelSpec;
 use crate::arch::contract::{IterwiseUnifiedModel, UnifiedArchInput};
 use crate::op::Op;
+use crate::timing::kernels::kv_compress_store::FP8_DS_MLA_ROW_BYTES;
 use crate::timing::kernels::{
     ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput, MhcRmsNormKernelConfig,
     MhcRmsNormKernelInput, MhcTerminalHeadKernel, MoeEpAllGatherKernel, MoeEpAllGatherKernelConfig,
@@ -355,12 +356,13 @@ pub fn build_configs(
         .iter()
         .try_fold(0_u64, |sum, ratio| {
             sum.checked_add(
-                584 + match ratio {
-                    1 => 0,
-                    4 => 146,
-                    128 => 5,
-                    _ => unreachable!(),
-                },
+                u64::from(FP8_DS_MLA_ROW_BYTES)
+                    + match ratio {
+                        1 => 0,
+                        4 => 146,
+                        128 => 5,
+                        _ => unreachable!(),
+                    },
             )
         })
         .ok_or_else(|| fit_failed("KV byte accounting overflow"))?;

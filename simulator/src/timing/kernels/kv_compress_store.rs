@@ -8,6 +8,11 @@ use crate::timing::kernels::engine::{register_kernel, KernelSpec, OffGrid};
 use crate::timing::sweep::{Axis, Coords, SweepGrid};
 use crate::timing::{Dim, KernelConfig, SweepCoords};
 
+/// Bytes of one `fp8_ds_mla` cache row, as this kind stores it and the gather
+/// and decode kinds read it: 448 fp8 values, 64 bf16 rope values and 8 scale
+/// bytes.
+pub const FP8_DS_MLA_ROW_BYTES: u32 = 584;
+
 #[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct KvCompressStoreKernelConfig {
     #[serde(deserialize_with = "de_backends")]
@@ -104,8 +109,8 @@ fn logical_bytes(config: &KvCompressStoreKernelConfig, input: &KvCompressStoreKe
     let head_dim = config.head_dim.get();
     // (compression window, state width, cache row bytes), as the runners set them.
     let (window, state_width, row_bytes) = match (head_dim, ratio) {
-        (512, 4) => (8, 1024, 584),
-        (512, _) => (ratio, 512, 584),
+        (512, 4) => (8, 1024, FP8_DS_MLA_ROW_BYTES),
+        (512, _) => (ratio, 512, FP8_DS_MLA_ROW_BYTES),
         _ => (8, 512, 132),
     };
     let (rows, active) = input.work(ratio);

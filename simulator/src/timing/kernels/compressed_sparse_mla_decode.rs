@@ -3,6 +3,7 @@
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::{CacheKind, Extrapolation};
 use crate::timing::kernels::engine::{register_kernel, KernelSpec, OffGrid};
+use crate::timing::kernels::kv_compress_store::FP8_DS_MLA_ROW_BYTES;
 use crate::timing::sweep::{Axis, Coords, SweepGrid};
 use crate::timing::{Dim, KernelConfig, SweepCoords};
 
@@ -100,10 +101,6 @@ fn canonical_counts(
     )
 }
 
-/// Bytes of one selected `fp8_ds_mla` cache row: 448 fp8 values, 64 bf16 rope
-/// values and 8 scale bytes.
-const CACHE_ROW_BYTES: f64 = 584.0;
-
 /// The profiler's logical bytes: q, each selected cache row and its index, the
 /// per-request valid counts, the output and lse, and the head sinks.
 fn logical_bytes(
@@ -120,7 +117,7 @@ fn logical_bytes(
         .sum();
     let count_arrays = if config.compress_ratio > 1 { 2.0 } else { 1.0 };
     batch * heads * f64::from(config.head_dim.get()) * f64::from(config.q_dtype.size_bytes())
-        + selected * (CACHE_ROW_BYTES + 4.0)
+        + selected * (f64::from(FP8_DS_MLA_ROW_BYTES) + 4.0)
         + batch * 4.0 * count_arrays
         + batch
             * heads

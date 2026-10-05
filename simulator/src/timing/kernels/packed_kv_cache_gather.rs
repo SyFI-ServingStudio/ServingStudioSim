@@ -3,6 +3,7 @@
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::{CacheKind, Extrapolation};
 use crate::timing::kernels::engine::{register_kernel, KernelSpec, OffGrid};
+use crate::timing::kernels::kv_compress_store::FP8_DS_MLA_ROW_BYTES;
 use crate::timing::sweep::{Axis, Coords, SweepGrid};
 use crate::timing::{Dim, KernelConfig, SweepCoords};
 
@@ -102,10 +103,6 @@ fn canonical_input(
     }
 }
 
-/// Bytes of one packed `fp8_ds_mla` cache row: 448 fp8 values, 64 bf16 rope
-/// values and 8 scale bytes.
-const CACHE_ROW_BYTES: f64 = 584.0;
-
 /// The profiler's logical bytes: each gathered row read with its slot and
 /// written dequantized, plus the length arrays.
 fn logical_bytes(
@@ -124,7 +121,7 @@ fn logical_bytes(
         2.0
     };
     gathered
-        * (CACHE_ROW_BYTES
+        * (f64::from(FP8_DS_MLA_ROW_BYTES)
             + 4.0
             + f64::from(config.head_dim.get()) * f64::from(config.output_dtype.size_bytes()))
         + input.seq_lens.len() as f64 * 4.0 * length_arrays
