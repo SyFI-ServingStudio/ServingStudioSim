@@ -477,6 +477,7 @@ fn slo_entry(id: RequestId, now: Time, rec: &RequestRecord) -> RequestSloEntry {
         declared_prefix_tokens: rec.request.definition.session.declared_prefix_tokens(),
         prefix_cache_hit_tokens: rec.telemetry.prefix_cache_hit_tokens,
         fresh_prompt_tokens: rec.request.definition.prompt_tokens,
+        target_output_tokens: rec.request.definition.target_output_tokens,
         retraction_count: rec.telemetry.retraction_count,
         reprocessed_prefill_output_tokens_before: rec
             .telemetry

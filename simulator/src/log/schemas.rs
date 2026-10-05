@@ -386,6 +386,9 @@ pub fn request_slo_schema() -> Arc<Schema> {
             false,
         ),
         Field::new("speculative_progress", DataType::Utf8, true),
+        // The immutable output length the request asks for. Appended last to
+        // keep the schema append-only.
+        Field::new("target_output_tokens", DataType::UInt32, false),
     ]))
 }
 

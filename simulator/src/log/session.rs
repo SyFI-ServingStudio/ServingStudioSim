@@ -220,6 +220,7 @@ mod tests {
             declared_prefix_tokens: 0,
             prefix_cache_hit_tokens: Some(0),
             fresh_prompt_tokens: 0,
+            target_output_tokens: 0,
             retraction_count: 0,
             reprocessed_prefill_output_tokens_before: Vec::new(),
             reprocessed_prefill_prefix_hit_tokens: Vec::new(),
