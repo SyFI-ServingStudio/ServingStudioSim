@@ -31,10 +31,10 @@ from launcher.exec import _build_subprocess_env, binary_path
 from profiling.db.migrate import require_current
 
 
-def run_json(binary: Path, args: list[str], stdin: str | None = None) -> Any:
-    """``binary args`` (with ``stdin``) as the JSON it prints; raises with its
-    stderr when it fails."""
-    result = subprocess.run(
+def run(binary: Path, args: list[str], stdin: str | None = None) -> subprocess.CompletedProcess:
+    """``binary args`` (with ``stdin``) in the launcher's subprocess env, its
+    output captured; the caller reads its exit."""
+    return subprocess.run(
         [str(binary), *args],
         input=stdin,
         capture_output=True,
@@ -42,6 +42,12 @@ def run_json(binary: Path, args: list[str], stdin: str | None = None) -> Any:
         env=_build_subprocess_env(),
         check=False,
     )
+
+
+def run_json(binary: Path, args: list[str], stdin: str | None = None) -> Any:
+    """``binary args`` (with ``stdin``) as the JSON it prints; raises with its
+    stderr when it fails."""
+    result = run(binary, args, stdin)
     if result.returncode:
         raise RuntimeError(f"{Path(binary).name} {args[0]}: {result.stderr.strip()}")
     return json.loads(result.stdout)

@@ -224,7 +224,7 @@ def check_capture(
       count}`` (``simulator dry-run``: the deployment's ``build_flow``, nothing
       simulated); raises with the simulator's message when it does not build;
     - how the capture's requests do not fit its pools (:func:`plan_run`):
-      ``{"reason", "requests", "total", "max_model_len"}``, the counts when the
+      ``{"reason", "pool", "max_model_len", "requests", "total"}``, the limit when the
       simulator gives them; None when they fit;
     - the pools' request bounds (:attr:`SimMember.bounds`): the build's, else
       the member's own.
@@ -838,15 +838,14 @@ class SimulationService:
         except KeyError:
             names = [capture.name for capture in member.captures]
             raise BadWorkload(f"{preset} has no capture {workload.capture!r}; it has {names}")
-        replayed = workload.source == "capture"
-        blocker = member.blocker(capture, replayed=replayed)
+        blocker = member.blocker(capture, replayed=workload.source == "capture")
         if blocker is not None and "misfit" in blocker:
             # The capture's own requests do not fit: refused as any trace
             # that does not fit is, with the limit.
-            too_long = {k: v for k, v in blocker["misfit"].items() if k != "reason"}
-            raise BadWorkload(blocker["misfit"]["reason"], too_long or None)
-        reason = member.runnable(capture, replayed=replayed)
-        if reason is not None:
+            too_long = dict(blocker["misfit"])
+            raise BadWorkload(too_long.pop("reason"), too_long or None)
+        if blocker is not None:
+            reason = SimMember.reason(blocker)
             raise NotRunnable(f"{preset} {member.params} on {capture.name}: {reason}")
         simulation_id, directory = self.queue.new_directory()
         try:

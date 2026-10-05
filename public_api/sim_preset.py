@@ -48,7 +48,14 @@ import yaml
 
 from launcher.corpus import ROUTING_FILES, resolve_reference
 from public_api import preset as public_preset
-from public_api.deployments import DeploymentIndex, Member, _axes, find_member
+from public_api.deployments import (
+    BadMember,
+    DeploymentIndex,
+    Member,
+    UnknownDeployment,
+    _axes,
+    find_member,
+)
 
 REPO_ROOT = public_preset.REPO_ROOT
 SIM_PRESET_ROOT = REPO_ROOT / "presets" / "public_sim"
@@ -280,8 +287,13 @@ class SimMember:
     def runnable(self, capture: Capture, *, replayed: bool = True) -> str | None:
         """:meth:`blocker` as one sentence; None when it can run ``capture``."""
         blocker = self.blocker(capture, replayed=replayed)
-        if blocker is None or "error" in blocker:
-            return blocker and blocker["error"]
+        return None if blocker is None else self.reason(blocker)
+
+    @staticmethod
+    def reason(blocker: dict) -> str:
+        """One :meth:`blocker` answer as one sentence."""
+        if "error" in blocker:
+            return blocker["error"]
         if "misfit" in blocker:
             return blocker["misfit"]["reason"]
         rows = ", ".join(f"{k} {n}" for k, n in sorted(blocker["missing"].items()))
@@ -304,7 +316,7 @@ class SimMember:
             try:
                 arch = {role: self.arch_member(index, role, capture) for role in self.pools}
                 break
-            except Exception:  # noqa: BLE001, S112 — BadMember, UnknownDeployment
+            except (BadMember, UnknownDeployment):
                 continue
         for role, pool in self.pools.items():
             member = arch.get(role)
@@ -430,7 +442,7 @@ class SimIndex:
             for role in member.pools:
                 try:
                     arch = member.arch_member(self.index, role, capture)
-                except Exception as error:  # noqa: BLE001 — BadMember, UnknownDeployment
+                except (BadMember, UnknownDeployment) as error:
                     member.failures[capture.name] = f"pool {role}: {error}"
                     break
                 if arch.error:

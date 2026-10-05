@@ -34,13 +34,12 @@ from pathlib import Path
 from alignment.load_generator.runner import TRACEGEN
 from launcher.exec import (
     ERROR_JSON,
-    _build_subprocess_env,
     binary_error,
     binary_path,
     binary_too_long,
 )
 from public_api.predict import Refused, _cause
-from public_api.sources import introspect
+from public_api.sources import introspect, run
 
 # The generators the service runs: `coding-session` materializes a corpus file
 # from this host, which a reader cannot name.
@@ -79,23 +78,13 @@ class TraceSource:
     name: str = "the trace"
 
 
-def _simulator(args: list[str], build_type: str) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        [str(binary_path(build_type)), *args],
-        capture_output=True,
-        text=True,
-        env=_build_subprocess_env(),
-        check=False,
-    )
-
-
 def _workload_plan(flags: list[str], document: dict, block: dict, build_type: str) -> list[dict]:
     with tempfile.TemporaryDirectory(prefix="public-workload-") as directory:
         scratch = Path(directory)
         path, error = scratch / "workload.json", scratch / ERROR_JSON
         path.write_text(json.dumps(document))
         args = ["workload-plan", *flags, str(path), "--error-json", str(error)]
-        result = _simulator(args, build_type)
+        result = run(binary_path(build_type), args)
         if result.returncode:
             traces = {Path(trace).parent for trace in block["trace_files"]}
             cause = _cause(binary_error(error), result.stderr, scratch, *traces)
