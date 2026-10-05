@@ -16,7 +16,6 @@ use crate::timing::sweep::{Axis, Coords, SweepGrid};
 use crate::timing::{Dim, KernelConfig, SweepCoords};
 
 const MAX_BATCHED_QUERY_ROWS: u32 = 16384;
-const MAX_REQUESTS: usize = 64;
 
 #[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct DsaSparseMlaPrefillKernelConfig {
@@ -49,7 +48,6 @@ pub struct DsaSparseMlaPrefillKernelInput {
 impl DsaSparseMlaPrefillKernelInput {
     fn work(&self) -> (u32, u32, f64) {
         assert!(!self.query_context_pairs.is_empty());
-        assert!(self.query_context_pairs.len() <= MAX_REQUESTS);
 
         let mut num_queries = 0_u32;
         let mut causal_context_sum = 0_f64;
@@ -87,7 +85,7 @@ impl SweepCoords for DsaSparseMlaPrefillKernelInput {
 }
 
 fn canonical_pairs(num_queries: u32, num_requests: u32, context: u32) -> Option<Vec<(u32, u32)>> {
-    if num_requests == 0 || num_requests > num_queries || num_requests as usize > MAX_REQUESTS {
+    if num_requests == 0 || num_requests > num_queries {
         return None;
     }
     let base = num_queries / num_requests;
@@ -114,6 +112,8 @@ impl KernelSpec for DsaSparseMlaPrefillSpec {
         assert!(config.softmax_scale_denominator > 0);
         SweepGrid::new(vec![
             Axis::values([1, 8, 24, 64, 128, 256, 512, 1024, 1536, 2048, 8192]),
+            // Batches beyond 64 requests (many short extends at high concurrency)
+            // extrapolate along this axis; they are not rejected.
             Axis::values([1, 2, 4, 8, 16, 64]),
             Axis::values([
                 1, 32, 128, 192, 256, 512, 1024, 2048, 4096, 8192, 65536, 1048576,
@@ -191,6 +191,14 @@ mod tests {
             index_distribution: "recent_contiguous".to_string(),
             cache_layout: "hnd_paged_mqa_fp8_latent_rope".to_string(),
         }
+    }
+
+    #[test]
+    fn a_batch_past_the_profiled_request_axis_still_has_coordinates() {
+        let input = DsaSparseMlaPrefillKernelInput {
+            query_context_pairs: vec![(1, 65_792); 512],
+        };
+        assert_eq!(input.coords()[..], [512.0, 512.0, 65_792.0]);
     }
 
     #[test]
