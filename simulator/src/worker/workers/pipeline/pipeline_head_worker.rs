@@ -589,6 +589,41 @@ mod tests {
     }
 
     #[test]
+    fn a_hybrid_head_decodes_and_frees_its_state_blocks_for_the_next_request() {
+        // 36 tokens of blocks; each request needs 12 + 3 tokens plus 8 of fixed
+        // state, so the second starts only once the first has decoded and left.
+        let store = shared_with(&[(0, 12, 3), (1, 12, 3)]);
+        let mut worker = hybrid_head(Rc::clone(&store), 16, 80, true);
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(1)));
+        let mut events = Vec::new();
+        let mut done = Vec::new();
+        let mut first_launch = None;
+        let mut now = 0.0;
+        while done.len() < 2 && now < 100.0 {
+            events.clear();
+            worker.tick(Time::from_ms(now), &mut events);
+            for (microbatch, prefill, _) in launched(&events) {
+                if prefill == 12 && first_launch.is_some() {
+                    assert_eq!(done, [RequestId(0)], "the second prompt waits for blocks");
+                }
+                first_launch.get_or_insert(microbatch);
+                worker.enqueue(PipelineHeadMsg::MicrobatchExit {
+                    microbatch,
+                    at: Time::from_ms(now + 1.0),
+                });
+            }
+            done.extend(completed(&events));
+            now += 1.0;
+        }
+        assert_eq!(done, [RequestId(0), RequestId(1)]);
+        for id in [RequestId(0), RequestId(1)] {
+            assert_eq!(store.borrow()[id].progress.output_tokens_emitted, 3);
+        }
+        assert_eq!(worker.status().active_requests, 0);
+    }
+
+    #[test]
     fn a_hybrid_head_without_block_alignment_chunks_plainly() {
         // Same prompt and budget: each chunk is min(remaining, budget).
         assert_eq!(hybrid_chunks(false), [6, 4]);
