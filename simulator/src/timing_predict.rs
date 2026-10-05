@@ -355,6 +355,7 @@ fn ensure_fits(what: &str, context: u32, max_model_len: u32) -> Result<()> {
     if context > max_model_len {
         return Err(TooLong {
             max_model_len,
+            pool: None,
             requests: None,
             total: None,
             message: format!("{what} {context} exceeds max_model_len {max_model_len}"),

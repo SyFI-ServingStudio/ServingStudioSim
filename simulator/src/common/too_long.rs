@@ -8,6 +8,9 @@
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct TooLong {
     pub max_model_len: u32,
+    /// The role of the pool whose `max_model_len` it is (`main`, `prefill`,
+    /// `decode`, `attn`); None for a timing-predict case, which has no pool.
+    pub pool: Option<&'static str>,
     /// How many of a trace's requests are too long; None for one case.
     pub requests: Option<usize>,
     /// How many requests the trace has; None for one case.

@@ -166,6 +166,7 @@ pub fn check_trace(cfg: &RunConfig, trace: &TraceFrontend) -> anyhow::Result<()>
             };
             return Err(TooLong {
                 max_model_len: pool.max_model_len,
+                pool: Some(role),
                 requests: Some(long),
                 total: Some(total),
                 message: format!(
@@ -332,8 +333,13 @@ mod tests {
         );
         let too_long = error.downcast_ref::<TooLong>().expect("a TooLong refusal");
         assert_eq!(
-            (too_long.max_model_len, too_long.requests, too_long.total),
-            (131072, Some(2), Some(4))
+            (
+                too_long.max_model_len,
+                too_long.pool,
+                too_long.requests,
+                too_long.total
+            ),
+            (131072, Some("main"), Some(2), Some(4))
         );
     }
 
