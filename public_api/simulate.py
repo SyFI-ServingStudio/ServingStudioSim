@@ -820,7 +820,14 @@ class SimulationService:
         except KeyError:
             names = [capture.name for capture in member.captures]
             raise BadWorkload(f"{preset} has no capture {workload.capture!r}; it has {names}")
-        reason = member.runnable(capture, replayed=workload.source == "capture")
+        replayed = workload.source == "capture"
+        blocker = member.blocker(capture, replayed=replayed)
+        if blocker is not None and "misfit" in blocker:
+            # The capture's own requests do not fit: refused as any trace
+            # that does not fit is, with the limit.
+            too_long = {k: v for k, v in blocker["misfit"].items() if k != "reason"}
+            raise BadWorkload(blocker["misfit"]["reason"], too_long or None)
+        reason = member.runnable(capture, replayed=replayed)
         if reason is not None:
             raise NotRunnable(f"{preset} {member.params} on {capture.name}: {reason}")
         simulation_id, directory = self.queue.new_directory()

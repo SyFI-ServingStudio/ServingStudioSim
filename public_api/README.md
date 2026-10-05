@@ -172,7 +172,8 @@ which may replay any capture's requests, lists each request list once by its
 requests alone, so a capture's acceptance column does not make a new list.
 
 Before it queues, the request is checked: the member exists (400 with
-`choices` otherwise) and builds and is measured on that capture (409); the
+`choices` otherwise) and builds and is measured on that capture (409), and a
+replayed capture's own requests fit (its `misfit`, refused as below); the
 source's fields are given (`generator` for `generated`, `upload` for `upload`,
 neither for `capture`); there are at most 2000 requests; a speculative worker
 gets acceptance from exactly one of `accept_rate` and an upload tagged

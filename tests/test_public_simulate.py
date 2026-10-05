@@ -453,6 +453,21 @@ def test_a_capture_too_long_for_a_member_is_that_captures_misfit(sims) -> None:
     assert not any(m.misfits for m in others)
 
 
+def test_replaying_a_misfit_capture_is_refused_with_the_limit(client, sims, tmp_path) -> None:
+    """Replaying a capture whose requests do not fit answers as any trace that
+    does not fit: 400 with the limit and the counts."""
+    spec = sims.preset(SPEC[0]).members[0]
+    name = spec.captures[0].name
+    too_long = {"requests": 3, "total": 4, "max_model_len": 8}
+    spec.misfits[name] = {"reason": "3 of 4 requests exceed", **too_long}
+
+    answer = _post(client, *SPEC, capture=name, accept_rate=0.5)
+
+    assert answer.status_code == 400, answer.json()
+    assert answer.json()["detail"] == {"message": "3 of 4 requests exceed", "too_long": too_long}
+    assert not any((tmp_path / "sims").iterdir())
+
+
 def test_rows_a_capture_lacks_block_it_before_its_misfit(sims) -> None:
     """The rows follow the capture's routing, so a capture that is both too
     long and unmeasured is reported as lacking rows, which blocks a run of
