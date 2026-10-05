@@ -401,6 +401,13 @@ pub enum IterWorkerSel {
         #[serde(default = "default_gpu_time_multiplier")]
         #[param(default = 1.0)]
         gpu_time_multiplier: f64,
+        /// Cap each microbatch at `ceil(resident decodes / pp_size)` decodes so
+        /// running requests split across the in-flight microbatches. Off is
+        /// vLLM: every ready decode joins the next microbatch, so requests that
+        /// become ready together stay in one microbatch.
+        #[serde(default)]
+        #[param(default = false)]
+        balance_decode_microbatches: bool,
     },
     /// PD prefill half: prefills then hands off to a decode pool (no local decode).
     PdPrefill {

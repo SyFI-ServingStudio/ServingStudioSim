@@ -319,17 +319,24 @@ mod tests {
         max_batch_tokens: u32,
         attn_kv_bytes: u64,
     ) -> PipelineHead<FakeModel> {
-        build_pipeline_head_worker(
-            WorkerId(0),
-            "stage",
-            Arc::new(FakeModel::for_ms(1.0)),
-            LAYOUT,
+        head_with(
             store,
             WorkerConfig {
                 max_batch_tokens: Some(max_batch_tokens),
                 attn_kv_bytes,
                 ..WorkerConfig::default()
             },
+        )
+    }
+
+    fn head_with(store: SharedRequests, config: WorkerConfig) -> PipelineHead<FakeModel> {
+        build_pipeline_head_worker(
+            WorkerId(0),
+            "stage",
+            Arc::new(FakeModel::for_ms(1.0)),
+            LAYOUT,
+            store,
+            config,
             None,
             PoolId(0),
             "test-gpu",
@@ -622,5 +629,64 @@ mod tests {
         for request in [RequestId(0), RequestId(1)] {
             assert_eq!(requests[request].progress.output_tokens_emitted, 3);
         }
+    }
+
+    /// Run four 1-token prompts with four outputs each through a depth-2 head
+    /// whose microbatches exit 2 ms after launch. Returns each decode
+    /// microbatch's request count and the completion order.
+    fn decode_microbatch_sizes(balance: bool) -> (Vec<usize>, Vec<RequestId>) {
+        let store = shared_with(&[(0, 1, 4), (1, 1, 4), (2, 1, 4), (3, 1, 4)]);
+        let mut worker = head_with(
+            Rc::clone(&store),
+            WorkerConfig {
+                max_batch_tokens: Some(8),
+                attn_kv_bytes: 1_000,
+                balance_decode_microbatches: balance,
+                ..WorkerConfig::default()
+            },
+        );
+        for id in 0..4 {
+            worker.enqueue(PipelineHeadMsg::Request(RequestId(id)));
+        }
+        let (mut sizes, mut done, mut exits) = (Vec::new(), Vec::new(), Vec::new());
+        let mut events = Vec::new();
+        for step in 0..200 {
+            let now = Time::from_ms(f64::from(step) * 0.5);
+            exits.retain(|&(microbatch, at): &(u64, Time)| {
+                if at > now {
+                    return true;
+                }
+                worker.enqueue(PipelineHeadMsg::MicrobatchExit { microbatch, at });
+                false
+            });
+            events.clear();
+            worker.tick(now, &mut events);
+            for event in &events {
+                if let PipelineHeadEvent::MicrobatchLaunched { microbatch, .. } = event {
+                    exits.push((microbatch.id, microbatch.ready_at + Time::from_ms(2.0)));
+                    let rows = microbatch.input.groups[0].decode_kv_lens.len();
+                    if rows > 0 {
+                        sizes.push(rows);
+                    }
+                }
+            }
+            done.extend(completed(&events));
+        }
+        (sizes, done)
+    }
+
+    #[test]
+    fn balanced_decodes_split_running_requests_across_the_depth() {
+        // Greedy (vLLM): the four requests become ready at the same exit and
+        // ride one microbatch for every step.
+        let (greedy, greedy_done) = decode_microbatch_sizes(false);
+        assert!(greedy.iter().all(|&rows| rows == 4), "{greedy:?}");
+        // Balanced: ceil(4 / 2) = 2 per microbatch, so both in-flight slots
+        // carry half the running requests and stay split until completion.
+        let (balanced, balanced_done) = decode_microbatch_sizes(true);
+        assert!(balanced.iter().all(|&rows| rows == 2), "{balanced:?}");
+        assert_eq!(balanced.iter().sum::<usize>(), greedy.iter().sum::<usize>());
+        assert_eq!(greedy_done.len(), 4);
+        assert_eq!(balanced_done.len(), 4);
     }
 }

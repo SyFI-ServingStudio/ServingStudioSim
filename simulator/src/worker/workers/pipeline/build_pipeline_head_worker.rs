@@ -73,11 +73,14 @@ pub(crate) fn build_pipeline_head_worker<M: IterwiseUnifiedModel>(
         essentials.sampler,
         prefix_cache_logger,
     );
-    let admission = PipelinedChunkedPrefillAdmission::new(
+    let mut admission = PipelinedChunkedPrefillAdmission::new(
         PendingOrder::new(config.pending_order),
         (),
         max_batch_tokens,
     );
+    if config.balance_decode_microbatches {
+        admission = admission.with_balanced_decodes(layout.depth);
+    }
 
     PipelineHeadWorker::from_components(
         essentials.context,

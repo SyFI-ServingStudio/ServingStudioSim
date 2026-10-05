@@ -11,8 +11,13 @@
 //! output returns (`num_new_tokens == 0`), or with async scheduling holds it
 //! `pp_size` steps (`next_decode_eligible_step`). A microbatch therefore takes
 //! the ready decodes, one query row each, then started prompts, then fresh
-//! prompts, under one token budget. Scheduling is greedy: nothing balances
-//! decodes across the in-flight microbatches.
+//! prompts, under one token budget. By default scheduling is greedy, as in
+//! vLLM: nothing balances decodes across the in-flight microbatches, so
+//! requests that become ready together stay in one microbatch and the other
+//! stages idle. `with_balanced_decodes(depth)` caps each microbatch at
+//! `ceil(resident decodes / depth)` decodes instead, so the running requests
+//! split across the `depth` microbatches the pipeline holds and each returns
+//! to the next round on its own.
 //!
 //! The pending policy owns fresh requests. A prompt that has started and still
 //! has unscheduled prefill tokens stays in `started_prefills`, in start order,
@@ -50,6 +55,9 @@ pub struct PipelinedChunkedPrefillAdmission<P: PendingOrderPolicy> {
     in_flight_decodes: HashSet<RequestId>,
     /// The decodes the microbatch being formed carries, until it is committed.
     scheduled_decodes: Vec<RequestId>,
+    /// Pipeline depth when decodes are balanced across microbatches; `None`
+    /// schedules every ready decode (vLLM).
+    balanced_depth: Option<u16>,
 }
 
 /// One request's chunk in one microbatch, snapshotted when it was committed.
@@ -92,7 +100,15 @@ impl<P: PendingOrderPolicy> PipelinedChunkedPrefillAdmission<P> {
             started_prefills: Vec::new(),
             in_flight_decodes: HashSet::new(),
             scheduled_decodes: Vec::new(),
+            balanced_depth: None,
         }
+    }
+
+    /// Cap each microbatch's decodes at `ceil(resident decodes / depth)`.
+    pub(crate) fn with_balanced_decodes(mut self, depth: u16) -> Self {
+        assert!(depth > 0, "pipeline depth must be positive");
+        self.balanced_depth = Some(depth);
+        self
     }
 
     /// Admit fresh prompts into the budget left after started prompts.
@@ -206,11 +222,22 @@ where
         let mut remaining_budget = max_batch_tokens;
         // Running decodes first, as vLLM schedules its running queue before
         // waiting prompts. One whose previous step has not returned sits out.
+        let decode_cap = match self.balanced_depth {
+            None => usize::MAX,
+            Some(depth) => {
+                let mut resident_decodes = 0_usize;
+                kv_store.visit_decode_members(PARTITION, |_, _| resident_decodes += 1);
+                resident_decodes.div_ceil(usize::from(depth))
+            }
+        };
         let (in_flight_decodes, scheduled_decodes) =
             (&self.in_flight_decodes, &mut self.scheduled_decodes);
         scheduled_decodes.clear();
         kv_store.visit_decode_members(PARTITION, |request, _| {
-            if remaining_budget > 0 && !in_flight_decodes.contains(&request) {
+            if remaining_budget > 0
+                && scheduled_decodes.len() < decode_cap
+                && !in_flight_decodes.contains(&request)
+            {
                 scheduled_decodes.push(request);
                 remaining_budget -= 1;
             }
