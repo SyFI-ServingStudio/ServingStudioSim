@@ -9,7 +9,6 @@ from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerN
 from profiling.runners.metrics import ComputeMetrics
 
 _BACKEND = "inv_rope_fp8_quant:vllm_triton"
-# The Triton kernel stores tl.float8e4nv, which Triton lowers only on SM89+.
 _NUM_GROUPS = 8
 _HEADS_PER_GROUP = 8
 _HEAD_DIM = 512

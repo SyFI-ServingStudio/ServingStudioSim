@@ -67,7 +67,7 @@ register(
         args_schema=InvRopeFp8QuantArgs,
         metric_family=MetricFamily.COMPUTE,
         batch_outlier_policy=BatchOutlierPolicy(),
-        # FP8 e4m3 conversion needs SM89+.
+        # The Triton kernel stores tl.float8e4nv, which Triton lowers only on SM89+.
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
             min_compute_capability=(8, 9),

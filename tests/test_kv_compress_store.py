@@ -1,5 +1,9 @@
+import re
+from pathlib import Path
+
 import pytest
 
+from profiling.kernels import kv_compress_store
 from profiling.runners.attention.kv_compress_store_cutedsl import (
     _logical_work,
     _padded_stride,
@@ -128,3 +132,11 @@ def test_indexer_block_size_and_eps_are_runtime_values():
         "fp32_per_token",
     )
     assert (shape.kv_block_size, shape.rms_eps) == (32, 1.0e-5)
+
+
+def test_cache_row_bytes_match_the_simulators() -> None:
+    rust = Path(__file__).resolve().parents[1] / "simulator/src/timing/kernels/kv_compress_store.rs"
+    text = rust.read_text()
+    for name in ("FP8_DS_MLA_ROW_BYTES", "FP8_INDEXER_ROW_BYTES"):
+        (value,) = re.findall(rf"const {name}: u32 = (\d+);", text)
+        assert getattr(kv_compress_store, name) == int(value), name

@@ -36,7 +36,6 @@ from profiling.runners.metrics import ComputeMetrics
 
 _BACKEND = "vllm_fused_moe:vllm_triton"
 _FUSED_MOE_MODULE = "vllm.model_executor.layers.fused_moe.fused_moe"
-# Triton lowers float8_e4m3fn (fp8e4nv) dots only on SM89 and newer.
 
 
 @dataclass(frozen=True)

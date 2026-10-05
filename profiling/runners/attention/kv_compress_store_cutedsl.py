@@ -13,8 +13,6 @@ from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerN
 from profiling.runners.metrics import ComputeMetrics
 
 _BACKEND = "kv_compress_store:vllm_cutedsl"
-# The kernel packs e4m3 with cvt.rn.satfinite.e4m3x2.f32 (PTX that exists only
-# on SM89+).
 # The fp8_ds_mla cache row below (448 fp8 NoPE + 64 bf16 RoPE + 8 UE8M0 scales)
 # fixes one 512-wide KV head with a 64-wide RoPE tail.
 _CACHE_IDENTITY = (1, 512, 64)

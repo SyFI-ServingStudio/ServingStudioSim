@@ -4,6 +4,7 @@ import math
 from types import SimpleNamespace
 from typing import Any
 
+from profiling.kernels.kv_compress_store import FP8_INDEXER_ROW_BYTES
 from profiling.profilers.energy import Energy
 from profiling.profilers.timer import Timer
 from profiling.runners.attention.kv_compress_store_cutedsl import (
@@ -95,7 +96,7 @@ def _validate_args(
         logical_block_size // 4,
         head_dim=128,
         rope_head_dim=64,
-        cache_row_bytes=132,
+        cache_row_bytes=FP8_INDEXER_ROW_BYTES,
         token_stride=128,
         scale_dim=4,
         quant_block=128,
@@ -157,7 +158,9 @@ def _check_output(torch: Any, save_op: Any, compress_op: Any, operands: Any, sha
             rtol=0,
             atol=0,
         )
-    poison = torch.full((132,), _POISON, dtype=torch.uint8, device=operands.kv_cache.device)
+    poison = torch.full(
+        (FP8_INDEXER_ROW_BYTES,), _POISON, dtype=torch.uint8, device=operands.kv_cache.device
+    )
     for slot, row in enumerate(operands.active_rows):
         packed = _cache_row(torch, operands, shape, slot)
         if slot < 3:

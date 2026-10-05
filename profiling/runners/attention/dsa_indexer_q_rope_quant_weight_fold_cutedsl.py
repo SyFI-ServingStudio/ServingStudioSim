@@ -11,8 +11,6 @@ from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerN
 from profiling.runners.metrics import ComputeMetrics
 
 _BACKEND = "dsa_indexer_q_rope_quant_weight_fold:vllm_cutedsl_fp8"
-# The kernel packs e4m3 with cvt.rn.satfinite.e4m3x2.f32 (vllm/cute_utils/cvt.py),
-# a PTX instruction that exists only on SM89+.
 _HEAD_DIM = 128
 _ROPE_DIM = 64
 # fp8_max and the amax floor are literals in IndexerQFp8Kernel.kernel.
