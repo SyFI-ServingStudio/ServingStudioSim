@@ -5,13 +5,11 @@ from typing import Any
 
 from profiling.profilers.energy import Energy
 from profiling.profilers.timer import Timer
+from profiling.runners.attention.dsa_persistent_topk_decode import VLLM_TOP_K, WORKSPACE_BYTES
 from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
 
 _BACKEND = "dsa_persistent_topk_decode:vllm_fork_cuda"
-# The callable's K instantiations (vLLM csrc/libtorch_stable/topk.cu dispatch).
-_TOP_K = frozenset({512, 1024, 2048})
-_WORKSPACE_BYTES = 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -51,8 +49,10 @@ def _validate_args(
         raise ValueError("context_len must be a nonnegative int")
     if type(next_n) is not int or next_n < 1:
         raise ValueError("next_n must be a positive int")
-    if top_k not in _TOP_K:
-        raise ProfilerNotImplemented(f"{_BACKEND} requires top_k in {sorted(_TOP_K)}, got {top_k}")
+    if top_k not in VLLM_TOP_K:
+        raise ProfilerNotImplemented(
+            f"{_BACKEND} requires top_k in {sorted(VLLM_TOP_K)}, got {top_k}"
+        )
     if (
         type(max_model_len) is not int
         or max_model_len < 1
@@ -98,7 +98,7 @@ def _build_operands(
         logits=logits,
         lengths=torch.tensor(lengths, dtype=torch.int32, device=device),
         indices=torch.empty((num_rows, top_k), dtype=torch.int32, device=device),
-        workspace=torch.empty(_WORKSPACE_BYTES, dtype=torch.uint8, device=device),
+        workspace=torch.empty(WORKSPACE_BYTES, dtype=torch.uint8, device=device),
         top_k=top_k,
     )
 

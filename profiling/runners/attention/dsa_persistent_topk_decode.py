@@ -27,13 +27,14 @@ _LOGITS_DTYPE = DType.FP32
 _INDEX_DTYPE = "int32"
 _CONTEXT_MODE = "uniform"
 # The callable's K instantiations (vLLM csrc/libtorch_stable/topk.cu dispatch);
-# GLM-5.3-Flash's kpool indexer selects 2048 / 4. The Torch composite is checked
-# against the same reference, so both backends share the bound.
-_VLLM_TOP_K = frozenset({512, 1024, 2048})
+# GLM-5.3-Flash's kpool indexer selects 2048 / 4. Every backend, the fork's and
+# the Torch reference's included, shares this bound and the workspace below.
+VLLM_TOP_K = frozenset({512, 1024, 2048})
 # The corrected extension builds SASS for sm_90 only
 # (dsa_persistent_topk_native/loader.py `_CUDA_CFLAGS`).
 _NATIVE_EXTENSION_CAPABILITY = (9, 0)
-_WORKSPACE_BYTES = 1024 * 1024
+# vLLM's RADIX_TOPK_WORKSPACE_SIZE (model_executor/layers/sparse_attn_indexer.py).
+WORKSPACE_BYTES = 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -68,7 +69,6 @@ def _validate_args(
     logits_dtype: DType | str,
     index_dtype: str,
     context_mode: str,
-    allowed_top_k: frozenset[int] = _VLLM_TOP_K,
 ) -> tuple[int, int, int, int, int, int, DType, str, str]:
     batch_size = int(batch_size)
     context_len = int(context_len)
@@ -104,8 +104,8 @@ def _validate_args(
         raise ValueError(
             f"context_len must be <= max_model_len, got {context_len} and {max_model_len}"
         )
-    if top_k not in allowed_top_k:
-        required = " or ".join(f"top_k={value}" for value in sorted(allowed_top_k))
+    if top_k not in VLLM_TOP_K:
+        required = " or ".join(f"top_k={value}" for value in sorted(VLLM_TOP_K))
         raise ValueError(f"dsa_persistent_topk_decode requires {required}, got {top_k}")
     if logits_row_stride <= 0 or logits_row_stride < max_model_len:
         raise ValueError(
@@ -258,7 +258,7 @@ def _build_native_operands(
         logits_row_stride=logits_row_stride,
         device=device,
     )
-    workspace = torch.empty((_WORKSPACE_BYTES,), dtype=torch.uint8, device=device)
+    workspace = torch.empty((WORKSPACE_BYTES,), dtype=torch.uint8, device=device)
     return _DsaPersistentTopkDecodeNativeOperands(
         logits_backing=logits_backing,
         logits=logits,
@@ -686,7 +686,6 @@ def profile_dsa_persistent_topk_decode_vllm_cuda(
         logits_dtype,
         index_dtype,
         context_mode,
-        allowed_top_k=_VLLM_TOP_K,
     )
     try:
         import torch

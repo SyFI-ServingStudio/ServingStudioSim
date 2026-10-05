@@ -624,7 +624,7 @@ def test_operand_layout_for_ordinary_and_fully_padded_rows() -> None:
 
 def test_native_operand_layout_has_exact_workspace_without_composite_intermediates() -> None:
     from profiling.runners.attention.dsa_persistent_topk_decode import (
-        _WORKSPACE_BYTES,
+        WORKSPACE_BYTES,
         _build_native_operands,
     )
 
@@ -645,7 +645,7 @@ def test_native_operand_layout_has_exact_workspace_without_composite_intermediat
     assert operands.lengths.tolist() == [[4, 5], [4, 5], [4, 5]]
     assert operands.flat_lengths.tolist() == [4, 5, 4, 5, 4, 5]
     assert operands.out.shape == (6, 4)
-    assert operands.workspace.shape == (_WORKSPACE_BYTES,)
+    assert operands.workspace.shape == (WORKSPACE_BYTES,)
     assert operands.workspace.dtype is torch.uint8
     assert operands.workspace.is_contiguous()
     assert not hasattr(operands, "valid_mask")
@@ -761,7 +761,6 @@ def test_both_backends_accept_every_kernel_top_k() -> None:
     # GLM-5.3-Flash kpool: 2048 pools of an 8192-token request, token-wide rows.
     kpool = _BASE_SPEC | {"context_len": 2048, "max_model_len": 8192, "top_k": 512}
     kpool["logits_row_stride"] = 8192
-    assert runner._validate_args(**kpool, allowed_top_k=runner._VLLM_TOP_K)[4] == 512
     assert runner._validate_args(**kpool)[4] == 512
     assert runner._validate_args(**(kpool | {"top_k": 1024}))[4] == 1024
     with pytest.raises(ValueError, match="top_k=512 or top_k=1024 or top_k=2048, got 256"):
