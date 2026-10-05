@@ -205,9 +205,6 @@ class KernelProfilerSpec:
     def runner_module(self) -> str:
         return self.subprocess_module or self.runner_ref.module_name
 
-    def load_runner(self) -> ProfileFn:
-        return self.runner_ref.load(self.runner_module)
-
     def load_list_runner(self) -> ListRunnerFn:
         """Load the runner as a list runner: native if ``list_native``, else the
         single-spec runner wrapped by ``batched``. This is what the worker calls
@@ -418,10 +415,6 @@ def find_kernel_profiler_spec(
         if profiler_spec.backend == backend:
             return profiler_spec
     raise KeyError(f"no profiler spec registered for {kernel_kind}:{backend}")
-
-
-def load_runner(kernel_kind: KernelKind, backend: str) -> ProfileFn:
-    return find_kernel_profiler_spec(kernel_kind, backend).load_runner()
 
 
 def find_table(kernel_kind: KernelKind, backend: str) -> str:
