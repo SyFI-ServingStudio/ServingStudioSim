@@ -4,8 +4,8 @@ A request names a member of a sim preset (:mod:`public_api.sim_preset`) and a
 workload. The workload's requests come from one of three sources: a
 capture the member offers (its arch preset's ``workload`` row, whose
 ``trace.csv`` the run replays), a trace req-frontend's ``tracegen`` draws, or a
-CSV the reader uploaded (:mod:`public_api.workloads`). The arrival and
-concurrency knobs below apply to all three. An MoE member's routing is always
+CSV the reader uploaded (:mod:`public_api.workloads`). Its ``load`` (a request
+rate or a concurrency, :class:`Load`) applies to all three. An MoE member's routing is always
 one of its captures, the ``capture`` the request names or its first: a
 generated or uploaded workload is labelled "requests from your workload,
 routing from capture X", and nothing defaults to a synthetic routing.
@@ -17,8 +17,8 @@ column), and the simulator loads the trace as the run will and refuses what a
 pool cannot serve (``simulator workload-plan --config``: a request past a pool's
 ``max_model_len``, an acceptance vector of another width than the worker
 drafts). Then it writes the run's directory under the service's
-simulations directory: the trace it replays (the source's first
-``num_requests`` rows, with the acceptance column a speculative worker reads)
+simulations directory: the trace it replays (the source's rows, with the
+acceptance column a speculative worker reads)
 and the concrete run config. A queued run is the launcher's standard single run
 (``launcher.sweep.run_single``, analyzed, without plots) in a child process
 (:mod:`public_api.simulate_run`), at most ``max_running`` at once. The Analyzer
@@ -31,6 +31,7 @@ from __future__ import annotations
 import csv
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -44,7 +45,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from launcher.corpus import resolve_hf_references, resolve_reference
 from launcher.exec import ERROR_JSON, _build_subprocess_env, binary_error, binary_path
@@ -61,7 +62,17 @@ from launcher.schema.loader import Registry
 from public_api.deployments import DeploymentIndex
 from public_api.predict import _cause, missing_by_role
 from public_api.sim_preset import Capture, SimMember
-from public_api.workloads import BadWorkload, TraceSource, Workloads, describe, plan_run
+from public_api.workloads import (
+    BadWorkload,
+    TraceSource,
+    Workloads,
+    describe,
+    plan,
+    plan_run,
+    read_block,
+    trace_facts,
+    trace_source,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -81,8 +92,6 @@ RUN_PRESET = "simulation.preset.json"
 # A generated workload's trace, as tracegen writes it (with its manifest and
 # plan beside it); the run replays `workload.csv`, cut from it.
 _GENERATED = "generated.csv"
-# The format of a capture's `trace.csv`.
-CAPTURE_FORMAT = "text-generation-independent"
 
 
 class NotRunnable(RuntimeError):
@@ -97,10 +106,31 @@ class UnknownSimulation(LookupError):
     """No simulation has this id (or it was removed)."""
 
 
+class Load(BaseModel):
+    """How hard a simulation drives its requests: ``rate``, the requests (a
+    session trace's sessions) per second they arrive at, the trace's own spacing
+    scaled to that mean; or ``concurrency``, every request ready at once and at
+    most this many in flight. A workload with no load replays the trace's own
+    arrival times."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    rate: float | None = Field(default=None, gt=0)
+    concurrency: int | None = Field(default=None, ge=1)
+
+    @model_validator(mode="after")
+    def _one(self) -> Load:
+        if (self.rate is None) == (self.concurrency is None):
+            raise ValueError("give exactly one of rate and concurrency")
+        return self
+
+
 class Workload(BaseModel):
     """What a simulation replays. ``source`` says where its requests come from:
     a capture the member offers, a trace ``generator`` draws, or an ``upload``
-    (``GET /workloads`` describes both)."""
+    (``GET /workloads`` describes both). Every request of the source runs."""
+
+    model_config = ConfigDict(extra="forbid")
 
     source: Literal["capture", "generated", "upload"] = "capture"
     # A capture the member offers (`/simulations/presets`); its first by default.
@@ -111,13 +141,7 @@ class Workload(BaseModel):
     generator: dict[str, Any] | None = None
     # `upload`: the `workload_id` POST /workloads answered.
     upload: str | None = None
-    # The source's first `num_requests` rows; all of them by default.
-    num_requests: int | None = Field(default=None, ge=1)
-    # `trace_timed` replays each request at arrival_time / request_rate;
-    # `saturated` releases every request at once.
-    arrival_mode: Literal["trace_timed", "saturated"] = "trace_timed"
-    request_rate: float = Field(default=1.0, gt=0)
-    max_concurrency: int | None = Field(default=None, ge=1)
+    load: Load | None = None
     # Simulated time to run (ms); with run_to_end, the least it runs.
     duration_ms: float | None = Field(default=None, gt=0)
     run_to_end: bool = True
@@ -193,10 +217,16 @@ def missing_rows(
     dry-run``: the deployment's ``build_flow``, nothing simulated) and return
     the profile.db rows its kernels lack, ``{kernel role: count}``. Raises with
     the simulator's message when it does not build."""
+    # The capture's trace as its header reads (a speculative capture's records
+    # its acceptance); a speculative worker reads one either way.
+    source = trace_source(Path(resolve_reference(capture.trace)), capture.name, build_type)
+    tags = list(source.input_file_tags)
+    if _speculative_draft(member) and "speculative" not in tags:
+        tags.append("speculative")
     workload = {
         "trace_files": [capture.trace],
-        "input_file_format": "text-generation-independent",
-        "input_file_tags": ["speculative"] if _speculative_draft(member) else [],
+        "input_file_format": source.input_file_format,
+        "input_file_tags": tags,
         "arrival_mode": "trace_timed",
         "run_to_end": True,
         "request_rate": 1.0,
@@ -216,6 +246,46 @@ def missing_rows(
         if result.returncode:
             raise RuntimeError(_cause(binary_error(error), result.stderr, scratch))
         return missing_by_role(json.loads(report.read_text()))
+
+
+# The simulator's refusal of requests longer than a pool's context
+# (`deployment::check_trace`).
+_TOO_LONG = re.compile(r"(\d+) of (\d+) requests exceed pool \S+ max_model_len (\d+)")
+
+
+def misfit(
+    index: DeploymentIndex,
+    member: SimMember,
+    capture: Capture,
+    registry: Registry,
+    build_type: str = "release",
+) -> dict | None:
+    """How ``capture``'s requests do not fit ``member``'s pools, replayed as a
+    run replays them (:func:`write_trace`, then the simulator's own check,
+    :func:`plan_run`): ``{"reason", "requests", "total", "max_model_len"}``,
+    the counts when the simulator names them; None when they fit. A drafting
+    member stands in an acceptance the capture lacks: the reader gives one, and
+    its value does not change whether a request fits."""
+    source = trace_source(Path(resolve_reference(capture.trace)), capture.name, build_type)
+    stand_in = None
+    if _speculative_draft(member) and "speculative" not in source.input_file_tags:
+        stand_in = 1.0
+    workload = Workload(source="capture", capture=capture.name, accept_rate=stand_in)
+    with tempfile.TemporaryDirectory(prefix="public-sim-fit-") as directory:
+        scratch = Path(directory)
+        path = scratch / _TRACE
+        tags, _ = write_trace(member, source, workload, path)
+        trace = TraceSource(path, source.input_file_format, tuple(tags), source.name)
+        config = concrete(run_tree(index, member, capture, read_block(trace), scratch), registry)
+        try:
+            plan_run(config, build_type)
+        except BadWorkload as refusal:
+            reason = str(refusal)
+            long = _TOO_LONG.search(reason)
+            names = ("requests", "total", "max_model_len")
+            counts = dict(zip(names, map(int, long.groups()))) if long else {}
+            return {"reason": reason, **counts}
+    return None
 
 
 # -- workloads -----------------------------------------------------------------
@@ -249,31 +319,66 @@ def _accept_rate(member: SimMember, workload: Workload, source: TraceSource) -> 
     return json.dumps(rate) if isinstance(rate, list) else repr(float(rate))
 
 
+def _fit_draft_window(member: SimMember, rows: list[dict]) -> int:
+    """Shorten, in place, each request a speculative worker could not finish
+    only because its last verify reads ``draft_tokens`` past the request: the
+    simulator verifies a fixed width, where vLLM drafts fewer tokens near
+    ``max_model_len`` and serves it. Such a request loses at most
+    ``draft_tokens`` tokens, from its output while it keeps one, then its
+    input. A request longer than ``max_model_len`` itself is left for the
+    simulator to refuse. Returns how many requests were shortened."""
+    draft = _speculative_draft(member)
+    bounds = [
+        pool["arch_params"]["max_model_len"]
+        for pool in member.pools.values()
+        if pool["worker"]["type"] == "speculative" and "max_model_len" in pool["arch_params"]
+    ]
+    if draft is None or not bounds:
+        return 0
+    bound = int(min(bounds))
+    shortened = 0
+    for row in rows:
+        lengths = {k: int(row[k]) for k in ("prefix_len", "input_len", "output_len") if k in row}
+        over = sum(lengths.values()) + draft - bound
+        if not 0 < over <= draft:
+            continue
+        cut = min(over, lengths["output_len"] - 1)
+        row["output_len"] = str(lengths["output_len"] - cut)
+        row["input_len"] = str(lengths["input_len"] - (over - cut))
+        shortened += 1
+    return shortened
+
+
 def write_trace(
     member: SimMember,
     source: TraceSource,
     workload: Workload,
     out: Path,
-) -> tuple[int, list[str]]:
-    """Write the trace this run replays to ``out``: the source's first
-    ``num_requests`` rows, every column kept, with an ``accept_rate`` column for
-    a speculative worker. Returns the row count and the trace's tags; raises
-    :class:`BadWorkload` on a trace the member cannot serve."""
+) -> tuple[list[str], int]:
+    """Write the trace this run replays to ``out``: the source's rows, every
+    column kept, with an ``accept_rate`` column for a speculative worker. A
+    worker that drafts nothing runs a speculative trace (a speculative
+    capture's, which records its acceptance) without that column and tag: the
+    acceptance belongs to the capture's proposer, not to the requests.
+    A request that misses a speculative worker's draft window by a few tokens
+    is shortened to fit (:func:`_fit_draft_window`). Returns the trace's tags
+    and how many requests were shortened; raises :class:`BadWorkload` on a
+    trace the member cannot serve."""
     with open(source.path, newline="") as stream:
         reader = csv.DictReader(stream)
         fields = list(reader.fieldnames or [])
         rows = list(reader)
-    count = len(rows) if workload.num_requests is None else workload.num_requests
-    if count > len(rows):
-        raise BadWorkload(f"{source.name} has {len(rows)} requests, not {count}")
-    if count > MAX_REQUESTS:
+    if len(rows) > MAX_REQUESTS:
         raise BadWorkload(
-            f"{source.name} has {count} requests; at most {MAX_REQUESTS} per simulation "
-            "(set num_requests)"
+            f"{source.name} has {len(rows)} requests; at most {MAX_REQUESTS} per simulation"
         )
-    rows = rows[:count]
     accept = _accept_rate(member, workload, source)
     tags = list(source.input_file_tags)
+    if _speculative_draft(member) is None and "speculative" in tags:
+        tags.remove("speculative")
+        fields.remove("accept_rate")
+        rows = [{k: v for k, v in row.items() if k != "accept_rate"} for row in rows]
+    shortened = _fit_draft_window(member, rows)
     if accept:
         fields.append("accept_rate")
         tags.append("speculative")
@@ -282,23 +387,27 @@ def write_trace(
         writer.writeheader()
         for row in rows:
             writer.writerow(row | ({"accept_rate": accept} if accept else {}))
-    return count, tags
+    return tags, shortened
 
 
-def workload_block(
-    workload: Workload, trace: Path, input_file_format: str, input_file_tags: list[str]
-) -> dict:
-    """The run config's ``workload`` for this request."""
-    block: dict[str, Any] = {
-        "trace_files": [str(trace)],
-        "input_file_format": input_file_format,
-        "input_file_tags": input_file_tags,
-        "arrival_mode": workload.arrival_mode,
-        "request_rate": workload.request_rate,
-        "run_to_end": workload.run_to_end,
-    }
-    if workload.max_concurrency is not None:
-        block["max_concurrency"] = workload.max_concurrency
+def workload_block(workload: Workload, trace: TraceSource, facts: dict) -> dict:
+    """The run config's ``workload`` for this request. ``workload.load`` in the
+    simulator's terms: a rate is the trace-timed replay's speed-up, the asked
+    rate over the trace's own (``facts``, :func:`trace_facts`); a concurrency
+    is a saturated replay capped at it."""
+    load = workload.load
+    block: dict[str, Any] = read_block(trace) | {"run_to_end": workload.run_to_end}
+    del block["duration_ms"]
+    if load is not None and load.concurrency is not None:
+        block["arrival_mode"] = "saturated"
+        block["max_concurrency"] = load.concurrency
+    elif load is not None:
+        if facts["rate"] is None:
+            raise BadWorkload(
+                f"{trace.name} has no rate of its own to scale: its requests all arrive "
+                "at once; give load.concurrency"
+            )
+        block["request_rate"] = load.rate / facts["rate"]
     if workload.duration_ms is not None:
         block["duration_ms"] = workload.duration_ms
     elif not workload.run_to_end:
@@ -675,13 +784,31 @@ class SimulationService:
     registry: Registry
     queue: Simulations
     workloads: Workloads
+    # Each capture trace's `trace_facts`, by its reference: read once.
+    _facts: dict[str, dict] = field(default_factory=dict)
+
+    def capture_facts(self, reference: str) -> dict:
+        """What a capture's trace holds (:func:`trace_facts`), as the simulator
+        reads it."""
+        if reference not in self._facts:
+            source = self._capture_source(reference, reference)
+            facts = trace_facts(plan(read_block(source), self.queue.build_type))
+            self._facts[reference] = facts | {"input_file_tags": list(source.input_file_tags)}
+        return self._facts[reference]
+
+    def _capture_source(self, reference: str, name: str) -> TraceSource:
+        return trace_source(Path(resolve_reference(reference)), name, self.queue.build_type)
 
     def presets(self) -> dict:
+        catalog = self.sims.catalog()
+        for preset in catalog:
+            for capture in preset["captures"]:
+                capture["facts"] = self.capture_facts(capture["trace"])
         return {
             "sim_commit": self.sims.index.sim_commit,
             "limits": self.queue.limits(),
             "workload": Workload.model_json_schema(),
-            "presets": self.sims.catalog(),
+            "presets": catalog,
         }
 
     def describe_workloads(self) -> dict:
@@ -700,11 +827,7 @@ class SimulationService:
             return self.workloads.generate(workload.generator, directory / _GENERATED)
         if workload.source == "upload":
             return self.workloads.uploaded(workload.upload)
-        return TraceSource(
-            path=Path(resolve_reference(capture.trace)),
-            input_file_format=CAPTURE_FORMAT,
-            name=f"capture {capture.name}",
-        )
+        return self._capture_source(capture.trace, f"capture {capture.name}")
 
     def start(self, preset: str, params: dict, workload: Workload) -> dict:
         """Check the request, write its run directory and queue it."""
@@ -721,9 +844,11 @@ class SimulationService:
         simulation_id, directory = self.queue.new_directory()
         try:
             source = self._source(workload, capture, directory)
-            trace = directory / _TRACE
-            count, tags = write_trace(member, source, workload, trace)
-            block = workload_block(workload, trace, source.input_file_format, tags)
+            path = directory / _TRACE
+            tags, shortened = write_trace(member, source, workload, path)
+            trace = TraceSource(path, source.input_file_format, tuple(tags), source.name)
+            facts = trace_facts(plan(read_block(trace), self.queue.build_type))
+            block = workload_block(workload, trace, facts)
             tree = run_tree(index, member, capture, block, directory)
             config = concrete(tree, self.registry)
             plan_run(config, self.queue.build_type)
@@ -735,7 +860,8 @@ class SimulationService:
             request = {
                 "preset": preset,
                 "params": member.params,
-                "workload": workload.model_dump() | {"capture": used, "num_requests": count},
+                "workload": workload.model_dump()
+                | {"capture": used, "trace": facts, "shortened": shortened},
                 "routing": routed,
                 "gpus": member.summary(index)["gpus"],
             }

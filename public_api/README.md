@@ -136,16 +136,37 @@ POST /api/public/v1/simulate
     "capture": null,              // capture source: its trace; MoE: its routing. The preset's first by default
     "generator": {"type": "synthetic", "sessions": 100, "rounds": "1", "input_len": "lognormal:1024,0.8"},
     "upload": null,               // upload source: a workload_id from POST /workloads
-    "num_requests": null,         // the trace's first N rows; all by default
-    "arrival_mode": "trace_timed",// or "saturated"
-    "request_rate": 1.0,          // arrival_time / request_rate
-    "max_concurrency": null,
+    "load": {"rate": 4.0},        // or {"concurrency": 32}; none: the trace's own arrival times
     "duration_ms": null,          // required when run_to_end is false
     "run_to_end": true,
     "accept_rate": null           // speculative workers only: one probability, or one per draft position
   }
 }
 ```
+
+Every request of the source runs. `load` is one number: `rate`, the requests
+(a session trace's sessions) per second, replays the trace's own spacing
+scaled to that mean, so the simulator's trace-timed `request_rate` is the
+asked rate over the trace's; `concurrency` makes every request ready at once
+and keeps at most that many in flight (sessions, when rounds chain). A trace
+whose requests all arrive at once has no rate to scale and takes only a
+concurrency. Unknown workload fields are refused (422), not ignored.
+
+What a trace holds is read once, by `simulator workload-plan`: each capture
+in `/simulations/presets` and each upload's record carry `requests`,
+`sessions` (whether rounds chain), the mean `prompt_tokens` (carried prefix
+included) and `output_tokens`, and `rate`, the first rounds' arrivals per
+second over their span (null when they all arrive at once). They also
+carry `input_file_tags`, the tags the trace's header fits.
+
+A capture's trace is read as the format and tags its header fits, like an
+upload. A speculative capture's trace carries the acceptance that capture
+recorded, one chain per request (the `speculative` tag's `accept_rate`
+column, from the capture pass's own per-request decode progress): a
+speculative member replays it and takes no `accept_rate`, and a worker that
+drafts nothing runs the same requests without that column. A dense member,
+which may replay any capture's requests, lists each request list once by its
+requests alone, so a capture's acceptance column does not make a new list.
 
 Before it queues, the request is checked: the member exists (400 with
 `choices` otherwise) and builds and is measured on that capture (409); the
@@ -161,15 +182,19 @@ input_len + output_len`, plus the draft tokens for a speculative worker, fits
 each pool's `max_model_len`, which is the arch's own or else its checkpoint's
 `max_position_embeddings`; and a per-position `accept_rate` has one probability
 per draft position) (400 for each). The run's directory holds the trace
-it replays (`workload.csv`: the source's first `num_requests` rows, with the
-`accept_rate` column), a generated trace as tracegen wrote it
+it replays (`workload.csv`: the source's rows, with the `accept_rate`
+column), a generated trace as tracegen wrote it
 (`generated.csv`, `.manifest.json`, `.plan.json`), the concrete run config
-(`simulation.run.json`) and the record (`simulation.json`). A queued run is
+(`simulation.run.json`) and the record (`simulation.json`), whose `workload`
+also says what the trace held (`trace`: the facts below). A queued run is
 the launcher's standard single run (`launcher.sweep.run_single`, analyzed, no
 plots) in a child process (`public_api/simulate_run.py`).
 
 `POST /workloads` reads the body (at most 1 MiB, 413 past it) as the declared
-`format` and `tags` with the same `simulator workload-plan` and keeps it only
+`format` and `tags`, or with neither as the format whose columns, with some of
+its tags' columns, are exactly the header's (`simulator trace-formats`; a
+header that fits none is refused with the list, and tags without a format are
+refused), with the same `simulator workload-plan` and keeps it only
 when it loads and has at most 2000 requests. An upload tagged `speculative`
 carries its own `accept_rate` column; its width is checked against a member's
 worker when a simulation names it.

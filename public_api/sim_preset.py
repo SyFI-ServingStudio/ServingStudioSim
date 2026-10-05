@@ -36,7 +36,6 @@ that capture's routing.
 
 from __future__ import annotations
 
-import hashlib
 from collections import Counter
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -186,15 +185,19 @@ def _row_captures(rows: dict) -> list[Capture]:
 
 
 def _content(reference: str) -> str:
-    """A digest of the file ``reference`` names."""
-    return hashlib.sha256(Path(resolve_reference(reference)).read_bytes()).hexdigest()
+    """A digest of the requests the trace ``reference`` names (a column a tag
+    adds, such as a speculative capture's acceptance, is not a request)."""
+    from public_api.workloads import requests_digest
+
+    return requests_digest(Path(resolve_reference(reference)))
 
 
 def _all_traces(index: DeploymentIndex) -> list[Capture]:
     """Every published request list once, for a member that routes nothing.
 
-    Captures of one workload on several models often record the same requests;
-    each list is kept once, named by its workload label (the directory after
+    Captures of one workload on several models often record the same requests
+    (a speculative capture adds its acceptance, which is not a request); each
+    list is kept once, named by its workload label (the directory after
     `<model>/<backend>/`), with its first model's directory added when one label
     has several lists. The list the most captures record comes first, the
     default."""
@@ -241,6 +244,9 @@ class SimMember:
     # is covered by `checked[0]` (dense).
     failures: dict[str, str] = field(default_factory=dict)
     missing: dict[str, dict[str, int]] = field(default_factory=dict)
+    # Per capture name: how its requests do not fit the pools as a run replays
+    # them (`simulate.misfit`). Checked for every capture, dense or not.
+    misfits: dict[str, dict] = field(default_factory=dict)
 
     @property
     def dense(self) -> bool:
@@ -256,10 +262,15 @@ class SimMember:
 
     def blocker(self, capture: Capture) -> dict | None:
         """Why this member cannot run ``capture``: ``{"error": <the build's
-        message>}`` or ``{"missing": {<kernel role>: <profile.db rows it
-        lacks>}}``; None when it can."""
+        message>}``, ``{"misfit": <how its requests do not fit>}`` or
+        ``{"missing": {<kernel role>: <profile.db rows it lacks>}}``; None when
+        it can."""
         if self.error:
             return {"error": self.error}
+        if capture.name in self.failures:
+            return {"error": self.failures[capture.name]}
+        if capture.name in self.misfits:
+            return {"misfit": self.misfits[capture.name]}
         key = self.checked[0].name if self.dense and self.checked else capture.name
         if key in self.failures:
             return {"error": self.failures[key]}
@@ -274,6 +285,8 @@ class SimMember:
         blocker = self.blocker(capture)
         if blocker is None or "error" in blocker:
             return blocker and blocker["error"]
+        if "misfit" in blocker:
+            return blocker["misfit"]["reason"]
         rows = ", ".join(f"{k} {n}" for k, n in sorted(blocker["missing"].items()))
         return f"lacks profile.db rows: {rows}"
 
@@ -400,46 +413,69 @@ class SimIndex:
         return rows[0] if rows[0] is not None else _all_traces(self.index)
 
     def _bind(self, member: SimMember) -> str | None:
-        """Find each pool's arch member for every capture; the reason it cannot
-        run any capture, or None."""
+        """Find each pool's arch member for every capture. A capture whose arch
+        does not build is that capture's failure; the reason it cannot run any
+        capture, or None."""
         for capture in member.captures:
             for role in member.pools:
                 try:
                     arch = member.arch_member(self.index, role, capture)
                 except Exception as error:  # noqa: BLE001 — BadMember, UnknownDeployment
-                    return f"pool {role}: {error}"
+                    member.failures[capture.name] = f"pool {role}: {error}"
+                    break
                 if arch.error:
-                    return f"pool {role}: its arch does not build: {arch.error}"
+                    member.failures[capture.name] = (
+                        f"pool {role}: its arch does not build: {arch.error}"
+                    )
+                    break
+        if len(member.failures) == len(member.captures):
+            return member.failures[member.captures[0].name]
         return None
 
     def check(
-        self, dry_run: Callable[[SimMember, Capture], dict[str, int]], *, jobs: int = 8
+        self,
+        dry_run: Callable[[SimMember, Capture], dict[str, int]],
+        misfit: Callable[[SimMember, Capture], dict | None] = lambda member, capture: None,
+        *,
+        jobs: int = 8,
     ) -> None:
         """Build every member through the deployment (``dry_run``: the
         simulator's ``dry-run`` of its run config) and record the profile.db
         rows each lacks. A dense member is built once; an MoE member once per
-        capture, whose routing changes its kernels."""
+        capture, whose routing changes its kernels. Whether a capture's requests
+        fit (``misfit``) is asked of every capture: it depends on the trace."""
         work = []
         for preset in self.presets.values():
             for member in preset.members:
                 if member.error:
                     continue
                 member.checked = member.captures[:1] if member.dense else list(member.captures)
-                work.extend((member, capture) for capture in member.checked)
+                work.extend(
+                    (dry_run, member, capture)
+                    for capture in member.checked
+                    if capture.name not in member.failures
+                )
+                work.extend(
+                    (misfit, member, capture)
+                    for capture in member.captures
+                    if capture.name not in member.failures
+                )
 
         def one(item):
-            member, capture = item
+            ask, member, capture = item
             try:
-                return member, capture, dry_run(member, capture), None
+                return ask, member, capture, ask(member, capture), None
             except Exception as error:  # noqa: BLE001 — the build's own message
-                return member, capture, None, str(error)
+                return ask, member, capture, None, str(error)
 
         with ThreadPoolExecutor(max_workers=jobs) as pool:
-            for member, capture, missing, error in pool.map(one, work):
+            for ask, member, capture, answer, error in pool.map(one, work):
                 if error is not None:
                     member.failures[capture.name] = error
-                else:
-                    member.missing[capture.name] = missing
+                elif ask is dry_run:
+                    member.missing[capture.name] = answer
+                elif answer is not None:
+                    member.misfits[capture.name] = answer
 
     def preset(self, preset_id: str) -> SimPreset:
         if preset_id not in self.presets:

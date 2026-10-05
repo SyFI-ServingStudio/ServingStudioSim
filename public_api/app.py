@@ -240,11 +240,12 @@ def create_app(
     @app.post(f"{PREFIX}/workloads", status_code=201)
     async def upload_workload(
         request: Request,
-        input_file_format: str = Query(simulate.CAPTURE_FORMAT, alias="format"),
-        tags: str = "",
+        input_file_format: str | None = Query(None, alias="format"),
+        tags: str | None = None,
     ) -> dict:
         """Keep an uploaded trace (the request body, a CSV) for a day; the
-        answer's ``workload_id`` is a simulation's ``workload.upload``."""
+        answer's ``workload_id`` is a simulation's ``workload.upload``. With no
+        ``format``, its format and tags are the ones its header fits."""
         service = need_simulations()
         with limited(upload_limit, request):
             body = bytearray()
@@ -254,7 +255,7 @@ def create_app(
                     raise HTTPException(
                         413, f"an upload is at most {workloads.MAX_UPLOAD_BYTES} bytes"
                     )
-            names = [tag for tag in tags.split(",") if tag]
+            names = None if tags is None else [tag for tag in tags.split(",") if tag]
             return await answer(service.workloads.upload, bytes(body), input_file_format, names)
 
     @app.get(f"{PREFIX}/simulations/{{simulation_id}}")

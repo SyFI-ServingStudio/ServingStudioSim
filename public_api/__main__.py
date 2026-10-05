@@ -103,6 +103,7 @@ def main(argv: list[str] | None = None) -> int:
         lambda member, capture: simulate.missing_rows(
             index, member, capture, registry, args.build_type
         ),
+        lambda member, capture: simulate.misfit(index, member, capture, registry, args.build_type),
         jobs=args.jobs,
     )
     args.runs_dir.mkdir(parents=True, exist_ok=True)

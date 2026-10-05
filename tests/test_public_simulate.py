@@ -37,6 +37,9 @@ CAPTURE_DIR = f"{HF}/glm/vllm/capa/capture/20260101"
 # A dense member names a capture by its workload label.
 DENSE_TRACE = "capa"
 DRAFT = 3
+# The speculative pool's bound: request 2 (900 + 200 tokens) fits it only
+# without the draft window.
+MAX_MODEL_LEN = 1100
 # id, input_len, output_len.
 TRACE_ROWS = [(0, 100, 50), (1, 200, 60), (2, 900, 200), (3, 50, 10)]
 needs_tracegen = pytest.mark.skipif(not TRACEGEN.is_file(), reason="tracegen not built")
@@ -61,7 +64,7 @@ pools:
   main:
     groups:
       - replicas: 1
-        arch: {{preset: spec}}
+        arch: {{preset: spec, max_model_len: {MAX_MODEL_LEN}}}
         worker: {{type: speculative, draft_tokens: {DRAFT}}}
 """
 PD_SIM = """\
@@ -114,13 +117,16 @@ def _arch_index(model_config: Path) -> DeploymentIndex:
         checkpoint="zai-org/GLM",
         arch="moe",
         gpu="NVIDIA B200",
-        axes=[{"name": "workload", "values": list(rows), "rows": rows}],
+        axes=[
+            {"name": "max_model_len", "values": [MAX_MODEL_LEN]},
+            {"name": "workload", "values": list(rows), "rows": rows},
+        ],
         members=[
             Member(
                 preset="GLM/spec",
-                params={"workload": label},
+                params={"max_model_len": MAX_MODEL_LEN, "workload": label},
                 gpu="NVIDIA B200",
-                arch={"type": "moe", **row},
+                arch={"type": "moe", "max_model_len": MAX_MODEL_LEN, **row},
                 block={},
                 gpus_per_replica=4,
             )
@@ -195,6 +201,8 @@ def _rows_plan(block: dict, build_type: str = "release") -> list[dict]:
     return [
         {
             "request_id": row.get("request_id", row.get("id")),
+            "predecessor_request_id": None,
+            "session_arrival_time_ms": float(row.get("arrival_time", 0)) * 1000,
             "prefix_len": int(row.get("prefix_len", 0)),
             "input_len": int(row["input_len"]),
             "output_len": int(row["output_len"]),
@@ -225,9 +233,35 @@ def run_plans(monkeypatch: pytest.MonkeyPatch) -> RunPlans:
     return plans
 
 
+# `simulator trace-formats`, as far as these tests read it.
+FORMATS = {
+    "formats": [
+        {
+            "name": "text-generation-independent",
+            "columns": ["id", "arrival_time", "input_len", "output_len"],
+            "tags": ["session", "slo", "priority", "speculative"],
+        },
+        {
+            "name": "text-generation-session-execution-v2",
+            "columns": ["request_id", "session_id", "round_idx", "arrival_time_ms"]
+            + ["prefix_len", "input_len", "output_len", "tool_wait_after_ms"],
+            "tags": ["slo", "priority", "speculative"],
+        },
+    ],
+    "tags": [
+        {"name": "session", "columns": ["session_id", "prefix_kv", "tool_wait_after_ms"]},
+        {"name": "slo", "columns": ["ttft_slo_ms", "tpot_slo_ms", "e2e_slo_ms"]},
+        {"name": "priority", "columns": ["priority"]},
+        {"name": "speculative", "columns": ["accept_rate"]},
+    ],
+}
+
+
 @pytest.fixture
 def rows_plan(monkeypatch: pytest.MonkeyPatch, run_plans: RunPlans) -> None:
     monkeypatch.setattr(workloads, "plan", _rows_plan)
+    monkeypatch.setattr(simulate, "plan", _rows_plan)
+    monkeypatch.setattr(workloads, "trace_formats", lambda build_type="release": FORMATS)
 
 
 RUN = """\
@@ -320,6 +354,15 @@ def _upload(client: TestClient, text: str, **query):
     )
 
 
+def _sessions(rows) -> str:
+    lines = [",".join(FORMATS["formats"][1]["columns"])]
+    lines += [
+        f"session_{n}_round_000000,{n},0,{n * 500},0,{input_len},{output_len},0"
+        for n, (_, input_len, output_len) in enumerate(rows)
+    ]
+    return "\n".join(lines) + "\n"
+
+
 def _independent(rows) -> str:
     lines = ["id,arrival_time,input_len,output_len"]
     lines += [
@@ -359,11 +402,44 @@ def test_presets_list_members_captures_and_what_cannot_run(client: TestClient) -
 
     # An MoE arch offers its capture rows, never the uniform one.
     spec = presets["GLM/spec_speculative"]
+    # Each capture says what its trace holds, as the simulator reads it.
+    facts = {
+        "requests": 4,
+        "sessions": False,
+        "prompt_tokens": 312.5,
+        "output_tokens": 80.0,
+        "rate": 2.0,
+        "input_file_tags": [],
+    }
     assert spec["captures"] == [
-        {"name": "capa", "trace": f"{CAPTURE_DIR}/trace.csv", "routing": "popularity"}
+        {
+            "name": "capa",
+            "trace": f"{CAPTURE_DIR}/trace.csv",
+            "routing": "popularity",
+            "facts": facts,
+        }
     ]
     pd = presets["Llama/dense_pd"]
     assert [m["gpus"] for m in pd["members"]] == [3, 5]
+
+
+def test_a_capture_too_long_for_a_member_is_that_captures_misfit(sims) -> None:
+    """A capture whose requests the member cannot hold is offered as a
+    misfit with the simulator's counts; the member's other captures and the
+    other members still run."""
+    spec = sims.preset("GLM/spec_speculative").members[0]
+    names = [capture.name for capture in spec.captures]
+    too_long = {"reason": "3 of 4 requests exceed", "requests": 3, "total": 4, "max_model_len": 8}
+
+    def misfit(member, capture):
+        return too_long if member is spec and capture.name == names[0] else None
+
+    sims.check(lambda member, capture: {}, misfit, jobs=2)
+    assert spec.summary(sims.index)["unavailable"] == {names[0]: {"misfit": too_long}}
+    assert spec.runnable(spec.capture(names[0])) == "3 of 4 requests exceed"
+    assert all(spec.runnable(spec.capture(name)) is None for name in names[1:])
+    others = [m for p in sims.presets.values() for m in p.members if m is not spec]
+    assert not any(m.misfits for m in others)
 
 
 def test_a_dense_member_lists_each_request_list_once(monkeypatch) -> None:
@@ -425,18 +501,19 @@ def test_without_a_simulation_service_the_routes_answer_503(sims) -> None:
         ("Llama/dense_barebone", {"tp_size": 4, "replicas": 1}, {}, 400, "has no member"),
         ("Llama/dense_barebone", {"tp_size": 1}, {}, 400, "missing ['replicas']"),
         (*DENSE, {"capture": "nope"}, 400, "has no capture 'nope'"),
-        (*DENSE, {"num_requests": 5}, 400, f"capture {DENSE_TRACE} has 4 requests, not 5"),
         (*DENSE, {"run_to_end": False}, 400, "needs duration_ms"),
         (*DENSE, {"source": "generated"}, 400, "a generated workload needs workload.generator"),
         (*DENSE, {"source": "upload"}, 400, "an upload workload needs workload.upload"),
         (*DENSE, {"upload": "abc"}, 400, "a capture workload takes no generator or upload"),
         (*DENSE, {"source": "upload", "upload": "abc"}, 400, "no upload 'abc'"),
         (*DENSE, {"accept_rate": 0.5}, 400, "only to a speculative worker"),
-        (*SPEC, {"num_requests": 2}, 400, "needs workload.accept_rate"),
+        (*SPEC, {}, 400, "needs workload.accept_rate"),
         ("Llama/dense_barebone", {"tp_size": 2, "replicas": 2}, {}, 409, "lacks profile.db"),
-        (*DENSE, {"num_requests": 0}, 422, None),
-        (*DENSE, {"arrival_mode": "poisson"}, 422, None),
-        (*DENSE, {"request_rate": 0}, 422, None),
+        (*DENSE, {"num_requests": 2}, 422, None),
+        (*DENSE, {"load": {}}, 422, None),
+        (*DENSE, {"load": {"rate": 1, "concurrency": 8}}, 422, None),
+        (*DENSE, {"load": {"rate": 0}}, 422, None),
+        (*DENSE, {"load": {"concurrency": 0}}, 422, None),
     ],
 )
 def test_a_request_the_member_cannot_run_is_refused_before_it_queues(
@@ -474,14 +551,15 @@ def test_at_most_max_requests_per_simulation(client, monkeypatch) -> None:
     answer = _post(client, *DENSE)
     assert answer.status_code == 400
     assert "has 4 requests; at most 3 per simulation" in answer.json()["detail"]
-    assert _post(client, *DENSE, num_requests=3).status_code == 202
 
 
 # -- runs ----------------------------------------------------------------------
 
 
 def test_a_simulation_runs_reports_its_summary_and_is_deleted(client, tmp_path) -> None:
-    started = _post(client, *DENSE, num_requests=2, request_rate=2.0, max_concurrency=8)
+    # The capture's four requests arrive at 2 per second; 4 per second replays
+    # them twice as fast.
+    started = _post(client, *DENSE, load={"rate": 4.0})
     assert started.status_code == 202
     sim_id = started.json()["simulation_id"]
 
@@ -495,7 +573,8 @@ def test_a_simulation_runs_reports_its_summary_and_is_deleted(client, tmp_path) 
     assert answer["preset"] == DENSE[0] and answer["params"] == DENSE[1]
     assert answer["workload"]["capture"] == DENSE_TRACE
     assert answer["routing"] == started.json()["routing"]
-    assert answer["workload"]["num_requests"] == 2
+    assert answer["workload"]["trace"]["requests"] == 4
+    assert answer["workload"]["load"] == {"rate": 4.0, "concurrency": None}
     assert answer["gpus"] == 1
     assert answer["run_id"] == f"run-{sim_id}"
     summary = answer["summary"]
@@ -507,7 +586,8 @@ def test_a_simulation_runs_reports_its_summary_and_is_deleted(client, tmp_path) 
     config = json.loads((run / simulate.RUN_CONFIG).read_text())
     workload = config["workload"]
     assert workload["trace_files"] == [str(run / "workload.csv")]
-    assert workload["request_rate"] == 2.0 and workload["max_concurrency"] == 8
+    assert workload["arrival_mode"] == "trace_timed" and workload["request_rate"] == 2.0
+    assert "max_concurrency" not in workload
     assert workload["input_file_tags"] == []
     assert config["io"]["log_dir"] == str(run)
     assert config["pools"]["main"]["groups"] == [
@@ -519,7 +599,7 @@ def test_a_simulation_runs_reports_its_summary_and_is_deleted(client, tmp_path) 
         }
     ]
     with (run / "workload.csv").open() as stream:
-        assert [row["id"] for row in csv.DictReader(stream)] == ["0", "1"]
+        assert [row["id"] for row in csv.DictReader(stream)] == ["0", "1", "2", "3"]
 
     assert client.delete(f"{PREFIX}/simulations/{sim_id}").json() == {
         "simulation_id": sim_id,
@@ -531,7 +611,7 @@ def test_a_simulation_runs_reports_its_summary_and_is_deleted(client, tmp_path) 
 
 
 def test_a_speculative_run_gets_its_acceptance_and_the_capture_routing(client, tmp_path) -> None:
-    started = _post(client, *SPEC, num_requests=2, accept_rate=[0.9, 0.7, 0.5])
+    started = _post(client, *SPEC, load={"concurrency": 8}, accept_rate=[0.9, 0.7, 0.5])
     sim_id = started.json()["simulation_id"]
     assert started.json()["routing"] == {
         "capture": "capa",
@@ -542,12 +622,84 @@ def test_a_speculative_run_gets_its_acceptance_and_the_capture_routing(client, t
     run = tmp_path / "sims" / sim_id
     config = json.loads((run / simulate.RUN_CONFIG).read_text())
     assert config["workload"]["input_file_tags"] == ["speculative"]
+    assert config["workload"]["arrival_mode"] == "saturated"
+    assert config["workload"]["max_concurrency"] == 8
     arch = config["pools"]["main"]["groups"][0]["arch"]
     assert arch["routing"] == "popularity"
     assert arch["expert_popularity_file"] == f"{CAPTURE_DIR}/popularity.json"
     with (run / "workload.csv").open() as stream:
         rows = list(csv.DictReader(stream))
-    assert [row["accept_rate"] for row in rows] == ["[0.9, 0.7, 0.5]"] * 2
+    assert [row["accept_rate"] for row in rows] == ["[0.9, 0.7, 0.5]"] * 4
+
+
+def _with_acceptance(trace: Path) -> None:
+    """Give the capture's trace the acceptance a speculative capture records."""
+    with trace.open() as stream:
+        rows = list(csv.DictReader(stream))
+    with trace.open("w", newline="") as stream:
+        writer = csv.DictWriter(stream, [*rows[0], "accept_rate"])
+        writer.writeheader()
+        for n, row in enumerate(rows):
+            writer.writerow(row | {"accept_rate": f"[0.{n + 5},0.5,0.5]"})
+
+
+def test_a_speculative_capture_runs_on_the_acceptance_it_recorded(client, trace, tmp_path):
+    _with_acceptance(trace)
+    presets = client.get(f"{PREFIX}/simulations/presets").json()["presets"]
+    (spec,) = [preset for preset in presets if preset["id"] == SPEC[0]]
+    assert spec["captures"][0]["facts"]["input_file_tags"] == ["speculative"]
+
+    # A speculative worker replays each request's own recorded chain.
+    started = _post(client, *SPEC)
+    assert started.status_code == 202, started.json()
+    run = tmp_path / "sims" / started.json()["simulation_id"]
+    config = json.loads((run / simulate.RUN_CONFIG).read_text())
+    assert config["workload"]["input_file_tags"] == ["speculative"]
+    with (run / "workload.csv").open() as stream:
+        assert [row["accept_rate"] for row in csv.DictReader(stream)] == [
+            f"[0.{n + 5},0.5,0.5]" for n in range(len(TRACE_ROWS))
+        ]
+    # Its own column is the acceptance: a second one is refused.
+    both = _post(client, *SPEC, accept_rate=0.5)
+    assert both.status_code == 400
+    assert "carries its own accept_rate column" in both.json()["detail"]
+
+    # A worker that drafts nothing runs the same requests without it.
+    dense = _post(client, *DENSE)
+    assert dense.status_code == 202, dense.json()
+    run = tmp_path / "sims" / dense.json()["simulation_id"]
+    config = json.loads((run / simulate.RUN_CONFIG).read_text())
+    assert config["workload"]["input_file_tags"] == []
+    with (run / "workload.csv").open() as stream:
+        reader = csv.DictReader(stream)
+        assert reader.fieldnames == ["id", "input_len", "output_len", "arrival_time"]
+        assert len(list(reader)) == len(TRACE_ROWS)
+
+
+def test_the_requests_of_a_trace_digest_without_a_tags_columns(trace, rows_plan, tmp_path):
+    plain = tmp_path / "plain.csv"
+    plain.write_bytes(trace.read_bytes())
+    _with_acceptance(trace)
+    assert workloads.requests_digest(trace) == workloads.requests_digest(plain)
+    lengths = tmp_path / "lengths.csv"
+    lengths.write_text(plain.read_text().replace("\n0,100,", "\n0,101,"))
+    assert workloads.requests_digest(lengths) != workloads.requests_digest(plain)
+
+
+def test_a_request_that_misses_the_draft_window_by_a_few_tokens_is_shortened(client, tmp_path):
+    started = _post(client, *SPEC, accept_rate=0.5)
+    assert started.status_code == 202, started.json()
+    sim_id = started.json()["simulation_id"]
+    with (tmp_path / "sims" / sim_id / "workload.csv").open() as stream:
+        rows = [(row["input_len"], row["output_len"]) for row in csv.DictReader(stream)]
+    # 900 + 200 + 3 drafted tokens is 3 past 1100: its output loses those 3.
+    assert rows == [("100", "50"), ("200", "60"), ("900", "197"), ("50", "10")]
+    assert _wait(client, sim_id)["workload"]["shortened"] == 1
+
+    # A worker that drafts nothing serves it whole.
+    dense = _post(client, *DENSE).json()["simulation_id"]
+    with (tmp_path / "sims" / dense / "workload.csv").open() as stream:
+        assert [row["output_len"] for row in csv.DictReader(stream)][2] == "200"
 
 
 def test_a_failed_run_reports_its_cause(client, runner) -> None:
@@ -630,9 +782,9 @@ def test_simulate_and_predict_are_rate_limited_per_client(
         upload_limit=RateLimiter(1, 60.0),
     )
     # A refused request is no work done: it does not count.
-    assert _post(client, *DENSE, num_requests=9).status_code == 400
-    assert _post(client, *DENSE, num_requests=1).status_code == 202
-    refused = _post(client, *DENSE, num_requests=1)
+    assert _post(client, *DENSE, capture="nope").status_code == 400
+    assert _post(client, *DENSE).status_code == 202
+    refused = _post(client, *DENSE)
     assert refused.status_code == 429
     assert int(refused.headers["Retry-After"]) >= 1
 
@@ -686,7 +838,7 @@ def test_a_generated_workload_routes_as_the_members_capture(client, tmp_path, ac
     }
     sim_id = started.json()["simulation_id"]
     answer = _wait(client, sim_id)
-    assert answer["workload"]["capture"] == "capa" and answer["workload"]["num_requests"] == 3
+    assert answer["workload"]["capture"] == "capa" and answer["workload"]["trace"]["requests"] == 3
 
     run = tmp_path / "sims" / sim_id
     config = json.loads((run / simulate.RUN_CONFIG).read_text())
@@ -730,8 +882,11 @@ def test_an_uploaded_workload_is_kept_and_simulated(client, tmp_path) -> None:
     uploaded = _upload(client, _independent([("a", 10, 5), ("b", 20, 5)]))
     assert uploaded.status_code == 201, uploaded.json()
     record = uploaded.json()
-    assert record["requests"] == 2
+    # Read as the format its header fits; what it holds, as the simulator reads it.
     assert record["input_file_format"] == "text-generation-independent"
+    assert record["input_file_tags"] == []
+    assert record["requests"] == 2 and record["rate"] == 2.0
+    assert record["prompt_tokens"] == 15.0 and record["output_tokens"] == 5.0
 
     started = _post(client, *DENSE, source="upload", upload=record["workload_id"])
     assert started.status_code == 202, started.json()
@@ -752,7 +907,8 @@ def test_an_uploaded_workload_is_kept_and_simulated(client, tmp_path) -> None:
 
 def test_an_upload_carries_its_own_acceptance_or_takes_the_requests(client, tmp_path) -> None:
     rows = 'id,arrival_time,input_len,output_len,accept_rate\na,0.0,10,5,"[0.9,0.8,0.7]"\n'
-    record = _upload(client, rows, tags="speculative").json()
+    record = _upload(client, rows).json()
+    # Its accept_rate column is the speculative tag's.
     assert record["input_file_tags"] == ["speculative"]
 
     # The upload's column is the acceptance; the simulator checks its width.
@@ -768,6 +924,27 @@ def test_an_upload_carries_its_own_acceptance_or_takes_the_requests(client, tmp_
     both = _post(client, *SPEC, source="upload", upload=record["workload_id"], accept_rate=0.5)
     assert both.status_code == 400
     assert "carries its own accept_rate column" in both.json()["detail"]
+
+
+@pytest.mark.parametrize(
+    ("header", "message"),
+    [
+        ("id,arrival_time,input_len", "fits no trace format"),
+        ("id,arrival_time,input_len,output_len,priority,bogus", "fits no trace format"),
+    ],
+)
+def test_an_upload_whose_header_fits_no_format_is_refused(client, tmp_path, header, message):
+    answer = _upload(client, header + "\n")
+    assert answer.status_code == 400
+    assert message in answer.json()["detail"]
+    assert "text-generation-independent: id, arrival_time" in answer.json()["detail"]
+    assert not any((tmp_path / "uploads").iterdir())
+
+
+def test_tags_without_a_format_are_refused(client) -> None:
+    answer = _upload(client, _independent(TRACE_ROWS), tags="slo")
+    assert answer.status_code == 400
+    assert "tags need a format" in answer.json()["detail"]
 
 
 def test_an_upload_past_the_limits_is_refused(client, tmp_path, monkeypatch) -> None:
@@ -800,8 +977,14 @@ def test_the_simulator_refuses_what_a_run_would_refuse(binary_client) -> None:
     )
     assert answer.status_code == 400
     assert answer.json()["detail"].startswith("trace.csv: header does not match")
-    assert _upload(binary_client, _independent(TRACE_ROWS), tags="slo").status_code == 400
+    slo = _upload(
+        binary_client, _independent(TRACE_ROWS), format="text-generation-independent", tags="slo"
+    )
+    assert slo.status_code == 400
+    # With no format, the one its header fits, from the simulator's own list.
     assert _upload(binary_client, _independent(TRACE_ROWS)).json()["requests"] == 4
+    sessions = _upload(binary_client, _sessions(TRACE_ROWS)).json()
+    assert sessions["input_file_format"] == "text-generation-session-execution-v2"
 
 
 @pytest.mark.needs_binary

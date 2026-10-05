@@ -8,7 +8,8 @@ values. A trace, whatever made it, is read by ``simulator workload-plan``,
 which loads a run config's ``workload`` block exactly as a run does (format,
 tags, every row) and prints its requests; given the whole run config, it also
 refuses the requests a pool cannot serve, as the run would before its first
-tick. The formats an upload may declare are ``simulator trace-formats``. What
+tick. The formats an upload may declare are ``simulator trace-formats``; an
+upload that declares none is read as the one its header fits. What
 this module adds is the service's own limits: which generators it offers, how
 long one may run, how large an upload may be, and how long an upload is kept.
 
@@ -18,6 +19,8 @@ record, ``upload.json``), and are removed a day after they arrive.
 
 from __future__ import annotations
 
+import csv
+import hashlib
 import json
 import resource
 import shutil
@@ -98,6 +101,114 @@ def plan_run(config: dict, build_type: str = "release") -> list[dict]:
     the simulator's reason, when a request does not fit one of its pools
     (``simulator workload-plan --config``: the check a run makes first)."""
     return _workload_plan(["--config"], config, config["workload"], build_type)
+
+
+def read_block(source: TraceSource) -> dict:
+    """A ``workload`` block that only reads ``source``: the replay settings
+    are a simulation's."""
+    return {
+        "trace_files": [str(source.path)],
+        "input_file_format": source.input_file_format,
+        "input_file_tags": list(source.input_file_tags),
+        "arrival_mode": "trace_timed",
+        "request_rate": 1.0,
+        "run_to_end": True,
+        "duration_ms": 1.0,
+    }
+
+
+def trace_facts(requests: list[dict]) -> dict:
+    """What a reader is told about a trace, from :func:`plan`'s requests: how
+    many there are, their mean prompt (carried prefix included) and output
+    tokens, and the rate they arrive at. Only a session's first round arrives
+    on the trace's clock (a later round follows its predecessor), so the rate
+    counts those, per second over their span; None when they all arrive at
+    once."""
+    first = sorted(
+        float(r["session_arrival_time_ms"]) for r in requests if r["predecessor_request_id"] is None
+    )
+    span_ms = first[-1] - first[0] if first else 0.0
+    count = len(requests)
+    mean = lambda values: sum(values) / count if count else None  # noqa: E731
+    return {
+        "requests": count,
+        "sessions": len(first) < count,
+        "prompt_tokens": mean(r["prefix_len"] + r["input_len"] for r in requests),
+        "output_tokens": mean(r["output_len"] for r in requests),
+        "rate": (len(first) - 1) / span_ms * 1000 if span_ms > 0 else None,
+    }
+
+
+_FORMATS: dict[str, tuple[float, dict]] = {}
+_FORMATS_LOCK = threading.Lock()
+
+
+def trace_formats(build_type: str = "release") -> dict:
+    """``simulator trace-formats``: every trace format, its columns and tags,
+    and each tag's columns; read again when the binary changes."""
+    binary = binary_path(build_type)
+    stamp = binary.stat().st_mtime
+    with _FORMATS_LOCK:
+        if build_type in _FORMATS and _FORMATS[build_type][0] == stamp:
+            return _FORMATS[build_type][1]
+    result = _simulator(["trace-formats"], build_type)
+    if result.returncode:
+        raise RuntimeError(f"simulator trace-formats: {result.stderr.strip()}")
+    formats = json.loads(result.stdout)
+    with _FORMATS_LOCK:
+        _FORMATS[build_type] = (stamp, formats)
+    return formats
+
+
+def _header(path: Path) -> list[str]:
+    with open(path, newline="") as stream:
+        return [column.strip() for column in next(csv.reader(stream), [])]
+
+
+def trace_source(path: Path, name: str, build_type: str = "release") -> TraceSource:
+    """A published trace as the simulator reads it: the format and tags its
+    header fits (:func:`detect_format`). A speculative capture's trace carries
+    the acceptance it recorded, a column of the ``speculative`` tag."""
+    fmt, tags = detect_format(_header(path), trace_formats(build_type))
+    return TraceSource(Path(path), fmt, tuple(tags), name)
+
+
+def requests_digest(path: Path, build_type: str = "release") -> str:
+    """A digest of a trace's requests: its format's own columns, row by row,
+    without the columns a tag adds (such as the acceptance a speculative
+    capture recorded), so two traces of the same requests digest alike."""
+    source = trace_source(path, str(path), build_type)
+    formats = {fmt["name"]: fmt for fmt in trace_formats(build_type)["formats"]}
+    columns = formats[source.input_file_format]["columns"]
+    digest = hashlib.sha256(source.input_file_format.encode())
+    with open(path, newline="") as stream:
+        for row in csv.DictReader(stream):
+            digest.update(json.dumps([row[c] for c in columns]).encode())
+    return digest.hexdigest()
+
+
+def detect_format(header: list[str], formats: dict) -> tuple[str, list[str]]:
+    """The trace format and tags whose columns are exactly ``header``, from
+    ``simulator trace-formats``. A format fits when its columns and those of
+    some of its tags make up the header; raises when none or several do."""
+    have = set(header)
+    tag_columns = {tag["name"]: set(tag["columns"]) for tag in formats["tags"]}
+    fits = []
+    for fmt in formats["formats"]:
+        tags = [t for t in fmt["tags"] if tag_columns[t] <= have]
+        if set(fmt["columns"]).union(*(tag_columns[t] for t in tags)) == have:
+            fits.append((fmt["name"], tags))
+    if len(fits) == 1:
+        return fits[0]
+    accepted = "; ".join(
+        f"{fmt['name']}: {', '.join(fmt['columns'])}"
+        + (f" (and optionally the columns of {', '.join(fmt['tags'])})" if fmt["tags"] else "")
+        for fmt in formats["formats"]
+    )
+    found = ", ".join(header) or "no columns"
+    if not fits:
+        raise BadWorkload(f"the header ({found}) fits no trace format. They are {accepted}")
+    raise BadWorkload(f"the header ({found}) fits several trace formats; give format")
 
 
 def _limit_memory() -> None:
@@ -207,14 +318,28 @@ class Workloads:
     # -- uploaded --------------------------------------------------------------
 
     def trace_formats(self) -> dict:
-        """The formats an upload may declare and their tags (``simulator
-        trace-formats``)."""
-        return self._cached("trace-formats", binary_path(self.build_type), ["trace-formats"])
+        """The formats an upload may declare and their tags."""
+        return trace_formats(self.build_type)
 
-    def upload(self, body: bytes, input_file_format: str, input_file_tags: list[str]) -> dict:
-        """Keep an uploaded trace once the simulator reads it; its record."""
+    def upload(
+        self, body: bytes, input_file_format: str | None, input_file_tags: list[str] | None
+    ) -> dict:
+        """Keep an uploaded trace once the simulator reads it; its record. With
+        no format, the format and tags are the ones its header fits
+        (:func:`detect_format`)."""
         from public_api.simulate import MAX_REQUESTS
 
+        if input_file_format is None:
+            if input_file_tags is not None:
+                raise BadWorkload(
+                    "tags need a format: give format with them, or neither and the header "
+                    "picks both"
+                )
+            header = body.decode("utf-8", "replace").splitlines()[:1]
+            columns = next(csv.reader(header), [])
+            input_file_format, input_file_tags = detect_format(
+                [c.strip() for c in columns], self.trace_formats()
+            )
         self.prune()
         workload_id = uuid.uuid4().hex
         directory = self.uploads_dir / workload_id
@@ -222,19 +347,8 @@ class Workloads:
         try:
             trace = directory / _TRACE
             trace.write_bytes(body)
-            requests = plan(
-                {
-                    "trace_files": [str(trace)],
-                    "input_file_format": input_file_format,
-                    "input_file_tags": input_file_tags,
-                    # Replay settings are the simulation's; these only read the file.
-                    "arrival_mode": "trace_timed",
-                    "request_rate": 1.0,
-                    "run_to_end": True,
-                    "duration_ms": 1.0,
-                },
-                self.build_type,
-            )
+            source = TraceSource(trace, input_file_format, tuple(input_file_tags or ()))
+            requests = plan(read_block(source), self.build_type)
             if len(requests) > MAX_REQUESTS:
                 raise BadWorkload(
                     f"the upload has {len(requests)} requests; a simulation runs at most "
@@ -244,8 +358,8 @@ class Workloads:
             record = {
                 "workload_id": workload_id,
                 "input_file_format": input_file_format,
-                "input_file_tags": input_file_tags,
-                "requests": len(requests),
+                "input_file_tags": list(input_file_tags or ()),
+                **trace_facts(requests),
                 "created_at": created,
             }
             (directory / _RECORD).write_text(json.dumps(record))
@@ -302,9 +416,10 @@ def describe(workloads: Workloads, limits: dict, schema: dict) -> dict:
                 **workloads.generators(),
             },
             "upload": {
-                "summary": "A CSV you send to POST /workloads (body: the file; query: "
-                "`format`, and `tags` comma-separated); the answer's workload_id is the "
-                "simulation's workload.upload.",
+                "summary": "A CSV you send to POST /workloads (body: the file). Its format "
+                "and tags are the ones its header fits, or the query's `format` and `tags` "
+                "(comma-separated); the answer's workload_id is the simulation's "
+                "workload.upload.",
                 "max_bytes": MAX_UPLOAD_BYTES,
                 "keep_s": KEEP_S,
                 **workloads.trace_formats(),

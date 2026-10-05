@@ -82,10 +82,14 @@ routing, and the answer states the routing it used (step 4). A dense model
 routes nothing.
 
 **A capture** (`"source": "capture"`, the default). The requests are the
-capture's recorded trace, and its routing is the capture's own:
+capture's recorded trace, and its routing is the capture's own. Each capture's
+`facts` say what it holds: `requests`, mean `prompt_tokens` and
+`output_tokens`, `rate`, its recorded requests per second, and
+`input_file_tags`. A capture tagged `speculative` carries the acceptance it
+recorded, per request, so a speculative member needs no `accept_rate` on it:
 
 ```json
-{"source": "capture", "capture": "c32_long", "num_requests": 64}
+{"source": "capture", "capture": "c32_long", "load": {"rate": 8}}
 ```
 
 **A generated trace** (`"source": "generated"`). req-frontend's `tracegen`
@@ -126,27 +130,28 @@ r0,0,2048,256
 r1,250,1024,128
 r2,500,4096,512
 EOF
-UP=$(curl -s -X POST "$API/workloads?format=text-generation-independent" \
+UP=$(curl -s -X POST "$API/workloads" \
   -H 'content-type: text/csv' --data-binary @trace.csv | jq -r .workload_id)
 ```
 
 A format's `columns` are the header the file must have, exactly, in any order;
-each tag adds its own columns. In `text-generation-independent`,
+each tag adds its own columns. With no `format` (and no `tags`), the service
+reads the file as the format and tags its header fits; give `format` (and
+`tags`) to say it yourself. In `text-generation-independent`,
 `arrival_time` is in milliseconds and must not decrease down the file. The
 service reads the file as a run will and answers 400 with the reason when it
-cannot; the answer gives `requests` and `expires_at` (24 hours). An upload
+cannot; the answer gives the format and tags it read, the same facts a capture
+has (`requests`, `prompt_tokens`, `output_tokens`, `rate`) and `expires_at`
+(24 hours). An upload
 tagged `speculative` carries each request's acceptance in its `accept_rate`
 column (one probability, or a JSON list of `draft_tokens` of them); a
 speculative member then takes no `accept_rate` in the simulation.
 
-**Knobs for every source.**
+**Knobs for every source.** Every request of the source runs.
 
 | Field | Default | Meaning |
 | --- | --- | --- |
-| `num_requests` | all | Replay the trace's first N requests. |
-| `arrival_mode` | `trace_timed` | `trace_timed` releases each request at its arrival time divided by `request_rate`; `saturated` releases every request at once. |
-| `request_rate` | 1.0 | Speeds the trace's timeline up (`2.0` is twice the rate). |
-| `max_concurrency` | none | At most this many requests (or sessions, when chained) in flight. |
+| `load` | the trace's own arrival times | One of `{"rate": r}`: r requests (sessions, when rounds chain) per second, the trace's spacing scaled to that mean; or `{"concurrency": c}`: every request ready at once, at most c in flight. A trace whose requests all arrive at once (`rate` null) takes only a concurrency. |
 | `run_to_end` | true | Run until every request finishes; with false, `duration_ms` of simulated time. |
 | `duration_ms` | none | Simulated milliseconds to run; required when `run_to_end` is false. |
 | `accept_rate` | none | Speculative workers only, and then required unless the upload carries its own column: the chance each draft token is accepted, one number for every position or a list of `draft_tokens` numbers, one per position. |
@@ -208,7 +213,7 @@ echo "$S" | jq '{status, error, routing, workload, gpus, summary}'
 
 `status` is `queued` (with `queue_position`), `running`, `done`, `failed`
 (with `error`) or `timed_out`. The record repeats the request: `preset`,
-`params`, `workload` (with the `capture` used and `num_requests`), `routing`
+`params`, `workload` (with the `capture` used and `trace`, its facts), `routing`
 and `gpus`. Once done, `summary` has:
 
 - `requests`: `total` and `finished`; `cause` says why the run stopped;
@@ -244,8 +249,8 @@ not a model of real traffic; it tells how the deployment responds to the shape
 you asked for, so say which shape you simulated.
 
 When you answer, name the preset, the member's `params`, the GPUs, the
-workload (its source, the generator arguments or upload, `num_requests`,
-`request_rate`, `arrival_mode`, `max_concurrency`, `accept_rate`), the
+workload (its source, the generator arguments or upload, its request count,
+the `load`, `accept_rate`), the
 `routing.label`, and the numbers from `summary` you quote, with `requests`
 finished out of total. Quote only numbers the API returns; label any
 arithmetic on them as your own.
