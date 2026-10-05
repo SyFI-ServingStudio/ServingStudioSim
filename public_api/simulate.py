@@ -11,10 +11,12 @@ generated or uploaded workload is labelled "requests from your workload,
 routing from capture X", and nothing defaults to a synthetic routing.
 
 The service checks the request before queueing it, so a run never starts on
-input that would fail it: the member builds and is measured, the simulator
-loads the trace as the run will (``simulator workload-plan``), every request
-fits each pool's ``max_model_len``, a speculative worker gets an
-``accept_rate``. Then it writes the run's directory under the service's
+input that would fail it: the member builds and is measured, a speculative
+worker gets an ``accept_rate`` (the request's, or an uploaded trace's own
+column), and the simulator loads the trace as the run will and refuses what a
+pool cannot serve (``simulator workload-plan --config``: a request past a pool's
+``max_model_len``, an acceptance vector of another width than the worker
+drafts). Then it writes the run's directory under the service's
 simulations directory: the trace it replays (the source's first
 ``num_requests`` rows, with the acceptance column a speculative worker reads)
 and the concrete run config. A queued run is the launcher's standard single run
@@ -59,7 +61,7 @@ from launcher.schema.loader import Registry
 from public_api.deployments import DeploymentIndex
 from public_api.predict import _cause, missing_by_role
 from public_api.sim_preset import Capture, SimMember
-from public_api.workloads import BadWorkload, TraceSource, Workloads, describe, plan
+from public_api.workloads import BadWorkload, TraceSource, Workloads, describe, plan_run
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -219,46 +221,31 @@ def missing_rows(
 # -- workloads -----------------------------------------------------------------
 
 
-def _max_model_len(arch: dict) -> int | None:
-    """The longest request an arch serves: its ``max_model_len``, or for an arch
-    without one, its checkpoint's ``max_position_embeddings`` (the model config
-    the simulator reads)."""
-    if arch.get("max_model_len") is not None:
-        return int(arch["max_model_len"])
-    if arch.get("model_config") is None:
-        return None
-    limit = json.loads(Path(arch["model_config"]).read_text()).get("max_position_embeddings")
-    return None if limit is None else int(limit)
-
-
-def _max_model_lens(index: DeploymentIndex, member: SimMember, capture: Capture) -> dict:
-    """Each pool's longest request, for the archs that bound it."""
-    out = {}
-    for role in member.pools:
-        limit = _max_model_len(member.arch_member(index, role, capture).arch)
-        if limit is not None:
-            out[role] = limit
-    return out
-
-
-def _accept_rate(member: SimMember, workload: Workload) -> str | None:
-    """The trace's ``accept_rate`` cell, or None for a member that drafts nothing."""
+def _accept_rate(member: SimMember, workload: Workload, source: TraceSource) -> str | None:
+    """The ``accept_rate`` cell to add to every row, or None to add none. A
+    member that drafts nothing takes no acceptance; a speculative one takes the
+    request's ``accept_rate`` or the trace's own column (a source tagged
+    ``speculative``), never both, since one would silently override the other.
+    The simulator checks the values against the worker (``plan_run``)."""
     draft = _speculative_draft(member)
     if draft is None:
         if workload.accept_rate is not None:
             raise BadWorkload("accept_rate applies only to a speculative worker")
         return None
+    own = "speculative" in source.input_file_tags
     rate = workload.accept_rate
     if rate is None:
+        if own:
+            return None
         raise BadWorkload(
             f"a speculative worker drafting {draft} tokens needs workload.accept_rate: "
-            f"one probability, or {draft}, one per draft position"
+            f"one probability, or {draft}, one per draft position; or upload a trace "
+            "tagged speculative with its own accept_rate column"
         )
-    rates = rate if isinstance(rate, list) else [rate]
-    if isinstance(rate, list) and len(rate) != draft:
-        raise BadWorkload(f"accept_rate has {len(rate)} positions; this worker drafts {draft}")
-    if any(not 0.0 <= r <= 1.0 for r in rates):
-        raise BadWorkload("accept_rate probabilities must be between 0 and 1")
+    if own:
+        raise BadWorkload(
+            f"{source.name} carries its own accept_rate column; leave workload.accept_rate unset"
+        )
     return json.dumps(rate) if isinstance(rate, list) else repr(float(rate))
 
 
@@ -285,7 +272,7 @@ def write_trace(
             "(set num_requests)"
         )
     rows = rows[:count]
-    accept = _accept_rate(member, workload)
+    accept = _accept_rate(member, workload, source)
     tags = list(source.input_file_tags)
     if accept:
         fields.append("accept_rate")
@@ -296,31 +283,6 @@ def write_trace(
         for row in rows:
             writer.writerow(row | ({"accept_rate": accept} if accept else {}))
     return count, tags
-
-
-def check_requests(
-    index: DeploymentIndex, member: SimMember, capture: Capture, requests: list[dict]
-) -> None:
-    """Refuse requests a pool cannot hold: ``requests`` are the run's, as
-    ``simulator workload-plan`` reads them (a session round's context is its
-    prefix, its fresh input and its output)."""
-    # A speculative request's last verify reads up to draft_tokens past its output.
-    extra = _speculative_draft(member) or 0
-    for role, limit in _max_model_lens(index, member, capture).items():
-        over = [
-            request["request_id"]
-            for request in requests
-            if request["prefix_len"] + request["input_len"] + request["output_len"] + extra > limit
-        ]
-        if over:
-            fit = "prefix_len + input_len + output_len" + (
-                f" + {extra} draft tokens" if extra else ""
-            )
-            raise BadWorkload(
-                f"{len(over)} of {len(requests)} requests exceed pool {role}'s max_model_len "
-                f"{limit} ({fit}), first ids {over[:5]}; pick a member with a longer "
-                "max_model_len or shorter requests"
-            )
 
 
 def workload_block(
@@ -764,7 +726,7 @@ class SimulationService:
             block = workload_block(workload, trace, source.input_file_format, tags)
             tree = run_tree(index, member, capture, block, directory)
             config = concrete(tree, self.registry)
-            check_requests(index, member, capture, plan(config["workload"], self.queue.build_type))
+            plan_run(config, self.queue.build_type)
             (directory / RUN_CONFIG).write_text(json.dumps(config, indent=1))
             (directory / RUN_PRESET).write_text(json.dumps(tree, indent=1))
             routed = routing(member, capture, workload.source)

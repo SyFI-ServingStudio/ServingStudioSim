@@ -135,7 +135,9 @@ each tag adds its own columns. In `text-generation-independent`,
 `arrival_time` is in milliseconds and must not decrease down the file. The
 service reads the file as a run will and answers 400 with the reason when it
 cannot; the answer gives `requests` and `expires_at` (24 hours). An upload
-takes no `speculative` tag: acceptance is the simulation's `accept_rate`.
+tagged `speculative` carries each request's acceptance in its `accept_rate`
+column (one probability, or a JSON list of `draft_tokens` of them); a
+speculative member then takes no `accept_rate` in the simulation.
 
 **Knobs for every source.**
 
@@ -147,7 +149,7 @@ takes no `speculative` tag: acceptance is the simulation's `accept_rate`.
 | `max_concurrency` | none | At most this many requests (or sessions, when chained) in flight. |
 | `run_to_end` | true | Run until every request finishes; with false, `duration_ms` of simulated time. |
 | `duration_ms` | none | Simulated milliseconds to run; required when `run_to_end` is false. |
-| `accept_rate` | none | Speculative workers only, and then required: the chance each draft token is accepted, one number for every position or a list of `draft_tokens` numbers, one per position. |
+| `accept_rate` | none | Speculative workers only, and then required unless the upload carries its own column: the chance each draft token is accepted, one number for every position or a list of `draft_tokens` numbers, one per position. |
 
 `/simulations/presets` also gives the full JSON schema of the workload under
 `workload`.
@@ -188,7 +190,7 @@ The request is checked before it queues:
 | Status | Cause | `detail` |
 | --- | --- | --- |
 | 400 | `params` miss an axis, name an unknown one, or match no member | `{message, choices}`; `choices` lists every member's `params` |
-| 400 | A bad workload: an unknown capture or upload, a generator argument tracegen rejects, a trace the simulator cannot read, more than 2000 requests, a request longer than a pool's `max_model_len` (prefix + input + output, plus the draft tokens of a speculative worker), a missing or wrong `accept_rate` | the reason, naming the request or argument |
+| 400 | A bad workload: an unknown capture or upload, a generator argument tracegen rejects, a trace the simulator cannot read, more than 2000 requests, a request longer than a pool's `max_model_len` (prefix + input + output, plus the draft tokens of a speculative worker), a missing or wrong `accept_rate` (both the request's and an upload's column, or a list that is not `draft_tokens` long) | the reason, naming the request or argument |
 | 404 | Unknown preset id | `no public preset '...'` |
 | 409 | The member does not build or lacks profile.db rows for that capture | the reason; pick another member or capture |
 | 413 | An upload over `max_bytes` | the limit |

@@ -6,10 +6,11 @@ Nothing here knows a trace's columns or rules. The generator's knobs are
 ``generator`` object becomes that generator's command line; tracegen checks the
 values. A trace, whatever made it, is read by ``simulator workload-plan``,
 which loads a run config's ``workload`` block exactly as a run does (format,
-tags, every row) and prints its requests; the formats an upload may declare are
-``simulator trace-formats``. What this module adds is the service's own limits:
-which generators it offers, how long one may run, how large an upload may be,
-and how long an upload is kept.
+tags, every row) and prints its requests; given the whole run config, it also
+refuses the requests a pool cannot serve, as the run would before its first
+tick. The formats an upload may declare are ``simulator trace-formats``. What
+this module adds is the service's own limits: which generators it offers, how
+long one may run, how large an upload may be, and how long an upload is kept.
 
 Uploads live in their own directory, one per upload (``trace.csv`` and its
 record, ``upload.json``), and are removed a day after they arrive.
@@ -43,9 +44,6 @@ GENERATE_TIMEOUT_S = 30.0
 _GENERATE_MEMORY = 2 << 30
 MAX_UPLOAD_BYTES = 1 << 20
 KEEP_S = 24 * 3600
-# An upload's acceptance is the simulation's `accept_rate`, checked against the
-# worker's draft width; a per-row column would bypass that check.
-_UPLOAD_REFUSED_TAGS = {"speculative": "give acceptance as the simulation's workload.accept_rate"}
 _RECORD = "upload.json"
 _TRACE = "trace.csv"
 
@@ -75,19 +73,31 @@ def _simulator(args: list[str], build_type: str) -> subprocess.CompletedProcess:
     )
 
 
-def plan(block: dict, build_type: str = "release") -> list[dict]:
-    """The requests a run of the ``workload`` block ``block`` releases, one per
-    row, as ``simulator workload-plan`` loads them; raises
-    :class:`BadWorkload` with the simulator's reason when a run could not."""
+def _workload_plan(flags: list[str], document: dict, block: dict, build_type: str) -> list[dict]:
     with tempfile.TemporaryDirectory(prefix="public-workload-") as directory:
         scratch = Path(directory)
         path, error = scratch / "workload.json", scratch / ERROR_JSON
-        path.write_text(json.dumps(block))
-        result = _simulator(["workload-plan", str(path), "--error-json", str(error)], build_type)
+        path.write_text(json.dumps(document))
+        args = ["workload-plan", *flags, str(path), "--error-json", str(error)]
+        result = _simulator(args, build_type)
         if result.returncode:
             traces = {Path(trace).parent for trace in block["trace_files"]}
             raise BadWorkload(_cause(binary_error(error), result.stderr, scratch, *traces))
     return json.loads(result.stdout)["requests"]
+
+
+def plan(block: dict, build_type: str = "release") -> list[dict]:
+    """The requests a run of the ``workload`` block ``block`` releases, one per
+    row, as ``simulator workload-plan`` loads them; raises
+    :class:`BadWorkload` with the simulator's reason when a run could not."""
+    return _workload_plan([], block, block, build_type)
+
+
+def plan_run(config: dict, build_type: str = "release") -> list[dict]:
+    """:func:`plan` of the run config ``config``'s workload, also refused, with
+    the simulator's reason, when a request does not fit one of its pools
+    (``simulator workload-plan --config``: the check a run makes first)."""
+    return _workload_plan(["--config"], config, config["workload"], build_type)
 
 
 def _limit_memory() -> None:
@@ -197,24 +207,14 @@ class Workloads:
     # -- uploaded --------------------------------------------------------------
 
     def trace_formats(self) -> dict:
-        """The formats an upload may declare (``simulator trace-formats``), with
-        the tags the service takes in an upload."""
-        described = self._cached("trace-formats", binary_path(self.build_type), ["trace-formats"])
-        return {
-            "formats": [
-                fmt | {"tags": [tag for tag in fmt["tags"] if tag not in _UPLOAD_REFUSED_TAGS]}
-                for fmt in described["formats"]
-            ],
-            "tags": [tag for tag in described["tags"] if tag["name"] not in _UPLOAD_REFUSED_TAGS],
-        }
+        """The formats an upload may declare and their tags (``simulator
+        trace-formats``)."""
+        return self._cached("trace-formats", binary_path(self.build_type), ["trace-formats"])
 
     def upload(self, body: bytes, input_file_format: str, input_file_tags: list[str]) -> dict:
         """Keep an uploaded trace once the simulator reads it; its record."""
         from public_api.simulate import MAX_REQUESTS
 
-        for tag in input_file_tags:
-            if tag in _UPLOAD_REFUSED_TAGS:
-                raise BadWorkload(f"an upload takes no `{tag}` tag: {_UPLOAD_REFUSED_TAGS[tag]}")
         self.prune()
         workload_id = uuid.uuid4().hex
         directory = self.uploads_dir / workload_id

@@ -151,13 +151,16 @@ Before it queues, the request is checked: the member exists (400 with
 `choices` otherwise) and builds and is measured on that capture (409); the
 source's fields are given (`generator` for `generated`, `upload` for `upload`,
 neither for `capture`); there are at most 2000 requests; a speculative worker
-gets `accept_rate` and no other worker does; the simulator loads the trace as
-the run will (`simulator workload-plan` on the run config's `workload` block:
-format, tags, every row, the replay settings, so chaining a trace without
-sessions is refused); and every request's `prefix_len + input_len +
-output_len` (plus the draft tokens for a speculative worker) fits each pool's
-`max_model_len`, or for an arch without one, its checkpoint's
-`max_position_embeddings` (400 for each). The run's directory holds the trace
+gets acceptance from exactly one of `accept_rate` and an upload tagged
+`speculative` (its own column), and no other worker takes `accept_rate`; and
+the simulator loads the trace as the run will and checks it against the run's
+pools (`simulator workload-plan --config` on the run config, the check `run`
+makes before its first tick: format, tags, every row, the replay settings, so
+chaining a trace without sessions is refused; every request's `prefix_len +
+input_len + output_len`, plus the draft tokens for a speculative worker, fits
+each pool's `max_model_len`, which is the arch's own or else its checkpoint's
+`max_position_embeddings`; and a per-position `accept_rate` has one probability
+per draft position) (400 for each). The run's directory holds the trace
 it replays (`workload.csv`: the source's first `num_requests` rows, with the
 `accept_rate` column), a generated trace as tracegen wrote it
 (`generated.csv`, `.manifest.json`, `.plan.json`), the concrete run config
@@ -167,9 +170,9 @@ plots) in a child process (`public_api/simulate_run.py`).
 
 `POST /workloads` reads the body (at most 1 MiB, 413 past it) as the declared
 `format` and `tags` with the same `simulator workload-plan` and keeps it only
-when it loads and has at most 2000 requests. It takes no `speculative` tag:
-acceptance is the simulation's `accept_rate`, which the service checks against
-the worker's draft width.
+when it loads and has at most 2000 requests. An upload tagged `speculative`
+carries its own `accept_rate` column; its width is checked against a member's
+worker when a simulation names it.
 
 Once `done`, `summary` is the run's `summary.json` and the Analyzer's
 `slo-general` report:

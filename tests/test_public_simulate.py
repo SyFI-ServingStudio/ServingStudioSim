@@ -1,12 +1,14 @@
 """``/simulations``, ``/simulate`` and ``/workloads``: sim presets, request
 checks, generated and uploaded workloads, the queue and the rate limits.
 
-The arch presets are fixtures (a dense one whose model config bounds its
-requests, and an MoE speculative one with a capture row and a max_model_len);
-the sim presets are written for each test; a run is a small script standing in
-for the launcher's child process. The simulator's trace loading (``simulator
-workload-plan``) is stood in for by reading the trace's rows, except in the
-tests marked ``needs_binary``, which run it; tracegen runs where it is built.
+The arch presets are fixtures (a dense one and an MoE speculative one with a
+capture row); the sim presets are written for each test; a run is a small
+script standing in for the launcher's child process. The simulator's trace
+loading (``simulator workload-plan``) is stood in for by reading the trace's
+rows, except in the tests marked ``needs_binary``, which run it; tracegen runs
+where it is built. Whether a trace fits a pool is the simulator's check on the
+run config, which these fixture archs cannot build: it is the real members'
+test (``test_public_sim_presets``), and here a stand-in that refuses.
 """
 
 from __future__ import annotations
@@ -34,11 +36,8 @@ HF = "hf://datasets/UW-SyFI/servingstudio-workload@" + "a" * 40
 CAPTURE_DIR = f"{HF}/glm/vllm/capa/capture/20260101"
 # A dense member names a capture by its workload label.
 DENSE_TRACE = "capa"
-MAX_MODEL_LEN = 1000
-# The dense checkpoint's max_position_embeddings: every capture row fits it.
-DENSE_POSITIONS = 1100
 DRAFT = 3
-# id, input_len, output_len: the third request does not fit MAX_MODEL_LEN.
+# id, input_len, output_len.
 TRACE_ROWS = [(0, 100, 50), (1, 200, 60), (2, 900, 200), (3, 50, 10)]
 needs_tracegen = pytest.mark.skipif(not TRACEGEN.is_file(), reason="tracegen not built")
 
@@ -121,7 +120,7 @@ def _arch_index(model_config: Path) -> DeploymentIndex:
                 preset="GLM/spec",
                 params={"workload": label},
                 gpu="NVIDIA B200",
-                arch={"type": "moe", "max_model_len": MAX_MODEL_LEN, **row},
+                arch={"type": "moe", **row},
                 block={},
                 gpus_per_replica=4,
             )
@@ -160,7 +159,7 @@ def sims(tmp_path: Path, arch_presets: Path) -> SimIndex:
         _write(root, "GLM/spec_speculative", SPEC_SIM),
     ]
     config = tmp_path / "llama.json"
-    config.write_text(json.dumps({"max_position_embeddings": DENSE_POSITIONS}))
+    config.write_text(json.dumps({"max_position_embeddings": 131072}))
     sims = SimIndex.build(_arch_index(config), paths)
 
     def dry_run(member, capture):
@@ -204,9 +203,30 @@ def _rows_plan(block: dict, build_type: str = "release") -> list[dict]:
     ]
 
 
+class RunPlans:
+    """Stands in for ``simulator workload-plan --config``: the run configs it
+    was given, and the refusal it answers with when ``refusal`` is set."""
+
+    def __init__(self) -> None:
+        self.configs: list[dict] = []
+        self.refusal: str | None = None
+
+    def __call__(self, config: dict, build_type: str = "release") -> list[dict]:
+        self.configs.append(config)
+        if self.refusal:
+            raise workloads.BadWorkload(self.refusal)
+        return _rows_plan(config["workload"], build_type)
+
+
 @pytest.fixture
-def rows_plan(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(simulate, "plan", _rows_plan)
+def run_plans(monkeypatch: pytest.MonkeyPatch) -> RunPlans:
+    plans = RunPlans()
+    monkeypatch.setattr(simulate, "plan_run", plans)
+    return plans
+
+
+@pytest.fixture
+def rows_plan(monkeypatch: pytest.MonkeyPatch, run_plans: RunPlans) -> None:
     monkeypatch.setattr(workloads, "plan", _rows_plan)
 
 
@@ -413,10 +433,6 @@ def test_without_a_simulation_service_the_routes_answer_503(sims) -> None:
         (*DENSE, {"source": "upload", "upload": "abc"}, 400, "no upload 'abc'"),
         (*DENSE, {"accept_rate": 0.5}, 400, "only to a speculative worker"),
         (*SPEC, {"num_requests": 2}, 400, "needs workload.accept_rate"),
-        (*SPEC, {"num_requests": 2, "accept_rate": [0.5, 0.4]}, 400, "has 2 positions"),
-        (*SPEC, {"num_requests": 2, "accept_rate": 1.5}, 400, "between 0 and 1"),
-        # Request 2 needs 900 + 200 + 3 draft tokens > 1000.
-        (*SPEC, {"accept_rate": 0.5}, 400, "1 of 4 requests exceed pool main's max_model_len"),
         ("Llama/dense_barebone", {"tp_size": 2, "replicas": 2}, {}, 409, "lacks profile.db"),
         (*DENSE, {"num_requests": 0}, 422, None),
         (*DENSE, {"arrival_mode": "poisson"}, 422, None),
@@ -434,6 +450,23 @@ def test_a_request_the_member_cannot_run_is_refused_before_it_queues(
         assert message in (detail if isinstance(detail, str) else detail["message"])
     # Nothing is left behind.
     assert not any((tmp_path / "sims").iterdir())
+
+
+def test_the_simulators_check_of_the_run_refuses_before_it_queues(
+    client, run_plans, tmp_path
+) -> None:
+    run_plans.refusal = "1 of 4 requests exceed pool main's max_model_len 1000 (...)"
+    answer = _post(client, *SPEC, accept_rate=[0.9, 0.8, 0.7])
+
+    assert answer.status_code == 400
+    assert answer.json()["detail"] == run_plans.refusal
+    assert not any((tmp_path / "sims").iterdir())
+    # It checked the whole run: the trace the run replays, on the member's pools.
+    (config,) = run_plans.configs
+    assert config["pools"]["main"]["groups"][0]["worker"]["draft_tokens"] == DRAFT
+    assert config["workload"]["input_file_tags"] == ["speculative"]
+    (trace,) = config["workload"]["trace_files"]
+    assert Path(trace).name == "workload.csv"
 
 
 def test_at_most_max_requests_per_simulation(client, monkeypatch) -> None:
@@ -606,7 +639,8 @@ def test_simulate_and_predict_are_rate_limited_per_client(
     body = {"preset": "Llama/dense", "params": {"tp_size": 9}, "cases": []}
     assert [client.post(f"{PREFIX}/predict", json=body).status_code for _ in range(3)] == [400] * 3
 
-    assert _upload(client, "not,a,trace\n", tags="speculative").status_code == 400
+    too_many = [(n, 1, 1) for n in range(simulate.MAX_REQUESTS + 1)]
+    assert _upload(client, _independent(too_many)).status_code == 400
     assert _upload(client, _independent(TRACE_ROWS)).status_code == 201
     assert _upload(client, _independent(TRACE_ROWS)).status_code == 429
 
@@ -681,7 +715,6 @@ def test_a_generated_workload_routes_as_the_members_capture(client, tmp_path, ac
         (SMALL | {"input_len": "bogus"}, "is not a distribution"),
         (SMALL | {"sessions": 0}, "--sessions must be greater than 0"),
         (SMALL | {"seed": [1]}, "takes one number or string"),
-        (SMALL | {"input_len": "1100"}, "3 of 3 requests exceed pool main's max_model_len 1100"),
     ],
 )
 def test_a_generator_the_service_cannot_run_is_refused(
@@ -717,12 +750,24 @@ def test_an_uploaded_workload_is_kept_and_simulated(client, tmp_path) -> None:
     )
 
 
-def test_an_upload_too_long_for_the_checkpoint_is_refused(client) -> None:
-    # The dense arch has no max_model_len: its checkpoint's max_position_embeddings bounds it.
-    record = _upload(client, _independent([("long", 1000, 101)])).json()
-    answer = _post(client, *DENSE, source="upload", upload=record["workload_id"])
-    assert answer.status_code == 400
-    assert f"exceed pool main's max_model_len {DENSE_POSITIONS}" in answer.json()["detail"]
+def test_an_upload_carries_its_own_acceptance_or_takes_the_requests(client, tmp_path) -> None:
+    rows = 'id,arrival_time,input_len,output_len,accept_rate\na,0.0,10,5,"[0.9,0.8,0.7]"\n'
+    record = _upload(client, rows, tags="speculative").json()
+    assert record["input_file_tags"] == ["speculative"]
+
+    # The upload's column is the acceptance; the simulator checks its width.
+    started = _post(client, *SPEC, source="upload", upload=record["workload_id"])
+    assert started.status_code == 202, started.json()
+    run = tmp_path / "sims" / started.json()["simulation_id"]
+    config = json.loads((run / simulate.RUN_CONFIG).read_text())
+    assert config["workload"]["input_file_tags"] == ["speculative"]
+    with (run / "workload.csv").open() as stream:
+        assert [row["accept_rate"] for row in csv.DictReader(stream)] == ["[0.9,0.8,0.7]"]
+
+    # Two acceptances for one request is a mistake, not a precedence rule.
+    both = _post(client, *SPEC, source="upload", upload=record["workload_id"], accept_rate=0.5)
+    assert both.status_code == 400
+    assert "carries its own accept_rate column" in both.json()["detail"]
 
 
 def test_an_upload_past_the_limits_is_refused(client, tmp_path, monkeypatch) -> None:
@@ -730,16 +775,20 @@ def test_an_upload_past_the_limits_is_refused(client, tmp_path, monkeypatch) -> 
     answer = _upload(client, _independent(TRACE_ROWS))
     assert answer.status_code == 400
     assert "the upload has 4 requests; a simulation runs at most 3" in answer.json()["detail"]
-    answer = _upload(client, _independent(TRACE_ROWS), tags="speculative")
-    assert "workload.accept_rate" in answer.json()["detail"]
     monkeypatch.setattr(workloads, "MAX_UPLOAD_BYTES", 16)
     assert _upload(client, _independent(TRACE_ROWS)).status_code == 413
     assert not any((tmp_path / "uploads").iterdir())
 
 
 @pytest.fixture
-def binary_client(sims, trace, tmp_path, runner) -> TestClient:
-    """Like ``client``, but the simulator itself loads every trace."""
+def binary_client(sims, trace, tmp_path, runner, monkeypatch) -> TestClient:
+    """Like ``client``, but the simulator itself loads every trace. The fixture
+    archs do not build, so a run's trace is loaded without its pools."""
+    monkeypatch.setattr(
+        simulate,
+        "plan_run",
+        lambda config, build_type="release": workloads.plan(config["workload"], build_type),
+    )
     return _client(sims, _queue(tmp_path, runner))
 
 
@@ -773,7 +822,8 @@ def test_a_generated_session_trace_runs_through_the_simulators_loader(binary_cli
         "text-generation-independent",
         "text-generation-session-execution-v2",
     ]
-    assert "speculative" not in formats[0]["tags"]
+    # An upload may carry its own acceptance.
+    assert "speculative" in formats[0]["tags"]
 
 
 # -- sim preset shape ----------------------------------------------------------
