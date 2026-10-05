@@ -28,7 +28,7 @@ use simulator::log::LoggerSession;
 use simulator::schema::list_params;
 use simulator::sim::{
     run_sim, trace_formats, ArrivalSchedule, CapacityLimit, InputFileFormat, InputFileSchema,
-    LoadedTrace, SessionDependency, TickCfg, TraceFrontend, TraceTag,
+    LoadedTrace, TickCfg, TraceFrontend, TraceTag,
 };
 use simulator::timing::bridge::{print_dry_run, write_config_records, write_dry_run_report};
 use simulator::timing::PerfApiBridge;
@@ -206,15 +206,8 @@ fn load_frontend(workload: &WorkloadSpec) -> Result<TraceFrontend> {
     let input_file_schema = InputFileSchema::new(input_file_format, input_file_tags)?;
     let arrival = ArrivalSchedule::parse(&workload.arrival_mode, workload.request_rate)?;
     let capacity = CapacityLimit::parse(workload.max_concurrency.map(|n| n as usize))?;
-    let session_dependency = SessionDependency::parse(&workload.session_dependency)?;
-    LoadedTrace::load(
-        &workload.trace_files,
-        &input_file_schema,
-        arrival,
-        capacity,
-        session_dependency,
-    )?
-    .into_current_text_frontend()
+    LoadedTrace::load(&workload.trace_files, &input_file_schema, arrival, capacity)?
+        .into_current_text_frontend()
 }
 
 /// Compact wall-clock log timestamp: `[MM:SS.mmm]` (UTC minute-of-hour). Drops

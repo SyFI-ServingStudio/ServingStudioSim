@@ -119,7 +119,6 @@ class Workload(BaseModel):
     # Simulated time to run (ms); with run_to_end, the least it runs.
     duration_ms: float | None = Field(default=None, gt=0)
     run_to_end: bool = True
-    session_dependency: Literal["independent", "chained"] = "independent"
     # A speculative worker's per-request acceptance: one probability for every
     # draft position, or one per position (draft_tokens of them).
     accept_rate: float | list[float] | None = None
@@ -197,7 +196,6 @@ def missing_rows(
         "input_file_format": "text-generation-independent",
         "input_file_tags": ["speculative"] if _speculative_draft(member) else [],
         "arrival_mode": "trace_timed",
-        "session_dependency": "independent",
         "run_to_end": True,
         "request_rate": 1.0,
     }
@@ -336,7 +334,6 @@ def workload_block(
         "arrival_mode": workload.arrival_mode,
         "request_rate": workload.request_rate,
         "run_to_end": workload.run_to_end,
-        "session_dependency": workload.session_dependency,
     }
     if workload.max_concurrency is not None:
         block["max_concurrency"] = workload.max_concurrency

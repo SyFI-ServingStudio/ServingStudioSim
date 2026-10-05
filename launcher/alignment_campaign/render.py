@@ -447,7 +447,6 @@ def simulation_document(
         workload["max_concurrency"] = case.max_concurrency
     if case.rate is not None:
         workload["request_rate"] = case.rate.value
-    workload["session_dependency"] = "independent"
     workload["run_to_end"] = True
 
     arch = dict(variant.arch)

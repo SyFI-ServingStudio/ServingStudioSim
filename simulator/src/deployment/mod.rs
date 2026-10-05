@@ -89,8 +89,7 @@ mod tests {
     use super::*;
 
     const WORKLOAD: &str = "workload: { trace_files: [t.csv], input_file_format: \
-        text-generation-independent, arrival_mode: trace_timed, session_dependency: \
-        independent, duration_ms: 1000.0, run_to_end: true, request_rate: 1.0, \
+        text-generation-independent, arrival_mode: trace_timed, duration_ms: 1000.0, run_to_end: true, request_rate: 1.0, \
         input_file_tags: [TAGS] }\n";
     const IO: &str = "io: { log_dir: logs, log_level: info, quiet: true, \
         force_cache_build: false, log_output_token_times: false }\n";

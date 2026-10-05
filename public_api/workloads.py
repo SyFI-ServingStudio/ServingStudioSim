@@ -229,7 +229,6 @@ class Workloads:
                     "input_file_tags": input_file_tags,
                     # Replay settings are the simulation's; these only read the file.
                     "arrival_mode": "trace_timed",
-                    "session_dependency": "independent",
                     "request_rate": 1.0,
                     "run_to_end": True,
                     "duration_ms": 1.0,

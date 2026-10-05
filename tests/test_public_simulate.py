@@ -704,10 +704,6 @@ def binary_client(sims, trace, tmp_path, runner) -> TestClient:
 
 @pytest.mark.needs_binary
 def test_the_simulator_refuses_what_a_run_would_refuse(binary_client) -> None:
-    # A capture's trace declares no sessions to chain.
-    answer = _post(binary_client, *DENSE, session_dependency="chained", duration_ms=1000.0)
-    assert answer.status_code == 400
-    assert "chained needs the `session` trace tag" in answer.json()["detail"]
     # An upload is read as the format it declares, before it is kept.
     answer = _upload(
         binary_client, _independent(TRACE_ROWS), format="text-generation-session-execution-v2"
@@ -728,7 +724,6 @@ def test_a_generated_session_trace_runs_through_the_simulators_loader(binary_cli
         source="generated",
         generator=generator,
         accept_rate=0.6,
-        session_dependency="chained",
         duration_ms=1000.0,
     )
     assert answer.status_code == 202, answer.json()

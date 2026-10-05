@@ -110,9 +110,8 @@ independent requests, give `"rounds": "1"`:
                "arrival_rate": 2, "seed": 1}}
 ```
 
-For multi-round sessions, set `"session_dependency": "chained"`: each round
-then waits for the previous round to finish and for its tool wait. Without it,
-every round of a session arrives with the session.
+A session trace's rounds always chain: each round waits for the previous round
+to finish and for its tool wait.
 
 **An uploaded CSV** (`"source": "upload"`). Send the file to `POST /workloads`
 with its `format` (and, optionally, comma-separated `tags`), then name the
@@ -145,7 +144,6 @@ takes no `speculative` tag: acceptance is the simulation's `accept_rate`.
 | `arrival_mode` | `trace_timed` | `trace_timed` releases each request at its arrival time divided by `request_rate`; `saturated` releases every request at once. |
 | `request_rate` | 1.0 | Speeds the trace's timeline up (`2.0` is twice the rate). |
 | `max_concurrency` | none | At most this many requests (or sessions, when chained) in flight. |
-| `session_dependency` | `independent` | `chained` makes a session's rounds wait for each other; only a session trace has rounds. |
 | `run_to_end` | true | Run until every request finishes; with false, `duration_ms` of simulated time. |
 | `duration_ms` | none | Simulated milliseconds to run; required when `run_to_end` is false. |
 | `accept_rate` | none | Speculative workers only, and then required: the chance each draft token is accepted, one number for every position or a list of `draft_tokens` numbers, one per position. |

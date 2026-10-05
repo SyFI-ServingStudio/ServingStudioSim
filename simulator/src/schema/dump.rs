@@ -261,15 +261,10 @@ mod tests {
                 .any(|param| param["name"] == "max_concurrency"),
             "max_concurrency is exposed independently of arrival_mode"
         );
-        let session_dependency = workload
-            .iter()
-            .find(|param| param["name"] == "session_dependency")
-            .expect("session_dependency is exposed");
-        assert_eq!(
-            session_dependency["choices"],
-            json!(["independent", "chained"])
-        );
-        assert!(workload.iter().all(|param| param["name"] != "replay_mode"));
+        // The trace decides whether rounds chain.
+        for retired in ["replay_mode", "session_dependency"] {
+            assert!(workload.iter().all(|param| param["name"] != retired));
+        }
     }
 
     #[test]

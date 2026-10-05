@@ -132,15 +132,8 @@ impl TraceFrontend<TextGenerationDefinition> {
         input_file_schema: &InputFileSchema,
         arrival: ArrivalSchedule,
         capacity: CapacityLimit,
-        session_dependency: SessionDependency,
     ) -> Result<Self> {
-        load_typed(
-            files,
-            input_file_schema,
-            arrival,
-            capacity,
-            session_dependency,
-        )
+        load_typed(files, input_file_schema, arrival, capacity)
     }
 }
 
@@ -207,72 +200,35 @@ impl LoadedTrace {
         input_file_schema: &InputFileSchema,
         arrival: ArrivalSchedule,
         capacity: CapacityLimit,
-        session_dependency: SessionDependency,
     ) -> Result<Self> {
         Ok(match input_file_schema.request_family() {
-            RequestFamily::TextGeneration => Self::TextGeneration(load_typed(
-                files,
-                input_file_schema,
-                arrival,
-                capacity,
-                session_dependency,
-            )?),
-            RequestFamily::ImageToText => Self::ImageToText(load_typed(
-                files,
-                input_file_schema,
-                arrival,
-                capacity,
-                session_dependency,
-            )?),
-            RequestFamily::VideoToText => Self::VideoToText(load_typed(
-                files,
-                input_file_schema,
-                arrival,
-                capacity,
-                session_dependency,
-            )?),
-            RequestFamily::AudioToText => Self::AudioToText(load_typed(
-                files,
-                input_file_schema,
-                arrival,
-                capacity,
-                session_dependency,
-            )?),
-            RequestFamily::TextToImage => Self::TextToImage(load_typed(
-                files,
-                input_file_schema,
-                arrival,
-                capacity,
-                session_dependency,
-            )?),
-            RequestFamily::TextToVideo => Self::TextToVideo(load_typed(
-                files,
-                input_file_schema,
-                arrival,
-                capacity,
-                session_dependency,
-            )?),
-            RequestFamily::TextToSpeech => Self::TextToSpeech(load_typed(
-                files,
-                input_file_schema,
-                arrival,
-                capacity,
-                session_dependency,
-            )?),
-            RequestFamily::ImageToVideo => Self::ImageToVideo(load_typed(
-                files,
-                input_file_schema,
-                arrival,
-                capacity,
-                session_dependency,
-            )?),
-            RequestFamily::OmniGeneration => Self::OmniGeneration(load_typed(
-                files,
-                input_file_schema,
-                arrival,
-                capacity,
-                session_dependency,
-            )?),
+            RequestFamily::TextGeneration => {
+                Self::TextGeneration(load_typed(files, input_file_schema, arrival, capacity)?)
+            }
+            RequestFamily::ImageToText => {
+                Self::ImageToText(load_typed(files, input_file_schema, arrival, capacity)?)
+            }
+            RequestFamily::VideoToText => {
+                Self::VideoToText(load_typed(files, input_file_schema, arrival, capacity)?)
+            }
+            RequestFamily::AudioToText => {
+                Self::AudioToText(load_typed(files, input_file_schema, arrival, capacity)?)
+            }
+            RequestFamily::TextToImage => {
+                Self::TextToImage(load_typed(files, input_file_schema, arrival, capacity)?)
+            }
+            RequestFamily::TextToVideo => {
+                Self::TextToVideo(load_typed(files, input_file_schema, arrival, capacity)?)
+            }
+            RequestFamily::TextToSpeech => {
+                Self::TextToSpeech(load_typed(files, input_file_schema, arrival, capacity)?)
+            }
+            RequestFamily::ImageToVideo => {
+                Self::ImageToVideo(load_typed(files, input_file_schema, arrival, capacity)?)
+            }
+            RequestFamily::OmniGeneration => {
+                Self::OmniGeneration(load_typed(files, input_file_schema, arrival, capacity)?)
+            }
         })
     }
 
@@ -341,12 +297,10 @@ fn load_typed<Definition: TraceDefinition>(
     input_file_schema: &InputFileSchema,
     arrival: ArrivalSchedule,
     capacity: CapacityLimit,
-    session_dependency: SessionDependency,
 ) -> Result<TraceFrontend<Definition>> {
     if files.is_empty() {
         bail!("no trace files given (--trace-files)");
     }
-    validate_replay(session_dependency, input_file_schema)?;
     let mut scheduled_requests = Vec::new();
     let mut session_start_times = std::collections::HashMap::new();
     let mut source_identities = schema::SourceIdentities::default();
@@ -367,7 +321,12 @@ fn load_typed<Definition: TraceDefinition>(
         .iter()
         .map(|request| request.release)
         .collect::<Vec<_>>();
-    let replay_scheduler = ReplayScheduler::new(arrival, capacity, session_dependency, &releases);
+    let replay_scheduler = ReplayScheduler::new(
+        arrival,
+        capacity,
+        SessionDependency::of(input_file_schema),
+        &releases,
+    );
     Ok(TraceFrontend {
         scheduled_requests,
         releases,
@@ -376,28 +335,6 @@ fn load_typed<Definition: TraceDefinition>(
         replay_scheduler,
         source_identities,
     })
-}
-
-/// Reject a release configuration that cannot run, before any file is read.
-///
-/// Takes the declaration too, because one axis's precondition is about the data
-/// rather than its own payload: chaining rounds is meaningless on a trace that
-/// declares no sessions. Checking it here rather than at the config call site
-/// means every caller is covered, tests included.
-fn validate_replay(
-    session_dependency: SessionDependency,
-    input_file_schema: &InputFileSchema,
-) -> Result<()> {
-    if session_dependency == SessionDependency::Chained
-        && !input_file_schema.carries(TraceTag::Session)
-        && !input_file_schema.input_file_format.has_session_topology()
-    {
-        bail!(
-            "session_dependency: chained needs the `session` trace tag — without \
-             session columns there are no rounds to chain"
-        );
-    }
-    Ok(())
 }
 
 /// Arrival times must be non-decreasing across rows.
@@ -491,14 +428,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = write_execution_v2(dir.path());
 
-        let frontend = TraceFrontend::load(
-            &[path],
-            &declare_execution_v2(),
-            open_loop(1.0),
-            uncapped(),
-            SessionDependency::Chained,
-        )
-        .unwrap();
+        let frontend =
+            TraceFrontend::load(&[path], &declare_execution_v2(), open_loop(1.0), uncapped())
+                .unwrap();
 
         // Row order, not identifier order: `b` arrives first and gets dense 0.
         assert_eq!(
@@ -520,14 +452,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = write_execution_v2(dir.path());
 
-        let frontend = TraceFrontend::load(
-            &[path],
-            &declare_execution_v2(),
-            open_loop(1.0),
-            uncapped(),
-            SessionDependency::Chained,
-        )
-        .unwrap();
+        let frontend =
+            TraceFrontend::load(&[path], &declare_execution_v2(), open_loop(1.0), uncapped())
+                .unwrap();
         let plan = frontend.plan_rows();
 
         assert_eq!(plan.len(), 3);
@@ -557,14 +484,9 @@ mod tests {
         )
         .unwrap();
 
-        let error = TraceFrontend::load(
-            &[path],
-            &declare_execution_v2(),
-            open_loop(1.0),
-            uncapped(),
-            SessionDependency::Chained,
-        )
-        .unwrap_err();
+        let error =
+            TraceFrontend::load(&[path], &declare_execution_v2(), open_loop(1.0), uncapped())
+                .unwrap_err();
         let error = format!("{error:#}");
 
         assert!(error.contains("no previous context"), "{error}");
@@ -599,7 +521,6 @@ mod tests {
             &declaration,
             open_loop(1.0),
             uncapped(),
-            SessionDependency::Chained,
         )
         .unwrap();
 
@@ -613,15 +534,10 @@ mod tests {
 
         // And the same file without the declaration is refused rather than
         // parsed with two columns nobody reads.
-        let error = TraceFrontend::load(
-            &[path],
-            &declare_execution_v2(),
-            open_loop(1.0),
-            uncapped(),
-            SessionDependency::Chained,
-        )
-        .unwrap_err()
-        .to_string();
+        let error =
+            TraceFrontend::load(&[path], &declare_execution_v2(), open_loop(1.0), uncapped())
+                .unwrap_err()
+                .to_string();
         assert!(error.contains("ttft_slo_ms"), "{error}");
     }
 
@@ -681,7 +597,6 @@ mod tests {
             &InputFileSchema::text_generation_independent(),
             arrival,
             uncapped(),
-            SessionDependency::Independent,
         )
     }
 
@@ -826,7 +741,6 @@ mod tests {
             &InputFileSchema::text_generation_independent(),
             ArrivalSchedule::saturated(),
             capped(2),
-            SessionDependency::Independent,
         )
         .unwrap();
         assert_eq!(
@@ -887,7 +801,6 @@ mod tests {
             &declare("text_generation", &["session"]),
             open_loop(1.0),
             uncapped(),
-            SessionDependency::Chained,
         )
         .unwrap();
 
@@ -923,7 +836,6 @@ mod tests {
             &declare("text_generation", &["session"]),
             open_loop(1.0),
             uncapped(),
-            SessionDependency::Chained,
         )
         .unwrap();
         assert_eq!(
@@ -965,7 +877,6 @@ mod tests {
             &declare("text_generation", &["session"]),
             ArrivalSchedule::saturated(),
             capped(2),
-            SessionDependency::Chained,
         )
         .unwrap();
 
@@ -1020,7 +931,6 @@ mod tests {
             &declare("text_generation", &["session"]),
             open_loop(1.0),
             capped(2),
-            SessionDependency::Chained,
         )
         .unwrap();
 
@@ -1072,7 +982,6 @@ mod tests {
             &declare("text_generation", &["session"]),
             open_loop(1.0),
             capped(1),
-            SessionDependency::Chained,
         )
         .unwrap();
 
@@ -1113,7 +1022,6 @@ mod tests {
             &InputFileSchema::text_generation_independent(),
             open_loop(1.0),
             capped(2),
-            SessionDependency::Independent,
         )
         .unwrap();
 
@@ -1161,7 +1069,6 @@ mod tests {
             &declare("text_generation", &["session"]),
             open_loop(1.0),
             uncapped(),
-            SessionDependency::Chained,
         )
         .unwrap();
         let mut open = load_text(&[open], 1.0).unwrap();
@@ -1171,25 +1078,24 @@ mod tests {
         assert!(chained.exhausted() && open.exhausted());
     }
 
-    /// Asking for chaining on a trace that declares no sessions is a hard error,
-    /// not a silent degrade — the run would look like it chained and would not.
+    /// The trace decides: rounds chain exactly when it declares sessions.
     #[test]
-    fn rejects_chained_dependency_without_the_session_tag() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = write_csv(
-            dir.path(),
-            "nosession.csv",
-            "id,input_len,output_len,arrival_time\n0,8,2,0.0\n",
-        );
-        let err = TraceFrontend::load(
-            &[path],
-            &InputFileSchema::text_generation_independent(),
-            open_loop(1.0),
-            uncapped(),
-            SessionDependency::Chained,
+    fn a_trace_chains_its_rounds_exactly_when_it_has_sessions() {
+        let independent = InputFileSchema::text_generation_independent();
+        let tagged = InputFileSchema::new(
+            InputFileFormat::TextGenerationIndependent,
+            vec![TraceTag::Session],
         )
-        .unwrap_err();
-        assert!(err.to_string().contains("`session` trace tag"));
+        .unwrap();
+        let rounds =
+            InputFileSchema::new(InputFileFormat::TextGenerationSessionExecutionV2, vec![])
+                .unwrap();
+        assert_eq!(
+            SessionDependency::of(&independent),
+            SessionDependency::Independent
+        );
+        assert_eq!(SessionDependency::of(&tagged), SessionDependency::Chained);
+        assert_eq!(SessionDependency::of(&rounds), SessionDependency::Chained);
     }
 
     // ---- declared replay axes ----------------------------------------------
@@ -1214,9 +1120,6 @@ mod tests {
         for name in ArrivalSchedule::CONFIG_CHOICES {
             ArrivalSchedule::parse(name, 1.0).unwrap();
         }
-        for name in SessionDependency::CHOICES {
-            SessionDependency::parse(name).unwrap();
-        }
         // A cap is optional under either arrival mode, and composes with both.
         assert_eq!(
             CapacityLimit::parse(None).unwrap(),
@@ -1225,8 +1128,6 @@ mod tests {
         assert!(CapacityLimit::parse(Some(4)).is_ok());
         assert!(ArrivalSchedule::parse("teleport", 1.0).is_err());
         assert!(ArrivalSchedule::parse("session_chain", 1.0).is_err());
-        assert!(SessionDependency::parse("causal-ish").is_err());
-        assert!(SessionDependency::parse("session_chain").is_err());
     }
 
     // ---- declared schema ----------------------------------------------------
@@ -1280,7 +1181,6 @@ mod tests {
             ),
             open_loop(1.0),
             uncapped(),
-            SessionDependency::Independent,
         )
         .unwrap();
         let scheduled_request = &fe.scheduled_requests[0];
@@ -1340,7 +1240,6 @@ mod tests {
             &declare("image_to_text", &[]),
             open_loop(1.0),
             uncapped(),
-            SessionDependency::Independent,
         )
         .unwrap();
         assert!(loaded
@@ -1369,7 +1268,6 @@ mod tests {
             &declare("text_generation", &["session", "slo", "priority"]),
             open_loop(1.0),
             uncapped(),
-            SessionDependency::Independent,
         )
         .unwrap();
         assert!(fe.scheduled_requests[0].release.session.is_none());
@@ -1396,7 +1294,6 @@ mod tests {
             &declare("text_generation", &["slo"]),
             open_loop(1.0),
             uncapped(),
-            SessionDependency::Independent,
         )
         .unwrap_err()
         .to_string();
@@ -1422,7 +1319,6 @@ mod tests {
             &declare("image_to_text", &[]),
             open_loop(1.0),
             uncapped(),
-            SessionDependency::Independent,
         )
         .unwrap() else {
             panic!("expected image-to-text frontend");
@@ -1461,7 +1357,6 @@ mod tests {
             &declare("audio_to_text", &[]),
             open_loop(1.0),
             uncapped(),
-            SessionDependency::Independent,
         )
         .unwrap() else {
             panic!("expected audio-to-text frontend");
@@ -1496,7 +1391,6 @@ mod tests {
             &declare("text_to_video", &[]),
             open_loop(1.0),
             uncapped(),
-            SessionDependency::Independent,
         )
         .unwrap() else {
             panic!("expected text-to-video frontend");
@@ -1536,7 +1430,6 @@ mod tests {
             &declare("image_to_video", &[]),
             open_loop(1.0),
             uncapped(),
-            SessionDependency::Independent,
         )
         .unwrap() else {
             panic!("expected image-to-video frontend");
@@ -1617,7 +1510,6 @@ mod tests {
             &declare("omni_generation", &[]),
             open_loop(1.0),
             uncapped(),
-            SessionDependency::Independent,
         )
         .unwrap() else {
             panic!("expected omni-generation frontend");
@@ -1641,7 +1533,6 @@ mod tests {
             &declare("omni_generation", &[]),
             open_loop(1.0),
             uncapped(),
-            SessionDependency::Independent,
         )
         .unwrap_err();
         assert!(error.to_string().contains("input_segments"));
@@ -1700,7 +1591,6 @@ mod tests {
             &declare("text_generation", &["slo"]),
             open_loop(1.0),
             uncapped(),
-            SessionDependency::Independent,
         )
         .unwrap_err();
         let message = err.to_string();
@@ -1725,7 +1615,6 @@ mod tests {
             &declare("text_to_image", &[]),
             open_loop(1.0),
             uncapped(),
-            SessionDependency::Independent,
         )
         .unwrap_err();
         let message = err.to_string();
@@ -1765,7 +1654,6 @@ mod tests {
             &declare("text_to_video", &[]),
             open_loop(1.0),
             uncapped(),
-            SessionDependency::Independent,
         )
         .unwrap_err();
         assert!(err.to_string().contains("greater than zero"));

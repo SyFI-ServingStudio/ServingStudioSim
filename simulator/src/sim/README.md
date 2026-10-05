@@ -30,10 +30,13 @@ For the layer overview see `doc/detailed_design/L7.md`.
     request otherwise. A unit that the cap held back is stamped with the instant
     its slot opened, not its trace arrival, so it is not charged for a wait the
     measured runner does not report either.
-  - **Session dependency** —
-    `session_dependency: independent | chained`. Independent rows have no causal
-    gate. Chained session heads follow the arrival mode and the cap, while each
-    successor waits for predecessor completion plus `tool_wait_after_ms`.
+  - **Session dependency** — set by the trace, not the config: a trace with
+    sessions (the `session` tag, or a format whose rows are rounds) chains them,
+    and one without has none to chain. Independent rows have no causal gate.
+    Chained session heads follow the arrival mode and the cap, while each
+    successor waits for predecessor completion plus `tool_wait_after_ms`. A
+    later round's own arrival is its session's, so replaying it independently
+    would release a whole conversation at once.
 
   All combinations are valid; the axes were deliberately split apart because a
   capped replay of a recorded timeline is a real workload and a single fused

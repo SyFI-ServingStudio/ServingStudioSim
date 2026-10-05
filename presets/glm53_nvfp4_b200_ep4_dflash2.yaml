@@ -23,7 +23,6 @@ workload:
   input_file_format: text-generation-independent
   input_file_tags: [speculative]
   arrival_mode: trace_timed
-  session_dependency: independent
   run_to_end: true
 
 io:

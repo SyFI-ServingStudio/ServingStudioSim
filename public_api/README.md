@@ -141,7 +141,6 @@ POST /api/public/v1/simulate
     "max_concurrency": null,
     "duration_ms": null,          // required when run_to_end is false
     "run_to_end": true,
-    "session_dependency": "independent",
     "accept_rate": null           // speculative workers only: one probability, or one per draft position
   }
 }

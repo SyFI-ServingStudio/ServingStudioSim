@@ -12,7 +12,6 @@ workload:
   # ServingStudioSim scales trace_timed timestamps by request_rate, so 1.0 is required
   # to preserve them exactly.
   request_rate: 1.0
-  session_dependency: independent
   run_to_end: true
 
 io:

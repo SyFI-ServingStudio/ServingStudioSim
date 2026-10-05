@@ -176,13 +176,6 @@ _FIXTURE = {
                 "choices": ["trace_timed", "saturated"],
                 "description": "",
             },
-            {
-                "name": "session_dependency",
-                "type": "string",
-                "required": True,
-                "choices": ["independent", "chained"],
-                "description": "",
-            },
         ],
         "io": [
             {"name": "log_dir", "type": "path", "default": "logs", "description": ""},
@@ -218,7 +211,6 @@ def _base(*, arch=None, worker=None, log_dir="logs/x", **extra):
             "trace_files": ["t.csv"],
             "input_file_format": "text-generation-independent",
             "arrival_mode": "trace_timed",
-            "session_dependency": "independent",
         },
         "io": {"log_dir": log_dir},
         "pools": {
@@ -454,12 +446,11 @@ def test_validate_rejects_legacy_replay_mode(schema):
     assert any("workload.replay_mode" in error and "unknown" in error for error in errs)
 
 
-@pytest.mark.parametrize("axis", ["arrival_mode", "session_dependency"])
-def test_validate_requires_both_replay_axes(schema, axis):
+def test_validate_requires_the_arrival_mode(schema):
     preset = _base()
-    del preset["workload"][axis]
+    del preset["workload"]["arrival_mode"]
     errs = validate_params(preset, schema)
-    assert any(axis in error and "required" in error for error in errs)
+    assert any("arrival_mode" in error and "required" in error for error in errs)
 
 
 def test_validate_unknown_arch_payload_key(schema):
@@ -1372,7 +1363,6 @@ def test_readme_worked_example(schema):
             "trace_files": ["trace/aime_long.csv"],
             "input_file_format": "text-generation-independent",
             "arrival_mode": "trace_timed",
-            "session_dependency": "independent",
         },
         "io": {"log_dir": "logs/pd_{prefill_tp}_d{decode_tp}tp_r{decode_replicas}_{batch}"},
         "pools": {
@@ -1781,7 +1771,6 @@ def test_logged_process_captures_stdout(tmp_path):
                     "run_to_end": False,
                     "request_rate": 10.0,
                     "arrival_mode": "trace_timed",
-                    "session_dependency": "independent",
                 },
                 "io": {
                     "log_dir": str(tmp_path),

@@ -226,7 +226,6 @@ workload:                        # run-global workload params
   trace_files: ["trace/smoke.csv"]
   input_file_format: text-generation-independent
   arrival_mode: trace_timed
-  session_dependency: independent
 io:                              # run-global output + logging
   log_dir: "logs/tp{tensor_parallel}"   # {name} drops a sweep value into the path
 pools:
@@ -378,7 +377,6 @@ workload:
     - trace/aime_long.csv
   input_file_format: text-generation-independent
   arrival_mode: trace_timed
-  session_dependency: independent
   duration_ms: 20000.0
   run_to_end: true
   request_rate: 12.0
