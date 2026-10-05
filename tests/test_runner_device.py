@@ -13,7 +13,11 @@ from types import SimpleNamespace
 import pytest
 from fixtures.fake_torch import fake_cuda_torch
 
-from profiling.db.registry import BackendSupport, iter_kernel_profiler_specs
+from profiling.db.registry import (
+    BackendSupport,
+    find_kernel_profiler_spec,
+    iter_kernel_profiler_specs,
+)
 from profiling.runners.device import require_cuda_toolkit, unsupported_device
 from profiling.runners.exceptions import ProfilerNotImplemented
 
@@ -23,34 +27,38 @@ def _install_torch(monkeypatch, capability, *, name="NVIDIA GPU", available=True
     monkeypatch.setitem(sys.modules, "torch", torch)
 
 
-_GATED = sorted(
-    (
-        pytest.param(
-            spec.kernel_kind, spec.backend, spec.supports, id=f"{spec.kernel_kind}-{spec.backend}"
-        )
-        for spec in iter_kernel_profiler_specs()
-        if spec.supports.device_rule() is not None
-    ),
-    key=lambda param: param.id,
+_CAPABILITIES = ((8, 0), (8, 9), (9, 0), (10, 0), (10, 3), (12, 0))
+# Expected admission on each capability above, one row per kind of rule. The
+# truth is written out, not recomputed from BackendSupport, so a wrong
+# declaration or a wrong capability match both fail here.
+_PINNED = {
+    ("mxfp4_marlin_moe_gemm", "vllm_marlin"): "YYYYYY",  # 8.0+
+    ("kv_compress_store", "vllm_triton"): "-YYYYY",  # 8.9+
+    ("nvfp4_quant", "vllm_cuda"): "---YYY",  # 10.0+
+    ("all_reduce_fusion", "flashinfer_mnnvl"): "---Y--",  # sm_100a
+    ("nvfp4_fused_moe", "flashinfer_trtllm_sm100"): "---YY-",  # sm_100f
+    ("gdn_chunk_delta_rule", "flashinfer"): "--Y---",  # sm_90a
+    ("dsa_sparse_mla_attention", "vllm_flashmla_bf16"): "--YYY-",  # sm_90a, sm_100f
+    ("dsa_paged_mqa_logits_decode", "deepgemm_fp8"): "--YYYY",  # + sm_120f
+}
+
+
+@pytest.mark.parametrize(
+    ("kind", "backend", "admitted"),
+    [pytest.param(*key, row, id=f"{key[0]}-{key[1]}") for key, row in _PINNED.items()],
 )
-
-
-@pytest.mark.parametrize(("kind", "backend", "supports"), _GATED)
-@pytest.mark.parametrize("capability", [(8, 0), (8, 9), (9, 0), (10, 0), (10, 3), (12, 0)])
-def test_every_gated_backend_is_refused_exactly_where_its_support_says(
-    monkeypatch, kind, backend, supports, capability
-):
-    # Catches a worker gate that disagrees with the declaration the launcher
-    # and the public catalog read.
-    _install_torch(monkeypatch, capability, name="NVIDIA Test")
-    error = unsupported_device(supports, f"{kind} {backend}")
-    if supports.allows_compute_capability(capability):
-        assert error is None
-    else:
-        assert error == (
-            f"{kind} {backend} needs {supports.device_rule()}, "
-            f"got NVIDIA Test with SM{capability[0]}{capability[1]}"
-        )
+def test_named_backends_are_admitted_exactly_where_pinned(monkeypatch, kind, backend, admitted):
+    supports = find_kernel_profiler_spec(kind, backend).supports
+    for capability, mark in zip(_CAPABILITIES, admitted, strict=True):
+        _install_torch(monkeypatch, capability, name="NVIDIA Test")
+        error = unsupported_device(supports, f"{kind} {backend}")
+        if mark == "Y":
+            assert error is None, capability
+        else:
+            assert error == (
+                f"{kind} {backend} needs {supports.device_rule()}, "
+                f"got NVIDIA Test with SM{capability[0]}{capability[1]}"
+            ), capability
 
 
 def test_the_sm10x_family_and_the_fp8_floor_are_capability_rules(monkeypatch):
