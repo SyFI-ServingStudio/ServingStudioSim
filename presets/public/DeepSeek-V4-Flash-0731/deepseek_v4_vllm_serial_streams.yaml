@@ -9,7 +9,7 @@ compound:
   workload:
     shape_grid_128:
       routing: popularity
-      expert_popularity_file: hf://datasets/UW-SyFI/servingstudio-workload@9498d838a0cb1793980d8bf90998eb7f9722fb2d/deepseek_v4_flash/vllm/shape_grid_128/capture/20260822/popularity.json
+      expert_popularity_file: hf://datasets/UW-SyFI/servingstudio-workload@c3f5ecaab0bbff757c64864bf2ec24f5e1f76b5c/deepseek_v4_flash/vllm/shape_grid_128/capture/20260822/popularity.json
     uniform:
       routing: uniform
       expert_popularity_file: null

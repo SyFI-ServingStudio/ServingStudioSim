@@ -9,4 +9,4 @@ compound:
   workload:
     ctx8k_out1k:
       routing: popularity
-      expert_popularity_file: hf://datasets/UW-SyFI/servingstudio-workload@9498d838a0cb1793980d8bf90998eb7f9722fb2d/qwen36_35b_a3b_fp8/vllm/ctx8k_out1k/capture/20260818/popularity.json
+      expert_popularity_file: hf://datasets/UW-SyFI/servingstudio-workload@c3f5ecaab0bbff757c64864bf2ec24f5e1f76b5c/qwen36_35b_a3b_fp8/vllm/ctx8k_out1k/capture/20260818/popularity.json
