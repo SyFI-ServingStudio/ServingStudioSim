@@ -1025,6 +1025,50 @@ async fn prediction_http_routes_publish_catalog_descriptor_cases_and_problem_jso
         .is_some_and(|detail| !detail.contains(temporary.path().to_string_lossy().as_ref())));
 }
 
+#[tokio::test]
+async fn prediction_subject_routes_read_what_the_analysis_wrote_by_registry_name() {
+    let temporary = TempDir::new().expect("temporary logs root");
+    let prediction_path = temporary.path().join("predict-llama");
+    make_prediction(&prediction_path, "p_subjects");
+    fs::create_dir_all(prediction_path.join("reports")).unwrap();
+    fs::create_dir_all(prediction_path.join("payloads")).unwrap();
+    fs::write(
+        prediction_path.join("payloads/kernel_time_share_composition.json"),
+        r#"{"available": true, "overall": {"kernel_time_ms": 2.0, "segments": [
+            {"position": "m.mlp", "kind": "single_gemm", "kernel_time_ms": 1.5, "share_pct": 75.0}
+        ]}}"#,
+    )
+    .unwrap();
+    fs::write(
+        prediction_path.join("reports/slo_general_report.json"),
+        r#"{"available": false, "reason": "no requests"}"#,
+    )
+    .unwrap();
+    let router = prediction_test_router(temporary.path());
+    let base = "/api/analyzer/v1/predictions/p_subjects/subjects";
+
+    let (status, share) =
+        get_json(router.clone(), &format!("{base}/kernel-time-share/payload")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(share["overall"]["segments"][0]["position"], "m.mlp");
+
+    // A subject that does not apply is served as the analysis wrote it.
+    let (status, slo) = get_json(router.clone(), &format!("{base}/slo-general/report")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(slo["available"], false);
+
+    // Not run, or not a subject: 404, and the name never becomes a path.
+    for subject in [
+        "kernel-time-share/report",
+        "no-such-subject/payload",
+        "..%2Freports/payload",
+    ] {
+        let (status, missing) = get_json(router.clone(), &format!("{base}/{subject}")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{subject}");
+        assert_eq!(missing["code"], "artifact_missing", "{subject}");
+    }
+}
+
 #[test]
 fn prediction_discovery_skips_duplicate_ids_and_ignores_old_logs() {
     let temporary = TempDir::new().expect("temporary logs root");
