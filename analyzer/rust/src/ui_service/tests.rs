@@ -2742,7 +2742,7 @@ async fn kernel_profile_http_routes_publish_descriptor_and_enriched_curve() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(descriptor["kind"], "kernel_profile");
-    assert_eq!(descriptor["workspace_id"], "root_0");
+    assert_eq!(descriptor["workspace_id"], "w_root_0");
     assert_eq!(descriptor["kernel"]["metric_family"], "compute");
     assert_eq!(descriptor["gpu"]["cache_key"], "NVIDIA H200");
     assert_eq!(descriptor["gpu"]["observed_name"], "NVIDIA H200");
@@ -2793,7 +2793,7 @@ async fn kernel_measurement_http_routes_publish_descriptor_summary_and_plot() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(descriptor["kind"], "kernel_measurement");
-    assert_eq!(descriptor["workspace_id"], "root_0");
+    assert_eq!(descriptor["workspace_id"], "w_root_0");
     assert_eq!(descriptor["gpu"]["observed_name"], "NVIDIA H200");
     assert_eq!(descriptor["gpu_provenance"]["source"], "measurement");
     assert_eq!(descriptor["duration_s"], 10.0);

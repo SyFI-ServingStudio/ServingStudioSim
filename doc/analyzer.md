@@ -513,6 +513,9 @@ logs roots. The service reloads it for discovery, scans only active workspaces,
 and publishes `workspace_id` on every run/sweep catalog entry and payload.
 Opaque `run_id` and `sweep_id` are therefore interpreted only together with
 their workspace id; clients must not resolve an id against another workspace.
+Static `--logs-root` roots are named `w_root_0`, `w_root_1`, ... in flag order,
+the same `w_*` form a registry id must take, so a client addresses either kind
+of workspace the same way.
 
 A managed Launcher run writes `experiment.meta.json` at the experiment root:
 
