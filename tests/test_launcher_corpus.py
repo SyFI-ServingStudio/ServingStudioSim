@@ -223,7 +223,7 @@ def test_the_resolved_copy_is_written_only_under_the_run_directory_lease(
     monkeypatch.setattr(timing_predict, "binary_path", stop)
 
     with pytest.raises(Stop):
-        asyncio.run(timing_predict.run_one(config_path, "release", analyze=False))
+        asyncio.run(timing_predict.run_one(config_path, "release", analysis="none"))
 
     assert seen_before_lease == [False]
     assert copy.is_file()

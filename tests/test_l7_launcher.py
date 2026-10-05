@@ -27,6 +27,7 @@ from launcher.exec import (
     _run_capture,
     binary_path,
     run_analysis,
+    run_essential_analysis,
     run_iter_breakdown,
     run_logged_process,
     run_sweep_analysis,
@@ -425,6 +426,36 @@ def test_iter_breakdown_uses_shared_process_supervisor(monkeypatch, tmp_path):
         [str(analyzer_path), "gen-iter-breakdown", str(log_dir), "--max-iters", str(2**31)]
     ]
     assert "generated" in (log_dir / "stdout.log").read_text()
+
+
+def test_essential_analysis_runs_only_the_breakdown_and_the_kernel_ranking(monkeypatch, tmp_path):
+    analyzer_path = tmp_path / "analyze"
+    analyzer_path.write_text("")
+    log_dir = tmp_path / "prediction"
+    log_dir.mkdir()
+    captured_commands: list[list[str]] = []
+
+    async def supervise(spec):
+        command = [str(argument) for argument in spec.argv]
+        captured_commands.append(command)
+        return ProcessResult(
+            argv=tuple(command),
+            pid=1,
+            process_group_id=1,
+            exit_code=0,
+            elapsed_seconds=0.0,
+            output="",
+        )
+
+    monkeypatch.setattr("launcher.exec.analyzer_binary_path", lambda _build_type: analyzer_path)
+    monkeypatch.setattr("launcher.exec._PROCESS_SUPERVISOR.run", supervise)
+
+    asyncio.run(run_essential_analysis(log_dir))
+
+    assert captured_commands == [
+        [str(analyzer_path), "gen-iter-breakdown", str(log_dir), "--max-iters", str(2**31)],
+        [str(analyzer_path), "run", str(log_dir), "kernel-time-share"],
+    ]
 
 
 # ── validation ──────────────────────────────────────────────────────────────

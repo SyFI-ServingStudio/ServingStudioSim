@@ -43,6 +43,7 @@ from .exec import (
     binary_path,
     cargo_build,
     run_analysis,
+    run_essential_analysis,
     run_iter_breakdown,
     run_logged_process,
 )
@@ -339,11 +340,19 @@ def _binary_config(config_path: Path, resolved: dict | None, log_dir: Path) -> P
     return copy
 
 
+# How much of the Analyzer runs after a prediction: "full" (every applicable
+# subject, the trace, the plots unless --no-plot, and the iteration breakdown),
+# "essential" (--analyzer-essential-only: the breakdown and the kernel ranking,
+# `run_essential_analysis`), or "none" (--no-analyze).
+ANALYSIS_LEVELS = ("full", "essential", "none")
+
+
 async def run_one(
-    config_path: Path, build_type: str, analyze: bool, *, render: bool = True
+    config_path: Path, build_type: str, analysis: str = "full", *, render: bool = True
 ) -> bool:
-    """Run one already-built predictor config. ``render=False`` (``--no-plot``)
-    keeps the analysis but draws no PNGs.
+    """Run one already-built predictor config with ``analysis`` (one of
+    ANALYSIS_LEVELS). ``render=False`` (``--no-plot``) keeps a full analysis
+    but draws no PNGs.
 
     Public so the alignment timing-predict stage can reuse the exact predictor
     execution/snapshot path.
@@ -441,17 +450,19 @@ async def run_one(
             result=result,
             artifacts=validation.paths,
         )
-        if analyze:
-            if managed_job is not None:
-                managed_job.report("analysis_running")
+        if analysis != "none" and managed_job is not None:
+            managed_job.report("analysis_running")
+        if analysis == "full":
             # Best-effort: `analyze trace` (the Perfetto tree) + `analyze run`. Cost
             # subjects apply; request/throughput subjects self-skip on a predict dir.
             await run_analysis(log_dir, build_type, render=render)
-        # Predict-only, analyzed or not: the cost tree per case, with each node's
-        # time and share (reports/iter_breakdown.ans and its JSON twin). Not in the
-        # shared run_analysis — a real run's thousands of iters would make that file
-        # enormous; a predict dir has only a few cases.
-        await run_iter_breakdown(log_dir, build_type)
+            # Predict-only: the cost tree per case, with each node's time and share
+            # (reports/iter_breakdown.ans and its JSON twin). Not in the shared
+            # run_analysis — a real run's thousands of iters would make that file
+            # enormous; a predict dir has only a few cases.
+            await run_iter_breakdown(log_dir, build_type)
+        elif analysis == "essential":
+            await run_essential_analysis(log_dir, build_type)
         if managed_job is not None:
             managed_job.report("ready", summary=descriptor)
         return True
@@ -533,7 +544,7 @@ def dry_run_report(config_path: Path, build_type: str) -> tuple[str, dict | None
 
 def main(argv: list[str]) -> int:
     build_type = "release"
-    analyze = True
+    analysis = "full"
     render = True
     dry_run = False
     configs: list[str] = []
@@ -543,8 +554,13 @@ def main(argv: list[str]) -> int:
             build_type = next(it, "")
             if not build_type:
                 sys.exit("timing-predict: --build-type needs a value")
-        elif tok == "--no-analyze":
-            analyze = False
+        elif tok in ("--no-analyze", "--analyzer-essential-only"):
+            level = "none" if tok == "--no-analyze" else "essential"
+            if analysis not in ("full", level):
+                sys.exit(
+                    "timing-predict: --no-analyze and --analyzer-essential-only exclude each other"
+                )
+            analysis = level
         elif tok == "--no-plot":
             render = False
         elif tok == "--dry-run":
@@ -561,7 +577,7 @@ def main(argv: list[str]) -> int:
         )
 
     # INV-8: the single shared build (also produces the analyzer binary).
-    if not cargo_build(build_type, build_analyzer=analyze and not dry_run):
+    if not cargo_build(build_type, build_analyzer=analysis != "none" and not dry_run):
         sys.exit("build failed (see errors above)")
 
     rc = 0
@@ -576,7 +592,7 @@ def main(argv: list[str]) -> int:
                 print(f"[dry-run] {c}")
                 succeeded = dry_run_one(config_path, build_type)
             else:
-                succeeded = asyncio.run(run_one(config_path, build_type, analyze, render=render))
+                succeeded = asyncio.run(run_one(config_path, build_type, analysis, render=render))
         except ValueError as exc:
             # Only the dry run reports a config error this way; a real run's
             # ValueError is raised after launch and keeps its traceback.

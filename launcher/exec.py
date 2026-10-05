@@ -649,19 +649,37 @@ async def run_iter_breakdown(log_dir: Path, build_type: str = "debug") -> None:
     cases. The verb itself is general (`analyze gen-iter-breakdown <dir>` works on
     any artifact dir); only the *automatic* emission is predict-scoped. Failures
     warn and return (analysis never fails an otherwise-successful run)."""
-    analyzer = analyzer_binary_path(build_type)
-    if not analyzer.exists():
-        print(f"[analyze] {analyzer} not built; skipping iter-breakdown for {log_dir}")
-        return
     # Every row: a predict dir holds one per case and section, and its readers
     # take each case's tree from the JSON twin.
-    argv = [str(analyzer), "gen-iter-breakdown", str(log_dir), "--max-iters", str(2**31)]
-    rc, out = await _run_capture(argv)
-    stdout_log = log_dir / "stdout.log"
+    await _run_analyzer_step(log_dir, build_type, "gen-iter-breakdown", "--max-iters", str(2**31))
+
+
+# What a timing prediction's reader needs and nothing more: the cost tree with
+# each node's time (`run_iter_breakdown`) and the kernels ranked by their share
+# of it (`kernel-time-share`). Milliseconds, against the ~1 s full analysis.
+ESSENTIAL_SUBJECTS = ("kernel-time-share",)
+
+
+async def run_essential_analysis(log_dir: Path, build_type: str = "debug") -> None:
+    """Best-effort: the iteration breakdown plus `analyze run` of only the
+    ESSENTIAL_SUBJECTS, no trace and no plots."""
+    await run_iter_breakdown(log_dir, build_type)
+    await _run_analyzer_step(log_dir, build_type, "run", *ESSENTIAL_SUBJECTS)
+
+
+async def _run_analyzer_step(log_dir: Path, build_type: str, verb: str, *args: str) -> None:
+    """`analyze <verb> <log_dir> <args>`, its output appended to the run's
+    `stdout.log`. Failures warn and return (analysis never fails an
+    otherwise-successful run)."""
+    analyzer = analyzer_binary_path(build_type)
+    if not analyzer.exists():
+        print(f"[analyze] {analyzer} not built; skipping {verb} for {log_dir}")
+        return
+    rc, out = await _run_capture([str(analyzer), verb, str(log_dir), *args])
     if out:
-        with stdout_log.open("a") as fh:
-            fh.write(f"\n=== analyze gen-iter-breakdown ===\n{out}")
+        with (log_dir / "stdout.log").open("a") as fh:
+            fh.write(f"\n=== analyze {verb} ===\n{out}")
             if not out.endswith("\n"):
                 fh.write("\n")
     if rc != 0:
-        print(f"[analyze] gen-iter-breakdown failed for {log_dir}:\n{out}")
+        print(f"[analyze] {verb} failed for {log_dir}:\n{out}")

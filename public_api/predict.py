@@ -12,7 +12,12 @@ needed a GPU, instead of profiling it. Nothing writes profile.db.
 
 The answer is per case, per section: the total, the cost tree with each node's
 time as the Analyzer reads it (``analyze gen-iter-breakdown``), and each slot's
-backend and coverage by the slot index of :meth:`DeploymentIndex.tree`.
+backend and coverage by the slot index of :meth:`DeploymentIndex.tree`. Beside
+the cases, ``kernel_time_share`` is the Analyzer's ``kernel-time-share`` over
+all of them: every slot name's time, its layers summed, critical path only,
+largest first, and their sums by kernel kind (``kinds``). A run that is not
+analyzed runs only these two
+(``--analyzer-essential-only``).
 
 :func:`missing_specs` asks the same launcher entry, as a dry run, which profile.db
 rows the member's kernels lack; a member that lacks any is not predictable.
@@ -145,7 +150,9 @@ def predict(
         log_dir = runs_dir / uuid.uuid4().hex if analyze else scratch / "out"
         config = _write_config(member, cases, scratch, log_dir)
         try:
-            run = launcher.run_one(config, build_type, analyze=analyze, render=False)
+            run = launcher.run_one(
+                config, build_type, "full" if analyze else "essential", render=False
+            )
             if not asyncio.run(run):
                 log = log_dir / "stdout.log"
                 text = log.read_text(errors="replace") if log.exists() else ""
@@ -223,4 +230,6 @@ def _read(member: Member, cases: list, log_dir: Path) -> dict:
                 "coverage": flags,
             }
         )
-    return {"cases": out}
+    # The Analyzer's kernel ranking over every case (`kernel-time-share`).
+    share = json.loads((log_dir / "payloads" / "kernel_time_share_composition.json").read_text())
+    return {"cases": out, "kernel_time_share": share["overall"]}
