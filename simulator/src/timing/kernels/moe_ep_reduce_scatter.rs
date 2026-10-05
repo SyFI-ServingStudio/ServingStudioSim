@@ -42,8 +42,8 @@ impl KernelSpec for MoeEpReduceScatterSpec {
     }
 
     fn infeasible_mask(config: &Self::Config, grid: &SweepGrid) -> Vec<bool> {
-        grid.expand_2d(|total, maximum| {
-            canonical_tokens(config.num_gpus, total as u32, maximum as u32).is_none()
+        grid.expand_2d(|total, ragged_max| {
+            canonical_tokens(config.num_gpus, total as u32, ragged_max as u32).is_none()
         })
     }
 
@@ -55,9 +55,10 @@ impl KernelSpec for MoeEpReduceScatterSpec {
         assert!(matches!(config.num_gpus, 2 | 4 | 8));
         assert_eq!(config.dtype, DType::Bf16);
         assert_eq!(config.fabric, "nvlink");
-        grid.expand_2d(|total, maximum| {
-            let per_rank_tokens = canonical_tokens(config.num_gpus, total as u32, maximum as u32)
-                .unwrap_or_else(|| vec![total as u32; config.num_gpus as usize]);
+        grid.expand_2d(|total, ragged_max| {
+            let per_rank_tokens =
+                canonical_tokens(config.num_gpus, total as u32, ragged_max as u32)
+                    .unwrap_or_else(|| vec![total as u32; config.num_gpus as usize]);
             ArgsPayload::new()
                 .with("backend", backend)
                 .with("num_gpus", config.num_gpus)
