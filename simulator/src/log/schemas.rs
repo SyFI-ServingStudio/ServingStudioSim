@@ -13,6 +13,8 @@ use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Fields, Schema};
 
+use crate::timing::{CoverageFlags, LeafMetrics};
+
 /// Legacy ref-style scalar envelope helper. The current writer uses
 /// [`cost_log_schema`] below; do not infer the live parquet columns from this
 /// compatibility surface.
@@ -100,7 +102,10 @@ pub fn cost_log_schema() -> Arc<Schema> {
         Field::new("energy_j", DataType::Float64, false),
         Field::new("groups", DataType::List(group_item), false),
         Field::new("slot_time_ms", DataType::List(time_item), false),
-        Field::new("slot_coverage", DataType::List(cov_item), false),
+        // The metadata names the bits (`CoverageFlags::NAMES`, comma-separated,
+        // bit 0 first), so no reader keeps its own copy.
+        Field::new("slot_coverage", DataType::List(cov_item), false)
+            .with_metadata([("flags".to_string(), CoverageFlags::NAMES.join(","))].into()),
         // Per-slot input JSON (one string per leaf, slot-aligned to slot_time_ms).
         // Appended last: append-only, so old readers are unaffected.
         Field::new(
@@ -136,15 +141,17 @@ pub fn cost_log_schema() -> Arc<Schema> {
         ),
         // Per-slot selected backend (slot-aligned to `slot_time_ms`): the
         // position-local index into the leaf's candidate list (`backends` in the
-        // matching `cost_manifest` sidecar), or `255` when the leaf was not
-        // executed this iteration. Lets a consumer see which of a multi-backend
-        // position's candidates best-of-N picked. Appended last: append-only, so
-        // old readers are unaffected.
+        // matching `cost_manifest` sidecar), or `LeafMetrics::NO_BACKEND`
+        // (its `none` metadata) when the leaf was not executed this iteration.
+        // Lets a consumer see which of a multi-backend position's candidates
+        // best-of-N picked. Appended last: append-only, so old readers are
+        // unaffected.
         Field::new(
             "slot_backend",
             DataType::List(Arc::new(Field::new("item", DataType::UInt8, false))),
             false,
-        ),
+        )
+        .with_metadata([("none".to_string(), LeafMetrics::NO_BACKEND.to_string())].into()),
     ]))
 }
 

@@ -32,11 +32,9 @@ import pyarrow.parquet as pq
 
 from launcher import timing_predict as launcher
 from launcher.exec import ERROR_JSON, binary_error
-from public_api.deployments import Member, coverage_flags
+from public_api.deployments import Member
 
 MAX_CASES = 64
-# `LeafMetrics::NO_BACKEND` (simulator `timing/cache/interp.rs`).
-NO_BACKEND = 255
 
 
 class BadCases(ValueError):
@@ -170,7 +168,7 @@ def _read(member: Member, cases: list, log_dir: Path) -> dict:
     """A finished prediction's times, per case and section, on ``member``'s tree."""
     raw = log_dir / "raw"
     manifest = json.loads((raw / "cost_manifest" / "worker_predict_0.json").read_text())
-    rows = pq.read_table(
+    table = pq.read_table(
         raw / "cost_log" / "worker_predict_0.parquet",
         columns=[
             "iter_id",
@@ -181,7 +179,11 @@ def _read(member: Member, cases: list, log_dir: Path) -> dict:
             "slot_backend",
             "slot_coverage",
         ],
-    ).to_pylist()
+    )
+    rows = table.to_pylist()
+    # The simulator names the coverage bits and the no-backend value in the columns.
+    flag_names = table.schema.field("slot_coverage").metadata[b"flags"].decode().split(",")
+    no_backend = int(table.schema.field("slot_backend").metadata[b"none"])
     sections = {s["section"]: s for s in manifest["sections"]}
     # The Analyzer's tree per row (`analyze gen-iter-breakdown`): each node's
     # time for one call, scaled, and its share of the row's time.
@@ -202,8 +204,9 @@ def _read(member: Member, cases: list, log_dir: Path) -> dict:
             raise RuntimeError(f"{member.preset}: the predicted tree differs from the index's")
         flags: dict[str, list[int]] = {}
         for index, bits in enumerate(row["slot_coverage"]):
-            for name in coverage_flags(bits):
-                flags.setdefault(name, []).append(index)
+            for bit, name in enumerate(flag_names):
+                if bits >> bit & 1:
+                    flags.setdefault(name, []).append(index)
         out[row["iter_id"]]["sections"].append(
             {
                 "section": row["section"],
@@ -214,7 +217,7 @@ def _read(member: Member, cases: list, log_dir: Path) -> dict:
                 # null: the leaf did not run (`LeafMetrics::NO_BACKEND`), as an
                 # inter-node transfer on one node.
                 "slot_backend": [
-                    None if b == NO_BACKEND else slot["backends"][b]
+                    None if b == no_backend else slot["backends"][b]
                     for slot, b in zip(tree["slots"], row["slot_backend"], strict=True)
                 ],
                 "coverage": flags,

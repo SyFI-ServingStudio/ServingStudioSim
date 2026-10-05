@@ -34,9 +34,6 @@ from public_api import preset as public_preset
 REPO_ROOT = public_preset.REPO_ROOT
 
 # How a `Dim` serializes in a manifest's `kernel_config`.
-_COVERAGE_FLAGS = (("extrapolated", 1 << 0), ("jit", 1 << 1), ("no_coverage", 1 << 2))
-
-
 class UnknownDeployment(LookupError):
     """No public preset has this id."""
 
@@ -65,11 +62,6 @@ def scalar_identity(identity: dict) -> tuple[dict, list[str]]:
         else:
             scalars[name] = value
     return scalars, structured
-
-
-def coverage_flags(bits: int) -> list[str]:
-    """``CoverageFlags`` (simulator ``timing``) as names."""
-    return [name for name, bit in _COVERAGE_FLAGS if bits & bit]
 
 
 def _text(value: Any) -> str:
