@@ -7,9 +7,16 @@
 # `launcher` groups). The container mounts this checkout read-only at the same
 # path and serves its profiling/profile.db with its target/release/simulator
 # and analyze, so build those first. Predictions are kept for Read more in
-# logs/public_api/predictions and simulations run in logs/public_api/simulations,
-# the two writable mounts. To serve new code or data, update the checkout,
-# rebuild the binaries and run this again.
+# logs/public_api/predictions, simulations run in logs/public_api/simulations and
+# uploaded workloads are kept in logs/public_api/workloads: the three writable
+# mounts. To serve new code or data, update the checkout, rebuild the binaries
+# and run this again.
+#
+# The service is reached through the CSE web host's proxy (the Intro site's
+# public/.htaccess), so the rate limits must count the client its
+# X-Forwarded-For names, not the proxy. PUBLIC_API_FORWARDED_ALLOW_IPS lists the
+# proxies trusted to name it (uvicorn's --forwarded-allow-ips, comma-separated);
+# it defaults to new-rumble.cs.washington.edu, the CSE web host that forwards.
 set -euo pipefail
 
 if [[ $# -ne 2 ]]; then
@@ -20,6 +27,7 @@ bind=$1
 port=$2
 name=${PUBLIC_API_CONTAINER:-servingstudio-public-api}
 image=${PUBLIC_API_IMAGE:-servingstudio-public-api}
+forwarded_allow_ips=${PUBLIC_API_FORWARDED_ALLOW_IPS:-128.208.3.117}
 repo=$(cd "$(dirname "$0")/../.." && pwd -P)
 hf_home=${HF_HOME:-$HOME/.cache/huggingface}
 
@@ -55,5 +63,6 @@ docker run -d --name "$name" --restart unless-stopped \
   "$image" \
   python -m public_api serve --bind 0.0.0.0 --port "$port" \
   --db "$repo/profiling/profile.db" --build-type release \
-  --runs-dir "$runs" --sims-dir "$sims" --workloads-dir "$uploads" --analyzer-port "$((port + 1))" >/dev/null
+  --runs-dir "$runs" --sims-dir "$sims" --workloads-dir "$uploads" --analyzer-port "$((port + 1))" \
+  --forwarded-allow-ips "$forwarded_allow_ips" >/dev/null
 echo "$name serving $repo on $bind:$port"
