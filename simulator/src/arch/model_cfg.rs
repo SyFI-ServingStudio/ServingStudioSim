@@ -76,6 +76,36 @@ struct JsonModelConfig {
     torch_dtype: String,
 }
 
+/// A checkpoint's `max_position_embeddings`: the longest request vLLM serves
+/// when no `--max-model-len` is given. A multimodal checkpoint (Qwen3.6) keeps
+/// it under `text_config`, which is the config vLLM reads it from.
+///
+/// vLLM also rescales the value for some RoPE scalings; for every checked-in
+/// config the result is this field (Llama 3's `llama3` scaling is exempt, and
+/// DeepSeek V4's YaRN `original_max_position_embeddings × factor` equals it).
+pub fn max_position_embeddings(path: &Path) -> Result<u32> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading model config {}", path.display()))?;
+    let raw: serde_json::Value = serde_json::from_str(&text)
+        .with_context(|| format!("parsing model config {}", path.display()))?;
+    let config = raw.get("text_config").unwrap_or(&raw);
+    let value = config.get("max_position_embeddings").with_context(|| {
+        format!(
+            "model config {} has no max_position_embeddings; give the arch a max_model_len",
+            path.display()
+        )
+    })?;
+    value
+        .as_u64()
+        .and_then(|value| u32::try_from(value).ok())
+        .with_context(|| {
+            format!(
+                "model config {}: max_position_embeddings {value} is not a token count",
+                path.display()
+            )
+        })
+}
+
 fn parse_dtype(s: &str) -> Result<DType> {
     Ok(match s {
         "float16" | "fp16" => DType::Fp16,

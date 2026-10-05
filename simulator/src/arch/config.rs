@@ -53,6 +53,15 @@ pub struct ModelSpec {
     pub fp8: bool,
 }
 
+impl ModelSpec {
+    /// The checkpoint's `max_position_embeddings`, the longest request an arch
+    /// without its own `max_model_len` serves (see
+    /// [`model_cfg::max_position_embeddings`](super::model_cfg::max_position_embeddings)).
+    pub fn max_position_embeddings(&self) -> anyhow::Result<u32> {
+        super::model_cfg::max_position_embeddings(std::path::Path::new(&self.model_config))
+    }
+}
+
 // ── iter-wise contract (unified, pd) ────────────────────────────────────────
 
 /// Where a MoE arch's expert demand comes from: synthetic uniform/random
@@ -553,6 +562,30 @@ impl IterArchSel {
             | Self::Glm52SglangNvfp4TpDsaMoe { model, .. } => model,
         }
     }
+
+    /// The longest request this arch serves, in tokens of context (prompt,
+    /// output and any tokens a verify reads ahead): its `max_model_len` where
+    /// the arch takes one, else the checkpoint's `max_position_embeddings`, as
+    /// vLLM defaults it. Every variant is listed so a new one decides which.
+    pub fn max_model_len(&self) -> anyhow::Result<u32> {
+        match self {
+            Self::Glm52VllmNvfp4DsaMoe { max_model_len, .. }
+            | Self::Glm52VllmNvfp4DsaMoeSpeculative { max_model_len, .. }
+            | Self::Glm53VllmNvfp4DsaMoeDflash2 { max_model_len, .. }
+            | Self::Glm53FlashVllmFp8KdaDsaMoe { max_model_len, .. }
+            | Self::Glm52SglangNvfp4TpDsaMoe { max_model_len, .. } => Ok(*max_model_len),
+            Self::Qwen36Local { model, .. }
+            | Self::Llama3Dense { model }
+            | Self::Llama3DenseTp { model, .. }
+            | Self::Llama3DpAttnTpFfn { model, .. }
+            | Self::Qwen3MoeDpAttnEpFfn { model, .. }
+            | Self::Qwen3MoeFp8DpAttnEpFfn { model, .. }
+            | Self::Qwen3VllmMoeDpAttnEpFfn { model, .. }
+            | Self::DeepseekV4Vllm { model, .. }
+            | Self::DeepseekV4VllmSerialStreams { model, .. }
+            | Self::Glm52VllmDsaMoe { model, .. } => model.max_position_embeddings(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -961,6 +994,71 @@ mod iter_tests {
             r#"{"type":"glm52_dsa_moe","model_config":"model/config/glm52.json","fp8":false}"#;
         assert!(serde_json::from_str::<IterArchSel>(raw).is_err());
     }
+
+    fn checked_in(config: &str) -> String {
+        format!("{}/model/config/{config}.json", env!("CARGO_MANIFEST_DIR"))
+    }
+
+    /// An arch's own `max_model_len` wins; without one, the checkpoint's
+    /// `max_position_embeddings`, read from `text_config` for Qwen3.6.
+    #[test]
+    fn max_model_len_is_the_arch_param_else_the_checkpoints_positions() {
+        let limit = |arch: &str, config: &str, extra: &str| {
+            let raw = format!(
+                r#"{{"type":"{arch}","model_config":"{}","fp8":false{extra}}}"#,
+                checked_in(config)
+            );
+            serde_json::from_str::<IterArchSel>(&raw)
+                .unwrap()
+                .max_model_len()
+                .unwrap()
+        };
+        assert_eq!(
+            limit("llama3_dense_tp", "llama3_8b", r#","tp_size":2"#),
+            131_072
+        );
+        assert_eq!(limit("qwen36_local", "qwen3_6_35b_a3b_fp8", ""), 262_144);
+        assert_eq!(
+            limit("glm52_vllm_nvfp4_dsa_moe", "glm52_nvfp4", ""),
+            1_048_576
+        );
+        assert_eq!(
+            limit(
+                "glm52_vllm_nvfp4_dsa_moe",
+                "glm52_nvfp4",
+                r#","max_model_len":8192"#
+            ),
+            8192
+        );
+        assert_eq!(
+            limit("glm53_flash_vllm_fp8_kda_dsa_moe", "glm53_flash", ""),
+            8192
+        );
+
+        let attn = format!(
+            r#"{{"type":"qwen3_attn_tp","model_config":"{}","fp8":false,"attn_tp_size":4}}"#,
+            checked_in("qwen3_235b")
+        );
+        let attn: AttnArchSel = serde_json::from_str(&attn).unwrap();
+        assert_eq!(attn.max_model_len().unwrap(), 40_960);
+    }
+
+    #[test]
+    fn a_checkpoint_without_positions_needs_an_explicit_max_model_len() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, r#"{"hidden_size": 8}"#).unwrap();
+        let raw = format!(
+            r#"{{"type":"llama3_dense","model_config":"{}","fp8":false}}"#,
+            path.display()
+        );
+        let error = serde_json::from_str::<IterArchSel>(&raw)
+            .unwrap()
+            .max_model_len()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("has no max_position_embeddings"), "{error}");
+    }
 }
 // ── layer-wise attn / ffn contract (AFD) ────────────────────────────────────
 
@@ -986,6 +1084,14 @@ impl AttnArchSel {
     pub fn model(&self) -> &ModelSpec {
         match self {
             Self::Qwen3AttnTp { model, .. } => model,
+        }
+    }
+
+    /// The longest request this attention side serves; see
+    /// [`IterArchSel::max_model_len`]. The FFN side holds no context.
+    pub fn max_model_len(&self) -> anyhow::Result<u32> {
+        match self {
+            Self::Qwen3AttnTp { model, .. } => model.max_position_embeddings(),
         }
     }
 }

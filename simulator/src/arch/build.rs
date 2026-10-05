@@ -1901,7 +1901,8 @@ pub struct PredictShape {
     /// request's query length.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub query_width: Option<u32>,
-    /// A speculative arch's context limit, which no request may exceed.
+    /// The arch's longest request ([`IterArchSel::max_model_len`]), which no
+    /// case's request may exceed; an FFN side, which holds no context, has none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_model_len: Option<u32>,
 }
@@ -2031,14 +2032,17 @@ fn build_arch(
                         )?;
                         let shape = PredictShape {
                             query_width: Some(draft_tokens + 1),
-                            max_model_len: Some(model.max_model_len()),
+                            max_model_len: Some(selector.max_model_len()?),
                             ..PredictShape::new("speculative_iter", model.num_attn_dp_groups())
                         };
                         (model.gpus_per_replica(), shape, model.cost_log_manifest())
                     }
                     _ => {
                         let model = build_iter_model(selector, gpu, UNIFIED_MODEL_NAME, bridge)?;
-                        let shape = PredictShape::new("iter", model.num_attn_dp_groups());
+                        let shape = PredictShape {
+                            max_model_len: Some(selector.max_model_len()?),
+                            ..PredictShape::new("iter", model.num_attn_dp_groups())
+                        };
                         (model.gpus_per_replica(), shape, model.cost_log_manifest())
                     }
                 };
@@ -2055,7 +2059,10 @@ fn build_arch(
             kernel_configs,
             |selector: &AttnArchSel, gpu, bridge| {
                 let model = build_attn_model(selector, gpu, AFD_MODEL_NAME, bridge)?;
-                let shape = PredictShape::new("attn", model.num_attn_dp_groups());
+                let shape = PredictShape {
+                    max_model_len: Some(selector.max_model_len()?),
+                    ..PredictShape::new("attn", model.num_attn_dp_groups())
+                };
                 Ok((model.gpus_per_replica(), shape, model.cost_log_manifest()))
             },
         ),
@@ -3045,8 +3052,8 @@ mod tests {
     }
 
     /// Each build names the `timing-predict` selector its cases go under and
-    /// how many groups a case lists: one per attention DP shard, and a
-    /// speculative arch's verify width and context limit besides.
+    /// how many groups a case lists: one per attention DP shard, the context
+    /// limit, and a speculative arch's verify width besides.
     #[test]
     fn arch_blocks_give_their_prediction_case_shape() {
         let mut blocks = sample_blocks();
@@ -3079,9 +3086,11 @@ mod tests {
         assert_eq!(
             shapes,
             [
-                ("iter", 1, None, None),
-                ("attn", 1, None, None),
-                ("iter", 4, None, None),
+                // GLM-5.2 NVFP4's own max_model_len default; the others have
+                // none, so their checkpoint's max_position_embeddings.
+                ("iter", 1, None, Some(1_048_576)),
+                ("attn", 1, None, Some(40_960)),
+                ("iter", 4, None, Some(40_960)),
                 ("speculative_iter", 1, Some(6), Some(8192)),
             ]
         );
