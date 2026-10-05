@@ -5,8 +5,8 @@
 # once per structure, so checkpoints that differ only in weights (a thinking
 # release, a later version of one architecture) share one file. `family` groups
 # models on the site.
-meta-llama/Meta-Llama-3-8B:
-  name: Llama 3 8B
+meta-llama/Llama-3.1-8B:
+  name: Llama 3.1 8B
   family: Llama
   config: llama3_8b
 Qwen/Qwen3-235B-A22B:

@@ -1,4 +1,4 @@
-# Llama 3 8B on H200, prefill and decode on separate TP replicas.
+# Llama 3.1 8B on H200, prefill and decode on separate TP replicas.
 # Workers: the defaults presets/pd_aime_1p32d.yaml runs with (1 prefill, 32 decode, TP1).
 deployment: pd
 pools:

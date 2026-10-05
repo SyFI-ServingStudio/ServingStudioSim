@@ -1,4 +1,4 @@
-# Llama 3 8B on H200: TP replicas behind one router, each a barebone worker.
+# Llama 3.1 8B on H200: TP replicas behind one router, each a barebone worker.
 # Worker: the defaults presets/unified_aime.yaml runs with.
 deployment: unified
 pools:

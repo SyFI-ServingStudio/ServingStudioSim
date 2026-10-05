@@ -75,7 +75,7 @@ The tree route takes the preset's `id` from `/models`, which has the form
 `{checkpoint directory}/{arch}`, and every axis as a query parameter:
 
 ```bash
-curl -s "$API/models/Meta-Llama-3-8B/llama3_dense_tp/tree?tp_size=2" > tree.json
+curl -s "$API/models/Llama-3.1-8B/llama3_dense_tp/tree?tp_size=2" > tree.json
 jq '{arch, gpu, gpus_per_replica, predict, missing}' tree.json
 jq -r '.sections[] | .section as $s | .slots | to_entries[]
   | [$s, .key, .value.name, .value.kernel, .value.config] | @tsv' tree.json
@@ -116,7 +116,7 @@ length is the context the new token attends to. A group may hold only
 prefills, only decodes, or both. The examples below use members of the public
 presets; each case list goes into the request body of step 4.
 
-**Dense, whole iteration** (`Meta-Llama-3-8B/llama3_dense_tp`, `tp_size: 2`;
+**Dense, whole iteration** (`Llama-3.1-8B/llama3_dense_tp`, `tp_size: 2`;
 `iter`, 1 group). Three decodes, then a 2048-token prefill batched with 32
 decodes at 4096:
 
@@ -173,7 +173,7 @@ must equal the member's value; a number given as a string also matches.
 
 ```bash
 curl -s -X POST "$API/predict" -H 'content-type: application/json' -d '{
-  "preset": "Meta-Llama-3-8B/llama3_dense_tp",
+  "preset": "Llama-3.1-8B/llama3_dense_tp",
   "params": {"tp_size": 2},
   "cases": [{"groups": [{"decode_kv_lens": [1024, 2048, 4096]}]},
             {"groups": [{"prefill_chunk_pairs": [[0, 2048]], "decode_count": 32, "average_decode_length": 4096}]}]
@@ -218,8 +218,8 @@ Errors carry `detail`:
 
 ```bash
 curl -s -X POST "$API/predict" -H 'content-type: application/json' \
-  -d '{"preset": "Meta-Llama-3-8B/llama3_dense_tp", "params": {"tp_size": 3}, "cases": [{"groups": [{"decode_kv_lens": [1024]}]}]}'
-# {"detail":{"message":"Meta-Llama-3-8B/llama3_dense_tp has no member {'tp_size': '3'}","choices":[{"tp_size":1},{"tp_size":2},{"tp_size":4},{"tp_size":8}]}}
+  -d '{"preset": "Llama-3.1-8B/llama3_dense_tp", "params": {"tp_size": 3}, "cases": [{"groups": [{"decode_kv_lens": [1024]}]}]}'
+# {"detail":{"message":"Llama-3.1-8B/llama3_dense_tp has no member {'tp_size': '3'}","choices":[{"tp_size":1},{"tp_size":2},{"tp_size":4},{"tp_size":8}]}}
 ```
 
 ### Analyze and keep a prediction

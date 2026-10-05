@@ -128,7 +128,7 @@ dense member "...; the model routes no experts".
 ```json
 POST /api/public/v1/simulate
 {
-  "preset": "Meta-Llama-3-8B/llama3_dense_tp_barebone",
+  "preset": "Llama-3.1-8B/llama3_dense_tp_barebone",
   "params": {"tp_size": 1, "replicas": 1},
   "workload": {
     "source": "generated",        // "capture" (default), "generated" or "upload"
