@@ -158,13 +158,14 @@ pub fn print_dry_run(report: &[KernelMissing]) {
     );
 }
 
-/// Write [`dry_run_document`] of `report` to `path`.
+/// Write a dry run's `document` (a [`dry_run_document`], plus whatever the
+/// command adds to it) to `path`.
 pub fn write_dry_run_report(
     path: &std::path::Path,
-    report: &[KernelMissing],
+    document: &serde_json::Value,
 ) -> anyhow::Result<()> {
     use anyhow::Context;
-    let text = serde_json::to_string(&dry_run_document(report)).expect("dry-run report serializes");
+    let text = serde_json::to_string(document).expect("dry-run report serializes");
     std::fs::write(path, text).with_context(|| format!("writing dry-run report {}", path.display()))
 }
 

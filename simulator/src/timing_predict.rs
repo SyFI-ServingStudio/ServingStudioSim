@@ -55,7 +55,9 @@ use crate::arch::contract::{
 use crate::arch::{AttnArchSel, FfnArchSel, IterArchSel};
 use crate::common::{Time, TooLong, WorkerId};
 use crate::deployment::BackendOverrides;
-use crate::timing::bridge::{print_dry_run, write_config_records, write_dry_run_report};
+use crate::timing::bridge::{
+    dry_run_document, print_dry_run, write_config_records, write_dry_run_report,
+};
 use crate::timing::{CostManifestDoc, PerfApiBridge};
 use crate::worker::CostBuffers;
 
@@ -482,7 +484,7 @@ pub fn run_timing_predict(
         );
         print_dry_run(&report);
         if let Some(path) = report_json {
-            write_dry_run_report(path, &report)?;
+            write_dry_run_report(path, &dry_run_document(&report))?;
         }
         return Ok(());
     }

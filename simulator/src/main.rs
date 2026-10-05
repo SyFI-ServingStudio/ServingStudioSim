@@ -24,14 +24,16 @@ use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 
 use simulator::common::{RequestStore, SharedRequests, TooLong};
-use simulator::deployment::{build_flow, check_trace, RunConfig, WorkloadSpec};
+use simulator::deployment::{build_flow, check_trace, pool_bounds, RunConfig, WorkloadSpec};
 use simulator::log::LoggerSession;
 use simulator::schema::list_params;
 use simulator::sim::{
     run_sim, trace_formats, ArrivalSchedule, CapacityLimit, InputFileFormat, InputFileSchema,
     LoadedTrace, TickCfg, TraceFrontend, TraceTag,
 };
-use simulator::timing::bridge::{print_dry_run, write_config_records, write_dry_run_report};
+use simulator::timing::bridge::{
+    dry_run_document, print_dry_run, write_config_records, write_dry_run_report,
+};
 use simulator::timing::PerfApiBridge;
 use simulator::timing_predict::PredictMode;
 
@@ -133,7 +135,7 @@ struct PredictArgs {
     /// See [`CacheArgs::kernel_configs_out`].
     #[arg(long, value_name = "FILE")]
     kernel_configs_out: Option<PathBuf>,
-    /// See [`DryRunArgs::report_json`].
+    /// See [`DryRunArgs::report_json`], without `pools`.
     #[arg(long, value_name = "FILE", requires = "dry_run")]
     report_json: Option<PathBuf>,
 }
@@ -169,7 +171,10 @@ struct DryRunArgs {
     #[command(flatten)]
     cache: CacheArgs,
     /// Also write the report to this JSON file: `{"schema_version": 1,
-    /// "kernels": [{name, kind, missing, total}], "missing", "total"}`.
+    /// "kernels": [{name, kind, missing, total}], "missing", "total",
+    /// "pools": [{role, max_model_len, draft_tokens}]}`, one `pools` entry per
+    /// request-serving pool group (`deployment::pool_bounds`; `draft_tokens`
+    /// is null for a non-speculative worker).
     #[arg(long, value_name = "FILE")]
     report_json: Option<PathBuf>,
 }
@@ -474,7 +479,9 @@ fn cmd_dry_run(
     println!("dry run: {} kernels", report.len());
     print_dry_run(&report);
     if let Some(path) = report_json {
-        write_dry_run_report(path, &report)?;
+        let mut document = dry_run_document(&report);
+        document["pools"] = serde_json::to_value(pool_bounds(&cfg)?)?;
+        write_dry_run_report(path, &document)?;
     }
     if let Some(path) = kernel_configs_out {
         write_config_records(path, &bridge.take_config_records())?;

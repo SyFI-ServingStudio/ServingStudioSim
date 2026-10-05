@@ -69,14 +69,19 @@ fn ensure_speculative_trace(cfg: &RunConfig) -> anyhow::Result<()> {
 }
 
 /// One pool group's bound on the requests it serves: the pool's role, its
-/// arch's longest request, and a speculative worker's draft width.
-struct PoolBound {
-    role: &'static str,
-    max_model_len: u32,
-    draft_tokens: Option<u32>,
+/// arch's longest request, and a speculative worker's draft width (`None` for
+/// any other worker). `simulator dry-run --report-json` writes these under
+/// `pools`, so a service reads the bounds a run enforces instead of
+/// re-deriving them from the preset.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PoolBound {
+    pub role: &'static str,
+    pub max_model_len: u32,
+    pub draft_tokens: Option<u32>,
 }
 
-fn pool_bounds(cfg: &RunConfig) -> anyhow::Result<Vec<PoolBound>> {
+/// Every request-serving pool group's [`PoolBound`], in pool order.
+pub fn pool_bounds(cfg: &RunConfig) -> anyhow::Result<Vec<PoolBound>> {
     fn iter_pool(
         role: &'static str,
         pool: &PoolSpec<IterArchSel, IterWorkerSel>,
@@ -299,6 +304,19 @@ mod tests {
             CapacityLimit::parse(None).unwrap(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn each_pool_group_reports_its_bound_as_the_dry_run_writes_it() {
+        let bounds = |worker| serde_json::to_value(pool_bounds(&llama_config("", worker)).unwrap());
+        assert_eq!(
+            bounds(SPECULATIVE).unwrap(),
+            serde_json::json!([{"role": "main", "max_model_len": 131072, "draft_tokens": 3}])
+        );
+        assert_eq!(
+            bounds("{type: barebone, attn_gpu_memory_gb: 80.0}").unwrap(),
+            serde_json::json!([{"role": "main", "max_model_len": 131072, "draft_tokens": null}])
+        );
     }
 
     #[test]
