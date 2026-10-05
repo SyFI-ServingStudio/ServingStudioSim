@@ -437,6 +437,8 @@ def test_a_capture_too_long_for_a_member_is_that_captures_misfit(sims) -> None:
     sims.check(lambda member, capture: {}, misfit, jobs=2)
     assert spec.summary(sims.index)["unavailable"] == {names[0]: {"misfit": too_long}}
     assert spec.runnable(spec.capture(names[0])) == "3 of 4 requests exceed"
+    # Its routing still serves requests that are not its own.
+    assert spec.runnable(spec.capture(names[0]), replayed=False) is None
     assert all(spec.runnable(spec.capture(name)) is None for name in names[1:])
     others = [m for p in sims.presets.values() for m in p.members if m is not spec]
     assert not any(m.misfits for m in others)

@@ -828,7 +828,7 @@ class SimulationService:
         except KeyError:
             names = [capture.name for capture in member.captures]
             raise BadWorkload(f"{preset} has no capture {workload.capture!r}; it has {names}")
-        reason = member.runnable(capture)
+        reason = member.runnable(capture, replayed=workload.source == "capture")
         if reason is not None:
             raise NotRunnable(f"{preset} {member.params} on {capture.name}: {reason}")
         simulation_id, directory = self.queue.new_directory()

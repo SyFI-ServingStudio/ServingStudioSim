@@ -260,16 +260,18 @@ class SimMember:
                 return capture
         raise KeyError(name)
 
-    def blocker(self, capture: Capture) -> dict | None:
+    def blocker(self, capture: Capture, *, replayed: bool = True) -> dict | None:
         """Why this member cannot run ``capture``: ``{"error": <the build's
         message>}``, ``{"misfit": <how its requests do not fit>}`` or
         ``{"missing": {<kernel role>: <profile.db rows it lacks>}}``; None when
-        it can."""
+        it can. A misfit is of the capture's own requests, so it blocks only a
+        run that replays them (``replayed``), not one that takes only its
+        routing."""
         if self.error:
             return {"error": self.error}
         if capture.name in self.failures:
             return {"error": self.failures[capture.name]}
-        if capture.name in self.misfits:
+        if replayed and capture.name in self.misfits:
             return {"misfit": self.misfits[capture.name]}
         key = self.checked[0].name if self.dense and self.checked else capture.name
         if key in self.failures:
@@ -280,9 +282,9 @@ class SimMember:
             return {"error": "not checked"}
         return None
 
-    def runnable(self, capture: Capture) -> str | None:
+    def runnable(self, capture: Capture, *, replayed: bool = True) -> str | None:
         """:meth:`blocker` as one sentence; None when it can run ``capture``."""
-        blocker = self.blocker(capture)
+        blocker = self.blocker(capture, replayed=replayed)
         if blocker is None or "error" in blocker:
             return blocker and blocker["error"]
         if "misfit" in blocker:
