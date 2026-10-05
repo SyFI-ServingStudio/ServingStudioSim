@@ -637,7 +637,45 @@ fn composition_json(
     json!({
         "kernel_time_ms": totals.kernel_time_ms,
         "segments": segments,
+        "kinds": kinds_json(totals, positions, position_order),
     })
+}
+
+/// The scope's segments rolled up by kernel kind, largest first (ties by
+/// kind): each kind's time and share, and how many positions it holds. A
+/// kind's positions are the segments of that `kind`.
+fn kinds_json(
+    totals: &ScopeTotals,
+    positions: &[Position],
+    position_order: &[usize],
+) -> Vec<Value> {
+    let mut kinds: Vec<(&str, f64, usize)> = Vec::new();
+    for &position_id in position_order {
+        let time_ms = totals.position_time_ms[position_id];
+        if time_ms <= TIME_EPSILON_MS {
+            continue;
+        }
+        let kind = positions[position_id].kind.as_str();
+        match kinds.iter_mut().find(|(name, _, _)| *name == kind) {
+            Some((_, total, count)) => {
+                *total += time_ms;
+                *count += 1;
+            }
+            None => kinds.push((kind, time_ms, 1)),
+        }
+    }
+    kinds.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    kinds
+        .into_iter()
+        .map(|(kind, time_ms, count)| {
+            json!({
+                "kind": kind,
+                "kernel_time_ms": time_ms,
+                "share_pct": 100.0 * time_ms / totals.kernel_time_ms,
+                "positions": count,
+            })
+        })
+        .collect()
 }
 
 fn validate_tree(manifest: &Manifest) -> Result<()> {
@@ -709,6 +747,7 @@ fn definitions() -> Value {
         "position": "the manifest leaf's full semantic name; identical names across Max siblings and worker replicas are pooled",
         "kernel_time_ms": "exact DataFusion SUM(cost_log.total_time_ms) for the scope; sampled position mixtures are normalized to each worker's exact root total",
         "share_pct": "position-attributed kernel_time_ms / scope kernel_time_ms × 100; segments sum to 100%",
+        "kinds": "the scope's segments summed by kernel kind, largest first; kinds sum to 100%",
         "tree_attribution": "Sum forwards to all children; Scale multiplies its child; Max forwards to the critical child and divides by overlap; exactly tied critical children split evenly",
         "levels": "workers are keyed by (pool_tag, worker_id); pools sum their workers; overall sums all pools",
         "sampling": "DataFusion first counts scalar rows per worker, then predicate/projection-pushes a worker-local regular iter_id stride into the heavy slot_time_ms scan; meta.exact=false marks estimates",
@@ -771,6 +810,34 @@ mod tests {
             ],
             node_labels: vec![None; 6],
         }
+    }
+
+    #[test]
+    fn kinds_sum_their_segments_largest_first() {
+        let positions: Vec<Position> = [
+            ("m.a", "gemm"),
+            ("m.b", "norm"),
+            ("m.c", "gemm"),
+            ("m.d", "idle"),
+        ]
+        .into_iter()
+        .map(|(name, kind)| Position {
+            name: name.into(),
+            kind: kind.into(),
+        })
+        .collect();
+        let totals = ScopeTotals {
+            kernel_time_ms: 10.0,
+            position_time_ms: vec![3.0, 5.0, 2.0, 0.0],
+        };
+        let kinds = kinds_json(&totals, &positions, &[1, 0, 2, 3]);
+        assert_eq!(
+            kinds,
+            vec![
+                json!({"kind": "gemm", "kernel_time_ms": 5.0, "share_pct": 50.0, "positions": 2}),
+                json!({"kind": "norm", "kernel_time_ms": 5.0, "share_pct": 50.0, "positions": 1}),
+            ]
+        );
     }
 
     #[test]
