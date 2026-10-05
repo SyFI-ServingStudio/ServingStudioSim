@@ -45,7 +45,7 @@ variants:
       ep_size: 4
       nvl_num_gpu: 4
       routing: popularity
-      expert_popularity_file: hf://datasets/UW-SyFI/servingstudio-workload@9498d838a0cb1793980d8bf90998eb7f9722fb2d/glm52_nvfp4/vllm_mtp_k5/diverse_100/capture/20260830/popularity.json
+      expert_popularity_file: hf://datasets/UW-SyFI/servingstudio-workload@c3f5ecaab0bbff757c64864bf2ec24f5e1f76b5c/glm52_nvfp4/vllm_mtp_k5/diverse_100/capture/20260830/popularity.json
       mtp_mode: full_index
       draft_tokens: 5
     worker:

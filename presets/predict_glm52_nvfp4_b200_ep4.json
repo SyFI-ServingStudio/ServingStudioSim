@@ -8,7 +8,7 @@
       "nvl_num_gpu": 4,
       "max_model_len": 8192,
       "routing": "popularity",
-      "expert_popularity_file": "hf://datasets/UW-SyFI/servingstudio-workload@9498d838a0cb1793980d8bf90998eb7f9722fb2d/glm52_nvfp4/vllm/c32_long/capture/20260824/popularity.json",
+      "expert_popularity_file": "hf://datasets/UW-SyFI/servingstudio-workload@c3f5ecaab0bbff757c64864bf2ec24f5e1f76b5c/glm52_nvfp4/vllm/c32_long/capture/20260824/popularity.json",
       "mtp_mode": "off"
     }
   },

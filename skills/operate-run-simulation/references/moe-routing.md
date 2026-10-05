@@ -52,7 +52,7 @@ the launcher fetches during expansion:
 
 ```yaml
 routing: corpus
-token_corpus_file: hf://datasets/UW-SyFI/servingstudio-workload@9498d838a0cb1793980d8bf90998eb7f9722fb2d/glm52_nvfp4/vllm_mtp_k5/quadrant_c48/capture/20260923/manifest.json
+token_corpus_file: hf://datasets/UW-SyFI/servingstudio-workload@c3f5ecaab0bbff757c64864bf2ec24f5e1f76b5c/glm52_nvfp4/vllm_mtp_k5/quadrant_c48/capture/20260923/manifest.json
 ```
 
 Only dataset-repo references (`hf://datasets/...`) are accepted, and the
