@@ -15,6 +15,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from fixtures.fake_torch import fake_cuda_torch
 
 from profiling import perf_api
 from profiling.db.args import DType
@@ -514,39 +515,28 @@ def test_validate_accepts_ordinary_speculative_and_zero_context() -> None:
     assert speculative[:3] == (16, 8192, 2)
 
 
-def _fake_cuda(capability, name="NVIDIA GPU"):
-    return SimpleNamespace(
-        cuda=SimpleNamespace(
-            is_available=lambda: True,
-            current_device=lambda: 0,
-            get_device_name=lambda _device: name,
-            get_device_capability=lambda _device: capability,
-        )
-    )
-
-
 def test_requires_cuda_but_no_gpu_allowlist() -> None:
     from profiling.runners.attention.dsa_persistent_topk_decode import (
         _validate_cuda_device,
     )
 
-    no_cuda = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False))
+    no_cuda = fake_cuda_torch(available=False)
     with pytest.raises(ProfilerNotImplemented, match="CUDA is required"):
         _validate_cuda_device(no_cuda)
     for name, capability in (("NVIDIA H100", (9, 0)), ("NVIDIA A100", (8, 0))):
-        _validate_cuda_device(_fake_cuda(capability, name))
-        _validate_cuda_device(_fake_cuda(capability, name), backend="vllm_cuda")
+        _validate_cuda_device(fake_cuda_torch(capability, name))
+        _validate_cuda_device(fake_cuda_torch(capability, name), backend="vllm_cuda")
 
 
 def test_path_choice_follows_compute_capability_not_gpu_name() -> None:
     from profiling.runners.attention.dsa_persistent_topk_decode import _uses_native_extension
 
     # Any sm_90 part runs the corrected extension (built for sm_90 only).
-    assert _uses_native_extension(_fake_cuda((9, 0), "NVIDIA H100"))
-    assert _uses_native_extension(_fake_cuda((9, 0), "NVIDIA H200"))
+    assert _uses_native_extension(fake_cuda_torch((9, 0), "NVIDIA H100"))
+    assert _uses_native_extension(fake_cuda_torch((9, 0), "NVIDIA H200"))
     # Everything else uses the image vLLM op, with the overflow tolerance.
-    assert not _uses_native_extension(_fake_cuda((10, 0), "NVIDIA B200"))
-    assert not _uses_native_extension(_fake_cuda((12, 0), "NVIDIA RTX PRO 6000"))
+    assert not _uses_native_extension(fake_cuda_torch((10, 0), "NVIDIA B200"))
+    assert not _uses_native_extension(fake_cuda_torch((12, 0), "NVIDIA RTX PRO 6000"))
 
 
 def test_large_batches_are_accepted() -> None:

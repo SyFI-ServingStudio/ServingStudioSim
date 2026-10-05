@@ -8,9 +8,10 @@ from __future__ import annotations
 
 import json
 import sys
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 
 import pytest
+from fixtures.fake_torch import fake_cuda_torch
 
 from profiling.db.registry import BackendSupport, iter_kernel_profiler_specs
 from profiling.runners.device import require_cuda_toolkit, unsupported_device
@@ -18,12 +19,7 @@ from profiling.runners.exceptions import ProfilerNotImplemented
 
 
 def _install_torch(monkeypatch, capability, *, name="NVIDIA GPU", available=True):
-    torch = ModuleType("torch")
-    torch.cuda = SimpleNamespace(
-        is_available=lambda: available,
-        get_device_capability=lambda _index: capability,
-        get_device_name=lambda _index: name,
-    )
+    torch = fake_cuda_torch(capability, name, available=available)
     monkeypatch.setitem(sys.modules, "torch", torch)
 
 

@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from fixtures.fake_torch import fake_cuda_torch
 
 from profiling import perf_api
 from profiling.db.args import DType
@@ -363,27 +364,17 @@ def test_rejects_nonboolean_clean_logits():
         _validate_args(**kwargs)
 
 
-def _fake_cuda(capability, name="NVIDIA GPU"):
-    return SimpleNamespace(
-        cuda=SimpleNamespace(
-            is_available=lambda: True,
-            current_device=lambda: 0,
-            get_device_name=lambda _device: name,
-            get_device_capability=lambda _device: capability,
-        )
-    )
-
 
 def test_torch_backend_requires_cuda_but_no_gpu_allowlist():
     from profiling.runners.attention.dsa_mqa_logits_prefill import (
         _validate_cuda_device,
     )
 
-    no_cuda = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False))
+    no_cuda = fake_cuda_torch(available=False)
     with pytest.raises(ProfilerNotImplemented, match="CUDA is required"):
         _validate_cuda_device(no_cuda)
-    _validate_cuda_device(_fake_cuda((9, 0), "NVIDIA H100"))
-    _validate_cuda_device(_fake_cuda((8, 0), "NVIDIA A100"))
+    _validate_cuda_device(fake_cuda_torch((9, 0), "NVIDIA H100"))
+    _validate_cuda_device(fake_cuda_torch((8, 0), "NVIDIA A100"))
 
 
 def test_deepgemm_device_check_is_the_per_arch_head_set():
@@ -392,11 +383,11 @@ def test_deepgemm_device_check_is_the_per_arch_head_set():
     )
 
     # Any SM90 part (H100 included) runs the SM90 kernels.
-    require_heads(_fake_cuda((9, 0), "NVIDIA H100"), "deepgemm", 32)
-    require_heads(_fake_cuda((10, 0), "NVIDIA B200"), "deepgemm", 8)
-    require_heads(_fake_cuda((12, 0)), "deepgemm", 16)
+    require_heads(fake_cuda_torch((9, 0), "NVIDIA H100"), "deepgemm", 32)
+    require_heads(fake_cuda_torch((10, 0), "NVIDIA B200"), "deepgemm", 8)
+    require_heads(fake_cuda_torch((12, 0)), "deepgemm", 16)
     with pytest.raises(ProfilerNotImplemented, match="num_heads=8 on SM9x"):
-        require_heads(_fake_cuda((9, 0)), "deepgemm", 8)
+        require_heads(fake_cuda_torch((9, 0)), "deepgemm", 8)
 
 
 def test_deepgemm_cupti_filter_is_architecture_agnostic():

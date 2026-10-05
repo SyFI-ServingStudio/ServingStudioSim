@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from fixtures.fake_torch import fake_cuda_torch
 
 from profiling import perf_api
 from profiling.db.args import DType
@@ -356,36 +357,25 @@ def test_trtllm_fp8_validation_accepts_tp4_local_heads_and_fp8_storage() -> None
     assert validated.valid_counts == (2048,)
 
 
-def _fake_cuda(capability, name="NVIDIA GPU"):
-    return SimpleNamespace(
-        cuda=SimpleNamespace(
-            is_available=lambda: True,
-            current_device=lambda: 0,
-            get_device_name=lambda _device: name,
-            get_device_capability=lambda _device: capability,
-        )
-    )
-
-
 def test_flashmla_selected_k_tile_follows_compute_capability_and_heads() -> None:
     from profiling.runners.attention.dsa_sparse_mla_attention import (
         _require_cuda,
         _require_flashmla_tile,
     )
 
-    no_cuda = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False))
+    no_cuda = fake_cuda_torch(available=False)
     with pytest.raises(ProfilerNotImplemented, match="CUDA is required"):
         _require_cuda(no_cuda)
     # The Torch composite runs on any CUDA device.
-    _require_cuda(_fake_cuda((8, 0), "NVIDIA A100"))
+    _require_cuda(fake_cuda_torch((8, 0), "NVIDIA A100"))
     # FlashMLA tiles selected_k by 128 on SM90 and by 64 only for 64 heads on SM10x.
-    _require_flashmla_tile(_fake_cuda((9, 0), "NVIDIA H100"), num_heads=64, selected_k=2048)
-    _require_flashmla_tile(_fake_cuda((10, 0), "NVIDIA B200"), num_heads=128, selected_k=1024)
-    _require_flashmla_tile(_fake_cuda((10, 3)), num_heads=64, selected_k=576)
+    _require_flashmla_tile(fake_cuda_torch((9, 0), "NVIDIA H100"), num_heads=64, selected_k=2048)
+    _require_flashmla_tile(fake_cuda_torch((10, 0), "NVIDIA B200"), num_heads=128, selected_k=1024)
+    _require_flashmla_tile(fake_cuda_torch((10, 3)), num_heads=64, selected_k=576)
     with pytest.raises(ProfilerNotImplemented, match="selected_k % 128"):
-        _require_flashmla_tile(_fake_cuda((9, 0)), num_heads=64, selected_k=576)
+        _require_flashmla_tile(fake_cuda_torch((9, 0)), num_heads=64, selected_k=576)
     with pytest.raises(ProfilerNotImplemented, match="selected_k % 128"):
-        _require_flashmla_tile(_fake_cuda((10, 0)), num_heads=128, selected_k=576)
+        _require_flashmla_tile(fake_cuda_torch((10, 0)), num_heads=128, selected_k=576)
 
 
 @pytest.mark.parametrize(
