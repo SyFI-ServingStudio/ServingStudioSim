@@ -1,7 +1,7 @@
 //! Compressed sparse MLA prefill over one complete request batch.
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
-use crate::timing::cache::{CacheKind, RateWork};
+use crate::timing::cache::CacheKind;
 use crate::timing::kernels::causal_rows;
 use crate::timing::kernels::dsa_compressed_mqa_logits_prefill::query_axis;
 use crate::timing::kernels::engine::{register_kernel, KernelSpec, OffGrid};
@@ -192,7 +192,7 @@ impl KernelSpec for CompressedSparseMlaPrefillSpec {
                     .collect(),
             );
         }
-        OffGrid::Rate(RateWork::Bytes(logical_bytes(config, input)))
+        OffGrid::Bandwidth(logical_bytes(config, input))
     }
 
     fn enumerate(

@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
-use crate::timing::cache::{CacheKind, Extrapolation, RateWork};
+use crate::timing::cache::{CacheKind, Extrapolation};
 use crate::timing::kernels::engine::{register_kernel, KernelSpec, OffGrid};
 use crate::timing::sweep::{Axis, Coords, SweepGrid};
 use crate::timing::{Dim, KernelConfig, SweepCoords};
@@ -184,7 +184,7 @@ impl KernelSpec for KvCompressStoreSpec {
         input: &Self::Input,
         _backend: &'static str,
     ) -> OffGrid<Self::Input> {
-        OffGrid::Rate(RateWork::Bytes(logical_bytes(config, input)))
+        OffGrid::Bandwidth(logical_bytes(config, input))
     }
 
     fn enumerate(

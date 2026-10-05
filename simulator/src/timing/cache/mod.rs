@@ -14,7 +14,6 @@ pub mod linear_3d;
 pub mod log_2d;
 
 pub(crate) use backend::BackendCache;
-pub use backend::RateWork;
 pub use cliff_2d::Cache2DCliff;
 pub use direct_1d::Cache1DDirect;
 pub use linear_1d::Cache1DLinear;

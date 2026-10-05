@@ -1,7 +1,7 @@
 //! DSA indexer-prefill top-k over compressed keys, for one complete request batch.
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
-use crate::timing::cache::{CacheKind, RateWork};
+use crate::timing::cache::CacheKind;
 use crate::timing::kernels::causal_rows;
 use crate::timing::kernels::dsa_compressed_mqa_logits_prefill::{
     canonical_pairs, infeasible_mask, sweep_grid, DsaCompressedPrefillKernelInput,
@@ -72,7 +72,7 @@ impl KernelSpec for DsaCompressedTopkPrefillSpec {
         input: &Self::Input,
         _backend: &'static str,
     ) -> OffGrid<Self::Input> {
-        OffGrid::Rate(RateWork::Bytes(logical_bytes(config, input)))
+        OffGrid::Bandwidth(logical_bytes(config, input))
     }
 
     fn enumerate(

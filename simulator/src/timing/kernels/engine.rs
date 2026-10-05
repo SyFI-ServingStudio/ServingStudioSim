@@ -11,7 +11,7 @@ use std::marker::PhantomData;
 
 use crate::timing::bridge::{ArgsPayload, ConfigGrid, KernelKind, KernelMetrics, PerfApiBridge};
 use crate::timing::cache::interp::LeafMetrics;
-use crate::timing::cache::{BackendCache, CacheKind, OutlierWarning, PeakRates, RateWork};
+use crate::timing::cache::{BackendCache, CacheKind, OutlierWarning, PeakRates};
 use crate::timing::result::CacheProbe;
 use crate::timing::sweep::{SweepCoords, SweepGrid};
 use crate::timing::{BuildError, Coords, DType, Probe};
@@ -186,13 +186,12 @@ pub trait KernelSpec: 'static {
 pub enum OffGrid<I> {
     /// Extend the cache's interpolant.
     Cache,
-    /// Hold the nearest grid point's achieved rate: [`RateWork::Flops`] at its
-    /// TFLOPS or [`RateWork::Bytes`] at its bandwidth. The work must be counted
-    /// the way the profiler counts it for that backend, since the grid point's
-    /// rate comes from the profiler's own counts. A spec picks the rate its
-    /// kernel holds as it scales (the one measured flat across its largest
-    /// shapes).
-    Rate(RateWork),
+    /// Hold the nearest grid point's achieved bandwidth, given the input's
+    /// logical bytes. The bytes must be counted the way the profiler counts
+    /// them for that backend, since the grid point's bandwidth comes from the
+    /// profiler's own counts. A spec picks it when its kernel's bandwidth
+    /// measured flat across its largest shapes.
+    Bandwidth(f64),
     /// The input runs as these independent launches, one after another: the
     /// answer is the sum of theirs.
     Launches(Vec<I>),
@@ -398,7 +397,7 @@ impl<S: KernelSpec> Kernel<S> {
         }
         match S::off_grid(&self.config, input, self.config.backends()[index]) {
             OffGrid::Cache => backend_cache.eval(coords),
-            OffGrid::Rate(work) => backend_cache.eval_at_edge_rate(coords, work),
+            OffGrid::Bandwidth(bytes) => backend_cache.eval_at_edge_bandwidth(coords, bytes),
             OffGrid::Launches(launches) => {
                 let mut total = LeafMetrics::ZERO;
                 for launch in &launches {

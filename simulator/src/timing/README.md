@@ -139,12 +139,12 @@ Three optional `KernelSpec` hooks (default no-ops, but load-bearing when needed)
   is the shipped example: its `(A,B)` re-axis grid has an unreachable `A < B/2`
   corner that the mask strips.
 - **`off_grid()`** — how each backend answers an input past the profiled grid.
-  The default extends the cache's interpolant. `OffGrid::Rate` holds the nearest
-  grid point's achieved rate instead: the input's logical FLOPs (`RateWork::Flops`)
-  or bytes (`RateWork::Bytes`), counted as the backend's profiler counts them,
-  over that point's own. `OffGrid::Launches` splits an input the kernel runs as
-  independent sequential launches and sums them. Pick the rate that measured
-  flattest across the kernel's largest shapes; a missing grid point is never a
+  The default extends the cache's interpolant. `OffGrid::Bandwidth` holds the
+  nearest grid point's achieved bandwidth instead: the input's logical bytes,
+  counted as the backend's profiler counts them, over that point's own, for a
+  kernel whose bandwidth measured flat across its largest shapes.
+  `OffGrid::Launches` splits an input the kernel runs as independent sequential
+  launches and sums them. A missing grid point is never a
   reason to reject a shape the production kernel runs. `dsa_sparse_mla_prefill`
   (bandwidth) and `compressed_sparse_mla_prefill` (64-request launches, then
   bandwidth) are the shipped examples.

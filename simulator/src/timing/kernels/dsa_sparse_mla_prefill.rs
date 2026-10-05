@@ -10,7 +10,7 @@
 //! `context - queries + 1 ..= context` rather than all seeing the endpoint.
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
-use crate::timing::cache::{CacheKind, RateWork};
+use crate::timing::cache::CacheKind;
 use crate::timing::kernels::causal_rows;
 use crate::timing::kernels::engine::{register_kernel, KernelSpec, OffGrid};
 use crate::timing::sweep::{Axis, Coords, SweepGrid};
@@ -171,7 +171,7 @@ impl KernelSpec for DsaSparseMlaPrefillSpec {
         input: &Self::Input,
         _backend: &'static str,
     ) -> OffGrid<Self::Input> {
-        OffGrid::Rate(RateWork::Bytes(logical_bytes(config, input)))
+        OffGrid::Bandwidth(logical_bytes(config, input))
     }
 
     fn enumerate(

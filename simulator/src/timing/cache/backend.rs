@@ -10,17 +10,6 @@ use crate::timing::cache::interp::{CoverageFlags, LeafMetrics};
 use crate::timing::cache::{build_cache, Cache, CacheKind, OutlierWarning, PeakRates};
 use crate::timing::sweep::SweepGrid;
 
-/// The work an input does, in the units its backend's profiler reports, for a
-/// past-the-grid answer that holds a rate: the achieved FLOP rate or the
-/// achieved bandwidth of the nearest grid point.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum RateWork {
-    /// Logical FLOPs; time follows at the edge's TFLOPS.
-    Flops(f64),
-    /// Logical bytes; time follows at the edge's bandwidth.
-    Bytes(f64),
-}
-
 /// Per-backend cache wrapper: a fitted `Box<dyn Cache>` and the range of each
 /// grid axis. `*Kernel` runs best-of-N over a `Vec<BackendCache>` via `eval`.
 pub(crate) struct BackendCache {
@@ -58,27 +47,23 @@ impl BackendCache {
             .all(|(&x, &(lo, hi))| (lo..=hi).contains(&x))
     }
 
-    /// The answer past the grid that holds the nearest grid point's rate:
+    /// The answer past the grid that holds the nearest grid point's bandwidth:
     /// clamp `sweep` into the grid, read that point, and scale all its metrics
-    /// by `work` over the point's own work (its logical FLOPs or bytes), so the
-    /// input runs at the edge's TFLOPS or bandwidth. Flagged `EXTRAPOLATED`.
-    /// Falls back to the cache's own extrapolation when the edge reports no
-    /// work of that kind.
-    pub(crate) fn eval_at_edge_rate(&self, sweep: &[f64], work: RateWork) -> LeafMetrics {
+    /// by the input's logical `bytes` over the point's own, so the input runs
+    /// at the edge's bandwidth. Flagged `EXTRAPOLATED`. Falls back to the
+    /// cache's own extrapolation when the edge reports no bytes.
+    pub(crate) fn eval_at_edge_bandwidth(&self, sweep: &[f64], bytes: f64) -> LeafMetrics {
         let clamped: Vec<f64> = sweep
             .iter()
             .zip(&self.bounds)
             .map(|(&x, &(lo, hi))| x.clamp(lo, hi))
             .collect();
         let mut edge = self.cache.eval(&clamped);
-        let (work, edge_work) = match work {
-            RateWork::Flops(flops) => (flops, f64::from(edge.m.flops)),
-            RateWork::Bytes(bytes) => (bytes, f64::from(edge.m.bytes)),
-        };
-        if !(edge_work > 0.0 && edge_work.is_finite() && work.is_finite() && work >= 0.0) {
+        let edge_bytes = f64::from(edge.m.bytes);
+        if !(edge_bytes > 0.0 && edge_bytes.is_finite() && bytes.is_finite() && bytes >= 0.0) {
             return self.cache.eval(sweep);
         }
-        edge.m.scale((work / edge_work) as f32);
+        edge.m.scale((bytes / edge_bytes) as f32);
         edge.coverage |= CoverageFlags::EXTRAPOLATED;
         edge
     }
@@ -98,7 +83,7 @@ impl BackendCache {
 
 #[cfg(test)]
 mod tests {
-    use super::{BackendCache, RateWork};
+    use super::BackendCache;
     use crate::timing::bridge::KernelMetrics;
     use crate::timing::cache::interp::CoverageFlags;
     use crate::timing::cache::CacheKind;
@@ -133,7 +118,7 @@ mod tests {
     }
 
     #[test]
-    fn past_the_grid_holds_the_edge_rate() {
+    fn past_the_grid_holds_the_edge_bandwidth() {
         let grid = SweepGrid::new(vec![vec![1.0, 2.0]]);
         let (cache, _warnings) = BackendCache::fit(
             "single_gemm",
@@ -146,15 +131,11 @@ mod tests {
         assert!(cache.contains(&[2.0]));
         assert!(!cache.contains(&[10.0]));
 
-        // The edge (x=2) runs 3 ms at 2 GB/s and 1 TFLOPS: 6e6 bytes, 3e9 FLOPs.
-        // The cache's own line would give 19 ms at x=10.
-        let at_bandwidth = cache.eval_at_edge_rate(&[10.0], RateWork::Bytes(2e7));
+        // The edge (x=2) runs 3 ms at 2 GB/s: 6e6 bytes. The cache's own line
+        // would give 19 ms at x=10.
+        let at_bandwidth = cache.eval_at_edge_bandwidth(&[10.0], 2e7);
         assert!((at_bandwidth.m.time_ms - 10.0).abs() < 1e-4);
         assert!((at_bandwidth.m.energy_j - 10.0 / 3.0).abs() < 1e-4);
         assert!(at_bandwidth.coverage.contains(CoverageFlags::EXTRAPOLATED));
-
-        let at_tflops = cache.eval_at_edge_rate(&[10.0], RateWork::Flops(6e9));
-        assert!((at_tflops.m.time_ms - 6.0).abs() < 1e-4);
-        assert!((at_tflops.m.bytes - 1.2e7).abs() < 1.0);
     }
 }
