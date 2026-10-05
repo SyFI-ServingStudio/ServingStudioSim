@@ -13,9 +13,6 @@ from profiling.runners.exceptions import ProfilerNotImplemented
 # and hc_mult from the tensor shapes, so neither the GPU nor the stream geometry
 # is a launch constraint; every runner checks its outputs against vLLM's Torch
 # implementation before timing, which rejects a geometry a kernel mishandles.
-# DeepSeek V4 production geometry, kept as the documented default.
-HIDDEN_SIZE = 4096
-HC_MULT = 4
 RMS_EPS = 1e-6
 HC_EPS = 1e-6
 POST_MULTIPLIER = 2.0
@@ -27,8 +24,6 @@ def mix_width(hc_mult: int) -> int:
     return hc_mult * (hc_mult + 2)
 
 
-MIX_WIDTH = mix_width(HC_MULT)
-
 _BF16_BYTES = 2
 _FP32_BYTES = 4
 
@@ -36,8 +31,8 @@ _FP32_BYTES = 4
 @dataclass(frozen=True)
 class Shape:
     num_tokens: int
-    hidden_size: int = HIDDEN_SIZE
-    hc_mult: int = HC_MULT
+    hidden_size: int
+    hc_mult: int
 
 
 @dataclass(frozen=True)
@@ -150,9 +145,6 @@ def assert_outputs_close(torch: Any, actual: tuple[Any, ...], expected: tuple[An
 __all__ = [
     "CommonInputs",
     "HC_EPS",
-    "HC_MULT",
-    "HIDDEN_SIZE",
-    "MIX_WIDTH",
     "POST_MULTIPLIER",
     "RMS_EPS",
     "SINKHORN_ITERATIONS",
