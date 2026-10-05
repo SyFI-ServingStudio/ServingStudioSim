@@ -48,7 +48,6 @@ DOC = KernelDoc(
     ),
     default_metric="memory_bandwidth_gbps",
     method=(f"{CUPTI_METHOD} Three warm-up calls run first; every launch of the call is counted."),
-    caveats=("Only q_dim = 1536 and kv_dim = 512 on H200 and B200 are measured.",),
     reference=None,
 )
 

@@ -63,7 +63,6 @@ DOC = KernelDoc(
     caveats=(
         "Logits increase with key position, so the selection is deterministic "
         "rather than driven by model scores.",
-        "Only compress_ratio 4, top_k 512 and a 512 MiB logits limit on H200 are measured.",
     ),
     # The output check is local to the measured runner; there is no separate reference module.
     reference=None,

@@ -68,9 +68,6 @@ DOC = KernelDoc(
     caveats=(
         "Neither the increasing uniform logits nor the random max_ragged "
         "template follows a live indexer's score distribution.",
-        "max_ragged rows are measured only with next_n = 1 and top_k = 512, by "
-        "vllm_fork_cuda on H200; uniform rows with top_k = 2048, and with "
-        "top_k = 512 by vllm_cuda on B200.",
         "Off SM90 the check before timing accepts a long row that differs from "
         "the reference only when the kernel's known threshold-bin buffer "
         "overflow explains the difference; such a row's timing is the "

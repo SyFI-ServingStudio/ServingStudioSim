@@ -70,7 +70,7 @@ class GdnChunkDeltaRuleArgs(KernelArgs):
     num_heads: int = arg(unit="heads", doc="Output heads with separate values and states.")
     key_head_dim: int = arg(unit="elements", doc="Features in each key and query head.")
     value_head_dim: int = arg(unit="elements", doc="Features in each value and output head.")
-    dtype: DType = arg(doc="Element type of query, key and value inputs; only bf16 is measured.")
+    dtype: DType = arg(doc="Element type of query, key and value inputs.")
 
 
 DOC = KernelDoc(
@@ -106,7 +106,6 @@ DOC = KernelDoc(
         "boundaries and outputs are allocated before the capture."
     ),
     caveats=(
-        "Only H200 is measured.",
         "Each call starts from an all-zero state.",
         "The 64-token width appears only in the FLOP estimate; bytes count "
         "minimum logical traffic, not physical traffic.",

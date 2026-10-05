@@ -73,8 +73,6 @@ DOC = KernelDoc(
     caveats=(
         "Queries and keys are deterministic FP8 values; projection, "
         "quantization and key gathering are not included.",
-        "Only compress_ratio 4, 64 heads of 128 elements and a 512 MiB logits "
-        "buffer on H200 are measured.",
         "GB/s counts logical bytes for the valid query-key pairs, not physical "
         "memory transactions.",
     ),

@@ -77,8 +77,7 @@ DOC = KernelDoc(
         "flashinfer_trtllm_fp8 also accepts rope_dim = 0, with its own cache "
         "layout. vllm_flashmla_bf16 needs selected_k to be a multiple of "
         "FlashMLA's top-k tile: 128 on SM90, and 64 at 64 heads or 128 otherwise "
-        "on SM10x. Measured rows use selected_k = 2048, and also 2176 for "
-        "flashinfer_trtllm_fp8.",
+        "on SM10x.",
         "GB/s includes 8 bytes per query head for the max-logit and log-sum-exp"
         " outputs, even for backends that return only the attention output.",
     ),

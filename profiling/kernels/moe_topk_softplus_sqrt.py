@@ -55,8 +55,7 @@ DOC = KernelDoc(
         "before timing."
     ),
     caveats=(
-        "Only 256 experts and top_k = 6 on H200 are measured; hash mode uses a "
-        "129,280-entry table.",
+        "Hash mode uses a 129,280-entry table.",
         "The correction bias, the hash table and the token IDs are synthetic.",
         "GB/s counts logical inputs and outputs, not the whole hash table.",
     ),

@@ -61,8 +61,7 @@ DOC = KernelDoc(
         "GB/s counts the logical operand elements, not the gaps in the packed "
         "storage the strided views skip.",
         "Each backend fixes k and n to its layout: k = 192 or 256, n = 512 for "
-        "query absorption and k = 512, n = 256 for value expansion. Measured rows "
-        "use 8, 16, 32 or 64 heads.",
+        "query absorption and k = 512, n = 256 for value expansion.",
         "torch_mla_v_up reads an attention output padded to 64 heads, so it takes "
         "at most 64 heads.",
     ),

@@ -62,8 +62,7 @@ DOC = KernelDoc(
         "Tensor-parallel attention and MLP blocks end with an all-reduce of the "
         "row-parallel projection's output, so every GPU holds the full sum. "
         "message_size_bytes is the full buffer each GPU contributes, not a shard. "
-        "Measured on the GPUs of one node, over whatever links connect them "
-        "(NVLink so far)."
+        "Measured on the GPUs of one node, over whatever links connect them."
     ),
     category="Communication",
     formula=(

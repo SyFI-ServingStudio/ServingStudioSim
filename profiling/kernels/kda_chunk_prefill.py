@@ -109,8 +109,7 @@ DOC = KernelDoc(
         "sequences is checked against a per-token PyTorch reference."
     ),
     caveats=(
-        "Only num_heads = 16 and head_dim = 128 on B200 are measured. FLA's chunk "
-        "kernels take head_dim up to 256.",
+        "FLA's chunk kernels take head_dim up to 256.",
         "Each one-token decode sequence occupies a whole 64-token chunk in the "
         "chunk-parallel kernels.",
         "The timed calls reuse one cu_seqlens tensor, so FLA's cached chunk-index "

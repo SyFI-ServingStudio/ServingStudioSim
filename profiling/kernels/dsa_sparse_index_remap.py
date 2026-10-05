@@ -75,8 +75,7 @@ DOC = KernelDoc(
         " captured from serving.",
         "selected_k must be a positive multiple of 128, the tile width vLLM's "
         "Triton wrapper asserts; any block size works while the slot ids fit "
-        "in int32. Measured rows use 64-token blocks with selected_k = 2048 "
-        "or 2176.",
+        "in int32.",
     ),
     reference="profiling.runners.attention.dsa_sparse_index_remap_reference",
 )

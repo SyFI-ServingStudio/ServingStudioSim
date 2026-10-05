@@ -58,7 +58,6 @@ DOC = KernelDoc(
         "sequence. Outputs are checked against the reference first."
     ),
     caveats=(
-        "vllm_cuda is measured only for 256 experts and top_k = 8 in bf16 on H200.",
         "TFLOPS counts comparisons and exponentials as nominal operations.",
         "GB/s counts one logits read and the three outputs; the torch backend's"
         " workspaces are not counted.",

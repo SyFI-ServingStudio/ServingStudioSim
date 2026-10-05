@@ -46,10 +46,9 @@ DOC = KernelDoc(
     default_metric="memory_bandwidth_gbps",
     method=(f"{CUPTI_METHOD} Five warm-up calls run first. Every launch of the call is counted."),
     caveats=(
-        "Only top_k = 6 and hidden_dim = 4096 in bf16 on H200 are measured.",
-        "Those rows were measured on a vLLM build that fell back to torch's "
-        "reduce_kernel at top_k = 6; newer builds use a dedicated vectorized "
-        "kernel.",
+        "At top_k = 6 the profiling vLLM build fell back to torch's "
+        "reduce_kernel, so those rows time that kernel; newer builds use a "
+        "dedicated vectorized kernel.",
     ),
     reference="profiling.runners.moe.moe_sum_reference",
 )

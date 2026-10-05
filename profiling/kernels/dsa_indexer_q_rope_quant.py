@@ -59,8 +59,8 @@ DOC = KernelDoc(
         "included."
     ),
     caveats=(
-        "Only 128-element heads with 64 RoPE elements first and no Hadamard "
-        "transform are measured, on B200.",
+        "The runner takes only 128-element heads with 64 RoPE elements first "
+        "and no Hadamard transform.",
         "GB/s counts logical input and output bytes, including the FP8 queries "
         "and FP32 weights, not physical memory transactions.",
     ),

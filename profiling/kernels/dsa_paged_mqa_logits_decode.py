@@ -79,8 +79,7 @@ DOC = KernelDoc(
     ),
     caveats=(
         "Uniform rows give every request the same context length and every "
-        "logical page its own physical page. max_ragged rows are measured only "
-        "with next_n = 1, 64 heads and a 1,048,576-wide score row, on H200.",
+        "logical page its own physical page.",
         "Both backends' TFLOPS and GB/s use the page-rounded DeepGEMM schedule;"
         " GB/s excludes the scheduling metadata, torch intermediates and "
         "physical transactions.",

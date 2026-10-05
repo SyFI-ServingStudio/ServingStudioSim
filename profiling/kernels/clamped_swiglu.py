@@ -57,7 +57,6 @@ DOC = KernelDoc(
         "reference precede capture. Every launch of vLLM's callable is counted."
     ),
     caveats=(
-        "Only hidden_dim = 2048 in bf16 on H200 is measured.",
         "GB/s counts the two bf16 input halves and one bf16 output, without "
         "counting any temporary traffic.",
     ),

@@ -93,8 +93,7 @@ DOC = KernelDoc(
         "single-step PyTorch reference and the states are restored."
     ),
     caveats=(
-        "Only num_heads = 16 and head_dim = 128 on B200 are measured; the kernel "
-        "takes any head_dim.",
+        "The kernel takes any head_dim.",
         "Only a plain decode step is measured, one token per request and no speculative decoding.",
         "The short causal convolution before the call is a separate kind, gdn_causal_conv_decode.",
         "GB/s counts each input once and leaves out the copies' extra reads and writes.",
