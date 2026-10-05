@@ -16,6 +16,7 @@ use crate::op::attention::DsaSparseMlaExactVarlenConfig;
 use crate::op::Op;
 use crate::timing::bridge::DType;
 use crate::timing::expert_demand::ExpertDemand;
+use crate::timing::kernels::all_reduce_fusion::flashinfer_fusion_workspace;
 use crate::timing::kernels::{
     AllReduceFusionKernel, AllReduceFusionKernelConfig, AllReduceFusionKernelInput,
     AllReduceFusionSpec, AllReduceKernel, AllReduceKernelConfig, AllReduceKernelInput,
@@ -48,10 +49,6 @@ use crate::worklet::{
 
 const ARCH_KIND: &str = "glm52_sglang_nvfp4_tp_dsa_moe";
 const NUM_LAYERS: u32 = 78;
-/// Every TP boundary in this graph is FlashInfer's fused all-reduce, whose
-/// workspace policy covers TP 2/4/8 only. TP1 has no TP boundary, so this graph
-/// does not describe it.
-const FUSED_ALLREDUCE_TP_SIZES: [u16; 3] = [2, 4, 8];
 const NUM_DENSE_LAYERS: u32 = 3;
 const NUM_INITIAL_SHARED_LAYERS: u32 = 3;
 const NUM_SPARSE_CYCLES: u32 = 18;
@@ -261,10 +258,13 @@ pub fn build_configs(
     mtp_mode: Glm52MtpMode,
 ) -> Result<Glm52SglangNvfp4TpDsaMoeConfigs, BuildError> {
     validate_model_cfg(model).map_err(fit_failed)?;
-    if !FUSED_ALLREDUCE_TP_SIZES.contains(&parallel.tp_size) {
+    // Every TP boundary in this graph is FlashInfer's fused all-reduce, so it
+    // describes exactly the TPs whose fusion workspace exists on the GPU (TP1
+    // has no TP boundary and no workspace).
+    if flashinfer_fusion_workspace(&parallel.gpu_name, u32::from(parallel.tp_size)).is_none() {
         return Err(fit_failed(format!(
-            "tp_size {} has no FlashInfer fused all-reduce; expected one of {FUSED_ALLREDUCE_TP_SIZES:?}",
-            parallel.tp_size
+            "tp_size {} has no FlashInfer fused all-reduce on {}",
+            parallel.tp_size, parallel.gpu_name
         )));
     }
     if MOE_INTERMEDIATE_DIM % u32::from(parallel.tp_size) != 0 {
@@ -1818,28 +1818,22 @@ mod tests {
     #[test]
     fn invalid_parallel_and_batch_contracts_fail_closed() {
         let routing = ExpertDemand::popularity(&RoutingDistribution::uniform(NUM_EXPERTS), 1);
-        // Any TP with a fused all-reduce builds; others have no TP boundary
-        // kernel (0, 1, 16) or do not divide the head and FFN widths (3, 6).
-        for tp_size in FUSED_ALLREDUCE_TP_SIZES {
-            assert!(build_configs(
-                &model(),
-                &parallel(tp_size),
-                &routing,
-                false,
-                Glm52MtpMode::Off,
-            )
-            .is_ok());
+        // Any TP with a fused all-reduce on the GPU builds (B200's SM100 fuses
+        // TP16 too); others have no TP boundary kernel (0, 1, and 16 on H200)
+        // or do not divide the head and FFN widths (3, 6).
+        let builds = |tp_size, gpu: &str| {
+            let mut parallel = parallel(tp_size);
+            parallel.gpu_name = gpu.to_string();
+            build_configs(&model(), &parallel, &routing, false, Glm52MtpMode::Off).is_ok()
+        };
+        for tp_size in [2, 4, 8, 16] {
+            assert!(builds(tp_size, "NVIDIA B200"), "TP{tp_size}");
         }
-        for tp_size in [0, 1, 3, 6, 16] {
-            assert!(build_configs(
-                &model(),
-                &parallel(tp_size),
-                &routing,
-                false,
-                Glm52MtpMode::Off,
-            )
-            .is_err());
+        for tp_size in [0, 1, 3, 6] {
+            assert!(!builds(tp_size, "NVIDIA B200"), "TP{tp_size}");
         }
+        assert!(builds(8, "NVIDIA H200"));
+        assert!(!builds(16, "NVIDIA H200"));
         // max_model_len is a parametric kernel config field, bounded only by
         // the checkpoint's context.
         for max_model_len in [1, 8_192, 32_768, 524_289, CHECKPOINT_MAX_CONTEXT] {

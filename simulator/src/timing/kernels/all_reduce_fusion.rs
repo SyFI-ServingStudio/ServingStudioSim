@@ -44,12 +44,12 @@ pub struct AllReduceFusionSpec;
 /// vLLM's default FlashInfer fused all-reduce workspace, in bytes, by the GPU's
 /// compute capability and TP (`FI_ALLREDUCE_FUSION_MAX_SIZE_MB` in
 /// `vllm/compilation/passes/fusion/allreduce_rms_fusion.py`). vLLM keys it by
-/// the exact capability, so SM103 (B300) is not SM100 (B200, GB200). Both
-/// fused all-reduce kinds read it.
-pub(crate) fn flashinfer_fusion_max_bytes(gpu_name: &str, num_gpus: u32) -> u64 {
-    let capability = compute_capability(gpu_name)
-        .unwrap_or_else(|| panic!("{gpu_name} has no compute capability in gpu/spec.json"));
-    let kib: u64 = match (capability, num_gpus) {
+/// the exact capability, so SM103 (B300) is not SM100 (B200, GB200). `None`
+/// where vLLM does not fuse: a TP or GPU with no row, or a GPU with no compute
+/// capability in gpu/spec.json. Both fused all-reduce kinds read it, and an
+/// arch whose every TP boundary is this fusion admits exactly its TPs.
+pub(crate) fn flashinfer_fusion_workspace(gpu_name: &str, num_gpus: u32) -> Option<u64> {
+    let kib: u64 = match (compute_capability(gpu_name)?, num_gpus) {
         ((9, 0), 2) => 64 * 1024,
         ((9, 0), 4) => 2 * 1024,
         ((9, 0), 8) => 512,
@@ -61,12 +61,20 @@ pub(crate) fn flashinfer_fusion_max_bytes(gpu_name: &str, num_gpus: u32) -> u64 
         ((10, 3), 8) => 4 * 1024,
         ((10, 7), 2 | 4) => 64 * 1024,
         ((10, 7), 8) => 2 * 1024,
-        ((major, minor), tp) => panic!(
-            "vLLM has no FlashInfer all-reduce fusion workspace for {gpu_name} \
-             (SM{major}{minor}) at TP {tp}"
-        ),
+        _ => return None,
     };
-    kib * 1024
+    Some(kib * 1024)
+}
+
+/// [`flashinfer_fusion_workspace`] for a fused kernel config, which exists
+/// only where vLLM fuses.
+pub(crate) fn flashinfer_fusion_max_bytes(gpu_name: &str, num_gpus: u32) -> u64 {
+    flashinfer_fusion_workspace(gpu_name, num_gpus).unwrap_or_else(|| {
+        panic!(
+            "vLLM has no FlashInfer all-reduce fusion workspace for {gpu_name} at TP \
+             {num_gpus} (or gpu/spec.json has no compute capability for it)"
+        )
+    })
 }
 
 impl AllReduceFusionSpec {
