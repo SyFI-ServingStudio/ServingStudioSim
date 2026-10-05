@@ -111,24 +111,13 @@ pub struct ConfigUse {
 /// Version of the document [`config_records_document`] builds.
 pub const CONFIG_RECORDS_SCHEMA_VERSION: u32 = 1;
 
-/// `records` as the JSON document `--kernel-configs-out` writes.
+/// `records` as the JSON document `cost-trees --kernel-configs` gives each
+/// build under `kernel_configs`.
 pub fn config_records_document(records: &[KernelConfigRecord]) -> serde_json::Value {
     serde_json::json!({
         "schema_version": CONFIG_RECORDS_SCHEMA_VERSION,
         "configs": records,
     })
-}
-
-/// Write [`config_records_document`] of `records` to `path`.
-pub fn write_config_records(
-    path: &std::path::Path,
-    records: &[KernelConfigRecord],
-) -> anyhow::Result<()> {
-    use anyhow::Context;
-    let text =
-        serde_json::to_string(&config_records_document(records)).expect("config records serialize");
-    std::fs::write(path, text)
-        .with_context(|| format!("writing kernel config records {}", path.display()))
 }
 
 /// Version of the document [`dry_run_document`] builds.

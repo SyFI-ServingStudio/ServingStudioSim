@@ -31,9 +31,7 @@ use simulator::sim::{
     run_sim, trace_formats, ArrivalSchedule, CapacityLimit, InputFileFormat, InputFileSchema,
     LoadedTrace, TickCfg, TraceFrontend, TraceTag,
 };
-use simulator::timing::bridge::{
-    dry_run_document, print_dry_run, write_config_records, write_dry_run_report,
-};
+use simulator::timing::bridge::{dry_run_document, print_dry_run, write_dry_run_report};
 use simulator::timing::PerfApiBridge;
 use simulator::timing_predict::PredictMode;
 
@@ -65,7 +63,7 @@ enum Cmd {
     /// Run one simulation.
     Run(RunArgs),
     /// Prebuild the profile.db kernel cache, then exit without simulating.
-    BuildCacheOnly(CacheArgs),
+    BuildCacheOnly(RunArgs),
     /// Report how many kernel specs are missing from profile.db (the JIT work a
     /// cache build would do), per kernel, then exit without building or running.
     DryRun(DryRunArgs),
@@ -132,9 +130,6 @@ struct PredictArgs {
     /// Validate and report missing `profile.db` specs; cost and write nothing.
     #[arg(long)]
     dry_run: bool,
-    /// See [`CacheArgs::kernel_configs_out`].
-    #[arg(long, value_name = "FILE")]
-    kernel_configs_out: Option<PathBuf>,
     /// See [`DryRunArgs::report_json`], without `pools`.
     #[arg(long, value_name = "FILE", requires = "dry_run")]
     report_json: Option<PathBuf>,
@@ -148,28 +143,15 @@ struct CostTreeArgs {
     #[arg(value_name = "FILE")]
     archs: PathBuf,
     /// Also give each build's kernel configs (with the grid of args each one
-    /// reads) under `kernel_configs`, as the document `--kernel-configs-out`
-    /// writes.
+    /// reads) under `kernel_configs`: `{"schema_version": 1, "configs": [...]}`.
     #[arg(long)]
     kernel_configs: bool,
-}
-
-/// `build-cache-only` / `dry-run`: a run config, and where to write the kernel
-/// configs the build asks profile.db for.
-#[derive(Args)]
-struct CacheArgs {
-    /// Path to the structured run config (`.yaml` / `.yml` / `.json`).
-    config: PathBuf,
-    /// Write every kernel config the build asks profile.db for, with the grid
-    /// of args each one reads, to this JSON file once the command succeeds.
-    #[arg(long, value_name = "FILE")]
-    kernel_configs_out: Option<PathBuf>,
 }
 
 #[derive(Args)]
 struct DryRunArgs {
     #[command(flatten)]
-    cache: CacheArgs,
+    run: RunArgs,
     /// Also write the report to this JSON file: `{"schema_version": 1,
     /// "kernels": [{name, kind, missing, total}], "missing", "total",
     /// "pools": [{role, max_model_len, draft_tokens}]}`, one `pools` entry per
@@ -179,7 +161,7 @@ struct DryRunArgs {
     report_json: Option<PathBuf>,
 }
 
-/// Shared payload for `run` / `build-cache-only` / `dry-run`: a path to one
+/// Shared payload for `run` / `build-cache-only` / `dry-run` / `emit-backends`: a path to one
 /// structured config file. The `deployment` tag inside it picks the topology.
 #[derive(Args)]
 struct RunArgs {
@@ -290,14 +272,8 @@ fn main() -> anyhow::Result<()> {
 fn dispatch(cmd: Cmd) -> Result<()> {
     match cmd {
         Cmd::Run(args) => cmd_run(&args.config),
-        Cmd::BuildCacheOnly(args) => {
-            cmd_build_cache(&args.config, args.kernel_configs_out.as_deref())
-        }
-        Cmd::DryRun(args) => cmd_dry_run(
-            &args.cache.config,
-            args.cache.kernel_configs_out.as_deref(),
-            args.report_json.as_deref(),
-        ),
+        Cmd::BuildCacheOnly(args) => cmd_build_cache(&args.config),
+        Cmd::DryRun(args) => cmd_dry_run(&args.run.config, args.report_json.as_deref()),
         Cmd::EmitBackends(args) => cmd_emit_backends(&args.config),
         Cmd::ListParams => {
             // serde_json::Value serializes infallibly; pretty for `list-params`.
@@ -330,7 +306,6 @@ fn dispatch(cmd: Cmd) -> Result<()> {
             } else {
                 PredictMode::Run
             },
-            args.kernel_configs_out.as_deref(),
             args.report_json.as_deref(),
         ),
         Cmd::WorkloadPlan(args) => {
@@ -417,13 +392,10 @@ fn cmd_run(config: &Path) -> anyhow::Result<()> {
 /// `count_missing` and never fits, so no kernel time is needed to discover what
 /// is missing. JIT stays off throughout: nothing is profiled on demand, and
 /// `issue_collected` does all the measuring.
-fn cmd_build_cache(config: &Path, kernel_configs_out: Option<&Path>) -> anyhow::Result<()> {
+fn cmd_build_cache(config: &Path) -> anyhow::Result<()> {
     let cfg = load_config(config)?;
     let bridge = PerfApiBridge::new().context("starting the PyO3 perf_api bridge")?;
     bridge.enable_dry_run();
-    if kernel_configs_out.is_some() {
-        bridge.enable_config_records();
-    }
     bridge
         .begin_collect()
         .context("starting the profiling collect pass")?;
@@ -450,9 +422,6 @@ fn cmd_build_cache(config: &Path, kernel_configs_out: Option<&Path>) -> anyhow::
         .issue_collected(total_missing)
         .context("measuring the collected profiling work")?;
     tracing::info!("cache build complete: profile.db populated");
-    if let Some(path) = kernel_configs_out {
-        write_config_records(path, &bridge.take_config_records())?;
-    }
     Ok(())
 }
 
@@ -461,17 +430,10 @@ fn cmd_build_cache(config: &Path, kernel_configs_out: Option<&Path>) -> anyhow::
 /// how many of its specs are absent from `profile.db` (the JIT work a real cache
 /// build would do). Exits before the tick loop. JIT stays off so nothing is
 /// profiled — this is a read-only coverage probe.
-fn cmd_dry_run(
-    config: &Path,
-    kernel_configs_out: Option<&Path>,
-    report_json: Option<&Path>,
-) -> anyhow::Result<()> {
+fn cmd_dry_run(config: &Path, report_json: Option<&Path>) -> anyhow::Result<()> {
     let cfg = load_config(config)?;
     let bridge = PerfApiBridge::new().context("starting the PyO3 perf_api bridge")?;
     bridge.enable_dry_run();
-    if kernel_configs_out.is_some() {
-        bridge.enable_config_records();
-    }
     let store: SharedRequests = Rc::new(RefCell::new(RequestStore::new()));
     let _flow = build_flow(&cfg, &bridge, store)?;
 
@@ -482,9 +444,6 @@ fn cmd_dry_run(
         let mut document = dry_run_document(&report);
         document["pools"] = serde_json::to_value(pool_bounds(&cfg)?)?;
         write_dry_run_report(path, &document)?;
-    }
-    if let Some(path) = kernel_configs_out {
-        write_config_records(path, &bridge.take_config_records())?;
     }
     Ok(())
 }

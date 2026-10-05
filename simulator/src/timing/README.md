@@ -195,6 +195,4 @@ makes `Kernel::build` record, in any bridge mode, each config it builds:
 values only), the GPU, the sweep grid with the args of each cell (without
 `backend`, which must be the only column that differs between a config's
 backends), the infeasible cells, and every `(pool, role)` that built it.
-`build-cache-only`, `dry-run` and `timing-predict` write them with
-`--kernel-configs-out FILE`, and `cost-trees --kernel-configs` gives each arch
-block's under `kernel_configs`.
+`cost-trees --kernel-configs` gives each arch block's under `kernel_configs`.

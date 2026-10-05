@@ -1881,8 +1881,9 @@ pub struct ArchBuild {
     pub predict: Option<PredictShape>,
     /// The cost tree, in the `cost_manifest/*.json` form; `None` on error.
     pub cost_manifest: Option<crate::timing::CostManifestDoc>,
-    /// The kernel configs the build asks profile.db for, as the document
-    /// `--kernel-configs-out` writes; only when asked for, and `None` on error.
+    /// The kernel configs the build asks profile.db for, as
+    /// [`config_records_document`](crate::timing::bridge::config_records_document)
+    /// builds; only when asked for, and `None` on error.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kernel_configs: Option<serde_json::Value>,
     /// Per `cost_manifest` section, per slot: the index in `kernel_configs`'
@@ -3027,8 +3028,8 @@ mod tests {
         }
     }
 
-    /// Asked for, each build carries the kernel configs it builds, in the
-    /// document `--kernel-configs-out` writes; otherwise none.
+    /// Asked for, each build carries the kernel configs it builds; otherwise
+    /// none.
     #[test]
     fn arch_blocks_carry_their_kernel_configs_when_asked() {
         for b in build_arch_blocks(&sample_blocks(), true) {
