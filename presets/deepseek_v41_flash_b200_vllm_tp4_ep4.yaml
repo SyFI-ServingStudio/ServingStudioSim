@@ -12,7 +12,6 @@ workload:
   input_file_format: text-generation-independent
   arrival_mode: saturated
   max_concurrency: 48
-  session_dependency: independent
   run_to_end: true
 
 io:
