@@ -149,7 +149,7 @@ def _validate_args(
             f"{_BACKEND} supports storage identity {_STORAGE_IDENTITY}, got {storage_identity}"
         )
     # vLLM's index width (vllm/models/deepseek_v4/nvidia/flashmla.py):
-    # round_up(top_k + window_size, 128), 128 or 640 for DeepSeek V4.
+    # round_up(top_k + window_size, 128).
     padded_topk = -(-(selected_k + window_size) // _TOPK_ALIGNMENT) * _TOPK_ALIGNMENT
     return _Shape(
         query_context_pairs,

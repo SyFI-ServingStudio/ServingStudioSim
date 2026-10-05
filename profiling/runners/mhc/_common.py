@@ -6,9 +6,9 @@ from typing import Any
 from profiling.db.args import DType
 from profiling.runners.exceptions import ProfilerNotImplemented
 
-# The post/pre boundary callables are shared by DeepSeek V4 and GLM-5.3-Flash.
-# GLM-5.3-Flash runs them with rms_norm_eps=1e-5 instead of RMS_EPS below; the
-# eps is a scalar and does not change the launch sequence or the timing.
+# Every model with mHC boundaries launches these same post/pre callables, some
+# with an rms_norm_eps other than RMS_EPS below; the eps is a scalar and does
+# not change the launch sequence or the timing.
 # The TileLang kernels are JIT-compiled for the current GPU and take hidden_size
 # and hc_mult from the tensor shapes, so neither the GPU nor the stream geometry
 # is a launch constraint; every runner checks its outputs against vLLM's Torch

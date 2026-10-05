@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 from profiling.runners.exceptions import ProfilerNotImplemented
 
-# DeepSeek V4 builds the indexer only on C4 layers
+# The indexer is built only on C4 layers
 # (vllm/models/deepseek_v4/attention.py: `if self.compress_ratio == 4`).
 _INDEXER_COMPRESS_RATIO = 4
 

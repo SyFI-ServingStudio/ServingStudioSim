@@ -11,7 +11,7 @@ from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerN
 from profiling.runners.metrics import ComputeMetrics
 
 _BACKEND = "compressed_sparse_mla_decode:vllm_flashmla_fp8_cudagraph"
-# vLLM's paged layout for each DeepSeek V4 layer kind: the SWA-only layer has no
+# vLLM's paged layout for each compressed-attention layer kind: the SWA-only layer has no
 # extra cache; C4 and C128 compressed caches page 64 and 2 rows per block.
 _PAGE_SIZE = {1: 0, 4: 64, 128: 2}
 _PLANNER_MODES = frozenset({"planned", "reused"})

@@ -1,4 +1,4 @@
-"""Profile GLM-5.2's production SM100 varlen sparse-MLA prefill launch."""
+"""Profile the production SM100 varlen sparse-MLA prefill launch."""
 
 from __future__ import annotations
 
