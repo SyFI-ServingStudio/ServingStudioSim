@@ -47,9 +47,11 @@ impl<M: IterwiseUnifiedModel> UnifiedIterExecution<M> {
                 group.prefill_tokens += chunk_tokens;
             });
             if batch_plan.partition_runs_decode(partition) {
-                kv_store.visit_decode_members(partition, |_, current_kv| {
-                    group.decode_kv_lens.push(current_kv as u32);
-                    group.total_kv_len += current_kv as u32;
+                kv_store.visit_decode_members(partition, |request, current_kv| {
+                    if batch_plan.decode_member_runs(partition, request) {
+                        group.decode_kv_lens.push(current_kv as u32);
+                        group.total_kv_len += current_kv as u32;
+                    }
                 });
             }
             group.decode_tokens = group.decode_kv_lens.len() as u32;

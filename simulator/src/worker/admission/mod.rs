@@ -9,7 +9,7 @@ mod chunked_prefill_admission;
 mod decode_completion;
 mod fresh_request_slot_admission;
 mod local_prefill_decode_admission;
-mod pipelined_prefill_admission;
+mod pipelined_chunked_prefill_admission;
 mod placement;
 mod policy;
 mod prefill_handoff_admission;
@@ -20,7 +20,7 @@ pub use decode_completion::{
 };
 pub use fresh_request_slot_admission::FreshRequestSlotAdmission;
 pub use local_prefill_decode_admission::LocalPrefillDecodeAdmission;
-pub use pipelined_prefill_admission::PipelinedPrefillAdmission;
+pub use pipelined_chunked_prefill_admission::PipelinedChunkedPrefillAdmission;
 pub use placement::LoadBalance;
 pub(crate) use policy::EnqueueSequence;
 pub use policy::{
@@ -58,16 +58,24 @@ pub trait IterAdmission<K: KvStore> {
 ///
 /// Several microbatches are in flight at once, so a request's prefill progress
 /// is committed when its chunk is scheduled (`commit_microbatch`), and its
-/// completion waits until that microbatch leaves the last stage
-/// (`complete_microbatch`). The shell keeps one ticket per in-flight microbatch.
+/// token and completion wait until that microbatch leaves the last stage
+/// (`complete_microbatch`). A running request has at most one microbatch in
+/// flight. The shell keeps one ticket per in-flight microbatch.
 pub trait MicrobatchAdmission<K: KvStore> {
     /// What completion needs to know about one formed microbatch.
     type Ticket;
 
     fn accept_request(&mut self, kv_store: &mut K, request: RequestId, context: &WorkerContext);
-    /// Schedule the next microbatch's chunks into KV. `false` when nothing can run.
-    fn form_microbatch(&mut self, kv_store: &mut K, context: &WorkerContext, now: Time) -> bool;
-    /// Called after execution lowered the scheduled chunks: commit their prefill
+    /// Schedule the next microbatch's prefill chunks into KV and its decodes
+    /// into `batch_plan`. `false` when nothing can run.
+    fn form_microbatch(
+        &mut self,
+        kv_store: &mut K,
+        context: &WorkerContext,
+        batch_plan: &mut IterBatchPlan,
+        now: Time,
+    ) -> bool;
+    /// Called after execution lowered the microbatch: commit its prefill
     /// progress so the next microbatch can carry each request's following chunk.
     fn commit_microbatch(&mut self, kv_store: &mut K, now: Time) -> Self::Ticket;
     /// The microbatch left the last stage at `at`; push the requests it finished.

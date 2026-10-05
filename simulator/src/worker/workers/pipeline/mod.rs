@@ -14,22 +14,23 @@ pub(crate) use build_pipeline_stage_worker::build_pipeline_stage_worker;
 pub use pipeline_head_worker::{PipelineHeadWorker, PipelineLayout};
 pub use pipeline_stage_worker::PipelineStageWorker;
 
-use crate::worker::admission::{PendingOrder, PipelinedPrefillAdmission};
+use crate::worker::admission::{PendingOrder, PipelinedChunkedPrefillAdmission};
 use crate::worker::execution::UnifiedIterExecution;
 use crate::worker::kv::{FullAttnKv, HybridGdnKv};
 
 /// Production pipeline head: full-attention KV sized for the stage with the most
-/// KV per token, prefill-only pipelined chunk admission, and stage-0 execution.
+/// KV per token, pipelined chunked prefill and decode admission, and stage-0
+/// execution.
 pub type PipelineHead<M> = PipelineHeadWorker<
     FullAttnKv,
-    PipelinedPrefillAdmission<PendingOrder>,
+    PipelinedChunkedPrefillAdmission<PendingOrder>,
     UnifiedIterExecution<M>,
 >;
 /// Pipeline head of a hybrid recurrent + full-attention model: one block pool
 /// for per-token attention KV and per-request recurrent state.
 pub type HybridPipelineHead<M> = PipelineHeadWorker<
     HybridGdnKv,
-    PipelinedPrefillAdmission<PendingOrder>,
+    PipelinedChunkedPrefillAdmission<PendingOrder>,
     UnifiedIterExecution<M>,
 >;
 /// Production follower stage.
