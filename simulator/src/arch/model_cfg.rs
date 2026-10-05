@@ -91,7 +91,8 @@ pub fn max_position_embeddings(path: &Path) -> Result<u32> {
     let config = raw.get("text_config").unwrap_or(&raw);
     let value = config.get("max_position_embeddings").with_context(|| {
         format!(
-            "model config {} has no max_position_embeddings; give the arch a max_model_len",
+            "model config {} has no max_position_embeddings, which this arch takes as its \
+             longest request; add the checkpoint's value to the config",
             path.display()
         )
     })?;
