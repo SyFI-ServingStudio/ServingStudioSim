@@ -71,11 +71,15 @@ _ROCPD_SUFFIXES = ("_results.db", ".db")
 VLLM_V1_MULTIPROCESSING_ENV = "VLLM_ENABLE_V1_MULTIPROCESSING"
 
 #: The env var each worker process carries its rank in, used to template a
-#: per-rank rocprofv3 output name for TP>1. vLLM sets ``RANK`` (global) and
-#: ``LOCAL_RANK`` (per-node) on every worker; ``RANK`` is the default so each of
-#: the N worker processes writes a distinct ``<name>_rank<N>_results.db``. The
-#: exact var that is populated in the traced worker must be confirmed on the
-#: 8-GPU TP run (see the runbook); it is configurable for that reason.
+#: per-rank rocprofv3 output name for TP>1, so each of the N workers writes a
+#: distinct ``<name>_rank<N>_results.db``. NOTE: vLLM's V1 offline
+#: ``LLM(tensor_parallel_size=N)`` MultiprocExecutor does NOT export this (it
+#: passes each worker its rank as a constructor kwarg, not an env var — only the
+#: Ray path calls ``update_environment_variables``). The ``roctx_shim`` stamps the
+#: worker's global rank into ``RANK`` (and ``LOCAL_RANK``) on the first forward,
+#: which rocprofv3 — resolving ``%q{ENV}%`` at output-finalize time — picks up when
+#: it writes the per-process rocpd. It is configurable in case a future stack
+#: populates a different var.
 OUTPUT_RANK_ENV_DEFAULT = "RANK"
 
 #: Body of the generated ``sitecustomize.py`` prepended to the launched server's

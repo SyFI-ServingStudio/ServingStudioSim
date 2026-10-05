@@ -50,6 +50,14 @@ from typing import Callable, Iterator, Protocol, runtime_checkable
 #: annotation off entirely (a pass that must not carry instrumentation).
 ROCTX_SCOPES_ENV = "VLLM_ROCTX_SCOPES_FOR_PROFILING"
 
+#: Env vars the shim stamps with this worker's global rank on the first forward so
+#: rocprofv3's per-rank ``-o <name>_rank%q{RANK}%`` template resolves per worker
+#: (see :func:`install_vllm_roctx_shim`). ``RANK`` matches ``rocprof_capture``'s
+#: ``OUTPUT_RANK_ENV_DEFAULT``; ``LOCAL_RANK`` is stamped defensively (equal on a
+#: single node) so a ``--rank-env LOCAL_RANK`` capture resolves identically.
+WORKER_RANK_ENV = "RANK"
+WORKER_LOCAL_RANK_ENV = "LOCAL_RANK"
+
 #: The ``vllm.general_plugins`` entry-point name this package registers for
 #: :func:`install_vllm_roctx_shim` (see ``pyproject.toml``). vLLM auto-loads and
 #: calls every entry point in that group in each worker process unless
@@ -625,10 +633,49 @@ def install_vllm_roctx_shim(
     _, sentinel = select_sentinel_launcher(sentinel_name)
     annotator = IterationAnnotator(backend, enabled=True, sentinel=sentinel)
 
+    # Stamp this worker's global rank into RANK/LOCAL_RANK so rocprofv3's per-rank
+    # output template ``-o <name>_rank%q{RANK}%`` resolves to a distinct path per
+    # worker. vLLM's V1 offline ``LLM(tensor_parallel_size=N)`` MultiprocExecutor
+    # passes each worker its rank as a constructor kwarg and does NOT export
+    # ``RANK``/``LOCAL_RANK`` into the process environment (only the Ray path calls
+    # ``update_environment_variables``), so the template would otherwise expand to
+    # the empty string and every worker would collide on one ``<name>_rank_*`` DB.
+    # rocprofv3 resolves ``%q{ENV}%`` at output-finalize time, so stamping on the
+    # first forward — after vLLM's distributed init has run — is still picked up
+    # when the per-process rocpd file is written. We stamp once per process (the
+    # first ``execute_model``); single-node TP ⇒ global rank == local rank ==
+    # 0..N-1, exactly what the downstream filename→rank merge expects. Because the
+    # whole shim only installs when ``VLLM_ROCTX_SCOPES_FOR_PROFILING=1`` (gated
+    # above), the serving path is byte-identical when profiling is off.
+    _rank_stamped = {"done": False}
+
+    def _stamp_rank_env_once() -> None:
+        if _rank_stamped["done"]:
+            return
+        _rank_stamped["done"] = True
+        try:
+            import torch.distributed as dist  # noqa: PLC0415
+
+            if dist.is_available() and dist.is_initialized():
+                rank = dist.get_rank()
+            else:
+                from vllm.distributed.parallel_state import (  # noqa: PLC0415
+                    get_world_group,
+                )
+
+                rank = get_world_group().rank_in_group
+        except Exception:
+            # Never let rank stamping perturb a forward; a missing rank just leaves
+            # the template unresolved, which the capture's per-rank gate surfaces.
+            return
+        os.environ[WORKER_RANK_ENV] = str(rank)
+        os.environ[WORKER_LOCAL_RANK_ENV] = str(rank)
+
     def _wrap_execute_model(runner_cls: type) -> None:
         original_execute_model = runner_cls.execute_model
 
         def execute_model(self, scheduler_output, *args, **kwargs):  # type: ignore[no-untyped-def]
+            _stamp_rank_env_once()
             record = _forward_record_from_scheduler_output(scheduler_output)
             with annotator.forward(record=record):
                 return original_execute_model(self, scheduler_output, *args, **kwargs)
