@@ -46,17 +46,11 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from launcher.corpus import resolve_hf_references, resolve_reference
+from launcher.__main__ import InvalidPreset, expand_preset
+from launcher.corpus import resolve_reference
 from launcher.exec import ERROR_JSON, _build_subprocess_env, binary_error, binary_path
 from launcher.process.leases import LauncherLeases
-from launcher.schema import (
-    _format_log_dir,
-    expand_sweep_params,
-    normalize_params,
-    validate_expanded,
-    validate_params,
-)
-from launcher.schema.argv import write_config
+from launcher.schema.argv import build_cli_command
 from launcher.schema.loader import Registry
 from public_api.deployments import DeploymentIndex
 from public_api.predict import _cause, missing_by_role
@@ -152,12 +146,15 @@ class Workload(BaseModel):
 # -- run configs ---------------------------------------------------------------
 
 
-def _speculative_draft(member: SimMember) -> int | None:
-    """The draft width of the member's speculative worker; None without one."""
-    for pool in member.pools.values():
-        if pool["worker"]["type"] == "speculative":
-            return int(pool["worker"].get("draft_tokens", 5))
-    return None
+def _drafts(member: SimMember) -> bool:
+    """Whether one of the member's pools runs a speculative worker."""
+    return any(pool["worker"]["type"] == "speculative" for pool in member.pools.values())
+
+
+def _draft_tokens(bounds: list[dict] | None) -> int | None:
+    """How many tokens the drafting pool drafts, as the simulator's ``bounds``
+    (:attr:`SimMember.bounds`) say; None when no pool drafts or before a build."""
+    return next((b["draft_tokens"] for b in bounds or [] if b["draft_tokens"]), None)
 
 
 def run_tree(
@@ -193,102 +190,101 @@ def run_tree(
 
 def concrete(tree: dict, registry: Registry) -> dict:
     """``tree`` as the launcher hands it to a run: validated against the
-    simulator's schema, every default filled, captures fetched to local files.
-    The launcher's own expansion of one preset, without the sweep."""
-    errors = validate_params(tree, registry)
-    if errors:
-        raise BadWorkload("; ".join(errors))
-    (candidate,) = expand_sweep_params(tree, registry)
-    errors = validate_expanded(candidate, registry)
-    if errors:
-        raise BadWorkload("; ".join(errors))
-    return resolve_hf_references(_format_log_dir(normalize_params(candidate, registry)))
+    simulator's schema, every default filled, captures fetched to local files
+    (the launcher's :func:`~launcher.__main__.expand_preset` of one run)."""
+    try:
+        (candidate,) = expand_preset(tree, registry, "the simulation")
+    except InvalidPreset as error:
+        raise BadWorkload(str(error)) from None
+    return candidate
 
 
-def missing_rows(
+def check_capture(
     index: DeploymentIndex,
     member: SimMember,
     capture: Capture,
     registry: Registry,
     build_type: str = "release",
-) -> dict[str, int]:
-    """Build ``member`` on ``capture`` the way a run does (``simulator
-    dry-run``: the deployment's ``build_flow``, nothing simulated) and return
-    the profile.db rows its kernels lack, ``{kernel role: count}``. Raises with
-    the simulator's message when it does not build."""
-    # The capture's trace as its header reads (a speculative capture's records
-    # its acceptance); a speculative worker reads one either way.
-    source = trace_source(Path(resolve_reference(capture.trace)), capture.name, build_type)
-    tags = list(source.input_file_tags)
-    if _speculative_draft(member) and "speculative" not in tags:
-        tags.append("speculative")
-    workload = {
-        "trace_files": [capture.trace],
-        "input_file_format": source.input_file_format,
-        "input_file_tags": tags,
-        "arrival_mode": "trace_timed",
-        "run_to_end": True,
-        "request_rate": 1.0,
-    }
-    with tempfile.TemporaryDirectory(prefix="public-sim-check-") as directory:
-        scratch = Path(directory)
-        config = concrete(run_tree(index, member, capture, workload, scratch), registry)
-        path = write_config(config, scratch / "run_config.yaml")
-        report, error = scratch / "dry_run_report.json", scratch / ERROR_JSON
-        argv = [str(binary_path(build_type)), "dry-run", str(path)]
-        argv += ["--report-json", str(report), "--error-json", str(error)]
-        env = {**_build_subprocess_env(), "RUST_LOG": "warn"}
-        with _LEASES.profile_database(write=False):
-            result = subprocess.run(
-                argv, cwd=REPO_ROOT, env=env, capture_output=True, text=True, check=False
-            )
-        if result.returncode:
-            raise RuntimeError(_cause(binary_error(error), result.stderr, scratch))
-        return missing_by_role(json.loads(report.read_text()))
+    *,
+    build: bool = True,
+) -> tuple[dict[str, int] | None, dict | None, list[dict] | None]:
+    """What a run of ``member`` on ``capture`` meets, from the run's own checks
+    of one run config, its trace written as a run writes it
+    (:func:`write_trace`):
 
+    - with ``build``, the profile.db rows its kernels lack, ``{kernel role:
+      count}`` (``simulator dry-run``: the deployment's ``build_flow``, nothing
+      simulated); raises with the simulator's message when it does not build;
+    - how the capture's requests do not fit its pools (:func:`plan_run`):
+      ``{"reason", "requests", "total", "max_model_len"}``, the counts when the
+      simulator gives them; None when they fit;
+    - the pools' request bounds (:attr:`SimMember.bounds`): the build's, else
+      the member's own.
 
-def misfit(
-    index: DeploymentIndex,
-    member: SimMember,
-    capture: Capture,
-    registry: Registry,
-    build_type: str = "release",
-) -> dict | None:
-    """How ``capture``'s requests do not fit ``member``'s pools, replayed as a
-    run replays them (:func:`write_trace`, then the simulator's own check,
-    :func:`plan_run`): ``{"reason", "requests", "total", "max_model_len"}``,
-    the counts when the simulator names them; None when they fit. A drafting
-    member stands in an acceptance the capture lacks: the reader gives one, and
-    its value does not change whether a request fits."""
+    A drafting member stands in an acceptance the capture lacks: the reader
+    gives one, and its value changes neither answer."""
     source = trace_source(Path(resolve_reference(capture.trace)), capture.name, build_type)
     stand_in = None
-    if _speculative_draft(member) and "speculative" not in source.input_file_tags:
+    if _drafts(member) and "speculative" not in source.input_file_tags:
         stand_in = 1.0
     workload = Workload(source="capture", capture=capture.name, accept_rate=stand_in)
-    with tempfile.TemporaryDirectory(prefix="public-sim-fit-") as directory:
+    with tempfile.TemporaryDirectory(prefix="public-sim-check-") as directory:
         scratch = Path(directory)
         path = scratch / _TRACE
-        tags, _ = write_trace(member, source, workload, path)
+        # The build gives the pools' bounds, which decide the trace's
+        # shortening: written once for the build, again with them.
+        bounds = None if build else member.bounds
+        tags, _ = write_trace(member, source, workload, path, bounds)
         trace = TraceSource(path, source.input_file_format, tuple(tags), source.name)
         config = concrete(run_tree(index, member, capture, read_block(trace), scratch), registry)
+        missing = None
+        if build:
+            missing, bounds = _dry_run(config, scratch, build_type)
+            write_trace(member, source, workload, path, bounds)
         try:
             plan_run(config, build_type)
+            misfit = None
         except BadWorkload as refusal:
-            return {"reason": str(refusal), **(refusal.too_long or {})}
-    return None
+            misfit = {"reason": str(refusal), **(refusal.too_long or {})}
+    return missing, misfit, bounds
+
+
+def _dry_run(config: dict, scratch: Path, build_type: str) -> tuple[dict[str, int], list[dict]]:
+    """``simulator dry-run`` of ``config``: the profile.db rows it lacks, and
+    its pools' request bounds."""
+    report, error = scratch / "dry_run_report.json", scratch / ERROR_JSON
+    argv = build_cli_command(
+        config, binary_path(build_type), scratch / "run_config.yaml", "dry-run", error_json=error
+    )
+    env = {**_build_subprocess_env(), "RUST_LOG": "warn"}
+    with _LEASES.profile_database(write=False):
+        result = subprocess.run(
+            [*argv, "--report-json", str(report)],
+            cwd=REPO_ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    if result.returncode:
+        raise RuntimeError(_cause(binary_error(error), result.stderr, scratch))
+    document = json.loads(report.read_text())
+    return missing_by_role(document), document["pools"]
 
 
 # -- workloads -----------------------------------------------------------------
 
 
-def _accept_rate(member: SimMember, workload: Workload, source: TraceSource) -> str | None:
+def _accept_rate(
+    member: SimMember, workload: Workload, source: TraceSource, draft: int | None
+) -> str | None:
     """The ``accept_rate`` cell to add to every row, or None to add none. A
     member that drafts nothing takes no acceptance; a speculative one takes the
     request's ``accept_rate`` or the trace's own column (a source tagged
     ``speculative``), never both, since one would silently override the other.
-    The simulator checks the values against the worker (``plan_run``)."""
-    draft = _speculative_draft(member)
-    if draft is None:
+    The simulator checks the values against the worker (``plan_run``); ``draft``
+    is its draft width, when known, for the message."""
+    if not _drafts(member):
         if workload.accept_rate is not None:
             raise BadWorkload("accept_rate applies only to a speculative worker")
         return None
@@ -297,10 +293,11 @@ def _accept_rate(member: SimMember, workload: Workload, source: TraceSource) -> 
     if rate is None:
         if own:
             return None
+        width = f"{draft}, " if draft else ""
         raise BadWorkload(
-            f"a speculative worker drafting {draft} tokens needs workload.accept_rate: "
-            f"one probability, or {draft}, one per draft position; or upload a trace "
-            "tagged speculative with its own accept_rate column"
+            "a speculative worker needs workload.accept_rate: one probability, or "
+            f"{width}one per draft position; or upload a trace tagged speculative with "
+            "its own accept_rate column"
         )
     if own:
         raise BadWorkload(
@@ -309,23 +306,20 @@ def _accept_rate(member: SimMember, workload: Workload, source: TraceSource) -> 
     return json.dumps(rate) if isinstance(rate, list) else repr(float(rate))
 
 
-def _fit_draft_window(member: SimMember, rows: list[dict]) -> int:
+def _fit_draft_window(bounds: list[dict] | None, rows: list[dict]) -> int:
     """Shorten, in place, each request a speculative worker could not finish
     only because its last verify reads ``draft_tokens`` past the request: the
     simulator verifies a fixed width, where vLLM drafts fewer tokens near
-    ``max_model_len`` and serves it. Such a request loses at most
-    ``draft_tokens`` tokens, from its output while it keeps one, then its
-    input. A request longer than ``max_model_len`` itself is left for the
-    simulator to refuse. Returns how many requests were shortened."""
-    draft = _speculative_draft(member)
-    bounds = [
-        pool["arch_params"]["max_model_len"]
-        for pool in member.pools.values()
-        if pool["worker"]["type"] == "speculative" and "max_model_len" in pool["arch_params"]
-    ]
-    if draft is None or not bounds:
+    ``max_model_len`` and serves it. ``bounds`` are the simulator's (the pools'
+    ``max_model_len`` and ``draft_tokens``, :attr:`SimMember.bounds`). Such a
+    request loses at most ``draft_tokens`` tokens, from its output while it
+    keeps one, then its input. A request longer than ``max_model_len`` itself is
+    left for the simulator to refuse. Returns how many requests were shortened."""
+    drafting = [b for b in bounds or [] if b["draft_tokens"]]
+    if not drafting:
         return 0
-    bound = int(min(bounds))
+    pool = min(drafting, key=lambda b: b["max_model_len"] - b["draft_tokens"])
+    bound, draft = pool["max_model_len"], pool["draft_tokens"]
     shortened = 0
     for row in rows:
         lengths = {k: int(row[k]) for k in ("prefix_len", "input_len", "output_len") if k in row}
@@ -344,6 +338,7 @@ def write_trace(
     source: TraceSource,
     workload: Workload,
     out: Path,
+    bounds: list[dict] | None,
 ) -> tuple[list[str], int]:
     """Write the trace this run replays to ``out``: the source's rows, every
     column kept, with an ``accept_rate`` column for a speculative worker. A
@@ -351,7 +346,7 @@ def write_trace(
     capture's, which records its acceptance) without that column and tag: the
     acceptance belongs to the capture's proposer, not to the requests.
     A request that misses a speculative worker's draft window by a few tokens
-    is shortened to fit (:func:`_fit_draft_window`). Returns the trace's tags
+    is shortened to fit the pools' ``bounds`` (:func:`_fit_draft_window`). Returns the trace's tags
     and how many requests were shortened; raises :class:`BadWorkload` on a
     trace the member cannot serve."""
     with open(source.path, newline="") as stream:
@@ -362,13 +357,13 @@ def write_trace(
         raise BadWorkload(
             f"{source.name} has {len(rows)} requests; at most {MAX_REQUESTS} per simulation"
         )
-    accept = _accept_rate(member, workload, source)
+    accept = _accept_rate(member, workload, source, _draft_tokens(bounds))
     tags = list(source.input_file_tags)
-    if _speculative_draft(member) is None and "speculative" in tags:
+    if not _drafts(member) and "speculative" in tags:
         tags.remove("speculative")
         fields.remove("accept_rate")
         rows = [{k: v for k, v in row.items() if k != "accept_rate"} for row in rows]
-    shortened = _fit_draft_window(member, rows)
+    shortened = _fit_draft_window(bounds, rows)
     if accept:
         fields.append("accept_rate")
         tags.append("speculative")
@@ -520,7 +515,8 @@ class Simulation:
     def save(self) -> None:
         path = self.directory / _RECORD
         tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self.record(), indent=1))
+        # The request again as it was asked, so a restart reads it back whole.
+        tmp.write_text(json.dumps(self.record() | {"_request": self.request}, indent=1))
         os.replace(tmp, path)
 
 
@@ -581,13 +577,9 @@ class Simulations:
             try:
                 data = json.loads(record.read_text())
                 created, started, finished = data.pop("_stamps")
+                request = data.pop("_request")
             except (OSError, ValueError, KeyError):
                 continue
-            request = {
-                key: data[key]
-                for key in ("preset", "params", "workload", "routing", "gpus")
-                if key in data
-            }
             sim = Simulation(
                 id=data["simulation_id"],
                 directory=record.parent,
@@ -835,7 +827,7 @@ class SimulationService:
         try:
             source = self._source(workload, capture, directory)
             path = directory / _TRACE
-            tags, shortened = write_trace(member, source, workload, path)
+            tags, shortened = write_trace(member, source, workload, path, member.bounds)
             trace = TraceSource(path, source.input_file_format, tuple(tags), source.name)
             facts = trace_facts(plan(read_block(trace), self.queue.build_type))
             block = workload_block(workload, trace, facts)

@@ -9,6 +9,7 @@ import subprocess
 import pytest
 import yaml
 
+from launcher.alignment_campaign.check import ROUTING_FILES
 from profiling.perf_api import DB_PATH
 from public_api import predict
 from public_api import preset as public_preset
@@ -20,7 +21,6 @@ CAPTURE = re.compile(
     r"^hf://datasets/UW-SyFI/servingstudio-workload@[0-9a-f]{40}/"
     r"[a-z0-9_]+/[a-z0-9_]+/[a-z0-9_]+/capture/\d{8}/(popularity|manifest)\.json$"
 )
-CAPTURE_FIELDS = ("expert_popularity_file", "token_corpus_file")
 SYNTHETIC = ("uniform", "random")
 
 
@@ -67,7 +67,7 @@ def test_a_workload_names_its_routing_and_a_pinned_capture(path):
 
     for name, row in rows.items():
         assert re.fullmatch(r"[a-z0-9_]+", name)
-        captures = {field: row.get(field) for field in CAPTURE_FIELDS if row.get(field)}
+        captures = {field: row.get(field) for field in ROUTING_FILES.values() if row.get(field)}
         if row["routing"] in SYNTHETIC:
             assert name == row["routing"] and not captures, name
             continue
@@ -90,7 +90,7 @@ def test_every_moe_member_states_its_routing(sim_bin):
             # There is no default routing: a capture, or uniform/random written out.
             assert arch.get("routing") in ("uniform", "random", "popularity", "corpus"), path
             if arch["routing"] in ("uniform", "random"):
-                assert not any(arch.get(field) for field in CAPTURE_FIELDS), path
+                assert not any(arch.get(field) for field in ROUTING_FILES.values()), path
 
 
 @pytest.mark.needs_binary

@@ -62,7 +62,11 @@ def sims(bound) -> sim_preset.SimIndex:
     """:func:`bound`'s presets, built through the simulator's ``dry-run``, as
     the service checks them at start."""
     sims, registry = bound
-    sims.check(lambda member, capture: simulate.missing_rows(sims.index, member, capture, registry))
+    sims.check(
+        lambda member, capture, build: simulate.check_capture(
+            sims.index, member, capture, registry, build=build
+        )
+    )
     return sims
 
 
@@ -83,12 +87,15 @@ def test_an_moe_member_replays_its_captures_never_a_synthetic_routing(sims):
 def test_every_sim_member_builds_and_is_measured(sims):
     """Each member, on each capture it offers, builds through the deployment's
     ``build_flow`` and finds every profile.db row in the shipped profile.db:
-    the site offers only simulations it can run from measurements."""
+    the site offers only simulations it can run from measurements. A capture
+    longer than a member's context is a misfit of its requests, not of the
+    member (the test below)."""
     unavailable = [
-        (preset.id, member.params, member.summary(sims.index)["unavailable"])
+        (preset.id, member.params, capture, reason)
         for preset in sims.presets.values()
         for member in preset.members
-        if member.summary(sims.index)["unavailable"]
+        for capture, reason in member.summary(sims.index)["unavailable"].items()
+        if "misfit" not in reason
     ]
     assert not unavailable
 
@@ -101,14 +108,19 @@ def test_a_capture_longer_than_the_members_context_does_not_fit(bound):
     sims, registry = bound
     preset = "GLM-5.3-Flash/glm53_flash_vllm_fp8_kda_dsa_moe_chunked_prefill"
     short = sims.member(preset, {"replicas": 1, "server": "ctx8k"})
-    found = simulate.misfit(sims.index, short, short.capture("diverse_100"), registry)
+    _, found, _ = simulate.check_capture(
+        sims.index, short, short.capture("diverse_100"), registry, build=False
+    )
     assert {k: found[k] for k in ("requests", "total", "max_model_len")} == {
         "requests": 46,
         "total": 100,
         "max_model_len": 8192,
     }
     long = sims.member(preset, {"replicas": 1, "server": "ctx128k"})
-    assert simulate.misfit(sims.index, long, long.capture("diverse_100"), registry) is None
+    _, fits, _ = simulate.check_capture(
+        sims.index, long, long.capture("diverse_100"), registry, build=False
+    )
+    assert fits is None
 
 
 def _plan_run(bound, tmp_path, preset: str, params: dict, rows: str, tags: list[str]) -> list:

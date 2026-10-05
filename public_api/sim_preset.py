@@ -26,9 +26,10 @@ public site already predicts, and what the arch presets prove (it builds, its
 rows are measured) carries over. The expanded list is the support list: a
 combination is supported when a sim preset has a member for it.
 
-The workload is the request's (:mod:`public_api.simulate`). Today it is a
-capture: one ``workload`` row of the pools' arch preset, whose routing file the
-arch reads and whose ``trace.csv`` the run replays. An arch that routes no
+The workload is the request's (:mod:`public_api.simulate`): a capture's
+requests, requests of the reader's shape, or the reader's file. The routing is
+always a capture's: one ``workload`` row of the pools' arch preset, whose
+routing file the arch reads and whose ``trace.csv`` a capture run replays. An arch that routes no
 experts (a dense model) has no capture rows; its member replays the requests
 of any published capture (each distinct trace once), with nothing read from
 that capture's routing.
@@ -45,17 +46,15 @@ from typing import Any
 
 import yaml
 
+from launcher.alignment_campaign.check import ROUTING_FILES
 from launcher.corpus import resolve_reference
-from launcher.schema.expand import expand_sweep_params
 from public_api import preset as public_preset
-from public_api.deployments import DeploymentIndex, Member, _axes, _text
+from public_api.deployments import DeploymentIndex, Member, _axes, find_member
 
 REPO_ROOT = public_preset.REPO_ROOT
 SIM_PRESET_ROOT = REPO_ROOT / "presets" / "public_sim"
 
-_CONTROL = ("sweep", "compound", "derived", "constraints")
 # Routing a capture row binds; `uniform` / `random` rows are synthetic, not captures.
-_CAPTURE_FIELDS = {"popularity": "expert_popularity_file", "corpus": "token_corpus_file"}
 
 
 class SimPresetError(ValueError):
@@ -72,7 +71,7 @@ def load(path: Path) -> dict:
     preset = yaml.safe_load(path.read_text())
     if not isinstance(preset, dict):
         raise SimPresetError(f"{path}: not a mapping")
-    unknown = sorted(set(preset) - {"deployment", "pools", *_CONTROL})
+    unknown = sorted(set(preset) - {"deployment", "pools", *public_preset.CONTROL})
     if unknown:
         raise SimPresetError(f"{path}: unknown keys {unknown}; a sim preset has no workload")
     if not isinstance(preset.get("deployment"), str):
@@ -114,12 +113,8 @@ def members(preset: dict) -> list[dict]:
     ``{placement?, replicas, arch_preset, arch_params, worker}``. ``labels``
     names the member by its swept values, a compound group by its row label."""
     tree = {key: preset[key] for key in ("deployment", "pools")}
-    control = {key: preset[key] for key in _CONTROL if key in preset}
-    swept = [*preset.get("sweep", {}), *preset.get("compound", {})]
     out = []
-    for candidate in expand_sweep_params(tree | control, registry=None):
-        env = candidate["_env"]
-        labels = candidate.get("_sweep_labels", {})
+    for candidate, labels in public_preset.expand(preset, tree):
         pools = {}
         for role, pool in candidate["pools"].items():
             group = pool["groups"][0]
@@ -133,7 +128,7 @@ def members(preset: dict) -> list[dict]:
             }
         out.append(
             {
-                "labels": {name: labels.get(name, env[name]) for name in swept},
+                "labels": labels,
                 "deployment": candidate["deployment"],
                 "pools": pools,
             }
@@ -152,7 +147,6 @@ class Capture:
     # `hf://datasets/...@<sha>/<dir>/trace.csv`.
     trace: str
     routing: str | None = None
-    routing_file: str | None = None
     # The arch preset row this capture is; None for a dense member's.
     arch_row: str | None = None
 
@@ -168,7 +162,7 @@ def _row_captures(rows: dict) -> list[Capture]:
     """An arch preset's capture rows, in its order (the first is its default)."""
     out = []
     for label, row in rows.items():
-        field_name = _CAPTURE_FIELDS.get(row.get("routing"))
+        field_name = ROUTING_FILES.get(row.get("routing"))
         if field_name is None:
             continue
         reference = row[field_name]
@@ -177,7 +171,6 @@ def _row_captures(rows: dict) -> list[Capture]:
                 name=label,
                 trace=f"{_capture_dir(reference)}/trace.csv",
                 routing=row["routing"],
-                routing_file=reference,
                 arch_row=label,
             )
         )
@@ -245,8 +238,11 @@ class SimMember:
     failures: dict[str, str] = field(default_factory=dict)
     missing: dict[str, dict[str, int]] = field(default_factory=dict)
     # Per capture name: how its requests do not fit the pools as a run replays
-    # them (`simulate.misfit`). Checked for every capture, dense or not.
+    # them (`simulate.check_capture`). Checked for every capture, dense or not.
     misfits: dict[str, dict] = field(default_factory=dict)
+    # Its pools' request bounds as the simulator's build gives them
+    # (`dry-run --report-json` `pools`: role, max_model_len, draft_tokens).
+    bounds: list[dict] | None = None
 
     @property
     def dense(self) -> bool:
@@ -436,48 +432,47 @@ class SimIndex:
 
     def check(
         self,
-        dry_run: Callable[[SimMember, Capture], dict[str, int]],
-        misfit: Callable[[SimMember, Capture], dict | None] = lambda member, capture: None,
+        check: Callable[[SimMember, Capture, bool], tuple],
         *,
         jobs: int = 8,
     ) -> None:
-        """Build every member through the deployment (``dry_run``: the
-        simulator's ``dry-run`` of its run config) and record the profile.db
-        rows each lacks. A dense member is built once; an MoE member once per
-        capture, whose routing changes its kernels. Whether a capture's requests
-        fit (``misfit``) is asked of every capture: it depends on the trace."""
-        work = []
+        """Check every member's captures as a run would (``check``:
+        :func:`public_api.simulate.check_capture`), recording the profile.db
+        rows each lacks, its pools' bounds and each capture whose requests do
+        not fit. The build is asked once of a dense member and once per capture
+        of an MoE member, whose routing changes its kernels (``check``'s third
+        argument); whether the requests fit, of every capture, after the builds
+        that give the bounds they are fitted to."""
+        builds, fits = [], []
         for preset in self.presets.values():
             for member in preset.members:
                 if member.error:
                     continue
                 member.checked = member.captures[:1] if member.dense else list(member.captures)
-                work.extend(
-                    (dry_run, member, capture)
-                    for capture in member.checked
-                    if capture.name not in member.failures
-                )
-                work.extend(
-                    (misfit, member, capture)
-                    for capture in member.captures
-                    if capture.name not in member.failures
-                )
+                for capture in member.captures:
+                    if capture.name not in member.failures:
+                        built = capture in member.checked
+                        (builds if built else fits).append((member, capture, built))
 
         def one(item):
-            ask, member, capture = item
+            member, capture, build = item
             try:
-                return ask, member, capture, ask(member, capture), None
+                return member, capture, check(member, capture, build), None
             except Exception as error:  # noqa: BLE001 — the build's own message
-                return ask, member, capture, None, str(error)
+                return member, capture, None, str(error)
 
         with ThreadPoolExecutor(max_workers=jobs) as pool:
-            for ask, member, capture, answer, error in pool.map(one, work):
-                if error is not None:
-                    member.failures[capture.name] = error
-                elif ask is dry_run:
-                    member.missing[capture.name] = answer
-                elif answer is not None:
-                    member.misfits[capture.name] = answer
+            for work in (builds, fits):
+                for member, capture, answer, error in pool.map(one, work):
+                    if error is not None:
+                        member.failures[capture.name] = error
+                        continue
+                    missing, misfit, bounds = answer
+                    if missing is not None:
+                        member.missing[capture.name] = missing
+                        member.bounds = bounds
+                    if misfit is not None:
+                        member.misfits[capture.name] = misfit
 
     def preset(self, preset_id: str) -> SimPreset:
         if preset_id not in self.presets:
@@ -489,25 +484,8 @@ class SimIndex:
     def member(self, preset_id: str, params: dict[str, Any]) -> SimMember:
         """The member whose axis values are ``params``, compared as a query
         string spells them."""
-        from public_api.deployments import BadMember
-
         preset = self.preset(preset_id)
-        names = [axis["name"] for axis in preset.axes]
-        choices = [m.params for m in preset.members]
-        given = {name: _text(value) for name, value in params.items()}
-        missing = [name for name in names if name not in given]
-        unknown = sorted(set(given) - set(names))
-        if missing or unknown:
-            raise BadMember(
-                f"{preset_id} takes exactly its axes {names}"
-                + (f"; missing {missing}" if missing else "")
-                + (f"; unknown {unknown}" if unknown else ""),
-                choices,
-            )
-        for member in preset.members:
-            if all(_text(member.params[name]) == given[name] for name in names):
-                return member
-        raise BadMember(f"{preset_id} has no member {given}", choices)
+        return find_member(preset_id, preset.axes, preset.members, params)[1]
 
     def catalog(self) -> list[dict]:
         return [

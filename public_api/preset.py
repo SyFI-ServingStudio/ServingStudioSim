@@ -41,7 +41,8 @@ MODEL_CATALOG = REPO_ROOT / "model" / "catalog.yaml"
 ARCH_CATALOG = REPO_ROOT / "model" / "arch_catalog.yaml"
 WORKLOAD = "workload"
 
-_CONTROL = ("sweep", "compound", "derived", "constraints")
+# The launcher's sweep language a preset may use (`launcher.schema.expand`).
+CONTROL = ("sweep", "compound", "derived", "constraints")
 
 
 class PresetError(ValueError):
@@ -57,7 +58,7 @@ def load(path: Path, catalog: dict | None = None) -> dict:
     preset = yaml.safe_load(path.read_text())
     if not isinstance(preset, dict):
         raise PresetError(f"{path}: not a mapping")
-    allowed = {"checkpoint", "gpu", "arch", *_CONTROL}
+    allowed = {"checkpoint", "gpu", "arch", *CONTROL}
     unknown = sorted(set(preset) - allowed)
     if unknown:
         raise PresetError(f"{path}: unknown keys {unknown}")
@@ -93,19 +94,23 @@ def members(preset: dict, registry: Registry | None = None) -> list[dict]:
         **tree["arch"],
         "model_config": str(REPO_ROOT / "model" / "config" / f"{preset['_config']}.json"),
     }
-    control = {key: preset[key] for key in _CONTROL if key in preset}
+    return [
+        {
+            "gpu": candidate["gpu"],
+            "arch": normalize_arch(candidate["arch"], registry) if registry else candidate["arch"],
+            "labels": labels,
+        }
+        for candidate, labels in expand(preset, tree)
+    ]
+
+
+def expand(preset: dict, tree: dict) -> list[tuple[dict, dict]]:
+    """``tree`` expanded by ``preset``'s sweep language (:data:`CONTROL`), each
+    member with its labels: its swept values, a compound group by its row label."""
+    control = {key: preset[key] for key in CONTROL if key in preset}
+    swept = [*preset.get("sweep", {}), *preset.get("compound", {})]
     out = []
     for candidate in expand_sweep_params(tree | control, registry=None):
-        env = candidate["_env"]
-        labels = candidate.get("_sweep_labels", {})
-        swept = [*preset.get("sweep", {}), *preset.get("compound", {})]
-        out.append(
-            {
-                "gpu": candidate["gpu"],
-                "arch": (
-                    normalize_arch(candidate["arch"], registry) if registry else candidate["arch"]
-                ),
-                "labels": {name: labels.get(name, env[name]) for name in swept},
-            }
-        )
+        env, labels = candidate["_env"], candidate.get("_sweep_labels", {})
+        out.append((candidate, {name: labels.get(name, env[name]) for name in swept}))
     return out

@@ -168,13 +168,21 @@ def sims(tmp_path: Path, arch_presets: Path) -> SimIndex:
     config.write_text(json.dumps({"max_position_embeddings": 131072}))
     sims = SimIndex.build(_arch_index(config), paths)
 
-    def dry_run(member, capture):
+    def check(member, capture, build):
         pool = member.pools["main"] if "main" in member.pools else None
-        if pool and pool["replicas"] == 2 and pool["arch_params"] == {"tp_size": 2}:
-            return {"layer.qkv": 1}
-        return {}
+        lacks = pool and pool["replicas"] == 2 and pool["arch_params"] == {"tp_size": 2}
+        # The pools' bounds as the simulator's dry-run reports them.
+        bounds = [
+            {"role": role, "max_model_len": MAX_MODEL_LEN, "draft_tokens": DRAFT}
+            if pool["worker"]["type"] == "speculative"
+            else {"role": role, "max_model_len": 131072, "draft_tokens": None}
+            for role, pool in member.pools.items()
+        ]
+        if not build:
+            return None, None, member.bounds
+        return {"layer.qkv": 1} if lacks else {}, None, bounds
 
-    sims.check(dry_run, jobs=2)
+    sims.check(check, jobs=2)
     return sims
 
 
@@ -431,10 +439,11 @@ def test_a_capture_too_long_for_a_member_is_that_captures_misfit(sims) -> None:
     names = [capture.name for capture in spec.captures]
     too_long = {"reason": "3 of 4 requests exceed", "requests": 3, "total": 4, "max_model_len": 8}
 
-    def misfit(member, capture):
-        return too_long if member is spec and capture.name == names[0] else None
+    def check(member, capture, build):
+        fits = member is not spec or capture.name != names[0]
+        return {} if build else None, None if fits else too_long, member.bounds
 
-    sims.check(lambda member, capture: {}, misfit, jobs=2)
+    sims.check(check, jobs=2)
     assert spec.summary(sims.index)["unavailable"] == {names[0]: {"misfit": too_long}}
     assert spec.runnable(spec.capture(names[0])) == "3 of 4 requests exceed"
     # Its routing still serves requests that are not its own.

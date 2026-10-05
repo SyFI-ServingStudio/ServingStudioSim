@@ -100,10 +100,9 @@ def main(argv: list[str] | None = None) -> int:
     registry = schema_from_dict(sources.list_params())
     sims = SimIndex.build(index)
     sims.check(
-        lambda member, capture: simulate.missing_rows(
-            index, member, capture, registry, args.build_type
+        lambda member, capture, build: simulate.check_capture(
+            index, member, capture, registry, args.build_type, build=build
         ),
-        lambda member, capture: simulate.misfit(index, member, capture, registry, args.build_type),
         jobs=args.jobs,
     )
     args.runs_dir.mkdir(parents=True, exist_ok=True)

@@ -33,7 +33,7 @@ from public_api import preset as public_preset
 
 REPO_ROOT = public_preset.REPO_ROOT
 
-# How a `Dim` serializes in a manifest's `kernel_config`.
+
 class UnknownDeployment(LookupError):
     """No public preset has this id."""
 
@@ -171,6 +171,28 @@ def _section(section: dict, configs: list[str | None]) -> dict:
         for slot, config in zip(section["slots"], configs, strict=True)
     ]
     return {"section": section["section"], "slots": slots}
+
+
+def find_member(preset_id: str, axes: list[dict], members: list, params: dict[str, Any]):
+    """``(position, member)`` of the one of ``members`` whose ``axes`` values are
+    ``params``: each axis, no other name, compared as a query string spells
+    them. Raises :class:`BadMember` with the choices otherwise."""
+    names = [axis["name"] for axis in axes]
+    choices = [m.params for m in members]
+    given = {name: _text(value) for name, value in params.items()}
+    missing = [name for name in names if name not in given]
+    unknown = sorted(set(given) - set(names))
+    if missing or unknown:
+        raise BadMember(
+            f"{preset_id} takes exactly its axes {names}"
+            + (f"; missing {missing}" if missing else "")
+            + (f"; unknown {unknown}" if unknown else ""),
+            choices,
+        )
+    for position, member in enumerate(members):
+        if all(_text(member.params[name]) == given[name] for name in names):
+            return position, member
+    raise BadMember(f"{preset_id} has no member {given}", choices)
 
 
 class DeploymentIndex:
@@ -319,22 +341,7 @@ class DeploymentIndex:
         """The member whose axis values are ``params``: each axis, no other
         name, compared as a query string spells them."""
         preset = self.preset(preset_id)
-        names = [axis["name"] for axis in preset.axes]
-        choices = [m.params for m in preset.members]
-        given = {name: _text(value) for name, value in params.items()}
-        missing = [name for name in names if name not in given]
-        unknown = sorted(set(given) - set(names))
-        if missing or unknown:
-            raise BadMember(
-                f"{preset_id} takes exactly its axes {names}"
-                + (f"; missing {missing}" if missing else "")
-                + (f"; unknown {unknown}" if unknown else ""),
-                choices,
-            )
-        for position, member in enumerate(preset.members):
-            if all(_text(member.params[name]) == given[name] for name in names):
-                return position, member
-        raise BadMember(f"{preset_id} has no member {given}", choices)
+        return find_member(preset_id, preset.axes, preset.members, params)
 
     # -- documents -----------------------------------------------------------------
 
