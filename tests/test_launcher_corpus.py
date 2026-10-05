@@ -76,6 +76,18 @@ def test_a_reference_without_a_pinned_commit_is_refused(hub, reference):
         resolve_hf_references({"token_corpus_file": reference})
 
 
+def test_a_payload_that_cannot_be_fetched_is_a_corpus_error(hub, tmp_path):
+    """Callers catch only CorpusError, so the payload's fetch must raise it as the
+    manifest's does, not the hub's own exception."""
+    snapshot = tmp_path / "snapshot" / "glm53"
+    (snapshot / "routes.u16").unlink()
+
+    with pytest.raises(CorpusError, match="glm53/routes.u16"):
+        resolve_hf_references(
+            {"token_corpus_file": f"hf://datasets/uw/workload@{SHA}/glm53/manifest.json"}
+        )
+
+
 def test_a_manifest_whose_payload_lands_elsewhere_is_refused(tmp_path, monkeypatch):
     def fake_download(repo, revision, path):
         local = tmp_path / Path(path).name if path.endswith(".u16") else tmp_path / "a" / "b.json"

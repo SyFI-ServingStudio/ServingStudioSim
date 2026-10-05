@@ -41,6 +41,15 @@ def _download(repo: str, revision: str, path: str) -> Path:
     )
 
 
+def _fetch(repo: str, revision: str, path: str) -> Path:
+    """Download one file of a reference; a failure is a `CorpusError`, which is
+    all a caller catches."""
+    try:
+        return _download(repo, revision, path)
+    except Exception as exc:  # noqa: BLE001 — the hub raises a wide family
+        raise CorpusError(f"fetching hf://datasets/{repo}@{revision}/{path}: {exc}") from exc
+
+
 def resolve_reference(reference: str) -> str:
     """Fetch one `hf://` reference and return the local path it resolved to.
 
@@ -56,10 +65,7 @@ def resolve_reference(reference: str) -> str:
             "not a branch or tag"
         )
     repo, revision, path = match["repo"], match["revision"], match["path"]
-    try:
-        local = _download(repo, revision, path)
-    except Exception as exc:  # noqa: BLE001 — the hub raises a wide family
-        raise CorpusError(f"fetching {reference}: {exc}") from exc
+    local = _fetch(repo, revision, path)
 
     if local.name.endswith(".json"):
         try:
@@ -67,7 +73,7 @@ def resolve_reference(reference: str) -> str:
         except json.JSONDecodeError as exc:
             raise CorpusError(f"{reference} is not readable JSON: {exc}") from exc
         if isinstance(data_file, str) and data_file:
-            payload = _download(repo, revision, str(Path(path).parent / data_file))
+            payload = _fetch(repo, revision, str(Path(path).parent / data_file))
             # The loader resolves `data_file` against the manifest's directory,
             # so that is where the hub must have put it -- a subdirectory too.
             if payload != local.parent / data_file:
