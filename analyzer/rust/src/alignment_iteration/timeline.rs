@@ -1302,6 +1302,18 @@ impl ReferenceRank {
             "idle_ms": idle_ms,
             "idle_fraction": occupancy.idle_fraction(),
             "gap_count": self.gaps.len(),
+            // Every gap, in span order, so the lane draws these rather than
+            // re-deriving them from the launches.
+            "gaps_ns": self
+                .gaps
+                .iter()
+                .map(|gap| {
+                    [
+                        (gap.start_ns as i64) - (time_origin_ns as i64),
+                        (gap.end_ns as i64) - (time_origin_ns as i64),
+                    ]
+                })
+                .collect::<Vec<_>>(),
             "inter_phase_ms": inter_phase_ms,
             // Per phase, because a whole-iteration idle figure is dominated by
             // the host time BETWEEN phases, which is a different fact from a
@@ -1364,6 +1376,7 @@ fn definitions() -> Value {
         "slot_multiplicity": "each slot's exact CostTree Scale multiplicity; folded workload = slot_ms x slot_multiplicity. Shared by every iteration because the tree shape is static",
         "operation_totals": "the ONLY sound join between the two lanes. occurrence_ratio is a counting ratio (3 measured kernels priced as 1 modelled leaf), never a per-kernel correspondence",
         "reference_rank.idle_ms": "span_ms - busy_ms over the reference rank's correlated kernels; this is the bubble budget the GPU lane draws",
+        "reference_rank.gaps_ns": "every stretch of the reference rank's span with no kernel on it, as [start_ns, end_ns] in span order, capture-relative like gpu_span_ns; the complement of its launches' union inside gpu_span_ns",
         "reference_rank.inter_phase_ms": "span_ms not covered by any phase's kernel span on the reference rank: the GPU waiting on the host between phases",
         "reference_rank": "carried on every timeline detail row as well as on the report row, so the wall-clock card reads the reference rank's occupancy and gaps instead of re-deriving them",
         "selected_as": "why this iteration is in the file: group_median (a typical member of its kernel program), global_max_error / global_min_error (the capture's extremes), or manifest_override",
@@ -1482,6 +1495,11 @@ mod tests {
         // 1-3 ms and 8-8.5 ms lie in no phase's span.
         assert_eq!(report["inter_phase_ms"], 2.5);
         assert_eq!(report["gap_count"], 3);
+        // In span order; none before the first launch or after the last.
+        assert_eq!(
+            report["gaps_ns"],
+            json!([[MS, 3 * MS], [5 * MS, 6 * MS], [8 * MS, 17 * MS / 2]])
+        );
         let phases = report["phases"].as_array().unwrap();
         assert_eq!(
             phases
