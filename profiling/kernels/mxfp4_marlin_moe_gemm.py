@@ -96,6 +96,7 @@ register(
             ),
             url="https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/fused_moe/experts/marlin_moe.py",
         ),
+        # BF16 Marlin needs SM80+.
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
             min_compute_capability=(8, 0),

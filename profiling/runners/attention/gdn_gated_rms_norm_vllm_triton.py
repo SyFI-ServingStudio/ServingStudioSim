@@ -15,11 +15,12 @@ from typing import Any
 from profiling.db.args import DType
 from profiling.profilers.energy import Energy
 from profiling.profilers.timer import Timer
-from profiling.runners.attention._gdn_common import load_required_callable, require_cuda
+from profiling.runners.attention._gdn_common import load_required_callable
 from profiling.runners.attention.gdn_gated_rms_norm_torch import (
     _logical_bytes,
     _semantic_flops,
 )
+from profiling.runners.device import require_cuda
 from profiling.runners.exceptions import (
     KernelLaunchFailed,
     OOMError,
@@ -100,7 +101,7 @@ def _correctness_guard_args(args: _ValidatedArgs) -> _ValidatedArgs:
 
 
 def _require_cuda(torch: Any) -> None:
-    require_cuda(torch, backend=_BACKEND)
+    require_cuda(torch, _BACKEND)
 
 
 def _load_fused_callable() -> Any:

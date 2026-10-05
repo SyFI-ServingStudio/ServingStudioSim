@@ -34,9 +34,6 @@ from profiling.profilers.timer import Timer
 from profiling.runners.exceptions import KernelLaunchFailed, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
 
-# Inductor emits a portable Triton pointwise kernel; Triton lowers bf16 only on
-# SM80+.
-_BF16_COMPUTE_CAPABILITY = (8, 0)
 # Substring, not an exact name: inductor suffixes the fusion with a per-graph
 # counter (`..._view_4`, `..._view_7`), so the digits are not stable.
 _KERNEL_NAME = "triton_poi_fused"
@@ -86,13 +83,6 @@ def _validate_args(
         bool(is_neox_style),
         resolved_dtype,
     )
-
-
-def _validate_cuda_device(torch: Any) -> None:
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented("vllm_mla_rope requires a CUDA device")
-    if tuple(torch.cuda.get_device_capability(0)) < _BF16_COMPUTE_CAPABILITY:
-        raise ProfilerNotImplemented("vllm_mla_rope requires compute capability >= 8.0 (bf16)")
 
 
 def _build_rotary_embedding(
@@ -234,7 +224,6 @@ def profile_vllm_mla_rope_vllm_inductor(
     except ImportError as exc:
         raise ProfilerNotImplemented("PyTorch is required for vllm_inductor") from exc
 
-    _validate_cuda_device(torch)
     torch_dtype = torch.bfloat16
     qk_head_dim = qk_nope_head_dim + rope_dim
 

@@ -367,37 +367,25 @@ def _fake_cuda(capability, name="NVIDIA GPU"):
     )
 
 
-def test_device_checks_follow_compute_capability_not_gpu_name() -> None:
+def test_flashmla_selected_k_tile_follows_compute_capability_and_heads() -> None:
     from profiling.runners.attention.dsa_sparse_mla_attention import (
         _require_cuda,
-        _require_flashmla_device,
-        _require_trtllm_gen_device,
+        _require_flashmla_tile,
     )
 
     no_cuda = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False))
-    for check in (_require_cuda, _require_trtllm_gen_device):
-        with pytest.raises(ProfilerNotImplemented, match="CUDA is required"):
-            check(no_cuda)
     with pytest.raises(ProfilerNotImplemented, match="CUDA is required"):
-        _require_flashmla_device(no_cuda, num_heads=64, selected_k=2048)
-
+        _require_cuda(no_cuda)
     # The Torch composite runs on any CUDA device.
     _require_cuda(_fake_cuda((8, 0), "NVIDIA A100"))
-    # FlashMLA: any sm90a part (H100 included) or the sm100f family.
-    _require_flashmla_device(_fake_cuda((9, 0), "NVIDIA H100"), num_heads=64, selected_k=2048)
-    _require_flashmla_device(_fake_cuda((10, 0), "NVIDIA B200"), num_heads=128, selected_k=1024)
-    _require_flashmla_device(_fake_cuda((10, 3)), num_heads=64, selected_k=576)
-    with pytest.raises(ProfilerNotImplemented, match="sm90a"):
-        _require_flashmla_device(_fake_cuda((8, 9)), num_heads=64, selected_k=2048)
+    # FlashMLA tiles selected_k by 128 on SM90 and by 64 only for 64 heads on SM10x.
+    _require_flashmla_tile(_fake_cuda((9, 0), "NVIDIA H100"), num_heads=64, selected_k=2048)
+    _require_flashmla_tile(_fake_cuda((10, 0), "NVIDIA B200"), num_heads=128, selected_k=1024)
+    _require_flashmla_tile(_fake_cuda((10, 3)), num_heads=64, selected_k=576)
     with pytest.raises(ProfilerNotImplemented, match="selected_k % 128"):
-        _require_flashmla_device(_fake_cuda((9, 0)), num_heads=64, selected_k=576)
+        _require_flashmla_tile(_fake_cuda((9, 0)), num_heads=64, selected_k=576)
     with pytest.raises(ProfilerNotImplemented, match="selected_k % 128"):
-        _require_flashmla_device(_fake_cuda((10, 0)), num_heads=128, selected_k=576)
-    # TRTLLM-GEN: the SM100 family only.
-    _require_trtllm_gen_device(_fake_cuda((10, 0), "NVIDIA B200"))
-    _require_trtllm_gen_device(_fake_cuda((10, 3), "NVIDIA B300"))
-    with pytest.raises(ProfilerNotImplemented, match="SM100-family"):
-        _require_trtllm_gen_device(_fake_cuda((9, 0), "NVIDIA H200"))
+        _require_flashmla_tile(_fake_cuda((10, 0)), num_heads=128, selected_k=576)
 
 
 @pytest.mark.parametrize(
@@ -917,7 +905,7 @@ def test_flashmla_profile_times_only_native_callable_and_reuses_accounting(
         return returned
 
     monkeypatch.setattr(
-        runner, "_require_flashmla_device", lambda *_args, **_kwargs: calls.append("gpu")
+        runner, "_require_flashmla_tile", lambda *_args, **_kwargs: calls.append("gpu")
     )
     monkeypatch.setattr(
         runner, "_load_flashmla_sparse_fwd", lambda: calls.append("load") or fake_flash
@@ -995,7 +983,7 @@ def test_flashmla_profile_times_only_native_callable_and_reuses_accounting(
 def test_flashmla_profile_typed_failures(monkeypatch) -> None:
     from profiling.runners.attention import dsa_sparse_mla_attention as runner
 
-    monkeypatch.setattr(runner, "_require_flashmla_device", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(runner, "_require_flashmla_tile", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
 
     def unavailable():
@@ -1035,7 +1023,7 @@ def test_flashmla_profile_typed_failures(monkeypatch) -> None:
 def test_flashmla_profile_preserves_typed_oom(monkeypatch) -> None:
     from profiling.runners.attention import dsa_sparse_mla_attention as runner
 
-    monkeypatch.setattr(runner, "_require_flashmla_device", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(runner, "_require_flashmla_tile", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(runner, "_load_flashmla_sparse_fwd", lambda: object())
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
 
@@ -1083,7 +1071,8 @@ def test_trtllm_fp8_rope_dim_selects_the_accepted_layout(monkeypatch, overrides,
     def reached(*_args, **_kwargs):
         raise ProfilerNotImplemented("reached the launch")
 
-    monkeypatch.setattr(runner, "_require_trtllm_gen_device", reached)
+    monkeypatch.setattr(runner, "_build_trtllm_fp8_operands", reached)
+    monkeypatch.setattr("torch.cuda.current_device", lambda: 0)
     with pytest.raises(ProfilerNotImplemented, match=match):
         runner.profile_dsa_sparse_mla_attention_flashinfer_trtllm_fp8(**(_NOPE_SPEC | overrides))
 

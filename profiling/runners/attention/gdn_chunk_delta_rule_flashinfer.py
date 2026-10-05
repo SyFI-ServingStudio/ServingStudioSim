@@ -29,10 +29,7 @@ from profiling.profilers.timer import Timer
 from profiling.runners.attention._gdn_common import (
     exact_int as _exact_int,
 )
-from profiling.runners.attention._gdn_common import (
-    load_required_callable,
-    require_compute_capability,
-)
+from profiling.runners.attention._gdn_common import load_required_callable
 from profiling.runners.exceptions import (
     KernelLaunchFailed,
     OOMError,
@@ -47,10 +44,6 @@ _CALLABLE_NAME = "chunk_gated_delta_rule"
 # `void cutlass::device_kernel<flat::kernel::FlatKernelTmaWarpSpecializedDeltaRule<...>>`;
 # `FlatKernel` is the shortest fragment unique to it in a GDN layer.
 _KERNEL_NAME = "FlatKernel"
-# FlashInfer builds that kernel only for sm_90a (`gen_gdn_prefill_sm90_module`,
-# `sm90a_nvcc_flags`); on SM100 `chunk_gated_delta_rule` dispatches a different
-# CuTe DSL kernel (`chunk_gated_delta_rule_sm100`) that this runner does not time.
-_REQUIRED_CAPABILITY = (9, 0)
 # FlashInfer chooses its own chunk width internally; this constant only sizes
 # the semantic FLOP estimate below, never the launch.
 _SEMANTIC_CHUNK = 64
@@ -141,12 +134,6 @@ def profile_gdn_chunk_delta_rule_flashinfer(
         raise ProfilerNotImplemented(f"PyTorch is required for {_BACKEND}") from exc
 
     try:
-        require_compute_capability(
-            torch,
-            backend=_BACKEND,
-            capability=_REQUIRED_CAPABILITY,
-            reason="FlashInfer's sm_90a CUTLASS GDN prefill kernel",
-        )
         fused_callable = load_required_callable(
             importlib.import_module,
             backend=_BACKEND,

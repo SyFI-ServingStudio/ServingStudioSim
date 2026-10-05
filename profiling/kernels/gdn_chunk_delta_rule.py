@@ -120,6 +120,9 @@ register(
     KernelProfilerSpec(
         kernel_kind=KIND,
         backend="flashinfer",
+        # FlashInfer builds the timed CUTLASS kernel only for sm_90a (gen_gdn_prefill_sm90_module,
+        # sm90a_nvcc_flags); on SM100 chunk_gated_delta_rule dispatches a different CuTe DSL kernel
+        # (chunk_gated_delta_rule_sm100) that the runner does not time.
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
             sm_targets=frozenset({"sm_90a"}),

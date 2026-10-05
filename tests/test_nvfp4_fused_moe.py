@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import pytest
 
 from launcher.backends import dedup_roles, validate_backend_map
@@ -9,11 +7,9 @@ from profiling.db.args import DType
 from profiling.db.batch import coerce_args
 from profiling.db.registry import BackendSupport, known_backends, supported_backends
 from profiling.kernels.nvfp4_fused_moe import KIND, Nvfp4FusedMoeArgs
-from profiling.runners.exceptions import ProfilerNotImplemented
 from profiling.runners.moe.exact_topk import exact_topk_ids
 from profiling.runners.moe.nvfp4_fused_moe import (
     _logical_bytes,
-    _require_sm100_family,
     _validate_args,
 )
 
@@ -172,19 +168,3 @@ def test_runner_accepts_the_nvfp4_weight_format_as_dtype_or_wire_string() -> Non
         assert _validate_args(**spec, weight_format=weight_format)["weight_format"] == "nvfp4_e2m1"
     with pytest.raises(ValueError, match="nvfp4_e2m1 weights"):
         _validate_args(**spec, weight_format="int4")
-
-
-@pytest.mark.parametrize(
-    ("capability", "accepted"), [((10, 0), True), ((10, 3), True), ((9, 0), False)]
-)
-def test_trtllm_fp4_moe_gates_on_the_sm10x_family(
-    capability: tuple[int, int], accepted: bool
-) -> None:
-    torch = SimpleNamespace(
-        cuda=SimpleNamespace(is_available=lambda: True, get_device_capability=lambda: capability)
-    )
-    if accepted:
-        _require_sm100_family(torch)
-    else:
-        with pytest.raises(ProfilerNotImplemented, match="SM10x"):
-            _require_sm100_family(torch)

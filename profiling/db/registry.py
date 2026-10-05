@@ -148,6 +148,17 @@ class BackendSupport:
             return False
         return True
 
+    def device_rule(self) -> str | None:
+        """The device requirement in words (``"sm_90a or sm_100f"``), or ``None``
+        when the backend runs on any CUDA device."""
+        rules = []
+        if self.min_compute_capability is not None:
+            major, minor = self.min_compute_capability
+            rules.append(f"compute capability {major}.{minor}+")
+        if self.sm_targets is not None:
+            rules.append(" or ".join(sorted(self.sm_targets)))
+        return " and ".join(rules) or None
+
 
 # Permissive default for specs that do not declare a capability (test fixtures);
 # every production kernel below sets `supports=` explicitly.

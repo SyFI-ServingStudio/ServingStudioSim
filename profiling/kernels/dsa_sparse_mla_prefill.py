@@ -84,6 +84,7 @@ register(
     KernelProfilerSpec(
         kernel_kind=KIND,
         backend="flashinfer_trtllm_fp8",
+        # TRTLLM-GEN sparse MLA (fmhaSm100) runs only on the SM10x family.
         supports=BackendSupport(
             compute=frozenset({DType.FP8_E4M3}),
             kv=frozenset({DType.FP8_E4M3}),

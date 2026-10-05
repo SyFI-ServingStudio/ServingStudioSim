@@ -113,6 +113,7 @@ register(
     KernelProfilerSpec(
         kernel_kind=KIND,
         backend="flashinfer_trtllm_fp8",
+        # TRTLLM-GEN sparse MLA (fmhaSm100) runs only on the SM10x family.
         supports=BackendSupport(
             compute=frozenset({DType.FP8_E4M3}),
             kv=frozenset({DType.FP8_E4M3}),
@@ -142,6 +143,7 @@ register(
     KernelProfilerSpec(
         kernel_kind=KIND,
         backend="vllm_flashmla_bf16",
+        # FlashMLA's Arch::is_sm90a() / is_sm100f(): exactly SM90, or any SM10x.
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
             kv=frozenset({DType.BF16}),

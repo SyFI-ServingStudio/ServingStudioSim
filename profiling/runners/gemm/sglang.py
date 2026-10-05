@@ -19,19 +19,6 @@ def _validate_shape(m: int, n: int, k: int) -> None:
             raise ValueError(f"{name} must be a positive integer")
 
 
-def _require_sm100(backend: str) -> None:
-    import torch
-
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented(f"CUDA is required for the {backend} backend")
-    # SGLang's `initialize_bf16_gemm_config` resolves `auto` to cutedsl when
-    # `is_sm100_supported()`: compute capability major 10, the whole SM10x family.
-    if torch.cuda.get_device_capability()[0] != 10:
-        raise ProfilerNotImplemented(
-            "SGLang resolves `bf16_gemm_backend='auto'` to cutedsl only on SM10x"
-        )
-
-
 def _measure(
     kernel: Callable[[], object],
     m: int,
@@ -79,7 +66,6 @@ def profile_single_gemm_sglang_bf16(
     except ImportError as exc:
         raise ProfilerNotImplemented("the SGLang environment is required") from exc
 
-    _require_sm100("sglang_bf16_auto")
     try:
         activations = torch.randn(m, k, dtype=torch.bfloat16, device="cuda")
         weight = torch.randn(n, k, dtype=torch.bfloat16, device="cuda")
@@ -121,7 +107,6 @@ def profile_single_gemm_sglang_fused_a(
     except ImportError as exc:
         raise ProfilerNotImplemented("the SGLang environment is required") from exc
 
-    _require_sm100("sglang_fused_a_auto")
     try:
         activations = torch.randn(m, k, dtype=torch.bfloat16, device="cuda")
         weight = torch.randn(n, k, dtype=torch.bfloat16, device="cuda")

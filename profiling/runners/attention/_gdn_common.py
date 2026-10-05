@@ -22,31 +22,6 @@ def exact_int(name: str, value: object) -> int:
     return value
 
 
-def require_cuda(torch: Any, *, backend: str) -> None:
-    """Require a CUDA device; these runners launch portable Triton/CUDA kernels."""
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented(f"CUDA is required for {backend}")
-
-
-def require_compute_capability(
-    torch: Any,
-    *,
-    backend: str,
-    capability: tuple[int, int],
-    reason: str,
-) -> None:
-    """Require CUDA and one compute capability for an arch-specific kernel build."""
-    require_cuda(torch, backend=backend)
-    device = torch.cuda.current_device()
-    actual = tuple(torch.cuda.get_device_capability(device))
-    if actual != capability:
-        gpu_name = str(torch.cuda.get_device_name(device))
-        raise ProfilerNotImplemented(
-            f"{backend} requires SM{capability[0]}{capability[1]} ({reason}), "
-            f"got {gpu_name} with SM{actual[0]}{actual[1]}"
-        )
-
-
 def load_required_callable(
     import_module: Callable[[str], Any],
     *,

@@ -83,28 +83,3 @@ def test_nvfp4_quant_rejects_nonproduction_cache_identities(kwargs, message) -> 
     }
     with pytest.raises(ValueError, match=message):
         nvfp4_quant._validate_args(**spec)
-
-
-def _fake_cuda_torch(capability: tuple[int, int], name: str) -> SimpleNamespace:
-    return SimpleNamespace(
-        cuda=SimpleNamespace(
-            is_available=lambda: True,
-            current_device=lambda: 0,
-            get_device_capability=lambda _device: capability,
-            get_device_name=lambda _device: name,
-        )
-    )
-
-
-@pytest.mark.parametrize(
-    ("capability", "name"),
-    [((10, 0), "NVIDIA B200"), ((10, 3), "NVIDIA B300"), ((12, 0), "NVIDIA RTX PRO 6000")],
-)
-def test_nvfp4_accepts_every_fp4_capable_arch(capability, name) -> None:
-    # vLLM's NVFP4 quant entry accepts SM100-SM129; only SM100 itself is measured.
-    nvfp4_quant._validate_cuda_device(_fake_cuda_torch(capability, name))
-
-
-def test_nvfp4_rejects_pre_blackwell() -> None:
-    with pytest.raises(nvfp4_quant.ProfilerNotImplemented, match="requires SM100\\+"):
-        nvfp4_quant._validate_cuda_device(_fake_cuda_torch((9, 0), "NVIDIA H200"))

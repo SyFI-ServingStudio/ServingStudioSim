@@ -22,7 +22,6 @@ from profiling.runners.attention.dsa_sparse_mla_attention import (
     _launch_trtllm_fp8,
     _logical_bytes,
     _logical_flops,
-    _require_trtllm_gen_device,
     _row_indices,
     _TrtllmFp8Operands,
 )
@@ -249,7 +248,6 @@ def profile_dsa_sparse_mla_prefill_flashinfer_trtllm_fp8(
         raise ProfilerNotImplemented(f"{_BACKEND} requires the repository vllm_env") from exc
 
     try:
-        _require_trtllm_gen_device(torch, backend=_BACKEND)
         device = torch.device("cuda", torch.cuda.current_device())
         operands = _build_operands(torch, shape, device=device)
 

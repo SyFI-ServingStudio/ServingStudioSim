@@ -45,21 +45,6 @@ def _validate_args(
     return num_tokens, hidden_size
 
 
-def _validate_cuda_device(torch: Any) -> None:
-    # Capability floor, not one GPU: vLLM's NVFP4 quant entry accepts SM100-SM129
-    # (nvfp4_quant_entry.cu, `nvfp4_quant_sm_supported`) and FlashInfer's
-    # cute-dsl nvfp4_quantize requires SM100+. FP4 conversion has no SM90 path.
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented("NVFP4 profiling requires CUDA")
-    device = torch.cuda.current_device()
-    capability = tuple(torch.cuda.get_device_capability(device))
-    if capability[0] < 10:
-        gpu_name = str(torch.cuda.get_device_name(device))
-        raise ProfilerNotImplemented(
-            f"NVFP4 profiling requires SM100+, got {gpu_name} with SM{capability[0]}{capability[1]}"
-        )
-
-
 def profile_nvfp4_quant_vllm_cuda(
     num_tokens: int,
     hidden_size: int,
@@ -76,7 +61,6 @@ def profile_nvfp4_quant_vllm_cuda(
     except ImportError as exc:
         raise ProfilerNotImplemented("the instrumented vLLM environment is required") from exc
 
-    _validate_cuda_device(torch)
     source = torch.randn((num_tokens, hidden_size), dtype=torch.bfloat16, device="cuda")
     global_scale = torch.ones((), dtype=torch.float32, device="cuda")
 
@@ -107,7 +91,6 @@ def profile_nvfp4_quant_flashinfer_cutedsl(
     except ImportError as exc:
         raise ProfilerNotImplemented("the SGLang environment is required") from exc
 
-    _validate_cuda_device(torch)
     source = torch.randn((num_tokens, hidden_size), dtype=torch.bfloat16, device="cuda")
     global_scale = torch.full((1,), 1.0 / (_E4M3_MAX * 6.0), dtype=torch.float32, device="cuda")
 

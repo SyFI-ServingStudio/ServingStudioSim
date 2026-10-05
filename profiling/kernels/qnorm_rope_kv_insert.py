@@ -88,6 +88,8 @@ register(
         args_schema=QnormRopeKvInsertArgs,
         metric_family=MetricFamily.COMPUTE,
         batch_outlier_policy=BatchOutlierPolicy(),
+        # The vLLM op is built for every CUDA arch; its host launcher refuses below SM80 (the bf16
+        # body compiles to a no-op there).
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
             kv=frozenset({DType.FP8_E4M3}),

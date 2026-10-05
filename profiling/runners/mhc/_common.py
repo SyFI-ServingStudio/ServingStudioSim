@@ -69,11 +69,6 @@ def validate_args(
     return Shape(num_tokens, hidden_size, hc_mult)
 
 
-def require_cuda(torch: Any, kind: str) -> None:
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented(f"{kind} requires CUDA")
-
-
 def prepare_common(torch: Any, shape: Shape) -> CommonInputs:
     generator = torch.Generator().manual_seed(41)
     hidden, streams = shape.hidden_size, shape.hc_mult
@@ -171,7 +166,6 @@ __all__ = [
     "prepare_common",
     "mix_width",
     "reference_pre",
-    "require_cuda",
     "residual_bytes",
     "validate_args",
 ]

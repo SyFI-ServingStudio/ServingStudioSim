@@ -12,7 +12,6 @@ from profiling.runners.metrics import ComputeMetrics
 _BACKEND = "packed_kv_cache_gather:vllm_cutedsl"
 # The kernel dequantizes with cvt.rn.f16x2.e4m3x2 (vllm/cute_utils/cvt.py), PTX
 # that exists only on SM89+.
-_MIN_CAPABILITY = (8, 9)
 _MODEL_IDENTITY = (1, 512, 448, 64)
 _STORAGE_IDENTITY = (
     "fp8_ds_mla",
@@ -107,12 +106,7 @@ def _validate_args(
 
 
 def _require_cutedsl_gpu(torch: Any, has_cutedsl: Any) -> Any:
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented(f"{_BACKEND} requires CUDA")
     device = torch.device("cuda", torch.cuda.current_device())
-    capability = tuple(torch.cuda.get_device_capability(device))
-    if capability < _MIN_CAPABILITY:
-        raise ProfilerNotImplemented(f"{_BACKEND} needs FP8 e4m3 (SM89+), got SM{capability}")
     if not has_cutedsl():
         raise ProfilerNotImplemented(f"{_BACKEND} requires the production Cutlass DSL path")
     return device

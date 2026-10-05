@@ -106,6 +106,7 @@ register(
     KernelProfilerSpec(
         kernel_kind=KIND,
         backend="vllm_inductor",
+        # Inductor emits a portable Triton pointwise kernel; Triton lowers bf16 only on SM80+.
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
             min_compute_capability=(8, 0),

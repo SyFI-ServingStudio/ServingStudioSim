@@ -153,7 +153,9 @@ kernels/           One file per kernel kind. Each declares KIND + <Kind>Args and
 runners/           L1a measurement. Subpackage per op family (gemm, attention,
   metrics.py         comm, norm, elementwise, idle). Return ComputeMetrics or
   exceptions.py      CommMetrics. Typed failures (OOMError, KernelLaunchFailed,
-                     ProfilerNotImplemented) are understood by L1b.
+  device.py          ProfilerNotImplemented) are understood by L1b. device.py
+                     holds the shared device checks, including the worker's
+                     BackendSupport gate.
 
 profilers/         Low-level timing/energy primitives used by runners
                    (Timer.cupti, Energy.perf, CUPTI kernel profiler + C++ ext).
@@ -215,8 +217,12 @@ historical results and record the selected database with the experiment.
 4. `LocalGpuChunk.run` writes the chunk payload to a temp JSON, sets
    `CUDA_VISIBLE_DEVICES`, applies the selected `ProfileEnv`'s ordered Python
    and shared-library paths, and spawns `python -m profiling.exec.local_worker`
-   in that environment. The worker lazy-loads the registered runner via
-   `RunnerRef`, executes each spec, and writes JSON results back.
+   in that environment. The worker first checks the real device against the
+   backend's declared `BackendSupport` device rule (`runners/device.py`) and
+   refuses every spec of the chunk without loading the runner when it fails;
+   runners repeat no capability rule and keep only shape-dependent checks.
+   Otherwise it lazy-loads the registered runner via `RunnerRef`, executes each
+   spec, and writes JSON results back.
 5. Require every successful worker result to report its observed physical GPU,
    validate all observations against the requested cache key, then persist the
    rows through `Table.insert`. Failed specs retain their worker error in one

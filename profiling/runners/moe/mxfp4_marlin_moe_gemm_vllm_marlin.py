@@ -13,7 +13,6 @@ from profiling.runners.metrics import ComputeMetrics
 _BACKEND = "mxfp4_marlin_moe_gemm:vllm_marlin"
 # Marlin's MoE kernel rejects BF16 activations below Ampere (ops.cu:
 # "Turing only support FP16 or INT8 activation").
-_BF16_MIN_CAPABILITY = (8, 0)
 # Marlin thread tiles are (thread_k, thread_n) in {(128,128), (64,128),
 # (128,64), (64,256)}, so a shape needs n % 64 and k % 128, or n % 128 and
 # k % 64 (vLLM marlin_utils.marlin_padded_nk); either also keeps whole
@@ -244,16 +243,6 @@ def profile_mxfp4_marlin_moe_gemm_vllm_marlin(
         raise ProfilerNotImplemented(f"{_BACKEND} requires the pinned vLLM environment") from exc
 
     try:
-        if not torch.cuda.is_available():
-            raise ProfilerNotImplemented(f"{_BACKEND} requires CUDA")
-        device = torch.cuda.current_device()
-        capability = tuple(torch.cuda.get_device_capability(device))
-        if capability < _BF16_MIN_CAPABILITY:
-            gpu_name = str(torch.cuda.get_device_name(device))
-            raise ProfilerNotImplemented(
-                f"{_BACKEND} needs BF16 Marlin (SM80+), got {gpu_name} with "
-                f"SM{capability[0]}{capability[1]}"
-            )
         launch, logical_weight, route_ids = _prepare(
             torch,
             shape,

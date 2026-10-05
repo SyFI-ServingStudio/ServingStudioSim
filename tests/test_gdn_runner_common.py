@@ -7,7 +7,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from profiling.runners.attention import _gdn_common
 from profiling.runners.exceptions import ProfilerNotImplemented
 
 _VLLM_GDN_RUNNER_MODULES = (
@@ -45,17 +44,3 @@ def test_vllm_gdn_triton_runners_require_cuda_but_no_gpu_name(runner_module_name
         runner_module._require_cuda(_fake_torch("NVIDIA H200", cuda_available=False))
     for gpu_name in ("NVIDIA H200", "NVIDIA B200", "NVIDIA H100", "NVIDIA A100-SXM4-80GB"):
         runner_module._require_cuda(_fake_torch(gpu_name))
-
-
-def test_require_compute_capability_gates_on_capability_not_name() -> None:
-    def check(fake: SimpleNamespace) -> None:
-        _gdn_common.require_compute_capability(
-            fake, backend="x:y", capability=(9, 0), reason="sm_90a build"
-        )
-
-    with pytest.raises(ProfilerNotImplemented, match="CUDA is required"):
-        check(_fake_torch("NVIDIA H200", cuda_available=False))
-    with pytest.raises(ProfilerNotImplemented, match=r"requires SM90 \(sm_90a build\).*SM100"):
-        check(_fake_torch("NVIDIA B200", capability=(10, 0)))
-    check(_fake_torch("NVIDIA H200"))
-    check(_fake_torch("NVIDIA H100 80GB HBM3"))

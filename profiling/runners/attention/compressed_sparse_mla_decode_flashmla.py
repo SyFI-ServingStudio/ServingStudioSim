@@ -17,7 +17,7 @@ _PLANNER_MODES = frozenset({"planned", "reused"})
 # FlashMLA sparse decode (csrc/api/sparse_decode.h at vLLM's pinned 6bc4941):
 # h_q 64 or 128, MQA (h_kv 1), and the MODEL1 584-byte cache that this runner
 # packs needs d_qk = d_v = 512; topk and extra_topk tile by 64 (TOPK_BLOCK_SIZE
-# on SM90, B_TOPK on SM100). It runs only on SM90a and SM100f.
+# on SM90, B_TOPK on SM100).
 _NUM_HEADS = frozenset({64, 128})
 _CACHE_SHAPE = (1, 512, 512)
 _TOPK_BLOCK = 64
@@ -119,17 +119,6 @@ def _validate_args(
         compress_ratio,
         planner_mode,
     )
-
-
-def _require_flashmla_gpu(torch: Any) -> Any:
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented(f"{_BACKEND} requires CUDA")
-    device = torch.device("cuda", torch.cuda.current_device())
-    capability = tuple(torch.cuda.get_device_capability(device))
-    # FlashMLA's Arch::is_sm90a() / is_sm100f(): exactly SM90, or any SM10x.
-    if capability != (9, 0) and capability[0] != 10:
-        raise ProfilerNotImplemented(f"{_BACKEND} requires SM90a or SM100f, got SM{capability}")
-    return device
 
 
 def _patterned_cache(
@@ -335,7 +324,7 @@ def profile_compressed_sparse_mla_decode_flashmla(
     except ImportError as exc:
         raise ProfilerNotImplemented(f"{_BACKEND} requires pinned vLLM FlashMLA") from exc
     try:
-        device = _require_flashmla_gpu(torch)
+        device = torch.device("cuda", torch.cuda.current_device())
         operands = _prepare(torch, shape, device)
         graph, _output, lse = _capture(
             torch, flash_mla_with_kvcache, get_mla_metadata, operands, shape

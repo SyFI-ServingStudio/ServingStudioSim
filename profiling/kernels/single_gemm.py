@@ -151,6 +151,8 @@ register(
     KernelProfilerSpec(
         kernel_kind=KIND,
         backend="sglang_bf16_auto",
+        # SGLang's initialize_bf16_gemm_config resolves `auto` to cutedsl when
+        # is_sm100_supported(): compute capability major 10.
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
             sm_targets=frozenset({"sm_100f"}),
@@ -179,6 +181,8 @@ register(
     KernelProfilerSpec(
         kernel_kind=KIND,
         backend="sglang_fused_a_auto",
+        # SGLang's initialize_bf16_gemm_config resolves `auto` to cutedsl when
+        # is_sm100_supported(): compute capability major 10.
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
             sm_targets=frozenset({"sm_100f"}),

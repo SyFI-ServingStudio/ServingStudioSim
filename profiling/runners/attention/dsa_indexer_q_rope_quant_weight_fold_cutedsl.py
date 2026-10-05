@@ -12,7 +12,6 @@ from profiling.runners.metrics import ComputeMetrics
 _BACKEND = "dsa_indexer_q_rope_quant_weight_fold:vllm_cutedsl_fp8"
 # The kernel packs e4m3 with cvt.rn.satfinite.e4m3x2.f32 (vllm/cute_utils/cvt.py),
 # a PTX instruction that exists only on SM89+.
-_MIN_CAPABILITY = (8, 9)
 _HEAD_DIM = 128
 _ROPE_DIM = 64
 # fp8_max and the amax floor are literals in IndexerQFp8Kernel.kernel.
@@ -269,11 +268,9 @@ def profile_dsa_indexer_q_rope_quant_weight_fold_cutedsl(
     except ImportError as exc:
         raise ProfilerNotImplemented(f"{_BACKEND} requires pinned vLLM CuteDSL") from exc
     try:
-        if not torch.cuda.is_available():
-            raise ProfilerNotImplemented(f"{_BACKEND} requires CUDA")
         device = torch.device("cuda", torch.cuda.current_device())
-        if tuple(torch.cuda.get_device_capability(device)) < _MIN_CAPABILITY or not has_cutedsl():
-            raise ProfilerNotImplemented(f"{_BACKEND} requires CuteDSL on SM89+ (FP8 e4m3)")
+        if not has_cutedsl():
+            raise ProfilerNotImplemented(f"{_BACKEND} requires CuteDSL")
         operands = _build_operands(torch, shape, device)
         _check_output(torch, fused_indexer_q_rope_quant_fp8_cutedsl, operands, shape)
 

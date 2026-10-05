@@ -24,7 +24,6 @@ from profiling.runners.metrics import ComputeMetrics
 _BACKEND = "kv_compress_store:vllm_triton"
 # compress_norm_rope_store_triton stores tl.float8e4nv, which Triton lowers
 # only on SM89+.
-_MIN_CAPABILITY = (8, 9)
 # The fp8_indexer cache row (128 fp8 + one fp32 scale) fixes the C4 indexer's
 # single 128-wide KV head with a 64-wide RoPE tail. The indexer exists only on
 # C4 layers.
@@ -105,16 +104,6 @@ def _validate_args(
         page_alignment=576,
         rms_eps=float(rms_eps),
     )
-
-
-def _require_fp8_gpu(torch: Any) -> Any:
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented(f"{_BACKEND} requires CUDA")
-    device = torch.device("cuda", torch.cuda.current_device())
-    capability = tuple(torch.cuda.get_device_capability(device))
-    if capability < _MIN_CAPABILITY:
-        raise ProfilerNotImplemented(f"{_BACKEND} needs FP8 e4m3 (SM89+), got SM{capability}")
-    return device
 
 
 def _launch(save_op: Any, compress_op: Any, operands: Any, shape: _Shape) -> None:
@@ -229,7 +218,7 @@ def profile_kv_compress_store_triton(
         )
         from vllm.models.deepseek_v4.common.ops.save_partial_states import save_partial_states
 
-        operands = _build_operands(torch, shape, _require_fp8_gpu(torch))
+        operands = _build_operands(torch, shape, torch.device("cuda", torch.cuda.current_device()))
         _check_output(torch, save_partial_states, compress_norm_rope_store_triton, operands, shape)
 
         def run() -> None:

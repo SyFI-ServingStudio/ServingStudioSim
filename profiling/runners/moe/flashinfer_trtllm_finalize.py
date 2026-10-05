@@ -11,11 +11,11 @@ from typing import Any
 from profiling.db.args import DType
 from profiling.profilers.energy import Energy
 from profiling.profilers.timer import Timer
+from profiling.runners.device import require_cuda_toolkit
 from profiling.runners.exceptions import KernelLaunchFailed, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
 
 _CUDA_MINIMUM = (12, 8)
-_HOPPER_COMPUTE_CAPABILITY = (9, 0)
 _KERNEL_NAME = "finalizeMoeRoutingKernel"
 _JIT_MODULE_NAME = "vibesim_moe_finalize_routing_bf16_sm90"
 
@@ -145,39 +145,6 @@ def _routing_metadata(
     # scaling rather than accidentally accepting the NO_SCALE specialization.
     final_scales = [0.25 + 0.5 * ((slot_index % 7) / 6.0) for slot_index in range(routed_capacity)]
     return selected_experts, unpermute_map, final_scales
-
-
-def _parse_cuda_version(cuda_version: object) -> tuple[int, int] | None:
-    if cuda_version is None:
-        return None
-    version_parts = str(cuda_version).split(".")
-    if len(version_parts) < 2:
-        return None
-    try:
-        return int(version_parts[0]), int(version_parts[1])
-    except ValueError:
-        return None
-
-
-def _validate_cuda_device(torch: Any) -> None:
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented(
-            "CUDA is required for the flashinfer_trtllm moe_finalize_routing backend"
-        )
-    cuda_version = _parse_cuda_version(getattr(torch.version, "cuda", None))
-    if cuda_version is None or cuda_version < _CUDA_MINIMUM:
-        rendered_version = getattr(torch.version, "cuda", None)
-        raise ProfilerNotImplemented(
-            f"flashinfer_trtllm moe_finalize_routing requires CUDA >= 12.8, got {rendered_version}"
-        )
-    device = torch.cuda.current_device()
-    compute_capability = tuple(torch.cuda.get_device_capability(device))
-    if compute_capability != _HOPPER_COMPUTE_CAPABILITY:
-        gpu_name = str(torch.cuda.get_device_name(device))
-        raise ProfilerNotImplemented(
-            "flashinfer_trtllm moe_finalize_routing requires SM90/SM90a Hopper, "
-            f"got {gpu_name} with SM{compute_capability[0]}{compute_capability[1]}"
-        )
 
 
 @functools.cache
@@ -349,7 +316,7 @@ def profile_moe_finalize_routing_flashinfer_trtllm(
     except ImportError as exc:
         raise ProfilerNotImplemented("torch is required for moe_finalize_routing") from exc
 
-    _validate_cuda_device(torch)
+    require_cuda_toolkit(torch, _CUDA_MINIMUM, "flashinfer_trtllm moe_finalize_routing")
     try:
         launch = prepare_moe_finalize_routing_launch(
             torch,

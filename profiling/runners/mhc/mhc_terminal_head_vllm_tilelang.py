@@ -6,6 +6,7 @@ from typing import Any
 from profiling.db.args import DType
 from profiling.profilers.energy import Energy
 from profiling.profilers.timer import Timer
+from profiling.runners.device import require_cuda
 from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
 from profiling.runners.mhc._common import (
@@ -19,7 +20,6 @@ from profiling.runners.mhc._common import (
     mix_bytes,
     prepare_common,
     reference_pre,
-    require_cuda,
     residual_bytes,
     validate_args,
 )

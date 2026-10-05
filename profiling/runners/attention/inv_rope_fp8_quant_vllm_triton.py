@@ -10,7 +10,6 @@ from profiling.runners.metrics import ComputeMetrics
 
 _BACKEND = "inv_rope_fp8_quant:vllm_triton"
 # The Triton kernel stores tl.float8e4nv, which Triton lowers only on SM89+.
-_MIN_CAPABILITY = (8, 9)
 _NUM_GROUPS = 8
 _HEADS_PER_GROUP = 8
 _HEAD_DIM = 512
@@ -45,14 +44,6 @@ def _validate_args(num_tokens: int) -> int:
     if type(num_tokens) is not int or num_tokens <= 0:
         raise ValueError(f"num_tokens must be a positive integer, got {num_tokens!r}")
     return num_tokens
-
-
-def _require_fp8_gpu(torch: Any) -> None:
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented(f"{_BACKEND} requires CUDA")
-    capability = tuple(torch.cuda.get_device_capability(torch.cuda.current_device()))
-    if capability < _MIN_CAPABILITY:
-        raise ProfilerNotImplemented(f"{_BACKEND} needs FP8 e4m3 (SM89+), got SM{capability}")
 
 
 def _prepare(torch: Any, callable: Any, num_tokens: int) -> _Launch:
@@ -113,7 +104,6 @@ def profile_inv_rope_fp8_quant_vllm_triton(
         raise ProfilerNotImplemented(f"{_BACKEND} requires pinned vLLM") from exc
 
     try:
-        _require_fp8_gpu(torch)
         launch = _prepare(torch, fused_inv_rope_fp8_quant, num_tokens)
         _check_output(torch, launch)
         time_ms = Timer.cupti(launch.run, warmup=3, kernel_name=None)

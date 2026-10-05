@@ -93,6 +93,8 @@ register(
     KernelProfilerSpec(
         kernel_kind=KIND,
         backend="flashinfer_trtllm_sm100",
+        # TRT-LLM-gen cubins target the SM10x family; vLLM enables this kernel on any SM10x device
+        # (TrtLlmBf16ExpertsBase: is_device_capability_family(100)).
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
             sm_targets=frozenset({"sm_100f"}),

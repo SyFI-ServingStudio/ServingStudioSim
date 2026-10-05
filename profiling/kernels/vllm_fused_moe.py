@@ -127,6 +127,7 @@ register(
     KernelProfilerSpec(
         kernel_kind=KIND,
         backend="vllm_triton",
+        # FP8 e4m3 conversion needs SM89+.
         supports=BackendSupport(
             compute=frozenset({DType.FP8_E4M3}),
             min_compute_capability=(8, 9),

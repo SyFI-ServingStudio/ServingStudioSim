@@ -53,10 +53,8 @@ from profiling.profilers.timer import Timer
 from profiling.runners.attention._gdn_common import (
     exact_int as _exact_int,
 )
-from profiling.runners.attention._gdn_common import (
-    load_required_callable,
-    require_cuda,
-)
+from profiling.runners.attention._gdn_common import load_required_callable
+from profiling.runners.device import require_cuda
 from profiling.runners.exceptions import (
     KernelLaunchFailed,
     OOMError,
@@ -279,7 +277,7 @@ def profile_kda_recurrent_decode_vllm_triton(
     except ImportError as exc:
         raise ProfilerNotImplemented(f"PyTorch is required for {_BACKEND}") from exc
     try:
-        require_cuda(torch, backend=_BACKEND)
+        require_cuda(torch, _BACKEND)
         callable_ = load_required_callable(
             importlib.import_module,
             backend=_BACKEND,

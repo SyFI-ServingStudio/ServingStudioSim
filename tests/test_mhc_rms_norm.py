@@ -4,13 +4,13 @@ import math
 
 import pytest
 
+from profiling.runners.device import require_cuda
 from profiling.runners.exceptions import ProfilerNotImplemented
 from profiling.runners.mhc import mhc_fused_post_pre_rms_norm_vllm_tilelang as fused
 from profiling.runners.mhc import mhc_pre_rms_norm_vllm_tilelang as pre
 from profiling.runners.mhc import mhc_terminal_head_vllm_tilelang as head
 from profiling.runners.mhc._common import (
     Shape,
-    require_cuda,
     validate_args,
 )
 
@@ -65,7 +65,7 @@ def test_gate_requires_cuda_but_no_particular_gpu() -> None:
     # gap, not a reason for the boundary or terminal-head runners to refuse.
     for name in ("NVIDIA H200", "NVIDIA B200", "NVIDIA H100 80GB HBM3"):
         require_cuda(_FakeTorch(name), "mhc")
-    with pytest.raises(ProfilerNotImplemented, match="requires CUDA"):
+    with pytest.raises(ProfilerNotImplemented, match="CUDA is required"):
         require_cuda(_FakeTorch("NVIDIA H200", available=False), "mhc")
 
 

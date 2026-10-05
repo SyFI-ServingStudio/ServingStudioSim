@@ -67,12 +67,6 @@ def _load_runtime() -> tuple[Any, Any, Any, Any]:
         )
     except ImportError as exc:
         raise ProfilerNotImplemented("FlashInfer and the vLLM fork are required") from exc
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented("FP8 block-scale MoE profiling requires CUDA")
-    # TRT-LLM-gen cubins target the SM10x family, where vLLM enables this
-    # kernel (TrtLlmFp8ExpertsBase: is_device_capability_family(100)).
-    if tuple(torch.cuda.get_device_capability())[0] != 10:
-        raise ProfilerNotImplemented("FP8 block-scale MoE profiling requires an SM10x GPU")
     return torch, per_token_group_quant_fp8, swap_w13_to_w31, _shuffle_deepseek_fp8_moe_weights
 
 

@@ -144,12 +144,6 @@ def profile_qnorm_rope_kv_insert_vllm_cuda(
     except ImportError as exc:
         raise ProfilerNotImplemented(f"{_BACKEND} requires pinned vLLM") from exc
     try:
-        # The vLLM op is built for every CUDA arch; its host launcher refuses
-        # below SM80 (the bf16 body compiles to a no-op there).
-        if not torch.cuda.is_available():
-            raise ProfilerNotImplemented(f"{_BACKEND} requires CUDA")
-        if tuple(torch.cuda.get_device_capability()) < (8, 0):
-            raise ProfilerNotImplemented(f"{_BACKEND} requires SM80+")
         device = torch.device("cuda", torch.cuda.current_device())
         generator = torch.Generator(device=device).manual_seed(47)
         q = torch.randn(

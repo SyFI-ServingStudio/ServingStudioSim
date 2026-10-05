@@ -14,7 +14,7 @@ _BACKEND = "compressed_sparse_mla_prefill:vllm_flashmla_bf16"
 # h_q 64 or 128, d_v 512, MQA indices; the bf16 d512 request-slot cache this
 # runner builds fixes d_qk = 512. SM90 asserts topk % (2 * B_TOPK) == 0 with
 # B_TOPK 64 (sm90/prefill/sparse/phase1.cuh), so the padded index width is a
-# multiple of 128. It runs only on SM90a and SM100f.
+# multiple of 128.
 _NUM_HEADS = frozenset({64, 128})
 _CACHE_SHAPE = (1, 512, 512)
 _DIM = 512
@@ -367,13 +367,7 @@ def profile_compressed_sparse_mla_prefill_flashmla(
     except ImportError as exc:
         raise ProfilerNotImplemented(f"{_BACKEND} requires packaged FlashMLA") from exc
     try:
-        if not torch.cuda.is_available():
-            raise ProfilerNotImplemented(f"{_BACKEND} requires CUDA")
         device = torch.device("cuda", torch.cuda.current_device())
-        capability = tuple(torch.cuda.get_device_capability(device))
-        # FlashMLA's Arch::is_sm90a() / is_sm100f(): exactly SM90, or any SM10x.
-        if capability != (9, 0) and capability[0] != 10:
-            raise ProfilerNotImplemented(f"{_BACKEND} requires SM90a or SM100f, got SM{capability}")
         operands = tuple(_build_operands(torch, chunk, device) for chunk in _chunks(shape))
         for chunk in operands:
             _check_output(torch, flash_mla_sparse_fwd, chunk)

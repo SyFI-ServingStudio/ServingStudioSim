@@ -312,39 +312,20 @@ def _device_capability(torch: Any) -> tuple[int, int]:
     return int(major), int(minor)
 
 
-def _flashmla_topk_block(capability: tuple[int, int], num_heads: int) -> int | None:
-    """FlashMLA's selected-K tile for d_qk 576, or None when it has no kernel."""
+def _flashmla_topk_block(capability: tuple[int, int], num_heads: int) -> int:
+    """FlashMLA's selected-K tile for d_qk 576 on the backend's SM90 or SM10x device."""
     if capability == (9, 0):
         return 128
-    if capability[0] == 10:
-        return 64 if num_heads == 64 else 128
-    return None
+    return 64 if num_heads == 64 else 128
 
 
-def _require_flashmla_device(torch: Any, *, num_heads: int, selected_k: int) -> None:
-    _require_cuda(torch, backend=_FLASHMLA_BACKEND)
+def _require_flashmla_tile(torch: Any, *, num_heads: int, selected_k: int) -> None:
     capability = _device_capability(torch)
     block = _flashmla_topk_block(capability, num_heads)
-    if block is None:
-        raise ProfilerNotImplemented(
-            f"{_FLASHMLA_BACKEND} needs sm90a (9.0) or an sm100f (10.x) device, "
-            f"got {capability[0]}.{capability[1]}"
-        )
     if selected_k % block:
         raise ProfilerNotImplemented(
             f"{_FLASHMLA_BACKEND} on {capability[0]}.{capability[1]} with "
             f"{num_heads} heads needs selected_k % {block} == 0, got {selected_k}"
-        )
-
-
-def _require_trtllm_gen_device(torch: Any, *, backend: str = _TRTLLM_FP8_BACKEND) -> None:
-    """TRTLLM-GEN sparse MLA (fmhaSm100) runs only on the SM100 family."""
-    _require_cuda(torch, backend=backend)
-    capability = _device_capability(torch)
-    if capability[0] != 10:
-        raise ProfilerNotImplemented(
-            f"{backend} needs an SM100-family (10.x) device for TRTLLM-GEN sparse MLA, "
-            f"got {capability[0]}.{capability[1]}"
         )
 
 
@@ -952,7 +933,6 @@ def profile_dsa_sparse_mla_attention_flashinfer_trtllm_fp8(
         ) from exc
 
     try:
-        _require_trtllm_gen_device(torch)
         device = torch.device("cuda", torch.cuda.current_device())
         operands = _build_trtllm_fp8_operands(
             torch,
@@ -1063,7 +1043,7 @@ def profile_dsa_sparse_mla_attention_vllm_flashmla_bf16(
         raise ProfilerNotImplemented(f"{_FLASHMLA_BACKEND} requires PyTorch in vllm_env") from exc
 
     try:
-        _require_flashmla_device(torch, num_heads=num_heads, selected_k=selected_k)
+        _require_flashmla_tile(torch, num_heads=num_heads, selected_k=selected_k)
         flash_mla_sparse_fwd = _load_flashmla_sparse_fwd()
         device = torch.device("cuda", torch.cuda.current_device())
         operands = _build_operands(

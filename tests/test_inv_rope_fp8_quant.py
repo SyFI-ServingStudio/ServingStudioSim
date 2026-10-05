@@ -44,25 +44,3 @@ def test_launch_preserves_the_production_public_call_contract():
             },
         )
     ]
-
-
-@pytest.mark.parametrize(
-    ("capability", "accepted"), [((8, 0), False), ((8, 9), True), ((9, 0), True), ((10, 0), True)]
-)
-def test_gpu_guard_is_the_fp8_capability_floor(capability, accepted):
-    from types import SimpleNamespace
-
-    from profiling.runners.attention.inv_rope_fp8_quant_vllm_triton import _require_fp8_gpu
-    from profiling.runners.exceptions import ProfilerNotImplemented
-
-    cuda = SimpleNamespace(
-        is_available=lambda: True,
-        current_device=lambda: 0,
-        get_device_capability=lambda _device: capability,
-    )
-    torch = SimpleNamespace(cuda=cuda)
-    if accepted:
-        _require_fp8_gpu(torch)
-    else:
-        with pytest.raises(ProfilerNotImplemented, match="SM89"):
-            _require_fp8_gpu(torch)
