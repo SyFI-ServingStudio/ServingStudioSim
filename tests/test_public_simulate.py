@@ -387,7 +387,7 @@ def test_presets_list_members_captures_and_what_cannot_run(client: TestClient) -
     answer = client.get(f"{PREFIX}/simulations/presets").json()
 
     assert answer["sim_commit"] == "abc123"
-    assert answer["limits"]["max_requests"] == simulate.MAX_REQUESTS
+    assert answer["limits"]["max_requests"] == workloads.MAX_REQUESTS
     assert "accept_rate" in answer["workload"]["properties"]
     presets = {preset["id"]: preset for preset in answer["presets"]}
     assert set(presets) == {"Llama/dense_barebone", "Llama/dense_pd", "GLM/spec_speculative"}
@@ -592,7 +592,7 @@ def test_the_simulators_check_of_the_run_refuses_before_it_queues(
 
 
 def test_at_most_max_requests_per_simulation(client, monkeypatch) -> None:
-    monkeypatch.setattr(simulate, "MAX_REQUESTS", 3)
+    monkeypatch.setattr(workloads, "MAX_REQUESTS", 3)
     answer = _post(client, *DENSE)
     assert answer.status_code == 400
     assert "has 4 requests; at most 3 per simulation" in answer.json()["detail"]
@@ -747,6 +747,27 @@ def test_a_request_that_misses_the_draft_window_by_a_few_tokens_is_shortened(cli
         assert [row["output_len"] for row in csv.DictReader(stream)][2] == "200"
 
 
+def test_the_draft_window_counts_the_prefix_the_simulator_counts() -> None:
+    """A session row's ``prefix_kv`` (independent format) and a round's
+    ``prefix_len`` (chained) count as the simulator's reader counts them; a
+    ``prefix_kv`` without a session does not, and a request with too little to
+    lose is left for the simulator to refuse."""
+    bounds = [{"max_model_len": 100, "draft_tokens": 3}]
+    rows = [
+        {"input_len": "40", "output_len": "50", "session_id": "s", "prefix_kv": "10"},
+        {"input_len": "40", "output_len": "50", "session_id": "", "prefix_kv": "10"},
+        {"input_len": "40", "output_len": "50", "prefix_len": "10"},
+        {"input_len": "2", "output_len": "1", "prefix_len": "97"},
+    ]
+    assert simulate._fit_draft_window(bounds, rows) == 2
+    assert [(r["input_len"], r["output_len"]) for r in rows] == [
+        ("40", "47"),
+        ("40", "50"),
+        ("40", "47"),
+        ("2", "1"),
+    ]
+
+
 def test_a_failed_run_reports_its_cause(client, runner) -> None:
     runner.mode = "fail"
     answer = _wait(client, _post(client, *DENSE).json()["simulation_id"])
@@ -836,7 +857,7 @@ def test_simulate_and_predict_are_rate_limited_per_client(
     body = {"preset": "Llama/dense", "params": {"tp_size": 9}, "cases": []}
     assert [client.post(f"{PREFIX}/predict", json=body).status_code for _ in range(3)] == [400] * 3
 
-    too_many = [(n, 1, 1) for n in range(simulate.MAX_REQUESTS + 1)]
+    too_many = [(n, 1, 1) for n in range(workloads.MAX_REQUESTS + 1)]
     assert _upload(client, _independent(too_many)).status_code == 400
     assert _upload(client, _independent(TRACE_ROWS)).status_code == 201
     assert _upload(client, _independent(TRACE_ROWS)).status_code == 429
@@ -993,10 +1014,10 @@ def test_tags_without_a_format_are_refused(client) -> None:
 
 
 def test_an_upload_past_the_limits_is_refused(client, tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr(simulate, "MAX_REQUESTS", 3)
+    monkeypatch.setattr(workloads, "MAX_REQUESTS", 3)
     answer = _upload(client, _independent(TRACE_ROWS))
     assert answer.status_code == 400
-    assert "the upload has 4 requests; a simulation runs at most 3" in answer.json()["detail"]
+    assert "the upload has 4 requests; at most 3 per simulation" in answer.json()["detail"]
     monkeypatch.setattr(workloads, "MAX_UPLOAD_BYTES", 16)
     assert _upload(client, _independent(TRACE_ROWS)).status_code == 413
     assert not any((tmp_path / "uploads").iterdir())

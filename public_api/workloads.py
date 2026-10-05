@@ -52,6 +52,7 @@ GENERATE_TIMEOUT_S = 30.0
 # stopped here rather than by the host.
 _GENERATE_MEMORY = 2 << 30
 MAX_UPLOAD_BYTES = 1 << 20
+MAX_REQUESTS = 2000
 KEEP_S = 24 * 3600
 _RECORD = "upload.json"
 _TRACE = "trace.csv"
@@ -59,6 +60,12 @@ _TRACE = "trace.csv"
 
 class BadWorkload(Refused):
     """A workload this member cannot run; the message says why."""
+
+
+def check_count(name: str, requests: int) -> None:
+    """Refuse a trace of more requests than one simulation runs."""
+    if requests > MAX_REQUESTS:
+        raise BadWorkload(f"{name} has {requests} requests; at most {MAX_REQUESTS} per simulation")
 
 
 @dataclass(frozen=True)
@@ -297,8 +304,6 @@ class Workloads:
         """Keep an uploaded trace once the simulator reads it; its record. With
         no format, the format and tags are the ones its header fits
         (:func:`detect_format`)."""
-        from public_api.simulate import MAX_REQUESTS
-
         if input_file_format is None:
             if input_file_tags is not None:
                 raise BadWorkload(
@@ -319,11 +324,7 @@ class Workloads:
             trace.write_bytes(body)
             source = TraceSource(trace, input_file_format, tuple(input_file_tags or ()))
             requests = plan(read_block(source), self.build_type)
-            if len(requests) > MAX_REQUESTS:
-                raise BadWorkload(
-                    f"the upload has {len(requests)} requests; a simulation runs at most "
-                    f"{MAX_REQUESTS}"
-                )
+            check_count("the upload", len(requests))
             created = time.time()
             record = {
                 "workload_id": workload_id,

@@ -52,6 +52,7 @@ from launcher.exec import ERROR_JSON, _build_subprocess_env, binary_error, binar
 from launcher.process.leases import LauncherLeases
 from launcher.schema.argv import build_cli_command
 from launcher.schema.loader import Registry
+from public_api import workloads
 from public_api.deployments import DeploymentIndex
 from public_api.predict import _cause, missing_by_role
 from public_api.sim_preset import Capture, SimMember
@@ -59,6 +60,7 @@ from public_api.workloads import (
     BadWorkload,
     TraceSource,
     Workloads,
+    check_count,
     describe,
     plan,
     plan_run,
@@ -69,7 +71,6 @@ from public_api.workloads import (
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-MAX_REQUESTS = 2000
 MAX_RUNNING = 2
 MAX_QUEUED = 32
 TIMEOUT_S = 10 * 60
@@ -313,8 +314,9 @@ def _fit_draft_window(bounds: list[dict] | None, rows: list[dict]) -> int:
     ``max_model_len`` and serves it. ``bounds`` are the simulator's (the pools'
     ``max_model_len`` and ``draft_tokens``, :attr:`SimMember.bounds`). Such a
     request loses at most ``draft_tokens`` tokens, from its output while it
-    keeps one, then its input. A request longer than ``max_model_len`` itself is
-    left for the simulator to refuse. Returns how many requests were shortened."""
+    keeps one, then its input. A request longer than ``max_model_len`` itself, or
+    one with too little input to lose, is left for the simulator to refuse.
+    Returns how many requests were shortened."""
     drafting = [b for b in bounds or [] if b["draft_tokens"]]
     if not drafting:
         return 0
@@ -322,15 +324,27 @@ def _fit_draft_window(bounds: list[dict] | None, rows: list[dict]) -> int:
     bound, draft = pool["max_model_len"], pool["draft_tokens"]
     shortened = 0
     for row in rows:
-        lengths = {k: int(row[k]) for k in ("prefix_len", "input_len", "output_len") if k in row}
-        over = sum(lengths.values()) + draft - bound
-        if not 0 < over <= draft:
+        output, given = int(row["output_len"]), int(row["input_len"])
+        over = _prefix(row) + given + output + draft - bound
+        cut = min(over, output - 1)
+        if not 0 < over <= draft or over - cut >= given:
             continue
-        cut = min(over, lengths["output_len"] - 1)
-        row["output_len"] = str(lengths["output_len"] - cut)
-        row["input_len"] = str(lengths["input_len"] - (over - cut))
+        row["output_len"] = str(output - cut)
+        row["input_len"] = str(given - (over - cut))
         shortened += 1
     return shortened
+
+
+def _prefix(row: dict) -> int:
+    """The prefix the simulator counts toward a request's length, as its trace
+    reader takes it (``sim/frontend/schema.rs``): a chained round's
+    ``prefix_len``, or an independent row's ``prefix_kv`` when it names a
+    session."""
+    if row.get("prefix_len"):
+        return int(row["prefix_len"])
+    if row.get("session_id") and row.get("prefix_kv"):
+        return int(row["prefix_kv"])
+    return 0
 
 
 def write_trace(
@@ -353,10 +367,7 @@ def write_trace(
         reader = csv.DictReader(stream)
         fields = list(reader.fieldnames or [])
         rows = list(reader)
-    if len(rows) > MAX_REQUESTS:
-        raise BadWorkload(
-            f"{source.name} has {len(rows)} requests; at most {MAX_REQUESTS} per simulation"
-        )
+    check_count(source.name, len(rows))
     accept = _accept_rate(member, workload, source, _draft_tokens(bounds))
     tags = list(source.input_file_tags)
     if not _drafts(member) and "speculative" in tags:
@@ -565,7 +576,7 @@ class Simulations:
         return {
             "max_running": self.max_running,
             "max_queued": self.max_queued,
-            "max_requests": MAX_REQUESTS,
+            "max_requests": workloads.MAX_REQUESTS,
             "timeout_s": self.timeout_s,
             "keep_s": self.keep_s,
         }
