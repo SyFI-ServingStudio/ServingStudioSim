@@ -9,8 +9,6 @@ FLOPs describe the semantic operation, not undocumented device traffic.
 
 from __future__ import annotations
 
-from typing import Any
-
 from profiling.db.args import DType
 from profiling.profilers.energy import Energy
 from profiling.profilers.timer import Timer
@@ -32,13 +30,6 @@ def _validate_args(m: int, hidden: int, dtype: DType | str) -> tuple[int, int, D
     return m, hidden, dtype
 
 
-def _validate_cuda_device(torch: Any) -> None:
-    # vLLM's rms_norm is a generic CUDA kernel built for every arch vLLM ships;
-    # an unmeasured GPU is a data gap, not a reason to refuse.
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented("CUDA is required for the rms_norm vllm_cuda backend")
-
-
 def profile_rms_norm_vllm_cuda(m: int, hidden: int, dtype: DType | str) -> ComputeMetrics:
     """Profile vLLM's one-launch out-of-place RMSNorm."""
     m, hidden, dtype = _validate_args(m, hidden, dtype)
@@ -49,8 +40,6 @@ def profile_rms_norm_vllm_cuda(m: int, hidden: int, dtype: DType | str) -> Compu
         raise ProfilerNotImplemented(
             "the instrumented vLLM environment is required for the rms_norm vllm_cuda backend"
         ) from exc
-
-    _validate_cuda_device(torch)
 
     try:
         torch_dtype = dtype.torch()

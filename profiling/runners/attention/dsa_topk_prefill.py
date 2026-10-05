@@ -96,11 +96,6 @@ def _validate_args(
     )
 
 
-def _validate_cuda_device(torch: Any) -> None:
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented("CUDA is required for the torch dsa_topk_prefill backend")
-
-
 def _validate_vllm_args(
     num_queries: int,
     num_keys: int,
@@ -131,11 +126,6 @@ def _validate_vllm_args(
         span_mode,
     )
     return validated
-
-
-def _validate_vllm_cuda_device(torch: Any) -> None:
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented("CUDA is required for the dsa_topk_prefill vllm_cuda backend")
 
 
 def _resolve_vllm_prefill_op(torch: Any) -> Any:
@@ -259,11 +249,6 @@ def _load_sglang_cuda_backend() -> tuple[Any, Any]:
     return torch, fast_topk_transform_fused
 
 
-def _validate_sglang_cuda_device(torch: Any) -> None:
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented("CUDA is required for dsa_topk_prefill:sglang_cuda")
-
-
 @dataclass(frozen=True)
 class _SglangPagedExtras:
     lengths: Any
@@ -360,8 +345,6 @@ def profile_dsa_topk_prefill_torch(
             "torch is required for the torch dsa_topk_prefill backend"
         ) from exc
 
-    _validate_cuda_device(torch)
-
     try:
         operands = _build_operands(
             torch,
@@ -427,7 +410,6 @@ def profile_dsa_topk_prefill_vllm_cuda(
         span_mode,
     )
     torch, top_k_per_row_prefill = _load_vllm_cuda_backend()
-    _validate_vllm_cuda_device(torch)
 
     try:
         operands = _build_operands(
@@ -510,7 +492,6 @@ def profile_dsa_topk_prefill_sglang_cuda(
         _SGLANG_TOP_K,
     )
     torch, fast_topk_transform_fused = _load_sglang_cuda_backend()
-    _validate_sglang_cuda_device(torch)
     try:
         operands = _build_operands(
             torch,

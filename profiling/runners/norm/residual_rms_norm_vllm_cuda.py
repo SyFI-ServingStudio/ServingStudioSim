@@ -7,8 +7,6 @@ nominal FLOPs describe the semantic operation, not undocumented device traffic.
 
 from __future__ import annotations
 
-from typing import Any
-
 from profiling.db.args import DType
 from profiling.profilers.energy import Energy
 from profiling.profilers.timer import Timer
@@ -37,13 +35,6 @@ def _validate_args(
     return m, hidden, dtype
 
 
-def _validate_cuda_device(torch: Any) -> None:
-    # vLLM's fused_add_rms_norm is a generic CUDA kernel built for every arch
-    # vLLM ships; an unmeasured (dtype, GPU) pair is a data gap.
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented("CUDA is required for the residual_rms_norm vllm_cuda backend")
-
-
 def profile_residual_rms_norm_vllm_cuda(
     m: int,
     hidden: int,
@@ -59,8 +50,6 @@ def profile_residual_rms_norm_vllm_cuda(
             "the instrumented vLLM environment is required for "
             "the residual_rms_norm vllm_cuda backend"
         ) from exc
-
-    _validate_cuda_device(torch)
 
     try:
         torch_dtype = dtype.torch()

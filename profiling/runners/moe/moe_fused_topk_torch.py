@@ -192,8 +192,6 @@ def profile_moe_fused_topk(
         import torch
     except ImportError as exc:
         raise ProfilerNotImplemented("torch is required for moe_fused_topk") from exc
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented("CUDA is required for torch moe_fused_topk")
     try:
         operands = _build_operands(torch, args, device=torch.device("cuda"))
         _check_correctness(torch, operands)

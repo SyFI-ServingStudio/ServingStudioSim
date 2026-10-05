@@ -6,6 +6,7 @@ from typing import Any
 
 from profiling.profilers.energy import Energy
 from profiling.profilers.timer import Timer
+from profiling.runners.device import require_cutedsl
 from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
 
@@ -103,13 +104,6 @@ def _validate_args(
         block_size,
         offset,
     )
-
-
-def _require_cutedsl_gpu(torch: Any, has_cutedsl: Any) -> Any:
-    device = torch.device("cuda", torch.cuda.current_device())
-    if not has_cutedsl():
-        raise ProfilerNotImplemented(f"{_BACKEND} requires the production Cutlass DSL path")
-    return device
 
 
 def _block_table(torch: Any, shape: _Shape, device: Any) -> tuple[Any, int]:
@@ -258,11 +252,11 @@ def profile_packed_kv_cache_gather_cutedsl(
     try:
         import torch
         from vllm.models.deepseek_v4.common.ops import dequantize_and_gather_k_cache
-        from vllm.utils.import_utils import has_cutedsl
     except ImportError as exc:
         raise ProfilerNotImplemented(f"{_BACKEND} requires pinned vLLM") from exc
     try:
-        device = _require_cutedsl_gpu(torch, has_cutedsl)
+        require_cutedsl(_BACKEND)
+        device = torch.device("cuda", torch.cuda.current_device())
         operands = _prepare(torch, shape, device)
 
         def launch():

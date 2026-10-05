@@ -19,7 +19,6 @@ from profiling.kernels.mla_cache_append import KIND, MlaCacheAppendArgs
 from profiling.runners.attention.mla_cache_append_reference import (
     mla_cache_append_reference,
 )
-from profiling.runners.exceptions import ProfilerNotImplemented
 
 _TORCH_BACKEND = "torch"
 _VLLM_BACKEND = "vllm_cuda"
@@ -335,25 +334,6 @@ def test_runner_rejects_unsupported_cache_format_before_cuda(cache_format):
         )
 
 
-def test_runner_requires_cuda_but_no_gpu_allowlist():
-    from profiling.runners.attention.mla_cache_append import (
-        _validate_cuda_device,
-    )
-
-    no_cuda = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False))
-    with pytest.raises(ProfilerNotImplemented, match="CUDA is required"):
-        _validate_cuda_device(no_cuda)
-
-    h100 = SimpleNamespace(
-        cuda=SimpleNamespace(
-            is_available=lambda: True,
-            current_device=lambda: 0,
-            get_device_name=lambda _device: "NVIDIA H100",
-        )
-    )
-    _validate_cuda_device(h100)
-
-
 def test_vllm_runner_rejects_invalid_args_before_framework_imports():
     from profiling.runners.attention.mla_cache_append import (
         profile_mla_cache_append_vllm_cuda,
@@ -382,25 +362,6 @@ def test_vllm_runner_rejects_invalid_args_before_framework_imports():
             profile_mla_cache_append_vllm_cuda(**(valid | overrides))
 
 
-def test_vllm_runner_requires_cuda_but_no_gpu_allowlist():
-    from profiling.runners.attention.mla_cache_append import (
-        _validate_vllm_cuda_device,
-    )
-
-    no_cuda = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False))
-    with pytest.raises(ProfilerNotImplemented, match="CUDA is required"):
-        _validate_vllm_cuda_device(no_cuda)
-
-    h100 = SimpleNamespace(
-        cuda=SimpleNamespace(
-            is_available=lambda: True,
-            current_device=lambda: 0,
-            get_device_name=lambda _device: "NVIDIA H100",
-        )
-    )
-    _validate_vllm_cuda_device(h100)
-
-
 def test_vllm_runner_maps_fp8_cache_to_torch_storage_dtype(monkeypatch):
     from profiling.runners.attention import mla_cache_append as runner
 
@@ -423,7 +384,6 @@ def test_vllm_runner_maps_fp8_cache_to_torch_storage_dtype(monkeypatch):
     fake_vllm = ModuleType("vllm")
     fake_vllm._custom_ops = Ops
     monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
-    monkeypatch.setattr(runner, "_validate_vllm_cuda_device", lambda _torch: None)
     monkeypatch.setattr(runner, "_build_operands", build_operands)
     monkeypatch.setattr(runner, "_verify_vllm_launch", lambda *_args: None)
     monkeypatch.setattr(torch, "ones", lambda *args, **kwargs: object())

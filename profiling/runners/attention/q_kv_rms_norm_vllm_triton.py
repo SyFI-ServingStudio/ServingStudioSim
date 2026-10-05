@@ -46,9 +46,6 @@ def profile_q_kv_rms_norm_vllm_triton(
     except ImportError as exc:
         raise ProfilerNotImplemented(f"{_BACKEND} requires pinned vLLM") from exc
     try:
-        # A portable Triton kernel: any CUDA GPU runs it.
-        if not torch.cuda.is_available():
-            raise ProfilerNotImplemented(f"{_BACKEND} requires CUDA")
         device = torch.device("cuda", torch.cuda.current_device())
         generator = torch.Generator(device=device).manual_seed(43)
         # Callers pass split views of the fused q_a/kv_a projection output.

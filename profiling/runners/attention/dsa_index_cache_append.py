@@ -121,20 +121,6 @@ def _validate_args(
     )
 
 
-def _validate_cuda_device(torch: Any) -> None:
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented(
-            "CUDA is required for the torch dsa_index_cache_append backend"
-        )
-
-
-def _validate_vllm_cuda_device(torch: Any) -> None:
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented(
-            "CUDA is required for the dsa_index_cache_append vllm_cuda backend"
-        )
-
-
 def _build_operands(
     torch: Any,
     *,
@@ -284,8 +270,6 @@ def profile_dsa_index_cache_append_torch(
             "torch is required for the torch dsa_index_cache_append backend"
         ) from exc
 
-    _validate_cuda_device(torch)
-
     try:
         operands = _build_operands(
             torch,
@@ -330,13 +314,6 @@ def profile_dsa_index_cache_append_torch(
         raise KernelLaunchFailed(str(exc)) from exc
 
 
-def _validate_sglang_device(torch: Any) -> None:
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented(
-            "CUDA is required for dsa_index_cache_append:sglang_fused_norm_rope_store"
-        )
-
-
 def profile_dsa_index_cache_append_sglang_fused_norm_rope_store(
     num_tokens: int,
     index_dim: int,
@@ -377,7 +354,6 @@ def profile_dsa_index_cache_append_sglang_fused_norm_rope_store(
             "dsa_index_cache_append:sglang_fused_norm_rope_store requires the SGLang environment"
         ) from exc
 
-    _validate_sglang_device(torch)
     try:
         device = torch.device("cuda", torch.cuda.current_device())
         generator = torch.Generator(device=device).manual_seed(42)
@@ -497,8 +473,6 @@ def profile_dsa_index_cache_append_vllm_cuda(
             "the instrumented vLLM environment is required for "
             "the dsa_index_cache_append vllm_cuda backend"
         ) from exc
-
-    _validate_vllm_cuda_device(torch)
 
     try:
         operands = _build_operands(

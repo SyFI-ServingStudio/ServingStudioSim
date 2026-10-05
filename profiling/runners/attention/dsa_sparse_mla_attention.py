@@ -302,11 +302,6 @@ def _validate_args(
     )
 
 
-def _require_cuda(torch: Any, *, backend: str = "dsa_sparse_mla_attention:torch") -> None:
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented(f"CUDA is required for {backend}")
-
-
 def _device_capability(torch: Any) -> tuple[int, int]:
     major, minor = torch.cuda.get_device_capability(torch.cuda.current_device())
     return int(major), int(minor)
@@ -749,7 +744,6 @@ def profile_dsa_sparse_mla_attention_torch(
         raise ProfilerNotImplemented("PyTorch is unavailable") from exc
 
     try:
-        _require_cuda(torch)
         device = torch.device("cuda", torch.cuda.current_device())
         operands = _build_operands(
             torch, validated, num_heads=num_heads, selected_k=selected_k, device=device

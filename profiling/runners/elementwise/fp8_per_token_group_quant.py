@@ -81,14 +81,6 @@ def _validate_args(
     return num_tokens, hidden_size, group_size, input_dtype, scale_format
 
 
-def _validate_cuda_device(torch: Any, scale_format: str = _COLUMN_MAJOR) -> None:
-    del scale_format  # every format launches on any CUDA GPU
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented(
-            "CUDA is required for fp8_per_token_group_quant vllm_cuda"
-        )
-
-
 def _load_vllm_quant_op(torch: Any, scale_format: str = _COLUMN_MAJOR) -> Any:
     """Load vLLM's public stable-ABI op without importing model runtime state."""
     try:
@@ -225,7 +217,6 @@ def profile_fp8_per_token_group_quant_vllm_cuda(
     except ImportError as exc:
         raise ProfilerNotImplemented("PyTorch is required for vllm_cuda") from exc
 
-    _validate_cuda_device(torch, scale_format)
     quant_op = _load_vllm_quant_op(torch, scale_format)
     input_tensor, output_quantized, output_scales = _allocate_operands(
         torch,

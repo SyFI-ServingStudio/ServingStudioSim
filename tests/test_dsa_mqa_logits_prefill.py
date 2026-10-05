@@ -364,19 +364,6 @@ def test_rejects_nonboolean_clean_logits():
         _validate_args(**kwargs)
 
 
-
-def test_torch_backend_requires_cuda_but_no_gpu_allowlist():
-    from profiling.runners.attention.dsa_mqa_logits_prefill import (
-        _validate_cuda_device,
-    )
-
-    no_cuda = fake_cuda_torch(available=False)
-    with pytest.raises(ProfilerNotImplemented, match="CUDA is required"):
-        _validate_cuda_device(no_cuda)
-    _validate_cuda_device(fake_cuda_torch((9, 0), "NVIDIA H100"))
-    _validate_cuda_device(fake_cuda_torch((8, 0), "NVIDIA A100"))
-
-
 def test_deepgemm_device_check_is_the_per_arch_head_set():
     from profiling.runners.attention.dsa_compressed_mqa_logits_prefill_deepgemm import (
         require_deepgemm_mqa_logits_heads as require_heads,

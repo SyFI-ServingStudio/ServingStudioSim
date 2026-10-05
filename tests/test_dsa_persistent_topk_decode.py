@@ -515,19 +515,6 @@ def test_validate_accepts_ordinary_speculative_and_zero_context() -> None:
     assert speculative[:3] == (16, 8192, 2)
 
 
-def test_requires_cuda_but_no_gpu_allowlist() -> None:
-    from profiling.runners.attention.dsa_persistent_topk_decode import (
-        _validate_cuda_device,
-    )
-
-    no_cuda = fake_cuda_torch(available=False)
-    with pytest.raises(ProfilerNotImplemented, match="CUDA is required"):
-        _validate_cuda_device(no_cuda)
-    for name, capability in (("NVIDIA H100", (9, 0)), ("NVIDIA A100", (8, 0))):
-        _validate_cuda_device(fake_cuda_torch(capability, name))
-        _validate_cuda_device(fake_cuda_torch(capability, name), backend="vllm_cuda")
-
-
 def test_path_choice_follows_compute_capability_not_gpu_name() -> None:
     from profiling.runners.attention.dsa_persistent_topk_decode import _uses_native_extension
 
@@ -817,7 +804,6 @@ def test_profile_uses_cuda_event_total_and_returns_compute_metrics(monkeypatch) 
         logits_row_stride=8,
         device="cpu",
     )
-    monkeypatch.setattr(runner, "_validate_cuda_device", lambda _torch: None)
     monkeypatch.setattr(runner, "_build_operands", lambda *args, **kwargs: operands)
     monkeypatch.setattr(runner, "_validate_semantics", lambda *args, **kwargs: None)
 
@@ -858,7 +844,6 @@ def test_profile_uses_cuda_event_total_and_returns_compute_metrics(monkeypatch) 
 def test_profile_translates_runtime_failure(monkeypatch) -> None:
     from profiling.runners.attention import dsa_persistent_topk_decode as runner
 
-    monkeypatch.setattr(runner, "_validate_cuda_device", lambda _torch: None)
     monkeypatch.setattr(runner, "_validate_semantics", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         runner,
@@ -993,7 +978,6 @@ def test_native_profile_times_only_complete_op_and_returns_metrics(monkeypatch, 
         events.append(("op", args))
         return None
 
-    monkeypatch.setattr(runner, "_validate_cuda_device", lambda *args, **kwargs: None)
     monkeypatch.setattr(runner, "_uses_native_extension", lambda _torch: True)
     monkeypatch.setattr(runner, "_load_native_op", lambda _torch: fake_op)
     monkeypatch.setattr(runner, "_build_native_operands", lambda *args, **kwargs: operands)
@@ -1041,7 +1025,6 @@ def test_native_profile_translates_op_runtime_failure(monkeypatch) -> None:
     def fail_op(*args):
         raise RuntimeError("synthetic pinned op failure")
 
-    monkeypatch.setattr(runner, "_validate_cuda_device", lambda *args, **kwargs: None)
     monkeypatch.setattr(runner, "_uses_native_extension", lambda _torch: True)
     monkeypatch.setattr(runner, "_load_native_op", lambda _torch: fail_op)
     monkeypatch.setattr(runner, "_build_native_operands", lambda *args, **kwargs: operands)

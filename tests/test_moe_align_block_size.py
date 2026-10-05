@@ -71,22 +71,3 @@ def test_vllm_runner_rejects_more_experts_than_its_block_scan(
     monkeypatch.setitem(sys.modules, "torch", None)
     with pytest.raises(ProfilerNotImplemented, match="at most 992 experts"):
         runner.profile_moe_align_block_size_vllm_cuda(4, 993, 2, 16)
-
-
-def test_vllm_runner_needs_cuda_but_no_gpu_model() -> None:
-    from types import SimpleNamespace
-
-    from profiling.runners.moe import moe_align_block_size_vllm_cuda as runner
-
-    def fake_torch(available: bool) -> SimpleNamespace:
-        return SimpleNamespace(
-            cuda=SimpleNamespace(
-                is_available=lambda: available,
-                current_device=lambda: 0,
-                get_device_name=lambda _: "NVIDIA B200",
-            )
-        )
-
-    runner._require_cuda(fake_torch(True))
-    with pytest.raises(ProfilerNotImplemented, match="requires CUDA"):
-        runner._require_cuda(fake_torch(False))

@@ -76,13 +76,6 @@ def _validate_args(
         raise ProfilerNotImplemented(f"{_BACKEND} requires weight_output_dtype=fp32")
 
 
-def _validate_device(torch: Any) -> None:
-    # SGLang JIT-builds main_norm_rope.cuh for the current device; the kernel
-    # has no arch-specific path (PDL is opted in only where the arch supports it).
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented(f"{_BACKEND} requires CUDA")
-
-
 def _prepare(torch: Any, callable_: Any, *, num_tokens: int, num_heads: int) -> _Launch:
     device = torch.device("cuda", torch.cuda.current_device())
     generator = torch.Generator(device=device).manual_seed(0)
@@ -153,7 +146,6 @@ def profile_dsa_indexer_q_rope_quant_sglang_cuda(
         raise ProfilerNotImplemented(f"{_BACKEND} requires the SGLang environment") from exc
 
     try:
-        _validate_device(torch)
         launch = _prepare(
             torch,
             fused_q_indexer_rope_first_quant,

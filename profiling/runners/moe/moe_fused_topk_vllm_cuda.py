@@ -113,12 +113,6 @@ def _validate_operands(
         raise ValueError("logits and hidden_states must share one device")
 
 
-def _require_cuda(torch: Any) -> None:
-    # A vLLM _moe_C CUDA op built for every CUDA arch the wheel targets.
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented(f"CUDA is required for {_BACKEND}")
-
-
 def _load_callable() -> Any:
     try:
         module = importlib.import_module(_MODULE)
@@ -233,7 +227,6 @@ def profile_moe_fused_topk_vllm_cuda(
     except ImportError as exc:
         raise ProfilerNotImplemented(f"PyTorch is required for {_BACKEND}") from exc
     try:
-        _require_cuda(torch)
         callable_ = _load_callable()
         device = torch.device("cuda", torch.cuda.current_device())
         operands = _build_operands(torch, args, device=device)

@@ -20,7 +20,6 @@ from profiling.runners.attention.gdn_prefill_post_conv_torch import (
     _logical_bytes,
     _semantic_flops,
 )
-from profiling.runners.device import require_cuda
 from profiling.runners.exceptions import (
     KernelLaunchFailed,
     OOMError,
@@ -131,10 +130,6 @@ def _guard_args(args: _ValidatedArgs) -> _ValidatedArgs:
     packed_width = _operand_shapes(args).conv_output[1]
     max_tokens = max(1, _MAX_GUARD_PACKED_ELEMENTS // packed_width)
     return replace(args, num_tokens=min(args.num_tokens, max_tokens))
-
-
-def _require_cuda(torch: Any) -> None:
-    require_cuda(torch, _BACKEND)
 
 
 def _load_fused_callable() -> Any:
@@ -341,7 +336,6 @@ def profile_gdn_prefill_post_conv_vllm_triton(
         raise ProfilerNotImplemented(f"PyTorch is required for {_BACKEND}") from exc
 
     try:
-        _require_cuda(torch)
         fused_callable = _load_fused_callable()
         device = torch.device("cuda", torch.cuda.current_device())
         operands = _build_operands(torch, args, device=device)

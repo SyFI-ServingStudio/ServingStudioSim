@@ -68,6 +68,7 @@ register(
         args_schema=MoeAlignBlockSizeArgs,
         metric_family=MetricFamily.COMPUTE,
         batch_outlier_policy=BatchOutlierPolicy(),
+        # No capability rule: a vLLM _C CUDA op built for every arch the wheel targets.
         supports=BackendSupport(compute=None),
         subprocess_env="vllm_env",
         doc=BackendDoc(

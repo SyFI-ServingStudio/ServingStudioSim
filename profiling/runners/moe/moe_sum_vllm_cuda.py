@@ -41,13 +41,6 @@ def _validate_args(
     return num_tokens, top_k, hidden_dim
 
 
-def _require_cuda(torch: Any) -> None:
-    # A vLLM _C CUDA op built for every CUDA arch the wheel targets; no GPU
-    # model or capability floor beyond CUDA itself.
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented(f"{_BACKEND} requires CUDA")
-
-
 def _prepare(
     torch: Any,
     callable_: Callable[[Any, Any], None],
@@ -88,7 +81,6 @@ def profile_moe_sum_vllm_cuda(
         raise ProfilerNotImplemented(f"{_BACKEND} requires the pinned vLLM environment") from exc
 
     try:
-        _require_cuda(torch)
         launch = _prepare(torch, _custom_ops.moe_sum, num_tokens, top_k, hidden_dim)
         _check_output(torch, launch)
         # The kernel moe_sum launches depends on top_k and the vLLM build (older

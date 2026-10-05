@@ -91,21 +91,3 @@ def test_fp32_prepare_needs_highest_precision_and_caches_a_contiguous_weight() -
     launch = _prepare(fake_torch, shape)
     assert launch.fp32_input
     assert (launch.input_tensor, launch.weight_transposed) == ("input", "weight.T.contiguous()")
-
-
-def test_requires_cuda_but_no_particular_gpu() -> None:
-    # torch.mm/cuBLAS runs on any CUDA GPU; an unmeasured GPU is a data gap.
-    from profiling.runners.gemm.gemm_fp32_output_torch_cublas import _require_gpu
-
-    with pytest.raises(ProfilerNotImplemented, match="requires CUDA"):
-        _require_gpu(SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False)))
-    for gpu_name in ("NVIDIA H200", "NVIDIA H100 80GB HBM3", "NVIDIA A100-SXM4-80GB"):
-        _require_gpu(
-            SimpleNamespace(
-                cuda=SimpleNamespace(
-                    is_available=lambda: True,
-                    current_device=lambda: 0,
-                    get_device_name=lambda _device, name=gpu_name: name,
-                )
-            )
-        )

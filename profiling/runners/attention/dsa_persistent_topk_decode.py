@@ -137,13 +137,6 @@ def _validate_args(
     )
 
 
-def _validate_cuda_device(torch: Any, *, backend: str = "torch") -> None:
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented(
-            f"CUDA is required for the {backend} dsa_persistent_topk_decode backend"
-        )
-
-
 def _uses_native_extension(torch: Any) -> bool:
     """True when the device can run the corrected sm_90 extension."""
     capability = tuple(torch.cuda.get_device_capability(torch.cuda.current_device()))
@@ -577,8 +570,6 @@ def profile_dsa_persistent_topk_decode_torch(
             "torch is required for the torch dsa_persistent_topk_decode backend"
         ) from exc
 
-    _validate_cuda_device(torch)
-
     try:
         operands = _build_operands(
             torch,
@@ -694,7 +685,6 @@ def profile_dsa_persistent_topk_decode_vllm_cuda(
             "torch is required for the vllm_cuda dsa_persistent_topk_decode backend"
         ) from exc
 
-    _validate_cuda_device(torch, backend="vllm_cuda")
     # The image vLLM op carries the known buffered-path overflow bug; the
     # corrected sm_90 extension does not, so only the former is tolerated.
     overflow_allowed = not _uses_native_extension(torch)

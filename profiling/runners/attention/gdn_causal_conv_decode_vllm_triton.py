@@ -20,7 +20,6 @@ from profiling.runners.attention.gdn_causal_conv_decode_torch import (
     _logical_bytes,
     _semantic_flops,
 )
-from profiling.runners.device import require_cuda
 from profiling.runners.exceptions import (
     KernelLaunchFailed,
     OOMError,
@@ -115,10 +114,6 @@ def _operand_shapes(args: _ValidatedArgs) -> _OperandShapes:
 
 def _valid_slot_indices(batch_size: int) -> tuple[int, ...]:
     return tuple(range(1, batch_size + 1))
-
-
-def _require_cuda(torch: Any) -> None:
-    require_cuda(torch, _BACKEND)
 
 
 def _load_fused_callable() -> Any:
@@ -251,7 +246,6 @@ def profile_gdn_causal_conv_decode_vllm_triton(
         raise ProfilerNotImplemented(f"PyTorch is required for {_BACKEND}") from exc
 
     try:
-        _require_cuda(torch)
         fused_callable = _load_fused_callable()
         device = torch.device("cuda", torch.cuda.current_device())
         operands = _build_operands(torch, args, device=device)

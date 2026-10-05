@@ -6,7 +6,6 @@ import subprocess
 import sys
 from dataclasses import fields
 from re import escape
-from types import SimpleNamespace
 from typing import Any, get_type_hints
 
 import pytest
@@ -573,24 +572,6 @@ def test_malformed_types_fail_before_allocation(
         runner.profile_dsa_sparse_index_remap_torch(**(_BASE_SPEC | {name: value}))
 
 
-def test_backends_require_cuda_but_no_gpu_allowlist() -> None:
-    from profiling.runners.attention.dsa_sparse_index_remap import _require_cuda
-
-    no_cuda = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False))
-    with pytest.raises(ProfilerNotImplemented, match="CUDA is required"):
-        _require_cuda(no_cuda)
-
-    h100 = SimpleNamespace(
-        cuda=SimpleNamespace(
-            is_available=lambda: True,
-            current_device=lambda: 0,
-            get_device_name=lambda _device: "NVIDIA H100",
-        )
-    )
-    _require_cuda(h100)
-    _require_cuda(h100, backend="dsa_sparse_index_remap:vllm_triton")
-
-
 def test_unmeasured_queries_requests_block_sizes_and_widths_are_accepted() -> None:
     from profiling.runners.attention import dsa_sparse_index_remap as runner
 
@@ -1011,7 +992,6 @@ def test_profile_times_complete_composite_and_returns_live_zero_flop_metrics(
         counts=None,
     )
     calls: list[Any] = []
-    monkeypatch.setattr(runner, "_require_cuda", lambda _torch: calls.append("gpu"))
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(
         runner,
@@ -1061,7 +1041,6 @@ def test_profile_times_complete_composite_and_returns_live_zero_flop_metrics(
     assert metrics.tflops == 0.0
     assert metrics.memory_bandwidth_gbps == logical_bytes / 0.002 / 1e9
     assert calls == [
-        "gpu",
         "build",
         "correctness",
         ("timer", {}),
@@ -1076,14 +1055,6 @@ def test_profile_preserves_typed_unavailable_oom_and_execution_failures(
 ) -> None:
     from profiling.runners.attention import dsa_sparse_index_remap as runner
 
-    def unavailable(_torch: Any) -> None:
-        raise ProfilerNotImplemented("CUDA is required")
-
-    monkeypatch.setattr(runner, "_require_cuda", unavailable)
-    with pytest.raises(ProfilerNotImplemented, match="CUDA is required"):
-        runner.profile_dsa_sparse_index_remap_torch(**_BASE_SPEC)
-
-    monkeypatch.setattr(runner, "_require_cuda", lambda _torch: None)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
 
     def oom(*_args: Any, **_kwargs: Any) -> Any:

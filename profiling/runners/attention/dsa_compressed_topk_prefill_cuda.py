@@ -138,8 +138,6 @@ def profile_dsa_compressed_topk_prefill_cuda(
     except ImportError as exc:
         raise ProfilerNotImplemented(f"{_BACKEND} requires pinned vLLM") from exc
     try:
-        if not torch.cuda.is_available():
-            raise ProfilerNotImplemented(f"{_BACKEND} requires CUDA")
         # top_k_per_row_prefill (csrc/libtorch_stable/sampler.cu) is a generic
         # CUDA kernel with no arch-specific path.
         device = torch.device("cuda", torch.cuda.current_device())

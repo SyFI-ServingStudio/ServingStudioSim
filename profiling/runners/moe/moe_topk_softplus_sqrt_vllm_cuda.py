@@ -169,9 +169,6 @@ def profile_moe_topk_softplus_sqrt_vllm_cuda(
         raise ProfilerNotImplemented(f"{_BACKEND} requires the pinned vLLM environment") from exc
 
     try:
-        # A vLLM _moe_C CUDA op built for every CUDA arch the wheel targets.
-        if not torch.cuda.is_available():
-            raise ProfilerNotImplemented(f"{_BACKEND} requires CUDA")
         launch = _prepare(torch, _custom_ops.topk_hash_softplus_sqrt, shape)
         _check_output(torch, launch)
         # One launch per call, but not always the same kernel: hash routing with

@@ -76,6 +76,7 @@ register(
     KernelProfilerSpec(
         kernel_kind=KIND,
         backend="vllm_cuda",
+        # No capability rule: every scale format, packed UE8M0 included, is generic CUDA.
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
         ),

@@ -100,11 +100,6 @@ def _validate_args(
     return num_batches, m, n, k, dtype
 
 
-def _validate_cuda_device(torch: Any) -> None:
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented("CUDA is required for the torch_mla_q_absorb backend")
-
-
 def _validate_v_up_args(
     num_batches: int,
     m: int,
@@ -133,11 +128,6 @@ def _validate_v_up_args(
     if dtype is not _SUPPORTED_DTYPE:
         raise ValueError(f"torch_mla_v_up supports only bf16, got {dtype.value}")
     return num_batches, m, n, k, dtype
-
-
-def _validate_v_up_cuda_device(torch: Any) -> None:
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented("CUDA is required for the torch_mla_v_up backend")
 
 
 def _build_q_absorb_operands(
@@ -268,8 +258,6 @@ def profile_mla_q_absorb(
             "torch is required for the torch_mla_q_absorb backend"
         ) from exc
 
-    _validate_cuda_device(torch)
-
     try:
         operands = _build_q_absorb_operands(
             torch,
@@ -324,8 +312,6 @@ def profile_mla_v_up(
         import torch
     except ImportError as exc:
         raise ProfilerNotImplemented("torch is required for the torch_mla_v_up backend") from exc
-
-    _validate_v_up_cuda_device(torch)
 
     try:
         operands = _build_v_up_operands(
@@ -444,8 +430,6 @@ def _profile_layout_bmm(
         import torch
     except ImportError as exc:
         raise ProfilerNotImplemented(f"torch is required for the {backend} backend") from exc
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented(f"CUDA is required for the {backend} backend")
     try:
         operands = build(
             torch, layout, num_batches=num_batches, m=m, torch_dtype=dtype.torch(), device="cuda"

@@ -88,6 +88,7 @@ register(
     KernelProfilerSpec(
         kernel_kind=KIND,
         backend="vllm_cuda",
+        # No capability rule: a vLLM _moe_C CUDA op built for every arch the wheel targets.
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
         ),

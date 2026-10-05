@@ -72,6 +72,8 @@ register(
     KernelProfilerSpec(
         kernel_kind=KIND,
         backend="flashinfer",
+        # No capability rule: FlashInfer JIT-builds rope.cu for the current device;
+        # its PDL instructions are guarded by __CUDA_ARCH__ >= 900 (pos_enc.cuh).
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
             kv=frozenset({DType.FP8_E4M3}),

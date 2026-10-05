@@ -5,7 +5,6 @@ from __future__ import annotations
 import subprocess
 import sys
 from dataclasses import fields
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -15,7 +14,6 @@ from profiling.db.args import DType
 from profiling.db.batch import coerce_args
 from profiling.db.registry import MetricFamily, find_kernel_profiler_spec, known_backends
 from profiling.kernels.batched_gemm import KIND, BatchedGemmArgs
-from profiling.runners.exceptions import ProfilerNotImplemented
 
 _Q_BACKEND = "torch_mla_q_absorb"
 _V_UP_BACKEND = "torch_mla_v_up"
@@ -190,23 +188,6 @@ def test_runner_rejects_non_bf16_dtype(dtype):
         _validate_args(64, 1, 512, 192, dtype)
 
 
-def test_runner_requires_cuda_but_accepts_any_gpu():
-    from profiling.runners.gemm.batched_gemm import _validate_cuda_device
-
-    no_cuda = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False))
-    with pytest.raises(ProfilerNotImplemented, match="CUDA is required"):
-        _validate_cuda_device(no_cuda)
-
-    h100 = SimpleNamespace(
-        cuda=SimpleNamespace(
-            is_available=lambda: True,
-            current_device=lambda: 0,
-            get_device_name=lambda _device: "NVIDIA H100",
-        )
-    )
-    _validate_cuda_device(h100)
-
-
 @pytest.mark.parametrize(
     ("num_batches", "m", "n", "k"),
     [
@@ -258,23 +239,6 @@ def test_v_up_rejects_non_bf16_dtype(dtype):
 
     with pytest.raises(ValueError, match="supports only bf16"):
         _validate_v_up_args(64, 1, 256, 512, dtype)
-
-
-def test_v_up_requires_cuda_but_accepts_any_gpu():
-    from profiling.runners.gemm.batched_gemm import _validate_v_up_cuda_device
-
-    no_cuda = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False))
-    with pytest.raises(ProfilerNotImplemented, match="CUDA is required"):
-        _validate_v_up_cuda_device(no_cuda)
-
-    h100 = SimpleNamespace(
-        cuda=SimpleNamespace(
-            is_available=lambda: True,
-            current_device=lambda: 0,
-            get_device_name=lambda _device: "NVIDIA H100",
-        )
-    )
-    _validate_v_up_cuda_device(h100)
 
 
 @pytest.mark.parametrize("num_batches", [64, 32, 16, 8])

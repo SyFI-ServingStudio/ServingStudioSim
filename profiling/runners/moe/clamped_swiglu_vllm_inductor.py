@@ -39,13 +39,6 @@ def _validate_args(num_rows: int, hidden_dim: int, dtype: DType | str) -> tuple[
     return num_rows, hidden_dim
 
 
-def _require_cuda(torch: Any) -> None:
-    # A vLLM _C CUDA op built for every CUDA arch the wheel targets; no GPU
-    # model or capability floor beyond CUDA itself.
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented(f"{_BACKEND} requires CUDA")
-
-
 def _prepare(torch: Any, callable_: Callable[..., None], num_rows: int, hidden_dim: int) -> _Launch:
     device = torch.device("cuda", torch.cuda.current_device())
     generator = torch.Generator(device=device).manual_seed(0)
@@ -80,7 +73,6 @@ def profile_clamped_swiglu_vllm_inductor(
         raise ProfilerNotImplemented(f"{_BACKEND} requires the pinned vLLM environment") from exc
 
     try:
-        _require_cuda(torch)
         launch = _prepare(torch, swiglu_limit_func, num_rows, hidden_dim)
         _compile_and_check(torch, launch)
         time_ms = Timer.cupti(launch.run, kernel_name=None)

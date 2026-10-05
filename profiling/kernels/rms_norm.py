@@ -106,6 +106,7 @@ register(
     KernelProfilerSpec(
         kernel_kind=KIND,
         backend="vllm_cuda",
+        # No capability rule: a generic vLLM CUDA kernel built for every arch vLLM ships.
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
         ),

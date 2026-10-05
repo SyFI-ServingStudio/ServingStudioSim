@@ -20,7 +20,6 @@ from profiling.runners.attention.gdn_causal_conv_prefill_torch import (
     _logical_bytes,
     _semantic_flops,
 )
-from profiling.runners.device import require_cuda
 from profiling.runners.exceptions import (
     KernelLaunchFailed,
     OOMError,
@@ -175,10 +174,6 @@ def _expected_chunk_mapping(
     batch_ids = tuple(batch for batch in range(batch_size) for _chunk in range(chunks_per_sequence))
     offsets = tuple(chunk for _batch in range(batch_size) for chunk in range(chunks_per_sequence))
     return batch_ids, offsets
-
-
-def _require_cuda(torch: Any) -> None:
-    require_cuda(torch, _BACKEND)
 
 
 def _load_vllm_components() -> tuple[Any, Any]:
@@ -456,7 +451,6 @@ def profile_gdn_causal_conv_prefill_vllm_triton(
         raise ProfilerNotImplemented(f"PyTorch is required for {_BACKEND}") from exc
 
     try:
-        _require_cuda(torch)
         fused_callable, metadata_helper = _load_vllm_components()
         device = torch.device("cuda", torch.cuda.current_device())
         guard_args = _guard_args(args)

@@ -6,6 +6,7 @@ from typing import Any
 
 from profiling.profilers.energy import Energy
 from profiling.profilers.timer import Timer
+from profiling.runners.device import require_cutedsl
 from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
 
@@ -264,13 +265,11 @@ def profile_dsa_indexer_q_rope_quant_weight_fold_cutedsl(
         from vllm.models.deepseek_v4.nvidia.ops.fused_indexer_q_cutedsl import (
             fused_indexer_q_rope_quant_fp8_cutedsl,
         )
-        from vllm.utils.import_utils import has_cutedsl
     except ImportError as exc:
         raise ProfilerNotImplemented(f"{_BACKEND} requires pinned vLLM CuteDSL") from exc
     try:
+        require_cutedsl(_BACKEND)
         device = torch.device("cuda", torch.cuda.current_device())
-        if not has_cutedsl():
-            raise ProfilerNotImplemented(f"{_BACKEND} requires CuteDSL")
         operands = _build_operands(torch, shape, device)
         _check_output(torch, fused_indexer_q_rope_quant_fp8_cutedsl, operands, shape)
 

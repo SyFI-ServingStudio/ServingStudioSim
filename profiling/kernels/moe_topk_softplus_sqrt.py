@@ -76,6 +76,7 @@ register(
         args_schema=MoeTopkSoftplusSqrtArgs,
         metric_family=MetricFamily.COMPUTE,
         batch_outlier_policy=BatchOutlierPolicy(),
+        # No capability rule: a vLLM _moe_C CUDA op built for every arch the wheel targets.
         supports=BackendSupport(
             compute=frozenset({DType.FP32}),
         ),

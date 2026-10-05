@@ -218,10 +218,11 @@ historical results and record the selected database with the experiment.
 4. `LocalGpuChunk.run` writes the chunk payload to a temp JSON, sets
    `CUDA_VISIBLE_DEVICES`, applies the selected `ProfileEnv`'s ordered Python
    and shared-library paths, and spawns `python -m profiling.exec.local_worker`
-   in that environment. The worker first checks the real device against the
-   backend's declared `BackendSupport` device rule (`runners/device.py`) and
-   refuses every spec of the chunk without loading the runner when it fails;
-   runners repeat no capability rule and keep only shape-dependent checks.
+   in that environment. The worker first checks the real device: every backend
+   needs CUDA, and a backend's declared `BackendSupport` device rule must hold
+   (`runners/device.py`). When either fails it refuses every spec of the chunk
+   without loading the runner; runners repeat neither check and keep only
+   shape-dependent ones.
    Otherwise it lazy-loads the registered runner via `RunnerRef`, executes each
    spec, and writes JSON results back.
 5. Require every successful worker result to report its observed physical GPU,

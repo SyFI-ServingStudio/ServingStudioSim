@@ -101,24 +101,3 @@ def test_vllm_cuda_backend_runs_vllms_own_op_in_the_vllm_image():
     assert _validate_args(32, 4096, "bf16")[:2] == (32, 4096)
     with pytest.raises(ValueError, match="bf16"):
         _validate_args(32, 4096, "fp16")
-
-
-def test_vllm_cuda_runner_requires_cuda_but_no_particular_gpu():
-    # The previous (bf16, "NVIDIA B200") pair gate was a measured-GPU record.
-    from types import SimpleNamespace
-
-    from profiling.runners.exceptions import ProfilerNotImplemented
-    from profiling.runners.norm.rms_norm_vllm_cuda import _validate_cuda_device
-
-    with pytest.raises(ProfilerNotImplemented, match="CUDA is required"):
-        _validate_cuda_device(SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False)))
-    for gpu_name in ("NVIDIA H200", "NVIDIA H100 80GB HBM3", "NVIDIA B200"):
-        _validate_cuda_device(
-            SimpleNamespace(
-                cuda=SimpleNamespace(
-                    is_available=lambda: True,
-                    current_device=lambda: 0,
-                    get_device_name=lambda _device, name=gpu_name: name,
-                )
-            )
-        )

@@ -68,15 +68,17 @@ def test_the_sm10x_family_and_the_fp8_floor_are_capability_rules(monkeypatch):
         assert (unsupported_device(fp8, "x") is None) is fp8_ok
 
 
-def test_a_backend_without_a_rule_never_reads_the_device(monkeypatch):
-    monkeypatch.setitem(sys.modules, "torch", None)
-    assert unsupported_device(BackendSupport(compute=None), "x") is None
-
-
-def test_a_gated_backend_without_cuda_is_refused(monkeypatch):
+def test_every_backend_needs_cuda_and_one_without_a_rule_takes_any_gpu(monkeypatch):
+    # Runners no longer check for CUDA themselves, so the gate must refuse a
+    # CUDA-less worker even for a backend that declares no capability rule.
+    ruleless = BackendSupport(compute=None)
+    gated = BackendSupport(compute=None, sm_targets=frozenset({"sm_100f"}))
     _install_torch(monkeypatch, (10, 0), available=False)
-    supports = BackendSupport(compute=None, sm_targets=frozenset({"sm_100f"}))
-    assert unsupported_device(supports, "k b") == "CUDA is required for k b"
+    assert unsupported_device(ruleless, "k b") == "CUDA is required for k b"
+    assert unsupported_device(gated, "k b") == "CUDA is required for k b"
+    for capability in ((7, 0), (8, 0), (12, 0)):
+        _install_torch(monkeypatch, capability)
+        assert unsupported_device(ruleless, "k b") is None
 
 
 @pytest.mark.parametrize(

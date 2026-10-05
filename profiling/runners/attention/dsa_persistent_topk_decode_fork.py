@@ -162,8 +162,6 @@ def profile_dsa_persistent_topk_decode_vllm_fork_cuda(
         raise ProfilerNotImplemented(f"{_BACKEND} requires pinned vLLM") from exc
 
     try:
-        if not torch.cuda.is_available():
-            raise ProfilerNotImplemented(f"{_BACKEND} requires CUDA")
         device = torch.device("cuda", torch.cuda.current_device())
         public_op = torch.ops._C.persistent_topk
         operands = _build_operands(

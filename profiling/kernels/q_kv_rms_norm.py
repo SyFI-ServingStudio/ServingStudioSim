@@ -64,6 +64,7 @@ register(
         args_schema=QKvRmsNormArgs,
         metric_family=MetricFamily.COMPUTE,
         batch_outlier_policy=BatchOutlierPolicy(),
+        # No capability rule: a portable Triton kernel.
         supports=BackendSupport(compute=frozenset({DType.BF16})),
         subprocess_env="vllm_env",
         doc=BackendDoc(

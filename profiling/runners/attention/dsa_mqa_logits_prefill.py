@@ -125,13 +125,6 @@ def _validate_args(
     )
 
 
-def _validate_cuda_device(torch: Any) -> None:
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented(
-            "CUDA is required for the torch dsa_mqa_logits_prefill backend"
-        )
-
-
 def _load_deepgemm_backend() -> tuple[Any, Any]:
     """Load the pinned DeepGEMM measurement provider in the worker process."""
     try:
@@ -368,8 +361,6 @@ def profile_dsa_mqa_logits_prefill_torch(
         raise ProfilerNotImplemented(
             "torch is required for the torch dsa_mqa_logits_prefill backend"
         ) from exc
-
-    _validate_cuda_device(torch)
 
     try:
         operands = _build_operands(

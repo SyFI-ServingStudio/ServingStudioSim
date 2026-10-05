@@ -90,6 +90,8 @@ register(
     KernelProfilerSpec(
         kernel_kind=KIND,
         backend="vllm_cuda",
+        # No capability rule: vLLM's fused_add_rms_norm is a generic CUDA kernel built
+        # for every arch vLLM ships.
         supports=BackendSupport(
             compute=frozenset({DType.BF16, DType.FP16}),
         ),

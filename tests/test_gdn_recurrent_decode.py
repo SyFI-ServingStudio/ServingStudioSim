@@ -5,7 +5,6 @@ from __future__ import annotations
 import subprocess
 import sys
 from dataclasses import fields
-from types import SimpleNamespace
 
 import pytest
 
@@ -19,7 +18,6 @@ from profiling.kernels.gdn_recurrent_decode import (
     KIND,
     GdnRecurrentDecodeArgs,
 )
-from profiling.runners.exceptions import ProfilerNotImplemented
 
 _SPEC = {
     "batch_size": 1,
@@ -355,16 +353,6 @@ def test_vllm_correctness_guard_matches_reference_and_restores_cpu_state() -> No
     )
     assert torch.equal(operands.initial_state, state_before)
     assert torch.count_nonzero(operands.out) == 0
-
-
-def test_runner_reports_missing_cuda_as_typed_unsupported() -> None:
-    from profiling.runners.attention.gdn_recurrent_decode_torch import (
-        _validate_cuda_device,
-    )
-
-    no_cuda = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False))
-    with pytest.raises(ProfilerNotImplemented, match="CUDA is required"):
-        _validate_cuda_device(no_cuda)
 
 
 def test_semantic_metrics_are_explicit_logical_counts() -> None:

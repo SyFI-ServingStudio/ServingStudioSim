@@ -4,7 +4,6 @@ import math
 
 import pytest
 
-from profiling.runners.device import require_cuda
 from profiling.runners.exceptions import ProfilerNotImplemented
 from profiling.runners.mhc import mhc_fused_post_pre_rms_norm_vllm_tilelang as fused
 from profiling.runners.mhc import mhc_pre_rms_norm_vllm_tilelang as pre
@@ -38,35 +37,6 @@ def test_rejects_non_bf16_streams() -> None:
     # vLLM's TileLang wrappers assert bf16 residual streams.
     with pytest.raises(ProfilerNotImplemented, match="bf16"):
         validate_args("mhc", 128, 4096, 4, "fp16")
-
-
-class _FakeCuda:
-    def __init__(self, name: str, available: bool = True) -> None:
-        self._name = name
-        self._available = available
-
-    def is_available(self) -> bool:
-        return self._available
-
-    def current_device(self) -> int:
-        return 0
-
-    def get_device_name(self, _device: int) -> str:
-        return self._name
-
-
-class _FakeTorch:
-    def __init__(self, name: str, available: bool = True) -> None:
-        self.cuda = _FakeCuda(name, available)
-
-
-def test_gate_requires_cuda_but_no_particular_gpu() -> None:
-    # TileLang JIT-compiles for the current GPU; an unmeasured GPU is a data
-    # gap, not a reason for the boundary or terminal-head runners to refuse.
-    for name in ("NVIDIA H200", "NVIDIA B200", "NVIDIA H100 80GB HBM3"):
-        require_cuda(_FakeTorch(name), "mhc")
-    with pytest.raises(ProfilerNotImplemented, match="CUDA is required"):
-        require_cuda(_FakeTorch("NVIDIA H200", available=False), "mhc")
 
 
 def _nbytes(*tensors: tuple[tuple[int, ...], int]) -> int:

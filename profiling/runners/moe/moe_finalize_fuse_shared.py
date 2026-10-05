@@ -114,8 +114,6 @@ def profile_moe_finalize_fuse_shared_sglang(
         raise ProfilerNotImplemented(f"{_BACKEND} requires the SGLang environment") from exc
 
     try:
-        if not torch.cuda.is_available():
-            raise ProfilerNotImplemented(f"{_BACKEND} requires CUDA")
         launch = _prepare(
             torch,
             moe_finalize_fuse_shared,

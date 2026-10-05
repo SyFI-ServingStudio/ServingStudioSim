@@ -6,7 +6,6 @@ from typing import Any
 from profiling.db.args import DType
 from profiling.profilers.energy import Energy
 from profiling.profilers.timer import Timer
-from profiling.runners.device import require_cuda
 from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
 from profiling.runners.mhc._common import (
@@ -74,7 +73,6 @@ def profile_mhc_pre_rms_norm_vllm_tilelang(
         raise ProfilerNotImplemented(f"{_KIND} requires pinned vLLM and TileLang") from exc
 
     try:
-        require_cuda(torch, _KIND)
         inputs = prepare_common(torch, shape)
         launch = _Launch(mhc_pre_tilelang, inputs)
         expected = reference_pre(torch, inputs)

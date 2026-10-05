@@ -358,11 +358,6 @@ def _validate_args(
     )
 
 
-def _require_cuda(torch: Any, *, backend: str = _BACKEND) -> None:
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented(f"CUDA is required for {backend}")
-
-
 def _coprime_stride(size: int, preferred: int) -> int:
     if size <= 1:
         return 1
@@ -835,7 +830,6 @@ def profile_dsa_sparse_index_remap_torch(
         raise ProfilerNotImplemented(f"{_BACKEND} requires PyTorch") from exc
 
     try:
-        _require_cuda(torch)
         device = torch.device("cuda", torch.cuda.current_device())
         operands = _build_operands(torch, validated, device=device)
         _check_correctness(torch, validated, operands)
@@ -984,7 +978,6 @@ def profile_dsa_sparse_index_remap_vllm_triton(
         raise ProfilerNotImplemented(f"{_VLLM_BACKEND} requires the repository vllm_env") from exc
 
     try:
-        _require_cuda(torch, backend=_VLLM_BACKEND)
         device = torch.device("cuda", torch.cuda.current_device())
         operands = _build_operands(torch, validated, device=device)
         _check_vllm_triton_correctness(

@@ -74,6 +74,7 @@ register(
         args_schema=GemmFp32OutputArgs,
         metric_family=MetricFamily.COMPUTE,
         batch_outlier_policy=BatchOutlierPolicy(),
+        # No capability rule: torch.mm/cuBLAS runs on any CUDA GPU.
         supports=BackendSupport(
             compute=frozenset({DType.BF16, DType.FP32}),
         ),

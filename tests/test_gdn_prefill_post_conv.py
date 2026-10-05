@@ -5,7 +5,6 @@ from __future__ import annotations
 import subprocess
 import sys
 from dataclasses import fields
-from types import SimpleNamespace
 
 import pytest
 
@@ -19,7 +18,6 @@ from profiling.kernels.gdn_prefill_post_conv import (
     KIND,
     GdnPrefillPostConvArgs,
 )
-from profiling.runners.exceptions import ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
 
 _SPEC = {
@@ -256,16 +254,6 @@ def test_runner_shapes_and_bounded_deterministic_cpu_operands() -> None:
         assert torch.isfinite(parameter).all()
     for name in ("conv_output", "a", "b", "A_log", "dt_bias"):
         assert torch.equal(getattr(first, name), getattr(second, name))
-
-
-def test_runner_reports_missing_cuda_as_typed_unsupported() -> None:
-    from profiling.runners.attention.gdn_prefill_post_conv_torch import (
-        _validate_cuda_device,
-    )
-
-    no_cuda = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False))
-    with pytest.raises(ProfilerNotImplemented, match="CUDA is required"):
-        _validate_cuda_device(no_cuda)
 
 
 def test_semantic_metrics_are_explicit_logical_counts() -> None:
@@ -579,7 +567,6 @@ def test_vllm_profile_times_only_one_fused_call_and_needs_no_reset(monkeypatch) 
         assert per_iter_time_ms == 0.5
         return 0.25
 
-    monkeypatch.setattr(runner, "_require_cuda", lambda _torch: None)
     monkeypatch.setattr(runner, "_load_fused_callable", lambda: fake_fused)
     monkeypatch.setattr(runner, "_build_operands", fake_build)
     monkeypatch.setattr(runner, "_validate_operands", lambda *_args, **_kwargs: None)
@@ -655,7 +642,6 @@ def test_profile_times_only_semantic_call_and_needs_no_reset(monkeypatch) -> Non
         assert per_iter_time_ms == 0.5
         return 0.25
 
-    monkeypatch.setattr(runner, "_validate_cuda_device", lambda _torch: None)
     monkeypatch.setattr(runner, "_build_operands", fake_build)
     monkeypatch.setattr(reference, "gdn_prefill_post_conv_reference", counted_reference)
     monkeypatch.setattr(runner.Timer, "cupti", staticmethod(fake_timer))

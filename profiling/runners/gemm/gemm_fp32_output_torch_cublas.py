@@ -65,12 +65,6 @@ def _validate_args(
     return _Shape(m, n, k, dtype)
 
 
-def _require_gpu(torch: Any) -> None:
-    # torch.mm/cuBLAS runs on any CUDA GPU; an unmeasured GPU is a data gap.
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented(f"{_BACKEND} requires CUDA")
-
-
 def _prepare(torch: Any, shape: _Shape) -> _Launch:
     device = torch.device("cuda", torch.cuda.current_device())
     generator = torch.Generator(device=device).manual_seed(31)
@@ -110,7 +104,6 @@ def profile_gemm_fp32_output_torch_cublas(
         raise ProfilerNotImplemented(f"{_BACKEND} requires Torch") from exc
 
     try:
-        _require_gpu(torch)
         launch = _prepare(torch, shape)
         _check_output(torch, launch)
         # A logical call may be one NvJet kernel or an ordered split-K pair.

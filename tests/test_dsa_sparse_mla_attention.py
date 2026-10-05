@@ -358,16 +358,8 @@ def test_trtllm_fp8_validation_accepts_tp4_local_heads_and_fp8_storage() -> None
 
 
 def test_flashmla_selected_k_tile_follows_compute_capability_and_heads() -> None:
-    from profiling.runners.attention.dsa_sparse_mla_attention import (
-        _require_cuda,
-        _require_flashmla_tile,
-    )
+    from profiling.runners.attention.dsa_sparse_mla_attention import _require_flashmla_tile
 
-    no_cuda = fake_cuda_torch(available=False)
-    with pytest.raises(ProfilerNotImplemented, match="CUDA is required"):
-        _require_cuda(no_cuda)
-    # The Torch composite runs on any CUDA device.
-    _require_cuda(fake_cuda_torch((8, 0), "NVIDIA A100"))
     # FlashMLA tiles selected_k by 128 on SM90 and by 64 only for 64 heads on SM10x.
     _require_flashmla_tile(fake_cuda_torch((9, 0), "NVIDIA H100"), num_heads=64, selected_k=2048)
     _require_flashmla_tile(fake_cuda_torch((10, 0), "NVIDIA B200"), num_heads=128, selected_k=1024)
@@ -825,7 +817,6 @@ def test_profile_times_complete_composite_and_returns_compute_metrics(monkeypatc
 
     operands = runner._Operands(q=object(), cache=object(), selected_indices=object())
     calls: list[str] = []
-    monkeypatch.setattr(runner, "_require_cuda", lambda _torch: None)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(runner, "_build_operands", lambda *_args, **_kwargs: operands)
     monkeypatch.setattr(
@@ -869,8 +860,6 @@ def test_profile_times_complete_composite_and_returns_compute_metrics(monkeypatc
 
 def test_profile_translates_runtime_failures(monkeypatch) -> None:
     from profiling.runners.attention import dsa_sparse_mla_attention as runner
-
-    monkeypatch.setattr(runner, "_require_cuda", lambda _torch: None)
 
     def fail(*_args, **_kwargs):
         raise RuntimeError("allocation failed")

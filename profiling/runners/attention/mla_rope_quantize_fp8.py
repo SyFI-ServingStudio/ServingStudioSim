@@ -82,13 +82,6 @@ def _validate_args(
     return resolved_input, resolved_quant
 
 
-def _validate_device(torch: Any) -> None:
-    # FlashInfer JIT-builds rope.cu for the current device with no arch list;
-    # its PDL instructions are guarded by __CUDA_ARCH__ >= 900 in pos_enc.cuh.
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented(f"{_BACKEND} requires CUDA")
-
-
 def _prepare(
     torch: Any,
     callable_: Any,
@@ -175,7 +168,6 @@ def profile_mla_rope_quantize_fp8_flashinfer(
         raise ProfilerNotImplemented(f"{_BACKEND} requires the SGLang environment") from exc
 
     try:
-        _validate_device(torch)
         launch = _prepare(
             torch,
             mla_rope_quantize_fp8,

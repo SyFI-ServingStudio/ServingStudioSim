@@ -5,7 +5,6 @@ from __future__ import annotations
 import subprocess
 import sys
 from dataclasses import fields
-from types import SimpleNamespace
 
 import pytest
 
@@ -19,7 +18,6 @@ from profiling.kernels.gdn_causal_conv_prefill import (
     KIND,
     GdnCausalConvPrefillArgs,
 )
-from profiling.runners.exceptions import ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
 
 _SPEC = {
@@ -547,7 +545,6 @@ def test_vllm_profile_timed_callable_is_one_fused_call(monkeypatch) -> None:
         fn()
         return 0.25
 
-    monkeypatch.setattr(runner, "_require_cuda", lambda _torch: None)
     monkeypatch.setattr(runner, "_load_vllm_components", lambda: (fake_fused, object()))
     monkeypatch.setattr(runner, "_build_operands", fake_build)
     monkeypatch.setattr(runner, "_check_correctness", fake_guard)
@@ -561,16 +558,6 @@ def test_vllm_profile_timed_callable_is_one_fused_call(monkeypatch) -> None:
     assert metrics.time_ms == 0.5
     assert metrics.energy_j == 0.25
     assert calls == {"fused": 2, "build": 2, "guard": 1, "timer": 1, "energy": 1}
-
-
-def test_runner_reports_missing_cuda_as_typed_unsupported() -> None:
-    from profiling.runners.attention.gdn_causal_conv_prefill_torch import (
-        _validate_cuda_device,
-    )
-
-    no_cuda = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False))
-    with pytest.raises(ProfilerNotImplemented, match="CUDA is required"):
-        _validate_cuda_device(no_cuda)
 
 
 def test_profile_timed_calls_need_no_state_reset(monkeypatch) -> None:
@@ -605,7 +592,6 @@ def test_profile_timed_calls_need_no_state_reset(monkeypatch) -> None:
         fn()
         return 0.25
 
-    monkeypatch.setattr(runner, "_validate_cuda_device", lambda _torch: None)
     monkeypatch.setattr(runner, "_build_operands", lambda *_args, **_kwargs: operands)
     monkeypatch.setattr(reference, "gdn_causal_conv_prefill_reference", fake_reference)
     monkeypatch.setattr(runner.Timer, "cupti", staticmethod(fake_timer))

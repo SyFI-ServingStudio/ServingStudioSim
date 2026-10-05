@@ -40,9 +40,6 @@ def profile_single_gemm(
     except ImportError as exc:
         raise ProfilerNotImplemented("torch is required for the torch GEMM runner") from exc
 
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented("CUDA is required for the torch GEMM runner")
-
     try:
         torch_dtype = dtype.torch()
         a = torch.randn(m, k, dtype=torch_dtype, device="cuda")
@@ -96,9 +93,6 @@ def profile_single_gemm_linear(
     except ImportError as exc:
         raise ProfilerNotImplemented("torch is required for the torch_linear backend") from exc
 
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented("CUDA is required for the torch_linear backend")
-
     try:
         torch_dtype = dtype.torch()
         activations = torch.randn(m, k, dtype=torch_dtype, device="cuda")
@@ -149,9 +143,6 @@ def profile_grouped_gemm(
         import torch
     except ImportError as exc:
         raise ProfilerNotImplemented("torch is required for the torch grouped-GEMM runner") from exc
-
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented("CUDA is required for the torch grouped-GEMM runner")
 
     total_m = sum(batches)
     if total_m == 0:

@@ -7,6 +7,7 @@ from typing import Any
 
 from profiling.profilers.energy import Energy
 from profiling.profilers.timer import Timer
+from profiling.runners.device import require_cutedsl
 from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
 
@@ -149,13 +150,6 @@ def _validate_args(
         logical_block_size // compress_ratio,
         rms_eps=float(rms_eps),
     )
-
-
-def _require_cutedsl_gpu(torch: Any, has_cutedsl: Any) -> Any:
-    device = torch.device("cuda", torch.cuda.current_device())
-    if not has_cutedsl():
-        raise ProfilerNotImplemented(f"{_BACKEND} requires the production Cutlass DSL path")
-    return device
 
 
 def _padded_stride(row_count: int) -> int:
@@ -436,9 +430,9 @@ def profile_kv_compress_store_cutedsl(
         from vllm.models.deepseek_v4.nvidia.ops.sparse_attn_compress_cutedsl import (
             compress_norm_rope_store_cutedsl,
         )
-        from vllm.utils.import_utils import has_cutedsl
 
-        device = _require_cutedsl_gpu(torch, has_cutedsl)
+        require_cutedsl(_BACKEND)
+        device = torch.device("cuda", torch.cuda.current_device())
         operands = _build_operands(torch, shape, device)
         _check_output(torch, save_partial_states, compress_norm_rope_store_cutedsl, operands, shape)
 

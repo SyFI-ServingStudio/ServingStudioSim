@@ -20,7 +20,6 @@ from profiling.runners.attention.gdn_gated_rms_norm_torch import (
     _logical_bytes,
     _semantic_flops,
 )
-from profiling.runners.device import require_cuda
 from profiling.runners.exceptions import (
     KernelLaunchFailed,
     OOMError,
@@ -98,10 +97,6 @@ def _correctness_guard_args(args: _ValidatedArgs) -> _ValidatedArgs:
     max_rows_for_elements = max(1, _GUARD_MAX_ELEMENTS // args.hidden)
     guard_m = min(args.m, _GUARD_MAX_ROWS, max_rows_for_elements)
     return _ValidatedArgs(m=guard_m, hidden=args.hidden, dtype=args.dtype)
-
-
-def _require_cuda(torch: Any) -> None:
-    require_cuda(torch, _BACKEND)
 
 
 def _load_fused_callable() -> Any:
@@ -213,7 +208,6 @@ def profile_gdn_gated_rms_norm_vllm_triton(
         raise ProfilerNotImplemented(f"PyTorch is required for {_BACKEND}") from exc
 
     try:
-        _require_cuda(torch)
         fused_callable = _load_fused_callable()
         device = torch.device("cuda", torch.cuda.current_device())
         operands = _build_operands(torch, args, device=device)

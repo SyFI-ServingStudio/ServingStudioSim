@@ -180,7 +180,6 @@ def test_generic_kernel_accepts_any_dividing_group_size(scale_format, group_size
 
 def test_packed_format_uses_deepgemm_tma_layout_on_any_gpu():
     from profiling.runners.elementwise import fp8_per_token_group_quant as runner
-    from profiling.runners.exceptions import ProfilerNotImplemented
 
     strided = []
     fake_torch = SimpleNamespace(
@@ -197,14 +196,6 @@ def test_packed_format_uses_deepgemm_tma_layout_on_any_gpu():
             get_device_name=lambda _device: "NVIDIA H200",
         ),
     )
-    # Previously Blackwell-only; the packed kernel is generic CUDA.
-    for scale_format in ("ue8m0_packed_int32", "ue8m0_row_major", "ue8m0_column_major"):
-        runner._validate_cuda_device(fake_torch, scale_format)
-    with pytest.raises(ProfilerNotImplemented, match="CUDA is required"):
-        runner._validate_cuda_device(
-            SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False)),
-            "ue8m0_packed_int32",
-        )
     operands = runner._allocate_operands(
         fake_torch, num_tokens=33, hidden_size=4096, group_size=128,
         scale_format="ue8m0_packed_int32",

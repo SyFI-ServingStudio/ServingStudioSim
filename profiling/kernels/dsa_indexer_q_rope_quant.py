@@ -73,6 +73,8 @@ register(
     KernelProfilerSpec(
         kernel_kind=KIND,
         backend="sglang_cuda",
+        # No capability rule: SGLang JIT-builds main_norm_rope.cuh for the current
+        # device, with PDL opted in only where the arch supports it.
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
         ),

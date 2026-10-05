@@ -49,8 +49,6 @@ def profile_gemm_fp32_output_sglang_router(
     except ImportError as exc:
         raise ProfilerNotImplemented(f"{_BACKEND} requires the SGLang environment") from exc
 
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented(f"{_BACKEND} requires CUDA")
     sm = _device_sm(torch)
 
     try:

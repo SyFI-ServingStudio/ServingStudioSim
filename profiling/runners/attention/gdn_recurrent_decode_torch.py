@@ -79,11 +79,6 @@ def _validate_args(
     )
 
 
-def _validate_cuda_device(torch: Any) -> None:
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented("CUDA is required for the torch gdn_recurrent_decode backend")
-
-
 def _build_operands(
     torch: Any,
     *,
@@ -229,8 +224,6 @@ def profile_gdn_recurrent_decode(
         raise ProfilerNotImplemented(
             "torch is required for the torch gdn_recurrent_decode backend"
         ) from exc
-
-    _validate_cuda_device(torch)
 
     try:
         from profiling.runners.attention.gdn_recurrent_decode_reference import (

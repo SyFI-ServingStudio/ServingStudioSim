@@ -102,13 +102,6 @@ def _check_outputs(torch: Any, launch: _Launch, shape: AlignmentShape) -> None:
             raise AssertionError(f"routes for local expert {expert} differ")
 
 
-def _require_cuda(torch: Any) -> None:
-    # A vLLM _C CUDA op built for every CUDA arch the wheel targets; no GPU
-    # model or capability floor beyond CUDA itself.
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented(f"{_BACKEND} requires CUDA")
-
-
 def profile_moe_align_block_size_vllm_cuda(
     num_tokens: int,
     num_experts: int,
@@ -130,7 +123,6 @@ def profile_moe_align_block_size_vllm_cuda(
         raise ProfilerNotImplemented(f"{_BACKEND} requires the pinned vLLM checkout") from exc
 
     try:
-        _require_cuda(torch)
         launch = _prepare(torch, _custom_ops.moe_align_block_size, shape)
         _check_outputs(torch, launch, shape)
         time_ms = Timer.cupti(launch.run, warmup=5, kernel_name=None)

@@ -5,7 +5,6 @@ from __future__ import annotations
 import subprocess
 import sys
 from dataclasses import fields
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -22,7 +21,6 @@ from profiling.kernels.dsa_index_cache_append import (
 from profiling.runners.attention.dsa_index_cache_append_reference import (
     dsa_index_cache_append_reference,
 )
-from profiling.runners.exceptions import ProfilerNotImplemented
 
 _BACKEND = "torch"
 _VLLM_BACKEND = "vllm_cuda"
@@ -365,29 +363,6 @@ def test_runner_rejects_unsupported_cache_format_before_cuda(cache_format):
         )
 
 
-def test_runner_requires_cuda_but_no_gpu_allowlist():
-    from profiling.runners.attention.dsa_index_cache_append import (
-        _validate_cuda_device,
-        _validate_sglang_device,
-    )
-
-    no_cuda = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False))
-    with pytest.raises(ProfilerNotImplemented, match="CUDA is required"):
-        _validate_cuda_device(no_cuda)
-    with pytest.raises(ProfilerNotImplemented, match="CUDA is required"):
-        _validate_sglang_device(no_cuda)
-
-    h100 = SimpleNamespace(
-        cuda=SimpleNamespace(
-            is_available=lambda: True,
-            current_device=lambda: 0,
-            get_device_name=lambda _device: "NVIDIA H100",
-        )
-    )
-    _validate_cuda_device(h100)
-    _validate_sglang_device(h100)
-
-
 def test_profile_entry_rejects_invalid_args_before_torch_import():
     from profiling.runners.attention.dsa_index_cache_append import (
         profile_dsa_index_cache_append_torch,
@@ -443,25 +418,6 @@ def test_vllm_profile_entry_rejects_invalid_args_before_framework_imports():
     for overrides, match in invalid_cases:
         with pytest.raises(ValueError, match=match):
             profile_dsa_index_cache_append_vllm_cuda(**(valid | overrides))
-
-
-def test_vllm_runner_requires_cuda_but_no_gpu_allowlist():
-    from profiling.runners.attention.dsa_index_cache_append import (
-        _validate_vllm_cuda_device,
-    )
-
-    no_cuda = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False))
-    with pytest.raises(ProfilerNotImplemented, match="CUDA is required"):
-        _validate_vllm_cuda_device(no_cuda)
-
-    h100 = SimpleNamespace(
-        cuda=SimpleNamespace(
-            is_available=lambda: True,
-            current_device=lambda: 0,
-            get_device_name=lambda _device: "NVIDIA H100",
-        )
-    )
-    _validate_vllm_cuda_device(h100)
 
 
 def test_operand_constructor_matches_glm_page_planar_layout():
