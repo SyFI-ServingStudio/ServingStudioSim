@@ -41,7 +41,7 @@
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::CacheKind;
-use crate::timing::kernels::engine::{register_kernel, KernelSpec};
+use crate::timing::kernels::engine::{register_kernel, KernelSpec, OffGrid};
 use crate::timing::sweep::{Axis, Coords, SweepGrid};
 use crate::timing::{Dim, KernelConfig, SweepCoords};
 
@@ -251,6 +251,63 @@ fn gather_area(pairs: &[(u32, u32)], config: &CompressedSparseMlaRopeCastKernelC
         start = end;
     }
     area
+}
+
+/// Bytes of one cache record: the SWA cache is always MXFP8; the compressed
+/// cache is NVFP4 or MXFP8.
+fn record_bytes(format: &str) -> f64 {
+    match format {
+        "mxfp8" => 528.0,
+        "nvfp4" => 288.0,
+        other => panic!("unknown cache format {other:?}"),
+    }
+}
+
+/// The batch's logical bytes as the profiler counts them: Q in BF16 and the
+/// FP8 output with one scale byte per 32, plus, in decode, the index words of
+/// every row's window and top-k slots and the selected records; in prefill,
+/// each gathered record read and written back as BF16, then one BF16 row and
+/// one index word per selected key.
+fn logical_bytes(
+    config: &CompressedSparseMlaRopeCastKernelConfig,
+    input: &CompressedSparseMlaRopeCastKernelInput,
+) -> f64 {
+    let ratio = config.compress_ratio;
+    let heads = f64::from(config.num_heads.get());
+    let head_dim = f64::from(config.head_dim.get());
+    let swa_record = record_bytes(&config.swa_cache_format);
+    let extra_record = if ratio == 0 {
+        0.0
+    } else {
+        record_bytes(&config.compressed_cache_format)
+    };
+    let (mut rows, mut swa_keys, mut extra_keys) = (0.0, 0_u64, 0_u64);
+    let (mut gathered_swa, mut gathered_extra) = (0_u64, 0_u64);
+    for &(query, context) in &input.query_context_pairs {
+        let (n, before) = (u64::from(context), u64::from(context - query));
+        rows += f64::from(query);
+        swa_keys += sum_min(n, u64::from(WINDOW)) - sum_min(before, u64::from(WINDOW));
+        gathered_swa += u64::from(query + (context - query).min(WINDOW - 1));
+        if ratio > 0 {
+            let (ratio, topk) = (u64::from(ratio), u64::from(INDEX_TOPK));
+            extra_keys += sum_min_div(n, ratio, topk) - sum_min_div(before, ratio, topk);
+            gathered_extra += n / ratio;
+        }
+    }
+    let (swa_keys, extra_keys) = (swa_keys as f64, extra_keys as f64);
+    let q_and_out = rows * heads * (2.0 * head_dim + head_dim + head_dim / 32.0);
+    if is_decode(config) {
+        let slots = f64::from(WINDOW + if ratio == 0 { 0 } else { INDEX_TOPK });
+        return q_and_out
+            + rows * 4.0 * slots
+            + swa_keys * swa_record
+            + extra_keys * extra_record;
+    }
+    let bf16_row = 2.0 * head_dim;
+    q_and_out
+        + gathered_swa as f64 * (swa_record + bf16_row)
+        + gathered_extra as f64 * (extra_record + bf16_row)
+        + (swa_keys + extra_keys) * (bf16_row + 4.0)
 }
 
 /// The gather area every (tokens, keys) point reaches without extra context.
@@ -532,6 +589,19 @@ impl KernelSpec for CompressedSparseMlaRopeCastSpec {
         grid.expand(|point| canonical_pairs(config, point).is_none())
     }
 
+    /// Past the grid (more query rows than the step budget, or more gather
+    /// area than two longest requests) the launch holds its bandwidth, as
+    /// compressed_sparse_mla_decode and _prefill do: on B200 the last two
+    /// measured points along the query axis sit within 2% of each other's
+    /// bandwidth in decode and within 13% in prefill.
+    fn off_grid(
+        config: &Self::Config,
+        input: &Self::Input,
+        _backend: &'static str,
+    ) -> OffGrid<Self::Input> {
+        OffGrid::Bandwidth(logical_bytes(config, input))
+    }
+
     fn enumerate(
         config: &Self::Config,
         grid: &SweepGrid,
@@ -594,6 +664,28 @@ mod tests {
             "output_dtype": "fp8_e4m3",
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn logical_bytes_match_measured_rows() {
+        // Profiled B200 rows' logged bandwidth x time.
+        let bytes = |mode: &str, ratio: u32, pairs: Vec<(u32, u32)>| {
+            logical_bytes(
+                &config(mode, ratio),
+                &CompressedSparseMlaRopeCastKernelInput {
+                    query_context_pairs: pairs,
+                },
+            )
+        };
+        assert_eq!(bytes("decode", 0, vec![(1, 128)]), 167_424.0);
+        assert_eq!(bytes("decode", 1, vec![(1, 32)]), 128_000.0);
+        assert_eq!(bytes("decode", 2, vec![(1, 704), (1, 704)]), 541_696.0);
+        assert_eq!(bytes("prefill", 0, vec![(64, 64)]), 8_594_560.0);
+        assert_eq!(bytes("prefill", 1, vec![(64, 66112)]), 135_499_248.0);
+        assert_eq!(
+            bytes("prefill", 2, vec![(1023, 1237), (1, 5120)]),
+            612_957_244.0
+        );
     }
 
     fn coords(mode: &str, ratio: u32, pairs: &[(u32, u32)]) -> Coords {
