@@ -14,6 +14,7 @@ mod core;
 mod discovery;
 mod hardware;
 mod kernel_input_distribution;
+mod kernel_kinds;
 mod kernel_measurement;
 mod kernel_profile;
 mod kernel_throughput_analysis;
@@ -431,6 +432,7 @@ fn read_only_router(state: ServiceState) -> Router {
             get(get_kernel_measurement_plot),
         )
         .route("/api/analyzer/v1/hardware/gpus", get(get_hardware_gpus))
+        .route("/api/analyzer/v1/kernel-kinds", get(get_kernel_kinds))
         .route("/api/analyzer/v1/runs", get(list_runs))
         .route("/api/analyzer/v1/sweeps", get(list_sweeps))
         .route("/api/analyzer/v1/sweeps/latest", get(get_latest_sweep))
@@ -1262,6 +1264,29 @@ fn plot_content_type(plot_name: &str) -> &'static str {
         "image/jpeg"
     } else {
         "image/png"
+    }
+}
+
+async fn get_kernel_kinds(State(state): State<ServiceState>) -> Response {
+    let repo_root = Arc::clone(&state.repo_root);
+    match tokio::task::spawn_blocking(move || kernel_kinds::kernel_kinds(&repo_root)).await {
+        Ok(Ok(value)) => Json(value).into_response(),
+        Ok(Err(error)) => {
+            eprintln!("[analyze] kernel kinds unreadable: {error:#}");
+            problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "kernel_kinds_unreadable",
+                "The kernel kinds' DOCs could not be read.",
+            )
+        }
+        Err(error) => {
+            eprintln!("[analyze] kernel kinds worker failed: {error}");
+            problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "kernel_kinds_unreadable",
+                "The kernel kinds' DOCs could not be read.",
+            )
+        }
     }
 }
 

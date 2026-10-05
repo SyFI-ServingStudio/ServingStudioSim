@@ -489,6 +489,29 @@ def test_a_forwarded_report_names_its_prediction_not_the_host_path(
     assert answer.json() == {"log_dir": "72dd8769"}
 
 
+def test_the_kernel_kinds_are_forwarded(
+    db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from public_api import app as app_module
+
+    seen = []
+
+    def analyzer(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        return httpx.Response(200, json={"kinds": {}})
+
+    real = httpx.AsyncClient
+    monkeypatch.setattr(
+        app_module.httpx,
+        "AsyncClient",
+        lambda **kwargs: real(transport=httpx.MockTransport(analyzer), **kwargs),
+    )
+    kernels = KernelLibrary(FixtureSources(db_path=db), _index())
+    client = TestClient(create_app(kernels, tmp_path, "http://analyzer"))
+    assert client.get(f"{PREFIX}/analyzer/kernel-kinds").json() == {"kinds": {}}
+    assert seen == ["/api/analyzer/v1/kernel-kinds"]
+
+
 def test_a_failed_run_names_no_host_path(tmp_path: Path) -> None:
     scratch, log_dir = tmp_path / "scratch", tmp_path / "runs" / "abc"
     error = f"parsing JSON cases file {scratch}/cases.json: unknown field"

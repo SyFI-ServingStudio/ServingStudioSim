@@ -301,4 +301,19 @@ def create_app(
         id is the ``run_id`` of ``GET /simulations/{id}``. No catalog."""
         return await forward("runs", run_id, subject, request)
 
+    @app.get(f"{PREFIX}/analyzer/kernel-kinds")
+    async def kernel_kinds() -> Response:
+        """The Analyzer's ``/api/analyzer/v1/kernel-kinds``: each kernel kind's
+        title and category from its DOC, by which a result names and groups its
+        kernels."""
+        if analyzer is None:
+            raise HTTPException(503, "this service runs no Analyzer")
+        async with httpx.AsyncClient(timeout=120) as client:
+            answer = await client.get(f"{analyzer}/api/analyzer/v1/kernel-kinds")
+        return Response(
+            answer.content,
+            status_code=answer.status_code,
+            media_type=answer.headers.get("content-type"),
+        )
+
     return app

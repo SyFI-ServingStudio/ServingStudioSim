@@ -3797,3 +3797,19 @@ fn an_unknown_alignment_id_resolves_to_not_found() {
     let known = &discover_alignments(&roots).expect("discover")[0].alignment_id;
     assert!(resolve_alignment(&roots, known).is_ok());
 }
+
+#[tokio::test]
+async fn kernel_kinds_route_serves_each_kind_doc_title_and_category() {
+    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("repository root above analyzer/rust");
+    let router = prediction_test_router(repo);
+
+    let (status, value) = get_json(router, "/api/analyzer/v1/kernel-kinds").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["categories"][0], "GEMM");
+    assert_eq!(value["kinds"]["single_gemm"]["category"], "GEMM");
+    assert_eq!(value["kinds"]["rms_norm"]["title"], "RMSNorm");
+}

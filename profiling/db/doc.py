@@ -259,3 +259,27 @@ def kernel_doc(kernel_kind: str) -> KernelDoc | None:
     except ModuleNotFoundError:
         return None
     return getattr(module, "DOC", None)
+
+
+def kind_vocabulary() -> dict:
+    """Each registered kind's title and category, and the categories in order.
+
+    What a view needs to name a kernel and group it by family. ``analyze
+    serve`` serves it as ``GET /api/analyzer/v1/kernel-kinds``, so the UI groups
+    and labels kinds from these DOCs, not from a table of its own.
+    """
+
+    from profiling.db.registry import iter_kernel_profiler_specs
+
+    kinds = sorted({spec.kernel_kind for spec in iter_kernel_profiler_specs()})
+    docs = {kind: kernel_doc(kind) for kind in kinds}
+    return {
+        "schema_version": 1,
+        "categories": list(CATEGORIES),
+        "kinds": {
+            kind: {"title": doc.title, "category": doc.category}
+            for kind, doc in docs.items()
+            if doc is not None
+        },
+    }
+

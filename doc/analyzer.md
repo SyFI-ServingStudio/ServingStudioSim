@@ -573,6 +573,9 @@ peer to runs, sweeps, and timing predictions. The read-only protocol is:
   declared image. The plot path accepts exactly one normal component and only a name
   the resource declares, so traversal and undeclared files are impossible.
 - `GET /api/analyzer/v1/hardware/gpus?name=<gpu_name>` resolves the GPU spec catalog.
+- `GET /api/analyzer/v1/kernel-kinds` serves each kernel kind's `title` and `category`
+  from its DOC (`profiling.db.doc.kind_vocabulary`) and the categories in order. The UI
+  names and groups kernels by it and keeps no kind table of its own.
 
 The Python profiling artifact path owns the metadata and never depends on a
 conversation backend (direct development runs also write resource identity).
