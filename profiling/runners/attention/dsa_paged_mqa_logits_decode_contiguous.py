@@ -11,7 +11,7 @@ from typing import Any
 from profiling.profilers.energy import Energy
 from profiling.profilers.timer import Timer
 from profiling.runners.attention.dsa_paged_mqa_logits_decode import (
-    _validate_deepgemm_cuda_device,
+    _check_deepgemm_launch_bounds,
 )
 from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
@@ -301,9 +301,7 @@ def profile_contiguous_deepgemm_fp8(
         raise ProfilerNotImplemented(f"{_BACKEND} requires pinned vLLM DeepGEMM") from exc
 
     try:
-        if not torch.cuda.is_available():
-            raise ProfilerNotImplemented(f"{_BACKEND} requires CUDA")
-        num_sms = _validate_deepgemm_cuda_device(
+        num_sms = _check_deepgemm_launch_bounds(
             torch, num_heads=num_heads, head_dim=head_dim, block_size=block_size, next_n=next_n
         )
         device = torch.device("cuda", torch.cuda.current_device())

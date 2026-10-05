@@ -196,15 +196,7 @@ def _validate_args(
     )
 
 
-def _validate_cuda_device(torch: Any) -> None:
-    # The Torch composite is plain tensor math; any CUDA GPU runs it.
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented(
-            "CUDA is required for the torch dsa_paged_mqa_logits_decode backend"
-        )
-
-
-def _validate_deepgemm_cuda_device(
+def _check_deepgemm_launch_bounds(
     torch: Any,
     *,
     num_heads: int,
@@ -217,17 +209,10 @@ def _validate_deepgemm_cuda_device(
     vLLM's indexer builds the schedule for the device's own SM count
     (``num_compute_units``), so the runner passes the same value.
     """
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented(
-            "CUDA is required for the dsa_paged_mqa_logits_decode deepgemm_fp8 backend"
-        )
     device = torch.cuda.current_device()
     arch_major = int(torch.cuda.get_device_capability(device)[0])
-    bounds = _DEEPGEMM_ARCH_BOUNDS.get(arch_major)
-    if bounds is None:
-        raise ProfilerNotImplemented(
-            f"dsa_paged_mqa_logits_decode deepgemm_fp8 has no DeepGEMM kernel for SM{arch_major}x"
-        )
+    # The worker has checked the backend's sm_targets, one per key here.
+    bounds = _DEEPGEMM_ARCH_BOUNDS[arch_major]
     for name, value in (
         ("num_heads", num_heads),
         ("head_dim", head_dim),
@@ -623,8 +608,6 @@ def profile_dsa_paged_mqa_logits_decode_torch(
             "torch is required for the torch dsa_paged_mqa_logits_decode backend"
         ) from exc
 
-    _validate_cuda_device(torch)
-
     try:
         operands = _build_operands(
             torch,
@@ -764,7 +747,7 @@ def _profile_dsa_paged_mqa_logits_decode_deepgemm_fp8(
         clean_logits,
     )
     torch, deep_gemm = load_backend()
-    num_sms = _validate_deepgemm_cuda_device(
+    num_sms = _check_deepgemm_launch_bounds(
         torch, num_heads=num_heads, head_dim=head_dim, block_size=block_size, next_n=next_n
     )
 

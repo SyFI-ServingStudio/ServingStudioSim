@@ -329,25 +329,6 @@ def test_missing_torch_is_typed(monkeypatch):
         runner.profile_dsa_paged_mqa_logits_decode_torch(**_BASE_SPEC)
 
 
-def test_torch_composite_needs_only_cuda():
-    from profiling.runners.attention.dsa_paged_mqa_logits_decode import (
-        _validate_cuda_device,
-    )
-
-    no_cuda = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False))
-    with pytest.raises(ProfilerNotImplemented, match="CUDA is required"):
-        _validate_cuda_device(no_cuda)
-
-    h100 = SimpleNamespace(
-        cuda=SimpleNamespace(
-            is_available=lambda: True,
-            current_device=lambda: 0,
-            get_device_name=lambda _device: "NVIDIA H100",
-        )
-    )
-    _validate_cuda_device(h100)
-
-
 def _deepgemm_device(capability, num_sms):
     return SimpleNamespace(
         cuda=SimpleNamespace(
@@ -362,24 +343,17 @@ def _deepgemm_device(capability, num_sms):
 _GLM_SHAPE = {"num_heads": 64, "head_dim": 128, "block_size": 64, "next_n": 1}
 
 
-def test_deepgemm_device_check_uses_arch_bounds_and_the_device_sm_count():
+def test_deepgemm_launch_bounds_return_the_device_sm_count():
     from profiling.runners.attention.dsa_paged_mqa_logits_decode import (
-        _validate_deepgemm_cuda_device,
+        _check_deepgemm_launch_bounds,
     )
-
-    no_cuda = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False))
-    with pytest.raises(ProfilerNotImplemented, match="CUDA is required"):
-        _validate_deepgemm_cuda_device(no_cuda, **_GLM_SHAPE)
 
     # vLLM schedules for the device's own SM count: H100 SXM, H200, a
     # partitioned H200, B200 and B300 all launch.
-    assert _validate_deepgemm_cuda_device(_deepgemm_device((9, 0), 132), **_GLM_SHAPE) == 132
-    assert _validate_deepgemm_cuda_device(_deepgemm_device((9, 0), 130), **_GLM_SHAPE) == 130
-    assert _validate_deepgemm_cuda_device(_deepgemm_device((10, 0), 148), **_GLM_SHAPE) == 148
-    assert _validate_deepgemm_cuda_device(_deepgemm_device((10, 3), 148), **_GLM_SHAPE) == 148
-
-    with pytest.raises(ProfilerNotImplemented, match="no DeepGEMM kernel for SM8x"):
-        _validate_deepgemm_cuda_device(_deepgemm_device((8, 0), 108), **_GLM_SHAPE)
+    assert _check_deepgemm_launch_bounds(_deepgemm_device((9, 0), 132), **_GLM_SHAPE) == 132
+    assert _check_deepgemm_launch_bounds(_deepgemm_device((9, 0), 130), **_GLM_SHAPE) == 130
+    assert _check_deepgemm_launch_bounds(_deepgemm_device((10, 0), 148), **_GLM_SHAPE) == 148
+    assert _check_deepgemm_launch_bounds(_deepgemm_device((10, 3), 148), **_GLM_SHAPE) == 148
 
 
 @pytest.mark.parametrize(
@@ -399,17 +373,17 @@ def test_deepgemm_device_check_uses_arch_bounds_and_the_device_sm_count():
         ((12, 0), {"head_dim": 64}, False),
     ],
 )
-def test_deepgemm_device_check_applies_each_arch_launch_bound(capability, overrides, accepted):
+def test_deepgemm_launch_bounds_apply_each_arch_bound(capability, overrides, accepted):
     from profiling.runners.attention.dsa_paged_mqa_logits_decode import (
-        _validate_deepgemm_cuda_device,
+        _check_deepgemm_launch_bounds,
     )
 
     device = _deepgemm_device(capability, 132)
     if accepted:
-        _validate_deepgemm_cuda_device(device, **(_GLM_SHAPE | overrides))
+        _check_deepgemm_launch_bounds(device, **(_GLM_SHAPE | overrides))
     else:
         with pytest.raises(ProfilerNotImplemented, match="DeepGEMM paged MQA logits"):
-            _validate_deepgemm_cuda_device(device, **(_GLM_SHAPE | overrides))
+            _check_deepgemm_launch_bounds(device, **(_GLM_SHAPE | overrides))
 
 
 def test_deepgemm_cupti_filter_is_architecture_agnostic():
