@@ -2176,7 +2176,7 @@ fn slot_configs(
     let index: std::collections::HashMap<String, usize> = records
         .iter()
         .enumerate()
-        .map(|(i, r)| (key(&r.kind, &r.gpu_name, &r.identity), i))
+        .map(|(i, r)| (key(r.kind, &r.gpu_name, &r.identity), i))
         .collect();
     manifest
         .sections

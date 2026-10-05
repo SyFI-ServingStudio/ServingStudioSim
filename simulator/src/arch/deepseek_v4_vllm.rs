@@ -329,7 +329,7 @@ pub fn build_configs(
 ) -> std::result::Result<DeepseekV4VllmConfigs, BuildError> {
     // Every layer runs the PyNCCL EP all-gather/reduce-scatter pair, which
     // needs two or more ranks (PyNcclCommunicator disables itself at one).
-    if parallel.ep_size < 2 || NUM_EXPERTS % u32::from(parallel.ep_size) != 0 {
+    if parallel.ep_size < 2 || !NUM_EXPERTS.is_multiple_of(u32::from(parallel.ep_size)) {
         return Err(fit_failed(format!(
             "ep_size {} must be >= 2 and divide the {NUM_EXPERTS} experts",
             parallel.ep_size

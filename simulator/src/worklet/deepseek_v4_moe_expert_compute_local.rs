@@ -88,7 +88,7 @@ impl DeepseekV4MoeExpertComputeLocalWorklet {
         assert_eq!(config.hidden_dtype, DType::Bf16);
         assert!(
             !config.local_ppm.is_empty()
-                && config.num_experts.get() as usize % config.local_ppm.len() == 0,
+                && (config.num_experts.get() as usize).is_multiple_of(config.local_ppm.len()),
             "local_ppm must be an even shard of the experts"
         );
         assert!(config.local_ppm.iter().any(|&mass| mass > 0));

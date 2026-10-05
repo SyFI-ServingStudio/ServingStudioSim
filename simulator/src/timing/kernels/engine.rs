@@ -393,7 +393,7 @@ impl<S: KernelSpec> Kernel<S> {
         coords: &Coords,
     ) -> LeafMetrics {
         if backend_cache.contains(coords) {
-            return backend_cache.eval(&coords);
+            return backend_cache.eval(coords);
         }
         match S::off_grid(&self.config, input, self.config.backends()[index]) {
             OffGrid::Cache => backend_cache.eval(coords),
