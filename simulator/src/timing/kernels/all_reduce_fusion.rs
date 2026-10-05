@@ -46,9 +46,10 @@ pub struct AllReduceFusionSpec;
 /// `vllm/compilation/passes/fusion/allreduce_rms_fusion.py`). vLLM keys it by
 /// the exact capability, so SM103 (B300) is not SM100 (B200, GB200). `None`
 /// where vLLM does not fuse: a TP or GPU with no row, or a GPU with no compute
-/// capability in gpu/spec.json. Both fused all-reduce kinds read it, and an
-/// arch whose every TP boundary is this fusion admits exactly its TPs.
-pub(crate) fn flashinfer_fusion_workspace(gpu_name: &str, num_gpus: u32) -> Option<u64> {
+/// capability in gpu/spec.json. Both fused all-reduce kinds read it. The TP16
+/// rows are vLLM's multi-node MNNVL, which no runner measures
+/// ([`runner_tp_sizes`]).
+fn flashinfer_fusion_workspace(gpu_name: &str, num_gpus: u32) -> Option<u64> {
     let kib: u64 = match (compute_capability(gpu_name)?, num_gpus) {
         ((9, 0), 2) => 64 * 1024,
         ((9, 0), 4) => 2 * 1024,
@@ -64,6 +65,43 @@ pub(crate) fn flashinfer_fusion_workspace(gpu_name: &str, num_gpus: u32) -> Opti
         _ => return None,
     };
     Some(kib * 1024)
+}
+
+/// The TPs a FlashInfer fused all-reduce backend's runner measures, one node's
+/// NVLink domain: `SUPPORTED_TP_SIZES` in
+/// `profiling/runners/comm/flashinfer_trtllm.py` (both fused kinds) and the
+/// keys of `SM100_MAX_SIZE_MB` in `flashinfer_mnnvl.py`. A test reads both.
+fn runner_tp_sizes(backend: &str) -> &'static [u32] {
+    match backend {
+        "flashinfer_trtllm" | "flashinfer_mnnvl" => &[2, 4, 8],
+        other => panic!("{other} is not a FlashInfer fused all-reduce backend"),
+    }
+}
+
+/// Why a FlashInfer fused all-reduce with `backends` over `num_gpus` GPUs of
+/// `gpu_name` cannot be modeled, if it cannot: a TP a backend's runner does
+/// not measure, or one vLLM has no FlashInfer budget for on that GPU. An arch
+/// that builds a fused all-reduce from its TP param checks this first, so it
+/// refuses the TP instead of building a grid no runner can fill.
+pub fn fused_all_reduce_refusal(
+    backends: &[&str],
+    gpu_name: &str,
+    num_gpus: u32,
+) -> Option<String> {
+    if let Some(backend) = backends
+        .iter()
+        .find(|backend| !runner_tp_sizes(backend).contains(&num_gpus))
+    {
+        return Some(format!(
+            "the {backend} fused all-reduce is measured at TP {:?}, not {num_gpus}",
+            runner_tp_sizes(backend)
+        ));
+    }
+    flashinfer_fusion_workspace(gpu_name, num_gpus)
+        .is_none()
+        .then(|| {
+            format!("vLLM has no FlashInfer all-reduce budget for {gpu_name} at TP {num_gpus}")
+        })
 }
 
 /// [`flashinfer_fusion_workspace`] for a fused kernel config, which exists
@@ -190,6 +228,63 @@ mod tests {
         assert_eq!(flashinfer_fusion_max_bytes("NVIDIA B300", 4), 64 * MIB);
         assert_eq!(flashinfer_fusion_max_bytes("NVIDIA B300", 8), 4 * MIB);
         assert_eq!(flashinfer_fusion_max_bytes("NVIDIA H200", 8), MIB / 2);
+    }
+
+    /// The TPs and the SM100 budget this module models are the ones the
+    /// runners measure, read from the runners themselves.
+    #[test]
+    fn the_runners_measure_the_tps_and_sm100_budget_modeled_here() {
+        use pyo3::prelude::*;
+        use std::collections::BTreeMap;
+        const MIB: f64 = 1024.0 * 1024.0;
+        Python::with_gil(|py| {
+            // The repository root, where `profiling` lives.
+            py.import("sys")
+                .unwrap()
+                .getattr("path")
+                .unwrap()
+                .call_method1("insert", (0, env!("CARGO_MANIFEST_DIR")))
+                .unwrap();
+            let trtllm = PyModule::import(py, "profiling.runners.comm.flashinfer_trtllm").unwrap();
+            let sorted = py.import("builtins").unwrap().getattr("sorted").unwrap();
+            let tps: Vec<u32> = sorted
+                .call1((trtllm.getattr("SUPPORTED_TP_SIZES").unwrap(),))
+                .unwrap()
+                .extract()
+                .unwrap();
+            assert_eq!(tps, runner_tp_sizes("flashinfer_trtllm"));
+            let mnnvl = PyModule::import(py, "profiling.runners.comm.flashinfer_mnnvl").unwrap();
+            let budget: BTreeMap<u32, f64> = mnnvl
+                .getattr("SM100_MAX_SIZE_MB")
+                .unwrap()
+                .extract()
+                .unwrap();
+            assert_eq!(
+                budget.keys().copied().collect::<Vec<_>>(),
+                runner_tp_sizes("flashinfer_mnnvl")
+            );
+            for (tp, mb) in budget {
+                assert_eq!(
+                    flashinfer_fusion_workspace("NVIDIA B200", tp),
+                    Some((mb * MIB) as u64),
+                    "TP{tp}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn a_tp_no_runner_measures_is_refused_with_its_reason() {
+        let trtllm = ["flashinfer_trtllm"];
+        assert_eq!(fused_all_reduce_refusal(&trtllm, "NVIDIA B200", 8), None);
+        // vLLM budgets SM100 TP16 (multi-node MNNVL); no runner launches it.
+        assert!(fused_all_reduce_refusal(&trtllm, "NVIDIA B200", 16)
+            .unwrap()
+            .contains("measured at TP [2, 4, 8]"));
+        assert!(fused_all_reduce_refusal(&["flashinfer_mnnvl"], "NVIDIA B200", 1).is_some());
+        assert!(fused_all_reduce_refusal(&trtllm, "NVIDIA A100", 4)
+            .unwrap()
+            .contains("no FlashInfer all-reduce budget"));
     }
 
     #[test]

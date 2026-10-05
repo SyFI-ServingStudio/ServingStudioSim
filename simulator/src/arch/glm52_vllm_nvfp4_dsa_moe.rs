@@ -31,6 +31,7 @@ use crate::op::attention::DsaSparseMlaExactVarlenConfig;
 use crate::op::Op;
 use crate::timing::bridge::DType;
 use crate::timing::expert_demand::ExpertDemand;
+use crate::timing::kernels::all_reduce_fusion::fused_all_reduce_refusal;
 use crate::timing::kernels::{
     AllReduceFusionKernel, AllReduceFusionKernelConfig, AllReduceFusionKernelInput,
     AllReduceFusionSpec, AllReduceKernel, AllReduceKernelConfig, AllReduceKernelInput,
@@ -448,6 +449,17 @@ fn build_configs_for_decode(
     if NUM_EXPERTS % u32::from(parallel.ep_size) != 0 {
         return Err(fit_failed(format!(
             "num_experts {NUM_EXPERTS} must be divisible by ep_size {}",
+            parallel.ep_size
+        )));
+    }
+    // The TP boundaries are FlashInfer's fused all-reduce over the EP group.
+    if let Some(reason) = fused_all_reduce_refusal(
+        FUSED_ALLREDUCE_BACKENDS,
+        &parallel.gpu_name,
+        u32::from(parallel.ep_size),
+    ) {
+        return Err(fit_failed(format!(
+            "ep_size {}: {reason}",
             parallel.ep_size
         )));
     }

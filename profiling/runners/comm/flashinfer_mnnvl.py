@@ -36,7 +36,10 @@ from profiling.runners.metrics import RunnerResult
 # workspace and bounds the tensors vLLM dispatches to FlashInfer; larger
 # tensors fall through to another all-reduce backend. The one statement of the
 # budget on the Python side: the kernel DOC and the backend's ``sm_100a`` gate
-# refer to it rather than repeat it.
+# refer to it rather than repeat it. vLLM's TP16 row is multi-node MNNVL, which
+# this one-node launcher cannot run, so the keys are the TPs the runner measures.
+# A Rust test (simulator/src/timing/kernels/all_reduce_fusion.rs) checks these
+# rows against the simulator's copy of vLLM's table.
 SM100_MAX_SIZE_MB: dict[int, float] = {2: 64, 4: 32, 8: 1}
 MIB = 1024 * 1024
 # vLLM ``PDL_ADVANCE_LAUNCH_TOKENS``; FlashInfer ignores it on MNNVL but the
@@ -67,7 +70,9 @@ def spec_error(spec: dict) -> str | None:
     num_gpus = int(spec["num_gpus"])
     if num_gpus not in SM100_MAX_SIZE_MB:
         sizes = "/".join(str(size) for size in sorted(SM100_MAX_SIZE_MB))
-        return f"vLLM FlashInfer all-reduce supports TP {sizes} on SM100, got {num_gpus}"
+        return (
+            f"the FlashInfer MNNVL all-reduce runner measures TP {sizes} (one node), got {num_gpus}"
+        )
     if spec["fabric"] != "nvlink":
         return f"FlashInfer MNNVL all-reduce needs NVLink multicast, got fabric={spec['fabric']!r}"
     dtype = DType.from_value(spec["dtype"])
