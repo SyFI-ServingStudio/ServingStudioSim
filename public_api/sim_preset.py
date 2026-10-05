@@ -254,19 +254,28 @@ class SimMember:
                 return capture
         raise KeyError(name)
 
-    def runnable(self, capture: Capture) -> str | None:
-        """Why this member cannot run ``capture``; None when it can."""
+    def blocker(self, capture: Capture) -> dict | None:
+        """Why this member cannot run ``capture``: ``{"error": <the build's
+        message>}`` or ``{"missing": {<kernel role>: <profile.db rows it
+        lacks>}}``; None when it can."""
         if self.error:
-            return self.error
+            return {"error": self.error}
         key = self.checked[0].name if self.dense and self.checked else capture.name
         if key in self.failures:
-            return self.failures[key]
+            return {"error": self.failures[key]}
         if self.missing.get(key):
-            rows = ", ".join(f"{k} {n}" for k, n in sorted(self.missing[key].items()))
-            return f"lacks profile.db rows: {rows}"
+            return {"missing": self.missing[key]}
         if key not in self.missing:
-            return "not checked"
+            return {"error": "not checked"}
         return None
+
+    def runnable(self, capture: Capture) -> str | None:
+        """:meth:`blocker` as one sentence; None when it can run ``capture``."""
+        blocker = self.blocker(capture)
+        if blocker is None or "error" in blocker:
+            return blocker and blocker["error"]
+        rows = ", ".join(f"{k} {n}" for k, n in sorted(blocker["missing"].items()))
+        return f"lacks profile.db rows: {rows}"
 
     def arch_member(self, index: DeploymentIndex, role: str, capture: Capture) -> Member:
         pool = self.pools[role]
@@ -295,9 +304,9 @@ class SimMember:
             "pools": pools,
             "error": self.error,
             "unavailable": {
-                capture.name: reason
+                capture.name: blocker
                 for capture in self.captures
-                if (reason := self.runnable(capture)) is not None
+                if (blocker := self.blocker(capture)) is not None
             },
         }
 

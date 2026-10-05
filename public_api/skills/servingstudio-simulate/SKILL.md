@@ -54,8 +54,9 @@ replay. Each member gives:
 - `gpus`: the GPUs it occupies, every pool and replica included.
 - `pools`: per role, `replicas`, the arch preset's `arch_params` (such as
   `max_model_len`), `gpus_per_replica` and the `worker` block.
-- `unavailable`: per capture, why the member cannot run it (it does not build,
-  or profile.db lacks rows). A member can run a capture missing from this map.
+- `unavailable`: per capture, why the member cannot run it: `{"error": ...}`
+  when it does not build, or `{"missing": {<kernel role>: <rows>}}` when
+  profile.db lacks rows. A member can run a capture missing from this map.
 
 ```bash
 jq '.presets[] | select(.id == "GLM-5.2-NVFP4/glm52_vllm_nvfp4_dsa_moe_chunked_prefill")

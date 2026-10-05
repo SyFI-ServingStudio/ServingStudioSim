@@ -334,7 +334,7 @@ def test_presets_list_members_captures_and_what_cannot_run(client: TestClient) -
     assert len(members) == 4
     lacking = members[json.dumps({"replicas": 2, "tp_size": 2})]
     assert lacking["gpus"] == 4
-    assert lacking["unavailable"] == {DENSE_TRACE: "lacks profile.db rows: layer.qkv 1"}
+    assert lacking["unavailable"] == {DENSE_TRACE: {"missing": {"layer.qkv": 1}}}
     assert members[json.dumps({"replicas": 1, "tp_size": 1})]["unavailable"] == {}
 
     # An MoE arch offers its capture rows, never the uniform one.
