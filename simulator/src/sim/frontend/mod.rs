@@ -50,14 +50,12 @@ impl<Definition: RequestDefinition> TraceFrontend<Definition> {
     /// Every request's definition with its id in the source trace, in row
     /// order: what a check of the whole trace before the run reads.
     pub fn source_requests(&self) -> impl Iterator<Item = (String, &Definition)> + '_ {
-        let ids = self.source_identities.request_source_ids();
-        self.scheduled_requests.iter().map(move |request| {
-            let id = request.release.request_id.0;
-            let source = ids
-                .get(id as usize)
-                .cloned()
-                .unwrap_or_else(|| id.to_string());
-            (source, &request.definition)
+        self.scheduled_requests.iter().map(|request| {
+            (
+                self.source_identities
+                    .request_source_id(request.release.request_id),
+                &request.definition,
+            )
         })
     }
 }
@@ -97,12 +95,7 @@ impl TraceFrontend<TextGenerationDefinition> {
         let mut rows = Vec::with_capacity(self.scheduled_requests.len());
         for request in &self.scheduled_requests {
             let release = &request.release;
-            let source_request_id = self
-                .source_identities
-                .request_source_ids()
-                .get(release.request_id.0 as usize)
-                .cloned()
-                .unwrap_or_else(|| release.request_id.0.to_string());
+            let source_request_id = self.source_identities.request_source_id(release.request_id);
             let (session_id, round_idx, predecessor_request_id) = match release.session {
                 Some(session) => {
                     let id = session.session_id;
@@ -110,12 +103,7 @@ impl TraceFrontend<TextGenerationDefinition> {
                         .entry(id)
                         .and_modify(|count| *count += 1)
                         .or_insert(0);
-                    let source_session_id = self
-                        .source_identities
-                        .session_source_ids()
-                        .get(id as usize)
-                        .cloned()
-                        .unwrap_or_else(|| id.to_string());
+                    let source_session_id = self.source_identities.session_source_id(id);
                     let predecessor =
                         previous_request_by_session.insert(id, source_request_id.clone());
                     (Some(source_session_id), Some(round), predecessor)
