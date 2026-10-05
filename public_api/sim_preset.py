@@ -318,6 +318,7 @@ class SimMember:
                 break
             except (BadMember, UnknownDeployment):
                 continue
+        limits = {bound["role"]: bound["max_model_len"] for bound in self.bounds or []}
         for role, pool in self.pools.items():
             member = arch.get(role)
             per_replica = member.gpus_per_replica if member else None
@@ -326,6 +327,9 @@ class SimMember:
             pools[role] = {
                 "replicas": pool["replicas"],
                 "arch_params": pool["arch_params"],
+                # The longest request the pool serves, as the build bounds it,
+                # also when `arch_params` leave it to the model's own limit.
+                "max_model_len": limits.get(role),
                 "gpus_per_replica": per_replica,
                 "worker": pool["worker"],
             }

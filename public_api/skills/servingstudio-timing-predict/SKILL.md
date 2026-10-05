@@ -27,17 +27,18 @@ curl -s "$API/health"
 ```
 
 If `/health` does not return `{"status": "ok", ...}`, ask the user for the base
-URL; do not guess another host.
+URL; do not guess another host. `$API/openapi.json` lists every route.
 
 ## 1. Find a deployment
 
 `/models` lists every checkpoint with its presets, one per arch type. A preset
-has `axes` (each swept parameter and its values) and `members` (one per
-combination of axis values). List the members:
+has `axes` (each swept parameter and its values) and `members`, one per
+combination the preset publishes; not every combination of axis values is a
+member, so pick from the list. List the members:
 
 ```bash
-curl -s "$API/models" | jq -r '.checkpoints[] | .presets[] | .id as $id | .members[]
-  | [$id, (.params | tojson), .gpus_per_replica, (.predict | tojson), (.missing | tojson)] | @tsv'
+curl -s "$API/models" | jq -r '.checkpoints[] | .presets[] | .id as $id | .gpu as $g | .members[]
+  | [$id, $g, (.params | tojson), .gpus_per_replica, (.predict | tojson), (.missing | tojson), .error] | @tsv'
 ```
 
 Each member gives:
@@ -58,6 +59,23 @@ axis's `rows` show what each workload binds: `routing`, and the capture it
 reads (`expert_popularity_file` or `token_corpus_file`, an `hf://datasets/...`
 reference). Prefer a workload that reads a capture; use `uniform` or `random`
 only when the user asks for it, and name the workload in your answer.
+
+When several members fit the question:
+
+- `max_model_len`: take the smallest value at or above the longest request in
+  your cases. It enters the attention and indexer kernels' configs (logits
+  width, blocks per request), so a larger one predicts different kernels, not
+  the same ones with headroom.
+- `mtp_mode` (speculative GLM presets): how the MTP proposer layer runs its DSA
+  indexer. `full_index` computes the indexer on every proposer pass;
+  `index_share` computes it on the first pass and reuses that top-k on the
+  passes after it.
+  Pick the one the user's deployment runs; otherwise report both, from
+  members that share every other axis value.
+- A preset with no `axes` has one member; post `"params": {}`.
+- Prefer an `iter` preset for "how long is one step": it times the whole
+  replica. `attn` and `ffn` presets time one side of a disaggregated
+  deployment (step 5).
 
 ```bash
 curl -s "$API/models" | jq '.checkpoints[].presets[]
@@ -129,8 +147,10 @@ decodes at 4096:
 
 **MoE with a capture workload** (`Qwen3-235B-A22B-FP8/qwen3_moe_fp8_dp_attn_ep_ffn`,
 `attn_tp_size: 4, ep_size: 8, workload: ctx8k_out1k`; `iter`, 2 groups, one
-per attention DP group). Both groups decode 64 requests; then one
-group prefills an 8k prompt while the other decodes one request:
+per attention DP group). Each group is one DP group's batch, so a replica
+batch of N requests is split across the groups. Here the replica decodes 128
+requests, 64 per group; then one group prefills an 8k prompt while the other
+decodes one request:
 
 ```json
 [{"groups": [{"decode_count": 64, "average_decode_length": 8192},
@@ -141,7 +161,8 @@ group prefills an 8k prompt while the other decodes one request:
 **Speculative** (`GLM-5.3-NVFP4/glm53_vllm_nvfp4_dsa_moe_dflash2`,
 `max_model_len: 8192, workload: diverse_100`; `speculative_iter`, 1 group,
 `query_width` 8). Each decode request is `[kv_len, query_width]`: its KV length
-once the verify step has run, and the member's `query_width` (draft tokens + 1):
+once the verify step has run, and the member's `query_width` (draft tokens + 1).
+A request with 4096 tokens of context before the step is `[4104, 8]`:
 
 ```json
 [{"groups": [{"decode_requests": [[4096, 8], [4096, 8], [6000, 8], [2000, 8]]}]},
@@ -182,8 +203,10 @@ curl -s -X POST "$API/predict" -H 'content-type: application/json' -d '{
 jq -c '.cases | to_entries[] | .key as $c | .value.sections[] | [$c, .section, .layer, .total_ms]' prediction.json
 ```
 
-The answer has `sim_commit` and `cases`, one entry per case in request order.
-Each entry's `sections` gives, per section:
+The answer has `sim_commit`, `cases`, one entry per case in request order,
+and `kernel_time_share`, pooled over all the cases: each kernel position's
+time on the critical path with its layers summed, largest first, and the sums
+by kernel kind. Each case's `sections` gives, per section:
 
 - `total_ms` and `energy_j`, the section's time and modeled energy;
 - `nodes`, the case's cost tree as the Analyzer reads it (`analyze
@@ -191,9 +214,12 @@ Each entry's `sections` gives, per section:
   `node` id, `kind` (`sum`, `max`, `scale` or `leaf`), `depth`, `label`, `ms` (one call), `total_ms` (`ms` times
   every enclosing `scale` node's n), `pct` (`total_ms` over the root's), and
   `critical` (on the chain of slowest children from the root, the rows
-  `iter_breakdown.ans` marks with ▸). A leaf names its `slot`; runs of
-  identical siblings show one node with `copies` (and, under a `max`,
-  `avg_total_ms`);
+  `iter_breakdown.ans` marks with ▸). Under a `sum` every child adds to the
+  time, so `critical` only marks the largest one; rank nodes by `total_ms` or
+  `pct` to say where the time goes. A leaf names its `slot`. Runs of identical
+  siblings, such as the same kernel on each rank, show one representative node
+  with `copies` (and, under a `max`, `avg_total_ms`); its time is one copy's,
+  not their sum;
 - `slot_backend[j]`, the backend chosen for kernel leaf `j`; null means the
   leaf did not run for this case (for example the prefill kernel in a
   decode-only batch);
@@ -254,10 +280,24 @@ in a case's `operations`, one per section: `0` for `iter`, `0` to `4` for the
 | `subjects/kernel-input-distribution/payload` | the inputs each kernel position saw across all cases |
 | `subjects/scoped-optimality/report?path=iter/root/1` | optimality of one subtree; `path` is the section and child ordinals from the root (or pass `label`) |
 
+Slots outside the measured grid, by name:
+
+```bash
+jq -r '.cases[0].sections[0] | .coverage.extrapolated as $x
+  | .nodes[] | select(.slot != null and (.slot | IN($x[]))) | [.slot, .label] | @tsv' prediction.json
+```
+
 ```bash
 curl -s "$P/subjects/cases/payload" | jq -c '.cases[] | {case_id, total_time_ms}'
-curl -s "$P/cases/0/subjects/optimality-waterfall/payload" | jq '.level | {total, buckets}'
+curl -s "$P/cases/0/subjects/optimality-waterfall/payload" | jq '{meta, level: (.level | {total, buckets})}'
 ```
+
+The waterfall's `buckets` are `hardware_optimal`, `hardware_gap`,
+`communication`, `imbalance`, `batching` and `idle`, in GPU-seconds. Check
+`meta.necessary_work_available` and `meta.caveats` first: when the Analyzer
+cannot label the iteration's necessary work exactly, it estimates it
+(`meta.necessary_work_mode`) and says why in `caveats`; pass that on with the
+numbers.
 
 An unknown or expired id answers 404 `prediction_not_found`.
 
@@ -269,7 +309,9 @@ What a time is depends on the selector:
   (`gpus_per_replica` GPUs), every group in the case included. Section `iter`,
   `layer` -1.
 - `speculative_iter`: one verify iteration of the target model together with
-  the proposer pass the tree shows (for example `unified.dflash2`).
+  the proposer pass the tree shows (a root child such as `unified.dflash2` or
+  `MTP layer N`). Report the proposer's `total_ms` beside the case total, so
+  the verify and draft costs read separately.
 - `attn`: one layer of attention on one attention shard (`layer` 0). Every
   layer sees the same batch, so the attention work of an iteration is this
   time times the layer count, which the root label states (`94 layers`).

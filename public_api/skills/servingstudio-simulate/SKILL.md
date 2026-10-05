@@ -28,7 +28,7 @@ curl -s "$API/health"
 ```
 
 If `/health` does not return `{"status": "ok", ...}`, ask the user for the base
-URL; do not guess another host.
+URL; do not guess another host. `$API/openapi.json` lists every route.
 
 A simulation runs in the background: `POST /simulate` queues it and answers at
 once, and you read it with `GET /simulations/{id}` until it is done. Two run at
@@ -42,28 +42,38 @@ minute per client; a refused request does not count.
 
 ```bash
 curl -s "$API/simulations/presets" > presets.json
-jq -r '.presets[] | .id as $id | .members[]
-  | [$id, (.params | tojson), .gpus, (.unavailable | keys | join(","))] | @tsv' presets.json
+jq -r '.presets[] | .id as $id | ([.pools[].gpu] | unique | join("+")) as $g | .members[]
+  | [$id, $g, (.params | tojson), .gpus, (.unavailable | keys | join(","))] | @tsv' presets.json
 ```
 
 A preset gives its `deployment`, its `pools` (per role, the arch preset, arch,
 GPU and worker type) and `captures`, the recorded workloads its members can
-replay. Each member gives:
+replay. A capture's `routing` says how it routes experts (`popularity`,
+`corpus`, or null for a dense model, which can replay any published trace,
+including one recorded on another model). Each member gives:
 
 - `params`: its axis values. A simulation names the member by these, exactly.
 - `gpus`: the GPUs it occupies, every pool and replica included.
-- `pools`: per role, `replicas`, the arch preset's `arch_params` (such as
-  `max_model_len`), `gpus_per_replica` and the `worker` block.
+- `pools`: per role, `replicas`, the arch preset's `arch_params`,
+  `max_model_len` (the longest request the pool serves; `arch_params` may leave
+  it to the model's own limit), `gpus_per_replica` and the `worker` block.
 - `unavailable`: per capture, why the member cannot run it: `{"error": ...}`
   when it does not build, `{"missing": {<kernel role>: <rows>}}` when
   profile.db lacks rows, or `{"misfit": {"reason", "max_model_len", ...}}`
   when the capture's requests do not fit its pools' `max_model_len` (that
   blocks a replay only; the capture still serves as routing). A member can run
   a capture missing from this map.
+- `error`: why the member does not build, or null.
+
+An axis can carry `rows`, what each of its values sets: `server: ep4_ctx128k`
+is `ep_size` 4 with `max_model_len` 131072. The members that can replay one
+capture:
 
 ```bash
 jq '.presets[] | select(.id == "GLM-5.2-NVFP4/glm52_vllm_nvfp4_dsa_moe_chunked_prefill")
   | {deployment, pools, axes, captures}' presets.json
+jq -c '.presets[] | select(.id == "GLM-5.2-NVFP4/glm52_vllm_nvfp4_dsa_moe_chunked_prefill")
+  | .members[] | select(.error == null and (.unavailable | has("diverse_100") | not)) | .params' presets.json
 ```
 
 A worker of type `speculative` drafts `draft_tokens` per request per step; its
@@ -89,10 +99,13 @@ capture's recorded trace, and its routing is the capture's own. Each capture's
 `facts` say what it holds: `requests`, mean `prompt_tokens` and
 `output_tokens`, `rate`, its recorded requests per second, and
 `input_file_tags`. A capture tagged `speculative` carries the acceptance it
-recorded, per request, so a speculative member needs no `accept_rate` on it:
+recorded, per request, so a speculative member needs no `accept_rate` on it.
+A capture whose `rate` is null had every request arrive at once; it takes a
+concurrency, not a rate:
 
 ```json
-{"source": "capture", "capture": "c32_long", "load": {"rate": 8}}
+{"source": "capture", "capture": "diverse_100", "load": {"rate": 4}}
+{"source": "capture", "capture": "c32_long", "load": {"concurrency": 32}}
 ```
 
 **A generated trace** (`"source": "generated"`). req-frontend's `tracegen`
@@ -118,12 +131,19 @@ independent requests, give `"rounds": "1"`:
                "arrival_rate": 2, "seed": 1}}
 ```
 
+`arrival_pattern` is `poisson` (the default) or `constant`. Poisson
+arrivals drawn at `arrival_rate` 2 have a mean near 2, not exactly 2 (the
+upload's or trace's `rate` says what was drawn). To run at exactly r per
+second, keep the draw and add `"load": {"rate": r}` (below), which rescales
+the arrivals to that mean.
+
 A session trace's rounds always chain: each round waits for the previous round
 to finish and for its tool wait.
 
 **An uploaded CSV** (`"source": "upload"`). Send the file to `POST /workloads`
-with its `format` (and, optionally, comma-separated `tags`), then name the
-answer's `workload_id`:
+as the raw request body (`--data-binary`, not a multipart `-F` form), with
+`format` and comma-separated `tags` as query parameters when you give them,
+then name the answer's `workload_id`:
 
 ```bash
 curl -s "$API/workloads" | jq '.sources.upload | {formats, tags, max_bytes}'
@@ -135,6 +155,7 @@ r2,500,4096,512
 EOF
 UP=$(curl -s -X POST "$API/workloads" \
   -H 'content-type: text/csv' --data-binary @trace.csv | jq -r .workload_id)
+# or say the format: "$API/workloads?format=text-generation-independent"
 ```
 
 A format's `columns` are the header the file must have, exactly, in any order;
@@ -143,9 +164,11 @@ reads the file as the format and tags its header fits; give `format` (and
 `tags`) to say it yourself. In `text-generation-independent`,
 `arrival_time` is in milliseconds and must not decrease down the file. The
 service reads the file as a run will and answers 400 with the reason when it
-cannot; the answer gives the format and tags it read, the same facts a capture
-has (`requests`, `prompt_tokens`, `output_tokens`, `rate`) and `expires_at`
-(24 hours). An upload
+cannot; the answer gives `workload_id`, the `input_file_format` and
+`input_file_tags` it read, the same facts a capture has (`requests`,
+`sessions`, true when rounds chain, mean `prompt_tokens` and `output_tokens`,
+`rate`) and `expires_at` (24 hours). An upload cannot be deleted; it
+expires. An upload
 tagged `speculative` carries each request's acceptance in its `accept_rate`
 column (one probability, or a JSON list of `draft_tokens` of them); a
 speculative member then takes no `accept_rate` in the simulation.
@@ -206,28 +229,36 @@ The request is checked before it queues:
 
 ## 4. Read the result
 
-Poll every few seconds; most runs take seconds to a minute:
+Poll every few seconds; most runs take seconds to a minute, and a run stops
+itself at 10 minutes, so give up after about 12:
 
 ```bash
-until S=$(curl -s "$API/simulations/$ID"); echo "$S" | jq -e '.status | test("done|failed|timed_out")' >/dev/null; do
+for i in $(seq 144); do S=$(curl -s "$API/simulations/$ID")
+  echo "$S" | jq -e '.status | test("done|failed|timed_out")' >/dev/null && break
   echo "$S" | jq -c '{status, queue_position}'; sleep 5; done
 echo "$S" | jq '{status, error, routing, workload, gpus, summary}'
 ```
 
 `status` is `queued` (with `queue_position`), `running`, `done`, `failed`
 (with `error`) or `timed_out`. The record repeats the request: `preset`,
-`params`, `workload` (with the `capture` used and `trace`, its facts), `routing`
-and `gpus`. Once done, `summary` has:
+`params`, `workload` (with the `capture` used, `trace`, its facts as
+recorded, before any `load` rescales its rate, and
+`shortened`, how many requests lost their last tokens to fit a speculative
+pool's draft window), `routing` and `gpus`. Once done, `summary` has:
 
-- `requests`: `total` and `finished`; `cause` says why the run stopped;
-- `sim_ms`: simulated time;
+- `cause`: why the run stopped;
+- `requests`: `total` and `finished`;
+- `sim_ms`: simulated time, the drain after the last arrival included;
+- `num_gpus`: the GPUs the run counted;
 - `throughput`: `total_tok_s`, `prefill_tok_s`, `decode_tok_s`,
-  `total_tok_s_per_gpu`, `completed_req_s`;
+  `total_tok_s_per_gpu`, and `completed_req_s`, finished requests over
+  `sim_ms`; each is over all of `sim_ms`, not only the busy part;
 - `ttft_ms`, `tpot_ms`, `e2e_ms`: `mean`, `p50`, `p90`, `p99`, `max` and `n`, in
-  milliseconds.
+  milliseconds. `n` counts the requests the metric covers: a request with one
+  output token has no TPOT, so `tpot_ms.n` can be below `finished`.
 
 ```bash
-echo "$S" | jq '.summary | {requests, sim_ms, throughput, ttft: .ttft_ms, tpot: .tpot_ms, e2e: .e2e_ms}'
+echo "$S" | jq '.summary | {cause, requests, sim_ms, throughput, ttft: .ttft_ms, tpot: .tpot_ms, e2e: .e2e_ms}'
 ```
 
 For more, the Analyzer serves the run under `$API/analyzer/runs/{run_id}/`,
