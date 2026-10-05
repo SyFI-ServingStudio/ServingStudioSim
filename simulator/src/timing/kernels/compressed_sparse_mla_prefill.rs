@@ -3,6 +3,7 @@
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::{CacheKind, RateWork};
 use crate::timing::kernels::causal_rows;
+use crate::timing::kernels::dsa_compressed_mqa_logits_prefill::query_axis;
 use crate::timing::kernels::engine::{register_kernel, KernelSpec, OffGrid};
 use crate::timing::sweep::{Axis, Coords, SweepGrid};
 use crate::timing::{Dim, KernelConfig, SweepCoords};
@@ -138,13 +139,15 @@ impl KernelSpec for CompressedSparseMlaPrefillSpec {
 
     fn sweep_grid(config: &Self::Config) -> SweepGrid {
         assert_eq!(config.prefill_chunk_size, 4);
-        assert_eq!(config.max_num_batched_tokens, 8192);
         assert_eq!(
             config.selected_k,
             if config.compress_ratio == 1 { 0 } else { 512 }
         );
         SweepGrid::new(vec![
-            Axis::values([1, 4, 16, 64, 128, 256, 512, 1024, 2048, 4096, 8192]),
+            query_axis(
+                &[1, 4, 16, 64, 128, 256, 512, 1024, 2048, 4096, 8192],
+                config.max_num_batched_tokens,
+            ),
             Axis::values([1, 32, 128, 512, 2048, 8192, 32768, 65536, 262144, 1048576])
                 .into_iter()
                 .filter(|&context| context <= f64::from(config.max_model_len))

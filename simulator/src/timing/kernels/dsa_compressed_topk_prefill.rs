@@ -50,10 +50,9 @@ impl KernelSpec for DsaCompressedTopkPrefillSpec {
     const KIND: KernelKind = "dsa_compressed_topk_prefill";
 
     fn sweep_grid(config: &Self::Config) -> SweepGrid {
-        assert_eq!(config.max_num_batched_tokens, 8192);
         assert_eq!(config.max_logits_bytes, 512 * 1024 * 1024);
         assert_eq!(config.compress_ratio, 4);
-        sweep_grid(config.max_model_len)
+        sweep_grid(config.max_model_len, config.max_num_batched_tokens)
     }
 
     fn cache_kind(_backend: &'static str) -> CacheKind {

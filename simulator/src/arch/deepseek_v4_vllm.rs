@@ -46,7 +46,6 @@ const NUM_EXPERTS: u32 = 256;
 const TOP_K: u32 = 6;
 const EXPERT_WIDTH: u32 = 2048;
 const VOCAB_SIZE: u32 = 129_280;
-const MAX_BATCHED_TOKENS: u32 = 8192;
 const CYCLE_COUNT: u32 = 19;
 
 const MHC_BACKENDS: &[&str] = &["vllm_tilelang"];
@@ -212,6 +211,9 @@ pub struct DeepseekV4VllmParallel {
     pub nvl_num_gpu: u16,
     pub gpu_name: String,
     pub serialize_streams: bool,
+    /// vLLM's `--max-num-batched-tokens`: the most tokens one step runs, which
+    /// sizes the attention buffers and splits the indexer's prefill launches.
+    pub max_num_batched_tokens: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -405,7 +407,7 @@ fn layer_config(
             planner_mode: recipe.planner.into(),
             serialize_streams: parallel.serialize_streams,
             max_model_len: model.max_model_len,
-            max_num_batched_tokens: MAX_BATCHED_TOKENS,
+            max_num_batched_tokens: parallel.max_num_batched_tokens,
             hidden_size: model.hidden_size.clone(),
             hc_mult: model.hc_mult,
             num_attention_heads: model.num_attention_heads.clone(),
@@ -989,6 +991,7 @@ mod tests {
             nvl_num_gpu: ep_size,
             gpu_name: gpu_name.to_string(),
             serialize_streams: false,
+            max_num_batched_tokens: 8192,
         }
     }
 

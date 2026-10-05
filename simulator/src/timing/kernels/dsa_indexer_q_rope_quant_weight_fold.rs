@@ -2,8 +2,9 @@
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::CacheKind;
+use crate::timing::kernels::dsa_compressed_mqa_logits_prefill::query_axis;
 use crate::timing::kernels::engine::{register_kernel, KernelSpec};
-use crate::timing::sweep::{Axis, SweepGrid};
+use crate::timing::sweep::SweepGrid;
 use crate::timing::{Dim, KernelConfig, SweepCoords};
 
 #[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -41,10 +42,12 @@ impl KernelSpec for DsaIndexerQRopeQuantWeightFoldSpec {
     const KIND: KernelKind = "dsa_indexer_q_rope_quant_weight_fold";
 
     fn sweep_grid(config: &Self::Config) -> SweepGrid {
-        assert_eq!(config.max_num_batched_tokens, 8192);
-        SweepGrid::new(vec![Axis::values([
-            1, 2, 4, 8, 16, 32, 64, 128, 256, 384, 511, 512, 513, 768, 1024, 2048, 4096, 8192,
-        ])])
+        SweepGrid::new(vec![query_axis(
+            &[
+                1, 2, 4, 8, 16, 32, 64, 128, 256, 384, 511, 512, 513, 768, 1024, 2048, 4096, 8192,
+            ],
+            config.max_num_batched_tokens,
+        )])
     }
 
     fn cache_kind(_backend: &'static str) -> CacheKind {

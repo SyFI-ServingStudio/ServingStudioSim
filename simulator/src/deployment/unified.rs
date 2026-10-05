@@ -457,6 +457,7 @@ impl Deployment for UnifiedDeployment {
                     *routing_seed,
                     expert_popularity_file.as_deref(),
                     serialize_streams,
+                    chunk_tokens(&g.worker),
                     &gpu_name,
                     MODEL_NAME,
                     bridge,
@@ -813,6 +814,17 @@ fn ensure_hp_unified(worker: &IterWorkerSel) -> anyhow::Result<()> {
 
 /// Whole-iteration arches with a captured chunked-prefill runtime may use the
 /// ordinary HP admission recipe or the dedicated hard-cap/chunking recipe.
+/// The most tokens one step of `worker` runs: its chunk under chunked
+/// prefill; None for a worker that runs each prompt whole.
+fn chunk_tokens(worker: &IterWorkerSel) -> Option<u32> {
+    match worker {
+        IterWorkerSel::ChunkedPrefill {
+            max_batch_tokens, ..
+        } => Some(*max_batch_tokens),
+        _ => None,
+    }
+}
+
 fn ensure_hp_or_chunked_worker(arch_name: &str, worker: &IterWorkerSel) -> anyhow::Result<()> {
     match worker {
         IterWorkerSel::HpUnified { .. } | IterWorkerSel::ChunkedPrefill { .. } => Ok(()),

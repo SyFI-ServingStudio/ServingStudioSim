@@ -947,7 +947,9 @@ pub fn qwen3_vllm_moe(
 
 /// Build DeepSeek V4 through the same routing-profile loader used by Qwen and
 /// GLM. `serialize_streams` changes only CostTree composition; kernel inputs and
-/// profile identities remain identical.
+/// profile identities remain identical. `step_tokens` is the most tokens one
+/// step runs: a chunked-prefill worker's chunk, or None when steps are not
+/// chunked, where a whole prompt runs at once and vLLM sizes for max_model_len.
 #[allow(clippy::too_many_arguments)]
 pub fn deepseek_v4_vllm(
     model_spec: &ModelSpec,
@@ -955,6 +957,7 @@ pub fn deepseek_v4_vllm(
     routing_seed: Option<u64>,
     expert_popularity_file: Option<&str>,
     serialize_streams: bool,
+    step_tokens: Option<u32>,
     gpu: &str,
     name: &str,
     bridge: &PerfApiBridge,
@@ -975,6 +978,7 @@ pub fn deepseek_v4_vllm(
         nvl_num_gpu: 4,
         gpu_name: gpu.to_string(),
         serialize_streams,
+        max_num_batched_tokens: step_tokens.unwrap_or(model_cfg.max_model_len),
     };
     let configs = deepseek_v4_vllm::build_configs(&model_cfg, &parallel, &routing)
         .context("expanding DeepSeek V4 architecture configs")?;
@@ -1605,6 +1609,7 @@ pub fn build_iter_model(
             *routing_seed,
             expert_popularity_file.as_deref(),
             false,
+            None,
             gpu,
             name,
             bridge,
@@ -1620,6 +1625,7 @@ pub fn build_iter_model(
             *routing_seed,
             expert_popularity_file.as_deref(),
             true,
+            None,
             gpu,
             name,
             bridge,

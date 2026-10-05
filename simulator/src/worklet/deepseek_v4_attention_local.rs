@@ -948,11 +948,6 @@ fn validate_config(config: &DeepseekV4AttentionLocalWorkletConfig) -> Result<(),
             INDEX_HEAD_DIM,
         ),
         ("selected_k", config.selected_k, SELECTED_K),
-        (
-            "max_num_batched_tokens",
-            config.max_num_batched_tokens,
-            8192,
-        ),
     ];
     for (name, actual, expected) in identity {
         if actual != expected {

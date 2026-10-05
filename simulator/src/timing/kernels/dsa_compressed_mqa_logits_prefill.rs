@@ -47,9 +47,28 @@ impl SweepCoords for DsaCompressedPrefillKernelInput {
     }
 }
 
-pub(crate) fn sweep_grid(max_model_len: u32) -> SweepGrid {
+/// Queries in one step, from one up to the most a step runs
+/// (`max_num_batched_tokens`): `base` below it, then doubling to it.
+pub(crate) fn query_axis(base: &[u32], max_num_batched_tokens: u32) -> Vec<f64> {
+    let mut values: Vec<u32> = base
+        .iter()
+        .copied()
+        .filter(|&queries| queries < max_num_batched_tokens)
+        .collect();
+    let mut next = values.last().map_or(1, |&last| last * 2);
+    while next < max_num_batched_tokens {
+        values.push(next);
+        next *= 2;
+    }
+    values.push(max_num_batched_tokens);
+    Axis::values(values)
+}
+
+const PREFILL_QUERIES: [u32; 11] = [1, 4, 16, 64, 128, 256, 512, 1024, 2048, 4096, 8192];
+
+pub(crate) fn sweep_grid(max_model_len: u32, max_num_batched_tokens: u32) -> SweepGrid {
     SweepGrid::new(vec![
-        Axis::values([1, 4, 16, 64, 128, 256, 512, 1024, 2048, 4096, 8192]),
+        query_axis(&PREFILL_QUERIES, max_num_batched_tokens),
         Axis::values([4, 32, 128, 512, 2048, 8192, 32768, 65536, 262144, 1048576])
             .into_iter()
             .filter(|&context| context <= f64::from(max_model_len))
@@ -142,10 +161,9 @@ impl KernelSpec for DsaCompressedMqaLogitsPrefillSpec {
     const KIND: KernelKind = "dsa_compressed_mqa_logits_prefill";
 
     fn sweep_grid(config: &Self::Config) -> SweepGrid {
-        assert_eq!(config.max_num_batched_tokens, 8192);
         assert_eq!(config.max_logits_bytes, 512 * 1024 * 1024);
         assert_eq!(config.compress_ratio, 4);
-        sweep_grid(config.max_model_len)
+        sweep_grid(config.max_model_len, config.max_num_batched_tokens)
     }
 
     fn cache_kind(_backend: &'static str) -> CacheKind {
@@ -208,6 +226,26 @@ register_kernel!(
 mod tests {
     use super::*;
     use crate::timing::SweepCoords;
+
+    #[test]
+    fn the_query_axis_ends_at_the_most_a_step_runs() {
+        // An 8192-token chunk keeps the grid its rows were measured on.
+        assert_eq!(
+            query_axis(&PREFILL_QUERIES, 8192),
+            Axis::values(PREFILL_QUERIES)
+        );
+        // A smaller chunk stops there, an odd one included.
+        assert_eq!(
+            query_axis(&PREFILL_QUERIES, 2052),
+            Axis::values([1, 4, 16, 64, 128, 256, 512, 1024, 2048, 2052])
+        );
+        // Unchunked steps run a whole prompt, up to max_model_len.
+        let unchunked = query_axis(&PREFILL_QUERIES, 1_048_576);
+        assert_eq!(
+            unchunked[10..],
+            Axis::values([8192, 16384, 32768, 65536, 131072, 262144, 524288, 1_048_576])[..]
+        );
+    }
 
     #[test]
     fn one_large_request_stays_one_semantic_input() {
