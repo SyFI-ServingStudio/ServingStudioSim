@@ -10,7 +10,7 @@ each successive gap is an attributable source of sub-optimality:
 |---|---|---|
 | R0 Real            | `span × G`            | — (GPU·s actually held) |
 | R1 Busy            | `Σ total_time × G`   | **idle** (scheduler gaps) |
-| R2 Balanced        | real times, `Max`→mean | **imbalance** (DP/EP straggler) |
+| R2 Balanced        | real times, rank `Max`→mean, stream `Parallel` kept | **imbalance** (DP/EP straggler) |
 | R3 per-config best | unlocked: selected grid-peak throughput; locked: R2 unchanged | **batching** |
 | R4 ignore network  | R3, comm leaves → 0  | **communication** |
 | R5 hardware limit  | active regime's work unit / matching GPU-spec peak | **profiled↔hardware** |
@@ -93,10 +93,10 @@ hub (module doc + shared rung constants/helpers + `pub use run::run_optimality`)
   `run_meta` GPU counts and `gpu/spec.json`, wires the stages below, and assembles
   the report/payload JSON (+ the `unavailable` degrade paths, `definitions`).
 - `prepare.rs` — preparation. Interns every manifest leaf into a global location
-  and precomputes each `(pool, worker, section)`'s fold weights `α` + rate ceilings
+  and precomputes each `(pool, worker, section)`'s tree + rate ceilings
   (`build_section_fold_plans`); no folding here.
 - `fold.rs` — the algorithm. Exact R0/R1 SQL sums (`read_exact_worker_totals`) + the
-  stride-sampled R2..R5 mean-fold hot loop (`accumulate_fold`,
+  stride-sampled R2..R5 balanced-fold hot loop (`accumulate_fold`,
   `leaf_selected_throughput_ms`).
 - `levels.rs` — the worker / pool / cluster tiers. `assemble_tiers` turns the fold's
   per-worker accumulators into named R0..R5 values and rolls them up; `levels_json`
@@ -160,9 +160,12 @@ reported under a subtree label.
 - R0/R1 are exact SQL sums over every row; R2..R5 fold a 1-in-`stride`-iteration
   sample (rates are near-constant across iterations) **anchored to the exact R1**
   by the sampled ratio, so the ladder stays monotone and the buckets stay exact.
-- The mean-mode fold (`trace::manifest::fold_mean`) is linear ⇒ a precomputed
-  per-leaf weight `α` (`∏ 1/(child·overlap)` over `Max` × `∏ n` over `Scale`) gives
-  both the per-worker totals and the additive per-kernel attribution in one walk.
+- The balanced fold (`trace::manifest::BalancedFold`) re-evaluates each sampled
+  row's tree once for R2..R5: rank `Max` → mean/overlap, stream `Parallel` →
+  max/overlap (its slowest child for that rung). The same walk attributes each
+  rung to the leaves, so per-worker totals and the per-kernel attribution add up.
+  On the 555,785-row GLM-5.2 run (834 slots, 1,035 nodes, 11,115 sampled rows) the
+  walk takes ~0.3 s of the fold's ~12 s, which is reading the sampled slot lists.
 - R3 is not a roofline of the current point. It approximates large-batch
   operation: if any fitted point's algorithmic intensity reaches the GPU-spec
   ridge, the config uses only its peak TFLOP/s; otherwise it uses only peak GB/s.

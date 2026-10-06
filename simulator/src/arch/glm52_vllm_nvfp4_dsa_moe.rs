@@ -947,8 +947,8 @@ impl Glm52RoutedExperts {
     /// it hides underneath the routed experts; a larger batch runs it serially.
     /// The tree shape is fixed (INV-1), so each child mints the shared expert
     /// twice -- concurrent with the routed slice, and serial after it -- and
-    /// `eval_with_shared` fills the one the batch size selects. `Max` still
-    /// sums work (INV-4), so the hidden copy's flops and bytes count.
+    /// `eval_with_shared` fills the one the batch size selects. `Parallel`
+    /// still sums work (INV-4), so the hidden copy's flops and bytes count.
     fn compile_with_shared(
         &self,
         shared_expert: &Glm52SharedExpertLocalWorklet,
@@ -962,7 +962,7 @@ impl Glm52RoutedExperts {
             let concurrent = shared_expert.compile(builder);
             let routed = routed(builder);
             CostNode::Sum(vec![
-                CostNode::Max {
+                CostNode::Parallel {
                     overlap: 1.0,
                     children: vec![concurrent, routed],
                 },

@@ -14,8 +14,8 @@
 //! pass with no allocation when the caller reuses `scratch`.
 //!
 //! Names live only here (compile time / the slot list), never on the hot path or
-//! in log rows (INV-5). `Max`/`Scale` are defined for the full algebra even
-//! though the dense vertical only emits `Leaf`/`Sum`/`Scale`.
+//! in log rows (INV-5). `Max`/`Parallel`/`Scale` are defined for the full algebra
+//! even though the dense vertical only emits `Leaf`/`Sum`/`Scale`.
 
 use std::collections::VecDeque;
 use std::fmt::Write;
@@ -35,9 +35,18 @@ pub enum CostNode {
     Leaf(usize),
     /// `Σ children` (serial composition; time/flops/bytes all sum).
     Sum(Vec<CostNode>),
-    /// Fan-out: wallclock `= max(children)/overlap`. Unused by the dense vertical
-    /// (no collective); present for future HP/EP fan-out (INV-3).
+    /// Rank fan-out: each child is the same section on a different rank (DP/EP/TP
+    /// shard); wallclock `= max(children)/overlap`, the slowest rank. A gap between
+    /// the ranks is load imbalance.
     Max {
+        overlap: f32,
+        children: Vec<CostNode>,
+    },
+    /// Concurrent streams on one device: the children run at the same time on the
+    /// same GPU (e.g. an auxiliary-stream shared expert beside the routed experts).
+    /// Aggregates exactly like [`Self::Max`] — wallclock `= max(children)/overlap`,
+    /// work summed — but a gap between the children is overlap, not imbalance.
+    Parallel {
         overlap: f32,
         children: Vec<CostNode>,
     },
@@ -66,6 +75,10 @@ pub enum FlatCostNode {
         overlap: f32,
         children: Range<usize>,
     },
+    Parallel {
+        overlap: f32,
+        children: Range<usize>,
+    },
     Scale {
         n: u32,
         children: Range<usize>,
@@ -88,8 +101,8 @@ pub struct LeafDesc {
 /// parquet `slot_*` list columns) with the flattened aggregation
 /// [`nodes`](Self::nodes), so a consumer reading a row from `cost_log/` can
 /// re-run [`CostTree::aggregate`] over that row's `slot_time_ms` to reproduce
-/// `total_time_ms`: the `Scale{n}` fold, `Sum`, and `Max{overlap}` operators
-/// are all present (slot names alone can't reconstruct the total).
+/// `total_time_ms`: the `Scale{n}` fold, `Sum`, `Max{overlap}`, and
+/// `Parallel{overlap}` operators are all present (slot names alone can't reconstruct the total).
 ///
 /// [`node_labels`](Self::node_labels) recovers the composite identity that
 /// [`CostTree::flatten`] drops: it is index-aligned to [`nodes`](Self::nodes) —
@@ -315,6 +328,13 @@ impl CostTree {
                         children: range,
                     }
                 }
+                CostNode::Parallel { overlap, children } => {
+                    let range = Self::reserve(&mut out, &mut labels, &mut queue, children);
+                    FlatCostNode::Parallel {
+                        overlap: *overlap,
+                        children: range,
+                    }
+                }
                 CostNode::Scale { n, child } => {
                     let range = Self::reserve(
                         &mut out,
@@ -370,8 +390,10 @@ impl CostTree {
     /// Composites combine:
     ///   - `Sum`  — field-wise sum of children (coverage flags unioned);
     ///   - `Scale{n}` — child subtree × `n` (the homogeneous-layer fold);
-    ///   - `Max{overlap}` — `time = max(child.time)/overlap`, other fields summed
-    ///     (flops/bytes/energy always add — work doesn't overlap away, INV-4).
+    ///   - `Max{overlap}` / `Parallel{overlap}` — `time = max(child.time)/overlap`,
+    ///     other fields summed (flops/bytes/energy always add — work doesn't
+    ///     overlap away, INV-4).
+    ///
     /// Coverage flags always OR up the tree, so a warning anywhere surfaces at
     /// the root.
     ///
@@ -413,7 +435,8 @@ impl CostTree {
                     acc.scale(*n as f32);
                     acc
                 }
-                FlatCostNode::Max { overlap, children } => {
+                FlatCostNode::Max { overlap, children }
+                | FlatCostNode::Parallel { overlap, children } => {
                     let mut acc = LeafMetrics::ZERO;
                     let mut max_time = 0.0f32;
                     for c in children.clone() {
@@ -457,6 +480,12 @@ impl CostTree {
             }
             CostNode::Max { overlap, children } => {
                 writeln!(out, "{ind}Max{{overlap={overlap}}}").unwrap();
+                for c in children {
+                    self.write_node(c, depth + 1, out);
+                }
+            }
+            CostNode::Parallel { overlap, children } => {
+                writeln!(out, "{ind}Parallel{{overlap={overlap}}}").unwrap();
                 for c in children {
                     self.write_node(c, depth + 1, out);
                 }
@@ -702,6 +731,42 @@ w (PreAttnLocalWorklet) [local (1 GPU); qkv n=6144, k=4096]
     }
 
     #[test]
+    fn parallel_aggregates_like_max_and_keeps_its_own_manifest_tag() {
+        // Parallel{overlap=0.9}( leaf x, leaf y ): same time/work as Max; the flat
+        // node and its JSON tag stay `Parallel` so a consumer can tell streams
+        // from ranks.
+        let mut b = CostTreeBuilder::new();
+        let root = CostNode::Parallel {
+            overlap: 0.9,
+            children: vec![
+                b.leaf("x", "kx", serde_json::json!({})),
+                b.leaf("y", "ky", serde_json::json!({})),
+            ],
+        };
+        let tree = b.finish(root);
+        let flat = tree.flatten();
+        assert_eq!(
+            flat[0],
+            FlatCostNode::Parallel {
+                overlap: 0.9,
+                children: 1..3
+            }
+        );
+        let buf = [leaf(4.0, 10.0, 100.0), leaf(6.0, 20.0, 200.0)];
+        let mut scratch = Vec::new();
+        let total = CostTree::aggregate(&flat, &buf, &mut scratch).m;
+        assert_eq!(total.time_ms, 6.0 / 0.9);
+        assert_eq!(total.flops, 30.0);
+        assert_eq!(total.bytes, 300.0);
+        let json = serde_json::to_value(&tree.manifest().nodes[0]).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"Parallel": {"overlap": 0.9f32, "children": {"start": 1, "end": 3}}})
+        );
+        assert!(tree.describe().starts_with("Parallel{overlap=0.9}"));
+    }
+
+    #[test]
     fn aggregate_unions_coverage_flags_up_the_tree() {
         // One extrapolated leaf deep in the folded layer must surface at the root.
         let flat = sample().flatten();
@@ -747,6 +812,7 @@ w (PreAttnLocalWorklet) [local (1 GPU); qkv n=6144, k=4096]
             let range = match node {
                 FlatCostNode::Sum { children }
                 | FlatCostNode::Max { children, .. }
+                | FlatCostNode::Parallel { children, .. }
                 | FlatCostNode::Scale { children, .. } => children.clone(),
                 FlatCostNode::Leaf(_) => continue,
             };

@@ -1057,6 +1057,12 @@ fn tree_json(manifest: &Manifest, row: &ExactRow, node_index: usize) -> Result<V
             tree_children(manifest, row, children.clone())?,
             Some(("overlap", json!(overlap))),
         ),
+        FlatCostNode::Parallel { overlap, children } => container_json(
+            "parallel",
+            label,
+            tree_children(manifest, row, children.clone())?,
+            Some(("overlap", json!(overlap))),
+        ),
         FlatCostNode::Scale { n, children } => container_json(
             "scale",
             label,

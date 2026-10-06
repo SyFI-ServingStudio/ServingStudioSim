@@ -1,9 +1,10 @@
 //! Fold algorithm — the ladder's compute core, fed by [`super::prepare`].
 //!
 //! R0/R1 are exact SQL sums over every row ([`read_exact_worker_totals`]). R2..R5 fold
-//! a stride-sampled set of rows ([`accumulate_fold`]): the mean-mode fold is linear,
-//! so each rung is `Σ_slot α·value` with the precomputed per-slot weight `α`, one
-//! dot product per row. Unlocked analysis selects one grid throughput basis for
+//! a stride-sampled set of rows ([`accumulate_fold`]): each rung substitutes its
+//! leaf values and re-evaluates the section's tree with [`BalancedFold`] (rank
+//! `Max` → mean, stream `Parallel` → max), one tree walk per row for all four
+//! rungs. Unlocked analysis selects one grid throughput basis for
 //! R3 and reuses it for R5. Locked-batch analysis sets R3=R2 and selects R5's
 //! basis from each current leaf. The sampled sums land in each worker's
 //! accumulators and, per slot, in `(location, worker)` attribution cells.
@@ -15,6 +16,7 @@ use arrow_array::{Array, Float32Array, ListArray, RecordBatch, StringArray};
 use datafusion::prelude::SessionContext;
 
 use crate::session::{col, collect, value_f64};
+use crate::trace::manifest::BalancedFold;
 
 use super::prepare::SectionFoldPlan;
 use super::{MAX_STRIDE, TARGET_SAMPLED_ITERS};
@@ -132,8 +134,8 @@ pub(super) async fn choose_stride(ctx: &SessionContext) -> Result<u64> {
     Ok((num_iters / TARGET_SAMPLED_ITERS).clamp(1, MAX_STRIDE))
 }
 
-/// Fold the stride-sampled rows: per row `Σ_slot α·value` for R2..R5 into its
-/// worker, and the same per-slot contributions into `(location, worker)`.
+/// Fold the stride-sampled rows: per row the balanced R2..R5 tree values into its
+/// worker, and their per-leaf attribution into `(location, worker)`.
 pub(super) async fn accumulate_fold(
     ctx: &SessionContext,
     stride: u64,
@@ -210,6 +212,8 @@ async fn accumulate_fold_query(
 ) -> Result<u64> {
     let record_batches = collect(ctx, &sql).await?;
     let mut sampled_rows = 0u64;
+    let mut balanced_fold = BalancedFold::<4>::default();
+    let mut leaf_rungs_by_slot: Vec<[f64; 4]> = Vec::new();
     for batch in &record_batches {
         let pool_tags = string_column(batch, "pool_tag")?;
         let worker_ids = col(batch, "worker_id")?;
@@ -253,15 +257,14 @@ async fn accumulate_fold_query(
             sampled_rows += 1;
             workers[worker_index].sampled_busy_ms += value_f64(total_times, row)?.max(0.0);
 
+            if fold_plan.manifest.nodes.is_empty() {
+                continue;
+            }
             let (start, end) = (offsets[row] as usize, offsets[row + 1] as usize);
-            let mut row_rungs_ms = [0.0f64; 4];
-            for (slot, value_index) in (start..end).enumerate() {
-                let Some(&mean_fold_weight) = fold_plan.mean_fold_weight_by_slot.get(slot) else {
-                    break;
-                };
-                if mean_fold_weight == 0.0 {
-                    continue;
-                }
+            let num_slots = fold_plan.location_id_by_slot.len();
+            leaf_rungs_by_slot.clear();
+            leaf_rungs_by_slot.resize(num_slots, [0.0; 4]);
+            for (slot, value_index) in (start..end).enumerate().take(num_slots) {
                 let observed_time_ms = times.value(value_index) as f64;
                 let leaf_flops = flops.value(value_index) as f64;
                 let leaf_bytes = bytes.value(value_index) as f64;
@@ -299,7 +302,7 @@ async fn accumulate_fold_query(
                     )
                 };
                 // R2 real, R3 per-config-best, R4 drop-comm, R5 hardware.
-                let leaf_rungs_ms = [
+                leaf_rungs_by_slot[slot] = [
                     observed_time_ms,
                     per_config_best_ms,
                     if is_communication {
@@ -313,17 +316,24 @@ async fn accumulate_fold_query(
                         hardware_limit_ms
                     },
                 ];
-                let weighted_rungs_ms = leaf_rungs_ms.map(|value| mean_fold_weight * value);
-                for rung_index in 0..4 {
-                    row_rungs_ms[rung_index] += weighted_rungs_ms[rung_index];
-                }
-                let location_worker_rungs = sampled_rungs_by_location_worker
-                    .entry((fold_plan.location_id_by_slot[slot], worker_index))
-                    .or_insert([0.0; 4]);
-                for rung_index in 0..4 {
-                    location_worker_rungs[rung_index] += weighted_rungs_ms[rung_index];
-                }
             }
+            let row_rungs_ms = balanced_fold.fold(
+                &fold_plan.manifest,
+                0,
+                1.0,
+                &|slot| leaf_rungs_by_slot.get(slot).copied().unwrap_or([0.0; 4]),
+                &mut |slot, contribution_ms| {
+                    let Some(&location_id) = fold_plan.location_id_by_slot.get(slot) else {
+                        return;
+                    };
+                    let location_worker_rungs = sampled_rungs_by_location_worker
+                        .entry((location_id, worker_index))
+                        .or_insert([0.0; 4]);
+                    for rung_index in 0..4 {
+                        location_worker_rungs[rung_index] += contribution_ms[rung_index];
+                    }
+                },
+            );
             for rung_index in 0..4 {
                 workers[worker_index].sampled_rungs_ms[rung_index] += row_rungs_ms[rung_index];
             }
