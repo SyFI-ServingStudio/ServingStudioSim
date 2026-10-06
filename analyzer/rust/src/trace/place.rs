@@ -148,8 +148,13 @@ impl<'a> Placer<'a> {
                 w.end(track, t);
                 t - t0
             }
-            FlatCostNode::Max { overlap, children } => {
-                let label = self.label_or(idx, "max");
+            FlatCostNode::Max { overlap, children }
+            | FlatCostNode::Parallel { overlap, children } => {
+                let fallback = match &self.manifest.nodes[idx] {
+                    FlatCostNode::Parallel { .. } => "parallel",
+                    _ => "max",
+                };
+                let label = self.label_or(idx, fallback);
                 w.begin(track, t0, &label, &[]);
                 let dd = if self.expanded {
                     // Legacy fan-out: each branch on its own child-track lane, all
@@ -201,7 +206,9 @@ pub fn slice_pairs_per_iter(manifest: &Manifest) -> usize {
     fn count(manifest: &Manifest, idx: usize) -> usize {
         match &manifest.nodes[idx] {
             FlatCostNode::Leaf(_) => 1,
-            FlatCostNode::Sum { children } | FlatCostNode::Max { children, .. } => {
+            FlatCostNode::Sum { children }
+            | FlatCostNode::Max { children, .. }
+            | FlatCostNode::Parallel { children, .. } => {
                 1 + children.clone().map(|c| count(manifest, c)).sum::<usize>()
             }
             FlatCostNode::Scale { n, children } => {
@@ -230,7 +237,7 @@ pub fn critical_pairs_per_iter(manifest: &Manifest, slot_ns: &[i64]) -> usize {
                     .map(|c| count(manifest, c, slot_ns))
                     .sum::<usize>()
             }
-            FlatCostNode::Max { children, .. } => {
+            FlatCostNode::Max { children, .. } | FlatCostNode::Parallel { children, .. } => {
                 let crit = children
                     .clone()
                     .max_by_key(|&c| node_time(manifest, c, slot_ns))

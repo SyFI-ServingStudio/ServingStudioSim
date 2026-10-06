@@ -708,7 +708,7 @@ impl SparseBody {
         let ffn_allreduce_fused_norm = self.ffn_allreduce_fused_norm.compile(builder);
         let local_experts = CostNode::Labeled {
             label: format!("{}.moe.local_experts [SGLang dual stream]", self.name),
-            child: Box::new(CostNode::Max {
+            child: Box::new(CostNode::Parallel {
                 overlap: 1.0,
                 children: vec![shared_expert, CostNode::Sum(vec![routed_expert, finalize])],
             }),
@@ -1598,15 +1598,27 @@ mod tests {
         assert_eq!(resolved.lm_head.k, mtp_head.lm_head.k);
     }
 
-    fn count_max_nodes(node: &CostNode) -> usize {
+    /// `(rank Max, stream Parallel)` node counts.
+    fn count_fanout_nodes(node: &CostNode) -> (usize, usize) {
+        let sum_children = |children: &[CostNode]| {
+            children
+                .iter()
+                .map(count_fanout_nodes)
+                .fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1))
+        };
         match node {
-            CostNode::Leaf(_) => 0,
-            CostNode::Sum(children) => children.iter().map(count_max_nodes).sum(),
+            CostNode::Leaf(_) => (0, 0),
+            CostNode::Sum(children) => sum_children(children),
             CostNode::Max { children, .. } => {
-                1 + children.iter().map(count_max_nodes).sum::<usize>()
+                let (max, parallel) = sum_children(children);
+                (max + 1, parallel)
+            }
+            CostNode::Parallel { children, .. } => {
+                let (max, parallel) = sum_children(children);
+                (max, parallel + 1)
             }
             CostNode::Scale { child, .. } | CostNode::Labeled { child, .. } => {
-                count_max_nodes(child)
+                count_fanout_nodes(child)
             }
         }
     }
@@ -1616,8 +1628,9 @@ mod tests {
         let model = built(Glm52MtpMode::Off);
         let tree = model.cost_tree();
         // Three sparse section families are compiled once each. Their routed
-        // path includes finalize and overlaps the shared-expert path via Max.
-        assert_eq!(count_max_nodes(&tree.root), 3);
+        // path includes finalize and overlaps the shared-expert stream via
+        // Parallel; one symmetric rank has no rank Max.
+        assert_eq!(count_fanout_nodes(&tree.root), (0, 3));
         let description = tree.describe();
         assert!(description.contains("TP4 EP1; per-rank"));
         assert!(!description.contains("Max over 4 ranks"));

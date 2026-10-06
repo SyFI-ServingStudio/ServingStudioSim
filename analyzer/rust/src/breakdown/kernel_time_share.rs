@@ -1,11 +1,11 @@
 //! Run-wide kernel-time composition by semantic CostTree leaf position.
 //!
 //! The hot `cost_log` stores slot-aligned durations while the matching manifest
-//! owns each slot's semantic name and the Sum/Max/Scale aggregation tree. This
+//! owns each slot's semantic name and the Sum/Max/Parallel/Scale aggregation tree. This
 //! subject reconstructs an overlap-aware root attribution for every selected
 //! row, then rolls it up at three levels: `(pool_tag, worker_id)`, `pool_tag`, and
 //! the whole run. A Sum forwards attribution to every child, Scale multiplies its
-//! child, and Max forwards only to the row's critical child (equal critical
+//! child, and Max/Parallel forwards only to the row's critical child (equal critical
 //! children split the attribution). Therefore every emitted scope's position
 //! shares sum to 100% of that scope's CostTree root kernel time.
 //!
@@ -153,7 +153,8 @@ impl SectionPlan {
                 FlatCostNode::Sum { children } => {
                     children.clone().map(|child| self.node_times[child]).sum()
                 }
-                FlatCostNode::Max { overlap, children } => {
+                FlatCostNode::Max { overlap, children }
+                | FlatCostNode::Parallel { overlap, children } => {
                     let max_child = children
                         .clone()
                         .map(|child| self.node_times[child])
@@ -195,7 +196,8 @@ impl SectionPlan {
                     FlatCostNode::Scale { n, children } => {
                         self.node_weights[children.start] += weight * f64::from(*n);
                     }
-                    FlatCostNode::Max { overlap, children } => {
+                    FlatCostNode::Max { overlap, children }
+                    | FlatCostNode::Parallel { overlap, children } => {
                         let max_child = children
                             .clone()
                             .map(|child| self.node_times[child])
@@ -729,7 +731,9 @@ fn validate_tree(manifest: &Manifest) -> Result<()> {
                 }
                 continue;
             }
-            FlatCostNode::Sum { children } | FlatCostNode::Max { children, .. } => children,
+            FlatCostNode::Sum { children }
+            | FlatCostNode::Max { children, .. }
+            | FlatCostNode::Parallel { children, .. } => children,
             FlatCostNode::Scale { children, .. } => {
                 if children.end != children.start + 1 {
                     bail!("Scale node {idx} must own exactly one child");
@@ -787,7 +791,7 @@ fn definitions() -> Value {
         "kernel_time_ms": "exact DataFusion SUM(cost_log.total_time_ms) for the scope; sampled position mixtures are normalized to each worker's exact root total",
         "share_pct": "position-attributed kernel_time_ms / scope kernel_time_ms × 100; segments sum to 100%",
         "kinds": "the scope's segments summed by kernel kind, largest first; kinds sum to 100%",
-        "tree_attribution": "Sum forwards to all children; Scale multiplies its child; Max forwards to the critical child and divides by overlap; exactly tied critical children split evenly",
+        "tree_attribution": "Sum forwards to all children; Scale multiplies its child; Max and Parallel forward to the critical child and divide by overlap; exactly tied critical children split evenly",
         "levels": "workers are keyed by (pool_tag, worker_id); pools sum their workers; overall sums all pools",
         "sampling": "DataFusion first counts scalar rows per worker, then predicate/projection-pushes a worker-local regular iter_id stride into the heavy slot_time_ms scan; meta.exact=false marks estimates",
     })

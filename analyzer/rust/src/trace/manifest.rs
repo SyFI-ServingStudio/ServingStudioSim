@@ -108,6 +108,10 @@ pub enum FlatCostNode {
         overlap: f32,
         children: Range<usize>,
     },
+    Parallel {
+        overlap: f32,
+        children: Range<usize>,
+    },
     Scale {
         n: u32,
         children: Range<usize>,
@@ -157,7 +161,7 @@ impl ManifestDoc {
 
 /// Aggregate duration (ns) of the subtree rooted at node `idx`, folding this
 /// tree the same way the sim did to produce `total_time_ms`: Leaf = its slot,
-/// Sum = Σ children, Max = max(children)/overlap, Scale = n × child. Ancestor
+/// Sum = Σ children, Max/Parallel = max(children)/overlap, Scale = n × child. Ancestor
 /// `Scale`s are NOT applied (this is the node's own local fold). The root's
 /// value reproduces `total_time_ms` up to per-leaf ns rounding.
 ///
@@ -169,7 +173,7 @@ pub(crate) fn node_time(m: &Manifest, idx: usize, slot_ns: &[i64]) -> i64 {
     match &m.nodes[idx] {
         FlatCostNode::Leaf(slot) => slot_ns.get(*slot).copied().unwrap_or(0),
         FlatCostNode::Sum { children } => children.clone().map(|c| node_time(m, c, slot_ns)).sum(),
-        FlatCostNode::Max { overlap, children } => {
+        FlatCostNode::Max { overlap, children } | FlatCostNode::Parallel { overlap, children } => {
             let maxd = children
                 .clone()
                 .map(|c| node_time(m, c, slot_ns))
@@ -182,47 +186,151 @@ pub(crate) fn node_time(m: &Manifest, idx: usize, slot_ns: &[i64]) -> i64 {
     }
 }
 
-/// Balanced (perfect-parallelism) fold of the subtree at `idx`, streamed as
-/// per-leaf `(slot, weight)` visits rather than a single number. This is the
-/// **mean-mode** sibling of [`node_time`]: where `node_time` collapses a `Max`
-/// (parallel shards) to its straggler (`max/overlap`), this collapses it to the
-/// balanced average (`mean/overlap`) — modelling every shard's GPU doing an equal
-/// share, i.e. the imbalance-free lower bound the `optimality` subject wants.
+/// Balanced fold of a subtree for `R` rungs at once: each rung substitutes its
+/// own leaf values and re-evaluates the tree, with
+/// - `Max` (rank fan-out) folded to `mean/overlap`: every rank does an equal
+///   share, so the gap to `node_time`'s straggler is load imbalance;
+/// - `Parallel` (streams on one device) kept at `max/overlap`: nothing to
+///   balance, so the streams' overlap never reads as imbalance;
+/// - `Sum` = Σ, `Scale{n}` = n × child, as in [`node_time`].
 ///
-/// The fold is **linear** in the leaf values, so it factors into a per-leaf
-/// weight `α` (`∏ 1/(child_count·overlap)` over `Max` ancestors × `∏ n` over
-/// `Scale` ancestors) times that leaf's value. Emitting `(slot, α)` lets one walk
-/// serve every rung (real time, per-config-best, hardware roofline) and every
-/// aggregate (worker total + per-kernel attribution) — the caller multiplies `α`
-/// by whichever leaf value that rung/bucket needs. `visit` is called exactly once
-/// per `Leaf` node in the subtree.
-pub(crate) fn fold_mean<F: FnMut(usize, f64)>(
-    m: &Manifest,
-    idx: usize,
-    weight: f64,
-    visit: &mut F,
-) {
-    match &m.nodes[idx] {
-        FlatCostNode::Leaf(slot) => visit(*slot, weight),
-        FlatCostNode::Sum { children } => {
-            for c in children.clone() {
-                fold_mean(m, c, weight, visit);
-            }
+/// [`Self::fold`] returns the per-rung subtree value and attributes it to the
+/// leaves: `visit(slot, contribution)` runs once per `Leaf`, and the
+/// contributions sum to the value. Under a `Parallel` each rung's share goes to
+/// that rung's slowest child (exact ties split evenly), so a stream hidden
+/// behind another contributes 0 for that rung. The scratch is reused across
+/// calls; a fold allocates only when the tree grows.
+#[derive(Default)]
+pub(crate) struct BalancedFold<const R: usize> {
+    value_by_node: Vec<[f64; R]>,
+}
+
+impl<const R: usize> BalancedFold<R> {
+    pub(crate) fn fold(
+        &mut self,
+        m: &Manifest,
+        root: usize,
+        scale: f64,
+        leaf_value: &impl Fn(usize) -> [f64; R],
+        visit: &mut impl FnMut(usize, [f64; R]),
+    ) -> [f64; R] {
+        if self.value_by_node.len() < m.nodes.len() {
+            self.value_by_node.resize(m.nodes.len(), [0.0; R]);
         }
-        FlatCostNode::Max { overlap, children } => {
-            let count = children.len().max(1) as f64;
-            let ov = (*overlap as f64).max(1e-9);
-            let child_weight = weight / (count * ov);
-            for c in children.clone() {
-                fold_mean(m, c, child_weight, visit);
+        let value = self.evaluate(m, root, leaf_value);
+        self.attribute(m, root, [scale; R], visit);
+        value.map(|v| v * scale)
+    }
+
+    fn evaluate(
+        &mut self,
+        m: &Manifest,
+        idx: usize,
+        leaf_value: &impl Fn(usize) -> [f64; R],
+    ) -> [f64; R] {
+        let value = match &m.nodes[idx] {
+            FlatCostNode::Leaf(slot) => leaf_value(*slot),
+            FlatCostNode::Sum { children } => {
+                let mut sum = [0.0; R];
+                for c in children.clone() {
+                    add(&mut sum, self.evaluate(m, c, leaf_value));
+                }
+                sum
             }
-        }
-        // `Scale` applies its subtree `n` times on one timeline (num_layers); like
-        // `node_time` it recurses through `children.start` (the single child).
-        FlatCostNode::Scale { n, children } => {
-            fold_mean(m, children.start, weight * (*n as f64), visit);
+            FlatCostNode::Scale { n, children } => self
+                .evaluate(m, children.start, leaf_value)
+                .map(|v| v * f64::from(*n)),
+            FlatCostNode::Max { overlap, children } => {
+                let mut sum = [0.0; R];
+                for c in children.clone() {
+                    add(&mut sum, self.evaluate(m, c, leaf_value));
+                }
+                let divisor = children.len().max(1) as f64 * overlap_divisor(*overlap);
+                sum.map(|v| v / divisor)
+            }
+            FlatCostNode::Parallel { overlap, children } => {
+                let mut max = [0.0f64; R];
+                for c in children.clone() {
+                    let child = self.evaluate(m, c, leaf_value);
+                    for r in 0..R {
+                        max[r] = max[r].max(child[r]);
+                    }
+                }
+                let divisor = overlap_divisor(*overlap);
+                max.map(|v| v / divisor)
+            }
+        };
+        self.value_by_node[idx] = value;
+        value
+    }
+
+    /// Push `weight` (the ancestors' multiplier per rung) down to the leaves.
+    fn attribute(
+        &self,
+        m: &Manifest,
+        idx: usize,
+        weight: [f64; R],
+        visit: &mut impl FnMut(usize, [f64; R]),
+    ) {
+        match &m.nodes[idx] {
+            FlatCostNode::Leaf(slot) => {
+                let value = self.value_by_node[idx];
+                visit(*slot, std::array::from_fn(|r| weight[r] * value[r]));
+            }
+            FlatCostNode::Sum { children } => {
+                for c in children.clone() {
+                    self.attribute(m, c, weight, visit);
+                }
+            }
+            FlatCostNode::Scale { n, children } => {
+                self.attribute(m, children.start, weight.map(|w| w * f64::from(*n)), visit);
+            }
+            FlatCostNode::Max { overlap, children } => {
+                let divisor = children.len().max(1) as f64 * overlap_divisor(*overlap);
+                let child_weight = weight.map(|w| w / divisor);
+                for c in children.clone() {
+                    self.attribute(m, c, child_weight, visit);
+                }
+            }
+            FlatCostNode::Parallel { overlap, children } => {
+                let divisor = overlap_divisor(*overlap);
+                let mut max = [f64::NEG_INFINITY; R];
+                let mut ties = [0u32; R];
+                for c in children.clone() {
+                    let child = self.value_by_node[c];
+                    for r in 0..R {
+                        if child[r] > max[r] {
+                            max[r] = child[r];
+                            ties[r] = 1;
+                        } else if child[r] == max[r] {
+                            ties[r] += 1;
+                        }
+                    }
+                }
+                for c in children.clone() {
+                    let child = self.value_by_node[c];
+                    let child_weight = std::array::from_fn(|r| {
+                        if child[r] == max[r] {
+                            weight[r] / divisor / f64::from(ties[r])
+                        } else {
+                            0.0
+                        }
+                    });
+                    self.attribute(m, c, child_weight, visit);
+                }
+            }
         }
     }
+}
+
+fn add<const R: usize>(sum: &mut [f64; R], value: [f64; R]) {
+    for r in 0..R {
+        sum[r] += value[r];
+    }
+}
+
+fn overlap_divisor(overlap: f32) -> f64 {
+    f64::from(overlap).max(1e-9)
 }
 
 #[cfg(test)]
@@ -285,7 +393,7 @@ mod tests {
     }
 
     #[test]
-    fn fold_mean_is_linear_and_collapses_max_to_mean() {
+    fn balanced_fold_takes_the_mean_over_ranks() {
         // Sum[ Max{overlap:1}[ Leaf0, Leaf1 ], Scale{n:3}[ Leaf2 ] ].
         let m = Manifest {
             slots: Vec::new(), // slot descs unused by the fold
@@ -305,17 +413,80 @@ mod tests {
             ],
             node_labels: Vec::new(),
         };
-        // α: Leaf0/Leaf1 sit under Max/2 → 0.5 each; Leaf2 under Scale×3 → 3.
-        let mut alpha = [0.0f64; 3];
-        fold_mean(&m, 0, 1.0, &mut |slot, w| alpha[slot] += w);
-        assert_eq!(alpha, [0.5, 0.5, 3.0]);
-
-        // Mean-fold value: 0.5·t0 + 0.5·t1 + 3·t2 (mean over the Max pair), whereas
-        // node_time takes the Max (straggler) → max(t0,t1) + 3·t2.
         let slot_ns = [10i64, 20, 5];
-        let mean: f64 = (0..3).map(|i| alpha[i] * slot_ns[i] as f64).sum();
-        assert_eq!(mean, 0.5 * 10.0 + 0.5 * 20.0 + 3.0 * 5.0); // 30.0
+        let mut contribution = [0.0f64; 3];
+        let [balanced] = BalancedFold::<1>::default().fold(
+            &m,
+            0,
+            1.0,
+            &|slot| [slot_ns[slot] as f64],
+            &mut |slot, [c]| contribution[slot] += c,
+        );
+        // Mean over the Max pair: 0.5·t0 + 0.5·t1 + 3·t2, attributed per leaf,
+        // whereas node_time takes the Max (straggler) → max(t0,t1) + 3·t2.
+        assert_eq!(balanced, 0.5 * 10.0 + 0.5 * 20.0 + 3.0 * 5.0); // 30.0
+        assert_eq!(contribution, [5.0, 10.0, 15.0]);
         assert_eq!(node_time(&m, 0, &slot_ns), 20 + 3 * 5); // 35 (max branch)
+    }
+
+    #[test]
+    fn balanced_fold_keeps_parallel_streams_at_their_wallclock_per_rung() {
+        // Scale{2}[ Sum[ Parallel{overlap:0.5}[ Leaf0, Sum[Leaf1, Leaf2] ], Leaf3 ] ].
+        let m = Manifest {
+            slots: Vec::new(),
+            nodes: vec![
+                FlatCostNode::Scale {
+                    n: 2,
+                    children: 1..2,
+                },
+                FlatCostNode::Sum { children: 2..4 },
+                FlatCostNode::Parallel {
+                    overlap: 0.5,
+                    children: 4..6,
+                },
+                FlatCostNode::Leaf(3),
+                FlatCostNode::Leaf(0),
+                FlatCostNode::Sum { children: 6..8 },
+                FlatCostNode::Leaf(1),
+                FlatCostNode::Leaf(2),
+            ],
+            node_labels: Vec::new(),
+        };
+        // Rung 0: stream A (slot 0) = 8 is slower than B (1+2 = 3).
+        // Rung 1: A drops to 1, so B (3) becomes the critical stream.
+        // Rung 2: an exact tie (3 vs 3) splits evenly.
+        let leaf = [
+            [8.0, 1.0, 3.0],
+            [1.0, 1.0, 1.0],
+            [2.0, 2.0, 2.0],
+            [4.0, 4.0, 4.0],
+        ];
+        let mut contribution = [[0.0f64; 3]; 4];
+        let value =
+            BalancedFold::<3>::default().fold(&m, 0, 1.0, &|slot| leaf[slot], &mut |slot, c| {
+                for r in 0..3 {
+                    contribution[slot][r] += c[r];
+                }
+            });
+        assert_eq!(
+            value,
+            [
+                2.0 * (8.0 / 0.5 + 4.0),
+                2.0 * (3.0 / 0.5 + 4.0),
+                2.0 * (3.0 / 0.5 + 4.0)
+            ]
+        );
+        // The node equals node_time's wallclock: Parallel never reads as imbalance.
+        let slot_ns = [8i64, 1, 2, 4];
+        assert_eq!(node_time(&m, 0, &slot_ns) as f64, value[0]);
+        assert_eq!(contribution[0], [32.0, 0.0, 6.0]);
+        assert_eq!(contribution[1], [0.0, 4.0, 2.0]);
+        assert_eq!(contribution[2], [0.0, 8.0, 4.0]);
+        assert_eq!(contribution[3], [8.0, 8.0, 8.0]);
+        for r in 0..3 {
+            let total: f64 = contribution.iter().map(|c| c[r]).sum();
+            assert_eq!(total, value[r], "rung {r} contributions reconcile");
+        }
     }
 
     #[test]

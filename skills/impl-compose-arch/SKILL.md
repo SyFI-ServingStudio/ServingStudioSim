@@ -76,7 +76,9 @@ backends/algorithms = different arch files (no in-file if/match polymorphism).
   the order `cost_tree` minted them.
 - `gpu_name` is the single source of truth threaded into every kernel lookup.
 - Multi-rank fan-out uses `CostNode::Max` / `LeafMetrics` with overlap_factor `1.0`
-  at L4 — real <1.0 overlap only lives inside an L3 worklet.
+  at L4 — real <1.0 overlap only lives inside an L3 worklet. Concurrent streams
+  on one device (an auxiliary-stream branch) use `CostNode::Parallel`, never
+  `Max`: Optimality folds every `Max` to its mean and reports the gap as imbalance.
 - Preserve each worklet's source barriers and common spine. L4 may fold
   homogeneous layer repetition with `Scale`, but must not clone phase-specific
   trees, expand ranks/chunks into slots, or move children across a join. A
