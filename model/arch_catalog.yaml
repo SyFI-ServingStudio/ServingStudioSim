@@ -39,3 +39,7 @@ glm52_sglang_nvfp4_tp_dsa_moe:
   name: "SGLang, TP"
 glm53_flash_vllm_fp8_kda_dsa_moe:
   name: "vLLM, TP and EP"
+deepseek_v41_vllm:
+  name: "vLLM, TP attention, EP MoE"
+deepseek_v41_vllm_serial_streams:
+  name: "vLLM, TP attention, EP MoE, side streams serialized"

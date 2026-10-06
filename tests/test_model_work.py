@@ -2658,3 +2658,278 @@ def test_dflash2_stage_flop_and_byte_goldens(dflash2):
 def test_dflash2_rejects_a_sliding_window_the_checkpoint_does_not_have():
     with pytest.raises(ValueError, match="draft_sliding_window"):
         work_floors._dflash2_model(str(GLM52_NVFP4), str(GLM53_DFLASH2), 4096)
+
+
+# --------------------------------------------------------------------------- #
+# DeepSeek-V4.1-Flash: sliding-window + compressed sparse attention, mHC, engram
+# --------------------------------------------------------------------------- #
+# Hand-derived from DeepSeek's reference inference/model.py, the config, and the
+# checkpoint's safetensors headers (logical FP4 elements unpacked, scales not
+# parameters). The DSpark MTP layers and the vision tower are excluded.
+
+DSV41 = Path(__file__).resolve().parents[1] / "model" / "config" / "deepseek_v41_flash.json"
+DSV41_MAP = (
+    Path(__file__).resolve().parents[1]
+    / "model"
+    / "work"
+    / "location_maps"
+    / "deepseek_v41_vllm_tp4_ep4_unified.json"
+)
+V41_H, V41_V, V41_Q, V41_HD, V41_NH, V41_OL, V41_OG = 5120, 129280, 1280, 512, 64, 1024, 8
+V41_E, V41_K, V41_I = 384, 6, 2304
+V41_IH, V41_ID, V41_TOPK, V41_W, V41_HC, V41_MIX = 32, 128, 512, 128, 4, 24
+V41_CAND = 2048 * 8
+V41_ENGRAM_ROWS = (384_006_168, 384_016_682)
+V41_ENGRAM_COLS = 3 * 8  # (max_ngram 4 - 1) n-grams x 8 heads
+V41_ATTN_MM = (
+    V41_Q * V41_H  # wq_a
+    + V41_NH * V41_HD * V41_Q  # wq_b
+    + V41_HD * V41_H  # wkv
+    + V41_OG * V41_OL * (V41_NH * V41_HD // V41_OG)  # block-diagonal wo_a
+    + V41_H * V41_OG * V41_OL  # wo_b
+)
+V41_ATTN_VEC = V41_Q + V41_HD + V41_NH  # q_norm, kv_norm, attn_sink
+V41_COMP2 = 2 * V41_HD * V41_H + V41_HD  # compressor wkv + wgate + norm (ratio 2)
+V41_COMP1 = V41_HD * V41_H + V41_HD  # compressor wkv + norm (ratio 1)
+V41_IDX_Q = V41_IH * V41_ID * V41_Q + V41_IH * V41_H  # indexer wq_b + weights_proj
+V41_IDX_OWNER = V41_IDX_Q + V41_ID * V41_HD + V41_ID  # + wk + k_norm
+V41_MHC = 2 * (V41_MIX * V41_HC * V41_H + V41_MIX + 3)  # fn, base, scale per sublayer
+V41_EXPERT = 3 * V41_I * V41_H
+V41_LAYER = (
+    V41_ATTN_MM
+    + V41_ATTN_VEC
+    + 2 * V41_H  # attn_norm, ffn_norm
+    + V41_MHC
+    + V41_E * V41_H  # router
+    + V41_E  # router selection bias
+    + V41_E * V41_EXPERT
+    + V41_EXPERT  # shared expert
+)
+V41_ENGRAM_WKV = V41_H * (V41_HC + 1) * V41_ENGRAM_COLS * 256
+V41_ENGRAM = sum(V41_ENGRAM_ROWS) * 256 + 2 * (V41_ENGRAM_WKV + 2 * V41_HC * V41_H)
+
+
+@pytest.fixture(scope="module")
+def dsv41():
+    return load_model(DSV41)
+
+
+def test_dsv41_parameter_goldens_reconcile_with_the_checkpoint(dsv41):
+    label = dsv41.label(Workload(matmul_tokens=0, head_positions=0))
+    total = (
+        40 * V41_LAYER
+        + 3 * V41_COMP2
+        + V41_COMP1
+        + 4 * V41_IDX_OWNER
+        + 4 * V41_IDX_Q
+        + V41_ENGRAM
+        + 2 * V41_V * V41_H  # embed + untied head
+        + V41_H  # final norm
+    )
+    # Sum of every non-vision, non-mtp, non-scale safetensors tensor (I8 FP4
+    # packs x2), minus the image-only router bias_vl: 763,205,315,794 - MTP
+    # 14,225,362,530 - vision/aligner/image tokens 485,268,480 - bias_vl 15,360.
+    assert total == 763_205_315_794 - 14_225_362_530 - 485_268_480 - 15_360
+    assert label.params["total"] == total == 748_494_669_424
+    active_layers = (
+        40 * (V41_LAYER - V41_E * V41_EXPERT + V41_K * V41_EXPERT)
+        + 3 * V41_COMP2
+        + V41_COMP1
+        + 4 * V41_IDX_OWNER
+        + 4 * V41_IDX_Q
+        + 2 * (V41_ENGRAM_WKV + 2 * V41_HC * V41_H + V41_ENGRAM_COLS * 256)  # hashed rows only
+        + V41_H
+    )
+    assert label.params["activated"]["layers"] == active_layers == 15_468_672_112
+    assert label.params["activated"]["with_embed_head"] == active_layers + 2 * V41_V * V41_H
+    breakdown = label.params["breakdown"]
+    assert breakdown["experts"] == 40 * V41_E * V41_EXPERT == 543_581_798_400
+    assert breakdown["engram"] == V41_ENGRAM == 196_928_504_320
+    assert breakdown["mhc"] == 40 * V41_MHC
+    assert sum(breakdown.values()) == total
+    assert compute_parameter_counts(DSV41)["total"] == total
+
+
+def test_dsv41_weight_bytes_reconcile_with_the_checkpoint(dsv41):
+    # MXFP4 experts: half a byte per weight plus one E8M0 byte per 32 along K.
+    expert_bytes = V41_EXPERT // 2 + (2 * V41_I * V41_H + V41_H * V41_I) // 32
+    assert expert_bytes == 17_694_720 + 1_105_920
+    # 278.6 GB quoted for the checkpoint's packed experts = 40x384 body experts
+    # plus 3x128 DSpark experts, values only.
+    assert (40 * V41_E + 3 * 128) * V41_EXPERT // 2 == 278_585_671_680
+    # 196.9 GB quoted for engram = both FP8 tables plus both wkv, values only.
+    assert sum(V41_ENGRAM_ROWS) * 256 + 2 * V41_ENGRAM_WKV == 196_928_422_400
+    # A 2048-token batch hits every expert, so its weight floor reads all of them.
+    label = dsv41.label(Workload.causal_lm(prefill=[(2048, 0)], sampled=1))
+    by_name = {segment.name: segment for segment in label.segments}
+    experts = sum(
+        segment.bytes_total
+        for name, segment in by_name.items()
+        if name.endswith(("expert_gate_up", "expert_down")) and "shared" not in name
+    )
+    loaded = V41_E * (1 - (1 - 1 / V41_E) ** (2048 * V41_K))
+    assert experts == pytest.approx(40 * loaded * expert_bytes, rel=1e-12)
+    # FP8 32x32 blocks with one E8M0 byte each; FP32 mixing; gathered engram rows.
+    assert by_name["l0_swa.wq_a"].bytes == V41_Q * V41_H + (V41_Q // 32) * (V41_H // 32)
+    assert by_name["l0_swa.wo_a"].bytes == V41_OG * (V41_OL * 4096 + 32 * 128)
+    assert by_name["l0_swa.router"].bytes == V41_E * V41_H * 2
+    assert by_name["l0_swa.mhc_attn.fn"].bytes == V41_MIX * V41_HC * V41_H * 4
+    assert by_name["l1_swa_engram.engram.table"].bytes == 2048 * V41_ENGRAM_COLS * 264
+    assert by_name["lm_head"].bytes == V41_V * V41_H * 2
+
+
+def _dsv41_attention_expectations(prefill: bool):
+    """(attn pairs by ratio, index pairs by role, kv bytes) for the two goldens."""
+    if prefill:  # one 2048-token chunk, no prefix
+        window = V41_W * (V41_W + 1) // 2 + (2048 - V41_W) * V41_W
+        # sum_j min(512, j // 2): floor sum to j=1023, then 1025 saturated queries.
+        ratio2 = (2 * 511 * 510 // 2 + 511 * 2) + 1025 * V41_TOPK
+        ratio1 = V41_TOPK * (V41_TOPK + 1) // 2 + (2048 - V41_TOPK) * V41_TOPK
+        index2 = 1024 * 1024  # sum_j j // 2
+        index1 = 2048 * 2049 // 2  # below the 16384-position candidate cap
+        kv = (
+            40 * V41_W * 528  # ring keeps only the last window of the chunk
+            + (3 * 1024 + 2048) * 288  # new compressed latents
+            + (3 * 1024 + 2048) * 68  # new index keys
+        )  # no cached reads, no carried partial group (2048 is even)
+    else:  # one decode token at kv_len 4096 (4095 cached)
+        window = V41_W
+        ratio2 = V41_TOPK  # min(512, 4096 // 2)
+        ratio1 = V41_TOPK
+        index2 = 4096 // 2
+        index1 = 4096
+        reads = (
+            40 * (V41_W - 1) * 528
+            + 38 * V41_TOPK * 288
+            + 3 * (4095 // 2) * 68  # ratio-2 owners score every cached entry
+            + 5 * 4095 * 68  # layer 20 and the four candidate consumers
+        )
+        appends = 40 * 528 + 4 * 288 + 4 * 68
+        kv = reads + appends + 3 * 4096  # position 4095 completes a pair: one state read
+    attn_pairs = 2 * window + 18 * (window + ratio2) + 20 * (window + ratio1)
+    index_pairs = 3 * index2 + 5 * index1
+    return attn_pairs, index_pairs, kv
+
+
+@pytest.mark.parametrize("prefill", [False, True])
+def test_dsv41_flop_and_state_goldens(dsv41, prefill):
+    tokens = 2048 if prefill else 1
+    workload = (
+        Workload.causal_lm(prefill=[(2048, 0)], sampled=1)
+        if prefill
+        else Workload.causal_lm(decode=[4096], sampled=1)
+    )
+    label = dsv41.label(workload)
+    attn_pairs, index_pairs, kv = _dsv41_attention_expectations(prefill)
+    new_latents = 3 * 1024 + 2048 if prefill else 4
+    expected = {
+        "attn_proj": 2
+        * tokens
+        * (40 * V41_ATTN_MM + 3 * 2 * V41_HD * V41_H + V41_HD * V41_H + 8 * V41_IDX_Q)
+        + 2 * new_latents * V41_ID * V41_HD,  # indexer wk runs per new latent
+        "attn_internal": 2 * V41_NH * (2 * V41_HD) * attn_pairs + 2 * V41_IH * V41_ID * index_pairs,
+        "ffn": 2 * tokens * 40 * (V41_K + 1) * V41_EXPERT,
+        "router": 2 * tokens * 40 * V41_E * V41_H,
+        "lm_head": 2 * V41_V * V41_H,
+        "mhc": 2 * tokens * 80 * V41_MIX * V41_HC * V41_H,
+        "engram": 2 * tokens * 2 * V41_ENGRAM_WKV,
+    }
+    assert label.flops == expected
+    if prefill:
+        assert label.flops_total == 69_062_896_386_048
+    else:
+        assert label.flops_total == 35_699_294_208
+    assert label.bytes["kv"] == kv
+
+
+def test_dsv41_collapsed_analyzer_geometry_matches_exact_single_requests(dsv41):
+    """floors.py sends one summed interaction per phase; one request is exact."""
+    for totals, exact in (
+        (
+            {"matmul_tokens": 1, "prefill_tokens": 0, "decode_passes": 1, "prefill_pairs": 0,
+             "prefill_cached": 0, "decode_kv": 4096, "prefill_requests": 0},
+            Workload.causal_lm(decode=[4096], sampled=1),
+        ),
+        (
+            {"matmul_tokens": 2048, "prefill_tokens": 2048, "decode_passes": 0,
+             "prefill_pairs": 2048 * 2049 // 2, "prefill_cached": 0, "decode_kv": 0,
+             "prefill_requests": 1},
+            Workload.causal_lm(prefill=[(2048, 0)], sampled=1),
+        ),
+    ):
+        collapsed = dsv41.label(work_floors._aggregate_workload(totals))
+        direct = dsv41.label(exact)
+        assert {s.name: (s.flops_total, s.bytes_total) for s in collapsed.segments} == {
+            s.name: (s.flops_total, s.bytes_total) for s in direct.segments
+        }
+
+
+def test_dsv41_sparse_caps_and_candidate_restriction(dsv41):
+    long_decode = dsv41.label(Workload.causal_lm(decode=[65_536], sampled=1))
+    rows = {segment.name: segment for segment in long_decode.segments}
+    # Attention saturates at window + top-k regardless of context.
+    assert rows["c1_share.attn.decode"].flops == 2 * V41_NH * 2 * V41_HD * (V41_W + V41_TOPK)
+    # Layer 20 scores every entry; the candidate consumers only 2048 blocks x 8.
+    assert rows["c1_source_candidate.indexer.decode"].flops == 2 * V41_IH * V41_ID * 65_536
+    assert rows["c1_candidate_index.indexer.decode"].flops == 2 * V41_IH * V41_ID * V41_CAND
+    assert rows["c1_candidate_index.indexer.decode"].bytes == V41_CAND * 68
+    # A ratio-2 decode token makes exactly one carried-group transaction.
+    for kv_len in (4096, 4097):
+        label = dsv41.label(Workload.causal_lm(decode=[kv_len], sampled=1))
+        state = {s.name: s for s in label.segments}["c2_source.compressor_state"]
+        assert state.bytes == 2 * V41_HD * 4
+    # Every semantic row exists at zero work, so row sets never depend on the batch.
+    empty = {s.name for s in dsv41.label(Workload.causal_lm(decode=[4096])).segments}
+    mixed = {
+        s.name for s in dsv41.label(Workload.causal_lm(prefill=[(7, 3)], decode=[9])).segments
+    }
+    assert empty == mixed
+
+
+def test_dsv41_excludes_mtp_and_vision_and_keeps_bf16_modules(dsv41):
+    assert dsv41.num_layers == 40
+    assert [stack.count for stack in dsv41.layers] == [1, 1, 2, 10, 1, 5, 1, 12, 4, 3]
+    label = dsv41.label(Workload.causal_lm(decode=[4096], sampled=1))
+    dtypes = {segment.name: segment.compute_dtype for segment in label.segments}
+    assert dtypes["c2_source.compressor.wkv"] == "bf16"
+    assert dtypes["c2_source.indexer.weights_proj"] == "bf16"
+    assert dtypes["l0_swa.router"] == "bf16"
+    assert dtypes["lm_head"] == "bf16"
+    assert dtypes["l0_swa.expert_gate_up"] == "fp8"  # MXFP4 weights x FP8 activations
+    assert dtypes["l0_swa.shared_down"] == "fp8"
+    assert not any(name.startswith(("mtp", "dspark", "vision")) for name in dtypes)
+
+
+def test_dsv41_location_map_consumes_every_semantic_once(dsv41):
+    location_map = json.loads(DSV41_MAP.read_text())
+    assert location_map["schema_version"] == 1
+    assert location_map["mapping_id"] == "deepseek-v41-vllm-tp4-ep4-unified-v1"
+    assert location_map["arch_types"] == ["deepseek_v41_vllm"]
+    locations = [row["location"] for row in location_map["locations"]]
+    mapped = [semantic for row in location_map["locations"] for semantic in row["semantics"]]
+    assert len(locations) == len(set(locations)) == 292
+    assert len(mapped) == len(set(mapped))
+    for workload in (
+        Workload.causal_lm(decode=[4096] * 3, sampled=3),
+        Workload.causal_lm(prefill=[(2048, 0)], sampled=1),
+        work_floors._aggregate_workload(
+            {"matmul_tokens": 2048, "prefill_tokens": 2003, "decode_passes": 45,
+             "prefill_pairs": 1_829_000, "prefill_cached": 4005, "decode_kv": 83_176,
+             "prefill_requests": 2}
+        ),
+    ):
+        assert set(mapped) == {segment.name for segment in dsv41.label(workload).segments}
+    semantics = {row["location"]: row["semantics"] for row in location_map["locations"]}
+    assert semantics["unified.layer20.attn.indexer.score.candidates"] == []
+    assert semantics["unified.layer24.attn.indexer.score.decode_logits"] == [
+        "c1_candidate_index.indexer.decode"
+    ]
+    assert semantics["unified.engram_prefetch.layer14.engram_lookup"] == [
+        "c2_source_engram.engram.table"
+    ]
+    assert semantics["unified.layer2.ffn.routed.fused_moe"] == [
+        "c2_source.expert_gate_up",
+        "c2_source.expert_down",
+    ]
+    assert not any("all_reduce" in location or "all_gather" in location for location in locations)
+    assert sum(not row["semantics"] for row in location_map["locations"]) == 99

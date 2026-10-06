@@ -69,6 +69,15 @@ library used by the matching alignment run. Environment validation fails before
 acquiring a GPU when the link is absent; the execution layer prepends it to
 `LD_LIBRARY_PATH` before Torch's libraries.
 
+`vllm_upstream_fork_env` is a host env: the alignment checkout
+`alignment/profiler/vllm` (or `$VIBESIM_VLLM_FORK_ROOT`) and its own `.venv`. It
+serves the backends that need that checkout rebased onto upstream vLLM (its
+models and newer FlashInfer, DeepGEMM and FlashMLA builds), which the
+`vllm_env` image, built from fork commit 3f667d7, lacks. The worker drops
+inherited site-packages from `PYTHONPATH`, so the project Torch cannot shadow
+the venv's own build. Once the container is rebuilt from the rebased checkout,
+move those backends to `vllm_env` and remove this env.
+
 `Timer.cupti`'s duration path is a two-pass GPU-active-time measurement. It
 first records 10 real callable launches, computes
 `ceil(min_duration_ms / estimate_mean_ms)`, then records exactly that many
@@ -78,7 +87,10 @@ active-time estimate requests more launches. The default cap is 50,000 launches.
 By default, both passes run a
 read-only reduction over a 64 MiB (or
 `2 × reported L2`, whichever is larger) FP32 tensor before every logical
-callable launch. The reduction's CUPTI records validate ordering but are
+callable launch. Before 2026-09-25 the L2 size was read from a misspelled
+Torch attribute and always fell back to 64 MiB, so rows profiled earlier on a
+GPU with more than 32 MiB of L2 (H100, H200, B200) carry a warm-cache bias;
+refill such rows with `--force` before trusting small-kernel timings. The reduction's CUPTI records validate ordering but are
 excluded from the callable time. This clean-line displacement avoids the dirty
 writeback artifact of memset/`zero_()`; it remains a cold-ish preconditioner,
 not a hardware invalidate. `Timer.cupti(clear_l2=False)` is the explicit

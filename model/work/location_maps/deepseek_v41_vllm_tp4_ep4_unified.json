@@ -1,0 +1,1647 @@
+{
+  "schema_version": 1,
+  "mapping_id": "deepseek-v41-vllm-tp4-ep4-unified-v1",
+  "arch_types": [
+    "deepseek_v41_vllm"
+  ],
+  "locations": [
+    {
+      "location": "unified.prologue.embedding",
+      "semantics": [
+        "embedding"
+      ]
+    },
+    {
+      "location": "unified.prologue.engram_hash",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer0.attn.entry.hc_expand",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer0.attn.entry.mhc_hc_prenorm",
+      "semantics": [
+        "l0_swa.mhc_attn.fn"
+      ]
+    },
+    {
+      "location": "unified.layer0.attn.entry.mhc_pre_big_fuse",
+      "semantics": [
+        "l0_swa.mhc_attn.mix",
+        "l0_swa.attn_norm"
+      ]
+    },
+    {
+      "location": "unified.layer0.attn.input.fused_wqa_wkv",
+      "semantics": [
+        "l0_swa.wq_a",
+        "l0_swa.wkv"
+      ]
+    },
+    {
+      "location": "unified.layer0.attn.main.qk_rmsnorm",
+      "semantics": [
+        "l0_swa.q_norm",
+        "l0_swa.kv_norm"
+      ]
+    },
+    {
+      "location": "unified.layer0.attn.main.wq_b",
+      "semantics": [
+        "l0_swa.wq_b"
+      ]
+    },
+    {
+      "location": "unified.layer0.attn.main.kv_insert",
+      "semantics": [
+        "l0_swa.window_cache_append"
+      ]
+    },
+    {
+      "location": "unified.layer0.attn.attention.mega_attn.prefill",
+      "semantics": [
+        "l0_swa.attn.prefill"
+      ]
+    },
+    {
+      "location": "unified.layer0.attn.attention.mega_attn.decode",
+      "semantics": [
+        "l0_swa.attn.decode",
+        "l0_swa.attn_sink"
+      ]
+    },
+    {
+      "location": "unified.layer0.attn.output.wo_a_einsum",
+      "semantics": [
+        "l0_swa.wo_a"
+      ]
+    },
+    {
+      "location": "unified.layer0.attn.output.wo_b",
+      "semantics": [
+        "l0_swa.wo_b"
+      ]
+    },
+    {
+      "location": "unified.layer0.ffn.entry.mega_mhc_post_pre",
+      "semantics": [
+        "l0_swa.mhc_ffn.fn",
+        "l0_swa.mhc_ffn.mix",
+        "l0_swa.ffn_norm"
+      ]
+    },
+    {
+      "location": "unified.layer0.ffn.routed.router_gate",
+      "semantics": [
+        "l0_swa.router"
+      ]
+    },
+    {
+      "location": "unified.layer0.ffn.routed.topk",
+      "semantics": [
+        "l0_swa.router_bias"
+      ]
+    },
+    {
+      "location": "unified.layer0.ffn.routed.input_quant",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer0.ffn.routed.fused_moe",
+      "semantics": [
+        "l0_swa.expert_gate_up",
+        "l0_swa.expert_down"
+      ]
+    },
+    {
+      "location": "unified.layer0.ffn.shared.gate_up",
+      "semantics": [
+        "l0_swa.shared_gate_up"
+      ]
+    },
+    {
+      "location": "unified.layer0.ffn.shared.act_and_mul",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer0.ffn.shared.down",
+      "semantics": [
+        "l0_swa.shared_down"
+      ]
+    },
+    {
+      "location": "unified.layer0.ffn.shared.gate_up.serial",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer0.ffn.shared.act_and_mul.serial",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer0.ffn.shared.down.serial",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer0.ffn.residual_add",
+      "semantics": []
+    },
+    {
+      "location": "unified.engram_prefetch.layer1.engram_lookup",
+      "semantics": [
+        "l1_swa_engram.engram.table"
+      ]
+    },
+    {
+      "location": "unified.engram_prefetch.layer14.engram_lookup",
+      "semantics": [
+        "c2_source_engram.engram.table"
+      ]
+    },
+    {
+      "location": "unified.layer1.engram.mhc_post",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer1.engram.gather_copy",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer1.engram.wkv",
+      "semantics": [
+        "l1_swa_engram.engram.wkv"
+      ]
+    },
+    {
+      "location": "unified.layer1.engram.post_wkv",
+      "semantics": [
+        "l1_swa_engram.engram.gate_weights"
+      ]
+    },
+    {
+      "location": "unified.layer1.engram.mhc_hc_prenorm",
+      "semantics": [
+        "l1_swa_engram.mhc_attn.fn"
+      ]
+    },
+    {
+      "location": "unified.layer1.engram.mhc_pre_big_fuse",
+      "semantics": [
+        "l1_swa_engram.mhc_attn.mix",
+        "l1_swa_engram.attn_norm"
+      ]
+    },
+    {
+      "location": "unified.layer1.attn.input.fused_wqa_wkv",
+      "semantics": [
+        "l1_swa_engram.wq_a",
+        "l1_swa_engram.wkv"
+      ]
+    },
+    {
+      "location": "unified.layer1.attn.main.qk_rmsnorm",
+      "semantics": [
+        "l1_swa_engram.q_norm",
+        "l1_swa_engram.kv_norm"
+      ]
+    },
+    {
+      "location": "unified.layer1.attn.main.wq_b",
+      "semantics": [
+        "l1_swa_engram.wq_b"
+      ]
+    },
+    {
+      "location": "unified.layer1.attn.main.kv_insert",
+      "semantics": [
+        "l1_swa_engram.window_cache_append"
+      ]
+    },
+    {
+      "location": "unified.layer1.attn.attention.mega_attn.prefill",
+      "semantics": [
+        "l1_swa_engram.attn.prefill"
+      ]
+    },
+    {
+      "location": "unified.layer1.attn.attention.mega_attn.decode",
+      "semantics": [
+        "l1_swa_engram.attn.decode",
+        "l1_swa_engram.attn_sink"
+      ]
+    },
+    {
+      "location": "unified.layer1.attn.output.wo_a_einsum",
+      "semantics": [
+        "l1_swa_engram.wo_a"
+      ]
+    },
+    {
+      "location": "unified.layer1.attn.output.wo_b",
+      "semantics": [
+        "l1_swa_engram.wo_b"
+      ]
+    },
+    {
+      "location": "unified.layer1.ffn.entry.mega_mhc_post_pre",
+      "semantics": [
+        "l1_swa_engram.mhc_ffn.fn",
+        "l1_swa_engram.mhc_ffn.mix",
+        "l1_swa_engram.ffn_norm"
+      ]
+    },
+    {
+      "location": "unified.layer1.ffn.routed.router_gate",
+      "semantics": [
+        "l1_swa_engram.router"
+      ]
+    },
+    {
+      "location": "unified.layer1.ffn.routed.topk",
+      "semantics": [
+        "l1_swa_engram.router_bias"
+      ]
+    },
+    {
+      "location": "unified.layer1.ffn.routed.input_quant",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer1.ffn.routed.fused_moe",
+      "semantics": [
+        "l1_swa_engram.expert_gate_up",
+        "l1_swa_engram.expert_down"
+      ]
+    },
+    {
+      "location": "unified.layer1.ffn.shared.gate_up",
+      "semantics": [
+        "l1_swa_engram.shared_gate_up"
+      ]
+    },
+    {
+      "location": "unified.layer1.ffn.shared.act_and_mul",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer1.ffn.shared.down",
+      "semantics": [
+        "l1_swa_engram.shared_down"
+      ]
+    },
+    {
+      "location": "unified.layer1.ffn.shared.gate_up.serial",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer1.ffn.shared.act_and_mul.serial",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer1.ffn.shared.down.serial",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer1.ffn.residual_add",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer2.attn.entry.mega_mhc_post_pre",
+      "semantics": [
+        "c2_source.mhc_attn.fn",
+        "c2_source.mhc_attn.mix",
+        "c2_source.attn_norm"
+      ]
+    },
+    {
+      "location": "unified.layer2.attn.input.fused_wqa_wkv",
+      "semantics": [
+        "c2_source.wq_a",
+        "c2_source.wkv"
+      ]
+    },
+    {
+      "location": "unified.layer2.attn.compressor.kv_score_proj",
+      "semantics": [
+        "c2_source.compressor.wkv",
+        "c2_source.compressor.wgate"
+      ]
+    },
+    {
+      "location": "unified.layer2.attn.indexer.weights_proj",
+      "semantics": [
+        "c2_source.indexer.weights_proj"
+      ]
+    },
+    {
+      "location": "unified.layer2.attn.compressor.kv_score_proj.serial",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer2.attn.indexer.weights_proj.serial",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer2.attn.main.qk_rmsnorm",
+      "semantics": [
+        "c2_source.q_norm",
+        "c2_source.kv_norm"
+      ]
+    },
+    {
+      "location": "unified.layer2.attn.main.wq_b",
+      "semantics": [
+        "c2_source.wq_b"
+      ]
+    },
+    {
+      "location": "unified.layer2.attn.main.kv_insert",
+      "semantics": [
+        "c2_source.window_cache_append"
+      ]
+    },
+    {
+      "location": "unified.layer2.attn.compressor.save_compress_norm",
+      "semantics": [
+        "c2_source.compressor.norm",
+        "c2_source.compressor_state"
+      ]
+    },
+    {
+      "location": "unified.layer2.attn.compressor.save_compress_norm.serial",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer2.attn.indexer.wk",
+      "semantics": [
+        "c2_source.indexer.wk"
+      ]
+    },
+    {
+      "location": "unified.layer2.attn.indexer.k_store",
+      "semantics": [
+        "c2_source.indexer.k_norm",
+        "c2_source.index_cache_append"
+      ]
+    },
+    {
+      "location": "unified.layer2.attn.indexer.wq_b",
+      "semantics": [
+        "c2_source.indexer.wq_b"
+      ]
+    },
+    {
+      "location": "unified.layer2.attn.indexer.q_rope_quant",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer2.attn.compressor.nvfp4_insert",
+      "semantics": [
+        "c2_source.compressed_cache_append"
+      ]
+    },
+    {
+      "location": "unified.layer2.attn.compressor.nvfp4_insert.serial",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer2.attn.indexer.score.prefill_k_gather",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer2.attn.indexer.score.prefill_logits",
+      "semantics": [
+        "c2_source.indexer.prefill"
+      ]
+    },
+    {
+      "location": "unified.layer2.attn.indexer.score.prefill_topk",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer2.attn.indexer.score.decode_logits",
+      "semantics": [
+        "c2_source.indexer.decode"
+      ]
+    },
+    {
+      "location": "unified.layer2.attn.indexer.score.decode_topk",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer2.attn.attention.mega_attn.prefill",
+      "semantics": [
+        "c2_source.attn.prefill"
+      ]
+    },
+    {
+      "location": "unified.layer2.attn.attention.mega_attn.decode",
+      "semantics": [
+        "c2_source.attn.decode",
+        "c2_source.attn_sink"
+      ]
+    },
+    {
+      "location": "unified.layer2.attn.output.wo_a_einsum",
+      "semantics": [
+        "c2_source.wo_a"
+      ]
+    },
+    {
+      "location": "unified.layer2.attn.output.wo_b",
+      "semantics": [
+        "c2_source.wo_b"
+      ]
+    },
+    {
+      "location": "unified.layer2.ffn.entry.mega_mhc_post_pre",
+      "semantics": [
+        "c2_source.mhc_ffn.fn",
+        "c2_source.mhc_ffn.mix",
+        "c2_source.ffn_norm"
+      ]
+    },
+    {
+      "location": "unified.layer2.ffn.routed.router_gate",
+      "semantics": [
+        "c2_source.router"
+      ]
+    },
+    {
+      "location": "unified.layer2.ffn.routed.topk",
+      "semantics": [
+        "c2_source.router_bias"
+      ]
+    },
+    {
+      "location": "unified.layer2.ffn.routed.input_quant",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer2.ffn.routed.fused_moe",
+      "semantics": [
+        "c2_source.expert_gate_up",
+        "c2_source.expert_down"
+      ]
+    },
+    {
+      "location": "unified.layer2.ffn.shared.gate_up",
+      "semantics": [
+        "c2_source.shared_gate_up"
+      ]
+    },
+    {
+      "location": "unified.layer2.ffn.shared.act_and_mul",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer2.ffn.shared.down",
+      "semantics": [
+        "c2_source.shared_down"
+      ]
+    },
+    {
+      "location": "unified.layer2.ffn.shared.gate_up.serial",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer2.ffn.shared.act_and_mul.serial",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer2.ffn.shared.down.serial",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer2.ffn.residual_add",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer3.attn.entry.mega_mhc_post_pre",
+      "semantics": [
+        "c2_share.mhc_attn.fn",
+        "c2_share.mhc_attn.mix",
+        "c2_share.attn_norm"
+      ]
+    },
+    {
+      "location": "unified.layer3.attn.input.fused_wqa_wkv",
+      "semantics": [
+        "c2_share.wq_a",
+        "c2_share.wkv"
+      ]
+    },
+    {
+      "location": "unified.layer3.attn.main.qk_rmsnorm",
+      "semantics": [
+        "c2_share.q_norm",
+        "c2_share.kv_norm"
+      ]
+    },
+    {
+      "location": "unified.layer3.attn.main.wq_b",
+      "semantics": [
+        "c2_share.wq_b"
+      ]
+    },
+    {
+      "location": "unified.layer3.attn.main.kv_insert",
+      "semantics": [
+        "c2_share.window_cache_append"
+      ]
+    },
+    {
+      "location": "unified.layer3.attn.attention.mega_attn.prefill",
+      "semantics": [
+        "c2_share.attn.prefill"
+      ]
+    },
+    {
+      "location": "unified.layer3.attn.attention.mega_attn.decode",
+      "semantics": [
+        "c2_share.attn.decode",
+        "c2_share.attn_sink"
+      ]
+    },
+    {
+      "location": "unified.layer3.attn.output.wo_a_einsum",
+      "semantics": [
+        "c2_share.wo_a"
+      ]
+    },
+    {
+      "location": "unified.layer3.attn.output.wo_b",
+      "semantics": [
+        "c2_share.wo_b"
+      ]
+    },
+    {
+      "location": "unified.layer3.ffn.entry.mega_mhc_post_pre",
+      "semantics": [
+        "c2_share.mhc_ffn.fn",
+        "c2_share.mhc_ffn.mix",
+        "c2_share.ffn_norm"
+      ]
+    },
+    {
+      "location": "unified.layer3.ffn.routed.router_gate",
+      "semantics": [
+        "c2_share.router"
+      ]
+    },
+    {
+      "location": "unified.layer3.ffn.routed.topk",
+      "semantics": [
+        "c2_share.router_bias"
+      ]
+    },
+    {
+      "location": "unified.layer3.ffn.routed.input_quant",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer3.ffn.routed.fused_moe",
+      "semantics": [
+        "c2_share.expert_gate_up",
+        "c2_share.expert_down"
+      ]
+    },
+    {
+      "location": "unified.layer3.ffn.shared.gate_up",
+      "semantics": [
+        "c2_share.shared_gate_up"
+      ]
+    },
+    {
+      "location": "unified.layer3.ffn.shared.act_and_mul",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer3.ffn.shared.down",
+      "semantics": [
+        "c2_share.shared_down"
+      ]
+    },
+    {
+      "location": "unified.layer3.ffn.shared.gate_up.serial",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer3.ffn.shared.act_and_mul.serial",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer3.ffn.shared.down.serial",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer3.ffn.residual_add",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer14.engram.mhc_post",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer14.engram.gather_copy",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer14.engram.wkv",
+      "semantics": [
+        "c2_source_engram.engram.wkv"
+      ]
+    },
+    {
+      "location": "unified.layer14.engram.post_wkv",
+      "semantics": [
+        "c2_source_engram.engram.gate_weights"
+      ]
+    },
+    {
+      "location": "unified.layer14.engram.mhc_hc_prenorm",
+      "semantics": [
+        "c2_source_engram.mhc_attn.fn"
+      ]
+    },
+    {
+      "location": "unified.layer14.engram.mhc_pre_big_fuse",
+      "semantics": [
+        "c2_source_engram.mhc_attn.mix",
+        "c2_source_engram.attn_norm"
+      ]
+    },
+    {
+      "location": "unified.layer14.attn.input.fused_wqa_wkv",
+      "semantics": [
+        "c2_source_engram.wq_a",
+        "c2_source_engram.wkv"
+      ]
+    },
+    {
+      "location": "unified.layer14.attn.compressor.kv_score_proj",
+      "semantics": [
+        "c2_source_engram.compressor.wkv",
+        "c2_source_engram.compressor.wgate"
+      ]
+    },
+    {
+      "location": "unified.layer14.attn.indexer.weights_proj",
+      "semantics": [
+        "c2_source_engram.indexer.weights_proj"
+      ]
+    },
+    {
+      "location": "unified.layer14.attn.compressor.kv_score_proj.serial",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer14.attn.indexer.weights_proj.serial",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer14.attn.main.qk_rmsnorm",
+      "semantics": [
+        "c2_source_engram.q_norm",
+        "c2_source_engram.kv_norm"
+      ]
+    },
+    {
+      "location": "unified.layer14.attn.main.wq_b",
+      "semantics": [
+        "c2_source_engram.wq_b"
+      ]
+    },
+    {
+      "location": "unified.layer14.attn.main.kv_insert",
+      "semantics": [
+        "c2_source_engram.window_cache_append"
+      ]
+    },
+    {
+      "location": "unified.layer14.attn.compressor.save_compress_norm",
+      "semantics": [
+        "c2_source_engram.compressor.norm",
+        "c2_source_engram.compressor_state"
+      ]
+    },
+    {
+      "location": "unified.layer14.attn.compressor.save_compress_norm.serial",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer14.attn.indexer.wk",
+      "semantics": [
+        "c2_source_engram.indexer.wk"
+      ]
+    },
+    {
+      "location": "unified.layer14.attn.indexer.k_store",
+      "semantics": [
+        "c2_source_engram.indexer.k_norm",
+        "c2_source_engram.index_cache_append"
+      ]
+    },
+    {
+      "location": "unified.layer14.attn.indexer.wq_b",
+      "semantics": [
+        "c2_source_engram.indexer.wq_b"
+      ]
+    },
+    {
+      "location": "unified.layer14.attn.indexer.q_rope_quant",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer14.attn.compressor.nvfp4_insert",
+      "semantics": [
+        "c2_source_engram.compressed_cache_append"
+      ]
+    },
+    {
+      "location": "unified.layer14.attn.compressor.nvfp4_insert.serial",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer14.attn.indexer.score.prefill_k_gather",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer14.attn.indexer.score.prefill_logits",
+      "semantics": [
+        "c2_source_engram.indexer.prefill"
+      ]
+    },
+    {
+      "location": "unified.layer14.attn.indexer.score.prefill_topk",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer14.attn.indexer.score.decode_logits",
+      "semantics": [
+        "c2_source_engram.indexer.decode"
+      ]
+    },
+    {
+      "location": "unified.layer14.attn.indexer.score.decode_topk",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer14.attn.attention.mega_attn.prefill",
+      "semantics": [
+        "c2_source_engram.attn.prefill"
+      ]
+    },
+    {
+      "location": "unified.layer14.attn.attention.mega_attn.decode",
+      "semantics": [
+        "c2_source_engram.attn.decode",
+        "c2_source_engram.attn_sink"
+      ]
+    },
+    {
+      "location": "unified.layer14.attn.output.wo_a_einsum",
+      "semantics": [
+        "c2_source_engram.wo_a"
+      ]
+    },
+    {
+      "location": "unified.layer14.attn.output.wo_b",
+      "semantics": [
+        "c2_source_engram.wo_b"
+      ]
+    },
+    {
+      "location": "unified.layer14.ffn.entry.mega_mhc_post_pre",
+      "semantics": [
+        "c2_source_engram.mhc_ffn.fn",
+        "c2_source_engram.mhc_ffn.mix",
+        "c2_source_engram.ffn_norm"
+      ]
+    },
+    {
+      "location": "unified.layer14.ffn.routed.router_gate",
+      "semantics": [
+        "c2_source_engram.router"
+      ]
+    },
+    {
+      "location": "unified.layer14.ffn.routed.topk",
+      "semantics": [
+        "c2_source_engram.router_bias"
+      ]
+    },
+    {
+      "location": "unified.layer14.ffn.routed.input_quant",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer14.ffn.routed.fused_moe",
+      "semantics": [
+        "c2_source_engram.expert_gate_up",
+        "c2_source_engram.expert_down"
+      ]
+    },
+    {
+      "location": "unified.layer14.ffn.shared.gate_up",
+      "semantics": [
+        "c2_source_engram.shared_gate_up"
+      ]
+    },
+    {
+      "location": "unified.layer14.ffn.shared.act_and_mul",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer14.ffn.shared.down",
+      "semantics": [
+        "c2_source_engram.shared_down"
+      ]
+    },
+    {
+      "location": "unified.layer14.ffn.shared.gate_up.serial",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer14.ffn.shared.act_and_mul.serial",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer14.ffn.shared.down.serial",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer14.ffn.residual_add",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer15.attn.entry.mega_mhc_post_pre",
+      "semantics": [
+        "c2_share_after_engram.mhc_attn.fn",
+        "c2_share_after_engram.mhc_attn.mix",
+        "c2_share_after_engram.attn_norm"
+      ]
+    },
+    {
+      "location": "unified.layer15.attn.input.fused_wqa_wkv",
+      "semantics": [
+        "c2_share_after_engram.wq_a",
+        "c2_share_after_engram.wkv"
+      ]
+    },
+    {
+      "location": "unified.layer15.attn.main.qk_rmsnorm",
+      "semantics": [
+        "c2_share_after_engram.q_norm",
+        "c2_share_after_engram.kv_norm"
+      ]
+    },
+    {
+      "location": "unified.layer15.attn.main.wq_b",
+      "semantics": [
+        "c2_share_after_engram.wq_b"
+      ]
+    },
+    {
+      "location": "unified.layer15.attn.main.kv_insert",
+      "semantics": [
+        "c2_share_after_engram.window_cache_append"
+      ]
+    },
+    {
+      "location": "unified.layer15.attn.attention.mega_attn.prefill",
+      "semantics": [
+        "c2_share_after_engram.attn.prefill"
+      ]
+    },
+    {
+      "location": "unified.layer15.attn.attention.mega_attn.decode",
+      "semantics": [
+        "c2_share_after_engram.attn.decode",
+        "c2_share_after_engram.attn_sink"
+      ]
+    },
+    {
+      "location": "unified.layer15.attn.output.wo_a_einsum",
+      "semantics": [
+        "c2_share_after_engram.wo_a"
+      ]
+    },
+    {
+      "location": "unified.layer15.attn.output.wo_b",
+      "semantics": [
+        "c2_share_after_engram.wo_b"
+      ]
+    },
+    {
+      "location": "unified.layer15.ffn.entry.mega_mhc_post_pre",
+      "semantics": [
+        "c2_share_after_engram.mhc_ffn.fn",
+        "c2_share_after_engram.mhc_ffn.mix",
+        "c2_share_after_engram.ffn_norm"
+      ]
+    },
+    {
+      "location": "unified.layer15.ffn.routed.router_gate",
+      "semantics": [
+        "c2_share_after_engram.router"
+      ]
+    },
+    {
+      "location": "unified.layer15.ffn.routed.topk",
+      "semantics": [
+        "c2_share_after_engram.router_bias"
+      ]
+    },
+    {
+      "location": "unified.layer15.ffn.routed.input_quant",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer15.ffn.routed.fused_moe",
+      "semantics": [
+        "c2_share_after_engram.expert_gate_up",
+        "c2_share_after_engram.expert_down"
+      ]
+    },
+    {
+      "location": "unified.layer15.ffn.shared.gate_up",
+      "semantics": [
+        "c2_share_after_engram.shared_gate_up"
+      ]
+    },
+    {
+      "location": "unified.layer15.ffn.shared.act_and_mul",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer15.ffn.shared.down",
+      "semantics": [
+        "c2_share_after_engram.shared_down"
+      ]
+    },
+    {
+      "location": "unified.layer15.ffn.shared.gate_up.serial",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer15.ffn.shared.act_and_mul.serial",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer15.ffn.shared.down.serial",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer15.ffn.residual_add",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer20.attn.entry.mega_mhc_post_pre",
+      "semantics": [
+        "c1_source_candidate.mhc_attn.fn",
+        "c1_source_candidate.mhc_attn.mix",
+        "c1_source_candidate.attn_norm"
+      ]
+    },
+    {
+      "location": "unified.layer20.attn.input.fused_wqa_wkv",
+      "semantics": [
+        "c1_source_candidate.wq_a",
+        "c1_source_candidate.wkv"
+      ]
+    },
+    {
+      "location": "unified.layer20.attn.compressor.kv_score_proj",
+      "semantics": [
+        "c1_source_candidate.compressor.wkv"
+      ]
+    },
+    {
+      "location": "unified.layer20.attn.indexer.weights_proj",
+      "semantics": [
+        "c1_source_candidate.indexer.weights_proj"
+      ]
+    },
+    {
+      "location": "unified.layer20.attn.compressor.kv_score_proj.serial",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer20.attn.indexer.weights_proj.serial",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer20.attn.main.qk_rmsnorm",
+      "semantics": [
+        "c1_source_candidate.q_norm",
+        "c1_source_candidate.kv_norm"
+      ]
+    },
+    {
+      "location": "unified.layer20.attn.main.wq_b",
+      "semantics": [
+        "c1_source_candidate.wq_b"
+      ]
+    },
+    {
+      "location": "unified.layer20.attn.main.kv_insert",
+      "semantics": [
+        "c1_source_candidate.window_cache_append"
+      ]
+    },
+    {
+      "location": "unified.layer20.attn.compressor.save_compress_norm",
+      "semantics": [
+        "c1_source_candidate.compressor.norm"
+      ]
+    },
+    {
+      "location": "unified.layer20.attn.compressor.save_compress_norm.serial",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer20.attn.indexer.wk",
+      "semantics": [
+        "c1_source_candidate.indexer.wk"
+      ]
+    },
+    {
+      "location": "unified.layer20.attn.indexer.k_store",
+      "semantics": [
+        "c1_source_candidate.indexer.k_norm",
+        "c1_source_candidate.index_cache_append"
+      ]
+    },
+    {
+      "location": "unified.layer20.attn.indexer.wq_b",
+      "semantics": [
+        "c1_source_candidate.indexer.wq_b"
+      ]
+    },
+    {
+      "location": "unified.layer20.attn.indexer.q_rope_quant",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer20.attn.compressor.nvfp4_insert",
+      "semantics": [
+        "c1_source_candidate.compressed_cache_append"
+      ]
+    },
+    {
+      "location": "unified.layer20.attn.compressor.nvfp4_insert.serial",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer20.attn.indexer.score.prefill_k_gather",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer20.attn.indexer.score.prefill_logits",
+      "semantics": [
+        "c1_source_candidate.indexer.prefill"
+      ]
+    },
+    {
+      "location": "unified.layer20.attn.indexer.score.prefill_topk",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer20.attn.indexer.score.decode_logits",
+      "semantics": [
+        "c1_source_candidate.indexer.decode"
+      ]
+    },
+    {
+      "location": "unified.layer20.attn.indexer.score.candidates",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer20.attn.indexer.score.decode_topk",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer20.attn.attention.mega_attn.prefill",
+      "semantics": [
+        "c1_source_candidate.attn.prefill"
+      ]
+    },
+    {
+      "location": "unified.layer20.attn.attention.mega_attn.decode",
+      "semantics": [
+        "c1_source_candidate.attn.decode",
+        "c1_source_candidate.attn_sink"
+      ]
+    },
+    {
+      "location": "unified.layer20.attn.output.wo_a_einsum",
+      "semantics": [
+        "c1_source_candidate.wo_a"
+      ]
+    },
+    {
+      "location": "unified.layer20.attn.output.wo_b",
+      "semantics": [
+        "c1_source_candidate.wo_b"
+      ]
+    },
+    {
+      "location": "unified.layer20.ffn.entry.mega_mhc_post_pre",
+      "semantics": [
+        "c1_source_candidate.mhc_ffn.fn",
+        "c1_source_candidate.mhc_ffn.mix",
+        "c1_source_candidate.ffn_norm"
+      ]
+    },
+    {
+      "location": "unified.layer20.ffn.routed.router_gate",
+      "semantics": [
+        "c1_source_candidate.router"
+      ]
+    },
+    {
+      "location": "unified.layer20.ffn.routed.topk",
+      "semantics": [
+        "c1_source_candidate.router_bias"
+      ]
+    },
+    {
+      "location": "unified.layer20.ffn.routed.input_quant",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer20.ffn.routed.fused_moe",
+      "semantics": [
+        "c1_source_candidate.expert_gate_up",
+        "c1_source_candidate.expert_down"
+      ]
+    },
+    {
+      "location": "unified.layer20.ffn.shared.gate_up",
+      "semantics": [
+        "c1_source_candidate.shared_gate_up"
+      ]
+    },
+    {
+      "location": "unified.layer20.ffn.shared.act_and_mul",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer20.ffn.shared.down",
+      "semantics": [
+        "c1_source_candidate.shared_down"
+      ]
+    },
+    {
+      "location": "unified.layer20.ffn.shared.gate_up.serial",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer20.ffn.shared.act_and_mul.serial",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer20.ffn.shared.down.serial",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer20.ffn.residual_add",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer21.attn.entry.mega_mhc_post_pre",
+      "semantics": [
+        "c1_share.mhc_attn.fn",
+        "c1_share.mhc_attn.mix",
+        "c1_share.attn_norm"
+      ]
+    },
+    {
+      "location": "unified.layer21.attn.input.fused_wqa_wkv",
+      "semantics": [
+        "c1_share.wq_a",
+        "c1_share.wkv"
+      ]
+    },
+    {
+      "location": "unified.layer21.attn.main.qk_rmsnorm",
+      "semantics": [
+        "c1_share.q_norm",
+        "c1_share.kv_norm"
+      ]
+    },
+    {
+      "location": "unified.layer21.attn.main.wq_b",
+      "semantics": [
+        "c1_share.wq_b"
+      ]
+    },
+    {
+      "location": "unified.layer21.attn.main.kv_insert",
+      "semantics": [
+        "c1_share.window_cache_append"
+      ]
+    },
+    {
+      "location": "unified.layer21.attn.attention.mega_attn.prefill",
+      "semantics": [
+        "c1_share.attn.prefill"
+      ]
+    },
+    {
+      "location": "unified.layer21.attn.attention.mega_attn.decode",
+      "semantics": [
+        "c1_share.attn.decode",
+        "c1_share.attn_sink"
+      ]
+    },
+    {
+      "location": "unified.layer21.attn.output.wo_a_einsum",
+      "semantics": [
+        "c1_share.wo_a"
+      ]
+    },
+    {
+      "location": "unified.layer21.attn.output.wo_b",
+      "semantics": [
+        "c1_share.wo_b"
+      ]
+    },
+    {
+      "location": "unified.layer21.ffn.entry.mega_mhc_post_pre",
+      "semantics": [
+        "c1_share.mhc_ffn.fn",
+        "c1_share.mhc_ffn.mix",
+        "c1_share.ffn_norm"
+      ]
+    },
+    {
+      "location": "unified.layer21.ffn.routed.router_gate",
+      "semantics": [
+        "c1_share.router"
+      ]
+    },
+    {
+      "location": "unified.layer21.ffn.routed.topk",
+      "semantics": [
+        "c1_share.router_bias"
+      ]
+    },
+    {
+      "location": "unified.layer21.ffn.routed.input_quant",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer21.ffn.routed.fused_moe",
+      "semantics": [
+        "c1_share.expert_gate_up",
+        "c1_share.expert_down"
+      ]
+    },
+    {
+      "location": "unified.layer21.ffn.shared.gate_up",
+      "semantics": [
+        "c1_share.shared_gate_up"
+      ]
+    },
+    {
+      "location": "unified.layer21.ffn.shared.act_and_mul",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer21.ffn.shared.down",
+      "semantics": [
+        "c1_share.shared_down"
+      ]
+    },
+    {
+      "location": "unified.layer21.ffn.shared.gate_up.serial",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer21.ffn.shared.act_and_mul.serial",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer21.ffn.shared.down.serial",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer21.ffn.residual_add",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer24.attn.entry.mega_mhc_post_pre",
+      "semantics": [
+        "c1_candidate_index.mhc_attn.fn",
+        "c1_candidate_index.mhc_attn.mix",
+        "c1_candidate_index.attn_norm"
+      ]
+    },
+    {
+      "location": "unified.layer24.attn.input.fused_wqa_wkv",
+      "semantics": [
+        "c1_candidate_index.wq_a",
+        "c1_candidate_index.wkv"
+      ]
+    },
+    {
+      "location": "unified.layer24.attn.indexer.weights_proj",
+      "semantics": [
+        "c1_candidate_index.indexer.weights_proj"
+      ]
+    },
+    {
+      "location": "unified.layer24.attn.indexer.weights_proj.serial",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer24.attn.main.qk_rmsnorm",
+      "semantics": [
+        "c1_candidate_index.q_norm",
+        "c1_candidate_index.kv_norm"
+      ]
+    },
+    {
+      "location": "unified.layer24.attn.main.wq_b",
+      "semantics": [
+        "c1_candidate_index.wq_b"
+      ]
+    },
+    {
+      "location": "unified.layer24.attn.main.kv_insert",
+      "semantics": [
+        "c1_candidate_index.window_cache_append"
+      ]
+    },
+    {
+      "location": "unified.layer24.attn.indexer.wq_b",
+      "semantics": [
+        "c1_candidate_index.indexer.wq_b"
+      ]
+    },
+    {
+      "location": "unified.layer24.attn.indexer.q_rope_quant",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer24.attn.indexer.score.prefill_k_gather",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer24.attn.indexer.score.prefill_logits",
+      "semantics": [
+        "c1_candidate_index.indexer.prefill"
+      ]
+    },
+    {
+      "location": "unified.layer24.attn.indexer.score.prefill_topk",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer24.attn.indexer.score.decode_logits",
+      "semantics": [
+        "c1_candidate_index.indexer.decode"
+      ]
+    },
+    {
+      "location": "unified.layer24.attn.indexer.score.candidates",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer24.attn.indexer.score.decode_topk",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer24.attn.attention.mega_attn.prefill",
+      "semantics": [
+        "c1_candidate_index.attn.prefill"
+      ]
+    },
+    {
+      "location": "unified.layer24.attn.attention.mega_attn.decode",
+      "semantics": [
+        "c1_candidate_index.attn.decode",
+        "c1_candidate_index.attn_sink"
+      ]
+    },
+    {
+      "location": "unified.layer24.attn.output.wo_a_einsum",
+      "semantics": [
+        "c1_candidate_index.wo_a"
+      ]
+    },
+    {
+      "location": "unified.layer24.attn.output.wo_b",
+      "semantics": [
+        "c1_candidate_index.wo_b"
+      ]
+    },
+    {
+      "location": "unified.layer24.ffn.entry.mega_mhc_post_pre",
+      "semantics": [
+        "c1_candidate_index.mhc_ffn.fn",
+        "c1_candidate_index.mhc_ffn.mix",
+        "c1_candidate_index.ffn_norm"
+      ]
+    },
+    {
+      "location": "unified.layer24.ffn.routed.router_gate",
+      "semantics": [
+        "c1_candidate_index.router"
+      ]
+    },
+    {
+      "location": "unified.layer24.ffn.routed.topk",
+      "semantics": [
+        "c1_candidate_index.router_bias"
+      ]
+    },
+    {
+      "location": "unified.layer24.ffn.routed.input_quant",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer24.ffn.routed.fused_moe",
+      "semantics": [
+        "c1_candidate_index.expert_gate_up",
+        "c1_candidate_index.expert_down"
+      ]
+    },
+    {
+      "location": "unified.layer24.ffn.shared.gate_up",
+      "semantics": [
+        "c1_candidate_index.shared_gate_up"
+      ]
+    },
+    {
+      "location": "unified.layer24.ffn.shared.act_and_mul",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer24.ffn.shared.down",
+      "semantics": [
+        "c1_candidate_index.shared_down"
+      ]
+    },
+    {
+      "location": "unified.layer24.ffn.shared.gate_up.serial",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer24.ffn.shared.act_and_mul.serial",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer24.ffn.shared.down.serial",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer24.ffn.residual_add",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer37.attn.entry.mega_mhc_post_pre",
+      "semantics": [
+        "c1_share_dspark_target.mhc_attn.fn",
+        "c1_share_dspark_target.mhc_attn.mix",
+        "c1_share_dspark_target.attn_norm"
+      ]
+    },
+    {
+      "location": "unified.layer37.attn.input.fused_wqa_wkv",
+      "semantics": [
+        "c1_share_dspark_target.wq_a",
+        "c1_share_dspark_target.wkv"
+      ]
+    },
+    {
+      "location": "unified.layer37.attn.main.qk_rmsnorm",
+      "semantics": [
+        "c1_share_dspark_target.q_norm",
+        "c1_share_dspark_target.kv_norm"
+      ]
+    },
+    {
+      "location": "unified.layer37.attn.main.wq_b",
+      "semantics": [
+        "c1_share_dspark_target.wq_b"
+      ]
+    },
+    {
+      "location": "unified.layer37.attn.main.kv_insert",
+      "semantics": [
+        "c1_share_dspark_target.window_cache_append"
+      ]
+    },
+    {
+      "location": "unified.layer37.attn.attention.mega_attn.prefill",
+      "semantics": [
+        "c1_share_dspark_target.attn.prefill"
+      ]
+    },
+    {
+      "location": "unified.layer37.attn.attention.mega_attn.decode",
+      "semantics": [
+        "c1_share_dspark_target.attn.decode",
+        "c1_share_dspark_target.attn_sink"
+      ]
+    },
+    {
+      "location": "unified.layer37.attn.output.wo_a_einsum",
+      "semantics": [
+        "c1_share_dspark_target.wo_a"
+      ]
+    },
+    {
+      "location": "unified.layer37.attn.output.wo_b",
+      "semantics": [
+        "c1_share_dspark_target.wo_b"
+      ]
+    },
+    {
+      "location": "unified.layer37.ffn.entry.mega_mhc_post_pre",
+      "semantics": [
+        "c1_share_dspark_target.mhc_ffn.fn",
+        "c1_share_dspark_target.mhc_ffn.mix",
+        "c1_share_dspark_target.ffn_norm"
+      ]
+    },
+    {
+      "location": "unified.layer37.ffn.routed.router_gate",
+      "semantics": [
+        "c1_share_dspark_target.router"
+      ]
+    },
+    {
+      "location": "unified.layer37.ffn.routed.topk",
+      "semantics": [
+        "c1_share_dspark_target.router_bias"
+      ]
+    },
+    {
+      "location": "unified.layer37.ffn.routed.input_quant",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer37.ffn.routed.fused_moe",
+      "semantics": [
+        "c1_share_dspark_target.expert_gate_up",
+        "c1_share_dspark_target.expert_down"
+      ]
+    },
+    {
+      "location": "unified.layer37.ffn.shared.gate_up",
+      "semantics": [
+        "c1_share_dspark_target.shared_gate_up"
+      ]
+    },
+    {
+      "location": "unified.layer37.ffn.shared.act_and_mul",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer37.ffn.shared.down",
+      "semantics": [
+        "c1_share_dspark_target.shared_down"
+      ]
+    },
+    {
+      "location": "unified.layer37.ffn.shared.gate_up.serial",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer37.ffn.shared.act_and_mul.serial",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer37.ffn.shared.down.serial",
+      "semantics": []
+    },
+    {
+      "location": "unified.layer37.ffn.residual_add",
+      "semantics": []
+    },
+    {
+      "location": "unified.head.mhc_post",
+      "semantics": []
+    },
+    {
+      "location": "unified.head.hc_head_collapse",
+      "semantics": []
+    },
+    {
+      "location": "unified.head.final_rms_norm",
+      "semantics": [
+        "final_norm"
+      ]
+    },
+    {
+      "location": "unified.head.lm_head",
+      "semantics": [
+        "lm_head"
+      ]
+    }
+  ]
+}

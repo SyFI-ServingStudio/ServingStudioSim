@@ -34,6 +34,14 @@ def test_gemm_backend_is_locked_to_dtype():
     assert backend_supports("single_gemm", "torch_linear", DType.BF16)
     assert backend_supports("single_gemm", "torch_linear", DType.FP16)
     assert not backend_supports("single_gemm", "torch_linear", DType.FP8_E4M3)
+    # MXFP8 block-scaled compute is its own dtype: only the MXFP8 linear runs it,
+    # and that backend never serves per-tensor FP8 or BF16 rows.
+    assert supported_backends("single_gemm", DType.MXFP8_E4M3) == ["flashinfer_mxfp8"]
+    assert not backend_supports("single_gemm", "flashinfer_mxfp8", DType.FP8_E4M3)
+    assert not backend_supports("single_gemm", "flashinfer_mxfp8", DType.BF16)
+    assert not backend_supports(
+        "single_gemm", "flashinfer_mxfp8", DType.MXFP8_E4M3, gpu="NVIDIA H200"
+    )
 
 
 def test_attention_backend_dtype_matrix():

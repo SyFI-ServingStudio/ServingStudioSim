@@ -855,3 +855,28 @@ def test_timer_cupti_max_rep_also_bounds_the_probe(monkeypatch: pytest.MonkeyPat
 
     Timer.cupti(lambda: None, max_rep=200)
     assert calls[0]["max_iter"] == 200
+
+
+def test_default_l2_flush_reads_torch_l2_cache_size(monkeypatch: pytest.MonkeyPatch):
+    from types import SimpleNamespace
+
+    from profiling.profilers import cupti_kernel_profiler as ckp
+
+    mib = 1024 * 1024
+
+    def fake_torch(props):
+        cuda = SimpleNamespace(get_device_properties=lambda device: props)
+        return SimpleNamespace(cuda=cuda)
+
+    # B200 reports 126.5 MiB of L2: the flush is 2 x L2, not the 64 MiB floor.
+    b200 = SimpleNamespace(L2_cache_size=132644864)
+    monkeypatch.setattr(ckp, "_require_torch", lambda: fake_torch(b200))
+    assert ckp.default_l2_flush_bytes(0) == 2 * 132644864
+
+    # A small L2 keeps the 64 MiB floor, and a missing attribute falls back to it.
+    monkeypatch.setattr(
+        ckp, "_require_torch", lambda: fake_torch(SimpleNamespace(L2_cache_size=6 * mib))
+    )
+    assert ckp.default_l2_flush_bytes(0) == 64 * mib
+    monkeypatch.setattr(ckp, "_require_torch", lambda: fake_torch(SimpleNamespace()))
+    assert ckp.default_l2_flush_bytes(0) == 64 * mib

@@ -9,7 +9,8 @@
 //! `hp_unified`, `glm52_vllm_dsa_moe` + `hp_unified`, and
 //! `glm52_vllm_nvfp4_dsa_moe` + either `hp_unified` or `chunked_prefill`,
 //! `glm52_vllm_nvfp4_dsa_moe_speculative` + `speculative`, and
-//! `glm52_sglang_nvfp4_tp_dsa_moe` + `chunked_prefill`. GLM's TP1 local
+//! `glm52_sglang_nvfp4_tp_dsa_moe` + `chunked_prefill`, and `deepseek_v4_vllm`
+//! / `deepseek_v41_vllm` + either `hp_unified` or `chunked_prefill`. GLM's TP1 local
 //! attention uses one independent KV/input partition per EP rank; the worker
 //! shells and mutable request/KV lifecycle are unchanged. Each wired arm
 //! monomorphizes its concrete model/worker pair and
@@ -464,6 +465,56 @@ impl Deployment for UnifiedDeployment {
                 )?);
                 assemble_hp_or_chunked_flow(
                     "DeepSeek-V4",
+                    model,
+                    store,
+                    worker_config,
+                    log_dir,
+                    gpu_name,
+                    dp_cfg,
+                    &g.worker,
+                )
+            }
+            arch @ (IterArchSel::DeepseekV41Vllm {
+                routing,
+                routing_seed,
+                expert_popularity_file,
+                token_corpus_file,
+                decoder_swa_bounded_replay,
+                max_model_len,
+                ..
+            }
+            | IterArchSel::DeepseekV41VllmSerialStreams {
+                routing,
+                routing_seed,
+                expert_popularity_file,
+                token_corpus_file,
+                decoder_swa_bounded_replay,
+                max_model_len,
+                ..
+            }) => {
+                // Pure TP4 attention (one attention group, four replicated KV
+                // shards) like the GLM-5.2 SGLang TP4 arch. The worker's
+                // `FullAttnKv` sizes on the arch's per-token compressed + index
+                // pages; the sliding-window cache is a per-request constant the
+                // arch leaves out (see `total_kv_bytes_per_token`).
+                ensure_hp_or_chunked_worker("DeepSeek-V4.1", &g.worker)?;
+                let serialize_streams =
+                    matches!(arch, IterArchSel::DeepseekV41VllmSerialStreams { .. });
+                let model = Arc::new(arch_build::deepseek_v41_vllm(
+                    model_spec,
+                    *routing,
+                    *routing_seed,
+                    expert_popularity_file.as_deref(),
+                    token_corpus_file.as_deref(),
+                    serialize_streams,
+                    *decoder_swa_bounded_replay,
+                    *max_model_len,
+                    &gpu_name,
+                    MODEL_NAME,
+                    bridge,
+                )?);
+                assemble_hp_or_chunked_flow(
+                    "DeepSeek-V4.1",
                     model,
                     store,
                     worker_config,

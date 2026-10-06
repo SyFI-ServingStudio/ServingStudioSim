@@ -9,17 +9,18 @@ Wire string: ``"single_gemm"`` — matches Rust ``KernelSpec::KIND`` in
 by ``profiling.facade`` to generate ``get_single_gemm_times`` /
 ``count_missing_single_gemm``.
 
-Six backends share this kind/table/schema: ``torch`` (contiguous-RHS
+Seven backends share this kind/table/schema: ``torch`` (contiguous-RHS
 ``torch.mm``), ``torch_linear`` (model-weight-layout ``F.linear`` in the main
 environment), ``torch_linear_vllm`` (the same expression in vLLM's pinned
 environment), ``sglang_bf16_auto`` and ``sglang_fused_a_auto`` (SGLang's
-production BF16 dispatches, SM100 only), and ``deepgemm`` (FP8 dense GEMM,
-``dtype = fp8_e4m3``).
+production BF16 dispatches, SM100 only), ``deepgemm`` (FP8 dense GEMM,
+``dtype = fp8_e4m3``), and ``flashinfer_mxfp8`` (MXFP8 dense linear:
+activation quant + FlashInfer CuTe-DSL block-scaled GEMM, ``dtype = mxfp8_e4m3``).
 BF16/FP16 model defaults offer both generic Torch variants and the timing cache
 selects the faster one per shape.
 
 Importing this module has a side effect: it appends ``KernelProfilerSpec`` rows
-to the registry. The runner modules ``profiling.runners.gemm.{torch,deepgemm}``
+to the registry. The runner modules under ``profiling.runners.gemm``
 are referenced lazily via ``RunnerRef`` so the main process never eager-imports
 torch/cuda.
 """
@@ -47,7 +48,7 @@ class SingleGemmArgs(KernelArgs):
     m: int = arg(unit="tokens", doc="Rows of the activation: tokens in the batch.")
     n: int = arg(unit="elements", doc="Output features of the weight.")
     k: int = arg(unit="elements", doc="Input features, the reduction dimension.")
-    dtype: DType = arg(doc="Element type of A and B. fp8_e4m3 writes bf16 output.")
+    dtype: DType = arg(doc="Element type of A and B. fp8_e4m3 and mxfp8_e4m3 write bf16 output.")
 
 
 DOC = KernelDoc(
@@ -73,11 +74,15 @@ DOC = KernelDoc(
         "sparsity are not measured.",
         "torch and torch_linear compute the same product. They are separate rows "
         "because the weight layout changes which cuBLAS kernel runs.",
+        "flashinfer_mxfp8 takes bf16 activations and includes their MXFP8 "
+        "quantization in the time; its GB/s adds the bf16 read and the "
+        "quantized write of the activation.",
     ),
     method=(
         f"{CUPTI_METHOD} The torch and SGLang backends count overlapping launches "
         "once, by the time the GPU is busy, because Blackwell can split one logical "
-        "GEMM into several; deepgemm sums its launches."
+        "GEMM into several; deepgemm and flashinfer_mxfp8 sum their launches "
+        "(flashinfer_mxfp8 autotunes the call once before timing)."
     ),
     # torch.mm is its own reference: the torch backend measures exactly it.
     reference=None,
@@ -232,6 +237,39 @@ register(
                 "before timing, as vLLM passes them."
             ),
             url="https://github.com/deepseek-ai/DeepGEMM",
+        ),
+    )
+)
+
+# MXFP8 dense linear: one slot = the swizzled MXFP8 activation quant +
+# FlashInfer CuTe-DSL block-scaled GEMM that
+# FlashInferCutedslMxfp8LinearKernel.apply_weights issues, bf16 out.
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="flashinfer_mxfp8",
+        # vLLM's FlashInferCutedslMxfp8LinearKernel.is_supported():
+        # is_device_capability_family(100), the SM10x family.
+        supports=BackendSupport(
+            compute=frozenset({DType.MXFP8_E4M3}),
+            sm_targets=frozenset({"sm_100f"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.gemm.flashinfer_mxfp8",
+            function_name="profile_single_gemm_flashinfer_mxfp8",
+        ),
+        table_name=KIND,
+        args_schema=SingleGemmArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="vllm_upstream_fork_env",
+        doc=BackendDoc(
+            summary=(
+                "vLLM's FlashInferCutedslMxfp8LinearKernel: FlashInfer MXFP8 "
+                "quantization of the bf16 activation (UE8M0 per 32, swizzled) and "
+                "the CuTe-DSL block-scaled GEMM mm_mxfp8, bf16 output."
+            ),
+            url="https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/kernels/linear/mxfp8/flashinfer.py",
         ),
     )
 )

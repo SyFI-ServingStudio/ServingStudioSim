@@ -351,6 +351,27 @@ mod tests {
         assert_eq!(tp8.axes()[0].last(), Some(&128.0));
     }
 
+    /// DeepSeek-V4.1-Flash TP4 (H=5120): the switch lands off the power-of-two
+    /// grid (25/26) and the cap (3276) is not a token-axis point.
+    #[test]
+    fn mnnvl_sweep_at_hidden_5120_brackets_switch_and_cap() {
+        let config = AllReduceFusionKernelConfig {
+            hidden_dim: 5120,
+            ..mnnvl_config(4)
+        };
+        assert_eq!(AllReduceFusionSpec::mnnvl_max_oneshot_tokens(&config), 25);
+        assert_eq!(AllReduceFusionSpec::max_fused_tokens(&config), 3276);
+
+        let grid = AllReduceFusionSpec::sweep_grid(&config);
+        let tokens = &grid.axes()[0];
+        for t in [16.0, 17.0, 25.0, 26.0, 3200.0, 3276.0] {
+            assert!(tokens.contains(&t), "missing {t}");
+        }
+        assert_eq!(tokens.last(), Some(&3276.0));
+        assert!(tokens.windows(2).all(|w| w[0] < w[1]));
+        assert_eq!(tokens.len(), 36);
+    }
+
     #[test]
     fn mnnvl_enumerate_matches_python_schema() {
         let config = mnnvl_config(4);

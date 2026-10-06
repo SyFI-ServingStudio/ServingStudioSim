@@ -7,6 +7,7 @@
 pub mod build;
 pub mod config;
 pub mod contract;
+pub mod deepseek_v41_vllm;
 pub mod deepseek_v4_vllm;
 pub mod glm52_model_cfg;
 pub mod glm52_sglang_nvfp4_tp_dsa_moe;
@@ -32,6 +33,10 @@ pub use contract::{
     ArchGroupInput, AttnArchInput, AttnLayerwiseModel, FfnArchInput, FfnLayerwiseModel,
     IterwiseUnifiedModel, SpeculativeArchGroupInput, SpeculativeArchInput, SpeculativeDecodeInput,
     SpeculativeUnifiedModel, UnifiedArchInput,
+};
+pub use deepseek_v41_vllm::{
+    DeepseekV41ModelCfg, DeepseekV41VllmConfigs, DeepseekV41VllmModel, DeepseekV41VllmParallel,
+    DeepseekV41VllmResolved,
 };
 pub use deepseek_v4_vllm::{
     DeepseekV4ModelCfg, DeepseekV4VllmConfigs, DeepseekV4VllmModel, DeepseekV4VllmParallel,

@@ -19,6 +19,7 @@ from profiling.kernels import (
     clamped_swiglu,  # noqa: F401
     compressed_sparse_mla_decode,  # noqa: F401
     compressed_sparse_mla_prefill,  # noqa: F401
+    compressed_sparse_mla_rope_cast,  # noqa: F401
     dsa_compressed_mqa_logits_prefill,  # noqa: F401
     dsa_compressed_topk_prefill,  # noqa: F401
     dsa_index_cache_append,  # noqa: F401
@@ -32,6 +33,7 @@ from profiling.kernels import (
     dsa_sparse_mla_prefill,  # noqa: F401
     dsa_topk_prefill,  # noqa: F401
     elementwise,  # noqa: F401
+    engram_lookup,  # noqa: F401
     flashinfer_attn_decode,  # noqa: F401
     flashinfer_attn_prefill,  # noqa: F401
     flashinfer_attn_rect,  # noqa: F401
@@ -74,6 +76,7 @@ from profiling.kernels import (
     p2p_intra,  # noqa: F401
     packed_kv_cache_gather,  # noqa: F401
     q_kv_rms_norm,  # noqa: F401
+    q_pad_kv_rope_mxfp8_insert,  # noqa: F401
     qnorm_rope_kv_insert,  # noqa: F401
     residual_rms_norm,  # noqa: F401
     rms_norm,  # noqa: F401
