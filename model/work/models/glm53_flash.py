@@ -18,11 +18,13 @@ Out of scope, by construction:
 - the MTP layer (``num_nextn_predict_layers``, checkpoint layer 45) — speculative
   decoding is off in the labelled deployment, so no stage runs it.
 
-Precision is per module from the FP8 config's ``modules_to_not_convert``. Its entries
-are layer-qualified, and one layer-relative path is BF16 on some layers and FP8 on
-others (``self_attn.o_proj`` stays BF16 on KDA layers; DSA's ``o_proj`` carries a
-``weight_scale_inv``). DSA-layer attention paths are therefore matched under a
-``dsa.`` module prefix.
+Precision is per module from the config's exclusion list: the FP8 config's
+``modules_to_not_convert``, or the ModelOpt NVFP4 config's ``ignore`` /
+``exclude_modules`` (trailing ``*`` wildcards; attention, routers and the shared
+expert stay BF16 there). Entries are layer-qualified, and one layer-relative path
+is BF16 on some layers and FP8 on others (``self_attn.o_proj`` stays BF16 on KDA
+layers; DSA's ``o_proj`` carries a ``weight_scale_inv``). DSA-layer attention
+paths are therefore matched under a ``dsa.`` module prefix.
 """
 
 from __future__ import annotations
@@ -36,12 +38,12 @@ from ..core import LayerStack, MatmulGroup, Model, NormWeightGroup, dtype_bytes
 from ..ffn.dense import DenseSwiGLU
 from ..ffn.moe import MoE
 from ..mixers.mhc import ManifoldHyperConnections, MhcFinalPost
-from ..quantization import QuantScheme, parse_quantization_config
+from ..quantization import QuantScheme, modelopt_excluded, parse_quantization_config
 
 _KDA = "linear_attention"
 _DSA = "deepseek_sparse_attention"
 _DSA_MODULE_PREFIX = "dsa"
-_QUALIFIED = re.compile(r"^model\.(?:language_model\.)?layers\.(\d+)\.(.+)$")
+_QUALIFIED = re.compile(r"^model\.(?:language_model\.)?layers\.(\d+)(?:\.(.+))?$")
 
 
 def _schedule(config: dict) -> tuple[list[str], list[str]]:
@@ -74,11 +76,17 @@ def _schedule(config: dict) -> tuple[list[str], list[str]]:
 
 
 def _quant(config: dict, attention: list[str]) -> QuantScheme | None:
-    scheme = parse_quantization_config(config)
+    scheme = parse_quantization_config(config, layer_qualified_exclusions=True)
     if scheme is None:
         return None
+    quant = config["quantization_config"]
+    if quant.get("quant_method") == "modelopt":
+        excluded = modelopt_excluded(quant) or ()
+    else:
+        excluded = quant.get("modules_to_not_convert", ())
     not_converted = set()
-    for module in config["quantization_config"].get("modules_to_not_convert", ()):
+    for entry in excluded:
+        module = entry.rstrip("*").rstrip(".")
         match = _QUALIFIED.match(module)
         if match is None:
             not_converted.add(module.removeprefix("model."))
@@ -86,9 +94,15 @@ def _quant(config: dict, attention: list[str]) -> QuantScheme | None:
         layer, path = int(match.group(1)), match.group(2)
         if layer >= len(attention):
             continue  # the MTP layer, out of scope
-        if attention[layer] == _DSA and path.startswith("self_attn."):
+        if path is None:
+            raise ValueError(f"{entry!r} excludes a whole decoder layer; not modeled")
+        if attention[layer] == _DSA and (path == "self_attn" or path.startswith("self_attn.")):
             path = f"{_DSA_MODULE_PREFIX}.{path}"
         not_converted.add(path)
+    if quant.get("quant_method") == "modelopt":
+        # ModelOpt converts nn.Linear only; the mHC mixing matrices are bare
+        # parameters, so its `ignore` list need not name them (the FP8 repo does).
+        not_converted.update(f"hc_{side}_fn" for side in ("attn", "ffn"))
     return replace(scheme, not_converted=frozenset(not_converted))
 
 

@@ -1,5 +1,13 @@
 //! GLM-5.3-Flash (`Glm5NextForConditionalGeneration`) FP8 block checkpoint on
-//! B200, aligned to the vLLM fork's TP4 / EP4 deployment (MTP off).
+//! B200, aligned to the vLLM fork's TP4 / EP4 deployment (MTP off), and the
+//! same graph for NVIDIA's NVFP4 checkpoint (`glm53_flash_vllm_nvfp4_*`).
+//!
+//! The checkpoint's `quantization_config` sets each FFN's precision
+//! ([`Glm53FlashQuant`]). FP8 block: the dense FFN, shared expert and routed
+//! experts are 128x128 FP8. NVFP4 (ModelOpt, `ignore` = attention, routers,
+//! shared experts): the dense FFN and routed experts are NVFP4 W4A4 and the
+//! shared expert is BF16. Attention projections, the router and lm_head are
+//! BF16 in both, and the KV cache is FP8.
 //!
 //! One rank group of `tp_size` ranks: attention, the dense FFN and the shared
 //! expert are tensor-parallel (64 KDA and 64 MLA heads split over the ranks,
@@ -23,6 +31,9 @@
 //! the slice is `2048 // tp` (`config.py:1350`): 512 at TP4, 256 at TP8, both
 //! multiples of the 128x128 weight block, so no block refinement applies
 //! (`oracle/fp8.py:295-298`).
+//! The NVFP4 checkpoint's MoE TP runs the monolithic
+//! `trtllm_fp4_block_scale_moe` on the same slice; 512 and 256 are multiples of
+//! its 16-element group.
 //!
 //! The 45 layers are hybrid: `linear_attn_config.kda_layers` are Kimi Delta
 //! Attention, the rest (every 4th, 3..43) DeepSeek sparse attention with the
@@ -79,12 +90,12 @@ use crate::timing::{
 };
 use crate::worklet::{
     Glm53DsaAttnLocalWorklet, Glm53DsaAttnLocalWorkletConfig, Glm53DsaAttnLocalWorkletInput,
-    Glm53DsaAttnLocalWorkletResolved, Glm53Fp8MlpLocalWorklet, Glm53Fp8MlpLocalWorkletConfig,
-    Glm53Fp8MlpLocalWorkletInput, Glm53Fp8MlpLocalWorkletResolved, Glm53KdaAttnLocalWorklet,
-    Glm53KdaAttnLocalWorkletConfig, Glm53KdaAttnLocalWorkletInput,
-    Glm53KdaAttnLocalWorkletResolved, Glm53MoeRouterLocalWorklet, Glm53MoeRouterLocalWorkletConfig,
-    Glm53MoeRouterLocalWorkletInput, Glm53RoutedMoeLocalWorklet, Glm53RoutedMoeLocalWorkletConfig,
-    Glm53RoutedMoeLocalWorkletInput, Glm53RoutedMoeLocalWorkletResolved,
+    Glm53DsaAttnLocalWorkletResolved, Glm53KdaAttnLocalWorklet, Glm53KdaAttnLocalWorkletConfig,
+    Glm53KdaAttnLocalWorkletInput, Glm53KdaAttnLocalWorkletResolved, Glm53MlpLocalWorklet,
+    Glm53MlpLocalWorkletConfig, Glm53MlpLocalWorkletInput, Glm53MlpLocalWorkletResolved,
+    Glm53MoeRouterLocalWorklet, Glm53MoeRouterLocalWorkletConfig, Glm53MoeRouterLocalWorkletInput,
+    Glm53RoutedMoeLocalWorklet, Glm53RoutedMoeLocalWorkletConfig, Glm53RoutedMoeLocalWorkletInput,
+    Glm53RoutedMoeLocalWorkletResolved, Glm53WeightPrecision,
 };
 
 const ARCH_KIND: &str = "glm53_flash_vllm_fp8_kda_dsa_moe";
@@ -126,6 +137,14 @@ const SPARSE_ATTN_BACKENDS: &[&str] = &["flashinfer_trtllm_fp8"];
 const MLA_APPEND_BACKENDS: &[&str] = &["vllm_cuda"];
 const INDEX_REMAP_BACKENDS: &[&str] = &["vllm_triton"];
 const FUSED_MOE_BACKENDS: &[&str] = &["flashinfer_trtllm_fp8_block_sm100"];
+/// vLLM passes `RoutingMethodType.DeepSeekV3` for this sigmoid + bias,
+/// single-group router on both the FP8 block and the NVFP4 MoE path
+/// (`router/grouped_topk_router.py:275-284`).
+const ROUTING_METHOD: &str = "deepseek_v3";
+const NVFP4_QUANT_BACKENDS: &[&str] = &["vllm_cuda"];
+/// vLLM's default NVFP4 linear on SM100 (`FlashInferCuteDslNvFp4LinearKernel`).
+const NVFP4_GEMM_BACKENDS: &[&str] = &["flashinfer_cutedsl"];
+const NVFP4_FUSED_MOE_BACKENDS: &[&str] = &["flashinfer_trtllm_sm100"];
 const ALL_REDUCE_BACKENDS: &[&str] = &["flashinfer_mnnvl"];
 /// TP8 stand-in for MNNVL below the 128-token cap. The MNNVL workspace fails
 /// on the profiling host since 2026-10-03 (`cuMulticastAddDevice` returns
@@ -166,6 +185,143 @@ pub struct Glm53FlashModelCfg {
     pub hc_mult: u32,
     pub rms_norm_eps: f64,
     pub vocab_size: u32,
+    pub quant: Glm53FlashQuant,
+}
+
+/// The checkpoint's weight quantization, from its `quantization_config`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Glm53FlashQuant {
+    /// `quant_method: fp8`, 128x128 blocks: dense FFN, shared and routed
+    /// experts FP8 (`zai-org/GLM-5.3-Flash-FP8`).
+    Fp8Block,
+    /// ModelOpt NVFP4 W4A4, 16-element groups: dense FFN and routed experts
+    /// NVFP4, shared expert BF16 (`nvidia/GLM-5.3-Flash-NVFP4`).
+    Nvfp4,
+}
+
+impl Glm53FlashQuant {
+    /// The modeled schemes only. A config that converts a different module set
+    /// (attention, routers or the shared expert) is refused, not approximated.
+    fn from_config(cfg: &Value, num_layers: u32, first_k_dense_replace: u32) -> Result<Self> {
+        let quant = cfg
+            .get("quantization_config")
+            .context("GLM-5.3-Flash is modeled for a quantized checkpoint; config has no quantization_config")?;
+        match quant.get("quant_method").and_then(Value::as_str) {
+            Some("fp8") => {
+                let block = quant.get("weight_block_size");
+                ensure!(
+                    block == Some(&serde_json::json!([128, 128])),
+                    "GLM-5.3-Flash FP8 is modeled with 128x128 weight blocks, got {block:?}"
+                );
+                Ok(Self::Fp8Block)
+            }
+            Some("modelopt") => {
+                Self::check_nvfp4(quant, num_layers, first_k_dense_replace)?;
+                Ok(Self::Nvfp4)
+            }
+            other => anyhow::bail!("GLM-5.3-Flash quant_method {other:?} is not modeled"),
+        }
+    }
+
+    /// ModelOpt NVFP4 as `nvidia/GLM-5.3-Flash-NVFP4` ships it: 16-element
+    /// FP4 groups for weights and activations, FP8 KV, and an `ignore` list
+    /// that leaves exactly every layer's attention and every MoE layer's
+    /// router and shared expert BF16. Every other entry must name a module
+    /// outside the decoder body (`lm_head`, embeddings, vision tower, layers at
+    /// or past `num_hidden_layers`, i.e. MTP).
+    fn check_nvfp4(quant: &Value, num_layers: u32, first_k_dense_replace: u32) -> Result<()> {
+        ensure!(
+            quant.get("quant_algo").and_then(Value::as_str) == Some("NVFP4"),
+            "GLM-5.3-Flash ModelOpt is modeled for quant_algo NVFP4"
+        );
+        if let Some(groups) = quant.get("config_groups").and_then(Value::as_object) {
+            for (name, group) in groups {
+                for side in ["weights", "input_activations"] {
+                    let size = group.pointer(&format!("/{side}/group_size"));
+                    ensure!(
+                        size == Some(&serde_json::json!(16)),
+                        "GLM-5.3-Flash NVFP4 is modeled with 16-element groups; \
+                         config_groups.{name}.{side}.group_size is {size:?}"
+                    );
+                }
+            }
+        }
+        if let Some(kv) = quant.get("kv_cache_scheme").filter(|kv| !kv.is_null()) {
+            ensure!(
+                kv.get("num_bits") == Some(&serde_json::json!(8)),
+                "GLM-5.3-Flash NVFP4 is modeled with an 8-bit KV cache, got {kv}"
+            );
+        }
+        let entries = quant
+            .get("ignore")
+            .and_then(Value::as_array)
+            .context("ModelOpt NVFP4 config needs an `ignore` list")?;
+        // Per body layer: [self_attn*, mlp.gate, mlp.shared_experts*] seen.
+        let mut seen = vec![[false; 3]; num_layers as usize];
+        for entry in entries {
+            let entry = entry
+                .as_str()
+                .context("ModelOpt `ignore` entries must be strings")?;
+            let body = entry.split_once("layers.").and_then(|(prefix, rest)| {
+                let digits = rest
+                    .find(|c: char| !c.is_ascii_digit())
+                    .unwrap_or(rest.len());
+                let layer: u32 = rest[..digits].parse().ok()?;
+                Some((prefix, layer, &rest[digits..]))
+            });
+            match body {
+                Some((prefix, layer, "*"))
+                    if layer >= num_layers && (prefix.is_empty() || prefix.ends_with('.')) => {}
+                Some((_, layer, suffix)) if layer < num_layers => {
+                    let module = match suffix {
+                        ".self_attn*" => 0,
+                        ".mlp.gate" | ".mlp.shared_experts*" if layer >= first_k_dense_replace => {
+                            if suffix == ".mlp.gate" {
+                                1
+                            } else {
+                                2
+                            }
+                        }
+                        _ => anyhow::bail!(
+                            "GLM-5.3-Flash NVFP4 does not model `ignore` entry {entry:?}: \
+                             only attention, MoE routers and shared experts stay BF16"
+                        ),
+                    };
+                    seen[layer as usize][module] = true;
+                }
+                Some(_) => {
+                    anyhow::bail!("GLM-5.3-Flash NVFP4 does not model `ignore` entry {entry:?}")
+                }
+                None => ensure!(
+                    entry == "lm_head"
+                        || entry.ends_with("embed_tokens")
+                        || entry.ends_with("visual*"),
+                    "GLM-5.3-Flash NVFP4 does not model `ignore` entry {entry:?}"
+                ),
+            }
+        }
+        for (layer, [attn, gate, shared]) in seen.into_iter().enumerate() {
+            let moe = layer as u32 >= first_k_dense_replace;
+            ensure!(
+                attn,
+                "GLM-5.3-Flash NVFP4 is modeled with layer {layer} self_attn* left BF16"
+            );
+            ensure!(
+                !moe || (gate && shared),
+                "GLM-5.3-Flash NVFP4 is modeled with layer {layer} mlp.gate and \
+                 mlp.shared_experts* left BF16"
+            );
+        }
+        Ok(())
+    }
+
+    /// The arch-tag word for this scheme.
+    pub fn tag(self) -> &'static str {
+        match self {
+            Self::Fp8Block => "fp8",
+            Self::Nvfp4 => "nvfp4",
+        }
+    }
 }
 
 impl Glm53FlashModelCfg {
@@ -193,7 +349,7 @@ impl Glm53FlashModelCfg {
         let model_type = cfg.get("model_type").and_then(Value::as_str).unwrap_or("");
         ensure!(
             model_type == "glm5_next_text" || model_type == "glm5_next",
-            "{ARCH_KIND} requires a GLM-5.3-Flash (glm5_next) config, got model_type {model_type:?}"
+            "GLM-5.3-Flash arches require a glm5_next config, got model_type {model_type:?}"
         );
         let linear = cfg
             .get("linear_attn_config")
@@ -251,10 +407,21 @@ impl Glm53FlashModelCfg {
             hc_mult: u("hc_mult")?,
             rms_norm_eps: f("rms_norm_eps")?,
             vocab_size: u("vocab_size")?,
+            // HF nests the text model under `text_config` and keeps
+            // `quantization_config` at the top level.
+            quant: Glm53FlashQuant::from_config(
+                if cfg.get("quantization_config").is_some() {
+                    cfg
+                } else {
+                    root
+                },
+                u("num_hidden_layers")?,
+                u("first_k_dense_replace")?,
+            )?,
         };
         ensure!(
             u("qk_rope_head_dim")? == 0,
-            "{ARCH_KIND} models the no-rope MLA latent; qk_rope_head_dim must be 0"
+            "GLM-5.3-Flash arches model the no-rope MLA latent; qk_rope_head_dim must be 0"
         );
         ensure!(
             model.n_shared_experts == 1,
@@ -382,8 +549,8 @@ pub struct Glm53FlashVllmConfigs {
     pub groups: Vec<Glm53FlashLayerGroup>,
     pub kda: Glm53KdaAttnLocalWorkletConfig,
     pub dsa: Glm53DsaAttnLocalWorkletConfig,
-    pub dense_ffn: Glm53Fp8MlpLocalWorkletConfig,
-    pub shared_expert: Glm53Fp8MlpLocalWorkletConfig,
+    pub dense_ffn: Glm53MlpLocalWorkletConfig,
+    pub shared_expert: Glm53MlpLocalWorkletConfig,
     pub router: Glm53MoeRouterLocalWorkletConfig,
     /// One per EP rank, ranked by routed workload; a single config under MoE
     /// TP, where every rank runs the same slice of every expert.
@@ -436,14 +603,39 @@ pub fn build_configs(
         input_bytes_per_token: input.into(),
         output_bytes_per_token: output.into(),
     };
-    let mlp = |intermediate: u32| Glm53Fp8MlpLocalWorkletConfig {
-        hidden: model.hidden.into(),
-        intermediate: intermediate.into(),
-        activation_dtype: ACTIVATION_DTYPE,
-        gpu_name: gpu.clone(),
-        quant_backends: FP8_QUANT_BACKENDS.to_vec(),
-        fp8_gemm_backends: FP8_GEMM_BACKENDS.to_vec(),
-        elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
+    let mlp = |intermediate: u32, precision: Glm53WeightPrecision| {
+        let (quant_backends, gemm_backends) = match precision {
+            Glm53WeightPrecision::Bf16 => (Vec::new(), BF16_GEMM_BACKENDS),
+            Glm53WeightPrecision::Fp8Block => (FP8_QUANT_BACKENDS.to_vec(), FP8_GEMM_BACKENDS),
+            Glm53WeightPrecision::Nvfp4 => (NVFP4_QUANT_BACKENDS.to_vec(), NVFP4_GEMM_BACKENDS),
+        };
+        Glm53MlpLocalWorkletConfig {
+            hidden: model.hidden.into(),
+            intermediate: intermediate.into(),
+            precision,
+            activation_dtype: ACTIVATION_DTYPE,
+            gpu_name: gpu.clone(),
+            quant_backends,
+            gemm_backends: gemm_backends.to_vec(),
+            elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
+        }
+    };
+    // (dense FFN, shared expert, routed experts) as the checkpoint stores them.
+    let (dense_precision, shared_precision, routed_precision) = match model.quant {
+        Glm53FlashQuant::Fp8Block => (
+            Glm53WeightPrecision::Fp8Block,
+            Glm53WeightPrecision::Fp8Block,
+            Glm53WeightPrecision::Fp8Block,
+        ),
+        Glm53FlashQuant::Nvfp4 => (
+            Glm53WeightPrecision::Nvfp4,
+            Glm53WeightPrecision::Bf16,
+            Glm53WeightPrecision::Nvfp4,
+        ),
+    };
+    let (routed_quant_backends, routed_moe_backends) = match model.quant {
+        Glm53FlashQuant::Fp8Block => (FP8_QUANT_BACKENDS, FUSED_MOE_BACKENDS),
+        Glm53FlashQuant::Nvfp4 => (NVFP4_QUANT_BACKENDS, NVFP4_FUSED_MOE_BACKENDS),
     };
     if model.index_topk + model.index_kpool - 1 > SELECTED_K {
         return Err(fit_failed(
@@ -469,10 +661,12 @@ pub fn build_configs(
         topk_group: model.topk_group,
         routed_scaling_numerator: model.routed_scaling.0,
         routed_scaling_denominator: model.routed_scaling.1,
+        precision: routed_precision,
+        routing_method: ROUTING_METHOD.to_string(),
         activation_dtype: ACTIVATION_DTYPE,
         gpu_name: gpu.clone(),
-        quant_backends: FP8_QUANT_BACKENDS.to_vec(),
-        fused_moe_backends: FUSED_MOE_BACKENDS.to_vec(),
+        quant_backends: routed_quant_backends.to_vec(),
+        fused_moe_backends: routed_moe_backends.to_vec(),
         expert_demand: demand.clone(),
         folded_rank_position: 0,
     };
@@ -521,11 +715,17 @@ pub fn build_configs(
             index_remap_backends: INDEX_REMAP_BACKENDS.to_vec(),
             elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
         },
-        dense_ffn: mlp(divide("intermediate_size", model.intermediate_size)?),
-        shared_expert: mlp(divide(
-            "shared expert intermediate",
-            model.moe_intermediate_size * model.n_shared_experts,
-        )?),
+        dense_ffn: mlp(
+            divide("intermediate_size", model.intermediate_size)?,
+            dense_precision,
+        ),
+        shared_expert: mlp(
+            divide(
+                "shared expert intermediate",
+                model.moe_intermediate_size * model.n_shared_experts,
+            )?,
+            shared_precision,
+        ),
         router: Glm53MoeRouterLocalWorkletConfig {
             hidden: model.hidden.into(),
             num_experts: model.n_routed_experts.into(),
@@ -585,8 +785,8 @@ pub struct Glm53FlashVllmResolved {
     pub raw_cfg: Glm53FlashVllmConfigs,
     pub kda: Glm53KdaAttnLocalWorkletResolved,
     pub dsa: Glm53DsaAttnLocalWorkletResolved,
-    pub dense_ffn: Glm53Fp8MlpLocalWorkletResolved,
-    pub shared_expert: Glm53Fp8MlpLocalWorkletResolved,
+    pub dense_ffn: Glm53MlpLocalWorkletResolved,
+    pub shared_expert: Glm53MlpLocalWorkletResolved,
     pub routed: Vec<Glm53RoutedMoeLocalWorkletResolved>,
 }
 
@@ -594,8 +794,8 @@ pub fn resolve_configs(cfgs: &Glm53FlashVllmConfigs) -> Glm53FlashVllmResolved {
     Glm53FlashVllmResolved {
         kda: Glm53KdaAttnLocalWorklet::resolve_config(&cfgs.kda),
         dsa: Glm53DsaAttnLocalWorklet::resolve_config(&cfgs.dsa),
-        dense_ffn: Glm53Fp8MlpLocalWorklet::resolve_config(&cfgs.dense_ffn),
-        shared_expert: Glm53Fp8MlpLocalWorklet::resolve_config(&cfgs.shared_expert),
+        dense_ffn: Glm53MlpLocalWorklet::resolve_config(&cfgs.dense_ffn),
+        shared_expert: Glm53MlpLocalWorklet::resolve_config(&cfgs.shared_expert),
         routed: cfgs
             .routed
             .iter()
@@ -636,7 +836,7 @@ struct MoeBlock {
     name: String,
     router: Glm53MoeRouterLocalWorklet,
     input_glue: Op<ElementwiseKernel>,
-    shared_expert: Glm53Fp8MlpLocalWorklet,
+    shared_expert: Glm53MlpLocalWorklet,
     routed: Vec<Glm53RoutedMoeLocalWorklet>,
     combine_glue: Op<ElementwiseKernel>,
 }
@@ -692,7 +892,7 @@ impl MoeBlock {
         self.router
             .eval(&Glm53MoeRouterLocalWorkletInput { num_tokens }, ev);
         push(&self.input_glue, ElementwiseKernelInput { num_tokens }, ev);
-        let shared = Glm53Fp8MlpLocalWorkletInput { num_tokens };
+        let shared = Glm53MlpLocalWorkletInput { num_tokens };
         // Zero tokens pushes zeros: exactly one of the two copies runs.
         let (concurrent_tokens, serial_tokens) = if overlapped {
             (num_tokens, 0)
@@ -724,7 +924,7 @@ impl MoeBlock {
 }
 
 enum Ffn {
-    Dense(Glm53Fp8MlpLocalWorklet),
+    Dense(Glm53MlpLocalWorklet),
     Moe(MoeBlock),
 }
 
@@ -868,7 +1068,7 @@ impl LayerGroup {
         );
         match &self.ffn {
             Ffn::Dense(worklet) => {
-                worklet.eval(&Glm53Fp8MlpLocalWorkletInput { num_tokens: tokens }, ev)
+                worklet.eval(&Glm53MlpLocalWorkletInput { num_tokens: tokens }, ev)
             }
             Ffn::Moe(block) => block.eval(tokens, ev),
         }
@@ -920,7 +1120,7 @@ pub(crate) fn build_layer_group(
         )?),
     };
     let ffn = match group.ffn {
-        FfnKind::Dense => Ffn::Dense(Glm53Fp8MlpLocalWorklet::build(
+        FfnKind::Dense => Ffn::Dense(Glm53MlpLocalWorklet::build(
             format!("{p}.dense_ffn"),
             resolved.dense_ffn.clone(),
             bridge,
@@ -941,7 +1141,7 @@ pub(crate) fn build_layer_group(
                     ElementwiseKernel::build,
                     bridge,
                 )?,
-                shared_expert: Glm53Fp8MlpLocalWorklet::build(
+                shared_expert: Glm53MlpLocalWorklet::build(
                     format!("{m}.shared_expert"),
                     resolved.shared_expert.clone(),
                     bridge,
@@ -1456,10 +1656,52 @@ mod tests {
     }
 
     fn built_with(parallel: Glm53FlashVllmParallel) -> Glm53FlashVllmModel {
+        built_for(&model_cfg(), parallel)
+    }
+
+    fn nvfp4_model_cfg() -> Glm53FlashModelCfg {
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("model/config/glm53_flash_nvfp4.json");
+        Glm53FlashModelCfg::from_json(&path).unwrap()
+    }
+
+    fn built_for(
+        model: &Glm53FlashModelCfg,
+        parallel: Glm53FlashVllmParallel,
+    ) -> Glm53FlashVllmModel {
         let bridge = PerfApiBridge::new_uninit_for_test();
         bridge.enable_enumerate();
-        let configs = build_configs(&model_cfg(), &parallel, &demand()).unwrap();
+        let configs = build_configs(model, &parallel, &demand()).unwrap();
         build("unified".into(), resolve_configs(&configs), &bridge).unwrap()
+    }
+
+    /// The manifest's non-collective locations equal the map's, and the map
+    /// is the given arch's.
+    fn assert_map_covers(
+        model: &Glm53FlashModelCfg,
+        arch: &str,
+        cases: &[(Glm53FlashVllmParallel, &str, usize)],
+    ) {
+        use std::collections::BTreeSet;
+        for (parallel, map, locations) in cases {
+            let manifest = built_for(model, parallel.clone()).cost_log_manifest();
+            let actual: BTreeSet<_> = manifest
+                .slots
+                .iter()
+                .filter(|slot| !matches!(slot.kind.as_str(), "all_reduce_fusion" | "all_reduce"))
+                .map(|slot| slot.name.as_str())
+                .collect();
+            let map: serde_json::Value = serde_json::from_str(map).unwrap();
+            assert_eq!(map["arch_types"], serde_json::json!([arch]));
+            let mapped: BTreeSet<_> = map["locations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["location"].as_str().unwrap())
+                .collect();
+            assert_eq!(actual, mapped);
+            assert_eq!(mapped.len(), *locations);
+        }
     }
 
     fn layout(tp_size: u16, enable_expert_parallel: bool) -> Glm53FlashVllmParallel {
@@ -1631,58 +1873,142 @@ mod tests {
 
     #[test]
     fn necessary_work_map_covers_the_compiled_locations() {
-        use std::collections::BTreeSet;
         // Kpool DSA work is per-request in context, so the labeler needs each KV length.
         assert!(built().logs_decode_kv_lens());
         // The analyzer picks the map whose locations equal the manifest's, so
         // each routed-rank fan-out has its own. MoE TP4 and TP8 share one.
-        for (parallel, map, locations) in [
-            (
-                layout(4, true),
-                include_str!(
-                    "../../../model/work/location_maps/glm53_flash_vllm_fp8_kda_dsa_moe_unified.json"
+        let moe_tp = include_str!(
+            "../../../model/work/location_maps/glm53_flash_vllm_fp8_kda_dsa_moe_unified_moe_tp.json"
+        );
+        assert_map_covers(
+            &model_cfg(),
+            ARCH_KIND,
+            &[
+                (
+                    layout(4, true),
+                    include_str!(
+                        "../../../model/work/location_maps/glm53_flash_vllm_fp8_kda_dsa_moe_unified.json"
+                    ),
+                    128,
                 ),
-                128,
-            ),
-            (
-                layout(8, true),
-                include_str!(
-                    "../../../model/work/location_maps/glm53_flash_vllm_fp8_kda_dsa_moe_unified_ep8.json"
+                (
+                    layout(8, true),
+                    include_str!(
+                        "../../../model/work/location_maps/glm53_flash_vllm_fp8_kda_dsa_moe_unified_ep8.json"
+                    ),
+                    144,
                 ),
-                144,
-            ),
-            (
-                layout(4, false),
-                include_str!(
-                    "../../../model/work/location_maps/glm53_flash_vllm_fp8_kda_dsa_moe_unified_moe_tp.json"
+                (layout(4, false), moe_tp, 116),
+                (layout(8, false), moe_tp, 116),
+            ],
+        );
+    }
+
+    #[test]
+    fn nvfp4_map_drops_the_bf16_shared_experts_quant() {
+        let moe_tp = include_str!(
+            "../../../model/work/location_maps/glm53_flash_vllm_nvfp4_kda_dsa_moe_unified_moe_tp.json"
+        );
+        // Each MoE layer group's shared expert loses its two quant leaves:
+        // 2 groups x 2 leaves fewer than FP8.
+        assert_map_covers(
+            &nvfp4_model_cfg(),
+            "glm53_flash_vllm_nvfp4_kda_dsa_moe",
+            &[
+                (
+                    layout(4, true),
+                    include_str!(
+                        "../../../model/work/location_maps/glm53_flash_vllm_nvfp4_kda_dsa_moe_unified.json"
+                    ),
+                    124,
                 ),
-                116,
-            ),
-            (
-                layout(8, false),
-                include_str!(
-                    "../../../model/work/location_maps/glm53_flash_vllm_fp8_kda_dsa_moe_unified_moe_tp.json"
+                (
+                    layout(8, true),
+                    include_str!(
+                        "../../../model/work/location_maps/glm53_flash_vllm_nvfp4_kda_dsa_moe_unified_ep8.json"
+                    ),
+                    140,
                 ),
-                116,
-            ),
+                (layout(4, false), moe_tp, 112),
+                (layout(8, false), moe_tp, 112),
+            ],
+        );
+    }
+
+    /// The shipped NVFP4 config with its `quantization_config` edited.
+    fn nvfp4_config_with(edit: impl FnOnce(&mut Value)) -> Result<Glm53FlashModelCfg> {
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("model/config/glm53_flash_nvfp4.json");
+        let mut root: Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        edit(root.get_mut("quantization_config").unwrap());
+        Glm53FlashModelCfg::from_value(&root)
+    }
+
+    fn ignore_list(quant: &mut Value) -> &mut Vec<Value> {
+        quant["ignore"].as_array_mut().unwrap()
+    }
+
+    #[test]
+    fn nvfp4_ignore_list_must_match_the_modeled_bf16_set() {
+        let error = |edit: fn(&mut Value)| nvfp4_config_with(edit).unwrap_err().to_string();
+        assert!(nvfp4_config_with(|_| {}).is_ok());
+        // One layer's attention converted to FP4 is not modeled.
+        let msg = error(|q| {
+            ignore_list(q).retain(|e| e != "model.language_model.layers.7.self_attn*");
+        });
+        assert!(msg.contains("layer 7 self_attn*"), "{msg}");
+        // Nor one MoE layer's shared expert.
+        let msg = error(|q| {
+            ignore_list(q).retain(|e| e != "model.language_model.layers.30.mlp.shared_experts*");
+        });
+        assert!(msg.contains("layer 30 mlp.gate"), "{msg}");
+        // A whole body layer left BF16, or a dense layer's FFN, is refused.
+        for entry in [
+            "model.language_model.layers.0*",
+            "model.language_model.layers.1.mlp*",
+            "model.language_model.layers.12.mlp.experts*",
+            "model.language_model.layers.1.mlp.gate",
         ] {
-            let manifest = built_with(parallel).cost_log_manifest();
-            let actual: BTreeSet<_> = manifest
-                .slots
-                .iter()
-                .filter(|slot| !matches!(slot.kind.as_str(), "all_reduce_fusion" | "all_reduce"))
-                .map(|slot| slot.name.as_str())
-                .collect();
-            let map: serde_json::Value = serde_json::from_str(map).unwrap();
-            assert_eq!(map["arch_types"], serde_json::json!([ARCH_KIND]));
-            let mapped: BTreeSet<_> = map["locations"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|row| row["location"].as_str().unwrap())
-                .collect();
-            assert_eq!(actual, mapped);
-            assert_eq!(mapped.len(), locations);
+            let msg = nvfp4_config_with(|q| ignore_list(q).push(entry.into()))
+                .unwrap_err()
+                .to_string();
+            assert!(msg.contains(entry), "{entry}: {msg}");
+        }
+        // MTP layers past num_hidden_layers may be ignored whole.
+        assert!(nvfp4_config_with(|q| ignore_list(q).push("model.layers.46*".into())).is_ok());
+        let msg = error(|q| q["config_groups"]["group_0"]["weights"]["group_size"] = 32.into());
+        assert!(msg.contains("16-element groups"), "{msg}");
+        let msg = error(|q| q["kv_cache_scheme"]["num_bits"] = 16.into());
+        assert!(msg.contains("8-bit KV cache"), "{msg}");
+    }
+
+    #[test]
+    fn nvfp4_checkpoint_runs_fp4_dense_and_routed_and_a_bf16_shared_expert() {
+        let model = nvfp4_model_cfg();
+        assert_eq!(model.quant, Glm53FlashQuant::Nvfp4);
+        assert_eq!(model_cfg().quant, Glm53FlashQuant::Fp8Block);
+        // Same graph dimensions: only quantization_config differs.
+        assert_eq!(
+            Glm53FlashModelCfg {
+                quant: Glm53FlashQuant::Fp8Block,
+                ..model.clone()
+            },
+            model_cfg()
+        );
+        let resolved = resolve_configs(&build_configs(&model, &parallel(), &demand()).unwrap());
+        assert_eq!(resolved.dense_ffn.gate_up.dtype, DType::Nvfp4E2m1);
+        assert_eq!(resolved.dense_ffn.gate_up.backends, ["flashinfer_cutedsl"]);
+        assert!(matches!(
+            resolved.dense_ffn.down_quant,
+            Some(crate::worklet::Glm53ActivationQuantConfig::Nvfp4(_))
+        ));
+        assert_eq!(resolved.shared_expert.gate_up.dtype, DType::Bf16);
+        assert!(resolved.shared_expert.gate_up_quant.is_none());
+        for routed in &resolved.routed {
+            assert_eq!(routed.fused_moe.weight_format, DType::Nvfp4E2m1);
+            assert_eq!(routed.fused_moe.backends, ["flashinfer_trtllm_sm100"]);
+            assert_eq!(routed.fused_moe.routing_method, "deepseek_v3");
         }
     }
 
@@ -1702,9 +2028,12 @@ mod tests {
 
     #[test]
     fn leaves_appear_in_slot_order_so_labels_match_eval_pushes() {
-        let mut order = Vec::new();
-        leaf_order(&built().cost_tree().root, &mut order);
-        assert_eq!(order, (0..order.len()).collect::<Vec<_>>());
+        for model in [built(), built_for(&nvfp4_model_cfg(), parallel())] {
+            let mut order = Vec::new();
+            leaf_order(&model.cost_tree().root, &mut order);
+            assert_eq!(order, (0..order.len()).collect::<Vec<_>>());
+            assert_eq!(model.cost_log_manifest().slots.len(), model.n_slots);
+        }
     }
 
     #[test]

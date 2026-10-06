@@ -106,6 +106,10 @@ _FP4_ARCHS = frozenset(
         "glm53_vllm_nvfp4_dsa_moe_dflash2",
         "glm52_vllm_nvfp4_pp_dsa_moe",
         "glm52_vllm_nvfp4_dp_attn_dsa_moe",
+        # GLM-5.3-Flash NVFP4; its config's kv_cache_scheme already sets the FP8 cache.
+        "glm53_flash_vllm_nvfp4_kda_dsa_moe",
+        "glm53_flash_vllm_nvfp4_pp_kda_dsa_moe",
+        "glm53_flash_vllm_nvfp4_dp_attn_ep_moe",
     }
 )
 

@@ -57,3 +57,9 @@ zai-org/GLM-5.3-Flash:
   name: GLM-5.3-Flash
   family: GLM
   config: glm53_flash
+# The ModelOpt NVFP4 export of GLM-5.3-Flash: routed experts and the dense FFN
+# in NVFP4; attention, routers and the shared expert stay BF16.
+nvidia/GLM-5.3-Flash-NVFP4:
+  name: GLM-5.3-Flash NVFP4
+  family: GLM
+  config: glm53_flash_nvfp4

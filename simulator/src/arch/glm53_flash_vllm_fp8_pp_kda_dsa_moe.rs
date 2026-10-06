@@ -1,4 +1,7 @@
-//! GLM-5.3-Flash FP8 under pure pipeline parallelism, aligned to vLLM on B200.
+//! GLM-5.3-Flash (FP8 block or NVFP4, [`Glm53FlashQuant`]) under pure pipeline
+//! parallelism, aligned to vLLM on B200.
+//!
+//! [`Glm53FlashQuant`]: crate::arch::glm53_flash_vllm_fp8_kda_dsa_moe::Glm53FlashQuant
 //!
 //! Each pipeline stage is one GPU running a contiguous range of the 45 decoder
 //! layers at TP1 / EP1: all 64 KDA heads, all 64 MLA heads, and all 288 routed
@@ -492,9 +495,21 @@ impl Glm53FlashVllmFp8PpStageModel {
             children.push(input.embedding.compile(builder));
             children.push(input.hc_expand.compile(builder));
         }
+        let (start, end) = self.layer_range;
         for (group, count) in &self.groups {
+            // The stage's own layers of this group, so a manifest says which
+            // layer each section folds (tools/pp-layer-balance reads them).
+            let layers: Vec<u32> = group
+                .layers()
+                .iter()
+                .copied()
+                .filter(|layer| (start..end).contains(layer))
+                .collect();
             children.push(CostNode::Labeled {
-                label: format!("{} x{count} (Scale {count})", group.label()),
+                label: format!(
+                    "{} x{count} (Scale {count}) layers {layers:?}",
+                    group.label()
+                ),
                 child: Box::new(CostNode::Scale {
                     n: *count,
                     child: Box::new(group.compile_layer(builder)),
@@ -817,8 +832,12 @@ mod tests {
     use std::path::Path;
 
     fn model_cfg() -> Glm53FlashModelCfg {
+        config("glm53_flash")
+    }
+
+    fn config(name: &str) -> Glm53FlashModelCfg {
         Glm53FlashModelCfg::from_json(
-            &Path::new(env!("CARGO_MANIFEST_DIR")).join("model/config/glm53_flash.json"),
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("model/config/{name}.json")),
         )
         .unwrap()
     }
@@ -838,7 +857,11 @@ mod tests {
     }
 
     fn built_named(name: &str, pp_size: u16) -> Glm53FlashVllmFp8PpModel {
-        let cfgs = build_configs(&model_cfg(), &parallel(pp_size), &uniform()).unwrap();
+        built_for(&model_cfg(), name, pp_size)
+    }
+
+    fn built_for(model: &Glm53FlashModelCfg, name: &str, pp_size: u16) -> Glm53FlashVllmFp8PpModel {
+        let cfgs = build_configs(model, &parallel(pp_size), &uniform()).unwrap();
         let bridge = PerfApiBridge::new_uninit_for_test();
         bridge.enable_enumerate();
         build(name.to_string(), resolve_configs(&cfgs), &bridge).unwrap()
@@ -921,6 +944,38 @@ mod tests {
                 assert!(!slot.name.contains("routed_rank1"), "{}", slot.name);
             }
         }
+    }
+
+    /// tools/pp-layer-balance maps layers to kinds from these labels.
+    #[test]
+    fn stage_group_labels_name_their_layers() {
+        let model = built(4);
+        let mut seen = Vec::new();
+        for stage in model.stages() {
+            let (start, end) = stage.layer_range();
+            let mut stage_layers = Vec::new();
+            for label in stage.cost_log_manifest().node_labels.iter().flatten() {
+                let Some((head, list)) = label.split_once(" layers [") else {
+                    continue;
+                };
+                if !head.contains("(Scale ") {
+                    continue;
+                }
+                let (_, scale) = head.rsplit_once(" (Scale ").unwrap();
+                let count: usize = scale.trim_end_matches(')').parse().unwrap();
+                let layers: Vec<u32> = list
+                    .trim_end_matches(']')
+                    .split(", ")
+                    .map(|layer| layer.parse().unwrap())
+                    .collect();
+                assert_eq!(layers.len(), count, "{label}");
+                stage_layers.extend(layers);
+            }
+            stage_layers.sort_unstable();
+            assert_eq!(stage_layers, (start..end).collect::<Vec<_>>());
+            seen.extend(stage_layers);
+        }
+        assert_eq!(seen, (0..45).collect::<Vec<_>>());
     }
 
     #[test]
@@ -1058,13 +1113,9 @@ mod tests {
         assert!(model.check_input(&too_long).is_err());
     }
 
-    #[test]
-    fn pp_location_map_matches_every_noncommunication_manifest_location() {
-        let map: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../model/work/location_maps/glm53_flash_vllm_fp8_pp_kda_dsa_moe_pp.json"
-        ))
-        .unwrap();
-        assert_eq!(map["arch_types"], serde_json::json!([ARCH_KIND]));
+    fn assert_map_covers(model: &Glm53FlashModelCfg, arch: &str, map: &str, locations: usize) {
+        let map: serde_json::Value = serde_json::from_str(map).unwrap();
+        assert_eq!(map["arch_types"], serde_json::json!([arch]));
         let mapped: BTreeSet<String> = map["locations"]
             .as_array()
             .unwrap()
@@ -1072,14 +1123,38 @@ mod tests {
             .map(|row| row["location"].as_str().unwrap().to_string())
             .collect();
         for pp_size in [4_u16, 8, 11] {
-            let locations: BTreeSet<String> = built_named("pp", pp_size)
+            let actual: BTreeSet<String> = built_for(model, "pp", pp_size)
                 .cost_log_manifest()
                 .slots
                 .into_iter()
                 .map(|slot| slot.name)
                 .collect();
-            assert_eq!(locations.len(), 116);
-            assert_eq!(mapped, locations);
+            assert_eq!(actual.len(), locations);
+            assert_eq!(mapped, actual);
         }
+    }
+
+    #[test]
+    fn pp_location_map_matches_every_noncommunication_manifest_location() {
+        assert_map_covers(
+            &model_cfg(),
+            ARCH_KIND,
+            include_str!(
+                "../../../model/work/location_maps/glm53_flash_vllm_fp8_pp_kda_dsa_moe_pp.json"
+            ),
+            116,
+        );
+    }
+
+    #[test]
+    fn nvfp4_pp_map_drops_the_bf16_shared_expert_quant() {
+        assert_map_covers(
+            &config("glm53_flash_nvfp4"),
+            "glm53_flash_vllm_nvfp4_pp_kda_dsa_moe",
+            include_str!(
+                "../../../model/work/location_maps/glm53_flash_vllm_nvfp4_pp_kda_dsa_moe_pp.json"
+            ),
+            112,
+        );
     }
 }

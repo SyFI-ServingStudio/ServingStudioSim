@@ -62,7 +62,7 @@ pub use glm52_vllm_nvfp4_pp_dsa_moe::{
     Glm52VllmNvfp4PpResolved, Glm52VllmNvfp4PpStageModel,
 };
 pub use glm53_flash_vllm_fp8_kda_dsa_moe::{
-    Glm53FlashModelCfg, Glm53FlashVllmModel, Glm53FlashVllmParallel,
+    Glm53FlashModelCfg, Glm53FlashQuant, Glm53FlashVllmModel, Glm53FlashVllmParallel,
 };
 pub use glm53_flash_vllm_fp8_pp_kda_dsa_moe::{
     Glm53FlashVllmFp8PpModel, Glm53FlashVllmFp8PpParallel, Glm53FlashVllmFp8PpStageModel,

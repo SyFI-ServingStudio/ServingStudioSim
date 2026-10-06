@@ -56,7 +56,12 @@ class Nvfp4FusedMoeArgs(KernelArgs):
         ),
     )
     routing_method: str = arg(
-        doc="Router selection rule: minimax2 for NVFP4, deepseek_v3 for FP8 block-scale."
+        doc=(
+            "Router selection rule. minimax2: sigmoid + bias top-k over BF16 logits."
+            " deepseek_v3: DeepSeekV3 sigmoid + bias top-k with the routed scale, over"
+            " FP32 logits and bias. The vLLM NVFP4 backends take either, the SGLang"
+            " backend minimax2, the FP8 block-scale backend deepseek_v3."
+        )
     )
     n_group: int = arg(unit="groups", doc="Expert groups considered by the router.")
     topk_group: int = arg(unit="groups", doc="Expert groups retained before expert selection.")
@@ -95,7 +100,8 @@ DOC = KernelDoc(
         "TFLOPS = 2·local_rows·(hidden_size·2·intermediate_size "
         "+ intermediate_size·hidden_size) / time",
         "output_rows = num_tokens for vLLM; local_rows for SGLang",
-        "routing_bytes = 2·num_tokens·num_experts + 2·num_experts",
+        "routing_bytes = b·(num_tokens·num_experts + num_experts); "
+        "b = 2 for minimax2 (BF16 logits and bias), 4 for deepseek_v3 (FP32)",
         "routed backend: routing_bytes = 8·num_tokens·top_k",
         "activation_bytes = local_rows·(hidden_size/2 + hidden_size/group_size)",
         "weight_bytes = active_experts·(intermediate_size·hidden_size "
@@ -120,13 +126,17 @@ DOC = KernelDoc(
     caveats=(
         "The backends end at different points, so their times cover "
         "different work: the vLLM backends include the combine, SGLang does not.",
-        "The FP8 block-scale backend accepts only ungrouped deepseek_v3 routing "
-        "(n_group = topk_group = 1); its autotuner stops at 8192 tokens, so larger "
+        "deepseek_v3 routing is accepted only ungrouped (n_group = topk_group = 1), "
+        "where forced logits can realize any per-expert histogram; FlashInfer then runs "
+        "the same routing kernel as minimax2, with the routed scale and FP32 inputs.",
+        "The FP8 block-scale backend's autotuner stops at 8192 tokens, so larger "
         "shapes reuse the largest tuned bucket.",
         "Activation quantization is outside the call, and the router logits are synthetic.",
-        "The routed backend tunes up to max(8192, next power of two ≥ num_tokens); "
+        "The vLLM backends tune up to max(8192, next power of two ≥ num_tokens); "
         "vLLM tunes up to max_num_batched_tokens·dp_size, which picks the same "
         "bucket for every shape it serves.",
+        "No SwiGLU clamp is passed (gemm1_clamp_limit is None); vLLM passes the "
+        "model's swiglu_limit when it has one.",
         "GB/s counts logical traffic for the local rows and the experts that "
         "have rows; small side outputs are left out.",
     ),
