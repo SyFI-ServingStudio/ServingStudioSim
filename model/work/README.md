@@ -111,6 +111,8 @@ attention/glm52_dsa.py  GLM MLA/DSA             (future: fine-grained experts)
 models/llama3.py     compose(GQA, dense)       models/qwen3_moe.py  compose(GQA, MoE)
 models/qwen3_6.py    hybrid [GDN×3, GQA×1] + dense    registry.py  architectures[0] -> builder
 models/glm52.py      dense/full-index + sparse/index-share stacks + shared MoE
+attention/deepseek_v41.py  DeepSeek-V4.1 window + compressed sparse attention
+models/deepseek_v41.py     10 role stacks + MXFP4 MoE + FP32 mHC mixing + engram
 ```
 
 - **New attention (MLA/SWA/SSM)** → one new `attention/*.py`; every FFN combination is free.
@@ -151,6 +153,19 @@ work and exact parameter totals.
 The only currency between a spec and `core.py` is
 `MatmulGroup(name, n, k, activated_mult, total_count, bucket)`; `core.py` applies
 `flops = 2·(matmul_tokens·activated_mult)·n·k` and folds `× num_layers` uniformly.
+
+DeepSeek-V4.1-Flash attends to each layer's 128-token sliding window plus, at
+compressed layers, the top-512 entries of a ratio-1 or ratio-2 compressed KV
+cache shared from four KV-source layers; index owners score every compressed
+entry, while the four candidate-consumer indexers score only the 2048 x 8
+positions the layer-20 candidate source keeps. Cache entries use the reference
+numerics (window 528 B, compressed 288 B, MXFP4 index keys 68 B). mHC mixing
+matrices are FP32 matmuls (`mhc` FLOP bucket); the engram tables are gathered
+weights read only at the hashed rows (`engram` bucket and parameter key). The
+analyzer sends one summed interaction per phase, so this spec reconstructs a
+mean request per phase: exact for a single request, an over-estimate of the
+sparse-attention floor when a batch straddles the window/top-k caps. The DSpark
+MTP layers and the vision tower are not labeled.
 
 ## Modality-agnostic workload
 

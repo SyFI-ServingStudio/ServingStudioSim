@@ -63,3 +63,7 @@ nvidia/GLM-5.3-Flash-NVFP4:
   name: GLM-5.3-Flash NVFP4
   family: GLM
   config: glm53_flash_nvfp4
+deepseek-ai/DeepSeek-V4.1-Flash:
+  name: DeepSeek V4.1 Flash
+  family: DeepSeek
+  config: deepseek_v41_flash

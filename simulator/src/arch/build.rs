@@ -21,27 +21,27 @@ use crate::arch::contract::SpeculativeUnifiedModel;
 use crate::arch::model_cfg::ModelCfg;
 use crate::arch::moe_model_cfg::MoeModelCfg;
 use crate::arch::{
-    deepseek_v4_vllm, glm52_sglang_nvfp4_tp_dsa_moe, glm52_vllm_dsa_moe,
+    deepseek_v41_vllm, deepseek_v4_vllm, glm52_sglang_nvfp4_tp_dsa_moe, glm52_vllm_dsa_moe,
     glm52_vllm_nvfp4_dp_attn_dsa_moe, glm52_vllm_nvfp4_dsa_moe, glm52_vllm_nvfp4_pp_dsa_moe,
     glm53_flash_vllm_fp8_dp_attn_ep_moe, glm53_flash_vllm_fp8_kda_dsa_moe,
     glm53_flash_vllm_fp8_pp_kda_dsa_moe, glm53_vllm_nvfp4_dsa_moe_dflash2, llama3_dense,
     llama3_dense_tp, llama3_dp_attn_tp_ffn, qwen36_local, qwen3_attn_layerwise,
     qwen3_ffn_moe_layerwise, qwen3_fp8_ffn_moe_layerwise, qwen3_moe_dp_attn_ep_ffn,
     qwen3_moe_fp8_dp_attn_ep_ffn, qwen3_vllm_moe_dp_attn_ep_ffn, AttnLayerwiseModel,
-    DeepseekV4ModelCfg, DeepseekV4VllmModel, DeepseekV4VllmParallel, DenseParallel,
-    DenseTpParallel, Dflash2DraftResolved, DpAttnTpFfnParallel, FfnLayerwiseModel, Glm52ModelCfg,
-    Glm52MtpMode, Glm52SglangNvfp4TpDsaMoeModel, Glm52SglangNvfp4TpDsaMoeParallel,
-    Glm52VllmDsaMoeModel, Glm52VllmDsaMoeParallel, Glm52VllmNvfp4DpAttnDsaMoeModel,
-    Glm52VllmNvfp4DpAttnParallel, Glm52VllmNvfp4DsaMoeModel, Glm52VllmNvfp4DsaMoeParallel,
-    Glm52VllmNvfp4DsaMoeSpeculativeModel, Glm52VllmNvfp4PpDsaMoeModel, Glm52VllmNvfp4PpParallel,
-    Glm53FlashModelCfg, Glm53FlashQuant, Glm53FlashVllmFp8PpModel, Glm53FlashVllmFp8PpParallel,
-    Glm53FlashVllmModel, Glm53FlashVllmParallel, Glm53VllmNvfp4DsaMoeDflash2Model,
-    IterwiseUnifiedModel, Llama3DenseModel, Llama3DenseTpModel, Llama3DpAttnTpFfnModel,
-    Qwen36LocalModel, Qwen36LocalParallel, Qwen36ModelCfg, Qwen3AttnLayerwiseModel,
-    Qwen3AttnParallel, Qwen3FfnMoeLayerwiseModel, Qwen3FfnMoeParallel,
-    Qwen3Fp8FfnMoeLayerwiseModel, Qwen3Fp8FfnMoeParallel, Qwen3MoeDpAttnEpFfnModel,
-    Qwen3MoeFp8DpAttnEpFfnModel, Qwen3MoeFp8Parallel, Qwen3MoeParallel,
-    Qwen3VllmMoeDpAttnEpFfnModel, Qwen3VllmMoeParallel,
+    DeepseekV41ModelCfg, DeepseekV41VllmModel, DeepseekV41VllmParallel, DeepseekV4ModelCfg,
+    DeepseekV4VllmModel, DeepseekV4VllmParallel, DenseParallel, DenseTpParallel,
+    Dflash2DraftResolved, DpAttnTpFfnParallel, FfnLayerwiseModel, Glm52ModelCfg, Glm52MtpMode,
+    Glm52SglangNvfp4TpDsaMoeModel, Glm52SglangNvfp4TpDsaMoeParallel, Glm52VllmDsaMoeModel,
+    Glm52VllmDsaMoeParallel, Glm52VllmNvfp4DpAttnDsaMoeModel, Glm52VllmNvfp4DpAttnParallel,
+    Glm52VllmNvfp4DsaMoeModel, Glm52VllmNvfp4DsaMoeParallel, Glm52VllmNvfp4DsaMoeSpeculativeModel,
+    Glm52VllmNvfp4PpDsaMoeModel, Glm52VllmNvfp4PpParallel, Glm53FlashModelCfg, Glm53FlashQuant,
+    Glm53FlashVllmFp8PpModel, Glm53FlashVllmFp8PpParallel, Glm53FlashVllmModel,
+    Glm53FlashVllmParallel, Glm53VllmNvfp4DsaMoeDflash2Model, IterwiseUnifiedModel,
+    Llama3DenseModel, Llama3DenseTpModel, Llama3DpAttnTpFfnModel, Qwen36LocalModel,
+    Qwen36LocalParallel, Qwen36ModelCfg, Qwen3AttnLayerwiseModel, Qwen3AttnParallel,
+    Qwen3FfnMoeLayerwiseModel, Qwen3FfnMoeParallel, Qwen3Fp8FfnMoeLayerwiseModel,
+    Qwen3Fp8FfnMoeParallel, Qwen3MoeDpAttnEpFfnModel, Qwen3MoeFp8DpAttnEpFfnModel,
+    Qwen3MoeFp8Parallel, Qwen3MoeParallel, Qwen3VllmMoeDpAttnEpFfnModel, Qwen3VllmMoeParallel,
 };
 use crate::common::Fabric;
 use crate::timing::bridge::DType;
@@ -996,6 +996,58 @@ pub fn deepseek_v4_vllm(
         .context("building DeepSeek V4 vLLM model (often a missing profile.db row)")
 }
 
+/// Build DeepSeek-V4.1-Flash (B200, TP4 attention + EP4 experts). Routed demand
+/// resolves through the shared [`ExpertDemandSource`]: one binding over all 40
+/// routed layers, verify width 1 (no speculative decoding). The MoE rows were
+/// profiled on the capture's token corpus, so `routing = corpus` is the
+/// production choice. `serialize_streams` changes only CostTree composition;
+/// `decoder_swa_bounded_replay` (a counterfactual, see
+/// [`deepseek_v41_vllm::BoundedReplay`]) changes only the late layers' inputs.
+#[allow(clippy::too_many_arguments)]
+pub fn deepseek_v41_vllm(
+    model_spec: &ModelSpec,
+    routing_kind: RoutingKind,
+    routing_seed: Option<u64>,
+    expert_popularity_file: Option<&str>,
+    token_corpus_file: Option<&str>,
+    serialize_streams: bool,
+    decoder_swa_bounded_replay: bool,
+    max_model_len: Option<u32>,
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<DeepseekV41VllmModel> {
+    let model_cfg = DeepseekV41ModelCfg::from_json(Path::new(&model_spec.model_config), model_spec)
+        .context("loading exact DeepSeek-V4.1-Flash model config")?;
+    let parallel = DeepseekV41VllmParallel {
+        tp_size: deepseek_v41_vllm::TP_SIZE,
+        ep_size: deepseek_v41_vllm::EP_SIZE,
+        gpu_name: gpu.to_string(),
+        serialize_streams,
+        decoder_swa_bounded_replay,
+        max_model_len: deepseek_v41_vllm::resolve_max_model_len(
+            max_model_len,
+            model_cfg.max_position_embeddings,
+        )?,
+    };
+    let source = ExpertDemandSource {
+        kind: routing_kind,
+        seed: routing_seed,
+        num_experts: model_cfg.num_experts,
+        experts_per_token: model_cfg.top_k,
+        ep_size: parallel.ep_size as u16,
+        expert_popularity_file,
+        token_corpus_file,
+        num_routed_layers: model_cfg.num_layers,
+    };
+    let demand = source.demand(0..model_cfg.num_layers as usize, 1)?;
+    let configs = deepseek_v41_vllm::build_configs(&model_cfg, &parallel, &demand)
+        .context("expanding DeepSeek-V4.1-Flash architecture configs")?;
+    let resolved = deepseek_v41_vllm::resolve_configs(&configs);
+    deepseek_v41_vllm::build(name.to_string(), resolved, bridge)
+        .context("building DeepSeek-V4.1-Flash vLLM model (often a missing profile.db row)")
+}
+
 /// Build the GLM-5.2 model in aligned vLLM kernel granularity.
 #[allow(clippy::too_many_arguments)]
 pub fn glm52_vllm_dsa_moe(
@@ -1903,6 +1955,48 @@ pub fn build_iter_model(
             expert_popularity_file.as_deref(),
             true,
             None,
+            gpu,
+            name,
+            bridge,
+        )?),
+        IterArchSel::DeepseekV41Vllm {
+            model,
+            routing,
+            routing_seed,
+            expert_popularity_file,
+            token_corpus_file,
+            decoder_swa_bounded_replay,
+            max_model_len,
+        } => Box::new(deepseek_v41_vllm(
+            model,
+            *routing,
+            *routing_seed,
+            expert_popularity_file.as_deref(),
+            token_corpus_file.as_deref(),
+            false,
+            *decoder_swa_bounded_replay,
+            *max_model_len,
+            gpu,
+            name,
+            bridge,
+        )?),
+        IterArchSel::DeepseekV41VllmSerialStreams {
+            model,
+            routing,
+            routing_seed,
+            expert_popularity_file,
+            token_corpus_file,
+            decoder_swa_bounded_replay,
+            max_model_len,
+        } => Box::new(deepseek_v41_vllm(
+            model,
+            *routing,
+            *routing_seed,
+            expert_popularity_file.as_deref(),
+            token_corpus_file.as_deref(),
+            true,
+            *decoder_swa_bounded_replay,
+            *max_model_len,
             gpu,
             name,
             bridge,

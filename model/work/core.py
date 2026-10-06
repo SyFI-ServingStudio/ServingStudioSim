@@ -21,6 +21,7 @@ that define what does (and does not) count toward the minimum.
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -289,6 +290,12 @@ _FLOPS_BUCKET = {
     "shared_expert": "ffn",
     "router": "router",
     "residual_mix": "residual_mix",
+    # Optional buckets: they appear in `WorkLabel.flops` only for a model that
+    # has such rows, so the historical five-key dict of every other model is
+    # unchanged. DeepSeek-V4.1's hyper-connection mixing projections and its
+    # engram n-gram value projection are neither attention nor FFN.
+    "mhc": "mhc",
+    "engram": "engram",
 }
 _PARAM_BUCKET = {
     "attn_proj": "attn",
@@ -297,6 +304,8 @@ _PARAM_BUCKET = {
     "shared_expert": "shared",
     "router": "router",
     "residual_mix": "residual_mix",
+    "mhc": "mhc",
+    "engram": "engram",
 }
 
 
@@ -314,6 +323,15 @@ class MatmulGroup:
     ``modules_to_not_convert`` is matched against, so a model whose config
     declares a ``quantization_config`` must fill it on every group — see
     :meth:`Model.weight_bytes_per_instance`.
+
+    ``storage_dtype`` pins a matrix the checkpoint stores outside both the master
+    dtype and the quantization scheme (DeepSeek-V4.1 keeps its hyper-connection
+    mixing matrices in FP32); ``compute_dtype`` then names the peak its matmul is
+    floored against. Both default to the checkpoint-wide rules.
+
+    ``rows`` is how many positions pass through this matrix, when that is not
+    every matmul token: DeepSeek-V4.1's indexer key projection runs once per
+    compressed KV entry, not once per token. It receives the stack's workload.
     """
 
     name: str
@@ -324,6 +342,13 @@ class MatmulGroup:
     bucket: str = "dense_ffn"
     routed: bool = False  # weights are routed experts -> only the hit subset is loaded
     module: str | None = None
+    storage_dtype: str | None = None
+    compute_dtype: str | None = None
+    rows: Callable[[Workload], float] | None = None
+
+    def matmul_rows(self, workload: Workload) -> float:
+        """Positions multiplied by this matrix in ``workload``."""
+        return workload.matmul_tokens if self.rows is None else self.rows(workload)
 
     @property
     def activated_params(self) -> int:
@@ -604,6 +629,14 @@ class LearnedWeightGroup:
 
     ``count`` / ``param_count`` split traversals from distinct copies exactly as
     :class:`LayerStack` does.
+
+    ``dtype_bytes`` overrides the master dtype for a vector stored otherwise
+    (FP32 attention sinks, or an FP8 table whose per-row scales are folded into a
+    fractional bytes-per-element). ``read_elements`` is how many elements one
+    forward must read when that is not the whole group — a gathered table such as
+    DeepSeek-V4.1's engram, which touches only the hashed rows. It receives the
+    main workload. ``activated_elements`` is the per-token parameter count when
+    that is not the whole group.
     """
 
     name: str
@@ -619,6 +652,18 @@ class LearnedWeightGroup:
     #: touches, which the owning spec reports in its own semantic rows. Only
     #: honored for a stack component's groups.
     gathered: bool = False
+    dtype_bytes: float | None = None
+    read_elements: Callable[[Workload], float] | None = None
+    activated_elements: int | None = None
+
+    def read_bytes(self, workload: Workload, master_dtype_bytes: float) -> float:
+        elements = self.elements if self.read_elements is None else self.read_elements(workload)
+        return elements * (master_dtype_bytes if self.dtype_bytes is None else self.dtype_bytes)
+
+    def activated_fraction(self) -> float:
+        if self.activated_elements is None or self.elements == 0:
+            return 1.0
+        return self.activated_elements / self.elements
 
 
 # Existing builders use the more specific historical name.
@@ -673,15 +718,22 @@ class Model:
         compulsory traffic of exactly the path that dominates a quantized MoE.
         """
         elements = float(group.n) * float(group.k)
+        if group.storage_dtype is not None:
+            return elements * dtype_bytes(group.storage_dtype)
         if self.quant is None or not self._is_converted(group):
             return elements * self.weight_dtype_bytes
-        return elements * self.quant.bytes_per_weight + self.quant.scale_bytes(group.n, group.k)
+        scheme = self.quant.scheme_for(group.module)
+        return elements * scheme.bytes_per_weight + scheme.scale_bytes(group.n, group.k)
 
     def matmul_compute_dtype(self, group: MatmulGroup) -> str:
         """Precision ``group``'s matmul executes at (selects its peak TFLOP/s)."""
+        if group.compute_dtype is not None:
+            return canonical_dtype(group.compute_dtype)
+        if group.storage_dtype is not None:
+            return canonical_dtype(group.storage_dtype)
         if self.quant is None or not self._is_converted(group):
             return self.master_dtype
-        return self.quant.compute_dtype
+        return self.quant.scheme_for(group.module).compute_dtype
 
     def _is_converted(self, group: MatmulGroup) -> bool:
         if group.module is None:
@@ -819,12 +871,13 @@ class Model:
                 *mixer_groups,
             ):
                 loaded = group.loaded_instances(tokens)
+                rows = group.matmul_rows(stack_wl)
                 segments.append(
                     Segment(
                         name=f"{prefix}{group.name}",
                         bucket=_FLOPS_BUCKET[group.bucket],
                         byte_kind="weights",
-                        flops=2.0 * tokens * group.activated_mult * group.n * group.k,
+                        flops=2.0 * rows * group.activated_mult * group.n * group.k,
                         bytes=loaded * self.weight_bytes_per_instance(group),
                         count=stack.count,
                         compute_dtype=self.matmul_compute_dtype(group),
@@ -833,8 +886,8 @@ class Model:
                 instances = stack.distinct_instances
                 activated_params += group.activated_params * instances
                 total_params += group.total_params * instances
-                breakdown.setdefault(_PARAM_BUCKET[group.bucket], 0)
-                breakdown[_PARAM_BUCKET[group.bucket]] += group.total_params * instances
+                param_key = _PARAM_BUCKET[group.bucket]
+                breakdown[param_key] = breakdown.get(param_key, 0) + group.total_params * instances
 
             for component in (stack.attn, stack.ffn, stack.mixer):
                 if component is None:
@@ -847,16 +900,15 @@ class Model:
                                 bucket="embedding",
                                 byte_kind="weights",
                                 flops=0.0,
-                                bytes=weight.elements * self.weight_dtype_bytes,
+                                bytes=weight.read_bytes(stack_wl, self.weight_dtype_bytes),
                                 count=stack.count,
                                 compute_dtype=self.master_dtype,
                             )
                         )
                     params = weight.elements * stack.distinct_instances
-                    activated_params += params
+                    activated_params += round(params * weight.activated_fraction())
                     total_params += params
-                    breakdown.setdefault(weight.breakdown, 0)
-                    breakdown[weight.breakdown] += params
+                    breakdown[weight.breakdown] = breakdown.get(weight.breakdown, 0) + params
 
             # Attention semantic phases remain independent of simulator shapes.
             # MLA/DSA exposes several rows (indexer, sparse attention, and two
@@ -934,7 +986,7 @@ class Model:
                     bucket="embedding",
                     byte_kind="weights",
                     flops=0.0,
-                    bytes=norm_weight.elements * self.weight_dtype_bytes,
+                    bytes=norm_weight.read_bytes(wl, self.weight_dtype_bytes),
                     count=norm_weight.count,
                     compute_dtype=self.master_dtype,
                 )
@@ -942,9 +994,9 @@ class Model:
             norm_params = norm_weight.elements * (
                 norm_weight.count if norm_weight.param_count is None else norm_weight.param_count
             )
-            activated_params += norm_params
+            activated_params += round(norm_params * norm_weight.activated_fraction())
             total_params += norm_params
-            breakdown[norm_weight.breakdown] += norm_params
+            breakdown[norm_weight.breakdown] = breakdown.get(norm_weight.breakdown, 0) + norm_params
 
         for component in self.epilogue:
             for semantic in component.semantic_segments(wl):
@@ -1034,6 +1086,9 @@ class Model:
                 flops.setdefault(segment.bucket, 0.0)
             if segment.bucket in flops:
                 flops[segment.bucket] += segment.flops_total
+            elif segment.bucket in _FLOPS_BUCKET.values():
+                # An optional bucket (see _FLOPS_BUCKET) exists only where used.
+                flops[segment.bucket] = flops.get(segment.bucket, 0.0) + segment.flops_total
             byte_sum[segment.byte_kind] += segment.bytes_total
 
         # "activated" has more than one defensible convention; expose all of them

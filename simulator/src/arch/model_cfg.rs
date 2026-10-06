@@ -114,6 +114,7 @@ fn parse_dtype(s: &str) -> Result<DType> {
         "float32" | "fp32" => DType::Fp32,
         "float8_e4m3fn" | "fp8_e4m3" => DType::Fp8E4m3,
         "float8_e5m2" | "fp8_e5m2" => DType::Fp8E5m2,
+        "mxfp8_e4m3" => DType::Mxfp8E4m3,
         "int8" => DType::Int8,
         "int4" => DType::Int4,
         other => bail!("unsupported torch_dtype {other:?}"),

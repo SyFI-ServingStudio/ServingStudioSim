@@ -41,6 +41,10 @@ use crate::timing::kernels::{
     VllmMlaRopeKernelInput,
 };
 
+use crate::timing::kernels::CompressedSparseMlaRopeCastKernelInput;
+use crate::timing::kernels::QPadKvRopeMxfp8InsertKernelInput;
+use crate::timing::kernels::EngramLookupKernelInput;
+
 /// The prefill aggregating leaf's input: the full `(prefix_len, append_len)`
 /// fan-out the attention op summed into one slot (many prefill requests fold to a
 /// single leaf).
@@ -148,6 +152,9 @@ log_inputs! {
     KvCompressStore => KvCompressStoreKernelInput,
     CompressedSparseMlaDecode => CompressedSparseMlaDecodeKernelInput,
     CompressedSparseMlaPrefill => CompressedSparseMlaPrefillKernelInput,
+    CompressedSparseMlaRopeCast => CompressedSparseMlaRopeCastKernelInput,
+    QPadKvRopeMxfp8Insert => QPadKvRopeMxfp8InsertKernelInput,
+    EngramLookup => EngramLookupKernelInput,
     MoeTopkSoftplusSqrt => MoeTopkSoftplusSqrtKernelInput,
     GemmFp32Output => GemmFp32OutputKernelInput,
     MlaRopeQuantizeFp8 => MlaRopeQuantizeFp8KernelInput,

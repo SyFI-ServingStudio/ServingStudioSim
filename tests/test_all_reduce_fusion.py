@@ -73,6 +73,10 @@ def test_mnnvl_oneshot_rule_matches_flashinfer_threshold():
     assert not uses_oneshot(4, 33, 4096, DType.BF16)
     assert uses_oneshot(8, 16, 4096, DType.BF16)
     assert not uses_oneshot(8, 17, 4096, DType.BF16)
+    # Hidden 5120 at TP4: one-shot through T=25, so a
+    # T=48 decode runs twoshotAllreduceKernel.
+    assert uses_oneshot(4, 25, 5120, DType.BF16)
+    assert not uses_oneshot(4, 26, 5120, DType.BF16)
 
 
 def test_mnnvl_batch_rejects_non_production_specs_and_forwards_the_rest(monkeypatch):

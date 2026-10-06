@@ -26,11 +26,16 @@ class DType(StrEnum):
     FP32 = "fp32"
     FP8_E4M3 = "fp8_e4m3"
     FP8_E5M2 = "fp8_e5m2"
+    # OCP MX block format: e4m3 data with one ue8m0 scale per 32 elements.
+    MXFP8_E4M3 = "mxfp8_e4m3"
     INT8 = "int8"
     INT4 = "int4"
     # Packed e2m1 elements with one fp8 scale per 16-element group: the operand
     # format of Blackwell FP4 tensor cores. No torch dtype holds it unpacked.
     NVFP4_E2M1 = "nvfp4_e2m1"
+    # OCP MX block format: packed e2m1 elements with one ue8m0 scale per 32
+    # elements. No torch dtype holds it unpacked.
+    MXFP4_E2M1 = "mxfp4_e2m1"
 
     @classmethod
     def from_value(cls, value: Any) -> DType:
@@ -45,6 +50,7 @@ class DType(StrEnum):
             "torch.bfloat16": cls.BF16,
             "float32": cls.FP32,
             "torch.float32": cls.FP32,
+            "mxfp8": cls.MXFP8_E4M3,
         }
         if normalized in aliases:
             return aliases[normalized]
@@ -57,9 +63,12 @@ class DType(StrEnum):
             DType.FP32: 4,
             DType.FP8_E4M3: 1,
             DType.FP8_E5M2: 1,
+            # Data bytes only; the per-32 ue8m0 scale adds 1/32 byte per element.
+            DType.MXFP8_E4M3: 1,
             DType.INT8: 1,
             DType.INT4: 0.5,
             DType.NVFP4_E2M1: 0.5,
+            DType.MXFP4_E2M1: 0.5,
         }[self]
 
     # Keep framework conversions lazy so importing DB schemas does not import

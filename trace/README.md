@@ -101,6 +101,13 @@ the prompt text (enwik8 or enwik9) is recorded in the capture's provenance.
 Copied from the runs that took the captures; there is no generator script. Keep
 the bytes: a reformatted file no longer matches its capture's `trace.csv`.
 
+`quadrant_c48_96.csv` is not a dataset capture: it is the trace the
+DeepSeek-V4.1-Flash nsys capture replayed, which
+`presets/deepseek_v41_flash_b200_vllm_tp4_ep4.yaml` mirrors. 96 requests, 24
+each of (128, 128), (128, 4096), (4096, 128) and (3072, 3072), 1 s apart,
+captured saturated at concurrency 48. The dataset's `quadrant_c48` capture
+replayed a different, 192-request trace.
+
 ## Session-wise traces
 
 Multi-round coding-agent traces carry a wider schema, one row per round:

@@ -17,6 +17,7 @@ from profiling.kernels.batched_gemm import KIND, BatchedGemmArgs
 
 _Q_BACKEND = "torch_mla_q_absorb"
 _V_UP_BACKEND = "torch_mla_v_up"
+_WO_A_BACKEND = "deepgemm_mxfp8_einsum_grouped_o_proj"
 
 
 def test_args_field_order_and_dtype_coercion():
@@ -57,6 +58,7 @@ def test_kind_table_backend_and_runner_ref_contract():
         _V_UP_BACKEND,
         "torch_mla_q_absorb_no_rope",
         "torch_mla_v_up_unpadded",
+        _WO_A_BACKEND,
     ]
     assert spec.kernel_kind == KIND
     assert spec.table_name == KIND

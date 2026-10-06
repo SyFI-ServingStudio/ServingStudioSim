@@ -1,9 +1,12 @@
-//! MLA production-layout batched GEMMs: one cached perf model per
+//! Production-layout batched GEMMs: one cached perf model per
 //! `(num_batches, n, k, dtype)` config.
 //!
-//! Q absorption and V-up use separate kernel instances with singleton backend
-//! lists and different static `(n, k)` dimensions. This kind owns its Python
-//! profile table and does not reuse `single_gemm` through `profile_kind()`.
+//! MLA Q absorption and V-up use separate kernel instances with singleton
+//! backend lists and different static `(n, k)` dimensions. DeepSeek-V4.1 `wo_a`
+//! (`deepgemm_mxfp8_einsum_grouped_o_proj`) is one DeepGEMM MXFP8 grouped einsum
+//! with `num_batches` = local `wo_a` groups, `(n, k) = (1024, 4096)` and
+//! `dtype = mxfp8_e4m3` (both operands). This kind owns its Python profile
+//! table and does not reuse `single_gemm` through `profile_kind()`.
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::CacheKind;
@@ -73,6 +76,7 @@ mod tests {
     use serde_json::Value;
 
     const Q_BACKEND: &str = "torch_mla_q_absorb";
+    const WO_A_BACKEND: &str = "deepgemm_mxfp8_einsum_grouped_o_proj";
     const V_BACKEND: &str = "torch_mla_v_up";
 
     fn local_heads() -> Dim {
@@ -99,6 +103,52 @@ mod tests {
             k: Dim::param("kv_lora_rank", 512),
             dtype: DType::Bf16,
         }
+    }
+
+    /// DeepSeek-V4.1 `wo_a` at TP4: 8 groups / 4 ranks = 2 local groups.
+    fn wo_a_config() -> BatchedGemmKernelConfig {
+        BatchedGemmKernelConfig {
+            backends: vec![WO_A_BACKEND],
+            gpu_name: "NVIDIA B200".to_string(),
+            num_batches: Dim::param("o_groups", 8) / Dim::param("attn_tp", 4),
+            n: Dim::param("o_lora_rank", 1024),
+            k: Dim::param("o_group_k", 4096),
+            dtype: DType::Mxfp8E4m3,
+        }
+    }
+
+    /// Catches a DSV4.1 wo_a payload that drifts from the Python
+    /// `BatchedGemmArgs` wire form (mxfp8 dtype string, local group count),
+    /// which would read as missing rows and silently JIT/extrapolate.
+    #[test]
+    fn wo_a_mxfp8_config_forwards_python_payload_and_uses_shared_grid() {
+        let cfg = wo_a_config();
+        assert_eq!(cfg.compute_dtype(), Some(DType::Mxfp8E4m3));
+        assert_eq!(cfg.kv_dtype(), None);
+        assert_eq!(
+            BatchedGemmSpec::cache_kind(WO_A_BACKEND),
+            CacheKind::Cache1DLinear
+        );
+
+        let grid = BatchedGemmSpec::sweep_grid(&cfg);
+        assert_eq!(grid.axes()[0].len(), 68);
+        assert!(BatchedGemmSpec::infeasible_mask(&cfg, &grid).is_empty());
+
+        let payloads = BatchedGemmSpec::enumerate(&cfg, &grid, WO_A_BACKEND);
+        assert_eq!(payloads.len(), 68);
+        let last = payloads.last().unwrap();
+        assert_eq!(last.backend(), Some(WO_A_BACKEND));
+        assert_eq!(
+            serde_json::to_value(last.fields()).unwrap(),
+            serde_json::json!({
+                "backend": WO_A_BACKEND,
+                "num_batches": 2,
+                "m": 65536,
+                "n": 1024,
+                "k": 4096,
+                "dtype": "mxfp8_e4m3",
+            })
+        );
     }
 
     #[test]

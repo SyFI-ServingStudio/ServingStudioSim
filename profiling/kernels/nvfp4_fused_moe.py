@@ -8,7 +8,11 @@ profiled stages would double-count overlap and could select different tactics.
 Despite the kind name, `weight_format` selects the expert weight recipe: the
 NVFP4 backends take `nvfp4_e2m1` / group 16, and the FP8 block-scale backend
 (`trtllm_fp8_block_scale_moe`) takes `fp8_e4m3` / group 128: 128x128 weight
-blocks with per-token-group-128 FP8 activations. `input_dtype` is the unquantized
+blocks with per-token-group-128 FP8 activations. The MXFP4 backend
+(`trtllm_fp4_block_scale_routed_moe`) takes `mxfp4_e2m1` / group 32 with MXFP8
+activations and `routing_method="precomputed_dsv4"`: finished top-k ids and
+weights come in, so it only permutes (n_group = topk_group = 1, routed scale
+1/1; the router already applied the scale). `input_dtype` is the unquantized
 activation and output precision in every backend.
 """
 
@@ -45,22 +49,25 @@ class Nvfp4FusedMoeArgs(KernelArgs):
         doc=(
             "Packed expert weight format, and the tensor-core precision: the call"
             " quantizes activations to it, so both GEMM operands share it."
-            " nvfp4_e2m1 for the NVFP4 backends, fp8_e4m3 for the FP8 block-scale backend."
+            " nvfp4_e2m1 for the NVFP4 backends, fp8_e4m3 for the FP8 block-scale backend,"
+            " mxfp4_e2m1 for the MXFP4 backend (whose activations are MXFP8)."
         )
     )
     group_size: int = arg(
         unit="elements",
         doc=(
             "Elements sharing one scale: 16 for NVFP4; 128 for FP8, per 1x128 activation"
-            " group and 128x128 weight block."
+            " group and 128x128 weight block; 32 for MXFP4."
         ),
     )
     routing_method: str = arg(
         doc=(
             "Router selection rule. minimax2: sigmoid + bias top-k over BF16 logits."
             " deepseek_v3: DeepSeekV3 sigmoid + bias top-k with the routed scale, over"
-            " FP32 logits and bias. The vLLM NVFP4 backends take either, the SGLang"
-            " backend minimax2, the FP8 block-scale backend deepseek_v3."
+            " FP32 logits and bias. precomputed_dsv4: finished top-k ids and weights."
+            " The vLLM NVFP4 backends take minimax2 or deepseek_v3, the SGLang backend"
+            " minimax2, the FP8 block-scale backend deepseek_v3, the MXFP4 backend"
+            " precomputed_dsv4."
         )
     )
     n_group: int = arg(unit="groups", doc="Expert groups considered by the router.")
@@ -81,16 +88,19 @@ DOC = KernelDoc(
     summary="Route block-quantized tokens through packed expert weights and produce their MoE outputs.",
     description=(
         "A routed MoE layer runs as this one FlashInfer call on hidden states"
-        " already quantized to weight_format (NVFP4, or FP8 with 128-wide "
-        "block scales): routing, the gate-up projection, SwiGLU "
+        " already quantized to weight_format (NVFP4, FP8 with 128-wide "
+        "block scales, or MXFP8 for MXFP4 weights): routing, the gate-up "
+        "projection, SwiGLU "
         "and the down projection. per_expert_batches gives the tokens routed to"
         " every expert across all GPUs, and the first num_local_experts are "
         "this GPU's. The vLLM backend also combines the expert outputs; the "
         "SGLang backend leaves the combine to a later kernel, "
-        "moe_finalize_fuse_shared. The FP8 block-scale backend also combines. "
-        "The routed backend takes top-k IDs and weights chosen before the call, "
-        "as vLLM does under data plus expert parallelism, so routing_method, "
-        "n_group, topk_group and the scaling factor do not reach the kernel."
+        "moe_finalize_fuse_shared. The FP8 block-scale and MXFP4 backends also "
+        "combine. The routed backend takes top-k IDs and weights chosen before the "
+        "call, as vLLM does under data plus expert parallelism, so routing_method, "
+        "n_group, topk_group and the scaling factor do not reach the kernel. The "
+        "MXFP4 backend takes finished top-k ids and weights, so its routing step "
+        "only groups tokens by expert."
     ),
     category="MoE",
     subcategory="Expert compute",
@@ -114,6 +124,11 @@ DOC = KernelDoc(
         "weight_bytes = active_experts·(3·intermediate_size·hidden_size "
         "+ 4·3·intermediate_size·hidden_size/128²); "
         "GB/s = (routing_bytes + activation_bytes + weight_bytes + 2·hidden_size·num_tokens) / time",
+        "MXFP4: routing_bytes = 8·num_tokens·top_k; "
+        "activation_bytes = local_rows·(hidden_size + hidden_size/32); "
+        "weight_bytes = active_experts·(3·intermediate_size·hidden_size/2 "
+        "+ 3·intermediate_size·hidden_size/32); GB/s = (routing_bytes + activation_bytes "
+        "+ weight_bytes + 4·num_local_experts + 2·hidden_size·num_tokens) / time",
     ),
     default_metric="time_ms",
     method=(
@@ -131,12 +146,15 @@ DOC = KernelDoc(
         "the same routing kernel as minimax2, with the routed scale and FP32 inputs.",
         "The FP8 block-scale backend's autotuner stops at 8192 tokens, so larger "
         "shapes reuse the largest tuned bucket.",
+        "The MXFP4 backend accepts only precomputed_dsv4 routing with group 32, "
+        "n_group = topk_group = 1 and routed scaling 1/1, with the SwiGLU clamp "
+        "applied; it too tunes up to 8192 tokens.",
         "Activation quantization is outside the call, and the router logits are synthetic.",
-        "The vLLM backends tune up to max(8192, next power of two ≥ num_tokens); "
+        "The vLLM NVFP4 backends tune up to max(8192, next power of two ≥ num_tokens); "
         "vLLM tunes up to max_num_batched_tokens·dp_size, which picks the same "
         "bucket for every shape it serves.",
-        "No SwiGLU clamp is passed (gemm1_clamp_limit is None); vLLM passes the "
-        "model's swiglu_limit when it has one.",
+        "The NVFP4 backends pass no SwiGLU clamp (gemm1_clamp_limit is None); vLLM "
+        "passes the model's swiglu_limit when it has one.",
         "GB/s counts logical traffic for the local rows and the experts that "
         "have rows; small side outputs are left out.",
     ),
@@ -258,5 +276,35 @@ register(
             url="https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/fused_moe/experts/trtllm_fp8_moe.py",
         ),
         subprocess_env="vllm_env",
+    )
+)
+
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="flashinfer_trtllm_sm100_mxfp4",
+        # TRT-LLM-gen cubins target the SM10x family, where vLLM enables this kernel
+        # (TrtLlmMxfp4ExpertsBase: is_device_capability_family(100)).
+        supports=BackendSupport(
+            compute=frozenset({DType.MXFP4_E2M1}),
+            sm_targets=frozenset({"sm_100f"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.moe.mxfp4_fused_moe",
+            function_name="profile_mxfp4_fused_moe_sm100",
+        ),
+        table_name=KIND,
+        args_schema=Nvfp4FusedMoeArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="vllm_upstream_fork_env",
+        doc=BackendDoc(
+            summary=(
+                "FlashInfer trtllm_fp4_block_scale_routed_moe (MXFP4 weights, MXFP8 "
+                "activations) on precomputed top-k, as vLLM's TRT-LLM MXFP4 experts "
+                "call it, including final expert combination."
+            ),
+            url="https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/fused_moe/experts/trtllm_mxfp4_moe.py",
+        ),
     )
 )

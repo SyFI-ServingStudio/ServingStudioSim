@@ -10,7 +10,10 @@ the 40 MB of labeled inventory it produces is derived.
 The evidence keys are exactly the ones `operate-run-alignment` allows a
 name to be disambiguated by, and no others:
 
-  * `name` — a fragment of the measured kernel name, always required;
+  * `name` — a fragment of the measured kernel name, always required. With
+    `name_exact` it must equal the whole name instead: a kernel literally
+    named `kernel` (an anonymous CuTe/Triton launch) is otherwise unnameable,
+    because every measured name contains that fragment;
   * `after` — the operation of the nearest mapped kernel before it in the same
     segment body. One CUTLASS tile is the router projection in one layer kind
     and the indexer's wk projection in another; the predecessor is what tells
@@ -77,6 +80,8 @@ class Rule:
     slot_suffixes: tuple[str, ...]
     """Suffixes of the simulated slots this operation is compared against."""
     excluded_slot_prefixes: tuple[str, ...] = ()
+    name_exact: bool = False
+    """Match `name` against the whole kernel name rather than as a fragment."""
     after: str | None = None
     after_name: str | None = None
     before: str | None = None
@@ -101,6 +106,7 @@ class Rule:
     def from_mapping(record: dict) -> Rule:
         unknown = set(record) - {
             "name",
+            "name_exact",
             "operation",
             "type",
             "role",
@@ -159,6 +165,7 @@ class Rule:
             role=record.get("role", ""),
             slot_suffixes=tuple(record.get("slot_suffixes", ())),
             excluded_slot_prefixes=tuple(excluded),
+            name_exact=bool(record.get("name_exact", False)),
             after=record.get("after"),
             after_name=record.get("after_name"),
             before=record.get("before"),
@@ -173,7 +180,10 @@ class Rule:
         )
 
     def matches(self, position) -> bool:
-        if self.name not in position.name:
+        if self.name_exact:
+            if self.name != position.name:
+                return False
+        elif self.name not in position.name:
             return False
         if self.phase is not None and position.phase != self.phase:
             return False
@@ -408,6 +418,12 @@ def _subsumes(wide: Rule, narrow: Rule) -> bool:
         want = getattr(wide, key)
         if want is not None and getattr(narrow, key) != want:
             return False
+    # An exact name claims one kernel name, so it contains only a narrow rule
+    # that claims that same single name; a fragment contains an exact name
+    # exactly when the fragment occurs in it, which the substring test below
+    # already decides.
+    if wide.name_exact and (not narrow.name_exact or narrow.name != wide.name):
+        return False
     for key in SUBSTRING_KEYS:
         want = getattr(wide, key)
         if want is None:
