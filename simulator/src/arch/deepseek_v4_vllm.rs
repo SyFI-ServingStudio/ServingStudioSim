@@ -461,6 +461,7 @@ fn layer_config(
             hidden_dtype: DType::Bf16,
             router_dtype: DType::Fp32,
             fabric: "nvlink".into(),
+            max_total_tokens: 8192,
         },
         shared: DeepseekV4SharedExpertLocalWorkletConfig {
             hidden_size: model.hidden_size.clone(),
@@ -500,6 +501,7 @@ fn layer_config(
             hidden_size: model.hidden_size.clone(),
             dtype: DType::Bf16,
             fabric: "nvlink".into(),
+            max_total_tokens: 8192,
         },
         finalize: ElementwiseKernelConfig {
             backends: vec!["torch"],

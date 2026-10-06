@@ -255,7 +255,7 @@ mod tests {
     use crate::common::{PoolId, SessionInput, SharedRequests, UnifiedStage};
     use crate::test_helpers::{shared_with, test_cluster, FakeModel};
     use crate::worker::admission::{FifoOrder, ShortestJobFirst};
-    use crate::worker::config::BoundedFutureKvAdmissionConfig;
+    use crate::worker::config::{BoundedFutureKvAdmissionConfig, DpPlacement};
     use crate::worker::kv::{PrefixCacheConfig, PrefixKv};
     use crate::worker::types::{WorkerConfig, WorkerEventCommon, WorkerMsgCommon};
     use crate::worker::workers::iter::{
@@ -836,6 +836,61 @@ mod tests {
         );
     }
 
+    /// [`third_request_partition`] on the hybrid (recurrent-state) worker.
+    fn hybrid_third_request_partition(dp_placement: DpPlacement) -> (usize, usize) {
+        let store = shared_with(&[(0, 4, 500), (1, 4, 1), (2, 4, 1)]);
+        let mut worker = build_hybrid_chunked_prefill_worker(
+            WorkerId(0),
+            "main",
+            Arc::new(FakeModel {
+                ms: 1.0,
+                dp_groups: 2,
+            }),
+            store,
+            WorkerConfig {
+                max_batch_tokens: Some(64),
+                dp_placement,
+                ..WorkerConfig::default()
+            },
+            None,
+            PoolId(0),
+            "test-gpu",
+            test_cluster(),
+        );
+        let mut events = Vec::new();
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(0)));
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(1)));
+        for step in 0..20 {
+            worker.tick(Time::from_ms(step as f64), &mut events);
+        }
+        assert_eq!(events.len(), 1, "only request 1 has finished");
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(2)));
+        assert!(worker.form_batch(Time::from_ms(20.0)));
+        let mut input: crate::arch::UnifiedArchInput = Default::default();
+        worker.execution.build_iteration_input(
+            &worker.kv_store,
+            &worker.context.requests,
+            &worker.batch_plan,
+            &mut input,
+        );
+        (
+            input.groups[0].prefill_chunk_pairs.len(),
+            input.groups[1].prefill_chunk_pairs.len(),
+        )
+    }
+
+    #[test]
+    fn hybrid_worker_honours_the_dp_placement() {
+        assert_eq!(
+            hybrid_third_request_partition(DpPlacement::RoundRobin),
+            (1, 0)
+        );
+        assert_eq!(
+            hybrid_third_request_partition(DpPlacement::VllmLeastLoaded),
+            (0, 1)
+        );
+    }
+
     fn chunked_worker(
         store: SharedRequests,
         batch_policy: BatchPolicy,
@@ -1152,6 +1207,60 @@ mod tests {
             PoolId(0),
             "test-gpu",
             test_cluster(),
+        );
+    }
+
+    /// Two partitions; request 0 decodes for a long time on partition 0 while
+    /// request 1 finishes on partition 1. Round-robin then sends request 2
+    /// back to busy partition 0; vLLM's least-loaded balancer picks idle 1.
+    fn third_request_partition(dp_placement: DpPlacement) -> (usize, usize) {
+        let store = shared_with(&[(0, 4, 500), (1, 4, 1), (2, 4, 1)]);
+        let mut worker = build_chunked_prefill_worker(
+            WorkerId(0),
+            "main",
+            Arc::new(FakeModel {
+                ms: 1.0,
+                dp_groups: 2,
+            }),
+            store,
+            WorkerConfig {
+                max_batch_tokens: Some(64),
+                dp_placement,
+                ..WorkerConfig::default()
+            },
+            None,
+            PoolId(0),
+            "test-gpu",
+            test_cluster(),
+        );
+        let mut events = Vec::new();
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(0)));
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(1)));
+        for step in 0..20 {
+            worker.tick(Time::from_ms(step as f64), &mut events);
+        }
+        assert_eq!(events.len(), 1, "only request 1 has finished");
+        assert_eq!(worker.kv_store.decode_members(0).count(), 1);
+        assert_eq!(worker.kv_store.decode_members(1).count(), 0);
+
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(2)));
+        assert!(worker.form_batch(Time::from_ms(20.0)));
+        (
+            worker.kv_store.prefill_admits(0).count(),
+            worker.kv_store.prefill_admits(1).count(),
+        )
+    }
+
+    #[test]
+    fn round_robin_dp_placement_ignores_partition_load() {
+        assert_eq!(third_request_partition(DpPlacement::RoundRobin), (1, 0));
+    }
+
+    #[test]
+    fn vllm_least_loaded_dp_placement_picks_the_idle_partition() {
+        assert_eq!(
+            third_request_partition(DpPlacement::VllmLeastLoaded),
+            (0, 1)
         );
     }
 

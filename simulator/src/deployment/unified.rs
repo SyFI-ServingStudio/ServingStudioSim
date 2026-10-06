@@ -40,8 +40,9 @@ use crate::timing::PerfApiBridge;
 use crate::worker::{
     build_barebone_worker, build_chunked_prefill_worker, build_hp_worker,
     build_hybrid_chunked_prefill_worker, build_qwen36_hybrid_worker, build_speculative_worker,
-    resolve_prefix_cache_config, BatchPolicy, IterWorker, IterWorkerSel, KvAdmissionConfig,
-    PendingOrderKind, PrefillChunkAlignment, PrefixCacheMode, PrefixCachePolicy, WorkerConfig,
+    resolve_prefix_cache_config, BatchPolicy, DpPlacement, IterWorker, IterWorkerSel,
+    KvAdmissionConfig, PendingOrderKind, PrefillChunkAlignment, PrefixCacheMode, PrefixCachePolicy,
+    WorkerConfig,
 };
 
 use super::Deployment;
@@ -188,6 +189,10 @@ impl Deployment for UnifiedDeployment {
             prefill_chunk_alignment: prefill_chunk_alignment(&g.worker),
             speculative_draft_tokens: speculative_draft_tokens(&g.worker),
             speculative_acceptance_seed: speculative_acceptance_seed(&g.worker),
+            dp_placement: match &g.worker {
+                IterWorkerSel::ChunkedPrefill { dp_placement, .. } => *dp_placement,
+                _ => DpPlacement::RoundRobin,
+            },
             ..WorkerConfig::default()
         };
 
@@ -277,6 +282,43 @@ impl Deployment for UnifiedDeployment {
                 )?);
                 assemble_hybrid_flow(
                     "GLM-5.3-Flash vLLM FP8",
+                    model,
+                    store,
+                    worker_config,
+                    log_dir,
+                    gpu_name,
+                    dp_cfg,
+                    &g.worker,
+                )
+            }
+            // Same hybrid KV as the TP arch, held per DP rank: each rank's
+            // partition charges its own requests' MLA/kpool KV and KDA state.
+            IterArchSel::Glm53FlashVllmFp8DpAttnEpMoe {
+                ep_size,
+                max_model_len,
+                routing,
+                routing_seed,
+                expert_popularity_file,
+                token_corpus_file,
+                cudagraph_capture_sizes,
+                ..
+            } => {
+                ensure_hybrid_worker("GLM-5.3-Flash vLLM FP8 DP-attention/EP", &g.worker)?;
+                let model = Arc::new(arch_build::glm53_flash_vllm_fp8_dp_attn_ep_moe(
+                    model_spec,
+                    *ep_size,
+                    *max_model_len,
+                    *routing,
+                    *routing_seed,
+                    expert_popularity_file.as_deref(),
+                    token_corpus_file.as_deref(),
+                    cudagraph_capture_sizes,
+                    &gpu_name,
+                    MODEL_NAME,
+                    bridge,
+                )?);
+                assemble_hybrid_flow(
+                    "GLM-5.3-Flash vLLM FP8 DP-attention/EP",
                     model,
                     store,
                     worker_config,
@@ -983,6 +1025,7 @@ mod tests {
             kv_admission: crate::worker::config::KvAdmissionSpec::default(),
             gpu_time_multiplier: 1.0,
             prefill_gpu_time_multiplier: None,
+            dp_placement: DpPlacement::RoundRobin,
             prefill_chunk_alignment: PrefillChunkAlignment::Checkpoint,
         }
     }

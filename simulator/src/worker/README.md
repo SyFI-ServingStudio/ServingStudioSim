@@ -345,7 +345,15 @@ non-final chunks end on recurrent-state checkpoint boundaries, and the budget
 a clipped chunk leaves may start further prompts. Only the hybrid recipes set
 it, from the arch's checkpoint interval, when prefix caching is on and the
 worker's `prefill_chunk_alignment` is `checkpoint` (the default, vLLM's
-behavior); `plain` gives `min(remaining, budget)` chunks.
+behavior); `plain` gives `min(remaining, budget)` chunks. The unified hybrid
+recipe honours `dp_placement` like the full-attention one.
+
+With several attention partitions (an attention-DP arch), `dp_placement`
+chooses where a cold request lands. `round-robin` (default) rotates blindly;
+`vllm-least-loaded` ports vLLM's DP load balancer
+(`DPLBAsyncMPClient.get_core_engine_for_request`): lowest `waiting + running`,
+waiting requests penalised by `6 * max(0, kv_usage - 0.5)` each, scan start
+rotated per placement. Retained-prefix affinity still wins over both.
 
 KV admission is a separate selector component (`kv_admission_policy`), shared
 by `chunked_prefill` and `speculative`:

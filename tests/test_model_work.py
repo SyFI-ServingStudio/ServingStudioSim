@@ -2496,6 +2496,8 @@ def test_dflash2_stage_flop_and_byte_goldens(dflash2):
 def test_dflash2_rejects_a_sliding_window_the_checkpoint_does_not_have():
     with pytest.raises(ValueError, match="draft_sliding_window"):
         work_floors._dflash2_model(str(GLM52_NVFP4), str(GLM53_DFLASH2), 4096)
+
+
 @pytest.mark.parametrize(("variant", "ranks"), [("ep8", 8), ("moe_tp", 1)])
 def test_glm53_location_map_variants_differ_only_in_routed_rank_fan_out(variant, ranks):
     """EP8 and MoE TP keep the TP4/EP4 semantic attribution; only the empty routed-rank rows change.
@@ -2521,3 +2523,32 @@ def test_glm53_location_map_variants_differ_only_in_routed_rank_fan_out(variant,
     assert {rank(loc) for loc in rules if rank(loc) is not None} == set(range(ranks))
     assert all(rules[loc] == base[loc] for loc in rules if rank(loc) == 0)
     assert all(rules[loc] == [] for loc in rules if (rank(loc) or 0) > 0)
+
+
+def test_glm53_dp_attn_ep_location_maps_consume_every_semantic_row_once():
+    """DP4/EP4 and DP8/EP8 maps reuse the TP map's semantics; collectives map to ``[]``."""
+    tp_rules = {
+        row["location"]: row["semantics"]
+        for row in json.loads(G53_LOCATION_MAP.read_text())["locations"]
+    }
+    model = work_floors._model_for_spec(
+        {"arch_type": "glm53_flash_vllm_fp8_dp_attn_ep_moe", "config": str(GLM53)}
+    )
+    workload = work_floors._aggregate_workload(_g53_geometry_totals([(0, 2048)], [3000]))
+    expected = {segment.name for segment in model.label(workload).segments}
+    for ep in (4, 8):
+        path = G53_LOCATION_MAP.with_name(f"glm53_flash_vllm_fp8_dp_attn_ep_moe_ep{ep}.json")
+        mapping = json.loads(path.read_text())
+        assert mapping["arch_types"] == ["glm53_flash_vllm_fp8_dp_attn_ep_moe"]
+        rules = {row["location"]: row["semantics"] for row in mapping["locations"]}
+        mapped = [semantic for semantics in rules.values() for semantic in semantics]
+        assert len(mapped) == len(set(mapped))
+        assert set(mapped) == expected
+        for tag in ("dsa_moe", "kda_moe"):
+            for op in ("dispatch_quant", "dispatch_all_gather", "combine_reduce_scatter"):
+                assert rules[f"unified.{tag}.moe.{op}"] == []
+            for rank in range(1, ep):
+                assert rules[f"unified.{tag}.moe.routed_rank{rank}.fused_moe"] == []
+        for location, semantics in rules.items():
+            if location in tp_rules:
+                assert semantics == tp_rules[location], location

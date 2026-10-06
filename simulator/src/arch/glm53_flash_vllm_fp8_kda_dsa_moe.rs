@@ -90,17 +90,17 @@ use crate::worklet::{
 const ARCH_KIND: &str = "glm53_flash_vllm_fp8_kda_dsa_moe";
 pub(crate) const ACTIVATION_DTYPE: DType = DType::Bf16;
 /// Sparse page-table width: `round_up(index_topk + index_kpool - 1, 128)`.
-const SELECTED_K: u32 = 2176;
-const CACHE_BLOCK_SIZE: u32 = 64;
+pub(crate) const SELECTED_K: u32 = 2176;
+pub(crate) const CACHE_BLOCK_SIZE: u32 = 64;
 /// vLLM runs the shared expert on an aux stream at or below this batch size.
-const SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: u32 = 256;
+pub(crate) const SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: u32 = 256;
 /// `Max{overlap}` of the aux-stream shared expert against its routed slice.
 /// The two streams contend for SMs and HBM: decode's routed and shared kernels
 /// each run 15-75% above their isolated profile.db rows, while the serial
 /// (T > 256) copies match within 2%. Measured union / isolated max over
 /// decode: 1.091 (20260924_0, bs 32) and 1.129 (20260925_0 diverse_100,
 /// bs 1-24, graph-padded) -> 1/0.9.
-const SHARED_EXPERTS_STREAM_OVERLAP: f32 = 0.9;
+pub(crate) const SHARED_EXPERTS_STREAM_OVERLAP: f32 = 0.9;
 
 const BF16_GEMM_BACKENDS: &[&str] = &["torch_linear_vllm"];
 const FP8_GEMM_BACKENDS: &[&str] = &["deepgemm"];
@@ -274,11 +274,11 @@ impl Glm53FlashModelCfg {
         Ok(model)
     }
 
-    fn is_kda(&self, layer: u32) -> bool {
+    pub(crate) fn is_kda(&self, layer: u32) -> bool {
         self.kda_layers.contains(&layer)
     }
 
-    fn is_dense(&self, layer: u32) -> bool {
+    pub(crate) fn is_dense(&self, layer: u32) -> bool {
         layer < self.first_k_dense_replace
     }
 
@@ -306,13 +306,13 @@ pub struct Glm53FlashVllmParallel {
 
 /// Which attention and FFN a layer group carries, and how it opens.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AttnKind {
+pub(crate) enum AttnKind {
     Kda,
     Dsa,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum FfnKind {
+pub(crate) enum FfnKind {
     Dense,
     Moe,
 }
@@ -322,15 +322,15 @@ enum FfnKind {
 pub struct Glm53FlashLayerGroup {
     pub label: String,
     pub layers: Vec<u32>,
-    attn: AttnKind,
-    ffn: FfnKind,
+    pub(crate) attn: AttnKind,
+    pub(crate) ffn: FfnKind,
     /// Only layer 0 opens with a standalone mHC pre.
-    opens_stream: bool,
+    pub(crate) opens_stream: bool,
 }
 
 /// The ordered layer groups of a model config. Layers with the same attention
 /// kind, FFN kind, and opening boundary fold into one group.
-fn layer_groups(model: &Glm53FlashModelCfg) -> Vec<Glm53FlashLayerGroup> {
+pub(crate) fn layer_groups(model: &Glm53FlashModelCfg) -> Vec<Glm53FlashLayerGroup> {
     let mut groups: Vec<Glm53FlashLayerGroup> = Vec::new();
     for layer in 0..model.num_layers {
         let attn = if model.is_kda(layer) {
@@ -605,20 +605,20 @@ pub fn resolve_configs(cfgs: &Glm53FlashVllmConfigs) -> Glm53FlashVllmResolved {
     }
 }
 
-enum Boundary {
+pub(crate) enum Boundary {
     Pre(Op<MhcPreRmsNormKernel>),
     Fused(Op<MhcFusedPostPreRmsNormKernel>),
 }
 
 impl Boundary {
-    fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
+    pub(crate) fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
         match self {
             Self::Pre(op) => op.compile(builder),
             Self::Fused(op) => op.compile(builder),
         }
     }
 
-    fn eval(&self, num_tokens: u32, ev: &mut Evaluator) {
+    pub(crate) fn eval(&self, num_tokens: u32, ev: &mut Evaluator) {
         let input = MhcRmsNormKernelInput { num_tokens };
         match self {
             Self::Pre(op) => push(op, input, ev),
