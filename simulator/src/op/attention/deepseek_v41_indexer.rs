@@ -12,7 +12,9 @@
 //!    one fp32 scale per key) into a contiguous buffer.
 //! 2. `prefill_logits`: DeepGEMM `sm100_mqa_logits`, reusing
 //!    `dsa_mqa_logits_prefill` (B200 rows exist at 32 heads x 128, FP8,
-//!    `single_causal_tail`). One `num_sequences = 1` call per request, summed.
+//!    `single_causal_tail`). One `num_sequences = 1` call per request, summed;
+//!    a request whose logits pass vLLM's 512 MiB budget runs as query
+//!    sub-chunks, one call each (see [`INDEXER_MAX_LOGITS_ELEMS`]).
 //! 3. `prefill_topk` (placeholder): `topKPerRowPrefill` (top-512). No B200
 //!    `dsa_topk_prefill` rows exist at `top_k = 512` (only 2048).
 //! 4. `decode_logits`: DeepGEMM `sm100_paged_mqa_logits`, reusing
@@ -81,6 +83,14 @@ pub fn byte_rate_placeholder_shape(input: u32, output: u32) -> (u32, u32) {
 }
 /// One index-cache key: 128 FP8 bytes plus one fp32 scale.
 const INDEX_KEY_BYTES: u32 = 132;
+/// fp32 logits one prefill logits call may hold: vLLM's
+/// `VLLM_SPARSE_INDEXER_MAX_LOGITS_MB` default 512 (fork `envs.py:61`).
+/// `_split_indexer_prefill_chunks` (fork `v1/attention/backends/mla/
+/// indexer.py:1208`) sub-chunks a request whose `queries x keys` exceeds it on
+/// the query axis, `elems / keys` queries per call; the keys are gathered
+/// once (`skip_kv_gather` for every later sub-chunk). A 2048-token chunk
+/// splits past 65536 compressed keys.
+const INDEXER_MAX_LOGITS_ELEMS: u32 = 512 * 1024 * 1024 / 4;
 
 /// Where a layer sits in the layer-20 candidate-block scheme.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -380,10 +390,13 @@ pub(crate) fn derive_work(input: &DeepseekV41IndexerOpInput, ratio: u32) -> Inde
         gathered_keys = gathered_keys
             .checked_add(keys)
             .expect("gathered index keys must fit u32");
-        prefill_logits.push(DsaMqaLogitsPrefillKernelInput {
-            num_queries: queries,
-            num_keys: keys,
-        });
+        let per_call = (INDEXER_MAX_LOGITS_ELEMS / keys).max(1);
+        prefill_logits.extend((0..queries).step_by(per_call as usize).map(|first| {
+            DsaMqaLogitsPrefillKernelInput {
+                num_queries: per_call.min(queries - first),
+                num_keys: keys,
+            }
+        }));
         prefill_tile_bytes += u64::from(queries) * (4 * u64::from(keys) + topk_output);
     }
 
@@ -459,6 +472,30 @@ mod tests {
         assert_eq!(work.prefill_k_gather.num_tokens, 564);
         // decode: (4 * 2774 + 2 * 2048) / 4096 -> 4 tiles.
         assert_eq!(work.decode_topk.num_tokens, 4);
+    }
+
+    #[test]
+    fn prefill_logits_past_the_budget_split_on_the_query_axis() {
+        let shapes = |queries, context, ratio| {
+            derive_work(
+                &DeepseekV41IndexerOpInput {
+                    prefill_query_context_pairs: vec![(queries, context)],
+                    decode_kv_lens: vec![],
+                },
+                ratio,
+            )
+            .prefill_logits
+            .iter()
+            .map(|s| (s.num_queries, s.num_keys))
+            .collect::<Vec<_>>()
+        };
+        // 2048 x 65536 is exactly the budget: one call.
+        assert_eq!(shapes(2048, 131_072, 2), [(2048, 65_536)]);
+        assert_eq!(shapes(2048, 131_072, 1), [(1024, 131_072); 2]);
+        // A 1M-key chunk runs 16 calls of 128 queries; a ragged tail keeps
+        // its remainder.
+        assert_eq!(shapes(2048, 1_048_576, 1), [(128, 1_048_576); 16]);
+        assert_eq!(shapes(200, 1_048_576, 1), [(128, 1_048_576), (72, 1_048_576)]);
     }
 
     #[test]
