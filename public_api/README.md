@@ -42,7 +42,7 @@ container that Docker restarts on failure and when the host reboots
 ```bash
 uv run cargo build --release -p simulator -p analyzer
 cargo build --release --manifest-path alignment/load_generator/req-frontend/Cargo.toml --bin tracegen
-public_api/docker/run.sh 10.158.48.50 5220
+public_api/docker/run.sh <bind-address> <port>
 docker logs -f servingstudio-public-api
 tail -f logs/public_api/access/$(date -u +%F).jsonl
 ```
@@ -53,6 +53,11 @@ The container runs as the calling user and mounts the checkout read-only at the
 same path, with its git directory (a worktree's lies outside it). It serves
 that checkout's code, `profiling/profile.db`, `target/release/simulator` and
 req-frontend's `tracegen`, and writes only `logs/public_api/{predictions,simulations,workloads,access}`.
+Bind the host address the CSE web host's proxy reaches; that address is kept out
+of this public repository, in the Intro deploy's `CSE_PUBLIC_API_TARGET`. The
+container reads Hugging Face offline, from `$HF_HOME/hub` (default
+`~/.cache/huggingface/hub`), so on a new host download the workload dataset
+revision the presets pin first.
 The access log is in the checkout, so it outlives the container; Docker's own
 log is capped at 4 × 50 MB. To serve new code or data, update the checkout,
 rebuild the simulator and rerun `run.sh`, which replaces the container. `PUBLIC_API_CONTAINER` and `PUBLIC_API_IMAGE` override the
