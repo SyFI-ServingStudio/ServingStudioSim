@@ -433,11 +433,25 @@ class TritonSentinelLauncher:
         assert SENTINEL_KERNEL_NAME in vibesim_sentinel.__name__
         self._torch = torch
         self._kernel = vibesim_sentinel
-        self._scratch = torch.zeros(1, dtype=torch.int32, device="cuda")
+        # One scratch buffer per CUDA device, allocated lazily at launch time.
+        # The buffer MUST live on the device the kernel launches on, which is the
+        # worker's current device — not whatever cuda:0 was current when this
+        # launcher was constructed. Under TP the launcher is built before the
+        # worker calls set_device, so binding at construction would hand a cuda:0
+        # pointer to a cuda:N launch on rank N (HIP illegal memory access).
+        self._scratch_by_device: dict[int, "torch.Tensor"] = {}
+
+    def _scratch_for_current_device(self) -> "torch.Tensor":
+        device = self._torch.cuda.current_device()
+        scratch = self._scratch_by_device.get(device)
+        if scratch is None:
+            scratch = self._torch.zeros(1, dtype=self._torch.int32, device=device)
+            self._scratch_by_device[device] = scratch
+        return scratch
 
     def launch(self, iteration: int) -> None:
         grid = (1, iteration + SENTINEL_GRID_Y_OFFSET, 1)
-        self._kernel[grid](self._scratch, num_warps=1)
+        self._kernel[grid](self._scratch_for_current_device(), num_warps=1)
 
 
 class TorchSentinelLauncher:
@@ -457,10 +471,21 @@ class TorchSentinelLauncher:
         import torch  # noqa: PLC0415 — deferred so the module imports without torch
 
         self._torch = torch
-        self._scratch = torch.zeros(1, device="cuda")
+        # Per-current-device scratch, allocated at launch time — same rank-safety
+        # reason as TritonSentinelLauncher: the op must run on the worker's
+        # current device, not the cuda:0 that was current at construction.
+        self._scratch_by_device: dict[int, "torch.Tensor"] = {}
+
+    def _scratch_for_current_device(self) -> "torch.Tensor":
+        device = self._torch.cuda.current_device()
+        scratch = self._scratch_by_device.get(device)
+        if scratch is None:
+            scratch = self._torch.zeros(1, device=device)
+            self._scratch_by_device[device] = scratch
+        return scratch
 
     def launch(self, iteration: int) -> None:
-        self._scratch.add_(1.0)
+        self._scratch_for_current_device().add_(1.0)
 
 
 #: Sentinel-launcher selection order for ``select_sentinel_launcher("auto")``:

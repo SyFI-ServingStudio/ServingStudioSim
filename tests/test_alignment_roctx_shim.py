@@ -490,3 +490,52 @@ def test_shim_regions_feed_the_real_rocpd_join(tmp_path):
         "hipblaslt_gemm_f16",
         "flash_fwd_attn_kernel",
     }
+
+
+def _cuda_device_count() -> int:
+    """CUDA device count, or 0 when torch is absent or has no CUDA build."""
+    try:
+        import torch  # noqa: PLC0415
+    except Exception:  # noqa: BLE001 — torch is optional on a CPU test host
+        return 0
+    try:
+        return torch.cuda.device_count() if torch.cuda.is_available() else 0
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+@pytest.mark.skipif(
+    _cuda_device_count() < 1,
+    reason="needs a CUDA device to exercise sentinel scratch device binding",
+)
+def test_sentinel_scratch_tracks_current_device_not_construction_device():
+    """Regression for the rank-unsafe sentinel scratch (HIP illegal access on rank 1).
+
+    The scratch buffer the sentinel kernel dereferences must live on the device
+    that is *current at launch time*, not the device that happened to be current
+    when the launcher was constructed. Under tensor parallelism the launcher is
+    built before the worker calls ``torch.cuda.set_device``, so a construction-time
+    binding hands a cuda:0 pointer to a cuda:N launch on rank N.
+
+    Here we construct the launcher with device 0 current, then switch the current
+    device and assert the scratch the launcher would use follows the switch. True
+    rank>0 coverage needs >=2 GPUs (the hardware capture job provides that); with a
+    single GPU this still pins the device-tracking contract on device 0.
+    """
+    import torch  # noqa: PLC0415
+
+    original = torch.cuda.current_device()
+    try:
+        torch.cuda.set_device(0)
+        launcher = roctx_shim.TorchSentinelLauncher()
+        target = _cuda_device_count() - 1  # the highest available device
+        torch.cuda.set_device(target)
+        scratch = launcher._scratch_for_current_device()
+        assert scratch.device.type == "cuda"
+        assert scratch.device.index == target == torch.cuda.current_device()
+        # Constructing at device 0 must not have bound device 0 when we launch
+        # from a different current device.
+        if target != 0:
+            assert 0 not in launcher._scratch_by_device
+    finally:
+        torch.cuda.set_device(original)
