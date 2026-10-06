@@ -194,19 +194,46 @@ def build_ranges_from_rocpd(
     something to paper over.
     """
     all_dispatches = kernel_dispatch_records_from_rocpd(db_path)
+    roctx = roctx_regions_from_rocpd(db_path)
+    return build_ranges_from_dispatches(
+        all_dispatches, roctx, default_stage=default_stage, capture_kind="rocpd"
+    )
+
+
+def build_ranges_from_dispatches(
+    all_dispatches: list[RocpdDispatch],
+    roctx: list[RoctxRegion],
+    *,
+    default_stage: str = "all",
+    capture_kind: str = "capture",
+) -> list[RangeStats]:
+    """Attribute pre-read dispatches to their iteration ranges (backend-neutral).
+
+    The backend-neutral core of :func:`build_ranges_from_rocpd`, factored out so a
+    non-rocpd reader (the torch/kineto producer in ``alignment/torchprof``) can
+    feed the identical sentinel/roctx iteration-segmentation and
+    timestamp-containment attribution without forking it. ``all_dispatches`` carries
+    the model GPU kernels *and* any ``vibesim_sentinel`` markers (both already as
+    :class:`RocpdDispatch`); ``roctx`` is the capture's iteration ranges (empty when
+    the backend records none, which is the common torch-on-ROCm case). The
+    roctx-first, sentinel-fallback marker selection and the raise-when-neither
+    contract are exactly the rocpd path's, so the two producers cannot drift.
+
+    ``capture_kind`` only colours the "nothing to align" error text.
+    """
     sentinels = [d for d in all_dispatches if is_sentinel_dispatch(d)]
     # The sentinels are markers; only the model dispatches are ever attributed.
     dispatches = [d for d in all_dispatches if not is_sentinel_dispatch(d)]
 
-    iter_regions = iteration_regions(roctx_regions_from_rocpd(db_path))
+    iter_regions = iteration_regions(roctx)
     if not iter_regions and sentinels:
         iter_regions = sentinel_iteration_regions(sentinels, dispatches)
     if not iter_regions:
         raise ValueError(
-            "rocpd capture has no (vllm|sglang)_iteration(N) roctx ranges and no "
-            "vibesim_sentinel marker kernels; the dispatches cannot be attributed "
-            "to iterations (an uninstrumented capture, or one taken without the "
-            "roctx iteration plugin / Option-B sentinel emitter)"
+            f"{capture_kind} capture has no (vllm|sglang)_iteration(N) roctx ranges "
+            "and no vibesim_sentinel marker kernels; the dispatches cannot be "
+            "attributed to iterations (an uninstrumented capture, or one taken "
+            "without the roctx iteration plugin / Option-B sentinel emitter)"
         )
     return _attribute_dispatches_to_regions(iter_regions, dispatches, default_stage)
 
