@@ -103,8 +103,13 @@ def merge_parsed(parsed_by_rank: dict[int, dict[str, Any]]) -> dict[str, Any]:
         _single_device(doc, Path(str(doc.get("sqlite", f"rank {rank}"))))
     sources = {rank: str(doc.get("sqlite", "")) for rank, doc in parsed_by_rank.items()}
     kinds = {doc.get("source") for doc in parsed_by_rank.values()}
-    if kinds != {"rocpd"}:
-        raise ValueError(f"every input must be a rocpd parse; got sources {sorted(kinds)}")
+    # Backend-agnostic: the per-rank docs may all be "rocpd" or all "torch" (the
+    # Kineto producer), but they must agree -- merging ranks captured by different
+    # backends into one document would mix incomparable timelines. The single
+    # uniform kind is propagated to the merged document's `source`.
+    if len(kinds) != 1:
+        raise ValueError(f"inputs disagree on capture source: {sorted(kinds)}")
+    source = next(iter(kinds))
     range_modes = {doc.get("range_mode") for doc in parsed_by_rank.values()}
     if len(range_modes) != 1:
         raise ValueError(f"inputs disagree on range_mode: {sorted(range_modes)}")
@@ -195,7 +200,7 @@ def merge_parsed(parsed_by_rank: dict[int, dict[str, Any]]) -> dict[str, Any]:
             "unpaired_steps_by_device": {},
         },
         "sqlite": ", ".join(sources[rank] for rank in ranks),
-        "source": "rocpd",
+        "source": source,
         "iteration_start": base.get("iteration_start"),
         "iteration_end": base.get("iteration_end"),
         "range_mode": base.get("range_mode"),
