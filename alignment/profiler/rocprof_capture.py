@@ -149,17 +149,23 @@ _RANK_FROM_FILENAME_RE = re.compile(r"_rank(\d+)(?:_results)?\.db$")
 #: the rocprofv3 root itself and tears the executor down without a cross-process
 #: SIGTERM.
 #:
-#: ``ATTACH_MODE_TOOL_ENV`` removes the wrapping CLI entirely. The rocprofiler-sdk
-#: tool environment that ``rocprofv3`` would export (the ``ROCP_TOOL_LIBRARIES`` /
-#: ``ROCPROF_*`` / ``LD_PRELOAD`` knobs that make the ROCm runtime load
-#: ``librocprofiler-sdk-tool.so`` in-process) is harvested once and injected into the
-#: launched server's environment instead. The ROCm runtime then loads the tool only
-#: in the processes that initialize it — the GPU worker processes — and NOT in the
-#: pure-Python ``EngineCore`` or driver, so the teardown SIGTERM reaches only
-#: handler-free processes, vLLM's orderly shutdown runs, and each worker finalizes
-#: its own per-rank rocpd on its own clean exit. This is robust to a separate
-#: ``EngineCore`` process, so it is the mechanism for a true multiprocessing TP>1
-#: capture.
+#: ``ATTACH_MODE_TOOL_ENV`` removes the wrapping CLI entirely and injects the
+#: rocprofiler-sdk tool through the rocprofiler-REGISTER path only. ``rocprofv3``
+#: injects its tool TWO ways at once (observed on rocprofv3 1.3.2 / ROCm 7.2.3): an
+#: ``LD_PRELOAD`` of ``librocprofiler-sdk-tool.so`` AND ``ROCP_TOOL_LIBRARIES``.
+#: ``LD_PRELOAD`` loads the tool UNCONDITIONALLY in every process (parent, EngineCore,
+#: workers) at process start — reinstating the exact teardown deadlock (the preloaded
+#: tool's signal handler fires in EngineCore and blocks on its worker children) — and,
+#: with ``ROCPROFILER_LIBRARY_CTOR=1``, expands ``%q{RANK}%`` at process start before
+#: the worker's rank is known. So this mode DROPS ``LD_PRELOAD`` and keeps only
+#: ``ROCP_TOOL_LIBRARIES`` (+ the ``ROCPROFILER_REGISTER_LIBRARY`` register lib):
+#: rocprofiler-register loads the tool lazily when the ROCm runtime initializes, which
+#: happens only in the GPU worker processes and only AFTER the worker has set ``RANK``.
+#: The pure-Python ``EngineCore`` and driver never initialize the runtime, so they
+#: never load the tool, the teardown SIGTERM reaches only handler-free processes,
+#: vLLM's orderly shutdown runs, and each worker resolves ``%q{RANK}%`` and finalizes
+#: its own per-rank rocpd on its own clean exit. This is the mechanism for a true
+#: multiprocessing TP>1 capture.
 ATTACH_MODE_WRAP = "wrap"
 ATTACH_MODE_TOOL_ENV = "tool-env"
 ATTACH_MODES = (ATTACH_MODE_WRAP, ATTACH_MODE_TOOL_ENV)
@@ -174,14 +180,18 @@ ATTACH_MODES = (ATTACH_MODE_WRAP, ATTACH_MODE_TOOL_ENV)
 #: (``LD_PRELOAD``), and the ``ROCPROF*``/``ROCPROFILER*`` trace+output knobs.
 _TOOL_ENV_KEY_RE = re.compile(r"^(ROCP_|ROCPROF|HSA_TOOLS_LIB|LD_PRELOAD|ROCPROFILER)")
 
-#: The harvested keys that actually SELECT/LOAD the rocprofiler-sdk tool in a
-#: process. Their values — the tool library name and the loader preload path — are
-#: the stack- and version-specific part that cannot be guessed, so at least one
-#: must come from the harvest. The ``ROCPROF_*`` trace/output knobs are set
-#: explicitly from the capture config instead (:func:`tool_env_output_config`), so
-#: the per-rank output template is deterministic even when this rocprofv3 build
-#: keeps the output configuration out of the child environment.
-_TOOL_LOADER_KEYS = ("ROCP_TOOL_LIBRARIES", "HSA_TOOLS_LIB", "LD_PRELOAD")
+#: The harvested key whose VALUE selects the rocprofiler-sdk tool library by the
+#: rocprofiler-register path. It must come from the harvest (the absolute library
+#: path is stack- and version-specific), and it is what makes the ROCm runtime load
+#: the tool lazily at init — in the GPU workers only — rather than at process start.
+_TOOL_LIBRARIES_KEY = "ROCP_TOOL_LIBRARIES"
+
+#: Harvested keys that are DROPPED from the injected env. ``LD_PRELOAD`` would load
+#: the tool unconditionally in every process (reinstating the EngineCore teardown
+#: deadlock and expanding ``%q{RANK}%`` before the rank is set), which is exactly what
+#: the rocprofiler-register path exists to avoid. A pre-existing ``LD_PRELOAD`` in the
+#: base env is preserved untouched; only rocprofv3's harvested one is dropped.
+_TOOL_ENV_DROP_KEYS = ("LD_PRELOAD",)
 
 Runner = Callable[[list[str]], subprocess.CompletedProcess]
 
@@ -495,7 +505,10 @@ def tool_env_output_config(
     if config.kernel_trace:
         env["ROCPROF_KERNEL_TRACE"] = "1"
     if config.marker_trace:
-        env["ROCPROF_MARKER_TRACE"] = "1"
+        # rocprofv3 1.3.2 spells the roctx/marker toggle ROCPROF_MARKER_API_TRACE
+        # (confirmed by harvesting what the CLI injects); the sentinel path does not
+        # depend on it, but keep it on so a roctx-recording stack also gets markers.
+        env["ROCPROF_MARKER_API_TRACE"] = "1"
     if config.hip_trace:
         env["ROCPROF_HIP_API_TRACE"] = "1"
     return env
@@ -540,17 +553,23 @@ def run_capture_per_rank_tool_env(
         base_env=base_env,
         probe_runner=probe_runner,
     )
-    if not any(key in injected for key in _TOOL_LOADER_KEYS):
+    if _TOOL_LIBRARIES_KEY not in injected:
         raise RuntimeError(
-            "tool-env attach harvested no rocprofiler-sdk tool-loader environment "
-            f"from rocprofv3 (looked for {list(_TOOL_LOADER_KEYS)}; got "
-            f"{sorted(injected)}); this rocprofv3 build does not load its tool by "
-            "environment, so the wrapping attach mode must be used instead"
+            f"tool-env attach harvested no {_TOOL_LIBRARIES_KEY} from rocprofv3 (got "
+            f"{sorted(injected)}); this rocprofv3 build does not load its tool by the "
+            "rocprofiler-register path, so the wrapping attach mode must be used instead"
         )
     server_env = dict(base_env)
-    server_env.update(injected)  # tool-loader vars (+ anything rocprofv3 exported)
-    # Set the trace/output configuration explicitly so per-rank naming is
-    # deterministic even if rocprofv3 kept it out of the harvested child env.
+    # Inject the harvested rocprofiler-sdk env EXCEPT the keys that would load the
+    # tool unconditionally at process start (LD_PRELOAD): the rocprofiler-register
+    # path (ROCP_TOOL_LIBRARIES) loads it lazily at ROCm-runtime init, so the tool
+    # lands in the GPU workers only — not the EngineCore/driver — and after RANK is set.
+    for key, value in injected.items():
+        if key in _TOOL_ENV_DROP_KEYS:
+            continue
+        server_env[key] = value
+    # Set the trace/output configuration explicitly (deterministic per-rank naming)
+    # rather than trusting rocprofv3 to have exported it into the harvested child env.
     server_env.update(tool_env_output_config(config, output_dir, templated_name))
     completed = runner(list(server_argv), env=server_env, check=True)  # type: ignore[call-arg]
     if getattr(completed, "returncode", 0) not in (0, None):

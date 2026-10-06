@@ -512,13 +512,18 @@ def test_harvest_tool_env_raises_when_no_loader_var(tmp_path):
     base_env = {"PATH": "/usr/bin"}
 
     def fake_probe_runner(argv, env=None, check=True):
-        # Harvest sees only a ROCPROF_* output knob, but NO tool-loader var — the
-        # build does not load its tool by environment, so tool-env cannot attach.
+        # Harvest sees only a preload + output knob, but NO ROCP_TOOL_LIBRARIES — the
+        # build does not load its tool by the rocprofiler-register path, so tool-env
+        # cannot attach without reinstating the LD_PRELOAD deadlock.
         return subprocess.CompletedProcess(
-            argv, 0, stdout=_env_dump_stdout({**base_env, "ROCPROF_KERNEL_TRACE": "1"})
+            argv,
+            0,
+            stdout=_env_dump_stdout(
+                {**base_env, "ROCPROF_KERNEL_TRACE": "1", "LD_PRELOAD": "/opt/rocm/lib/tool.so"}
+            ),
         )
 
-    with pytest.raises(RuntimeError, match="no rocprofiler-sdk tool-loader environment"):
+    with pytest.raises(RuntimeError, match="no ROCP_TOOL_LIBRARIES"):
         run_capture_per_rank_tool_env(
             _fake_exe(tmp_path),
             RocprofConfig(tp_size=2),
@@ -537,7 +542,13 @@ def test_tool_env_runs_server_without_rocprofv3_prefix(tmp_path):
 
     out_dir = tmp_path / "out"
     base_env = {"PATH": "/usr/bin", ROCTX_SCOPES_ENV: "1"}
-    tool_env = {"ROCP_TOOL_LIBRARIES": "librocprofiler-sdk-tool.so", "ROCPROF_KERNEL_TRACE": "1"}
+    # rocprofv3 injects BOTH a tool LD_PRELOAD and ROCP_TOOL_LIBRARIES; the preload
+    # must be DROPPED (it would load the tool in every process at start).
+    tool_env = {
+        "ROCP_TOOL_LIBRARIES": "librocprofiler-sdk-tool.so",
+        "LD_PRELOAD": "/opt/rocm/lib/librocprofiler-sdk-tool.so",
+        "ROCPROFILER_REGISTER_LIBRARY": "/opt/rocm/lib/librocprofiler-sdk.so.1.3.2",
+    }
 
     def fake_probe_runner(argv, env=None, check=True):
         return subprocess.CompletedProcess(argv, 0, stdout=_env_dump_stdout({**base_env, **tool_env}))
@@ -566,12 +577,15 @@ def test_tool_env_runs_server_without_rocprofv3_prefix(tmp_path):
     # prefix and NO literal '--' separator.
     assert seen["argv"] == ["python", "-m", "vllm", "serve", "model"]
     assert "rocprofv3" not in seen["argv"][0]
-    # The harvested tool-loader var rode onto the server env, atop the roctx flag.
+    # The harvested rocprofiler-register vars rode onto the server env (atop roctx),
+    # but the tool LD_PRELOAD was dropped so the tool loads only at GPU-runtime init.
     assert seen["env"]["ROCP_TOOL_LIBRARIES"] == "librocprofiler-sdk-tool.so"
+    assert seen["env"]["ROCPROFILER_REGISTER_LIBRARY"] == "/opt/rocm/lib/librocprofiler-sdk.so.1.3.2"
+    assert "LD_PRELOAD" not in seen["env"]
     assert seen["env"][ROCTX_SCOPES_ENV] == "1"
     # The trace/output config is set explicitly with deterministic per-rank naming.
     assert seen["env"]["ROCPROF_KERNEL_TRACE"] == "1"
-    assert seen["env"]["ROCPROF_MARKER_TRACE"] == "1"
+    assert seen["env"]["ROCPROF_MARKER_API_TRACE"] == "1"
     assert seen["env"]["ROCPROF_OUTPUT_FORMAT"] == "rocpd"
     assert seen["env"]["ROCPROF_OUTPUT_PATH"] == str(out_dir)
     assert seen["env"]["ROCPROF_OUTPUT_FILE_NAME"] == f"trace_rank%q{{{OUTPUT_RANK_ENV_DEFAULT}}}%"
