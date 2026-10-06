@@ -319,7 +319,7 @@ impl MoeBlock {
                     self.fused_moe.len(),
                     SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD
                 ),
-                child: Box::new(CostNode::Max {
+                child: Box::new(CostNode::Parallel {
                     overlap: SHARED_EXPERTS_STREAM_OVERLAP,
                     children: vec![
                         CostNode::Sum(vec![dispatch, experts, combine]),
@@ -1116,7 +1116,9 @@ mod tests {
     fn leaf_order(node: &CostNode, out: &mut Vec<usize>) {
         match node {
             CostNode::Leaf(slot) => out.push(*slot),
-            CostNode::Sum(children) | CostNode::Max { children, .. } => {
+            CostNode::Sum(children)
+            | CostNode::Max { children, .. }
+            | CostNode::Parallel { children, .. } => {
                 children.iter().for_each(|child| leaf_order(child, out))
             }
             CostNode::Scale { child, .. } | CostNode::Labeled { child, .. } => {

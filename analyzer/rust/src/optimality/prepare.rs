@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use serde_json::Value;
 
-use crate::trace::manifest::{fold_mean, ManifestDoc};
+use crate::trace::manifest::{Manifest, ManifestDoc};
 
 use super::grid_peaks::GridPeakCatalog;
 use super::spec::GpuSpec;
@@ -53,11 +53,11 @@ pub(super) fn kernel_locations_by_worker(
 }
 
 /// Per `(pool_tag, worker_id, section)` structural metadata, precomputed once so
-/// the hot row loop is array indexing: the mean-fold weight `α` per slot, the
-/// slot→location map, and each slot's rate ceilings.
+/// the hot row loop is array indexing plus one balanced fold of the section's
+/// tree: the tree itself, the slot→location map, and each slot's rate ceilings.
 pub(super) struct SectionFoldPlan {
-    /// Mean-mode fold weight per slot (`Σ` of leaf weights if a slot recurs).
-    pub(super) mean_fold_weight_by_slot: Vec<f64>,
+    /// The section's cost tree, re-evaluated per row for every rung.
+    pub(super) manifest: Manifest,
     pub(super) location_id_by_slot: Vec<u32>,
     pub(super) is_communication_by_slot: Vec<bool>,
     /// Grid-peak ceilings for R3 (`0` = no sidecar entry → that leaf's R3 = R2).
@@ -73,7 +73,7 @@ pub(super) struct SectionFoldPlan {
 }
 
 /// Intern every manifest leaf into a global location, and precompute each
-/// `(pool_tag, worker_id, section)`'s fold weights + per-slot rate ceilings.
+/// `(pool_tag, worker_id, section)`'s per-slot rate ceilings.
 pub(super) fn build_section_fold_plans(
     manifests_by_worker: &BTreeMap<(String, u16), ManifestDoc>,
     grid_peak_catalog: &GridPeakCatalog,
@@ -90,15 +90,6 @@ pub(super) fn build_section_fold_plans(
         for manifest_section in &manifest_doc.sections {
             let manifest = &manifest_section.manifest;
             let num_slots = manifest.slots.len();
-            let mut mean_fold_weight_by_slot = vec![0.0; num_slots];
-            // Root is node 0 (BFS layout: parent precedes children).
-            if !manifest.nodes.is_empty() {
-                fold_mean(manifest, 0, 1.0, &mut |slot, leaf_weight| {
-                    if let Some(accumulated_weight) = mean_fold_weight_by_slot.get_mut(slot) {
-                        *accumulated_weight += leaf_weight;
-                    }
-                });
-            }
 
             let mut location_id_by_slot = Vec::with_capacity(num_slots);
             let mut is_communication_by_slot = Vec::with_capacity(num_slots);
@@ -155,7 +146,7 @@ pub(super) fn build_section_fold_plans(
                     manifest_section.section.clone(),
                 ),
                 SectionFoldPlan {
-                    mean_fold_weight_by_slot,
+                    manifest: manifest.clone(),
                     location_id_by_slot,
                     is_communication_by_slot,
                     grid_peak_tflops_by_slot,

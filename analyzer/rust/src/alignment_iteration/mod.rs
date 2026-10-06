@@ -2066,7 +2066,8 @@ fn slot_contexts(manifest: &Manifest) -> Result<Vec<Option<String>>> {
             }
             FlatCostNode::Scale { children, .. }
             | FlatCostNode::Sum { children }
-            | FlatCostNode::Max { children, .. } => {
+            | FlatCostNode::Max { children, .. }
+            | FlatCostNode::Parallel { children, .. } => {
                 for child in children.clone() {
                     visit(manifest, child, chain, out)?;
                 }
@@ -2127,7 +2128,9 @@ fn leaf_scales(manifest: &Manifest) -> Result<Vec<u64>> {
                 );
                 visit(manifest, children.start, scale * u64::from(*n), out)?;
             }
-            FlatCostNode::Sum { children } | FlatCostNode::Max { children, .. } => {
+            FlatCostNode::Sum { children }
+            | FlatCostNode::Max { children, .. }
+            | FlatCostNode::Parallel { children, .. } => {
                 for child in children.clone() {
                     visit(manifest, child, scale, out)?;
                 }
@@ -2174,7 +2177,8 @@ fn critical_path_leaf_ms(manifest: &Manifest, slot_ms: &[f64]) -> Result<Vec<f64
                 validate_child_range(manifest, index, children, "Sum")?;
                 children.clone().map(|child| node_times[child]).sum()
             }
-            FlatCostNode::Max { overlap, children } => {
+            FlatCostNode::Max { overlap, children }
+            | FlatCostNode::Parallel { overlap, children } => {
                 validate_child_range(manifest, index, children, "Max")?;
                 let critical_child = first_max_child(children.clone(), &node_times);
                 node_times[critical_child] / f64::from(*overlap).max(TIME_EPSILON_MS)
@@ -2208,7 +2212,8 @@ fn critical_path_leaf_ms(manifest: &Manifest, slot_ms: &[f64]) -> Result<Vec<f64
             FlatCostNode::Scale { n, children } => {
                 node_weights[children.start] += weight * f64::from(*n);
             }
-            FlatCostNode::Max { overlap, children } => {
+            FlatCostNode::Max { overlap, children }
+            | FlatCostNode::Parallel { overlap, children } => {
                 let critical_child = first_max_child(children.clone(), &node_times);
                 node_weights[critical_child] += weight / f64::from(*overlap).max(TIME_EPSILON_MS);
             }

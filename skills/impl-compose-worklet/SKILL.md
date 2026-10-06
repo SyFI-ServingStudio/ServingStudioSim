@@ -71,17 +71,21 @@ the mandatory sync grain: `local` / `tp` / `hp` / `ep` / `hptp` / `eptp`.
 - No op-slot polymorphism — slot fields are concrete `Op<K>` / `*Op` / `Option<...>`,
   never `enum` / `Box<dyn>` (V7). Backends pass through as config strings.
 
-Reconstruct the production dependency graph before choosing `Sum` or `Max`.
+Reconstruct the production dependency graph before choosing `Sum`, `Max`, or
+`Parallel`. `Max` is a rank fan-out: the same section on interchangeable ranks,
+where a gap is load imbalance. `Parallel` is concurrent streams on one device:
+different work sharing the GPU, where a gap is overlap; Optimality balances a
+`Max` but never a `Parallel`.
 Mixed prefill/decode inputs share one common projection spine when production
 does; do not concatenate two complete phase worklets and double-charge common
-work. A `Max` may contain only children launched from the same source fanout and
+work. A `Parallel` may contain only children launched from the same source fanout and
 must close at the real join/barrier before later work begins. A compound L1 slot
 retains every fixed prologue/tail launch inside its public boundary.
 
 Do not mint slots for runtime chunks, ranks, layer repetition, or capacity. If
 the L1 callable owns a loop or fixed multi-launch sequence, it remains one
-semantic slot. A serial-stream counterfactual changes only `Max` versus ordered
-`Sum`; it preserves the same leaves, inputs, and source barriers.
+semantic slot. A serial-stream counterfactual changes only `Parallel` versus
+ordered `Sum`; it preserves the same leaves, inputs, and source barriers.
 
 Profile DB compatibility must not determine worklet semantics. When a
 source-backed workload derivation changes, propagate the new physical input and

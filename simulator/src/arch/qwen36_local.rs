@@ -1261,7 +1261,7 @@ mod tests {
             assert!(!tree
                 .flatten()
                 .iter()
-                .any(|n| matches!(n, FlatCostNode::Max { .. })));
+                .any(|n| matches!(n, FlatCostNode::Max { .. } | FlatCostNode::Parallel { .. })));
             if layers == 5 {
                 let gdn_slots = tree
                     .slots

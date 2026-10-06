@@ -94,7 +94,7 @@ pub(crate) const SELECTED_K: u32 = 2176;
 pub(crate) const CACHE_BLOCK_SIZE: u32 = 64;
 /// vLLM runs the shared expert on an aux stream at or below this batch size.
 pub(crate) const SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: u32 = 256;
-/// `Max{overlap}` of the aux-stream shared expert against its routed slice.
+/// `Parallel{overlap}` of the aux-stream shared expert against its routed slice.
 /// The two streams contend for SMs and HBM: decode's routed and shared kernels
 /// each run 15-75% above their isolated profile.db rows, while the serial
 /// (T > 256) copies match within 2%. Measured union / isolated max over
@@ -657,7 +657,7 @@ impl MoeBlock {
                 let concurrent_shared = self.shared_expert.compile(builder);
                 let concurrent_routed = routed.compile(builder);
                 CostNode::Sum(vec![
-                    CostNode::Max {
+                    CostNode::Parallel {
                         overlap: SHARED_EXPERTS_STREAM_OVERLAP,
                         children: vec![concurrent_shared, concurrent_routed],
                     },
@@ -1689,7 +1689,9 @@ mod tests {
     fn leaf_order(node: &CostNode, out: &mut Vec<usize>) {
         match node {
             CostNode::Leaf(slot) => out.push(*slot),
-            CostNode::Sum(children) | CostNode::Max { children, .. } => {
+            CostNode::Sum(children)
+            | CostNode::Max { children, .. }
+            | CostNode::Parallel { children, .. } => {
                 children.iter().for_each(|child| leaf_order(child, out))
             }
             CostNode::Scale { child, .. } | CostNode::Labeled { child, .. } => {

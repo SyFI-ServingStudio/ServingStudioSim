@@ -346,6 +346,9 @@ fn base_label(m: &Manifest, idx: usize) -> String {
         FlatCostNode::Max { overlap, .. } => lbl
             .map(str::to_string)
             .unwrap_or_else(|| format!("Max{{overlap={}}}", fmt_overlap(*overlap))),
+        FlatCostNode::Parallel { overlap, .. } => lbl
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("Parallel{{overlap={}}}", fmt_overlap(*overlap))),
         FlatCostNode::Scale { n, .. } => format!("{} ×{}", lbl.unwrap_or("scale"), n),
     }
 }
@@ -372,6 +375,13 @@ fn signature(m: &Manifest, idx: usize) -> String {
         FlatCostNode::Max { overlap, children } => {
             format!(
                 "M[{lbl}|{}]({})",
+                fmt_overlap(*overlap),
+                sig_children(m, children)
+            )
+        }
+        FlatCostNode::Parallel { overlap, children } => {
+            format!(
+                "P[{lbl}|{}]({})",
                 fmt_overlap(*overlap),
                 sig_children(m, children)
             )
@@ -525,8 +535,13 @@ impl<'a> Renderer<'a> {
                     out,
                 );
             }
-            FlatCostNode::Sum { children } | FlatCostNode::Max { children, .. } => {
-                let is_max = matches!(&self.m.nodes[idx], FlatCostNode::Max { .. });
+            FlatCostNode::Sum { children }
+            | FlatCostNode::Max { children, .. }
+            | FlatCostNode::Parallel { children, .. } => {
+                let is_max = matches!(
+                    &self.m.nodes[idx],
+                    FlatCostNode::Max { .. } | FlatCostNode::Parallel { .. }
+                );
                 let groups = collapse(self.m, children.clone());
                 // Critical child = the group whose representative has the max
                 // node_time (siblings share scale, so node_time orders them).
@@ -615,6 +630,7 @@ fn tree_json(row: &BreakRow, m: &Manifest) -> serde_json::Value {
                 FlatCostNode::Leaf(_) => "leaf",
                 FlatCostNode::Sum { .. } => "sum",
                 FlatCostNode::Max { .. } => "max",
+                FlatCostNode::Parallel { .. } => "parallel",
                 FlatCostNode::Scale { .. } => "scale",
             };
             let mut node = serde_json::json!({

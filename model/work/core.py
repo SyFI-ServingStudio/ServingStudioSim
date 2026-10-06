@@ -533,6 +533,11 @@ def empty_bytes() -> dict[str, float]:
     return {key: 0.0 for key in _BYTES_KEYS}
 
 
+def _needs_request_geometry(attn: object) -> bool:
+    """Does this attention spec label only exact per-request geometry?"""
+    return bool(getattr(attn, "needs_request_geometry", False))
+
+
 def empty_breakdown() -> dict[str, int]:
     return {key: 0 for key in _PARAM_BREAKDOWN_KEYS}
 
@@ -688,6 +693,57 @@ class Model:
         assert self.quant is not None
         return self.quant.is_converted(group.module)
 
+    def geometry_segments(self, wl: Workload) -> list[Segment]:
+        """The rows ``label(wl)`` gets from attention specs that need per-request
+        geometry, and nothing else: the complement of
+        ``label(wl, geometry_attention=False)``. Cheap next to a whole label,
+        since it skips every weight, norm, and scalar-only attention row."""
+        return self.geometry_segments_batch([wl])[0]
+
+    def geometry_segments_batch(self, wls: list[Workload]) -> list[list[Segment]]:
+        """:meth:`geometry_segments` of each workload. A spec with
+        ``semantic_segments_batch`` evaluates them all in one call."""
+        segments: list[list[Segment]] = [[] for _ in wls]
+        for stack in self.layers:
+            if not _needs_request_geometry(stack.attn):
+                continue
+            present = [
+                (index, wl if stack.stage is None else wl.stages.get(stack.stage))
+                for index, wl in enumerate(wls)
+            ]
+            present = [(index, stack_wl) for index, stack_wl in present if stack_wl is not None]
+            stack_wls = [stack_wl for _index, stack_wl in present]
+            batch = getattr(stack.attn, "semantic_segments_batch", None)
+            semantics = (
+                batch(stack_wls)
+                if batch is not None
+                else [stack.attn.semantic_segments(stack_wl) for stack_wl in stack_wls]
+            )
+            for (index, _stack_wl), rows in zip(present, semantics, strict=True):
+                segments[index].extend(self._segments_from_semantics(stack, rows))
+        return segments
+
+    def _attention_semantic_segments(self, stack: LayerStack, stack_wl: Workload) -> list[Segment]:
+        return self._segments_from_semantics(stack, stack.attn.semantic_segments(stack_wl))
+
+    def _segments_from_semantics(self, stack: LayerStack, semantics: list) -> list[Segment]:
+        prefix = f"{stack.tag}." if stack.tag else ""
+        return [
+            Segment(
+                name=f"{prefix}{semantic.name}",
+                bucket=semantic.bucket,
+                byte_kind=semantic.byte_kind,
+                flops=semantic.flops,
+                bytes=semantic.bytes,
+                count=stack.count,
+                # A row that names no precision runs at the master
+                # dtype: quantizing the weights does not move the
+                # attention kernels onto the FP8 tensor cores.
+                compute_dtype=semantic.compute_dtype or self.master_dtype,
+            )
+            for semantic in semantics
+        ]
+
     @classmethod
     def uniform(
         cls,
@@ -716,7 +772,14 @@ class Model:
             quant=quant,
         )
 
-    def label(self, wl: Workload) -> WorkLabel:
+    def label(self, wl: Workload, *, geometry_attention: bool = True) -> WorkLabel:
+        """The necessary-work label of one forward over ``wl``.
+
+        ``geometry_attention=False`` leaves out the rows of every attention spec
+        that ``needs_request_geometry`` — exactly the rows
+        :meth:`geometry_segments` returns — so the rest can be labelled from a
+        collapsed aggregate those specs would refuse.
+        """
         # A workload naming a stage no stack runs would silently contribute an
         # output-projection row with nothing behind it, so it is a caller bug
         # rather than an empty result.
@@ -798,23 +861,9 @@ class Model:
             # Attention semantic phases remain independent of simulator shapes.
             # MLA/DSA exposes several rows (indexer, sparse attention, and two
             # cache writes); older specs retain the historical fused rows.
-            custom_semantics = getattr(stack.attn, "semantic_segments", None)
-            if custom_semantics is not None:
-                for semantic in custom_semantics(stack_wl):
-                    segments.append(
-                        Segment(
-                            name=f"{prefix}{semantic.name}",
-                            bucket=semantic.bucket,
-                            byte_kind=semantic.byte_kind,
-                            flops=semantic.flops,
-                            bytes=semantic.bytes,
-                            count=stack.count,
-                            # A row that names no precision runs at the master
-                            # dtype: quantizing the weights does not move the
-                            # attention kernels onto the FP8 tensor cores.
-                            compute_dtype=semantic.compute_dtype or self.master_dtype,
-                        )
-                    )
+            if getattr(stack.attn, "semantic_segments", None) is not None:
+                if geometry_attention or not _needs_request_geometry(stack.attn):
+                    segments.extend(self._attention_semantic_segments(stack, stack_wl))
             else:
                 phase_compute_dtype = getattr(stack.attn, "phase_compute_dtype", None)
                 attention_phases = (

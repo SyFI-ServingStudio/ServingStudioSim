@@ -68,32 +68,37 @@ fold used for runtime is:
 
 - `Leaf`: the leaf value;
 - `Sum`: sum of children;
-- `Max`: `max(children) / overlap`;
+- `Max`: `max(children) / overlap` — the same section on different ranks;
+- `Parallel`: `max(children) / overlap` — concurrent streams on one GPU;
 - `Scale(n)`: `n × child`.
 
-The optimality fold replaces `Max` with a balanced mean:
+Each rung substitutes its own leaf values and re-evaluates this tree. The fold
+changes only `Max`:
 
 ```text
 Max(children) / overlap  →  mean(children) / overlap
 ```
 
-This fold is linear. Each leaf slot `l` therefore has a precomputed coefficient
-`α_l`:
+The mean is the perfectly balanced load across ranks. A `Parallel` holds
+different work sharing one GPU, so there is no load to balance: it keeps
+`max(children) / overlap` at every rung and selects its slowest child again with
+that rung's values.
+
+The fold attributes each row value to its leaves. `Sum` forwards its weight to
+every child, `Scale(n)` multiplies it by `n`, `Max` divides it by
+`number_of_children × overlap`, and `Parallel` forwards `weight / overlap` only to
+that rung's slowest child (an exact tie splits evenly). Leaf `l`'s contribution
+is `c_l(v) = weight_l × v_l` for the chosen leaf values `v`, and
 
 ```text
-α_l =
-  product of 1 / (number_of_children × overlap) over Max ancestors
-  × product of n over Scale ancestors
+row value = Σ_l c_l(v)
 ```
 
-For any chosen leaf value `v_l`, the balanced row value is:
-
-```text
-Σ_l α_l × v_l
-```
-
-The same `α_l` is used both for a worker total and for the leaf/location
-attribution. Consequently, per-location R2–R5 values add back to the scope rung.
+In a tree without `Parallel`, `weight_l` is the constant
+`∏ 1 / (number_of_children × overlap)` over `Max` ancestors `× ∏ n` over `Scale`
+ancestors. Under a `Parallel` it also depends on which child is slowest in that
+row and rung. The same contributions give the worker total and the leaf/location
+attribution, so per-location R2–R5 values add back to the scope rung.
 
 R0 and R1 are exact SQL aggregates over all rows. R2–R5 use iterations selected
 by:
@@ -152,16 +157,17 @@ difference is scheduler idle.
 
 ### R2 — Balanced
 
-For each sampled row, use the observed `slot_time_ms` at every leaf and fold with
-the balanced `Max → mean` coefficients:
+For each sampled row, use the observed `slot_time_ms` at every leaf and apply the
+balanced fold:
 
 ```text
-sampled_R2_w = Σ_rows Σ_leaves α_l × observed_time_ms_l
+sampled_R2_w = Σ_rows Σ_leaves c_l(observed_time_ms)
 R2_w = A_w × sampled_R2_w / 1000
 ```
 
-It preserves observed kernel timings, `Sum`, `Scale`, and overlap, while replacing
-straggler selection inside every `Max` by equal load. The `R1 - R2` difference is
+It preserves observed kernel timings, `Sum`, `Scale`, `Parallel`, and overlap,
+while replacing straggler selection inside every `Max` by equal load, so overlap
+between streams never reads as imbalance. The `R1 - R2` difference is
 critical-path load imbalance. It is not assigned to individual kernels because
 there is no unique additive leaf attribution for a `max - mean` critical-path
 gap.
@@ -349,10 +355,10 @@ sections/workers; `Max` siblings and DP replicas of that location pool together.
 The additive kernel baseline starts at R2:
 
 ```text
-kernel R2 = anchored Σ α_l × observed_time_l
-kernel R3 = anchored Σ α_l × per_config_best_l
-kernel R4 = anchored Σ α_l × ignore_network_l
-kernel R5 = anchored Σ α_l × hardware_limit_l
+kernel R2 = anchored Σ c_l(observed_time)
+kernel R3 = anchored Σ c_l(per_config_best)
+kernel R4 = anchored Σ c_l(ignore_network)
+kernel R5 = anchored Σ c_l(hardware_limit)
 ```
 
 There is no per-kernel R0 or R1. Idle and imbalance are scope-level critical-path
@@ -461,7 +467,7 @@ Without R6/R7, the left-to-right sections are:
 | `hardware_gap` | R4−R5 | Profiled kernel versus spec-sheet compute/HBM peak |
 | `communication` | R3−R4 | Communication leaves removed at R4 |
 | `batching` | R2−R3 | Loss relative to the best fitted rate for the fixed config |
-| `imbalance` | R1−R2 | `Max` critical path versus balanced mean |
+| `imbalance` | R1−R2 | Rank `Max` critical path versus balanced mean |
 | `idle` | R0−R1 | Gaps between worker rows inside its held span |
 
 When R6/R7 are available, the displayed, R5-clamped floors replace the R5

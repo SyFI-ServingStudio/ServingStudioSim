@@ -34,7 +34,9 @@ one array per field (element ``i`` of every array is shape ``i``)::
 
 Each fixed-batch roofline is evaluated before occurrence weighting. Dense affine
 bases vectorize the common path; every basis is independently checked against one
-direct ``model.label`` result, with a per-shape direct fallback on mismatch. The
+direct ``model.label`` result, with a per-shape direct fallback on mismatch. Shapes
+with ``request_geometry`` split: the basis covers every row but the
+geometry-bound attention ones, which are labelled exactly per shape on their own. The
 worker response includes ``composition`` counters so Rust can validate the
 shape/iteration contract and expose whether any fallback was required.
 
@@ -388,25 +390,38 @@ def _request_interactions(totals: dict) -> list[AttnInteraction]:
     interactions: list[AttnInteraction] = []
     decode_passes = decode_kv = 0
     prefill_requests = prefill_pairs = prefill_cached = 0
+    # A saturated decode run carries millions of keys, so this loop avoids
+    # per-key work it does not need (the error name, a split list).
     for encoded, raw_count in sorted(totals["request_geometry"].items()):
-        count = _exact_count(raw_count, f"request_geometry[{encoded!r}]")
-        kind, *lengths = encoded.split(":")
-        values = [int(length) for length in lengths]
-        if kind == "decode" and len(values) == 1 and values[0] >= 1:
-            (kv_len,) = values
-            interactions.append(AttnInteraction(1, kv_len, kv_len - 1, "causal", "decode", count))
-            decode_passes += count
-            decode_kv += count * kv_len
-        elif kind == "prefill" and len(values) == 2 and values[1] >= 1:
-            prefix, append = values
-            interactions.append(
-                AttnInteraction(append, prefix + append, prefix, "causal", "prefill", count)
-            )
-            prefill_requests += count
-            prefill_pairs += count * (append * prefix + append * (append + 1) // 2)
-            prefill_cached += count * prefix
+        if type(raw_count) is float and raw_count > 0 and raw_count.is_integer():
+            count = int(raw_count)
         else:
-            raise ValueError(f"malformed request_geometry key {encoded!r}")
+            count = _exact_count(raw_count, f"request_geometry[{encoded!r}]")
+        kind, _, lengths = encoded.partition(":")
+        try:
+            if kind == "decode":
+                kv_len = int(lengths)
+                if kv_len >= 1:
+                    interactions.append(
+                        AttnInteraction(1, kv_len, kv_len - 1, "causal", "decode", count)
+                    )
+                    decode_passes += count
+                    decode_kv += count * kv_len
+                    continue
+            elif kind == "prefill":
+                prefix_text, _, append_text = lengths.partition(":")
+                prefix, append = int(prefix_text), int(append_text)
+                if append >= 1:
+                    interactions.append(
+                        AttnInteraction(append, prefix + append, prefix, "causal", "prefill", count)
+                    )
+                    prefill_requests += count
+                    prefill_pairs += count * (append * prefix + append * (append + 1) // 2)
+                    prefill_cached += count * prefix
+                    continue
+        except ValueError:
+            pass
+        raise ValueError(f"malformed request_geometry key {encoded!r}")
     derived = {
         "decode_passes": decode_passes,
         "decode_kv": decode_kv,
@@ -560,6 +575,28 @@ def _segment_work(model, totals: dict) -> dict[str, tuple[float, float]]:
     return {segment.name: (segment.flops_total, segment.bytes_total) for segment in label.segments}
 
 
+def _labels_geometry_apart(model) -> bool:
+    """Can this model's geometry-bound attention rows be labelled on their own?"""
+    return any(getattr(stack.attn, "needs_request_geometry", False) for stack in model.layers)
+
+
+def _scalar_segment_work(model, totals: dict) -> dict[str, tuple[float, float]]:
+    """Every row a geometry-carrying shape's work has *except* the geometry-bound
+    attention rows, from its scalars alone. Those rows are the only ones that
+    refuse a collapsed aggregate, so with them left out it is an ordinary label."""
+    scalars = {name: value for name, value in totals.items() if name != "request_geometry"}
+    label = model.label(_aggregate_workload(scalars), geometry_attention=False)
+    return {segment.name: (segment.flops_total, segment.bytes_total) for segment in label.segments}
+
+
+def _geometry_segment_work(model, totals: dict) -> dict[str, tuple[float, float]]:
+    """The geometry-bound attention rows of one shape, exact from its geometry."""
+    return {
+        segment.name: (segment.flops_total, segment.bytes_total)
+        for segment in model.geometry_segments(_aggregate_workload(totals))
+    }
+
+
 def _subtract_segment_work(
     left: dict[str, tuple[float, float]], right: dict[str, tuple[float, float]]
 ) -> dict[str, tuple[float, float]]:
@@ -592,7 +629,7 @@ def _basis_key(model, totals: dict, has_routed_matmul: bool) -> tuple[int | None
 
 
 def _workload_basis(
-    model, totals: dict, has_routed_matmul: bool
+    model, totals: dict, has_routed_matmul: bool, segment_work=_segment_work
 ) -> dict[str, dict[str, tuple[float, float]] | dict[str, int]]:
     """Affine semantic-work basis, with nonlinear dimensions pinned in the key.
 
@@ -616,6 +653,9 @@ def _workload_basis(
 
     Shapes below the saturation cap still simply fail validation and take the exact
     direct path, as before.
+
+    ``segment_work`` labels one point; :func:`_scalar_segment_work` fits the scalar
+    part of a geometry-carrying group (see :func:`_validated_basis`).
     """
     prefill_present, decode_present = _mode_presence(totals)
     base_totals = {field_name: 0 for field_name in _WORKLOAD_FIELDS}
@@ -627,7 +667,7 @@ def _workload_basis(
         base_totals["matmul_tokens"] = matmul_tokens
     elif matmul_tokens >= model.vocab:
         base_totals["matmul_tokens"] = model.vocab
-    base = _segment_work(model, base_totals)
+    base = segment_work(model, base_totals)
     coefficients = {}
     for field_name in _WORKLOAD_FIELDS:
         if has_routed_matmul and field_name == "matmul_tokens":
@@ -642,12 +682,12 @@ def _workload_basis(
             # Hold one parent request in both points to isolate this coefficient.
             probe_totals["prefill_requests"] = 1
             reference_totals = dict(base_totals, prefill_requests=1)
-            reference = _segment_work(model, reference_totals)
+            reference = segment_work(model, reference_totals)
         else:
             # Every large geometry field is already present at the probe scale in
             # the origin, so all other coefficients share the base reference.
             reference = base
-        delta = _subtract_segment_work(_segment_work(model, probe_totals), reference)
+        delta = _subtract_segment_work(segment_work(model, probe_totals), reference)
         coefficients[field_name] = {
             name: (flops / probe, bytes_ / probe) for name, (flops, bytes_) in delta.items()
         }
@@ -725,6 +765,10 @@ class _ShapeColumns:
     def carries_speculative_geometry(self) -> bool:
         return any(self._columns.get("speculative_geometry", ()))
 
+    def all_carry_request_geometry(self, rows: np.ndarray) -> bool:
+        column = self._columns.get("request_geometry")
+        return column is not None and all(column[int(row)] for row in rows)
+
 
 def _validation_rows(shapes: _ShapeColumns, rows: np.ndarray) -> list[int]:
     """The group members a basis must reproduce exactly to be accepted.
@@ -760,36 +804,80 @@ def _validated_basis(
     basis_cache: dict[_BasisKey, dict | None],
     default_dtype: str,
 ) -> dict | None:
-    """Build and independently validate one basis before any batch reduction."""
+    """Build and independently validate one basis before any batch reduction.
+
+    Per-request geometry exists because some attention rows are not affine in the
+    scalars. When every such row comes from a spec that `needs_request_geometry`,
+    the group is *split*: the basis spans the scalar part (every other row), and
+    each shape's geometry-bound rows are labelled exactly on their own
+    (:func:`_geometry_columns`) — a small fraction of a whole label. The split is
+    validated like any basis, against whole direct labels at the group's corners.
+    Speculative geometry, and geometry on a model that cannot label it apart, is
+    still reduced one shape at a time.
+    """
     totals = shapes.totals(int(rows[0]))
     basis_key = _basis_key(model, totals, has_routed_matmul)
-    # Per-request geometry exists exactly because the work is not affine in the
-    # scalars, so such shapes are always reduced directly.
+    split = bool(totals.get("request_geometry"))
     if (
         totals.get("speculative_geometry")
-        or totals.get("request_geometry")
+        or (
+            split
+            and not (_labels_geometry_apart(model) and shapes.all_carry_request_geometry(rows))
+        )
         or len(rows) < _MIN_BASIS_GROUP
     ):
         # Counted with the validation failures: both mean "this group was reduced
         # one shape at a time".
         basis_cache[basis_key] = None
     if basis_key not in basis_cache:
-        candidate = _workload_basis(model, totals, has_routed_matmul)
+        scalar_work = _scalar_segment_work if split else _segment_work
+        candidate = _workload_basis(model, totals, has_routed_matmul, scalar_work)
+        candidate["split"] = split
+
+        def reconstructed(row_totals: dict) -> dict[str, tuple[float, float]] | None:
+            work = _reconstruct_segment_work(candidate, row_totals)
+            if not split:
+                return work
+            geometry = _geometry_segment_work(model, row_totals)
+            return None if work.keys() & geometry.keys() else work | geometry
+
         matches = all(
-            _segment_work_matches(
-                _reconstruct_segment_work(candidate, shapes.totals(row)),
-                _segment_work(model, shapes.totals(row)),
-            )
+            (work := reconstructed(shapes.totals(row))) is not None
+            and _segment_work_matches(work, _segment_work(model, shapes.totals(row)))
             for row in _validation_rows(shapes, rows)
         )
         if matches:
             # Validation just proved the basis spans exactly the direct label's
             # segment names, so one label at these totals resolves every dtype.
             candidate["dtypes"] = _segment_dtypes(model, totals, default_dtype)
+            candidate["geometry_names"] = (
+                frozenset(_geometry_segment_work(model, totals)) if split else frozenset()
+            )
             basis_cache[basis_key] = candidate
         else:
             basis_cache[basis_key] = None
     return basis_cache[basis_key]
+
+
+def _geometry_columns(
+    model, shapes: _ShapeColumns, rows: np.ndarray, expected: frozenset[str]
+) -> tuple[tuple[str, ...], np.ndarray, np.ndarray] | None:
+    """Each row's geometry-bound rows as (names, flops[row, name], bytes[row, name]).
+
+    None when a row's segment names differ from the validated ones (`expected`):
+    their dtypes were never resolved, so the group is reduced directly instead.
+    """
+    names = tuple(sorted(expected))
+    flops = np.empty((len(rows), len(names)), dtype=np.float64)
+    bytes_ = np.empty((len(rows), len(names)), dtype=np.float64)
+    workloads = [_aggregate_workload(shapes.totals(int(row))) for row in rows]
+    for index, segments in enumerate(model.geometry_segments_batch(workloads)):
+        work = {segment.name: (segment.flops_total, segment.bytes_total) for segment in segments}
+        if work.keys() != expected:
+            return None
+        for column, name in enumerate(names):
+            flops[index, column], bytes_[index, column] = work[name]
+    return names, flops, bytes_
 
 
 def _reduce_affine_group(
@@ -798,8 +886,14 @@ def _reduce_affine_group(
     rows: np.ndarray,
     peak,
     bandwidth_gbps: float,
+    geometry: tuple[tuple[str, ...], np.ndarray, np.ndarray] | None = None,
 ) -> tuple[float, float, dict[str, dict]]:
-    """Evaluate all shapes sharing one basis as dense array operations."""
+    """Evaluate all shapes sharing one basis as dense array operations.
+
+    ``geometry`` carries a split basis's exact per-row geometry-bound rows
+    (:func:`_geometry_columns`); they join the reconstructed rows before any
+    roofline, since the fused floor maxes over a whole iteration's work.
+    """
     coefficients = basis["coefficients"]
     field_names = tuple(coefficients)
     segment_names = set(basis["base"])
@@ -833,14 +927,19 @@ def _reduce_affine_group(
             shapes.counts[field_name][rows] - basis["origin"][field_name]
         )
     occurrences = shapes.occurrences[rows].astype(np.float64)
+
+    segment_flops = workload_deltas @ coefficient_flops + base_flops
+    segment_bytes = workload_deltas @ coefficient_bytes + base_bytes
+    if geometry is not None:
+        geometry_names, geometry_flops, geometry_bytes = geometry
+        segment_names = segment_names + geometry_names
+        segment_flops = np.hstack((segment_flops, geometry_flops))
+        segment_bytes = np.hstack((segment_bytes, geometry_bytes))
     # One peak per segment: a mixed-precision checkpoint runs some rows on the FP8
     # tensor cores and others (router, sparse MLA) at the master dtype.
     segment_peaks = np.asarray(
         [peak(basis["dtypes"][name]) for name in segment_names], dtype=np.float64
     )
-
-    segment_flops = workload_deltas @ coefficient_flops + base_flops
-    segment_bytes = workload_deltas @ coefficient_bytes + base_bytes
     compute_seconds = segment_flops / (segment_peaks * 1e12)
     memory_seconds = segment_bytes / (bandwidth_gbps * 1e9)
     segment_necessary = np.maximum(compute_seconds, memory_seconds)
@@ -940,13 +1039,27 @@ def compute_floors(log_dir: Path, levels: dict[str, dict]) -> dict[str, dict]:
     """Per-level {necessary, segmented} in GPU·seconds via the labeler roofline."""
     pool_specs = _pool_specs(log_dir)
     out: dict[str, dict] = {}
+    # A one-worker pool sends the same totals as `cluster`, `<pool>` and
+    # `<pool>/<worker>`; with per-request geometry each label is ~0.5M requests.
+    labelled: list[tuple[dict, dict, dict]] = []
     for level_key, totals in levels.items():
         try:
             spec = _spec_for_level(level_key, pool_specs)
-            model = _model_for_spec(spec)
-            _check_precision(model, spec)
-            _validate_speculative_totals(spec, totals)
-            out[level_key] = _label_payload(model, totals, spec)
+            payload = next(
+                (
+                    payload
+                    for seen_spec, seen_totals, payload in labelled
+                    if seen_spec == spec and seen_totals == totals
+                ),
+                None,
+            )
+            if payload is None:
+                model = _model_for_spec(spec)
+                _check_precision(model, spec)
+                _validate_speculative_totals(spec, totals)
+                payload = _label_payload(model, totals, spec)
+                labelled.append((spec, totals, payload))
+            out[level_key] = payload
         except Exception as error:  # noqa: BLE001 - isolate independent batch rows
             # One heterogeneous or unsupported scope must not discard valid
             # worker/pool labels in the same subprocess batch.
@@ -1025,13 +1138,20 @@ def compute_locked_compositions(log_dir: Path, compositions: dict[str, dict]) ->
                     basis_cache,
                     spec["dtype"],
                 )
+                geometry = None
+                if basis is not None and basis["split"]:
+                    geometry = _geometry_columns(model, shapes, rows, basis["geometry_names"])
+                    if geometry is None:
+                        # Reduced one shape at a time after all; count it so.
+                        key = _basis_key(model, shapes.totals(int(rows[0])), has_routed_matmul)
+                        basis_cache[key] = basis = None
                 if basis is None:
                     group_fused, group_segmented, group_segments = _reduce_direct_group(
                         model, shapes, rows, spec, peak, bandwidth_gbps
                     )
                 else:
                     group_fused, group_segmented, group_segments = _reduce_affine_group(
-                        basis, shapes, rows, peak, bandwidth_gbps
+                        basis, shapes, rows, peak, bandwidth_gbps, geometry
                     )
                 fused_seconds += group_fused
                 segmented_seconds += group_segmented

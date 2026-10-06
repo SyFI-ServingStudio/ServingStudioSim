@@ -212,22 +212,22 @@ model** — and specifically it must not become a `CostNode::Max`. Every
 `Max` in the simulator is a cross-rank fan-out of interchangeable replicas: the
 attribution below forwards only its critical child, and the `optimality` ladder's
 R2 rung folds `Max → mean` and calls the residue *imbalance*. Two different
-computations sharing one GPU are neither interchangeable nor balanceable, and
-same-device contention puts wall time at ≥ max(children) rather than ≤, so
-modelling that overlap needs a new node kind rather than a reused one.
+computations sharing one GPU are neither interchangeable nor balanceable, so the
+cost model writes them as `CostNode::Parallel`. It aggregates like `Max`
+(`max(children) / overlap`, work summed; `overlap < 1` when same-device
+contention puts wall time above the slower stream), but `optimality` keeps it at
+`max / overlap` on every rung, so stream overlap never reads as imbalance.
 
-Until that node exists, `deepseek_v4_vllm_serial_streams` is the
-Optimality-safe DeepSeek-V4 provider: it keeps the same leaves and cross-rank
-DP4/EP4 `Max` nodes as `deepseek_v4_vllm`, but lowers every same-device source
-fan-out to `Sum`. The base provider remains useful for timing comparison, but
-its R1→R2 residue must not be interpreted as pure rank imbalance.
+`deepseek_v4_vllm_serial_streams` keeps the same leaves and cross-rank DP4/EP4
+`Max` nodes as `deepseek_v4_vllm`, but lowers every same-device source fan-out
+to `Sum`. It is the serialized-stream counterfactual for timing comparison.
 
 The alignment trio is separate not by deployment but by **source scope** (see
 below): it reads an alignment manifest instead of a plain run directory.
 
 The simulated side of `alignment-iteration` uses the same CostTree semantics as
 the headline prediction. `Sum` forwards attribution to every child, `Scale`
-multiplies its child, and `Max` forwards only the critical child; an exact tie
+multiplies its child, and `Max` or `Parallel` forwards only the critical child; an exact tie
 deterministically selects the first child. Per-kernel and per-operation
 simulated contributions therefore sum to `total_time_ms`, not to the raw sum of
 every parallel leaf. The latter remains only as a mapping-coverage audit value.

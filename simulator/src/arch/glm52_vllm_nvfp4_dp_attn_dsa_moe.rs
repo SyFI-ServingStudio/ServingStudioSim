@@ -371,7 +371,7 @@ impl DpSparseLayer {
                  auxiliary-stream shared expert alongside]",
                 self.name
             ),
-            child: Box::new(CostNode::Max {
+            child: Box::new(CostNode::Parallel {
                 overlap: 1.0,
                 children: vec![aux_shared, CostNode::Sum(vec![dispatch, routed, combine])],
             }),
