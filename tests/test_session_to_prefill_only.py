@@ -86,3 +86,21 @@ def test_a_full_prefix_round_recomputes_its_last_token(tmp_path):
     assert by_id["session_0_round_000000"] == (499, 1)
     assert by_id["session_0_round_000001"] == (0, 40)
     assert manifest["source_full_prefix_rounds_given_one_fresh_token"] == 1
+
+
+def test_trace_output_keeps_each_round_output_and_counts_it_in_the_context(tmp_path):
+    source = _session_trace(tmp_path / "s.csv", [(0, 100), (150, 20)])
+    output = tmp_path / "d.csv"
+
+    manifest = write_prefill_only_trace(
+        source, output, requests=None, seed=0, max_context=1024, trace_output=True
+    )
+
+    assert {row["output_len"] for row in _rows(output)} == {"50"}
+    assert manifest["output_len"] == "trace"
+    assert manifest["total_output_tokens"] == 100
+    assert manifest["max_request_context"] == 150 + 20 + 50
+    with pytest.raises(ValueError, match="exceed max_context 200"):
+        write_prefill_only_trace(
+            source, tmp_path / "e.csv", requests=None, seed=0, max_context=200, trace_output=True
+        )

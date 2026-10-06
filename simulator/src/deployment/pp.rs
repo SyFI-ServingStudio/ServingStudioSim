@@ -116,6 +116,7 @@ fn worker_config(cfg: &PpConfig, worker: &IterWorkerSel) -> anyhow::Result<Worke
         attn_gpu_memory_gb,
         max_batch_tokens,
         gpu_time_multiplier,
+        balance_decode_microbatches,
     } = worker
     else {
         bail!("pp: the stage pool requires worker `pipeline_chunked_prefill`, got {worker:?}");
@@ -137,6 +138,7 @@ fn worker_config(cfg: &PpConfig, worker: &IterWorkerSel) -> anyhow::Result<Worke
         max_batch_tokens: Some(*max_batch_tokens),
         pending_order: PendingOrderKind::Fifo,
         prefix_cache,
+        balance_decode_microbatches: *balance_decode_microbatches,
         ..WorkerConfig::default()
     })
 }

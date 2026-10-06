@@ -6,7 +6,7 @@ use std::sync::Arc;
 use crate::arch::contract::IterwiseUnifiedModel;
 use crate::common::{PoolId, SharedRequests, WorkerId};
 use crate::log::PrefixCacheLogger;
-use crate::worker::admission::{PendingOrder, PipelinedPrefillAdmission};
+use crate::worker::admission::{PendingOrder, PipelinedChunkedPrefillAdmission};
 use crate::worker::execution::UnifiedIterExecution;
 use crate::worker::gpu_cluster::SharedGpuCluster;
 use crate::worker::kv::FullAttnKv;
@@ -73,11 +73,14 @@ pub(crate) fn build_pipeline_head_worker<M: IterwiseUnifiedModel>(
         essentials.sampler,
         prefix_cache_logger,
     );
-    let admission = PipelinedPrefillAdmission::new(
+    let mut admission = PipelinedChunkedPrefillAdmission::new(
         PendingOrder::new(config.pending_order),
         (),
         max_batch_tokens,
     );
+    if config.balance_decode_microbatches {
+        admission = admission.with_balanced_decodes(layout.depth);
+    }
 
     PipelineHeadWorker::from_components(
         essentials.context,

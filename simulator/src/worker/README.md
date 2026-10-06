@@ -43,7 +43,7 @@ different timelines and should not be hidden behind one giant FSM abstraction.
 | `pd_decode` | `FullAttnKv` | thin inline landed-request ingress | `UnifiedIterExecution` | `PullDecodeWorker` |
 | `disagg_attn` | `FullAttnKv` | `FreshRequestSlotAdmission<SessionStartOrder>` | `AttentionLayerExecutionAdapter` | `SlotAttentionWorker` + private `AttentionSlotPipeline` |
 | `disagg_ffn` | none | none; L6 sends complete tasks | `FfnSectionExecutionAdapter` | `BufferedFfnWorker` |
-| `pipeline_chunked_prefill`, stage 0 | `FullAttnKv`, one partition, sized by the stage with the most KV per token | `PipelinedPrefillAdmission<PendingOrder>` | `UnifiedIterExecution` | `PipelineHeadWorker` |
+| `pipeline_chunked_prefill`, stage 0 | `FullAttnKv`, one partition, sized by the stage with the most KV per token | `PipelinedChunkedPrefillAdmission<PendingOrder>` | `UnifiedIterExecution` | `PipelineHeadWorker` |
 | `pipeline_chunked_prefill`, stages 1..N-1 | none | none; L6 hands over microbatches | `UnifiedIterExecution` (as `PipelineStageExecution`) | `PipelineStageWorker` |
 
 Hybrid recurrent + attention archs (Qwen3.6 local, GLM-5.3-Flash) swap in
@@ -292,11 +292,17 @@ form_microbatch → build input → commit_microbatch → stage-0 compute
   → MicrobatchLaunched … MicrobatchExit → complete_microbatch
 ```
 
-`PipelinedPrefillAdmission` commits a chunk's prefill progress when it is
+`PipelinedChunkedPrefillAdmission` commits a chunk's prefill progress when it is
 scheduled (vLLM V1), so the next microbatch can carry the same prompt's next
-chunk while the previous one is on a later stage. Token emission, `Done`, and KV
-release wait for the exit, stamped with the exact exit time. Prefill only:
-requests that want decode fail at enqueue.
+chunk while the previous one is on a later stage. Token emission, decode KV
+advance, `Done`, and KV release wait for the exit, stamped with the exact exit
+time. A decode step needs the previous token, so a running request has at most
+one microbatch in flight; each microbatch takes the ready decodes first, then
+started and fresh prompts, under one token budget. Ready decodes all join by
+default (vLLM); `balance_decode_microbatches` caps them at
+`ceil(resident decodes / depth)` per microbatch. Admission writes the chosen
+decode subset into `IterBatchPlan`, and input lowering skips the resident decodes
+outside it.
 
 `PipelineStageWorker` has no KV/admission axes. It runs microbatches FIFO,
 double-buffering one activation pull against one compute, at exact times derived

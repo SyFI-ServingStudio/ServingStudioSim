@@ -81,10 +81,13 @@ Each tick, in order:
 3. **Periodic `request_state` snapshot** (every `snapshot_dt`) — dense over the
    *admitted* set, so per-segment workload is a plain diff of consecutive
    snapshots. Plus a heartbeat log line.
-4. **Termination check** (all O(1)): `DrainComplete` (trace exhausted + zero
+4. **Termination check**: `DrainComplete` (trace exhausted + zero
    in-flight), `DurationReached` (`clock ≥ duration`, unless `run_to_end`), or
-   `Stuck` (a watchdog: trace drained but neither completions nor the
-   admitted-id watermark advanced for `stuck_threshold`).
+   `Stuck` (a watchdog: trace drained but no completion, admission, or
+   processed prefill/output token for `stuck_threshold`). The first two are
+   O(1); the watchdog sums the admitted requests' token progress once per
+   100 s sample after the trace is exhausted, so a long decode tail with
+   nothing completing is progress, not a stall.
 5. **Advance** `clock += tick_dt`.
 
 In-flight is tracked from arrival/completion **counters**, never by scanning the
