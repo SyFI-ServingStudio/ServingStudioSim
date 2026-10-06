@@ -27,7 +27,10 @@
 //! `in_flight_decodes` until its microbatch exits.
 //!
 //! KV reserves the full request footprint once at admission and releases it at
-//! completion. One attention partition only.
+//! completion. A hybrid recurrent model with prefix caching ends every non-final
+//! chunk on a state-checkpoint boundary (vLLM's `_mamba_block_aligned_split`,
+//! which does not change under PP), via the same rule as unified chunked
+//! prefill. One attention partition only.
 
 use std::collections::HashSet;
 
@@ -48,6 +51,8 @@ pub struct PipelinedChunkedPrefillAdmission<P: PendingOrderPolicy> {
     policy_context: P::Context,
     enqueue_sequence: EnqueueSequence,
     max_batch_tokens: u32,
+    /// Checkpoint interval a non-final chunk must end on, if any.
+    chunk_end_quantum: Option<u32>,
     /// Prompts that have started and still have prefill tokens to schedule, in
     /// start order.
     started_prefills: Vec<AdmissionCandidate>,
@@ -97,11 +102,19 @@ impl<P: PendingOrderPolicy> PipelinedChunkedPrefillAdmission<P> {
             policy_context,
             enqueue_sequence: EnqueueSequence::default(),
             max_batch_tokens,
+            chunk_end_quantum: None,
             started_prefills: Vec::new(),
             in_flight_decodes: HashSet::new(),
             scheduled_decodes: Vec::new(),
             balanced_depth: None,
         }
+    }
+
+    /// End every non-final chunk on a multiple of `quantum` context tokens.
+    pub(crate) fn with_chunk_end_quantum(mut self, quantum: u32) -> Self {
+        assert!(quantum > 0, "chunk-end quantum must be positive");
+        self.chunk_end_quantum = Some(quantum);
+        self
     }
 
     /// Cap each microbatch's decodes at `ceil(resident decodes / depth)`.
@@ -135,7 +148,7 @@ impl<P: PendingOrderPolicy> PipelinedChunkedPrefillAdmission<P> {
             let chunk_tokens = next_chunk_tokens(
                 resolved_prefill,
                 remaining_budget,
-                None,
+                self.chunk_end_quantum,
                 self.max_batch_tokens,
             );
             if chunk_tokens == 0 {
@@ -219,6 +232,7 @@ where
         now: Time,
     ) -> bool {
         let max_batch_tokens = self.max_batch_tokens;
+        let chunk_end_quantum = self.chunk_end_quantum;
         let mut remaining_budget = max_batch_tokens;
         // Running decodes first, as vLLM schedules its running queue before
         // waiting prompts. One whose previous step has not returned sits out.
@@ -247,8 +261,12 @@ where
         // Started prompts keep start order. One that cannot run keeps its place.
         self.started_prefills.retain(|candidate| {
             let resolved_prefill = kv_store.resolved_prefill_context(candidate.request_id);
-            let chunk_tokens =
-                next_chunk_tokens(resolved_prefill, remaining_budget, None, max_batch_tokens);
+            let chunk_tokens = next_chunk_tokens(
+                resolved_prefill,
+                remaining_budget,
+                chunk_end_quantum,
+                max_batch_tokens,
+            );
             if chunk_tokens == 0 {
                 return true;
             }

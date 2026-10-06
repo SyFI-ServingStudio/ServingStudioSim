@@ -555,6 +555,50 @@ pub enum IterArchSel {
         #[serde(default)]
         cudagraph_capture_sizes: Vec<u32>,
     },
+    /// [`Self::Glm53FlashVllmFp8KdaDsaMoe`]'s kernels under pure pipeline
+    /// parallelism. Each of `pp_size` stages is one GPU running a contiguous
+    /// layer range (vLLM's `get_pp_indices`) at TP1 / EP1: every head and
+    /// expert is local, so a stage has no collective. Each stage caches only
+    /// its own KDA (per request) and DSA (per token) layers; from PP12 a stage
+    /// has KDA layers but no DSA layer, which vLLM's hybrid cache rejects. MTP
+    /// is not run. Runs only under deployment `pp`.
+    Glm53FlashVllmFp8PpKdaDsaMoe {
+        #[serde(flatten)]
+        model: ModelSpec,
+        /// Pipeline stages, one GPU each.
+        #[param(cache_key)]
+        pp_size: u16,
+        /// Configured context cap: the indexer's logits row stride and the
+        /// sparse-index page-table extent.
+        #[serde(default = "default_glm53_flash_max_model_len")]
+        #[param(default = 8192, cache_key)]
+        max_model_len: u32,
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS, cache_key)]
+        routing: RoutingKind,
+        #[serde(default)]
+        #[param(cache_key)]
+        routing_seed: Option<u64>,
+        /// Measured per-expert popularity captured at EP1 (one rank owns all
+        /// 288 experts). Requires `routing = popularity`.
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+        /// Recorded per-token expert routes from a `token_corpus` pass, as a
+        /// manifest path. Requires `routing = corpus`. Routes are per token, so
+        /// a corpus captured at any EP size folds to EP1.
+        #[serde(default)]
+        #[param(cache_key)]
+        token_corpus_file: Option<String>,
+        /// vLLM `--cudagraph-capture-sizes`, as for the TP = EP graph. Empty:
+        /// no padding (eager).
+        #[serde(default)]
+        cudagraph_capture_sizes: Vec<u32>,
+        /// vLLM `VLLM_PP_LAYER_PARTITION`: layers per stage, `pp_size` counts
+        /// summing to 45. Empty: vLLM's default `get_pp_indices` split.
+        #[serde(default)]
+        layer_partition: Vec<u32>,
+    },
     /// SGLang's B200 NVFP4 launch graph under pure tensor parallelism. Every
     /// rank owns all experts (EP1) and shards the routed intermediate axis by
     /// TP, so there is no expert-parallel or NVLink-domain selector.
@@ -607,6 +651,7 @@ impl IterArchSel {
             | Self::Glm52VllmNvfp4DsaMoeSpeculative { model, .. }
             | Self::Glm53VllmNvfp4DsaMoeDflash2 { model, .. }
             | Self::Glm53FlashVllmFp8KdaDsaMoe { model, .. }
+            | Self::Glm53FlashVllmFp8PpKdaDsaMoe { model, .. }
             | Self::Glm52SglangNvfp4TpDsaMoe { model, .. } => model,
         }
     }
@@ -622,6 +667,7 @@ impl IterArchSel {
             | Self::Glm52VllmNvfp4DsaMoeSpeculative { max_model_len, .. }
             | Self::Glm53VllmNvfp4DsaMoeDflash2 { max_model_len, .. }
             | Self::Glm53FlashVllmFp8KdaDsaMoe { max_model_len, .. }
+            | Self::Glm53FlashVllmFp8PpKdaDsaMoe { max_model_len, .. }
             | Self::Glm52SglangNvfp4TpDsaMoe { max_model_len, .. } => Ok(*max_model_len),
             Self::Qwen36Local { model, .. }
             | Self::Llama3Dense { model }

@@ -3,9 +3,11 @@
 //! and owns the pipeline's KV; later stages pull activations over NVLink and
 //! compute their layers.
 //!
-//! The only wired pair is `glm52_vllm_nvfp4_pp_dsa_moe` + `pipeline_chunked_prefill`.
+//! Wired pairs: `glm52_vllm_nvfp4_pp_dsa_moe` and the hybrid
+//! `glm53_flash_vllm_fp8_pp_kda_dsa_moe`, each with `pipeline_chunked_prefill`.
 //! The arch builds every stage's model once; the stage models are shared across
-//! replicas.
+//! replicas. The hybrid head charges KV and recurrent state against one block
+//! pool (`PipelineHybridState`).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -23,9 +25,10 @@ use crate::orchestrator::{
 use crate::timing::kernels::{P2pIntraKernel, P2pIntraKernelConfig};
 use crate::timing::PerfApiBridge;
 use crate::worker::{
-    build_pipeline_head_worker, build_pipeline_stage_worker, resolve_prefix_cache_config,
-    CostSource, IterWorkerSel, PendingOrderKind, PipelineLayout, PrefixCacheMode,
-    PrefixCachePolicy, WorkerConfig,
+    build_hybrid_pipeline_head_worker, build_pipeline_head_worker, build_pipeline_stage_worker,
+    resolve_prefix_cache_config, CostSource, IterWorker, IterWorkerSel, PendingOrderKind,
+    PipelineHeadEvent, PipelineHeadMsg, PipelineHybridState, PipelineLayout, PrefillChunkAlignment,
+    PrefixCacheMode, PrefixCachePolicy, WorkerConfig,
 };
 
 use super::Deployment;
@@ -91,9 +94,12 @@ impl Deployment for PpDeployment {
                     kv_bytes_per_token: pipeline.pipeline_kv_bytes_per_token(),
                     activation_bytes_per_token: pipeline.activation_bytes_per_token(),
                 };
+                let head_model = Arc::clone(&pipeline.stages()[0]);
+                let head_store = std::rc::Rc::clone(&store);
+                let head_log_dir = log_dir.clone();
+                let head_gpu = gpu_name.clone();
                 Ok(assemble_pp_flow(
                     pipeline.stages(),
-                    layout,
                     store,
                     worker_config,
                     log_dir,
@@ -104,6 +110,94 @@ impl Deployment for PpDeployment {
                         placement,
                     },
                     build_activation_cost(&gpu_name, bridge)?,
+                    move |id, cluster| {
+                        build_pipeline_head_worker(
+                            id,
+                            STAGE_POOL_TAG,
+                            Arc::clone(&head_model),
+                            layout,
+                            std::rc::Rc::clone(&head_store),
+                            worker_config,
+                            head_log_dir.clone(),
+                            PP_STAGE_POOL,
+                            &head_gpu,
+                            std::rc::Rc::clone(cluster),
+                        )
+                    },
+                ))
+            }
+            IterArchSel::Glm53FlashVllmFp8PpKdaDsaMoe {
+                pp_size,
+                max_model_len,
+                routing,
+                routing_seed,
+                expert_popularity_file,
+                token_corpus_file,
+                cudagraph_capture_sizes,
+                layer_partition,
+                ..
+            } => {
+                let pipeline = arch_build::glm53_flash_vllm_fp8_pp_kda_dsa_moe(
+                    model_spec,
+                    *pp_size,
+                    *max_model_len,
+                    *routing,
+                    *routing_seed,
+                    expert_popularity_file.as_deref(),
+                    token_corpus_file.as_deref(),
+                    cudagraph_capture_sizes,
+                    layer_partition,
+                    &gpu_name,
+                    MODEL_NAME,
+                    bridge,
+                )?;
+                let layout = PipelineLayout {
+                    depth: pipeline.pp_size(),
+                    kv_bytes_per_token: pipeline.pipeline_kv_bytes_per_token(),
+                    activation_bytes_per_token: pipeline.activation_bytes_per_token(),
+                };
+                let hybrid = PipelineHybridState {
+                    block_tokens: pipeline.block_tokens(),
+                    state_blocks_per_request: pipeline.state_blocks_per_request(),
+                    block_aligned_chunks: matches!(
+                        g.worker,
+                        IterWorkerSel::PipelineChunkedPrefill {
+                            prefill_chunk_alignment: PrefillChunkAlignment::Checkpoint,
+                            ..
+                        }
+                    ),
+                };
+                let head_model = Arc::clone(&pipeline.stages()[0]);
+                let head_store = std::rc::Rc::clone(&store);
+                let head_log_dir = log_dir.clone();
+                let head_gpu = gpu_name.clone();
+                Ok(assemble_pp_flow(
+                    pipeline.stages(),
+                    store,
+                    worker_config,
+                    log_dir,
+                    gpu_name.clone(),
+                    PpStagePoolConfig {
+                        replicas: g.replicas,
+                        depth: layout.depth,
+                        placement,
+                    },
+                    build_activation_cost(&gpu_name, bridge)?,
+                    move |id, cluster| {
+                        build_hybrid_pipeline_head_worker(
+                            id,
+                            STAGE_POOL_TAG,
+                            Arc::clone(&head_model),
+                            layout,
+                            hybrid,
+                            std::rc::Rc::clone(&head_store),
+                            worker_config,
+                            head_log_dir.clone(),
+                            PP_STAGE_POOL,
+                            &head_gpu,
+                            std::rc::Rc::clone(cluster),
+                        )
+                    },
                 ))
             }
             other => bail!("pp: arch {other:?} has no pipeline-parallel stage model"),
@@ -117,6 +211,7 @@ fn worker_config(cfg: &PpConfig, worker: &IterWorkerSel) -> anyhow::Result<Worke
         max_batch_tokens,
         gpu_time_multiplier,
         balance_decode_microbatches,
+        ..
     } = worker
     else {
         bail!("pp: the stage pool requires worker `pipeline_chunked_prefill`, got {worker:?}");
@@ -159,37 +254,29 @@ fn build_activation_cost(gpu_name: &str, bridge: &PerfApiBridge) -> anyhow::Resu
     Ok(CostSource::IntraKernel(kernel))
 }
 
+/// One pipeline flow: `build_head` makes each replica's stage-0 head (its KV
+/// store is the arch's choice); every later stage is a follower.
 #[allow(clippy::too_many_arguments)]
-fn assemble_pp_flow<M: IterwiseUnifiedModel>(
+fn assemble_pp_flow<M, H>(
     stages: &[Arc<M>],
-    layout: PipelineLayout,
     store: SharedRequests,
     worker_config: WorkerConfig,
     log_dir: Option<PathBuf>,
     gpu_name: String,
     pool_config: PpStagePoolConfig,
     cost: CostSource,
-) -> Box<dyn Flow> {
-    assert_eq!(stages.len(), usize::from(layout.depth));
-    let head_model = Arc::clone(&stages[0]);
+    build_head: impl FnMut(crate::common::WorkerId, &crate::worker::SharedGpuCluster) -> H,
+) -> Box<dyn Flow>
+where
+    M: IterwiseUnifiedModel + 'static,
+    H: IterWorker<Msg = PipelineHeadMsg, Event = PipelineHeadEvent> + 'static,
+{
+    assert_eq!(stages.len(), usize::from(pool_config.depth));
     Box::new(PpFlow::new(
         std::rc::Rc::clone(&store),
         &pool_config,
         cost,
-        |id, cluster| {
-            build_pipeline_head_worker(
-                id,
-                STAGE_POOL_TAG,
-                Arc::clone(&head_model),
-                layout,
-                std::rc::Rc::clone(&store),
-                worker_config,
-                log_dir.clone(),
-                PP_STAGE_POOL,
-                &gpu_name,
-                std::rc::Rc::clone(cluster),
-            )
-        },
+        build_head,
         |id, stage, cluster| {
             build_pipeline_stage_worker(
                 id,

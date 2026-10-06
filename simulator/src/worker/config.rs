@@ -424,6 +424,12 @@ pub enum IterWorkerSel {
         #[serde(default = "default_gpu_time_multiplier")]
         #[param(default = 1.0)]
         gpu_time_multiplier: f64,
+        /// Hybrid archs only: `checkpoint` ends non-final prefill chunks on the
+        /// recurrent checkpoint interval (vLLM's Mamba `align` mode); `plain`
+        /// chunks as `min(remaining, budget)`, leaving that engine artifact out.
+        #[serde(default)]
+        #[param(string, default = "checkpoint", choices = PREFILL_CHUNK_ALIGNMENT_CHOICES)]
+        prefill_chunk_alignment: PrefillChunkAlignment,
         /// Cap each microbatch at `ceil(resident decodes / pp_size)` decodes so
         /// running requests split across the in-flight microbatches. Off is
         /// vLLM: every ready decode joins the next microbatch, so requests that
