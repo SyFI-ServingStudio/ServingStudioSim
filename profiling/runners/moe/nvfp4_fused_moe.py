@@ -11,10 +11,23 @@ from profiling.runners.autotune_cache import autotune_cached
 from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
 from profiling.runners.moe.exact_topk import exact_topk_ids
+from profiling.runners.moe.fp8_block_fused_moe import forced_routing_logits
 
 WEIGHT_FORMAT = DType.NVFP4_E2M1
 GROUP_SIZE = 16
-ROUTING_METHODS = {"minimax2": 7}
+# flashinfer.fused_moe.RoutingMethodType. Both are sigmoid + correction-bias
+# top-k with renormalized weights; DeepSeekV3 also applies the routed scale.
+# Ungrouped DeepSeekV3 runs the same routingCustom kernel as MiniMax2
+# (trtllm_fused_moe_runner.cu, `DeepSeekV3 && nGroup <= 1`).
+ROUTING_METHODS = {"minimax2": 7, "deepseek_v3": 2}
+# Bytes per router logit and per correction-bias element that vLLM passes.
+# MiniMax2 rows keep the BF16 router of their model. DeepSeekV3 rows are for a
+# model with `moe_router_dtype: float32`: GateLinear emits FP32 logits
+# (router_logits_dtype = gate.out_dtype) and e_score_correction_bias is an FP32
+# parameter, both passed to the kernel unchanged.
+ROUTING_ELEMENT_BYTES = {"minimax2": 2, "deepseek_v3": 4}
+# The SGLang deferred-finalize backend is only measured for MiniMax2.
+SGLANG_ROUTING_METHODS = frozenset({"minimax2"})
 _PREPARED_WEIGHT_CACHE: dict[tuple[str, int, int, int, int], tuple[Any, Any, Any, Any]] = {}
 SGLANG_PDL_MAX_TOKENS = 8192
 
@@ -183,7 +196,53 @@ def _precomputed_routing_kwargs(torch: Any, ids: Any, args: dict[str, Any]) -> d
     }
 
 
-def _validate_args(**kwargs: Any) -> dict[str, Any]:
+def tuning_label(args: dict[str, Any], stack: str, precomputed_routing: bool) -> str:
+    """Name of the persisted tactic file for this call's runner configuration.
+
+    FlashInfer's file key for ``trtllm_fp4_block_scale_moe`` holds only the
+    custom-op name, the runner class and the bucketed input shapes (output,
+    logits, top-k ids/weights, hidden states and scales); ``MoERunner`` adds no
+    ``get_cache_key_extras``. The local expert count, the intermediate size and,
+    for the routed call, the global expert count shape the GEMMs but are absent
+    from those shapes, so EP4 and TP8 rows of one model would share a key and
+    the second would replay the first one's tactic. vLLM never sees that: it
+    tunes in-process, where the key also hashes the runner. One file per
+    configuration restores that separation.
+    """
+
+    label = f"nvfp4_fused_moe.{stack}" + (".routed" if precomputed_routing else "")
+    return (
+        f"{label}.e{args['num_experts']}.l{args['num_local_experts']}"
+        f".h{args['hidden_size']}.i{args['intermediate_size']}"
+    )
+
+
+def _forced_routing(
+    torch: Any, ids: list[list[int]], args: dict[str, Any], device: Any = "cuda"
+) -> tuple[Any, Any]:
+    """Router logits and zero correction bias whose top-k is exactly ``ids``.
+
+    Both are in the dtype vLLM passes for the routing method (see
+    ``ROUTING_ELEMENT_BYTES``). With a zero bias, sigmoid + top-k picks the
+    distinct high logits regardless of the routed scale.
+    """
+
+    if args["routing_method"] == "deepseek_v3":
+        logits = forced_routing_logits(torch, ids, args["num_experts"], device)
+        return logits, torch.zeros(args["num_experts"], dtype=torch.float32, device=device)
+    logits = torch.full(
+        (args["num_tokens"], args["num_experts"]),
+        -16.0,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    selected = torch.tensor(ids, dtype=torch.int64, device=device)
+    priorities = torch.arange(args["top_k"], dtype=torch.bfloat16, device=device)
+    logits.scatter_(1, selected, (16.0 - priorities).expand_as(selected).contiguous())
+    return logits, torch.zeros(args["num_experts"], dtype=torch.bfloat16, device=device)
+
+
+def _validate_args(*, stack: str = "vllm", **kwargs: Any) -> dict[str, Any]:
     args = dict(kwargs)
     for name in (
         "num_tokens",
@@ -208,6 +267,14 @@ def _validate_args(**kwargs: Any) -> dict[str, Any]:
         raise ValueError("NVFP4 fused MoE requires nvfp4_e2m1 weights with group_size=16")
     if args["routing_method"] not in ROUTING_METHODS:
         raise ValueError(f"unsupported routing method: {args['routing_method']}")
+    if stack == "sglang" and args["routing_method"] not in SGLANG_ROUTING_METHODS:
+        raise ValueError(f"unsupported routing method for SGLang: {args['routing_method']}")
+    # Grouped DeepSeekV3 routing only admits experts from the best topk_group
+    # groups, so forced logits could not realize an arbitrary histogram.
+    if args["routing_method"] == "deepseek_v3" and (
+        args["n_group"] != 1 or args["topk_group"] != 1
+    ):
+        raise ValueError("only ungrouped deepseek_v3 routing (n_group=topk_group=1) is supported")
     if args["hidden_size"] % 256 or args["intermediate_size"] % 256:
         raise ValueError("TRT-LLM NVFP4 dimensions must be divisible by 256")
     if len(args["per_expert_batches"]) != args["num_experts"]:
@@ -249,9 +316,13 @@ def _logical_bytes(
     intermediate = args["intermediate_size"]
     experts = args["num_experts"]
 
-    # BF16 router logits + bias, or fp32 weights + int32 IDs already selected.
+    # Router logits + correction bias at the router's element size, or fp32
+    # weights + int32 IDs already selected.
+    routing_element = ROUTING_ELEMENT_BYTES[args["routing_method"]]
     routing = (
-        8 * tokens * args["top_k"] if precomputed_routing else 2 * tokens * experts + 2 * experts
+        8 * tokens * args["top_k"]
+        if precomputed_routing
+        else routing_element * (tokens * experts + experts)
     )
     # Packed FP4 routed activations + one FP8 scale per group of GROUP_SIZE.
     activations = local_rows * (hidden // 2 + hidden // GROUP_SIZE)
@@ -294,7 +365,7 @@ def _profile_nvfp4_fused_moe_sm100(
     spec.pop("stack")
     spec.pop("do_finalize")
     spec.pop("precomputed_routing")
-    args = _validate_args(**spec)
+    args = _validate_args(stack=stack, **spec)
     try:
         import flashinfer
         from flashinfer.autotuner import autotune
@@ -305,16 +376,7 @@ def _profile_nvfp4_fused_moe_sm100(
             top_k=args["top_k"],
             per_expert_batches=args["per_expert_batches"],
         )
-        routing_logits = torch.full(
-            (args["num_tokens"], args["num_experts"]),
-            -16.0,
-            dtype=torch.bfloat16,
-            device="cuda",
-        )
-        selected = torch.tensor(ids, dtype=torch.int64, device="cuda")
-        priorities = torch.arange(args["top_k"], dtype=torch.bfloat16, device="cuda")
-        routing_logits.scatter_(1, selected, (16.0 - priorities).expand_as(selected).contiguous())
-        routing_bias = torch.zeros(args["num_experts"], dtype=torch.bfloat16, device="cuda")
+        routing_logits, routing_bias = _forced_routing(torch, ids, args)
         hidden, hidden_scale, per_token_scale = _quantized_hidden(
             torch, quantize, args["num_tokens"], args["hidden_size"]
         )
@@ -398,8 +460,7 @@ def _profile_nvfp4_fused_moe_sm100(
         # signature, so timing an extra autotune here would select a tactic its
         # production invocation does not use.
         if stack != "sglang":
-            tuning_label = f"nvfp4_fused_moe.{stack}" + (".routed" if precomputed_routing else "")
-            with autotune_cached(autotune, tuning_label):
+            with autotune_cached(autotune, tuning_label(args, stack, precomputed_routing)):
                 run_once()
         else:
             run_once()
