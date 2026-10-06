@@ -186,6 +186,16 @@ pub(crate) fn node_time(m: &Manifest, idx: usize, slot_ns: &[i64]) -> i64 {
     }
 }
 
+/// The child of a `Max`/`Parallel` with the largest [`node_time`]: the
+/// critical path through it. On an exact tie the last such child, as
+/// `max_by_key` picks. Placement, the worker CostTree's `critical` and every
+/// other critical-path pick share this so they name the same child.
+pub(crate) fn critical_child(m: &Manifest, children: Range<usize>, slot_ns: &[i64]) -> usize {
+    children
+        .max_by_key(|&c| node_time(m, c, slot_ns))
+        .expect("Max/Parallel node has at least one child")
+}
+
 /// Balanced fold of a subtree for `R` rungs at once: each rung substitutes its
 /// own leaf values and re-evaluates the tree, with
 /// - `Max` (rank fan-out) folded to `mean/overlap`: every rank does an equal
