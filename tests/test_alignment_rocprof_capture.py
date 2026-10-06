@@ -505,16 +505,20 @@ def test_harvest_tool_env_extracts_rocprofiler_vars_only(tmp_path):
     }
 
 
-def test_harvest_tool_env_raises_when_nothing_injected(tmp_path):
-    """A rocprofv3 that configures by a channel other than env is surfaced, not hidden."""
+def test_harvest_tool_env_raises_when_no_loader_var(tmp_path):
+    """A rocprofv3 that loads its tool by a channel other than env is surfaced."""
     from alignment.profiler.rocprof_capture import run_capture_per_rank_tool_env
 
     base_env = {"PATH": "/usr/bin"}
 
     def fake_probe_runner(argv, env=None, check=True):
-        return subprocess.CompletedProcess(argv, 0, stdout=_env_dump_stdout(base_env))
+        # Harvest sees only a ROCPROF_* output knob, but NO tool-loader var — the
+        # build does not load its tool by environment, so tool-env cannot attach.
+        return subprocess.CompletedProcess(
+            argv, 0, stdout=_env_dump_stdout({**base_env, "ROCPROF_KERNEL_TRACE": "1"})
+        )
 
-    with pytest.raises(RuntimeError, match="harvested no rocprofiler-sdk environment"):
+    with pytest.raises(RuntimeError, match="no rocprofiler-sdk tool-loader environment"):
         run_capture_per_rank_tool_env(
             _fake_exe(tmp_path),
             RocprofConfig(tp_size=2),
@@ -562,10 +566,15 @@ def test_tool_env_runs_server_without_rocprofv3_prefix(tmp_path):
     # prefix and NO literal '--' separator.
     assert seen["argv"] == ["python", "-m", "vllm", "serve", "model"]
     assert "rocprofv3" not in seen["argv"][0]
-    # The injected rocprofiler-sdk env rode onto the server env, atop the roctx flag.
+    # The harvested tool-loader var rode onto the server env, atop the roctx flag.
     assert seen["env"]["ROCP_TOOL_LIBRARIES"] == "librocprofiler-sdk-tool.so"
-    assert seen["env"]["ROCPROF_KERNEL_TRACE"] == "1"
     assert seen["env"][ROCTX_SCOPES_ENV] == "1"
+    # The trace/output config is set explicitly with deterministic per-rank naming.
+    assert seen["env"]["ROCPROF_KERNEL_TRACE"] == "1"
+    assert seen["env"]["ROCPROF_MARKER_TRACE"] == "1"
+    assert seen["env"]["ROCPROF_OUTPUT_FORMAT"] == "rocpd"
+    assert seen["env"]["ROCPROF_OUTPUT_PATH"] == str(out_dir)
+    assert seen["env"]["ROCPROF_OUTPUT_FILE_NAME"] == f"trace_rank%q{{{OUTPUT_RANK_ENV_DEFAULT}}}%"
     assert [p.name for p in found] == ["trace_rank0_results.db", "trace_rank1_results.db"]
 
 
@@ -575,7 +584,10 @@ def test_cli_attach_mode_tool_env_end_to_end(tmp_path):
     parsed_out = tmp_path / "parsed.json"
 
     def fake_probe_runner(argv, env=None, check=True):
-        dump = _env_dump_stdout({**(env or {}), "ROCPROF_KERNEL_TRACE": "1"})
+        # Harvest surfaces the tool-loader var; output/trace config is set explicitly.
+        dump = _env_dump_stdout(
+            {**(env or {}), "ROCP_TOOL_LIBRARIES": "librocprofiler-sdk-tool.so"}
+        )
         return subprocess.CompletedProcess(argv, 0, stdout=dump)
 
     def fake_runner(argv, env=None, check=True):

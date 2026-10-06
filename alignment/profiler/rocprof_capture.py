@@ -174,6 +174,15 @@ ATTACH_MODES = (ATTACH_MODE_WRAP, ATTACH_MODE_TOOL_ENV)
 #: (``LD_PRELOAD``), and the ``ROCPROF*``/``ROCPROFILER*`` trace+output knobs.
 _TOOL_ENV_KEY_RE = re.compile(r"^(ROCP_|ROCPROF|HSA_TOOLS_LIB|LD_PRELOAD|ROCPROFILER)")
 
+#: The harvested keys that actually SELECT/LOAD the rocprofiler-sdk tool in a
+#: process. Their values — the tool library name and the loader preload path — are
+#: the stack- and version-specific part that cannot be guessed, so at least one
+#: must come from the harvest. The ``ROCPROF_*`` trace/output knobs are set
+#: explicitly from the capture config instead (:func:`tool_env_output_config`), so
+#: the per-rank output template is deterministic even when this rocprofv3 build
+#: keeps the output configuration out of the child environment.
+_TOOL_LOADER_KEYS = ("ROCP_TOOL_LIBRARIES", "HSA_TOOLS_LIB", "LD_PRELOAD")
+
 Runner = Callable[[list[str]], subprocess.CompletedProcess]
 
 
@@ -466,6 +475,32 @@ def harvest_tool_env(
     return injected
 
 
+def tool_env_output_config(
+    config: RocprofConfig, output_dir: Path, output_name_template: str
+) -> dict[str, str]:
+    """The explicit ``ROCPROF_*`` trace+output environment for a tool-env capture.
+
+    Set from the capture config with the documented rocprofiler-sdk variable names
+    (``ROCPROF_OUTPUT_PATH`` / ``ROCPROF_OUTPUT_FILE_NAME`` / ``ROCPROF_OUTPUT_FORMAT``
+    and the per-trace toggles) rather than relying on rocprofv3 to export them, so
+    each worker writes ``<output_name>_rank<N>`` under ``output_dir`` deterministically.
+    ``output_name_template`` carries the per-rank ``%q{RANK}%`` key the tool resolves
+    for itself in each worker process.
+    """
+    env = {
+        "ROCPROF_OUTPUT_FORMAT": config.output_format,
+        "ROCPROF_OUTPUT_PATH": str(output_dir),
+        "ROCPROF_OUTPUT_FILE_NAME": output_name_template,
+    }
+    if config.kernel_trace:
+        env["ROCPROF_KERNEL_TRACE"] = "1"
+    if config.marker_trace:
+        env["ROCPROF_MARKER_TRACE"] = "1"
+    if config.hip_trace:
+        env["ROCPROF_HIP_API_TRACE"] = "1"
+    return env
+
+
 def run_capture_per_rank_tool_env(
     executable: ResolvedRocprofExecutable,
     config: RocprofConfig,
@@ -505,15 +540,18 @@ def run_capture_per_rank_tool_env(
         base_env=base_env,
         probe_runner=probe_runner,
     )
-    if not injected:
+    if not any(key in injected for key in _TOOL_LOADER_KEYS):
         raise RuntimeError(
-            "tool-env attach harvested no rocprofiler-sdk environment from rocprofv3 "
-            f"(looked for keys matching {_TOOL_ENV_KEY_RE.pattern!r}); this rocprofv3 "
-            "build does not configure in-process tracing by environment, so the "
-            "wrapping attach mode must be used instead"
+            "tool-env attach harvested no rocprofiler-sdk tool-loader environment "
+            f"from rocprofv3 (looked for {list(_TOOL_LOADER_KEYS)}; got "
+            f"{sorted(injected)}); this rocprofv3 build does not load its tool by "
+            "environment, so the wrapping attach mode must be used instead"
         )
     server_env = dict(base_env)
-    server_env.update(injected)
+    server_env.update(injected)  # tool-loader vars (+ anything rocprofv3 exported)
+    # Set the trace/output configuration explicitly so per-rank naming is
+    # deterministic even if rocprofv3 kept it out of the harvested child env.
+    server_env.update(tool_env_output_config(config, output_dir, templated_name))
     completed = runner(list(server_argv), env=server_env, check=True)  # type: ignore[call-arg]
     if getattr(completed, "returncode", 0) not in (0, None):
         raise RuntimeError(f"server exited with code {completed.returncode}")
