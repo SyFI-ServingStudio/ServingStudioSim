@@ -140,7 +140,37 @@ def test_single_gemm_known_backends_include_framework_dispatches():
         "sglang_bf16_auto",
         "sglang_fused_a_auto",
         "deepgemm",
+        "flashinfer_cutedsl",
     }
+
+
+def test_flashinfer_cutedsl_backend_is_nvfp4_sm10x_in_vllm_env():
+    # Guards the device/dtype contract the worker enforces before loading the
+    # runner: a bf16 config or a Hopper card must never route to the FP4 GEMM.
+    spec = find_kernel_profiler_spec("single_gemm", "flashinfer_cutedsl")
+    assert spec.table_name == "single_gemm"
+    assert spec.args_schema is SingleGemmArgs
+    assert spec.subprocess_env == "vllm_env"
+    assert spec.supports.compute == frozenset({DType.NVFP4_E2M1})
+    assert spec.supports.sm_targets == frozenset({"sm_100f"})
+    assert spec.runner_ref.module_name == "profiling.runners.gemm.flashinfer_fp4"
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"m": 8, "n": 64, "k": 64, "dtype": "bf16"}, "NVFP4-only"),
+        ({"m": 8, "n": 64, "k": 40, "dtype": "nvfp4_e2m1"}, "divisible by 16"),
+        ({"m": 0, "n": 64, "k": 64, "dtype": "nvfp4_e2m1"}, "positive"),
+    ],
+)
+def test_flashinfer_cutedsl_runner_rejects_specs_vllm_cannot_quantize(kwargs, message):
+    # Rejected before any torch/vLLM import, so a bad spec fails loudly instead
+    # of being timed as some other GEMM.
+    from profiling.runners.gemm.flashinfer_fp4 import profile_single_gemm
+
+    with pytest.raises(ValueError, match=message):
+        profile_single_gemm(**kwargs)
 
 
 def test_torch_linear_backend_registered_sharing_table_and_args():
