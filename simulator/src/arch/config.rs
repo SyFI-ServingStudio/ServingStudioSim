@@ -377,6 +377,52 @@ pub enum IterArchSel {
         #[param(cache_key)]
         token_corpus_file: Option<String>,
     },
+    /// [`Self::Glm52VllmNvfp4DsaMoe`]'s kernels under data-parallel attention
+    /// and expert-parallel MoE (vLLM `--data-parallel-size ep_size
+    /// --enable-expert-parallel`, TP1). Every GPU is its own engine with its
+    /// own batch and KV; attention, dense FFN, shared expert and lm_head run
+    /// whole on each GPU's tokens, and only the routed experts are sharded,
+    /// behind an NVFP4 all-gather and a bf16 reduce-scatter. MTP is not run.
+    /// GLM-5.3 NVFP4 is the same graph.
+    Glm52VllmNvfp4DpAttnDsaMoe {
+        #[serde(flatten)]
+        model: ModelSpec,
+        /// Data-parallel attention ranks, which are also the expert-parallel
+        /// group: one GPU each.
+        #[serde(default = "default_glm52_nvfp4_parallel_size")]
+        #[param(default = 4, cache_key)]
+        ep_size: u16,
+        #[serde(default = "default_glm52_nvfp4_parallel_size")]
+        #[param(default = 4, cache_key)]
+        nvl_num_gpu: u16,
+        /// Configured context cap and padded DSA-logits row stride.
+        #[serde(default = "default_glm52_nvfp4_max_model_len")]
+        #[param(default = 1048576, cache_key)]
+        max_model_len: u32,
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS, cache_key)]
+        routing: RoutingKind,
+        #[serde(default)]
+        #[param(cache_key)]
+        routing_seed: Option<u64>,
+        /// Measured per-expert popularity captured at the same
+        /// `expert_parallel_size`. Requires `routing = popularity`.
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+        /// Recorded per-token expert routes from a `token_corpus` pass, as a
+        /// manifest path. Requires `routing = corpus`. Only the body slice is
+        /// read: no MTP layer runs.
+        #[serde(default)]
+        #[param(cache_key)]
+        token_corpus_file: Option<String>,
+        /// vLLM's CUDA-graph capture sizes. When the busiest DP rank's tokens
+        /// fit a captured size, every rank pads to that graph and every
+        /// kernel outside the attention graph break runs on the padded rows.
+        /// Empty: every step runs eager, unpadded.
+        #[serde(default)]
+        cudagraph_capture_sizes: Vec<u32>,
+    },
     /// [`Self::Glm52VllmNvfp4DsaMoe`]'s kernels under pure pipeline
     /// parallelism. Each of `pp_size` stages is one GPU running a contiguous
     /// layer range (vLLM's `get_pp_indices`) at EP1: every head and expert is
@@ -689,6 +735,7 @@ impl IterArchSel {
             | Self::Glm52VllmDsaMoe { model, .. }
             | Self::Glm52VllmNvfp4DsaMoe { model, .. }
             | Self::Glm52VllmNvfp4PpDsaMoe { model, .. }
+            | Self::Glm52VllmNvfp4DpAttnDsaMoe { model, .. }
             | Self::Glm52VllmNvfp4DsaMoeSpeculative { model, .. }
             | Self::Glm53VllmNvfp4DsaMoeDflash2 { model, .. }
             | Self::Glm53FlashVllmFp8KdaDsaMoe { model, .. }
@@ -706,6 +753,7 @@ impl IterArchSel {
         match self {
             Self::Glm52VllmNvfp4DsaMoe { max_model_len, .. }
             | Self::Glm52VllmNvfp4PpDsaMoe { max_model_len, .. }
+            | Self::Glm52VllmNvfp4DpAttnDsaMoe { max_model_len, .. }
             | Self::Glm52VllmNvfp4DsaMoeSpeculative { max_model_len, .. }
             | Self::Glm53VllmNvfp4DsaMoeDflash2 { max_model_len, .. }
             | Self::Glm53FlashVllmFp8KdaDsaMoe { max_model_len, .. }

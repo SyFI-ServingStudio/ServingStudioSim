@@ -82,7 +82,10 @@ DOC = KernelDoc(
         " every expert across all GPUs, and the first num_local_experts are "
         "this GPU's. The vLLM backend also combines the expert outputs; the "
         "SGLang backend leaves the combine to a later kernel, "
-        "moe_finalize_fuse_shared. The FP8 block-scale backend also combines."
+        "moe_finalize_fuse_shared. The FP8 block-scale backend also combines. "
+        "The routed backend takes top-k IDs and weights chosen before the call, "
+        "as vLLM does under data plus expert parallelism, so routing_method, "
+        "n_group, topk_group and the scaling factor do not reach the kernel."
     ),
     category="MoE",
     subcategory="Expert compute",
@@ -93,6 +96,7 @@ DOC = KernelDoc(
         "+ intermediate_size·hidden_size) / time",
         "output_rows = num_tokens for vLLM; local_rows for SGLang",
         "routing_bytes = 2·num_tokens·num_experts + 2·num_experts",
+        "routed backend: routing_bytes = 8·num_tokens·top_k",
         "activation_bytes = local_rows·(hidden_size/2 + hidden_size/group_size)",
         "weight_bytes = active_experts·(intermediate_size·hidden_size "
         "+ intermediate_size·hidden_size/8 + hidden_size·intermediate_size/2 "
@@ -120,6 +124,9 @@ DOC = KernelDoc(
         "(n_group = topk_group = 1); its autotuner stops at 8192 tokens, so larger "
         "shapes reuse the largest tuned bucket.",
         "Activation quantization is outside the call, and the router logits are synthetic.",
+        "The routed backend tunes up to max(8192, next power of two ≥ num_tokens); "
+        "vLLM tunes up to max_num_batched_tokens·dp_size, which picks the same "
+        "bucket for every shape it serves.",
         "GB/s counts logical traffic for the local rows and the experts that "
         "have rows; small side outputs are left out.",
     ),
@@ -151,6 +158,35 @@ register(
             summary=(
                 "FlashInfer trtllm_fp4_block_scale_moe through vLLM's NVFP4 path, "
                 "including final expert combination."
+            ),
+            url="https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/fused_moe/experts/trtllm_nvfp4_moe.py",
+        ),
+        subprocess_env="vllm_env",
+    )
+)
+
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="flashinfer_trtllm_routed_sm100",
+        # Same SM10x TRT-LLM-gen cubins as flashinfer_trtllm_sm100.
+        supports=BackendSupport(
+            compute=frozenset({DType.NVFP4_E2M1}),
+            sm_targets=frozenset({"sm_100f"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.moe.nvfp4_fused_moe",
+            function_name="profile_nvfp4_fused_moe_routed_sm100",
+        ),
+        table_name=KIND,
+        args_schema=Nvfp4FusedMoeArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        doc=BackendDoc(
+            summary=(
+                "FlashInfer trtllm_fp4_block_scale_routed_moe through vLLM's modular "
+                "NVFP4 path under data plus expert parallelism: top-k IDs and fp32 "
+                "weights are selected before dispatch, and the call finalizes."
             ),
             url="https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/fused_moe/experts/trtllm_nvfp4_moe.py",
         ),

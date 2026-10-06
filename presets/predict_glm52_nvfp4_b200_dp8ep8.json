@@ -1,0 +1,17 @@
+{
+  "arch": {
+    "iter": {
+      "type": "glm52_vllm_nvfp4_dp_attn_dsa_moe",
+      "model_config": "model/config/glm52_nvfp4.json",
+      "fp8": false,
+      "ep_size": 8,
+      "nvl_num_gpu": 8,
+      "max_model_len": 131072,
+      "routing": "popularity",
+      "expert_popularity_file": "presets/alignment/glm52_nvfp4_b200_tp8/expert_popularity.json"
+    }
+  },
+  "gpu": "NVIDIA B200",
+  "log_dir": "logs/predict_glm52_nvfp4_b200_dp8ep8",
+  "cases_file": "predict_glm52_nvfp4_b200_dp8ep8_cases.json"
+}

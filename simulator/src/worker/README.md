@@ -355,6 +355,13 @@ chooses where a cold request lands. `round-robin` (default) rotates blindly;
 waiting requests penalised by `6 * max(0, kv_usage - 0.5)` each, scan start
 rotated per placement. Retained-prefix affinity still wins over both.
 
+With several attention partitions (an attention-DP arch), `dp_placement`
+chooses where a cold request lands. `round-robin` (default) rotates blindly;
+`vllm-least-loaded` ports vLLM's DP load balancer
+(`DPLBAsyncMPClient.get_core_engine_for_request`): lowest `waiting + running`,
+waiting requests penalised by `6 * max(0, kv_usage - 0.5)` each, scan start
+rotated per placement. Retained-prefix affinity still wins over both.
+
 KV admission is a separate selector component (`kv_admission_policy`), shared
 by `chunked_prefill` and `speculative`:
 

@@ -11,6 +11,11 @@
 //! per-token-group-128 activations) with `deepseek_v3` routing,
 //! `n_group = topk_group = 1`, and routed scaling 5/2. Its autotuner stops at
 //! 8192 tokens, so larger grid points reuse the top tactic bucket.
+//!
+//! `flashinfer_trtllm_routed_sm100` is vLLM's modular call under data plus
+//! expert parallelism (`trtllm_fp4_block_scale_routed_moe`): the top-k IDs and
+//! fp32 weights arrive precomputed, so the routing fields stay in the key but do
+//! not reach the kernel.
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::CacheKind;

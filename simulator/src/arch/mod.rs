@@ -11,6 +11,7 @@ pub mod deepseek_v4_vllm;
 pub mod glm52_model_cfg;
 pub mod glm52_sglang_nvfp4_tp_dsa_moe;
 pub mod glm52_vllm_dsa_moe;
+pub mod glm52_vllm_nvfp4_dp_attn_dsa_moe;
 pub mod glm52_vllm_nvfp4_dsa_moe;
 pub mod glm52_vllm_nvfp4_pp_dsa_moe;
 pub mod glm53_flash_vllm_fp8_dp_attn_ep_moe;
@@ -47,6 +48,10 @@ pub use glm52_sglang_nvfp4_tp_dsa_moe::{
 };
 pub use glm52_vllm_dsa_moe::{
     Glm52VllmDsaMoeConfigs, Glm52VllmDsaMoeModel, Glm52VllmDsaMoeParallel, Glm52VllmDsaMoeResolved,
+};
+pub use glm52_vllm_nvfp4_dp_attn_dsa_moe::{
+    Glm52VllmNvfp4DpAttnConfigs, Glm52VllmNvfp4DpAttnDsaMoeModel, Glm52VllmNvfp4DpAttnParallel,
+    Glm52VllmNvfp4DpAttnResolved,
 };
 pub use glm52_vllm_nvfp4_dsa_moe::{
     Glm52VllmNvfp4DsaMoeConfigs, Glm52VllmNvfp4DsaMoeModel, Glm52VllmNvfp4DsaMoeParallel,

@@ -671,6 +671,43 @@ impl Deployment for UnifiedDeployment {
                     build_speculative_worker,
                 ))
             }
+            IterArchSel::Glm52VllmNvfp4DpAttnDsaMoe {
+                ep_size,
+                nvl_num_gpu,
+                max_model_len,
+                routing,
+                routing_seed,
+                expert_popularity_file,
+                token_corpus_file,
+                cudagraph_capture_sizes,
+                ..
+            } => {
+                ensure_hp_or_chunked_worker("GLM-5.2 NVFP4 DP attention", &g.worker)?;
+                let model = Arc::new(arch_build::glm52_vllm_nvfp4_dp_attn_dsa_moe(
+                    model_spec,
+                    *ep_size,
+                    *nvl_num_gpu,
+                    *max_model_len,
+                    *routing,
+                    *routing_seed,
+                    expert_popularity_file.as_deref(),
+                    token_corpus_file.as_deref(),
+                    cudagraph_capture_sizes,
+                    &gpu_name,
+                    MODEL_NAME,
+                    bridge,
+                )?);
+                assemble_hp_or_chunked_flow(
+                    "GLM-5.2 NVFP4 DP attention",
+                    model,
+                    store,
+                    worker_config,
+                    log_dir,
+                    gpu_name,
+                    dp_cfg,
+                    &g.worker,
+                )
+            }
             // A pipeline stage is its own worker cadence, so the arch is not a
             // unified worker's model.
             IterArchSel::Glm52VllmNvfp4PpDsaMoe { .. } => {

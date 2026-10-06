@@ -103,6 +103,7 @@ _FP4_ARCHS = frozenset(
         "glm52_sglang_nvfp4_tp_dsa_moe",
         "glm53_vllm_nvfp4_dsa_moe_dflash2",
         "glm52_vllm_nvfp4_pp_dsa_moe",
+        "glm52_vllm_nvfp4_dp_attn_dsa_moe",
     }
 )
 
