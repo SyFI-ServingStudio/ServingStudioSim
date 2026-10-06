@@ -19,21 +19,24 @@ balanced for an idle pipeline balances nothing.
 - The kernel-time report gives each worker's time per leaf position, so a
   group's time on a stage divided by its layer count is that kind's per-layer
   cost. Every stage runs the same microbatches over the same contexts, so this
-  cost does not depend on which stage runs the layer. The tool checks that
-  and prints the spread.
+  cost does not depend on which stage runs the layer; the tool prints how far
+  the stages disagree.
+- A fixed leaf is billed to the first stage, the last stage, or every stage,
+  by which stages carry it, so the runs need at least two stages.
 - Predicted stage time is then the sum over its layers plus its fixed leaves.
   The tool reproduces each run's own stage times as a check before it searches.
 
 It models compute only: no activation transfer and no pipeline bubble, so read
 its gain as the change in the busiest stage's kernel time, then confirm with a
-real run of the chosen split. On GLM-5.3-Flash NVFP4 TraceLab saturated runs
-it scored vLLM's PP4 split 3.4% behind [12, 11, 11, 11]; the runs measured
-2.8-2.9%, and a split it scored as tied measured within 0.2%.
+simulated run of the chosen split. On GLM-5.3-Flash NVFP4 TraceLab saturated
+simulations it scored vLLM's PP4 split 3.4% behind [12, 11, 11, 11]; simulating
+both splits measured 2.8-2.9%, and a split it scored as tied measured within 0.2%.
 
 ## Usage
 
     uv run python tools/pp-layer-balance/pp_layer_balance.py <run_dir>... \\
-        [--pp-size 8] [--each-stage-needs 'dsa_*'] [--top 5] [--json out.json]
+        [--pp-size 8] [--each-stage-needs 'dsa_*'] [--top 5] [--tolerance 0.02] \\
+        [--json out.json]
 
 - Several runs (e.g. the saturated point of two trace policies) are weighed
   equally: each run's costs are normalized to its own total before summing.
@@ -42,6 +45,7 @@ it scored vLLM's PP4 split 3.4% behind [12, 11, 11, 11]; the runs measured
 - `--each-stage-needs GLOB` rejects splits with a stage holding no layer whose
   kind matches GLOB (repeatable). GLM-5.3-Flash needs `'dsa_*'`: vLLM's hybrid
   cache grouping cannot place KDA state on a stage without a DSA layer.
+- `--json` writes every listed split and the recommended `layer_partition`.
 """
 
 from __future__ import annotations
@@ -54,6 +58,8 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
+# Splits within tolerance are enumerated; past this many, widen nothing further.
+MAX_SPLITS = 100_000
 STAGE_RE = re.compile(r"pipeline stage (\d+) of (\d+)")
 GROUP_RE = re.compile(r"^(?P<kind>\S+) x(?P<n>\d+) \(Scale \d+\) layers \[(?P<layers>[\d, ]*)\]$")
 
@@ -103,7 +109,7 @@ def parse_manifest(path: Path) -> Stage:
         for c in children(i):
             yield from leaves(c)
 
-    def walk(i, kind):
+    def walk(i):
         label = labels[i] or ""
         group = GROUP_RE.match(label)
         if "Scale" in nodes[i] and label and not group:
@@ -129,9 +135,9 @@ def parse_manifest(path: Path) -> Stage:
         if "Leaf" in node:
             stage.fixed_leaves.add(slots[node["Leaf"]]["name"])
         for c in children(i):
-            walk(c, kind)
+            walk(c)
 
-    walk(0, None)
+    walk(0)
     clash = stage.fixed_leaves & set(stage.group_of_leaf)
     if clash:
         sys.exit(f"{path}: leaves both fixed and in a layer group: {sorted(clash)[:3]}")
@@ -158,6 +164,14 @@ def load_run(path: Path) -> Run:
                 kind_of_layer[layer] = kind
     if sorted(kind_of_layer) != list(range(len(kind_of_layer))):
         sys.exit(f"{path}: layers do not cover 0..{len(kind_of_layer) - 1}")
+    if n < 2:
+        sys.exit(f"{path}: one stage cannot tell first-stage from last-stage fixed costs")
+    start = 0
+    for s in stages:
+        layers = sorted(x for group in s.layers.values() for x in group)
+        if layers != list(range(start, start + len(layers))):
+            sys.exit(f"{path}: stage {s.index} layers {layers} do not follow layer {start - 1}")
+        start += len(layers)
 
     report = json.loads((path / "reports/kernel_time_share_report.json").read_text())
     workers = sorted(report["totals"]["workers"], key=lambda w: w["worker_id"])
@@ -167,7 +181,10 @@ def load_run(path: Path) -> Run:
         )
 
     per_stage_cost: dict[str, list[float]] = {}
-    fixed_by_stage = [0.0] * n
+    fixed_ms: dict[str, list[float]] = {}  # fixed leaf -> ms on each stage
+    for s in stages:
+        for leaf in s.fixed_leaves:
+            fixed_ms.setdefault(leaf, [0.0] * n)
     for s, w in zip(stages, workers):
         group_ms: dict[str, float] = {}
         for seg in w["segments"]:
@@ -176,7 +193,7 @@ def load_run(path: Path) -> Run:
                 kind = s.group_of_leaf[name]
                 group_ms[kind] = group_ms.get(kind, 0.0) + ms
             elif name in s.fixed_leaves:
-                fixed_by_stage[s.index] += ms
+                fixed_ms[name][s.index] += ms
             else:
                 sys.exit(f"{path}: stage {s.index} reports position {name} that its manifest lacks")
         for kind, layers in s.layers.items():
@@ -188,11 +205,17 @@ def load_run(path: Path) -> Run:
         for k, v in per_stage_cost.items()
     }
     # Fixed leaves: by which stages carry them (the first, the last, or all).
-    first = fixed_by_stage[0]
-    last = fixed_by_stage[-1] if n > 1 else 0.0
-    middle = fixed_by_stage[1:-1]
-    every = sum(middle) / len(middle) if middle else 0.0
-    fixed_cost = {"first": first - every, "last": last - every, "every": every}
+    fixed_cost = {"first": 0.0, "last": 0.0, "every": 0.0}
+    for leaf, ms in fixed_ms.items():
+        on = [s.index for s in stages if leaf in s.fixed_leaves]
+        if on == list(range(n)):
+            fixed_cost["every"] += sum(ms) / n
+        elif on == [0]:
+            fixed_cost["first"] += ms[0]
+        elif on == [n - 1]:
+            fixed_cost["last"] += ms[-1]
+        else:
+            sys.exit(f"{path}: fixed leaf {leaf} runs on stages {on}, not the first, last or all")
     return Run(
         path,
         n,
@@ -233,6 +256,14 @@ def ranges(sizes):
     return out
 
 
+def stage_ranges(run: Run):
+    out = []
+    for s in run.stages:
+        layers = sorted(x for group in s.layers.values() for x in group)
+        out.append((layers[0], layers[-1] + 1))
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("runs", nargs="+", type=Path)
@@ -256,7 +287,16 @@ def main():
                 f"{r.path}: layer kinds differ from {runs[0].path}; mix runs of one model only"
             )
     num_layers = len(kinds)
-    pp = args.pp_size or runs[0].num_stages
+    pp = runs[0].num_stages if args.pp_size is None else args.pp_size
+    if not 1 <= pp <= num_layers:
+        sys.exit(f"--pp-size must be in 1..{num_layers}, got {pp}")
+    if args.tolerance < 0 or args.top < 1:
+        sys.exit("--tolerance must be >= 0 and --top >= 1")
+    for glob in args.each_stage_needs:
+        if not any(fnmatch.fnmatch(k, glob) for k in set(kinds.values())):
+            sys.exit(
+                f"--each-stage-needs {glob!r} matches no layer kind {sorted(set(kinds.values()))}"
+            )
 
     print(f"{num_layers} layers; per-layer cost by kind (ms; max spread across stages):")
     for r in runs:
@@ -269,6 +309,8 @@ def main():
             f"every {r.fixed_cost['every']:,.1f}"
         )
         own = [stage_cost(r, lo, hi, i, r.num_stages) for i, (lo, hi) in enumerate(stage_ranges(r))]
+        if min(r.stage_ms) <= 0:
+            sys.exit(f"{r.path}: a stage reports no kernel time; use a run that loads every stage")
         err = max(abs(a - b) / b for a, b in zip(own, r.stage_ms))
         print(f"    check: rebuilt stage times vs report, max error {err:.3%}")
         if err > 0.01:
@@ -296,9 +338,10 @@ def main():
             for lo in range(i - 1, hi):
                 if best[i - 1][lo] == INF:
                     continue
-                c = seg.setdefault(
-                    (lo, hi, i - 1), cost(lo, hi, i - 1) if feasible(lo, hi) else INF
-                )
+                key = (lo, hi, i - 1)
+                if key not in seg:
+                    seg[key] = cost(lo, hi, i - 1) if feasible(lo, hi) else INF
+                c = seg[key]
                 best[i][hi] = min(best[i][hi], max(best[i - 1][lo], c))
     optimum = best[pp][num_layers]
     if optimum == INF:
@@ -307,6 +350,8 @@ def main():
     found = []
 
     def dfs(i, lo, sizes, worst, sq):
+        if len(found) >= MAX_SPLITS:
+            return
         if i == pp:
             if lo == num_layers:
                 found.append((worst, sq, sizes))
@@ -319,6 +364,8 @@ def main():
                 dfs(i + 1, hi, sizes + [hi - lo], max(worst, c), sq + c * c)
 
     dfs(0, 0, [], 0.0, 0.0)
+    if len(found) >= MAX_SPLITS:
+        print(f"note: stopped at {MAX_SPLITS:,} splits within tolerance; lower --tolerance")
     found.sort(key=lambda x: (x[0], x[1]))
 
     def describe(sizes):
@@ -331,6 +378,9 @@ def main():
         own = [hi - lo for lo, hi in stage_ranges(runs[0])]
         if own != reference[0][1]:
             reference.append(("run's split", own))
+    for name, sizes in reference:
+        if not all(feasible(lo, hi) for lo, hi in ranges(sizes)):
+            print(f"note: {name} {sizes} violates --each-stage-needs; it cannot be served")
     base = describe(reference[-1][1])[0]
     print(
         f"\nPP{pp} splits (stage cost = share of each run's total, summed over runs; "
@@ -356,12 +406,15 @@ def main():
             + " ".join(f"{c:.3f}" for c in cs)
         )
     keep = reference[-1]
-    if base <= found[0][0] * (1 + 1e-9):
+    keep_feasible = all(feasible(lo, hi) for lo, hi in ranges(keep[1]))
+    if keep_feasible and base <= found[0][0] * (1 + 1e-9):
         # A tie is no reason to move layers: keep the split that already runs.
         print(f"\n{keep[0]} is already optimal; the remaining imbalance is layer granularity.")
-        print(f"layer_partition: {keep[1]}")
+        chosen = keep[1]
     else:
-        print(f"\nlayer_partition: {found[0][2]}")
+        print()
+        chosen = found[0][2]
+    print(f"layer_partition: {chosen}")
     if args.json:
         args.json.write_text(
             json.dumps(
@@ -370,18 +423,11 @@ def main():
                     "pp_size": pp,
                     "each_stage_needs": args.each_stage_needs,
                     "splits": rows,
+                    "layer_partition": chosen,
                 },
                 indent=2,
             )
         )
-
-
-def stage_ranges(run: Run):
-    out = []
-    for s in run.stages:
-        layers = sorted(x for group in s.layers.values() for x in group)
-        out.append((layers[0], layers[-1] + 1))
-    return out
 
 
 if __name__ == "__main__":
