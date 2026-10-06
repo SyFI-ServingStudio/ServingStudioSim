@@ -452,3 +452,172 @@ def test_cli_injects_roctx_flag_into_launched_server_env(tmp_path):
 def test_cli_requires_double_dash():
     with pytest.raises(SystemExit):
         rocprof_capture.main(["--output-dir", "x", "--output-name", "n"])
+
+
+# ---- tool-env attach mode (the multiprocessing-TP per-rank fix) ---------------
+
+
+def _env_dump_stdout(env: dict[str, str]) -> str:
+    return "".join(f"{k}={v}\n" for k, v in env.items())
+
+
+def test_harvest_tool_env_extracts_rocprofiler_vars_only(tmp_path):
+    """Harvest lifts only the new/changed rocprofiler-sdk keys, dropping noise."""
+    from alignment.profiler.rocprof_capture import harvest_tool_env
+
+    base_env = {"PATH": "/usr/bin", "HOME": "/home/x"}
+    # What `rocprofv3 ... -- env` would print: the base env plus the injected
+    # rocprofiler-sdk knobs, plus unrelated process noise that must be ignored.
+    injected_by_rocprofv3 = {
+        **base_env,
+        "ROCP_TOOL_LIBRARIES": "librocprofiler-sdk-tool.so",
+        "ROCPROF_KERNEL_TRACE": "1",
+        "ROCPROF_OUTPUT_FORMAT": "rocpd",
+        "ROCPROF_OUTPUT_PATH": str(tmp_path / "out"),
+        "ROCPROF_OUTPUT_FILE_NAME": "trace_rank%q{RANK}%",
+        "LD_PRELOAD": "/opt/rocm/lib/librocprofiler-sdk-tool.so",
+        "PWD": "/some/where",  # noise: not a rocprofiler key
+        "SHLVL": "2",  # noise
+    }
+
+    def fake_probe_runner(argv, env=None, check=True):
+        # Confirm the harvest probes rocprofv3 with the templated -o and a trivial cmd.
+        assert "--kernel-trace" in argv
+        assert argv[argv.index("-o") + 1] == "trace_rank%q{RANK}%"
+        assert argv[argv.index("--") + 1 :] == ["env"]
+        return subprocess.CompletedProcess(argv, 0, stdout=_env_dump_stdout(injected_by_rocprofv3))
+
+    injected = harvest_tool_env(
+        _fake_exe(tmp_path),
+        RocprofConfig(tp_size=2),
+        tmp_path / "out",
+        "trace_rank%q{RANK}%",
+        base_env=base_env,
+        probe_runner=fake_probe_runner,
+    )
+    assert injected == {
+        "ROCP_TOOL_LIBRARIES": "librocprofiler-sdk-tool.so",
+        "ROCPROF_KERNEL_TRACE": "1",
+        "ROCPROF_OUTPUT_FORMAT": "rocpd",
+        "ROCPROF_OUTPUT_PATH": str(tmp_path / "out"),
+        "ROCPROF_OUTPUT_FILE_NAME": "trace_rank%q{RANK}%",
+        "LD_PRELOAD": "/opt/rocm/lib/librocprofiler-sdk-tool.so",
+    }
+
+
+def test_harvest_tool_env_raises_when_nothing_injected(tmp_path):
+    """A rocprofv3 that configures by a channel other than env is surfaced, not hidden."""
+    from alignment.profiler.rocprof_capture import run_capture_per_rank_tool_env
+
+    base_env = {"PATH": "/usr/bin"}
+
+    def fake_probe_runner(argv, env=None, check=True):
+        return subprocess.CompletedProcess(argv, 0, stdout=_env_dump_stdout(base_env))
+
+    with pytest.raises(RuntimeError, match="harvested no rocprofiler-sdk environment"):
+        run_capture_per_rank_tool_env(
+            _fake_exe(tmp_path),
+            RocprofConfig(tp_size=2),
+            ["python", "-m", "vllm", "serve", "model"],
+            tmp_path / "out",
+            "trace",
+            env=base_env,
+            probe_runner=fake_probe_runner,
+            runner=lambda *a, **k: subprocess.CompletedProcess([], 0),
+        )
+
+
+def test_tool_env_runs_server_without_rocprofv3_prefix(tmp_path):
+    """tool-env launches the server DIRECTLY with the injected tool env, no wrap."""
+    from alignment.profiler.rocprof_capture import run_capture_per_rank_tool_env
+
+    out_dir = tmp_path / "out"
+    base_env = {"PATH": "/usr/bin", ROCTX_SCOPES_ENV: "1"}
+    tool_env = {"ROCP_TOOL_LIBRARIES": "librocprofiler-sdk-tool.so", "ROCPROF_KERNEL_TRACE": "1"}
+
+    def fake_probe_runner(argv, env=None, check=True):
+        return subprocess.CompletedProcess(argv, 0, stdout=_env_dump_stdout({**base_env, **tool_env}))
+
+    seen = {}
+
+    def fake_runner(argv, env=None, check=True):
+        seen["argv"] = argv
+        seen["env"] = env
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for rank in (0, 1):
+            _complete_fixture(out_dir / f"trace_rank{rank}_results.db")
+        return subprocess.CompletedProcess(argv, 0)
+
+    found = run_capture_per_rank_tool_env(
+        _fake_exe(tmp_path),
+        RocprofConfig(tp_size=2),
+        ["python", "-m", "vllm", "serve", "model"],
+        out_dir,
+        "trace",
+        env=base_env,
+        probe_runner=fake_probe_runner,
+        runner=fake_runner,
+    )
+    # The server ran directly — the argv is the server command, with NO rocprofv3
+    # prefix and NO literal '--' separator.
+    assert seen["argv"] == ["python", "-m", "vllm", "serve", "model"]
+    assert "rocprofv3" not in seen["argv"][0]
+    # The injected rocprofiler-sdk env rode onto the server env, atop the roctx flag.
+    assert seen["env"]["ROCP_TOOL_LIBRARIES"] == "librocprofiler-sdk-tool.so"
+    assert seen["env"]["ROCPROF_KERNEL_TRACE"] == "1"
+    assert seen["env"][ROCTX_SCOPES_ENV] == "1"
+    assert [p.name for p in found] == ["trace_rank0_results.db", "trace_rank1_results.db"]
+
+
+def test_cli_attach_mode_tool_env_end_to_end(tmp_path):
+    """`--attach-mode tool-env --tp-size 2` drives harvest -> direct launch -> parse."""
+    out_dir = tmp_path / "cap"
+    parsed_out = tmp_path / "parsed.json"
+
+    def fake_probe_runner(argv, env=None, check=True):
+        dump = _env_dump_stdout({**(env or {}), "ROCPROF_KERNEL_TRACE": "1"})
+        return subprocess.CompletedProcess(argv, 0, stdout=dump)
+
+    def fake_runner(argv, env=None, check=True):
+        # No rocprofv3 wrap: argv is the raw server command.
+        assert argv[0] == "python"
+        base = "trace"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for rank in (0, 1):
+            _complete_fixture(out_dir / f"{base}_rank{rank}_results.db")
+        return subprocess.CompletedProcess(argv, 0)
+
+    rc = rocprof_capture.main(
+        [
+            "--output-dir",
+            str(out_dir),
+            "--output-name",
+            "trace",
+            "--tp-size",
+            "2",
+            "--attach-mode",
+            "tool-env",
+            "--parsed-output",
+            str(parsed_out),
+            "--",
+            "python",
+            "-m",
+            "vllm.entrypoints.cli.main",
+            "serve",
+            "model",
+        ],
+        resolver=lambda _p: _fake_exe(out_dir),
+        runner=fake_runner,
+        probe_runner=fake_probe_runner,
+    )
+    assert rc == 0
+    for rank in (0, 1):
+        assert (tmp_path / f"parsed.rank{rank}.json").exists()
+
+
+def test_attach_mode_defaults_to_wrap():
+    """The default attach mode keeps the original single-rocprofv3 wrap behavior."""
+    args = rocprof_capture.build_parser().parse_args(
+        ["--output-dir", "d", "--output-name", "n", "--tp-size", "2"]
+    )
+    assert args.attach_mode == rocprof_capture.ATTACH_MODE_WRAP

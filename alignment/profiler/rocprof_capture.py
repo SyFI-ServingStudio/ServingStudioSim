@@ -131,6 +131,49 @@ def write_roctx_sitecustomize_dir(parent: Path | None = None) -> Path:
 #: templated ``-o`` (``<name>_rank<N>_results.db`` / ``<name>_rank<N>.db``).
 _RANK_FROM_FILENAME_RE = re.compile(r"_rank(\d+)(?:_results)?\.db$")
 
+#: How a TP>1 per-rank capture attaches the profiler to the worker processes.
+#:
+#: ``ATTACH_MODE_WRAP`` is the original mechanism: one ``rocprofv3`` CLI wraps the
+#: whole launcher process tree, and the inherited rocprofiler-sdk tool traces every
+#: process, each writing its own ``%q{RANK}%`` rocpd on a clean exit. This is sound
+#: ONLY when no process that receives vLLM's teardown SIGTERM owns worker children.
+#: On vLLM V1 with a separate ``EngineCore`` process (``VLLM_ENABLE_V1_MULTIPROCESSING=1``)
+#: it DEADLOCKS: at shutdown vLLM SIGTERMs ``EngineCore``; rocprofv3's
+#: ``error_signal_handler`` catches signal 15 inside ``EngineCore`` and blocks
+#: ("will wait for N children to exit") because its TP workers have not been told to
+#: stop; vLLM force-kills ``EngineCore`` after its grace window, before any worker
+#: finalizes, so ZERO per-rank databases land. (Confirmed on rocprofv3 1.3.2 / ROCm
+#: 7.2.3.) The wrap mode therefore requires the engine in-process
+#: (``VLLM_ENABLE_V1_MULTIPROCESSING=0``), which :func:`build_capture_server_env`
+#: already defaults, so the only process holding worker children (the launcher) is
+#: the rocprofv3 root itself and tears the executor down without a cross-process
+#: SIGTERM.
+#:
+#: ``ATTACH_MODE_TOOL_ENV`` removes the wrapping CLI entirely. The rocprofiler-sdk
+#: tool environment that ``rocprofv3`` would export (the ``ROCP_TOOL_LIBRARIES`` /
+#: ``ROCPROF_*`` / ``LD_PRELOAD`` knobs that make the ROCm runtime load
+#: ``librocprofiler-sdk-tool.so`` in-process) is harvested once and injected into the
+#: launched server's environment instead. The ROCm runtime then loads the tool only
+#: in the processes that initialize it — the GPU worker processes — and NOT in the
+#: pure-Python ``EngineCore`` or driver, so the teardown SIGTERM reaches only
+#: handler-free processes, vLLM's orderly shutdown runs, and each worker finalizes
+#: its own per-rank rocpd on its own clean exit. This is robust to a separate
+#: ``EngineCore`` process, so it is the mechanism for a true multiprocessing TP>1
+#: capture.
+ATTACH_MODE_WRAP = "wrap"
+ATTACH_MODE_TOOL_ENV = "tool-env"
+ATTACH_MODES = (ATTACH_MODE_WRAP, ATTACH_MODE_TOOL_ENV)
+
+#: The environment keys that carry rocprofiler-sdk tool configuration. Only these
+#: are lifted out of a harvest of what ``rocprofv3`` injects, so unrelated process
+#: env (``PWD``, ``SHLVL``, ``_`` …) never leaks into the launched server. Matched by
+#: prefix because the ``ROCPROF_*`` trace/output surface is open-ended and a version
+#: bump may add or rename a knob — harvesting rather than hardcoding keeps a renamed
+#: knob from being silently dropped. Covers the tool-library selector
+#: (``ROCP_TOOL_LIBRARIES``; legacy ``HSA_TOOLS_LIB``), the loader preload
+#: (``LD_PRELOAD``), and the ``ROCPROF*``/``ROCPROFILER*`` trace+output knobs.
+_TOOL_ENV_KEY_RE = re.compile(r"^(ROCP_|ROCPROF|HSA_TOOLS_LIB|LD_PRELOAD|ROCPROFILER)")
+
 Runner = Callable[[list[str]], subprocess.CompletedProcess]
 
 
@@ -369,6 +412,114 @@ def run_capture_per_rank(
     return locate_rocpd_per_rank(output_dir, output_name)
 
 
+#: A runner that CAPTURES stdout, used to harvest the env ``rocprofv3`` injects.
+#: Separate from :data:`Runner` (which streams), and injectable so the harvest is
+#: unit-testable without the real binary.
+ProbeRunner = Callable[..., subprocess.CompletedProcess]
+
+
+def _default_probe_runner(argv: list[str], *, env: dict[str, str] | None, check: bool) -> subprocess.CompletedProcess:
+    return subprocess.run(argv, env=env, check=check, capture_output=True, text=True)
+
+
+def harvest_tool_env(
+    executable: ResolvedRocprofExecutable,
+    config: RocprofConfig,
+    output_dir: Path,
+    output_name: str,
+    *,
+    base_env: dict[str, str],
+    probe_runner: ProbeRunner = _default_probe_runner,
+    probe_argv: tuple[str, ...] = ("env",),
+) -> dict[str, str]:
+    """Return the rocprofiler-sdk tool env ``rocprofv3`` injects, by probing it.
+
+    Runs ``rocprofv3 <flags> -d <dir> -o <output_name> -- env`` (the probe prints
+    its own environment and exits immediately, so rocprofv3 finalizes a throwaway,
+    kernel-less database) and diffs the probe's environment against ``base_env``.
+    The keys that are new or changed AND match :data:`_TOOL_ENV_KEY_RE` are exactly
+    the rocprofiler-sdk knobs — tool-library selector, loader preload, and
+    ``ROCPROF_*`` trace/output configuration — that make the ROCm runtime load the
+    tool in-process. ``output_name`` is passed through verbatim (templated with the
+    per-rank ``%q{RANK}%`` key by the caller) so the harvested output configuration
+    already carries the per-rank template each worker resolves for itself.
+
+    Harvesting rather than hardcoding the key names keeps a rocprofv3 version bump
+    that renames or adds a knob from silently dropping configuration.
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    argv = build_capture_argv(executable, config, list(probe_argv), output_dir, output_name)
+    completed = probe_runner(argv, env=base_env, check=True)
+    text = getattr(completed, "stdout", "") or ""
+    if isinstance(text, bytes):
+        text = text.decode("utf-8", "replace")
+    injected: dict[str, str] = {}
+    for line in text.splitlines():
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        if not _TOOL_ENV_KEY_RE.match(key):
+            continue
+        if base_env.get(key) != value:
+            injected[key] = value
+    return injected
+
+
+def run_capture_per_rank_tool_env(
+    executable: ResolvedRocprofExecutable,
+    config: RocprofConfig,
+    server_argv: list[str],
+    output_dir: Path,
+    output_name: str,
+    *,
+    rank_env: str = OUTPUT_RANK_ENV_DEFAULT,
+    env: dict[str, str] | None = None,
+    runner: Runner = subprocess.run,
+    probe_runner: ProbeRunner = _default_probe_runner,
+) -> list[Path]:
+    """Run a TP>1 server with the rocprofiler-sdk tool injected per-process by env.
+
+    The :data:`ATTACH_MODE_TOOL_ENV` path: harvest the tool env rocprofv3 would
+    export (:func:`harvest_tool_env`) for the per-rank templated output name, merge
+    it into the server environment, and launch the server DIRECTLY — no wrapping
+    rocprofv3 process. The ROCm runtime loads ``librocprofiler-sdk-tool.so``
+    in-process only where it initializes (the GPU workers), each worker resolves the
+    ``%q{RANK}%`` template and finalizes its own rocpd on a clean exit, and the
+    teardown SIGTERM never reaches a profiler signal handler that owns worker
+    children — so a separate ``EngineCore`` process no longer deadlocks the capture.
+
+    ``runner`` runs the server (its argv is the server command, NOT a rocprofv3
+    command); ``probe_runner`` runs the one-shot env harvest. Both are injectable so
+    the whole path is unit-testable on-host without rocprofv3 or GPUs.
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    base_env = dict(os.environ if env is None else env)
+    templated_name = per_rank_output_name(output_name, rank_env)
+    injected = harvest_tool_env(
+        executable,
+        config,
+        output_dir,
+        templated_name,
+        base_env=base_env,
+        probe_runner=probe_runner,
+    )
+    if not injected:
+        raise RuntimeError(
+            "tool-env attach harvested no rocprofiler-sdk environment from rocprofv3 "
+            f"(looked for keys matching {_TOOL_ENV_KEY_RE.pattern!r}); this rocprofv3 "
+            "build does not configure in-process tracing by environment, so the "
+            "wrapping attach mode must be used instead"
+        )
+    server_env = dict(base_env)
+    server_env.update(injected)
+    completed = runner(list(server_argv), env=server_env, check=True)  # type: ignore[call-arg]
+    if getattr(completed, "returncode", 0) not in (0, None):
+        raise RuntimeError(f"server exited with code {completed.returncode}")
+    return locate_rocpd_per_rank(output_dir, output_name)
+
+
 def validate_rocpd(db_path: Path) -> dict:
     """Sanity-check a fresh rocpd against the iteration-marker + dispatch contract.
 
@@ -476,6 +627,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="env var each worker carries its rank in, for the per-rank -o template",
     )
     parser.add_argument(
+        "--attach-mode",
+        choices=ATTACH_MODES,
+        default=ATTACH_MODE_WRAP,
+        help=(
+            "how a TP>1 capture attaches the profiler: 'wrap' runs one rocprofv3 "
+            "around the launcher (needs the engine in-process); 'tool-env' injects "
+            "the rocprofiler-sdk tool env per-process so a separate EngineCore does "
+            "not deadlock teardown (the robust multiprocessing-TP mechanism)"
+        ),
+    )
+    parser.add_argument(
         "--rocprof-arg",
         dest="rocprof_args",
         action="append",
@@ -525,12 +687,14 @@ def main(
     *,
     resolver: Callable[[str | None], ResolvedRocprofExecutable] = resolve_rocprof_executable,
     runner: Runner = subprocess.run,
+    probe_runner: ProbeRunner = _default_probe_runner,
 ) -> int:
     """`alignment rocpd-capture` entry point.
 
-    ``resolver`` / ``runner`` are injectable so the capture assembly, rocpd
-    validation, and parse chain can be exercised on-host with the rocprofv3 binary
-    and GPU subprocess stood in for; production uses the real defaults.
+    ``resolver`` / ``runner`` / ``probe_runner`` are injectable so the capture
+    assembly, the tool-env harvest, rocpd validation, and the parse chain can be
+    exercised on-host with the rocprofv3 binary and GPU subprocess stood in for;
+    production uses the real defaults.
     """
     import sys
 
@@ -551,16 +715,29 @@ def main(
     capture_env = build_capture_server_env()
 
     if config.tp_size > 1:
-        db_paths = run_capture_per_rank(
-            executable,
-            config,
-            server_argv,
-            args.output_dir,
-            args.output_name,
-            rank_env=args.rank_env,
-            env=capture_env,
-            runner=runner,
-        )
+        if args.attach_mode == ATTACH_MODE_TOOL_ENV:
+            db_paths = run_capture_per_rank_tool_env(
+                executable,
+                config,
+                server_argv,
+                args.output_dir,
+                args.output_name,
+                rank_env=args.rank_env,
+                env=capture_env,
+                runner=runner,
+                probe_runner=probe_runner,
+            )
+        else:
+            db_paths = run_capture_per_rank(
+                executable,
+                config,
+                server_argv,
+                args.output_dir,
+                args.output_name,
+                rank_env=args.rank_env,
+                env=capture_env,
+                runner=runner,
+            )
         overall = 0
         for db_path in db_paths:
             rank = rank_from_rocpd_path(db_path)
