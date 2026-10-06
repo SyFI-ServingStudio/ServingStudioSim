@@ -545,10 +545,14 @@ fn excess_axis(config: &CompressedSparseMlaRopeCastKernelConfig) -> Vec<f64> {
     }
     // The top planes are one and two max-length requests at the largest
     // token count; the second covers chunks that pad to two long requests.
+    // Below them the planes step by 4x; those at or past the top plane drop,
+    // so a short `max_model_len` (the 131072 capture) keeps its own grid and
+    // a long one (1048576) measures the 256K-row middle instead of
+    // interpolating 64K rows straight to 1M.
     let longest = f64::from(config.max_model_len / config.compress_ratio);
     let floor = area_floor(config.max_num_batched_tokens, config.compress_ratio);
     let (one, two) = (longest - floor, 2.0 * longest - floor);
-    let mut axis = Axis::values([0, 1024, 4096, 16384, 65536])
+    let mut axis = Axis::values([0, 1024, 4096, 16384, 65536, 262144])
         .into_iter()
         .filter(|&rows| rows < one)
         .collect::<Vec<_>>();
@@ -659,6 +663,15 @@ mod tests {
         ratio: u32,
         heads: u32,
     ) -> CompressedSparseMlaRopeCastKernelConfig {
+        config_at(mode, ratio, heads, 131072)
+    }
+
+    fn config_at(
+        mode: &str,
+        ratio: u32,
+        heads: u32,
+        max_model_len: u32,
+    ) -> CompressedSparseMlaRopeCastKernelConfig {
         serde_json::from_value(serde_json::json!({
             "backends": ["flashmla_mega"],
             "gpu_name": "NVIDIA B200",
@@ -669,7 +682,7 @@ mod tests {
             "num_heads": heads,
             "head_dim": 512,
             "rope_dim": 64,
-            "max_model_len": 131072,
+            "max_model_len": max_model_len,
             "max_num_batched_tokens": 2048,
             "prefill_chunk_size": 4,
             "q_dtype": "bf16",
@@ -758,19 +771,51 @@ mod tests {
     /// and a grid past the 500 feasible-coordinate ceiling.
     #[test]
     fn canonical_batches_project_onto_their_grid_points() {
-        for (mode, heads) in [("decode", 64), ("decode", 128), ("prefill", 64)] {
+        let shapes = [("decode", 64), ("decode", 128), ("prefill", 64)];
+        for ((mode, heads), max_model_len) in shapes
+            .into_iter()
+            .flat_map(|shape| [(shape, 131072), (shape, 1_048_576)])
+        {
             for ratio in 0..=2 {
-                let config = config_with_heads(mode, ratio, heads);
+                let config = config_at(mode, ratio, heads, max_model_len);
                 let grid = CompressedSparseMlaRopeCastSpec::sweep_grid(&config);
                 let mask = CompressedSparseMlaRopeCastSpec::infeasible_mask(&config, &grid);
                 let feasible = mask.iter().filter(|&&drop| !drop).count();
                 assert!(
                     feasible > 0 && feasible <= 500,
-                    "{mode} r{ratio}: {feasible}"
+                    "{mode} r{ratio} @{max_model_len}: {feasible}"
                 );
-                eprintln!("{mode} r{ratio}: {} cells, {feasible} feasible", mask.len());
+                eprintln!(
+                    "{mode} r{ratio} @{max_model_len}: {} cells, {feasible} feasible",
+                    mask.len()
+                );
             }
         }
+    }
+
+    /// The gather-area planes: the 131072 capture keeps its 4x ladder below
+    /// one and two longest requests; at 1048576 the ladder reaches 256K rows.
+    #[test]
+    fn excess_planes_ladder_up_to_the_longest_requests() {
+        let planes =
+            |ratio, max_model_len| excess_axis(&config_at("prefill", ratio, 64, max_model_len));
+        assert_eq!(
+            planes(1, 131072),
+            [0.0, 1024.0, 4096.0, 16384.0, 65536.0, 128512.0, 259584.0]
+        );
+        assert_eq!(
+            planes(2, 131072),
+            [0.0, 1024.0, 4096.0, 16384.0, 64000.0, 129536.0]
+        );
+        assert_eq!(
+            planes(1, 1_048_576),
+            [0.0, 1024.0, 4096.0, 16384.0, 65536.0, 262144.0, 1046016.0, 2094592.0]
+        );
+        assert_eq!(
+            planes(2, 1_048_576),
+            [0.0, 1024.0, 4096.0, 16384.0, 65536.0, 262144.0, 522752.0, 1047040.0]
+        );
+        assert_eq!(excess_axis(&config_at("decode", 2, 64, 1_048_576)), [0.0]);
     }
 
     /// Catches a ratio-0 layer configured with a compressed cache.

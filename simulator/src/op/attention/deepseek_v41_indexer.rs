@@ -30,6 +30,11 @@
 //! compressed keys reads `4c` bytes and writes its 512 int32 indices, so the
 //! placeholder token count is `ceil(sum(4c + 2048) / 4096)`. The elementwise
 //! kind cannot see a context length, so the tile is the unit that carries it.
+//!
+//! A long prefill context sizes the prefill placeholders past the elementwise
+//! sweep (65536 tokens: a 2048-token chunk at a 128K-key context already
+//! streams 134K tiles). Past it they hold the edge's bandwidth, see
+//! [`held_at_grid_edge`].
 
 use std::sync::Arc;
 
@@ -41,8 +46,8 @@ use crate::timing::kernels::{
     ElementwiseKernelInput,
 };
 use crate::timing::{
-    BuildError, CostNode, CostTreeBuilder, Dim, Evaluator, LeafMetrics, PerfApiBridge, Probe,
-    SlotInput,
+    BuildError, CostNode, CostTreeBuilder, CoverageFlags, Dim, Evaluator, LeafMetrics,
+    PerfApiBridge, Probe, SlotInput,
 };
 
 /// Bytes of one placeholder tile: 1024 fp32 logits.
@@ -317,9 +322,30 @@ fn push(kernel: &ElementwiseKernel, input: ElementwiseKernelInput, ev: &mut Eval
     let metrics = if input.num_tokens == 0 {
         LeafMetrics::ZERO
     } else {
-        kernel.eval(&input)
+        held_at_grid_edge(input.num_tokens, |num_tokens| {
+            kernel.eval(&ElementwiseKernelInput { num_tokens })
+        })
     };
     ev.push(metrics, || SlotInput::from(input));
+}
+
+/// The last token count of the `elementwise` sweep (`Axis::token_axis`).
+const ELEMENTWISE_GRID_EDGE: u32 = 65_536;
+
+/// A placeholder of `tokens` tiles or keys. Past the elementwise grid the
+/// kind's cache extends its last segment, whose slope is the profiler's
+/// L2-resident marginal cost: a 526336-key gather came out at 7.7 us, 18 TB/s,
+/// past B200's HBM. These placeholders only stream bytes, so they hold the
+/// edge's bandwidth instead, as `compressed_sparse_mla_*` do past their grids:
+/// the edge's metrics scaled by `tokens / edge`, flagged extrapolated.
+fn held_at_grid_edge(tokens: u32, eval: impl Fn(u32) -> LeafMetrics) -> LeafMetrics {
+    if tokens <= ELEMENTWISE_GRID_EDGE {
+        return eval(tokens);
+    }
+    let mut metrics = eval(ELEMENTWISE_GRID_EDGE);
+    metrics.scale(tokens as f32 / ELEMENTWISE_GRID_EDGE as f32);
+    metrics.coverage |= CoverageFlags::EXTRAPOLATED;
+    metrics
 }
 
 /// Per-call shapes of the six leaves.
@@ -448,7 +474,37 @@ mod tests {
             (r1.decode_logits.max_model_len.get(), r1.decode_logits.block_size),
             (131_072, 128)
         );
-        assert_eq!(r1.candidates.unwrap().output_bytes_per_token.get(), LOGIT_TILE_BYTES);
+        assert_eq!(
+            r1.candidates.unwrap().output_bytes_per_token.get(),
+            LOGIT_TILE_BYTES
+        );
+    }
+
+    #[test]
+    fn placeholders_past_the_elementwise_grid_hold_the_edge_bandwidth() {
+        use crate::timing::sweep::Axis;
+        use crate::timing::Metrics4;
+        assert_eq!(
+            Axis::token_axis().last().copied(),
+            Some(f64::from(ELEMENTWISE_GRID_EDGE))
+        );
+        // A stand-in cache: 1 us per 1000 tokens plus a 2 us floor.
+        let eval = |tokens: u32| LeafMetrics {
+            m: Metrics4 {
+                time_ms: 0.002 + tokens as f32 * 1e-6,
+                flops: 0.0,
+                bytes: tokens as f32,
+                energy_j: 0.0,
+            },
+            ..LeafMetrics::ZERO
+        };
+        let inside = held_at_grid_edge(4096, eval);
+        assert_eq!(inside.m.bytes, 4096.0);
+        assert!(inside.coverage.is_empty());
+        let past = held_at_grid_edge(4 * ELEMENTWISE_GRID_EDGE, eval);
+        assert_eq!(past.m.bytes, 4.0 * 65_536.0);
+        assert!((past.m.time_ms - 4.0 * eval(ELEMENTWISE_GRID_EDGE).m.time_ms).abs() < 1e-6);
+        assert!(past.coverage.contains(CoverageFlags::EXTRAPOLATED));
     }
 
     #[test]
