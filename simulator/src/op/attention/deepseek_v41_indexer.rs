@@ -343,11 +343,13 @@ fn push(kernel: &ElementwiseKernel, input: ElementwiseKernelInput, ev: &mut Eval
 const ELEMENTWISE_GRID_EDGE: u32 = 65_536;
 
 /// A placeholder of `tokens` tiles or keys. Past the elementwise grid the
-/// kind's cache extends its last segment, whose slope is the profiler's
-/// L2-resident marginal cost: a 526336-key gather came out at 7.7 us, 18 TB/s,
-/// past B200's HBM. These placeholders only stream bytes, so they hold the
-/// edge's bandwidth instead, as `compressed_sparse_mla_*` do past their grids:
-/// the edge's metrics scaled by `tokens / edge`, flagged extrapolated.
+/// kind's cache extends its last segment, and at these few-microsecond sizes
+/// that slope is launch-bound noise: the 132 B/key gather rows rise only
+/// 2.50 -> 2.85 us from 32768 to 65536 keys (a 25 TB/s marginal rate), so a
+/// 526336-key gather came out at 7.7 us, 18 TB/s, past B200's HBM. These
+/// placeholders only stream bytes, so they hold the edge's bandwidth instead
+/// (6.1 TB/s for that gather), as `compressed_sparse_mla_*` do past their
+/// grids: the edge's metrics scaled by `tokens / edge`, flagged extrapolated.
 fn held_at_grid_edge(tokens: u32, eval: impl Fn(u32) -> LeafMetrics) -> LeafMetrics {
     if tokens <= ELEMENTWISE_GRID_EDGE {
         return eval(tokens);
