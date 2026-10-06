@@ -28,12 +28,12 @@ use crate::timing::{BuildError, CostNode, CostTreeBuilder, Dim, Evaluator, PerfA
 use super::glm53_common::{
     atomic, push_or_zero, Glm53ActivationQuant, Glm53ActivationQuantConfig, Glm53WeightPrecision,
 };
+use super::glm53_mlp_local::NVFP4_GROUP_SIZE;
 
 /// TRT-LLM's FP8 block MoE reads fp32 scales in row-major order.
 pub const ROW_MAJOR_SCALE_FORMAT: &str = "ue8m0_row_major";
 /// TRT-LLM's NVFP4 MoE reads E4M3 group scales unswizzled, row-major.
 pub const NVFP4_LINEAR_SCALE_FORMAT: &str = "linear_e4m3";
-const NVFP4_GROUP_SIZE: u32 = 16;
 const QUANT_GROUP_SIZE: u32 = 128;
 
 #[derive(Clone, Debug)]

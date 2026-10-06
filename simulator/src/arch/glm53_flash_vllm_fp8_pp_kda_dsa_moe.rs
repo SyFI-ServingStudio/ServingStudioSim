@@ -1,4 +1,7 @@
-//! GLM-5.3-Flash FP8 under pure pipeline parallelism, aligned to vLLM on B200.
+//! GLM-5.3-Flash (FP8 block or NVFP4, [`Glm53FlashQuant`]) under pure pipeline
+//! parallelism, aligned to vLLM on B200.
+//!
+//! [`Glm53FlashQuant`]: crate::arch::glm53_flash_vllm_fp8_kda_dsa_moe::Glm53FlashQuant
 //!
 //! Each pipeline stage is one GPU running a contiguous range of the 45 decoder
 //! layers at TP1 / EP1: all 64 KDA heads, all 64 MLA heads, and all 288 routed

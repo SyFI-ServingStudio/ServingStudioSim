@@ -33,7 +33,8 @@ pub const PACKED_SCALE_FORMAT: &str = "ue8m0_packed_int32";
 /// The 128x4-tile swizzled E4M3 scales an NVFP4 linear GEMM reads.
 pub const NVFP4_SWIZZLED_SCALE_FORMAT: &str = "swizzled_e4m3";
 const FP8_QUANT_GROUP_SIZE: u32 = 128;
-const NVFP4_GROUP_SIZE: u32 = 16;
+/// ModelOpt NVFP4's 16-element FP4 group.
+pub(crate) const NVFP4_GROUP_SIZE: u32 = 16;
 
 #[derive(Clone, Debug)]
 pub struct Glm53MlpLocalWorkletConfig {

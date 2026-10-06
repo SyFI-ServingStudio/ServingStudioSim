@@ -1753,22 +1753,25 @@ pub fn qwen3_fp8_ffn_moe(
         .context("building native FP8 Qwen3 AFD ffn-side model")
 }
 
-/// Build ONE iter-wise arch model from its selector, boxed as `dyn`. The
-/// model-only seam the offline `timing-predict` (iter arch) path uses (it evaluates
-/// [`IterwiseUnifiedModel`] directly, no worker/flow). The deployments do NOT box
-/// — they call the concrete `dense` / `dense_tp` / … builders above to keep their
-/// worker factories monomorphized (L4 §4.1). This single match is the only place
-/// the selector tag picks a builder.
 /// The checkpoint quantization a GLM-5.3-Flash arch tag is for.
 pub fn glm53_flash_quant(sel: &IterArchSel) -> Glm53FlashQuant {
     match sel {
         IterArchSel::Glm53FlashVllmNvfp4KdaDsaMoe { .. }
         | IterArchSel::Glm53FlashVllmNvfp4PpKdaDsaMoe { .. }
         | IterArchSel::Glm53FlashVllmNvfp4DpAttnEpMoe { .. } => Glm53FlashQuant::Nvfp4,
-        _ => Glm53FlashQuant::Fp8Block,
+        IterArchSel::Glm53FlashVllmFp8KdaDsaMoe { .. }
+        | IterArchSel::Glm53FlashVllmFp8PpKdaDsaMoe { .. }
+        | IterArchSel::Glm53FlashVllmFp8DpAttnEpMoe { .. } => Glm53FlashQuant::Fp8Block,
+        other => unreachable!("{other:?} is not a GLM-5.3-Flash arch tag"),
     }
 }
 
+/// Build ONE iter-wise arch model from its selector, boxed as `dyn`. The
+/// model-only seam the offline `timing-predict` (iter arch) path uses (it evaluates
+/// [`IterwiseUnifiedModel`] directly, no worker/flow). The deployments do NOT box
+/// — they call the concrete `dense` / `dense_tp` / … builders above to keep their
+/// worker factories monomorphized (L4 §4.1). This single match is the only place
+/// the selector tag picks a builder.
 pub fn build_iter_model(
     sel: &IterArchSel,
     gpu: &str,

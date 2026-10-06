@@ -31,6 +31,9 @@
 //! the slice is `2048 // tp` (`config.py:1350`): 512 at TP4, 256 at TP8, both
 //! multiples of the 128x128 weight block, so no block refinement applies
 //! (`oracle/fp8.py:295-298`).
+//! The NVFP4 checkpoint's MoE TP runs the monolithic
+//! `trtllm_fp4_block_scale_moe` on the same slice; 512 and 256 are multiples of
+//! its 16-element group.
 //!
 //! The 45 layers are hybrid: `linear_attn_config.kda_layers` are Kimi Delta
 //! Attention, the rest (every 4th, 3..43) DeepSeek sparse attention with the
@@ -134,16 +137,14 @@ const SPARSE_ATTN_BACKENDS: &[&str] = &["flashinfer_trtllm_fp8"];
 const MLA_APPEND_BACKENDS: &[&str] = &["vllm_cuda"];
 const INDEX_REMAP_BACKENDS: &[&str] = &["vllm_triton"];
 const FUSED_MOE_BACKENDS: &[&str] = &["flashinfer_trtllm_fp8_block_sm100"];
-/// vLLM's FP8 block MoE passes `RoutingMethodType.DeepSeekV3` for this
-/// sigmoid + bias, single-group router.
-const FP8_ROUTING_METHOD: &str = "deepseek_v3";
+/// vLLM passes `RoutingMethodType.DeepSeekV3` for this sigmoid + bias,
+/// single-group router on both the FP8 block and the NVFP4 MoE path
+/// (`router/grouped_topk_router.py:275-284`).
+const ROUTING_METHOD: &str = "deepseek_v3";
 const NVFP4_QUANT_BACKENDS: &[&str] = &["vllm_cuda"];
 /// vLLM's default NVFP4 linear on SM100 (`FlashInferCuteDslNvFp4LinearKernel`).
 const NVFP4_GEMM_BACKENDS: &[&str] = &["flashinfer_cutedsl"];
 const NVFP4_FUSED_MOE_BACKENDS: &[&str] = &["flashinfer_trtllm_sm100"];
-/// The same router keeps `RoutingMethodType.DeepSeekV3` on the NVFP4 path
-/// (`router/grouped_topk_router.py:275-284`).
-const NVFP4_ROUTING_METHOD: &str = "deepseek_v3";
 const ALL_REDUCE_BACKENDS: &[&str] = &["flashinfer_mnnvl"];
 /// TP8 stand-in for MNNVL below the 128-token cap. The MNNVL workspace fails
 /// on the profiling host since 2026-10-03 (`cuMulticastAddDevice` returns
@@ -201,7 +202,7 @@ pub enum Glm53FlashQuant {
 impl Glm53FlashQuant {
     /// The modeled schemes only. A config that converts a different module set
     /// (attention, routers or the shared expert) is refused, not approximated.
-    fn from_config(cfg: &Value) -> Result<Self> {
+    fn from_config(cfg: &Value, num_layers: u32, first_k_dense_replace: u32) -> Result<Self> {
         let quant = cfg
             .get("quantization_config")
             .context("GLM-5.3-Flash is modeled for a quantized checkpoint; config has no quantization_config")?;
@@ -215,35 +216,103 @@ impl Glm53FlashQuant {
                 Ok(Self::Fp8Block)
             }
             Some("modelopt") => {
-                ensure!(
-                    quant.get("quant_algo").and_then(Value::as_str) == Some("NVFP4"),
-                    "GLM-5.3-Flash ModelOpt is modeled for quant_algo NVFP4"
-                );
-                let ignored: Vec<&str> = quant
-                    .get("ignore")
-                    .and_then(Value::as_array)
-                    .context("ModelOpt NVFP4 config needs an `ignore` list")?
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .collect();
-                for module in ["self_attn*", "mlp.gate", "mlp.shared_experts*"] {
-                    ensure!(
-                        ignored
-                            .iter()
-                            .any(|entry| entry.ends_with(&format!(".{module}"))),
-                        "GLM-5.3-Flash NVFP4 is modeled with {module} left BF16"
-                    );
-                }
-                ensure!(
-                    !ignored
-                        .iter()
-                        .any(|entry| entry.contains(".mlp.experts") || entry.ends_with(".mlp*")),
-                    "GLM-5.3-Flash NVFP4 is modeled with NVFP4 routed experts and dense FFN"
-                );
+                Self::check_nvfp4(quant, num_layers, first_k_dense_replace)?;
                 Ok(Self::Nvfp4)
             }
             other => anyhow::bail!("GLM-5.3-Flash quant_method {other:?} is not modeled"),
         }
+    }
+
+    /// ModelOpt NVFP4 as `nvidia/GLM-5.3-Flash-NVFP4` ships it: 16-element
+    /// FP4 groups for weights and activations, FP8 KV, and an `ignore` list
+    /// that leaves exactly every layer's attention and every MoE layer's
+    /// router and shared expert BF16. Every other entry must name a module
+    /// outside the decoder body (`lm_head`, embeddings, vision tower, layers at
+    /// or past `num_hidden_layers`, i.e. MTP).
+    fn check_nvfp4(quant: &Value, num_layers: u32, first_k_dense_replace: u32) -> Result<()> {
+        ensure!(
+            quant.get("quant_algo").and_then(Value::as_str) == Some("NVFP4"),
+            "GLM-5.3-Flash ModelOpt is modeled for quant_algo NVFP4"
+        );
+        if let Some(groups) = quant.get("config_groups").and_then(Value::as_object) {
+            for (name, group) in groups {
+                for side in ["weights", "input_activations"] {
+                    let size = group.pointer(&format!("/{side}/group_size"));
+                    ensure!(
+                        size == Some(&serde_json::json!(16)),
+                        "GLM-5.3-Flash NVFP4 is modeled with 16-element groups; \
+                         config_groups.{name}.{side}.group_size is {size:?}"
+                    );
+                }
+            }
+        }
+        if let Some(kv) = quant.get("kv_cache_scheme").filter(|kv| !kv.is_null()) {
+            ensure!(
+                kv.get("num_bits") == Some(&serde_json::json!(8)),
+                "GLM-5.3-Flash NVFP4 is modeled with an 8-bit KV cache, got {kv}"
+            );
+        }
+        let entries = quant
+            .get("ignore")
+            .and_then(Value::as_array)
+            .context("ModelOpt NVFP4 config needs an `ignore` list")?;
+        // Per body layer: [self_attn*, mlp.gate, mlp.shared_experts*] seen.
+        let mut seen = vec![[false; 3]; num_layers as usize];
+        for entry in entries {
+            let entry = entry
+                .as_str()
+                .context("ModelOpt `ignore` entries must be strings")?;
+            let body = entry.split_once("layers.").and_then(|(prefix, rest)| {
+                let digits = rest
+                    .find(|c: char| !c.is_ascii_digit())
+                    .unwrap_or(rest.len());
+                let layer: u32 = rest[..digits].parse().ok()?;
+                Some((prefix, layer, &rest[digits..]))
+            });
+            match body {
+                Some((prefix, layer, "*"))
+                    if layer >= num_layers && (prefix.is_empty() || prefix.ends_with('.')) => {}
+                Some((_, layer, suffix)) if layer < num_layers => {
+                    let module = match suffix {
+                        ".self_attn*" => 0,
+                        ".mlp.gate" | ".mlp.shared_experts*" if layer >= first_k_dense_replace => {
+                            if suffix == ".mlp.gate" {
+                                1
+                            } else {
+                                2
+                            }
+                        }
+                        _ => anyhow::bail!(
+                            "GLM-5.3-Flash NVFP4 does not model `ignore` entry {entry:?}: \
+                             only attention, MoE routers and shared experts stay BF16"
+                        ),
+                    };
+                    seen[layer as usize][module] = true;
+                }
+                Some(_) => {
+                    anyhow::bail!("GLM-5.3-Flash NVFP4 does not model `ignore` entry {entry:?}")
+                }
+                None => ensure!(
+                    entry == "lm_head"
+                        || entry.ends_with("embed_tokens")
+                        || entry.ends_with("visual*"),
+                    "GLM-5.3-Flash NVFP4 does not model `ignore` entry {entry:?}"
+                ),
+            }
+        }
+        for (layer, [attn, gate, shared]) in seen.into_iter().enumerate() {
+            let moe = layer as u32 >= first_k_dense_replace;
+            ensure!(
+                attn,
+                "GLM-5.3-Flash NVFP4 is modeled with layer {layer} self_attn* left BF16"
+            );
+            ensure!(
+                !moe || (gate && shared),
+                "GLM-5.3-Flash NVFP4 is modeled with layer {layer} mlp.gate and \
+                 mlp.shared_experts* left BF16"
+            );
+        }
+        Ok(())
     }
 
     /// The arch-tag word for this scheme.
@@ -280,7 +349,7 @@ impl Glm53FlashModelCfg {
         let model_type = cfg.get("model_type").and_then(Value::as_str).unwrap_or("");
         ensure!(
             model_type == "glm5_next_text" || model_type == "glm5_next",
-            "{ARCH_KIND} requires a GLM-5.3-Flash (glm5_next) config, got model_type {model_type:?}"
+            "GLM-5.3-Flash arches require a glm5_next config, got model_type {model_type:?}"
         );
         let linear = cfg
             .get("linear_attn_config")
@@ -340,15 +409,19 @@ impl Glm53FlashModelCfg {
             vocab_size: u("vocab_size")?,
             // HF nests the text model under `text_config` and keeps
             // `quantization_config` at the top level.
-            quant: Glm53FlashQuant::from_config(if cfg.get("quantization_config").is_some() {
-                cfg
-            } else {
-                root
-            })?,
+            quant: Glm53FlashQuant::from_config(
+                if cfg.get("quantization_config").is_some() {
+                    cfg
+                } else {
+                    root
+                },
+                u("num_hidden_layers")?,
+                u("first_k_dense_replace")?,
+            )?,
         };
         ensure!(
             u("qk_rope_head_dim")? == 0,
-            "{ARCH_KIND} models the no-rope MLA latent; qk_rope_head_dim must be 0"
+            "GLM-5.3-Flash arches model the no-rope MLA latent; qk_rope_head_dim must be 0"
         );
         ensure!(
             model.n_shared_experts == 1,
@@ -560,13 +633,9 @@ pub fn build_configs(
             Glm53WeightPrecision::Nvfp4,
         ),
     };
-    let (routed_quant_backends, routed_moe_backends, routing_method) = match model.quant {
-        Glm53FlashQuant::Fp8Block => (FP8_QUANT_BACKENDS, FUSED_MOE_BACKENDS, FP8_ROUTING_METHOD),
-        Glm53FlashQuant::Nvfp4 => (
-            NVFP4_QUANT_BACKENDS,
-            NVFP4_FUSED_MOE_BACKENDS,
-            NVFP4_ROUTING_METHOD,
-        ),
+    let (routed_quant_backends, routed_moe_backends) = match model.quant {
+        Glm53FlashQuant::Fp8Block => (FP8_QUANT_BACKENDS, FUSED_MOE_BACKENDS),
+        Glm53FlashQuant::Nvfp4 => (NVFP4_QUANT_BACKENDS, NVFP4_FUSED_MOE_BACKENDS),
     };
     if model.index_topk + model.index_kpool - 1 > SELECTED_K {
         return Err(fit_failed(
@@ -593,7 +662,7 @@ pub fn build_configs(
         routed_scaling_numerator: model.routed_scaling.0,
         routed_scaling_denominator: model.routed_scaling.1,
         precision: routed_precision,
-        routing_method: routing_method.to_string(),
+        routing_method: ROUTING_METHOD.to_string(),
         activation_dtype: ACTIVATION_DTYPE,
         gpu_name: gpu.clone(),
         quant_backends: routed_quant_backends.to_vec(),
@@ -1866,6 +1935,54 @@ mod tests {
         );
     }
 
+    /// The shipped NVFP4 config with its `quantization_config` edited.
+    fn nvfp4_config_with(edit: impl FnOnce(&mut Value)) -> Result<Glm53FlashModelCfg> {
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("model/config/glm53_flash_nvfp4.json");
+        let mut root: Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        edit(root.get_mut("quantization_config").unwrap());
+        Glm53FlashModelCfg::from_value(&root)
+    }
+
+    fn ignore_list(quant: &mut Value) -> &mut Vec<Value> {
+        quant["ignore"].as_array_mut().unwrap()
+    }
+
+    #[test]
+    fn nvfp4_ignore_list_must_match_the_modeled_bf16_set() {
+        let error = |edit: fn(&mut Value)| nvfp4_config_with(edit).unwrap_err().to_string();
+        assert!(nvfp4_config_with(|_| {}).is_ok());
+        // One layer's attention converted to FP4 is not modeled.
+        let msg = error(|q| {
+            ignore_list(q).retain(|e| e != "model.language_model.layers.7.self_attn*");
+        });
+        assert!(msg.contains("layer 7 self_attn*"), "{msg}");
+        // Nor one MoE layer's shared expert.
+        let msg = error(|q| {
+            ignore_list(q).retain(|e| e != "model.language_model.layers.30.mlp.shared_experts*");
+        });
+        assert!(msg.contains("layer 30 mlp.gate"), "{msg}");
+        // A whole body layer left BF16, or a dense layer's FFN, is refused.
+        for entry in [
+            "model.language_model.layers.0*",
+            "model.language_model.layers.1.mlp*",
+            "model.language_model.layers.12.mlp.experts*",
+            "model.language_model.layers.1.mlp.gate",
+        ] {
+            let msg = nvfp4_config_with(|q| ignore_list(q).push(entry.into()))
+                .unwrap_err()
+                .to_string();
+            assert!(msg.contains(entry), "{entry}: {msg}");
+        }
+        // MTP layers past num_hidden_layers may be ignored whole.
+        assert!(nvfp4_config_with(|q| ignore_list(q).push("model.layers.46*".into())).is_ok());
+        let msg = error(|q| q["config_groups"]["group_0"]["weights"]["group_size"] = 32.into());
+        assert!(msg.contains("16-element groups"), "{msg}");
+        let msg = error(|q| q["kv_cache_scheme"]["num_bits"] = 16.into());
+        assert!(msg.contains("8-bit KV cache"), "{msg}");
+    }
+
     #[test]
     fn nvfp4_checkpoint_runs_fp4_dense_and_routed_and_a_bf16_shared_expert() {
         let model = nvfp4_model_cfg();
@@ -1911,9 +2028,12 @@ mod tests {
 
     #[test]
     fn leaves_appear_in_slot_order_so_labels_match_eval_pushes() {
-        let mut order = Vec::new();
-        leaf_order(&built().cost_tree().root, &mut order);
-        assert_eq!(order, (0..order.len()).collect::<Vec<_>>());
+        for model in [built(), built_for(&nvfp4_model_cfg(), parallel())] {
+            let mut order = Vec::new();
+            leaf_order(&model.cost_tree().root, &mut order);
+            assert_eq!(order, (0..order.len()).collect::<Vec<_>>());
+            assert_eq!(model.cost_log_manifest().slots.len(), model.n_slots);
+        }
     }
 
     #[test]

@@ -1,5 +1,5 @@
-//! GLM-5.3-Flash FP8 block checkpoint on B200 under vLLM data-parallel
-//! attention with expert-parallel MoE (`--data-parallel-size N
+//! GLM-5.3-Flash (FP8 block or NVFP4, [`Glm53FlashQuant`]) on B200 under vLLM
+//! data-parallel attention with expert-parallel MoE (`--data-parallel-size N
 //! --enable-expert-parallel`, TP 1). Paths below are in the vLLM fork.
 //!
 //! Every DP rank is its own `EngineCore` with its own scheduler and KV cache
