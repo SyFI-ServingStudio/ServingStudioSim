@@ -29,7 +29,7 @@ from typing import Any
 from profiling.db.args import DType
 from profiling.profilers.energy import Energy
 from profiling.profilers.timer import Timer
-from profiling.runners.exceptions import KernelLaunchFailed, ProfilerNotImplemented
+from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
 
 GROUP_SIZE = 16
@@ -41,26 +41,20 @@ _E4M3_MAX = 448.0
 
 @dataclass
 class Nvfp4LinearOperands:
-    """Inputs of the timed call, plus what an independent reference needs.
+    """Inputs of the timed call.
 
     ``x_fp4`` / ``x_blockscale`` are vLLM's ``scaled_fp4_quant`` output with the
     swizzled 128x4 scale layout; ``weight`` / ``weight_scale`` are the checkpoint
     tensors after ``FlashInferCuteDslNvFp4LinearKernel.process_weights_after_loading``
-    (swizzled scales, N/K padded to 32). The ``*_linear`` scales are the
-    row-major scales of the same quantization, for dequantization only.
+    (swizzled scales, N/K padded to 32).
     """
 
     x_fp4: Any
     x_blockscale: Any
-    x_global_scale: Any
     weight: Any
     weight_scale: Any
-    weight_global_scale: Any
     weights_padding_cols: int
     alpha: Any
-    weight_fp4_unpadded: Any
-    x_scale_linear: Any
-    weight_scale_linear: Any
 
 
 def prepare_operands(m: int, n: int, k: int, *, seed: int = 0) -> Nvfp4LinearOperands:
@@ -83,29 +77,23 @@ def prepare_operands(m: int, n: int, k: int, *, seed: int = 0) -> Nvfp4LinearOpe
     w_gs = global_scale(w)
 
     # Checkpoint-style weight: packed FP4 plus row-major E4M3 group scales.
-    w_fp4, w_scale_linear = scaled_fp4_quant(w, w_gs, is_sf_swizzled_layout=False)
+    w_fp4, w_scale = scaled_fp4_quant(w, w_gs, is_sf_swizzled_layout=False)
     # FlashInferCuteDslNvFp4LinearKernel.process_weights_after_loading.
-    weight_scale = swizzle_blockscale(w_scale_linear)
+    weight_scale = swizzle_blockscale(w_scale)
     weight, weights_padding_cols = pad_nvfp4_weight_for_cutlass(w_fp4)
 
     # apply_weights' activation quantization (the separate nvfp4_quant kind).
     x_fp4, x_blockscale = scaled_fp4_quant(
         x, x_gs, is_sf_swizzled_layout=True, backend="flashinfer-cutedsl"
     )
-    _, x_scale_linear = scaled_fp4_quant(x, x_gs, is_sf_swizzled_layout=False)
 
     return Nvfp4LinearOperands(
         x_fp4=x_fp4,
         x_blockscale=x_blockscale,
-        x_global_scale=x_gs,
         weight=weight,
         weight_scale=weight_scale,
-        weight_global_scale=w_gs,
         weights_padding_cols=int(weights_padding_cols),
         alpha=(1.0 / (x_gs * w_gs)).reshape(()).to(torch.float32),
-        weight_fp4_unpadded=w_fp4,
-        x_scale_linear=x_scale_linear,
-        weight_scale_linear=w_scale_linear,
     )
 
 
@@ -171,6 +159,8 @@ def profile_single_gemm(m: int, n: int, k: int, dtype: DType | str) -> ComputeMe
         # shape needs them, are part of the same logical linear and are summed.
         time_ms = Timer.cupti(apply)
         energy_j = Energy.perf(apply, warmup=5, per_iter_time_ms=time_ms)
+    except torch.OutOfMemoryError as exc:
+        raise OOMError("flashinfer_cutedsl NVFP4 GEMM ran out of CUDA memory") from exc
     except RuntimeError as exc:
         raise KernelLaunchFailed(str(exc)) from exc
 

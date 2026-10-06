@@ -13,8 +13,8 @@ from profiling.runners.moe.nvfp4_fused_moe import (
     _forced_routing,
     _logical_bytes,
     _validate_args,
-    routed_tune_max_num_tokens,
     tuning_label,
+    vllm_tune_max_num_tokens,
 )
 
 
@@ -76,10 +76,10 @@ def test_precomputed_routing_bills_selected_ids_and_weights_not_logits() -> None
 
 
 def test_routed_tuning_bound_covers_the_dp_gathered_batch() -> None:
-    assert routed_tune_max_num_tokens(1) == 8192
-    assert routed_tune_max_num_tokens(8192) == 8192
-    assert routed_tune_max_num_tokens(8193) == 16384
-    assert routed_tune_max_num_tokens(65536) == 65536
+    assert vllm_tune_max_num_tokens(1) == 8192
+    assert vllm_tune_max_num_tokens(8192) == 8192
+    assert vllm_tune_max_num_tokens(8193) == 16384
+    assert vllm_tune_max_num_tokens(65536) == 65536
 
 
 def test_logical_bytes_charge_weights_only_for_active_local_experts() -> None:

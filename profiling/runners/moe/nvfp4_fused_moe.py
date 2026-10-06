@@ -167,11 +167,13 @@ def _call_trtllm_fp4_moe(
     fn(**call_kwargs)
 
 
-def routed_tune_max_num_tokens(num_tokens: int) -> int:
-    """FlashInfer's tuning bound for vLLM's precomputed-routing call.
+def vllm_tune_max_num_tokens(num_tokens: int) -> int:
+    """FlashInfer's tuning bound for both of vLLM's TRT-LLM NVFP4 MoE calls.
 
-    vLLM passes min(max(max_num_batched_tokens * dp_size, 8192), chunk size).
-    The DP size is not a kernel argument, so use the smallest power of two that
+    vLLM passes ``fi_moe_largest_bucket``, max(max_num_batched_tokens * dp_size,
+    8192), to the monolithic call, and that capped at the chunk size to the
+    precomputed-routing call (``trtllm_nvfp4_moe.py``). Neither the batch budget
+    nor the DP size is a kernel argument, so use the smallest power of two that
     covers this call and is at least 8192; the bucket chosen for num_tokens is
     the same for any bound at or above it.
     """
@@ -207,10 +209,13 @@ def tuning_label(args: dict[str, Any], stack: str, precomputed_routing: bool) ->
     from those shapes, so EP4 and TP8 rows of one model would share a key and
     the second would replay the first one's tactic. vLLM never sees that: it
     tunes in-process, where the key also hashes the runner. One file per
-    configuration restores that separation.
+    configuration restores that separation. The routing method selects a
+    different routing kernel in the monolithic call, so it names the file too.
     """
 
-    label = f"nvfp4_fused_moe.{stack}" + (".routed" if precomputed_routing else "")
+    label = f"nvfp4_fused_moe.{stack}" + (
+        ".routed" if precomputed_routing else f".{args['routing_method']}"
+    )
     return (
         f"{label}.e{args['num_experts']}.l{args['num_local_experts']}"
         f".h{args['hidden_size']}.i{args['intermediate_size']}"
@@ -405,12 +410,15 @@ def _profile_nvfp4_fused_moe_sm100(
                 "enable_pdl": args["num_tokens"] <= SGLANG_PDL_MAX_TOKENS,
             }
             if stack == "sglang"
-            else {"enable_pdl": True}
+            else {
+                "enable_pdl": True,
+                "tune_max_num_tokens": vllm_tune_max_num_tokens(args["num_tokens"]),
+            }
         )
         if precomputed_routing:
             routing_kwargs = _precomputed_routing_kwargs(torch, ids, args)
             # vLLM's modular call leaves enable_pdl at FlashInfer's default.
-            stack_kwargs = {"tune_max_num_tokens": routed_tune_max_num_tokens(args["num_tokens"])}
+            stack_kwargs = {"tune_max_num_tokens": vllm_tune_max_num_tokens(args["num_tokens"])}
             fused_moe_fn = flashinfer.fused_moe.trtllm_fp4_block_scale_routed_moe
         else:
             routing_kwargs = {

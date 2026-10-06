@@ -132,9 +132,11 @@ DOC = KernelDoc(
         "The FP8 block-scale backend's autotuner stops at 8192 tokens, so larger "
         "shapes reuse the largest tuned bucket.",
         "Activation quantization is outside the call, and the router logits are synthetic.",
-        "The routed backend tunes up to max(8192, next power of two ≥ num_tokens); "
+        "The vLLM backends tune up to max(8192, next power of two ≥ num_tokens); "
         "vLLM tunes up to max_num_batched_tokens·dp_size, which picks the same "
         "bucket for every shape it serves.",
+        "No SwiGLU clamp is passed (gemm1_clamp_limit is None); vLLM passes the "
+        "model's swiglu_limit when it has one.",
         "GB/s counts logical traffic for the local rows and the experts that "
         "have rows; small side outputs are left out.",
     ),
