@@ -138,6 +138,12 @@ schema; no second hand-maintained config union belongs here.
     pipeline stage workers; `unified` rejects it. Each stage is its own
     `IterwiseUnifiedModel` (one GPU, its own layers' KV); the whole-pipeline
     model sums the stages for `timing-predict` and shares them by `Arc`.
+  - GLM-5.3-Flash vLLM FP8/NVFP4 pipeline stages
+    (`glm53_flash_vllm_{fp8,nvfp4}_pp_kda_dsa_moe`) → the same stage workers.
+    `layer_partition` overrides the `get_pp_indices` split (vLLM
+    `VLLM_PP_LAYER_PARTITION`). Each stage labels its layer groups with the
+    layers they hold, which `tools/pp-layer-balance/pp_layer_balance.py` reads
+    to pick a balanced split from a finished run.
 - PD:
   - Llama3 TP prefill → Llama3 TP decode
   - Llama3 TP prefill → Llama3 DP-attention/TP-FFN decode

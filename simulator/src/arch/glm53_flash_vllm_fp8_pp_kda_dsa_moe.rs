@@ -492,9 +492,21 @@ impl Glm53FlashVllmFp8PpStageModel {
             children.push(input.embedding.compile(builder));
             children.push(input.hc_expand.compile(builder));
         }
+        let (start, end) = self.layer_range;
         for (group, count) in &self.groups {
+            // The stage's own layers of this group, so a manifest says which
+            // layer each section folds (tools/pp-layer-balance reads them).
+            let layers: Vec<u32> = group
+                .layers()
+                .iter()
+                .copied()
+                .filter(|layer| (start..end).contains(layer))
+                .collect();
             children.push(CostNode::Labeled {
-                label: format!("{} x{count} (Scale {count})", group.label()),
+                label: format!(
+                    "{} x{count} (Scale {count}) layers {layers:?}",
+                    group.label()
+                ),
                 child: Box::new(CostNode::Scale {
                     n: *count,
                     child: Box::new(group.compile_layer(builder)),
@@ -929,6 +941,38 @@ mod tests {
                 assert!(!slot.name.contains("routed_rank1"), "{}", slot.name);
             }
         }
+    }
+
+    /// tools/pp-layer-balance maps layers to kinds from these labels.
+    #[test]
+    fn stage_group_labels_name_their_layers() {
+        let model = built(4);
+        let mut seen = Vec::new();
+        for stage in model.stages() {
+            let (start, end) = stage.layer_range();
+            let mut stage_layers = Vec::new();
+            for label in stage.cost_log_manifest().node_labels.iter().flatten() {
+                let Some((head, list)) = label.split_once(" layers [") else {
+                    continue;
+                };
+                if !head.contains("(Scale ") {
+                    continue;
+                }
+                let (_, scale) = head.rsplit_once(" (Scale ").unwrap();
+                let count: usize = scale.trim_end_matches(')').parse().unwrap();
+                let layers: Vec<u32> = list
+                    .trim_end_matches(']')
+                    .split(", ")
+                    .map(|layer| layer.parse().unwrap())
+                    .collect();
+                assert_eq!(layers.len(), count, "{label}");
+                stage_layers.extend(layers);
+            }
+            stage_layers.sort_unstable();
+            assert_eq!(stage_layers, (start..end).collect::<Vec<_>>());
+            seen.extend(stage_layers);
+        }
+        assert_eq!(seen, (0..45).collect::<Vec<_>>());
     }
 
     #[test]
