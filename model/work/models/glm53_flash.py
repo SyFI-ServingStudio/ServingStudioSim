@@ -19,12 +19,12 @@ Out of scope, by construction:
   decoding is off in the labelled deployment, so no stage runs it.
 
 Precision is per module from the config's exclusion list: the FP8 config's
-``modules_to_not_convert``, or the ModelOpt NVFP4 config's ``ignore`` (trailing ``*``
-wildcards; attention, routers and the shared expert stay BF16 there). Entries are
-layer-qualified, and one layer-relative path is BF16 on some layers and FP8 on
-others (``self_attn.o_proj`` stays BF16 on KDA layers; DSA's ``o_proj`` carries a
-``weight_scale_inv``). DSA-layer attention paths are therefore matched under a
-``dsa.`` module prefix.
+``modules_to_not_convert``, or the ModelOpt NVFP4 config's ``ignore`` /
+``exclude_modules`` (trailing ``*`` wildcards; attention, routers and the shared
+expert stay BF16 there). Entries are layer-qualified, and one layer-relative path
+is BF16 on some layers and FP8 on others (``self_attn.o_proj`` stays BF16 on KDA
+layers; DSA's ``o_proj`` carries a ``weight_scale_inv``). DSA-layer attention
+paths are therefore matched under a ``dsa.`` module prefix.
 """
 
 from __future__ import annotations
@@ -38,7 +38,7 @@ from ..core import LayerStack, MatmulGroup, Model, NormWeightGroup, dtype_bytes
 from ..ffn.dense import DenseSwiGLU
 from ..ffn.moe import MoE
 from ..mixers.mhc import ManifoldHyperConnections, MhcFinalPost
-from ..quantization import QuantScheme, parse_quantization_config
+from ..quantization import QuantScheme, modelopt_excluded, parse_quantization_config
 
 _KDA = "linear_attention"
 _DSA = "deepseek_sparse_attention"
@@ -76,11 +76,14 @@ def _schedule(config: dict) -> tuple[list[str], list[str]]:
 
 
 def _quant(config: dict, attention: list[str]) -> QuantScheme | None:
-    scheme = parse_quantization_config(config)
+    scheme = parse_quantization_config(config, layer_qualified_exclusions=True)
     if scheme is None:
         return None
     quant = config["quantization_config"]
-    excluded = quant.get("modules_to_not_convert", quant.get("ignore", ()))
+    if quant.get("quant_method") == "modelopt":
+        excluded = modelopt_excluded(quant) or ()
+    else:
+        excluded = quant.get("modules_to_not_convert", ())
     not_converted = set()
     for entry in excluded:
         module = entry.rstrip("*").rstrip(".")

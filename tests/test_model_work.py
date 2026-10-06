@@ -2223,6 +2223,26 @@ def test_glm53_nvfp4_hand_derived_weight_bytes():
     assert stored == pytest.approx(converted * fp4 + 2 * bf16)
 
 
+def test_modelopt_exclusions_need_a_per_layer_reader():
+    """A layer-qualified or inner-wildcard ModelOpt exclusion cannot be flattened."""
+    raw = json.loads(GLM53_NVFP4.read_text())
+    with pytest.raises(ValueError, match="name single layers"):
+        parse_quantization_config(raw)
+    assert parse_quantization_config(raw, layer_qualified_exclusions=True) is not None
+    quant = raw["quantization_config"]
+    flat = {"quantization_config": {**quant, "ignore": ["lm_head", "model.visual*"]}}
+    assert parse_quantization_config(flat).not_converted == {"lm_head", "visual"}
+    renamed = {**quant, "exclude_modules": quant["ignore"]}
+    del renamed["ignore"]
+    assert (
+        load_model(GLM53_NVFP4).quant == build_model({**raw, "quantization_config": renamed}).quant
+    )
+    for entry in ("*.mlp.gate", "model.layers.*.self_attn*"):
+        bad = {"quantization_config": {**quant, "ignore": [entry]}}
+        with pytest.raises(ValueError, match="one trailing"):
+            parse_quantization_config(bad)
+
+
 def test_glm53_kpool_closed_forms_match_brute_force():
     from model.work.attention.glm53_kpool_dsa import (
         pooled_prefix_sum,
