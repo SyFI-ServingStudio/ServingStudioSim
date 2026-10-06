@@ -2022,6 +2022,93 @@ mod tests {
         }
     }
 
+    /// A 500K-token request at the default (1M) `max_model_len`: its last
+    /// prefill chunk and its decode cost from profile.db rows. Needs the warm
+    /// rows and the capture-2 token corpus; run from the repo with
+    /// `PYTHONPATH=$PWD uv run cargo test -p simulator --lib long_context -- --ignored`.
+    #[test]
+    #[ignore = "needs warm profile.db rows and the capture-2 token corpus"]
+    fn long_context_request_costs_against_profile_db() {
+        use crate::arch::config::IterArchSel;
+        use crate::timing::cache::interp::CoverageFlags;
+
+        let root = env!("CARGO_MANIFEST_DIR");
+        let selector: IterArchSel = serde_json::from_value(serde_json::json!({
+            "type": "deepseek_v41_vllm",
+            "model_config": CONFIG,
+            "fp8": true,
+            "routing": "corpus",
+            "token_corpus_file": format!(
+                "{root}/logs/20260924_0_dsv41_flash_capture/profile_corpus/token_corpus/manifest.json"
+            ),
+        }))
+        .unwrap();
+        assert_eq!(selector.max_model_len().unwrap(), 1_048_576);
+        let bridge = PerfApiBridge::new().expect("perf_api bridge");
+        let model =
+            crate::arch::build::build_iter_model(&selector, GPU_NAME, "unified", &bridge).unwrap();
+        let names: Vec<String> = model
+            .cost_log_manifest()
+            .slots
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        let (mut slots, mut scratch, mut inputs) = (Vec::new(), Vec::new(), Vec::new());
+        let mut eval = |batch: &UnifiedArchInput| {
+            let total = model.eval_iter_with_inputs(batch, &mut slots, &mut scratch, &mut inputs);
+            assert!(total.m.time_ms.is_finite() && total.m.time_ms > 0.0);
+            assert!(!total.coverage.contains(CoverageFlags::NO_COVERAGE));
+            let flagged: Vec<(String, serde_json::Value)> = (0..names.len())
+                .filter(|&slot| !slots[slot].coverage.is_empty())
+                .map(|slot| {
+                    (
+                        names[slot].clone(),
+                        serde_json::to_value(&inputs[slot]).unwrap(),
+                    )
+                })
+                .collect();
+            // FlashMLA and the indexer logits are on grid at any context.
+            for (slot, name) in names.iter().enumerate() {
+                if name.contains(".mega_attn.") || name.contains("_logits") {
+                    assert!(slots[slot].coverage.is_empty(), "{name}");
+                }
+            }
+            (total.m.time_ms, flagged)
+        };
+        // Past the elementwise grid only through the context-sized indexer
+        // placeholders, which hold the edge bandwidth and say so.
+        let held = [".prefill_topk", ".prefill_k_gather", ".candidates"];
+        let (prefill_ms, flagged) = eval(&one_group(vec![(497_952, 2048)], vec![]));
+        assert!(!flagged.is_empty());
+        for (name, _) in &flagged {
+            assert!(
+                name.contains(".attn.indexer.score.") && held.iter().any(|h| name.ends_with(h)),
+                "{name}"
+            );
+        }
+        for leaf in held {
+            assert!(
+                flagged.iter().any(|(name, _)| name.ends_with(leaf)),
+                "{leaf}"
+            );
+        }
+        let (mixed_ms, mixed_flagged) = eval(&one_group(vec![(497_952, 2048)], vec![500_000; 7]));
+        assert!(mixed_ms > prefill_ms);
+        for (name, _) in &mixed_flagged {
+            assert!(held.iter().any(|h| name.ends_with(h)), "{name}");
+        }
+        // Decode: context changes no flag; only the row-sized leaves below the
+        // 32-token grid start of a one-row batch are flagged.
+        let (decode_ms, flagged) = eval(&one_group(vec![], vec![500_000]));
+        assert!(decode_ms < prefill_ms);
+        for (name, input) in &flagged {
+            assert!(
+                input["num_tokens"].as_u64().is_some_and(|n| n < 32),
+                "{name} {input}"
+            );
+        }
+    }
+
     #[test]
     fn cudagraph_rows_follow_the_capture_sizes() {
         let sizes = [
