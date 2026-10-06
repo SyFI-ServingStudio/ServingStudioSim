@@ -1550,7 +1550,9 @@ mod tests {
         fn walk(node: &CostNode, factor: u32, out: &mut Vec<u32>) {
             match node {
                 CostNode::Leaf(slot) => out[*slot] = factor,
-                CostNode::Sum(children) | CostNode::Max { children, .. } => {
+                CostNode::Sum(children)
+                | CostNode::Max { children, .. }
+                | CostNode::Parallel { children, .. } => {
                     children.iter().for_each(|c| walk(c, factor, out))
                 }
                 CostNode::Scale { n, child } => walk(child, factor * n, out),

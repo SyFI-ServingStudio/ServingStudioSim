@@ -1492,6 +1492,24 @@ def test_nested_quantization_paths_preserve_component_boundaries():
     assert legacy.is_converted("mlp.gate_proj")
 
 
+def test_memoized_conversion_answers_repeat_and_leave_scheme_identity_alone():
+    raw = {
+        "quantization_config": {
+            "quant_method": "fp8",
+            "modules_to_not_convert": ["model.layers.7.mlp.gate"],
+        }
+    }
+    queried, fresh = parse_quantization_config(raw), parse_quantization_config(raw)
+    for _ in range(2):
+        assert not queried.is_converted("mlp.gate")
+        assert not queried.is_converted("mlp.gate.e_score_correction_bias")
+        assert queried.is_converted("mlp.gate_proj")
+    # The memo is a cache, not part of the scheme: a queried scheme still equals
+    # and hashes like one that answered nothing.
+    assert queried == fresh
+    assert hash(queried) == hash(fresh)
+
+
 def test_gated_attention_doubles_q_projection():
     from model.work.attention.gqa import GQA
 
@@ -2305,7 +2323,9 @@ def test_glm53_locked_floor_uses_the_served_fp8_mla_cache(tmp_path):
         {"occurrences": 2, "totals": _g53_geometry_totals([], [2048] * 32)},
         {"occurrences": 1, "totals": _g53_geometry_totals([(0, 2048)], [])},
     ]
-    result = work_floors.compute_locked_compositions(tmp_path, {"main/0": _columns(shapes)})["main/0"]
+    result = work_floors.compute_locked_compositions(tmp_path, {"main/0": _columns(shapes)})[
+        "main/0"
+    ]
     assert "error" not in result, result
     assert result["composition"]["affine_bases"] == 0
     rows = {segment["name"]: segment for segment in result["segments"]}
@@ -2314,6 +2334,154 @@ def test_glm53_locked_floor_uses_the_served_fp8_mla_cache(tmp_path):
     assert rows["dsa_moe.attn.decode"]["bytes"] == 2 * 32 * 2047 * 512 * 11
     assert rows["dsa_moe.attn.decode"]["compute_dtype"] == "fp8"
     assert result["segmented"] >= result["necessary"] > 0
+
+
+def test_glm53_geometry_rows_and_the_rest_partition_the_label(glm53):
+    """`geometry_segments` is exactly what `geometry_attention=False` leaves out."""
+    workload = work_floors._aggregate_workload(
+        _g53_geometry_totals([(2019, 29), (0, 512)], [3000, 10, 70000])
+    )
+    whole = {s.name: (s.flops_total, s.bytes_total) for s in glm53.label(workload).segments}
+    rest = {
+        s.name: (s.flops_total, s.bytes_total)
+        for s in glm53.label(workload, geometry_attention=False).segments
+    }
+    geometry = {s.name: (s.flops_total, s.bytes_total) for s in glm53.geometry_segments(workload)}
+    assert set(geometry) == {
+        f"dsa_moe.{name}"
+        for name in (
+            "indexer.prefill",
+            "attn.prefill",
+            "indexer.decode",
+            "attn.decode",
+            "mla_cache_append",
+            "index_cache_append",
+        )
+    }
+    assert not rest.keys() & geometry.keys()
+    assert rest | geometry == whole
+
+
+def test_glm53_kpool_batch_and_array_paths_match_the_per_request_sums(glm53):
+    """`semantic_segments_batch`, and the numpy path a long interaction list takes,
+    equal the per-request Python-int sums."""
+    from model.work.attention.glm53_kpool_dsa import _VECTORIZE_FROM
+
+    attn = next(stack.attn for stack in glm53.layers if stack.tag == "dsa_moe")
+    small = work_floors._aggregate_workload(_g53_geometry_totals([(2019, 29)], [3000, 10, 70000]))
+    long_decode = [1 + 997 * i for i in range(_VECTORIZE_FROM * 2)]
+    large = work_floors._aggregate_workload(_g53_geometry_totals([(0, 512)], long_decode))
+    assert len(large.attn) >= _VECTORIZE_FROM
+
+    def per_request(wl):
+        # Every interaction on its own is below the vectorize threshold.
+        rows = [attn.semantic_segments(Workload(**{**vars(wl), "attn": [i]})) for i in wl.attn]
+        names = [row.name for row in rows[0]]
+        return {
+            name: tuple(
+                sum(getattr(r, field) for row in rows for r in row if r.name == name)
+                for field in ("flops", "bytes")
+            )
+            for name in names
+            if "cache_append" not in name
+        }
+
+    def rows(semantics):
+        return {
+            row.name: (row.flops, row.bytes) for row in semantics if "cache_append" not in row.name
+        }
+
+    batch = attn.semantic_segments_batch([small, large])
+    for wl, batched in zip((small, large), batch, strict=True):
+        direct = attn.semantic_segments(wl)
+        assert [row.name for row in batched] == [row.name for row in direct]
+        for got, want in zip(batched, direct, strict=True):
+            assert got.flops == pytest.approx(want.flops, rel=1e-12)
+            assert got.bytes == pytest.approx(want.bytes, rel=1e-12)
+        for name, (flops, bytes_) in per_request(wl).items():
+            assert rows(direct)[name][0] == pytest.approx(flops, rel=1e-12)
+            assert rows(direct)[name][1] == pytest.approx(bytes_, rel=1e-12)
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["decode:0", "decode:5:6", "decode:x", "prefill:3", "prefill:3:0", "prefill:3:4:5", "other:1"],
+)
+def test_malformed_request_geometry_keys_are_refused(key):
+    totals = {**_g53_geometry_totals([], []), "request_geometry": {key: 1.0}}
+    with pytest.raises(ValueError, match="malformed request_geometry key"):
+        work_floors._request_interactions(totals)
+
+
+def test_glm53_geometry_groups_split_off_their_attention_rows(monkeypatch, tmp_path, glm53):
+    """A group of geometry-carrying shapes reduces through a split basis — the
+    scalar rows as array math, the kpool DSA rows exactly per shape — and lands
+    on the per-shape direct reduction."""
+    spec = {
+        "arch_type": "glm53_flash_vllm_fp8_kda_dsa_moe",
+        "config": str(GLM53),
+        "gpu": "NVIDIA B200",
+        "dtype": "fp8",
+        "arch_fp8": True,
+        "arch_quant_dtype": "fp8",
+    }
+    monkeypatch.setattr(work_floors, "_pool_specs", lambda _log_dir: {"main": spec})
+    # One decode batch size (routed models pin `matmul_tokens` in the key) with
+    # contexts on both sides of the kpool top-k cap, so the attention rows are
+    # far from affine in the summed `decode_kv`; a second group mixes prefill.
+    decode = [
+        {
+            "occurrences": 1 + i % 3,
+            "totals": _g53_geometry_totals([], [64 + 997 * i * j for j in range(8)]),
+        }
+        for i in range(30)
+    ]
+    mixed = [
+        {"occurrences": 2, "totals": _g53_geometry_totals([(4096 * i, 504)], [100 * i + 1] * 8)}
+        for i in range(30)
+    ]
+    composition = {"main/0": _columns(decode + mixed)}
+
+    split = work_floors.compute_locked_compositions(tmp_path, composition)["main/0"]
+    monkeypatch.setattr(work_floors, "_MIN_BASIS_GROUP", 10**9)
+    direct = work_floors.compute_locked_compositions(tmp_path, composition)["main/0"]
+
+    assert "error" not in split, split
+    assert split["composition"]["affine_bases"] == 2
+    assert split["composition"]["direct_fallback_bases"] == 0
+    assert direct["composition"]["affine_bases"] == 0
+    assert split["necessary"] == pytest.approx(direct["necessary"], rel=1e-12)
+    assert split["segmented"] == pytest.approx(direct["segmented"], rel=1e-12)
+    split_rows = {row["name"]: row for row in split["segments"]}
+    direct_rows = {row["name"]: row for row in direct["segments"]}
+    assert split_rows.keys() == direct_rows.keys()
+    for name, row in direct_rows.items():
+        assert split_rows[name]["compute_dtype"] == row["compute_dtype"]
+        for field in ("flops", "bytes", "necessary"):
+            assert split_rows[name][field] == pytest.approx(row[field], rel=1e-12, abs=1e-300)
+
+
+def test_split_basis_falls_back_when_validation_fails(monkeypatch, tmp_path):
+    spec = {
+        "arch_type": "glm53_flash_vllm_fp8_kda_dsa_moe",
+        "config": str(GLM53),
+        "gpu": "NVIDIA B200",
+        "dtype": "fp8",
+        "arch_fp8": True,
+        "arch_quant_dtype": "fp8",
+    }
+    monkeypatch.setattr(work_floors, "_pool_specs", lambda _log_dir: {"main": spec})
+    monkeypatch.setattr(work_floors, "_segment_work_matches", lambda *_values: False)
+    shapes = [
+        {"occurrences": 1, "totals": _g53_geometry_totals([], [100 + 50 * i] * 4)}
+        for i in range(30)
+    ]
+    result = work_floors.compute_locked_compositions(tmp_path, {"main/0": _columns(shapes)})[
+        "main/0"
+    ]
+    assert "error" not in result, result
+    assert result["composition"]["affine_bases"] == 0
+    assert result["composition"]["direct_fallback_bases"] == 1
 
 
 G53_LOCATION_MAP = (
@@ -2358,6 +2526,140 @@ def test_glm53_location_map_consumes_every_semantic_row_once():
     assert rules["unified.hc_expand"] == rules["unified.hc_contract_mean"] == []
 
 
+# --- DFlash2 proposer (glm53_vllm_nvfp4_dsa_moe_dflash2) -------------------------
+#
+# Draft checkpoint incoai/GLM-5.3-DFlash2 (`model/config/glm53_dflash2.json`): six
+# non-causal sliding-window Qwen3 layers, hidden 6144, intermediate 12288, 64 query /
+# 8 KV heads of 128, window 2048, two-tap grouped convolutions of group 16, six
+# target layers fused by `fc`, a rank-256 top-16 candidate selector. It ships no
+# embedding or lm_head: vLLM shares the target's.
+
+GLM53_DFLASH2 = Path(__file__).resolve().parents[1] / "model" / "config" / "glm53_dflash2.json"
+DFLASH2_SNAPSHOT = Path(
+    "/raid/hf/hub/models--incoai--GLM-5.3-DFlash2/snapshots/425aa615ce320caac34400208b30808c8f14f76c"
+)
+D_H, D_I, D_HQ, D_HKV, D_HD, D_L, D_V, D_W = 6144, 12288, 64, 8, 128, 6, 154880, 2048
+D_CONV_N = 2 * 2 * (D_H // 16)  # kernel_projection: hidden -> 2 * taps * groups
+D_CONV_BASE = 2 * 2 * D_H  # base_kernel [2, taps, hidden]
+D_RANK, D_TOPK = 256, 16
+D_LAYER_PARAMS = (
+    (D_HQ + 2 * D_HKV) * D_HD * D_H  # q/k/v
+    + D_H * D_HQ * D_HD  # o
+    + 3 * D_H * D_I  # gate, up, down
+    + 2 * D_CONV_N * D_H  # attention_conv / mlp_conv projections
+    + 2 * D_CONV_BASE
+    + 2 * D_H  # input / post-attention norms
+    + 2 * D_HD  # q_norm, k_norm
+)
+D_PARAMS = (
+    D_L * D_LAYER_PARAMS
+    + D_H * 6 * D_H  # fc over six target layers
+    + 2 * D_H  # hidden_norm, final norm
+    + D_RANK * D_H  # selector hidden_projection
+    + 2 * D_V * D_RANK  # predecessor / successor codebooks
+)
+
+
+@pytest.fixture(scope="module")
+def dflash2():
+    return work_floors._dflash2_model(str(GLM52_NVFP4), str(GLM53_DFLASH2), D_W)
+
+
+def _dflash2_workload(prefill, decode, depth=7):
+    from model.work.speculative import aggregate_workload
+
+    geometry = {"draft_tokens": depth, "max_model_len": 8192, "prefill": prefill, "decode": decode}
+    totals = {
+        "matmul_tokens": sum(q for _, q in prefill) + sum(q for _, q in decode),
+        "prefill_tokens": sum(q for _, q in prefill),
+        "prefill_requests": len(prefill),
+        "prefill_pairs": sum(q * p + q * (q + 1) // 2 for p, q in prefill),
+        "prefill_cached": sum(p for p, _ in prefill),
+        "decode_passes": len(decode),
+        "decode_kv": sum(kv - q for kv, q in decode),
+        "speculative_geometry": {json.dumps(geometry): 1},
+    }
+    return aggregate_workload(totals, "dflash2")
+
+
+def test_dflash2_window_pairs_match_brute_force():
+    from model.work.attention.dflash2 import window_pairs
+
+    for q, context, window in [
+        (8, 0, 2048),
+        (8, 100, 16),
+        (8, 2040, 2048),
+        (3, 7, 4),
+        (8, 9000, 2048),
+    ]:
+        keys = context + q
+        brute = sum(
+            1
+            for i in range(q)
+            for key in range(keys)
+            if abs((context + i) - key) < window  # HF/vLLM symmetric non-causal window
+        )
+        assert window_pairs(q, keys, window) == brute
+
+
+def test_dflash2_draft_params_are_hand_derived(dflash2):
+    assert D_PARAMS == 2_459_424_256
+    target = load_model(GLM52_NVFP4)
+    wl = _dflash2_workload([[0, 16]], [[100, 8]])
+    body = target.label(replace(wl, stages={})).params["total"]
+    assert dflash2.label(wl).params["total"] - body == D_PARAMS
+    # The proposer replaces the checkpoint's MTP layer, which the target never runs.
+    assert not any(stack.stage and stack.stage.startswith("mtp") for stack in dflash2.layers)
+
+
+@pytest.mark.skipif(not DFLASH2_SNAPSHOT.exists(), reason="GLM-5.3-DFlash2 checkpoint not present")
+def test_dflash2_params_match_the_safetensors_header():
+    import struct
+
+    with open(DFLASH2_SNAPSHOT / "model.safetensors", "rb") as handle:
+        header = json.loads(handle.read(struct.unpack("<Q", handle.read(8))[0]))
+    header.pop("__metadata__", None)
+    assert sum(math.prod(entry["shape"]) for entry in header.values()) == D_PARAMS
+    assert not any("embed_tokens" in name or "lm_head" in name for name in header)
+
+
+def test_dflash2_stage_flop_and_byte_goldens(dflash2):
+    # Two verify requests ending at contexts 100 and 4104, one 16-token prompt:
+    # R = 3 requests, k = 7, C = 32 context rows, 24 draft rows, 21 scored positions.
+    label = dflash2.label(_dflash2_workload([[0, 16]], [[100, 8], [4104, 8]]))
+    seg = {s.name: s for s in label.segments}
+    assert seg["dflash2_context.fc"].flops_total == 2 * 32 * D_H * 6 * D_H
+    assert seg["dflash2_context.fc"].bytes_total == D_H * 6 * D_H * 2
+    assert seg["dflash2_context_kv.kv_proj"].flops_total == D_L * 2 * 32 * 2 * D_HKV * D_HD * D_H
+    # FP8 cache (`--kv-cache-dtype fp8_e4m3`): one byte per element, K and V.
+    assert seg["dflash2_context_kv.kv_cache_append"].bytes_total == D_L * 32 * 2 * D_HKV * D_HD
+    assert seg["dflash2_draft.qkv"].flops_total == D_L * 2 * 24 * (D_HQ + 2 * D_HKV) * D_HD * D_H
+    assert seg["dflash2_draft.attention_conv_proj"].flops_total == D_L * 2 * 24 * D_CONV_N * D_H
+    # Blocks of 8 over 100+8 and 16+8 keys see every key; over 4104+8 keys each
+    # query sees min(4112, 2048 + t), t = 0..7: 8 * 2048 + 28.
+    pairs = 8 * 108 + (8 * 2048 + 28) + 8 * 24
+    assert seg["dflash2_draft.attn"].flops_total == D_L * 4 * D_HQ * D_HD * pairs
+    assert seg["dflash2_draft.attn"].compute_dtype == "fp8"
+    # Cached context keys read: the window's union, min(context, W - 1).
+    assert seg["dflash2_draft.attn"].bytes_total == D_L * (100 + 2047 + 16) * 2 * D_HKV * D_HD
+    assert seg["dflash2_select.lm_head"].flops_total == 2 * 21 * D_H * D_V
+    assert seg["dflash2_select.lm_head"].bytes_total == 0  # the target's head, read once
+    assert seg["dflash2_select.hidden_projection"].flops_total == 2 * 21 * D_RANK * D_H
+    assert seg["dflash2_select.edge_scores"].flops_total == 2 * 21 * D_TOPK * D_TOPK * D_RANK
+    # Predecessors: an anchor plus the candidates of positions 1..6; successors:
+    # the candidates of all seven positions; each a BF16 rank-256 row.
+    gathered = (3 * (1 + 6 * D_TOPK) + 21 * D_TOPK) * D_RANK * 2
+    assert seg["dflash2_select.codebook_gather"].bytes_total == gathered
+    # The target verifies every row and samples each one.
+    assert seg["lm_head"].flops_total == 2 * (1 + 16) * D_H * D_V
+    assert all(s.compute_dtype in ("bf16", "fp8") for name, s in seg.items() if "dflash2" in name)
+
+
+def test_dflash2_rejects_a_sliding_window_the_checkpoint_does_not_have():
+    with pytest.raises(ValueError, match="draft_sliding_window"):
+        work_floors._dflash2_model(str(GLM52_NVFP4), str(GLM53_DFLASH2), 4096)
+
+
 # --------------------------------------------------------------------------- #
 # DeepSeek-V4.1-Flash: sliding-window + compressed sparse attention, mHC, engram
 # --------------------------------------------------------------------------- #
@@ -2373,38 +2675,38 @@ DSV41_MAP = (
     / "location_maps"
     / "deepseek_v41_vllm_tp4_ep4_unified.json"
 )
-D_H, D_V, D_Q, D_HD, D_NH, D_OL, D_OG = 5120, 129280, 1280, 512, 64, 1024, 8
-D_E, D_K, D_I = 384, 6, 2304
-D_IH, D_ID, D_TOPK, D_W, D_HC, D_MIX = 32, 128, 512, 128, 4, 24
-D_CAND = 2048 * 8
-D_ENGRAM_ROWS = (384_006_168, 384_016_682)
-D_ENGRAM_COLS = 3 * 8  # (max_ngram 4 - 1) n-grams x 8 heads
-D_ATTN_MM = (
-    D_Q * D_H  # wq_a
-    + D_NH * D_HD * D_Q  # wq_b
-    + D_HD * D_H  # wkv
-    + D_OG * D_OL * (D_NH * D_HD // D_OG)  # block-diagonal wo_a
-    + D_H * D_OG * D_OL  # wo_b
+V41_H, V41_V, V41_Q, V41_HD, V41_NH, V41_OL, V41_OG = 5120, 129280, 1280, 512, 64, 1024, 8
+V41_E, V41_K, V41_I = 384, 6, 2304
+V41_IH, V41_ID, V41_TOPK, V41_W, V41_HC, V41_MIX = 32, 128, 512, 128, 4, 24
+V41_CAND = 2048 * 8
+V41_ENGRAM_ROWS = (384_006_168, 384_016_682)
+V41_ENGRAM_COLS = 3 * 8  # (max_ngram 4 - 1) n-grams x 8 heads
+V41_ATTN_MM = (
+    V41_Q * V41_H  # wq_a
+    + V41_NH * V41_HD * V41_Q  # wq_b
+    + V41_HD * V41_H  # wkv
+    + V41_OG * V41_OL * (V41_NH * V41_HD // V41_OG)  # block-diagonal wo_a
+    + V41_H * V41_OG * V41_OL  # wo_b
 )
-D_ATTN_VEC = D_Q + D_HD + D_NH  # q_norm, kv_norm, attn_sink
-D_COMP2 = 2 * D_HD * D_H + D_HD  # compressor wkv + wgate + norm (ratio 2)
-D_COMP1 = D_HD * D_H + D_HD  # compressor wkv + norm (ratio 1)
-D_IDX_Q = D_IH * D_ID * D_Q + D_IH * D_H  # indexer wq_b + weights_proj
-D_IDX_OWNER = D_IDX_Q + D_ID * D_HD + D_ID  # + wk + k_norm
-D_MHC = 2 * (D_MIX * D_HC * D_H + D_MIX + 3)  # fn, base, scale per sublayer
-D_EXPERT = 3 * D_I * D_H
-D_LAYER = (
-    D_ATTN_MM
-    + D_ATTN_VEC
-    + 2 * D_H  # attn_norm, ffn_norm
-    + D_MHC
-    + D_E * D_H  # router
-    + D_E  # router selection bias
-    + D_E * D_EXPERT
-    + D_EXPERT  # shared expert
+V41_ATTN_VEC = V41_Q + V41_HD + V41_NH  # q_norm, kv_norm, attn_sink
+V41_COMP2 = 2 * V41_HD * V41_H + V41_HD  # compressor wkv + wgate + norm (ratio 2)
+V41_COMP1 = V41_HD * V41_H + V41_HD  # compressor wkv + norm (ratio 1)
+V41_IDX_Q = V41_IH * V41_ID * V41_Q + V41_IH * V41_H  # indexer wq_b + weights_proj
+V41_IDX_OWNER = V41_IDX_Q + V41_ID * V41_HD + V41_ID  # + wk + k_norm
+V41_MHC = 2 * (V41_MIX * V41_HC * V41_H + V41_MIX + 3)  # fn, base, scale per sublayer
+V41_EXPERT = 3 * V41_I * V41_H
+V41_LAYER = (
+    V41_ATTN_MM
+    + V41_ATTN_VEC
+    + 2 * V41_H  # attn_norm, ffn_norm
+    + V41_MHC
+    + V41_E * V41_H  # router
+    + V41_E  # router selection bias
+    + V41_E * V41_EXPERT
+    + V41_EXPERT  # shared expert
 )
-D_ENGRAM_WKV = D_H * (D_HC + 1) * D_ENGRAM_COLS * 256
-D_ENGRAM = sum(D_ENGRAM_ROWS) * 256 + 2 * (D_ENGRAM_WKV + 2 * D_HC * D_H)
+V41_ENGRAM_WKV = V41_H * (V41_HC + 1) * V41_ENGRAM_COLS * 256
+V41_ENGRAM = sum(V41_ENGRAM_ROWS) * 256 + 2 * (V41_ENGRAM_WKV + 2 * V41_HC * V41_H)
 
 
 @pytest.fixture(scope="module")
@@ -2415,14 +2717,14 @@ def dsv41():
 def test_dsv41_parameter_goldens_reconcile_with_the_checkpoint(dsv41):
     label = dsv41.label(Workload(matmul_tokens=0, head_positions=0))
     total = (
-        40 * D_LAYER
-        + 3 * D_COMP2
-        + D_COMP1
-        + 4 * D_IDX_OWNER
-        + 4 * D_IDX_Q
-        + D_ENGRAM
-        + 2 * D_V * D_H  # embed + untied head
-        + D_H  # final norm
+        40 * V41_LAYER
+        + 3 * V41_COMP2
+        + V41_COMP1
+        + 4 * V41_IDX_OWNER
+        + 4 * V41_IDX_Q
+        + V41_ENGRAM
+        + 2 * V41_V * V41_H  # embed + untied head
+        + V41_H  # final norm
     )
     # Sum of every non-vision, non-mtp, non-scale safetensors tensor (I8 FP4
     # packs x2), minus the image-only router bias_vl: 763,205,315,794 - MTP
@@ -2430,33 +2732,33 @@ def test_dsv41_parameter_goldens_reconcile_with_the_checkpoint(dsv41):
     assert total == 763_205_315_794 - 14_225_362_530 - 485_268_480 - 15_360
     assert label.params["total"] == total == 748_494_669_424
     active_layers = (
-        40 * (D_LAYER - D_E * D_EXPERT + D_K * D_EXPERT)
-        + 3 * D_COMP2
-        + D_COMP1
-        + 4 * D_IDX_OWNER
-        + 4 * D_IDX_Q
-        + 2 * (D_ENGRAM_WKV + 2 * D_HC * D_H + D_ENGRAM_COLS * 256)  # hashed rows only
-        + D_H
+        40 * (V41_LAYER - V41_E * V41_EXPERT + V41_K * V41_EXPERT)
+        + 3 * V41_COMP2
+        + V41_COMP1
+        + 4 * V41_IDX_OWNER
+        + 4 * V41_IDX_Q
+        + 2 * (V41_ENGRAM_WKV + 2 * V41_HC * V41_H + V41_ENGRAM_COLS * 256)  # hashed rows only
+        + V41_H
     )
     assert label.params["activated"]["layers"] == active_layers == 15_468_672_112
-    assert label.params["activated"]["with_embed_head"] == active_layers + 2 * D_V * D_H
+    assert label.params["activated"]["with_embed_head"] == active_layers + 2 * V41_V * V41_H
     breakdown = label.params["breakdown"]
-    assert breakdown["experts"] == 40 * D_E * D_EXPERT == 543_581_798_400
-    assert breakdown["engram"] == D_ENGRAM == 196_928_504_320
-    assert breakdown["mhc"] == 40 * D_MHC
+    assert breakdown["experts"] == 40 * V41_E * V41_EXPERT == 543_581_798_400
+    assert breakdown["engram"] == V41_ENGRAM == 196_928_504_320
+    assert breakdown["mhc"] == 40 * V41_MHC
     assert sum(breakdown.values()) == total
     assert compute_parameter_counts(DSV41)["total"] == total
 
 
 def test_dsv41_weight_bytes_reconcile_with_the_checkpoint(dsv41):
     # MXFP4 experts: half a byte per weight plus one E8M0 byte per 32 along K.
-    expert_bytes = D_EXPERT // 2 + (2 * D_I * D_H + D_H * D_I) // 32
+    expert_bytes = V41_EXPERT // 2 + (2 * V41_I * V41_H + V41_H * V41_I) // 32
     assert expert_bytes == 17_694_720 + 1_105_920
     # 278.6 GB quoted for the checkpoint's packed experts = 40x384 body experts
     # plus 3x128 DSpark experts, values only.
-    assert (40 * D_E + 3 * 128) * D_EXPERT // 2 == 278_585_671_680
+    assert (40 * V41_E + 3 * 128) * V41_EXPERT // 2 == 278_585_671_680
     # 196.9 GB quoted for engram = both FP8 tables plus both wkv, values only.
-    assert sum(D_ENGRAM_ROWS) * 256 + 2 * D_ENGRAM_WKV == 196_928_422_400
+    assert sum(V41_ENGRAM_ROWS) * 256 + 2 * V41_ENGRAM_WKV == 196_928_422_400
     # A 2048-token batch hits every expert, so its weight floor reads all of them.
     label = dsv41.label(Workload.causal_lm(prefill=[(2048, 0)], sampled=1))
     by_name = {segment.name: segment for segment in label.segments}
@@ -2465,40 +2767,40 @@ def test_dsv41_weight_bytes_reconcile_with_the_checkpoint(dsv41):
         for name, segment in by_name.items()
         if name.endswith(("expert_gate_up", "expert_down")) and "shared" not in name
     )
-    loaded = D_E * (1 - (1 - 1 / D_E) ** (2048 * D_K))
+    loaded = V41_E * (1 - (1 - 1 / V41_E) ** (2048 * V41_K))
     assert experts == pytest.approx(40 * loaded * expert_bytes, rel=1e-12)
     # FP8 32x32 blocks with one E8M0 byte each; FP32 mixing; gathered engram rows.
-    assert by_name["l0_swa.wq_a"].bytes == D_Q * D_H + (D_Q // 32) * (D_H // 32)
-    assert by_name["l0_swa.wo_a"].bytes == D_OG * (D_OL * 4096 + 32 * 128)
-    assert by_name["l0_swa.router"].bytes == D_E * D_H * 2
-    assert by_name["l0_swa.mhc_attn.fn"].bytes == D_MIX * D_HC * D_H * 4
-    assert by_name["l1_swa_engram.engram.table"].bytes == 2048 * D_ENGRAM_COLS * 264
-    assert by_name["lm_head"].bytes == D_V * D_H * 2
+    assert by_name["l0_swa.wq_a"].bytes == V41_Q * V41_H + (V41_Q // 32) * (V41_H // 32)
+    assert by_name["l0_swa.wo_a"].bytes == V41_OG * (V41_OL * 4096 + 32 * 128)
+    assert by_name["l0_swa.router"].bytes == V41_E * V41_H * 2
+    assert by_name["l0_swa.mhc_attn.fn"].bytes == V41_MIX * V41_HC * V41_H * 4
+    assert by_name["l1_swa_engram.engram.table"].bytes == 2048 * V41_ENGRAM_COLS * 264
+    assert by_name["lm_head"].bytes == V41_V * V41_H * 2
 
 
 def _dsv41_attention_expectations(prefill: bool):
     """(attn pairs by ratio, index pairs by role, kv bytes) for the two goldens."""
     if prefill:  # one 2048-token chunk, no prefix
-        window = D_W * (D_W + 1) // 2 + (2048 - D_W) * D_W
+        window = V41_W * (V41_W + 1) // 2 + (2048 - V41_W) * V41_W
         # sum_j min(512, j // 2): floor sum to j=1023, then 1025 saturated queries.
-        ratio2 = (2 * 511 * 510 // 2 + 511 * 2) + 1025 * D_TOPK
-        ratio1 = D_TOPK * (D_TOPK + 1) // 2 + (2048 - D_TOPK) * D_TOPK
+        ratio2 = (2 * 511 * 510 // 2 + 511 * 2) + 1025 * V41_TOPK
+        ratio1 = V41_TOPK * (V41_TOPK + 1) // 2 + (2048 - V41_TOPK) * V41_TOPK
         index2 = 1024 * 1024  # sum_j j // 2
         index1 = 2048 * 2049 // 2  # below the 16384-position candidate cap
         kv = (
-            40 * D_W * 528  # ring keeps only the last window of the chunk
+            40 * V41_W * 528  # ring keeps only the last window of the chunk
             + (3 * 1024 + 2048) * 288  # new compressed latents
             + (3 * 1024 + 2048) * 68  # new index keys
         )  # no cached reads, no carried partial group (2048 is even)
     else:  # one decode token at kv_len 4096 (4095 cached)
-        window = D_W
-        ratio2 = D_TOPK  # min(512, 4096 // 2)
-        ratio1 = D_TOPK
+        window = V41_W
+        ratio2 = V41_TOPK  # min(512, 4096 // 2)
+        ratio1 = V41_TOPK
         index2 = 4096 // 2
         index1 = 4096
         reads = (
-            40 * (D_W - 1) * 528
-            + 38 * D_TOPK * 288
+            40 * (V41_W - 1) * 528
+            + 38 * V41_TOPK * 288
             + 3 * (4095 // 2) * 68  # ratio-2 owners score every cached entry
             + 5 * 4095 * 68  # layer 20 and the four candidate consumers
         )
@@ -2521,14 +2823,16 @@ def test_dsv41_flop_and_state_goldens(dsv41, prefill):
     attn_pairs, index_pairs, kv = _dsv41_attention_expectations(prefill)
     new_latents = 3 * 1024 + 2048 if prefill else 4
     expected = {
-        "attn_proj": 2 * tokens * (40 * D_ATTN_MM + 3 * 2 * D_HD * D_H + D_HD * D_H + 8 * D_IDX_Q)
-        + 2 * new_latents * D_ID * D_HD,  # indexer wk runs per new latent
-        "attn_internal": 2 * D_NH * (2 * D_HD) * attn_pairs + 2 * D_IH * D_ID * index_pairs,
-        "ffn": 2 * tokens * 40 * (D_K + 1) * D_EXPERT,
-        "router": 2 * tokens * 40 * D_E * D_H,
-        "lm_head": 2 * D_V * D_H,
-        "mhc": 2 * tokens * 80 * D_MIX * D_HC * D_H,
-        "engram": 2 * tokens * 2 * D_ENGRAM_WKV,
+        "attn_proj": 2
+        * tokens
+        * (40 * V41_ATTN_MM + 3 * 2 * V41_HD * V41_H + V41_HD * V41_H + 8 * V41_IDX_Q)
+        + 2 * new_latents * V41_ID * V41_HD,  # indexer wk runs per new latent
+        "attn_internal": 2 * V41_NH * (2 * V41_HD) * attn_pairs + 2 * V41_IH * V41_ID * index_pairs,
+        "ffn": 2 * tokens * 40 * (V41_K + 1) * V41_EXPERT,
+        "router": 2 * tokens * 40 * V41_E * V41_H,
+        "lm_head": 2 * V41_V * V41_H,
+        "mhc": 2 * tokens * 80 * V41_MIX * V41_HC * V41_H,
+        "engram": 2 * tokens * 2 * V41_ENGRAM_WKV,
     }
     assert label.flops == expected
     if prefill:
@@ -2564,16 +2868,16 @@ def test_dsv41_sparse_caps_and_candidate_restriction(dsv41):
     long_decode = dsv41.label(Workload.causal_lm(decode=[65_536], sampled=1))
     rows = {segment.name: segment for segment in long_decode.segments}
     # Attention saturates at window + top-k regardless of context.
-    assert rows["c1_share.attn.decode"].flops == 2 * D_NH * 2 * D_HD * (D_W + D_TOPK)
+    assert rows["c1_share.attn.decode"].flops == 2 * V41_NH * 2 * V41_HD * (V41_W + V41_TOPK)
     # Layer 20 scores every entry; the candidate consumers only 2048 blocks x 8.
-    assert rows["c1_source_candidate.indexer.decode"].flops == 2 * D_IH * D_ID * 65_536
-    assert rows["c1_candidate_index.indexer.decode"].flops == 2 * D_IH * D_ID * D_CAND
-    assert rows["c1_candidate_index.indexer.decode"].bytes == D_CAND * 68
+    assert rows["c1_source_candidate.indexer.decode"].flops == 2 * V41_IH * V41_ID * 65_536
+    assert rows["c1_candidate_index.indexer.decode"].flops == 2 * V41_IH * V41_ID * V41_CAND
+    assert rows["c1_candidate_index.indexer.decode"].bytes == V41_CAND * 68
     # A ratio-2 decode token makes exactly one carried-group transaction.
     for kv_len in (4096, 4097):
         label = dsv41.label(Workload.causal_lm(decode=[kv_len], sampled=1))
         state = {s.name: s for s in label.segments}["c2_source.compressor_state"]
-        assert state.bytes == 2 * D_HD * 4
+        assert state.bytes == 2 * V41_HD * 4
     # Every semantic row exists at zero work, so row sets never depend on the batch.
     empty = {s.name for s in dsv41.label(Workload.causal_lm(decode=[4096])).segments}
     mixed = {

@@ -2827,6 +2827,59 @@ mod tests {
     }
 
     #[test]
+    fn dflash2_necessary_work_map_covers_the_compiled_locations() {
+        use std::collections::BTreeSet;
+        let bridge = PerfApiBridge::new_uninit_for_test();
+        bridge.enable_enumerate();
+        let mut spec = glm52_model_spec();
+        spec.model_config = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("model/config/glm52_nvfp4.json")
+            .to_string_lossy()
+            .into_owned();
+        let map: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../model/work/location_maps/glm53_vllm_nvfp4_dsa_moe_dflash2.json"
+        ))
+        .unwrap();
+        let mapped: BTreeSet<_> = map["locations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["location"].as_str().unwrap())
+            .collect();
+        for ep in [4, 8] {
+            let built = glm53_vllm_nvfp4_dsa_moe_dflash2(
+                &spec,
+                ep,
+                ep,
+                8192,
+                RoutingKind::Uniform,
+                None,
+                None,
+                None,
+                7,
+                2048,
+                "NVIDIA B200",
+                "unified",
+                &bridge,
+            )
+            .unwrap();
+            let manifest = built.cost_log_manifest();
+            let actual: BTreeSet<_> = manifest
+                .slots
+                .iter()
+                .filter(|slot| {
+                    !matches!(
+                        slot.kind.as_str(),
+                        "all_reduce" | "all_reduce_fusion" | "all_reduce_residual_rms_norm"
+                    )
+                })
+                .map(|slot| slot.name.as_str())
+                .collect();
+            assert_eq!(actual, mapped, "EP={ep}");
+        }
+    }
+
+    #[test]
     fn glm52_sparse_layer_count_matches_the_checkpoint_schedule() {
         // A popularity profile is keyed by MoE layers, not decoder layers.
         // GLM's first three are dense, so these must differ by exactly three.

@@ -987,7 +987,7 @@ fn compose_parallel(children: Vec<CostNode>, serialize_streams: bool) -> CostNod
     if serialize_streams {
         CostNode::Sum(children)
     } else {
-        CostNode::Max {
+        CostNode::Parallel {
             overlap: 1.0,
             children,
         }
