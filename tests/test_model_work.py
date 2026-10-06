@@ -1492,6 +1492,24 @@ def test_nested_quantization_paths_preserve_component_boundaries():
     assert legacy.is_converted("mlp.gate_proj")
 
 
+def test_memoized_conversion_answers_repeat_and_leave_scheme_identity_alone():
+    raw = {
+        "quantization_config": {
+            "quant_method": "fp8",
+            "modules_to_not_convert": ["model.layers.7.mlp.gate"],
+        }
+    }
+    queried, fresh = parse_quantization_config(raw), parse_quantization_config(raw)
+    for _ in range(2):
+        assert not queried.is_converted("mlp.gate")
+        assert not queried.is_converted("mlp.gate.e_score_correction_bias")
+        assert queried.is_converted("mlp.gate_proj")
+    # The memo is a cache, not part of the scheme: a queried scheme still equals
+    # and hashes like one that answered nothing.
+    assert queried == fresh
+    assert hash(queried) == hash(fresh)
+
+
 def test_gated_attention_doubles_q_projection():
     from model.work.attention.gqa import GQA
 
@@ -2316,6 +2334,154 @@ def test_glm53_locked_floor_uses_the_served_fp8_mla_cache(tmp_path):
     assert rows["dsa_moe.attn.decode"]["bytes"] == 2 * 32 * 2047 * 512 * 11
     assert rows["dsa_moe.attn.decode"]["compute_dtype"] == "fp8"
     assert result["segmented"] >= result["necessary"] > 0
+
+
+def test_glm53_geometry_rows_and_the_rest_partition_the_label(glm53):
+    """`geometry_segments` is exactly what `geometry_attention=False` leaves out."""
+    workload = work_floors._aggregate_workload(
+        _g53_geometry_totals([(2019, 29), (0, 512)], [3000, 10, 70000])
+    )
+    whole = {s.name: (s.flops_total, s.bytes_total) for s in glm53.label(workload).segments}
+    rest = {
+        s.name: (s.flops_total, s.bytes_total)
+        for s in glm53.label(workload, geometry_attention=False).segments
+    }
+    geometry = {s.name: (s.flops_total, s.bytes_total) for s in glm53.geometry_segments(workload)}
+    assert set(geometry) == {
+        f"dsa_moe.{name}"
+        for name in (
+            "indexer.prefill",
+            "attn.prefill",
+            "indexer.decode",
+            "attn.decode",
+            "mla_cache_append",
+            "index_cache_append",
+        )
+    }
+    assert not rest.keys() & geometry.keys()
+    assert rest | geometry == whole
+
+
+def test_glm53_kpool_batch_and_array_paths_match_the_per_request_sums(glm53):
+    """`semantic_segments_batch`, and the numpy path a long interaction list takes,
+    equal the per-request Python-int sums."""
+    from model.work.attention.glm53_kpool_dsa import _VECTORIZE_FROM
+
+    attn = next(stack.attn for stack in glm53.layers if stack.tag == "dsa_moe")
+    small = work_floors._aggregate_workload(_g53_geometry_totals([(2019, 29)], [3000, 10, 70000]))
+    long_decode = [1 + 997 * i for i in range(_VECTORIZE_FROM * 2)]
+    large = work_floors._aggregate_workload(_g53_geometry_totals([(0, 512)], long_decode))
+    assert len(large.attn) >= _VECTORIZE_FROM
+
+    def per_request(wl):
+        # Every interaction on its own is below the vectorize threshold.
+        rows = [attn.semantic_segments(Workload(**{**vars(wl), "attn": [i]})) for i in wl.attn]
+        names = [row.name for row in rows[0]]
+        return {
+            name: tuple(
+                sum(getattr(r, field) for row in rows for r in row if r.name == name)
+                for field in ("flops", "bytes")
+            )
+            for name in names
+            if "cache_append" not in name
+        }
+
+    def rows(semantics):
+        return {
+            row.name: (row.flops, row.bytes) for row in semantics if "cache_append" not in row.name
+        }
+
+    batch = attn.semantic_segments_batch([small, large])
+    for wl, batched in zip((small, large), batch, strict=True):
+        direct = attn.semantic_segments(wl)
+        assert [row.name for row in batched] == [row.name for row in direct]
+        for got, want in zip(batched, direct, strict=True):
+            assert got.flops == pytest.approx(want.flops, rel=1e-12)
+            assert got.bytes == pytest.approx(want.bytes, rel=1e-12)
+        for name, (flops, bytes_) in per_request(wl).items():
+            assert rows(direct)[name][0] == pytest.approx(flops, rel=1e-12)
+            assert rows(direct)[name][1] == pytest.approx(bytes_, rel=1e-12)
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["decode:0", "decode:5:6", "decode:x", "prefill:3", "prefill:3:0", "prefill:3:4:5", "other:1"],
+)
+def test_malformed_request_geometry_keys_are_refused(key):
+    totals = {**_g53_geometry_totals([], []), "request_geometry": {key: 1.0}}
+    with pytest.raises(ValueError, match="malformed request_geometry key"):
+        work_floors._request_interactions(totals)
+
+
+def test_glm53_geometry_groups_split_off_their_attention_rows(monkeypatch, tmp_path, glm53):
+    """A group of geometry-carrying shapes reduces through a split basis — the
+    scalar rows as array math, the kpool DSA rows exactly per shape — and lands
+    on the per-shape direct reduction."""
+    spec = {
+        "arch_type": "glm53_flash_vllm_fp8_kda_dsa_moe",
+        "config": str(GLM53),
+        "gpu": "NVIDIA B200",
+        "dtype": "fp8",
+        "arch_fp8": True,
+        "arch_quant_dtype": "fp8",
+    }
+    monkeypatch.setattr(work_floors, "_pool_specs", lambda _log_dir: {"main": spec})
+    # One decode batch size (routed models pin `matmul_tokens` in the key) with
+    # contexts on both sides of the kpool top-k cap, so the attention rows are
+    # far from affine in the summed `decode_kv`; a second group mixes prefill.
+    decode = [
+        {
+            "occurrences": 1 + i % 3,
+            "totals": _g53_geometry_totals([], [64 + 997 * i * j for j in range(8)]),
+        }
+        for i in range(30)
+    ]
+    mixed = [
+        {"occurrences": 2, "totals": _g53_geometry_totals([(4096 * i, 504)], [100 * i + 1] * 8)}
+        for i in range(30)
+    ]
+    composition = {"main/0": _columns(decode + mixed)}
+
+    split = work_floors.compute_locked_compositions(tmp_path, composition)["main/0"]
+    monkeypatch.setattr(work_floors, "_MIN_BASIS_GROUP", 10**9)
+    direct = work_floors.compute_locked_compositions(tmp_path, composition)["main/0"]
+
+    assert "error" not in split, split
+    assert split["composition"]["affine_bases"] == 2
+    assert split["composition"]["direct_fallback_bases"] == 0
+    assert direct["composition"]["affine_bases"] == 0
+    assert split["necessary"] == pytest.approx(direct["necessary"], rel=1e-12)
+    assert split["segmented"] == pytest.approx(direct["segmented"], rel=1e-12)
+    split_rows = {row["name"]: row for row in split["segments"]}
+    direct_rows = {row["name"]: row for row in direct["segments"]}
+    assert split_rows.keys() == direct_rows.keys()
+    for name, row in direct_rows.items():
+        assert split_rows[name]["compute_dtype"] == row["compute_dtype"]
+        for field in ("flops", "bytes", "necessary"):
+            assert split_rows[name][field] == pytest.approx(row[field], rel=1e-12, abs=1e-300)
+
+
+def test_split_basis_falls_back_when_validation_fails(monkeypatch, tmp_path):
+    spec = {
+        "arch_type": "glm53_flash_vllm_fp8_kda_dsa_moe",
+        "config": str(GLM53),
+        "gpu": "NVIDIA B200",
+        "dtype": "fp8",
+        "arch_fp8": True,
+        "arch_quant_dtype": "fp8",
+    }
+    monkeypatch.setattr(work_floors, "_pool_specs", lambda _log_dir: {"main": spec})
+    monkeypatch.setattr(work_floors, "_segment_work_matches", lambda *_values: False)
+    shapes = [
+        {"occurrences": 1, "totals": _g53_geometry_totals([], [100 + 50 * i] * 4)}
+        for i in range(30)
+    ]
+    result = work_floors.compute_locked_compositions(tmp_path, {"main/0": _columns(shapes)})[
+        "main/0"
+    ]
+    assert "error" not in result, result
+    assert result["composition"]["affine_bases"] == 0
+    assert result["composition"]["direct_fallback_bases"] == 1
 
 
 G53_LOCATION_MAP = (
