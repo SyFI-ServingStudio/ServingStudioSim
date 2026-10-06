@@ -20,15 +20,7 @@ pushed. Section 8 lists what remains, in priority order.
 Paths are repo-relative. `tmp/` is gitignored and `logs/` is untracked, so the
 files they name exist only in this worktree
 (`/raid/kanzhu/ServingStudio/wt-i-want-to-support-deepseek-v4-1-flash`). The
-tables this handoff depends on are copied below; the small files it depends on
-are copied next to this document:
-
-| Copy in `doc/pr/dsv41-flash/` | Original | Purpose |
-|---|---|---|
-| `profile_db/db_renames.py.txt` | `tmp/dsv41/merge/db_renames.py` | Kind/backend/value renames for a v2 profile.db copy (rename to `.py` to run; kept as `.txt` so repo lint skips it) |
-| `profile_db/renames.md` | `tmp/dsv41/merge/renames.md` | Full rename table with the reason for each name |
-| `profile_db/build_l2fix.py.txt` | `tmp/dsv41/merge2/db/build_l2fix.py` | Builds the DB copy with the 308 post-L2-fix elementwise rows |
-| `profile_db/elementwise_conflicts_main_kept.csv` | elementwise rows of `tmp/dsv41/merge/conflicts_main_kept.csv` | The 308 conflicting elementwise rows: main's and the branch's time_ms |
+tables this handoff depends on are copied below.
 
 ## 1. Summary
 
@@ -58,7 +50,7 @@ are copied next to this document:
   (no capture behind it) and an unpinned `max_model_len` defaulting to
   1048576, with rows profiled and validated out to 1M context.
 - **Blocking.** The fork is not pushed and its gitlink is not committed
-  (Section 8b); the DSv4.1 profile.db rows are not committed (Section 8c).
+  (Section 8b).
 
 ## 2. Architecture notes and how the simulator models each feature
 
@@ -161,8 +153,8 @@ op and worklet names keep the model name, as main does.
 | `nvfp4_fused_moe` `weight_format` value `mxfp4_ue8m0` | `mxfp4_e2m1` |
 | profiling env `vllm_fork_env` | `vllm_upstream_fork_env` |
 
-`profile_db/renames.md` has the full table, including main's V4 table renames
-that `db_renames.py.txt` also applies to an old DB.
+The committed profile.db already uses the new names; no old name survives in
+code or data.
 
 ### 3.3 L2, L3 and L4
 
@@ -234,12 +226,11 @@ that `db_renames.py.txt` also applies to an old DB.
     (336 rows), which V4.1 reads.
   - The fix moved V4.1's simulated decode iteration by +0.61 ms (decode
     `mega_attn` 0.75x -> 0.95x of measured, Section 5.1).
-  - **308 `elementwise` / `triton` rows** conflict between main and this
-    branch: the branch re-measured them after the fix. Main's values were kept
-    in the working DB, which makes V4.1 cases 0.04-0.08 ms faster than with the
-    branch's values (Section 5.4). The rows are listed in
-    `profile_db/elementwise_conflicts_main_kept.csv`; branch/main time_ms has
-    median +3.3% and range −31% to +104% (*measured*).
+  - **308 B200 `elementwise` / `triton` rows** that main also has take the
+    branch's re-measurement (ba967452): 305 from the fix commit 83c98169, 3
+    from d7d132a0 (within 0.4% of main's). Branch/main time_ms has median
+    +3.3% and range −31% to +104% (*measured*). Other models on B200 read
+    these rows.
 - **`vllm_upstream_fork_env`** (42c377f, `profiling/exec/env.py`). A host
   profiling env on `alignment/profiler/vllm/.venv` (or `$VIBESIM_VLLM_FORK_ROOT`),
   because main's `vllm_env` container is built from fork 3f667d7, which has no
@@ -411,10 +402,8 @@ ms, `pred.overview`). Off and on refer to the bounded-replay flag:
 
 The only change in the whole sequence is the merge-1 step of −0.035 to −0.079
 ms per case, and the per-slot diff traces all of it to the 308 elementwise rows
-(Section 4): with the branch's rows swapped into a DB copy
-(`tmp/dsv41/merge2/profile_l2fix_copy.db`, built by
-`profile_db/build_l2fix.py.txt`) the current code reproduces the pre-merge
-values bit for bit. Merge 2 and the `max_model_len` change are bit-identical
+(Section 4): with the branch's rows swapped in, as the committed DB now has
+them, the current code reproduces the pre-merge values bit for bit. Merge 2 and the `max_model_len` change are bit-identical
 in every slot.
 
 ### 5.5 Long-context prediction (max_model_len 1048576)
@@ -504,18 +493,21 @@ start, which are unrelated to context.
 - **Branch.** `i-want-to-support-deepseek-v4-1-flash` at 51bd8476 before this
   document's commit; 85 commits ahead of origin/main by `git rev-list`, 54 on
   the first-parent line since the original base 8900dec (18 merges of L1 agent
-  branches and 2 merges of origin/main among them). Nothing is pushed. origin/main
-  has moved 5 commits past the last merge base, 865c11b9.
+  branches and 2 merges of origin/main among them). Nothing is pushed. Two more
+  merges followed: 0b801784 (origin/main through #75) and f1828f3a (#77).
 - **Merges.** d8fc2f3 merged origin/main 9161180 (25 conflicted files); c669848b
-  merged 865c11b9 (10 files). Both took main's structure: renames by mechanism,
+  merged 865c11b9 (10 files); 0b801784 (3 files: model.work core and
+  quantization, test_model_work) and f1828f3a (clean) came after, with 3222a5c5
+  moving the aux-stream fan-outs to `CostNode::Parallel`. The first two took main's structure: renames by mechanism,
   no `#[supported]`, `OffGrid`, capability rules on `BackendSupport`. After merge
   2: `cargo test -p simulator --lib` 1214 passed (1219 after the max_model_len
   work); pytest 3938 passed, 0 failed, the same statuses as a clean origin/main
   worktree plus 72 new tests (*measured* test runs, `tmp/dsv41/merge2/phaseB.md`,
   `tmp/dsv41/maxlen/phaseB.md`).
-- **profile.db.** The working copy carries the V4.1 rows and is marked
-  skip-worktree (`git ls-files -v` shows `S profiling/profile.db`). It is
-  **not committed**; HEAD's blob is main's.
+- **profile.db.** Committed in ba967452: main's DB plus the branch's rows,
+  merged by semantic key with `profiling.db.merge` (5,470 rows inserted, 0
+  conflicts), then the 308 elementwise rows above swapped to the branch's
+  values. The working copy equals HEAD and stays skip-worktree.
   - Merge 2 inserted 4,139 branch rows into main's DB (0 conflicts); the
     max_model_len work added 1,330 rows (Slurm 3932/3933; fidelity 3934 wrote
     none).
@@ -523,13 +515,7 @@ start, which are unrelated to context.
     schema v2), `tmp/dsv41/merge2/profile_pre_merge2.db`,
     `tmp/dsv41/maxlen/profile_before.db` and
     `tmp/dsv41/maxlen/phaseB/profile_pre_phaseB.db` (identical to the previous).
-  - To rebuild from the v2 backup: copy it; run `db_renames.py` on the copy
-    **before** `kernel-profile migrate-db` (a value rename on v3 would need
-    `args_hash` recomputed, and the script refuses it); migrate; delete rows
-    whose semantic key main already has (main wins) and main's deleted kinds;
-    then `kernel-profile merge-db <main.db> <delta.db>`. The merge-2 row
-    classification is `tmp/dsv41/merge2/db/analyze.py`; both phase reports
-    (`tmp/dsv41/merge{,2}/phaseB.md`) give the exact commands and counts.
+  - The pre-commit working copy is `tmp/dsv41/commit_db/working_copy_backup.db`.
 - **Fork submodule** `alignment/profiler/vllm`: local branch
   `servingstudio-alignment-v41` at 892da0822f, 16 commits on upstream 04730e8
   (instrumentation plus three docs commits), on no remote branch. The parent
@@ -548,13 +534,10 @@ start, which are unrelated to context.
   (*measured*, 2026-10-05, `tmp/dsv41/public/check_members.py`).
 - **(b) Push the fork, commit the gitlink, open the PR.** Push
   `servingstudio-alignment-v41` (892da0822f), commit the parent gitlink, and
-  open the PR from this branch. origin/main is 5 commits past the last merge, so
-  a third merge will likely come first.
-- **(c) profile.db.** Re-measure the stale `Timer.cupti` rows after the L2 fix
-  (at least the 966 indexer-logits rows V4.1 reads; then other models and GPUs),
-  and decide the 308 elementwise rows: keep main's, or adopt the branch's
-  post-fix values, which other models also read and so needs sign-off. Then
-  decide how the DB lands in the PR.
+  open the PR from this branch.
+- **(c) profile.db.** Committed (ba967452, the branch's elementwise values).
+  Still open: re-measure the stale `Timer.cupti` rows after the L2 fix (at
+  least the 966 indexer-logits rows V4.1 reads; then other models and GPUs).
 - **(d) Fidelity round 2.** Capture prompt routes into the token corpus (vLLM
   `routed_experts` for prefill); replace the MoE fold with an order-statistic
   E[per-batch max rank]; promote placeholders to L1 kinds (indexer candidates,
