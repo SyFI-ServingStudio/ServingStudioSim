@@ -14,8 +14,9 @@ pub use config::{GroupSpec, PlacementPolicy, PoolSpec};
 pub use impls::{
     AfdAttnPoolController, AfdFfnPoolController, AfdFlow, DpPlacementPolicy, PdFlow,
     SimpleDpConfig, SimpleDpFlow, SimpleDpPoolConfig, SimpleDpPoolController, AFD_ATTN_POOL,
-    AFD_FFN_POOL, PD_DECODE_POOL, PD_PREFILL_POOL,
+    AFD_FFN_POOL, PD_DECODE_POOL, PD_PREFILL_POOL, PP_STAGE_POOL,
 };
+pub use impls::{PpFlow, PpStagePoolConfig, PpStagePoolController};
 
 use crate::common::{Request, RequestDefinition, TextGenerationDefinition, Time};
 use crate::worker::SharedGpuCluster;

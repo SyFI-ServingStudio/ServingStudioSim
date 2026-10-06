@@ -179,6 +179,7 @@ impl VllmFp8AttnBlockTpWorklet {
                     strategy: "auto".to_string(),
                     launch_with_pdl: true,
                     fp32_acc: true,
+                    fused_token_limit: None,
                 }
             });
         let max_fused_tokens = tp_ar_fused

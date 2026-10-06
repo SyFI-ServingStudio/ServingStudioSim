@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import shutil
 import sys
-from collections.abc import Iterable
+from collections.abc import Iterable, MutableMapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -158,6 +158,25 @@ def compose_pythonpath(profile_env: ProfileEnv, existing: str | None) -> str:
     return os.pathsep.join(entries)
 
 
+# Interpreter-selection variables a host worker inherits from its caller. The
+# launcher's PyO3 child sets them to the project venv's stdlib and site-packages.
+_INTERPRETER_PATH_VARS = ("PYTHONHOME", "PYTHONPATH", "VIRTUAL_ENV")
+
+
+def set_worker_python_env(profile_env: ProfileEnv, env: MutableMapping[str, str]) -> None:
+    """Set a host worker's import path in `env` (a copy of the caller's environment).
+
+    A worker on the project interpreter keeps the caller's PYTHONPATH after its
+    own entries. A worker on its own interpreter (`sglang_env`) drops the
+    caller's interpreter variables: inherited, they would put the project venv's
+    Torch and FlashInfer ahead of the env's own stack.
+    """
+    if profile_env.python_executable != _default_python():
+        for key in _INTERPRETER_PATH_VARS:
+            env.pop(key, None)
+    env["PYTHONPATH"] = compose_pythonpath(profile_env, env.get("PYTHONPATH"))
+
+
 def compose_library_path(profile_env: ProfileEnv, existing: str | None) -> str:
     """Prepend env-owned shared libraries exactly as the framework launch does.
 
@@ -189,4 +208,5 @@ __all__ = [
     "compose_pythonpath",
     "register_profile_env",
     "resolve_profile_env",
+    "set_worker_python_env",
 ]

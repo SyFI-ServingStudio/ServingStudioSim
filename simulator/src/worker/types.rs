@@ -7,6 +7,9 @@
 //! neutral home here so no concrete cadence shell owns the shared protocol
 //! vocabulary.
 
+use std::rc::Rc;
+
+use crate::arch::contract::UnifiedArchInput;
 use crate::common::{RequestId, Time, WorkerId};
 use crate::worker::admission::LoadBalance;
 
@@ -421,6 +424,67 @@ pub enum FfnWorkerEvent {
         slot: u8,
         reqs: Vec<RequestId>,
         completed: Vec<RequestId>,
+    },
+}
+
+// ── Pipeline-parallel protocol ───────────────────────────────────────────────
+
+/// One microbatch's activations moving from one pipeline stage to the next.
+///
+/// The head stage lowers the batch once; every stage costs its own layers on the
+/// same shared `input`. `send_gid` and `ready_at` say where and when the previous
+/// stage's output is resident, so the receiving stage submits its own pull.
+#[derive(Clone, Debug)]
+pub struct PipelineMicrobatch {
+    /// Head-local sequence number. Every stage logs its cost under this
+    /// iteration id, so one microbatch's rows line up across stage cost logs.
+    pub id: u64,
+    pub input: Rc<UnifiedArchInput>,
+    pub activation_bytes: u64,
+    pub send_gid: u16,
+    pub ready_at: Time,
+}
+
+/// Pipeline head (stage 0) message set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PipelineHeadMsg {
+    Request(RequestId),
+    /// Microbatch `microbatch` left the last stage at `at`.
+    MicrobatchExit {
+        microbatch: u64,
+        at: Time,
+    },
+}
+
+/// Pipeline head event set.
+#[derive(Clone, Debug)]
+pub enum PipelineHeadEvent {
+    /// Stage 0 finished the microbatch; L6 hands it to stage 1.
+    MicrobatchLaunched {
+        worker: WorkerId,
+        microbatch: PipelineMicrobatch,
+    },
+    RequestComplete {
+        worker: WorkerId,
+        req: RequestId,
+    },
+}
+
+/// Pipeline follower stage message set.
+#[derive(Clone, Debug)]
+pub enum PipelineStageMsg {
+    Microbatch(PipelineMicrobatch),
+}
+
+/// Pipeline follower stage event set.
+#[derive(Clone, Debug)]
+pub enum PipelineStageEvent {
+    /// This stage finished the microbatch. `microbatch.send_gid`/`ready_at` now
+    /// name this stage's output; L6 hands it to the next stage, or reports the
+    /// exit to the head when this was the last stage.
+    StageDone {
+        worker: WorkerId,
+        microbatch: PipelineMicrobatch,
     },
 }
 

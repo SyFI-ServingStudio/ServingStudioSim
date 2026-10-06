@@ -161,6 +161,9 @@ impl Deployment for UnifiedDeployment {
             IterWorkerSel::PdPrefill { .. } | IterWorkerSel::PdDecode { .. } => {
                 bail!("unified: pd_prefill / pd_decode workers belong to the `pd` deployment")
             }
+            IterWorkerSel::PipelineChunkedPrefill { .. } => {
+                bail!("unified: the pipeline_chunked_prefill worker belongs to the `pp` deployment")
+            }
         };
         let prefix_cache = resolve_prefix_cache_config(
             "unified",
@@ -623,6 +626,11 @@ impl Deployment for UnifiedDeployment {
                     build_speculative_worker,
                 ))
             }
+            // A pipeline stage is its own worker cadence, so the arch is not a
+            // unified worker's model.
+            IterArchSel::Glm52VllmNvfp4PpDsaMoe { .. } => {
+                bail!("unified: glm52_vllm_nvfp4_pp_dsa_moe runs only under deployment `pp`")
+            }
             IterArchSel::Glm52SglangNvfp4TpDsaMoe {
                 tp_size,
                 max_model_len,
@@ -753,7 +761,9 @@ fn prefill_gpu_time_multiplier(worker: &IterWorkerSel) -> anyhow::Result<Option<
             prefill_gpu_time_multiplier,
             ..
         } => *prefill_gpu_time_multiplier,
-        IterWorkerSel::PdPrefill { .. } | IterWorkerSel::PdDecode { .. } => None,
+        IterWorkerSel::PdPrefill { .. }
+        | IterWorkerSel::PdDecode { .. }
+        | IterWorkerSel::PipelineChunkedPrefill { .. } => None,
     };
     if let Some(multiplier) = multiplier {
         ensure!(

@@ -31,5 +31,5 @@ pub use request_family::{
     VideoGenerationDefinition, VideoGenerationRequest, VideoTextGenerationDefinition,
     VideoTextGenerationRequest, VideoToTextDefinition, VideoToTextRequest,
 };
-pub use request_stage::{AfdStage, PdStage, StageEvent, StageVocab, UnifiedStage};
+pub use request_stage::{AfdStage, PdStage, PpStage, StageEvent, StageVocab, UnifiedStage};
 pub use time::Time;

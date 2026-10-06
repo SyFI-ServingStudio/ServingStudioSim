@@ -1669,7 +1669,10 @@ def test_glm52_nvfp4_location_map_consumes_every_semantic_once():
     mapped = [semantic for row in location_map["locations"] for semantic in row["semantics"]]
 
     assert location_map["schema_version"] == 1
-    assert location_map["arch_types"] == ["glm52_vllm_nvfp4_dsa_moe"]
+    assert location_map["arch_types"] == [
+        "glm52_vllm_nvfp4_dsa_moe",
+        "glm52_vllm_nvfp4_pp_dsa_moe",
+    ]
     assert len(locations) == len(set(locations)) == 114
     assert len(mapped) == len(set(mapped))
     assert set(mapped) == names

@@ -649,6 +649,62 @@ mod tests {
             .is_some());
     }
 
+    #[test]
+    fn chunked_prefill_computes_only_the_fresh_prompt_after_a_pinned_prefix() {
+        let store = shared_with(&[(0, 12_000, 2), (1, 12_000, 2)]);
+        store.borrow_mut()[RequestId(0)].request.definition.session = SessionInput::PinnedPrefix {
+            prefix_tokens: 30_000,
+        };
+        // Room for the pinned request's 30_000 + 12_000 + 2 context, not for a
+        // second request beside it: the prefix counts toward capacity.
+        let mut worker = build_chunked_prefill_worker(
+            WorkerId(0),
+            "main",
+            Arc::new(FakeModel::for_ms(1.0)),
+            Rc::clone(&store),
+            WorkerConfig {
+                max_batch_tokens: Some(8_192),
+                attn_kv_bytes: 50_000,
+                prefix_cache: PrefixCacheConfig::Disabled,
+                ..WorkerConfig::default()
+            },
+            None,
+            PoolId(0),
+            "test-gpu",
+            test_cluster(),
+        );
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(0)));
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(1)));
+
+        let mut chunk_pairs = Vec::new();
+        for step in 0..2 {
+            assert!(worker.form_batch(Time::from_ms(step as f64)));
+            let mut input = Default::default();
+            worker.execution.build_iteration_input(
+                &worker.kv_store,
+                &worker.context.requests,
+                &worker.batch_plan,
+                &mut input,
+            );
+            chunk_pairs.extend(input.groups[0].prefill_chunk_pairs.iter().copied());
+            worker.admission.complete_iteration(
+                &mut worker.kv_store,
+                &worker.context,
+                &worker.batch_plan,
+                &mut Vec::new(),
+                Time::from_ms(step as f64 + 1.0),
+            );
+        }
+        // Attention sees the pinned prefix as context; only 12_000 tokens run.
+        assert_eq!(chunk_pairs, [(30_000, 8_192), (38_192, 3_808)]);
+        assert!(!store.borrow()[RequestId(1)].lifecycle.admitted);
+        let requests = store.borrow();
+        let record = &requests[RequestId(0)];
+        assert_eq!(record.progress.prefill_tokens_processed, 12_000);
+        assert_eq!(record.telemetry.prefix_cache_hit_tokens, Some(30_000));
+        assert!(record.telemetry.first_output_time.is_some());
+    }
+
     fn hybrid_chunked_worker(
         store: SharedRequests,
         chunk_end_quantum: Option<u32>,

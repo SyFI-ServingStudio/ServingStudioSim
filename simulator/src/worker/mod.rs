@@ -33,8 +33,9 @@ pub use kv::{PrefixCacheConfig, PrefixCacheMode, PrefixCachePolicy};
 pub use types::{
     AttnWorkerEvent, AttnWorkerMsg, BatchFsmState, FfnPullSource, FfnTask, FfnTaskKind,
     FfnWorkerEvent, FfnWorkerMsg, IterCursor, IterEndState, PdDecodeEvent, PdDecodeMsg,
-    PdPrefillEvent, PdPrefillMsg, TransferPlan, WorkerConfig, WorkerEventCommon, WorkerFsmState,
-    WorkerMsgCommon, WorkerStatus,
+    PdPrefillEvent, PdPrefillMsg, PipelineHeadEvent, PipelineHeadMsg, PipelineMicrobatch,
+    PipelineStageEvent, PipelineStageMsg, TransferPlan, WorkerConfig, WorkerEventCommon,
+    WorkerFsmState, WorkerMsgCommon, WorkerStatus,
 };
 pub(crate) use workers::afd_attention::build_afd_attention_worker;
 pub use workers::afd_attention::DisaggAttnWorker;
@@ -51,3 +52,5 @@ pub use workers::iter::{
 };
 pub(crate) use workers::pd_decode::build_pd_decode_worker;
 pub use workers::pd_decode::PdDecodeWorker;
+pub(crate) use workers::pipeline::{build_pipeline_head_worker, build_pipeline_stage_worker};
+pub use workers::pipeline::{PipelineHead, PipelineLayout, PipelineStage};

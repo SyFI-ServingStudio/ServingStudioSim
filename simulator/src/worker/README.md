@@ -43,6 +43,8 @@ different timelines and should not be hidden behind one giant FSM abstraction.
 | `pd_decode` | `FullAttnKv` | thin inline landed-request ingress | `UnifiedIterExecution` | `PullDecodeWorker` |
 | `disagg_attn` | `FullAttnKv` | `FreshRequestSlotAdmission<SessionStartOrder>` | `AttentionLayerExecutionAdapter` | `SlotAttentionWorker` + private `AttentionSlotPipeline` |
 | `disagg_ffn` | none | none; L6 sends complete tasks | `FfnSectionExecutionAdapter` | `BufferedFfnWorker` |
+| `pipeline_chunked_prefill`, stage 0 | `FullAttnKv`, one partition, sized by the stage with the most KV per token | `PipelinedPrefillAdmission<PendingOrder>` | `UnifiedIterExecution` | `PipelineHeadWorker` |
+| `pipeline_chunked_prefill`, stages 1..N-1 | none | none; L6 hands over microbatches | `UnifiedIterExecution` (as `PipelineStageExecution`) | `PipelineStageWorker` |
 
 Hybrid recurrent + attention archs (Qwen3.6 local, GLM-5.3-Flash) swap in
 `HybridGdnKv` under `barebone` (`Qwen36HybridWorker`) and `chunked_prefill`
@@ -116,9 +118,11 @@ token gate belong to admission (`admission/placement.rs` and
 `admission/token_budget.rs`); there is no mixed `admission_helpers` module or
 one-variant capacity-policy seam.
 
-`SessionInput` remains one closed immutable request declaration: either
-`Standalone`, or a session id plus its first trace arrival and declared reusable
-prefix. Admission asks
+`SessionInput` remains one closed immutable request declaration: `Standalone`;
+`PinnedPrefix`, a standalone request whose trace declares its prefix resident on
+arrival (resolved by every prefix-capable KV as a full hit on any partition,
+reserved and released with the request, never retained or evicted); or a
+session id plus its first trace arrival and declared reusable prefix. Admission asks
 `PrefixKv` to locate the best retained match before fallback placement, resolve
 that partition's hit, gate the actual compute
 `fresh + declared - resident`, and reserve the post-prefill context
@@ -227,7 +231,7 @@ Execution owns the model, reusable input buffer shape, and `CostBuffers`:
 The shell treats `E::Input` as opaque. Transfer submission stays in the shell
 because it is part of cadence overlap, not model math.
 
-## Four production cadence families
+## Production cadence families
 
 ### 1. Whole iteration: `workers/iter/`
 
@@ -276,6 +280,29 @@ incoming → pulling_task → computing_task → SectionReady / IterComplete
 Terminal owns token emission and completion but preserves the sticky attention
 worker as the request's recorded location.
 
+### 5. Pipeline stages: `workers/pipeline/`
+
+A pipeline-parallel replica is one head and `depth - 1` followers, one GPU each.
+`PipelineHeadWorker` owns admission and KV for the whole pipeline and stage 0's
+compute. It forms a microbatch whenever stage 0 is idle and fewer than `depth`
+microbatches are in flight:
+
+```text
+form_microbatch → build input → commit_microbatch → stage-0 compute
+  → MicrobatchLaunched … MicrobatchExit → complete_microbatch
+```
+
+`PipelinedPrefillAdmission` commits a chunk's prefill progress when it is
+scheduled (vLLM V1), so the next microbatch can carry the same prompt's next
+chunk while the previous one is on a later stage. Token emission, `Done`, and KV
+release wait for the exit, stamped with the exact exit time. Prefill only:
+requests that want decode fail at enqueue.
+
+`PipelineStageWorker` has no KV/admission axes. It runs microbatches FIFO,
+double-buffering one activation pull against one compute, at exact times derived
+from the previous stage's `ready_at`. It stamps no request stage, so requests stay
+located on their head.
+
 ## Construction and deployment wiring
 
 Every concrete recipe is isolated in a `build_*_worker.rs` file. Repeated
@@ -295,6 +322,7 @@ Deployments and pool controllers only call those recipes:
 - PD → `build_pd_prefill_worker` / `build_pd_decode_worker`
 - AFD attention → `build_afd_attention_worker`
 - AFD FFN → `build_afd_ffn_worker`
+- PP → `build_pipeline_head_worker` / `build_pipeline_stage_worker`
 
 Message/event enums, pool behavior, and flow barriers remain L6 contracts; the
 composition refactor does not create a second deployment layer.

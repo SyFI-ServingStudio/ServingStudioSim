@@ -173,6 +173,7 @@ pub enum RunConfig {
     Unified(UnifiedConfig),
     Pd(PdConfig),
     Afd(AfdConfig),
+    Pp(PpConfig),
 }
 
 impl RunConfig {
@@ -181,6 +182,7 @@ impl RunConfig {
             RunConfig::Unified(c) => &c.workload,
             RunConfig::Pd(c) => &c.workload,
             RunConfig::Afd(c) => &c.workload,
+            RunConfig::Pp(c) => &c.workload,
         }
     }
 
@@ -189,6 +191,7 @@ impl RunConfig {
             RunConfig::Unified(c) => &c.io,
             RunConfig::Pd(c) => &c.io,
             RunConfig::Afd(c) => &c.io,
+            RunConfig::Pp(c) => &c.io,
         }
     }
 
@@ -200,6 +203,7 @@ impl RunConfig {
             RunConfig::Unified(_) => crate::common::UnifiedStage::VOCAB,
             RunConfig::Pd(_) => crate::common::PdStage::VOCAB,
             RunConfig::Afd(_) => crate::common::AfdStage::VOCAB,
+            RunConfig::Pp(_) => crate::common::PpStage::VOCAB,
         }
     }
 }
@@ -239,6 +243,23 @@ pub struct PdConfig {
 pub struct PdPools {
     pub prefill: PoolSpec<IterArchSel, IterWorkerSel>,
     pub decode: PoolSpec<IterArchSel, IterWorkerSel>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PpConfig {
+    pub workload: WorkloadSpec,
+    pub io: IoSpec,
+    pub pools: PpPools,
+    /// Per-kernel backend overrides (see [`BackendOverrides`]); absent = none.
+    #[serde(default)]
+    pub backends: BackendOverrides,
+}
+
+/// One pool whose workers are the stages of `replicas` pipelines.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PpPools {
+    pub stage: PoolSpec<IterArchSel, IterWorkerSel>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

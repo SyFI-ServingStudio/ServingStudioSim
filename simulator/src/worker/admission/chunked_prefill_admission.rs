@@ -791,7 +791,7 @@ where
 /// The next chunk of `resolved_prefill` that `budget` tokens can carry, ending
 /// on a `chunk_end_quantum` boundary when one is set. `0` means the request
 /// cannot run this iteration.
-fn next_chunk_tokens(
+pub(super) fn next_chunk_tokens(
     resolved_prefill: ResolvedPrefillContext,
     budget: u32,
     chunk_end_quantum: Option<u32>,

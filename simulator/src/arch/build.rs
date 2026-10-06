@@ -22,22 +22,22 @@ use crate::arch::model_cfg::ModelCfg;
 use crate::arch::moe_model_cfg::MoeModelCfg;
 use crate::arch::{
     deepseek_v4_vllm, glm52_sglang_nvfp4_tp_dsa_moe, glm52_vllm_dsa_moe, glm52_vllm_nvfp4_dsa_moe,
-    glm53_flash_vllm_fp8_kda_dsa_moe, glm53_vllm_nvfp4_dsa_moe_dflash2, llama3_dense,
-    llama3_dense_tp, llama3_dp_attn_tp_ffn, qwen36_local, qwen3_attn_layerwise,
-    qwen3_ffn_moe_layerwise, qwen3_fp8_ffn_moe_layerwise, qwen3_moe_dp_attn_ep_ffn,
-    qwen3_moe_fp8_dp_attn_ep_ffn, qwen3_vllm_moe_dp_attn_ep_ffn, AttnLayerwiseModel,
-    DeepseekV4ModelCfg, DeepseekV4VllmModel, DeepseekV4VllmParallel, DenseParallel,
-    DenseTpParallel, Dflash2DraftResolved, DpAttnTpFfnParallel, FfnLayerwiseModel, Glm52ModelCfg,
-    Glm52MtpMode, Glm52SglangNvfp4TpDsaMoeModel, Glm52SglangNvfp4TpDsaMoeParallel,
+    glm52_vllm_nvfp4_pp_dsa_moe, glm53_flash_vllm_fp8_kda_dsa_moe,
+    glm53_vllm_nvfp4_dsa_moe_dflash2, llama3_dense, llama3_dense_tp, llama3_dp_attn_tp_ffn,
+    qwen36_local, qwen3_attn_layerwise, qwen3_ffn_moe_layerwise, qwen3_fp8_ffn_moe_layerwise,
+    qwen3_moe_dp_attn_ep_ffn, qwen3_moe_fp8_dp_attn_ep_ffn, qwen3_vllm_moe_dp_attn_ep_ffn,
+    AttnLayerwiseModel, DeepseekV4ModelCfg, DeepseekV4VllmModel, DeepseekV4VllmParallel,
+    DenseParallel, DenseTpParallel, Dflash2DraftResolved, DpAttnTpFfnParallel, FfnLayerwiseModel,
+    Glm52ModelCfg, Glm52MtpMode, Glm52SglangNvfp4TpDsaMoeModel, Glm52SglangNvfp4TpDsaMoeParallel,
     Glm52VllmDsaMoeModel, Glm52VllmDsaMoeParallel, Glm52VllmNvfp4DsaMoeModel,
-    Glm52VllmNvfp4DsaMoeParallel, Glm52VllmNvfp4DsaMoeSpeculativeModel, Glm53FlashModelCfg,
-    Glm53FlashVllmModel, Glm53FlashVllmParallel, Glm53VllmNvfp4DsaMoeDflash2Model,
-    IterwiseUnifiedModel, Llama3DenseModel, Llama3DenseTpModel, Llama3DpAttnTpFfnModel,
-    Qwen36LocalModel, Qwen36LocalParallel, Qwen36ModelCfg, Qwen3AttnLayerwiseModel,
-    Qwen3AttnParallel, Qwen3FfnMoeLayerwiseModel, Qwen3FfnMoeParallel,
-    Qwen3Fp8FfnMoeLayerwiseModel, Qwen3Fp8FfnMoeParallel, Qwen3MoeDpAttnEpFfnModel,
-    Qwen3MoeFp8DpAttnEpFfnModel, Qwen3MoeFp8Parallel, Qwen3MoeParallel,
-    Qwen3VllmMoeDpAttnEpFfnModel, Qwen3VllmMoeParallel,
+    Glm52VllmNvfp4DsaMoeParallel, Glm52VllmNvfp4DsaMoeSpeculativeModel,
+    Glm52VllmNvfp4PpDsaMoeModel, Glm52VllmNvfp4PpParallel, Glm53FlashModelCfg, Glm53FlashVllmModel,
+    Glm53FlashVllmParallel, Glm53VllmNvfp4DsaMoeDflash2Model, IterwiseUnifiedModel,
+    Llama3DenseModel, Llama3DenseTpModel, Llama3DpAttnTpFfnModel, Qwen36LocalModel,
+    Qwen36LocalParallel, Qwen36ModelCfg, Qwen3AttnLayerwiseModel, Qwen3AttnParallel,
+    Qwen3FfnMoeLayerwiseModel, Qwen3FfnMoeParallel, Qwen3Fp8FfnMoeLayerwiseModel,
+    Qwen3Fp8FfnMoeParallel, Qwen3MoeDpAttnEpFfnModel, Qwen3MoeFp8DpAttnEpFfnModel,
+    Qwen3MoeFp8Parallel, Qwen3MoeParallel, Qwen3VllmMoeDpAttnEpFfnModel, Qwen3VllmMoeParallel,
 };
 use crate::common::Fabric;
 use crate::timing::bridge::DType;
@@ -1096,6 +1096,57 @@ pub fn glm52_vllm_nvfp4_dsa_moe(
         .context("building B200 GLM-5.2 NVFP4 model (often a missing profile.db row)")
 }
 
+/// Build the B200 GLM-5.2/5.3 NVFP4 graph under pure pipeline parallelism:
+/// `pp_size` one-GPU stages at EP1, as the whole-pipeline view over them.
+///
+/// Routing is resolved at EP1 because one GPU owns all experts, so a
+/// popularity profile must have been captured with `expert_parallel_size == 1`.
+/// A deployment shares the built stages with its workers through
+/// [`Glm52VllmNvfp4PpDsaMoeModel::stages`].
+#[allow(clippy::too_many_arguments)]
+pub fn glm52_vllm_nvfp4_pp_dsa_moe(
+    model_spec: &ModelSpec,
+    pp_size: u16,
+    max_model_len: u32,
+    routing_kind: RoutingKind,
+    routing_seed: Option<u64>,
+    expert_popularity_file: Option<&str>,
+    token_corpus_file: Option<&str>,
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<Glm52VllmNvfp4PpDsaMoeModel> {
+    let model_cfg = glm52_model_cfg(model_spec).context("loading exact GLM-5.2 NVFP4 config")?;
+    let source = ExpertDemandSource {
+        kind: routing_kind,
+        seed: routing_seed,
+        num_experts: model_cfg.num_experts.get(),
+        experts_per_token: model_cfg.router_top_k,
+        // EP1: each stage's GPU owns all experts, so the fold sees one rank.
+        ep_size: 1,
+        expert_popularity_file,
+        token_corpus_file,
+        num_routed_layers: num_sparse_layers(&model_cfg),
+    };
+    let body_demand = source.demand(0..num_sparse_layers(&model_cfg) as usize, 1)?;
+    let parallel = Glm52VllmNvfp4PpParallel {
+        pp_size,
+        max_model_len,
+        gpu_name: gpu.to_string(),
+    };
+    let configs = glm52_vllm_nvfp4_pp_dsa_moe::build_configs(
+        &model_cfg,
+        &parallel,
+        &body_demand,
+        model_spec.fp8,
+    )
+    .context("expanding B200 GLM-5.2 NVFP4 pipeline-parallel architecture configs")?;
+    let resolved = glm52_vllm_nvfp4_pp_dsa_moe::resolve_configs(&configs);
+    glm52_vllm_nvfp4_pp_dsa_moe::build(name.to_string(), resolved, bridge).context(
+        "building B200 GLM-5.2 NVFP4 pipeline-parallel model (often a missing profile.db row)",
+    )
+}
+
 /// Build the B200 GLM-5.2 NVFP4 target-verify graph with its MTP proposer.
 ///
 /// The result is a different type from [`glm52_vllm_nvfp4_dsa_moe`]'s, not the
@@ -1673,6 +1724,26 @@ pub fn build_iter_model(
             *routing,
             *routing_seed,
             *mtp_mode,
+            expert_popularity_file.as_deref(),
+            token_corpus_file.as_deref(),
+            gpu,
+            name,
+            bridge,
+        )?),
+        IterArchSel::Glm52VllmNvfp4PpDsaMoe {
+            model,
+            pp_size,
+            max_model_len,
+            routing,
+            routing_seed,
+            expert_popularity_file,
+            token_corpus_file,
+        } => Box::new(glm52_vllm_nvfp4_pp_dsa_moe(
+            model,
+            *pp_size,
+            *max_model_len,
+            *routing,
+            *routing_seed,
             expert_popularity_file.as_deref(),
             token_corpus_file.as_deref(),
             gpu,

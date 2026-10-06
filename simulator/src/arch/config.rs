@@ -372,6 +372,39 @@ pub enum IterArchSel {
         #[param(cache_key)]
         token_corpus_file: Option<String>,
     },
+    /// [`Self::Glm52VllmNvfp4DsaMoe`]'s kernels under pure pipeline
+    /// parallelism. Each of `pp_size` stages is one GPU running a contiguous
+    /// layer range (vLLM's `get_pp_indices`) at EP1: every head and expert is
+    /// local, so a stage has no collective. MTP is not run. GLM-5.3 NVFP4 is
+    /// the same graph. Runs only under deployment `pp`.
+    Glm52VllmNvfp4PpDsaMoe {
+        #[serde(flatten)]
+        model: ModelSpec,
+        /// Pipeline stages, one GPU each.
+        #[param(cache_key)]
+        pp_size: u16,
+        /// Configured context cap and padded DSA-logits row stride.
+        #[serde(default = "default_glm52_nvfp4_max_model_len")]
+        #[param(default = 1048576, cache_key)]
+        max_model_len: u32,
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS, cache_key)]
+        routing: RoutingKind,
+        #[serde(default)]
+        #[param(cache_key)]
+        routing_seed: Option<u64>,
+        /// Measured per-expert popularity captured at EP1 (one rank owns all
+        /// 256 experts). Requires `routing = popularity`.
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+        /// Recorded per-token expert routes from a `token_corpus` pass, as a
+        /// manifest path. Requires `routing = corpus`. Only the body slice is
+        /// read: a stage runs no MTP layer.
+        #[serde(default)]
+        #[param(cache_key)]
+        token_corpus_file: Option<String>,
+    },
     /// [`Self::Glm52VllmNvfp4DsaMoe`] driving its MTP layer as a real drafter:
     /// one target verify pass over `draft_tokens + 1` rows per decode request,
     /// then `draft_tokens` draft passes.
@@ -556,6 +589,7 @@ impl IterArchSel {
             | Self::DeepseekV4VllmSerialStreams { model, .. }
             | Self::Glm52VllmDsaMoe { model, .. }
             | Self::Glm52VllmNvfp4DsaMoe { model, .. }
+            | Self::Glm52VllmNvfp4PpDsaMoe { model, .. }
             | Self::Glm52VllmNvfp4DsaMoeSpeculative { model, .. }
             | Self::Glm53VllmNvfp4DsaMoeDflash2 { model, .. }
             | Self::Glm53FlashVllmFp8KdaDsaMoe { model, .. }
@@ -570,6 +604,7 @@ impl IterArchSel {
     pub fn max_model_len(&self) -> anyhow::Result<u32> {
         match self {
             Self::Glm52VllmNvfp4DsaMoe { max_model_len, .. }
+            | Self::Glm52VllmNvfp4PpDsaMoe { max_model_len, .. }
             | Self::Glm52VllmNvfp4DsaMoeSpeculative { max_model_len, .. }
             | Self::Glm53VllmNvfp4DsaMoeDflash2 { max_model_len, .. }
             | Self::Glm53FlashVllmFp8KdaDsaMoe { max_model_len, .. }

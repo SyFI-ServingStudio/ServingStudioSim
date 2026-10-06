@@ -73,3 +73,16 @@ pub trait FfnTaskExecution {
         start: Time,
     ) -> Time;
 }
+
+/// Costs one pipeline stage on a microbatch the head stage already lowered.
+///
+/// A follower stage owns no KV and forms no batch, so it cannot build its own
+/// input; it evaluates its layers on the carried one.
+pub trait PipelineStageExecution {
+    fn evaluate_stage(
+        &mut self,
+        input: &crate::arch::contract::UnifiedArchInput,
+        microbatch: u64,
+        start: Time,
+    ) -> Time;
+}
