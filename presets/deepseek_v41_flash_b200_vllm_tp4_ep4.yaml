@@ -33,7 +33,7 @@ pools:
           max_model_len: 131072
           # Recorded per-token expert routes from the capture's token_corpus pass.
           routing: corpus
-          token_corpus_file: logs/20260924_0_dsv41_flash_capture/profile_corpus/token_corpus/manifest.json
+          token_corpus_file: hf://datasets/UW-SyFI/servingstudio-workload@c3f5ecaab0bbff757c64864bf2ec24f5e1f76b5c/deepseek_v41_flash/vllm/diverse_100/capture/20260924/manifest.json
           # What-if, default false (= the captured vLLM): decoder SWA bounded
           # replay (vLLM PR #58132 / SGLang --enable-decoder-swa-bounded-replay).
           # Layers past the last KV source (21-39) run only each prefill chunk's

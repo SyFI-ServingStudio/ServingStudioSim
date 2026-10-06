@@ -1,18 +1,14 @@
-# vLLM DeepSeek-V4.1-Flash on four B200s, TP4 attention and EP4 experts over
-# the same ranks, with the gated side streams serialized (an alignment
-# counterfactual). max_model_len 131072 is the capture's --max-model-len
+# vLLM DeepSeek-V4.1-Flash on four B200s: TP4 attention and EP4 experts over
+# the same ranks. max_model_len 131072 is the capture's --max-model-len
 # (logs/20260924_0_dsv41_flash_capture); 1048576 is vLLM's default, the
 # checkpoint's max_position_embeddings.
 # decoder_swa_bounded_replay is a what-if with no capture behind it (vLLM PR
 # #58132 / SGLang --enable-decoder-swa-bounded-replay); false is the vLLM
 # the capture ran.
-# The capture's token-corpus workload is not on
-# hf://datasets/UW-SyFI/servingstudio-workload yet; until it is uploaded and
-# pinned as the first workload row, uniform routing is the only workload.
 checkpoint: deepseek-ai/DeepSeek-V4.1-Flash
 gpu: NVIDIA B200
 arch:
-  type: deepseek_v41_vllm_serial_streams
+  type: deepseek_v41_vllm
   fp8: true
   max_model_len: ${max_model_len}
   decoder_swa_bounded_replay: ${decoder_swa_bounded_replay}
@@ -23,6 +19,6 @@ sweep:
   decoder_swa_bounded_replay: [false, true]
 compound:
   workload:
-    uniform:
-      routing: uniform
-      token_corpus_file: null
+    diverse_100:
+      routing: corpus
+      token_corpus_file: hf://datasets/UW-SyFI/servingstudio-workload@c3f5ecaab0bbff757c64864bf2ec24f5e1f76b5c/deepseek_v41_flash/vllm/diverse_100/capture/20260924/manifest.json

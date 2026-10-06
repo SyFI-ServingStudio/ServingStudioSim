@@ -29,7 +29,6 @@ are copied next to this document:
 | `profile_db/renames.md` | `tmp/dsv41/merge/renames.md` | Full rename table with the reason for each name |
 | `profile_db/build_l2fix.py.txt` | `tmp/dsv41/merge2/db/build_l2fix.py` | Builds the DB copy with the 308 post-L2-fix elementwise rows |
 | `profile_db/elementwise_conflicts_main_kept.csv` | elementwise rows of `tmp/dsv41/merge/conflicts_main_kept.csv` | The 308 conflicting elementwise rows: main's and the branch's time_ms |
-| `public_preset_drafts/{public,public_sim}/DeepSeek-V4.1-Flash/*.yaml` | `tmp/dsv41/public/draft/` | Blocked public presets (Section 8a) |
 
 ## 1. Summary
 
@@ -58,9 +57,8 @@ are copied next to this document:
 - **Beyond the capture.** A counterfactual flag `decoder_swa_bounded_replay`
   (no capture behind it) and an unpinned `max_model_len` defaulting to
   1048576, with rows profiled and validated out to 1M context.
-- **Blocking.** Public presets wait on user approval to upload the corpus
-  capture to Hugging Face (Section 8a); the fork is not pushed and its gitlink
-  is not committed (Section 8b).
+- **Blocking.** The fork is not pushed and its gitlink is not committed
+  (Section 8b); the DSv4.1 profile.db rows are not committed (Section 8c).
 
 ## 2. Architecture notes and how the simulator models each feature
 
@@ -214,13 +212,13 @@ that `db_renames.py.txt` also applies to an old DB.
 - **Simulation preset**: `presets/deepseek_v41_flash_b200_vllm_tp4_ep4.yaml`
   (capture-2 workload, corpus routing, `max_model_len: 131072` pinned,
   `gpu_time_multiplier: 1.0361`, `attn_gpu_memory_gb: 81.506844672`).
-- **Timing-predict presets**: `presets/predict_deepseek_v41_vllm{,_serial}.json`
-  with `predict_deepseek_v41_vllm_cases.json` (4 capture-shaped cases), and
-  `presets/predict_deepseek_v41_vllm_longctx{,_cases}.json` (14 cases out to 1M,
-  unpinned).
-- The corpus preset paths point into `logs/20260924_0_dsv41_flash_capture/`,
-  which is untracked; on another machine they need the corpus capture
-  (Section 8a).
+- **Public presets**: `presets/public/DeepSeek-V4.1-Flash/` (arch:
+  `max_model_len` [131072, 1048576] x replay [false, true]) and
+  `presets/public_sim/DeepSeek-V4.1-Flash/` (`chunked_prefill` 2048, replicas
+  [1, 2], replay [false, true], pinned at 131072), both on the `diverse_100`
+  corpus workload.
+- Every corpus reference names the capture uploaded in dataset commit
+  `aa400a0a` and pinned at `c3f5ecaa`: `hf://datasets/UW-SyFI/servingstudio-workload@c3f5ecaab0bbff757c64864bf2ec24f5e1f76b5c/deepseek_v41_flash/vllm/diverse_100/capture/20260924/manifest.json`.
 
 ## 4. Changes that affect more than V4.1
 
@@ -542,17 +540,12 @@ start, which are unrelated to context.
 
 ## 8. What is left and open decisions, in priority order
 
-- **(a) Upload the corpus capture to Hugging Face (needs user approval).** The
-  public presets must name a pinned `hf://datasets/UW-SyFI/servingstudio-workload@<sha>/…`
-  capture (`tests/test_public_presets.py`). Proposed path
-  `deepseek_v41_flash/vllm/diverse_100/capture/20260924/` with `manifest.json`,
-  `routes.u16` and `trace.csv` (= `logs/20260924_0_dsv41_flash_capture/trace_diverse_100.csv`).
-  A uniform-routing-only preset fails `test_every_member_is_measured`: each
-  member misses 67 `nvfp4_fused_moe` rows (*measured*, re-checked on 2026-10-05
-  with `tmp/dsv41/public/check_members.py`). The drafts are in
-  `public_preset_drafts/` (arch: `max_model_len` [131072, 1048576] x replay
-  [false, true]; sim: `chunked_prefill` 2048, replicas [1, 2], replay
-  [false, true], pinned at 131072); add the pinned corpus row once uploaded.
+- **(a) Corpus capture on Hugging Face — done.** Uploaded in dataset commit
+  `aa400a0a` as `deepseek_v41_flash/vllm/diverse_100/capture/20260924/`
+  (`routes.u16` sha256 and `manifest.json` match the local capture); the
+  public presets carry it as their only workload row, pinned at `c3f5ecaa`.
+  A uniform row is not offered: each member misses 67 `nvfp4_fused_moe` rows
+  (*measured*, 2026-10-05, `tmp/dsv41/public/check_members.py`).
 - **(b) Push the fork, commit the gitlink, open the PR.** Push
   `servingstudio-alignment-v41` (892da0822f), commit the parent gitlink, and
   open the PR from this branch. origin/main is 5 commits past the last merge, so
@@ -607,10 +600,6 @@ simulation read the working profile.db and need no GPU when every row exists;
 with `--no-gpu` a missing row is an error instead of a GPU JIT.
 
 ```bash
-# Timing predict: the four capture-shaped cases, and the long-context set
-uv run python -m launcher timing-predict presets/predict_deepseek_v41_vllm.json --no-gpu
-uv run python -m launcher timing-predict presets/predict_deepseek_v41_vllm_longctx.json --dry-run --no-gpu
-
 # Simulation of capture 2's workload (dry run first, then the run)
 uv run python -m launcher presets/deepseek_v41_flash_b200_vllm_tp4_ep4.yaml --dry-run --cache-report
 uv run python -m launcher presets/deepseek_v41_flash_b200_vllm_tp4_ep4.yaml
