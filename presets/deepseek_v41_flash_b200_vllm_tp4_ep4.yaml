@@ -8,7 +8,7 @@ workload:
   # The capture-2 workload: 96 requests (128/128, 128/4096, 4096/128,
   # 3072/3072 x 24), saturated at 48 in flight.
   trace_files:
-    - logs/20260924_0_dsv41_flash_capture/trace_quadrant_c48.csv
+    - trace/quadrant_c48_96.csv
   input_file_format: text-generation-independent
   arrival_mode: saturated
   max_concurrency: 48
