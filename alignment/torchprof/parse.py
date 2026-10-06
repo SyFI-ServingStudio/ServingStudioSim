@@ -193,7 +193,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="stage for ranges lacking a metrics stage (e.g. 'prefill' for a prefill window)",
     )
     parser.add_argument("--top-n", type=int, default=12)
-    parser.add_argument("--output", type=Path, default=None, help="Write parsed.json here (else stdout)")
+    parser.add_argument(
+        "--output", type=Path, default=None, help="Write parsed.json here (else stdout)"
+    )
     parser.add_argument(
         "--sequences-output",
         type=Path,
