@@ -26,6 +26,11 @@ pools:
           type: deepseek_v41_vllm
           model_config: model/config/deepseek_v41_flash.json
           fp8: true
+          # The capture's --max-model-len. Omitted, it defaults to the
+          # checkpoint's 1048576; it is a timing input (the FlashMLA prefill
+          # workspace, the indexer's padded logits rows), so this pin keeps the
+          # captured 131072 rows.
+          max_model_len: 131072
           # Recorded per-token expert routes from the capture's token_corpus pass.
           routing: corpus
           token_corpus_file: logs/20260924_0_dsv41_flash_capture/profile_corpus/token_corpus/manifest.json

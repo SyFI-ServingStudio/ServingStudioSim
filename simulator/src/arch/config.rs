@@ -326,6 +326,13 @@ pub enum IterArchSel {
         #[serde(default)]
         #[param(cache_key)]
         token_corpus_file: Option<String>,
+        /// vLLM `--max-model-len`: the longest request, and the extent the
+        /// FlashMLA prefill planner sizes its compressed-KV workspace for.
+        /// Omitted, the checkpoint's `max_position_embeddings` (1048576), as
+        /// vLLM defaults it; anything larger is refused.
+        #[serde(default)]
+        #[param(cache_key)]
+        max_model_len: Option<u32>,
         /// Decoder SWA bounded replay what-if (vLLM PR #58132 / SGLang
         /// `--enable-decoder-swa-bounded-replay`): layers past the last KV
         /// source run only each prefill chunk's last `sliding_window` extend
@@ -352,6 +359,13 @@ pub enum IterArchSel {
         #[serde(default)]
         #[param(cache_key)]
         token_corpus_file: Option<String>,
+        /// vLLM `--max-model-len`: the longest request, and the extent the
+        /// FlashMLA prefill planner sizes its compressed-KV workspace for.
+        /// Omitted, the checkpoint's `max_position_embeddings` (1048576), as
+        /// vLLM defaults it; anything larger is refused.
+        #[serde(default)]
+        #[param(cache_key)]
+        max_model_len: Option<u32>,
         /// Decoder SWA bounded replay what-if (vLLM PR #58132 / SGLang
         /// `--enable-decoder-swa-bounded-replay`): layers past the last KV
         /// source run only each prefill chunk's last `sliding_window` extend
@@ -631,10 +645,19 @@ impl IterArchSel {
             | Self::Glm53VllmNvfp4DsaMoeDflash2 { max_model_len, .. }
             | Self::Glm53FlashVllmFp8KdaDsaMoe { max_model_len, .. }
             | Self::Glm52SglangNvfp4TpDsaMoe { max_model_len, .. } => Ok(*max_model_len),
-            // The arch is built at the captured deployment's `--max-model-len`.
-            Self::DeepseekV41Vllm { .. } | Self::DeepseekV41VllmSerialStreams { .. } => {
-                Ok(super::deepseek_v41_vllm::MAX_MODEL_LEN)
+            Self::DeepseekV41Vllm {
+                model,
+                max_model_len,
+                ..
             }
+            | Self::DeepseekV41VllmSerialStreams {
+                model,
+                max_model_len,
+                ..
+            } => super::deepseek_v41_vllm::resolve_max_model_len(
+                *max_model_len,
+                model.max_position_embeddings()?,
+            ),
             Self::Qwen36Local { model, .. }
             | Self::Llama3Dense { model }
             | Self::Llama3DenseTp { model, .. }
@@ -1095,6 +1118,15 @@ mod iter_tests {
             limit("glm53_flash_vllm_fp8_kda_dsa_moe", "glm53_flash", ""),
             8192
         );
+        // DeepSeek-V4.1 defaults to the checkpoint's 1M positions; the
+        // capture presets pin their 131072.
+        for arch in ["deepseek_v41_vllm", "deepseek_v41_vllm_serial_streams"] {
+            assert_eq!(limit(arch, "deepseek_v41_flash", ""), 1_048_576);
+            assert_eq!(
+                limit(arch, "deepseek_v41_flash", r#","max_model_len":131072"#),
+                131_072
+            );
+        }
 
         let attn = format!(
             r#"{{"type":"qwen3_attn_tp","model_config":"{}","fp8":false,"attn_tp_size":4}}"#,
@@ -1102,6 +1134,24 @@ mod iter_tests {
         );
         let attn: AttnArchSel = serde_json::from_str(&attn).unwrap();
         assert_eq!(attn.max_model_len().unwrap(), 40_960);
+    }
+
+    /// DeepSeek-V4.1 takes no `max_model_len` past the trained positions.
+    #[test]
+    fn deepseek_v41_refuses_a_max_model_len_past_its_positions() {
+        let raw = format!(
+            r#"{{"type":"deepseek_v41_vllm","model_config":"{}","fp8":true,"max_model_len":1048577}}"#,
+            checked_in("deepseek_v41_flash")
+        );
+        let error = serde_json::from_str::<IterArchSel>(&raw)
+            .unwrap()
+            .max_model_len()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("max_model_len must be 1..=1048576"),
+            "{error}"
+        );
     }
 
     #[test]

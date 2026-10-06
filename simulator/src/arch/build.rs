@@ -1008,6 +1008,7 @@ pub fn deepseek_v41_vllm(
     token_corpus_file: Option<&str>,
     serialize_streams: bool,
     decoder_swa_bounded_replay: bool,
+    max_model_len: Option<u32>,
     gpu: &str,
     name: &str,
     bridge: &PerfApiBridge,
@@ -1020,6 +1021,10 @@ pub fn deepseek_v41_vllm(
         gpu_name: gpu.to_string(),
         serialize_streams,
         decoder_swa_bounded_replay,
+        max_model_len: deepseek_v41_vllm::resolve_max_model_len(
+            max_model_len,
+            model_cfg.max_position_embeddings,
+        )?,
     };
     let source = ExpertDemandSource {
         kind: routing_kind,
@@ -1689,6 +1694,7 @@ pub fn build_iter_model(
             expert_popularity_file,
             token_corpus_file,
             decoder_swa_bounded_replay,
+            max_model_len,
         } => Box::new(deepseek_v41_vllm(
             model,
             *routing,
@@ -1697,6 +1703,7 @@ pub fn build_iter_model(
             token_corpus_file.as_deref(),
             false,
             *decoder_swa_bounded_replay,
+            *max_model_len,
             gpu,
             name,
             bridge,
@@ -1708,6 +1715,7 @@ pub fn build_iter_model(
             expert_popularity_file,
             token_corpus_file,
             decoder_swa_bounded_replay,
+            max_model_len,
         } => Box::new(deepseek_v41_vllm(
             model,
             *routing,
@@ -1716,6 +1724,7 @@ pub fn build_iter_model(
             token_corpus_file.as_deref(),
             true,
             *decoder_swa_bounded_replay,
+            *max_model_len,
             gpu,
             name,
             bridge,

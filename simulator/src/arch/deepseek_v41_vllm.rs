@@ -87,9 +87,9 @@ const INDEX_SOURCE_LAYERS: [u32; 8] = [2, 8, 14, 20, 24, 28, 32, 36];
 const CANDIDATE_SOURCE_LAYER: u32 = 20;
 const ENGRAM_LAYERS: [u32; 2] = [1, 14];
 
-// Deployment identity (capture 2 `profile.yaml` / server log).
-/// `--max-model-len 131072`.
-pub(crate) const MAX_MODEL_LEN: u32 = 131_072;
+// Deployment identity (capture 2 `profile.yaml` / server log). Its
+// `--max-model-len 131072` is the selector's `max_model_len`, which the
+// capture presets pin; see [`resolve_max_model_len`].
 /// `max_num_batched_tokens` (= `chunk_size` 2048).
 const MAX_BATCHED_TOKENS: u32 = 2048;
 /// `--block-size 128`: one KV page; an index page holds `128 / ratio` keys.
@@ -153,6 +153,9 @@ pub struct DeepseekV41ModelCfg {
     pub moe_intermediate_size: u32,
     pub num_shared_experts: u32,
     pub vocab_size: u32,
+    /// The longest context the checkpoint is trained for, and vLLM's default
+    /// `--max-model-len`.
+    pub max_position_embeddings: u32,
     /// Body layers only (the three MTP entries are dropped); 0, 1 or 2.
     pub compress_ratios: Vec<u32>,
     pub kv_source_layer_ids: Vec<u32>,
@@ -340,6 +343,7 @@ impl DeepseekV41ModelCfg {
             moe_intermediate_size: raw.moe_intermediate_size,
             num_shared_experts: raw.n_shared_experts,
             vocab_size: raw.vocab_size,
+            max_position_embeddings: raw.max_position_embeddings,
             compress_ratios: ratios,
             kv_source_layer_ids: raw.kv_source_layer_ids,
             index_source_layer_ids: raw.index_source_layer_ids,
@@ -506,6 +510,30 @@ pub struct DeepseekV41VllmParallel {
     pub serialize_streams: bool,
     /// Decoder SWA bounded replay (what-if; see [`BoundedReplay`]).
     pub decoder_swa_bounded_replay: bool,
+    /// Resolved `--max-model-len` (see [`resolve_max_model_len`]).
+    pub max_model_len: u32,
+}
+
+/// The selector's `max_model_len`, defaulted to the checkpoint's
+/// `max_position_embeddings` as vLLM does. vLLM refuses a larger value without
+/// `VLLM_ALLOW_LONG_MAX_MODEL_LEN`, and nothing past the trained positions is
+/// modeled, so neither is it accepted here.
+///
+/// The value is a timing input, not only an admission bound: the FlashMLA
+/// prefill planner sizes its compressed-KV workspace for `max_model_len /
+/// ratio` keys and the indexer's decode logits rows are padded to it, so the
+/// capture presets pin the captured 131072 to reproduce its rows.
+pub(crate) fn resolve_max_model_len(
+    requested: Option<u32>,
+    max_position_embeddings: u32,
+) -> Result<u32> {
+    let max_model_len = requested.unwrap_or(max_position_embeddings);
+    ensure!(
+        (1..=max_position_embeddings).contains(&max_model_len),
+        "{ARCH_KIND}: max_model_len must be 1..={max_position_embeddings} \
+         (the checkpoint's max_position_embeddings), got {max_model_len}"
+    );
+    Ok(max_model_len)
 }
 
 /// Decoder SWA bounded replay: a counterfactual with no framework capture
@@ -658,6 +686,12 @@ pub fn build_configs(
     if let Some(reason) = fused_all_reduce_refusal(ALL_REDUCE_BACKENDS, &parallel.gpu_name, TP_SIZE)
     {
         return Err(fit_failed(reason));
+    }
+    if !(1..=model.max_position_embeddings).contains(&parallel.max_model_len) {
+        return Err(fit_failed(format!(
+            "max_model_len must be 1..={} (max_position_embeddings), got {}",
+            model.max_position_embeddings, parallel.max_model_len
+        )));
     }
     if demand.num_experts() != model.num_experts as usize {
         return Err(fit_failed(format!(
@@ -825,7 +859,7 @@ fn layer_config(
                 KV_BLOCK_SIZE
             },
             swa_block_size: SWA_BLOCK_SIZE,
-            max_model_len: MAX_MODEL_LEN,
+            max_model_len: parallel.max_model_len,
             max_num_batched_tokens: MAX_BATCHED_TOKENS,
             prefill_chunk_size: PREFILL_CHUNK_SIZE,
             gpu_name: gpu.clone(),
@@ -979,6 +1013,8 @@ pub struct DeepseekV41VllmModel {
     plan: Vec<PlanNode>,
     head: DeepseekV41HeadTpWorklet,
     serialize_streams: bool,
+    /// Longest request context; longer inputs are refused.
+    max_model_len: u32,
     total_kv_bytes_per_token: u64,
     bounded_replay: Option<BoundedReplay>,
     late_bodies: Vec<bool>,
@@ -992,6 +1028,7 @@ pub fn build(
     bridge: &PerfApiBridge,
 ) -> std::result::Result<DeepseekV41VllmModel, BuildError> {
     let serialize_streams = resolved.layer0.attention.raw_cfg.serialize_streams;
+    let max_model_len = resolved.layer0.attention.raw_cfg.max_model_len;
     let bodies = resolved
         .bodies
         .into_iter()
@@ -1013,6 +1050,7 @@ pub fn build(
         plan: resolved.plan,
         head: DeepseekV41HeadTpWorklet::build(format!("{name}.head"), resolved.head, bridge)?,
         serialize_streams,
+        max_model_len,
         total_kv_bytes_per_token: resolved.total_kv_bytes_per_token,
         bounded_replay: resolved.bounded_replay,
         late_bodies: resolved.late_bodies,
@@ -1091,7 +1129,7 @@ impl DeepseekV41VllmModel {
     }
 
     fn eval_into(&self, batch: &UnifiedArchInput, evaluator: &mut Evaluator) {
-        let input = normalize_input(batch)
+        let input = normalize_input(batch, self.max_model_len)
             .unwrap_or_else(|reason| panic!("invalid DeepSeek-V4.1 input: {reason}"));
         let tokens = DeepseekV41PrologueTpWorkletInput {
             num_tokens: input.rows,
@@ -1197,7 +1235,10 @@ pub fn cudagraph_rows(tokens: u32) -> u32 {
     }
 }
 
-fn normalize_input(input: &UnifiedArchInput) -> std::result::Result<NormalizedInput, String> {
+fn normalize_input(
+    input: &UnifiedArchInput,
+    max_model_len: u32,
+) -> std::result::Result<NormalizedInput, String> {
     if input.groups.len() != 1 {
         return Err(format!(
             "TP4 attention takes exactly one group, got {}",
@@ -1211,9 +1252,10 @@ fn normalize_input(input: &UnifiedArchInput) -> std::result::Result<NormalizedIn
         let context = prefix
             .checked_add(append)
             .ok_or_else(|| format!("prefill request {request} context overflows u32"))?;
-        if append == 0 || context > MAX_MODEL_LEN {
+        if append == 0 || context > max_model_len {
             return Err(format!(
-                "prefill request {request} ({prefix}, {append}) must append 1..=max_model_len"
+                "prefill request {request} ({prefix}, {append}) must append 1..=max_model_len \
+                 {max_model_len}"
             ));
         }
         prefill_tokens = prefill_tokens
@@ -1285,6 +1327,8 @@ mod tests {
 
     /// The GPU of the capture the profile rows were measured for.
     const GPU_NAME: &str = "NVIDIA B200";
+    /// The capture's `--max-model-len`, which its profile rows are keyed on.
+    const CAPTURED_MAX_MODEL_LEN: u32 = 131_072;
     const CONFIG: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/model/config/deepseek_v41_flash.json"
@@ -1314,6 +1358,7 @@ mod tests {
             gpu_name: GPU_NAME.into(),
             serialize_streams: false,
             decoder_swa_bounded_replay: false,
+            max_model_len: CAPTURED_MAX_MODEL_LEN,
         }
     }
 
@@ -1637,36 +1682,89 @@ mod tests {
 
     #[test]
     fn input_pads_to_the_graph_size_and_gates_the_aux_stream() {
-        let decode = normalize_input(&UnifiedArchInput {
-            groups: vec![group(vec![], vec![1000; 48])],
-            tokens_per_source_rank: vec![],
-        })
+        let decode = normalize_input(
+            &UnifiedArchInput {
+                groups: vec![group(vec![], vec![1000; 48])],
+                tokens_per_source_rank: vec![],
+            },
+            CAPTURED_MAX_MODEL_LEN,
+        )
         .unwrap();
         assert_eq!((decode.rows, decode.logits_rows), (48, 48));
         assert!(decode.attention.aux_stream_live);
 
-        let mixed = normalize_input(&UnifiedArchInput {
-            groups: vec![group(vec![(512, 126)], vec![900; 48])],
-            tokens_per_source_rank: vec![],
-        })
+        let mixed = normalize_input(
+            &UnifiedArchInput {
+                groups: vec![group(vec![(512, 126)], vec![900; 48])],
+                tokens_per_source_rank: vec![],
+            },
+            CAPTURED_MAX_MODEL_LEN,
+        )
         .unwrap();
         assert_eq!((mixed.rows, mixed.logits_rows), (176, 49));
         assert!(!mixed.attention.aux_stream_live);
         assert_eq!(mixed.attention.prefill_query_context_pairs, [(126, 638)]);
 
-        let big_decode = normalize_input(&UnifiedArchInput {
-            groups: vec![group(vec![], vec![10; 65])],
-            tokens_per_source_rank: vec![],
-        })
+        let big_decode = normalize_input(
+            &UnifiedArchInput {
+                groups: vec![group(vec![], vec![10; 65])],
+                tokens_per_source_rank: vec![],
+            },
+            CAPTURED_MAX_MODEL_LEN,
+        )
         .unwrap();
         assert_eq!(big_decode.rows, 72);
         assert!(!big_decode.attention.aux_stream_live);
 
-        assert!(normalize_input(&UnifiedArchInput {
-            groups: vec![ArchGroupInput::default(), ArchGroupInput::default()],
-            tokens_per_source_rank: vec![],
-        })
+        assert!(normalize_input(
+            &UnifiedArchInput {
+                groups: vec![ArchGroupInput::default(), ArchGroupInput::default()],
+                tokens_per_source_rank: vec![],
+            },
+            CAPTURED_MAX_MODEL_LEN,
+        )
         .is_err());
+    }
+
+    /// `max_model_len` defaults to the checkpoint's 1M positions, refuses more,
+    /// and bounds each prefill request's context.
+    #[test]
+    fn max_model_len_defaults_to_the_positions_and_bounds_requests() {
+        let cfg = model_cfg();
+        assert_eq!(cfg.max_position_embeddings, 1_048_576);
+        let default = resolve_max_model_len(None, cfg.max_position_embeddings).unwrap();
+        assert_eq!(default, 1_048_576);
+        assert_eq!(
+            resolve_max_model_len(Some(131_072), cfg.max_position_embeddings).unwrap(),
+            131_072
+        );
+        for bad in [0, 1_048_577] {
+            assert!(resolve_max_model_len(Some(bad), cfg.max_position_embeddings).is_err());
+            let over = DeepseekV41VllmParallel {
+                max_model_len: bad,
+                ..parallel()
+            };
+            assert!(build_configs(&cfg, &over, &uniform_demand()).is_err());
+        }
+        // The resolved value reaches every attention config.
+        let full = DeepseekV41VllmParallel {
+            max_model_len: default,
+            ..parallel()
+        };
+        let configs = build_configs(&cfg, &full, &uniform_demand()).unwrap();
+        assert!(std::iter::once(&configs.layer0)
+            .chain(&configs.bodies)
+            .all(|body| body.attention.max_model_len == default));
+
+        // A request whose context is exactly max_model_len is served; one
+        // token more is refused.
+        let last_chunk = one_group(vec![(default - 2048, 2048)], vec![]);
+        assert!(normalize_input(&last_chunk, default).is_ok());
+        let past = one_group(vec![(default - 2047, 2048)], vec![]);
+        let error = normalize_input(&past, default).err().unwrap();
+        assert!(error.contains("max_model_len 1048576"), "{error}");
+        // The capture's pin refuses what the default serves.
+        assert!(normalize_input(&last_chunk, CAPTURED_MAX_MODEL_LEN).is_err());
     }
 
     fn replay_parallel() -> DeepseekV41VllmParallel {
@@ -1745,7 +1843,8 @@ mod tests {
     #[test]
     fn bounded_replay_input_keeps_the_last_window_of_each_chunk() {
         let reduce = |prefill, decode| {
-            let full = normalize_input(&one_group(prefill, decode)).unwrap();
+            let full =
+                normalize_input(&one_group(prefill, decode), CAPTURED_MAX_MODEL_LEN).unwrap();
             let late = bounded_replay_input(&full, 128);
             (full, late)
         };
