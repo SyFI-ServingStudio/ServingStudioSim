@@ -226,6 +226,38 @@ serial dependence alone does not prove that a shared weight must leave cache
 and be fetched again. Kernel timing and CostTree approximations never determine
 the necessary FLOP formulas.
 
+### DFlash2 proposer
+
+`glm53_vllm_nvfp4_dsa_moe_dflash2` verifies with the same GLM-5.2 NVFP4 target
+rows, but its proposer is a separate checkpoint (`model/config/glm53_dflash2.json`,
+a verbatim copy of `incoai/GLM-5.3-DFlash2`'s config) that drafts a whole block in
+one pass, so there is no recurrence. `floors.py` attaches it to the target model
+by arch type (`models/dflash2.py`; the checkpoint's own MTP layer is not run),
+and `speculative.py` builds three stages from the same geometry:
+
+- `dflash2_context`, over every target row `C`: `fc` (six target layers'
+  hidden states, `6·hidden -> hidden`), `hidden_norm`, the K/V halves of each
+  draft layer's `qkv_proj`, and the compulsory draft-cache writes
+  (`C · layers · 2 · kv_heads · head_dim` bytes at the served FP8 cache dtype).
+- `dflash2_draft`, over `R · (k + 1)` query rows: six Qwen3 layers with their
+  two grouped-convolution coefficient projections and base kernels, and a
+  non-causal block attending its context plus itself inside the symmetric
+  sliding window (`attention/dflash2.py`: per request
+  `Σ_{t<q} min(context + q, W + t)` pairs, `min(context, W - 1)` cached keys
+  read; the block's own K/V are not persistent). The attention row is pinned
+  to FP8 because the engine attends the FP8 cache with an FP8 query.
+- `dflash2_select`, over the `R · k` drafted positions: the shared target
+  `lm_head` (FLOPs only; its weights are read once by the target row), the
+  rank-256 `hidden_projection`, `2 · top_k² · rank` edge-scoring FLOPs, and
+  the codebook rows gathered (anchor plus `k − 1` positions' candidates for
+  predecessors, `k` positions' for successors, each capped at the vocabulary).
+
+The draft's embedding (the target's table) and its convolution, norm, RoPE,
+top-k and selector-walk math carry no row, by the same conventions as above.
+Every scheduled request drafts, prefilling or verifying. The simulator prices
+no separate draft final norm, so `glm53_vllm_nvfp4_dsa_moe_dflash2.json` maps
+that learned scale to the selector's `lm_head` location it feeds.
+
 Request-side admission/completion telemetry separately records completed rounds,
 emitted outputs, resident KV, and pending work. Conservation uses those facts,
 not an average acceptance-rate estimate, including at a mid-iteration stop.

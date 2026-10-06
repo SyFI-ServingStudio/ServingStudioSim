@@ -2305,7 +2305,9 @@ def test_glm53_locked_floor_uses_the_served_fp8_mla_cache(tmp_path):
         {"occurrences": 2, "totals": _g53_geometry_totals([], [2048] * 32)},
         {"occurrences": 1, "totals": _g53_geometry_totals([(0, 2048)], [])},
     ]
-    result = work_floors.compute_locked_compositions(tmp_path, {"main/0": _columns(shapes)})["main/0"]
+    result = work_floors.compute_locked_compositions(tmp_path, {"main/0": _columns(shapes)})[
+        "main/0"
+    ]
     assert "error" not in result, result
     assert result["composition"]["affine_bases"] == 0
     rows = {segment["name"]: segment for segment in result["segments"]}
@@ -2356,3 +2358,137 @@ def test_glm53_location_map_consumes_every_semantic_row_once():
     assert rules["unified.first_kda_dense.attn_mhc_pre"][0] == "first_kda_dense.mhc.attn_fn"
     assert rules["unified.final_mhc_post"] == ["mhc.final_post"]
     assert rules["unified.hc_expand"] == rules["unified.hc_contract_mean"] == []
+
+
+# --- DFlash2 proposer (glm53_vllm_nvfp4_dsa_moe_dflash2) -------------------------
+#
+# Draft checkpoint incoai/GLM-5.3-DFlash2 (`model/config/glm53_dflash2.json`): six
+# non-causal sliding-window Qwen3 layers, hidden 6144, intermediate 12288, 64 query /
+# 8 KV heads of 128, window 2048, two-tap grouped convolutions of group 16, six
+# target layers fused by `fc`, a rank-256 top-16 candidate selector. It ships no
+# embedding or lm_head: vLLM shares the target's.
+
+GLM53_DFLASH2 = Path(__file__).resolve().parents[1] / "model" / "config" / "glm53_dflash2.json"
+DFLASH2_SNAPSHOT = Path(
+    "/raid/hf/hub/models--incoai--GLM-5.3-DFlash2/snapshots/425aa615ce320caac34400208b30808c8f14f76c"
+)
+D_H, D_I, D_HQ, D_HKV, D_HD, D_L, D_V, D_W = 6144, 12288, 64, 8, 128, 6, 154880, 2048
+D_CONV_N = 2 * 2 * (D_H // 16)  # kernel_projection: hidden -> 2 * taps * groups
+D_CONV_BASE = 2 * 2 * D_H  # base_kernel [2, taps, hidden]
+D_RANK, D_TOPK = 256, 16
+D_LAYER_PARAMS = (
+    (D_HQ + 2 * D_HKV) * D_HD * D_H  # q/k/v
+    + D_H * D_HQ * D_HD  # o
+    + 3 * D_H * D_I  # gate, up, down
+    + 2 * D_CONV_N * D_H  # attention_conv / mlp_conv projections
+    + 2 * D_CONV_BASE
+    + 2 * D_H  # input / post-attention norms
+    + 2 * D_HD  # q_norm, k_norm
+)
+D_PARAMS = (
+    D_L * D_LAYER_PARAMS
+    + D_H * 6 * D_H  # fc over six target layers
+    + 2 * D_H  # hidden_norm, final norm
+    + D_RANK * D_H  # selector hidden_projection
+    + 2 * D_V * D_RANK  # predecessor / successor codebooks
+)
+
+
+@pytest.fixture(scope="module")
+def dflash2():
+    return work_floors._dflash2_model(str(GLM52_NVFP4), str(GLM53_DFLASH2), D_W)
+
+
+def _dflash2_workload(prefill, decode, depth=7):
+    from model.work.speculative import aggregate_workload
+
+    geometry = {"draft_tokens": depth, "max_model_len": 8192, "prefill": prefill, "decode": decode}
+    totals = {
+        "matmul_tokens": sum(q for _, q in prefill) + sum(q for _, q in decode),
+        "prefill_tokens": sum(q for _, q in prefill),
+        "prefill_requests": len(prefill),
+        "prefill_pairs": sum(q * p + q * (q + 1) // 2 for p, q in prefill),
+        "prefill_cached": sum(p for p, _ in prefill),
+        "decode_passes": len(decode),
+        "decode_kv": sum(kv - q for kv, q in decode),
+        "speculative_geometry": {json.dumps(geometry): 1},
+    }
+    return aggregate_workload(totals, "dflash2")
+
+
+def test_dflash2_window_pairs_match_brute_force():
+    from model.work.attention.dflash2 import window_pairs
+
+    for q, context, window in [
+        (8, 0, 2048),
+        (8, 100, 16),
+        (8, 2040, 2048),
+        (3, 7, 4),
+        (8, 9000, 2048),
+    ]:
+        keys = context + q
+        brute = sum(
+            1
+            for i in range(q)
+            for key in range(keys)
+            if abs((context + i) - key) < window  # HF/vLLM symmetric non-causal window
+        )
+        assert window_pairs(q, keys, window) == brute
+
+
+def test_dflash2_draft_params_are_hand_derived(dflash2):
+    assert D_PARAMS == 2_459_424_256
+    target = load_model(GLM52_NVFP4)
+    wl = _dflash2_workload([[0, 16]], [[100, 8]])
+    body = target.label(replace(wl, stages={})).params["total"]
+    assert dflash2.label(wl).params["total"] - body == D_PARAMS
+    # The proposer replaces the checkpoint's MTP layer, which the target never runs.
+    assert not any(stack.stage and stack.stage.startswith("mtp") for stack in dflash2.layers)
+
+
+@pytest.mark.skipif(not DFLASH2_SNAPSHOT.exists(), reason="GLM-5.3-DFlash2 checkpoint not present")
+def test_dflash2_params_match_the_safetensors_header():
+    import struct
+
+    with open(DFLASH2_SNAPSHOT / "model.safetensors", "rb") as handle:
+        header = json.loads(handle.read(struct.unpack("<Q", handle.read(8))[0]))
+    header.pop("__metadata__", None)
+    assert sum(math.prod(entry["shape"]) for entry in header.values()) == D_PARAMS
+    assert not any("embed_tokens" in name or "lm_head" in name for name in header)
+
+
+def test_dflash2_stage_flop_and_byte_goldens(dflash2):
+    # Two verify requests ending at contexts 100 and 4104, one 16-token prompt:
+    # R = 3 requests, k = 7, C = 32 context rows, 24 draft rows, 21 scored positions.
+    label = dflash2.label(_dflash2_workload([[0, 16]], [[100, 8], [4104, 8]]))
+    seg = {s.name: s for s in label.segments}
+    assert seg["dflash2_context.fc"].flops_total == 2 * 32 * D_H * 6 * D_H
+    assert seg["dflash2_context.fc"].bytes_total == D_H * 6 * D_H * 2
+    assert seg["dflash2_context_kv.kv_proj"].flops_total == D_L * 2 * 32 * 2 * D_HKV * D_HD * D_H
+    # FP8 cache (`--kv-cache-dtype fp8_e4m3`): one byte per element, K and V.
+    assert seg["dflash2_context_kv.kv_cache_append"].bytes_total == D_L * 32 * 2 * D_HKV * D_HD
+    assert seg["dflash2_draft.qkv"].flops_total == D_L * 2 * 24 * (D_HQ + 2 * D_HKV) * D_HD * D_H
+    assert seg["dflash2_draft.attention_conv_proj"].flops_total == D_L * 2 * 24 * D_CONV_N * D_H
+    # Blocks of 8 over 100+8 and 16+8 keys see every key; over 4104+8 keys each
+    # query sees min(4112, 2048 + t), t = 0..7: 8 * 2048 + 28.
+    pairs = 8 * 108 + (8 * 2048 + 28) + 8 * 24
+    assert seg["dflash2_draft.attn"].flops_total == D_L * 4 * D_HQ * D_HD * pairs
+    assert seg["dflash2_draft.attn"].compute_dtype == "fp8"
+    # Cached context keys read: the window's union, min(context, W - 1).
+    assert seg["dflash2_draft.attn"].bytes_total == D_L * (100 + 2047 + 16) * 2 * D_HKV * D_HD
+    assert seg["dflash2_select.lm_head"].flops_total == 2 * 21 * D_H * D_V
+    assert seg["dflash2_select.lm_head"].bytes_total == 0  # the target's head, read once
+    assert seg["dflash2_select.hidden_projection"].flops_total == 2 * 21 * D_RANK * D_H
+    assert seg["dflash2_select.edge_scores"].flops_total == 2 * 21 * D_TOPK * D_TOPK * D_RANK
+    # Predecessors: an anchor plus the candidates of positions 1..6; successors:
+    # the candidates of all seven positions; each a BF16 rank-256 row.
+    gathered = (3 * (1 + 6 * D_TOPK) + 21 * D_TOPK) * D_RANK * 2
+    assert seg["dflash2_select.codebook_gather"].bytes_total == gathered
+    # The target verifies every row and samples each one.
+    assert seg["lm_head"].flops_total == 2 * (1 + 16) * D_H * D_V
+    assert all(s.compute_dtype in ("bf16", "fp8") for name, s in seg.items() if "dflash2" in name)
+
+
+def test_dflash2_rejects_a_sliding_window_the_checkpoint_does_not_have():
+    with pytest.raises(ValueError, match="draft_sliding_window"):
+        work_floors._dflash2_model(str(GLM52_NVFP4), str(GLM53_DFLASH2), 4096)
