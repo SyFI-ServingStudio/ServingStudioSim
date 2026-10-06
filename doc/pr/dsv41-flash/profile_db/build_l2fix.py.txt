@@ -1,0 +1,24 @@
+import sqlite3,csv
+D='tmp/dsv41/merge2/'
+keys=[(r['gpu'],r['backend'],bytes.fromhex(r['args_hash'])) for r in csv.DictReader(open('tmp/dsv41/merge/conflicts_main_kept.csv')) if r['table']=='elementwise']
+c=sqlite3.connect(D+'profile_l2fix_copy.db'); c.row_factory=sqlite3.Row
+c.execute("attach 'tmp/dsv41/merge/work_v3.db' as w")
+cols=[r[1] for r in c.execute('pragma main.table_info(elementwise)') if r[1]!='id']
+cl=','.join(f'"{x}"' for x in cols)
+n=0; rk=set(); same=0
+for g,b,a in keys:
+    src=c.execute(f'select {cl} from w.elementwise where gpu_name=? and backend=? and args_hash=?',(g,b,a)).fetchall()
+    old=c.execute('select time_ms from main.elementwise where gpu_name=? and backend=? and args_hash=?',(g,b,a)).fetchall()
+    assert len(src)==1 and len(old)==1
+    same+= old[0][0]==src[0]['time_ms']
+    c.execute('delete from main.elementwise where gpu_name=? and backend=? and args_hash=?',(g,b,a))
+    c.execute(f'insert into main.elementwise ({cl}) values ({",".join("?"*len(cols))})',tuple(src[0]))
+    rk.add(src[0]['run_key']); n+=1
+pc=[r[1] for r in c.execute('pragma main.table_info(_profile_run)') if r[1]!='id']
+missing=[k for k in rk if not c.execute('select 1 from main._profile_run where run_key=?',(k,)).fetchone()]
+for k in missing:
+    r=c.execute(f'select {",".join(pc)} from w._profile_run where run_key=?',(k,)).fetchone()
+    c.execute(f'insert into main._profile_run ({",".join(pc)}) values ({",".join("?"*len(pc))})',tuple(r))
+print('replaced',n,'same time',same,'run_keys',len(rk),'missing run rows added',len(missing))
+for k in rk: print(' run', c.execute('select profiler_git_hash from main._profile_run where run_key=?',(k,)).fetchone()[0])
+c.commit()

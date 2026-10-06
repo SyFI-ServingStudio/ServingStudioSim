@@ -1,0 +1,27 @@
+# vLLM DeepSeek-V4.1-Flash on four B200s, TP4 attention with EP4 experts,
+# chunked prefill at 2048 tokens, as capture 2's server ran
+# (logs/20260924_0_dsv41_flash_capture/profile_nsys_cg2048.yaml: vLLM fork,
+# TP4/EP4 on 4x B200, --max-model-len 131072, --max-num-batched-tokens 2048).
+# max_model_len is that server's 131072: attn_gpu_memory_gb is its KV pool
+# (603004 blocks x 135168 B per GPU, the smallest rank's), and at vLLM's
+# default 1048576 the FlashMLA workspace takes about 4.2 GB more of it.
+# gpu_time_multiplier is the capture-2 kernel alignment's (al_6e04cf7b...).
+# decoder_swa_bounded_replay is the arch preset's what-if (no capture behind it).
+deployment: unified
+pools:
+  main:
+    groups:
+      - replicas: ${replicas}
+        arch:
+          preset: deepseek_v41_vllm_serial_streams
+          max_model_len: 131072
+          decoder_swa_bounded_replay: ${decoder_swa_bounded_replay}
+        worker:
+          type: chunked_prefill
+          max_batch_tokens: 2048
+          batch_policy: mix
+          gpu_time_multiplier: 1.0361
+          attn_gpu_memory_gb: 81.506844672
+sweep:
+  replicas: [1, 2]
+  decoder_swa_bounded_replay: [false, true]
