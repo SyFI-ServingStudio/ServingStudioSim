@@ -32,6 +32,16 @@
 //! fold into the same per-sublayer `Max`, a slight over-estimate of the true
 //! max-of-sums between collectives when ranks are unevenly loaded.
 //!
+//! The NVFP4 checkpoint (`glm53_flash_vllm_nvfp4_dp_attn_ep_moe`) takes the
+//! modular TRT-LLM NVFP4 experts instead: the monolithic kernel declines a
+//! DP + EP config (`experts/trtllm_nvfp4_moe.py:476-481`), so vLLM's grouped
+//! top-k selects the experts on each rank first (`moe_runner.py:620-633`),
+//! the local tokens are NVFP4-quantized, one all-gatherv carries the packed
+//! activations, block scales, top-k weights and IDs
+//! (`prepare_finalize/naive_dp_ep.py:112-185`, `moe_ep_quantized_all_gather`),
+//! and `trtllm_fp4_block_scale_routed_moe` runs with the routing precomputed.
+//! The combine is the same bf16 reduce-scatterv.
+//!
 //! At or below 256 local tokens vLLM runs the shared expert on an aux stream,
 //! launched before the gate and joined after the combine; that copy overlaps
 //! the dispatch, routed experts and combine (`Max{overlap}` as in the TP arch).
@@ -41,18 +51,19 @@ use anyhow::Result;
 use crate::arch::contract::{IterwiseUnifiedModel, UnifiedArchInput};
 use crate::arch::glm53_flash_vllm_fp8_kda_dsa_moe::{
     self as tp_arch, atomic, graph_padded_tokens, push, AttnKind, Boundary, FfnKind,
-    Glm53FlashLayerGroup, Glm53FlashModelCfg, Glm53FlashVllmConfigs, Glm53FlashVllmParallel,
-    ACTIVATION_DTYPE, SHARED_EXPERTS_STREAM_OVERLAP, SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD,
+    Glm53FlashLayerGroup, Glm53FlashModelCfg, Glm53FlashQuant, Glm53FlashVllmConfigs,
+    Glm53FlashVllmParallel, ACTIVATION_DTYPE, SHARED_EXPERTS_STREAM_OVERLAP,
+    SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD,
 };
 use crate::op::mhc::{MhcTerminalPostConfig, MhcTerminalPostInput, MhcTerminalPostOp};
 use crate::op::Op;
 use crate::timing::bridge::DType;
 use crate::timing::expert_demand::ExpertDemand;
 use crate::timing::kernels::{
-    ElementwiseKernel, ElementwiseKernelInput, Fp8PerTokenGroupQuantKernel,
-    Fp8PerTokenGroupQuantKernelInput, MhcFusedPostPreRmsNormKernel, MhcPreRmsNormKernel,
-    MhcRmsNormKernelInput, MoeEpAllGatherKernel, MoeEpAllGatherKernelConfig,
-    MoeEpCollectiveKernelInput, MoeEpReduceScatterKernel, MoeEpReduceScatterKernelConfig,
+    ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput,
+    MhcFusedPostPreRmsNormKernel, MhcPreRmsNormKernel, MhcRmsNormKernelInput, MoeEpAllGatherKernel,
+    MoeEpAllGatherKernelConfig, MoeEpCollectiveKernelInput, MoeEpQuantizedAllGatherKernel,
+    MoeEpQuantizedAllGatherKernelConfig, MoeEpReduceScatterKernel, MoeEpReduceScatterKernelConfig,
     Nvfp4FusedMoeKernel, Nvfp4FusedMoeKernelInput, RmsNormKernel, RmsNormKernelInput,
     SingleGemmKernel, SingleGemmKernelInput,
 };
@@ -61,14 +72,18 @@ use crate::timing::{
     LeafMetrics, PerfApiBridge, SlotInput,
 };
 use crate::worklet::{
-    Glm53DsaAttnLocalWorklet, Glm53DsaAttnLocalWorkletInput, Glm53Fp8MlpLocalWorklet,
-    Glm53Fp8MlpLocalWorkletInput, Glm53KdaAttnLocalWorklet, Glm53KdaAttnLocalWorkletInput,
-    Glm53MoeRouterLocalWorklet, Glm53MoeRouterLocalWorkletInput, Glm53RoutedMoeLocalWorklet,
-    Glm53RoutedMoeLocalWorkletConfig, Glm53RoutedMoeLocalWorkletResolved,
+    Glm53ActivationQuant, Glm53DsaAttnLocalWorklet, Glm53DsaAttnLocalWorkletInput,
+    Glm53KdaAttnLocalWorklet, Glm53KdaAttnLocalWorkletInput, Glm53MlpLocalWorklet,
+    Glm53MlpLocalWorkletInput, Glm53MoeRouterLocalWorklet, Glm53MoeRouterLocalWorkletInput,
+    Glm53RoutedMoeLocalWorklet, Glm53RoutedMoeLocalWorkletConfig,
+    Glm53RoutedMoeLocalWorkletResolved,
 };
 
 const ARCH_KIND: &str = "glm53_flash_vllm_fp8_dp_attn_ep_moe";
 const COLLECTIVE_BACKENDS: &[&str] = &["vllm_pynccl"];
+/// The NVFP4 modular experts take the routing chosen before the dispatch.
+const NVFP4_ROUTED_MOE_BACKENDS: &[&str] = &["flashinfer_trtllm_routed_sm100"];
+const ROUTER_SELECT_BACKENDS: &[&str] = &["triton"];
 /// vLLM V1's default `max_num_batched_tokens` for chunked prefill: one rank's
 /// scheduler budget, which bounds the collectives' profiled token grid.
 const RANK_TOKEN_BUDGET: u32 = 8192;
@@ -91,8 +106,20 @@ pub struct Glm53FlashDpAttnEpConfigs {
     pub parallel: Glm53FlashDpAttnEpParallel,
     /// One per EP rank, ranked by routed workload.
     pub routed: Vec<Glm53RoutedMoeLocalWorkletConfig>,
-    pub dispatch: MoeEpAllGatherKernelConfig,
+    pub dispatch: Glm53FlashDispatchConfig,
+    /// vLLM's grouped top-k ahead of an NVFP4 dispatch: fp32 logits and bias
+    /// in, top-k IDs and weights out. FP8 routes inside the fused MoE.
+    pub router_select: Option<ElementwiseKernelConfig>,
     pub combine: MoeEpReduceScatterKernelConfig,
+}
+
+/// The MoE dispatch all-gather for the checkpoint's routed experts.
+#[derive(Clone, Debug)]
+pub enum Glm53FlashDispatchConfig {
+    /// FP8 activations, fp32 router logits and block scales.
+    Fp8(MoeEpAllGatherKernelConfig),
+    /// Packed NVFP4 activations, E4M3 group scales, top-k weights and IDs.
+    Nvfp4(MoeEpQuantizedAllGatherKernelConfig),
 }
 
 pub fn build_configs(
@@ -121,21 +148,52 @@ pub fn build_configs(
     )?;
     let mut template = local.routed[0].clone();
     template.ep_size = dp;
+    if model.quant == Glm53FlashQuant::Nvfp4 {
+        template.fused_moe_backends = NVFP4_ROUTED_MOE_BACKENDS.to_vec();
+    }
     let routed = Glm53RoutedMoeLocalWorkletConfig::split_for_ep(template, demand.clone());
     let gpu = parallel.gpu_name.clone();
     let max_total_tokens = RANK_TOKEN_BUDGET * u32::from(dp);
+    let (dispatch, router_select) = match model.quant {
+        Glm53FlashQuant::Fp8Block => (
+            Glm53FlashDispatchConfig::Fp8(MoeEpAllGatherKernelConfig {
+                backends: COLLECTIVE_BACKENDS.to_vec(),
+                gpu_name: gpu.clone(),
+                num_gpus: dp.into(),
+                hidden_size: model.hidden.into(),
+                num_experts: model.n_routed_experts.into(),
+                hidden_dtype: DType::Fp8E4m3,
+                router_dtype: DType::Fp32,
+                fabric: "nvlink".into(),
+                max_total_tokens,
+            }),
+            None,
+        ),
+        Glm53FlashQuant::Nvfp4 => {
+            let fp32 = DType::Fp32.size_bytes();
+            (
+                Glm53FlashDispatchConfig::Nvfp4(MoeEpQuantizedAllGatherKernelConfig {
+                    backends: COLLECTIVE_BACKENDS.to_vec(),
+                    gpu_name: gpu.clone(),
+                    num_gpus: dp.into(),
+                    hidden_size: model.hidden.into(),
+                    top_k: model.num_experts_per_tok.into(),
+                    activation_dtype: DType::Nvfp4E2m1,
+                    fabric: "nvlink".into(),
+                    max_total_tokens,
+                }),
+                Some(ElementwiseKernelConfig {
+                    backends: ROUTER_SELECT_BACKENDS.to_vec(),
+                    gpu_name: gpu.clone(),
+                    input_bytes_per_token: (2 * model.n_routed_experts * fp32).into(),
+                    output_bytes_per_token: (model.num_experts_per_tok * (fp32 + 4)).into(),
+                }),
+            )
+        }
+    };
     Ok(Glm53FlashDpAttnEpConfigs {
-        dispatch: MoeEpAllGatherKernelConfig {
-            backends: COLLECTIVE_BACKENDS.to_vec(),
-            gpu_name: gpu.clone(),
-            num_gpus: dp.into(),
-            hidden_size: model.hidden.into(),
-            num_experts: model.n_routed_experts.into(),
-            hidden_dtype: DType::Fp8E4m3,
-            router_dtype: DType::Fp32,
-            fabric: "nvlink".into(),
-            max_total_tokens,
-        },
+        dispatch,
+        router_select,
         combine: MoeEpReduceScatterKernelConfig {
             backends: COLLECTIVE_BACKENDS.to_vec(),
             gpu_name: gpu,
@@ -179,9 +237,10 @@ struct MoeBlock {
     name: String,
     router: Glm53MoeRouterLocalWorklet,
     input_glue: Op<ElementwiseKernel>,
-    shared_expert: Glm53Fp8MlpLocalWorklet,
-    dispatch_quant: Op<Fp8PerTokenGroupQuantKernel>,
-    dispatch: Op<MoeEpAllGatherKernel>,
+    shared_expert: Glm53MlpLocalWorklet,
+    router_select: Option<Op<ElementwiseKernel>>,
+    dispatch_quant: Glm53ActivationQuant,
+    dispatch: Dispatch,
     /// One per EP rank, ranked by routed workload.
     fused_moe: Vec<Op<Nvfp4FusedMoeKernel>>,
     combine: Op<MoeEpReduceScatterKernel>,
@@ -189,8 +248,29 @@ struct MoeBlock {
 }
 
 enum Ffn {
-    Dense(Glm53Fp8MlpLocalWorklet),
+    Dense(Glm53MlpLocalWorklet),
     Moe(MoeBlock),
+}
+
+enum Dispatch {
+    Fp8(Op<MoeEpAllGatherKernel>),
+    Nvfp4(Op<MoeEpQuantizedAllGatherKernel>),
+}
+
+impl Dispatch {
+    fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
+        match self {
+            Self::Fp8(op) => op.compile(builder),
+            Self::Nvfp4(op) => op.compile(builder),
+        }
+    }
+
+    fn eval(&self, input: MoeEpCollectiveKernelInput, ev: &mut Evaluator) {
+        match self {
+            Self::Fp8(op) => push(op, input, ev),
+            Self::Nvfp4(op) => push(op, input, ev),
+        }
+    }
 }
 
 struct LayerGroup {
@@ -219,12 +299,15 @@ impl LayerGroup {
                 ];
                 match &self.ffn {
                     Ffn::Dense(worklet) => leaves.push(worklet.compile(builder)),
-                    Ffn::Moe(block) => leaves.extend([
-                        block.router.compile(builder),
-                        block.input_glue.compile(builder),
-                        block.shared_expert.compile(builder),
-                        block.dispatch_quant.compile(builder),
-                    ]),
+                    Ffn::Moe(block) => {
+                        leaves.push(block.router.compile(builder));
+                        leaves.extend(block.router_select.as_ref().map(|op| op.compile(builder)));
+                        leaves.extend([
+                            block.input_glue.compile(builder),
+                            block.shared_expert.compile(builder),
+                            block.dispatch_quant.compile(builder),
+                        ]);
+                    }
                 }
                 CostNode::Sum(leaves)
             })
@@ -267,7 +350,7 @@ impl LayerGroup {
             );
             match &self.ffn {
                 Ffn::Dense(worklet) => worklet.eval(
-                    &Glm53Fp8MlpLocalWorkletInput {
+                    &Glm53MlpLocalWorkletInput {
                         num_tokens: rank.rows,
                     },
                     ev,
@@ -339,28 +422,27 @@ impl MoeBlock {
     fn eval_local(&self, rows: u32, ev: &mut Evaluator) {
         self.router
             .eval(&Glm53MoeRouterLocalWorkletInput { num_tokens: rows }, ev);
+        if let Some(select) = &self.router_select {
+            push(select, ElementwiseKernelInput { num_tokens: rows }, ev);
+        }
         push(
             &self.input_glue,
             ElementwiseKernelInput { num_tokens: rows },
             ev,
         );
         self.shared_expert.eval_or_zero(
-            &Glm53Fp8MlpLocalWorkletInput { num_tokens: rows },
+            &Glm53MlpLocalWorkletInput { num_tokens: rows },
             rows <= SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD,
             ev,
         );
-        push(
-            &self.dispatch_quant,
-            Fp8PerTokenGroupQuantKernelInput { num_tokens: rows },
-            ev,
-        );
+        self.dispatch_quant.eval_or_zero(rows, false, ev);
     }
 
     fn eval_expert_sections(&self, batch: &NormalizedBatch, ev: &mut Evaluator) {
         let collective = MoeEpCollectiveKernelInput {
             per_rank_tokens: batch.ranks.iter().map(|rank| rank.rows).collect(),
         };
-        push(&self.dispatch, collective.clone(), ev);
+        self.dispatch.eval(collective.clone(), ev);
         for op in &self.fused_moe {
             push(
                 op,
@@ -373,7 +455,7 @@ impl MoeBlock {
         push(&self.combine, collective, ev);
         for rank in &batch.ranks {
             self.shared_expert.eval_or_zero(
-                &Glm53Fp8MlpLocalWorkletInput {
+                &Glm53MlpLocalWorkletInput {
                     num_tokens: rank.rows,
                 },
                 rank.rows > SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD,
@@ -543,7 +625,7 @@ fn build_group(
         )?),
     };
     let ffn = match group.ffn {
-        FfnKind::Dense => Ffn::Dense(Glm53Fp8MlpLocalWorklet::build(
+        FfnKind::Dense => Ffn::Dense(Glm53MlpLocalWorklet::build(
             format!("{p}.dense_ffn"),
             resolved.local.dense_ffn.clone(),
             bridge,
@@ -564,25 +646,40 @@ fn build_group(
                     ElementwiseKernel::build,
                     bridge,
                 )?,
-                shared_expert: Glm53Fp8MlpLocalWorklet::build(
+                shared_expert: Glm53MlpLocalWorklet::build(
                     format!("{m}.shared_expert"),
                     resolved.local.shared_expert.clone(),
                     bridge,
                 )?,
-                dispatch_quant: atomic(
+                router_select: cfg
+                    .router_select
+                    .clone()
+                    .map(|select| {
+                        atomic(m, "router_select", select, ElementwiseKernel::build, bridge)
+                    })
+                    .transpose()?,
+                dispatch_quant: Glm53ActivationQuant::build(
                     m,
                     "dispatch_quant",
                     resolved.routed[0].input_quant.clone(),
-                    Fp8PerTokenGroupQuantKernel::build,
                     bridge,
                 )?,
-                dispatch: atomic(
-                    m,
-                    "dispatch_all_gather",
-                    cfg.dispatch.clone(),
-                    MoeEpAllGatherKernel::build,
-                    bridge,
-                )?,
+                dispatch: match cfg.dispatch.clone() {
+                    Glm53FlashDispatchConfig::Fp8(dispatch) => Dispatch::Fp8(atomic(
+                        m,
+                        "dispatch_all_gather",
+                        dispatch,
+                        MoeEpAllGatherKernel::build,
+                        bridge,
+                    )?),
+                    Glm53FlashDispatchConfig::Nvfp4(dispatch) => Dispatch::Nvfp4(atomic(
+                        m,
+                        "dispatch_all_gather",
+                        dispatch,
+                        MoeEpQuantizedAllGatherKernel::build,
+                        bridge,
+                    )?),
+                },
                 fused_moe: resolved
                     .routed
                     .iter()
@@ -979,7 +1076,11 @@ mod tests {
     use crate::timing::routing::RoutingDistribution;
 
     fn model_cfg() -> Glm53FlashModelCfg {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("model/config/glm53_flash.json");
+        config("glm53_flash")
+    }
+
+    fn config(name: &str) -> Glm53FlashModelCfg {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("model/config/{name}.json"));
         Glm53FlashModelCfg::from_json(&path).unwrap()
     }
 
@@ -993,10 +1094,14 @@ mod tests {
     }
 
     fn built(dp_size: u16) -> Glm53FlashDpAttnEpModel {
+        built_for(&model_cfg(), dp_size)
+    }
+
+    fn built_for(model: &Glm53FlashModelCfg, dp_size: u16) -> Glm53FlashDpAttnEpModel {
         let bridge = PerfApiBridge::new_uninit_for_test();
         bridge.enable_enumerate();
         let demand = ExpertDemand::popularity(&RoutingDistribution::uniform(288), 42);
-        let configs = build_configs(&model_cfg(), &parallel(dp_size), &demand).unwrap();
+        let configs = build_configs(model, &parallel(dp_size), &demand).unwrap();
         build("unified".into(), resolve_configs(&configs), &bridge).unwrap()
     }
 
@@ -1030,11 +1135,11 @@ mod tests {
         assert_eq!(configs.local.lm_head.n.get(), model_cfg().vocab_size);
         assert_eq!(configs.routed.len(), 8);
         assert_eq!(resolved.routed[0].fused_moe.num_local_experts.get(), 36);
-        assert_eq!(configs.dispatch.hidden_dtype, DType::Fp8E4m3);
-        assert_eq!(
-            (configs.dispatch.num_gpus, configs.dispatch.max_total_tokens),
-            (8, 65536)
-        );
+        let Glm53FlashDispatchConfig::Fp8(dispatch) = &configs.dispatch else {
+            panic!("the FP8 checkpoint dispatches FP8 activations");
+        };
+        assert_eq!(dispatch.hidden_dtype, DType::Fp8E4m3);
+        assert_eq!((dispatch.num_gpus, dispatch.max_total_tokens), (8, 65536));
         assert!(build_configs(&model_cfg(), &parallel(1), &demand).is_err());
         assert!(build_configs(&model_cfg(), &parallel(5), &demand).is_err());
     }
@@ -1082,11 +1187,10 @@ mod tests {
 
     /// The analyzer picks a location map by arch type and the exact set of
     /// non-communication locations, so EP4 and EP8 each need their own map.
-    #[test]
-    fn necessary_work_maps_cover_the_compiled_locations() {
+    fn assert_maps_cover(model: &Glm53FlashModelCfg, arch: &str, locations: impl Fn(u16) -> usize) {
         use std::collections::BTreeSet;
         for dp in [4_u16, 8] {
-            let model = built(dp);
+            let model = built_for(model, dp);
             assert!(model.logs_decode_kv_lens());
             let actual: BTreeSet<String> = model
                 .cost_log_manifest()
@@ -1094,12 +1198,11 @@ mod tests {
                 .into_iter()
                 .map(|slot| slot.name)
                 .collect();
-            let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(format!(
-                "model/work/location_maps/glm53_flash_vllm_fp8_dp_attn_ep_moe_ep{dp}.json"
-            ));
+            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(format!("model/work/location_maps/{arch}_ep{dp}.json"));
             let map: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-            assert_eq!(map["arch_types"], serde_json::json!([ARCH_KIND]));
+            assert_eq!(map["arch_types"], serde_json::json!([arch]));
             let mapped: BTreeSet<String> = map["locations"]
                 .as_array()
                 .unwrap()
@@ -1107,10 +1210,45 @@ mod tests {
                 .map(|row| row["location"].as_str().unwrap().to_string())
                 .collect();
             assert_eq!(actual, mapped, "EP{dp}");
-            // The TP map's 128 less 8 per-rank input quants, plus per MoE kind
-            // the dispatch quant, gather, scatter and ranks 4..dp.
-            assert_eq!(mapped.len(), 128 - 8 + 2 * (3 + usize::from(dp) - 4));
+            assert_eq!(mapped.len(), locations(dp));
         }
+    }
+
+    #[test]
+    fn necessary_work_maps_cover_the_compiled_locations() {
+        // The TP map's 128 less 8 per-rank input quants, plus per MoE kind
+        // the dispatch quant, gather, scatter and ranks 4..dp.
+        assert_maps_cover(&model_cfg(), ARCH_KIND, |dp| {
+            128 - 8 + 2 * (3 + usize::from(dp) - 4)
+        });
+    }
+
+    #[test]
+    fn nvfp4_maps_add_the_router_select_and_drop_the_shared_expert_quant() {
+        // Per MoE kind: +1 vLLM top-k select, -2 BF16 shared-expert quants.
+        assert_maps_cover(
+            &config("glm53_flash_nvfp4"),
+            "glm53_flash_vllm_nvfp4_dp_attn_ep_moe",
+            |dp| 128 - 8 + 2 * (3 + usize::from(dp) - 4) - 2,
+        );
+    }
+
+    #[test]
+    fn nvfp4_dispatches_packed_fp4_after_a_vllm_top_k_select() {
+        let demand = ExpertDemand::popularity(&RoutingDistribution::uniform(288), 42);
+        let model = config("glm53_flash_nvfp4");
+        let configs = build_configs(&model, &parallel(4), &demand).unwrap();
+        let Glm53FlashDispatchConfig::Nvfp4(dispatch) = &configs.dispatch else {
+            panic!("the NVFP4 checkpoint dispatches packed NVFP4 activations");
+        };
+        assert_eq!(dispatch.top_k.get(), model.num_experts_per_tok);
+        assert!(configs.router_select.is_some());
+        let resolved = resolve_configs(&configs);
+        assert_eq!(
+            resolved.routed[0].fused_moe.backends,
+            ["flashinfer_trtllm_routed_sm100"]
+        );
+        assert_eq!(resolved.routed[0].fused_moe.routing_method, "deepseek_v3");
     }
 
     fn leaf_order(node: &CostNode, out: &mut Vec<usize>) {

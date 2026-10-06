@@ -817,8 +817,12 @@ mod tests {
     use std::path::Path;
 
     fn model_cfg() -> Glm53FlashModelCfg {
+        config("glm53_flash")
+    }
+
+    fn config(name: &str) -> Glm53FlashModelCfg {
         Glm53FlashModelCfg::from_json(
-            &Path::new(env!("CARGO_MANIFEST_DIR")).join("model/config/glm53_flash.json"),
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("model/config/{name}.json")),
         )
         .unwrap()
     }
@@ -838,7 +842,11 @@ mod tests {
     }
 
     fn built_named(name: &str, pp_size: u16) -> Glm53FlashVllmFp8PpModel {
-        let cfgs = build_configs(&model_cfg(), &parallel(pp_size), &uniform()).unwrap();
+        built_for(&model_cfg(), name, pp_size)
+    }
+
+    fn built_for(model: &Glm53FlashModelCfg, name: &str, pp_size: u16) -> Glm53FlashVllmFp8PpModel {
+        let cfgs = build_configs(model, &parallel(pp_size), &uniform()).unwrap();
         let bridge = PerfApiBridge::new_uninit_for_test();
         bridge.enable_enumerate();
         build(name.to_string(), resolve_configs(&cfgs), &bridge).unwrap()
@@ -1058,13 +1066,9 @@ mod tests {
         assert!(model.check_input(&too_long).is_err());
     }
 
-    #[test]
-    fn pp_location_map_matches_every_noncommunication_manifest_location() {
-        let map: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../model/work/location_maps/glm53_flash_vllm_fp8_pp_kda_dsa_moe_pp.json"
-        ))
-        .unwrap();
-        assert_eq!(map["arch_types"], serde_json::json!([ARCH_KIND]));
+    fn assert_map_covers(model: &Glm53FlashModelCfg, arch: &str, map: &str, locations: usize) {
+        let map: serde_json::Value = serde_json::from_str(map).unwrap();
+        assert_eq!(map["arch_types"], serde_json::json!([arch]));
         let mapped: BTreeSet<String> = map["locations"]
             .as_array()
             .unwrap()
@@ -1072,14 +1076,38 @@ mod tests {
             .map(|row| row["location"].as_str().unwrap().to_string())
             .collect();
         for pp_size in [4_u16, 8, 11] {
-            let locations: BTreeSet<String> = built_named("pp", pp_size)
+            let actual: BTreeSet<String> = built_for(model, "pp", pp_size)
                 .cost_log_manifest()
                 .slots
                 .into_iter()
                 .map(|slot| slot.name)
                 .collect();
-            assert_eq!(locations.len(), 116);
-            assert_eq!(mapped, locations);
+            assert_eq!(actual.len(), locations);
+            assert_eq!(mapped, actual);
         }
+    }
+
+    #[test]
+    fn pp_location_map_matches_every_noncommunication_manifest_location() {
+        assert_map_covers(
+            &model_cfg(),
+            ARCH_KIND,
+            include_str!(
+                "../../../model/work/location_maps/glm53_flash_vllm_fp8_pp_kda_dsa_moe_pp.json"
+            ),
+            116,
+        );
+    }
+
+    #[test]
+    fn nvfp4_pp_map_drops_the_bf16_shared_expert_quant() {
+        assert_map_covers(
+            &config("glm53_flash_nvfp4"),
+            "glm53_flash_vllm_nvfp4_pp_kda_dsa_moe",
+            include_str!(
+                "../../../model/work/location_maps/glm53_flash_vllm_nvfp4_pp_kda_dsa_moe_pp.json"
+            ),
+            112,
+        );
     }
 }

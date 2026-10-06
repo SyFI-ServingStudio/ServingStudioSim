@@ -136,9 +136,21 @@ impl Deployment for PpDeployment {
                 cudagraph_capture_sizes,
                 layer_partition,
                 ..
+            }
+            | IterArchSel::Glm53FlashVllmNvfp4PpKdaDsaMoe {
+                pp_size,
+                max_model_len,
+                routing,
+                routing_seed,
+                expert_popularity_file,
+                token_corpus_file,
+                cudagraph_capture_sizes,
+                layer_partition,
+                ..
             } => {
                 let pipeline = arch_build::glm53_flash_vllm_fp8_pp_kda_dsa_moe(
                     model_spec,
+                    arch_build::glm53_flash_quant(&g.arch),
                     *pp_size,
                     *max_model_len,
                     *routing,

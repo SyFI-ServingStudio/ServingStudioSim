@@ -264,10 +264,22 @@ impl Deployment for UnifiedDeployment {
                 token_corpus_file,
                 cudagraph_capture_sizes,
                 ..
+            }
+            | IterArchSel::Glm53FlashVllmNvfp4KdaDsaMoe {
+                tp_size,
+                enable_expert_parallel,
+                max_model_len,
+                routing,
+                routing_seed,
+                expert_popularity_file,
+                token_corpus_file,
+                cudagraph_capture_sizes,
+                ..
             } => {
-                ensure_hybrid_worker("GLM-5.3-Flash vLLM FP8", &g.worker)?;
+                ensure_hybrid_worker("GLM-5.3-Flash vLLM", &g.worker)?;
                 let model = Arc::new(arch_build::glm53_flash_vllm_fp8_kda_dsa_moe(
                     model_spec,
+                    arch_build::glm53_flash_quant(&g.arch),
                     *tp_size,
                     *enable_expert_parallel,
                     *max_model_len,
@@ -281,7 +293,7 @@ impl Deployment for UnifiedDeployment {
                     bridge,
                 )?);
                 assemble_hybrid_flow(
-                    "GLM-5.3-Flash vLLM FP8",
+                    "GLM-5.3-Flash vLLM",
                     model,
                     store,
                     worker_config,
@@ -302,10 +314,21 @@ impl Deployment for UnifiedDeployment {
                 token_corpus_file,
                 cudagraph_capture_sizes,
                 ..
+            }
+            | IterArchSel::Glm53FlashVllmNvfp4DpAttnEpMoe {
+                ep_size,
+                max_model_len,
+                routing,
+                routing_seed,
+                expert_popularity_file,
+                token_corpus_file,
+                cudagraph_capture_sizes,
+                ..
             } => {
-                ensure_hybrid_worker("GLM-5.3-Flash vLLM FP8 DP-attention/EP", &g.worker)?;
+                ensure_hybrid_worker("GLM-5.3-Flash vLLM DP-attention/EP", &g.worker)?;
                 let model = Arc::new(arch_build::glm53_flash_vllm_fp8_dp_attn_ep_moe(
                     model_spec,
+                    arch_build::glm53_flash_quant(&g.arch),
                     *ep_size,
                     *max_model_len,
                     *routing,
@@ -318,7 +341,7 @@ impl Deployment for UnifiedDeployment {
                     bridge,
                 )?);
                 assemble_hybrid_flow(
-                    "GLM-5.3-Flash vLLM FP8 DP-attention/EP",
+                    "GLM-5.3-Flash vLLM DP-attention/EP",
                     model,
                     store,
                     worker_config,
@@ -713,9 +736,10 @@ impl Deployment for UnifiedDeployment {
             IterArchSel::Glm52VllmNvfp4PpDsaMoe { .. } => {
                 bail!("unified: glm52_vllm_nvfp4_pp_dsa_moe runs only under deployment `pp`")
             }
-            IterArchSel::Glm53FlashVllmFp8PpKdaDsaMoe { .. } => {
+            IterArchSel::Glm53FlashVllmFp8PpKdaDsaMoe { .. }
+            | IterArchSel::Glm53FlashVllmNvfp4PpKdaDsaMoe { .. } => {
                 bail!(
-                    "unified: glm53_flash_vllm_fp8_pp_kda_dsa_moe runs only under deployment `pp`"
+                    "unified: the glm53_flash_vllm_*_pp_kda_dsa_moe archs run only under deployment `pp`"
                 )
             }
             IterArchSel::Glm52SglangNvfp4TpDsaMoe {
