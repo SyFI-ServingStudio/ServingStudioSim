@@ -1212,7 +1212,8 @@ pub fn glm52_vllm_nvfp4_dsa_moe_speculative(
         .context("building speculative B200 GLM-5.2 NVFP4 model (often a missing profile.db row)")
 }
 
-/// Build the B200 GLM-5.3-Flash FP8 KDA/DSA/MoE model (vLLM fork, TP = EP).
+/// Build the B200 GLM-5.3-Flash FP8 KDA/DSA/MoE model (vLLM fork; routed
+/// experts EP = TP, or TP-sliced without `--enable-expert-parallel`).
 ///
 /// The checkpoint's layer schedule is exact, so layer-count overrides are
 /// rejected. Routing is resolved over the 42 routed layers; a corpus captured
@@ -1221,6 +1222,7 @@ pub fn glm52_vllm_nvfp4_dsa_moe_speculative(
 pub fn glm53_flash_vllm_fp8_kda_dsa_moe(
     model_spec: &ModelSpec,
     tp_size: u16,
+    enable_expert_parallel: bool,
     max_model_len: u32,
     routing_kind: RoutingKind,
     routing_seed: Option<u64>,
@@ -1248,7 +1250,7 @@ pub fn glm53_flash_vllm_fp8_kda_dsa_moe(
         seed: routing_seed,
         num_experts: model_cfg.n_routed_experts,
         experts_per_token: model_cfg.num_experts_per_tok,
-        ep_size: tp_size,
+        ep_size: if enable_expert_parallel { tp_size } else { 1 },
         expert_popularity_file,
         token_corpus_file,
         num_routed_layers: routed_layers,
@@ -1257,6 +1259,7 @@ pub fn glm53_flash_vllm_fp8_kda_dsa_moe(
     let demand = source.demand(0..routed_layers as usize, 1)?;
     let parallel = Glm53FlashVllmParallel {
         tp_size,
+        enable_expert_parallel,
         max_model_len,
         gpu_name: gpu.to_string(),
         cudagraph_capture_sizes: cudagraph_capture_sizes.to_vec(),
@@ -1775,6 +1778,7 @@ pub fn build_iter_model(
         IterArchSel::Glm53FlashVllmFp8KdaDsaMoe {
             model,
             tp_size,
+            enable_expert_parallel,
             max_model_len,
             routing,
             routing_seed,
@@ -1784,6 +1788,7 @@ pub fn build_iter_model(
         } => Box::new(glm53_flash_vllm_fp8_kda_dsa_moe(
             model,
             *tp_size,
+            *enable_expert_parallel,
             *max_model_len,
             *routing,
             *routing_seed,

@@ -30,6 +30,23 @@ pub enum BatchPolicy {
 
 const BATCH_POLICY_CHOICES: [&str; 2] = ["mix", "separate-prefill-priority"];
 
+/// Where the chunked-prefill worker may end a hybrid (recurrent +
+/// full-attention) arch's non-final prefill chunk. A pure full-attention arch
+/// has no recurrent checkpoint and always chunks plainly.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PrefillChunkAlignment {
+    /// With prefix caching on, end every non-final chunk on the arch's
+    /// recurrent checkpoint interval, as vLLM's Mamba `align` cache mode does
+    /// (`Scheduler._mamba_block_aligned_split`).
+    #[default]
+    Checkpoint,
+    /// `min(remaining prompt, token budget)`: no checkpoint alignment.
+    Plain,
+}
+
+const PREFILL_CHUNK_ALIGNMENT_CHOICES: [&str; 2] = ["checkpoint", "plain"];
+
 /// KV-capacity rule paired with chunked prefill. `FullFootprint` preserves the
 /// historical no-retraction lifecycle. `BoundedFuture` uses an explicit
 /// future-token estimate and therefore requires decode retraction.
@@ -334,6 +351,12 @@ pub enum IterWorkerSel {
         /// every iteration.
         #[serde(default)]
         prefill_gpu_time_multiplier: Option<f64>,
+        /// Hybrid archs only: `checkpoint` ends non-final prefill chunks on the
+        /// recurrent checkpoint interval (vLLM's Mamba `align` mode); `plain`
+        /// chunks as `min(remaining, budget)`, leaving that engine artifact out.
+        #[serde(default)]
+        #[param(string, default = "checkpoint", choices = PREFILL_CHUNK_ALIGNMENT_CHOICES)]
+        prefill_chunk_alignment: PrefillChunkAlignment,
     },
     /// Chunked prefill with a speculating decode engine: one verify pass per
     /// iteration submits `draft_tokens + 1` rows per resident decode and retires

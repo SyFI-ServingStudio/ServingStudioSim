@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from dataclasses import replace
 from pathlib import Path
 
@@ -2495,3 +2496,28 @@ def test_dflash2_stage_flop_and_byte_goldens(dflash2):
 def test_dflash2_rejects_a_sliding_window_the_checkpoint_does_not_have():
     with pytest.raises(ValueError, match="draft_sliding_window"):
         work_floors._dflash2_model(str(GLM52_NVFP4), str(GLM53_DFLASH2), 4096)
+@pytest.mark.parametrize(("variant", "ranks"), [("ep8", 8), ("moe_tp", 1)])
+def test_glm53_location_map_variants_differ_only_in_routed_rank_fan_out(variant, ranks):
+    """EP8 and MoE TP keep the TP4/EP4 semantic attribution; only the empty routed-rank rows change.
+
+    The analyzer picks the map whose locations equal the run's manifest, so each
+    routed-rank fan-out (EP4, EP8, and one rank under MoE TP) has its own file.
+    """
+    base_rows = json.loads(G53_LOCATION_MAP.read_text())["locations"]
+    base = {row["location"]: row["semantics"] for row in base_rows}
+    path = G53_LOCATION_MAP.with_name(f"glm53_flash_vllm_fp8_kda_dsa_moe_unified_{variant}.json")
+    mapping = json.loads(path.read_text())
+    assert mapping["arch_types"] == ["glm53_flash_vllm_fp8_kda_dsa_moe"]
+    rules = {row["location"]: row["semantics"] for row in mapping["locations"]}
+    assert len(rules) == len(mapping["locations"])
+
+    def rank(location):
+        match = re.search(r"\.routed_rank(\d+)\.", location)
+        return int(match.group(1)) if match else None
+
+    assert {loc: sem for loc, sem in rules.items() if rank(loc) is None} == {
+        loc: sem for loc, sem in base.items() if rank(loc) is None
+    }
+    assert {rank(loc) for loc in rules if rank(loc) is not None} == set(range(ranks))
+    assert all(rules[loc] == base[loc] for loc in rules if rank(loc) == 0)
+    assert all(rules[loc] == [] for loc in rules if (rank(loc) or 0) > 0)

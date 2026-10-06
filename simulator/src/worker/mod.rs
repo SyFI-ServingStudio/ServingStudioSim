@@ -24,7 +24,7 @@ pub use admission::{
 pub(crate) use config::resolve_prefix_cache_config;
 pub use config::{
     AttnWorkerSel, BatchPolicy, DecodeRetractionPolicy, FfnWorkerSel, IterWorkerSel,
-    KvAdmissionConfig, KvAdmissionPolicy,
+    KvAdmissionConfig, KvAdmissionPolicy, PrefillChunkAlignment,
 };
 pub use cost_buffers::CostBuffers;
 pub use gpu_cluster::{CostSource, GpuCluster, GpuInfo, SharedGpuCluster};

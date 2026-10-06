@@ -1,4 +1,6 @@
-//! GLM-5.3-Flash MoE router and routed experts on one EP rank.
+//! GLM-5.3-Flash MoE router and routed experts on one rank: an EP rank's
+//! whole experts, or (`ep_size` 1, `moe_intermediate` already divided by TP)
+//! a MoE-TP rank's slice of every expert.
 //!
 //! The router gate is `GateLinear` (BF16 weight, fp32 logits) and vLLM computes
 //! it twice per layer (`glm5next/nvidia/model.py:264` and `moe_runner.py`),

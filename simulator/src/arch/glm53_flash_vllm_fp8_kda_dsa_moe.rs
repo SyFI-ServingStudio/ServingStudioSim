@@ -1,11 +1,28 @@
 //! GLM-5.3-Flash (`Glm5NextForConditionalGeneration`) FP8 block checkpoint on
 //! B200, aligned to the vLLM fork's TP4 / EP4 deployment (MTP off).
 //!
-//! One rank group: attention and the dense FFN are tensor-parallel (16 local
-//! KDA heads, 16 local MLA heads, the indexer's 32 heads replicated), the
-//! routed experts expert-parallel (72 of 288 per rank). Every sublayer ends in
-//! a plain TP all-reduce (`flashinfer_comm.allreduce_fusion`, kAllReduce,
-//! MNNVL), 91 per iteration: embedding + 45 attention + 3 dense + 42 MoE.
+//! One rank group of `tp_size` ranks: attention, the dense FFN and the shared
+//! expert are tensor-parallel (64 KDA and 64 MLA heads split over the ranks,
+//! the indexer's 32 heads replicated). The routed experts follow vLLM's
+//! `--enable-expert-parallel`: on, each rank owns 288 / tp whole experts (EP4
+//! is the captured deployment); off, every rank owns all 288 experts sliced to
+//! 2048 / tp on the intermediate axis (MoE TP). Every sublayer ends in a plain
+//! TP all-reduce (`flashinfer_comm.allreduce_fusion`, kAllReduce, MNNVL, up to
+//! FlashInfer's workspace cap; NCCL above it, see `TpAllReduce`), 91 per
+//! iteration: embedding + 45 attention + 3 dense + 42 MoE; the MoE combine
+//! is the same all-reduce in both modes (vLLM `moe_runner.py:504-509` reduces
+//! when `tp_size > 1 or ep_size > 1`).
+//!
+//! MoE TP runs the same callable as EP: vLLM's FP8 oracle tries
+//! FLASHINFER_TRTLLM first on SM100 (`fused_moe/oracle/fp8.py:81-96`), whose
+//! parallel check admits plain TP (`experts/trtllm_fp8_moe.py:186-193`), and
+//! the monolithic `trtllm_fp8_block_scale_moe` call takes
+//! `intermediate_size_per_partition` and `local_num_experts`
+//! (`trtllm_fp8_moe.py:497-501`). Without EP, `FusedMoEParallelConfig.make`
+//! keeps `tp_size` and sets `ep_size = 1` (`fused_moe/config.py:1225-1238`), so
+//! the slice is `2048 // tp` (`config.py:1350`): 512 at TP4, 256 at TP8, both
+//! multiples of the 128x128 weight block, so no block refinement applies
+//! (`oracle/fp8.py:295-298`).
 //!
 //! The 45 layers are hybrid: `linear_attn_config.kda_layers` are Kimi Delta
 //! Attention, the rest (every 4th, 3..43) DeepSeek sparse attention with the
@@ -50,6 +67,7 @@ use crate::timing::expert_demand::ExpertDemand;
 use crate::timing::kernels::all_reduce_fusion::fused_all_reduce_refusal;
 use crate::timing::kernels::{
     AllReduceFusionKernel, AllReduceFusionKernelConfig, AllReduceFusionKernelInput,
+    AllReduceFusionSpec, AllReduceKernel, AllReduceKernelConfig, AllReduceKernelInput,
     ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput,
     MhcFusedPostPreRmsNormKernel, MhcPreRmsNormKernel, MhcRmsNormKernelConfig,
     MhcRmsNormKernelInput, RmsNormKernel, RmsNormKernelConfig, RmsNormKernelInput,
@@ -74,10 +92,11 @@ const ACTIVATION_DTYPE: DType = DType::Bf16;
 /// Sparse page-table width: `round_up(index_topk + index_kpool - 1, 128)`.
 const SELECTED_K: u32 = 2176;
 const CACHE_BLOCK_SIZE: u32 = 64;
-/// vLLM's hybrid block size for this deployment ("attention block size 2176"
-/// in the capture's server log): the token interval at which the KDA state is
-/// checkpointed and a prefix-cache hit can resume.
-const HYBRID_BLOCK_SIZE: u32 = 2176;
+/// vLLM's hybrid block-size alignment for MLA: TRT-LLM/FlashInfer MLA decode
+/// needs the manager block to be a multiple of 128 tokens
+/// (`platforms/interface.py:893-906`), which also covers the kpool indexer's
+/// `index_kpool * min(PAGED_MQA_PAGE_SIZES)` = 4 * 32 (`platforms/cuda.py:414-431`).
+const HYBRID_BLOCK_ALIGNMENT: u32 = 128;
 /// vLLM runs the shared expert on an aux stream at or below this batch size.
 const SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: u32 = 256;
 /// `Max{overlap}` of the aux-stream shared expert against its routed slice.
@@ -113,6 +132,13 @@ const MLA_APPEND_BACKENDS: &[&str] = &["vllm_cuda"];
 const INDEX_REMAP_BACKENDS: &[&str] = &["vllm_triton"];
 const FUSED_MOE_BACKENDS: &[&str] = &["flashinfer_trtllm_fp8_block_sm100"];
 const ALL_REDUCE_BACKENDS: &[&str] = &["flashinfer_mnnvl"];
+/// TP8 stand-in for MNNVL below the 128-token cap. The MNNVL workspace fails
+/// on the profiling host since 2026-10-03 (`cuMulticastAddDevice` returns
+/// CUDA_ERROR_ILLEGAL_STATE at 4 and 8 GPUs; jobs 3410, 3413), so the TP8 rows
+/// cannot be measured; TRT-LLM IPC is what vLLM's `auto` backend falls back to
+/// on a single node when that workspace fails (`flashinfer_all_reduce.py:137-160`).
+const TP8_ALL_REDUCE_BACKENDS: &[&str] = &["flashinfer_trtllm"];
+const LARGE_ALL_REDUCE_BACKENDS: &[&str] = &["nccl"];
 
 /// The checkpoint's dimensions, read strictly from its `config.json`.
 #[derive(Clone, Debug, PartialEq)]
@@ -270,10 +296,13 @@ impl Glm53FlashModelCfg {
     }
 }
 
-/// Deployment layout: one TP = EP rank group.
+/// Deployment layout: one tensor-parallel rank group.
 #[derive(Clone, Debug)]
 pub struct Glm53FlashVllmParallel {
     pub tp_size: u16,
+    /// vLLM `--enable-expert-parallel`: routed experts EP = TP when on, sliced
+    /// on the intermediate axis over the TP ranks when off.
+    pub enable_expert_parallel: bool,
     pub max_model_len: u32,
     pub gpu_name: String,
     /// vLLM `--cudagraph-capture-sizes`; empty runs eager (no padding).
@@ -361,12 +390,15 @@ pub struct Glm53FlashVllmConfigs {
     pub dense_ffn: Glm53Fp8MlpLocalWorkletConfig,
     pub shared_expert: Glm53Fp8MlpLocalWorkletConfig,
     pub router: Glm53MoeRouterLocalWorkletConfig,
-    /// One per EP rank, ranked by routed workload.
+    /// One per EP rank, ranked by routed workload; a single config under MoE
+    /// TP, where every rank runs the same slice of every expert.
     pub routed: Vec<Glm53RoutedMoeLocalWorkletConfig>,
     pub embedding: ElementwiseKernelConfig,
     pub hc_expand: ElementwiseKernelConfig,
     pub mhc: MhcRmsNormKernelConfig,
     pub all_reduce: AllReduceFusionKernelConfig,
+    /// The all-reduce vLLM falls back to above FlashInfer's workspace cap.
+    pub large_all_reduce: AllReduceKernelConfig,
     /// Routed-input copy ahead of routing, and the shared + routed combine.
     pub moe_input_glue: ElementwiseKernelConfig,
     pub moe_combine_glue: ElementwiseKernelConfig,
@@ -413,11 +445,20 @@ pub fn build_configs(
             "pooled indexer window exceeds the 2176-wide page table",
         ));
     }
+    let (ep_size, routed_intermediate) = if parallel.enable_expert_parallel {
+        divide("n_routed_experts", model.n_routed_experts)?;
+        (parallel.tp_size, model.moe_intermediate_size)
+    } else {
+        (
+            1,
+            divide("moe_intermediate_size", model.moe_intermediate_size)?,
+        )
+    };
     let routed_template = Glm53RoutedMoeLocalWorkletConfig {
         hidden: model.hidden.into(),
-        moe_intermediate: model.moe_intermediate_size.into(),
+        moe_intermediate: routed_intermediate.into(),
         num_experts: model.n_routed_experts.into(),
-        ep_size: parallel.tp_size,
+        ep_size,
         top_k: model.num_experts_per_tok,
         n_group: model.n_group,
         topk_group: model.topk_group,
@@ -430,7 +471,6 @@ pub fn build_configs(
         expert_demand: demand.clone(),
         folded_rank_position: 0,
     };
-    divide("n_routed_experts", model.n_routed_experts)?;
     Ok(Glm53FlashVllmConfigs {
         groups: layer_groups(model),
         kda: Glm53KdaAttnLocalWorkletConfig {
@@ -500,13 +540,23 @@ pub fn build_configs(
             hidden_dtype: ACTIVATION_DTYPE,
         },
         all_reduce: AllReduceFusionKernelConfig {
-            backends: ALL_REDUCE_BACKENDS.to_vec(),
+            backends: if tp == 8 {
+                TP8_ALL_REDUCE_BACKENDS.to_vec()
+            } else {
+                ALL_REDUCE_BACKENDS.to_vec()
+            },
             gpu_name: gpu.clone(),
             num_gpus: tp,
             hidden_dim: model.hidden,
             dtype: ACTIVATION_DTYPE,
             fabric: Fabric::Nvlink,
             fused_token_limit: None,
+        },
+        large_all_reduce: AllReduceKernelConfig {
+            backends: LARGE_ALL_REDUCE_BACKENDS.to_vec(),
+            gpu_name: gpu.clone(),
+            num_gpus: tp,
+            fabric: Fabric::Nvlink,
         },
         moe_input_glue: ew(hidden_bytes, hidden_bytes),
         moe_combine_glue: ew(2 * hidden_bytes, hidden_bytes),
@@ -596,6 +646,7 @@ impl MoeBlock {
     /// batches too large for the aux stream. One of the two pairs is filled
     /// per iteration; INV-1 fixes the shape.
     fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
+        let ep = self.routed.len();
         let router = self.router.compile(builder);
         let input_glue = self.input_glue.compile(builder);
         let ranks = self
@@ -617,10 +668,8 @@ impl MoeBlock {
         let combine_glue = self.combine_glue.compile(builder);
         CostNode::Labeled {
             label: format!(
-                "{} (MoE) [EP{} ranked ranks; shared expert overlaps routed at T<={}]",
-                self.name,
-                self.routed.len(),
-                SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD
+                "{} (MoE) [EP{ep} ranked ranks; shared expert overlaps routed at T<={}]",
+                self.name, SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD
             ),
             child: Box::new(CostNode::Sum(vec![
                 router,
@@ -678,15 +727,81 @@ enum Ffn {
     Moe(MoeBlock),
 }
 
+/// One TP all-reduce boundary. vLLM's `CudaCommunicator.all_reduce` takes
+/// FlashInfer while the `[tokens, hidden]` input fits its workspace
+/// (`should_use_fi_ar`, `flashinfer_all_reduce.py:441-450`; 32 MiB at TP4 and
+/// 1 MiB at TP8 on SM100, `allreduce_rms_fusion.py:104-116`) and a different
+/// all-reduce above it (`cuda_communicator.py:305-370`): custom AR stops at
+/// 2 MiB / 1 MiB on SM100 (`all_reduce_utils.py:38-43`), so at TP4 that is
+/// pynccl, and at TP8 torch symmetric memory up to 128 MiB, for which the
+/// measured NCCL curve stands in. Both slots are compiled and the inactive one
+/// is pushed as zero, so the slot layout does not depend on the batch.
+struct TpAllReduce {
+    fused: Op<AllReduceFusionKernel>,
+    large: Op<AllReduceKernel>,
+    max_fused_tokens: u32,
+    bytes_per_token: u64,
+}
+
+impl TpAllReduce {
+    fn build(
+        prefix: &str,
+        suffix: &str,
+        cfg: &Glm53FlashVllmConfigs,
+        bridge: &PerfApiBridge,
+    ) -> std::result::Result<Self, BuildError> {
+        Ok(Self {
+            fused: atomic(
+                prefix,
+                suffix,
+                cfg.all_reduce.clone(),
+                AllReduceFusionKernel::build,
+                bridge,
+            )?,
+            large: atomic(
+                prefix,
+                &format!("{suffix}_large"),
+                cfg.large_all_reduce.clone(),
+                AllReduceKernel::build,
+                bridge,
+            )?,
+            max_fused_tokens: AllReduceFusionSpec::max_fused_tokens(&cfg.all_reduce),
+            bytes_per_token: u64::from(cfg.all_reduce.hidden_dim)
+                * u64::from(cfg.all_reduce.dtype.size_bytes()),
+        })
+    }
+
+    fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
+        CostNode::Sum(vec![
+            self.fused.compile(builder),
+            self.large.compile(builder),
+        ])
+    }
+
+    fn eval(&self, tokens: u32, ev: &mut Evaluator) {
+        let fused_input = AllReduceFusionKernelInput { num_tokens: tokens };
+        let large_input = AllReduceKernelInput {
+            message_size_bytes: u64::from(tokens) * self.bytes_per_token,
+        };
+        if tokens <= self.max_fused_tokens {
+            push(&self.fused, fused_input, ev);
+            ev.push(LeafMetrics::ZERO, || large_input.into());
+        } else {
+            ev.push(LeafMetrics::ZERO, || fused_input.into());
+            push(&self.large, large_input, ev);
+        }
+    }
+}
+
 struct LayerGroup {
     label: String,
     layers: Vec<u32>,
     attn_boundary: Boundary,
     attn: Attention,
-    attn_all_reduce: Op<AllReduceFusionKernel>,
+    attn_all_reduce: TpAllReduce,
     ffn_boundary: Op<MhcFusedPostPreRmsNormKernel>,
     ffn: Ffn,
-    ffn_all_reduce: Op<AllReduceFusionKernel>,
+    ffn_all_reduce: TpAllReduce,
 }
 
 impl LayerGroup {
@@ -724,11 +839,7 @@ impl LayerGroup {
             Attention::Kda(worklet) => worklet.eval(&batch.kda, ev),
             Attention::Dsa(worklet) => worklet.eval(&batch.dsa, ev),
         }
-        push(
-            &self.attn_all_reduce,
-            AllReduceFusionKernelInput { num_tokens: tokens },
-            ev,
-        );
+        self.attn_all_reduce.eval(tokens, ev);
         push(
             &self.ffn_boundary,
             MhcRmsNormKernelInput { num_tokens: tokens },
@@ -740,22 +851,19 @@ impl LayerGroup {
             }
             Ffn::Moe(block) => block.eval(tokens, ev),
         }
-        push(
-            &self.ffn_all_reduce,
-            AllReduceFusionKernelInput { num_tokens: tokens },
-            ev,
-        );
+        self.ffn_all_reduce.eval(tokens, ev);
     }
 }
 
 pub struct Glm53FlashVllmModel {
     pub name: String,
     pub tp_size: u16,
+    pub enable_expert_parallel: bool,
     pub max_model_len: u32,
     /// Sorted, deduplicated capture sizes (see `Glm53FlashVllmParallel`).
     cudagraph_capture_sizes: Vec<u32>,
     embedding: Op<ElementwiseKernel>,
-    embedding_all_reduce: Op<AllReduceFusionKernel>,
+    embedding_all_reduce: TpAllReduce,
     hc_expand: Op<ElementwiseKernel>,
     groups: Vec<LayerGroup>,
     terminal_post: MhcTerminalPostOp,
@@ -764,6 +872,9 @@ pub struct Glm53FlashVllmModel {
     lm_head: Op<SingleGemmKernel>,
     total_kv_bytes_per_token: u64,
     recurrent_state_bytes_per_request: u64,
+    /// vLLM's hybrid block size: the token interval at which the KDA state is
+    /// checkpointed and a prefix-cache hit can resume.
+    hybrid_block_size: u32,
     cost_flat: Vec<FlatCostNode>,
     n_slots: usize,
 }
@@ -863,13 +974,7 @@ pub fn build(
             layers: group.layers.clone(),
             attn_boundary,
             attn,
-            attn_all_reduce: atomic(
-                p,
-                "attn_all_reduce",
-                cfg.all_reduce.clone(),
-                AllReduceFusionKernel::build,
-                bridge,
-            )?,
+            attn_all_reduce: TpAllReduce::build(p, "attn_all_reduce", cfg, bridge)?,
             ffn_boundary: atomic(
                 p,
                 "ffn_mhc_post_pre",
@@ -878,13 +983,7 @@ pub fn build(
                 bridge,
             )?,
             ffn,
-            ffn_all_reduce: atomic(
-                p,
-                "ffn_all_reduce",
-                cfg.all_reduce.clone(),
-                AllReduceFusionKernel::build,
-                bridge,
-            )?,
+            ffn_all_reduce: TpAllReduce::build(p, "ffn_all_reduce", cfg, bridge)?,
         });
     }
     let model_cfg = &cfg.model;
@@ -895,11 +994,14 @@ pub fn build(
         + u64::from(model_cfg.index_head_dim + 4) / u64::from(model_cfg.index_kpool);
     let total_kv_bytes_per_token = tp * u64::from(model_cfg.num_dsa_layers()) * dsa_bytes_per_token;
     let kda_layers = model_cfg.kda_layers.len() as u64;
-    let recurrent_state_bytes_per_request = tp
-        * kda_layers
-        * u64::from(
-            resolved.kda.ssm_state_bytes_per_request + resolved.kda.conv_state_bytes_per_request,
-        );
+    let hybrid_block_size = hybrid_block_size(
+        resolved.kda.ssm_state_bytes_per_request + resolved.kda.conv_state_bytes_per_request,
+        model_cfg.kv_lora_rank,
+    );
+    // vLLM pads each KDA layer's mamba page up to one attention page ("Padding
+    // mamba page size by 2.64%" at TP4), so that is what a request holds.
+    let recurrent_state_bytes_per_request =
+        tp * kda_layers * u64::from(hybrid_block_size) * u64::from(model_cfg.kv_lora_rank);
     let mut model = Glm53FlashVllmModel {
         embedding: atomic(
             n,
@@ -908,13 +1010,7 @@ pub fn build(
             ElementwiseKernel::build,
             bridge,
         )?,
-        embedding_all_reduce: atomic(
-            n,
-            "embedding_all_reduce",
-            cfg.all_reduce.clone(),
-            AllReduceFusionKernel::build,
-            bridge,
-        )?,
+        embedding_all_reduce: TpAllReduce::build(n, "embedding_all_reduce", cfg, bridge)?,
         hc_expand: atomic(
             n,
             "hc_expand",
@@ -954,6 +1050,7 @@ pub fn build(
             bridge,
         )?,
         tp_size: cfg.parallel.tp_size,
+        enable_expert_parallel: cfg.parallel.enable_expert_parallel,
         max_model_len: cfg.parallel.max_model_len,
         cudagraph_capture_sizes: {
             let mut sizes = cfg.parallel.cudagraph_capture_sizes.clone();
@@ -963,6 +1060,7 @@ pub fn build(
         },
         total_kv_bytes_per_token,
         recurrent_state_bytes_per_request,
+        hybrid_block_size,
         cost_flat: Vec::new(),
         n_slots: 0,
         name,
@@ -990,10 +1088,15 @@ impl Glm53FlashVllmModel {
             self.final_norm.compile(&mut builder),
             self.lm_head.compile(&mut builder),
         ]);
+        let layout = if self.enable_expert_parallel {
+            format!("TP=EP{}", self.tp_size)
+        } else {
+            format!("TP{} with MoE TP{}", self.tp_size, self.tp_size)
+        };
         let root = CostNode::Labeled {
             label: format!(
-                "{} (Glm53FlashVllmModel) [TP=EP{}; timing_context<={}]",
-                self.name, self.tp_size, self.max_model_len
+                "{} (Glm53FlashVllmModel) [{layout}; timing_context<={}]",
+                self.name, self.max_model_len
             ),
             child: Box::new(CostNode::Sum(children)),
         };
@@ -1009,11 +1112,7 @@ impl Glm53FlashVllmModel {
             ElementwiseKernelInput { num_tokens: tokens },
             ev,
         );
-        push(
-            &self.embedding_all_reduce,
-            AllReduceFusionKernelInput { num_tokens: tokens },
-            ev,
-        );
+        self.embedding_all_reduce.eval(tokens, ev);
         push(
             &self.hc_expand,
             ElementwiseKernelInput { num_tokens: tokens },
@@ -1077,7 +1176,7 @@ impl IterwiseUnifiedModel for Glm53FlashVllmModel {
     }
 
     fn recurrent_checkpoint_interval_tokens(&self) -> u32 {
-        HYBRID_BLOCK_SIZE
+        self.hybrid_block_size
     }
 
     /// The kpool DSA's top-k cap makes necessary work per-request in context.
@@ -1121,6 +1220,17 @@ impl IterwiseUnifiedModel for Glm53FlashVllmModel {
         );
         total
     }
+}
+
+/// vLLM's hybrid attention block size (`platforms/interface.py:919-927`): the
+/// smallest 128-aligned token count whose per-layer attention page covers one
+/// per-rank KDA mamba page (SSM + conv). The fp8 MLA latent is one byte per
+/// element and is not split by TP, while the KDA heads are, so the block halves
+/// from TP4 (2176, the capture's "Setting attention block size to 2176
+/// tokens") to TP8 (1152).
+fn hybrid_block_size(mamba_page_bytes: u32, attn_page_bytes_per_token: u32) -> u32 {
+    let quantum = HYBRID_BLOCK_ALIGNMENT * attn_page_bytes_per_token;
+    HYBRID_BLOCK_ALIGNMENT * mamba_page_bytes.div_ceil(quantum)
 }
 
 /// The row count vLLM runs a CUDA-graph replay on: the smallest captured size
@@ -1263,6 +1373,7 @@ mod tests {
     fn parallel() -> Glm53FlashVllmParallel {
         Glm53FlashVllmParallel {
             tp_size: 4,
+            enable_expert_parallel: true,
             max_model_len: 8192,
             gpu_name: "NVIDIA B200".into(),
             cudagraph_capture_sizes: Vec::new(),
@@ -1281,11 +1392,99 @@ mod tests {
     }
 
     fn built() -> Glm53FlashVllmModel {
+        built_with(parallel())
+    }
+
+    fn demand() -> ExpertDemand {
+        ExpertDemand::popularity(&RoutingDistribution::uniform(288), 42)
+    }
+
+    fn built_with(parallel: Glm53FlashVllmParallel) -> Glm53FlashVllmModel {
         let bridge = PerfApiBridge::new_uninit_for_test();
         bridge.enable_enumerate();
-        let demand = ExpertDemand::popularity(&RoutingDistribution::uniform(288), 42);
-        let configs = build_configs(&model_cfg(), &parallel(), &demand).unwrap();
+        let configs = build_configs(&model_cfg(), &parallel, &demand()).unwrap();
         build("unified".into(), resolve_configs(&configs), &bridge).unwrap()
+    }
+
+    fn layout(tp_size: u16, enable_expert_parallel: bool) -> Glm53FlashVllmParallel {
+        Glm53FlashVllmParallel {
+            tp_size,
+            enable_expert_parallel,
+            ..parallel()
+        }
+    }
+
+    #[test]
+    fn expert_parallel_splits_whole_experts_and_moe_tp_slices_every_expert() {
+        let demand = ExpertDemand::popularity(&RoutingDistribution::uniform(288), 42);
+        // (tp, EP?) -> (routed configs, local experts, intermediate, heads).
+        for (tp, ep, ranks, local, intermediate, heads) in [
+            (4, true, 4, 72, 2048, 16),
+            (8, true, 8, 36, 2048, 8),
+            (4, false, 1, 288, 512, 16),
+            (8, false, 1, 288, 256, 8),
+        ] {
+            let configs = build_configs(&model_cfg(), &layout(tp, ep), &demand).unwrap();
+            let resolved = resolve_configs(&configs);
+            assert_eq!(resolved.routed.len(), ranks, "tp {tp} ep {ep}");
+            for routed in &resolved.routed {
+                assert_eq!(routed.fused_moe.num_local_experts.get(), local);
+                assert_eq!(routed.fused_moe.intermediate_size.get(), intermediate);
+                assert_eq!(routed.fused_moe.num_experts.get(), 288);
+            }
+            assert_eq!(configs.kda.num_heads.get(), heads);
+            assert_eq!(configs.dsa.num_heads.get(), heads);
+            // The indexer's heads are replicated on every rank.
+            assert_eq!(configs.dsa.index_num_heads.get(), 32);
+            // Dense FFN and shared expert are TP-sliced in both MoE modes.
+            assert_eq!(configs.dense_ffn.intermediate.get(), 12288 / u32::from(tp));
+            assert_eq!(
+                configs.shared_expert.intermediate.get(),
+                2048 / u32::from(tp)
+            );
+            assert_eq!(configs.all_reduce.num_gpus, u32::from(tp));
+        }
+    }
+
+    #[test]
+    fn all_reduce_leaves_flashinfer_at_its_workspace_cap() {
+        // 32 MiB at TP4 and 1 MiB at TP8 over 4096 bf16 hidden values per token.
+        for (tp, cap) in [(4, 4096), (8, 128)] {
+            let model = built_with(layout(tp, true));
+            let backend = if tp == 8 {
+                "flashinfer_trtllm"
+            } else {
+                "flashinfer_mnnvl"
+            };
+            let configs = build_configs(&model_cfg(), &layout(tp, true), &demand()).unwrap();
+            assert_eq!(configs.all_reduce.backends, [backend]);
+            assert_eq!(configs.large_all_reduce.backends, ["nccl"]);
+            assert_eq!(model.embedding_all_reduce.max_fused_tokens, cap);
+            assert_eq!(model.embedding_all_reduce.bytes_per_token, 8192);
+            for group in &model.groups {
+                assert_eq!(group.attn_all_reduce.max_fused_tokens, cap);
+                assert_eq!(group.ffn_all_reduce.max_fused_tokens, cap);
+            }
+        }
+    }
+
+    #[test]
+    fn eight_ranks_keep_whole_model_state_and_grow_the_routed_rank_fan_out() {
+        let ep8 = built_with(layout(8, true));
+        // Every rank keeps the whole MLA latent, so per-token bytes scale with
+        // TP; the KDA heads split, so the per-request state only changes by
+        // its padding to the hybrid block.
+        assert_eq!(ep8.total_kv_bytes_per_token(), 8 * 11 * (512 + 33));
+        // Half the KDA heads per rank: a 1152-token hybrid block (9 x 128).
+        assert_eq!(ep8.recurrent_checkpoint_interval_tokens(), 1152);
+        assert_eq!(ep8.recurrent_state_bytes_per_request(), 8 * 34 * 1152 * 512);
+        assert_eq!((ep8.gpus_per_replica(), ep8.num_attn_shards()), (8, 8));
+        let moe = |ranks: usize| 2 + 2 + ranks * 14;
+        let kda_dense = 6 + 13 + 5;
+        let total = |ranks| 4 + 2 * kda_dense + (6 + 31 + moe(ranks)) + (6 + 13 + moe(ranks)) + 4;
+        assert_eq!(ep8.n_slots, total(8));
+        assert_eq!(built_with(layout(4, false)).n_slots, total(1));
+        assert_eq!(built_with(layout(8, false)).n_slots, total(1));
     }
 
     #[test]
@@ -1325,53 +1524,88 @@ mod tests {
     fn kv_and_recurrent_state_bytes_are_whole_model_totals() {
         let model = built();
         assert_eq!(model.total_kv_bytes_per_token(), 4 * 11 * (512 + 33));
+        // The true state is (1 << 20) + 6144 * 3 * 2 bytes per rank and layer;
+        // vLLM pads it to one 2176-token attention page, 2.64% more.
+        assert_eq!(model.recurrent_checkpoint_interval_tokens(), 2176);
         assert_eq!(
             model.recurrent_state_bytes_per_request(),
-            4 * 34 * ((1 << 20) + 6144 * 3 * 2)
+            4 * 34 * 2176 * 512
         );
-        assert_eq!(model.recurrent_checkpoint_interval_tokens(), 2176);
+        let true_state = (1u64 << 20) + 6144 * 3 * 2;
+        let padding = (2176 * 512) as f64 / true_state as f64 - 1.0;
+        assert!((padding - 0.0264).abs() < 5e-5, "{padding}");
         assert_eq!((model.gpus_per_replica(), model.num_attn_shards()), (4, 4));
     }
 
     #[test]
     fn compiled_tree_has_a_fixed_slot_count() {
         let model = built();
-        // Prologue 3; per group: 2 boundaries + 2 all-reduces + attention
-        // (KDA 13, DSA 31) + FFN (dense 5; MoE 2 router + 2 glue + 4 ranks x
-        // (concurrent 5 + 2, serial 2 + 5)); epilogue 4.
-        let kda_dense = 4 + 13 + 5;
-        let dsa_moe = 4 + 31 + 60;
-        let kda_moe = 4 + 13 + 60;
-        assert_eq!(model.n_slots, 3 + 2 * kda_dense + dsa_moe + kda_moe + 4);
+        // Prologue 4 (the all-reduce is a fused + large pair); per group:
+        // 2 boundaries + 2 all-reduce pairs + attention (KDA 13, DSA 31) +
+        // FFN (dense 5; MoE 2 router + 2 glue + 4 ranks x (concurrent 5 + 2,
+        // serial 2 + 5)); epilogue 4.
+        let kda_dense = 6 + 13 + 5;
+        let dsa_moe = 6 + 31 + 60;
+        let kda_moe = 6 + 13 + 60;
+        assert_eq!(model.n_slots, 4 + 2 * kda_dense + dsa_moe + kda_moe + 4);
         assert_eq!(model.cost_log_manifest().slots.len(), model.n_slots);
     }
 
     #[test]
     fn necessary_work_map_covers_the_compiled_locations() {
         use std::collections::BTreeSet;
-        let model = built();
         // Kpool DSA work is per-request in context, so the labeler needs each KV length.
-        assert!(model.logs_decode_kv_lens());
-        let manifest = model.cost_log_manifest();
-        let actual: BTreeSet<_> = manifest
-            .slots
-            .iter()
-            .filter(|slot| slot.kind != "all_reduce_fusion")
-            .map(|slot| slot.name.as_str())
-            .collect();
-        let map: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../model/work/location_maps/glm53_flash_vllm_fp8_kda_dsa_moe_unified.json"
-        ))
-        .unwrap();
-        assert_eq!(map["arch_types"], serde_json::json!([ARCH_KIND]));
-        let mapped: BTreeSet<_> = map["locations"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|row| row["location"].as_str().unwrap())
-            .collect();
-        assert_eq!(actual, mapped);
-        assert_eq!(mapped.len(), 128);
+        assert!(built().logs_decode_kv_lens());
+        // The analyzer picks the map whose locations equal the manifest's, so
+        // each routed-rank fan-out has its own. MoE TP4 and TP8 share one.
+        for (parallel, map, locations) in [
+            (
+                layout(4, true),
+                include_str!(
+                    "../../../model/work/location_maps/glm53_flash_vllm_fp8_kda_dsa_moe_unified.json"
+                ),
+                128,
+            ),
+            (
+                layout(8, true),
+                include_str!(
+                    "../../../model/work/location_maps/glm53_flash_vllm_fp8_kda_dsa_moe_unified_ep8.json"
+                ),
+                144,
+            ),
+            (
+                layout(4, false),
+                include_str!(
+                    "../../../model/work/location_maps/glm53_flash_vllm_fp8_kda_dsa_moe_unified_moe_tp.json"
+                ),
+                116,
+            ),
+            (
+                layout(8, false),
+                include_str!(
+                    "../../../model/work/location_maps/glm53_flash_vllm_fp8_kda_dsa_moe_unified_moe_tp.json"
+                ),
+                116,
+            ),
+        ] {
+            let manifest = built_with(parallel).cost_log_manifest();
+            let actual: BTreeSet<_> = manifest
+                .slots
+                .iter()
+                .filter(|slot| !matches!(slot.kind.as_str(), "all_reduce_fusion" | "all_reduce"))
+                .map(|slot| slot.name.as_str())
+                .collect();
+            let map: serde_json::Value = serde_json::from_str(map).unwrap();
+            assert_eq!(map["arch_types"], serde_json::json!([ARCH_KIND]));
+            let mapped: BTreeSet<_> = map["locations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["location"].as_str().unwrap())
+                .collect();
+            assert_eq!(actual, mapped);
+            assert_eq!(mapped.len(), locations);
+        }
     }
 
     fn leaf_order(node: &CostNode, out: &mut Vec<usize>) {

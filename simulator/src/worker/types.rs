@@ -583,6 +583,10 @@ pub struct WorkerConfig {
     /// `recurrent_checkpoint_interval_tokens`. Only the hybrid KV recipe reads
     /// it.
     pub ssm_checkpoint_interval_tokens: Option<u32>,
+    /// Whether a hybrid arch's non-final prefill chunks end on its recurrent
+    /// checkpoint interval (from the `chunked_prefill` selector). Only the
+    /// hybrid chunked-prefill recipe reads it.
+    pub prefill_chunk_alignment: crate::worker::config::PrefillChunkAlignment,
     /// Candidate positions the drafter proposes per request per iteration (from
     /// the worker selector). The verify width is one more than this. Only the
     /// speculative recipe reads it, and it must match the width the model was
@@ -612,6 +616,7 @@ impl Default for WorkerConfig {
             balance_decode_microbatches: false,
             prefix_cache: crate::worker::kv::PrefixCacheConfig::default(),
             ssm_checkpoint_interval_tokens: None,
+            prefill_chunk_alignment: crate::worker::config::PrefillChunkAlignment::Checkpoint,
             speculative_draft_tokens: 0,
             speculative_acceptance_seed: None,
         }

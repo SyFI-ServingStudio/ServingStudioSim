@@ -41,7 +41,7 @@ use crate::worker::{
     build_barebone_worker, build_chunked_prefill_worker, build_hp_worker,
     build_hybrid_chunked_prefill_worker, build_qwen36_hybrid_worker, build_speculative_worker,
     resolve_prefix_cache_config, BatchPolicy, IterWorker, IterWorkerSel, KvAdmissionConfig,
-    PendingOrderKind, PrefixCacheMode, PrefixCachePolicy, WorkerConfig,
+    PendingOrderKind, PrefillChunkAlignment, PrefixCacheMode, PrefixCachePolicy, WorkerConfig,
 };
 
 use super::Deployment;
@@ -185,6 +185,7 @@ impl Deployment for UnifiedDeployment {
             kv_admission,
             prefix_cache,
             ssm_checkpoint_interval_tokens: ssm_checkpoint_interval_tokens(&g.worker),
+            prefill_chunk_alignment: prefill_chunk_alignment(&g.worker),
             speculative_draft_tokens: speculative_draft_tokens(&g.worker),
             speculative_acceptance_seed: speculative_acceptance_seed(&g.worker),
             ..WorkerConfig::default()
@@ -250,6 +251,7 @@ impl Deployment for UnifiedDeployment {
             // hp_unified recipes would leave the KDA state invisible.
             IterArchSel::Glm53FlashVllmFp8KdaDsaMoe {
                 tp_size,
+                enable_expert_parallel,
                 max_model_len,
                 routing,
                 routing_seed,
@@ -262,6 +264,7 @@ impl Deployment for UnifiedDeployment {
                 let model = Arc::new(arch_build::glm53_flash_vllm_fp8_kda_dsa_moe(
                     model_spec,
                     *tp_size,
+                    *enable_expert_parallel,
                     *max_model_len,
                     *routing,
                     *routing_seed,
@@ -740,6 +743,18 @@ fn ssm_checkpoint_interval_tokens(worker: &IterWorkerSel) -> Option<u32> {
     }
 }
 
+/// The `chunked_prefill` selector's hybrid chunk alignment; every other
+/// selector keeps the checkpoint-aligned default.
+fn prefill_chunk_alignment(worker: &IterWorkerSel) -> PrefillChunkAlignment {
+    match worker {
+        IterWorkerSel::ChunkedPrefill {
+            prefill_chunk_alignment,
+            ..
+        } => *prefill_chunk_alignment,
+        _ => PrefillChunkAlignment::default(),
+    }
+}
+
 /// Prefill-iteration multiplier of any co-located selector. The PD selectors do
 /// not carry it: every PD prefill iteration schedules prefill and no PD decode
 /// iteration does, so `gpu_time_multiplier` already expresses either stage.
@@ -963,6 +978,7 @@ mod tests {
             kv_admission: crate::worker::config::KvAdmissionSpec::default(),
             gpu_time_multiplier: 1.0,
             prefill_gpu_time_multiplier: None,
+            prefill_chunk_alignment: PrefillChunkAlignment::Checkpoint,
         }
     }
 
