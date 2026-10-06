@@ -2,9 +2,10 @@
 //!
 //! - The production stream-overlap gates. vLLM decides per forward whether a
 //!   side stream runs, so each gated side branch is minted twice (concurrent
-//!   under a `Max`, and serial after it) and `eval` fills the copy the batch
-//!   selects, as `glm52_vllm_nvfp4_dsa_moe` does for its shared expert. The
-//!   tree stays fixed (INV-1) and `Max` still sums the hidden copy's work.
+//!   under a `Parallel`, and serial after it) and `eval` fills the copy the
+//!   batch selects, as `glm52_vllm_nvfp4_dsa_moe` does for its shared expert.
+//!   The tree stays fixed (INV-1) and `Parallel` still sums the hidden copy's
+//!   work.
 //! - Elementwise byte placeholders for launches with no L1 kind. Each
 //!   placeholder is named after the launch it stands for and sized by the
 //!   bytes it reads and writes per token; the source anchor is on the config
@@ -115,7 +116,7 @@ pub(super) fn compile_serial_copy<K: Probe>(op: &Op<K>, builder: &mut CostTreeBu
     )
 }
 
-/// `main` with its gated side branches: `Sum[Max{main, side...}, serial...]`.
+/// `main` with its gated side branches: `Sum[Parallel{main, side...}, serial...]`.
 ///
 /// Each element of `concurrent` is one side stream's branch; `serial` holds
 /// the same branches' serial copies. With no side branch this is just `main`.
@@ -130,7 +131,7 @@ pub(super) fn gated_fanout(
     let mut children = vec![CostNode::Sum(main)];
     children.extend(concurrent);
     CostNode::Sum(vec![
-        CostNode::Max {
+        CostNode::Parallel {
             overlap: 1.0,
             children,
         },
@@ -168,7 +169,9 @@ mod tests {
         let CostNode::Sum(children) = node else {
             panic!("gated fanout is a Sum")
         };
-        assert!(matches!(children[0], CostNode::Max { ref children, .. } if children.len() == 2));
+        assert!(
+            matches!(children[0], CostNode::Parallel { ref children, .. } if children.len() == 2)
+        );
         assert!(matches!(children[1], CostNode::Sum(ref serial) if serial.len() == 1));
     }
 }

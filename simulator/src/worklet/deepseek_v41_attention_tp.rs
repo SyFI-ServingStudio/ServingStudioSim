@@ -21,7 +21,7 @@
 //!    `T <= VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD` (1024). Decode 1337 layer 2:
 //!    compressor GEMM s19 835.49-841.18 us, weights_proj s47915 835.87-839.68,
 //!    fused_wqa_wkv s47916 836.10-849.28, joined by the QK RMSNorm at 848.58
-//!    (real overlap -> `Max`). Mixed 288 (T=174) layer 2: s19 / s45358 /
+//!    (real overlap -> `Parallel`). Mixed 288 (T=174) layer 2: s19 / s45358 /
 //!    s45359 all start within 4093.69-4094.33 (overlap). Mixed 310 (T=2048)
 //!    layer 2: all on s19 back to back, 3721.92-3764.51 (serial -> `Sum`).
 //! 3. QK RMSNorm (placeholder).

@@ -16,7 +16,7 @@
 //! s45352, shared on s19). Mixed 310 (2048 tokens) runs everything on s19.
 //! That is `VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD` (256, fork
 //! `envs.py:299`, `fused_moe/runner/shared_experts.py:111-116`), so the shared
-//! branch is a gated dual slot: `Max{routed, shared}` at `T <= 256`, serial
+//! branch is a gated dual slot: `Parallel{routed, shared}` at `T <= 256`, serial
 //! above.
 //!
 //! The busiest EP rank is `folded_rank_position = 0` of the shared

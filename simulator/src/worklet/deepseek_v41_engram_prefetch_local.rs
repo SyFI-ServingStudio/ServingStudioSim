@@ -16,7 +16,7 @@
 //!   2325.12. The lookups finish before the consumer, but they are not free.
 //!
 //! Capture 3 (`logs/20260924_0_dsv41_flash_capture`, Phase-5 D3) shows why a
-//! race (`Max`) under-states the window: the lookups share the device with the
+//! race (`Parallel`) under-states the window: the lookups share the device with the
 //! concurrent main path and slow it down.
 //!
 //! - Iteration 160 (T=2048, device 0): the lookups run 2-570 us and 169-780 us
@@ -31,11 +31,10 @@
 //!
 //! So the composition is serial `Sum[main path from the hash to the layer-1
 //! AllGather, lookup_l1, lookup_l14]`: the two lookups contend with each other
-//! and with the main path. Same-device contention must not be a `CostNode::Max`
-//! (`doc/analyzer.md`, "Concurrent CUDA streams"); `Sum` is the closest
-//! existing node until a contention node exists, and it still under-predicts
-//! the window in every captured bucket (the in-server pair is longer than the
-//! isolated L1 lookup). Layer 14's consumer is further away still, so charging
+//! and with the main path. `Parallel{overlap < 1}` could only reach `Sum` by
+//! an overlap no capture calibrates, and `Sum` still under-predicts the window
+//! in every captured bucket (the in-server pair is longer than the isolated L1
+//! lookup). Layer 14's consumer is further away still, so charging
 //! both lookups against the layer-1 window is the conservative choice.
 //!
 //! Tree order: [`compile_joined`](DeepseekV41EngramPrefetchLocalWorklet::compile_joined)

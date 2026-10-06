@@ -306,7 +306,7 @@ include:
 | mixed (1536,2048] (80) | 45.413 | 43.062 | 43.712 | 0.963 | +0.719 | −0.068 |
 
 Read the alignment by **group, not by overlapped per-op rows**. The analyzer
-gives a hidden `Max` branch zero simulated time and gives the measured time to
+gives a hidden `Parallel` branch zero simulated time and gives the measured time to
 whichever launch started first, so rows such as `ffn.shared.*` (0 simulated at
 T <= 256) are attribution artifacts, not missing work. Group deviations after
 fix 1 (sim − measured, ms per iteration; winner-device spans; source
@@ -453,11 +453,11 @@ start, which are unrelated to context.
   up to half the SMs for 0.6-0.8 ms and slow the main-path kernels beside them;
   the hash-to-all-gather window grows about 0.70 ms per ms of lookup at
   T ≈ 2048, so the pair is about 70% serial (*measured*). `Sum[main, lookups]`
-  stands in for a same-device contention node, which does not exist
-  (`doc/analyzer.md`, "Concurrent CUDA streams"). Whether the slowdown is SM
+  stands in for same-device contention; `Parallel{overlap < 1}` would need an
+  overlap no capture calibrates. Whether the slowdown is SM
   occupancy or memory/TLB pressure was inferred, not isolated.
-- **Max/Sum stream thresholds.** Shared expert ‖ routed expert overlaps under
-  `Max` for T <= 256; stage A (`fused_wqa_wkv` ‖ compressor ‖ indexer
+- **Parallel/Sum stream thresholds.** Shared expert ‖ routed expert overlaps under
+  `Parallel` for T <= 256; stage A (`fused_wqa_wkv` ‖ compressor ‖ indexer
   `weights_proj`) for T <= 1024; `Sum` above. Both match vLLM's source
   thresholds; capture 2 has no mixed batch between T = 175 and 1116, so it is
   consistent with them but cannot tighten them. The compressor aux stream is
