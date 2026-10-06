@@ -1492,6 +1492,24 @@ def test_nested_quantization_paths_preserve_component_boundaries():
     assert legacy.is_converted("mlp.gate_proj")
 
 
+def test_memoized_conversion_answers_repeat_and_leave_scheme_identity_alone():
+    raw = {
+        "quantization_config": {
+            "quant_method": "fp8",
+            "modules_to_not_convert": ["model.layers.7.mlp.gate"],
+        }
+    }
+    queried, fresh = parse_quantization_config(raw), parse_quantization_config(raw)
+    for _ in range(2):
+        assert not queried.is_converted("mlp.gate")
+        assert not queried.is_converted("mlp.gate.e_score_correction_bias")
+        assert queried.is_converted("mlp.gate_proj")
+    # The memo is a cache, not part of the scheme: a queried scheme still equals
+    # and hashes like one that answered nothing.
+    assert queried == fresh
+    assert hash(queried) == hash(fresh)
+
+
 def test_gated_attention_doubles_q_projection():
     from model.work.attention.gqa import GQA
 

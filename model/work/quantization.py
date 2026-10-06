@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 # Strips the two wrappers HF puts in front of a layer-relative module path.
 _LAYER_PREFIX = re.compile(r"^model\.(?:language_model\.)?layers\.\d+\.")
@@ -55,6 +55,12 @@ class QuantScheme:
     #: If set, only these module subtrees are converted. ModelOpt's GLM-5.2
     #: NVFP4 checkpoint uses this to quantize routed experts and nothing else.
     converted_prefixes: frozenset[str] | None = None
+    #: module -> is_converted. The answer depends only on the module path, but
+    #: `Model.label` asks twice per matmul group per call; on a FP8 checkpoint
+    #: with ~1,000 excluded paths the scan was ~90% of every label.
+    _converted_memo: dict[str, bool] = field(
+        default_factory=dict, init=False, repr=False, compare=False, hash=False
+    )
 
     def is_converted(self, module: str) -> bool:
         """Was ``module`` (a layer-relative path) actually quantized?
@@ -62,6 +68,12 @@ class QuantScheme:
         Matching is by path component, not raw string prefix: ``mlp.gate`` must
         not swallow the dense FFN's ``mlp.gate_proj``.
         """
+        converted = self._converted_memo.get(module)
+        if converted is None:
+            converted = self._converted_memo[module] = self._match_converted(module)
+        return converted
+
+    def _match_converted(self, module: str) -> bool:
         if self.converted_prefixes is not None and not any(
             module == prefix or module.startswith(f"{prefix}.")
             for prefix in self.converted_prefixes
