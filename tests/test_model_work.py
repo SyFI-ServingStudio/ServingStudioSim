@@ -2164,6 +2164,65 @@ def test_glm53_precision_follows_the_layer_qualified_exclusions(glm53):
     assert dtypes["kda_moe"]["router"] == "bf16"
 
 
+GLM53_NVFP4 = GLM53.with_name("glm53_flash_nvfp4.json")
+
+
+def test_glm53_nvfp4_converts_the_routed_experts_and_dense_ffn_only():
+    """NVIDIA's ModelOpt export: FP4 routed experts and dense FFN; attention, router,
+    shared expert and the mHC parameters (not nn.Linear) stay BF16; FP8 KV cache."""
+    model = load_model(GLM53_NVFP4)
+    assert model.quant.compute_dtype == "fp4"
+    assert model.quant.block_shape == (1, 16)
+    fp4 = {
+        stack.tag: {
+            group.name
+            for group in (
+                *stack.attn.matmul_groups(),
+                *stack.ffn.matmul_groups(),
+                *stack.mixer.matmul_groups(),
+            )
+            if model.matmul_compute_dtype(group) == "fp4"
+        }
+        for stack in model.layers
+    }
+    assert fp4 == {
+        "first_kda_dense": {"gate_up", "down"},
+        "kda_dense": {"gate_up", "down"},
+        "dsa_moe": {"expert_gate_up", "expert_down"},
+        "kda_moe": {"expert_gate_up", "expert_down"},
+    }
+    dsa = next(stack for stack in model.layers if stack.tag == "dsa_moe")
+    assert dsa.attn.mla_cache_dtype_bytes == dsa.attn.index_cache_dtype_bytes == 1.0
+    label = model.label(Workload(matmul_tokens=0, head_positions=0))
+    assert (
+        label.params == load_model(GLM53).label(Workload(matmul_tokens=0, head_positions=0)).params
+    )
+
+
+def test_glm53_nvfp4_hand_derived_weight_bytes():
+    """Stored bytes: FP4 + one E4M3 scale per 16 for the converted, BF16 for the rest."""
+    model = load_model(GLM53_NVFP4)
+    fp4 = 0.5 + 1 / 16
+    converted = G53_MOE_LAYERS * 288 * G53_EXPERT + G53_DENSE_LAYERS * G53_DENSE
+    bf16 = (
+        G53_KDA_LAYERS * G53_KDA_MATMUL
+        + G53_DSA_LAYERS * G53_DSA_MATMUL
+        + G53_LAYERS * G53_MHC_FN
+        + G53_MOE_LAYERS * (G53_ROUTER + G53_EXPERT)
+    )
+    stored = 0.0
+    for stack in model.layers:
+        groups = [
+            *stack.attn.matmul_groups(),
+            *stack.ffn.matmul_groups(),
+            *stack.mixer.matmul_groups(),
+        ]
+        stored += stack.count * sum(
+            group.total_count * model.weight_bytes_per_instance(group) for group in groups
+        )
+    assert stored == pytest.approx(converted * fp4 + 2 * bf16)
+
+
 def test_glm53_kpool_closed_forms_match_brute_force():
     from model.work.attention.glm53_kpool_dsa import (
         pooled_prefix_sum,
@@ -2718,3 +2777,41 @@ def test_glm53_dp_attn_ep_location_maps_consume_every_semantic_row_once():
         for location, semantics in rules.items():
             if location in tp_rules:
                 assert semantics == tp_rules[location], location
+
+
+@pytest.mark.parametrize(
+    ("nvfp4", "fp8"),
+    [
+        ("kda_dsa_moe_unified", "kda_dsa_moe_unified"),
+        ("kda_dsa_moe_unified_ep8", "kda_dsa_moe_unified_ep8"),
+        ("kda_dsa_moe_unified_moe_tp", "kda_dsa_moe_unified_moe_tp"),
+        ("pp_kda_dsa_moe_pp", "pp_kda_dsa_moe_pp"),
+        ("dp_attn_ep_moe_ep4", "dp_attn_ep_moe_ep4"),
+        ("dp_attn_ep_moe_ep8", "dp_attn_ep_moe_ep8"),
+    ],
+)
+def test_glm53_nvfp4_location_maps_are_the_fp8_maps_less_the_shared_expert_quant(nvfp4, fp8):
+    """Same semantics as FP8: the BF16 shared expert has no input quants, and the
+    DP arch's vLLM top-k select (``router_select``) is glue like the quants."""
+    root = G53_LOCATION_MAP.parent
+    mapping = json.loads((root / f"glm53_flash_vllm_nvfp4_{nvfp4}.json").read_text())
+    base = json.loads((root / f"glm53_flash_vllm_fp8_{fp8}.json").read_text())
+    arch = base["arch_types"][0].replace("_fp8_", "_nvfp4_")
+    assert mapping["arch_types"] == [arch]
+    rules = {row["location"]: row["semantics"] for row in mapping["locations"]}
+    fp8_rules = {row["location"]: row["semantics"] for row in base["locations"]}
+    dropped = {
+        loc for loc in fp8_rules if re.search(r"shared_expert\.(gate_up|down)_input_quant$", loc)
+    }
+    added = {loc for loc in rules if loc.endswith(".moe.router_select")}
+    assert len(dropped) == 4
+    assert len(added) == (2 if "dp_attn" in nvfp4 else 0)
+    assert all(fp8_rules[loc] == [] for loc in dropped)
+    assert all(rules[loc] == [] for loc in added)
+    assert set(rules) == (set(fp8_rules) - dropped) | added
+    assert all(rules[loc] == fp8_rules[loc] for loc in set(rules) - added)
+    model = work_floors._model_for_spec({"arch_type": arch, "config": str(GLM53_NVFP4)})
+    workload = work_floors._aggregate_workload(_g53_geometry_totals([(0, 2048)], [3000]))
+    mapped = [semantic for semantics in rules.values() for semantic in semantics]
+    assert len(mapped) == len(set(mapped))
+    assert {segment.name for segment in model.label(workload).segments} == set(mapped)

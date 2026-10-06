@@ -92,6 +92,22 @@ class QuantScheme:
         return math.ceil(n / block_n) * math.ceil(k / block_k) * self.scale_dtype_bytes
 
 
+def _modelopt_group_size(quant: dict) -> int:
+    """The weight group size of a ModelOpt NVFP4 config, in either layout.
+
+    The flat layout states ``weight_group_size``; the compressed-tensors layout
+    (``config_groups``, as ModelOpt 0.47 writes) states it per group, and
+    every group must agree.
+    """
+    groups = quant.get("config_groups")
+    if not groups:
+        return int(quant.get("weight_group_size", 16))
+    sizes = {int(group["weights"]["group_size"]) for group in groups.values()}
+    if len(sizes) != 1:
+        raise ValueError(f"ModelOpt config_groups disagree on weight group size: {sorted(sizes)}")
+    return sizes.pop()
+
+
 def parse_quantization_config(raw_config: dict) -> QuantScheme | None:
     """Build a :class:`QuantScheme` from a raw HF config, or None if unquantized.
 
@@ -114,22 +130,34 @@ def parse_quantization_config(raw_config: dict) -> QuantScheme | None:
             raise ValueError(
                 "model.work only supports ModelOpt checkpoints with quant_algo='NVFP4'"
             )
-        if not quant.get("routed_experts_only"):
+        excluded = quant.get("ignore", quant.get("exclude_modules"))
+        if not quant.get("routed_experts_only") and excluded is None:
             raise ValueError(
-                "ModelOpt NVFP4 configs must declare routed_experts_only=true; "
-                "the accountant cannot safely infer layer-relative exclusions from wildcards"
+                "ModelOpt NVFP4 configs must declare routed_experts_only=true or list "
+                "the unquantized modules under `ignore`"
             )
-        group_size = int(quant.get("weight_group_size", 16))
+        group_size = _modelopt_group_size(quant)
         if group_size != 16:
             raise ValueError(f"unsupported NVFP4 weight_group_size {group_size}; expected 16")
+        if quant.get("routed_experts_only"):
+            not_converted = frozenset()
+            converted_prefixes = frozenset({"mlp.experts"})
+        else:
+            # Every Linear is converted except the listed modules. The list is
+            # checkpoint-qualified with trailing `*` wildcards; a per-model
+            # builder that knows the layer schedule refines it (`not_converted`).
+            not_converted = frozenset(
+                _layer_relative(module.rstrip("*").rstrip(".")) for module in excluded
+            )
+            converted_prefixes = None
         return QuantScheme(
             bytes_per_weight=0.5,
             compute_dtype="fp4",
             # The checkpoint stores one FP8 E4M3 scale per 16 weights.
             block_shape=(1, group_size),
             scale_dtype_bytes=1.0,
-            not_converted=frozenset(),
-            converted_prefixes=frozenset({"mlp.experts"}),
+            not_converted=not_converted,
+            converted_prefixes=converted_prefixes,
         )
 
     fmt = quant.get("fmt")
