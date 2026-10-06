@@ -2,9 +2,11 @@
 # chunked prefill at 2048 tokens, as capture 2's server ran
 # (logs/20260924_0_dsv41_flash_capture/profile_nsys_cg2048.yaml: vLLM fork,
 # TP4/EP4 on 4x B200, --max-model-len 131072, --max-num-batched-tokens 2048).
-# max_model_len is that server's 131072: attn_gpu_memory_gb is its KV pool
-# (603004 blocks x 135168 B per GPU, the smallest rank's), and at vLLM's
-# default 1048576 the FlashMLA workspace takes about 4.2 GB more of it.
+# attn_gpu_memory_gb is the KV pool per GPU at each max_model_len. 131072 is
+# capture 2's server, measured: 603004 blocks x 135168 B (the smallest rank's).
+# 1048576 (vLLM's default) is an estimate, not measured: 562757 blocks, the
+# 131072 pool less about 5.4 GB of workspace sized by max_model_len (FlashMLA
+# prefill 0.61 -> 4.84 GB, the indexer K gather about 1.2 GB more).
 # gpu_time_multiplier is the capture-2 kernel alignment's (al_6e04cf7b...).
 # decoder_swa_bounded_replay is the arch preset's what-if (no capture behind it).
 deployment: unified
@@ -14,14 +16,18 @@ pools:
       - replicas: ${replicas}
         arch:
           preset: deepseek_v41_vllm
-          max_model_len: 131072
+          max_model_len: ${max_model_len}
           decoder_swa_bounded_replay: ${decoder_swa_bounded_replay}
         worker:
           type: chunked_prefill
           max_batch_tokens: 2048
           batch_policy: mix
           gpu_time_multiplier: 1.0361
-          attn_gpu_memory_gb: 81.506844672
+          attn_gpu_memory_gb: ${attn_gpu_memory_gb}
 sweep:
   replicas: [1, 2]
   decoder_swa_bounded_replay: [false, true]
+compound:
+  server:
+    ctx128k: {max_model_len: 131072, attn_gpu_memory_gb: 81.506844672}
+    ctx1m: {max_model_len: 1048576, attn_gpu_memory_gb: 76.066738176}
