@@ -34,12 +34,23 @@ from alignment.profiler.rocprof_capture import (
     build_capture_server_env,
     locate_rocpd,
     locate_rocpd_per_rank,
+    per_pid_output_name,
     per_rank_output_name,
+    pid_from_rocpd_path,
     rank_from_rocpd_path,
     resolve_rocprof_executable,
     validate_rocpd,
 )
-from alignment.profiler.roctx_shim import ROCTX_SCOPES_ENV
+from alignment.profiler.roctx_shim import RANK_PID_DIR_ENV, ROCTX_SCOPES_ENV
+
+
+def _write_pid_dbs_and_sidecars(out_dir, pidrank_dir, pid_to_rank, *, base="trace"):
+    """Simulate a tool-env run: %pid%-named DBs + the shim's pid->rank sidecars."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    pidrank_dir.mkdir(parents=True, exist_ok=True)
+    for pid, rank in pid_to_rank.items():
+        _complete_fixture(out_dir / f"{base}_pid{pid}_results.db")
+        (pidrank_dir / f"{pid}.rank").write_text(str(rank))
 
 _GUID = "0000b1c7_c35b_735b_96a7_f0a02ff013cc"
 _PID = 4242
@@ -321,6 +332,53 @@ def test_per_rank_output_name_and_rank_parsing():
     assert rank_from_rocpd_path(Path("trace_results.db")) is None
 
 
+def test_per_pid_output_name_and_pid_parsing():
+    """The per-pid -o template uses rocprofiler's always-resolvable %pid% key."""
+    from pathlib import Path
+
+    assert per_pid_output_name("trace") == "trace_pid%pid%"
+    assert pid_from_rocpd_path(Path("trace_pid12345_results.db")) == 12345
+    assert pid_from_rocpd_path(Path("trace_pid7.db")) == 7
+    assert pid_from_rocpd_path(Path("trace_rank0_results.db")) is None
+
+
+def test_attribute_pid_dbs_to_ranks_renames_by_sidecar(tmp_path):
+    """pid-named DBs are renamed to _rank<N> using the shim's pid->rank sidecars."""
+    from alignment.profiler.rocprof_capture import _attribute_pid_dbs_to_ranks
+
+    pidrank = tmp_path / "trace_pidrank"
+    # pid order deliberately not rank order, to prove the join (not a sort coincidence).
+    _write_pid_dbs_and_sidecars(tmp_path, pidrank, {5002: 0, 5000: 2, 5001: 1})
+    found = _attribute_pid_dbs_to_ranks(tmp_path, "trace", pidrank)
+    assert [p.name for p in found] == [
+        "trace_rank0_results.db",
+        "trace_rank1_results.db",
+        "trace_rank2_results.db",
+    ]
+    assert not list(tmp_path.glob("trace_pid*.db"))
+
+
+def test_attribute_pid_dbs_raises_without_matching_sidecar(tmp_path):
+    """A DB with no pid->rank sidecar is refused loudly (no guessed rank)."""
+    from alignment.profiler.rocprof_capture import _attribute_pid_dbs_to_ranks
+
+    pidrank = tmp_path / "trace_pidrank"
+    pidrank.mkdir()
+    _complete_fixture(tmp_path / "trace_pid6000_results.db")  # no sidecar for 6000
+    with pytest.raises(RuntimeError, match="no pid->rank sidecar"):
+        _attribute_pid_dbs_to_ranks(tmp_path, "trace", pidrank)
+
+
+def test_attribute_pid_dbs_raises_when_no_db(tmp_path):
+    """No per-process DB at all is a capture miss, not an empty trace."""
+    from alignment.profiler.rocprof_capture import _attribute_pid_dbs_to_ranks
+
+    pidrank = tmp_path / "trace_pidrank"
+    pidrank.mkdir()
+    with pytest.raises(FileNotFoundError, match="no per-process rocpd"):
+        _attribute_pid_dbs_to_ranks(tmp_path, "trace", pidrank)
+
+
 def test_per_rank_argv_carries_templated_output_name(tmp_path):
     """build_capture_argv emits the templated -o so each worker writes its own db."""
     from alignment.profiler.config import RocprofConfig
@@ -558,9 +616,11 @@ def test_tool_env_runs_server_without_rocprofv3_prefix(tmp_path):
     def fake_runner(argv, env=None, check=True):
         seen["argv"] = argv
         seen["env"] = env
-        out_dir.mkdir(parents=True, exist_ok=True)
-        for rank in (0, 1):
-            _complete_fixture(out_dir / f"trace_rank{rank}_results.db")
+        # The tool names DBs by %pid%; the shim drops pid->rank sidecars. Simulate two
+        # workers whose pids map to ranks 0 and 1 (out of pid order, to prove the join).
+        _write_pid_dbs_and_sidecars(
+            out_dir, Path(env[RANK_PID_DIR_ENV]), {9001: 1, 9000: 0}
+        )
         return subprocess.CompletedProcess(argv, 0)
 
     found = run_capture_per_rank_tool_env(
@@ -583,13 +643,17 @@ def test_tool_env_runs_server_without_rocprofv3_prefix(tmp_path):
     assert seen["env"]["ROCPROFILER_REGISTER_LIBRARY"] == "/opt/rocm/lib/librocprofiler-sdk.so.1.3.2"
     assert "LD_PRELOAD" not in seen["env"]
     assert seen["env"][ROCTX_SCOPES_ENV] == "1"
-    # The trace/output config is set explicitly with deterministic per-rank naming.
+    # The trace/output config is set explicitly with deterministic per-pid naming.
     assert seen["env"]["ROCPROF_KERNEL_TRACE"] == "1"
     assert seen["env"]["ROCPROF_MARKER_API_TRACE"] == "1"
     assert seen["env"]["ROCPROF_OUTPUT_FORMAT"] == "rocpd"
     assert seen["env"]["ROCPROF_OUTPUT_PATH"] == str(out_dir)
-    assert seen["env"]["ROCPROF_OUTPUT_FILE_NAME"] == f"trace_rank%q{{{OUTPUT_RANK_ENV_DEFAULT}}}%"
+    assert seen["env"]["ROCPROF_OUTPUT_FILE_NAME"] == "trace_pid%pid%"
+    # The shim sidecar dir is handed to the server so each worker records its rank.
+    assert seen["env"][RANK_PID_DIR_ENV] == str(out_dir / "trace_pidrank")
+    # The pid-named DBs were renamed to their per-rank filenames, in rank order.
     assert [p.name for p in found] == ["trace_rank0_results.db", "trace_rank1_results.db"]
+    assert not list(out_dir.glob("trace_pid*.db"))
 
 
 def test_cli_attach_mode_tool_env_end_to_end(tmp_path):
@@ -605,12 +669,12 @@ def test_cli_attach_mode_tool_env_end_to_end(tmp_path):
         return subprocess.CompletedProcess(argv, 0, stdout=dump)
 
     def fake_runner(argv, env=None, check=True):
-        # No rocprofv3 wrap: argv is the raw server command.
+        # No rocprofv3 wrap: argv is the raw server command. The tool writes %pid% DBs
+        # and the shim drops pid->rank sidecars; the driver renames to per-rank DBs.
         assert argv[0] == "python"
-        base = "trace"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        for rank in (0, 1):
-            _complete_fixture(out_dir / f"{base}_rank{rank}_results.db")
+        _write_pid_dbs_and_sidecars(
+            out_dir, Path(env[RANK_PID_DIR_ENV]), {7000: 0, 7001: 1}
+        )
         return subprocess.CompletedProcess(argv, 0)
 
     rc = rocprof_capture.main(

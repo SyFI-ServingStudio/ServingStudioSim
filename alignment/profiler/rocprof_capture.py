@@ -45,7 +45,7 @@ from ..rocpd.evidence import (
     sentinel_iteration_regions,
 )
 from .config import RocprofConfig
-from .roctx_shim import ROCTX_SCOPES_ENV
+from .roctx_shim import RANK_PID_DIR_ENV, ROCTX_SCOPES_ENV
 
 try:  # the readers live in the profiling package (C0)
     from profiling.profilers.rocprof_kernel_profiler import (
@@ -131,6 +131,13 @@ def write_roctx_sitecustomize_dir(parent: Path | None = None) -> Path:
 #: templated ``-o`` (``<name>_rank<N>_results.db`` / ``<name>_rank<N>.db``).
 _RANK_FROM_FILENAME_RE = re.compile(r"_rank(\d+)(?:_results)?\.db$")
 
+#: Recovers the OS pid from a per-process rocpd filename the tool-env path writes
+#: with the ``%pid%`` placeholder (``<name>_pid<PID>_results.db`` / ``<name>_pid<PID>.db``).
+#: rocprofiler-sdk always resolves ``%pid%`` (unlike ``%q{RANK}%``, which expands at
+#: process start before vLLM's MultiprocExecutor stamps the worker rank), so naming by
+#: pid and attributing rank from a sidecar afterwards is the collision-free mechanism.
+_PID_FROM_FILENAME_RE = re.compile(r"_pid(\d+)(?:_results)?\.db$")
+
 #: How a TP>1 per-rank capture attaches the profiler to the worker processes.
 #:
 #: ``ATTACH_MODE_WRAP`` is the original mechanism: one ``rocprofv3`` CLI wraps the
@@ -215,6 +222,89 @@ def rank_from_rocpd_path(db_path: Path) -> int | None:
     """Parse the worker rank out of a per-rank rocpd filename, or ``None``."""
     match = _RANK_FROM_FILENAME_RE.search(db_path.name)
     return int(match.group(1)) if match else None
+
+
+def per_pid_output_name(output_name: str) -> str:
+    """Template a per-process rocprofv3 ``-o`` name keyed by OS pid.
+
+    rocprofiler-sdk resolves the ``%pid%`` placeholder in every traced process
+    (always, and uniquely), so an N-way tensor-parallel server writes one database
+    per worker — ``<name>_pid<PID>_results.db`` — with no filename collision. This
+    replaces the ``%q{RANK}%`` template for the tool-env path, where the rank env is
+    not yet set when rocprofiler-sdk expands the output name at runtime init; rank is
+    recovered afterwards from the shim's pid->rank sidecars (:func:`_attribute_pid_dbs_to_ranks`).
+    """
+    return f"{output_name}_pid%pid%"
+
+
+def pid_from_rocpd_path(db_path: Path) -> int | None:
+    """Parse the OS pid out of a per-process rocpd filename, or ``None``."""
+    match = _PID_FROM_FILENAME_RE.search(db_path.name)
+    return int(match.group(1)) if match else None
+
+
+def _read_pid_rank_sidecars(pidrank_dir: Path) -> dict[int, int]:
+    """Read the ``<pid>.rank`` sidecars the roctx shim drops, as ``{pid: rank}``.
+
+    The shim writes one file per GPU worker (see
+    :func:`roctx_shim.write_rank_pid_sidecar`) once it learns its rank on the first
+    forward. A malformed or non-numeric sidecar is skipped rather than aborting the
+    whole attribution.
+    """
+    mapping: dict[int, int] = {}
+    if not pidrank_dir.is_dir():
+        return mapping
+    for sidecar in pidrank_dir.glob("*.rank"):
+        try:
+            pid = int(sidecar.stem)
+            rank = int(sidecar.read_text().strip())
+        except (ValueError, OSError):
+            continue
+        mapping[pid] = rank
+    return mapping
+
+
+def _attribute_pid_dbs_to_ranks(
+    output_dir: Path, output_name: str, pidrank_dir: Path
+) -> list[Path]:
+    """Rename each ``%pid%``-named rocpd to its ``_rank<N>`` filename, in rank order.
+
+    Joins the per-process databases a tool-env capture wrote
+    (``<name>_pid<PID>{suffix}``) to the shim's pid->rank sidecars and renames each to
+    the ``<name>_rank<N>{suffix}`` spelling the merge pipeline keys rank on
+    (``rocpd/merge.py`` parses ``rank(\\d+)`` from the filename). Raises when no
+    per-process database exists (a capture that traced no worker), or when a database
+    has no matching sidecar (the shim never stamped that worker's rank — attributing it
+    to a guessed rank would be fabricated data, so refuse loudly instead).
+    """
+    pid_rank = _read_pid_rank_sidecars(pidrank_dir)
+    renamed: list[tuple[int, Path]] = []
+    seen: set[Path] = set()
+    for suffix in _ROCPD_SUFFIXES:
+        for candidate in sorted(output_dir.glob(f"{output_name}_pid*{suffix}")):
+            if candidate in seen:
+                continue
+            pid = pid_from_rocpd_path(candidate)
+            if pid is None:
+                continue
+            seen.add(candidate)
+            if pid not in pid_rank:
+                raise RuntimeError(
+                    f"rocpd {candidate.name} has no pid->rank sidecar in {pidrank_dir} "
+                    f"(sidecars present: {sorted(pid_rank)}); the roctx shim never stamped "
+                    "this worker's rank, so its rank cannot be attributed without guessing"
+                )
+            rank = pid_rank[pid]
+            target = output_dir / f"{output_name}_rank{rank}{suffix}"
+            candidate.rename(target)
+            renamed.append((rank, target))
+    if not renamed:
+        raise FileNotFoundError(
+            f"no per-process rocpd databases for output name {output_name!r} under "
+            f"{output_dir} (looked for {output_name}_pid<PID>{_ROCPD_SUFFIXES})"
+        )
+    renamed.sort(key=lambda item: item[0])
+    return [path for _, path in renamed]
 
 
 @dataclass(frozen=True)
@@ -493,9 +583,9 @@ def tool_env_output_config(
     Set from the capture config with the documented rocprofiler-sdk variable names
     (``ROCPROF_OUTPUT_PATH`` / ``ROCPROF_OUTPUT_FILE_NAME`` / ``ROCPROF_OUTPUT_FORMAT``
     and the per-trace toggles) rather than relying on rocprofv3 to export them, so
-    each worker writes ``<output_name>_rank<N>`` under ``output_dir`` deterministically.
-    ``output_name_template`` carries the per-rank ``%q{RANK}%`` key the tool resolves
-    for itself in each worker process.
+    each worker writes its own database under ``output_dir`` deterministically.
+    ``output_name_template`` carries the per-process ``%pid%`` key the tool resolves
+    for itself in each worker process (rank is attributed afterwards from sidecars).
     """
     env = {
         "ROCPROF_OUTPUT_FORMAT": config.output_format,
@@ -544,7 +634,11 @@ def run_capture_per_rank_tool_env(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     base_env = dict(os.environ if env is None else env)
-    templated_name = per_rank_output_name(output_name, rank_env)
+    # Name each worker's database by %pid% (always resolvable, unique) rather than
+    # %q{RANK}% (empty at runtime init, before vLLM's MultiprocExecutor stamps the
+    # rank — which collided every worker onto one filename). Rank is recovered after
+    # the run from the shim's pid->rank sidecars and the files renamed to _rank<N>.
+    templated_name = per_pid_output_name(output_name)
     injected = harvest_tool_env(
         executable,
         config,
@@ -568,13 +662,17 @@ def run_capture_per_rank_tool_env(
         if key in _TOOL_ENV_DROP_KEYS:
             continue
         server_env[key] = value
-    # Set the trace/output configuration explicitly (deterministic per-rank naming)
+    # Set the trace/output configuration explicitly (deterministic per-pid naming)
     # rather than trusting rocprofv3 to have exported it into the harvested child env.
     server_env.update(tool_env_output_config(config, output_dir, templated_name))
+    # Point the roctx shim at a sidecar dir so each worker records its pid->rank once
+    # it learns its rank; the driver reads these below to rename pid DBs to rank DBs.
+    pidrank_dir = output_dir / f"{output_name}_pidrank"
+    server_env[RANK_PID_DIR_ENV] = str(pidrank_dir)
     completed = runner(list(server_argv), env=server_env, check=True)  # type: ignore[call-arg]
     if getattr(completed, "returncode", 0) not in (0, None):
         raise RuntimeError(f"server exited with code {completed.returncode}")
-    return locate_rocpd_per_rank(output_dir, output_name)
+    return _attribute_pid_dbs_to_ranks(output_dir, output_name, pidrank_dir)
 
 
 def validate_rocpd(db_path: Path) -> dict:

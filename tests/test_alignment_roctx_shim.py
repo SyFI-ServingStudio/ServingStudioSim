@@ -33,11 +33,13 @@ from alignment.profiler.roctx_shim import (
     ROCTX_PLUGIN_ENTRY_POINT_NAME,
     IterationAnnotator,
     RecordingBackend,
+    RANK_PID_DIR_ENV,
     install_vllm_roctx_shim,
     iteration_label,
     iteration_record_marker,
     roctx_scopes_enabled,
     select_backend,
+    write_rank_pid_sidecar,
 )
 from alignment.rocpd.evidence import build_ranges_from_rocpd
 
@@ -47,6 +49,21 @@ _GUID = "0000b1c7_c35b_735b_96a7_f0a02ff013cc"
 _PID = 4242
 _TID = 55
 _AGENT = 1
+
+
+def test_write_rank_pid_sidecar_noop_without_env():
+    """Normal serving (env unset) never touches the filesystem."""
+    assert write_rank_pid_sidecar(0, environ={}) is None
+
+
+def test_write_rank_pid_sidecar_records_pid_to_rank(tmp_path):
+    """When the capture driver sets the dir, the shim drops <pid>.rank mapping rank."""
+    env = {RANK_PID_DIR_ENV: str(tmp_path / "pidrank")}
+    path = write_rank_pid_sidecar(3, environ=env, pid=8080)
+    assert path is not None
+    sidecar = Path(path)
+    assert sidecar.name == "8080.rank"
+    assert sidecar.read_text() == "3"
 
 
 def test_emitted_label_matches_parser_regex():

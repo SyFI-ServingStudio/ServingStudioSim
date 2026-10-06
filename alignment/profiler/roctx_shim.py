@@ -58,6 +58,16 @@ ROCTX_SCOPES_ENV = "VLLM_ROCTX_SCOPES_FOR_PROFILING"
 WORKER_RANK_ENV = "RANK"
 WORKER_LOCAL_RANK_ENV = "LOCAL_RANK"
 
+#: When set by the capture driver, the directory into which each worker drops a
+#: ``<pid>.rank`` sidecar mapping its OS process id to its global rank, on the first
+#: forward (right where the rank becomes known). The tool-env attach path names each
+#: worker's rocpd by ``%pid%`` — the only discriminator the rocprofiler-sdk tool
+#: resolves reliably (``%q{RANK}%`` expands before the worker's rank is set on this
+#: stack) — and uses these sidecars to rename ``<name>_pid<PID>`` to the per-rank
+#: ``<name>_rank<N>`` the offline merge keys on. Unset during normal serving, so this
+#: is inert off the capture path.
+RANK_PID_DIR_ENV = "VIBESIM_RANK_PID_DIR"
+
 #: The ``vllm.general_plugins`` entry-point name this package registers for
 #: :func:`install_vllm_roctx_shim` (see ``pyproject.toml``). vLLM auto-loads and
 #: calls every entry point in that group in each worker process unless
@@ -604,6 +614,30 @@ class IterationAnnotator:
         self._backend.mark(iteration_record_marker(payload, iteration=iteration))
 
 
+def write_rank_pid_sidecar(
+    rank: int, *, environ: dict[str, str] | None = None, pid: int | None = None
+) -> str | None:
+    """Drop a ``<pid>.rank`` sidecar mapping this process to ``rank``, or ``None``.
+
+    Written only when :data:`RANK_PID_DIR_ENV` names a directory (the tool-env
+    capture path sets it); returns the sidecar path written, or ``None`` when the
+    env is unset so normal serving never touches the filesystem. The capture driver
+    reads these to rename each ``%pid%``-named rocpd to its per-rank filename.
+    """
+    env = os.environ if environ is None else environ
+    sidecar_dir = env.get(RANK_PID_DIR_ENV)
+    if not sidecar_dir:
+        return None
+    from pathlib import Path  # noqa: PLC0415 — module stays import-light without pathlib
+
+    pid = os.getpid() if pid is None else pid
+    directory = Path(sidecar_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    sidecar = directory / f"{pid}.rank"
+    sidecar.write_text(str(rank))
+    return str(sidecar)
+
+
 def roctx_scopes_enabled(environ: dict[str, str] | None = None) -> bool:
     """Whether the env gate turns the iteration annotation on."""
     env = os.environ if environ is None else environ
@@ -695,6 +729,13 @@ def install_vllm_roctx_shim(
             return
         os.environ[WORKER_RANK_ENV] = str(rank)
         os.environ[WORKER_LOCAL_RANK_ENV] = str(rank)
+        # Drop the pid->rank sidecar the tool-env capture path renames DBs by. The
+        # %pid% output name is already correct in the tool; this records which rank
+        # that pid is. Guarded so a sidecar write never perturbs a forward.
+        try:
+            write_rank_pid_sidecar(rank)
+        except Exception:
+            pass
 
     def _wrap_execute_model(runner_cls: type) -> None:
         original_execute_model = runner_cls.execute_model
