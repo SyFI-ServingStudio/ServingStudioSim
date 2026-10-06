@@ -9,8 +9,8 @@
 //!
 //! Launch order and streams (capture 2 = Slurm job 1185, device 0; decode
 //! iteration 1337 = 48 decode rows, mixed iteration 310 = 2048 tokens, mixed
-//! iteration 288 = 174 tokens; timestamps relative to each iteration's first
-//! kernel, extracted to `tmp/dsv41/phase2/iter*_ts.txt`):
+//! iteration 288 = 174 tokens; timestamps in us relative to each iteration's
+//! first kernel):
 //!
 //! 1. entry: `mega_mhc` (previous FFN post + this pre), or at layer 0 the
 //!    hc-copy expand plus the non-fused pre (hc_prenorm GEMM, pre_big_fuse).
