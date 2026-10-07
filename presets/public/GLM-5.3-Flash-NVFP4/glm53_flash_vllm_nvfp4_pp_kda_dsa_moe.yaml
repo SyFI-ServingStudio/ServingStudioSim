@@ -1,10 +1,12 @@
-checkpoint: zai-org/GLM-5.3-Flash
+# There is no NVFP4 capture yet: the workloads are the FP8 GLM-5.3-Flash captures'
+# token corpora. Routes are per token, and the NVFP4 export keeps the router in BF16
+# (model/catalog.yaml), so the FP8 routes stand in for NVFP4's.
+checkpoint: nvidia/GLM-5.3-Flash-NVFP4
 gpu: NVIDIA B200
 arch:
-  type: glm53_flash_vllm_fp8_kda_dsa_moe
-  fp8: true
-  tp_size: ${tp_size}
-  enable_expert_parallel: ${enable_expert_parallel}
+  type: glm53_flash_vllm_nvfp4_pp_kda_dsa_moe
+  fp8: false
+  pp_size: ${pp_size}
   max_model_len: ${max_model_len}
   cudagraph_capture_sizes: [1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136, 144, 152, 160, 168, 176, 184, 192, 200, 208, 216, 224, 232, 240, 248, 256, 272, 288, 304, 320,
     336, 352, 368, 384, 400, 416, 432, 448, 464, 480, 496, 512, 528, 544, 560, 576, 592, 608, 624, 640, 656, 672, 688, 704, 720, 736, 752, 768, 784, 800, 816, 832, 848, 864, 880, 896, 912, 928, 944, 960,
@@ -14,16 +16,11 @@ arch:
   routing: ${routing}
   token_corpus_file: ${token_corpus_file}
 sweep:
-  tp_size: [4, 8]
-  enable_expert_parallel: [true, false]
+  pp_size: [4, 8]
   max_model_len: [8192, 65536, 131072, 262144, 524288, 1048576]
-# diverse_100's routes are measured (nvfp4_fused_moe rows) only at TP4 with EP.
-constraints: [workload == 'balanced_c32' or (tp_size == 4 and enable_expert_parallel)]
+# Only balanced_c32: diverse_100's routes lack nvfp4_fused_moe rows for NVFP4.
 compound:
   workload:
-    diverse_100:
-      routing: corpus
-      token_corpus_file: hf://datasets/UW-SyFI/servingstudio-workload@c3f5ecaab0bbff757c64864bf2ec24f5e1f76b5c/glm53_flash_fp8/vllm/diverse_100/capture/20260925/manifest.json
     balanced_c32:
       routing: corpus
       token_corpus_file: hf://datasets/UW-SyFI/servingstudio-workload@c3f5ecaab0bbff757c64864bf2ec24f5e1f76b5c/glm53_flash_fp8/vllm/balanced_c32/capture/20260924/manifest.json

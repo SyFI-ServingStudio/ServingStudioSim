@@ -1,7 +1,0 @@
-[
-  { "groups": [ { "prefill_chunk_pairs": [[0, 1024]] } ] },
-  { "groups": [ { "prefill_chunk_pairs": [[0, 4096]] } ] },
-  { "groups": [ { "prefill_chunk_pairs": [[0, 16384]] } ] },
-  { "groups": [ { "prefill_chunk_pairs": [[57344, 8192]] } ] },
-  { "groups": [ { "prefill_chunk_pairs": [[0, 2048], [0, 2048], [0, 2048], [0, 2048]] } ] }
-]

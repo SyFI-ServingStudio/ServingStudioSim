@@ -37,8 +37,22 @@ glm53_vllm_nvfp4_dsa_moe_dflash2:
   name: "vLLM, TP and EP, DFlash speculative decoding"
 glm52_sglang_nvfp4_tp_dsa_moe:
   name: "SGLang, TP"
+glm52_vllm_nvfp4_pp_dsa_moe:
+  name: "vLLM, PP"
+glm52_vllm_nvfp4_dp_attn_dsa_moe:
+  name: "vLLM, DP attention, EP MoE"
 glm53_flash_vllm_fp8_kda_dsa_moe:
-  name: "vLLM, TP and EP"
+  name: "vLLM, TP attention, EP or TP MoE"
+glm53_flash_vllm_fp8_pp_kda_dsa_moe:
+  name: "vLLM, PP"
+glm53_flash_vllm_fp8_dp_attn_ep_moe:
+  name: "vLLM, DP attention, EP MoE"
+glm53_flash_vllm_nvfp4_kda_dsa_moe:
+  name: "vLLM, TP attention, EP or TP MoE"
+glm53_flash_vllm_nvfp4_pp_kda_dsa_moe:
+  name: "vLLM, PP"
+glm53_flash_vllm_nvfp4_dp_attn_ep_moe:
+  name: "vLLM, DP attention, EP MoE"
 deepseek_v41_vllm:
   name: "vLLM, TP attention, EP MoE"
 deepseek_v41_vllm_serial_streams:
