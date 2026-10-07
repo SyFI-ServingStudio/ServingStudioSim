@@ -33,6 +33,16 @@
 //! slices of `P / depth`, not a shrinking `P/depth, 3P/depth^2, ...` series.
 //! The split never waits: a microbatch takes `min(pending, target)` and starts.
 //!
+//! `with_slot_plan(depth)` instead keeps a plan of the next `depth`
+//! microbatches (`MicrobatchSlotPlan`) and bin-packs whole requests into the
+//! least-loaded one, splitting a request only at `max_batch_tokens`. A request
+//! is admitted, and its full KV footprint reserved, when it is first placed:
+//! a planned chunk can then always launch, and at most `depth` microbatches'
+//! worth of prompts hold KV before their first chunk runs. Requests that find no
+//! room stay in the pending policy. At launch the head slot's chunks are
+//! scheduled as planned; ready decodes still come first, and a chunk they push
+//! past `max_batch_tokens` is cut and its request re-planned.
+//!
 //! The pending policy owns fresh requests. A prompt that has started and still
 //! has unscheduled prefill tokens stays in `started_prefills`, in start order,
 //! and keeps priority over fresh prompts. A request whose last chunk is in flight
@@ -49,12 +59,13 @@
 use std::collections::HashSet;
 
 use crate::common::{RequestId, Time, UnifiedStage};
-use crate::worker::kv::ChunkedPrefillKv;
+use crate::worker::kv::{ChunkedPrefillKv, ResolvedPrefillContext};
 use crate::worker::shared::advance_scope::AdvanceScope;
 use crate::worker::shared::context::WorkerContext;
 use crate::worker::types::IterBatchPlan;
 
 use super::chunked_prefill_admission::next_chunk_tokens;
+use super::microbatch_slot_plan::{MicrobatchSlotPlan, UnplannedPrefill};
 use super::{AdmissionCandidate, EnqueueSequence, MicrobatchAdmission, PendingOrderPolicy};
 
 /// The only attention partition of a pipeline head.
@@ -82,6 +93,8 @@ pub struct PipelinedChunkedPrefillAdmission<P: PendingOrderPolicy> {
     even_split: Option<EvenSplit>,
     /// Prefill tokens of the committed microbatches that have not exited.
     in_flight_prefill_tokens: u64,
+    /// The next microbatches' planned prefill; `None` schedules at formation.
+    slot_plan: Option<MicrobatchSlotPlan>,
 }
 
 /// Prefill sizing of [`PipelinedChunkedPrefillAdmission::with_even_split`].
@@ -136,12 +149,17 @@ impl<P: PendingOrderPolicy> PipelinedChunkedPrefillAdmission<P> {
             balanced_depth: None,
             even_split: None,
             in_flight_prefill_tokens: 0,
+            slot_plan: None,
         }
     }
 
     /// End every non-final chunk on a multiple of `quantum` context tokens.
     pub(crate) fn with_chunk_end_quantum(mut self, quantum: u32) -> Self {
         assert!(quantum > 0, "chunk-end quantum must be positive");
+        assert!(
+            self.slot_plan.is_none(),
+            "the microbatch slot plan does not align chunk ends; use plain chunk alignment"
+        );
         self.chunk_end_quantum = Some(quantum);
         self
     }
@@ -150,6 +168,17 @@ impl<P: PendingOrderPolicy> PipelinedChunkedPrefillAdmission<P> {
     pub(crate) fn with_balanced_decodes(mut self, depth: u16) -> Self {
         assert!(depth > 0, "pipeline depth must be positive");
         self.balanced_depth = Some(depth);
+        self
+    }
+
+    /// Bin-pack whole requests into a plan of the next `depth` microbatches.
+    pub(crate) fn with_slot_plan(mut self, depth: u16) -> Self {
+        assert!(
+            self.chunk_end_quantum.is_none(),
+            "the microbatch slot plan does not align chunk ends; use plain chunk alignment"
+        );
+        assert!(self.even_split.is_none(), "choose one microbatch split");
+        self.slot_plan = Some(MicrobatchSlotPlan::new(depth, self.max_batch_tokens));
         self
     }
 
@@ -192,6 +221,120 @@ impl<P: PendingOrderPolicy> PipelinedChunkedPrefillAdmission<P> {
         remaining_budget.min(target as u32)
     }
 
+    /// Pop the policy head, reserve its KV, and stamp it into prefill.
+    fn admit_head<K: ChunkedPrefillKv>(
+        &mut self,
+        kv_store: &mut K,
+        context: &WorkerContext,
+        candidate: AdmissionCandidate,
+        resolved_prefill: ResolvedPrefillContext,
+        footprint: K::Footprint,
+        now: Time,
+    ) {
+        let popped = self.policy.pop(&mut self.policy_context);
+        debug_assert_eq!(popped, Some(candidate));
+        kv_store.reserve_chunked_prefill_context(
+            candidate.request_id,
+            PARTITION,
+            resolved_prefill,
+            footprint,
+            now,
+        );
+        let mut store = context.requests.borrow_mut();
+        store.mark_admitted(candidate.request_id);
+        let record = &mut store[candidate.request_id];
+        record.record_prefix_cache_hit_tokens(resolved_prefill.resident_prefix_tokens());
+        context.stamp_stage(record, now, UnifiedStage::Prefill as u16);
+    }
+
+    /// Place started remainders, then fresh prompts while a future slot has
+    /// room and KV admits them.
+    fn plan_pending_prefill<K: ChunkedPrefillKv>(
+        &mut self,
+        plan: &mut MicrobatchSlotPlan,
+        kv_store: &mut K,
+        context: &WorkerContext,
+        now: Time,
+    ) {
+        let mut index = 0;
+        while index < plan.unplanned.len() {
+            let UnplannedPrefill { request, tokens } = plan.unplanned[index];
+            let left = plan.place(request, tokens);
+            if left == 0 {
+                plan.unplanned.remove(index);
+            } else {
+                plan.unplanned[index].tokens = left;
+                index += 1;
+            }
+        }
+        while plan.has_room() {
+            self.policy.refresh_head(&mut |candidate| {
+                kv_store
+                    .resident_prefix_tokens(candidate.fresh_prompt_tokens, candidate.session_input)
+            });
+            let Some(candidate) = self.policy.peek() else {
+                break;
+            };
+            let resolved_prefill = kv_store.preview_prefill_context(
+                PARTITION,
+                candidate.fresh_prompt_tokens,
+                candidate.session_input,
+            );
+            let tokens = resolved_prefill.remaining_prefill_tokens();
+            if tokens == 0 {
+                break;
+            }
+            let footprint = kv_store.footprint(
+                candidate.request_id,
+                resolved_prefill.post_prefill_context_tokens(),
+                candidate.remaining_output_tokens,
+            );
+            if !kv_store.fits(PARTITION, &footprint) {
+                break;
+            }
+            self.admit_head(
+                kv_store,
+                context,
+                candidate,
+                resolved_prefill,
+                footprint,
+                now,
+            );
+            let left = plan.place(candidate.request_id, tokens);
+            if left > 0 {
+                plan.unplanned.push_back(UnplannedPrefill {
+                    request: candidate.request_id,
+                    tokens: left,
+                });
+            }
+        }
+    }
+
+    /// Schedule the head slot's chunks into KV within `budget`. A chunk the
+    /// budget cuts returns, with its request's later chunks, to the front of
+    /// the unplanned list.
+    fn launch_planned_slot<K: ChunkedPrefillKv>(
+        plan: &mut MicrobatchSlotPlan,
+        kv_store: &mut K,
+        mut budget: u32,
+    ) {
+        let head = plan.launch_head_slot();
+        for chunk in head.chunks {
+            let take = chunk.tokens.min(budget);
+            if take > 0 {
+                kv_store.schedule_prefill_chunk(chunk.request, PARTITION, take);
+                budget -= take;
+            }
+            if take < chunk.tokens {
+                let tokens = chunk.tokens - take + plan.withdraw(chunk.request);
+                plan.unplanned.push_front(UnplannedPrefill {
+                    request: chunk.request,
+                    tokens,
+                });
+            }
+        }
+    }
+
     /// Admit fresh prompts into the budget left after started prompts.
     fn admit_fresh_prompts<K: ChunkedPrefillKv>(
         &mut self,
@@ -230,22 +373,14 @@ impl<P: PendingOrderPolicy> PipelinedChunkedPrefillAdmission<P> {
             if !kv_store.fits(PARTITION, &footprint) {
                 break;
             }
-            let popped = self.policy.pop(&mut self.policy_context);
-            debug_assert_eq!(popped, Some(candidate));
-            kv_store.reserve_chunked_prefill_context(
-                candidate.request_id,
-                PARTITION,
+            self.admit_head(
+                kv_store,
+                context,
+                candidate,
                 resolved_prefill,
                 footprint,
                 now,
             );
-            {
-                let mut store = context.requests.borrow_mut();
-                store.mark_admitted(candidate.request_id);
-                let record = &mut store[candidate.request_id];
-                record.record_prefix_cache_hit_tokens(resolved_prefill.resident_prefix_tokens());
-                context.stamp_stage(record, now, UnifiedStage::Prefill as u16);
-            }
             kv_store.schedule_prefill_chunk(candidate.request_id, PARTITION, chunk_tokens);
             remaining_budget -= chunk_tokens;
             if chunk_tokens < resolved_prefill.remaining_prefill_tokens() {
@@ -326,6 +461,12 @@ where
         });
         batch_plan.reset_decode_participation(1, false);
         batch_plan.select_partition_decodes(PARTITION, self.scheduled_decodes.clone());
+        if let Some(mut plan) = self.slot_plan.take() {
+            self.plan_pending_prefill(&mut plan, kv_store, context, now);
+            Self::launch_planned_slot(&mut plan, kv_store, remaining_budget);
+            self.slot_plan = Some(plan);
+            return kv_store.has_prefill_admit(PARTITION) || !self.scheduled_decodes.is_empty();
+        }
         let mut remaining_budget = self.prefill_budget(kv_store, remaining_budget);
         // Started prompts keep start order. One that cannot run keeps its place.
         self.started_prefills.retain(|candidate| {
