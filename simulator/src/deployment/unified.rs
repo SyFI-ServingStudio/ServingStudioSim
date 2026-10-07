@@ -326,7 +326,8 @@ impl Deployment for UnifiedDeployment {
                 cudagraph_capture_sizes,
                 ..
             } => {
-                ensure_hybrid_worker("GLM-5.3-Flash vLLM DP-attention/EP", &g.worker)?;
+                // Barebone's hybrid recipe holds one partition, not one per rank.
+                ensure_chunked_prefill_worker("GLM-5.3-Flash vLLM DP-attention/EP", &g.worker)?;
                 let model = Arc::new(arch_build::glm53_flash_vllm_fp8_dp_attn_ep_moe(
                     model_spec,
                     arch_build::glm53_flash_quant(&g.arch),
@@ -851,6 +852,13 @@ fn ensure_hybrid_worker(arch_name: &str, worker: &IterWorkerSel) -> anyhow::Resu
         other => bail!(
             "unified: {arch_name} requires worker `barebone` or `chunked_prefill`, got {other:?}"
         ),
+    }
+}
+
+fn ensure_chunked_prefill_worker(arch_name: &str, worker: &IterWorkerSel) -> anyhow::Result<()> {
+    match worker {
+        IterWorkerSel::ChunkedPrefill { .. } => Ok(()),
+        other => bail!("unified: {arch_name} requires worker `chunked_prefill`, got {other:?}"),
     }
 }
 

@@ -243,6 +243,16 @@ pub(crate) fn fit_failed(reason: impl Into<String>) -> BuildError {
     }
 }
 
+/// The TP boundaries are FlashInfer's fused all-reduce over the EP group, so
+/// a graph that builds them needs a measured fusion workspace at `ep_size`.
+fn refuse_unfused_all_reduce(parallel: &Glm52VllmNvfp4DsaMoeParallel) -> Result<(), BuildError> {
+    let ep_size = u32::from(parallel.ep_size);
+    match fused_all_reduce_refusal(FUSED_ALLREDUCE_BACKENDS, &parallel.gpu_name, ep_size) {
+        Some(reason) => Err(fit_failed(format!("ep_size {ep_size}: {reason}"))),
+        None => Ok(()),
+    }
+}
+
 fn attention_config(
     model: &Glm52ModelCfg,
     parallel: &Glm52VllmNvfp4DsaMoeParallel,
@@ -454,22 +464,10 @@ fn build_configs_for_decode(
         )));
     }
     // The TP boundaries are FlashInfer's fused all-reduce over the EP group.
-    // EP1 has no TP boundary: it is the one-GPU pipeline stage, which leaves
-    // the all-reduce leaves out of its graph.
-    let refusal = (parallel.ep_size > 1)
-        .then(|| {
-            fused_all_reduce_refusal(
-                FUSED_ALLREDUCE_BACKENDS,
-                &parallel.gpu_name,
-                u32::from(parallel.ep_size),
-            )
-        })
-        .flatten();
-    if let Some(reason) = refusal {
-        return Err(fit_failed(format!(
-            "ep_size {}: {reason}",
-            parallel.ep_size
-        )));
+    // EP1 is the one-GPU pipeline stage or DP rank, which builds no
+    // all-reduce; graphs that do build one check in `Glm52TargetForward::build`.
+    if parallel.ep_size > 1 {
+        refuse_unfused_all_reduce(parallel)?;
     }
     if parallel.nvl_num_gpu == 0
         || parallel.nvl_num_gpu > parallel.ep_size
@@ -1597,6 +1595,7 @@ impl Glm52TargetForward {
         resolved: &Glm52VllmNvfp4DsaMoeResolved,
         bridge: &PerfApiBridge,
     ) -> Result<Self, BuildError> {
+        refuse_unfused_all_reduce(&resolved.raw_cfg.parallel)?;
         let ep_size = resolved.raw_cfg.parallel.ep_size;
         let embedding = build_atomic(
             format!("{name}.main.embedding"),
@@ -3036,6 +3035,29 @@ mod tests {
         let bridge = PerfApiBridge::new_uninit_for_test();
         bridge.enable_enumerate();
         assert!(build_speculative("unified".to_string(), resolve_configs(&cfg), &bridge).is_err());
+    }
+
+    #[test]
+    fn the_ep1_recipe_builds_but_its_all_reduce_graph_is_refused() {
+        // EP1 is the pipeline stage's and DP rank's recipe; the graph with TP
+        // boundaries must still refuse it cleanly instead of panicking on the
+        // missing fusion workspace.
+        let demand = ExpertDemand::popularity(&RoutingDistribution::uniform(NUM_EXPERTS), 1);
+        let cfg = build_configs(
+            &model(),
+            &parallel(1),
+            &demand,
+            None,
+            false,
+            Glm52MtpMode::Off,
+        )
+        .unwrap();
+        let bridge = PerfApiBridge::new_uninit_for_test();
+        bridge.enable_enumerate();
+        let error = build("unified".to_string(), resolve_configs(&cfg), &bridge)
+            .err()
+            .expect("EP1 has no fused all-reduce");
+        assert!(error.to_string().contains("ep_size 1"), "{error}");
     }
 
     #[test]

@@ -575,18 +575,12 @@ pub fn build_configs(
     demand: &ExpertDemand,
 ) -> std::result::Result<Glm53FlashVllmConfigs, BuildError> {
     let tp = u32::from(parallel.tp_size);
-    let all_reduce_backends = if tp == 8 {
-        TP8_ALL_REDUCE_BACKENDS
-    } else {
-        ALL_REDUCE_BACKENDS
-    };
-    // TP1 has no TP boundary: it is the one-GPU pipeline stage, which builds
-    // its layers without the all-reduces.
+    let all_reduce_backends = tp_all_reduce_backends(tp);
+    // TP1 has no TP boundary: it is the one-GPU pipeline stage or DP rank,
+    // which builds its layers without the all-reduces. `build`, which always
+    // builds them, refuses TP1 itself.
     if tp > 1 {
-        if let Some(reason) = fused_all_reduce_refusal(all_reduce_backends, &parallel.gpu_name, tp)
-        {
-            return Err(fit_failed(format!("tp_size {tp}: {reason}")));
-        }
+        refuse_unfused_all_reduce(parallel)?;
     }
     let divide = |what: &str, value: u32| -> std::result::Result<u32, BuildError> {
         if tp == 0 || value % tp != 0 {
@@ -1222,6 +1216,7 @@ pub fn build(
     bridge: &PerfApiBridge,
 ) -> std::result::Result<Glm53FlashVllmModel, BuildError> {
     let cfg = &resolved.raw_cfg;
+    refuse_unfused_all_reduce(&cfg.parallel)?;
     let n = name.as_str();
     let groups = cfg
         .groups
@@ -1608,6 +1603,26 @@ where
     ev.push(metrics, || input.clone().into());
 }
 
+fn tp_all_reduce_backends(tp: u32) -> &'static [&'static str] {
+    if tp == 8 {
+        TP8_ALL_REDUCE_BACKENDS
+    } else {
+        ALL_REDUCE_BACKENDS
+    }
+}
+
+/// A graph with TP boundaries needs vLLM's fused all-reduce workspace at
+/// `tp_size`; TP1 has none.
+fn refuse_unfused_all_reduce(
+    parallel: &Glm53FlashVllmParallel,
+) -> std::result::Result<(), BuildError> {
+    let tp = u32::from(parallel.tp_size);
+    match fused_all_reduce_refusal(tp_all_reduce_backends(tp), &parallel.gpu_name, tp) {
+        Some(reason) => Err(fit_failed(format!("tp_size {tp}: {reason}"))),
+        None => Ok(()),
+    }
+}
+
 fn fit_failed(reason: impl Into<String>) -> BuildError {
     BuildError::FitFailed {
         kind: ARCH_KIND,
@@ -1673,6 +1688,20 @@ mod tests {
         bridge.enable_enumerate();
         let configs = build_configs(model, &parallel, &demand()).unwrap();
         build("unified".into(), resolve_configs(&configs), &bridge).unwrap()
+    }
+
+    #[test]
+    fn tp1_configs_build_but_the_all_reduce_graph_refuses_them() {
+        // TP1 is the pipeline stage's and DP rank's recipe; the graph with TP
+        // boundaries must refuse it cleanly instead of panicking on the
+        // missing fusion workspace.
+        let configs = build_configs(&model_cfg(), &layout(1, true), &demand()).unwrap();
+        let bridge = PerfApiBridge::new_uninit_for_test();
+        bridge.enable_enumerate();
+        let error = build("unified".into(), resolve_configs(&configs), &bridge)
+            .err()
+            .expect("TP1 has no fused all-reduce");
+        assert!(error.to_string().contains("tp_size 1"), "{error}");
     }
 
     /// The manifest's non-collective locations equal the map's, and the map
