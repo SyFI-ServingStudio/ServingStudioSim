@@ -9,13 +9,15 @@ Wire string: ``"single_gemm"`` — matches Rust ``KernelSpec::KIND`` in
 by ``profiling.facade`` to generate ``get_single_gemm_times`` /
 ``count_missing_single_gemm``.
 
-Seven backends share this kind/table/schema: ``torch`` (contiguous-RHS
+Eight backends share this kind/table/schema: ``torch`` (contiguous-RHS
 ``torch.mm``), ``torch_linear`` (model-weight-layout ``F.linear`` in the main
 environment), ``torch_linear_vllm`` (the same expression in vLLM's pinned
 environment), ``sglang_bf16_auto`` and ``sglang_fused_a_auto`` (SGLang's
 production BF16 dispatches, SM100 only), ``deepgemm`` (FP8 dense GEMM,
-``dtype = fp8_e4m3``), and ``flashinfer_mxfp8`` (MXFP8 dense linear:
-activation quant + FlashInfer CuTe-DSL block-scaled GEMM, ``dtype = mxfp8_e4m3``).
+``dtype = fp8_e4m3``), ``flashinfer_cutedsl`` (vLLM's default NVFP4 W4A4
+linear on SM10x, ``dtype = nvfp4_e2m1``), and ``flashinfer_mxfp8`` (MXFP8 dense
+linear: activation quant + FlashInfer CuTe-DSL block-scaled GEMM,
+``dtype = mxfp8_e4m3``).
 BF16/FP16 model defaults offer both generic Torch variants and the timing cache
 selects the faster one per shape.
 
@@ -48,7 +50,9 @@ class SingleGemmArgs(KernelArgs):
     m: int = arg(unit="tokens", doc="Rows of the activation: tokens in the batch.")
     n: int = arg(unit="elements", doc="Output features of the weight.")
     k: int = arg(unit="elements", doc="Input features, the reduction dimension.")
-    dtype: DType = arg(doc="Element type of A and B. fp8_e4m3 and mxfp8_e4m3 write bf16 output.")
+    dtype: DType = arg(
+        doc="Element type of A and B. fp8_e4m3, nvfp4_e2m1 and mxfp8_e4m3 write bf16 output."
+    )
 
 
 DOC = KernelDoc(
@@ -67,6 +71,7 @@ DOC = KernelDoc(
         "TFLOPS = 2·m·n·k / time",
         "GB/s = (m·k + k·n + m·n) · bytes per element / time",
         "deepgemm (fp8 in, bf16 out): GB/s = (m·k + k·n + 2·m·n) / time",
+        "flashinfer_cutedsl (nvfp4 in, bf16 out): GB/s = ((m·k + k·n)·(1/2 + 1/16) + 2·m·n) / time",
     ),
     default_metric="tflops",
     caveats=(
@@ -81,8 +86,10 @@ DOC = KernelDoc(
     method=(
         f"{CUPTI_METHOD} The torch and SGLang backends count overlapping launches "
         "once, by the time the GPU is busy, because Blackwell can split one logical "
-        "GEMM into several; deepgemm and flashinfer_mxfp8 sum their launches "
-        "(flashinfer_mxfp8 autotunes the call once before timing)."
+        "GEMM into several; deepgemm, flashinfer_cutedsl and flashinfer_mxfp8 sum "
+        "their launches. flashinfer_cutedsl times only the GEMM: the activation "
+        "quantization before it is the nvfp4_quant kind. flashinfer_mxfp8 includes "
+        "its activation quantization and autotunes the call once before timing."
     ),
     # torch.mm is its own reference: the torch backend measures exactly it.
     reference=None,
@@ -238,6 +245,39 @@ register(
             ),
             url="https://github.com/deepseek-ai/DeepGEMM",
         ),
+    )
+)
+
+# vLLM's default NVFP4 (ModelOpt W4A4, group 16) dense linear on SM10x:
+# FlashInferCuteDslNvFp4LinearKernel heads _POSSIBLE_NVFP4_KERNELS and its
+# is_supported requires is_device_capability_family(100); FlashInfer's
+# _cute_dsl_gemm_fp4_requirement accepts SM100/103/107, all in the sm_100f family.
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="flashinfer_cutedsl",
+        supports=BackendSupport(
+            compute=frozenset({DType.NVFP4_E2M1}),
+            sm_targets=frozenset({"sm_100f"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.gemm.flashinfer_fp4",
+            function_name="profile_single_gemm",
+        ),
+        table_name=KIND,
+        args_schema=SingleGemmArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        doc=BackendDoc(
+            summary=(
+                "vLLM's FlashInferCuteDslNvFp4LinearKernel after its activation "
+                "quantization: flashinfer mm_fp4(backend='cute-dsl') on packed FP4 A "
+                "and B with swizzled E4M3 scales per 16 k-elements, bf16 output, "
+                "heuristic tactic (vLLM skips fp4_gemm autotuning). SM10x only."
+            ),
+            url="https://github.com/flashinfer-ai/flashinfer",
+        ),
+        subprocess_env="vllm_env",
     )
 )
 

@@ -113,6 +113,11 @@ const fn default_glm53_flash_max_model_len() -> u32 {
     8192
 }
 
+/// The captured GLM-5.3-Flash deployment ran `--enable-expert-parallel`.
+const fn default_glm53_flash_enable_expert_parallel() -> bool {
+    true
+}
+
 /// A speculative GLM must actually run its MTP layer, so unlike the ordinary
 /// selector it cannot default to `off`.
 const fn default_glm52_speculative_mtp_mode() -> Glm52MtpMode {
@@ -441,6 +446,85 @@ pub enum IterArchSel {
         #[param(cache_key)]
         token_corpus_file: Option<String>,
     },
+    /// [`Self::Glm52VllmNvfp4DsaMoe`]'s kernels under data-parallel attention
+    /// and expert-parallel MoE (vLLM `--data-parallel-size ep_size
+    /// --enable-expert-parallel`, TP1). Every GPU is its own engine with its
+    /// own batch and KV; attention, dense FFN, shared expert and lm_head run
+    /// whole on each GPU's tokens, and only the routed experts are sharded,
+    /// behind an NVFP4 all-gather and a bf16 reduce-scatter. MTP is not run.
+    /// GLM-5.3 NVFP4 is the same graph.
+    Glm52VllmNvfp4DpAttnDsaMoe {
+        #[serde(flatten)]
+        model: ModelSpec,
+        /// Data-parallel attention ranks, which are also the expert-parallel
+        /// group: one GPU each.
+        #[serde(default = "default_glm52_nvfp4_parallel_size")]
+        #[param(default = 4, cache_key)]
+        ep_size: u16,
+        #[serde(default = "default_glm52_nvfp4_parallel_size")]
+        #[param(default = 4, cache_key)]
+        nvl_num_gpu: u16,
+        /// Configured context cap and padded DSA-logits row stride.
+        #[serde(default = "default_glm52_nvfp4_max_model_len")]
+        #[param(default = 1048576, cache_key)]
+        max_model_len: u32,
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS, cache_key)]
+        routing: RoutingKind,
+        #[serde(default)]
+        #[param(cache_key)]
+        routing_seed: Option<u64>,
+        /// Measured per-expert popularity captured at the same
+        /// `expert_parallel_size`. Requires `routing = popularity`.
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+        /// Recorded per-token expert routes from a `token_corpus` pass, as a
+        /// manifest path. Requires `routing = corpus`. Only the body slice is
+        /// read: no MTP layer runs.
+        #[serde(default)]
+        #[param(cache_key)]
+        token_corpus_file: Option<String>,
+        /// vLLM's CUDA-graph capture sizes. When the busiest DP rank's tokens
+        /// fit a captured size, every rank pads to that graph and every
+        /// kernel outside the attention graph break runs on the padded rows.
+        /// Empty: every step runs eager, unpadded.
+        #[serde(default)]
+        cudagraph_capture_sizes: Vec<u32>,
+    },
+    /// [`Self::Glm52VllmNvfp4DsaMoe`]'s kernels under pure pipeline
+    /// parallelism. Each of `pp_size` stages is one GPU running a contiguous
+    /// layer range (vLLM's `get_pp_indices`) at EP1: every head and expert is
+    /// local, so a stage has no collective. MTP is not run. GLM-5.3 NVFP4 is
+    /// the same graph. Runs only under deployment `pp`.
+    Glm52VllmNvfp4PpDsaMoe {
+        #[serde(flatten)]
+        model: ModelSpec,
+        /// Pipeline stages, one GPU each.
+        #[param(cache_key)]
+        pp_size: u16,
+        /// Configured context cap and padded DSA-logits row stride.
+        #[serde(default = "default_glm52_nvfp4_max_model_len")]
+        #[param(default = 1048576, cache_key)]
+        max_model_len: u32,
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS, cache_key)]
+        routing: RoutingKind,
+        #[serde(default)]
+        #[param(cache_key)]
+        routing_seed: Option<u64>,
+        /// Measured per-expert popularity captured at EP1 (one rank owns all
+        /// 256 experts). Requires `routing = popularity`.
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+        /// Recorded per-token expert routes from a `token_corpus` pass, as a
+        /// manifest path. Requires `routing = corpus`. Only the body slice is
+        /// read: a stage runs no MTP layer.
+        #[serde(default)]
+        #[param(cache_key)]
+        token_corpus_file: Option<String>,
+    },
     /// [`Self::Glm52VllmNvfp4DsaMoe`] driving its MTP layer as a real drafter:
     /// one target verify pass over `draft_tokens + 1` rows per decode request,
     /// then `draft_tokens` draft passes.
@@ -543,14 +627,23 @@ pub enum IterArchSel {
     },
     /// GLM-5.3-Flash FP8 block checkpoint on B200 through the vLLM fork: 34 KDA
     /// + 11 DSA (kpool indexer) layers, 3 dense + 42 MoE FFNs, 4-wide mHC. One
-    /// TP = EP rank group; MTP is not run.
+    /// tensor-parallel rank group whose routed experts are either expert- or
+    /// tensor-parallel; MTP is not run.
     Glm53FlashVllmFp8KdaDsaMoe {
         #[serde(flatten)]
         model: ModelSpec,
-        /// Shared tensor/expert-parallel rank count.
+        /// Tensor-parallel rank count: attention heads, the dense FFN and the
+        /// shared expert are split over it, and so are the routed experts.
         #[serde(default = "default_glm52_nvfp4_parallel_size")]
         #[param(default = 4, cache_key)]
         tp_size: u16,
+        /// vLLM `--enable-expert-parallel`. On, each rank owns
+        /// `n_routed_experts / tp_size` whole experts (EP = TP). Off, each rank
+        /// owns every expert, sliced to `moe_intermediate_size / tp_size` on
+        /// the intermediate axis (MoE TP).
+        #[serde(default = "default_glm53_flash_enable_expert_parallel")]
+        #[param(default = true, cache_key)]
+        enable_expert_parallel: bool,
         /// Configured context cap: the indexer's logits row stride and the
         /// sparse-index page-table extent.
         #[serde(default = "default_glm53_flash_max_model_len")]
@@ -574,6 +667,212 @@ pub enum IterArchSel {
         /// token count up to the next captured size, and every kernel outside
         /// the attention graph break runs on the padded rows. Empty: no
         /// padding (eager).
+        #[serde(default)]
+        cudagraph_capture_sizes: Vec<u32>,
+    },
+    /// [`Self::Glm53FlashVllmFp8KdaDsaMoe`]'s kernels under pure pipeline
+    /// parallelism. Each of `pp_size` stages is one GPU running a contiguous
+    /// layer range (vLLM's `get_pp_indices`) at TP1 / EP1: every head and
+    /// expert is local, so a stage has no collective. Each stage caches only
+    /// its own KDA (per request) and DSA (per token) layers; from PP12 a stage
+    /// has KDA layers but no DSA layer, which vLLM's hybrid cache rejects. MTP
+    /// is not run. Runs only under deployment `pp`.
+    Glm53FlashVllmFp8PpKdaDsaMoe {
+        #[serde(flatten)]
+        model: ModelSpec,
+        /// Pipeline stages, one GPU each.
+        #[param(cache_key)]
+        pp_size: u16,
+        /// Configured context cap: the indexer's logits row stride and the
+        /// sparse-index page-table extent.
+        #[serde(default = "default_glm53_flash_max_model_len")]
+        #[param(default = 8192, cache_key)]
+        max_model_len: u32,
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS, cache_key)]
+        routing: RoutingKind,
+        #[serde(default)]
+        #[param(cache_key)]
+        routing_seed: Option<u64>,
+        /// Measured per-expert popularity captured at EP1 (one rank owns all
+        /// 288 experts). Requires `routing = popularity`.
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+        /// Recorded per-token expert routes from a `token_corpus` pass, as a
+        /// manifest path. Requires `routing = corpus`. Routes are per token, so
+        /// a corpus captured at any EP size folds to EP1.
+        #[serde(default)]
+        #[param(cache_key)]
+        token_corpus_file: Option<String>,
+        /// vLLM `--cudagraph-capture-sizes`, as for the TP = EP graph. Empty:
+        /// no padding (eager).
+        #[serde(default)]
+        cudagraph_capture_sizes: Vec<u32>,
+        /// vLLM `VLLM_PP_LAYER_PARTITION`: layers per stage, `pp_size` counts
+        /// summing to 45. Empty: vLLM's default `get_pp_indices` split.
+        #[serde(default)]
+        layer_partition: Vec<u32>,
+    },
+    /// [`Self::Glm53FlashVllmFp8KdaDsaMoe`]'s kernels under data-parallel
+    /// attention and expert-parallel MoE (vLLM `--data-parallel-size ep_size
+    /// --enable-expert-parallel`, TP1). Every GPU is its own engine with its
+    /// own batch, KV and KDA state; attention, dense FFN, shared expert and
+    /// lm_head run whole on each GPU's tokens, and only the routed experts are
+    /// sharded, behind an FP8 all-gather and a bf16 reduce-scatter.
+    Glm53FlashVllmFp8DpAttnEpMoe {
+        #[serde(flatten)]
+        model: ModelSpec,
+        /// Data-parallel attention ranks, which are also the expert-parallel
+        /// group: one GPU each.
+        #[serde(default = "default_glm52_nvfp4_parallel_size")]
+        #[param(default = 4, cache_key)]
+        ep_size: u16,
+        /// Configured context cap: the indexer's logits row stride and the
+        /// sparse-index page-table extent.
+        #[serde(default = "default_glm53_flash_max_model_len")]
+        #[param(default = 8192, cache_key)]
+        max_model_len: u32,
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS, cache_key)]
+        routing: RoutingKind,
+        #[serde(default)]
+        #[param(cache_key)]
+        routing_seed: Option<u64>,
+        /// Measured per-expert popularity captured at the same
+        /// `expert_parallel_size`. Requires `routing = popularity`.
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+        /// Recorded per-token expert routes from a `token_corpus` pass, as a
+        /// manifest path. Requires `routing = corpus`.
+        #[serde(default)]
+        #[param(cache_key)]
+        token_corpus_file: Option<String>,
+        /// vLLM `--cudagraph-capture-sizes`. When every rank's batch fits a
+        /// captured size, all ranks pad to the busiest rank's graph; otherwise
+        /// they run eager on their own rows. Empty: always eager.
+        #[serde(default)]
+        cudagraph_capture_sizes: Vec<u32>,
+    },
+    /// [`Self::Glm53FlashVllmFp8KdaDsaMoe`]'s graph for NVIDIA's ModelOpt NVFP4
+    /// checkpoint (`nvidia/GLM-5.3-Flash-NVFP4`): NVFP4 routed experts and
+    /// dense FFN, BF16 shared expert; attention and the router as in FP8.
+    Glm53FlashVllmNvfp4KdaDsaMoe {
+        #[serde(flatten)]
+        model: ModelSpec,
+        /// Tensor-parallel rank count: attention heads, the dense FFN and the
+        /// shared expert are split over it, and so are the routed experts.
+        #[serde(default = "default_glm52_nvfp4_parallel_size")]
+        #[param(default = 4, cache_key)]
+        tp_size: u16,
+        /// vLLM `--enable-expert-parallel`. On, each rank owns
+        /// `n_routed_experts / tp_size` whole experts (EP = TP). Off, each rank
+        /// owns every expert, sliced to `moe_intermediate_size / tp_size` on
+        /// the intermediate axis (MoE TP).
+        #[serde(default = "default_glm53_flash_enable_expert_parallel")]
+        #[param(default = true, cache_key)]
+        enable_expert_parallel: bool,
+        /// Configured context cap: the indexer's logits row stride and the
+        /// sparse-index page-table extent.
+        #[serde(default = "default_glm53_flash_max_model_len")]
+        #[param(default = 8192, cache_key)]
+        max_model_len: u32,
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS, cache_key)]
+        routing: RoutingKind,
+        #[serde(default)]
+        #[param(cache_key)]
+        routing_seed: Option<u64>,
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+        /// Recorded per-token expert routes from a `token_corpus` pass, as a
+        /// manifest path. Requires `routing = corpus`.
+        #[serde(default)]
+        #[param(cache_key)]
+        token_corpus_file: Option<String>,
+        /// vLLM `--cudagraph-capture-sizes`. The engine pads an iteration's
+        /// token count up to the next captured size, and every kernel outside
+        /// the attention graph break runs on the padded rows. Empty: no
+        /// padding (eager).
+        #[serde(default)]
+        cudagraph_capture_sizes: Vec<u32>,
+    },
+    /// [`Self::Glm53FlashVllmFp8PpKdaDsaMoe`] for the NVFP4 checkpoint (see
+    /// [`Self::Glm53FlashVllmNvfp4KdaDsaMoe`]). Runs only under deployment `pp`.
+    Glm53FlashVllmNvfp4PpKdaDsaMoe {
+        #[serde(flatten)]
+        model: ModelSpec,
+        /// Pipeline stages, one GPU each.
+        #[param(cache_key)]
+        pp_size: u16,
+        /// Configured context cap: the indexer's logits row stride and the
+        /// sparse-index page-table extent.
+        #[serde(default = "default_glm53_flash_max_model_len")]
+        #[param(default = 8192, cache_key)]
+        max_model_len: u32,
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS, cache_key)]
+        routing: RoutingKind,
+        #[serde(default)]
+        #[param(cache_key)]
+        routing_seed: Option<u64>,
+        /// Measured per-expert popularity captured at EP1 (one rank owns all
+        /// 288 experts). Requires `routing = popularity`.
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+        /// Recorded per-token expert routes from a `token_corpus` pass, as a
+        /// manifest path. Requires `routing = corpus`. Routes are per token, so
+        /// a corpus captured at any EP size folds to EP1.
+        #[serde(default)]
+        #[param(cache_key)]
+        token_corpus_file: Option<String>,
+        /// vLLM `--cudagraph-capture-sizes`, as for the TP = EP graph. Empty:
+        /// no padding (eager).
+        #[serde(default)]
+        cudagraph_capture_sizes: Vec<u32>,
+        /// vLLM `VLLM_PP_LAYER_PARTITION`: layers per stage, `pp_size` counts
+        /// summing to 45. Empty: vLLM's default `get_pp_indices` split.
+        #[serde(default)]
+        layer_partition: Vec<u32>,
+    },
+    /// [`Self::Glm53FlashVllmFp8DpAttnEpMoe`] for the NVFP4 checkpoint (see
+    /// [`Self::Glm53FlashVllmNvfp4KdaDsaMoe`]): the routed experts sit behind
+    /// an NVFP4 all-gather and a bf16 reduce-scatter.
+    Glm53FlashVllmNvfp4DpAttnEpMoe {
+        #[serde(flatten)]
+        model: ModelSpec,
+        /// Data-parallel attention ranks, which are also the expert-parallel
+        /// group: one GPU each.
+        #[serde(default = "default_glm52_nvfp4_parallel_size")]
+        #[param(default = 4, cache_key)]
+        ep_size: u16,
+        /// Configured context cap: the indexer's logits row stride and the
+        /// sparse-index page-table extent.
+        #[serde(default = "default_glm53_flash_max_model_len")]
+        #[param(default = 8192, cache_key)]
+        max_model_len: u32,
+        #[serde(default)]
+        #[param(string, default = "uniform", choices = ROUTING_KINDS, cache_key)]
+        routing: RoutingKind,
+        #[serde(default)]
+        #[param(cache_key)]
+        routing_seed: Option<u64>,
+        /// Measured per-expert popularity captured at the same
+        /// `expert_parallel_size`. Requires `routing = popularity`.
+        #[serde(default)]
+        #[param(cache_key)]
+        expert_popularity_file: Option<String>,
+        /// Recorded per-token expert routes from a `token_corpus` pass, as a
+        /// manifest path. Requires `routing = corpus`.
+        #[serde(default)]
+        #[param(cache_key)]
+        token_corpus_file: Option<String>,
+        /// vLLM `--cudagraph-capture-sizes`. When every rank's batch fits a
+        /// captured size, all ranks pad to the busiest rank's graph; otherwise
+        /// they run eager on their own rows. Empty: always eager.
         #[serde(default)]
         cudagraph_capture_sizes: Vec<u32>,
     },
@@ -627,9 +926,16 @@ impl IterArchSel {
             | Self::DeepseekV41VllmSerialStreams { model, .. }
             | Self::Glm52VllmDsaMoe { model, .. }
             | Self::Glm52VllmNvfp4DsaMoe { model, .. }
+            | Self::Glm52VllmNvfp4PpDsaMoe { model, .. }
+            | Self::Glm52VllmNvfp4DpAttnDsaMoe { model, .. }
             | Self::Glm52VllmNvfp4DsaMoeSpeculative { model, .. }
             | Self::Glm53VllmNvfp4DsaMoeDflash2 { model, .. }
             | Self::Glm53FlashVllmFp8KdaDsaMoe { model, .. }
+            | Self::Glm53FlashVllmFp8PpKdaDsaMoe { model, .. }
+            | Self::Glm53FlashVllmFp8DpAttnEpMoe { model, .. }
+            | Self::Glm53FlashVllmNvfp4KdaDsaMoe { model, .. }
+            | Self::Glm53FlashVllmNvfp4PpKdaDsaMoe { model, .. }
+            | Self::Glm53FlashVllmNvfp4DpAttnEpMoe { model, .. }
             | Self::Glm52SglangNvfp4TpDsaMoe { model, .. } => model,
         }
     }
@@ -641,9 +947,16 @@ impl IterArchSel {
     pub fn max_model_len(&self) -> anyhow::Result<u32> {
         match self {
             Self::Glm52VllmNvfp4DsaMoe { max_model_len, .. }
+            | Self::Glm52VllmNvfp4PpDsaMoe { max_model_len, .. }
+            | Self::Glm52VllmNvfp4DpAttnDsaMoe { max_model_len, .. }
             | Self::Glm52VllmNvfp4DsaMoeSpeculative { max_model_len, .. }
             | Self::Glm53VllmNvfp4DsaMoeDflash2 { max_model_len, .. }
             | Self::Glm53FlashVllmFp8KdaDsaMoe { max_model_len, .. }
+            | Self::Glm53FlashVllmFp8PpKdaDsaMoe { max_model_len, .. }
+            | Self::Glm53FlashVllmFp8DpAttnEpMoe { max_model_len, .. }
+            | Self::Glm53FlashVllmNvfp4KdaDsaMoe { max_model_len, .. }
+            | Self::Glm53FlashVllmNvfp4PpKdaDsaMoe { max_model_len, .. }
+            | Self::Glm53FlashVllmNvfp4DpAttnEpMoe { max_model_len, .. }
             | Self::Glm52SglangNvfp4TpDsaMoe { max_model_len, .. } => Ok(*max_model_len),
             Self::DeepseekV41Vllm {
                 model,

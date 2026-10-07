@@ -83,6 +83,7 @@ impl DeepseekV41PrologueTpWorklet {
                 hidden_dim: hidden,
                 dtype: DType::Bf16,
                 fabric: Fabric::Nvlink,
+                fused_token_limit: None,
             }),
             // nvidia/model.py:777 `_hash_ids_kernel`: the current id and its
             // lookback window in, one int64 row id per hash column out.

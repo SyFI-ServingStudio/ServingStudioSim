@@ -120,10 +120,19 @@ hub (module doc + shared rung constants/helpers + `pub use run::run_optimality`)
   exact-iteration detail uses the same contract. Transport failure degrades the
   request, while one unsupported/heterogeneous scope degrades only that scope to the
   plain R5 ladder. Locked responses expose shape, iteration, affine-basis, and direct
-  fallback counters in payload meta.
+  fallback counters in payload meta. A PP stage gets its share of the whole model's
+  label (see `pipeline.rs`); a pipelined pool's floor, and the cluster over it, are the
+  sum of its stages' floors and are never labelled as one pooled workload. Equal
+  locked compositions within a pool (every stage of one pipeline) are sent once.
+- `pipeline.rs` — PP stage identity. Reads each stage worker's index and `[start,
+  end)` decoder layers from its manifest root label (`"... pipeline stage <i> of <N>
+  ... [layers <start>..<end>..."`, the label `tools/pp-layer-balance` also reads) and
+  checks that each pipelined pool's stages are exactly `0..N` and tile from layer 0.
 - `location.rs` — strict exact-iteration semantic-location mapping. It validates
   complete coverage, computes per-location `max(FLOPs/TFLOPS, bytes/BW)`, and
-  attaches R6 plus redundant/under-accounted diagnostics atomically.
+  attaches R6 plus redundant/under-accounted diagnostics atomically. A PP stage uses
+  its arch's whole-pipeline map restricted to the locations the stage ran; the
+  coverage check is unchanged.
 
 ## Offline scoped analysis
 

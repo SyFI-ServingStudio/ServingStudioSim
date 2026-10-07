@@ -7,6 +7,9 @@
 //! neutral home here so no concrete cadence shell owns the shared protocol
 //! vocabulary.
 
+use std::rc::Rc;
+
+use crate::arch::contract::UnifiedArchInput;
 use crate::common::{RequestId, Time, WorkerId};
 use crate::worker::admission::LoadBalance;
 
@@ -36,10 +39,15 @@ pub struct BatchFsmState {
 /// KV membership remains authoritative in the KV axis. This plan only states
 /// whether each partition's resident decode requests participate in the
 /// current iteration, so a prefill-only scheduler can leave those requests
-/// resident without charging or advancing them.
+/// resident without charging or advancing them. A pipeline head narrows that
+/// to a selected subset: requests whose previous step is still in flight on a
+/// later stage stay resident but sit the microbatch out.
 #[derive(Clone, Debug, Default)]
 pub struct IterBatchPlan {
     decode_participation: Vec<bool>,
+    /// Per partition, sorted: the only resident decodes that run when the
+    /// partition participates. `None` means all of them.
+    selected_decodes: Vec<Option<Vec<RequestId>>>,
 }
 
 impl IterBatchPlan {
@@ -47,6 +55,8 @@ impl IterBatchPlan {
         self.decode_participation.clear();
         self.decode_participation
             .resize(num_partitions, participates);
+        self.selected_decodes.clear();
+        self.selected_decodes.resize(num_partitions, None);
     }
 
     pub(crate) fn set_partition_runs_decode(&mut self, partition: u16, runs_decode: bool) {
@@ -57,11 +67,30 @@ impl IterBatchPlan {
         *entry = runs_decode;
     }
 
+    /// Run only `requests` among the partition's resident decodes.
+    pub(crate) fn select_partition_decodes(
+        &mut self,
+        partition: u16,
+        mut requests: Vec<RequestId>,
+    ) {
+        self.set_partition_runs_decode(partition, !requests.is_empty());
+        requests.sort_unstable();
+        self.selected_decodes[usize::from(partition)] = Some(requests);
+    }
+
     pub(crate) fn partition_runs_decode(&self, partition: u16) -> bool {
         self.decode_participation
             .get(usize::from(partition))
             .copied()
             .expect("batch plan partition must exist")
+    }
+
+    /// Whether resident decode `request` runs, given its partition participates.
+    pub(crate) fn decode_member_runs(&self, partition: u16, request: RequestId) -> bool {
+        match &self.selected_decodes[usize::from(partition)] {
+            None => true,
+            Some(selected) => selected.binary_search(&request).is_ok(),
+        }
     }
 }
 
@@ -424,6 +453,67 @@ pub enum FfnWorkerEvent {
     },
 }
 
+// ── Pipeline-parallel protocol ───────────────────────────────────────────────
+
+/// One microbatch's activations moving from one pipeline stage to the next.
+///
+/// The head stage lowers the batch once; every stage costs its own layers on the
+/// same shared `input`. `send_gid` and `ready_at` say where and when the previous
+/// stage's output is resident, so the receiving stage submits its own pull.
+#[derive(Clone, Debug)]
+pub struct PipelineMicrobatch {
+    /// Head-local sequence number. Every stage logs its cost under this
+    /// iteration id, so one microbatch's rows line up across stage cost logs.
+    pub id: u64,
+    pub input: Rc<UnifiedArchInput>,
+    pub activation_bytes: u64,
+    pub send_gid: u16,
+    pub ready_at: Time,
+}
+
+/// Pipeline head (stage 0) message set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PipelineHeadMsg {
+    Request(RequestId),
+    /// Microbatch `microbatch` left the last stage at `at`.
+    MicrobatchExit {
+        microbatch: u64,
+        at: Time,
+    },
+}
+
+/// Pipeline head event set.
+#[derive(Clone, Debug)]
+pub enum PipelineHeadEvent {
+    /// Stage 0 finished the microbatch; L6 hands it to stage 1.
+    MicrobatchLaunched {
+        worker: WorkerId,
+        microbatch: PipelineMicrobatch,
+    },
+    RequestComplete {
+        worker: WorkerId,
+        req: RequestId,
+    },
+}
+
+/// Pipeline follower stage message set.
+#[derive(Clone, Debug)]
+pub enum PipelineStageMsg {
+    Microbatch(PipelineMicrobatch),
+}
+
+/// Pipeline follower stage event set.
+#[derive(Clone, Debug)]
+pub enum PipelineStageEvent {
+    /// This stage finished the microbatch. `microbatch.send_gid`/`ready_at` now
+    /// name this stage's output; L6 hands it to the next stage, or reports the
+    /// exit to the head when this was the last stage.
+    StageDone {
+        worker: WorkerId,
+        microbatch: PipelineMicrobatch,
+    },
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct WorkerStatus {
     pub queued_requests: u32,
@@ -481,6 +571,10 @@ pub struct WorkerConfig {
     /// KV admission/retraction mechanics for chunked prefill. Other worker
     /// recipes retain the full-footprint default.
     pub kv_admission: crate::worker::config::KvAdmissionConfig,
+    /// Cap each pipeline microbatch's decodes at `ceil(resident decodes /
+    /// depth)` instead of scheduling every ready decode (vLLM). Only the
+    /// pipeline head recipe reads it.
+    pub balance_decode_microbatches: bool,
     /// Whether and how completed-session KV uses the dynamically available
     /// attention slack. This never adds capacity beyond `attn_kv_bytes`.
     pub prefix_cache: crate::worker::kv::PrefixCacheConfig,
@@ -489,6 +583,10 @@ pub struct WorkerConfig {
     /// `recurrent_checkpoint_interval_tokens`. Only the hybrid KV recipe reads
     /// it.
     pub ssm_checkpoint_interval_tokens: Option<u32>,
+    /// Whether a hybrid arch's non-final prefill chunks end on its recurrent
+    /// checkpoint interval (from the `chunked_prefill` selector). Only the
+    /// hybrid chunked-prefill recipe reads it.
+    pub prefill_chunk_alignment: crate::worker::config::PrefillChunkAlignment,
     /// Candidate positions the drafter proposes per request per iteration (from
     /// the worker selector). The verify width is one more than this. Only the
     /// speculative recipe reads it, and it must match the width the model was
@@ -499,6 +597,9 @@ pub struct WorkerConfig {
     /// draw must be reproducible run-to-run like every other modeled quantity,
     /// so this selects *which* deterministic stream, never whether there is one.
     pub speculative_acceptance_seed: Option<u64>,
+    /// Attention-DP partition placement (from the chunked-prefill selector).
+    /// Only multi-partition chunked-prefill workers read it.
+    pub dp_placement: crate::worker::config::DpPlacement,
 }
 
 impl Default for WorkerConfig {
@@ -515,10 +616,13 @@ impl Default for WorkerConfig {
             pending_order: crate::worker::admission::PendingOrderKind::default(),
             batch_policy: crate::worker::config::BatchPolicy::Mix,
             kv_admission: crate::worker::config::KvAdmissionConfig::FullFootprint,
+            balance_decode_microbatches: false,
             prefix_cache: crate::worker::kv::PrefixCacheConfig::default(),
             ssm_checkpoint_interval_tokens: None,
+            prefill_chunk_alignment: crate::worker::config::PrefillChunkAlignment::Checkpoint,
             speculative_draft_tokens: 0,
             speculative_acceptance_seed: None,
+            dp_placement: crate::worker::config::DpPlacement::RoundRobin,
         }
     }
 }

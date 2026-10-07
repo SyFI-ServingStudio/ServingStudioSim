@@ -3,11 +3,12 @@ gpu: NVIDIA B200
 arch:
   type: glm52_sglang_nvfp4_tp_dsa_moe
   fp8: false
-  tp_size: 4
+  tp_size: ${tp_size}
   max_model_len: ${max_model_len}
   routing: ${routing}
   expert_popularity_file: ${expert_popularity_file}
 sweep:
+  tp_size: [4, 8]
   max_model_len: [8192, 65536, 131072, 262144, 524288, 1048576]
 compound:
   workload:

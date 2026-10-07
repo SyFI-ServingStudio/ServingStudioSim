@@ -56,7 +56,10 @@ For the layer overview see `doc/detailed_design/L7.md`.
 
   The drain loop lives here so a caller can't under-drain by polling once per
   tick. The text schema remains the four legacy columns and is declared as
-  `input_file_format: text-generation-independent`. `RequestStore::reserve_slots` creates empty
+  `input_file_format: text-generation-independent`. An optional `prefix_len`
+  column pins a resident prefix (`SessionInput::PinnedPrefix`); req-frontend
+  does not declare it yet, so `frontend/pinned_prefix.rs` reads that format
+  itself when the column is present and defers to req-frontend otherwise. `RequestStore::reserve_slots` creates empty
   `Option` slots; requests are inserted only when the scheduler releases them.
   Compact arrived/admitted id indexes keep lifecycle scans proportional to the
   relevant live set rather than the full reserved trace.
@@ -78,10 +81,13 @@ Each tick, in order:
 3. **Periodic `request_state` snapshot** (every `snapshot_dt`) — dense over the
    *admitted* set, so per-segment workload is a plain diff of consecutive
    snapshots. Plus a heartbeat log line.
-4. **Termination check** (all O(1)): `DrainComplete` (trace exhausted + zero
+4. **Termination check**: `DrainComplete` (trace exhausted + zero
    in-flight), `DurationReached` (`clock ≥ duration`, unless `run_to_end`), or
-   `Stuck` (a watchdog: trace drained but neither completions nor the
-   admitted-id watermark advanced for `stuck_threshold`).
+   `Stuck` (a watchdog: trace drained but no completion, admission, or
+   processed prefill/output token for `stuck_threshold`). The first two are
+   O(1); the watchdog sums the admitted requests' token progress once per
+   100 s sample after the trace is exhausted, so a long decode tail with
+   nothing completing is progress, not a stall.
 5. **Advance** `clock += tick_dt`.
 
 In-flight is tracked from arrival/completion **counters**, never by scanning the

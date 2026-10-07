@@ -368,6 +368,16 @@ fn cmd_run(config: &Path) -> anyhow::Result<()> {
     // persist the structured form as `<log_dir>/summary.json` for regression
     // tests + the aggregator, then point at the parquet logs.
     summary.write_json(log_dir)?;
+    // Dropping the flow drops every worker, which flushes and joins its
+    // `cost_log` writer; a writer that failed fails the run here instead of
+    // leaving an incomplete cost_log behind a successful exit.
+    drop(flow);
+    let failures = simulator::log::cost_log_failures(log_dir)?;
+    anyhow::ensure!(
+        failures.is_empty(),
+        "cost_log writer failed: {}",
+        failures.join("; ")
+    );
     tracing::info!(
         cause = ?summary.cause,
         log_dir = %log_dir.display(),

@@ -32,6 +32,8 @@ from profiling.db.storage import canonical_json
 from public_api import preset as public_preset
 
 REPO_ROOT = public_preset.REPO_ROOT
+# Members built by one ``cost_trees`` call.
+_MEMBERS_PER_CALL = 4
 
 
 class UnknownDeployment(LookupError):
@@ -258,12 +260,18 @@ class DeploymentIndex:
                 axes=_axes(preset),
                 members=members,
             )
-        presets = list(index.presets.values())
+        # A large preset's members split into several calls, so one preset does
+        # not leave the other workers idle while it builds.
+        chunks = [
+            (preset, start, preset.members[start : start + _MEMBERS_PER_CALL])
+            for preset in index.presets.values()
+            for start in range(0, len(preset.members), _MEMBERS_PER_CALL)
+        ]
         with ThreadPoolExecutor(max_workers=jobs) as pool:
-            builds = pool.map(lambda p: cost_trees([m.block for m in p.members]), presets)
-            for preset, built in zip(presets, builds, strict=True):
+            builds = pool.map(lambda chunk: cost_trees([m.block for m in chunk[2]]), chunks)
+            for (preset, start, members), built in zip(chunks, builds, strict=True):
                 for position, (member, result) in enumerate(
-                    zip(preset.members, built, strict=True)
+                    zip(members, built, strict=True), start=start
                 ):
                     index._add(preset.id, position, member, result)
         return index

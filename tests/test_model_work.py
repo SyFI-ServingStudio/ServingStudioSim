@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from dataclasses import replace
 from pathlib import Path
 
@@ -1687,7 +1688,10 @@ def test_glm52_nvfp4_location_map_consumes_every_semantic_once():
     mapped = [semantic for row in location_map["locations"] for semantic in row["semantics"]]
 
     assert location_map["schema_version"] == 1
-    assert location_map["arch_types"] == ["glm52_vllm_nvfp4_dsa_moe"]
+    assert location_map["arch_types"] == [
+        "glm52_vllm_nvfp4_dsa_moe",
+        "glm52_vllm_nvfp4_pp_dsa_moe",
+    ]
     assert len(locations) == len(set(locations)) == 114
     assert len(mapped) == len(set(mapped))
     assert set(mapped) == names
@@ -1913,7 +1917,11 @@ def test_every_public_arch_on_an_fp4_checkpoint_is_labeled_fp4():
         if "arch" not in preset or "checkpoint" not in preset:
             continue
         config = root / "model" / "config" / f"{catalog[preset['checkpoint']]['config']}.json"
-        quant = parse_quantization_config(json.loads(config.read_text()))
+        # Only the compute dtype matters here, so per-layer ModelOpt exclusions
+        # (GLM-5.3-Flash NVFP4) need no layer resolution.
+        quant = parse_quantization_config(
+            json.loads(config.read_text()), layer_qualified_exclusions=True
+        )
         fp4 = quant is not None and quant.compute_dtype == "fp4"
         assert (preset["arch"]["type"] in work_floors._FP4_ARCHS) == fp4, path.name
 
@@ -2158,6 +2166,85 @@ def test_glm53_precision_follows_the_layer_qualified_exclusions(glm53):
         "down",
     }
     assert dtypes["kda_moe"]["router"] == "bf16"
+
+
+GLM53_NVFP4 = GLM53.with_name("glm53_flash_nvfp4.json")
+
+
+def test_glm53_nvfp4_converts_the_routed_experts_and_dense_ffn_only():
+    """NVIDIA's ModelOpt export: FP4 routed experts and dense FFN; attention, router,
+    shared expert and the mHC parameters (not nn.Linear) stay BF16; FP8 KV cache."""
+    model = load_model(GLM53_NVFP4)
+    assert model.quant.compute_dtype == "fp4"
+    assert model.quant.block_shape == (1, 16)
+    fp4 = {
+        stack.tag: {
+            group.name
+            for group in (
+                *stack.attn.matmul_groups(),
+                *stack.ffn.matmul_groups(),
+                *stack.mixer.matmul_groups(),
+            )
+            if model.matmul_compute_dtype(group) == "fp4"
+        }
+        for stack in model.layers
+    }
+    assert fp4 == {
+        "first_kda_dense": {"gate_up", "down"},
+        "kda_dense": {"gate_up", "down"},
+        "dsa_moe": {"expert_gate_up", "expert_down"},
+        "kda_moe": {"expert_gate_up", "expert_down"},
+    }
+    dsa = next(stack for stack in model.layers if stack.tag == "dsa_moe")
+    assert dsa.attn.mla_cache_dtype_bytes == dsa.attn.index_cache_dtype_bytes == 1.0
+    label = model.label(Workload(matmul_tokens=0, head_positions=0))
+    assert (
+        label.params == load_model(GLM53).label(Workload(matmul_tokens=0, head_positions=0)).params
+    )
+
+
+def test_glm53_nvfp4_hand_derived_weight_bytes():
+    """Stored bytes: FP4 + one E4M3 scale per 16 for the converted, BF16 for the rest."""
+    model = load_model(GLM53_NVFP4)
+    fp4 = 0.5 + 1 / 16
+    converted = G53_MOE_LAYERS * 288 * G53_EXPERT + G53_DENSE_LAYERS * G53_DENSE
+    bf16 = (
+        G53_KDA_LAYERS * G53_KDA_MATMUL
+        + G53_DSA_LAYERS * G53_DSA_MATMUL
+        + G53_LAYERS * G53_MHC_FN
+        + G53_MOE_LAYERS * (G53_ROUTER + G53_EXPERT)
+    )
+    stored = 0.0
+    for stack in model.layers:
+        groups = [
+            *stack.attn.matmul_groups(),
+            *stack.ffn.matmul_groups(),
+            *stack.mixer.matmul_groups(),
+        ]
+        stored += stack.count * sum(
+            group.total_count * model.weight_bytes_per_instance(group) for group in groups
+        )
+    assert stored == pytest.approx(converted * fp4 + 2 * bf16)
+
+
+def test_modelopt_exclusions_need_a_per_layer_reader():
+    """A layer-qualified or inner-wildcard ModelOpt exclusion cannot be flattened."""
+    raw = json.loads(GLM53_NVFP4.read_text())
+    with pytest.raises(ValueError, match="name single layers"):
+        parse_quantization_config(raw)
+    assert parse_quantization_config(raw, layer_qualified_exclusions=True) is not None
+    quant = raw["quantization_config"]
+    flat = {"quantization_config": {**quant, "ignore": ["lm_head", "model.visual*"]}}
+    assert parse_quantization_config(flat).not_converted == {"lm_head", "visual"}
+    renamed = {**quant, "exclude_modules": quant["ignore"]}
+    del renamed["ignore"]
+    assert (
+        load_model(GLM53_NVFP4).quant == build_model({**raw, "quantization_config": renamed}).quant
+    )
+    for entry in ("*.mlp.gate", "model.layers.*.self_attn*"):
+        bad = {"quantization_config": {**quant, "ignore": [entry]}}
+        with pytest.raises(ValueError, match="one trailing"):
+            parse_quantization_config(bad)
 
 
 def test_glm53_kpool_closed_forms_match_brute_force():
@@ -2660,6 +2747,100 @@ def test_dflash2_rejects_a_sliding_window_the_checkpoint_does_not_have():
         work_floors._dflash2_model(str(GLM52_NVFP4), str(GLM53_DFLASH2), 4096)
 
 
+@pytest.mark.parametrize(("variant", "ranks"), [("ep8", 8), ("moe_tp", 1)])
+def test_glm53_location_map_variants_differ_only_in_routed_rank_fan_out(variant, ranks):
+    """EP8 and MoE TP keep the TP4/EP4 semantic attribution; only the empty routed-rank rows change.
+
+    The analyzer picks the map whose locations equal the run's manifest, so each
+    routed-rank fan-out (EP4, EP8, and one rank under MoE TP) has its own file.
+    """
+    base_rows = json.loads(G53_LOCATION_MAP.read_text())["locations"]
+    base = {row["location"]: row["semantics"] for row in base_rows}
+    path = G53_LOCATION_MAP.with_name(f"glm53_flash_vllm_fp8_kda_dsa_moe_unified_{variant}.json")
+    mapping = json.loads(path.read_text())
+    assert mapping["arch_types"] == ["glm53_flash_vllm_fp8_kda_dsa_moe"]
+    rules = {row["location"]: row["semantics"] for row in mapping["locations"]}
+    assert len(rules) == len(mapping["locations"])
+
+    def rank(location):
+        match = re.search(r"\.routed_rank(\d+)\.", location)
+        return int(match.group(1)) if match else None
+
+    assert {loc: sem for loc, sem in rules.items() if rank(loc) is None} == {
+        loc: sem for loc, sem in base.items() if rank(loc) is None
+    }
+    assert {rank(loc) for loc in rules if rank(loc) is not None} == set(range(ranks))
+    assert all(rules[loc] == base[loc] for loc in rules if rank(loc) == 0)
+    assert all(rules[loc] == [] for loc in rules if (rank(loc) or 0) > 0)
+
+
+def test_glm53_dp_attn_ep_location_maps_consume_every_semantic_row_once():
+    """DP4/EP4 and DP8/EP8 maps reuse the TP map's semantics; collectives map to ``[]``."""
+    tp_rules = {
+        row["location"]: row["semantics"]
+        for row in json.loads(G53_LOCATION_MAP.read_text())["locations"]
+    }
+    model = work_floors._model_for_spec(
+        {"arch_type": "glm53_flash_vllm_fp8_dp_attn_ep_moe", "config": str(GLM53)}
+    )
+    workload = work_floors._aggregate_workload(_g53_geometry_totals([(0, 2048)], [3000]))
+    expected = {segment.name for segment in model.label(workload).segments}
+    for ep in (4, 8):
+        path = G53_LOCATION_MAP.with_name(f"glm53_flash_vllm_fp8_dp_attn_ep_moe_ep{ep}.json")
+        mapping = json.loads(path.read_text())
+        assert mapping["arch_types"] == ["glm53_flash_vllm_fp8_dp_attn_ep_moe"]
+        rules = {row["location"]: row["semantics"] for row in mapping["locations"]}
+        mapped = [semantic for semantics in rules.values() for semantic in semantics]
+        assert len(mapped) == len(set(mapped))
+        assert set(mapped) == expected
+        for tag in ("dsa_moe", "kda_moe"):
+            for op in ("dispatch_quant", "dispatch_all_gather", "combine_reduce_scatter"):
+                assert rules[f"unified.{tag}.moe.{op}"] == []
+            for rank in range(1, ep):
+                assert rules[f"unified.{tag}.moe.routed_rank{rank}.fused_moe"] == []
+        for location, semantics in rules.items():
+            if location in tp_rules:
+                assert semantics == tp_rules[location], location
+
+
+@pytest.mark.parametrize(
+    ("nvfp4", "fp8"),
+    [
+        ("kda_dsa_moe_unified", "kda_dsa_moe_unified"),
+        ("kda_dsa_moe_unified_ep8", "kda_dsa_moe_unified_ep8"),
+        ("kda_dsa_moe_unified_moe_tp", "kda_dsa_moe_unified_moe_tp"),
+        ("pp_kda_dsa_moe_pp", "pp_kda_dsa_moe_pp"),
+        ("dp_attn_ep_moe_ep4", "dp_attn_ep_moe_ep4"),
+        ("dp_attn_ep_moe_ep8", "dp_attn_ep_moe_ep8"),
+    ],
+)
+def test_glm53_nvfp4_location_maps_are_the_fp8_maps_less_the_shared_expert_quant(nvfp4, fp8):
+    """Same semantics as FP8: the BF16 shared expert has no input quants, and the
+    DP arch's vLLM top-k select (``router_select``) is glue like the quants."""
+    root = G53_LOCATION_MAP.parent
+    mapping = json.loads((root / f"glm53_flash_vllm_nvfp4_{nvfp4}.json").read_text())
+    base = json.loads((root / f"glm53_flash_vllm_fp8_{fp8}.json").read_text())
+    arch = base["arch_types"][0].replace("_fp8_", "_nvfp4_")
+    assert mapping["arch_types"] == [arch]
+    rules = {row["location"]: row["semantics"] for row in mapping["locations"]}
+    fp8_rules = {row["location"]: row["semantics"] for row in base["locations"]}
+    dropped = {
+        loc for loc in fp8_rules if re.search(r"shared_expert\.(gate_up|down)_input_quant$", loc)
+    }
+    added = {loc for loc in rules if loc.endswith(".moe.router_select")}
+    assert len(dropped) == 4
+    assert len(added) == (2 if "dp_attn" in nvfp4 else 0)
+    assert all(fp8_rules[loc] == [] for loc in dropped)
+    assert all(rules[loc] == [] for loc in added)
+    assert set(rules) == (set(fp8_rules) - dropped) | added
+    assert all(rules[loc] == fp8_rules[loc] for loc in set(rules) - added)
+    model = work_floors._model_for_spec({"arch_type": arch, "config": str(GLM53_NVFP4)})
+    workload = work_floors._aggregate_workload(_g53_geometry_totals([(0, 2048)], [3000]))
+    mapped = [semantic for semantics in rules.values() for semantic in semantics]
+    assert len(mapped) == len(set(mapped))
+    assert {segment.name for segment in model.label(workload).segments} == set(mapped)
+
+
 # --------------------------------------------------------------------------- #
 # DeepSeek-V4.1-Flash: sliding-window + compressed sparse attention, mHC, engram
 # --------------------------------------------------------------------------- #
@@ -2933,3 +3114,203 @@ def test_dsv41_location_map_consumes_every_semantic_once(dsv41):
     ]
     assert not any("all_reduce" in location or "all_gather" in location for location in locations)
     assert sum(not row["semantics"] for row in location_map["locations"]) == 99
+
+
+# ---------------------------------------------------------------------------
+# Pipeline-parallel stages: each stage keeps its share of the whole model's label.
+# ---------------------------------------------------------------------------
+
+# Uneven, non-default splits, so a stage boundary cuts through every stack.
+_PP_LAYOUTS = {
+    "glm53": (GLM53, [(0, 2), (2, 9), (9, 30), (30, 45)]),
+    "glm52": (GLM52, [(0, 4), (4, 7), (7, 41), (41, 78)]),
+}
+_PP_DECODE = {
+    "matmul_tokens": 8,
+    "prefill_tokens": 0,
+    "decode_passes": 8,
+    "prefill_pairs": 0,
+    "prefill_cached": 0,
+    "decode_kv": 8 * 4096,
+    "prefill_requests": 0,
+    # Exact per-request geometry: GLM-5.3's kpool DSA refuses collapsed sums.
+    "request_geometry": {"decode:4096": 8},
+}
+_PP_PREFILL = {
+    "matmul_tokens": 256,
+    "prefill_tokens": 256,
+    "decode_passes": 0,
+    "prefill_pairs": 256 * 257 // 2,
+    "prefill_cached": 0,
+    "decode_kv": 0,
+    "prefill_requests": 1,
+    "request_geometry": {"prefill:0:256": 1},
+}
+
+
+def _pp_case(monkeypatch, arch: str):
+    config, layout = _PP_LAYOUTS[arch]
+    pp_model = load_model(config)
+    spec = {
+        "config": str(config),
+        "gpu": "H200",
+        "dtype": "bf16",
+        "arch_fp8": pp_model.quant is not None,
+    }
+    monkeypatch.setattr(work_floors, "_pool_specs", lambda _log_dir: {"pp": spec})
+    monkeypatch.setattr(work_floors, "_model", lambda _config_path: pp_model)
+    stages = {f"pp/{index}": list(layers) for index, layers in enumerate(layout)}
+    return pp_model, stages
+
+
+def _assert_stages_sum_to_whole(stage_results: list[dict], whole: dict) -> None:
+    assert sum(result["necessary"] for result in stage_results) == pytest.approx(
+        whole["necessary"], rel=1e-12
+    )
+    assert sum(result["segmented"] for result in stage_results) == pytest.approx(
+        whole["segmented"], rel=1e-12
+    )
+    for result in stage_results:
+        assert 0 < result["necessary"] <= result["segmented"] * (1 + 1e-12)
+    whole_segments = {segment["name"]: segment for segment in whole["segments"]}
+    for field in ("flops", "bytes", "necessary"):
+        stage_sums: dict[str, float] = {}
+        for result in stage_results:
+            for segment in result["segments"]:
+                stage_sums[segment["name"]] = stage_sums.get(segment["name"], 0.0) + segment[field]
+        assert stage_sums.keys() <= whole_segments.keys()
+        for name, segment in whole_segments.items():
+            assert stage_sums.get(name, 0.0) == pytest.approx(segment[field], rel=1e-12, abs=1e-30)
+
+
+@pytest.mark.parametrize("arch", sorted(_PP_LAYOUTS))
+def test_pipeline_stage_shares_own_every_row_exactly_once(arch):
+    config, layout = _PP_LAYOUTS[arch]
+    pp_model = load_model(config)
+    segments = pp_model.label(
+        Workload.causal_lm(decode=[4096] * 4, prefill=[(512, 0)], sampled=5)
+    ).segments
+    for segment in segments:
+        shares = [pp_model.pipeline_stage_share(segment, layers) for layers in layout]
+        assert sum(shares) == pytest.approx(1.0), segment.name
+    by_name = {segment.name: segment for segment in segments}
+    first, last = layout[0], layout[-1]
+    assert pp_model.pipeline_stage_share(by_name["embedding"], first) == 1.0
+    assert pp_model.pipeline_stage_share(by_name["lm_head"], last) == 1.0
+    assert pp_model.pipeline_stage_share(by_name["lm_head"], first) == 0.0
+    # Stacks own their checkpoint layers and tile the decoder.
+    body = [stack for stack in pp_model.layers if stack.stage is None]
+    assert sorted(layer for stack in body for layer in stack.layers) == list(
+        range(pp_model.num_layers)
+    )
+    per_layer = next(segment for segment in segments if segment.count > 1)
+    with pytest.raises(ValueError, match="cannot be placed"):
+        pp_model.pipeline_stage_share(replace(per_layer, stack=None), first)
+    with pytest.raises(ValueError):
+        pp_model.pipeline_stage_share(by_name["embedding"], (0, pp_model.num_layers + 1))
+
+
+def test_pipeline_stage_layers_follow_the_checkpoint_schedule(glm53):
+    glm52 = load_model(GLM52)
+    stacks52 = {stack.tag: stack.layers for stack in glm52.layers}
+    assert stacks52["dense_full_index"] == (0, 1, 2)
+    assert stacks52["sparse_initial_index_share"] == (3, 4, 5)
+    assert stacks52["sparse_cycle_full_index"] == tuple(range(6, 78, 4))
+    stacks53 = {stack.tag: stack.layers for stack in glm53.layers}
+    assert stacks53["first_kda_dense"] == (0,)
+    assert stacks53["dsa_moe"] == tuple(range(3, 45, 4))
+
+
+def test_a_model_without_layer_ownership_refuses_a_stage_view(model):
+    segments = model.label(Workload.causal_lm(decode=[4096], sampled=1)).segments
+    stack_row = next(segment for segment in segments if segment.stack is not None)
+    with pytest.raises(ValueError):
+        model.pipeline_stage_share(stack_row, (0, 16))
+
+
+@pytest.mark.parametrize("force_direct_fallback", [False, True])
+@pytest.mark.parametrize("arch", sorted(_PP_LAYOUTS))
+def test_locked_pipeline_stages_add_up_to_one_whole_model(monkeypatch, arch, force_direct_fallback):
+    _pp_model, stages = _pp_case(monkeypatch, arch)
+    monkeypatch.setattr(work_floors, "_MIN_BASIS_GROUP", 1)
+    if force_direct_fallback:
+        monkeypatch.setattr(work_floors, "_segment_work_matches", lambda *_values: False)
+    composition = _columns(
+        [
+            {"occurrences": 5, "totals": _PP_DECODE},
+            {
+                "occurrences": 2,
+                "totals": {
+                    **_PP_DECODE,
+                    "decode_kv": 8 * 65536,
+                    "request_geometry": {"decode:65536": 8},
+                },
+            },
+            {"occurrences": 3, "totals": _PP_PREFILL},
+        ]
+    )
+    whole = work_floors.compute_locked_compositions(Path("unused"), {"pp/0": composition})["pp/0"]
+    aliases = {key: "pp/0" for key in stages if key != "pp/0"}
+    result = work_floors.compute_locked_compositions(
+        Path("unused"), {"pp/0": composition}, stages, aliases
+    )
+    assert sorted(result) == sorted(stages)
+    stage_results = [result[key] for key in sorted(stages, key=lambda key: int(key[3:]))]
+    assert all("error" not in stage for stage in stage_results)
+    _assert_stages_sum_to_whole(stage_results, whole)
+    assert any(segment["name"] == "embedding" for segment in stage_results[0]["segments"])
+    assert all(
+        segment["name"] not in {"embedding", "lm_head"}
+        for stage in stage_results[1:-1]
+        for segment in stage["segments"]
+    )
+    # The pre-fix over-count: every stage carrying the whole model.
+    assert sum(stage["necessary"] for stage in stage_results) < len(stages) * whole["necessary"]
+    for stage in stage_results:
+        assert stage["composition"] == whole["composition"]
+
+    # Aliases alone (no stages) repeat the sent label unchanged.
+    plain = work_floors.compute_locked_compositions(
+        Path("unused"), {"pp/0": composition}, None, {"pp/1": "pp/0"}
+    )
+    assert plain["pp/1"] == plain["pp/0"] == whole
+
+
+def test_locked_pipeline_stages_refuse_bad_layouts(monkeypatch):
+    _pp_model, stages = _pp_case(monkeypatch, "glm53")
+    composition = _columns([{"occurrences": 1, "totals": _PP_DECODE}])
+    gap = {"pp/0": [0, 10], "pp/1": [12, 45]}
+    result = work_floors.compute_locked_compositions(
+        Path("unused"), {"pp/0": composition}, gap, {"pp/1": "pp/0"}
+    )
+    assert "do not tile" in result["pp/0"]["error"]
+    assert result["pp/1"] == result["pp/0"]
+    mixed = work_floors.compute_locked_compositions(
+        Path("unused"), {"pp/0": composition}, {"pp/0": [0, 45]}, {"pp/1": "pp/0"}
+    )
+    assert "is not a stage" in mixed["pp/0"]["error"]
+    with pytest.raises(ValueError, match="unsent"):
+        work_floors.compute_locked_compositions(
+            Path("unused"), {"pp/0": composition}, stages, {"pp/1": "pp/9"}
+        )
+
+
+@pytest.mark.parametrize("arch", sorted(_PP_LAYOUTS))
+def test_unlocked_pipeline_stage_levels_add_up_to_one_whole_model(monkeypatch, arch):
+    _pp_model, stages = _pp_case(monkeypatch, arch)
+    totals = {
+        field: _PP_DECODE[field] * 10 + _PP_PREFILL[field] * 3
+        for field in _PP_DECODE
+        if field != "request_geometry"
+    }
+    totals["request_geometry"] = {"decode:4096": 80, "prefill:0:256": 3}
+    whole = work_floors.compute_floors(Path("unused"), {"pp/0": totals})["pp/0"]
+    levels = {key: totals for key in stages}
+    levels["pp/__saturated_worker__/1"] = totals
+    levels["pp"] = totals
+    levels["cluster"] = totals
+    result = work_floors.compute_floors(Path("unused"), levels, stages)
+    _assert_stages_sum_to_whole([result[key] for key in stages], whole)
+    assert result["pp/__saturated_worker__/1"] == result["pp/1"]
+    assert "sum of its stages" in result["pp"]["error"]
+    assert "sum of its stages" in result["cluster"]["error"]

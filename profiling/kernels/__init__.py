@@ -63,6 +63,7 @@ from profiling.kernels import (
     moe_alltoall,  # noqa: F401
     moe_alltoall_prepare,  # noqa: F401
     moe_ep_all_gather,  # noqa: F401
+    moe_ep_quantized_all_gather,  # noqa: F401
     moe_ep_reduce_scatter,  # noqa: F401
     moe_finalize_fuse_shared,  # noqa: F401
     moe_finalize_routing,  # noqa: F401

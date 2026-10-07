@@ -5,12 +5,18 @@
 //!
 //! Despite the kind name, `weight_format` selects the expert weight recipe and
 //! the backend string selects the callable. The NVFP4 backends
-//! (`flashinfer_trtllm_sm100*`) take `nvfp4_e2m1` / group 16. The FP8 block-scale
+//! (`flashinfer_trtllm_sm100`, `flashinfer_trtllm_routed_sm100`) take
+//! `nvfp4_e2m1` / group 16. The FP8 block-scale
 //! backend `flashinfer_trtllm_fp8_block_sm100` (`trtllm_fp8_block_scale_moe`,
 //! DeepSeek-FP8) takes `fp8_e4m3` / group 128 (128x128 weight blocks,
 //! per-token-group-128 activations) with `deepseek_v3` routing,
 //! `n_group = topk_group = 1`, and routed scaling 5/2. Its autotuner stops at
 //! 8192 tokens, so larger grid points reuse the top tactic bucket.
+//!
+//! `flashinfer_trtllm_routed_sm100` is vLLM's modular call under data plus
+//! expert parallelism (`trtllm_fp4_block_scale_routed_moe`): the top-k IDs and
+//! fp32 weights arrive precomputed, so the routing fields stay in the key but do
+//! not reach the kernel.
 //!
 //! The MXFP4 backend `flashinfer_trtllm_sm100_mxfp4`
 //! (`trtllm_fp4_block_scale_routed_moe`, MXFP8 activations) takes

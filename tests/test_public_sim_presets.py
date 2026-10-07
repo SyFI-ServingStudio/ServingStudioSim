@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 
@@ -14,6 +15,9 @@ from public_api.deployments import DeploymentIndex
 from public_api.sources import Sources
 
 PRESETS = sim_preset.sim_preset_paths()
+
+# The checks run one simulator process per member; use the host's cores.
+JOBS = min(64, os.cpu_count() or 8)
 
 
 def _ids(paths):
@@ -52,7 +56,7 @@ def bound(sim_bin) -> tuple[sim_preset.SimIndex, object]:
         }
     )
     index = DeploymentIndex.build(
-        sources.cost_trees, sources.list_params(), sim_commit=None, paths=arch_paths
+        sources.cost_trees, sources.list_params(), sim_commit=None, paths=arch_paths, jobs=JOBS
     )
     return sim_preset.SimIndex.build(index), schema_from_dict(sources.list_params())
 
@@ -65,11 +69,13 @@ def sims(bound) -> sim_preset.SimIndex:
     sims.check(
         lambda member, capture, build: simulate.check_capture(
             sims.index, member, capture, registry, build=build
-        )
+        ),
+        jobs=JOBS,
     )
     return sims
 
 
+@pytest.mark.presets
 @pytest.mark.needs_binary
 def test_an_moe_member_replays_its_captures_never_a_synthetic_routing(sims):
     """A member's captures are its arch preset's capture rows (a dense arch,
@@ -82,6 +88,7 @@ def test_an_moe_member_replays_its_captures_never_a_synthetic_routing(sims):
                 assert capture.routing in ("popularity", "corpus"), (preset.id, capture)
 
 
+@pytest.mark.presets
 @pytest.mark.needs_binary
 @pytest.mark.needs_db
 def test_every_sim_member_builds_and_is_measured(sims):
@@ -100,6 +107,7 @@ def test_every_sim_member_builds_and_is_measured(sims):
     assert not unavailable
 
 
+@pytest.mark.presets
 @pytest.mark.needs_binary
 def test_a_capture_longer_than_the_members_context_does_not_fit(bound):
     """A capture whose requests exceed a member's context is that capture's
@@ -142,6 +150,7 @@ def _plan_run(bound, tmp_path, preset: str, params: dict, rows: str, tags: list[
     return workloads.plan_run(simulate.concrete(tree, registry))
 
 
+@pytest.mark.presets
 @pytest.mark.needs_binary
 def test_a_request_past_the_checkpoints_positions_is_refused(bound, tmp_path):
     """Llama 3.1 8B has no max_model_len param: its config's
@@ -159,6 +168,7 @@ def test_a_request_past_the_checkpoints_positions_is_refused(bound, tmp_path):
     )
 
 
+@pytest.mark.presets
 @pytest.mark.needs_binary
 def test_a_speculative_trace_must_fit_the_draft_and_its_width(bound, tmp_path):
     """GLM-5.2 NVFP4 MTP at ctx8k drafts 5 tokens past every output, and a

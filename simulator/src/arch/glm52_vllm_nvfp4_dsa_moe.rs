@@ -23,7 +23,8 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use crate::arch::contract::{
-    IterwiseUnifiedModel, SpeculativeArchInput, SpeculativeUnifiedModel, UnifiedArchInput,
+    ArchGroupInput, IterwiseUnifiedModel, SpeculativeArchInput, SpeculativeUnifiedModel,
+    UnifiedArchInput,
 };
 use crate::arch::glm52_model_cfg::{Glm52ModelCfg, Glm52MtpMode};
 use crate::common::Fabric;
@@ -62,12 +63,12 @@ use crate::worklet::{
 };
 
 const ARCH_KIND: &str = "glm52_vllm_nvfp4_dsa_moe";
-const NUM_LAYERS: u32 = 78;
-const NUM_DENSE_LAYERS: u32 = 3;
-const NUM_INITIAL_SHARED_LAYERS: u32 = 3;
+pub(crate) const NUM_LAYERS: u32 = 78;
+pub(crate) const NUM_DENSE_LAYERS: u32 = 3;
+pub(crate) const NUM_INITIAL_SHARED_LAYERS: u32 = 3;
 const NUM_SPARSE_CYCLES: u32 = 18;
 const NUM_SHARED_PER_CYCLE: u32 = 3;
-const HIDDEN_DIM: u32 = 6_144;
+pub(crate) const HIDDEN_DIM: u32 = 6_144;
 const DENSE_INTERMEDIATE_DIM: u32 = 12_288;
 const NUM_ATTN_HEADS: u32 = 64;
 const RAW_NUM_KV_HEADS: u32 = 64;
@@ -84,7 +85,7 @@ const MODEL_INDEX_HEADS: u32 = 32;
 const PROFILE_INDEX_HEADS: u32 = 32;
 const INDEX_HEAD_DIM: u32 = 128;
 const INDEX_TOP_K: u32 = 2_048;
-const CHECKPOINT_MAX_CONTEXT: u32 = 1_048_576;
+pub(crate) const CHECKPOINT_MAX_CONTEXT: u32 = 1_048_576;
 const NUM_EXPERTS: u32 = 256;
 const ROUTER_TOP_K: u32 = 8;
 const MOE_INTERMEDIATE_DIM: u32 = 2_048;
@@ -99,7 +100,7 @@ const NUM_MTP_LAYERS: u32 = 1;
 const CACHE_BLOCK_SIZE: u32 = 64;
 const QUANT_BLOCK_SIZE: u32 = 128;
 const SOFTMAX_SCALE_DENOMINATOR: u32 = 16;
-const FULL_INDEX_LAYERS: [u32; 21] = [
+pub(crate) const FULL_INDEX_LAYERS: [u32; 21] = [
     0, 1, 2, 6, 10, 14, 18, 22, 26, 30, 34, 38, 42, 46, 50, 54, 58, 62, 66, 70, 74,
 ];
 
@@ -239,6 +240,16 @@ pub(crate) fn fit_failed(reason: impl Into<String>) -> BuildError {
     BuildError::FitFailed {
         kind: ARCH_KIND,
         reason: reason.into(),
+    }
+}
+
+/// The TP boundaries are FlashInfer's fused all-reduce over the EP group, so
+/// a graph that builds them needs a measured fusion workspace at `ep_size`.
+fn refuse_unfused_all_reduce(parallel: &Glm52VllmNvfp4DsaMoeParallel) -> Result<(), BuildError> {
+    let ep_size = u32::from(parallel.ep_size);
+    match fused_all_reduce_refusal(FUSED_ALLREDUCE_BACKENDS, &parallel.gpu_name, ep_size) {
+        Some(reason) => Err(fit_failed(format!("ep_size {ep_size}: {reason}"))),
+        None => Ok(()),
     }
 }
 
@@ -453,15 +464,10 @@ fn build_configs_for_decode(
         )));
     }
     // The TP boundaries are FlashInfer's fused all-reduce over the EP group.
-    if let Some(reason) = fused_all_reduce_refusal(
-        FUSED_ALLREDUCE_BACKENDS,
-        &parallel.gpu_name,
-        u32::from(parallel.ep_size),
-    ) {
-        return Err(fit_failed(format!(
-            "ep_size {}: {reason}",
-            parallel.ep_size
-        )));
+    // EP1 is the one-GPU pipeline stage or DP rank, which builds no
+    // all-reduce; graphs that do build one check in `Glm52TargetForward::build`.
+    if parallel.ep_size > 1 {
+        refuse_unfused_all_reduce(parallel)?;
     }
     if parallel.nvl_num_gpu == 0
         || parallel.nvl_num_gpu > parallel.ep_size
@@ -707,6 +713,7 @@ fn build_configs_for_decode(
             hidden_dim: model.hidden_dim.get(),
             dtype: DType::Bf16,
             fabric: Fabric::Nvlink,
+            fused_token_limit: None,
         },
         tp_allreduce_fused: AllReduceResidualRmsNormKernelConfig {
             backends: FUSED_ALLREDUCE_BACKENDS.to_vec(),
@@ -718,6 +725,7 @@ fn build_configs_for_decode(
             strategy: "auto".to_string(),
             launch_with_pdl: true,
             fp32_acc: true,
+            fused_token_limit: None,
         },
         embedding: ElementwiseKernelConfig {
             backends: ELEMENTWISE_BACKENDS.to_vec(),
@@ -1018,91 +1026,42 @@ impl Glm52RoutedExperts {
     }
 }
 
-struct Glm52SparseBody {
+/// One sparse decoder layer: DSA attention, the router, and the shared plus
+/// routed experts, with the TP/EP collectives at its two boundaries when the
+/// layer runs over a rank group.
+pub(crate) struct Glm52SparseBody {
     name: String,
     attention: VllmGlm52DsaAttnLocalWorklet,
     router: Glm52MoeRouterLocalWorklet,
     routed_experts: Glm52RoutedExperts,
     shared_expert: Glm52SharedExpertLocalWorklet,
+    /// `None` for a rank-local layer, which reduces nothing: the pipeline
+    /// stages run every head and expert on one GPU. It then mints no
+    /// collective leaf, and the router's standalone residual RMSNorm always
+    /// bills the post-attention norm that a fused all-reduce would otherwise own.
+    collectives: Option<Glm52SparseCollectives>,
+    ep_size: u16,
+    top_k: u32,
+}
+
+/// The two TP/EP boundaries of a sparse layer: the attention output's
+/// all-reduce (fused with the next residual RMSNorm below its size limit) and
+/// the MoE output's all-reduce (fused below its own limit).
+struct Glm52SparseCollectives {
     attention_allreduce: Op<AllReduceKernel>,
     attention_allreduce_fused: Op<AllReduceResidualRmsNormKernel>,
     attention_allreduce_max_fused_tokens: u32,
     ffn_allreduce_fallback: Op<AllReduceKernel>,
     ffn_allreduce_fusion: Op<AllReduceFusionKernel>,
     ffn_allreduce_max_fused_tokens: u32,
-    ep_size: u16,
-    top_k: u32,
 }
 
-impl Glm52SparseBody {
-    /// The NVFP4 body layer: layers 0..77.
+impl Glm52SparseCollectives {
     fn build(
-        name: String,
-        attention: VllmGlm52DsaAttnLocalWorkletResolved,
+        name: &str,
         common: &Glm52VllmNvfp4DsaMoeResolved,
         bridge: &PerfApiBridge,
     ) -> Result<Self, BuildError> {
-        // Every rank keeps the same slot name: the rank axis already shows up
-        // as the `Max` node's children, and a rank suffix would rename the
-        // slots a labeled kernel inventory refers to.
-        let routed_experts = Glm52RoutedExperts::Nvfp4(
-            common
-                .nvfp4_moe
-                .iter()
-                .map(|rank_resolved| {
-                    Nvfp4MoeLocalWorklet::build(
-                        format!("{name}.moe.routed_experts"),
-                        rank_resolved.clone(),
-                        bridge,
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-        );
-        Self::build_with_experts(name, attention, common, routed_experts, bridge)
-    }
-
-    /// The BF16 MTP layer, whose experts the checkpoint does not quantize.
-    fn build_bf16(
-        name: String,
-        attention: VllmGlm52DsaAttnLocalWorkletResolved,
-        common: &Glm52VllmNvfp4DsaMoeResolved,
-        experts: &[Bf16MoeLocalWorkletResolved],
-        bridge: &PerfApiBridge,
-    ) -> Result<Self, BuildError> {
-        let routed_experts = Glm52RoutedExperts::Bf16(
-            experts
-                .iter()
-                .map(|rank_resolved| {
-                    Bf16MoeLocalWorklet::build(
-                        format!("{name}.moe.routed_experts"),
-                        rank_resolved.clone(),
-                        bridge,
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-        );
-        Self::build_with_experts(name, attention, common, routed_experts, bridge)
-    }
-
-    fn build_with_experts(
-        name: String,
-        attention: VllmGlm52DsaAttnLocalWorkletResolved,
-        common: &Glm52VllmNvfp4DsaMoeResolved,
-        routed_experts: Glm52RoutedExperts,
-        bridge: &PerfApiBridge,
-    ) -> Result<Self, BuildError> {
-        let attention =
-            VllmGlm52DsaAttnLocalWorklet::build(format!("{name}.attention"), attention, bridge)?;
-        let router = Glm52MoeRouterLocalWorklet::build(
-            format!("{name}.moe.router"),
-            common.sparse_router.clone(),
-            bridge,
-        )?;
-        let shared_expert = Glm52SharedExpertLocalWorklet::build(
-            format!("{name}.moe.shared_expert"),
-            common.shared_expert.clone(),
-            bridge,
-        )?;
         let attention_allreduce = build_atomic(
             format!("{name}.attention.tp_allreduce"),
             common.tp_allreduce.clone(),
@@ -1132,31 +1091,190 @@ impl Glm52SparseBody {
         let ffn_allreduce_max_fused_tokens =
             AllReduceFusionSpec::max_fused_tokens(&common.tp_allreduce_fusion);
         Ok(Self {
-            name,
-            attention,
-            router,
-            routed_experts,
-            shared_expert,
             attention_allreduce,
             attention_allreduce_fused,
             attention_allreduce_max_fused_tokens,
             ffn_allreduce_fallback,
             ffn_allreduce_fusion,
             ffn_allreduce_max_fused_tokens,
+        })
+    }
+
+    /// Whether the attention all-reduce takes the fused residual-RMSNorm path,
+    /// which then owns the post-attention norm.
+    fn attention_uses_fused(&self, total_tokens: u32) -> bool {
+        total_tokens > 0 && total_tokens <= self.attention_allreduce_max_fused_tokens
+    }
+
+    fn eval_attention(&self, total_tokens: u32, ev: &mut Evaluator) {
+        let use_fused = self.attention_uses_fused(total_tokens);
+        eval_atomic_or_zero(
+            &self.attention_allreduce,
+            AllReduceKernelInput {
+                message_size_bytes: u64::from(total_tokens) * u64::from(HIDDEN_DIM) * 2,
+            },
+            total_tokens == 0 || use_fused,
+            ev,
+        );
+        eval_atomic_or_zero(
+            &self.attention_allreduce_fused,
+            AllReduceResidualRmsNormKernelInput {
+                num_tokens: total_tokens,
+            },
+            !use_fused,
+            ev,
+        );
+    }
+
+    fn eval_ffn(&self, total_tokens: u32, ev: &mut Evaluator) {
+        let use_ffn_fusion =
+            total_tokens > 0 && total_tokens <= self.ffn_allreduce_max_fused_tokens;
+        eval_atomic_or_zero(
+            &self.ffn_allreduce_fallback,
+            AllReduceKernelInput {
+                message_size_bytes: u64::from(total_tokens) * u64::from(HIDDEN_DIM) * 2,
+            },
+            total_tokens == 0 || use_ffn_fusion,
+            ev,
+        );
+        eval_atomic_or_zero(
+            &self.ffn_allreduce_fusion,
+            AllReduceFusionKernelInput {
+                num_tokens: total_tokens,
+            },
+            !use_ffn_fusion,
+            ev,
+        );
+    }
+}
+
+impl Glm52SparseBody {
+    /// The NVFP4 body layer: layers 0..77.
+    fn build(
+        name: String,
+        attention: VllmGlm52DsaAttnLocalWorkletResolved,
+        common: &Glm52VllmNvfp4DsaMoeResolved,
+        bridge: &PerfApiBridge,
+    ) -> Result<Self, BuildError> {
+        let routed_experts = Self::nvfp4_experts(&name, common, bridge)?;
+        Self::build_with_experts(name, attention, common, routed_experts, true, bridge)
+    }
+
+    /// The NVFP4 body layer on one GPU that owns every head and expert, so it
+    /// has no collective to build. Built from an EP1 recipe; the leaves are
+    /// named exactly as [`Self::build`] names them.
+    pub(crate) fn build_rank_local(
+        name: String,
+        attention: VllmGlm52DsaAttnLocalWorkletResolved,
+        common: &Glm52VllmNvfp4DsaMoeResolved,
+        bridge: &PerfApiBridge,
+    ) -> Result<Self, BuildError> {
+        if common.raw_cfg.parallel.ep_size != 1 {
+            return Err(fit_failed(format!(
+                "a rank-local sparse layer needs an EP1 recipe, got ep_size {}",
+                common.raw_cfg.parallel.ep_size
+            )));
+        }
+        let routed_experts = Self::nvfp4_experts(&name, common, bridge)?;
+        Self::build_with_experts(name, attention, common, routed_experts, false, bridge)
+    }
+
+    fn nvfp4_experts(
+        name: &str,
+        common: &Glm52VllmNvfp4DsaMoeResolved,
+        bridge: &PerfApiBridge,
+    ) -> Result<Glm52RoutedExperts, BuildError> {
+        // Every rank keeps the same slot name: the rank axis already shows up
+        // as the `Max` node's children, and a rank suffix would rename the
+        // slots a labeled kernel inventory refers to.
+        Ok(Glm52RoutedExperts::Nvfp4(
+            common
+                .nvfp4_moe
+                .iter()
+                .map(|rank_resolved| {
+                    Nvfp4MoeLocalWorklet::build(
+                        format!("{name}.moe.routed_experts"),
+                        rank_resolved.clone(),
+                        bridge,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        ))
+    }
+
+    /// The BF16 MTP layer, whose experts the checkpoint does not quantize.
+    fn build_bf16(
+        name: String,
+        attention: VllmGlm52DsaAttnLocalWorkletResolved,
+        common: &Glm52VllmNvfp4DsaMoeResolved,
+        experts: &[Bf16MoeLocalWorkletResolved],
+        bridge: &PerfApiBridge,
+    ) -> Result<Self, BuildError> {
+        let routed_experts = Glm52RoutedExperts::Bf16(
+            experts
+                .iter()
+                .map(|rank_resolved| {
+                    Bf16MoeLocalWorklet::build(
+                        format!("{name}.moe.routed_experts"),
+                        rank_resolved.clone(),
+                        bridge,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+        Self::build_with_experts(name, attention, common, routed_experts, true, bridge)
+    }
+
+    fn build_with_experts(
+        name: String,
+        attention: VllmGlm52DsaAttnLocalWorkletResolved,
+        common: &Glm52VllmNvfp4DsaMoeResolved,
+        routed_experts: Glm52RoutedExperts,
+        with_collectives: bool,
+        bridge: &PerfApiBridge,
+    ) -> Result<Self, BuildError> {
+        let attention =
+            VllmGlm52DsaAttnLocalWorklet::build(format!("{name}.attention"), attention, bridge)?;
+        let router = Glm52MoeRouterLocalWorklet::build(
+            format!("{name}.moe.router"),
+            common.sparse_router.clone(),
+            bridge,
+        )?;
+        let shared_expert = Glm52SharedExpertLocalWorklet::build(
+            format!("{name}.moe.shared_expert"),
+            common.shared_expert.clone(),
+            bridge,
+        )?;
+        let collectives = if with_collectives {
+            Some(Glm52SparseCollectives::build(&name, common, bridge)?)
+        } else {
+            None
+        };
+        Ok(Self {
+            name,
+            attention,
+            router,
+            routed_experts,
+            shared_expert,
+            collectives,
             ep_size: common.raw_cfg.parallel.ep_size,
             top_k: common.raw_cfg.model.router_top_k,
         })
     }
 
-    fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
+    pub(crate) fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
         let attention = labeled_max(
             format!("{}.attention [Max over TP ranks]", self.name),
             (0..self.ep_size)
                 .map(|_| self.attention.compile(builder))
                 .collect(),
         );
-        let attention_allreduce = self.attention_allreduce.compile(builder);
-        let attention_allreduce_fused = self.attention_allreduce_fused.compile(builder);
+        let attention_collectives = self.collectives.as_ref().map(|collectives| {
+            [
+                collectives.attention_allreduce.compile(builder),
+                collectives.attention_allreduce_fused.compile(builder),
+            ]
+        });
         // Leaves are numbered in the order they are declared here, and `eval`
         // must push in the same order — so these statements follow the measured
         // launch order, which is also the order the `Sum` below lists them in.
@@ -1171,60 +1289,64 @@ impl Glm52SparseBody {
             self.routed_experts
                 .compile_with_shared(&self.shared_expert, builder),
         );
-        let ffn_allreduce_fallback = self.ffn_allreduce_fallback.compile(builder);
-        let ffn_allreduce_fusion = self.ffn_allreduce_fusion.compile(builder);
+        let ffn_collectives = self.collectives.as_ref().map(|collectives| {
+            [
+                collectives.ffn_allreduce_fallback.compile(builder),
+                collectives.ffn_allreduce_fusion.compile(builder),
+            ]
+        });
+        let precision = self.routed_experts.precision_label();
+        let (layer_label, moe_label) = if self.collectives.is_some() {
+            (
+                format!(
+                    "{} [sparse layer; TP=EP={}; top-{} {precision} routed experts]",
+                    self.name, self.ep_size, self.top_k
+                ),
+                format!(
+                    "{}.moe [router -> local shared+{precision} experts -> TP allreduce]",
+                    self.name
+                ),
+            )
+        } else {
+            (
+                format!(
+                    "{} [sparse layer; rank-local, no collectives; top-{} {precision} routed experts]",
+                    self.name, self.top_k
+                ),
+                format!(
+                    "{}.moe [router -> local shared+{precision} experts]",
+                    self.name
+                ),
+            )
+        };
+        let mut layer = vec![attention];
+        layer.extend(attention_collectives.into_iter().flatten());
+        let mut moe = vec![router, experts_and_shared];
+        moe.extend(ffn_collectives.into_iter().flatten());
+        layer.push(CostNode::Labeled {
+            label: moe_label,
+            child: Box::new(CostNode::Sum(moe)),
+        });
         CostNode::Labeled {
-            label: format!(
-                "{} [sparse layer; TP=EP={}; top-{} {} routed experts]",
-                self.name,
-                self.ep_size,
-                self.top_k,
-                self.routed_experts.precision_label()
-            ),
-            child: Box::new(CostNode::Sum(vec![
-                attention,
-                attention_allreduce,
-                attention_allreduce_fused,
-                CostNode::Labeled {
-                    label: format!(
-                        "{}.moe [router -> local shared+{} experts -> TP allreduce]",
-                        self.name,
-                        self.routed_experts.precision_label()
-                    ),
-                    child: Box::new(CostNode::Sum(vec![
-                        router,
-                        experts_and_shared,
-                        ffn_allreduce_fallback,
-                        ffn_allreduce_fusion,
-                    ])),
-                },
-            ])),
+            label: layer_label,
+            child: Box::new(CostNode::Sum(layer)),
         }
     }
 
-    fn eval(&self, batch: &NormalizedBatch, ev: &mut Evaluator) {
+    pub(crate) fn eval(&self, batch: &NormalizedBatch, ev: &mut Evaluator) {
         let group = &batch.groups[0];
-        let use_fused = batch.total_tokens > 0
-            && batch.total_tokens <= self.attention_allreduce_max_fused_tokens;
         for _ in 0..self.ep_size {
             self.attention.eval(&group.attention_input, ev);
         }
-        eval_atomic_or_zero(
-            &self.attention_allreduce,
-            AllReduceKernelInput {
-                message_size_bytes: u64::from(batch.total_tokens) * u64::from(HIDDEN_DIM) * 2,
-            },
-            batch.total_tokens == 0 || use_fused,
-            ev,
-        );
-        eval_atomic_or_zero(
-            &self.attention_allreduce_fused,
-            AllReduceResidualRmsNormKernelInput {
-                num_tokens: batch.total_tokens,
-            },
-            !use_fused,
-            ev,
-        );
+        // Without a fused all-reduce the router's own leaf bills the
+        // post-attention residual RMSNorm.
+        let use_fused = self
+            .collectives
+            .as_ref()
+            .is_some_and(|collectives| collectives.attention_uses_fused(batch.total_tokens));
+        if let Some(collectives) = &self.collectives {
+            collectives.eval_attention(batch.total_tokens, ev);
+        }
         for _ in 0..self.ep_size {
             self.router.eval_with_post_attn_norm(
                 &Glm52MoeRouterLocalWorkletInput {
@@ -1241,24 +1363,9 @@ impl Glm52SparseBody {
             overlapped,
             ev,
         );
-        let use_ffn_fusion =
-            batch.total_tokens > 0 && batch.total_tokens <= self.ffn_allreduce_max_fused_tokens;
-        eval_atomic_or_zero(
-            &self.ffn_allreduce_fallback,
-            AllReduceKernelInput {
-                message_size_bytes: u64::from(batch.total_tokens) * u64::from(HIDDEN_DIM) * 2,
-            },
-            batch.total_tokens == 0 || use_ffn_fusion,
-            ev,
-        );
-        eval_atomic_or_zero(
-            &self.ffn_allreduce_fusion,
-            AllReduceFusionKernelInput {
-                num_tokens: batch.total_tokens,
-            },
-            !use_ffn_fusion,
-            ev,
-        );
+        if let Some(collectives) = &self.collectives {
+            collectives.eval_ffn(batch.total_tokens, ev);
+        }
     }
 }
 
@@ -1488,6 +1595,7 @@ impl Glm52TargetForward {
         resolved: &Glm52VllmNvfp4DsaMoeResolved,
         bridge: &PerfApiBridge,
     ) -> Result<Self, BuildError> {
+        refuse_unfused_all_reduce(&resolved.raw_cfg.parallel)?;
         let ep_size = resolved.raw_cfg.parallel.ep_size;
         let embedding = build_atomic(
             format!("{name}.main.embedding"),
@@ -2137,16 +2245,16 @@ pub(crate) struct NormalizedGroup {
     /// Rows the sampler needs logits for: one per prefill request, and every
     /// decode query row, because a verify step scores all of them. This exceeds
     /// `request_count` by the drafted positions.
-    logits_rows: u32,
+    pub(crate) logits_rows: u32,
     /// One entry per request, at that request's own KV length.
     pub(crate) endpoint_context_lens: Vec<u32>,
-    attention_input: VllmGlm52DsaAttnLocalWorkletInput,
+    pub(crate) attention_input: VllmGlm52DsaAttnLocalWorkletInput,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct NormalizedBatch {
     pub(crate) groups: Vec<NormalizedGroup>,
-    total_tokens: u32,
+    pub(crate) total_tokens: u32,
 }
 
 impl NormalizedBatch {
@@ -2196,7 +2304,7 @@ impl NormalizedBatch {
     }
 }
 
-fn normalize_input(
+pub(crate) fn normalize_input(
     input: &UnifiedArchInput,
     _ep_size: u16,
     max_model_len: u32,
@@ -2207,96 +2315,103 @@ fn normalize_input(
             input.groups.len()
         ));
     }
-    let mut groups = Vec::with_capacity(input.groups.len());
-    let mut total_tokens = 0_u32;
-    for (group_index, group) in input.groups.iter().enumerate() {
-        let mut prefill_tokens = 0_u32;
-        let mut prefill_query_cache_pairs = Vec::with_capacity(group.prefill_chunk_pairs.len());
-        let mut endpoint_context_lens =
-            Vec::with_capacity(group.prefill_chunk_pairs.len() + group.decode_kv_lens.len());
-        for (request_index, &(prefix, append)) in group.prefill_chunk_pairs.iter().enumerate() {
-            if append == 0 {
-                return Err(format!(
-                    "group {group_index} prefill request {request_index} append must be nonzero"
-                ));
-            }
-            let cache_tokens = prefix.checked_add(append).ok_or_else(|| {
-                format!("group {group_index} prefill request {request_index} prefix+append overflows u32")
-            })?;
-            if cache_tokens > max_model_len {
-                return Err(format!(
-                    "group {group_index} prefill request {request_index} context {cache_tokens} exceeds max_model_len {max_model_len}"
-                ));
-            }
-            prefill_tokens = prefill_tokens
-                .checked_add(append)
-                .ok_or_else(|| format!("group {group_index} prefill token sum overflows u32"))?;
-            prefill_query_cache_pairs.push((append, cache_tokens));
-            endpoint_context_lens.push(cache_tokens);
-        }
-        if group.prefill_tokens != prefill_tokens {
-            return Err(format!(
-                "group {group_index} prefill_tokens {} must equal append sum {prefill_tokens}",
-                group.prefill_tokens
-            ));
-        }
-        let decode_tokens = u32::try_from(group.decode_kv_lens.len())
-            .map_err(|_| format!("group {group_index} decode request count exceeds u32"))?;
-        if group.decode_tokens != decode_tokens {
-            return Err(format!(
-                "group {group_index} decode_tokens {} must equal decode_kv_lens length {decode_tokens}",
-                group.decode_tokens
-            ));
-        }
-        let mut decode_context = None;
-        for (request_index, &context) in group.decode_kv_lens.iter().enumerate() {
-            if !(1..=max_model_len).contains(&context) {
-                return Err(format!(
-                    "group {group_index} decode request {request_index} context {context} must be in 1..={max_model_len}"
-                ));
-            }
-            decode_context =
-                Some(decode_context.map_or(context, |current: u32| current.max(context)));
-            endpoint_context_lens.push(context);
-        }
-        let batch_tokens = prefill_tokens
-            .checked_add(decode_tokens)
-            .ok_or_else(|| format!("group {group_index} batch token sum overflows u32"))?;
-        if group.batch_tokens != batch_tokens {
-            return Err(format!(
-                "group {group_index} batch_tokens {} must equal prefill+decode {batch_tokens}",
-                group.batch_tokens
-            ));
-        }
-        check_sparse_attention_rows(group_index, batch_tokens)?;
-        let request_count =
-            u32::try_from(group.prefill_chunk_pairs.len() + group.decode_kv_lens.len())
-                .map_err(|_| format!("group {group_index} request count exceeds u32"))?;
-        total_tokens = total_tokens
-            .checked_add(batch_tokens)
-            .ok_or_else(|| "pooled token count overflows u32".to_string())?;
-        groups.push(NormalizedGroup {
-            batch_tokens,
-            request_count,
-            // Without speculation every decode request submits one query row,
-            // so the sampler scores exactly one row per request.
-            logits_rows: request_count,
-            endpoint_context_lens,
-            attention_input: VllmGlm52DsaAttnLocalWorkletInput {
-                num_new_tokens: batch_tokens,
-                prefill_query_cache_pairs,
-                decode: decode_context.map(|context_len| VllmGlm52DsaAttnLocalDecodeInput {
-                    batch_size: decode_tokens,
-                    context_len,
-                    context_lens: Some(group.decode_kv_lens.clone()),
-                    requires_padding: false,
-                }),
-            },
-        });
-    }
+    let group = normalize_group(0, &input.groups[0], max_model_len)?;
+    let total_tokens = group.batch_tokens;
     Ok(NormalizedBatch {
-        groups,
+        groups: vec![group],
         total_tokens,
+    })
+}
+
+/// Validate one attention group and lower it to the worklet inputs.
+///
+/// `group_index` only labels errors. A data-parallel graph lowers each of its
+/// attention groups through this, so every group obeys the same rules as the
+/// single tensor-parallel group.
+pub(crate) fn normalize_group(
+    group_index: usize,
+    group: &ArchGroupInput,
+    max_model_len: u32,
+) -> std::result::Result<NormalizedGroup, String> {
+    let mut prefill_tokens = 0_u32;
+    let mut prefill_query_cache_pairs = Vec::with_capacity(group.prefill_chunk_pairs.len());
+    let mut endpoint_context_lens =
+        Vec::with_capacity(group.prefill_chunk_pairs.len() + group.decode_kv_lens.len());
+    for (request_index, &(prefix, append)) in group.prefill_chunk_pairs.iter().enumerate() {
+        if append == 0 {
+            return Err(format!(
+                "group {group_index} prefill request {request_index} append must be nonzero"
+            ));
+        }
+        let cache_tokens = prefix.checked_add(append).ok_or_else(|| {
+            format!(
+                "group {group_index} prefill request {request_index} prefix+append overflows u32"
+            )
+        })?;
+        if cache_tokens > max_model_len {
+            return Err(format!(
+                "group {group_index} prefill request {request_index} context {cache_tokens} exceeds max_model_len {max_model_len}"
+            ));
+        }
+        prefill_tokens = prefill_tokens
+            .checked_add(append)
+            .ok_or_else(|| format!("group {group_index} prefill token sum overflows u32"))?;
+        prefill_query_cache_pairs.push((append, cache_tokens));
+        endpoint_context_lens.push(cache_tokens);
+    }
+    if group.prefill_tokens != prefill_tokens {
+        return Err(format!(
+            "group {group_index} prefill_tokens {} must equal append sum {prefill_tokens}",
+            group.prefill_tokens
+        ));
+    }
+    let decode_tokens = u32::try_from(group.decode_kv_lens.len())
+        .map_err(|_| format!("group {group_index} decode request count exceeds u32"))?;
+    if group.decode_tokens != decode_tokens {
+        return Err(format!(
+            "group {group_index} decode_tokens {} must equal decode_kv_lens length {decode_tokens}",
+            group.decode_tokens
+        ));
+    }
+    let mut decode_context = None;
+    for (request_index, &context) in group.decode_kv_lens.iter().enumerate() {
+        if !(1..=max_model_len).contains(&context) {
+            return Err(format!(
+                "group {group_index} decode request {request_index} context {context} must be in 1..={max_model_len}"
+            ));
+        }
+        decode_context = Some(decode_context.map_or(context, |current: u32| current.max(context)));
+        endpoint_context_lens.push(context);
+    }
+    let batch_tokens = prefill_tokens
+        .checked_add(decode_tokens)
+        .ok_or_else(|| format!("group {group_index} batch token sum overflows u32"))?;
+    if group.batch_tokens != batch_tokens {
+        return Err(format!(
+            "group {group_index} batch_tokens {} must equal prefill+decode {batch_tokens}",
+            group.batch_tokens
+        ));
+    }
+    check_sparse_attention_rows(group_index, batch_tokens)?;
+    let request_count = u32::try_from(group.prefill_chunk_pairs.len() + group.decode_kv_lens.len())
+        .map_err(|_| format!("group {group_index} request count exceeds u32"))?;
+    Ok(NormalizedGroup {
+        batch_tokens,
+        request_count,
+        // Without speculation every decode request submits one query row,
+        // so the sampler scores exactly one row per request.
+        logits_rows: request_count,
+        endpoint_context_lens,
+        attention_input: VllmGlm52DsaAttnLocalWorkletInput {
+            num_new_tokens: batch_tokens,
+            prefill_query_cache_pairs,
+            decode: decode_context.map(|context_len| VllmGlm52DsaAttnLocalDecodeInput {
+                batch_size: decode_tokens,
+                context_len,
+                context_lens: Some(group.decode_kv_lens.clone()),
+                requires_padding: false,
+            }),
+        },
     })
 }
 
@@ -2462,7 +2577,7 @@ fn labeled_max(label: String, children: Vec<CostNode>) -> CostNode {
     }
 }
 
-fn build_atomic<K, C, F>(
+pub(crate) fn build_atomic<K, C, F>(
     name: String,
     config: C,
     build_kernel: F,
@@ -2478,7 +2593,7 @@ where
     ))
 }
 
-fn eval_atomic_or_zero<K>(op: &Op<K>, input: K::Input, zero: bool, ev: &mut Evaluator)
+pub(crate) fn eval_atomic_or_zero<K>(op: &Op<K>, input: K::Input, zero: bool, ev: &mut Evaluator)
 where
     K: Probe,
     K::Input: Clone + Into<SlotInput>,
@@ -2541,23 +2656,24 @@ fn expected_speculative_slot_count(
     expected_slot_count(ep_size) + expected_mtp_pass_slots(ep_size, false) + recurrent
 }
 
+/// One decoder layer's cached state for one token on one rank.
+///
+/// MLA stores one FP8 (kv_lora_rank + rope_dim) vector. Every decoder layer
+/// also allocates its FP8 index key plus one FP32 scale, even when that layer
+/// reuses a previous layer's top-k result and skips the indexer compute.
+pub(crate) fn decoder_layer_state_bytes_per_token() -> u64 {
+    u64::from(KV_LORA_RANK + ROPE_DIM) * u64::from(DType::Fp8E4m3.size_bytes())
+        + u64::from(INDEX_HEAD_DIM + DType::Fp32.size_bytes())
+}
+
 pub(crate) fn state_bytes_per_token(
     ep_size: u16,
     mtp_mode: Glm52MtpMode,
 ) -> std::result::Result<u64, BuildError> {
-    // vLLM keeps both caches replicated on every TP rank. MLA stores one FP8
-    // (kv_lora_rank + rope_dim) vector. Every decoder layer also allocates its
-    // FP8 index key plus one FP32 scale, even when that layer reuses a previous
-    // layer's top-k result and skips the indexer compute.
-    let main_mla_per_rank = u64::from(NUM_LAYERS)
-        .checked_mul(u64::from(KV_LORA_RANK + ROPE_DIM))
-        .and_then(|value| value.checked_mul(u64::from(DType::Fp8E4m3.size_bytes())))
-        .ok_or_else(|| fit_failed("main MLA state bytes overflow u64"))?;
-    let index_per_rank = u64::from(NUM_LAYERS)
-        .checked_mul(u64::from(INDEX_HEAD_DIM + DType::Fp32.size_bytes()))
-        .ok_or_else(|| fit_failed("index state bytes overflow u64"))?;
-    let main_per_rank = main_mla_per_rank
-        .checked_add(index_per_rank)
+    // vLLM keeps both caches replicated on every TP rank, and every one of the
+    // 78 body layers allocates the same per-layer state.
+    let main_per_rank = u64::from(NUM_LAYERS)
+        .checked_mul(decoder_layer_state_bytes_per_token())
         .ok_or_else(|| fit_failed("main state bytes overflow u64"))?;
     let mtp_mla_per_rank = u64::from(KV_LORA_RANK + ROPE_DIM)
         .checked_mul(u64::from(DType::Fp8E4m3.size_bytes()))
@@ -2919,6 +3035,29 @@ mod tests {
         let bridge = PerfApiBridge::new_uninit_for_test();
         bridge.enable_enumerate();
         assert!(build_speculative("unified".to_string(), resolve_configs(&cfg), &bridge).is_err());
+    }
+
+    #[test]
+    fn the_ep1_recipe_builds_but_its_all_reduce_graph_is_refused() {
+        // EP1 is the pipeline stage's and DP rank's recipe; the graph with TP
+        // boundaries must still refuse it cleanly instead of panicking on the
+        // missing fusion workspace.
+        let demand = ExpertDemand::popularity(&RoutingDistribution::uniform(NUM_EXPERTS), 1);
+        let cfg = build_configs(
+            &model(),
+            &parallel(1),
+            &demand,
+            None,
+            false,
+            Glm52MtpMode::Off,
+        )
+        .unwrap();
+        let bridge = PerfApiBridge::new_uninit_for_test();
+        bridge.enable_enumerate();
+        let error = build("unified".to_string(), resolve_configs(&cfg), &bridge)
+            .err()
+            .expect("EP1 has no fused all-reduce");
+        assert!(error.to_string().contains("ep_size 1"), "{error}");
     }
 
     #[test]

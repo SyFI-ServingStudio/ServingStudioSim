@@ -9,8 +9,12 @@ from profiling.db.registry import BackendSupport, known_backends, supported_back
 from profiling.kernels.nvfp4_fused_moe import KIND, Nvfp4FusedMoeArgs
 from profiling.runners.moe.exact_topk import exact_topk_ids
 from profiling.runners.moe.nvfp4_fused_moe import (
+    ROUTING_METHODS,
+    _forced_routing,
     _logical_bytes,
     _validate_args,
+    tuning_label,
+    vllm_tune_max_num_tokens,
 )
 
 
@@ -38,6 +42,7 @@ def _args() -> dict:
         "num_experts": 128,
         "num_local_experts": 32,
         "top_k": 8,
+        "routing_method": "minimax2",
         "per_expert_batches": per_expert_batches,
     }
 
@@ -60,6 +65,21 @@ def test_logical_bytes_follow_the_finalize_mode_of_the_dispatch() -> None:
     hidden = args["hidden_size"]
     assert deferred - finalized == 2 * hidden * (local_rows - args["num_tokens"])
     assert finalized != deferred
+
+
+def test_precomputed_routing_bills_selected_ids_and_weights_not_logits() -> None:
+    args = _args()
+    routed = _logical_bytes(args, do_finalize=True, precomputed_routing=True)
+    logits = _logical_bytes(args, do_finalize=True)
+    tokens, experts, top_k = args["num_tokens"], args["num_experts"], args["top_k"]
+    assert logits - routed == 2 * tokens * experts + 2 * experts - 8 * tokens * top_k
+
+
+def test_routed_tuning_bound_covers_the_dp_gathered_batch() -> None:
+    assert vllm_tune_max_num_tokens(1) == 8192
+    assert vllm_tune_max_num_tokens(8192) == 8192
+    assert vllm_tune_max_num_tokens(8193) == 16384
+    assert vllm_tune_max_num_tokens(65536) == 65536
 
 
 def test_logical_bytes_charge_weights_only_for_active_local_experts() -> None:
@@ -171,3 +191,118 @@ def test_runner_accepts_the_nvfp4_weight_format_as_dtype_or_wire_string() -> Non
         assert _validate_args(**spec, weight_format=weight_format)["weight_format"] == "nvfp4_e2m1"
     with pytest.raises(ValueError, match="nvfp4_e2m1 weights"):
         _validate_args(**spec, weight_format="int4")
+
+
+def _glm_ep4_spec(**overrides: object) -> dict:
+    # A 288-expert, top-8 layer on one EP4 rank (72 local experts), 16 tokens,
+    # half of this rank's experts idle.
+    batches = [0] * 288
+    for expert in range(0, 64, 2):
+        batches[expert] = 4
+    spec = {
+        "num_tokens": 16,
+        "hidden_size": 4096,
+        "intermediate_size": 2048,
+        "num_experts": 288,
+        "num_local_experts": 72,
+        "top_k": 8,
+        "input_dtype": "bf16",
+        "weight_format": "nvfp4_e2m1",
+        "group_size": 16,
+        "routing_method": "deepseek_v3",
+        "n_group": 1,
+        "topk_group": 1,
+        "routed_scaling_numerator": 5,
+        "routed_scaling_denominator": 2,
+        "per_expert_batches": tuple(batches),
+    }
+    spec.update(overrides)
+    return spec
+
+
+def test_routing_methods_map_to_flashinfer_routing_method_types() -> None:
+    # flashinfer.fused_moe.RoutingMethodType: DeepSeekV3 = 2, MiniMax2 = 7.
+    assert ROUTING_METHODS == {"minimax2": 7, "deepseek_v3": 2}
+
+
+def test_vllm_backends_accept_ungrouped_deepseek_v3_routing() -> None:
+    args = _validate_args(**_glm_ep4_spec())
+    assert args["routing_method"] == "deepseek_v3"
+
+
+@pytest.mark.parametrize(
+    ("override", "stack", "message"),
+    [
+        ({"n_group": 8, "topk_group": 4}, "vllm", "ungrouped"),
+        ({}, "sglang", "SGLang"),
+        ({"routing_method": "renormalize"}, "vllm", "routing method"),
+    ],
+)
+def test_validation_rejects_routing_the_measured_call_would_not_honor(
+    override: dict, stack: str, message: str
+) -> None:
+    """Grouped routing would ignore the forced histogram, and the SGLang
+    backend is only measured for MiniMax2, so these keys would mislabel rows."""
+    with pytest.raises(ValueError, match=message):
+        _validate_args(stack=stack, **_glm_ep4_spec(**override))
+
+
+def test_forced_deepseek_v3_routing_realizes_the_histogram_with_fp32_inputs() -> None:
+    """The monolithic call routes from logits, so DeepSeekV3 selection over the
+    forced FP32 logits and zero FP32 bias must pick exactly the row's experts,
+    at the dtype vLLM passes for an FP32 router."""
+    torch = pytest.importorskip("torch")
+    from profiling.runners.moe.fp8_block_fused_moe_reference import deepseek_v3_routing
+
+    args = _validate_args(**_glm_ep4_spec())
+    ids = exact_topk_ids(
+        num_tokens=args["num_tokens"], top_k=8, per_expert_batches=args["per_expert_batches"]
+    )
+    logits, bias = _forced_routing(torch, ids, args, device="cpu")
+    assert logits.dtype is torch.float32 and bias.dtype is torch.float32
+
+    chosen, weights = deepseek_v3_routing(torch, logits, bias, top_k=8, routed_scaling_factor=2.5)
+    counts = torch.bincount(chosen.flatten(), minlength=288).tolist()
+    assert counts == list(args["per_expert_batches"])
+    torch.testing.assert_close(weights.sum(dim=-1), torch.full((16,), 2.5))
+
+
+def test_forced_minimax2_routing_keeps_bf16_logits_and_bias() -> None:
+    torch = pytest.importorskip("torch")
+    args = _validate_args(**_glm_ep4_spec(routing_method="minimax2"))
+    ids = exact_topk_ids(
+        num_tokens=args["num_tokens"], top_k=8, per_expert_batches=args["per_expert_batches"]
+    )
+    logits, bias = _forced_routing(torch, ids, args, device="cpu")
+    assert logits.dtype is torch.bfloat16 and bias.dtype is torch.bfloat16
+    chosen = torch.topk(logits.float(), 8).indices.tolist()
+    assert [set(row) for row in chosen] == [set(row) for row in ids]
+
+
+def test_logical_bytes_charge_routing_at_the_router_element_size() -> None:
+    """DeepSeekV3 rows read FP32 logits and bias, MiniMax2 rows BF16; the routed
+    backend reads the same pre-selected IDs and weights for both."""
+    deepseek = _validate_args(**_glm_ep4_spec())
+    minimax = _validate_args(**_glm_ep4_spec(routing_method="minimax2"))
+    tokens, experts = 16, 288
+    assert _logical_bytes(deepseek, do_finalize=True) - _logical_bytes(
+        minimax, do_finalize=True
+    ) == 2 * (tokens * experts + experts)
+    assert _logical_bytes(deepseek, do_finalize=True, precomputed_routing=True) == _logical_bytes(
+        minimax, do_finalize=True, precomputed_routing=True
+    )
+
+
+def test_tuning_label_separates_configurations_flashinfer_keys_alike() -> None:
+    """FlashInfer's persisted key is the bucketed input shapes alone, which are
+    identical for EP4, EP8, MoE-TP4 and MoE-TP8 ranks of one model; each must
+    tune into its own file or later rows replay the first one's tactic."""
+    configs = [(72, 2048), (36, 2048), (288, 512), (288, 256)]
+    labels = {
+        tuning_label(
+            _glm_ep4_spec(num_local_experts=local, intermediate_size=inter), "vllm", routed
+        )
+        for local, inter in configs
+        for routed in (False, True)
+    }
+    assert len(labels) == 2 * len(configs)

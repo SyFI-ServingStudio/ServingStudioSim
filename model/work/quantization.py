@@ -6,7 +6,9 @@ trained in) and add a single ``quantization_config`` key describing what was
 actually stored on disk. Everything this module needs comes from that key, so
 ``load_model(path)`` needs no extra argument: pointing at ``glm52.json`` gives
 a BF16 accountant, ``glm52_fp8.json`` gives an FP8 one, and the ModelOpt
-``glm52_nvfp4.json`` config gives an NVFP4 routed-expert accountant.
+``glm52_nvfp4.json`` config gives an NVFP4 routed-expert accountant. A ModelOpt
+config that instead lists its unquantized modules (``ignore``/``exclude_modules``)
+converts every other Linear.
 
 Two things follow from a scheme and both matter to the necessary-work floor:
 
@@ -110,8 +112,48 @@ class QuantScheme:
         return math.ceil(n / block_n) * math.ceil(k / block_k) * self.scale_dtype_bytes
 
 
-def parse_quantization_config(raw_config: dict) -> QuantScheme | None:
+def _modelopt_group_size(quant: dict) -> int:
+    """The weight group size of a ModelOpt NVFP4 config, in either layout.
+
+    The flat layout states ``weight_group_size``; the compressed-tensors layout
+    (``config_groups``, as ModelOpt 0.47 writes) states it per group, and
+    every group must agree.
+    """
+    groups = quant.get("config_groups")
+    if not groups:
+        return int(quant.get("weight_group_size", 16))
+    sizes = {int(group["weights"]["group_size"]) for group in groups.values()}
+    if len(sizes) != 1:
+        raise ValueError(f"ModelOpt config_groups disagree on weight group size: {sorted(sizes)}")
+    return sizes.pop()
+
+
+def modelopt_excluded(quant: dict) -> list[str] | None:
+    """A ModelOpt config's unquantized modules, from ``ignore`` or ``exclude_modules``.
+
+    Entries are checkpoint paths with at most one ``*``, trailing. A leading or
+    inner wildcard (``*.mlp.gate``) cannot be resolved to module paths here and is
+    refused.
+    """
+    excluded = quant.get("ignore", quant.get("exclude_modules"))
+    if excluded is None:
+        return None
+    for entry in excluded:
+        if "*" in entry.rstrip("*") or entry.count("*") > 1:
+            raise ValueError(f"ModelOpt exclusion {entry!r}: only one trailing `*` is modeled")
+    return list(excluded)
+
+
+def parse_quantization_config(
+    raw_config: dict, *, layer_qualified_exclusions: bool = False
+) -> QuantScheme | None:
     """Build a :class:`QuantScheme` from a raw HF config, or None if unquantized.
+
+    A ModelOpt NVFP4 exclusion list that names single layers
+    (``model.layers.7.self_attn*``) differs layer by layer, and one layer-relative
+    set cannot say which; it raises unless the caller passes
+    ``layer_qualified_exclusions=True``, which a model builder that knows the layer
+    schedule does before replacing ``not_converted`` with its own per-layer reading.
 
     An unrecognized ``quant_method`` raises rather than silently falling back to
     the master dtype: a wrong precision here shows up as a "minimum" larger than
@@ -132,22 +174,38 @@ def parse_quantization_config(raw_config: dict) -> QuantScheme | None:
             raise ValueError(
                 "model.work only supports ModelOpt checkpoints with quant_algo='NVFP4'"
             )
-        if not quant.get("routed_experts_only"):
+        excluded = modelopt_excluded(quant)
+        if not quant.get("routed_experts_only") and excluded is None:
             raise ValueError(
-                "ModelOpt NVFP4 configs must declare routed_experts_only=true; "
-                "the accountant cannot safely infer layer-relative exclusions from wildcards"
+                "ModelOpt NVFP4 configs must declare routed_experts_only=true or list "
+                "the unquantized modules under `ignore`"
             )
-        group_size = int(quant.get("weight_group_size", 16))
+        group_size = _modelopt_group_size(quant)
         if group_size != 16:
             raise ValueError(f"unsupported NVFP4 weight_group_size {group_size}; expected 16")
+        if quant.get("routed_experts_only"):
+            not_converted = frozenset()
+            converted_prefixes = frozenset({"mlp.experts"})
+        else:
+            # Every Linear is converted except the listed modules.
+            qualified = [entry for entry in excluded if _LAYER_PREFIX.match(entry)]
+            if qualified and not layer_qualified_exclusions:
+                raise ValueError(
+                    f"ModelOpt exclusions name single layers ({qualified[0]!r}, ...); "
+                    "the model builder must resolve them per layer"
+                )
+            not_converted = frozenset(
+                _layer_relative(module.rstrip("*").rstrip(".")) for module in excluded
+            )
+            converted_prefixes = None
         return QuantScheme(
             bytes_per_weight=0.5,
             compute_dtype="fp4",
             # The checkpoint stores one FP8 E4M3 scale per 16 weights.
             block_shape=(1, group_size),
             scale_dtype_bytes=1.0,
-            not_converted=frozenset(),
-            converted_prefixes=frozenset({"mlp.experts"}),
+            not_converted=not_converted,
+            converted_prefixes=converted_prefixes,
         )
 
     fmt = quant.get("fmt")

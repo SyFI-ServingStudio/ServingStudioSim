@@ -22,16 +22,20 @@ use crate::arch::model_cfg::ModelCfg;
 use crate::arch::moe_model_cfg::MoeModelCfg;
 use crate::arch::{
     deepseek_v41_vllm, deepseek_v4_vllm, glm52_sglang_nvfp4_tp_dsa_moe, glm52_vllm_dsa_moe,
-    glm52_vllm_nvfp4_dsa_moe, glm53_flash_vllm_fp8_kda_dsa_moe, glm53_vllm_nvfp4_dsa_moe_dflash2,
-    llama3_dense, llama3_dense_tp, llama3_dp_attn_tp_ffn, qwen36_local, qwen3_attn_layerwise,
+    glm52_vllm_nvfp4_dp_attn_dsa_moe, glm52_vllm_nvfp4_dsa_moe, glm52_vllm_nvfp4_pp_dsa_moe,
+    glm53_flash_vllm_fp8_dp_attn_ep_moe, glm53_flash_vllm_fp8_kda_dsa_moe,
+    glm53_flash_vllm_fp8_pp_kda_dsa_moe, glm53_vllm_nvfp4_dsa_moe_dflash2, llama3_dense,
+    llama3_dense_tp, llama3_dp_attn_tp_ffn, qwen36_local, qwen3_attn_layerwise,
     qwen3_ffn_moe_layerwise, qwen3_fp8_ffn_moe_layerwise, qwen3_moe_dp_attn_ep_ffn,
     qwen3_moe_fp8_dp_attn_ep_ffn, qwen3_vllm_moe_dp_attn_ep_ffn, AttnLayerwiseModel,
     DeepseekV41ModelCfg, DeepseekV41VllmModel, DeepseekV41VllmParallel, DeepseekV4ModelCfg,
     DeepseekV4VllmModel, DeepseekV4VllmParallel, DenseParallel, DenseTpParallel,
     Dflash2DraftResolved, DpAttnTpFfnParallel, FfnLayerwiseModel, Glm52ModelCfg, Glm52MtpMode,
     Glm52SglangNvfp4TpDsaMoeModel, Glm52SglangNvfp4TpDsaMoeParallel, Glm52VllmDsaMoeModel,
-    Glm52VllmDsaMoeParallel, Glm52VllmNvfp4DsaMoeModel, Glm52VllmNvfp4DsaMoeParallel,
-    Glm52VllmNvfp4DsaMoeSpeculativeModel, Glm53FlashModelCfg, Glm53FlashVllmModel,
+    Glm52VllmDsaMoeParallel, Glm52VllmNvfp4DpAttnDsaMoeModel, Glm52VllmNvfp4DpAttnParallel,
+    Glm52VllmNvfp4DsaMoeModel, Glm52VllmNvfp4DsaMoeParallel, Glm52VllmNvfp4DsaMoeSpeculativeModel,
+    Glm52VllmNvfp4PpDsaMoeModel, Glm52VllmNvfp4PpParallel, Glm53FlashModelCfg, Glm53FlashQuant,
+    Glm53FlashVllmFp8PpModel, Glm53FlashVllmFp8PpParallel, Glm53FlashVllmModel,
     Glm53FlashVllmParallel, Glm53VllmNvfp4DsaMoeDflash2Model, IterwiseUnifiedModel,
     Llama3DenseModel, Llama3DenseTpModel, Llama3DpAttnTpFfnModel, Qwen36LocalModel,
     Qwen36LocalParallel, Qwen36ModelCfg, Qwen3AttnLayerwiseModel, Qwen3AttnParallel,
@@ -1148,6 +1152,115 @@ pub fn glm52_vllm_nvfp4_dsa_moe(
         .context("building B200 GLM-5.2 NVFP4 model (often a missing profile.db row)")
 }
 
+/// Build the B200 GLM-5.2/5.3 NVFP4 graph under data-parallel attention and
+/// expert-parallel MoE: `ep_size` GPUs, each its own attention rank at TP1,
+/// sharing the routed experts.
+///
+/// Routing is folded over `ep_size` ranks, so a popularity profile must have
+/// been captured at that `expert_parallel_size`.
+#[allow(clippy::too_many_arguments)]
+pub fn glm52_vllm_nvfp4_dp_attn_dsa_moe(
+    model_spec: &ModelSpec,
+    ep_size: u16,
+    nvl_num_gpu: u16,
+    max_model_len: u32,
+    routing_kind: RoutingKind,
+    routing_seed: Option<u64>,
+    expert_popularity_file: Option<&str>,
+    token_corpus_file: Option<&str>,
+    cudagraph_capture_sizes: &[u32],
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<Glm52VllmNvfp4DpAttnDsaMoeModel> {
+    let model_cfg = glm52_model_cfg(model_spec).context("loading exact GLM-5.2 NVFP4 config")?;
+    let source = ExpertDemandSource {
+        kind: routing_kind,
+        seed: routing_seed,
+        num_experts: model_cfg.num_experts.get(),
+        experts_per_token: model_cfg.router_top_k,
+        ep_size,
+        expert_popularity_file,
+        token_corpus_file,
+        num_routed_layers: num_sparse_layers(&model_cfg),
+    };
+    let body_demand = source.demand(0..num_sparse_layers(&model_cfg) as usize, 1)?;
+    let parallel = Glm52VllmNvfp4DpAttnParallel {
+        ep_size,
+        nvl_num_gpu,
+        max_model_len,
+        gpu_name: gpu.to_string(),
+        cudagraph_capture_sizes: {
+            let mut sizes = cudagraph_capture_sizes.to_vec();
+            sizes.sort_unstable();
+            sizes.dedup();
+            sizes
+        },
+    };
+    let configs = glm52_vllm_nvfp4_dp_attn_dsa_moe::build_configs(
+        &model_cfg,
+        &parallel,
+        &body_demand,
+        model_spec.fp8,
+    )
+    .context("expanding B200 GLM-5.2 NVFP4 DP-attention + EP architecture configs")?;
+    let resolved = glm52_vllm_nvfp4_dp_attn_dsa_moe::resolve_configs(&configs);
+    glm52_vllm_nvfp4_dp_attn_dsa_moe::build(name.to_string(), resolved, bridge).context(
+        "building B200 GLM-5.2 NVFP4 DP-attention + EP model (often a missing profile.db row)",
+    )
+}
+
+/// Build the B200 GLM-5.2/5.3 NVFP4 graph under pure pipeline parallelism:
+/// `pp_size` one-GPU stages at EP1, as the whole-pipeline view over them.
+///
+/// Routing is resolved at EP1 because one GPU owns all experts, so a
+/// popularity profile must have been captured with `expert_parallel_size == 1`.
+/// A deployment shares the built stages with its workers through
+/// [`Glm52VllmNvfp4PpDsaMoeModel::stages`].
+#[allow(clippy::too_many_arguments)]
+pub fn glm52_vllm_nvfp4_pp_dsa_moe(
+    model_spec: &ModelSpec,
+    pp_size: u16,
+    max_model_len: u32,
+    routing_kind: RoutingKind,
+    routing_seed: Option<u64>,
+    expert_popularity_file: Option<&str>,
+    token_corpus_file: Option<&str>,
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<Glm52VllmNvfp4PpDsaMoeModel> {
+    let model_cfg = glm52_model_cfg(model_spec).context("loading exact GLM-5.2 NVFP4 config")?;
+    let source = ExpertDemandSource {
+        kind: routing_kind,
+        seed: routing_seed,
+        num_experts: model_cfg.num_experts.get(),
+        experts_per_token: model_cfg.router_top_k,
+        // EP1: each stage's GPU owns all experts, so the fold sees one rank.
+        ep_size: 1,
+        expert_popularity_file,
+        token_corpus_file,
+        num_routed_layers: num_sparse_layers(&model_cfg),
+    };
+    let body_demand = source.demand(0..num_sparse_layers(&model_cfg) as usize, 1)?;
+    let parallel = Glm52VllmNvfp4PpParallel {
+        pp_size,
+        max_model_len,
+        gpu_name: gpu.to_string(),
+    };
+    let configs = glm52_vllm_nvfp4_pp_dsa_moe::build_configs(
+        &model_cfg,
+        &parallel,
+        &body_demand,
+        model_spec.fp8,
+    )
+    .context("expanding B200 GLM-5.2 NVFP4 pipeline-parallel architecture configs")?;
+    let resolved = glm52_vllm_nvfp4_pp_dsa_moe::resolve_configs(&configs);
+    glm52_vllm_nvfp4_pp_dsa_moe::build(name.to_string(), resolved, bridge).context(
+        "building B200 GLM-5.2 NVFP4 pipeline-parallel model (often a missing profile.db row)",
+    )
+}
+
 /// Build the B200 GLM-5.2 NVFP4 target-verify graph with its MTP proposer.
 ///
 /// The result is a different type from [`glm52_vllm_nvfp4_dsa_moe`]'s, not the
@@ -1213,7 +1326,8 @@ pub fn glm52_vllm_nvfp4_dsa_moe_speculative(
         .context("building speculative B200 GLM-5.2 NVFP4 model (often a missing profile.db row)")
 }
 
-/// Build the B200 GLM-5.3-Flash FP8 KDA/DSA/MoE model (vLLM fork, TP = EP).
+/// Build the B200 GLM-5.3-Flash FP8 KDA/DSA/MoE model (vLLM fork; routed
+/// experts EP = TP, or TP-sliced without `--enable-expert-parallel`).
 ///
 /// The checkpoint's layer schedule is exact, so layer-count overrides are
 /// rejected. Routing is resolved over the 42 routed layers; a corpus captured
@@ -1221,7 +1335,9 @@ pub fn glm52_vllm_nvfp4_dsa_moe_speculative(
 #[allow(clippy::too_many_arguments)]
 pub fn glm53_flash_vllm_fp8_kda_dsa_moe(
     model_spec: &ModelSpec,
+    quant: Glm53FlashQuant,
     tp_size: u16,
+    enable_expert_parallel: bool,
     max_model_len: u32,
     routing_kind: RoutingKind,
     routing_seed: Option<u64>,
@@ -1232,32 +1348,18 @@ pub fn glm53_flash_vllm_fp8_kda_dsa_moe(
     name: &str,
     bridge: &PerfApiBridge,
 ) -> Result<Glm53FlashVllmModel> {
-    if model_spec.num_layers.is_some() || model_spec.sim_num_layers.is_some() {
-        bail!(
-            "GLM-5.3-Flash architecture rejects num_layers/sim_num_layers overrides; the exact hybrid 45-layer schedule is required"
-        );
-    }
-    anyhow::ensure!(
-        model_spec.fp8,
-        "GLM-5.3-Flash is modeled for its FP8 block checkpoint; set fp8: true"
-    );
-    let model_cfg = Glm53FlashModelCfg::from_json(Path::new(&model_spec.model_config))
-        .context("loading GLM-5.3-Flash config")?;
-    let routed_layers = model_cfg.num_moe_layers();
-    let source = ExpertDemandSource {
-        kind: routing_kind,
-        seed: routing_seed,
-        num_experts: model_cfg.n_routed_experts,
-        experts_per_token: model_cfg.num_experts_per_tok,
-        ep_size: tp_size,
+    let (model_cfg, demand) = glm53_flash_model_and_demand(
+        model_spec,
+        quant,
+        if enable_expert_parallel { tp_size } else { 1 },
+        routing_kind,
+        routing_seed,
         expert_popularity_file,
         token_corpus_file,
-        num_routed_layers: routed_layers,
-    };
-    // Ordinary decode: one row per request, so a verify block is one token.
-    let demand = source.demand(0..routed_layers as usize, 1)?;
+    )?;
     let parallel = Glm53FlashVllmParallel {
         tp_size,
+        enable_expert_parallel,
         max_model_len,
         gpu_name: gpu.to_string(),
         cudagraph_capture_sizes: cudagraph_capture_sizes.to_vec(),
@@ -1267,6 +1369,163 @@ pub fn glm53_flash_vllm_fp8_kda_dsa_moe(
     let resolved = glm53_flash_vllm_fp8_kda_dsa_moe::resolve_configs(&configs);
     glm53_flash_vllm_fp8_kda_dsa_moe::build(name.to_string(), resolved, bridge)
         .context("building GLM-5.3-Flash model (often a missing profile.db row)")
+}
+
+/// The exact GLM-5.3-Flash config, which must declare the arch tag's
+/// quantization (`fp8: true` exactly for the FP8 block checkpoint).
+fn glm53_flash_model_cfg(
+    model_spec: &ModelSpec,
+    quant: Glm53FlashQuant,
+) -> Result<Glm53FlashModelCfg> {
+    let model_cfg = Glm53FlashModelCfg::from_json(Path::new(&model_spec.model_config))
+        .context("loading GLM-5.3-Flash config")?;
+    anyhow::ensure!(
+        model_cfg.quant == quant,
+        "{} declares a {} checkpoint, but the arch is the {} one",
+        model_spec.model_config,
+        model_cfg.quant.tag(),
+        quant.tag()
+    );
+    anyhow::ensure!(
+        model_spec.fp8 == (quant == Glm53FlashQuant::Fp8Block),
+        "GLM-5.3-Flash {}: set fp8: {}",
+        quant.tag(),
+        quant == Glm53FlashQuant::Fp8Block
+    );
+    Ok(model_cfg)
+}
+
+/// The exact GLM-5.3-Flash config and its routed demand folded to `ep_size`
+/// ranks. Routing is resolved over the 42 routed layers; a corpus captured with
+/// MTP off records exactly those.
+fn glm53_flash_model_and_demand(
+    model_spec: &ModelSpec,
+    quant: Glm53FlashQuant,
+    ep_size: u16,
+    routing_kind: RoutingKind,
+    routing_seed: Option<u64>,
+    expert_popularity_file: Option<&str>,
+    token_corpus_file: Option<&str>,
+) -> Result<(
+    Glm53FlashModelCfg,
+    crate::timing::expert_demand::ExpertDemand,
+)> {
+    if model_spec.num_layers.is_some() || model_spec.sim_num_layers.is_some() {
+        bail!(
+            "GLM-5.3-Flash architecture rejects num_layers/sim_num_layers overrides; the exact hybrid 45-layer schedule is required"
+        );
+    }
+    let model_cfg = glm53_flash_model_cfg(model_spec, quant)?;
+    let routed_layers = model_cfg.num_moe_layers();
+    let source = ExpertDemandSource {
+        kind: routing_kind,
+        seed: routing_seed,
+        num_experts: model_cfg.n_routed_experts,
+        experts_per_token: model_cfg.num_experts_per_tok,
+        ep_size,
+        expert_popularity_file,
+        token_corpus_file,
+        num_routed_layers: routed_layers,
+    };
+    // Ordinary decode: one row per request, so a verify block is one token.
+    let demand = source.demand(0..routed_layers as usize, 1)?;
+    Ok((model_cfg, demand))
+}
+
+/// Build the B200 GLM-5.3-Flash FP8 graph under pure pipeline parallelism:
+/// `pp_size` one-GPU stages at TP1 / EP1, as the whole-pipeline view over them.
+///
+/// Routing is resolved at EP1 because one GPU owns all 288 experts. A
+/// deployment shares the built stages with its workers through
+/// [`Glm53FlashVllmFp8PpModel::stages`].
+#[allow(clippy::too_many_arguments)]
+pub fn glm53_flash_vllm_fp8_pp_kda_dsa_moe(
+    model_spec: &ModelSpec,
+    quant: Glm53FlashQuant,
+    pp_size: u16,
+    max_model_len: u32,
+    routing_kind: RoutingKind,
+    routing_seed: Option<u64>,
+    expert_popularity_file: Option<&str>,
+    token_corpus_file: Option<&str>,
+    cudagraph_capture_sizes: &[u32],
+    layer_partition: &[u32],
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<Glm53FlashVllmFp8PpModel> {
+    let (model_cfg, demand) = glm53_flash_model_and_demand(
+        model_spec,
+        quant,
+        1,
+        routing_kind,
+        routing_seed,
+        expert_popularity_file,
+        token_corpus_file,
+    )?;
+    let parallel = Glm53FlashVllmFp8PpParallel {
+        pp_size,
+        max_model_len,
+        gpu_name: gpu.to_string(),
+        cudagraph_capture_sizes: cudagraph_capture_sizes.to_vec(),
+        layer_partition: layer_partition.to_vec(),
+    };
+    let configs =
+        glm53_flash_vllm_fp8_pp_kda_dsa_moe::build_configs(&model_cfg, &parallel, &demand)
+            .context("expanding GLM-5.3-Flash pipeline-parallel architecture configs")?;
+    let resolved = glm53_flash_vllm_fp8_pp_kda_dsa_moe::resolve_configs(&configs);
+    glm53_flash_vllm_fp8_pp_kda_dsa_moe::build(name.to_string(), resolved, bridge)
+        .context("building GLM-5.3-Flash pipeline-parallel model (often a missing profile.db row)")
+}
+
+/// Build the B200 GLM-5.3-Flash FP8 model under data-parallel attention and
+/// expert-parallel MoE (vLLM `--data-parallel-size ep_size
+/// --enable-expert-parallel`, TP1).
+#[allow(clippy::too_many_arguments)]
+pub fn glm53_flash_vllm_fp8_dp_attn_ep_moe(
+    model_spec: &ModelSpec,
+    quant: Glm53FlashQuant,
+    ep_size: u16,
+    max_model_len: u32,
+    routing_kind: RoutingKind,
+    routing_seed: Option<u64>,
+    expert_popularity_file: Option<&str>,
+    token_corpus_file: Option<&str>,
+    cudagraph_capture_sizes: &[u32],
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<glm53_flash_vllm_fp8_dp_attn_ep_moe::Glm53FlashDpAttnEpModel> {
+    if model_spec.num_layers.is_some() || model_spec.sim_num_layers.is_some() {
+        bail!(
+            "GLM-5.3-Flash architecture rejects num_layers/sim_num_layers overrides; the exact hybrid 45-layer schedule is required"
+        );
+    }
+    let model_cfg = glm53_flash_model_cfg(model_spec, quant)?;
+    let routed_layers = model_cfg.num_moe_layers();
+    let source = ExpertDemandSource {
+        kind: routing_kind,
+        seed: routing_seed,
+        num_experts: model_cfg.n_routed_experts,
+        experts_per_token: model_cfg.num_experts_per_tok,
+        ep_size,
+        expert_popularity_file,
+        token_corpus_file,
+        num_routed_layers: routed_layers,
+    };
+    let demand = source.demand(0..routed_layers as usize, 1)?;
+    let parallel = glm53_flash_vllm_fp8_dp_attn_ep_moe::Glm53FlashDpAttnEpParallel {
+        dp_size: ep_size,
+        max_model_len,
+        gpu_name: gpu.to_string(),
+        cudagraph_capture_sizes: cudagraph_capture_sizes.to_vec(),
+    };
+    let configs =
+        glm53_flash_vllm_fp8_dp_attn_ep_moe::build_configs(&model_cfg, &parallel, &demand)
+            .context("expanding GLM-5.3-Flash DP-attention/EP architecture configs")?;
+    let resolved = glm53_flash_vllm_fp8_dp_attn_ep_moe::resolve_configs(&configs);
+    glm53_flash_vllm_fp8_dp_attn_ep_moe::build(name.to_string(), resolved, bridge)
+        .context("building GLM-5.3-Flash DP-attention/EP model (often a missing profile.db row)")
 }
 
 /// Build the GLM target graph driven by a DFlash2 block-parallel proposer.
@@ -1546,6 +1805,19 @@ pub fn qwen3_fp8_ffn_moe(
         .context("building native FP8 Qwen3 AFD ffn-side model")
 }
 
+/// The checkpoint quantization a GLM-5.3-Flash arch tag is for.
+pub fn glm53_flash_quant(sel: &IterArchSel) -> Glm53FlashQuant {
+    match sel {
+        IterArchSel::Glm53FlashVllmNvfp4KdaDsaMoe { .. }
+        | IterArchSel::Glm53FlashVllmNvfp4PpKdaDsaMoe { .. }
+        | IterArchSel::Glm53FlashVllmNvfp4DpAttnEpMoe { .. } => Glm53FlashQuant::Nvfp4,
+        IterArchSel::Glm53FlashVllmFp8KdaDsaMoe { .. }
+        | IterArchSel::Glm53FlashVllmFp8PpKdaDsaMoe { .. }
+        | IterArchSel::Glm53FlashVllmFp8DpAttnEpMoe { .. } => Glm53FlashQuant::Fp8Block,
+        other => unreachable!("{other:?} is not a GLM-5.3-Flash arch tag"),
+    }
+}
+
 /// Build ONE iter-wise arch model from its selector, boxed as `dyn`. The
 /// model-only seam the offline `timing-predict` (iter arch) path uses (it evaluates
 /// [`IterwiseUnifiedModel`] directly, no worker/flow). The deployments do NOT box
@@ -1773,6 +2045,50 @@ pub fn build_iter_model(
             name,
             bridge,
         )?),
+        IterArchSel::Glm52VllmNvfp4DpAttnDsaMoe {
+            model,
+            ep_size,
+            nvl_num_gpu,
+            max_model_len,
+            routing,
+            routing_seed,
+            expert_popularity_file,
+            token_corpus_file,
+            cudagraph_capture_sizes,
+        } => Box::new(glm52_vllm_nvfp4_dp_attn_dsa_moe(
+            model,
+            *ep_size,
+            *nvl_num_gpu,
+            *max_model_len,
+            *routing,
+            *routing_seed,
+            expert_popularity_file.as_deref(),
+            token_corpus_file.as_deref(),
+            cudagraph_capture_sizes,
+            gpu,
+            name,
+            bridge,
+        )?),
+        IterArchSel::Glm52VllmNvfp4PpDsaMoe {
+            model,
+            pp_size,
+            max_model_len,
+            routing,
+            routing_seed,
+            expert_popularity_file,
+            token_corpus_file,
+        } => Box::new(glm52_vllm_nvfp4_pp_dsa_moe(
+            model,
+            *pp_size,
+            *max_model_len,
+            *routing,
+            *routing_seed,
+            expert_popularity_file.as_deref(),
+            token_corpus_file.as_deref(),
+            gpu,
+            name,
+            bridge,
+        )?),
         IterArchSel::Glm52SglangNvfp4TpDsaMoe {
             model,
             tp_size,
@@ -1798,6 +2114,18 @@ pub fn build_iter_model(
         IterArchSel::Glm53FlashVllmFp8KdaDsaMoe {
             model,
             tp_size,
+            enable_expert_parallel,
+            max_model_len,
+            routing,
+            routing_seed,
+            expert_popularity_file,
+            token_corpus_file,
+            cudagraph_capture_sizes,
+        }
+        | IterArchSel::Glm53FlashVllmNvfp4KdaDsaMoe {
+            model,
+            tp_size,
+            enable_expert_parallel,
             max_model_len,
             routing,
             routing_seed,
@@ -1806,7 +2134,78 @@ pub fn build_iter_model(
             cudagraph_capture_sizes,
         } => Box::new(glm53_flash_vllm_fp8_kda_dsa_moe(
             model,
+            glm53_flash_quant(sel),
             *tp_size,
+            *enable_expert_parallel,
+            *max_model_len,
+            *routing,
+            *routing_seed,
+            expert_popularity_file.as_deref(),
+            token_corpus_file.as_deref(),
+            cudagraph_capture_sizes,
+            gpu,
+            name,
+            bridge,
+        )?),
+        IterArchSel::Glm53FlashVllmFp8PpKdaDsaMoe {
+            model,
+            pp_size,
+            max_model_len,
+            routing,
+            routing_seed,
+            expert_popularity_file,
+            token_corpus_file,
+            cudagraph_capture_sizes,
+            layer_partition,
+        }
+        | IterArchSel::Glm53FlashVllmNvfp4PpKdaDsaMoe {
+            model,
+            pp_size,
+            max_model_len,
+            routing,
+            routing_seed,
+            expert_popularity_file,
+            token_corpus_file,
+            cudagraph_capture_sizes,
+            layer_partition,
+        } => Box::new(glm53_flash_vllm_fp8_pp_kda_dsa_moe(
+            model,
+            glm53_flash_quant(sel),
+            *pp_size,
+            *max_model_len,
+            *routing,
+            *routing_seed,
+            expert_popularity_file.as_deref(),
+            token_corpus_file.as_deref(),
+            cudagraph_capture_sizes,
+            layer_partition,
+            gpu,
+            name,
+            bridge,
+        )?),
+        IterArchSel::Glm53FlashVllmFp8DpAttnEpMoe {
+            model,
+            ep_size,
+            max_model_len,
+            routing,
+            routing_seed,
+            expert_popularity_file,
+            token_corpus_file,
+            cudagraph_capture_sizes,
+        }
+        | IterArchSel::Glm53FlashVllmNvfp4DpAttnEpMoe {
+            model,
+            ep_size,
+            max_model_len,
+            routing,
+            routing_seed,
+            expert_popularity_file,
+            token_corpus_file,
+            cudagraph_capture_sizes,
+        } => Box::new(glm53_flash_vllm_fp8_dp_attn_ep_moe(
+            model,
+            glm53_flash_quant(sel),
+            *ep_size,
             *max_model_len,
             *routing,
             *routing_seed,
@@ -2324,6 +2723,33 @@ mod tests {
         assert_eq!(built.gpus_per_replica(), 1);
         assert_eq!(built.total_kv_bytes_per_token(), 20_480);
         assert_eq!(built.cost_log_manifest().slots.len(), 72);
+    }
+
+    /// A GLM-5.3-Flash arch builds only the checkpoint whose precision its tag
+    /// names: the FP8 and NVFP4 tags share one graph, so a mismatch would
+    /// otherwise build silently at the wrong precision.
+    #[test]
+    fn glm53_flash_tags_reject_the_other_checkpoint() {
+        let build = |arch: &str, config: &str, fp8: bool| {
+            let raw = format!(
+                r#"{{"type":"{arch}","model_config":"{}","fp8":{fp8}}}"#,
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join(format!("model/config/{config}.json"))
+                    .display()
+            );
+            let selector: IterArchSel = serde_json::from_str(&raw).unwrap();
+            let bridge = PerfApiBridge::new_uninit_for_test();
+            bridge.enable_enumerate();
+            build_iter_model(&selector, "NVIDIA B200", "test", &bridge).map(|_| ())
+        };
+        let nvfp4 = "glm53_flash_vllm_nvfp4_kda_dsa_moe";
+        let fp8 = "glm53_flash_vllm_fp8_kda_dsa_moe";
+        build(nvfp4, "glm53_flash_nvfp4", false).unwrap();
+        build(fp8, "glm53_flash", true).unwrap();
+        let wrong = build(nvfp4, "glm53_flash", false).unwrap_err().to_string();
+        assert!(wrong.contains("declares a fp8 checkpoint"), "{wrong}");
+        assert!(build(fp8, "glm53_flash_nvfp4", true).is_err());
+        assert!(build(nvfp4, "glm53_flash_nvfp4", true).is_err());
     }
 
     /// Two callables, one artifact. This is the whole reason the corpus is

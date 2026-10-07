@@ -104,7 +104,7 @@ preset's `axes` as a query parameter:
 
 ```bash
 curl -s "$API/models" | jq -r '.checkpoints[] | .presets[] | [.id, .gpu, (.axes | map(.name) | join(","))] | @tsv'
-curl -s "$API/models/GLM-5.3-Flash/glm53_flash_vllm_fp8_kda_dsa_moe/tree?max_model_len=8192&workload=diverse_100" > tree.json
+curl -s "$API/models/GLM-5.3-Flash/glm53_flash_vllm_fp8_kda_dsa_moe/tree?tp_size=4&enable_expert_parallel=true&max_model_len=8192&workload=diverse_100" > tree.json
 jq -r '[.sections[].slots[].kernel] | unique[]' tree.json
 jq -r '.sections[] | .slots[] | [.kernel, (.backends | join(",")), .config, .name] | @tsv' tree.json
 ```

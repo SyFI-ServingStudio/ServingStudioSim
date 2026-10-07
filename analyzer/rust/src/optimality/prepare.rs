@@ -202,6 +202,9 @@ fn is_communication_kind(kind: &str) -> bool {
             | "reduce_scatter"
             | "all_to_all"
             | "moe_alltoall"
+            | "moe_ep_all_gather"
+            | "moe_ep_quantized_all_gather"
+            | "moe_ep_reduce_scatter"
             | "broadcast"
             | "gather"
             | "scatter"
@@ -220,6 +223,17 @@ mod tests {
     fn moe_exchange_is_communication_but_its_local_prepare_is_not() {
         assert!(is_communication_kind("moe_alltoall"));
         assert!(!is_communication_kind("moe_alltoall_prepare"));
+    }
+
+    #[test]
+    fn naive_dp_ep_gather_and_scatter_are_communication() {
+        for kind in [
+            "moe_ep_all_gather",
+            "moe_ep_quantized_all_gather",
+            "moe_ep_reduce_scatter",
+        ] {
+            assert!(is_communication_kind(kind), "{kind}");
+        }
     }
 
     #[test]

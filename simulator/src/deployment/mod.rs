@@ -11,10 +11,12 @@
 pub mod afd;
 pub mod config;
 pub mod pd;
+pub mod pp;
 pub mod unified;
 
 pub use config::{
-    AfdConfig, BackendOverrides, IoSpec, LogLevel, PdConfig, RunConfig, UnifiedConfig, WorkloadSpec,
+    AfdConfig, BackendOverrides, IoSpec, LogLevel, PdConfig, PpConfig, RunConfig, UnifiedConfig,
+    WorkloadSpec,
 };
 
 use anyhow::{bail, ensure, Context};
@@ -27,9 +29,9 @@ use crate::timing::PerfApiBridge;
 use crate::worker::IterWorkerSel;
 
 /// Dispatch a deserialized `RunConfig` to its deployment's `build`. The single
-/// place the `deployment` tag routes to a concrete topology. `unified`, `pd`, and
-/// `afd` are all wired. What a pool requires of the trace it serves is checked
-/// by [`check_trace`], before a run builds anything.
+/// place the `deployment` tag routes to a concrete topology. `unified`, `pd`,
+/// `afd`, and `pp` are all wired. What a pool requires of the trace it serves is
+/// checked by [`check_trace`], before a run builds anything.
 pub fn build_flow(
     cfg: &RunConfig,
     bridge: &PerfApiBridge,
@@ -39,6 +41,7 @@ pub fn build_flow(
         RunConfig::Unified(c) => unified::UnifiedDeployment::build(c, bridge, store),
         RunConfig::Pd(c) => pd::PdDeployment::build(c, bridge, store),
         RunConfig::Afd(c) => afd::AfdDeployment::build(c, bridge, store),
+        RunConfig::Pp(c) => pp::PpDeployment::build(c, bridge, store),
     }
 }
 
@@ -93,6 +96,8 @@ pub fn pool_bounds(cfg: &RunConfig) -> anyhow::Result<Vec<PoolBound>> {
                 });
             }
         }
+        // Every stage carries the same arch; the bound is the pipeline's.
+        RunConfig::Pp(c) => iter_pool("stage", &c.pools.stage, &mut out)?,
     }
     Ok(out)
 }

@@ -34,7 +34,8 @@
 //!
 //! Per-link cost comes from a [`CostSource`]: production holds the `p2p_inter` L1
 //! kernel and reads its profiled inter-node send/recv-vs-message-size curve via
-//! `eval`; tests hold an analytic per-link bandwidth. The enum is the test seam —
+//! `eval` (a pipeline-parallel deployment, whose stages share one NVLink domain,
+//! holds the `p2p_intra` kernel instead); tests hold an analytic per-link bandwidth. The enum is the test seam —
 //! the kernel can't be built without a perf-api bridge + `profile.db` rows, so the
 //! cluster's contention-logic unit tests use the analytic variant instead.
 //!
@@ -60,7 +61,9 @@ use serde::Serialize;
 
 use crate::common::Time;
 use crate::log::{GpuClusterEntry, NetworkLogger};
-use crate::timing::kernels::{P2pInterKernel, P2pInterKernelInput};
+use crate::timing::kernels::{
+    P2pInterKernel, P2pInterKernelInput, P2pIntraKernel, P2pIntraKernelInput,
+};
 
 /// One physical GPU and who owns it. The cluster's `gpus` field is a flat list
 /// of these (the reporting / `run_meta.json` subset); `pool` + `worker_id` make
@@ -81,10 +84,13 @@ pub struct GpuInfo {
 }
 
 /// Where a transfer's per-link time comes from. `Kernel` is the profiled
-/// inter-node p2p curve (production); `Analytic` is a constant per-link bandwidth
-/// (`bytes_per_ms`) used as the unit-test seam / a bridge-free fallback.
+/// inter-node p2p curve (production); `IntraKernel` is the profiled NVLink p2p
+/// curve, for endpoints inside one NVLink domain (pipeline stages); `Analytic` is
+/// a constant per-link bandwidth (`bytes_per_ms`) used as the unit-test seam / a
+/// bridge-free fallback.
 pub enum CostSource {
     Kernel(P2pInterKernel),
+    IntraKernel(P2pIntraKernel),
     Analytic { bytes_per_ms: f64 },
 }
 
@@ -103,6 +109,10 @@ impl CostSource {
                 let leaf = k.eval(&P2pInterKernelInput { message_size_bytes });
                 Time::from_ms(leaf.m.time_ms.max(0.0) as f64)
             }
+            CostSource::IntraKernel(k) => {
+                let leaf = k.eval(&P2pIntraKernelInput { message_size_bytes });
+                Time::from_ms(leaf.m.time_ms.max(0.0) as f64)
+            }
             CostSource::Analytic { bytes_per_ms } => {
                 Time::from_ms(message_size_bytes as f64 / bytes_per_ms)
             }
@@ -118,8 +128,9 @@ impl CostSource {
     fn latency(&self) -> Time {
         match self {
             CostSource::Analytic { .. } => Time::ZERO,
-            CostSource::Kernel(_) => {
-                // 2^10 = the p2p_inter sweep floor (see p2p_inter.rs sweep_grid).
+            CostSource::Kernel(_) | CostSource::IntraKernel(_) => {
+                // 2^10 = the p2p sweep floor (see p2p_inter.rs / p2p_intra.rs
+                // sweep_grid).
                 let b0 = 1024u64;
                 let t0 = self.link_time(b0).as_ms();
                 let t1 = self.link_time(2 * b0).as_ms();

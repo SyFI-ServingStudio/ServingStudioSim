@@ -7,6 +7,7 @@ use crate::arch::contract::IterwiseUnifiedModel;
 use crate::common::{PoolId, SharedRequests, WorkerId};
 use crate::log::PrefixCacheLogger;
 use crate::worker::admission::{ChunkedPrefillAdmission, LoadBalance, PendingOrder};
+use crate::worker::config::DpPlacement;
 use crate::worker::execution::UnifiedIterExecution;
 use crate::worker::gpu_cluster::SharedGpuCluster;
 use crate::worker::kv::FullAttnKv;
@@ -65,10 +66,10 @@ pub(crate) fn build_chunked_prefill_worker<M: IterwiseUnifiedModel>(
         essentials.sampler,
         prefix_cache_logger,
     );
-    let balance = if num_partitions == 1 {
-        LoadBalance::Single
-    } else {
-        LoadBalance::RoundRobin { next: 0 }
+    let balance = match (num_partitions, config.dp_placement) {
+        (1, _) => LoadBalance::Single,
+        (_, DpPlacement::RoundRobin) => LoadBalance::RoundRobin { next: 0 },
+        (_, DpPlacement::VllmLeastLoaded) => LoadBalance::LeastLoaded { next: 0 },
     };
     let admission = ChunkedPrefillAdmission::new(
         (0..num_partitions)

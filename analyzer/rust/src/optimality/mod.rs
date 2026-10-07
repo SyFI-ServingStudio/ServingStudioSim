@@ -77,6 +77,7 @@ mod kernel;
 mod ladder;
 mod levels;
 mod location;
+mod pipeline;
 mod prepare;
 mod run;
 mod scoped;

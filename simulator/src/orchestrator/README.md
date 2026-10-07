@@ -17,6 +17,7 @@ production source-tree guide.
 6. `impls/afd_attn_pool.rs` — AFD placement, aggregation, scatter, barriers.
 7. `impls/afd_ffn_pool.rs` — AFD FFN task routing.
 8. `impls/afd.rs` — AFD flow ordering.
+9. `impls/pp.rs` — PP stage pool and flow.
 
 ## Topology vocabulary
 
@@ -27,6 +28,7 @@ deployment → pool(role) → homogeneous group → worker replica
 - unified: `main`
 - PD: `prefill`, `decode`
 - AFD: `attn`, `ffn`
+- PP: `stage`
 
 `PoolSpec<Arch, Worker>` and `GroupSpec<Arch, Worker>` keep the L4/L5 contract
 class typed. Current deployment builders accept one homogeneous group per pool;
@@ -118,6 +120,22 @@ tasks across FFN replicas, ticks due workers, and returns `SectionReady` or
 `AfdFlow` drives attention, forwards aggregated tasks to FFN, applies FFN events
 back to attention, and surfaces completed requests. Cross-pool transfers use the
 same shared `GpuCluster`.
+
+## PP (`pp.rs`)
+
+One `stage` pool holds `replicas` pipelines of `depth` workers each; worker
+`r * depth + s` is stage `s` of replica `r`, built in that order so a replica's
+GPUs are contiguous. `PpStagePoolController`:
+
+- places arrivals on heads (least-queued or round-robin);
+- routes `MicrobatchLaunched` / `StageDone` to the next stage of the same replica;
+- turns the last stage's `StageDone` into `MicrobatchExit` for the head;
+- repeats the sweep at one `now` until no worker emits an event, and makes every
+  message receiver due immediately, so a computing head still completes an
+  exited microbatch on the tick it exits.
+
+`PpFlow` builds the shared cluster with the `p2p_intra` cost and surfaces
+completed requests.
 
 ## Ownership rules
 

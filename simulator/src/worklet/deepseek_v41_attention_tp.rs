@@ -447,6 +447,7 @@ impl DeepseekV41AttentionTpWorklet {
                 hidden_dim: hidden,
                 dtype: DType::Bf16,
                 fabric: Fabric::Nvlink,
+                fused_token_limit: None,
             }),
             raw_cfg: cfg.clone(),
         }

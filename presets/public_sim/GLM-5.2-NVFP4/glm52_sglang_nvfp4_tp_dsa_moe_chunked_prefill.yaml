@@ -9,6 +9,7 @@ pools:
       - replicas: ${replicas}
         arch:
           preset: glm52_sglang_nvfp4_tp_dsa_moe
+          tp_size: 4
           max_model_len: ${max_model_len}
         worker:
           type: chunked_prefill

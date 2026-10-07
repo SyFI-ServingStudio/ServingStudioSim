@@ -140,8 +140,38 @@ def test_single_gemm_known_backends_include_framework_dispatches():
         "sglang_bf16_auto",
         "sglang_fused_a_auto",
         "deepgemm",
+        "flashinfer_cutedsl",
         "flashinfer_mxfp8",
     }
+
+
+def test_flashinfer_cutedsl_backend_is_nvfp4_sm10x_in_vllm_env():
+    # Guards the device/dtype contract the worker enforces before loading the
+    # runner: a bf16 config or a Hopper card must never route to the FP4 GEMM.
+    spec = find_kernel_profiler_spec("single_gemm", "flashinfer_cutedsl")
+    assert spec.table_name == "single_gemm"
+    assert spec.args_schema is SingleGemmArgs
+    assert spec.subprocess_env == "vllm_env"
+    assert spec.supports.compute == frozenset({DType.NVFP4_E2M1})
+    assert spec.supports.sm_targets == frozenset({"sm_100f"})
+    assert spec.runner_ref.module_name == "profiling.runners.gemm.flashinfer_fp4"
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"m": 8, "n": 64, "k": 64, "dtype": "bf16"}, "NVFP4-only"),
+        ({"m": 8, "n": 64, "k": 40, "dtype": "nvfp4_e2m1"}, "divisible by 16"),
+        ({"m": 0, "n": 64, "k": 64, "dtype": "nvfp4_e2m1"}, "positive"),
+    ],
+)
+def test_flashinfer_cutedsl_runner_rejects_specs_vllm_cannot_quantize(kwargs, message):
+    # Rejected before any torch/vLLM import, so a bad spec fails loudly instead
+    # of being timed as some other GEMM.
+    from profiling.runners.gemm.flashinfer_fp4 import profile_single_gemm
+
+    with pytest.raises(ValueError, match=message):
+        profile_single_gemm(**kwargs)
 
 
 def test_torch_linear_backend_registered_sharing_table_and_args():
@@ -1492,8 +1522,11 @@ def test_local_chunk_uses_selected_external_python_and_project_path(
     )
     monkeypatch.setattr("profiling.exec.local.resolve_profile_env", fake_resolve_profile_env)
     monkeypatch.setattr("profiling.exec.local.subprocess.run", fake_subprocess_run)
-    existing_pythonpath = os.pathsep.join(["/existing/first", "/existing/second"])
-    monkeypatch.setenv("PYTHONPATH", existing_pythonpath)
+    # The launcher's PyO3 child points these at the project venv; an env with
+    # its own interpreter must not import the project's Torch through them.
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join(["/project/site-packages", "/existing"]))
+    monkeypatch.setenv("PYTHONHOME", "/project/python-home")
+    monkeypatch.setenv("VIRTUAL_ENV", "/project/.venv")
     monkeypatch.setenv("LD_LIBRARY_PATH", "/existing/lib")
 
     results = LocalGpuChunk([2]).run(
@@ -1514,11 +1547,21 @@ def test_local_chunk_uses_selected_external_python_and_project_path(
             str(Path(__file__).parents[1]),
             str(first_import_root),
             str(second_import_root),
-            existing_pythonpath,
         ]
     )
+    assert "PYTHONHOME" not in captured_env
+    assert "VIRTUAL_ENV" not in captured_env
     assert captured_env["LD_LIBRARY_PATH"] == os.pathsep.join([str(library_root), "/existing/lib"])
     assert isinstance(results[0].metrics, ComputeMetrics)
+
+
+def test_project_interpreter_worker_keeps_the_inherited_pythonpath(monkeypatch):
+    from profiling.exec.env import _default_python, set_worker_python_env
+
+    env = {"PYTHONPATH": "/existing", "PYTHONHOME": "/home"}
+    set_worker_python_env(ProfileEnv("default_env", _default_python()), env)
+    assert env["PYTHONPATH"] == os.pathsep.join([str(Path(__file__).parents[1]), "/existing"])
+    assert env["PYTHONHOME"] == "/home"
 
 
 def test_run_profile_batch_rejects_invalid_gpu_count():

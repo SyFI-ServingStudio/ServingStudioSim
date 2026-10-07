@@ -101,6 +101,7 @@ markers = [
     "needs_db: requires warm profile.db rows for the config under test",
     "agent: Codex runner+judge tier (opt-in: --run-agent)",
     "bench: perf/timing, non-deterministic (opt-in: -m bench)",
+    "presets: builds every public member through the simulator (just test-presets)",
 ]
 
 [tool.ruff]

@@ -32,6 +32,12 @@ pub struct AllReduceFusionKernelConfig {
     #[compute_dtype]
     pub dtype: DType,
     pub fabric: Fabric,
+    /// An engine's own fused-token limit, replacing vLLM's workspace-size
+    /// rule when set: SGLang fuses any batch of at most 2048 tokens whatever
+    /// its byte size (`layers/communicator.py:162-179`). `None` (vLLM) is left
+    /// out of the config identity, so vLLM configs keep their identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fused_token_limit: Option<u32>,
 }
 
 #[derive(Clone, SweepCoords, serde::Serialize, serde::Deserialize)]
@@ -116,8 +122,12 @@ pub(crate) fn flashinfer_fusion_max_bytes(gpu_name: &str, num_gpus: u32) -> u64 
 }
 
 impl AllReduceFusionSpec {
-    /// Largest token count for which vLLM selects FlashInfer.
+    /// Largest token count the engine runs through FlashInfer:
+    /// `fused_token_limit` when set, else vLLM's workspace cap.
     pub fn max_fused_tokens(config: &AllReduceFusionKernelConfig) -> u32 {
+        if let Some(limit) = config.fused_token_limit {
+            return limit;
+        }
         let bytes_per_token = u64::from(config.hidden_dim)
             .checked_mul(config.dtype.size_bytes() as u64)
             .expect("all-reduce bytes per token overflow");
@@ -202,7 +212,24 @@ mod tests {
             hidden_dim: 6144,
             dtype: DType::Bf16,
             fabric: Fabric::Nvlink,
+            fused_token_limit: None,
         }
+    }
+
+    #[test]
+    fn an_engine_token_limit_replaces_the_workspace_cap() {
+        let sglang = AllReduceFusionKernelConfig {
+            fused_token_limit: Some(2048),
+            ..config(8)
+        };
+        assert_eq!(AllReduceFusionSpec::max_fused_tokens(&sglang), 2048);
+        assert_eq!(
+            AllReduceFusionSpec::sweep_grid(&sglang).axes()[0].last(),
+            Some(&2048.0)
+        );
+        // vLLM configs keep their identity: the unset limit is not serialized.
+        assert!(config(8).identity().get("fused_token_limit").is_none());
+        assert_eq!(sglang.identity()["fused_token_limit"], 2048);
     }
 
     #[test]

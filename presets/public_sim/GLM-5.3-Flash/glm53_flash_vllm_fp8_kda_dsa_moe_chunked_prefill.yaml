@@ -9,6 +9,8 @@ pools:
       - replicas: ${replicas}
         arch:
           preset: glm53_flash_vllm_fp8_kda_dsa_moe
+          tp_size: 4
+          enable_expert_parallel: true
           max_model_len: ${max_model_len}
         worker:
           type: chunked_prefill

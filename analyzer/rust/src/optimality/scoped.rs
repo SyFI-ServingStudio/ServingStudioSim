@@ -27,6 +27,7 @@ use crate::trace::manifest::{
 };
 
 use super::floors::{self, SemanticWork};
+use super::pipeline;
 use super::spec::{load_gpu_spec, GpuSpec};
 
 type WorkerKey = (String, u16);
@@ -1068,6 +1069,9 @@ fn is_communication_kind(kind: &str) -> bool {
             | "all_gather"
             | "reduce_scatter"
             | "all_to_all"
+            | "moe_ep_all_gather"
+            | "moe_ep_quantized_all_gather"
+            | "moe_ep_reduce_scatter"
             | "broadcast"
             | "gather"
             | "scatter"
@@ -1092,6 +1096,9 @@ async fn compute_semantic_floors(
     let root = repo_root().context("repository root is required for location maps")?;
     let maps = load_location_maps(&root)?;
     let labels = floors::compute_saturated_run_labels(ctx, log_dir, 1).await?;
+    // A pipeline stage's label is its own share of the model, mapped through its
+    // part of the whole-pipeline map.
+    let stages = pipeline::pipeline_stages(manifests)?;
 
     let mut mapping_ids = BTreeSet::new();
     let mut semantic_names = BTreeSet::new();
@@ -1118,7 +1125,12 @@ async fn compute_semantic_floors(
                 )
             })?;
         let manifest_doc = &manifests[&occurrence.worker];
-        let map = select_location_map(&maps, &pool_spec.arch_type, manifest_doc)?;
+        let map = select_location_map(
+            &maps,
+            &pool_spec.arch_type,
+            manifest_doc,
+            stages.contains_key(&occurrence.worker),
+        )?;
         mapping_ids.insert(map.mapping_id.clone());
         let hardware_key = (
             pool_spec.arch_type.clone(),
@@ -1241,10 +1253,13 @@ fn load_location_maps(root: &Path) -> Result<Vec<LocationMap>> {
     Ok(maps)
 }
 
+/// The map whose locations are exactly the worker's; a pipeline stage's map need
+/// only contain its locations (see `location.rs`).
 fn select_location_map<'a>(
     maps: &'a [LocationMap],
     arch_type: &str,
     manifest_doc: &ManifestDoc,
+    pipeline_stage: bool,
 ) -> Result<&'a LocationMap> {
     let expected = manifest_doc
         .sections
@@ -1261,11 +1276,16 @@ fn select_location_map<'a>(
                 .any(|candidate| candidate == arch_type)
         })
         .filter(|map| {
-            map.locations
+            let mapped = map
+                .locations
                 .iter()
                 .map(|location| location.location.as_str())
-                .collect::<BTreeSet<_>>()
-                == expected
+                .collect::<BTreeSet<_>>();
+            if pipeline_stage {
+                mapped.is_superset(&expected)
+            } else {
+                mapped == expected
+            }
         })
         .collect::<Vec<_>>();
     match candidates.as_slice() {
