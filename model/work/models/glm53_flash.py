@@ -168,8 +168,12 @@ def build(raw_config: dict) -> Model:
     )
 
     first_dense = config["first_k_dense_replace"]
-    kda_moe = sum(t == _KDA for t in attention[first_dense:])
-    dsa_moe = sum(t == _DSA for t in attention)
+    # `_schedule` proved every dense layer is KDA and every DSA layer is MoE.
+    kda_dense = tuple(range(1, first_dense))
+    dsa_moe = tuple(layer for layer, kind in enumerate(attention) if kind == _DSA)
+    kda_moe = tuple(
+        layer for layer, kind in enumerate(attention) if kind == _KDA and layer >= first_dense
+    )
     mixer = ManifoldHyperConnections(hidden=hidden, streams=streams)
     layers = [
         LayerStack(
@@ -178,15 +182,31 @@ def build(raw_config: dict) -> Model:
             count=1,
             tag="first_kda_dense",
             mixer=replace(mixer, first_layer=True),
+            layers=(0,),
         ),
-        LayerStack(attn=kda, ffn=dense, count=first_dense - 1, tag="kda_dense", mixer=mixer),
-        LayerStack(attn=dsa, ffn=moe, count=dsa_moe, tag="dsa_moe", mixer=mixer),
-        LayerStack(attn=kda, ffn=moe, count=kda_moe, tag="kda_moe", mixer=mixer),
+        LayerStack(
+            attn=kda,
+            ffn=dense,
+            count=len(kda_dense),
+            tag="kda_dense",
+            mixer=mixer,
+            layers=kda_dense,
+        ),
+        LayerStack(
+            attn=dsa, ffn=moe, count=len(dsa_moe), tag="dsa_moe", mixer=mixer, layers=dsa_moe
+        ),
+        LayerStack(
+            attn=kda, ffn=moe, count=len(kda_moe), tag="kda_moe", mixer=mixer, layers=kda_moe
+        ),
     ]
     # noaux_tc routing adds a learned fp32 per-expert bias to the router scores.
     norm_weights = [
         NormWeightGroup(
-            f"{stack.tag}.router_bias", config["n_routed_experts"], stack.count, "router"
+            f"{stack.tag}.router_bias",
+            config["n_routed_experts"],
+            stack.count,
+            "router",
+            stack=stack.tag,
         )
         for stack in layers
         if stack.ffn is moe and config.get("topk_method") == "noaux_tc"

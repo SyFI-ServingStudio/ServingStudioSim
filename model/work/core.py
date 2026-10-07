@@ -382,6 +382,9 @@ _FLOPS_KEYS = ("attn_proj", "attn_internal", "ffn", "router", "lm_head")
 #: on first use so every other model's FLOP and parameter dicts stay unchanged.
 _OPTIONAL_KEYS = ("residual_mix",)
 _BYTES_KEYS = ("weights", "kv")
+#: The token-embedding gather row: the one once-per-forward row that runs before
+#: the first decoder layer rather than after the last.
+EMBEDDING_SEGMENT = "embedding"
 _PARAM_BREAKDOWN_KEYS = (
     "embedding",
     "norm",
@@ -411,6 +414,11 @@ class Segment:
     its router, norms, and (for GLM-5.2 DSA) its BF16 sparse-MLA kernel at the master
     dtype — so a single global dtype cannot describe it. ``None`` means the segment
     makes no claim and inherits whatever default the caller passes.
+
+    ``stack`` is the :attr:`LayerStack.tag` of the stack whose ``count`` layers this
+    row folds over, or ``None`` for a once-per-forward row (embedding, final norm,
+    epilogue, head). It is what places the row on a pipeline stage
+    (:meth:`Model.pipeline_stage_share`).
     """
 
     name: str
@@ -420,6 +428,7 @@ class Segment:
     bytes: float
     count: int
     compute_dtype: str | None = None
+    stack: str | None = None
 
     @property
     def flops_total(self) -> float:
@@ -603,6 +612,10 @@ class LayerStack:
     pass over weights an earlier stack already counted: the recurrent draft steps
     re-enter the one MTP layer, so they re-read it (they are serially dependent,
     so no implementation can fuse the reads) without adding parameters.
+
+    ``layers`` names the checkpoint decoder layers (0-based) the ``count`` instances
+    are. A model that declares it on every main-body stack can be split across
+    pipeline stages (:meth:`Model.pipeline_stage_share`); one that does not, cannot.
     """
 
     attn: AttentionSpec
@@ -613,6 +626,7 @@ class LayerStack:
     extra_matmuls: list[MatmulGroup] = field(default_factory=list)
     param_count: int | None = None
     mixer: object | None = None
+    layers: tuple[int, ...] = ()
 
     @property
     def distinct_instances(self) -> int:
@@ -655,6 +669,9 @@ class LearnedWeightGroup:
     dtype_bytes: float | None = None
     read_elements: Callable[[Workload], float] | None = None
     activated_elements: int | None = None
+    #: The :attr:`LayerStack.tag` whose layers hold one copy each of this group
+    #: (a per-layer norm), or ``None`` for a once-per-forward vector.
+    stack: str | None = None
 
     def read_bytes(self, workload: Workload, master_dtype_bytes: float) -> float:
         elements = self.elements if self.read_elements is None else self.read_elements(workload)
@@ -701,6 +718,49 @@ class Model:
         # Builders pass the config's own spelling ("bfloat16"); segments and the
         # analyzer wire compare dtypes as strings, so normalize once here.
         self.master_dtype = canonical_dtype(self.master_dtype)
+        body = [stack for stack in self.layers if stack.stage is None]
+        if any(stack.layers for stack in body):
+            declared = [layer for stack in body for layer in stack.layers]
+            if any(len(stack.layers) != stack.count for stack in body) or sorted(declared) != list(
+                range(self.num_layers)
+            ):
+                raise ValueError(
+                    f"{self.name}: main-body stack layers must partition "
+                    f"0..{self.num_layers}, one per instance"
+                )
+
+    def pipeline_stage_share(self, segment: Segment, layers: tuple[int, int]) -> float:
+        """The fraction of ``segment``'s work a pipeline stage running decoder
+        ``layers`` (``[start, end)``) performs.
+
+        A stack row splits by how many of its stack's layers fall in the range —
+        every instance of a stack is the same work. The token embedding runs on the
+        stage holding layer 0; every other once-per-forward row (final norm,
+        epilogue, output head) runs after the last layer. A row that repeats per
+        layer without naming its stack cannot be placed and is refused.
+        """
+        start, end = layers
+        if not 0 <= start < end <= self.num_layers:
+            raise ValueError(f"{self.name}: no pipeline stage runs layers {start}..{end}")
+        if segment.stack is None:
+            if segment.count != 1:
+                raise ValueError(
+                    f"{self.name}: row {segment.name!r} repeats {segment.count} times "
+                    "without naming its layer stack; it cannot be placed on a pipeline stage"
+                )
+            if segment.name == EMBEDDING_SEGMENT:
+                return 1.0 if start == 0 else 0.0
+            return 1.0 if end == self.num_layers else 0.0
+        stacks = [
+            stack for stack in self.layers if stack.tag == segment.stack and stack.stage is None
+        ]
+        if len(stacks) != 1 or not stacks[0].layers:
+            raise ValueError(
+                f"{self.name}: row {segment.name!r} names stack {segment.stack!r}, which is "
+                "not one main-body stack with declared layers"
+            )
+        stack_layers = stacks[0].layers
+        return sum(start <= layer < end for layer in stack_layers) / len(stack_layers)
 
     @property
     def num_layers(self) -> int:
@@ -788,6 +848,7 @@ class Model:
                 flops=semantic.flops,
                 bytes=semantic.bytes,
                 count=stack.count,
+                stack=stack.tag,
                 # A row that names no precision runs at the master
                 # dtype: quantizing the weights does not move the
                 # attention kernels onto the FP8 tensor cores.
@@ -880,6 +941,7 @@ class Model:
                         flops=2.0 * rows * group.activated_mult * group.n * group.k,
                         bytes=loaded * self.weight_bytes_per_instance(group),
                         count=stack.count,
+                        stack=stack.tag,
                         compute_dtype=self.matmul_compute_dtype(group),
                     )
                 )
@@ -902,6 +964,7 @@ class Model:
                                 flops=0.0,
                                 bytes=weight.read_bytes(stack_wl, self.weight_dtype_bytes),
                                 count=stack.count,
+                                stack=stack.tag,
                                 compute_dtype=self.master_dtype,
                             )
                         )
@@ -936,6 +999,7 @@ class Model:
                             flops=stack.attn.internal_flops(phase_workload),
                             bytes=stack.attn.kv_bytes(phase_workload),
                             count=stack.count,
+                            stack=stack.tag,
                             # A row that names no precision runs at the master dtype.
                             compute_dtype=mechanism_dtype or self.master_dtype,
                         )
@@ -950,6 +1014,7 @@ class Model:
                             flops=0.0,
                             bytes=cache_write_bytes,
                             count=stack.count,
+                            stack=stack.tag,
                             compute_dtype=self.master_dtype,
                         )
                     )
@@ -967,6 +1032,7 @@ class Model:
                             flops=semantic.flops,
                             bytes=semantic.bytes,
                             count=stack.count,
+                            stack=stack.tag,
                             compute_dtype=semantic.compute_dtype or self.master_dtype,
                         )
                     )
@@ -989,6 +1055,7 @@ class Model:
                     bytes=norm_weight.read_bytes(wl, self.weight_dtype_bytes),
                     count=norm_weight.count,
                     compute_dtype=self.master_dtype,
+                    stack=norm_weight.stack,
                 )
             )
             norm_params = norm_weight.elements * (
@@ -1028,7 +1095,7 @@ class Model:
         # `model.embed_tokens.weight_scale_inv`, so the list is not the authority here.
         segments.append(
             Segment(
-                name="embedding",
+                name=EMBEDDING_SEGMENT,
                 bucket="embedding",
                 byte_kind="weights",
                 flops=0.0,

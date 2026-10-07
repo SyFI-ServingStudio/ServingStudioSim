@@ -606,7 +606,7 @@ async fn collect_actual(ctx: &SessionContext, mode: WorkloadMode) -> Result<Actu
 /// labeler roofline needs (prefill KV read + request count). All fields are additive,
 /// so pool / cluster levels are plain rollups of this map. A rollup of every worker
 /// reproduces the run-wide conservation `actual`, which is the cross-check.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct WorkloadTotals {
     pub(crate) matmul_tokens: f64,             // Σ batch_tokens
     pub(crate) prefill_tokens: f64,            // Σ prefill_tokens
@@ -629,7 +629,7 @@ pub(crate) struct WorkloadTotals {
 /// The labeler evaluates each distinct shape once; callers multiply its roofline
 /// result by `occurrences`, preserving batch boundaries without one subprocess row
 /// per iteration.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct WeightedWorkload {
     pub(crate) totals: WorkloadTotals,
     pub(crate) occurrences: u64,

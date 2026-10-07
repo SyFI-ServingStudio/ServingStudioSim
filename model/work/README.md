@@ -150,6 +150,19 @@ and index-cache writes while retaining the MLA cache write. Its q_absorb and v_u
 single learned `kv_b_proj` matrix, so the accountant preserves both execution
 work and exact parameter totals.
 
+### Pipeline-parallel stages
+
+A PP stage runs the same microbatches as every other stage of its pipeline, through
+its own layers only. A stack that declares its checkpoint `layers` (GLM-5.2 and
+GLM-5.3-Flash do) lets `Model.pipeline_stage_share(segment, (start, end))` say how
+much of a row a stage owns: a stack row by the fraction of the stack's layers in the
+stage's range, the `embedding` row on the stage that holds layer 0, and every other
+once-per-forward row (final norm, `lm_head`, a final mHC collapse) on the last stage.
+A per-layer row that names no stack is refused rather than guessed. `floors.py`
+labels the stage's workload with the whole model and keeps that share of each row;
+the stage's scope-fused floor is its share of the iteration's binding resource, so
+both floors of the stages add up to the whole model's.
+
 The only currency between a spec and `core.py` is
 `MatmulGroup(name, n, k, activated_mult, total_count, bucket)`; `core.py` applies
 `flops = 2·(matmul_tokens·activated_mult)·n·k` and folds `× num_layers` uniformly.
