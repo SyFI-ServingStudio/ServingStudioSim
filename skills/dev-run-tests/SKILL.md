@@ -25,6 +25,7 @@ and crashes — see memory `vibesim_pyo3_build_python_pin`).
 | db | `needs_db` | warm `profile.db` rows | *(test asserts/skips itself)* |
 | agent | `agent` | Codex runner+judge | not `--run-agent` (opt-in) |
 | bench | `bench` | — (perf, non-deterministic) | not `-m bench` (opt-in) |
+| presets | `presets` | release binary + `profile.db` | excluded by `test-cpu`; run by `just test-presets` |
 
 cpu/binary/gpu auto-skip on *absence*; agent/bench are **opt-in** (expensive /
 flaky), never collected unless explicitly requested.
@@ -35,10 +36,11 @@ Install once: `cargo install just`. Then from the repo root:
 
 ```bash
 just              # = test-cpu (the fast default gate)
-just test-cpu     # Rust --lib tests + mocked pytest (no GPU/binary)
+just test-cpu     # Rust --lib tests beside mocked pytest, ~20 s (no GPU)
+just test-presets # every public predict/sim preset member built through the binary, ~45 s
 just test-gpu     # gpu tier (throughput regression, cupti, …) on a CUDA box
 just test-agent   # Codex skill-test harness (tests/skill_tests/*.md)
-just test-all     # cpu + gpu
+just test-all     # cpu + presets + gpu
 just test-bench   # separate perf step: sim-speed (warn-only) + Rust release microbenches (--ignored)
 just update-golden # (re)record per-GPU goldens on THIS device
 ```
@@ -51,7 +53,7 @@ just test-bench
 ```
 
 Raw pytest equivalents (when you need `-k` / `-x`): `uv run pytest -m gpu`,
-`uv run pytest -m "not gpu and not agent and not bench"`, etc. Rust tests need
+`uv run pytest -m "not gpu and not agent and not bench and not presets"`, `uv run pytest -m presets`, etc. Rust tests need
 the libpython dir on `LD_LIBRARY_PATH` (the recipes set it; do the same by hand:
 `` LD_LIBRARY_PATH="$(uv run python -c 'import sysconfig;print(sysconfig.get_config_var("LIBDIR"))'):$LD_LIBRARY_PATH" uv run cargo test -p simulator --lib ``).
 
@@ -132,6 +134,8 @@ the public profiling smoke workflow for per-kernel DB/GPU evidence. Put generic
 registry behavior in shared infra tests.
 
 - Pure logic → no marker (cpu). Keep it deterministic and mock the GPU.
+- Builds every public preset member (seconds per member through the binary) →
+  `@pytest.mark.presets`, so `test-cpu` stays near 20 s.
 - Needs the binary / a CUDA device / warm db → add `@pytest.mark.needs_binary` /
   `gpu` / `needs_db` (module-level `pytestmark` if the whole file is one tier).
 - A hardware-dependent number → compare to `golden("<metric>")[key]`, skip if

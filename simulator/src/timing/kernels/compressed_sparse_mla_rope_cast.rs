@@ -772,25 +772,30 @@ mod tests {
     #[test]
     fn canonical_batches_project_onto_their_grid_points() {
         let shapes = [("decode", 64), ("decode", 128), ("prefill", 64)];
-        for ((mode, heads), max_model_len) in shapes
+        let cases = shapes
             .into_iter()
             .flat_map(|shape| [(shape, 131072), (shape, 1_048_576)])
-        {
-            for ratio in 0..=2 {
-                let config = config_at(mode, ratio, heads, max_model_len);
-                let grid = CompressedSparseMlaRopeCastSpec::sweep_grid(&config);
-                let mask = CompressedSparseMlaRopeCastSpec::infeasible_mask(&config, &grid);
-                let feasible = mask.iter().filter(|&&drop| !drop).count();
-                assert!(
-                    feasible > 0 && feasible <= 500,
-                    "{mode} r{ratio} @{max_model_len}: {feasible}"
-                );
-                eprintln!(
-                    "{mode} r{ratio} @{max_model_len}: {} cells, {feasible} feasible",
-                    mask.len()
-                );
+            .flat_map(|case| (0..=2).map(move |ratio| (case, ratio)))
+            .collect::<Vec<_>>();
+        // Each grid's canonical batches are independent; search them in parallel.
+        std::thread::scope(|scope| {
+            for &(((mode, heads), max_model_len), ratio) in &cases {
+                scope.spawn(move || {
+                    let config = config_at(mode, ratio, heads, max_model_len);
+                    let grid = CompressedSparseMlaRopeCastSpec::sweep_grid(&config);
+                    let mask = CompressedSparseMlaRopeCastSpec::infeasible_mask(&config, &grid);
+                    let feasible = mask.iter().filter(|&&drop| !drop).count();
+                    assert!(
+                        feasible > 0 && feasible <= 500,
+                        "{mode} r{ratio} @{max_model_len}: {feasible}"
+                    );
+                    eprintln!(
+                        "{mode} h{heads} r{ratio} @{max_model_len}: {} cells, {feasible} feasible",
+                        mask.len()
+                    );
+                });
             }
-        }
+        });
     }
 
     /// The gather-area planes: the 131072 capture keeps its 4x ladder below
