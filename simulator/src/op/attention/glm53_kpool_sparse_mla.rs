@@ -70,7 +70,16 @@ pub struct Glm53KpoolSparseMlaConfig {
     pub cache_dtype: DType,
     pub output_dtype: DType,
     pub index_dtype: String,
+    /// Access pattern of the selected cache rows for the DECODE leaf and the
+    /// index-remap kernel. Decode fans a sparse top-k pool across the whole
+    /// context, so its selected positions are scattered (`unique_scattered_pages`).
     pub index_distribution: String,
+    /// Access pattern for the PREFILL (CausalTail) leaf. A causal prefill reads
+    /// a contiguous recent prefix rather than a random scatter, so on MI300X the
+    /// arch pins this to `recent_contiguous` while decode stays scattered; the
+    /// two leaves then price against different measured microbench rows. B200
+    /// keeps `unique_scattered_pages` here, so its prefill rows are unchanged.
+    pub prefill_index_distribution: String,
     pub cache_layout: String,
     pub mla_cache_block_size: u32,
     pub mla_cache_format: String,
@@ -129,7 +138,7 @@ impl Glm53KpoolSparseMlaOp {
                 "cache block size and max_model_len must be positive",
             ));
         }
-        let attention = |valid_counts_pattern| DsaSparseMlaAttentionKernelConfig {
+        let attention = |valid_counts_pattern, index_distribution: String| DsaSparseMlaAttentionKernelConfig {
             backends: cfg.sparse_attention_backends.clone(),
             gpu_name: cfg.gpu_name.clone(),
             num_heads: cfg.num_heads.clone(),
@@ -144,7 +153,7 @@ impl Glm53KpoolSparseMlaOp {
             index_dtype: cfg.index_dtype.clone(),
             output_dtype: cfg.output_dtype,
             valid_counts_pattern,
-            index_distribution: cfg.index_distribution.clone(),
+            index_distribution,
             cache_layout: cfg.cache_layout.clone(),
         };
         // The remap kernel names its locality by blocks rather than pages.
@@ -175,11 +184,17 @@ impl Glm53KpoolSparseMlaOp {
                 return_valid_counts: true,
                 index_dtype: cfg.index_dtype.clone(),
             },
-            prefill: attention(ValidCountsPattern::CausalTail),
-            decode: attention(ValidCountsPattern::PooledUniformFull {
-                index_topk: cfg.index_topk,
-                index_kpool: cfg.index_kpool,
-            }),
+            prefill: attention(
+                ValidCountsPattern::CausalTail,
+                cfg.prefill_index_distribution.clone(),
+            ),
+            decode: attention(
+                ValidCountsPattern::PooledUniformFull {
+                    index_topk: cfg.index_topk,
+                    index_kpool: cfg.index_kpool,
+                },
+                cfg.index_distribution.clone(),
+            ),
         })
     }
 
@@ -449,6 +464,7 @@ mod tests {
             output_dtype: DType::Bf16,
             index_dtype: "int32".to_string(),
             index_distribution: "unique_scattered_pages".to_string(),
+            prefill_index_distribution: "unique_scattered_pages".to_string(),
             cache_layout: "hnd_paged_mqa_fp8_latent".to_string(),
             mla_cache_block_size: 64,
             mla_cache_format: "plain".to_string(),

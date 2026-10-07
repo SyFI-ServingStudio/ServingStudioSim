@@ -109,6 +109,12 @@ pub struct Glm53DsaAttnLocalWorkletConfig {
     pub sparse_mla_q_dtype: DType,
     pub sparse_mla_cache_dtype: DType,
     pub sparse_mla_cache_layout: &'static str,
+    /// Access pattern the PREFILL (CausalTail) sparse-MLA leaf prices against.
+    /// A 2048-token causal prefill reads a contiguous recent prefix, so MI300X
+    /// pins this to `recent_contiguous`; B200 keeps `unique_scattered_pages` so
+    /// its prefill rows stay byte-identical. The decode leaf and index-remap
+    /// kernel always stay scattered (set directly in the op config below).
+    pub sparse_mla_prefill_index_distribution: &'static str,
     pub gpu_name: String,
     pub bf16_gemm_backends: Vec<&'static str>,
     pub fp32_gemm_backends: Vec<&'static str>,
@@ -358,6 +364,7 @@ impl Glm53DsaAttnLocalWorklet {
                 output_dtype: bf16,
                 index_dtype: "int32".into(),
                 index_distribution: "unique_scattered_pages".into(),
+                prefill_index_distribution: cfg.sparse_mla_prefill_index_distribution.into(),
                 cache_layout: cfg.sparse_mla_cache_layout.into(),
                 mla_cache_block_size: cfg.cache_block_size,
                 mla_cache_format: "plain".into(),
@@ -744,6 +751,7 @@ mod tests {
             sparse_mla_q_dtype: DType::Fp8E4m3,
             sparse_mla_cache_dtype: DType::Fp8E4m3,
             sparse_mla_cache_layout: "hnd_paged_mqa_fp8_latent",
+            sparse_mla_prefill_index_distribution: "unique_scattered_pages",
             gpu_name: "NVIDIA B200".into(),
             bf16_gemm_backends: vec!["torch_linear_vllm"],
             fp32_gemm_backends: vec!["torch_cublas"],
