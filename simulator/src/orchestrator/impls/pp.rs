@@ -11,7 +11,8 @@
 //!
 //! A stage hand-off costs no simulator tick: `tick` repeats the pool sweep at the
 //! same `now` until no worker emits an event, so a microbatch that finishes on
-//! one stage is already pulling on the next. Every routed message makes its
+//! one stage is already pulling on the next. Followers settle before heads tick,
+//! so a head forms only after every exit up to `now` has reached it. Every routed message makes its
 //! receiver due immediately, even one with a later compute wakeup: a head that
 //! is computing must still complete an exited microbatch now, so L7 sees the
 //! request finish at the right tick.
@@ -133,10 +134,15 @@ where
 
     /// Sweep due workers and route their hand-offs until none emits an event.
     /// Completed requests are appended to `completed`.
+    ///
+    /// Followers run to their own fixpoint before any head ticks, so every
+    /// microbatch that has left its last stage by `now` reaches its head before
+    /// the head forms the next one: a returning decode joins that formation,
+    /// and the exit's KV release is sampled before it.
     pub fn tick_collect(&mut self, now: Time, completed: &mut Vec<RequestId>) {
         loop {
+            self.settle_followers(now);
             let mut head_events = std::mem::take(&mut self.head_events);
-            let mut stage_events = std::mem::take(&mut self.stage_events);
             for pipeline in &mut self.replicas {
                 if pipeline.head_wakeup <= now {
                     pipeline.head_wakeup = pipeline
@@ -144,6 +150,23 @@ where
                         .tick(now, &mut head_events)
                         .unwrap_or(NO_WAKEUP_TIME);
                 }
+            }
+            let quiescent = head_events.is_empty();
+            for event in head_events.drain(..) {
+                self.on_head_event(event, completed);
+            }
+            self.head_events = head_events;
+            if quiescent {
+                break;
+            }
+        }
+    }
+
+    /// Tick due followers and route their hand-offs until none emits an event.
+    fn settle_followers(&mut self, now: Time) {
+        loop {
+            let mut stage_events = std::mem::take(&mut self.stage_events);
+            for pipeline in &mut self.replicas {
                 for (wakeup, follower) in pipeline
                     .follower_wakeups
                     .iter_mut()
@@ -156,14 +179,10 @@ where
                     }
                 }
             }
-            let quiescent = head_events.is_empty() && stage_events.is_empty();
-            for event in head_events.drain(..) {
-                self.on_head_event(event, completed);
-            }
+            let quiescent = stage_events.is_empty();
             for event in stage_events.drain(..) {
                 self.on_stage_event(event);
             }
-            self.head_events = head_events;
             self.stage_events = stage_events;
             if quiescent {
                 break;
@@ -394,6 +413,33 @@ mod tests {
         assert_eq!(completed, vec![(RequestId(0), Time::from_ms(4.0))]);
         let first_output = store.borrow()[RequestId(0)].telemetry.first_output_time;
         assert_eq!(first_output, Some(Time::from_ms(4.0 * STAGE_MS)));
+    }
+
+    #[test]
+    fn an_exit_on_the_formation_tick_joins_that_microbatch() {
+        // A's prefill leaves stage 1 at 2 ms, the tick B arrives on. The head
+        // must see that exit before it forms, so A's decode rides with B's
+        // prefill in the microbatch starting at 2 ms instead of waiting for
+        // stage 0 to finish it at 3 ms.
+        let (mut flow, _store) = build_flow(1, 2, 64);
+        flow.on_arrival(text_request(RequestId(0), 4, 2, Time::ZERO));
+        let mut completed = Vec::new();
+        for step in 0..10 {
+            let now = Time::from_ms(step as f64);
+            if step == 2 {
+                flow.on_arrival(text_request(RequestId(1), 4, 1, now));
+            }
+            for OrchAction::Complete { req } in flow.tick(now) {
+                completed.push((req, now));
+            }
+        }
+        assert_eq!(
+            completed,
+            vec![
+                (RequestId(0), Time::from_ms(4.0)),
+                (RequestId(1), Time::from_ms(4.0)),
+            ]
+        );
     }
 
     #[test]

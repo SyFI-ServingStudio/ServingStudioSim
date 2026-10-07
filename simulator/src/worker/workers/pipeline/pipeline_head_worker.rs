@@ -7,7 +7,10 @@
 //!
 //! Cadence. Stage 0 runs one microbatch at a time. It forms the next one when it
 //! is idle and fewer than `pipeline_depth` microbatches are in flight, so at most
-//! one microbatch per stage exists, as in vLLM's batch queue. A microbatch may mix
+//! one microbatch per stage exists, as in vLLM's batch queue. It starts that
+//! microbatch at the exact time the state allowing it arose (stage 0's finish,
+//! an exit, or a request's arrival tick), so stage 0, like the followers, is
+//! not rounded to the simulator tick. A microbatch may mix
 //! prefill chunks and decode steps; admission writes which resident decodes it
 //! carries into the batch plan. When stage 0 finishes, the shell emits
 //! `MicrobatchLaunched` and L6 hands the microbatch to stage 1. When the last
@@ -79,6 +82,13 @@ where
     in_flight: VecDeque<(u64, A::Ticket)>,
     /// Exits received since the last tick.
     exits: Vec<(u64, Time)>,
+    /// Whether a request arrived since the last tick.
+    request_arrived: bool,
+    /// Latest time anything the next formation depends on changed: stage 0
+    /// finishing, a microbatch exiting, or a request arriving (at the tick that
+    /// delivered it). Nothing changes between this and `now`, so the next
+    /// microbatch forms and starts here, not on the tick grid.
+    state_changed_at: Time,
     completed: Vec<RequestId>,
 }
 
@@ -116,6 +126,8 @@ where
             computing: None,
             in_flight: VecDeque::new(),
             exits: Vec::new(),
+            request_arrived: false,
+            state_changed_at: Time::ZERO,
             completed: Vec::new(),
         }
     }
@@ -168,6 +180,7 @@ where
     fn on_msg_request(&mut self, request: RequestId) {
         self.admission
             .accept_request(&mut self.kv_store, request, &self.context);
+        self.request_arrived = true;
     }
 
     fn on_msg_microbatch_exit(&mut self, microbatch: u64, at: Time) {
@@ -175,8 +188,11 @@ where
     }
 
     fn tick_inner(&mut self, now: Time, events: &mut Vec<PipelineHeadEvent>) -> Option<Time> {
+        if std::mem::take(&mut self.request_arrived) {
+            self.state_changed_at = self.state_changed_at.max(now);
+        }
         // Exits first: they release KV the next formation may need, and their
-        // times precede `now`, so KV samples stay in time order.
+        // times precede the formation's, so KV samples stay in time order.
         self.complete_exited_microbatches(events);
         loop {
             let mut progressed = false;
@@ -190,22 +206,25 @@ where
                     compute_end,
                 } = self.computing.take().unwrap();
                 microbatch.ready_at = compute_end;
+                self.state_changed_at = self.state_changed_at.max(compute_end);
                 events.push(PipelineHeadEvent::MicrobatchLaunched {
                     worker: self.context.id,
                     microbatch,
                 });
                 progressed = true;
             }
+            let start = self.state_changed_at;
+            debug_assert!(start <= now, "formation state changed after now");
             if self.computing.is_none()
                 && self.in_flight.len() < usize::from(self.layout.depth)
                 && self.admission.form_microbatch(
                     &mut self.kv_store,
                     &self.context,
                     &mut self.batch_plan,
-                    now,
+                    start,
                 )
             {
-                self.computing = Some(self.launch_microbatch(now));
+                self.computing = Some(self.launch_microbatch(start));
                 progressed = true;
             }
             if !progressed {
@@ -232,6 +251,7 @@ where
                 &mut self.completed,
                 at,
             );
+            self.state_changed_at = self.state_changed_at.max(at);
             events.extend(
                 self.completed
                     .drain(..)
@@ -243,8 +263,9 @@ where
         }
     }
 
-    /// Lower the scheduled chunks and decodes, commit them, and start stage 0.
-    fn launch_microbatch(&mut self, now: Time) -> ComputingMicrobatch {
+    /// Lower the scheduled chunks and decodes, commit them, and start stage 0
+    /// at `start`.
+    fn launch_microbatch(&mut self, start: Time) -> ComputingMicrobatch {
         let mut input = UnifiedArchInput::default();
         self.execution.build_iteration_input(
             &self.kv_store,
@@ -254,23 +275,23 @@ where
         );
         let id = self.next_microbatch;
         self.next_microbatch += 1;
-        let ticket = self.admission.commit_microbatch(&mut self.kv_store, now);
+        let ticket = self.admission.commit_microbatch(&mut self.kv_store, start);
         self.in_flight.push_back((id, ticket));
         let tokens: u64 = input
             .groups
             .iter()
             .map(|group| u64::from(group.batch_tokens))
             .sum();
-        let cost = self.execution.evaluate_iteration(&input, id, now);
+        let cost = self.execution.evaluate_iteration(&input, id, start);
         ComputingMicrobatch {
             microbatch: PipelineMicrobatch {
                 id,
                 input: Rc::new(input),
                 activation_bytes: tokens * self.layout.activation_bytes_per_token,
                 send_gid: self.send_gid,
-                ready_at: now + cost,
+                ready_at: start + cost,
             },
-            compute_end: now + cost,
+            compute_end: start + cost,
         }
     }
 
@@ -400,7 +421,9 @@ mod tests {
         for step in 10..20 {
             worker.tick(Time::from_ms(step as f64), &mut events);
         }
-        assert_eq!(launched(&events), vec![(3, 2, Time::from_ms(11.0))]);
+        // The exit at 9.5 frees the window; stage 0 starts then, off the tick
+        // grid, and finishes at 10.5.
+        assert_eq!(launched(&events), vec![(3, 2, Time::from_ms(10.5))]);
         assert_eq!(
             store.borrow()[RequestId(0)]
                 .progress
@@ -408,6 +431,25 @@ mod tests {
             4
         );
         assert!(completed(&events).is_empty());
+    }
+
+    #[test]
+    fn stage0_starts_the_next_microbatch_when_it_finishes_not_on_the_tick() {
+        let store = shared_with(&[(0, 8, 1)]);
+        let mut worker = head(Rc::clone(&store), 4, 1_000);
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
+        let mut events = Vec::new();
+        worker.tick(Time::ZERO, &mut events);
+        // Stage 0 finishes the first chunk at 1.0 ms; the head sees it at 1.3.
+        assert_eq!(
+            worker.tick(Time::from_ms(1.3), &mut events),
+            Some(Time::from_ms(2.0))
+        );
+        assert_eq!(
+            launched(&events),
+            vec![(1, 4, Time::from_ms(1.0))],
+            "the second chunk started at 1.0 and finishes at 2.0"
+        );
     }
 
     #[test]
@@ -467,7 +509,8 @@ mod tests {
             worker.tick(Time::from_ms(step as f64), &mut events);
         }
         assert_eq!(completed(&events), vec![RequestId(0)]);
-        assert_eq!(launched(&events), vec![(2, 12, Time::from_ms(6.0))]);
+        // The freed KV admits the second prompt at the exit, not at the tick.
+        assert_eq!(launched(&events), vec![(2, 12, Time::from_ms(5.5))]);
     }
 
     #[test]

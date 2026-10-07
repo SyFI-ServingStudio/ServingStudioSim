@@ -285,7 +285,9 @@ worker as the request's recorded location.
 A pipeline-parallel replica is one head and `depth - 1` followers, one GPU each.
 `PipelineHeadWorker` owns admission and KV for the whole pipeline and stage 0's
 compute. It forms a microbatch whenever stage 0 is idle and fewer than `depth`
-microbatches are in flight:
+microbatches are in flight, and starts it at the exact time that became true
+(stage 0's finish, an exit, or the tick a request arrived on), not on the tick
+grid:
 
 ```text
 form_microbatch → build input → commit_microbatch → stage-0 compute
