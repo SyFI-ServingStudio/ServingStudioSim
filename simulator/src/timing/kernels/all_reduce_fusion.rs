@@ -13,13 +13,41 @@
 //! stops at the cap. No mask or clamp is applied: a query above the cap
 //! extrapolates linearly from the last two-shot segment and is flagged
 //! `EXTRAPOLATED` rather than silently pinned to the cap time.
+//!
+//! BARRIER (Infinity Fabric / MI300X only). The `rocm_fabric_roofline` row
+//! (`profiling/runners/comm/fabric_roofline.py`) is a pure bandwidth roofline:
+//! `2(N-1)/N · bytes / 896 GB/s`, the data-movement floor. A bandwidth roofline
+//! cannot represent the RCCL/PYNCCL cross-rank sync barrier — the real
+//! `disable_custom_all_reduce` path's per-collective launch + link + sync
+//! latency, which is independent of message size. `adjust_metrics` adds that
+//! barrier on top of the cached roofline for `Fabric::InfinityFabric`
+//! (see `INFINITY_FABRIC_BARRIER_US_PER_RING_STEP`). Keeping the barrier in the
+//! cost model, not in the profiled row, keeps the row a clean roofline and
+//! avoids double-counting if it is regenerated. NVLink/B200 is untouched: its
+//! `flashinfer_mnnvl` row is a real measurement that already includes sync.
 
 use crate::common::Fabric;
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::CacheKind;
+use crate::timing::cache::interp::LeafMetrics;
 use crate::timing::kernels::engine::{register_kernel, KernelSpec};
 use crate::timing::sweep::{Axis, SweepGrid};
 use crate::timing::{KernelConfig, SweepCoords};
+
+/// Infinity-Fabric all-reduce cross-rank sync-barrier latency, in microseconds
+/// per ring step, added on top of the bandwidth roofline (see the module doc's
+/// BARRIER note). A ring all-reduce runs `2(num_gpus - 1)` sequential
+/// send/recv steps; under vLLM-ROCm's `disable_custom_all_reduce` the collective
+/// runs on PYNCCL/RCCL, whose per-step kernel-launch + link + sync latency does
+/// not scale with message size. Calibrated to the first real measured MI300X
+/// TP4/EP4 Check-1 (`servingstudio-mi300x-decisions.md` decision #103): the
+/// measured prefill all-reduce (2048 tokens) and decode all-reduce (32 tokens)
+/// are within ~20% of each other despite a 64x byte difference, i.e. the cost is
+/// barrier- not bandwidth-bound, which a bandwidth roofline alone cannot show.
+/// At TP4 the 6 ring steps sum to ~94.2 us/collective, reproducing the measured
+/// 11,126 us prefill all-reduce (91 collectives) to within 0.02%; the same
+/// constant predicts the measured 9,135 us decode all-reduce to within ~6%.
+const INFINITY_FABRIC_BARRIER_US_PER_RING_STEP: f32 = 15.70;
 
 #[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct AllReduceFusionKernelConfig {
@@ -116,6 +144,25 @@ impl KernelSpec for AllReduceFusionSpec {
 
     fn cache_kind(_backend: &'static str) -> CacheKind {
         CacheKind::Cache1DLinear
+    }
+
+    /// Add the Infinity-Fabric cross-rank sync-barrier latency on top of the
+    /// cached bandwidth roofline. Gated to `Fabric::InfinityFabric` with more
+    /// than one rank, so every NVLink/B200 all-reduce is bit-identical (its row
+    /// is a real FlashInfer MNNVL measurement that already includes launch/sync,
+    /// so no correction applies). A single rank is a no-op collective (0 steps).
+    fn adjust_metrics(
+        config: &Self::Config,
+        _input: &Self::Input,
+        mut metrics: LeafMetrics,
+    ) -> LeafMetrics {
+        if config.fabric == Fabric::InfinityFabric && config.num_gpus > 1 {
+            let ring_steps = 2 * (config.num_gpus - 1);
+            let barrier_ms =
+                INFINITY_FABRIC_BARRIER_US_PER_RING_STEP * ring_steps as f32 / 1000.0;
+            metrics.m.time_ms += barrier_ms;
+        }
+        metrics
     }
 
     fn enumerate(
@@ -229,6 +276,55 @@ mod tests {
         );
         assert_eq!(fields.get("hidden_dim"), Some(&Value::from(4096_u32)));
         assert_eq!(fields.get("fabric"), Some(&Value::from("nvlink")));
+    }
+
+    fn roofline_config(num_gpus: u32, fabric: Fabric) -> AllReduceFusionKernelConfig {
+        AllReduceFusionKernelConfig {
+            backends: vec!["rocm_fabric_roofline"],
+            gpu_name: "MI300X".to_string(),
+            num_gpus,
+            hidden_dim: 4096,
+            dtype: DType::Bf16,
+            fabric,
+        }
+    }
+
+    #[test]
+    fn infinity_fabric_adds_sync_barrier_on_top_of_roofline() {
+        use crate::timing::cache::interp::LeafMetrics;
+        // Bandwidth roofline at 2048 tokens, TP4 (matches the profiled row).
+        let roofline_ms = 0.028_086_857_f32;
+        let mut m = LeafMetrics::ZERO;
+        m.m.time_ms = roofline_ms;
+        let input = AllReduceFusionKernelInput { num_tokens: 2048 };
+
+        // TP4 Infinity Fabric: 6 ring steps add ~94.2 us → ~122.3 us/collective.
+        let adjusted =
+            AllReduceFusionSpec::adjust_metrics(&roofline_config(4, Fabric::InfinityFabric), &input, m);
+        let expected =
+            roofline_ms + INFINITY_FABRIC_BARRIER_US_PER_RING_STEP * 6.0 / 1000.0;
+        assert!((adjusted.m.time_ms - expected).abs() < 1e-6);
+        // 91 collectives reproduce the measured 11,126 us prefill all-reduce.
+        let total_us = f64::from(adjusted.m.time_ms) * 1000.0 * 91.0;
+        assert!((total_us - 11_125.9).abs() < 50.0, "got {total_us} us");
+    }
+
+    #[test]
+    fn nvlink_and_single_rank_are_untouched() {
+        use crate::timing::cache::interp::LeafMetrics;
+        let mut m = LeafMetrics::ZERO;
+        m.m.time_ms = 0.05;
+        let input = AllReduceFusionKernelInput { num_tokens: 2048 };
+
+        // NVLink (B200 path) gets no barrier — bit-identical.
+        let nvlink =
+            AllReduceFusionSpec::adjust_metrics(&roofline_config(4, Fabric::Nvlink), &input, m);
+        assert_eq!(nvlink.m.time_ms, 0.05);
+
+        // A single rank is a no-op collective: no barrier even on Infinity Fabric.
+        let one_rank =
+            AllReduceFusionSpec::adjust_metrics(&roofline_config(1, Fabric::InfinityFabric), &input, m);
+        assert_eq!(one_rank.m.time_ms, 0.05);
     }
 
     #[test]

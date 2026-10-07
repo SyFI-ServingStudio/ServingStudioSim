@@ -139,6 +139,25 @@ pub trait KernelSpec: 'static {
         input.coords()
     }
 
+    /// Config-aware correction applied to the interpolated cache result in
+    /// [`Kernel::eval`], before the metrics reach the CostTree. Default:
+    /// identity (the cache row is the whole cost). Override ONLY where a
+    /// measured/analytic cache row cannot by itself represent a cost component
+    /// that the row's axes do not carry. The one current user is the
+    /// Infinity-Fabric all-reduce, whose profiled row is a pure bandwidth
+    /// roofline (data-movement time) and cannot encode the RCCL/PYNCCL
+    /// cross-rank sync-barrier latency — a per-collective, message-size-
+    /// independent cost added here (`all_reduce_fusion.rs`). Keeping it in the
+    /// cost model rather than in the row avoids double-counting if the analytic
+    /// bandwidth row is ever regenerated.
+    fn adjust_metrics(
+        _config: &Self::Config,
+        _input: &Self::Input,
+        metrics: LeafMetrics,
+    ) -> LeafMetrics {
+        metrics
+    }
+
     /// Grid cells (row-major, aligned with `enumerate`) that are physically
     /// infeasible. Their profiled sample is forced non-finite at build so a
     /// multilinear cache drops them and renormalizes over feasible corners,
@@ -353,7 +372,8 @@ impl<S: KernelSpec> Kernel<S> {
     /// preserving that backend's coverage bits.
     pub fn eval(&self, input: &S::Input) -> LeafMetrics {
         let coords = S::cache_coords(&self.config, input);
-        self.eval_cache_coords(&coords)
+        let metrics = self.eval_cache_coords(&coords);
+        S::adjust_metrics(&self.config, input, metrics)
     }
 
     fn eval_cache_coords(&self, coords: &Coords) -> LeafMetrics {
