@@ -82,8 +82,12 @@ pub(crate) fn build_pipeline_head_worker<M: IterwiseUnifiedModel>(
     if config.balance_decode_microbatches {
         admission = admission.with_balanced_decodes(layout.depth);
     }
-    if let MicrobatchSizing::Even { min_tokens } = config.microbatch_sizing {
-        admission = admission.with_even_split(layout.depth, min_tokens);
+    match config.microbatch_sizing {
+        MicrobatchSizing::Greedy => {}
+        MicrobatchSizing::Even { min_tokens } => {
+            admission = admission.with_even_split(layout.depth, min_tokens);
+        }
+        MicrobatchSizing::Plan => admission = admission.with_slot_plan(layout.depth),
     }
 
     PipelineHeadWorker::from_components(
@@ -220,8 +224,12 @@ pub(crate) fn build_hybrid_pipeline_head_worker<M: IterwiseUnifiedModel>(
     if config.balance_decode_microbatches {
         admission = admission.with_balanced_decodes(layout.depth);
     }
-    if let MicrobatchSizing::Even { min_tokens } = config.microbatch_sizing {
-        admission = admission.with_even_split(layout.depth, min_tokens);
+    match config.microbatch_sizing {
+        MicrobatchSizing::Greedy => {}
+        MicrobatchSizing::Even { min_tokens } => {
+            admission = admission.with_even_split(layout.depth, min_tokens);
+        }
+        MicrobatchSizing::Plan => admission = admission.with_slot_plan(layout.depth),
     }
 
     PipelineHeadWorker::from_components(

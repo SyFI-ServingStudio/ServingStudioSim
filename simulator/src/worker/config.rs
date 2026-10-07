@@ -69,9 +69,13 @@ pub enum MicrobatchSplit {
     /// Take one `pp_size`-th of the round: `clamp(ceil((pending + in-flight
     /// prefill tokens) / pp_size), min_microbatch_tokens, max_batch_tokens)`.
     Even,
+    /// Keep a plan of the next `pp_size` microbatches and bin-pack whole
+    /// requests into the least-loaded one; a request splits only at
+    /// `max_batch_tokens`.
+    Plan,
 }
 
-const MICROBATCH_SPLIT_CHOICES: [&str; 2] = ["greedy", "even"];
+const MICROBATCH_SPLIT_CHOICES: [&str; 3] = ["greedy", "even", "plan"];
 
 /// Validated microbatch prefill sizing the pipeline-head recipe applies.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -81,6 +85,7 @@ pub enum MicrobatchSizing {
     Even {
         min_tokens: u32,
     },
+    Plan,
 }
 
 /// Lower the `microbatch_split` / `min_microbatch_tokens` selector pair. The
@@ -92,13 +97,17 @@ pub(crate) fn resolve_microbatch_sizing(
     max_batch_tokens: u32,
 ) -> Result<MicrobatchSizing> {
     match split {
-        MicrobatchSplit::Greedy => {
+        MicrobatchSplit::Greedy | MicrobatchSplit::Plan => {
             ensure!(
                 min_microbatch_tokens == 0,
                 "min_microbatch_tokens ({min_microbatch_tokens}) only applies with \
-                 microbatch_split: even; greedy takes every pending token it can"
+                 microbatch_split: even; greedy and plan never split a request below \
+                 max_batch_tokens"
             );
-            Ok(MicrobatchSizing::Greedy)
+            Ok(match split {
+                MicrobatchSplit::Plan => MicrobatchSizing::Plan,
+                _ => MicrobatchSizing::Greedy,
+            })
         }
         MicrobatchSplit::Even => {
             ensure!(
@@ -514,7 +523,9 @@ pub enum IterWorkerSel {
         /// `greedy` (vLLM) fills each microbatch's prefill up to
         /// `max_batch_tokens`; `even` sizes it to one `pp_size`-th of the
         /// pending plus in-flight prefill, so a backlog spreads over the
-        /// pipeline instead of one full microbatch followed by small ones.
+        /// pipeline instead of one full microbatch followed by small ones;
+        /// `plan` bin-packs whole requests into the next `pp_size`
+        /// microbatches, least-loaded first.
         #[serde(default)]
         #[param(string, default = "greedy", choices = MICROBATCH_SPLIT_CHOICES)]
         microbatch_split: MicrobatchSplit,
@@ -677,6 +688,11 @@ mod tests {
             "{error}"
         );
         assert!(resolve_microbatch_sizing(MicrobatchSplit::Even, 8193, 8192).is_err());
+        assert!(resolve_microbatch_sizing(MicrobatchSplit::Plan, 1024, 8192).is_err());
+        assert_eq!(
+            resolve_microbatch_sizing(MicrobatchSplit::Plan, 0, 8192).unwrap(),
+            MicrobatchSizing::Plan
+        );
         assert_eq!(
             resolve_microbatch_sizing(MicrobatchSplit::Even, 1024, 8192).unwrap(),
             MicrobatchSizing::Even { min_tokens: 1024 }

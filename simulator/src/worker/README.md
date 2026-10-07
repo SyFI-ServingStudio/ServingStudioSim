@@ -312,8 +312,13 @@ Prefill fills each microbatch greedily up to `max_batch_tokens` by default
 max_batch_tokens)`: pending is started prompts' unscheduled tokens plus the
 policy's `queued_prompt_tokens()`, in-flight is the prefill of formed microbatches
 that have not exited. One prompt into an empty pipeline therefore runs as `depth`
-equal slices. The split never holds a microbatch back, and
-`min_microbatch_tokens` is rejected unless the split is `even`.
+equal slices. `microbatch_split: plan` keeps a `MicrobatchSlotPlan` of the next
+`depth` microbatches and bin-packs whole requests into the least-loaded one that
+leaves room for all of it, splitting a request only at `max_batch_tokens`; under a
+backlog it fills from the earliest room, so every slot runs full as with greedy.
+A planned request is admitted (KV reserved) when first placed. Neither split
+holds a microbatch back, and `min_microbatch_tokens` is rejected unless the split
+is `even`.
 
 `PipelineStageWorker` has no KV/admission axes. It runs microbatches FIFO,
 double-buffering one activation pull against one compute, at exact times derived
