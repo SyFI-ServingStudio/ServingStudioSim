@@ -254,6 +254,14 @@ const SPARSE_MLA_CACHE_DTYPE: DType = DType::Fp8E4m3;
 const SPARSE_MLA_CACHE_DTYPE_MI300X: DType = DType::Bf16;
 const SPARSE_MLA_CACHE_LAYOUT: &str = "hnd_paged_mqa_fp8_latent";
 const SPARSE_MLA_CACHE_LAYOUT_MI300X: &str = "token_major_mqa_bf16_latent";
+// Access pattern the sparse-MLA PREFILL (CausalTail) leaf prices against. A
+// causal prefill reads a contiguous recent prefix, not a random page scatter,
+// so MI300X pins `recent_contiguous`; the decode leaf stays scattered. B200
+// keeps `unique_scattered_pages` for prefill, so its rows stay byte-identical.
+// (Decision #106: closes the MI300X DSA sparse-MLA prefill 3.78x over-prediction
+// caused by the prefill leaf inheriting the scattered microbench row.)
+const SPARSE_MLA_PREFILL_INDEX_DIST: &str = "unique_scattered_pages";
+const SPARSE_MLA_PREFILL_INDEX_DIST_MI300X: &str = "recent_contiguous";
 
 /// Pick the MI300X backend list for an MI300X target, else the default
 /// (NVIDIA) list. Additive and gpu-gated — the same shape as
@@ -644,6 +652,11 @@ pub fn build_configs(
                 &gpu,
                 SPARSE_MLA_CACHE_LAYOUT_MI300X,
                 SPARSE_MLA_CACHE_LAYOUT,
+            ),
+            sparse_mla_prefill_index_distribution: pin_mi300x_str(
+                &gpu,
+                SPARSE_MLA_PREFILL_INDEX_DIST_MI300X,
+                SPARSE_MLA_PREFILL_INDEX_DIST,
             ),
             gpu_name: gpu.clone(),
             bf16_gemm_backends: pin_mi300x(&gpu, BF16_GEMM_BACKENDS_MI300X, BF16_GEMM_BACKENDS),
