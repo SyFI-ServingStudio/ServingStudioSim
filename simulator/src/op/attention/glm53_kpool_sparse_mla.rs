@@ -138,24 +138,25 @@ impl Glm53KpoolSparseMlaOp {
                 "cache block size and max_model_len must be positive",
             ));
         }
-        let attention = |valid_counts_pattern, index_distribution: String| DsaSparseMlaAttentionKernelConfig {
-            backends: cfg.sparse_attention_backends.clone(),
-            gpu_name: cfg.gpu_name.clone(),
-            num_heads: cfg.num_heads.clone(),
-            num_kv_heads: Dim::param("num_kv_heads", 1),
-            selected_k: cfg.selected_k,
-            latent_dim: cfg.latent_dim.clone(),
-            rope_dim: cfg.rope_dim.clone(),
-            value_dim: cfg.latent_dim.clone(),
-            softmax_scale_denominator: cfg.softmax_scale_denominator,
-            q_dtype: cfg.q_dtype,
-            cache_dtype: cfg.cache_dtype,
-            index_dtype: cfg.index_dtype.clone(),
-            output_dtype: cfg.output_dtype,
-            valid_counts_pattern,
-            index_distribution,
-            cache_layout: cfg.cache_layout.clone(),
-        };
+        let attention =
+            |valid_counts_pattern, index_distribution: String| DsaSparseMlaAttentionKernelConfig {
+                backends: cfg.sparse_attention_backends.clone(),
+                gpu_name: cfg.gpu_name.clone(),
+                num_heads: cfg.num_heads.clone(),
+                num_kv_heads: Dim::param("num_kv_heads", 1),
+                selected_k: cfg.selected_k,
+                latent_dim: cfg.latent_dim.clone(),
+                rope_dim: cfg.rope_dim.clone(),
+                value_dim: cfg.latent_dim.clone(),
+                softmax_scale_denominator: cfg.softmax_scale_denominator,
+                q_dtype: cfg.q_dtype,
+                cache_dtype: cfg.cache_dtype,
+                index_dtype: cfg.index_dtype.clone(),
+                output_dtype: cfg.output_dtype,
+                valid_counts_pattern,
+                index_distribution,
+                cache_layout: cfg.cache_layout.clone(),
+            };
         // The remap kernel names its locality by blocks rather than pages.
         let remap_distribution = match cfg.index_distribution.as_str() {
             "unique_scattered_pages" => "unique_scattered_blocks",
