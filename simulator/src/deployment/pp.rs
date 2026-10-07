@@ -26,9 +26,9 @@ use crate::timing::kernels::{P2pIntraKernel, P2pIntraKernelConfig};
 use crate::timing::PerfApiBridge;
 use crate::worker::{
     build_hybrid_pipeline_head_worker, build_pipeline_head_worker, build_pipeline_stage_worker,
-    resolve_prefix_cache_config, CostSource, IterWorker, IterWorkerSel, PendingOrderKind,
-    PipelineHeadEvent, PipelineHeadMsg, PipelineHybridState, PipelineLayout, PrefillChunkAlignment,
-    PrefixCacheMode, PrefixCachePolicy, WorkerConfig,
+    resolve_microbatch_sizing, resolve_prefix_cache_config, CostSource, IterWorker, IterWorkerSel,
+    PendingOrderKind, PipelineHeadEvent, PipelineHeadMsg, PipelineHybridState, PipelineLayout,
+    PrefillChunkAlignment, PrefixCacheMode, PrefixCachePolicy, WorkerConfig,
 };
 
 use super::Deployment;
@@ -224,6 +224,8 @@ fn worker_config(cfg: &PpConfig, worker: &IterWorkerSel) -> anyhow::Result<Worke
         max_batch_tokens,
         gpu_time_multiplier,
         balance_decode_microbatches,
+        microbatch_split,
+        min_microbatch_tokens,
         ..
     } = worker
     else {
@@ -237,6 +239,9 @@ fn worker_config(cfg: &PpConfig, worker: &IterWorkerSel) -> anyhow::Result<Worke
         None,
         *attn_gpu_memory_gb,
     )?;
+    let microbatch_sizing =
+        resolve_microbatch_sizing(*microbatch_split, *min_microbatch_tokens, *max_batch_tokens)
+            .context("pp: pipeline_chunked_prefill")?;
     Ok(WorkerConfig {
         attn_kv_bytes: (*attn_gpu_memory_gb * 1e9) as u64,
         log_output_token_times: cfg.io.log_output_token_times,
@@ -247,6 +252,7 @@ fn worker_config(cfg: &PpConfig, worker: &IterWorkerSel) -> anyhow::Result<Worke
         pending_order: PendingOrderKind::Fifo,
         prefix_cache,
         balance_decode_microbatches: *balance_decode_microbatches,
+        microbatch_sizing,
         ..WorkerConfig::default()
     })
 }

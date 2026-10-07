@@ -859,4 +859,105 @@ mod tests {
         assert_eq!(greedy_done.len(), 4);
         assert_eq!(balanced_done.len(), 4);
     }
+
+    /// A four-stage head with `max_batch_tokens` 2048 and the given sizing.
+    fn depth4_head(
+        store: SharedRequests,
+        microbatch_sizing: crate::worker::config::MicrobatchSizing,
+    ) -> PipelineHead<FakeModel> {
+        build_pipeline_head_worker(
+            WorkerId(0),
+            "stage",
+            Arc::new(FakeModel::for_ms(1.0)),
+            PipelineLayout { depth: 4, ..LAYOUT },
+            store,
+            WorkerConfig {
+                max_batch_tokens: Some(2048),
+                attn_kv_bytes: 100_000,
+                microbatch_sizing,
+                ..WorkerConfig::default()
+            },
+            None,
+            PoolId(0),
+            "test-gpu",
+            test_cluster(),
+        )
+    }
+
+    /// Prefill tokens of each launched microbatch, in order.
+    fn launched_tokens(events: &[PipelineHeadEvent]) -> Vec<u64> {
+        launched(events)
+            .into_iter()
+            .map(|(_, tokens, _)| tokens)
+            .collect()
+    }
+
+    #[test]
+    fn greedy_sizing_fills_each_microbatch_to_the_cap() {
+        use crate::worker::config::MicrobatchSizing;
+        let store = shared_with(&[(0, 3000, 1)]);
+        let mut worker = depth4_head(Rc::clone(&store), MicrobatchSizing::Greedy);
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
+        let mut events = Vec::new();
+        for step in 0..6 {
+            worker.tick(Time::from_ms(step as f64), &mut events);
+        }
+        assert_eq!(launched_tokens(&events), vec![2048, 952]);
+    }
+
+    #[test]
+    fn even_sizing_slices_one_prompt_into_depth_equal_pieces() {
+        use crate::worker::config::MicrobatchSizing;
+        let store = shared_with(&[(0, 3000, 1)]);
+        let mut worker = depth4_head(Rc::clone(&store), MicrobatchSizing::Even { min_tokens: 0 });
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
+        let mut events = Vec::new();
+        for step in 0..6 {
+            worker.tick(Time::from_ms(step as f64), &mut events);
+        }
+        // In-flight tokens count toward the round, so each slice stays P / 4
+        // instead of shrinking as P/4, 3P/16, ...
+        assert_eq!(launched_tokens(&events), vec![750, 750, 750, 750]);
+    }
+
+    #[test]
+    fn even_sizing_counts_in_flight_tokens_when_new_work_arrives() {
+        use crate::worker::config::MicrobatchSizing;
+        let store = shared_with(&[(0, 400, 1), (1, 1200, 1)]);
+        let mut worker = depth4_head(Rc::clone(&store), MicrobatchSizing::Even { min_tokens: 0 });
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
+        let mut events = Vec::new();
+        worker.tick(Time::ZERO, &mut events);
+        worker.tick(Time::from_ms(1.0), &mut events);
+        // Two slices of 100 are in flight and 200 tokens pending when 1200 more
+        // arrive: the round is 1600, so every later slice is 400.
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(1)));
+        for step in 2..8 {
+            worker.tick(Time::from_ms(step as f64), &mut events);
+        }
+        assert_eq!(launched_tokens(&events), vec![100, 100, 400, 400]);
+        assert_eq!(worker.in_flight.len(), 4);
+    }
+
+    #[test]
+    fn even_sizing_floor_takes_a_short_prompt_whole_and_never_waits() {
+        use crate::worker::config::MicrobatchSizing;
+        let store = shared_with(&[(0, 100, 1), (1, 10, 1)]);
+        let mut worker = depth4_head(
+            Rc::clone(&store),
+            MicrobatchSizing::Even { min_tokens: 1024 },
+        );
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
+        let mut events = Vec::new();
+        worker.tick(Time::ZERO, &mut events);
+        // A later 10-token prompt starts as soon as stage 0 is free, below the
+        // floor and with work in flight: the floor sizes, it never holds.
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(1)));
+        worker.tick(Time::from_ms(0.5), &mut events);
+        worker.tick(Time::from_ms(2.0), &mut events);
+        assert_eq!(
+            launched(&events),
+            vec![(1, 100, Time::from_ms(1.0)), (2, 10, Time::from_ms(2.0))]
+        );
+    }
 }

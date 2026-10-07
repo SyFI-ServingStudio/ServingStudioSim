@@ -306,6 +306,15 @@ default (vLLM); `balance_decode_microbatches` caps them at
 decode subset into `IterBatchPlan`, and input lowering skips the resident decodes
 outside it.
 
+Prefill fills each microbatch greedily up to `max_batch_tokens` by default
+(`microbatch_split: greedy`, vLLM). `microbatch_split: even` sizes it to
+`clamp(ceil((pending + in-flight prefill tokens) / depth), min_microbatch_tokens,
+max_batch_tokens)`: pending is started prompts' unscheduled tokens plus the
+policy's `queued_prompt_tokens()`, in-flight is the prefill of formed microbatches
+that have not exited. One prompt into an empty pipeline therefore runs as `depth`
+equal slices. The split never holds a microbatch back, and
+`min_microbatch_tokens` is rejected unless the split is `even`.
+
 `PipelineStageWorker` has no KV/admission axes. It runs microbatches FIFO,
 double-buffering one activation pull against one compute, at exact times derived
 from the previous stage's `ready_at`. It stamps no request stage, so requests stay

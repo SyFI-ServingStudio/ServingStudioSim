@@ -59,6 +59,60 @@ pub enum PrefillChunkAlignment {
 
 const PREFILL_CHUNK_ALIGNMENT_CHOICES: [&str; 2] = ["checkpoint", "plain"];
 
+/// How a pipeline head sizes each microbatch's prefill.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MicrobatchSplit {
+    /// Take as much pending prefill as `max_batch_tokens` allows (vLLM).
+    #[default]
+    Greedy,
+    /// Take one `pp_size`-th of the round: `clamp(ceil((pending + in-flight
+    /// prefill tokens) / pp_size), min_microbatch_tokens, max_batch_tokens)`.
+    Even,
+}
+
+const MICROBATCH_SPLIT_CHOICES: [&str; 2] = ["greedy", "even"];
+
+/// Validated microbatch prefill sizing the pipeline-head recipe applies.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MicrobatchSizing {
+    #[default]
+    Greedy,
+    Even {
+        min_tokens: u32,
+    },
+}
+
+/// Lower the `microbatch_split` / `min_microbatch_tokens` selector pair. The
+/// minimum only floors the even target: alone it would be a hold gate, which
+/// can leave a prompt's last small chunk waiting while other work flows.
+pub(crate) fn resolve_microbatch_sizing(
+    split: MicrobatchSplit,
+    min_microbatch_tokens: u32,
+    max_batch_tokens: u32,
+) -> Result<MicrobatchSizing> {
+    match split {
+        MicrobatchSplit::Greedy => {
+            ensure!(
+                min_microbatch_tokens == 0,
+                "min_microbatch_tokens ({min_microbatch_tokens}) only applies with \
+                 microbatch_split: even; greedy takes every pending token it can"
+            );
+            Ok(MicrobatchSizing::Greedy)
+        }
+        MicrobatchSplit::Even => {
+            ensure!(
+                min_microbatch_tokens <= max_batch_tokens,
+                "min_microbatch_tokens ({min_microbatch_tokens}) must be <= \
+                 max_batch_tokens ({max_batch_tokens})"
+            );
+            Ok(MicrobatchSizing::Even {
+                min_tokens: min_microbatch_tokens,
+            })
+        }
+    }
+}
+
 /// KV-capacity rule paired with chunked prefill. `FullFootprint` preserves the
 /// historical no-retraction lifecycle. `BoundedFuture` uses an explicit
 /// future-token estimate and therefore requires decode retraction.
@@ -457,6 +511,18 @@ pub enum IterWorkerSel {
         #[serde(default)]
         #[param(default = false)]
         balance_decode_microbatches: bool,
+        /// `greedy` (vLLM) fills each microbatch's prefill up to
+        /// `max_batch_tokens`; `even` sizes it to one `pp_size`-th of the
+        /// pending plus in-flight prefill, so a backlog spreads over the
+        /// pipeline instead of one full microbatch followed by small ones.
+        #[serde(default)]
+        #[param(string, default = "greedy", choices = MICROBATCH_SPLIT_CHOICES)]
+        microbatch_split: MicrobatchSplit,
+        /// Floor on the `even` target, in prefill tokens (`0`: none). Valid
+        /// only with `microbatch_split: even`; never delays a microbatch.
+        #[serde(default)]
+        #[param(default = 0)]
+        min_microbatch_tokens: u32,
     },
     /// PD prefill half: prefills then hands off to a decode pool (no local decode).
     PdPrefill {
@@ -582,6 +648,40 @@ pub(crate) fn resolve_prefix_cache_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn min_microbatch_tokens_requires_the_even_split() {
+        let worker: IterWorkerSel = serde_yaml::from_str(
+            "type: pipeline_chunked_prefill\nattn_gpu_memory_gb: 80.0\nmax_batch_tokens: 8192\n",
+        )
+        .expect("parse pipeline worker");
+        let IterWorkerSel::PipelineChunkedPrefill {
+            microbatch_split,
+            min_microbatch_tokens,
+            ..
+        } = worker
+        else {
+            panic!("expected pipeline_chunked_prefill");
+        };
+        assert_eq!(
+            resolve_microbatch_sizing(microbatch_split, min_microbatch_tokens, 8192).unwrap(),
+            MicrobatchSizing::Greedy,
+            "the default is vLLM's greedy fill"
+        );
+
+        let error = resolve_microbatch_sizing(MicrobatchSplit::Greedy, 1024, 8192).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("only applies with microbatch_split: even"),
+            "{error}"
+        );
+        assert!(resolve_microbatch_sizing(MicrobatchSplit::Even, 8193, 8192).is_err());
+        assert_eq!(
+            resolve_microbatch_sizing(MicrobatchSplit::Even, 1024, 8192).unwrap(),
+            MicrobatchSizing::Even { min_tokens: 1024 }
+        );
+    }
 
     #[test]
     fn selector_defaults_to_uncapped_opportunistic_prefix_reuse() {
