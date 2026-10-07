@@ -19,6 +19,20 @@
 //! split across the `depth` microbatches the pipeline holds and each returns
 //! to the next round on its own.
 //!
+//! Prefill takes as much pending work as the budget allows by default (vLLM),
+//! so at moderate load a small microbatch forms from whatever arrived while
+//! stage 0 was busy, and the backlog that builds meanwhile fills the next one to
+//! `max_batch_tokens`. `with_even_split(depth, min)` instead sizes each
+//! microbatch's prefill to one `depth`-th of the round the pipeline holds:
+//! `clamp(ceil((pending + in-flight prefill tokens) / depth), min,
+//! max_batch_tokens)`. Pending counts started prompts' unscheduled tokens and
+//! queued fresh prompts' tokens (before any prefix hit, and whether or not KV
+//! admits them yet); in-flight counts the prefill tokens of microbatches formed
+//! and not yet exited. Counting the in-flight tokens keeps the size steady
+//! through a round: one `P`-token prompt into an empty pipeline runs as `depth`
+//! slices of `P / depth`, not a shrinking `P/depth, 3P/depth^2, ...` series.
+//! The split never waits: a microbatch takes `min(pending, target)` and starts.
+//!
 //! The pending policy owns fresh requests. A prompt that has started and still
 //! has unscheduled prefill tokens stays in `started_prefills`, in start order,
 //! and keeps priority over fresh prompts. A request whose last chunk is in flight
@@ -63,6 +77,19 @@ pub struct PipelinedChunkedPrefillAdmission<P: PendingOrderPolicy> {
     /// Pipeline depth when decodes are balanced across microbatches; `None`
     /// schedules every ready decode (vLLM).
     balanced_depth: Option<u16>,
+    /// Prefill target rule when microbatches are sized evenly over the round;
+    /// `None` fills each microbatch greedily (vLLM).
+    even_split: Option<EvenSplit>,
+    /// Prefill tokens of the committed microbatches that have not exited.
+    in_flight_prefill_tokens: u64,
+}
+
+/// Prefill sizing of [`PipelinedChunkedPrefillAdmission::with_even_split`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EvenSplit {
+    depth: u16,
+    /// Floor on the target, so a thin backlog does not run as tiny slices.
+    min_tokens: u32,
 }
 
 /// One request's chunk in one microbatch, snapshotted when it was committed.
@@ -107,6 +134,8 @@ impl<P: PendingOrderPolicy> PipelinedChunkedPrefillAdmission<P> {
             in_flight_decodes: HashSet::new(),
             scheduled_decodes: Vec::new(),
             balanced_depth: None,
+            even_split: None,
+            in_flight_prefill_tokens: 0,
         }
     }
 
@@ -122,6 +151,45 @@ impl<P: PendingOrderPolicy> PipelinedChunkedPrefillAdmission<P> {
         assert!(depth > 0, "pipeline depth must be positive");
         self.balanced_depth = Some(depth);
         self
+    }
+
+    /// Size each microbatch's prefill to `clamp(ceil(round tokens / depth),
+    /// min_tokens, max_batch_tokens)`, where the round is the pending prefill
+    /// plus the prefill already in flight.
+    pub(crate) fn with_even_split(mut self, depth: u16, min_tokens: u32) -> Self {
+        assert!(depth > 0, "pipeline depth must be positive");
+        assert!(
+            min_tokens <= self.max_batch_tokens,
+            "min microbatch tokens {min_tokens} exceed max_batch_tokens {}",
+            self.max_batch_tokens
+        );
+        self.even_split = Some(EvenSplit { depth, min_tokens });
+        self
+    }
+
+    /// The prefill-token budget of the microbatch being formed, given what is
+    /// left of `max_batch_tokens` after decodes.
+    fn prefill_budget<K: ChunkedPrefillKv>(&self, kv_store: &K, remaining_budget: u32) -> u32 {
+        let Some(EvenSplit { depth, min_tokens }) = self.even_split else {
+            return remaining_budget;
+        };
+        let started: u64 = self
+            .started_prefills
+            .iter()
+            .map(|candidate| {
+                u64::from(
+                    kv_store
+                        .resolved_prefill_context(candidate.request_id)
+                        .remaining_prefill_tokens(),
+                )
+            })
+            .sum();
+        let round_tokens =
+            started + self.policy.queued_prompt_tokens() + self.in_flight_prefill_tokens;
+        let target = round_tokens
+            .div_ceil(u64::from(depth))
+            .clamp(u64::from(min_tokens), u64::from(self.max_batch_tokens));
+        remaining_budget.min(target as u32)
     }
 
     /// Admit fresh prompts into the budget left after started prompts.
@@ -258,6 +326,7 @@ where
         });
         batch_plan.reset_decode_participation(1, false);
         batch_plan.select_partition_decodes(PARTITION, self.scheduled_decodes.clone());
+        let mut remaining_budget = self.prefill_budget(kv_store, remaining_budget);
         // Started prompts keep start order. One that cannot run keeps its place.
         self.started_prefills.retain(|candidate| {
             let resolved_prefill = kv_store.resolved_prefill_context(candidate.request_id);
@@ -305,6 +374,7 @@ where
         }
         kv_store.clear_prefill_admits(PARTITION);
         kv_store.sample_submit(PARTITION, now);
+        self.in_flight_prefill_tokens += ticket.tokens();
         ticket
     }
 
@@ -316,6 +386,7 @@ where
         completed: &mut Vec<RequestId>,
         at: Time,
     ) {
+        self.in_flight_prefill_tokens -= ticket.tokens();
         let MicrobatchTicket { chunks, decodes } = ticket;
         let mut finished_decodes = Vec::new();
         {

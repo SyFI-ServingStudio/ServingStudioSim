@@ -43,6 +43,7 @@ impl PartialEq for ShortestWorkFirst {
 pub struct ShortestJobFirst {
     queue: BinaryHeap<ShortestWorkFirst>,
     queued_kv_tokens: u64,
+    queued_prompt_tokens: u64,
 }
 
 impl ShortestJobFirst {
@@ -56,6 +57,7 @@ impl PendingOrderPolicy for ShortestJobFirst {
 
     fn push(&mut self, candidate: AdmissionCandidate, _context: &mut Self::Context) {
         self.queued_kv_tokens += candidate.queued_kv_tokens();
+        self.queued_prompt_tokens += u64::from(candidate.fresh_prompt_tokens);
         self.queue.push(ShortestWorkFirst(candidate));
     }
 
@@ -66,6 +68,7 @@ impl PendingOrderPolicy for ShortestJobFirst {
     fn pop(&mut self, _context: &mut Self::Context) -> Option<AdmissionCandidate> {
         let candidate = self.queue.pop()?.0;
         self.queued_kv_tokens -= candidate.queued_kv_tokens();
+        self.queued_prompt_tokens -= u64::from(candidate.fresh_prompt_tokens);
         Some(candidate)
     }
 
@@ -88,6 +91,7 @@ impl PendingOrderPolicy for ShortestJobFirst {
         self.queue = BinaryHeap::from(retained);
         if let Some(candidate) = removed {
             self.queued_kv_tokens -= candidate.queued_kv_tokens();
+            self.queued_prompt_tokens -= u64::from(candidate.fresh_prompt_tokens);
         }
         removed
     }
@@ -104,6 +108,10 @@ impl PendingOrderPolicy for ShortestJobFirst {
 
     fn queued_kv_tokens(&self) -> u64 {
         self.queued_kv_tokens
+    }
+
+    fn queued_prompt_tokens(&self) -> u64 {
+        self.queued_prompt_tokens
     }
 }
 
@@ -162,5 +170,6 @@ mod tests {
         );
         assert!(!policy.contains(RequestId(0)));
         assert_eq!(policy.queued_kv_tokens(), 5);
+        assert_eq!(policy.queued_prompt_tokens(), 4);
     }
 }

@@ -135,6 +135,11 @@ impl PendingOrderPolicy for PendingOrder {
     fn queued_kv_tokens(&self) -> u64 {
         dispatch!(self, inner => inner.queued_kv_tokens())
     }
+
+    #[inline]
+    fn queued_prompt_tokens(&self) -> u64 {
+        dispatch!(self, inner => inner.queued_prompt_tokens())
+    }
 }
 
 /// Immutable facts available to a pending-order policy.
@@ -258,6 +263,11 @@ pub trait PendingOrderPolicy {
     fn contains(&self, request: RequestId) -> bool;
     fn len(&self) -> usize;
     fn queued_kv_tokens(&self) -> u64;
+    /// Sum of the queued candidates' `fresh_prompt_tokens`: the prefill work
+    /// waiting to start, before any prefix-cache hit. Kept beside
+    /// `queued_kv_tokens` so a lifecycle can size a batch to the backlog without
+    /// walking the queue.
+    fn queued_prompt_tokens(&self) -> u64;
 
     #[inline]
     fn is_empty(&self) -> bool {

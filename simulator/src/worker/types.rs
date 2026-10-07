@@ -575,6 +575,9 @@ pub struct WorkerConfig {
     /// depth)` instead of scheduling every ready decode (vLLM). Only the
     /// pipeline head recipe reads it.
     pub balance_decode_microbatches: bool,
+    /// How a pipeline head sizes each microbatch's prefill. Only the pipeline
+    /// head recipe reads it.
+    pub microbatch_sizing: crate::worker::config::MicrobatchSizing,
     /// Whether and how completed-session KV uses the dynamically available
     /// attention slack. This never adds capacity beyond `attn_kv_bytes`.
     pub prefix_cache: crate::worker::kv::PrefixCacheConfig,
@@ -617,6 +620,7 @@ impl Default for WorkerConfig {
             batch_policy: crate::worker::config::BatchPolicy::Mix,
             kv_admission: crate::worker::config::KvAdmissionConfig::FullFootprint,
             balance_decode_microbatches: false,
+            microbatch_sizing: crate::worker::config::MicrobatchSizing::Greedy,
             prefix_cache: crate::worker::kv::PrefixCacheConfig::default(),
             ssm_checkpoint_interval_tokens: None,
             prefill_chunk_alignment: crate::worker::config::PrefillChunkAlignment::Checkpoint,

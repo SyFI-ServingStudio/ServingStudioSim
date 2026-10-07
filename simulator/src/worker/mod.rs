@@ -21,10 +21,10 @@ pub use admission::{
     AdmissionCandidate, FifoOrder, LoadBalance, LongestPrefixMatch, PendingOrder, PendingOrderKind,
     PendingOrderPolicy, SessionStartOrder, ShortestJobFirst,
 };
-pub(crate) use config::resolve_prefix_cache_config;
+pub(crate) use config::{resolve_microbatch_sizing, resolve_prefix_cache_config};
 pub use config::{
     AttnWorkerSel, BatchPolicy, DecodeRetractionPolicy, DpPlacement, FfnWorkerSel, IterWorkerSel,
-    KvAdmissionConfig, KvAdmissionPolicy, PrefillChunkAlignment,
+    KvAdmissionConfig, KvAdmissionPolicy, MicrobatchSizing, MicrobatchSplit, PrefillChunkAlignment,
 };
 pub use cost_buffers::CostBuffers;
 pub use gpu_cluster::{CostSource, GpuCluster, GpuInfo, SharedGpuCluster};

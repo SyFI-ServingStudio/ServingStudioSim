@@ -7,6 +7,7 @@ use crate::arch::contract::IterwiseUnifiedModel;
 use crate::common::{PoolId, SharedRequests, WorkerId};
 use crate::log::PrefixCacheLogger;
 use crate::worker::admission::{PendingOrder, PipelinedChunkedPrefillAdmission};
+use crate::worker::config::MicrobatchSizing;
 use crate::worker::execution::UnifiedIterExecution;
 use crate::worker::gpu_cluster::SharedGpuCluster;
 use crate::worker::kv::{FullAttnKv, HybridGdnKv, PrefixCacheConfig};
@@ -80,6 +81,9 @@ pub(crate) fn build_pipeline_head_worker<M: IterwiseUnifiedModel>(
     );
     if config.balance_decode_microbatches {
         admission = admission.with_balanced_decodes(layout.depth);
+    }
+    if let MicrobatchSizing::Even { min_tokens } = config.microbatch_sizing {
+        admission = admission.with_even_split(layout.depth, min_tokens);
     }
 
     PipelineHeadWorker::from_components(
@@ -215,6 +219,9 @@ pub(crate) fn build_hybrid_pipeline_head_worker<M: IterwiseUnifiedModel>(
     };
     if config.balance_decode_microbatches {
         admission = admission.with_balanced_decodes(layout.depth);
+    }
+    if let MicrobatchSizing::Even { min_tokens } = config.microbatch_sizing {
+        admission = admission.with_even_split(layout.depth, min_tokens);
     }
 
     PipelineHeadWorker::from_components(
