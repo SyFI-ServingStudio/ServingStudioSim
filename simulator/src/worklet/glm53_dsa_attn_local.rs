@@ -112,6 +112,11 @@ pub struct Glm53DsaAttnLocalWorkletConfig {
     pub mla_cache_append_backends: Vec<&'static str>,
     pub index_remap_backends: Vec<&'static str>,
     pub elementwise_backends: Vec<&'static str>,
+    /// The fork's head-major MLA layout copies (`q_concat`, `output_copy`).
+    /// Current vLLM writes `ql_nope` token-major through `bmm(out=)` and
+    /// skips the empty-query `masked_fill_` unless DCP or HiSparse is on, so
+    /// `false` zeroes both.
+    pub mla_layout_copies: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -600,7 +605,7 @@ impl Glm53DsaAttnLocalWorklet {
             false,
             ev,
         );
-        push_or_zero(&self.q_concat, all.clone(), false, ev);
+        push_or_zero(&self.q_concat, all.clone(), !cfg.mla_layout_copies, ev);
         push_or_zero(&self.q_fp8_quant, all.clone(), false, ev);
         self.sparse_mla.eval(
             &Glm53KpoolSparseMlaInput {
@@ -613,7 +618,7 @@ impl Glm53DsaAttnLocalWorklet {
             },
             ev,
         );
-        push_or_zero(&self.output_copy, all.clone(), false, ev);
+        push_or_zero(&self.output_copy, all.clone(), !cfg.mla_layout_copies, ev);
         push_or_zero(
             &self.v_up,
             BatchedGemmKernelInput { m: w.total_tokens },
@@ -744,6 +749,7 @@ mod tests {
             mla_cache_append_backends: vec!["vllm_cuda"],
             index_remap_backends: vec!["vllm_triton"],
             elementwise_backends: vec!["triton"],
+            mla_layout_copies: true,
         }
     }
 

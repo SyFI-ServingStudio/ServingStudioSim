@@ -55,7 +55,10 @@ pub struct Glm53KdaAttnLocalWorkletConfig {
     pub gpu_name: String,
     pub bf16_gemm_backends: Vec<&'static str>,
     pub conv_backends: Vec<&'static str>,
+    /// Recurrent-decode backends.
     pub core_backends: Vec<&'static str>,
+    /// Chunked-prefill backends: the serving engine's KDA prefill kernel.
+    pub chunk_prefill_backends: Vec<&'static str>,
     pub elementwise_backends: Vec<&'static str>,
 }
 
@@ -160,7 +163,7 @@ impl Glm53KdaAttnLocalWorklet {
             prefill_small_glue: ew(SMALL_GLUE_BYTES_PER_TOKEN, SMALL_GLUE_BYTES_PER_TOKEN),
             state_gather: ew(STATE_TRANSFER_UNIT_BYTES, STATE_TRANSFER_UNIT_BYTES),
             chunk_prefill: KdaChunkPrefillKernelConfig {
-                backends: cfg.core_backends.clone(),
+                backends: cfg.chunk_prefill_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
                 num_heads: cfg.num_heads.clone(),
                 head_dim: cfg.head_dim.clone(),
@@ -404,6 +407,7 @@ mod tests {
             bf16_gemm_backends: vec!["torch_linear_vllm"],
             conv_backends: vec!["vllm_triton"],
             core_backends: vec!["vllm_triton"],
+            chunk_prefill_backends: vec!["vllm_triton"],
             elementwise_backends: vec!["triton"],
         }
     }
