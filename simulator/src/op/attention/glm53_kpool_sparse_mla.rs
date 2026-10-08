@@ -70,7 +70,25 @@ pub struct Glm53KpoolSparseMlaConfig {
     pub cache_dtype: DType,
     pub output_dtype: DType,
     pub index_dtype: String,
+    /// Access pattern of the selected cache rows for the DECODE leaf and the
+    /// index-remap kernel. Decode fans a sparse top-k pool across the whole
+    /// context, so its selected positions are scattered (`unique_scattered_pages`).
     pub index_distribution: String,
+    /// Access pattern for the UNPOOLED PREFILL (CausalTail) leaf (B200 and any
+    /// target that does not pool). B200 keeps `unique_scattered_pages`, so its
+    /// prefill rows are unchanged. Ignored when `pool_prefill_slots` is set: the
+    /// pooled prefill reuses the decode `index_distribution` so it shares the
+    /// decode leaf's measured grid (the pooled/scattered index distribution only
+    /// shifts the row ~0.15%, so there is no separate contiguous curve to hit).
+    pub prefill_index_distribution: String,
+    /// True when this GPU's sparse-MLA attention kernel reads the kpool-COMPRESSED
+    /// KV (one entry per pool), so a prefill row at causal position `n` touches
+    /// `min(ceil(n / index_kpool), index_topk / index_kpool)` slots rather than
+    /// the uncompressed `n`. Set only on MI300X (`rocm_triton_mla_sparse`), whose
+    /// live prefill runs ~kpool-fold faster than the uncompressed slot count would
+    /// predict. B200 leaves this false and keeps the CausalTail uncompressed path
+    /// byte-identical. See `derive_shape` for the coordinate it produces.
+    pub pool_prefill_slots: bool,
     pub cache_layout: String,
     pub mla_cache_block_size: u32,
     pub mla_cache_format: String,
@@ -96,6 +114,7 @@ pub struct Glm53KpoolSparseMlaOp {
     index_topk: u32,
     index_kpool: u32,
     selected_k: u32,
+    pool_prefill_slots: bool,
 }
 
 /// The four L1 configurations one op identity expands into.
@@ -129,24 +148,25 @@ impl Glm53KpoolSparseMlaOp {
                 "cache block size and max_model_len must be positive",
             ));
         }
-        let attention = |valid_counts_pattern| DsaSparseMlaAttentionKernelConfig {
-            backends: cfg.sparse_attention_backends.clone(),
-            gpu_name: cfg.gpu_name.clone(),
-            num_heads: cfg.num_heads.clone(),
-            num_kv_heads: Dim::param("num_kv_heads", 1),
-            selected_k: cfg.selected_k,
-            latent_dim: cfg.latent_dim.clone(),
-            rope_dim: cfg.rope_dim.clone(),
-            value_dim: cfg.latent_dim.clone(),
-            softmax_scale_denominator: cfg.softmax_scale_denominator,
-            q_dtype: cfg.q_dtype,
-            cache_dtype: cfg.cache_dtype,
-            index_dtype: cfg.index_dtype.clone(),
-            output_dtype: cfg.output_dtype,
-            valid_counts_pattern,
-            index_distribution: cfg.index_distribution.clone(),
-            cache_layout: cfg.cache_layout.clone(),
-        };
+        let attention =
+            |valid_counts_pattern, index_distribution: String| DsaSparseMlaAttentionKernelConfig {
+                backends: cfg.sparse_attention_backends.clone(),
+                gpu_name: cfg.gpu_name.clone(),
+                num_heads: cfg.num_heads.clone(),
+                num_kv_heads: Dim::param("num_kv_heads", 1),
+                selected_k: cfg.selected_k,
+                latent_dim: cfg.latent_dim.clone(),
+                rope_dim: cfg.rope_dim.clone(),
+                value_dim: cfg.latent_dim.clone(),
+                softmax_scale_denominator: cfg.softmax_scale_denominator,
+                q_dtype: cfg.q_dtype,
+                cache_dtype: cfg.cache_dtype,
+                index_dtype: cfg.index_dtype.clone(),
+                output_dtype: cfg.output_dtype,
+                valid_counts_pattern,
+                index_distribution,
+                cache_layout: cfg.cache_layout.clone(),
+            };
         // The remap kernel names its locality by blocks rather than pages.
         let remap_distribution = match cfg.index_distribution.as_str() {
             "unique_scattered_pages" => "unique_scattered_blocks",
@@ -175,11 +195,33 @@ impl Glm53KpoolSparseMlaOp {
                 return_valid_counts: true,
                 index_dtype: cfg.index_dtype.clone(),
             },
-            prefill: attention(ValidCountsPattern::CausalTail),
-            decode: attention(ValidCountsPattern::PooledUniformFull {
-                index_topk: cfg.index_topk,
-                index_kpool: cfg.index_kpool,
-            }),
+            // The pooled prefill reads kpool-compressed KV, so it prices against
+            // the SAME measured pattern and index distribution as decode
+            // (`PooledUniformFull` over scattered pages) and shares that leaf's
+            // banked grid. `derive_shape` collapses the pooled per-row counts to
+            // a uniform `(rows, pooled-per-row)` coordinate inside that grid. The
+            // unpooled path (B200) keeps the CausalTail leaf byte-identical.
+            prefill: if cfg.pool_prefill_slots {
+                attention(
+                    ValidCountsPattern::PooledUniformFull {
+                        index_topk: cfg.index_topk,
+                        index_kpool: cfg.index_kpool,
+                    },
+                    cfg.index_distribution.clone(),
+                )
+            } else {
+                attention(
+                    ValidCountsPattern::CausalTail,
+                    cfg.prefill_index_distribution.clone(),
+                )
+            },
+            decode: attention(
+                ValidCountsPattern::PooledUniformFull {
+                    index_topk: cfg.index_topk,
+                    index_kpool: cfg.index_kpool,
+                },
+                cfg.index_distribution.clone(),
+            ),
         })
     }
 
@@ -214,6 +256,7 @@ impl Glm53KpoolSparseMlaOp {
             index_topk: cfg.index_topk,
             index_kpool: cfg.index_kpool,
             selected_k: cfg.selected_k,
+            pool_prefill_slots: cfg.pool_prefill_slots,
             name,
         })
     }
@@ -239,8 +282,14 @@ impl Glm53KpoolSparseMlaOp {
 
     /// Push the four slots in compile order (INV-2).
     pub fn eval(&self, input: &Glm53KpoolSparseMlaInput, ev: &mut Evaluator) {
-        let shape = derive_shape(input, self.index_topk, self.index_kpool, self.selected_k)
-            .unwrap_or_else(|reason| panic!("invalid Glm53KpoolSparseMlaInput: {reason}"));
+        let shape = derive_shape(
+            input,
+            self.index_topk,
+            self.index_kpool,
+            self.selected_k,
+            self.pool_prefill_slots,
+        )
+        .unwrap_or_else(|reason| panic!("invalid Glm53KpoolSparseMlaInput: {reason}"));
 
         let cache_append = MlaCacheAppendKernelInput {
             num_tokens: shape.num_rows,
@@ -362,11 +411,53 @@ fn pooled_valid_count(span: u32, index_topk: u32, index_kpool: u32) -> u32 {
     span.min(index_topk + span % index_kpool)
 }
 
+/// Compressed (pool-granular) slots a row at causal position `span` reads when
+/// the attention kernel attends to the kpool CACHE rather than its expansion.
+///
+/// The pooled indexer keeps one entry per pool, so the row sees
+/// `ceil(span / index_kpool)` pools, selected down to at most the `index_topk`
+/// pool budget `index_topk / index_kpool`. This is the uncompressed
+/// [`pooled_valid_count`] scaled by `index_kpool` (modulo the partial tail
+/// pool), and it is the count the MI300X `rocm_triton_mla_sparse` kernel
+/// actually reads — ~kpool-fold below the expansion.
+fn pooled_prefill_slot_count(span: u32, index_topk: u32, index_kpool: u32) -> u32 {
+    span.div_ceil(index_kpool).min(index_topk / index_kpool)
+}
+
+/// The prefill attention coordinate when the kernel reads kpool-compressed KV.
+///
+/// Every row of the iteration goes through one attention query (INV-1), so the
+/// op reports a single `(num_queries, num_cache_tokens)` pair. The kernel is
+/// linear in the total of valid slots and independent of how they spread over
+/// rows (verified on the `rocm_triton_mla_sparse` grid: a causal ramp and a
+/// uniform batch of the same total/`num_queries` agree to <2%), so we price the
+/// pooled work as a UNIFORM read of `pooled_total / num_rows` pooled slots over
+/// every row. That coordinate lands inside the decode leaf's measured
+/// `PooledUniformFull` grid (e.g. `u:256x2048`, `u:512x2048`) with no new rows.
+fn pooled_prefill_query(
+    local_span_lengths: &[u32],
+    index_topk: u32,
+    index_kpool: u32,
+) -> DsaSparseMlaAttentionKernelInput {
+    let num_rows = local_span_lengths.len() as u32;
+    let pooled_total: u64 = local_span_lengths
+        .iter()
+        .map(|&span| u64::from(pooled_prefill_slot_count(span, index_topk, index_kpool)))
+        .sum();
+    // Uniform pooled slots per row; the whole batch's pooled work is preserved.
+    let num_cache_tokens = (pooled_total / u64::from(num_rows)).max(1) as u32;
+    DsaSparseMlaAttentionKernelInput {
+        num_queries: num_rows,
+        num_cache_tokens,
+    }
+}
+
 fn derive_shape(
     input: &Glm53KpoolSparseMlaInput,
     index_topk: u32,
     index_kpool: u32,
     selected_k: u32,
+    pool_prefill: bool,
 ) -> Result<Shape, String> {
     let mut request_row_counts = Vec::new();
     let mut local_span_lengths = Vec::new();
@@ -395,7 +486,13 @@ fn derive_shape(
     let num_rows = u32::try_from(local_span_lengths.len())
         .map_err(|_| "query-row count exceeds u32".to_string())?;
     let prefill_bearing = !input.prefill_query_cache_pairs.is_empty();
-    let prefill = prefill_bearing.then(|| combined_causal_query(&valid_counts, selected_k));
+    let prefill = prefill_bearing.then(|| {
+        if pool_prefill {
+            pooled_prefill_query(&local_span_lengths, index_topk, index_kpool)
+        } else {
+            combined_causal_query(&valid_counts, selected_k)
+        }
+    });
     let decode = input
         .decode_context_lens
         .iter()
@@ -449,6 +546,8 @@ mod tests {
             output_dtype: DType::Bf16,
             index_dtype: "int32".to_string(),
             index_distribution: "unique_scattered_pages".to_string(),
+            prefill_index_distribution: "unique_scattered_pages".to_string(),
+            pool_prefill_slots: false,
             cache_layout: "hnd_paged_mqa_fp8_latent".to_string(),
             mla_cache_block_size: 64,
             mla_cache_format: "plain".to_string(),
@@ -497,7 +596,7 @@ mod tests {
             prefill_query_cache_pairs: vec![(3, 5)],
             decode_context_lens: vec![1000, 4003],
         };
-        let shape = derive_shape(&input, 2048, 4, 2176).unwrap();
+        let shape = derive_shape(&input, 2048, 4, 2176, false).unwrap();
         assert_eq!(shape.num_rows, 5);
         let remap = shape.remap.unwrap();
         assert_eq!(remap.request_row_counts, [1, 1, 3]);
@@ -518,7 +617,7 @@ mod tests {
             prefill_query_cache_pairs: Vec::new(),
             decode_context_lens: vec![1000, 4003],
         };
-        let shape = derive_shape(&input, 2048, 4, 2176).unwrap();
+        let shape = derive_shape(&input, 2048, 4, 2176, false).unwrap();
         assert!(shape.prefill.is_none());
         let decode = shape.decode.unwrap();
         assert_eq!((decode.num_queries, decode.num_cache_tokens), (2, 4003));
@@ -531,13 +630,88 @@ mod tests {
             prefill_query_cache_pairs: vec![(1000, 1500)],
             decode_context_lens: Vec::new(),
         };
-        let prefill = derive_shape(&input, 2048, 4, 2176)
+        let prefill = derive_shape(&input, 2048, 4, 2176, false)
             .unwrap()
             .prefill
             .unwrap();
         assert_eq!(
             (prefill.num_queries, prefill.num_cache_tokens),
             (1000, 1500)
+        );
+    }
+
+    #[test]
+    fn pooled_prefill_slot_count_pools_and_saturates() {
+        // Below index_topk: ceil(span / kpool) pools.
+        assert_eq!(pooled_prefill_slot_count(1, 2048, 4), 1);
+        assert_eq!(pooled_prefill_slot_count(4, 2048, 4), 1);
+        assert_eq!(pooled_prefill_slot_count(5, 2048, 4), 2);
+        assert_eq!(pooled_prefill_slot_count(2048, 2048, 4), 512);
+        // Past index_topk the top-k pool budget (index_topk / kpool) saturates.
+        assert_eq!(pooled_prefill_slot_count(2049, 2048, 4), 512);
+        assert_eq!(pooled_prefill_slot_count(4096, 2048, 4), 512);
+    }
+
+    #[test]
+    fn pooled_prefill_maps_the_honest_iterations_to_banked_uniform_cells() {
+        // The two captured GLM-5.3-Flash MI300X prefill iterations, pooled.
+        // iter0 = [[0, 2048]] -> op pair (append 2048, context 2048): rows span
+        // 1..=2048, pooled counts ceil(n/4) sum to 4*(1+..+512) = 525,312 over
+        // 2048 rows -> u:256x2048 (verified MI300X row, 339.3 us/layer).
+        let iter0 = Glm53KpoolSparseMlaInput {
+            prefill_query_cache_pairs: vec![(2048, 2048)],
+            decode_context_lens: Vec::new(),
+        };
+        let p0 = derive_shape(&iter0, 2048, 4, 2176, true)
+            .unwrap()
+            .prefill
+            .unwrap();
+        assert_eq!((p0.num_queries, p0.num_cache_tokens), (2048, 256));
+
+        // iter1 = [[2048, 2048]] -> op pair (append 2048, context 4096): rows
+        // span 2049..=4096, every pooled count saturates at index_topk/kpool=512
+        // -> 2048*512 = 1,048,576 -> u:512x2048 (verified MI300X row, 609.6 us).
+        let iter1 = Glm53KpoolSparseMlaInput {
+            prefill_query_cache_pairs: vec![(2048, 4096)],
+            decode_context_lens: Vec::new(),
+        };
+        let p1 = derive_shape(&iter1, 2048, 4, 2176, true)
+            .unwrap()
+            .prefill
+            .unwrap();
+        assert_eq!((p1.num_queries, p1.num_cache_tokens), (2048, 512));
+
+        // The unpooled (B200) path is unchanged: iter0 keeps its full causal ramp.
+        let unpooled = derive_shape(&iter0, 2048, 4, 2176, false)
+            .unwrap()
+            .prefill
+            .unwrap();
+        assert_eq!((unpooled.num_queries, unpooled.num_cache_tokens), (2048, 2048));
+    }
+
+    #[test]
+    fn pooled_prefill_leaf_reuses_the_scattered_pooled_grid() {
+        let mut cfg = cfg();
+        cfg.pool_prefill_slots = true;
+        cfg.prefill_index_distribution = "recent_contiguous".to_string();
+        let resolved = Glm53KpoolSparseMlaOp::resolve_config(&cfg).unwrap();
+        // Pooled prefill prices against the decode pattern + scattered pages, so
+        // it shares the decode leaf's measured grid (prefill_index_distribution
+        // is ignored when pooling).
+        assert_eq!(
+            resolved.prefill.valid_counts_pattern,
+            ValidCountsPattern::PooledUniformFull {
+                index_topk: 2048,
+                index_kpool: 4,
+            }
+        );
+        assert_eq!(resolved.prefill.index_distribution, "unique_scattered_pages");
+        assert_eq!(
+            resolved.decode.valid_counts_pattern,
+            ValidCountsPattern::PooledUniformFull {
+                index_topk: 2048,
+                index_kpool: 4,
+            }
         );
     }
 
@@ -550,13 +724,13 @@ mod tests {
 
     #[test]
     fn empty_batch_has_no_remap_and_bad_pairs_fail() {
-        let shape = derive_shape(&Glm53KpoolSparseMlaInput::default(), 2048, 4, 2176).unwrap();
+        let shape = derive_shape(&Glm53KpoolSparseMlaInput::default(), 2048, 4, 2176, false).unwrap();
         assert!(shape.remap.is_none() && shape.decode.is_none() && shape.prefill.is_none());
         let bad = Glm53KpoolSparseMlaInput {
             prefill_query_cache_pairs: vec![(6, 5)],
             decode_context_lens: Vec::new(),
         };
-        assert!(derive_shape(&bad, 2048, 4, 2176).is_err());
+        assert!(derive_shape(&bad, 2048, 4, 2176, false).is_err());
     }
 
     #[test]

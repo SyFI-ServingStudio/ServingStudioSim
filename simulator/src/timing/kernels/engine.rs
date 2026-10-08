@@ -139,6 +139,25 @@ pub trait KernelSpec: 'static {
         input.coords()
     }
 
+    /// Config-aware correction applied to the interpolated cache result in
+    /// [`Kernel::eval`], before the metrics reach the CostTree. Default:
+    /// identity (the cache row is the whole cost). Override ONLY where a
+    /// measured/analytic cache row cannot by itself represent a cost component
+    /// that the row's axes do not carry. The one current user is the
+    /// Infinity-Fabric all-reduce, whose profiled row is a pure bandwidth
+    /// roofline (data-movement time) and cannot encode the RCCL/PYNCCL
+    /// cross-rank sync-barrier latency — a per-collective, message-size-
+    /// independent cost added here (`all_reduce_fusion.rs`). Keeping it in the
+    /// cost model rather than in the row avoids double-counting if the analytic
+    /// bandwidth row is ever regenerated.
+    fn adjust_metrics(
+        _config: &Self::Config,
+        _input: &Self::Input,
+        metrics: LeafMetrics,
+    ) -> LeafMetrics {
+        metrics
+    }
+
     /// Grid cells (row-major, aligned with `enumerate`) that are physically
     /// infeasible. Their profiled sample is forced non-finite at build so a
     /// multilinear cache drops them and renormalizes over feasible corners,
@@ -382,7 +401,12 @@ impl<S: KernelSpec> Kernel<S> {
     /// [`KernelSpec::off_grid`] says.
     pub fn eval(&self, input: &S::Input) -> LeafMetrics {
         let coords = S::cache_coords(&self.config, input);
-        self.best_of(|index, backend_cache| self.eval_backend(index, backend_cache, input, &coords))
+        // main's off-grid-aware best-of selection, then #80's post-eval
+        // adjustment hook (the MI300X Infinity-Fabric all-reduce sync barrier;
+        // a no-op default for every other kernel).
+        let metrics =
+            self.best_of(|index, backend_cache| self.eval_backend(index, backend_cache, input, &coords));
+        S::adjust_metrics(&self.config, input, metrics)
     }
 
     fn eval_backend(

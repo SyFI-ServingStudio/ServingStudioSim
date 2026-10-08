@@ -24,6 +24,16 @@ simulator reads ``time_ms`` as the cost.
 Because the number is derived, not timed, the runner needs no multi-GPU rank
 group and no device work: the spec declares no ``gpu_count_fn`` (so ``gpu_count``
 is 1) and the runner returns one ``CommMetrics`` per spec from pure arithmetic.
+
+This row is ONLY the bandwidth roofline (data-movement time). A bandwidth
+roofline cannot represent the RCCL/PYNCCL cross-rank sync barrier that
+dominates the real ``disable_custom_all_reduce`` all-reduce at small message
+sizes. That per-collective, message-size-independent barrier latency is added
+in the simulator cost model, NOT here, so this row stays a clean roofline and
+is not double-counted if regenerated. See
+``simulator/src/timing/kernels/all_reduce_fusion.rs``
+(``INFINITY_FABRIC_BARRIER_US_PER_RING_STEP`` / ``adjust_metrics``) and
+``servingstudio-mi300x-decisions.md`` decision #103.
 """
 
 from __future__ import annotations

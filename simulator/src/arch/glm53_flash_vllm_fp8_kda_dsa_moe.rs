@@ -300,6 +300,23 @@ const SPARSE_MLA_CACHE_DTYPE: DType = DType::Fp8E4m3;
 const SPARSE_MLA_CACHE_DTYPE_MI300X: DType = DType::Bf16;
 const SPARSE_MLA_CACHE_LAYOUT: &str = "hnd_paged_mqa_fp8_latent";
 const SPARSE_MLA_CACHE_LAYOUT_MI300X: &str = "token_major_mqa_bf16_latent";
+// Access pattern the UNPOOLED sparse-MLA PREFILL (CausalTail) leaf prices
+// against. Every target now uses `unique_scattered_pages`: the index
+// distribution shifts the measured row only ~0.15% (decision #123 disproved the
+// `recent_contiguous` repoint of decision #106/PR #80 — there is no separate
+// contiguous fast path). On MI300X the 3.78x prefill over-prediction is instead
+// closed by `SPARSE_MLA_POOL_PREFILL_MI300X` below (the kpool-compressed slot
+// count), which supersedes any prefill index-distribution choice.
+const SPARSE_MLA_PREFILL_INDEX_DIST: &str = "unique_scattered_pages";
+const SPARSE_MLA_PREFILL_INDEX_DIST_MI300X: &str = "unique_scattered_pages";
+// True iff this GPU's sparse-MLA attention kernel reads kpool-COMPRESSED KV, so
+// the prefill leaf must price pooled slots. MI300X runs `rocm_triton_mla_sparse`
+// over the pooled `token_major_mqa_bf16_latent` cache and measured ~kpool-fold
+// faster than the uncompressed selected-slot count predicts (decision #123); its
+// prefill shares the scattered `PooledUniformFull` decode grid, no new rows.
+// B200's FlashInfer path keeps the uncompressed CausalTail leaf byte-identical.
+const SPARSE_MLA_POOL_PREFILL: bool = false;
+const SPARSE_MLA_POOL_PREFILL_MI300X: bool = true;
 
 /// Pick the MI300X backend list for an MI300X target, else the default
 /// (NVIDIA) list. Additive and gpu-gated — the same shape as
@@ -906,6 +923,16 @@ pub fn build_configs(
                 SPARSE_MLA_CACHE_LAYOUT_MI300X,
                 SPARSE_MLA_CACHE_LAYOUT,
             ),
+            sparse_mla_prefill_index_distribution: pin_mi300x_str(
+                &gpu,
+                SPARSE_MLA_PREFILL_INDEX_DIST_MI300X,
+                SPARSE_MLA_PREFILL_INDEX_DIST,
+            ),
+            sparse_mla_pool_prefill: if is_mi300x(&gpu) {
+                SPARSE_MLA_POOL_PREFILL_MI300X
+            } else {
+                SPARSE_MLA_POOL_PREFILL
+            },
             gpu_name: gpu.clone(),
             bf16_gemm_backends: pin_mi300x(&gpu, BF16_GEMM_BACKENDS_MI300X, BF16_GEMM_BACKENDS),
             fp32_gemm_backends: pin_mi300x(&gpu, FP32_GEMM_BACKENDS_MI300X, FP32_GEMM_BACKENDS),

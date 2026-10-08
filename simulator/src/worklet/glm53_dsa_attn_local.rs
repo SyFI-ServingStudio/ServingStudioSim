@@ -109,6 +109,17 @@ pub struct Glm53DsaAttnLocalWorkletConfig {
     pub sparse_mla_q_dtype: DType,
     pub sparse_mla_cache_dtype: DType,
     pub sparse_mla_cache_layout: &'static str,
+    /// Access pattern the UNPOOLED PREFILL (CausalTail) sparse-MLA leaf prices
+    /// against (B200 and any target that does not pool). B200 keeps
+    /// `unique_scattered_pages` so its prefill rows stay byte-identical. Unused
+    /// on a target that pools (`sparse_mla_pool_prefill`), whose prefill shares
+    /// the scattered decode grid.
+    pub sparse_mla_prefill_index_distribution: &'static str,
+    /// True when this GPU's sparse-MLA attention kernel reads kpool-COMPRESSED
+    /// KV, so the prefill leaf prices pooled slots (`ceil(ctx / kpool)` capped at
+    /// `index_topk / kpool`) instead of the uncompressed causal count. Set on
+    /// MI300X (`rocm_triton_mla_sparse`); B200 leaves it false.
+    pub sparse_mla_pool_prefill: bool,
     pub gpu_name: String,
     pub bf16_gemm_backends: Vec<&'static str>,
     pub fp32_gemm_backends: Vec<&'static str>,
@@ -358,6 +369,8 @@ impl Glm53DsaAttnLocalWorklet {
                 output_dtype: bf16,
                 index_dtype: "int32".into(),
                 index_distribution: "unique_scattered_pages".into(),
+                prefill_index_distribution: cfg.sparse_mla_prefill_index_distribution.into(),
+                pool_prefill_slots: cfg.sparse_mla_pool_prefill,
                 cache_layout: cfg.sparse_mla_cache_layout.into(),
                 mla_cache_block_size: cfg.cache_block_size,
                 mla_cache_format: "plain".into(),
@@ -744,6 +757,8 @@ mod tests {
             sparse_mla_q_dtype: DType::Fp8E4m3,
             sparse_mla_cache_dtype: DType::Fp8E4m3,
             sparse_mla_cache_layout: "hnd_paged_mqa_fp8_latent",
+            sparse_mla_prefill_index_distribution: "unique_scattered_pages",
+            sparse_mla_pool_prefill: false,
             gpu_name: "NVIDIA B200".into(),
             bf16_gemm_backends: vec!["torch_linear_vllm"],
             fp32_gemm_backends: vec!["torch_cublas"],
