@@ -395,6 +395,7 @@ mod tests {
         let layout = PipelineLayout {
             depth,
             kv_bytes_per_token: 1,
+            tier_kv_bytes_per_token: 1,
             activation_bytes_per_token: 0,
         };
         let flow = PpFlow::new(

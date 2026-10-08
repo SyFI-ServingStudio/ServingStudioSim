@@ -680,6 +680,13 @@ pub enum IterWorkerSel {
         #[serde(default)]
         #[param(default = 0.0)]
         prefix_tier_max_read_wait_ms: f64,
+        /// With a tier: every stage reads the pipeline's mean KV bytes per
+        /// token, as if the stages held equal shares, instead of the most
+        /// loaded stage's. Sizes tier capacity the same way; HBM is unchanged.
+        /// A what-if, not vLLM: its layer split leaves the stages unequal.
+        #[serde(default)]
+        #[param(default = false)]
+        prefix_tier_balanced_load: bool,
         #[serde(default)]
         #[param(default = false)]
         external_decode: bool,
