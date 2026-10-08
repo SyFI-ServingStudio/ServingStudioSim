@@ -18,7 +18,7 @@
 //!   steps this is the batch size and sets the global split count.
 //! - `prefill_tokens`: query tokens of the other requests. It sets the bucketed
 //!   tile shape, the M-tile count and the ShearingBias rows. Up to 128 tokens
-//!   it is rounded up to its power-of-two bucket (at least 16): there the
+//!   it is rounded up to its power-of-two bucket (at least 32): there the
 //!   bucket, not the count, decides the q_stage, the cu-blocks launches, the
 //!   split rule and the M-tile count (one tile per 64 tokens), so a 40-token
 //!   chunk runs like a 64-token one, not like the mean of 32 and 64.
@@ -63,17 +63,28 @@ const CTA_OVERHEAD_TILES: f64 = 1.0;
 const SHARED_WORK_WEIGHT: f64 = 0.25;
 /// Decode-request counts on the grid. 80 sits just past the first CTA wave
 /// (2 KV heads x 74 requests fill 148 SMs; B200 local decode goes 20 -> 31 us
-/// from 64 to 128 requests). 2 and 4 are left out: the global split rule gives
-/// 1 and 2 requests the same 32 splits, and 1 -> 8 interpolates 4 within 2%
-/// in decode.
+/// from 64 to 128 requests). 2 and 4 are left out: 1 -> 8 interpolates them
+/// within 5% (B200 global decode at max_model_len 131072, 131072 keys: 2
+/// requests 78 us measured, 83 us interpolated).
 const DECODE_AXIS: [u32; 9] = [0, 1, 8, 16, 32, 64, 80, 128, 256];
 /// Prefill-token counts: 32 and 64 bracket the q_stage switch (packed rows >
 /// 128) and the cu-blocks launch (packed rows > 256); 2048 is the step budget.
-const PREFILL_AXIS: [u32; 9] = [0, 16, 32, 64, 128, 256, 512, 1024, 2048];
+/// No point below 32: up to 32 tokens (128 packed rows at GQA 4) a chunk is
+/// one M tile at q_stage 1 whatever its size (B200 global, 4175 keys: 28.6 us
+/// at 16 tokens, 28.2 us at 32).
+const PREFILL_AXIS: [u32; 8] = [0, 32, 64, 128, 256, 512, 1024, 2048];
 /// Contexts sit half a KV tile past a tile boundary (`128 k + 64`): a real
 /// context is rarely tile-aligned, and an aligned one reads one KV tile fewer
 /// (B200 local decode: 18.7 us at 1024 keys, 20.8 us at 6000).
 const CONTEXT_TILE_OFFSET: u32 = 64;
+/// Global contexts double from 512 keys up to this many, then grow by 4x.
+/// Up to here the split scheduler still raises the per-request split count
+/// with the context (one KV tile per split while a request has fewer tiles
+/// than splits); past it every CTA reads a fixed share of its request, so
+/// time is linear in the context (B200 at max_model_len 131072, 8256 to
+/// 131072 keys: 4x steps interpolate 1 to 256 decodes and 2048-token chunks
+/// within 10%).
+const CONTEXT_DOUBLING_END: u32 = 2048;
 const BISECTION_STEPS: usize = 48;
 
 #[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -148,7 +159,14 @@ fn group(config: &InklingRelAttentionKernelConfig) -> u32 {
     config.num_qo_heads.get() / config.num_kv_heads.get()
 }
 
-/// `inkling_fa4_num_splits` (fa4_rel_attention.py) on SM10x.
+/// `inkling_fa4_num_splits` (fa4_rel_attention.py) on SM10x: the static
+/// split cap, set by the batch size, the bucketed query and `max_model_len`.
+/// On device `FlashPrepareScheduler` lowers each request's count to
+/// `ceil(tiles / tiles_per_sm)`, `tiles_per_sm` being the batch's KV tiles
+/// times 1.157 x KV heads over 148 SMs, so a request never gets more splits
+/// than KV tiles and a lone decode stays near 64. The CTA model keeps the cap:
+/// the canonical rows carry the real count, and the cap only steers the
+/// context projection, where a lower count on short requests moves little.
 fn num_splits(config: &InklingRelAttentionKernelConfig, batch: u32, bucket: u32) -> u32 {
     if config.is_local {
         return 1;
@@ -362,9 +380,14 @@ fn context_axis(config: &InklingRelAttentionKernelConfig) -> Vec<f64> {
         let window = config.rel_extent;
         vec![1, window * 5 / 8, window + CONTEXT_TILE_OFFSET]
     } else {
-        // 1, then doubling from 512 keys, each half a tile past the boundary.
+        // 1, then 512, 1024, 2048, 8192, 32768, ... keys, each half a tile
+        // past the boundary.
+        let boundaries = std::iter::successors(Some(512_u32), |&keys| {
+            let step = if keys < CONTEXT_DOUBLING_END { 2 } else { 4 };
+            keys.checked_mul(step)
+        });
         std::iter::once(1)
-            .chain((0..).map(|k| (512_u32 << k) + CONTEXT_TILE_OFFSET))
+            .chain(boundaries.map(|keys| keys + CONTEXT_TILE_OFFSET))
             .take_while(|&context| context < config.max_model_len)
             .collect()
     };
@@ -374,11 +397,11 @@ fn context_axis(config: &InklingRelAttentionKernelConfig) -> Vec<f64> {
 }
 
 /// The cache's prefill coordinate: the bucket up to 128 tokens (see the
-/// module doc), the token count past it.
+/// module doc; at least the 32-token grid floor), the token count past it.
 fn prefill_coordinate(prefill: u32) -> u32 {
     match prefill {
         0 => 0,
-        1..=128 => bucket(prefill).max(16),
+        1..=128 => bucket(prefill).max(PREFILL_AXIS[1]),
         _ => prefill,
     }
 }
@@ -486,6 +509,15 @@ mod tests {
         // The captured ~2018-token mixed step with 30 decodes does not split.
         assert_eq!(num_splits(&global, 31, 2048), 1);
         assert_eq!(num_splits(&config(true), 1, 1), 1);
+        // At max_model_len 131072 a lone decode's cap rises to 128; two
+        // requests keep 128 // (2 B) = 32.
+        let long = InklingRelAttentionKernelConfig {
+            max_model_len: 131072,
+            ..config(false)
+        };
+        assert_eq!(num_splits(&long, 1, 1), 128);
+        assert_eq!(num_splits(&long, 2, 1), 32);
+        assert_eq!(num_splits(&long, 33, 2048), 1);
     }
 
     #[test]
@@ -500,7 +532,7 @@ mod tests {
                 (30, 2048, 1088),
                 (0, 512, 576),
                 (8, 64, 1),
-                (80, 16, 320),
+                (80, 32, 320),
             ] {
                 if is_local && context > context_top(&cfg) {
                     continue;
@@ -561,7 +593,7 @@ mod tests {
         let mut pairs = vec![(1, 2000); 20];
         pairs.push((40, 2040));
         assert_eq!(project(&cfg, &pairs)[1], 64.0);
-        assert_eq!(prefill_coordinate(3), 16);
+        assert_eq!(prefill_coordinate(3), 32);
         assert_eq!(prefill_coordinate(100), 128);
         assert_eq!(prefill_coordinate(300), 300);
     }
@@ -579,22 +611,55 @@ mod tests {
 
     #[test]
     fn grid_stays_under_the_coordinate_ceiling() {
-        for is_local in [false, true] {
-            let cfg = config(is_local);
-            let grid = InklingRelAttentionSpec::sweep_grid(&cfg);
-            let feasible = InklingRelAttentionSpec::infeasible_mask(&cfg, &grid)
-                .iter()
-                .filter(|&&masked| !masked)
-                .count();
-            assert!(feasible <= 500, "local={is_local}: {feasible} coordinates");
+        for max_model_len in [8192, 131072] {
+            for is_local in [false, true] {
+                let cfg = InklingRelAttentionKernelConfig {
+                    max_model_len,
+                    ..config(is_local)
+                };
+                let grid = InklingRelAttentionSpec::sweep_grid(&cfg);
+                let feasible = InklingRelAttentionSpec::infeasible_mask(&cfg, &grid)
+                    .iter()
+                    .filter(|&&masked| !masked)
+                    .count();
+                assert!(
+                    feasible <= 500,
+                    "local={is_local} max_model_len={max_model_len}: {feasible} coordinates"
+                );
+            }
         }
-        let local = InklingRelAttentionSpec::sweep_grid(&config(true));
-        assert_eq!(local.axes()[2], [1.0, 320.0, 576.0, 1088.0]);
-        let global = InklingRelAttentionSpec::sweep_grid(&config(false));
+    }
+
+    #[test]
+    fn context_axis_reaches_max_model_len() {
+        // Defect caught: a global axis that stops short of max_model_len
+        // (long requests extrapolate) or doubles all the way up (past the
+        // coordinate ceiling); and a local axis that grows with max_model_len
+        // though a local layer reads only its window.
+        let axis = |is_local: bool, max_model_len: u32| {
+            let cfg = InklingRelAttentionKernelConfig {
+                max_model_len,
+                ..config(is_local)
+            };
+            InklingRelAttentionSpec::sweep_grid(&cfg).axes()[2].clone()
+        };
+        assert_eq!(axis(true, 8192), [1.0, 320.0, 576.0, 1088.0]);
+        assert_eq!(axis(true, 131072), [1.0, 320.0, 576.0, 1088.0]);
+        assert_eq!(axis(false, 8192), [1.0, 576.0, 1088.0, 2112.0, 8192.0]);
         assert_eq!(
-            global.axes()[2],
-            [1.0, 576.0, 1088.0, 2112.0, 4160.0, 8192.0]
+            axis(false, 131072),
+            [1.0, 576.0, 1088.0, 2112.0, 8256.0, 32832.0, 131072.0]
         );
+        // A context past the window and the longest global request both
+        // project inside the axis.
+        let global = InklingRelAttentionKernelConfig {
+            max_model_len: 131072,
+            ..config(false)
+        };
+        let [_, _, c] = project(&global, &[(1, 131072)]);
+        assert!((c - 131072.0).abs() <= 1.0, "{c}");
+        let [_, _, c] = project(&global, &[(1, 45000), (2048, 130048)]);
+        assert!(c > 125_000.0 && c <= 131_072.0, "{c}");
     }
 
     #[test]
