@@ -13,6 +13,19 @@ dependencies = [
     "transformers>=5.13.0",
 ]
 
+# AMD alignment-capture plugin seam. The NVIDIA path bakes the
+# ``vllm_iteration(N): <phase>`` NVTX scopes into the instrumented vLLM fork's
+# own source (enabled by ``VLLM_NVTX_SCOPES_FOR_PROFILING``); there is no AMD
+# fork, so the identical roctx annotation is injected into *stock* ROCm vLLM
+# through its plugin system. vLLM loads and calls every ``vllm.general_plugins``
+# entry point in each worker process, so once this package is importable in the
+# serving venv, ``install_vllm_roctx_shim`` runs there automatically. It no-ops
+# unless ``VLLM_ROCTX_SCOPES_FOR_PROFILING=1`` (which ``rocprof_capture`` sets),
+# mirroring the NVTX env gate. The entry-point name is pinned in
+# ``alignment.profiler.roctx_shim.ROCTX_PLUGIN_ENTRY_POINT_NAME``.
+[project.entry-points."vllm.general_plugins"]
+vibesim_roctx_shim = "alignment.profiler.roctx_shim:install_vllm_roctx_shim"
+
 [tool.uv]
 package = false
 # This repo's normal Python working env includes tests/lint plus L1 profiling

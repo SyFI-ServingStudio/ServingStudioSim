@@ -220,6 +220,145 @@ def test_real_rocpd_shape_resolves_display_name_via_join(tmp_path):
     assert norm == pytest.approx([0.0112, 0.0112])
 
 
+def _write_full_rocpd(path, dispatches, regions=()):
+    """Write a rocpd db with the full dispatch columns + a roctx region table.
+
+    Mirrors the real rocprofv3 1.3.2 / ROCm 7.2 shape the offline alignment
+    producer reads: GUID-suffixed tables, a ``rocpd_kernel_dispatch`` carrying
+    ``pid/tid/agent_id/dispatch_id/queue_id/stream_id/start/end`` and a
+    ``kernel_id`` FK to ``rocpd_info_kernel_symbol`` (``display_name``), plus a
+    ``rocpd_region`` whose ``name_id`` interns the roctx text in ``rocpd_string``.
+
+    ``dispatches`` is ``(start, end, name, stream_id, dispatch_id, agent_id, pid, tid)``;
+    ``regions`` is ``(start, end, tid, pid, text)``.
+    """
+    guid = "0000b1c7_c35b_735b_96a7_f0a02ff013cc"
+    conn = sqlite3.connect(path)
+    conn.execute(f"CREATE TABLE rocpd_string_{guid} (id INTEGER PRIMARY KEY, string TEXT)")
+    conn.execute(
+        f"CREATE TABLE rocpd_info_kernel_symbol_{guid} "
+        "(id INTEGER PRIMARY KEY, kernel_name TEXT, display_name TEXT)"
+    )
+    conn.execute(
+        f"CREATE TABLE rocpd_kernel_dispatch_{guid} "
+        "(id INTEGER PRIMARY KEY, pid INTEGER, tid INTEGER, agent_id INTEGER, "
+        "kernel_id INTEGER, dispatch_id INTEGER, queue_id INTEGER, stream_id INTEGER, "
+        "start BIGINT, end BIGINT, region_name_id INTEGER)"
+    )
+    conn.execute(
+        f"CREATE TABLE rocpd_region_{guid} "
+        "(id INTEGER PRIMARY KEY, pid INTEGER, tid INTEGER, start BIGINT, end BIGINT, name_id INTEGER)"
+    )
+    strings = {}
+
+    def intern(text):
+        if text not in strings:
+            strings[text] = len(strings) + 1
+            conn.execute(
+                f"INSERT INTO rocpd_string_{guid} (id, string) VALUES (?, ?)",
+                (strings[text], text),
+            )
+        return strings[text]
+
+    symbols = {}
+    for start, end, name, *_ in dispatches:
+        if name not in symbols:
+            symbols[name] = len(symbols) + 1
+            conn.execute(
+                f"INSERT INTO rocpd_info_kernel_symbol_{guid} (id, kernel_name, display_name) "
+                "VALUES (?, ?, ?)",
+                (symbols[name], f"_mangled_{name}", name),
+            )
+    for i, (start, end, name, stream_id, dispatch_id, agent_id, pid, tid) in enumerate(
+        dispatches, start=1
+    ):
+        conn.execute(
+            f"INSERT INTO rocpd_kernel_dispatch_{guid} "
+            "(id, pid, tid, agent_id, kernel_id, dispatch_id, queue_id, stream_id, "
+            "start, end, region_name_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (i, pid, tid, agent_id, symbols[name], dispatch_id, 0, stream_id, start, end, 0),
+        )
+    for i, (start, end, tid, pid, text) in enumerate(regions, start=1):
+        conn.execute(
+            f"INSERT INTO rocpd_region_{guid} (id, pid, tid, start, end, name_id) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (i, pid, tid, start, end, intern(text)),
+        )
+    conn.commit()
+    conn.close()
+
+
+def test_dispatch_records_carry_full_fields(tmp_path):
+    # A full dispatch row must surface stream/correlation/device/pid, join the
+    # demangled display name, and come back in start order.
+    from profiling.profilers.rocprof_kernel_profiler import kernel_dispatch_records_from_rocpd
+
+    db = tmp_path / "full.db"
+    _write_full_rocpd(
+        db,
+        [
+            (1_000, 251_000, "rms_norm_kernel", 7, 101, 1, 2832324, 55),  # start 1000
+            (0, 500_000, "hipblaslt_gemm", 7, 100, 1, 2832324, 55),  # start 0 (earlier)
+        ],
+    )
+    records = kernel_dispatch_records_from_rocpd(str(db))
+    assert [r.start_ns for r in records] == [0, 1_000]  # start order
+    gemm, norm = records
+    assert gemm.name == "hipblaslt_gemm"
+    assert (gemm.stream_id, gemm.correlation_id, gemm.device_id, gemm.pid) == (7, 100, 1, 2832324)
+    assert gemm.duration_ns == 500_000
+    assert norm.correlation_id == 101  # rocpd dispatch_id used as correlation id
+
+
+def test_dispatch_records_synthesize_correlation_when_absent(tmp_path):
+    # A pure kernel trace with no dispatch_id/correlation column must still yield
+    # a monotonic, unique, non-null correlation id in start order.
+    from profiling.profilers.rocprof_kernel_profiler import kernel_dispatch_records_from_rocpd
+
+    db = tmp_path / "flat.db"
+    _write_flat_rocpd(db, [(0, 500_000, "kA"), (500_000, 750_000, "kB"), (1_000_000, 1_100_000, "kC")])
+    records = kernel_dispatch_records_from_rocpd(str(db))
+    assert [r.correlation_id for r in records] == [1, 2, 3]
+    assert len({r.correlation_id for r in records}) == 3
+
+
+def test_roctx_regions_loaded_with_text(tmp_path):
+    # The region loader must join name_id to the string table and return ranges
+    # in start order with their roctx text.
+    from profiling.profilers.rocprof_kernel_profiler import roctx_regions_from_rocpd
+
+    db = tmp_path / "regions.db"
+    _write_full_rocpd(
+        db,
+        [(0, 500_000, "rms_norm_kernel", 0, 1, 1, 42, 55)],
+        regions=[
+            (100, 400_000, 55, 42, "vllm_iteration(0): forward"),
+            (500_000, 900_000, 55, 42, "vllm_iteration(1): forward"),
+        ],
+    )
+    regions = roctx_regions_from_rocpd(str(db))
+    assert [r.name for r in regions] == [
+        "vllm_iteration(0): forward",
+        "vllm_iteration(1): forward",
+    ]
+    assert (regions[0].start_ns, regions[0].end_ns, regions[0].tid, regions[0].pid) == (
+        100,
+        400_000,
+        55,
+        42,
+    )
+
+
+def test_roctx_regions_empty_when_no_region_table(tmp_path):
+    # A kernel-only trace (the upstream vLLM capture) has no region table; the
+    # loader must report no markers rather than raise.
+    from profiling.profilers.rocprof_kernel_profiler import roctx_regions_from_rocpd
+
+    db = tmp_path / "joined.db"
+    _write_joined_rocpd(db, [(0, 500_000, "rms_norm_kernel")])
+    assert roctx_regions_from_rocpd(str(db)) == []
+
+
 def test_profile_kernel_without_sdk_raises():
     # On a CPU host rocprofiler-sdk is absent, so the in-process collector must
     # fail honestly rather than fabricate a time.
