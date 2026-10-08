@@ -18,6 +18,8 @@ pub use full_attn::FullAttnKv;
 pub use hybrid_gdn::HybridGdnKv;
 pub(crate) use shared::prefix_cache::PrefixCacheTokenConfig;
 pub use shared::prefix_cache::{PrefixCacheConfig, PrefixCacheMode, PrefixCachePolicy};
+pub use shared::prefix_tiers::PrefixTierSpec;
+pub(crate) use shared::prefix_tiers::{PrefixTierHit, PrefixTiers};
 
 /// KV-owned runtime facts for one request's prefill on one partition.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -190,6 +192,19 @@ pub trait PrefixKv: KvStore {
     );
     fn resolved_prefill_context(&self, request: RequestId) -> ResolvedPrefillContext;
     fn release_retaining_prefix(&mut self, request: RequestId, partition: PartitionId, now: Time);
+
+    /// Put `tokens` of `session_id`'s context into the retained tier, as a
+    /// read from a slower tier or a decode run elsewhere hands them back. It
+    /// replaces the session's entry and is clamped to the slack like any
+    /// retention.
+    fn restore_prefix(
+        &mut self,
+        request: RequestId,
+        partition: PartitionId,
+        session_id: u32,
+        tokens: u64,
+        now: Time,
+    );
 
     /// How much of `session_input`'s declared prefix is resident *right now*,
     /// wherever it lives. This is what a cache-aware pending order ranks by;

@@ -611,6 +611,12 @@ pub struct WorkerConfig {
     /// Pipeline head only: shortest remaining prefill first across started and
     /// queued prompts.
     pub srpt: bool,
+    /// Pipeline head only: the DRAM and SSD tiers behind the HBM prefix
+    /// cache, fastest first (`None`: no such tier).
+    pub prefix_tiers: [Option<crate::worker::kv::PrefixTierSpec>; 2],
+    /// Pipeline head only: decode runs elsewhere; requests complete at their
+    /// first token and retain their whole target context.
+    pub external_decode: bool,
     /// Candidate positions the drafter proposes per request per iteration (from
     /// the worker selector). The verify width is one more than this. Only the
     /// speculative recipe reads it, and it must match the width the model was
@@ -648,6 +654,8 @@ impl Default for WorkerConfig {
             long_prefill_token_threshold: None,
             load_budget: None,
             srpt: false,
+            prefix_tiers: [None, None],
+            external_decode: false,
             speculative_draft_tokens: 0,
             speculative_acceptance_seed: None,
             dp_placement: crate::worker::config::DpPlacement::RoundRobin,

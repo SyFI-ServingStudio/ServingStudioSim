@@ -77,6 +77,9 @@ where
     rr_next: usize,
     /// Each admitted request's replica and prompt tokens, until it completes.
     assigned: HashMap<RequestId, (usize, u64)>,
+    /// Each session's replica: a session's later rounds follow its first, to
+    /// the pipeline holding its context.
+    session_replica: HashMap<u32, usize>,
     head_events: Vec<PipelineHeadEvent>,
     stage_events: Vec<PipelineStageEvent>,
 }
@@ -117,14 +120,26 @@ where
             placement: cfg.placement,
             rr_next: 0,
             assigned: HashMap::new(),
+            session_replica: HashMap::new(),
             head_events: Vec::new(),
             stage_events: Vec::new(),
         }
     }
 
-    /// Place `request`, whose prompt has `prompt_tokens` tokens to prefill.
-    pub fn admit(&mut self, request: RequestId, prompt_tokens: u64) {
-        let replica = match self.placement {
+    /// Place `request`, whose prompt has `prompt_tokens` tokens to prefill. A
+    /// session's later rounds go where its first went.
+    pub fn admit(&mut self, request: RequestId, prompt_tokens: u64, session: Option<u32>) {
+        let sticky = session.and_then(|session| self.session_replica.get(&session).copied());
+        let replica = sticky.unwrap_or_else(|| self.place(prompt_tokens));
+        if let Some(session) = session {
+            self.session_replica.insert(session, replica);
+        }
+        self.assigned.insert(request, (replica, prompt_tokens));
+        self.route_to_head(replica, PipelineHeadMsg::Request(request));
+    }
+
+    fn place(&mut self, prompt_tokens: u64) -> usize {
+        match self.placement {
             PpPlacement::LeastQueued => self.least_queued_replica(),
             PpPlacement::RoundRobin => {
                 let replica = self.rr_next;
@@ -143,9 +158,7 @@ where
                     .map(|(replica, _)| replica)
                     .expect("pp has at least one replica")
             }
-        };
-        self.assigned.insert(request, (replica, prompt_tokens));
-        self.route_to_head(replica, PipelineHeadMsg::Request(request));
+        }
     }
 
     fn least_queued_replica(&self) -> usize {
@@ -331,8 +344,9 @@ where
     fn on_arrival(&mut self, req: Request) {
         let id = req.core.id;
         let prompt_tokens = u64::from(req.definition.prompt_tokens);
+        let session = req.definition.session.session_id();
         self.requests.borrow_mut().insert(req);
-        self.stage_pool.admit(id, prompt_tokens);
+        self.stage_pool.admit(id, prompt_tokens, session);
     }
 
     fn tick(&mut self, now: Time) -> Vec<OrchAction> {

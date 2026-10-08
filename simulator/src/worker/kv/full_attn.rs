@@ -426,6 +426,25 @@ impl PrefixKv for FullAttnKv {
             .expect("resolved prefill context must exist for an admitted fresh request")
     }
 
+    fn restore_prefix(
+        &mut self,
+        request: RequestId,
+        partition: PartitionId,
+        session_id: u32,
+        tokens: u64,
+        now: Time,
+    ) {
+        self.retain_prefix(
+            request,
+            partition,
+            session_id,
+            tokens,
+            None,
+            now,
+            PrefixCacheRetentionReason::Restore,
+        );
+    }
+
     fn release_retaining_prefix(&mut self, request: RequestId, partition: PartitionId, now: Time) {
         FullAttnKv::release_retaining_prefix(self, request, partition, now);
     }
