@@ -7,20 +7,24 @@ ground truth comes from the public profiling CLI with `--fresh` (measured,
 never written to a DB), and this file only places physical probes and compares.
 
 Probes, for the Inkling-Small TP4 config (8 q / 2 KV heads, local 512-window
-and global layers, max_model_len 8192):
+and global layers) at `--max-model-len` (default 8192):
 
 - `decode_uniform`: off-grid batch sizes and contexts, every request alike;
 - `decode_ragged`: contexts spread over a range, as a serving step has them;
 - `mixed`: one prefill chunk (off-grid length and prefix) beside decodes;
 - `two_chunks`: two prefill chunks in one step;
 - `extrapolate`: past the grid (more decodes, a longer chunk);
+- past 8192 the set is the long-context one instead (`long_context_probes`):
+  `long_decode_uniform` at off-grid contexts, `long_decode_ragged`,
+  `long_mixed` (a chunk at a long prefix beside ragged decodes) and
+  `long_chunk` (a chunk alone at a long prefix);
 - optionally `--capture-probes FILE`: exact batches taken from a vLLM capture
   (a JSON list of `{"label", "pairs", ...}`), labelled `capture_<label>`.
 
 Two stages, run from the repo root under uv:
 
     uv run python tools/cache-fidelity-analyzer/inkling_rel_attention_fidelity.py \
-        probes --out-dir DIR [--capture-probes FILE]
+        probes --out-dir DIR [--max-model-len N] [--capture-probes FILE]
     uv run python -m profiling run inkling_rel_attention --backend tml_fa4 \
         --specs DIR/probe_specs.json --fresh --output-dir OUT --json > DIR/truth.json
     uv run python tools/cache-fidelity-analyzer/inkling_rel_attention_fidelity.py \
@@ -44,8 +48,6 @@ import cache_fidelity as cf  # the generic core (sibling file)
 KIND = "inkling_rel_attention"
 BACKEND = "tml_fa4"
 GPU = "NVIDIA B200"
-MAX_MODEL_LEN = 8192
-
 _DIMS = {
     "num_qo_heads": 8,
     "num_kv_heads": 2,
@@ -54,16 +56,16 @@ _DIMS = {
     "kv_layout": "lbnhc",
     "q_dtype": "bf16",
     "kv_dtype": "bf16",
-    "max_model_len": MAX_MODEL_LEN,
 }
 
 
-def config(is_local: bool) -> dict:
+def config(is_local: bool, max_model_len: int) -> dict:
     return {
         "backends": [BACKEND],
         "gpu_name": GPU,
         "is_local": is_local,
         "rel_extent": 512 if is_local else 1024,
+        "max_model_len": max_model_len,
         **_DIMS,
     }
 
@@ -107,17 +109,63 @@ def synthetic_probes() -> list[tuple[list[list[int]], str]]:
     return p
 
 
-def stage_probes(out: Path, capture: Path | None) -> None:
+def _log_spread(count: int, lo: int, hi: int) -> list[list[int]]:
+    """Decode contexts spread geometrically over [lo, hi], as a long-context
+    serving step holds many short requests and a few long ones."""
+    if count == 1:
+        return [[1, hi]]
+    return [[1, round(lo * (hi / lo) ** (i / (count - 1)))] for i in range(count)]
+
+
+def long_context_probes(max_model_len: int) -> list[tuple[list[list[int]], str]]:
+    """Probes between the long-context grid points (8256, 32832, max_model_len)."""
+    p: list[tuple[list[list[int]], str]] = []
+    for context in (20000, 45000, 90000, 120000):
+        for batch in (1, 4, 32, 100):
+            p.append(([[1, context]] * batch, "long_decode_uniform"))
+    for batch in (8, 32, 64):
+        p.append((_log_spread(batch, 300, max_model_len - 1000), "long_decode_ragged"))
+    for chunk, prefix, decodes in [
+        (2016, 20000, 32),
+        (2016, 64000, 32),
+        (2016, 100000, 32),
+        (2016, 128000, 32),
+        (512, 100000, 8),
+        (128, 60000, 16),
+    ]:
+        pairs = _log_spread(decodes, 300, max_model_len - 1000)
+        pairs.append([chunk, prefix + chunk])
+        p.append((pairs, "long_mixed"))
+    for chunk, prefix in [(2048, 45000), (2048, 90000), (1000, 120000)]:
+        p.append(([[chunk, prefix + chunk]], "long_chunk"))
+    return p
+
+
+def stage_probes(out: Path, capture: Path | None, max_model_len: int) -> None:
     out.mkdir(parents=True, exist_ok=True)
-    generated = synthetic_probes()
+    if max_model_len > 8192:
+        generated = long_context_probes(max_model_len)
+    else:
+        generated = synthetic_probes()
     if capture is not None:
         for entry in json.loads(capture.read_text()):
             generated.append((entry["pairs"], f"capture_{entry['label']}"))
     probes, specs = [], []
     for is_local in (True, False):
-        dims = {k: v for k, v in config(is_local).items() if k not in cf._NON_DIM_KEYS}
+        dims = {
+            k: v
+            for k, v in config(is_local, max_model_len).items()
+            if k not in cf._NON_DIM_KEYS
+        }
         for pairs, region in generated:
-            probes.append({"is_local": is_local, "region": region, "pairs": pairs})
+            probes.append(
+                {
+                    "is_local": is_local,
+                    "max_model_len": max_model_len,
+                    "region": region,
+                    "pairs": pairs,
+                }
+            )
             specs.append({**dims, "query_context_pairs": pairs})
     (out / "probes.json").write_text(json.dumps(probes))
     (out / "probe_specs.json").write_text(json.dumps(specs))
@@ -152,8 +200,11 @@ def stage_report(out: Path, truth_path: Path, sim_bin: str) -> None:
     rows = []
     for is_local in (True, False):
         idx = [i for i, p in enumerate(probes) if p["is_local"] == is_local]
+        if not idx:
+            continue
+        max_model_len = probes[idx[0]].get("max_model_len", 8192)
         points = [{"query_context_pairs": probes[i]["pairs"]} for i in idx]
-        results = cf.eval_kind(sim_bin, KIND, config(is_local), points)
+        results = cf.eval_kind(sim_bin, KIND, config(is_local, max_model_len), points)
         for i, r in zip(idx, results):
             t = truth[i]
             tms = t.get("metrics", {}).get("time_ms") if t.get("status") == "ok" else None
@@ -200,10 +251,11 @@ def main() -> None:
     ap.add_argument("--out-dir", type=Path, required=True)
     ap.add_argument("--truth", type=Path)
     ap.add_argument("--capture-probes", type=Path)
+    ap.add_argument("--max-model-len", type=int, default=8192)
     ap.add_argument("--sim-bin", default="target/release/simulator")
     args = ap.parse_args()
     if args.stage == "probes":
-        stage_probes(args.out_dir, args.capture_probes)
+        stage_probes(args.out_dir, args.capture_probes, args.max_model_len)
     else:
         stage_report(args.out_dir, args.truth, args.sim_bin)
 
