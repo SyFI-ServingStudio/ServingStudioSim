@@ -16,9 +16,9 @@ use crate::worker::workers::iter_build_essentials::{
     full_attention_token_capacity, prepare_iter_build_essentials,
 };
 
-use super::head_prefix_tiers::HeadPrefixTiers;
 use super::pipeline_head_worker::{PipelineHeadWorker, PipelineLayout};
 use super::{HybridPipelineHead, PipelineHead};
+use crate::worker::workers::session_prefix_tiers::SessionPrefixTiers;
 
 /// `stage_model` is stage 0's layers. KV capacity comes from `layout`, not the
 /// stage model: every stage holds the same tokens, so the stage with the most KV
@@ -299,23 +299,23 @@ fn head_prefix_tiers(
     hit_quantum: u32,
     log_dir: Option<&std::path::Path>,
     id: WorkerId,
-) -> Option<HeadPrefixTiers> {
+) -> Option<SessionPrefixTiers> {
     let specs: Vec<_> = config.prefix_tiers.iter().flatten().copied().collect();
     (!specs.is_empty()).then(|| {
-        HeadPrefixTiers::new(
+        SessionPrefixTiers::new(
             &specs,
             layout.kv_bytes_per_token,
             state_tokens,
             hit_quantum,
             log_dir,
-            id,
+            &format!("w{}", id.0),
         )
     })
 }
 
 fn with_head_options<K, A, E>(
     head: PipelineHeadWorker<K, A, E>,
-    prefix_tiers: Option<HeadPrefixTiers>,
+    prefix_tiers: Option<SessionPrefixTiers>,
     external_decode: bool,
 ) -> PipelineHeadWorker<K, A, E>
 where

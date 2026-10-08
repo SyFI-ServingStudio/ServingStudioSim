@@ -344,6 +344,13 @@ round computes) as if a decode instance handed it back. The trace carries the
 decode time in its tool waits (`trace/session_decode_wait.py`). The `pp` flow
 keeps each session on the replica its first round went to.
 
+The hybrid `chunked_prefill` worker (DP attention included) takes the same
+`dram_tier_gb` / `ssd_tier_gb` / `external_decode` knobs. `SessionTierWorker`
+(`workers/iter/session_tier_worker.rs`) wraps the shell with one tier set per
+attention DP rank, and the admission keeps a session on the rank it last ran on
+(`ChunkedPrefillAdmission::with_sticky_sessions`). There `plain` alignment also
+means exact prefix reuse.
+
 `PipelineStageWorker` has no KV/admission axes. It runs microbatches FIFO,
 double-buffering one activation pull against one compute, at exact times derived
 from the previous stage's `ready_at`. It stamps no request stage, so requests stay

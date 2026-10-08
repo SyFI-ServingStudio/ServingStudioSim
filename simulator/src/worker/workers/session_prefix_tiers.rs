@@ -1,19 +1,21 @@
-//! A pipeline head's DRAM/SSD prefix tiers and their per-request log.
+//! One HBM cache's DRAM/SSD prefix tiers and their per-request log: a pipeline
+//! head's, or one DP rank's.
 //!
-//! The head looks a session up here when its request arrives: a context that
+//! The worker looks a session up here when its request arrives: a context that
 //! HBM no longer holds but a slower tier does is read back first, and the
 //! request queues once the read lands. Every finished context is written
-//! through. `prefix_tiers_w<id>.csv` records, per session request, where its
-//! declared prefix was found; `prefix_tiers_w<id>.json` the tiers' totals.
+//! through. `prefix_tiers_<tag>.csv` records, per session request, where its
+//! declared prefix was found; `prefix_tiers_<tag>.json` the tiers' totals. The
+//! tag is `w<worker>`, or `w<worker>_p<rank>` for a DP rank.
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-use crate::common::{RequestId, Time, WorkerId};
+use crate::common::{RequestId, Time};
 use crate::worker::kv::{PrefixTierHit, PrefixTierSpec, PrefixTiers};
 
-pub(crate) struct HeadPrefixTiers {
+pub(crate) struct SessionPrefixTiers {
     tiers: PrefixTiers,
     /// HBM resumes a session only at multiples of this (a hybrid model's
     /// state block; 1 for full attention), so a tier hit counts in it too.
@@ -29,18 +31,18 @@ pub(crate) struct HeadPrefixTiers {
     tier_requests: Vec<u64>,
 }
 
-impl HeadPrefixTiers {
+impl SessionPrefixTiers {
     pub(crate) fn new(
         specs: &[PrefixTierSpec],
         kv_bytes_per_token: u64,
         state_tokens: u64,
         hit_quantum: u32,
         log_dir: Option<&Path>,
-        worker: WorkerId,
+        tag: &str,
     ) -> Self {
         let rows = log_dir.map(|dir| {
             let mut file = BufWriter::new(
-                File::create(dir.join(format!("prefix_tiers_w{}.csv", worker.0)))
+                File::create(dir.join(format!("prefix_tiers_{tag}.csv")))
                     .expect("create the prefix tier log"),
             );
             writeln!(
@@ -54,7 +56,7 @@ impl HeadPrefixTiers {
             tiers: PrefixTiers::new(specs, kv_bytes_per_token, state_tokens),
             hit_quantum: hit_quantum.max(1),
             rows,
-            summary_path: log_dir.map(|dir| dir.join(format!("prefix_tiers_w{}.json", worker.0))),
+            summary_path: log_dir.map(|dir| dir.join(format!("prefix_tiers_{tag}.json"))),
             requests: 0,
             declared_tokens: 0,
             hbm_tokens: 0,
@@ -122,7 +124,7 @@ impl HeadPrefixTiers {
     }
 }
 
-impl Drop for HeadPrefixTiers {
+impl Drop for SessionPrefixTiers {
     fn drop(&mut self) {
         if let Some(rows) = &mut self.rows {
             let _ = rows.flush();

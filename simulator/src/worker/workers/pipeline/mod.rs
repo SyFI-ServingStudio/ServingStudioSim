@@ -3,7 +3,6 @@
 
 mod build_pipeline_head_worker;
 mod build_pipeline_stage_worker;
-mod head_prefix_tiers;
 mod pipeline_head_worker;
 mod pipeline_stage_worker;
 

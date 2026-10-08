@@ -65,6 +65,10 @@ pub struct ChunkedPrefillAdmission<P: PendingOrderPolicy, D = SingleTokenDecodeC
     /// (see `SpeculativeUnifiedModel::drafting_slots_per_request`). Zero for
     /// ordinary decode and sequential drafters.
     drafting_slots: u32,
+    /// Sticky sessions: the partition each session last ran on, used when HBM
+    /// no longer holds its prefix (its slower-tier copy lives there). `None`
+    /// places such a request by the balance policy.
+    session_partitions: Option<HashMap<u32, usize>>,
 }
 
 impl<P: PendingOrderPolicy> ChunkedPrefillAdmission<P, SingleTokenDecodeCompletion> {
@@ -134,7 +138,23 @@ impl<P: PendingOrderPolicy, D> ChunkedPrefillAdmission<P, D> {
             next_admission: 0,
             decode_completion,
             drafting_slots,
+            session_partitions: None,
         }
+    }
+
+    /// Keep each session on the partition of its last request, as a router
+    /// that knows where the session's DRAM/SSD copy lives would.
+    pub(crate) fn with_sticky_sessions(mut self) -> Self {
+        self.session_partitions = Some(HashMap::new());
+        self
+    }
+
+    /// The partition `session_id` last ran on, when sessions are sticky.
+    pub(crate) fn session_partition(&self, session_id: u32) -> Option<u16> {
+        self.session_partitions
+            .as_ref()?
+            .get(&session_id)
+            .map(|&partition| partition as u16)
     }
 
     /// End every non-final chunk on a multiple of `quantum` context tokens.
@@ -157,8 +177,24 @@ impl<P: PendingOrderPolicy, D> ChunkedPrefillAdmission<P, D> {
         kv_store: &K,
         session_input: SessionInput,
     ) -> usize {
+        let partition = self.place(kv_store, session_input);
+        if let (Some(sessions), Some(session_id)) =
+            (&mut self.session_partitions, session_input.session_id())
+        {
+            sessions.insert(session_id, partition);
+        }
+        partition
+    }
+
+    fn place<K: ChunkedPrefillKv>(&mut self, kv_store: &K, session_input: SessionInput) -> usize {
         if let Some(partition) = kv_store.retained_prefix_partition(session_input) {
             return usize::from(partition);
+        }
+        if let Some(&partition) = session_input
+            .session_id()
+            .and_then(|session_id| self.session_partitions.as_ref()?.get(&session_id))
+        {
+            return partition;
         }
         if !self.balance.needs_load() {
             return self.balance.choose(self.partition_policies.len());
