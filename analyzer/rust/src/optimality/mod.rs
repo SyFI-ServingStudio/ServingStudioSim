@@ -206,6 +206,8 @@ pub(crate) fn ratio(num: f64, den: f64) -> f64 {
 #[cfg(test)]
 mod glm53_tests;
 #[cfg(test)]
+mod inkling_tests;
+#[cfg(test)]
 mod speculative_tests;
 
 #[cfg(test)]

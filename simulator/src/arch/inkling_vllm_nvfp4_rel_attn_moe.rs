@@ -919,6 +919,13 @@ impl IterwiseUnifiedModel for InklingVllmModel {
         self.tp_size
     }
 
+    /// Sliding-window attention, relative logits and the short-conv states make
+    /// necessary work per-request in context (`min(context, window)`), which a
+    /// decode KV total cannot recover.
+    fn logs_decode_kv_lens(&self) -> bool {
+        true
+    }
+
     fn cost_log_manifest(&self) -> CostManifest {
         self.cost_tree().manifest()
     }
@@ -1173,6 +1180,34 @@ mod tests {
             .slots
             .iter()
             .any(|slot| slot.name == "unified.global_nvfp4_moe.moe.gate_select"));
+    }
+
+    #[test]
+    fn necessary_work_map_covers_the_compiled_locations() {
+        use std::collections::BTreeSet;
+        let model = built();
+        assert!(model.logs_decode_kv_lens());
+        // Communication leaves never appear in a map (`analyzer` optimality).
+        let actual: BTreeSet<String> = model
+            .cost_log_manifest()
+            .slots
+            .into_iter()
+            .filter(|slot| slot.kind != "all_reduce")
+            .map(|slot| slot.name)
+            .collect();
+        let map: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../model/work/location_maps/inkling_vllm_nvfp4_tp4_ep4_unified.json"
+        ))
+        .unwrap();
+        assert_eq!(map["arch_types"][0], ARCH_KIND);
+        let mapped: BTreeSet<String> = map["locations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["location"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(actual.len(), 69);
+        assert_eq!(actual, mapped);
     }
 
     #[test]
