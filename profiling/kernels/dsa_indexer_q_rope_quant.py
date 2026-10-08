@@ -59,8 +59,8 @@ DOC = KernelDoc(
         "included."
     ),
     caveats=(
-        "Only 128-element heads with 64 RoPE elements first and no Hadamard "
-        "transform are measured, on B200.",
+        "The runner takes only 128-element heads with 64 RoPE elements first "
+        "and no Hadamard transform.",
         "GB/s counts logical input and output bytes, including the FP8 queries "
         "and FP32 weights, not physical memory transactions.",
     ),
@@ -73,9 +73,10 @@ register(
     KernelProfilerSpec(
         kernel_kind=KIND,
         backend="sglang_cuda",
+        # No capability rule: SGLang JIT-builds main_norm_rope.cuh for the current
+        # device, with PDL opted in only where the arch supports it.
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
-            gpus=frozenset({"NVIDIA B200"}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.attention.dsa_indexer_q_rope_quant",

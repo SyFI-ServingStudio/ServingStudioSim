@@ -477,7 +477,7 @@ pub struct AttnArchInput {
 /// each arch owns the shape its cost actually reads. `deny_unknown_fields` keeps a
 /// predicted ffn case from carrying stray attention vocabulary it would silently
 /// drop.
-#[derive(Clone, Debug, Default, serde::Deserialize)]
+#[derive(Clone, Debug, Default, serde::Deserialize, schema_derive::ParamStruct)]
 #[serde(deny_unknown_fields)]
 pub struct FfnArchInput {
     /// Tokens processed by each attention DP shard this forward pass (length =

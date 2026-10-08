@@ -11,6 +11,13 @@ from ..core import MatmulGroup
 class DenseSwiGLU:
     hidden: int
     intermediate: int
+    #: Checkpoint path prefix for a block that lives outside the body's layers
+    #: (a separate draft checkpoint), so a quantized target's rules cannot
+    #: match it.
+    module_prefix: str = ""
+
+    def _module(self, path: str) -> str:
+        return f"{self.module_prefix}.{path}" if self.module_prefix else path
 
     def matmul_groups(self) -> list[MatmulGroup]:
         return [
@@ -19,13 +26,13 @@ class DenseSwiGLU:
                 n=2 * self.intermediate,
                 k=self.hidden,
                 bucket="dense_ffn",
-                module="mlp.gate_up_proj",
+                module=self._module("mlp.gate_up_proj"),
             ),
             MatmulGroup(
                 "down",
                 n=self.hidden,
                 k=self.intermediate,
                 bucket="dense_ffn",
-                module="mlp.down_proj",
+                module=self._module("mlp.down_proj"),
             ),
         ]

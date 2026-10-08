@@ -51,10 +51,12 @@ client output when deriving per-request acceptance rates.
 
 ### One maintained fork line
 
-`servingstudio-alignment` is the only maintained line, on upstream vLLM
-v0.28.1rc0 (`8369aff`). Its `ALIGNMENT.md` records the base, what the line adds
-(instrumentation, MTP drafter route capture under model runner V2, record-only
-EPLB), and how each commit of the retired `moesim-profile` line was carried.
+`servingstudio-alignment` is the only maintained line, on upstream vLLM main
+`04730e8` (2026-09-24, the newest main with a `cu130` wheel that serves
+DeepSeek-V4.1; previously v0.28.1rc0 `8369aff`). Its `ALIGNMENT.md` records the
+base, what the line adds (instrumentation, MTP drafter route capture under model
+runner V2, record-only EPLB), and how each commit of the retired
+`moesim-profile` line was carried.
 `moesim-profile` stays on the remote because recorded captures name it. Every
 capture's `<name>_launch.json` records the fork's `head`, `branch`, and
 `status_short` under `fork_git`.

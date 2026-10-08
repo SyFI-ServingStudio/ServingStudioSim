@@ -1,5 +1,5 @@
-"""profile.db's compact v3 storage: args keys, provenance runs, identity blobs,
-and the lossless upgrade from v2."""
+"""profile.db's compact v3 storage: args keys, provenance runs, the lossless
+upgrade from v2, and the tables an older checkout wrote that migration drops."""
 
 from __future__ import annotations
 
@@ -12,7 +12,6 @@ from typing import get_type_hints
 
 import pytest
 
-from profiling.db import kernel_config as kc
 from profiling.db import storage
 from profiling.db.args import DType
 from profiling.db.merge import merge_profile_databases
@@ -22,9 +21,6 @@ from profiling.db.table import ProfileRow, Table, _sqlite_type, _to_db_value
 from profiling.runners.metrics import ComputeMetrics
 
 GPU = "NVIDIA H200"
-SOURCE = {"timing_predict": "presets/predict_x.json", "gpu": GPU, "arch": {"type": "x"}}
-# Long enough that its JSON reaches storage.BLOB_MIN_BYTES.
-POPULARITY = [[3907 + i % 7 for i in range(256)] for _ in range(2)]
 
 
 def _spec(kind: str) -> KernelProfilerSpec:
@@ -109,7 +105,6 @@ def _v2_db(path: Path) -> None:
     finalize, moe = _spec("moe_finalize_fuse_shared"), _spec("bf16_fused_moe")
     prov_a = ("abc", "2026-09-01T00:00:00+00:00", "12.9", "580.1", None)
     prov_b = ("def-dirty", "2026-09-02T00:00:07+00:00", None, "580.1", "0.5.1")
-    identity = {"hidden": 3072, "expert_demand": {"popularity": {"ppm": POPULARITY}}}
     with closing(sqlite3.connect(path)) as conn, conn:
         conn.execute("CREATE TABLE _db_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
         conn.execute("INSERT INTO _db_metadata VALUES ('schema_version', '2')")
@@ -118,79 +113,24 @@ def _v2_db(path: Path) -> None:
         _v2_insert(conn, finalize, _finalize_args(1, True), prov_a, 1)
         _v2_insert(conn, finalize, _finalize_args(1, False), prov_b, 2)
         _v2_insert(conn, moe, _moe_args(2), prov_a, 3)
-        conn.execute(
-            """
-            CREATE TABLE _kernel_config (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                kind TEXT NOT NULL, config_hash TEXT NOT NULL, gpu_name TEXT NOT NULL,
-                profile_kind TEXT NOT NULL, identity TEXT NOT NULL, cache_coords TEXT NOT NULL,
-                grid_axes TEXT NOT NULL, cells BLOB NOT NULL, infeasible TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(kind, config_hash, gpu_name))
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE _kernel_config_source (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                source_hash TEXT NOT NULL, source TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, UNIQUE(source_hash))
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE _kernel_config_use (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                kind TEXT NOT NULL, config_hash TEXT NOT NULL, gpu_name TEXT NOT NULL,
-                source_hash TEXT NOT NULL, pool TEXT NOT NULL, role TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(kind, config_hash, gpu_name, source_hash, pool, role))
-            """
-        )
-        config_hash = kc.content_hash(identity)
-        cells = kc._encode_cells([_cell(_moe_args(2))])
-        conn.execute(
-            "INSERT INTO _kernel_config (kind, config_hash, gpu_name, profile_kind, identity, "
-            "cache_coords, grid_axes, cells, infeasible, created_at) VALUES "
-            "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                "bf16_fused_moe",
-                config_hash,
-                GPU,
-                "bf16_fused_moe",
-                kc.canonical_json(identity),
-                '["num_tokens"]',
-                "[[2.0]]",
-                cells,
-                "[]",
-                "2026-09-03 04:05:06",
-            ),
-        )
-        source_hash = kc.content_hash(SOURCE)
-        conn.execute(
-            "INSERT INTO _kernel_config_source (source_hash, source, created_at) VALUES (?, ?, ?)",
-            (source_hash, kc.canonical_json(SOURCE), "2026-09-03 04:05:06"),
-        )
-        for role in ("unified.moe.experts", "unified.moe.shared"):
-            conn.execute(
-                "INSERT INTO _kernel_config_use (kind, config_hash, gpu_name, source_hash, pool, "
-                "role, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (
-                    "bf16_fused_moe",
-                    config_hash,
-                    GPU,
-                    source_hash,
-                    "main",
-                    role,
-                    "2026-09-03 04:05:06",
-                ),
-            )
+        _retired_registry(conn)
 
 
-def _cell(args) -> dict:
-    """A grid cell as the simulator writes it: args in JSON form, no backend."""
-    out = {}
-    for f in fields(args):
-        value = getattr(args, f.name)
-        out[f.name] = list(value) if isinstance(value, tuple) else _to_db_value(value)
-    return out
+def _retired_registry(conn: sqlite3.Connection) -> None:
+    """The kernel-config registry tables an older checkout wrote, with a row each."""
+    for table in (
+        "_kernel_config",
+        "_kernel_config_source",
+        "_kernel_config_role",
+        "_kernel_config_use",
+        "_kernel_config_blob",
+    ):
+        conn.execute(f"CREATE TABLE {table} (id INTEGER PRIMARY KEY, body TEXT NOT NULL)")
+        conn.execute(f"INSERT INTO {table} (body) VALUES ('x')")
+
+
+def _tables(conn: sqlite3.Connection) -> set[str]:
+    return {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
 
 
 def _rows(conn: sqlite3.Connection, table: str, sql: str) -> list[dict]:
@@ -219,6 +159,7 @@ def test_upgrade_keeps_every_row_as_v2_stored_it(tmp_path: Path) -> None:
         assert conn.execute(f"SELECT COUNT(*) FROM {storage.RUN_TABLE}").fetchone()[0] == 2
         version = conn.execute("SELECT value FROM _db_metadata WHERE key = 'schema_version'")
         assert version.fetchone()[0] == str(SCHEMA_VERSION)
+        assert not any(name.startswith("_kernel_config") for name in _tables(conn))
 
 
 def test_upgraded_rows_are_found_by_their_args(tmp_path: Path) -> None:
@@ -238,27 +179,6 @@ def test_upgraded_rows_are_found_by_their_args(tmp_path: Path) -> None:
     assert row["created_at"] == "2026-09-03 01:02:03"
     assert "args_hash" not in row and "run_key" not in row
     assert moe.exists([_moe_args(3)], gpu_name=GPU) == [False]
-
-
-def test_upgraded_registry_reads_as_registered(tmp_path: Path) -> None:
-    db = tmp_path / "profile.db"
-    _v2_db(db)
-    migrate(db)
-
-    with closing(sqlite3.connect(db)) as conn:
-        [config] = kc.registered_configs(conn, "bf16_fused_moe")
-        stored = conn.execute("SELECT identity FROM _kernel_config").fetchone()[0]
-        blobs = conn.execute(f"SELECT COUNT(*) FROM {storage.BLOB_TABLE}").fetchone()[0]
-        [ids] = kc.cell_row_ids(conn, moe_table(db), GPU, config.grid.cells)
-    assert config.identity["expert_demand"]["popularity"]["ppm"] == POPULARITY
-    assert kc.content_hash(config.identity) == config.config_hash
-    assert storage.BLOB_REF in stored and blobs == 1
-    assert [use.role for use in config.uses] == ["unified.moe.experts", "unified.moe.shared"]
-    assert ids == [1]  # the bf16_fused_moe table's one row
-
-
-def moe_table(db: Path) -> Table:
-    return Table(_spec("bf16_fused_moe"), db)
 
 
 def test_readers_refuse_a_db_an_older_checkout_wrote(tmp_path: Path) -> None:
@@ -283,44 +203,6 @@ def test_args_hash_refuses_a_value_sqlite_would_reformat() -> None:
         storage.args_hash({"a": 0.5}, {"a": "TEXT"})
 
 
-def _record(identity: dict, role: str) -> dict:
-    return {
-        "kind": "single_gemm",
-        "profile_kind": "single_gemm",
-        "gpu_name": GPU,
-        "identity": identity,
-        "grid": {
-            "cache_coords": ["m"],
-            "axes": [[1.0]],
-            "cells": [{"m": 1, "n": 6144, "k": 4096, "dtype": "bf16"}],
-            "infeasible": [],
-        },
-        "uses": [{"pool": "main", "role": role}],
-    }
-
-
-def _register(db: Path, *records: dict) -> None:
-    document = {"schema_version": kc.RECORDS_SCHEMA_VERSION, "configs": list(records)}
-    kc.register_kernel_configs(db, document, {"main": SOURCE})
-
-
-def test_configs_share_one_blob_and_a_stale_blob_is_pruned(tmp_path: Path) -> None:
-    db = tmp_path / "profile.db"
-    _register(
-        db,
-        _record({"n": 1, "ppm": POPULARITY}, "a"),
-        _record({"n": 2, "ppm": POPULARITY}, "b"),
-    )
-    with closing(sqlite3.connect(db)) as conn:
-        assert conn.execute(f"SELECT COUNT(*) FROM {storage.BLOB_TABLE}").fetchone()[0] == 1
-        conn.execute("DELETE FROM _kernel_config WHERE identity LIKE '%\"n\":1%'")
-        storage.prune_blobs(conn)
-        assert conn.execute(f"SELECT COUNT(*) FROM {storage.BLOB_TABLE}").fetchone()[0] == 1
-        conn.execute("DELETE FROM _kernel_config")
-        storage.prune_blobs(conn)
-        assert conn.execute(f"SELECT COUNT(*) FROM {storage.BLOB_TABLE}").fetchone()[0] == 0
-
-
 def _measure(db: Path, m: int) -> None:
     table = Table(_spec("single_gemm"), db)
     table.insert(
@@ -339,28 +221,42 @@ def _measure(db: Path, m: int) -> None:
     )
 
 
-def test_two_dbs_with_one_run_and_blob_merge_without_conflict(tmp_path: Path) -> None:
+def test_two_dbs_with_one_run_merge_without_conflict(tmp_path: Path) -> None:
     left, right = tmp_path / "left.db", tmp_path / "right.db"
     _measure(left, 1)
     _measure(right, 2)
-    _register(left, _record({"n": 1, "ppm": POPULARITY}, "a"))
-    _register(
-        right, _record({"n": 1, "ppm": POPULARITY}, "a"), _record({"n": 2, "ppm": POPULARITY}, "b")
-    )
 
     report = merge_profile_databases(left, right, tmp_path / "out.db")
 
     assert report.published and not report.conflicts
     with closing(sqlite3.connect(tmp_path / "out.db")) as conn:
         count = lambda t: conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]  # noqa: E731
-        assert (count("single_gemm"), count(storage.RUN_TABLE), count(storage.BLOB_TABLE)) == (
-            2,
-            1,
-            1,
-        )
-        configs = kc.registered_configs(conn, "single_gemm")
-    assert sorted(config.identity["n"] for config in configs) == [1, 2]
-    assert all(config.identity["ppm"] == POPULARITY for config in configs)
+        assert (count("single_gemm"), count(storage.RUN_TABLE)) == (2, 1)
+
+
+def test_migration_drops_the_registry_an_older_v3_checkout_wrote(tmp_path: Path) -> None:
+    left, right = tmp_path / "left.db", tmp_path / "right.db"
+    _measure(left, 1)
+    _measure(right, 2)
+    with closing(sqlite3.connect(right)) as conn, conn:
+        _retired_registry(conn)
+
+    with pytest.raises(ValueError, match="migrate-db"):
+        merge_profile_databases(left, right, tmp_path / "out.db")
+    assert not (tmp_path / "out.db").exists()
+
+    assert migrate(right) is True
+    assert migrate(right) is False
+
+    with closing(sqlite3.connect(right)) as conn:
+        assert not any(name.startswith("_kernel_config") for name in _tables(conn))
+    [row] = Table(_spec("single_gemm"), right).rows_for(
+        [_spec("single_gemm").args_schema(m=2, n=6144, k=4096, dtype=DType.BF16)],
+        backend="torch",
+        gpu_name=GPU,
+    )
+    assert row["time_ms"] == 0.02
+    assert merge_profile_databases(left, right, tmp_path / "out.db").published
 
 
 def test_a_conflict_report_names_the_runs_by_their_provenance(tmp_path: Path) -> None:

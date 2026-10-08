@@ -14,6 +14,7 @@ Per design §1.2.3 / §1.2.7:
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import shutil
 import sys
@@ -36,10 +37,34 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_PARALLELISM = 200
 _PROCESS_SUPERVISOR = ProcessSupervisor()
 _LAUNCHER_LEASES = LauncherLeases(REPO_ROOT)
+# A failed run's error (`simulator --error-json`), in its `raw/`.
+ERROR_JSON = "error.json"
 
 
 def binary_path(build_type: str = "debug") -> Path:
     return REPO_ROOT / "target" / build_type / "simulator"
+
+
+def _error_document(path: Path) -> dict:
+    """What the simulator's ``--error-json`` wrote to ``path``; empty when it
+    wrote nothing (it succeeded or panicked)."""
+    try:
+        return json.loads(path.read_text())
+    except FileNotFoundError:
+        return {}
+
+
+def binary_error(path: Path) -> str | None:
+    """The simulator's error as its ``--error-json`` wrote it to ``path``: the
+    cause chain on one line. None when it wrote none (it succeeded or panicked)."""
+    return _error_document(path).get("error")
+
+
+def binary_too_long(path: Path) -> dict | None:
+    """The limit and counts of a request too long for its pool or arch, as the
+    simulator's ``--error-json`` wrote them to ``path`` (``max_model_len``, and
+    for a trace ``requests`` too long of ``total``). None for any other error."""
+    return _error_document(path).get("too_long")
 
 
 def analyzer_binary_path(build_type: str = "debug") -> Path:
@@ -637,16 +662,37 @@ async def run_iter_breakdown(log_dir: Path, build_type: str = "debug") -> None:
     cases. The verb itself is general (`analyze gen-iter-breakdown <dir>` works on
     any artifact dir); only the *automatic* emission is predict-scoped. Failures
     warn and return (analysis never fails an otherwise-successful run)."""
+    # Every row: a predict dir holds one per case and section, and its readers
+    # take each case's tree from the JSON twin.
+    await _run_analyzer_step(log_dir, build_type, "gen-iter-breakdown", "--max-iters", str(2**31))
+
+
+# What a timing prediction's reader needs and nothing more: the cost tree with
+# each node's time (`run_iter_breakdown`) and the kernels ranked by their share
+# of it (`kernel-time-share`). Milliseconds, against the ~1 s full analysis.
+ESSENTIAL_SUBJECTS = ("kernel-time-share",)
+
+
+async def run_essential_analysis(log_dir: Path, build_type: str = "debug") -> None:
+    """Best-effort: the iteration breakdown plus `analyze run` of only the
+    ESSENTIAL_SUBJECTS, no trace and no plots."""
+    await run_iter_breakdown(log_dir, build_type)
+    await _run_analyzer_step(log_dir, build_type, "run", *ESSENTIAL_SUBJECTS)
+
+
+async def _run_analyzer_step(log_dir: Path, build_type: str, verb: str, *args: str) -> None:
+    """`analyze <verb> <log_dir> <args>`, its output appended to the run's
+    `stdout.log`. Failures warn and return (analysis never fails an
+    otherwise-successful run)."""
     analyzer = analyzer_binary_path(build_type)
     if not analyzer.exists():
-        print(f"[analyze] {analyzer} not built; skipping iter-breakdown for {log_dir}")
+        print(f"[analyze] {analyzer} not built; skipping {verb} for {log_dir}")
         return
-    rc, out = await _run_capture([str(analyzer), "gen-iter-breakdown", str(log_dir)])
-    stdout_log = log_dir / "stdout.log"
+    rc, out = await _run_capture([str(analyzer), verb, str(log_dir), *args])
     if out:
-        with stdout_log.open("a") as fh:
-            fh.write(f"\n=== analyze gen-iter-breakdown ===\n{out}")
+        with (log_dir / "stdout.log").open("a") as fh:
+            fh.write(f"\n=== analyze {verb} ===\n{out}")
             if not out.endswith("\n"):
                 fh.write("\n")
     if rc != 0:
-        print(f"[analyze] gen-iter-breakdown failed for {log_dir}:\n{out}")
+        print(f"[analyze] {verb} failed for {log_dir}:\n{out}")

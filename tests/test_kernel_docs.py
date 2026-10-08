@@ -133,3 +133,12 @@ def test_view_fields_are_rust_config_fields(kind: str, rust_kernels: list[dict])
             assert view_field.field in config, f"{kind}: {view_field.field} is not a config field"
         assert view_field.label.strip() and view_field.doc.strip()
     assert view.title.strip() and view.summary.strip()
+
+
+def test_kind_vocabulary_names_every_kind_by_its_doc() -> None:
+    vocabulary = kernel_docs.kind_vocabulary()
+    assert vocabulary["categories"] == list(CATEGORIES)
+    assert sorted(vocabulary["kinds"]) == sorted(KINDS)
+    for kind, entry in vocabulary["kinds"].items():
+        doc = kernel_doc(kind)
+        assert entry == {"title": doc.title, "category": doc.category}

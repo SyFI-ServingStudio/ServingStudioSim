@@ -67,10 +67,6 @@ def _load_runtime() -> tuple[Any, Any, Any, Any]:
         )
     except ImportError as exc:
         raise ProfilerNotImplemented("FlashInfer and the vLLM fork are required") from exc
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented("FP8 block-scale MoE profiling requires CUDA")
-    if tuple(torch.cuda.get_device_capability()) != (10, 0):
-        raise ProfilerNotImplemented("FP8 block-scale MoE profiling requires SM100")
     return torch, per_token_group_quant_fp8, swap_w13_to_w31, _shuffle_deepseek_fp8_moe_weights
 
 

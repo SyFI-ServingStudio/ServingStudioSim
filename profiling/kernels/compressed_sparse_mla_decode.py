@@ -14,6 +14,7 @@ from profiling.db.registry import (
     RunnerRef,
     register,
 )
+from profiling.kernels.kv_compress_store import FP8_DS_MLA_ROW_BYTES
 
 KIND = "compressed_sparse_mla_decode"
 
@@ -66,7 +67,7 @@ DOC = KernelDoc(
         "O = softmax(q · K_selectedᵀ / √head_dim) · V_selected, per query head",
         "S = Σ(swa_valid_counts) + Σ(extra_valid_counts); R = len(swa_valid_counts)",
         "TFLOPS = 2·num_heads·(head_dim + value_dim)·S / time",
-        "GB/s = [R·num_heads·head_dim·2 + S·(584 + 4) + "
+        f"GB/s = [R·num_heads·head_dim·2 + S·({FP8_DS_MLA_ROW_BYTES} + 4) + "
         "R·4·(2 if compress_ratio > 1 else 1) + R·num_heads·(value_dim·2 + 4) "
         "+ num_heads·4] / time",
     ),
@@ -99,10 +100,11 @@ register(
         args_schema=CompressedSparseMlaDecodeArgs,
         metric_family=MetricFamily.COMPUTE,
         batch_outlier_policy=BatchOutlierPolicy(),
+        # FlashMLA's Arch::is_sm90a() / is_sm100f(): exactly SM90, or any SM10x.
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
             kv=frozenset({DType.FP8_E4M3}),
-            gpus=frozenset({"NVIDIA H200"}),
+            sm_targets=frozenset({"sm_90a", "sm_100f"}),
         ),
         subprocess_env="vllm_env",
         doc=BackendDoc(

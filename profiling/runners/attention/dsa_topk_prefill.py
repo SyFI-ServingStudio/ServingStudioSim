@@ -19,17 +19,15 @@ from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerN
 from profiling.runners.metrics import ComputeMetrics
 
 _NUM_SEQUENCES = 1
-_TOP_K = 2048
-# `top_k_per_row_prefill` instantiates these widths; a kpool indexer selects
-# index_topk / index_kpool pools per row (512 at 2048 / 4).
-_VLLM_TOP_K = frozenset({512, 1024, 2048})
+# `top_k_per_row_prefill` takes top_k at runtime (vLLM csrc/libtorch_stable/
+# sampler.cu:850-875, dynamic shared memory of top_k ints), and so does the
+# Torch composite. SGLang's fast_topk_transform_fused is compiled for 2048 only
+# (sgl_kernel/top_k.py asserts topk == 2048; csrc/elementwise/topk.cu TopK).
+_SGLANG_TOP_K = frozenset({2048})
 _LOGITS_DTYPE = DType.FP32
 _INDEX_DTYPE = "int32"
 _SPAN_MODE = "single_causal_tail"
-_REQUIRED_GPU = "NVIDIA H200"
-_VLLM_SUPPORTED_GPUS = ("NVIDIA H200", "NVIDIA B200")
 _VLLM_KERNEL_NAME = "topKPerRowPrefill"
-_SGLANG_SUPPORTED_GPUS = ("NVIDIA B200",)
 _SGLANG_KERNEL_NAME = "topk_transform_prefill_kernel"
 
 
@@ -54,7 +52,7 @@ def _validate_args(
     logits_dtype: DType | str,
     index_dtype: str,
     span_mode: str,
-    allowed_top_k: frozenset[int] = frozenset({_TOP_K}),
+    allowed_top_k: frozenset[int] | None = None,
 ) -> tuple[int, int, int, int, int, DType, str, str]:
     num_queries = int(num_queries)
     num_keys = int(num_keys)
@@ -71,7 +69,9 @@ def _validate_args(
         raise ValueError(f"num_queries must be <= num_keys, got {num_queries} and {num_keys}")
     if num_sequences != _NUM_SEQUENCES:
         raise ValueError(f"dsa_topk_prefill requires num_sequences=1, got {num_sequences}")
-    if top_k not in allowed_top_k:
+    if top_k <= 0:
+        raise ValueError(f"dsa_topk_prefill requires top_k > 0, got {top_k}")
+    if allowed_top_k is not None and top_k not in allowed_top_k:
         raise ValueError(f"dsa_topk_prefill requires top_k in {sorted(allowed_top_k)}, got {top_k}")
     if logits_row_stride <= 0 or logits_row_stride < num_keys:
         raise ValueError(
@@ -94,16 +94,6 @@ def _validate_args(
         index_dtype,
         span_mode,
     )
-
-
-def _validate_cuda_device(torch: Any) -> None:
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented("CUDA is required for the torch dsa_topk_prefill backend")
-    gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
-    if gpu_name != _REQUIRED_GPU:
-        raise ProfilerNotImplemented(
-            f"torch dsa_topk_prefill is verified only on {_REQUIRED_GPU}, got {gpu_name}"
-        )
 
 
 def _validate_vllm_args(
@@ -134,20 +124,8 @@ def _validate_vllm_args(
         logits_dtype,
         index_dtype,
         span_mode,
-        _VLLM_TOP_K,
     )
     return validated
-
-
-def _validate_vllm_cuda_device(torch: Any) -> None:
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented("CUDA is required for the dsa_topk_prefill vllm_cuda backend")
-    gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
-    if gpu_name not in _VLLM_SUPPORTED_GPUS:
-        raise ProfilerNotImplemented(
-            "dsa_topk_prefill vllm_cuda is verified only on "
-            f"{' or '.join(_VLLM_SUPPORTED_GPUS)}, got {gpu_name}"
-        )
 
 
 def _resolve_vllm_prefill_op(torch: Any) -> Any:
@@ -271,17 +249,6 @@ def _load_sglang_cuda_backend() -> tuple[Any, Any]:
     return torch, fast_topk_transform_fused
 
 
-def _validate_sglang_cuda_device(torch: Any) -> None:
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented("CUDA is required for dsa_topk_prefill:sglang_cuda")
-    gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
-    if gpu_name not in _SGLANG_SUPPORTED_GPUS:
-        raise ProfilerNotImplemented(
-            "dsa_topk_prefill:sglang_cuda is verified only on "
-            f"{' or '.join(_SGLANG_SUPPORTED_GPUS)}, got {gpu_name}"
-        )
-
-
 @dataclass(frozen=True)
 class _SglangPagedExtras:
     lengths: Any
@@ -378,8 +345,6 @@ def profile_dsa_topk_prefill_torch(
             "torch is required for the torch dsa_topk_prefill backend"
         ) from exc
 
-    _validate_cuda_device(torch)
-
     try:
         operands = _build_operands(
             torch,
@@ -445,7 +410,6 @@ def profile_dsa_topk_prefill_vllm_cuda(
         span_mode,
     )
     torch, top_k_per_row_prefill = _load_vllm_cuda_backend()
-    _validate_vllm_cuda_device(torch)
 
     try:
         operands = _build_operands(
@@ -525,9 +489,9 @@ def profile_dsa_topk_prefill_sglang_cuda(
         logits_dtype,
         index_dtype,
         span_mode,
+        _SGLANG_TOP_K,
     )
     torch, fast_topk_transform_fused = _load_sglang_cuda_backend()
-    _validate_sglang_cuda_device(torch)
     try:
         operands = _build_operands(
             torch,

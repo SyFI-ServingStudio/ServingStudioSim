@@ -37,10 +37,11 @@
 //! never inferred from tp×dp×ep. R0/R1 are exact SQL sums over every row; R2..R5
 //! fold a **stride-sampled** set of rows (a location's rates are near-constant
 //! across iterations) and are anchored to the exact R1 by their sampled ratio, so
-//! the ladder stays monotone and the buckets stay exact. The mean-mode fold is
-//! linear, so each rung factors into a precomputed per-leaf weight `α` times that
-//! leaf's value — one dot product per row, and the same `α` gives the additive
-//! per-kernel attribution for the kernel-level bars.
+//! the ladder stays monotone and the buckets stay exact. Each rung substitutes its
+//! leaf values and re-evaluates the row's tree once (`trace::manifest::BalancedFold`):
+//! rank `Max` → mean, stream `Parallel` → max/overlap. The same walk attributes the
+//! value to its leaves, which gives the additive per-kernel attribution for the
+//! kernel-level bars.
 //!
 //! The locked R6/R7 floors are **stratified**, not exact. They used to label every
 //! iteration, which only looked affordable because equal shapes deduplicate — and
@@ -57,9 +58,9 @@
 //! - `run.rs` — orchestration: `run_optimality` wires the stages and assembles the
 //!   report/payload JSON (+ the `unavailable` degrade paths).
 //! - `prepare.rs` — preparation: interns manifest leaves into locations and
-//!   precomputes each section's fold weights + rate ceilings (`build_section_fold_plans`).
+//!   precomputes each section's rate ceilings (`build_section_fold_plans`).
 //! - `fold.rs` — the algorithm: exact R0/R1 SQL sums + the stride-sampled R2..R5
-//!   mean-fold (`read_exact_worker_totals`, `accumulate_fold`,
+//!   balanced fold (`read_exact_worker_totals`, `accumulate_fold`,
 //!   `leaf_selected_throughput_ms`).
 //! - `levels.rs` — the worker / pool / cluster tiers: rung assembly + rollup +
 //!   level/report JSON.
@@ -76,6 +77,7 @@ mod kernel;
 mod ladder;
 mod levels;
 mod location;
+mod pipeline;
 mod prepare;
 mod run;
 mod scoped;

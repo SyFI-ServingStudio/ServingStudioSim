@@ -46,7 +46,8 @@ analyze = [
 # alignment parse's kernel rows (`alignment/nsys/parsed_io.py`) and reads run
 # parquet.
 # Read-only data service for the external ServingStudio site (public_api/).
-# Same stack as the Agent service; `httpx` is FastAPI's TestClient transport.
+# Same stack as the Agent service; `httpx` forwards the Analyzer's routes and is
+# FastAPI's TestClient transport.
 public-api = [
     "fastapi>=0.115",
     "httpx>=0.28",
@@ -100,6 +101,7 @@ markers = [
     "needs_db: requires warm profile.db rows for the config under test",
     "agent: Codex runner+judge tier (opt-in: --run-agent)",
     "bench: perf/timing, non-deterministic (opt-in: -m bench)",
+    "presets: builds every public member through the simulator (just test-presets)",
 ]
 
 [tool.ruff]

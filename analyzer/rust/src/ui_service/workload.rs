@@ -1,9 +1,17 @@
-//! Bounded overview of the repository trace files named by run parameters.
+//! Bounded overview of the requests a run released: what each asked for and
+//! when it arrived, from the run's own request record
+//! (`raw/request_slo.parquet`: `declared_prefix_tokens + fresh_prompt_tokens`
+//! in, `target_output_tokens` out, `arrival_time_ms`). The simulator read the
+//! trace files and recorded every request it released, in whatever trace
+//! format and replay mode the run used; the trace paths here only label them.
 
+use std::fs::File;
 use std::path::{Component, Path};
 
 use anyhow::{bail, Context, Result};
-use serde::Deserialize;
+use datafusion::arrow::array::{Array, Float64Array, UInt32Array};
+use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use datafusion::parquet::arrow::ProjectionMask;
 use serde_json::{json, Value};
 
 use super::artifact::read_run_json;
@@ -11,10 +19,10 @@ use super::discovery::{regular_file, DiscoveredRun};
 use super::ArtifactNotFound;
 
 const MAX_POINTS: usize = 72;
+const REQUESTS: &str = "raw/request_slo.parquet";
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug)]
 struct TraceEntry {
-    id: u32,
     input_len: u32,
     output_len: u32,
     arrival_time: f64,
@@ -22,39 +30,31 @@ struct TraceEntry {
 
 pub(super) fn read_workload(run: &DiscoveredRun, repo_root: &Path) -> Result<Value> {
     let params = read_run_json(&run.path, "raw/params.json")?;
-    let source_paths = trace_file_paths(&params)?;
+    let source_paths = trace_file_paths(&params)?
+        .iter()
+        .map(|path| trace_label(path, repo_root))
+        .collect::<Result<Vec<_>>>()?;
     if source_paths.is_empty() {
         return Err(ArtifactNotFound.into());
     }
-    for source_path in &source_paths {
-        validate_trace_path(source_path)?;
+    let mut entries = read_requests(&run.path.join(REQUESTS))?;
+    if entries.is_empty() {
+        bail!("{REQUESTS} records no request");
     }
-
-    let canonical_root = repo_root
-        .canonicalize()
-        .context("canonicalize configured root")?;
-    let mut entries = Vec::new();
-    for source_path in &source_paths {
-        let trace_path = resolve_trace_path(repo_root, &canonical_root, source_path)?;
-        read_trace_file(&trace_path, &mut entries)?;
-    }
-    validate_trace(&entries)?;
+    entries.sort_by(|a, b| a.arrival_time.total_cmp(&b.arrival_time));
 
     let request_rate = params
         .pointer("/workload/request_rate")
         .and_then(Value::as_f64)
         .filter(|rate| rate.is_finite() && *rate > 0.0)
         .context("raw/params.json workload.request_rate must be finite and positive")?;
-    // Read the arrival axis, not the capacity one. A cap bounds how many units
-    // run at once; it says nothing about where release times come from, and a
-    // capped trace-timed run still rescales the recorded timeline by
-    // `request_rate`. Inferring one axis from the other reported the source
-    // trace's raw arrivals for every capped run.
+    // Arrival times are the run's own releases: a trace-timed run's are
+    // already rescaled by `request_rate`, a saturated run's are when it
+    // released each request.
     let saturated = params
         .pointer("/workload/arrival_mode")
         .and_then(Value::as_str)
         == Some("saturated");
-    let arrival_scale = if saturated { 1.0 } else { request_rate };
     let request_count = entries.len() as f64;
     let average_input_tokens = entries
         .iter()
@@ -67,8 +67,7 @@ pub(super) fn read_workload(run: &DiscoveredRun, repo_root: &Path) -> Result<Val
         .sum::<u64>() as f64
         / request_count;
     let (token_lengths, input_density, output_density) = length_distribution(&entries);
-    let (arrival_seconds, arrivals, arrival_trend, peak_to_mean) =
-        arrival_distribution(&entries, arrival_scale);
+    let (arrival_seconds, arrivals, arrival_trend, peak_to_mean) = arrival_distribution(&entries);
 
     Ok(json!({
         "schema_version": 1,
@@ -77,7 +76,7 @@ pub(super) fn read_workload(run: &DiscoveredRun, repo_root: &Path) -> Result<Val
         "request_count": entries.len(),
         "average_input_tokens": average_input_tokens,
         "average_output_tokens": average_output_tokens,
-        "arrival_basis": if saturated { "source_trace" } else { "effective_trace_timed" },
+        "arrival_basis": if saturated { "effective_open_loop" } else { "effective_trace_timed" },
         "request_rate": request_rate,
         "token_lengths": token_lengths,
         "input_density": input_density,
@@ -107,33 +106,102 @@ pub(super) fn trace_file_paths(params: &Value) -> Result<Vec<String>> {
         .collect()
 }
 
-fn resolve_trace_path(
-    repo_root: &Path,
-    canonical_root: &Path,
-    source_path: &str,
-) -> Result<std::path::PathBuf> {
-    validate_trace_path(source_path)?;
-    let relative = Path::new(source_path);
-    let mut relative_candidates = vec![relative];
-    if let Some(root_name) = repo_root.file_name() {
-        if let Ok(without_root_prefix) = relative.strip_prefix(root_name) {
-            if !without_root_prefix.as_os_str().is_empty() {
-                relative_candidates.push(without_root_prefix);
-            }
+/// A trace file as the overview names it: repository-relative. A run the
+/// launcher wrote outside its repository's `logs/` (a service's run
+/// directory) names its trace by an absolute path under the configured root;
+/// it is named from that root's `logs` or `trace` directory down.
+fn trace_label(source_path: &str, repo_root: &Path) -> Result<String> {
+    let path = Path::new(source_path);
+    if !path.is_absolute() {
+        validate_trace_path(source_path)?;
+        return Ok(source_path.to_owned());
+    }
+    let components = path.components().collect::<Vec<_>>();
+    let from = components.iter().rposition(|component| {
+        matches!(component, Component::Normal(name) if *name == "logs" || *name == "trace")
+    });
+    let label = from.map(|from| {
+        components[from..]
+            .iter()
+            .map(|component| component.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/")
+    });
+    let under_root = repo_root
+        .canonicalize()
+        .ok()
+        .zip(path.canonicalize().ok())
+        .is_some_and(|(root, path)| path.starts_with(root));
+    match label {
+        Some(label) if under_root && regular_file(path) => {
+            validate_trace_path(&label)?;
+            Ok(label)
+        }
+        _ => {
+            bail!("trace file must be a relative path inside a trace directory or a CSV under logs")
         }
     }
-    let trace_path = relative_candidates
-        .into_iter()
-        .map(|candidate| repo_root.join(candidate))
-        .find(|candidate| regular_file(candidate))
-        .ok_or(ArtifactNotFound)?;
-    let canonical_trace = trace_path
-        .canonicalize()
-        .with_context(|| format!("canonicalize trace file {}", trace_path.display()))?;
-    if !canonical_trace.starts_with(canonical_root) {
-        bail!("trace file resolves outside configured root");
+}
+
+/// Each released request's prompt, target output and arrival, as the run
+/// recorded it.
+fn read_requests(path: &Path) -> Result<Vec<TraceEntry>> {
+    if !regular_file(path) {
+        return Err(ArtifactNotFound.into());
     }
-    Ok(canonical_trace)
+    let open = || File::open(path).with_context(|| format!("open {}", path.display()));
+    let builder = ParquetRecordBatchReaderBuilder::try_new(open()?)
+        .with_context(|| format!("read parquet metadata of {}", path.display()))?;
+    let schema = builder.schema().clone();
+    let names = [
+        "arrival_time_ms",
+        "declared_prefix_tokens",
+        "fresh_prompt_tokens",
+        "target_output_tokens",
+    ];
+    let roots = names
+        .iter()
+        .map(|name| {
+            schema
+                .index_of(name)
+                .with_context(|| format!("{} has no `{name}` column", path.display()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mask = ProjectionMask::roots(builder.parquet_schema(), roots);
+    let mut entries = Vec::new();
+    for batch in builder.with_projection(mask).build()? {
+        let batch = batch?;
+        let column = |name: &str| {
+            batch
+                .column_by_name(name)
+                .with_context(|| format!("{} lost `{name}`", path.display()))
+        };
+        let arrival = column("arrival_time_ms")?
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .context("arrival_time_ms is not Float64")?
+            .clone();
+        let u32s = |name: &str| -> Result<UInt32Array> {
+            Ok(column(name)?
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .with_context(|| format!("{name} is not UInt32"))?
+                .clone())
+        };
+        let (prefix, fresh, output) = (
+            u32s("declared_prefix_tokens")?,
+            u32s("fresh_prompt_tokens")?,
+            u32s("target_output_tokens")?,
+        );
+        for row in 0..batch.num_rows() {
+            entries.push(TraceEntry {
+                input_len: prefix.value(row) + fresh.value(row),
+                output_len: output.value(row),
+                arrival_time: arrival.value(row),
+            });
+        }
+    }
+    Ok(entries)
 }
 
 fn validate_trace_path(source_path: &str) -> Result<()> {
@@ -159,44 +227,6 @@ fn validate_trace_path(source_path: &str) -> Result<()> {
             .is_some_and(|extension| extension == "csv");
     if !is_normal_relative || !(passes_through_trace_directory || is_experiment_csv) {
         bail!("trace file must be a relative path inside a trace directory or a CSV under logs");
-    }
-    Ok(())
-}
-
-fn read_trace_file(path: &Path, entries: &mut Vec<TraceEntry>) -> Result<()> {
-    let mut reader = csv::Reader::from_path(path)
-        .with_context(|| format!("open trace file {}", path.display()))?;
-    let headers = reader
-        .headers()
-        .with_context(|| format!("read trace header {}", path.display()))?;
-    if headers.iter().any(|header| header == "round_idx") {
-        bail!("multi-round traces are not supported");
-    }
-    for (row, result) in reader.deserialize().enumerate() {
-        let entry: TraceEntry =
-            result.with_context(|| format!("parse {} row {row}", path.display()))?;
-        if entry.input_len == 0 || entry.output_len == 0 {
-            bail!("{} row {row} has a zero token length", path.display());
-        }
-        if !entry.arrival_time.is_finite() || entry.arrival_time < 0.0 {
-            bail!("{} row {row} has an invalid arrival_time", path.display());
-        }
-        entries.push(entry);
-    }
-    Ok(())
-}
-
-fn validate_trace(entries: &[TraceEntry]) -> Result<()> {
-    if entries.is_empty() {
-        bail!("trace files contained no rows");
-    }
-    for (index, entry) in entries.iter().enumerate() {
-        if entry.id != index as u32 {
-            bail!("trace row {index} has non-sequential id {}", entry.id);
-        }
-        if index > 0 && entry.arrival_time < entries[index - 1].arrival_time {
-            bail!("trace row {index} has decreasing arrival_time");
-        }
     }
     Ok(())
 }
@@ -247,10 +277,7 @@ fn normalized_counts(counts: &[u64]) -> Vec<f64> {
         .collect()
 }
 
-fn arrival_distribution(
-    entries: &[TraceEntry],
-    arrival_scale: f64,
-) -> (Vec<f64>, Vec<u64>, Vec<f64>, f64) {
+fn arrival_distribution(entries: &[TraceEntry]) -> (Vec<f64>, Vec<u64>, Vec<f64>, f64) {
     let start_ms = entries
         .first()
         .map(|entry| entry.arrival_time)
@@ -277,7 +304,7 @@ fn arrival_distribution(
         0.0
     };
     let arrival_seconds = (0..bucket_count)
-        .map(|index| (start_ms + (index as f64 + 0.5) * bucket_width) / arrival_scale / 1000.0)
+        .map(|index| (start_ms + (index as f64 + 0.5) * bucket_width) / 1000.0)
         .collect();
     let arrival_trend = moving_average(&arrivals, 2);
     let mean = entries.len() as f64 / bucket_count as f64;

@@ -102,8 +102,8 @@ def test_registration_support_and_facades() -> None:
     assert spec.supports.kv is None
     assert spec.supports.allows(DType.FP32, gpu="NVIDIA H200")
     assert not spec.supports.allows(DType.BF16, gpu="NVIDIA H200")
-    assert not spec.supports.allows(DType.FP32, gpu="NVIDIA H100")
-    assert not spec.supports.allows(DType.FP32, gpu="NVIDIA B200")
+    assert spec.supports.allows(DType.FP32, gpu="NVIDIA H100")
+    assert spec.supports.allows(DType.FP32, gpu="NVIDIA B200")
     assert spec.runner_ref.module_name == ("profiling.runners.attention.dsa_topk_prefill")
     assert spec.runner_ref.function_name == "profile_dsa_topk_prefill_torch"
     assert hasattr(perf_api, "get_dsa_topk_prefill_times")
@@ -126,7 +126,7 @@ def test_vllm_registration_reuses_schema_table_family_support_and_facades() -> N
     assert vllm_spec.supports.allows(DType.FP32, gpu="NVIDIA H200")
     assert vllm_spec.supports.allows(DType.FP32, gpu="NVIDIA B200")
     assert not vllm_spec.supports.allows(DType.BF16, gpu="NVIDIA H200")
-    assert not vllm_spec.supports.allows(DType.FP32, gpu="NVIDIA H100")
+    assert vllm_spec.supports.allows(DType.FP32, gpu="NVIDIA H100")
     assert vllm_spec.runner_ref.module_name == ("profiling.runners.attention.dsa_topk_prefill")
     assert vllm_spec.runner_ref.function_name == ("profile_dsa_topk_prefill_vllm_cuda")
     assert hasattr(perf_api, "get_dsa_topk_prefill_times")
@@ -189,7 +189,7 @@ def test_runner_ref_resolves_without_importing_torch() -> None:
         ({"num_keys": 0}, "must be > 0"),
         ({"num_queries": 129, "num_keys": 128}, "must be <= num_keys"),
         ({"num_sequences": 2}, "num_sequences=1"),
-        ({"top_k": 1024}, r"top_k in \[2048\]"),
+        ({"top_k": 0}, "top_k > 0"),
         ({"logits_row_stride": 0}, "positive and >= num_keys"),
         ({"logits_row_stride": 4095}, "positive and >= num_keys"),
         ({"logits_dtype": DType.BF16}, "logits_dtype=fp32"),
@@ -214,51 +214,23 @@ def test_explicit_unpadded_and_padded_strides_are_valid() -> None:
         assert validated[4] == stride
 
 
-def test_rejects_missing_cuda_and_unverified_gpu() -> None:
-    from profiling.runners.attention.dsa_topk_prefill import _validate_cuda_device
+@pytest.mark.parametrize("top_k", [256, 512, 1024, 2048, 4096])
+def test_runtime_top_k_backends_accept_any_positive_width(top_k) -> None:
+    from profiling.runners.attention.dsa_topk_prefill import _validate_args, _validate_vllm_args
 
-    no_cuda = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False))
-    with pytest.raises(ProfilerNotImplemented, match="CUDA is required"):
-        _validate_cuda_device(no_cuda)
-
-    h100 = SimpleNamespace(
-        cuda=SimpleNamespace(
-            is_available=lambda: True,
-            current_device=lambda: 0,
-            get_device_name=lambda _device: "NVIDIA H100",
-        )
-    )
-    with pytest.raises(ProfilerNotImplemented, match="verified only on NVIDIA H200"):
-        _validate_cuda_device(h100)
+    assert _validate_args(**(_BASE_SPEC | {"top_k": top_k}))[3] == top_k
+    assert _validate_vllm_args(**(_BASE_SPEC | {"top_k": top_k}))[3] == top_k
 
 
-def test_vllm_rejects_missing_cuda_and_unverified_gpu() -> None:
-    from profiling.runners.attention.dsa_topk_prefill import (
-        _validate_vllm_cuda_device,
-    )
+def test_sglang_keeps_its_compiled_2048_width(monkeypatch) -> None:
+    from profiling.runners.attention import dsa_topk_prefill as runner
 
-    no_cuda = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False))
-    with pytest.raises(ProfilerNotImplemented, match="CUDA is required"):
-        _validate_vllm_cuda_device(no_cuda)
+    def fail_if_loaded():
+        raise AssertionError("SGLang loader must not run")
 
-    h100 = SimpleNamespace(
-        cuda=SimpleNamespace(
-            is_available=lambda: True,
-            current_device=lambda: 0,
-            get_device_name=lambda _device: "NVIDIA H100",
-        )
-    )
-    with pytest.raises(ProfilerNotImplemented, match="verified only on NVIDIA H200"):
-        _validate_vllm_cuda_device(h100)
-
-    b200 = SimpleNamespace(
-        cuda=SimpleNamespace(
-            is_available=lambda: True,
-            current_device=lambda: 0,
-            get_device_name=lambda _device: "NVIDIA B200",
-        )
-    )
-    _validate_vllm_cuda_device(b200)
+    monkeypatch.setattr(runner, "_load_sglang_cuda_backend", fail_if_loaded)
+    with pytest.raises(ValueError, match=r"top_k in \[2048\]"):
+        runner.profile_dsa_topk_prefill_sglang_cuda(**(_BASE_SPEC | {"top_k": 1024}))
 
 
 def test_vllm_rejects_common_and_backend_specific_args_before_loading(
@@ -279,7 +251,7 @@ def test_vllm_rejects_common_and_backend_specific_args_before_loading(
         ({"num_keys": 0}, "must be > 0"),
         ({"num_queries": 129, "num_keys": 128}, "must be <= num_keys"),
         ({"num_sequences": 2}, "num_sequences=1"),
-        ({"top_k": 256}, r"top_k in \[512, 1024, 2048\]"),
+        ({"top_k": 0}, "top_k > 0"),
         ({"logits_row_stride": 0}, "positive and >= num_keys"),
         ({"logits_row_stride": 4095}, "positive and >= num_keys"),
         ({"logits_dtype": DType.BF16}, "logits_dtype=fp32"),
@@ -455,7 +427,6 @@ def test_logical_bytes_accounts_only_valid_logits_metadata_and_output() -> None:
 def test_profile_translates_runtime_failure(monkeypatch) -> None:
     from profiling.runners.attention import dsa_topk_prefill as runner
 
-    monkeypatch.setattr(runner, "_validate_cuda_device", lambda _torch: None)
     monkeypatch.setattr(
         runner,
         "_build_operands",
@@ -493,7 +464,6 @@ def test_vllm_profile_forwards_exact_operands_and_arguments(monkeypatch) -> None
         "_load_vllm_cuda_backend",
         lambda: (fake_torch, fake_op),
     )
-    monkeypatch.setattr(runner, "_validate_vllm_cuda_device", lambda _torch: None)
     monkeypatch.setattr(runner, "_build_operands", lambda *args, **kwargs: operands)
 
     def fake_cupti(kernel, *, kernel_name):
@@ -539,7 +509,6 @@ def test_vllm_profile_translates_runtime_failure(monkeypatch) -> None:
         "_load_vllm_cuda_backend",
         lambda: (fake_torch, fail_launch),
     )
-    monkeypatch.setattr(runner, "_validate_vllm_cuda_device", lambda _torch: None)
     monkeypatch.setattr(
         runner,
         "_build_operands",

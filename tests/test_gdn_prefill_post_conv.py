@@ -5,7 +5,6 @@ from __future__ import annotations
 import subprocess
 import sys
 from dataclasses import fields
-from types import SimpleNamespace
 
 import pytest
 
@@ -19,7 +18,6 @@ from profiling.kernels.gdn_prefill_post_conv import (
     KIND,
     GdnPrefillPostConvArgs,
 )
-from profiling.runners.exceptions import ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
 
 _SPEC = {
@@ -82,14 +80,13 @@ def test_registration_table_kind_runner_and_support_contract() -> None:
 
     assert spec.supports.compute == frozenset({DType.BF16})
     assert spec.supports.kv is None
-    assert spec.supports.gpus is None
     assert spec.supports.allows(DType.BF16, gpu="NVIDIA H200")
     assert spec.supports.allows(DType.BF16, gpu="NVIDIA B200")
     assert not spec.supports.allows(DType.FP16, gpu="NVIDIA H200")
     assert not spec.supports.allows(DType.FP32, gpu="NVIDIA H200")
 
 
-def test_vllm_registration_reuses_schema_table_and_is_h200_only() -> None:
+def test_vllm_registration_reuses_schema_table_and_runs_on_any_gpu() -> None:
     spec = find_kernel_profiler_spec(KIND, "vllm_triton")
 
     assert spec.kernel_kind == spec.table_name == KIND
@@ -105,10 +102,9 @@ def test_vllm_registration_reuses_schema_table_and_is_h200_only() -> None:
 
     assert spec.supports.compute == frozenset({DType.BF16})
     assert spec.supports.kv is None
-    assert spec.supports.gpus == frozenset({"NVIDIA H200"})
     assert spec.supports.allows(DType.BF16, gpu="NVIDIA H200")
-    assert not spec.supports.allows(DType.BF16, gpu="NVIDIA H100")
-    assert not spec.supports.allows(DType.BF16, gpu="NVIDIA B200")
+    assert spec.supports.allows(DType.BF16, gpu="NVIDIA H100")
+    assert spec.supports.allows(DType.BF16, gpu="NVIDIA B200")
     assert not spec.supports.allows(DType.FP16, gpu="NVIDIA H200")
 
 
@@ -260,16 +256,6 @@ def test_runner_shapes_and_bounded_deterministic_cpu_operands() -> None:
         assert torch.equal(getattr(first, name), getattr(second, name))
 
 
-def test_runner_reports_missing_cuda_as_typed_unsupported() -> None:
-    from profiling.runners.attention.gdn_prefill_post_conv_torch import (
-        _validate_cuda_device,
-    )
-
-    no_cuda = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False))
-    with pytest.raises(ProfilerNotImplemented, match="CUDA is required"):
-        _validate_cuda_device(no_cuda)
-
-
 def test_semantic_metrics_are_explicit_logical_counts() -> None:
     from profiling.runners.attention.gdn_prefill_post_conv_torch import (
         _logical_bytes,
@@ -338,40 +324,31 @@ def test_vllm_runner_rejects_unsupported_dtype_before_import(dtype: str, monkeyp
 
 @pytest.mark.parametrize(
     ("key_head_dim", "value_head_dim"),
-    [(7, 5), (64, 128), (128, 64), (32, 32), (256, 256)],
+    [(7, 5), (64, 128), (128, 64), (32, 32), (256, 256), (64, 64), (128, 128)],
 )
-def test_vllm_runner_rejects_unestablished_head_dimensions_before_import(
-    key_head_dim: int,
-    value_head_dim: int,
-    monkeypatch,
+def test_vllm_runner_accepts_any_positive_head_dimensions(
+    key_head_dim: int, value_head_dim: int
 ) -> None:
-    import profiling.runners.attention.gdn_prefill_post_conv_vllm_triton as runner
-
-    monkeypatch.setattr(
-        runner,
-        "_load_fused_callable",
-        lambda: (_ for _ in ()).throw(AssertionError("vLLM import must not be reached")),
-    )
-    with pytest.raises(ValueError, match="established"):
-        runner.profile_gdn_prefill_post_conv_vllm_triton(
-            **(
-                _SPEC
-                | {
-                    "key_head_dim": key_head_dim,
-                    "value_head_dim": value_head_dim,
-                }
-            )
-        )
-
-
-@pytest.mark.parametrize("head_dim", [64, 128])
-def test_vllm_runner_accepts_established_head_dimension_pairs(head_dim: int) -> None:
+    # fused_post_conv_prep pads K and V to next_power_of_2 block widths and
+    # masks the tail, so any positive head dims launch.
     from profiling.runners.attention.gdn_prefill_post_conv_vllm_triton import (
         _validate_args,
     )
 
-    args = _validate_args(**(_SPEC | {"key_head_dim": head_dim, "value_head_dim": head_dim}))
-    assert (args.key_head_dim, args.value_head_dim) == (head_dim, head_dim)
+    args = _validate_args(
+        **(_SPEC | {"key_head_dim": key_head_dim, "value_head_dim": value_head_dim})
+    )
+    assert (args.key_head_dim, args.value_head_dim) == (key_head_dim, value_head_dim)
+
+
+@pytest.mark.parametrize("field", ["key_head_dim", "value_head_dim"])
+def test_vllm_runner_rejects_non_positive_head_dimensions(field: str) -> None:
+    from profiling.runners.attention.gdn_prefill_post_conv_vllm_triton import (
+        _validate_args,
+    )
+
+    with pytest.raises(ValueError, match="must be > 0"):
+        _validate_args(**(_SPEC | {field: 0}))
 
 
 def test_vllm_runner_shapes_dtypes_contiguity_and_guard_bound() -> None:
@@ -590,7 +567,6 @@ def test_vllm_profile_times_only_one_fused_call_and_needs_no_reset(monkeypatch) 
         assert per_iter_time_ms == 0.5
         return 0.25
 
-    monkeypatch.setattr(runner, "_require_h200", lambda _torch: None)
     monkeypatch.setattr(runner, "_load_fused_callable", lambda: fake_fused)
     monkeypatch.setattr(runner, "_build_operands", fake_build)
     monkeypatch.setattr(runner, "_validate_operands", lambda *_args, **_kwargs: None)
@@ -666,7 +642,6 @@ def test_profile_times_only_semantic_call_and_needs_no_reset(monkeypatch) -> Non
         assert per_iter_time_ms == 0.5
         return 0.25
 
-    monkeypatch.setattr(runner, "_validate_cuda_device", lambda _torch: None)
     monkeypatch.setattr(runner, "_build_operands", fake_build)
     monkeypatch.setattr(reference, "gdn_prefill_post_conv_reference", counted_reference)
     monkeypatch.setattr(runner.Timer, "cupti", staticmethod(fake_timer))

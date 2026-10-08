@@ -90,14 +90,11 @@ pub struct WorkloadSpec {
     /// When a new top-level unit becomes eligible: `trace_timed` replays the
     /// trace's own arrival timeline, `saturated` makes every unit eligible at
     /// once. Independent of `max_concurrency`, which caps how many may be
-    /// active, and of `session_dependency`, which decides what a unit is.
+    /// active. A trace with sessions chains their rounds: a later round waits
+    /// for its predecessor plus its `tool_wait_after_ms`, and a unit is a
+    /// session; without sessions a unit is a request.
     #[param(choices = simulator::sim::ArrivalMode::CONFIG_CHOICES)]
     pub arrival_mode: String,
-    /// Whether every trace row is independently eligible or later rounds wait
-    /// for predecessor completion plus `tool_wait_after_ms`. `chained` requires
-    /// the `session` trace tag and composes with either replay pacing.
-    #[param(choices = simulator::sim::SessionDependency::CHOICES)]
-    pub session_dependency: String,
     /// Fixed simulation tick step (µs) — the time quantum the loop advances by
     /// each iteration. Finer ticks mean less TTFT/TPOT quantization (and smaller
     /// inter-slice gaps in the trace) at ~no throughput cost, since per-tick work
@@ -176,6 +173,7 @@ pub enum RunConfig {
     Unified(UnifiedConfig),
     Pd(PdConfig),
     Afd(AfdConfig),
+    Pp(PpConfig),
 }
 
 impl RunConfig {
@@ -184,6 +182,7 @@ impl RunConfig {
             RunConfig::Unified(c) => &c.workload,
             RunConfig::Pd(c) => &c.workload,
             RunConfig::Afd(c) => &c.workload,
+            RunConfig::Pp(c) => &c.workload,
         }
     }
 
@@ -192,6 +191,7 @@ impl RunConfig {
             RunConfig::Unified(c) => &c.io,
             RunConfig::Pd(c) => &c.io,
             RunConfig::Afd(c) => &c.io,
+            RunConfig::Pp(c) => &c.io,
         }
     }
 
@@ -203,6 +203,7 @@ impl RunConfig {
             RunConfig::Unified(_) => crate::common::UnifiedStage::VOCAB,
             RunConfig::Pd(_) => crate::common::PdStage::VOCAB,
             RunConfig::Afd(_) => crate::common::AfdStage::VOCAB,
+            RunConfig::Pp(_) => crate::common::PpStage::VOCAB,
         }
     }
 }
@@ -245,6 +246,23 @@ pub struct PdPools {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct PpConfig {
+    pub workload: WorkloadSpec,
+    pub io: IoSpec,
+    pub pools: PpPools,
+    /// Per-kernel backend overrides (see [`BackendOverrides`]); absent = none.
+    #[serde(default)]
+    pub backends: BackendOverrides,
+}
+
+/// One pool whose workers are the stages of `replicas` pipelines.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PpPools {
+    pub stage: PoolSpec<IterArchSel, IterWorkerSel>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct AfdConfig {
     pub workload: WorkloadSpec,
     pub io: IoSpec,
@@ -276,7 +294,7 @@ mod tests {
     // (G8) — model_config sits flat alongside tp_size under `arch`.
     const UNIFIED_YAML: &str = r#"
 deployment: unified
-workload: { trace_files: ["trace/smoke.csv"], input_file_format: text-generation-independent, arrival_mode: trace_timed, session_dependency: independent, duration_ms: 5000.0, run_to_end: true, request_rate: 10.0 }
+workload: { trace_files: ["trace/smoke.csv"], input_file_format: text-generation-independent, arrival_mode: trace_timed, duration_ms: 5000.0, run_to_end: true, request_rate: 10.0 }
 io: { log_dir: "logs/smoke", log_level: info, quiet: false, force_cache_build: false, log_output_token_times: false }
 pools:
   main:
@@ -317,16 +335,25 @@ pools:
         assert!(cfg.io().log_stage_transitions);
         assert_eq!(cfg.workload().request_rate, 10.0);
         assert_eq!(cfg.workload().arrival_mode, "trace_timed");
-        assert_eq!(cfg.workload().session_dependency, "independent");
     }
 
     #[test]
     fn legacy_replay_mode_is_not_accepted() {
-        let legacy = UNIFIED_YAML
-            .replace("arrival_mode: trace_timed", "replay_mode: open_loop")
-            .replace(", session_dependency: independent", "");
+        let legacy = UNIFIED_YAML.replace("arrival_mode: trace_timed", "replay_mode: open_loop");
         let error = serde_yaml::from_str::<RunConfig>(&legacy).unwrap_err();
         assert!(error.to_string().contains("replay_mode"), "{error}");
+    }
+
+    /// The trace decides whether rounds chain; a config that still says
+    /// is refused rather than half obeyed.
+    #[test]
+    fn session_dependency_is_not_a_workload_field() {
+        let legacy = UNIFIED_YAML.replace(
+            "arrival_mode: trace_timed",
+            "arrival_mode: trace_timed, session_dependency: independent",
+        );
+        let error = serde_yaml::from_str::<RunConfig>(&legacy).unwrap_err();
+        assert!(error.to_string().contains("session_dependency"), "{error}");
     }
 
     #[test]
@@ -334,7 +361,7 @@ pools:
         // YAML is a JSON superset; the equivalent JSON must parse identically.
         let json = serde_json::json!({
             "deployment": "unified",
-            "workload": {"trace_files": ["t.csv"], "input_file_format": "text-generation-independent", "arrival_mode": "trace_timed", "session_dependency": "independent", "duration_ms": 5000.0, "run_to_end": true, "request_rate": 10.0},
+            "workload": {"trace_files": ["t.csv"], "input_file_format": "text-generation-independent", "arrival_mode": "trace_timed", "duration_ms": 5000.0, "run_to_end": true, "request_rate": 10.0},
             "io": {"log_dir": "logs", "log_level": "info", "quiet": false, "force_cache_build": false, "log_output_token_times": false},
             "pools": {"main": {"placement": "least-queued", "groups": [
                 {"gpu": "H200", "replicas": 1,
@@ -395,6 +422,15 @@ pools:
     }
 
     #[test]
+    fn a_group_with_zero_replicas_is_a_config_error() {
+        let error =
+            serde_yaml::from_str::<RunConfig>(&UNIFIED_YAML.replace("replicas: 1", "replicas: 0"))
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("replicas must be at least 1"), "{error}");
+    }
+
+    #[test]
     fn unknown_group_field_rejected() {
         // deny_unknown_fields on GroupSpec (a plain struct) catches stray keys.
         let bad = UNIFIED_YAML.replace("replicas: 1", "replicas: 1\n        bogus: 3");
@@ -405,7 +441,7 @@ pools:
     fn pd_two_pools_parse() {
         let yaml = r#"
 deployment: pd
-workload: { trace_files: ["t.csv"], input_file_format: text-generation-independent, arrival_mode: trace_timed, session_dependency: independent, duration_ms: 5000.0, run_to_end: false, request_rate: 10.0 }
+workload: { trace_files: ["t.csv"], input_file_format: text-generation-independent, arrival_mode: trace_timed, duration_ms: 5000.0, run_to_end: false, request_rate: 10.0 }
 io: { log_dir: "logs", log_level: info, quiet: false, force_cache_build: false, log_output_token_times: false }
 pools:
   prefill:
@@ -431,7 +467,7 @@ pools:
         // aggregated replica, qwen3_ffn_moe). Mirrors `pd_two_pools_parse`.
         let yaml = r#"
 deployment: afd
-workload: { trace_files: ["t.csv"], input_file_format: text-generation-independent, arrival_mode: trace_timed, session_dependency: independent, duration_ms: 5000.0, run_to_end: false, request_rate: 10.0 }
+workload: { trace_files: ["t.csv"], input_file_format: text-generation-independent, arrival_mode: trace_timed, duration_ms: 5000.0, run_to_end: false, request_rate: 10.0 }
 io: { log_dir: "logs", log_level: info, quiet: false, force_cache_build: false, log_output_token_times: false }
 pools:
   attn:
@@ -473,7 +509,7 @@ pools:
         // DP-attention arch carries two TP degrees; pairs with the hp_unified worker.
         let yaml = r#"
 deployment: unified
-workload: { trace_files: ["t.csv"], input_file_format: text-generation-independent, arrival_mode: trace_timed, session_dependency: independent, duration_ms: 5000.0, run_to_end: true, request_rate: 10.0 }
+workload: { trace_files: ["t.csv"], input_file_format: text-generation-independent, arrival_mode: trace_timed, duration_ms: 5000.0, run_to_end: true, request_rate: 10.0 }
 io: { log_dir: "logs", log_level: info, quiet: false, force_cache_build: false, log_output_token_times: false }
 pools:
   main:

@@ -1,0 +1,33 @@
+# vLLM GLM-5.3-Flash NVFP4 on B200, TP4 or TP8 attention with the experts expert-parallel
+# (EP = TP) or tensor-parallel (MoE TP), chunked prefill at 2048 tokens.
+# Worker: the PR #78 Flash study,
+# no alignment pack: plain prefill chunking (no vLLM Mamba align-mode chunk ends),
+# gpu_time_multiplier 1.0 (pure kernel sum). Its 8192-token chunk is replaced by 2048, the chunk
+# of the TP4/EP4 sibling glm53_flash_vllm_fp8_kda_dsa_moe_chunked_prefill (the captured server's,
+# also its largest CUDA graph).
+# attn_gpu_memory_gb: 89.13 GB, the common per-GPU KV/state budget of every Flash NVFP4 layout,
+# the FP8 rule re-costed for the
+# NVFP4 weights: 57.79 + (FP8 DP4/EP4 92.47 - NVFP4 DP4/EP4 61.13 GB). No NVFP4 server measured the
+# activation and graph overhead; it is assumed equal to FP8's. The study's TraceLab runs used twice
+# it (178.26) only so that 1M-token contexts fit.
+deployment: unified
+pools:
+  main:
+    groups:
+      - replicas: ${replicas}
+        arch:
+          preset: glm53_flash_vllm_nvfp4_kda_dsa_moe
+          tp_size: ${tp_size}
+          enable_expert_parallel: ${enable_expert_parallel}
+          max_model_len: ${max_model_len}
+        worker:
+          type: chunked_prefill
+          max_batch_tokens: 2048
+          batch_policy: mix
+          prefill_chunk_alignment: plain
+          attn_gpu_memory_gb: 89.13
+sweep:
+  replicas: [1, 2]
+  tp_size: [4, 8]
+  enable_expert_parallel: [true, false]
+  max_model_len: [8192, 131072, 524288]

@@ -1,54 +1,69 @@
-# Reader-facing identity of each model config, for the Kernel Library.
+# Reader-facing identity of each checkpoint, for the public site.
 #
-# model/config/*.json mirror the checkpoints' Hugging Face configs and carry no
-# display name, so this file names them. Keyed like `#[supported]` rows: the
-# file stem in model/config/. `family` groups models on the site; `checkpoint`
-# is the Hugging Face repository the config was taken from.
-llama3_8b:
-  name: Llama 3 8B
+# Keyed by the checkpoint's Hugging Face repository. `config` is the stem of the
+# model/config/*.json that describes its structure: a verbatim HF config, kept
+# once per structure, so checkpoints that differ only in weights (a thinking
+# release, a later version of one architecture) share one file. `family` groups
+# models on the site.
+meta-llama/Llama-3.1-8B:
+  name: Llama 3.1 8B
   family: Llama
-  checkpoint: meta-llama/Meta-Llama-3-8B
-qwen3_235b:
+  config: llama3_8b
+Qwen/Qwen3-235B-A22B:
   name: Qwen3 235B-A22B
   family: Qwen
-  checkpoint: Qwen/Qwen3-235B-A22B
-qwen3_235b_fp8:
+  config: qwen3_235b
+Qwen/Qwen3-235B-A22B-FP8:
   name: Qwen3 235B-A22B FP8
   family: Qwen
-  checkpoint: Qwen/Qwen3-235B-A22B-FP8
-qwen3_235b_thinking_2507_fp8:
+  config: qwen3_235b_fp8
+# Differs from Qwen3-235B-A22B-FP8 in rope_theta and max_position_embeddings,
+# which no Qwen arch reads.
+Qwen/Qwen3-235B-A22B-Thinking-2507-FP8:
   name: Qwen3 235B-A22B Thinking 2507 FP8
   family: Qwen
-  checkpoint: Qwen/Qwen3-235B-A22B-Thinking-2507-FP8
-qwen3_coder_480b:
+  config: qwen3_235b_fp8
+Qwen/Qwen3-Coder-480B-A35B-Instruct:
   name: Qwen3 Coder 480B-A35B
   family: Qwen
-  checkpoint: Qwen/Qwen3-Coder-480B-A35B-Instruct
-qwen3_6_35b_a3b_fp8:
+  config: qwen3_coder_480b
+Qwen/Qwen3.6-35B-A3B-FP8:
   name: Qwen3.6 35B-A3B FP8
   family: Qwen
-  checkpoint: Qwen/Qwen3.6-35B-A3B-FP8
-deepseek_v4_flash_0731:
+  config: qwen3_6_35b_a3b_fp8
+deepseek-ai/DeepSeek-V4-Flash-0731:
   name: DeepSeek V4 Flash 0731
   family: DeepSeek
-  checkpoint: deepseek-ai/DeepSeek-V4-Flash-0731
-glm52:
+  config: deepseek_v4_flash_0731
+zai-org/GLM-5.2:
   name: GLM-5.2
   family: GLM
-  checkpoint: zai-org/GLM-5.2
-glm52_fp8:
+  config: glm52
+zai-org/GLM-5.2-FP8:
   name: GLM-5.2 FP8
   family: GLM
-  checkpoint: zai-org/GLM-5.2-FP8
-glm52_nvfp4:
+  config: glm52_fp8
+nvidia/GLM-5.2-NVFP4:
   name: GLM-5.2 NVFP4
   family: GLM
-  checkpoint: nvidia/GLM-5.2-NVFP4
-glm53_nvfp4:
+  config: glm52_nvfp4
+# GLM-5.3's target is the GLM-5.2 graph: its config differs only in
+# transformers_version, and its quantization config describes the same scheme.
+incoai/GLM-5.3-NVFP4:
   name: GLM-5.3 NVFP4
   family: GLM
-  checkpoint: incoai/GLM-5.3-NVFP4
-glm53_flash:
+  config: glm52_nvfp4
+zai-org/GLM-5.3-Flash:
   name: GLM-5.3-Flash
   family: GLM
-  checkpoint: zai-org/GLM-5.3-Flash
+  config: glm53_flash
+# The ModelOpt NVFP4 export of GLM-5.3-Flash: routed experts and the dense FFN
+# in NVFP4; attention, routers and the shared expert stay BF16.
+nvidia/GLM-5.3-Flash-NVFP4:
+  name: GLM-5.3-Flash NVFP4
+  family: GLM
+  config: glm53_flash_nvfp4
+deepseek-ai/DeepSeek-V4.1-Flash:
+  name: DeepSeek V4.1 Flash
+  family: DeepSeek
+  config: deepseek_v41_flash

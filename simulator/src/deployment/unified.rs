@@ -9,7 +9,8 @@
 //! `hp_unified`, `glm52_vllm_dsa_moe` + `hp_unified`, and
 //! `glm52_vllm_nvfp4_dsa_moe` + either `hp_unified` or `chunked_prefill`,
 //! `glm52_vllm_nvfp4_dsa_moe_speculative` + `speculative`, and
-//! `glm52_sglang_nvfp4_tp_dsa_moe` + `chunked_prefill`. GLM's TP1 local
+//! `glm52_sglang_nvfp4_tp_dsa_moe` + `chunked_prefill`, and `deepseek_v4_vllm`
+//! / `deepseek_v41_vllm` + either `hp_unified` or `chunked_prefill`. GLM's TP1 local
 //! attention uses one independent KV/input partition per EP rank; the worker
 //! shells and mutable request/KV lifecycle are unchanged. Each wired arm
 //! monomorphizes its concrete model/worker pair and
@@ -40,8 +41,9 @@ use crate::timing::PerfApiBridge;
 use crate::worker::{
     build_barebone_worker, build_chunked_prefill_worker, build_hp_worker,
     build_hybrid_chunked_prefill_worker, build_qwen36_hybrid_worker, build_speculative_worker,
-    resolve_prefix_cache_config, BatchPolicy, IterWorker, IterWorkerSel, KvAdmissionConfig,
-    PendingOrderKind, PrefixCacheMode, PrefixCachePolicy, WorkerConfig,
+    resolve_prefix_cache_config, BatchPolicy, DpPlacement, IterWorker, IterWorkerSel,
+    KvAdmissionConfig, PendingOrderKind, PrefillChunkAlignment, PrefixCacheMode, PrefixCachePolicy,
+    WorkerConfig,
 };
 
 use super::Deployment;
@@ -161,6 +163,9 @@ impl Deployment for UnifiedDeployment {
             IterWorkerSel::PdPrefill { .. } | IterWorkerSel::PdDecode { .. } => {
                 bail!("unified: pd_prefill / pd_decode workers belong to the `pd` deployment")
             }
+            IterWorkerSel::PipelineChunkedPrefill { .. } => {
+                bail!("unified: the pipeline_chunked_prefill worker belongs to the `pp` deployment")
+            }
         };
         let prefix_cache = resolve_prefix_cache_config(
             "unified",
@@ -182,8 +187,13 @@ impl Deployment for UnifiedDeployment {
             kv_admission,
             prefix_cache,
             ssm_checkpoint_interval_tokens: ssm_checkpoint_interval_tokens(&g.worker),
+            prefill_chunk_alignment: prefill_chunk_alignment(&g.worker),
             speculative_draft_tokens: speculative_draft_tokens(&g.worker),
             speculative_acceptance_seed: speculative_acceptance_seed(&g.worker),
+            dp_placement: match &g.worker {
+                IterWorkerSel::ChunkedPrefill { dp_placement, .. } => *dp_placement,
+                _ => DpPlacement::RoundRobin,
+            },
             ..WorkerConfig::default()
         };
 
@@ -247,6 +257,18 @@ impl Deployment for UnifiedDeployment {
             // hp_unified recipes would leave the KDA state invisible.
             IterArchSel::Glm53FlashVllmFp8KdaDsaMoe {
                 tp_size,
+                enable_expert_parallel,
+                max_model_len,
+                routing,
+                routing_seed,
+                expert_popularity_file,
+                token_corpus_file,
+                cudagraph_capture_sizes,
+                ..
+            }
+            | IterArchSel::Glm53FlashVllmNvfp4KdaDsaMoe {
+                tp_size,
+                enable_expert_parallel,
                 max_model_len,
                 routing,
                 routing_seed,
@@ -255,10 +277,12 @@ impl Deployment for UnifiedDeployment {
                 cudagraph_capture_sizes,
                 ..
             } => {
-                ensure_hybrid_worker("GLM-5.3-Flash vLLM FP8", &g.worker)?;
+                ensure_hybrid_worker("GLM-5.3-Flash vLLM", &g.worker)?;
                 let model = Arc::new(arch_build::glm53_flash_vllm_fp8_kda_dsa_moe(
                     model_spec,
+                    arch_build::glm53_flash_quant(&g.arch),
                     *tp_size,
+                    *enable_expert_parallel,
                     *max_model_len,
                     *routing,
                     *routing_seed,
@@ -270,7 +294,56 @@ impl Deployment for UnifiedDeployment {
                     bridge,
                 )?);
                 assemble_hybrid_flow(
-                    "GLM-5.3-Flash vLLM FP8",
+                    "GLM-5.3-Flash vLLM",
+                    model,
+                    store,
+                    worker_config,
+                    log_dir,
+                    gpu_name,
+                    dp_cfg,
+                    &g.worker,
+                )
+            }
+            // Same hybrid KV as the TP arch, held per DP rank: each rank's
+            // partition charges its own requests' MLA/kpool KV and KDA state.
+            IterArchSel::Glm53FlashVllmFp8DpAttnEpMoe {
+                ep_size,
+                max_model_len,
+                routing,
+                routing_seed,
+                expert_popularity_file,
+                token_corpus_file,
+                cudagraph_capture_sizes,
+                ..
+            }
+            | IterArchSel::Glm53FlashVllmNvfp4DpAttnEpMoe {
+                ep_size,
+                max_model_len,
+                routing,
+                routing_seed,
+                expert_popularity_file,
+                token_corpus_file,
+                cudagraph_capture_sizes,
+                ..
+            } => {
+                // Barebone's hybrid recipe holds one partition, not one per rank.
+                ensure_chunked_prefill_worker("GLM-5.3-Flash vLLM DP-attention/EP", &g.worker)?;
+                let model = Arc::new(arch_build::glm53_flash_vllm_fp8_dp_attn_ep_moe(
+                    model_spec,
+                    arch_build::glm53_flash_quant(&g.arch),
+                    *ep_size,
+                    *max_model_len,
+                    *routing,
+                    *routing_seed,
+                    expert_popularity_file.as_deref(),
+                    token_corpus_file.as_deref(),
+                    cudagraph_capture_sizes,
+                    &gpu_name,
+                    MODEL_NAME,
+                    bridge,
+                )?);
+                assemble_hybrid_flow(
+                    "GLM-5.3-Flash vLLM DP-attention/EP",
                     model,
                     store,
                     worker_config,
@@ -457,12 +530,63 @@ impl Deployment for UnifiedDeployment {
                     *routing_seed,
                     expert_popularity_file.as_deref(),
                     serialize_streams,
+                    chunk_tokens(&g.worker),
                     &gpu_name,
                     MODEL_NAME,
                     bridge,
                 )?);
                 assemble_hp_or_chunked_flow(
                     "DeepSeek-V4",
+                    model,
+                    store,
+                    worker_config,
+                    log_dir,
+                    gpu_name,
+                    dp_cfg,
+                    &g.worker,
+                )
+            }
+            arch @ (IterArchSel::DeepseekV41Vllm {
+                routing,
+                routing_seed,
+                expert_popularity_file,
+                token_corpus_file,
+                decoder_swa_bounded_replay,
+                max_model_len,
+                ..
+            }
+            | IterArchSel::DeepseekV41VllmSerialStreams {
+                routing,
+                routing_seed,
+                expert_popularity_file,
+                token_corpus_file,
+                decoder_swa_bounded_replay,
+                max_model_len,
+                ..
+            }) => {
+                // Pure TP4 attention (one attention group, four replicated KV
+                // shards) like the GLM-5.2 SGLang TP4 arch. The worker's
+                // `FullAttnKv` sizes on the arch's per-token compressed + index
+                // pages; the sliding-window cache is a per-request constant the
+                // arch leaves out (see `total_kv_bytes_per_token`).
+                ensure_hp_or_chunked_worker("DeepSeek-V4.1", &g.worker)?;
+                let serialize_streams =
+                    matches!(arch, IterArchSel::DeepseekV41VllmSerialStreams { .. });
+                let model = Arc::new(arch_build::deepseek_v41_vllm(
+                    model_spec,
+                    *routing,
+                    *routing_seed,
+                    expert_popularity_file.as_deref(),
+                    token_corpus_file.as_deref(),
+                    serialize_streams,
+                    *decoder_swa_bounded_replay,
+                    *max_model_len,
+                    &gpu_name,
+                    MODEL_NAME,
+                    bridge,
+                )?);
+                assemble_hp_or_chunked_flow(
+                    "DeepSeek-V4.1",
                     model,
                     store,
                     worker_config,
@@ -622,6 +746,54 @@ impl Deployment for UnifiedDeployment {
                     build_speculative_worker,
                 ))
             }
+            IterArchSel::Glm52VllmNvfp4DpAttnDsaMoe {
+                ep_size,
+                nvl_num_gpu,
+                max_model_len,
+                routing,
+                routing_seed,
+                expert_popularity_file,
+                token_corpus_file,
+                cudagraph_capture_sizes,
+                ..
+            } => {
+                ensure_hp_or_chunked_worker("GLM-5.2 NVFP4 DP attention", &g.worker)?;
+                let model = Arc::new(arch_build::glm52_vllm_nvfp4_dp_attn_dsa_moe(
+                    model_spec,
+                    *ep_size,
+                    *nvl_num_gpu,
+                    *max_model_len,
+                    *routing,
+                    *routing_seed,
+                    expert_popularity_file.as_deref(),
+                    token_corpus_file.as_deref(),
+                    cudagraph_capture_sizes,
+                    &gpu_name,
+                    MODEL_NAME,
+                    bridge,
+                )?);
+                assemble_hp_or_chunked_flow(
+                    "GLM-5.2 NVFP4 DP attention",
+                    model,
+                    store,
+                    worker_config,
+                    log_dir,
+                    gpu_name,
+                    dp_cfg,
+                    &g.worker,
+                )
+            }
+            // A pipeline stage is its own worker cadence, so the arch is not a
+            // unified worker's model.
+            IterArchSel::Glm52VllmNvfp4PpDsaMoe { .. } => {
+                bail!("unified: glm52_vllm_nvfp4_pp_dsa_moe runs only under deployment `pp`")
+            }
+            IterArchSel::Glm53FlashVllmFp8PpKdaDsaMoe { .. }
+            | IterArchSel::Glm53FlashVllmNvfp4PpKdaDsaMoe { .. } => {
+                bail!(
+                    "unified: the glm53_flash_vllm_*_pp_kda_dsa_moe archs run only under deployment `pp`"
+                )
+            }
             IterArchSel::Glm52SglangNvfp4TpDsaMoe {
                 tp_size,
                 max_model_len,
@@ -683,6 +855,13 @@ fn ensure_hybrid_worker(arch_name: &str, worker: &IterWorkerSel) -> anyhow::Resu
     }
 }
 
+fn ensure_chunked_prefill_worker(arch_name: &str, worker: &IterWorkerSel) -> anyhow::Result<()> {
+    match worker {
+        IterWorkerSel::ChunkedPrefill { .. } => Ok(()),
+        other => bail!("unified: {arch_name} requires worker `chunked_prefill`, got {other:?}"),
+    }
+}
+
 fn assemble_hybrid_flow<M>(
     arch_name: &str,
     model: Arc<M>,
@@ -731,6 +910,18 @@ fn ssm_checkpoint_interval_tokens(worker: &IterWorkerSel) -> Option<u32> {
     }
 }
 
+/// The `chunked_prefill` selector's hybrid chunk alignment; every other
+/// selector keeps the checkpoint-aligned default.
+fn prefill_chunk_alignment(worker: &IterWorkerSel) -> PrefillChunkAlignment {
+    match worker {
+        IterWorkerSel::ChunkedPrefill {
+            prefill_chunk_alignment,
+            ..
+        } => *prefill_chunk_alignment,
+        _ => PrefillChunkAlignment::default(),
+    }
+}
+
 /// Prefill-iteration multiplier of any co-located selector. The PD selectors do
 /// not carry it: every PD prefill iteration schedules prefill and no PD decode
 /// iteration does, so `gpu_time_multiplier` already expresses either stage.
@@ -752,7 +943,9 @@ fn prefill_gpu_time_multiplier(worker: &IterWorkerSel) -> anyhow::Result<Option<
             prefill_gpu_time_multiplier,
             ..
         } => *prefill_gpu_time_multiplier,
-        IterWorkerSel::PdPrefill { .. } | IterWorkerSel::PdDecode { .. } => None,
+        IterWorkerSel::PdPrefill { .. }
+        | IterWorkerSel::PdDecode { .. }
+        | IterWorkerSel::PipelineChunkedPrefill { .. } => None,
     };
     if let Some(multiplier) = multiplier {
         ensure!(
@@ -808,6 +1001,17 @@ fn ensure_hp_unified(worker: &IterWorkerSel) -> anyhow::Result<()> {
         other => {
             bail!("unified: this DP-attention/MoE arch requires worker `hp_unified`, got {other:?}")
         }
+    }
+}
+
+/// The most tokens one step of `worker` runs: its chunk under chunked
+/// prefill; None for a worker that runs each prompt whole.
+fn chunk_tokens(worker: &IterWorkerSel) -> Option<u32> {
+    match worker {
+        IterWorkerSel::ChunkedPrefill {
+            max_batch_tokens, ..
+        } => Some(*max_batch_tokens),
+        _ => None,
     }
 }
 
@@ -941,6 +1145,8 @@ mod tests {
             kv_admission: crate::worker::config::KvAdmissionSpec::default(),
             gpu_time_multiplier: 1.0,
             prefill_gpu_time_multiplier: None,
+            dp_placement: DpPlacement::RoundRobin,
+            prefill_chunk_alignment: PrefillChunkAlignment::Checkpoint,
         }
     }
 
@@ -1089,7 +1295,7 @@ mod tests {
     fn glm52_unified_config_preserves_ep8_hp_pairing() {
         let yaml = r#"
 deployment: unified
-workload: { trace_files: ["trace/smoke.csv"], input_file_format: text-generation-independent, arrival_mode: trace_timed, session_dependency: independent, duration_ms: 1000.0, run_to_end: true, request_rate: 1.0 }
+workload: { trace_files: ["trace/smoke.csv"], input_file_format: text-generation-independent, arrival_mode: trace_timed, duration_ms: 1000.0, run_to_end: true, request_rate: 1.0 }
 io: { log_dir: "logs/test", log_level: info, quiet: true, force_cache_build: false, log_output_token_times: false }
 pools:
   main:
@@ -1175,7 +1381,7 @@ pools:
         // shows up here rather than at run time.
         let yaml = r#"
 deployment: unified
-workload: { trace_files: ["trace/smoke.csv"], input_file_format: text-generation-independent, arrival_mode: trace_timed, session_dependency: independent, duration_ms: 1000.0, run_to_end: true, request_rate: 1.0 }
+workload: { trace_files: ["trace/smoke.csv"], input_file_format: text-generation-independent, arrival_mode: trace_timed, duration_ms: 1000.0, run_to_end: true, request_rate: 1.0 }
 io: { log_dir: "logs/test", log_level: info, quiet: true, force_cache_build: false, log_output_token_times: false }
 pools:
   main:

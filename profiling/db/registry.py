@@ -11,6 +11,7 @@ the accumulated specs.
 from __future__ import annotations
 
 import importlib
+import re
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from enum import StrEnum
@@ -20,6 +21,7 @@ from profiling.db.args import DType, KernelArgs
 from profiling.db.doc import BackendDoc
 from profiling.db.kind import KernelKind
 from profiling.db.outlier import BatchOutlierPolicy
+from profiling.gpu_catalog import gpu_architecture, gpu_compute_capability, gpu_vendor
 from profiling.runners.metrics import Metrics, RunnerResult
 
 ProfileFn = Callable[..., Metrics]
@@ -55,9 +57,25 @@ class RunnerRef:
         return runner
 
 
+# NVIDIA target names a kernel build is compiled for: ``sm_<major><minor>`` plus
+# ``a`` (arch-specific: that exact compute capability) or ``f`` (family: every
+# minor of that major, e.g. ``sm_100f`` = SM100 and SM103).
+_SM_TARGET = re.compile(r"sm_(\d+)(\d)([af])")
+
+
+def _sm_target_matches(target: str, capability: tuple[int, int]) -> bool:
+    match = _SM_TARGET.fullmatch(target)
+    if match is None:
+        raise ValueError(f"unknown sm target {target!r}; expected e.g. 'sm_90a' or 'sm_100f'")
+    major, minor, kind = int(match[1]), int(match[2]), match[3]
+    if kind == "a":
+        return capability == (major, minor)
+    return capability[0] == major
+
+
 @dataclass(frozen=True)
 class BackendSupport:
-    """Which dtypes / GPU a ``(kernel_kind, backend)`` can actually run.
+    """Which dtypes / devices a ``(kernel_kind, backend)`` can actually run.
 
     The single source of truth for backend-selection validation and the dry-run
     ``options`` column — NOT ``profile.db`` row presence. A cold cache has no
@@ -75,11 +93,29 @@ class BackendSupport:
       fp8-kv, which is a current production config. Only fp8 *compute* needs
       ``fa3``. Keeping ``compute`` and ``kv`` separate is what lets ``fa2`` stay
       valid for fp8-KV while ``cudnn`` (bf16-kv only) is correctly excluded.
-    - ``gpus`` — ``None`` = any GPU; a set restricts to those ``gpu_name`` values.
-    - ``compute_gpu_pairs`` — optional non-Cartesian refinement for backends
-      whose verified dtype set differs by GPU. When both dtype and GPU are
-      known, the pair must be present in this set in addition to passing the
-      independent axes.
+
+    The device axis is the CUDA compute capability the kernel build genuinely
+    needs, never the GPUs it happens to be measured on: a missing profile row is
+    a data gap the profiler fills, not a reason to refuse a backend. Declare it
+    only with source evidence. The worker checks it against the real device
+    before it loads the runner, so a runner does not repeat it.
+
+    - ``min_compute_capability`` — the oldest ``(major, minor)`` that can run the
+      kernel at all, e.g. ``(8, 9)`` for a Triton FP8 e4m3 conversion.
+    - ``sm_targets`` — the arch-specific builds the kernel exists for, as NVIDIA
+      target names: ``sm_90a`` = exactly SM90, ``sm_100f`` = the SM10x family.
+      The device must match one of them.
+    - ``arch_targets`` — the AMD-architecture analog of ``sm_targets``, as the
+      catalog's ``architecture`` names (e.g. ``"CDNA3"`` for MI300X). AMD parts
+      have no CUDA compute capability, so this is the gate a ROCm-only backend
+      declares. The two target spaces are parallel on purpose: ``sm_targets``
+      gates NVIDIA devices, ``arch_targets`` gates AMD devices, and the device's
+      vendor (from the catalog) selects which applies.
+
+    A GPU name resolves to its vendor, compute capability and architecture
+    through ``gpu/spec.json`` (``profiling.gpu_catalog``). A GPU the catalog does
+    not know, or a call without a GPU, skips the device check — the worker still
+    checks the real device when it profiles.
 
     The profile.db cache still keys on the full dtype tuple; this type only gates
     *which backends are legal*. Fine, per-request shape constraints (e.g. cudnn
@@ -89,8 +125,9 @@ class BackendSupport:
 
     compute: frozenset[DType] | None
     kv: frozenset[DType] | None = None
-    gpus: frozenset[str] | None = None
-    compute_gpu_pairs: frozenset[tuple[DType, str]] | None = None
+    min_compute_capability: tuple[int, int] | None = None
+    sm_targets: frozenset[str] | None = None
+    arch_targets: frozenset[str] | None = None
 
     def allows(
         self,
@@ -102,15 +139,64 @@ class BackendSupport:
             return False
         if self.kv is not None and kv_dtype is not None and kv_dtype not in self.kv:
             return False
-        if self.gpus is not None and gpu is not None and gpu not in self.gpus:
+        if gpu is None:
+            return True
+        return self.allows_device(gpu)
+
+    @property
+    def _has_cuda_device_rule(self) -> bool:
+        return self.min_compute_capability is not None or self.sm_targets is not None
+
+    def allows_device(self, gpu: str) -> bool:
+        """Whether the device named ``gpu`` can run the kernel. The device's
+        vendor (from ``gpu/spec.json``) selects the gate: NVIDIA parts gate on
+        CUDA compute capability (``min_compute_capability`` / ``sm_targets``);
+        AMD parts gate on ``arch_targets``. An unknown GPU (not in the catalog)
+        is not refused — the worker still checks the real device at profile time."""
+        vendor = gpu_vendor(gpu)
+        if vendor is None:
+            return True
+        if vendor == "NVIDIA":
+            # An AMD-only backend (arch_targets but no CUDA rule) cannot run here.
+            if self.arch_targets is not None and not self._has_cuda_device_rule:
+                return False
+            return self.allows_compute_capability(gpu_compute_capability(gpu))
+        # Non-NVIDIA part (e.g. an AMD CDNA GPU).
+        if self.arch_targets is not None:
+            return gpu_architecture(gpu) in self.arch_targets
+        # No AMD gate. A device-agnostic backend (``compute is None``: a comm
+        # size-keyed / elementwise byte-keyed kernel) runs on any device and is
+        # not refused here — the worker checks the real device at profile time.
+        # A compute kernel gated only for CUDA (``compute`` set, no arch_targets)
+        # is CUDA-only and cannot run on a CDNA part.
+        return self.compute is None
+
+    def allows_compute_capability(self, capability: tuple[int, int] | None) -> bool:
+        """Whether a device of this CUDA compute capability can run the kernel;
+        ``None`` (unknown device) is not refused. NVIDIA device gate only;
+        ``arch_targets`` is handled by :meth:`allows_device`."""
+        if capability is None:
+            return True
+        if self.min_compute_capability is not None and capability < self.min_compute_capability:
             return False
-        if (
-            self.compute_gpu_pairs is not None
-            and gpu is not None
-            and (compute_dtype, gpu) not in self.compute_gpu_pairs
+        if self.sm_targets is not None and not any(
+            _sm_target_matches(target, capability) for target in self.sm_targets
         ):
             return False
         return True
+
+    def device_rule(self) -> str | None:
+        """The device requirement in words (``"sm_90a or sm_100f"``, ``"CDNA3"``),
+        or ``None`` when the backend runs on any device."""
+        rules = []
+        if self.min_compute_capability is not None:
+            major, minor = self.min_compute_capability
+            rules.append(f"compute capability {major}.{minor}+")
+        if self.sm_targets is not None:
+            rules.append(" or ".join(sorted(self.sm_targets)))
+        if self.arch_targets is not None:
+            rules.append(" or ".join(sorted(self.arch_targets)))
+        return " and ".join(rules) or None
 
 
 # Permissive default for specs that do not declare a capability (test fixtures);
@@ -156,9 +242,6 @@ class KernelProfilerSpec:
     @property
     def runner_module(self) -> str:
         return self.subprocess_module or self.runner_ref.module_name
-
-    def load_runner(self) -> ProfileFn:
-        return self.runner_ref.load(self.runner_module)
 
     def load_list_runner(self) -> ListRunnerFn:
         """Load the runner as a list runner: native if ``list_native``, else the
@@ -257,26 +340,23 @@ def _validate_registry(registry: list[KernelProfilerSpec]) -> None:
                     f"{profiler_spec.kernel_kind}:{profiler_spec.backend} declares an "
                     f"empty {axis} dtype set; use None for a {axis}-agnostic axis"
                 )
-        if supports.compute_gpu_pairs is not None:
-            if not supports.compute_gpu_pairs:
+        if supports.sm_targets is not None:
+            if not supports.sm_targets:
                 raise ValueError(
                     f"{profiler_spec.kernel_kind}:{profiler_spec.backend} declares an "
-                    "empty compute_gpu_pairs set; use None when no pair refinement is needed"
+                    "empty sm_targets set; use None when any architecture runs it"
                 )
-            if supports.compute is not None and any(
-                dtype not in supports.compute for dtype, _gpu in supports.compute_gpu_pairs
-            ):
-                raise ValueError(
-                    f"{profiler_spec.kernel_kind}:{profiler_spec.backend} declares a "
-                    "compute_gpu_pairs dtype outside its compute axis"
-                )
-            if supports.gpus is not None and any(
-                gpu not in supports.gpus for _dtype, gpu in supports.compute_gpu_pairs
-            ):
-                raise ValueError(
-                    f"{profiler_spec.kernel_kind}:{profiler_spec.backend} declares a "
-                    "compute_gpu_pairs GPU outside its gpus axis"
-                )
+            for target in supports.sm_targets:
+                if _SM_TARGET.fullmatch(target) is None:
+                    raise ValueError(
+                        f"{profiler_spec.kernel_kind}:{profiler_spec.backend} declares "
+                        f"unknown sm target {target!r}; expected e.g. 'sm_90a' or 'sm_100f'"
+                    )
+        if supports.arch_targets is not None and not supports.arch_targets:
+            raise ValueError(
+                f"{profiler_spec.kernel_kind}:{profiler_spec.backend} declares an "
+                "empty arch_targets set; use None when any architecture runs it"
+            )
 
         _validate_worker_env(profiler_spec)
 
@@ -378,10 +458,6 @@ def find_kernel_profiler_spec(
         if profiler_spec.backend == backend:
             return profiler_spec
     raise KeyError(f"no profiler spec registered for {kernel_kind}:{backend}")
-
-
-def load_runner(kernel_kind: KernelKind, backend: str) -> ProfileFn:
-    return find_kernel_profiler_spec(kernel_kind, backend).load_runner()
 
 
 def find_table(kernel_kind: KernelKind, backend: str) -> str:

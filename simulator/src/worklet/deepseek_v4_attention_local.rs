@@ -815,12 +815,9 @@ fn normalize_input(
     input: &DeepseekV4AttentionLocalWorkletInput,
     config: &DeepseekV4AttentionLocalWorkletConfig,
 ) -> Result<NormalizedInput, String> {
-    if input.num_tokens > config.max_num_batched_tokens {
-        return Err(format!(
-            "num_tokens {} exceeds {}",
-            input.num_tokens, config.max_num_batched_tokens
-        ));
-    }
+    // A step past `max_num_batched_tokens` is not refused: vLLM never schedules
+    // one, but a worker that admits one is still priced, its kernels past
+    // their query axis (`causal_rows::query_axis`) answered off the grid.
     let decode_rows = u32::try_from(input.decode_kv_lens.len())
         .map_err(|_| "decode row count exceeds u32".to_string())?;
     let mut active_rows = decode_rows;
@@ -948,11 +945,6 @@ fn validate_config(config: &DeepseekV4AttentionLocalWorkletConfig) -> Result<(),
             INDEX_HEAD_DIM,
         ),
         ("selected_k", config.selected_k, SELECTED_K),
-        (
-            "max_num_batched_tokens",
-            config.max_num_batched_tokens,
-            8192,
-        ),
     ];
     for (name, actual, expected) in identity {
         if actual != expected {
@@ -995,7 +987,7 @@ fn compose_parallel(children: Vec<CostNode>, serialize_streams: bool) -> CostNod
     if serialize_streams {
         CostNode::Sum(children)
     } else {
-        CostNode::Max {
+        CostNode::Parallel {
             overlap: 1.0,
             children,
         }
@@ -1071,6 +1063,19 @@ mod tests {
             vec![7, 15, 12, 13, 14, 15, 8]
         );
         assert_eq!(work.compressor.row_request_ids, vec![0, 1, 2, 2, 2, 2, 3]);
+    }
+
+    #[test]
+    fn a_step_past_the_token_budget_is_normalized_not_refused() {
+        let mut config = config();
+        config.max_num_batched_tokens = 4;
+        let input = DeepseekV4AttentionLocalWorkletInput {
+            num_tokens: 8,
+            num_insert_tokens: 7,
+            prefill_query_context_pairs: vec![(4, 16), (1, 9)],
+            decode_kv_lens: vec![7, 15],
+        };
+        assert_eq!(normalize_input(&input, &config).unwrap().gemm.m, 8);
     }
 
     #[test]

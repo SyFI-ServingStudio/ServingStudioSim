@@ -29,10 +29,7 @@ from profiling.profilers.timer import Timer
 from profiling.runners.attention._gdn_common import (
     exact_int as _exact_int,
 )
-from profiling.runners.attention._gdn_common import (
-    load_required_callable,
-    require_exact_gpu,
-)
+from profiling.runners.attention._gdn_common import load_required_callable
 from profiling.runners.exceptions import (
     KernelLaunchFailed,
     OOMError,
@@ -121,7 +118,7 @@ def profile_gdn_chunk_delta_rule_flashinfer(
     value_head_dim: int,
     dtype: DType | str,
 ) -> ComputeMetrics:
-    """Profile FlashInfer's single-launch GDN prefill delta rule on an H200."""
+    """Profile FlashInfer's single-launch GDN prefill delta rule on SM90."""
     args = _validate_args(
         num_tokens,
         max_sequence_length,
@@ -137,7 +134,6 @@ def profile_gdn_chunk_delta_rule_flashinfer(
         raise ProfilerNotImplemented(f"PyTorch is required for {_BACKEND}") from exc
 
     try:
-        require_exact_gpu(torch, backend=_BACKEND, required_gpu="NVIDIA H200")
         fused_callable = load_required_callable(
             importlib.import_module,
             backend=_BACKEND,

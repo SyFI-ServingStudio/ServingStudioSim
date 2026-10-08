@@ -138,7 +138,7 @@ register(
         kernel_kind=KIND,
         backend="torch_rocm",
         # Byte-keyed / uint8 — dtype-agnostic.
-        supports=BackendSupport(compute=None, gpus=frozenset({"MI300X"})),
+        supports=BackendSupport(compute=None, arch_targets=frozenset({"CDNA3"})),
         runner_ref=RunnerRef(
             module_name="profiling.runners.elementwise.torch_rocm",
             function_name="profile_elementwise_torch_rocm",

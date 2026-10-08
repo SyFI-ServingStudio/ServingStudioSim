@@ -42,9 +42,6 @@ def profile_residual_rms_norm(
             "torch is required for the residual_rms_norm Torch backend"
         ) from exc
 
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented("CUDA is required for the residual_rms_norm Torch backend")
-
     try:
         torch_dtype = dtype.torch()
         x = torch.randn(m, hidden, dtype=torch_dtype, device="cuda")

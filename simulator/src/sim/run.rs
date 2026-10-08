@@ -25,11 +25,12 @@ const HEARTBEAT_INTERVAL_MS: f64 = 1000.0;
 /// consecutive rows, so this is its raw temporal resolution.
 const REQUEST_STATE_SNAPSHOT_INTERVAL_MS: f64 = 10_000.0;
 
-/// Sim-time between stuck-watchdog samples. The watchdog is an O(1) liveness
-/// check (did `completed` or the admitted-id watermark advance since the last
-/// sample), so the cadence only bounds how fast a true stall is detected, not
-/// hot-loop cost. With `stuck_threshold` (60 s) below this interval, one sample
-/// window with no progress flags the deadlock.
+/// Sim-time between stuck-watchdog samples. The watchdog compares a liveness
+/// snapshot (completions, the admitted-id watermark, and the admitted requests'
+/// summed token progress) with the previous sample; it runs only after the trace
+/// is exhausted and once per sample, so the cadence bounds how fast a true stall
+/// is detected, not hot-loop cost. With `stuck_threshold` (60 s) below this
+/// interval, one sample window with no progress flags the deadlock.
 const WATCHDOG_SAMPLE_MS: f64 = 100_000.0;
 
 /// Iteration-count gate shared by every periodic step in the tick loop
@@ -73,7 +74,8 @@ pub enum TerminationCause {
     DrainComplete,
     /// `--duration-ms` reached with work still outstanding (default, no run_to_end).
     DurationReached,
-    /// Trace exhausted but in-flight work made no progress for `stuck_threshold`.
+    /// Trace exhausted but in-flight work made no progress (no completion,
+    /// admission, or processed token) for `stuck_threshold`.
     Stuck,
 }
 
@@ -162,7 +164,7 @@ pub fn run_sim(
 ) -> anyhow::Result<RunSummary> {
     let wall_start = Instant::now();
     let mut clock = Time::ZERO;
-    let mut prev_progress = 0u64;
+    let mut prev_progress = Liveness::default();
     let mut idle_for = Time::ZERO;
     // In-flight is the frontend's ledger (its emitted cursor − completions fed
     // back below), not a per-tick store scan (that scan was ~90% of runtime on
@@ -240,15 +242,16 @@ pub fn run_sim(
             break TerminationCause::DurationReached;
         }
 
-        // 3b. Stuck watchdog — O(1), no store scan. Progress means a request
-        //     completed OR a new request was admitted since the last sample.
-        //     Both are monotonic, so their sum advances iff one did. A full
-        //     sample window with neither advancing (trace already drained, work
-        //     still in flight) is a deadlock. Only checked post-exhaustion,
-        //     where Stuck can occur.
+        // 3b. Stuck watchdog. Progress means a request completed, a new request
+        //     was admitted, or an admitted request processed a prefill or output
+        //     token since the last sample. A full sample window with none of
+        //     these (trace already drained, work still in flight) is a deadlock;
+        //     a long decode tail with nothing completing is not. Only checked
+        //     post-exhaustion, where Stuck can occur, and once per sample, so the
+        //     store scan stays off the hot loop.
         if exhausted && in_flight > 0 && watchdog.fire() {
-            let progress = frontend.num_completed() + store.borrow().num_admitted();
-            if progress > prev_progress {
+            let progress = liveness(frontend.num_completed(), &store.borrow());
+            if progress != prev_progress {
                 prev_progress = progress;
                 idle_for = Time::ZERO;
             } else {
@@ -346,6 +349,31 @@ pub fn run_sim(
         summary.realtime_x,
     );
     Ok(summary)
+}
+
+/// What the stuck watchdog compares between samples. Token progress is summed
+/// over every admitted request, so it only changes when work is done; it is
+/// compared for change rather than growth because a retraction may roll a
+/// request's prefill progress back.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Liveness {
+    completed: u64,
+    admitted: u64,
+    tokens: u64,
+}
+
+fn liveness(completed: u64, store: &RequestStore) -> Liveness {
+    Liveness {
+        completed,
+        admitted: store.num_admitted(),
+        tokens: store
+            .iter_admitted()
+            .map(|(_, record)| {
+                u64::from(record.progress.prefill_tokens_processed)
+                    + u64::from(record.progress.output_tokens_emitted)
+            })
+            .sum(),
+    }
 }
 
 /// The two tables flush asymmetrically because they have different shapes:
@@ -477,6 +505,7 @@ fn slo_entry(id: RequestId, now: Time, rec: &RequestRecord) -> RequestSloEntry {
         declared_prefix_tokens: rec.request.definition.session.declared_prefix_tokens(),
         prefix_cache_hit_tokens: rec.telemetry.prefix_cache_hit_tokens,
         fresh_prompt_tokens: rec.request.definition.prompt_tokens,
+        target_output_tokens: rec.request.definition.target_output_tokens,
         retraction_count: rec.telemetry.retraction_count,
         reprocessed_prefill_output_tokens_before: rec
             .telemetry
@@ -513,9 +542,7 @@ mod tests {
         DpPlacementPolicy, SimpleDpConfig, SimpleDpFlow, SimpleDpPoolConfig, UnifiedWorkerFactory,
     };
     use crate::sim::frontend::TraceFrontend;
-    use crate::sim::frontend::{
-        ArrivalSchedule, CapacityLimit, InputFileSchema, SessionDependency,
-    };
+    use crate::sim::frontend::{ArrivalSchedule, CapacityLimit, InputFileSchema};
     use crate::test_helpers::{text_request, FakeModel};
     use crate::worker::{build_barebone_worker, WorkerConfig};
     use std::cell::RefCell;
@@ -554,6 +581,53 @@ mod tests {
     }
 
     #[test]
+    fn a_decode_tail_longer_than_a_watchdog_sample_is_not_stuck() {
+        // One request decoding 300 tokens at 500 ms per iteration: 150 s after
+        // the trace is exhausted with no completion or admission, longer than one
+        // 100 s watchdog sample. Its emitted tokens are the progress.
+        let dir = tempfile::tempdir().unwrap();
+        let trace = write_trace_with_output_len(dir.path(), 1, 300);
+        let store: SharedRequests = Rc::new(RefCell::new(RequestStore::new()));
+        let factory = UnifiedWorkerFactory::new(
+            Arc::new(FakeModel::for_ms(500.0)),
+            Rc::clone(&store),
+            WorkerConfig::default(),
+            None,
+            "test-gpu".to_string(),
+            "main",
+            build_barebone_worker::<FakeModel>,
+        );
+        let cfg = SimpleDpConfig {
+            dp_pool: SimpleDpPoolConfig {
+                pool: PoolId(0),
+                num_workers: 1,
+                placement: DpPlacementPolicy::RoundRobin,
+            },
+        };
+        let mut flow = SimpleDpFlow::new(cfg, factory);
+        let mut frontend = TraceFrontend::load(
+            &[trace],
+            &InputFileSchema::text_generation_independent(),
+            ArrivalSchedule::trace_timed(1.0).unwrap(),
+            CapacityLimit::unlimited(),
+        )
+        .unwrap();
+        let mut logger = LoggerSession::open(dir.path(), true, false).unwrap();
+
+        let summary = run_sim(
+            &mut flow,
+            &store,
+            &mut frontend,
+            &mut logger,
+            &TickCfg::new(1000.0, true, 1000),
+        )
+        .unwrap();
+        assert_eq!(summary.cause, TerminationCause::DrainComplete);
+        assert_eq!(summary.decode_tokens, 300);
+        assert!(summary.sim_ms > WATCHDOG_SAMPLE_MS);
+    }
+
+    #[test]
     fn end_to_end_completes_and_writes_parquet() {
         let dir = tempfile::tempdir().unwrap();
         let trace = write_trace(dir.path(), 4);
@@ -585,7 +659,6 @@ mod tests {
             &InputFileSchema::text_generation_independent(),
             ArrivalSchedule::trace_timed(1.0).unwrap(),
             CapacityLimit::unlimited(),
-            SessionDependency::Independent,
         )
         .unwrap();
         let mut logger = LoggerSession::open(dir.path(), true, false).unwrap();
@@ -652,7 +725,6 @@ mod tests {
             &InputFileSchema::text_generation_independent(),
             ArrivalSchedule::trace_timed(1.0).unwrap(),
             CapacityLimit::unlimited(),
-            SessionDependency::Independent,
         )
         .unwrap();
         let mut logger = LoggerSession::open(dir.path(), false, false).unwrap();

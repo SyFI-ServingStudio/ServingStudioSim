@@ -2,7 +2,8 @@
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::{CacheKind, Extrapolation};
-use crate::timing::kernels::engine::{register_kernel, KernelSpec};
+use crate::timing::kernels::engine::{register_kernel, KernelSpec, OffGrid};
+use crate::timing::kernels::kv_compress_store::FP8_DS_MLA_ROW_BYTES;
 use crate::timing::sweep::{Axis, Coords, SweepGrid};
 use crate::timing::{Dim, KernelConfig, SweepCoords};
 
@@ -47,7 +48,6 @@ pub struct PackedKvCacheGatherKernelInput {
 impl PackedKvCacheGatherKernelInput {
     fn work(&self) -> (u32, f64) {
         assert!(!self.seq_lens.is_empty());
-        assert!(self.seq_lens.len() <= 4);
         assert!(self.gather_lens.is_empty() || self.gather_lens.len() == self.seq_lens.len());
         let selected = if self.gather_lens.is_empty() {
             &self.seq_lens
@@ -103,6 +103,30 @@ fn canonical_input(
     }
 }
 
+/// The profiler's logical bytes: each gathered row read with its slot and
+/// written dequantized, plus the length arrays.
+fn logical_bytes(
+    config: &PackedKvCacheGatherKernelConfig,
+    input: &PackedKvCacheGatherKernelInput,
+) -> f64 {
+    let lengths = if input.gather_lens.is_empty() {
+        &input.seq_lens
+    } else {
+        &input.gather_lens
+    };
+    let gathered: f64 = lengths.iter().map(|&rows| f64::from(rows)).sum();
+    let length_arrays = if input.gather_lens.is_empty() {
+        1.0
+    } else {
+        2.0
+    };
+    gathered
+        * (f64::from(FP8_DS_MLA_ROW_BYTES)
+            + 4.0
+            + f64::from(config.head_dim.get()) * f64::from(config.output_dtype.size_bytes()))
+        + input.seq_lens.len() as f64 * 4.0 * length_arrays
+}
+
 pub struct PackedKvCacheGatherSpec;
 
 impl KernelSpec for PackedKvCacheGatherSpec {
@@ -132,6 +156,16 @@ impl KernelSpec for PackedKvCacheGatherSpec {
 
     fn cache_kind(_backend: &'static str) -> CacheKind {
         CacheKind::Cache2DLinear(Extrapolation::Product)
+    }
+
+    /// Past the grid the copy holds its bandwidth. Unmeasured: the kernel only
+    /// moves rows.
+    fn off_grid(
+        config: &Self::Config,
+        input: &Self::Input,
+        _backend: &'static str,
+    ) -> OffGrid<Self::Input> {
+        OffGrid::Bandwidth(logical_bytes(config, input))
     }
 
     fn enumerate(
@@ -165,7 +199,7 @@ register_kernel!(PackedKvCacheGatherKernel, PackedKvCacheGatherSpec);
 
 #[cfg(test)]
 mod tests {
-    use super::PackedKvCacheGatherKernelInput;
+    use super::*;
     use crate::timing::SweepCoords;
 
     #[test]
@@ -175,5 +209,18 @@ mod tests {
             gather_lens: vec![128, 64],
         };
         assert_eq!(&*input.coords(), &[2.0, 96.0]);
+    }
+
+    #[test]
+    fn logical_bytes_match_a_measured_row() {
+        // A profiled H200 row's logged bandwidth x time.
+        let config: PackedKvCacheGatherKernelConfig =
+            serde_json::from_value(serde_json::json!({"gpu_name": "NVIDIA H200", "workspace_rows": 256, "block_table_width": 3, "block_size": 64, "offset": 128, "num_kv_heads": 1, "head_dim": 512, "fp8_dim": 448, "quant_group_size": 64, "cache_dtype": "fp8_ds_mla", "output_dtype": "bf16", "cache_layout": "block_segregated_data_then_scales", "scale_format": "ue8m0", "backends": ["vllm_cutedsl"], "mode": "full", "suffix_sequence_len": 0, "max_gather_rows": 1, "kv_dtype": "fp8_e4m3"}))
+            .unwrap();
+        let input = PackedKvCacheGatherKernelInput {
+            seq_lens: vec![5, 3],
+            gather_lens: Vec::new(),
+        };
+        assert_eq!(logical_bytes(&config, &input), 12_904.0);
     }
 }

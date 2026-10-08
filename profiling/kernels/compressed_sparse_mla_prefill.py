@@ -92,10 +92,11 @@ register(
         args_schema=CompressedSparseMlaPrefillArgs,
         metric_family=MetricFamily.COMPUTE,
         batch_outlier_policy=BatchOutlierPolicy(),
+        # FlashMLA's Arch::is_sm90a() / is_sm100f(): exactly SM90, or any SM10x.
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
             kv=frozenset({DType.BF16}),
-            gpus=frozenset({"NVIDIA H200"}),
+            sm_targets=frozenset({"sm_90a", "sm_100f"}),
         ),
         subprocess_env="vllm_env",
         doc=BackendDoc(

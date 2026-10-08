@@ -86,7 +86,7 @@ def test_import_is_lazy_for_runner_torch_and_vllm():
         ({"num_tokens": 0}, "num_tokens must be > 0"),
         ({"hidden_size": 0}, "hidden_size must be > 0"),
         ({"hidden_size": 4100}, "divide hidden_size"),
-        ({"group_size": 64}, "requires group_size=128"),
+        ({"group_size": 64, "scale_format": "ue8m0_packed_int32"}, "requires group_size=128"),
         ({"input_dtype": DType.FP16}, "requires input_dtype=bf16"),
         ({"scale_format": "fp32_row_major"}, "ue8m0_column_major"),
     ],
@@ -169,9 +169,17 @@ def test_profile_calls_exact_vllm_op_and_reports_logical_bytes(monkeypatch):
     assert metrics.energy_j == 0.25
 
 
-def test_packed_format_uses_deepgemm_tma_layout_on_blackwell_only():
+@pytest.mark.parametrize("scale_format", ["ue8m0_column_major", "ue8m0_row_major"])
+@pytest.mark.parametrize("group_size", [32, 64, 128])
+def test_generic_kernel_accepts_any_dividing_group_size(scale_format, group_size):
+    # Only the packed register kernel is compiled for group_size 128.
     from profiling.runners.elementwise import fp8_per_token_group_quant as runner
-    from profiling.runners.exceptions import ProfilerNotImplemented
+
+    assert runner._validate_args(64, 4096, group_size, DType.BF16, scale_format)[2] == group_size
+
+
+def test_packed_format_uses_deepgemm_tma_layout_on_any_gpu():
+    from profiling.runners.elementwise import fp8_per_token_group_quant as runner
 
     strided = []
     fake_torch = SimpleNamespace(
@@ -188,8 +196,6 @@ def test_packed_format_uses_deepgemm_tma_layout_on_blackwell_only():
             get_device_name=lambda _device: "NVIDIA H200",
         ),
     )
-    with pytest.raises(ProfilerNotImplemented, match="requires compute capability"):
-        runner._validate_cuda_device(fake_torch, "ue8m0_packed_int32")
     operands = runner._allocate_operands(
         fake_torch, num_tokens=33, hidden_size=4096, group_size=128,
         scale_format="ue8m0_packed_int32",
@@ -218,7 +224,6 @@ def test_exact_vllm_op_matches_torch_reference_on_cuda():
 
     from profiling.runners.elementwise import fp8_per_token_group_quant as runner
 
-    runner._validate_cuda_device(torch)
     quant_op = runner._load_vllm_quant_op(torch)
     input_tensor, output_quantized, output_scales = runner._allocate_operands(
         torch,

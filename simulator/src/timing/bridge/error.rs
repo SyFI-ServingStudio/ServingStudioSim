@@ -52,11 +52,11 @@ pub enum BuildError {
     FitFailed { kind: KernelKind, reason: String },
 
     /// A config's grid cells map to different profile.db args under two of its
-    /// backends in a column other than `backend`. The kernel-config registry
-    /// stores one set of args per cell, so this would record the wrong rows.
+    /// backends in a column other than `backend`. A kernel-config record holds
+    /// one set of args per cell, so this would record the wrong rows.
     #[error(
         "{kind} enumerates different profile.db args for backends {first} and {other}; \
-         the kernel-config registry needs args that differ only in `backend`"
+         a kernel-config record needs args that differ only in `backend`"
     )]
     BackendDependentArgs {
         kind: KernelKind,

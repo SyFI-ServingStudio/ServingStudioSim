@@ -7,7 +7,37 @@ independent-request CSV schema:
 id,input_len,output_len,arrival_time
 ```
 
-`arrival_time` is measured in milliseconds. Generate a deterministic fixed-shape
+`arrival_time` is measured in milliseconds.
+
+### Optional `prefix_len`: a pinned prefix hit
+
+ServingStudio Sim also accepts one optional column, `prefix_len`, in any position:
+
+```text
+id,input_len,output_len,arrival_time,prefix_len
+r0,4096,1,0,32768
+r1,4096,1,0,0
+```
+
+`prefix_len` is the number of tokens before this request's prompt that are
+already resident in the prefix cache when it arrives. `input_len` stays the
+fresh tokens to compute, as in the session schema's `prefix_len,input_len`
+pair, so the request's context after prefill is `prefix_len + input_len`.
+
+The hit is forced. It does not depend on cache state, eviction, the prefix
+cache mode, sessions, or which worker or partition the request lands on. The
+prefix KV is reserved with the request (it counts toward capacity), is released
+when the request completes, and is never retained as a shared cache entry.
+`request_slo` records `declared_prefix_tokens = prefix_cache_hit_tokens =
+prefix_len` and `prefill_processed = input_len`. A missing column, a blank cell,
+or `0` loads exactly as the four-column file does. A row that also declares a
+`session_id` through the `session` tag must use `prefix_kv` instead.
+
+req-frontend does not declare `prefix_len` yet: its replay client rejects a file
+that carries the column (`header does not match ... unexpected: ["prefix_len"]`).
+Keep pinned-prefix traces to the simulator until the client models the hit.
+
+Generate a deterministic fixed-shape
 capacity workload with:
 
 ```bash
@@ -52,6 +82,31 @@ Two properties are deliberate and worth not "tidying up":
 Generated once and committed as data; there is no generator script, so the table
 above is the file's only description. Regenerate it by hand if the ranges need to
 move, and update these numbers with it.
+
+## Capture workloads
+
+The routing captures in the dataset repo `UW-SyFI/servingstudio-workload` each
+replayed one of these traces; each capture's `provenance.json` names the file
+and its `trace.csv` is a byte copy of it. They carry lengths and arrivals only:
+the prompt text (enwik8 or enwik9) is recorded in the capture's provenance.
+
+| File | Requests | Shape | Arrivals |
+|---|---|---|---|
+| `diverse_100.csv` | 100 | above | Poisson |
+| `c32_long.csv` | 64 | 8 each of input {256, 1024, 2048, 4096} x output {128, 256}, round-robin | all at 0; captured saturated at concurrency 32 |
+| `balanced_c32.csv` | 256 | 32 each of the same 8 pairs, in a different order | 1 s apart; captured saturated at concurrency 32 |
+| `ctx8k_out1k.csv` | 256 | all 8192 in / 1024 out | all at 0; captured at concurrency 64 |
+| `shape_grid_128.csv` | 128 | 4 each of input {128 ... 16384} (x2) x output {32, 128, 512, 1024} | all at 0; captured at concurrency 64 |
+
+Copied from the runs that took the captures; there is no generator script. Keep
+the bytes: a reformatted file no longer matches its capture's `trace.csv`.
+
+`quadrant_c48_96.csv` is not a dataset capture: it is the trace the
+DeepSeek-V4.1-Flash nsys capture replayed, which
+`presets/deepseek_v41_flash_b200_vllm_tp4_ep4.yaml` mirrors. 96 requests, 24
+each of (128, 128), (128, 4096), (4096, 128) and (3072, 3072), 1 s apart,
+captured saturated at concurrency 48. The dataset's `quadrant_c48` capture
+replayed a different, 192-request trace.
 
 ## Session-wise traces
 
@@ -107,3 +162,23 @@ cargo run --release --bin tracegen -- coding-session \
 Step 3 also invents the arrival timeline — the corpus has no session arrival
 times — at a default `poisson`, 1 session/s, seed 0. The manifest records all
 three, so the timeline is reproducible rather than merely plausible.
+
+### Prefill-only replay
+
+`session_to_prefill_only.py` turns either session trace into an independent
+trace for prefill studies. Every round becomes one request: its fresh tokens
+are `input_len`, its planned prefix is a pinned `prefix_len` hit, and
+`output_len` is 1. Sessions, tool waits, and the session timeline are dropped.
+
+```bash
+uv run python trace/session_to_prefill_only.py trace/tracelab_preserving.csv \
+  "$TMPDIR/prefill_5k.csv" --requests 5000 --seed 0
+```
+
+`--requests` takes a seeded uniform sample of rounds in random order, and
+arrivals are Poisson at 1 request/s, so a preset's `workload.request_rate`
+sweeps the offered load. With the same seed, the two policies sample the same
+rounds at the same arrival times and differ only in the prefix/fresh split.
+Contexts reach 999,888 tokens, so runs need `max_model_len: 1048576`. The
+pinned prefix is reserved only while its request runs, so this replay measures
+prefill compute, not prefix-cache capacity.

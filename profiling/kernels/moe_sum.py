@@ -32,9 +32,9 @@ DOC = KernelDoc(
     description=(
         "Routed experts leave top_k output rows per token; this "
         "step sums them into one hidden_dim-wide row. vLLM's moe_sum has "
-        "dedicated kernels only for small top_k in the measured build, so top_k"
-        " = 6 falls back to torch's sum over the expert dimension. The expert "
-        "rows are random bf16 values."
+        "dedicated kernels for small top_k and a general kernel for the rest; "
+        "older builds fell back to torch's sum over the expert dimension at "
+        "top_k = 6. The expert rows are random bf16 values."
     ),
     category="MoE",
     subcategory="Routing and combine",
@@ -44,15 +44,11 @@ DOC = KernelDoc(
         "GB/s = 2·num_tokens·hidden_dim·(top_k + 1) / time",
     ),
     default_metric="memory_bandwidth_gbps",
-    method=(
-        f"{CUPTI_METHOD} "
-        "Five warm-up calls run first. Only PyTorch reduce_kernel launches, the"
-        " fallback's kernel, are counted."
-    ),
+    method=(f"{CUPTI_METHOD} Five warm-up calls run first. Every launch of the call is counted."),
     caveats=(
-        "Only top_k = 6 and hidden_dim = 4096 in bf16 on H200 are measured.",
-        "Newer vLLM has a dedicated vectorized kernel for top_k = 6, so these "
-        "rows describe the fallback.",
+        "At top_k = 6 the profiling vLLM build fell back to torch's "
+        "reduce_kernel, so those rows time that kernel; newer builds use a "
+        "dedicated vectorized kernel.",
     ),
     reference="profiling.runners.moe.moe_sum_reference",
 )
@@ -70,13 +66,13 @@ register(
         args_schema=MoeSumArgs,
         metric_family=MetricFamily.COMPUTE,
         batch_outlier_policy=BatchOutlierPolicy(),
+        # No capability rule: a vLLM _C CUDA op built for every arch the wheel targets.
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
-            gpus=frozenset({"NVIDIA H200"}),
         ),
         subprocess_env="vllm_env",
         doc=BackendDoc(
-            summary="vLLM's _custom_ops.moe_sum, which falls back to torch sum at top_k = 6.",
+            summary="vLLM's _custom_ops.moe_sum, timed as one call at any top_k.",
             url="https://github.com/vllm-project/vllm/blob/main/vllm/_custom_ops.py",
         ),
     )

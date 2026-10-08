@@ -26,7 +26,7 @@ use super::PROTOCOL_VERSION;
 pub(super) fn build_descriptor(run: &DiscoveredRun) -> Result<Value> {
     let params = read_run_json(&run.path, "raw/params.json")?;
     let deployment = match params.get("deployment").and_then(Value::as_str) {
-        Some(value) if matches!(value, "unified" | "pd" | "afd") => value,
+        Some(value) if matches!(value, "unified" | "pd" | "afd" | "pp") => value,
         // Params from checkouts that predate the top-level `deployment` field
         // (including prediction-produced run dirs) always described exactly
         // one pool with unified semantics; more than one pool would be a

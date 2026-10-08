@@ -43,7 +43,6 @@ def test_args_registry_support_environment_and_facades() -> None:
     assert torch_spec.runner_ref.module_name.endswith("moe_fused_topk_torch")
     assert torch_spec.runner_ref.function_name == "profile_moe_fused_topk"
     assert cuda_spec.subprocess_env == "vllm_env"
-    assert cuda_spec.supports.gpus == frozenset({"NVIDIA H200"})
     assert cuda_spec.runner_ref.module_name.endswith("moe_fused_topk_vllm_cuda")
     assert cuda_spec.runner_ref.function_name == "profile_moe_fused_topk_vllm_cuda"
     assert hasattr(perf_api, "get_moe_fused_topk_times")
@@ -76,8 +75,7 @@ def test_registry_import_is_lazy() -> None:
         {"num_tokens": 0},
         {"num_tokens": True},
         {"num_tokens": 1.5},
-        {"num_experts": 128},
-        {"top_k": 4},
+        {"top_k": 257},
         {"dtype": "fp16"},
     ],
 )
@@ -90,6 +88,26 @@ def test_vllm_validation_precedes_torch_vllm_import(
     monkeypatch.setitem(sys.modules, "vllm", None)
     with pytest.raises(ValueError):
         runner.profile_moe_fused_topk_vllm_cuda(**(_SPEC | updates))
+
+
+@pytest.mark.parametrize(
+    ("num_experts", "top_k"), [(256, 8), (128, 4), (60, 4), (512, 22), (384, 8), (100, 100)]
+)
+def test_vllm_accepts_any_expert_count_and_top_k(num_experts: int, top_k: int) -> None:
+    import profiling.runners.moe.moe_fused_topk_vllm_cuda as runner
+
+    args = runner._validate_args(3, num_experts, top_k, "bf16")
+    assert (args.num_experts, args.top_k) == (num_experts, top_k)
+
+
+@pytest.mark.parametrize("num_experts", [8, 60, 256, 512, 576])
+def test_vllm_guard_logits_keep_the_top_experts_distinct(num_experts: int) -> None:
+    import profiling.runners.moe.moe_fused_topk_vllm_cuda as runner
+
+    args = runner._validate_args(128, num_experts, min(8, num_experts), "bf16")
+    logits = runner._build_operands(torch, args, device=torch.device("cpu")).logits
+    top = torch.sort(logits.float(), dim=1, descending=True).values[:, : min(248, num_experts)]
+    assert bool((top[:, :-1] > top[:, 1:]).all())
 
 
 def test_vllm_shapes_guard_metrics_and_packed_operands() -> None:
@@ -120,15 +138,19 @@ def test_vllm_shapes_guard_metrics_and_packed_operands() -> None:
     )
 
 
-def test_vllm_guard_matches_reference_and_checks_fresh_outputs() -> None:
+@pytest.mark.parametrize(("num_experts", "top_k"), [(256, 8), (60, 4), (512, 22)])
+def test_vllm_guard_matches_reference_and_checks_fresh_outputs(
+    num_experts: int, top_k: int
+) -> None:
     import profiling.runners.moe.moe_fused_topk_vllm_cuda as runner
 
-    args = runner._validate_args(3, 256, 8, "bf16")
+    args = runner._validate_args(3, num_experts, top_k, "bf16")
     operands = runner._build_operands(torch, args, device=torch.device("cpu"))
     before = (operands.logits.clone(), operands.hidden_states.clone())
 
     def callable_(**kwargs):
-        weights, expert_ids, source = moe_fused_topk_reference(kwargs["gating_output"], 8)
+        assert kwargs["topk"] == top_k
+        weights, expert_ids, source = moe_fused_topk_reference(kwargs["gating_output"], top_k)
         return weights.clone(), expert_ids.clone(), source.clone()
 
     runner._check_correctness(torch, callable_, operands, args, synchronize=lambda: None)
@@ -156,7 +178,7 @@ def test_vllm_rejects_nonpacked_and_bad_outputs() -> None:
         runner._validate_outputs(torch, outputs, operands, args)
 
 
-def test_vllm_timing_isolation_and_exact_selector(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_vllm_timing_isolation_counts_every_launch(monkeypatch: pytest.MonkeyPatch) -> None:
     import profiling.runners.moe.moe_fused_topk_vllm_cuda as runner
 
     events: list[str] = []
@@ -166,7 +188,7 @@ def test_vllm_timing_isolation_and_exact_selector(monkeypatch: pytest.MonkeyPatc
         cuda=SimpleNamespace(
             is_available=lambda: True,
             current_device=lambda: 0,
-            get_device_name=lambda _: "NVIDIA H200",
+            get_device_name=lambda _: "NVIDIA B200",
         ),
         device=lambda *args: "cuda",
     )
@@ -194,14 +216,15 @@ def test_vllm_timing_isolation_and_exact_selector(monkeypatch: pytest.MonkeyPatc
     )
     metrics = runner.profile_moe_fused_topk_vllm_cuda(**_SPEC)
     assert metrics.time_ms == 1.0
-    assert "topkGating" in runner._KERNEL_NAME and "ScoringFuncE0" in runner._KERNEL_NAME
+    # topkGating, or moeSoftmax + moeTopK for expert counts without a fused
+    # specialization: every launch of the wrapper is counted.
     assert events == [
         "load",
         "build",
         "validate",
         "guard",
         "timer",
-        runner._KERNEL_NAME,
+        None,
         "wrapper",
         "energy",
         "wrapper",

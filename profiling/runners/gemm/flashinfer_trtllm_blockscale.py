@@ -32,12 +32,12 @@ from typing import Any
 from profiling.db.args import DType
 from profiling.profilers.energy import Energy
 from profiling.profilers.timer import Timer
+from profiling.runners.device import require_cuda_toolkit
 from profiling.runners.exceptions import KernelLaunchFailed, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
 
 _BLOCK_SIZE = 128
 _CUDA_MINIMUM = (12, 8)
-_HOPPER_COMPUTE_CAPABILITY = (9, 0)
 _JIT_MODULE_NAME = "vibesim_flashinfer_trtllm_fp8_blockscale_grouped_gemm_sm90"
 
 
@@ -170,39 +170,11 @@ def _production_capacity(
     return max_shape_m, max_shape_m_padded
 
 
-def _parse_cuda_version(cuda_version: object) -> tuple[int, int] | None:
-    if cuda_version is None:
-        return None
-    version_parts = str(cuda_version).split(".")
-    if len(version_parts) < 2:
-        return None
-    try:
-        return int(version_parts[0]), int(version_parts[1])
-    except ValueError:
-        return None
-
-
-def _validate_cuda_device(torch: Any) -> int:
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented(
-            "CUDA is required for the FlashInfer/TensorRT-LLM FP8 block-scale grouped GEMM"
-        )
-    cuda_version = _parse_cuda_version(getattr(torch.version, "cuda", None))
-    if cuda_version is None or cuda_version < _CUDA_MINIMUM:
-        rendered_version = getattr(torch.version, "cuda", None)
-        raise ProfilerNotImplemented(
-            "FlashInfer/TensorRT-LLM FP8 block-scale grouped GEMM requires "
-            f"CUDA >= 12.8, got {rendered_version}"
-        )
-    device = torch.cuda.current_device()
-    compute_capability = tuple(torch.cuda.get_device_capability(device))
-    if compute_capability != _HOPPER_COMPUTE_CAPABILITY:
-        gpu_name = str(torch.cuda.get_device_name(device))
-        raise ProfilerNotImplemented(
-            "FlashInfer/TensorRT-LLM FP8 block-scale grouped GEMM requires SM90/SM90a, "
-            f"got {gpu_name} with SM{compute_capability[0]}{compute_capability[1]}"
-        )
-    return int(torch.cuda.get_device_properties(device).multi_processor_count)
+def _device_sm_count(torch: Any) -> int:
+    require_cuda_toolkit(
+        torch, _CUDA_MINIMUM, "FlashInfer/TensorRT-LLM FP8 block-scale grouped GEMM"
+    )
+    return int(torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count)
 
 
 @functools.cache
@@ -519,7 +491,7 @@ def profile_fp8_blockscale_grouped_gemm_flashinfer_trtllm(
             "torch is required for the direct FP8 block-scale grouped GEMM"
         ) from exc
 
-    num_device_sms = _validate_cuda_device(torch)
+    num_device_sms = _device_sm_count(torch)
     try:
         launch = prepare_fp8_blockscale_grouped_gemm_launch(
             torch,

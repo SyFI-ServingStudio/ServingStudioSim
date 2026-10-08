@@ -6,7 +6,8 @@
 //! per-token attention KV. With prefix caching on, vLLM runs such a model in its
 //! Mamba `align` cache mode, which only checkpoints state at block boundaries and
 //! therefore ends every non-final prefill chunk on one; the lifecycle gets the
-//! arch's checkpoint interval as its chunk-end quantum to match.
+//! arch's checkpoint interval as its chunk-end quantum to match, unless the
+//! selector asks for `plain` chunking.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -15,6 +16,8 @@ use crate::arch::contract::IterwiseUnifiedModel;
 use crate::common::{PoolId, SharedRequests, WorkerId};
 use crate::log::PrefixCacheLogger;
 use crate::worker::admission::{ChunkedPrefillAdmission, LoadBalance, PendingOrder};
+use crate::worker::config::DpPlacement;
+use crate::worker::config::PrefillChunkAlignment;
 use crate::worker::execution::UnifiedIterExecution;
 use crate::worker::gpu_cluster::SharedGpuCluster;
 use crate::worker::kv::{HybridGdnKv, PrefixCacheConfig};
@@ -55,6 +58,7 @@ pub(crate) fn build_hybrid_chunked_prefill_worker<M: IterwiseUnifiedModel>(
         .ssm_checkpoint_interval_tokens
         .unwrap_or_else(|| model.recurrent_checkpoint_interval_tokens());
     let chunk_end_quantum = (checkpoint_interval_tokens > 0
+        && config.prefill_chunk_alignment == PrefillChunkAlignment::Checkpoint
         && !matches!(config.prefix_cache, PrefixCacheConfig::Disabled))
     .then_some(checkpoint_interval_tokens);
     tracing::info!(
@@ -96,10 +100,10 @@ pub(crate) fn build_hybrid_chunked_prefill_worker<M: IterwiseUnifiedModel>(
         essentials.sampler,
         prefix_cache_logger,
     );
-    let balance = if num_partitions == 1 {
-        LoadBalance::Single
-    } else {
-        LoadBalance::RoundRobin { next: 0 }
+    let balance = match (num_partitions, config.dp_placement) {
+        (1, _) => LoadBalance::Single,
+        (_, DpPlacement::RoundRobin) => LoadBalance::RoundRobin { next: 0 },
+        (_, DpPlacement::VllmLeastLoaded) => LoadBalance::LeastLoaded { next: 0 },
     };
     let admission = ChunkedPrefillAdmission::new(
         (0..num_partitions)

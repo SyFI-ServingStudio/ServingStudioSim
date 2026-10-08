@@ -2,25 +2,27 @@
 
 from __future__ import annotations
 
-import json
 import sqlite3
 from pathlib import Path
 
 from profiling.db import storage
-from profiling.db.storage import (
-    CONFIG_TABLE,
-    NON_ARG_COLUMNS,
-    RUN_COLUMNS,
-    SOURCE_TABLE,
-    USE_TABLE,
-    quote,
-)
+from profiling.db.storage import NON_ARG_COLUMNS, RUN_COLUMNS, quote
 
 SCHEMA_VERSION = 3
 SCHEMA_HASH = "l1-compact-keys-v3"
 
 _METRIC_COLUMNS = frozenset(
     {"time_ms", "tflops", "memory_bandwidth_gbps", "algbw_gbps", "busbw_gbps", "energy_j"}
+)
+# Tables an older checkout wrote that this one no longer reads (the kernel-config
+# registry). Migration drops them; `profiling.db.merge` refuses an input that
+# still holds one.
+RETIRED_TABLES = (
+    "_kernel_config",
+    "_kernel_config_source",
+    "_kernel_config_role",
+    "_kernel_config_use",
+    "_kernel_config_blob",
 )
 
 
@@ -54,7 +56,8 @@ def migrate_connection(
 
     Table writes use this form so schema preparation and row persistence share
     one transaction. Read paths never receive a writable connection and cannot
-    invoke migration as a side effect. Returns whether a v2 table was upgraded.
+    invoke migration as a side effect. Returns whether a v2 table was upgraded
+    or a retired table dropped.
     """
     if target_version != SCHEMA_VERSION:
         raise ValueError(f"unsupported profile DB schema version {target_version}")
@@ -71,6 +74,7 @@ def migrate_connection(
         """
     )
     upgraded = _upgrade_v2(conn)
+    upgraded |= _drop_retired(conn)
     conn.executemany(
         """
         INSERT INTO _db_metadata(key, value)
@@ -123,15 +127,19 @@ def _upgrade_v2(conn: sqlite3.Connection) -> bool:
     can hold kind tables written before the metadata table existed.
     """
     kinds = [name for name in _user_tables(conn) if _is_v2_kind_table(conn, name)]
-    registry = _is_v2_registry(conn)
-    if not kinds and not registry:
+    if not kinds:
         return False
     conn.execute(storage.RUN_SCHEMA)
     for name in kinds:
         _upgrade_kind_table(conn, name)
-    if registry:
-        _upgrade_registry(conn)
     return True
+
+
+def _drop_retired(conn: sqlite3.Connection) -> bool:
+    retired = [name for name in _user_tables(conn) if name in RETIRED_TABLES]
+    for name in retired:
+        conn.execute(f"DROP TABLE {quote(name)}")
+    return bool(retired)
 
 
 def _user_tables(conn: sqlite3.Connection) -> list[str]:
@@ -152,13 +160,6 @@ def _is_v2_kind_table(conn: sqlite3.Connection, table: str) -> bool:
     if table.startswith("_"):
         return False
     return "profiler_git_hash" in {row[1] for row in _columns(conn, table)}
-
-
-def _is_v2_registry(conn: sqlite3.Connection) -> bool:
-    tables = set(_user_tables(conn))
-    if USE_TABLE not in tables:
-        return False
-    return "kind" in {row[1] for row in _columns(conn, USE_TABLE)}
 
 
 def _column_def(row: tuple) -> str:
@@ -228,70 +229,3 @@ def _upgrade_kind_table(conn: sqlite3.Connection, table: str) -> None:
         conn.execute(insert, values)
     conn.execute(f"DROP TABLE {quote(table)}")
     conn.execute(f"ALTER TABLE {quote(staging)} RENAME TO {quote(table)}")
-
-
-def _upgrade_registry(conn: sqlite3.Connection) -> None:
-    for table in (CONFIG_TABLE, SOURCE_TABLE, USE_TABLE):
-        conn.execute(f"ALTER TABLE {table} RENAME TO _v2{table}")
-    for statement in storage.REGISTRY_SCHEMA:
-        conn.execute(statement)
-
-    for row in conn.execute(
-        f"""
-        SELECT id, kind, config_hash, gpu_name, profile_kind, identity, cache_coords,
-            grid_axes, cells, infeasible, created_at
-        FROM _v2{CONFIG_TABLE} ORDER BY id
-        """
-    ).fetchall():
-        id_, kind, config_hash, gpu_name, profile_kind, identity, *grid, created_at = row
-        conn.execute(
-            f"""
-            INSERT INTO {CONFIG_TABLE}
-                (id, config_key, kind, config_hash, gpu_name, profile_kind, identity,
-                 cache_coords, grid_axes, cells, infeasible, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                id_,
-                storage.config_key(kind, config_hash, gpu_name),
-                kind,
-                config_hash,
-                gpu_name,
-                profile_kind,
-                storage.pack_identity(conn, json.loads(identity)),
-                *grid,
-                storage.epoch(created_at),
-            ),
-        )
-    for id_, source_hash, source, created_at in conn.execute(
-        f"SELECT id, source_hash, source, created_at FROM _v2{SOURCE_TABLE} ORDER BY id"
-    ).fetchall():
-        conn.execute(
-            f"""
-            INSERT INTO {SOURCE_TABLE} (id, source_key, source_hash, source, created_at)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (id_, storage.source_key(source_hash), source_hash, source, storage.epoch(created_at)),
-        )
-    for id_, kind, config_hash, gpu_name, source_hash, pool, role, created_at in conn.execute(
-        f"""
-        SELECT id, kind, config_hash, gpu_name, source_hash, pool, role, created_at
-        FROM _v2{USE_TABLE} ORDER BY id
-        """
-    ).fetchall():
-        conn.execute(
-            f"""
-            INSERT INTO {USE_TABLE} (id, config_key, source_key, pool, role_key, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (
-                id_,
-                storage.config_key(kind, config_hash, gpu_name),
-                storage.source_key(source_hash),
-                pool,
-                storage.ensure_role(conn, role),
-                storage.epoch(created_at),
-            ),
-        )
-    for table in (CONFIG_TABLE, SOURCE_TABLE, USE_TABLE):
-        conn.execute(f"DROP TABLE _v2{table}")

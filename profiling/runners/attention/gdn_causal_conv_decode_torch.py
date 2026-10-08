@@ -83,13 +83,6 @@ def _validate_args(
     )
 
 
-def _validate_cuda_device(torch: Any) -> None:
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented(
-            "CUDA is required for the torch gdn_causal_conv_decode backend"
-        )
-
-
 def _operand_shapes(args: _ValidatedArgs) -> _OperandShapes:
     return _OperandShapes(
         x=(args.batch_size, args.channels),
@@ -201,8 +194,6 @@ def profile_gdn_causal_conv_decode(
             "torch and the semantic reference are required for the torch "
             "gdn_causal_conv_decode backend"
         ) from exc
-
-    _validate_cuda_device(torch)
 
     try:
         operands = _build_operands(torch, args, device=torch.device("cuda"))

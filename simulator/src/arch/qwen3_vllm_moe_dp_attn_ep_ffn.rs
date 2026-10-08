@@ -366,6 +366,7 @@ pub fn build_configs(
         strategy: "auto".to_string(),
         launch_with_pdl: true,
         fp32_acc: true,
+        fused_token_limit: None,
     };
     Qwen3VllmMoeDpAttnEpFfnConfigs {
         attn_block: attn_block_config(model, parallel.attn_tp_size, gpu),

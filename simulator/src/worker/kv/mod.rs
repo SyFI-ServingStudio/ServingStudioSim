@@ -194,12 +194,20 @@ pub trait PrefixKv: KvStore {
     /// How much of `session_input`'s declared prefix is resident *right now*,
     /// wherever it lives. This is what a cache-aware pending order ranks by;
     /// `declared_prefix_tokens` is only its upper bound. A session with no
-    /// retained partition has nothing to reuse and scores zero.
+    /// retained partition has nothing to reuse and scores zero; a pinned prefix
+    /// is resident on every partition.
     ///
     /// Two hash lookups, no mutation — cheap enough for the admission hot path.
     fn resident_prefix_tokens(&self, fresh_prompt_tokens: u32, session_input: SessionInput) -> u32 {
-        let Some(partition) = self.retained_prefix_partition(session_input) else {
-            return 0;
+        let partition = match session_input {
+            SessionInput::Standalone => return 0,
+            SessionInput::PinnedPrefix { .. } => 0,
+            SessionInput::Session { .. } => {
+                let Some(partition) = self.retained_prefix_partition(session_input) else {
+                    return 0;
+                };
+                partition
+            }
         };
         self.preview_prefill_context(partition, fresh_prompt_tokens, session_input)
             .resident_prefix_tokens()
@@ -286,6 +294,10 @@ pub trait IterWorkerKv: KvStore {
     fn live_decode_count(&self, partition: PartitionId) -> u32;
     fn has_prefill_admit(&self, partition: PartitionId) -> bool;
     fn status_active(&self, partition: PartitionId) -> u32;
+    /// Fraction of the partition's KV capacity that running requests hold or
+    /// have reserved (retained prefix KV is reclaimable, so it does not count),
+    /// the analogue of vLLM's per-engine `kv_cache_usage`.
+    fn kv_usage(&self, partition: PartitionId) -> f64;
     fn release_external(&mut self, request: RequestId, current_kv: u64) -> Option<PartitionId>;
 
     /// Static-dispatch iteration over this iteration's fresh prefills.

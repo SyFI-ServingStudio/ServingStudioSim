@@ -21,14 +21,12 @@ from profiling.profilers.timer import Timer
 from profiling.runners.exceptions import KernelLaunchFailed, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
 
-_KV_LORA_RANK = 512
-_ROPE_DIM = 64
-_BLOCK_SIZE = 64
+# The plain cache format takes kv_lora_rank, pe_dim, and block_size from the
+# tensors at runtime (vLLM concat_and_cache_mla only checks
+# kv_cache.size(2) == kv_lora_rank + pe_dim; the 512/64 checks there apply to
+# the fp8_ds_mla and nvfp4_ds_mla formats, not this one).
 _CACHE_FORMAT = "plain"
-_REQUIRED_GPU = "NVIDIA H200"
-_VLLM_SUPPORTED_GPUS = ("NVIDIA H200", "NVIDIA B200")
 _VLLM_KERNEL_NAME = "concat_and_cache_mla_kernel"
-_SGLANG_SUPPORTED_GPUS = ("NVIDIA B200",)
 
 
 @dataclass(frozen=True)
@@ -69,19 +67,6 @@ def _validate_args(
             f"num_tokens, kv_lora_rank, and block_size must be > 0 and rope_dim >= {min_rope_dim}, "
             f"got {num_tokens}, {kv_lora_rank}, {rope_dim}, and {block_size}"
         )
-    supported_rope_dims = (_ROPE_DIM, 0) if allow_zero_rope else (_ROPE_DIM,)
-    if (
-        kv_lora_rank != _KV_LORA_RANK
-        or rope_dim not in supported_rope_dims
-        or block_size != _BLOCK_SIZE
-    ):
-        allowed = " or ".join(
-            f"({_KV_LORA_RANK}, {rope}, {_BLOCK_SIZE})" for rope in supported_rope_dims
-        )
-        raise ValueError(
-            f"mla_cache_append requires (kv_lora_rank, rope_dim, block_size) == {allowed}, "
-            f"got ({kv_lora_rank}, {rope_dim}, {block_size})"
-        )
     supported_kv_dtypes = {DType.BF16, DType.FP8_E4M3} if allow_fp8_cache else {DType.BF16}
     supported_input_dtypes = {DType.BF16, DType.FP8_E4M3} if allow_fp8_input else {DType.BF16}
     if input_dtype not in supported_input_dtypes or kv_dtype not in supported_kv_dtypes:
@@ -104,27 +89,6 @@ def _validate_args(
         kv_dtype,
         cache_format,
     )
-
-
-def _validate_cuda_device(torch: Any) -> None:
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented("CUDA is required for the torch mla_cache_append backend")
-    gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
-    if gpu_name != _REQUIRED_GPU:
-        raise ProfilerNotImplemented(
-            f"torch mla_cache_append is verified only on {_REQUIRED_GPU}, got {gpu_name}"
-        )
-
-
-def _validate_vllm_cuda_device(torch: Any) -> None:
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented("CUDA is required for the mla_cache_append vllm_cuda backend")
-    gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
-    if gpu_name not in _VLLM_SUPPORTED_GPUS:
-        raise ProfilerNotImplemented(
-            "mla_cache_append vllm_cuda is verified only on "
-            f"{' or '.join(_VLLM_SUPPORTED_GPUS)}, got {gpu_name}"
-        )
 
 
 def _build_operands(
@@ -248,8 +212,6 @@ def profile_mla_cache_append_torch(
             "torch is required for the torch mla_cache_append backend"
         ) from exc
 
-    _validate_cuda_device(torch)
-
     try:
         operands = _build_operands(
             torch,
@@ -299,17 +261,6 @@ def profile_mla_cache_append_torch(
         raise KernelLaunchFailed(str(exc)) from exc
 
 
-def _validate_sglang_cuda_device(torch: Any) -> None:
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented("CUDA is required for mla_cache_append:sglang_cuda")
-    gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
-    if gpu_name not in _SGLANG_SUPPORTED_GPUS:
-        raise ProfilerNotImplemented(
-            "mla_cache_append:sglang_cuda is verified only on "
-            f"{' or '.join(_SGLANG_SUPPORTED_GPUS)}, got {gpu_name}"
-        )
-
-
 def profile_mla_cache_append_sglang_cuda(
     num_tokens: int,
     kv_lora_rank: int,
@@ -351,7 +302,6 @@ def profile_mla_cache_append_sglang_cuda(
             "mla_cache_append:sglang_cuda requires the SGLang environment"
         ) from exc
 
-    _validate_sglang_cuda_device(torch)
     try:
         device = torch.device("cuda", torch.cuda.current_device())
         generator = torch.Generator(device=device).manual_seed(42)
@@ -459,8 +409,6 @@ def profile_mla_cache_append_vllm_cuda(
             "the instrumented vLLM environment is required for "
             "the mla_cache_append vllm_cuda backend"
         ) from exc
-
-    _validate_vllm_cuda_device(torch)
 
     try:
         operands = _build_operands(

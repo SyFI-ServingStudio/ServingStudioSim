@@ -114,7 +114,7 @@ variant's parameters.
 
 | Contract | Wired selectors |
 |---|---|
-| `IterArchSel` | `qwen36_local`, `llama3_dense`, `llama3_dense_tp`, `llama3_dp_attn_tp_ffn`, `qwen3_moe_dp_attn_ep_ffn`, `qwen3_moe_fp8_dp_attn_ep_ffn`, `qwen3_vllm_moe_dp_attn_ep_ffn`, `deepseek_v4_vllm`, `deepseek_v4_vllm_serial_streams`, `glm52_vllm_dsa_moe`, `glm52_vllm_nvfp4_dsa_moe`, `glm52_vllm_nvfp4_dsa_moe_speculative`, `glm53_vllm_nvfp4_dsa_moe_dflash2`, `glm52_sglang_nvfp4_tp_dsa_moe` |
+| `IterArchSel` | `qwen36_local`, `llama3_dense`, `llama3_dense_tp`, `llama3_dp_attn_tp_ffn`, `qwen3_moe_dp_attn_ep_ffn`, `qwen3_moe_fp8_dp_attn_ep_ffn`, `qwen3_vllm_moe_dp_attn_ep_ffn`, `deepseek_v4_vllm`, `deepseek_v4_vllm_serial_streams`, `deepseek_v41_vllm`, `deepseek_v41_vllm_serial_streams`, `glm52_vllm_dsa_moe`, `glm52_vllm_nvfp4_dsa_moe`, `glm52_vllm_nvfp4_dsa_moe_speculative`, `glm52_vllm_nvfp4_pp_dsa_moe`, `glm52_vllm_nvfp4_dp_attn_dsa_moe`, `glm53_vllm_nvfp4_dsa_moe_dflash2`, `glm52_sglang_nvfp4_tp_dsa_moe`, `glm53_flash_vllm_{fp8,nvfp4}_kda_dsa_moe`, `glm53_flash_vllm_{fp8,nvfp4}_pp_kda_dsa_moe`, `glm53_flash_vllm_{fp8,nvfp4}_dp_attn_ep_moe` |
 | `AttnArchSel` | `qwen3_attn_tp` |
 | `FfnArchSel` | `qwen3_ffn_moe`, `qwen3_fp8_ffn_moe` |
 
@@ -130,7 +130,20 @@ schema; no second hand-maintained config union belongs here.
   - Qwen3 MoE DP-attention/EP-FFN (native BF16, native FP8, or vLLM-aligned FP8) → `hp_unified`
   - GLM-5.2 vLLM DSA/MoE → `hp_unified`
   - GLM-5.2 vLLM NVFP4 → `hp_unified`, `chunked_prefill`, or `speculative`
+  - GLM-5.2/5.3 vLLM NVFP4 DP attention + EP (`glm52_vllm_nvfp4_dp_attn_dsa_moe`)
+    → `hp_unified` or `chunked_prefill`, one KV partition per DP rank
   - GLM-5.2 SGLang NVFP4 pure TP → `chunked_prefill`
+- pp:
+  - GLM-5.2/5.3 vLLM NVFP4 pipeline stages (`glm52_vllm_nvfp4_pp_dsa_moe`) →
+    pipeline stage workers; `unified` rejects it. Each stage is its own
+    `IterwiseUnifiedModel` (one GPU, its own layers' KV); the whole-pipeline
+    model sums the stages for `timing-predict` and shares them by `Arc`.
+  - GLM-5.3-Flash vLLM FP8/NVFP4 pipeline stages
+    (`glm53_flash_vllm_{fp8,nvfp4}_pp_kda_dsa_moe`) → the same stage workers.
+    `layer_partition` overrides the `get_pp_indices` split (vLLM
+    `VLLM_PP_LAYER_PARTITION`). Each stage labels its layer groups with the
+    layers they hold, which `tools/pp-layer-balance/pp_layer_balance.py` reads
+    to pick a balanced split from a finished run.
 - PD:
   - Llama3 TP prefill → Llama3 TP decode
   - Llama3 TP prefill → Llama3 DP-attention/TP-FFN decode

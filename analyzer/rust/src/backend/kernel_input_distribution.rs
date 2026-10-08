@@ -27,14 +27,16 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use arrow_array::{Array, ListArray, RecordBatch, StringArray, UInt8Array};
 use datafusion::prelude::SessionContext;
 use serde_json::{json, Value};
 
 use crate::io::{read_cost_manifests, SCHEMA_VERSION};
 use crate::pca::pca_project_2d;
-use crate::session::{col, collect, register_cost_log, require_columns, value_f64, COST_LOG_TABLE};
+use crate::session::{
+    col, collect, register_cost_log, require_columns, slot_backend_none, value_f64, COST_LOG_TABLE,
+};
 
 /// cost_log columns that always exist when cost logging is on (drift guard — a
 /// genuine schema regression here should fail loud, not silently degrade).
@@ -44,9 +46,6 @@ const CORE_COLS: &[&str] = &["pool_tag", "worker_id", "section", "iter_id"];
 /// them → `available: false` (an expected old-run case, not a drift error), so
 /// they are probed softly rather than through `require_columns`.
 const OPTIONAL_COLS: &[&str] = &["slot_input", "slot_backend"];
-
-/// Sentinel `slot_backend` value: the leaf was not executed this iteration.
-const NO_BACKEND: u8 = u8::MAX;
 
 /// Iteration sampling bounds (shared intent with `kernel-throughput`): keep
 /// ~1-in-`MAX_STRIDE` iterations on a long run, shrinking toward every iteration
@@ -166,7 +165,17 @@ pub async fn run(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)>
     }
 
     let stride = choose_stride(ctx).await?;
-    let scan = accumulate(ctx, stride, &slot_loc, &plottable, positions.len()).await?;
+    let no_backend = slot_backend_none(&crate::io::resolve_artifact_path(log_dir, "cost_log"))?
+        .context("cost_log has no slot_backend column")?;
+    let scan = accumulate(
+        ctx,
+        stride,
+        no_backend,
+        &slot_loc,
+        &plottable,
+        positions.len(),
+    )
+    .await?;
 
     // Build one payload position + one report position per plottable location that
     // saw ≥1 sampled executed slot with an input. Positions are emitted in name
@@ -298,6 +307,7 @@ struct Scan {
 async fn accumulate(
     ctx: &SessionContext,
     stride: u64,
+    no_backend: u8,
     slot_loc: &HashMap<(&str, u16, &str), Vec<u32>>,
     plottable: &[bool],
     num_positions: usize,
@@ -352,7 +362,7 @@ async fn accumulate(
                     continue;
                 }
                 let backend = bk_vals.value(jb);
-                if backend == NO_BACKEND {
+                if backend == no_backend {
                     skipped_not_executed += 1;
                     continue;
                 }

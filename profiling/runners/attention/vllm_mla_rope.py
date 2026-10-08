@@ -34,8 +34,6 @@ from profiling.profilers.timer import Timer
 from profiling.runners.exceptions import KernelLaunchFailed, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
 
-_SUPPORTED_GPUS = frozenset({"NVIDIA H100", "NVIDIA H200", "NVIDIA B200"})
-_HOPPER_COMPUTE_CAPABILITY = (9, 0)
 # Substring, not an exact name: inductor suffixes the fusion with a per-graph
 # counter (`..._view_4`, `..._view_7`), so the digits are not stable.
 _KERNEL_NAME = "triton_poi_fused"
@@ -85,18 +83,6 @@ def _validate_args(
         bool(is_neox_style),
         resolved_dtype,
     )
-
-
-def _validate_cuda_device(torch: Any) -> None:
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented("vllm_mla_rope requires a CUDA device")
-    device_name = torch.cuda.get_device_name(0)
-    if device_name not in _SUPPORTED_GPUS:
-        raise ProfilerNotImplemented(
-            f"vllm_mla_rope is validated on {sorted(_SUPPORTED_GPUS)}, got {device_name}"
-        )
-    if torch.cuda.get_device_capability(0) < _HOPPER_COMPUTE_CAPABILITY:
-        raise ProfilerNotImplemented("vllm_mla_rope requires compute capability >= 9.0")
 
 
 def _build_rotary_embedding(
@@ -238,7 +224,6 @@ def profile_vllm_mla_rope_vllm_inductor(
     except ImportError as exc:
         raise ProfilerNotImplemented("PyTorch is required for vllm_inductor") from exc
 
-    _validate_cuda_device(torch)
     torch_dtype = torch.bfloat16
     qk_head_dim = qk_nope_head_dim + rope_dim
 
@@ -249,6 +234,12 @@ def profile_vllm_mla_rope_vllm_inductor(
         is_neox_style=is_neox_style,
         torch_dtype=torch_dtype,
     )
+    # Every spec compiles the same block code object. Without a reset, dynamo
+    # counts each earlier spec in this worker toward its recompile limit (8) and
+    # past it stops specialising, so a row's time depended on how many shapes
+    # the worker profiled before it (2-5.5x on B200). Reset so every row is
+    # measured on its own shape-specialised kernel.
+    torch._dynamo.reset()
     compiled_block = torch.compile(_build_block(torch, rotary_emb, qk_nope_head_dim), dynamic=False)
     operands = _allocate_operands(
         torch,

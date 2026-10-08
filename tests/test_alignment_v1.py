@@ -1590,6 +1590,29 @@ def test_alignment_analyzer_and_renderer_end_to_end(tmp_path):
         "unified.attn",
         "unified.attn.combine",
     ]
+    # Every timeline detail row carries the reference rank's occupancy exactly
+    # as the report row states it, so the wall-clock card reads it rather than
+    # re-deriving it from the intervals.
+    timeline_payload = json.loads((analysis / "payloads" / "alignment_timeline.json").read_text())
+    timeline_report = json.loads(
+        (analysis / "reports" / "alignment_timeline_report.json").read_text()
+    )
+    timeline_detail = timeline_payload["iteration_detail"]
+    timeline_shard = (analysis / "payloads" / timeline_detail["file"]).read_bytes()
+    assert timeline_report["iterations"]
+    for row in timeline_report["iterations"]:
+        key = str(row["iteration_id"])
+        offset, length = timeline_detail["byte_ranges"][key]
+        record = json.loads(
+            pa.decompress(
+                timeline_shard[offset : offset + length],
+                decompressed_size=timeline_detail["decoded_lengths"][key],
+                codec="zstd",
+                asbytes=True,
+            )
+        )
+        assert record["reference_rank"] == row["reference_rank"]
+        assert record["reference_rank"]["inter_phase_ms"] >= 0
     assert e2e_report["meta"]["request_id_audit"]["shared_ids"] == 2
     assert e2e_report["latency"]["client_ttft"]["measured_ms"]["mean"] == 40.0
     assert e2e_report["latency"]["server_ttft"]["measured_ms"]["mean"] == 32.5

@@ -1,0 +1,12 @@
+# Routing: uniform; this arch reads no capture.
+checkpoint: Qwen/Qwen3-Coder-480B-A35B-Instruct
+gpu: NVIDIA H200
+arch:
+  type: qwen3_fp8_ffn_moe
+  fp8: true
+  attn_tp_size: ${attn_tp_size}
+  ep_size: 8
+  nvl_num_gpu: 8
+  routing: uniform
+sweep:
+  attn_tp_size: [1, 4]

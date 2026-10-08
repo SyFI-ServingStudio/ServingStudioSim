@@ -51,11 +51,6 @@ def _validate_args(m: int, hidden: int, dtype: DType | str) -> _ValidatedArgs:
     return _ValidatedArgs(m=m, hidden=hidden, dtype=dtype)
 
 
-def _validate_cuda_device(torch: Any) -> None:
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented("CUDA is required for the torch gdn_gated_rms_norm backend")
-
-
 def _operand_shapes(args: _ValidatedArgs) -> _OperandShapes:
     matrix_shape = (args.m, args.hidden)
     return _OperandShapes(
@@ -126,8 +121,6 @@ def profile_gdn_gated_rms_norm(
         raise ProfilerNotImplemented(
             "torch and the semantic reference are required for the torch gdn_gated_rms_norm backend"
         ) from exc
-
-    _validate_cuda_device(torch)
 
     try:
         operands = _build_operands(torch, args, device=torch.device("cuda"))

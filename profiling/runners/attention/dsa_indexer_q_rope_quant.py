@@ -12,7 +12,6 @@ from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerN
 from profiling.runners.metrics import ComputeMetrics
 
 _BACKEND = "dsa_indexer_q_rope_quant:sglang_cuda"
-_SUPPORTED_GPUS = ("NVIDIA B200",)
 _HEAD_DIM = 128
 _ROPE_DIM = 64
 _ROPE_LAYOUT = "rope_first"
@@ -75,16 +74,6 @@ def _validate_args(
         raise ProfilerNotImplemented(f"{_BACKEND} requires q_output_dtype=fp8_e4m3")
     if DType.from_value(weight_output_dtype) is not DType.FP32:
         raise ProfilerNotImplemented(f"{_BACKEND} requires weight_output_dtype=fp32")
-
-
-def _validate_device(torch: Any) -> None:
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented(f"{_BACKEND} requires CUDA")
-    gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
-    if gpu_name not in _SUPPORTED_GPUS:
-        raise ProfilerNotImplemented(
-            f"{_BACKEND} is verified only on {' or '.join(_SUPPORTED_GPUS)}, got {gpu_name}"
-        )
 
 
 def _prepare(torch: Any, callable_: Any, *, num_tokens: int, num_heads: int) -> _Launch:
@@ -157,7 +146,6 @@ def profile_dsa_indexer_q_rope_quant_sglang_cuda(
         raise ProfilerNotImplemented(f"{_BACKEND} requires the SGLang environment") from exc
 
     try:
-        _validate_device(torch)
         launch = _prepare(
             torch,
             fused_q_indexer_rope_first_quant,

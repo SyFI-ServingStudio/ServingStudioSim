@@ -45,6 +45,10 @@ pyo3 = { version = "0.20", features = ["auto-initialize"] }
 # Vendored as a git submodule, so a Rust build of this repository now requires
 # `git submodule update --init`.
 req-frontend = { path = "alignment/load_generator/req-frontend", default-features = false }
+# Reads the optional `prefix_len` column req-frontend does not declare yet
+# (sim/frontend/pinned_prefix.rs); also the tests' CSV fixture writer. Same
+# crate req-frontend already builds.
+csv = "1"
 
 # Link-time distributed registry: each kernel registers a `KernelQueryEntry` so
 # the `kernel-query` subcommand maps a runtime `kind` -> builder with no central
@@ -83,8 +87,6 @@ dhat-heap = ["dep:dhat"]
 [dev-dependencies]
 # Temp dirs/files for L7 frontend + tick-driver + parquet writer tests.
 tempfile = "3"
-# Test-only CSV fixture writer; production parsing belongs to req-frontend.
-csv = "1"
 # Statistical microbenchmark harness for the cache-lookup hot path
 # (benches/cache_lookup.rs). `default-features = false` drops the plotters/rayon
 # pulls; we only need the sampling + confidence-interval estimates.

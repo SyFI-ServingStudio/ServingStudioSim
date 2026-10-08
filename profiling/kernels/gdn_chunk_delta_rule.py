@@ -70,7 +70,7 @@ class GdnChunkDeltaRuleArgs(KernelArgs):
     num_heads: int = arg(unit="heads", doc="Output heads with separate values and states.")
     key_head_dim: int = arg(unit="elements", doc="Features in each key and query head.")
     value_head_dim: int = arg(unit="elements", doc="Features in each value and output head.")
-    dtype: DType = arg(doc="Element type of query, key and value inputs; only bf16 is measured.")
+    dtype: DType = arg(doc="Element type of query, key and value inputs.")
 
 
 DOC = KernelDoc(
@@ -106,7 +106,6 @@ DOC = KernelDoc(
         "boundaries and outputs are allocated before the capture."
     ),
     caveats=(
-        "Only H200 is measured.",
         "Each call starts from an all-zero state.",
         "The 64-token width appears only in the FLOP estimate; bytes count "
         "minimum logical traffic, not physical traffic.",
@@ -120,9 +119,12 @@ register(
     KernelProfilerSpec(
         kernel_kind=KIND,
         backend="flashinfer",
+        # FlashInfer builds the timed CUTLASS kernel only for sm_90a (gen_gdn_prefill_sm90_module,
+        # sm90a_nvcc_flags); on SM100 chunk_gated_delta_rule dispatches a different CuTe DSL kernel
+        # (chunk_gated_delta_rule_sm100) that the runner does not time.
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
-            gpus=frozenset({"NVIDIA H200"}),
+            sm_targets=frozenset({"sm_90a"}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.attention.gdn_chunk_delta_rule_flashinfer",

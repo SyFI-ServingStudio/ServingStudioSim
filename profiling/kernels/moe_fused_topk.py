@@ -1,7 +1,7 @@
 """Fused MoE softmax/top-k router-selection kernel kind.
 
 The Torch backend is a multi-launch semantic baseline. Production simulation
-uses vLLM's single-launch CUDA backend.
+uses vLLM's fused_topk CUDA backend.
 """
 
 from __future__ import annotations
@@ -52,12 +52,12 @@ DOC = KernelDoc(
     default_metric="memory_bandwidth_gbps",
     method=(
         f"{CUPTI_METHOD} "
-        "vllm_cuda counts only its topkGating kernel (the bf16, 256-expert, "
-        "top-8 softmax specialization); torch counts every launch of its "
+        "vllm_cuda counts every kernel of one fused_topk call: a topkGating "
+        "specialization where vLLM has one for the expert count, otherwise the "
+        "moeSoftmax and moeTopK pair. torch counts every launch of its "
         "sequence. Outputs are checked against the reference first."
     ),
     caveats=(
-        "vllm_cuda is measured only for 256 experts and top_k = 8 in bf16 on H200.",
         "TFLOPS counts comparisons and exponentials as nominal operations.",
         "GB/s counts one logits read and the three outputs; the torch backend's"
         " workspaces are not counted.",
@@ -88,9 +88,9 @@ register(
     KernelProfilerSpec(
         kernel_kind=KIND,
         backend="vllm_cuda",
+        # No capability rule: a vLLM _moe_C CUDA op built for every arch the wheel targets.
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
-            gpus=frozenset({"NVIDIA H200"}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.moe.moe_fused_topk_vllm_cuda",
@@ -102,7 +102,7 @@ register(
         batch_outlier_policy=BatchOutlierPolicy(),
         subprocess_env="vllm_env",
         doc=BackendDoc(
-            summary="vLLM fused_topk with the one-launch BF16 E256/K8 ordinary-softmax kernel.",
+            summary="vLLM fused_topk: one topkGating launch for a specialized expert count.",
             url="https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/fused_moe/router/fused_topk_router.py",
         ),
     )

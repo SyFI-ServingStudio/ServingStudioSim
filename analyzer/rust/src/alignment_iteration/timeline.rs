@@ -714,6 +714,10 @@ struct TimelineDetail<'a> {
     simulated: SimulatedBlock<'a>,
     operation_totals: Vec<Value>,
     host: Option<Value>,
+    /// The reference rank's occupancy, as the report row states it: the
+    /// wall-clock card reads these numbers rather than re-deriving them from
+    /// the intervals above.
+    reference_rank: &'a Value,
 }
 
 #[derive(Serialize)]
@@ -1018,6 +1022,8 @@ fn build_iteration(
     };
 
     let occupancy = reference.occupancy();
+    let reference_rank =
+        reference.report(&occupancy, reference_device_id, measurement, time_origin_ns);
     let host_rows = host_context.and_then(|context| context.rows);
     let detail = serde_json::to_vec(&TimelineDetail {
         iteration_id: summary.iteration_id,
@@ -1042,6 +1048,7 @@ fn build_iteration(
         // Absent when the capture carries no host sidecar, which is a different
         // fact from "the CPU did nothing" and must not render as an empty lane.
         host: host_rows.map(host::IterationHost::value),
+        reference_rank: &reference_rank,
     })?;
 
     let mut report = json!({
@@ -1061,12 +1068,7 @@ fn build_iteration(
             .map(|(cycle, simulated_cycle)| simulated_cycle - cycle),
         "measured_busy_union_ms": measurement.busy_union_ms,
         "measured_rows": measurement.kernels.len(),
-        "reference_rank": reference.report(
-            &occupancy,
-            reference_device_id,
-            measurement,
-            time_origin_ns,
-        ),
+        "reference_rank": reference_rank,
     });
     report
         .as_object_mut()
@@ -1284,6 +1286,15 @@ impl ReferenceRank {
         crossing.sort_by(|left, right| {
             (right.end_ns - right.start_ns).cmp(&(left.end_ns - left.start_ns))
         });
+        let phases: Vec<_> = measurement
+            .phase_summaries
+            .iter()
+            .filter(|summary| summary.device_id == device_id)
+            .collect();
+        // Phase extents can overlap when two phases interleave on the device,
+        // so what no phase covers is taken against their union.
+        let phase_spans: Vec<(u64, u64)> = phases.iter().map(|summary| summary.span_ns).collect();
+        let inter_phase_ms = (span_ms - interval_union_ns(&phase_spans) as f64 / 1e6).max(0.0);
         json!({
             "device_id": device_id,
             "span_ms": span_ms,
@@ -1291,13 +1302,24 @@ impl ReferenceRank {
             "idle_ms": idle_ms,
             "idle_fraction": occupancy.idle_fraction(),
             "gap_count": self.gaps.len(),
+            // Every gap, in span order, so the lane draws these rather than
+            // re-deriving them from the launches.
+            "gaps_ns": self
+                .gaps
+                .iter()
+                .map(|gap| {
+                    [
+                        (gap.start_ns as i64) - (time_origin_ns as i64),
+                        (gap.end_ns as i64) - (time_origin_ns as i64),
+                    ]
+                })
+                .collect::<Vec<_>>(),
+            "inter_phase_ms": inter_phase_ms,
             // Per phase, because a whole-iteration idle figure is dominated by
             // the host time BETWEEN phases, which is a different fact from a
             // stall inside the forward pass.
-            "phases": measurement
-                .phase_summaries
+            "phases": phases
                 .iter()
-                .filter(|summary| summary.device_id == device_id)
                 .map(|summary| {
                     let phase_span_ms = (summary.span_ns.1 - summary.span_ns.0) as f64 / 1e6;
                     json!({
@@ -1354,6 +1376,9 @@ fn definitions() -> Value {
         "slot_multiplicity": "each slot's exact CostTree Scale multiplicity; folded workload = slot_ms x slot_multiplicity. Shared by every iteration because the tree shape is static",
         "operation_totals": "the ONLY sound join between the two lanes. occurrence_ratio is a counting ratio (3 measured kernels priced as 1 modelled leaf), never a per-kernel correspondence",
         "reference_rank.idle_ms": "span_ms - busy_ms over the reference rank's correlated kernels; this is the bubble budget the GPU lane draws",
+        "reference_rank.gaps_ns": "every stretch of the reference rank's span with no kernel on it, as [start_ns, end_ns] in span order, capture-relative like gpu_span_ns; the complement of its launches' union inside gpu_span_ns",
+        "reference_rank.inter_phase_ms": "span_ms not covered by any phase's kernel span on the reference rank: the GPU waiting on the host between phases",
+        "reference_rank": "carried on every timeline detail row as well as on the report row, so the wall-clock card reads the reference rank's occupancy and gaps instead of re-deriving them",
         "selected_as": "why this iteration is in the file: group_median (a typical member of its kernel program), global_max_error / global_min_error (the capture's extremes), or manifest_override",
         "host.nvtx": "per thread, one [start_ns, duration_ns, string_id, depth] per NVTX range overlapping this iteration's host window. start_ns is anchor-relative like host.window_ns, NOT capture-relative like gpu_span_ns and the measured kernel intervals — the host block keeps small numbers because there are millions of these rows. Depth is measured containment on that thread, not an assumed outer/inner split",
         "host.api": "per thread, one [start_ns, duration_ns, string_id, class_index, correlation_id] per CUDA runtime call, anchor-relative like host.nvtx. class_index indexes meta.host_timeline.api_classes; correlation_id is the NSYS launch identity used to connect this call to one measured kernel; a thread between two calls is unaccounted for, not idle — the capture carries no CPU sampling",
@@ -1381,6 +1406,126 @@ mod tests {
         assert!(names.resolve(u64::MAX, "unregistered").is_err());
     }
     use super::*;
+
+    const MS: u64 = 1_000_000;
+
+    /// One kernel occurrence: `(phase, operation, [(device, start, end)])`.
+    fn occurrence(
+        phase: &str,
+        operation: &str,
+        launches: &[(i64, u64, u64)],
+    ) -> (String, super::super::IterationKernelAggregate) {
+        let launches: Vec<_> = launches
+            .iter()
+            .map(
+                |&(device_id, start_ns, end_ns)| super::super::KernelLaunch {
+                    device_id,
+                    start_ns,
+                    end_ns,
+                    correlation_id: None,
+                    track_index: 0,
+                    stream_id: None,
+                },
+            )
+            .collect();
+        (
+            operation.to_owned(),
+            super::super::IterationKernelAggregate {
+                phase: phase.to_owned(),
+                name: format!("{operation}_kernel"),
+                operation: Some(operation.to_owned()),
+                device_ids: launches.iter().map(|launch| launch.device_id).collect(),
+                launches,
+                ..Default::default()
+            },
+        )
+    }
+
+    fn phase(
+        device_id: i64,
+        phase: &str,
+        span_ns: (u64, u64),
+        busy_ms: f64,
+    ) -> super::super::PhaseSummary {
+        super::super::PhaseSummary {
+            device_id,
+            phase: phase.to_owned(),
+            busy_union_ms: busy_ms,
+            kernel_sum_ms: busy_ms,
+            kernel_count: 1,
+            span_ns,
+        }
+    }
+
+    /// preprocess 0-1 ms, forward 3-5 and 6-8 ms then 8.5-10 ms postprocess on
+    /// rank 0; rank 1 runs through rank 0's forward hole.
+    fn reference_rank_report() -> Value {
+        let measurement = IterationMeasurement {
+            kernels: vec![
+                occurrence("preprocess", "embed", &[(0, 0, MS)]),
+                occurrence(
+                    "forward",
+                    "kv_cache_append",
+                    &[(0, 3 * MS, 5 * MS), (1, 5 * MS, 6 * MS)],
+                ),
+                occurrence("forward", "attention", &[(0, 6 * MS, 8 * MS)]),
+                occurrence("postprocess", "sample", &[(0, 17 * MS / 2, 10 * MS)]),
+            ],
+            inventory_kernels: Vec::new(),
+            phase_summaries: vec![
+                phase(0, "preprocess", (0, MS), 1.0),
+                phase(0, "forward", (3 * MS, 8 * MS), 4.0),
+                phase(0, "postprocess", (17 * MS / 2, 10 * MS), 1.5),
+                phase(1, "forward", (5 * MS, 6 * MS), 1.0),
+            ],
+            device_ids: BTreeSet::from([0, 1]),
+            busy_union_ms: 0.0,
+            track_intervals: BTreeMap::new(),
+        };
+        let reference = ReferenceRank::of(&measurement, 0);
+        reference.report(&reference.occupancy(), 0, &measurement, 0)
+    }
+
+    #[test]
+    fn reference_rank_splits_the_span_into_phase_kernel_time_and_host_time() {
+        let report = reference_rank_report();
+        assert_eq!(report["span_ms"], 10.0);
+        assert_eq!(report["busy_ms"], 6.5);
+        assert_eq!(report["idle_ms"], 3.5);
+        // 1-3 ms and 8-8.5 ms lie in no phase's span.
+        assert_eq!(report["inter_phase_ms"], 2.5);
+        assert_eq!(report["gap_count"], 3);
+        // In span order; none before the first launch or after the last.
+        assert_eq!(
+            report["gaps_ns"],
+            json!([[MS, 3 * MS], [5 * MS, 6 * MS], [8 * MS, 17 * MS / 2]])
+        );
+        let phases = report["phases"].as_array().unwrap();
+        assert_eq!(
+            phases
+                .iter()
+                .map(|phase| phase["phase"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["preprocess", "forward", "postprocess"]
+        );
+        assert_eq!(phases[1]["busy_ms"], 4.0);
+        assert_eq!(phases[1]["idle_ms"], 1.0);
+        assert_eq!(phases[1]["idle_fraction"], 0.2);
+    }
+
+    #[test]
+    fn reference_rank_gaps_name_their_edges_and_ignore_peer_ranks() {
+        let report = reference_rank_report();
+        // Rank 1's kernel fills 5-6 ms on its own rank, not on the reference.
+        let forward_gaps = report["phases"][1]["largest_gaps"].as_array().unwrap();
+        assert_eq!(forward_gaps.len(), 1);
+        assert_eq!(forward_gaps[0]["start_ns"], 5 * MS);
+        assert_eq!(forward_gaps[0]["duration_us"], 1000.0);
+        assert_eq!(forward_gaps[0]["after"]["operation"], "kv_cache_append");
+        assert_eq!(forward_gaps[0]["before"]["operation"], "attention");
+        let crossing = report["largest_inter_phase_gaps"].as_array().unwrap();
+        assert_eq!(crossing[0]["duration_us"], 2000.0);
+    }
 
     fn summary(iteration_id: u64, kind: &str, sequence: &str, relative: f64) -> IterationSummary {
         IterationSummary {

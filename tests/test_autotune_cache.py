@@ -95,3 +95,46 @@ def test_cached_autotune_does_not_swallow_the_body(tmp_path: Path, monkeypatch) 
         raise AssertionError("TypeError was swallowed")
 
     assert len(seen) == 1
+
+
+def test_each_file_receives_only_its_own_configs_tactics(tmp_path: Path, monkeypatch) -> None:
+    """One worker profiles several configurations. FlashInfer saves the whole
+    process-wide tactic dict under hash-free keys into whichever file is open, so
+    the second configuration's file must not inherit the first one's entries."""
+
+    import json
+    import sys
+    import threading
+    import types
+
+    class AutoTuner:
+        instance = None
+
+        def __init__(self) -> None:
+            self._lock = threading.Lock()
+            self.profiling_cache: dict[str, str] = {}
+
+        @classmethod
+        def get(cls) -> AutoTuner:
+            cls.instance = cls.instance or cls()
+            return cls.instance
+
+    module = types.ModuleType("fake_flashinfer_autotuner")
+    module.AutoTuner = AutoTuner
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+
+    @contextlib.contextmanager
+    def autotune(tune_mode: bool = True, cache: str | None = None):
+        yield
+        Path(cache).write_text(json.dumps(AutoTuner.get().profiling_cache))
+
+    autotune.__module__ = module.__name__
+    monkeypatch.setenv(CACHE_DIR_ENV, str(tmp_path))
+
+    for label, tactic in (("cfg-a", "a"), ("cfg-b", "b")):
+        with autotune_cached(autotune, label):
+            AutoTuner.get().profiling_cache[f"shape-{label}"] = tactic
+    saved = {
+        label: json.loads(autotune_cache_path(label).read_text()) for label in ("cfg-a", "cfg-b")
+    }
+    assert saved == {"cfg-a": {"shape-cfg-a": "a"}, "cfg-b": {"shape-cfg-b": "b"}}

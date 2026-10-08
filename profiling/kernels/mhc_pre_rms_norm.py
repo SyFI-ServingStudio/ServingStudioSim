@@ -36,8 +36,9 @@ DOC = KernelDoc(
         "mHC keeps hc_mult residual streams per token instead of one."
         " Before each block, one vLLM TileLang call projects the streams to"
         " three sets of mixing weights, sums the streams with the pre-mix "
-        "weights into the block input, and RMS-normalizes it. The measurement "
-        "uses 4 bf16 streams of 4,096 features and random residuals."
+        "weights into the block input, and RMS-normalizes it. TileLang compiles "
+        "the call for each hidden_size and hc_mult; the measurement uses random "
+        "residuals."
     ),
     category="Normalization",
     subcategory="Hyper-connections",
@@ -55,8 +56,7 @@ DOC = KernelDoc(
         "implementation before timing."
     ),
     caveats=(
-        "Only hidden_size = 4096, hc_mult = 4 in bf16 on H200 and B200 is "
-        "measured, with ε = 1e-6; another ε runs the same launches.",
+        "The runner uses ε = 1e-6; another ε runs the same launches.",
         "TFLOPS is not computed. GB/s counts the streams and weights read "
         "once and the mixes and block input written once.",
     ),
@@ -78,7 +78,6 @@ register(
         batch_outlier_policy=BatchOutlierPolicy(),
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
-            gpus=frozenset({"NVIDIA H200", "NVIDIA B200"}),
         ),
         subprocess_env="vllm_env",
         doc=BackendDoc(
@@ -107,7 +106,7 @@ register(
     KernelProfilerSpec(
         kernel_kind=KIND,
         backend="elementwise_floor",
-        supports=BackendSupport(compute=None, gpus=frozenset({"MI300X"})),
+        supports=BackendSupport(compute=None, arch_targets=frozenset({"CDNA3"})),
         runner_ref=RunnerRef(
             module_name="profiling.runners.elementwise.floor",
             function_name="profile_mhc_pre_rms_norm_floor",

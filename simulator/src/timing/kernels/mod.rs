@@ -5,9 +5,11 @@ pub mod all_reduce_fusion;
 pub mod all_reduce_residual_rms_norm;
 pub mod batched_gemm;
 pub mod bf16_fused_moe;
+mod causal_rows;
 pub mod clamped_swiglu;
 pub mod compressed_sparse_mla_decode;
 pub mod compressed_sparse_mla_prefill;
+pub mod compressed_sparse_mla_rope_cast;
 pub mod dsa_compressed_mqa_logits_prefill;
 pub mod dsa_compressed_topk_prefill;
 pub mod dsa_index_cache_append;
@@ -22,6 +24,7 @@ pub mod dsa_sparse_mla_prefill;
 pub mod dsa_topk_prefill;
 pub mod elementwise;
 pub mod engine;
+pub mod engram_lookup;
 pub mod flashinfer_attn_decode;
 pub mod flashinfer_attn_prefill;
 pub mod flashinfer_attn_rect;
@@ -51,6 +54,7 @@ pub mod moe_align_block_size;
 pub mod moe_alltoall;
 pub mod moe_alltoall_prepare;
 pub mod moe_ep_all_gather;
+pub mod moe_ep_quantized_all_gather;
 pub mod moe_ep_reduce_scatter;
 pub mod moe_finalize_fuse_shared;
 pub mod moe_finalize_routing;
@@ -64,6 +68,7 @@ pub mod p2p_inter;
 pub mod p2p_intra;
 pub mod packed_kv_cache_gather;
 pub mod q_kv_rms_norm;
+pub mod q_pad_kv_rope_mxfp8_insert;
 pub mod qnorm_rope_kv_insert;
 pub mod residual_rms_norm;
 pub mod rms_norm;
@@ -96,6 +101,10 @@ pub use compressed_sparse_mla_decode::{
 pub use compressed_sparse_mla_prefill::{
     CompressedSparseMlaPrefillKernel, CompressedSparseMlaPrefillKernelConfig,
     CompressedSparseMlaPrefillKernelInput, CompressedSparseMlaPrefillSpec,
+};
+pub use compressed_sparse_mla_rope_cast::{
+    CompressedSparseMlaRopeCastKernel, CompressedSparseMlaRopeCastKernelConfig,
+    CompressedSparseMlaRopeCastKernelInput, CompressedSparseMlaRopeCastSpec,
 };
 pub use dsa_compressed_mqa_logits_prefill::{
     DsaCompressedMqaLogitsPrefillKernel, DsaCompressedMqaLogitsPrefillKernelConfig,
@@ -139,7 +148,7 @@ pub use dsa_sparse_mla_attention::{
 };
 pub use dsa_sparse_mla_prefill::{
     DsaSparseMlaPrefillKernel, DsaSparseMlaPrefillKernelConfig, DsaSparseMlaPrefillKernelInput,
-    DsaSparseMlaPrefillSpec,
+    DsaSparseMlaPrefillSpec, MAX_LAUNCH_QUERY_ROWS,
 };
 pub use dsa_topk_prefill::{
     DsaTopkPrefillKernel, DsaTopkPrefillKernelConfig, DsaTopkPrefillKernelInput, DsaTopkPrefillSpec,
@@ -147,7 +156,10 @@ pub use dsa_topk_prefill::{
 pub use elementwise::{
     ElementwiseKernel, ElementwiseKernelConfig, ElementwiseKernelInput, ElementwiseSpec,
 };
-pub use engine::{Kernel, KernelConfig, KernelSpec};
+pub use engine::{Kernel, KernelConfig, KernelSpec, OffGrid};
+pub use engram_lookup::{
+    EngramLookupKernel, EngramLookupKernelConfig, EngramLookupKernelInput, EngramLookupSpec,
+};
 pub use flashinfer_attn_decode::{
     FlashinferAttnDecodeKernel, FlashinferAttnDecodeKernelConfig, FlashinferAttnDecodeKernelInput,
     FlashinferAttnDecodeSpec,
@@ -251,6 +263,9 @@ pub use moe_ep_all_gather::{
     MoeEpAllGatherKernel, MoeEpAllGatherKernelConfig, MoeEpAllGatherSpec,
     MoeEpCollectiveKernelInput,
 };
+pub use moe_ep_quantized_all_gather::{
+    MoeEpQuantizedAllGatherKernel, MoeEpQuantizedAllGatherKernelConfig, MoeEpQuantizedAllGatherSpec,
+};
 pub use moe_ep_reduce_scatter::{
     MoeEpReduceScatterKernel, MoeEpReduceScatterKernelConfig, MoeEpReduceScatterSpec,
 };
@@ -288,6 +303,10 @@ pub use packed_kv_cache_gather::{
 };
 pub use q_kv_rms_norm::{
     QKvRmsNormKernel, QKvRmsNormKernelConfig, QKvRmsNormKernelInput, QKvRmsNormSpec,
+};
+pub use q_pad_kv_rope_mxfp8_insert::{
+    QPadKvRopeMxfp8InsertKernel, QPadKvRopeMxfp8InsertKernelConfig,
+    QPadKvRopeMxfp8InsertKernelInput, QPadKvRopeMxfp8InsertSpec,
 };
 pub use qnorm_rope_kv_insert::{
     QnormRopeKvInsertKernel, QnormRopeKvInsertKernelConfig, QnormRopeKvInsertKernelInput,

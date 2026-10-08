@@ -71,8 +71,6 @@ def profile_grouped_gemm(
         import torch
     except ImportError as exc:
         raise ProfilerNotImplemented("torch required for the deepgemm grouped-GEMM runner") from exc
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented("CUDA required for the deepgemm grouped-GEMM runner")
     try:
         import deep_gemm
         from deep_gemm.utils import (
@@ -167,8 +165,6 @@ def profile_single_gemm(
         import torch
     except ImportError as exc:
         raise ProfilerNotImplemented("torch required for the deepgemm single-GEMM runner") from exc
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented("CUDA required for the deepgemm single-GEMM runner")
     try:
         import deep_gemm
         from deep_gemm.utils import per_block_cast_to_fp8, per_token_cast_to_fp8

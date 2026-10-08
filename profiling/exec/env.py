@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import shutil
 import sys
-from collections.abc import Iterable
+from collections.abc import Iterable, MutableMapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -16,6 +16,11 @@ class ProfileEnv:
     python_executable: Path
     additional_python_paths: tuple[Path, ...] = ()
     additional_library_paths: tuple[Path, ...] = ()
+    # True for an env whose interpreter owns a separate venv. The worker then
+    # drops inherited site-packages from PYTHONPATH: a parent venv's third-party
+    # stack (e.g. the project Torch that the PyO3 bridge exports) would shadow
+    # the env's own ABI-matched builds. Repo source stays importable.
+    isolated_site_packages: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "python_executable", Path(self.python_executable))
@@ -84,6 +89,16 @@ _PROFILE_ENVS_ROOT = Path.home() / "profile_envs"
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _PROJECT_UV_PYTHON = _PROJECT_ROOT / ".venv" / "bin" / "python"
 _SGLANG_CHECKOUT = _PROJECT_ROOT / "alignment" / "profiler" / "sglang"
+# The alignment vLLM checkout (alignment/profiler/vllm) and its own built
+# `.venv`. A separate worktree without the initialized submodule points
+# VIBESIM_VLLM_FORK_ROOT at the checkout that owns the `.venv`.
+_VLLM_FORK_CHECKOUT = Path(
+    os.environ.get("VIBESIM_VLLM_FORK_ROOT", _PROJECT_ROOT / "alignment" / "profiler" / "vllm")
+)
+_VLLM_FORK_PYTHON = _VLLM_FORK_CHECKOUT / ".venv" / "bin" / "python"
+_VLLM_FORK_TORCH_LIB = (
+    _VLLM_FORK_CHECKOUT / ".venv" / "lib" / "python3.12" / "site-packages" / "torch" / "lib"
+)
 _SGLANG_PYTHON_ROOT = _SGLANG_CHECKOUT / "python"
 _SGLANG_PYTHON = _SGLANG_PYTHON_ROOT / ".venv-sglang" / "bin" / "python"
 
@@ -123,6 +138,23 @@ ENV_REGISTRY: dict[str, ProfileEnv | ContainerProfileEnv] = {
         _SGLANG_PYTHON,
         additional_python_paths=(_SGLANG_PYTHON_ROOT,),
     ),
+    # The alignment vLLM checkout's own host venv (alignment/profiler/README.md).
+    # It exists because vllm_env's image is built from fork commit 3f667d7, and
+    # some backends need a newer tree: the checkout rebased onto upstream vLLM
+    # 04730e8, with the models and the newer FlashInfer/DeepGEMM/FlashMLA builds
+    # those backends call. Source and native extensions come from the checkout,
+    # Torch's CUDA runtime resolves first as in the alignment server launch, and
+    # inherited site-packages are dropped so the project Torch cannot shadow the
+    # venv's ABI-matched build. Remove this env, and move its backends to
+    # vllm_env, once profiling/container/build.sh builds from the rebased
+    # checkout.
+    "vllm_upstream_fork_env": ProfileEnv(
+        "vllm_upstream_fork_env",
+        _VLLM_FORK_PYTHON,
+        additional_python_paths=(_VLLM_FORK_CHECKOUT,),
+        additional_library_paths=(_VLLM_FORK_TORCH_LIB,),
+        isolated_site_packages=True,
+    ),
     # vLLM runners execute in the pinned image (the alignment fork's vLLM
     # commit, profiling/container/build.sh); host source and Python packages
     # are deliberately outside this environment boundary.
@@ -161,12 +193,14 @@ def register_profile_env(
     python_executable: Path | str,
     additional_python_paths: Iterable[Path | str] = (),
     additional_library_paths: Iterable[Path | str] = (),
+    isolated_site_packages: bool = False,
 ) -> None:
     ENV_REGISTRY[name] = ProfileEnv(
         name=name,
         python_executable=Path(python_executable),
         additional_python_paths=tuple(Path(path) for path in additional_python_paths),
         additional_library_paths=tuple(Path(path) for path in additional_library_paths),
+        isolated_site_packages=isolated_site_packages,
     )
 
 
@@ -176,9 +210,36 @@ def compose_pythonpath(profile_env: ProfileEnv, existing: str | None) -> str:
         str(_PROJECT_ROOT),
         *(str(path) for path in profile_env.additional_python_paths),
     ]
-    if existing:
+    if existing and profile_env.isolated_site_packages:
+        entries.extend(
+            entry for entry in existing.split(os.pathsep) if entry and not _is_site_packages(entry)
+        )
+    elif existing:
         entries.append(existing)
     return os.pathsep.join(entries)
+
+
+def _is_site_packages(entry: str) -> bool:
+    return any(part in ("site-packages", "dist-packages") for part in Path(entry).parts)
+
+
+# Interpreter-selection variables a host worker inherits from its caller. The
+# launcher's PyO3 child sets them to the project venv's stdlib and site-packages.
+_INTERPRETER_PATH_VARS = ("PYTHONHOME", "PYTHONPATH", "VIRTUAL_ENV")
+
+
+def set_worker_python_env(profile_env: ProfileEnv, env: MutableMapping[str, str]) -> None:
+    """Set a host worker's import path in `env` (a copy of the caller's environment).
+
+    A worker on the project interpreter keeps the caller's PYTHONPATH after its
+    own entries. A worker on its own interpreter (`sglang_env`, `vllm_upstream_fork_env`) drops the
+    caller's interpreter variables: inherited, they would put the project venv's
+    Torch and FlashInfer ahead of the env's own stack.
+    """
+    if profile_env.python_executable != _default_python():
+        for key in _INTERPRETER_PATH_VARS:
+            env.pop(key, None)
+    env["PYTHONPATH"] = compose_pythonpath(profile_env, env.get("PYTHONPATH"))
 
 
 def compose_library_path(profile_env: ProfileEnv, existing: str | None) -> str:
@@ -212,4 +273,5 @@ __all__ = [
     "compose_pythonpath",
     "register_profile_env",
     "resolve_profile_env",
+    "set_worker_python_env",
 ]

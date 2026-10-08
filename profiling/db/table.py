@@ -3,20 +3,22 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import subprocess
+import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, fields
+from dataclasses import dataclass, fields
 from datetime import UTC, datetime
 from enum import Enum
 from functools import cache, lru_cache
 from importlib import metadata as importlib_metadata
 from pathlib import Path
-from typing import Any, get_origin, get_type_hints
+from typing import Any, get_origin
 
 from profiling.db import storage
-from profiling.db.args import KernelArgs
+from profiling.db.args import KernelArgs, field_types
 from profiling.db.kind import KernelKind
 from profiling.db.migrate import SCHEMA_HASH, migrate_connection, require_current
 from profiling.db.registry import KernelProfilerSpec, MetricFamily
@@ -35,6 +37,10 @@ STANDARD_COLUMNS = [
 # How long a writer waits for the write lock before giving up. See
 # `Table._write_transaction`.
 _WRITE_LOCK_TIMEOUT_S = 120.0
+# Bound parameters per lookup statement; SQLite allows 32766. See `Table._match_rows`.
+_SQL_VARIABLES = 30000
+# Each thread's last read-only connection. See `Table._connect_read_only`.
+_read_only = threading.local()
 
 COMPUTE_METRIC_COLUMNS = ["time_ms", "tflops", "memory_bandwidth_gbps", "energy_j"]
 # message_size for comm kernels is an args/cache-key column, NOT a measured
@@ -179,10 +185,15 @@ class Table:
         with conn:
             if not self._table_exists(conn):
                 return [self._missing_entry(args, backend, gpu_name) for args in args_list]
-            return [
-                self._query_one(conn, args, backend, gpu_name, include_outliers)
-                for args in args_list
-            ]
+            rows = self._match_rows(
+                conn, args_list, backend, gpu_name, include_outliers, select="t.*"
+            )
+        return [
+            self._missing_entry(args, backend, gpu_name)
+            if row is None
+            else _metrics_from_row(row, self.profiler_spec.metric_family)
+            for args, row in zip(args_list, rows, strict=True)
+        ]
 
     def rows_for(
         self,
@@ -208,13 +219,13 @@ class Table:
 
     def db_key(self, args: KernelArgs) -> tuple[Any, ...]:
         """``args`` as this table stores them, in ``args_columns`` order."""
-        values = _args_to_db(args)
-        return tuple(values[column] for column in self.args_columns)
+        return tuple(_to_db_value(getattr(args, column)) for column in self.args_columns)
 
     def args_hash(self, key: tuple[Any, ...]) -> bytes:
         """The ``args_hash`` column of a row whose args are ``key`` (:meth:`db_key`)."""
         return storage.args_hash(
-            dict(zip(self.args_columns, key, strict=True)), self._declared_types()
+            dict(zip(self.args_columns, key, strict=True)),
+            _declared_types(self.profiler_spec.args_schema),
         )
 
     def args_match_sql(self, alias: str = "") -> str:
@@ -225,13 +236,6 @@ class Table:
         return " AND ".join(
             [f"{prefix}args_hash = ?", *(f"{prefix}{column} = ?" for column in self.args_columns)]
         )
-
-    def _declared_types(self) -> dict[str, str]:
-        type_hints = get_type_hints(self.profiler_spec.args_schema)
-        return {
-            field.name: _sqlite_type(type_hints[field.name])
-            for field in fields(self.profiler_spec.args_schema)
-        }
 
     def exists(
         self,
@@ -247,7 +251,8 @@ class Table:
         with conn:
             if not self._table_exists(conn):
                 return [False for _ in args_list]
-            return [self._exists_one(conn, args, backend, gpu_name) for args in args_list]
+            rows = self._match_rows(conn, args_list, backend, gpu_name, include_outliers=False)
+        return [row is not None for row in rows]
 
     def metadata(self) -> TableMetadata:
         conn = self._connect_read_only()
@@ -292,13 +297,26 @@ class Table:
             yield conn
 
     def _connect_read_only(self) -> sqlite3.Connection | None:
-        """Open a physically read-only connection without creating the DB."""
+        """A physically read-only connection, without creating the DB.
+
+        A build queries once per kernel, and a new connection parses the whole
+        schema before its first statement. So each thread reuses its last
+        connection while the file is the same one, unchanged on disk; any write,
+        replacement or fork opens (and ``require_current`` checks) a new one.
+        """
         if not self.db_path.is_file():
             return None
-        conn = sqlite3.connect(f"{self.db_path.resolve().as_uri()}?mode=ro", uri=True)
+        path = self.db_path.resolve()
+        stat = path.stat()
+        identity = (path, stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, os.getpid())
+        cached = getattr(_read_only, "connection", None)
+        if cached is not None and cached[0] == identity:
+            return cached[1]
+        conn = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA query_only = ON")
         require_current(conn, str(self.db_path))
+        _read_only.connection = (identity, conn)
         return conn
 
     def _ensure_schema(self, conn: sqlite3.Connection) -> None:
@@ -309,7 +327,7 @@ class Table:
                 self.name,
                 [
                     f"{column} {declared} NOT NULL"
-                    for column, declared in self._declared_types().items()
+                    for column, declared in _declared_types(self.profiler_spec.args_schema).items()
                 ],
                 [
                     f"{column} {column_def}"
@@ -361,35 +379,53 @@ class Table:
             if column in existing and column not in metric_columns:
                 conn.execute(f"ALTER TABLE {self.name} DROP COLUMN {column}")
 
-    def _query_one(
+    def _match_rows(
         self,
         conn: sqlite3.Connection,
-        args: KernelArgs,
+        args_list: list[KernelArgs],
         backend: str,
         gpu_name: str,
         include_outliers: bool,
-    ) -> Metrics | MissingEntry:
-        where, values = self._where(args, backend, gpu_name)
-        if not include_outliers:
-            where += " AND is_outlier = 0"
-        row = conn.execute(f"SELECT * FROM {self.name} WHERE {where} LIMIT 1", values).fetchone()
-        if row is None:
-            return MissingEntry(self.profiler_spec.kernel_kind, backend, gpu_name, args)
-        return _metrics_from_row(row, self.profiler_spec.metric_family)
+        *,
+        select: str = "",
+    ) -> list[sqlite3.Row | None]:
+        """The row of each args on ``(gpu_name, backend)``, or None.
 
-    def _exists_one(
-        self,
-        conn: sqlite3.Connection,
-        args: KernelArgs,
-        backend: str,
-        gpu_name: str,
-    ) -> bool:
-        where, values = self._where(args, backend, gpu_name)
-        row = conn.execute(
-            f"SELECT 1 FROM {self.name} WHERE {where} AND is_outlier = 0 LIMIT 1",
-            values,
-        ).fetchone()
-        return row is not None
+        One statement per chunk of args rather than one per args: the chunk is a
+        ``VALUES`` table ``c`` joined to this table's rows ``t``, and ``select``
+        names further ``t`` columns to return. Each args still finds its row
+        through the ``(gpu_name, backend, args_hash)`` unique index, and its args
+        columns confirm it in SQL, where each column's declared type converts the
+        ``VALUES`` value exactly as it converts a bound ``column = ?``.
+        """
+        columns = ["_i", "_hash", *self.args_columns]
+        match = " AND ".join(
+            [
+                "t.gpu_name = ?",
+                "t.backend = ?",
+                "t.args_hash = c._hash",
+                *(f"t.{column} = c.{column}" for column in self.args_columns),
+                *([] if include_outliers else ["t.is_outlier = 0"]),
+            ]
+        )
+        found: list[sqlite3.Row | None] = [None] * len(args_list)
+        chunk = max(1, (_SQL_VARIABLES - 2) // len(columns))
+        for start in range(0, len(args_list), chunk):
+            part = args_list[start : start + chunk]
+            values = ", ".join([f"({', '.join('?' * len(columns))})"] * len(part))
+            bound: list[Any] = []
+            for index, args in enumerate(part, start):
+                key = self.db_key(args)
+                bound += [index, self.args_hash(key), *key]
+            # CROSS JOIN keeps `c` the outer loop, so `t` is probed by its index.
+            sql = (
+                f"WITH c({', '.join(columns)}) AS (VALUES {values}) "
+                f"SELECT {', '.join(['c._i AS _i', *([select] if select else [])])} "
+                f"FROM c CROSS JOIN {self.name} t WHERE {match}"
+            )
+            for row in conn.execute(sql, [*bound, gpu_name, backend]):
+                found[row["_i"]] = row
+        return found
 
     def _where(self, args: KernelArgs, backend: str, gpu_name: str) -> tuple[str, list[Any]]:
         """Unqualified columns: the caller's FROM names this table once (the
@@ -444,10 +480,6 @@ class Table:
                 )
 
 
-def _args_to_db(args: KernelArgs) -> dict[str, Any]:
-    return {key: _to_db_value(value) for key, value in asdict(args).items()}
-
-
 def _metrics_to_db(metrics: Metrics) -> dict[str, Any]:
     if isinstance(metrics, ComputeMetrics):
         return {
@@ -490,6 +522,12 @@ def _to_db_value(value: Any) -> Any:
     if isinstance(value, list):
         return json.dumps(value, separators=(",", ":"))
     return value
+
+
+@cache
+def _declared_types(args_schema: type[KernelArgs]) -> dict[str, str]:
+    """Each args column's declared SQLite type, in column order."""
+    return {name: _sqlite_type(annotation) for name, annotation in field_types(args_schema).items()}
 
 
 def _sqlite_type(annotation: Any) -> str:

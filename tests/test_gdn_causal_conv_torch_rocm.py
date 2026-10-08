@@ -21,12 +21,12 @@ def test_torch_rocm_backend_registered_for_mi300x(kind: str) -> None:
     # The MI300X path is a separate backend of the same kind, gated to MI300X and
     # routed to the vllm_rocm_env image. The NVIDIA rows must be left untouched.
     rocm = find_kernel_profiler_spec(kind, "torch_rocm")
-    assert rocm.supports.gpus == frozenset({"MI300X"})
+    assert rocm.supports.arch_targets == frozenset({"CDNA3"})
     assert rocm.subprocess_env == "vllm_rocm_env"
     assert rocm.runner_ref.function_name == f"profile_{kind}_torch_rocm"
 
     nvidia = find_kernel_profiler_spec(kind, "vllm_triton")
-    assert "MI300X" not in nvidia.supports.gpus
+    assert nvidia.supports.arch_targets is None
 
 
 @pytest.mark.parametrize("kind", ["gdn_causal_conv_decode", "gdn_causal_conv_prefill"])

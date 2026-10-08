@@ -106,7 +106,6 @@ register(
         backend="vllm_triton",
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
-            gpus=frozenset({"NVIDIA H200", "NVIDIA B200"}),
         ),
         runner_ref=RunnerRef(
             module_name=("profiling.runners.attention.gdn_causal_conv_prefill_vllm_triton"),
@@ -140,7 +139,7 @@ register(
         backend="torch_rocm",
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
-            gpus=frozenset({"MI300X"}),
+            arch_targets=frozenset({"CDNA3"}),
         ),
         runner_ref=RunnerRef(
             module_name=("profiling.runners.attention.gdn_causal_conv_prefill_torch_rocm"),
