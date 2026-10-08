@@ -91,7 +91,7 @@ DOC = KernelDoc(
         "second stream in parallel with the q and rel-projection kernels."
     ),
     category="Attention",
-    subcategory="Inkling relative attention",
+    subcategory="MHA / GQA",
     formula=(
         "k' = bf16(k + Σ_i w_k[i] · k[p − W + 1 + i]), v' likewise",
         "q̂ = RMSNorm(q) · tau, k̂ = RMSNorm(k'), rel = (r @ W_rel) · tau",
