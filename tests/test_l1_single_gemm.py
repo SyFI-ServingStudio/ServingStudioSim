@@ -142,6 +142,9 @@ def test_single_gemm_known_backends_include_framework_dispatches():
         "deepgemm",
         "flashinfer_cutedsl",
         "flashinfer_mxfp8",
+        # MI300X (ROCm) dense-GEMM backends.
+        "rocm_scaled_mm",
+        "torch_rocm",
     }
 
 
@@ -1581,6 +1584,7 @@ def test_documented_profile_env_registry_complete():
         "flashinfer_local",
         "sglang_env",
         "vllm_env",
+        "vllm_rocm_env",
         "vllm_upstream_fork_env",
     }
     assert set(ENV_REGISTRY) == expected_envs

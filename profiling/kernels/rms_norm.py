@@ -23,7 +23,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from profiling.db.args import DType, KernelArgs
-from profiling.db.doc import CUPTI_METHOD, BackendDoc, KernelDoc, arg
+from profiling.db.doc import CUPTI_METHOD, ROCPROF_METHOD, BackendDoc, KernelDoc, arg
 from profiling.db.outlier import BatchOutlierPolicy
 from profiling.db.registry import (
     BackendSupport,
@@ -124,6 +124,39 @@ register(
                 "vLLM's rms_norm CUDA op, as RMSNorm.forward_cuda launches it without a residual."
             ),
             url="https://github.com/vllm-project/vllm/blob/main/csrc/libtorch_stable/layernorm_kernels.cu",
+        ),
+    )
+)
+
+# PyTorch's fused RMSNorm (``torch.nn.functional.rms_norm``) on a ROCm/HIP
+# device. The first-step ROCm reference backend for MI300X: a real production
+# public callable, timed kernel-only via rocprofv3 dispatch durations
+# (``Timer.rocprof``), MI300X-gated so it never competes with the NVIDIA rows.
+# Replaced later by an aiter/Triton fused norm once that path is profiled.
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        # Norms stay 16-bit even in an fp8 run (activation precision).
+        backend="torch_rocm",
+        supports=BackendSupport(
+            compute=frozenset({DType.BF16, DType.FP16}),
+            arch_targets=frozenset({"CDNA3"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.norm.rms_norm_torch_rocm",
+            function_name="profile_rms_norm_torch_rocm",
+        ),
+        table_name=KIND,
+        args_schema=RmsNormArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="vllm_rocm_env",
+        doc=BackendDoc(
+            summary=(
+                "PyTorch's torch.nn.functional.rms_norm, run on ROCm/MI300X and timed "
+                f"with rocprofv3. {ROCPROF_METHOD}"
+            ),
+            url="https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.rms_norm.html",
         ),
     )
 )

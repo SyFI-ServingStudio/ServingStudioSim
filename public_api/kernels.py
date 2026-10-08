@@ -59,20 +59,26 @@ class BadQuery(ValueError):
 
 
 def _supports(supports: BackendSupport) -> dict:
-    """A backend's dtypes and device requirement. ``gpus`` names the catalog's
-    NVIDIA GPUs whose compute capability meets the requirement; None when the
-    backend has none (any CUDA GPU)."""
+    """A backend's dtypes and device requirement. ``gpus`` names the catalog
+    GPUs the device gate admits — NVIDIA by compute capability, AMD by
+    ``arch_targets`` architecture; None when the backend has no device gate
+    (any GPU)."""
     capability = supports.min_compute_capability
-    device = capability is not None or supports.sm_targets is not None
+    device = (
+        capability is not None
+        or supports.sm_targets is not None
+        or supports.arch_targets is not None
+    )
     return {
         "compute": sorted(supports.compute) if supports.compute else None,
         "kv": sorted(supports.kv) if supports.kv else None,
         "min_compute_capability": ".".join(map(str, capability)) if capability else None,
         "sm_targets": sorted(supports.sm_targets) if supports.sm_targets else None,
+        "arch_targets": sorted(supports.arch_targets) if supports.arch_targets else None,
         "gpus": [
             gpu.canonical_name
-            for gpu in _nvidia_gpus()
-            if supports.allows_compute_capability(gpu.compute_capability)
+            for gpu in _catalog_gpus()
+            if supports.allows_device(gpu.canonical_name)
         ]
         if device
         else None,
@@ -80,10 +86,11 @@ def _supports(supports: BackendSupport) -> dict:
 
 
 @cache
-def _nvidia_gpus() -> list[GpuSpecResolution]:
-    """The GPUs of ``gpu/spec.json`` that have a compute capability, in its order."""
+def _catalog_gpus() -> list[GpuSpecResolution]:
+    """Every resolvable GPU of ``gpu/spec.json``, in catalog order. The device
+    gate (``allows_device``) decides which a backend admits."""
     gpus = (resolve_gpu_spec(gpu["name"]) for gpu in load_gpu_catalog())
-    return [gpu for gpu in gpus if gpu is not None and gpu.compute_capability is not None]
+    return [gpu for gpu in gpus if gpu is not None]
 
 
 def _arg_type(annotation: Any) -> str:

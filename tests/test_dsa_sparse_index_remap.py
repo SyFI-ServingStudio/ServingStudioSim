@@ -17,6 +17,8 @@ from profiling.db.batch import coerce_args
 from profiling.db.outlier import BatchOutlierPolicy
 from profiling.db.registry import MetricFamily, find_kernel_profiler_spec, known_backends
 from profiling.kernels.dsa_sparse_index_remap import KIND, DsaSparseIndexRemapArgs
+# MI300X elementwise byte-placeholder floor (GLM-5.3-Flash port, decision #37).
+_FLOOR_BACKEND = "elementwise_floor"
 from profiling.runners.attention.dsa_sparse_index_remap_reference import (
     dsa_sparse_index_remap_reference,
 )
@@ -115,7 +117,7 @@ def test_registration_support_family_environment_runner_ref_and_facades() -> Non
     vllm_spec = find_kernel_profiler_spec(KIND, "vllm_triton")
 
     assert KIND == "dsa_sparse_index_remap"
-    assert known_backends(KIND) == ["torch", "vllm_triton"]
+    assert known_backends(KIND) == ["torch", "vllm_triton", _FLOOR_BACKEND]
     assert spec.kernel_kind == spec.table_name == KIND
     assert spec.args_schema is DsaSparseIndexRemapArgs
     assert spec.metric_family is MetricFamily.COMPUTE

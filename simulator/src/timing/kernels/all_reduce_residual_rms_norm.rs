@@ -10,7 +10,7 @@
 use crate::common::Fabric;
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::CacheKind;
-use crate::timing::kernels::all_reduce_fusion::flashinfer_fusion_max_bytes;
+use crate::timing::kernels::all_reduce_fusion::fused_workspace_max_bytes;
 use crate::timing::kernels::engine::{register_kernel, KernelSpec};
 use crate::timing::sweep::{Axis, SweepGrid};
 use crate::timing::{KernelConfig, SweepCoords};
@@ -54,7 +54,8 @@ impl AllReduceResidualRmsNormSpec {
             return limit;
         }
         let bytes_per_token = (config.hidden_dim as u64) * (config.dtype.size_bytes() as u64);
-        (flashinfer_fusion_max_bytes(&config.gpu_name, config.num_gpus) / bytes_per_token) as u32
+        (fused_workspace_max_bytes(&config.gpu_name, config.num_gpus, config.fabric)
+            / bytes_per_token) as u32
     }
 }
 

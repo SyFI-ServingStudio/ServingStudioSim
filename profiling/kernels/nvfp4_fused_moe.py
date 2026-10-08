@@ -308,3 +308,39 @@ register(
         ),
     )
 )
+
+
+# The AMD/MI300X path. With AITER enabled, vLLM-ROCm routes the GLM-5.3-Flash
+# FusedMoE layer to aiter.fmoe_fp8_blockscale_g1u1 for Silu + FP8 block-scale
+# (block_shape=[128,128]); this is the single largest share of iteration time.
+# Same arg coordinates as the B200 flashinfer_trtllm_fp8_block_sm100 row (the
+# Nvfp4FusedMoeArgs schema is reused unchanged and validated identically); the
+# row is keyed by (gpu_name, backend), so the NVIDIA B200 rows are untouched.
+# Timed kernel-only via rocprofv3 in the vllm_rocm_env image. See
+# doc/pr/glm53-flash-mi300x/tier-a-amd-backends.md (Kernel 2, Q4/Q5).
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="rocm_aiter_fp8_block",
+        supports=BackendSupport(
+            compute=frozenset({DType.FP8_E4M3}),
+            arch_targets=frozenset({"CDNA3"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.moe.rocm_aiter_fp8_block_fused_moe",
+            function_name="profile_rocm_aiter_fp8_block_fused_moe",
+        ),
+        table_name=KIND,
+        args_schema=Nvfp4FusedMoeArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        doc=BackendDoc(
+            summary=(
+                "AITER fmoe_fp8_blockscale_g1u1 through vLLM-ROCm's AITER FP8 "
+                "block-scale FusedMoE path, including final expert combination."
+            ),
+            url="https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/fused_moe/experts/rocm_aiter_moe.py",
+        ),
+        subprocess_env="vllm_rocm_env",
+    )
+)

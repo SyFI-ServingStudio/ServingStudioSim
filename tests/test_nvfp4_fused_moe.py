@@ -136,6 +136,9 @@ def test_weight_format_coerces_to_the_nvfp4_dtype() -> None:
 
 
 _FP8_BLOCK_BACKEND = "flashinfer_trtllm_fp8_block_sm100"
+# The FP8-block (not NVFP4) backends of this kind: the B200 FlashInfer one and
+# the MI300X AITER one. Both gate on fp8_e4m3, each on its own GPU.
+_FP8_BLOCK_BACKENDS = {_FP8_BLOCK_BACKEND, "rocm_aiter_fp8_block"}
 _MXFP4_BACKEND = "flashinfer_trtllm_sm100_mxfp4"
 
 
@@ -144,10 +147,12 @@ def test_backends_gate_on_the_weight_format_not_the_bf16_input() -> None:
     asks for backends at nvfp4_e2m1 (or fp8_e4m3 for the FP8 block-scale
     backend, mxfp4_e2m1 for the MXFP4 one). input_dtype (bf16) is only the
     activation before quantization."""
-    nvfp4 = sorted(set(known_backends(KIND)) - {_FP8_BLOCK_BACKEND, _MXFP4_BACKEND})
+    nvfp4 = sorted(set(known_backends(KIND)) - _FP8_BLOCK_BACKENDS - {_MXFP4_BACKEND})
     assert sorted(supported_backends(KIND, DType.NVFP4_E2M1, None, "NVIDIA B200")) == nvfp4
     assert supported_backends(KIND, DType.FP8_E4M3, None, "NVIDIA B200") == [_FP8_BLOCK_BACKEND]
     assert supported_backends(KIND, DType.MXFP4_E2M1, None, "NVIDIA B200") == [_MXFP4_BACKEND]
+    # The MI300X AITER FP8-block backend is gated to MI300X, not B200.
+    assert supported_backends(KIND, DType.FP8_E4M3, None, "MI300X") == ["rocm_aiter_fp8_block"]
     assert supported_backends(KIND, DType.BF16, None, "NVIDIA B200") == []
     assert supported_backends(KIND, DType.NVFP4_E2M1, None, "NVIDIA H200") == []
     # A backend declared at bf16, as these were before, fails the gate.
@@ -168,7 +173,7 @@ def test_launcher_validation_accepts_nvfp4_roles_and_rejects_bf16_ones() -> None
     }
     (role,) = dedup_roles([record])
     assert role.compute is DType.NVFP4_E2M1
-    assert set(role.options) == set(known_backends(KIND)) - {_FP8_BLOCK_BACKEND, _MXFP4_BACKEND}
+    assert set(role.options) == set(known_backends(KIND)) - _FP8_BLOCK_BACKENDS - {_MXFP4_BACKEND}
     backend_map = {"main": {"unified.moe.experts": ["flashinfer_trtllm_sm100"]}}
     assert validate_backend_map(backend_map, [role]) == []
     (bf16_role,) = dedup_roles([{**record, "compute_dtype": "bf16"}])

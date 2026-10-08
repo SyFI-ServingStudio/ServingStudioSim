@@ -29,6 +29,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import time
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any
@@ -115,6 +116,19 @@ def args_hash(values: Mapping[str, Any], declared_types: Mapping[str, str]) -> b
     return hashlib.sha256(canonical_json(stored).encode()).digest()[:8]
 
 
+def now_epoch() -> int:
+    """Current time as epoch seconds, computed in Python.
+
+    Inserts supply ``created_at`` with this instead of leaning on SQLite's
+    ``unixepoch()``: that function arrived in SQLite 3.38 (2022), and some
+    runtimes we profile inside (the vLLM-ROCm container) ship an older SQLite,
+    where an insert whose ``created_at`` defaulted to ``unixepoch()`` died with
+    ``unknown function: unixepoch()``. The stored value is identical to what
+    ``unixepoch()`` would have produced: integer UTC epoch seconds.
+    """
+    return int(time.time())
+
+
 def epoch(timestamp: str) -> int:
     """Epoch seconds of a v2 timestamp (``RUN_AT_FORMAT`` or ``CREATED_AT_FORMAT``)."""
     parsed = datetime.fromisoformat(timestamp)
@@ -175,7 +189,9 @@ def kind_table_schema(name: str, arg_defs: list[str], metric_defs: list[str]) ->
             "is_outlier INTEGER NOT NULL DEFAULT 0",
             "retry_count INTEGER NOT NULL DEFAULT 0",
             "outlier_reason TEXT",
-            "created_at INTEGER NOT NULL DEFAULT (unixepoch())",
+            # created_at is supplied explicitly on every insert (storage.now_epoch);
+            # no SQL-side unixepoch() default, so inserts work on pre-3.38 SQLite.
+            "created_at INTEGER NOT NULL",
             "UNIQUE(gpu_name, backend, args_hash)",
         ]
     )

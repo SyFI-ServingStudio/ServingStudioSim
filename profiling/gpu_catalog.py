@@ -67,6 +67,11 @@ class GpuSpecResolution:
     interconnect_bandwidth_gbps: float | None = None
     # CUDA ``(major, minor)``; ``None`` for a non-NVIDIA part.
     compute_capability: tuple[int, int] | None = None
+    # Hardware vendor (e.g. ``"NVIDIA"``, ``"AMD"``) and micro-architecture
+    # (e.g. ``"CDNA3"``), verbatim from the catalog. The AMD device gate reads
+    # ``architecture`` the way the CUDA gate reads ``compute_capability``.
+    vendor: str | None = None
+    architecture: str | None = None
 
     @property
     def interconnect_one_way_gbps(self) -> float | None:
@@ -144,6 +149,8 @@ def resolve_gpu_spec(name: str, root: Path | None = None) -> GpuSpecResolution |
             interconnect=_string_or_none(gpu, "interconnect"),
             interconnect_bandwidth_gbps=_number(gpu, "interconnect_bandwidth_gbps"),
             compute_capability=_compute_capability(gpu),
+            vendor=_string_or_none(gpu, "vendor"),
+            architecture=_string_or_none(gpu, "architecture"),
         )
     return None
 
@@ -155,6 +162,28 @@ def gpu_compute_capability(name: str) -> tuple[int, int] | None:
     catalog or the part has no CUDA compute capability."""
     spec = resolve_gpu_spec(name)
     return spec.compute_capability if spec is not None else None
+
+
+@cache
+def gpu_vendor(name: str) -> str | None:
+    """Hardware vendor of a catalog GPU (e.g. ``"NVIDIA"``, ``"AMD"``). Falls
+    back to ``"NVIDIA"`` for a matched part that declares a CUDA compute
+    capability but no explicit ``vendor``. ``None`` when the name is not in the
+    catalog or its vendor cannot be determined."""
+    spec = resolve_gpu_spec(name)
+    if spec is None:
+        return None
+    if spec.vendor is not None:
+        return spec.vendor
+    return "NVIDIA" if spec.compute_capability is not None else None
+
+
+@cache
+def gpu_architecture(name: str) -> str | None:
+    """Micro-architecture of a catalog GPU (e.g. ``"CDNA3"``). ``None`` when the
+    name is not in the catalog or the entry declares no ``architecture``."""
+    spec = resolve_gpu_spec(name)
+    return spec.architecture if spec is not None else None
 
 
 def same_canonical_sku(left: str, right: str, root: Path | None = None) -> bool:

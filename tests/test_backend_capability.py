@@ -77,13 +77,16 @@ def test_comm_and_elementwise_are_dtype_agnostic():
 
 def test_supported_backends_filters_options_by_dtype():
     # The dry-run `options` column: filter registered backends to a dtype.
-    assert supported_backends("single_gemm", DType.FP8_E4M3) == ["deepgemm"]
+    # gpu=None skips the GPU axis, so the MI300X ROCm backends pass the dtype
+    # filter here alongside the NVIDIA rows.
+    assert supported_backends("single_gemm", DType.FP8_E4M3) == ["deepgemm", "rocm_scaled_mm"]
     assert supported_backends("single_gemm", DType.BF16) == [
         "torch",
         "torch_linear_vllm",
         "torch_linear",
         "sglang_bf16_auto",
         "sglang_fused_a_auto",
+        "torch_rocm",
     ]
     assert set(supported_backends("flashinfer_attn_prefill", DType.FP8_E4M3)) == {
         "fa3",

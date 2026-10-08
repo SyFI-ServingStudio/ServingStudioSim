@@ -59,6 +59,8 @@ def test_kind_table_backend_and_runner_ref_contract():
         "torch_mla_q_absorb_no_rope",
         "torch_mla_v_up_unpadded",
         _WO_A_BACKEND,
+        # MI300X (ROCm) bmm backend.
+        "torch_rocm",
     ]
     assert spec.kernel_kind == KIND
     assert spec.table_name == KIND

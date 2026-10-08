@@ -147,6 +147,7 @@ class Table:
             "profiler_run_at",
             "verified",
             *metric_columns,
+            "created_at",
         ]
         placeholders = ", ".join("?" for _ in columns)
         # Replacement policy: same (gpu_name, backend, args) overwrites the
@@ -457,6 +458,7 @@ class Table:
             storage.epoch(row.profiler_run_at or _utc_now()),
             int(row.verified),
             *(metric_values[column] for column in metric_columns),
+            storage.now_epoch(),
         ]
 
     def _metric_columns(self) -> list[str]:

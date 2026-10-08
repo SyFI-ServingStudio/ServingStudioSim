@@ -159,6 +159,14 @@ CUPTI_METHOD = (
 )
 
 
+#: How ``Timer.rocprof`` measures on ROCm (``profiling/profilers/timer.py``).
+ROCPROF_METHOD = (
+    "GPU kernel time from rocprofv3 kernel-dispatch durations (end - start per "
+    "dispatch, from the rocpd database), summed per logical launch and averaged "
+    "over a fixed launch count. The ROCm counterpart of the CUPTI method."
+)
+
+
 @dataclass(frozen=True)
 class ViewField:
     """One Rust config field a :class:`ConfigView` is drawn by.

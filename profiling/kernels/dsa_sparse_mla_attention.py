@@ -141,6 +141,36 @@ register(
 register(
     KernelProfilerSpec(
         kernel_kind=KIND,
+        backend="rocm_triton_mla_sparse",
+        supports=BackendSupport(
+            compute=frozenset({DType.BF16}),
+            kv=frozenset({DType.BF16}),
+            arch_targets=frozenset({"CDNA3"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.attention.dsa_sparse_mla_attention_rocm_triton",
+            function_name="profile_dsa_sparse_mla_attention_rocm_triton",
+        ),
+        table_name=KIND,
+        args_schema=DsaSparseMlaAttentionArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="vllm_rocm_env",
+        doc=BackendDoc(
+            summary=(
+                "vLLM's rope-free Triton ragged sparse-MLA kernel "
+                "(rocm_sparse_attn_prefill, head_dim=512 nope=512 rope=0) on a BF16 "
+                "latent, the GLM-5.3-Flash DSA decode path on MI300X."
+            ),
+            url="https://github.com/vllm-project/vllm/blob/main/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py",
+        ),
+    )
+)
+
+
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
         backend="vllm_flashmla_bf16",
         # FlashMLA's Arch::is_sm90a() / is_sm100f(): exactly SM90, or any SM10x.
         supports=BackendSupport(

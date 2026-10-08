@@ -33,7 +33,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from profiling.db.args import KernelArgs
-from profiling.db.doc import CUPTI_METHOD, BackendDoc, KernelDoc, arg
+from profiling.db.doc import CUPTI_METHOD, ROCPROF_METHOD, BackendDoc, KernelDoc, arg
 from profiling.db.outlier import BatchOutlierPolicy
 from profiling.db.registry import (
     BackendSupport,
@@ -124,3 +124,35 @@ for _backend, _runner_module in (
             ),
         )
     )
+
+
+# Eager-PyTorch byte mover on a ROCm/HIP device, timed kernel-only via
+# rocprofv3. The measured MI300X anchor for the `elementwise` byte-placeholder
+# floor: the GLM-5.3-Flash arch's glue slots already priced as `elementwise`
+# (embedding gather, mHC stream expand/contract, MoE input/combine copies) need
+# a backend with MI300X rows, and the campaign floors un-measured composed kinds
+# onto this curve. Same `torch`-realization byte contract as the CUDA `torch`
+# backend, MI300X-gated (gfx942) so it never competes with the NVIDIA rows.
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="torch_rocm",
+        # Byte-keyed / uint8 — dtype-agnostic.
+        supports=BackendSupport(compute=None, arch_targets=frozenset({"CDNA3"})),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.elementwise.torch_rocm",
+            function_name="profile_elementwise_torch_rocm",
+        ),
+        table_name=KIND,
+        args_schema=ElementwiseArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="vllm_rocm_env",
+        doc=BackendDoc(
+            summary=(
+                "Eager PyTorch byte mover (bitwise_not / amax / zero_) on ROCm/MI300X, "
+                f"timed with rocprofv3. {ROCPROF_METHOD}"
+            ),
+        ),
+    )
+)

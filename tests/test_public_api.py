@@ -76,8 +76,8 @@ def db(tmp_path: Path) -> Path:
         metrics, (git_hash, run_at, *versions) = rest[4:8], rest[8:]
         conn.execute(
             "insert into single_gemm (gpu_name, backend, m, n, k, dtype, args_hash, run_key, "
-            "profiler_run_at, time_ms, tflops, memory_bandwidth_gbps, energy_j) "
-            f"values ({', '.join('?' * 13)})",
+            "profiler_run_at, time_ms, tflops, memory_bandwidth_gbps, energy_j, created_at) "
+            f"values ({', '.join('?' * 14)})",
             (
                 gpu,
                 backend,
@@ -86,6 +86,7 @@ def db(tmp_path: Path) -> Path:
                 storage.run_key(conn, (git_hash, *versions)),
                 storage.epoch(run_at),
                 *metrics,
+                storage.now_epoch(),
             ),
         )
     conn.commit()
@@ -231,12 +232,23 @@ def test_a_backends_gpus_follow_its_compute_capability() -> None:
     assert "L40S" in fp8["gpus"] and not any(gpu.startswith("A100") for gpu in fp8["gpus"])
 
 
-# The FP8 block-scale backend of this kind takes FP8 weights in 128-wide blocks.
+# The FP8 block-scale backends of this kind take FP8 weights in 128-wide blocks:
+# the B200 FlashInfer path and the MI300X AITER path. Both share the FP8 row
+# shape (format, 128-wide group, deepseek_v3 routing); each gates on its own GPU.
 _FP8_BLOCK_BACKEND = "flashinfer_trtllm_fp8_block_sm100"
+_ROCM_FP8_BLOCK_BACKEND = "rocm_aiter_fp8_block"
 _MXFP4_BACKEND = "flashinfer_trtllm_sm100_mxfp4"
-_WEIGHT_FORMAT = {_FP8_BLOCK_BACKEND: DType.FP8_E4M3, _MXFP4_BACKEND: DType.MXFP4_E2M1}
-_GROUP_SIZE = {_FP8_BLOCK_BACKEND: 128, _MXFP4_BACKEND: 32}
-_ROUTING = {_FP8_BLOCK_BACKEND: "deepseek_v3", _MXFP4_BACKEND: "precomputed_dsv4"}
+_WEIGHT_FORMAT = {
+    _FP8_BLOCK_BACKEND: DType.FP8_E4M3,
+    _ROCM_FP8_BLOCK_BACKEND: DType.FP8_E4M3,
+    _MXFP4_BACKEND: DType.MXFP4_E2M1,
+}
+_GROUP_SIZE = {_FP8_BLOCK_BACKEND: 128, _ROCM_FP8_BLOCK_BACKEND: 128, _MXFP4_BACKEND: 32}
+_ROUTING = {
+    _FP8_BLOCK_BACKEND: "deepseek_v3",
+    _ROCM_FP8_BLOCK_BACKEND: "deepseek_v3",
+    _MXFP4_BACKEND: "precomputed_dsv4",
+}
 
 
 def _nvfp4_row(backend: str) -> ProfileRow:

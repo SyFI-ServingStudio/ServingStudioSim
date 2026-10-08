@@ -32,7 +32,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from profiling.db.args import DType, KernelArgs
-from profiling.db.doc import CUPTI_METHOD, BackendDoc, KernelDoc, arg
+from profiling.db.doc import CUPTI_METHOD, ROCPROF_METHOD, BackendDoc, KernelDoc, arg
 from profiling.db.outlier import BatchOutlierPolicy
 from profiling.db.registry import (
     BackendSupport,
@@ -310,6 +310,73 @@ register(
                 "the CuTe-DSL block-scaled GEMM mm_mxfp8, bf16 output."
             ),
             url="https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/kernels/linear/mxfp8/flashinfer.py",
+        ),
+    )
+)
+
+# ---- MI300X (ROCm) backends ------------------------------------------------
+# The AMD counterparts of the dense single-GEMM backends above. MI300X-gated so
+# they never compete with the NVIDIA rows; B200 stays byte-identical.
+#
+# rocm_scaled_mm — the FP8 replacement for `deepgemm` (Blackwell SM100, no CDNA3
+# path). torch._scaled_mm dispatches hipBLASLt's scaled FP8 GEMM, fp8 in / bf16
+# out, with device tensors in float8_e4m3fnuz (the gfx942 FP8 E4M3 variant; the
+# OCP float8_e4m3fn is rejected there). Default env — torch-on-ROCm, no extra
+# container, like the other torch_rocm reference backends.
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="rocm_scaled_mm",
+        supports=BackendSupport(
+            compute=frozenset({DType.FP8_E4M3}),
+            arch_targets=frozenset({"CDNA3"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.gemm.rocm_scaled_mm",
+            function_name="profile_single_gemm_scaled_mm",
+        ),
+        table_name=KIND,
+        args_schema=SingleGemmArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="vllm_rocm_env",
+        doc=BackendDoc(
+            summary=(
+                "torch._scaled_mm (hipBLASLt scaled FP8 GEMM) on ROCm/MI300X, "
+                "float8_e4m3fnuz in / bf16 out, timed with rocprofv3. "
+                f"{ROCPROF_METHOD}"
+            ),
+            url="https://docs.pytorch.org/docs/stable/generated/torch._scaled_mm.html",
+        ),
+    )
+)
+
+# torch_rocm — the BF16 dense GEMM on ROCm (F.linear, vLLM/Transformers (n, k)
+# weight layout), the MI300X counterpart of the B200-gated torch_linear_vllm:
+# the attention projections and LM head that stay 16-bit.
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="torch_rocm",
+        supports=BackendSupport(
+            compute=frozenset({DType.BF16, DType.FP16}),
+            arch_targets=frozenset({"CDNA3"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.gemm.torch_rocm",
+            function_name="profile_single_gemm_torch_rocm",
+        ),
+        table_name=KIND,
+        args_schema=SingleGemmArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="vllm_rocm_env",
+        doc=BackendDoc(
+            summary=(
+                "torch.nn.functional.linear (bf16) on ROCm/MI300X, timed with "
+                f"rocprofv3. {ROCPROF_METHOD}"
+            ),
+            url="https://pytorch.org/docs/stable/generated/torch.nn.functional.linear.html",
         ),
     )
 )

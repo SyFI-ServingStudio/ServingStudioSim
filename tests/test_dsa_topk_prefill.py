@@ -24,6 +24,8 @@ from profiling.runners.exceptions import KernelLaunchFailed, ProfilerNotImplemen
 _BACKEND = "torch"
 _VLLM_BACKEND = "vllm_cuda"
 _SGLANG_BACKEND = "sglang_cuda"
+# MI300X elementwise byte-placeholder floor (GLM-5.3-Flash port, decision #37).
+_FLOOR_BACKEND = "elementwise_floor"
 _BASE_SPEC = {
     "num_queries": 128,
     "num_keys": 8192,
@@ -91,7 +93,7 @@ def test_registration_support_and_facades() -> None:
     spec = find_kernel_profiler_spec(KIND, _BACKEND)
 
     assert KIND == "dsa_topk_prefill"
-    assert known_backends(KIND) == [_BACKEND, _VLLM_BACKEND, _SGLANG_BACKEND]
+    assert known_backends(KIND) == [_BACKEND, _VLLM_BACKEND, _SGLANG_BACKEND, _FLOOR_BACKEND]
     assert spec.kernel_kind == spec.table_name == KIND
     assert spec.args_schema is DsaTopkPrefillArgs
     assert spec.metric_family is MetricFamily.COMPUTE

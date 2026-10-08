@@ -113,6 +113,67 @@ pub(crate) const SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: u32 = 256;
 /// bs 1-24, graph-padded) -> 1/0.9.
 pub(crate) const SHARED_EXPERTS_STREAM_OVERLAP: f32 = 0.9;
 
+/// The canonical `gpu/spec.json` name of the AMD MI300X target and its spec
+/// aliases. A `gpu_name` in this set drives the AMD fabric below; everything
+/// else keeps the NVIDIA defaults, so B200 stays byte-identical.
+const MI300X_GPU_NAMES: &[&str] = &["MI300X", "AMD MI300X", "MI300"];
+
+/// True when this arch is targeting an AMD MI300X (8x MI300X / `mi3008x`).
+fn is_mi300x(gpu_name: &str) -> bool {
+    MI300X_GPU_NAMES.contains(&gpu_name)
+}
+
+/// The intra-node all-reduce fabric for the target GPU. NVIDIA parts ride
+/// NVLink; MI300X rides AMD Infinity Fabric (xGMI), 896 GB/s bidirectional per
+/// `gpu/spec.json`'s MI300X `interconnect_bandwidth_gbps`. Defaulting to NVLink
+/// keeps every existing NVIDIA target byte-identical (additive).
+fn intra_node_fabric(gpu_name: &str) -> Fabric {
+    if is_mi300x(gpu_name) {
+        Fabric::InfinityFabric
+    } else {
+        Fabric::Nvlink
+    }
+}
+
+// ============================ L1 kernel-backend pins ========================
+//
+// Each `*_BACKENDS` constant names the profile.db backend key for one kernel
+// kind. These names are the NVIDIA/vLLM-fork backends measured on B200 and are
+// the default for every non-MI300X target.
+//
+// MI300X diverges because vLLM-ROCm dispatches the model through separate aiter
+// / ROCm-Triton launches, not the FlashInfer/TRT-LLM fusion (Phase 0). Where
+// the MI300X profiling campaign has MEASURED a ROCm backend (rows registered in
+// `profiling/kernels/`), a `*_BACKENDS_MI300X` constant pins it and
+// `pin_mi300x` selects it when `gpu_name` is MI300X; B200 keeps the NVIDIA
+// name, so it stays byte-identical. Pinned so far, by iteration-time share:
+//   * FUSED_MOE_BACKENDS   (nvfp4_fused_moe)                 -> rocm_aiter_fp8_block
+//   * SPARSE_ATTN_BACKENDS (dsa_sparse_mla)                  -> rocm_triton_mla_sparse
+//   * KDA_BACKENDS         (kda_recurrent_decode/chunk_prefill) -> torch_rocm
+//   * CONV_BACKENDS        (gdn_causal_conv decode+prefill)  -> torch_rocm
+//   * QKV_NORM_BACKENDS    (q_kv_rms_norm)                   -> torch_rocm
+//   * RMS_NORM_BACKENDS    (rms_norm)                        -> torch_rocm
+//
+// The negligible-share tail (Phase-4 ranking, decision #38) now resolves on
+// MI300X through the `elementwise` byte-placeholder floor instead of an
+// NVIDIA-only backend: `fp8_per_token_group_quant`, `gemm_fp32_output` (the DSA
+// index-head weights AND the MoE router GEMM), the DSA indexer logits + top-k
+// pairs (`dsa_{paged_mqa_logits,persistent_topk}_decode`,
+// `dsa_{mqa_logits,topk}_prefill`), `mla_cache_append`, `dsa_sparse_index_remap`,
+// and the mHC norms (`mhc_pre_rms_norm`, `mhc_fused_post_pre_rms_norm`). Each is
+// pinned to its `elementwise_floor` backend via a `*_BACKENDS_MI300X` constant
+// below; see those constants and `profiling/runners/elementwise/floor.py`.
+//
+// The TP all-reduce (ALL_REDUCE_BACKENDS, the `all_reduce_fusion` kind) is a
+// multi-GPU COMM collective, so it is NOT floorable onto the single-GPU
+// `elementwise` byte-mover (metric-family mismatch). vLLM-ROCm runs an RCCL /
+// aiter custom all-reduce over Infinity Fabric, not FlashInfer MNNVL (NVLink
+// multicast only), and a MEASURED RCCL all-reduce needs a 4+ GPU Infinity-Fabric
+// group. So on MI300X this kind resolves to `rocm_fabric_roofline`: an analytic
+// ring all-reduce roofline derived from the Infinity-Fabric bandwidth
+// (`profiling/runners/comm/fabric_roofline.py`, decision #42), a COMM-family
+// backend (not a compute floor). The fabric pin below already selects Infinity
+// Fabric; the backend pin selects the roofline. B200 keeps flashinfer_mnnvl.
 const BF16_GEMM_BACKENDS: &[&str] = &["torch_linear_vllm"];
 const FP8_GEMM_BACKENDS: &[&str] = &["deepgemm"];
 const FP8_QUANT_BACKENDS: &[&str] = &["vllm_cuda"];
@@ -153,6 +214,127 @@ const ALL_REDUCE_BACKENDS: &[&str] = &["flashinfer_mnnvl"];
 /// on a single node when that workspace fails (`flashinfer_all_reduce.py:137-160`).
 const TP8_ALL_REDUCE_BACKENDS: &[&str] = &["flashinfer_trtllm"];
 const LARGE_ALL_REDUCE_BACKENDS: &[&str] = &["nccl"];
+
+// Measured MI300X (ROCm) backend pins. `pin_mi300x` selects one of these when
+// `gpu_name` is MI300X; every other GPU keeps the NVIDIA constant above, so
+// B200 is byte-identical. All names are registered in `profiling/kernels/`.
+const RMS_NORM_BACKENDS_MI300X: &[&str] = &["torch_rocm"];
+const KDA_BACKENDS_MI300X: &[&str] = &["torch_rocm"];
+const CONV_BACKENDS_MI300X: &[&str] = &["torch_rocm"];
+const QKV_NORM_BACKENDS_MI300X: &[&str] = &["torch_rocm"];
+const SPARSE_ATTN_BACKENDS_MI300X: &[&str] = &["rocm_triton_mla_sparse"];
+const FUSED_MOE_BACKENDS_MI300X: &[&str] = &["rocm_aiter_fp8_block"];
+// Dense/shared FP8 single-GEMM on MI300X: the ROCm `torch._scaled_mm` path
+// (`profiling/kernels/single_gemm.py` `rocm_scaled_mm`), the CDNA3 replacement
+// for the B200 `deepgemm` fp8 GEMM.
+const FP8_GEMM_BACKENDS_MI300X: &[&str] = &["rocm_scaled_mm"];
+// Dense BF16 single-GEMM on MI300X: the ROCm eager F.linear path
+// (`profiling/kernels/single_gemm.py` `torch_rocm`).
+const BF16_GEMM_BACKENDS_MI300X: &[&str] = &["torch_rocm"];
+// Batched BF16 GEMM (MLA q-absorb / v-up) on MI300X: the ROCm batched path
+// (`profiling/kernels/batched_gemm.py` `torch_rocm`).
+const BATCHED_GEMM_BACKENDS_MI300X: &[&str] = &["torch_rocm"];
+// Elementwise byte-mover floor on MI300X: the eager-PyTorch ROCm backend
+// (`profiling/kernels/elementwise.py` `torch_rocm`, timed with rocprofv3). The
+// NVIDIA `triton`/`torch` elementwise rows are CUPTI-measured and carry no
+// MI300X data, so the arch's byte-sized glue slots (embedding gather, mHC stream
+// expand/contract, MoE input/combine copies) read this measured MI300X curve
+// instead. This is also the designed floor the mHC/GEMM/quant/indexer composed
+// kinds route onto as the MI300X campaign proceeds. B200 keeps `triton`.
+const ELEMENTWISE_BACKENDS_MI300X: &[&str] = &["torch_rocm"];
+
+// Analytic memory-roofline floor pins (GLM-5.3-Flash MI300X port, decision #37
+// "mechanism B", converted to closed-form by decision #49). Each of these kinds
+// carries a negligible predicted share of iteration time (Phase-4 ranking,
+// decision #38) and has no MI300X-native backend yet, so on MI300X its cost is a
+// closed-form memory roofline over the kind's HBM byte footprint
+// (t = launch_latency + (read+write bytes) / effective MI300X HBM bandwidth),
+// via a per-kind `elementwise_floor` backend registered in
+// `profiling/kernels/<kind>.py` (`gpus={MI300X}`, compute-agnostic). It is
+// DERIVED, not timed: no per-cell allocation and no rocprofv3, so a cell whose
+// footprint exceeds 192 GB HBM (e.g. the DSA prefill indexer logits) yields a
+// finite time instead of OOM-ing, like the `rocm_fabric_roofline` all-reduce. The
+// pin is what makes the arch SELECT that backend on MI300X so a real
+// `timing-predict` resolves the kind instead of rejecting its NVIDIA-only
+// default. B200 and every other NVIDIA target keep the constant above, so they
+// stay byte-identical. When the campaign measures a real ROCm backend for one of
+// these, swap its pin here.
+const FP8_QUANT_BACKENDS_MI300X: &[&str] = &["elementwise_floor"];
+const FP32_GEMM_BACKENDS_MI300X: &[&str] = &["elementwise_floor"];
+const ROUTER_GEMM_BACKENDS_MI300X: &[&str] = &["elementwise_floor"];
+const MQA_LOGITS_BACKENDS_MI300X: &[&str] = &["elementwise_floor"];
+const TOPK_BACKENDS_MI300X: &[&str] = &["elementwise_floor"];
+const MQA_LOGITS_PREFILL_BACKENDS_MI300X: &[&str] = &["elementwise_floor"];
+const TOPK_PREFILL_BACKENDS_MI300X: &[&str] = &["elementwise_floor"];
+const MLA_APPEND_BACKENDS_MI300X: &[&str] = &["elementwise_floor"];
+const INDEX_REMAP_BACKENDS_MI300X: &[&str] = &["elementwise_floor"];
+const MHC_BACKENDS_MI300X: &[&str] = &["elementwise_floor"];
+// TP all-reduce on MI300X: the analytic Infinity-Fabric ring roofline, a
+// COMM-family backend derived from the fabric bandwidth (decision #42,
+// `profiling/runners/comm/fabric_roofline.py`). Not a measured multi-GPU row and
+// not a compute floor; B200 keeps the NVIDIA `flashinfer_mnnvl` above.
+const ALL_REDUCE_BACKENDS_MI300X: &[&str] = &["rocm_fabric_roofline"];
+// The large (non-fused) all-reduce on MI300X: RCCL over Infinity Fabric, a
+// MEASURED multi-GPU COMM row (unlike the fused roofline above). vLLM-ROCm's
+// large all-reduce rides the pynccl path, which on a ROCm Torch build dispatches
+// RCCL (`profiling/runners/comm/rccl.py`). B200 keeps NVIDIA `nccl`.
+const LARGE_ALL_REDUCE_BACKENDS_MI300X: &[&str] = &["rccl"];
+
+// Sparse-MLA attention (`dsa_sparse_mla_attention`) latent coordinate. The
+// backend pin above (SPARSE_ATTN_BACKENDS*) chooses the kernel; this coordinate
+// must match what that backend's `_validate` accepts, for BOTH the prefill and
+// decode leaves of the `glm53_kpool_sparse_mla` op.
+//
+// B200's `flashinfer_trtllm_fp8` is fp8 by construction: an fp8 query against an
+// fp8 paged latent (`hnd_paged_mqa_fp8_latent`, 512 B/token). MI300X's
+// `rocm_triton_mla_sparse` is BF16 by construction: its `_validate` (via
+// `_rocm_triton_mla_sparse_common`) pins q, cache and output to BF16 and the
+// layout to `token_major_mqa_bf16_latent`, a rope-free 512-wide BF16 latent
+// (1024 B/token). The cache dtype also sizes the MLA cache-append byte floor, so
+// pinning it to BF16 keeps the whole MI300X sparse-MLA path internally
+// consistent at the bf16 latent size. output_dtype is BF16 on both and is not
+// gated. B200 keeps the fp8 coordinate below, so it stays byte-identical.
+const SPARSE_MLA_Q_DTYPE: DType = DType::Fp8E4m3;
+const SPARSE_MLA_Q_DTYPE_MI300X: DType = DType::Bf16;
+const SPARSE_MLA_CACHE_DTYPE: DType = DType::Fp8E4m3;
+const SPARSE_MLA_CACHE_DTYPE_MI300X: DType = DType::Bf16;
+const SPARSE_MLA_CACHE_LAYOUT: &str = "hnd_paged_mqa_fp8_latent";
+const SPARSE_MLA_CACHE_LAYOUT_MI300X: &str = "token_major_mqa_bf16_latent";
+
+/// Pick the MI300X backend list for an MI300X target, else the default
+/// (NVIDIA) list. Additive and gpu-gated — the same shape as
+/// `intra_node_fabric`, so no NVIDIA path changes.
+fn pin_mi300x(
+    gpu_name: &str,
+    mi300x: &[&'static str],
+    default: &[&'static str],
+) -> Vec<&'static str> {
+    if is_mi300x(gpu_name) {
+        mi300x.to_vec()
+    } else {
+        default.to_vec()
+    }
+}
+
+/// `pin_mi300x` for a scalar `DType` coordinate field (e.g. the sparse-MLA
+/// query/cache dtype). Gpu-gated and additive; B200 keeps `default`.
+fn pin_mi300x_dtype(gpu_name: &str, mi300x: DType, default: DType) -> DType {
+    if is_mi300x(gpu_name) {
+        mi300x
+    } else {
+        default
+    }
+}
+
+/// `pin_mi300x` for a static-string coordinate field (e.g. the sparse-MLA cache
+/// layout). Gpu-gated and additive; B200 keeps `default`.
+fn pin_mi300x_str(gpu_name: &str, mi300x: &'static str, default: &'static str) -> &'static str {
+    if is_mi300x(gpu_name) {
+        mi300x
+    } else {
+        default
+    }
+}
 
 /// The checkpoint's dimensions, read strictly from its `config.json`.
 #[derive(Clone, Debug, PartialEq)]
@@ -592,16 +774,32 @@ pub fn build_configs(
     let hidden_bytes = model.hidden * ACTIVATION_DTYPE.size_bytes();
     let stream_bytes = model.hc_mult * hidden_bytes;
     let ew = |input: u32, output: u32| ElementwiseKernelConfig {
-        backends: ELEMENTWISE_BACKENDS.to_vec(),
+        backends: pin_mi300x(&gpu, ELEMENTWISE_BACKENDS_MI300X, ELEMENTWISE_BACKENDS),
         gpu_name: gpu.clone(),
         input_bytes_per_token: input.into(),
         output_bytes_per_token: output.into(),
     };
     let mlp = |intermediate: u32, precision: Glm53WeightPrecision| {
-        let (quant_backends, gemm_backends) = match precision {
-            Glm53WeightPrecision::Bf16 => (Vec::new(), BF16_GEMM_BACKENDS),
-            Glm53WeightPrecision::Fp8Block => (FP8_QUANT_BACKENDS.to_vec(), FP8_GEMM_BACKENDS),
-            Glm53WeightPrecision::Nvfp4 => (NVFP4_QUANT_BACKENDS.to_vec(), NVFP4_GEMM_BACKENDS),
+        // Two orthogonal axes pick the MLP backends: the weight precision
+        // (BF16 / FP8-block / NVFP4) chooses the backend family, and
+        // `pin_mi300x` then swaps in the measured ROCm backend on an MI300X
+        // target. Off MI300X `pin_mi300x` returns the NVIDIA `default` on every
+        // arm, so the B200 path stays byte-identical. MI300X checkpoints are
+        // always FP8-block, so only the Fp8Block arm's MI300X pins are exercised
+        // there; the BF16 arm's pin covers the NVFP4-mode shared expert should a
+        // ROCm NVFP4 campaign ever add one.
+        let (quant_backends, gemm_backends): (Vec<&'static str>, Vec<&'static str>) = match precision
+        {
+            Glm53WeightPrecision::Bf16 => {
+                (Vec::new(), pin_mi300x(&gpu, BF16_GEMM_BACKENDS_MI300X, BF16_GEMM_BACKENDS))
+            }
+            Glm53WeightPrecision::Fp8Block => (
+                pin_mi300x(&gpu, FP8_QUANT_BACKENDS_MI300X, FP8_QUANT_BACKENDS),
+                pin_mi300x(&gpu, FP8_GEMM_BACKENDS_MI300X, FP8_GEMM_BACKENDS),
+            ),
+            Glm53WeightPrecision::Nvfp4 => {
+                (NVFP4_QUANT_BACKENDS.to_vec(), NVFP4_GEMM_BACKENDS.to_vec())
+            }
         };
         Glm53MlpLocalWorkletConfig {
             hidden: model.hidden.into(),
@@ -610,8 +808,8 @@ pub fn build_configs(
             activation_dtype: ACTIVATION_DTYPE,
             gpu_name: gpu.clone(),
             quant_backends,
-            gemm_backends: gemm_backends.to_vec(),
-            elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
+            gemm_backends,
+            elementwise_backends: pin_mi300x(&gpu, ELEMENTWISE_BACKENDS_MI300X, ELEMENTWISE_BACKENDS),
         }
     };
     // (dense FFN, shared expert, routed experts) as the checkpoint stores them.
@@ -659,8 +857,11 @@ pub fn build_configs(
         routing_method: ROUTING_METHOD.to_string(),
         activation_dtype: ACTIVATION_DTYPE,
         gpu_name: gpu.clone(),
-        quant_backends: routed_quant_backends.to_vec(),
-        fused_moe_backends: routed_moe_backends.to_vec(),
+        // Precision-selected backends (routed_*_backends, FP8-block or NVFP4)
+        // pinned to the measured ROCm backend on MI300X. B200 keeps the
+        // precision-selected default; MI300X is always FP8-block.
+        quant_backends: pin_mi300x(&gpu, FP8_QUANT_BACKENDS_MI300X, routed_quant_backends),
+        fused_moe_backends: pin_mi300x(&gpu, FUSED_MOE_BACKENDS_MI300X, routed_moe_backends),
         expert_demand: demand.clone(),
         folded_rank_position: 0,
     };
@@ -674,10 +875,10 @@ pub fn build_configs(
             conv_kernel_size: model.short_conv_kernel_size.into(),
             activation_dtype: ACTIVATION_DTYPE,
             gpu_name: gpu.clone(),
-            bf16_gemm_backends: BF16_GEMM_BACKENDS.to_vec(),
-            conv_backends: CONV_BACKENDS.to_vec(),
-            core_backends: KDA_BACKENDS.to_vec(),
-            elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
+            bf16_gemm_backends: pin_mi300x(&gpu, BF16_GEMM_BACKENDS_MI300X, BF16_GEMM_BACKENDS),
+            conv_backends: pin_mi300x(&gpu, CONV_BACKENDS_MI300X, CONV_BACKENDS),
+            core_backends: pin_mi300x(&gpu, KDA_BACKENDS_MI300X, KDA_BACKENDS),
+            elementwise_backends: pin_mi300x(&gpu, ELEMENTWISE_BACKENDS_MI300X, ELEMENTWISE_BACKENDS),
         },
         dsa: Glm53DsaAttnLocalWorkletConfig {
             hidden: model.hidden.into(),
@@ -694,20 +895,43 @@ pub fn build_configs(
             max_model_len: parallel.max_model_len,
             cache_block_size: CACHE_BLOCK_SIZE,
             rms_eps: model.rms_norm_eps,
+            sparse_mla_q_dtype: pin_mi300x_dtype(&gpu, SPARSE_MLA_Q_DTYPE_MI300X, SPARSE_MLA_Q_DTYPE),
+            sparse_mla_cache_dtype: pin_mi300x_dtype(
+                &gpu,
+                SPARSE_MLA_CACHE_DTYPE_MI300X,
+                SPARSE_MLA_CACHE_DTYPE,
+            ),
+            sparse_mla_cache_layout: pin_mi300x_str(
+                &gpu,
+                SPARSE_MLA_CACHE_LAYOUT_MI300X,
+                SPARSE_MLA_CACHE_LAYOUT,
+            ),
             gpu_name: gpu.clone(),
-            bf16_gemm_backends: BF16_GEMM_BACKENDS.to_vec(),
-            fp32_gemm_backends: FP32_GEMM_BACKENDS.to_vec(),
-            qkv_norm_backends: QKV_NORM_BACKENDS.to_vec(),
-            mla_bmm_q_absorb_backends: Q_ABSORB_BACKENDS.to_vec(),
-            mla_bmm_v_up_backends: V_UP_BACKENDS.to_vec(),
-            mqa_logits_backends: MQA_LOGITS_BACKENDS.to_vec(),
-            topk_backends: TOPK_BACKENDS.to_vec(),
-            mqa_logits_prefill_backends: MQA_LOGITS_PREFILL_BACKENDS.to_vec(),
-            topk_prefill_backends: TOPK_PREFILL_BACKENDS.to_vec(),
-            sparse_attention_backends: SPARSE_ATTN_BACKENDS.to_vec(),
-            mla_cache_append_backends: MLA_APPEND_BACKENDS.to_vec(),
-            index_remap_backends: INDEX_REMAP_BACKENDS.to_vec(),
-            elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
+            bf16_gemm_backends: pin_mi300x(&gpu, BF16_GEMM_BACKENDS_MI300X, BF16_GEMM_BACKENDS),
+            fp32_gemm_backends: pin_mi300x(&gpu, FP32_GEMM_BACKENDS_MI300X, FP32_GEMM_BACKENDS),
+            qkv_norm_backends: pin_mi300x(&gpu, QKV_NORM_BACKENDS_MI300X, QKV_NORM_BACKENDS),
+            mla_bmm_q_absorb_backends: pin_mi300x(
+                &gpu,
+                BATCHED_GEMM_BACKENDS_MI300X,
+                Q_ABSORB_BACKENDS,
+            ),
+            mla_bmm_v_up_backends: pin_mi300x(&gpu, BATCHED_GEMM_BACKENDS_MI300X, V_UP_BACKENDS),
+            mqa_logits_backends: pin_mi300x(&gpu, MQA_LOGITS_BACKENDS_MI300X, MQA_LOGITS_BACKENDS),
+            topk_backends: pin_mi300x(&gpu, TOPK_BACKENDS_MI300X, TOPK_BACKENDS),
+            mqa_logits_prefill_backends: pin_mi300x(
+                &gpu,
+                MQA_LOGITS_PREFILL_BACKENDS_MI300X,
+                MQA_LOGITS_PREFILL_BACKENDS,
+            ),
+            topk_prefill_backends: pin_mi300x(&gpu, TOPK_PREFILL_BACKENDS_MI300X, TOPK_PREFILL_BACKENDS),
+            sparse_attention_backends: pin_mi300x(
+                &gpu,
+                SPARSE_ATTN_BACKENDS_MI300X,
+                SPARSE_ATTN_BACKENDS,
+            ),
+            mla_cache_append_backends: pin_mi300x(&gpu, MLA_APPEND_BACKENDS_MI300X, MLA_APPEND_BACKENDS),
+            index_remap_backends: pin_mi300x(&gpu, INDEX_REMAP_BACKENDS_MI300X, INDEX_REMAP_BACKENDS),
+            elementwise_backends: pin_mi300x(&gpu, ELEMENTWISE_BACKENDS_MI300X, ELEMENTWISE_BACKENDS),
         },
         dense_ffn: mlp(
             divide("intermediate_size", model.intermediate_size)?,
@@ -725,45 +949,56 @@ pub fn build_configs(
             num_experts: model.n_routed_experts.into(),
             activation_dtype: ACTIVATION_DTYPE,
             gpu_name: gpu.clone(),
-            gemm_backends: ROUTER_GEMM_BACKENDS.to_vec(),
+            gemm_backends: pin_mi300x(&gpu, ROUTER_GEMM_BACKENDS_MI300X, ROUTER_GEMM_BACKENDS),
         },
         routed: Glm53RoutedMoeLocalWorkletConfig::split_for_ep(routed_template, demand.clone()),
         // Row gather: reads and writes one hidden row per token.
         embedding: ew(hidden_bytes, hidden_bytes),
         hc_expand: ew(hidden_bytes, stream_bytes),
         mhc: MhcRmsNormKernelConfig {
-            backends: MHC_BACKENDS.to_vec(),
+            backends: pin_mi300x(&gpu, MHC_BACKENDS_MI300X, MHC_BACKENDS),
             gpu_name: gpu.clone(),
             hidden_size: model.hidden.into(),
             hc_mult: model.hc_mult,
             hidden_dtype: ACTIVATION_DTYPE,
         },
         all_reduce: AllReduceFusionKernelConfig {
-            backends: all_reduce_backends.to_vec(),
+            // Precision/TP-selected default (all_reduce_backends) pinned to the
+            // analytic Infinity-Fabric roofline on MI300X; B200 keeps the default.
+            backends: pin_mi300x(&gpu, ALL_REDUCE_BACKENDS_MI300X, all_reduce_backends),
             gpu_name: gpu.clone(),
             num_gpus: tp,
             hidden_dim: model.hidden,
             dtype: ACTIVATION_DTYPE,
-            fabric: Fabric::Nvlink,
+            // Name-independent hardware pin: NVLink for NVIDIA, Infinity Fabric
+            // for MI300X. B200 keeps `Fabric::Nvlink` unchanged.
+            fabric: intra_node_fabric(&gpu),
             fused_token_limit: None,
         },
         large_all_reduce: AllReduceKernelConfig {
-            backends: LARGE_ALL_REDUCE_BACKENDS.to_vec(),
+            // The large (non-fused) all-reduce: NVIDIA runs NCCL, MI300X runs RCCL
+            // over Infinity Fabric. vLLM-ROCm reaches this collective through the
+            // same pynccl path as NVIDIA, which on a ROCm Torch build dispatches
+            // RCCL (Torch's "nccl" process-group backend aliases to librccl on
+            // ROCm). A MEASURED multi-GPU row, not a roofline (decision: measure
+            // the EP/comm collectives on MI300X). The fabric pin selects the real
+            // hardware; B200 is byte-identical (NCCL + NVLink).
+            backends: pin_mi300x(&gpu, LARGE_ALL_REDUCE_BACKENDS_MI300X, LARGE_ALL_REDUCE_BACKENDS),
             gpu_name: gpu.clone(),
             num_gpus: tp,
-            fabric: Fabric::Nvlink,
+            fabric: intra_node_fabric(&gpu),
         },
         moe_input_glue: ew(hidden_bytes, hidden_bytes),
         moe_combine_glue: ew(2 * hidden_bytes, hidden_bytes),
         hc_contract_mean: ew(stream_bytes, hidden_bytes),
         final_norm: RmsNormKernelConfig {
-            backends: RMS_NORM_BACKENDS.to_vec(),
+            backends: pin_mi300x(&gpu, RMS_NORM_BACKENDS_MI300X, RMS_NORM_BACKENDS),
             gpu_name: gpu.clone(),
             hidden: model.hidden.into(),
             dtype: ACTIVATION_DTYPE,
         },
         lm_head: SingleGemmKernelConfig {
-            backends: BF16_GEMM_BACKENDS.to_vec(),
+            backends: pin_mi300x(&gpu, BF16_GEMM_BACKENDS_MI300X, BF16_GEMM_BACKENDS),
             gpu_name: gpu,
             n: Dim::param("vocab_per_rank", divide("vocab_size", model.vocab_size)?),
             k: model.hidden.into(),
@@ -1225,8 +1460,17 @@ pub fn build(
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let model_cfg = &cfg.model;
     let tp = u64::from(cfg.parallel.tp_size);
-    let total_kv_bytes_per_token =
-        tp * u64::from(model_cfg.num_dsa_layers()) * dsa_layer_bytes_per_token(model_cfg);
+    // `dsa_layer_bytes_per_token` is the MLA latent (fp8, 1 byte/elem on NVIDIA)
+    // plus the kpool index cache. MI300X runs the rope-free Triton sparse-MLA
+    // kernel, which requires a non-fp8 (bf16, 2 bytes/elem) latent -> one extra
+    // byte per `kv_lora_rank` element per layer (~1024 vs 512 bytes/token,
+    // decision #32). Additive and gpu-gated; B200 is byte-identical.
+    let dsa_layer_bytes = if is_mi300x(&cfg.parallel.gpu_name) {
+        dsa_layer_bytes_per_token(model_cfg) + u64::from(model_cfg.kv_lora_rank)
+    } else {
+        dsa_layer_bytes_per_token(model_cfg)
+    };
+    let total_kv_bytes_per_token = tp * u64::from(model_cfg.num_dsa_layers()) * dsa_layer_bytes;
     let kda_layers = model_cfg.kda_layers.len() as u64;
     let hybrid_block_size = hybrid_block_tokens(
         kda_layer_state_bytes_per_request(&resolved),
@@ -1257,8 +1501,12 @@ pub fn build(
             format!("{n}.final_mhc_post"),
             MhcTerminalPostConfig {
                 mhc: cfg.mhc.clone(),
-                pre_backends: MHC_BACKENDS.to_vec(),
-                fused_backends: MHC_BACKENDS.to_vec(),
+                pre_backends: pin_mi300x(&cfg.parallel.gpu_name, MHC_BACKENDS_MI300X, MHC_BACKENDS),
+                fused_backends: pin_mi300x(
+                    &cfg.parallel.gpu_name,
+                    MHC_BACKENDS_MI300X,
+                    MHC_BACKENDS,
+                ),
             },
             bridge,
         )?,
@@ -1617,6 +1865,14 @@ fn refuse_unfused_all_reduce(
     parallel: &Glm53FlashVllmParallel,
 ) -> std::result::Result<(), BuildError> {
     let tp = u32::from(parallel.tp_size);
+    // The FlashInfer all-reduce budget gate applies only to the FlashInfer
+    // backends NVIDIA uses. MI300X runs the analytic Infinity-Fabric ring
+    // roofline (`rocm_fabric_roofline`, decision #42), which is modelable at any
+    // TP and carries no FlashInfer workspace budget, so it is not subject to
+    // this refusal. B200 keeps the gate unchanged.
+    if is_mi300x(&parallel.gpu_name) {
+        return Ok(());
+    }
     match fused_all_reduce_refusal(tp_all_reduce_backends(tp), &parallel.gpu_name, tp) {
         Some(reason) => Err(fit_failed(format!("tp_size {tp}: {reason}"))),
         None => Ok(()),
@@ -1649,6 +1905,33 @@ mod tests {
             gpu_name: "NVIDIA B200".into(),
             cudagraph_capture_sizes: Vec::new(),
         }
+    }
+
+    #[test]
+    fn fabric_follows_the_target_gpu_and_b200_stays_nvlink() {
+        let demand = ExpertDemand::popularity(&RoutingDistribution::uniform(288), 42);
+        // B200 is unchanged.
+        let b200 = build_configs(&model_cfg(), &parallel(), &demand).unwrap();
+        assert_eq!(b200.all_reduce.fabric, Fabric::Nvlink);
+        // B200 keeps the NVIDIA-only MNNVL fused all-reduce backend, and NCCL for
+        // the large (non-fused) all-reduce.
+        assert_eq!(b200.all_reduce.backends, vec!["flashinfer_mnnvl"]);
+        assert_eq!(b200.large_all_reduce.backends, vec!["nccl"]);
+        assert_eq!(b200.large_all_reduce.fabric, Fabric::Nvlink);
+        // MI300X flips the name-independent fabric pin and both all-reduce backend
+        // pins: the analytic Infinity-Fabric roofline for the fused all-reduce
+        // (instead of NVIDIA-only MNNVL) and measured RCCL for the large one
+        // (instead of NVIDIA NCCL).
+        let mut amd = parallel();
+        amd.gpu_name = "MI300X".into();
+        let mi300x = build_configs(&model_cfg(), &amd, &demand).unwrap();
+        assert_eq!(mi300x.all_reduce.fabric, Fabric::InfinityFabric);
+        assert_eq!(mi300x.all_reduce.gpu_name, "MI300X");
+        assert_eq!(mi300x.all_reduce.backends, vec!["rocm_fabric_roofline"]);
+        assert_eq!(mi300x.large_all_reduce.backends, vec!["rccl"]);
+        assert_eq!(mi300x.large_all_reduce.fabric, Fabric::InfinityFabric);
+        assert_eq!(mi300x.large_all_reduce.gpu_name, "MI300X");
+        assert!(is_mi300x("AMD MI300X") && !is_mi300x("NVIDIA B200"));
     }
 
     #[test]

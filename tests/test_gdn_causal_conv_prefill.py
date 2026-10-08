@@ -93,7 +93,7 @@ def test_registration_table_kind_runner_and_support_contract() -> None:
     spec = find_kernel_profiler_spec(KIND, "torch")
 
     assert KIND == "gdn_causal_conv_prefill"
-    assert known_backends(KIND) == ["torch", "vllm_triton"]
+    assert known_backends(KIND) == ["torch", "vllm_triton", "torch_rocm"]
     assert spec.kernel_kind == spec.table_name == KIND
     assert spec.backend == "torch"
     assert spec.args_schema is GdnCausalConvPrefillArgs

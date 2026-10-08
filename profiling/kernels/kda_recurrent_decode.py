@@ -136,3 +136,38 @@ register(
         ),
     )
 )
+
+
+# The AMD/ROCm path. common/kda.py's ``is_rocm()`` branch dispatches the same
+# ``fused_recurrent_kda`` call to the glm5next ``amd`` subtree (AMD Triton
+# kernels); the callable's signature is identical to the NVIDIA one, so the
+# operand layout and keyword set are unchanged. Measured on MI300X in the
+# vllm_rocm_env image, timed kernel-only via rocprofv3 (the ROCm counterpart of
+# the CUPTI path the NVIDIA backend uses). NVIDIA B200 rows are untouched.
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="torch_rocm",
+        supports=BackendSupport(
+            compute=frozenset({DType.BF16}),
+            arch_targets=frozenset({"CDNA3"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.attention.kda_recurrent_decode_torch_rocm",
+            function_name="profile_kda_recurrent_decode_torch_rocm",
+        ),
+        table_name=KIND,
+        args_schema=KdaRecurrentDecodeArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="vllm_rocm_env",
+        doc=BackendDoc(
+            summary=(
+                "AMD glm5next fused_recurrent_kda (is_rocm() dispatch): the same "
+                "four input copies and recurrent kernel as the NVIDIA backend, "
+                "run as AMD Triton kernels on CDNA3."
+            ),
+            url="https://github.com/vllm-project/vllm/blob/main/vllm/models/glm5next/amd/ops/third_party/kda/kernels.py",
+        ),
+    )
+)

@@ -39,7 +39,7 @@ def test_args_and_registration_preserve_varlen_request_boundaries():
     assert args.q_dtype is args.cache_dtype is DType.FP8_E4M3
     assert args.output_dtype is DType.BF16
 
-    assert known_backends(KIND) == ["flashinfer_trtllm_fp8"]
+    assert known_backends(KIND) == ["flashinfer_trtllm_fp8", "rocm_triton_mla_sparse"]
     spec = find_kernel_profiler_spec(KIND, "flashinfer_trtllm_fp8")
     assert spec.args_schema is DsaSparseMlaPrefillArgs
     assert spec.subprocess_env == "vllm_env"
