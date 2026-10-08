@@ -109,8 +109,7 @@ DOC = KernelDoc(
         "sequences is checked against a per-token PyTorch reference."
     ),
     caveats=(
-        "Only num_heads = 16 and head_dim = 128 on B200 are measured; the runner "
-        "accepts only head_dim = 128.",
+        "FLA's chunk kernels take head_dim up to 256.",
         "Each one-token decode sequence occupies a whole 64-token chunk in the "
         "chunk-parallel kernels.",
         "The timed calls reuse one cu_seqlens tensor, so FLA's cached chunk-index "
@@ -129,7 +128,6 @@ register(
         backend="vllm_triton",
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
-            gpus=frozenset({"NVIDIA B200"}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.attention.kda_chunk_prefill_vllm_triton",
@@ -174,7 +172,7 @@ register(
         backend="torch_rocm",
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
-            gpus=frozenset({"MI300X"}),
+            arch_targets=frozenset({"CDNA3"}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.attention.kda_chunk_prefill_torch_rocm",

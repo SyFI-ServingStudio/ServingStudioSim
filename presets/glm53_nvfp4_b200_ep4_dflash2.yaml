@@ -23,7 +23,6 @@ workload:
   input_file_format: text-generation-independent
   input_file_tags: [speculative]
   arrival_mode: trace_timed
-  session_dependency: independent
   run_to_end: true
 
 io:
@@ -36,7 +35,7 @@ pools:
         replicas: 1
         arch:
           type: glm53_vllm_nvfp4_dsa_moe_dflash2
-          model_config: model/config/glm53_nvfp4.json
+          model_config: model/config/glm52_nvfp4.json
           fp8: false
           ep_size: 4
           nvl_num_gpu: 4
@@ -46,7 +45,7 @@ pools:
           # groups. The target runs no MTP layer, so the corpus is the 75 body
           # layers only. See skills/operate-run-simulation/references/moe-routing.md.
           routing: corpus
-          token_corpus_file: hf://UW-SyFI/servingstudio-corpora@c09af698f8192222ee8852f8c727630789890310/glm53_nvfp4_dflash2/manifest.json
+          token_corpus_file: hf://datasets/UW-SyFI/servingstudio-workload@c3f5ecaab0bbff757c64864bf2ec24f5e1f76b5c/glm53_nvfp4/vllm_dflash2_k7/diverse_100/capture/20260922/manifest.json
           draft_tokens: 7
           draft_sliding_window: 2048
         worker:

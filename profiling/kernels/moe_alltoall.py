@@ -123,7 +123,6 @@ register(
         # `hidden_bytes` rather than as a dtype.
         supports=BackendSupport(
             compute=None,
-            gpus=frozenset({"NVIDIA H100", "NVIDIA H200", "NVIDIA B200"}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.moe.flashinfer_mnnvl_alltoall",

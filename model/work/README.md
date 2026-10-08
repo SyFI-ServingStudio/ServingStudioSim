@@ -111,6 +111,8 @@ attention/glm52_dsa.py  GLM MLA/DSA             (future: fine-grained experts)
 models/llama3.py     compose(GQA, dense)       models/qwen3_moe.py  compose(GQA, MoE)
 models/qwen3_6.py    hybrid [GDN×3, GQA×1] + dense    registry.py  architectures[0] -> builder
 models/glm52.py      dense/full-index + sparse/index-share stacks + shared MoE
+attention/deepseek_v41.py  DeepSeek-V4.1 window + compressed sparse attention
+models/deepseek_v41.py     10 role stacks + MXFP4 MoE + FP32 mHC mixing + engram
 ```
 
 - **New attention (MLA/SWA/SSM)** → one new `attention/*.py`; every FFN combination is free.
@@ -148,9 +150,35 @@ and index-cache writes while retaining the MLA cache write. Its q_absorb and v_u
 single learned `kv_b_proj` matrix, so the accountant preserves both execution
 work and exact parameter totals.
 
+### Pipeline-parallel stages
+
+A PP stage runs the same microbatches as every other stage of its pipeline, through
+its own layers only. A stack that declares its checkpoint `layers` (GLM-5.2 and
+GLM-5.3-Flash do) lets `Model.pipeline_stage_share(segment, (start, end))` say how
+much of a row a stage owns: a stack row by the fraction of the stack's layers in the
+stage's range, the `embedding` row on the stage that holds layer 0, and every other
+once-per-forward row (final norm, `lm_head`, a final mHC collapse) on the last stage.
+A per-layer row that names no stack is refused rather than guessed. `floors.py`
+labels the stage's workload with the whole model and keeps that share of each row;
+the stage's scope-fused floor is its share of the iteration's binding resource, so
+both floors of the stages add up to the whole model's.
+
 The only currency between a spec and `core.py` is
 `MatmulGroup(name, n, k, activated_mult, total_count, bucket)`; `core.py` applies
 `flops = 2·(matmul_tokens·activated_mult)·n·k` and folds `× num_layers` uniformly.
+
+DeepSeek-V4.1-Flash attends to each layer's 128-token sliding window plus, at
+compressed layers, the top-512 entries of a ratio-1 or ratio-2 compressed KV
+cache shared from four KV-source layers; index owners score every compressed
+entry, while the four candidate-consumer indexers score only the 2048 x 8
+positions the layer-20 candidate source keeps. Cache entries use the reference
+numerics (window 528 B, compressed 288 B, MXFP4 index keys 68 B). mHC mixing
+matrices are FP32 matmuls (`mhc` FLOP bucket); the engram tables are gathered
+weights read only at the hashed rows (`engram` bucket and parameter key). The
+analyzer sends one summed interaction per phase, so this spec reconstructs a
+mean request per phase: exact for a single request, an over-estimate of the
+sparse-attention floor when a batch straddles the window/top-k caps. The DSpark
+MTP layers and the vision tower are not labeled.
 
 ## Modality-agnostic workload
 
@@ -225,6 +253,38 @@ Weights follow the accountant's existing read-once lower-bound convention;
 serial dependence alone does not prove that a shared weight must leave cache
 and be fetched again. Kernel timing and CostTree approximations never determine
 the necessary FLOP formulas.
+
+### DFlash2 proposer
+
+`glm53_vllm_nvfp4_dsa_moe_dflash2` verifies with the same GLM-5.2 NVFP4 target
+rows, but its proposer is a separate checkpoint (`model/config/glm53_dflash2.json`,
+a verbatim copy of `incoai/GLM-5.3-DFlash2`'s config) that drafts a whole block in
+one pass, so there is no recurrence. `floors.py` attaches it to the target model
+by arch type (`models/dflash2.py`; the checkpoint's own MTP layer is not run),
+and `speculative.py` builds three stages from the same geometry:
+
+- `dflash2_context`, over every target row `C`: `fc` (six target layers'
+  hidden states, `6·hidden -> hidden`), `hidden_norm`, the K/V halves of each
+  draft layer's `qkv_proj`, and the compulsory draft-cache writes
+  (`C · layers · 2 · kv_heads · head_dim` bytes at the served FP8 cache dtype).
+- `dflash2_draft`, over `R · (k + 1)` query rows: six Qwen3 layers with their
+  two grouped-convolution coefficient projections and base kernels, and a
+  non-causal block attending its context plus itself inside the symmetric
+  sliding window (`attention/dflash2.py`: per request
+  `Σ_{t<q} min(context + q, W + t)` pairs, `min(context, W - 1)` cached keys
+  read; the block's own K/V are not persistent). The attention row is pinned
+  to FP8 because the engine attends the FP8 cache with an FP8 query.
+- `dflash2_select`, over the `R · k` drafted positions: the shared target
+  `lm_head` (FLOPs only; its weights are read once by the target row), the
+  rank-256 `hidden_projection`, `2 · top_k² · rank` edge-scoring FLOPs, and
+  the codebook rows gathered (anchor plus `k − 1` positions' candidates for
+  predecessors, `k` positions' for successors, each capped at the vocabulary).
+
+The draft's embedding (the target's table) and its convolution, norm, RoPE,
+top-k and selector-walk math carry no row, by the same conventions as above.
+Every scheduled request drafts, prefilling or verifying. The simulator prices
+no separate draft final norm, so `glm53_vllm_nvfp4_dsa_moe_dflash2.json` maps
+that learned scale to the selector's `lm_head` location it feeds.
 
 Request-side admission/completion telemetry separately records completed rounds,
 emitted outputs, resident KV, and pending work. Conservation uses those facts,

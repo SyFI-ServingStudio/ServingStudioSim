@@ -53,14 +53,14 @@ def test_backend_registered_for_mi300x_only() -> None:
     from profiling.db.registry import find_kernel_profiler_spec
 
     spec = find_kernel_profiler_spec("nvfp4_fused_moe", "rocm_aiter_fp8_block")
-    assert spec.supports.gpus == frozenset({"MI300X"})
+    assert spec.supports.arch_targets == frozenset({"CDNA3"})
     assert spec.supports.compute == frozenset({__import__("profiling.db.args", fromlist=["DType"]).DType.FP8_E4M3})
     assert spec.subprocess_env == "vllm_rocm_env"
     assert spec.runner_ref.function_name == "profile_rocm_aiter_fp8_block_fused_moe"
     assert spec.args_schema.__name__ == "Nvfp4FusedMoeArgs"
 
     b200_spec = find_kernel_profiler_spec("nvfp4_fused_moe", "flashinfer_trtllm_fp8_block_sm100")
-    assert b200_spec.supports.gpus == frozenset({"NVIDIA B200"})
+    assert b200_spec.supports.arch_targets is None
     assert b200_spec.subprocess_env == "vllm_env"
 
 

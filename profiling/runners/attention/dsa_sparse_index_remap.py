@@ -21,16 +21,10 @@ from profiling.runners.metrics import ComputeMetrics
 
 _BACKEND = "dsa_sparse_index_remap:torch"
 _VLLM_BACKEND = "dsa_sparse_index_remap:vllm_triton"
-_REQUIRED_GPU = "NVIDIA H200"
-_SELECTED_K = 2048
-# The vLLM wrapper also serves a kpool indexer's round_up(index_topk +
-# index_kpool - 1, 128) = 2176-wide table (<= 2051 active entries per row).
-_VLLM_SELECTED_K = frozenset({2048, 2176})
-_BLOCK_SIZE = 64
-_MAX_BLOCKS_PER_REQUEST = 16384
-_MAX_LOCAL_SPAN = _BLOCK_SIZE * _MAX_BLOCKS_PER_REQUEST
-_MAX_QUERIES = 16384
 _INDEX_DTYPE = "int32"
+# vLLM's triton_convert_req_index_to_global_index asserts
+# NUM_TOPK_TOKENS % BLOCK_N == 0 with BLOCK_N=128 (v1/attention/backends/mla/
+# sparse_utils.py); the logical accounting below counts those same tiles.
 _SOURCE_BLOCK_N = 128
 _ROW_CHUNK_SIZE = 64
 _OPERAND_CHECK_CHUNK_SIZE = 256
@@ -257,7 +251,6 @@ def _validate_args(
     workspace_partition: str,
     return_valid_counts: bool,
     index_dtype: str,
-    supported_selected_k: frozenset[int] = frozenset({_SELECTED_K}),
 ) -> _ValidatedArgs:
     integers = {
         "num_queries": num_queries,
@@ -279,19 +272,25 @@ def _validate_args(
     if type(return_valid_counts) is not bool:
         raise TypeError("return_valid_counts must be a Python bool")
 
-    if not 1 <= num_queries <= _MAX_QUERIES:
-        raise ProfilerNotImplemented(f"num_queries must be in 1..{_MAX_QUERIES}")
-    if not 1 <= num_requests <= min(num_queries, 256):
-        raise ProfilerNotImplemented("num_requests must be in 1..min(num_queries, 256)")
-    if selected_k not in supported_selected_k:
-        allowed = " or ".join(str(value) for value in sorted(supported_selected_k))
-        raise ProfilerNotImplemented(f"selected_k must be {allowed}, got {selected_k}")
-    if block_size != _BLOCK_SIZE:
-        raise ProfilerNotImplemented(f"block_size must be {_BLOCK_SIZE}, got {block_size}")
-    if not 1 <= max_blocks_per_request <= _MAX_BLOCKS_PER_REQUEST:
+    if num_queries < 1:
+        raise ProfilerNotImplemented(f"num_queries must be >= 1, got {num_queries}")
+    # Every request owns at least one query row.
+    if not 1 <= num_requests <= num_queries:
+        raise ProfilerNotImplemented("num_requests must be in 1..num_queries")
+    if selected_k < 1 or selected_k % _SOURCE_BLOCK_N:
         raise ProfilerNotImplemented(
-            f"max_blocks_per_request must be in 1..{_MAX_BLOCKS_PER_REQUEST}, "
-            f"got {max_blocks_per_request}"
+            f"selected_k must be a positive multiple of {_SOURCE_BLOCK_N}, got {selected_k}"
+        )
+    if block_size < 1:
+        raise ProfilerNotImplemented(f"block_size must be >= 1, got {block_size}")
+    if max_blocks_per_request < 1:
+        raise ProfilerNotImplemented(
+            f"max_blocks_per_request must be >= 1, got {max_blocks_per_request}"
+        )
+    # Remapped slots are int32 (index_dtype), so the paged pool must fit in it.
+    if num_requests * max_blocks_per_request * block_size > _INT32_MAX:
+        raise ProfilerNotImplemented(
+            "num_requests * max_blocks_per_request * block_size must fit int32 slot ids"
         )
     if index_dtype != _INDEX_DTYPE:
         raise ProfilerNotImplemented(f"index_dtype must be {_INDEX_DTYPE}")
@@ -357,22 +356,6 @@ def _validate_args(
         workspace_partition=partition,
         return_valid_counts=return_valid_counts,
     )
-
-
-def _require_h200(torch: Any) -> None:
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented(f"CUDA is required for {_BACKEND}")
-    gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
-    if gpu_name != _REQUIRED_GPU:
-        raise ProfilerNotImplemented(f"{_BACKEND} requires {_REQUIRED_GPU}, got {gpu_name!r}")
-
-
-def _require_b200(torch: Any) -> None:
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented(f"CUDA is required for {_VLLM_BACKEND}")
-    gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
-    if gpu_name != "NVIDIA B200":
-        raise ProfilerNotImplemented(f"{_VLLM_BACKEND} requires NVIDIA B200, got {gpu_name!r}")
 
 
 def _coprime_stride(size: int, preferred: int) -> int:
@@ -824,7 +807,7 @@ def profile_dsa_sparse_index_remap_torch(
     return_valid_counts: bool,
     index_dtype: str,
 ) -> ComputeMetrics:
-    """Profile the complete Torch semantic composite on an NVIDIA H200."""
+    """Profile the complete Torch semantic composite on any CUDA device."""
     validated = _validate_args(
         num_queries=num_queries,
         num_requests=num_requests,
@@ -847,7 +830,6 @@ def profile_dsa_sparse_index_remap_torch(
         raise ProfilerNotImplemented(f"{_BACKEND} requires PyTorch") from exc
 
     try:
-        _require_h200(torch)
         device = torch.device("cuda", torch.cuda.current_device())
         operands = _build_operands(torch, validated, device=device)
         _check_correctness(torch, validated, operands)
@@ -971,7 +953,7 @@ def profile_dsa_sparse_index_remap_vllm_triton(
     return_valid_counts: bool,
     index_dtype: str,
 ) -> ComputeMetrics:
-    """Profile vLLM's production sparse-index Triton wrapper on B200."""
+    """Profile vLLM's production sparse-index Triton wrapper."""
     validated = _validate_args(
         num_queries=num_queries,
         num_requests=num_requests,
@@ -986,7 +968,6 @@ def profile_dsa_sparse_index_remap_vllm_triton(
         workspace_partition=workspace_partition,
         return_valid_counts=return_valid_counts,
         index_dtype=index_dtype,
-        supported_selected_k=_VLLM_SELECTED_K,
     )
     try:
         import torch
@@ -997,7 +978,6 @@ def profile_dsa_sparse_index_remap_vllm_triton(
         raise ProfilerNotImplemented(f"{_VLLM_BACKEND} requires the repository vllm_env") from exc
 
     try:
-        _require_b200(torch)
         device = torch.device("cuda", torch.cuda.current_device())
         operands = _build_operands(torch, validated, device=device)
         _check_vllm_triton_correctness(

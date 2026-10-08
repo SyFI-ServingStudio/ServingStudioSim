@@ -11,8 +11,12 @@ from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerN
 from profiling.runners.metrics import ComputeMetrics
 
 _BACKEND = "mxfp4_marlin_moe_gemm:vllm_marlin"
-_GPU_NAME = "NVIDIA H200"
-_LOCAL_EXPERTS = 64
+# Marlin's MoE kernel rejects BF16 activations below Ampere (ops.cu:
+# "Turing only support FP16 or INT8 activation").
+# Marlin thread tiles are (thread_k, thread_n) in {(128,128), (64,128),
+# (128,64), (64,256)}, so a shape needs n % 64 and k % 128, or n % 128 and
+# k % 64 (vLLM marlin_utils.marlin_padded_nk); either also keeps whole
+# 32-wide MXFP4 scale groups and 64-wide repack tiles.
 
 
 @dataclass(frozen=True)
@@ -28,6 +32,10 @@ class _Shape:
     @property
     def capacity(self) -> int:
         return self.m * self.input_top_k
+
+    @property
+    def num_local_experts(self) -> int:
+        return len(self.per_group_batches)
 
 
 @dataclass(frozen=True)
@@ -56,20 +64,24 @@ def _validate_args(
         raise ProfilerNotImplemented(f"{_BACKEND} requires dtype=bf16")
     if type(mul_topk_weights) is not bool:
         raise TypeError("mul_topk_weights must be a bool")
-    supported_block = type(block_size_m) is int and (
-        block_size_m == 8 or block_size_m in (16, 32, 48, 64)
-    )
+    # Marlin MoE instantiates moe_block_size 8, 16, 32, 48 and 64 only
+    # (marlin_moe_wna16/ops.cu: "unsupported moe_block_size").
+    supported_block = type(block_size_m) is int and block_size_m in (8, 16, 32, 48, 64)
     if not supported_block:
         raise ProfilerNotImplemented(f"{_BACKEND} requires block_size_m=8 or 16/32/48/64")
-
-    is_fc1 = (n, k, input_top_k, mul_topk_weights) == (4096, 4096, 6, False)
-    is_fc2 = (n, k, input_top_k, mul_topk_weights) == (4096, 2048, 1, True)
-    if not (is_fc1 or is_fc2):
-        raise ProfilerNotImplemented(f"{_BACKEND} supports only DeepSeek V4 FC1/FC2 shapes")
+    fits_tile = (n % 64 == 0 and k % 128 == 0) or (n % 128 == 0 and k % 64 == 0)
+    if not fits_tile:
+        raise ProfilerNotImplemented(
+            f"{_BACKEND} needs n % 64 and k % 128, or n % 128 and k % 64; got n={n}, k={k}"
+        )
 
     batches = tuple(per_group_batches)
-    if len(batches) != _LOCAL_EXPERTS:
-        raise ProfilerNotImplemented(f"{_BACKEND} requires {_LOCAL_EXPERTS} local experts")
+    if not batches:
+        raise ValueError("per_group_batches must hold one count per local expert")
+    # Routes are aligned over the local experts plus one remote sentinel by
+    # vLLM's moe_align_block_size, which handles at most 992 experts.
+    if len(batches) + 1 > 992:
+        raise ProfilerNotImplemented(f"{_BACKEND} aligns at most 991 local experts")
     if any(type(count) is not int or count < 0 for count in batches):
         raise ValueError("per_group_batches must contain non-negative integers")
     if not 0 < sum(batches) <= m * input_top_k:
@@ -82,9 +94,9 @@ def _build_routes(torch: Any, shape: _Shape, align_routes: Callable[..., Any]) -
         expert for expert, count in enumerate(shape.per_group_batches) for _ in range(count)
     ]
     remote_rows = shape.capacity - len(local_ids)
-    num_global_experts = _LOCAL_EXPERTS + int(remote_rows > 0)
+    num_global_experts = shape.num_local_experts + int(remote_rows > 0)
     route_ids_cpu = torch.tensor(
-        local_ids + [_LOCAL_EXPERTS] * remote_rows,
+        local_ids + [shape.num_local_experts] * remote_rows,
         dtype=torch.int32,
     ).reshape(shape.m, shape.input_top_k)
     route_ids = route_ids_cpu.cuda()
@@ -115,12 +127,12 @@ def _make_weights(torch: Any, shape: _Shape, dependencies: dict[str, Any]) -> tu
     packed = dependencies["repack"](
         qweight, torch.empty(0, dtype=torch.int32, device="cuda"), shape.k, shape.n, 4
     )
-    packed_weights = packed.cpu().unsqueeze(0).repeat(_LOCAL_EXPERTS, 1, 1).cuda()
+    packed_weights = packed.cpu().unsqueeze(0).repeat(shape.num_local_experts, 1, 1).cuda()
     permuted_scales = dependencies["permute_scales"](
         raw_scales.T.to(torch.bfloat16), shape.k, shape.n, 32, False
     )
     processed_scales = dependencies["process_scales"](permuted_scales, input_dtype=torch.bfloat16)
-    weight_scales = processed_scales.unsqueeze(0).repeat(_LOCAL_EXPERTS, 1, 1).cuda()
+    weight_scales = processed_scales.unsqueeze(0).repeat(shape.num_local_experts, 1, 1).cuda()
 
     high = ((raw_fp4 & 0x80) | ((raw_fp4 & 0x70) >> 2)).view(torch.float8_e4m3fn)
     low_bits = raw_fp4 << 4
@@ -178,7 +190,8 @@ def _prepare(torch: Any, shape: _Shape, dependencies: dict[str, Any]) -> tuple[_
 def _check_output(torch: Any, launch: _Launch, logical_weight: Any, route_ids: Any) -> None:
     launch.run()
     torch.cuda.synchronize()
-    sample_flat_row = int(torch.nonzero(route_ids.reshape(-1) < _LOCAL_EXPERTS).flatten()[0])
+    num_local_experts = launch.keyword_args["b_qweight"].shape[0]
+    sample_flat_row = int(torch.nonzero(route_ids.reshape(-1) < num_local_experts).flatten()[0])
     activation = launch.keyword_args["input"]
     source_row = sample_flat_row // launch.keyword_args["top_k"]
     expected = activation[source_row].cpu().float() @ logical_weight.float()
@@ -230,13 +243,6 @@ def profile_mxfp4_marlin_moe_gemm_vllm_marlin(
         raise ProfilerNotImplemented(f"{_BACKEND} requires the pinned vLLM environment") from exc
 
     try:
-        if not torch.cuda.is_available():
-            raise ProfilerNotImplemented(f"{_BACKEND} requires CUDA")
-        gpu_name = str(torch.cuda.get_device_name(torch.cuda.current_device()))
-        if gpu_name != _GPU_NAME:
-            raise ProfilerNotImplemented(
-                f"{_BACKEND} is verified only on {_GPU_NAME}, got {gpu_name}"
-            )
         launch, logical_weight, route_ids = _prepare(
             torch,
             shape,

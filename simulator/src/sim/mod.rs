@@ -7,8 +7,8 @@ pub mod repro;
 pub mod run;
 
 pub use frontend::{
-    ArrivalMode, ArrivalSchedule, CapacityLimit, InputFileFormat, InputFileSchema, LoadedTrace,
-    ReleaseMetadata, RequestFamily, ScheduledRequest, SchedulingDeclaration, SessionDependency,
+    trace_formats, ArrivalMode, ArrivalSchedule, CapacityLimit, InputFileFormat, InputFileSchema,
+    LoadedTrace, ReleaseMetadata, RequestFamily, ScheduledRequest, SchedulingDeclaration,
     SessionReleaseMetadata, SourceIdentities, TraceFrontend, TraceTag,
 };
 pub use run::{run_sim, RunSummary, TerminationCause, TickCfg};

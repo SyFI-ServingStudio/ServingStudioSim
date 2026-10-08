@@ -93,6 +93,9 @@ pub struct RequestSloEntry {
     /// independently from runtime prefill work so conservation can verify
     /// `hit + computed = fresh + declared` instead of deriving its own input.
     pub fresh_prompt_tokens: u32,
+    /// Immutable output length the request asks for. `num_output_tokens` is
+    /// what it produced, short of this for a request the run stopped.
+    pub target_output_tokens: u32,
     pub retraction_count: u32,
     pub reprocessed_prefill_output_tokens_before: Vec<u32>,
     pub reprocessed_prefill_prefix_hit_tokens: Vec<u32>,
@@ -373,46 +376,33 @@ fn build_groups_column(entries: &[CostLogEntry], group_logs: &[GroupInputLog]) -
     groups_builder.finish()
 }
 
-pub(crate) fn cost_to_record_batch(chunk: &CostLogChunk) -> Result<RecordBatch> {
-    let entries = &chunk.entries;
-    let pool_tag: Vec<&str> = entries.iter().map(|_| chunk.pool_tag).collect();
-    let worker_id: Vec<u16> = entries.iter().map(|e| e.worker_id).collect();
-    let iter_id: Vec<u64> = entries.iter().map(|e| e.iter_id).collect();
-    let batch_id: Vec<u64> = entries.iter().map(|e| e.batch_id).collect();
-    let wall_start: Vec<f64> = entries.iter().map(|e| e.wall_start_ms).collect();
-    let total_time: Vec<f64> = entries.iter().map(|e| e.total_time_ms).collect();
-    let energy: Vec<f64> = entries.iter().map(|e| e.energy_j).collect();
-    let section: Vec<&str> = entries.iter().map(|e| e.section).collect();
-    let layer: Vec<i16> = entries.iter().map(|e| e.layer).collect();
+/// Most `slot_input` JSON bytes one cost-log record batch may carry. Arrow's
+/// `Utf8` column indexes its values with `i32` offsets, so one batch holds at most
+/// `i32::MAX` bytes of strings; a chunk is `STREAM_FLUSH_ROWS` rows whatever their
+/// size, and on a long-context EP run 8,192 rows of per-slot inputs passed 2 GiB.
+/// Half the limit leaves headroom and keeps a batch's builders at a bounded size.
+pub(crate) const MAX_SLOT_INPUT_BYTES_PER_BATCH: usize = 1 << 30;
 
-    // Per-iteration input_section: one List<Struct> entry per row.
-    let groups = build_groups_column(entries, &chunk.group_logs);
+/// Convert one buffered chunk into record batches, cutting it between rows so no
+/// batch's `slot_input` strings exceed [`MAX_SLOT_INPUT_BYTES_PER_BATCH`]. Most
+/// chunks fit in one batch.
+pub(crate) fn cost_to_record_batches(chunk: &CostLogChunk) -> Result<Vec<RecordBatch>> {
+    cost_to_record_batches_within(chunk, MAX_SLOT_INPUT_BYTES_PER_BATCH)
+}
 
-    // Two parallel List columns, one (non-null, possibly empty) list per row.
-    // Non-nullable `item` to match the schema (ListBuilder defaults to nullable).
-    let mut time_builder = ListBuilder::new(Float32Builder::new())
-        .with_field(Arc::new(Field::new("item", DataType::Float32, false)));
-    let mut cov_builder = ListBuilder::new(UInt8Builder::new()).with_field(Arc::new(Field::new(
-        "item",
-        DataType::UInt8,
-        false,
-    )));
-    // Achieved FLOPs / bytes, slot-aligned to `time_builder` (same cursor).
-    let mut flops_builder = ListBuilder::new(Float32Builder::new())
-        .with_field(Arc::new(Field::new("item", DataType::Float32, false)));
-    let mut bytes_builder = ListBuilder::new(Float32Builder::new())
-        .with_field(Arc::new(Field::new("item", DataType::Float32, false)));
-    // Selected backend per slot, slot-aligned to `time_builder` (same cursor).
-    let mut backend_builder = ListBuilder::new(UInt8Builder::new())
-        .with_field(Arc::new(Field::new("item", DataType::UInt8, false)));
-    // Per-slot input JSON, serialized HERE on the writer thread (the sim thread
-    // only handed over the inline `SlotInput` enums). One (possibly empty) list per row.
-    let mut input_builder = ListBuilder::new(StringBuilder::new())
-        .with_field(Arc::new(Field::new("item", DataType::Utf8, false)));
-    let mut slot_input_cursor = 0usize;
-    let mut slot_cursor = 0usize;
-    let mut json_buf = Vec::new();
-    for e in entries {
+fn cost_to_record_batches_within(
+    chunk: &CostLogChunk,
+    max_slot_input_bytes: usize,
+) -> Result<Vec<RecordBatch>> {
+    let mut lists = SlotListBuilders::new();
+    let mut batches = Vec::new();
+    let (mut batch_first_row, mut batch_first_group) = (0usize, 0usize);
+    let (mut slot_cursor, mut slot_input_cursor, mut group_cursor) = (0usize, 0usize, 0usize);
+    // One row's slot inputs as JSON, serialized HERE on the writer thread (the sim
+    // thread only handed over the inline `SlotInput` enums), and where each ends.
+    let mut row_json = Vec::new();
+    let mut row_json_ends = Vec::new();
+    for (row, e) in chunk.entries.iter().enumerate() {
         let slot_end = slot_cursor + e.slot_len;
         ensure!(
             slot_end <= chunk.slot_times.len()
@@ -422,42 +412,42 @@ pub(crate) fn cost_to_record_batch(chunk: &CostLogChunk) -> Result<RecordBatch> 
                 && slot_end <= chunk.slot_backends.len(),
             "cost_log slot slice exceeds chunk buffer"
         );
-        for &t in &chunk.slot_times[slot_cursor..slot_end] {
-            time_builder.values().append_value(t);
-        }
-        time_builder.append(true);
-        for &c in &chunk.slot_covs[slot_cursor..slot_end] {
-            cov_builder.values().append_value(c);
-        }
-        cov_builder.append(true);
-        for &f in &chunk.slot_flops[slot_cursor..slot_end] {
-            flops_builder.values().append_value(f);
-        }
-        flops_builder.append(true);
-        for &b in &chunk.slot_bytes[slot_cursor..slot_end] {
-            bytes_builder.values().append_value(b);
-        }
-        bytes_builder.append(true);
-        for &b in &chunk.slot_backends[slot_cursor..slot_end] {
-            backend_builder.values().append_value(b);
-        }
-        backend_builder.append(true);
-        slot_cursor = slot_end;
         let slot_input_end = slot_input_cursor + e.slot_input_len;
         ensure!(
             slot_input_end <= chunk.slot_inputs.len(),
             "cost_log slot_input slice exceeds chunk buffer"
         );
+        row_json.clear();
+        row_json_ends.clear();
         for slot in &chunk.slot_inputs[slot_input_cursor..slot_input_end] {
-            json_buf.clear();
-            let json = match serde_json::to_writer(&mut json_buf, slot) {
-                Ok(()) => std::str::from_utf8(&json_buf).unwrap_or("null"),
-                Err(_) => "null",
-            };
-            input_builder.values().append_value(json);
+            let start = row_json.len();
+            if serde_json::to_writer(&mut row_json, slot).is_err() {
+                row_json.truncate(start);
+                row_json.extend_from_slice(b"null");
+            }
+            row_json_ends.push(row_json.len());
         }
+        ensure!(
+            row_json.len() <= max_slot_input_bytes,
+            "cost_log row {} (iter {}) has {} bytes of slot_input, over the {} per batch",
+            row,
+            e.iter_id,
+            row_json.len(),
+            max_slot_input_bytes
+        );
+        if row > batch_first_row && lists.slot_input_bytes + row_json.len() > max_slot_input_bytes {
+            batches.push(lists.finish(
+                chunk,
+                batch_first_row..row,
+                batch_first_group..group_cursor,
+            )?);
+            batch_first_row = row;
+            batch_first_group = group_cursor;
+        }
+        lists.append_row(chunk, slot_cursor..slot_end, &row_json, &row_json_ends);
+        slot_cursor = slot_end;
         slot_input_cursor = slot_input_end;
-        input_builder.append(true);
+        group_cursor += e.group_len;
     }
     ensure!(
         slot_input_cursor == chunk.slot_inputs.len(),
@@ -471,28 +461,125 @@ pub(crate) fn cost_to_record_batch(chunk: &CostLogChunk) -> Result<RecordBatch> 
             && slot_cursor == chunk.slot_backends.len(),
         "cost_log chunk has unused slot time/coverage/flops/bytes/backend values"
     );
+    if batch_first_row < chunk.entries.len() || batches.is_empty() {
+        batches.push(lists.finish(
+            chunk,
+            batch_first_row..chunk.entries.len(),
+            batch_first_group..group_cursor,
+        )?);
+    }
+    Ok(batches)
+}
 
-    Ok(RecordBatch::try_new(
-        cost_log_schema(),
-        vec![
-            Arc::new(StringArray::from(pool_tag)),
-            Arc::new(UInt16Array::from(worker_id)),
-            Arc::new(UInt64Array::from(iter_id)),
-            Arc::new(UInt64Array::from(batch_id)),
-            Arc::new(Float64Array::from(wall_start)),
-            Arc::new(Float64Array::from(total_time)),
-            Arc::new(Float64Array::from(energy)),
-            Arc::new(groups),
-            Arc::new(time_builder.finish()),
-            Arc::new(cov_builder.finish()),
-            Arc::new(input_builder.finish()),
-            Arc::new(StringArray::from(section)),
-            Arc::new(Int16Array::from(layer)),
-            Arc::new(flops_builder.finish()),
-            Arc::new(bytes_builder.finish()),
-            Arc::new(backend_builder.finish()),
-        ],
-    )?)
+/// The per-slot list columns of the record batch being built: one (non-null,
+/// possibly empty) list per row. `finish` emits the batch and resets the builders
+/// for the next one.
+struct SlotListBuilders {
+    time: ListBuilder<Float32Builder>,
+    coverage: ListBuilder<UInt8Builder>,
+    /// Achieved FLOPs / bytes, slot-aligned to `time` (same cursor).
+    flops: ListBuilder<Float32Builder>,
+    bytes: ListBuilder<Float32Builder>,
+    /// Selected backend per slot, slot-aligned to `time` (same cursor).
+    backend: ListBuilder<UInt8Builder>,
+    input: ListBuilder<StringBuilder>,
+    /// String bytes appended to `input` since the last `finish`.
+    slot_input_bytes: usize,
+}
+
+impl SlotListBuilders {
+    fn new() -> Self {
+        // Non-nullable `item` to match the schema (ListBuilder defaults to nullable).
+        let item = |data_type| Arc::new(Field::new("item", data_type, false));
+        Self {
+            time: ListBuilder::new(Float32Builder::new()).with_field(item(DataType::Float32)),
+            coverage: ListBuilder::new(UInt8Builder::new()).with_field(item(DataType::UInt8)),
+            flops: ListBuilder::new(Float32Builder::new()).with_field(item(DataType::Float32)),
+            bytes: ListBuilder::new(Float32Builder::new()).with_field(item(DataType::Float32)),
+            backend: ListBuilder::new(UInt8Builder::new()).with_field(item(DataType::UInt8)),
+            input: ListBuilder::new(StringBuilder::new()).with_field(item(DataType::Utf8)),
+            slot_input_bytes: 0,
+        }
+    }
+
+    fn append_row(
+        &mut self,
+        chunk: &CostLogChunk,
+        slots: std::ops::Range<usize>,
+        slot_input_json: &[u8],
+        slot_input_ends: &[usize],
+    ) {
+        self.time
+            .values()
+            .append_slice(&chunk.slot_times[slots.clone()]);
+        self.time.append(true);
+        self.coverage
+            .values()
+            .append_slice(&chunk.slot_covs[slots.clone()]);
+        self.coverage.append(true);
+        self.flops
+            .values()
+            .append_slice(&chunk.slot_flops[slots.clone()]);
+        self.flops.append(true);
+        self.bytes
+            .values()
+            .append_slice(&chunk.slot_bytes[slots.clone()]);
+        self.bytes.append(true);
+        self.backend
+            .values()
+            .append_slice(&chunk.slot_backends[slots]);
+        self.backend.append(true);
+        let mut start = 0;
+        for &end in slot_input_ends {
+            let json = std::str::from_utf8(&slot_input_json[start..end]).unwrap_or("null");
+            self.input.values().append_value(json);
+            start = end;
+        }
+        self.input.append(true);
+        self.slot_input_bytes += slot_input_json.len();
+    }
+
+    fn finish(
+        &mut self,
+        chunk: &CostLogChunk,
+        rows: std::ops::Range<usize>,
+        groups: std::ops::Range<usize>,
+    ) -> Result<RecordBatch> {
+        let entries = &chunk.entries[rows];
+        let pool_tag: Vec<&str> = entries.iter().map(|_| chunk.pool_tag).collect();
+        let worker_id: Vec<u16> = entries.iter().map(|e| e.worker_id).collect();
+        let iter_id: Vec<u64> = entries.iter().map(|e| e.iter_id).collect();
+        let batch_id: Vec<u64> = entries.iter().map(|e| e.batch_id).collect();
+        let wall_start: Vec<f64> = entries.iter().map(|e| e.wall_start_ms).collect();
+        let total_time: Vec<f64> = entries.iter().map(|e| e.total_time_ms).collect();
+        let energy: Vec<f64> = entries.iter().map(|e| e.energy_j).collect();
+        let section: Vec<&str> = entries.iter().map(|e| e.section).collect();
+        let layer: Vec<i16> = entries.iter().map(|e| e.layer).collect();
+        // Per-iteration input_section: one List<Struct> entry per row.
+        let group_column = build_groups_column(entries, &chunk.group_logs[groups]);
+        self.slot_input_bytes = 0;
+        Ok(RecordBatch::try_new(
+            cost_log_schema(),
+            vec![
+                Arc::new(StringArray::from(pool_tag)),
+                Arc::new(UInt16Array::from(worker_id)),
+                Arc::new(UInt64Array::from(iter_id)),
+                Arc::new(UInt64Array::from(batch_id)),
+                Arc::new(Float64Array::from(wall_start)),
+                Arc::new(Float64Array::from(total_time)),
+                Arc::new(Float64Array::from(energy)),
+                Arc::new(group_column),
+                Arc::new(self.time.finish()),
+                Arc::new(self.coverage.finish()),
+                Arc::new(self.input.finish()),
+                Arc::new(StringArray::from(section)),
+                Arc::new(Int16Array::from(layer)),
+                Arc::new(self.flops.finish()),
+                Arc::new(self.bytes.finish()),
+                Arc::new(self.backend.finish()),
+            ],
+        )?)
+    }
 }
 
 pub(crate) fn state_to_record_batch(entries: &[RequestStateEntry]) -> Result<RecordBatch> {
@@ -539,7 +626,7 @@ pub struct KvSnapshotEntry {
 
 /// `pool_tag` is the whole chunk's stream tag (one worker owns one `KvSampler`),
 /// so it is passed once here rather than duplicated into every [`KvSnapshotEntry`]
-/// — mirrors how `cost_to_record_batch` takes `CostLogChunk::pool_tag`.
+/// — mirrors how `cost_to_record_batches` takes `CostLogChunk::pool_tag`.
 pub(crate) fn kv_to_record_batch(
     pool_tag: &str,
     entries: &[KvSnapshotEntry],
@@ -715,6 +802,7 @@ pub(crate) fn slo_to_record_batch(
     let prefix_cache_hit_tokens: Vec<Option<u32>> =
         entries.iter().map(|e| e.prefix_cache_hit_tokens).collect();
     let fresh_prompt_tokens: Vec<u32> = entries.iter().map(|e| e.fresh_prompt_tokens).collect();
+    let target_output_tokens: Vec<u32> = entries.iter().map(|e| e.target_output_tokens).collect();
     let retraction_count: Vec<u32> = entries.iter().map(|e| e.retraction_count).collect();
     let ttft: Vec<Option<f32>> = entries.iter().map(|e| e.ttft_ms).collect();
     let finish_decode: Vec<Option<f32>> = entries.iter().map(|e| e.finish_decode_time_ms).collect();
@@ -865,6 +953,7 @@ pub(crate) fn slo_to_record_batch(
                     })
                     .collect::<Vec<_>>(),
             )),
+            Arc::new(UInt32Array::from(target_output_tokens)),
         ],
     )?)
 }
@@ -978,6 +1067,7 @@ mod tests {
             declared_prefix_tokens: 0,
             prefix_cache_hit_tokens: Some(0),
             fresh_prompt_tokens: 0,
+            target_output_tokens: 0,
             retraction_count: 0,
             reprocessed_prefill_output_tokens_before: Vec::new(),
             reprocessed_prefill_prefix_hit_tokens: Vec::new(),
@@ -1058,7 +1148,7 @@ mod tests {
                 decode_kv_lens: None,
             },
         ];
-        let batch = cost_to_record_batch(&CostLogChunk {
+        let mut batches = cost_to_record_batches(&CostLogChunk {
             pool_tag: "decode",
             entries,
             group_logs,
@@ -1070,6 +1160,8 @@ mod tests {
             slot_inputs: vec![],
         })
         .unwrap();
+        assert_eq!(batches.len(), 1);
+        let batch = batches.remove(0);
         assert_eq!(batch.num_rows(), 2);
         // slot_flops / slot_bytes round-trip as the last two List<f32> columns,
         // slot-aligned to slot_time_ms (both rows have slot_len 3).
@@ -1174,6 +1266,131 @@ mod tests {
         let row1 = groups_col.value(1);
         let g1 = row1.as_any().downcast_ref::<StructArray>().unwrap();
         assert_eq!(g1.len(), 1);
+    }
+
+    /// Four rows, one group and two slot inputs each, `batch_tokens` = row index.
+    fn chunk_with_slot_inputs() -> CostLogChunk {
+        use crate::timing::kernels::SingleGemmKernelInput;
+
+        let rows = 4u32;
+        let mut chunk = CostLogChunk::with_capacity("main", 4, 4, 8, 8);
+        for row in 0..rows {
+            chunk.entries.push(CostLogEntry {
+                worker_id: 0,
+                iter_id: u64::from(row),
+                batch_id: 0,
+                wall_start_ms: f64::from(row),
+                total_time_ms: 1.0,
+                energy_j: 0.0,
+                section: "iter",
+                layer: -1,
+                group_len: 1,
+                slot_len: 2,
+                slot_input_len: 2,
+            });
+            chunk.group_logs.push(GroupInputLog {
+                batch_tokens: row,
+                prefill_tokens: row,
+                decode_request_count: 0,
+                decode_kv_total: 0,
+                prefill_chunk_pairs: vec![(0, row)],
+                decode_query_rows: 0,
+                speculative_geometry: None,
+                decode_kv_lens: None,
+            });
+            for slot in 0..2u32 {
+                chunk.slot_times.push(row as f32);
+                chunk.slot_covs.push(0);
+                chunk.slot_flops.push(0.0);
+                chunk.slot_bytes.push(0.0);
+                chunk.slot_backends.push(0);
+                // Two-digit `m` so every row's JSON is the same length.
+                chunk.slot_inputs.push(
+                    SingleGemmKernelInput {
+                        m: 10 + 2 * row + slot,
+                    }
+                    .into(),
+                );
+            }
+        }
+        chunk
+    }
+
+    fn slot_input_strings(batches: &[RecordBatch]) -> Vec<Vec<String>> {
+        batches
+            .iter()
+            .flat_map(|batch| {
+                let column = batch
+                    .column_by_name("slot_input")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<ListArray>()
+                    .unwrap()
+                    .clone();
+                (0..column.len())
+                    .map(|row| {
+                        let values = column.value(row);
+                        let values = values.as_any().downcast_ref::<StringArray>().unwrap();
+                        values.iter().map(|v| v.unwrap().to_owned()).collect()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cost_log_chunk_splits_between_rows_at_the_slot_input_byte_budget() {
+        let chunk = chunk_with_slot_inputs();
+        let whole = cost_to_record_batches(&chunk).unwrap();
+        assert_eq!(whole.len(), 1);
+        let row_bytes: usize = slot_input_strings(&whole)[0].iter().map(String::len).sum();
+
+        // Room for two rows, not three: the chunk splits 2 + 2.
+        let split = cost_to_record_batches_within(&chunk, 2 * row_bytes + row_bytes / 2).unwrap();
+        assert_eq!(
+            split.iter().map(RecordBatch::num_rows).collect::<Vec<_>>(),
+            vec![2, 2]
+        );
+        assert_eq!(slot_input_strings(&split), slot_input_strings(&whole));
+        // Each batch carries its own rows' groups and per-slot values.
+        for (batch, first_row) in split.iter().zip([0u32, 2]) {
+            let groups = batch
+                .column_by_name("groups")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .unwrap();
+            let times = batch
+                .column_by_name("slot_time_ms")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .unwrap();
+            for row in 0..2 {
+                let group = groups.value(row);
+                let group = group.as_any().downcast_ref::<StructArray>().unwrap();
+                let tokens = group
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<UInt32Array>()
+                    .unwrap();
+                assert_eq!(tokens.values(), &[first_row + row as u32]);
+                let time = times.value(row);
+                let time = time.as_any().downcast_ref::<Float32Array>().unwrap();
+                assert_eq!(time.values(), &[(first_row as usize + row) as f32; 2]);
+            }
+        }
+
+        // A budget below one row's inputs: one batch per row.
+        let per_row = cost_to_record_batches_within(&chunk, row_bytes).unwrap();
+        assert_eq!(per_row.len(), 4);
+    }
+
+    #[test]
+    fn cost_log_row_larger_than_the_byte_budget_is_an_error() {
+        let chunk = chunk_with_slot_inputs();
+        let error = cost_to_record_batches_within(&chunk, 4).unwrap_err();
+        assert!(error.to_string().contains("bytes of slot_input"), "{error}");
     }
 
     #[test]

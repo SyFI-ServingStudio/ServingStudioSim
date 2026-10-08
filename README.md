@@ -133,9 +133,9 @@ uv run cargo build --release --workspace
 Run Python and Cargo commands through `uv run` from the repository root so the
 simulator's embedded Python uses that environment.
 
-### 2. Run Llama 3 8B
+### 2. Run Llama 3.1 8B
 
-The included [smoke preset](presets/unified_smoke.yaml) models Llama 3 8B in BF16
+The included [smoke preset](presets/unified_smoke.yaml) models Llama 3.1 8B in BF16
 on one NVIDIA H200. It replays three small requests from
 [`trace/smoke.csv`](trace/smoke.csv) and runs until all requests finish.
 

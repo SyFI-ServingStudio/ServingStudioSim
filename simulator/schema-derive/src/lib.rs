@@ -8,9 +8,7 @@
 //!     (`ModelSpec`, `GroupSpec`, `PoolSpec`, `WorkloadSpec`, `IoSpec`).
 //!   - `#[derive(ProviderSchema)]` on a `#[serde(tag = "type")]` enum →
 //!     `pub const SCHEMA: &[(&str, &[ParamDef])]`, one row per variant: the
-//!     serde-snake_case tag plus that variant's own (non-flatten) field params;
-//!     and `pub const SUPPORTED: &[(&str, &[SupportedRow])]`, the variant's
-//!     `#[supported(param = [values], ...)]` rows (`schema::supported`).
+//!     serde-snake_case tag plus that variant's own (non-flatten) field params.
 //!
 //! Name + wire type are inferred from the field's Rust type; the description is
 //! the field's `///` doc comment. Everything serde/clap cannot express rides on
@@ -19,9 +17,6 @@
 //!                                     sub-trees: `groups`, `arch`, `worker`).
 //!   - `#[param(default = LIT)]`    → `.default_<kind>(LIT)`.
 //!   - `#[param(cache_key)]`        → `.cache_key()`.
-//!   - `#[param(set_when_predicting)]` → `.set_when_predicting()` (a traffic
-//!                                     param such as MoE `routing`, whose
-//!                                     default is not a representative choice).
 //!   - `#[param(choices = CONST)]`  → `.choices(&CONST)`.
 //!   - `#[param(string)]`           → treat the field as a `string` param even
 //!                                     though its Rust type is a foreign enum
@@ -34,7 +29,7 @@
 //! also carries `#[serde(default)]` — in that case (and for any other type
 //! tagged `#[serde(default)]`) the param is marked `.optional()`, matching
 //! serde's "absent = Default::default()" semantics (e.g. `Vec<f32>` defaults to
-//! the empty list).
+//! the empty list). A `Vec<[int; 2]>` is an `int_pair_list`.
 
 use proc_macro::TokenStream;
 use quote::{quote, ToTokens};
@@ -67,7 +62,6 @@ struct ParamAttr {
     skip: bool,
     force_string: bool,
     cache_key: bool,
-    set_when_predicting: bool,
     default: Option<Lit>,
     choices: Option<Expr>,
 }
@@ -104,7 +98,7 @@ pub fn derive_param_struct(input: TokenStream) -> TokenStream {
 
 // ── enum derive → `SCHEMA` ──────────────────────────────────────────────────
 
-#[proc_macro_derive(ProviderSchema, attributes(param, supported))]
+#[proc_macro_derive(ProviderSchema, attributes(param))]
 pub fn derive_provider_schema(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     let name = &input.ident;
@@ -116,13 +110,8 @@ pub fn derive_provider_schema(input: TokenStream) -> TokenStream {
 
     let mut errors = Vec::new();
     let mut rows = Vec::new();
-    let mut supported = Vec::new();
     for v in variants {
         let tag = snake_case(&v.ident.to_string());
-        match supported_rows(&v.attrs) {
-            Ok(r) => supported.push(quote! { ( #tag, &[ #( #r ),* ] ) }),
-            Err(e) => errors.push(e),
-        }
         let fields = match &v.fields {
             Fields::Named(named) => named.named.iter().collect::<Vec<_>>(),
             Fields::Unit => Vec::new(),
@@ -146,106 +135,9 @@ pub fn derive_provider_schema(input: TokenStream) -> TokenStream {
         impl #impl_generics #name #ty_generics #where_clause {
             pub const SCHEMA: &'static [(&'static str, &'static [::simulator::schema::ParamDef])] =
                 &[ #( #rows ),* ];
-            pub const SUPPORTED: &'static [(&'static str, &'static [::simulator::schema::SupportedRow])] =
-                &[ #( #supported ),* ];
         }
     }
     .into()
-}
-
-// ── `#[supported(...)]` rows on a variant ───────────────────────────────────
-
-/// Each `#[supported(name = [lit, ...], ...)]` attribute → one `SupportedRow`.
-/// A list holds literals of one kind: integers, strings or bools. Whether each name is a
-/// param of the arch is checked by a test over the emitted schema, since the
-/// flattened `ModelSpec` fields are not visible here.
-fn supported_rows(attrs: &[Attribute]) -> syn::Result<Vec<proc_macro2::TokenStream>> {
-    let mut rows = Vec::new();
-    for a in attrs {
-        if !a.path().is_ident("supported") {
-            continue;
-        }
-        let nested = a.parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated)?;
-        let mut names = Vec::new();
-        let mut entries = Vec::new();
-        for m in nested {
-            let nv = match m {
-                Meta::NameValue(nv) => nv,
-                other => {
-                    return Err(syn::Error::new(
-                        other.span(),
-                        "supported: expected `param = [values]`",
-                    ))
-                }
-            };
-            let name = nv
-                .path
-                .get_ident()
-                .ok_or_else(|| syn::Error::new(nv.path.span(), "supported: expected a param name"))?
-                .to_string();
-            if names.contains(&name) {
-                return Err(syn::Error::new(
-                    nv.path.span(),
-                    "supported: param listed twice",
-                ));
-            }
-            let Expr::Array(array) = &nv.value else {
-                return Err(syn::Error::new(
-                    nv.value.span(),
-                    "supported: values must be a `[...]` list",
-                ));
-            };
-            let mut ints = Vec::new();
-            let mut strs = Vec::new();
-            let mut bools = Vec::new();
-            for e in &array.elems {
-                match e {
-                    Expr::Lit(ExprLit {
-                        lit: Lit::Int(i), ..
-                    }) => ints.push(i.clone()),
-                    Expr::Lit(ExprLit {
-                        lit: Lit::Str(s), ..
-                    }) => strs.push(s.clone()),
-                    Expr::Lit(ExprLit {
-                        lit: Lit::Bool(b), ..
-                    }) => bools.push(b.clone()),
-                    other => {
-                        return Err(syn::Error::new(
-                            other.span(),
-                            "supported: values must be integer, string or bool literals",
-                        ))
-                    }
-                }
-            }
-            let values = match (ints.is_empty(), strs.is_empty(), bools.is_empty()) {
-                (false, true, true) => {
-                    quote! { ::simulator::schema::SupportedValues::Int(&[ #( #ints ),* ]) }
-                }
-                (true, false, true) => {
-                    quote! { ::simulator::schema::SupportedValues::Str(&[ #( #strs ),* ]) }
-                }
-                (true, true, false) => {
-                    quote! { ::simulator::schema::SupportedValues::Bool(&[ #( #bools ),* ]) }
-                }
-                (true, true, true) => {
-                    return Err(syn::Error::new(array.span(), "supported: empty value list"))
-                }
-                _ => {
-                    return Err(syn::Error::new(
-                        array.span(),
-                        "supported: mixes integer, string and bool values",
-                    ))
-                }
-            };
-            entries.push(quote! { ( #name, #values ) });
-            names.push(name);
-        }
-        if entries.is_empty() {
-            return Err(syn::Error::new(a.span(), "supported: empty row"));
-        }
-        rows.push(quote! { ::simulator::schema::SupportedRow(&[ #( #entries ),* ]) });
-    }
-    Ok(rows)
 }
 
 // ── shared: one field → a `ParamDef` builder chain ──────────────────────────
@@ -325,9 +217,6 @@ fn param_defs<'a>(
         if attr.cache_key {
             chain = quote! { #chain.cache_key() };
         }
-        if attr.set_when_predicting {
-            chain = quote! { #chain.set_when_predicting() };
-        }
         let desc = doc_string(&f.attrs);
         chain = quote! { #chain.desc(#desc) };
         defs.push(chain);
@@ -343,6 +232,21 @@ fn classify(ty: &Type) -> syn::Result<Classified> {
         return Ok(c);
     }
     if let Some(inner) = generic_inner(ty, "Vec") {
+        // `Vec<[int; 2]>`: a list of pairs.
+        if let Type::Array(pair) = inner {
+            if is_len_two(&pair.len) && matches!(scalar_kind(&pair.elem), Ok(Scalar::Int)) {
+                return Ok(Classified {
+                    ctor: "int_pair_list",
+                    default_method: "",
+                    optional: false,
+                    is_bool: false,
+                });
+            }
+            return Err(syn::Error::new(
+                ty.span(),
+                "param: the only array element a list takes is `[int; 2]`",
+            ));
+        }
         return Ok(Classified {
             ctor: list_ctor(scalar_kind(inner)?, inner)?,
             default_method: "",
@@ -413,6 +317,10 @@ fn list_ctor(s: Scalar, ty: &Type) -> syn::Result<&'static str> {
     }
 }
 
+fn is_len_two(len: &Expr) -> bool {
+    matches!(len, Expr::Lit(ExprLit { lit: Lit::Int(n), .. }) if n.base10_digits() == "2")
+}
+
 fn last_ident(ty: &Type) -> Option<String> {
     if let Type::Path(tp) = ty {
         return tp.path.segments.last().map(|s| s.ident.to_string());
@@ -481,9 +389,6 @@ fn parse_param_attr(attrs: &[Attribute]) -> syn::Result<ParamAttr> {
                 Meta::Path(p) if p.is_ident("skip") => out.skip = true,
                 Meta::Path(p) if p.is_ident("string") => out.force_string = true,
                 Meta::Path(p) if p.is_ident("cache_key") => out.cache_key = true,
-                Meta::Path(p) if p.is_ident("set_when_predicting") => {
-                    out.set_when_predicting = true
-                }
                 Meta::NameValue(nv) if nv.path.is_ident("default") => {
                     if let Expr::Lit(ExprLit { lit, .. }) = nv.value {
                         out.default = Some(lit);

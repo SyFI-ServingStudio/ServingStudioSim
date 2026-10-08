@@ -158,7 +158,9 @@ def _get_extension() -> Any:
 def default_l2_flush_bytes(device: int | str | Any = 0) -> int:
     torch_mod = _require_torch()
     props = torch_mod.cuda.get_device_properties(device)
-    l2_size = getattr(props, "l2_cache_size", 0) or 0
+    # Torch spells it ``L2_cache_size``. Before this was fixed the lowercase
+    # lookup always missed, so rows profiled earlier used the 64 MiB floor.
+    l2_size = getattr(props, "L2_cache_size", 0) or 0
     return max(64 * 1024 * 1024, 2 * int(l2_size))
 
 

@@ -1,4 +1,5 @@
-"""Read-only data service for the external ServingStudio site.
+"""Data service for the external ServingStudio site: kernels, models,
+predictions and simulations.
 
 The Intro site's pages call this service through the site's own origin
 (``/api/public/v1``); the site proxies those paths here. It is separate from

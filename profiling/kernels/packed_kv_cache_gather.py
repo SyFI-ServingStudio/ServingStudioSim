@@ -14,6 +14,7 @@ from profiling.db.registry import (
     RunnerRef,
     register,
 )
+from profiling.kernels.kv_compress_store import FP8_DS_MLA_ROW_BYTES
 
 KIND = "packed_kv_cache_gather"
 
@@ -55,7 +56,7 @@ DOC = KernelDoc(
     formula=(
         "G = Σi (gather_lens[i] if supplied else seq_lens[i]); R = len(seq_lens)",
         "TFLOPS = G·448 / time",
-        "GB/s = [G·(584 + 4 + 512·2) + 4·R·(2 if gather_lens else 1)] / time",
+        f"GB/s = [G·({FP8_DS_MLA_ROW_BYTES} + 4 + 512·2) + 4·R·(2 if gather_lens else 1)] / time",
     ),
     default_metric="memory_bandwidth_gbps",
     method=(
@@ -84,10 +85,11 @@ register(
         args_schema=PackedKvCacheGatherArgs,
         metric_family=MetricFamily.COMPUTE,
         batch_outlier_policy=BatchOutlierPolicy(),
+        # FP8 e4m3 conversion needs SM89+.
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
             kv=frozenset({DType.FP8_E4M3}),
-            gpus=frozenset({"NVIDIA H200"}),
+            min_compute_capability=(8, 9),
         ),
         subprocess_env="vllm_env",
         doc=BackendDoc(

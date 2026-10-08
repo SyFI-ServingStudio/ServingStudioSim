@@ -23,10 +23,11 @@ use crate::io::{
 use crate::kernel_query::repo_root;
 use crate::session::{col, collect, require_columns, value_f32_list, value_f64, value_string};
 use crate::trace::manifest::{
-    fold_mean, node_time, FlatCostNode, Manifest, ManifestDoc, ManifestSection,
+    node_time, BalancedFold, FlatCostNode, Manifest, ManifestDoc, ManifestSection,
 };
 
 use super::floors::{self, SemanticWork};
+use super::pipeline;
 use super::spec::{load_gpu_spec, GpuSpec};
 
 type WorkerKey = (String, u16);
@@ -671,6 +672,7 @@ fn validate_manifest(manifest: &Manifest) -> Result<()> {
             }
             FlatCostNode::Sum { children }
             | FlatCostNode::Max { children, .. }
+            | FlatCostNode::Parallel { children, .. }
             | FlatCostNode::Scale { children, .. }
                 if children.start > children.end || children.end > manifest.nodes.len() =>
             {
@@ -692,6 +694,7 @@ fn node_children(manifest: &Manifest, node_idx: usize) -> Result<Vec<usize>> {
         FlatCostNode::Leaf(_) => return Ok(Vec::new()),
         FlatCostNode::Sum { children }
         | FlatCostNode::Max { children, .. }
+        | FlatCostNode::Parallel { children, .. }
         | FlatCostNode::Scale { children, .. } => children.clone(),
     };
     if range.start > range.end || range.end > manifest.nodes.len() {
@@ -750,6 +753,7 @@ fn node_kind(node: &FlatCostNode) -> &'static str {
         FlatCostNode::Leaf(_) => "leaf",
         FlatCostNode::Sum { .. } => "sum",
         FlatCostNode::Max { .. } => "max",
+        FlatCostNode::Parallel { .. } => "parallel",
         FlatCostNode::Scale { .. } => "scale",
     }
 }
@@ -983,8 +987,8 @@ fn compute_row_rungs(
         .map(|value| (value * 1e6).round() as i64)
         .collect::<Vec<_>>();
     let r0_ms = ancestor_scale * node_time(manifest, node_idx, &slot_ns) as f64 / 1e6;
-    let leaf_weights = selected_leaf_weights(manifest, node_idx, ancestor_scale);
-    let has_communication = leaf_weights.iter().any(|(slot, _)| {
+    let leaf_slots = selected_leaf_slots(manifest, node_idx);
+    let has_communication = leaf_slots.iter().any(|slot| {
         manifest
             .slots
             .get(*slot)
@@ -1002,8 +1006,8 @@ fn compute_row_rungs(
             r5_gpu_s: None,
         });
     }
-    let mut r5_ms = 0.0;
-    for (slot, weight) in leaf_weights {
+    let mut leaf_r5_ms = vec![0.0; manifest.slots.len()];
+    for slot in leaf_slots {
         let leaf = &manifest.slots[slot];
         let peak_tflops = hardware.spec.peak_tflops(leaf_dtype(&leaf.kernel_config));
         let bandwidth_gbps = hardware.spec.mem_bandwidth_gbps;
@@ -1016,24 +1020,39 @@ fn compute_row_rungs(
         let compute_ms = row.slot_flops[slot] / (peak_tflops * 1e12) * 1e3;
         let memory_ms = row.slot_bytes[slot] / (bandwidth_gbps * 1e9) * 1e3;
         // Do not let a stale/coarse hardware catalog exceed the measured leaf.
-        r5_ms += weight * compute_ms.max(memory_ms).min(row.slot_time_ms[slot]);
+        leaf_r5_ms[slot] = compute_ms.max(memory_ms).min(row.slot_time_ms[slot]);
     }
+    let [r5_ms] = BalancedFold::<1>::default().fold(
+        manifest,
+        node_idx,
+        ancestor_scale,
+        &|slot| [leaf_r5_ms[slot]],
+        &mut |_, _| {},
+    );
     Ok(RowRungs {
         r0_gpu_s: r0_ms * gpu_count / 1e3,
         r5_gpu_s: Some(r5_ms * gpu_count / 1e3),
     })
 }
 
-fn selected_leaf_weights(
-    manifest: &Manifest,
-    node_idx: usize,
-    ancestor_scale: f64,
-) -> Vec<(usize, f64)> {
-    let mut weights = Vec::new();
-    fold_mean(manifest, node_idx, ancestor_scale, &mut |slot, weight| {
-        weights.push((slot, weight));
-    });
-    weights
+/// Slots of every leaf under `node_idx`, in tree order.
+fn selected_leaf_slots(manifest: &Manifest, node_idx: usize) -> Vec<usize> {
+    fn collect(manifest: &Manifest, node_idx: usize, slots: &mut Vec<usize>) {
+        match &manifest.nodes[node_idx] {
+            FlatCostNode::Leaf(slot) => slots.push(*slot),
+            FlatCostNode::Sum { children }
+            | FlatCostNode::Max { children, .. }
+            | FlatCostNode::Parallel { children, .. }
+            | FlatCostNode::Scale { children, .. } => {
+                for child in children.clone() {
+                    collect(manifest, child, slots);
+                }
+            }
+        }
+    }
+    let mut slots = Vec::new();
+    collect(manifest, node_idx, &mut slots);
+    slots
 }
 
 fn leaf_dtype(config: &Value) -> &str {
@@ -1050,6 +1069,9 @@ fn is_communication_kind(kind: &str) -> bool {
             | "all_gather"
             | "reduce_scatter"
             | "all_to_all"
+            | "moe_ep_all_gather"
+            | "moe_ep_quantized_all_gather"
+            | "moe_ep_reduce_scatter"
             | "broadcast"
             | "gather"
             | "scatter"
@@ -1074,6 +1096,9 @@ async fn compute_semantic_floors(
     let root = repo_root().context("repository root is required for location maps")?;
     let maps = load_location_maps(&root)?;
     let labels = floors::compute_saturated_run_labels(ctx, log_dir, 1).await?;
+    // A pipeline stage's label is its own share of the model, mapped through its
+    // part of the whole-pipeline map.
+    let stages = pipeline::pipeline_stages(manifests)?;
 
     let mut mapping_ids = BTreeSet::new();
     let mut semantic_names = BTreeSet::new();
@@ -1100,7 +1125,12 @@ async fn compute_semantic_floors(
                 )
             })?;
         let manifest_doc = &manifests[&occurrence.worker];
-        let map = select_location_map(&maps, &pool_spec.arch_type, manifest_doc)?;
+        let map = select_location_map(
+            &maps,
+            &pool_spec.arch_type,
+            manifest_doc,
+            stages.contains_key(&occurrence.worker),
+        )?;
         mapping_ids.insert(map.mapping_id.clone());
         let hardware_key = (
             pool_spec.arch_type.clone(),
@@ -1223,10 +1253,13 @@ fn load_location_maps(root: &Path) -> Result<Vec<LocationMap>> {
     Ok(maps)
 }
 
+/// The map whose locations are exactly the worker's; a pipeline stage's map need
+/// only contain its locations (see `location.rs`).
 fn select_location_map<'a>(
     maps: &'a [LocationMap],
     arch_type: &str,
     manifest_doc: &ManifestDoc,
+    pipeline_stage: bool,
 ) -> Result<&'a LocationMap> {
     let expected = manifest_doc
         .sections
@@ -1243,11 +1276,16 @@ fn select_location_map<'a>(
                 .any(|candidate| candidate == arch_type)
         })
         .filter(|map| {
-            map.locations
+            let mapped = map
+                .locations
                 .iter()
                 .map(|location| location.location.as_str())
-                .collect::<BTreeSet<_>>()
-                == expected
+                .collect::<BTreeSet<_>>();
+            if pipeline_stage {
+                mapped.is_superset(&expected)
+            } else {
+                mapped == expected
+            }
         })
         .collect::<Vec<_>>();
     match candidates.as_slice() {
@@ -1466,19 +1504,15 @@ mod tests {
     }
 
     #[test]
-    fn scale_selection_recurses_to_all_descendant_leaves_and_scales_weights() {
+    fn scale_selection_recurses_to_all_descendant_leaves() {
         let manifests = BTreeMap::from([(("predict".to_owned(), 0), sample_doc())]);
         let selector = Selector::parse(Some("iter/1"), None).unwrap();
         let selection = resolve_selection(&selector, &manifests).unwrap();
         let occurrence = &selection.occurrences[0];
         assert_eq!(selection.signature.leaves, ["q_norm", "k_norm"]);
         assert_eq!(occurrence.ancestor_scale, 1.0);
-        let weights = selected_leaf_weights(
-            &sample_manifest(),
-            occurrence.node_idx,
-            occurrence.ancestor_scale,
-        );
-        assert_eq!(weights, vec![(1, 2.0), (2, 2.0)]);
+        let slots = selected_leaf_slots(&sample_manifest(), occurrence.node_idx);
+        assert_eq!(slots, vec![1, 2]);
     }
 
     #[test]

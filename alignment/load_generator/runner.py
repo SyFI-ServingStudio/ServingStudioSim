@@ -13,6 +13,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 REQ_FRONTEND_ROOT = Path(__file__).resolve().parent / "req-frontend"
 REPLAY_MANIFEST = REQ_FRONTEND_ROOT / "Cargo.toml"
 SESSION_RUNNER = REQ_FRONTEND_ROOT / "target" / "release" / "session_runner"
+# Draws or materializes a canonical trace (`tracegen describe` lists its knobs).
+TRACEGEN = REQ_FRONTEND_ROOT / "target" / "release" / "tracegen"
 
 
 @dataclass(frozen=True)

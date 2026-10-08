@@ -84,10 +84,11 @@ register(
     KernelProfilerSpec(
         kernel_kind=KIND,
         backend="flashinfer_trtllm_fp8",
+        # TRTLLM-GEN sparse MLA (fmhaSm100) runs only on the SM10x family.
         supports=BackendSupport(
             compute=frozenset({DType.FP8_E4M3}),
             kv=frozenset({DType.FP8_E4M3}),
-            gpus=frozenset({"NVIDIA B200"}),
+            sm_targets=frozenset({"sm_100f"}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.attention.dsa_sparse_mla_prefill",
@@ -115,7 +116,7 @@ register(
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
             kv=frozenset({DType.BF16}),
-            gpus=frozenset({"MI300X"}),
+            arch_targets=frozenset({"CDNA3"}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.attention.dsa_sparse_mla_prefill_rocm_triton",

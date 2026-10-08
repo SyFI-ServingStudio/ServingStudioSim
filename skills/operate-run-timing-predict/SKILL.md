@@ -62,10 +62,14 @@ uv run python -m launcher timing-predict presets/<config>.json
 
 Multiple configs may be passed in one call, for example the two AFD halves.
 Supported flags are `--build-type <build-type>` (default `release`),
-`--no-analyze`, `--dry-run`, `--register-kernel-configs`, and `--no-gpu`. There
-is no `--override`. A real run registers the kernel configs it asks profile.db
-for in the kernel-config registry; `--register-kernel-configs` does only that,
-with a dry-run and no GPU.
+`--no-analyze`, `--analyzer-essential-only`, `--no-plot`, `--dry-run`, and
+`--no-gpu`. There is no `--override`.
+
+By default the full analysis runs: every applicable Analyzer subject, the trace,
+and the per-case iteration breakdown. `--analyzer-essential-only` runs only the
+iteration breakdown and `kernel-time-share`, in milliseconds instead of about a
+second; `--no-analyze` runs neither. `--no-plot` keeps the full analysis but
+draws no PNGs.
 
 Run `--dry-run` first on a new config. It builds the model, checks every case
 against it, and prints one line per kernel with the `profile.db` specs a real
@@ -94,8 +98,10 @@ cost artifacts under `log_dir`. Important outputs include:
 
 - `prediction.cases.json`: snapshotted cases;
 - `raw/cost_log/worker_predict_0.parquet` and its manifest;
-- `reports/iter_breakdown.ans`: per-case CostTree totals and leaves when analysis
-  was enabled;
+- `reports/iter_breakdown.ans` and `payloads/iter_breakdown.json`: per-case
+  CostTree totals and leaves, unless `--no-analyze`;
+- `payloads/kernel_time_share_composition.json`: kernels ranked by their share,
+  with a rollup by kernel kind, unless `--no-analyze`;
 - trace and plot artifacts produced by the normal analysis path.
 
 A timing-predict directory is explicitly cataloged as `timing_predict`; it does

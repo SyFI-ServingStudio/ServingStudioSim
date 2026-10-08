@@ -21,7 +21,7 @@ registers its own spec -> the same ``args_schema`` and table, routing to its own
 before calling, so the runner is selected by backend, not told it). Unsupported
 combos raise ``ProfilerNotImplemented`` at profile time: ``cudnn+fp8``,
 ``cudnn`` causal with ``prefix_len>0``, and ``trt`` entirely (trtllm-gen has no
-ragged kernel and is B200-only — kept registered for a future paged/B200 path).
+ragged kernel and is SM10x-only — kept registered for a future paged SM10x path).
 
 Shape split: static Config = ``(num_qo_heads, num_kv_heads, head_dim, q_dtype,
 kv_dtype, o_dtype)``; runtime 2D sweep Input = ``(prefix_len, append_len)``.
@@ -56,8 +56,8 @@ _BACKENDS = ("fa2", "fa3", "trt", "cudnn")
 #   fa2   : bf16 compute, but fp8 KV is fine (bf16-q / fp8-kv is a prod config).
 #   fa3   : fp8 compute + fp8 KV.
 #   cudnn : bf16 only on both axes (no fp8 at all).
-#   trt   : fp8, Blackwell-only (gpus-gated to B200; also runtime-gated on the
-#           ragged path, which is not modeled here).
+#   trt   : fp8, trtllm-gen kernels for the SM10x family only (sm_100f; also
+#           runtime-gated on the ragged path, which is not modeled here).
 _SUPPORTS = {
     "fa2": BackendSupport(
         compute=frozenset({DType.BF16}), kv=frozenset({DType.BF16, DType.FP8_E4M3})
@@ -72,7 +72,7 @@ _SUPPORTS = {
     "trt": BackendSupport(
         compute=frozenset({DType.FP8_E4M3}),
         kv=frozenset({DType.FP8_E4M3}),
-        gpus=frozenset({"NVIDIA B200"}),  # trtllm-gen kernels are Blackwell-only
+        sm_targets=frozenset({"sm_100f"}),
     ),
 }
 

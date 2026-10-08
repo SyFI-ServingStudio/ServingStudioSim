@@ -77,7 +77,8 @@ def test_guard_shape_keeps_the_mixed_topology_bounded() -> None:
 @pytest.mark.parametrize(
     "override",
     [
-        {"head_dim": 64},
+        {"head_dim": 0},
+        {"head_dim": 257},  # FLA chunk kernels assert K <= 256
         {"dtype": "fp16"},
         {"num_decode_sequences": 2048},  # pure decode: fused_recurrent_kda, not this path
         {"max_sequence_length": 0},
@@ -89,6 +90,12 @@ def test_rejects_shapes_outside_the_verified_path(override: dict) -> None:
     # Defect: silently profiling a path production never takes.
     with pytest.raises(ValueError):
         runner.validate_args(**{**_CAPTURE, **override})
+
+
+@pytest.mark.parametrize("head_dim", [64, 96, 128, 256])
+def test_accepts_head_dims_up_to_the_kernel_bound(head_dim: int) -> None:
+    # Defect: refusing an unmeasured head dim the chunk kernels launch.
+    assert runner.validate_args(**{**_CAPTURE, "head_dim": head_dim}).head_dim == head_dim
 
 
 @pytest.mark.parametrize(

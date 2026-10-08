@@ -60,6 +60,11 @@
 //! the observed layer count; FFN checks use `pool_tag=ffn` and expect
 //! `Σ[p + rp + max(d-1-r,0)] × (layers + 3)` section-token passes.
 //!
+//! A `deployment=pp` request passes every stage of its pipeline, and each stage
+//! logs the same microbatch, so every check sums all stages' rows and multiplies
+//! request-side expected work by the pipeline depth (`pp_size` of the stage
+//! pool's arch). A stage that dropped or repeated a microbatch fails the check.
+//!
 //! When EP/HP multi-group lands, the per-group reduction needs the same revisit
 //! as `batch::composition` (sum for partition-style, pick-one for replicate-style
 //! HP) — one group today (unified dense asserts a single HP group).
@@ -108,22 +113,68 @@ const WARN_PCT: f64 = 5.0;
 enum WorkloadMode {
     Iterwise,
     Afd,
+    /// Pipeline stages: each stage logs every microbatch once.
+    Pp {
+        stages: usize,
+    },
 }
 
 impl WorkloadMode {
-    fn from_deployment(deployment: Option<&str>) -> Self {
-        match deployment {
+    fn from_run(deployment: Option<&str>, params: Option<&Value>) -> Result<Self> {
+        Ok(match deployment {
             Some("afd") => Self::Afd,
+            Some("pp") => Self::Pp {
+                stages: pipeline_depth(params)?,
+            },
             _ => Self::Iterwise,
-        }
+        })
     }
 
     fn label(self) -> &'static str {
         match self {
             Self::Iterwise => "iterwise",
             Self::Afd => "afd-layered",
+            Self::Pp { .. } => "pp-stages",
         }
     }
+
+    /// How many times one request's attention work appears in `cost_log`.
+    fn layer_multiplier(self, num_layers: usize) -> f64 {
+        match self {
+            Self::Iterwise => 1.0,
+            Self::Afd => num_layers as f64,
+            Self::Pp { stages } => stages as f64,
+        }
+    }
+
+    /// How many times one request's FFN token pass appears in `cost_log`.
+    fn ffn_multiplier(self, num_layers: usize) -> f64 {
+        match self {
+            Self::Iterwise => 1.0,
+            Self::Afd => num_layers as f64 + 3.0,
+            Self::Pp { stages } => stages as f64,
+        }
+    }
+}
+
+/// `pp_size` of the `stage` pool's arch: every request passes that many stages.
+fn pipeline_depth(params: Option<&Value>) -> Result<usize> {
+    let groups = params
+        .and_then(|p| p["pools"]["stage"]["groups"].as_array())
+        .ok_or_else(|| anyhow!("pp run has no `pools.stage.groups` in params.json"))?;
+    let depths: BTreeSet<u64> = groups
+        .iter()
+        .map(|group| {
+            group["arch"]["pp_size"]
+                .as_u64()
+                .ok_or_else(|| anyhow!("pp stage group has no integer `arch.pp_size`"))
+        })
+        .collect::<Result<_>>()?;
+    ensure!(
+        depths.len() == 1,
+        "pp stage groups disagree on pp_size: {depths:?}"
+    );
+    Ok(*depths.first().unwrap() as usize)
 }
 
 /// Run-wide actuals summed from `cost_log` groups. f64 is exact for these integer
@@ -184,11 +235,12 @@ fn uses_speculative_worker(params: &Value) -> bool {
 
 pub async fn run_workload(ctx: &SessionContext, log_dir: &Path) -> Result<(Value, Value)> {
     let params_path = resolve_artifact_path(log_dir, "params.json");
-    let mut speculative = false;
-    if params_path.is_file() {
-        let params: Value = serde_json::from_reader(std::fs::File::open(params_path)?)?;
-        speculative = uses_speculative_worker(&params);
-    }
+    let params: Option<Value> = if params_path.is_file() {
+        Some(serde_json::from_reader(std::fs::File::open(params_path)?)?)
+    } else {
+        None
+    };
+    let speculative = params.as_ref().is_some_and(uses_speculative_worker);
     if !register_cost_log(ctx, log_dir).await? {
         let reason = "cost_log/ dir not found";
         return Ok((
@@ -209,7 +261,7 @@ pub async fn run_workload(ctx: &SessionContext, log_dir: &Path) -> Result<(Value
     require_columns(ctx, "slo", SLO_COLS).await?;
 
     let deployment = read_deployment(log_dir);
-    let mode = WorkloadMode::from_deployment(deployment.as_deref());
+    let mode = WorkloadMode::from_run(deployment.as_deref(), params.as_ref())?;
     let actual = collect_actual(ctx, mode).await?;
     let mut expected = collect_expected(ctx, mode, actual.num_layers).await?;
 
@@ -272,14 +324,8 @@ pub async fn run_workload(ctx: &SessionContext, log_dir: &Path) -> Result<(Value
 }
 
 fn checks_for_mode(mode: WorkloadMode, actual: &Actual, expected: &Expected) -> Vec<Value> {
-    let layer_multiplier = match mode {
-        WorkloadMode::Iterwise => 1.0,
-        WorkloadMode::Afd => actual.num_layers as f64,
-    };
-    let ffn_multiplier = match mode {
-        WorkloadMode::Iterwise => 1.0,
-        WorkloadMode::Afd => actual.num_layers as f64 + 3.0,
-    };
+    let layer_multiplier = mode.layer_multiplier(actual.num_layers);
+    let ffn_multiplier = mode.ffn_multiplier(actual.num_layers);
     let boundary_decode_requests = expected.boundary_decode_requests as f64;
     let decode_boundary_allowance = boundary_decode_requests * layer_multiplier;
     let ffn_boundary_allowance = boundary_decode_requests * ffn_multiplier;
@@ -293,6 +339,7 @@ fn checks_for_mode(mode: WorkloadMode, actual: &Actual, expected: &Expected) -> 
                 WorkloadMode::Iterwise => {
                     "tokens prefilled: Σ cost_log prefill_tokens vs Σ request_slo prefill_processed"
                 }
+                WorkloadMode::Pp { .. } => "PP stage prefill work: Σ cost_log prefill_tokens over stages vs Σ p × stages",
                 WorkloadMode::Afd => {
                     "AFD attention-layer prefill work: Σ attn cost_log prefill_tokens vs Σ p × layers"
                 }
@@ -342,6 +389,7 @@ fn checks_for_mode(mode: WorkloadMode, actual: &Actual, expected: &Expected) -> 
                 WorkloadMode::Iterwise => {
                     "decode forward passes: Σ cost_log decode_request_count vs Σ max(d-1-r,0), r=completed re-prefills"
                 }
+                WorkloadMode::Pp { .. } => "PP stage decode passes: Σ cost_log decode_request_count over stages vs Σ max(d-1-r,0) × stages",
                 WorkloadMode::Afd => {
                     "AFD attention-layer decode passes: Σ attn cost_log decode_request_count vs Σ max(d-1-r,0) × layers"
                 }
@@ -356,6 +404,7 @@ fn checks_for_mode(mode: WorkloadMode, actual: &Actual, expected: &Expected) -> 
                 WorkloadMode::Iterwise => {
                     "tokens through FFN: Σ cost_log batch_tokens vs Σ [p + rp + max(d-1-r,0)]"
                 }
+                WorkloadMode::Pp { .. } => "PP stage token pass: Σ cost_log batch_tokens over stages vs Σ[p + rp + max(d-1-r,0)] × stages",
                 WorkloadMode::Afd => {
                     "AFD FFN section token pass: Σ ffn cost_log batch_tokens vs Σ[p + rp + max(d-1-r,0)] × (layers+3)"
                 }
@@ -370,6 +419,7 @@ fn checks_for_mode(mode: WorkloadMode, actual: &Actual, expected: &Expected) -> 
                 WorkloadMode::Iterwise => {
                     "causal prefill attn work: Σ [a·prefix + a(a+1)/2] vs Σ [p·hit + p(p+1)/2]"
                 }
+                WorkloadMode::Pp { .. } => "PP stage causal prefill work: Σ [a·prefix + a(a+1)/2] vs Σ [p·hit + p(p+1)/2] × stages",
                 WorkloadMode::Afd => {
                     "AFD attention-layer causal prefill work: Σ [a·prefix + a(a+1)/2] vs Σ [p·hit + p(p+1)/2] × layers"
                 }
@@ -384,6 +434,7 @@ fn checks_for_mode(mode: WorkloadMode, actual: &Actual, expected: &Expected) -> 
                 WorkloadMode::Iterwise => {
                     "cold-equivalent causal prefill work: actual + Σ hit(hit+1)/2 vs Σ (fresh+declared)(fresh+declared+1)/2"
                 }
+                WorkloadMode::Pp { .. } => "PP stage cold-equivalent causal prefill work: actual + saved prefix triangle vs immutable cold baseline × stages",
                 WorkloadMode::Afd => {
                     "AFD cold-equivalent causal prefill work: actual + saved prefix triangle vs immutable cold baseline × layers"
                 }
@@ -398,6 +449,7 @@ fn checks_for_mode(mode: WorkloadMode, actual: &Actual, expected: &Expected) -> 
                 WorkloadMode::Iterwise => {
                     "decode KV read: no-retraction baseline minus the ordinary decode read replaced by each completed re-prefill"
                 }
+                WorkloadMode::Pp { .. } => "PP stage decode KV read: Σ cost_log decode_kv_total over stages vs Σ [m·(hit+p) + m(m-1)/2] × stages",
                 WorkloadMode::Afd => {
                     "AFD attention-layer decode KV read: Σ attn cost_log decode_kv_total vs Σ [m·(hit+p) + m(m-1)/2] × layers"
                 }
@@ -409,13 +461,13 @@ fn checks_for_mode(mode: WorkloadMode, actual: &Actual, expected: &Expected) -> 
     ];
 
     let self_actual = match mode {
-        WorkloadMode::Iterwise => actual.batch_tokens,
+        WorkloadMode::Iterwise | WorkloadMode::Pp { .. } => actual.batch_tokens,
         WorkloadMode::Afd => actual.attn_batch_tokens,
     };
     specs.push((
         "cost_log_batch_self_consistency",
         match mode {
-            WorkloadMode::Iterwise => {
+            WorkloadMode::Iterwise | WorkloadMode::Pp { .. } => {
                 "cost_log internal: Σ batch_tokens vs Σ(prefill_tokens + decode_request_count)"
             }
             WorkloadMode::Afd => {
@@ -495,8 +547,9 @@ async fn collect_actual(ctx: &SessionContext, mode: WorkloadMode) -> Result<Actu
     a.iters = count_rows(ctx, "SELECT COUNT(*) AS c FROM cost_log").await?;
 
     match mode {
-        WorkloadMode::Iterwise => {
-            // One row = one iteration; sum every field over the flattened groups.
+        WorkloadMode::Iterwise | WorkloadMode::Pp { .. } => {
+            // One row = one iteration (one stage's microbatch under PP); sum every
+            // field over the flattened groups.
             let batches = collect(ctx, "SELECT groups FROM cost_log").await?;
             for batch in &batches {
                 let gs = groups_struct(groups_list(batch)?)?;
@@ -553,7 +606,7 @@ async fn collect_actual(ctx: &SessionContext, mode: WorkloadMode) -> Result<Actu
 /// labeler roofline needs (prefill KV read + request count). All fields are additive,
 /// so pool / cluster levels are plain rollups of this map. A rollup of every worker
 /// reproduces the run-wide conservation `actual`, which is the cross-check.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct WorkloadTotals {
     pub(crate) matmul_tokens: f64,             // Σ batch_tokens
     pub(crate) prefill_tokens: f64,            // Σ prefill_tokens
@@ -576,7 +629,7 @@ pub(crate) struct WorkloadTotals {
 /// The labeler evaluates each distinct shape once; callers multiply its roofline
 /// result by `occurrences`, preserving batch boundaries without one subprocess row
 /// per iteration.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct WeightedWorkload {
     pub(crate) totals: WorkloadTotals,
     pub(crate) occurrences: u64,
@@ -1289,14 +1342,8 @@ impl Expected {
             }
         }
 
-        let layer_multiplier = match mode {
-            WorkloadMode::Iterwise => 1.0,
-            WorkloadMode::Afd => num_layers as f64,
-        };
-        let ffn_multiplier = match mode {
-            WorkloadMode::Iterwise => 1.0,
-            WorkloadMode::Afd => num_layers as f64 + 3.0,
-        };
+        let layer_multiplier = mode.layer_multiplier(num_layers);
+        let ffn_multiplier = mode.ffn_multiplier(num_layers);
         let completed_reprocessed = input
             .reprocessed_prefills
             .iter()
@@ -1662,6 +1709,55 @@ mod tests {
         let checks = checks_for_mode(WorkloadMode::Iterwise, &actual, &expected);
         assert_eq!(checks.len(), 12);
         assert!(checks.iter().all(|check| check["status"] == "OK"));
+    }
+
+    #[test]
+    fn pp_expects_every_stage_to_log_each_prefill_once() {
+        let params = json!({"deployment": "pp", "pools": {"stage": {"groups": [{
+            "arch": {"type": "glm52_vllm_nvfp4_pp_dsa_moe", "pp_size": 4}
+        }]}}});
+        let mode = WorkloadMode::from_run(Some("pp"), Some(&params)).unwrap();
+        assert_eq!(mode, WorkloadMode::Pp { stages: 4 });
+        assert!(WorkloadMode::from_run(Some("pp"), Some(&json!({}))).is_err());
+
+        let mut expected = Expected::default();
+        expected.add_request(
+            mode,
+            0,
+            RequestSloWorkInput {
+                completed: true,
+                fresh_prompt_tokens: 100.0,
+                declared_prefix_tokens: 0.0,
+                prefix_cache_hit_tokens: Some(0.0),
+                prefill_tokens_processed: 100.0,
+                num_output_tokens: 1.0,
+                reprocessed_prefills: Vec::new(),
+            },
+        );
+        // Four stages each log the 100-token prompt, split into two chunks.
+        let stage_causal = (60.0 * 61.0 / 2.0) + (40.0 * 60.0 + 40.0 * 41.0 / 2.0);
+        let actual = Actual {
+            prefill_tokens: 400.0,
+            attn_batch_tokens: 400.0,
+            batch_tokens: 400.0,
+            causal: 4.0 * stage_causal,
+            ..Actual::default()
+        };
+        let checks = checks_for_mode(mode, &actual, &expected);
+        assert!(checks.iter().all(|check| check["status"] == "OK"));
+
+        // A stage that skipped one chunk is caught.
+        let short = Actual {
+            prefill_tokens: 360.0,
+            batch_tokens: 360.0,
+            ..actual
+        };
+        let checks = checks_for_mode(mode, &short, &expected);
+        let prefill = checks
+            .iter()
+            .find(|check| check["name"] == "prefill_tokens")
+            .unwrap();
+        assert_ne!(prefill["status"], "OK");
     }
 
     #[test]

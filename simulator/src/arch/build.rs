@@ -21,23 +21,27 @@ use crate::arch::contract::SpeculativeUnifiedModel;
 use crate::arch::model_cfg::ModelCfg;
 use crate::arch::moe_model_cfg::MoeModelCfg;
 use crate::arch::{
-    deepseek_v4_vllm, glm52_sglang_nvfp4_tp_dsa_moe, glm52_vllm_dsa_moe, glm52_vllm_nvfp4_dsa_moe,
-    glm53_flash_vllm_fp8_kda_dsa_moe, glm53_vllm_nvfp4_dsa_moe_dflash2, llama3_dense,
+    deepseek_v41_vllm, deepseek_v4_vllm, glm52_sglang_nvfp4_tp_dsa_moe, glm52_vllm_dsa_moe,
+    glm52_vllm_nvfp4_dp_attn_dsa_moe, glm52_vllm_nvfp4_dsa_moe, glm52_vllm_nvfp4_pp_dsa_moe,
+    glm53_flash_vllm_fp8_dp_attn_ep_moe, glm53_flash_vllm_fp8_kda_dsa_moe,
+    glm53_flash_vllm_fp8_pp_kda_dsa_moe, glm53_vllm_nvfp4_dsa_moe_dflash2, llama3_dense,
     llama3_dense_tp, llama3_dp_attn_tp_ffn, qwen36_local, qwen3_attn_layerwise,
     qwen3_ffn_moe_layerwise, qwen3_fp8_ffn_moe_layerwise, qwen3_moe_dp_attn_ep_ffn,
     qwen3_moe_fp8_dp_attn_ep_ffn, qwen3_vllm_moe_dp_attn_ep_ffn, AttnLayerwiseModel,
-    DeepseekV4ModelCfg, DeepseekV4VllmModel, DeepseekV4VllmParallel, DenseParallel,
-    DenseTpParallel, Dflash2DraftResolved, DpAttnTpFfnParallel, FfnLayerwiseModel, Glm52ModelCfg,
-    Glm52MtpMode, Glm52SglangNvfp4TpDsaMoeModel, Glm52SglangNvfp4TpDsaMoeParallel,
-    Glm52VllmDsaMoeModel, Glm52VllmDsaMoeParallel, Glm52VllmNvfp4DsaMoeModel,
-    Glm52VllmNvfp4DsaMoeParallel, Glm52VllmNvfp4DsaMoeSpeculativeModel, Glm53FlashModelCfg,
-    Glm53FlashVllmModel, Glm53FlashVllmParallel, Glm53VllmNvfp4DsaMoeDflash2Model,
-    IterwiseUnifiedModel, Llama3DenseModel, Llama3DenseTpModel, Llama3DpAttnTpFfnModel,
-    Qwen36LocalModel, Qwen36LocalParallel, Qwen36ModelCfg, Qwen3AttnLayerwiseModel,
-    Qwen3AttnParallel, Qwen3FfnMoeLayerwiseModel, Qwen3FfnMoeParallel,
-    Qwen3Fp8FfnMoeLayerwiseModel, Qwen3Fp8FfnMoeParallel, Qwen3MoeDpAttnEpFfnModel,
-    Qwen3MoeFp8DpAttnEpFfnModel, Qwen3MoeFp8Parallel, Qwen3MoeParallel,
-    Qwen3VllmMoeDpAttnEpFfnModel, Qwen3VllmMoeParallel,
+    DeepseekV41ModelCfg, DeepseekV41VllmModel, DeepseekV41VllmParallel, DeepseekV4ModelCfg,
+    DeepseekV4VllmModel, DeepseekV4VllmParallel, DenseParallel, DenseTpParallel,
+    Dflash2DraftResolved, DpAttnTpFfnParallel, FfnLayerwiseModel, Glm52ModelCfg, Glm52MtpMode,
+    Glm52SglangNvfp4TpDsaMoeModel, Glm52SglangNvfp4TpDsaMoeParallel, Glm52VllmDsaMoeModel,
+    Glm52VllmDsaMoeParallel, Glm52VllmNvfp4DpAttnDsaMoeModel, Glm52VllmNvfp4DpAttnParallel,
+    Glm52VllmNvfp4DsaMoeModel, Glm52VllmNvfp4DsaMoeParallel, Glm52VllmNvfp4DsaMoeSpeculativeModel,
+    Glm52VllmNvfp4PpDsaMoeModel, Glm52VllmNvfp4PpParallel, Glm53FlashModelCfg, Glm53FlashQuant,
+    Glm53FlashVllmFp8PpModel, Glm53FlashVllmFp8PpParallel, Glm53FlashVllmModel,
+    Glm53FlashVllmParallel, Glm53VllmNvfp4DsaMoeDflash2Model, IterwiseUnifiedModel,
+    Llama3DenseModel, Llama3DenseTpModel, Llama3DpAttnTpFfnModel, Qwen36LocalModel,
+    Qwen36LocalParallel, Qwen36ModelCfg, Qwen3AttnLayerwiseModel, Qwen3AttnParallel,
+    Qwen3FfnMoeLayerwiseModel, Qwen3FfnMoeParallel, Qwen3Fp8FfnMoeLayerwiseModel,
+    Qwen3Fp8FfnMoeParallel, Qwen3MoeDpAttnEpFfnModel, Qwen3MoeFp8DpAttnEpFfnModel,
+    Qwen3MoeFp8Parallel, Qwen3MoeParallel, Qwen3VllmMoeDpAttnEpFfnModel, Qwen3VllmMoeParallel,
 };
 use crate::common::Fabric;
 use crate::timing::bridge::DType;
@@ -151,6 +155,8 @@ struct ExpertPopularityProfile {
     model_role: Option<String>,
     num_moe_layers: u32,
     num_logical_experts: u32,
+    /// The EP the capture ran at, kept as provenance. The counts are of logical
+    /// experts, so a run at any EP partitions them by its own `ep_size`.
     expert_parallel_size: u16,
     experts_per_rank: u32,
     experts_per_token: u32,
@@ -367,7 +373,6 @@ fn load_expert_popularity(
             validate_expert_popularity(
                 &profile,
                 expected_num_experts,
-                ep_size,
                 expected_num_moe_layers,
                 expected_experts_per_token,
                 path,
@@ -421,7 +426,6 @@ fn load_expert_popularity(
 fn validate_expert_popularity(
     profile: &ExpertPopularityProfile,
     expected_num_experts: u32,
-    expected_ep_size: u16,
     expected_num_moe_layers: u32,
     expected_experts_per_token: u32,
     path: &str,
@@ -451,11 +455,6 @@ fn validate_expert_popularity(
         profile.num_moe_layers == expected_num_moe_layers,
         "expert popularity profile {path} has {} MoE layers, model requires {expected_num_moe_layers}",
         profile.num_moe_layers
-    );
-    anyhow::ensure!(
-        profile.expert_parallel_size == expected_ep_size,
-        "expert popularity profile {path} has ep_size {}, run requires {expected_ep_size}",
-        profile.expert_parallel_size
     );
     anyhow::ensure!(
         profile.experts_per_rank * u32::from(profile.expert_parallel_size)
@@ -950,9 +949,16 @@ pub fn qwen3_vllm_moe(
         .context("building vLLM-aligned FP8 Qwen3-MoE model")
 }
 
+/// The one expert-parallel width the DeepSeek V4 selectors model, over one
+/// NVLink domain of as many GPUs: the selectors take no `ep_size`, and routing
+/// and the parallel layout both read it from here.
+const DEEPSEEK_V4_EP_SIZE: u16 = 4;
+
 /// Build DeepSeek V4 through the same routing-profile loader used by Qwen and
 /// GLM. `serialize_streams` changes only CostTree composition; kernel inputs and
-/// profile identities remain identical.
+/// profile identities remain identical. `step_tokens` is the most tokens one
+/// step runs: a chunked-prefill worker's chunk, or None when steps are not
+/// chunked, where a whole prompt runs at once and vLLM sizes for max_model_len.
 #[allow(clippy::too_many_arguments)]
 pub fn deepseek_v4_vllm(
     model_spec: &ModelSpec,
@@ -960,6 +966,7 @@ pub fn deepseek_v4_vllm(
     routing_seed: Option<u64>,
     expert_popularity_file: Option<&str>,
     serialize_streams: bool,
+    step_tokens: Option<u32>,
     gpu: &str,
     name: &str,
     bridge: &PerfApiBridge,
@@ -970,22 +977,75 @@ pub fn deepseek_v4_vllm(
         routing_kind,
         routing_seed,
         model_cfg.num_experts.get(),
-        4,
+        DEEPSEEK_V4_EP_SIZE,
         model_cfg.num_layers,
         model_cfg.top_k,
         expert_popularity_file,
     )?;
     let parallel = DeepseekV4VllmParallel {
-        ep_size: 4,
-        nvl_num_gpu: 4,
+        ep_size: DEEPSEEK_V4_EP_SIZE,
+        nvl_num_gpu: DEEPSEEK_V4_EP_SIZE,
         gpu_name: gpu.to_string(),
         serialize_streams,
+        max_num_batched_tokens: step_tokens.unwrap_or(model_cfg.max_model_len),
     };
     let configs = deepseek_v4_vllm::build_configs(&model_cfg, &parallel, &routing)
         .context("expanding DeepSeek V4 architecture configs")?;
     let resolved = deepseek_v4_vllm::resolve_configs(&configs);
     deepseek_v4_vllm::build(name.to_string(), resolved, bridge)
         .context("building DeepSeek V4 vLLM model (often a missing profile.db row)")
+}
+
+/// Build DeepSeek-V4.1-Flash (B200, TP4 attention + EP4 experts). Routed demand
+/// resolves through the shared [`ExpertDemandSource`]: one binding over all 40
+/// routed layers, verify width 1 (no speculative decoding). The MoE rows were
+/// profiled on the capture's token corpus, so `routing = corpus` is the
+/// production choice. `serialize_streams` changes only CostTree composition;
+/// `decoder_swa_bounded_replay` (a counterfactual, see
+/// [`deepseek_v41_vllm::BoundedReplay`]) changes only the late layers' inputs.
+#[allow(clippy::too_many_arguments)]
+pub fn deepseek_v41_vllm(
+    model_spec: &ModelSpec,
+    routing_kind: RoutingKind,
+    routing_seed: Option<u64>,
+    expert_popularity_file: Option<&str>,
+    token_corpus_file: Option<&str>,
+    serialize_streams: bool,
+    decoder_swa_bounded_replay: bool,
+    max_model_len: Option<u32>,
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<DeepseekV41VllmModel> {
+    let model_cfg = DeepseekV41ModelCfg::from_json(Path::new(&model_spec.model_config), model_spec)
+        .context("loading exact DeepSeek-V4.1-Flash model config")?;
+    let parallel = DeepseekV41VllmParallel {
+        tp_size: deepseek_v41_vllm::TP_SIZE,
+        ep_size: deepseek_v41_vllm::EP_SIZE,
+        gpu_name: gpu.to_string(),
+        serialize_streams,
+        decoder_swa_bounded_replay,
+        max_model_len: deepseek_v41_vllm::resolve_max_model_len(
+            max_model_len,
+            model_cfg.max_position_embeddings,
+        )?,
+    };
+    let source = ExpertDemandSource {
+        kind: routing_kind,
+        seed: routing_seed,
+        num_experts: model_cfg.num_experts,
+        experts_per_token: model_cfg.top_k,
+        ep_size: parallel.ep_size as u16,
+        expert_popularity_file,
+        token_corpus_file,
+        num_routed_layers: model_cfg.num_layers,
+    };
+    let demand = source.demand(0..model_cfg.num_layers as usize, 1)?;
+    let configs = deepseek_v41_vllm::build_configs(&model_cfg, &parallel, &demand)
+        .context("expanding DeepSeek-V4.1-Flash architecture configs")?;
+    let resolved = deepseek_v41_vllm::resolve_configs(&configs);
+    deepseek_v41_vllm::build(name.to_string(), resolved, bridge)
+        .context("building DeepSeek-V4.1-Flash vLLM model (often a missing profile.db row)")
 }
 
 /// Build the GLM-5.2 model in aligned vLLM kernel granularity.
@@ -1092,6 +1152,115 @@ pub fn glm52_vllm_nvfp4_dsa_moe(
         .context("building B200 GLM-5.2 NVFP4 model (often a missing profile.db row)")
 }
 
+/// Build the B200 GLM-5.2/5.3 NVFP4 graph under data-parallel attention and
+/// expert-parallel MoE: `ep_size` GPUs, each its own attention rank at TP1,
+/// sharing the routed experts.
+///
+/// Routing is folded over `ep_size` ranks, so a popularity profile must have
+/// been captured at that `expert_parallel_size`.
+#[allow(clippy::too_many_arguments)]
+pub fn glm52_vllm_nvfp4_dp_attn_dsa_moe(
+    model_spec: &ModelSpec,
+    ep_size: u16,
+    nvl_num_gpu: u16,
+    max_model_len: u32,
+    routing_kind: RoutingKind,
+    routing_seed: Option<u64>,
+    expert_popularity_file: Option<&str>,
+    token_corpus_file: Option<&str>,
+    cudagraph_capture_sizes: &[u32],
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<Glm52VllmNvfp4DpAttnDsaMoeModel> {
+    let model_cfg = glm52_model_cfg(model_spec).context("loading exact GLM-5.2 NVFP4 config")?;
+    let source = ExpertDemandSource {
+        kind: routing_kind,
+        seed: routing_seed,
+        num_experts: model_cfg.num_experts.get(),
+        experts_per_token: model_cfg.router_top_k,
+        ep_size,
+        expert_popularity_file,
+        token_corpus_file,
+        num_routed_layers: num_sparse_layers(&model_cfg),
+    };
+    let body_demand = source.demand(0..num_sparse_layers(&model_cfg) as usize, 1)?;
+    let parallel = Glm52VllmNvfp4DpAttnParallel {
+        ep_size,
+        nvl_num_gpu,
+        max_model_len,
+        gpu_name: gpu.to_string(),
+        cudagraph_capture_sizes: {
+            let mut sizes = cudagraph_capture_sizes.to_vec();
+            sizes.sort_unstable();
+            sizes.dedup();
+            sizes
+        },
+    };
+    let configs = glm52_vllm_nvfp4_dp_attn_dsa_moe::build_configs(
+        &model_cfg,
+        &parallel,
+        &body_demand,
+        model_spec.fp8,
+    )
+    .context("expanding B200 GLM-5.2 NVFP4 DP-attention + EP architecture configs")?;
+    let resolved = glm52_vllm_nvfp4_dp_attn_dsa_moe::resolve_configs(&configs);
+    glm52_vllm_nvfp4_dp_attn_dsa_moe::build(name.to_string(), resolved, bridge).context(
+        "building B200 GLM-5.2 NVFP4 DP-attention + EP model (often a missing profile.db row)",
+    )
+}
+
+/// Build the B200 GLM-5.2/5.3 NVFP4 graph under pure pipeline parallelism:
+/// `pp_size` one-GPU stages at EP1, as the whole-pipeline view over them.
+///
+/// Routing is resolved at EP1 because one GPU owns all experts, so a
+/// popularity profile must have been captured with `expert_parallel_size == 1`.
+/// A deployment shares the built stages with its workers through
+/// [`Glm52VllmNvfp4PpDsaMoeModel::stages`].
+#[allow(clippy::too_many_arguments)]
+pub fn glm52_vllm_nvfp4_pp_dsa_moe(
+    model_spec: &ModelSpec,
+    pp_size: u16,
+    max_model_len: u32,
+    routing_kind: RoutingKind,
+    routing_seed: Option<u64>,
+    expert_popularity_file: Option<&str>,
+    token_corpus_file: Option<&str>,
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<Glm52VllmNvfp4PpDsaMoeModel> {
+    let model_cfg = glm52_model_cfg(model_spec).context("loading exact GLM-5.2 NVFP4 config")?;
+    let source = ExpertDemandSource {
+        kind: routing_kind,
+        seed: routing_seed,
+        num_experts: model_cfg.num_experts.get(),
+        experts_per_token: model_cfg.router_top_k,
+        // EP1: each stage's GPU owns all experts, so the fold sees one rank.
+        ep_size: 1,
+        expert_popularity_file,
+        token_corpus_file,
+        num_routed_layers: num_sparse_layers(&model_cfg),
+    };
+    let body_demand = source.demand(0..num_sparse_layers(&model_cfg) as usize, 1)?;
+    let parallel = Glm52VllmNvfp4PpParallel {
+        pp_size,
+        max_model_len,
+        gpu_name: gpu.to_string(),
+    };
+    let configs = glm52_vllm_nvfp4_pp_dsa_moe::build_configs(
+        &model_cfg,
+        &parallel,
+        &body_demand,
+        model_spec.fp8,
+    )
+    .context("expanding B200 GLM-5.2 NVFP4 pipeline-parallel architecture configs")?;
+    let resolved = glm52_vllm_nvfp4_pp_dsa_moe::resolve_configs(&configs);
+    glm52_vllm_nvfp4_pp_dsa_moe::build(name.to_string(), resolved, bridge).context(
+        "building B200 GLM-5.2 NVFP4 pipeline-parallel model (often a missing profile.db row)",
+    )
+}
+
 /// Build the B200 GLM-5.2 NVFP4 target-verify graph with its MTP proposer.
 ///
 /// The result is a different type from [`glm52_vllm_nvfp4_dsa_moe`]'s, not the
@@ -1157,7 +1326,8 @@ pub fn glm52_vllm_nvfp4_dsa_moe_speculative(
         .context("building speculative B200 GLM-5.2 NVFP4 model (often a missing profile.db row)")
 }
 
-/// Build the B200 GLM-5.3-Flash FP8 KDA/DSA/MoE model (vLLM fork, TP = EP).
+/// Build the B200 GLM-5.3-Flash FP8 KDA/DSA/MoE model (vLLM fork; routed
+/// experts EP = TP, or TP-sliced without `--enable-expert-parallel`).
 ///
 /// The checkpoint's layer schedule is exact, so layer-count overrides are
 /// rejected. Routing is resolved over the 42 routed layers; a corpus captured
@@ -1165,7 +1335,9 @@ pub fn glm52_vllm_nvfp4_dsa_moe_speculative(
 #[allow(clippy::too_many_arguments)]
 pub fn glm53_flash_vllm_fp8_kda_dsa_moe(
     model_spec: &ModelSpec,
+    quant: Glm53FlashQuant,
     tp_size: u16,
+    enable_expert_parallel: bool,
     max_model_len: u32,
     routing_kind: RoutingKind,
     routing_seed: Option<u64>,
@@ -1176,32 +1348,18 @@ pub fn glm53_flash_vllm_fp8_kda_dsa_moe(
     name: &str,
     bridge: &PerfApiBridge,
 ) -> Result<Glm53FlashVllmModel> {
-    if model_spec.num_layers.is_some() || model_spec.sim_num_layers.is_some() {
-        bail!(
-            "GLM-5.3-Flash architecture rejects num_layers/sim_num_layers overrides; the exact hybrid 45-layer schedule is required"
-        );
-    }
-    anyhow::ensure!(
-        model_spec.fp8,
-        "GLM-5.3-Flash is modeled for its FP8 block checkpoint; set fp8: true"
-    );
-    let model_cfg = Glm53FlashModelCfg::from_json(Path::new(&model_spec.model_config))
-        .context("loading GLM-5.3-Flash config")?;
-    let routed_layers = model_cfg.num_moe_layers();
-    let source = ExpertDemandSource {
-        kind: routing_kind,
-        seed: routing_seed,
-        num_experts: model_cfg.n_routed_experts,
-        experts_per_token: model_cfg.num_experts_per_tok,
-        ep_size: tp_size,
+    let (model_cfg, demand) = glm53_flash_model_and_demand(
+        model_spec,
+        quant,
+        if enable_expert_parallel { tp_size } else { 1 },
+        routing_kind,
+        routing_seed,
         expert_popularity_file,
         token_corpus_file,
-        num_routed_layers: routed_layers,
-    };
-    // Ordinary decode: one row per request, so a verify block is one token.
-    let demand = source.demand(0..routed_layers as usize, 1)?;
+    )?;
     let parallel = Glm53FlashVllmParallel {
         tp_size,
+        enable_expert_parallel,
         max_model_len,
         gpu_name: gpu.to_string(),
         cudagraph_capture_sizes: cudagraph_capture_sizes.to_vec(),
@@ -1211,6 +1369,163 @@ pub fn glm53_flash_vllm_fp8_kda_dsa_moe(
     let resolved = glm53_flash_vllm_fp8_kda_dsa_moe::resolve_configs(&configs);
     glm53_flash_vllm_fp8_kda_dsa_moe::build(name.to_string(), resolved, bridge)
         .context("building GLM-5.3-Flash model (often a missing profile.db row)")
+}
+
+/// The exact GLM-5.3-Flash config, which must declare the arch tag's
+/// quantization (`fp8: true` exactly for the FP8 block checkpoint).
+fn glm53_flash_model_cfg(
+    model_spec: &ModelSpec,
+    quant: Glm53FlashQuant,
+) -> Result<Glm53FlashModelCfg> {
+    let model_cfg = Glm53FlashModelCfg::from_json(Path::new(&model_spec.model_config))
+        .context("loading GLM-5.3-Flash config")?;
+    anyhow::ensure!(
+        model_cfg.quant == quant,
+        "{} declares a {} checkpoint, but the arch is the {} one",
+        model_spec.model_config,
+        model_cfg.quant.tag(),
+        quant.tag()
+    );
+    anyhow::ensure!(
+        model_spec.fp8 == (quant == Glm53FlashQuant::Fp8Block),
+        "GLM-5.3-Flash {}: set fp8: {}",
+        quant.tag(),
+        quant == Glm53FlashQuant::Fp8Block
+    );
+    Ok(model_cfg)
+}
+
+/// The exact GLM-5.3-Flash config and its routed demand folded to `ep_size`
+/// ranks. Routing is resolved over the 42 routed layers; a corpus captured with
+/// MTP off records exactly those.
+fn glm53_flash_model_and_demand(
+    model_spec: &ModelSpec,
+    quant: Glm53FlashQuant,
+    ep_size: u16,
+    routing_kind: RoutingKind,
+    routing_seed: Option<u64>,
+    expert_popularity_file: Option<&str>,
+    token_corpus_file: Option<&str>,
+) -> Result<(
+    Glm53FlashModelCfg,
+    crate::timing::expert_demand::ExpertDemand,
+)> {
+    if model_spec.num_layers.is_some() || model_spec.sim_num_layers.is_some() {
+        bail!(
+            "GLM-5.3-Flash architecture rejects num_layers/sim_num_layers overrides; the exact hybrid 45-layer schedule is required"
+        );
+    }
+    let model_cfg = glm53_flash_model_cfg(model_spec, quant)?;
+    let routed_layers = model_cfg.num_moe_layers();
+    let source = ExpertDemandSource {
+        kind: routing_kind,
+        seed: routing_seed,
+        num_experts: model_cfg.n_routed_experts,
+        experts_per_token: model_cfg.num_experts_per_tok,
+        ep_size,
+        expert_popularity_file,
+        token_corpus_file,
+        num_routed_layers: routed_layers,
+    };
+    // Ordinary decode: one row per request, so a verify block is one token.
+    let demand = source.demand(0..routed_layers as usize, 1)?;
+    Ok((model_cfg, demand))
+}
+
+/// Build the B200 GLM-5.3-Flash FP8 graph under pure pipeline parallelism:
+/// `pp_size` one-GPU stages at TP1 / EP1, as the whole-pipeline view over them.
+///
+/// Routing is resolved at EP1 because one GPU owns all 288 experts. A
+/// deployment shares the built stages with its workers through
+/// [`Glm53FlashVllmFp8PpModel::stages`].
+#[allow(clippy::too_many_arguments)]
+pub fn glm53_flash_vllm_fp8_pp_kda_dsa_moe(
+    model_spec: &ModelSpec,
+    quant: Glm53FlashQuant,
+    pp_size: u16,
+    max_model_len: u32,
+    routing_kind: RoutingKind,
+    routing_seed: Option<u64>,
+    expert_popularity_file: Option<&str>,
+    token_corpus_file: Option<&str>,
+    cudagraph_capture_sizes: &[u32],
+    layer_partition: &[u32],
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<Glm53FlashVllmFp8PpModel> {
+    let (model_cfg, demand) = glm53_flash_model_and_demand(
+        model_spec,
+        quant,
+        1,
+        routing_kind,
+        routing_seed,
+        expert_popularity_file,
+        token_corpus_file,
+    )?;
+    let parallel = Glm53FlashVllmFp8PpParallel {
+        pp_size,
+        max_model_len,
+        gpu_name: gpu.to_string(),
+        cudagraph_capture_sizes: cudagraph_capture_sizes.to_vec(),
+        layer_partition: layer_partition.to_vec(),
+    };
+    let configs =
+        glm53_flash_vllm_fp8_pp_kda_dsa_moe::build_configs(&model_cfg, &parallel, &demand)
+            .context("expanding GLM-5.3-Flash pipeline-parallel architecture configs")?;
+    let resolved = glm53_flash_vllm_fp8_pp_kda_dsa_moe::resolve_configs(&configs);
+    glm53_flash_vllm_fp8_pp_kda_dsa_moe::build(name.to_string(), resolved, bridge)
+        .context("building GLM-5.3-Flash pipeline-parallel model (often a missing profile.db row)")
+}
+
+/// Build the B200 GLM-5.3-Flash FP8 model under data-parallel attention and
+/// expert-parallel MoE (vLLM `--data-parallel-size ep_size
+/// --enable-expert-parallel`, TP1).
+#[allow(clippy::too_many_arguments)]
+pub fn glm53_flash_vllm_fp8_dp_attn_ep_moe(
+    model_spec: &ModelSpec,
+    quant: Glm53FlashQuant,
+    ep_size: u16,
+    max_model_len: u32,
+    routing_kind: RoutingKind,
+    routing_seed: Option<u64>,
+    expert_popularity_file: Option<&str>,
+    token_corpus_file: Option<&str>,
+    cudagraph_capture_sizes: &[u32],
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<glm53_flash_vllm_fp8_dp_attn_ep_moe::Glm53FlashDpAttnEpModel> {
+    if model_spec.num_layers.is_some() || model_spec.sim_num_layers.is_some() {
+        bail!(
+            "GLM-5.3-Flash architecture rejects num_layers/sim_num_layers overrides; the exact hybrid 45-layer schedule is required"
+        );
+    }
+    let model_cfg = glm53_flash_model_cfg(model_spec, quant)?;
+    let routed_layers = model_cfg.num_moe_layers();
+    let source = ExpertDemandSource {
+        kind: routing_kind,
+        seed: routing_seed,
+        num_experts: model_cfg.n_routed_experts,
+        experts_per_token: model_cfg.num_experts_per_tok,
+        ep_size,
+        expert_popularity_file,
+        token_corpus_file,
+        num_routed_layers: routed_layers,
+    };
+    let demand = source.demand(0..routed_layers as usize, 1)?;
+    let parallel = glm53_flash_vllm_fp8_dp_attn_ep_moe::Glm53FlashDpAttnEpParallel {
+        dp_size: ep_size,
+        max_model_len,
+        gpu_name: gpu.to_string(),
+        cudagraph_capture_sizes: cudagraph_capture_sizes.to_vec(),
+    };
+    let configs =
+        glm53_flash_vllm_fp8_dp_attn_ep_moe::build_configs(&model_cfg, &parallel, &demand)
+            .context("expanding GLM-5.3-Flash DP-attention/EP architecture configs")?;
+    let resolved = glm53_flash_vllm_fp8_dp_attn_ep_moe::resolve_configs(&configs);
+    glm53_flash_vllm_fp8_dp_attn_ep_moe::build(name.to_string(), resolved, bridge)
+        .context("building GLM-5.3-Flash DP-attention/EP model (often a missing profile.db row)")
 }
 
 /// Build the GLM target graph driven by a DFlash2 block-parallel proposer.
@@ -1490,6 +1805,19 @@ pub fn qwen3_fp8_ffn_moe(
         .context("building native FP8 Qwen3 AFD ffn-side model")
 }
 
+/// The checkpoint quantization a GLM-5.3-Flash arch tag is for.
+pub fn glm53_flash_quant(sel: &IterArchSel) -> Glm53FlashQuant {
+    match sel {
+        IterArchSel::Glm53FlashVllmNvfp4KdaDsaMoe { .. }
+        | IterArchSel::Glm53FlashVllmNvfp4PpKdaDsaMoe { .. }
+        | IterArchSel::Glm53FlashVllmNvfp4DpAttnEpMoe { .. } => Glm53FlashQuant::Nvfp4,
+        IterArchSel::Glm53FlashVllmFp8KdaDsaMoe { .. }
+        | IterArchSel::Glm53FlashVllmFp8PpKdaDsaMoe { .. }
+        | IterArchSel::Glm53FlashVllmFp8DpAttnEpMoe { .. } => Glm53FlashQuant::Fp8Block,
+        other => unreachable!("{other:?} is not a GLM-5.3-Flash arch tag"),
+    }
+}
+
 /// Build ONE iter-wise arch model from its selector, boxed as `dyn`. The
 /// model-only seam the offline `timing-predict` (iter arch) path uses (it evaluates
 /// [`IterwiseUnifiedModel`] directly, no worker/flow). The deployments do NOT box
@@ -1610,6 +1938,7 @@ pub fn build_iter_model(
             *routing_seed,
             expert_popularity_file.as_deref(),
             false,
+            None,
             gpu,
             name,
             bridge,
@@ -1625,6 +1954,49 @@ pub fn build_iter_model(
             *routing_seed,
             expert_popularity_file.as_deref(),
             true,
+            None,
+            gpu,
+            name,
+            bridge,
+        )?),
+        IterArchSel::DeepseekV41Vllm {
+            model,
+            routing,
+            routing_seed,
+            expert_popularity_file,
+            token_corpus_file,
+            decoder_swa_bounded_replay,
+            max_model_len,
+        } => Box::new(deepseek_v41_vllm(
+            model,
+            *routing,
+            *routing_seed,
+            expert_popularity_file.as_deref(),
+            token_corpus_file.as_deref(),
+            false,
+            *decoder_swa_bounded_replay,
+            *max_model_len,
+            gpu,
+            name,
+            bridge,
+        )?),
+        IterArchSel::DeepseekV41VllmSerialStreams {
+            model,
+            routing,
+            routing_seed,
+            expert_popularity_file,
+            token_corpus_file,
+            decoder_swa_bounded_replay,
+            max_model_len,
+        } => Box::new(deepseek_v41_vllm(
+            model,
+            *routing,
+            *routing_seed,
+            expert_popularity_file.as_deref(),
+            token_corpus_file.as_deref(),
+            true,
+            *decoder_swa_bounded_replay,
+            *max_model_len,
             gpu,
             name,
             bridge,
@@ -1673,6 +2045,50 @@ pub fn build_iter_model(
             name,
             bridge,
         )?),
+        IterArchSel::Glm52VllmNvfp4DpAttnDsaMoe {
+            model,
+            ep_size,
+            nvl_num_gpu,
+            max_model_len,
+            routing,
+            routing_seed,
+            expert_popularity_file,
+            token_corpus_file,
+            cudagraph_capture_sizes,
+        } => Box::new(glm52_vllm_nvfp4_dp_attn_dsa_moe(
+            model,
+            *ep_size,
+            *nvl_num_gpu,
+            *max_model_len,
+            *routing,
+            *routing_seed,
+            expert_popularity_file.as_deref(),
+            token_corpus_file.as_deref(),
+            cudagraph_capture_sizes,
+            gpu,
+            name,
+            bridge,
+        )?),
+        IterArchSel::Glm52VllmNvfp4PpDsaMoe {
+            model,
+            pp_size,
+            max_model_len,
+            routing,
+            routing_seed,
+            expert_popularity_file,
+            token_corpus_file,
+        } => Box::new(glm52_vllm_nvfp4_pp_dsa_moe(
+            model,
+            *pp_size,
+            *max_model_len,
+            *routing,
+            *routing_seed,
+            expert_popularity_file.as_deref(),
+            token_corpus_file.as_deref(),
+            gpu,
+            name,
+            bridge,
+        )?),
         IterArchSel::Glm52SglangNvfp4TpDsaMoe {
             model,
             tp_size,
@@ -1698,6 +2114,18 @@ pub fn build_iter_model(
         IterArchSel::Glm53FlashVllmFp8KdaDsaMoe {
             model,
             tp_size,
+            enable_expert_parallel,
+            max_model_len,
+            routing,
+            routing_seed,
+            expert_popularity_file,
+            token_corpus_file,
+            cudagraph_capture_sizes,
+        }
+        | IterArchSel::Glm53FlashVllmNvfp4KdaDsaMoe {
+            model,
+            tp_size,
+            enable_expert_parallel,
             max_model_len,
             routing,
             routing_seed,
@@ -1706,7 +2134,78 @@ pub fn build_iter_model(
             cudagraph_capture_sizes,
         } => Box::new(glm53_flash_vllm_fp8_kda_dsa_moe(
             model,
+            glm53_flash_quant(sel),
             *tp_size,
+            *enable_expert_parallel,
+            *max_model_len,
+            *routing,
+            *routing_seed,
+            expert_popularity_file.as_deref(),
+            token_corpus_file.as_deref(),
+            cudagraph_capture_sizes,
+            gpu,
+            name,
+            bridge,
+        )?),
+        IterArchSel::Glm53FlashVllmFp8PpKdaDsaMoe {
+            model,
+            pp_size,
+            max_model_len,
+            routing,
+            routing_seed,
+            expert_popularity_file,
+            token_corpus_file,
+            cudagraph_capture_sizes,
+            layer_partition,
+        }
+        | IterArchSel::Glm53FlashVllmNvfp4PpKdaDsaMoe {
+            model,
+            pp_size,
+            max_model_len,
+            routing,
+            routing_seed,
+            expert_popularity_file,
+            token_corpus_file,
+            cudagraph_capture_sizes,
+            layer_partition,
+        } => Box::new(glm53_flash_vllm_fp8_pp_kda_dsa_moe(
+            model,
+            glm53_flash_quant(sel),
+            *pp_size,
+            *max_model_len,
+            *routing,
+            *routing_seed,
+            expert_popularity_file.as_deref(),
+            token_corpus_file.as_deref(),
+            cudagraph_capture_sizes,
+            layer_partition,
+            gpu,
+            name,
+            bridge,
+        )?),
+        IterArchSel::Glm53FlashVllmFp8DpAttnEpMoe {
+            model,
+            ep_size,
+            max_model_len,
+            routing,
+            routing_seed,
+            expert_popularity_file,
+            token_corpus_file,
+            cudagraph_capture_sizes,
+        }
+        | IterArchSel::Glm53FlashVllmNvfp4DpAttnEpMoe {
+            model,
+            ep_size,
+            max_model_len,
+            routing,
+            routing_seed,
+            expert_popularity_file,
+            token_corpus_file,
+            cudagraph_capture_sizes,
+        } => Box::new(glm53_flash_vllm_fp8_dp_attn_ep_moe(
+            model,
+            glm53_flash_quant(sel),
+            *ep_size,
             *max_model_len,
             *routing,
             *routing_seed,
@@ -1863,90 +2362,79 @@ pub fn build_ffn_model(
     })
 }
 
-/// One `#[supported]` combination of an arch, built structure-only.
+/// One arch block on one GPU, built structure-only.
 #[derive(Debug, serde::Serialize)]
-pub struct SupportedBuild {
+pub struct ArchBuild {
     /// The arch contract, as `list-params` groups providers: `iter_wise`,
     /// `layer_wise_attn` or `layer_wise_ffn`.
     pub contract: &'static str,
     pub arch: String,
-    /// The row's GPU (the group's `gpu`, the profile.db key).
+    /// The group's `gpu`, the profile.db key.
     pub gpu: String,
-    /// The row's arch params (`model_config` a `model/config/` stem). Params the
-    /// row leaves out took their schema defaults.
+    /// The block's arch params, without `type`. Params the block leaves out
+    /// took their schema defaults.
     pub params: serde_json::Map<String, serde_json::Value>,
     pub gpus_per_replica: Option<u16>,
+    /// What a `timing-predict` case for this build looks like; `None` on error.
+    pub predict: Option<PredictShape>,
     /// The cost tree, in the `cost_manifest/*.json` form; `None` on error.
     pub cost_manifest: Option<crate::timing::CostManifestDoc>,
-    /// The kernel configs the build asks profile.db for, as the document
-    /// `--kernel-configs-out` writes; only when asked for, and `None` on error.
+    /// The kernel configs the build asks profile.db for, as
+    /// [`config_records_document`](crate::timing::bridge::config_records_document)
+    /// builds; only when asked for, and `None` on error.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kernel_configs: Option<serde_json::Value>,
+    /// Per `cost_manifest` section, per slot: the index in `kernel_configs`'
+    /// `configs` of the config the slot's kernel reads, matched by kind, GPU
+    /// and [`KernelConfig::identity`](crate::timing::KernelConfig::identity);
+    /// null when none matches. Only with `kernel_configs`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slot_configs: Option<Vec<Vec<Option<usize>>>>,
     pub error: Option<String>,
 }
 
+/// The `timing-predict` case shape of a built arch: the arch selector the
+/// predict config names it under, and what each case must hold.
+#[derive(Debug, serde::Serialize)]
+pub struct PredictShape {
+    /// `iter`, `speculative_iter`, `attn` or `ffn`.
+    pub selector: &'static str,
+    /// The groups each case lists (`groups`, or an ffn case's
+    /// `tokens_per_group`): the model's attention DP shards.
+    pub groups: u16,
+    /// A speculative arch's verify width, `draft_tokens + 1`: every decode
+    /// request's query length.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query_width: Option<u32>,
+    /// The arch's longest request ([`IterArchSel::max_model_len`]), which no
+    /// case's request may exceed; an FFN side, which holds no context, has none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_model_len: Option<u32>,
+}
+
+impl PredictShape {
+    fn new(selector: &'static str, groups: u16) -> Self {
+        Self {
+            selector,
+            groups,
+            query_width: None,
+            max_model_len: None,
+        }
+    }
+}
+
+/// What a structure-only build returns: the replica width, its prediction case
+/// shape and its cost tree.
+type Built = (u16, PredictShape, crate::timing::CostManifestDoc);
+
 /// The dotted-leaf prefix a deployment gives its model, which starts every leaf
-/// name and kernel-config role. Supported builds use the deployment's own, as
+/// name and kernel-config role. Arch builds use the deployment's own, as
 /// `timing-predict` does, so their leaves are named as a real run's are.
 const UNIFIED_MODEL_NAME: &str = "unified";
 const AFD_MODEL_NAME: &str = "afd";
 
-/// Build every `#[supported]` combination of every arch on its row's GPU,
-/// structure only ([`PerfApiBridge::structure_only`]: no Python, `profile.db` or
-/// GPU). A combination that fails to parse or build (including a panicking
-/// shape assertion) is returned with its error, not raised.
-pub fn build_supported_archs(kernel_configs: bool) -> Vec<SupportedBuild> {
-    use serde_json::{Map, Value};
-
-    let schema = crate::schema::list_params();
-    let mut out = Vec::new();
-    for (contract, rows) in [
-        ("iter_wise", IterArchSel::SUPPORTED),
-        ("layer_wise_attn", AttnArchSel::SUPPORTED),
-        ("layer_wise_ffn", FfnArchSel::SUPPORTED),
-    ] {
-        for (tag, rows) in rows {
-            for row in *rows {
-                for combo in row.combinations() {
-                    let mut gpu = String::new();
-                    let mut params = Map::new();
-                    for (name, value) in &combo {
-                        if *name == "gpu" {
-                            gpu = value.as_str().unwrap_or_default().to_string();
-                        } else {
-                            params.insert((*name).into(), value.clone());
-                        }
-                    }
-                    // A row names a model config by its `model/config/` stem.
-                    let mut block = params.clone();
-                    if let Some(Value::String(model)) = params.get("model_config") {
-                        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-                            .join(format!("model/config/{model}.json"));
-                        block.insert(
-                            "model_config".into(),
-                            path.to_string_lossy().into_owned().into(),
-                        );
-                    }
-                    block.insert("type".into(), (*tag).into());
-                    out.push(build_arch(
-                        &schema,
-                        contract,
-                        tag,
-                        gpu,
-                        params,
-                        block,
-                        kernel_configs,
-                    ));
-                }
-            }
-        }
-    }
-    out
-}
-
-/// One arch block on one GPU, as a run's pool group gives it: the form the
-/// kernel-config registry records each source's groups in.
-/// `supported-cost-trees --archs FILE` reads a list of them.
+/// One arch block on one GPU, as a run's pool group gives it.
+/// `cost-trees FILE` reads a list of them.
 #[derive(Debug, Deserialize)]
 pub struct ArchBlock {
     pub gpu: String,
@@ -1954,12 +2442,12 @@ pub struct ArchBlock {
     pub arch: serde_json::Map<String, serde_json::Value>,
 }
 
-/// Build each block structure only, as [`build_supported_archs`] builds a
-/// row's combination: a param the block leaves out takes its schema default.
-/// Each result's `params` is its block without `type`. A block whose tag no
-/// contract provides, or that fails to parse or build, is returned with its
-/// error, not raised.
-pub fn build_arch_blocks(blocks: &[ArchBlock], kernel_configs: bool) -> Vec<SupportedBuild> {
+/// Build each block on its GPU structure only ([`PerfApiBridge::structure_only`]:
+/// no Python, `profile.db` or GPU): a param the block leaves out takes its
+/// schema default. Each result's `params` is its block without `type`. A block
+/// whose tag no contract provides, or that fails to parse or build (including
+/// a panicking shape assertion), is returned with its error, not raised.
+pub fn build_arch_blocks(blocks: &[ArchBlock], kernel_configs: bool) -> Vec<ArchBuild> {
     let schema = crate::schema::list_params();
     blocks
         .iter()
@@ -1984,14 +2472,16 @@ pub fn build_arch_blocks(blocks: &[ArchBlock], kernel_configs: bool) -> Vec<Supp
                     block.arch.clone(),
                     kernel_configs,
                 ),
-                None => SupportedBuild {
+                None => ArchBuild {
                     contract: "",
                     arch: tag.to_string(),
                     gpu: block.gpu.clone(),
                     params,
                     gpus_per_replica: None,
+                    predict: None,
                     cost_manifest: None,
                     kernel_configs: None,
+                    slot_configs: None,
                     error: Some(format!("no arch contract provides {tag:?}")),
                 },
             }
@@ -2009,7 +2499,7 @@ fn build_arch(
     params: serde_json::Map<String, serde_json::Value>,
     block: serde_json::Map<String, serde_json::Value>,
     kernel_configs: bool,
-) -> SupportedBuild {
+) -> ArchBuild {
     let mut arch = serde_json::Map::new();
     let common = schema["arch_common"]
         .as_array()
@@ -2036,24 +2526,34 @@ fn build_arch(
             |selector: &IterArchSel, gpu, bridge| {
                 // A speculative arch builds a different model type, with its
                 // own tree: the verify pass plus its draft passes.
-                let (gpus, manifest) = match selector {
+                let (gpus, shape, manifest) = match selector {
                     IterArchSel::Glm52VllmNvfp4DsaMoeSpeculative { .. }
                     | IterArchSel::Glm53VllmNvfp4DsaMoeDflash2 { .. } => {
-                        let (model, _) = build_speculative_iter_model(
+                        let (model, draft_tokens) = build_speculative_iter_model(
                             selector,
                             gpu,
                             UNIFIED_MODEL_NAME,
                             bridge,
                         )?;
-                        (model.gpus_per_replica(), model.cost_log_manifest())
+                        let shape = PredictShape {
+                            query_width: Some(draft_tokens + 1),
+                            max_model_len: Some(selector.max_model_len()?),
+                            ..PredictShape::new("speculative_iter", model.num_attn_dp_groups())
+                        };
+                        (model.gpus_per_replica(), shape, model.cost_log_manifest())
                     }
                     _ => {
                         let model = build_iter_model(selector, gpu, UNIFIED_MODEL_NAME, bridge)?;
-                        (model.gpus_per_replica(), model.cost_log_manifest())
+                        let shape = PredictShape {
+                            max_model_len: Some(selector.max_model_len()?),
+                            ..PredictShape::new("iter", model.num_attn_dp_groups())
+                        };
+                        (model.gpus_per_replica(), shape, model.cost_log_manifest())
                     }
                 };
                 Ok((
                     gpus,
+                    shape,
                     crate::timing::CostManifestDoc::single("iter", manifest),
                 ))
             },
@@ -2064,7 +2564,11 @@ fn build_arch(
             kernel_configs,
             |selector: &AttnArchSel, gpu, bridge| {
                 let model = build_attn_model(selector, gpu, AFD_MODEL_NAME, bridge)?;
-                Ok((model.gpus_per_replica(), model.cost_log_manifest()))
+                let shape = PredictShape {
+                    max_model_len: Some(selector.max_model_len()?),
+                    ..PredictShape::new("attn", model.num_attn_dp_groups())
+                };
+                Ok((model.gpus_per_replica(), shape, model.cost_log_manifest()))
             },
         ),
         _ => build_selector(
@@ -2073,47 +2577,51 @@ fn build_arch(
             kernel_configs,
             |selector: &FfnArchSel, gpu, bridge| {
                 let model = build_ffn_model(selector, gpu, AFD_MODEL_NAME, bridge)?;
-                Ok((model.gpus_per_replica(), model.cost_log_manifest()))
+                let shape = PredictShape::new("ffn", model.num_dp_groups());
+                Ok((model.gpus_per_replica(), shape, model.cost_log_manifest()))
             },
         ),
     };
-    let mut supported = SupportedBuild {
+    let mut out = ArchBuild {
         contract,
         arch: tag.to_string(),
         gpu,
         params,
         gpus_per_replica: None,
+        predict: None,
         cost_manifest: None,
         kernel_configs: None,
+        slot_configs: None,
         error: None,
     };
     match built {
-        Ok((gpus_per_replica, manifest, configs)) => {
-            supported.gpus_per_replica = Some(gpus_per_replica);
-            supported.cost_manifest = Some(manifest);
-            supported.kernel_configs = configs;
+        Ok(((gpus_per_replica, shape, manifest), configs)) => {
+            out.gpus_per_replica = Some(gpus_per_replica);
+            out.predict = Some(shape);
+            if let Some((document, slots)) = configs {
+                out.kernel_configs = Some(document);
+                out.slot_configs = Some(slots);
+            }
+            out.cost_manifest = Some(manifest);
         }
-        Err(error) => supported.error = Some(error),
+        Err(error) => out.error = Some(error),
     }
-    supported
+    out
 }
 
+/// The kernel-config records document and, per manifest section and slot, the
+/// record its kernel reads ([`ArchBuild::slot_configs`]).
+type Configs = (serde_json::Value, Vec<Vec<Option<usize>>>);
+
 /// Parse `arch` as selector `S` and `build` it on `gpu` with a structure-only
-/// bridge: the replica width, the cost tree and, when asked, the kernel-config
-/// records document. A parse error, build error or panic is the error text.
+/// bridge: the replica width, the prediction case shape, the cost tree and,
+/// when asked, the kernel-config records with each slot's. A parse error, build error or panic is the error text.
 fn build_selector<S: serde::de::DeserializeOwned>(
     arch: serde_json::Map<String, serde_json::Value>,
     gpu: &str,
     kernel_configs: bool,
-    build: impl Fn(&S, &str, &PerfApiBridge) -> Result<(u16, crate::timing::CostManifestDoc)>,
-) -> std::result::Result<
-    (
-        u16,
-        crate::timing::CostManifestDoc,
-        Option<serde_json::Value>,
-    ),
-    String,
-> {
+    build: impl Fn(&S, &str, &PerfApiBridge) -> Result<Built>,
+) -> std::result::Result<(Built, Option<Configs>), String> {
     let selector: S = serde_json::from_value(serde_json::Value::Object(arch))
         .map_err(|e| format!("config: {e}"))?;
     let bridge = PerfApiBridge::structure_only();
@@ -2124,13 +2632,19 @@ fn build_selector<S: serde::de::DeserializeOwned>(
         build(&selector, gpu, &bridge)
     }));
     match built {
-        Ok(Ok((gpus_per_replica, manifest))) => Ok((
-            gpus_per_replica,
-            manifest,
-            kernel_configs.then(|| {
-                crate::timing::bridge::config_records_document(&bridge.take_config_records())
-            }),
-        )),
+        Ok(Ok(built)) => {
+            let configs = if kernel_configs {
+                let records = bridge.take_config_records();
+                let slots = slot_configs(&built.2, &records).map_err(|e| format!("{e:#}"))?;
+                Some((
+                    crate::timing::bridge::config_records_document(&records),
+                    slots,
+                ))
+            } else {
+                None
+            };
+            Ok((built, configs))
+        }
         Ok(Err(e)) => Err(format!("{e:#}")),
         Err(panic) => Err(panic
             .downcast_ref::<String>()
@@ -2141,6 +2655,42 @@ fn build_selector<S: serde::de::DeserializeOwned>(
                 |message| format!("build panicked: {message}"),
             )),
     }
+}
+
+/// Per section and slot of `manifest`, the index in `records` of the config
+/// the slot's kernel reads: the record with its kind, GPU and identity.
+fn slot_configs(
+    manifest: &crate::timing::CostManifestDoc,
+    records: &[crate::timing::bridge::KernelConfigRecord],
+) -> Result<Vec<Vec<Option<usize>>>> {
+    let key = |kind: &str, gpu: &str, identity: &serde_json::Value| {
+        serde_json::to_string(&(kind, gpu, identity)).expect("an identity serializes")
+    };
+    let index: std::collections::HashMap<String, usize> = records
+        .iter()
+        .enumerate()
+        .map(|(i, r)| (key(r.kind, &r.gpu_name, &r.identity), i))
+        .collect();
+    manifest
+        .sections
+        .iter()
+        .map(|section| {
+            section
+                .manifest
+                .slots
+                .iter()
+                .map(|slot| {
+                    let gpu = slot.kernel_config["gpu_name"].as_str().unwrap_or_default();
+                    let identity = crate::timing::kernels::engine::config_identity(
+                        &slot.kind,
+                        slot.kernel_config.clone(),
+                    )
+                    .with_context(|| format!("slot {}", slot.name))?;
+                    Ok(index.get(&key(&slot.kind, gpu, &identity)).copied())
+                })
+                .collect()
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -2173,6 +2723,33 @@ mod tests {
         assert_eq!(built.gpus_per_replica(), 1);
         assert_eq!(built.total_kv_bytes_per_token(), 20_480);
         assert_eq!(built.cost_log_manifest().slots.len(), 72);
+    }
+
+    /// A GLM-5.3-Flash arch builds only the checkpoint whose precision its tag
+    /// names: the FP8 and NVFP4 tags share one graph, so a mismatch would
+    /// otherwise build silently at the wrong precision.
+    #[test]
+    fn glm53_flash_tags_reject_the_other_checkpoint() {
+        let build = |arch: &str, config: &str, fp8: bool| {
+            let raw = format!(
+                r#"{{"type":"{arch}","model_config":"{}","fp8":{fp8}}}"#,
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join(format!("model/config/{config}.json"))
+                    .display()
+            );
+            let selector: IterArchSel = serde_json::from_str(&raw).unwrap();
+            let bridge = PerfApiBridge::new_uninit_for_test();
+            bridge.enable_enumerate();
+            build_iter_model(&selector, "NVIDIA B200", "test", &bridge).map(|_| ())
+        };
+        let nvfp4 = "glm53_flash_vllm_nvfp4_kda_dsa_moe";
+        let fp8 = "glm53_flash_vllm_fp8_kda_dsa_moe";
+        build(nvfp4, "glm53_flash_nvfp4", false).unwrap();
+        build(fp8, "glm53_flash", true).unwrap();
+        let wrong = build(nvfp4, "glm53_flash", false).unwrap_err().to_string();
+        assert!(wrong.contains("declares a fp8 checkpoint"), "{wrong}");
+        assert!(build(fp8, "glm53_flash_nvfp4", true).is_err());
+        assert!(build(nvfp4, "glm53_flash_nvfp4", true).is_err());
     }
 
     /// Two callables, one artifact. This is the whole reason the corpus is
@@ -2477,6 +3054,22 @@ mod tests {
         assert_eq!(routing.ppm(), &[375_000, 250_000, 218_750, 156_250]);
         assert_eq!(routing.layer_ppm().len(), 2);
 
+        // Captured at EP2, the counts are of logical experts, so a run at any EP
+        // partitions them: at EP1 and EP4 each layer sorts all four experts.
+        for ep_size in [1, 4] {
+            let other_ep = resolve_routing_source(
+                RoutingKind::Popularity,
+                None,
+                4,
+                ep_size,
+                2,
+                2,
+                Some(profile_path),
+            )
+            .unwrap();
+            assert_eq!(other_ep.ppm(), &[375_000, 343_750, 156_250, 125_000]);
+        }
+
         let mut infeasible_profile = profile.clone();
         infeasible_profile["counts_by_layer"][0] = serde_json::json!([9, 2, 3, 2]);
         infeasible_profile["probabilities_by_layer"][0] =
@@ -2657,6 +3250,59 @@ mod tests {
         // consumer can read one as the other.
         assert!(built.cost_log_manifest().slots.len() > 474);
         assert_eq!(built.num_attn_shards(), 4);
+    }
+
+    #[test]
+    fn dflash2_necessary_work_map_covers_the_compiled_locations() {
+        use std::collections::BTreeSet;
+        let bridge = PerfApiBridge::new_uninit_for_test();
+        bridge.enable_enumerate();
+        let mut spec = glm52_model_spec();
+        spec.model_config = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("model/config/glm52_nvfp4.json")
+            .to_string_lossy()
+            .into_owned();
+        let map: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../model/work/location_maps/glm53_vllm_nvfp4_dsa_moe_dflash2.json"
+        ))
+        .unwrap();
+        let mapped: BTreeSet<_> = map["locations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["location"].as_str().unwrap())
+            .collect();
+        for ep in [4, 8] {
+            let built = glm53_vllm_nvfp4_dsa_moe_dflash2(
+                &spec,
+                ep,
+                ep,
+                8192,
+                RoutingKind::Uniform,
+                None,
+                None,
+                None,
+                7,
+                2048,
+                "NVIDIA B200",
+                "unified",
+                &bridge,
+            )
+            .unwrap();
+            let manifest = built.cost_log_manifest();
+            let actual: BTreeSet<_> = manifest
+                .slots
+                .iter()
+                .filter(|slot| {
+                    !matches!(
+                        slot.kind.as_str(),
+                        "all_reduce" | "all_reduce_fusion" | "all_reduce_residual_rms_norm"
+                    )
+                })
+                .map(|slot| slot.name.as_str())
+                .collect();
+            assert_eq!(actual, mapped, "EP={ep}");
+        }
     }
 
     #[test]
@@ -2895,84 +3541,11 @@ mod tests {
         assert_eq!(narrow_bytes, 6 * 8 * 128 * 2);
     }
 
-    /// Every `#[supported]` combination of an arch builds its cost
-    /// tree, so a row cannot claim a deployment the arch cannot build.
-    #[test]
-    fn every_supported_arch_deployment_builds_its_cost_tree() {
-        let builds = build_supported_archs(false);
-        let failures: Vec<String> = builds
-            .iter()
-            .filter_map(|b| {
-                b.error
-                    .as_ref()
-                    .map(|e| format!("{} {:?}: {e}", b.arch, b.params))
-            })
-            .collect();
-        assert!(
-            failures.is_empty(),
-            "unbuildable #[supported] rows:\n{}",
-            failures.join("\n")
-        );
-        for b in &builds {
-            let doc = b.cost_manifest.as_ref().unwrap();
-            assert!(
-                !doc.sections.is_empty()
-                    && doc.sections.iter().all(|s| !s.manifest.slots.is_empty()),
-                "{}: empty cost tree",
-                b.arch
-            );
-        }
-    }
-
-    /// A supported build names its leaves as a run of its deployment does, so
-    /// its kernel-config roles match the ones runs register.
-    #[test]
-    fn supported_builds_name_leaves_like_their_deployment() {
-        for b in build_supported_archs(false) {
-            let prefix = if b.contract == "iter_wise" {
-                "unified."
-            } else {
-                "afd."
-            };
-            for section in &b.cost_manifest.as_ref().unwrap().sections {
-                for slot in &section.manifest.slots {
-                    assert!(slot.name.starts_with(prefix), "{}: {}", b.arch, slot.name);
-                }
-            }
-        }
-    }
-
-    /// Asked for, each supported build carries the kernel configs it builds, in
-    /// the document `--kernel-configs-out` writes.
-    #[test]
-    fn supported_builds_carry_their_kernel_configs_when_asked() {
-        for b in build_supported_archs(true) {
-            let doc = b.kernel_configs.as_ref().expect("kernel_configs");
-            assert_eq!(
-                doc["schema_version"],
-                crate::timing::bridge::CONFIG_RECORDS_SCHEMA_VERSION
-            );
-            let configs = doc["configs"].as_array().unwrap();
-            assert!(!configs.is_empty(), "{} {:?}: no configs", b.arch, b.params);
-            assert!(configs.iter().all(|c| c["gpu_name"] == b.gpu.as_str()));
-        }
-        assert!(build_supported_archs(false)
-            .iter()
-            .all(|b| b.kernel_configs.is_none()));
-    }
-
-    /// An arch block builds the tree its `#[supported]` combination builds when
-    /// it names the same params, and a param it sets changes the tree: how the
-    /// public API builds a registered run's tree.
-    #[test]
-    fn arch_blocks_build_like_their_supported_combination() {
-        let supported = build_supported_archs(false);
-        let row = supported
-            .iter()
-            .find(|b| b.arch == "glm53_vllm_nvfp4_dsa_moe_dflash2")
-            .expect("a dflash2 row");
-        let mut arch = row.params.clone();
-        let model = arch["model_config"].as_str().unwrap().to_string();
+    /// An arch block on `gpu` with `params`, its model config a `model/config/`
+    /// file named by stem.
+    fn arch_block(gpu: &str, tag: &str, model: &str, params: serde_json::Value) -> ArchBlock {
+        let mut arch = params.as_object().cloned().unwrap_or_default();
+        arch.insert("type".into(), tag.into());
         arch.insert(
             "model_config".into(),
             Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -2981,32 +3554,158 @@ mod tests {
                 .into_owned()
                 .into(),
         );
-        arch.insert("type".into(), row.arch.clone().into());
-        let mut short = arch.clone();
+        ArchBlock {
+            gpu: gpu.into(),
+            arch,
+        }
+    }
+
+    /// An iter-wise block (GLM-5.2 NVFP4 at EP4) and an AFD attention block
+    /// (Qwen3-235B attention at TP4).
+    fn sample_blocks() -> Vec<ArchBlock> {
+        vec![
+            arch_block(
+                "NVIDIA B200",
+                "glm52_vllm_nvfp4_dsa_moe",
+                "glm52_nvfp4",
+                serde_json::json!({"ep_size": 4, "nvl_num_gpu": 4}),
+            ),
+            arch_block(
+                "NVIDIA H200",
+                "qwen3_attn_tp",
+                "qwen3_235b",
+                serde_json::json!({"attn_tp_size": 4}),
+            ),
+        ]
+    }
+
+    /// Each block builds a non-empty cost tree under its contract, its leaves
+    /// named as a run of its deployment names them, so its kernel-config roles
+    /// match a run's.
+    #[test]
+    fn arch_blocks_build_their_cost_trees_named_like_a_run() {
+        let built = build_arch_blocks(&sample_blocks(), false);
+        for (b, (contract, prefix)) in built
+            .iter()
+            .zip([("iter_wise", "unified."), ("layer_wise_attn", "afd.")])
+        {
+            assert_eq!(b.error, None, "{}", b.arch);
+            assert_eq!(b.contract, contract);
+            let doc = b.cost_manifest.as_ref().unwrap();
+            assert!(
+                !doc.sections.is_empty()
+                    && doc.sections.iter().all(|s| !s.manifest.slots.is_empty()),
+                "{}: empty cost tree",
+                b.arch
+            );
+            for section in &doc.sections {
+                for slot in &section.manifest.slots {
+                    assert!(slot.name.starts_with(prefix), "{}: {}", b.arch, slot.name);
+                }
+            }
+        }
+    }
+
+    /// Asked for, each build carries the kernel configs it builds; otherwise
+    /// none.
+    #[test]
+    fn arch_blocks_carry_their_kernel_configs_when_asked() {
+        for b in build_arch_blocks(&sample_blocks(), true) {
+            let doc = b.kernel_configs.as_ref().expect("kernel_configs");
+            assert_eq!(
+                doc["schema_version"],
+                crate::timing::bridge::CONFIG_RECORDS_SCHEMA_VERSION
+            );
+            let configs = doc["configs"].as_array().unwrap();
+            assert!(!configs.is_empty(), "{} {:?}: no configs", b.arch, b.params);
+            assert!(configs.iter().all(|c| c["gpu_name"] == b.gpu.as_str()));
+            // Every slot names the record of the config its kernel reads.
+            let manifest = b.cost_manifest.as_ref().unwrap();
+            let slots = b.slot_configs.as_ref().expect("slot_configs");
+            assert_eq!(slots.len(), manifest.sections.len());
+            for (section, indices) in manifest.sections.iter().zip(slots) {
+                assert_eq!(indices.len(), section.manifest.slots.len());
+                for (slot, index) in section.manifest.slots.iter().zip(indices) {
+                    let record = &configs[index.expect("a slot with no record")];
+                    assert_eq!(record["kind"], slot.kind.as_str(), "{}", slot.name);
+                }
+            }
+        }
+        assert!(build_arch_blocks(&sample_blocks(), false)
+            .iter()
+            .all(|b| b.kernel_configs.is_none() && b.slot_configs.is_none()));
+    }
+
+    /// Each build names the `timing-predict` selector its cases go under and
+    /// how many groups a case lists: one per attention DP shard, the context
+    /// limit, and a speculative arch's verify width besides.
+    #[test]
+    fn arch_blocks_give_their_prediction_case_shape() {
+        let mut blocks = sample_blocks();
+        blocks.push(arch_block(
+            "NVIDIA H200",
+            "qwen3_moe_fp8_dp_attn_ep_ffn",
+            "qwen3_235b_fp8",
+            serde_json::json!({"ep_size": 8, "attn_tp_size": 2, "nvl_num_gpu": 8, "routing": "uniform", "fp8": true}),
+        ));
+        blocks.push(arch_block(
+            "NVIDIA B200",
+            "glm52_vllm_nvfp4_dsa_moe_speculative",
+            "glm52_nvfp4",
+            serde_json::json!({"ep_size": 4, "nvl_num_gpu": 4, "draft_tokens": 5, "max_model_len": 8192}),
+        ));
+        let shapes: Vec<_> = build_arch_blocks(&blocks, false)
+            .into_iter()
+            .map(|b| {
+                let shape = b
+                    .predict
+                    .unwrap_or_else(|| panic!("{}: {:?}", b.arch, b.error));
+                (
+                    shape.selector,
+                    shape.groups,
+                    shape.query_width,
+                    shape.max_model_len,
+                )
+            })
+            .collect();
+        assert_eq!(
+            shapes,
+            [
+                // GLM-5.2 NVFP4's own max_model_len default; the others have
+                // none, so their checkpoint's max_position_embeddings.
+                ("iter", 1, None, Some(1_048_576)),
+                ("attn", 1, None, Some(40_960)),
+                ("iter", 4, None, Some(40_960)),
+                ("speculative_iter", 1, Some(6), Some(8192)),
+            ]
+        );
+    }
+
+    /// A param a block sets changes the tree its defaults build, and a tag no
+    /// contract provides is an error, not a panic.
+    #[test]
+    fn a_block_param_changes_the_tree_and_an_unknown_tag_is_an_error() {
+        let [base, _] = <[ArchBlock; 2]>::try_from(sample_blocks()).unwrap();
+        let mut short = base.arch.clone();
         short.insert("max_model_len".into(), 8192.into());
         let blocks = [
             ArchBlock {
-                gpu: row.gpu.clone(),
-                arch: arch.clone(),
-            },
-            ArchBlock {
-                gpu: row.gpu.clone(),
+                gpu: base.gpu.clone(),
                 arch: short,
             },
             ArchBlock {
-                gpu: row.gpu.clone(),
+                gpu: base.gpu.clone(),
                 arch: [("type".to_string(), "no_such_arch".into())]
                     .into_iter()
                     .collect(),
             },
+            base,
         ];
         let built = build_arch_blocks(&blocks, false);
-        let json = |b: &SupportedBuild| serde_json::to_value(b.cost_manifest.as_ref()).unwrap();
+        let json = |b: &ArchBuild| serde_json::to_value(b.cost_manifest.as_ref()).unwrap();
         assert_eq!(built[0].error, None);
-        assert_eq!(built[0].contract, "iter_wise");
-        assert_eq!(json(&built[0]), json(row));
-        assert_eq!(built[1].params["max_model_len"], 8192);
-        assert_ne!(json(&built[1]), json(row));
-        assert!(built[2].error.as_deref().unwrap().contains("no_such_arch"));
+        assert_eq!(built[0].params["max_model_len"], 8192);
+        assert_ne!(json(&built[0]), json(&built[2]));
+        assert!(built[1].error.as_deref().unwrap().contains("no_such_arch"));
     }
 }

@@ -1,0 +1,58 @@
+# DeepSeek-V4.1-Flash on one four-GPU B200 NVLink domain under the vLLM V1
+# scheduler: TP4 attention and EP4 experts over the same four ranks, chunked
+# prefill with a 2048-token budget. Mirrors the capture-2 deployment
+# (logs/20260924_0_dsv41_flash_capture/profile_nsys_cg2048.yaml).
+deployment: unified
+
+workload:
+  # The capture-2 workload: 96 requests (128/128, 128/4096, 4096/128,
+  # 3072/3072 x 24), saturated at 48 in flight.
+  trace_files:
+    - trace/quadrant_c48_96.csv
+  input_file_format: text-generation-independent
+  arrival_mode: saturated
+  max_concurrency: 48
+  run_to_end: true
+
+io:
+  log_dir: logs/deepseek_v41_flash_b200_vllm_tp4_ep4
+
+pools:
+  main:
+    groups:
+      - gpu: "NVIDIA B200"
+        replicas: 1
+        arch:
+          type: deepseek_v41_vllm
+          model_config: model/config/deepseek_v41_flash.json
+          fp8: true
+          # The capture's --max-model-len. Omitted, it defaults to the
+          # checkpoint's 1048576; it is a timing input (the FlashMLA prefill
+          # workspace, the indexer's padded logits rows), so this pin keeps the
+          # captured 131072 rows.
+          max_model_len: 131072
+          # Recorded per-token expert routes from the capture's token_corpus pass.
+          routing: corpus
+          token_corpus_file: hf://datasets/UW-SyFI/servingstudio-workload@c3f5ecaab0bbff757c64864bf2ec24f5e1f76b5c/deepseek_v41_flash/vllm/diverse_100/capture/20260924/manifest.json
+          # What-if, default false (= the captured vLLM): decoder SWA bounded
+          # replay (vLLM PR #58132 / SGLang --enable-decoder-swa-bounded-replay).
+          # Layers past the last KV source (21-39) run only each prefill chunk's
+          # last sliding_window (128) extend tokens. No capture backs it.
+          decoder_swa_bounded_replay: false
+        worker:
+          type: chunked_prefill
+          # vLLM max_num_batched_tokens=2048. The V1 scheduler fills decodes
+          # first and spends the remaining budget on prefill chunks in the same
+          # iteration (mixed batches).
+          max_batch_tokens: 2048
+          batch_policy: mix
+          # recommended_gpu_time_multiplier from the capture-2 kernel alignment
+          # (Analyzer al_6e04cf7b..., sum of measured GPU cycle / sum of
+          # measured kernel time). It stretches kernel sums to the measured
+          # duty cycle.
+          gpu_time_multiplier: 1.0361
+          # vLLM KV pool per GPU in capture 2: 603004 blocks x 135168 B (the
+          # smallest rank's budget; "GPU KV cache size: 46,767,420 tokens" is
+          # that pool divided into 131072-token requests). The arch charges
+          # 1056 B/token/rank, so the simulator sees 77,184,512 tokens.
+          attn_gpu_memory_gb: 81.506844672

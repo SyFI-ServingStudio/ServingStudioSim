@@ -180,8 +180,6 @@ def profile_kv_cache_append_torch(
         import torch
     except ImportError as exc:
         raise ProfilerNotImplemented("torch is required for the Torch reference") from exc
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented("CUDA is required for KV-cache append profiling")
 
     try:
         key, value, key_cache, value_cache, slot_mapping, _, _ = _make_inputs(
@@ -247,8 +245,6 @@ def profile_kv_cache_append_vllm_cuda(
         raise ProfilerNotImplemented(
             "the instrumented vLLM environment is required for vllm_cuda"
         ) from exc
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented("CUDA is required for KV-cache append profiling")
 
     try:
         key, value, key_cache, value_cache, slot_mapping, k_scale, v_scale = _make_inputs(

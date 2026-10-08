@@ -14,9 +14,10 @@
 //! - `held` is a separate ledger from `promised` with its own per-partition
 //!   running total, because held KV is physically resident while its owner has
 //!   left the local decode set.
-//! - `HashMap` iteration order is observable: [`Self::drain_promised`] feeds
-//!   prefill-admit order, which feeds model input and event order. Do not swap
-//!   the container for one with a different order without re-recording goldens.
+//! - [`Self::drain_promised`] reports promises in the order they were made: it
+//!   feeds prefill-admit order, which feeds model input and event order. A
+//!   `HashMap`'s iteration order is not that order, and std seeds it afresh in
+//!   every native process, so it must not leak into the drain.
 
 use std::collections::HashMap;
 
@@ -25,8 +26,11 @@ use crate::worker::kv::ResolvedPrefillContext;
 use crate::worker::shared::advance_scope::PartitionId;
 
 pub(crate) struct RequestLedger {
-    /// Reserved-but-not-yet-resident footprints, as `(partition, charge)`.
-    promised: HashMap<RequestId, (PartitionId, u64)>,
+    /// Reserved-but-not-yet-resident footprints, as `(partition, charge)`,
+    /// with the sequence number each was promised at.
+    promised: HashMap<RequestId, (PartitionId, u64, u64)>,
+    /// The sequence number the next promise gets.
+    next_promise: u64,
     /// Full-footprint reservations held across partial-prefill iterations.
     chunked_prefill: HashMap<RequestId, (PartitionId, u64)>,
     /// Prefilled KV awaiting a decode-side pull acknowledgement.
@@ -43,6 +47,7 @@ impl RequestLedger {
     pub(crate) fn new(num_partitions: usize) -> Self {
         Self {
             promised: HashMap::new(),
+            next_promise: 0,
             chunked_prefill: HashMap::new(),
             held: HashMap::new(),
             held_by_partition: vec![0; num_partitions],
@@ -70,7 +75,9 @@ impl RequestLedger {
     // ── promised ─────────────────────────────────────────────────────────────
 
     pub(crate) fn promise(&mut self, request: RequestId, partition: PartitionId, charge: u64) {
-        self.promised.insert(request, (partition, charge));
+        self.promised
+            .insert(request, (partition, charge, self.next_promise));
+        self.next_promise += 1;
         self.placement.insert(request, partition);
     }
 
@@ -85,8 +92,12 @@ impl RequestLedger {
     pub(crate) fn promised_charge(&self, request: RequestId) -> Option<u64> {
         self.promised
             .get(&request)
-            .or_else(|| self.chunked_prefill.get(&request))
-            .map(|(_, charge)| *charge)
+            .map(|&(_, charge, _)| charge)
+            .or_else(|| {
+                self.chunked_prefill
+                    .get(&request)
+                    .map(|&(_, charge)| charge)
+            })
     }
 
     #[inline]
@@ -94,8 +105,8 @@ impl RequestLedger {
         let newly_promised: u64 = self
             .promised
             .values()
-            .filter(|(promised_partition, _)| *promised_partition == partition)
-            .map(|(_, charge)| *charge)
+            .filter(|(promised_partition, _, _)| *promised_partition == partition)
+            .map(|(_, charge, _)| *charge)
             .sum();
         let chunked_prefill: u64 = self
             .chunked_prefill
@@ -111,7 +122,7 @@ impl RequestLedger {
         let newly_promised = self
             .promised
             .values()
-            .filter(|(promised_partition, _)| *promised_partition == partition)
+            .filter(|(promised_partition, _, _)| *promised_partition == partition)
             .count();
         let chunked_prefill = self
             .chunked_prefill
@@ -123,11 +134,11 @@ impl RequestLedger {
     }
 
     pub(crate) fn promote_promise_to_chunked_prefill(&mut self, request: RequestId) {
-        let reservation = self
+        let (partition, charge, _) = self
             .promised
             .remove(&request)
             .expect("chunked prefill must promote an existing promise");
-        self.chunked_prefill.insert(request, reservation);
+        self.chunked_prefill.insert(request, (partition, charge));
     }
 
     pub(crate) fn forget_chunked_prefill(&mut self, request: RequestId) {
@@ -138,20 +149,19 @@ impl RequestLedger {
         self.chunked_prefill.contains_key(&request)
     }
 
-    /// Empty `promised` and report `(partition, request)` in iteration order.
-    ///
-    /// Collect-then-clear rather than `drain()` so the order the store observes
-    /// is the same `HashMap` order the pre-split code produced.
+    /// Empty `promised` and report `(partition, request)` in the order the
+    /// promises were made.
     pub(crate) fn drain_promised(&mut self) -> Vec<(PartitionId, RequestId)> {
-        let drained: Vec<(PartitionId, RequestId)> = self
+        let mut drained: Vec<(u64, PartitionId, RequestId)> = self
             .promised
-            .iter()
-            .map(|(&request, &(partition, _))| (partition, request))
+            .drain()
+            .map(|(request, (partition, _, seq))| (seq, partition, request))
             .collect();
-        for (_, request) in &drained {
-            self.promised.remove(request);
-        }
+        drained.sort_unstable_by_key(|&(seq, _, _)| seq);
         drained
+            .into_iter()
+            .map(|(_, partition, request)| (partition, request))
+            .collect()
     }
 
     // ── held ─────────────────────────────────────────────────────────────────
@@ -224,6 +234,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn promises_drain_in_the_order_they_were_made() {
+        // Not id order, and enough of them that a hash map's order would differ
+        // from one process to the next.
+        let order: Vec<u32> = (0..64).map(|i| (i * 37) % 64).collect();
+        let mut ledger = RequestLedger::new(1);
+        for &id in &order {
+            ledger.promise(RequestId(id), 0, 1);
+        }
+        ledger.forget_promise(RequestId(order[5]));
+        let drained: Vec<u32> = ledger
+            .drain_promised()
+            .into_iter()
+            .map(|(_, r)| r.0)
+            .collect();
+        let expected: Vec<u32> = order.iter().copied().filter(|&id| id != order[5]).collect();
+        assert_eq!(drained, expected);
+    }
+
+    #[test]
     fn promise_places_and_drain_clears_both_the_promise_and_nothing_else() {
         let mut ledger = RequestLedger::new(2);
         ledger.promise(RequestId(0), 1, 30);
@@ -233,10 +262,8 @@ mod tests {
         assert_eq!(ledger.partition_promised_count(1), 2);
         assert_eq!(ledger.partition_promised(0), 50);
 
-        let mut drained = ledger.drain_promised();
-        drained.sort_by_key(|(_, request)| request.0);
         assert_eq!(
-            drained,
+            ledger.drain_promised(),
             [(1, RequestId(0)), (1, RequestId(1)), (0, RequestId(2))]
         );
         assert_eq!(ledger.partition_promised(1), 0);

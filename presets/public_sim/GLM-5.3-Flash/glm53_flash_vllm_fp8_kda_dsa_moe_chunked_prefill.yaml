@@ -1,0 +1,35 @@
+# vLLM GLM-5.3-Flash FP8 on B200, TP4 with EP4, chunked prefill at 2048 tokens.
+# Worker: presets/alignment/glm53_flash_fp8_b200_tp4_ep4 (variant ep4_tp4_dp1).
+# attn_gpu_memory_gb is the KV budget its cases measured at that max_model_len:
+# 63.92 GiB at 8K, 63.37 GiB at 128K and 58.43 GiB at 512K, in decimal GB.
+deployment: unified
+pools:
+  main:
+    groups:
+      - replicas: ${replicas}
+        arch:
+          preset: glm53_flash_vllm_fp8_kda_dsa_moe
+          tp_size: 4
+          enable_expert_parallel: true
+          max_model_len: ${max_model_len}
+        worker:
+          type: chunked_prefill
+          prefill_gpu_time_multiplier: 1.18
+          max_batch_tokens: 2048
+          batch_policy: mix
+          kv_admission_policy: bounded-future
+          kv_page_size: 1
+          kv_max_future_tokens: 1
+          kv_initial_new_token_ratio: 0.0
+          kv_minimum_new_token_ratio: 0.0
+          kv_new_token_ratio_decay_steps: 1
+          kv_retract_decode_steps: 1
+          decode_retraction_policy: fcfs
+          attn_gpu_memory_gb: ${attn_gpu_memory_gb}
+sweep:
+  replicas: [1, 2]
+compound:
+  server:
+    ctx8k: {max_model_len: 8192, attn_gpu_memory_gb: 68.63}
+    ctx128k: {max_model_len: 131072, attn_gpu_memory_gb: 68.04}
+    ctx512k: {max_model_len: 524288, attn_gpu_memory_gb: 62.74}

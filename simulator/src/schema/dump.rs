@@ -9,7 +9,11 @@
 //!   - `arch_common`: the model fields every arch tag carries;
 //!   - `group_common`: the flat fields every group carries (gpu / replicas);
 //!   - `pool_common`: the flat fields every pool carries (placement);
-//!   - `common`: run-global workload / io params.
+//!   - `common`: run-global workload / io params;
+//!   - `predict_cases`: per `timing-predict` arch selector, the fields of one
+//!     case. `groups`: a case is `{groups: [...]}`, each group these fields;
+//!     `case`: a case is an object of these fields. How many groups a model
+//!     takes is the model's (`cost-trees` gives it as `predict.groups`).
 //!
 //! This module only *arranges* — every param's defaults / choices / cache-key
 //! flag is *derived from the config types themselves*: `#[derive(ParamStruct)]`
@@ -22,9 +26,11 @@
 use serde_json::{json, Map, Value};
 
 use crate::arch::config::{AttnArchSel, FfnArchSel, IterArchSel, ModelSpec};
+use crate::arch::contract::FfnArchInput;
 use crate::deployment::config::{IoSpec, WorkloadSpec};
 use crate::orchestrator::config::{GroupSpec, PoolSpec};
-use crate::schema::{ParamDef, SupportedRow};
+use crate::schema::ParamDef;
+use crate::timing_predict::{PredictGroup, SpeculativePredictGroup};
 use crate::worker::config::{AttnWorkerSel, FfnWorkerSel, IterWorkerSel, KvAdmissionSpec};
 
 /// Serialize a `const PARAMS` slice to a JSON array of ParamDef objects.
@@ -56,19 +62,6 @@ fn providers_with_flattened(
     Value::Object(m)
 }
 
-/// An arch layer's providers, each tag with `#[supported]` rows also carrying
-/// `"supported": [{param: [values]}, ...]`.
-fn arch_providers(schema: &[(&str, &[ParamDef])], supported: &[(&str, &[SupportedRow])]) -> Value {
-    let mut out = providers(schema);
-    for (tag, rows) in supported {
-        if !rows.is_empty() {
-            out[*tag]["supported"] =
-                serde_json::to_value(rows).expect("SupportedRow is infallibly Serialize");
-        }
-    }
-    out
-}
-
 /// Build the full `list-params` registry JSON.
 pub fn list_params() -> Value {
     json!({
@@ -76,12 +69,13 @@ pub fn list_params() -> Value {
             "unified": { "pools": { "main": "iter_wise" } },
             "pd":      { "pools": { "prefill": "iter_wise", "decode": "iter_wise" } },
             "afd":     { "pools": { "attn": "layer_wise_attn", "ffn": "layer_wise_ffn" } },
+            "pp":      { "pools": { "stage": "iter_wise" } },
         },
         "providers": {
             "arch": {
-                "iter_wise":       arch_providers(IterArchSel::SCHEMA, IterArchSel::SUPPORTED),
-                "layer_wise_attn": arch_providers(AttnArchSel::SCHEMA, AttnArchSel::SUPPORTED),
-                "layer_wise_ffn":  arch_providers(FfnArchSel::SCHEMA, FfnArchSel::SUPPORTED),
+                "iter_wise":       providers(IterArchSel::SCHEMA),
+                "layer_wise_attn": providers(AttnArchSel::SCHEMA),
+                "layer_wise_ffn":  providers(FfnArchSel::SCHEMA),
             },
             "worker": {
                 "iter_wise":       providers_with_flattened(
@@ -102,12 +96,58 @@ pub fn list_params() -> Value {
             "workload": params(WorkloadSpec::PARAMS),
             "io":       params(IoSpec::PARAMS),
         },
+        "predict_cases": {
+            "iter":             {"groups": params(PredictGroup::PARAMS)},
+            "speculative_iter": {"groups": params(SpeculativePredictGroup::PARAMS)},
+            "attn":             {"groups": params(PredictGroup::PARAMS)},
+            "ffn":              {"case": params(FfnArchInput::PARAMS)},
+        },
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each `timing-predict` selector publishes its case fields, typed as the
+    /// case structs deserialize them: `[a, b]` pairs as `int_pair_list`.
+    #[test]
+    fn predict_cases_list_each_selectors_case_fields() {
+        let cases = &list_params()["predict_cases"];
+        let fields = |selector: &str, key: &str| -> Vec<(String, String)> {
+            cases[selector][key]
+                .as_array()
+                .unwrap_or_else(|| panic!("{selector}.{key}"))
+                .iter()
+                .map(|p| {
+                    (
+                        p["name"].as_str().unwrap().into(),
+                        p["type"].as_str().unwrap().into(),
+                    )
+                })
+                .collect()
+        };
+        let pair = |n: &str, t: &str| (n.to_string(), t.to_string());
+        let group = vec![
+            pair("prefill_chunk_pairs", "int_pair_list"),
+            pair("decode_kv_lens", "int_list"),
+            pair("decode_count", "int"),
+            pair("average_decode_length", "int"),
+        ];
+        assert_eq!(fields("iter", "groups"), group);
+        assert_eq!(fields("attn", "groups"), group);
+        assert_eq!(
+            fields("speculative_iter", "groups"),
+            [
+                pair("prefill_chunk_pairs", "int_pair_list"),
+                pair("decode_requests", "int_pair_list"),
+            ]
+        );
+        assert_eq!(
+            fields("ffn", "case"),
+            [pair("tokens_per_group", "int_list")]
+        );
+    }
 
     /// The group's GPU and an arch's routing pick kernels, so the launcher's
     /// cache-key dedup must tell configs apart by them.
@@ -150,85 +190,6 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-    }
-
-    #[test]
-    fn dense_tp_publishes_its_supported_deployments() {
-        let schema = list_params();
-        let arch = &schema["providers"]["arch"]["iter_wise"];
-        assert_eq!(
-            arch["llama3_dense_tp"]["supported"],
-            json!([{"gpu": ["NVIDIA H200"], "model_config": ["llama3_8b"], "tp_size": [1, 2, 4, 8]}])
-        );
-    }
-
-    /// Every `#[supported]` row names a `gpu` and a `model_config`, and each other
-    /// param is a param of that arch: its own, or a model field every arch carries.
-    #[test]
-    fn supported_rows_name_only_params_of_their_arch() {
-        let schema = list_params();
-        let common: Vec<&str> = schema["arch_common"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|p| p["name"].as_str().unwrap())
-            .collect();
-        for (layer, providers) in schema["providers"]["arch"].as_object().unwrap() {
-            for (tag, provider) in providers.as_object().unwrap() {
-                let own: Vec<&str> = provider["params"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .map(|p| p["name"].as_str().unwrap())
-                    .collect();
-                for row in provider["supported"].as_array().into_iter().flatten() {
-                    let row = row.as_object().unwrap();
-                    for required in ["gpu", "model_config"] {
-                        assert!(
-                            row.contains_key(required),
-                            "{layer}.{tag}: a #[supported] row names no {required}"
-                        );
-                    }
-                    for name in row.keys() {
-                        assert!(
-                            name == "gpu"
-                                || own.contains(&name.as_str())
-                                || common.contains(&name.as_str()),
-                            "{layer}.{tag}: #[supported] names {name}, not a param of the arch"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    /// Every model a `#[supported]` row names is a `model/config/<stem>.json`
-    /// and has a `model/catalog.yaml` entry (its name on the Kernel Library).
-    #[test]
-    fn supported_models_have_a_config_and_a_catalog_entry() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let catalog: serde_yaml::Mapping = serde_yaml::from_str(
-            &std::fs::read_to_string(root.join("model/catalog.yaml")).unwrap(),
-        )
-        .unwrap();
-        let schema = list_params();
-        for providers in schema["providers"]["arch"].as_object().unwrap().values() {
-            for (tag, provider) in providers.as_object().unwrap() {
-                for row in provider["supported"].as_array().into_iter().flatten() {
-                    for model in row["model_config"].as_array().into_iter().flatten() {
-                        let model = model.as_str().unwrap();
-                        assert!(
-                            root.join(format!("model/config/{model}.json")).exists(),
-                            "{tag}: model/config/{model}.json does not exist"
-                        );
-                        assert!(
-                            catalog.contains_key(model),
-                            "{tag}: {model} has no model/catalog.yaml entry"
-                        );
-                    }
-                }
-            }
-        }
     }
 
     #[test]
@@ -301,15 +262,10 @@ mod tests {
                 .any(|param| param["name"] == "max_concurrency"),
             "max_concurrency is exposed independently of arrival_mode"
         );
-        let session_dependency = workload
-            .iter()
-            .find(|param| param["name"] == "session_dependency")
-            .expect("session_dependency is exposed");
-        assert_eq!(
-            session_dependency["choices"],
-            json!(["independent", "chained"])
-        );
-        assert!(workload.iter().all(|param| param["name"] != "replay_mode"));
+        // The trace decides whether rounds chain.
+        for retired in ["replay_mode", "session_dependency"] {
+            assert!(workload.iter().all(|param| param["name"] != retired));
+        }
     }
 
     #[test]

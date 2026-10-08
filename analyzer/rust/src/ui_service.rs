@@ -14,6 +14,7 @@ mod core;
 mod discovery;
 mod hardware;
 mod kernel_input_distribution;
+mod kernel_kinds;
 mod kernel_measurement;
 mod kernel_profile;
 mod kernel_throughput_analysis;
@@ -66,7 +67,7 @@ use alignment::{
     read_alignment_sequence, reference_lane_projection, AlignmentDetailIndex,
     AlignmentSequenceIndex, DiscoveredAlignment,
 };
-use artifact::read_json;
+use artifact::read_bytes;
 use batch::{read_batch_payload, read_batch_report};
 use catalog::build_catalog;
 use concurrency::{read_concurrency_payload, read_concurrency_report};
@@ -381,8 +382,12 @@ fn read_only_router(state: ServiceState) -> Router {
             get(get_prediction_cases),
         )
         .route(
-            "/api/analyzer/v1/predictions/{prediction_id}/subjects/kernel-input-distribution/payload",
-            get(get_prediction_kernel_input_distribution),
+            "/api/analyzer/v1/predictions/{prediction_id}/subjects/{subject}/report",
+            get(get_prediction_report),
+        )
+        .route(
+            "/api/analyzer/v1/predictions/{prediction_id}/subjects/{subject}/payload",
+            get(get_prediction_payload),
         )
         .route(
             "/api/analyzer/v1/predictions/{prediction_id}/cases/{case_id}/operations/{operation_id}/subjects/cost-tree/payload",
@@ -427,6 +432,7 @@ fn read_only_router(state: ServiceState) -> Router {
             get(get_kernel_measurement_plot),
         )
         .route("/api/analyzer/v1/hardware/gpus", get(get_hardware_gpus))
+        .route("/api/analyzer/v1/kernel-kinds", get(get_kernel_kinds))
         .route("/api/analyzer/v1/runs", get(list_runs))
         .route("/api/analyzer/v1/sweeps", get(list_sweeps))
         .route("/api/analyzer/v1/sweeps/latest", get(get_latest_sweep))
@@ -920,22 +926,53 @@ async fn get_prediction_cases(
     }
 }
 
-async fn get_prediction_kernel_input_distribution(
-    RoutePath(prediction_id): RoutePath<String>,
+async fn get_prediction_report(
+    RoutePath((prediction_id, subject)): RoutePath<(String, String)>,
     State(state): State<ServiceState>,
 ) -> Response {
-    let prediction = match state.resolve_prediction(&prediction_id) {
-        Ok(prediction) => prediction,
-        Err(error) => return prediction_resource_error(error),
-    };
-    match read_json(
-        &prediction
-            .path
-            .join("payloads/kernel_input_distribution_scatter.json"),
-    ) {
-        Ok(value) => Json(value).into_response(),
+    match state
+        .resolve_prediction(&prediction_id)
+        .and_then(|prediction| prediction_artifact_bytes(&prediction, &subject, false))
+    {
+        Ok(bytes) => alignment_json_bytes_response(bytes),
         Err(error) => prediction_resource_error(error),
     }
+}
+
+async fn get_prediction_payload(
+    RoutePath((prediction_id, subject)): RoutePath<(String, String)>,
+    State(state): State<ServiceState>,
+) -> Response {
+    match state
+        .resolve_prediction(&prediction_id)
+        .and_then(|prediction| prediction_artifact_bytes(&prediction, &subject, true))
+    {
+        Ok(bytes) => alignment_json_bytes_response(bytes),
+        Err(error) => prediction_resource_error(error),
+    }
+}
+
+/// One subject's report or payload as `analyze run` wrote it into the
+/// prediction's directory, named by the subject registry, so every subject
+/// the analysis ran is readable without a route of its own. A subject that
+/// does not apply to a prediction wrote `available: false`; one that did not
+/// run is 404. The name is matched against the registry, so a request never
+/// contributes a path component.
+fn prediction_artifact_bytes(
+    prediction: &DiscoveredPrediction,
+    subject: &str,
+    payload: bool,
+) -> Result<Vec<u8>> {
+    let entry = crate::registry::SUBJECTS
+        .iter()
+        .find(|entry| entry.name == subject)
+        .ok_or(ArtifactNotFound)?;
+    let (directory, name) = if payload {
+        ("payloads", entry.payload_name)
+    } else {
+        ("reports", entry.report_name)
+    };
+    read_bytes(&prediction.path.join(directory).join(name))
 }
 
 async fn get_prediction_cost_tree(
@@ -1227,6 +1264,29 @@ fn plot_content_type(plot_name: &str) -> &'static str {
         "image/jpeg"
     } else {
         "image/png"
+    }
+}
+
+async fn get_kernel_kinds(State(state): State<ServiceState>) -> Response {
+    let repo_root = Arc::clone(&state.repo_root);
+    match tokio::task::spawn_blocking(move || kernel_kinds::kernel_kinds(&repo_root)).await {
+        Ok(Ok(value)) => Json(value).into_response(),
+        Ok(Err(error)) => {
+            eprintln!("[analyze] kernel kinds unreadable: {error:#}");
+            problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "kernel_kinds_unreadable",
+                "The kernel kinds' DOCs could not be read.",
+            )
+        }
+        Err(error) => {
+            eprintln!("[analyze] kernel kinds worker failed: {error}");
+            problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "kernel_kinds_unreadable",
+                "The kernel kinds' DOCs could not be read.",
+            )
+        }
     }
 }
 

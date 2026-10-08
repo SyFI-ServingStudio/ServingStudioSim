@@ -1,0 +1,16 @@
+# Llama 3.1 8B on H200: TP replicas behind one router, each a barebone worker.
+# Worker: the defaults presets/unified_aime.yaml runs with.
+deployment: unified
+pools:
+  main:
+    groups:
+      - replicas: ${replicas}
+        arch:
+          preset: llama3_dense_tp
+          tp_size: ${tp_size}
+        worker:
+          type: barebone
+sweep:
+  tp_size: [1, 2, 4, 8]
+  replicas: [1, 2, 4, 8]
+constraints: [tp_size * replicas <= 8]

@@ -1,0 +1,6 @@
+checkpoint: meta-llama/Llama-3.1-8B
+gpu: NVIDIA H200
+arch:
+  type: llama3_dp_attn_tp_ffn
+  attn_tp_size: 4
+  ffn_tp_size: 8

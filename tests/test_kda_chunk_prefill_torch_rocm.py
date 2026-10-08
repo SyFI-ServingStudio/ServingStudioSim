@@ -24,12 +24,12 @@ def test_torch_rocm_backend_registered_for_mi300x() -> None:
     from profiling.db.registry import find_kernel_profiler_spec
 
     rocm_spec = find_kernel_profiler_spec("kda_chunk_prefill", "torch_rocm")
-    assert rocm_spec.supports.gpus == frozenset({"MI300X"})
+    assert rocm_spec.supports.arch_targets == frozenset({"CDNA3"})
     assert rocm_spec.subprocess_env == "vllm_rocm_env"
     assert rocm_spec.runner_ref.function_name == "profile_kda_chunk_prefill_torch_rocm"
 
     nvidia_spec = find_kernel_profiler_spec("kda_chunk_prefill", "vllm_triton")
-    assert nvidia_spec.supports.gpus == frozenset({"NVIDIA B200"})
+    assert nvidia_spec.supports.arch_targets is None
     assert nvidia_spec.subprocess_env == "vllm_env"
 
 

@@ -211,8 +211,7 @@ class Registry:
     # deployment name -> {"pools": {role -> contract class}}
     # (e.g. {"pools": {"main": "iter_wise"}}).
     deployments: dict[str, dict[str, dict[str, str]]]
-    # contract -> arch tag -> {"params": [ParamDef], "supported"?: [row]}; same
-    # for workers (no "supported"). A row maps param -> allowed values.
+    # contract -> arch tag -> {"params": [ParamDef]}; same for workers.
     arch_providers: dict[str, dict[str, dict[str, list[dict]]]]
     worker_providers: dict[str, dict[str, dict[str, list[dict]]]]
     # ParamDefs every arch tag / group / pool / the run-global blocks carry.
@@ -228,10 +227,6 @@ class Registry:
 
     def arch_params(self, contract: str, arch_type: str | None) -> list[dict]:
         return self.arch_providers.get(contract, {}).get(arch_type or "", {}).get("params", [])
-
-    def arch_supported(self, contract: str, arch_type: str | None) -> list[dict]:
-        """The arch's `#[supported]` rows; empty when it declares none."""
-        return self.arch_providers.get(contract, {}).get(arch_type or "", {}).get("supported", [])
 
     def worker_params(self, contract: str, worker_type: str | None) -> list[dict]:
         return self.worker_providers.get(contract, {}).get(worker_type or "", {}).get("params", [])
@@ -339,16 +334,21 @@ def iter_slots(registry: Registry, config: dict, *, create: bool = False) -> Ite
                     yield Slot(group, fld, pdef, base + (fld,))
             arch = _child(group, "arch")
             if arch is not None:
-                arch_type = arch.get("type")
-                for pdef in registry.arch_common:
-                    yield Slot(arch, pdef["name"], pdef, base + ("arch", pdef["name"]))
-                for pdef in registry.arch_params(contract, arch_type):
-                    yield Slot(arch, pdef["name"], pdef, base + ("arch", pdef["name"]))
+                yield from iter_arch_slots(registry, contract, arch, base + ("arch",))
             worker = _child(group, "worker")
             if worker is not None:
                 worker_type = worker.get("type")
                 for pdef in registry.worker_params(contract, worker_type):
                     yield Slot(worker, pdef["name"], pdef, base + ("worker", pdef["name"]))
+
+
+def iter_arch_slots(
+    registry: Registry, contract: str, arch: dict, path: tuple[str, ...] = ("arch",)
+) -> Iterator[Slot]:
+    """Yield one `Slot` per expected param of one arch block of `contract`:
+    the params every arch carries, then its type's own."""
+    for pdef in [*registry.arch_common, *registry.arch_params(contract, arch.get("type"))]:
+        yield Slot(arch, pdef["name"], pdef, path + (pdef["name"],))
 
 
 def unknown_keys(registry: Registry, config: dict) -> list[str]:

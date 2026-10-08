@@ -16,6 +16,15 @@ pub mod deepseek_v4_attention_local;
 pub mod deepseek_v4_moe_expert_compute_local;
 pub mod deepseek_v4_moe_router_local;
 pub mod deepseek_v4_shared_expert_local;
+pub mod deepseek_v41_attention_tp;
+pub mod deepseek_v41_common;
+pub mod deepseek_v41_engram_prefetch_local;
+pub mod deepseek_v41_engram_tp;
+pub mod deepseek_v41_head_tp;
+#[cfg(test)]
+mod deepseek_v41_iteration_tests;
+pub mod deepseek_v41_moe_ffn_ep;
+pub mod deepseek_v41_prologue_tp;
 pub mod dflash2_context_kv_local;
 pub mod dflash2_draft_layer_local;
 pub mod dflash2_selector_local;
@@ -30,8 +39,8 @@ pub mod glm52_mtp_prelude_local;
 pub mod glm52_shared_expert_local;
 mod glm53_common;
 pub mod glm53_dsa_attn_local;
-pub mod glm53_fp8_mlp_local;
 pub mod glm53_kda_attn_local;
+pub mod glm53_mlp_local;
 pub mod glm53_moe_local;
 pub mod mlp_block_tp;
 pub mod moe_expert_compute_local;
@@ -87,6 +96,31 @@ pub use deepseek_v4_shared_expert_local::{
     DeepseekV4SharedExpertLocalWorklet, DeepseekV4SharedExpertLocalWorkletConfig,
     DeepseekV4SharedExpertLocalWorkletInput, DeepseekV4SharedExpertLocalWorkletResolved,
 };
+pub use deepseek_v41_attention_tp::{
+    DeepseekV41AttentionEntry, DeepseekV41AttentionLayer, DeepseekV41AttentionTpWorklet,
+    DeepseekV41AttentionTpWorkletConfig, DeepseekV41AttentionTpWorkletInput,
+    DeepseekV41AttentionTpWorkletResolved, DeepseekV41IndexRole,
+};
+pub use deepseek_v41_engram_prefetch_local::{
+    DeepseekV41EngramPrefetchLocalWorklet, DeepseekV41EngramPrefetchLocalWorkletConfig, DeepseekV41EngramPrefetchLocalWorkletInput,
+    DeepseekV41EngramPrefetchLocalWorkletResolved,
+};
+pub use deepseek_v41_engram_tp::{
+    DeepseekV41EngramTpWorklet, DeepseekV41EngramTpWorkletConfig, DeepseekV41EngramTpWorkletInput,
+    DeepseekV41EngramTpWorkletResolved,
+};
+pub use deepseek_v41_head_tp::{
+    DeepseekV41HeadTpWorklet, DeepseekV41HeadTpWorkletConfig, DeepseekV41HeadTpWorkletInput,
+    DeepseekV41HeadTpWorkletResolved,
+};
+pub use deepseek_v41_moe_ffn_ep::{
+    DeepseekV41MoeFfnEpWorklet, DeepseekV41MoeFfnEpWorkletConfig, DeepseekV41MoeFfnEpWorkletInput,
+    DeepseekV41MoeFfnEpWorkletResolved,
+};
+pub use deepseek_v41_prologue_tp::{
+    DeepseekV41PrologueTpWorklet, DeepseekV41PrologueTpWorkletConfig, DeepseekV41PrologueTpWorkletInput,
+    DeepseekV41PrologueTpWorkletResolved,
+};
 pub use dflash2_context_kv_local::{
     Dflash2ContextKvLocalWorklet, Dflash2ContextKvLocalWorkletConfig,
     Dflash2ContextKvLocalWorkletInput, Dflash2ContextKvLocalWorkletResolved,
@@ -133,17 +167,18 @@ pub use glm52_shared_expert_local::{
     Glm52SharedExpertLocalWorklet, Glm52SharedExpertLocalWorkletConfig,
     Glm52SharedExpertLocalWorkletInput, Glm52SharedExpertLocalWorkletResolved,
 };
+pub use glm53_common::{Glm53ActivationQuant, Glm53ActivationQuantConfig, Glm53WeightPrecision};
 pub use glm53_dsa_attn_local::{
     Glm53DsaAttnLocalWorklet, Glm53DsaAttnLocalWorkletConfig, Glm53DsaAttnLocalWorkletInput,
     Glm53DsaAttnLocalWorkletResolved,
 };
-pub use glm53_fp8_mlp_local::{
-    Glm53Fp8MlpLocalWorklet, Glm53Fp8MlpLocalWorkletConfig, Glm53Fp8MlpLocalWorkletInput,
-    Glm53Fp8MlpLocalWorkletResolved,
-};
 pub use glm53_kda_attn_local::{
     Glm53KdaAttnLocalWorklet, Glm53KdaAttnLocalWorkletConfig, Glm53KdaAttnLocalWorkletInput,
     Glm53KdaAttnLocalWorkletResolved,
+};
+pub use glm53_mlp_local::{
+    Glm53MlpLocalWorklet, Glm53MlpLocalWorkletConfig, Glm53MlpLocalWorkletInput,
+    Glm53MlpLocalWorkletResolved,
 };
 pub use glm53_moe_local::{
     Glm53MoeRouterLocalWorklet, Glm53MoeRouterLocalWorkletConfig, Glm53MoeRouterLocalWorkletInput,

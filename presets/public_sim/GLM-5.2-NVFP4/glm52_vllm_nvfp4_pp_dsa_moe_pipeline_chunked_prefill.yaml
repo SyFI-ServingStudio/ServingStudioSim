@@ -1,0 +1,26 @@
+# vLLM GLM-5.2 NVFP4 on B200, pure PP4 or PP8 (one GPU per stage, EP1), chunked prefill
+# at 2048 tokens.
+# Worker: the PR #78 PP study,
+# no alignment pack: pipeline_chunked_prefill, gpu_time_multiplier 1.0 (pure kernel sum). Its
+# 8192-token chunk is replaced by 2048, the chunk of the vLLM sibling
+# glm52_vllm_nvfp4_dsa_moe_chunked_prefill (the captured server's).
+# attn_gpu_memory_gb is that study's per-GPU budget for every layout: the SGLang TP4 server's
+# measured KV pool, 817408 tokens x 220896 B / 4 GPUs = 45.140539392 GB. Every stage holds the
+# same tokens, so the head sizes KV by the stage with the most KV bytes per token.
+deployment: pp
+pools:
+  stage:
+    groups:
+      - replicas: ${replicas}
+        arch:
+          preset: glm52_vllm_nvfp4_pp_dsa_moe
+          pp_size: ${pp_size}
+          max_model_len: ${max_model_len}
+        worker:
+          type: pipeline_chunked_prefill
+          max_batch_tokens: 2048
+          attn_gpu_memory_gb: 45.140539392
+sweep:
+  replicas: [1, 2]
+  pp_size: [4, 8]
+  max_model_len: [8192, 65536, 131072, 262144, 524288]

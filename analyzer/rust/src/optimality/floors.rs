@@ -23,8 +23,16 @@
 //! (`uv run python -m model.work.floors`). Transport/parse failure degrades the
 //! request; a per-level label failure degrades only that scope and leaves other
 //! worker/pool labels available.
+//!
+//! A pipeline-parallel stage owns only its layers ([`super::pipeline`]). Every
+//! request names the run's stages and their layer ranges, and the labeler gives a
+//! stage level its share of the whole model's label, so the stages of one pipeline
+//! add up to one whole-model floor. A pipelined pool's floor, and the cluster over
+//! it, are those sums; they are never labelled as one pooled workload, which would
+//! push each microbatch through the whole model once per stage. Identical locked
+//! compositions (every stage of one pipeline) are sent once.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -39,6 +47,8 @@ use crate::conservation::workload::{
     WeightedWorkload, WorkloadTotals,
 };
 use crate::kernel_query::owning_repo_root;
+
+use super::pipeline::{read_pipeline_stages, PipelineStages};
 
 /// One level's two labeler floors, in GPU·seconds. Ordered `fused ≤ segmented`.
 #[derive(Clone, Copy, Default)]
@@ -106,7 +116,8 @@ impl IterationLabel {
 pub(super) struct RunLabels {
     pub(super) floors: FloorsByLevel,
     pub(super) workers: HashMap<(String, u16), WorkerComposition>,
-    pub(super) errors: HashMap<String, String>,
+    /// By level key, in order: the report lists one caveat per error.
+    pub(super) errors: BTreeMap<String, String>,
     /// Distinct shapes in the *sample* that was labeled.
     pub(super) batch_locked_unique_shapes: Option<usize>,
     /// Iterations the floors describe: the exact run total the sample is anchored to.
@@ -120,7 +131,7 @@ pub(super) struct RunLabels {
 
 struct ParsedLabels {
     labels: HashMap<String, IterationLabel>,
-    errors: HashMap<String, String>,
+    errors: BTreeMap<String, String>,
     composition_stats: HashMap<String, CompositionStats>,
 }
 
@@ -144,16 +155,19 @@ pub(super) async fn compute_saturated_run_labels(
     if by_worker.is_empty() {
         return Err(anyhow!("no cost_log workload rows to aggregate"));
     }
-    let mut levels = rollup_levels(&by_worker);
+    let stages = read_pipeline_stages(log_dir)?;
+    let mut levels = rollup_levels(&by_worker, &stages);
     let normalization = f64::from(replication_factor);
     for ((pool_tag, worker_id), totals) in &by_worker {
         let mut saturated_totals = totals.clone();
         saturated_totals.scale(normalization);
         levels.insert(saturated_worker_key(pool_tag, *worker_id), saturated_totals);
     }
-    let response = run_labeler_json(log_dir, &levels)?;
+    let response = run_labeler_json(log_dir, &levels, &stages)?;
     let ParsedLabels {
-        mut labels, errors, ..
+        mut labels,
+        mut errors,
+        ..
     } = parse_labels(&response)?;
     let mut workers = HashMap::new();
     for (pool_tag, worker_id) in by_worker.keys() {
@@ -172,10 +186,11 @@ pub(super) async fn compute_saturated_run_labels(
             );
         }
     }
-    let floors = labels
+    let mut floors: FloorsByLevel = labels
         .into_iter()
         .map(|(key, label)| (key, label.floors))
         .collect();
+    add_pipelined_rollups(&by_worker, &stages, &mut floors, &mut errors);
     Ok(RunLabels {
         floors,
         workers,
@@ -230,7 +245,8 @@ pub(super) async fn compute_batch_locked_run_labels(
         .map(|sample| sample.decode_stride)
         .max()
         .unwrap_or(1);
-    let request = build_locked_request(&shapes_by_worker);
+    let stages = read_pipeline_stages(log_dir)?;
+    let request = build_locked_request(&shapes_by_worker, &stages);
     let response = run_labeler_request(log_dir, &request)?;
     let ParsedLabels {
         mut labels,
@@ -319,7 +335,7 @@ pub(super) async fn compute_iteration_label(
     totals.scale(normalization);
     let level_key = format!("{pool_tag}/{worker_id}");
     let levels = HashMap::from([(level_key.clone(), totals)]);
-    let response = run_labeler_json(log_dir, &levels)?;
+    let response = run_labeler_json(log_dir, &levels, &read_pipeline_stages(log_dir)?)?;
     let mut parsed = parse_labels(&response)?;
     if let Some(error) = parsed.errors.remove(&level_key) {
         return Err(anyhow!("labeler could not label iteration: {error}"));
@@ -377,7 +393,7 @@ fn parse_labels(response: &Value) -> Result<ParsedLabels> {
         .and_then(Value::as_object)
         .context("labeler output missing `levels` object")?;
     let mut labels = HashMap::new();
-    let mut errors = HashMap::new();
+    let mut errors = BTreeMap::new();
     let mut composition_stats = HashMap::new();
     for (key, level) in levels {
         if let Some(error) = level.get("error").and_then(Value::as_str) {
@@ -465,13 +481,23 @@ fn parse_labels(response: &Value) -> Result<ParsedLabels> {
 /// Roll the per-worker totals up into the three level granularities the waterfall
 /// draws. All `WorkloadTotals` fields are additive, so pool = Σ its workers and
 /// cluster = Σ all — the roofline (a max) is applied per level by the labeler.
+///
+/// A pipelined pool is the exception: its stages each forward the same tokens, so
+/// summing them would label every microbatch once per stage. Neither that pool nor
+/// a cluster containing one is labelled; [`add_pipelined_rollups`] adds their stage
+/// floors instead.
 fn rollup_levels(
     by_worker: &HashMap<(String, u16), WorkloadTotals>,
+    stages: &PipelineStages,
 ) -> HashMap<String, WorkloadTotals> {
     let mut levels: HashMap<String, WorkloadTotals> = HashMap::new();
     for ((pool_tag, worker_id), totals) in by_worker {
-        levels.entry("cluster".to_string()).or_default().add(totals);
-        levels.entry(pool_tag.clone()).or_default().add(totals);
+        if stages.is_empty() {
+            levels.entry("cluster".to_string()).or_default().add(totals);
+        }
+        if !stages.contains_key(&(pool_tag.clone(), *worker_id)) {
+            levels.entry(pool_tag.clone()).or_default().add(totals);
+        }
         levels
             .entry(format!("{pool_tag}/{worker_id}"))
             .or_default()
@@ -480,8 +506,69 @@ fn rollup_levels(
     levels
 }
 
-fn run_labeler_json(log_dir: &Path, levels: &HashMap<String, WorkloadTotals>) -> Result<Value> {
-    let request = build_request(levels);
+/// The pool and cluster floors [`rollup_levels`] leaves out of a pipelined run:
+/// each pipelined pool is the sum of its stages' floors, and the cluster is the sum
+/// of its pools' when every pool is pipelined. A cluster mixing pipelined and plain
+/// pools has no composed floor. A scope with a missing member is left absent; the
+/// member's own error is already reported.
+fn add_pipelined_rollups(
+    by_worker: &HashMap<(String, u16), WorkloadTotals>,
+    stages: &PipelineStages,
+    floors: &mut FloorsByLevel,
+    errors: &mut BTreeMap<String, String>,
+) {
+    if stages.is_empty() {
+        return;
+    }
+    let pools: BTreeSet<&str> = by_worker
+        .keys()
+        .map(|(pool_tag, _)| pool_tag.as_str())
+        .collect();
+    let pipelined: BTreeSet<&str> = stages
+        .keys()
+        .map(|(pool_tag, _)| pool_tag.as_str())
+        .collect();
+    for pool_tag in &pipelined {
+        let mut pool_floors = Floors::default();
+        let complete = by_worker
+            .keys()
+            .filter(|(worker_pool, _)| worker_pool == pool_tag)
+            .all(
+                |(_, worker_id)| match floors.get(&format!("{pool_tag}/{worker_id}")) {
+                    Some(stage_floors) => {
+                        pool_floors.add_scaled(*stage_floors, 1.0);
+                        true
+                    }
+                    None => false,
+                },
+            );
+        if complete {
+            floors.insert(pool_tag.to_string(), pool_floors);
+        }
+    }
+    if pools != pipelined {
+        errors.insert(
+            "cluster".to_string(),
+            "no composed floor for a cluster mixing pipelined and plain pools".to_string(),
+        );
+        return;
+    }
+    let mut cluster_floors = Floors::default();
+    for pool_tag in &pools {
+        match floors.get(*pool_tag) {
+            Some(pool_floors) => cluster_floors.add_scaled(*pool_floors, 1.0),
+            None => return,
+        }
+    }
+    floors.insert("cluster".to_string(), cluster_floors);
+}
+
+fn run_labeler_json(
+    log_dir: &Path,
+    levels: &HashMap<String, WorkloadTotals>,
+    stages: &PipelineStages,
+) -> Result<Value> {
+    let request = build_request(levels, stages);
     run_labeler_request(log_dir, &request)
 }
 
@@ -538,12 +625,29 @@ fn run_labeler_request(log_dir: &Path, request: &impl Serialize) -> Result<Value
     serde_json::from_slice(&output.stdout).context("parse labeler stdout as JSON")
 }
 
-fn build_request(levels: &HashMap<String, WorkloadTotals>) -> Value {
+fn build_request(levels: &HashMap<String, WorkloadTotals>, stages: &PipelineStages) -> Value {
     let mut level_json = Map::new();
     for (key, totals) in levels {
         level_json.insert(key.clone(), workload_json(totals));
     }
-    json!({ "levels": Value::Object(level_json) })
+    let mut request = json!({ "levels": Value::Object(level_json) });
+    if !stages.is_empty() {
+        request["pipeline_stages"] = json!(pipeline_stages_json(stages));
+    }
+    request
+}
+
+/// `"<pool_tag>/<worker_id>"` -> `[start, end)` decoder layers, for every stage.
+fn pipeline_stages_json(stages: &PipelineStages) -> BTreeMap<String, [u32; 2]> {
+    stages
+        .iter()
+        .map(|((pool_tag, worker_id), stage)| {
+            (
+                format!("{pool_tag}/{worker_id}"),
+                [stage.layers.0, stage.layers.1],
+            )
+        })
+        .collect()
 }
 
 /// One worker's deduplicated shapes as parallel arrays: element `i` of every
@@ -573,13 +677,41 @@ struct WorkloadColumns<'a> {
 #[derive(Serialize)]
 struct LockedRequest<'a> {
     locked_compositions: BTreeMap<String, LockedComposition<'a>>,
+    /// Worker key -> the key of the identical composition sent in its place.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    composition_aliases: BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pipeline_stages: BTreeMap<String, [u32; 2]>,
 }
 
-fn build_locked_request(
-    shapes_by_worker: &HashMap<(String, u16), Vec<WeightedWorkload>>,
-) -> LockedRequest<'_> {
-    let locked_compositions = shapes_by_worker
-        .iter()
+fn build_locked_request<'a>(
+    shapes_by_worker: &'a HashMap<(String, u16), Vec<WeightedWorkload>>,
+    stages: &PipelineStages,
+) -> LockedRequest<'a> {
+    // Every stage of a pipeline forwards the same microbatches, so its stages'
+    // compositions are equal; send each distinct composition of a pool once.
+    let mut worker_keys: Vec<&(String, u16)> = shapes_by_worker.keys().collect();
+    worker_keys.sort();
+    let mut sent: Vec<&(String, u16)> = Vec::new();
+    let mut composition_aliases = BTreeMap::new();
+    for worker_key in worker_keys {
+        let shapes = &shapes_by_worker[worker_key];
+        match sent
+            .iter()
+            .find(|sent_key| sent_key.0 == worker_key.0 && shapes_by_worker[**sent_key] == *shapes)
+        {
+            Some(sent_key) => {
+                composition_aliases.insert(
+                    format!("{}/{}", worker_key.0, worker_key.1),
+                    format!("{}/{}", sent_key.0, sent_key.1),
+                );
+            }
+            None => sent.push(worker_key),
+        }
+    }
+    let locked_compositions = sent
+        .into_iter()
+        .map(|worker_key| (worker_key, &shapes_by_worker[worker_key]))
         .map(|((pool_tag, worker_id), shapes)| {
             let column = |field: fn(&WorkloadTotals) -> f64| {
                 shapes.iter().map(|shape| field(&shape.totals)).collect()
@@ -610,6 +742,8 @@ fn build_locked_request(
         .collect();
     LockedRequest {
         locked_compositions,
+        composition_aliases,
+        pipeline_stages: pipeline_stages_json(stages),
     }
 }
 
@@ -632,8 +766,39 @@ fn workload_json(totals: &WorkloadTotals) -> Value {
 mod tests {
     use serde_json::json;
 
-    use super::{parse_labels, rollup_locked_floors, Floors, WorkerComposition};
-    use crate::conservation::workload::WorkloadTotals;
+    use std::collections::{BTreeMap, HashMap};
+
+    use super::{
+        add_pipelined_rollups, build_locked_request, build_request, parse_labels, rollup_levels,
+        rollup_locked_floors, Floors, FloorsByLevel, WorkerComposition,
+    };
+    use crate::conservation::workload::{WeightedWorkload, WorkloadTotals};
+    use crate::optimality::pipeline::{PipelineStage, PipelineStages};
+
+    fn tokens(matmul_tokens: f64) -> WorkloadTotals {
+        WorkloadTotals {
+            matmul_tokens,
+            ..WorkloadTotals::default()
+        }
+    }
+
+    /// `pool` as a pipeline of `ranges.len()` stages over those layer ranges.
+    fn pipeline(pool: &str, ranges: &[(u32, u32)]) -> PipelineStages {
+        ranges
+            .iter()
+            .enumerate()
+            .map(|(index, &layers)| {
+                (
+                    (pool.to_string(), index as u16),
+                    PipelineStage {
+                        index: index as u16,
+                        num_stages: ranges.len() as u16,
+                        layers,
+                    },
+                )
+            })
+            .collect()
+    }
 
     #[test]
     fn workload_payload_carries_stateful_prefill_requests() {
@@ -715,5 +880,112 @@ mod tests {
         assert_eq!(complete_floors["main"].fused, 13.0);
         assert_eq!(complete_floors["cluster"].fused, 18.0);
         assert_eq!(complete_floors["cluster"].segmented, 23.0);
+    }
+
+    #[test]
+    fn a_pipelined_pool_is_never_labelled_as_one_pooled_workload() {
+        let by_worker = HashMap::from([
+            (("pp".to_string(), 0), tokens(8.0)),
+            (("pp".to_string(), 1), tokens(8.0)),
+        ]);
+        let plain = rollup_levels(&by_worker, &PipelineStages::new());
+        assert_eq!(plain["pp"].matmul_tokens, 16.0);
+        assert_eq!(plain["cluster"].matmul_tokens, 16.0);
+
+        let stages = pipeline("pp", &[(0, 20), (20, 45)]);
+        let levels = rollup_levels(&by_worker, &stages);
+        let mut keys: Vec<&str> = levels.keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(keys, ["pp/0", "pp/1"]);
+        let request = build_request(&levels, &stages);
+        assert_eq!(
+            request["pipeline_stages"]["pp/1"],
+            serde_json::json!([20, 45])
+        );
+        assert!(build_request(&plain, &PipelineStages::new())
+            .get("pipeline_stages")
+            .is_none());
+    }
+
+    #[test]
+    fn pipelined_pool_and_cluster_floors_are_the_sum_of_their_stages() {
+        let by_worker = HashMap::from([
+            (("pp".to_string(), 0), tokens(8.0)),
+            (("pp".to_string(), 1), tokens(8.0)),
+        ]);
+        let stages = pipeline("pp", &[(0, 20), (20, 45)]);
+        let stage_floors = |fused, segmented| Floors { fused, segmented };
+        let mut floors: FloorsByLevel = BTreeMap::from([
+            ("pp/0".to_string(), stage_floors(2.0, 3.0)),
+            ("pp/1".to_string(), stage_floors(5.0, 7.0)),
+        ])
+        .into_iter()
+        .collect();
+        let mut errors = BTreeMap::new();
+        add_pipelined_rollups(&by_worker, &stages, &mut floors, &mut errors);
+        assert!(errors.is_empty());
+        assert_eq!(floors["pp"].fused, 7.0);
+        assert_eq!(floors["pp"].segmented, 10.0);
+        assert_eq!(floors["cluster"].fused, 7.0);
+
+        // A missing stage leaves its pool and the cluster absent, not undercounted.
+        let mut partial: FloorsByLevel =
+            BTreeMap::from([("pp/0".to_string(), stage_floors(2.0, 3.0))])
+                .into_iter()
+                .collect();
+        add_pipelined_rollups(&by_worker, &stages, &mut partial, &mut errors);
+        assert!(!partial.contains_key("pp") && !partial.contains_key("cluster"));
+
+        // A plain pool beside a pipelined one has no composed cluster floor.
+        let mut mixed_workers = by_worker.clone();
+        mixed_workers.insert(("decode".to_string(), 0), tokens(1.0));
+        let mut mixed = floors.clone();
+        mixed.remove("cluster");
+        add_pipelined_rollups(&mixed_workers, &stages, &mut mixed, &mut errors);
+        assert!(!mixed.contains_key("cluster"));
+        assert!(errors["cluster"].contains("mixing pipelined and plain pools"));
+    }
+
+    #[test]
+    fn identical_locked_compositions_are_sent_once_per_pool() {
+        let shapes = |matmul_tokens| {
+            vec![WeightedWorkload {
+                totals: tokens(matmul_tokens),
+                occurrences: 3,
+            }]
+        };
+        let shapes_by_worker = HashMap::from([
+            (("pp".to_string(), 0), shapes(8.0)),
+            (("pp".to_string(), 1), shapes(8.0)),
+            (("pp".to_string(), 2), shapes(8.0)),
+            (("dp".to_string(), 0), shapes(8.0)),
+            (("dp".to_string(), 1), shapes(9.0)),
+        ]);
+        let stages = pipeline("pp", &[(0, 10), (10, 20), (20, 45)]);
+        let request =
+            serde_json::to_value(build_locked_request(&shapes_by_worker, &stages)).unwrap();
+        let mut sent: Vec<&str> = request["locked_compositions"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        sent.sort();
+        // Equal compositions in different pools are never aliased to each other.
+        assert_eq!(sent, ["dp/0", "dp/1", "pp/0"]);
+        assert_eq!(
+            request["composition_aliases"],
+            serde_json::json!({"pp/1": "pp/0", "pp/2": "pp/0"})
+        );
+        assert_eq!(
+            request["pipeline_stages"]["pp/2"],
+            serde_json::json!([20, 45])
+        );
+
+        let plain = HashMap::from([(("dp".to_string(), 0), shapes(8.0))]);
+        let plain_request =
+            serde_json::to_value(build_locked_request(&plain, &PipelineStages::new())).unwrap();
+        assert!(plain_request.get("composition_aliases").is_none());
+        assert!(plain_request.get("pipeline_stages").is_none());
     }
 }

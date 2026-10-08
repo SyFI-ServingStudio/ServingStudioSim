@@ -1,0 +1,33 @@
+# vLLM GLM-5.2 NVFP4 on B200, DP4 or DP8 attention (TP1 per GPU) with EP4 or EP8 experts,
+# chunked prefill at 2048 tokens.
+# Worker: the PR #78 DP study,
+# no alignment pack: batch_policy mix, vLLM's DP load balancer, gpu_time_multiplier 1.0. Its
+# 8192-token chunk is replaced by 2048, the chunk of the vLLM sibling
+# glm52_vllm_nvfp4_dsa_moe_chunked_prefill (the captured server's).
+# attn_gpu_memory_gb follows that study's DP-correct rule:
+# the SGLang TP4 measured pool, 45.140539392 GB, minus the extra weight a GPU holds when every rank
+# keeps all non-expert weights: KV = 45.1405 - (W_dpN - W_tp4), 19.59879168 GB at DP4 (354,896
+# tokens per rank) and 70.55964288 GB at DP8 (1,277,698). DP4 therefore stops at 256K context.
+deployment: unified
+pools:
+  main:
+    groups:
+      - replicas: ${replicas}
+        arch:
+          preset: glm52_vllm_nvfp4_dp_attn_dsa_moe
+          ep_size: ${ep_size}
+          max_model_len: ${max_model_len}
+        worker:
+          type: chunked_prefill
+          max_batch_tokens: 2048
+          batch_policy: mix
+          dp_placement: vllm-least-loaded
+          attn_gpu_memory_gb: ${attn_gpu_memory_gb}
+sweep:
+  replicas: [1, 2]
+  max_model_len: [8192, 65536, 131072, 262144, 524288]
+compound:
+  layout:
+    dp4ep4: {ep_size: 4, attn_gpu_memory_gb: 19.59879168}
+    dp8ep8: {ep_size: 8, attn_gpu_memory_gb: 70.55964288}
+constraints: [ep_size == 8 or max_model_len <= 262144]

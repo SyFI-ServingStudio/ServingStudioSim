@@ -3,7 +3,9 @@ use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, Float64Array, Int16Array, RecordBatch, StringArray, UInt64Array};
+use arrow_array::{
+    ArrayRef, Float64Array, Int16Array, RecordBatch, StringArray, UInt32Array, UInt64Array,
+};
 use arrow_schema::{DataType, Field, Schema};
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
@@ -1025,6 +1027,50 @@ async fn prediction_http_routes_publish_catalog_descriptor_cases_and_problem_jso
         .is_some_and(|detail| !detail.contains(temporary.path().to_string_lossy().as_ref())));
 }
 
+#[tokio::test]
+async fn prediction_subject_routes_read_what_the_analysis_wrote_by_registry_name() {
+    let temporary = TempDir::new().expect("temporary logs root");
+    let prediction_path = temporary.path().join("predict-llama");
+    make_prediction(&prediction_path, "p_subjects");
+    fs::create_dir_all(prediction_path.join("reports")).unwrap();
+    fs::create_dir_all(prediction_path.join("payloads")).unwrap();
+    fs::write(
+        prediction_path.join("payloads/kernel_time_share_composition.json"),
+        r#"{"available": true, "overall": {"kernel_time_ms": 2.0, "segments": [
+            {"position": "m.mlp", "kind": "single_gemm", "kernel_time_ms": 1.5, "share_pct": 75.0}
+        ]}}"#,
+    )
+    .unwrap();
+    fs::write(
+        prediction_path.join("reports/slo_general_report.json"),
+        r#"{"available": false, "reason": "no requests"}"#,
+    )
+    .unwrap();
+    let router = prediction_test_router(temporary.path());
+    let base = "/api/analyzer/v1/predictions/p_subjects/subjects";
+
+    let (status, share) =
+        get_json(router.clone(), &format!("{base}/kernel-time-share/payload")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(share["overall"]["segments"][0]["position"], "m.mlp");
+
+    // A subject that does not apply is served as the analysis wrote it.
+    let (status, slo) = get_json(router.clone(), &format!("{base}/slo-general/report")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(slo["available"], false);
+
+    // Not run, or not a subject: 404, and the name never becomes a path.
+    for subject in [
+        "kernel-time-share/report",
+        "no-such-subject/payload",
+        "..%2Freports/payload",
+    ] {
+        let (status, missing) = get_json(router.clone(), &format!("{base}/{subject}")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{subject}");
+        assert_eq!(missing["code"], "artifact_missing", "{subject}");
+    }
+}
+
 #[test]
 fn prediction_discovery_skips_duplicate_ids_and_ignores_old_logs() {
     let temporary = TempDir::new().expect("temporary logs root");
@@ -1652,21 +1698,42 @@ fn model_resource_rejects_paths_outside_model_config() {
     assert!(error.to_string().contains("below model/config"));
 }
 
+/// The run's request record, as the simulator writes `raw/request_slo.parquet`:
+/// one row per released request, `(arrival_time_ms, declared_prefix_tokens,
+/// fresh_prompt_tokens, target_output_tokens)`.
+fn write_released_requests(run_path: &Path, rows: &[(f64, u32, u32, u32)]) {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("arrival_time_ms", DataType::Float64, false),
+        Field::new("declared_prefix_tokens", DataType::UInt32, false),
+        Field::new("fresh_prompt_tokens", DataType::UInt32, false),
+        Field::new("target_output_tokens", DataType::UInt32, false),
+    ]));
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(Float64Array::from_iter_values(rows.iter().map(|row| row.0))),
+        Arc::new(UInt32Array::from_iter_values(rows.iter().map(|row| row.1))),
+        Arc::new(UInt32Array::from_iter_values(rows.iter().map(|row| row.2))),
+        Arc::new(UInt32Array::from_iter_values(rows.iter().map(|row| row.3))),
+    ];
+    let batch =
+        RecordBatch::try_new(Arc::clone(&schema), columns).expect("build request record batch");
+    let file = fs::File::create(run_path.join("raw/request_slo.parquet"))
+        .expect("create request record");
+    let mut writer = ArrowWriter::try_new(file, schema, None).expect("create parquet writer");
+    writer.write(&batch).expect("write request rows");
+    writer.close().expect("close request record");
+}
+
 #[test]
-fn workload_resource_summarizes_configured_trace() {
+fn workload_resource_summarizes_the_requests_the_run_released() {
     let temporary = TempDir::new().expect("temporary logs root");
     let run_path = temporary.path().join("simulation");
     make_core_run(&run_path);
-    let repo = TempDir::new().expect("temporary repository");
-    fs::create_dir_all(repo.path().join("trace")).expect("create trace directory");
-    fs::write(
-        repo.path().join("trace/workload.csv"),
-        "id,input_len,output_len,arrival_time\n\
-         0,8,32,0\n\
-         1,16,64,2000\n\
-         2,32,128,4000\n",
-    )
-    .expect("write trace");
+    // Released out of order and already on the run's own timeline; no trace
+    // file is read, so none is written.
+    write_released_requests(
+        &run_path,
+        &[(1000.0, 0, 16, 64), (0.0, 0, 8, 32), (2000.0, 0, 32, 128)],
+    );
     let roots =
         configure_logs_roots(vec![temporary.path().to_path_buf()]).expect("configure logs root");
     let run = discover_runs(&roots)
@@ -1674,7 +1741,7 @@ fn workload_resource_summarizes_configured_trace() {
         .pop()
         .expect("one run");
 
-    let workload = read_workload(&run, repo.path()).expect("read workload resource");
+    let workload = read_workload(&run, temporary.path()).expect("read workload resource");
 
     assert_eq!(workload["schema_version"], 1);
     assert_eq!(workload["scope"], "configured_trace");
@@ -1696,31 +1763,20 @@ fn workload_resource_summarizes_configured_trace() {
 }
 
 #[test]
-fn workload_arrival_basis_reads_the_arrival_axis_not_the_capacity_cap() {
+fn workload_resource_counts_a_rounds_carried_context_as_its_prompt() {
     let temporary = TempDir::new().expect("temporary logs root");
     let run_path = temporary.path().join("simulation");
     make_core_run(&run_path);
-    // A capped run is still trace-timed unless it says otherwise, so the
-    // recorded timeline must stay rescaled by request_rate.
     let params = fs::read_to_string(run_path.join("raw/params.json")).expect("read params");
     fs::write(
         run_path.join("raw/params.json"),
         params.replace(
             r#""request_rate": 2.0"#,
-            r#""request_rate": 2.0, "max_concurrency": 2, "arrival_mode": "trace_timed""#,
+            r#""request_rate": 2.0, "arrival_mode": "saturated""#,
         ),
     )
     .expect("write params");
-    let repo = TempDir::new().expect("temporary repository");
-    fs::create_dir_all(repo.path().join("trace")).expect("create trace directory");
-    fs::write(
-        repo.path().join("trace/workload.csv"),
-        "id,input_len,output_len,arrival_time\n\
-         0,8,32,0\n\
-         1,16,64,2000\n\
-         2,32,128,4000\n",
-    )
-    .expect("write trace");
+    write_released_requests(&run_path, &[(0.0, 0, 100, 10), (0.0, 110, 50, 10)]);
     let roots =
         configure_logs_roots(vec![temporary.path().to_path_buf()]).expect("configure logs root");
     let run = discover_runs(&roots)
@@ -1728,71 +1784,75 @@ fn workload_arrival_basis_reads_the_arrival_axis_not_the_capacity_cap() {
         .pop()
         .expect("one run");
 
-    let workload = read_workload(&run, repo.path()).expect("read workload resource");
+    let workload = read_workload(&run, temporary.path()).expect("read workload resource");
 
-    assert_eq!(workload["arrival_basis"], "effective_trace_timed");
-    let arrival_seconds = workload["arrival_seconds"]
-        .as_array()
-        .expect("arrival seconds");
-    assert!((arrival_seconds[1].as_f64().unwrap() - 1.0).abs() < 1e-9);
+    assert_eq!(workload["arrival_basis"], "effective_open_loop");
+    assert_eq!(workload["average_input_tokens"], 130.0);
 }
 
 #[test]
-fn workload_resource_accepts_launcher_experiment_trace_path() {
-    let repository = TempDir::new().expect("temporary repository");
-    let logs_root = repository.path().join("logs");
-    let run_path = repository.path().join("logs/experiment/rate90.0/tp1");
-    make_core_run(&run_path);
-    let source_path = "logs/experiment/trace/workload.csv";
-    let params_path = run_path.join("raw/params.json");
-    let params = fs::read_to_string(&params_path)
-        .expect("read params")
-        .replace("trace/workload.csv", source_path);
-    fs::write(params_path, params).expect("write launcher params");
-    fs::create_dir_all(repository.path().join("logs/experiment/trace"))
-        .expect("create experiment trace directory");
-    fs::write(
-        repository.path().join(source_path),
-        "id,input_len,output_len,arrival_time\n0,8,32,0\n1,16,64,2000\n",
-    )
-    .expect("write experiment trace");
-    let roots = configure_logs_roots(vec![logs_root.clone()]).expect("configure logs root");
+fn workload_resource_without_a_request_record_is_not_found() {
+    let temporary = TempDir::new().expect("temporary logs root");
+    make_core_run(&temporary.path().join("simulation"));
+    let roots =
+        configure_logs_roots(vec![temporary.path().to_path_buf()]).expect("configure logs root");
     let run = discover_runs(&roots)
         .expect("discover runs")
         .pop()
         .expect("one run");
 
-    let workload = read_workload(&run, &logs_root).expect("read launcher experiment workload");
+    let error = read_workload(&run, temporary.path()).expect_err("no request record");
 
-    assert_eq!(workload["source_paths"], json!([source_path]));
-    assert_eq!(workload["request_count"], 2);
+    assert!(error.downcast_ref::<ArtifactNotFound>().is_some());
 }
 
 #[test]
-fn workload_resource_accepts_csv_directly_in_experiment_directory() {
+fn workload_resource_labels_a_launcher_experiment_trace() {
     let repository = TempDir::new().expect("temporary repository");
     let logs_root = repository.path().join("logs");
-    let run_path = logs_root.join("experiment/rate32");
+    for (run, source_path) in [
+        ("experiment/rate90.0/tp1", "logs/experiment/trace/workload.csv"),
+        ("experiment/rate32", "logs/experiment/trace.csv"),
+    ] {
+        let run_path = logs_root.join(run);
+        make_core_run(&run_path);
+        let params_path = run_path.join("raw/params.json");
+        let params = fs::read_to_string(&params_path)
+            .expect("read params")
+            .replace("trace/workload.csv", source_path);
+        fs::write(params_path, params).expect("write launcher params");
+        write_released_requests(&run_path, &[(0.0, 0, 1024, 256), (1000.0, 0, 1024, 256)]);
+    }
+    let roots = configure_logs_roots(vec![logs_root.clone()]).expect("configure logs root");
+    for run in discover_runs(&roots).expect("discover runs") {
+        let workload = read_workload(&run, &logs_root).expect("read launcher experiment workload");
+        let source_path = workload["source_paths"][0].as_str().expect("one label");
+        assert!(source_path.starts_with("logs/experiment/"), "{source_path}");
+        assert_eq!(workload["request_count"], 2);
+        assert_eq!(workload["average_input_tokens"], 1024.0);
+    }
+}
+
+#[test]
+fn workload_resource_names_an_absolute_trace_under_the_root_from_its_logs_directory() {
+    let repository = TempDir::new().expect("temporary repository");
+    let logs_root = repository.path().join("logs");
+    let run_path = logs_root.join("service/run");
     make_core_run(&run_path);
-    let source_path = "logs/experiment/trace.csv";
+    let trace = logs_root.join("service/trace.csv");
+    fs::write(&trace, "id,input_len,output_len,arrival_time\n").expect("write trace");
     let params_path = run_path.join("raw/params.json");
     let params = fs::read_to_string(&params_path)
         .expect("read params")
-        .replace("trace/workload.csv", source_path);
+        .replace("trace/workload.csv", trace.to_str().expect("utf-8 path"));
     fs::write(params_path, params).expect("write params");
-    fs::write(
-        repository.path().join(source_path),
-        "id,input_len,output_len,arrival_time\n0,1024,256,0\n1,1024,256,1000\n",
-    )
-    .expect("write trace");
-    let roots = configure_logs_roots(vec![logs_root.clone()]).expect("configure root");
+    write_released_requests(&run_path, &[(0.0, 0, 8, 8)]);
+    let roots = configure_logs_roots(vec![logs_root.clone()]).expect("configure logs root");
     let run = discover_runs(&roots).expect("discover").pop().expect("run");
-    for root in [repository.path(), logs_root.as_path()] {
-        let workload = read_workload(&run, root).expect("read experiment trace");
-        assert_eq!(workload["request_count"], 2);
-        assert_eq!(workload["average_input_tokens"], 1024.0);
-        assert_eq!(workload["average_output_tokens"], 256.0);
-    }
+
+    let workload = read_workload(&run, repository.path()).expect("read service run workload");
+
+    assert_eq!(workload["source_paths"], json!(["logs/service/trace.csv"]));
 }
 
 #[test]
@@ -2682,7 +2742,7 @@ async fn kernel_profile_http_routes_publish_descriptor_and_enriched_curve() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(descriptor["kind"], "kernel_profile");
-    assert_eq!(descriptor["workspace_id"], "root_0");
+    assert_eq!(descriptor["workspace_id"], "w_root_0");
     assert_eq!(descriptor["kernel"]["metric_family"], "compute");
     assert_eq!(descriptor["gpu"]["cache_key"], "NVIDIA H200");
     assert_eq!(descriptor["gpu"]["observed_name"], "NVIDIA H200");
@@ -2733,7 +2793,7 @@ async fn kernel_measurement_http_routes_publish_descriptor_summary_and_plot() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(descriptor["kind"], "kernel_measurement");
-    assert_eq!(descriptor["workspace_id"], "root_0");
+    assert_eq!(descriptor["workspace_id"], "w_root_0");
     assert_eq!(descriptor["gpu"]["observed_name"], "NVIDIA H200");
     assert_eq!(descriptor["gpu_provenance"]["source"], "measurement");
     assert_eq!(descriptor["duration_s"], 10.0);
@@ -3736,4 +3796,20 @@ fn an_unknown_alignment_id_resolves_to_not_found() {
     assert!(resolve_alignment(&roots, "al_nope").is_err());
     let known = &discover_alignments(&roots).expect("discover")[0].alignment_id;
     assert!(resolve_alignment(&roots, known).is_ok());
+}
+
+#[tokio::test]
+async fn kernel_kinds_route_serves_each_kind_doc_title_and_category() {
+    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("repository root above analyzer/rust");
+    let router = prediction_test_router(repo);
+
+    let (status, value) = get_json(router, "/api/analyzer/v1/kernel-kinds").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["categories"][0], "GEMM");
+    assert_eq!(value["kinds"]["single_gemm"]["category"], "GEMM");
+    assert_eq!(value["kinds"]["rms_norm"]["title"], "RMSNorm");
 }

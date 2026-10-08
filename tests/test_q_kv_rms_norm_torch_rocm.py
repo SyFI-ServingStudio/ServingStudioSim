@@ -14,12 +14,12 @@ from profiling.runners.attention import q_kv_rms_norm_torch_rocm as rocm
 
 def test_torch_rocm_backend_registered_for_mi300x() -> None:
     spec = find_kernel_profiler_spec("q_kv_rms_norm", "torch_rocm")
-    assert spec.supports.gpus == frozenset({"MI300X"})
+    assert spec.supports.arch_targets == frozenset({"CDNA3"})
     assert spec.subprocess_env == "vllm_rocm_env"
     assert spec.runner_ref.function_name == "profile_q_kv_rms_norm_torch_rocm"
 
     nvidia = find_kernel_profiler_spec("q_kv_rms_norm", "vllm_triton")
-    assert "MI300X" not in nvidia.supports.gpus
+    assert nvidia.supports.arch_targets is None
 
 
 def test_signature_matches_kind_args() -> None:

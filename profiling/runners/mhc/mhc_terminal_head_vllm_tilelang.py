@@ -11,15 +11,14 @@ from profiling.runners.metrics import ComputeMetrics
 from profiling.runners.mhc._common import (
     HC_EPS,
     RMS_EPS,
-    TERMINAL_HEAD_GPUS,
     CommonInputs,
+    Shape,
     bandwidth_gbps,
     head_weight_bytes,
     hidden_bytes,
     mix_bytes,
     prepare_common,
     reference_pre,
-    require_gpu,
     residual_bytes,
     validate_args,
 )
@@ -55,17 +54,17 @@ class _Launch:
         return self.norm(hidden)
 
 
-def _logical_bytes(num_tokens: int) -> int:
+def _logical_bytes(shape: Shape) -> int:
     """Read the layer output, the streams, the mixes and the head weights once;
     write the multi-token prediction buffer and the normalized hidden state.
     The post-block result between launches is internal and not counted."""
     return (
-        hidden_bytes(num_tokens)
-        + residual_bytes(num_tokens)
-        + mix_bytes(num_tokens)
-        + head_weight_bytes()
-        + residual_bytes(num_tokens)
-        + hidden_bytes(num_tokens)
+        hidden_bytes(shape)
+        + residual_bytes(shape)
+        + mix_bytes(shape)
+        + head_weight_bytes(shape)
+        + residual_bytes(shape)
+        + hidden_bytes(shape)
     )
 
 
@@ -89,7 +88,6 @@ def profile_mhc_terminal_head_vllm_tilelang(
         raise ProfilerNotImplemented(f"{_KIND} requires pinned vLLM and TileLang") from exc
 
     try:
-        require_gpu(torch, _KIND, TERMINAL_HEAD_GPUS)
         inputs = prepare_common(torch, shape)
         x = torch.randn((shape.num_tokens, hidden_size), dtype=torch.bfloat16, device="cuda")
         post_mix, comb_mix, _ = reference_pre(torch, inputs)
@@ -99,9 +97,10 @@ def profile_mhc_terminal_head_vllm_tilelang(
         with set_current_vllm_config(VllmConfig()):
             norm = RMSNorm(hidden_size, eps=RMS_EPS).cuda()
         norm.weight.data.fill_(1.0)
-        head_fn = inputs.fn[:4].contiguous()
+        # The head has hc_mult fn rows, one scale and hc_mult biases.
+        head_fn = inputs.fn[: shape.hc_mult].contiguous()
         head_scale = inputs.hc_scale[:1].contiguous()
-        head_base = inputs.hc_base[:4].contiguous()
+        head_base = inputs.hc_base[: shape.hc_mult].contiguous()
         mtp_buffer = torch.empty_like(inputs.residual).flatten(1)
         launch = _Launch(
             mhc_post_tilelang,
@@ -139,7 +138,7 @@ def profile_mhc_terminal_head_vllm_tilelang(
     return ComputeMetrics(
         time_ms=float(time_ms),
         tflops=0.0,
-        memory_bandwidth_gbps=bandwidth_gbps(_logical_bytes(shape.num_tokens), time_ms),
+        memory_bandwidth_gbps=bandwidth_gbps(_logical_bytes(shape), time_ms),
         energy_j=float(energy_j),
     )
 

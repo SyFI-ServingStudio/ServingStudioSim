@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-SUPPORTED_BLOCK_SIZES = frozenset({8, 16, 32, 48, 64})
-
 
 @dataclass(frozen=True)
 class AlignmentShape:
@@ -45,10 +43,10 @@ def validate_shape(
     for name, value in scalars.items():
         if type(value) is not int or value <= 0:
             raise ValueError(f"{name} must be a positive integer")
+    # Each token routes to top_k distinct experts. block_size is any positive
+    # padding multiple: the alignment arithmetic is parametric in it.
     if top_k > num_experts:
         raise ValueError("top_k must not exceed num_experts")
-    if block_size not in SUPPORTED_BLOCK_SIZES:
-        raise ValueError(f"block_size must be one of {sorted(SUPPORTED_BLOCK_SIZES)}")
 
     return AlignmentShape(
         num_tokens=num_tokens,
@@ -68,8 +66,8 @@ def build_topk_ids(shape: AlignmentShape) -> tuple[tuple[int, ...], ...]:
 
 
 def expected_block_owners(expert_counts: tuple[int, ...], block_size: int) -> tuple[int, ...]:
-    if block_size not in SUPPORTED_BLOCK_SIZES:
-        raise ValueError(f"block_size must be one of {sorted(SUPPORTED_BLOCK_SIZES)}")
+    if type(block_size) is not int or block_size <= 0:
+        raise ValueError("block_size must be a positive integer")
     if any(type(count) is not int or count < 0 for count in expert_counts):
         raise ValueError("expert_counts entries must be non-negative integers")
     return tuple(

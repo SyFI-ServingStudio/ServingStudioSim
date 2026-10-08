@@ -17,13 +17,13 @@ from typing import Any
 from profiling.db.args import DType
 from profiling.profilers.energy import Energy
 from profiling.profilers.timer import Timer
+from profiling.runners.device import require_cuda_toolkit
 from profiling.runners.exceptions import KernelLaunchFailed, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
 
 _BLOCK_SIZE = 128
 _INPUT_DTYPE = DType.BF16
 _CUDA_MINIMUM = (12, 8)
-_HOPPER_COMPUTE_CAPABILITY = (9, 0)
 _KERNEL_NAME = "scale_1x128_kernel"
 _JIT_MODULE_NAME = "vibesim_fp8_block_quant_grouped_sm90"
 
@@ -52,41 +52,6 @@ def _validate_args(
             f"flashinfer_trtllm fp8_block_quant requires input_dtype=bf16, got {input_dtype.value}"
         )
     return num_tokens, hidden_size, num_problems, input_dtype
-
-
-def _parse_cuda_version(cuda_version: object) -> tuple[int, int] | None:
-    if cuda_version is None:
-        return None
-    version_parts = str(cuda_version).split(".")
-    if len(version_parts) < 2:
-        return None
-    try:
-        return int(version_parts[0]), int(version_parts[1])
-    except ValueError:
-        return None
-
-
-def _validate_cuda_device(torch: Any) -> None:
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented(
-            "CUDA is required for the flashinfer_trtllm fp8_block_quant backend"
-        )
-
-    cuda_version = _parse_cuda_version(getattr(torch.version, "cuda", None))
-    if cuda_version is None or cuda_version < _CUDA_MINIMUM:
-        rendered_version = getattr(torch.version, "cuda", None)
-        raise ProfilerNotImplemented(
-            f"flashinfer_trtllm fp8_block_quant requires CUDA >= 12.8, got {rendered_version}"
-        )
-
-    device = torch.cuda.current_device()
-    compute_capability = tuple(torch.cuda.get_device_capability(device))
-    if compute_capability != _HOPPER_COMPUTE_CAPABILITY:
-        gpu_name = str(torch.cuda.get_device_name(device))
-        raise ProfilerNotImplemented(
-            "flashinfer_trtllm fp8_block_quant requires SM90/SM90a Hopper, "
-            f"got {gpu_name} with SM{compute_capability[0]}{compute_capability[1]}"
-        )
 
 
 def _compute_grouped_padded_offset(offset: int, problem_index: int) -> int:
@@ -275,7 +240,7 @@ def profile_fp8_block_quant_flashinfer_trtllm(
             "torch is required for the flashinfer_trtllm fp8_block_quant backend"
         ) from exc
 
-    _validate_cuda_device(torch)
+    require_cuda_toolkit(torch, _CUDA_MINIMUM, "flashinfer_trtllm fp8_block_quant")
 
     try:
         run_once, _, _, _, _ = _prepare_grouped_quant_launch(

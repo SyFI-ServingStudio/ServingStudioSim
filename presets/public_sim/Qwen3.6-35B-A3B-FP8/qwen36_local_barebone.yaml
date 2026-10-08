@@ -1,0 +1,18 @@
+# vLLM Qwen3.6-35B-A3B FP8 on one H200, the barebone worker. Worker: the
+# simulation of the ctx8k_out1k capture's own run
+# (20260818_0_qwen36_local_hybrid_alignment). attn_gpu_memory_gb is the pool
+# vLLM allocated there: 4412 whole 21,626,880 B blocks out of 88.88 GiB.
+deployment: unified
+pools:
+  main:
+    groups:
+      - replicas: ${replicas}
+        arch:
+          preset: qwen36_local
+        worker:
+          type: barebone
+          pending_order: fifo
+          max_batch_tokens: 8192
+          attn_gpu_memory_gb: 95.41779456
+sweep:
+  replicas: [1, 2, 4, 8]

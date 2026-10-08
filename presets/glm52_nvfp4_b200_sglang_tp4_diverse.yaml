@@ -12,7 +12,6 @@ workload:
   # ServingStudioSim scales trace_timed timestamps by request_rate, so 1.0 is required
   # to preserve them exactly.
   request_rate: 1.0
-  session_dependency: independent
   run_to_end: true
 
 io:
@@ -31,7 +30,7 @@ pools:
           max_model_len: 131072
           routing: popularity
           routing_seed: null
-          expert_popularity_file: presets/alignment/glm52_nvfp4_b200_sglang_tp4/expert_popularity.json
+          expert_popularity_file: hf://datasets/UW-SyFI/servingstudio-workload@c3f5ecaab0bbff757c64864bf2ec24f5e1f76b5c/glm52_nvfp4/sglang/diverse_100/capture/20260829/popularity.json
           mtp_mode: "off"
         worker:
           type: chunked_prefill

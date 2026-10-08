@@ -67,6 +67,13 @@ def test_validation_retains_boundaries_valid_counts_and_page_offsets():
     assert shape.num_queries == 3
 
 
+@pytest.mark.parametrize("num_heads", [1, 8, 16, 32, 64, 128])
+def test_validation_accepts_any_positive_head_count(num_heads):
+    from profiling.runners.attention.dsa_sparse_mla_prefill import _validate_args
+
+    assert _validate_args(**(_BASE_SPEC | {"num_heads": num_heads})).num_heads == num_heads
+
+
 @pytest.mark.parametrize(
     ("overrides", "error", "match"),
     [
@@ -74,8 +81,11 @@ def test_validation_retains_boundaries_valid_counts_and_page_offsets():
         ({"query_context_pairs": ((0, 1),)}, ValueError, "0 < query <= context"),
         ({"query_context_pairs": ((2, 1),)}, ValueError, "0 < query <= context"),
         ({"query_context_pairs": ([1, 1],)}, TypeError, "integer.*pairs"),
-        ({"num_heads": 64}, ProfilerNotImplemented, "model identity"),
-        ({"selected_k": 1024}, ProfilerNotImplemented, "model identity"),
+        ({"num_heads": 0}, ValueError, "num_heads must be >= 1"),
+        ({"num_heads": 16.0}, TypeError, "num_heads must be an integer"),
+        ({"selected_k": 0}, ValueError, "selected_k must be >= 1"),
+        ({"softmax_scale": 0.0}, ValueError, "softmax_scale must be positive"),
+        ({"latent_dim": 256}, ProfilerNotImplemented, "model identity"),
         ({"q_dtype": "bf16"}, ProfilerNotImplemented, "storage identity"),
         ({"cache_layout": "token_major"}, ProfilerNotImplemented, "storage identity"),
         ({"index_distribution": "random"}, ProfilerNotImplemented, "index_distribution"),
@@ -88,15 +98,24 @@ def test_validation_fails_closed(overrides, error, match):
         _validate_args(**(_BASE_SPEC | overrides))
 
 
+def test_unmeasured_widths_and_scales_are_accepted():
+    from profiling.runners.attention.dsa_sparse_mla_prefill import _validate_args
+
+    shape = _validate_args(**(_BASE_SPEC | {"selected_k": 1024, "softmax_scale": 576**-0.5}))
+    assert shape.selected_k == 1024
+    assert max(shape.valid_counts) <= 1024
+    assert _validate_args(**(_BASE_SPEC | {"selected_k": 2176})).selected_k == 2176
+
+
 def test_operand_builder_keeps_requests_in_disjoint_physical_page_ranges(
     monkeypatch,
 ):
     from profiling.runners.attention import dsa_sparse_mla_prefill as runner
 
-    monkeypatch.setattr(runner, "_SELECTED_K", 4)
     monkeypatch.setattr(runner, "_TRTLLM_WORKSPACE_BYTES", 16)
     shape = runner._Shape(
         num_heads=16,
+        selected_k=4,
         pairs=((2, 3), (1, 65)),
         valid_counts=(2, 3, 4),
         request_page_offsets=(0, 1),

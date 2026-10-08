@@ -255,7 +255,7 @@ mod tests {
     use crate::common::{PoolId, SessionInput, SharedRequests, UnifiedStage};
     use crate::test_helpers::{shared_with, test_cluster, FakeModel};
     use crate::worker::admission::{FifoOrder, ShortestJobFirst};
-    use crate::worker::config::BoundedFutureKvAdmissionConfig;
+    use crate::worker::config::{BoundedFutureKvAdmissionConfig, DpPlacement};
     use crate::worker::kv::{PrefixCacheConfig, PrefixKv};
     use crate::worker::types::{WorkerConfig, WorkerEventCommon, WorkerMsgCommon};
     use crate::worker::workers::iter::{
@@ -649,9 +649,77 @@ mod tests {
             .is_some());
     }
 
+    #[test]
+    fn chunked_prefill_computes_only_the_fresh_prompt_after_a_pinned_prefix() {
+        let store = shared_with(&[(0, 12_000, 2), (1, 12_000, 2)]);
+        store.borrow_mut()[RequestId(0)].request.definition.session = SessionInput::PinnedPrefix {
+            prefix_tokens: 30_000,
+        };
+        // Room for the pinned request's 30_000 + 12_000 + 2 context, not for a
+        // second request beside it: the prefix counts toward capacity.
+        let mut worker = build_chunked_prefill_worker(
+            WorkerId(0),
+            "main",
+            Arc::new(FakeModel::for_ms(1.0)),
+            Rc::clone(&store),
+            WorkerConfig {
+                max_batch_tokens: Some(8_192),
+                attn_kv_bytes: 50_000,
+                prefix_cache: PrefixCacheConfig::Disabled,
+                ..WorkerConfig::default()
+            },
+            None,
+            PoolId(0),
+            "test-gpu",
+            test_cluster(),
+        );
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(0)));
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(1)));
+
+        let mut chunk_pairs = Vec::new();
+        for step in 0..2 {
+            assert!(worker.form_batch(Time::from_ms(step as f64)));
+            let mut input = Default::default();
+            worker.execution.build_iteration_input(
+                &worker.kv_store,
+                &worker.context.requests,
+                &worker.batch_plan,
+                &mut input,
+            );
+            chunk_pairs.extend(input.groups[0].prefill_chunk_pairs.iter().copied());
+            worker.admission.complete_iteration(
+                &mut worker.kv_store,
+                &worker.context,
+                &worker.batch_plan,
+                &mut Vec::new(),
+                Time::from_ms(step as f64 + 1.0),
+            );
+        }
+        // Attention sees the pinned prefix as context; only 12_000 tokens run.
+        assert_eq!(chunk_pairs, [(30_000, 8_192), (38_192, 3_808)]);
+        assert!(!store.borrow()[RequestId(1)].lifecycle.admitted);
+        let requests = store.borrow();
+        let record = &requests[RequestId(0)];
+        assert_eq!(record.progress.prefill_tokens_processed, 12_000);
+        assert_eq!(record.telemetry.prefix_cache_hit_tokens, Some(30_000));
+        assert!(record.telemetry.first_output_time.is_some());
+    }
+
     fn hybrid_chunked_worker(
         store: SharedRequests,
         chunk_end_quantum: Option<u32>,
+    ) -> HybridChunkedPrefillWorker<FakeModel> {
+        hybrid_chunked_worker_aligned(
+            store,
+            chunk_end_quantum,
+            crate::worker::config::PrefillChunkAlignment::Checkpoint,
+        )
+    }
+
+    fn hybrid_chunked_worker_aligned(
+        store: SharedRequests,
+        chunk_end_quantum: Option<u32>,
+        prefill_chunk_alignment: crate::worker::config::PrefillChunkAlignment,
     ) -> HybridChunkedPrefillWorker<FakeModel> {
         build_hybrid_chunked_prefill_worker(
             WorkerId(0),
@@ -661,6 +729,7 @@ mod tests {
             WorkerConfig {
                 max_batch_tokens: Some(10),
                 ssm_checkpoint_interval_tokens: chunk_end_quantum,
+                prefill_chunk_alignment,
                 ..WorkerConfig::default()
             },
             None,
@@ -730,6 +799,26 @@ mod tests {
     }
 
     #[test]
+    fn plain_alignment_ignores_the_checkpoint_interval() {
+        let store = shared_with(&[(0, 20, 2), (1, 2, 1)]);
+        let mut worker = hybrid_chunked_worker_aligned(
+            Rc::clone(&store),
+            Some(4),
+            crate::worker::config::PrefillChunkAlignment::Plain,
+        );
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(0)));
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(1)));
+
+        // Same interval as the checkpoint-aligned case, but the chunk spends
+        // the whole budget instead of stopping on boundary 8.
+        assert_eq!(hybrid_chunk_pairs(&mut worker, Time::ZERO), [(0, 10)]);
+        assert_eq!(
+            hybrid_chunk_pairs(&mut worker, Time::from_ms(1.0)),
+            [(10, 10)]
+        );
+    }
+
+    #[test]
     fn without_a_checkpoint_interval_a_partial_chunk_spends_the_whole_budget() {
         let store = shared_with(&[(0, 20, 2), (1, 2, 1)]);
         let mut worker = hybrid_chunked_worker(Rc::clone(&store), None);
@@ -744,6 +833,61 @@ mod tests {
         assert_eq!(
             hybrid_chunk_pairs(&mut worker, Time::from_ms(2.0)),
             [(0, 2)]
+        );
+    }
+
+    /// [`third_request_partition`] on the hybrid (recurrent-state) worker.
+    fn hybrid_third_request_partition(dp_placement: DpPlacement) -> (usize, usize) {
+        let store = shared_with(&[(0, 4, 500), (1, 4, 1), (2, 4, 1)]);
+        let mut worker = build_hybrid_chunked_prefill_worker(
+            WorkerId(0),
+            "main",
+            Arc::new(FakeModel {
+                ms: 1.0,
+                dp_groups: 2,
+            }),
+            store,
+            WorkerConfig {
+                max_batch_tokens: Some(64),
+                dp_placement,
+                ..WorkerConfig::default()
+            },
+            None,
+            PoolId(0),
+            "test-gpu",
+            test_cluster(),
+        );
+        let mut events = Vec::new();
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(0)));
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(1)));
+        for step in 0..20 {
+            worker.tick(Time::from_ms(step as f64), &mut events);
+        }
+        assert_eq!(events.len(), 1, "only request 1 has finished");
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(2)));
+        assert!(worker.form_batch(Time::from_ms(20.0)));
+        let mut input: crate::arch::UnifiedArchInput = Default::default();
+        worker.execution.build_iteration_input(
+            &worker.kv_store,
+            &worker.context.requests,
+            &worker.batch_plan,
+            &mut input,
+        );
+        (
+            input.groups[0].prefill_chunk_pairs.len(),
+            input.groups[1].prefill_chunk_pairs.len(),
+        )
+    }
+
+    #[test]
+    fn hybrid_worker_honours_the_dp_placement() {
+        assert_eq!(
+            hybrid_third_request_partition(DpPlacement::RoundRobin),
+            (1, 0)
+        );
+        assert_eq!(
+            hybrid_third_request_partition(DpPlacement::VllmLeastLoaded),
+            (0, 1)
         );
     }
 
@@ -1063,6 +1207,60 @@ mod tests {
             PoolId(0),
             "test-gpu",
             test_cluster(),
+        );
+    }
+
+    /// Two partitions; request 0 decodes for a long time on partition 0 while
+    /// request 1 finishes on partition 1. Round-robin then sends request 2
+    /// back to busy partition 0; vLLM's least-loaded balancer picks idle 1.
+    fn third_request_partition(dp_placement: DpPlacement) -> (usize, usize) {
+        let store = shared_with(&[(0, 4, 500), (1, 4, 1), (2, 4, 1)]);
+        let mut worker = build_chunked_prefill_worker(
+            WorkerId(0),
+            "main",
+            Arc::new(FakeModel {
+                ms: 1.0,
+                dp_groups: 2,
+            }),
+            store,
+            WorkerConfig {
+                max_batch_tokens: Some(64),
+                dp_placement,
+                ..WorkerConfig::default()
+            },
+            None,
+            PoolId(0),
+            "test-gpu",
+            test_cluster(),
+        );
+        let mut events = Vec::new();
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(0)));
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(1)));
+        for step in 0..20 {
+            worker.tick(Time::from_ms(step as f64), &mut events);
+        }
+        assert_eq!(events.len(), 1, "only request 1 has finished");
+        assert_eq!(worker.kv_store.decode_members(0).count(), 1);
+        assert_eq!(worker.kv_store.decode_members(1).count(), 0);
+
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(2)));
+        assert!(worker.form_batch(Time::from_ms(20.0)));
+        (
+            worker.kv_store.prefill_admits(0).count(),
+            worker.kv_store.prefill_admits(1).count(),
+        )
+    }
+
+    #[test]
+    fn round_robin_dp_placement_ignores_partition_load() {
+        assert_eq!(third_request_partition(DpPlacement::RoundRobin), (1, 0));
+    }
+
+    #[test]
+    fn vllm_least_loaded_dp_placement_picks_the_idle_partition() {
+        assert_eq!(
+            third_request_partition(DpPlacement::VllmLeastLoaded),
+            (0, 1)
         );
     }
 

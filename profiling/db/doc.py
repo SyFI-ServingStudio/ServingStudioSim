@@ -183,15 +183,14 @@ class ViewField:
 
 @dataclass(frozen=True)
 class ConfigView:
-    """A chart drawn from several registered configs of a kind at once.
+    """A chart drawn from several kernel configs of a kind at once.
 
     The configs a deployment builds for one leaf that differ only in
     ``series`` are one chart: one line per config, over the config's sweep
     axis. ``series`` values are positions in an order, 0 first; line ``n``
     reads ``label n+1`` and position 0, which leads the order, is drawn
-    strongest. ``workload`` is picked with a selector; the public API names
-    each config's value (``config_labels``). The page knows only these roles,
-    never the kind.
+    strongest. ``workload`` is picked with a selector. The page knows only
+    these roles, never the kind.
     """
 
     title: str
@@ -268,3 +267,27 @@ def kernel_doc(kernel_kind: str) -> KernelDoc | None:
     except ModuleNotFoundError:
         return None
     return getattr(module, "DOC", None)
+
+
+def kind_vocabulary() -> dict:
+    """Each registered kind's title and category, and the categories in order.
+
+    What a view needs to name a kernel and group it by family. ``analyze
+    serve`` serves it as ``GET /api/analyzer/v1/kernel-kinds``, so the UI groups
+    and labels kinds from these DOCs, not from a table of its own.
+    """
+
+    from profiling.db.registry import iter_kernel_profiler_specs
+
+    kinds = sorted({spec.kernel_kind for spec in iter_kernel_profiler_specs()})
+    docs = {kind: kernel_doc(kind) for kind in kinds}
+    return {
+        "schema_version": 1,
+        "categories": list(CATEGORIES),
+        "kinds": {
+            kind: {"title": doc.title, "category": doc.category}
+            for kind, doc in docs.items()
+            if doc is not None
+        },
+    }
+

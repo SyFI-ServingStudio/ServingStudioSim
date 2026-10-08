@@ -57,3 +57,12 @@ class AttentionSpec(Protocol):
     # Optional: a spec may expose more than the historical one fused attention
     # row. Model.label uses getattr so existing specs remain source-compatible.
     def semantic_segments(self, wl: Workload) -> list[AttentionSemantic]: ...
+
+    # Optional (default False): the spec's work is not a function of the workload
+    # scalars, only of each request's own causal interaction, so it labels exact
+    # per-request geometry and refuses collapsed aggregates. Such a spec must expose
+    # `semantic_segments`; `Model.geometry_segments` labels it on its own so the
+    # analyzer can reduce everything else from the scalars. It may also expose
+    # `semantic_segments_batch(wls) -> [semantic_segments(wl) for wl in wls]` to
+    # evaluate many small workloads in one pass.
+    needs_request_geometry: bool

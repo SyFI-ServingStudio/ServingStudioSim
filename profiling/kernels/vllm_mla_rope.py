@@ -106,9 +106,10 @@ register(
     KernelProfilerSpec(
         kernel_kind=KIND,
         backend="vllm_inductor",
+        # Inductor emits a portable Triton pointwise kernel; Triton lowers bf16 only on SM80+.
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
-            gpus=frozenset({"NVIDIA H100", "NVIDIA H200", "NVIDIA B200"}),
+            min_compute_capability=(8, 0),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.attention.vllm_mla_rope",
