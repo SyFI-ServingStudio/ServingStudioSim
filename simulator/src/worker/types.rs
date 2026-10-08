@@ -522,6 +522,20 @@ pub struct WorkerStatus {
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
+/// A pipeline head's load-following microbatch budget: `low_tokens` while
+/// stage 0 has idle time, rising to `max_batch_tokens` as stage 0's busy
+/// fraction over `window` climbs from `busy_lo` to `busy_hi`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PipelineLoadBudget {
+    pub low_tokens: u32,
+    pub window: Time,
+    pub busy_lo: f64,
+    pub busy_hi: f64,
+    /// Rise with the prefill backlog between these token counts instead of the
+    /// busy fraction.
+    pub backlog: Option<(u64, u64)>,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct WorkerConfig {
     pub balance: LoadBalance,
@@ -590,6 +604,27 @@ pub struct WorkerConfig {
     /// checkpoint interval (from the `chunked_prefill` selector). Only the
     /// hybrid chunked-prefill recipe reads it.
     pub prefill_chunk_alignment: crate::worker::config::PrefillChunkAlignment,
+    /// vLLM's `long_prefill_token_threshold` (from the chunked-prefill
+    /// selectors): the most prefill tokens one request takes per iteration.
+    /// `None` leaves only the batch budget. Only chunked-prefill recipes read it.
+    pub long_prefill_token_threshold: Option<u32>,
+    /// When the pipeline head applies `long_prefill_token_threshold`.
+    pub long_prefill_cap_mode: crate::worker::config::LongPrefillCapMode,
+    /// The pipeline head applies the threshold only to prompts of at least this
+    /// many fresh tokens (`0`: every prompt).
+    pub long_prefill_cap_min_prompt_tokens: u32,
+    /// Pipeline head only: fresh prompts fill a microbatch before started ones,
+    /// which keep up to this many tokens each. `None` is vLLM's started-first.
+    pub fresh_first_reserve_tokens: Option<u32>,
+    /// Pipeline head only: the load-following microbatch budget, `None` for
+    /// the fixed `max_batch_tokens`.
+    pub load_budget: Option<PipelineLoadBudget>,
+    /// Pipeline head only: `(floor, overhead tokens)` of the tail ladder,
+    /// `None` for full chunks up to a prompt's end.
+    pub tail_ladder: Option<(u32, u32)>,
+    /// Pipeline head only: shortest remaining prefill first across started and
+    /// queued prompts.
+    pub srpt: bool,
     /// Candidate positions the drafter proposes per request per iteration (from
     /// the worker selector). The verify width is one more than this. Only the
     /// speculative recipe reads it, and it must match the width the model was
@@ -624,6 +659,13 @@ impl Default for WorkerConfig {
             prefix_cache: crate::worker::kv::PrefixCacheConfig::default(),
             ssm_checkpoint_interval_tokens: None,
             prefill_chunk_alignment: crate::worker::config::PrefillChunkAlignment::Checkpoint,
+            long_prefill_token_threshold: None,
+            long_prefill_cap_mode: crate::worker::config::LongPrefillCapMode::Always,
+            long_prefill_cap_min_prompt_tokens: 0,
+            fresh_first_reserve_tokens: None,
+            load_budget: None,
+            tail_ladder: None,
+            srpt: false,
             speculative_draft_tokens: 0,
             speculative_acceptance_seed: None,
             dp_placement: crate::worker::config::DpPlacement::RoundRobin,

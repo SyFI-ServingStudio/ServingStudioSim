@@ -118,6 +118,10 @@ pub(crate) fn build_hybrid_chunked_prefill_worker<M: IterwiseUnifiedModel>(
         Some(quantum) => admission.with_chunk_end_quantum(quantum),
         None => admission,
     };
+    let admission = match config.long_prefill_token_threshold {
+        Some(threshold) => admission.with_long_prefill_threshold(threshold),
+        None => admission,
+    };
     IterBatchWorker::from_components(
         essentials.context,
         kv_store,

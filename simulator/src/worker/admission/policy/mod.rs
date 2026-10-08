@@ -22,7 +22,7 @@ mod shortest_job_first;
 pub use fifo::FifoOrder;
 pub use longest_prefix_match::LongestPrefixMatch;
 pub use session_start::SessionStartOrder;
-pub use shortest_job_first::ShortestJobFirst;
+pub use shortest_job_first::{JobSize, ShortestJobFirst};
 
 /// Preset-facing queue discipline selector. Carries no state — it names which
 /// of the existing policies a worker should instantiate.
@@ -36,6 +36,8 @@ pub enum PendingOrderKind {
     Fifo,
     /// Smallest remaining work first.
     ShortestJobFirst,
+    /// Fewest prefill tokens to compute first: shortest time to first token.
+    ShortestPrefillFirst,
     /// Most already-resident prefix KV first, so a batch recomputes as few
     /// evicted tokens as possible.
     LongestPrefixMatch,
@@ -68,6 +70,9 @@ impl PendingOrder {
             PendingOrderKind::SessionStart => Self::SessionStart(SessionStartOrder::new()),
             PendingOrderKind::Fifo => Self::Fifo(FifoOrder::new()),
             PendingOrderKind::ShortestJobFirst => Self::ShortestJobFirst(ShortestJobFirst::new()),
+            PendingOrderKind::ShortestPrefillFirst => {
+                Self::ShortestJobFirst(ShortestJobFirst::by(JobSize::PrefillTokens))
+            }
             PendingOrderKind::LongestPrefixMatch => {
                 Self::LongestPrefixMatch(LongestPrefixMatch::new())
             }

@@ -24,7 +24,8 @@ pub use admission::{
 pub(crate) use config::{resolve_microbatch_sizing, resolve_prefix_cache_config};
 pub use config::{
     AttnWorkerSel, BatchPolicy, DecodeRetractionPolicy, DpPlacement, FfnWorkerSel, IterWorkerSel,
-    KvAdmissionConfig, KvAdmissionPolicy, MicrobatchSizing, MicrobatchSplit, PrefillChunkAlignment,
+    KvAdmissionConfig, KvAdmissionPolicy, LongPrefillCapMode, MicrobatchSizing, MicrobatchSplit,
+    PrefillChunkAlignment,
 };
 pub use cost_buffers::CostBuffers;
 pub use gpu_cluster::{CostSource, GpuCluster, GpuInfo, SharedGpuCluster};
@@ -33,9 +34,9 @@ pub use kv::{PrefixCacheConfig, PrefixCacheMode, PrefixCachePolicy};
 pub use types::{
     AttnWorkerEvent, AttnWorkerMsg, BatchFsmState, FfnPullSource, FfnTask, FfnTaskKind,
     FfnWorkerEvent, FfnWorkerMsg, IterCursor, IterEndState, PdDecodeEvent, PdDecodeMsg,
-    PdPrefillEvent, PdPrefillMsg, PipelineHeadEvent, PipelineHeadMsg, PipelineMicrobatch,
-    PipelineStageEvent, PipelineStageMsg, TransferPlan, WorkerConfig, WorkerEventCommon,
-    WorkerFsmState, WorkerMsgCommon, WorkerStatus,
+    PdPrefillEvent, PdPrefillMsg, PipelineHeadEvent, PipelineHeadMsg, PipelineLoadBudget,
+    PipelineMicrobatch, PipelineStageEvent, PipelineStageMsg, TransferPlan, WorkerConfig,
+    WorkerEventCommon, WorkerFsmState, WorkerMsgCommon, WorkerStatus,
 };
 pub(crate) use workers::afd_attention::build_afd_attention_worker;
 pub use workers::afd_attention::DisaggAttnWorker;
