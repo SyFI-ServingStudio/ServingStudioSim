@@ -204,8 +204,13 @@ uv run python trace/session_decode_wait.py trace/tracelab_preserving.csv \
 state. Session durations are heavy-tailed, and half of all session-time sits in
 sessions longer than 3 h, so a loop started from N fresh sessions drifts for
 many hours. The first N sessions are therefore drawn by duration, and each one
-joins at a random point of its life with a cold context. Every later session is
-drawn whole.
+joins at a random point of its life. A one-token placeholder round holds its slot
+for the rest of the wait that point fell in, so joining rounds arrive as they
+would in steady state, not all at once. The joining round keeps its declared
+prefix: an engine without the context recomputes it, and one with
+`prefix_tier_warm_start` reads it from its slowest tier. `--cold-at-once` keeps
+the earlier start (every joining round at t = 0, its context as fresh tokens).
+Every later session is drawn whole.
 
 ```bash
 uv run python trace/session_closed_loop.py "$TMPDIR/mono_sessions_d80.csv" \

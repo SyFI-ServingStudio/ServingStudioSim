@@ -3,40 +3,35 @@
 //!
 //! It wraps the whole-iteration shell and acts only between its messages:
 //!
-//! - **Arrival.** A session request goes to the rank that holds its context
-//!   (HBM's retained entry, else the rank it last ran on; the admission keeps
-//!   sessions sticky). If that rank's tiers hold more of the context than its
-//!   HBM does, the request waits for a FIFO read of the difference, and the
-//!   context goes back into HBM (`restore_prefix`) before the shell sees it.
+//! - **Tier reads.** The admission owns the tiers (`admission/prefix_fetch.rs`):
+//!   when a request reaches the head of its rank's queue and that rank's tiers
+//!   hold more of its context than HBM does, it leaves the queue for a FIFO
+//!   read of the difference and returns once the read lands. Sessions stick to
+//!   the rank they last ran on. This worker wakes the shell when a read lands.
 //! - **Completion.** The finished context is written through to its rank's
 //!   tiers. With `external_decode`, a request completes at its first token and
 //!   its context, every output but the last, is restored into HBM as a decode
 //!   instance would hand it back.
 //!
-//! The same mechanism as the pipeline head's (`workers/pipeline`), one tier set
-//! per rank instead of one per pipeline. Without tiers or external decode it is
-//! the bare shell.
+//! The pipeline head (`workers/pipeline`) does the same with one tier set per
+//! pipeline. Without tiers or external decode it is the bare shell.
 
-use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::HashMap;
 
 use crate::arch::contract::IterwiseUnifiedModel;
-use crate::common::{RequestId, SessionInput, Time, WorkerId};
+use crate::common::{RequestId, Time, WorkerId};
 use crate::worker::iter_worker::IterWorker;
 use crate::worker::kv::PrefixKv;
 use crate::worker::types::WorkerStatus;
-use crate::worker::workers::session_prefix_tiers::SessionPrefixTiers;
 use crate::worker::{WorkerEventCommon, WorkerMsgCommon};
 
 use super::iter_batch_worker::HybridChunkedPrefillShell;
 
 pub struct SessionTierWorker<M: IterwiseUnifiedModel> {
     inner: HybridChunkedPrefillShell<M>,
-    /// One per attention DP rank; empty without tiers.
-    tiers: Vec<SessionPrefixTiers>,
-    /// Requests waiting for a tier read: (ready, request, session, context
-    /// tokens read, rank).
-    loading: BinaryHeap<Reverse<(Time, RequestId, u32, u32, u16)>>,
+    /// Whether the admission reads from DRAM/SSD tiers (finished contexts are
+    /// then written through).
+    tiers: bool,
     /// With `external_decode`: each in-flight request's original target
     /// outputs, while it runs with a target of one.
     external_outputs: Option<HashMap<RequestId, u32>>,
@@ -45,13 +40,12 @@ pub struct SessionTierWorker<M: IterwiseUnifiedModel> {
 impl<M: IterwiseUnifiedModel> SessionTierWorker<M> {
     pub(super) fn new(
         inner: HybridChunkedPrefillShell<M>,
-        tiers: Vec<SessionPrefixTiers>,
+        tiers: bool,
         external_decode: bool,
     ) -> Self {
         Self {
             inner,
             tiers,
-            loading: BinaryHeap::new(),
             external_outputs: external_decode.then(HashMap::new),
         }
     }
@@ -62,68 +56,14 @@ impl<M: IterwiseUnifiedModel> SessionTierWorker<M> {
     }
 
     fn on_request(&mut self, request: RequestId) {
-        let (session_input, prompt_tokens, arrival) = {
+        if let Some(outputs) = &mut self.external_outputs {
             let requests = self.inner.requests().clone();
             let mut store = requests.borrow_mut();
-            let record = &mut store[request];
-            if let Some(outputs) = &mut self.external_outputs {
-                let definition = &mut record.request.definition;
-                outputs.insert(request, definition.target_output_tokens);
-                definition.target_output_tokens = 1;
-            }
-            (
-                record.request.definition.session,
-                record.request.definition.prompt_tokens,
-                record.request.core.arrival_time,
-            )
-        };
-        if let (
-            false,
-            SessionInput::Session {
-                session_id,
-                declared_prefix_tokens,
-                ..
-            },
-        ) = (self.tiers.is_empty(), session_input)
-        {
-            let (kv_store, admission) = self.inner.kv_and_admission();
-            let retained = kv_store.retained_prefix_partition(session_input);
-            if let Some(rank) = retained.or_else(|| admission.session_partition(session_id)) {
-                let hbm_tokens = if retained == Some(rank) {
-                    kv_store
-                        .preview_prefill_context(rank, prompt_tokens, session_input)
-                        .resident_prefix_tokens()
-                } else {
-                    0
-                };
-                if let Some((hit, ready)) = self.tiers[usize::from(rank)].on_arrival(
-                    request,
-                    session_id,
-                    declared_prefix_tokens,
-                    hbm_tokens,
-                    arrival,
-                ) {
-                    self.loading
-                        .push(Reverse((ready, request, session_id, hit.tokens, rank)));
-                    return;
-                }
-            }
+            let definition = &mut store[request].request.definition;
+            outputs.insert(request, definition.target_output_tokens);
+            definition.target_output_tokens = 1;
         }
         self.inner.enqueue(WorkerMsgCommon::Request(request));
-    }
-
-    /// Hand every request whose read has landed by `now` to the shell, its
-    /// context back in its rank's HBM.
-    fn land_loads(&mut self, now: Time) {
-        while let Some(&Reverse((ready, request, session_id, tokens, rank))) = self.loading.peek() {
-            if ready > now {
-                break;
-            }
-            self.loading.pop();
-            let (kv_store, _) = self.inner.kv_and_admission();
-            kv_store.restore_prefix(request, rank, session_id, u64::from(tokens), ready);
-            self.inner.enqueue(WorkerMsgCommon::Request(request));
-        }
     }
 
     fn on_request_complete(&mut self, request: RequestId, at: Time) {
@@ -131,7 +71,7 @@ impl<M: IterwiseUnifiedModel> SessionTierWorker<M> {
             .external_outputs
             .as_mut()
             .and_then(|outputs| outputs.remove(&request));
-        if self.tiers.is_empty() && external_outputs.is_none_or(|outputs| outputs <= 1) {
+        if !self.tiers && external_outputs.is_none_or(|outputs| outputs <= 1) {
             return;
         }
         let (session_input, context_tokens) = {
@@ -156,8 +96,8 @@ impl<M: IterwiseUnifiedModel> SessionTierWorker<M> {
         if external_outputs.is_some_and(|outputs| outputs > 1) {
             kv_store.restore_prefix(request, rank, session_id, context_tokens, at);
         }
-        if let Some(tiers) = self.tiers.get_mut(usize::from(rank)) {
-            tiers.store(session_id, context_tokens);
+        if self.tiers {
+            admission.store_session_context(rank, session_id, context_tokens);
         }
     }
 }
@@ -176,7 +116,6 @@ impl<M: IterwiseUnifiedModel> IterWorker for SessionTierWorker<M> {
     }
 
     fn tick(&mut self, now: Time, events: &mut Vec<Self::Event>) -> Option<Time> {
-        self.land_loads(now);
         let first = events.len();
         let wakeup = self.inner.tick(now, events);
         let completed: Vec<RequestId> = events[first..]
@@ -189,13 +128,14 @@ impl<M: IterwiseUnifiedModel> IterWorker for SessionTierWorker<M> {
         for request in completed {
             self.on_request_complete(request, now);
         }
-        let next_load = self.loading.peek().map(|Reverse((ready, ..))| *ready);
-        [wakeup, next_load].into_iter().flatten().min()
+        let (_, admission) = self.inner.kv_and_admission();
+        let next_read = admission.next_prefix_read();
+        [wakeup, next_read].into_iter().flatten().min()
     }
 
     fn status(&self) -> WorkerStatus {
         let mut status = self.inner.status();
-        status.queued_requests += self.loading.len() as u32;
+        status.queued_requests += self.inner.admission().reading_requests();
         status
     }
 }
@@ -205,7 +145,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::common::{PoolId, SharedRequests};
+    use crate::common::{PoolId, SessionInput, SharedRequests};
     use crate::test_helpers::{shared_with, test_cluster, FakeModel};
     use crate::worker::kv::PrefixTierSpec;
     use crate::worker::types::WorkerConfig;

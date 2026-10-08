@@ -226,6 +226,10 @@ where
         (&mut self.kv_store, &mut self.admission)
     }
 
+    pub(super) fn admission(&self) -> &A {
+        &self.admission
+    }
+
     pub(super) fn requests(&self) -> &crate::common::SharedRequests {
         &self.context.requests
     }

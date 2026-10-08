@@ -6,7 +6,9 @@ use std::sync::Arc;
 use crate::arch::contract::IterwiseUnifiedModel;
 use crate::common::{PoolId, SharedRequests, WorkerId};
 use crate::log::PrefixCacheLogger;
-use crate::worker::admission::{PendingOrder, PipelinedChunkedPrefillAdmission};
+use crate::worker::admission::{
+    PendingOrder, PipelinedChunkedPrefillAdmission, PrefixFetch, SessionPrefixTiers,
+};
 use crate::worker::config::MicrobatchSizing;
 use crate::worker::execution::UnifiedIterExecution;
 use crate::worker::gpu_cluster::SharedGpuCluster;
@@ -18,7 +20,6 @@ use crate::worker::workers::iter_build_essentials::{
 
 use super::pipeline_head_worker::{PipelineHeadWorker, PipelineLayout};
 use super::{HybridPipelineHead, PipelineHead};
-use crate::worker::workers::session_prefix_tiers::SessionPrefixTiers;
 
 /// `stage_model` is stage 0's layers. KV capacity comes from `layout`, not the
 /// stage model: every stage holds the same tokens, so the stage with the most KV
@@ -100,6 +101,11 @@ pub(crate) fn build_pipeline_head_worker<M: IterwiseUnifiedModel>(
     if config.srpt {
         admission = admission.with_srpt();
     }
+    let has_tiers = prefix_tiers.is_some();
+    if let Some(tiers) = prefix_tiers {
+        admission = admission
+            .with_prefix_fetch(PrefixFetch::new(vec![tiers], config.prefix_tier_warm_start));
+    }
 
     with_head_options(
         PipelineHeadWorker::from_components(
@@ -110,7 +116,7 @@ pub(crate) fn build_pipeline_head_worker<M: IterwiseUnifiedModel>(
             layout,
             send_gid,
         ),
-        prefix_tiers,
+        has_tiers,
         config.external_decode,
     )
 }
@@ -276,6 +282,11 @@ pub(crate) fn build_hybrid_pipeline_head_worker<M: IterwiseUnifiedModel>(
     if config.srpt {
         admission = admission.with_srpt();
     }
+    let has_tiers = prefix_tiers.is_some();
+    if let Some(tiers) = prefix_tiers {
+        admission = admission
+            .with_prefix_fetch(PrefixFetch::new(vec![tiers], config.prefix_tier_warm_start));
+    }
 
     with_head_options(
         PipelineHeadWorker::from_components(
@@ -286,7 +297,7 @@ pub(crate) fn build_hybrid_pipeline_head_worker<M: IterwiseUnifiedModel>(
             layout,
             send_gid,
         ),
-        prefix_tiers,
+        has_tiers,
         config.external_decode,
     )
 }
@@ -315,7 +326,7 @@ fn head_prefix_tiers(
 
 fn with_head_options<K, A, E>(
     head: PipelineHeadWorker<K, A, E>,
-    prefix_tiers: Option<SessionPrefixTiers>,
+    prefix_tiers: bool,
     external_decode: bool,
 ) -> PipelineHeadWorker<K, A, E>
 where
@@ -326,9 +337,10 @@ where
         Input = crate::arch::contract::UnifiedArchInput,
     >,
 {
-    let head = match prefix_tiers {
-        Some(tiers) => head.with_prefix_tiers(tiers),
-        None => head,
+    let head = if prefix_tiers {
+        head.with_prefix_tiers()
+    } else {
+        head
     };
     if external_decode {
         head.with_external_decode()

@@ -13,9 +13,15 @@ So the file starts in the renewal process's equilibrium instead:
 - The first N sessions are drawn with probability proportional to their
   duration (the sum of their rounds' waits, except the last round's). Each
   one joins at a uniformly random instant of its life, at the first round
-  after that instant. Earlier rounds are dropped. The joining round becomes
-  round 0 with no prefix: its whole context is fresh tokens, the cold-cache
-  recompute a server pays when it starts mid-conversation.
+  after that instant. Earlier rounds are dropped.
+- Such a session starts with a one-token placeholder round (round 0), whose
+  wait is the rest of the wait the instant fell in, so the joining rounds
+  arrive spread as they would in steady state rather than all at t = 0. The
+  joining round keeps its declared prefix: a server without the context
+  recomputes it, and one with `prefix_tier_warm_start` reads it from its
+  slowest tier, where a long-lived session's context would sit.
+  `--cold-at-once` restores the old start instead: no placeholder, and the
+  joining round is round 0 with its whole context as fresh tokens.
 - Every later session is a whole session drawn uniformly, with replacement.
 
 The source should already carry decode time in its waits
@@ -63,6 +69,11 @@ def main() -> None:
     parser.add_argument("--concurrency", type=int, required=True, help="sessions started in equilibrium")
     parser.add_argument("--after", type=int, required=True, help="whole sessions drawn after them")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--cold-at-once",
+        action="store_true",
+        help="no placeholder round: join rounds arrive at t = 0 with their context as fresh tokens",
+    )
     args = parser.parse_args()
     if args.concurrency < 1 or args.after < 0:
         raise SystemExit("--concurrency must be positive and --after non-negative")
@@ -85,19 +96,28 @@ def main() -> None:
     cumulative = list(itertools.accumulate(duration[s] for s in weighted))
 
     rng = random.Random(args.seed)
-    totals = dict(rows=0, cold_tokens=0, dropped_rounds=0)
+    totals = dict(rows=0, cold_tokens=0, dropped_rounds=0, join_delay_ms_sum=0.0, join_delay_ms_max=0.0)
     out_sessions = 0
     with args.out.open("w", newline="") as handle:
         writer = csv.writer(handle, lineterminator="\n")
         writer.writerow(COLUMNS)
 
-        def emit(rows: list[dict[str, str]], first_prefix: int) -> None:
+        def emit(rows: list[dict[str, str]], first_prefix: int, delay_ms: float | None = None) -> None:
             nonlocal out_sessions
             sid = out_sessions
             out_sessions += 1
+            if delay_ms is not None:
+                # Placeholder round: one token in, one out, then the rest of the wait.
+                rows = [
+                    dict(prefix_len="0", input_len="1", output_len="1", tool_wait_after_ms=f"{delay_ms:.6f}"),
+                    *rows,
+                ]
+                totals["join_delay_ms_sum"] += delay_ms
+                totals["join_delay_ms_max"] = max(totals["join_delay_ms_max"], delay_ms)
+                totals["cold_tokens"] += first_prefix
             for idx, row in enumerate(rows):
                 prefix_len, input_len = int(row["prefix_len"]), int(row["input_len"])
-                if idx == 0 and first_prefix:
+                if idx == 0 and first_prefix and delay_ms is None:
                     prefix_len, input_len = 0, prefix_len + input_len
                     totals["cold_tokens"] += input_len
                 writer.writerow(
@@ -118,7 +138,8 @@ def main() -> None:
             pick = bisect.bisect_right(cumulative, rng.random() * cumulative[-1])
             name = weighted[min(pick, len(weighted) - 1)]
             instant = rng.random() * duration[name]
-            # Join at the first round arriving after `instant`.
+            # Join at the first round arriving after `instant`, the rest of
+            # that wait later.
             elapsed, join = 0.0, len(sessions[name]) - 1
             for k, wait in enumerate(waits[name]):
                 elapsed += wait
@@ -127,7 +148,7 @@ def main() -> None:
                     break
             totals["dropped_rounds"] += join
             rows = sessions[name][join:]
-            emit(rows, int(rows[0]["prefix_len"]))
+            emit(rows, int(rows[0]["prefix_len"]), None if args.cold_at_once else elapsed - instant)
         for _ in range(args.after):
             emit(sessions[rng.choice(names)], 0)
 
@@ -137,6 +158,7 @@ def main() -> None:
         "concurrency": args.concurrency,
         "after": args.after,
         "seed": args.seed,
+        "cold_at_once": args.cold_at_once,
         "sessions": out_sessions,
         **totals,
     }

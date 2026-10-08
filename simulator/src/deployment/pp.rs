@@ -237,6 +237,7 @@ fn worker_config(cfg: &PpConfig, worker: &IterWorkerSel) -> anyhow::Result<Worke
         dram_tier_gb_per_s,
         ssd_tier_gb,
         ssd_tier_gb_per_s,
+        prefix_tier_warm_start,
         external_decode,
         ..
     } = worker
@@ -299,6 +300,7 @@ fn worker_config(cfg: &PpConfig, worker: &IterWorkerSel) -> anyhow::Result<Worke
         }),
         srpt: *srpt,
         prefix_tiers,
+        prefix_tier_warm_start: *prefix_tier_warm_start,
         external_decode: *external_decode,
         ..WorkerConfig::default()
     })

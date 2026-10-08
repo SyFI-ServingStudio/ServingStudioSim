@@ -66,6 +66,7 @@ use crate::worker::shared::context::WorkerContext;
 use crate::worker::types::IterBatchPlan;
 
 use super::chunked_prefill_admission::next_chunk_tokens;
+use super::prefix_fetch::{AtHead, PrefixFetch};
 use super::{AdmissionCandidate, EnqueueSequence, MicrobatchAdmission, PendingOrderPolicy};
 
 /// The only attention partition of a pipeline head.
@@ -102,6 +103,8 @@ pub struct PipelinedChunkedPrefillAdmission<P: PendingOrderPolicy> {
     /// Shortest remaining prefill first across started and queued prompts;
     /// `false` keeps vLLM's started-first order.
     srpt: bool,
+    /// DRAM/SSD tiers behind HBM, read when a request reaches the head.
+    prefix_fetch: Option<PrefixFetch>,
 }
 
 /// [`PipelinedChunkedPrefillAdmission::with_load_budget`]: the microbatch
@@ -180,7 +183,15 @@ impl<P: PendingOrderPolicy> PipelinedChunkedPrefillAdmission<P> {
             in_flight_prefill_tokens: 0,
             load_budget: None,
             srpt: false,
+            prefix_fetch: None,
         }
+    }
+
+    /// Read session contexts back from DRAM/SSD tiers when a request reaches
+    /// the head of the queue (`prefix_fetch.rs`).
+    pub(crate) fn with_prefix_fetch(mut self, fetch: PrefixFetch) -> Self {
+        self.prefix_fetch = Some(fetch);
+        self
     }
 
     /// End every non-final chunk on a multiple of `quantum` context tokens.
@@ -298,13 +309,24 @@ impl<P: PendingOrderPolicy> PipelinedChunkedPrefillAdmission<P> {
     ) -> u32 {
         let mut remaining_budget = budget;
         while remaining_budget > 0 {
+            let fetch = &self.prefix_fetch;
             self.policy.refresh_head(&mut |candidate| {
-                kv_store
-                    .resident_prefix_tokens(candidate.fresh_prompt_tokens, candidate.session_input)
+                let hbm = kv_store
+                    .resident_prefix_tokens(candidate.fresh_prompt_tokens, candidate.session_input);
+                fetch.as_ref().map_or(hbm, |fetch| {
+                    fetch.rank_tokens(PARTITION, candidate.session_input, hbm)
+                })
             });
             let Some(candidate) = self.policy.peek() else {
                 break;
             };
+            if let Some(fetch) = &mut self.prefix_fetch {
+                if fetch.at_head(kv_store, PARTITION, candidate, now) == AtHead::Read {
+                    let popped = self.policy.pop(&mut self.policy_context);
+                    debug_assert_eq!(popped, Some(candidate));
+                    continue;
+                }
+            }
             let resolved_prefill = kv_store.preview_prefill_context(
                 PARTITION,
                 candidate.fresh_prompt_tokens,
@@ -348,6 +370,14 @@ impl<P: PendingOrderPolicy> PipelinedChunkedPrefillAdmission<P> {
                 let record = &mut store[candidate.request_id];
                 record.record_prefix_cache_hit_tokens(resolved_prefill.resident_prefix_tokens());
                 context.stamp_stage(record, now, UnifiedStage::Prefill as u16);
+            }
+            if let Some(fetch) = &mut self.prefix_fetch {
+                fetch.admitted(
+                    PARTITION,
+                    candidate,
+                    resolved_prefill.resident_prefix_tokens(),
+                    now,
+                );
             }
             kv_store.schedule_prefill_chunk(candidate.request_id, PARTITION, chunk_tokens);
             remaining_budget -= chunk_tokens;
@@ -431,13 +461,16 @@ where
                     .session_start_or(arrival_time),
             )
         };
+        let hbm_tokens = kv_store.resident_prefix_tokens(fresh_prompt_tokens, session_input);
         let candidate = self.enqueue_sequence.freeze(
             request,
             fresh_prompt_tokens,
             target_output_tokens,
             session_input,
             conversation_start_time,
-            kv_store.resident_prefix_tokens(fresh_prompt_tokens, session_input),
+            self.prefix_fetch.as_ref().map_or(hbm_tokens, |fetch| {
+                fetch.rank_tokens(PARTITION, session_input, hbm_tokens)
+            }),
         );
         debug_assert!(!self.policy.contains(request));
         self.policy.push(candidate, &mut self.policy_context);
@@ -450,6 +483,7 @@ where
         batch_plan: &mut IterBatchPlan,
         now: Time,
     ) -> bool {
+        self.land_prefix_reads(kv_store, now);
         let max_batch_tokens = self.max_batch_tokens;
         let chunk_end_quantum = self.chunk_end_quantum;
         let mut remaining_budget = max_batch_tokens;
@@ -610,5 +644,28 @@ where
 
     fn queued_requests(&self) -> u32 {
         self.policy.len() as u32
+    }
+
+    fn land_prefix_reads(&mut self, kv_store: &mut K, now: Time) -> Option<Time> {
+        let (policy, policy_context) = (&mut self.policy, &mut self.policy_context);
+        self.prefix_fetch
+            .as_mut()?
+            .land(kv_store, now, |_, candidate| {
+                policy.push_front(candidate, policy_context)
+            })
+    }
+
+    fn next_prefix_read(&self) -> Option<Time> {
+        self.prefix_fetch.as_ref()?.next_landing()
+    }
+
+    fn reading_requests(&self) -> u32 {
+        self.prefix_fetch.as_ref().map_or(0, PrefixFetch::reading)
+    }
+
+    fn store_session_context(&mut self, _partition: u16, session_id: u32, tokens: u64) {
+        if let Some(fetch) = &mut self.prefix_fetch {
+            fetch.store(PARTITION, session_id, tokens);
+        }
     }
 }

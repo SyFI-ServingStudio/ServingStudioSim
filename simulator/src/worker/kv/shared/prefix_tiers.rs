@@ -11,8 +11,8 @@
 //! than a faster one, so a lookup takes the fastest tier with the longest hit.
 //!
 //! Loads queue FIFO on one channel per tier (its read bandwidth), from the
-//! moment the request arrives, before admission. Writes are free: their
-//! bandwidth is not modeled, only counted.
+//! moment admission reaches the request (`admission/prefix_fetch.rs`). Writes
+//! are free: their bandwidth is not modeled, only counted.
 //!
 //! Units are KV tokens of the most loaded GPU (the pipeline's
 //! `kv_bytes_per_token`). A hybrid model's entry also charges one recurrent
@@ -207,6 +207,15 @@ impl PrefixTiers {
             faster.store(session_id, u64::from(hit.tokens), state_tokens);
         }
         ready
+    }
+
+    /// Put a context that predates the run into the slowest tier only, where
+    /// a long-lived session's context would have settled.
+    pub(crate) fn seed(&mut self, session_id: u32, tokens: u64) {
+        let state_tokens = self.state_tokens;
+        if let Some(tier) = self.tiers.last_mut() {
+            tier.store(session_id, tokens, state_tokens);
+        }
     }
 
     /// Write-through of a finished request's context to every tier.

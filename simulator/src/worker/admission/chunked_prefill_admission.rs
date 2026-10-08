@@ -31,6 +31,7 @@ use crate::worker::kv::{ChunkedPrefillKv, ResolvedPrefillContext};
 use crate::worker::shared::context::WorkerContext;
 use crate::worker::types::{IterBatchPlan, WorkerEventCommon, WorkerMsgCommon};
 
+use super::prefix_fetch::{AtHead, PrefixFetch};
 use super::{
     AdmissionCandidate, DecodeCompletion, EnqueueSequence, IterAdmission, LoadBalance,
     PartitionLoad, PendingOrderPolicy, SingleTokenDecodeCompletion,
@@ -69,6 +70,9 @@ pub struct ChunkedPrefillAdmission<P: PendingOrderPolicy, D = SingleTokenDecodeC
     /// no longer holds its prefix (its slower-tier copy lives there). `None`
     /// places such a request by the balance policy.
     session_partitions: Option<HashMap<u32, usize>>,
+    /// DRAM/SSD tiers behind each partition's HBM, read when a request
+    /// reaches the head of its queue.
+    prefix_fetch: Option<PrefixFetch>,
 }
 
 impl<P: PendingOrderPolicy> ChunkedPrefillAdmission<P, SingleTokenDecodeCompletion> {
@@ -139,6 +143,43 @@ impl<P: PendingOrderPolicy, D> ChunkedPrefillAdmission<P, D> {
             decode_completion,
             drafting_slots,
             session_partitions: None,
+            prefix_fetch: None,
+        }
+    }
+
+    /// Read session contexts back from each partition's DRAM/SSD tiers when a
+    /// request reaches the head of its queue (`prefix_fetch.rs`).
+    pub(crate) fn with_prefix_fetch(mut self, fetch: PrefixFetch) -> Self {
+        self.prefix_fetch = Some(fetch);
+        self
+    }
+
+    /// Return the requests whose tier read has landed by `now` to the front
+    /// of their partition's queue.
+    fn land_prefix_reads<K: ChunkedPrefillKv>(&mut self, kv_store: &mut K, now: Time) {
+        let policies = &mut self.partition_policies;
+        if let Some(fetch) = &mut self.prefix_fetch {
+            fetch.land(kv_store, now, |partition, candidate| {
+                let (policy, policy_context) = &mut policies[usize::from(partition)];
+                policy.push_front(candidate, policy_context);
+            });
+        }
+    }
+
+    /// When the next tier read lands.
+    pub(crate) fn next_prefix_read(&self) -> Option<Time> {
+        self.prefix_fetch.as_ref()?.next_landing()
+    }
+
+    /// Requests out of their queue while a tier read runs.
+    pub(crate) fn reading_requests(&self) -> u32 {
+        self.prefix_fetch.as_ref().map_or(0, PrefixFetch::reading)
+    }
+
+    /// Write a finished session context through to `partition`'s tiers.
+    pub(crate) fn store_session_context(&mut self, partition: u16, session_id: u32, tokens: u64) {
+        if let Some(fetch) = &mut self.prefix_fetch {
+            fetch.store(partition, session_id, tokens);
         }
     }
 
@@ -436,18 +477,21 @@ where
                     .session_start_or(arrival_time),
             )
         };
+        // Placement is frozen when the request enters the worker. Retained KV
+        // has hard affinity; cold requests use the same generic balance policy
+        // as ordinary local admission.
+        let partition = self.choose_partition(kv_store, session_input);
+        let hbm_tokens = kv_store.resident_prefix_tokens(fresh_prompt_tokens, session_input);
         let candidate = self.enqueue_sequence.freeze(
             request,
             fresh_prompt_tokens,
             remaining_output_tokens,
             session_input,
             conversation_start_time,
-            kv_store.resident_prefix_tokens(fresh_prompt_tokens, session_input),
+            self.prefix_fetch.as_ref().map_or(hbm_tokens, |fetch| {
+                fetch.rank_tokens(partition as u16, session_input, hbm_tokens)
+            }),
         );
-        // Placement is frozen when the request enters the worker. Retained KV
-        // has hard affinity; cold requests use the same generic balance policy
-        // as ordinary local admission.
-        let partition = self.choose_partition(kv_store, session_input);
         let (policy, policy_context) = &mut self.partition_policies[partition];
         debug_assert!(!policy.contains(request));
         policy.push(candidate, policy_context);
@@ -460,6 +504,7 @@ where
         batch_plan: &mut IterBatchPlan,
         now: Time,
     ) -> bool {
+        self.land_prefix_reads(kv_store, now);
         let num_partitions = kv_store.num_partitions();
         debug_assert_eq!(self.partition_policies.len(), num_partitions);
         self.started_prefills.resize_with(num_partitions, Vec::new);
@@ -556,15 +601,26 @@ where
             while !retracted_before_admission && remaining_budgets[partition_index] > drafting_slots
             {
                 let (policy, policy_context) = &mut self.partition_policies[partition_index];
+                let fetch = &mut self.prefix_fetch;
                 policy.refresh_head(&mut |candidate| {
-                    kv_store.resident_prefix_tokens(
+                    let hbm = kv_store.resident_prefix_tokens(
                         candidate.fresh_prompt_tokens,
                         candidate.session_input,
-                    )
+                    );
+                    fetch.as_ref().map_or(hbm, |fetch| {
+                        fetch.rank_tokens(partition, candidate.session_input, hbm)
+                    })
                 });
                 let Some(candidate) = policy.peek() else {
                     break;
                 };
+                if let Some(fetch) = fetch {
+                    if fetch.at_head(kv_store, partition, candidate, now) == AtHead::Read {
+                        let popped = policy.pop(policy_context);
+                        debug_assert_eq!(popped, Some(candidate));
+                        continue;
+                    }
+                }
                 if candidate.remaining_output_tokens > 1
                     && future_decode_slots
                         .as_ref()
@@ -650,6 +706,14 @@ where
                         );
                     }
                     context.stamp_stage(record, now, UnifiedStage::Prefill as u16);
+                }
+                if let Some(fetch) = &mut self.prefix_fetch {
+                    fetch.admitted(
+                        partition,
+                        candidate,
+                        resolved_prefill.resident_prefix_tokens(),
+                        now,
+                    );
                 }
                 assert!(
                     self.prefill_episodes
@@ -836,6 +900,13 @@ where
     }
 
     fn cancel_pending(&mut self, request: RequestId) -> bool {
+        if self
+            .prefix_fetch
+            .as_mut()
+            .is_some_and(|fetch| fetch.cancel(request))
+        {
+            return true;
+        }
         for (policy, _) in &mut self.partition_policies {
             if policy.remove(request).is_some() {
                 return true;

@@ -127,13 +127,14 @@ impl Deployment for UnifiedDeployment {
                 batch_policy,
                 kv_admission,
                 gpu_time_multiplier,
+                pending_order,
                 // Read by `prefill_gpu_time_multiplier` below.
                 ..
             } => (
                 *attn_gpu_memory_gb,
                 *gpu_time_multiplier,
                 Some(*max_batch_tokens),
-                PendingOrderKind::Fifo,
+                *pending_order,
                 PrefixCacheMode::Opportunistic,
                 PrefixCachePolicy::Lru,
                 None,
@@ -211,6 +212,13 @@ impl Deployment for UnifiedDeployment {
                 )?,
                 _ => [None, None],
             },
+            prefix_tier_warm_start: matches!(
+                &g.worker,
+                IterWorkerSel::ChunkedPrefill {
+                    prefix_tier_warm_start: true,
+                    ..
+                }
+            ),
             external_decode: matches!(
                 &g.worker,
                 IterWorkerSel::ChunkedPrefill {
@@ -1200,10 +1208,12 @@ mod tests {
             dp_placement: DpPlacement::RoundRobin,
             prefill_chunk_alignment: PrefillChunkAlignment::Checkpoint,
             long_prefill_token_threshold: 0,
+            pending_order: PendingOrderKind::Fifo,
             dram_tier_gb: 0.0,
             dram_tier_gb_per_s: 50.0,
             ssd_tier_gb: 0.0,
             ssd_tier_gb_per_s: 10.0,
+            prefix_tier_warm_start: false,
             external_decode: false,
         }
     }

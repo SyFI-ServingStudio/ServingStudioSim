@@ -27,23 +27,23 @@
 //! - A head blocked on the in-flight window or on KV has no wakeup: only an exit
 //!   or a new request can unblock it, and L6 ticks it on every message.
 //!
-//! Prefix tiers. With DRAM/SSD tiers configured, an arriving session request
-//! whose context HBM no longer holds but a slower tier does is read back first:
-//! it queues for admission only when the read lands, back in HBM's retained
-//! tier. Every finished context is written through to the tiers. With
-//! `external_decode`, a request completes at its first token, as if a decode
-//! instance took it, and its whole target context is retained.
+//! Prefix tiers. With DRAM/SSD tiers configured, the admission reads a session
+//! context back when the request reaches the head of its queue
+//! (`admission/prefix_fetch.rs`); the head lands those reads before it forms a
+//! microbatch and wakes when the next one lands. Every finished context is
+//! written through to the tiers. With `external_decode`, a request completes
+//! at its first token, as if a decode instance took it, and its whole target
+//! context is retained.
 //!
 //! Reading order: state types → struct → construction → `IterWorker` → message
-//! handlers → tick (exits, landed loads, stage-0 completion, formation) →
+//! handlers → tick (exits, landed reads, stage-0 completion, formation) →
 //! wakeup → tests.
 
-use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
 use crate::arch::contract::UnifiedArchInput;
-use crate::common::{RequestId, SessionInput, Time, WorkerId};
+use crate::common::{RequestId, Time, WorkerId};
 use crate::worker::admission::MicrobatchAdmission;
 use crate::worker::execution::IterModelExecution;
 use crate::worker::iter_worker::IterWorker;
@@ -52,8 +52,6 @@ use crate::worker::shared::context::WorkerContext;
 use crate::worker::types::{
     IterBatchPlan, PipelineHeadEvent, PipelineHeadMsg, PipelineMicrobatch, WorkerStatus,
 };
-
-use crate::worker::workers::session_prefix_tiers::SessionPrefixTiers;
 
 /// Activation size and depth of the pipeline this head feeds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -101,9 +99,9 @@ where
     /// microbatch forms and starts here, not on the tick grid.
     state_changed_at: Time,
     completed: Vec<RequestId>,
-    prefix_tiers: Option<SessionPrefixTiers>,
-    /// Reads from a slower tier in flight: (lands, request, session, tokens).
-    loading: BinaryHeap<Reverse<(Time, RequestId, u32, u32)>>,
+    /// Whether the admission reads from DRAM/SSD tiers (finished contexts
+    /// are then written through).
+    prefix_tiers: bool,
     /// `external_decode`: each running request's target output tokens.
     external_outputs: Option<HashMap<RequestId, u32>>,
 }
@@ -145,14 +143,15 @@ where
             request_arrived: false,
             state_changed_at: Time::ZERO,
             completed: Vec::new(),
-            prefix_tiers: None,
-            loading: BinaryHeap::new(),
+            prefix_tiers: false,
             external_outputs: None,
         }
     }
 
-    pub(super) fn with_prefix_tiers(mut self, tiers: SessionPrefixTiers) -> Self {
-        self.prefix_tiers = Some(tiers);
+    /// The admission was built with a `PrefixFetch`: write every finished
+    /// context through to its tiers.
+    pub(super) fn with_prefix_tiers(mut self) -> Self {
+        self.prefix_tiers = true;
         self
     }
 
@@ -194,7 +193,7 @@ where
 
     fn status(&self) -> WorkerStatus {
         WorkerStatus {
-            queued_requests: self.admission.queued_requests() + self.loading.len() as u32,
+            queued_requests: self.admission.queued_requests() + self.admission.reading_requests(),
             active_requests: self.kv_store.status_active(0),
         }
     }
@@ -206,66 +205,17 @@ where
     A: MicrobatchAdmission<K>,
     E: IterModelExecution<K, Input = UnifiedArchInput>,
 {
-    /// Hand the request to decode elsewhere after its first token, then find
-    /// its prefix: queue it now, or once a slower tier's read lands.
+    /// Hand the request to decode elsewhere after its first token, and queue it.
     fn on_msg_request(&mut self, request: RequestId) {
-        let (session_input, prompt_tokens, arrival) = {
+        if let Some(outputs) = &mut self.external_outputs {
             let mut store = self.context.requests.borrow_mut();
-            let record = &mut store[request];
-            let definition = &mut record.request.definition;
-            if let Some(outputs) = &mut self.external_outputs {
-                outputs.insert(request, definition.target_output_tokens);
-                definition.target_output_tokens = 1;
-            }
-            (
-                definition.session,
-                definition.prompt_tokens,
-                record.request.core.arrival_time,
-            )
-        };
-        if let (
-            Some(tiers),
-            SessionInput::Session {
-                session_id,
-                declared_prefix_tokens,
-                ..
-            },
-        ) = (&mut self.prefix_tiers, session_input)
-        {
-            let hbm_tokens = self
-                .kv_store
-                .resident_prefix_tokens(prompt_tokens, session_input);
-            if let Some((hit, ready)) = tiers.on_arrival(
-                request,
-                session_id,
-                declared_prefix_tokens,
-                hbm_tokens,
-                arrival,
-            ) {
-                self.loading
-                    .push(Reverse((ready, request, session_id, hit.tokens)));
-                return;
-            }
+            let definition = &mut store[request].request.definition;
+            outputs.insert(request, definition.target_output_tokens);
+            definition.target_output_tokens = 1;
         }
         self.admission
             .accept_request(&mut self.kv_store, request, &self.context);
         self.request_arrived = true;
-    }
-
-    /// Queue every request whose read has landed by `now`, its context back in
-    /// HBM's retained tier.
-    fn land_loads(&mut self, now: Time) {
-        while let Some(&Reverse((ready, request, session_id, tokens))) = self.loading.peek() {
-            if ready > now {
-                break;
-            }
-            self.loading.pop();
-            self.kv_store
-                .restore_prefix(request, 0, session_id, u64::from(tokens), ready);
-            self.admission
-                .accept_request(&mut self.kv_store, request, &self.context);
-            self.state_changed_at = self.state_changed_at.max(ready);
-        }
     }
 
     /// Retain a finished request's whole context: hand a decode-elsewhere
@@ -275,7 +225,7 @@ where
             .external_outputs
             .as_mut()
             .and_then(|outputs| outputs.remove(&request));
-        if self.prefix_tiers.is_none() && external_outputs.is_none_or(|outputs| outputs <= 1) {
+        if !self.prefix_tiers && external_outputs.is_none_or(|outputs| outputs <= 1) {
             return;
         }
         let (session_input, context_tokens) = {
@@ -297,8 +247,9 @@ where
             self.kv_store
                 .restore_prefix(request, 0, session_id, context_tokens, at);
         }
-        if let Some(tiers) = &mut self.prefix_tiers {
-            tiers.store(session_id, context_tokens);
+        if self.prefix_tiers {
+            self.admission
+                .store_session_context(0, session_id, context_tokens);
         }
     }
 
@@ -313,7 +264,9 @@ where
         // Exits first: they release KV the next formation may need, and their
         // times precede the formation's, so KV samples stay in time order.
         self.complete_exited_microbatches(events);
-        self.land_loads(now);
+        if let Some(landed) = self.admission.land_prefix_reads(&mut self.kv_store, now) {
+            self.state_changed_at = self.state_changed_at.max(landed);
+        }
         loop {
             let mut progressed = false;
             if self
@@ -415,7 +368,7 @@ where
     }
 
     fn next_wakeup(&self) -> Option<Time> {
-        let load = self.loading.peek().map(|Reverse((ready, ..))| *ready);
+        let load = self.admission.next_prefix_read();
         let compute = self
             .computing
             .as_ref()
@@ -1291,11 +1244,20 @@ mod tests {
     }
 
     fn tiered_head(store: SharedRequests, external_decode: bool) -> PipelineHead<FakeModel> {
+        tiered_head_with(store, external_decode, false)
+    }
+
+    fn tiered_head_with(
+        store: SharedRequests,
+        external_decode: bool,
+        warm_start: bool,
+    ) -> PipelineHead<FakeModel> {
         // 2 B/token, 120 tokens of HBM. DRAM: 500 tokens read at 1e5 B/s, so
         // 50 tokens take 1 ms.
         head_with(
             store,
             WorkerConfig {
+                prefix_tier_warm_start: warm_start,
                 max_batch_tokens: Some(64),
                 attn_kv_bytes: 240,
                 prefix_tiers: [
@@ -1391,5 +1353,82 @@ mod tests {
             store[RequestId(1)].telemetry.prefix_cache_hit_tokens,
             Some(54)
         );
+    }
+
+    #[test]
+    fn a_context_evicted_while_queued_is_read_when_admission_reaches_it() {
+        // Round 1 of session 7 arrives while HBM still holds round 0's 50
+        // tokens, behind a 100-token prompt of session 8 whose admission evicts
+        // them. The read starts when round 1 reaches the head, not at arrival,
+        // so it still finds its context; HBM alone recomputes it.
+        for (tiers, hit) in [(true, 50), (false, 0)] {
+            let store = shared_with(&[(0, 50, 1), (1, 100, 1), (2, 4, 1)]);
+            as_session(&store, 0, 7, 0, 0.0);
+            as_session(&store, 1, 8, 0, 4.0);
+            as_session(&store, 2, 7, 51, 4.0);
+            let mut worker = if tiers {
+                tiered_head(Rc::clone(&store), false)
+            } else {
+                head_with(
+                    Rc::clone(&store),
+                    WorkerConfig {
+                        max_batch_tokens: Some(64),
+                        attn_kv_bytes: 240,
+                        ..WorkerConfig::default()
+                    },
+                )
+            };
+            let mut events = Vec::new();
+            worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
+            run_until(&mut worker, Time::ZERO, Time::from_ms(3.0), &mut events);
+            let round1 = store.borrow()[RequestId(2)].request.definition.session;
+            assert_eq!(worker.kv_store.resident_prefix_tokens(4, round1), 50);
+            worker.enqueue(PipelineHeadMsg::Request(RequestId(1)));
+            worker.enqueue(PipelineHeadMsg::Request(RequestId(2)));
+            run_until(
+                &mut worker,
+                Time::from_ms(4.0),
+                Time::from_ms(60.0),
+                &mut events,
+            );
+            assert_eq!(
+                completed(&events),
+                vec![RequestId(0), RequestId(1), RequestId(2)]
+            );
+            assert_eq!(
+                store.borrow()[RequestId(2)]
+                    .telemetry
+                    .prefix_cache_hit_tokens,
+                Some(hit),
+                "tiers={tiers}"
+            );
+        }
+    }
+
+    #[test]
+    fn warm_start_reads_a_pre_run_context_from_the_slowest_tier() {
+        // A session's first request in the run declares 40 tokens: with warm
+        // start they come from the tier (0.8 ms), without it they are computed.
+        for (warm_start, hit, read_ms) in [(true, 40, 0.8), (false, 0, 0.0)] {
+            let store = shared_with(&[(0, 4, 1)]);
+            as_session(&store, 0, 7, 40, 0.0);
+            let mut worker = tiered_head_with(Rc::clone(&store), false, warm_start);
+            let mut events = Vec::new();
+            worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
+            run_until(&mut worker, Time::ZERO, Time::from_ms(20.0), &mut events);
+            assert_eq!(completed(&events), vec![RequestId(0)]);
+            assert_eq!(
+                store.borrow()[RequestId(0)]
+                    .telemetry
+                    .prefix_cache_hit_tokens,
+                Some(hit)
+            );
+            // Stage 0 starts once the read lands.
+            let launches = launched(&events);
+            assert!(
+                launches[0].2 > Time::from_ms(read_ms),
+                "warm_start={warm_start}: {launches:?}"
+            );
+        }
     }
 }

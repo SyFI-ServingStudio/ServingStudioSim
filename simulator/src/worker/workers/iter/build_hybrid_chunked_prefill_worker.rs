@@ -10,9 +10,10 @@
 //! selector asks for `plain` chunking. `plain` also reuses prefixes exactly
 //! (one state at a retained entry's end, `HybridGdnKv::with_exact_prefix_reuse`).
 //!
-//! The shell is wrapped in `SessionTierWorker`, which adds the selector's
-//! DRAM/SSD tiers (one set per attention DP rank, sessions sticky to their
-//! rank) and `external_decode`.
+//! The selector's DRAM/SSD tiers go to the admission (one set per attention DP
+//! rank, read when a request reaches the head of its rank's queue; sessions
+//! sticky to their rank), and the shell is wrapped in `SessionTierWorker`,
+//! which writes finished contexts through and runs `external_decode`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -20,7 +21,9 @@ use std::sync::Arc;
 use crate::arch::contract::IterwiseUnifiedModel;
 use crate::common::{PoolId, SharedRequests, WorkerId};
 use crate::log::PrefixCacheLogger;
-use crate::worker::admission::{ChunkedPrefillAdmission, LoadBalance, PendingOrder};
+use crate::worker::admission::{
+    ChunkedPrefillAdmission, LoadBalance, PendingOrder, PrefixFetch, SessionPrefixTiers,
+};
 use crate::worker::config::DpPlacement;
 use crate::worker::config::PrefillChunkAlignment;
 use crate::worker::execution::UnifiedIterExecution;
@@ -33,7 +36,6 @@ use super::session_tier_worker::SessionTierWorker;
 use crate::worker::workers::iter_build_essentials::{
     full_attention_token_capacity, prepare_iter_build_essentials,
 };
-use crate::worker::workers::session_prefix_tiers::SessionPrefixTiers;
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_hybrid_chunked_prefill_worker<M: IterwiseUnifiedModel>(
@@ -169,11 +171,17 @@ pub(crate) fn build_hybrid_chunked_prefill_worker<M: IterwiseUnifiedModel>(
     } else {
         admission
     };
+    let has_tiers = !tiers.is_empty();
+    let admission = if has_tiers {
+        admission.with_prefix_fetch(PrefixFetch::new(tiers, config.prefix_tier_warm_start))
+    } else {
+        admission
+    };
     let shell = IterBatchWorker::from_components(
         essentials.context,
         kv_store,
         admission,
         UnifiedIterExecution::new(model, essentials.cost),
     );
-    SessionTierWorker::new(shell, tiers, config.external_decode)
+    SessionTierWorker::new(shell, has_tiers, config.external_decode)
 }
