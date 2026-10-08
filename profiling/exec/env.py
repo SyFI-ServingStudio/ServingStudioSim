@@ -155,6 +155,17 @@ ENV_REGISTRY: dict[str, ProfileEnv | ContainerProfileEnv] = {
         additional_library_paths=(_VLLM_FORK_TORCH_LIB,),
         isolated_site_packages=True,
     ),
+    # FlashKDA, the KDA prefill kernel upstream vLLM vendors as _flashkda_C,
+    # built standalone from the same commit (vllm-project/FlashKDA@17a037d,
+    # registered as torch.ops.flash_kda). vllm_env's fork image predates it,
+    # and the project Torch (cu128) cannot build its sm_100f code, so this
+    # venv carries Torch 2.13.0/cu130 as upstream vLLM pins it. Setup:
+    # profiling/README.md "flashkda_env".
+    "flashkda_env": ProfileEnv(
+        "flashkda_env",
+        _profile_env_python("flashkda_env"),
+        isolated_site_packages=True,
+    ),
     # vLLM runners execute in the pinned image (the alignment fork's vLLM
     # commit, profiling/container/build.sh); host source and Python packages
     # are deliberately outside this environment boundary.

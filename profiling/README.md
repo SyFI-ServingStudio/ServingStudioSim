@@ -78,6 +78,27 @@ inherited site-packages from `PYTHONPATH`, so the project Torch cannot shadow
 the venv's own build. Once the container is rebuilt from the rebased checkout,
 move those backends to `vllm_env` and remove this env.
 
+`flashkda_env` is a host venv at `~/profile_envs/flashkda_env` (a symlink to a
+disk with room is fine) for the `kda_chunk_prefill` `flashkda` backend. It holds
+Torch 2.13.0 (cu130, upstream vLLM's pin) and FlashKDA built from
+`vllm-project/FlashKDA@17a037d98da546deb4591e967cf961a43c034d8b`, the commit
+upstream vLLM vendors as `_flashkda_C`. The project Torch is cu128 and cannot
+build FlashKDA's `sm_100f`/`sm_120f` code, so the backend needs its own venv.
+Build it with a CUDA 13 toolkit:
+
+```bash
+uv venv --python 3.12 ~/profile_envs/flashkda_env
+uv pip install --python ~/profile_envs/flashkda_env/bin/python \
+  torch==2.13.0 numpy nvidia-ml-py setuptools wheel packaging ninja
+git clone https://github.com/vllm-project/FlashKDA.git && cd FlashKDA
+git checkout 17a037d98da546deb4591e967cf961a43c034d8b
+git submodule update --init --depth 1 cutlass
+CUDA_HOME=/usr/local/cuda-13.1 FLASH_KDA_CUDA_ARCHS=90a,100f,120f \
+  uv pip install --python ~/profile_envs/flashkda_env/bin/python --no-build-isolation .
+```
+
+The package version (`0.0.1+17a037d`) goes into each row's `backend_version`.
+
 `Timer.cupti`'s duration path is a two-pass GPU-active-time measurement. It
 first records 10 real callable launches, computes
 `ceil(min_duration_ms / estimate_mean_ms)`, then records exactly that many
