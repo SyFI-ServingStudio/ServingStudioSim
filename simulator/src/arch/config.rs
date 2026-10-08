@@ -130,6 +130,15 @@ fn default_glm53_flash_kda_prefill_backend() -> String {
     "vllm_triton".to_string()
 }
 
+/// `gdn_causal_conv_prefill` backends a GLM-5.3-Flash arch can run its KDA
+/// short-conv prefill on: vLLM's varlen Triton call, or Dao-AILab
+/// causal-conv1d's channel-last kernel, one launch per sequence.
+pub(crate) const GLM53_FLASH_CAUSAL_CONV_BACKENDS: [&str; 2] = ["vllm_triton", "dao_channellast"];
+
+fn default_glm53_flash_causal_conv_backend() -> String {
+    "vllm_triton".to_string()
+}
+
 const fn default_glm53_flash_mla_layout_copies() -> bool {
     true
 }
@@ -748,6 +757,15 @@ pub enum IterArchSel {
         #[serde(default = "default_glm53_flash_indexer_max_logits_mb")]
         #[param(default = 512, cache_key)]
         indexer_max_logits_mb: u32,
+        /// KDA short-conv prefill kernel (`gdn_causal_conv_prefill` backend):
+        /// `vllm_triton`, vLLM's one varlen `causal_conv1d_fn` launch over every
+        /// token, or `dao_channellast`, Dao-AILab causal-conv1d's channel-last
+        /// kernel launched once per prefill sequence, with the iteration's
+        /// decode tokens on vLLM's `causal_conv1d_update`. No vLLM release
+        /// dispatches to the latter.
+        #[serde(default = "default_glm53_flash_causal_conv_backend")]
+        #[param(string, default = "vllm_triton", choices = GLM53_FLASH_CAUSAL_CONV_BACKENDS, cache_key)]
+        causal_conv_backend: String,
     },
     /// [`Self::Glm53FlashVllmFp8KdaDsaMoe`]'s kernels under pure pipeline
     /// parallelism. Each of `pp_size` stages is one GPU running a contiguous
@@ -828,6 +846,15 @@ pub enum IterArchSel {
         #[serde(default = "default_glm53_flash_indexer_max_logits_mb")]
         #[param(default = 512, cache_key)]
         indexer_max_logits_mb: u32,
+        /// KDA short-conv prefill kernel (`gdn_causal_conv_prefill` backend):
+        /// `vllm_triton`, vLLM's one varlen `causal_conv1d_fn` launch over every
+        /// token, or `dao_channellast`, Dao-AILab causal-conv1d's channel-last
+        /// kernel launched once per prefill sequence, with the iteration's
+        /// decode tokens on vLLM's `causal_conv1d_update`. No vLLM release
+        /// dispatches to the latter.
+        #[serde(default = "default_glm53_flash_causal_conv_backend")]
+        #[param(string, default = "vllm_triton", choices = GLM53_FLASH_CAUSAL_CONV_BACKENDS, cache_key)]
+        causal_conv_backend: String,
     },
     /// [`Self::Glm53FlashVllmFp8KdaDsaMoe`]'s kernels under data-parallel
     /// attention and expert-parallel MoE (vLLM `--data-parallel-size ep_size
@@ -905,6 +932,15 @@ pub enum IterArchSel {
         #[serde(default = "default_glm53_flash_indexer_max_logits_mb")]
         #[param(default = 512, cache_key)]
         indexer_max_logits_mb: u32,
+        /// KDA short-conv prefill kernel (`gdn_causal_conv_prefill` backend):
+        /// `vllm_triton`, vLLM's one varlen `causal_conv1d_fn` launch over every
+        /// token, or `dao_channellast`, Dao-AILab causal-conv1d's channel-last
+        /// kernel launched once per prefill sequence, with the iteration's
+        /// decode tokens on vLLM's `causal_conv1d_update`. No vLLM release
+        /// dispatches to the latter.
+        #[serde(default = "default_glm53_flash_causal_conv_backend")]
+        #[param(string, default = "vllm_triton", choices = GLM53_FLASH_CAUSAL_CONV_BACKENDS, cache_key)]
+        causal_conv_backend: String,
     },
     /// [`Self::Glm53FlashVllmFp8KdaDsaMoe`]'s graph for NVIDIA's ModelOpt NVFP4
     /// checkpoint (`nvidia/GLM-5.3-Flash-NVFP4`): NVFP4 routed experts and
@@ -985,6 +1021,15 @@ pub enum IterArchSel {
         #[serde(default = "default_glm53_flash_indexer_max_logits_mb")]
         #[param(default = 512, cache_key)]
         indexer_max_logits_mb: u32,
+        /// KDA short-conv prefill kernel (`gdn_causal_conv_prefill` backend):
+        /// `vllm_triton`, vLLM's one varlen `causal_conv1d_fn` launch over every
+        /// token, or `dao_channellast`, Dao-AILab causal-conv1d's channel-last
+        /// kernel launched once per prefill sequence, with the iteration's
+        /// decode tokens on vLLM's `causal_conv1d_update`. No vLLM release
+        /// dispatches to the latter.
+        #[serde(default = "default_glm53_flash_causal_conv_backend")]
+        #[param(string, default = "vllm_triton", choices = GLM53_FLASH_CAUSAL_CONV_BACKENDS, cache_key)]
+        causal_conv_backend: String,
     },
     /// [`Self::Glm53FlashVllmFp8PpKdaDsaMoe`] for the NVFP4 checkpoint (see
     /// [`Self::Glm53FlashVllmNvfp4KdaDsaMoe`]). Runs only under deployment `pp`.
@@ -1060,6 +1105,15 @@ pub enum IterArchSel {
         #[serde(default = "default_glm53_flash_indexer_max_logits_mb")]
         #[param(default = 512, cache_key)]
         indexer_max_logits_mb: u32,
+        /// KDA short-conv prefill kernel (`gdn_causal_conv_prefill` backend):
+        /// `vllm_triton`, vLLM's one varlen `causal_conv1d_fn` launch over every
+        /// token, or `dao_channellast`, Dao-AILab causal-conv1d's channel-last
+        /// kernel launched once per prefill sequence, with the iteration's
+        /// decode tokens on vLLM's `causal_conv1d_update`. No vLLM release
+        /// dispatches to the latter.
+        #[serde(default = "default_glm53_flash_causal_conv_backend")]
+        #[param(string, default = "vllm_triton", choices = GLM53_FLASH_CAUSAL_CONV_BACKENDS, cache_key)]
+        causal_conv_backend: String,
     },
     /// [`Self::Glm53FlashVllmFp8DpAttnEpMoe`] for the NVFP4 checkpoint (see
     /// [`Self::Glm53FlashVllmNvfp4KdaDsaMoe`]): the routed experts sit behind
@@ -1134,6 +1188,15 @@ pub enum IterArchSel {
         #[serde(default = "default_glm53_flash_indexer_max_logits_mb")]
         #[param(default = 512, cache_key)]
         indexer_max_logits_mb: u32,
+        /// KDA short-conv prefill kernel (`gdn_causal_conv_prefill` backend):
+        /// `vllm_triton`, vLLM's one varlen `causal_conv1d_fn` launch over every
+        /// token, or `dao_channellast`, Dao-AILab causal-conv1d's channel-last
+        /// kernel launched once per prefill sequence, with the iteration's
+        /// decode tokens on vLLM's `causal_conv1d_update`. No vLLM release
+        /// dispatches to the latter.
+        #[serde(default = "default_glm53_flash_causal_conv_backend")]
+        #[param(string, default = "vllm_triton", choices = GLM53_FLASH_CAUSAL_CONV_BACKENDS, cache_key)]
+        causal_conv_backend: String,
     },
     /// SGLang's B200 NVFP4 launch graph under pure tensor parallelism. Every
     /// rank owns all experts (EP1) and shards the routed intermediate axis by

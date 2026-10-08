@@ -176,6 +176,16 @@ ENV_REGISTRY: dict[str, ProfileEnv | ContainerProfileEnv] = {
         _profile_env_python("flashkda_env"),
         isolated_site_packages=True,
     ),
+    # Dao-AILab causal-conv1d's prebuilt wheel, installed with `--no-deps
+    # --target` into one directory and imported on the project interpreter.
+    # The wheel is built against the project's Torch (2.10, cu12, cxx11 ABI),
+    # so it needs no venv of its own; a Torch bump fails its import loudly.
+    # Setup: profiling/README.md "causal_conv1d_env".
+    "causal_conv1d_env": ProfileEnv(
+        "causal_conv1d_env",
+        _default_python(),
+        additional_python_paths=(_PROFILE_ENVS_ROOT / "causal_conv1d",),
+    ),
     # vLLM runners execute in the pinned image (the alignment fork's vLLM
     # commit, profiling/container/build.sh); host source and Python packages
     # are deliberately outside this environment boundary.
