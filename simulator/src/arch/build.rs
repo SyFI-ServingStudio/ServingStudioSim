@@ -16,7 +16,9 @@ use std::path::Path;
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
-use crate::arch::config::{AttnArchSel, FfnArchSel, IterArchSel, ModelSpec, RoutingKind};
+use crate::arch::config::{
+    AttnArchSel, FfnArchSel, IterArchSel, ModelSpec, RoutingKind, GLM53_FLASH_KDA_PREFILL_BACKENDS,
+};
 use crate::arch::contract::SpeculativeUnifiedModel;
 use crate::arch::model_cfg::ModelCfg;
 use crate::arch::moe_model_cfg::MoeModelCfg;
@@ -34,14 +36,15 @@ use crate::arch::{
     Glm52SglangNvfp4TpDsaMoeModel, Glm52SglangNvfp4TpDsaMoeParallel, Glm52VllmDsaMoeModel,
     Glm52VllmDsaMoeParallel, Glm52VllmNvfp4DpAttnDsaMoeModel, Glm52VllmNvfp4DpAttnParallel,
     Glm52VllmNvfp4DsaMoeModel, Glm52VllmNvfp4DsaMoeParallel, Glm52VllmNvfp4DsaMoeSpeculativeModel,
-    Glm52VllmNvfp4PpDsaMoeModel, Glm52VllmNvfp4PpParallel, Glm53FlashModelCfg, Glm53FlashQuant,
-    Glm53FlashVllmFp8PpModel, Glm53FlashVllmFp8PpParallel, Glm53FlashVllmModel,
-    Glm53FlashVllmParallel, Glm53VllmNvfp4DsaMoeDflash2Model, IterwiseUnifiedModel,
-    Llama3DenseModel, Llama3DenseTpModel, Llama3DpAttnTpFfnModel, Qwen36LocalModel,
-    Qwen36LocalParallel, Qwen36ModelCfg, Qwen3AttnLayerwiseModel, Qwen3AttnParallel,
-    Qwen3FfnMoeLayerwiseModel, Qwen3FfnMoeParallel, Qwen3Fp8FfnMoeLayerwiseModel,
-    Qwen3Fp8FfnMoeParallel, Qwen3MoeDpAttnEpFfnModel, Qwen3MoeFp8DpAttnEpFfnModel,
-    Qwen3MoeFp8Parallel, Qwen3MoeParallel, Qwen3VllmMoeDpAttnEpFfnModel, Qwen3VllmMoeParallel,
+    Glm52VllmNvfp4PpDsaMoeModel, Glm52VllmNvfp4PpParallel, Glm53FlashKernelPath,
+    Glm53FlashModelCfg, Glm53FlashQuant, Glm53FlashVllmFp8PpModel, Glm53FlashVllmFp8PpParallel,
+    Glm53FlashVllmModel, Glm53FlashVllmParallel, Glm53VllmNvfp4DsaMoeDflash2Model,
+    IterwiseUnifiedModel, Llama3DenseModel, Llama3DenseTpModel, Llama3DpAttnTpFfnModel,
+    Qwen36LocalModel, Qwen36LocalParallel, Qwen36ModelCfg, Qwen3AttnLayerwiseModel,
+    Qwen3AttnParallel, Qwen3FfnMoeLayerwiseModel, Qwen3FfnMoeParallel,
+    Qwen3Fp8FfnMoeLayerwiseModel, Qwen3Fp8FfnMoeParallel, Qwen3MoeDpAttnEpFfnModel,
+    Qwen3MoeFp8DpAttnEpFfnModel, Qwen3MoeFp8Parallel, Qwen3MoeParallel,
+    Qwen3VllmMoeDpAttnEpFfnModel, Qwen3VllmMoeParallel,
 };
 use crate::common::Fabric;
 use crate::timing::bridge::DType;
@@ -1344,6 +1347,7 @@ pub fn glm53_flash_vllm_fp8_kda_dsa_moe(
     expert_popularity_file: Option<&str>,
     token_corpus_file: Option<&str>,
     cudagraph_capture_sizes: &[u32],
+    kernel_path: Glm53FlashKernelPath,
     gpu: &str,
     name: &str,
     bridge: &PerfApiBridge,
@@ -1363,6 +1367,7 @@ pub fn glm53_flash_vllm_fp8_kda_dsa_moe(
         max_model_len,
         gpu_name: gpu.to_string(),
         cudagraph_capture_sizes: cudagraph_capture_sizes.to_vec(),
+        kernel_path,
     };
     let configs = glm53_flash_vllm_fp8_kda_dsa_moe::build_configs(&model_cfg, &parallel, &demand)
         .context("expanding GLM-5.3-Flash architecture configs")?;
@@ -1450,6 +1455,7 @@ pub fn glm53_flash_vllm_fp8_pp_kda_dsa_moe(
     token_corpus_file: Option<&str>,
     cudagraph_capture_sizes: &[u32],
     layer_partition: &[u32],
+    kernel_path: Glm53FlashKernelPath,
     gpu: &str,
     name: &str,
     bridge: &PerfApiBridge,
@@ -1469,6 +1475,7 @@ pub fn glm53_flash_vllm_fp8_pp_kda_dsa_moe(
         gpu_name: gpu.to_string(),
         cudagraph_capture_sizes: cudagraph_capture_sizes.to_vec(),
         layer_partition: layer_partition.to_vec(),
+        kernel_path,
     };
     let configs =
         glm53_flash_vllm_fp8_pp_kda_dsa_moe::build_configs(&model_cfg, &parallel, &demand)
@@ -1492,6 +1499,7 @@ pub fn glm53_flash_vllm_fp8_dp_attn_ep_moe(
     expert_popularity_file: Option<&str>,
     token_corpus_file: Option<&str>,
     cudagraph_capture_sizes: &[u32],
+    kernel_path: Glm53FlashKernelPath,
     gpu: &str,
     name: &str,
     bridge: &PerfApiBridge,
@@ -1519,6 +1527,7 @@ pub fn glm53_flash_vllm_fp8_dp_attn_ep_moe(
         max_model_len,
         gpu_name: gpu.to_string(),
         cudagraph_capture_sizes: cudagraph_capture_sizes.to_vec(),
+        kernel_path,
     };
     let configs =
         glm53_flash_vllm_fp8_dp_attn_ep_moe::build_configs(&model_cfg, &parallel, &demand)
@@ -1803,6 +1812,53 @@ pub fn qwen3_fp8_ffn_moe(
     );
     qwen3_fp8_ffn_moe_layerwise::build(name.to_string(), resolved, bridge)
         .context("building native FP8 Qwen3 AFD ffn-side model")
+}
+
+/// The vLLM code path a GLM-5.3-Flash arch tag's kernels follow.
+pub fn glm53_flash_kernel_path(sel: &IterArchSel) -> Result<Glm53FlashKernelPath> {
+    let (backend, mla_layout_copies) = match sel {
+        IterArchSel::Glm53FlashVllmFp8KdaDsaMoe {
+            kda_prefill_backend,
+            mla_layout_copies,
+            ..
+        }
+        | IterArchSel::Glm53FlashVllmFp8PpKdaDsaMoe {
+            kda_prefill_backend,
+            mla_layout_copies,
+            ..
+        }
+        | IterArchSel::Glm53FlashVllmFp8DpAttnEpMoe {
+            kda_prefill_backend,
+            mla_layout_copies,
+            ..
+        }
+        | IterArchSel::Glm53FlashVllmNvfp4KdaDsaMoe {
+            kda_prefill_backend,
+            mla_layout_copies,
+            ..
+        }
+        | IterArchSel::Glm53FlashVllmNvfp4PpKdaDsaMoe {
+            kda_prefill_backend,
+            mla_layout_copies,
+            ..
+        }
+        | IterArchSel::Glm53FlashVllmNvfp4DpAttnEpMoe {
+            kda_prefill_backend,
+            mla_layout_copies,
+            ..
+        } => (kda_prefill_backend, *mla_layout_copies),
+        other => unreachable!("{other:?} is not a GLM-5.3-Flash arch tag"),
+    };
+    let Some(&kda_prefill_backend) = GLM53_FLASH_KDA_PREFILL_BACKENDS
+        .iter()
+        .find(|&&known| known == backend.as_str())
+    else {
+        bail!("kda_prefill_backend {backend:?} is not one of {GLM53_FLASH_KDA_PREFILL_BACKENDS:?}");
+    };
+    Ok(Glm53FlashKernelPath {
+        kda_prefill_backend,
+        mla_layout_copies,
+    })
 }
 
 /// The checkpoint quantization a GLM-5.3-Flash arch tag is for.
@@ -2121,6 +2177,7 @@ pub fn build_iter_model(
             expert_popularity_file,
             token_corpus_file,
             cudagraph_capture_sizes,
+            ..
         }
         | IterArchSel::Glm53FlashVllmNvfp4KdaDsaMoe {
             model,
@@ -2132,6 +2189,7 @@ pub fn build_iter_model(
             expert_popularity_file,
             token_corpus_file,
             cudagraph_capture_sizes,
+            ..
         } => Box::new(glm53_flash_vllm_fp8_kda_dsa_moe(
             model,
             glm53_flash_quant(sel),
@@ -2143,6 +2201,7 @@ pub fn build_iter_model(
             expert_popularity_file.as_deref(),
             token_corpus_file.as_deref(),
             cudagraph_capture_sizes,
+            glm53_flash_kernel_path(sel)?,
             gpu,
             name,
             bridge,
@@ -2157,6 +2216,7 @@ pub fn build_iter_model(
             token_corpus_file,
             cudagraph_capture_sizes,
             layer_partition,
+            ..
         }
         | IterArchSel::Glm53FlashVllmNvfp4PpKdaDsaMoe {
             model,
@@ -2168,6 +2228,7 @@ pub fn build_iter_model(
             token_corpus_file,
             cudagraph_capture_sizes,
             layer_partition,
+            ..
         } => Box::new(glm53_flash_vllm_fp8_pp_kda_dsa_moe(
             model,
             glm53_flash_quant(sel),
@@ -2179,6 +2240,7 @@ pub fn build_iter_model(
             token_corpus_file.as_deref(),
             cudagraph_capture_sizes,
             layer_partition,
+            glm53_flash_kernel_path(sel)?,
             gpu,
             name,
             bridge,
@@ -2192,6 +2254,7 @@ pub fn build_iter_model(
             expert_popularity_file,
             token_corpus_file,
             cudagraph_capture_sizes,
+            ..
         }
         | IterArchSel::Glm53FlashVllmNvfp4DpAttnEpMoe {
             model,
@@ -2202,6 +2265,7 @@ pub fn build_iter_model(
             expert_popularity_file,
             token_corpus_file,
             cudagraph_capture_sizes,
+            ..
         } => Box::new(glm53_flash_vllm_fp8_dp_attn_ep_moe(
             model,
             glm53_flash_quant(sel),
@@ -2212,6 +2276,7 @@ pub fn build_iter_model(
             expert_popularity_file.as_deref(),
             token_corpus_file.as_deref(),
             cudagraph_capture_sizes,
+            glm53_flash_kernel_path(sel)?,
             gpu,
             name,
             bridge,

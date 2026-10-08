@@ -469,6 +469,28 @@ pub struct Glm53FlashVllmParallel {
     pub gpu_name: String,
     /// vLLM `--cudagraph-capture-sizes`; empty runs eager (no padding).
     pub cudagraph_capture_sizes: Vec<u32>,
+    pub kernel_path: Glm53FlashKernelPath,
+}
+
+/// Which vLLM code path the layers' kernels follow where the fork this arch was
+/// captured on (3f667d7) and current vLLM differ.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Glm53FlashKernelPath {
+    /// `kda_chunk_prefill` backend of the KDA prefill core.
+    pub kda_prefill_backend: &'static str,
+    /// Whether the DSA layers pay the fork's `q_concat` and output
+    /// `masked_fill_` copies.
+    pub mla_layout_copies: bool,
+}
+
+impl Default for Glm53FlashKernelPath {
+    /// The captured fork.
+    fn default() -> Self {
+        Self {
+            kda_prefill_backend: "vllm_triton",
+            mla_layout_copies: true,
+        }
+    }
 }
 
 /// Which attention and FFN a layer group carries, and how it opens.
@@ -677,6 +699,7 @@ pub fn build_configs(
             bf16_gemm_backends: BF16_GEMM_BACKENDS.to_vec(),
             conv_backends: CONV_BACKENDS.to_vec(),
             core_backends: KDA_BACKENDS.to_vec(),
+            chunk_prefill_backends: vec![parallel.kernel_path.kda_prefill_backend],
             elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
         },
         dsa: Glm53DsaAttnLocalWorkletConfig {
@@ -708,6 +731,7 @@ pub fn build_configs(
             mla_cache_append_backends: MLA_APPEND_BACKENDS.to_vec(),
             index_remap_backends: INDEX_REMAP_BACKENDS.to_vec(),
             elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
+            mla_layout_copies: parallel.kernel_path.mla_layout_copies,
         },
         dense_ffn: mlp(
             divide("intermediate_size", model.intermediate_size)?,
@@ -1648,6 +1672,7 @@ mod tests {
             max_model_len: 8192,
             gpu_name: "NVIDIA B200".into(),
             cudagraph_capture_sizes: Vec::new(),
+            kernel_path: Default::default(),
         }
     }
 

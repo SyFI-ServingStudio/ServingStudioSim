@@ -38,9 +38,10 @@ use crate::timing::kernels::engine::{register_kernel, KernelSpec};
 use crate::timing::sweep::{Axis, SweepGrid};
 use crate::timing::{Coords, Dim, KernelConfig, SweepCoords};
 
-/// Ceiling on prefill tokens `P = L*R`. Twice the 8,192-token query domain,
-/// so cells covering `P <= 8192` keep their upper corners profiled.
-const MAX_PREFILL_TOKENS: u64 = 16_384;
+/// Ceiling on prefill tokens `P = L*R`. Twice the 16,384-token step budget
+/// the pipeline-parallel runs schedule, so cells covering `P <= 16384` keep
+/// their upper corners profiled.
+const MAX_PREFILL_TOKENS: u64 = 32_768;
 
 #[derive(KernelConfig, Hash, PartialEq, Eq, Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct KdaChunkPrefillKernelConfig {
@@ -106,8 +107,8 @@ impl KernelSpec for KdaChunkPrefillSpec {
     fn sweep_grid(_config: &Self::Config) -> SweepGrid {
         SweepGrid::new(vec![
             // L = 2 anchors the sub-chunk regime (chunks = R + D); from one
-            // chunk (64) up, powers of two to the 8,192-token query domain.
-            Axis::chain([vec![2.0], Axis::pow2(6, 13)]),
+            // chunk (64) up, powers of two to a 16,384-token sequence.
+            Axis::chain([vec![2.0], Axis::pow2(6, 14)]),
             Axis::pow2(0, 9),
             Axis::values([0, 1, 2, 4, 8, 16, 32, 64]),
         ])
@@ -235,12 +236,12 @@ mod tests {
     }
 
     #[test]
-    fn mask_keeps_exactly_the_432_cells_within_the_prefill_ceiling() {
+    fn mask_keeps_exactly_the_512_cells_within_the_prefill_ceiling() {
         let cfg = config();
         let grid = KdaChunkPrefillSpec::sweep_grid(&cfg);
         assert_eq!(
             grid.axes()[0],
-            vec![2.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 2048.0, 4096.0, 8192.0]
+            vec![2.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 2048.0, 4096.0, 8192.0, 16384.0]
         );
         assert_eq!(grid.axes()[1].first(), Some(&1.0));
         assert_eq!(grid.axes()[1].last(), Some(&512.0));
@@ -250,19 +251,19 @@ mod tests {
         );
 
         let mask = KdaChunkPrefillSpec::infeasible_mask(&cfg, &grid);
-        assert_eq!(mask.len(), 720);
-        // 54 (L, R) pairs x 8 D.
-        assert_eq!(mask.iter().filter(|&&masked| !masked).count(), 432);
+        assert_eq!(mask.len(), 800);
+        // 64 (L, R) pairs x 8 D.
+        assert_eq!(mask.iter().filter(|&&masked| !masked).count(), 512);
 
         let payloads = KdaChunkPrefillSpec::enumerate(&cfg, &grid, "vllm_triton");
-        assert_eq!(payloads.len(), 720);
+        assert_eq!(payloads.len(), 800);
         for (payload, &masked) in payloads.iter().zip(&mask) {
             let fields = payload.fields();
             let prefill = fields["num_tokens"].as_u64().unwrap()
                 - fields["num_decode_sequences"].as_u64().unwrap();
             let length = fields["max_sequence_length"].as_u64().unwrap();
             assert_eq!(prefill % length, 0);
-            // Boundary: 64x256 and 8192x2 (P = 16384) stay profiled.
+            // Boundary: 64x512 and 16384x2 (P = 32768) stay profiled.
             assert_eq!(masked, prefill > MAX_PREFILL_TOKENS);
         }
     }

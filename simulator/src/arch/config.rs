@@ -118,6 +118,19 @@ const fn default_glm53_flash_enable_expert_parallel() -> bool {
     true
 }
 
+/// `kda_chunk_prefill` backends a GLM-5.3-Flash arch can run its KDA prefill
+/// on: the fork's Triton `chunk_kda_with_fused_gate`, or FlashKDA, which
+/// upstream vLLM picks by default on SM90 / SM10x (`kda_prefill_backend: auto`).
+pub(crate) const GLM53_FLASH_KDA_PREFILL_BACKENDS: [&str; 2] = ["vllm_triton", "flashkda"];
+
+fn default_glm53_flash_kda_prefill_backend() -> String {
+    "vllm_triton".to_string()
+}
+
+const fn default_glm53_flash_mla_layout_copies() -> bool {
+    true
+}
+
 /// A speculative GLM must actually run its MTP layer, so unlike the ordinary
 /// selector it cannot default to `off`.
 const fn default_glm52_speculative_mtp_mode() -> Glm52MtpMode {
@@ -669,6 +682,20 @@ pub enum IterArchSel {
         /// padding (eager).
         #[serde(default)]
         cudagraph_capture_sizes: Vec<u32>,
+        /// KDA chunked-prefill kernel (`kda_chunk_prefill` backend):
+        /// `vllm_triton`, the fork's `chunk_kda_with_fused_gate`, or
+        /// `flashkda`, upstream vLLM's default on SM90 / SM10x. Decode keeps
+        /// `fused_recurrent_kda`.
+        #[serde(default = "default_glm53_flash_kda_prefill_backend")]
+        #[param(string, default = "vllm_triton", choices = GLM53_FLASH_KDA_PREFILL_BACKENDS, cache_key)]
+        kda_prefill_backend: String,
+        /// The two sparse-MLA layout copies of vLLM fork 3f667d7: the
+        /// `q_concat` transpose copy of the absorbed query and the `masked_fill_`
+        /// over the attention output. vLLM 04730e8 and later write the query
+        /// token-major and fill only under DCP or HiSparse; false models that.
+        #[serde(default = "default_glm53_flash_mla_layout_copies")]
+        #[param(default = true, cache_key)]
+        mla_layout_copies: bool,
     },
     /// [`Self::Glm53FlashVllmFp8KdaDsaMoe`]'s kernels under pure pipeline
     /// parallelism. Each of `pp_size` stages is one GPU running a contiguous
@@ -713,6 +740,20 @@ pub enum IterArchSel {
         /// summing to 45. Empty: vLLM's default `get_pp_indices` split.
         #[serde(default)]
         layer_partition: Vec<u32>,
+        /// KDA chunked-prefill kernel (`kda_chunk_prefill` backend):
+        /// `vllm_triton`, the fork's `chunk_kda_with_fused_gate`, or
+        /// `flashkda`, upstream vLLM's default on SM90 / SM10x. Decode keeps
+        /// `fused_recurrent_kda`.
+        #[serde(default = "default_glm53_flash_kda_prefill_backend")]
+        #[param(string, default = "vllm_triton", choices = GLM53_FLASH_KDA_PREFILL_BACKENDS, cache_key)]
+        kda_prefill_backend: String,
+        /// The two sparse-MLA layout copies of vLLM fork 3f667d7: the
+        /// `q_concat` transpose copy of the absorbed query and the `masked_fill_`
+        /// over the attention output. vLLM 04730e8 and later write the query
+        /// token-major and fill only under DCP or HiSparse; false models that.
+        #[serde(default = "default_glm53_flash_mla_layout_copies")]
+        #[param(default = true, cache_key)]
+        mla_layout_copies: bool,
     },
     /// [`Self::Glm53FlashVllmFp8KdaDsaMoe`]'s kernels under data-parallel
     /// attention and expert-parallel MoE (vLLM `--data-parallel-size ep_size
@@ -754,6 +795,20 @@ pub enum IterArchSel {
         /// they run eager on their own rows. Empty: always eager.
         #[serde(default)]
         cudagraph_capture_sizes: Vec<u32>,
+        /// KDA chunked-prefill kernel (`kda_chunk_prefill` backend):
+        /// `vllm_triton`, the fork's `chunk_kda_with_fused_gate`, or
+        /// `flashkda`, upstream vLLM's default on SM90 / SM10x. Decode keeps
+        /// `fused_recurrent_kda`.
+        #[serde(default = "default_glm53_flash_kda_prefill_backend")]
+        #[param(string, default = "vllm_triton", choices = GLM53_FLASH_KDA_PREFILL_BACKENDS, cache_key)]
+        kda_prefill_backend: String,
+        /// The two sparse-MLA layout copies of vLLM fork 3f667d7: the
+        /// `q_concat` transpose copy of the absorbed query and the `masked_fill_`
+        /// over the attention output. vLLM 04730e8 and later write the query
+        /// token-major and fill only under DCP or HiSparse; false models that.
+        #[serde(default = "default_glm53_flash_mla_layout_copies")]
+        #[param(default = true, cache_key)]
+        mla_layout_copies: bool,
     },
     /// [`Self::Glm53FlashVllmFp8KdaDsaMoe`]'s graph for NVIDIA's ModelOpt NVFP4
     /// checkpoint (`nvidia/GLM-5.3-Flash-NVFP4`): NVFP4 routed experts and
@@ -798,6 +853,20 @@ pub enum IterArchSel {
         /// padding (eager).
         #[serde(default)]
         cudagraph_capture_sizes: Vec<u32>,
+        /// KDA chunked-prefill kernel (`kda_chunk_prefill` backend):
+        /// `vllm_triton`, the fork's `chunk_kda_with_fused_gate`, or
+        /// `flashkda`, upstream vLLM's default on SM90 / SM10x. Decode keeps
+        /// `fused_recurrent_kda`.
+        #[serde(default = "default_glm53_flash_kda_prefill_backend")]
+        #[param(string, default = "vllm_triton", choices = GLM53_FLASH_KDA_PREFILL_BACKENDS, cache_key)]
+        kda_prefill_backend: String,
+        /// The two sparse-MLA layout copies of vLLM fork 3f667d7: the
+        /// `q_concat` transpose copy of the absorbed query and the `masked_fill_`
+        /// over the attention output. vLLM 04730e8 and later write the query
+        /// token-major and fill only under DCP or HiSparse; false models that.
+        #[serde(default = "default_glm53_flash_mla_layout_copies")]
+        #[param(default = true, cache_key)]
+        mla_layout_copies: bool,
     },
     /// [`Self::Glm53FlashVllmFp8PpKdaDsaMoe`] for the NVFP4 checkpoint (see
     /// [`Self::Glm53FlashVllmNvfp4KdaDsaMoe`]). Runs only under deployment `pp`.
@@ -837,6 +906,20 @@ pub enum IterArchSel {
         /// summing to 45. Empty: vLLM's default `get_pp_indices` split.
         #[serde(default)]
         layer_partition: Vec<u32>,
+        /// KDA chunked-prefill kernel (`kda_chunk_prefill` backend):
+        /// `vllm_triton`, the fork's `chunk_kda_with_fused_gate`, or
+        /// `flashkda`, upstream vLLM's default on SM90 / SM10x. Decode keeps
+        /// `fused_recurrent_kda`.
+        #[serde(default = "default_glm53_flash_kda_prefill_backend")]
+        #[param(string, default = "vllm_triton", choices = GLM53_FLASH_KDA_PREFILL_BACKENDS, cache_key)]
+        kda_prefill_backend: String,
+        /// The two sparse-MLA layout copies of vLLM fork 3f667d7: the
+        /// `q_concat` transpose copy of the absorbed query and the `masked_fill_`
+        /// over the attention output. vLLM 04730e8 and later write the query
+        /// token-major and fill only under DCP or HiSparse; false models that.
+        #[serde(default = "default_glm53_flash_mla_layout_copies")]
+        #[param(default = true, cache_key)]
+        mla_layout_copies: bool,
     },
     /// [`Self::Glm53FlashVllmFp8DpAttnEpMoe`] for the NVFP4 checkpoint (see
     /// [`Self::Glm53FlashVllmNvfp4KdaDsaMoe`]): the routed experts sit behind
@@ -875,6 +958,20 @@ pub enum IterArchSel {
         /// they run eager on their own rows. Empty: always eager.
         #[serde(default)]
         cudagraph_capture_sizes: Vec<u32>,
+        /// KDA chunked-prefill kernel (`kda_chunk_prefill` backend):
+        /// `vllm_triton`, the fork's `chunk_kda_with_fused_gate`, or
+        /// `flashkda`, upstream vLLM's default on SM90 / SM10x. Decode keeps
+        /// `fused_recurrent_kda`.
+        #[serde(default = "default_glm53_flash_kda_prefill_backend")]
+        #[param(string, default = "vllm_triton", choices = GLM53_FLASH_KDA_PREFILL_BACKENDS, cache_key)]
+        kda_prefill_backend: String,
+        /// The two sparse-MLA layout copies of vLLM fork 3f667d7: the
+        /// `q_concat` transpose copy of the absorbed query and the `masked_fill_`
+        /// over the attention output. vLLM 04730e8 and later write the query
+        /// token-major and fill only under DCP or HiSparse; false models that.
+        #[serde(default = "default_glm53_flash_mla_layout_copies")]
+        #[param(default = true, cache_key)]
+        mla_layout_copies: bool,
     },
     /// SGLang's B200 NVFP4 launch graph under pure tensor parallelism. Every
     /// rank owns all experts (EP1) and shards the routed intermediate axis by

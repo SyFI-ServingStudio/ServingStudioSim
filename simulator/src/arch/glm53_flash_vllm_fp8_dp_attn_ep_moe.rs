@@ -96,6 +96,7 @@ pub struct Glm53FlashDpAttnEpParallel {
     pub gpu_name: String,
     /// vLLM `--cudagraph-capture-sizes`; empty runs eager (no padding).
     pub cudagraph_capture_sizes: Vec<u32>,
+    pub kernel_path: tp_arch::Glm53FlashKernelPath,
 }
 
 #[derive(Clone, Debug)]
@@ -143,6 +144,7 @@ pub fn build_configs(
             max_model_len: parallel.max_model_len,
             gpu_name: parallel.gpu_name.clone(),
             cudagraph_capture_sizes: parallel.cudagraph_capture_sizes.clone(),
+            kernel_path: parallel.kernel_path.clone(),
         },
         demand,
     )?;
@@ -1090,6 +1092,7 @@ mod tests {
             max_model_len: 131072,
             gpu_name: "NVIDIA B200".into(),
             cudagraph_capture_sizes: Vec::new(),
+            kernel_path: Default::default(),
         }
     }
 
