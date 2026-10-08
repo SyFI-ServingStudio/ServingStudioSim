@@ -1,0 +1,26 @@
+# Llama 3.1 8B on H200, prefill and decode on separate TP replicas.
+# Workers: the defaults presets/pd_aime_1p32d.yaml runs with (1 prefill, 32 decode, TP1).
+deployment: pd
+pools:
+  prefill:
+    groups:
+      - replicas: ${prefill_replicas}
+        arch:
+          preset: llama3_dense_tp
+          tp_size: ${prefill_tp}
+        worker:
+          type: pd_prefill
+  decode:
+    groups:
+      - replicas: ${decode_replicas}
+        arch:
+          preset: llama3_dense_tp
+          tp_size: ${decode_tp}
+        worker:
+          type: pd_decode
+sweep:
+  prefill_tp: [1, 2, 4, 8]
+  prefill_replicas: [1, 2, 4]
+  decode_tp: [1, 2, 4, 8]
+  decode_replicas: [1, 2, 4, 8, 16, 32]
+constraints: [prefill_tp * prefill_replicas <= 8, decode_tp * decode_replicas <= 32]

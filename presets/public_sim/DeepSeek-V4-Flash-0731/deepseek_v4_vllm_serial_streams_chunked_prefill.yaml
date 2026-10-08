@@ -1,0 +1,19 @@
+# vLLM DeepSeek-V4-Flash on H200, DP4 attention with EP4 experts, chunked
+# prefill at 8192 tokens, as the shape_grid_128 capture's server ran
+# (20260822_1_deepseek_v4_serial_vllm_alignment_c64_128: --enable-chunked-prefill
+# --max-num-batched-tokens 8192). attn_gpu_memory_gb is that server's
+# `Available KV cache memory: 80.79 GiB` per rank, in decimal GB.
+deployment: unified
+pools:
+  main:
+    groups:
+      - replicas: ${replicas}
+        arch:
+          preset: deepseek_v4_vllm_serial_streams
+        worker:
+          type: chunked_prefill
+          max_batch_tokens: 8192
+          batch_policy: mix
+          attn_gpu_memory_gb: 86.75
+sweep:
+  replicas: [1, 2]

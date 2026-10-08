@@ -59,7 +59,8 @@ DOC = KernelDoc(
     ),
     caveats=(
         "Only one sequence is measured, on scores that are deterministic and "
-        "free of ties. top_k is 2048, and vllm_cuda also accepts 512 or 1024.",
+        "free of ties. sglang_cuda takes only top_k = 2048; torch and vllm_cuda "
+        "take any top_k.",
         "GB/s counts valid scores, row bounds and output indices, not padding "
         "or torch intermediates; SGLang also counts its page-table output.",
     ),
@@ -73,7 +74,6 @@ register(
         backend="torch",
         supports=BackendSupport(
             compute=frozenset({DType.FP32}),
-            gpus=frozenset({"NVIDIA H200"}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.attention.dsa_topk_prefill",
@@ -93,7 +93,6 @@ register(
         backend="vllm_cuda",
         supports=BackendSupport(
             compute=frozenset({DType.FP32}),
-            gpus=frozenset({"NVIDIA H200", "NVIDIA B200"}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.attention.dsa_topk_prefill",
@@ -117,7 +116,6 @@ register(
         backend="sglang_cuda",
         supports=BackendSupport(
             compute=frozenset({DType.FP32}),
-            gpus=frozenset({"NVIDIA B200"}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.attention.dsa_topk_prefill",
@@ -155,7 +153,7 @@ register(
     KernelProfilerSpec(
         kernel_kind=KIND,
         backend="elementwise_floor",
-        supports=BackendSupport(compute=None, gpus=frozenset({"MI300X"})),
+        supports=BackendSupport(compute=None, arch_targets=frozenset({"CDNA3"})),
         runner_ref=RunnerRef(
             module_name="profiling.runners.elementwise.floor",
             function_name="profile_dsa_topk_prefill_floor",

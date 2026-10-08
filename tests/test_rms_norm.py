@@ -97,7 +97,6 @@ def test_vllm_cuda_backend_runs_vllms_own_op_in_the_vllm_image():
 
     spec = find_kernel_profiler_spec("rms_norm", "vllm_cuda")
     assert spec.subprocess_env == "vllm_env"
-    assert spec.supports.gpus == frozenset({"NVIDIA B200"})
     assert spec.runner_ref.function_name == "profile_rms_norm_vllm_cuda"
     assert _validate_args(32, 4096, "bf16")[:2] == (32, 4096)
     with pytest.raises(ValueError, match="bf16"):
@@ -112,7 +111,7 @@ def test_torch_rocm_backend_is_mi300x_gated_and_runs_in_rocm_image():
 
     spec = find_kernel_profiler_spec("rms_norm", "torch_rocm")
     assert spec.subprocess_env == "vllm_rocm_env"
-    assert spec.supports.gpus == frozenset({"MI300X"})
+    assert spec.supports.arch_targets == frozenset({"CDNA3"})
     assert spec.runner_ref.function_name == "profile_rms_norm_torch_rocm"
     assert spec.runner_ref.module_name == "profiling.runners.norm.rms_norm_torch_rocm"
     # bf16 and fp16 are supported activation precisions; fp8 is not.

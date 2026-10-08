@@ -44,6 +44,9 @@ Session-capable definition（当前 autoregressive directional families 与 omni
 `declared_prefix_tokens`。因此不存在“有 session start 但没有 session id/prefix
 declaration”的半状态。L5 admission 将它归一化为 concrete
 `conversation_start_time`；standalone request 使用自己的实际 release time。
+`SessionInput::PinnedPrefix { prefix_tokens }` 是带 trace-declared resident prefix
+的 standalone request（independent CSV 的可选 `prefix_len` 列）：没有 session id，
+其 prefix 在任何 partition 上都按 forced hit 解析。
 
 prompt/output token 数不在 core。它们属于 `TextGenerationDefinition`。directional
 family 使用 `ImageExtent`、`VideoExtent`、`AudioExtent` 具体类型，因此
@@ -130,7 +133,8 @@ SessionDependency::Chained
 共享 crate 的 `ArrivalMode` 决定 release time 从哪来；ServingStudio Sim 的
 `ArrivalSchedule` 只额外携带 rate-1-normalized trace 所需的 `request_rate` 算术。
 `CapacityLimit` 决定同时能有几个 unit 活着；`SessionDependency` 决定一行是否必须等待同 session predecessor completion +
-`tool_wait_after_ms`。三轴全组合合法 —— 尤其 `trace_timed + max_concurrency`：
+`tool_wait_after_ms`。`SessionDependency` 不是配置项，由 trace 决定（`SessionDependency::of`）：带 session
+（`session` tag 或 session-execution 格式）就 chained，否则 independent。三轴全组合合法 —— 尤其 `trace_timed + max_concurrency`：
 按录制时间线回放、同时限制并发，这是真实 workload，此前被熔在一起的
 `ReplayPacing` 表达不了。
 
@@ -203,7 +207,9 @@ post_prefill_context_tokens = fresh prompt + declared prefix
 `ResolvedPrefillContext` 只存于 `FullAttnKv`。Execution 从 `PrefixKv` 读取
 resident 与 `prefill_tokens_to_compute`；`TextGenerationProgress` 仍只保存真实 processed prefill
 work 与 emitted output tokens。cache disabled/evicted/placement miss 都会重算缺失 prefix，
-不会把 declaration 当成 guaranteed hit。admission 成功时会把实际 resident 数一次性复制到
+不会把 declaration 当成 guaranteed hit；唯一例外是 `SessionInput::PinnedPrefix`，
+它的 prefix 由 trace 声明为已驻留，因此 `resident = declared = prefix_tokens`，随 request
+reserve/release，不进入 retained cache。admission 成功时会把实际 resident 数一次性复制到
 `RequestTelemetry.prefix_cache_hit_tokens`，L7 再把 declaration 与这个 observation 一起写入
 `request_slo`。同一行还独立保留 immutable `fresh_prompt_tokens` 与 runtime
 `prefill_processed`：`NULL` hit 表示从未完成 prefix resolution，`0` 表示真实 miss；miss

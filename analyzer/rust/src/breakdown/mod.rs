@@ -40,7 +40,7 @@ use std::path::Path;
 use anyhow::{bail, Context, Result};
 use datafusion::prelude::SessionContext;
 
-use crate::io::{read_cost_manifests, report_path};
+use crate::io::{payload_path, read_cost_manifests, report_path, write_json};
 use crate::session::{
     col, collect, column_f64, register_cost_log, require_columns, value_f32_list, value_f64,
     value_groups, value_string, GroupInput, COST_LOG_TABLE,
@@ -169,6 +169,7 @@ pub async fn run(
     }
 
     let mut out = String::new();
+    let mut iterations = Vec::new();
     for row in &rows {
         let key = (row.pool_tag.clone(), row.worker_id);
         let doc = manifests
@@ -184,6 +185,7 @@ pub async fn run(
         out.push('\n');
         out.push_str(&render_tree(manifest, &row.slot_ns, color));
         out.push('\n');
+        iterations.push(tree_json(row, manifest));
     }
     if omitted > 0 {
         out.push_str(&format!(
@@ -198,6 +200,10 @@ pub async fn run(
     }
     fs::write(&out_path, out.as_bytes())
         .with_context(|| format!("write {}", out_path.display()))?;
+    write_json(
+        &payload_path(log_dir, "iter_breakdown.json"),
+        &serde_json::json!({"iterations": iterations, "omitted": omitted}),
+    )?;
     println!(
         "wrote {} ({} iteration(s){})",
         out_path.display(),
@@ -340,6 +346,9 @@ fn base_label(m: &Manifest, idx: usize) -> String {
         FlatCostNode::Max { overlap, .. } => lbl
             .map(str::to_string)
             .unwrap_or_else(|| format!("Max{{overlap={}}}", fmt_overlap(*overlap))),
+        FlatCostNode::Parallel { overlap, .. } => lbl
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("Parallel{{overlap={}}}", fmt_overlap(*overlap))),
         FlatCostNode::Scale { n, .. } => format!("{} ×{}", lbl.unwrap_or("scale"), n),
     }
 }
@@ -366,6 +375,13 @@ fn signature(m: &Manifest, idx: usize) -> String {
         FlatCostNode::Max { overlap, children } => {
             format!(
                 "M[{lbl}|{}]({})",
+                fmt_overlap(*overlap),
+                sig_children(m, children)
+            )
+        }
+        FlatCostNode::Parallel { overlap, children } => {
+            format!(
+                "P[{lbl}|{}]({})",
                 fmt_overlap(*overlap),
                 sig_children(m, children)
             )
@@ -418,7 +434,9 @@ fn rep_of(m: &Manifest, g: &Group, is_max: bool, slot_ns: &[i64]) -> usize {
 /// One rendered tree row, pre-alignment. `plain` is the prefix+label (ANSI-free,
 /// so its char count is its visible width); `time_ns` is the scale-applied
 /// "whole-iteration contribution". `is_leaf` tints the row (non-leaf blue, leaf
-/// white); `critical` adds bold + the `▸` gutter.
+/// white); `critical` adds bold + the `▸` gutter. `node`, `depth`, `label`,
+/// `own_ns` (the node's own [`node_time`], one instance) and `repeat` are the
+/// same row in fields, for the JSON twin.
 struct Line {
     plain: String,
     is_leaf: bool,
@@ -426,9 +444,15 @@ struct Line {
     pct: f64,
     trailing: String,
     critical: bool,
+    node: usize,
+    depth: usize,
+    label: String,
+    own_ns: i64,
+    repeat: Option<Repeat>,
 }
 
 /// `×N` annotation carried onto a collapsed representative's line.
+#[derive(Clone, Copy)]
 struct Repeat {
     n: usize,
     /// For a `Max` parent: the average member contribution in ns. The row's time
@@ -455,17 +479,20 @@ impl<'a> Renderer<'a> {
         idx: usize,
         scale: i64,
         indent: &Indent,
+        depth: usize,
         on_crit: bool,
         repeat: Option<Repeat>,
         out: &mut Vec<Line>,
     ) {
-        let disp = node_time(self.m, idx, self.slot_ns).saturating_mul(scale);
+        let own = node_time(self.m, idx, self.slot_ns);
+        let disp = own.saturating_mul(scale);
         let pct = if self.root_ns > 0 {
             disp as f64 / self.root_ns as f64 * 100.0
         } else {
             0.0
         };
-        let mut label = base_label(self.m, idx);
+        let base = base_label(self.m, idx);
+        let mut label = base.clone();
         let mut trailing = String::new();
         if let Some(rep) = repeat {
             label = format!("{label} ×{}", rep.n);
@@ -482,6 +509,11 @@ impl<'a> Renderer<'a> {
             pct,
             trailing,
             critical: on_crit,
+            node: idx,
+            depth,
+            label: base,
+            own_ns: own,
+            repeat,
         });
 
         match &self.m.nodes[idx] {
@@ -497,13 +529,19 @@ impl<'a> Renderer<'a> {
                     children.start,
                     scale.saturating_mul(*n as i64),
                     &ci,
+                    depth + 1,
                     on_crit,
                     None,
                     out,
                 );
             }
-            FlatCostNode::Sum { children } | FlatCostNode::Max { children, .. } => {
-                let is_max = matches!(&self.m.nodes[idx], FlatCostNode::Max { .. });
+            FlatCostNode::Sum { children }
+            | FlatCostNode::Max { children, .. }
+            | FlatCostNode::Parallel { children, .. } => {
+                let is_max = matches!(
+                    &self.m.nodes[idx],
+                    FlatCostNode::Max { .. } | FlatCostNode::Parallel { .. }
+                );
                 let groups = collapse(self.m, children.clone());
                 // Critical child = the group whose representative has the max
                 // node_time (siblings share scale, so node_time orders them).
@@ -540,7 +578,7 @@ impl<'a> Renderer<'a> {
                     } else {
                         None
                     };
-                    self.render(rep_idx, scale, &ci, child_crit, repeat, out);
+                    self.render(rep_idx, scale, &ci, depth + 1, child_crit, repeat, out);
                 }
             }
         }
@@ -557,9 +595,8 @@ impl<'a> Renderer<'a> {
     }
 }
 
-/// Render one iteration's tree (header excluded) to text, aligning the time
-/// column and (when `color`) wrapping critical-path rows yellow.
-fn render_tree(m: &Manifest, slot_ns: &[i64], color: bool) -> String {
+/// One iteration's tree rows (header excluded), root first, in display order.
+fn tree_lines(m: &Manifest, slot_ns: &[i64]) -> Vec<Line> {
     let root_ns = node_time(m, 0, slot_ns);
     let r = Renderer {
         m,
@@ -571,8 +608,64 @@ fn render_tree(m: &Manifest, slot_ns: &[i64], color: bool) -> String {
         own: String::new(),
         child: String::new(),
     };
-    r.render(0, 1, &root_indent, true, None, &mut lines);
-    format_lines(&lines, color)
+    r.render(0, 1, &root_indent, 0, true, None, &mut lines);
+    lines
+}
+
+/// Render one iteration's tree (header excluded) to text, aligning the time
+/// column and (when `color`) wrapping critical-path rows yellow.
+fn render_tree(m: &Manifest, slot_ns: &[i64], color: bool) -> String {
+    format_lines(&tree_lines(m, slot_ns), color)
+}
+
+/// One iteration's tree as `payloads/iter_breakdown.json` holds it: the rows the
+/// text renders, in its order, as fields. `ms` is one instance of the node,
+/// `total_ms` the same times every enclosing Scale's n, `pct` that of the root.
+fn tree_json(row: &BreakRow, m: &Manifest) -> serde_json::Value {
+    let ms = |ns: i64| ns as f64 / 1e6;
+    let nodes: Vec<_> = tree_lines(m, &row.slot_ns)
+        .iter()
+        .map(|l| {
+            let kind = match &m.nodes[l.node] {
+                FlatCostNode::Leaf(_) => "leaf",
+                FlatCostNode::Sum { .. } => "sum",
+                FlatCostNode::Max { .. } => "max",
+                FlatCostNode::Parallel { .. } => "parallel",
+                FlatCostNode::Scale { .. } => "scale",
+            };
+            let mut node = serde_json::json!({
+                "node": l.node,
+                "kind": kind,
+                "depth": l.depth,
+                "label": l.label,
+                "ms": ms(l.own_ns),
+                "total_ms": ms(l.time_ns),
+                "pct": l.pct,
+                "critical": l.critical,
+            });
+            let fields = node.as_object_mut().expect("an object");
+            if let FlatCostNode::Leaf(slot) = &m.nodes[l.node] {
+                fields.insert("slot".into(), (*slot).into());
+            }
+            if let Some(repeat) = l.repeat {
+                fields.insert("copies".into(), repeat.n.into());
+                if let Some(avg) = repeat.avg {
+                    fields.insert("avg_total_ms".into(), ms(avg).into());
+                }
+            }
+            node
+        })
+        .collect();
+    serde_json::json!({
+        "pool_tag": row.pool_tag,
+        "worker_id": row.worker_id,
+        "iter_id": row.iter_id,
+        "batch_id": row.batch_id,
+        "section": row.section,
+        "layer": row.layer,
+        "total_ms": row.total_time_ms,
+        "nodes": nodes,
+    })
 }
 
 const YELLOW: &str = "\x1b[33m";
@@ -741,7 +834,7 @@ mod tests {
             root_ns,
         };
         let mut lines = Vec::new();
-        r.render(0, 1, &root_indent(), true, None, &mut lines);
+        r.render(0, 1, &root_indent(), 0, true, None, &mut lines);
         // The Scale line and the Max child under it both show 12ns (the ×3
         // whole-iteration contribution), not the 4ns single-layer time.
         let scale_line = lines.iter().find(|l| l.plain.contains("layer ×3")).unwrap();
@@ -751,6 +844,36 @@ mod tests {
             attn_line.time_ns, 12,
             "Max child ×3 = 12, scale passed through"
         );
+    }
+
+    #[test]
+    fn json_twin_carries_one_instance_and_the_scaled_share() {
+        let row = BreakRow {
+            pool_tag: "predict".into(),
+            worker_id: 0,
+            iter_id: 0,
+            batch_id: 0,
+            section: "iter".into(),
+            layer: -1,
+            total_time_ms: 27e-6,
+            slot_ns: vec![10_000, 8_000, 4_000, 5_000],
+            groups: Vec::new(),
+        };
+        let tree = tree_json(&row, &mixed());
+        let nodes = tree["nodes"].as_array().unwrap();
+        // The text's rows, in its order: Sum, Leaf0, Scale, Max, Leaf1, Leaf2, Leaf3.
+        let order: Vec<_> = nodes.iter().map(|n| n["node"].as_u64().unwrap()).collect();
+        assert_eq!(order, [0, 1, 2, 4, 5, 6, 3]);
+        let leaf_b = &nodes[4];
+        assert_eq!(leaf_b["slot"], 1);
+        assert_eq!(leaf_b["kind"], "leaf");
+        assert_eq!(nodes[2]["kind"], "scale");
+        assert_eq!(leaf_b["depth"], 3);
+        assert_eq!(leaf_b["ms"], 0.008, "one call");
+        assert_eq!(leaf_b["total_ms"], 0.024, "×3 layers");
+        assert_eq!(leaf_b["critical"], true);
+        assert_eq!(nodes[5]["critical"], false, "the faster Max child");
+        assert!((nodes[2]["pct"].as_f64().unwrap() - 12.0 / 27.0 * 100.0).abs() < 1e-9);
     }
 
     #[test]
@@ -809,7 +932,7 @@ mod tests {
             root_ns,
         };
         let mut lines = Vec::new();
-        r.render(0, 1, &root_indent(), true, None, &mut lines);
+        r.render(0, 1, &root_indent(), 0, true, None, &mut lines);
         // root Max + collapsed ×2 representative Sum + that Sum's leaf = 3 lines
         // (only the two sibling Sums collapse; the rep still renders its child).
         assert_eq!(lines.len(), 3);
@@ -836,7 +959,7 @@ mod tests {
             root_ns,
         };
         let mut lines = Vec::new();
-        r.render(0, 1, &root_indent(), true, None, &mut lines);
+        r.render(0, 1, &root_indent(), 0, true, None, &mut lines);
         // root (Sum=27) critical; its max child is Scale (12) > Leaf0 (10) > Leaf3 (5).
         let total = lines.iter().find(|l| l.plain == "total").unwrap();
         assert!(total.critical);

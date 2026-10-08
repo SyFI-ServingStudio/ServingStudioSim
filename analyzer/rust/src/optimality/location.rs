@@ -4,6 +4,12 @@
 //! `model.work` semantic rows to versioned manifest location names. Attribution is
 //! all-or-nothing so an arch change cannot silently turn missing necessary work into
 //! zero. Communication leaves are exempt because necessary model work is local work.
+//!
+//! A pipeline-parallel arch's map covers the whole pipeline, while each stage
+//! worker's manifest holds only its own layers' locations. A stage therefore uses
+//! the one map of its arch that contains all of its locations, restricted to them;
+//! its labeler rows are only the rows it owns, and the same strict check proves the
+//! restricted rules consume exactly those.
 
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
@@ -16,10 +22,11 @@ use super::floors::{Floors, IterationLabel, SemanticWork, WorkerComposition};
 use super::ladder::{
     KernelContribution, KernelLadder, KernelNecessaryWork, KernelRungs, NecessaryWorkPolicy,
 };
+use super::pipeline::read_pipeline_stages;
 use super::prepare::KernelLocation;
 use super::spec::GpuSpec;
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct LocationMap {
     schema_version: u64,
     mapping_id: String,
@@ -27,7 +34,7 @@ struct LocationMap {
     locations: Vec<LocationRule>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct LocationRule {
     location: String,
     semantics: Vec<String>,
@@ -68,6 +75,8 @@ struct PoolModelSpec {
 pub(super) struct LocationCatalog {
     maps: Vec<LocationMap>,
     pool_specs: BTreeMap<String, PoolModelSpec>,
+    /// Pools whose workers are pipeline stages ([`super::pipeline`]).
+    pipelined_pools: BTreeSet<String>,
 }
 
 pub(super) struct LocationAttribution {
@@ -126,7 +135,15 @@ impl LocationCatalog {
         maps.sort_by(|left: &LocationMap, right: &LocationMap| {
             left.mapping_id.cmp(&right.mapping_id)
         });
-        Ok(Self { maps, pool_specs })
+        let pipelined_pools = read_pipeline_stages(log_dir)?
+            .into_keys()
+            .map(|(pool_tag, _)| pool_tag)
+            .collect();
+        Ok(Self {
+            maps,
+            pool_specs,
+            pipelined_pools,
+        })
     }
 
     /// Add R6/R7 and per-location work to one typed ladder. The semantic label
@@ -203,7 +220,12 @@ impl LocationCatalog {
             .pool_specs
             .get(pool_tag)
             .with_context(|| format!("semantic attribution missing pool {pool_tag:?}"))?;
-        let location_map = select_location_map(&self.maps, &pool_spec.arch_type, kernel_locations)?;
+        let location_map = &select_location_map(
+            &self.maps,
+            &pool_spec.arch_type,
+            kernel_locations,
+            self.pipelined_pools.contains(pool_tag),
+        )?;
         let bandwidth_gbps = gpu_spec.mem_bandwidth_gbps;
         if bandwidth_gbps <= 0.0 {
             bail!("GPU spec lacks positive memory bandwidth");
@@ -350,11 +372,15 @@ impl LocationCatalog {
     }
 }
 
-fn select_location_map<'map>(
-    maps: &'map [LocationMap],
+/// The one map of `arch_type` whose locations are exactly the worker's
+/// non-communication locations. A pipeline stage instead takes the one map whose
+/// locations include all of its own, restricted to those rows.
+fn select_location_map(
+    maps: &[LocationMap],
     arch_type: &str,
     kernel_locations: &[KernelLocation],
-) -> Result<&'map LocationMap> {
+    pipeline_stage: bool,
+) -> Result<LocationMap> {
     let expected_locations: BTreeSet<&str> = kernel_locations
         .iter()
         .filter(|location| !location.is_communication)
@@ -369,16 +395,26 @@ fn select_location_map<'map>(
                 .any(|candidate| candidate == arch_type)
         })
         .filter(|location_map| {
-            location_map
+            let mapped: BTreeSet<&str> = location_map
                 .locations
                 .iter()
                 .map(|rule| rule.location.as_str())
-                .collect::<BTreeSet<_>>()
-                == expected_locations
+                .collect();
+            if pipeline_stage {
+                mapped.is_superset(&expected_locations)
+            } else {
+                mapped == expected_locations
+            }
         })
         .collect();
     match matches.as_slice() {
-        [location_map] => Ok(*location_map),
+        [location_map] => {
+            let mut location_map = (*location_map).clone();
+            location_map
+                .locations
+                .retain(|rule| expected_locations.contains(rule.location.as_str()));
+            Ok(location_map)
+        }
         [] => Err(anyhow!(
             "no semantic location map matches arch type {arch_type:?} and its exact manifest locations"
         )),
@@ -561,6 +597,7 @@ mod tests {
                     fallback_dtype: "bf16".to_string(),
                 },
             )]),
+            pipelined_pools: BTreeSet::new(),
         };
         let rungs_gpu_ms = BaseRungs {
             real: 10_000.0,
@@ -625,7 +662,57 @@ mod tests {
             },
         ];
 
-        let selected = select_location_map(&maps, "llama3_dense", &[location("pd.gemm")]).unwrap();
+        let selected =
+            select_location_map(&maps, "llama3_dense", &[location("pd.gemm")], false).unwrap();
         assert_eq!(selected.mapping_id, "pd");
+    }
+
+    /// A PP map lists the whole pipeline; each stage manifest holds its own part.
+    #[test]
+    fn a_pipeline_stage_uses_its_part_of_the_whole_pipeline_map() {
+        let rule = |location: &str, semantics: &[&str]| LocationRule {
+            location: location.to_string(),
+            semantics: semantics.iter().map(|name| name.to_string()).collect(),
+        };
+        let maps = vec![LocationMap {
+            schema_version: 1,
+            mapping_id: "pp".to_string(),
+            arch_types: vec!["pp_arch".to_string()],
+            locations: vec![
+                rule("pp.embedding", &["embedding"]),
+                rule("pp.layer.gemm", &["layer.gemm"]),
+                rule("pp.lm_head", &["lm_head"]),
+            ],
+        }];
+        let first_stage = [location("pp.embedding"), location("pp.layer.gemm")];
+
+        let selected = select_location_map(&maps, "pp_arch", &first_stage, true).unwrap();
+        let locations: Vec<&str> = selected
+            .locations
+            .iter()
+            .map(|rule| rule.location.as_str())
+            .collect();
+        assert_eq!(locations, ["pp.embedding", "pp.layer.gemm"]);
+        // The restricted rules must consume exactly the stage's own rows.
+        assert!(validate_mapping(
+            &selected,
+            &first_stage,
+            &[segment("embedding"), segment("layer.gemm")]
+        )
+        .is_ok());
+        assert!(validate_mapping(
+            &selected,
+            &first_stage,
+            &[
+                segment("embedding"),
+                segment("layer.gemm"),
+                segment("lm_head")
+            ]
+        )
+        .is_err());
+        // A worker that is not a stage still needs the exact location set.
+        assert!(select_location_map(&maps, "pp_arch", &first_stage, false).is_err());
+        // A stage running a location the map lacks has no map.
+        assert!(select_location_map(&maps, "pp_arch", &[location("pp.other")], true).is_err());
     }
 }

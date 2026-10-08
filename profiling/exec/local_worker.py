@@ -28,6 +28,7 @@ from profiling.profilers.measure_context import (
     clear_measure_context,
     set_measure_context,
 )
+from profiling.runners.device import unsupported_device
 from profiling.runners.metrics import RunnerResult
 
 _PROCESS_STARTED = time.time()
@@ -67,7 +68,10 @@ def _worker_main(input_path: Path, output_path: Path) -> None:
     # every runner receives already-coerced kwargs (the `batched` adapter and the
     # native comm runners stay schema-free). List-native comm runners spawn their
     # rank group once for the whole list; compute runners are wrapped by `batched`.
-    runner = profiler_spec.load_list_runner()
+    # The backend's declared device requirement is checked here, once, against
+    # the real device; runners keep only their shape-dependent checks.
+    device_error = unsupported_device(profiler_spec.supports, f"{kernel_kind} {backend}")
+    runner = profiler_spec.load_list_runner() if device_error is None else None
     kwargs_list = [
         args_to_spec(coerce_args(profiler_spec.args_schema, _strip_backend(chunk_spec)))
         for chunk_spec in chunk_specs
@@ -76,8 +80,11 @@ def _worker_main(input_path: Path, output_path: Path) -> None:
         set_measure_context(measure_context)
     emit("worker.boot", boot_started, time.time(), kind=kernel_kind, specs=len(kwargs_list))
     try:
-        with span("worker.runner", kind=kernel_kind, specs=len(kwargs_list)):
-            results = runner(kwargs_list)
+        if runner is None:
+            results = [RunnerResult(error=device_error) for _ in kwargs_list]
+        else:
+            with span("worker.runner", kind=kernel_kind, specs=len(kwargs_list)):
+                results = runner(kwargs_list)
     finally:
         if measure_context is not None:
             clear_measure_context()

@@ -69,6 +69,15 @@ library used by the matching alignment run. Environment validation fails before
 acquiring a GPU when the link is absent; the execution layer prepends it to
 `LD_LIBRARY_PATH` before Torch's libraries.
 
+`vllm_upstream_fork_env` is a host env: the alignment checkout
+`alignment/profiler/vllm` (or `$VIBESIM_VLLM_FORK_ROOT`) and its own `.venv`. It
+serves the backends that need that checkout rebased onto upstream vLLM (its
+models and newer FlashInfer, DeepGEMM and FlashMLA builds), which the
+`vllm_env` image, built from fork commit 3f667d7, lacks. The worker drops
+inherited site-packages from `PYTHONPATH`, so the project Torch cannot shadow
+the venv's own build. Once the container is rebuilt from the rebased checkout,
+move those backends to `vllm_env` and remove this env.
+
 `Timer.cupti`'s duration path is a two-pass GPU-active-time measurement. It
 first records 10 real callable launches, computes
 `ceil(min_duration_ms / estimate_mean_ms)`, then records exactly that many
@@ -78,7 +87,10 @@ active-time estimate requests more launches. The default cap is 50,000 launches.
 By default, both passes run a
 read-only reduction over a 64 MiB (or
 `2 × reported L2`, whichever is larger) FP32 tensor before every logical
-callable launch. The reduction's CUPTI records validate ordering but are
+callable launch. Before 2026-09-25 the L2 size was read from a misspelled
+Torch attribute and always fell back to 64 MiB, so rows profiled earlier on a
+GPU with more than 32 MiB of L2 (H100, H200, B200) carry a warm-cache bias;
+refill such rows with `--force` before trusting small-kernel timings. The reduction's CUPTI records validate ordering but are
 excluded from the callable time. This clean-line displacement avoids the dirty
 writeback artifact of memset/`zero_()`; it remains a cold-ish preconditioner,
 not a hardware invalidate. `Timer.cupti(clear_l2=False)` is the explicit
@@ -142,8 +154,6 @@ db/                L1b core: cache, registry, schema, scheduling.
   outlier.py         `BatchOutlierPolicy` — the per-spec `batch_outlier_policy`
                      field carried by every `KernelProfilerSpec` (placeholder).
   migrate.py         Schema version/hash + `_db_metadata`.
-  kernel_config.py   Kernel-config registry: which simulator configs asked for
-                     which rows (see DB shape).
   metadata.py        Read-only DB metadata + per-op profiler git hashes.
 
 kernels/           One file per kernel kind. Each declares KIND + <Kind>Args and
@@ -155,7 +165,9 @@ kernels/           One file per kernel kind. Each declares KIND + <Kind>Args and
 runners/           L1a measurement. Subpackage per op family (gemm, attention,
   metrics.py         comm, norm, elementwise, idle). Return ComputeMetrics or
   exceptions.py      CommMetrics. Typed failures (OOMError, KernelLaunchFailed,
-                     ProfilerNotImplemented) are understood by L1b.
+  device.py          ProfilerNotImplemented) are understood by L1b. device.py
+                     holds the shared device checks, including the worker's
+                     BackendSupport gate.
 
 profilers/         Low-level timing/energy primitives used by runners
                    (Timer.cupti, Energy.perf, CUPTI kernel profiler + C++ ext).
@@ -175,8 +187,9 @@ artifacts.py       Immutable per-job snapshots: request/results/curve/job.meta.j
 gpu_catalog.py     Read-only gpu/spec.json resolution (exact case-insensitive
                    name/aliases → canonical SKU); used to fail a measured job
                    whose requested cache key vs observed physical GPU mismatch, and
-                   to stamp resolved canonical names into metadata. NOT on the
-                   timing path.
+                   to stamp resolved canonical names into metadata, and to
+                   resolve a GPU's compute capability for BackendSupport. Kernel
+                   times never come from it.
 
 exec/              How a runner actually runs. GpuPool/GpuChunk contracts,
   pool.py            LocalGpuPool (spawns a worker subprocess per chunk),
@@ -217,8 +230,13 @@ historical results and record the selected database with the experiment.
 4. `LocalGpuChunk.run` writes the chunk payload to a temp JSON, sets
    `CUDA_VISIBLE_DEVICES`, applies the selected `ProfileEnv`'s ordered Python
    and shared-library paths, and spawns `python -m profiling.exec.local_worker`
-   in that environment. The worker lazy-loads the registered runner via
-   `RunnerRef`, executes each spec, and writes JSON results back.
+   in that environment. The worker first checks the real device: every backend
+   needs CUDA, and a backend's declared `BackendSupport` device rule must hold
+   (`runners/device.py`). When either fails it refuses every spec of the chunk
+   without loading the runner; runners repeat neither check and keep only
+   shape-dependent ones.
+   Otherwise it lazy-loads the registered runner via `RunnerRef`, executes each
+   spec, and writes JSON results back.
 5. Require every successful worker result to report its observed physical GPU,
    validate all observations against the requested cache key, then persist the
    rows through `Table.insert`. Failed specs retain their worker error in one
@@ -284,33 +302,6 @@ A DB an older checkout wrote (schema v2) is refused by readers until
 `python -m launcher kernel-profile migrate-db <path>` upgrades it in place; the
 upgrade keeps every row and id and then VACUUMs the file.
 
-A row's args are one grid cell of one simulator kernel config, but the row does
-not say which. Tables starting with `_` (so they are not kind tables) record it,
-written by the builds that ask for the rows:
-
-- `_kernel_config`, keyed `(kind, config_hash, gpu_name)`: the Rust
-  `KernelConfig::identity` (no `gpu_name` or `backends`, `Dim` values only;
-  `config_hash` is the SHA-256 of its sorted-key JSON), the profile table, the
-  cache coordinate names, the grid axes, and each cell's args without `backend`,
-  stored by column as zlib-compressed JSON (list-valued args make cells the
-  bulk). The grid is stored because it cannot always be recomputed: a
-  corpus-routed MoE config names a payload file.
-- `_kernel_config_source`, keyed `source_hash`: what built configs — the preset,
-  timing-predict config or `#[supported]` row, pool, GPU and arch block.
-- `_kernel_config_use`: which `(pool, role)` of which source built which config,
-  naming the config, source and role by content key (`config_key`, `source_key`,
-  `role_key` into `_kernel_config_role`).
-- `_kernel_config_blob`: each identity array of at least 1 KiB (an MoE routing's
-  per-layer popularity), stored once; the identity holds `{"$blob": "<key>"}` in
-  its place. `registered_configs` returns identities with the arrays restored, so
-  `config_hash` is still the hash of the full identity.
-
-The launcher registers them after a cache prebuild that profiled and after a
-timing-predict run; `--register-kernel-configs` registers a preset's or predict
-config's configs with a dry-run (no GPU), for rows measured earlier, and
-`--register-supported-kernel-configs` those of every `#[supported]` deployment.
-Registration writes nothing when every config, source and use is known.
-
 ## Adding a kernel
 
 Normally one new file: `kernels/<kind>.py` declaring `KIND`, a frozen
@@ -362,11 +353,10 @@ telemetry.
 `merge-db` reads both inputs without modifying them. It copies rows and whole
 tables found on only one side and deduplicates rows whose declared
 `UNIQUE(gpu_name, backend, args_hash)` identity and payload agree. The
-kernel-config registry and lookup tables merge the same way on their own
-content-hash keys; every reference between tables is such a key, never an `id`,
-so nothing is remapped. Both inputs must be at this checkout's schema (run
-`migrate-db` on an older one first);
-a config registered on both sides with different grids is a conflict. If the same
+`_profile_run` lookup table merges the same way on its content-hash `run_key`;
+rows reference it by that key, never by `id`, so nothing is remapped. Both
+inputs must be at this checkout's schema (run `migrate-db` on an older one
+first). If the same
 identity has different measurement, provenance, or outlier state, no output DB
 is published: the command returns `1` and writes both versions to
 `<output>.merge-report.json` for explicit resolution. Surrogate `id` and

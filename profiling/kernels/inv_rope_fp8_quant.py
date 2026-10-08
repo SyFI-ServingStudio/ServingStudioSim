@@ -67,9 +67,10 @@ register(
         args_schema=InvRopeFp8QuantArgs,
         metric_family=MetricFamily.COMPUTE,
         batch_outlier_policy=BatchOutlierPolicy(),
+        # The Triton kernel stores tl.float8e4nv, which Triton lowers only on SM89+.
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
-            gpus=frozenset({"NVIDIA H200"}),
+            min_compute_capability=(8, 9),
         ),
         subprocess_env="vllm_env",
         doc=BackendDoc(

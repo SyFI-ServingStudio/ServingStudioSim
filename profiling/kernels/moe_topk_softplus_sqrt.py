@@ -55,8 +55,7 @@ DOC = KernelDoc(
         "before timing."
     ),
     caveats=(
-        "Only 256 experts and top_k = 6 on H200 are measured; hash mode uses a "
-        "129,280-entry table.",
+        "Hash mode uses a 129,280-entry table.",
         "The correction bias, the hash table and the token IDs are synthetic.",
         "GB/s counts logical inputs and outputs, not the whole hash table.",
     ),
@@ -77,9 +76,9 @@ register(
         args_schema=MoeTopkSoftplusSqrtArgs,
         metric_family=MetricFamily.COMPUTE,
         batch_outlier_policy=BatchOutlierPolicy(),
+        # No capability rule: a vLLM _moe_C CUDA op built for every arch the wheel targets.
         supports=BackendSupport(
             compute=frozenset({DType.FP32}),
-            gpus=frozenset({"NVIDIA H200"}),
         ),
         subprocess_env="vllm_env",
         doc=BackendDoc(

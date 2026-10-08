@@ -68,7 +68,7 @@ pub trait KernelConfig:
         serde_json::to_value(self).expect("KernelConfig must serialize to JSON")
     }
 
-    /// The config's identity in profile.db's kernel-config registry: every
+    /// The config's identity in its kernel-config record: every
     /// field except `gpu_name` and `backends`, which profile.db rows key in
     /// their own columns, with each `Dim` reduced to its value. Two configs
     /// that fold to the same shape share one identity however their dims were
@@ -168,6 +168,16 @@ pub trait KernelSpec: 'static {
     fn infeasible_mask(_config: &Self::Config, _grid: &SweepGrid) -> Vec<bool> {
         Vec::new()
     }
+
+    /// How `backend` answers an input past the profiled grid. Only called for
+    /// such inputs. Default: [`OffGrid::Cache`], the cache's own extrapolation.
+    fn off_grid(
+        _config: &Self::Config,
+        _input: &Self::Input,
+        _backend: &'static str,
+    ) -> OffGrid<Self::Input> {
+        OffGrid::Cache
+    }
     fn enumerate(
         config: &Self::Config,
         grid: &SweepGrid,
@@ -188,6 +198,22 @@ pub trait KernelSpec: 'static {
     fn validate_config(_config: &Self::Config) -> anyhow::Result<()> {
         Ok(())
     }
+}
+
+/// A backend's answer for an input past its profiled grid, picked per spec by
+/// how the kernel scales there.
+pub enum OffGrid<I> {
+    /// Extend the cache's interpolant.
+    Cache,
+    /// Hold the nearest grid point's achieved bandwidth, given the input's
+    /// logical bytes. The bytes must be counted the way the profiler counts
+    /// them for that backend, since the grid point's bandwidth comes from the
+    /// profiler's own counts. A spec picks it when its kernel's bandwidth
+    /// measured flat across its largest shapes.
+    Bandwidth(f64),
+    /// The input runs as these independent launches, one after another: the
+    /// answer is the sum of theirs.
+    Launches(Vec<I>),
 }
 
 /// Generic kernel struct. Per-kernel files export
@@ -232,7 +258,7 @@ impl<S: KernelSpec> Kernel<S> {
             LeafMetrics::NO_BACKEND,
         );
 
-        // Kernel-config registry: record the config and the grid it asks for,
+        // Kernel-config records: record the config and the grid it asks for,
         // whatever the mode. Recording enumerates the grid itself, so it does not
         // depend on which of the paths below runs.
         if bridge.records_configs() {
@@ -370,13 +396,48 @@ impl<S: KernelSpec> Kernel<S> {
     /// All-four-metrics best-of-N for the CostTree eval path: return the
     /// [`LeafMetrics`] from the backend with the smallest non-negative wallclock,
     /// preserving that backend's coverage bits.
+    ///
+    /// Each backend answers an input past its grid as its spec's
+    /// [`KernelSpec::off_grid`] says.
     pub fn eval(&self, input: &S::Input) -> LeafMetrics {
         let coords = S::cache_coords(&self.config, input);
-        let metrics = self.eval_cache_coords(&coords);
+        // main's off-grid-aware best-of selection, then #80's post-eval
+        // adjustment hook (the MI300X Infinity-Fabric all-reduce sync barrier;
+        // a no-op default for every other kernel).
+        let metrics =
+            self.best_of(|index, backend_cache| self.eval_backend(index, backend_cache, input, &coords));
         S::adjust_metrics(&self.config, input, metrics)
     }
 
+    fn eval_backend(
+        &self,
+        index: usize,
+        backend_cache: &BackendCache,
+        input: &S::Input,
+        coords: &Coords,
+    ) -> LeafMetrics {
+        if backend_cache.contains(coords) {
+            return backend_cache.eval(coords);
+        }
+        match S::off_grid(&self.config, input, self.config.backends()[index]) {
+            OffGrid::Cache => backend_cache.eval(coords),
+            OffGrid::Bandwidth(bytes) => backend_cache.eval_at_edge_bandwidth(coords, bytes),
+            OffGrid::Launches(launches) => {
+                let mut total = LeafMetrics::ZERO;
+                for launch in &launches {
+                    let launch_coords = S::cache_coords(&self.config, launch);
+                    total.add(self.eval_backend(index, backend_cache, launch, &launch_coords));
+                }
+                total
+            }
+        }
+    }
+
     fn eval_cache_coords(&self, coords: &Coords) -> LeafMetrics {
+        self.best_of(|_, backend_cache| backend_cache.eval(coords))
+    }
+
+    fn best_of(&self, eval: impl Fn(usize, &BackendCache) -> LeafMetrics) -> LeafMetrics {
         match self.backend_caches.as_slice() {
             [] => panic!("kernel config validation must create at least one backend cache"),
             [backend_cache] => {
@@ -384,16 +445,16 @@ impl<S: KernelSpec> Kernel<S> {
                 // position-local index (0) so the `cost_log` slot_backend column
                 // carries a real choice, not the [`LeafMetrics::NO_BACKEND`]
                 // sentinel a bare cache eval returns.
-                let mut only = backend_cache.eval(&coords);
+                let mut only = eval(0, backend_cache);
                 only.backend_index = 0;
                 only
             }
             [first_cache, rest @ ..] => {
-                let mut best = first_cache.eval(&coords);
+                let mut best = eval(0, first_cache);
                 let mut best_time_ms = best.m.time_ms.max(0.0);
                 let mut best_index = 0u8;
                 for (offset, backend_cache) in rest.iter().enumerate() {
-                    let candidate = backend_cache.eval(&coords);
+                    let candidate = eval(offset + 1, backend_cache);
                     let candidate_time_ms = candidate.m.time_ms.max(0.0);
                     if candidate_time_ms < best_time_ms {
                         best = candidate;
@@ -522,6 +583,9 @@ pub(crate) struct KernelQueryEntry {
         serde_json::Value,
     )
         -> anyhow::Result<(serde_json::Value, Vec<Vec<f64>>, &'static [&'static str])>,
+    /// `identity` path: deserialize a config (a manifest slot's
+    /// `kernel_config`) and give [`KernelConfig::identity`].
+    pub identity: fn(serde_json::Value) -> anyhow::Result<serde_json::Value>,
 }
 
 inventory::collect!(KernelQueryEntry);
@@ -547,6 +611,7 @@ impl KernelQueryEntry {
             rows: rows_from_json::<S>,
             build: build_probe_from_json::<S>,
             describe: describe_from_json::<S>,
+            identity: identity_from_json::<S>,
         }
     }
 }
@@ -762,6 +827,30 @@ where
         grid_axes,
         <S::Input as SweepCoords>::coord_field_names(),
     ))
+}
+
+/// [`KernelConfig::identity`] of a serialized `S::Config`.
+fn identity_from_json<S>(config: serde_json::Value) -> anyhow::Result<serde_json::Value>
+where
+    S: KernelSpec,
+    S::Config: serde::de::DeserializeOwned,
+{
+    let config: S::Config = serde_json::from_value(config)
+        .map_err(|e| anyhow::anyhow!("config does not match {} KernelConfig: {e}", S::KIND))?;
+    Ok(config.identity())
+}
+
+/// [`KernelConfig::identity`] of a config of kernel `kind`, given as JSON (a
+/// manifest slot's `kernel_config`).
+pub(crate) fn config_identity(
+    kind: &str,
+    config: serde_json::Value,
+) -> anyhow::Result<serde_json::Value> {
+    let entry = inventory::iter::<KernelQueryEntry>
+        .into_iter()
+        .find(|e| e.kind == kind)
+        .ok_or_else(|| anyhow::anyhow!("no kernel kind {kind:?}"))?;
+    (entry.identity)(config)
 }
 
 /// Declare a kernel's public `Kernel<S>` type alias AND register it for

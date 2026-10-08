@@ -3,13 +3,16 @@
 //! See `doc/architecture.md` (the `common/` cross-cutting module).
 
 pub mod fabric;
+pub mod gpu;
 pub mod id;
 pub mod request;
 pub mod request_family;
 pub mod request_stage;
 pub mod time;
+pub mod too_long;
 
 pub use fabric::Fabric;
+pub use too_long::TooLong;
 pub use id::{BatchId, ExpertId, GroupId, IdMap, PoolId, RequestId, WorkerId};
 pub use request::{
     ActiveRequest, Request, RequestCore, RequestLifecycle, RequestRecord, RequestStore,
@@ -28,5 +31,5 @@ pub use request_family::{
     VideoGenerationDefinition, VideoGenerationRequest, VideoTextGenerationDefinition,
     VideoTextGenerationRequest, VideoToTextDefinition, VideoToTextRequest,
 };
-pub use request_stage::{AfdStage, PdStage, StageEvent, StageVocab, UnifiedStage};
+pub use request_stage::{AfdStage, PdStage, PpStage, StageEvent, StageVocab, UnifiedStage};
 pub use time::Time;

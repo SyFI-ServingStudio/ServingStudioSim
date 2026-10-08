@@ -17,9 +17,17 @@ def test_reference_applies_the_asymmetric_gate_and_up_clamps() -> None:
     torch.testing.assert_close(result, expected, atol=0.1, rtol=0.01)
 
 
-@pytest.mark.parametrize(("hidden_dim", "dtype"), [(1024, "bf16"), (2048, "fp16")])
-def test_runner_rejects_shapes_outside_the_measured_deepseek_path(
-    hidden_dim: int, dtype: str
+@pytest.mark.parametrize(
+    ("hidden_dim", "dtype", "error"),
+    [(2048, "fp16", ProfilerNotImplemented), (0, "bf16", ValueError)],
+)
+def test_runner_rejects_unbuilt_dtype_and_empty_rows(
+    hidden_dim: int, dtype: str, error: type[Exception]
 ) -> None:
-    with pytest.raises(ProfilerNotImplemented):
+    with pytest.raises(error):
         _validate_args(128, hidden_dim, dtype)
+
+
+@pytest.mark.parametrize("hidden_dim", [1024, 2048, 3072, 1001])
+def test_runner_accepts_any_positive_hidden_dim(hidden_dim: int) -> None:
+    assert _validate_args(128, hidden_dim, "bf16") == (128, hidden_dim)

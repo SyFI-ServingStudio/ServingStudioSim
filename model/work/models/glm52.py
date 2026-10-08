@@ -30,7 +30,9 @@ DRAFT_FIRST_STAGE = "mtp_first"
 DRAFT_RECURRENT_STAGE = "mtp_recurrent"
 
 
-def _require_schedule(raw_config: dict) -> tuple[int, int, int, int]:
+def _require_schedule(raw_config: dict) -> tuple[tuple[int, ...], ...]:
+    """The decoder layers of each body stack, in stack order: dense full-index,
+    initial sparse index-share, cycle full-index, cycle index-share."""
     layers = raw_config["num_hidden_layers"]
     mlp_types = raw_config.get("mlp_layer_types")
     indexer_types = raw_config.get("indexer_types")
@@ -39,35 +41,37 @@ def _require_schedule(raw_config: dict) -> tuple[int, int, int, int]:
     if len(mlp_types) != layers or len(indexer_types) != layers:
         raise ValueError("GLM-5.2 layer schedules must each match num_hidden_layers")
 
-    dense_full = sum(
-        mlp == "dense" and indexer == "full" for mlp, indexer in zip(mlp_types, indexer_types)
+    schedule = list(enumerate(zip(mlp_types, indexer_types)))
+    dense_full = tuple(
+        layer for layer, (mlp, indexer) in schedule if mlp == "dense" and indexer == "full"
     )
     # The model's explicit first six entries identify the initial three sparse
     # shared-index layers; use positional counts so duplicate values are harmless.
-    sparse_initial_share = sum(
-        1
-        for layer, (mlp, indexer) in enumerate(zip(mlp_types, indexer_types))
+    sparse_initial_share = tuple(
+        layer
+        for layer, (mlp, indexer) in schedule
         if 3 <= layer < 6 and mlp == "sparse" and indexer == "shared"
     )
-    sparse_cycle_full = sum(
-        1
-        for layer, (mlp, indexer) in enumerate(zip(mlp_types, indexer_types))
+    sparse_cycle_full = tuple(
+        layer
+        for layer, (mlp, indexer) in schedule
         if layer >= 6 and mlp == "sparse" and indexer == "full"
     )
-    sparse_cycle_share = sum(
-        1
-        for layer, (mlp, indexer) in enumerate(zip(mlp_types, indexer_types))
+    sparse_cycle_share = tuple(
+        layer
+        for layer, (mlp, indexer) in schedule
         if layer >= 6 and mlp == "sparse" and indexer == "shared"
     )
     expected = (3, 3, 18, 54)
-    actual = (dense_full, sparse_initial_share, sparse_cycle_full, sparse_cycle_share)
+    stacks = (dense_full, sparse_initial_share, sparse_cycle_full, sparse_cycle_share)
+    actual = tuple(len(stack_layers) for stack_layers in stacks)
     if actual != expected:
         raise ValueError(f"unsupported GLM-5.2 layer schedule: expected {expected}, got {actual}")
     if any(mlp != "dense" for mlp in mlp_types[:3]) or any(
         mlp != "sparse" for mlp in mlp_types[3:]
     ):
         raise ValueError("GLM-5.2 expects dense layers 0..2 followed by sparse layers")
-    return actual
+    return stacks
 
 
 def _attention(raw_config: dict, *, full_index: bool) -> Glm52DsaAttention:
@@ -167,9 +171,12 @@ def _mtp_stacks(raw_config: dict, hidden: int) -> list[LayerStack]:
 
 
 def build(raw_config: dict) -> Model:
-    dense_full_count, sparse_initial_count, sparse_cycle_full_count, sparse_cycle_share_count = (
-        _require_schedule(raw_config)
-    )
+    (
+        dense_full_layers,
+        sparse_initial_layers,
+        sparse_cycle_full_layers,
+        sparse_cycle_share_layers,
+    ) = _require_schedule(raw_config)
     hidden = raw_config["hidden_size"]
     weight_bytes = dtype_bytes(raw_config.get("dtype") or raw_config.get("torch_dtype", "bfloat16"))
     dense_ffn = DenseSwiGLU(hidden=hidden, intermediate=raw_config["intermediate_size"])
@@ -186,25 +193,29 @@ def build(raw_config: dict) -> Model:
         LayerStack(
             attn=_attention(raw_config, full_index=True),
             ffn=dense_ffn,
-            count=dense_full_count,
+            count=len(dense_full_layers),
+            layers=dense_full_layers,
             tag="dense_full_index",
         ),
         LayerStack(
             attn=_attention(raw_config, full_index=False),
             ffn=sparse_ffn,
-            count=sparse_initial_count,
+            count=len(sparse_initial_layers),
+            layers=sparse_initial_layers,
             tag="sparse_initial_index_share",
         ),
         LayerStack(
             attn=_attention(raw_config, full_index=True),
             ffn=sparse_ffn,
-            count=sparse_cycle_full_count,
+            count=len(sparse_cycle_full_layers),
+            layers=sparse_cycle_full_layers,
             tag="sparse_cycle_full_index",
         ),
         LayerStack(
             attn=_attention(raw_config, full_index=False),
             ffn=sparse_ffn,
-            count=sparse_cycle_share_count,
+            count=len(sparse_cycle_share_layers),
+            layers=sparse_cycle_share_layers,
             tag="sparse_cycle_index_share",
         ),
         *_mtp_stacks(raw_config, hidden),
@@ -220,6 +231,7 @@ def build(raw_config: dict) -> Model:
                 stack.count,
                 stage=stack.stage,
                 param_count=stack.param_count,
+                stack=stack.tag,
             )
 
         norm_weights.extend(

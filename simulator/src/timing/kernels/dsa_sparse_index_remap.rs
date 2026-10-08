@@ -1,13 +1,19 @@
 //! Request-local to global sparse-index remapping.
 //!
-//! `selected_k` is the index-table width: 2048, or 2176 for a kpool table
-//! (`round_up(index_topk + index_kpool - 1, 128)`, at most 2051 valid).
+//! `selected_k` is the index-table width, e.g. 2048, or 2176 for a kpool table
+//! (`round_up(index_topk + index_kpool - 1, 128)`, at most 2051 valid). vLLM's
+//! `triton_convert_req_index_to_global_index` asserts
+//! `NUM_TOPK_TOKENS % BLOCK_N == 0` with `BLOCK_N = 128`
+//! (`v1/attention/backends/mla/sparse_utils.py`), so any positive multiple of
+//! 128 is a legal width; the block size and block-table width are free as long
+//! as the int32 slot ids fit.
 //!
 //! The native Triton launch scans a fixed `selected_k` row for every query.
 //! Its variable physical work is captured by query rows, mean valid slots, and
 //! the number of rows routed into the prefill workspace. Request boundaries and
 //! all per-row vectors remain typed in `Input` and in the cost log even though
-//! they are intentionally not independent cache dimensions.
+//! they are intentionally not independent cache dimensions; the log carries them
+//! run-encoded (`timing::run_encoded`), since they are one value per query row.
 
 use crate::timing::bridge::{de_backends, ArgsPayload, KernelKind};
 use crate::timing::cache::CacheKind;
@@ -15,13 +21,10 @@ use crate::timing::kernels::engine::{register_kernel, KernelSpec};
 use crate::timing::sweep::{Axis, Coords, SweepGrid};
 use crate::timing::{KernelConfig, SweepCoords};
 
-const SUPPORTED_SELECTED_K: [u32; 2] = [2048, 2176];
-const MAX_SELECTED_K: u32 = 2176;
-const REQUIRED_BLOCK_SIZE: u32 = 64;
-const MAX_BLOCKS_PER_REQUEST: u32 = 16384;
-/// The profiler's grid bound; evaluation past it extrapolates like any 3D cache.
-const MAX_QUERIES: u32 = 16384;
-const MAX_LOCAL_SPAN: u32 = REQUIRED_BLOCK_SIZE * MAX_BLOCKS_PER_REQUEST;
+/// The Triton wrapper's `BLOCK_N`: `selected_k` must be a multiple of it.
+const SELECTED_K_TILE: u32 = 128;
+/// Remapped slot ids are int32, so one request's block table must fit in it.
+const MAX_SLOT_ID: u64 = i32::MAX as u64;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct DsaSparseIndexRemapWorkspacePartition {
@@ -45,8 +48,11 @@ pub struct DsaSparseIndexRemapKernelConfig {
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct DsaSparseIndexRemapKernelInput {
+    #[serde(with = "crate::timing::run_encoded")]
     pub request_row_counts: Vec<u32>,
+    #[serde(with = "crate::timing::run_encoded")]
     pub local_span_lengths: Vec<u32>,
+    #[serde(with = "crate::timing::run_encoded")]
     pub valid_counts: Vec<u32>,
     pub workspace_partition: Option<DsaSparseIndexRemapWorkspacePartition>,
 }
@@ -63,12 +69,12 @@ impl DsaSparseIndexRemapKernelInput {
         assert!(self
             .local_span_lengths
             .iter()
-            .all(|&span| span <= MAX_LOCAL_SPAN));
+            .all(|&span| u64::from(span) <= MAX_SLOT_ID));
         assert!(self
             .valid_counts
             .iter()
             .zip(&self.local_span_lengths)
-            .all(|(&count, &span)| count <= MAX_SELECTED_K.min(span)));
+            .all(|(&count, &span)| count <= span));
 
         let workspace_rows = match &self.workspace_partition {
             None => 0,
@@ -114,11 +120,7 @@ fn canonical_input(
     valid_count: u32,
     workspace_rows: u32,
 ) -> Option<DsaSparseIndexRemapKernelInput> {
-    if num_queries == 0
-        || num_queries > MAX_QUERIES
-        || valid_count > selected_k
-        || workspace_rows > num_queries
-    {
+    if num_queries == 0 || valid_count > selected_k || workspace_rows > num_queries {
         return None;
     }
     let (request_row_counts, workspace_partition) = match workspace_rows {
@@ -212,9 +214,20 @@ impl KernelSpec for DsaSparseIndexRemapSpec {
     const KIND: KernelKind = "dsa_sparse_index_remap";
 
     fn sweep_grid(config: &Self::Config) -> SweepGrid {
-        assert!(SUPPORTED_SELECTED_K.contains(&config.selected_k));
-        assert_eq!(config.block_size, REQUIRED_BLOCK_SIZE);
-        assert!((1..=MAX_BLOCKS_PER_REQUEST).contains(&config.max_blocks_per_request));
+        assert!(
+            config.selected_k > 0 && config.selected_k % SELECTED_K_TILE == 0,
+            "selected_k must be a positive multiple of {SELECTED_K_TILE}, got {}",
+            config.selected_k
+        );
+        assert!(config.block_size > 0, "block_size must be positive");
+        assert!(
+            config.max_blocks_per_request > 0,
+            "max_blocks_per_request must be positive"
+        );
+        assert!(
+            u64::from(config.block_size) * u64::from(config.max_blocks_per_request) <= MAX_SLOT_ID,
+            "one request's block table must fit int32 slot ids"
+        );
         SweepGrid::new(vec![
             Axis::values([1, 8, 24, 64, 128, 512, 2048, 4096, 8192]),
             Axis::values([0, 1, 64, 512, 2048]),
@@ -317,8 +330,34 @@ mod tests {
     }
 
     #[test]
+    fn long_context_rows_serialize_as_runs_and_round_trip() {
+        // One decode row, then two causal prefill chunks deep into a 1M context.
+        let pairs = [(4096_u32, 323_318_u32), (4096, 1_000_000)];
+        let mut input = DsaSparseIndexRemapKernelInput {
+            request_row_counts: vec![1],
+            local_span_lengths: vec![70_001],
+            valid_counts: vec![2048],
+            workspace_partition: None,
+        };
+        for (rows, context) in pairs {
+            input.request_row_counts.push(rows);
+            for span in context - rows + 1..=context {
+                input.local_span_lengths.push(span);
+                input.valid_counts.push(span.min(2048));
+            }
+        }
+        let text = serde_json::to_string(&input).unwrap();
+        assert!(text.len() < 200, "{text}");
+        let back: DsaSparseIndexRemapKernelInput = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.request_row_counts, input.request_row_counts);
+        assert_eq!(back.local_span_lengths, input.local_span_lengths);
+        assert_eq!(back.valid_counts, input.valid_counts);
+        assert_eq!(back.coords()[..], input.coords()[..]);
+    }
+
+    #[test]
     fn coords_admit_any_request_count_and_rows_past_the_grid() {
-        let rows = MAX_QUERIES + 64;
+        let rows = 16_384 + 64;
         let input = DsaSparseIndexRemapKernelInput {
             request_row_counts: vec![1; rows as usize],
             local_span_lengths: vec![4096; rows as usize],
@@ -385,6 +424,34 @@ mod tests {
             "c:2047..2049@2048"
         );
         assert_eq!(encode_vector(&[2, 4, 2, 4], false, 2048), "g:(2,4)x2");
+    }
+
+    #[test]
+    fn any_128_multiple_width_and_block_size_build_a_grid() {
+        for (selected_k, block_size) in [(128, 16), (512, 64), (4096, 128)] {
+            let mut config = config();
+            config.selected_k = selected_k;
+            config.block_size = block_size;
+            config.max_blocks_per_request = 1024;
+            let grid = DsaSparseIndexRemapSpec::sweep_grid(&config);
+            let payloads = DsaSparseIndexRemapSpec::enumerate(&config, &grid, "vllm_triton");
+            assert!(payloads.iter().all(|payload| {
+                payload.fields().get("selected_k") == Some(&Value::from(selected_k))
+                    && payload.fields().get("block_size") == Some(&Value::from(block_size))
+            }));
+            // Valid counts above the table width are masked, not enumerated.
+            let mask = DsaSparseIndexRemapSpec::infeasible_mask(&config, &grid);
+            assert_eq!(mask.len(), payloads.len());
+            assert!(mask.iter().any(|&masked| !masked));
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "positive multiple of 128")]
+    fn width_off_the_128_tile_is_rejected() {
+        let mut config = config();
+        config.selected_k = 2000;
+        DsaSparseIndexRemapSpec::sweep_grid(&config);
     }
 
     #[test]

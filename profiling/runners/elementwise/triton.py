@@ -141,9 +141,6 @@ def profile_elementwise(
     except ImportError as exc:
         raise ProfilerNotImplemented("torch is required for the triton elementwise runner") from exc
 
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented("CUDA is required for the triton elementwise runner")
-
     try:
         output_tensor = torch.empty(output_size_bytes, dtype=torch.uint8, device="cuda")
         if input_size_bytes == 0:

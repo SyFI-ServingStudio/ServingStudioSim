@@ -8,7 +8,7 @@
 //! the accumulated end of its children).
 
 use crate::perfetto::{Annotation, TraceWriter};
-use crate::trace::manifest::{node_time, FlatCostNode, Manifest};
+use crate::trace::manifest::{critical_child, node_time, FlatCostNode, Manifest};
 
 /// Per-iteration placement context. `slot_ns[slot]` is this iter's leaf duration
 /// (pre-rounded to ns); `slot_input[slot]` is the captured kernel input JSON
@@ -148,8 +148,13 @@ impl<'a> Placer<'a> {
                 w.end(track, t);
                 t - t0
             }
-            FlatCostNode::Max { overlap, children } => {
-                let label = self.label_or(idx, "max");
+            FlatCostNode::Max { overlap, children }
+            | FlatCostNode::Parallel { overlap, children } => {
+                let fallback = match &self.manifest.nodes[idx] {
+                    FlatCostNode::Parallel { .. } => "parallel",
+                    _ => "max",
+                };
+                let label = self.label_or(idx, fallback);
                 w.begin(track, t0, &label, &[]);
                 let dd = if self.expanded {
                     // Legacy fan-out: each branch on its own child-track lane, all
@@ -171,10 +176,7 @@ impl<'a> Placer<'a> {
                     // compress its whole subtree into the effective window. The
                     // wrapper then ends at the child's own returned length, so
                     // wrapper == child exactly (no sub-ns overhang / mis-nesting).
-                    let crit = children
-                        .clone()
-                        .max_by_key(|&c| node_time(self.manifest, c, self.slot_ns))
-                        .expect("Max node has at least one child");
+                    let crit = critical_child(self.manifest, children.clone(), self.slot_ns);
                     let crit_nat = node_time(self.manifest, crit, self.slot_ns).max(1);
                     let eff_nat = ((crit_nat as f64) / (*overlap as f64)).round() as i64;
                     let child_scale = scale * (eff_nat as f64) / (crit_nat as f64);
@@ -201,7 +203,9 @@ pub fn slice_pairs_per_iter(manifest: &Manifest) -> usize {
     fn count(manifest: &Manifest, idx: usize) -> usize {
         match &manifest.nodes[idx] {
             FlatCostNode::Leaf(_) => 1,
-            FlatCostNode::Sum { children } | FlatCostNode::Max { children, .. } => {
+            FlatCostNode::Sum { children }
+            | FlatCostNode::Max { children, .. }
+            | FlatCostNode::Parallel { children, .. } => {
                 1 + children.clone().map(|c| count(manifest, c)).sum::<usize>()
             }
             FlatCostNode::Scale { n, children } => {
@@ -230,11 +234,8 @@ pub fn critical_pairs_per_iter(manifest: &Manifest, slot_ns: &[i64]) -> usize {
                     .map(|c| count(manifest, c, slot_ns))
                     .sum::<usize>()
             }
-            FlatCostNode::Max { children, .. } => {
-                let crit = children
-                    .clone()
-                    .max_by_key(|&c| node_time(manifest, c, slot_ns))
-                    .expect("Max node has at least one child");
+            FlatCostNode::Max { children, .. } | FlatCostNode::Parallel { children, .. } => {
+                let crit = critical_child(manifest, children.clone(), slot_ns);
                 1 + count(manifest, crit, slot_ns)
             }
             FlatCostNode::Scale { n, children } => {

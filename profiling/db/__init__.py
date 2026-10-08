@@ -37,7 +37,6 @@ from profiling.db.registry import (
     find_table,
     iter_kernel_profiler_specs,
     known_backends,
-    load_runner,
     resolve_spec_backend,
 )
 from profiling.db.table import MissingEntry, ProfileRow, Table, TableMetadata
@@ -70,7 +69,6 @@ __all__ = [
     "get_profiler_versions",
     "iter_kernel_profiler_specs",
     "known_backends",
-    "load_runner",
     "migrate",
     "resolve_spec_backend",
     "run_profile_batch",

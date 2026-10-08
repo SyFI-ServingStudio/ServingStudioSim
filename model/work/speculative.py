@@ -1,8 +1,14 @@
 """Independent draft/verify workload reconstruction from request geometry.
 
 No kernel shapes or achieved work enter these formulas. The target verifies
-k+1 causal rows; the proposer first processes those rows and then advances each
-request endpoint once per remaining draft position.
+k+1 causal rows under every proposer; what the proposer runs depends on its
+mechanism, chosen by the stages the model declares:
+
+- **MTP** first processes the target's rows and then advances each request
+  endpoint once per remaining draft position.
+- **DFlash2** runs once, with no recurrence: it projects the context K/V of the
+  target's rows, forwards one non-causal block of ``k + 1`` query rows per
+  request against its context, and scores the ``k`` drafted positions.
 """
 
 import json
@@ -11,7 +17,23 @@ from collections import defaultdict
 from dataclasses import replace
 
 from .core import AttnInteraction, Workload
+from .models import dflash2
 from .models.glm52 import DRAFT_FIRST_STAGE, DRAFT_RECURRENT_STAGE
+
+#: Proposer -> the stages its stacks run against.
+PROPOSER_STAGES = {
+    "mtp": frozenset({DRAFT_FIRST_STAGE, DRAFT_RECURRENT_STAGE}),
+    "dflash2": frozenset(dflash2.STAGES),
+}
+
+
+def proposer_for(declared_stages) -> str:
+    """The proposer a model's staged stacks belong to."""
+    declared = frozenset(declared_stages)
+    matches = [name for name, stages in PROPOSER_STAGES.items() if declared and declared <= stages]
+    if len(matches) != 1:
+        raise ValueError(f"no single speculative proposer declares stages {sorted(declared)}")
+    return matches[0]
 
 
 def _integer(value, name, minimum=0):
@@ -20,12 +42,16 @@ def _integer(value, name, minimum=0):
     return value
 
 
-def aggregate_workload(totals: dict) -> Workload:
+def aggregate_workload(totals: dict, proposer: str = "mtp") -> Workload:
+    if proposer not in PROPOSER_STAGES:
+        raise ValueError(f"unknown speculative proposer {proposer!r}")
     geometries = totals.get("speculative_geometry")
     if not geometries:
         raise ValueError("speculative floors require per-stage workload geometry")
     target = defaultdict(float)
     recurrent = defaultdict(float)
+    # DFlash2: one block per request, keyed by the context it drafts against.
+    endpoints = defaultdict(float)
     depth = None
     for encoded, count in geometries.items():
         if (
@@ -56,6 +82,7 @@ def aggregate_workload(totals: dict) -> Workload:
                 if final > maximum:
                     raise ValueError("request context exceeds max_model_len")
                 target[(phase, q, cached)] += count
+                endpoints[final] += count
                 for advance in range(1, k):
                     endpoint = min(final + advance, maximum)
                     recurrent[("decode", 1, endpoint - 1)] += count
@@ -100,7 +127,40 @@ def aggregate_workload(totals: dict) -> Workload:
             actual, expected, rel_tol=1e-10, abs_tol=1e-8
         ):
             raise ValueError(f"speculative geometry disagrees with {name}: {actual} != {expected}")
-    stages = {DRAFT_FIRST_STAGE: workload(target, endpoint_head=True)}
-    if depth > 1:
-        stages[DRAFT_RECURRENT_STAGE] = workload(recurrent, endpoint_head=True)
+    if proposer == "dflash2":
+        stages = _dflash2_stages(result, endpoints, depth)
+    else:
+        stages = {DRAFT_FIRST_STAGE: workload(target, endpoint_head=True)}
+        if depth > 1:
+            stages[DRAFT_RECURRENT_STAGE] = workload(recurrent, endpoint_head=True)
     return replace(result, stages=stages)
+
+
+def _dflash2_stages(target: Workload, endpoints: dict, depth: int) -> dict[str, Workload]:
+    """The three DFlash2 stages of one step (see :mod:`model.work.models.dflash2`).
+
+    Every scheduled request drafts, prefilling or verifying alike, against the
+    context it ends the step with. The context stage consumes every row the
+    target ran; the draft stage forwards ``k + 1`` rows per request; the
+    selector scores the ``k`` drafted ones.
+    """
+    width = depth + 1
+    requests = sum(endpoints.values())
+    blocks = [
+        AttnInteraction(width, context + width, context, "full", None, count)
+        for context, count in sorted(endpoints.items())
+    ]
+
+    def stage(tokens, heads=0, attn=()):
+        return Workload(
+            matmul_tokens=tokens,
+            head_positions=heads,
+            attn=list(attn),
+            attention_step_count=requests,
+        )
+
+    return {
+        dflash2.CONTEXT_STAGE: stage(target.matmul_tokens),
+        dflash2.DRAFT_STAGE: stage(requests * width, attn=blocks),
+        dflash2.SELECT_STAGE: stage(requests * depth, heads=requests * depth),
+    }

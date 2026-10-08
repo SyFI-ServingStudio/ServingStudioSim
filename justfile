@@ -1,9 +1,10 @@
 # ServingStudioSim test-tier runner. One recipe per capability tier (see tests/conftest.py
 # + skill `dev-run-tests`). Install just: `cargo install just` (or your package mgr).
 #
-#   just            # = test-cpu (the fast default gate)
-#   just test-gpu   # GPU tier (throughput regression etc.)
-#   just test-all   # cpu + gpu
+#   just              # = test-cpu (the fast default gate)
+#   just test-presets # every public preset built through the simulator
+#   just test-gpu     # GPU tier (throughput regression etc.)
+#   just test-all     # cpu + presets + gpu
 #   just test-bench # separate perf step; run after test-all for full validation
 
 # libpython dir — the Rust test binary embeds PyO3 and crashes on
@@ -32,14 +33,33 @@ sync:
 profile-container-build:
     profiling/container/build.sh
 
-# cpu tier — Rust unit tests + deterministic mocked pytest. No GPU/binary.
+# The Rust tests run beside pytest; their log prints after it, in full on failure.
 # `workers` is the xdist worker count. Not `auto`: that means one worker per core,
 # and each worker pays ~9 s importing torch + flashinfer, so a big host spends
 # more on startup than it saves. 16 is the measured knee here (17 s, against 19 s
 # at 8 and 24); override on a smaller machine with `just test-cpu 4`.
+# cpu tier — Rust unit tests + deterministic mocked pytest. No GPU.
 test-cpu workers="16": sync
-    LD_LIBRARY_PATH="{{libdir}}:${LD_LIBRARY_PATH:-}" uv run --no-sync cargo test -p simulator --lib
-    uv run --no-sync pytest -m "not gpu and not agent and not bench" -n {{workers}}
+    #!/usr/bin/env bash
+    set -uo pipefail
+    rust_log="$(mktemp "${TMPDIR:-/tmp}/test-cpu-rust.XXXXXX")"
+    LD_LIBRARY_PATH="{{libdir}}:${LD_LIBRARY_PATH:-}" uv run --no-sync cargo test -p simulator --lib >"$rust_log" 2>&1 &
+    rust_pid=$!
+    uv run --no-sync pytest -m "not gpu and not agent and not bench and not presets" -n {{workers}}
+    pytest_rc=$?
+    wait "$rust_pid"
+    rust_rc=$?
+    if [ "$rust_rc" -ne 0 ]; then cat "$rust_log"; else grep -E "^test result:" "$rust_log"; fi
+    rm -f "$rust_log"
+    [ "$pytest_rc" -eq 0 ] && [ "$rust_rc" -eq 0 ]
+
+# Builds every public predict and sim preset member through the release
+# simulator (cost trees, then a dry-run per capture) and checks profile.db covers
+# it. Run it after touching presets, the public API or the catalog.
+# `--dist loadfile` keeps each file on one worker, so its module fixture builds once.
+# presets tier — every public preset member built and measured.
+test-presets workers="4": sync
+    uv run --no-sync pytest -m presets -n {{workers}} --dist loadfile
 
 # gpu tier — needs a CUDA device. Auto-includes needs_binary/needs_db tests when
 # present; the perf_api bridge / launcher set their own subprocess env.
@@ -55,8 +75,8 @@ test-bench: sync
     uv run --no-sync pytest -m bench
     LD_LIBRARY_PATH="{{libdir}}:${LD_LIBRARY_PATH:-}" uv run --no-sync cargo test -p simulator --release -- --ignored --nocapture
 
-# Main correctness gate (cpu + gpu). Full validation also runs `just test-bench`.
-test-all: test-cpu test-gpu
+# Main correctness gate (cpu + presets + gpu). Full validation also runs `just test-bench`.
+test-all: test-cpu test-presets test-gpu
 
 # (Re)record per-GPU goldens for throughput + sim-speed on this device.
 update-golden: sync

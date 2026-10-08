@@ -107,21 +107,6 @@ def _build_argparse():
         "exit without building caches or running.",
     )
     parser.add_argument(
-        "--register-kernel-configs",
-        action="store_true",
-        help="Register the kernel configs each run asks profile.db for (and the "
-        "grid of rows each one reads) in profile.db's kernel-config registry, "
-        "then exit. Runs the simulator's dry-run only: no GPU, no profiling. "
-        "For rows measured before the registry existed.",
-    )
-    parser.add_argument(
-        "--register-supported-kernel-configs",
-        action="store_true",
-        help="Register the kernel configs of every `#[supported]` arch deployment "
-        "(`simulator supported-cost-trees`) the way --register-kernel-configs does "
-        "for presets, then exit. Takes no preset.",
-    )
-    parser.add_argument(
         "--refresh",
         action="store_true",
         help="Re-run every run, ignoring `.complete` markers (default: resume — "
@@ -328,33 +313,38 @@ def _emit_backends(args, schema: Registry) -> int:
     return 0
 
 
-def _expand_preset(
+class InvalidPreset(ValueError):
+    """A preset that does not expand; ``errors`` are its problems, one line each."""
+
+    def __init__(self, errors: list[str]):
+        super().__init__("; ".join(errors))
+        self.errors = errors
+
+
+def expand_preset(
     preset: dict,
     schema: Registry,
     source: str,
     *,
     axis: str | None = None,
     label: str | None = None,
-) -> list[dict] | None:
+) -> list[dict]:
     """Validate + expand ONE config preset into normalized, log_dir-templated
-    candidates. Returns the candidate list, or `None` if the preset is invalid
-    (errors already printed). When `axis`/`label` are given (a `variants` manifest
-    branch), tag each run's `_env` with `{axis: label}` so the file becomes a named
-    aggregation axis, and prefix its `log_dir` with the label so cross-file runs
-    never collide."""
+    candidates, with its `hf://` references fetched to local files; raises
+    :class:`InvalidPreset` with every problem. When `axis`/`label` are given (a
+    `variants` manifest branch), tag each run's `_env` with `{axis: label}` so
+    the file becomes a named aggregation axis, and prefix its `log_dir` with the
+    label so cross-file runs never collide."""
     # Fold `backends_file` + inline `backends` into one nested `backends` block
     # BEFORE validation (so `backends_file` is gone) and before expansion (so its
     # `${var}` values are swept). Un-flattens the file's `pool/role` keys.
     try:
         preset = _merge_backends_file(preset, source)
     except PresetError as exc:
-        print(f"[invalid] {source}: {exc}", file=sys.stderr)
-        return None
+        raise InvalidPreset([str(exc)]) from exc
     errors = validate_params(preset, schema)
     if errors:
-        for error in errors:
-            print(f"[invalid] {source}: {error}", file=sys.stderr)
-        return None
+        raise InvalidPreset(errors)
 
     candidates: list[dict] = []
     for candidate in expand_sweep_params(preset, schema):
@@ -362,21 +352,19 @@ def _expand_preset(
         # type/choice checks run for real BEFORE normalize coerces.
         post_errors = validate_expanded(candidate, schema)
         if post_errors:
-            for error in post_errors:
-                print(f"[invalid] {source}: {error}", file=sys.stderr)
-            return None
+            raise InvalidPreset(post_errors)
         if axis is not None:
             env = candidate.setdefault("_env", {})
             if axis in env:
                 # The manifest's file axis would overwrite an inner sweep/compound/
                 # derived binding of the same name, corrupting _env + log_dir.
-                print(
-                    f"[invalid] {source}: variants axis {axis!r} collides with a "
-                    "sweep/compound/derived name in this preset; rename the manifest "
-                    "axis so the file axis stays distinct",
-                    file=sys.stderr,
+                raise InvalidPreset(
+                    [
+                        f"variants axis {axis!r} collides with a sweep/compound/derived "
+                        "name in this preset; rename the manifest axis so the file axis "
+                        "stays distinct"
+                    ]
                 )
-                return None
             env[axis] = label
         cand = _format_log_dir(normalize_params(candidate, schema))
         # Recordings the preset names by repository and revision rather than
@@ -385,12 +373,28 @@ def _expand_preset(
         try:
             cand = resolve_hf_references(cand)
         except CorpusError as exc:
-            print(f"[invalid] {source}: {exc}", file=sys.stderr)
-            return None
+            raise InvalidPreset([str(exc)]) from exc
         if axis is not None:
             cand["io"]["log_dir"] = f"{label}/{cand['io']['log_dir']}"
         candidates.append(cand)
     return candidates
+
+
+def _expand_preset(
+    preset: dict,
+    schema: Registry,
+    source: str,
+    *,
+    axis: str | None = None,
+    label: str | None = None,
+) -> list[dict] | None:
+    """:func:`expand_preset`, or `None` with its errors printed."""
+    try:
+        return expand_preset(preset, schema, source, axis=axis, label=label)
+    except InvalidPreset as exc:
+        for error in exc.errors:
+            print(f"[invalid] {source}: {error}", file=sys.stderr)
+        return None
 
 
 def _expand_manifest(
@@ -600,9 +604,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     args = _build_argparse().parse_args(argv)
-    if args.register_supported_kernel_configs and args.presets:
-        sys.exit("--register-supported-kernel-configs takes no preset")
-    if not args.presets and not args.register_supported_kernel_configs:
+    if not args.presets:
         sys.exit(
             "no preset given; usage: python -m launcher PRESET.yaml|json [...] "
             "(or choose timing-predict, kernel-profile, alignment, or list-params)"
@@ -618,11 +620,6 @@ def main(argv: list[str] | None = None) -> int:
     if not cargo_build(args.build_type, build_analyzer=not args.no_analyze):
         sys.exit("launcher preparation failed (see stage-specific error above)")
 
-    if args.register_supported_kernel_configs:
-        from .kernel_configs import register_supported_configs
-
-        return register_supported_configs(args.build_type)
-
     try:
         schema = load_schema(args.build_type)
     except SchemaNotFound as exc:
@@ -632,8 +629,6 @@ def main(argv: list[str] | None = None) -> int:
         return _emit_backends(args, schema)
 
     all_candidates: list[dict] = []
-    # The preset (or variants manifest) each candidate came from, in order.
-    candidate_presets: list[str] = []
     last_preset: dict = {}
     analyze_subjects: list[str] | None = None
     preset_energy: list[bool | None] = []
@@ -672,7 +667,6 @@ def main(argv: list[str] | None = None) -> int:
         if cands is None:
             return 2
         all_candidates.extend(cands)
-        candidate_presets.extend(preset_path for _ in cands)
 
     if not _apply_energy_policy(args.energy, preset_energy, args.presets):
         return 2
@@ -722,21 +716,6 @@ def main(argv: list[str] | None = None) -> int:
         from .cache_build import report_cache_coverage
 
         return report_cache_coverage(all_candidates, schema, args.build_type)
-
-    if args.register_kernel_configs:
-        from .cache_build import unique_by_cache_key
-        from .kernel_configs import register_run_configs
-
-        # Runs that differ only in non-kernel params build the same configs.
-        candidates = [
-            (preset, config)
-            for preset in dict.fromkeys(candidate_presets)
-            for config in unique_by_cache_key(
-                [c for p, c in zip(candidate_presets, all_candidates, strict=True) if p == preset],
-                schema,
-            )
-        ]
-        return register_run_configs(candidates, args.build_type)
 
     if args.profile:
         from .exec import perf_available

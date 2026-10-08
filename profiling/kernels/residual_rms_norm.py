@@ -90,16 +90,10 @@ register(
     KernelProfilerSpec(
         kernel_kind=KIND,
         backend="vllm_cuda",
+        # No capability rule: vLLM's fused_add_rms_norm is a generic CUDA kernel built
+        # for every arch vLLM ships.
         supports=BackendSupport(
             compute=frozenset({DType.BF16, DType.FP16}),
-            gpus=frozenset({"NVIDIA H200", "NVIDIA B200"}),
-            compute_gpu_pairs=frozenset(
-                {
-                    (DType.BF16, "NVIDIA H200"),
-                    (DType.FP16, "NVIDIA H200"),
-                    (DType.BF16, "NVIDIA B200"),
-                }
-            ),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.norm.residual_rms_norm_vllm_cuda",

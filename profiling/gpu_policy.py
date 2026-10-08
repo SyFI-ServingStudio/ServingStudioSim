@@ -19,6 +19,10 @@ from collections.abc import MutableMapping
 
 NO_GPU_ENV = "SERVINGSTUDIO_NO_GPU"
 _OFF = frozenset({"", "0", "false", "no", "off"})
+# The phrase every `GpuDisabledError` message carries. A caller that sees only
+# the message text, such as an error relayed from a child process's log,
+# matches on this instead of restating the wording.
+GPU_DISABLED_MARKER = f"needs a GPU, but {NO_GPU_ENV} is set"
 
 
 class GpuDisabledError(RuntimeError):
@@ -34,7 +38,7 @@ def require_gpu(action: str) -> None:
     """Raise `GpuDisabledError` if GPUs are disabled; ``action`` names the step."""
     if gpu_disabled():
         raise GpuDisabledError(
-            f"{action} needs a GPU, but {NO_GPU_ENV} is set. Fill the missing "
+            f"{action} {GPU_DISABLED_MARKER}. Fill the missing "
             f"profile.db rows on a GPU host, or unset {NO_GPU_ENV} (drop --no-gpu)."
         )
 

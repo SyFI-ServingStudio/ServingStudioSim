@@ -30,8 +30,8 @@ from profiling.exec.env import (
     ContainerProfileEnv,
     ProfileEnv,
     compose_library_path,
-    compose_pythonpath,
     resolve_profile_env,
+    set_worker_python_env,
 )
 from profiling.exec.local import _container_worker_command, find_idle_gpus
 from profiling.gpu_policy import require_gpu
@@ -158,10 +158,7 @@ def _run_worker(
             env = os.environ.copy()
             env.update(worker_env or {})
             env["CUDA_VISIBLE_DEVICES"] = str(gpu_index)
-            env["PYTHONPATH"] = compose_pythonpath(
-                profiler_env,
-                env.get("PYTHONPATH"),
-            )
+            set_worker_python_env(profiler_env, env)
             if profiler_env.additional_library_paths:
                 env["LD_LIBRARY_PATH"] = compose_library_path(
                     profiler_env,

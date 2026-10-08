@@ -5,14 +5,17 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
 
+from profiling.kernels.kv_compress_store import FP8_DS_MLA_ROW_BYTES
 from profiling.profilers.energy import Energy
 from profiling.profilers.timer import Timer
+from profiling.runners.device import require_cutedsl
 from profiling.runners.exceptions import KernelLaunchFailed, OOMError, ProfilerNotImplemented
 from profiling.runners.metrics import ComputeMetrics
 
 _BACKEND = "kv_compress_store:vllm_cutedsl"
-_GPU_NAME = "NVIDIA H200"
-_MODEL_IDENTITY = (1, 512, 64, 256, 1.0e-6)
+# The fp8_ds_mla cache row below (448 fp8 NoPE + 64 bf16 RoPE + 8 UE8M0 scales)
+# fixes one 512-wide KV head with a 64-wide RoPE tail.
+_CACHE_IDENTITY = (1, 512, 64)
 _STORAGE_IDENTITY = (
     "fp32",
     "bf16",
@@ -20,7 +23,6 @@ _STORAGE_IDENTITY = (
     "block_segregated_data_then_scales",
     "ue8m0",
 )
-_CACHE_ROW_BYTES = 584
 _TOKEN_STRIDE = 576
 _SCALE_DIM = 8
 _QUANT_BLOCK = 64
@@ -38,11 +40,12 @@ class _Shape:
     kv_block_size: int
     head_dim: int = 512
     rope_head_dim: int = 64
-    cache_row_bytes: int = _CACHE_ROW_BYTES
+    cache_row_bytes: int = FP8_DS_MLA_ROW_BYTES
     token_stride: int = _TOKEN_STRIDE
     scale_dim: int = _SCALE_DIM
     quant_block: int = _QUANT_BLOCK
     page_alignment: int = 576
+    rms_eps: float = 1.0e-6
 
     @property
     def active_rows(self) -> tuple[int, ...]:
@@ -90,8 +93,6 @@ def _validate_args(
 ) -> _Shape:
     if not row_positions or len(row_positions) != len(row_request_ids):
         raise ValueError("row_positions and row_request_ids must be non-empty equal tuples")
-    if len(row_positions) > 8192:
-        raise ProfilerNotImplemented(f"{_BACKEND} supports at most 8192 token rows")
     if any(type(position) is not int or position < 0 for position in row_positions):
         raise ValueError("row_positions must contain non-negative integers")
     if any(type(request) is not int or request < 0 for request in row_request_ids):
@@ -99,8 +100,6 @@ def _validate_args(
     request_count = max(row_request_ids) + 1
     if set(row_request_ids) != set(range(request_count)):
         raise ValueError("row_request_ids must densely cover [0, num_requests)")
-    if request_count > 64:
-        raise ProfilerNotImplemented(f"{_BACKEND} supports at most 64 requests")
     if compress_ratio not in (4, 128):
         raise ProfilerNotImplemented(f"{_BACKEND} supports compress_ratio=4/128")
     if type(state_block_table_width) is not int or state_block_table_width <= 0:
@@ -109,11 +108,25 @@ def _validate_args(
     required_width = max(position // state_block_size + 1 for position in row_positions)
     if state_block_table_width < required_width:
         raise ValueError("state_block_table_width does not cover row_positions")
-    model_identity = (num_kv_heads, head_dim, rope_head_dim, logical_block_size, rms_eps)
-    if model_identity != _MODEL_IDENTITY:
+    cache_identity = (num_kv_heads, head_dim, rope_head_dim)
+    if cache_identity != _CACHE_IDENTITY:
         raise ProfilerNotImplemented(
-            f"{_BACKEND} supports model identity {_MODEL_IDENTITY}, got {model_identity}"
+            f"{_BACKEND} supports (num_kv_heads, head_dim, rope_head_dim) {_CACHE_IDENTITY}, "
+            f"got {cache_identity}"
         )
+    # The store reads tokens per page from kv_cache.shape[1], so any logical
+    # block that holds a whole number of compressed rows works.
+    if (
+        type(logical_block_size) is not int
+        or logical_block_size <= 0
+        or logical_block_size % compress_ratio
+    ):
+        raise ValueError(
+            f"logical_block_size must be a positive multiple of compress_ratio={compress_ratio}"
+        )
+    # rms_eps is a runtime scalar; it never changes the launch.
+    if type(rms_eps) not in {int, float} or not math.isfinite(rms_eps) or rms_eps <= 0:
+        raise ValueError(f"rms_eps must be a positive finite number, got {rms_eps!r}")
     storage_identity = (
         str(state_dtype),
         str(norm_dtype),
@@ -133,24 +146,13 @@ def _validate_args(
         state_width,
         state_block_size,
         logical_block_size // compress_ratio,
+        rms_eps=float(rms_eps),
     )
-
-
-def _require_h200_cutedsl(torch: Any, has_cutedsl: Any) -> Any:
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented(f"{_BACKEND} requires CUDA")
-    device = torch.device("cuda", torch.cuda.current_device())
-    name = str(torch.cuda.get_device_name(device))
-    if name != _GPU_NAME or tuple(torch.cuda.get_device_capability(device)) != (9, 0):
-        raise ProfilerNotImplemented(f"{_BACKEND} requires {_GPU_NAME} SM90, got {name}")
-    if not has_cutedsl():
-        raise ProfilerNotImplemented(f"{_BACKEND} requires the production Cutlass DSL path")
-    return device
 
 
 def _padded_stride(row_count: int) -> int:
     # The production fp8_ds_mla cache spec pads every page to a 576-byte boundary.
-    return math.ceil(row_count * _CACHE_ROW_BYTES / 576) * 576
+    return math.ceil(row_count * FP8_DS_MLA_ROW_BYTES / 576) * 576
 
 
 def _build_operands(torch: Any, shape: _Shape, device: Any) -> _Operands:
@@ -283,7 +285,7 @@ def _launch(save_op: Any, public_op: Any, operands: _Operands, shape: _Shape) ->
         overlap=shape.ratio == 4,
         use_fp4_cache=False,
         rms_norm_weight=operands.norm_weight,
-        rms_norm_eps=1.0e-6,
+        rms_norm_eps=shape.rms_eps,
         quant_block=shape.quant_block,
         token_stride=shape.token_stride,
         scale_dim=shape.scale_dim,
@@ -319,7 +321,7 @@ def _reference(torch: Any, operands: _Operands, shape: _Shape, row: int) -> Any:
     kv = torch.stack(kv_rows)
     scores = torch.stack(score_rows)
     compressed = (kv * torch.softmax(scores, dim=0)).sum(dim=0)
-    normalized = compressed * torch.rsqrt(compressed.square().mean() + 1.0e-6)
+    normalized = compressed * torch.rsqrt(compressed.square().mean() + shape.rms_eps)
     normalized = normalized * operands.norm_weight.float()
     nope_dim = shape.head_dim - shape.rope_head_dim
     rope_pairs = normalized[nope_dim:].reshape(-1, 2)
@@ -426,9 +428,9 @@ def profile_kv_compress_store_cutedsl(
         from vllm.models.deepseek_v4.nvidia.ops.sparse_attn_compress_cutedsl import (
             compress_norm_rope_store_cutedsl,
         )
-        from vllm.utils.import_utils import has_cutedsl
 
-        device = _require_h200_cutedsl(torch, has_cutedsl)
+        require_cutedsl(_BACKEND)
+        device = torch.device("cuda", torch.cuda.current_device())
         operands = _build_operands(torch, shape, device)
         _check_output(torch, save_partial_states, compress_norm_rope_store_cutedsl, operands, shape)
 

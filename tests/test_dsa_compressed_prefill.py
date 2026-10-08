@@ -9,6 +9,9 @@ from profiling.kernels.dsa_compressed_mqa_logits_prefill import (
 from profiling.runners.attention.dsa_compressed_mqa_logits_prefill_deepgemm import (
     _launch as launch_mqa,
 )
+from profiling.runners.attention.dsa_compressed_mqa_logits_prefill_deepgemm import (
+    _validate_args as validate_mqa,
+)
 from profiling.runners.attention.dsa_compressed_prefill_workload import (
     build_indexer_prefill_chunks,
 )
@@ -17,6 +20,9 @@ from profiling.runners.attention.dsa_compressed_topk_prefill_cuda import (
 )
 from profiling.runners.attention.dsa_compressed_topk_prefill_cuda import (
     _required_logits_row_stride,
+)
+from profiling.runners.attention.dsa_compressed_topk_prefill_cuda import (
+    _validate_args as validate_topk,
 )
 from profiling.runners.exceptions import ProfilerNotImplemented
 
@@ -102,7 +108,68 @@ def test_public_launches_preserve_production_argument_order():
 
     calls.clear()
     topk_operands = SimpleNamespace(
-        logits=Logits(), row_starts="starts", row_ends="ends", output="output"
+        logits=Logits(), row_starts="starts", row_ends="ends", output="output", top_k=512
     )
     launch_topk(lambda *args: calls.append(args), topk_operands)
     assert calls == [(topk_operands.logits, "starts", "ends", "output", 3, 512, 1, 512)]
+
+
+def test_workload_caps_are_only_the_real_split_bounds():
+    # More than 64 requests, a 2M context, a 64K batch and a non-default logits
+    # budget all split the same way vLLM's splitter does.
+    chunks = build_indexer_prefill_chunks(((1, 64),) * 100, 65536, 8192, MIB_512, 4)
+    assert sum(len(chunk.pairs) for chunk in chunks) == 100
+    chunks = build_indexer_prefill_chunks(((65536, 2_097_152),), 2_097_152, 65536, MIB_512, 4)
+    assert sum(chunk.num_queries for chunk in chunks) == 65536
+    chunks = build_indexer_prefill_chunks(((2, 8), (3, 13)), 65536, 8192, 256 * 1024 * 1024, 4)
+    assert chunks[0].row_ends == (1, 2, 4, 5, 5)
+    with pytest.raises(ValueError, match="at least one request"):
+        build_indexer_prefill_chunks((), 65536, 8192, MIB_512, 4)
+    with pytest.raises(ValueError, match="cover all queries"):
+        build_indexer_prefill_chunks(((9, 16),), 65536, 8, MIB_512, 4)
+    with pytest.raises(ValueError, match="max_logits_bytes"):
+        build_indexer_prefill_chunks(((2, 8),), 65536, 8192, 0, 4)
+    with pytest.raises(ProfilerNotImplemented, match="C4"):
+        build_indexer_prefill_chunks(((2, 8),), 65536, 8192, MIB_512, 128)
+
+
+def _mqa_args(num_heads, head_dim):
+    return (
+        ((2, 8), (3, 13)),
+        65536,
+        8192,
+        MIB_512,
+        4,
+        num_heads,
+        head_dim,
+        "fp8_e4m3",
+        "fp8_e4m3",
+        "fp32",
+        "fp32",
+        "fp32",
+        False,
+    )
+
+
+@pytest.mark.parametrize(
+    ("num_heads", "head_dim"), [(64, 128), (32, 128), (16, 128), (8, 64), (64, 32)]
+)
+def test_mqa_logits_accepts_every_deepgemm_head_shape(num_heads, head_dim):
+    assert validate_mqa(*_mqa_args(num_heads, head_dim))
+
+
+@pytest.mark.parametrize(("num_heads", "head_dim"), [(128, 128), (48, 128), (64, 256)])
+def test_mqa_logits_rejects_shapes_deepgemm_asserts_against(num_heads, head_dim):
+    with pytest.raises(ProfilerNotImplemented, match="num_heads in"):
+        validate_mqa(*_mqa_args(num_heads, head_dim))
+
+
+@pytest.mark.parametrize("top_k", [512, 1024, 2048, 64])
+def test_compressed_topk_accepts_any_positive_width(top_k):
+    pairs = ((2, 8), (3, 13))
+    assert validate_topk(pairs, 65536, 8192, MIB_512, 4, top_k, "fp32", "int32")
+
+
+def test_compressed_topk_rejects_a_non_positive_width():
+    with pytest.raises(ValueError, match="top_k"):
+        validate_topk(((2, 8),), 65536, 8192, MIB_512, 4, 0, "fp32", "int32")

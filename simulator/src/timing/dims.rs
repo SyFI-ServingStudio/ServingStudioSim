@@ -303,9 +303,15 @@ pub fn values_only<T>(f: impl FnOnce() -> T) -> T {
     f()
 }
 
+/// Whether this thread is inside [`values_only`]: a field with a machine-local
+/// form, such as a corpus's file path, serializes its identity form too.
+pub fn serializing_values_only() -> bool {
+    VALUES_ONLY.with(Cell::get)
+}
+
 impl Serialize for Dim {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        if VALUES_ONLY.with(Cell::get) {
+        if serializing_values_only() {
             return s.serialize_u32(self.get());
         }
         let mut state = s.serialize_struct("Dim", 3)?;

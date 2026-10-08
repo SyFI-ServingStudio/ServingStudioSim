@@ -1,0 +1,12 @@
+checkpoint: Qwen/Qwen3.6-35B-A3B-FP8
+gpu: NVIDIA H200
+arch:
+  type: qwen36_local
+  fp8: true
+  routing: ${routing}
+  expert_popularity_file: ${expert_popularity_file}
+compound:
+  workload:
+    ctx8k_out1k:
+      routing: popularity
+      expert_popularity_file: hf://datasets/UW-SyFI/servingstudio-workload@c3f5ecaab0bbff757c64864bf2ec24f5e1f76b5c/qwen36_35b_a3b_fp8/vllm/ctx8k_out1k/capture/20260818/popularity.json

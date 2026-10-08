@@ -49,11 +49,21 @@ _DISPATCHES_PER_LAUNCH: int | None = 2
 
 
 def _validate(**kwargs: Any) -> Any:
+    # selected_k is gated to the allowed page-table widths here, in the runner:
+    # the shared ``_validate_args`` no longer allowlists it (the B200 runner moved
+    # operand bounds to the sweep grid's infeasible_mask), but the MI300X Triton
+    # path composes the 2176 kpool page-table width / 2048 raw index_topk and
+    # accepts only those (see ``common.ALLOWED_SELECTED_K``). This mirrors the
+    # prefill runner's own inline selected_k check.
+    selected_k = kwargs.get("selected_k")
+    if selected_k not in common.ALLOWED_SELECTED_K:
+        raise ProfilerNotImplemented(
+            f"{_FULL} requires selected_k in "
+            f"{sorted(common.ALLOWED_SELECTED_K)}, got {selected_k}"
+        )
     return _validate_args(
-        expected_num_heads=None,
         expected_rope_dim=common.ROPE_HEAD_DIM,
         expected_cache_layout=common.CACHE_LAYOUT,
-        allowed_selected_k=common.ALLOWED_SELECTED_K,
         **kwargs,
     )
 

@@ -1,0 +1,16 @@
+# Qwen3-235B-A22B on H200: attention TP4 x DP, experts over EP8 or EP32, the
+# hp_unified worker. Worker: presets/unified_qwen3_235b_ep8.yaml and _ep32.yaml.
+deployment: unified
+pools:
+  main:
+    groups:
+      - replicas: ${replicas}
+        arch:
+          preset: qwen3_moe_dp_attn_ep_ffn
+          ep_size: ${ep_size}
+        worker:
+          type: hp_unified
+          attn_gpu_memory_gb: 80.0
+sweep:
+  ep_size: [8, 32]
+  replicas: [1, 2]

@@ -68,10 +68,7 @@ DOC = KernelDoc(
     caveats=(
         "Neither the increasing uniform logits nor the random max_ragged "
         "template follows a live indexer's score distribution.",
-        "max_ragged rows are measured only with next_n = 1 and top_k = 512, by "
-        "vllm_fork_cuda on H200; uniform rows with top_k = 2048, and with "
-        "top_k = 512 by vllm_cuda on B200.",
-        "On B200 the check before timing accepts a long row that differs from "
+        "Off SM90 the check before timing accepts a long row that differs from "
         "the reference only when the kernel's known threshold-bin buffer "
         "overflow explains the difference; such a row's timing is the "
         "production kernel's, but its selection is wrong.",
@@ -88,7 +85,6 @@ register(
         backend="torch",
         supports=BackendSupport(
             compute=frozenset({DType.FP32}),
-            gpus=frozenset({"NVIDIA H200"}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.attention.dsa_persistent_topk_decode",
@@ -111,7 +107,6 @@ register(
         backend="vllm_cuda",
         supports=BackendSupport(
             compute=frozenset({DType.FP32}),
-            gpus=frozenset({"NVIDIA H200", "NVIDIA B200"}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.attention.dsa_persistent_topk_decode",
@@ -124,8 +119,8 @@ register(
         subprocess_env="vllm_env",
         doc=BackendDoc(
             summary=(
-                "vLLM's persistent_topk: the vLLM build's op on B200, and a corrected "
-                "build of the vLLM v0.23 kernel on H200."
+                "vLLM's persistent_topk: a corrected build of the vLLM v0.23 kernel "
+                "on SM90, and the vLLM build's op on every other GPU."
             ),
         ),
     )
@@ -138,7 +133,6 @@ register(
         backend="vllm_fork_cuda",
         supports=BackendSupport(
             compute=frozenset({DType.FP32}),
-            gpus=frozenset({"NVIDIA H200"}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.attention.dsa_persistent_topk_decode_fork",
@@ -177,7 +171,7 @@ register(
     KernelProfilerSpec(
         kernel_kind=KIND,
         backend="elementwise_floor",
-        supports=BackendSupport(compute=None, gpus=frozenset({"MI300X"})),
+        supports=BackendSupport(compute=None, arch_targets=frozenset({"CDNA3"})),
         runner_ref=RunnerRef(
             module_name="profiling.runners.elementwise.floor",
             function_name="profile_dsa_persistent_topk_decode_floor",

@@ -15,7 +15,7 @@ from typing import Any
 from profiling.db.args import DType
 from profiling.profilers.energy import Energy
 from profiling.profilers.timer import Timer
-from profiling.runners.attention._gdn_common import load_required_callable, require_exact_gpu
+from profiling.runners.attention._gdn_common import load_required_callable
 from profiling.runners.attention.gdn_prefill_post_conv_torch import (
     _logical_bytes,
     _semantic_flops,
@@ -31,8 +31,6 @@ _BACKEND = "gdn_prefill_post_conv:vllm_triton"
 _CALLABLE_MODULE = "vllm.model_executor.layers.fla.ops.fused_gdn_prefill_post_conv"
 _CALLABLE_NAME = "fused_post_conv_prep"
 _KERNEL_NAME = "_fused_post_conv_kernel"
-_REQUIRED_GPU = "NVIDIA H200"
-_SUPPORTED_HEAD_DIM_PAIRS = frozenset({(64, 64), (128, 128)})
 _MAX_GUARD_PACKED_ELEMENTS = 1_048_576
 _QK_ATOL = 1e-3
 _QK_RTOL = 1e-2
@@ -105,13 +103,6 @@ def _validate_args(
         raise ValueError(
             f"vllm_triton gdn_prefill_post_conv requires dtype=bf16, got {validated.dtype.value}"
         )
-    head_dims = (validated.key_head_dim, validated.value_head_dim)
-    if head_dims not in _SUPPORTED_HEAD_DIM_PAIRS:
-        supported = sorted(_SUPPORTED_HEAD_DIM_PAIRS)
-        raise ValueError(
-            "vllm_triton gdn_prefill_post_conv requires an established "
-            f"(key_head_dim, value_head_dim) pair in {supported}, got {head_dims}"
-        )
     return validated
 
 
@@ -139,10 +130,6 @@ def _guard_args(args: _ValidatedArgs) -> _ValidatedArgs:
     packed_width = _operand_shapes(args).conv_output[1]
     max_tokens = max(1, _MAX_GUARD_PACKED_ELEMENTS // packed_width)
     return replace(args, num_tokens=min(args.num_tokens, max_tokens))
-
-
-def _require_h200(torch: Any) -> None:
-    require_exact_gpu(torch, backend=_BACKEND, required_gpu=_REQUIRED_GPU)
 
 
 def _load_fused_callable() -> Any:
@@ -334,7 +321,7 @@ def profile_gdn_prefill_post_conv_vllm_triton(
     value_head_dim: int,
     dtype: DType | str,
 ) -> ComputeMetrics:
-    """Profile vLLM's fused prefill post-conv launch on an NVIDIA H200."""
+    """Profile vLLM's fused prefill post-conv launch."""
     args = _validate_args(
         num_tokens=num_tokens,
         num_qk_heads=num_qk_heads,
@@ -349,7 +336,6 @@ def profile_gdn_prefill_post_conv_vllm_triton(
         raise ProfilerNotImplemented(f"PyTorch is required for {_BACKEND}") from exc
 
     try:
-        _require_h200(torch)
         fused_callable = _load_fused_callable()
         device = torch.device("cuda", torch.cuda.current_device())
         operands = _build_operands(torch, args, device=device)

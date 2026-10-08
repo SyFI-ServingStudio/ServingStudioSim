@@ -6,7 +6,6 @@ import subprocess
 import sys
 from dataclasses import fields
 from re import escape
-from types import SimpleNamespace
 from typing import Any, get_type_hints
 
 import pytest
@@ -125,15 +124,17 @@ def test_registration_support_family_environment_runner_ref_and_facades() -> Non
     assert spec.batch_outlier_policy == BatchOutlierPolicy()
     assert spec.supports.compute is None
     assert spec.supports.kv is None
-    assert spec.supports.gpus == frozenset({"NVIDIA H200"})
+    assert spec.supports.min_compute_capability is None
+    assert spec.supports.sm_targets is None
     assert spec.supports.allows(DType.FP16, gpu="NVIDIA H200")
     assert spec.supports.allows(DType.FP32, DType.FP8_E4M3, gpu="NVIDIA H200")
-    assert not spec.supports.allows(DType.FP32, gpu="NVIDIA H100")
+    assert spec.supports.allows(DType.FP32, gpu="NVIDIA H100")
     assert spec.subprocess_env is None
     assert spec.runner_ref.module_name == ("profiling.runners.attention.dsa_sparse_index_remap")
     assert spec.runner_ref.function_name == "profile_dsa_sparse_index_remap_torch"
     assert vllm_spec.supports.compute is None
-    assert vllm_spec.supports.gpus == frozenset({"NVIDIA B200"})
+    assert vllm_spec.supports.min_compute_capability is None
+    assert vllm_spec.supports.sm_targets is None
     assert vllm_spec.subprocess_env == "vllm_env"
     assert vllm_spec.runner_ref.function_name == ("profile_dsa_sparse_index_remap_vllm_triton")
     assert hasattr(perf_api, "get_dsa_sparse_index_remap_times")
@@ -489,14 +490,14 @@ def test_spec5_rounded_8k_prefill_is_supported() -> None:
 @pytest.mark.parametrize(
     ("overrides", "match"),
     [
-        ({"num_queries": 0}, "1..16384"),
-        ({"num_queries": 16385}, "1..16384"),
-        ({"num_requests": 0}, "1..min"),
-        ({"num_requests": 5}, "1..min"),
-        ({"num_requests": 257}, "1..min"),
-        ({"selected_k": 1024}, "selected_k must be 2048"),
-        ({"block_size": 128}, "block_size must be 64"),
-        ({"max_blocks_per_request": 16385}, "max_blocks_per_request must be in 1..16384"),
+        ({"num_queries": 0}, "num_queries must be >= 1"),
+        ({"num_requests": 0}, "1..num_queries"),
+        ({"num_requests": 5}, "1..num_queries"),
+        ({"selected_k": 0}, "positive multiple of 128"),
+        ({"selected_k": 2000}, "positive multiple of 128"),
+        ({"block_size": 0}, "block_size must be >= 1"),
+        ({"max_blocks_per_request": 0}, "max_blocks_per_request must be >= 1"),
+        ({"max_blocks_per_request": 2**30}, "fit int32 slot ids"),
         ({"index_dtype": "int64"}, "index_dtype must be int32"),
         ({"index_distribution": "random"}, "index_distribution"),
         ({"page_table_mapping": "random"}, "page_table_mapping"),
@@ -573,27 +574,27 @@ def test_malformed_types_fail_before_allocation(
         runner.profile_dsa_sparse_index_remap_torch(**(_BASE_SPEC | {name: value}))
 
 
-def test_cuda_and_gpu_support_failures_are_typed() -> None:
-    from profiling.runners.attention.dsa_sparse_index_remap import (
-        _require_b200,
-        _require_h200,
-    )
+def test_unmeasured_queries_requests_block_sizes_and_widths_are_accepted() -> None:
+    from profiling.runners.attention import dsa_sparse_index_remap as runner
 
-    no_cuda = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False))
-    with pytest.raises(ProfilerNotImplemented, match="CUDA is required"):
-        _require_h200(no_cuda)
-
-    h100 = SimpleNamespace(
-        cuda=SimpleNamespace(
-            is_available=lambda: True,
-            current_device=lambda: 0,
-            get_device_name=lambda _device: "NVIDIA H100",
+    many = runner._validate_args(
+        **(
+            _BASE_SPEC
+            | {
+                "num_queries": 19950,
+                "num_requests": 300,
+                "request_row_counts": "g:(66,67)x150",
+                "local_span_lengths": "u:64x19950",
+                "valid_counts": "u:64x19950",
+            }
         )
     )
-    with pytest.raises(ProfilerNotImplemented, match="requires NVIDIA H200"):
-        _require_h200(h100)
-    with pytest.raises(ProfilerNotImplemented, match="requires NVIDIA B200"):
-        _require_b200(h100)
+    assert (many.num_queries, many.num_requests) == (19950, 300)
+    assert runner._validate_args(**(_BASE_SPEC | {"block_size": 128})).block_size == 128
+    assert runner._validate_args(**(_BASE_SPEC | {"selected_k": 1024})).selected_k == 1024
+    assert runner._validate_args(**(_BASE_SPEC | {"selected_k": 2176})).selected_k == 2176
+    wide = runner._validate_args(**(_BASE_SPEC | {"max_blocks_per_request": 32768}))
+    assert wide.max_blocks_per_request == 32768
 
 
 @pytest.mark.parametrize(
@@ -993,7 +994,6 @@ def test_profile_times_complete_composite_and_returns_live_zero_flop_metrics(
         counts=None,
     )
     calls: list[Any] = []
-    monkeypatch.setattr(runner, "_require_h200", lambda _torch: calls.append("gpu"))
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(
         runner,
@@ -1043,7 +1043,6 @@ def test_profile_times_complete_composite_and_returns_live_zero_flop_metrics(
     assert metrics.tflops == 0.0
     assert metrics.memory_bandwidth_gbps == logical_bytes / 0.002 / 1e9
     assert calls == [
-        "gpu",
         "build",
         "correctness",
         ("timer", {}),
@@ -1058,14 +1057,6 @@ def test_profile_preserves_typed_unavailable_oom_and_execution_failures(
 ) -> None:
     from profiling.runners.attention import dsa_sparse_index_remap as runner
 
-    def unavailable(_torch: Any) -> None:
-        raise ProfilerNotImplemented("CUDA is required")
-
-    monkeypatch.setattr(runner, "_require_h200", unavailable)
-    with pytest.raises(ProfilerNotImplemented, match="CUDA is required"):
-        runner.profile_dsa_sparse_index_remap_torch(**_BASE_SPEC)
-
-    monkeypatch.setattr(runner, "_require_h200", lambda _torch: None)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
 
     def oom(*_args: Any, **_kwargs: Any) -> Any:
@@ -1085,16 +1076,13 @@ def test_profile_preserves_typed_unavailable_oom_and_execution_failures(
     assert isinstance(launch_info.value.__cause__, RuntimeError)
 
 
-def test_only_the_vllm_backend_admits_the_kpool_table_width(
+def test_both_backends_admit_the_kpool_table_width(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from profiling.runners.attention import dsa_sparse_index_remap as runner
 
     kpool = _BASE_SPEC | {"selected_k": 2176}
-    with pytest.raises(ProfilerNotImplemented, match="selected_k must be 2048, got 2176"):
-        runner._validate_args(**kpool)
-    validated = runner._validate_args(**kpool, supported_selected_k=runner._VLLM_SELECTED_K)
-    assert validated.selected_k == 2176
+    assert runner._validate_args(**kpool).selected_k == 2176
 
     seen: dict[str, Any] = {}
 
@@ -1105,4 +1093,4 @@ def test_only_the_vllm_backend_admits_the_kpool_table_width(
     monkeypatch.setattr(runner, "_validate_args", stop_after_validation)
     with pytest.raises(RuntimeError, match="validated"):
         runner.profile_dsa_sparse_index_remap_vllm_triton(**kpool)
-    assert seen["supported_selected_k"] == frozenset({2048, 2176})
+    assert seen["selected_k"] == 2176

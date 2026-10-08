@@ -20,38 +20,38 @@ from profiling.runners.gemm import rocm_scaled_mm, torch_rocm
 
 def test_single_gemm_rocm_scaled_mm_registered_for_mi300x() -> None:
     spec = find_kernel_profiler_spec("single_gemm", "rocm_scaled_mm")
-    assert spec.supports.gpus == frozenset({"MI300X"})
+    assert spec.supports.arch_targets == frozenset({"CDNA3"})
     assert spec.supports.compute == frozenset({DType.FP8_E4M3})
     assert spec.subprocess_env == "vllm_rocm_env"
     assert spec.runner_ref.function_name == "profile_single_gemm_scaled_mm"
     assert spec.table_name == "single_gemm"
 
-    # The NVIDIA fp8 dense GEMM (deepgemm) is not weakened onto MI300X.
+    # The NVIDIA fp8 dense GEMM (deepgemm) was not given the AMD CDNA3 gate.
     deepgemm = find_kernel_profiler_spec("single_gemm", "deepgemm")
-    assert "MI300X" not in (deepgemm.supports.gpus or frozenset())
+    assert deepgemm.supports.arch_targets is None
 
 
 def test_single_gemm_torch_rocm_registered_for_mi300x() -> None:
     spec = find_kernel_profiler_spec("single_gemm", "torch_rocm")
-    assert spec.supports.gpus == frozenset({"MI300X"})
+    assert spec.supports.arch_targets == frozenset({"CDNA3"})
     assert DType.BF16 in spec.supports.compute
     assert spec.subprocess_env == "vllm_rocm_env"
     assert spec.runner_ref.function_name == "profile_single_gemm_torch_rocm"
 
-    # The B200-gated bf16 row (torch_linear_vllm) keeps its NVIDIA-only gate.
+    # The NVIDIA bf16 row (torch_linear_vllm) was not given the AMD CDNA3 gate.
     nvidia = find_kernel_profiler_spec("single_gemm", "torch_linear_vllm")
-    assert nvidia.supports.gpus == frozenset({"NVIDIA B200"})
+    assert nvidia.supports.arch_targets is None
 
 
 def test_batched_gemm_torch_rocm_registered_for_mi300x() -> None:
     spec = find_kernel_profiler_spec("batched_gemm", "torch_rocm")
-    assert spec.supports.gpus == frozenset({"MI300X"})
+    assert spec.supports.arch_targets == frozenset({"CDNA3"})
     assert spec.supports.compute == frozenset({DType.BF16})
     assert spec.subprocess_env == "vllm_rocm_env"
     assert spec.runner_ref.function_name == "profile_batched_gemm_torch_rocm"
 
     nvidia = find_kernel_profiler_spec("batched_gemm", "torch_mla_q_absorb_no_rope")
-    assert "MI300X" not in (nvidia.supports.gpus or frozenset())
+    assert nvidia.supports.arch_targets is None
 
 
 def test_runner_signatures_match_kind_args() -> None:

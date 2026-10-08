@@ -119,12 +119,12 @@ def test_registration_support_and_facades():
         kv_dtype=DType.BF16,
         gpu="NVIDIA H200",
     )
-    assert not spec.supports.allows(
+    assert spec.supports.allows(
         DType.FP8_E4M3,
         kv_dtype=DType.FP8_E4M3,
         gpu="NVIDIA H100",
     )
-    assert not spec.supports.allows(
+    assert spec.supports.allows(
         DType.FP8_E4M3,
         kv_dtype=DType.FP8_E4M3,
         gpu="NVIDIA B200",
@@ -246,9 +246,9 @@ def test_runner_refs_resolve_without_importing_frameworks_or_running_jit():
         ({"max_model_len": 0}, "must be > 0"),
         ({"context_len": 129}, "must be <= max_model_len"),
         ({"next_n": 0}, "next_n > 0"),
-        ({"num_heads": 16}, r"num_heads in \[32, 64\]"),
-        ({"head_dim": 64}, r"head_dim == 128"),
-        ({"block_size": 32}, r"block_size == 64"),
+        ({"num_heads": 0}, r"num_heads, head_dim, and block_size > 0"),
+        ({"head_dim": 0}, r"num_heads, head_dim, and block_size > 0"),
+        ({"block_size": -64}, r"num_heads, head_dim, and block_size > 0"),
         ({"q_dtype": DType.BF16}, "q_dtype=cache_dtype=fp8_e4m3"),
         ({"cache_dtype": DType.BF16}, "q_dtype=cache_dtype=fp8_e4m3"),
         ({"scale_dtype": DType.BF16}, "scale_dtype=weight_dtype"),
@@ -273,6 +273,22 @@ def test_accepts_sglang_native_32_head_instantiation():
     validated = _validate_args(**(_BASE_SPEC | {"num_heads": 32}))
 
     assert validated[4] == 32
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"num_heads": 16},
+        {"num_heads": 8},
+        {"head_dim": 64},
+        {"block_size": 32},
+        {"block_size": 128},
+    ],
+)
+def test_shape_validation_leaves_deepgemm_bounds_to_the_device_check(overrides):
+    from profiling.runners.attention.dsa_paged_mqa_logits_decode import _validate_args
+
+    _validate_args(**(_BASE_SPEC | overrides))
 
 
 def test_rejects_nonboolean_clean_logits():
@@ -315,68 +331,61 @@ def test_missing_torch_is_typed(monkeypatch):
         runner.profile_dsa_paged_mqa_logits_decode_torch(**_BASE_SPEC)
 
 
-def test_rejects_missing_cuda_and_unverified_gpu():
+def _deepgemm_device(capability, num_sms):
+    return SimpleNamespace(
+        cuda=SimpleNamespace(
+            is_available=lambda: True,
+            current_device=lambda: 0,
+            get_device_capability=lambda _device: capability,
+            get_device_properties=lambda _device: SimpleNamespace(multi_processor_count=num_sms),
+        )
+    )
+
+
+_GLM_SHAPE = {"num_heads": 64, "head_dim": 128, "block_size": 64, "next_n": 1}
+
+
+def test_deepgemm_launch_bounds_return_the_device_sm_count():
     from profiling.runners.attention.dsa_paged_mqa_logits_decode import (
-        _validate_cuda_device,
+        _check_deepgemm_launch_bounds,
     )
 
-    no_cuda = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False))
-    with pytest.raises(ProfilerNotImplemented, match="CUDA is required"):
-        _validate_cuda_device(no_cuda)
-
-    h100 = SimpleNamespace(
-        cuda=SimpleNamespace(
-            is_available=lambda: True,
-            current_device=lambda: 0,
-            get_device_name=lambda _device: "NVIDIA H100",
-        )
-    )
-    with pytest.raises(ProfilerNotImplemented, match="verified only on NVIDIA H200"):
-        _validate_cuda_device(h100)
+    # vLLM schedules for the device's own SM count: H100 SXM, H200, a
+    # partitioned H200, B200 and B300 all launch.
+    assert _check_deepgemm_launch_bounds(_deepgemm_device((9, 0), 132), **_GLM_SHAPE) == 132
+    assert _check_deepgemm_launch_bounds(_deepgemm_device((9, 0), 130), **_GLM_SHAPE) == 130
+    assert _check_deepgemm_launch_bounds(_deepgemm_device((10, 0), 148), **_GLM_SHAPE) == 148
+    assert _check_deepgemm_launch_bounds(_deepgemm_device((10, 3), 148), **_GLM_SHAPE) == 148
 
 
-def test_deepgemm_rejects_cuda_gpu_and_sm_count_mismatches():
+@pytest.mark.parametrize(
+    ("capability", "overrides", "accepted"),
+    [
+        ((9, 0), {"num_heads": 16}, False),
+        ((10, 0), {"num_heads": 16}, True),
+        ((10, 0), {"num_heads": 8}, True),
+        ((9, 0), {"block_size": 32}, True),
+        ((9, 0), {"block_size": 128}, False),
+        ((10, 0), {"block_size": 128}, True),
+        ((9, 0), {"next_n": 2}, True),
+        ((9, 0), {"next_n": 3}, False),
+        ((10, 0), {"next_n": 3}, True),
+        ((9, 0), {"head_dim": 64}, True),
+        ((9, 0), {"head_dim": 256}, False),
+        ((12, 0), {"head_dim": 64}, False),
+    ],
+)
+def test_deepgemm_launch_bounds_apply_each_arch_bound(capability, overrides, accepted):
     from profiling.runners.attention.dsa_paged_mqa_logits_decode import (
-        _validate_deepgemm_cuda_device,
+        _check_deepgemm_launch_bounds,
     )
 
-    no_cuda = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False))
-    with pytest.raises(ProfilerNotImplemented, match="CUDA is required"):
-        _validate_deepgemm_cuda_device(no_cuda)
-
-    h100 = SimpleNamespace(
-        cuda=SimpleNamespace(
-            is_available=lambda: True,
-            current_device=lambda: 0,
-            get_device_name=lambda _device: "NVIDIA H100",
-        )
-    )
-    with pytest.raises(
-        ProfilerNotImplemented,
-        match="verified only on NVIDIA H200 or NVIDIA B200",
-    ):
-        _validate_deepgemm_cuda_device(h100)
-
-    wrong_sm_count = SimpleNamespace(
-        cuda=SimpleNamespace(
-            is_available=lambda: True,
-            current_device=lambda: 0,
-            get_device_name=lambda _device: "NVIDIA H200",
-            get_device_properties=lambda _device: SimpleNamespace(multi_processor_count=130),
-        )
-    )
-    with pytest.raises(ProfilerNotImplemented, match="132-SM NVIDIA H200"):
-        _validate_deepgemm_cuda_device(wrong_sm_count)
-
-    b200 = SimpleNamespace(
-        cuda=SimpleNamespace(
-            is_available=lambda: True,
-            current_device=lambda: 0,
-            get_device_name=lambda _device: "NVIDIA B200",
-            get_device_properties=lambda _device: SimpleNamespace(multi_processor_count=148),
-        )
-    )
-    assert _validate_deepgemm_cuda_device(b200) == 148
+    device = _deepgemm_device(capability, 132)
+    if accepted:
+        _check_deepgemm_launch_bounds(device, **(_GLM_SHAPE | overrides))
+    else:
+        with pytest.raises(ProfilerNotImplemented, match="DeepGEMM paged MQA logits"):
+            _check_deepgemm_launch_bounds(device, **(_GLM_SHAPE | overrides))
 
 
 def test_deepgemm_cupti_filter_is_architecture_agnostic():
@@ -430,9 +439,9 @@ def test_deepgemm_entry_rejects_invalid_args_before_framework_loading(monkeypatc
         ({"max_model_len": 0}, "must be > 0"),
         ({"context_len": 129}, "must be <= max_model_len"),
         ({"next_n": -1}, "next_n > 0"),
-        ({"num_heads": 16}, r"num_heads in \[32, 64\]"),
-        ({"head_dim": 64}, r"head_dim == 128"),
-        ({"block_size": 32}, r"block_size == 64"),
+        ({"num_heads": 0}, r"num_heads, head_dim, and block_size > 0"),
+        ({"head_dim": 0}, r"num_heads, head_dim, and block_size > 0"),
+        ({"block_size": -64}, r"num_heads, head_dim, and block_size > 0"),
         ({"q_dtype": DType.BF16}, "q_dtype=cache_dtype=fp8_e4m3"),
         ({"cache_dtype": DType.BF16}, "q_dtype=cache_dtype=fp8_e4m3"),
         ({"scale_dtype": DType.BF16}, "scale_dtype=weight_dtype"),
@@ -632,7 +641,7 @@ def test_deepgemm_launch_failure_is_typed(monkeypatch):
         cuda=SimpleNamespace(
             is_available=lambda: True,
             current_device=lambda: 0,
-            get_device_name=lambda _device: "NVIDIA H200",
+            get_device_capability=lambda _device: (9, 0),
             get_device_properties=lambda _device: SimpleNamespace(multi_processor_count=132),
         )
     )

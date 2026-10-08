@@ -30,10 +30,13 @@ For the layer overview see `doc/detailed_design/L7.md`.
     request otherwise. A unit that the cap held back is stamped with the instant
     its slot opened, not its trace arrival, so it is not charged for a wait the
     measured runner does not report either.
-  - **Session dependency** —
-    `session_dependency: independent | chained`. Independent rows have no causal
-    gate. Chained session heads follow the arrival mode and the cap, while each
-    successor waits for predecessor completion plus `tool_wait_after_ms`.
+  - **Session dependency** — set by the trace, not the config: a trace with
+    sessions (the `session` tag, or a format whose rows are rounds) chains them,
+    and one without has none to chain. Independent rows have no causal gate.
+    Chained session heads follow the arrival mode and the cap, while each
+    successor waits for predecessor completion plus `tool_wait_after_ms`. A
+    later round's own arrival is its session's, so replaying it independently
+    would release a whole conversation at once.
 
   All combinations are valid; the axes were deliberately split apart because a
   capped replay of a recorded timeline is a real workload and a single fused
@@ -53,7 +56,10 @@ For the layer overview see `doc/detailed_design/L7.md`.
 
   The drain loop lives here so a caller can't under-drain by polling once per
   tick. The text schema remains the four legacy columns and is declared as
-  `input_file_format: text-generation-independent`. `RequestStore::reserve_slots` creates empty
+  `input_file_format: text-generation-independent`. An optional `prefix_len`
+  column pins a resident prefix (`SessionInput::PinnedPrefix`); req-frontend
+  does not declare it yet, so `frontend/pinned_prefix.rs` reads that format
+  itself when the column is present and defers to req-frontend otherwise. `RequestStore::reserve_slots` creates empty
   `Option` slots; requests are inserted only when the scheduler releases them.
   Compact arrived/admitted id indexes keep lifecycle scans proportional to the
   relevant live set rather than the full reserved trace.
@@ -75,10 +81,13 @@ Each tick, in order:
 3. **Periodic `request_state` snapshot** (every `snapshot_dt`) — dense over the
    *admitted* set, so per-segment workload is a plain diff of consecutive
    snapshots. Plus a heartbeat log line.
-4. **Termination check** (all O(1)): `DrainComplete` (trace exhausted + zero
+4. **Termination check**: `DrainComplete` (trace exhausted + zero
    in-flight), `DurationReached` (`clock ≥ duration`, unless `run_to_end`), or
-   `Stuck` (a watchdog: trace drained but neither completions nor the
-   admitted-id watermark advanced for `stuck_threshold`).
+   `Stuck` (a watchdog: trace drained but no completion, admission, or
+   processed prefill/output token for `stuck_threshold`). The first two are
+   O(1); the watchdog sums the admitted requests' token progress once per
+   100 s sample after the trace is exhausted, so a long decode tail with
+   nothing completing is progress, not a stall.
 5. **Advance** `clock += tick_dt`.
 
 In-flight is tracked from arrival/completion **counters**, never by scanning the

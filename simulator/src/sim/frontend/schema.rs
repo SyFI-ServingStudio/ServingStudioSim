@@ -3,7 +3,9 @@
 //! The shared crate owns complete input-file formats, header matching, CSV
 //! decoding, tag decoding, and format-specific structural validation. This
 //! module starts after that boundary: it assigns ServingStudioSim's dense ids and turns
-//! each shared row into one concrete [`RequestDefinition`].
+//! each shared row into one concrete [`RequestDefinition`]. The one exception is
+//! `text-generation-independent`'s optional `prefix_len` column, which the shared
+//! crate does not declare yet; [`super::pinned_prefix`] reads it.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -18,6 +20,7 @@ use req_frontend::schema::{RequestPriority, RequestSession, RequestSlo, RequestS
 use super::arrival::{
     ReleaseMetadata, ScheduledRequest, SchedulingDeclaration, SessionReleaseMetadata,
 };
+use super::pinned_prefix::{self, TextGenerationIndependentRow};
 use crate::common::{
     AudioExtent, AudioTextGenerationDefinition, DecodingStrategy, ImageExtent,
     ImageGenerationDefinition, ImageTextGenerationDefinition, ImageToVideoDefinition,
@@ -121,7 +124,16 @@ macro_rules! impl_independent_source_row {
     };
 }
 
-impl_independent_source_row!(text_generation::independent::TextGenerationRow);
+impl IndependentSourceRow for TextGenerationIndependentRow {
+    fn source_request_id(&self) -> &str {
+        &self.row.id
+    }
+
+    fn trace_arrival_time_ms(&self) -> f64 {
+        self.row.arrival_time
+    }
+}
+
 impl_independent_source_row!(image_to_text::Row);
 impl_independent_source_row!(video_to_text::Row);
 impl_independent_source_row!(audio_to_text::Row);
@@ -177,15 +189,20 @@ impl TraceDefinition for TextGenerationDefinition {
         let path = path_text(path)?;
         match input_file_schema.input_file_format {
             InputFileFormat::TextGenerationIndependent => append_independent(
-                text_generation::independent::load(path, input_file_schema)?,
+                pinned_prefix::load(path, input_file_schema)?,
                 session_start_times,
                 source_identities,
                 output,
-                |row, session, decoding| {
+                |TextGenerationIndependentRow {
+                     row,
+                     pinned_prefix_tokens,
+                 },
+                 session,
+                 decoding| {
                     Ok(Self {
                         prompt_tokens: usize_to_u32(row.input_len, "input_len")?,
                         target_output_tokens: usize_to_u32(row.output_len, "output_len")?,
-                        session,
+                        session: pin_prefix(session, pinned_prefix_tokens, &row.id)?,
                         decoding,
                     })
                 },
@@ -507,6 +524,28 @@ fn usize_to_u32(value: usize, column: &str) -> Result<u32> {
     u32::try_from(value).with_context(|| format!("{column}={value} exceeds u32"))
 }
 
+/// Attach a row's `prefix_len` to the session declaration its tags produced.
+/// Zero keeps the declaration unchanged, so a trace without pinned prefixes
+/// loads exactly as before the column existed.
+fn pin_prefix(
+    session: SessionInput,
+    pinned_prefix_tokens: u32,
+    source_request_id: &str,
+) -> Result<SessionInput> {
+    if pinned_prefix_tokens == 0 {
+        return Ok(session);
+    }
+    match session {
+        SessionInput::Standalone => Ok(SessionInput::PinnedPrefix {
+            prefix_tokens: pinned_prefix_tokens,
+        }),
+        SessionInput::Session { .. } | SessionInput::PinnedPrefix { .. } => bail!(
+            "request {source_request_id:?}: prefix_len pins a standalone request's prefix; \
+             a session row declares its reusable prefix with prefix_kv"
+        ),
+    }
+}
+
 fn slo_contract(slo: RequestSlo) -> SloContract {
     SloContract {
         ttft_slo: slo.ttft_slo_ms.map(Time::from_ms),
@@ -596,6 +635,23 @@ impl SourceIdentities {
     pub fn request_source_ids(&self) -> &[String] {
         &self.requests
     }
+
+    /// Dense request `id` in the trace's own name (its ordinal if unnamed).
+    pub fn request_source_id(&self, id: RequestId) -> String {
+        source_or_ordinal(&self.requests, id.0)
+    }
+
+    /// Dense session `id` in the trace's own name (its ordinal if unnamed).
+    pub fn session_source_id(&self, id: u32) -> String {
+        source_or_ordinal(&self.session_order, id)
+    }
+}
+
+fn source_or_ordinal(source_ids: &[String], dense: u32) -> String {
+    source_ids
+        .get(dense as usize)
+        .cloned()
+        .unwrap_or_else(|| dense.to_string())
 }
 
 pub(super) fn load_file<Definition: TraceDefinition>(

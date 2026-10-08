@@ -25,6 +25,7 @@ from __future__ import annotations
 import contextlib
 import os
 import re
+import sys
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -79,14 +80,40 @@ def autotune_cached(autotune: Any, kernel: str) -> Iterator[None]:
     inside the runner's own try block, where a missing FlashInfer is already
     translated into ``ProfilerNotImplemented``.
 
+    Tactics this process tuned under an earlier ``kernel`` are forgotten
+    first, so the file holds only this configuration's
+    (:func:`_forget_live_tactics`).
+
     Concurrent workers can still race -- one that loaded before another saved
     will overwrite it -- but the loser is a cache miss on the next run, not a
     wrong tactic, and the file converges as runs accumulate.
     """
 
     path = autotune_cache_path(kernel) if _supports_cache(autotune) else None
+    if path is not None:
+        _forget_live_tactics(autotune)
     with autotune() if path is None else autotune(cache=str(path)):
         yield
+
+
+def _forget_live_tactics(autotune: Any) -> None:
+    """Drop the tactics this process tuned for earlier files.
+
+    One worker profiles a chunk of specs, and each configuration has its own
+    file (``kernel``). On exit FlashInfer's ``save_configs`` writes the whole
+    process-wide ``profiling_cache`` into the current file under keys that leave
+    out the runner hash, so without this a later configuration's file would also
+    receive every earlier one's tactics, and a later process loading it would
+    replay them (loaded configs win over tuning). Each earlier tactic is already
+    in its own file, so nothing is lost.
+    """
+
+    tuner_cls = getattr(sys.modules.get(autotune.__module__), "AutoTuner", None)
+    if tuner_cls is None:
+        return
+    tuner = tuner_cls.get()
+    with tuner._lock:
+        tuner.profiling_cache.clear()
 
 
 def _supports_cache(autotune: Any) -> bool:

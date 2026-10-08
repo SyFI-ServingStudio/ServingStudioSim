@@ -20,12 +20,13 @@ use futures_util::StreamExt;
 use serde_json::{json, Value};
 use tokio::sync::Mutex as AsyncMutex;
 
+use crate::breakdown::kernel_time_share::row_composition;
 use crate::io::{read_cost_manifests, resolve_artifact_path};
 use crate::session::{
-    build_session, col, collect, column_f64, register_if_exists, require_columns, value_f32_list,
-    value_f64, value_groups, value_str_list, value_string,
+    build_session, col, collect, column_f64, register_if_exists, require_columns,
+    slot_backend_none, value_f32_list, value_f64, value_groups, value_str_list, value_string,
 };
-use crate::trace::manifest::{FlatCostNode, Manifest, ManifestDoc};
+use crate::trace::manifest::{critical_child, node_time, FlatCostNode, Manifest, ManifestDoc};
 
 use super::discovery::{regular_file, DiscoveredRun};
 
@@ -54,7 +55,8 @@ struct OptionalColumns {
     slot_input: bool,
     slot_flops: bool,
     slot_bytes: bool,
-    slot_backend: bool,
+    /// The column's not-executed value ([`slot_backend_none`]), when present.
+    slot_backend: Option<u8>,
 }
 
 const MAX_RANGE_LIMIT: usize = 384;
@@ -187,7 +189,8 @@ struct ExactRow {
     slot_input: Vec<String>,
     slot_flops: Vec<f64>,
     slot_bytes: Vec<f64>,
-    slot_backend: Vec<u8>,
+    /// Each slot's candidate index; `None` where the leaf was not executed.
+    slot_backend: Vec<Option<u8>>,
 }
 
 pub(super) fn details_descriptor(run: &DiscoveredRun) -> Option<Value> {
@@ -762,7 +765,7 @@ async fn exact_source_cost_tree(
     let (ctx, manifest_doc) = open_source(source, request_id, "cost_tree").await?;
     let require_started = Instant::now();
     require_columns(&ctx, TABLE, TREE_COLUMNS).await?;
-    let optional = optional_columns(&ctx).await?;
+    let optional = optional_columns(&ctx, source).await?;
     prof(request_id, "cost_tree event=schema", require_started);
     let mut projection = vec![
         "CAST(section AS VARCHAR) AS section",
@@ -781,7 +784,7 @@ async fn exact_source_cost_tree(
     if optional.slot_bytes {
         projection.push("slot_bytes");
     }
-    if optional.slot_backend {
+    if optional.slot_backend.is_some() {
         projection.push("slot_backend");
     }
     let sql = format!(
@@ -809,7 +812,12 @@ async fn exact_source_cost_tree(
     let manifest = manifest_doc
         .section(&row.section)
         .with_context(|| format!("worker manifest has no section {:?}", row.section))?;
-    let tree = tree_json(manifest, row, 0)?;
+    let slot_ns = slot_ns(&row.slot_time_ms);
+    let tree = tree_json(manifest, row, &slot_ns, 0)?;
+    // f64 here only because the reader widened the logged f32 list; narrowing
+    // back is exact.
+    let slot_time_ms: Vec<f32> = row.slot_time_ms.iter().map(|&time| time as f32).collect();
+    let time_share = row_composition(manifest, &slot_time_ms, row.total_time_ms)?;
     let identity = public_identity
         .as_object_mut()
         .context("cost-tree public identity must be an object")?;
@@ -825,6 +833,7 @@ async fn exact_source_cost_tree(
             "groups": row.groups,
         }],
         "tree": tree,
+        "time_share": time_share,
     });
     prof(request_id, "cost_tree event=tree_and_json", tree_started);
     prof(request_id, "cost_tree event=complete", started);
@@ -925,14 +934,14 @@ fn is_ffn(manifest: &ManifestDoc) -> bool {
     has_section(manifest, "prologue") && has_section(manifest, "post_attn")
 }
 
-async fn optional_columns(ctx: &SessionContext) -> Result<OptionalColumns> {
+async fn optional_columns(ctx: &SessionContext, source: &CostLogSource) -> Result<OptionalColumns> {
     let table = ctx.table(TABLE).await?;
     let has = |name: &str| table.schema().field_with_name(None, name).is_ok();
     Ok(OptionalColumns {
         slot_input: has("slot_input"),
         slot_flops: has("slot_flops"),
         slot_bytes: has("slot_bytes"),
-        slot_backend: has("slot_backend"),
+        slot_backend: slot_backend_none(&source.cost_path())?,
     })
 }
 
@@ -967,10 +976,12 @@ async fn read_exact_rows(
                 } else {
                     Vec::new()
                 },
-                slot_backend: if optional.slot_backend {
-                    value_u8_list(col(batch, "slot_backend")?, row)?
-                } else {
-                    Vec::new()
+                slot_backend: match optional.slot_backend {
+                    Some(none) => value_u8_list(col(batch, "slot_backend")?, row)?
+                        .into_iter()
+                        .map(|index| (index != none).then_some(index))
+                        .collect(),
+                    None => Vec::new(),
                 },
             });
         }
@@ -978,7 +989,24 @@ async fn read_exact_rows(
     Ok(rows)
 }
 
-fn tree_json(manifest: &Manifest, row: &ExactRow, node_index: usize) -> Result<Value> {
+/// Slot times in whole ns, the unit [`node_time`] folds in.
+fn slot_ns(slot_time_ms: &[f64]) -> Vec<i64> {
+    slot_time_ms
+        .iter()
+        .map(|&time| (time * 1e6).round() as i64)
+        .collect()
+}
+
+/// One node of the exact-operation CostTree. A leaf carries its slot time
+/// (`base`); every container carries its own wall time (`ms`, folded by
+/// [`node_time`], so the UI never re-derives it), and a `max` / `parallel`
+/// also names its critical child by index (`critical`).
+fn tree_json(
+    manifest: &Manifest,
+    row: &ExactRow,
+    slot_ns: &[i64],
+    node_index: usize,
+) -> Result<Value> {
     let node = manifest
         .nodes
         .get(node_index)
@@ -1007,7 +1035,7 @@ fn tree_json(manifest: &Manifest, row: &ExactRow, node_index: usize) -> Result<V
             let backend = row
                 .slot_backend
                 .get(*slot_index)
-                .and_then(|index| (*index != u8::MAX).then_some(*index as usize))
+                .and_then(|index| index.map(usize::from))
                 .and_then(|index| slot.backends().get(index).cloned());
             let input = row
                 .slot_input
@@ -1038,39 +1066,65 @@ fn tree_json(manifest: &Manifest, row: &ExactRow, node_index: usize) -> Result<V
         FlatCostNode::Sum { children } => container_json(
             "sum",
             label,
-            tree_children(manifest, row, children.clone())?,
-            None,
+            tree_children(manifest, row, slot_ns, children.clone())?,
+            node_ms(manifest, node_index, slot_ns),
+            &[],
         ),
         FlatCostNode::Max { overlap, children } => container_json(
             "max",
             label,
-            tree_children(manifest, row, children.clone())?,
-            Some(("overlap", json!(overlap))),
+            tree_children(manifest, row, slot_ns, children.clone())?,
+            node_ms(manifest, node_index, slot_ns),
+            &[
+                ("overlap", json!(overlap)),
+                ("critical", critical_json(manifest, children, slot_ns)),
+            ],
+        ),
+        FlatCostNode::Parallel { overlap, children } => container_json(
+            "parallel",
+            label,
+            tree_children(manifest, row, slot_ns, children.clone())?,
+            node_ms(manifest, node_index, slot_ns),
+            &[
+                ("overlap", json!(overlap)),
+                ("critical", critical_json(manifest, children, slot_ns)),
+            ],
         ),
         FlatCostNode::Scale { n, children } => container_json(
             "scale",
             label,
-            tree_children(manifest, row, children.clone())?,
-            Some(("n", json!(n))),
+            tree_children(manifest, row, slot_ns, children.clone())?,
+            node_ms(manifest, node_index, slot_ns),
+            &[("n", json!(n))],
         ),
     }
+}
+
+fn node_ms(manifest: &Manifest, node_index: usize, slot_ns: &[i64]) -> f64 {
+    node_time(manifest, node_index, slot_ns) as f64 / 1e6
+}
+
+/// The critical child's position among `children`.
+fn critical_json(manifest: &Manifest, children: &std::ops::Range<usize>, slot_ns: &[i64]) -> Value {
+    json!(critical_child(manifest, children.clone(), slot_ns) - children.start)
 }
 
 fn container_json(
     kind: &str,
     label: Option<String>,
     children: Vec<Value>,
-    extra: Option<(&str, Value)>,
+    ms: f64,
+    extra: &[(&str, Value)],
 ) -> Result<Value> {
-    let mut node = json!({"kind": kind, "children": children});
+    let mut node = json!({"kind": kind, "ms": ms, "children": children});
     let object = node
         .as_object_mut()
         .expect("container JSON is always an object");
     if let Some(label) = label {
         object.insert("label".to_owned(), Value::String(label));
     }
-    if let Some((key, value)) = extra {
-        object.insert(key.to_owned(), value);
+    for (key, value) in extra {
+        object.insert((*key).to_owned(), value.clone());
     }
     Ok(node)
 }
@@ -1078,10 +1132,11 @@ fn container_json(
 fn tree_children(
     manifest: &Manifest,
     row: &ExactRow,
+    slot_ns: &[i64],
     children: std::ops::Range<usize>,
 ) -> Result<Vec<Value>> {
     children
-        .map(|child| tree_json(manifest, row, child))
+        .map(|child| tree_json(manifest, row, slot_ns, child))
         .collect()
 }
 
@@ -1156,7 +1211,7 @@ mod tests {
             slot_input: vec![r#"{"m":8}"#.to_owned(), String::new()],
             slot_flops: vec![4.0e9, 0.0],
             slot_bytes: vec![0.0, 2.0e6],
-            slot_backend: vec![1, u8::MAX],
+            slot_backend: vec![Some(1), None],
         }
     }
 
@@ -1209,15 +1264,63 @@ mod tests {
             node_labels: vec![Some("parallel".to_owned()), None, None],
         };
 
-        let tree = tree_json(&manifest, &row("post_attn", 1), 0).unwrap();
+        let row = row("post_attn", 1);
+        let tree = tree_json(&manifest, &row, &slot_ns(&row.slot_time_ms), 0).unwrap();
 
         assert_eq!(tree["kind"], "max");
         assert_eq!(tree["overlap"], 2.0);
+        // The container's own wall time and critical child come from the
+        // Analyzer's fold: max(2 ms, 1 ms) / 2.
+        assert_eq!(tree["ms"], 1.0);
+        assert_eq!(tree["critical"], 0);
         assert_eq!(tree["children"][0]["slot"]["backend"], "triton");
         assert_eq!(tree["children"][0]["stats"]["input"]["m"], 8);
         assert_eq!(tree["children"][0]["stats"]["tflops"], 2.0);
         assert!(tree["children"][1]["stats"]["flops"].is_null());
         assert_eq!(tree["children"][1]["stats"]["gbps"], 2.0);
+    }
+
+    #[test]
+    fn cost_tree_containers_carry_their_wall_time_and_critical_stream() {
+        let leaf = |name: &str| LeafDesc {
+            name: name.to_owned(),
+            kind: "single_gemm".to_owned(),
+            kernel_config: json!({"backends": []}),
+        };
+        // Sum[ Scale{3}[leaf a], Parallel{1}[leaf b, leaf c] ], slots a=2, b=1, c=4 ms.
+        let manifest = Manifest {
+            slots: vec![leaf("a"), leaf("b"), leaf("c")],
+            nodes: vec![
+                FlatCostNode::Sum { children: 1..3 },
+                FlatCostNode::Scale {
+                    n: 3,
+                    children: 3..4,
+                },
+                FlatCostNode::Parallel {
+                    overlap: 1.0,
+                    children: 4..6,
+                },
+                FlatCostNode::Leaf(0),
+                FlatCostNode::Leaf(1),
+                FlatCostNode::Leaf(2),
+            ],
+            node_labels: vec![None; 6],
+        };
+        let mut row = row("iter", -1);
+        row.slot_time_ms = vec![2.0, 1.0, 4.0];
+        row.slot_input = vec![String::new(); 3];
+        row.slot_flops = vec![0.0; 3];
+        row.slot_bytes = vec![0.0; 3];
+        row.slot_backend = vec![None; 3];
+
+        let tree = tree_json(&manifest, &row, &slot_ns(&row.slot_time_ms), 0).unwrap();
+
+        assert_eq!(tree["ms"], 10.0);
+        assert_eq!(tree["children"][0]["ms"], 6.0);
+        assert_eq!(tree["children"][1]["kind"], "parallel");
+        assert_eq!(tree["children"][1]["ms"], 4.0);
+        assert_eq!(tree["children"][1]["critical"], 1);
+        assert!(tree["children"][1]["children"][0].get("ms").is_none());
     }
 
     #[test]

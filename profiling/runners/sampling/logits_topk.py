@@ -142,8 +142,6 @@ def profile_logits_topk_torch(
         import torch
     except ImportError as exc:
         raise ProfilerNotImplemented("torch is required for logits_topk") from exc
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented("CUDA is required for logits_topk")
 
     try:
         scores = _build_scores(torch, args)
@@ -174,8 +172,6 @@ def profile_logits_topk_flashinfer(
         raise ProfilerNotImplemented(
             "torch + flashinfer are required for the flashinfer logits_topk runner"
         ) from exc
-    if not torch.cuda.is_available():
-        raise ProfilerNotImplemented("CUDA is required for logits_topk")
 
     try:
         scores = _build_scores(torch, args)

@@ -127,9 +127,10 @@ register(
     KernelProfilerSpec(
         kernel_kind=KIND,
         backend="vllm_triton",
+        # Triton lowers float8_e4m3fn (fp8e4nv) dots only on SM89 and newer.
         supports=BackendSupport(
             compute=frozenset({DType.FP8_E4M3}),
-            gpus=frozenset({"NVIDIA H200"}),
+            min_compute_capability=(8, 9),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.moe.vllm_fused_moe_triton",

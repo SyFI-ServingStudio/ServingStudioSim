@@ -1,8 +1,11 @@
-"""Batched-GEMM kernel kind for MLA's per-head query absorption and value expansion.
+"""Batched-GEMM kernel kind for MLA's per-head query absorption and value
+expansion, and a grouped attention output projection.
 
 Each backend freezes one production storage layout (vLLM's packed Q-absorption
-or V-up views) instead of presenting its constants as generic batched GEMM
-behavior; the runners accept only the measured head widths.
+or V-up views, or the padded group-slot attention output a DeepGEMM MXFP8
+einsum reads) instead of presenting its constants as generic batched GEMM
+behavior. Any per-rank head count launches, except that the padded V-up layout
+holds at most 64 heads.
 """
 
 from __future__ import annotations
@@ -26,24 +29,39 @@ KIND: str = "batched_gemm"
 @dataclass(frozen=True)
 class BatchedGemmArgs(KernelArgs):
     num_batches: int = arg(
-        unit="heads", doc="Attention heads multiplied independently on this GPU."
+        unit="heads",
+        doc=(
+            "Attention heads (or, for the grouped output projection, head groups) "
+            "multiplied independently on this GPU."
+        ),
     )
     m: int = arg(unit="tokens", doc="Token rows per attention head.")
     n: int = arg(unit="elements", doc="Output features per attention head.")
     k: int = arg(unit="elements", doc="Input features per attention head.")
-    dtype: DType = arg(doc="Element type of the inputs and output; the backends use bf16.")
+    dtype: DType = arg(
+        doc=(
+            "Element type of both inputs: bf16 for the MLA backends, with bf16 "
+            "output; mxfp8_e4m3 for the grouped output projection, with bf16 output."
+        )
+    )
 
 
 DOC = KernelDoc(
-    title="MLA batched GEMM",
-    summary="Multiply one activation and weight matrix pair per attention head in MLA.",
+    title="Batched GEMM",
+    summary=(
+        "Multiply one activation and weight matrix pair per attention head (MLA) "
+        "or per head group (grouped output projection)."
+    ),
     description=(
         "vLLM's MLA runs two per-head batched multiplies. Query absorption "
         "multiplies each head's query by W_UK, mapping it into the compressed KV "
         "space; value expansion multiplies each head's attention output by W_UV, "
         "mapping it back to the value head. num_batches is the heads on this GPU "
         "and m the tokens. Each backend builds the same strided views of the "
-        "packed weight, activation and output that vLLM passes to torch.bmm."
+        "packed weight, activation and output that vLLM passes to torch.bmm. "
+        "A grouped low-rank attention output projection is the same shape of "
+        "work: each group of 8 heads' 4,096-wide attention output is multiplied "
+        "by that group's weight, as one DeepGEMM einsum on MXFP8 operands."
     ),
     category="GEMM",
     formula=(
@@ -53,14 +71,22 @@ DOC = KernelDoc(
     ),
     default_metric="tflops",
     method=(
-        f"{CUPTI_METHOD} Each backend times only its torch.bmm call; operand "
-        "construction and any head-padding copy are outside the timed call."
+        f"{CUPTI_METHOD} Each MLA backend times only its torch.bmm call; operand "
+        "construction and any head-padding copy are outside the timed call. The "
+        "grouped output projection times its one DeepGEMM launch after three "
+        "warm-up calls."
     ),
     caveats=(
         "GB/s counts the logical operand elements, not the gaps in the packed "
         "storage the strided views skip.",
-        "Only k = 192 or 256, n = 512 for query absorption and k = 512, n = 256 "
-        "for value expansion are measured, at 8, 16, 32 or 64 heads.",
+        "Each backend fixes k and n to its layout: k = 192 or 256, n = 512 for "
+        "query absorption and k = 512, n = 256 for value expansion.",
+        "torch_mla_v_up reads an attention output padded to 64 heads, so it takes "
+        "at most 64 heads.",
+        "The grouped output projection's activation is the FP8 attention output "
+        "with UE8M0 scales, stored in 8 padded group slots of which the call reads "
+        "the first num_batches. Its GB/s counts one byte per input element plus one "
+        "scale byte per 32, and two bytes per output element.",
     ),
     reference="profiling.runners.gemm.batched_gemm_reference",
 )
@@ -72,7 +98,6 @@ register(
         backend="torch_mla_q_absorb",
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
-            gpus=frozenset({"NVIDIA H200", "NVIDIA B200"}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.gemm.batched_gemm",
@@ -95,7 +120,6 @@ register(
         backend="torch_mla_v_up",
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
-            gpus=frozenset({"NVIDIA H200", "NVIDIA B200"}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.gemm.batched_gemm",
@@ -138,7 +162,6 @@ for _backend, _function, _summary in (
             backend=_backend,
             supports=BackendSupport(
                 compute=frozenset({DType.BF16}),
-                gpus=frozenset({"NVIDIA B200"}),
             ),
             runner_ref=RunnerRef(
                 module_name="profiling.runners.gemm.batched_gemm",
@@ -152,6 +175,38 @@ for _backend, _function, _summary in (
             doc=BackendDoc(summary=_summary, url=_MLA_URL),
         )
     )
+# Grouped output projection (wo_a): one DeepGEMM fp8_einsum "bhr,hdr->bhd" over
+# the local groups. Both operands are MXFP8 (e4m3 + ue8m0 per 32 K); the
+# activation is the fused attention output in its padded 8-slot layout; bf16 out.
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="deepgemm_mxfp8_einsum_grouped_o_proj",
+        # vLLM's DeepGemmMxfp8BmmLinearKernel.is_supported():
+        # is_device_capability_family(100), the SM10x family.
+        supports=BackendSupport(
+            compute=frozenset({DType.MXFP8_E4M3}),
+            sm_targets=frozenset({"sm_100f"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.gemm.deepgemm_mxfp8_einsum",
+            function_name="profile_batched_gemm_deepgemm_mxfp8_einsum_grouped_o_proj",
+        ),
+        table_name=KIND,
+        args_schema=BatchedGemmArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="vllm_upstream_fork_env",
+        doc=BackendDoc(
+            summary=(
+                'DeepGEMM fp8_einsum("bhr,hdr->bhd") with a (1, 1, 32) MXFP8 recipe, '
+                "as vLLM's DeepGemmMxfp8BmmLinearKernel applies a grouped output "
+                "projection to the fused attention's FP8 output."
+            ),
+            url="https://github.com/deepseek-ai/DeepGEMM",
+        ),
+    )
+)
 
 
 # ---- MI300X (ROCm) backend -------------------------------------------------
@@ -165,7 +220,7 @@ register(
         backend="torch_rocm",
         supports=BackendSupport(
             compute=frozenset({DType.BF16}),
-            gpus=frozenset({"MI300X"}),
+            arch_targets=frozenset({"CDNA3"}),
         ),
         runner_ref=RunnerRef(
             module_name="profiling.runners.gemm.torch_rocm",

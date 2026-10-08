@@ -77,7 +77,7 @@ def test_both_backends_registered_for_mi300x_only() -> None:
         ("dsa_sparse_mla_prefill", "profile_dsa_sparse_mla_prefill_rocm_triton"),
     ):
         spec = find_kernel_profiler_spec(kind, "rocm_triton_mla_sparse")
-        assert spec.supports.gpus == frozenset({"MI300X"})
+        assert spec.supports.arch_targets == frozenset({"CDNA3"})
         assert spec.supports.compute == frozenset({DType.BF16})
         assert spec.supports.kv == frozenset({DType.BF16})
         assert spec.subprocess_env == "vllm_rocm_env"
@@ -85,7 +85,7 @@ def test_both_backends_registered_for_mi300x_only() -> None:
 
     # B200 fp8 rows untouched.
     b200 = find_kernel_profiler_spec("dsa_sparse_mla_attention", "flashinfer_trtllm_fp8")
-    assert b200.supports.gpus == frozenset({"NVIDIA B200"})
+    assert b200.supports.arch_targets is None
     assert b200.supports.compute == frozenset({DType.FP8_E4M3})
     assert b200.subprocess_env == "vllm_env"
 

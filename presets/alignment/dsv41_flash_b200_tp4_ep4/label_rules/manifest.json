@@ -1,0 +1,30 @@
+{
+ "schema_version": 2,
+ "rule_files": ["rules.json"],
+ "note": "DeepSeek-V4.1-Flash on 4x B200 under vLLM TP4 attention / EP4 experts, labeled against the deepseek_v41_vllm CostTree. One order-independent rule set applied to a fixpoint; the rules need `name_exact` (alignment/labeling/rules.py) because the FusedQKRMSNorm and combine_topk_swa_indices launches are literally named `kernel`.",
+ "source": {
+  "capture": "logs/20260924_0_dsv41_flash_capture/profile_nsys_cg2048 (Slurm job 1185, max_cudagraph_capture_size 2048, quadrant_interference_c48 trace)",
+  "cost_manifest": "logs/20260924_0_dsv41_flash_capture/timing_predict/raw/cost_manifest/worker_predict_0.json",
+  "arch": "deepseek_v41_vllm, model/config/deepseek_v41_flash.json, routing corpus"
+ },
+ "unmapped_decisions": {
+  "note": "Rules can only write mapped labels (or synchronizing collectives), so an unmapped decision is the initialized label left in place. Every measured kernel family that stays unmapped is listed here with its reason; no simulated slot owns any of them.",
+  "forward": {
+   "direct_copy (unrolled_elementwise_kernel, before _compute_global_topk / mega attention, 40 per iteration)": "framework plumbing: position-tensor dtype cast feeding the attention call; no model math and no CostTree leaf",
+   "FillFunctor<int> (vectorized_elementwise_kernel, before sm100_paged_mqa_logits / cp_gather_indexer_k_quant_cache)": "alloc/fill: indexer logits workspace initialization",
+   "iteration 159 only (the single prefill-only eager iteration, 95 streams): unfused sm100_tf32_hc_prenorm_gemm_impl / mhc_pre_big_fuse_with_norm_tilelang_kernel / mhc_post_tilelang_kernel in place of mega_mhc, and one stream-expansion copy": "one-off eager path whose attention/FFN ownership cannot be read from neighbours; left unmapped rather than guessed (one iteration of 2236)"
+  },
+  "preprocess": {
+   "_compute_swa_indices_and_lens, _ring_slot_mapping, _gather_lookback, _indexer_decode_metadata, deep_gemm sched paged_mqa_logits_metadata, anonymous `kernel` (compressed slot mapping)": "attention metadata: per-iteration overhead, not modelled by a CostTree leaf",
+   "_prepare_pos_seq_lens, _combine_sampled_and_draft_tokens, _gather_block_tables, _compute_slot_mappings, _token_request_mapping, _prepare_prefill_inputs, _apply_write, _zero_kv_blocks, cub scan, arange/fill/compare/clamp/div_floor/add elementwise, empty-named launch": "input preparation and bookkeeping"
+  },
+  "sample": {
+   "index_elementwise_kernel (last-token row gather before lm_head)": "framework plumbing",
+   "direct_copy after the logits AllGather": "copy",
+   "_gumbel_sample, argmax reduce_kernel, scatter/gather, vectorized_gather, fill, _get_num_sampled_and_rejected": "sampling, not modelled"
+  },
+  "bookkeep": {
+   "_post_update_kernel": "scheduler bookkeeping"
+  }
+ }
+}

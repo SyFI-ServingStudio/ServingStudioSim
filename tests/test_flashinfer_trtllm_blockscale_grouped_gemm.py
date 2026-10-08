@@ -9,6 +9,9 @@ from types import SimpleNamespace
 import pytest
 
 from profiling.db.args import DType
+from profiling.db.registry import find_kernel_profiler_spec
+from profiling.runners.device import require_cuda_toolkit, unsupported_device
+from profiling.runners.exceptions import ProfilerNotImplemented
 from profiling.runners.gemm import flashinfer_trtllm_blockscale as runner
 
 
@@ -159,12 +162,16 @@ def _gpu_skip_reason() -> str | None:
         import torch
     except ImportError:
         return "torch is unavailable"
-    if not torch.cuda.is_available():
-        return "CUDA is unavailable"
-    if tuple(torch.cuda.get_device_capability()) != (9, 0):
-        return "direct FP8 block-scale GEMM requires SM90"
-    if runner._parse_cuda_version(torch.version.cuda) < (12, 8):
-        return "direct FP8 block-scale GEMM requires CUDA >= 12.8"
+    supports = find_kernel_profiler_spec(
+        "fp8_blockscale_grouped_gemm", "flashinfer_trtllm"
+    ).supports
+    reason = unsupported_device(supports, "direct FP8 block-scale GEMM")
+    if reason is not None:
+        return reason
+    try:
+        require_cuda_toolkit(torch, runner._CUDA_MINIMUM, "direct FP8 block-scale GEMM")
+    except ProfilerNotImplemented as exc:
+        return str(exc)
     try:
         import flashinfer  # noqa: F401
     except ImportError:

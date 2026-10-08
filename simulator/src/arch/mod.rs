@@ -7,12 +7,17 @@
 pub mod build;
 pub mod config;
 pub mod contract;
+pub mod deepseek_v41_vllm;
 pub mod deepseek_v4_vllm;
 pub mod glm52_model_cfg;
 pub mod glm52_sglang_nvfp4_tp_dsa_moe;
 pub mod glm52_vllm_dsa_moe;
+pub mod glm52_vllm_nvfp4_dp_attn_dsa_moe;
 pub mod glm52_vllm_nvfp4_dsa_moe;
+pub mod glm52_vllm_nvfp4_pp_dsa_moe;
+pub mod glm53_flash_vllm_fp8_dp_attn_ep_moe;
 pub mod glm53_flash_vllm_fp8_kda_dsa_moe;
+pub mod glm53_flash_vllm_fp8_pp_kda_dsa_moe;
 pub mod glm53_vllm_nvfp4_dsa_moe_dflash2;
 pub mod llama3_dense;
 pub mod llama3_dense_tp;
@@ -33,6 +38,10 @@ pub use contract::{
     IterwiseUnifiedModel, SpeculativeArchGroupInput, SpeculativeArchInput, SpeculativeDecodeInput,
     SpeculativeUnifiedModel, UnifiedArchInput,
 };
+pub use deepseek_v41_vllm::{
+    DeepseekV41ModelCfg, DeepseekV41VllmConfigs, DeepseekV41VllmModel, DeepseekV41VllmParallel,
+    DeepseekV41VllmResolved,
+};
 pub use deepseek_v4_vllm::{
     DeepseekV4ModelCfg, DeepseekV4VllmConfigs, DeepseekV4VllmModel, DeepseekV4VllmParallel,
     DeepseekV4VllmResolved,
@@ -45,12 +54,23 @@ pub use glm52_sglang_nvfp4_tp_dsa_moe::{
 pub use glm52_vllm_dsa_moe::{
     Glm52VllmDsaMoeConfigs, Glm52VllmDsaMoeModel, Glm52VllmDsaMoeParallel, Glm52VllmDsaMoeResolved,
 };
+pub use glm52_vllm_nvfp4_dp_attn_dsa_moe::{
+    Glm52VllmNvfp4DpAttnConfigs, Glm52VllmNvfp4DpAttnDsaMoeModel, Glm52VllmNvfp4DpAttnParallel,
+    Glm52VllmNvfp4DpAttnResolved,
+};
 pub use glm52_vllm_nvfp4_dsa_moe::{
     Glm52VllmNvfp4DsaMoeConfigs, Glm52VllmNvfp4DsaMoeModel, Glm52VllmNvfp4DsaMoeParallel,
     Glm52VllmNvfp4DsaMoeResolved, Glm52VllmNvfp4DsaMoeSpeculativeModel,
 };
+pub use glm52_vllm_nvfp4_pp_dsa_moe::{
+    Glm52VllmNvfp4PpConfigs, Glm52VllmNvfp4PpDsaMoeModel, Glm52VllmNvfp4PpParallel,
+    Glm52VllmNvfp4PpResolved, Glm52VllmNvfp4PpStageModel,
+};
 pub use glm53_flash_vllm_fp8_kda_dsa_moe::{
-    Glm53FlashModelCfg, Glm53FlashVllmModel, Glm53FlashVllmParallel,
+    Glm53FlashModelCfg, Glm53FlashQuant, Glm53FlashVllmModel, Glm53FlashVllmParallel,
+};
+pub use glm53_flash_vllm_fp8_pp_kda_dsa_moe::{
+    Glm53FlashVllmFp8PpModel, Glm53FlashVllmFp8PpParallel, Glm53FlashVllmFp8PpStageModel,
 };
 pub use glm53_vllm_nvfp4_dsa_moe_dflash2::{
     Dflash2DraftResolved, Glm53VllmNvfp4DsaMoeDflash2Model,

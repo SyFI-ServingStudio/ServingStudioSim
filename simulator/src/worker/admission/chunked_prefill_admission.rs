@@ -33,7 +33,7 @@ use crate::worker::types::{IterBatchPlan, WorkerEventCommon, WorkerMsgCommon};
 
 use super::{
     AdmissionCandidate, DecodeCompletion, EnqueueSequence, IterAdmission, LoadBalance,
-    PendingOrderPolicy, SingleTokenDecodeCompletion,
+    PartitionLoad, PendingOrderPolicy, SingleTokenDecodeCompletion,
 };
 
 pub struct ChunkedPrefillAdmission<P: PendingOrderPolicy, D = SingleTokenDecodeCompletion> {
@@ -145,10 +145,23 @@ impl<P: PendingOrderPolicy, D> ChunkedPrefillAdmission<P, D> {
         kv_store: &K,
         session_input: SessionInput,
     ) -> usize {
-        kv_store
-            .retained_prefix_partition(session_input)
-            .map(usize::from)
-            .unwrap_or_else(|| self.balance.choose(self.partition_policies.len()))
+        if let Some(partition) = kv_store.retained_prefix_partition(session_input) {
+            return usize::from(partition);
+        }
+        if !self.balance.needs_load() {
+            return self.balance.choose(self.partition_policies.len());
+        }
+        let loads: Vec<PartitionLoad> = self
+            .partition_policies
+            .iter()
+            .enumerate()
+            .map(|(partition, (policy, _))| PartitionLoad {
+                waiting: u32::try_from(policy.len()).expect("pending queue exceeds u32"),
+                running: kv_store.status_active(partition as u16),
+                kv_usage: kv_store.kv_usage(partition as u16),
+            })
+            .collect();
+        self.balance.choose_by_load(&loads)
     }
 
     fn bounded_config(&self) -> Option<BoundedFutureKvAdmissionConfig> {
@@ -791,7 +804,7 @@ where
 /// The next chunk of `resolved_prefill` that `budget` tokens can carry, ending
 /// on a `chunk_end_quantum` boundary when one is set. `0` means the request
 /// cannot run this iteration.
-fn next_chunk_tokens(
+pub(super) fn next_chunk_tokens(
     resolved_prefill: ResolvedPrefillContext,
     budget: u32,
     chunk_end_quantum: Option<u32>,

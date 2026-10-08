@@ -170,6 +170,45 @@ mod tests {
     }
 
     #[test]
+    fn pinned_prefix_is_not_computed_but_the_handoff_carries_it() {
+        let store = shared_with(&[(0, 16, 3)]);
+        store.borrow_mut()[RequestId(0)].request.definition.session =
+            SessionInput::PinnedPrefix { prefix_tokens: 100 };
+        let mut worker = build_pd_prefill_worker(
+            WorkerId(0),
+            "prefill",
+            Arc::new(FakeModel::for_ms(1.0)),
+            Rc::clone(&store),
+            WorkerConfig::default(),
+            None,
+            PoolId(0),
+            "test-gpu",
+            test_cluster(),
+        );
+        worker.enqueue(PdPrefillMsg::Request(RequestId(0)));
+        let mut events = Vec::new();
+        for step in 0..20 {
+            worker.tick(Time::from_ms(step as f64), &mut events);
+        }
+
+        assert_eq!(
+            events,
+            vec![PdPrefillEvent::PrefillDone {
+                worker: WorkerId(0),
+                req: RequestId(0),
+                send_gid: 0,
+                kv_tokens: 116,
+            }]
+        );
+        let requests = store.borrow();
+        assert_eq!(requests[RequestId(0)].progress.prefill_tokens_processed, 16);
+        assert_eq!(
+            requests[RequestId(0)].telemetry.prefix_cache_hit_tokens,
+            Some(100)
+        );
+    }
+
+    #[test]
     fn handoff_ack_returns_session_kv_to_the_prefill_cache() {
         let log_directory = tempdir().unwrap();
         let store = shared_with(&[(0, 16, 3), (1, 20, 3)]);

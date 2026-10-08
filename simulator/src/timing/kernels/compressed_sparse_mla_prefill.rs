@@ -2,7 +2,8 @@
 
 use crate::timing::bridge::{de_backends, ArgsPayload, DType, KernelKind};
 use crate::timing::cache::CacheKind;
-use crate::timing::kernels::engine::{register_kernel, KernelSpec};
+use crate::timing::kernels::causal_rows;
+use crate::timing::kernels::engine::{register_kernel, KernelSpec, OffGrid};
 use crate::timing::sweep::{Axis, Coords, SweepGrid};
 use crate::timing::{Dim, KernelConfig, SweepCoords};
 
@@ -39,7 +40,6 @@ pub struct CompressedSparseMlaPrefillKernelInput {
 impl CompressedSparseMlaPrefillKernelInput {
     fn work(&self) -> (u32, f64, u32) {
         assert!(!self.query_context_pairs.is_empty());
-        assert!(self.query_context_pairs.len() <= 64);
         let mut num_queries = 0_u32;
         let mut total_context = 0_u64;
         for &(queries, context) in &self.query_context_pairs {
@@ -49,7 +49,6 @@ impl CompressedSparseMlaPrefillKernelInput {
                 .expect("query total must fit u32");
             total_context += u64::from(context);
         }
-        assert!(num_queries <= 8192);
         let mean_context = total_context as f64 / self.query_context_pairs.len() as f64;
         let physical_launches = self.query_context_pairs.len().div_ceil(4) as u32;
         (num_queries, mean_context, physical_launches)
@@ -96,6 +95,39 @@ fn canonical_pairs(
         .then_some(pairs)
 }
 
+/// The most requests a profiled batch holds: 16 launches of four.
+const PROFILED_REQUESTS: usize = 64;
+
+/// The profiler's logical bytes: q, the padded top-k plus window indices and
+/// their lengths, the selected cache rows (compressed top-k and window), the
+/// output, and the max/lse rows.
+fn logical_bytes(
+    config: &CompressedSparseMlaPrefillKernelConfig,
+    input: &CompressedSparseMlaPrefillKernelInput,
+) -> f64 {
+    let heads = f64::from(config.num_heads.get());
+    let head_dim = f64::from(config.head_dim.get());
+    let (mut queries, mut valid) = (0.0, 0.0);
+    for &(request_queries, context) in &input.query_context_pairs {
+        queries += f64::from(request_queries);
+        valid += causal_rows::capped(request_queries, context, config.window_size);
+        if config.compress_ratio > 1 {
+            valid += causal_rows::compressed(
+                request_queries,
+                context,
+                config.compress_ratio,
+                Some(config.selected_k),
+            );
+        }
+    }
+    let per_query = f64::from(config.q_dtype.size_bytes()) * heads * head_dim
+        + 4.0 * f64::from(config.window_size + config.selected_k)
+        + 4.0
+        + f64::from(config.output_dtype.size_bytes()) * heads * f64::from(config.value_dim.get())
+        + 8.0 * heads;
+    queries * per_query + f64::from(config.cache_dtype.size_bytes()) * valid * head_dim
+}
+
 pub struct CompressedSparseMlaPrefillSpec;
 
 impl KernelSpec for CompressedSparseMlaPrefillSpec {
@@ -106,13 +138,12 @@ impl KernelSpec for CompressedSparseMlaPrefillSpec {
 
     fn sweep_grid(config: &Self::Config) -> SweepGrid {
         assert_eq!(config.prefill_chunk_size, 4);
-        assert_eq!(config.max_num_batched_tokens, 8192);
         assert_eq!(
             config.selected_k,
             if config.compress_ratio == 1 { 0 } else { 512 }
         );
         SweepGrid::new(vec![
-            Axis::values([1, 4, 16, 64, 128, 256, 512, 1024, 2048, 4096, 8192]),
+            causal_rows::query_axis(&causal_rows::PREFILL_QUERIES, config.max_num_batched_tokens),
             Axis::values([1, 32, 128, 512, 2048, 8192, 32768, 65536, 262144, 1048576])
                 .into_iter()
                 .filter(|&context| context <= f64::from(config.max_model_len))
@@ -134,6 +165,30 @@ impl KernelSpec for CompressedSparseMlaPrefillSpec {
             )
             .is_none()
         })
+    }
+
+    /// Requests run four to a launch, one launch after another, so a batch
+    /// past the profiled 16 launches is the sum of 64-request batches. Past
+    /// the query and context axes the launch holds its bandwidth: on H200 the
+    /// largest measured points sit within 9% of their neighbor's bandwidth and
+    /// up to 39% off its TFLOPS.
+    fn off_grid(
+        config: &Self::Config,
+        input: &Self::Input,
+        _backend: &'static str,
+    ) -> OffGrid<Self::Input> {
+        if input.query_context_pairs.len() > PROFILED_REQUESTS {
+            return OffGrid::Launches(
+                input
+                    .query_context_pairs
+                    .chunks(PROFILED_REQUESTS)
+                    .map(|pairs| CompressedSparseMlaPrefillKernelInput {
+                        query_context_pairs: pairs.to_vec(),
+                    })
+                    .collect(),
+            );
+        }
+        OffGrid::Bandwidth(logical_bytes(config, input))
     }
 
     fn enumerate(
@@ -185,7 +240,7 @@ register_kernel!(
 
 #[cfg(test)]
 mod tests {
-    use super::CompressedSparseMlaPrefillKernelInput;
+    use super::*;
     use crate::timing::SweepCoords;
 
     #[test]
@@ -195,5 +250,37 @@ mod tests {
         };
         assert_eq!(input.coords()[0], 15.0);
         assert_eq!(input.coords()[2], 2.0);
+    }
+
+    #[test]
+    fn logical_bytes_match_a_measured_row() {
+        // A profiled H200 row's logged bandwidth x time.
+        let config: CompressedSparseMlaPrefillKernelConfig =
+            serde_json::from_value(serde_json::json!({"gpu_name": "NVIDIA H200", "max_model_len": 1048576, "max_num_batched_tokens": 8192, "prefill_chunk_size": 4, "compress_ratio": 4, "window_size": 128, "selected_k": 512, "selected_index_pattern": "request_local_topk_plus_swa", "num_heads": 64, "num_kv_heads": 1, "head_dim": 512, "value_dim": 512, "q_dtype": "bf16", "cache_dtype": "bf16", "index_dtype": "int32", "output_dtype": "bf16", "cache_layout": "request_slot_major_flat_mqa_bf16_d512", "backends": ["vllm_flashmla_bf16"]}))
+            .unwrap();
+        let input = CompressedSparseMlaPrefillKernelInput {
+            query_context_pairs: vec![(1, 8192); 4],
+        };
+        assert_eq!(logical_bytes(&config, &input), 3_158_032.0);
+    }
+
+    #[test]
+    fn more_than_sixteen_launches_split_into_profiled_batches() {
+        let config: CompressedSparseMlaPrefillKernelConfig =
+            serde_json::from_value(serde_json::json!({"gpu_name": "NVIDIA H200", "max_model_len": 1048576, "max_num_batched_tokens": 8192, "prefill_chunk_size": 4, "compress_ratio": 4, "window_size": 128, "selected_k": 512, "selected_index_pattern": "request_local_topk_plus_swa", "num_heads": 64, "num_kv_heads": 1, "head_dim": 512, "value_dim": 512, "q_dtype": "bf16", "cache_dtype": "bf16", "index_dtype": "int32", "output_dtype": "bf16", "cache_layout": "request_slot_major_flat_mqa_bf16_d512", "backends": ["vllm_flashmla_bf16"]}))
+            .unwrap();
+        let input = CompressedSparseMlaPrefillKernelInput {
+            query_context_pairs: vec![(16, 4096); 130],
+        };
+        let OffGrid::Launches(launches) =
+            CompressedSparseMlaPrefillSpec::off_grid(&config, &input, "vllm_flashmla_bf16")
+        else {
+            panic!("130 requests must split into launches");
+        };
+        let sizes: Vec<_> = launches
+            .iter()
+            .map(|l| l.query_context_pairs.len())
+            .collect();
+        assert_eq!(sizes, [64, 64, 2]);
     }
 }

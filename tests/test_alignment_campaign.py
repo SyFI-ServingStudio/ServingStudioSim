@@ -321,7 +321,7 @@ def test_render_leaves_a_hub_reference_for_the_launcher_to_fetch(pack, tmp_path)
     """`hf://` is resolved during launcher expansion; it is not a pack path."""
     import dataclasses
 
-    reference = "hf://uw/corpora@0123456789abcdef0123456789abcdef01234567/glm53/manifest.json"
+    reference = "hf://datasets/uw/workload@0123456789abcdef0123456789abcdef01234567/glm53/manifest.json"
     case = pack.cases[0]
     corpus = dataclasses.replace(
         pack.variant_of(case),

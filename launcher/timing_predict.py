@@ -26,24 +26,27 @@ import asyncio
 import json
 import re
 import shutil
-import sqlite3
 import sys
 import tempfile
 import uuid
 from pathlib import Path
 
+from profiling.gpu_policy import gpu_disabled
+
 from .artifact_kind import ArtifactKind, write_artifact_kind
 from .corpus import CorpusError, resolve_hf_references
 from .exec import (
+    ERROR_JSON,
     REPO_ROOT,
     _build_subprocess_env,
+    binary_error,
     binary_path,
     cargo_build,
     run_analysis,
+    run_essential_analysis,
     run_iter_breakdown,
     run_logged_process,
 )
-from .kernel_configs import describe, predict_source, register_file, register_predict_configs
 from .managed_job import prepare_managed_job
 from .process import ProcessSpec, ProcessSupervisor
 from .process.artifacts import ArtifactValidationError, validate_timing_prediction_artifacts
@@ -62,8 +65,8 @@ PREDICTION_PROVENANCE_FILE = "prediction_provenance.json"
 
 def _load_config(path: Path) -> dict:
     """Parse the predict config (JSON or YAML) as the binary does. The binary
-    re-parses the whole thing, and the kernel-config registry records the
-    launcher's copy as the run's source, so the two must read alike."""
+    re-parses the whole thing, but a config with `hf://` references reaches it
+    as the launcher's resolved JSON copy, so the two must read alike."""
     text = path.read_text()
     if path.suffix == ".json":
         return json.loads(text)
@@ -75,7 +78,7 @@ def _load_config(path: Path) -> dict:
 def _binary_yaml_loader(yaml):
     """A safe loader that reads booleans as the binary's serde_yaml (YAML 1.2)
     does: only true and false. PyYAML's YAML 1.1 also reads on, off, yes and
-    no as booleans, which turned `mtp_mode: off` into `false` in the record."""
+    no as booleans, which would turn `mtp_mode: off` into `false`."""
 
     bool_tag = "tag:yaml.org,2002:bool"
 
@@ -337,12 +340,25 @@ def _binary_config(config_path: Path, resolved: dict | None, log_dir: Path) -> P
     return copy
 
 
-async def run_one(config_path: Path, build_type: str, analyze: bool) -> bool:
-    """Run one already-built predictor config.
+# How much of the Analyzer runs after a prediction: "full" (every applicable
+# subject, the trace, the plots unless --no-plot, and the iteration breakdown),
+# "essential" (--analyzer-essential-only: the breakdown and the kernel ranking,
+# `run_essential_analysis`), or "none" (--no-analyze).
+ANALYSIS_LEVELS = ("full", "essential", "none")
 
-    Public so the alignment timing-predict stage can reuse the exact predictor
-    execution/snapshot path.
+
+async def run_one(
+    config_path: Path, build_type: str, analysis: str = "full", *, render: bool = True
+) -> bool:
+    """Run one already-built predictor config with ``analysis`` (one of
+    ANALYSIS_LEVELS). ``render=False`` (``--no-plot``) keeps a full analysis
+    but draws no PNGs.
+
+    Public so the public API's ``/predict`` runs the CLI's own execution and
+    snapshot path.
     """
+    if analysis not in ANALYSIS_LEVELS:
+        raise ValueError(f"analysis must be one of {ANALYSIS_LEVELS}, not {analysis!r}")
     cfg = _load_config(config_path)
     log_dir = Path(cfg["log_dir"])
     if not log_dir.is_absolute():
@@ -371,35 +387,34 @@ async def run_one(config_path: Path, build_type: str, analyze: bool) -> bool:
         write_artifact_kind(log_dir, ArtifactKind.TIMING_PREDICTION)
         binary_config = _binary_config(config_path, resolved, log_dir)
         binary = binary_path(build_type)
+        (log_dir / "raw").mkdir(parents=True, exist_ok=True)
+        argv = [
+            str(binary),
+            "timing-predict",
+            str(binary_config),
+            "--error-json",
+            str(log_dir / "raw" / ERROR_JSON),
+        ]
         journal = RunJournal(log_dir)
-        async with _LAUNCHER_LEASES.profile_database(write=True):
+        # The predictor writes profile.db only to JIT-profile a missing row, which
+        # it refuses to do without a GPU: then predictions share the database.
+        write = not gpu_disabled()
+        async with _LAUNCHER_LEASES.profile_database(write=write):
             journal.update(
                 "timing_predict",
                 StageState.RUNNING,
-                resources=["profile-db:exclusive"],
+                resources=[f"profile-db:{'exclusive' if write else 'shared'}"],
             )
-            with tempfile.TemporaryDirectory(prefix="timing-predict-") as scratch:
-                kernel_configs = Path(scratch) / "kernel_configs.json"
-                argv = [
-                    str(binary),
-                    "timing-predict",
-                    "--kernel-configs-out",
-                    str(kernel_configs),
-                    str(binary_config),
-                ]
-                try:
-                    result = await run_logged_process(
-                        argv,
-                        log_dir,
-                        env=_build_subprocess_env(),
-                        name="timing_predict",
-                    )
-                except asyncio.CancelledError:
-                    journal.update("timing_predict", StageState.CANCELLED)
-                    raise
-                if result.succeeded:
-                    # Rows the run JIT-profiled, and the configs that asked for them.
-                    _register_kernel_configs(kernel_configs, cfg, config_path, journal)
+            try:
+                result = await run_logged_process(
+                    argv,
+                    log_dir,
+                    env=_build_subprocess_env(),
+                    name="timing_predict",
+                )
+            except asyncio.CancelledError:
+                journal.update("timing_predict", StageState.CANCELLED)
+                raise
         if not result.succeeded:
             journal.update(
                 "timing_predict",
@@ -437,16 +452,19 @@ async def run_one(config_path: Path, build_type: str, analyze: bool) -> bool:
             result=result,
             artifacts=validation.paths,
         )
-        if analyze:
-            if managed_job is not None:
-                managed_job.report("analysis_running")
+        if analysis != "none" and managed_job is not None:
+            managed_job.report("analysis_running")
+        if analysis == "full":
             # Best-effort: `analyze trace` (the Perfetto tree) + `analyze run`. Cost
             # subjects apply; request/throughput subjects self-skip on a predict dir.
-            await run_analysis(log_dir, build_type)
-            # Predict-only: the human-readable cost tree (reports/iter_breakdown.ans).
-            # Not in the shared run_analysis — a real run's thousands of iters would
-            # make that file enormous; a predict dir has only a few cases.
+            await run_analysis(log_dir, build_type, render=render)
+            # Predict-only: the cost tree per case, with each node's time and share
+            # (reports/iter_breakdown.ans and its JSON twin). Not in the shared
+            # run_analysis — a real run's thousands of iters would make that file
+            # enormous; a predict dir has only a few cases.
             await run_iter_breakdown(log_dir, build_type)
+        elif analysis == "essential":
+            await run_essential_analysis(log_dir, build_type)
         if managed_job is not None:
             managed_job.report("ready", summary=descriptor)
         return True
@@ -464,52 +482,28 @@ async def run_one(config_path: Path, build_type: str, analyze: bool) -> bool:
 
 
 def _report_failure(log_dir: Path) -> None:
-    """Name the failed prediction's log and its root cause on stderr.
-
-    anyhow prints the cause chain outermost first, so the last line is the root
-    (a missing row, a GPU refused under ``SERVINGSTUDIO_NO_GPU``, ...).
-    """
+    """Name the failed prediction's log and the binary's error on stderr."""
     log_path = log_dir / "stdout.log"
-    try:
-        lines = [line.strip() for line in log_path.read_text(errors="replace").splitlines()]
-    except OSError:
-        lines = []
-    cause = next((line for line in reversed(lines) if line), "")
+    cause = binary_error(log_dir / "raw" / ERROR_JSON)
     print(f"[failed] timing-predict: see {log_path}", file=sys.stderr)
     if cause:
         print(f"  {cause}", file=sys.stderr)
 
 
-def _register_kernel_configs(
-    records: Path, cfg: dict, config_path: Path, journal: RunJournal
-) -> None:
-    """Register a prediction's kernel configs. A failure is reported, not fatal:
-    the prediction is valid without it, and `--register-kernel-configs` can
-    register the configs later without a GPU."""
-    try:
-        report = register_file(records, source=predict_source(cfg, config_path))
-    except (OSError, ValueError, sqlite3.Error) as error:
-        print(f"[kernel-configs] {config_path}: registration failed: {error}", file=sys.stderr)
-        journal.update("register_kernel_configs", StageState.FAILED, error=str(error))
-        return
-    print(f"[kernel-configs] {config_path}: {describe(report)}")
-    journal.update("register_kernel_configs", StageState.SUCCEEDED)
-
-
-def register_one(config_path: Path, build_type: str) -> bool:
-    """`--register-kernel-configs`: register the kernel configs this predict
-    config asks for, without costing a case. Needs no GPU."""
-    cfg = _load_config(config_path)
-    return register_predict_configs(
-        config_path, cfg, _resolved_config(config_path, cfg), build_type
-    )
-
-
 def dry_run_one(config_path: Path, build_type: str) -> bool:
-    """Validate one predictor config without running it.
+    """Validate one predictor config without running it, printing its report."""
+    output, report, _ = dry_run_report(config_path, build_type)
+    print(output, end="" if output.endswith("\n") else "\n")
+    return report is not None
+
+
+def dry_run_report(config_path: Path, build_type: str) -> tuple[str, dict | None, str | None]:
+    """Validate one predictor config without running it: the binary's printed
+    report, the report as its `--report-json` document (None when the config is
+    invalid), and the binary's error (None when it wrote none).
 
     The binary builds the model on its dry-run bridge, lowers every case against
-    it, and prints the `profile.db` specs a real run would JIT-profile. Nothing is
+    it, and reports the `profile.db` specs a real run would JIT-profile. Nothing is
     costed or written under `log_dir`, no job is announced, and no GPU is used.
     """
     cfg = _load_config(config_path)
@@ -517,12 +511,23 @@ def dry_run_one(config_path: Path, build_type: str) -> bool:
         raise ValueError("timing-predict config requires log_dir")
     _resolve_cases(config_path, cfg)
     resolved = _resolved_config(config_path, cfg)
-    with tempfile.TemporaryDirectory(prefix="timing-predict-dry-run-") as scratch:
+    with tempfile.TemporaryDirectory(prefix="timing-predict-dry-run-") as directory:
+        scratch = Path(directory)
         binary_config = config_path
         if resolved is not None:
-            binary_config = Path(scratch) / "timing_predict_config.resolved.json"
+            binary_config = scratch / "timing_predict_config.resolved.json"
             binary_config.write_text(json.dumps(resolved, indent=2))
-        argv = [str(binary_path(build_type)), "timing-predict", "--dry-run", str(binary_config)]
+        report_path, error_path = scratch / "dry_run_report.json", scratch / ERROR_JSON
+        argv = [
+            str(binary_path(build_type)),
+            "timing-predict",
+            "--dry-run",
+            str(binary_config),
+            "--report-json",
+            str(report_path),
+            "--error-json",
+            str(error_path),
+        ]
         # The model build logs every cost tree at info; the report is the output.
         env = {"RUST_LOG": "warn", **_build_subprocess_env()}
         with _LAUNCHER_LEASES.profile_database(write=False):
@@ -535,15 +540,15 @@ def dry_run_one(config_path: Path, build_type: str) -> bool:
                     name="timing-predict-dry-run",
                 )
             )
-    print(result.output, end="" if result.output.endswith("\n") else "\n")
-    return result.succeeded
+        report = json.loads(report_path.read_text()) if result.succeeded else None
+        return result.output, report, binary_error(error_path)
 
 
 def main(argv: list[str]) -> int:
     build_type = "release"
-    analyze = True
+    analysis = "full"
+    render = True
     dry_run = False
-    register = False
     configs: list[str] = []
     it = iter(argv)
     for tok in it:
@@ -551,12 +556,17 @@ def main(argv: list[str]) -> int:
             build_type = next(it, "")
             if not build_type:
                 sys.exit("timing-predict: --build-type needs a value")
-        elif tok == "--no-analyze":
-            analyze = False
+        elif tok in ("--no-analyze", "--analyzer-essential-only"):
+            level = "none" if tok == "--no-analyze" else "essential"
+            if analysis not in ("full", level):
+                sys.exit(
+                    "timing-predict: --no-analyze and --analyzer-essential-only exclude each other"
+                )
+            analysis = level
+        elif tok == "--no-plot":
+            render = False
         elif tok == "--dry-run":
             dry_run = True
-        elif tok == "--register-kernel-configs":
-            register = True
         elif tok.startswith("-"):
             sys.exit(f"timing-predict: unknown flag {tok}")
         else:
@@ -569,9 +579,7 @@ def main(argv: list[str]) -> int:
         )
 
     # INV-8: the single shared build (also produces the analyzer binary).
-    if dry_run and register:
-        sys.exit("timing-predict: --dry-run and --register-kernel-configs are separate modes")
-    if not cargo_build(build_type, build_analyzer=analyze and not (dry_run or register)):
+    if not cargo_build(build_type, build_analyzer=analysis != "none" and not dry_run):
         sys.exit("build failed (see errors above)")
 
     rc = 0
@@ -585,14 +593,12 @@ def main(argv: list[str]) -> int:
             if dry_run:
                 print(f"[dry-run] {c}")
                 succeeded = dry_run_one(config_path, build_type)
-            elif register:
-                succeeded = register_one(config_path, build_type)
             else:
-                succeeded = asyncio.run(run_one(config_path, build_type, analyze))
+                succeeded = asyncio.run(run_one(config_path, build_type, analysis, render=render))
         except ValueError as exc:
-            # Only the dry run and registration report a config error this way;
-            # a real run's ValueError is raised after launch and keeps its traceback.
-            if not (dry_run or register):
+            # Only the dry run reports a config error this way; a real run's
+            # ValueError is raised after launch and keeps its traceback.
+            if not dry_run:
                 raise
             print(f"[invalid] {c}: {exc}", file=sys.stderr)
             rc = 2

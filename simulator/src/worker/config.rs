@@ -30,6 +30,35 @@ pub enum BatchPolicy {
 
 const BATCH_POLICY_CHOICES: [&str; 2] = ["mix", "separate-prefill-priority"];
 
+/// How a multi-partition worker places a fresh request on an attention DP
+/// partition. See [`crate::worker::admission::LoadBalance`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DpPlacement {
+    #[default]
+    RoundRobin,
+    VllmLeastLoaded,
+}
+
+const DP_PLACEMENT_CHOICES: [&str; 2] = ["round-robin", "vllm-least-loaded"];
+
+/// Where the chunked-prefill worker may end a hybrid (recurrent +
+/// full-attention) arch's non-final prefill chunk. A pure full-attention arch
+/// has no recurrent checkpoint and always chunks plainly.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PrefillChunkAlignment {
+    /// With prefix caching on, end every non-final chunk on the arch's
+    /// recurrent checkpoint interval, as vLLM's Mamba `align` cache mode does
+    /// (`Scheduler._mamba_block_aligned_split`).
+    #[default]
+    Checkpoint,
+    /// `min(remaining prompt, token budget)`: no checkpoint alignment.
+    Plain,
+}
+
+const PREFILL_CHUNK_ALIGNMENT_CHOICES: [&str; 2] = ["checkpoint", "plain"];
+
 /// KV-capacity rule paired with chunked prefill. `FullFootprint` preserves the
 /// historical no-retraction lifecycle. `BoundedFuture` uses an explicit
 /// future-token estimate and therefore requires decode retraction.
@@ -334,6 +363,20 @@ pub enum IterWorkerSel {
         /// every iteration.
         #[serde(default)]
         prefill_gpu_time_multiplier: Option<f64>,
+        /// How new requests are spread across the arch's attention DP
+        /// partitions when it has more than one (`num_attn_dp_groups`).
+        /// `round-robin` rotates blindly; `vllm-least-loaded` is vLLM's DP load
+        /// balancer (fewest waiting + running, waiting penalised under KV
+        /// pressure). Retained-prefix affinity overrides either.
+        #[serde(default)]
+        #[param(string, default = "round-robin", choices = DP_PLACEMENT_CHOICES)]
+        dp_placement: DpPlacement,
+        /// Hybrid archs only: `checkpoint` ends non-final prefill chunks on the
+        /// recurrent checkpoint interval (vLLM's Mamba `align` mode); `plain`
+        /// chunks as `min(remaining, budget)`, leaving that engine artifact out.
+        #[serde(default)]
+        #[param(string, default = "checkpoint", choices = PREFILL_CHUNK_ALIGNMENT_CHOICES)]
+        prefill_chunk_alignment: PrefillChunkAlignment,
     },
     /// Chunked prefill with a speculating decode engine: one verify pass per
     /// iteration submits `draft_tokens + 1` rows per resident decode and retires
@@ -380,6 +423,40 @@ pub enum IterWorkerSel {
         /// See [`IterWorkerSel::ChunkedPrefill`]'s field of the same name.
         #[serde(default)]
         prefill_gpu_time_multiplier: Option<f64>,
+    },
+    /// Pipeline-parallel stage worker for the `pp` deployment: stage 0 admits
+    /// requests and owns the pipeline's KV, later stages pull activations and
+    /// compute. vLLM V1 chunked prefill under pipeline parallelism: a prompt's
+    /// next chunk may be scheduled while its previous chunk is still on a later
+    /// stage, and at most one microbatch per stage is in flight. A running
+    /// request decodes one step at a time: its next step waits for the previous
+    /// step's microbatch to leave the last stage.
+    PipelineChunkedPrefill {
+        /// GPU memory for each stage (GB; primarily KV cache budget). Every stage
+        /// holds the same tokens, so the stage with the most KV bytes per token
+        /// sets the pipeline's token capacity.
+        #[param(default = 80.0)]
+        attn_gpu_memory_gb: f64,
+        /// Chunked-prefill cap: max tokens per microbatch.
+        max_batch_tokens: u32,
+        /// GPU wall/kernel time multiplier (≥ 1.0); models inter-kernel overhead
+        /// (see [`default_gpu_time_multiplier`]). cost_log stays pre-scale.
+        #[serde(default = "default_gpu_time_multiplier")]
+        #[param(default = 1.0)]
+        gpu_time_multiplier: f64,
+        /// Hybrid archs only: `checkpoint` ends non-final prefill chunks on the
+        /// recurrent checkpoint interval (vLLM's Mamba `align` mode); `plain`
+        /// chunks as `min(remaining, budget)`, leaving that engine artifact out.
+        #[serde(default)]
+        #[param(string, default = "checkpoint", choices = PREFILL_CHUNK_ALIGNMENT_CHOICES)]
+        prefill_chunk_alignment: PrefillChunkAlignment,
+        /// Cap each microbatch at `ceil(resident decodes / pp_size)` decodes so
+        /// running requests split across the in-flight microbatches. Off is
+        /// vLLM: every ready decode joins the next microbatch, so requests that
+        /// become ready together stay in one microbatch.
+        #[serde(default)]
+        #[param(default = false)]
+        balance_decode_microbatches: bool,
     },
     /// PD prefill half: prefills then hands off to a decode pool (no local decode).
     PdPrefill {

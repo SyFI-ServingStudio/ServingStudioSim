@@ -30,6 +30,20 @@ sends the buffer tails, closes the channel, and joins the writer, propagating it
 first error. Files are created **lazily** on the first non-empty write, so a
 stream that never produces a row leaves no file behind.
 
+`cost_log` chunks are cut by rows, but their `slot_input` JSON is not bounded by
+rows. Readers decode by row count too, so a `slot_input` column must stay small
+per row, not just per write: inputs that carry one value per query row (the
+sparse-index remap's span and valid-count vectors) serialize run-encoded
+(`timing/run_encoded.rs`), which took a 1M-context EP run from 1.5 MB to 12 KB
+per row. As a writer-side guard the writer still converts one chunk into as many
+record batches as keep each batch's `slot_input` under 1 GiB
+(`MAX_SLOT_INPUT_BYTES_PER_BATCH`).
+A `CostLogger` never stops the sim, but a failed writer deletes its partial
+parquet and leaves `cost_log/worker_<pool_tag>_<worker_id>.error`; `main` and
+timing-predict drop the workers, read those markers (`cost_log_failures`) and exit
+with an error, so a run can't succeed with an incomplete `cost_log`. Opening a
+stream first deletes the previous run's parquet and marker in that `log_dir`.
+
 ## Directory map
 
 Speculative iterations append nullable `groups.speculative_geometry` JSON with
@@ -89,10 +103,15 @@ observation copied at successful admission. A null hit means the request never
 reached prefix resolution; zero is a resolved cache miss. Consumers derive miss
 tokens as `declared - hit` and the hit rate from those two counts rather than
 depending on another redundant column. `fresh_prompt_tokens` separately records
-the immutable new suffix, while `prefill_processed` records work actually done.
+the immutable new suffix, while `prefill_processed` records work actually done;
+`target_output_tokens` is the output length the request asks for, and
+`num_output_tokens` what it produced.
 Once a request has produced its first output token, conservation therefore has
 the exact request-level invariant
 `prefix_cache_hit_tokens + prefill_processed = fresh_prompt_tokens + declared_prefix_tokens`.
+A pinned prefix (the independent format's `prefix_len` column) is declared and
+always hit: `declared_prefix_tokens = prefix_cache_hit_tokens = prefix_len`. It
+writes no `prefix_cache_event` row because it never enters the shared cache.
 
 The nullable `declared_ttft_slo_ms`, `declared_tpot_slo_ms`, and
 `declared_e2e_slo_ms` columns preserve the trace's per-request obligations.

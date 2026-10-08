@@ -16,6 +16,14 @@ from profiling.db.registry import (
 )
 
 KIND = "kv_compress_store"
+# Bytes of one fp8_ds_mla cache row, as this kind stores it and the gather,
+# insert and decode kinds read it: 448 fp8 values, 64 bf16 rope values and 8
+# scale bytes. Rust: timing/kernels/kv_compress_store.rs FP8_DS_MLA_ROW_BYTES.
+FP8_DS_MLA_ROW_BYTES = 448 + 64 * 2 + 8
+# Bytes of one fp8_indexer cache row, the 128-wide indexer head the Triton
+# backend stores on C4 layers: 128 fp8 values and one fp32 scale. Rust:
+# timing/kernels/kv_compress_store.rs FP8_INDEXER_ROW_BYTES.
+FP8_INDEXER_ROW_BYTES = 128 + 4
 
 
 @dataclass(frozen=True)
@@ -76,7 +84,8 @@ DOC = KernelDoc(
     ),
     caveats=(
         "state_width is 1024 for C4 with CuTe DSL and 512 otherwise; "
-        "cache_row_bytes is 584 for CuTe DSL and 132 for Triton.",
+        f"cache_row_bytes is {FP8_DS_MLA_ROW_BYTES} for CuTe DSL and "
+        f"{FP8_INDEXER_ROW_BYTES} for Triton.",
         "Partial states and the RoPE table are generated values, not model activations.",
     ),
     # The PyTorch correctness calculation is local to a measured runner.
@@ -96,10 +105,12 @@ register(
         args_schema=KvCompressStoreArgs,
         metric_family=MetricFamily.COMPUTE,
         batch_outlier_policy=BatchOutlierPolicy(),
+        # The kernel packs e4m3 with cvt.rn.satfinite.e4m3x2.f32, PTX that exists
+        # only on SM89+.
         supports=BackendSupport(
             compute=frozenset({DType.BF16, DType.FP32}),
             kv=frozenset({DType.FP8_E4M3}),
-            gpus=frozenset({"NVIDIA H200"}),
+            min_compute_capability=(8, 9),
         ),
         subprocess_env="vllm_env",
         doc=BackendDoc(
@@ -125,10 +136,12 @@ register(
         args_schema=KvCompressStoreArgs,
         metric_family=MetricFamily.COMPUTE,
         batch_outlier_policy=BatchOutlierPolicy(),
+        # compress_norm_rope_store_triton stores tl.float8e4nv, which Triton lowers
+        # only on SM89+.
         supports=BackendSupport(
             compute=frozenset({DType.BF16, DType.FP32}),
             kv=frozenset({DType.FP8_E4M3}),
-            gpus=frozenset({"NVIDIA H200"}),
+            min_compute_capability=(8, 9),
         ),
         subprocess_env="vllm_env",
         doc=BackendDoc(

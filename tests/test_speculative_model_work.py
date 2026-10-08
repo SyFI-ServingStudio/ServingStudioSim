@@ -28,7 +28,7 @@ def totals(*, depth=5, prefill=((0, 2),), decode=((106, 6), (2053, 6)), copies=1
     }
 
 
-def write_params(tmp_path, *, mode="index_share", depth=5):
+def write_params(tmp_path, *, mode="index_share", depth=5, arch=None):
     (tmp_path / "raw").mkdir()
     (tmp_path / "raw/params.json").write_text(
         json.dumps(
@@ -38,7 +38,8 @@ def write_params(tmp_path, *, mode="index_share", depth=5):
                         "groups": [
                             {
                                 "gpu": "NVIDIA B200",
-                                "arch": {
+                                "arch": arch
+                                or {
                                     "type": "glm52_vllm_nvfp4_dsa_moe_speculative",
                                     "model_config": str(CONFIG),
                                     "draft_tokens": depth,
@@ -133,3 +134,61 @@ def test_logged_depth_must_match_deployment(tmp_path):
     write_params(tmp_path, depth=3)
     result = floors.compute_floors(tmp_path, {"main": totals()})["main"]
     assert "draft depth disagrees" in result["error"]
+
+
+DFLASH2_ARCH = {
+    "type": "glm53_vllm_nvfp4_dsa_moe_dflash2",
+    "model_config": str(CONFIG),
+    "fp8": False,
+    "draft_tokens": 7,
+    "draft_sliding_window": 2048,
+}
+
+
+@pytest.mark.parametrize("phase", ["prefill", "decode", "mixed"])
+def test_dflash2_floor_handoff_and_exact_semantic_coverage(tmp_path, phase):
+    write_params(tmp_path, arch=DFLASH2_ARCH)
+    shape = totals(
+        depth=7,
+        prefill=() if phase == "decode" else ((0, 100),),
+        decode=() if phase == "prefill" else ((4104, 8),),
+    )
+    result = floors.compute_floors(tmp_path, {"main/0": shape})["main/0"]
+    assert "error" not in result, result
+    assert result["segmented"] >= result["necessary"] > 0
+    names = {s["name"] for s in result["segments"]}
+    assert not any(name.startswith("mtp") for name in names)
+    mapping = json.loads(
+        (ROOT / "model/work/location_maps/glm53_vllm_nvfp4_dsa_moe_dflash2.json").read_text()
+    )
+    assert mapping["arch_types"] == [DFLASH2_ARCH["type"]]
+    mapped = [s for row in mapping["locations"] for s in row["semantics"]]
+    assert len(mapped) == len(set(mapped))
+    assert set(mapped) == names
+    locked = floors.compute_locked_compositions(
+        tmp_path,
+        {"main/0": {"occurrences": [3], "totals": {k: [v] for k, v in shape.items()}}},
+    )["main/0"]
+    assert "error" not in locked, locked
+    assert locked["necessary"] == pytest.approx(3 * result["necessary"])
+    assert locked["segmented"] == pytest.approx(3 * result["segmented"])
+
+
+def test_dflash2_runs_one_block_pass_not_a_recurrence():
+    workload = aggregate_workload(
+        totals(depth=7, prefill=((0, 100),), decode=((4104, 8), (300, 8))), "dflash2"
+    )
+    assert set(workload.stages) == {"dflash2_context", "dflash2_draft", "dflash2_select"}
+    # Context: every target row. Draft: 8 query rows per request. Select: 7.
+    assert workload.stages["dflash2_context"].matmul_tokens == 116
+    assert workload.stages["dflash2_draft"].matmul_tokens == 3 * 8
+    assert workload.stages["dflash2_select"].head_positions == 3 * 7
+    blocks = sorted((i.num_query, i.num_cached_key) for i in workload.stages["dflash2_draft"].attn)
+    assert blocks == [(8, 100), (8, 300), (8, 4104)]
+
+
+def test_dflash2_geometry_needs_its_arch(tmp_path):
+    # The same geometry under a non-speculative arch is refused, not mislabeled.
+    write_params(tmp_path, arch={**DFLASH2_ARCH, "type": "glm52_vllm_nvfp4_dsa_moe"})
+    result = floors.compute_floors(tmp_path, {"main": totals(depth=7, decode=((4104, 8),))})
+    assert "requires a speculative architecture" in result["main"]["error"]

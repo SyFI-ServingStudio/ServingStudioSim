@@ -39,11 +39,13 @@ auto-skips what the host can't run. Use the `just` recipes (install: `cargo
 install just`) — they encode the env gotchas:
 
 ```bash
-just test-cpu     # Rust --lib + mocked pytest, xdist-parallel (~19 s). The default gate.
+just test-cpu     # Rust --lib beside mocked pytest, xdist-parallel (~20 s). The default gate.
                   #   `just test-cpu 4` on a smaller host.
+just test-presets # every public preset member built through the binary (~45 s);
+                  #   run after touching presets, public_api or the catalogs.
 just test-gpu     # gpu tier (throughput regression, cupti). Needs a CUDA device;
                   #   the launcher builds the binary + warms profile.db itself.
-just test-all     # cpu + gpu — the usual "did my refactor break anything".
+just test-all     # cpu + presets + gpu — the usual "did my refactor break anything".
 just test-bench   # opt-in: sim-speed median + Rust --ignored microbenches.
 just test-agent   # opt-in, expensive: Codex runner+judge skill cases.
 just update-golden # re-record per-GPU goldens after an INTENTIONAL cost change.
@@ -59,6 +61,8 @@ A stale `target/` bites here: `just test-cpu` builds the simulator lib, but a fe
 tests shell out to the `analyze` binary and use whatever is already built. After
 switching branches, `uv run cargo build -p analyzer --bin analyze` first, or a
 green tree can fail on artifacts the old binary wrote.
+The first `test-cpu` after a Rust change is slower than ~20 s: the `needs_binary`
+tests rebuild the release binary (about a minute here).
 
 After a refactor: `just test-all`. Modeled throughput is bit-identical run-to-run,
 so the throughput regression test **warns at ±1%** — if it warns, the refactor
