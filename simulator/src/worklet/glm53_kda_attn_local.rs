@@ -14,6 +14,10 @@
 //! ALL of its tokens, decodes included, through one `chunk_kda_with_fused_gate`
 //! call (`kda_chunk_prefill`, `D` = decode count) and one varlen conv; a
 //! decode-only iteration uses `causal_conv1d_update` and `fused_recurrent_kda`.
+//! A per-sequence short-conv prefill backend (`conv_prefill_per_sequence`)
+//! instead launches once per prefill sequence and runs the iteration's
+//! decode tokens through `causal_conv1d_update`, so its short conv is the sum of
+//! the `(1, L_i)` rows plus one decode launch.
 //! Only prefill-bearing iterations gather and scatter the fp32 SSM state.
 //!
 //! The prefill core's q/k/v `.contiguous()` copies and the FLA chain's
@@ -36,7 +40,10 @@ use crate::timing::kernels::{
     KdaRecurrentDecodeKernelConfig, KdaRecurrentDecodeKernelInput, SingleGemmKernel,
     SingleGemmKernelConfig, SingleGemmKernelInput,
 };
-use crate::timing::{BuildError, CostNode, CostTreeBuilder, Dim, Evaluator, PerfApiBridge};
+use crate::timing::{
+    BuildError, CostNode, CostTreeBuilder, Dim, Evaluator, GdnCausalConvPrefillLog, LeafMetrics,
+    PerfApiBridge,
+};
 
 use super::glm53_common::{atomic, elementwise, push_or_zero, repeated};
 
@@ -58,7 +65,14 @@ pub struct Glm53KdaAttnLocalWorkletConfig {
     pub activation_dtype: DType,
     pub gpu_name: String,
     pub bf16_gemm_backends: Vec<&'static str>,
-    pub conv_backends: Vec<&'static str>,
+    /// Short-conv prefill backends (`gdn_causal_conv_prefill`).
+    pub conv_prefill_backends: Vec<&'static str>,
+    /// The prefill backend launches once per sequence
+    /// (`gdn_causal_conv_prefill::launches_per_sequence`) rather than once over
+    /// every token of the iteration.
+    pub conv_prefill_per_sequence: bool,
+    /// Short-conv decode backends (`gdn_causal_conv_decode`).
+    pub conv_decode_backends: Vec<&'static str>,
     /// Recurrent-decode backends.
     pub core_backends: Vec<&'static str>,
     /// Chunked-prefill backends: the serving engine's KDA prefill kernel.
@@ -148,7 +162,7 @@ impl Glm53KdaAttnLocalWorklet {
             f_b: gemm(value_width.into(), cfg.gate_rank.into()),
             g_b: gemm(value_width.into(), cfg.gate_rank.into()),
             conv_prefill: GdnCausalConvPrefillKernelConfig {
-                backends: cfg.conv_backends.clone(),
+                backends: cfg.conv_prefill_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
                 channels: conv_channels.into(),
                 kernel_size: cfg.conv_kernel_size.clone(),
@@ -156,7 +170,7 @@ impl Glm53KdaAttnLocalWorklet {
                 state_dtype: cfg.activation_dtype,
             },
             conv_decode: GdnCausalConvDecodeKernelConfig {
-                backends: cfg.conv_backends.clone(),
+                backends: cfg.conv_decode_backends.clone(),
                 gpu_name: cfg.gpu_name.clone(),
                 channels: conv_channels.into(),
                 kernel_size: cfg.conv_kernel_size.clone(),
@@ -301,24 +315,29 @@ impl Glm53KdaAttnLocalWorklet {
             num_tokens: w.total_tokens,
         };
         let decode_only = !w.prefill_bearing;
+        let per_sequence = self.resolved.raw_cfg.conv_prefill_per_sequence;
         push_or_zero(&self.in_proj, rows.clone(), false, ev);
         push_or_zero(&self.f_b, rows.clone(), false, ev);
         push_or_zero(&self.g_b, rows.clone(), false, ev);
-        push_or_zero(
-            &self.conv_prefill,
-            GdnCausalConvPrefillKernelInput {
-                batch_size: 1,
-                sequence_length: w.total_tokens,
-            },
-            decode_only,
-            ev,
-        );
+        if per_sequence {
+            push_conv_per_sequence(&self.conv_prefill, &input.prefill_sequence_lengths, ev);
+        } else {
+            push_or_zero(
+                &self.conv_prefill,
+                GdnCausalConvPrefillKernelInput {
+                    batch_size: 1,
+                    sequence_length: w.total_tokens,
+                },
+                decode_only,
+                ev,
+            );
+        }
         push_or_zero(
             &self.conv_decode,
             GdnCausalConvDecodeKernelInput {
                 batch_size: input.decode_batch_size,
             },
-            w.prefill_bearing,
+            !decode_conv_runs(per_sequence, w.prefill_bearing, input.decode_batch_size),
             ev,
         );
         push_or_zero(&self.prefill_small_glue, tokens.clone(), decode_only, ev);
@@ -348,6 +367,43 @@ impl Glm53KdaAttnLocalWorklet {
         push_or_zero(&self.gated_norm, tokens, false, ev);
         push_or_zero(&self.o_proj, rows, false, ev);
     }
+}
+
+/// Whether the decode short conv launches: in a decode-only iteration, and in
+/// a mixed one only when the prefill backend launches per sequence, since
+/// vLLM's varlen prefill launch covers the decode tokens too.
+fn decode_conv_runs(per_sequence: bool, prefill_bearing: bool, decode_batch_size: u32) -> bool {
+    decode_batch_size > 0 && (per_sequence || !prefill_bearing)
+}
+
+/// One `(1, L_i)` launch per prefill sequence, summed into the one slot. No
+/// prefill sequence is zero work and skips the cache lookup.
+fn push_conv_per_sequence(
+    op: &Op<GdnCausalConvPrefillKernel>,
+    sequence_lengths: &[u32],
+    ev: &mut Evaluator,
+) {
+    let metrics = sum_per_sequence(sequence_lengths, |input| op.kernel.eval(input));
+    ev.push(metrics, || {
+        GdnCausalConvPrefillLog {
+            sequence_lengths: sequence_lengths.to_vec(),
+        }
+        .into()
+    });
+}
+
+fn sum_per_sequence(
+    sequence_lengths: &[u32],
+    mut eval: impl FnMut(&GdnCausalConvPrefillKernelInput) -> LeafMetrics,
+) -> LeafMetrics {
+    let mut metrics = LeafMetrics::ZERO;
+    for &sequence_length in sequence_lengths {
+        metrics.add_fanin(eval(&GdnCausalConvPrefillKernelInput {
+            batch_size: 1,
+            sequence_length,
+        }));
+    }
+    metrics
 }
 
 struct Work {
@@ -407,7 +463,9 @@ mod tests {
             activation_dtype: DType::Bf16,
             gpu_name: "NVIDIA B200".into(),
             bf16_gemm_backends: vec!["torch_linear_vllm"],
-            conv_backends: vec!["vllm_triton"],
+            conv_prefill_backends: vec!["vllm_triton"],
+            conv_prefill_per_sequence: false,
+            conv_decode_backends: vec!["vllm_triton"],
             core_backends: vec!["vllm_triton"],
             chunk_prefill_backends: vec!["vllm_triton"],
             chunk_prefill_takes_beta_logits: false,
@@ -421,6 +479,33 @@ mod tests {
         flashkda.chunk_prefill_takes_beta_logits = true;
         assert_eq!(prefill_small_glue_launches(&cfg()), 1);
         assert_eq!(prefill_small_glue_launches(&flashkda), 0);
+    }
+
+    #[test]
+    fn per_sequence_conv_sums_one_row_per_prefill_sequence() {
+        // A per-sequence backend priced as one (1, T) row would hide a launch
+        // per request; each length must reach the cache as its own B=1 row.
+        let mut seen = Vec::new();
+        let metrics = sum_per_sequence(&[3, 65, 2], |input| {
+            seen.push((input.batch_size, input.sequence_length));
+            let mut leaf = LeafMetrics::ZERO;
+            leaf.m.time_ms = input.sequence_length as f32;
+            leaf
+        });
+        assert_eq!(seen, [(1, 3), (1, 65), (1, 2)]);
+        assert_eq!(metrics.m.time_ms, 70.0);
+        assert_eq!(sum_per_sequence(&[], |_| unreachable!()).m.time_ms, 0.0);
+    }
+
+    #[test]
+    fn decode_tokens_leave_the_varlen_launch_only_for_a_per_sequence_backend() {
+        // vllm_triton: decodes ride in the one varlen prefill launch.
+        assert!(!decode_conv_runs(false, true, 29));
+        assert!(decode_conv_runs(false, false, 32));
+        // dao_channellast: a mixed iteration still runs causal_conv1d_update.
+        assert!(decode_conv_runs(true, true, 29));
+        assert!(decode_conv_runs(true, false, 32));
+        assert!(!decode_conv_runs(true, true, 0));
     }
 
     #[test]

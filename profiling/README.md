@@ -108,6 +108,21 @@ builds it from a pinned, hash-checked FlashInfer nightly. TIRx compiles its
 kernels with the CUDA 13 `nvcc` on `CUDA_PATH`/`PATH`; FlashInfer's JIT cache
 follows `FLASHINFER_WORKSPACE_BASE` (default `$HOME`).
 
+`causal_conv1d_env` serves the `gdn_causal_conv_prefill` `dao_channellast`
+backend. It runs the project interpreter with one extra import directory,
+`~/profile_envs/causal_conv1d` (a symlink to a disk with room is fine), that
+holds Dao-AILab `causal-conv1d` 1.7.0 from its prebuilt release wheel. The
+wheel is built against the project Torch (2.10, CUDA 12, cxx11 ABI) and ships
+SASS for sm_75 through sm_120, so it needs no venv or compiler. After a project
+Torch upgrade, install the wheel built for the new Torch instead:
+
+```bash
+uv pip install --python .venv/bin/python --no-deps --target ~/profile_envs/causal_conv1d \
+  https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.7.0/causal_conv1d-1.7.0+cu12torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl
+```
+
+Rows record `causal-conv1d <version>` as `backend_version`.
+
 `Timer.cupti`'s duration path is a two-pass GPU-active-time measurement. It
 first records 10 real callable launches, computes
 `ceil(min_duration_ms / estimate_mean_ms)`, then records exactly that many

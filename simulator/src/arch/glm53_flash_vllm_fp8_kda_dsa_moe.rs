@@ -76,6 +76,7 @@ use crate::op::Op;
 use crate::timing::bridge::DType;
 use crate::timing::expert_demand::ExpertDemand;
 use crate::timing::kernels::all_reduce_fusion::fused_all_reduce_refusal;
+use crate::timing::kernels::gdn_causal_conv_prefill::launches_per_sequence;
 use crate::timing::kernels::{
     AllReduceFusionKernel, AllReduceFusionKernelConfig, AllReduceFusionKernelInput,
     AllReduceFusionSpec, AllReduceKernel, AllReduceKernelConfig, AllReduceKernelInput,
@@ -122,7 +123,7 @@ const ELEMENTWISE_BACKENDS: &[&str] = &["triton"];
 pub(crate) const MHC_BACKENDS: &[&str] = &["vllm_tilelang"];
 const RMS_NORM_BACKENDS: &[&str] = &["vllm_cuda"];
 const KDA_BACKENDS: &[&str] = &["vllm_triton"];
-const CONV_BACKENDS: &[&str] = &["vllm_triton"];
+const CONV_DECODE_BACKENDS: &[&str] = &["vllm_triton"];
 const QKV_NORM_BACKENDS: &[&str] = &["vllm_triton"];
 const Q_ABSORB_BACKENDS: &[&str] = &["torch_mla_q_absorb_no_rope"];
 const V_UP_BACKENDS: &[&str] = &["torch_mla_v_up_unpadded"];
@@ -486,6 +487,8 @@ pub struct Glm53FlashKernelPath {
     pub indexer_topk_backend: &'static str,
     /// vLLM `VLLM_SPARSE_INDEXER_MAX_LOGITS_MB`.
     pub indexer_max_logits_mb: u32,
+    /// `gdn_causal_conv_prefill` backend of the KDA short conv.
+    pub causal_conv_backend: &'static str,
 }
 
 impl Glm53FlashKernelPath {
@@ -496,6 +499,13 @@ impl Glm53FlashKernelPath {
             self.kda_prefill_backend,
             "flashkda" | "flashinfer_cute_persistent"
         )
+    }
+
+    /// A per-sequence short-conv backend runs each prefill sequence as its own
+    /// launch and leaves the decode tokens to `causal_conv1d_update`; vLLM's
+    /// varlen call covers prefills and decodes in one launch.
+    pub fn causal_conv_launches_per_sequence(&self) -> bool {
+        launches_per_sequence(self.causal_conv_backend)
     }
 }
 
@@ -519,6 +529,7 @@ impl Default for Glm53FlashKernelPath {
             mhc_fused_backend: MHC_BACKENDS[0],
             indexer_topk_backend: "vllm_cuda",
             indexer_max_logits_mb: 512,
+            causal_conv_backend: "vllm_triton",
         }
     }
 }
@@ -738,7 +749,9 @@ pub fn build_configs(
             activation_dtype: ACTIVATION_DTYPE,
             gpu_name: gpu.clone(),
             bf16_gemm_backends: BF16_GEMM_BACKENDS.to_vec(),
-            conv_backends: CONV_BACKENDS.to_vec(),
+            conv_prefill_backends: vec![parallel.kernel_path.causal_conv_backend],
+            conv_prefill_per_sequence: parallel.kernel_path.causal_conv_launches_per_sequence(),
+            conv_decode_backends: CONV_DECODE_BACKENDS.to_vec(),
             core_backends: KDA_BACKENDS.to_vec(),
             chunk_prefill_backends: vec![parallel.kernel_path.kda_prefill_backend],
             chunk_prefill_takes_beta_logits: parallel.kernel_path.kda_prefill_takes_beta_logits(),
