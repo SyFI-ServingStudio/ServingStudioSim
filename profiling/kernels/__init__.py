@@ -70,6 +70,7 @@ from profiling.kernels import (
     moe_finalize_fuse_shared,  # noqa: F401
     moe_finalize_routing,  # noqa: F401
     moe_fused_topk,  # noqa: F401
+    moe_sink_gate_select,  # noqa: F401
     moe_sum,  # noqa: F401
     moe_topk_softplus_sqrt,  # noqa: F401
     mxfp4_marlin_moe_gemm,  # noqa: F401
