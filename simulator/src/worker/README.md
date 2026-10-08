@@ -337,10 +337,16 @@ model (`kv/shared/prefix_tiers.rs`). The admission owns them
 (`admission/prefix_fetch.rs`) and looks a session up when its request reaches the
 head of the queue, as vLLM's KV connector does at scheduling. If a tier holds
 more than HBM does, floored to HBM's hit quantum, the request leaves the queue
-while that tier's FIFO channel reads just the difference; when the read lands,
-the context goes back into HBM (`restore_prefix`) and the request returns to the
-front. A lookup at arrival would miss every context HBM evicts while the request
-queues. A shortest-prefill-first order ranks a request by what HBM or a tier
+while that tier's FIFO channel reads just the difference. As vLLM allocates an
+async load's blocks before it starts, the read starts only if the whole request
+fits in HBM (`KvStore::fits`), and holds that footprint (`PrefixKv::hold_for_read`)
+until admission; otherwise admission stops. A landed request waits in its
+partition's landed queue, which admission takes before the pending order (vLLM's
+skipped-waiting queue); there the context goes back into HBM (`restore_prefix`)
+and the hold turns into the request's reservation. A lookup at arrival would miss
+every context HBM evicts while the request queues. On the pipeline head,
+`prefix_tier_max_read_wait_ms` (not vLLM) starts a read only while its tier would
+begin it within that bound, so a long read queue does not sit on HBM. A shortest-prefill-first order ranks a request by what HBM or a tier
 holds. With `prefix_tier_warm_start`, a session request whose declared prefix
 exceeds every context the run stored for it is a pre-run conversation, read
 from the slowest tier (closed-loop traces that join sessions mid-life).

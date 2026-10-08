@@ -157,12 +157,8 @@ impl<P: PendingOrderPolicy, D> ChunkedPrefillAdmission<P, D> {
     /// Return the requests whose tier read has landed by `now` to the front
     /// of their partition's queue.
     fn land_prefix_reads<K: ChunkedPrefillKv>(&mut self, kv_store: &mut K, now: Time) {
-        let policies = &mut self.partition_policies;
         if let Some(fetch) = &mut self.prefix_fetch {
-            fetch.land(kv_store, now, |partition, candidate| {
-                let (policy, policy_context) = &mut policies[usize::from(partition)];
-                policy.push_front(candidate, policy_context);
-            });
+            fetch.land(kv_store, now);
         }
     }
 
@@ -602,23 +598,49 @@ where
             {
                 let (policy, policy_context) = &mut self.partition_policies[partition_index];
                 let fetch = &mut self.prefix_fetch;
-                policy.refresh_head(&mut |candidate| {
-                    let hbm = kv_store.resident_prefix_tokens(
-                        candidate.fresh_prompt_tokens,
-                        candidate.session_input,
-                    );
-                    fetch.as_ref().map_or(hbm, |fetch| {
-                        fetch.rank_tokens(partition, candidate.session_input, hbm)
-                    })
-                });
-                let Some(candidate) = policy.peek() else {
-                    break;
+                // Landed reads hold their blocks and go before the queue.
+                let landed = fetch
+                    .as_ref()
+                    .and_then(|fetch| fetch.peek_landed(partition));
+                let candidate = match landed {
+                    Some(candidate) => candidate,
+                    None => {
+                        policy.refresh_head(&mut |candidate| {
+                            let hbm = kv_store.resident_prefix_tokens(
+                                candidate.fresh_prompt_tokens,
+                                candidate.session_input,
+                            );
+                            fetch.as_ref().map_or(hbm, |fetch| {
+                                fetch.rank_tokens(partition, candidate.session_input, hbm)
+                            })
+                        });
+                        let Some(candidate) = policy.peek() else {
+                            break;
+                        };
+                        candidate
+                    }
                 };
-                if let Some(fetch) = fetch {
-                    if fetch.at_head(kv_store, partition, candidate, now) == AtHead::Read {
+                let take = |fetch: &mut Option<PrefixFetch>,
+                            policy: &mut P,
+                            policy_context: &mut P::Context| {
+                    if landed.is_some() {
+                        fetch
+                            .as_mut()
+                            .expect("a landed request implies prefix fetch")
+                            .pop_landed(partition);
+                    } else {
                         let popped = policy.pop(policy_context);
                         debug_assert_eq!(popped, Some(candidate));
-                        continue;
+                    }
+                };
+                if let Some(state) = fetch.as_mut() {
+                    match state.at_head(kv_store, partition, candidate, now) {
+                        AtHead::Admit => {}
+                        AtHead::Read => {
+                            take(fetch, policy, policy_context);
+                            continue;
+                        }
+                        AtHead::Blocked => break,
                     }
                 }
                 if candidate.remaining_output_tokens > 1
@@ -677,8 +699,7 @@ where
                 if !fits {
                     break;
                 }
-                let popped = policy.pop(policy_context);
-                debug_assert_eq!(popped, Some(candidate));
+                take(&mut self.prefix_fetch, policy, policy_context);
                 self.admission_order
                     .insert(candidate.request_id, self.next_admission);
                 self.next_admission += 1;

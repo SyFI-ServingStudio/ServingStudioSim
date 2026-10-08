@@ -27,7 +27,7 @@
 //! The tag is `w<worker>`, or `w<worker>_p<rank>` for a DP rank.
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -58,8 +58,8 @@ pub(crate) struct SessionPrefixTiers {
     tier_requests: Vec<u64>,
     warm_start_reads: u64,
     warm_start_tokens: u64,
-    /// Reads of a request whose earlier read had landed but was evicted again
-    /// before admission.
+    /// Reads of a request whose context an earlier read put back into HBM but
+    /// which was evicted before admission.
     rereads: u64,
 }
 
@@ -161,6 +161,10 @@ impl SessionPrefixTiers {
             self.warm_start_tokens += u64::from(hit.tokens);
         }
         self.tiers.load(session_id, hit, hbm_tokens, now)
+    }
+
+    fn queue_wait(&self, hit: PrefixTierHit, now: Time) -> Time {
+        self.tiers.queue_wait(hit.tier, now)
     }
 
     fn record_admission(&mut self, request: RequestId, session_id: u32, admission: Admitted) {
@@ -275,7 +279,6 @@ struct Admitted {
 struct Fetch {
     candidate: AdmissionCandidate,
     partition: u16,
-    session_id: u32,
     read: Read,
 }
 
@@ -286,19 +289,35 @@ pub(crate) enum AtHead {
     Admit,
     /// A read started: take it out of the queue until the read lands.
     Read,
+    /// A read is needed but the request does not fit in HBM beside what is
+    /// running and the other reads' holds (vLLM's waiting loop breaks when an
+    /// async load cannot allocate its blocks), or its tier's queue is past
+    /// the read-wait bound: stop admitting.
+    Blocked,
 }
 
 /// The tiers of every partition and the reads in flight.
 pub(crate) struct PrefixFetch {
     partitions: Vec<SessionPrefixTiers>,
     warm_start: bool,
+    /// Start a read only while its tier would begin it within this long.
+    max_read_wait: Option<Time>,
     /// Reads in flight, by landing time.
     reads: BinaryHeap<Reverse<(Time, RequestId)>>,
     /// Requests out of their queue while their read runs.
     reading: HashMap<RequestId, Fetch>,
-    /// Requests back in their queue whose read has landed. Their context goes
-    /// back into HBM each time they reach the head, until one is admitted.
+    /// Requests whose read has landed, still holding their HBM blocks. Each
+    /// partition admits them before its own queue, in landing order, as
+    /// vLLM's FCFS scheduler takes its skipped-waiting queue (loaded async
+    /// requests) first; the context goes into HBM when admission reaches them.
     landed: HashMap<RequestId, Fetch>,
+    landed_order: Vec<VecDeque<RequestId>>,
+    /// Landed requests whose context went back into HBM when admission
+    /// reached them, until admitted. One left unadmitted then re-checks HBM
+    /// at each later visit and is read again if its context was evicted.
+    restored: HashMap<RequestId, Fetch>,
+    /// Cancelled requests whose holds the next [`Self::land`] gives back.
+    cancelled: Vec<RequestId>,
 }
 
 impl PrefixFetch {
@@ -307,13 +326,28 @@ impl PrefixFetch {
             !partitions.is_empty(),
             "prefix fetch needs one tier set per partition"
         );
+        let landed_order = vec![VecDeque::new(); partitions.len()];
         Self {
             partitions,
             warm_start,
+            max_read_wait: None,
             reads: BinaryHeap::new(),
             reading: HashMap::new(),
             landed: HashMap::new(),
+            landed_order,
+            restored: HashMap::new(),
+            cancelled: Vec::new(),
         }
+    }
+
+    /// Start a read only while its tier would begin it within `ms`; past
+    /// that, the request at the head waits in its queue holding nothing. A
+    /// long queue of reads otherwise holds their HBM blocks for its whole
+    /// wait. 0 leaves reads unbounded, as vLLM does.
+    pub(crate) fn with_max_read_wait_ms(mut self, ms: f64) -> Self {
+        assert!(ms >= 0.0, "prefix_tier_max_read_wait_ms must be >= 0");
+        self.max_read_wait = (ms > 0.0).then(|| Time::from_ms(ms));
+        self
     }
 
     /// What a cache-aware order ranks the request by: the longer of HBM's
@@ -339,7 +373,8 @@ impl PrefixFetch {
 
     /// Decide what happens to the request at the head of `partition`'s queue:
     /// put a landed context back into HBM, or start a read when a tier holds
-    /// more than HBM.
+    /// more than HBM. A read starts only if the whole request fits, and holds
+    /// its footprint in HBM until it lands.
     pub(crate) fn at_head<K: PrefixKv>(
         &mut self,
         kv_store: &mut K,
@@ -355,6 +390,20 @@ impl PrefixFetch {
         else {
             return AtHead::Admit;
         };
+        if let Some(fetch) = self.landed.remove(&candidate.request_id) {
+            // Its blocks were held since the read started: the context fills
+            // them and the admission that follows takes them over.
+            kv_store.release_read_hold(candidate.request_id);
+            kv_store.restore_prefix(
+                candidate.request_id,
+                partition,
+                session_id,
+                u64::from(fetch.read.hit.tokens),
+                now,
+            );
+            self.restored.insert(candidate.request_id, fetch);
+            return AtHead::Admit;
+        }
         let hbm_tokens = kv_store
             .preview_prefill_context(
                 partition,
@@ -362,15 +411,11 @@ impl PrefixFetch {
                 candidate.session_input,
             )
             .resident_prefix_tokens();
-        let landed = self.landed.get(&candidate.request_id).copied();
-        if let Some(fetch) = landed {
-            if hbm_tokens >= fetch.read.hit.tokens {
-                return AtHead::Admit;
-            }
-            // Evicted again while it waited: count it, and read it again below.
-            self.partitions[usize::from(partition)].rereads += 1;
-            self.landed.remove(&candidate.request_id);
-        }
+        let reread = match self.restored.get(&candidate.request_id) {
+            Some(fetch) if hbm_tokens >= fetch.read.hit.tokens => return AtHead::Admit,
+            Some(_) => true,
+            None => false,
+        };
         let tiers = &mut self.partitions[usize::from(partition)];
         let Some((hit, seeded)) = tiers
             .lookup(session_id, declared_prefix_tokens, self.warm_start)
@@ -378,6 +423,34 @@ impl PrefixFetch {
         else {
             return AtHead::Admit;
         };
+        // The whole request must fit before its load starts; its blocks stay
+        // held until the read lands (the pinned fork reserves every block the
+        // request still needs, `_inflight_prefill_reserved_blocks`).
+        let post_prefill_context_tokens = kv_store
+            .preview_prefill_context(
+                partition,
+                candidate.fresh_prompt_tokens,
+                candidate.session_input,
+            )
+            .post_prefill_context_tokens();
+        let footprint = kv_store.footprint(
+            candidate.request_id,
+            post_prefill_context_tokens,
+            candidate.remaining_output_tokens,
+        );
+        if !kv_store.fits(partition, &footprint)
+            || self
+                .max_read_wait
+                .is_some_and(|max| tiers.queue_wait(hit, now) > max)
+        {
+            return AtHead::Blocked;
+        }
+        kv_store.hold_for_read(candidate.request_id, partition, &footprint, now);
+        if reread {
+            // Evicted after admission first reached it unadmitted.
+            tiers.rereads += 1;
+            self.restored.remove(&candidate.request_id);
+        }
         let ready = tiers.read(session_id, hit, seeded, hbm_tokens, now);
         self.reads.push(Reverse((ready, candidate.request_id)));
         self.reading.insert(
@@ -385,7 +458,6 @@ impl PrefixFetch {
             Fetch {
                 candidate,
                 partition,
-                session_id,
                 read: Read {
                     hit,
                     hbm_tokens,
@@ -397,15 +469,13 @@ impl PrefixFetch {
         AtHead::Read
     }
 
-    /// Land every read done by `now`: its context goes back into HBM, and its
-    /// request is handed back for the front of its queue. Returns the latest
+    /// Land every read done by `now`: its request, still holding its blocks,
+    /// waits for admission in its partition's landed queue. Returns the latest
     /// landing time, if any landed.
-    pub(crate) fn land<K: PrefixKv>(
-        &mut self,
-        kv_store: &mut K,
-        now: Time,
-        mut requeue: impl FnMut(u16, AdmissionCandidate),
-    ) -> Option<Time> {
+    pub(crate) fn land<K: PrefixKv>(&mut self, kv_store: &mut K, now: Time) -> Option<Time> {
+        for request in self.cancelled.drain(..) {
+            kv_store.release_read_hold(request);
+        }
         let mut latest = None;
         while let Some(&Reverse((ready, request))) = self.reads.peek() {
             if ready > now {
@@ -415,15 +485,8 @@ impl PrefixFetch {
             let Some(fetch) = self.reading.remove(&request) else {
                 continue;
             };
-            kv_store.restore_prefix(
-                request,
-                fetch.partition,
-                fetch.session_id,
-                u64::from(fetch.read.hit.tokens),
-                ready,
-            );
+            self.landed_order[usize::from(fetch.partition)].push_back(request);
             self.landed.insert(request, fetch);
-            requeue(fetch.partition, fetch.candidate);
             latest = Some(ready);
         }
         latest
@@ -447,7 +510,7 @@ impl PrefixFetch {
             return;
         };
         let read = self
-            .landed
+            .restored
             .remove(&candidate.request_id)
             .map(|fetch| fetch.read);
         self.partitions[usize::from(partition)].record_admission(
@@ -471,15 +534,41 @@ impl PrefixFetch {
         self.reads.peek().map(|Reverse((ready, _))| *ready)
     }
 
-    /// Requests out of their queue while a read runs.
-    pub(crate) fn reading(&self) -> u32 {
-        self.reading.len() as u32
+    /// The landed request `partition` admits next, ahead of its queue.
+    pub(crate) fn peek_landed(&self, partition: u16) -> Option<AdmissionCandidate> {
+        let request = self.landed_order[usize::from(partition)].front()?;
+        self.landed
+            .get(request)
+            .or_else(|| self.restored.get(request))
+            .map(|fetch| fetch.candidate)
     }
 
-    /// Forget a cancelled request; true if it was out of its queue reading.
+    /// Take the request [`Self::peek_landed`] returned out of the landed queue.
+    pub(crate) fn pop_landed(&mut self, partition: u16) {
+        self.landed_order[usize::from(partition)].pop_front();
+    }
+
+    /// Requests out of their queue for a read: reading, or landed and not yet
+    /// admitted.
+    pub(crate) fn reading(&self) -> u32 {
+        (self.reading.len() + self.landed_order.iter().map(VecDeque::len).sum::<usize>()) as u32
+    }
+
+    /// Forget a cancelled request; true if it was out of its queue for a read.
     pub(crate) fn cancel(&mut self, request: RequestId) -> bool {
-        self.landed.remove(&request);
-        self.reading.remove(&request).is_some()
+        let mut out_of_queue = false;
+        for order in &mut self.landed_order {
+            if let Some(at) = order.iter().position(|&landed| landed == request) {
+                order.remove(at);
+                out_of_queue = true;
+            }
+        }
+        self.restored.remove(&request);
+        if self.landed.remove(&request).is_some() || self.reading.remove(&request).is_some() {
+            self.cancelled.push(request);
+            out_of_queue = true;
+        }
+        out_of_queue
     }
 }
 
