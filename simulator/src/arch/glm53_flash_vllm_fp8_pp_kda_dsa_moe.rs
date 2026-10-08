@@ -1145,7 +1145,7 @@ mod tests {
             include_str!(
                 "../../../model/work/location_maps/glm53_flash_vllm_fp8_pp_kda_dsa_moe_pp.json"
             ),
-            116,
+            113,
         );
     }
 
@@ -1157,7 +1157,7 @@ mod tests {
             include_str!(
                 "../../../model/work/location_maps/glm53_flash_vllm_nvfp4_pp_kda_dsa_moe_pp.json"
             ),
-            112,
+            109,
         );
     }
 }
