@@ -46,11 +46,13 @@
 //! The locked R6/R7 floors are **stratified**, not exact. They used to label every
 //! iteration, which only looked affordable because equal shapes deduplicate — and
 //! they barely do: `decode_kv` is a running sum, so the 8h GLM-5.2 trace had 911,149
-//! distinct shapes across 978,623 iterations, one label per iteration. Every
-//! prefill-carrying iteration is still labeled (0.76% of iterations, 70.7% of the
-//! matmul-token mass, and all of the variance); the decode-only remainder is sampled
-//! to `FLOORS_TARGET_SAMPLED_ITERS` per worker and reweighted in integers so each
-//! worker's weights still sum to its exact iteration count. See
+//! distinct shapes across 978,623 iterations, one label per iteration. The
+//! prefill-carrying iterations are sampled by a hash of `iter_id` to
+//! `FLOORS_TARGET_SAMPLED_PREFILL_ITERS` per worker (a saturated PP stage is all
+//! prefill: 404,476 distinct shapes per stage on an 8 h run), the decode-only
+//! remainder by stride to `FLOORS_TARGET_SAMPLED_ITERS`, and each stratum is
+//! reweighted in integers so each worker's weights still sum to its exact
+//! iteration count. See
 //! `conservation::workload::collect_workload_shapes_by_worker`.
 //!
 //! ## Files
@@ -157,12 +159,18 @@ pub(crate) const TARGET_SAMPLED_ITERS: u64 = 80;
 /// Deliberately its own target, three orders of magnitude above
 /// `TARGET_SAMPLED_ITERS`: that one sizes a sample of per-location *rates*, which are
 /// near-constant across a run, whereas a workload *shape* drifts as context grows.
-/// Prefill-carrying iterations are not sampled at all (see
-/// `collect_workload_shapes_by_worker`); the labeler costs roughly 0.06 ms per
-/// distinct shape, so 50,000 keeps this stage at a few seconds against the ~49 s the
-/// rest of the subject takes. No upper clamp on the resulting stride: a longer run
-/// samples harder rather than labeling more.
+/// Prefill-carrying iterations have their own target,
+/// [`FLOORS_TARGET_SAMPLED_PREFILL_ITERS`]; the labeler costs roughly 0.06 ms per
+/// distinct decode shape, so 50,000 keeps this stage at a few seconds against the
+/// ~49 s the rest of the subject takes. No upper clamp on the resulting stride: a
+/// longer run samples harder rather than labeling more.
 pub(crate) const FLOORS_TARGET_SAMPLED_ITERS: u64 = 50_000;
+
+/// Prefill-carrying iterations kept per worker for the locked floors. A prefill
+/// shape costs the labeler far more than a decode one (a PP8 stage's 404,476
+/// shapes took ~143 s), and 10,000 hashed draws hold the floors' sampling error
+/// near 1% of the stratum's spread.
+pub(crate) const FLOORS_TARGET_SAMPLED_PREFILL_ITERS: u64 = 10_000;
 
 /// Top-N kernels drawn as individual bars at the kernel level; the rest fold into
 /// an `other` bar so the figure stays legible on a many-location deployment.

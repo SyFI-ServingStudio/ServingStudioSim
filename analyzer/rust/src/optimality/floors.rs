@@ -125,6 +125,8 @@ pub(super) struct RunLabels {
     /// Iterations actually labeled, before anchoring.
     pub(super) batch_locked_sampled_iterations: Option<u64>,
     pub(super) batch_locked_sample_stride: Option<u64>,
+    pub(super) batch_locked_prefill_iterations: Option<u64>,
+    pub(super) batch_locked_sampled_prefill_iterations: Option<u64>,
     pub(super) batch_locked_affine_bases: Option<u64>,
     pub(super) batch_locked_direct_fallback_bases: Option<u64>,
 }
@@ -199,6 +201,8 @@ pub(super) async fn compute_saturated_run_labels(
         batch_locked_iterations: None,
         batch_locked_sampled_iterations: None,
         batch_locked_sample_stride: None,
+        batch_locked_prefill_iterations: None,
+        batch_locked_sampled_prefill_iterations: None,
         batch_locked_affine_bases: None,
         batch_locked_direct_fallback_bases: None,
     })
@@ -209,18 +213,23 @@ pub(super) async fn compute_saturated_run_labels(
 /// no weights are amortized across separate batches. Worker floors then add into
 /// pool/cluster floors only when that whole scope is available.
 ///
-/// The shapes come stratified — every prefill-carrying iteration, plus a sampled
-/// slice of the decode-only ones, reweighted so the weights already sum to the
-/// worker's exact iteration count. See
+/// The shapes come stratified — a hashed sample of the prefill-carrying iterations
+/// and a strided slice of the decode-only ones, each reweighted so the weights
+/// already sum to the worker's exact iteration count. See
 /// [`collect_workload_shapes_by_worker`] for why a flat sample is the wrong shape of
 /// approximation here.
 pub(super) async fn compute_batch_locked_run_labels(
     ctx: &SessionContext,
     log_dir: &Path,
     target_sampled_decode_iterations: u64,
+    target_sampled_prefill_iterations: u64,
 ) -> Result<RunLabels> {
-    let samples_by_worker =
-        collect_workload_shapes_by_worker(ctx, target_sampled_decode_iterations).await?;
+    let samples_by_worker = collect_workload_shapes_by_worker(
+        ctx,
+        target_sampled_decode_iterations,
+        target_sampled_prefill_iterations,
+    )
+    .await?;
     let shapes_by_worker: HashMap<(String, u16), Vec<WeightedWorkload>> = samples_by_worker
         .iter()
         .map(|(worker_key, sample)| (worker_key.clone(), sample.shapes.clone()))
@@ -239,6 +248,14 @@ pub(super) async fn compute_batch_locked_run_labels(
     let batch_locked_labeled_iterations = samples_by_worker
         .values()
         .map(|sample| sample.labeled_iterations)
+        .sum();
+    let batch_locked_prefill_iterations = samples_by_worker
+        .values()
+        .map(|sample| sample.prefill_iterations)
+        .sum();
+    let batch_locked_sampled_prefill_iterations = samples_by_worker
+        .values()
+        .map(|sample| sample.sampled_prefill_iterations)
         .sum();
     let batch_locked_decode_stride = samples_by_worker
         .values()
@@ -306,6 +323,8 @@ pub(super) async fn compute_batch_locked_run_labels(
         batch_locked_iterations: Some(batch_locked_iterations),
         batch_locked_sampled_iterations: Some(batch_locked_labeled_iterations),
         batch_locked_sample_stride: Some(batch_locked_decode_stride),
+        batch_locked_prefill_iterations: Some(batch_locked_prefill_iterations),
+        batch_locked_sampled_prefill_iterations: Some(batch_locked_sampled_prefill_iterations),
         batch_locked_affine_bases: Some(returned_stats.affine_bases),
         batch_locked_direct_fallback_bases: Some(returned_stats.direct_fallback_bases),
     })
