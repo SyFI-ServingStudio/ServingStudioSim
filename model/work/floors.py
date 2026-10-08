@@ -127,6 +127,8 @@ _FP4_ARCHS = frozenset(
         "glm53_flash_vllm_nvfp4_kda_dsa_moe",
         "glm53_flash_vllm_nvfp4_pp_kda_dsa_moe",
         "glm53_flash_vllm_nvfp4_dp_attn_ep_moe",
+        # Inkling NVFP4 (routed experts only; layer 2's stay BF16).
+        "inkling_vllm_nvfp4_rel_attn_moe",
     }
 )
 
