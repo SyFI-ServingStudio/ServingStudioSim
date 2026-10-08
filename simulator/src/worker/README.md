@@ -312,13 +312,18 @@ Prefill fills each microbatch greedily up to `max_batch_tokens` by default
 max_batch_tokens)`: pending is started prompts' unscheduled tokens plus the
 policy's `queued_prompt_tokens()`, in-flight is the prefill of formed microbatches
 that have not exited. One prompt into an empty pipeline therefore runs as `depth`
-equal slices. `microbatch_split: plan` keeps a `MicrobatchSlotPlan` of the next
-`depth` microbatches and bin-packs whole requests into the least-loaded one that
-leaves room for all of it, splitting a request only at `max_batch_tokens`; under a
-backlog it fills from the earliest room, so every slot runs full as with greedy.
-A planned request is admitted (KV reserved) when first placed. Neither split
-holds a microbatch back, and `min_microbatch_tokens` is rejected unless the split
-is `even`.
+equal slices. The split never holds a microbatch back, and
+`min_microbatch_tokens` is rejected unless the split is `even`.
+
+Three knobs compose with either split. `long_prefill_token_threshold` caps any
+one request's chunk per microbatch, as vLLM's knob of that name does.
+`load_budget_low_tokens` (not vLLM) runs microbatches at that budget while the
+prefill backlog (queued, started and in-flight tokens) is at most
+`load_budget_backlog_lo_tokens`, rising linearly to `max_batch_tokens` at
+`load_budget_backlog_hi_tokens`; both bounds are required with the floor.
+`srpt` (not vLLM) orders prefill by remaining tokens across started and queued
+prompts instead of started first; pair it with `pending_order:
+shortest-prefill-first` so the queue offers its shortest prompt first.
 
 `PipelineStageWorker` has no KV/admission axes. It runs microbatches FIFO,
 double-buffering one activation pull against one compute, at exact times derived

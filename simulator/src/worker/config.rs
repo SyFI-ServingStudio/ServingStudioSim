@@ -69,42 +69,9 @@ pub enum MicrobatchSplit {
     /// Take one `pp_size`-th of the round: `clamp(ceil((pending + in-flight
     /// prefill tokens) / pp_size), min_microbatch_tokens, max_batch_tokens)`.
     Even,
-    /// Keep a plan of the next `pp_size` microbatches and bin-pack whole
-    /// requests into the least-loaded one; a request splits only at
-    /// `max_batch_tokens`.
-    Plan,
 }
 
-const MICROBATCH_SPLIT_CHOICES: [&str; 3] = ["greedy", "even", "plan"];
-
-/// When a pipeline head applies `long_prefill_token_threshold`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum LongPrefillCapMode {
-    /// Every microbatch (vLLM).
-    #[default]
-    Always,
-    /// Only while another prompt is waiting or prefilling.
-    Contended,
-    /// Only on a microbatch no fresh prompt joins: a started prompt that has
-    /// the pipeline to itself runs short chunks, so a prompt arriving next does
-    /// not trail a long chunk through every stage; with company it takes what
-    /// the fresh prompts leave.
-    Alone,
-    /// Fresh-first only: a started prompt may take as many tokens as the
-    /// fresh prompts in the microbatch, and at least the threshold. Alone it
-    /// runs threshold-sized chunks; behind a full microbatch of fresh work it
-    /// keeps pace with them.
-    Matched,
-    /// Even split only: the cap rises with the queue, to `max(threshold,
-    /// ceil(queued fresh prompt tokens / pp_size))`, read as each microbatch
-    /// begins forming. A prompt alone in the pipeline runs threshold-sized
-    /// chunks; a backlog lets it take a full share of each microbatch.
-    Backlog,
-}
-
-const LONG_PREFILL_CAP_MODE_CHOICES: [&str; 5] =
-    ["always", "contended", "alone", "matched", "backlog"];
+const MICROBATCH_SPLIT_CHOICES: [&str; 2] = ["greedy", "even"];
 
 /// Validated microbatch prefill sizing the pipeline-head recipe applies.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -114,7 +81,6 @@ pub enum MicrobatchSizing {
     Even {
         min_tokens: u32,
     },
-    Plan,
 }
 
 /// Lower the `microbatch_split` / `min_microbatch_tokens` selector pair. The
@@ -126,17 +92,13 @@ pub(crate) fn resolve_microbatch_sizing(
     max_batch_tokens: u32,
 ) -> Result<MicrobatchSizing> {
     match split {
-        MicrobatchSplit::Greedy | MicrobatchSplit::Plan => {
+        MicrobatchSplit::Greedy => {
             ensure!(
                 min_microbatch_tokens == 0,
                 "min_microbatch_tokens ({min_microbatch_tokens}) only applies with \
-                 microbatch_split: even; greedy and plan never split a request below \
-                 max_batch_tokens"
+                 microbatch_split: even; greedy takes every pending token it can"
             );
-            Ok(match split {
-                MicrobatchSplit::Plan => MicrobatchSizing::Plan,
-                _ => MicrobatchSizing::Greedy,
-            })
+            Ok(MicrobatchSizing::Greedy)
         }
         MicrobatchSplit::Even => {
             ensure!(
@@ -330,23 +292,6 @@ fn default_gpu_time_multiplier() -> f64 {
 /// serde fallback for the pipeline selector's `pending_order`: vLLM's FCFS.
 fn default_pipeline_pending_order() -> PendingOrderKind {
     PendingOrderKind::Fifo
-}
-
-/// serde fallbacks for the pipeline selector's load budget.
-fn default_load_budget_window_ms() -> f64 {
-    5000.0
-}
-fn default_load_budget_busy_lo() -> f64 {
-    0.5
-}
-fn default_load_budget_busy_hi() -> f64 {
-    0.9
-}
-/// serde fallback for the pipeline selector's `tail_ladder_overhead_tokens`:
-/// a stage's fixed cost in token-equivalents (GLM-5.3-Flash on B200 fits
-/// 8.5 ms + 8.6 us/token per PP4 stage, about 1000 tokens).
-fn default_tail_ladder_overhead_tokens() -> u32 {
-    1000
 }
 
 /// serde fallback for the speculative selector's `batch_policy`.
@@ -582,9 +527,7 @@ pub enum IterWorkerSel {
         /// `greedy` (vLLM) fills each microbatch's prefill up to
         /// `max_batch_tokens`; `even` sizes it to one `pp_size`-th of the
         /// pending plus in-flight prefill, so a backlog spreads over the
-        /// pipeline instead of one full microbatch followed by small ones;
-        /// `plan` bin-packs whole requests into the next `pp_size`
-        /// microbatches, least-loaded first.
+        /// pipeline instead of one full microbatch followed by small ones.
         #[serde(default)]
         #[param(string, default = "greedy", choices = MICROBATCH_SPLIT_CHOICES)]
         microbatch_split: MicrobatchSplit,
@@ -595,75 +538,33 @@ pub enum IterWorkerSel {
         min_microbatch_tokens: u32,
         /// vLLM's `long_prefill_token_threshold`: the most prefill tokens one
         /// request takes per microbatch (`0`: no cap, vLLM's default). Composes
-        /// with `greedy` and `even`; not valid with `plan` / `plan-split`.
+        /// with `greedy` and `even`.
         #[serde(default)]
         #[param(default = 0)]
         long_prefill_token_threshold: u32,
-        /// When `long_prefill_token_threshold` applies: `always` (vLLM),
-        /// `contended` (another prompt waits or prefills), `alone` (no fresh
-        /// prompt joins the microbatch), `matched` (fresh-first: the cap rises
-        /// to the microbatch's fresh tokens) or `backlog` (even split: the cap
-        /// rises with the queued fresh tokens over the depth).
-        #[serde(default)]
-        #[param(string, default = "always", choices = LONG_PREFILL_CAP_MODE_CHOICES)]
-        long_prefill_cap_mode: LongPrefillCapMode,
-        /// Apply `long_prefill_token_threshold` only to prompts with at least
-        /// this many fresh tokens (`0`: every prompt), so prompts below the tail
-        /// keep full-size chunks. Not vLLM.
-        #[serde(default)]
-        #[param(default = 0)]
-        long_prefill_cap_min_prompt_tokens: u32,
-        /// Fresh-first prefill order: queued prompts fill each microbatch before
-        /// started ones, which keep up to this many tokens each, then take what
-        /// is left. None is vLLM's started-first order. Greedy or even only.
-        #[serde(default)]
-        fresh_first_reserve_tokens: Option<u32>,
         /// Order in which queued fresh prompts are offered to the head. `fifo`
-        /// is vLLM; started prompts keep priority over fresh ones either way.
+        /// is vLLM; started prompts keep priority over fresh ones unless `srpt`.
         #[serde(default = "default_pipeline_pending_order")]
         #[param(string, default = "fifo", choices = PENDING_ORDER_CHOICES)]
         pending_order: PendingOrderKind,
         /// Load-following budget floor (`0`: off, vLLM's fixed budget). The
-        /// microbatch budget is this many tokens while stage 0 has idle time and
-        /// rises linearly to `max_batch_tokens` as stage 0's busy fraction over
-        /// `load_budget_window_ms` goes from `load_budget_busy_lo` to
-        /// `load_budget_busy_hi`. Greedy or even only. Not vLLM.
+        /// microbatch budget is this many tokens while the prefill backlog
+        /// (queued, started and in-flight tokens) is at most
+        /// `load_budget_backlog_lo_tokens`, rising linearly to
+        /// `max_batch_tokens` at `load_budget_backlog_hi_tokens`; both bounds
+        /// are required when the floor is set. Not vLLM.
         #[serde(default)]
         #[param(default = 0)]
         load_budget_low_tokens: u32,
-        #[serde(default = "default_load_budget_window_ms")]
-        #[param(default = 5000.0)]
-        load_budget_window_ms: f64,
-        #[serde(default = "default_load_budget_busy_lo")]
-        #[param(default = 0.5)]
-        load_budget_busy_lo: f64,
-        #[serde(default = "default_load_budget_busy_hi")]
-        #[param(default = 0.9)]
-        load_budget_busy_hi: f64,
-        /// Drive the load budget by the prefill backlog (queued, started and
-        /// in-flight tokens) instead: the floor up to this many tokens, rising
-        /// to `max_batch_tokens` at `load_budget_backlog_hi_tokens` (`0`: use
-        /// the busy fraction).
         #[serde(default)]
         #[param(default = 0)]
         load_budget_backlog_lo_tokens: u64,
         #[serde(default)]
         #[param(default = 0)]
         load_budget_backlog_hi_tokens: u64,
-        /// Tail ladder floor (`0`: off). Each prompt's last chunks shrink from
-        /// `max_batch_tokens` to this many tokens, each at most `(pp_size - 2) /
-        /// (pp_size - 1)` the stage time of the one before (stage time modeled
-        /// as `tail_ladder_overhead_tokens` + tokens), so its last chunk drains
-        /// the pipeline sooner. Greedy or even only. Not vLLM.
-        #[serde(default)]
-        #[param(default = 0)]
-        tail_ladder_min_tokens: u32,
-        #[serde(default = "default_tail_ladder_overhead_tokens")]
-        #[param(default = 1000)]
-        tail_ladder_overhead_tokens: u32,
         /// Shortest remaining prefill first across started and queued prompts
-        /// (queue order should be `shortest-prefill-first`). Overrides the
-        /// started-first / fresh-first order. Greedy or even only. Not vLLM.
+        /// (queue order should be `shortest-prefill-first`), instead of vLLM's
+        /// started-first order. Not vLLM.
         #[serde(default)]
         #[param(default = false)]
         srpt: bool,
@@ -821,11 +722,6 @@ mod tests {
             "{error}"
         );
         assert!(resolve_microbatch_sizing(MicrobatchSplit::Even, 8193, 8192).is_err());
-        assert!(resolve_microbatch_sizing(MicrobatchSplit::Plan, 1024, 8192).is_err());
-        assert_eq!(
-            resolve_microbatch_sizing(MicrobatchSplit::Plan, 0, 8192).unwrap(),
-            MicrobatchSizing::Plan
-        );
         assert_eq!(
             resolve_microbatch_sizing(MicrobatchSplit::Even, 1024, 8192).unwrap(),
             MicrobatchSizing::Even { min_tokens: 1024 }

@@ -127,7 +127,9 @@ One `stage` pool holds `replicas` pipelines of `depth` workers each; worker
 `r * depth + s` is stage `s` of replica `r`, built in that order so a replica's
 GPUs are contiguous. `PpStagePoolController`:
 
-- places arrivals on heads (least-queued or round-robin);
+- places arrivals on heads: least-queued, round-robin, or least-work-ahead (the
+  replica with the least outstanding prompt work, each prompt counted up to the
+  new one's size: the work that would run ahead of it under `srpt`);
 - routes `MicrobatchLaunched` / `StageDone` to the next stage of the same replica;
 - turns the last stage's `StageDone` into `MicrobatchExit` for the head;
 - repeats the sweep at one `now` until no worker emits an event, and makes every

@@ -9,7 +9,6 @@ mod chunked_prefill_admission;
 mod decode_completion;
 mod fresh_request_slot_admission;
 mod local_prefill_decode_admission;
-mod microbatch_slot_plan;
 mod pipelined_chunked_prefill_admission;
 mod placement;
 mod policy;

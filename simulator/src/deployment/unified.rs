@@ -199,12 +199,8 @@ impl Deployment for UnifiedDeployment {
         };
 
         ensure!(
-            !matches!(
-                pool.placement,
-                PlacementPolicy::LeastWork | PlacementPolicy::LeastWorkAhead
-            ),
-            "unified: placements least-work and least-work-ahead are implemented only for the pp \
-             deployment"
+            pool.placement != PlacementPolicy::LeastWorkAhead,
+            "unified: placement least-work-ahead is implemented only for the pp deployment"
         );
         let dp_cfg = SimpleDpConfig {
             dp_pool: SimpleDpPoolConfig {
@@ -1120,8 +1116,8 @@ fn placement_into(p: PlacementPolicy) -> DpPlacementPolicy {
     match p {
         PlacementPolicy::LeastQueued => DpPlacementPolicy::LeastQueued,
         PlacementPolicy::RoundRobin => DpPlacementPolicy::RoundRobin,
-        PlacementPolicy::LeastWork | PlacementPolicy::LeastWorkAhead => {
-            unreachable!("least-work is rejected before the pool is built")
+        PlacementPolicy::LeastWorkAhead => {
+            unreachable!("least-work-ahead is rejected before the pool is built")
         }
     }
 }
