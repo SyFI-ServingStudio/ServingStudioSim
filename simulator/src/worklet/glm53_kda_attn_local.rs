@@ -40,6 +40,9 @@ const STATE_TRANSFER_UNIT_BYTES: u32 = 4096;
 const PREFILL_COPY_LAUNCHES: u32 = 3;
 /// Prefill-bearing small launches: beta sigmoid, index scans, gate views.
 const PREFILL_SMALL_GLUE_LAUNCHES: u32 = 17;
+/// The beta sigmoid's share of them, gone when the prefill core takes raw
+/// beta logits.
+const PREFILL_BETA_SIGMOID_LAUNCHES: u32 = 1;
 const SMALL_GLUE_BYTES_PER_TOKEN: u32 = 64;
 
 #[derive(Clone, Debug)]
@@ -59,6 +62,9 @@ pub struct Glm53KdaAttnLocalWorkletConfig {
     pub core_backends: Vec<&'static str>,
     /// Chunked-prefill backends: the serving engine's KDA prefill kernel.
     pub chunk_prefill_backends: Vec<&'static str>,
+    /// The chunked-prefill core applies the beta sigmoid itself (FlashKDA),
+    /// so no separate sigmoid launch runs ahead of it.
+    pub chunk_prefill_takes_beta_logits: bool,
     pub elementwise_backends: Vec<&'static str>,
 }
 
@@ -282,7 +288,7 @@ impl Glm53KdaAttnLocalWorklet {
                 repeated(&self.prefill_copy, PREFILL_COPY_LAUNCHES, builder),
                 repeated(
                     &self.prefill_small_glue,
-                    PREFILL_SMALL_GLUE_LAUNCHES,
+                    prefill_small_glue_launches(cfg),
                     builder,
                 ),
                 self.state_gather.compile(builder),
@@ -391,6 +397,14 @@ fn derive_work(input: &Glm53KdaAttnLocalWorkletInput, state_bytes: u32) -> Resul
     })
 }
 
+fn prefill_small_glue_launches(cfg: &Glm53KdaAttnLocalWorkletConfig) -> u32 {
+    if cfg.chunk_prefill_takes_beta_logits {
+        PREFILL_SMALL_GLUE_LAUNCHES - PREFILL_BETA_SIGMOID_LAUNCHES
+    } else {
+        PREFILL_SMALL_GLUE_LAUNCHES
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -408,8 +422,17 @@ mod tests {
             conv_backends: vec!["vllm_triton"],
             core_backends: vec!["vllm_triton"],
             chunk_prefill_backends: vec!["vllm_triton"],
+            chunk_prefill_takes_beta_logits: false,
             elementwise_backends: vec!["triton"],
         }
+    }
+
+    #[test]
+    fn a_core_taking_beta_logits_drops_the_sigmoid_launch() {
+        let mut flashkda = cfg();
+        flashkda.chunk_prefill_takes_beta_logits = true;
+        assert_eq!(prefill_small_glue_launches(&cfg()), 17);
+        assert_eq!(prefill_small_glue_launches(&flashkda), 16);
     }
 
     #[test]
