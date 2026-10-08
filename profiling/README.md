@@ -99,6 +99,15 @@ CUDA_HOME=/usr/local/cuda-13.1 FLASH_KDA_CUDA_ARCHS=90a,100f,120f \
 
 The package version (`0.0.1+17a037d`) goes into each row's `backend_version`.
 
+`flashinfer_kda_env` is a host venv at `~/profile_envs/flashinfer_kda` (or a
+symlink to it) for the `kda_chunk_prefill` `flashinfer_*` backends. FlashInfer's
+Blackwell KDA prefill kernels are only on its main branch, and they need Torch
+cu130, CuTe DSL >= 4.7 and a CUDA-enabled TVM with TIRx, so neither the project
+venv nor `vllm_env` can host them. `profiling/exec/flashinfer_kda_env.sh [DIR]`
+builds it from a pinned, hash-checked FlashInfer nightly. TIRx compiles its
+kernels with the CUDA 13 `nvcc` on `CUDA_PATH`/`PATH`; FlashInfer's JIT cache
+follows `FLASHINFER_WORKSPACE_BASE` (default `$HOME`).
+
 `Timer.cupti`'s duration path is a two-pass GPU-active-time measurement. It
 first records 10 real callable launches, computes
 `ceil(min_duration_ms / estimate_mean_ms)`, then records exactly that many
