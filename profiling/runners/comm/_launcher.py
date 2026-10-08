@@ -184,6 +184,129 @@ class VllmLauncher(MultiGpuLauncher):
         return payload
 
 
+class VllmTpGroupLauncher(MultiGpuLauncher):
+    """Spawn ranks that initialize vLLM's own distributed state and TP group.
+
+    Production callables that look up ``vllm.distributed.get_tp_group()`` (and
+    use its ``GroupCoordinator`` for symmetric-memory rendezvous, barriers and
+    all-reduce) need the real parallel state, not a bare torch process group.
+    Each rank runs ``init_distributed_environment`` plus
+    ``initialize_model_parallel(tensor_model_parallel_size=num_gpus)`` under a
+    default ``VllmConfig``, then calls ``per_rank_fn(rank=, world_size=, **kwargs)``.
+    Only rank 0's return value is propagated; a failing rank's typed error is
+    forwarded like ``VllmLauncher``.
+    """
+
+    def __init__(
+        self,
+        num_gpus: int,
+        *,
+        master_addr: str = "127.0.0.1",
+        master_port: int | None = None,
+    ):
+        super().__init__(num_gpus)
+        self.master_addr = master_addr
+        self.master_port = master_port or _find_free_port()
+
+    def run(self, per_rank_fn: Callable[..., Any], **kwargs) -> Any:
+        try:
+            import torch.multiprocessing as mp
+        except ImportError as exc:
+            raise ProfilerNotImplemented("torch.multiprocessing is unavailable") from exc
+
+        context = mp.get_context("spawn")
+        result_queue = context.SimpleQueue()
+        try:
+            mp.spawn(
+                _vllm_tp_group_entry,
+                args=(
+                    self.num_gpus,
+                    self.master_addr,
+                    self.master_port,
+                    per_rank_fn,
+                    kwargs,
+                    result_queue,
+                ),
+                nprocs=self.num_gpus,
+                join=True,
+            )
+        except Exception as exc:
+            if not result_queue.empty():
+                ok, error_kind, payload = result_queue.get()
+                if not ok:
+                    _raise_remote_error(error_kind, payload)
+            raise KernelLaunchFailed(str(exc)) from exc
+
+        if result_queue.empty():
+            raise KernelLaunchFailed("vLLM TP rank group returned no result")
+        ok, error_kind, payload = result_queue.get()
+        if not ok:
+            _raise_remote_error(error_kind, payload)
+        return payload
+
+
+def _vllm_tp_group_entry(
+    rank: int,
+    world_size: int,
+    master_addr: str,
+    master_port: int,
+    per_rank_fn: Callable[..., Any],
+    fn_kwargs: dict[str, Any],
+    result_queue,
+) -> None:
+    os.environ.update(
+        {
+            "MASTER_ADDR": master_addr,
+            "MASTER_PORT": str(master_port),
+            "RANK": str(rank),
+            "WORLD_SIZE": str(world_size),
+            "LOCAL_RANK": str(rank),
+        }
+    )
+    initialized = False
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            raise ProfilerNotImplemented("CUDA is required for the vLLM TP group")
+        torch.cuda.set_device(rank)
+        from vllm.config import VllmConfig, set_current_vllm_config
+        from vllm.distributed.parallel_state import (
+            init_distributed_environment,
+            initialize_model_parallel,
+        )
+
+        with set_current_vllm_config(VllmConfig()):
+            init_distributed_environment(
+                world_size=world_size,
+                rank=rank,
+                distributed_init_method=f"tcp://{master_addr}:{master_port}",
+                local_rank=rank,
+                backend="nccl",
+            )
+            initialized = True
+            initialize_model_parallel(tensor_model_parallel_size=world_size)
+            result = per_rank_fn(rank=rank, world_size=world_size, **fn_kwargs)
+    except Exception as exc:
+        error_kind = "OOMError" if type(exc).__name__ == "OutOfMemoryError" else type(exc).__name__
+        result_queue.put((False, error_kind, str(exc)))
+        raise
+    finally:
+        if initialized:
+            try:
+                from vllm.distributed.parallel_state import (
+                    destroy_distributed_environment,
+                    destroy_model_parallel,
+                )
+
+                destroy_model_parallel()
+                destroy_distributed_environment()
+            except Exception:
+                pass
+    if rank == 0:
+        result_queue.put((True, "", result))
+
+
 def _torch_mp_entry(
     rank: int,
     world_size: int,

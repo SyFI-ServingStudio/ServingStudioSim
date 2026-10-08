@@ -81,6 +81,7 @@ from profiling.kernels import (
     qnorm_rope_kv_insert,  # noqa: F401
     residual_rms_norm,  # noqa: F401
     rms_norm,  # noqa: F401
+    rs_sconv_ag_residual_rms_norm,  # noqa: F401
     single_gemm,  # noqa: F401
     vllm_fused_moe,  # noqa: F401
     vllm_mla_rope,  # noqa: F401
