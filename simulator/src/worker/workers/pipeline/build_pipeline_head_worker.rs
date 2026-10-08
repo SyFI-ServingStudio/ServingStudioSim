@@ -103,8 +103,10 @@ pub(crate) fn build_pipeline_head_worker<M: IterwiseUnifiedModel>(
     }
     let has_tiers = prefix_tiers.is_some();
     if let Some(tiers) = prefix_tiers {
-        admission = admission
-            .with_prefix_fetch(PrefixFetch::new(vec![tiers], config.prefix_tier_warm_start));
+        admission = admission.with_prefix_fetch(
+            PrefixFetch::new(vec![tiers], config.prefix_tier_warm_start)
+                .with_max_read_wait_ms(config.prefix_tier_max_read_wait_ms),
+        );
     }
 
     with_head_options(
@@ -284,8 +286,10 @@ pub(crate) fn build_hybrid_pipeline_head_worker<M: IterwiseUnifiedModel>(
     }
     let has_tiers = prefix_tiers.is_some();
     if let Some(tiers) = prefix_tiers {
-        admission = admission
-            .with_prefix_fetch(PrefixFetch::new(vec![tiers], config.prefix_tier_warm_start));
+        admission = admission.with_prefix_fetch(
+            PrefixFetch::new(vec![tiers], config.prefix_tier_warm_start)
+                .with_max_read_wait_ms(config.prefix_tier_max_read_wait_ms),
+        );
     }
 
     with_head_options(

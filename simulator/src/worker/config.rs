@@ -673,6 +673,13 @@ pub enum IterWorkerSel {
         #[serde(default)]
         #[param(default = false)]
         prefix_tier_warm_start: bool,
+        /// With a tier: start a read only while its tier would begin it within
+        /// this many ms; past that, admission stops and the request waits in
+        /// its queue holding no HBM. Bounds what in-flight reads hold. 0: no
+        /// bound (vLLM). Not vLLM.
+        #[serde(default)]
+        #[param(default = 0.0)]
+        prefix_tier_max_read_wait_ms: f64,
         #[serde(default)]
         #[param(default = false)]
         external_decode: bool,

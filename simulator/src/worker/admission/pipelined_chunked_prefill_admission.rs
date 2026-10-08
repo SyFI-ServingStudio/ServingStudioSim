@@ -309,22 +309,37 @@ impl<P: PendingOrderPolicy> PipelinedChunkedPrefillAdmission<P> {
     ) -> u32 {
         let mut remaining_budget = budget;
         while remaining_budget > 0 {
-            let fetch = &self.prefix_fetch;
-            self.policy.refresh_head(&mut |candidate| {
-                let hbm = kv_store
-                    .resident_prefix_tokens(candidate.fresh_prompt_tokens, candidate.session_input);
-                fetch.as_ref().map_or(hbm, |fetch| {
-                    fetch.rank_tokens(PARTITION, candidate.session_input, hbm)
-                })
-            });
-            let Some(candidate) = self.policy.peek() else {
-                break;
+            let landed = self
+                .prefix_fetch
+                .as_ref()
+                .and_then(|fetch| fetch.peek_landed(PARTITION));
+            let candidate = match landed {
+                Some(candidate) => candidate,
+                None => {
+                    let fetch = &self.prefix_fetch;
+                    self.policy.refresh_head(&mut |candidate| {
+                        let hbm = kv_store.resident_prefix_tokens(
+                            candidate.fresh_prompt_tokens,
+                            candidate.session_input,
+                        );
+                        fetch.as_ref().map_or(hbm, |fetch| {
+                            fetch.rank_tokens(PARTITION, candidate.session_input, hbm)
+                        })
+                    });
+                    let Some(candidate) = self.policy.peek() else {
+                        break;
+                    };
+                    candidate
+                }
             };
             if let Some(fetch) = &mut self.prefix_fetch {
-                if fetch.at_head(kv_store, PARTITION, candidate, now) == AtHead::Read {
-                    let popped = self.policy.pop(&mut self.policy_context);
-                    debug_assert_eq!(popped, Some(candidate));
-                    continue;
+                match fetch.at_head(kv_store, PARTITION, candidate, now) {
+                    AtHead::Admit => {}
+                    AtHead::Read => {
+                        self.take_candidate(landed.is_some(), candidate);
+                        continue;
+                    }
+                    AtHead::Blocked => break,
                 }
             }
             let resolved_prefill = kv_store.preview_prefill_context(
@@ -355,8 +370,7 @@ impl<P: PendingOrderPolicy> PipelinedChunkedPrefillAdmission<P> {
             if !kv_store.fits(PARTITION, &footprint) {
                 break;
             }
-            let popped = self.policy.pop(&mut self.policy_context);
-            debug_assert_eq!(popped, Some(candidate));
+            self.take_candidate(landed.is_some(), candidate);
             kv_store.reserve_chunked_prefill_context(
                 candidate.request_id,
                 PARTITION,
@@ -386,6 +400,20 @@ impl<P: PendingOrderPolicy> PipelinedChunkedPrefillAdmission<P> {
             }
         }
         budget - remaining_budget
+    }
+
+    /// Take `candidate` out of the landed queue or the pending order, wherever
+    /// [`Self::admit_fresh_prompts`] found it.
+    fn take_candidate(&mut self, landed: bool, candidate: AdmissionCandidate) {
+        if landed {
+            self.prefix_fetch
+                .as_mut()
+                .expect("a landed request implies prefix fetch")
+                .pop_landed(PARTITION);
+        } else {
+            let popped = self.policy.pop(&mut self.policy_context);
+            debug_assert_eq!(popped, Some(candidate));
+        }
     }
 
     /// Fill `budget` shortest remaining prefill first: before each started
@@ -647,12 +675,7 @@ where
     }
 
     fn land_prefix_reads(&mut self, kv_store: &mut K, now: Time) -> Option<Time> {
-        let (policy, policy_context) = (&mut self.policy, &mut self.policy_context);
-        self.prefix_fetch
-            .as_mut()?
-            .land(kv_store, now, |_, candidate| {
-                policy.push_front(candidate, policy_context)
-            })
+        self.prefix_fetch.as_mut()?.land(kv_store, now)
     }
 
     fn next_prefix_read(&self) -> Option<Time> {

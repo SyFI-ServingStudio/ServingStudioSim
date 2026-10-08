@@ -1406,6 +1406,151 @@ mod tests {
     }
 
     #[test]
+    fn a_read_waits_until_its_request_fits_in_hbm_and_holds_it() {
+        // HBM holds 120 tokens. A 60-token prompt runs while session 7 (70
+        // pre-run tokens in the tier, 4 fresh) reaches the head with budget
+        // left: its 74 tokens do not fit beside the prompt, so its read starts
+        // only once the prompt leaves, as vLLM allocates an async load's
+        // blocks before starting it.
+        let store = shared_with(&[(0, 60, 1), (1, 4, 1)]);
+        as_session(&store, 0, 8, 0, 0.0);
+        as_session(&store, 1, 7, 70, 0.0);
+        let mut worker = tiered_head_with(Rc::clone(&store), false, true);
+        let mut events = Vec::new();
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(1)));
+        run_until(&mut worker, Time::ZERO, Time::from_ms(60.0), &mut events);
+        assert_eq!(completed(&events), vec![RequestId(0), RequestId(1)]);
+        assert_eq!(
+            store.borrow()[RequestId(1)]
+                .telemetry
+                .prefix_cache_hit_tokens,
+            Some(70)
+        );
+        // The prompt's microbatch leaves 1 ms after launch; the 70-token read
+        // (1.4 ms) starts then, and session 7 launches once it lands.
+        let launches = launched(&events);
+        assert_eq!(launches.len(), 2, "{launches:?}");
+        assert!(
+            launches[1].2 >= launches[0].2 + Time::from_ms(2.4),
+            "{launches:?}"
+        );
+    }
+
+    #[test]
+    fn a_landed_read_is_admitted_before_a_queue_head_that_cannot_start_its_read() {
+        // Shortest prefill first, 120 tokens of HBM. Session 7 (40 pre-run
+        // tokens, 4 fresh) starts its read and holds 45 tokens. Session 9 (80
+        // pre-run, 2 fresh) then ranks first but cannot start its read beside
+        // that hold. Session 7's landed read goes first, as vLLM schedules
+        // loaded requests before its waiting queue; otherwise neither moves.
+        let store = shared_with(&[(0, 4, 1), (1, 2, 1)]);
+        as_session(&store, 0, 7, 40, 0.0);
+        as_session(&store, 1, 9, 80, 0.1);
+        let mut worker = head_with(
+            Rc::clone(&store),
+            WorkerConfig {
+                pending_order: crate::worker::admission::PendingOrderKind::ShortestPrefillFirst,
+                prefix_tier_warm_start: true,
+                max_batch_tokens: Some(64),
+                attn_kv_bytes: 240,
+                prefix_tiers: [
+                    Some(crate::worker::kv::PrefixTierSpec {
+                        name: "dram",
+                        capacity_gb_per_gpu: 1e-6,
+                        read_gb_per_s_per_gpu: 1e-4,
+                    }),
+                    None,
+                ],
+                ..WorkerConfig::default()
+            },
+        );
+        let mut events = Vec::new();
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
+        run_until(&mut worker, Time::ZERO, Time::from_ms(0.1), &mut events);
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(1)));
+        run_until(
+            &mut worker,
+            Time::from_ms(0.1),
+            Time::from_ms(60.0),
+            &mut events,
+        );
+        assert_eq!(completed(&events), vec![RequestId(0), RequestId(1)]);
+        for (request, hit) in [(0, 40), (1, 80)] {
+            assert_eq!(
+                store.borrow()[RequestId(request)]
+                    .telemetry
+                    .prefix_cache_hit_tokens,
+                Some(hit)
+            );
+        }
+    }
+
+    #[test]
+    fn a_read_waits_in_its_queue_while_its_tier_is_past_the_read_wait_bound() {
+        // Session 7's 40-token read keeps the DRAM channel busy until 0.8 ms.
+        // Session 9 (20 pre-run tokens) reaches the head at 0.1 ms: unbounded,
+        // its read queues behind (and holds HBM); with a 0.5 ms bound it waits
+        // in its queue until the channel drains. Both land the same: the
+        // channel is FIFO.
+        for (bound_ms, reading_at_0_2) in [(0.0, 2), (0.5, 1)] {
+            let store = shared_with(&[(0, 4, 1), (1, 2, 1)]);
+            as_session(&store, 0, 7, 40, 0.0);
+            as_session(&store, 1, 9, 20, 0.1);
+            let mut worker = head_with(
+                Rc::clone(&store),
+                WorkerConfig {
+                    prefix_tier_warm_start: true,
+                    prefix_tier_max_read_wait_ms: bound_ms,
+                    max_batch_tokens: Some(64),
+                    attn_kv_bytes: 240,
+                    prefix_tiers: [
+                        Some(crate::worker::kv::PrefixTierSpec {
+                            name: "dram",
+                            capacity_gb_per_gpu: 1e-6,
+                            read_gb_per_s_per_gpu: 1e-4,
+                        }),
+                        None,
+                    ],
+                    ..WorkerConfig::default()
+                },
+            );
+            let reading = |worker: &PipelineHead<FakeModel>| {
+                crate::worker::admission::MicrobatchAdmission::<crate::worker::kv::FullAttnKv>::reading_requests(
+                    &worker.admission,
+                )
+            };
+            let mut events = Vec::new();
+            worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
+            run_until(&mut worker, Time::ZERO, Time::from_ms(0.1), &mut events);
+            worker.enqueue(PipelineHeadMsg::Request(RequestId(1)));
+            run_until(
+                &mut worker,
+                Time::from_ms(0.1),
+                Time::from_ms(0.2),
+                &mut events,
+            );
+            assert_eq!(reading(&worker), reading_at_0_2, "bound {bound_ms}");
+            run_until(
+                &mut worker,
+                Time::from_ms(0.2),
+                Time::from_ms(60.0),
+                &mut events,
+            );
+            assert_eq!(completed(&events), vec![RequestId(0), RequestId(1)]);
+            for (request, hit) in [(0, 40), (1, 20)] {
+                assert_eq!(
+                    store.borrow()[RequestId(request)]
+                        .telemetry
+                        .prefix_cache_hit_tokens,
+                    Some(hit),
+                    "bound {bound_ms}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn warm_start_reads_a_pre_run_context_from_the_slowest_tier() {
         // A session's first request in the run declares 40 tokens: with warm
         // start they come from the tier (0.8 ms), without it they are computed.

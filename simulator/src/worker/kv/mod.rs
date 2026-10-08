@@ -206,6 +206,21 @@ pub trait PrefixKv: KvStore {
         now: Time,
     );
 
+    /// Hold `footprint` for a request whose prefix a slower tier is reading
+    /// back. vLLM allocates an async load's blocks when the load starts and
+    /// keeps them for the whole transfer, so a read in flight counts against
+    /// [`KvStore::fits`] and pushes retained prefixes out like a reservation.
+    fn hold_for_read(
+        &mut self,
+        request: RequestId,
+        partition: PartitionId,
+        footprint: &Self::Footprint,
+        now: Time,
+    );
+
+    /// Drop a read's hold, if it has one.
+    fn release_read_hold(&mut self, request: RequestId);
+
     /// How much of `session_input`'s declared prefix is resident *right now*,
     /// wherever it lives. This is what a cache-aware pending order ranks by;
     /// `declared_prefix_tokens` is only its upper bound. A session with no

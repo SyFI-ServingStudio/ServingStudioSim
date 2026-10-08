@@ -209,6 +209,11 @@ impl PrefixTiers {
         ready
     }
 
+    /// How long a read queued on `tier` now would wait for its channel.
+    pub(crate) fn queue_wait(&self, tier: usize, now: Time) -> Time {
+        Time(self.tiers[tier].channel_free.0.saturating_sub(now.0))
+    }
+
     /// Put a context that predates the run into the slowest tier only, where
     /// a long-lived session's context would have settled.
     pub(crate) fn seed(&mut self, session_id: u32, tokens: u64) {
