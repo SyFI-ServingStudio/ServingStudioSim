@@ -69,6 +69,7 @@
 //! - `grid_peaks.rs` — the R3 grid-peak ceiling sidecar.
 //! - `spec.rs` — the R5 GPU-spec compute/bandwidth ceilings.
 
+mod compute_dtype;
 mod floors;
 mod fold;
 mod grid_peaks;

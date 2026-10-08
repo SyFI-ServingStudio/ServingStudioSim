@@ -9,6 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
 use datafusion::prelude::SessionContext;
@@ -26,6 +27,7 @@ use crate::trace::manifest::{
     node_time, BalancedFold, FlatCostNode, Manifest, ManifestDoc, ManifestSection,
 };
 
+use super::compute_dtype::ComputeDtypeFields;
 use super::floors::{self, SemanticWork};
 use super::pipeline;
 use super::spec::{load_gpu_spec, GpuSpec};
@@ -117,6 +119,7 @@ struct HardwareRef {
     requested_name: String,
     canonical_name: String,
     spec: GpuSpec,
+    compute_dtypes: Arc<ComputeDtypeFields>,
 }
 
 #[derive(Clone, Debug)]
@@ -786,6 +789,7 @@ fn load_hardware_inputs(log_dir: &Path, selection: &Selection) -> HardwareInputs
         .collect::<HashMap<_, _>>();
     let mut defaulted_gpu_count = false;
     let root = repo_root().ok();
+    let compute_dtypes = ComputeDtypeFields::for_repo(root.as_deref());
     let mut by_worker = HashMap::new();
     for occurrence in &selection.occurrences {
         let gpu_name = params
@@ -803,6 +807,7 @@ fn load_hardware_inputs(log_dir: &Path, selection: &Selection) -> HardwareInputs
                     requested_name: gpu_name.clone(),
                     canonical_name,
                     spec,
+                    compute_dtypes: compute_dtypes.clone(),
                 })
             }
         });
@@ -1009,7 +1014,11 @@ fn compute_row_rungs(
     let mut leaf_r5_ms = vec![0.0; manifest.slots.len()];
     for slot in leaf_slots {
         let leaf = &manifest.slots[slot];
-        let peak_tflops = hardware.spec.peak_tflops(leaf_dtype(&leaf.kernel_config));
+        let peak_tflops = hardware.spec.peak_tflops(
+            hardware
+                .compute_dtypes
+                .dtype(&leaf.kind, &leaf.kernel_config),
+        );
         let bandwidth_gbps = hardware.spec.mem_bandwidth_gbps;
         if peak_tflops <= 0.0 || bandwidth_gbps <= 0.0 {
             return Ok(RowRungs {
@@ -1053,13 +1062,6 @@ fn selected_leaf_slots(manifest: &Manifest, node_idx: usize) -> Vec<usize> {
     let mut slots = Vec::new();
     collect(manifest, node_idx, &mut slots);
     slots
-}
-
-fn leaf_dtype(config: &Value) -> &str {
-    ["dtype", "q_dtype", "input_dtype", "kv_dtype"]
-        .into_iter()
-        .find_map(|key| config.get(key).and_then(Value::as_str))
-        .unwrap_or("bf16")
 }
 
 fn is_communication_kind(kind: &str) -> bool {
@@ -1527,6 +1529,7 @@ mod tests {
             requested_name: "test".to_owned(),
             canonical_name: "test".to_owned(),
             spec: test_spec(),
+            compute_dtypes: Arc::default(),
         };
         let rungs = compute_row_rungs(&manifest, 2, 1.0, &row, 2.0, Some(&hardware)).unwrap();
         assert!((rungs.r0_gpu_s - 0.020).abs() < 1e-12);
