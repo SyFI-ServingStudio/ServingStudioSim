@@ -483,6 +483,14 @@ pub struct Glm53FlashKernelPath {
     pub mla_layout_copies: bool,
 }
 
+impl Glm53FlashKernelPath {
+    /// FlashKDA applies the beta sigmoid inside its call; FLA's chain takes
+    /// beta already passed through one.
+    pub fn kda_prefill_takes_beta_logits(&self) -> bool {
+        self.kda_prefill_backend == "flashkda"
+    }
+}
+
 impl Default for Glm53FlashKernelPath {
     /// The captured fork.
     fn default() -> Self {
@@ -700,6 +708,7 @@ pub fn build_configs(
             conv_backends: CONV_BACKENDS.to_vec(),
             core_backends: KDA_BACKENDS.to_vec(),
             chunk_prefill_backends: vec![parallel.kernel_path.kda_prefill_backend],
+            chunk_prefill_takes_beta_logits: parallel.kernel_path.kda_prefill_takes_beta_logits(),
             elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
         },
         dsa: Glm53DsaAttnLocalWorkletConfig {
