@@ -2775,7 +2775,8 @@ def test_glm53_location_map_variants_differ_only_in_routed_rank_fan_out(variant,
 
 
 def test_glm53_dp_attn_ep_location_maps_consume_every_semantic_row_once():
-    """DP4/EP4 and DP8/EP8 maps reuse the TP map's semantics; collectives map to ``[]``."""
+    """DP4/EP4 and DP8/EP8 maps reuse the TP map's semantics; collectives are not
+    locations, since the analyzer matches a map to the non-communication leaves."""
     tp_rules = {
         row["location"]: row["semantics"]
         for row in json.loads(G53_LOCATION_MAP.read_text())["locations"]
@@ -2794,8 +2795,9 @@ def test_glm53_dp_attn_ep_location_maps_consume_every_semantic_row_once():
         assert len(mapped) == len(set(mapped))
         assert set(mapped) == expected
         for tag in ("dsa_moe", "kda_moe"):
-            for op in ("dispatch_quant", "dispatch_all_gather", "combine_reduce_scatter"):
-                assert rules[f"unified.{tag}.moe.{op}"] == []
+            assert rules[f"unified.{tag}.moe.dispatch_quant"] == []
+            for op in ("dispatch_all_gather", "combine_reduce_scatter"):
+                assert f"unified.{tag}.moe.{op}" not in rules
             for rank in range(1, ep):
                 assert rules[f"unified.{tag}.moe.routed_rank{rank}.fused_moe"] == []
         for location, semantics in rules.items():
