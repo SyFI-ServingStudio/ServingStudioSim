@@ -264,13 +264,17 @@ class Timer:
         kernel_name: str | None = None,
         clear_l2: bool = True,
         interval_union: bool = False,
+        wall_span: bool = False,
     ) -> float:
         """Return average kernel-only runtime in milliseconds using CUPTI.
 
         Unlike the wall-clock timers, CUPTI records each launch's true kernel
         duration. With ``interval_union=True``, overlapping physical kernels
         count once, so a multi-stream fused callable is priced by GPU-active
-        union instead of summed residency. The default path measures ten
+        union instead of summed residency. With ``wall_span=True`` each launch
+        is priced from its first kernel start to its last kernel end, idle
+        gaps between its kernels included (a CUDA-graph replay of a forked
+        callable, where the gaps are part of the call). The default path measures ten
         launches, computes ``ceil(budget_ms / estimate_ms)``, and records that
         many launches in one uninterrupted formal capture. The budget is a
         100 ms probe, kept when the probe's launches show no drift and replaced
@@ -307,7 +311,13 @@ class Timer:
                 "Timer.cupti: rep is mutually exclusive with min_duration_ms / min_rep / max_rep"
             )
         cupti = _load_cupti_module()
-        duration_kwargs = {"interval_union": True} if interval_union else {}
+        if interval_union and wall_span:
+            raise ValueError("Timer.cupti: interval_union and wall_span are mutually exclusive")
+        duration_kwargs: dict[str, bool] = {}
+        if interval_union:
+            duration_kwargs["interval_union"] = True
+        if wall_span:
+            duration_kwargs["wall_span"] = True
 
         if rep is not None:
             if rep <= 0:

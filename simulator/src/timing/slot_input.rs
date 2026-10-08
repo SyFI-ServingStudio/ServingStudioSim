@@ -44,6 +44,7 @@ use crate::timing::kernels::{
 use crate::timing::kernels::CompressedSparseMlaRopeCastKernelInput;
 use crate::timing::kernels::QPadKvRopeMxfp8InsertKernelInput;
 use crate::timing::kernels::EngramLookupKernelInput;
+use crate::timing::kernels::InklingQkvrPrepKernelInput;
 
 /// The prefill aggregating leaf's input: the full `(prefix_len, append_len)`
 /// fan-out the attention op summed into one slot (many prefill requests fold to a
@@ -155,6 +156,7 @@ log_inputs! {
     CompressedSparseMlaRopeCast => CompressedSparseMlaRopeCastKernelInput,
     QPadKvRopeMxfp8Insert => QPadKvRopeMxfp8InsertKernelInput,
     EngramLookup => EngramLookupKernelInput,
+    InklingQkvrPrep => InklingQkvrPrepKernelInput,
     MoeTopkSoftplusSqrt => MoeTopkSoftplusSqrtKernelInput,
     GemmFp32Output => GemmFp32OutputKernelInput,
     InklingRelAttention => InklingRelAttentionKernelInput,
