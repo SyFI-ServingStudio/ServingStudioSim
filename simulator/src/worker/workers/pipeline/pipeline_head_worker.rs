@@ -865,14 +865,6 @@ mod tests {
         store: SharedRequests,
         microbatch_sizing: crate::worker::config::MicrobatchSizing,
     ) -> PipelineHead<FakeModel> {
-        depth4_head_capped(store, microbatch_sizing, 2048)
-    }
-
-    fn depth4_head_capped(
-        store: SharedRequests,
-        microbatch_sizing: crate::worker::config::MicrobatchSizing,
-        max_batch_tokens: u32,
-    ) -> PipelineHead<FakeModel> {
         build_pipeline_head_worker(
             WorkerId(0),
             "stage",
@@ -880,7 +872,7 @@ mod tests {
             PipelineLayout { depth: 4, ..LAYOUT },
             store,
             WorkerConfig {
-                max_batch_tokens: Some(max_batch_tokens),
+                max_batch_tokens: Some(2048),
                 attn_kv_bytes: 1_000_000,
                 microbatch_sizing,
                 ..WorkerConfig::default()
@@ -976,15 +968,6 @@ mod tests {
         microbatch_sizing: crate::worker::config::MicrobatchSizing,
         threshold: u32,
     ) -> PipelineHead<FakeModel> {
-        depth4_head_with_cap(store, microbatch_sizing, threshold, false)
-    }
-
-    fn depth4_head_with_cap(
-        store: SharedRequests,
-        microbatch_sizing: crate::worker::config::MicrobatchSizing,
-        threshold: u32,
-        when_contended: bool,
-    ) -> PipelineHead<FakeModel> {
         build_pipeline_head_worker(
             WorkerId(0),
             "stage",
@@ -996,11 +979,6 @@ mod tests {
                 attn_kv_bytes: 1_000_000,
                 microbatch_sizing,
                 long_prefill_token_threshold: Some(threshold),
-                long_prefill_cap_mode: if when_contended {
-                    crate::worker::config::LongPrefillCapMode::Contended
-                } else {
-                    crate::worker::config::LongPrefillCapMode::Always
-                },
                 ..WorkerConfig::default()
             },
             None,
@@ -1027,24 +1005,6 @@ mod tests {
         assert_eq!(launched_tokens(&events), vec![612, 512, 512, 512]);
     }
 
-    #[test]
-    fn a_contended_only_cap_lets_a_lone_prompt_take_the_whole_budget() {
-        use crate::worker::config::MicrobatchSizing;
-        let store = shared_with(&[(0, 3000, 1), (1, 100, 1)]);
-        let mut worker =
-            depth4_head_with_cap(Rc::clone(&store), MicrobatchSizing::Greedy, 512, true);
-        worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
-        let mut events = Vec::new();
-        worker.tick(Time::ZERO, &mut events);
-        // Alone, the long prompt fills the microbatch; once a short one waits,
-        // it drops to the cap and shares; alone again, it takes the rest.
-        worker.enqueue(PipelineHeadMsg::Request(RequestId(1)));
-        for step in 1..6 {
-            worker.tick(Time::from_ms(step as f64), &mut events);
-        }
-        assert_eq!(launched_tokens(&events), vec![2048, 612, 440]);
-    }
-
     /// Each launched microbatch's prefill chunk lengths, sorted.
     fn launched_chunk_lengths(events: &[PipelineHeadEvent]) -> Vec<Vec<u32>> {
         events
@@ -1065,91 +1025,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_first_serves_a_new_prompt_before_a_started_one_beyond_its_reserve() {
-        use crate::worker::config::MicrobatchSizing;
-        let store = shared_with(&[(0, 10_000, 1), (1, 1900, 1)]);
-        let mut worker = build_pipeline_head_worker(
-            WorkerId(0),
-            "stage",
-            Arc::new(FakeModel::for_ms(1.0)),
-            PipelineLayout { depth: 4, ..LAYOUT },
-            store,
-            WorkerConfig {
-                max_batch_tokens: Some(2048),
-                attn_kv_bytes: 1_000_000,
-                microbatch_sizing: MicrobatchSizing::Greedy,
-                fresh_first_reserve_tokens: Some(256),
-                ..WorkerConfig::default()
-            },
-            None,
-            PoolId(0),
-            "test-gpu",
-            test_cluster(),
-        );
-        worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
-        let mut events = Vec::new();
-        worker.tick(Time::ZERO, &mut events);
-        worker.enqueue(PipelineHeadMsg::Request(RequestId(1)));
-        for step in 1..4 {
-            worker.tick(Time::from_ms(step as f64), &mut events);
-        }
-        // Alone, the long prompt fills the microbatch. Then the new prompt takes
-        // everything but the long one's 256 reserve; next, its 108-token tail
-        // runs first and the long prompt takes the rest.
-        assert_eq!(
-            launched_chunk_lengths(&events),
-            vec![vec![2048], vec![256, 1792], vec![108, 1940]]
-        );
-    }
-
-    #[test]
-    fn a_load_budget_stays_low_after_idle_time_and_grows_with_busy_time() {
-        use crate::worker::config::MicrobatchSizing;
-        use crate::worker::types::PipelineLoadBudget;
-        let store = shared_with(&[(0, 100, 1), (1, 10_000, 1)]);
-        let mut worker = build_pipeline_head_worker(
-            WorkerId(0),
-            "stage",
-            Arc::new(FakeModel::for_ms(1.0)),
-            PipelineLayout { depth: 4, ..LAYOUT },
-            store,
-            WorkerConfig {
-                max_batch_tokens: Some(2048),
-                attn_kv_bytes: 1_000_000,
-                microbatch_sizing: MicrobatchSizing::Greedy,
-                load_budget: Some(PipelineLoadBudget {
-                    low_tokens: 512,
-                    window: Time::from_ms(4.0),
-                    busy_lo: 0.25,
-                    busy_hi: 0.75,
-                    backlog: None,
-                }),
-                ..WorkerConfig::default()
-            },
-            None,
-            PoolId(0),
-            "test-gpu",
-            test_cluster(),
-        );
-        worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
-        let mut events = Vec::new();
-        // The short prompt runs at 0 ms; the head then has nothing to do from
-        // 1 ms until the long prompt arrives at 4 ms.
-        for step in 0..4 {
-            worker.tick(Time::from_ms(step as f64), &mut events);
-        }
-        worker.enqueue(PipelineHeadMsg::Request(RequestId(1)));
-        for step in 4..8 {
-            worker.tick(Time::from_ms(step as f64), &mut events);
-        }
-        // The head was starved over [1, 4) ms, so it had work for 1/4, 1/4 and
-        // 2/4 of the window at the long prompt's formations at 4, 5 and 6 ms;
-        // the in-flight window is then full.
-        assert_eq!(launched_tokens(&events), vec![100, 512, 512, 1280]);
-    }
-
-    #[test]
-    fn a_backlog_driven_load_budget_follows_queued_and_in_flight_tokens() {
+    fn a_load_budget_follows_queued_and_in_flight_tokens() {
         use crate::worker::config::MicrobatchSizing;
         use crate::worker::types::PipelineLoadBudget;
         let store = shared_with(&[(0, 3000, 1)]);
@@ -1165,10 +1041,8 @@ mod tests {
                 microbatch_sizing: MicrobatchSizing::Greedy,
                 load_budget: Some(PipelineLoadBudget {
                     low_tokens: 512,
-                    window: Time::from_ms(4.0),
-                    busy_lo: 0.25,
-                    busy_hi: 0.75,
-                    backlog: Some((1000, 5000)),
+                    backlog_lo_tokens: 1000,
+                    backlog_hi_tokens: 5000,
                 }),
                 ..WorkerConfig::default()
             },
@@ -1185,39 +1059,6 @@ mod tests {
         // Backlog 3000 tokens (queued, then started plus in flight) is halfway
         // from 1000 to 5000: the budget sits halfway from 512 to 2048.
         assert_eq!(launched_tokens(&events), vec![1280, 1280, 440]);
-    }
-
-    #[test]
-    fn a_tail_ladder_shrinks_a_prompts_last_chunks() {
-        use crate::worker::config::MicrobatchSizing;
-        let store = shared_with(&[(0, 6000, 1)]);
-        let mut worker = build_pipeline_head_worker(
-            WorkerId(0),
-            "stage",
-            Arc::new(FakeModel::for_ms(1.0)),
-            PipelineLayout { depth: 4, ..LAYOUT },
-            store,
-            WorkerConfig {
-                max_batch_tokens: Some(2048),
-                attn_kv_bytes: 1_000_000,
-                microbatch_sizing: MicrobatchSizing::Greedy,
-                tail_ladder: Some((512, 1000)),
-                ..WorkerConfig::default()
-            },
-            None,
-            PoolId(0),
-            "test-gpu",
-            test_cluster(),
-        );
-        worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
-        let mut events = Vec::new();
-        for step in 0..6 {
-            worker.tick(Time::from_ms(step as f64), &mut events);
-        }
-        // Depth 4 grows the stage time (1000 + tokens) by 3/2 per step back from
-        // the end: steps 512 and 1268 (1780 tokens), then the cap. 6000 tokens
-        // run two full chunks, the 1268 step, and the 636 left.
-        assert_eq!(launched_tokens(&events), vec![2048, 2048, 1268, 636]);
     }
 
     #[test]
@@ -1261,90 +1102,6 @@ mod tests {
     }
 
     #[test]
-    fn a_matched_cap_lets_a_started_prompt_keep_pace_with_fresh_work() {
-        use crate::worker::config::{LongPrefillCapMode, MicrobatchSizing};
-        let store = shared_with(&[(0, 10_000, 1), (1, 1500, 1)]);
-        let mut worker = build_pipeline_head_worker(
-            WorkerId(0),
-            "stage",
-            Arc::new(FakeModel::for_ms(1.0)),
-            PipelineLayout { depth: 4, ..LAYOUT },
-            store,
-            WorkerConfig {
-                max_batch_tokens: Some(4096),
-                attn_kv_bytes: 1_000_000,
-                microbatch_sizing: MicrobatchSizing::Greedy,
-                long_prefill_token_threshold: Some(512),
-                long_prefill_cap_mode: LongPrefillCapMode::Matched,
-                fresh_first_reserve_tokens: Some(0),
-                ..WorkerConfig::default()
-            },
-            None,
-            PoolId(0),
-            "test-gpu",
-            test_cluster(),
-        );
-        worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
-        let mut events = Vec::new();
-        worker.tick(Time::ZERO, &mut events);
-        worker.enqueue(PipelineHeadMsg::Request(RequestId(1)));
-        for step in 1..4 {
-            worker.tick(Time::from_ms(step as f64), &mut events);
-        }
-        // Alone, the long prompt runs 512-token chunks; beside the new prompt's
-        // 512-token first chunk it takes 512 too. Then both are started: the
-        // new prompt's 988-token tail goes first and the long prompt matches
-        // the 512 floor, since no fresh prompt joins.
-        assert_eq!(
-            launched_chunk_lengths(&events)[..3],
-            [vec![512], vec![512, 512], vec![512, 512]]
-        );
-    }
-
-    #[test]
-    fn a_backlog_cap_runs_a_lone_prompt_at_the_floor_and_rises_with_the_queue() {
-        use crate::worker::config::{LongPrefillCapMode, MicrobatchSizing};
-        let store = shared_with(&[(0, 20_000, 1), (1, 6000, 1), (2, 6000, 1)]);
-        let mut worker = build_pipeline_head_worker(
-            WorkerId(0),
-            "stage",
-            Arc::new(FakeModel::for_ms(1.0)),
-            PipelineLayout { depth: 4, ..LAYOUT },
-            store,
-            WorkerConfig {
-                max_batch_tokens: Some(8192),
-                attn_kv_bytes: 10_000_000,
-                microbatch_sizing: MicrobatchSizing::Even { min_tokens: 0 },
-                long_prefill_token_threshold: Some(512),
-                long_prefill_cap_mode: LongPrefillCapMode::Backlog,
-                ..WorkerConfig::default()
-            },
-            None,
-            PoolId(0),
-            "test-gpu",
-            test_cluster(),
-        );
-        worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
-        let mut events = Vec::new();
-        let mut step = 0;
-        while launched_chunk_lengths(&events).is_empty() {
-            worker.tick(Time::from_ms(step as f64), &mut events);
-            step += 1;
-        }
-        // Its own 20k queued tokens do not count: alone it gets the floor.
-        assert_eq!(launched_chunk_lengths(&events), [vec![512]]);
-        // Once 12000 tokens are queued, the started prompt's cap is 12000 / 4;
-        // each fresh one leaves its own 6000 out, so its cap is 6000 / 4.
-        worker.enqueue(PipelineHeadMsg::Request(RequestId(1)));
-        worker.enqueue(PipelineHeadMsg::Request(RequestId(2)));
-        while launched_chunk_lengths(&events).len() < 3 {
-            worker.tick(Time::from_ms(step as f64), &mut events);
-            step += 1;
-        }
-        assert_eq!(launched_chunk_lengths(&events)[2], [1500, 1500, 3000]);
-    }
-
-    #[test]
     fn long_prefill_threshold_caps_the_even_target_per_request() {
         use crate::worker::config::MicrobatchSizing;
         let store = shared_with(&[(0, 8000, 1)]);
@@ -1360,81 +1117,5 @@ mod tests {
         }
         // The even target is 2000 (8000 / 4); one request may take only 1000.
         assert_eq!(launched_tokens(&events), vec![1000, 1000, 1000, 1000]);
-    }
-
-    #[test]
-    fn plan_runs_a_short_prompt_as_one_microbatch() {
-        use crate::worker::config::MicrobatchSizing;
-        let store = shared_with(&[(0, 5000, 1)]);
-        let mut worker = depth4_head_capped(Rc::clone(&store), MicrobatchSizing::Plan, 8192);
-        worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
-        let mut events = Vec::new();
-        for step in 0..6 {
-            worker.tick(Time::from_ms(step as f64), &mut events);
-        }
-        assert_eq!(launched_tokens(&events), vec![5000]);
-    }
-
-    #[test]
-    fn plan_splits_a_long_prompt_only_at_the_cap_in_successive_slots() {
-        use crate::worker::config::MicrobatchSizing;
-        let store = shared_with(&[(0, 20_000, 1)]);
-        let mut worker = depth4_head_capped(Rc::clone(&store), MicrobatchSizing::Plan, 8192);
-        worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
-        let mut events = Vec::new();
-        for step in 0..6 {
-            worker.tick(Time::from_ms(step as f64), &mut events);
-        }
-        assert_eq!(
-            launched(&events),
-            vec![
-                (1, 8192, Time::from_ms(1.0)),
-                (2, 8192, Time::from_ms(2.0)),
-                (3, 3616, Time::from_ms(3.0)),
-            ]
-        );
-    }
-
-    #[test]
-    fn plan_puts_requests_that_arrive_together_into_different_slots() {
-        use crate::worker::config::MicrobatchSizing;
-        let store = shared_with(&[(0, 100, 1), (1, 100, 1)]);
-        let mut worker = depth4_head_capped(Rc::clone(&store), MicrobatchSizing::Plan, 8192);
-        worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
-        worker.enqueue(PipelineHeadMsg::Request(RequestId(1)));
-        let mut events = Vec::new();
-        for step in 0..4 {
-            worker.tick(Time::from_ms(step as f64), &mut events);
-        }
-        // Greedy would carry both in one 200-token microbatch.
-        assert_eq!(launched_tokens(&events), vec![100, 100]);
-        // Both are admitted, KV reserved, when planned.
-        assert_eq!(worker.status().queued_requests, 0);
-    }
-
-    #[test]
-    fn plan_keeps_overflow_queued_and_fills_every_slot_under_backlog() {
-        use crate::worker::config::MicrobatchSizing;
-        // Six 3000-token prompts against four 4096-token slots: the fifth and
-        // sixth fill the gaps the first four leave, from the earliest room.
-        let store = shared_with(&[
-            (0, 3000, 1),
-            (1, 3000, 1),
-            (2, 3000, 1),
-            (3, 3000, 1),
-            (4, 3000, 1),
-            (5, 3000, 1),
-        ]);
-        let mut worker = depth4_head_capped(Rc::clone(&store), MicrobatchSizing::Plan, 4096);
-        for id in 0..6 {
-            worker.enqueue(PipelineHeadMsg::Request(RequestId(id)));
-        }
-        let mut events = Vec::new();
-        worker.tick(Time::ZERO, &mut events);
-        assert_eq!(worker.status().queued_requests, 0);
-        for step in 1..6 {
-            worker.tick(Time::from_ms(step as f64), &mut events);
-        }
-        assert_eq!(launched_tokens(&events), vec![4096, 4096, 4096, 4096]);
     }
 }

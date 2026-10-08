@@ -51,8 +51,6 @@ pub enum PpPlacement {
     /// Fewest queued, then active, requests at the head.
     LeastQueued,
     RoundRobin,
-    /// Fewest prompt tokens admitted and not yet complete.
-    LeastWork,
     /// Least outstanding prompt work counted up to the new request's size, the
     /// work that would run ahead of it under shortest-remaining-first.
     LeastWorkAhead,
@@ -77,8 +75,6 @@ where
     replicas: Vec<PpReplica<H, S>>,
     placement: PpPlacement,
     rr_next: usize,
-    /// Per replica: prompt tokens admitted and not yet complete.
-    outstanding_tokens: Vec<u64>,
     /// Each admitted request's replica and prompt tokens, until it completes.
     assigned: HashMap<RequestId, (usize, u64)>,
     head_events: Vec<PipelineHeadEvent>,
@@ -120,7 +116,6 @@ where
             replicas,
             placement: cfg.placement,
             rr_next: 0,
-            outstanding_tokens: vec![0; usize::from(cfg.replicas)],
             assigned: HashMap::new(),
             head_events: Vec::new(),
             stage_events: Vec::new(),
@@ -136,13 +131,6 @@ where
                 self.rr_next = (self.rr_next + 1) % self.replicas.len();
                 replica
             }
-            PpPlacement::LeastWork => self
-                .outstanding_tokens
-                .iter()
-                .enumerate()
-                .min_by_key(|&(replica, &tokens)| (tokens, replica))
-                .map(|(replica, _)| replica)
-                .expect("pp has at least one replica"),
             PpPlacement::LeastWorkAhead => {
                 let mut ahead = vec![0_u64; self.replicas.len()];
                 for &(replica, tokens) in self.assigned.values() {
@@ -156,7 +144,6 @@ where
                     .expect("pp has at least one replica")
             }
         };
-        self.outstanding_tokens[replica] += prompt_tokens;
         self.assigned.insert(request, (replica, prompt_tokens));
         self.route_to_head(replica, PipelineHeadMsg::Request(request));
     }
@@ -234,11 +221,9 @@ where
     fn on_head_event(&mut self, event: PipelineHeadEvent, completed: &mut Vec<RequestId>) {
         match event {
             PipelineHeadEvent::RequestComplete { req, .. } => {
-                let (replica, tokens) = self
-                    .assigned
+                self.assigned
                     .remove(&req)
                     .expect("a completed request was admitted");
-                self.outstanding_tokens[replica] -= tokens;
                 completed.push(req);
             }
             PipelineHeadEvent::MicrobatchLaunched { worker, microbatch } => {
@@ -517,21 +502,6 @@ mod tests {
         let times: Vec<Time> = completed.into_iter().map(|(_, at)| at).collect();
         let expected: Vec<Time> = (4..12).map(|ms| Time::from_ms(ms as f64)).collect();
         assert_eq!(times, expected);
-    }
-
-    #[test]
-    fn least_work_steers_short_prompts_off_a_pipeline_holding_a_long_one() {
-        let (mut flow, _store) = build_flow(2, 2, 64);
-        flow.stage_pool.placement = PpPlacement::LeastWork;
-        flow.on_arrival(text_request(RequestId(0), 10_000, 1, Time::ZERO));
-        flow.on_arrival(text_request(RequestId(1), 100, 1, Time::ZERO));
-        flow.on_arrival(text_request(RequestId(2), 100, 1, Time::ZERO));
-        // By request count the third prompt would tie and go to replica 0.
-        let replica = |id| flow.stage_pool.assigned[&RequestId(id)].0;
-        assert_eq!([replica(0), replica(1), replica(2)], [0, 1, 1]);
-        assert_eq!(flow.stage_pool.outstanding_tokens, [10_000, 200]);
-        run(&mut flow, 50, 1.0);
-        assert_eq!(flow.stage_pool.outstanding_tokens, [10_000, 0]);
     }
 
     #[test]

@@ -82,31 +82,18 @@ pub(crate) fn build_pipeline_head_worker<M: IterwiseUnifiedModel>(
     if config.balance_decode_microbatches {
         admission = admission.with_balanced_decodes(layout.depth);
     }
-    match config.microbatch_sizing {
-        MicrobatchSizing::Greedy => {}
-        MicrobatchSizing::Even { min_tokens } => {
-            admission = admission.with_even_split(layout.depth, min_tokens);
-        }
-        MicrobatchSizing::Plan => admission = admission.with_slot_plan(layout.depth),
+    if let MicrobatchSizing::Even { min_tokens } = config.microbatch_sizing {
+        admission = admission.with_even_split(layout.depth, min_tokens);
     }
     if let Some(threshold) = config.long_prefill_token_threshold {
         admission = admission.with_long_prefill_threshold(threshold);
-        admission = admission
-            .with_long_prefill_cap_mode(config.long_prefill_cap_mode)
-            .with_cap_min_prompt_tokens(config.long_prefill_cap_min_prompt_tokens);
-    }
-    if let Some(reserve) = config.fresh_first_reserve_tokens {
-        admission = admission.with_fresh_first(reserve);
     }
     if let Some(load) = config.load_budget {
-        admission =
-            admission.with_load_budget(load.low_tokens, load.window, load.busy_lo, load.busy_hi);
-        if let Some((lo_tokens, hi_tokens)) = load.backlog {
-            admission = admission.with_backlog_signal(lo_tokens, hi_tokens);
-        }
-    }
-    if let Some((min_tokens, overhead_tokens)) = config.tail_ladder {
-        admission = admission.with_tail_ladder(layout.depth, min_tokens, overhead_tokens);
+        admission = admission.with_load_budget(
+            load.low_tokens,
+            load.backlog_lo_tokens,
+            load.backlog_hi_tokens,
+        );
     }
     if config.srpt {
         admission = admission.with_srpt();
@@ -246,31 +233,18 @@ pub(crate) fn build_hybrid_pipeline_head_worker<M: IterwiseUnifiedModel>(
     if config.balance_decode_microbatches {
         admission = admission.with_balanced_decodes(layout.depth);
     }
-    match config.microbatch_sizing {
-        MicrobatchSizing::Greedy => {}
-        MicrobatchSizing::Even { min_tokens } => {
-            admission = admission.with_even_split(layout.depth, min_tokens);
-        }
-        MicrobatchSizing::Plan => admission = admission.with_slot_plan(layout.depth),
+    if let MicrobatchSizing::Even { min_tokens } = config.microbatch_sizing {
+        admission = admission.with_even_split(layout.depth, min_tokens);
     }
     if let Some(threshold) = config.long_prefill_token_threshold {
         admission = admission.with_long_prefill_threshold(threshold);
-        admission = admission
-            .with_long_prefill_cap_mode(config.long_prefill_cap_mode)
-            .with_cap_min_prompt_tokens(config.long_prefill_cap_min_prompt_tokens);
-    }
-    if let Some(reserve) = config.fresh_first_reserve_tokens {
-        admission = admission.with_fresh_first(reserve);
     }
     if let Some(load) = config.load_budget {
-        admission =
-            admission.with_load_budget(load.low_tokens, load.window, load.busy_lo, load.busy_hi);
-        if let Some((lo_tokens, hi_tokens)) = load.backlog {
-            admission = admission.with_backlog_signal(lo_tokens, hi_tokens);
-        }
-    }
-    if let Some((min_tokens, overhead_tokens)) = config.tail_ladder {
-        admission = admission.with_tail_ladder(layout.depth, min_tokens, overhead_tokens);
+        admission = admission.with_load_budget(
+            load.low_tokens,
+            load.backlog_lo_tokens,
+            load.backlog_hi_tokens,
+        );
     }
     if config.srpt {
         admission = admission.with_srpt();
