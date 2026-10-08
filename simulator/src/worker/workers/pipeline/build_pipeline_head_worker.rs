@@ -319,7 +319,7 @@ fn head_prefix_tiers(
     (!specs.is_empty()).then(|| {
         SessionPrefixTiers::new(
             &specs,
-            layout.kv_bytes_per_token,
+            layout.tier_kv_bytes_per_token,
             state_tokens,
             hit_quantum,
             log_dir,

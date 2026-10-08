@@ -93,6 +93,12 @@ impl Deployment for PpDeployment {
                 let layout = PipelineLayout {
                     depth: pipeline.pp_size(),
                     kv_bytes_per_token: pipeline.pipeline_kv_bytes_per_token(),
+                    tier_kv_bytes_per_token: tier_kv_bytes_per_token(
+                        &g.worker,
+                        pipeline.pipeline_kv_bytes_per_token(),
+                        pipeline.total_kv_bytes_per_token(),
+                        pipeline.pp_size(),
+                    ),
                     activation_bytes_per_token: pipeline.activation_bytes_per_token(),
                 };
                 let head_model = Arc::clone(&pipeline.stages()[0]);
@@ -168,6 +174,12 @@ impl Deployment for PpDeployment {
                 let layout = PipelineLayout {
                     depth: pipeline.pp_size(),
                     kv_bytes_per_token: pipeline.pipeline_kv_bytes_per_token(),
+                    tier_kv_bytes_per_token: tier_kv_bytes_per_token(
+                        &g.worker,
+                        pipeline.pipeline_kv_bytes_per_token(),
+                        pipeline.total_kv_bytes_per_token(),
+                        pipeline.pp_size(),
+                    ),
                     activation_bytes_per_token: pipeline.activation_bytes_per_token(),
                 };
                 let hybrid = PipelineHybridState {
@@ -216,6 +228,23 @@ impl Deployment for PpDeployment {
             }
             other => bail!("pp: arch {other:?} has no pipeline-parallel stage model"),
         }
+    }
+}
+
+/// Bytes per token each stage reads from a tier: the most loaded stage's, or
+/// with `prefix_tier_balanced_load` the stages' mean (rounded up).
+fn tier_kv_bytes_per_token(
+    worker: &IterWorkerSel,
+    most_loaded: u64,
+    total: u64,
+    depth: u16,
+) -> u64 {
+    match worker {
+        IterWorkerSel::PipelineChunkedPrefill {
+            prefix_tier_balanced_load: true,
+            ..
+        } => total.div_ceil(u64::from(depth.max(1))),
+        _ => most_loaded,
     }
 }
 
@@ -361,4 +390,36 @@ where
             )
         },
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pipeline_worker(extra: &str) -> IterWorkerSel {
+        serde_yaml::from_str(&format!(
+            "type: pipeline_chunked_prefill\nattn_gpu_memory_gb: 80.0\nmax_batch_tokens: 8192\n{extra}"
+        ))
+        .expect("parse pipeline worker")
+    }
+
+    #[test]
+    fn tiers_read_the_most_loaded_stage_unless_loads_are_balanced() {
+        // PP8 of GLM-5.3-Flash: 11 DSA layers of 545 B, at most 2 per stage.
+        let (most_loaded, total) = (2 * 545, 11 * 545);
+        assert_eq!(
+            tier_kv_bytes_per_token(&pipeline_worker(""), most_loaded, total, 8),
+            1090
+        );
+        assert_eq!(
+            tier_kv_bytes_per_token(
+                &pipeline_worker("prefix_tier_balanced_load: true\n"),
+                most_loaded,
+                total,
+                8
+            ),
+            750,
+            "5995 B over 8 stages, rounded up"
+        );
+    }
 }

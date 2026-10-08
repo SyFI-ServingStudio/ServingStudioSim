@@ -62,6 +62,10 @@ pub struct PipelineLayout {
     /// the same blocks, so the stage with the most bytes per token bounds the
     /// pipeline's token capacity.
     pub kv_bytes_per_token: u64,
+    /// Bytes per token each GPU reads from a DRAM/SSD tier: the most loaded
+    /// stage's (`kv_bytes_per_token`), or the stages' mean when tier loads
+    /// are assumed balanced (`prefix_tier_balanced_load`).
+    pub tier_kv_bytes_per_token: u64,
     /// Bytes one token's activations occupy between two stages.
     pub activation_bytes_per_token: u64,
 }
@@ -410,6 +414,7 @@ mod tests {
     const LAYOUT: PipelineLayout = PipelineLayout {
         depth: 2,
         kv_bytes_per_token: 2,
+        tier_kv_bytes_per_token: 2,
         activation_bytes_per_token: 4,
     };
 

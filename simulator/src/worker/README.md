@@ -346,7 +346,9 @@ skipped-waiting queue); there the context goes back into HBM (`restore_prefix`)
 and the hold turns into the request's reservation. A lookup at arrival would miss
 every context HBM evicts while the request queues. On the pipeline head,
 `prefix_tier_max_read_wait_ms` (not vLLM) starts a read only while its tier would
-begin it within that bound, so a long read queue does not sit on HBM. A shortest-prefill-first order ranks a request by what HBM or a tier
+begin it within that bound, so a long read queue does not sit on HBM.
+A tier is sized and read in the most loaded stage's bytes per token;
+`prefix_tier_balanced_load` (not vLLM) uses the stages' mean instead. A shortest-prefill-first order ranks a request by what HBM or a tier
 holds. With `prefix_tier_warm_start`, a session request whose declared prefix
 exceeds every context the run stored for it is a pre-run conversation, read
 from the slowest tier (closed-loop traces that join sessions mid-life).
