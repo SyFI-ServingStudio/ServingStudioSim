@@ -25,6 +25,11 @@
 //! epilogue       lm_head over one row per request, logits all-gather
 //! ```
 //!
+//! Each Lamport call has two rows: the balanced back-to-back profile, and the
+//! served decode-step regime (after the GEMM writing its input, cold
+//! per-layer buffers, the aux-stream sink join) that uniform-decode steps use
+//! (see `lamport_served`). Both are compiled under one slot name.
+//!
 //! The MoE: router, gate select and the top-k copies on every rank, then a
 //! `Max` over the EP ranks' ranked routed workloads; inside each rank the sink
 //! experts run on vLLM's aux stream concurrently with the routed call on a
@@ -87,6 +92,12 @@ const BF16_GEMM_BACKENDS: &[&str] = &["torch_linear_vllm"];
 const QKVR_PREP_BACKENDS: &[&str] = &["vllm_triton"];
 const REL_ATTENTION_BACKENDS: &[&str] = &["tml_fa4"];
 const LAMPORT_BACKENDS: &[&str] = &["vllm_lamport_triton"];
+/// The same call timed as a decode step runs it: after the GEMM that writes its
+/// input, with cold per-layer buffers and (MoE) the aux-stream sink join, as
+/// the marginal cost over those predecessors. Check 1c measured the decode
+/// call from the last rank's arrival at 11.7 us (attention) / 12.6 us (MoE) at
+/// T=32 against 10.1 / 10.3 us back to back; see [`lamport_served`].
+const LAMPORT_SERVED_BACKENDS: &[&str] = &["vllm_lamport_triton_served"];
 /// The fork's `_linear_with_fp32_out`: cute-DSL `ll_bf16` at T <= 64, cuBLAS
 /// `torch.mm(out_dtype=fp32)` above.
 const ROUTER_BACKENDS: &[&str] = &["vllm_inkling_router_auto"];
@@ -207,6 +218,9 @@ pub struct InklingVllmConfigs {
     pub reduce: RsSconvAgResidualRmsNormKernelConfig,
     /// Lamport after the MoE, summing the sink partial.
     pub moe_reduce: RsSconvAgResidualRmsNormKernelConfig,
+    /// `reduce` / `moe_reduce` in the served decode-step regime.
+    pub reduce_served: RsSconvAgResidualRmsNormKernelConfig,
+    pub moe_reduce_served: RsSconvAgResidualRmsNormKernelConfig,
     pub embed: ElementwiseKernelConfig,
     pub log_scaling_tau: ElementwiseKernelConfig,
     pub lm_head: SingleGemmKernelConfig,
@@ -284,15 +298,17 @@ pub fn build_configs(
         activation_backends: TRITON_ELEMENTWISE_BACKENDS.to_vec(),
         scale_backends: TORCH_ELEMENTWISE_BACKENDS.to_vec(),
     };
-    let lamport = |has_shared: bool| RsSconvAgResidualRmsNormKernelConfig {
-        backends: LAMPORT_BACKENDS.to_vec(),
-        gpu_name: gpu.clone(),
-        num_gpus: tp,
-        hidden_dim: model.hidden,
-        dtype: ACTIVATION_DTYPE,
-        fabric: Fabric::Nvlink,
-        conv_kernel_size: model.sconv_kernel_size,
-        has_shared,
+    let lamport = |has_shared: bool, backends: &[&'static str]| {
+        RsSconvAgResidualRmsNormKernelConfig {
+            backends: backends.to_vec(),
+            gpu_name: gpu.clone(),
+            num_gpus: tp,
+            hidden_dim: model.hidden,
+            dtype: ACTIVATION_DTYPE,
+            fabric: Fabric::Nvlink,
+            conv_kernel_size: model.sconv_kernel_size,
+            has_shared,
+        }
     };
     let (ep_size, moe_tp) = if parallel.enable_expert_parallel {
         divide("n_routed_experts", model.n_routed_experts)?;
@@ -407,8 +423,10 @@ pub fn build_configs(
         },
         routed_nvfp4,
         routed_bf16,
-        reduce: lamport(false),
-        moe_reduce: lamport(true),
+        reduce: lamport(false, LAMPORT_BACKENDS),
+        moe_reduce: lamport(true, LAMPORT_BACKENDS),
+        reduce_served: lamport(false, LAMPORT_SERVED_BACKENDS),
+        moe_reduce_served: lamport(true, LAMPORT_SERVED_BACKENDS),
         // `_embed_rmsnorm_kernel`: an int32 id plus the gathered row in, the
         // residual and the normed row out.
         embed: ew(
@@ -581,9 +599,50 @@ struct LayerGroup {
     label: String,
     layers: Vec<u32>,
     attn: InklingAttnLocalWorklet,
-    attn_reduce: Op<RsSconvAgResidualRmsNormKernel>,
+    attn_reduce: Lamport,
     ffn: Ffn,
-    ffn_reduce: Op<RsSconvAgResidualRmsNormKernel>,
+    ffn_reduce: Lamport,
+}
+
+/// One sublayer's Lamport call, compiled twice under one slot name: the
+/// balanced back-to-back row and the served decode-step row. One of the pair
+/// is filled per iteration (the other pushed as zero); see [`lamport_served`].
+struct Lamport {
+    balanced: Op<RsSconvAgResidualRmsNormKernel>,
+    served: Op<RsSconvAgResidualRmsNormKernel>,
+}
+
+impl Lamport {
+    fn build(
+        prefix: &str,
+        balanced: &RsSconvAgResidualRmsNormKernelConfig,
+        served: &RsSconvAgResidualRmsNormKernelConfig,
+        bridge: &PerfApiBridge,
+    ) -> std::result::Result<Self, BuildError> {
+        let op = |config: &RsSconvAgResidualRmsNormKernelConfig| {
+            atomic(
+                prefix,
+                "rs_sconv_ag_norm",
+                config.clone(),
+                RsSconvAgResidualRmsNormKernel::build,
+                bridge,
+            )
+        };
+        Ok(Self {
+            balanced: op(balanced)?,
+            served: op(served)?,
+        })
+    }
+
+    fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
+        CostNode::Sum(vec![self.balanced.compile(builder), self.served.compile(builder)])
+    }
+
+    fn eval(&self, tokens: u32, served: bool, ev: &mut Evaluator) {
+        let input = RsSconvAgResidualRmsNormKernelInput { num_tokens: tokens };
+        push_or_zero(&self.balanced, input.clone(), served, ev);
+        push_or_zero(&self.served, input, !served, ev);
+    }
 }
 
 impl LayerGroup {
@@ -614,15 +673,19 @@ impl LayerGroup {
             },
             ev,
         );
-        let reduce = RsSconvAgResidualRmsNormKernelInput { num_tokens: tokens };
-        push_or_zero(&self.attn_reduce, reduce.clone(), false, ev);
-        match &self.ffn {
+        let served = lamport_served(batch, sinks_overlap);
+        self.attn_reduce.eval(tokens, served.dense, ev);
+        let ffn_served = match &self.ffn {
             Ffn::Dense(worklet) => {
-                worklet.eval(&InklingMlpLocalWorkletInput { num_tokens: tokens }, ev)
+                worklet.eval(&InklingMlpLocalWorkletInput { num_tokens: tokens }, ev);
+                served.dense
             }
-            Ffn::Moe(block) => block.eval(tokens, sinks_overlap, ev),
-        }
-        push_or_zero(&self.ffn_reduce, reduce, false, ev);
+            Ffn::Moe(block) => {
+                block.eval(tokens, sinks_overlap, ev);
+                served.moe
+            }
+        };
+        self.ffn_reduce.eval(tokens, ffn_served, ev);
     }
 }
 
@@ -643,14 +706,9 @@ fn build_layer_group(
         },
         bridge,
     )?;
-    let attn_reduce = atomic(
-        &format!("{p}.attn"),
-        "rs_sconv_ag_norm",
-        cfg.reduce.clone(),
-        RsSconvAgResidualRmsNormKernel::build,
-        bridge,
-    )?;
-    let (ffn, ffn_name, ffn_reduce_cfg) = match group.ffn {
+    let attn_reduce =
+        Lamport::build(&format!("{p}.attn"), &cfg.reduce, &cfg.reduce_served, bridge)?;
+    let (ffn, ffn_name, ffn_reduce_cfgs) = match group.ffn {
         FfnKind::Dense => (
             Ffn::Dense(InklingMlpLocalWorklet::build(
                 format!("{p}.ffn"),
@@ -658,7 +716,7 @@ fn build_layer_group(
                 bridge,
             )?),
             format!("{p}.ffn"),
-            cfg.reduce.clone(),
+            (&cfg.reduce, &cfg.reduce_served),
         ),
         FfnKind::Moe(precision) => {
             let moe = format!("{p}.moe");
@@ -712,7 +770,7 @@ fn build_layer_group(
                     name: moe.clone(),
                 }),
                 moe,
-                cfg.moe_reduce.clone(),
+                (&cfg.moe_reduce, &cfg.moe_reduce_served),
             )
         }
     };
@@ -722,13 +780,7 @@ fn build_layer_group(
         attn,
         attn_reduce,
         ffn,
-        ffn_reduce: atomic(
-            &ffn_name,
-            "rs_sconv_ag_norm",
-            ffn_reduce_cfg,
-            RsSconvAgResidualRmsNormKernel::build,
-            bridge,
-        )?,
+        ffn_reduce: Lamport::build(&ffn_name, ffn_reduce_cfgs.0, ffn_reduce_cfgs.1, bridge)?,
     })
 }
 
@@ -985,6 +1037,28 @@ fn sinks_on_aux_stream(batch: &NormalizedBatch, padded_tokens: u32, capture_size
     padded_tokens <= SINK_STREAM_TOKEN_THRESHOLD && (uniform_decode || eager)
 }
 
+/// Which Lamport calls of a step take the served decode-step row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LamportServed {
+    /// After attention and the dense FFN.
+    dense: bool,
+    /// After the MoE, whose served row joins the aux-stream sinks.
+    moe: bool,
+}
+
+/// A uniform-decode step replays one FULL CUDA graph in which every Lamport
+/// call follows the GEMM that writes its input and finds the rest of its
+/// working set cold (Check 1c: the decode call's own work from the last
+/// rank's arrival is 11.7 / 12.6 us at T=32, not the back-to-back 10.1 /
+/// 10.3 us; no residual spin and no launch gaps). The MoE call's served row
+/// also joins the aux-stream sinks, which leaves its first launch no PDL edge,
+/// so it applies only while the sinks run there. Steps with a prefill chunk
+/// keep the balanced row, which matches the capture's T=2048 calls.
+fn lamport_served(batch: &NormalizedBatch, sinks_overlap: bool) -> LamportServed {
+    let uniform_decode = batch.query_context_pairs.iter().all(|&(query, _)| query == 1);
+    LamportServed { dense: uniform_decode, moe: uniform_decode && sinks_overlap }
+}
+
 /// One iteration, as every layer sees it (one TP group).
 struct NormalizedBatch {
     total_tokens: u32,
@@ -1194,8 +1268,9 @@ mod tests {
             .iter()
             .filter(|slot| slot.name.ends_with("rs_sconv_ag_norm"))
             .count();
-        // Two per layer group (attention + FFN/MoE), folded by Scale.
-        assert_eq!(lamports, 2 * 4);
+        // Two per layer group (attention + FFN/MoE), folded by Scale, each
+        // compiled as the balanced and the served row under one name.
+        assert_eq!(lamports, 2 * 2 * 4);
         assert!(manifest
             .slots
             .iter()
@@ -1270,6 +1345,27 @@ mod tests {
         // A step above the largest captured size runs eagerly: the aux stream
         // is back while it stays within the threshold.
         assert!(sinks_overlap(&step(vec![(0, 40)], vec![]), &[1, 2, 4, 8, 16, 32]));
+    }
+
+    #[test]
+    fn lamport_takes_the_served_row_only_on_uniform_decode_steps() {
+        let sizes = parallel().cudagraph_capture_sizes;
+        let served = |batch: NormalizedBatch| lamport_served(&batch, sinks_overlap(&batch, &sizes));
+        let both = LamportServed { dense: true, moe: true };
+        assert_eq!(served(step(vec![], vec![300; 28])), both);
+        assert_eq!(served(step(vec![], vec![2086])), both);
+        // A prefill chunk keeps every call on the balanced row.
+        let none = LamportServed { dense: false, moe: false };
+        assert_eq!(served(step(vec![(0, 50)], vec![400; 7])), none);
+        assert_eq!(served(step(vec![(0, 40)], vec![])), none);
+        // Decode above the sink threshold: the sinks are inline, so the MoE
+        // call has no aux-stream join and keeps the balanced row.
+        let wide: Vec<u32> = (1..=2048).collect();
+        let decode = step(vec![], vec![400; 300]);
+        assert_eq!(
+            lamport_served(&decode, sinks_overlap(&decode, &wide)),
+            LamportServed { dense: true, moe: false }
+        );
     }
 
     #[test]
