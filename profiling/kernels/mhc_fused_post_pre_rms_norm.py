@@ -51,9 +51,11 @@ DOC = KernelDoc(
         "16 splits), and the time steps at each switch and at each extra wave of "
         "the 16-split launch. Its rows report no GB/s.",
         "The previous post and comb weights come from the pre step on the same random streams.",
-        "TFLOPS is not computed. GB/s counts the layer output, streams, "
-        "previous mixes and weights read once and the updated streams, next "
-        "mixes and next block input written once.",
+        "TFLOPS is not computed. vllm_tilelang GB/s counts the HBM traffic of the "
+        "launches the call issues: the layer output, streams, previous mixes and "
+        "weights read and the updated streams, next mixes and next block input "
+        "written, plus, above 16 tokens, where the call is three launches (post, "
+        "prenorm GEMM, pre big-fuse), two more reads of the updated streams.",
     ),
     # The check composes PyTorch post-mix and pre-mix; no separate whole-call reference exists.
     reference=None,
