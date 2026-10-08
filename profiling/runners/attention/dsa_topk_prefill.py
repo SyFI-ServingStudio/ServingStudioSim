@@ -9,7 +9,7 @@ not part of this kind.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from profiling.db.args import DType
@@ -28,6 +28,11 @@ _LOGITS_DTYPE = DType.FP32
 _INDEX_DTYPE = "int32"
 _SPAN_MODE = "single_causal_tail"
 _VLLM_KERNEL_NAME = "topKPerRowPrefill"
+# DeepSelect (vLLM's `vllm._deepselect_C`, `torch.ops.deep_select.topk`) takes
+# k <= 4096 and rows shorter than 2**23 (vllm/model_executor/layers/
+# indexer_topk.py, `is_deep_select_supported`).
+_DEEP_SELECT_MAX_TOP_K = 4096
+_DEEP_SELECT_MAX_ROW = 1 << 23
 _SGLANG_KERNEL_NAME = "topk_transform_prefill_kernel"
 # Fixed seed of the synthetic scores, so every backend and every re-run of a
 # shape selects over the same values.
@@ -237,6 +242,164 @@ def _topk_indices(scores: Any, top_k: int, index_dtype: Any) -> Any:
     # Keeping the operation on the tensor permits CPU helper tests without a
     # module-level Torch import, preserving registry/RunnerRef laziness.
     return scores.topk(top_k, dim=1, largest=True, sorted=True).indices.to(dtype=index_dtype)
+
+
+def _load_deep_select_backend() -> tuple[Any, Any, tuple[int, int]]:
+    """Load Torch and register DeepSelect's ops inside the selected worker."""
+    try:
+        import torch
+        import vllm._deepselect_C  # noqa: F401  registers torch.ops.deep_select
+    except (ImportError, OSError, RuntimeError) as exc:
+        raise ProfilerNotImplemented(
+            "dsa_topk_prefill:deep_select requires vLLM's DeepSelect extension (vllm._deepselect_C)"
+        ) from exc
+    namespace = getattr(torch.ops, "deep_select", None)
+    op = getattr(namespace, "topk", None) if namespace is not None else None
+    if not callable(op):
+        raise ProfilerNotImplemented("torch.ops.deep_select.topk is unavailable")
+    input_align, output_align = torch.ops.deep_select.get_alignment_requirement()
+    return torch, op, (int(input_align), int(output_align))
+
+
+def _deep_select_output(
+    torch: Any, *, num_queries: int, top_k: int, output_align: int, device: str
+) -> Any:
+    """`[num_queries, top_k]` int32 whose row stride meets DeepSelect's alignment."""
+    lanes = max(1, output_align // 4)
+    stride = -(-top_k // lanes) * lanes
+    return torch.empty((num_queries, stride), dtype=torch.int32, device=device)[:, :top_k]
+
+
+def _launch_deep_select(op: Any, operands: _DsaTopkPrefillOperands, *, top_k: int) -> None:
+    """vLLM's `deep_select_topk`: right bounds only, -1 past a short row's span."""
+    op(
+        operands.logits,
+        top_k,
+        None,  # begin: unsupported, so every row must start at key 0
+        operands.row_ends,
+        False,  # sorted_value
+        False,  # sorted_index
+        None,  # output_value
+        operands.out,
+        None,  # output_idx_offset
+        -1,  # index fill past the span
+        float("-inf"),  # value fill past the span
+        False,  # return_value
+        False,  # abort_when_nan_found
+    )
+
+
+def _check_selection(torch: Any, operands: _DsaTopkPrefillOperands, *, top_k: int) -> None:
+    """Compare a few rows against torch.topk by selected-value multiset.
+
+    Production kernels neither order the selected indices nor break equal-value
+    ties, so the check compares sorted values, plus the natural indices and the
+    -1 tail of a row no longer than `top_k`.
+    """
+    num_queries = operands.out.shape[0]
+    for row in sorted({0, num_queries // 2, num_queries - 1}):
+        span = int(operands.row_ends[row]) - int(operands.row_starts[row])
+        got = operands.out[row].to(torch.int64)
+        if span <= top_k:
+            expected = operands.natural_output[row].to(torch.int64)
+            if not torch.equal(torch.sort(got).values, torch.sort(expected).values):
+                raise KernelLaunchFailed(f"row {row} (span {span}) selected {got.tolist()[:8]}")
+            continue
+        if bool((got < 0).any()) or bool((got >= span).any()):
+            raise KernelLaunchFailed(f"row {row} selected an index outside [0, {span})")
+        values = operands.logits[row, :span]
+        expected = torch.topk(values, top_k).values
+        if not torch.equal(torch.sort(values[got]).values, torch.sort(expected).values):
+            raise KernelLaunchFailed(f"row {row} (span {span}) is not the exact top-{top_k}")
+
+
+def profile_dsa_topk_prefill_deep_select(
+    num_queries: int,
+    num_keys: int,
+    num_sequences: int,
+    top_k: int,
+    logits_row_stride: int,
+    logits_dtype: DType | str,
+    index_dtype: str,
+    span_mode: str,
+) -> ComputeMetrics:
+    """Profile DeepSelect's exact FP32 top-k over the causal-tail score rows.
+
+    vLLM ships DeepSelect for the decode indexer; on the prefill path it is a
+    drop-in for `top_k_per_row_prefill` wherever every row starts at key 0
+    (`begin` is unsupported), which a single-sequence causal tail satisfies.
+    """
+    (
+        num_queries,
+        num_keys,
+        _num_sequences,
+        top_k,
+        logits_row_stride,
+        _logits_dtype,
+        _index_dtype,
+        _span_mode,
+    ) = _validate_args(
+        num_queries,
+        num_keys,
+        num_sequences,
+        top_k,
+        logits_row_stride,
+        logits_dtype,
+        index_dtype,
+        span_mode,
+    )
+    if top_k > _DEEP_SELECT_MAX_TOP_K:
+        raise ValueError(f"deep_select requires top_k <= {_DEEP_SELECT_MAX_TOP_K}, got {top_k}")
+    if num_keys >= _DEEP_SELECT_MAX_ROW:
+        raise ValueError(f"deep_select requires num_keys < {_DEEP_SELECT_MAX_ROW}, got {num_keys}")
+    torch, deep_select_topk, (input_align, output_align) = _load_deep_select_backend()
+    if (logits_row_stride * 4) % input_align:
+        raise ValueError(
+            f"deep_select needs a {input_align}-byte logits row stride, got "
+            f"{logits_row_stride} fp32 elements"
+        )
+    try:
+        operands = _build_operands(
+            torch,
+            num_queries=num_queries,
+            num_keys=num_keys,
+            top_k=top_k,
+            logits_row_stride=logits_row_stride,
+            device="cuda",
+        )
+        operands = replace(
+            operands,
+            out=_deep_select_output(
+                torch,
+                num_queries=num_queries,
+                top_k=top_k,
+                output_align=output_align,
+                device="cuda",
+            ),
+        )
+
+        def kernel() -> None:
+            _launch_deep_select(deep_select_topk, operands, top_k=top_k)
+
+        kernel()
+        torch.cuda.synchronize()
+        _check_selection(torch, operands, top_k=top_k)
+        # One logical call; count every launch it makes.
+        time_ms = Timer.cupti(kernel, kernel_name=None)
+        energy_j = Energy.perf(kernel, warmup=5, per_iter_time_ms=time_ms)
+    except torch.OutOfMemoryError as exc:
+        raise OOMError("dsa_topk_prefill:deep_select ran out of CUDA memory") from exc
+    except (RuntimeError, OSError) as exc:
+        raise KernelLaunchFailed(str(exc)) from exc
+
+    logical_bytes = _logical_bytes(num_queries=num_queries, num_keys=num_keys, top_k=top_k)
+    bandwidth_gbps = logical_bytes / (time_ms / 1000.0) / 1e9 if time_ms > 0 else 0.0
+    return ComputeMetrics(
+        time_ms=float(time_ms),
+        tflops=0.0,
+        memory_bandwidth_gbps=float(bandwidth_gbps),
+        energy_j=float(energy_j),
+    )
 
 
 def _load_sglang_cuda_backend() -> tuple[Any, Any]:

@@ -132,7 +132,6 @@ const TOPK_BACKENDS: &[&str] = &["vllm_cuda"];
 /// packaged `deepgemm_fp8` rows time the same kernel (0.573 ms at 2048 x 65536
 /// against 0.55 ms measured at a 261K-token context in capture 20260925_4).
 const MQA_LOGITS_PREFILL_BACKENDS: &[&str] = &["deepgemm_fp8"];
-const TOPK_PREFILL_BACKENDS: &[&str] = &["vllm_cuda"];
 const SPARSE_ATTN_BACKENDS: &[&str] = &["flashinfer_trtllm_fp8"];
 const MLA_APPEND_BACKENDS: &[&str] = &["vllm_cuda"];
 const INDEX_REMAP_BACKENDS: &[&str] = &["vllm_triton"];
@@ -483,6 +482,8 @@ pub struct Glm53FlashKernelPath {
     pub mla_layout_copies: bool,
     /// `mhc_fused_post_pre_rms_norm` backend of every fused mHC boundary.
     pub mhc_fused_backend: &'static str,
+    /// `indexer_topk_backend`: `vllm_cuda`, `deep_select` or `fastest`.
+    pub indexer_topk_backend: &'static str,
     /// vLLM `VLLM_SPARSE_INDEXER_MAX_LOGITS_MB`.
     pub indexer_max_logits_mb: u32,
 }
@@ -498,6 +499,17 @@ impl Glm53FlashKernelPath {
     }
 }
 
+impl Glm53FlashKernelPath {
+    /// The `dsa_topk_prefill` candidates of the prefill indexer's top-k;
+    /// `fastest` lets best-of-N pick per launch shape.
+    pub fn indexer_topk_prefill_backends(&self) -> Vec<&'static str> {
+        match self.indexer_topk_backend {
+            "fastest" => vec!["deep_select", "vllm_cuda"],
+            backend => vec![backend],
+        }
+    }
+}
+
 impl Default for Glm53FlashKernelPath {
     /// The captured fork.
     fn default() -> Self {
@@ -505,6 +517,7 @@ impl Default for Glm53FlashKernelPath {
             kda_prefill_backend: "vllm_triton",
             mla_layout_copies: true,
             mhc_fused_backend: MHC_BACKENDS[0],
+            indexer_topk_backend: "vllm_cuda",
             indexer_max_logits_mb: 512,
         }
     }
@@ -755,7 +768,7 @@ pub fn build_configs(
             mqa_logits_backends: MQA_LOGITS_BACKENDS.to_vec(),
             topk_backends: TOPK_BACKENDS.to_vec(),
             mqa_logits_prefill_backends: MQA_LOGITS_PREFILL_BACKENDS.to_vec(),
-            topk_prefill_backends: TOPK_PREFILL_BACKENDS.to_vec(),
+            topk_prefill_backends: parallel.kernel_path.indexer_topk_prefill_backends(),
             sparse_attention_backends: SPARSE_ATTN_BACKENDS.to_vec(),
             mla_cache_append_backends: MLA_APPEND_BACKENDS.to_vec(),
             index_remap_backends: INDEX_REMAP_BACKENDS.to_vec(),
@@ -1704,6 +1717,26 @@ mod tests {
             cudagraph_capture_sizes: Vec::new(),
             kernel_path: Default::default(),
         }
+    }
+
+    #[test]
+    fn fastest_indexer_top_k_offers_both_backends_to_best_of_n() {
+        let path = |indexer_topk_backend| Glm53FlashKernelPath {
+            indexer_topk_backend,
+            ..Glm53FlashKernelPath::default()
+        };
+        assert_eq!(
+            path("vllm_cuda").indexer_topk_prefill_backends(),
+            vec!["vllm_cuda"]
+        );
+        assert_eq!(
+            path("deep_select").indexer_topk_prefill_backends(),
+            vec!["deep_select"]
+        );
+        assert_eq!(
+            path("fastest").indexer_topk_prefill_backends(),
+            vec!["deep_select", "vllm_cuda"]
+        );
     }
 
     #[test]

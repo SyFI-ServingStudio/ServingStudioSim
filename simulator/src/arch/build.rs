@@ -17,7 +17,8 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
 use crate::arch::config::{
-    AttnArchSel, FfnArchSel, IterArchSel, ModelSpec, RoutingKind, GLM53_FLASH_KDA_PREFILL_BACKENDS,
+    AttnArchSel, FfnArchSel, IterArchSel, ModelSpec, RoutingKind,
+    GLM53_FLASH_INDEXER_TOPK_BACKENDS, GLM53_FLASH_KDA_PREFILL_BACKENDS,
     GLM53_FLASH_MHC_FUSED_BACKENDS,
 };
 use crate::arch::contract::SpeculativeUnifiedModel;
@@ -1817,11 +1818,12 @@ pub fn qwen3_fp8_ffn_moe(
 
 /// The vLLM code path a GLM-5.3-Flash arch tag's kernels follow.
 pub fn glm53_flash_kernel_path(sel: &IterArchSel) -> Result<Glm53FlashKernelPath> {
-    let (backend, mla_layout_copies, mhc_backend, indexer_max_logits_mb) = match sel {
+    let (backend, mla_layout_copies, mhc_backend, topk_backend, indexer_max_logits_mb) = match sel {
         IterArchSel::Glm53FlashVllmFp8KdaDsaMoe {
             kda_prefill_backend,
             mla_layout_copies,
             mhc_fused_backend,
+            indexer_topk_backend,
             indexer_max_logits_mb,
             ..
         }
@@ -1829,6 +1831,7 @@ pub fn glm53_flash_kernel_path(sel: &IterArchSel) -> Result<Glm53FlashKernelPath
             kda_prefill_backend,
             mla_layout_copies,
             mhc_fused_backend,
+            indexer_topk_backend,
             indexer_max_logits_mb,
             ..
         }
@@ -1836,6 +1839,7 @@ pub fn glm53_flash_kernel_path(sel: &IterArchSel) -> Result<Glm53FlashKernelPath
             kda_prefill_backend,
             mla_layout_copies,
             mhc_fused_backend,
+            indexer_topk_backend,
             indexer_max_logits_mb,
             ..
         }
@@ -1843,6 +1847,7 @@ pub fn glm53_flash_kernel_path(sel: &IterArchSel) -> Result<Glm53FlashKernelPath
             kda_prefill_backend,
             mla_layout_copies,
             mhc_fused_backend,
+            indexer_topk_backend,
             indexer_max_logits_mb,
             ..
         }
@@ -1850,6 +1855,7 @@ pub fn glm53_flash_kernel_path(sel: &IterArchSel) -> Result<Glm53FlashKernelPath
             kda_prefill_backend,
             mla_layout_copies,
             mhc_fused_backend,
+            indexer_topk_backend,
             indexer_max_logits_mb,
             ..
         }
@@ -1857,12 +1863,14 @@ pub fn glm53_flash_kernel_path(sel: &IterArchSel) -> Result<Glm53FlashKernelPath
             kda_prefill_backend,
             mla_layout_copies,
             mhc_fused_backend,
+            indexer_topk_backend,
             indexer_max_logits_mb,
             ..
         } => (
             kda_prefill_backend,
             *mla_layout_copies,
             mhc_fused_backend,
+            indexer_topk_backend,
             *indexer_max_logits_mb,
         ),
         other => unreachable!("{other:?} is not a GLM-5.3-Flash arch tag"),
@@ -1879,6 +1887,15 @@ pub fn glm53_flash_kernel_path(sel: &IterArchSel) -> Result<Glm53FlashKernelPath
     else {
         bail!("mhc_fused_backend {mhc_backend:?} is not one of {GLM53_FLASH_MHC_FUSED_BACKENDS:?}");
     };
+    let Some(&indexer_topk_backend) = GLM53_FLASH_INDEXER_TOPK_BACKENDS
+        .iter()
+        .find(|&&known| known == topk_backend.as_str())
+    else {
+        bail!(
+            "indexer_topk_backend {topk_backend:?} is not one of \
+             {GLM53_FLASH_INDEXER_TOPK_BACKENDS:?}"
+        );
+    };
     if indexer_max_logits_mb == 0 {
         bail!("indexer_max_logits_mb must be positive");
     }
@@ -1886,6 +1903,7 @@ pub fn glm53_flash_kernel_path(sel: &IterArchSel) -> Result<Glm53FlashKernelPath
         kda_prefill_backend,
         mla_layout_copies,
         mhc_fused_backend,
+        indexer_topk_backend,
         indexer_max_logits_mb,
     })
 }

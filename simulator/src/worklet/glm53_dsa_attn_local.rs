@@ -33,6 +33,8 @@
 //! A decode batch's indexer and attention shapes collapse to the batch's MAX
 //! context (the measured decode grids are uniform in context).
 
+use std::sync::Arc;
+
 use crate::op::attention::{
     Glm53KpoolSparseMlaConfig, Glm53KpoolSparseMlaInput, Glm53KpoolSparseMlaOp,
 };
@@ -192,6 +194,10 @@ pub struct Glm53DsaAttnLocalWorklet {
     pub topk_decode: Op<DsaPersistentTopkDecodeKernel>,
     pub mqa_logits_prefill: Op<DsaMqaLogitsPrefillKernel>,
     pub topk_prefill: Op<DsaTopkPrefillKernel>,
+    /// `vllm_cuda` top-k for launches that pack several requests, when
+    /// `topk_prefill` offers a backend that needs every row to start at key 0.
+    /// Its time lands in the `topk_prefill` slot.
+    topk_prefill_packed: Option<Arc<DsaTopkPrefillKernel>>,
     pub expand_pools: Op<ElementwiseKernel>,
     pub q_absorb: Op<BatchedGemmKernel>,
     pub q_concat: Op<ElementwiseKernel>,
@@ -444,6 +450,23 @@ impl Glm53DsaAttnLocalWorklet {
                 DsaMqaLogitsPrefillKernel::build,
                 bridge,
             )?,
+            topk_prefill_packed: if r
+                .topk_prefill
+                .backends
+                .iter()
+                .any(|backend| ROW_START_ZERO_TOPK_BACKENDS.contains(backend))
+            {
+                Some(Arc::new(DsaTopkPrefillKernel::build(
+                    format!("{n}.indexer.topk_prefill.packed"),
+                    DsaTopkPrefillKernelConfig {
+                        backends: vec![PACKED_TOPK_BACKEND],
+                        ..r.topk_prefill.clone()
+                    },
+                    bridge,
+                )?))
+            } else {
+                None
+            },
             topk_prefill: atomic(
                 n,
                 "indexer.topk_prefill",
@@ -636,7 +659,8 @@ impl Glm53DsaAttnLocalWorklet {
     }
 
     /// One MQA-logits and one top-k launch per indexer chunk, each slot summing
-    /// its launches.
+    /// its launches. A chunk packing several requests runs its top-k on
+    /// `topk_prefill_packed` when the configured backends cannot take it.
     fn eval_prefill_indexer(&self, chunks: &[IndexerChunk], ev: &mut Evaluator) {
         let mut logits = LeafMetrics::ZERO;
         let mut topk = LeafMetrics::ZERO;
@@ -651,7 +675,22 @@ impl Glm53DsaAttnLocalWorklet {
                 num_queries: chunk.rows,
                 num_keys: chunk.keys,
             };
-            topk.add_fanin(self.topk_prefill.kernel.eval(&input));
+            topk.add_fanin(match (&self.topk_prefill_packed, chunk.single_request) {
+                (Some(packed), false) => {
+                    let mut metrics = packed.eval(&input);
+                    // Report the pick against the slot's own backend list.
+                    metrics.backend_index = self
+                        .topk_prefill
+                        .kernel
+                        .config
+                        .backends
+                        .iter()
+                        .position(|&backend| backend == PACKED_TOPK_BACKEND)
+                        .map_or(LeafMetrics::NO_BACKEND, |index| index as u8);
+                    metrics
+                }
+                _ => self.topk_prefill.kernel.eval(&input),
+            });
         }
         let shapes = || {
             SlotInput::from(DsaIndexerPrefillLog {
@@ -680,6 +719,11 @@ struct Work {
 /// vLLM `get_max_prefill_buffer_size`: the gathered index-K workspace holds
 /// `40 * max_model_len` keys, and a request pack never exceeds it.
 const PREFILL_KEY_WORKSPACE_PER_MODEL_LEN: u64 = 40;
+/// Top-k backends that take no row start (DeepSelect's `begin` is
+/// unsupported), so every row of a launch must start at key 0.
+const ROW_START_ZERO_TOPK_BACKENDS: &[&str] = &["deep_select"];
+/// The top-k vLLM runs on every prefill chunk, packed ones included.
+const PACKED_TOPK_BACKEND: &str = "vllm_cuda";
 
 /// What bounds the prefill indexer's launches.
 struct IndexerBudget {
@@ -700,6 +744,9 @@ struct IndexerChunk {
     /// spans `(pos + 1) / index_kpool` completed pools. Never below `rows`
     /// (the kernel contract `rows <= keys`).
     keys: u32,
+    /// Every row starts at key 0: one request, or a query slice of one. A
+    /// pack of several requests offsets each later request's rows.
+    single_request: bool,
 }
 
 /// vLLM's `_split_indexer_prefill_chunks` (`v1/attention/backends/mla/
@@ -772,6 +819,7 @@ fn indexer_chunk(
     Ok(IndexerChunk {
         rows: u32::try_from(slice).map_err(|_| "prefill indexer rows overflow u32")?,
         keys: u32::try_from(keys.max(slice)).map_err(|_| "prefill indexer keys overflow u32")?,
+        single_request: pack.len() == 1,
     })
 }
 
@@ -939,7 +987,8 @@ mod tests {
             long.prefill_indexer_chunks,
             vec![IndexerChunk {
                 rows: 100,
-                keys: 562
+                keys: 562,
+                single_request: true
             }]
         );
     }
@@ -955,7 +1004,10 @@ mod tests {
         };
         // The fresh request spans fewer pools than rows: the contract
         // `rows <= keys` lifts it to a 1000 x 1000 tail.
-        assert_eq!((short.rows, short.keys), (1000, 1000));
+        assert_eq!(
+            (short.rows, short.keys, short.single_request),
+            (1000, 1000, true)
+        );
         let pairs = (pool_prefix_sum(262_168, 4) - pool_prefix_sum(261_120, 4)) as f64;
         let (rows, keys) = (f64::from(long.rows), f64::from(long.keys));
         assert_eq!(long.rows, 1048);
@@ -966,7 +1018,8 @@ mod tests {
             short.prefill_indexer_chunks,
             vec![IndexerChunk {
                 rows: 2048,
-                keys: 2048
+                keys: 2048,
+                single_request: true
             }]
         );
     }
@@ -982,6 +1035,7 @@ mod tests {
         assert_eq!(chunks.len(), 31);
         assert!(chunks[..30].iter().all(|c| c.rows == 546));
         assert_eq!(chunks[30].rows, 16_384 - 30 * 546);
+        assert!(chunks.iter().all(|c| c.single_request));
         // A slice's equivalent tail is its rows' mean pool span plus half its
         // rows, rounded up: 242,005 keys for the first, 245,761 for the last.
         assert_eq!(chunks[0].keys, 242_005);
@@ -995,11 +1049,13 @@ mod tests {
     #[test]
     fn short_requests_pack_into_one_launch_with_row_starts() {
         // Three 1k-row requests at 8k context: 3000 rows x 6000 pools fit
-        // 2^27 elements, so vLLM scores them in one call.
+        // 2^27 elements, so vLLM scores them in one call whose second and
+        // third requests start past key 0 (no DeepSelect).
         let w = work(vec![(7000, 1000); 3], Vec::new());
         assert_eq!(w.prefill_indexer_chunks.len(), 1);
         let chunk = w.prefill_indexer_chunks[0];
         assert_eq!(chunk.rows, 3000);
+        assert!(!chunk.single_request);
         // Per request: rows at 7000..7999 span 1750..=2000 pools.
         let pairs = 3 * (pool_prefix_sum(8000, 4) - pool_prefix_sum(7000, 4));
         let (r, k) = (3000_u64, u64::from(chunk.keys));
@@ -1010,13 +1066,18 @@ mod tests {
     fn a_pack_closes_before_the_request_that_would_overflow_it() {
         // 2000 rows over 30k pools fit 2^27 elements; two such requests do
         // not, so the first closes alone. A 3-token request (no completed
-        // pool) still joins the next pack.
+        // pool) still joins the next pack and gives it nonzero row starts.
         let w = work(vec![(118_000, 2000), (118_000, 2000), (0, 3)], Vec::new());
-        let rows: Vec<u32> = w.prefill_indexer_chunks.iter().map(|c| c.rows).collect();
-        assert_eq!(rows, vec![2000, 2003]);
+        let shape: Vec<(u32, bool)> = w
+            .prefill_indexer_chunks
+            .iter()
+            .map(|c| (c.rows, c.single_request))
+            .collect();
+        assert_eq!(shape, vec![(2000, true), (2003, false)]);
         // Alone, a request with no completed pool is no launch at all.
         let w = work(vec![(983_616, 16_384), (0, 3)], Vec::new());
         assert_eq!(w.prefill_indexer_rows, 16_387);
+        assert!(w.prefill_indexer_chunks.iter().all(|c| c.single_request));
         let rows: u32 = w.prefill_indexer_chunks.iter().map(|c| c.rows).sum();
         assert_eq!(rows, 16_384);
     }
@@ -1051,5 +1112,32 @@ mod tests {
             .slots
             .iter()
             .any(|slot| slot.name == "m.dsa.sparse_mla.decode"));
+    }
+
+    #[test]
+    fn a_row_start_zero_top_k_gets_a_vllm_fallback_for_packed_launches() {
+        // DeepSelect takes no row starts, so a pack of several requests must
+        // still price its top-k on vllm_cuda, inside the same slot.
+        let build = |backends: Vec<&'static str>| {
+            let bridge = PerfApiBridge::new_uninit_for_test();
+            bridge.enable_enumerate();
+            let mut config = cfg();
+            config.topk_prefill_backends = backends;
+            Glm53DsaAttnLocalWorklet::build(
+                "m.dsa".into(),
+                Glm53DsaAttnLocalWorklet::resolve_config(&config),
+                &bridge,
+            )
+            .unwrap()
+        };
+        assert!(build(vec!["vllm_cuda"]).topk_prefill_packed.is_none());
+        for backends in [vec!["deep_select"], vec!["deep_select", "vllm_cuda"]] {
+            let worklet = build(backends);
+            let packed = worklet.topk_prefill_packed.as_ref().unwrap();
+            assert_eq!(packed.config.backends, vec!["vllm_cuda"]);
+            let mut builder = CostTreeBuilder::new();
+            let root = worklet.compile(&mut builder);
+            assert_eq!(builder.finish(root).slots.len(), 24 + 4 + 3);
+        }
     }
 }
