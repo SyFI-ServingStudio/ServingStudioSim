@@ -1847,8 +1847,8 @@ mod tests {
         assert_eq!(ep8.recurrent_state_bytes_per_request(), 8 * 34 * 1152 * 512);
         assert_eq!((ep8.gpus_per_replica(), ep8.num_attn_shards()), (8, 8));
         let moe = |ranks: usize| 2 + 2 + ranks * 14;
-        let kda_dense = 6 + 13 + 5;
-        let total = |ranks| 4 + 2 * kda_dense + (6 + 31 + moe(ranks)) + (6 + 13 + moe(ranks)) + 4;
+        let kda_dense = 6 + 12 + 5;
+        let total = |ranks| 4 + 2 * kda_dense + (6 + 31 + moe(ranks)) + (6 + 12 + moe(ranks)) + 4;
         assert_eq!(ep8.n_slots, total(8));
         assert_eq!(built_with(layout(4, false)).n_slots, total(1));
         assert_eq!(built_with(layout(8, false)).n_slots, total(1));
@@ -1927,12 +1927,12 @@ mod tests {
     fn compiled_tree_has_a_fixed_slot_count() {
         let model = built();
         // Prologue 4 (the all-reduce is a fused + large pair); per group:
-        // 2 boundaries + 2 all-reduce pairs + attention (KDA 13, DSA 31) +
+        // 2 boundaries + 2 all-reduce pairs + attention (KDA 12, DSA 31) +
         // FFN (dense 5; MoE 2 router + 2 glue + 4 ranks x (concurrent 5 + 2,
         // serial 2 + 5)); epilogue 4.
-        let kda_dense = 6 + 13 + 5;
+        let kda_dense = 6 + 12 + 5;
         let dsa_moe = 6 + 31 + 60;
-        let kda_moe = 6 + 13 + 60;
+        let kda_moe = 6 + 12 + 60;
         assert_eq!(model.n_slots, 4 + 2 * kda_dense + dsa_moe + kda_moe + 4);
         assert_eq!(model.cost_log_manifest().slots.len(), model.n_slots);
     }
@@ -1955,17 +1955,17 @@ mod tests {
                     include_str!(
                         "../../../model/work/location_maps/glm53_flash_vllm_fp8_kda_dsa_moe_unified.json"
                     ),
-                    128,
+                    125,
                 ),
                 (
                     layout(8, true),
                     include_str!(
                         "../../../model/work/location_maps/glm53_flash_vllm_fp8_kda_dsa_moe_unified_ep8.json"
                     ),
-                    144,
+                    141,
                 ),
-                (layout(4, false), moe_tp, 116),
-                (layout(8, false), moe_tp, 116),
+                (layout(4, false), moe_tp, 113),
+                (layout(8, false), moe_tp, 113),
             ],
         );
     }
@@ -1986,17 +1986,17 @@ mod tests {
                     include_str!(
                         "../../../model/work/location_maps/glm53_flash_vllm_nvfp4_kda_dsa_moe_unified.json"
                     ),
-                    124,
+                    121,
                 ),
                 (
                     layout(8, true),
                     include_str!(
                         "../../../model/work/location_maps/glm53_flash_vllm_nvfp4_kda_dsa_moe_unified_ep8.json"
                     ),
-                    140,
+                    137,
                 ),
-                (layout(4, false), moe_tp, 112),
-                (layout(8, false), moe_tp, 112),
+                (layout(4, false), moe_tp, 109),
+                (layout(8, false), moe_tp, 109),
             ],
         );
     }
