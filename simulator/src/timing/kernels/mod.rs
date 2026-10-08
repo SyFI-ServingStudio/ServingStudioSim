@@ -39,6 +39,7 @@ pub mod gdn_prefill_post_conv;
 pub mod gdn_recurrent_decode;
 pub mod gemm_fp32_output;
 pub mod grouped_gemm;
+pub mod inkling_qkvr_prep;
 pub mod inv_rope_fp8_quant;
 pub mod kda_chunk_prefill;
 pub mod kda_recurrent_decode;
@@ -303,6 +304,10 @@ pub use packed_kv_cache_gather::{
 };
 pub use q_kv_rms_norm::{
     QKvRmsNormKernel, QKvRmsNormKernelConfig, QKvRmsNormKernelInput, QKvRmsNormSpec,
+};
+pub use inkling_qkvr_prep::{
+    InklingQkvrPrepKernel, InklingQkvrPrepKernelConfig, InklingQkvrPrepKernelInput,
+    InklingQkvrPrepSpec,
 };
 pub use q_pad_kv_rope_mxfp8_insert::{
     QPadKvRopeMxfp8InsertKernel, QPadKvRopeMxfp8InsertKernelConfig,
