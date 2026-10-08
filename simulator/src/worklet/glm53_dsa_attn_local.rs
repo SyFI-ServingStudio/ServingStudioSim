@@ -12,7 +12,11 @@
 //!   update, paged MQA logits and persistent top-k over `ceil(ctx / 4)` pools
 //!   (decode rows), the prefill MQA logits and per-row top-k over each row's
 //!   `(pos + 1) / 4` pools, and the pool-to-token expansion. The indexer
-//!   replicates its 32 heads on every rank.
+//!   replicates its 32 heads on every rank. vLLM runs the prefill logits and
+//!   top-k once per chunk of its metadata builder's plan: requests packed while
+//!   `rows x pools` fp32 logits fit `VLLM_SPARSE_INDEXER_MAX_LOGITS_MB`, and a
+//!   longer request split along its queries (31 calls for 16,384 rows over
+//!   245,760 pools at the 512 MiB default).
 //! * MLA: `W_UK` absorb, the FP8 query quant, the kpool sparse-MLA compound op
 //!   (cache append, remap, token-sparse attention for prefill and decode rows),
 //!   and `W_UV`.
@@ -45,7 +49,10 @@ use crate::timing::kernels::{
     QKvRmsNormKernelConfig, QKvRmsNormKernelInput, SingleGemmKernel, SingleGemmKernelConfig,
     SingleGemmKernelInput,
 };
-use crate::timing::{BuildError, CostNode, CostTreeBuilder, Dim, Evaluator, PerfApiBridge};
+use crate::timing::slot_input::DsaIndexerPrefillLog;
+use crate::timing::{
+    BuildError, CostNode, CostTreeBuilder, Dim, Evaluator, LeafMetrics, PerfApiBridge, SlotInput,
+};
 
 use super::glm53_common::{atomic, elementwise, push_or_zero, repeated};
 
@@ -117,6 +124,10 @@ pub struct Glm53DsaAttnLocalWorkletConfig {
     /// skips the empty-query `masked_fill_` unless DCP or HiSparse is on, so
     /// `false` zeroes both.
     pub mla_layout_copies: bool,
+    /// vLLM's prefill-indexer logits budget (`VLLM_SPARSE_INDEXER_MAX_LOGITS_MB`
+    /// in bytes): the fp32 `[rows, pools]` matrix of one MQA-logits call stays
+    /// within it, and each call is followed by its own top-k.
+    pub indexer_max_logits_bytes: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -502,7 +513,7 @@ impl Glm53DsaAttnLocalWorklet {
 
     pub fn eval(&self, input: &Glm53DsaAttnLocalWorkletInput, ev: &mut Evaluator) {
         let cfg = &self.resolved.raw_cfg;
-        let w = derive_work(input, cfg.index_topk, cfg.index_kpool)
+        let w = derive_work(input, &self.indexer_budget())
             .unwrap_or_else(|reason| panic!("invalid Glm53DsaAttnLocalWorkletInput: {reason}"));
         let rows = SingleGemmKernelInput { m: w.total_tokens };
         let tokens = |num_tokens| ElementwiseKernelInput { num_tokens };
@@ -573,25 +584,7 @@ impl Glm53DsaAttnLocalWorklet {
             no_decode,
             ev,
         );
-        let skip_prefill_indexer = w.prefill_indexer_rows == 0;
-        push_or_zero(
-            &self.mqa_logits_prefill,
-            DsaMqaLogitsPrefillKernelInput {
-                num_queries: w.prefill_indexer_rows,
-                num_keys: w.prefill_indexer_keys,
-            },
-            skip_prefill_indexer,
-            ev,
-        );
-        push_or_zero(
-            &self.topk_prefill,
-            DsaTopkPrefillKernelInput {
-                num_queries: w.prefill_indexer_rows,
-                num_keys: w.prefill_indexer_keys,
-            },
-            skip_prefill_indexer,
-            ev,
-        );
+        self.eval_prefill_indexer(&w.prefill_indexer_chunks, ev);
         let expand_rows = w.decode_rows + w.prefill_indexer_rows;
         push_or_zero(
             &self.expand_pools,
@@ -631,6 +624,45 @@ impl Glm53DsaAttnLocalWorklet {
     }
 }
 
+impl Glm53DsaAttnLocalWorklet {
+    fn indexer_budget(&self) -> IndexerBudget {
+        let cfg = &self.resolved.raw_cfg;
+        IndexerBudget {
+            index_topk: cfg.index_topk,
+            index_kpool: cfg.index_kpool,
+            max_logits_elems: cfg.indexer_max_logits_bytes / u64::from(DType::Fp32.size_bytes()),
+            max_keys: PREFILL_KEY_WORKSPACE_PER_MODEL_LEN * u64::from(cfg.max_model_len),
+        }
+    }
+
+    /// One MQA-logits and one top-k launch per indexer chunk, each slot summing
+    /// its launches.
+    fn eval_prefill_indexer(&self, chunks: &[IndexerChunk], ev: &mut Evaluator) {
+        let mut logits = LeafMetrics::ZERO;
+        let mut topk = LeafMetrics::ZERO;
+        for chunk in chunks {
+            logits.add_fanin(self.mqa_logits_prefill.kernel.eval(
+                &DsaMqaLogitsPrefillKernelInput {
+                    num_queries: chunk.rows,
+                    num_keys: chunk.keys,
+                },
+            ));
+            let input = DsaTopkPrefillKernelInput {
+                num_queries: chunk.rows,
+                num_keys: chunk.keys,
+            };
+            topk.add_fanin(self.topk_prefill.kernel.eval(&input));
+        }
+        let shapes = || {
+            SlotInput::from(DsaIndexerPrefillLog {
+                prefill_query_key_pairs: chunks.iter().map(|c| (c.rows, c.keys)).collect(),
+            })
+        };
+        ev.push(logits, shapes);
+        ev.push(topk, shapes);
+    }
+}
+
 struct Work {
     total_tokens: u32,
     prefill_tokens: u32,
@@ -639,23 +671,117 @@ struct Work {
     decode_pools: u32,
     /// Every prefill row once any prefill context exceeds `index_topk`, else
     /// 0: vLLM skips the prefill indexer only when every context fits, and
-    /// otherwise runs one logits and one top-k launch over all prefill rows.
+    /// otherwise scores and selects for all prefill rows.
     prefill_indexer_rows: u32,
+    /// The logits + top-k launches over those rows (empty when skipped).
+    prefill_indexer_chunks: Vec<IndexerChunk>,
+}
+
+/// vLLM `get_max_prefill_buffer_size`: the gathered index-K workspace holds
+/// `40 * max_model_len` keys, and a request pack never exceeds it.
+const PREFILL_KEY_WORKSPACE_PER_MODEL_LEN: u64 = 40;
+
+/// What bounds the prefill indexer's launches.
+struct IndexerBudget {
+    index_topk: u32,
+    index_kpool: u32,
+    /// fp32 logits elements one call may hold.
+    max_logits_elems: u64,
+    /// Pools one request pack may gather.
+    max_keys: u64,
+}
+
+/// One MQA-logits call and the top-k over its rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct IndexerChunk {
+    rows: u32,
     /// The single-causal-tail key count whose `rows x keys` triangle holds as
-    /// many (row, pool) pairs as the iteration's rows, where the row at
-    /// position `pos` spans `(pos + 1) / index_kpool` completed pools. Never
-    /// below `prefill_indexer_rows` (the kernel contract `rows <= keys`).
-    prefill_indexer_keys: u32,
+    /// many (row, pool) pairs as the chunk, where the row at position `pos`
+    /// spans `(pos + 1) / index_kpool` completed pools. Never below `rows`
+    /// (the kernel contract `rows <= keys`).
+    keys: u32,
+}
+
+/// vLLM's `_split_indexer_prefill_chunks` (`v1/attention/backends/mla/
+/// indexer.py`, which the fork's kpool indexer loops over): pack requests in
+/// order while the pack's `rows x pools` stays within the logits budget and
+/// its pools within the workspace; a request that alone exceeds the budget is
+/// split along its queries into `max_logits_elems / pools`-row slices. Pools
+/// are `context / index_kpool` per request; a pack with none is skipped.
+fn plan_indexer_chunks(
+    pairs: &[(u32, u32)],
+    budget: &IndexerBudget,
+) -> Result<Vec<IndexerChunk>, String> {
+    let kpool = budget.index_kpool;
+    let pools = |&(prefix, append): &(u32, u32)| u64::from((prefix + append) / kpool);
+    let mut chunks = Vec::new();
+    let mut end = 0;
+    while end < pairs.len() {
+        let start = end;
+        let (mut rows, mut keys) = (0_u64, 0_u64);
+        while end < pairs.len() {
+            let (new_rows, new_keys) = (rows + u64::from(pairs[end].1), keys + pools(&pairs[end]));
+            if new_keys > budget.max_keys || new_rows * new_keys > budget.max_logits_elems {
+                break;
+            }
+            (rows, keys) = (new_rows, new_keys);
+            end += 1;
+        }
+        if end == start {
+            (rows, keys) = (u64::from(pairs[end].1), pools(&pairs[end]));
+            end += 1;
+        }
+        if keys == 0 {
+            continue;
+        }
+        let pack = &pairs[start..end];
+        let slice_rows = (budget.max_logits_elems / keys).max(1);
+        let mut offset = 0;
+        while offset < rows {
+            let slice = slice_rows.min(rows - offset);
+            chunks.push(indexer_chunk(pack, offset, slice, kpool)?);
+            offset += slice;
+        }
+    }
+    Ok(chunks)
+}
+
+/// The chunk over rows `[offset, offset + slice)` of a pack's concatenated
+/// queries.
+fn indexer_chunk(
+    pack: &[(u32, u32)],
+    offset: u64,
+    slice: u64,
+    kpool: u32,
+) -> Result<IndexerChunk, String> {
+    let mut pooled_pairs = 0_u64;
+    let mut first_row = 0_u64;
+    for &(prefix, append) in pack {
+        let lo = offset.max(first_row);
+        let hi = (offset + slice).min(first_row + u64::from(append));
+        if lo < hi {
+            // Rows of this request at positions prefix + (lo..hi) - first_row.
+            let from = u64::from(prefix) + lo - first_row;
+            let to = u64::from(prefix) + hi - first_row;
+            pooled_pairs += pool_prefix_sum(to as u32, kpool) - pool_prefix_sum(from as u32, kpool);
+        }
+        first_row += u64::from(append);
+    }
+    // rows * keys - rows * (rows - 1) / 2 == pooled_pairs, solved for keys.
+    let keys = (2 * pooled_pairs + slice * (slice - 1)).div_ceil(2 * slice);
+    Ok(IndexerChunk {
+        rows: u32::try_from(slice).map_err(|_| "prefill indexer rows overflow u32")?,
+        keys: u32::try_from(keys.max(slice)).map_err(|_| "prefill indexer keys overflow u32")?,
+    })
 }
 
 fn derive_work(
     input: &Glm53DsaAttnLocalWorkletInput,
-    index_topk: u32,
-    index_kpool: u32,
+    budget: &IndexerBudget,
 ) -> Result<Work, String> {
+    let (index_topk, index_kpool) = (budget.index_topk, budget.index_kpool);
     let mut prefill_tokens = 0_u32;
     let mut needs_prefill_indexer = false;
-    let mut pooled_pairs = 0_u64;
     for (index, &(prefix, append)) in input.prefill_chunk_pairs.iter().enumerate() {
         if append == 0 {
             return Err(format!("prefill request {index} append must be positive"));
@@ -667,18 +793,14 @@ fn derive_work(
             .checked_add(append)
             .ok_or("prefill token sum overflows u32")?;
         needs_prefill_indexer |= context > index_topk;
-        pooled_pairs +=
-            pool_prefix_sum(context, index_kpool) - pool_prefix_sum(prefix, index_kpool);
     }
-    let (prefill_indexer_rows, prefill_indexer_keys) = if needs_prefill_indexer {
-        let rows = u64::from(prefill_tokens);
-        // rows * keys - rows * (rows - 1) / 2 == pooled_pairs, solved for keys.
-        let keys = (2 * pooled_pairs + rows * (rows - 1)).div_ceil(2 * rows);
-        let keys =
-            u32::try_from(keys.max(rows)).map_err(|_| "prefill indexer keys overflow u32")?;
-        (prefill_tokens, keys)
+    let (prefill_indexer_rows, prefill_indexer_chunks) = if needs_prefill_indexer {
+        (
+            prefill_tokens,
+            plan_indexer_chunks(&input.prefill_chunk_pairs, budget)?,
+        )
     } else {
-        (0, 0)
+        (0, Vec::new())
     };
     let decode_rows = input.decode_kv_lens.len() as u32;
     if input.decode_kv_lens.contains(&0) {
@@ -697,7 +819,7 @@ fn derive_work(
         decode_rows,
         decode_pools: max_decode.div_ceil(index_kpool),
         prefill_indexer_rows,
-        prefill_indexer_keys,
+        prefill_indexer_chunks,
     })
 }
 
@@ -750,7 +872,29 @@ mod tests {
             index_remap_backends: vec!["vllm_triton"],
             elementwise_backends: vec!["triton"],
             mla_layout_copies: true,
+            indexer_max_logits_bytes: 512 << 20,
         }
+    }
+
+    /// vLLM's defaults: 512 MiB of fp32 logits, `40 * 1M` workspace pools.
+    fn budget() -> IndexerBudget {
+        IndexerBudget {
+            index_topk: 2048,
+            index_kpool: 4,
+            max_logits_elems: (512 << 20) / 4,
+            max_keys: 40 << 20,
+        }
+    }
+
+    fn work(prefill_chunk_pairs: Vec<(u32, u32)>, decode_kv_lens: Vec<u32>) -> Work {
+        derive_work(
+            &Glm53DsaAttnLocalWorkletInput {
+                prefill_chunk_pairs,
+                decode_kv_lens,
+            },
+            &budget(),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -779,66 +923,102 @@ mod tests {
 
     #[test]
     fn decode_indexer_counts_pools_and_short_prefill_skips_its_indexer() {
-        let w = derive_work(
-            &Glm53DsaAttnLocalWorkletInput {
-                prefill_chunk_pairs: vec![(0, 2019)],
-                decode_kv_lens: vec![1000, 4001],
-            },
-            2048,
-            4,
-        )
-        .unwrap();
+        let w = work(vec![(0, 2019)], vec![1000, 4001]);
         assert_eq!(
             (w.total_tokens, w.prefill_tokens, w.decode_rows),
             (2021, 2019, 2)
         );
         assert_eq!(w.decode_pools, 1001);
         assert_eq!(w.prefill_indexer_rows, 0);
-        let long = derive_work(
-            &Glm53DsaAttnLocalWorkletInput {
-                prefill_chunk_pairs: vec![(2000, 100)],
-                decode_kv_lens: Vec::new(),
-            },
-            2048,
-            4,
-        )
-        .unwrap();
+        assert!(w.prefill_indexer_chunks.is_empty());
+        let long = work(vec![(2000, 100)], Vec::new());
         assert_eq!(long.prefill_indexer_rows, 100);
         // Rows at positions 2000..2099 span 500..=525 pools (51225 pairs); a
         // 100-row causal tail over 562 keys holds the same count.
-        assert_eq!(long.prefill_indexer_keys, 562);
+        assert_eq!(
+            long.prefill_indexer_chunks,
+            vec![IndexerChunk {
+                rows: 100,
+                keys: 562
+            }]
+        );
     }
 
     #[test]
     fn one_long_context_sends_every_prefill_row_through_the_indexer() {
-        let w = derive_work(
-            &Glm53DsaAttnLocalWorkletInput {
-                prefill_chunk_pairs: vec![(0, 1000), (261_120, 1048)],
-                decode_kv_lens: vec![500],
-            },
-            2048,
-            4,
-        )
-        .unwrap();
+        // 2048 rows x (250 + 65542) pools is just over 2^27 logits, so the two
+        // requests are separate launches.
+        let w = work(vec![(0, 1000), (261_120, 1048)], vec![500]);
         assert_eq!(w.prefill_indexer_rows, 2048);
-        let pairs = (pool_prefix_sum(1000, 4) + pool_prefix_sum(262_168, 4)
-            - pool_prefix_sum(261_120, 4)) as f64;
-        let (rows, keys) = (2048.0, f64::from(w.prefill_indexer_keys));
+        let [short, long] = w.prefill_indexer_chunks[..] else {
+            panic!("expected two launches, got {:?}", w.prefill_indexer_chunks);
+        };
+        // The fresh request spans fewer pools than rows: the contract
+        // `rows <= keys` lifts it to a 1000 x 1000 tail.
+        assert_eq!((short.rows, short.keys), (1000, 1000));
+        let pairs = (pool_prefix_sum(262_168, 4) - pool_prefix_sum(261_120, 4)) as f64;
+        let (rows, keys) = (f64::from(long.rows), f64::from(long.keys));
+        assert_eq!(long.rows, 1048);
         assert!((rows * keys - rows * (rows - 1.0) / 2.0 - pairs).abs() < rows);
         // A short context alone keeps the contract `rows <= keys`.
-        let short = derive_work(
-            &Glm53DsaAttnLocalWorkletInput {
-                prefill_chunk_pairs: vec![(2048, 2048)],
-                decode_kv_lens: Vec::new(),
-            },
-            2048,
-            4,
-        )
-        .unwrap();
+        let short = work(vec![(2048, 2048)], Vec::new());
         assert_eq!(
-            (short.prefill_indexer_rows, short.prefill_indexer_keys),
-            (2048, 2048)
+            short.prefill_indexer_chunks,
+            vec![IndexerChunk {
+                rows: 2048,
+                keys: 2048
+            }]
         );
+    }
+
+    #[test]
+    fn a_long_request_splits_into_vllm_query_slices() {
+        // vLLM at its 512 MiB default: 245,760 pools leave 2^27 / 245,760 =
+        // 546 rows per call, so a 16,384-row request is 30 slices of 546 and
+        // one of 4 (the 31 logits + 31 top-k launches measured on B200).
+        let prefix = 245_760 * 4 - 16_384;
+        let w = work(vec![(prefix, 16_384)], Vec::new());
+        let chunks = &w.prefill_indexer_chunks;
+        assert_eq!(chunks.len(), 31);
+        assert!(chunks[..30].iter().all(|c| c.rows == 546));
+        assert_eq!(chunks[30].rows, 16_384 - 30 * 546);
+        // A slice's equivalent tail is its rows' mean pool span plus half its
+        // rows, rounded up: 242,005 keys for the first, 245,761 for the last.
+        assert_eq!(chunks[0].keys, 242_005);
+        assert_eq!(chunks[30].keys, 245_761);
+        // Every slice's logits fit the budget.
+        assert!(chunks
+            .iter()
+            .all(|c| u64::from(c.rows) * 245_760 <= (512 << 20) / 4));
+    }
+
+    #[test]
+    fn short_requests_pack_into_one_launch_with_row_starts() {
+        // Three 1k-row requests at 8k context: 3000 rows x 6000 pools fit
+        // 2^27 elements, so vLLM scores them in one call.
+        let w = work(vec![(7000, 1000); 3], Vec::new());
+        assert_eq!(w.prefill_indexer_chunks.len(), 1);
+        let chunk = w.prefill_indexer_chunks[0];
+        assert_eq!(chunk.rows, 3000);
+        // Per request: rows at 7000..7999 span 1750..=2000 pools.
+        let pairs = 3 * (pool_prefix_sum(8000, 4) - pool_prefix_sum(7000, 4));
+        let (r, k) = (3000_u64, u64::from(chunk.keys));
+        assert!((r * k - r * (r - 1) / 2).abs_diff(pairs) < r);
+    }
+
+    #[test]
+    fn a_pack_closes_before_the_request_that_would_overflow_it() {
+        // 2000 rows over 30k pools fit 2^27 elements; two such requests do
+        // not, so the first closes alone. A 3-token request (no completed
+        // pool) still joins the next pack.
+        let w = work(vec![(118_000, 2000), (118_000, 2000), (0, 3)], Vec::new());
+        let rows: Vec<u32> = w.prefill_indexer_chunks.iter().map(|c| c.rows).collect();
+        assert_eq!(rows, vec![2000, 2003]);
+        // Alone, a request with no completed pool is no launch at all.
+        let w = work(vec![(983_616, 16_384), (0, 3)], Vec::new());
+        assert_eq!(w.prefill_indexer_rows, 16_387);
+        let rows: u32 = w.prefill_indexer_chunks.iter().map(|c| c.rows).sum();
+        assert_eq!(rows, 16_384);
     }
 
     #[test]

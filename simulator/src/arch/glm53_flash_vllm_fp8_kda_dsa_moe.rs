@@ -483,6 +483,8 @@ pub struct Glm53FlashKernelPath {
     pub mla_layout_copies: bool,
     /// `mhc_fused_post_pre_rms_norm` backend of every fused mHC boundary.
     pub mhc_fused_backend: &'static str,
+    /// vLLM `VLLM_SPARSE_INDEXER_MAX_LOGITS_MB`.
+    pub indexer_max_logits_mb: u32,
 }
 
 impl Glm53FlashKernelPath {
@@ -503,6 +505,7 @@ impl Default for Glm53FlashKernelPath {
             kda_prefill_backend: "vllm_triton",
             mla_layout_copies: true,
             mhc_fused_backend: MHC_BACKENDS[0],
+            indexer_max_logits_mb: 512,
         }
     }
 }
@@ -758,6 +761,9 @@ pub fn build_configs(
             index_remap_backends: INDEX_REMAP_BACKENDS.to_vec(),
             elementwise_backends: ELEMENTWISE_BACKENDS.to_vec(),
             mla_layout_copies: parallel.kernel_path.mla_layout_copies,
+            indexer_max_logits_bytes: u64::from(parallel.kernel_path.indexer_max_logits_mb)
+                * 1024
+                * 1024,
         },
         dense_ffn: mlp(
             divide("intermediate_size", model.intermediate_size)?,
