@@ -39,6 +39,13 @@ tokens as ``P // max_sequence_length`` full sequences plus one remainder, which
 is the chunked-prefill shape. Chunk size (64), fp32 state in ``[N,H,V,K]``
 layout, ``safe_gate=True`` and ``lower_bound=-5.0`` are fixed by the
 production path. They are not args.
+
+The ``flashinfer_*`` backends time ``flashinfer.kda.recurrent_kda`` with an
+explicit Blackwell backend, called as vLLM's ``--kda-prefill-backend
+flashinfer`` path calls it, on the same operand layout: the q/k/v copies, then
+one fused kernel that also does the L2 norms, the gate and the beta sigmoid.
+That call takes the raw bf16 beta logit, so the beta sigmoid that the
+``vllm_triton`` row leaves outside is inside these rows.
 """
 
 from __future__ import annotations
@@ -129,6 +136,8 @@ DOC = KernelDoc(
         "so does vllm_triton's beta sigmoid.",
         "FLOPs are logical counts at a 64-token chunk width; bytes count each "
         "input once and leave out the copies and intermediates.",
+        "The flashinfer_* backends fuse the beta sigmoid into the call and need "
+        "head_dim 128 and num_heads divisible by 8.",
     ),
     reference="profiling.runners.attention.kda_chunk_prefill_reference",
 )
@@ -165,6 +174,82 @@ register(
         row_provenance_ref=RunnerRef(
             module_name="profiling.runners.attention.kda_chunk_prefill_vllm_triton",
             function_name="row_provenance",
+        ),
+    )
+)
+
+
+# FlashInfer's Blackwell KDA prefill (flashinfer/kda.py `recurrent_kda`). Both
+# backends refuse any device but CC 10.0 / 10.3 (`get_compute_capability(...)
+# not in ((10, 0), (10, 3))` in flashinfer/kda_prefill_tirx.py and
+# kda_prefill_persistent.py), hence sm_100a / sm_103a rather than sm_100f.
+# FlashInfer's `ptx` backend is SM103a-only and its `cake` and `small-bh`
+# backends reject an FP32 state, so none of them is registered for this
+# contract.
+_FLASHINFER_BLACKWELL = BackendSupport(
+    compute=frozenset({DType.BF16}),
+    sm_targets=frozenset({"sm_100a", "sm_103a"}),
+)
+_FLASHINFER_RUNNER = "profiling.runners.attention.kda_chunk_prefill_flashinfer"
+_FLASHINFER_KDA_URL = "https://github.com/flashinfer-ai/flashinfer/blob/main/flashinfer/kda.py"
+
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="flashinfer_tirx",
+        supports=_FLASHINFER_BLACKWELL,
+        runner_ref=RunnerRef(
+            module_name=_FLASHINFER_RUNNER,
+            function_name="profile_kda_chunk_prefill_flashinfer_tirx",
+        ),
+        table_name=KIND,
+        args_schema=KdaChunkPrefillArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="flashinfer_kda_env",
+        doc=BackendDoc(
+            summary=(
+                "FlashInfer recurrent_kda(backend='tirx'), the NVlabs KDA-for-KDA TIRx "
+                "kernel: three q/k/v copies, a host-built work plan that uploads its "
+                "work list and clears handoff flags (two small fills) on every call, "
+                "then one persistent BT64 kernel that does the L2 norms, gate, beta "
+                "sigmoid and recurrence, handing FP32 state between CTAs."
+            ),
+            url=_FLASHINFER_KDA_URL,
+        ),
+        row_provenance_ref=RunnerRef(
+            module_name=_FLASHINFER_RUNNER,
+            function_name="row_provenance_tirx",
+        ),
+    )
+)
+
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="flashinfer_cute_persistent",
+        supports=_FLASHINFER_BLACKWELL,
+        runner_ref=RunnerRef(
+            module_name=_FLASHINFER_RUNNER,
+            function_name="profile_kda_chunk_prefill_flashinfer_cute_persistent",
+        ),
+        table_name=KIND,
+        args_schema=KdaChunkPrefillArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="flashinfer_kda_env",
+        doc=BackendDoc(
+            summary=(
+                "FlashInfer recurrent_kda(backend='cute-dsl-persistent'), the CuTe DSL "
+                "persistent prefill kernel: three q/k/v copies, then one kernel that "
+                "does the L2 norms, gate, beta sigmoid and recurrence. Its work plan "
+                "is cached per sequence layout and adds no launch."
+            ),
+            url=_FLASHINFER_KDA_URL,
+        ),
+        row_provenance_ref=RunnerRef(
+            module_name=_FLASHINFER_RUNNER,
+            function_name="row_provenance_cute_persistent",
         ),
     )
 )

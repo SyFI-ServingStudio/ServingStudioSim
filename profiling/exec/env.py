@@ -130,6 +130,16 @@ ENV_REGISTRY: dict[str, ProfileEnv | ContainerProfileEnv] = {
         "flashinfer_local",
         _profile_env_python("flashinfer_local"),
     ),
+    # FlashInfer's Blackwell KDA prefill backends (TIRx, CuTe DSL persistent)
+    # are on FlashInfer main after the 0.7.1 release branch was cut, and need
+    # Torch cu130, CuTe DSL >= 4.7 and a CUDA-enabled TVM with TIRx -- none of
+    # which the project venv (Torch 2.10 cu128, FlashInfer 0.6) can take. It is
+    # its own venv, built by `profiling/exec/flashinfer_kda_env.sh`.
+    "flashinfer_kda_env": ProfileEnv(
+        "flashinfer_kda_env",
+        _profile_env_python("flashinfer_kda"),
+        isolated_site_packages=True,
+    ),
     # SGLang's CUDA extensions are built against the checkout-local Torch and
     # FlashInfer stack. Keep the interpreter and source tree from the same
     # checkout so profiling cannot silently import a globally installed build.
