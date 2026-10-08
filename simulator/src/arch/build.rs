@@ -1817,43 +1817,54 @@ pub fn qwen3_fp8_ffn_moe(
 
 /// The vLLM code path a GLM-5.3-Flash arch tag's kernels follow.
 pub fn glm53_flash_kernel_path(sel: &IterArchSel) -> Result<Glm53FlashKernelPath> {
-    let (backend, mla_layout_copies, mhc_backend) = match sel {
+    let (backend, mla_layout_copies, mhc_backend, indexer_max_logits_mb) = match sel {
         IterArchSel::Glm53FlashVllmFp8KdaDsaMoe {
             kda_prefill_backend,
             mla_layout_copies,
             mhc_fused_backend,
+            indexer_max_logits_mb,
             ..
         }
         | IterArchSel::Glm53FlashVllmFp8PpKdaDsaMoe {
             kda_prefill_backend,
             mla_layout_copies,
             mhc_fused_backend,
+            indexer_max_logits_mb,
             ..
         }
         | IterArchSel::Glm53FlashVllmFp8DpAttnEpMoe {
             kda_prefill_backend,
             mla_layout_copies,
             mhc_fused_backend,
+            indexer_max_logits_mb,
             ..
         }
         | IterArchSel::Glm53FlashVllmNvfp4KdaDsaMoe {
             kda_prefill_backend,
             mla_layout_copies,
             mhc_fused_backend,
+            indexer_max_logits_mb,
             ..
         }
         | IterArchSel::Glm53FlashVllmNvfp4PpKdaDsaMoe {
             kda_prefill_backend,
             mla_layout_copies,
             mhc_fused_backend,
+            indexer_max_logits_mb,
             ..
         }
         | IterArchSel::Glm53FlashVllmNvfp4DpAttnEpMoe {
             kda_prefill_backend,
             mla_layout_copies,
             mhc_fused_backend,
+            indexer_max_logits_mb,
             ..
-        } => (kda_prefill_backend, *mla_layout_copies, mhc_fused_backend),
+        } => (
+            kda_prefill_backend,
+            *mla_layout_copies,
+            mhc_fused_backend,
+            *indexer_max_logits_mb,
+        ),
         other => unreachable!("{other:?} is not a GLM-5.3-Flash arch tag"),
     };
     let Some(&kda_prefill_backend) = GLM53_FLASH_KDA_PREFILL_BACKENDS
@@ -1868,10 +1879,14 @@ pub fn glm53_flash_kernel_path(sel: &IterArchSel) -> Result<Glm53FlashKernelPath
     else {
         bail!("mhc_fused_backend {mhc_backend:?} is not one of {GLM53_FLASH_MHC_FUSED_BACKENDS:?}");
     };
+    if indexer_max_logits_mb == 0 {
+        bail!("indexer_max_logits_mb must be positive");
+    }
     Ok(Glm53FlashKernelPath {
         kda_prefill_backend,
         mla_layout_copies,
         mhc_fused_backend,
+        indexer_max_logits_mb,
     })
 }
 
