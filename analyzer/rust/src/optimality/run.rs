@@ -17,6 +17,7 @@ use crate::io::{
 use crate::kernel_query::owning_repo_root;
 use crate::session::{register_cost_log, require_columns, COST_LOG_TABLE};
 
+use super::compute_dtype::ComputeDtypeFields;
 use super::ladder::NecessaryWorkPolicy;
 use super::spec::{self, GpuSpec};
 use super::{
@@ -130,9 +131,21 @@ pub async fn run_optimality(
         ));
     }
 
+    let compute_dtypes = ComputeDtypeFields::for_repo(repository_root.as_deref());
+    if !compute_dtypes.is_available() {
+        caveats.push(format!(
+            "kernel compute dtypes {}: R5 peaks guess each leaf's dtype from its config keys",
+            compute_dtypes.source
+        ));
+    }
+
     // Intern locations + precompute per-section metadata.
-    let (kernel_locations, section_fold_plan_by_key) =
-        prepare::build_section_fold_plans(&manifests_by_worker, &grid_peak_catalog, &gpu_spec);
+    let (kernel_locations, section_fold_plan_by_key) = prepare::build_section_fold_plans(
+        &manifests_by_worker,
+        &grid_peak_catalog,
+        &gpu_spec,
+        &compute_dtypes,
+    );
     let kernel_locations_by_worker = prepare::kernel_locations_by_worker(&manifests_by_worker);
 
     // Exact per-worker busy + span (all rows).

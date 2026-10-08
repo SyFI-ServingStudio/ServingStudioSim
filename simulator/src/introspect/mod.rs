@@ -81,6 +81,10 @@ enum KernelQueryRequest {
         #[serde(default)]
         inputs: Vec<Value>,
     },
+    /// Every registered kind's `simulator kernel-list` entry, so a caller that
+    /// already speaks kernel-query reads each kind's `#[compute_dtype]` field
+    /// instead of guessing it from config keys. No bridge, DB or GPU.
+    KernelList,
 }
 
 /// One entry of a batched `peak` request: a kernel `kind` + its `KernelConfig`.
@@ -176,6 +180,9 @@ pub fn run_kernel_query() -> anyhow::Result<()> {
         serde_json::from_str(&buf).context("parsing kernel-query JSON request")?;
 
     let out = match req {
+        KernelQueryRequest::KernelList => {
+            serde_json::to_string_pretty(&serde_json::json!({ "kernels": kernel_list() }))?
+        }
         // grid: pure metadata from `sweep_grid` — no bridge, no profiling.
         KernelQueryRequest::Grid { kind, config } => {
             let (describe_config, grid_axes, input_fields) = (lookup(&kind)?.describe)(config)
