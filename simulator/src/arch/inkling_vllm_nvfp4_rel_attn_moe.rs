@@ -27,9 +27,10 @@
 //!
 //! The MoE: router, gate select and the top-k copies on every rank, then a
 //! `Max` over the EP ranks' ranked routed workloads; inside each rank the sink
-//! experts run on vLLM's aux stream concurrently with the routed call when the
-//! batch has at most 256 tokens, and serially after it otherwise
-//! (`maybe_execute_in_parallel`, `ink/moe.py`). Both copies are compiled and
+//! experts run on vLLM's aux stream concurrently with the routed call on a
+//! decode-only step of at most 256 tokens, and serially after it otherwise
+//! (`maybe_execute_in_parallel`, `ink/moe.py`; see `sinks_on_aux_stream`).
+//! The top-k copies launch only above one token. Both copies are compiled and
 //! the inactive one is pushed as zeros. The routed call includes its NVFP4
 //! activation quant. Layer 2's BF16 experts run FlashInfer CUTLASS in
 //! production; the `bf16_fused_moe` trtllm-gen backend stands in for it.
@@ -71,8 +72,8 @@ const ACTIVATION_DTYPE: DType = DType::Bf16;
 /// Attention KV page: vLLM's `unify_kv_cache_spec_page_size` doubles the
 /// 16-token default so a page matches the 32 KiB conv-state page.
 const PAGE_SIZE: u32 = 32;
-/// `VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD`: the sinks run on the aux
-/// stream at or below this batch size.
+/// `VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD`: the sinks may run on the aux
+/// stream at or below this batch size (see [`sinks_on_aux_stream`]).
 pub const SINK_STREAM_TOKEN_THRESHOLD: u32 = 256;
 /// `Parallel{overlap}` of the aux-stream sinks against the routed call. The
 /// capture's decode routed MoE (~75 us at T=32, graph-padded) is within 4%
@@ -518,8 +519,8 @@ struct MoeBlock {
 
 impl MoeBlock {
     /// Router, then per EP rank: the sinks concurrent with that rank's routed
-    /// call, plus serial copies of both for batches too large for the aux
-    /// stream. One pair is filled per iteration; INV-1 fixes the shape.
+    /// call, plus serial copies of both for steps that keep the sinks on the
+    /// main stream. One pair is filled per iteration; INV-1 fixes the shape.
     fn compile(&self, builder: &mut CostTreeBuilder) -> CostNode {
         let ep = self.routed.len();
         let router = self.router.compile(builder);
@@ -541,7 +542,7 @@ impl MoeBlock {
             .collect();
         CostNode::Labeled {
             label: format!(
-                "{} (MoE) [EP{ep} ranked ranks; sinks overlap routed at T<={}]",
+                "{} (MoE) [EP{ep} ranked ranks; sinks overlap routed on decode-only T<={}]",
                 self.name, SINK_STREAM_TOKEN_THRESHOLD
             ),
             child: Box::new(CostNode::Sum(vec![
@@ -557,8 +558,7 @@ impl MoeBlock {
         }
     }
 
-    fn eval(&self, num_tokens: u32, ev: &mut Evaluator) {
-        let overlapped = num_tokens <= SINK_STREAM_TOKEN_THRESHOLD;
+    fn eval(&self, num_tokens: u32, overlapped: bool, ev: &mut Evaluator) {
         self.router
             .eval(&InklingRouterLocalWorkletInput { num_tokens }, ev);
         let sink = InklingMlpLocalWorkletInput { num_tokens };
@@ -606,7 +606,7 @@ impl LayerGroup {
         }
     }
 
-    fn eval(&self, batch: &NormalizedBatch, tokens: u32, ev: &mut Evaluator) {
+    fn eval(&self, batch: &NormalizedBatch, tokens: u32, sinks_overlap: bool, ev: &mut Evaluator) {
         self.attn.eval(
             &InklingAttnLocalWorkletInput {
                 num_tokens: tokens,
@@ -620,7 +620,7 @@ impl LayerGroup {
             Ffn::Dense(worklet) => {
                 worklet.eval(&InklingMlpLocalWorkletInput { num_tokens: tokens }, ev)
             }
-            Ffn::Moe(block) => block.eval(tokens, ev),
+            Ffn::Moe(block) => block.eval(tokens, sinks_overlap, ev),
         }
         push_or_zero(&self.ffn_reduce, reduce, false, ev);
     }
@@ -857,13 +857,14 @@ impl InklingVllmModel {
         let batch = normalize_input(input, self.max_model_len)
             .unwrap_or_else(|reason| panic!("invalid InklingVllmModel input: {reason}"));
         let tokens = graph_padded_tokens(&self.cudagraph_capture_sizes, batch.total_tokens);
+        let sinks_overlap = sinks_on_aux_stream(&batch, tokens, &self.cudagraph_capture_sizes);
         let rows = ElementwiseKernelInput { num_tokens: tokens };
         push_or_zero(&self.embed, rows.clone(), false, ev);
         if let Some(op) = &self.log_scaling_tau {
             push_or_zero(op, rows, false, ev);
         }
         for group in &self.groups {
-            group.eval(&batch, tokens, ev);
+            group.eval(&batch, tokens, sinks_overlap, ev);
         }
         let logits = batch.request_count;
         push_or_zero(&self.lm_head, SingleGemmKernelInput { m: logits }, false, ev);
@@ -963,6 +964,25 @@ fn graph_padded_tokens(sorted_sizes: &[u32], tokens: u32) -> u32 {
         Ok(_) => tokens,
         Err(index) => sorted_sizes.get(index).copied().unwrap_or(tokens),
     }
+}
+
+/// Whether the sink experts run on the aux stream, concurrent with the routed
+/// call (`InklingMoE.forward_partials`, vllm/models/inkling/nvidia/moe.py).
+///
+/// The fork passes the aux stream at `num_tokens <=
+/// VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD`, but `maybe_execute_in_parallel`
+/// (vllm/utils/multi_stream_utils.py) drops it while a breakable CUDA graph
+/// capture is active. Inkling auto-enables breakable graphs
+/// (`DEFAULT_BREAKABLE_CUDAGRAPH_ARCHITECTURES`, vllm/config/vllm.py) and the
+/// model runner wraps only PIECEWISE dispatch in them; FULL graphs are captured
+/// normally. Under FULL_AND_PIECEWISE a uniform-decode step replays a FULL
+/// graph (sinks on the aux stream), any step with a prefill chunk replays a
+/// breakable piecewise graph captured with the sinks inline, and a step above
+/// the largest captured size runs eagerly (aux stream again).
+fn sinks_on_aux_stream(batch: &NormalizedBatch, padded_tokens: u32, capture_sizes: &[u32]) -> bool {
+    let uniform_decode = batch.query_context_pairs.iter().all(|&(query, _)| query == 1);
+    let eager = capture_sizes.last().is_none_or(|&largest| batch.total_tokens > largest);
+    padded_tokens <= SINK_STREAM_TOKEN_THRESHOLD && (uniform_decode || eager)
 }
 
 /// One iteration, as every layer sees it (one TP group).
@@ -1208,6 +1228,48 @@ mod tests {
             .collect();
         assert_eq!(actual.len(), 69);
         assert_eq!(actual, mapped);
+    }
+
+    fn step(prefill_chunk_pairs: Vec<(u32, u32)>, decode_kv_lens: Vec<u32>) -> NormalizedBatch {
+        let prefill_tokens = prefill_chunk_pairs.iter().map(|&(_, append)| append).sum::<u32>();
+        let decode_tokens = decode_kv_lens.len() as u32;
+        let input = UnifiedArchInput {
+            groups: vec![ArchGroupInput {
+                batch_tokens: prefill_tokens + decode_tokens,
+                prefill_tokens,
+                decode_tokens,
+                prefill_chunk_pairs,
+                decode_kv_lens,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        normalize_input(&input, 8192).unwrap()
+    }
+
+    fn sinks_overlap(batch: &NormalizedBatch, sizes: &[u32]) -> bool {
+        sinks_on_aux_stream(batch, graph_padded_tokens(sizes, batch.total_tokens), sizes)
+    }
+
+    #[test]
+    fn sinks_overlap_only_on_decode_only_steps_up_to_the_threshold() {
+        // The capture's sizes: [1, 2, 4] + 8..256 by 8 + 256..=2048 by 16.
+        let mut sizes = vec![1, 2, 4];
+        sizes.extend((8..256).step_by(8));
+        sizes.extend((256..=2048).step_by(16));
+        // Pure decode replays a FULL graph: sinks on the aux stream.
+        assert!(sinks_overlap(&step(vec![], vec![300; 28]), &sizes));
+        assert!(sinks_overlap(&step(vec![], vec![2086]), &sizes));
+        // A prefill chunk replays a breakable piecewise graph, captured with
+        // the sinks inline, even at T <= 256 (Check 1: T 56..152).
+        assert!(!sinks_overlap(&step(vec![(0, 50)], vec![400; 7]), &sizes));
+        assert!(!sinks_overlap(&step(vec![(0, 128)], vec![]), &sizes));
+        // Above the threshold the fork never passes the aux stream.
+        assert!(!sinks_overlap(&step(vec![], vec![400; 300]), &sizes));
+        assert!(!sinks_overlap(&step(vec![(0, 2020)], vec![400; 8]), &sizes));
+        // A step above the largest captured size runs eagerly: the aux stream
+        // is back while it stays within the threshold.
+        assert!(sinks_overlap(&step(vec![(0, 40)], vec![]), &[1, 2, 4, 8, 16, 32]));
     }
 
     #[test]

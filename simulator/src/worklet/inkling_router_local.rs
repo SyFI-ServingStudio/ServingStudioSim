@@ -20,6 +20,13 @@ use super::glm53_common::{atomic, elementwise, push_or_zero, repeated};
 /// `weights[:, :top_k]` and `ids[:, :top_k]`: one launch each.
 const TOPK_COPIES: u32 = 2;
 
+/// Whether the top-k `contiguous()` copies launch. A one-row slice is already
+/// contiguous (PyTorch ignores the stride of a size-1 dim), so at one token
+/// both calls return the view and launch nothing.
+pub fn topk_copies_launch(num_tokens: u32) -> bool {
+    num_tokens > 1
+}
+
 #[derive(Clone, Debug)]
 pub struct InklingRouterLocalWorkletConfig {
     pub hidden: Dim,
@@ -141,7 +148,7 @@ impl InklingRouterLocalWorklet {
         push_or_zero(
             &self.topk_copy,
             ElementwiseKernelInput { num_tokens: tokens },
-            false,
+            !topk_copies_launch(tokens),
             ev,
         );
     }
@@ -170,5 +177,12 @@ mod tests {
         assert_eq!((resolved.router.n.get(), resolved.router.k.get()), (264, 4096));
         assert_eq!(resolved.gate_select.logits_row_stride, 264);
         assert_eq!(resolved.topk_copy.input_bytes_per_token.get(), 24);
+    }
+
+    #[test]
+    fn a_single_token_launches_no_topk_copy() {
+        assert!(!topk_copies_launch(1));
+        assert!(topk_copies_launch(2));
+        assert!(topk_copies_launch(32));
     }
 }
