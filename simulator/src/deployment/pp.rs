@@ -17,18 +17,19 @@ use anyhow::{bail, ensure, Context};
 use crate::arch::build as arch_build;
 use crate::arch::contract::IterwiseUnifiedModel;
 use crate::arch::IterArchSel;
-use crate::common::{Fabric, SharedRequests};
+use crate::common::{Fabric, SharedRequests, Time};
 use crate::deployment::config::PpConfig;
 use crate::orchestrator::{
-    DpPlacementPolicy, Flow, PlacementPolicy, PpFlow, PpStagePoolConfig, PP_STAGE_POOL,
+    Flow, PlacementPolicy, PpFlow, PpPlacement, PpStagePoolConfig, PP_STAGE_POOL,
 };
 use crate::timing::kernels::{P2pIntraKernel, P2pIntraKernelConfig};
 use crate::timing::PerfApiBridge;
 use crate::worker::{
     build_hybrid_pipeline_head_worker, build_pipeline_head_worker, build_pipeline_stage_worker,
     resolve_microbatch_sizing, resolve_prefix_cache_config, CostSource, IterWorker, IterWorkerSel,
-    PendingOrderKind, PipelineHeadEvent, PipelineHeadMsg, PipelineHybridState, PipelineLayout,
-    PrefillChunkAlignment, PrefixCacheMode, PrefixCachePolicy, WorkerConfig,
+    LongPrefillCapMode, MicrobatchSizing, PipelineHeadEvent, PipelineHeadMsg, PipelineHybridState,
+    PipelineLayout, PipelineLoadBudget, PrefillChunkAlignment, PrefixCacheMode, PrefixCachePolicy,
+    WorkerConfig,
 };
 
 use super::Deployment;
@@ -60,8 +61,10 @@ impl Deployment for PpDeployment {
         let gpu_name = g.gpu.clone();
         let log_dir = Some(cfg.io.log_dir.clone());
         let placement = match pool.placement {
-            PlacementPolicy::LeastQueued => DpPlacementPolicy::LeastQueued,
-            PlacementPolicy::RoundRobin => DpPlacementPolicy::RoundRobin,
+            PlacementPolicy::LeastQueued => PpPlacement::LeastQueued,
+            PlacementPolicy::RoundRobin => PpPlacement::RoundRobin,
+            PlacementPolicy::LeastWork => PpPlacement::LeastWork,
+            PlacementPolicy::LeastWorkAhead => PpPlacement::LeastWorkAhead,
         };
         let model_spec = g.arch.model();
         let _scope =
@@ -226,6 +229,20 @@ fn worker_config(cfg: &PpConfig, worker: &IterWorkerSel) -> anyhow::Result<Worke
         balance_decode_microbatches,
         microbatch_split,
         min_microbatch_tokens,
+        long_prefill_token_threshold,
+        pending_order,
+        long_prefill_cap_mode,
+        long_prefill_cap_min_prompt_tokens,
+        fresh_first_reserve_tokens,
+        load_budget_low_tokens,
+        load_budget_window_ms,
+        load_budget_busy_lo,
+        load_budget_busy_hi,
+        load_budget_backlog_lo_tokens,
+        load_budget_backlog_hi_tokens,
+        tail_ladder_min_tokens,
+        tail_ladder_overhead_tokens,
+        srpt,
         ..
     } = worker
     else {
@@ -242,6 +259,69 @@ fn worker_config(cfg: &PpConfig, worker: &IterWorkerSel) -> anyhow::Result<Worke
     let microbatch_sizing =
         resolve_microbatch_sizing(*microbatch_split, *min_microbatch_tokens, *max_batch_tokens)
             .context("pp: pipeline_chunked_prefill")?;
+    ensure!(
+        *long_prefill_token_threshold == 0
+            || matches!(
+                microbatch_sizing,
+                MicrobatchSizing::Greedy | MicrobatchSizing::Even { .. }
+            ),
+        "pp: long_prefill_token_threshold applies only with microbatch_split greedy or even"
+    );
+    ensure!(
+        *long_prefill_cap_mode == LongPrefillCapMode::Always || *long_prefill_token_threshold > 0,
+        "pp: long_prefill_cap_mode needs a long_prefill_token_threshold"
+    );
+    ensure!(
+        *long_prefill_cap_mode != LongPrefillCapMode::Backlog
+            || matches!(microbatch_sizing, MicrobatchSizing::Even { .. }),
+        "pp: long_prefill_cap_mode backlog needs microbatch_split even"
+    );
+    ensure!(
+        fresh_first_reserve_tokens.is_none()
+            || matches!(
+                microbatch_sizing,
+                MicrobatchSizing::Greedy | MicrobatchSizing::Even { .. }
+            ),
+        "pp: fresh_first_reserve_tokens applies only with microbatch_split greedy or even"
+    );
+    ensure!(
+        *load_budget_low_tokens == 0
+            || matches!(
+                microbatch_sizing,
+                MicrobatchSizing::Greedy | MicrobatchSizing::Even { .. }
+            ),
+        "pp: load_budget_low_tokens applies only with microbatch_split greedy or even"
+    );
+    ensure!(
+        *load_budget_low_tokens <= *max_batch_tokens
+            && *load_budget_window_ms > 0.0
+            && (0.0..*load_budget_busy_hi).contains(load_budget_busy_lo)
+            && *load_budget_busy_hi <= 1.0,
+        "pp: the load budget needs low_tokens <= max_batch_tokens, a positive window and \
+         0 <= busy_lo < busy_hi <= 1"
+    );
+    ensure!(
+        *load_budget_backlog_hi_tokens == 0
+            || (*load_budget_low_tokens > 0
+                && load_budget_backlog_lo_tokens < load_budget_backlog_hi_tokens),
+        "pp: load_budget_backlog_*_tokens need load_budget_low_tokens and lo < hi"
+    );
+    ensure!(
+        *tail_ladder_min_tokens == 0
+            || matches!(
+                microbatch_sizing,
+                MicrobatchSizing::Greedy | MicrobatchSizing::Even { .. }
+            ),
+        "pp: tail_ladder_min_tokens applies only with microbatch_split greedy or even"
+    );
+    ensure!(
+        !*srpt
+            || matches!(
+                microbatch_sizing,
+                MicrobatchSizing::Greedy | MicrobatchSizing::Even { .. }
+            ),
+        "pp: srpt applies only with microbatch_split greedy or even"
+    );
     Ok(WorkerConfig {
         attn_kv_bytes: (*attn_gpu_memory_gb * 1e9) as u64,
         log_output_token_times: cfg.io.log_output_token_times,
@@ -249,10 +329,28 @@ fn worker_config(cfg: &PpConfig, worker: &IterWorkerSel) -> anyhow::Result<Worke
         kv_log_stride: cfg.io.kv_log_stride,
         gpu_time_multiplier: *gpu_time_multiplier,
         max_batch_tokens: Some(*max_batch_tokens),
-        pending_order: PendingOrderKind::Fifo,
+        pending_order: *pending_order,
         prefix_cache,
         balance_decode_microbatches: *balance_decode_microbatches,
         microbatch_sizing,
+        long_prefill_token_threshold: (*long_prefill_token_threshold > 0)
+            .then_some(*long_prefill_token_threshold),
+        long_prefill_cap_mode: *long_prefill_cap_mode,
+        long_prefill_cap_min_prompt_tokens: *long_prefill_cap_min_prompt_tokens,
+        fresh_first_reserve_tokens: *fresh_first_reserve_tokens,
+        load_budget: (*load_budget_low_tokens > 0).then(|| PipelineLoadBudget {
+            low_tokens: *load_budget_low_tokens,
+            window: Time::from_ms(*load_budget_window_ms),
+            busy_lo: *load_budget_busy_lo,
+            busy_hi: *load_budget_busy_hi,
+            backlog: (*load_budget_backlog_hi_tokens > 0).then_some((
+                *load_budget_backlog_lo_tokens,
+                *load_budget_backlog_hi_tokens,
+            )),
+        }),
+        tail_ladder: (*tail_ladder_min_tokens > 0)
+            .then_some((*tail_ladder_min_tokens, *tail_ladder_overhead_tokens)),
+        srpt: *srpt,
         ..WorkerConfig::default()
     })
 }

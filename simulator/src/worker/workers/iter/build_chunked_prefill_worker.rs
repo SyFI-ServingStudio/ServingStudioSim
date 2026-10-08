@@ -80,6 +80,10 @@ pub(crate) fn build_chunked_prefill_worker<M: IterwiseUnifiedModel>(
         config.kv_admission,
         balance,
     );
+    let admission = match config.long_prefill_token_threshold {
+        Some(threshold) => admission.with_long_prefill_threshold(threshold),
+        None => admission,
+    };
 
     IterBatchWorker::from_components(
         essentials.context,

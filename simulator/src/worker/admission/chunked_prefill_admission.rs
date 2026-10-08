@@ -50,6 +50,9 @@ pub struct ChunkedPrefillAdmission<P: PendingOrderPolicy, D = SingleTokenDecodeC
     /// Context-token spacing that every non-final chunk must end on, when the
     /// engine can only checkpoint recurrent state at those boundaries.
     chunk_end_quantum: Option<u32>,
+    /// vLLM's `long_prefill_token_threshold`: the most prefill tokens one
+    /// request may take per iteration. `None` leaves only the batch budget.
+    long_prefill_threshold: Option<u32>,
     prefill_episodes: HashMap<RequestId, bool>,
     /// Order in which each running request was last admitted from the waiting
     /// queue; FCFS retraction evicts the most recent one.
@@ -125,6 +128,7 @@ impl<P: PendingOrderPolicy, D> ChunkedPrefillAdmission<P, D> {
             balance,
             started_prefills: Vec::new(),
             chunk_end_quantum: None,
+            long_prefill_threshold: None,
             prefill_episodes: HashMap::new(),
             admission_order: HashMap::new(),
             next_admission: 0,
@@ -137,6 +141,14 @@ impl<P: PendingOrderPolicy, D> ChunkedPrefillAdmission<P, D> {
     pub(crate) fn with_chunk_end_quantum(mut self, quantum: u32) -> Self {
         assert!(quantum > 0, "chunk-end quantum must be positive");
         self.chunk_end_quantum = Some(quantum);
+        self
+    }
+
+    /// Give no request more than `threshold` prefill tokens per iteration, so a
+    /// long prompt leaves the rest of the budget to other requests.
+    pub(crate) fn with_long_prefill_threshold(mut self, threshold: u32) -> Self {
+        assert!(threshold > 0, "long prefill threshold must be positive");
+        self.long_prefill_threshold = Some(threshold);
         self
     }
 
@@ -438,6 +450,7 @@ where
         // drafter's slots.
         let drafting_slots = self.drafting_slots;
         let chunk_end_quantum = self.chunk_end_quantum;
+        let long_prefill_threshold = self.long_prefill_threshold;
         let max_batch_tokens = self.max_batch_tokens;
         let decode_budget = query_width + drafting_slots;
         // One short prompt can create a whole verify window next iteration.
@@ -486,6 +499,7 @@ where
                     remaining_budgets[partition_index].saturating_sub(drafting_slots),
                     chunk_end_quantum,
                     max_batch_tokens,
+                    long_prefill_threshold,
                 );
                 if chunk_tokens == 0 {
                     return true;
@@ -535,6 +549,7 @@ where
                     remaining_budgets[partition_index] - drafting_slots,
                     chunk_end_quantum,
                     max_batch_tokens,
+                    long_prefill_threshold,
                 );
                 if chunk_tokens == 0 {
                     break;
@@ -804,14 +819,23 @@ where
 /// The next chunk of `resolved_prefill` that `budget` tokens can carry, ending
 /// on a `chunk_end_quantum` boundary when one is set. `0` means the request
 /// cannot run this iteration.
+///
+/// `long_prefill_threshold` caps the chunk before the budget does, as vLLM's
+/// `long_prefill_token_threshold` caps `num_new_tokens`, and also lowers the
+/// chunk cap the checkpoint alignment compares its quantum against.
 pub(super) fn next_chunk_tokens(
     resolved_prefill: ResolvedPrefillContext,
     budget: u32,
     chunk_end_quantum: Option<u32>,
     max_chunk_tokens: u32,
+    long_prefill_threshold: Option<u32>,
 ) -> u32 {
     let remaining = resolved_prefill.remaining_prefill_tokens();
-    let chunk_tokens = remaining.min(budget);
+    let (request_tokens, max_chunk_tokens) = match long_prefill_threshold {
+        None => (remaining, max_chunk_tokens),
+        Some(threshold) => (remaining.min(threshold), max_chunk_tokens.min(threshold)),
+    };
+    let chunk_tokens = request_tokens.min(budget);
     match chunk_end_quantum {
         None => chunk_tokens,
         Some(quantum) => {

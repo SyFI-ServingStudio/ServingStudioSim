@@ -191,6 +191,10 @@ matplotlib workers, 50 figures) against ~3 CPU-s for the simulation, 73% of the
 sweep's CPU, and `--no-plot` halved the sweep's wall time. Draw one run
 afterwards with `python analyzer/python render <run log_dir>`.
 
+`--parallelism N` caps how many runs of a sweep are in flight at once (default
+200). Lower it when each run is large: a 32-GPU PP run on an 80k-request trace
+peaks at about 36 GB of memory.
+
 Two concurrency mechanisms have different ownership:
 
 | Resource | Lease | Meaning |

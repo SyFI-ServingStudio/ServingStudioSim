@@ -188,6 +188,7 @@ impl Deployment for UnifiedDeployment {
             prefix_cache,
             ssm_checkpoint_interval_tokens: ssm_checkpoint_interval_tokens(&g.worker),
             prefill_chunk_alignment: prefill_chunk_alignment(&g.worker),
+            long_prefill_token_threshold: long_prefill_token_threshold(&g.worker),
             speculative_draft_tokens: speculative_draft_tokens(&g.worker),
             speculative_acceptance_seed: speculative_acceptance_seed(&g.worker),
             dp_placement: match &g.worker {
@@ -197,6 +198,14 @@ impl Deployment for UnifiedDeployment {
             ..WorkerConfig::default()
         };
 
+        ensure!(
+            !matches!(
+                pool.placement,
+                PlacementPolicy::LeastWork | PlacementPolicy::LeastWorkAhead
+            ),
+            "unified: placements least-work and least-work-ahead are implemented only for the pp \
+             deployment"
+        );
         let dp_cfg = SimpleDpConfig {
             dp_pool: SimpleDpPoolConfig {
                 pool: PoolId(0),
@@ -924,6 +933,18 @@ fn prefill_chunk_alignment(worker: &IterWorkerSel) -> PrefillChunkAlignment {
     }
 }
 
+/// The `chunked_prefill` selector's per-request prefill cap (`0` is off); every
+/// other selector leaves only the batch budget.
+fn long_prefill_token_threshold(worker: &IterWorkerSel) -> Option<u32> {
+    match worker {
+        IterWorkerSel::ChunkedPrefill {
+            long_prefill_token_threshold,
+            ..
+        } => (*long_prefill_token_threshold > 0).then_some(*long_prefill_token_threshold),
+        _ => None,
+    }
+}
+
 /// Prefill-iteration multiplier of any co-located selector. The PD selectors do
 /// not carry it: every PD prefill iteration schedules prefill and no PD decode
 /// iteration does, so `gpu_time_multiplier` already expresses either stage.
@@ -1099,6 +1120,9 @@ fn placement_into(p: PlacementPolicy) -> DpPlacementPolicy {
     match p {
         PlacementPolicy::LeastQueued => DpPlacementPolicy::LeastQueued,
         PlacementPolicy::RoundRobin => DpPlacementPolicy::RoundRobin,
+        PlacementPolicy::LeastWork | PlacementPolicy::LeastWorkAhead => {
+            unreachable!("least-work is rejected before the pool is built")
+        }
     }
 }
 
@@ -1149,6 +1173,7 @@ mod tests {
             prefill_gpu_time_multiplier: None,
             dp_placement: DpPlacement::RoundRobin,
             prefill_chunk_alignment: PrefillChunkAlignment::Checkpoint,
+            long_prefill_token_threshold: 0,
         }
     }
 

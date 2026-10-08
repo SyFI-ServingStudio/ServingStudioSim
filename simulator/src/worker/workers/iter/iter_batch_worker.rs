@@ -650,6 +650,39 @@ mod tests {
     }
 
     #[test]
+    fn long_prefill_threshold_lets_a_short_prompt_share_the_iteration() {
+        let store = shared_with(&[(0, 16_384, 2), (1, 100, 2)]);
+        let mut worker = build_chunked_prefill_worker(
+            WorkerId(0),
+            "main",
+            Arc::new(FakeModel::for_ms(1.0)),
+            Rc::clone(&store),
+            WorkerConfig {
+                max_batch_tokens: Some(8_192),
+                long_prefill_token_threshold: Some(4_096),
+                ..WorkerConfig::default()
+            },
+            None,
+            PoolId(0),
+            "test-gpu",
+            test_cluster(),
+        );
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(0)));
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(1)));
+
+        assert!(worker.form_batch(Time::ZERO));
+        let mut input = Default::default();
+        worker.execution.build_iteration_input(
+            &worker.kv_store,
+            &worker.context.requests,
+            &worker.batch_plan,
+            &mut input,
+        );
+        // Uncapped, the long prompt would take all 8192 and the short one wait.
+        assert_eq!(input.groups[0].prefill_chunk_pairs, [(0, 4_096), (0, 100)]);
+    }
+
+    #[test]
     fn chunked_prefill_computes_only_the_fresh_prompt_after_a_pinned_prefix() {
         let store = shared_with(&[(0, 12_000, 2), (1, 12_000, 2)]);
         store.borrow_mut()[RequestId(0)].request.definition.session = SessionInput::PinnedPrefix {
