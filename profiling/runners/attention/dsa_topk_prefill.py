@@ -29,6 +29,9 @@ _INDEX_DTYPE = "int32"
 _SPAN_MODE = "single_causal_tail"
 _VLLM_KERNEL_NAME = "topKPerRowPrefill"
 _SGLANG_KERNEL_NAME = "topk_transform_prefill_kernel"
+# Fixed seed of the synthetic scores, so every backend and every re-run of a
+# shape selects over the same values.
+_LOGITS_SEED = 0
 
 
 @dataclass(frozen=True)
@@ -170,16 +173,16 @@ def _build_operands(
         dtype=torch.float32,
         device=device,
     )
-    # A one-row template keeps construction deterministic and avoids a second
-    # full padded-logits allocation. Values are finite, signed, and non-tied.
-    column_template = torch.linspace(
-        -1.0,
-        1.0,
-        logits_row_stride,
-        dtype=torch.float32,
-        device=device,
-    )
-    logits_backing.copy_(column_template)
+    # Unsorted, seeded standard-normal scores, generated in place (no second
+    # padded allocation). A sorted template (one linspace row copied to every
+    # row) is the radix select's adversarial case: vLLM's top_k_per_row_prefill
+    # read 10.67 ms on it against 6.42 ms on DeepGEMM MQA logits of random FP8
+    # q/k at 16384 x 245760 (B200), while DeepSelect looked faster than it is.
+    # A row of MQA logits is a weighted sum over 32 heads, close to Gaussian,
+    # and both backends time within a few percent on the two distributions.
+    generator = torch.Generator(device=device)
+    generator.manual_seed(_LOGITS_SEED)
+    logits_backing.normal_(generator=generator)
     logits = logits_backing[:, :num_keys]
 
     row_starts = torch.zeros(num_queries, dtype=torch.int32, device=device)

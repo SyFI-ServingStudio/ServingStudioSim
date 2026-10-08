@@ -58,9 +58,12 @@ DOC = KernelDoc(
         "before each."
     ),
     caveats=(
-        "Only one sequence is measured, on scores that are deterministic and "
-        "free of ties. sglang_cuda takes only top_k = 2048; torch and vllm_cuda "
-        "take any top_k.",
+        "Only one sequence is measured, on seeded standard-normal scores: "
+        "unsorted like MQA logits, deterministic, and practically tie-free. "
+        "Rows measured before 2026-10-08 used one sorted linspace row for "
+        "every query, which slows vLLM's radix select about 1.7x at long "
+        "rows. sglang_cuda takes only top_k = 2048; torch and vllm_cuda take "
+        "any top_k.",
         "GB/s counts valid scores, row bounds and output indices, not padding "
         "or torch intermediates; SGLang also counts its page-table output.",
     ),
