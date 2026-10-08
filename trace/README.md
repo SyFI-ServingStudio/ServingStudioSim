@@ -198,3 +198,16 @@ arrival.
 uv run python trace/session_decode_wait.py trace/tracelab_preserving.csv \
   "$TMPDIR/mono_sessions_d80.csv" --decode-tok-s 80
 ```
+
+`session_closed_loop.py` orders such a trace for a closed loop of N sessions
+(`arrival_mode: saturated`, `workload.max_concurrency: N`) that starts in steady
+state. Session durations are heavy-tailed, and half of all session-time sits in
+sessions longer than 3 h, so a loop started from N fresh sessions drifts for
+many hours. The first N sessions are therefore drawn by duration, and each one
+joins at a random point of its life with a cold context. Every later session is
+drawn whole.
+
+```bash
+uv run python trace/session_closed_loop.py "$TMPDIR/mono_sessions_d80.csv" \
+  "$TMPDIR/closed_c1000.csv" --concurrency 1000 --after 20000 --seed 0
+```

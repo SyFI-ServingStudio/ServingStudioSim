@@ -53,7 +53,7 @@ use crate::worker::types::{
     IterBatchPlan, PipelineHeadEvent, PipelineHeadMsg, PipelineMicrobatch, WorkerStatus,
 };
 
-use super::head_prefix_tiers::HeadPrefixTiers;
+use crate::worker::workers::session_prefix_tiers::SessionPrefixTiers;
 
 /// Activation size and depth of the pipeline this head feeds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -101,7 +101,7 @@ where
     /// microbatch forms and starts here, not on the tick grid.
     state_changed_at: Time,
     completed: Vec<RequestId>,
-    prefix_tiers: Option<HeadPrefixTiers>,
+    prefix_tiers: Option<SessionPrefixTiers>,
     /// Reads from a slower tier in flight: (lands, request, session, tokens).
     loading: BinaryHeap<Reverse<(Time, RequestId, u32, u32)>>,
     /// `external_decode`: each running request's target output tokens.
@@ -151,7 +151,7 @@ where
         }
     }
 
-    pub(super) fn with_prefix_tiers(mut self, tiers: HeadPrefixTiers) -> Self {
+    pub(super) fn with_prefix_tiers(mut self, tiers: SessionPrefixTiers) -> Self {
         self.prefix_tiers = Some(tiers);
         self
     }

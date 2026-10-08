@@ -83,8 +83,11 @@ pub type Qwen36HybridWorker<M> = IterBatchWorker<
 >;
 /// `ChunkedPrefillWorker` on every axis but KV: the hybrid store charges each
 /// request's recurrent state against the attention capacity.
-pub type HybridChunkedPrefillWorker<M> =
+pub type HybridChunkedPrefillShell<M> =
     IterBatchWorker<HybridGdnKv, ChunkedPrefillAdmission<PendingOrder>, UnifiedIterExecution<M>>;
+/// The hybrid chunked-prefill shell, with optional DRAM/SSD prefix tiers per
+/// DP rank and decode run elsewhere (`SessionTierWorker`).
+pub type HybridChunkedPrefillWorker<M> = super::session_tier_worker::SessionTierWorker<M>;
 pub type PdPrefillWorker<M> =
     IterBatchWorker<FullAttnKv, PrefillHandoffAdmission<PendingOrder>, UnifiedIterExecution<M>>;
 
@@ -216,6 +219,15 @@ where
 
     pub fn id(&self) -> WorkerId {
         self.context.id
+    }
+
+    /// The KV store and admission, for a wrapper acting between messages.
+    pub(super) fn kv_and_admission(&mut self) -> (&mut K, &mut A) {
+        (&mut self.kv_store, &mut self.admission)
+    }
+
+    pub(super) fn requests(&self) -> &crate::common::SharedRequests {
+        &self.context.requests
     }
 }
 
@@ -776,6 +788,7 @@ mod tests {
         worker: &mut HybridChunkedPrefillWorker<FakeModel>,
         now: Time,
     ) -> Vec<(u32, u32)> {
+        let worker = worker.shell_mut();
         assert!(worker.form_batch(now));
         let mut input: crate::arch::UnifiedArchInput = Default::default();
         worker.execution.build_iteration_input(
@@ -898,6 +911,7 @@ mod tests {
         }
         assert_eq!(events.len(), 1, "only request 1 has finished");
         worker.enqueue(WorkerMsgCommon::Request(RequestId(2)));
+        let worker = worker.shell_mut();
         assert!(worker.form_batch(Time::from_ms(20.0)));
         let mut input: crate::arch::UnifiedArchInput = Default::default();
         worker.execution.build_iteration_input(

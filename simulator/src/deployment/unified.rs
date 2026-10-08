@@ -195,6 +195,29 @@ impl Deployment for UnifiedDeployment {
                 IterWorkerSel::ChunkedPrefill { dp_placement, .. } => *dp_placement,
                 _ => DpPlacement::RoundRobin,
             },
+            prefix_tiers: match &g.worker {
+                IterWorkerSel::ChunkedPrefill {
+                    dram_tier_gb,
+                    dram_tier_gb_per_s,
+                    ssd_tier_gb,
+                    ssd_tier_gb_per_s,
+                    ..
+                } => crate::worker::config::prefix_tier_specs(
+                    "unified",
+                    *dram_tier_gb,
+                    *dram_tier_gb_per_s,
+                    *ssd_tier_gb,
+                    *ssd_tier_gb_per_s,
+                )?,
+                _ => [None, None],
+            },
+            external_decode: matches!(
+                &g.worker,
+                IterWorkerSel::ChunkedPrefill {
+                    external_decode: true,
+                    ..
+                }
+            ),
             ..WorkerConfig::default()
         };
 
@@ -1068,15 +1091,22 @@ where
             dp_cfg,
             build_hp_worker,
         )),
-        IterWorkerSel::ChunkedPrefill { .. } => Ok(assemble_flow(
-            model,
-            store,
-            worker_config,
-            log_dir,
-            gpu_name,
-            dp_cfg,
-            build_chunked_prefill_worker,
-        )),
+        IterWorkerSel::ChunkedPrefill { .. } => {
+            ensure!(
+                worker_config.prefix_tiers == [None, None] && !worker_config.external_decode,
+                "unified: {arch_name}: prefix tiers and external_decode need a hybrid arch's \
+                 chunked_prefill"
+            );
+            Ok(assemble_flow(
+                model,
+                store,
+                worker_config,
+                log_dir,
+                gpu_name,
+                dp_cfg,
+                build_chunked_prefill_worker,
+            ))
+        }
         other => bail!("unified: unsupported {arch_name} worker {other:?}"),
     }
 }
@@ -1170,6 +1200,11 @@ mod tests {
             dp_placement: DpPlacement::RoundRobin,
             prefill_chunk_alignment: PrefillChunkAlignment::Checkpoint,
             long_prefill_token_threshold: 0,
+            dram_tier_gb: 0.0,
+            dram_tier_gb_per_s: 50.0,
+            ssd_tier_gb: 0.0,
+            ssd_tier_gb_per_s: 10.0,
+            external_decode: false,
         }
     }
 

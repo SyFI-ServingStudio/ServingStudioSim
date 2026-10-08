@@ -31,8 +31,6 @@ use crate::worker::{
     PrefillChunkAlignment, PrefixCacheMode, PrefixCachePolicy, WorkerConfig,
 };
 
-use crate::worker::kv::PrefixTierSpec;
-
 use super::Deployment;
 
 pub struct PpDeployment;
@@ -245,21 +243,13 @@ fn worker_config(cfg: &PpConfig, worker: &IterWorkerSel) -> anyhow::Result<Worke
     else {
         bail!("pp: the stage pool requires worker `pipeline_chunked_prefill`, got {worker:?}");
     };
-    let tier = |name, gb: f64, gb_per_s: f64| -> anyhow::Result<Option<PrefixTierSpec>> {
-        ensure!(
-            gb >= 0.0 && (gb == 0.0 || gb_per_s > 0.0),
-            "pp: {name}_tier_gb must be >= 0 and its bandwidth positive"
-        );
-        Ok((gb > 0.0).then_some(PrefixTierSpec {
-            name,
-            capacity_gb_per_gpu: gb,
-            read_gb_per_s_per_gpu: gb_per_s,
-        }))
-    };
-    let prefix_tiers = [
-        tier("dram", *dram_tier_gb, *dram_tier_gb_per_s)?,
-        tier("ssd", *ssd_tier_gb, *ssd_tier_gb_per_s)?,
-    ];
+    let prefix_tiers = crate::worker::config::prefix_tier_specs(
+        "pp",
+        *dram_tier_gb,
+        *dram_tier_gb_per_s,
+        *ssd_tier_gb,
+        *ssd_tier_gb_per_s,
+    )?;
     // Same defaults as unified `chunked_prefill`: FIFO and opportunistic reuse.
     let prefix_cache = resolve_prefix_cache_config(
         "pp",

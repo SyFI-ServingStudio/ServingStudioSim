@@ -296,6 +296,31 @@ fn default_pipeline_pending_order() -> PendingOrderKind {
 
 /// serde fallbacks for the pipeline selector's prefix tiers: a PCIe Gen5 x16
 /// link from host memory, and one Gen5 NVMe drive per GPU.
+/// The DRAM and SSD tiers a worker selector asks for (`[dram, ssd]`).
+pub(crate) fn prefix_tier_specs(
+    deployment: &str,
+    dram_gb: f64,
+    dram_gb_per_s: f64,
+    ssd_gb: f64,
+    ssd_gb_per_s: f64,
+) -> anyhow::Result<[Option<crate::worker::kv::PrefixTierSpec>; 2]> {
+    let tier = |name, gb: f64, gb_per_s: f64| {
+        anyhow::ensure!(
+            gb >= 0.0 && (gb == 0.0 || gb_per_s > 0.0),
+            "{deployment}: {name}_tier_gb must be >= 0 and its bandwidth positive"
+        );
+        Ok((gb > 0.0).then_some(crate::worker::kv::PrefixTierSpec {
+            name,
+            capacity_gb_per_gpu: gb,
+            read_gb_per_s_per_gpu: gb_per_s,
+        }))
+    };
+    Ok([
+        tier("dram", dram_gb, dram_gb_per_s)?,
+        tier("ssd", ssd_gb, ssd_gb_per_s)?,
+    ])
+}
+
 fn default_dram_tier_gb_per_s() -> f64 {
     50.0
 }
@@ -453,6 +478,27 @@ pub enum IterWorkerSel {
         #[serde(default)]
         #[param(default = 0)]
         long_prefill_token_threshold: u32,
+        /// Host DRAM behind each attention DP rank's HBM prefix cache, per GPU
+        /// (GB; `0`: none), as `pipeline_chunked_prefill`'s; hybrid archs only.
+        /// Sessions then stick to the rank they last ran on. Not vLLM.
+        #[serde(default)]
+        #[param(default = 0.0)]
+        dram_tier_gb: f64,
+        #[serde(default = "default_dram_tier_gb_per_s")]
+        #[param(default = 50.0)]
+        dram_tier_gb_per_s: f64,
+        /// Local SSD behind DRAM, per GPU (GB; `0`: none).
+        #[serde(default)]
+        #[param(default = 0.0)]
+        ssd_tier_gb: f64,
+        #[serde(default = "default_ssd_tier_gb_per_s")]
+        #[param(default = 10.0)]
+        ssd_tier_gb_per_s: f64,
+        /// Decode runs elsewhere, as `pipeline_chunked_prefill`'s; hybrid archs
+        /// only. Not vLLM.
+        #[serde(default)]
+        #[param(default = false)]
+        external_decode: bool,
     },
     /// Chunked prefill with a speculating decode engine: one verify pass per
     /// iteration submits `draft_tokens + 1` rows per resident decode and retires
@@ -598,8 +644,9 @@ pub enum IterWorkerSel {
         #[param(default = 10.0)]
         ssd_tier_gb_per_s: f64,
         /// Decode runs elsewhere: a request completes at its first token and
-        /// its context, every target output token included, is retained as a
-        /// decode instance would hand it back. Pair it with a session trace
+        /// its context, every target output token but the last (whose KV the
+        /// next round computes), is retained as a decode instance would hand
+        /// it back. Pair it with a session trace
         /// whose tool waits include the decode time
         /// (`trace/session_decode_wait.py`). Not vLLM.
         #[serde(default)]
