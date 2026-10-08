@@ -206,10 +206,12 @@ impl KernelSpec for DsaSparseIndexRemapSpec {
             u64::from(config.block_size) * u64::from(config.max_blocks_per_request) <= MAX_SLOT_ID,
             "one request's block table must fit int32 slot ids"
         );
+        // Query rows and workspace rows reach 16,384: a pipeline-parallel
+        // microbatch carries that many prefill tokens in one step.
         SweepGrid::new(vec![
-            Axis::values([1, 8, 24, 64, 128, 512, 2048, 4096, 8192]),
+            Axis::values([1, 8, 24, 64, 128, 512, 2048, 4096, 8192, 16384]),
             Axis::values([0, 1, 64, 512, 2048]),
-            Axis::values([0, 1, 8, 24, 64, 128, 512, 2048, 4096, 8192]),
+            Axis::values([0, 1, 8, 24, 64, 128, 512, 2048, 4096, 8192, 16384]),
         ])
     }
 
