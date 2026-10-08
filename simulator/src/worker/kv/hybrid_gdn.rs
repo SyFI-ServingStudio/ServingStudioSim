@@ -38,6 +38,9 @@
 //! per-snapshot charge, so a retained prefix pays for the snapshots that make it
 //! resumable.
 //!
+//! [`HybridGdnKv::with_exact_prefix_reuse`] leaves that engine limitation out:
+//! a retained entry keeps the state at its end and resumes at any token.
+//!
 //! ## Not modeled
 //!
 //! Live snapshots yield to admission but are never *proactively* shed: there is
@@ -402,6 +405,25 @@ impl PrefixKv for HybridGdnKv {
             .expect("resolved prefill context must exist for an admitted fresh request")
     }
 
+    fn restore_prefix(
+        &mut self,
+        request: RequestId,
+        partition: PartitionId,
+        session_id: u32,
+        tokens: u64,
+        now: Time,
+    ) {
+        self.retain_prefix(
+            request,
+            partition,
+            session_id,
+            tokens,
+            None,
+            now,
+            PrefixCacheRetentionReason::Restore,
+        );
+    }
+
     fn release_retaining_prefix(&mut self, request: RequestId, partition: PartitionId, now: Time) {
         let resolved_prefill = self.ledger.prefill_context(request);
         let retained_tokens = self.partitions[partition as usize]
@@ -621,6 +643,21 @@ impl HybridGdnKv {
             state_tokens_per_request,
             checkpoint_interval_tokens,
         }
+    }
+
+    /// Exact prefix reuse, the engine vLLM's `align` mode works around: a
+    /// retained session keeps its context and the state at its end, so a hit
+    /// resumes at any token instead of the last checkpoint, and costs one state
+    /// instead of one per checkpoint. Live decodes then leave no snapshots
+    /// behind either.
+    pub(crate) fn with_exact_prefix_reuse(mut self) -> Self {
+        let state_tokens = self.state_tokens_per_request;
+        self.prefix_caches = std::mem::take(&mut self.prefix_caches)
+            .into_iter()
+            .map(|cache| cache.with_entry_charge(state_tokens))
+            .collect();
+        self.checkpoint_interval_tokens = 0;
+        self
     }
 
     /// Hard-tier occupancy: whichever of the immediate and the projected total

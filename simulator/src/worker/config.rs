@@ -294,6 +294,15 @@ fn default_pipeline_pending_order() -> PendingOrderKind {
     PendingOrderKind::Fifo
 }
 
+/// serde fallbacks for the pipeline selector's prefix tiers: a PCIe Gen5 x16
+/// link from host memory, and one Gen5 NVMe drive per GPU.
+fn default_dram_tier_gb_per_s() -> f64 {
+    50.0
+}
+fn default_ssd_tier_gb_per_s() -> f64 {
+    10.0
+}
+
 /// serde fallback for the speculative selector's `batch_policy`.
 const fn default_batch_policy() -> BatchPolicy {
     BatchPolicy::Mix
@@ -511,9 +520,11 @@ pub enum IterWorkerSel {
         #[serde(default = "default_gpu_time_multiplier")]
         #[param(default = 1.0)]
         gpu_time_multiplier: f64,
-        /// Hybrid archs only: `checkpoint` ends non-final prefill chunks on the
-        /// recurrent checkpoint interval (vLLM's Mamba `align` mode); `plain`
-        /// chunks as `min(remaining, budget)`, leaving that engine artifact out.
+        /// Hybrid archs only: `checkpoint` is vLLM's Mamba `align` mode, which
+        /// ends non-final prefill chunks on the KV block and floors prefix hits
+        /// to it; `plain` chunks as `min(remaining, budget)` and reuses a
+        /// retained prefix exactly (one state at its end), leaving both engine
+        /// artifacts out.
         #[serde(default)]
         #[param(string, default = "checkpoint", choices = PREFILL_CHUNK_ALIGNMENT_CHOICES)]
         prefill_chunk_alignment: PrefillChunkAlignment,
@@ -568,6 +579,32 @@ pub enum IterWorkerSel {
         #[serde(default)]
         #[param(default = false)]
         srpt: bool,
+        /// Host DRAM behind the HBM prefix cache, per GPU (GB; `0`: none).
+        /// Every finished context is written through to each tier; a session
+        /// whose context is here but not in HBM waits for a read at
+        /// `dram_tier_gb_per_s` per GPU before it queues. Not vLLM.
+        #[serde(default)]
+        #[param(default = 0.0)]
+        dram_tier_gb: f64,
+        #[serde(default = "default_dram_tier_gb_per_s")]
+        #[param(default = 50.0)]
+        dram_tier_gb_per_s: f64,
+        /// Local SSD behind DRAM, per GPU (GB; `0`: none), read at
+        /// `ssd_tier_gb_per_s` per GPU.
+        #[serde(default)]
+        #[param(default = 0.0)]
+        ssd_tier_gb: f64,
+        #[serde(default = "default_ssd_tier_gb_per_s")]
+        #[param(default = 10.0)]
+        ssd_tier_gb_per_s: f64,
+        /// Decode runs elsewhere: a request completes at its first token and
+        /// its context, every target output token included, is retained as a
+        /// decode instance would hand it back. Pair it with a session trace
+        /// whose tool waits include the decode time
+        /// (`trace/session_decode_wait.py`). Not vLLM.
+        #[serde(default)]
+        #[param(default = false)]
+        external_decode: bool,
     },
     /// PD prefill half: prefills then hands off to a decode pool (no local decode).
     PdPrefill {

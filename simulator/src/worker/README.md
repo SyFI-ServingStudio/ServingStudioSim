@@ -325,6 +325,25 @@ prefill backlog (queued, started and in-flight tokens) is at most
 prompts instead of started first; pair it with `pending_order:
 shortest-prefill-first` so the queue offers its shortest prompt first.
 
+A hybrid head (`HybridGdnKv`) follows `prefill_chunk_alignment`. `checkpoint` is
+vLLM's Mamba `align` mode: non-final chunks end on the KV block and prefix hits
+floor to it, one state per block. `plain` chunks plainly and reuses exactly: a
+retained session keeps its context and the state at its end.
+
+Behind HBM's retained tier a head can keep host DRAM and SSD tiers
+(`dram_tier_gb`, `ssd_tier_gb`, per GPU, with read bandwidths). They are
+write-through LRUs of each session's latest context, plus one state for a hybrid
+model (`kv/shared/prefix_tiers.rs`). When a session request arrives, the head
+looks it up. If a tier holds more than HBM does, floored to HBM's hit quantum,
+the head reads just the difference on that tier's FIFO channel. When the read
+lands, the context goes back into HBM (`restore_prefix`) and the request is
+queued. `prefix_tiers_w<id>.csv` / `.json` record each lookup and the tiers'
+totals. With `external_decode`, a round completes at its first token. The head
+then restores its context with every output but the last (whose KV the next
+round computes) as if a decode instance handed it back. The trace carries the
+decode time in its tool waits (`trace/session_decode_wait.py`). The `pp` flow
+keeps each session on the replica its first round went to.
+
 `PipelineStageWorker` has no KV/admission axes. It runs microbatches FIFO,
 double-buffering one activation pull against one compute, at exact times derived
 from the previous stage's `ready_at`. It stamps no request stage, so requests stay

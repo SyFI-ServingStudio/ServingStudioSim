@@ -27,22 +27,33 @@
 //! - A head blocked on the in-flight window or on KV has no wakeup: only an exit
 //!   or a new request can unblock it, and L6 ticks it on every message.
 //!
+//! Prefix tiers. With DRAM/SSD tiers configured, an arriving session request
+//! whose context HBM no longer holds but a slower tier does is read back first:
+//! it queues for admission only when the read lands, back in HBM's retained
+//! tier. Every finished context is written through to the tiers. With
+//! `external_decode`, a request completes at its first token, as if a decode
+//! instance took it, and its whole target context is retained.
+//!
 //! Reading order: state types → struct → construction → `IterWorker` → message
-//! handlers → tick (exits, stage-0 completion, formation) → wakeup → tests.
+//! handlers → tick (exits, landed loads, stage-0 completion, formation) →
+//! wakeup → tests.
 
-use std::collections::VecDeque;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::rc::Rc;
 
 use crate::arch::contract::UnifiedArchInput;
-use crate::common::{RequestId, Time, WorkerId};
+use crate::common::{RequestId, SessionInput, Time, WorkerId};
 use crate::worker::admission::MicrobatchAdmission;
 use crate::worker::execution::IterModelExecution;
 use crate::worker::iter_worker::IterWorker;
-use crate::worker::kv::IterWorkerKv;
+use crate::worker::kv::{IterWorkerKv, PrefixKv};
 use crate::worker::shared::context::WorkerContext;
 use crate::worker::types::{
     IterBatchPlan, PipelineHeadEvent, PipelineHeadMsg, PipelineMicrobatch, WorkerStatus,
 };
+
+use super::head_prefix_tiers::HeadPrefixTiers;
 
 /// Activation size and depth of the pipeline this head feeds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,7 +75,7 @@ struct ComputingMicrobatch {
 
 pub struct PipelineHeadWorker<K, A, E>
 where
-    K: IterWorkerKv,
+    K: IterWorkerKv + PrefixKv,
     A: MicrobatchAdmission<K>,
     E: IterModelExecution<K, Input = UnifiedArchInput>,
 {
@@ -90,11 +101,16 @@ where
     /// microbatch forms and starts here, not on the tick grid.
     state_changed_at: Time,
     completed: Vec<RequestId>,
+    prefix_tiers: Option<HeadPrefixTiers>,
+    /// Reads from a slower tier in flight: (lands, request, session, tokens).
+    loading: BinaryHeap<Reverse<(Time, RequestId, u32, u32)>>,
+    /// `external_decode`: each running request's target output tokens.
+    external_outputs: Option<HashMap<RequestId, u32>>,
 }
 
 impl<K, A, E> PipelineHeadWorker<K, A, E>
 where
-    K: IterWorkerKv,
+    K: IterWorkerKv + PrefixKv,
     A: MicrobatchAdmission<K>,
     E: IterModelExecution<K, Input = UnifiedArchInput>,
 {
@@ -129,7 +145,20 @@ where
             request_arrived: false,
             state_changed_at: Time::ZERO,
             completed: Vec::new(),
+            prefix_tiers: None,
+            loading: BinaryHeap::new(),
+            external_outputs: None,
         }
+    }
+
+    pub(super) fn with_prefix_tiers(mut self, tiers: HeadPrefixTiers) -> Self {
+        self.prefix_tiers = Some(tiers);
+        self
+    }
+
+    pub(super) fn with_external_decode(mut self) -> Self {
+        self.external_outputs = Some(HashMap::new());
+        self
     }
 
     pub fn send_gid(&self) -> u16 {
@@ -139,7 +168,7 @@ where
 
 impl<K, A, E> IterWorker for PipelineHeadWorker<K, A, E>
 where
-    K: IterWorkerKv,
+    K: IterWorkerKv + PrefixKv,
     A: MicrobatchAdmission<K>,
     E: IterModelExecution<K, Input = UnifiedArchInput>,
 {
@@ -165,7 +194,7 @@ where
 
     fn status(&self) -> WorkerStatus {
         WorkerStatus {
-            queued_requests: self.admission.queued_requests(),
+            queued_requests: self.admission.queued_requests() + self.loading.len() as u32,
             active_requests: self.kv_store.status_active(0),
         }
     }
@@ -173,14 +202,104 @@ where
 
 impl<K, A, E> PipelineHeadWorker<K, A, E>
 where
-    K: IterWorkerKv,
+    K: IterWorkerKv + PrefixKv,
     A: MicrobatchAdmission<K>,
     E: IterModelExecution<K, Input = UnifiedArchInput>,
 {
+    /// Hand the request to decode elsewhere after its first token, then find
+    /// its prefix: queue it now, or once a slower tier's read lands.
     fn on_msg_request(&mut self, request: RequestId) {
+        let (session_input, prompt_tokens, arrival) = {
+            let mut store = self.context.requests.borrow_mut();
+            let record = &mut store[request];
+            let definition = &mut record.request.definition;
+            if let Some(outputs) = &mut self.external_outputs {
+                outputs.insert(request, definition.target_output_tokens);
+                definition.target_output_tokens = 1;
+            }
+            (
+                definition.session,
+                definition.prompt_tokens,
+                record.request.core.arrival_time,
+            )
+        };
+        if let (
+            Some(tiers),
+            SessionInput::Session {
+                session_id,
+                declared_prefix_tokens,
+                ..
+            },
+        ) = (&mut self.prefix_tiers, session_input)
+        {
+            let hbm_tokens = self
+                .kv_store
+                .resident_prefix_tokens(prompt_tokens, session_input);
+            if let Some((hit, ready)) = tiers.on_arrival(
+                request,
+                session_id,
+                declared_prefix_tokens,
+                hbm_tokens,
+                arrival,
+            ) {
+                self.loading
+                    .push(Reverse((ready, request, session_id, hit.tokens)));
+                return;
+            }
+        }
         self.admission
             .accept_request(&mut self.kv_store, request, &self.context);
         self.request_arrived = true;
+    }
+
+    /// Queue every request whose read has landed by `now`, its context back in
+    /// HBM's retained tier.
+    fn land_loads(&mut self, now: Time) {
+        while let Some(&Reverse((ready, request, session_id, tokens))) = self.loading.peek() {
+            if ready > now {
+                break;
+            }
+            self.loading.pop();
+            self.kv_store
+                .restore_prefix(request, 0, session_id, u64::from(tokens), ready);
+            self.admission
+                .accept_request(&mut self.kv_store, request, &self.context);
+            self.state_changed_at = self.state_changed_at.max(ready);
+        }
+    }
+
+    /// Retain a finished request's whole context: hand a decode-elsewhere
+    /// context back to HBM and write it through to the tiers.
+    fn on_request_complete(&mut self, request: RequestId, at: Time) {
+        let external_outputs = self
+            .external_outputs
+            .as_mut()
+            .and_then(|outputs| outputs.remove(&request));
+        if self.prefix_tiers.is_none() && external_outputs.is_none_or(|outputs| outputs <= 1) {
+            return;
+        }
+        let (session_input, context_tokens) = {
+            let store = self.context.requests.borrow();
+            let definition = &store[request].request.definition;
+            let outputs = external_outputs.unwrap_or(definition.target_output_tokens);
+            // The last output token has no KV yet: the next round computes it.
+            (
+                definition.session,
+                u64::from(definition.session.declared_prefix_tokens())
+                    + u64::from(definition.prompt_tokens)
+                    + u64::from(outputs.saturating_sub(1)),
+            )
+        };
+        let Some(session_id) = session_input.session_id() else {
+            return;
+        };
+        if external_outputs.is_some_and(|outputs| outputs > 1) {
+            self.kv_store
+                .restore_prefix(request, 0, session_id, context_tokens, at);
+        }
+        if let Some(tiers) = &mut self.prefix_tiers {
+            tiers.store(session_id, context_tokens);
+        }
     }
 
     fn on_msg_microbatch_exit(&mut self, microbatch: u64, at: Time) {
@@ -194,6 +313,7 @@ where
         // Exits first: they release KV the next formation may need, and their
         // times precede the formation's, so KV samples stay in time order.
         self.complete_exited_microbatches(events);
+        self.land_loads(now);
         loop {
             let mut progressed = false;
             if self
@@ -252,14 +372,13 @@ where
                 at,
             );
             self.state_changed_at = self.state_changed_at.max(at);
-            events.extend(
-                self.completed
-                    .drain(..)
-                    .map(|req| PipelineHeadEvent::RequestComplete {
-                        worker: self.context.id,
-                        req,
-                    }),
-            );
+            for req in std::mem::take(&mut self.completed) {
+                self.on_request_complete(req, at);
+                events.push(PipelineHeadEvent::RequestComplete {
+                    worker: self.context.id,
+                    req,
+                });
+            }
         }
     }
 
@@ -296,9 +415,15 @@ where
     }
 
     fn next_wakeup(&self) -> Option<Time> {
-        self.computing
+        let load = self.loading.peek().map(|Reverse((ready, ..))| *ready);
+        let compute = self
+            .computing
             .as_ref()
-            .map(|computing| computing.compute_end)
+            .map(|computing| computing.compute_end);
+        match (compute, load) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
     }
 }
 
@@ -565,7 +690,7 @@ mod tests {
         store: SharedRequests,
         max_batch_tokens: u32,
         attn_kv_bytes: u64,
-        block_aligned_chunks: bool,
+        align_mode: bool,
     ) -> crate::worker::workers::pipeline::HybridPipelineHead<FakeModel> {
         use crate::worker::kv::{PrefixCacheConfig, PrefixCachePolicy};
         use crate::worker::workers::pipeline::{
@@ -580,7 +705,7 @@ mod tests {
             PipelineHybridState {
                 block_tokens: 4,
                 state_blocks_per_request: 2,
-                block_aligned_chunks,
+                align_mode,
             },
             store,
             WorkerConfig {
@@ -605,7 +730,7 @@ mod tests {
         let hybrid = PipelineHybridState {
             block_tokens: 4,
             state_blocks_per_request: 2,
-            block_aligned_chunks: true,
+            align_mode: true,
         };
         // 80 bytes / 8 per block = 10 blocks, less vLLM's null block.
         assert_eq!(hybrid.capacity_tokens(&LAYOUT, 80), 36);
@@ -674,9 +799,9 @@ mod tests {
 
     /// Chunk sizes a hybrid head launches for one 10-token prompt at budget 6
     /// with 4-token blocks.
-    fn hybrid_chunks(block_aligned_chunks: bool) -> Vec<u64> {
+    fn hybrid_chunks(align_mode: bool) -> Vec<u64> {
         let store = shared_with(&[(0, 10, 1)]);
-        let mut worker = hybrid_head(Rc::clone(&store), 6, 1_000, block_aligned_chunks);
+        let mut worker = hybrid_head(Rc::clone(&store), 6, 1_000, align_mode);
         worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
         let mut events = Vec::new();
         for step in 0..6 {
@@ -1117,5 +1242,154 @@ mod tests {
         }
         // The even target is 2000 (8000 / 4); one request may take only 1000.
         assert_eq!(launched_tokens(&events), vec![1000, 1000, 1000, 1000]);
+    }
+
+    // ── Prefix tiers and decode elsewhere ────────────────────────────────────
+
+    fn as_session(
+        store: &SharedRequests,
+        id: u32,
+        session_id: u32,
+        declared: u32,
+        arrival_ms: f64,
+    ) {
+        let mut store = store.borrow_mut();
+        let request = &mut store[RequestId(id)].request;
+        request.definition.session = SessionInput::Session {
+            session_id,
+            session_start_time: Time::ZERO,
+            declared_prefix_tokens: declared,
+        };
+        request.core.arrival_time = Time::from_ms(arrival_ms);
+    }
+
+    /// Tick at every wakeup and stage-1 exit (1 ms after stage 0) up to `until`.
+    fn run_until(
+        worker: &mut PipelineHead<FakeModel>,
+        from: Time,
+        until: Time,
+        events: &mut Vec<PipelineHeadEvent>,
+    ) {
+        let mut exits: Vec<(u64, Time)> = Vec::new();
+        let mut now = from;
+        while now <= until {
+            let mut fresh = Vec::new();
+            let wakeup = worker.tick(now, &mut fresh);
+            for (id, _, ready) in launched(&fresh) {
+                exits.push((id, ready + Time::from_ms(1.0)));
+            }
+            events.extend(fresh);
+            let next_exit = exits.iter().map(|&(_, at)| at).min();
+            let next = [wakeup, next_exit].into_iter().flatten().min();
+            let Some(next) = next else { break };
+            if let Some(index) = exits.iter().position(|&(_, at)| at == next) {
+                let (microbatch, at) = exits.remove(index);
+                worker.enqueue(PipelineHeadMsg::MicrobatchExit { microbatch, at });
+            }
+            now = next.max(now);
+        }
+    }
+
+    fn tiered_head(store: SharedRequests, external_decode: bool) -> PipelineHead<FakeModel> {
+        // 2 B/token, 120 tokens of HBM. DRAM: 500 tokens read at 1e5 B/s, so
+        // 50 tokens take 1 ms.
+        head_with(
+            store,
+            WorkerConfig {
+                max_batch_tokens: Some(64),
+                attn_kv_bytes: 240,
+                prefix_tiers: [
+                    Some(crate::worker::kv::PrefixTierSpec {
+                        name: "dram",
+                        capacity_gb_per_gpu: 1e-6,
+                        read_gb_per_s_per_gpu: 1e-4,
+                    }),
+                    None,
+                ],
+                external_decode,
+                ..WorkerConfig::default()
+            },
+        )
+    }
+
+    #[test]
+    fn a_session_evicted_from_hbm_reads_its_context_back_from_dram_first() {
+        // Session 7 round 0 (50 tokens), then a 100-token prompt that evicts it
+        // from HBM, then round 1 declaring the 51-token context, whose first 50
+        // have KV in DRAM (the output's KV is round 1's to compute).
+        let store = shared_with(&[(0, 50, 1), (1, 100, 1), (2, 4, 1)]);
+        as_session(&store, 0, 7, 0, 0.0);
+        as_session(&store, 2, 7, 51, 10.0);
+        let mut worker = tiered_head(Rc::clone(&store), false);
+        let mut events = Vec::new();
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
+        run_until(&mut worker, Time::ZERO, Time::from_ms(3.0), &mut events);
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(1)));
+        run_until(
+            &mut worker,
+            Time::from_ms(3.0),
+            Time::from_ms(9.0),
+            &mut events,
+        );
+        assert_eq!(completed(&events), vec![RequestId(0), RequestId(1)]);
+
+        events.clear();
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(2)));
+        assert_eq!(
+            worker.tick(Time::from_ms(10.0), &mut events),
+            Some(Time::from_ms(11.0))
+        );
+        assert_eq!(worker.status().queued_requests, 1);
+        assert!(events.is_empty());
+        run_until(
+            &mut worker,
+            Time::from_ms(11.0),
+            Time::from_ms(20.0),
+            &mut events,
+        );
+        let pairs: Vec<(u32, u32)> = events
+            .iter()
+            .filter_map(|event| match event {
+                PipelineHeadEvent::MicrobatchLaunched { microbatch, .. } => {
+                    Some(microbatch.input.groups[0].prefill_chunk_pairs.clone())
+                }
+                PipelineHeadEvent::RequestComplete { .. } => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(pairs, [(50, 5)]);
+        let store = store.borrow();
+        let record = &store[RequestId(2)];
+        assert_eq!(record.telemetry.prefix_cache_hit_tokens, Some(50));
+        assert_eq!(record.lifecycle.completed, true);
+    }
+
+    #[test]
+    fn decode_elsewhere_completes_at_the_first_token_and_retains_the_outputs() {
+        // Round 0 has 5 target outputs; round 1 declares all 55 tokens and
+        // finds the 54 with KV in HBM (the last output's KV is round 1's to
+        // compute).
+        let store = shared_with(&[(0, 50, 5), (1, 4, 5)]);
+        as_session(&store, 0, 7, 0, 0.0);
+        as_session(&store, 1, 7, 55, 10.0);
+        let mut worker = tiered_head(Rc::clone(&store), true);
+        let mut events = Vec::new();
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
+        run_until(&mut worker, Time::ZERO, Time::from_ms(9.0), &mut events);
+        assert_eq!(completed(&events), vec![RequestId(0)]);
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(1)));
+        run_until(
+            &mut worker,
+            Time::from_ms(10.0),
+            Time::from_ms(20.0),
+            &mut events,
+        );
+        assert_eq!(completed(&events), vec![RequestId(0), RequestId(1)]);
+        let store = store.borrow();
+        assert_eq!(store[RequestId(0)].progress.output_tokens_emitted, 1);
+        assert_eq!(
+            store[RequestId(1)].telemetry.prefix_cache_hit_tokens,
+            Some(54)
+        );
     }
 }

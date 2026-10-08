@@ -129,7 +129,8 @@ GPUs are contiguous. `PpStagePoolController`:
 
 - places arrivals on heads: least-queued, round-robin, or least-work-ahead (the
   replica with the least outstanding prompt work, each prompt counted up to the
-  new one's size: the work that would run ahead of it under `srpt`);
+  new one's size: the work that would run ahead of it under `srpt`). A session
+  stays on the replica its first round went to, where its context is cached;
 - routes `MicrobatchLaunched` / `StageDone` to the next stage of the same replica;
 - turns the last stage's `StageDone` into `MicrobatchExit` for the head;
 - repeats the sweep at one `now` until no worker emits an event, and makes every

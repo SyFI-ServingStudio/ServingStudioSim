@@ -182,3 +182,19 @@ rounds at the same arrival times and differ only in the prefix/fresh split.
 Contexts reach 999,888 tokens, so runs need `max_model_len: 1048576`. The
 pinned prefix is reserved only while its request runs, so this replay measures
 prefill compute, not prefix-cache capacity.
+
+### Sessions with decode elsewhere
+
+`session_decode_wait.py` keeps a session trace whole (sessions, rounds, the
+timeline, prefixes) for a pipeline head with `external_decode: true`, which
+completes each round at its first token. The script adds the rest of the
+round's decode to its tool wait, `(output_len - 1) / decode_tok_s` seconds. So
+a prefix-cache study sees each round arrive when it would have, and the
+cache, not the trace, decides each hit. Zero-input rounds become one fresh
+token after a one-shorter prefix. `--sessions N` keeps the first N sessions by
+arrival.
+
+```bash
+uv run python trace/session_decode_wait.py trace/tracelab_preserving.csv \
+  "$TMPDIR/mono_sessions_d80.csv" --decode-tok-s 80
+```

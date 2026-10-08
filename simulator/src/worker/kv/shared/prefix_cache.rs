@@ -12,6 +12,10 @@
 //! quantizes to that interval and each retained entry additionally carries one
 //! `charge_per_checkpoint` for every snapshot it keeps. Both knobs are
 //! constructor parameters; `(1, 0)` is exactly the pre-hybrid behavior.
+//!
+//! An engine that keeps the state at a context's end instead (exact reuse,
+//! [`PrefixCache::with_entry_charge`]) resumes at any token: quantum one, and
+//! each entry pays one `charge_per_entry` for its final state.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -174,6 +178,8 @@ pub(crate) struct PrefixCache {
     quantum_tokens: u64,
     /// Extra occupancy every retained snapshot costs on top of its context KV.
     charge_per_checkpoint: u64,
+    /// Extra occupancy every entry costs: the one state at its end (exact reuse).
+    charge_per_entry: u64,
     entries: HashMap<u32, PrefixEntry>,
     /// `entries` ordered by the policy's eviction key, session id last, so the
     /// victim is the first element. A retained entry never changes (a hit
@@ -196,10 +202,21 @@ impl PrefixCache {
             policy,
             quantum_tokens: u64::from(quantum_tokens.max(1)),
             charge_per_checkpoint,
+            charge_per_entry: 0,
             entries: HashMap::new(),
             eviction_order: BTreeSet::new(),
             next_sequence: 0,
         }
+    }
+
+    /// Exact reuse: every entry keeps one `charge` state at its end, so any
+    /// prefix length is resumable. Replaces the snapshot quantum and charge.
+    pub(crate) fn with_entry_charge(mut self, charge: u64) -> Self {
+        assert!(self.entries.is_empty(), "set the entry charge before use");
+        self.quantum_tokens = 1;
+        self.charge_per_checkpoint = 0;
+        self.charge_per_entry = charge;
+        self
     }
 
     /// Context tokens held. Deliberately test-only: every production decision
@@ -211,10 +228,12 @@ impl PrefixCache {
     }
 
     /// What this tier actually occupies: retained context KV plus one charge per
-    /// retained snapshot. Equals [`Self::used_tokens`] when there is no per-
-    /// checkpoint charge.
+    /// retained snapshot or entry. Equals [`Self::used_tokens`] when there is
+    /// neither charge.
     pub(crate) fn used_charge(&self) -> u64 {
-        self.used_tokens + self.used_checkpoints * self.charge_per_checkpoint
+        self.used_tokens
+            + self.used_checkpoints * self.charge_per_checkpoint
+            + self.entries.len() as u64 * self.charge_per_entry
     }
 
     /// Round a length down to the coarsest boundary this cache can resume from.
@@ -225,7 +244,8 @@ impl PrefixCache {
     /// Occupancy a quantized `tokens` would add: the context KV plus one charge
     /// for each snapshot inside it.
     fn charge_of(&self, tokens: u64) -> u64 {
-        tokens + tokens / self.quantum_tokens * self.charge_per_checkpoint
+        let entry = if tokens > 0 { self.charge_per_entry } else { 0 };
+        tokens + tokens / self.quantum_tokens * self.charge_per_checkpoint + entry
     }
 
     /// The largest quantized length not exceeding `tokens` whose charge fits
@@ -233,6 +253,9 @@ impl PrefixCache {
     /// so the count is a plain division; at quantum one with no charge this is
     /// `min(tokens, capacity)`, the pre-hybrid rule.
     fn largest_fitting_length(&self, tokens: u64, capacity: u64) -> u64 {
+        if self.charge_per_entry > 0 {
+            return tokens.min(capacity.saturating_sub(self.charge_per_entry));
+        }
         let per_checkpoint = self.quantum_tokens + self.charge_per_checkpoint;
         let checkpoints = (tokens / self.quantum_tokens).min(capacity / per_checkpoint);
         checkpoints * self.quantum_tokens
@@ -573,5 +596,19 @@ mod tests {
         assert_eq!(take.entry_tokens, 60);
         assert_eq!(take.cache_used_before, 60);
         assert_eq!(take.cache_used_after, 0);
+    }
+
+    #[test]
+    fn exact_reuse_resumes_at_any_token_and_charges_one_state_per_entry() {
+        let mut cache =
+            PrefixCache::new(10_000, PrefixCachePolicy::Lru, 1_000, 500).with_entry_charge(500);
+        cache.insert(1, 2_345, 10_000, None);
+        assert_eq!(cache.peek(1, 2_340), 2_340);
+        assert_eq!(cache.used_charge(), 2_845);
+        // A second entry needs its own state: 6_000 + 500 does not fit beside
+        // 2_845, so session 1 is evicted.
+        cache.insert(2, 6_000, 9_000, None);
+        assert_eq!(cache.peek(1, 2_345), 0);
+        assert_eq!(cache.used_charge(), 6_500);
     }
 }

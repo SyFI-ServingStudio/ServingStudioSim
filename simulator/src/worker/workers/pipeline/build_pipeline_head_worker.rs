@@ -16,6 +16,7 @@ use crate::worker::workers::iter_build_essentials::{
     full_attention_token_capacity, prepare_iter_build_essentials,
 };
 
+use super::head_prefix_tiers::HeadPrefixTiers;
 use super::pipeline_head_worker::{PipelineHeadWorker, PipelineLayout};
 use super::{HybridPipelineHead, PipelineHead};
 
@@ -44,6 +45,7 @@ pub(crate) fn build_pipeline_head_worker<M: IterwiseUnifiedModel>(
         "a pipeline stage runs on one GPU"
     );
     let prefix_cache_logger = PrefixCacheLogger::open_opt(cost_log_dir.as_deref(), pool_tag, id);
+    let prefix_tiers = head_prefix_tiers(&config, &layout, 0, 1, cost_log_dir.as_deref(), id);
     let kv_capacity = full_attention_token_capacity(1, layout.kv_bytes_per_token, &config);
     let prefix_cache =
         config
@@ -99,13 +101,17 @@ pub(crate) fn build_pipeline_head_worker<M: IterwiseUnifiedModel>(
         admission = admission.with_srpt();
     }
 
-    PipelineHeadWorker::from_components(
-        essentials.context,
-        kv_store,
-        admission,
-        UnifiedIterExecution::new(stage_model, essentials.cost),
-        layout,
-        send_gid,
+    with_head_options(
+        PipelineHeadWorker::from_components(
+            essentials.context,
+            kv_store,
+            admission,
+            UnifiedIterExecution::new(stage_model, essentials.cost),
+            layout,
+            send_gid,
+        ),
+        prefix_tiers,
+        config.external_decode,
     )
 }
 
@@ -122,9 +128,12 @@ pub(crate) fn build_pipeline_head_worker<M: IterwiseUnifiedModel>(
 pub struct PipelineHybridState {
     pub block_tokens: u32,
     pub state_blocks_per_request: u32,
-    /// With prefix caching on, end every non-final chunk on a `block_tokens`
-    /// boundary (vLLM's Mamba `align` mode). `false` chunks plainly.
-    pub block_aligned_chunks: bool,
+    /// vLLM's Mamba `align` mode: with prefix caching on, every non-final
+    /// chunk ends on a `block_tokens` boundary, and a retained prefix keeps one
+    /// state per block and resumes at the last one. `false` chunks plainly and
+    /// reuses exactly: a retained prefix keeps the state at its end and resumes
+    /// at any token.
+    pub align_mode: bool,
 }
 
 impl PipelineHybridState {
@@ -143,8 +152,9 @@ impl PipelineHybridState {
 
 /// [`build_pipeline_head_worker`] for a hybrid model: `HybridGdnKv` charges
 /// each request its fixed state blocks on top of its context. With prefix
-/// caching on and `hybrid.block_aligned_chunks` set (vLLM's Mamba `align`
-/// mode), every non-final chunk ends on a `block_tokens` boundary.
+/// caching on and `hybrid.align_mode` set (vLLM's Mamba `align`
+/// mode), every non-final chunk ends on a `block_tokens` boundary and prefix
+/// hits floor to it; otherwise chunks are plain and reuse is exact.
 ///
 /// Context is charged by the token, not rounded up to whole blocks, so a
 /// request's charge is low by less than one block.
@@ -177,7 +187,19 @@ pub(crate) fn build_hybrid_pipeline_head_worker<M: IterwiseUnifiedModel>(
     let prefix_cache_logger = PrefixCacheLogger::open_opt(cost_log_dir.as_deref(), pool_tag, id);
     let kv_capacity = hybrid.capacity_tokens(&layout, config.attn_kv_bytes);
     let state_tokens_per_request = hybrid.state_tokens_per_request();
-    let chunk_end_quantum = (hybrid.block_aligned_chunks
+    let prefix_tiers = head_prefix_tiers(
+        &config,
+        &layout,
+        state_tokens_per_request,
+        if hybrid.align_mode {
+            hybrid.block_tokens
+        } else {
+            1
+        },
+        cost_log_dir.as_deref(),
+        id,
+    );
+    let chunk_end_quantum = (hybrid.align_mode
         && !matches!(config.prefix_cache, PrefixCacheConfig::Disabled))
     .then_some(hybrid.block_tokens);
     tracing::info!(
@@ -221,6 +243,11 @@ pub(crate) fn build_hybrid_pipeline_head_worker<M: IterwiseUnifiedModel>(
         essentials.sampler,
         prefix_cache_logger,
     );
+    let kv_store = if hybrid.align_mode {
+        kv_store
+    } else {
+        kv_store.with_exact_prefix_reuse()
+    };
     let admission = PipelinedChunkedPrefillAdmission::new(
         PendingOrder::new(config.pending_order),
         (),
@@ -250,12 +277,62 @@ pub(crate) fn build_hybrid_pipeline_head_worker<M: IterwiseUnifiedModel>(
         admission = admission.with_srpt();
     }
 
-    PipelineHeadWorker::from_components(
-        essentials.context,
-        kv_store,
-        admission,
-        UnifiedIterExecution::new(stage_model, essentials.cost),
-        layout,
-        send_gid,
+    with_head_options(
+        PipelineHeadWorker::from_components(
+            essentials.context,
+            kv_store,
+            admission,
+            UnifiedIterExecution::new(stage_model, essentials.cost),
+            layout,
+            send_gid,
+        ),
+        prefix_tiers,
+        config.external_decode,
     )
+}
+
+/// The DRAM/SSD tiers `config` asks for, in the pipeline's per-GPU token units.
+fn head_prefix_tiers(
+    config: &WorkerConfig,
+    layout: &PipelineLayout,
+    state_tokens: u64,
+    hit_quantum: u32,
+    log_dir: Option<&std::path::Path>,
+    id: WorkerId,
+) -> Option<HeadPrefixTiers> {
+    let specs: Vec<_> = config.prefix_tiers.iter().flatten().copied().collect();
+    (!specs.is_empty()).then(|| {
+        HeadPrefixTiers::new(
+            &specs,
+            layout.kv_bytes_per_token,
+            state_tokens,
+            hit_quantum,
+            log_dir,
+            id,
+        )
+    })
+}
+
+fn with_head_options<K, A, E>(
+    head: PipelineHeadWorker<K, A, E>,
+    prefix_tiers: Option<HeadPrefixTiers>,
+    external_decode: bool,
+) -> PipelineHeadWorker<K, A, E>
+where
+    K: crate::worker::kv::IterWorkerKv + crate::worker::kv::PrefixKv,
+    A: crate::worker::admission::MicrobatchAdmission<K>,
+    E: crate::worker::execution::IterModelExecution<
+        K,
+        Input = crate::arch::contract::UnifiedArchInput,
+    >,
+{
+    let head = match prefix_tiers {
+        Some(tiers) => head.with_prefix_tiers(tiers),
+        None => head,
+    };
+    if external_decode {
+        head.with_external_decode()
+    } else {
+        head
+    }
 }

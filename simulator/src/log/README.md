@@ -129,7 +129,9 @@ non-prefix committed occupancy represented by that sample.
 successfully reserves KV emits `activate`: `hit` destructively transfers the
 whole retained entry to the active request, while `miss` records a resolved cold
 lookup. Request completion emits `retain`; PD prefill emits it only after the
-decode pull acknowledgement releases held source KV. Cache removals emit
+decode pull acknowledgement releases held source KV. A pipeline head also emits
+`retain/restore` when a context comes back into HBM: a DRAM/SSD read landing,
+or an `external_decode` round handing its decoded context back. Cache removals emit
 `evict`, with one of `active-kv-pressure`, `replacement-policy`,
 `retention-capacity`, or `same-session-replacement`. A completed session that
 cannot retain any KV still emits `retain/no-cache-capacity` with a zero-sized
