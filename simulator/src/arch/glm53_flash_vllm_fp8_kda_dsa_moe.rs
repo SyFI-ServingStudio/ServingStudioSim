@@ -274,6 +274,11 @@ const MHC_BACKENDS_MI300X: &[&str] = &["elementwise_floor"];
 // `profiling/runners/comm/fabric_roofline.py`). Not a measured multi-GPU row and
 // not a compute floor; B200 keeps the NVIDIA `flashinfer_mnnvl` above.
 const ALL_REDUCE_BACKENDS_MI300X: &[&str] = &["rocm_fabric_roofline"];
+// The large (non-fused) all-reduce on MI300X: RCCL over Infinity Fabric, a
+// MEASURED multi-GPU COMM row (unlike the fused roofline above). vLLM-ROCm's
+// large all-reduce rides the pynccl path, which on a ROCm Torch build dispatches
+// RCCL (`profiling/runners/comm/rccl.py`). B200 keeps NVIDIA `nccl`.
+const LARGE_ALL_REDUCE_BACKENDS_MI300X: &[&str] = &["rccl"];
 
 // Sparse-MLA attention (`dsa_sparse_mla_attention`) latent coordinate. The
 // backend pin above (SPARSE_ATTN_BACKENDS*) chooses the kernel; this coordinate
@@ -971,11 +976,14 @@ pub fn build_configs(
             fused_token_limit: None,
         },
         large_all_reduce: AllReduceKernelConfig {
-            // TODO(mi300x-campaign): the large (non-fused) all-reduce keeps the
-            // NVIDIA backend as a documented placeholder on MI300X (no measured
-            // ROCm large all-reduce yet); the fabric is pinned to the real
-            // hardware. B200 is byte-identical (NVIDIA backend + NVLink).
-            backends: LARGE_ALL_REDUCE_BACKENDS.to_vec(),
+            // The large (non-fused) all-reduce: NVIDIA runs NCCL, MI300X runs RCCL
+            // over Infinity Fabric. vLLM-ROCm reaches this collective through the
+            // same pynccl path as NVIDIA, which on a ROCm Torch build dispatches
+            // RCCL (Torch's "nccl" process-group backend aliases to librccl on
+            // ROCm). A MEASURED multi-GPU row, not a roofline (decision: measure
+            // the EP/comm collectives on MI300X). The fabric pin selects the real
+            // hardware; B200 is byte-identical (NCCL + NVLink).
+            backends: pin_mi300x(&gpu, LARGE_ALL_REDUCE_BACKENDS_MI300X, LARGE_ALL_REDUCE_BACKENDS),
             gpu_name: gpu.clone(),
             num_gpus: tp,
             fabric: intra_node_fabric(&gpu),
@@ -1905,16 +1913,24 @@ mod tests {
         // B200 is unchanged.
         let b200 = build_configs(&model_cfg(), &parallel(), &demand).unwrap();
         assert_eq!(b200.all_reduce.fabric, Fabric::Nvlink);
-        // B200 keeps the NVIDIA-only MNNVL all-reduce backend.
+        // B200 keeps the NVIDIA-only MNNVL fused all-reduce backend, and NCCL for
+        // the large (non-fused) all-reduce.
         assert_eq!(b200.all_reduce.backends, vec!["flashinfer_mnnvl"]);
-        // MI300X flips the name-independent fabric pin and the backend pin: the
-        // analytic Infinity-Fabric roofline instead of NVIDIA-only MNNVL.
+        assert_eq!(b200.large_all_reduce.backends, vec!["nccl"]);
+        assert_eq!(b200.large_all_reduce.fabric, Fabric::Nvlink);
+        // MI300X flips the name-independent fabric pin and both all-reduce backend
+        // pins: the analytic Infinity-Fabric roofline for the fused all-reduce
+        // (instead of NVIDIA-only MNNVL) and measured RCCL for the large one
+        // (instead of NVIDIA NCCL).
         let mut amd = parallel();
         amd.gpu_name = "MI300X".into();
         let mi300x = build_configs(&model_cfg(), &amd, &demand).unwrap();
         assert_eq!(mi300x.all_reduce.fabric, Fabric::InfinityFabric);
         assert_eq!(mi300x.all_reduce.gpu_name, "MI300X");
         assert_eq!(mi300x.all_reduce.backends, vec!["rocm_fabric_roofline"]);
+        assert_eq!(mi300x.large_all_reduce.backends, vec!["rccl"]);
+        assert_eq!(mi300x.large_all_reduce.fabric, Fabric::InfinityFabric);
+        assert_eq!(mi300x.large_all_reduce.gpu_name, "MI300X");
         assert!(is_mi300x("AMD MI300X") && !is_mi300x("NVIDIA B200"));
     }
 

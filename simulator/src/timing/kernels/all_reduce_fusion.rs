@@ -149,9 +149,42 @@ pub(crate) fn flashinfer_fusion_max_bytes(gpu_name: &str, num_gpus: u32) -> u64 
     })
 }
 
+/// The fused all-reduce workspace cap in bytes for an AMD Infinity-Fabric
+/// target, keyed only by TP group size. MI300X runs the analytic Infinity-Fabric
+/// ring all-reduce roofline (`rocm_fabric_roofline`, decision #42), which has no
+/// FlashInfer workspace and no CUDA compute capability, so it cannot read
+/// [`flashinfer_fusion_workspace`]. The roofline is linear in `num_tokens`, so
+/// this cap only bounds the sweep's upper token count: `Cache1DLinear`
+/// interpolates within it and extrapolates linearly above, which is exact for
+/// the roofline. The TP->MiB values are vLLM's SM100 caps, kept so the MI300X
+/// sweep's token range matches the measured rows.
+fn infinity_fabric_fused_max_bytes(num_gpus: u32) -> u64 {
+    let mib: u64 = match num_gpus {
+        2 => 64,
+        4 => 32,
+        8 => 1,
+        _ => panic!("fused all-reduce supports TP 2/4/8, not {num_gpus}"),
+    };
+    mib * 1024 * 1024
+}
+
+/// The fused all-reduce workspace cap in bytes for a config, vendor-aware by its
+/// `fabric`. NVIDIA parts (NVLink) read vLLM's capability-keyed FlashInfer
+/// budget; AMD Infinity Fabric uses the capability-free cap above, so a target
+/// with no CUDA compute capability does not fall into the FlashInfer panic.
+/// Branching on the fabric (not the GPU name) keeps every NVLink config
+/// byte-identical.
+pub(crate) fn fused_workspace_max_bytes(gpu_name: &str, num_gpus: u32, fabric: Fabric) -> u64 {
+    match fabric {
+        Fabric::InfinityFabric => infinity_fabric_fused_max_bytes(num_gpus),
+        _ => flashinfer_fusion_max_bytes(gpu_name, num_gpus),
+    }
+}
+
 impl AllReduceFusionSpec {
-    /// Largest token count the engine runs through FlashInfer:
-    /// `fused_token_limit` when set, else vLLM's workspace cap.
+    /// Largest token count the engine runs through the fused all-reduce:
+    /// `fused_token_limit` when set, else the vendor's workspace cap
+    /// ([`fused_workspace_max_bytes`]).
     pub fn max_fused_tokens(config: &AllReduceFusionKernelConfig) -> u32 {
         if let Some(limit) = config.fused_token_limit {
             return limit;
@@ -159,7 +192,8 @@ impl AllReduceFusionSpec {
         let bytes_per_token = u64::from(config.hidden_dim)
             .checked_mul(config.dtype.size_bytes() as u64)
             .expect("all-reduce bytes per token overflow");
-        (flashinfer_fusion_max_bytes(&config.gpu_name, config.num_gpus) / bytes_per_token) as u32
+        (fused_workspace_max_bytes(&config.gpu_name, config.num_gpus, config.fabric)
+            / bytes_per_token) as u32
     }
 
     /// FlashInfer `MNNVL_ONE_SHOT_THRESHOLD` (`trtllm_mnnvl_ar.py`): one-shot
@@ -388,6 +422,27 @@ mod tests {
         assert_eq!(AllReduceFusionSpec::max_fused_tokens(&h200(4)), 170);
         assert_eq!(AllReduceFusionSpec::max_fused_tokens(&h200(8)), 42);
         assert_eq!(AllReduceFusionSpec::max_fused_tokens(&h200(2)), 5461);
+    }
+
+    #[test]
+    fn mi300x_infinity_fabric_uses_the_capability_free_cap_without_panic() {
+        // MI300X has no CUDA compute capability, so the FlashInfer workspace path
+        // would panic. The Infinity-Fabric roofline (rocm_fabric_roofline) uses
+        // the capability-free SM100 cap as the sweep upper bound: at TP4,
+        // 32 MiB / (6144 * 2 B) = 2730 (identical to B200 TP4); at TP8,
+        // 1 MiB / (6144 * 2 B) = 85.
+        let amd = |num_gpus| AllReduceFusionKernelConfig {
+            backends: vec!["rocm_fabric_roofline"],
+            gpu_name: "MI300X".to_string(),
+            fabric: Fabric::InfinityFabric,
+            ..config(num_gpus)
+        };
+        assert_eq!(AllReduceFusionSpec::max_fused_tokens(&amd(4)), 2730);
+        assert_eq!(
+            AllReduceFusionSpec::sweep_grid(&amd(4)).axes()[0].last(),
+            Some(&2730.0)
+        );
+        assert_eq!(AllReduceFusionSpec::max_fused_tokens(&amd(8)), 85);
     }
 
     fn mnnvl_config(num_gpus: u32) -> AllReduceFusionKernelConfig {

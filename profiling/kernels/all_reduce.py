@@ -98,15 +98,29 @@ _BACKEND_DOCS = {
         ),
         url="https://github.com/NVIDIA/nvshmem",
     ),
+    "rccl": BackendDoc(
+        summary=(
+            "torch.distributed.all_reduce with sum on the ROCm RCCL backend: the "
+            "MI300X large all-reduce vLLM-ROCm runs over Infinity Fabric. Torch's "
+            '"nccl" process-group backend aliases to librccl on a ROCm build.'
+        ),
+        url="https://github.com/ROCm/rccl",
+    ),
 }
 
 
-def _spec(backend: str, module_name: str) -> KernelProfilerSpec:
+def _spec(
+    backend: str,
+    module_name: str,
+    *,
+    supports: BackendSupport = BackendSupport(compute=None),
+    subprocess_env: str | None = None,
+) -> KernelProfilerSpec:
     return KernelProfilerSpec(
         kernel_kind=KIND,
         backend=backend,
         # Comm is size-keyed (fewer bytes at fp8, same bf16 curve) — dtype-agnostic.
-        supports=BackendSupport(compute=None),
+        supports=supports,
         # list_native: the runner spawns its rank group once per chunk and loops
         # every size inside, so the worker hands it the whole spec list (no per-shape
         # re-init). function_name points at the batch entry, not the single-spec one.
@@ -115,6 +129,7 @@ def _spec(backend: str, module_name: str) -> KernelProfilerSpec:
         args_schema=AllReduceArgs,
         metric_family=MetricFamily.COMM,
         batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env=subprocess_env,
         gpu_count_fn=lambda spec: int(spec["num_gpus"]),
         list_native=True,
         doc=_BACKEND_DOCS[backend],
@@ -123,3 +138,15 @@ def _spec(backend: str, module_name: str) -> KernelProfilerSpec:
 
 register(_spec("nccl", "profiling.runners.comm.nccl"))
 register(_spec("nvshmem", "profiling.runners.comm.nvshmem"))
+# MI300X large (non-fused) all-reduce: RCCL over Infinity Fabric, a MEASURED
+# multi-GPU row (GLM-5.3-Flash MI300X port). AMD-arch gated (CDNA3) and run in
+# the ROCm venv; the measurement reuses the NCCL runner because Torch's "nccl"
+# backend is RCCL on ROCm. B200 keeps the NVIDIA nccl backend above, byte-identical.
+register(
+    _spec(
+        "rccl",
+        "profiling.runners.comm.rccl",
+        supports=BackendSupport(compute=None, arch_targets=frozenset({"CDNA3"})),
+        subprocess_env="vllm_rocm_env",
+    )
+)
