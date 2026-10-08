@@ -320,9 +320,26 @@ def test_operand_layout_and_causal_tail_spans() -> None:
     assert operands.valid_mask.shape == (8, 8)
     assert operands.long_row_indices.tolist() == [4, 5, 6, 7]
     assert bool(torch.isfinite(operands.logits).all())
-    assert operands.logits.unique().numel() == 8
     assert bool(torch.any(operands.logits < 0))
     assert bool(torch.any(operands.logits > 0))
+
+
+def test_operand_scores_are_unsorted_distinct_and_seeded() -> None:
+    """A sorted or row-repeated score template is the radix select's slow case
+    (1.7x on vLLM's top_k_per_row_prefill at 16384 x 245760), so the rows must
+    differ from each other and not ascend, and stay identical across builds."""
+    from profiling.runners.attention.dsa_topk_prefill import _build_operands
+
+    def build():
+        return _build_operands(
+            torch, num_queries=8, num_keys=64, top_k=4, logits_row_stride=80, device="cpu"
+        )
+
+    logits = build().logits
+    assert logits.unique().numel() == logits.numel()
+    assert not torch.equal(logits[0], logits[1])
+    assert not bool((logits[:, 1:] >= logits[:, :-1]).all())
+    assert torch.equal(build().logits_backing, build().logits_backing)
 
 
 def _selected_value_map(logits, starts, ends, indices):
