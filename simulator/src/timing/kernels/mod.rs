@@ -72,6 +72,7 @@ pub mod q_pad_kv_rope_mxfp8_insert;
 pub mod qnorm_rope_kv_insert;
 pub mod residual_rms_norm;
 pub mod rms_norm;
+pub mod rs_sconv_ag_residual_rms_norm;
 pub mod single_gemm;
 pub mod vllm_fused_moe;
 pub mod vllm_mla_rope;
@@ -317,6 +318,10 @@ pub use residual_rms_norm::{
     ResidualRmsNormSpec,
 };
 pub use rms_norm::{RmsNormKernel, RmsNormKernelConfig, RmsNormKernelInput, RmsNormSpec};
+pub use rs_sconv_ag_residual_rms_norm::{
+    RsSconvAgResidualRmsNormKernel, RsSconvAgResidualRmsNormKernelConfig,
+    RsSconvAgResidualRmsNormKernelInput, RsSconvAgResidualRmsNormSpec,
+};
 pub use single_gemm::{
     SingleGemmKernel, SingleGemmKernelConfig, SingleGemmKernelInput, SingleGemmSpec,
 };
