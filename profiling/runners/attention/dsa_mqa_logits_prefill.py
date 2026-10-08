@@ -299,8 +299,16 @@ def _logical_scheduled_bytes(
     num_heads: int,
     head_dim: int,
 ) -> int:
-    """Return scheduled logical bytes, excluding Torch/TMA intermediates."""
-    sum_w, scheduled_cells, _nominal_flops = _scheduled_work(
+    """Return the call's compulsory HBM traffic, excluding Torch/TMA intermediates.
+
+    Queries, head weights and spans are read once and the scheduled logits
+    written once. Keys and their scales are read once too: every two-query tile
+    re-reads its key window (``head_dim * W`` bytes in all), but the one
+    sequence's keys (num_keys · head_dim FP8 bytes, 31 MB at 245,760 keys) sit in
+    L2 across tiles. Counting the re-reads put the B200 rows at ~17 TB/s, above
+    HBM, which made a compute-bound kernel look bandwidth-bound.
+    """
+    _sum_w, scheduled_cells, _nominal_flops = _scheduled_work(
         num_queries=num_queries,
         num_keys=num_keys,
         num_heads=num_heads,
@@ -308,8 +316,8 @@ def _logical_scheduled_bytes(
     )
     return (
         num_queries * num_heads * head_dim
-        + head_dim * sum_w
-        + 4 * sum_w
+        + head_dim * num_keys
+        + 4 * num_keys
         + 4 * num_queries * num_heads
         + 8 * num_queries
         + 4 * scheduled_cells
