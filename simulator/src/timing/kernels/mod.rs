@@ -39,6 +39,7 @@ pub mod gdn_prefill_post_conv;
 pub mod gdn_recurrent_decode;
 pub mod gemm_fp32_output;
 pub mod grouped_gemm;
+pub mod inkling_rel_attention;
 pub mod inv_rope_fp8_quant;
 pub mod kda_chunk_prefill;
 pub mod kda_recurrent_decode;
@@ -212,6 +213,10 @@ pub use gemm_fp32_output::{
 };
 pub use grouped_gemm::{
     GroupedGemmKernel, GroupedGemmKernelConfig, GroupedGemmKernelInput, GroupedGemmSpec,
+};
+pub use inkling_rel_attention::{
+    InklingRelAttentionKernel, InklingRelAttentionKernelConfig, InklingRelAttentionKernelInput,
+    InklingRelAttentionSpec,
 };
 pub use inv_rope_fp8_quant::{
     InvRopeFp8QuantKernel, InvRopeFp8QuantKernelConfig, InvRopeFp8QuantKernelInput,
