@@ -146,6 +146,16 @@ fn default_glm53_flash_mhc_fused_backend() -> String {
     "vllm_tilelang".to_string()
 }
 
+/// `dsa_topk_prefill` choices for a GLM-5.3-Flash arch's prefill indexer:
+/// vLLM's `top_k_per_row_prefill`, DeepSelect (needs a vLLM patch to dispatch
+/// on prefill), or the faster of the two per launch shape.
+pub(crate) const GLM53_FLASH_INDEXER_TOPK_BACKENDS: [&str; 3] =
+    ["vllm_cuda", "deep_select", "fastest"];
+
+fn default_glm53_flash_indexer_topk_backend() -> String {
+    "vllm_cuda".to_string()
+}
+
 /// vLLM's default `VLLM_SPARSE_INDEXER_MAX_LOGITS_MB` (`vllm/envs.py`).
 const fn default_glm53_flash_indexer_max_logits_mb() -> u32 {
     512
@@ -723,6 +733,15 @@ pub enum IterArchSel {
         #[serde(default = "default_glm53_flash_mhc_fused_backend")]
         #[param(string, default = "vllm_tilelang", choices = GLM53_FLASH_MHC_FUSED_BACKENDS, cache_key)]
         mhc_fused_backend: String,
+        /// DSA prefill-indexer top-k (`dsa_topk_prefill` backend):
+        /// `vllm_cuda` (`top_k_per_row_prefill`, what vLLM runs), `deep_select`
+        /// (DeepSelect, which vLLM runs only for decode), or `fastest`, the
+        /// per-launch best of the two. A launch packing several requests has
+        /// nonzero row starts, which DeepSelect cannot take, so it stays on
+        /// `vllm_cuda` under every choice.
+        #[serde(default = "default_glm53_flash_indexer_topk_backend")]
+        #[param(string, default = "vllm_cuda", choices = GLM53_FLASH_INDEXER_TOPK_BACKENDS, cache_key)]
+        indexer_topk_backend: String,
         /// vLLM `VLLM_SPARSE_INDEXER_MAX_LOGITS_MB`: the prefill indexer splits
         /// its queries so each MQA-logits call's fp32 `[rows, pools]` matrix
         /// fits this many MiB, and runs logits and top-k once per piece.
@@ -794,6 +813,15 @@ pub enum IterArchSel {
         #[serde(default = "default_glm53_flash_mhc_fused_backend")]
         #[param(string, default = "vllm_tilelang", choices = GLM53_FLASH_MHC_FUSED_BACKENDS, cache_key)]
         mhc_fused_backend: String,
+        /// DSA prefill-indexer top-k (`dsa_topk_prefill` backend):
+        /// `vllm_cuda` (`top_k_per_row_prefill`, what vLLM runs), `deep_select`
+        /// (DeepSelect, which vLLM runs only for decode), or `fastest`, the
+        /// per-launch best of the two. A launch packing several requests has
+        /// nonzero row starts, which DeepSelect cannot take, so it stays on
+        /// `vllm_cuda` under every choice.
+        #[serde(default = "default_glm53_flash_indexer_topk_backend")]
+        #[param(string, default = "vllm_cuda", choices = GLM53_FLASH_INDEXER_TOPK_BACKENDS, cache_key)]
+        indexer_topk_backend: String,
         /// vLLM `VLLM_SPARSE_INDEXER_MAX_LOGITS_MB`: the prefill indexer splits
         /// its queries so each MQA-logits call's fp32 `[rows, pools]` matrix
         /// fits this many MiB, and runs logits and top-k once per piece.
@@ -862,6 +890,15 @@ pub enum IterArchSel {
         #[serde(default = "default_glm53_flash_mhc_fused_backend")]
         #[param(string, default = "vllm_tilelang", choices = GLM53_FLASH_MHC_FUSED_BACKENDS, cache_key)]
         mhc_fused_backend: String,
+        /// DSA prefill-indexer top-k (`dsa_topk_prefill` backend):
+        /// `vllm_cuda` (`top_k_per_row_prefill`, what vLLM runs), `deep_select`
+        /// (DeepSelect, which vLLM runs only for decode), or `fastest`, the
+        /// per-launch best of the two. A launch packing several requests has
+        /// nonzero row starts, which DeepSelect cannot take, so it stays on
+        /// `vllm_cuda` under every choice.
+        #[serde(default = "default_glm53_flash_indexer_topk_backend")]
+        #[param(string, default = "vllm_cuda", choices = GLM53_FLASH_INDEXER_TOPK_BACKENDS, cache_key)]
+        indexer_topk_backend: String,
         /// vLLM `VLLM_SPARSE_INDEXER_MAX_LOGITS_MB`: the prefill indexer splits
         /// its queries so each MQA-logits call's fp32 `[rows, pools]` matrix
         /// fits this many MiB, and runs logits and top-k once per piece.
@@ -933,6 +970,15 @@ pub enum IterArchSel {
         #[serde(default = "default_glm53_flash_mhc_fused_backend")]
         #[param(string, default = "vllm_tilelang", choices = GLM53_FLASH_MHC_FUSED_BACKENDS, cache_key)]
         mhc_fused_backend: String,
+        /// DSA prefill-indexer top-k (`dsa_topk_prefill` backend):
+        /// `vllm_cuda` (`top_k_per_row_prefill`, what vLLM runs), `deep_select`
+        /// (DeepSelect, which vLLM runs only for decode), or `fastest`, the
+        /// per-launch best of the two. A launch packing several requests has
+        /// nonzero row starts, which DeepSelect cannot take, so it stays on
+        /// `vllm_cuda` under every choice.
+        #[serde(default = "default_glm53_flash_indexer_topk_backend")]
+        #[param(string, default = "vllm_cuda", choices = GLM53_FLASH_INDEXER_TOPK_BACKENDS, cache_key)]
+        indexer_topk_backend: String,
         /// vLLM `VLLM_SPARSE_INDEXER_MAX_LOGITS_MB`: the prefill indexer splits
         /// its queries so each MQA-logits call's fp32 `[rows, pools]` matrix
         /// fits this many MiB, and runs logits and top-k once per piece.
@@ -999,6 +1045,15 @@ pub enum IterArchSel {
         #[serde(default = "default_glm53_flash_mhc_fused_backend")]
         #[param(string, default = "vllm_tilelang", choices = GLM53_FLASH_MHC_FUSED_BACKENDS, cache_key)]
         mhc_fused_backend: String,
+        /// DSA prefill-indexer top-k (`dsa_topk_prefill` backend):
+        /// `vllm_cuda` (`top_k_per_row_prefill`, what vLLM runs), `deep_select`
+        /// (DeepSelect, which vLLM runs only for decode), or `fastest`, the
+        /// per-launch best of the two. A launch packing several requests has
+        /// nonzero row starts, which DeepSelect cannot take, so it stays on
+        /// `vllm_cuda` under every choice.
+        #[serde(default = "default_glm53_flash_indexer_topk_backend")]
+        #[param(string, default = "vllm_cuda", choices = GLM53_FLASH_INDEXER_TOPK_BACKENDS, cache_key)]
+        indexer_topk_backend: String,
         /// vLLM `VLLM_SPARSE_INDEXER_MAX_LOGITS_MB`: the prefill indexer splits
         /// its queries so each MQA-logits call's fp32 `[rows, pools]` matrix
         /// fits this many MiB, and runs logits and top-k once per piece.
@@ -1064,6 +1119,15 @@ pub enum IterArchSel {
         #[serde(default = "default_glm53_flash_mhc_fused_backend")]
         #[param(string, default = "vllm_tilelang", choices = GLM53_FLASH_MHC_FUSED_BACKENDS, cache_key)]
         mhc_fused_backend: String,
+        /// DSA prefill-indexer top-k (`dsa_topk_prefill` backend):
+        /// `vllm_cuda` (`top_k_per_row_prefill`, what vLLM runs), `deep_select`
+        /// (DeepSelect, which vLLM runs only for decode), or `fastest`, the
+        /// per-launch best of the two. A launch packing several requests has
+        /// nonzero row starts, which DeepSelect cannot take, so it stays on
+        /// `vllm_cuda` under every choice.
+        #[serde(default = "default_glm53_flash_indexer_topk_backend")]
+        #[param(string, default = "vllm_cuda", choices = GLM53_FLASH_INDEXER_TOPK_BACKENDS, cache_key)]
+        indexer_topk_backend: String,
         /// vLLM `VLLM_SPARSE_INDEXER_MAX_LOGITS_MB`: the prefill indexer splits
         /// its queries so each MQA-logits call's fp32 `[rows, pools]` matrix
         /// fits this many MiB, and runs logits and top-k once per piece.
