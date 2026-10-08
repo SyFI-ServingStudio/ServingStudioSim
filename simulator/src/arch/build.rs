@@ -24,7 +24,8 @@ use crate::arch::{
     deepseek_v41_vllm, deepseek_v4_vllm, glm52_sglang_nvfp4_tp_dsa_moe, glm52_vllm_dsa_moe,
     glm52_vllm_nvfp4_dp_attn_dsa_moe, glm52_vllm_nvfp4_dsa_moe, glm52_vllm_nvfp4_pp_dsa_moe,
     glm53_flash_vllm_fp8_dp_attn_ep_moe, glm53_flash_vllm_fp8_kda_dsa_moe,
-    glm53_flash_vllm_fp8_pp_kda_dsa_moe, glm53_vllm_nvfp4_dsa_moe_dflash2, llama3_dense,
+    glm53_flash_vllm_fp8_pp_kda_dsa_moe, glm53_vllm_nvfp4_dsa_moe_dflash2,
+    inkling_vllm_nvfp4_rel_attn_moe, llama3_dense,
     llama3_dense_tp, llama3_dp_attn_tp_ffn, qwen36_local, qwen3_attn_layerwise,
     qwen3_ffn_moe_layerwise, qwen3_fp8_ffn_moe_layerwise, qwen3_moe_dp_attn_ep_ffn,
     qwen3_moe_fp8_dp_attn_ep_ffn, qwen3_vllm_moe_dp_attn_ep_ffn, AttnLayerwiseModel,
@@ -36,7 +37,9 @@ use crate::arch::{
     Glm52VllmNvfp4DsaMoeModel, Glm52VllmNvfp4DsaMoeParallel, Glm52VllmNvfp4DsaMoeSpeculativeModel,
     Glm52VllmNvfp4PpDsaMoeModel, Glm52VllmNvfp4PpParallel, Glm53FlashModelCfg, Glm53FlashQuant,
     Glm53FlashVllmFp8PpModel, Glm53FlashVllmFp8PpParallel, Glm53FlashVllmModel,
-    Glm53FlashVllmParallel, Glm53VllmNvfp4DsaMoeDflash2Model, IterwiseUnifiedModel,
+    Glm53FlashVllmParallel, Glm53VllmNvfp4DsaMoeDflash2Model, InklingExpertDemand,
+    InklingExpertPrecision, InklingModelCfg, InklingVllmModel, InklingVllmParallel,
+    IterwiseUnifiedModel,
     Llama3DenseModel, Llama3DenseTpModel, Llama3DpAttnTpFfnModel, Qwen36LocalModel,
     Qwen36LocalParallel, Qwen36ModelCfg, Qwen3AttnLayerwiseModel, Qwen3AttnParallel,
     Qwen3FfnMoeLayerwiseModel, Qwen3FfnMoeParallel, Qwen3Fp8FfnMoeLayerwiseModel,
@@ -1432,6 +1435,76 @@ fn glm53_flash_model_and_demand(
     Ok((model_cfg, demand))
 }
 
+/// Build an Inkling ModelOpt NVFP4 checkpoint's graph under one vLLM TP group
+/// (routed experts EP = TP, or MoE TP).
+///
+/// The checkpoint's layer schedule is exact, so layer-count overrides are
+/// rejected. Routing is resolved per expert precision over that precision's
+/// slice of the MoE layer axis (Inkling-Small: layer 2's BF16 experts are
+/// corpus layer 0, the NVFP4 layers 3..41 are corpus layers 1..40); a corpus
+/// captured with MTP off records exactly the MoE layers.
+#[allow(clippy::too_many_arguments)]
+pub fn inkling_vllm_nvfp4_rel_attn_moe(
+    model_spec: &ModelSpec,
+    tp_size: u16,
+    enable_expert_parallel: bool,
+    max_model_len: u32,
+    routing_kind: RoutingKind,
+    routing_seed: Option<u64>,
+    expert_popularity_file: Option<&str>,
+    token_corpus_file: Option<&str>,
+    cudagraph_capture_sizes: &[u32],
+    gpu: &str,
+    name: &str,
+    bridge: &PerfApiBridge,
+) -> Result<InklingVllmModel> {
+    if model_spec.num_layers.is_some() || model_spec.sim_num_layers.is_some() {
+        bail!(
+            "Inkling architecture rejects num_layers/sim_num_layers overrides; the exact \
+             local/global and dense/MoE layer schedule is required"
+        );
+    }
+    anyhow::ensure!(
+        !model_spec.fp8,
+        "Inkling NVFP4: set fp8: false (the checkpoint is ModelOpt NVFP4)"
+    );
+    let model_cfg = InklingModelCfg::from_json(Path::new(&model_spec.model_config))
+        .context("loading Inkling config")?;
+    let source = ExpertDemandSource {
+        kind: routing_kind,
+        seed: routing_seed,
+        num_experts: model_cfg.n_routed_experts,
+        experts_per_token: model_cfg.num_experts_per_tok,
+        ep_size: if enable_expert_parallel { tp_size } else { 1 },
+        expert_popularity_file,
+        token_corpus_file,
+        num_routed_layers: model_cfg.num_moe_layers(),
+    };
+    // Ordinary decode: one row per request, so a verify block is one token.
+    let demand_for = |precision: InklingExpertPrecision| -> Result<Option<ExpertDemand>> {
+        model_cfg
+            .moe_layer_range(precision)?
+            .map(|layers| source.demand(layers, 1))
+            .transpose()
+    };
+    let demand = InklingExpertDemand {
+        nvfp4: demand_for(InklingExpertPrecision::Nvfp4)?,
+        bf16: demand_for(InklingExpertPrecision::Bf16)?,
+    };
+    let parallel = InklingVllmParallel {
+        tp_size,
+        enable_expert_parallel,
+        max_model_len,
+        gpu_name: gpu.to_string(),
+        cudagraph_capture_sizes: cudagraph_capture_sizes.to_vec(),
+    };
+    let configs = inkling_vllm_nvfp4_rel_attn_moe::build_configs(&model_cfg, &parallel, &demand)
+        .context("expanding Inkling architecture configs")?;
+    let resolved = inkling_vllm_nvfp4_rel_attn_moe::resolve_configs(&configs);
+    inkling_vllm_nvfp4_rel_attn_moe::build(name.to_string(), resolved, bridge)
+        .context("building Inkling model (often a missing profile.db row)")
+}
+
 /// Build the B200 GLM-5.3-Flash FP8 graph under pure pipeline parallelism:
 /// `pp_size` one-GPU stages at TP1 / EP1, as the whole-pipeline view over them.
 ///
@@ -2135,6 +2208,30 @@ pub fn build_iter_model(
         } => Box::new(glm53_flash_vllm_fp8_kda_dsa_moe(
             model,
             glm53_flash_quant(sel),
+            *tp_size,
+            *enable_expert_parallel,
+            *max_model_len,
+            *routing,
+            *routing_seed,
+            expert_popularity_file.as_deref(),
+            token_corpus_file.as_deref(),
+            cudagraph_capture_sizes,
+            gpu,
+            name,
+            bridge,
+        )?),
+        IterArchSel::InklingVllmNvfp4RelAttnMoe {
+            model,
+            tp_size,
+            enable_expert_parallel,
+            max_model_len,
+            routing,
+            routing_seed,
+            expert_popularity_file,
+            token_corpus_file,
+            cudagraph_capture_sizes,
+        } => Box::new(inkling_vllm_nvfp4_rel_attn_moe(
+            model,
             *tp_size,
             *enable_expert_parallel,
             *max_model_len,
