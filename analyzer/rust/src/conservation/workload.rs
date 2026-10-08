@@ -838,11 +838,14 @@ pub(crate) struct WorkerShapeSample {
     pub(crate) shapes: Vec<WeightedWorkload>,
     /// Iterations the weights add up to — the worker's exact total, by construction.
     pub(crate) iterations: u64,
-    /// Iterations actually drawn: every prefill-carrying one plus the sampled
-    /// decode-only ones. This is what the labeler's cost scales with.
+    /// Distinct shapes drawn from both strata. This is what the labeler's cost
+    /// scales with.
     pub(crate) labeled_iterations: u64,
     /// Stride applied to the decode-only stratum (1 = that stratum is exact too).
     pub(crate) decode_stride: u64,
+    /// Prefill-carrying iterations, and how many of them the sample kept.
+    pub(crate) prefill_iterations: u64,
+    pub(crate) sampled_prefill_iterations: u64,
 }
 
 /// Collect fixed-batch workloads for a run and deduplicate equal iteration shapes
@@ -854,21 +857,25 @@ pub(crate) struct WorkerShapeSample {
 /// "label every distinct shape" cost one label per iteration. So the iterations are
 /// **stratified**, not sampled flat:
 ///
-/// - **Prefill-carrying iterations are all kept.** On that run they are 0.76% of
-///   iterations but carry 70.7% of the matmul-token mass. They are also where the
-///   variance is, and they recur on a quasi-periodic schedule that an `iter_id %
-///   stride` sample aliases against: flat stride 50 moved the floors +0.37% while
-///   flat stride 19 — a *denser* sample — moved them +1.04%, because the phase, not
-///   the sample size, decided how many prefill steps were caught.
+/// - **Prefill-carrying iterations are sampled by a hash of `iter_id`** to about
+///   `target_sampled_prefill_iterations`. On a decode-heavy run they are 0.76% of
+///   iterations but carry 70.7% of the matmul-token mass, and they recur on a
+///   quasi-periodic schedule that an `iter_id % stride` sample aliases against:
+///   flat stride 50 moved the floors +0.37% while flat stride 19 — a *denser*
+///   sample — moved them +1.04%, because the phase, not the sample size, decided
+///   how many prefill steps were caught. A hash has no phase. A prefill-only run
+///   (a PP stage at saturation) has every iteration here — 404,476 distinct shapes
+///   per stage on an 8 h GLM-5.3 run — so this stratum must be sampled too.
 /// - **Decode-only iterations are sampled** to about
 ///   `target_sampled_decode_iterations`. They are numerous, cheap, and drift smoothly
 ///   with context length, so a systematic sample tracks them closely.
 ///
-/// The kept decode shapes are then reweighted so each worker's weights sum to its
-/// exact iteration count, which leaves the caller nothing to anchor.
+/// Each stratum's kept shapes are then reweighted so its weights sum to its exact
+/// iteration count, which leaves the caller nothing to anchor.
 pub(crate) async fn collect_workload_shapes_by_worker(
     ctx: &SessionContext,
     target_sampled_decode_iterations: u64,
+    target_sampled_prefill_iterations: u64,
 ) -> Result<HashMap<(String, u16), WorkerShapeSample>> {
     let batches = collect(
         ctx,
@@ -916,16 +923,32 @@ pub(crate) async fn collect_workload_shapes_by_worker(
         }
     }
 
-    // Decode-only iterations per worker, so each worker's stride is sized from its
-    // own stratum rather than from whichever worker ran longest.
+    // Each stratum's size per worker, so each worker's sampling rate is sized from
+    // its own strata rather than from whichever worker ran longest.
     let mut decode_iterations_by_worker: HashMap<(u16, u16), u64> = HashMap::new();
+    let mut prefill_iterations_by_worker: HashMap<(u16, u16), u64> = HashMap::new();
     for ((pool_index, worker_id, _iteration_id), totals) in &totals_by_iteration {
-        if !carries_prefill(totals) {
-            *decode_iterations_by_worker
-                .entry((*pool_index, *worker_id))
-                .or_default() += 1;
-        }
+        let stratum = if carries_prefill(totals) {
+            &mut prefill_iterations_by_worker
+        } else {
+            &mut decode_iterations_by_worker
+        };
+        *stratum.entry((*pool_index, *worker_id)).or_default() += 1;
     }
+    // Keep a prefill iteration when its hash falls under this cutoff.
+    let prefill_cutoff_by_worker: HashMap<(u16, u16), u64> = prefill_iterations_by_worker
+        .iter()
+        .map(|(worker_key, prefill_iterations)| {
+            let keep = target_sampled_prefill_iterations.max(1) as f64
+                / (*prefill_iterations).max(1) as f64;
+            let cutoff = if keep >= 1.0 {
+                u64::MAX
+            } else {
+                (keep * u64::MAX as f64) as u64
+            };
+            (*worker_key, cutoff)
+        })
+        .collect();
     let stride_by_worker: HashMap<(u16, u16), u64> = decode_iterations_by_worker
         .iter()
         .map(|(worker_key, decode_iterations)| {
@@ -938,11 +961,21 @@ pub(crate) async fn collect_workload_shapes_by_worker(
     let mut prefill_shapes: HashSet<((u16, u16), WorkloadShape)> = HashSet::new();
     let mut iterations_by_worker: HashMap<(u16, u16), u64> = HashMap::new();
     let mut sampled_decode_by_worker: HashMap<(u16, u16), u64> = HashMap::new();
+    let mut sampled_prefill_by_worker: HashMap<(u16, u16), u64> = HashMap::new();
     for ((pool_index, worker_id, iteration_id), totals) in totals_by_iteration {
         let worker_key = (pool_index, worker_id);
         *iterations_by_worker.entry(worker_key).or_default() += 1;
         let prefill = carries_prefill(&totals);
-        if !prefill {
+        if prefill {
+            let cutoff = prefill_cutoff_by_worker
+                .get(&worker_key)
+                .copied()
+                .unwrap_or(u64::MAX);
+            if cutoff != u64::MAX && splitmix64(iteration_id) > cutoff {
+                continue;
+            }
+            *sampled_prefill_by_worker.entry(worker_key).or_default() += 1;
+        } else {
             let stride = stride_by_worker.get(&worker_key).copied().unwrap_or(1);
             if iteration_id % stride != 0 {
                 continue;
@@ -986,11 +1019,27 @@ pub(crate) async fn collect_workload_shapes_by_worker(
             .get(&worker_key)
             .copied()
             .unwrap_or(0);
-        reweight_decode_stratum(
+        reweight_stratum(
             &mut shapes,
             &prefill_flags,
+            false,
             decode_iterations,
             sampled_decode,
+        );
+        let prefill_iterations = prefill_iterations_by_worker
+            .get(&worker_key)
+            .copied()
+            .unwrap_or(0);
+        let sampled_prefill_iterations = sampled_prefill_by_worker
+            .get(&worker_key)
+            .copied()
+            .unwrap_or(0);
+        reweight_stratum(
+            &mut shapes,
+            &prefill_flags,
+            true,
+            prefill_iterations,
+            sampled_prefill_iterations,
         );
         let iterations = iterations_by_worker
             .get(&worker_key)
@@ -1006,6 +1055,8 @@ pub(crate) async fn collect_workload_shapes_by_worker(
                 iterations,
                 labeled_iterations,
                 decode_stride,
+                prefill_iterations,
+                sampled_prefill_iterations,
             },
         );
     }
@@ -1066,24 +1117,27 @@ fn sort_shapes_with_flags(shapes: &mut [WeightedWorkload], prefill_flags: &mut [
 /// them. Largest-remainder distribution over the (already sorted, so deterministic)
 /// shape list makes the weights sum to `decode_iterations` exactly, which is what
 /// lets the caller treat the returned weights as the run's true iteration counts.
-fn reweight_decode_stratum(
+/// Scale one stratum's sampled occurrences (`prefill_flags[i] == prefill`) up to
+/// its exact iteration count, in integers.
+fn reweight_stratum(
     shapes: &mut [WeightedWorkload],
     prefill_flags: &[bool],
-    decode_iterations: u64,
-    sampled_decode: u64,
+    prefill: bool,
+    stratum_iterations: u64,
+    sampled_iterations: u64,
 ) {
-    if sampled_decode == 0 || decode_iterations == sampled_decode {
+    if sampled_iterations == 0 || stratum_iterations == sampled_iterations {
         return;
     }
-    let decode_indices: Vec<usize> = (0..shapes.len())
-        .filter(|&index| !prefill_flags[index])
+    let stratum_indices: Vec<usize> = (0..shapes.len())
+        .filter(|&index| prefill_flags[index] == prefill)
         .collect();
     let mut assigned = 0u64;
-    let mut remainders: Vec<(u64, usize)> = Vec::with_capacity(decode_indices.len());
-    for &index in &decode_indices {
-        let numerator = shapes[index].occurrences * decode_iterations;
-        let weight = numerator / sampled_decode;
-        remainders.push((numerator % sampled_decode, index));
+    let mut remainders: Vec<(u64, usize)> = Vec::with_capacity(stratum_indices.len());
+    for &index in &stratum_indices {
+        let numerator = shapes[index].occurrences * stratum_iterations;
+        let weight = numerator / sampled_iterations;
+        remainders.push((numerator % sampled_iterations, index));
         shapes[index].occurrences = weight;
         assigned += weight;
     }
@@ -1091,10 +1145,19 @@ fn reweight_decode_stratum(
     remainders.sort_by(|left, right| right.0.cmp(&left.0).then(left.1.cmp(&right.1)));
     for (_, index) in remainders
         .iter()
-        .take((decode_iterations - assigned) as usize)
+        .take((stratum_iterations - assigned) as usize)
     {
         shapes[*index].occurrences += 1;
     }
+}
+
+/// A fixed 64-bit mix of `iter_id` (SplitMix64's finalizer): uniform, and with no
+/// period an iteration schedule can line up with.
+fn splitmix64(value: u64) -> u64 {
+    let mut z = value.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
 }
 
 /// Typed, once-per-record-batch view of the fields needed by `model.work`.
@@ -1598,6 +1661,32 @@ mod tests {
                 "arch": {"type": "glm52_vllm_nvfp4_dsa_moe_speculative"}
             }]}}})
         ));
+    }
+
+    #[test]
+    fn reweighting_one_stratum_sums_to_its_count_and_leaves_the_other() {
+        let shape = |occurrences| WeightedWorkload {
+            totals: WorkloadTotals::default(),
+            occurrences,
+        };
+        let mut shapes = vec![shape(2), shape(1), shape(5)];
+        let prefill_flags = [true, true, false];
+        // 3 of 10 prefill iterations kept; the decode shape keeps its weight.
+        reweight_stratum(&mut shapes, &prefill_flags, true, 10, 3);
+        let weights: Vec<u64> = shapes.iter().map(|shape| shape.occurrences).collect();
+        assert_eq!(weights, vec![7, 3, 5]);
+    }
+
+    #[test]
+    fn the_prefill_hash_keeps_about_its_share_without_a_phase() {
+        // Catches a hash with a period: every 7th iteration is a prefill step
+        // here, and a phase-locked draw would keep all or none of them.
+        let cutoff = (0.1 * u64::MAX as f64) as u64;
+        let kept = (0..700_000u64)
+            .step_by(7)
+            .filter(|iteration| splitmix64(*iteration) <= cutoff)
+            .count();
+        assert!((9_000..11_000).contains(&kept), "kept {kept} of 100000");
     }
 
     #[test]
