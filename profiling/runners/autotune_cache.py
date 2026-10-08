@@ -72,6 +72,10 @@ def autotune_cache_path(kernel: str) -> Path | None:
     return base / f"{_slug(kernel)}.{_slug(device)}.fi{_slug(version)}.json"
 
 
+# The ``kernel`` whose tactics the process-wide tuner currently holds.
+_live_kernel: str | None = None
+
+
 @contextlib.contextmanager
 def autotune_cached(autotune: Any, kernel: str) -> Iterator[None]:
     """``autotune()`` that starts from, and writes back to, the shared cache.
@@ -82,16 +86,22 @@ def autotune_cached(autotune: Any, kernel: str) -> Iterator[None]:
 
     Tactics this process tuned under an earlier ``kernel`` are forgotten
     first, so the file holds only this configuration's
-    (:func:`_forget_live_tactics`).
+    (:func:`_forget_live_tactics`). Tactics tuned under the same ``kernel``
+    are kept: FlashInfer >= 0.7 ignores the loaded file while tuning whenever
+    the op's profiling policy is not the legacy default (the NVFP4 MoE's is
+    not), so clearing them would re-tune every bucket on every spec -- 46 s a
+    spec for the routed MoE, against 0.3 s of measurement.
 
     Concurrent workers can still race -- one that loaded before another saved
     will overwrite it -- but the loser is a cache miss on the next run, not a
     wrong tactic, and the file converges as runs accumulate.
     """
 
+    global _live_kernel
     path = autotune_cache_path(kernel) if _supports_cache(autotune) else None
-    if path is not None:
+    if path is not None and kernel != _live_kernel:
         _forget_live_tactics(autotune)
+    _live_kernel = kernel
     with autotune() if path is None else autotune(cache=str(path)):
         yield
 
