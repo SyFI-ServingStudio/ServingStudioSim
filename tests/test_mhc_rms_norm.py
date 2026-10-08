@@ -66,7 +66,7 @@ def _nbytes(*tensors: tuple[tuple[int, ...], int]) -> int:
 
 
 @pytest.mark.parametrize(("num_tokens", "h", "m"), [(1, 4096, 4), (128, 4096, 4), (16, 2048, 2)])
-def test_bandwidth_counts_each_external_tensor_once(num_tokens: int, h: int, m: int) -> None:
+def test_bandwidth_counts_the_traffic_of_each_call(num_tokens: int, h: int, m: int) -> None:
     t = num_tokens
     shape = Shape(t, h, m)
     residual = ((t, m, h), 2)
@@ -76,9 +76,11 @@ def test_bandwidth_counts_each_external_tensor_once(num_tokens: int, h: int, m: 
     head_weights = (((m, m * h), 4), ((1,), 4), ((m,), 4), ((h,), 2))
 
     assert pre._logical_bytes(shape) == _nbytes(residual, *pre_weights, *mixes, hidden)
-    assert fused._logical_bytes(shape) == _nbytes(
-        hidden, residual, *mixes, *pre_weights, residual, *mixes, hidden
-    )
+    one_pass = _nbytes(hidden, residual, *mixes, *pre_weights, residual, *mixes, hidden)
+    # Above 16 tokens the fused call is three launches; the prenorm GEMM and the
+    # pre big-fuse each read the updated streams again.
+    re_reads = 0 if t <= fused.SMALL_FMA_MAX_TOKENS else _nbytes(residual, residual)
+    assert fused.call_bytes(shape) == one_pass + re_reads
     assert head._logical_bytes(shape) == _nbytes(
         hidden, residual, *mixes, *head_weights, residual, hidden
     )
