@@ -30,7 +30,10 @@ DOC = KernelDoc(
         "The deepgemm_mega backend does the same per-token work in one persistent "
         "DeepGEMM launch, but collapses the streams with the pre mix carried from "
         'the previous block ("shifted") and returns this call\'s pre mix for the '
-        "next block."
+        "next block. The deepgemm_mega_nonshifted backend is the same DeepGEMM "
+        "launch without the shift: it collapses the streams with this call's own "
+        "pre mix, as vllm_tilelang does, so it has to read the updated streams "
+        "back once the mixes are known."
     ),
     category="Normalization",
     subcategory="Hyper-connections",
@@ -50,6 +53,10 @@ DOC = KernelDoc(
         "deepgemm_mega picks its K-split count from num_tokens (40, 27, 20, then "
         "16 splits), and the time steps at each switch and at each extra wave of "
         "the 16-split launch. Its rows report no GB/s.",
+        "deepgemm_mega_nonshifted also picks its K-split count from num_tokens "
+        "and steps at each switch and wave. Its GB/s counts one pass over the "
+        "call's tensors plus the second read of the updated streams; the K-split "
+        "partials are left out. No vLLM model dispatches it yet.",
         "The previous post and comb weights come from the pre step on the same random streams.",
         "TFLOPS is not computed. vllm_tilelang GB/s counts the HBM traffic of the "
         "launches the call issues: the layer output, streams, previous mixes and "
@@ -108,6 +115,36 @@ register(
                 "One DeepGEMM mega_mhc launch (shifted post, TF32 pre GEMM, "
                 "Sinkhorn mixes, collapse and RMSNorm), as vLLM's "
                 "mhc_shifted_post_pre_deep_gemm calls it."
+            ),
+            url="https://github.com/deepseek-ai/DeepGEMM",
+        ),
+    )
+)
+
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="deepgemm_mega_nonshifted",
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.mhc.mhc_fused_post_pre_rms_norm_deepgemm_mega_nonshifted",
+            function_name="profile_mhc_fused_post_pre_rms_norm_deepgemm_mega_nonshifted",
+        ),
+        table_name=KIND,
+        args_schema=MhcRmsNormArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        # The same sm100_mega_mhc_impl as deepgemm_mega ("This kernel only
+        # supports sm_100f"); vLLM gates it on is_device_capability_family(100).
+        supports=BackendSupport(
+            compute=frozenset({DType.BF16}),
+            sm_targets=frozenset({"sm_100f"}),
+        ),
+        subprocess_env="vllm_upstream_fork_env",
+        doc=BackendDoc(
+            summary=(
+                "One DeepGEMM mega_mhc launch without the shifted collapse (post, "
+                "TF32 pre GEMM, Sinkhorn mixes, collapse with this call's pre mix "
+                "and RMSNorm), the same math as vllm_tilelang."
             ),
             url="https://github.com/deepseek-ai/DeepGEMM",
         ),
