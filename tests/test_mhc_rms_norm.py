@@ -61,6 +61,28 @@ def test_deepgemm_mega_rejects_shapes_outside_the_v41_dispatch(
         validate_mega_args(*arguments)
 
 
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        (48, 4608, 4, "bf16"),
+        (48, 4096, 2, "bf16"),
+        (48, 4096, 4, "fp16"),
+        ((1 << 20) + 1, 4096, 4, "bf16"),
+    ],
+)
+def test_deepgemm_mega_nonshifted_rejects_shapes_mega_mhc_does_not_take(
+    arguments: tuple[object, ...],
+) -> None:
+    # Catches the non-shifted Mega mHC backend profiling a hidden size that is
+    # not a multiple of 1024, another hc_mult, or a batch past mega_mhc's cap.
+    from profiling.runners.mhc.mhc_fused_post_pre_rms_norm_deepgemm_mega_nonshifted import (
+        validate_args as validate_nonshifted_args,
+    )
+
+    with pytest.raises(ProfilerNotImplemented):
+        validate_nonshifted_args(*arguments)
+
+
 def _nbytes(*tensors: tuple[tuple[int, ...], int]) -> int:
     return sum(math.prod(shape) * itemsize for shape, itemsize in tensors)
 
@@ -84,3 +106,20 @@ def test_bandwidth_counts_the_traffic_of_each_call(num_tokens: int, h: int, m: i
     assert head._logical_bytes(shape) == _nbytes(
         hidden, residual, *mixes, *head_weights, residual, hidden
     )
+
+
+@pytest.mark.parametrize("num_tokens", [1, 16, 2048])
+def test_nonshifted_mega_counts_one_pass_and_the_stream_re_read(num_tokens: int) -> None:
+    # Catches the one-launch backend reporting the TileLang three-launch traffic
+    # (or one pass only): its Normal workers read the updated streams once more.
+    from profiling.runners.mhc import (
+        mhc_fused_post_pre_rms_norm_deepgemm_mega_nonshifted as mega,
+    )
+
+    t, h, m = num_tokens, 4096, 4
+    residual = ((t, m, h), 2)
+    hidden = ((t, h), 2)
+    mixes = (((t, m, 1), 4), ((t, m, m), 4))
+    pre_weights = (((m * (m + 2), m * h), 4), ((3,), 4), ((m * (m + 2),), 4), ((h,), 2))
+    one_pass = _nbytes(hidden, residual, *mixes, *pre_weights, residual, *mixes, hidden)
+    assert mega.call_bytes(Shape(t, h, m)) == one_pass + _nbytes(residual)

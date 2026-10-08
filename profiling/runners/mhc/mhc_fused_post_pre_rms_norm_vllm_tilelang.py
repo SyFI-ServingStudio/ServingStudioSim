@@ -17,9 +17,7 @@ from profiling.runners.mhc._common import (
     Shape,
     assert_outputs_close,
     bandwidth_gbps,
-    hidden_bytes,
-    mix_bytes,
-    pre_weight_bytes,
+    post_pre_one_pass_bytes,
     prepare_common,
     reference_pre,
     residual_bytes,
@@ -73,12 +71,7 @@ def call_bytes(shape: Shape) -> int:
     read the updated streams again. The GEMM's split-K partials (about 100 B
     per token per split) are left out.
     """
-    one_pass = (
-        2 * residual_bytes(shape)
-        + 2 * mix_bytes(shape)
-        + 2 * hidden_bytes(shape)
-        + pre_weight_bytes(shape)
-    )
+    one_pass = post_pre_one_pass_bytes(shape)
     if shape.num_tokens <= SMALL_FMA_MAX_TOKENS:
         return one_pass
     return one_pass + 2 * residual_bytes(shape)
