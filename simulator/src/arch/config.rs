@@ -121,7 +121,10 @@ const fn default_glm53_flash_enable_expert_parallel() -> bool {
 /// `kda_chunk_prefill` backends a GLM-5.3-Flash arch can run its KDA prefill
 /// on: the fork's Triton `chunk_kda_with_fused_gate`, or FlashKDA, which
 /// upstream vLLM picks by default on SM90 / SM10x (`kda_prefill_backend: auto`).
-pub(crate) const GLM53_FLASH_KDA_PREFILL_BACKENDS: [&str; 2] = ["vllm_triton", "flashkda"];
+/// `vllm_triton` is the fork's FLA chain, `flashkda` upstream vLLM's SM10x
+/// default; `flashinfer_cute_persistent` needs a vLLM patch to dispatch.
+pub(crate) const GLM53_FLASH_KDA_PREFILL_BACKENDS: [&str; 3] =
+    ["vllm_triton", "flashkda", "flashinfer_cute_persistent"];
 
 fn default_glm53_flash_kda_prefill_backend() -> String {
     "vllm_triton".to_string()

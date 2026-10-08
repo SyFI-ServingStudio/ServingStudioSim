@@ -484,10 +484,13 @@ pub struct Glm53FlashKernelPath {
 }
 
 impl Glm53FlashKernelPath {
-    /// FlashKDA applies the beta sigmoid inside its call; FLA's chain takes
-    /// beta already passed through one.
+    /// FlashKDA and FlashInfer's persistent kernel apply the beta sigmoid
+    /// inside their call; FLA's chain takes beta already passed through one.
     pub fn kda_prefill_takes_beta_logits(&self) -> bool {
-        self.kda_prefill_backend == "flashkda"
+        matches!(
+            self.kda_prefill_backend,
+            "flashkda" | "flashinfer_cute_persistent"
+        )
     }
 }
 
