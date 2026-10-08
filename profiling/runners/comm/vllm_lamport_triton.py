@@ -39,11 +39,16 @@ under PDL, not to the previous call's gather. Every call owns its own
 "layer" (input, residual, conv-state cache, conv/norm weights and GEMM weight,
 one per decoder layer up to 42, as production's per-layer conv caches), so
 everything not written by the immediate predecessor is cold in L2 when the call
-starts. With ``has_shared`` the sink partial is produced on a side stream and
-joined by an event before the call, as vLLM's aux-stream sinks are on a decode
-step; the two-parent join leaves the first launch no PDL edge. The row is the
-marginal cost: replay time of [predecessors, call] x N minus that of
-[predecessors] x N, per call, on the slowest rank.
+starts, except the residual: each call without a sink partial takes the
+previous call's residual output, as an attention call takes the residual the
+previous layer's MoE call just wrote. A ``has_shared`` (MoE) call keeps its
+own cold residual, since the routed experts stream far more than L2 between
+it and the attention call that wrote it. With ``has_shared`` the sink partial
+is produced on a side stream and joined by an event before the call, as vLLM's
+aux-stream sinks are on a decode step; the two-parent join leaves the first
+launch no PDL edge. The row is the marginal cost: replay time of
+[predecessors, call] x N minus that of [predecessors] x N, per call, on the
+slowest rank.
 """
 
 from __future__ import annotations
@@ -292,6 +297,7 @@ def _profile_one(
             state=state,
             cases=cases,
             side_stream_shared=has_shared,
+            chain_residual=not has_shared,
             warmup=warmup,
         )
     else:
@@ -603,7 +609,16 @@ def served_slot_cases(
 
 
 def time_served(
-    *, torch, dist, tp_group, state, cases, side_stream_shared, warmup, min_calls=30
+    *,
+    torch,
+    dist,
+    tp_group,
+    state,
+    cases,
+    side_stream_shared,
+    warmup,
+    chain_residual=False,
+    min_calls=30,
 ) -> float:
     """Marginal per-call ms of the Lamport call after its served predecessors.
 
@@ -611,8 +626,10 @@ def time_served(
     partial, the sink GEMM (forked onto a side stream and joined when
     ``side_stream_shared``, else serial on the main stream); graph B adds the
     Lamport call after each. ``len(cases)`` must be a multiple of 3 (buffer
-    generations). Trials alternate A and B; each rank keeps its median, and the
-    slowest rank's B minus the slowest rank's A is the marginal cost.
+    generations). With ``chain_residual`` each call takes the previous call's
+    residual output, as consecutive sublayers do in serving. Trials alternate A
+    and B; each rank keeps its median, and the slowest rank's B minus the
+    slowest rank's A is the marginal cost.
     """
     if len(cases) % 3:
         raise ValueError("served slots must be a multiple of the 3 Lamport generations")
@@ -634,10 +651,10 @@ def time_served(
             torch.matmul(case["sink_a"], case["sink_w"], out=case["shared"])
             torch.matmul(case["pred_a"], case["pred_w"], out=case["input"])
 
-    def call(case):
-        state.rs_sconv_ag_add_norm(
+    def call(case, residual=None):
+        _, residual_out = state.rs_sconv_ag_add_norm(
             case["input"],
-            case["residual"],
+            case["residual"] if residual is None else residual,
             case["conv_weight"],
             case["norm_weight"],
             INKLING_RMS_NORM_EPS,
@@ -651,11 +668,16 @@ def time_served(
             case["block_size"],
             shared_tensor=case["shared"],
         )
+        return residual_out if chain_residual else None
 
-    for _ in range(max(1, warmup // len(cases))):
+    def calls_in_order():
+        residual = None
         for case in cases:
             predecessors(case)
-            call(case)
+            residual = call(case, residual)
+
+    for _ in range(max(1, warmup // len(cases))):
+        calls_in_order()
     torch.cuda.synchronize()
 
     graph_a = torch.cuda.CUDAGraph()
@@ -666,9 +688,7 @@ def time_served(
     graph_b = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph_b):
         for _ in range(rounds):
-            for case in cases:
-                predecessors(case)
-                call(case)
+            calls_in_order()
     torch.cuda.synchronize()
     calls = rounds * len(cases)
 
