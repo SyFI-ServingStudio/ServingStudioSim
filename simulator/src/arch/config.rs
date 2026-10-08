@@ -134,6 +134,18 @@ const fn default_glm53_flash_mla_layout_copies() -> bool {
     true
 }
 
+/// `mhc_fused_post_pre_rms_norm` backends a GLM-5.3-Flash arch can run its
+/// fused mHC boundaries on: `vllm_tilelang`, vLLM's TileLang call (one launch
+/// up to 16 tokens, three above), or `deepgemm_mega_nonshifted`, DeepGEMM's
+/// one-launch `mega_mhc` without the shifted collapse (SM10x, hidden a
+/// multiple of 1024, four streams), which vLLM does not dispatch yet.
+pub(crate) const GLM53_FLASH_MHC_FUSED_BACKENDS: [&str; 2] =
+    ["vllm_tilelang", "deepgemm_mega_nonshifted"];
+
+fn default_glm53_flash_mhc_fused_backend() -> String {
+    "vllm_tilelang".to_string()
+}
+
 /// A speculative GLM must actually run its MTP layer, so unlike the ordinary
 /// selector it cannot default to `off`.
 const fn default_glm52_speculative_mtp_mode() -> Glm52MtpMode {
@@ -699,6 +711,13 @@ pub enum IterArchSel {
         #[serde(default = "default_glm53_flash_mla_layout_copies")]
         #[param(default = true, cache_key)]
         mla_layout_copies: bool,
+        /// Backend of every fused mHC post/pre boundary
+        /// (`mhc_fused_post_pre_rms_norm`): `vllm_tilelang` or
+        /// `deepgemm_mega_nonshifted`. The first pre and the last post keep
+        /// TileLang.
+        #[serde(default = "default_glm53_flash_mhc_fused_backend")]
+        #[param(string, default = "vllm_tilelang", choices = GLM53_FLASH_MHC_FUSED_BACKENDS, cache_key)]
+        mhc_fused_backend: String,
     },
     /// [`Self::Glm53FlashVllmFp8KdaDsaMoe`]'s kernels under pure pipeline
     /// parallelism. Each of `pp_size` stages is one GPU running a contiguous
@@ -757,6 +776,13 @@ pub enum IterArchSel {
         #[serde(default = "default_glm53_flash_mla_layout_copies")]
         #[param(default = true, cache_key)]
         mla_layout_copies: bool,
+        /// Backend of every fused mHC post/pre boundary
+        /// (`mhc_fused_post_pre_rms_norm`): `vllm_tilelang` or
+        /// `deepgemm_mega_nonshifted`. The first pre and the last post keep
+        /// TileLang.
+        #[serde(default = "default_glm53_flash_mhc_fused_backend")]
+        #[param(string, default = "vllm_tilelang", choices = GLM53_FLASH_MHC_FUSED_BACKENDS, cache_key)]
+        mhc_fused_backend: String,
     },
     /// [`Self::Glm53FlashVllmFp8KdaDsaMoe`]'s kernels under data-parallel
     /// attention and expert-parallel MoE (vLLM `--data-parallel-size ep_size
@@ -812,6 +838,13 @@ pub enum IterArchSel {
         #[serde(default = "default_glm53_flash_mla_layout_copies")]
         #[param(default = true, cache_key)]
         mla_layout_copies: bool,
+        /// Backend of every fused mHC post/pre boundary
+        /// (`mhc_fused_post_pre_rms_norm`): `vllm_tilelang` or
+        /// `deepgemm_mega_nonshifted`. The first pre and the last post keep
+        /// TileLang.
+        #[serde(default = "default_glm53_flash_mhc_fused_backend")]
+        #[param(string, default = "vllm_tilelang", choices = GLM53_FLASH_MHC_FUSED_BACKENDS, cache_key)]
+        mhc_fused_backend: String,
     },
     /// [`Self::Glm53FlashVllmFp8KdaDsaMoe`]'s graph for NVIDIA's ModelOpt NVFP4
     /// checkpoint (`nvidia/GLM-5.3-Flash-NVFP4`): NVFP4 routed experts and
@@ -870,6 +903,13 @@ pub enum IterArchSel {
         #[serde(default = "default_glm53_flash_mla_layout_copies")]
         #[param(default = true, cache_key)]
         mla_layout_copies: bool,
+        /// Backend of every fused mHC post/pre boundary
+        /// (`mhc_fused_post_pre_rms_norm`): `vllm_tilelang` or
+        /// `deepgemm_mega_nonshifted`. The first pre and the last post keep
+        /// TileLang.
+        #[serde(default = "default_glm53_flash_mhc_fused_backend")]
+        #[param(string, default = "vllm_tilelang", choices = GLM53_FLASH_MHC_FUSED_BACKENDS, cache_key)]
+        mhc_fused_backend: String,
     },
     /// [`Self::Glm53FlashVllmFp8PpKdaDsaMoe`] for the NVFP4 checkpoint (see
     /// [`Self::Glm53FlashVllmNvfp4KdaDsaMoe`]). Runs only under deployment `pp`.
@@ -923,6 +963,13 @@ pub enum IterArchSel {
         #[serde(default = "default_glm53_flash_mla_layout_copies")]
         #[param(default = true, cache_key)]
         mla_layout_copies: bool,
+        /// Backend of every fused mHC post/pre boundary
+        /// (`mhc_fused_post_pre_rms_norm`): `vllm_tilelang` or
+        /// `deepgemm_mega_nonshifted`. The first pre and the last post keep
+        /// TileLang.
+        #[serde(default = "default_glm53_flash_mhc_fused_backend")]
+        #[param(string, default = "vllm_tilelang", choices = GLM53_FLASH_MHC_FUSED_BACKENDS, cache_key)]
+        mhc_fused_backend: String,
     },
     /// [`Self::Glm53FlashVllmFp8DpAttnEpMoe`] for the NVFP4 checkpoint (see
     /// [`Self::Glm53FlashVllmNvfp4KdaDsaMoe`]): the routed experts sit behind
@@ -975,6 +1022,13 @@ pub enum IterArchSel {
         #[serde(default = "default_glm53_flash_mla_layout_copies")]
         #[param(default = true, cache_key)]
         mla_layout_copies: bool,
+        /// Backend of every fused mHC post/pre boundary
+        /// (`mhc_fused_post_pre_rms_norm`): `vllm_tilelang` or
+        /// `deepgemm_mega_nonshifted`. The first pre and the last post keep
+        /// TileLang.
+        #[serde(default = "default_glm53_flash_mhc_fused_backend")]
+        #[param(string, default = "vllm_tilelang", choices = GLM53_FLASH_MHC_FUSED_BACKENDS, cache_key)]
+        mhc_fused_backend: String,
     },
     /// SGLang's B200 NVFP4 launch graph under pure tensor parallelism. Every
     /// rank owns all experts (EP1) and shards the routed intermediate axis by
