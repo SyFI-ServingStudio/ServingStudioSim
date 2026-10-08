@@ -13,6 +13,7 @@ mod pipelined_chunked_prefill_admission;
 mod placement;
 mod policy;
 mod prefill_handoff_admission;
+mod prefix_fetch;
 mod token_budget;
 
 pub use decode_completion::{
@@ -29,6 +30,7 @@ pub use policy::{
     PendingOrderPolicy, SessionStartOrder, ShortestJobFirst,
 };
 pub use prefill_handoff_admission::PrefillHandoffAdmission;
+pub(crate) use prefix_fetch::{PrefixFetch, SessionPrefixTiers};
 pub(crate) use token_budget::prefill_fits_budget;
 
 pub trait IterAdmission<K: KvStore> {
@@ -89,6 +91,22 @@ pub trait MicrobatchAdmission<K: KvStore> {
         at: Time,
     );
     fn queued_requests(&self) -> u32;
+
+    /// Return the requests whose DRAM/SSD read has landed by `now` to their
+    /// queue; the latest landing time, if any did. Without tiers, nothing.
+    fn land_prefix_reads(&mut self, _kv_store: &mut K, _now: Time) -> Option<Time> {
+        None
+    }
+    /// When the next tier read lands.
+    fn next_prefix_read(&self) -> Option<Time> {
+        None
+    }
+    /// Requests out of the queue while a tier read runs.
+    fn reading_requests(&self) -> u32 {
+        0
+    }
+    /// Write a finished session context through to `partition`'s tiers.
+    fn store_session_context(&mut self, _partition: u16, _session_id: u32, _tokens: u64) {}
 }
 
 pub trait SlotPipelineAdmission<K: KvStore> {

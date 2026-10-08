@@ -611,11 +611,16 @@ pub struct WorkerConfig {
     /// Pipeline head only: shortest remaining prefill first across started and
     /// queued prompts.
     pub srpt: bool,
-    /// Pipeline head only: the DRAM and SSD tiers behind the HBM prefix
-    /// cache, fastest first (`None`: no such tier).
+    /// Pipeline head and hybrid chunked prefill: the DRAM and SSD tiers behind
+    /// the HBM prefix cache, fastest first (`None`: no such tier).
     pub prefix_tiers: [Option<crate::worker::kv::PrefixTierSpec>; 2],
-    /// Pipeline head only: decode runs elsewhere; requests complete at their
-    /// first token and retain their whole target context.
+    /// With prefix tiers: a session request whose declared prefix exceeds every
+    /// context the run stored for it began before the run, and its context is
+    /// read from the slowest tier.
+    pub prefix_tier_warm_start: bool,
+    /// Pipeline head and hybrid chunked prefill: decode runs elsewhere;
+    /// requests complete at their first token and retain their whole target
+    /// context.
     pub external_decode: bool,
     /// Candidate positions the drafter proposes per request per iteration (from
     /// the worker selector). The verify width is one more than this. Only the
@@ -655,6 +660,7 @@ impl Default for WorkerConfig {
             load_budget: None,
             srpt: false,
             prefix_tiers: [None, None],
+            prefix_tier_warm_start: false,
             external_decode: false,
             speculative_draft_tokens: 0,
             speculative_acceptance_seed: None,

@@ -333,22 +333,30 @@ retained session keeps its context and the state at its end.
 Behind HBM's retained tier a head can keep host DRAM and SSD tiers
 (`dram_tier_gb`, `ssd_tier_gb`, per GPU, with read bandwidths). They are
 write-through LRUs of each session's latest context, plus one state for a hybrid
-model (`kv/shared/prefix_tiers.rs`). When a session request arrives, the head
-looks it up. If a tier holds more than HBM does, floored to HBM's hit quantum,
-the head reads just the difference on that tier's FIFO channel. When the read
-lands, the context goes back into HBM (`restore_prefix`) and the request is
-queued. `prefix_tiers_w<id>.csv` / `.json` record each lookup and the tiers'
-totals. With `external_decode`, a round completes at its first token. The head
+model (`kv/shared/prefix_tiers.rs`). The admission owns them
+(`admission/prefix_fetch.rs`) and looks a session up when its request reaches the
+head of the queue, as vLLM's KV connector does at scheduling. If a tier holds
+more than HBM does, floored to HBM's hit quantum, the request leaves the queue
+while that tier's FIFO channel reads just the difference; when the read lands,
+the context goes back into HBM (`restore_prefix`) and the request returns to the
+front. A lookup at arrival would miss every context HBM evicts while the request
+queues. A shortest-prefill-first order ranks a request by what HBM or a tier
+holds. With `prefix_tier_warm_start`, a session request whose declared prefix
+exceeds every context the run stored for it is a pre-run conversation, read
+from the slowest tier (closed-loop traces that join sessions mid-life).
+`prefix_tiers_w<id>.csv` / `.json` record each admitted session request and the
+tiers' totals. With `external_decode`, a round completes at its first token. The head
 then restores its context with every output but the last (whose KV the next
 round computes) as if a decode instance handed it back. The trace carries the
 decode time in its tool waits (`trace/session_decode_wait.py`). The `pp` flow
 keeps each session on the replica its first round went to.
 
 The hybrid `chunked_prefill` worker (DP attention included) takes the same
-`dram_tier_gb` / `ssd_tier_gb` / `external_decode` knobs. `SessionTierWorker`
-(`workers/iter/session_tier_worker.rs`) wraps the shell with one tier set per
-attention DP rank, and the admission keeps a session on the rank it last ran on
-(`ChunkedPrefillAdmission::with_sticky_sessions`). There `plain` alignment also
+`dram_tier_gb` / `ssd_tier_gb` / `prefix_tier_warm_start` / `external_decode`
+knobs. Its admission reads from one tier set per attention DP rank and keeps a
+session on the rank it last ran on (`ChunkedPrefillAdmission::with_sticky_sessions`);
+`SessionTierWorker` (`workers/iter/session_tier_worker.rs`) wraps the shell to
+write finished contexts through and run `external_decode`. There `plain` alignment also
 means exact prefix reuse.
 
 `PipelineStageWorker` has no KV/admission axes. It runs microbatches FIFO,

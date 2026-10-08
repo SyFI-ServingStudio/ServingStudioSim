@@ -478,6 +478,13 @@ pub enum IterWorkerSel {
         #[serde(default)]
         #[param(default = 0)]
         long_prefill_token_threshold: u32,
+        /// Order of each rank's waiting queue. `fifo` is vLLM's FCFS;
+        /// `shortest-prefill-first` offers the prompt with the fewest tokens to
+        /// compute first, counting what HBM or a prefix tier holds as reused
+        /// (not vLLM). Started prompts keep priority either way.
+        #[serde(default = "default_pipeline_pending_order")]
+        #[param(string, default = "fifo", choices = PENDING_ORDER_CHOICES)]
+        pending_order: PendingOrderKind,
         /// Host DRAM behind each attention DP rank's HBM prefix cache, per GPU
         /// (GB; `0`: none), as `pipeline_chunked_prefill`'s; hybrid archs only.
         /// Sessions then stick to the rank they last ran on. Not vLLM.
@@ -496,6 +503,14 @@ pub enum IterWorkerSel {
         ssd_tier_gb_per_s: f64,
         /// Decode runs elsewhere, as `pipeline_chunked_prefill`'s; hybrid archs
         /// only. Not vLLM.
+        /// With a tier: a session request whose declared prefix exceeds every
+        /// context the run stored for that session is a conversation that began
+        /// before the run, and its context is read from the slowest tier, as a
+        /// long-lived session's would be in steady state. For closed-loop traces
+        /// that start sessions mid-life (`trace/session_closed_loop.py`).
+        #[serde(default)]
+        #[param(default = false)]
+        prefix_tier_warm_start: bool,
         #[serde(default)]
         #[param(default = false)]
         external_decode: bool,
@@ -627,8 +642,9 @@ pub enum IterWorkerSel {
         srpt: bool,
         /// Host DRAM behind the HBM prefix cache, per GPU (GB; `0`: none).
         /// Every finished context is written through to each tier; a session
-        /// whose context is here but not in HBM waits for a read at
-        /// `dram_tier_gb_per_s` per GPU before it queues. Not vLLM.
+        /// whose context is here but not in HBM is read back at
+        /// `dram_tier_gb_per_s` per GPU when admission reaches it, as vLLM's
+        /// KV connector does. Not vLLM.
         #[serde(default)]
         #[param(default = 0.0)]
         dram_tier_gb: f64,
@@ -649,6 +665,14 @@ pub enum IterWorkerSel {
         /// it back. Pair it with a session trace
         /// whose tool waits include the decode time
         /// (`trace/session_decode_wait.py`). Not vLLM.
+        /// With a tier: a session request whose declared prefix exceeds every
+        /// context the run stored for that session is a conversation that began
+        /// before the run, and its context is read from the slowest tier, as a
+        /// long-lived session's would be in steady state. For closed-loop traces
+        /// that start sessions mid-life (`trace/session_closed_loop.py`).
+        #[serde(default)]
+        #[param(default = false)]
+        prefix_tier_warm_start: bool,
         #[serde(default)]
         #[param(default = false)]
         external_decode: bool,
