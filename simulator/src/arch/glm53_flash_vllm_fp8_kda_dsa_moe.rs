@@ -481,6 +481,8 @@ pub struct Glm53FlashKernelPath {
     /// Whether the DSA layers pay the fork's `q_concat` and output
     /// `masked_fill_` copies.
     pub mla_layout_copies: bool,
+    /// `mhc_fused_post_pre_rms_norm` backend of every fused mHC boundary.
+    pub mhc_fused_backend: &'static str,
 }
 
 impl Glm53FlashKernelPath {
@@ -500,6 +502,7 @@ impl Default for Glm53FlashKernelPath {
         Self {
             kda_prefill_backend: "vllm_triton",
             mla_layout_copies: true,
+            mhc_fused_backend: MHC_BACKENDS[0],
         }
     }
 }
@@ -590,7 +593,11 @@ pub struct Glm53FlashVllmConfigs {
     pub routed: Vec<Glm53RoutedMoeLocalWorkletConfig>,
     pub embedding: ElementwiseKernelConfig,
     pub hc_expand: ElementwiseKernelConfig,
+    /// The first pre and the last post (TileLang); `mhc_fused` differs only in
+    /// its backends.
     pub mhc: MhcRmsNormKernelConfig,
+    /// Every fused post/pre boundary, on `kernel_path.mhc_fused_backend`.
+    pub mhc_fused: MhcRmsNormKernelConfig,
     pub all_reduce: AllReduceFusionKernelConfig,
     /// The all-reduce vLLM falls back to above FlashInfer's workspace cap.
     pub large_all_reduce: AllReduceKernelConfig,
@@ -697,6 +704,13 @@ pub fn build_configs(
         expert_demand: demand.clone(),
         folded_rank_position: 0,
     };
+    let mhc = MhcRmsNormKernelConfig {
+        backends: MHC_BACKENDS.to_vec(),
+        gpu_name: gpu.clone(),
+        hidden_size: model.hidden.into(),
+        hc_mult: model.hc_mult,
+        hidden_dtype: ACTIVATION_DTYPE,
+    };
     Ok(Glm53FlashVllmConfigs {
         groups: layer_groups(model),
         kda: Glm53KdaAttnLocalWorkletConfig {
@@ -767,12 +781,10 @@ pub fn build_configs(
         // Row gather: reads and writes one hidden row per token.
         embedding: ew(hidden_bytes, hidden_bytes),
         hc_expand: ew(hidden_bytes, stream_bytes),
-        mhc: MhcRmsNormKernelConfig {
-            backends: MHC_BACKENDS.to_vec(),
-            gpu_name: gpu.clone(),
-            hidden_size: model.hidden.into(),
-            hc_mult: model.hc_mult,
-            hidden_dtype: ACTIVATION_DTYPE,
+        mhc: mhc.clone(),
+        mhc_fused: MhcRmsNormKernelConfig {
+            backends: vec![parallel.kernel_path.mhc_fused_backend],
+            ..mhc
         },
         all_reduce: AllReduceFusionKernelConfig {
             backends: all_reduce_backends.to_vec(),
@@ -1132,7 +1144,7 @@ pub(crate) fn build_layer_group(
         Boundary::Fused(atomic(
             p,
             "attn_mhc_post_pre",
-            cfg.mhc.clone(),
+            cfg.mhc_fused.clone(),
             MhcFusedPostPreRmsNormKernel::build,
             bridge,
         )?)
@@ -1213,7 +1225,7 @@ pub(crate) fn build_layer_group(
         ffn_boundary: atomic(
             p,
             "ffn_mhc_post_pre",
-            cfg.mhc.clone(),
+            cfg.mhc_fused.clone(),
             MhcFusedPostPreRmsNormKernel::build,
             bridge,
         )?,
@@ -1725,6 +1737,39 @@ mod tests {
         bridge.enable_enumerate();
         let configs = build_configs(model, &parallel, &demand()).unwrap();
         build("unified".into(), resolve_configs(&configs), &bridge).unwrap()
+    }
+
+    /// Catches `mhc_fused_backend` not reaching the fused boundaries, or
+    /// leaking into the first pre and the terminal post, whose TileLang
+    /// decomposition has no other backend's rows.
+    #[test]
+    fn mhc_fused_backend_selects_only_the_fused_boundaries() {
+        let mut parallel = parallel();
+        parallel.kernel_path.mhc_fused_backend = "deepgemm_mega_nonshifted";
+        let bridge = PerfApiBridge::new_uninit_for_test();
+        bridge.enable_enumerate();
+        let configs = build_configs(&model_cfg(), &parallel, &demand()).unwrap();
+        build("unified".into(), resolve_configs(&configs), &bridge).unwrap();
+        let mhc: Vec<_> = bridge
+            .take_enum_report()
+            .into_iter()
+            .filter(|leaf| leaf.kind.starts_with("mhc_"))
+            .collect();
+        let fused_boundaries = mhc
+            .iter()
+            .filter(|leaf| leaf.name.ends_with("_mhc_post_pre"))
+            .inspect(|leaf| {
+                assert_eq!(leaf.kind, "mhc_fused_post_pre_rms_norm");
+                assert_eq!(leaf.backends, ["deepgemm_mega_nonshifted"], "{}", leaf.name);
+            })
+            .count();
+        assert!(fused_boundaries > 0);
+        for leaf in mhc
+            .iter()
+            .filter(|leaf| !leaf.name.ends_with("_mhc_post_pre"))
+        {
+            assert_eq!(leaf.backends, ["vllm_tilelang"], "{}", leaf.name);
+        }
     }
 
     #[test]

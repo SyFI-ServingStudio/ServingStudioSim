@@ -609,7 +609,7 @@ fn build_group(
         Boundary::Fused(atomic(
             p,
             "attn_mhc_post_pre",
-            local.mhc.clone(),
+            local.mhc_fused.clone(),
             MhcFusedPostPreRmsNormKernel::build,
             bridge,
         )?)
@@ -722,7 +722,7 @@ fn build_group(
         ffn_boundary: atomic(
             p,
             "ffn_mhc_post_pre",
-            local.mhc.clone(),
+            local.mhc_fused.clone(),
             MhcFusedPostPreRmsNormKernel::build,
             bridge,
         )?,

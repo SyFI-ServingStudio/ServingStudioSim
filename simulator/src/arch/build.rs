@@ -18,6 +18,7 @@ use serde::Deserialize;
 
 use crate::arch::config::{
     AttnArchSel, FfnArchSel, IterArchSel, ModelSpec, RoutingKind, GLM53_FLASH_KDA_PREFILL_BACKENDS,
+    GLM53_FLASH_MHC_FUSED_BACKENDS,
 };
 use crate::arch::contract::SpeculativeUnifiedModel;
 use crate::arch::model_cfg::ModelCfg;
@@ -1816,37 +1817,43 @@ pub fn qwen3_fp8_ffn_moe(
 
 /// The vLLM code path a GLM-5.3-Flash arch tag's kernels follow.
 pub fn glm53_flash_kernel_path(sel: &IterArchSel) -> Result<Glm53FlashKernelPath> {
-    let (backend, mla_layout_copies) = match sel {
+    let (backend, mla_layout_copies, mhc_backend) = match sel {
         IterArchSel::Glm53FlashVllmFp8KdaDsaMoe {
             kda_prefill_backend,
             mla_layout_copies,
+            mhc_fused_backend,
             ..
         }
         | IterArchSel::Glm53FlashVllmFp8PpKdaDsaMoe {
             kda_prefill_backend,
             mla_layout_copies,
+            mhc_fused_backend,
             ..
         }
         | IterArchSel::Glm53FlashVllmFp8DpAttnEpMoe {
             kda_prefill_backend,
             mla_layout_copies,
+            mhc_fused_backend,
             ..
         }
         | IterArchSel::Glm53FlashVllmNvfp4KdaDsaMoe {
             kda_prefill_backend,
             mla_layout_copies,
+            mhc_fused_backend,
             ..
         }
         | IterArchSel::Glm53FlashVllmNvfp4PpKdaDsaMoe {
             kda_prefill_backend,
             mla_layout_copies,
+            mhc_fused_backend,
             ..
         }
         | IterArchSel::Glm53FlashVllmNvfp4DpAttnEpMoe {
             kda_prefill_backend,
             mla_layout_copies,
+            mhc_fused_backend,
             ..
-        } => (kda_prefill_backend, *mla_layout_copies),
+        } => (kda_prefill_backend, *mla_layout_copies, mhc_fused_backend),
         other => unreachable!("{other:?} is not a GLM-5.3-Flash arch tag"),
     };
     let Some(&kda_prefill_backend) = GLM53_FLASH_KDA_PREFILL_BACKENDS
@@ -1855,9 +1862,16 @@ pub fn glm53_flash_kernel_path(sel: &IterArchSel) -> Result<Glm53FlashKernelPath
     else {
         bail!("kda_prefill_backend {backend:?} is not one of {GLM53_FLASH_KDA_PREFILL_BACKENDS:?}");
     };
+    let Some(&mhc_fused_backend) = GLM53_FLASH_MHC_FUSED_BACKENDS
+        .iter()
+        .find(|&&known| known == mhc_backend.as_str())
+    else {
+        bail!("mhc_fused_backend {mhc_backend:?} is not one of {GLM53_FLASH_MHC_FUSED_BACKENDS:?}");
+    };
     Ok(Glm53FlashKernelPath {
         kda_prefill_backend,
         mla_layout_copies,
+        mhc_fused_backend,
     })
 }
 
