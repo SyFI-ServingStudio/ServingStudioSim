@@ -35,8 +35,9 @@ DOC = KernelDoc(
         "torch.mm and out_dtype=float32, and the DSA indexer's head weights "
         "from fp32 inputs with a plain torch.mm; both are measured by "
         "torch_cublas. SGLang's MoE router computes router logits in fp32, "
-        "measured by sglang_router_auto. m is the tokens; n and k are the "
-        "output and input features."
+        "measured by sglang_router_auto, and the Inkling MoE router in the "
+        "alignment vLLM fork by vllm_inkling_router_auto. m is the tokens; n "
+        "and k are the output and input features."
     ),
     category="GEMM",
     formula=(
@@ -47,8 +48,8 @@ DOC = KernelDoc(
     default_metric="tflops",
     method=(
         f"{CUPTI_METHOD} torch_cublas counts every launch of the call, one kernel "
-        "or a split-K pair. sglang_router_auto counts overlapping launches once, by "
-        "the time the GPU is busy."
+        "or a split-K pair. sglang_router_auto and vllm_inkling_router_auto count "
+        "overlapping launches once, by the time the GPU is busy."
     ),
     caveats=(
         "The fp32 form runs at float32 matmul precision highest; the cast of "
@@ -56,6 +57,9 @@ DOC = KernelDoc(
         "Outside its dedicated shapes, sglang_router_auto calls linear_bf16_fp32, "
         "whose kernel (cuBLAS, HPC-Ops or DeepGEMM) is chosen by "
         "SGLANG_OPT_BF16_FP32_GEMM_ALGO in the profiling environment.",
+        "vllm_inkling_router_auto switches kernels at m = 64 (cute-DSL ll_bf16 at "
+        "or below, cuBLAS above) and at m = 4 (dot-product below, split-K above), "
+        "so its time is not smooth across those points.",
     ),
     # The measured library calls have no separate PyTorch reference module.
     reference=None,
@@ -114,6 +118,37 @@ register(
             ),
             # SGLang main replaced dsv3_router_gemm (#34693); pin the last upstream revision.
             url="https://github.com/sgl-project/sglang/blob/ee462b5899c02db4e9d250f43c4c54d81253c4c6/python/sglang/kernels/ops/gemm/dsv3_router_gemm.py",
+        ),
+    )
+)
+
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="vllm_inkling_router_auto",
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.gemm.gemm_fp32_output_vllm_inkling_router",
+            function_name="profile_gemm_fp32_output_vllm_inkling_router",
+        ),
+        table_name=KIND,
+        args_schema=GemmFp32OutputArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        # No capability rule: the call itself falls back to torch.mm below SM90
+        # (moe.py _linear_with_fp32_out checks has_device_capability(90)).
+        supports=BackendSupport(
+            compute=frozenset({DType.BF16}),
+        ),
+        # Inkling exists only in the upstream-rebased alignment fork.
+        subprocess_env="vllm_upstream_fork_env",
+        doc=BackendDoc(
+            summary=(
+                "The alignment fork's Inkling router dispatch _linear_with_fp32_out: "
+                "cute-DSL ll_bf16_gemm when m ≤ 64 on SM90+ (dot-product kernel at "
+                "m ≤ 4 or k < 2048, else split-K), otherwise torch.mm with "
+                "out_dtype=float32."
+            ),
+            url=None,
         ),
     )
 )
