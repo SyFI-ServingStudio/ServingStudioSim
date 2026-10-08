@@ -7,7 +7,7 @@
       "tp_size": 4,
       "max_model_len": 8192,
       "routing": "corpus",
-      "token_corpus_file": "hf://UW-SyFI/servingstudio-corpora@869a5d3966097154a654db4586c11cab92db046e/glm53_flash_fp8_tp4_ep4/manifest.json"
+      "token_corpus_file": "hf://datasets/UW-SyFI/servingstudio-workload@c3f5ecaab0bbff757c64864bf2ec24f5e1f76b5c/glm53_flash_fp8/vllm/balanced_c32/capture/20260924/manifest.json"
     }
   },
   "gpu": "MI300X",
