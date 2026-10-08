@@ -52,7 +52,10 @@ from profiling.runners.metrics import ComputeMetrics
 KIND = "inkling_qkvr_prep"
 _BACKEND = f"{KIND}:vllm_triton"
 _MAX_TOKENS = 65_536
-# max_model_len of the measured deployment; positions stay below it.
+# Bound for the random request contexts. Positions only index the conv-state
+# and attention caches (tau arrives precomputed, and conv block lookups clamp
+# to the table width), so the work does not depend on how long a context is;
+# rows stay valid for any max_model_len, including 131072.
 _MAX_POSITION = 8192
 _EPS = 1e-6
 # Per-head packed width of the conv-state cache: K | V | attn-out | mlp-out,
