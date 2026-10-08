@@ -1582,6 +1582,7 @@ def test_documented_profile_env_registry_complete():
         "sglang_env",
         "vllm_env",
         "vllm_upstream_fork_env",
+        "flashkda_env",
     }
     assert set(ENV_REGISTRY) == expected_envs
     assert (
