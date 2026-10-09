@@ -155,8 +155,35 @@ async def prebuild_caches(
     binary = binary_path(build_type)
     env = _build_subprocess_env()
 
-    async with _LAUNCHER_LEASES.profile_database(write=True):
+    # Probe under a shared lease first: a warm cache needs no exclusive lock, so
+    # a launcher never waits behind another launcher's running simulations.
+    pending = []
+    async with _LAUNCHER_LEASES.profile_database(write=False):
         for config in _unique_by_cache_key(param_sets, registry):
+            cfg_dir = _prebuild_log_dir(base_dir, config)
+            config_path = cfg_dir / "run_config.yaml"
+            build_cli_command(config, binary, config_path, subcommand="build-cache-only")
+            report = cfg_dir / "dry_run_report.json"
+            probe_argv = [str(binary), "dry-run", str(config_path), "--report-json", str(report)]
+            journal = RunJournal(cfg_dir)
+            missing = await _probe_missing(
+                probe_argv, report, cfg_dir, env, journal, "cache_probe_shared"
+            )
+            if missing is None:
+                return False
+            if missing == 0:
+                journal.update(
+                    "ensure_cache",
+                    StageState.SUCCEEDED,
+                    resources=["profile-db:shared"],
+                )
+            else:
+                pending.append(config)
+    if not pending:
+        return True
+
+    async with _LAUNCHER_LEASES.profile_database(write=True):
+        for config in pending:
             cfg_dir = _prebuild_log_dir(base_dir, config)
             config_path = cfg_dir / "run_config.yaml"
             build_argv = build_cli_command(
