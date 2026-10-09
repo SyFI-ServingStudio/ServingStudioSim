@@ -1576,16 +1576,25 @@ def test_run_profile_batch_rejects_invalid_gpu_count():
 
 def test_documented_profile_env_registry_complete():
     expected_envs = {
+        "causal_conv1d_env",
         "default_env",
         "flashinfer_pip_env",
         "flashinfer_local",
+        "flashinfer_kda_env",
         "sglang_env",
         "vllm_env",
         "vllm_upstream_fork_env",
+        "flashkda_env",
     }
     assert set(ENV_REGISTRY) == expected_envs
     assert (
         ENV_REGISTRY["flashinfer_pip_env"].python_executable
+        == ENV_REGISTRY["default_env"].python_executable
+    )
+    # The causal-conv1d wheel is ABI-matched to the project Torch, so its env
+    # must run the project interpreter, not a venv with another Torch.
+    assert (
+        ENV_REGISTRY["causal_conv1d_env"].python_executable
         == ENV_REGISTRY["default_env"].python_executable
     )
     vllm_env = ENV_REGISTRY["vllm_env"]

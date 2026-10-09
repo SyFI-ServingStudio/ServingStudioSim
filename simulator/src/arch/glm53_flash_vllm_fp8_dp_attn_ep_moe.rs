@@ -96,6 +96,7 @@ pub struct Glm53FlashDpAttnEpParallel {
     pub gpu_name: String,
     /// vLLM `--cudagraph-capture-sizes`; empty runs eager (no padding).
     pub cudagraph_capture_sizes: Vec<u32>,
+    pub kernel_path: tp_arch::Glm53FlashKernelPath,
 }
 
 #[derive(Clone, Debug)]
@@ -143,6 +144,7 @@ pub fn build_configs(
             max_model_len: parallel.max_model_len,
             gpu_name: parallel.gpu_name.clone(),
             cudagraph_capture_sizes: parallel.cudagraph_capture_sizes.clone(),
+            kernel_path: parallel.kernel_path.clone(),
         },
         demand,
     )?;
@@ -607,7 +609,7 @@ fn build_group(
         Boundary::Fused(atomic(
             p,
             "attn_mhc_post_pre",
-            local.mhc.clone(),
+            local.mhc_fused.clone(),
             MhcFusedPostPreRmsNormKernel::build,
             bridge,
         )?)
@@ -720,7 +722,7 @@ fn build_group(
         ffn_boundary: atomic(
             p,
             "ffn_mhc_post_pre",
-            local.mhc.clone(),
+            local.mhc_fused.clone(),
             MhcFusedPostPreRmsNormKernel::build,
             bridge,
         )?,
@@ -1090,6 +1092,7 @@ mod tests {
             max_model_len: 131072,
             gpu_name: "NVIDIA B200".into(),
             cudagraph_capture_sizes: Vec::new(),
+            kernel_path: Default::default(),
         }
     }
 
@@ -1169,14 +1172,14 @@ mod tests {
     fn compiled_tree_has_a_fixed_slot_count() {
         for dp in [4_usize, 8] {
             let model = built(dp as u16);
-            // Per rank: boundaries 2 + attention (KDA 13 / DSA 31) + FFN-local
+            // Per rank: boundaries 2 + attention (KDA 12 / DSA 31) + FFN-local
             // (dense 5; MoE router 2 + glue 1 + serial shared 5 + quant 1).
             // MoE group-wide: dispatch + dp fused + combine + dp x 5 concurrent
             // shared + dp combine glue. Prologue 2/rank, epilogue 4/rank.
             let moe_global = 1 + dp + 1 + 5 * dp + dp;
-            let kda_dense = dp * (2 + 13 + 5);
+            let kda_dense = dp * (2 + 12 + 5);
             let dsa_moe = dp * (2 + 31 + 9) + moe_global;
-            let kda_moe = dp * (2 + 13 + 9) + moe_global;
+            let kda_moe = dp * (2 + 12 + 9) + moe_global;
             assert_eq!(
                 model.n_slots,
                 2 * dp + 2 * kda_dense + dsa_moe + kda_moe + 4 * dp
@@ -1226,11 +1229,11 @@ mod tests {
 
     #[test]
     fn necessary_work_maps_cover_the_compiled_locations() {
-        // The TP map's 128 less 8 per-rank input quants, plus per MoE kind
+        // The TP map's 125 less 8 per-rank input quants, plus per MoE kind
         // the dispatch quant and ranks 4..dp (the gather and scatter are
         // communication, which no map lists).
         assert_maps_cover(&model_cfg(), ARCH_KIND, |dp| {
-            128 - 8 + 2 * (1 + usize::from(dp) - 4)
+            125 - 8 + 2 * (1 + usize::from(dp) - 4)
         });
     }
 
@@ -1240,7 +1243,7 @@ mod tests {
         assert_maps_cover(
             &config("glm53_flash_nvfp4"),
             "glm53_flash_vllm_nvfp4_dp_attn_ep_moe",
-            |dp| 128 - 8 + 2 * (1 + usize::from(dp) - 4) - 2,
+            |dp| 125 - 8 + 2 * (1 + usize::from(dp) - 4) - 2,
         );
     }
 

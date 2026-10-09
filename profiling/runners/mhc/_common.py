@@ -131,6 +131,20 @@ def head_weight_bytes(shape: Shape) -> int:
     return _FP32_BYTES * (head_fn + 1 + shape.hc_mult) + _BF16_BYTES * shape.hidden_size
 
 
+def post_pre_one_pass_bytes(shape: Shape) -> int:
+    """The fused post/pre call's traffic if it touched each tensor once.
+
+    Reads the layer output, the streams, the previous mixes and the weights,
+    and writes the updated streams, the next mixes and the next block input.
+    """
+    return (
+        2 * residual_bytes(shape)
+        + 2 * mix_bytes(shape)
+        + 2 * hidden_bytes(shape)
+        + pre_weight_bytes(shape)
+    )
+
+
 def bandwidth_gbps(logical_bytes: int, time_ms: float) -> float:
     return logical_bytes / (time_ms / 1000.0) / 1e9
 
@@ -154,6 +168,7 @@ __all__ = [
     "head_weight_bytes",
     "hidden_bytes",
     "mix_bytes",
+    "post_pre_one_pass_bytes",
     "pre_weight_bytes",
     "prepare_common",
     "mix_width",

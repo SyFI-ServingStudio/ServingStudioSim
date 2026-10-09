@@ -33,6 +33,13 @@ pub struct DsaTopkPrefillKernelInput {
     pub num_keys: u32,
 }
 
+/// Whether `backend` takes per-row key starts, which a launch packing several
+/// requests needs. DeepSelect's `begin` is unsupported, so it runs only
+/// launches whose every row starts at key 0.
+pub fn takes_row_starts(backend: &str) -> bool {
+    backend != "deep_select"
+}
+
 pub struct DsaTopkPrefillSpec;
 
 impl KernelSpec for DsaTopkPrefillSpec {

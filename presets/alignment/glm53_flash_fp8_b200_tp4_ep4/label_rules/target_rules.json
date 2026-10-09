@@ -289,12 +289,12 @@
    "phase": "forward"
   },
   {
-   "operation": "kda.prefill_qkv_copy",
+   "operation": "kda.chunk_prefill",
    "name": "at::native::elementwise_kernel",
    "type": "model",
-   "role": "KDA prefill q/k/v contiguous copies around the qk l2norm",
+   "role": "KDA chunk prefill: the chunk_kda_with_fused_gate call, its q/k/v contiguous copies and scratch fills included (the L1 kind times them)",
    "slot_suffixes": [
-    "kda.prefill_qkv_copy"
+    "kda.chunk_prefill"
    ],
    "source_experiment": "logs/20260924_0_glm53_flash_b200_tp4_ep4_nsys",
    "before": "kda.chunk_prefill",
@@ -361,7 +361,7 @@
    "operation": "kda.prefill_glue",
    "name": "triton_poi_fused__to_copy_sigmoid_0",
    "type": "model",
-   "role": "KDA prefill small launches: beta sigmoid, index scans, gate views",
+   "role": "KDA prefill small launches: beta sigmoid and FLA's once-per-step chunk-index setup",
    "slot_suffixes": [
     "kda.prefill_glue"
    ],
@@ -369,24 +369,24 @@
    "phase": "forward"
   },
   {
-   "operation": "kda.prefill_qkv_copy",
+   "operation": "kda.chunk_prefill",
    "name": "at::native::elementwise_kernel",
    "type": "model",
-   "role": "KDA prefill q/k/v contiguous copies around the qk l2norm",
+   "role": "KDA chunk prefill: the chunk_kda_with_fused_gate call, its q/k/v contiguous copies and scratch fills included (the L1 kind times them)",
    "slot_suffixes": [
-    "kda.prefill_qkv_copy"
+    "kda.chunk_prefill"
    ],
    "source_experiment": "logs/20260924_0_glm53_flash_b200_tp4_ep4_nsys",
    "after": "kda.prefill_glue",
    "phase": "forward"
   },
   {
-   "operation": "kda.prefill_qkv_copy",
+   "operation": "kda.chunk_prefill",
    "name": "at::native::elementwise_kernel",
    "type": "model",
-   "role": "KDA prefill q/k/v contiguous copies around the qk l2norm",
+   "role": "KDA chunk prefill: the chunk_kda_with_fused_gate call, its q/k/v contiguous copies and scratch fills included (the L1 kind times them)",
    "slot_suffixes": [
-    "kda.prefill_qkv_copy"
+    "kda.chunk_prefill"
    ],
    "source_experiment": "logs/20260924_0_glm53_flash_b200_tp4_ep4_nsys",
    "after": "kda.chunk_prefill",
@@ -396,7 +396,7 @@
    "operation": "kda.chunk_prefill",
    "name": "l2norm_fwd_kernel2",
    "type": "model",
-   "role": "KDA chunk prefill (chunk_kda_with_fused_gate: l2norm, gate cumsum, kkt, inverse, w/u, h, o)",
+   "role": "KDA chunk prefill: the chunk_kda_with_fused_gate call, its q/k/v contiguous copies and scratch fills included (the L1 kind times them)",
    "slot_suffixes": [
     "kda.chunk_prefill"
    ],
@@ -407,7 +407,7 @@
    "operation": "kda.chunk_prefill",
    "name": "kda_gate_cumsum_fwd_kernel",
    "type": "model",
-   "role": "KDA chunk prefill (chunk_kda_with_fused_gate: l2norm, gate cumsum, kkt, inverse, w/u, h, o)",
+   "role": "KDA chunk prefill: the chunk_kda_with_fused_gate call, its q/k/v contiguous copies and scratch fills included (the L1 kind times them)",
    "slot_suffixes": [
     "kda.chunk_prefill"
    ],
@@ -418,7 +418,7 @@
    "operation": "kda.chunk_prefill",
    "name": "chunk_kda_scaled_dot_kkt_fwd_kernel",
    "type": "model",
-   "role": "KDA chunk prefill (chunk_kda_with_fused_gate: l2norm, gate cumsum, kkt, inverse, w/u, h, o)",
+   "role": "KDA chunk prefill: the chunk_kda_with_fused_gate call, its q/k/v contiguous copies and scratch fills included (the L1 kind times them)",
    "slot_suffixes": [
     "kda.chunk_prefill"
    ],
@@ -429,7 +429,7 @@
    "operation": "kda.chunk_prefill",
    "name": "merge_16x16_to_64x64_inverse_kernel",
    "type": "model",
-   "role": "KDA chunk prefill (chunk_kda_with_fused_gate: l2norm, gate cumsum, kkt, inverse, w/u, h, o)",
+   "role": "KDA chunk prefill: the chunk_kda_with_fused_gate call, its q/k/v contiguous copies and scratch fills included (the L1 kind times them)",
    "slot_suffixes": [
     "kda.chunk_prefill"
    ],
@@ -440,7 +440,7 @@
    "operation": "kda.chunk_prefill",
    "name": "recompute_w_u_fwd_kernel",
    "type": "model",
-   "role": "KDA chunk prefill (chunk_kda_with_fused_gate: l2norm, gate cumsum, kkt, inverse, w/u, h, o)",
+   "role": "KDA chunk prefill: the chunk_kda_with_fused_gate call, its q/k/v contiguous copies and scratch fills included (the L1 kind times them)",
    "slot_suffixes": [
     "kda.chunk_prefill"
    ],
@@ -451,7 +451,7 @@
    "operation": "kda.chunk_prefill",
    "name": "chunk_gated_delta_rule_fwd_kernel_h",
    "type": "model",
-   "role": "KDA chunk prefill (chunk_kda_with_fused_gate: l2norm, gate cumsum, kkt, inverse, w/u, h, o)",
+   "role": "KDA chunk prefill: the chunk_kda_with_fused_gate call, its q/k/v contiguous copies and scratch fills included (the L1 kind times them)",
    "slot_suffixes": [
     "kda.chunk_prefill"
    ],
@@ -462,7 +462,7 @@
    "operation": "kda.chunk_prefill",
    "name": "chunk_gla_fwd_kernel_o",
    "type": "model",
-   "role": "KDA chunk prefill (chunk_kda_with_fused_gate: l2norm, gate cumsum, kkt, inverse, w/u, h, o)",
+   "role": "KDA chunk prefill: the chunk_kda_with_fused_gate call, its q/k/v contiguous copies and scratch fills included (the L1 kind times them)",
    "slot_suffixes": [
     "kda.chunk_prefill"
    ],
@@ -518,7 +518,7 @@
    "operation": "kda.prefill_glue",
    "name": "CUDAFunctor_add<int>",
    "type": "model",
-   "role": "KDA prefill small launches: beta sigmoid, index scans, gate views",
+   "role": "KDA prefill small launches: beta sigmoid and FLA's once-per-step chunk-index setup",
    "slot_suffixes": [
     "kda.prefill_glue"
    ],
@@ -529,7 +529,7 @@
    "operation": "kda.prefill_glue",
    "name": "CatArrayBatchedCopy_alignedK_contig",
    "type": "model",
-   "role": "KDA prefill small launches: beta sigmoid, index scans, gate views",
+   "role": "KDA prefill small launches: beta sigmoid and FLA's once-per-step chunk-index setup",
    "slot_suffixes": [
     "kda.prefill_glue"
    ],
@@ -540,7 +540,7 @@
    "operation": "kda.prefill_glue",
    "name": "DeviceScanInitKernel",
    "type": "model",
-   "role": "KDA prefill small launches: beta sigmoid, index scans, gate views",
+   "role": "KDA prefill small launches: beta sigmoid and FLA's once-per-step chunk-index setup",
    "slot_suffixes": [
     "kda.prefill_glue"
    ],
@@ -551,7 +551,7 @@
    "operation": "kda.prefill_glue",
    "name": "DeviceScanKernel",
    "type": "model",
-   "role": "KDA prefill small launches: beta sigmoid, index scans, gate views",
+   "role": "KDA prefill small launches: beta sigmoid and FLA's once-per-step chunk-index setup",
    "slot_suffixes": [
     "kda.prefill_glue"
    ],
@@ -562,7 +562,7 @@
    "operation": "kda.prefill_glue",
    "name": "at::native::vectorized_elementwise_kernel",
    "type": "model",
-   "role": "KDA prefill small launches: beta sigmoid, index scans, gate views",
+   "role": "KDA prefill small launches: beta sigmoid and FLA's once-per-step chunk-index setup",
    "slot_suffixes": [
     "kda.prefill_glue"
    ],
@@ -571,12 +571,12 @@
    "phase": "forward"
   },
   {
-   "operation": "kda.prefill_glue",
+   "operation": "kda.chunk_prefill",
    "name": "at::native::vectorized_elementwise_kernel",
    "type": "model",
-   "role": "KDA prefill small launches: beta sigmoid, index scans, gate views",
+   "role": "KDA chunk prefill: the chunk_kda_with_fused_gate call, its q/k/v contiguous copies and scratch fills included (the L1 kind times them)",
    "slot_suffixes": [
-    "kda.prefill_glue"
+    "kda.chunk_prefill"
    ],
    "source_experiment": "logs/20260924_0_glm53_flash_b200_tp4_ep4_nsys",
    "after": "kda.chunk_prefill",
@@ -586,7 +586,7 @@
    "operation": "kda.prefill_glue",
    "name": "unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda",
    "type": "model",
-   "role": "KDA prefill small launches: beta sigmoid, index scans, gate views",
+   "role": "KDA prefill small launches: beta sigmoid and FLA's once-per-step chunk-index setup",
    "slot_suffixes": [
     "kda.prefill_glue"
    ],

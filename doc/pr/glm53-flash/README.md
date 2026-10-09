@@ -79,8 +79,9 @@ lists and makes paths relative to the repository root.
     KDA chunk-prefill setup and ~1150 eager launches per mixed forward.
   - Modeling this interval is follow-up work.
 - **Prefill top-k timing template.** The `vllm_cuda` `dsa_topk_prefill`
-  rows use a linspace logits template. At 2048 rows x 65K pools they read
-  0.33 ms, against ~0.21 ms per layer measured.
+  rows used a linspace logits template. At 2048 rows x 65K pools they read
+  0.33 ms, against ~0.21 ms per layer measured. Re-profiled on seeded
+  standard-normal scores (2026-10-08) they read 0.24 ms.
 - **Decode top-k.** The measured `topk_decode` runs 9-19% slower than its
   stride-ramp rows. That is the other direction from the medium-path overflow
   exemption, so the rows stay.

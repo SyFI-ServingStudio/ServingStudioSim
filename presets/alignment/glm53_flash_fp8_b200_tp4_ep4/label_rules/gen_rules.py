@@ -77,10 +77,9 @@ for s, role in [("in_proj", "KDA in_proj_qkvbfg_a BF16 projection"),
                 ("g_b_proj", "KDA g_b low-rank output-gate projection"),
                 ("short_conv_prefill", "KDA merged q/k/v causal conv (varlen prefill)"),
                 ("short_conv_decode", "KDA merged q/k/v causal conv update (decode)"),
-                ("prefill_qkv_copy", "KDA prefill q/k/v contiguous copies around the qk l2norm"),
-                ("prefill_glue", "KDA prefill small launches: beta sigmoid, index scans, gate views"),
+                ("prefill_glue", "KDA prefill small launches: beta sigmoid and FLA's once-per-step chunk-index setup"),
                 ("state_gather", "KDA prefill SSM state gather"),
-                ("chunk_prefill", "KDA chunk prefill (chunk_kda_with_fused_gate: l2norm, gate cumsum, kkt, inverse, w/u, h, o)"),
+                ("chunk_prefill", "KDA chunk prefill: the chunk_kda_with_fused_gate call, its q/k/v contiguous copies and scratch fills included (the L1 kind times them)"),
                 ("recurrent_decode", "KDA fused recurrent decode: the fused_recurrent_kda call, its q/k/v/state contiguous copies included"),
                 ("state_scatter", "KDA prefill SSM state scatter"),
                 ("gated_norm", "KDA sigmoid-gated RMSNorm"),
@@ -97,7 +96,8 @@ M(K + "g_b_proj", NVJ, before_name="_causal_conv1d")
 M(K + "f_b_proj", NVJ, before=K + "g_b_proj")
 M(K + "in_proj", NVJ, before=K + "f_b_proj")
 M(K + "recurrent_decode", EW, after="<none>", before="<none>")
-M(K + "prefill_qkv_copy", EW, before=K + "chunk_prefill")
+# the chunk call's q/k/v copies belong to the call (the L1 kind times them)
+M(K + "chunk_prefill", EW, before=K + "chunk_prefill")
 M(K + "short_conv_prefill", "_causal_conv1d_fwd_kernel")
 M(K + "short_conv_decode", "_causal_conv1d_update_kernel")
 # the fused_recurrent_kda input copies belong to the call (the L1 kind times them)
@@ -105,8 +105,8 @@ M(K + "recurrent_decode", EW, after=K + "short_conv_decode")
 M(K + "recurrent_decode", EW, before=K + "recurrent_decode")
 M(K + "state_gather", "_gather_initial_states_kernel")
 M(K + "prefill_glue", "triton_poi_fused__to_copy_sigmoid_0")
-M(K + "prefill_qkv_copy", EW, after=K + "prefill_glue")
-M(K + "prefill_qkv_copy", EW, after=K + "chunk_prefill")
+M(K + "chunk_prefill", EW, after=K + "prefill_glue")
+M(K + "chunk_prefill", EW, after=K + "chunk_prefill")
 for n in ("l2norm_fwd_kernel2", "kda_gate_cumsum_fwd_kernel", "chunk_kda_scaled_dot_kkt_fwd_kernel",
           "merge_16x16_to_64x64_inverse_kernel", "recompute_w_u_fwd_kernel",
           "chunk_gated_delta_rule_fwd_kernel_h", "chunk_gla_fwd_kernel_o"):
@@ -120,8 +120,9 @@ M(K + "prefill_glue", "CUDAFunctor_add<int>")
 M(K + "prefill_glue", "CatArrayBatchedCopy_alignedK_contig")
 M(K + "prefill_glue", "DeviceScanInitKernel")
 M(K + "prefill_glue", "DeviceScanKernel")
-for prev in (K + "prefill_glue", K + "chunk_prefill", K + "prefill_qkv_copy"):
-    M(K + "prefill_glue", VEW, after=prev)
+M(K + "prefill_glue", VEW, after=K + "prefill_glue")
+# scratch fills between the chunk kernels run inside the call
+M(K + "chunk_prefill", VEW, after=K + "chunk_prefill")
 M(K + "prefill_glue", COPY, after=K + "prefill_glue")
 
 # ---------------- DSA ----------------

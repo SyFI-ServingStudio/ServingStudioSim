@@ -3,7 +3,9 @@
 The initial ``torch`` backend measures the complete multi-launch semantic
 reference. It is a correctness/performance baseline, not the production fused
 prefill launch, and must not be selected for production simulation after the
-vLLM backend is registered.
+vLLM backend is registered. ``vllm_triton`` is vLLM's one-launch varlen call;
+``dao_channellast`` is Dao-AILab causal-conv1d's channel-last kernel, one launch
+per sequence.
 """
 
 from __future__ import annotations
@@ -47,7 +49,9 @@ DOC = KernelDoc(
         " kernel_size − 1 input samples, zero-padded on the left if it is "
         "shorter, are saved as the request's convolution state. Sequences have "
         "equal length and bounded BF16 inputs; vllm_triton gets packed tokens "
-        "and sequence metadata prepared before timing."
+        "and sequence metadata prepared before timing. vllm_triton covers the "
+        "whole batch in one launch; dao_channellast launches once per sequence, "
+        "so its batch_size-B row is B launches."
     ),
     category="Attention",
     subcategory="Gated DeltaNet",
@@ -66,14 +70,18 @@ DOC = KernelDoc(
     method=(
         f"{CUPTI_METHOD} "
         "torch counts every launch of the reference; vllm_triton counts only "
-        "_causal_conv1d_fwd_kernel. Packing, metadata and the vLLM output check"
-        " run before timing."
+        "_causal_conv1d_fwd_kernel; dao_channellast sums every "
+        "causal_conv1d_channellast_fwd_kernel launch of the batch. Packing, "
+        "metadata and the output checks run before timing."
     ),
     caveats=(
         "Prior state is ignored; repeated calls rewrite the same state rows "
         "with the same input tails.",
         "The torch reference checks request indices on the GPU inside each timed call.",
         "FLOPs and bytes count the operation itself, not the torch backend's intermediate tensors.",
+        "dao_channellast passes no initial state. A continuation chunk would read "
+        "the slot as initial_states and so needs its final state in a separate "
+        "buffer plus a small copy back, which these rows leave out.",
     ),
     reference="profiling.runners.attention.gdn_causal_conv_prefill_reference",
 )
@@ -123,5 +131,39 @@ register(
             url="https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/mamba/ops/causal_conv1d.py",
         ),
         subprocess_env="vllm_env",
+    )
+)
+
+# Dao-AILab causal-conv1d 1.7.0's release wheel ships SASS for sm_75, sm_80,
+# sm_87, sm_90, sm_100 and sm_120 and no PTX (cuobjdump --list-elf), so a
+# device older than 7.5 has no kernel to load.
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="dao_channellast",
+        supports=BackendSupport(
+            compute=frozenset({DType.BF16}),
+            min_compute_capability=(7, 5),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.attention.gdn_causal_conv_prefill_dao_channellast",
+            function_name="profile_gdn_causal_conv_prefill_dao_channellast",
+        ),
+        table_name=KIND,
+        args_schema=GdnCausalConvPrefillArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        row_provenance_ref=RunnerRef(
+            module_name="profiling.runners.attention.gdn_causal_conv_prefill_dao_channellast",
+            function_name="row_provenance",
+        ),
+        doc=BackendDoc(
+            summary=(
+                "Dao-AILab causal-conv1d's channel-last kernel, one launch per sequence, "
+                "writing each final state straight into its cache slot."
+            ),
+            url="https://github.com/Dao-AILab/causal-conv1d/blob/main/csrc/causal_conv1d_fwd.cu",
+        ),
+        subprocess_env="causal_conv1d_env",
     )
 )

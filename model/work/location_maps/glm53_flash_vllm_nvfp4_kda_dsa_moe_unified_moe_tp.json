@@ -340,10 +340,6 @@
       "semantics": []
     },
     {
-      "location": "unified.first_kda_dense.kda.prefill_qkv_copy",
-      "semantics": []
-    },
-    {
       "location": "unified.first_kda_dense.kda.recurrent_decode",
       "semantics": [
         "first_kda_dense.attn.decode",
@@ -480,10 +476,6 @@
       "semantics": []
     },
     {
-      "location": "unified.kda_dense.kda.prefill_qkv_copy",
-      "semantics": []
-    },
-    {
       "location": "unified.kda_dense.kda.recurrent_decode",
       "semantics": [
         "kda_dense.attn.decode",
@@ -585,10 +577,6 @@
     },
     {
       "location": "unified.kda_moe.kda.prefill_glue",
-      "semantics": []
-    },
-    {
-      "location": "unified.kda_moe.kda.prefill_qkv_copy",
       "semantics": []
     },
     {

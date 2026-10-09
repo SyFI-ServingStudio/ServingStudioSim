@@ -52,15 +52,23 @@ DOC = KernelDoc(
     method=(
         "torch masks and selects as separate launches, timed with CUDA events: "
         "five warm-up calls, then a loop of back-to-back calls, taking the "
-        "median of three runs. vllm_cuda and sglang_cuda run once before the "
-        "capture; CUPTI then counts only topKPerRowPrefill or "
-        "topk_transform_prefill_kernel launches, with the L2 cache flushed "
-        "before each."
+        "median of three runs. vllm_cuda, deep_select and sglang_cuda run once "
+        "before the capture; CUPTI then counts only topKPerRowPrefill or "
+        "topk_transform_prefill_kernel launches, or every DeepSelect launch, "
+        "with the L2 cache flushed before each. deep_select's selection is "
+        "checked against torch.topk on three rows after the warm-up call."
     ),
     caveats=(
-        "Only one sequence is measured, on scores that are deterministic and "
-        "free of ties. sglang_cuda takes only top_k = 2048; torch and vllm_cuda "
-        "take any top_k.",
+        "Only one sequence is measured, on seeded standard-normal scores: "
+        "unsorted like MQA logits, deterministic, and practically tie-free. "
+        "Rows measured before 2026-10-08 used one sorted linspace row for "
+        "every query, which slows vLLM's radix select about 1.7x at long "
+        "rows. sglang_cuda takes only top_k = 2048; torch and vllm_cuda take "
+        "any top_k.",
+        "deep_select takes no row start, so it fits a span whose rows all "
+        "begin at key 0: one request, or a query slice of one. vLLM's prefill "
+        "indexer packs several short requests into one call with nonzero row "
+        "starts; those calls need vllm_cuda.",
         "GB/s counts valid scores, row bounds and output indices, not padding "
         "or torch intermediates; SGLang also counts its page-table output.",
     ),
@@ -106,6 +114,36 @@ register(
         doc=BackendDoc(
             summary="vLLM topKPerRowPrefill selects positions from each causal score row.",
             url="https://github.com/vllm-project/vllm/blob/main/csrc/libtorch_stable/sampler.cu",
+        ),
+    )
+)
+
+# DeepSelect is built for the SM10x family only: vLLM's
+# cmake/external_projects/deepselect.cmake lists "10.0f" (SM100 and SM103) as
+# its sole architecture. It ships in the vLLM tree rebased onto 04730e8.
+register(
+    KernelProfilerSpec(
+        kernel_kind=KIND,
+        backend="deep_select",
+        supports=BackendSupport(
+            compute=frozenset({DType.FP32}),
+            sm_targets=frozenset({"sm_100f"}),
+        ),
+        runner_ref=RunnerRef(
+            module_name="profiling.runners.attention.dsa_topk_prefill",
+            function_name="profile_dsa_topk_prefill_deep_select",
+        ),
+        table_name=KIND,
+        args_schema=DsaTopkPrefillArgs,
+        metric_family=MetricFamily.COMPUTE,
+        batch_outlier_policy=BatchOutlierPolicy(),
+        subprocess_env="vllm_upstream_fork_env",
+        doc=BackendDoc(
+            summary=(
+                "DeepSelect's exact FP32 top-k (torch.ops.deep_select.topk), "
+                "which vLLM uses for the decode indexer, over each row's prefix."
+            ),
+            url="https://github.com/vllm-project/DeepSelect",
         ),
     )
 )

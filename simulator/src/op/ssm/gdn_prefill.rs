@@ -193,6 +193,11 @@ fn derive_geometry(sequence_lengths: &[u32]) -> Result<Option<GdnPrefillGeometry
     }))
 }
 
+/// Sums one `(1, L_i)` row per sequence. That is exact for a per-sequence
+/// backend (`gdn_causal_conv_prefill::launches_per_sequence`), but vLLM's
+/// `vllm_triton` covers the whole varlen batch in one launch, so this charges
+/// it a launch floor per sequence: +3% at 8 x 2048 tokens, +93% at 256 x 64 on
+/// the B200 24576-channel rows.
 fn aggregate_causal_conv(
     sequence_lengths: &[u32],
     mut eval: impl FnMut(&GdnCausalConvPrefillKernelInput) -> LeafMetrics,

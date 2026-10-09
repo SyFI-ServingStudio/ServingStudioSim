@@ -1,8 +1,9 @@
 //! Fused mHC post/pre block with fused RMSNorm.
 //!
 //! Backends share the args and the per-token work (see the Python kind):
-//! `vllm_tilelang` is vLLM's TileLang call, and `deepgemm_mega` is the
-//! one-launch DeepGEMM `mega_mhc` with the shifted collapse.
+//! `vllm_tilelang` is vLLM's TileLang call, `deepgemm_mega` is the one-launch
+//! DeepGEMM `mega_mhc` with the shifted collapse, and
+//! `deepgemm_mega_nonshifted` is that launch collapsing with its own pre mix.
 //!
 //! `deepgemm_mega` picks its K-split count on the host from `num_tokens`. On
 //! B200 at hidden 5120 it measured 40 splits up to T=192, 27 up to T=320, 20 up
@@ -18,6 +19,12 @@
 //! Up to T=4096, where one extra wave still adds 10-50%, the grid holds the
 //! last T of each wave and T+1. Above that a step is at most ~12% and the
 //! 256-token spacing keeps the error within a few percent.
+//!
+//! `deepgemm_mega_nonshifted` is the same launch without the shifted collapse.
+//! On B200 at hidden 4096 it measured 64 splits up to T=128, 32 up to 256, 22
+//! up to 384 and 16 above (steps of 6-8%), and the 16-split launch steps at
+//! the same wave ends (+2-5 us each, 26% at T=577). Its configs get those
+//! split points plus the shared wave points.
 
 use crate::timing::bridge::{ArgsPayload, KernelKind};
 use crate::timing::cache::CacheKind;
@@ -58,21 +65,37 @@ const DEEPGEMM_MEGA_WAVE_POINTS: [u32; 14] = [
     576, 577, 1152, 1153, 1728, 1729, 2368, 2369, 2944, 2945, 3520, 3521, 4096, 4097,
 ];
 
-/// The shared MHC token grid, plus the K-split and wave points when
-/// `deepgemm_mega` is a candidate. Only that backend's configs get the extra
-/// rows. Other backends use `tilelang_sweep_grid`. The `deepgemm_mega` rows were
-/// measured on the shared mHC grid, without the TileLang T=17 point.
+const DEEPGEMM_MEGA_NONSHIFTED: &str = "deepgemm_mega_nonshifted";
+
+/// Non-shifted `mega_mhc` at hidden 4096: the last token count of each K-split
+/// specialization (64/32/22), the first of the next one, and one probe step
+/// (8) on either side.
+const DEEPGEMM_MEGA_NONSHIFTED_SPLIT_POINTS: [u32; 12] =
+    [120, 128, 129, 136, 248, 256, 257, 264, 376, 384, 385, 392];
+
+/// The shared MHC token grid, plus the K-split and wave points of each
+/// `mega_mhc` backend that is a candidate. Only those backends' configs get
+/// the extra rows. Other backends use `tilelang_sweep_grid`. The `mega_mhc`
+/// rows are measured on the shared mHC grid, without the TileLang T=17 point.
 fn fused_sweep_grid(config: &MhcRmsNormKernelConfig) -> SweepGrid {
-    if !config.backends.contains(&DEEPGEMM_MEGA) {
+    let shifted = config.backends.contains(&DEEPGEMM_MEGA);
+    let nonshifted = config.backends.contains(&DEEPGEMM_MEGA_NONSHIFTED);
+    if !shifted && !nonshifted {
         return tilelang_sweep_grid();
     }
     let base = sweep_grid();
     let mut axis = Axis::chain([
         base.axes()[0].clone(),
-        Axis::values(DEEPGEMM_MEGA_SPLIT_POINTS),
         Axis::values(DEEPGEMM_MEGA_WAVE_POINTS),
     ]);
+    if shifted {
+        axis = Axis::chain([axis, Axis::values(DEEPGEMM_MEGA_SPLIT_POINTS)]);
+    }
+    if nonshifted {
+        axis = Axis::chain([axis, Axis::values(DEEPGEMM_MEGA_NONSHIFTED_SPLIT_POINTS)]);
+    }
     axis.sort_by(f64::total_cmp);
+    axis.dedup();
     SweepGrid::new(vec![axis])
 }
 
@@ -155,6 +178,25 @@ mod tests {
         );
         assert_eq!(p.fields()["num_tokens"], 192);
         assert_eq!(p.fields()["hidden_size"], 5120);
+    }
+
+    /// Catches a grid that interpolates across a non-shifted `mega_mhc`
+    /// K-split step (128->129, 256->257, 384->385 at hidden 4096) or a 16-split
+    /// wave step, or that carries the shifted backend's 5120 split points.
+    #[test]
+    fn deepgemm_mega_nonshifted_grid_brackets_its_own_steps() {
+        let cfg = config("deepgemm_mega_nonshifted", "NVIDIA B200", 4096);
+        let grid = MhcFusedPostPreRmsNormSpec::sweep_grid(&cfg);
+        let axis = &grid.axes()[0];
+        assert!(axis.windows(2).all(|w| w[0] < w[1]));
+        for t in [
+            120.0, 128.0, 129.0, 136.0, 248.0, 256.0, 257.0, 264.0, 376.0, 384.0, 385.0, 392.0,
+            576.0, 577.0, 1152.0, 1153.0, 2944.0, 2945.0, 4096.0, 4097.0,
+        ] {
+            assert!(axis.contains(&t), "missing K-split or wave point {t}");
+        }
+        assert!(!axis.contains(&193.0) && !axis.contains(&17.0));
+        assert_eq!(axis.len(), 88);
     }
 
     /// Catches the K-split points leaking into the TileLang config, whose

@@ -130,6 +130,16 @@ ENV_REGISTRY: dict[str, ProfileEnv | ContainerProfileEnv] = {
         "flashinfer_local",
         _profile_env_python("flashinfer_local"),
     ),
+    # FlashInfer's Blackwell KDA prefill backends (TIRx, CuTe DSL persistent)
+    # are on FlashInfer main after the 0.7.1 release branch was cut, and need
+    # Torch cu130, CuTe DSL >= 4.7 and a CUDA-enabled TVM with TIRx -- none of
+    # which the project venv (Torch 2.10 cu128, FlashInfer 0.6) can take. It is
+    # its own venv, built by `profiling/exec/flashinfer_kda_env.sh`.
+    "flashinfer_kda_env": ProfileEnv(
+        "flashinfer_kda_env",
+        _profile_env_python("flashinfer_kda"),
+        isolated_site_packages=True,
+    ),
     # SGLang's CUDA extensions are built against the checkout-local Torch and
     # FlashInfer stack. Keep the interpreter and source tree from the same
     # checkout so profiling cannot silently import a globally installed build.
@@ -154,6 +164,27 @@ ENV_REGISTRY: dict[str, ProfileEnv | ContainerProfileEnv] = {
         additional_python_paths=(_VLLM_FORK_CHECKOUT,),
         additional_library_paths=(_VLLM_FORK_TORCH_LIB,),
         isolated_site_packages=True,
+    ),
+    # FlashKDA, the KDA prefill kernel upstream vLLM vendors as _flashkda_C,
+    # built standalone from the same commit (vllm-project/FlashKDA@17a037d,
+    # registered as torch.ops.flash_kda). vllm_env's fork image predates it,
+    # and the project Torch (cu128) cannot build its sm_100f code, so this
+    # venv carries Torch 2.13.0/cu130 as upstream vLLM pins it. Setup:
+    # profiling/README.md "flashkda_env".
+    "flashkda_env": ProfileEnv(
+        "flashkda_env",
+        _profile_env_python("flashkda_env"),
+        isolated_site_packages=True,
+    ),
+    # Dao-AILab causal-conv1d's prebuilt wheel, installed with `--no-deps
+    # --target` into one directory and imported on the project interpreter.
+    # The wheel is built against the project's Torch (2.10, cu12, cxx11 ABI),
+    # so it needs no venv of its own; a Torch bump fails its import loudly.
+    # Setup: profiling/README.md "causal_conv1d_env".
+    "causal_conv1d_env": ProfileEnv(
+        "causal_conv1d_env",
+        _default_python(),
+        additional_python_paths=(_PROFILE_ENVS_ROOT / "causal_conv1d",),
     ),
     # vLLM runners execute in the pinned image (the alignment fork's vLLM
     # commit, profiling/container/build.sh); host source and Python packages

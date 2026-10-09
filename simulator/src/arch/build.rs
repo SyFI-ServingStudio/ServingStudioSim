@@ -34,14 +34,15 @@ use crate::arch::{
     Glm52SglangNvfp4TpDsaMoeModel, Glm52SglangNvfp4TpDsaMoeParallel, Glm52VllmDsaMoeModel,
     Glm52VllmDsaMoeParallel, Glm52VllmNvfp4DpAttnDsaMoeModel, Glm52VllmNvfp4DpAttnParallel,
     Glm52VllmNvfp4DsaMoeModel, Glm52VllmNvfp4DsaMoeParallel, Glm52VllmNvfp4DsaMoeSpeculativeModel,
-    Glm52VllmNvfp4PpDsaMoeModel, Glm52VllmNvfp4PpParallel, Glm53FlashModelCfg, Glm53FlashQuant,
-    Glm53FlashVllmFp8PpModel, Glm53FlashVllmFp8PpParallel, Glm53FlashVllmModel,
-    Glm53FlashVllmParallel, Glm53VllmNvfp4DsaMoeDflash2Model, IterwiseUnifiedModel,
-    Llama3DenseModel, Llama3DenseTpModel, Llama3DpAttnTpFfnModel, Qwen36LocalModel,
-    Qwen36LocalParallel, Qwen36ModelCfg, Qwen3AttnLayerwiseModel, Qwen3AttnParallel,
-    Qwen3FfnMoeLayerwiseModel, Qwen3FfnMoeParallel, Qwen3Fp8FfnMoeLayerwiseModel,
-    Qwen3Fp8FfnMoeParallel, Qwen3MoeDpAttnEpFfnModel, Qwen3MoeFp8DpAttnEpFfnModel,
-    Qwen3MoeFp8Parallel, Qwen3MoeParallel, Qwen3VllmMoeDpAttnEpFfnModel, Qwen3VllmMoeParallel,
+    Glm52VllmNvfp4PpDsaMoeModel, Glm52VllmNvfp4PpParallel, Glm53FlashKernelPath,
+    Glm53FlashModelCfg, Glm53FlashQuant, Glm53FlashVllmFp8PpModel, Glm53FlashVllmFp8PpParallel,
+    Glm53FlashVllmModel, Glm53FlashVllmParallel, Glm53VllmNvfp4DsaMoeDflash2Model,
+    IterwiseUnifiedModel, Llama3DenseModel, Llama3DenseTpModel, Llama3DpAttnTpFfnModel,
+    Qwen36LocalModel, Qwen36LocalParallel, Qwen36ModelCfg, Qwen3AttnLayerwiseModel,
+    Qwen3AttnParallel, Qwen3FfnMoeLayerwiseModel, Qwen3FfnMoeParallel,
+    Qwen3Fp8FfnMoeLayerwiseModel, Qwen3Fp8FfnMoeParallel, Qwen3MoeDpAttnEpFfnModel,
+    Qwen3MoeFp8DpAttnEpFfnModel, Qwen3MoeFp8Parallel, Qwen3MoeParallel,
+    Qwen3VllmMoeDpAttnEpFfnModel, Qwen3VllmMoeParallel,
 };
 use crate::common::Fabric;
 use crate::timing::bridge::DType;
@@ -1344,6 +1345,7 @@ pub fn glm53_flash_vllm_fp8_kda_dsa_moe(
     expert_popularity_file: Option<&str>,
     token_corpus_file: Option<&str>,
     cudagraph_capture_sizes: &[u32],
+    kernel_path: Glm53FlashKernelPath,
     gpu: &str,
     name: &str,
     bridge: &PerfApiBridge,
@@ -1363,6 +1365,7 @@ pub fn glm53_flash_vllm_fp8_kda_dsa_moe(
         max_model_len,
         gpu_name: gpu.to_string(),
         cudagraph_capture_sizes: cudagraph_capture_sizes.to_vec(),
+        kernel_path,
     };
     let configs = glm53_flash_vllm_fp8_kda_dsa_moe::build_configs(&model_cfg, &parallel, &demand)
         .context("expanding GLM-5.3-Flash architecture configs")?;
@@ -1450,6 +1453,7 @@ pub fn glm53_flash_vllm_fp8_pp_kda_dsa_moe(
     token_corpus_file: Option<&str>,
     cudagraph_capture_sizes: &[u32],
     layer_partition: &[u32],
+    kernel_path: Glm53FlashKernelPath,
     gpu: &str,
     name: &str,
     bridge: &PerfApiBridge,
@@ -1469,6 +1473,7 @@ pub fn glm53_flash_vllm_fp8_pp_kda_dsa_moe(
         gpu_name: gpu.to_string(),
         cudagraph_capture_sizes: cudagraph_capture_sizes.to_vec(),
         layer_partition: layer_partition.to_vec(),
+        kernel_path,
     };
     let configs =
         glm53_flash_vllm_fp8_pp_kda_dsa_moe::build_configs(&model_cfg, &parallel, &demand)
@@ -1492,6 +1497,7 @@ pub fn glm53_flash_vllm_fp8_dp_attn_ep_moe(
     expert_popularity_file: Option<&str>,
     token_corpus_file: Option<&str>,
     cudagraph_capture_sizes: &[u32],
+    kernel_path: Glm53FlashKernelPath,
     gpu: &str,
     name: &str,
     bridge: &PerfApiBridge,
@@ -1519,6 +1525,7 @@ pub fn glm53_flash_vllm_fp8_dp_attn_ep_moe(
         max_model_len,
         gpu_name: gpu.to_string(),
         cudagraph_capture_sizes: cudagraph_capture_sizes.to_vec(),
+        kernel_path,
     };
     let configs =
         glm53_flash_vllm_fp8_dp_attn_ep_moe::build_configs(&model_cfg, &parallel, &demand)
@@ -1803,6 +1810,50 @@ pub fn qwen3_fp8_ffn_moe(
     );
     qwen3_fp8_ffn_moe_layerwise::build(name.to_string(), resolved, bridge)
         .context("building native FP8 Qwen3 AFD ffn-side model")
+}
+
+/// The vLLM code path a GLM-5.3-Flash arch tag's layers follow.
+pub fn glm53_flash_kernel_path(sel: &IterArchSel) -> Result<Glm53FlashKernelPath> {
+    let (mla_layout_copies, indexer_max_logits_mb) = match sel {
+        IterArchSel::Glm53FlashVllmFp8KdaDsaMoe {
+            mla_layout_copies,
+            indexer_max_logits_mb,
+            ..
+        }
+        | IterArchSel::Glm53FlashVllmFp8PpKdaDsaMoe {
+            mla_layout_copies,
+            indexer_max_logits_mb,
+            ..
+        }
+        | IterArchSel::Glm53FlashVllmFp8DpAttnEpMoe {
+            mla_layout_copies,
+            indexer_max_logits_mb,
+            ..
+        }
+        | IterArchSel::Glm53FlashVllmNvfp4KdaDsaMoe {
+            mla_layout_copies,
+            indexer_max_logits_mb,
+            ..
+        }
+        | IterArchSel::Glm53FlashVllmNvfp4PpKdaDsaMoe {
+            mla_layout_copies,
+            indexer_max_logits_mb,
+            ..
+        }
+        | IterArchSel::Glm53FlashVllmNvfp4DpAttnEpMoe {
+            mla_layout_copies,
+            indexer_max_logits_mb,
+            ..
+        } => (*mla_layout_copies, *indexer_max_logits_mb),
+        other => unreachable!("{other:?} is not a GLM-5.3-Flash arch tag"),
+    };
+    if indexer_max_logits_mb == 0 {
+        bail!("indexer_max_logits_mb must be positive");
+    }
+    Ok(Glm53FlashKernelPath {
+        mla_layout_copies,
+        indexer_max_logits_mb,
+    })
 }
 
 /// The checkpoint quantization a GLM-5.3-Flash arch tag is for.
@@ -2121,6 +2172,7 @@ pub fn build_iter_model(
             expert_popularity_file,
             token_corpus_file,
             cudagraph_capture_sizes,
+            ..
         }
         | IterArchSel::Glm53FlashVllmNvfp4KdaDsaMoe {
             model,
@@ -2132,6 +2184,7 @@ pub fn build_iter_model(
             expert_popularity_file,
             token_corpus_file,
             cudagraph_capture_sizes,
+            ..
         } => Box::new(glm53_flash_vllm_fp8_kda_dsa_moe(
             model,
             glm53_flash_quant(sel),
@@ -2143,6 +2196,7 @@ pub fn build_iter_model(
             expert_popularity_file.as_deref(),
             token_corpus_file.as_deref(),
             cudagraph_capture_sizes,
+            glm53_flash_kernel_path(sel)?,
             gpu,
             name,
             bridge,
@@ -2157,6 +2211,7 @@ pub fn build_iter_model(
             token_corpus_file,
             cudagraph_capture_sizes,
             layer_partition,
+            ..
         }
         | IterArchSel::Glm53FlashVllmNvfp4PpKdaDsaMoe {
             model,
@@ -2168,6 +2223,7 @@ pub fn build_iter_model(
             token_corpus_file,
             cudagraph_capture_sizes,
             layer_partition,
+            ..
         } => Box::new(glm53_flash_vllm_fp8_pp_kda_dsa_moe(
             model,
             glm53_flash_quant(sel),
@@ -2179,6 +2235,7 @@ pub fn build_iter_model(
             token_corpus_file.as_deref(),
             cudagraph_capture_sizes,
             layer_partition,
+            glm53_flash_kernel_path(sel)?,
             gpu,
             name,
             bridge,
@@ -2192,6 +2249,7 @@ pub fn build_iter_model(
             expert_popularity_file,
             token_corpus_file,
             cudagraph_capture_sizes,
+            ..
         }
         | IterArchSel::Glm53FlashVllmNvfp4DpAttnEpMoe {
             model,
@@ -2202,6 +2260,7 @@ pub fn build_iter_model(
             expert_popularity_file,
             token_corpus_file,
             cudagraph_capture_sizes,
+            ..
         } => Box::new(glm53_flash_vllm_fp8_dp_attn_ep_moe(
             model,
             glm53_flash_quant(sel),
@@ -2212,6 +2271,7 @@ pub fn build_iter_model(
             expert_popularity_file.as_deref(),
             token_corpus_file.as_deref(),
             cudagraph_capture_sizes,
+            glm53_flash_kernel_path(sel)?,
             gpu,
             name,
             bridge,
@@ -2698,6 +2758,27 @@ mod tests {
     use std::io::Write;
 
     use super::*;
+
+    #[test]
+    fn glm53_flash_kernel_path_reads_the_layout_params() {
+        // Kernel backends are no longer arch params (the run config's
+        // `backends` override picks them); only the two layout params remain.
+        let sel = |extra: &str| -> IterArchSel {
+            serde_json::from_str(&format!(
+                r#"{{"type": "glm53_flash_vllm_nvfp4_pp_kda_dsa_moe",
+                    "model_config": "model/config/glm53_flash_nvfp4.json", "fp8": false,
+                    "pp_size": 8, "routing": "uniform"{extra}}}"#
+            ))
+            .unwrap()
+        };
+        assert_eq!(
+            glm53_flash_kernel_path(&sel("")).unwrap(),
+            Glm53FlashKernelPath::default()
+        );
+        let current = glm53_flash_kernel_path(&sel(r#", "mla_layout_copies": false"#)).unwrap();
+        assert!(!current.mla_layout_copies);
+        assert!(glm53_flash_kernel_path(&sel(r#", "indexer_max_logits_mb": 0"#)).is_err());
+    }
 
     #[test]
     fn qwen36_local_uniform_builder_loads_the_pinned_nested_config() {

@@ -2611,7 +2611,7 @@ def test_glm53_location_map_consumes_every_semantic_row_once():
     assert mapping["schema_version"] == 1
     assert mapping["arch_types"] == ["glm53_flash_vllm_fp8_kda_dsa_moe"]
     rules = {row["location"]: row["semantics"] for row in mapping["locations"]}
-    assert len(rules) == len(mapping["locations"]) == 128
+    assert len(rules) == len(mapping["locations"]) == 125
     mapped = [semantic for semantics in rules.values() for semantic in semantics]
     assert len(mapped) == len(set(mapped))
     model = work_floors._model_for_spec(
