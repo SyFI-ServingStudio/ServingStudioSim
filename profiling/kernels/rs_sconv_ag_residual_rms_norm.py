@@ -80,11 +80,10 @@ DOC = KernelDoc(
     ),
     default_metric="time_ms",
     method=(
-        "CUPTI time of graph replays (vLLM runs the call inside a graph) of 30 "
-        "calls, each after an L2 clear: a call is the interval union of its own "
-        "four kernels, excluding the clear. After a reference check and 50 direct "
-        "calls, a host barrier aligns the GPUs before each of three timed trials; "
-        "the median call of the median trial per GPU and the fastest GPU are kept."
+        "Host time of CUDA graph replays (vLLM runs the call inside a graph) of "
+        "30 back-to-back calls, divided by the call count, as the other "
+        "graph-captured PDL collectives are timed. After a reference check and 50 "
+        "direct calls, a host barrier aligns the GPUs; the slowest GPU is kept."
     ),
     caveats=(
         "Every GPU arrives together, so the time excludes the cross-GPU skew "
