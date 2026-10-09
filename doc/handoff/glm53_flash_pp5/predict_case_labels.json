@@ -1,0 +1,17 @@
+[
+ "1 req prefix 0 + 8192",
+ "1 req prefix 32768 + 8192",
+ "1 req prefix 131072 + 8192",
+ "1 req prefix 524288 + 8192",
+ "1 req prefix 0 + 16384",
+ "1 req prefix 32768 + 16384",
+ "1 req prefix 131072 + 16384",
+ "1 req prefix 524288 + 16384",
+ "1 req prefix 0 + 32768",
+ "1 req prefix 32768 + 32768",
+ "1 req prefix 131072 + 32768",
+ "1 req prefix 524288 + 32768",
+ "16 req prefix 131072 + 2048",
+ "32 req prefix 131072 + 1024",
+ "op-point mb c3000 iter 98405 (12 seqs, 21301 tok)"
+]

@@ -59,6 +59,60 @@ pub enum PrefillChunkAlignment {
 
 const PREFILL_CHUNK_ALIGNMENT_CHOICES: [&str; 2] = ["checkpoint", "plain"];
 
+/// How a pipeline head sizes each microbatch's prefill.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MicrobatchSplit {
+    /// Take as much pending prefill as `max_batch_tokens` allows (vLLM).
+    #[default]
+    Greedy,
+    /// Take one `pp_size`-th of the round: `clamp(ceil((pending + in-flight
+    /// prefill tokens) / pp_size), min_microbatch_tokens, max_batch_tokens)`.
+    Even,
+}
+
+const MICROBATCH_SPLIT_CHOICES: [&str; 2] = ["greedy", "even"];
+
+/// Validated microbatch prefill sizing the pipeline-head recipe applies.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MicrobatchSizing {
+    #[default]
+    Greedy,
+    Even {
+        min_tokens: u32,
+    },
+}
+
+/// Lower the `microbatch_split` / `min_microbatch_tokens` selector pair. The
+/// minimum only floors the even target: alone it would be a hold gate, which
+/// can leave a prompt's last small chunk waiting while other work flows.
+pub(crate) fn resolve_microbatch_sizing(
+    split: MicrobatchSplit,
+    min_microbatch_tokens: u32,
+    max_batch_tokens: u32,
+) -> Result<MicrobatchSizing> {
+    match split {
+        MicrobatchSplit::Greedy => {
+            ensure!(
+                min_microbatch_tokens == 0,
+                "min_microbatch_tokens ({min_microbatch_tokens}) only applies with \
+                 microbatch_split: even; greedy takes every pending token it can"
+            );
+            Ok(MicrobatchSizing::Greedy)
+        }
+        MicrobatchSplit::Even => {
+            ensure!(
+                min_microbatch_tokens <= max_batch_tokens,
+                "min_microbatch_tokens ({min_microbatch_tokens}) must be <= \
+                 max_batch_tokens ({max_batch_tokens})"
+            );
+            Ok(MicrobatchSizing::Even {
+                min_tokens: min_microbatch_tokens,
+            })
+        }
+    }
+}
+
 /// KV-capacity rule paired with chunked prefill. `FullFootprint` preserves the
 /// historical no-retraction lifecycle. `BoundedFuture` uses an explicit
 /// future-token estimate and therefore requires decode retraction.
@@ -212,10 +266,11 @@ impl KvAdmissionSpec {
     }
 }
 
-const PENDING_ORDER_CHOICES: [&str; 4] = [
+const PENDING_ORDER_CHOICES: [&str; 5] = [
     "session-start",
     "fifo",
     "shortest-job-first",
+    "shortest-prefill-first",
     "longest-prefix-match",
 ];
 
@@ -232,6 +287,45 @@ const PREFIX_CACHE_MODE_CHOICES: [&str; 2] = ["disabled", "opportunistic"];
 /// a gap between iter/section slices in the trace, never inside a kernel slice.
 fn default_gpu_time_multiplier() -> f64 {
     1.0
+}
+
+/// serde fallback for the pipeline selector's `pending_order`: vLLM's FCFS.
+fn default_pipeline_pending_order() -> PendingOrderKind {
+    PendingOrderKind::Fifo
+}
+
+/// serde fallbacks for the pipeline selector's prefix tiers: a PCIe Gen5 x16
+/// link from host memory, and one Gen5 NVMe drive per GPU.
+/// The DRAM and SSD tiers a worker selector asks for (`[dram, ssd]`).
+pub(crate) fn prefix_tier_specs(
+    deployment: &str,
+    dram_gb: f64,
+    dram_gb_per_s: f64,
+    ssd_gb: f64,
+    ssd_gb_per_s: f64,
+) -> anyhow::Result<[Option<crate::worker::kv::PrefixTierSpec>; 2]> {
+    let tier = |name, gb: f64, gb_per_s: f64| {
+        anyhow::ensure!(
+            gb >= 0.0 && (gb == 0.0 || gb_per_s > 0.0),
+            "{deployment}: {name}_tier_gb must be >= 0 and its bandwidth positive"
+        );
+        Ok((gb > 0.0).then_some(crate::worker::kv::PrefixTierSpec {
+            name,
+            capacity_gb_per_gpu: gb,
+            read_gb_per_s_per_gpu: gb_per_s,
+        }))
+    };
+    Ok([
+        tier("dram", dram_gb, dram_gb_per_s)?,
+        tier("ssd", ssd_gb, ssd_gb_per_s)?,
+    ])
+}
+
+fn default_dram_tier_gb_per_s() -> f64 {
+    50.0
+}
+fn default_ssd_tier_gb_per_s() -> f64 {
+    10.0
 }
 
 /// serde fallback for the speculative selector's `batch_policy`.
@@ -377,6 +471,55 @@ pub enum IterWorkerSel {
         #[serde(default)]
         #[param(string, default = "checkpoint", choices = PREFILL_CHUNK_ALIGNMENT_CHOICES)]
         prefill_chunk_alignment: PrefillChunkAlignment,
+        /// vLLM's `long_prefill_token_threshold`: the most prefill tokens one
+        /// request takes per iteration, so a long prompt leaves the rest of the
+        /// budget to other requests (`0`: no cap, vLLM's default). Applies per
+        /// attention-DP partition.
+        #[serde(default)]
+        #[param(default = 0)]
+        long_prefill_token_threshold: u32,
+        /// Order of each rank's waiting queue. `fifo` is vLLM's FCFS;
+        /// `shortest-prefill-first` offers the prompt with the fewest tokens to
+        /// compute first, counting what HBM or a prefix tier holds as reused
+        /// (not vLLM). Started prompts keep priority either way.
+        #[serde(default = "default_pipeline_pending_order")]
+        #[param(string, default = "fifo", choices = PENDING_ORDER_CHOICES)]
+        pending_order: PendingOrderKind,
+        /// Host DRAM behind each attention DP rank's HBM prefix cache, per GPU
+        /// (GB; `0`: none), as `pipeline_chunked_prefill`'s; hybrid archs only.
+        /// Sessions then stick to the rank they last ran on. Not vLLM.
+        #[serde(default)]
+        #[param(default = 0.0)]
+        dram_tier_gb: f64,
+        #[serde(default = "default_dram_tier_gb_per_s")]
+        #[param(default = 50.0)]
+        dram_tier_gb_per_s: f64,
+        /// Local SSD behind DRAM, per GPU (GB; `0`: none).
+        #[serde(default)]
+        #[param(default = 0.0)]
+        ssd_tier_gb: f64,
+        #[serde(default = "default_ssd_tier_gb_per_s")]
+        #[param(default = 10.0)]
+        ssd_tier_gb_per_s: f64,
+        /// Decode runs elsewhere, as `pipeline_chunked_prefill`'s; hybrid archs
+        /// only. Not vLLM.
+        /// With a tier: a session request whose declared prefix exceeds every
+        /// context the run stored for that session is a conversation that began
+        /// before the run, and its context is read from the slowest tier, as a
+        /// long-lived session's would be in steady state. For closed-loop traces
+        /// that start sessions mid-life (`trace/session_closed_loop.py`).
+        #[serde(default)]
+        #[param(default = false)]
+        prefix_tier_warm_start: bool,
+        /// Serve a queued request that has waited this many ms since arrival
+        /// before the rest of its queue, so shortest-first cannot starve it
+        /// (`0`: off). Not vLLM.
+        #[serde(default)]
+        #[param(default = 0.0)]
+        force_schedule_after_ms: f64,
+        #[serde(default)]
+        #[param(default = false)]
+        external_decode: bool,
     },
     /// Chunked prefill with a speculating decode engine: one verify pass per
     /// iteration submits `draft_tokens + 1` rows per resident decode and retires
@@ -444,9 +587,11 @@ pub enum IterWorkerSel {
         #[serde(default = "default_gpu_time_multiplier")]
         #[param(default = 1.0)]
         gpu_time_multiplier: f64,
-        /// Hybrid archs only: `checkpoint` ends non-final prefill chunks on the
-        /// recurrent checkpoint interval (vLLM's Mamba `align` mode); `plain`
-        /// chunks as `min(remaining, budget)`, leaving that engine artifact out.
+        /// Hybrid archs only: `checkpoint` is vLLM's Mamba `align` mode, which
+        /// ends non-final prefill chunks on the KV block and floors prefix hits
+        /// to it; `plain` chunks as `min(remaining, budget)` and reuses a
+        /// retained prefix exactly (one state at its end), leaving both engine
+        /// artifacts out.
         #[serde(default)]
         #[param(string, default = "checkpoint", choices = PREFILL_CHUNK_ALIGNMENT_CHOICES)]
         prefill_chunk_alignment: PrefillChunkAlignment,
@@ -457,6 +602,106 @@ pub enum IterWorkerSel {
         #[serde(default)]
         #[param(default = false)]
         balance_decode_microbatches: bool,
+        /// `greedy` (vLLM) fills each microbatch's prefill up to
+        /// `max_batch_tokens`; `even` sizes it to one `pp_size`-th of the
+        /// pending plus in-flight prefill, so a backlog spreads over the
+        /// pipeline instead of one full microbatch followed by small ones.
+        #[serde(default)]
+        #[param(string, default = "greedy", choices = MICROBATCH_SPLIT_CHOICES)]
+        microbatch_split: MicrobatchSplit,
+        /// Floor on the `even` target, in prefill tokens (`0`: none). Valid
+        /// only with `microbatch_split: even`; never delays a microbatch.
+        #[serde(default)]
+        #[param(default = 0)]
+        min_microbatch_tokens: u32,
+        /// vLLM's `long_prefill_token_threshold`: the most prefill tokens one
+        /// request takes per microbatch (`0`: no cap, vLLM's default). Composes
+        /// with `greedy` and `even`.
+        #[serde(default)]
+        #[param(default = 0)]
+        long_prefill_token_threshold: u32,
+        /// Order in which queued fresh prompts are offered to the head. `fifo`
+        /// is vLLM; started prompts keep priority over fresh ones unless `srpt`.
+        #[serde(default = "default_pipeline_pending_order")]
+        #[param(string, default = "fifo", choices = PENDING_ORDER_CHOICES)]
+        pending_order: PendingOrderKind,
+        /// Load-following budget floor (`0`: off, vLLM's fixed budget). The
+        /// microbatch budget is this many tokens while the prefill backlog
+        /// (queued, started and in-flight tokens) is at most
+        /// `load_budget_backlog_lo_tokens`, rising linearly to
+        /// `max_batch_tokens` at `load_budget_backlog_hi_tokens`; both bounds
+        /// are required when the floor is set. Not vLLM.
+        #[serde(default)]
+        #[param(default = 0)]
+        load_budget_low_tokens: u32,
+        #[serde(default)]
+        #[param(default = 0)]
+        load_budget_backlog_lo_tokens: u64,
+        #[serde(default)]
+        #[param(default = 0)]
+        load_budget_backlog_hi_tokens: u64,
+        /// Shortest remaining prefill first across started and queued prompts
+        /// (queue order should be `shortest-prefill-first`), instead of vLLM's
+        /// started-first order. Not vLLM.
+        #[serde(default)]
+        #[param(default = false)]
+        srpt: bool,
+        /// Host DRAM behind the HBM prefix cache, per GPU (GB; `0`: none).
+        /// Every finished context is written through to each tier; a session
+        /// whose context is here but not in HBM is read back at
+        /// `dram_tier_gb_per_s` per GPU when admission reaches it, as vLLM's
+        /// KV connector does. Not vLLM.
+        #[serde(default)]
+        #[param(default = 0.0)]
+        dram_tier_gb: f64,
+        #[serde(default = "default_dram_tier_gb_per_s")]
+        #[param(default = 50.0)]
+        dram_tier_gb_per_s: f64,
+        /// Local SSD behind DRAM, per GPU (GB; `0`: none), read at
+        /// `ssd_tier_gb_per_s` per GPU.
+        #[serde(default)]
+        #[param(default = 0.0)]
+        ssd_tier_gb: f64,
+        #[serde(default = "default_ssd_tier_gb_per_s")]
+        #[param(default = 10.0)]
+        ssd_tier_gb_per_s: f64,
+        /// Decode runs elsewhere: a request completes at its first token and
+        /// its context, every target output token but the last (whose KV the
+        /// next round computes), is retained as a decode instance would hand
+        /// it back. Pair it with a session trace
+        /// whose tool waits include the decode time
+        /// (`trace/session_decode_wait.py`). Not vLLM.
+        /// With a tier: a session request whose declared prefix exceeds every
+        /// context the run stored for that session is a conversation that began
+        /// before the run, and its context is read from the slowest tier, as a
+        /// long-lived session's would be in steady state. For closed-loop traces
+        /// that start sessions mid-life (`trace/session_closed_loop.py`).
+        #[serde(default)]
+        #[param(default = false)]
+        prefix_tier_warm_start: bool,
+        /// With a tier: start a read only while its tier would begin it within
+        /// this many ms; past that, admission stops and the request waits in
+        /// its queue holding no HBM. Bounds what in-flight reads hold. 0: no
+        /// bound (vLLM). Not vLLM.
+        #[serde(default)]
+        #[param(default = 0.0)]
+        prefix_tier_max_read_wait_ms: f64,
+        /// With a tier: every stage reads the pipeline's mean KV bytes per
+        /// token, as if the stages held equal shares, instead of the most
+        /// loaded stage's. Sizes tier capacity the same way; HBM is unchanged.
+        /// A what-if, not vLLM: its layer split leaves the stages unequal.
+        #[serde(default)]
+        #[param(default = false)]
+        prefix_tier_balanced_load: bool,
+        /// Serve a request that has waited this many ms since arrival before
+        /// every other one, queued or started, so srpt / shortest-first cannot
+        /// starve it (`0`: off). Not vLLM.
+        #[serde(default)]
+        #[param(default = 0.0)]
+        force_schedule_after_ms: f64,
+        #[serde(default)]
+        #[param(default = false)]
+        external_decode: bool,
     },
     /// PD prefill half: prefills then hands off to a decode pool (no local decode).
     PdPrefill {
@@ -582,6 +827,40 @@ pub(crate) fn resolve_prefix_cache_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn min_microbatch_tokens_requires_the_even_split() {
+        let worker: IterWorkerSel = serde_yaml::from_str(
+            "type: pipeline_chunked_prefill\nattn_gpu_memory_gb: 80.0\nmax_batch_tokens: 8192\n",
+        )
+        .expect("parse pipeline worker");
+        let IterWorkerSel::PipelineChunkedPrefill {
+            microbatch_split,
+            min_microbatch_tokens,
+            ..
+        } = worker
+        else {
+            panic!("expected pipeline_chunked_prefill");
+        };
+        assert_eq!(
+            resolve_microbatch_sizing(microbatch_split, min_microbatch_tokens, 8192).unwrap(),
+            MicrobatchSizing::Greedy,
+            "the default is vLLM's greedy fill"
+        );
+
+        let error = resolve_microbatch_sizing(MicrobatchSplit::Greedy, 1024, 8192).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("only applies with microbatch_split: even"),
+            "{error}"
+        );
+        assert!(resolve_microbatch_sizing(MicrobatchSplit::Even, 8193, 8192).is_err());
+        assert_eq!(
+            resolve_microbatch_sizing(MicrobatchSplit::Even, 1024, 8192).unwrap(),
+            MicrobatchSizing::Even { min_tokens: 1024 }
+        );
+    }
 
     #[test]
     fn selector_defaults_to_uncapped_opportunistic_prefix_reuse() {

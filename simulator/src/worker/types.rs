@@ -522,6 +522,17 @@ pub struct WorkerStatus {
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
+/// A pipeline head's load-following microbatch budget: `low_tokens` while the
+/// prefill backlog (queued, started and in-flight tokens) is at most
+/// `backlog_lo_tokens`, rising linearly to `max_batch_tokens` at
+/// `backlog_hi_tokens`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PipelineLoadBudget {
+    pub low_tokens: u32,
+    pub backlog_lo_tokens: u64,
+    pub backlog_hi_tokens: u64,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct WorkerConfig {
     pub balance: LoadBalance,
@@ -575,6 +586,9 @@ pub struct WorkerConfig {
     /// depth)` instead of scheduling every ready decode (vLLM). Only the
     /// pipeline head recipe reads it.
     pub balance_decode_microbatches: bool,
+    /// How a pipeline head sizes each microbatch's prefill. Only the pipeline
+    /// head recipe reads it.
+    pub microbatch_sizing: crate::worker::config::MicrobatchSizing,
     /// Whether and how completed-session KV uses the dynamically available
     /// attention slack. This never adds capacity beyond `attn_kv_bytes`.
     pub prefix_cache: crate::worker::kv::PrefixCacheConfig,
@@ -587,6 +601,33 @@ pub struct WorkerConfig {
     /// checkpoint interval (from the `chunked_prefill` selector). Only the
     /// hybrid chunked-prefill recipe reads it.
     pub prefill_chunk_alignment: crate::worker::config::PrefillChunkAlignment,
+    /// vLLM's `long_prefill_token_threshold` (from the chunked-prefill
+    /// selectors): the most prefill tokens one request takes per iteration.
+    /// `None` leaves only the batch budget. Only chunked-prefill recipes read it.
+    pub long_prefill_token_threshold: Option<u32>,
+    /// Pipeline head only: the load-following microbatch budget, `None` for
+    /// the fixed `max_batch_tokens`.
+    pub load_budget: Option<PipelineLoadBudget>,
+    /// Pipeline head only: shortest remaining prefill first across started and
+    /// queued prompts.
+    pub srpt: bool,
+    /// Pipeline head and hybrid chunked prefill: the DRAM and SSD tiers behind
+    /// the HBM prefix cache, fastest first (`None`: no such tier).
+    pub prefix_tiers: [Option<crate::worker::kv::PrefixTierSpec>; 2],
+    /// With prefix tiers: a session request whose declared prefix exceeds every
+    /// context the run stored for it began before the run, and its context is
+    /// read from the slowest tier.
+    pub prefix_tier_warm_start: bool,
+    /// With prefix tiers: start a read only while its tier would begin it
+    /// within this many ms (0: no bound).
+    pub prefix_tier_max_read_wait_ms: f64,
+    /// Pipeline head and chunked prefill: serve a request that has waited
+    /// this many ms since arrival before the others (0: off).
+    pub force_schedule_after_ms: f64,
+    /// Pipeline head and hybrid chunked prefill: decode runs elsewhere;
+    /// requests complete at their first token and retain their whole target
+    /// context.
+    pub external_decode: bool,
     /// Candidate positions the drafter proposes per request per iteration (from
     /// the worker selector). The verify width is one more than this. Only the
     /// speculative recipe reads it, and it must match the width the model was
@@ -617,9 +658,18 @@ impl Default for WorkerConfig {
             batch_policy: crate::worker::config::BatchPolicy::Mix,
             kv_admission: crate::worker::config::KvAdmissionConfig::FullFootprint,
             balance_decode_microbatches: false,
+            microbatch_sizing: crate::worker::config::MicrobatchSizing::Greedy,
             prefix_cache: crate::worker::kv::PrefixCacheConfig::default(),
             ssm_checkpoint_interval_tokens: None,
             prefill_chunk_alignment: crate::worker::config::PrefillChunkAlignment::Checkpoint,
+            long_prefill_token_threshold: None,
+            load_budget: None,
+            srpt: false,
+            prefix_tiers: [None, None],
+            prefix_tier_warm_start: false,
+            prefix_tier_max_read_wait_ms: 0.0,
+            force_schedule_after_ms: 0.0,
+            external_decode: false,
             speculative_draft_tokens: 0,
             speculative_acceptance_seed: None,
             dp_placement: crate::worker::config::DpPlacement::RoundRobin,

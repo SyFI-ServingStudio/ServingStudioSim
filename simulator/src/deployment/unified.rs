@@ -127,13 +127,14 @@ impl Deployment for UnifiedDeployment {
                 batch_policy,
                 kv_admission,
                 gpu_time_multiplier,
+                pending_order,
                 // Read by `prefill_gpu_time_multiplier` below.
                 ..
             } => (
                 *attn_gpu_memory_gb,
                 *gpu_time_multiplier,
                 Some(*max_batch_tokens),
-                PendingOrderKind::Fifo,
+                *pending_order,
                 PrefixCacheMode::Opportunistic,
                 PrefixCachePolicy::Lru,
                 None,
@@ -188,15 +189,57 @@ impl Deployment for UnifiedDeployment {
             prefix_cache,
             ssm_checkpoint_interval_tokens: ssm_checkpoint_interval_tokens(&g.worker),
             prefill_chunk_alignment: prefill_chunk_alignment(&g.worker),
+            long_prefill_token_threshold: long_prefill_token_threshold(&g.worker),
             speculative_draft_tokens: speculative_draft_tokens(&g.worker),
             speculative_acceptance_seed: speculative_acceptance_seed(&g.worker),
             dp_placement: match &g.worker {
                 IterWorkerSel::ChunkedPrefill { dp_placement, .. } => *dp_placement,
                 _ => DpPlacement::RoundRobin,
             },
+            prefix_tiers: match &g.worker {
+                IterWorkerSel::ChunkedPrefill {
+                    dram_tier_gb,
+                    dram_tier_gb_per_s,
+                    ssd_tier_gb,
+                    ssd_tier_gb_per_s,
+                    ..
+                } => crate::worker::config::prefix_tier_specs(
+                    "unified",
+                    *dram_tier_gb,
+                    *dram_tier_gb_per_s,
+                    *ssd_tier_gb,
+                    *ssd_tier_gb_per_s,
+                )?,
+                _ => [None, None],
+            },
+            prefix_tier_warm_start: matches!(
+                &g.worker,
+                IterWorkerSel::ChunkedPrefill {
+                    prefix_tier_warm_start: true,
+                    ..
+                }
+            ),
+            external_decode: matches!(
+                &g.worker,
+                IterWorkerSel::ChunkedPrefill {
+                    external_decode: true,
+                    ..
+                }
+            ),
+            force_schedule_after_ms: match &g.worker {
+                IterWorkerSel::ChunkedPrefill {
+                    force_schedule_after_ms,
+                    ..
+                } => *force_schedule_after_ms,
+                _ => 0.0,
+            },
             ..WorkerConfig::default()
         };
 
+        ensure!(
+            pool.placement != PlacementPolicy::LeastWorkAhead,
+            "unified: placement least-work-ahead is implemented only for the pp deployment"
+        );
         let dp_cfg = SimpleDpConfig {
             dp_pool: SimpleDpPoolConfig {
                 pool: PoolId(0),
@@ -924,6 +967,18 @@ fn prefill_chunk_alignment(worker: &IterWorkerSel) -> PrefillChunkAlignment {
     }
 }
 
+/// The `chunked_prefill` selector's per-request prefill cap (`0` is off); every
+/// other selector leaves only the batch budget.
+fn long_prefill_token_threshold(worker: &IterWorkerSel) -> Option<u32> {
+    match worker {
+        IterWorkerSel::ChunkedPrefill {
+            long_prefill_token_threshold,
+            ..
+        } => (*long_prefill_token_threshold > 0).then_some(*long_prefill_token_threshold),
+        _ => None,
+    }
+}
+
 /// Prefill-iteration multiplier of any co-located selector. The PD selectors do
 /// not carry it: every PD prefill iteration schedules prefill and no PD decode
 /// iteration does, so `gpu_time_multiplier` already expresses either stage.
@@ -1051,15 +1106,22 @@ where
             dp_cfg,
             build_hp_worker,
         )),
-        IterWorkerSel::ChunkedPrefill { .. } => Ok(assemble_flow(
-            model,
-            store,
-            worker_config,
-            log_dir,
-            gpu_name,
-            dp_cfg,
-            build_chunked_prefill_worker,
-        )),
+        IterWorkerSel::ChunkedPrefill { .. } => {
+            ensure!(
+                worker_config.prefix_tiers == [None, None] && !worker_config.external_decode,
+                "unified: {arch_name}: prefix tiers and external_decode need a hybrid arch's \
+                 chunked_prefill"
+            );
+            Ok(assemble_flow(
+                model,
+                store,
+                worker_config,
+                log_dir,
+                gpu_name,
+                dp_cfg,
+                build_chunked_prefill_worker,
+            ))
+        }
         other => bail!("unified: unsupported {arch_name} worker {other:?}"),
     }
 }
@@ -1099,6 +1161,9 @@ fn placement_into(p: PlacementPolicy) -> DpPlacementPolicy {
     match p {
         PlacementPolicy::LeastQueued => DpPlacementPolicy::LeastQueued,
         PlacementPolicy::RoundRobin => DpPlacementPolicy::RoundRobin,
+        PlacementPolicy::LeastWorkAhead => {
+            unreachable!("least-work-ahead is rejected before the pool is built")
+        }
     }
 }
 
@@ -1149,6 +1214,15 @@ mod tests {
             prefill_gpu_time_multiplier: None,
             dp_placement: DpPlacement::RoundRobin,
             prefill_chunk_alignment: PrefillChunkAlignment::Checkpoint,
+            long_prefill_token_threshold: 0,
+            pending_order: PendingOrderKind::Fifo,
+            dram_tier_gb: 0.0,
+            dram_tier_gb_per_s: 50.0,
+            ssd_tier_gb: 0.0,
+            ssd_tier_gb_per_s: 10.0,
+            prefix_tier_warm_start: false,
+            force_schedule_after_ms: 0.0,
+            external_decode: false,
         }
     }
 

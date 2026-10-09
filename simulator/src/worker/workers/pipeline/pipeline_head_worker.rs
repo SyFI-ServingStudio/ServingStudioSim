@@ -27,10 +27,19 @@
 //! - A head blocked on the in-flight window or on KV has no wakeup: only an exit
 //!   or a new request can unblock it, and L6 ticks it on every message.
 //!
+//! Prefix tiers. With DRAM/SSD tiers configured, the admission reads a session
+//! context back when the request reaches the head of its queue
+//! (`admission/prefix_fetch.rs`); the head lands those reads before it forms a
+//! microbatch and wakes when the next one lands. Every finished context is
+//! written through to the tiers. With `external_decode`, a request completes
+//! at its first token, as if a decode instance took it, and its whole target
+//! context is retained.
+//!
 //! Reading order: state types → struct → construction → `IterWorker` → message
-//! handlers → tick (exits, stage-0 completion, formation) → wakeup → tests.
+//! handlers → tick (exits, landed reads, stage-0 completion, formation) →
+//! wakeup → tests.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
 use crate::arch::contract::UnifiedArchInput;
@@ -38,7 +47,7 @@ use crate::common::{RequestId, Time, WorkerId};
 use crate::worker::admission::MicrobatchAdmission;
 use crate::worker::execution::IterModelExecution;
 use crate::worker::iter_worker::IterWorker;
-use crate::worker::kv::IterWorkerKv;
+use crate::worker::kv::{IterWorkerKv, PrefixKv};
 use crate::worker::shared::context::WorkerContext;
 use crate::worker::types::{
     IterBatchPlan, PipelineHeadEvent, PipelineHeadMsg, PipelineMicrobatch, WorkerStatus,
@@ -53,6 +62,10 @@ pub struct PipelineLayout {
     /// the same blocks, so the stage with the most bytes per token bounds the
     /// pipeline's token capacity.
     pub kv_bytes_per_token: u64,
+    /// Bytes per token each GPU reads from a DRAM/SSD tier: the most loaded
+    /// stage's (`kv_bytes_per_token`), or the stages' mean when tier loads
+    /// are assumed balanced (`prefix_tier_balanced_load`).
+    pub tier_kv_bytes_per_token: u64,
     /// Bytes one token's activations occupy between two stages.
     pub activation_bytes_per_token: u64,
 }
@@ -64,7 +77,7 @@ struct ComputingMicrobatch {
 
 pub struct PipelineHeadWorker<K, A, E>
 where
-    K: IterWorkerKv,
+    K: IterWorkerKv + PrefixKv,
     A: MicrobatchAdmission<K>,
     E: IterModelExecution<K, Input = UnifiedArchInput>,
 {
@@ -90,11 +103,16 @@ where
     /// microbatch forms and starts here, not on the tick grid.
     state_changed_at: Time,
     completed: Vec<RequestId>,
+    /// Whether the admission reads from DRAM/SSD tiers (finished contexts
+    /// are then written through).
+    prefix_tiers: bool,
+    /// `external_decode`: each running request's target output tokens.
+    external_outputs: Option<HashMap<RequestId, u32>>,
 }
 
 impl<K, A, E> PipelineHeadWorker<K, A, E>
 where
-    K: IterWorkerKv,
+    K: IterWorkerKv + PrefixKv,
     A: MicrobatchAdmission<K>,
     E: IterModelExecution<K, Input = UnifiedArchInput>,
 {
@@ -129,7 +147,21 @@ where
             request_arrived: false,
             state_changed_at: Time::ZERO,
             completed: Vec::new(),
+            prefix_tiers: false,
+            external_outputs: None,
         }
+    }
+
+    /// The admission was built with a `PrefixFetch`: write every finished
+    /// context through to its tiers.
+    pub(super) fn with_prefix_tiers(mut self) -> Self {
+        self.prefix_tiers = true;
+        self
+    }
+
+    pub(super) fn with_external_decode(mut self) -> Self {
+        self.external_outputs = Some(HashMap::new());
+        self
     }
 
     pub fn send_gid(&self) -> u16 {
@@ -139,7 +171,7 @@ where
 
 impl<K, A, E> IterWorker for PipelineHeadWorker<K, A, E>
 where
-    K: IterWorkerKv,
+    K: IterWorkerKv + PrefixKv,
     A: MicrobatchAdmission<K>,
     E: IterModelExecution<K, Input = UnifiedArchInput>,
 {
@@ -165,7 +197,7 @@ where
 
     fn status(&self) -> WorkerStatus {
         WorkerStatus {
-            queued_requests: self.admission.queued_requests(),
+            queued_requests: self.admission.queued_requests() + self.admission.reading_requests(),
             active_requests: self.kv_store.status_active(0),
         }
     }
@@ -173,14 +205,56 @@ where
 
 impl<K, A, E> PipelineHeadWorker<K, A, E>
 where
-    K: IterWorkerKv,
+    K: IterWorkerKv + PrefixKv,
     A: MicrobatchAdmission<K>,
     E: IterModelExecution<K, Input = UnifiedArchInput>,
 {
+    /// Hand the request to decode elsewhere after its first token, and queue it.
     fn on_msg_request(&mut self, request: RequestId) {
+        if let Some(outputs) = &mut self.external_outputs {
+            let mut store = self.context.requests.borrow_mut();
+            let definition = &mut store[request].request.definition;
+            outputs.insert(request, definition.target_output_tokens);
+            definition.target_output_tokens = 1;
+        }
         self.admission
             .accept_request(&mut self.kv_store, request, &self.context);
         self.request_arrived = true;
+    }
+
+    /// Retain a finished request's whole context: hand a decode-elsewhere
+    /// context back to HBM and write it through to the tiers.
+    fn on_request_complete(&mut self, request: RequestId, at: Time) {
+        let external_outputs = self
+            .external_outputs
+            .as_mut()
+            .and_then(|outputs| outputs.remove(&request));
+        if !self.prefix_tiers && external_outputs.is_none_or(|outputs| outputs <= 1) {
+            return;
+        }
+        let (session_input, context_tokens) = {
+            let store = self.context.requests.borrow();
+            let definition = &store[request].request.definition;
+            let outputs = external_outputs.unwrap_or(definition.target_output_tokens);
+            // The last output token has no KV yet: the next round computes it.
+            (
+                definition.session,
+                u64::from(definition.session.declared_prefix_tokens())
+                    + u64::from(definition.prompt_tokens)
+                    + u64::from(outputs.saturating_sub(1)),
+            )
+        };
+        let Some(session_id) = session_input.session_id() else {
+            return;
+        };
+        if external_outputs.is_some_and(|outputs| outputs > 1) {
+            self.kv_store
+                .restore_prefix(request, 0, session_id, context_tokens, at);
+        }
+        if self.prefix_tiers {
+            self.admission
+                .store_session_context(0, session_id, context_tokens);
+        }
     }
 
     fn on_msg_microbatch_exit(&mut self, microbatch: u64, at: Time) {
@@ -194,6 +268,9 @@ where
         // Exits first: they release KV the next formation may need, and their
         // times precede the formation's, so KV samples stay in time order.
         self.complete_exited_microbatches(events);
+        if let Some(landed) = self.admission.land_prefix_reads(&mut self.kv_store, now) {
+            self.state_changed_at = self.state_changed_at.max(landed);
+        }
         loop {
             let mut progressed = false;
             if self
@@ -252,14 +329,13 @@ where
                 at,
             );
             self.state_changed_at = self.state_changed_at.max(at);
-            events.extend(
-                self.completed
-                    .drain(..)
-                    .map(|req| PipelineHeadEvent::RequestComplete {
-                        worker: self.context.id,
-                        req,
-                    }),
-            );
+            for req in std::mem::take(&mut self.completed) {
+                self.on_request_complete(req, at);
+                events.push(PipelineHeadEvent::RequestComplete {
+                    worker: self.context.id,
+                    req,
+                });
+            }
         }
     }
 
@@ -296,9 +372,15 @@ where
     }
 
     fn next_wakeup(&self) -> Option<Time> {
-        self.computing
+        let load = self.admission.next_prefix_read();
+        let compute = self
+            .computing
             .as_ref()
-            .map(|computing| computing.compute_end)
+            .map(|computing| computing.compute_end);
+        match (compute, load) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
     }
 }
 
@@ -332,6 +414,7 @@ mod tests {
     const LAYOUT: PipelineLayout = PipelineLayout {
         depth: 2,
         kv_bytes_per_token: 2,
+        tier_kv_bytes_per_token: 2,
         activation_bytes_per_token: 4,
     };
 
@@ -565,7 +648,7 @@ mod tests {
         store: SharedRequests,
         max_batch_tokens: u32,
         attn_kv_bytes: u64,
-        block_aligned_chunks: bool,
+        align_mode: bool,
     ) -> crate::worker::workers::pipeline::HybridPipelineHead<FakeModel> {
         use crate::worker::kv::{PrefixCacheConfig, PrefixCachePolicy};
         use crate::worker::workers::pipeline::{
@@ -580,7 +663,7 @@ mod tests {
             PipelineHybridState {
                 block_tokens: 4,
                 state_blocks_per_request: 2,
-                block_aligned_chunks,
+                align_mode,
             },
             store,
             WorkerConfig {
@@ -605,7 +688,7 @@ mod tests {
         let hybrid = PipelineHybridState {
             block_tokens: 4,
             state_blocks_per_request: 2,
-            block_aligned_chunks: true,
+            align_mode: true,
         };
         // 80 bytes / 8 per block = 10 blocks, less vLLM's null block.
         assert_eq!(hybrid.capacity_tokens(&LAYOUT, 80), 36);
@@ -674,9 +757,9 @@ mod tests {
 
     /// Chunk sizes a hybrid head launches for one 10-token prompt at budget 6
     /// with 4-token blocks.
-    fn hybrid_chunks(block_aligned_chunks: bool) -> Vec<u64> {
+    fn hybrid_chunks(align_mode: bool) -> Vec<u64> {
         let store = shared_with(&[(0, 10, 1)]);
-        let mut worker = hybrid_head(Rc::clone(&store), 6, 1_000, block_aligned_chunks);
+        let mut worker = hybrid_head(Rc::clone(&store), 6, 1_000, align_mode);
         worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
         let mut events = Vec::new();
         for step in 0..6 {
@@ -858,5 +941,787 @@ mod tests {
         assert_eq!(balanced.iter().sum::<usize>(), greedy.iter().sum::<usize>());
         assert_eq!(greedy_done.len(), 4);
         assert_eq!(balanced_done.len(), 4);
+    }
+
+    /// A four-stage head with `max_batch_tokens` 2048 and the given sizing.
+    fn depth4_head(
+        store: SharedRequests,
+        microbatch_sizing: crate::worker::config::MicrobatchSizing,
+    ) -> PipelineHead<FakeModel> {
+        build_pipeline_head_worker(
+            WorkerId(0),
+            "stage",
+            Arc::new(FakeModel::for_ms(1.0)),
+            PipelineLayout { depth: 4, ..LAYOUT },
+            store,
+            WorkerConfig {
+                max_batch_tokens: Some(2048),
+                attn_kv_bytes: 1_000_000,
+                microbatch_sizing,
+                ..WorkerConfig::default()
+            },
+            None,
+            PoolId(0),
+            "test-gpu",
+            test_cluster(),
+        )
+    }
+
+    /// Prefill tokens of each launched microbatch, in order.
+    fn launched_tokens(events: &[PipelineHeadEvent]) -> Vec<u64> {
+        launched(events)
+            .into_iter()
+            .map(|(_, tokens, _)| tokens)
+            .collect()
+    }
+
+    #[test]
+    fn greedy_sizing_fills_each_microbatch_to_the_cap() {
+        use crate::worker::config::MicrobatchSizing;
+        let store = shared_with(&[(0, 3000, 1)]);
+        let mut worker = depth4_head(Rc::clone(&store), MicrobatchSizing::Greedy);
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
+        let mut events = Vec::new();
+        for step in 0..6 {
+            worker.tick(Time::from_ms(step as f64), &mut events);
+        }
+        assert_eq!(launched_tokens(&events), vec![2048, 952]);
+    }
+
+    #[test]
+    fn even_sizing_slices_one_prompt_into_depth_equal_pieces() {
+        use crate::worker::config::MicrobatchSizing;
+        let store = shared_with(&[(0, 3000, 1)]);
+        let mut worker = depth4_head(Rc::clone(&store), MicrobatchSizing::Even { min_tokens: 0 });
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
+        let mut events = Vec::new();
+        for step in 0..6 {
+            worker.tick(Time::from_ms(step as f64), &mut events);
+        }
+        // In-flight tokens count toward the round, so each slice stays P / 4
+        // instead of shrinking as P/4, 3P/16, ...
+        assert_eq!(launched_tokens(&events), vec![750, 750, 750, 750]);
+    }
+
+    #[test]
+    fn even_sizing_counts_in_flight_tokens_when_new_work_arrives() {
+        use crate::worker::config::MicrobatchSizing;
+        let store = shared_with(&[(0, 400, 1), (1, 1200, 1)]);
+        let mut worker = depth4_head(Rc::clone(&store), MicrobatchSizing::Even { min_tokens: 0 });
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
+        let mut events = Vec::new();
+        worker.tick(Time::ZERO, &mut events);
+        worker.tick(Time::from_ms(1.0), &mut events);
+        // Two slices of 100 are in flight and 200 tokens pending when 1200 more
+        // arrive: the round is 1600, so every later slice is 400.
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(1)));
+        for step in 2..8 {
+            worker.tick(Time::from_ms(step as f64), &mut events);
+        }
+        assert_eq!(launched_tokens(&events), vec![100, 100, 400, 400]);
+        assert_eq!(worker.in_flight.len(), 4);
+    }
+
+    #[test]
+    fn even_sizing_floor_takes_a_short_prompt_whole_and_never_waits() {
+        use crate::worker::config::MicrobatchSizing;
+        let store = shared_with(&[(0, 100, 1), (1, 10, 1)]);
+        let mut worker = depth4_head(
+            Rc::clone(&store),
+            MicrobatchSizing::Even { min_tokens: 1024 },
+        );
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
+        let mut events = Vec::new();
+        worker.tick(Time::ZERO, &mut events);
+        // A later 10-token prompt starts as soon as stage 0 is free, below the
+        // floor and with work in flight: the floor sizes, it never holds.
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(1)));
+        worker.tick(Time::from_ms(0.5), &mut events);
+        worker.tick(Time::from_ms(2.0), &mut events);
+        assert_eq!(
+            launched(&events),
+            vec![(1, 100, Time::from_ms(1.0)), (2, 10, Time::from_ms(2.0))]
+        );
+    }
+
+    /// A four-stage greedy head, cap 2048, whose requests take at most
+    /// `threshold` prefill tokens per microbatch.
+    fn depth4_head_with_threshold(
+        store: SharedRequests,
+        microbatch_sizing: crate::worker::config::MicrobatchSizing,
+        threshold: u32,
+    ) -> PipelineHead<FakeModel> {
+        build_pipeline_head_worker(
+            WorkerId(0),
+            "stage",
+            Arc::new(FakeModel::for_ms(1.0)),
+            PipelineLayout { depth: 4, ..LAYOUT },
+            store,
+            WorkerConfig {
+                max_batch_tokens: Some(2048),
+                attn_kv_bytes: 1_000_000,
+                microbatch_sizing,
+                long_prefill_token_threshold: Some(threshold),
+                ..WorkerConfig::default()
+            },
+            None,
+            PoolId(0),
+            "test-gpu",
+            test_cluster(),
+        )
+    }
+
+    #[test]
+    fn long_prefill_threshold_leaves_budget_for_a_short_prompt_behind_a_long_one() {
+        use crate::worker::config::MicrobatchSizing;
+        let store = shared_with(&[(0, 3000, 1), (1, 100, 1)]);
+        let mut worker =
+            depth4_head_with_threshold(Rc::clone(&store), MicrobatchSizing::Greedy, 512);
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(1)));
+        let mut events = Vec::new();
+        for step in 0..6 {
+            worker.tick(Time::from_ms(step as f64), &mut events);
+        }
+        // Without the cap the long prompt takes all 2048 and the short one waits
+        // for the next microbatch; with it both start in the first.
+        assert_eq!(launched_tokens(&events), vec![612, 512, 512, 512]);
+    }
+
+    /// Each launched microbatch's prefill chunk lengths, sorted.
+    fn launched_chunk_lengths(events: &[PipelineHeadEvent]) -> Vec<Vec<u32>> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                PipelineHeadEvent::MicrobatchLaunched { microbatch, .. } => {
+                    let mut lengths: Vec<u32> = microbatch.input.groups[0]
+                        .prefill_chunk_pairs
+                        .iter()
+                        .map(|&(_, length)| length)
+                        .collect();
+                    lengths.sort_unstable();
+                    Some(lengths)
+                }
+                PipelineHeadEvent::RequestComplete { .. } => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_load_budget_follows_queued_and_in_flight_tokens() {
+        use crate::worker::config::MicrobatchSizing;
+        use crate::worker::types::PipelineLoadBudget;
+        let store = shared_with(&[(0, 3000, 1)]);
+        let mut worker = build_pipeline_head_worker(
+            WorkerId(0),
+            "stage",
+            Arc::new(FakeModel::for_ms(1.0)),
+            PipelineLayout { depth: 4, ..LAYOUT },
+            store,
+            WorkerConfig {
+                max_batch_tokens: Some(2048),
+                attn_kv_bytes: 1_000_000,
+                microbatch_sizing: MicrobatchSizing::Greedy,
+                load_budget: Some(PipelineLoadBudget {
+                    low_tokens: 512,
+                    backlog_lo_tokens: 1000,
+                    backlog_hi_tokens: 5000,
+                }),
+                ..WorkerConfig::default()
+            },
+            None,
+            PoolId(0),
+            "test-gpu",
+            test_cluster(),
+        );
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
+        let mut events = Vec::new();
+        for step in 0..5 {
+            worker.tick(Time::from_ms(step as f64), &mut events);
+        }
+        // Backlog 3000 tokens (queued, then started plus in flight) is halfway
+        // from 1000 to 5000: the budget sits halfway from 512 to 2048.
+        assert_eq!(launched_tokens(&events), vec![1280, 1280, 440]);
+    }
+
+    #[test]
+    fn srpt_orders_started_and_queued_prompts_by_remaining_tokens() {
+        use crate::worker::admission::PendingOrderKind;
+        use crate::worker::config::MicrobatchSizing;
+        let store = shared_with(&[(0, 2156, 1), (1, 10_000, 1), (2, 500, 1)]);
+        let mut worker = build_pipeline_head_worker(
+            WorkerId(0),
+            "stage",
+            Arc::new(FakeModel::for_ms(1.0)),
+            PipelineLayout { depth: 4, ..LAYOUT },
+            store,
+            WorkerConfig {
+                max_batch_tokens: Some(2048),
+                attn_kv_bytes: 1_000_000,
+                microbatch_sizing: MicrobatchSizing::Greedy,
+                pending_order: PendingOrderKind::ShortestPrefillFirst,
+                srpt: true,
+                ..WorkerConfig::default()
+            },
+            None,
+            PoolId(0),
+            "test-gpu",
+            test_cluster(),
+        );
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
+        let mut events = Vec::new();
+        worker.tick(Time::ZERO, &mut events);
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(1)));
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(2)));
+        for step in 1..4 {
+            worker.tick(Time::from_ms(step as f64), &mut events);
+        }
+        // Prompt 0's 108-token tail beats the queued 500, which beats the
+        // queued 10000; that one takes the rest and then runs alone.
+        assert_eq!(
+            launched_chunk_lengths(&events),
+            vec![vec![2048], vec![108, 500, 1440], vec![2048]]
+        );
+    }
+
+    /// A 10k-token prompt queued at 0 ms behind one 2048-token prompt arriving
+    /// every ms, each filling a microbatch under SPF + srpt; returns the long
+    /// prompt's prefill tokens processed by 12 ms.
+    fn starved_prompt_progress(force_schedule_after_ms: f64) -> u32 {
+        use crate::worker::admission::PendingOrderKind;
+        use crate::worker::config::MicrobatchSizing;
+        let mut requests = vec![(0, 10_000, 1)];
+        requests.extend((1..=12).map(|id| (id, 2048, 1)));
+        let store = shared_with(&requests);
+        for id in 1..=12 {
+            store.borrow_mut()[RequestId(id)].request.core.arrival_time =
+                Time::from_ms(f64::from(id - 1));
+        }
+        let mut worker = build_pipeline_head_worker(
+            WorkerId(0),
+            "stage",
+            Arc::new(FakeModel::for_ms(1.0)),
+            PipelineLayout { depth: 4, ..LAYOUT },
+            Rc::clone(&store),
+            WorkerConfig {
+                max_batch_tokens: Some(2048),
+                attn_kv_bytes: 1_000_000,
+                microbatch_sizing: MicrobatchSizing::Greedy,
+                pending_order: PendingOrderKind::ShortestPrefillFirst,
+                srpt: true,
+                force_schedule_after_ms,
+                ..WorkerConfig::default()
+            },
+            None,
+            PoolId(0),
+            "test-gpu",
+            test_cluster(),
+        );
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
+        let mut exits: Vec<(u64, Time)> = Vec::new();
+        for step in 0..12_u32 {
+            let start = Time::from_ms(f64::from(step));
+            let end = Time::from_ms(f64::from(step + 1));
+            worker.enqueue(PipelineHeadMsg::Request(RequestId(step + 1)));
+            let mut now = start;
+            loop {
+                exits.retain(|&(microbatch, at)| {
+                    let due = at <= now;
+                    if due {
+                        worker.enqueue(PipelineHeadMsg::MicrobatchExit { microbatch, at });
+                    }
+                    !due
+                });
+                let mut events = Vec::new();
+                let wakeup = worker.tick(now, &mut events);
+                for (id, _, ready) in launched(&events) {
+                    exits.push((id, ready + Time::from_ms(1.0)));
+                }
+                let next = [wakeup, exits.iter().map(|&(_, at)| at).min()]
+                    .into_iter()
+                    .flatten()
+                    .min();
+                match next {
+                    Some(next) if next > now && next < end => now = next,
+                    _ => break,
+                }
+            }
+        }
+        let progress = store.borrow()[RequestId(0)]
+            .progress
+            .prefill_tokens_processed;
+        progress
+    }
+
+    #[test]
+    fn a_request_waiting_past_the_force_bound_runs_before_shorter_ones() {
+        // SPF + srpt alone: every microbatch goes to a newer, shorter prompt.
+        assert_eq!(starved_prompt_progress(0.0), 0);
+        // Overdue at 5 ms, it takes whole microbatches from then on: at least
+        // three have left the pipeline by 12 ms.
+        assert!(
+            starved_prompt_progress(5.0) >= 3 * 2048,
+            "progress {}",
+            starved_prompt_progress(5.0)
+        );
+    }
+
+    #[test]
+    fn long_prefill_threshold_caps_the_even_target_per_request() {
+        use crate::worker::config::MicrobatchSizing;
+        let store = shared_with(&[(0, 8000, 1)]);
+        let mut worker = depth4_head_with_threshold(
+            Rc::clone(&store),
+            MicrobatchSizing::Even { min_tokens: 0 },
+            1000,
+        );
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
+        let mut events = Vec::new();
+        for step in 0..6 {
+            worker.tick(Time::from_ms(step as f64), &mut events);
+        }
+        // The even target is 2000 (8000 / 4); one request may take only 1000.
+        assert_eq!(launched_tokens(&events), vec![1000, 1000, 1000, 1000]);
+    }
+
+    // ── Prefix tiers and decode elsewhere ────────────────────────────────────
+
+    fn as_session(
+        store: &SharedRequests,
+        id: u32,
+        session_id: u32,
+        declared: u32,
+        arrival_ms: f64,
+    ) {
+        let mut store = store.borrow_mut();
+        let request = &mut store[RequestId(id)].request;
+        request.definition.session = SessionInput::Session {
+            session_id,
+            session_start_time: Time::ZERO,
+            declared_prefix_tokens: declared,
+        };
+        request.core.arrival_time = Time::from_ms(arrival_ms);
+    }
+
+    /// Tick at every wakeup and stage-1 exit (1 ms after stage 0) up to `until`.
+    fn run_until(
+        worker: &mut PipelineHead<FakeModel>,
+        from: Time,
+        until: Time,
+        events: &mut Vec<PipelineHeadEvent>,
+    ) {
+        let mut exits: Vec<(u64, Time)> = Vec::new();
+        let mut now = from;
+        while now <= until {
+            let mut fresh = Vec::new();
+            let wakeup = worker.tick(now, &mut fresh);
+            for (id, _, ready) in launched(&fresh) {
+                exits.push((id, ready + Time::from_ms(1.0)));
+            }
+            events.extend(fresh);
+            let next_exit = exits.iter().map(|&(_, at)| at).min();
+            let next = [wakeup, next_exit].into_iter().flatten().min();
+            let Some(next) = next else { break };
+            if let Some(index) = exits.iter().position(|&(_, at)| at == next) {
+                let (microbatch, at) = exits.remove(index);
+                worker.enqueue(PipelineHeadMsg::MicrobatchExit { microbatch, at });
+            }
+            now = next.max(now);
+        }
+    }
+
+    fn tiered_head(store: SharedRequests, external_decode: bool) -> PipelineHead<FakeModel> {
+        tiered_head_with(store, external_decode, false)
+    }
+
+    fn tiered_head_with(
+        store: SharedRequests,
+        external_decode: bool,
+        warm_start: bool,
+    ) -> PipelineHead<FakeModel> {
+        // 2 B/token, 120 tokens of HBM. DRAM: 500 tokens read at 1e5 B/s, so
+        // 50 tokens take 1 ms.
+        head_with(
+            store,
+            WorkerConfig {
+                prefix_tier_warm_start: warm_start,
+                max_batch_tokens: Some(64),
+                attn_kv_bytes: 240,
+                prefix_tiers: [
+                    Some(crate::worker::kv::PrefixTierSpec {
+                        name: "dram",
+                        capacity_gb_per_gpu: 1e-6,
+                        read_gb_per_s_per_gpu: 1e-4,
+                    }),
+                    None,
+                ],
+                external_decode,
+                ..WorkerConfig::default()
+            },
+        )
+    }
+
+    #[test]
+    fn a_session_evicted_from_hbm_reads_its_context_back_from_dram_first() {
+        // Session 7 round 0 (50 tokens), then a 100-token prompt that evicts it
+        // from HBM, then round 1 declaring the 51-token context, whose first 50
+        // have KV in DRAM (the output's KV is round 1's to compute).
+        let store = shared_with(&[(0, 50, 1), (1, 100, 1), (2, 4, 1)]);
+        as_session(&store, 0, 7, 0, 0.0);
+        as_session(&store, 2, 7, 51, 10.0);
+        let mut worker = tiered_head(Rc::clone(&store), false);
+        let mut events = Vec::new();
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
+        run_until(&mut worker, Time::ZERO, Time::from_ms(3.0), &mut events);
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(1)));
+        run_until(
+            &mut worker,
+            Time::from_ms(3.0),
+            Time::from_ms(9.0),
+            &mut events,
+        );
+        assert_eq!(completed(&events), vec![RequestId(0), RequestId(1)]);
+
+        events.clear();
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(2)));
+        assert_eq!(
+            worker.tick(Time::from_ms(10.0), &mut events),
+            Some(Time::from_ms(11.0))
+        );
+        assert_eq!(worker.status().queued_requests, 1);
+        assert!(events.is_empty());
+        run_until(
+            &mut worker,
+            Time::from_ms(11.0),
+            Time::from_ms(20.0),
+            &mut events,
+        );
+        let pairs: Vec<(u32, u32)> = events
+            .iter()
+            .filter_map(|event| match event {
+                PipelineHeadEvent::MicrobatchLaunched { microbatch, .. } => {
+                    Some(microbatch.input.groups[0].prefill_chunk_pairs.clone())
+                }
+                PipelineHeadEvent::RequestComplete { .. } => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(pairs, [(50, 5)]);
+        let store = store.borrow();
+        let record = &store[RequestId(2)];
+        assert_eq!(record.telemetry.prefix_cache_hit_tokens, Some(50));
+        assert_eq!(record.lifecycle.completed, true);
+    }
+
+    #[test]
+    fn decode_elsewhere_completes_at_the_first_token_and_retains_the_outputs() {
+        // Round 0 has 5 target outputs; round 1 declares all 55 tokens and
+        // finds the 54 with KV in HBM (the last output's KV is round 1's to
+        // compute).
+        let store = shared_with(&[(0, 50, 5), (1, 4, 5)]);
+        as_session(&store, 0, 7, 0, 0.0);
+        as_session(&store, 1, 7, 55, 10.0);
+        let mut worker = tiered_head(Rc::clone(&store), true);
+        let mut events = Vec::new();
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
+        run_until(&mut worker, Time::ZERO, Time::from_ms(9.0), &mut events);
+        assert_eq!(completed(&events), vec![RequestId(0)]);
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(1)));
+        run_until(
+            &mut worker,
+            Time::from_ms(10.0),
+            Time::from_ms(20.0),
+            &mut events,
+        );
+        assert_eq!(completed(&events), vec![RequestId(0), RequestId(1)]);
+        let store = store.borrow();
+        assert_eq!(store[RequestId(0)].progress.output_tokens_emitted, 1);
+        assert_eq!(
+            store[RequestId(1)].telemetry.prefix_cache_hit_tokens,
+            Some(54)
+        );
+    }
+
+    #[test]
+    fn a_context_evicted_while_queued_is_read_when_admission_reaches_it() {
+        // Round 1 of session 7 arrives while HBM still holds round 0's 50
+        // tokens, behind a 100-token prompt of session 8 whose admission evicts
+        // them. The read starts when round 1 reaches the head, not at arrival,
+        // so it still finds its context; HBM alone recomputes it.
+        for (tiers, hit) in [(true, 50), (false, 0)] {
+            let store = shared_with(&[(0, 50, 1), (1, 100, 1), (2, 4, 1)]);
+            as_session(&store, 0, 7, 0, 0.0);
+            as_session(&store, 1, 8, 0, 4.0);
+            as_session(&store, 2, 7, 51, 4.0);
+            let mut worker = if tiers {
+                tiered_head(Rc::clone(&store), false)
+            } else {
+                head_with(
+                    Rc::clone(&store),
+                    WorkerConfig {
+                        max_batch_tokens: Some(64),
+                        attn_kv_bytes: 240,
+                        ..WorkerConfig::default()
+                    },
+                )
+            };
+            let mut events = Vec::new();
+            worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
+            run_until(&mut worker, Time::ZERO, Time::from_ms(3.0), &mut events);
+            let round1 = store.borrow()[RequestId(2)].request.definition.session;
+            assert_eq!(worker.kv_store.resident_prefix_tokens(4, round1), 50);
+            worker.enqueue(PipelineHeadMsg::Request(RequestId(1)));
+            worker.enqueue(PipelineHeadMsg::Request(RequestId(2)));
+            run_until(
+                &mut worker,
+                Time::from_ms(4.0),
+                Time::from_ms(60.0),
+                &mut events,
+            );
+            assert_eq!(
+                completed(&events),
+                vec![RequestId(0), RequestId(1), RequestId(2)]
+            );
+            assert_eq!(
+                store.borrow()[RequestId(2)]
+                    .telemetry
+                    .prefix_cache_hit_tokens,
+                Some(hit),
+                "tiers={tiers}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_read_waits_until_its_request_fits_in_hbm_and_holds_it() {
+        // HBM holds 120 tokens. A 60-token prompt runs while session 7 (70
+        // pre-run tokens in the tier, 4 fresh) reaches the head with budget
+        // left: its 74 tokens do not fit beside the prompt, so its read starts
+        // only once the prompt leaves, as vLLM allocates an async load's
+        // blocks before starting it.
+        let store = shared_with(&[(0, 60, 1), (1, 4, 1)]);
+        as_session(&store, 0, 8, 0, 0.0);
+        as_session(&store, 1, 7, 70, 0.0);
+        let mut worker = tiered_head_with(Rc::clone(&store), false, true);
+        let mut events = Vec::new();
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(1)));
+        run_until(&mut worker, Time::ZERO, Time::from_ms(60.0), &mut events);
+        assert_eq!(completed(&events), vec![RequestId(0), RequestId(1)]);
+        assert_eq!(
+            store.borrow()[RequestId(1)]
+                .telemetry
+                .prefix_cache_hit_tokens,
+            Some(70)
+        );
+        // The prompt's microbatch leaves 1 ms after launch; the 70-token read
+        // (1.4 ms) starts then, and session 7 launches once it lands.
+        let launches = launched(&events);
+        assert_eq!(launches.len(), 2, "{launches:?}");
+        assert!(
+            launches[1].2 >= launches[0].2 + Time::from_ms(2.4),
+            "{launches:?}"
+        );
+    }
+
+    #[test]
+    fn a_landed_read_is_admitted_before_a_queue_head_that_cannot_start_its_read() {
+        // Shortest prefill first, 120 tokens of HBM. Session 7 (40 pre-run
+        // tokens, 4 fresh) starts its read and holds 45 tokens. Session 9 (80
+        // pre-run, 2 fresh) then ranks first but cannot start its read beside
+        // that hold. Session 7's landed read goes first, as vLLM schedules
+        // loaded requests before its waiting queue; otherwise neither moves.
+        let store = shared_with(&[(0, 4, 1), (1, 2, 1)]);
+        as_session(&store, 0, 7, 40, 0.0);
+        as_session(&store, 1, 9, 80, 0.1);
+        let mut worker = head_with(
+            Rc::clone(&store),
+            WorkerConfig {
+                pending_order: crate::worker::admission::PendingOrderKind::ShortestPrefillFirst,
+                prefix_tier_warm_start: true,
+                max_batch_tokens: Some(64),
+                attn_kv_bytes: 240,
+                prefix_tiers: [
+                    Some(crate::worker::kv::PrefixTierSpec {
+                        name: "dram",
+                        capacity_gb_per_gpu: 1e-6,
+                        read_gb_per_s_per_gpu: 1e-4,
+                    }),
+                    None,
+                ],
+                ..WorkerConfig::default()
+            },
+        );
+        let mut events = Vec::new();
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
+        run_until(&mut worker, Time::ZERO, Time::from_ms(0.1), &mut events);
+        worker.enqueue(PipelineHeadMsg::Request(RequestId(1)));
+        run_until(
+            &mut worker,
+            Time::from_ms(0.1),
+            Time::from_ms(60.0),
+            &mut events,
+        );
+        assert_eq!(completed(&events), vec![RequestId(0), RequestId(1)]);
+        for (request, hit) in [(0, 40), (1, 80)] {
+            assert_eq!(
+                store.borrow()[RequestId(request)]
+                    .telemetry
+                    .prefix_cache_hit_tokens,
+                Some(hit)
+            );
+        }
+    }
+
+    #[test]
+    fn a_read_waits_in_its_queue_while_its_tier_is_past_the_read_wait_bound() {
+        // Session 7's 40-token read keeps the DRAM channel busy until 0.8 ms.
+        // Session 9 (20 pre-run tokens) reaches the head at 0.1 ms: unbounded,
+        // its read queues behind (and holds HBM); with a 0.5 ms bound it waits
+        // in its queue until the channel drains. Both land the same: the
+        // channel is FIFO.
+        for (bound_ms, reading_at_0_2) in [(0.0, 2), (0.5, 1)] {
+            let store = shared_with(&[(0, 4, 1), (1, 2, 1)]);
+            as_session(&store, 0, 7, 40, 0.0);
+            as_session(&store, 1, 9, 20, 0.1);
+            let mut worker = head_with(
+                Rc::clone(&store),
+                WorkerConfig {
+                    prefix_tier_warm_start: true,
+                    prefix_tier_max_read_wait_ms: bound_ms,
+                    max_batch_tokens: Some(64),
+                    attn_kv_bytes: 240,
+                    prefix_tiers: [
+                        Some(crate::worker::kv::PrefixTierSpec {
+                            name: "dram",
+                            capacity_gb_per_gpu: 1e-6,
+                            read_gb_per_s_per_gpu: 1e-4,
+                        }),
+                        None,
+                    ],
+                    ..WorkerConfig::default()
+                },
+            );
+            let reading = |worker: &PipelineHead<FakeModel>| {
+                crate::worker::admission::MicrobatchAdmission::<crate::worker::kv::FullAttnKv>::reading_requests(
+                    &worker.admission,
+                )
+            };
+            let mut events = Vec::new();
+            worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
+            run_until(&mut worker, Time::ZERO, Time::from_ms(0.1), &mut events);
+            worker.enqueue(PipelineHeadMsg::Request(RequestId(1)));
+            run_until(
+                &mut worker,
+                Time::from_ms(0.1),
+                Time::from_ms(0.2),
+                &mut events,
+            );
+            assert_eq!(reading(&worker), reading_at_0_2, "bound {bound_ms}");
+            run_until(
+                &mut worker,
+                Time::from_ms(0.2),
+                Time::from_ms(60.0),
+                &mut events,
+            );
+            assert_eq!(completed(&events), vec![RequestId(0), RequestId(1)]);
+            for (request, hit) in [(0, 40), (1, 20)] {
+                assert_eq!(
+                    store.borrow()[RequestId(request)]
+                        .telemetry
+                        .prefix_cache_hit_tokens,
+                    Some(hit),
+                    "bound {bound_ms}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_request_past_the_read_wait_bound_is_passed_over_for_the_ones_behind() {
+        // Session 7's 40-token read keeps the DRAM channel busy until 0.8 ms.
+        // Session 9 reaches the head at 0.1 ms; request 2 behind it needs no
+        // read. Unbounded, session 9's read queues and request 2 follows it;
+        // with a 0.5 ms bound session 9 is passed over rather than stopping
+        // admission, so request 2 still runs at 0.1 ms (1 ms stage) instead of
+        // after the channel drains.
+        for bound_ms in [0.0, 0.5] {
+            let store = shared_with(&[(0, 4, 1), (1, 2, 1), (2, 8, 1)]);
+            as_session(&store, 0, 7, 40, 0.0);
+            as_session(&store, 1, 9, 20, 0.1);
+            let mut worker = head_with(
+                Rc::clone(&store),
+                WorkerConfig {
+                    prefix_tier_warm_start: true,
+                    prefix_tier_max_read_wait_ms: bound_ms,
+                    max_batch_tokens: Some(64),
+                    attn_kv_bytes: 240,
+                    prefix_tiers: [
+                        Some(crate::worker::kv::PrefixTierSpec {
+                            name: "dram",
+                            capacity_gb_per_gpu: 1e-6,
+                            read_gb_per_s_per_gpu: 1e-4,
+                        }),
+                        None,
+                    ],
+                    ..WorkerConfig::default()
+                },
+            );
+            let mut events = Vec::new();
+            worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
+            run_until(&mut worker, Time::ZERO, Time::from_ms(0.1), &mut events);
+            worker.enqueue(PipelineHeadMsg::Request(RequestId(1)));
+            worker.enqueue(PipelineHeadMsg::Request(RequestId(2)));
+            run_until(
+                &mut worker,
+                Time::from_ms(0.1),
+                Time::from_ms(60.0),
+                &mut events,
+            );
+            assert_eq!(
+                launched(&events)[0],
+                (1, 8, Time::from_ms(1.1)),
+                "bound {bound_ms}"
+            );
+            assert_eq!(
+                completed(&events),
+                vec![RequestId(2), RequestId(0), RequestId(1)],
+                "bound {bound_ms}"
+            );
+            assert_eq!(
+                store.borrow()[RequestId(1)]
+                    .telemetry
+                    .prefix_cache_hit_tokens,
+                Some(20),
+                "bound {bound_ms}"
+            );
+        }
+    }
+
+    #[test]
+    fn warm_start_reads_a_pre_run_context_from_the_slowest_tier() {
+        // A session's first request in the run declares 40 tokens: with warm
+        // start they come from the tier (0.8 ms), without it they are computed.
+        for (warm_start, hit, read_ms) in [(true, 40, 0.8), (false, 0, 0.0)] {
+            let store = shared_with(&[(0, 4, 1)]);
+            as_session(&store, 0, 7, 40, 0.0);
+            let mut worker = tiered_head_with(Rc::clone(&store), false, warm_start);
+            let mut events = Vec::new();
+            worker.enqueue(PipelineHeadMsg::Request(RequestId(0)));
+            run_until(&mut worker, Time::ZERO, Time::from_ms(20.0), &mut events);
+            assert_eq!(completed(&events), vec![RequestId(0)]);
+            assert_eq!(
+                store.borrow()[RequestId(0)]
+                    .telemetry
+                    .prefix_cache_hit_tokens,
+                Some(hit)
+            );
+            // Stage 0 starts once the read lands.
+            let launches = launched(&events);
+            assert!(
+                launches[0].2 > Time::from_ms(read_ms),
+                "warm_start={warm_start}: {launches:?}"
+            );
+        }
     }
 }

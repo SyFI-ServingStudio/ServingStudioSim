@@ -1,0 +1,88 @@
+# GLM-5.3-Flash NVFP4, PP5 on 5 x B200: the handoff's 16-minute check, full configuration (HBM + DRAM + SSD); read arrivals in [5, 15) min.
+# Run from the ServingStudioSim root after doc/handoff/glm53_flash_pp5/make_traces.sh:
+#   uv run python -m launcher doc/handoff/glm53_flash_pp5/pp5_16min.yaml --no-plot
+# Kernels: backends.yaml (the fastk path as per-role backends overrides). Scheduler and tiers: README.md section 7, scheduler.md.
+backends_file: backends.yaml
+deployment: pp
+
+workload:
+  trace_files: ${trace}
+  input_file_format: text-generation-session-execution-v2
+  # A closed loop of `conc` sessions (trace/session_closed_loop.py): the file's first `conc` sessions start in the
+  # renewal equilibrium (length-biased, joined mid-life with a cold context), and each finished session lets in the
+  # next. Rounds follow their predecessor by its tool wait plus its decode time (trace/session_decode_wait.py).
+  arrival_mode: saturated
+  max_concurrency: ${conc}
+  run_to_end: false
+  duration_ms: ${duration_ms}
+
+io:
+  log_dir: logs/glm53_flash_pp5/runs_16min/{load}
+
+pools:
+  stage:
+    groups:
+      - gpu: "NVIDIA B200"
+        replicas: 1
+        arch:
+          type: glm53_flash_vllm_nvfp4_pp_kda_dsa_moe
+          model_config: model/config/glm53_flash_nvfp4.json
+          fp8: false
+          pp_size: 5
+          max_model_len: 1048576
+          mla_layout_copies: false
+          indexer_max_logits_mb: 512
+          # Measured per-token routes (TP4/EP4 capture); routes are per token, so they fold to EP1.
+          routing: corpus
+          token_corpus_file: hf://datasets/UW-SyFI/servingstudio-workload@c3f5ecaab0bbff757c64864bf2ec24f5e1f76b5c/glm53_flash_fp8/vllm/balanced_c32/capture/20260924/manifest.json
+          # vLLM --max-cudagraph-capture-size 2048 as in the TP4 alignment pack; larger batches run eager.
+          cudagraph_capture_sizes: [1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136, 144, 152, 160, 168, 176, 184, 192, 200, 208, 216, 224, 232, 240, 248, 256, 272, 288, 304, 320, 336, 352, 368, 384, 400, 416, 432, 448, 464, 480, 496, 512, 528, 544, 560, 576, 592, 608, 624, 640, 656, 672, 688, 704, 720, 736, 752, 768, 784, 800, 816, 832, 848, 864, 880, 896, 912, 928, 944, 960, 976, 992, 1008, 1024, 1040, 1056, 1072, 1088, 1104, 1120, 1136, 1152, 1168, 1184, 1200, 1216, 1232, 1248, 1264, 1280, 1296, 1312, 1328, 1344, 1360, 1376, 1392, 1408, 1424, 1440, 1456, 1472, 1488, 1504, 1520, 1536, 1552, 1568, 1584, 1600, 1616, 1632, 1648, 1664, 1680, 1696, 1712, 1728, 1744, 1760, 1776, 1792, 1808, 1824, 1840, 1856, 1872, 1888, 1904, 1920, 1936, 1952, 1968, 1984, 2000, 2016, 2032, 2048]
+        worker:
+          type: pipeline_chunked_prefill
+          max_batch_tokens: ${max_batch_tokens}
+          gpu_time_multiplier: 1.0
+          # Plain chunking (min(remaining, budget)); no vLLM Mamba-align chunk ends.
+          prefill_chunk_alignment: plain
+          # The PP5 budget: vLLM's util-0.85 device budget 149.84 GB minus the largest stage's NVFP4 weights 40.88 GB.
+          attn_gpu_memory_gb: 108.96
+          # Decode runs elsewhere; its time is in the trace's tool waits.
+          external_decode: true
+          dram_tier_gb: ${dram_tier_gb}
+          dram_tier_gb_per_s: 50.0
+          ssd_tier_gb: ${ssd_tier_gb}
+          ssd_tier_gb_per_s: ${ssd_gb_per_s}
+          # A joining session's pre-run context sits in the slowest tier (closed-loop traces, placeholder round 0).
+          prefix_tier_warm_start: ${warm_start}
+          prefix_tier_max_read_wait_ms: 1000.0
+          prefix_tier_balanced_load: true
+          # Not vLLM: a request waiting 1 min since arrival goes before every other one.
+          force_schedule_after_ms: ${force_ms}
+          # The recommended scheduler (handoff scheduler.md).
+          microbatch_split: even
+          min_microbatch_tokens: 512
+          long_prefill_token_threshold: 0
+          pending_order: shortest-prefill-first
+          load_budget_backlog_hi_tokens: ${bl_hi}
+          load_budget_backlog_lo_tokens: ${bl_lo}
+          load_budget_low_tokens: ${bl_low}
+          srpt: true
+
+
+
+
+sweep:
+  duration_ms: [960000.0]
+  force_ms: [60000.0]
+compound:
+  tiers:
+    dram_ssd: {dram_tier_gb: 150.0, ssd_tier_gb: 8000.0, ssd_gb_per_s: 10.0, warm_start: true}
+  load:
+    c2000: {trace: [logs/glm53_flash_pp5/traces/closed16m_c2000.csv], conc: 2000}
+    c2500: {trace: [logs/glm53_flash_pp5/traces/closed16m_c2500.csv], conc: 2500}
+    c2656: {trace: [logs/glm53_flash_pp5/traces/closed16m_c2656.csv], conc: 2656}
+    c3000: {trace: [logs/glm53_flash_pp5/traces/closed16m_c3000.csv], conc: 3000}
+  mbt:
+    m32k: {max_batch_tokens: 32768}
+  budget:
+    bl1m3m: {bl_low: 4096, bl_lo: 1000000, bl_hi: 3000000}
+analyze_subjects: [utilization]

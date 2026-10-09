@@ -11,6 +11,7 @@ mod build_pd_prefill_worker;
 mod build_qwen36_hybrid_worker;
 mod build_speculative_worker;
 mod iter_batch_worker;
+mod session_tier_worker;
 
 pub(crate) use build_barebone_worker::build_barebone_worker;
 pub(crate) use build_chunked_prefill_worker::build_chunked_prefill_worker;

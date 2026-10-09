@@ -20,15 +20,15 @@ use crate::arch::IterArchSel;
 use crate::common::{Fabric, SharedRequests};
 use crate::deployment::config::PpConfig;
 use crate::orchestrator::{
-    DpPlacementPolicy, Flow, PlacementPolicy, PpFlow, PpStagePoolConfig, PP_STAGE_POOL,
+    Flow, PlacementPolicy, PpFlow, PpPlacement, PpStagePoolConfig, PP_STAGE_POOL,
 };
 use crate::timing::kernels::{P2pIntraKernel, P2pIntraKernelConfig};
 use crate::timing::PerfApiBridge;
 use crate::worker::{
     build_hybrid_pipeline_head_worker, build_pipeline_head_worker, build_pipeline_stage_worker,
-    resolve_prefix_cache_config, CostSource, IterWorker, IterWorkerSel, PendingOrderKind,
-    PipelineHeadEvent, PipelineHeadMsg, PipelineHybridState, PipelineLayout, PrefillChunkAlignment,
-    PrefixCacheMode, PrefixCachePolicy, WorkerConfig,
+    resolve_microbatch_sizing, resolve_prefix_cache_config, CostSource, IterWorker, IterWorkerSel,
+    PipelineHeadEvent, PipelineHeadMsg, PipelineHybridState, PipelineLayout, PipelineLoadBudget,
+    PrefillChunkAlignment, PrefixCacheMode, PrefixCachePolicy, WorkerConfig,
 };
 
 use super::Deployment;
@@ -60,8 +60,9 @@ impl Deployment for PpDeployment {
         let gpu_name = g.gpu.clone();
         let log_dir = Some(cfg.io.log_dir.clone());
         let placement = match pool.placement {
-            PlacementPolicy::LeastQueued => DpPlacementPolicy::LeastQueued,
-            PlacementPolicy::RoundRobin => DpPlacementPolicy::RoundRobin,
+            PlacementPolicy::LeastQueued => PpPlacement::LeastQueued,
+            PlacementPolicy::RoundRobin => PpPlacement::RoundRobin,
+            PlacementPolicy::LeastWorkAhead => PpPlacement::LeastWorkAhead,
         };
         let model_spec = g.arch.model();
         let _scope =
@@ -92,6 +93,12 @@ impl Deployment for PpDeployment {
                 let layout = PipelineLayout {
                     depth: pipeline.pp_size(),
                     kv_bytes_per_token: pipeline.pipeline_kv_bytes_per_token(),
+                    tier_kv_bytes_per_token: tier_kv_bytes_per_token(
+                        &g.worker,
+                        pipeline.pipeline_kv_bytes_per_token(),
+                        pipeline.total_kv_bytes_per_token(),
+                        pipeline.pp_size(),
+                    ),
                     activation_bytes_per_token: pipeline.activation_bytes_per_token(),
                 };
                 let head_model = Arc::clone(&pipeline.stages()[0]);
@@ -167,12 +174,18 @@ impl Deployment for PpDeployment {
                 let layout = PipelineLayout {
                     depth: pipeline.pp_size(),
                     kv_bytes_per_token: pipeline.pipeline_kv_bytes_per_token(),
+                    tier_kv_bytes_per_token: tier_kv_bytes_per_token(
+                        &g.worker,
+                        pipeline.pipeline_kv_bytes_per_token(),
+                        pipeline.total_kv_bytes_per_token(),
+                        pipeline.pp_size(),
+                    ),
                     activation_bytes_per_token: pipeline.activation_bytes_per_token(),
                 };
                 let hybrid = PipelineHybridState {
                     block_tokens: pipeline.block_tokens(),
                     state_blocks_per_request: pipeline.state_blocks_per_request(),
-                    block_aligned_chunks: matches!(
+                    align_mode: matches!(
                         g.worker,
                         IterWorkerSel::PipelineChunkedPrefill {
                             prefill_chunk_alignment: PrefillChunkAlignment::Checkpoint,
@@ -218,17 +231,57 @@ impl Deployment for PpDeployment {
     }
 }
 
+/// Bytes per token each stage reads from a tier: the most loaded stage's, or
+/// with `prefix_tier_balanced_load` the stages' mean (rounded up).
+fn tier_kv_bytes_per_token(
+    worker: &IterWorkerSel,
+    most_loaded: u64,
+    total: u64,
+    depth: u16,
+) -> u64 {
+    match worker {
+        IterWorkerSel::PipelineChunkedPrefill {
+            prefix_tier_balanced_load: true,
+            ..
+        } => total.div_ceil(u64::from(depth.max(1))),
+        _ => most_loaded,
+    }
+}
+
 fn worker_config(cfg: &PpConfig, worker: &IterWorkerSel) -> anyhow::Result<WorkerConfig> {
     let IterWorkerSel::PipelineChunkedPrefill {
         attn_gpu_memory_gb,
         max_batch_tokens,
         gpu_time_multiplier,
         balance_decode_microbatches,
+        microbatch_split,
+        min_microbatch_tokens,
+        long_prefill_token_threshold,
+        pending_order,
+        load_budget_low_tokens,
+        load_budget_backlog_lo_tokens,
+        load_budget_backlog_hi_tokens,
+        srpt,
+        dram_tier_gb,
+        dram_tier_gb_per_s,
+        ssd_tier_gb,
+        ssd_tier_gb_per_s,
+        prefix_tier_warm_start,
+        prefix_tier_max_read_wait_ms,
+        force_schedule_after_ms,
+        external_decode,
         ..
     } = worker
     else {
         bail!("pp: the stage pool requires worker `pipeline_chunked_prefill`, got {worker:?}");
     };
+    let prefix_tiers = crate::worker::config::prefix_tier_specs(
+        "pp",
+        *dram_tier_gb,
+        *dram_tier_gb_per_s,
+        *ssd_tier_gb,
+        *ssd_tier_gb_per_s,
+    )?;
     // Same defaults as unified `chunked_prefill`: FIFO and opportunistic reuse.
     let prefix_cache = resolve_prefix_cache_config(
         "pp",
@@ -237,6 +290,27 @@ fn worker_config(cfg: &PpConfig, worker: &IterWorkerSel) -> anyhow::Result<Worke
         None,
         *attn_gpu_memory_gb,
     )?;
+    let microbatch_sizing =
+        resolve_microbatch_sizing(*microbatch_split, *min_microbatch_tokens, *max_batch_tokens)
+            .context("pp: pipeline_chunked_prefill")?;
+    ensure!(
+        *load_budget_low_tokens <= *max_batch_tokens,
+        "pp: load_budget_low_tokens ({load_budget_low_tokens}) must be <= max_batch_tokens \
+         ({max_batch_tokens})"
+    );
+    if *load_budget_low_tokens > 0 {
+        ensure!(
+            load_budget_backlog_lo_tokens < load_budget_backlog_hi_tokens,
+            "pp: load_budget_low_tokens needs load_budget_backlog_lo_tokens < \
+             load_budget_backlog_hi_tokens, got {load_budget_backlog_lo_tokens} and \
+             {load_budget_backlog_hi_tokens}"
+        );
+    } else {
+        ensure!(
+            *load_budget_backlog_lo_tokens == 0 && *load_budget_backlog_hi_tokens == 0,
+            "pp: load_budget_backlog_*_tokens need load_budget_low_tokens"
+        );
+    }
     Ok(WorkerConfig {
         attn_kv_bytes: (*attn_gpu_memory_gb * 1e9) as u64,
         log_output_token_times: cfg.io.log_output_token_times,
@@ -244,9 +318,23 @@ fn worker_config(cfg: &PpConfig, worker: &IterWorkerSel) -> anyhow::Result<Worke
         kv_log_stride: cfg.io.kv_log_stride,
         gpu_time_multiplier: *gpu_time_multiplier,
         max_batch_tokens: Some(*max_batch_tokens),
-        pending_order: PendingOrderKind::Fifo,
+        pending_order: *pending_order,
         prefix_cache,
         balance_decode_microbatches: *balance_decode_microbatches,
+        microbatch_sizing,
+        long_prefill_token_threshold: (*long_prefill_token_threshold > 0)
+            .then_some(*long_prefill_token_threshold),
+        load_budget: (*load_budget_low_tokens > 0).then_some(PipelineLoadBudget {
+            low_tokens: *load_budget_low_tokens,
+            backlog_lo_tokens: *load_budget_backlog_lo_tokens,
+            backlog_hi_tokens: *load_budget_backlog_hi_tokens,
+        }),
+        srpt: *srpt,
+        prefix_tiers,
+        prefix_tier_warm_start: *prefix_tier_warm_start,
+        prefix_tier_max_read_wait_ms: *prefix_tier_max_read_wait_ms,
+        force_schedule_after_ms: *force_schedule_after_ms,
+        external_decode: *external_decode,
         ..WorkerConfig::default()
     })
 }
@@ -304,4 +392,36 @@ where
             )
         },
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pipeline_worker(extra: &str) -> IterWorkerSel {
+        serde_yaml::from_str(&format!(
+            "type: pipeline_chunked_prefill\nattn_gpu_memory_gb: 80.0\nmax_batch_tokens: 8192\n{extra}"
+        ))
+        .expect("parse pipeline worker")
+    }
+
+    #[test]
+    fn tiers_read_the_most_loaded_stage_unless_loads_are_balanced() {
+        // PP8 of GLM-5.3-Flash: 11 DSA layers of 545 B, at most 2 per stage.
+        let (most_loaded, total) = (2 * 545, 11 * 545);
+        assert_eq!(
+            tier_kv_bytes_per_token(&pipeline_worker(""), most_loaded, total, 8),
+            1090
+        );
+        assert_eq!(
+            tier_kv_bytes_per_token(
+                &pipeline_worker("prefix_tier_balanced_load: true\n"),
+                most_loaded,
+                total,
+                8
+            ),
+            750,
+            "5995 B over 8 stages, rounded up"
+        );
+    }
 }

@@ -40,6 +40,7 @@ impl PartialEq for EarliestSessionStart {
 pub struct SessionStartOrder {
     queue: BinaryHeap<EarliestSessionStart>,
     queued_kv_tokens: u64,
+    queued_prompt_tokens: u64,
 }
 
 impl SessionStartOrder {
@@ -53,6 +54,7 @@ impl PendingOrderPolicy for SessionStartOrder {
 
     fn push(&mut self, candidate: AdmissionCandidate, _context: &mut Self::Context) {
         self.queued_kv_tokens += candidate.queued_kv_tokens();
+        self.queued_prompt_tokens += u64::from(candidate.fresh_prompt_tokens);
         self.queue.push(EarliestSessionStart(candidate));
     }
 
@@ -63,6 +65,7 @@ impl PendingOrderPolicy for SessionStartOrder {
     fn pop(&mut self, _context: &mut Self::Context) -> Option<AdmissionCandidate> {
         let candidate = self.queue.pop()?.0;
         self.queued_kv_tokens -= candidate.queued_kv_tokens();
+        self.queued_prompt_tokens -= u64::from(candidate.fresh_prompt_tokens);
         Some(candidate)
     }
 
@@ -85,6 +88,7 @@ impl PendingOrderPolicy for SessionStartOrder {
         self.queue = BinaryHeap::from(retained);
         if let Some(candidate) = removed {
             self.queued_kv_tokens -= candidate.queued_kv_tokens();
+            self.queued_prompt_tokens -= u64::from(candidate.fresh_prompt_tokens);
         }
         removed
     }
@@ -101,6 +105,10 @@ impl PendingOrderPolicy for SessionStartOrder {
 
     fn queued_kv_tokens(&self) -> u64 {
         self.queued_kv_tokens
+    }
+
+    fn queued_prompt_tokens(&self) -> u64 {
+        self.queued_prompt_tokens
     }
 }
 
@@ -158,5 +166,6 @@ mod tests {
         );
         assert!(!policy.contains(RequestId(0)));
         assert_eq!(policy.queued_kv_tokens(), 5);
+        assert_eq!(policy.queued_prompt_tokens(), 4);
     }
 }

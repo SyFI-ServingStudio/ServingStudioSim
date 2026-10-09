@@ -19,6 +19,9 @@
 //! resident and unadvanced until a later decode-only iteration. This is the
 //! mechanism selected by SGLang when `enable_mixed_chunk` is false; admission
 //! capacity estimation and decode retraction are separate policies.
+//!
+//! `with_force_after(ms)` (not vLLM) serves a queued request that has waited
+//! `ms` since arrival before the rest of its partition's queue (`overdue.rs`).
 
 use std::cmp::Reverse;
 use std::collections::HashMap;
@@ -31,6 +34,8 @@ use crate::worker::kv::{ChunkedPrefillKv, ResolvedPrefillContext};
 use crate::worker::shared::context::WorkerContext;
 use crate::worker::types::{IterBatchPlan, WorkerEventCommon, WorkerMsgCommon};
 
+use super::overdue::OverdueQueue;
+use super::prefix_fetch::{AtHead, PrefixFetch};
 use super::{
     AdmissionCandidate, DecodeCompletion, EnqueueSequence, IterAdmission, LoadBalance,
     PartitionLoad, PendingOrderPolicy, SingleTokenDecodeCompletion,
@@ -50,6 +55,9 @@ pub struct ChunkedPrefillAdmission<P: PendingOrderPolicy, D = SingleTokenDecodeC
     /// Context-token spacing that every non-final chunk must end on, when the
     /// engine can only checkpoint recurrent state at those boundaries.
     chunk_end_quantum: Option<u32>,
+    /// vLLM's `long_prefill_token_threshold`: the most prefill tokens one
+    /// request may take per iteration. `None` leaves only the batch budget.
+    long_prefill_threshold: Option<u32>,
     prefill_episodes: HashMap<RequestId, bool>,
     /// Order in which each running request was last admitted from the waiting
     /// queue; FCFS retraction evicts the most recent one.
@@ -62,6 +70,16 @@ pub struct ChunkedPrefillAdmission<P: PendingOrderPolicy, D = SingleTokenDecodeC
     /// (see `SpeculativeUnifiedModel::drafting_slots_per_request`). Zero for
     /// ordinary decode and sequential drafters.
     drafting_slots: u32,
+    /// Sticky sessions: the partition each session last ran on, used when HBM
+    /// no longer holds its prefix (its slower-tier copy lives there). `None`
+    /// places such a request by the balance policy.
+    session_partitions: Option<HashMap<u32, usize>>,
+    /// DRAM/SSD tiers behind each partition's HBM, read when a request
+    /// reaches the head of its queue.
+    prefix_fetch: Option<PrefixFetch>,
+    /// Queued requests that waited past the force-schedule bound; `None`: no
+    /// bound.
+    overdue: Option<OverdueQueue>,
 }
 
 impl<P: PendingOrderPolicy> ChunkedPrefillAdmission<P, SingleTokenDecodeCompletion> {
@@ -125,12 +143,70 @@ impl<P: PendingOrderPolicy, D> ChunkedPrefillAdmission<P, D> {
             balance,
             started_prefills: Vec::new(),
             chunk_end_quantum: None,
+            long_prefill_threshold: None,
             prefill_episodes: HashMap::new(),
             admission_order: HashMap::new(),
             next_admission: 0,
             decode_completion,
             drafting_slots,
+            session_partitions: None,
+            prefix_fetch: None,
+            overdue: None,
         }
+    }
+
+    /// Serve a queued request that has waited `after_ms` since arrival before
+    /// the rest of its partition's queue (`overdue.rs`). Not vLLM.
+    pub(crate) fn with_force_after(mut self, after_ms: f64) -> Self {
+        self.overdue = Some(OverdueQueue::new(after_ms));
+        self
+    }
+
+    /// Read session contexts back from each partition's DRAM/SSD tiers when a
+    /// request reaches the head of its queue (`prefix_fetch.rs`).
+    pub(crate) fn with_prefix_fetch(mut self, fetch: PrefixFetch) -> Self {
+        self.prefix_fetch = Some(fetch);
+        self
+    }
+
+    /// Return the requests whose tier read has landed by `now` to the front
+    /// of their partition's queue.
+    fn land_prefix_reads<K: ChunkedPrefillKv>(&mut self, kv_store: &mut K, now: Time) {
+        if let Some(fetch) = &mut self.prefix_fetch {
+            fetch.land(kv_store, now);
+        }
+    }
+
+    /// When the next tier read lands.
+    pub(crate) fn next_prefix_read(&self) -> Option<Time> {
+        self.prefix_fetch.as_ref()?.next_landing()
+    }
+
+    /// Requests out of their queue while a tier read runs.
+    pub(crate) fn reading_requests(&self) -> u32 {
+        self.prefix_fetch.as_ref().map_or(0, PrefixFetch::reading)
+    }
+
+    /// Write a finished session context through to `partition`'s tiers.
+    pub(crate) fn store_session_context(&mut self, partition: u16, session_id: u32, tokens: u64) {
+        if let Some(fetch) = &mut self.prefix_fetch {
+            fetch.store(partition, session_id, tokens);
+        }
+    }
+
+    /// Keep each session on the partition of its last request, as a router
+    /// that knows where the session's DRAM/SSD copy lives would.
+    pub(crate) fn with_sticky_sessions(mut self) -> Self {
+        self.session_partitions = Some(HashMap::new());
+        self
+    }
+
+    /// The partition `session_id` last ran on, when sessions are sticky.
+    pub(crate) fn session_partition(&self, session_id: u32) -> Option<u16> {
+        self.session_partitions
+            .as_ref()?
+            .get(&session_id)
+            .map(|&partition| partition as u16)
     }
 
     /// End every non-final chunk on a multiple of `quantum` context tokens.
@@ -140,13 +216,37 @@ impl<P: PendingOrderPolicy, D> ChunkedPrefillAdmission<P, D> {
         self
     }
 
+    /// Give no request more than `threshold` prefill tokens per iteration, so a
+    /// long prompt leaves the rest of the budget to other requests.
+    pub(crate) fn with_long_prefill_threshold(mut self, threshold: u32) -> Self {
+        assert!(threshold > 0, "long prefill threshold must be positive");
+        self.long_prefill_threshold = Some(threshold);
+        self
+    }
+
     fn choose_partition<K: ChunkedPrefillKv>(
         &mut self,
         kv_store: &K,
         session_input: SessionInput,
     ) -> usize {
+        let partition = self.place(kv_store, session_input);
+        if let (Some(sessions), Some(session_id)) =
+            (&mut self.session_partitions, session_input.session_id())
+        {
+            sessions.insert(session_id, partition);
+        }
+        partition
+    }
+
+    fn place<K: ChunkedPrefillKv>(&mut self, kv_store: &K, session_input: SessionInput) -> usize {
         if let Some(partition) = kv_store.retained_prefix_partition(session_input) {
             return usize::from(partition);
+        }
+        if let Some(&partition) = session_input
+            .session_id()
+            .and_then(|session_id| self.session_partitions.as_ref()?.get(&session_id))
+        {
+            return partition;
         }
         if !self.balance.needs_load() {
             return self.balance.choose(self.partition_policies.len());
@@ -372,12 +472,19 @@ where
     fn accept_message(&mut self, kv_store: &mut K, msg: Self::Msg, context: &WorkerContext) {
         let WorkerMsgCommon::Request(request) = msg;
         debug_assert_eq!(self.partition_policies.len(), kv_store.num_partitions());
-        let (fresh_prompt_tokens, remaining_output_tokens, session_input, conversation_start_time) = {
+        let (
+            arrival_time,
+            fresh_prompt_tokens,
+            remaining_output_tokens,
+            session_input,
+            conversation_start_time,
+        ) = {
             let mut store = context.requests.borrow_mut();
             let record = &mut store[request];
             let arrival_time = record.request.core.arrival_time;
             context.stamp_stage(record, arrival_time, UnifiedStage::Pending as u16);
             (
+                arrival_time,
                 record.request.definition.prompt_tokens,
                 record.request.definition.target_output_tokens,
                 record.request.definition.session,
@@ -388,21 +495,27 @@ where
                     .session_start_or(arrival_time),
             )
         };
+        // Placement is frozen when the request enters the worker. Retained KV
+        // has hard affinity; cold requests use the same generic balance policy
+        // as ordinary local admission.
+        let partition = self.choose_partition(kv_store, session_input);
+        let hbm_tokens = kv_store.resident_prefix_tokens(fresh_prompt_tokens, session_input);
         let candidate = self.enqueue_sequence.freeze(
             request,
             fresh_prompt_tokens,
             remaining_output_tokens,
             session_input,
             conversation_start_time,
-            kv_store.resident_prefix_tokens(fresh_prompt_tokens, session_input),
+            self.prefix_fetch.as_ref().map_or(hbm_tokens, |fetch| {
+                fetch.rank_tokens(partition as u16, session_input, hbm_tokens)
+            }),
         );
-        // Placement is frozen when the request enters the worker. Retained KV
-        // has hard affinity; cold requests use the same generic balance policy
-        // as ordinary local admission.
-        let partition = self.choose_partition(kv_store, session_input);
         let (policy, policy_context) = &mut self.partition_policies[partition];
         debug_assert!(!policy.contains(request));
         policy.push(candidate, policy_context);
+        if let Some(overdue) = &mut self.overdue {
+            overdue.arrived(partition as u16, request, arrival_time);
+        }
     }
 
     fn form_batch(
@@ -412,8 +525,14 @@ where
         batch_plan: &mut IterBatchPlan,
         now: Time,
     ) -> bool {
+        self.land_prefix_reads(kv_store, now);
         let num_partitions = kv_store.num_partitions();
         debug_assert_eq!(self.partition_policies.len(), num_partitions);
+        if let Some(overdue) = &mut self.overdue {
+            for (partition, (policy, _)) in self.partition_policies.iter_mut().enumerate() {
+                overdue.promote(partition as u16, policy, now);
+            }
+        }
         self.started_prefills.resize_with(num_partitions, Vec::new);
         batch_plan.reset_decode_participation(num_partitions, true);
         let has_live_decode = |kv_store: &K| {
@@ -438,6 +557,7 @@ where
         // drafter's slots.
         let drafting_slots = self.drafting_slots;
         let chunk_end_quantum = self.chunk_end_quantum;
+        let long_prefill_threshold = self.long_prefill_threshold;
         let max_batch_tokens = self.max_batch_tokens;
         let decode_budget = query_width + drafting_slots;
         // One short prompt can create a whole verify window next iteration.
@@ -486,6 +606,7 @@ where
                     remaining_budgets[partition_index].saturating_sub(drafting_slots),
                     chunk_end_quantum,
                     max_batch_tokens,
+                    long_prefill_threshold,
                 );
                 if chunk_tokens == 0 {
                     return true;
@@ -506,15 +627,66 @@ where
             while !retracted_before_admission && remaining_budgets[partition_index] > drafting_slots
             {
                 let (policy, policy_context) = &mut self.partition_policies[partition_index];
-                policy.refresh_head(&mut |candidate| {
-                    kv_store.resident_prefix_tokens(
-                        candidate.fresh_prompt_tokens,
-                        candidate.session_input,
-                    )
-                });
-                let Some(candidate) = policy.peek() else {
-                    break;
+                let fetch = &mut self.prefix_fetch;
+                // Landed reads hold their blocks and go before the queue, then
+                // requests that waited past the force bound.
+                let landed = fetch
+                    .as_ref()
+                    .and_then(|fetch| fetch.peek_landed(partition));
+                let overdue = self
+                    .overdue
+                    .as_ref()
+                    .and_then(|overdue| overdue.peek(partition))
+                    .filter(|_| landed.is_none());
+                let candidate = match landed.or(overdue) {
+                    Some(candidate) => candidate,
+                    None => {
+                        policy.refresh_head(&mut |candidate| {
+                            let hbm = kv_store.resident_prefix_tokens(
+                                candidate.fresh_prompt_tokens,
+                                candidate.session_input,
+                            );
+                            fetch.as_ref().map_or(hbm, |fetch| {
+                                fetch.rank_tokens(partition, candidate.session_input, hbm)
+                            })
+                        });
+                        let Some(candidate) = policy.peek() else {
+                            break;
+                        };
+                        candidate
+                    }
                 };
+                let take = |fetch: &mut Option<PrefixFetch>,
+                            overdue_queue: &mut Option<OverdueQueue>,
+                            policy: &mut P,
+                            policy_context: &mut P::Context| {
+                    if landed.is_some() {
+                        fetch
+                            .as_mut()
+                            .expect("a landed request implies prefix fetch")
+                            .pop_landed(partition);
+                    } else if overdue.is_some() {
+                        let popped = overdue_queue
+                            .as_mut()
+                            .expect("an overdue request implies the bound")
+                            .pop(partition);
+                        debug_assert_eq!(popped, Some(candidate));
+                    } else {
+                        let popped = policy.pop(policy_context);
+                        debug_assert_eq!(popped, Some(candidate));
+                    }
+                };
+                if let Some(state) = fetch.as_mut() {
+                    match state.at_head(kv_store, partition, candidate, now) {
+                        AtHead::Admit => {}
+                        AtHead::Read => {
+                            take(fetch, &mut self.overdue, policy, policy_context);
+                            continue;
+                        }
+                        // Only a pipeline head sets the read-wait bound.
+                        AtHead::Blocked | AtHead::PassedOver => break,
+                    }
+                }
                 if candidate.remaining_output_tokens > 1
                     && future_decode_slots
                         .as_ref()
@@ -535,6 +707,7 @@ where
                     remaining_budgets[partition_index] - drafting_slots,
                     chunk_end_quantum,
                     max_batch_tokens,
+                    long_prefill_threshold,
                 );
                 if chunk_tokens == 0 {
                     break;
@@ -570,8 +743,12 @@ where
                 if !fits {
                     break;
                 }
-                let popped = policy.pop(policy_context);
-                debug_assert_eq!(popped, Some(candidate));
+                take(
+                    &mut self.prefix_fetch,
+                    &mut self.overdue,
+                    policy,
+                    policy_context,
+                );
                 self.admission_order
                     .insert(candidate.request_id, self.next_admission);
                 self.next_admission += 1;
@@ -599,6 +776,14 @@ where
                         );
                     }
                     context.stamp_stage(record, now, UnifiedStage::Prefill as u16);
+                }
+                if let Some(fetch) = &mut self.prefix_fetch {
+                    fetch.admitted(
+                        partition,
+                        candidate,
+                        resolved_prefill.resident_prefix_tokens(),
+                        now,
+                    );
                 }
                 assert!(
                     self.prefill_episodes
@@ -781,14 +966,32 @@ where
         self.partition_policies
             .iter()
             .map(|(policy, _)| policy.len() as u32)
-            .sum()
+            .sum::<u32>()
+            + self
+                .overdue
+                .as_ref()
+                .map_or(0, |overdue| overdue.len() as u32)
     }
 
     fn cancel_pending(&mut self, request: RequestId) -> bool {
+        if self
+            .prefix_fetch
+            .as_mut()
+            .is_some_and(|fetch| fetch.cancel(request))
+        {
+            return true;
+        }
         for (policy, _) in &mut self.partition_policies {
             if policy.remove(request).is_some() {
                 return true;
             }
+        }
+        if self
+            .overdue
+            .as_mut()
+            .is_some_and(|overdue| overdue.remove(request))
+        {
+            return true;
         }
         for started_prefills in &mut self.started_prefills {
             let started_count = started_prefills.len();
@@ -804,14 +1007,23 @@ where
 /// The next chunk of `resolved_prefill` that `budget` tokens can carry, ending
 /// on a `chunk_end_quantum` boundary when one is set. `0` means the request
 /// cannot run this iteration.
+///
+/// `long_prefill_threshold` caps the chunk before the budget does, as vLLM's
+/// `long_prefill_token_threshold` caps `num_new_tokens`, and also lowers the
+/// chunk cap the checkpoint alignment compares its quantum against.
 pub(super) fn next_chunk_tokens(
     resolved_prefill: ResolvedPrefillContext,
     budget: u32,
     chunk_end_quantum: Option<u32>,
     max_chunk_tokens: u32,
+    long_prefill_threshold: Option<u32>,
 ) -> u32 {
     let remaining = resolved_prefill.remaining_prefill_tokens();
-    let chunk_tokens = remaining.min(budget);
+    let (request_tokens, max_chunk_tokens) = match long_prefill_threshold {
+        None => (remaining, max_chunk_tokens),
+        Some(threshold) => (remaining.min(threshold), max_chunk_tokens.min(threshold)),
+    };
+    let chunk_tokens = request_tokens.min(budget);
     match chunk_end_quantum {
         None => chunk_tokens,
         Some(quantum) => {

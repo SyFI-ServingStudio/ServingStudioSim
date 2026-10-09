@@ -67,6 +67,12 @@ impl Deployment for PdDeployment {
             dg.arch.model().model_config,
         );
 
+        anyhow::ensure!(
+            [cfg.pools.prefill.placement, cfg.pools.decode.placement]
+                .iter()
+                .all(|placement| *placement != PlacementPolicy::LeastWorkAhead),
+            "pd: placement least-work-ahead is implemented only for the pp deployment"
+        );
         let prefill_cfg = pool_cfg(PD_PREFILL_POOL, pg.replicas, cfg.pools.prefill.placement);
         let decode_cfg = pool_cfg(PD_DECODE_POOL, dg.replicas, cfg.pools.decode.placement);
 
@@ -376,5 +382,8 @@ fn placement_into(p: PlacementPolicy) -> DpPlacementPolicy {
     match p {
         PlacementPolicy::LeastQueued => DpPlacementPolicy::LeastQueued,
         PlacementPolicy::RoundRobin => DpPlacementPolicy::RoundRobin,
+        PlacementPolicy::LeastWorkAhead => {
+            unreachable!("least-work-ahead is rejected before the pool is built")
+        }
     }
 }

@@ -19,18 +19,45 @@
 //! split across the `depth` microbatches the pipeline holds and each returns
 //! to the next round on its own.
 //!
+//! Prefill takes as much pending work as the budget allows by default (vLLM),
+//! so at moderate load a small microbatch forms from whatever arrived while
+//! stage 0 was busy, and the backlog that builds meanwhile fills the next one to
+//! `max_batch_tokens`. `with_even_split(depth, min)` instead sizes each
+//! microbatch's prefill to one `depth`-th of the round the pipeline holds:
+//! `clamp(ceil((pending + in-flight prefill tokens) / depth), min,
+//! max_batch_tokens)`. Pending counts started prompts' unscheduled tokens and
+//! queued fresh prompts' tokens (before any prefix hit, and whether or not KV
+//! admits them yet); in-flight counts the prefill tokens of microbatches formed
+//! and not yet exited. Counting the in-flight tokens keeps the size steady
+//! through a round: one `P`-token prompt into an empty pipeline runs as `depth`
+//! slices of `P / depth`, not a shrinking `P/depth, 3P/depth^2, ...` series.
+//! The split never waits: a microbatch takes `min(pending, target)` and starts.
+//!
 //! The pending policy owns fresh requests. A prompt that has started and still
 //! has unscheduled prefill tokens stays in `started_prefills`, in start order,
-//! and keeps priority over fresh prompts. A request whose last chunk is in flight
-//! is in neither list; its ticket is in the shell's in-flight queue. It joins KV's
-//! decode membership when that chunk exits, and a decode step's request is in
-//! `in_flight_decodes` until its microbatch exits.
+//! and keeps priority over fresh prompts unless `srpt` merges the two orders. A
+//! request whose last chunk is in flight is in neither list; its ticket is in the
+//! shell's in-flight queue. It joins KV's decode membership when that chunk
+//! exits, and a decode step's request is in `in_flight_decodes` until its
+//! microbatch exits.
 //!
 //! KV reserves the full request footprint once at admission and releases it at
 //! completion. A hybrid recurrent model with prefix caching ends every non-final
 //! chunk on a state-checkpoint boundary (vLLM's `_mamba_block_aligned_split`,
 //! which does not change under PP), via the same rule as unified chunked
-//! prefill. One attention partition only.
+//! prefill. `with_long_prefill_threshold(t)` caps any one request's chunk at `t`
+//! tokens per microbatch (vLLM's `long_prefill_token_threshold`), on top of the
+//! greedy or even budget. One attention partition only.
+//!
+//! One ordering and one budget rule are not vLLM. `with_srpt()` orders prefill
+//! by remaining tokens across started and queued prompts instead of started
+//! first, so a short prompt does not wait behind a long one's chunks.
+//! `with_load_budget(low, lo, hi)` runs microbatches at `low` tokens while the
+//! prefill backlog (queued, started and in-flight tokens) is at most `lo`, rising
+//! linearly to `max_batch_tokens` at `hi`, so a light load runs small
+//! microbatches that drain the pipeline sooner. `with_force_after(ms)` serves a
+//! request that has waited `ms` since arrival before every other one
+//! (`overdue.rs`), so shortest-first cannot starve a long prompt.
 
 use std::collections::HashSet;
 
@@ -41,6 +68,8 @@ use crate::worker::shared::context::WorkerContext;
 use crate::worker::types::IterBatchPlan;
 
 use super::chunked_prefill_admission::next_chunk_tokens;
+use super::overdue::OverdueQueue;
+use super::prefix_fetch::{AtHead, PrefixFetch};
 use super::{AdmissionCandidate, EnqueueSequence, MicrobatchAdmission, PendingOrderPolicy};
 
 /// The only attention partition of a pipeline head.
@@ -53,6 +82,9 @@ pub struct PipelinedChunkedPrefillAdmission<P: PendingOrderPolicy> {
     max_batch_tokens: u32,
     /// Checkpoint interval a non-final chunk must end on, if any.
     chunk_end_quantum: Option<u32>,
+    /// vLLM's `long_prefill_token_threshold`: the most prefill tokens one
+    /// request may take per microbatch.
+    long_prefill_threshold: Option<u32>,
     /// Prompts that have started and still have prefill tokens to schedule, in
     /// start order.
     started_prefills: Vec<AdmissionCandidate>,
@@ -63,6 +95,59 @@ pub struct PipelinedChunkedPrefillAdmission<P: PendingOrderPolicy> {
     /// Pipeline depth when decodes are balanced across microbatches; `None`
     /// schedules every ready decode (vLLM).
     balanced_depth: Option<u16>,
+    /// Prefill target rule when microbatches are sized evenly over the round;
+    /// `None` fills each microbatch greedily (vLLM).
+    even_split: Option<EvenSplit>,
+    /// Prefill tokens of the committed microbatches that have not exited.
+    in_flight_prefill_tokens: u64,
+    /// Budget that follows the prefill backlog; `None` keeps `max_batch_tokens`
+    /// at every load.
+    load_budget: Option<LoadBudget>,
+    /// Shortest remaining prefill first across started and queued prompts;
+    /// `false` keeps vLLM's started-first order.
+    srpt: bool,
+    /// DRAM/SSD tiers behind HBM, read when a request reaches the head.
+    prefix_fetch: Option<PrefixFetch>,
+    /// Requests that waited past the force-schedule bound; `None`: no bound.
+    overdue: Option<OverdueQueue>,
+}
+
+/// Where [`PipelinedChunkedPrefillAdmission::admit_fresh_prompts`] found its
+/// candidate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Source {
+    Landed,
+    Overdue,
+    Policy,
+}
+
+/// [`PipelinedChunkedPrefillAdmission::with_load_budget`]: the microbatch
+/// budget runs at `low_tokens` while the prefill backlog is at most
+/// `backlog_lo_tokens` and rises linearly to `max_batch_tokens` at
+/// `backlog_hi_tokens`. The backlog counts queued, started and in-flight
+/// prefill tokens.
+#[derive(Clone, Copy, Debug)]
+struct LoadBudget {
+    low_tokens: u32,
+    backlog_lo_tokens: u64,
+    backlog_hi_tokens: u64,
+}
+
+impl LoadBudget {
+    fn target(&self, backlog_tokens: u64, max_tokens: u32) -> u32 {
+        let rise = ((backlog_tokens as f64 - self.backlog_lo_tokens as f64)
+            / (self.backlog_hi_tokens - self.backlog_lo_tokens) as f64)
+            .clamp(0.0, 1.0);
+        self.low_tokens + (f64::from(max_tokens - self.low_tokens) * rise).round() as u32
+    }
+}
+
+/// Prefill sizing of [`PipelinedChunkedPrefillAdmission::with_even_split`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EvenSplit {
+    depth: u16,
+    /// Floor on the target, so a thin backlog does not run as tiny slices.
+    min_tokens: u32,
 }
 
 /// One request's chunk in one microbatch, snapshotted when it was committed.
@@ -103,17 +188,91 @@ impl<P: PendingOrderPolicy> PipelinedChunkedPrefillAdmission<P> {
             enqueue_sequence: EnqueueSequence::default(),
             max_batch_tokens,
             chunk_end_quantum: None,
+            long_prefill_threshold: None,
             started_prefills: Vec::new(),
             in_flight_decodes: HashSet::new(),
             scheduled_decodes: Vec::new(),
             balanced_depth: None,
+            even_split: None,
+            in_flight_prefill_tokens: 0,
+            load_budget: None,
+            srpt: false,
+            prefix_fetch: None,
+            overdue: None,
         }
+    }
+
+    /// Serve a request that has waited `after_ms` since arrival before every
+    /// other one, queued or started (`overdue.rs`). Not vLLM.
+    pub(crate) fn with_force_after(mut self, after_ms: f64) -> Self {
+        self.overdue = Some(OverdueQueue::new(after_ms));
+        self
+    }
+
+    /// Whether `request`, already started, has waited past the force bound.
+    fn started_overdue(&self, context: &WorkerContext, request: RequestId, now: Time) -> bool {
+        self.overdue.as_ref().is_some_and(|overdue| {
+            overdue.is_overdue(
+                context.requests.borrow()[request].request.core.arrival_time,
+                now,
+            )
+        })
+    }
+
+    /// Read session contexts back from DRAM/SSD tiers when a request reaches
+    /// the head of the queue (`prefix_fetch.rs`).
+    pub(crate) fn with_prefix_fetch(mut self, fetch: PrefixFetch) -> Self {
+        self.prefix_fetch = Some(fetch);
+        self
     }
 
     /// End every non-final chunk on a multiple of `quantum` context tokens.
     pub(crate) fn with_chunk_end_quantum(mut self, quantum: u32) -> Self {
         assert!(quantum > 0, "chunk-end quantum must be positive");
         self.chunk_end_quantum = Some(quantum);
+        self
+    }
+
+    /// Give no request more than `threshold` prefill tokens per microbatch, so a
+    /// long prompt leaves the rest of the budget to other requests.
+    pub(crate) fn with_long_prefill_threshold(mut self, threshold: u32) -> Self {
+        assert!(threshold > 0, "long prefill threshold must be positive");
+        self.long_prefill_threshold = Some(threshold);
+        self
+    }
+
+    /// Run microbatches at `low_tokens` while the prefill backlog (queued,
+    /// started and in-flight tokens) is at most `backlog_lo_tokens`, rising to
+    /// `max_batch_tokens` at `backlog_hi_tokens`. Not vLLM, whose budget is
+    /// fixed.
+    pub(crate) fn with_load_budget(
+        mut self,
+        low_tokens: u32,
+        backlog_lo_tokens: u64,
+        backlog_hi_tokens: u64,
+    ) -> Self {
+        assert!(
+            low_tokens > 0 && low_tokens <= self.max_batch_tokens,
+            "load budget floor {low_tokens} must lie in 1..=max_batch_tokens {}",
+            self.max_batch_tokens
+        );
+        assert!(
+            backlog_lo_tokens < backlog_hi_tokens,
+            "load budget needs backlog lo < hi tokens, got {backlog_lo_tokens}..{backlog_hi_tokens}"
+        );
+        self.load_budget = Some(LoadBudget {
+            low_tokens,
+            backlog_lo_tokens,
+            backlog_hi_tokens,
+        });
+        self
+    }
+
+    /// Order prefill by remaining tokens across started and queued prompts: a
+    /// queued prompt goes ahead of a started one with more left, and the reverse.
+    /// The queue must offer its shortest prompt first. Not vLLM.
+    pub(crate) fn with_srpt(mut self) -> Self {
+        self.srpt = true;
         self
     }
 
@@ -124,32 +283,133 @@ impl<P: PendingOrderPolicy> PipelinedChunkedPrefillAdmission<P> {
         self
     }
 
-    /// Admit fresh prompts into the budget left after started prompts.
+    /// Size each microbatch's prefill to `clamp(ceil(round tokens / depth),
+    /// min_tokens, max_batch_tokens)`, where the round is the pending prefill
+    /// plus the prefill already in flight.
+    pub(crate) fn with_even_split(mut self, depth: u16, min_tokens: u32) -> Self {
+        assert!(depth > 0, "pipeline depth must be positive");
+        assert!(
+            min_tokens <= self.max_batch_tokens,
+            "min microbatch tokens {min_tokens} exceed max_batch_tokens {}",
+            self.max_batch_tokens
+        );
+        self.even_split = Some(EvenSplit { depth, min_tokens });
+        self
+    }
+
+    /// The prefill-token budget of the microbatch being formed, given what is
+    /// left of `max_batch_tokens` after decodes.
+    fn prefill_budget<K: ChunkedPrefillKv>(&self, kv_store: &K, remaining_budget: u32) -> u32 {
+        if self.load_budget.is_none() && self.even_split.is_none() {
+            return remaining_budget;
+        }
+        let started: u64 = self
+            .started_prefills
+            .iter()
+            .map(|candidate| {
+                u64::from(
+                    kv_store
+                        .resolved_prefill_context(candidate.request_id)
+                        .remaining_prefill_tokens(),
+                )
+            })
+            .sum();
+        let round_tokens = started
+            + self.policy.queued_prompt_tokens()
+            + self.overdue.as_ref().map_or(0, OverdueQueue::prompt_tokens)
+            + self.in_flight_prefill_tokens;
+        let remaining_budget = match &self.load_budget {
+            None => remaining_budget,
+            Some(load) => remaining_budget.min(load.target(round_tokens, self.max_batch_tokens)),
+        };
+        let Some(EvenSplit { depth, min_tokens }) = self.even_split else {
+            return remaining_budget;
+        };
+        let target = round_tokens
+            .div_ceil(u64::from(depth))
+            .clamp(u64::from(min_tokens), u64::from(self.max_batch_tokens));
+        remaining_budget.min(target as u32)
+    }
+
+    /// Admit fresh prompts into `budget`: landed reads, then overdue requests,
+    /// then the pending order, stopping at the first pending one with more than
+    /// `no_longer_than` prefill tokens (`overdue_only`: no pending ones);
+    /// returns the tokens they took. Requests whose read is past the read-wait
+    /// bound are passed over and go back where they were.
     fn admit_fresh_prompts<K: ChunkedPrefillKv>(
         &mut self,
         kv_store: &mut K,
         context: &WorkerContext,
-        mut remaining_budget: u32,
+        budget: u32,
         now: Time,
-    ) {
+        no_longer_than: Option<u32>,
+        overdue_only: bool,
+    ) -> u32 {
+        let mut remaining_budget = budget;
+        let mut passed_over = Vec::new();
         while remaining_budget > 0 {
-            self.policy.refresh_head(&mut |candidate| {
-                kv_store
-                    .resident_prefix_tokens(candidate.fresh_prompt_tokens, candidate.session_input)
-            });
-            let Some(candidate) = self.policy.peek() else {
-                break;
+            let landed = self
+                .prefix_fetch
+                .as_ref()
+                .filter(|_| !overdue_only)
+                .and_then(|fetch| fetch.peek_landed(PARTITION));
+            let overdue = self
+                .overdue
+                .as_ref()
+                .and_then(|overdue| overdue.peek(PARTITION));
+            let (source, candidate) = match (landed, overdue) {
+                (Some(candidate), _) => (Source::Landed, candidate),
+                (None, Some(candidate)) => (Source::Overdue, candidate),
+                (None, None) if overdue_only => break,
+                (None, None) => {
+                    let fetch = &self.prefix_fetch;
+                    self.policy.refresh_head(&mut |candidate| {
+                        let hbm = kv_store.resident_prefix_tokens(
+                            candidate.fresh_prompt_tokens,
+                            candidate.session_input,
+                        );
+                        fetch.as_ref().map_or(hbm, |fetch| {
+                            fetch.rank_tokens(PARTITION, candidate.session_input, hbm)
+                        })
+                    });
+                    let Some(candidate) = self.policy.peek() else {
+                        break;
+                    };
+                    (Source::Policy, candidate)
+                }
             };
+            if let Some(fetch) = &mut self.prefix_fetch {
+                match fetch.at_head(kv_store, PARTITION, candidate, now) {
+                    AtHead::Admit => {}
+                    AtHead::Read => {
+                        self.take_candidate(source, candidate);
+                        continue;
+                    }
+                    AtHead::Blocked => break,
+                    AtHead::PassedOver => {
+                        self.take_candidate(source, candidate);
+                        passed_over.push((source, candidate));
+                        continue;
+                    }
+                }
+            }
             let resolved_prefill = kv_store.preview_prefill_context(
                 PARTITION,
                 candidate.fresh_prompt_tokens,
                 candidate.session_input,
             );
+            if source == Source::Policy
+                && no_longer_than
+                    .is_some_and(|bound| resolved_prefill.remaining_prefill_tokens() > bound)
+            {
+                break;
+            }
             let chunk_tokens = next_chunk_tokens(
                 resolved_prefill,
                 remaining_budget,
                 self.chunk_end_quantum,
                 self.max_batch_tokens,
+                self.long_prefill_threshold,
             );
             if chunk_tokens == 0 {
                 break;
@@ -162,8 +422,7 @@ impl<P: PendingOrderPolicy> PipelinedChunkedPrefillAdmission<P> {
             if !kv_store.fits(PARTITION, &footprint) {
                 break;
             }
-            let popped = self.policy.pop(&mut self.policy_context);
-            debug_assert_eq!(popped, Some(candidate));
+            self.take_candidate(source, candidate);
             kv_store.reserve_chunked_prefill_context(
                 candidate.request_id,
                 PARTITION,
@@ -178,12 +437,130 @@ impl<P: PendingOrderPolicy> PipelinedChunkedPrefillAdmission<P> {
                 record.record_prefix_cache_hit_tokens(resolved_prefill.resident_prefix_tokens());
                 context.stamp_stage(record, now, UnifiedStage::Prefill as u16);
             }
+            if let Some(fetch) = &mut self.prefix_fetch {
+                fetch.admitted(
+                    PARTITION,
+                    candidate,
+                    resolved_prefill.resident_prefix_tokens(),
+                    now,
+                );
+            }
             kv_store.schedule_prefill_chunk(candidate.request_id, PARTITION, chunk_tokens);
             remaining_budget -= chunk_tokens;
             if chunk_tokens < resolved_prefill.remaining_prefill_tokens() {
                 self.started_prefills.push(candidate);
             }
         }
+        // Newest first, so each overdue queue gets its order back.
+        for (source, candidate) in passed_over.into_iter().rev() {
+            match source {
+                Source::Policy => self.policy.push(candidate, &mut self.policy_context),
+                Source::Overdue => self
+                    .overdue
+                    .as_mut()
+                    .expect("an overdue request implies the bound")
+                    .push_front(PARTITION, candidate),
+                Source::Landed => unreachable!("a landed read is never passed over"),
+            }
+        }
+        budget - remaining_budget
+    }
+
+    /// Take `candidate` out of the landed queue, the overdue queue or the
+    /// pending order, wherever [`Self::admit_fresh_prompts`] found it.
+    fn take_candidate(&mut self, source: Source, candidate: AdmissionCandidate) {
+        match source {
+            Source::Landed => self
+                .prefix_fetch
+                .as_mut()
+                .expect("a landed request implies prefix fetch")
+                .pop_landed(PARTITION),
+            Source::Overdue => {
+                let popped = self
+                    .overdue
+                    .as_mut()
+                    .expect("an overdue request implies the bound")
+                    .pop(PARTITION);
+                debug_assert_eq!(popped, Some(candidate));
+            }
+            Source::Policy => {
+                let popped = self.policy.pop(&mut self.policy_context);
+                debug_assert_eq!(popped, Some(candidate));
+            }
+        }
+    }
+
+    /// Fill `budget` shortest remaining prefill first: before each started
+    /// prompt, queued prompts with no more tokens left than it go first.
+    /// Overdue requests, queued then started (oldest first), go before all.
+    fn form_prefill_srpt<K: ChunkedPrefillKv>(
+        &mut self,
+        kv_store: &mut K,
+        context: &WorkerContext,
+        mut budget: u32,
+        now: Time,
+    ) {
+        let remaining_of = |kv_store: &K, candidate: &AdmissionCandidate| {
+            kv_store
+                .resolved_prefill_context(candidate.request_id)
+                .remaining_prefill_tokens()
+        };
+        let mut started: Vec<(bool, u64, AdmissionCandidate)> =
+            std::mem::take(&mut self.started_prefills)
+                .into_iter()
+                .map(|candidate| {
+                    let overdue = self.started_overdue(context, candidate.request_id, now);
+                    let key = if overdue {
+                        context.requests.borrow()[candidate.request_id]
+                            .request
+                            .core
+                            .arrival_time
+                            .0
+                    } else {
+                        u64::from(remaining_of(kv_store, &candidate))
+                    };
+                    (!overdue, key, candidate)
+                })
+                .collect();
+        started.sort_by_key(|&(not_overdue, key, _)| (not_overdue, key));
+        if self.overdue.is_some() && budget > 0 {
+            budget -= self.admit_fresh_prompts(kv_store, context, budget, now, None, true);
+        }
+        let mut still_started = Vec::with_capacity(started.len());
+        for (not_overdue, _, candidate) in started {
+            let remaining = remaining_of(kv_store, &candidate);
+            if not_overdue && budget > 0 {
+                budget -= self.admit_fresh_prompts(
+                    kv_store,
+                    context,
+                    budget,
+                    now,
+                    Some(remaining),
+                    false,
+                );
+            }
+            let resolved_prefill = kv_store.resolved_prefill_context(candidate.request_id);
+            let chunk_tokens = next_chunk_tokens(
+                resolved_prefill,
+                budget,
+                self.chunk_end_quantum,
+                self.max_batch_tokens,
+                self.long_prefill_threshold,
+            );
+            if chunk_tokens > 0 {
+                kv_store.schedule_prefill_chunk(candidate.request_id, PARTITION, chunk_tokens);
+                budget -= chunk_tokens;
+            }
+            if chunk_tokens < remaining {
+                still_started.push(candidate);
+            }
+        }
+        if budget > 0 {
+            self.admit_fresh_prompts(kv_store, context, budget, now, None, false);
+        }
+        // Prompts admitted now and not finished join after the ones already started.
+        still_started.append(&mut self.started_prefills);
+        self.started_prefills = still_started;
     }
 }
 
@@ -212,16 +589,23 @@ where
                     .session_start_or(arrival_time),
             )
         };
+        let hbm_tokens = kv_store.resident_prefix_tokens(fresh_prompt_tokens, session_input);
         let candidate = self.enqueue_sequence.freeze(
             request,
             fresh_prompt_tokens,
             target_output_tokens,
             session_input,
             conversation_start_time,
-            kv_store.resident_prefix_tokens(fresh_prompt_tokens, session_input),
+            self.prefix_fetch.as_ref().map_or(hbm_tokens, |fetch| {
+                fetch.rank_tokens(PARTITION, session_input, hbm_tokens)
+            }),
         );
         debug_assert!(!self.policy.contains(request));
         self.policy.push(candidate, &mut self.policy_context);
+        if let Some(overdue) = &mut self.overdue {
+            let arrival = context.requests.borrow()[request].request.core.arrival_time;
+            overdue.arrived(PARTITION, request, arrival);
+        }
     }
 
     fn form_microbatch(
@@ -231,6 +615,10 @@ where
         batch_plan: &mut IterBatchPlan,
         now: Time,
     ) -> bool {
+        self.land_prefix_reads(kv_store, now);
+        if let Some(overdue) = &mut self.overdue {
+            overdue.promote(PARTITION, &mut self.policy, now);
+        }
         let max_batch_tokens = self.max_batch_tokens;
         let chunk_end_quantum = self.chunk_end_quantum;
         let mut remaining_budget = max_batch_tokens;
@@ -258,23 +646,30 @@ where
         });
         batch_plan.reset_decode_participation(1, false);
         batch_plan.select_partition_decodes(PARTITION, self.scheduled_decodes.clone());
-        // Started prompts keep start order. One that cannot run keeps its place.
-        self.started_prefills.retain(|candidate| {
-            let resolved_prefill = kv_store.resolved_prefill_context(candidate.request_id);
-            let chunk_tokens = next_chunk_tokens(
-                resolved_prefill,
-                remaining_budget,
-                chunk_end_quantum,
-                max_batch_tokens,
-            );
-            if chunk_tokens == 0 {
-                return true;
-            }
-            kv_store.schedule_prefill_chunk(candidate.request_id, PARTITION, chunk_tokens);
-            remaining_budget -= chunk_tokens;
-            chunk_tokens < resolved_prefill.remaining_prefill_tokens()
-        });
-        self.admit_fresh_prompts(kv_store, context, remaining_budget, now);
+        let mut remaining_budget = self.prefill_budget(kv_store, remaining_budget);
+        if self.srpt {
+            self.form_prefill_srpt(kv_store, context, remaining_budget, now);
+        } else {
+            let long_prefill_threshold = self.long_prefill_threshold;
+            // Started prompts keep start order. One that cannot run keeps its place.
+            self.started_prefills.retain(|candidate| {
+                let resolved_prefill = kv_store.resolved_prefill_context(candidate.request_id);
+                let chunk_tokens = next_chunk_tokens(
+                    resolved_prefill,
+                    remaining_budget,
+                    chunk_end_quantum,
+                    max_batch_tokens,
+                    long_prefill_threshold,
+                );
+                if chunk_tokens == 0 {
+                    return true;
+                }
+                kv_store.schedule_prefill_chunk(candidate.request_id, PARTITION, chunk_tokens);
+                remaining_budget -= chunk_tokens;
+                chunk_tokens < resolved_prefill.remaining_prefill_tokens()
+            });
+            self.admit_fresh_prompts(kv_store, context, remaining_budget, now, None, false);
+        }
         kv_store.has_prefill_admit(PARTITION) || !self.scheduled_decodes.is_empty()
     }
 
@@ -305,6 +700,7 @@ where
         }
         kv_store.clear_prefill_admits(PARTITION);
         kv_store.sample_submit(PARTITION, now);
+        self.in_flight_prefill_tokens += ticket.tokens();
         ticket
     }
 
@@ -316,6 +712,7 @@ where
         completed: &mut Vec<RequestId>,
         at: Time,
     ) {
+        self.in_flight_prefill_tokens -= ticket.tokens();
         let MicrobatchTicket { chunks, decodes } = ticket;
         let mut finished_decodes = Vec::new();
         {
@@ -381,6 +778,24 @@ where
     }
 
     fn queued_requests(&self) -> u32 {
-        self.policy.len() as u32
+        (self.policy.len() + self.overdue.as_ref().map_or(0, OverdueQueue::len)) as u32
+    }
+
+    fn land_prefix_reads(&mut self, kv_store: &mut K, now: Time) -> Option<Time> {
+        self.prefix_fetch.as_mut()?.land(kv_store, now)
+    }
+
+    fn next_prefix_read(&self) -> Option<Time> {
+        self.prefix_fetch.as_ref()?.next_landing()
+    }
+
+    fn reading_requests(&self) -> u32 {
+        self.prefix_fetch.as_ref().map_or(0, PrefixFetch::reading)
+    }
+
+    fn store_session_context(&mut self, _partition: u16, session_id: u32, tokens: u64) {
+        if let Some(fetch) = &mut self.prefix_fetch {
+            fetch.store(PARTITION, session_id, tokens);
+        }
     }
 }

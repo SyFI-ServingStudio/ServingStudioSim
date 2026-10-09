@@ -40,6 +40,8 @@ pub enum PrefixCacheEvictionReason {
 pub enum PrefixCacheRetentionReason {
     RequestComplete,
     HandoffComplete,
+    /// A slower tier's read or a decode elsewhere handed the context back.
+    Restore,
     NoCacheCapacity,
 }
 
@@ -75,6 +77,7 @@ impl PrefixCacheEventKind {
             }
             Self::Retain(PrefixCacheRetentionReason::RequestComplete) => "request-complete",
             Self::Retain(PrefixCacheRetentionReason::HandoffComplete) => "handoff-complete",
+            Self::Retain(PrefixCacheRetentionReason::Restore) => "restore",
             Self::Retain(PrefixCacheRetentionReason::NoCacheCapacity) => "no-cache-capacity",
         }
     }

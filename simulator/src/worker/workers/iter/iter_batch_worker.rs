@@ -83,8 +83,11 @@ pub type Qwen36HybridWorker<M> = IterBatchWorker<
 >;
 /// `ChunkedPrefillWorker` on every axis but KV: the hybrid store charges each
 /// request's recurrent state against the attention capacity.
-pub type HybridChunkedPrefillWorker<M> =
+pub type HybridChunkedPrefillShell<M> =
     IterBatchWorker<HybridGdnKv, ChunkedPrefillAdmission<PendingOrder>, UnifiedIterExecution<M>>;
+/// The hybrid chunked-prefill shell, with optional DRAM/SSD prefix tiers per
+/// DP rank and decode run elsewhere (`SessionTierWorker`).
+pub type HybridChunkedPrefillWorker<M> = super::session_tier_worker::SessionTierWorker<M>;
 pub type PdPrefillWorker<M> =
     IterBatchWorker<FullAttnKv, PrefillHandoffAdmission<PendingOrder>, UnifiedIterExecution<M>>;
 
@@ -216,6 +219,19 @@ where
 
     pub fn id(&self) -> WorkerId {
         self.context.id
+    }
+
+    /// The KV store and admission, for a wrapper acting between messages.
+    pub(super) fn kv_and_admission(&mut self) -> (&mut K, &mut A) {
+        (&mut self.kv_store, &mut self.admission)
+    }
+
+    pub(super) fn admission(&self) -> &A {
+        &self.admission
+    }
+
+    pub(super) fn requests(&self) -> &crate::common::SharedRequests {
+        &self.context.requests
     }
 }
 
@@ -649,6 +665,92 @@ mod tests {
             .is_some());
     }
 
+    /// A 5000-token prompt queued at 0 ms behind one 1000-token prompt arriving
+    /// every ms, each filling an iteration under SPF; returns the long prompt's
+    /// prefill tokens processed after 8 iterations.
+    fn starved_spf_progress(force_schedule_after_ms: f64) -> u32 {
+        use crate::worker::admission::PendingOrderKind;
+        let mut requests = vec![(0, 5_000, 1)];
+        requests.extend((1..=8).map(|id| (id, 1_000, 1)));
+        let store = shared_with(&requests);
+        for id in 1..=8 {
+            store.borrow_mut()[RequestId(id)].request.core.arrival_time =
+                Time::from_ms(f64::from(id - 1));
+        }
+        let mut worker = build_chunked_prefill_worker(
+            WorkerId(0),
+            "main",
+            Arc::new(FakeModel::for_ms(1.0)),
+            Rc::clone(&store),
+            WorkerConfig {
+                max_batch_tokens: Some(1_000),
+                pending_order: PendingOrderKind::ShortestPrefillFirst,
+                force_schedule_after_ms,
+                ..WorkerConfig::default()
+            },
+            None,
+            PoolId(0),
+            "test-gpu",
+            test_cluster(),
+        );
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(0)));
+        for step in 0..8_u32 {
+            worker.enqueue(WorkerMsgCommon::Request(RequestId(step + 1)));
+            assert!(worker.form_batch(Time::from_ms(f64::from(step))));
+            worker.admission.complete_iteration(
+                &mut worker.kv_store,
+                &worker.context,
+                &worker.batch_plan,
+                &mut Vec::new(),
+                Time::from_ms(f64::from(step + 1)),
+            );
+        }
+        let progress = store.borrow()[RequestId(0)]
+            .progress
+            .prefill_tokens_processed;
+        progress
+    }
+
+    #[test]
+    fn a_request_waiting_past_the_force_bound_leaves_the_spf_queue_first() {
+        assert_eq!(starved_spf_progress(0.0), 0, "SPF alone starves it");
+        // Overdue at 3 ms: it starts then and, started, keeps its place.
+        assert_eq!(starved_spf_progress(3.0), 5_000);
+    }
+
+    #[test]
+    fn long_prefill_threshold_lets_a_short_prompt_share_the_iteration() {
+        let store = shared_with(&[(0, 16_384, 2), (1, 100, 2)]);
+        let mut worker = build_chunked_prefill_worker(
+            WorkerId(0),
+            "main",
+            Arc::new(FakeModel::for_ms(1.0)),
+            Rc::clone(&store),
+            WorkerConfig {
+                max_batch_tokens: Some(8_192),
+                long_prefill_token_threshold: Some(4_096),
+                ..WorkerConfig::default()
+            },
+            None,
+            PoolId(0),
+            "test-gpu",
+            test_cluster(),
+        );
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(0)));
+        worker.enqueue(WorkerMsgCommon::Request(RequestId(1)));
+
+        assert!(worker.form_batch(Time::ZERO));
+        let mut input = Default::default();
+        worker.execution.build_iteration_input(
+            &worker.kv_store,
+            &worker.context.requests,
+            &worker.batch_plan,
+            &mut input,
+        );
+        // Uncapped, the long prompt would take all 8192 and the short one wait.
+        assert_eq!(input.groups[0].prefill_chunk_pairs, [(0, 4_096), (0, 100)]);
+    }
+
     #[test]
     fn chunked_prefill_computes_only_the_fresh_prompt_after_a_pinned_prefix() {
         let store = shared_with(&[(0, 12_000, 2), (1, 12_000, 2)]);
@@ -743,6 +845,7 @@ mod tests {
         worker: &mut HybridChunkedPrefillWorker<FakeModel>,
         now: Time,
     ) -> Vec<(u32, u32)> {
+        let worker = worker.shell_mut();
         assert!(worker.form_batch(now));
         let mut input: crate::arch::UnifiedArchInput = Default::default();
         worker.execution.build_iteration_input(
@@ -865,6 +968,7 @@ mod tests {
         }
         assert_eq!(events.len(), 1, "only request 1 has finished");
         worker.enqueue(WorkerMsgCommon::Request(RequestId(2)));
+        let worker = worker.shell_mut();
         assert!(worker.form_batch(Time::from_ms(20.0)));
         let mut input: crate::arch::UnifiedArchInput = Default::default();
         worker.execution.build_iteration_input(

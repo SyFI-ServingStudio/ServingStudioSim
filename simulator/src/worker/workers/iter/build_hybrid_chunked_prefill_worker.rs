@@ -7,7 +7,13 @@
 //! Mamba `align` cache mode, which only checkpoints state at block boundaries and
 //! therefore ends every non-final prefill chunk on one; the lifecycle gets the
 //! arch's checkpoint interval as its chunk-end quantum to match, unless the
-//! selector asks for `plain` chunking.
+//! selector asks for `plain` chunking. `plain` also reuses prefixes exactly
+//! (one state at a retained entry's end, `HybridGdnKv::with_exact_prefix_reuse`).
+//!
+//! The selector's DRAM/SSD tiers go to the admission (one set per attention DP
+//! rank, read when a request reaches the head of its rank's queue; sessions
+//! sticky to their rank), and the shell is wrapped in `SessionTierWorker`,
+//! which writes finished contexts through and runs `external_decode`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -15,7 +21,9 @@ use std::sync::Arc;
 use crate::arch::contract::IterwiseUnifiedModel;
 use crate::common::{PoolId, SharedRequests, WorkerId};
 use crate::log::PrefixCacheLogger;
-use crate::worker::admission::{ChunkedPrefillAdmission, LoadBalance, PendingOrder};
+use crate::worker::admission::{
+    ChunkedPrefillAdmission, LoadBalance, PendingOrder, PrefixFetch, SessionPrefixTiers,
+};
 use crate::worker::config::DpPlacement;
 use crate::worker::config::PrefillChunkAlignment;
 use crate::worker::execution::UnifiedIterExecution;
@@ -24,6 +32,7 @@ use crate::worker::kv::{HybridGdnKv, PrefixCacheConfig};
 use crate::worker::types::WorkerConfig;
 
 use super::iter_batch_worker::{HybridChunkedPrefillWorker, IterBatchWorker};
+use super::session_tier_worker::SessionTierWorker;
 use crate::worker::workers::iter_build_essentials::{
     full_attention_token_capacity, prepare_iter_build_essentials,
 };
@@ -72,6 +81,36 @@ pub(crate) fn build_hybrid_chunked_prefill_worker<M: IterwiseUnifiedModel>(
         "hybrid chunked prefill: recurrent state shares the attention capacity"
     );
 
+    let exact_reuse = checkpoint_interval_tokens > 0
+        && config.prefill_chunk_alignment == PrefillChunkAlignment::Plain;
+    // One tier set per DP rank, sized and read per GPU of the rank.
+    let tier_specs: Vec<_> = config.prefix_tiers.iter().flatten().copied().collect();
+    let tiers: Vec<SessionPrefixTiers> = if tier_specs.is_empty() {
+        Vec::new()
+    } else {
+        let bytes_per_gpu = model
+            .total_kv_bytes_per_token()
+            .div_ceil(u64::from(model.num_attn_shards().max(1)));
+        let hit_quantum = if exact_reuse || checkpoint_interval_tokens == 0 {
+            1
+        } else {
+            checkpoint_interval_tokens
+        };
+        (0..num_partitions)
+            .map(|rank| {
+                SessionPrefixTiers::new(
+                    &tier_specs,
+                    bytes_per_gpu,
+                    state_tokens_per_request,
+                    hit_quantum,
+                    cost_log_dir.as_deref(),
+                    &format!("w{}_p{rank}", id.0),
+                )
+            })
+            .collect()
+    };
+    let sticky_sessions = !tiers.is_empty() || config.external_decode;
+
     let prefix_cache = config.prefix_cache.resolve_tokens(
         kv_capacity,
         model.total_kv_bytes_per_token(),
@@ -100,6 +139,11 @@ pub(crate) fn build_hybrid_chunked_prefill_worker<M: IterwiseUnifiedModel>(
         essentials.sampler,
         prefix_cache_logger,
     );
+    let kv_store = if exact_reuse {
+        kv_store.with_exact_prefix_reuse()
+    } else {
+        kv_store
+    };
     let balance = match (num_partitions, config.dp_placement) {
         (1, _) => LoadBalance::Single,
         (_, DpPlacement::RoundRobin) => LoadBalance::RoundRobin { next: 0 },
@@ -118,10 +162,31 @@ pub(crate) fn build_hybrid_chunked_prefill_worker<M: IterwiseUnifiedModel>(
         Some(quantum) => admission.with_chunk_end_quantum(quantum),
         None => admission,
     };
-    IterBatchWorker::from_components(
+    let admission = match config.long_prefill_token_threshold {
+        Some(threshold) => admission.with_long_prefill_threshold(threshold),
+        None => admission,
+    };
+    let admission = if sticky_sessions {
+        admission.with_sticky_sessions()
+    } else {
+        admission
+    };
+    let admission = if config.force_schedule_after_ms > 0.0 {
+        admission.with_force_after(config.force_schedule_after_ms)
+    } else {
+        admission
+    };
+    let has_tiers = !tiers.is_empty();
+    let admission = if has_tiers {
+        admission.with_prefix_fetch(PrefixFetch::new(tiers, config.prefix_tier_warm_start))
+    } else {
+        admission
+    };
+    let shell = IterBatchWorker::from_components(
         essentials.context,
         kv_store,
         admission,
         UnifiedIterExecution::new(model, essentials.cost),
-    )
+    );
+    SessionTierWorker::new(shell, has_tiers, config.external_decode)
 }
