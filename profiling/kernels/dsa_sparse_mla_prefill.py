@@ -56,7 +56,7 @@ DOC = KernelDoc(
         "zero-based position",
         "O = softmax(softmax_scale · q · K_selectedᵀ) · V_selected",
         "Q = Σ request query counts; H = num_heads; K = selected_k; D = latent_dim + rope_dim",
-        "TFLOPS = 2·Q·H·K·(D + value_dim) / time",
+        "TFLOPS = 2·H·Σvalid_counts·(D + value_dim) / time",
         "logical bytes = Q·H·D + 4·Q·K + Σvalid_counts·D + 2·Q·H·value_dim + 8·Q·H",
         "GB/s = logical bytes / time",
     ),
@@ -72,8 +72,9 @@ DOC = KernelDoc(
         "range; they are not recorded indexer selections.",
         "The output check covers shape and finiteness only; there is no "
         "numerical comparison with a reference.",
-        "TFLOPS counts all selected_k slots even when fewer are valid; GB/s "
-        "includes 8 bytes per query head for outputs this call does not return.",
+        "TFLOPS counts only valid slots; masked selected_k slots take time but do "
+        "no attention work. GB/s includes 8 bytes per query head for outputs this "
+        "call does not return.",
     ),
     # This kind has no separate PyTorch reference implementation.
     reference=None,
