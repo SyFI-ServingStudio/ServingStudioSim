@@ -324,6 +324,12 @@ prefill backlog (queued, started and in-flight tokens) is at most
 `srpt` (not vLLM) orders prefill by remaining tokens across started and queued
 prompts instead of started first; pair it with `pending_order:
 shortest-prefill-first` so the queue offers its shortest prompt first.
+`force_schedule_after_ms` (not vLLM; also on `chunked_prefill`) serves a request
+that has waited that long since arrival before every other one, oldest first:
+queued ones leave the pending order for an overdue queue admission takes first,
+and with `srpt` overdue started prompts also go first. Shortest-first alone can
+leave a long prompt waiting for hours under a saturated closed loop
+(`admission/overdue.rs`).
 
 A hybrid head (`HybridGdnKv`) follows `prefill_chunk_alignment`. `checkpoint` is
 vLLM's Mamba `align` mode: non-final chunks end on the KV block and prefix hits
@@ -346,7 +352,8 @@ skipped-waiting queue); there the context goes back into HBM (`restore_prefix`)
 and the hold turns into the request's reservation. A lookup at arrival would miss
 every context HBM evicts while the request queues. On the pipeline head,
 `prefix_tier_max_read_wait_ms` (not vLLM) starts a read only while its tier would
-begin it within that bound, so a long read queue does not sit on HBM.
+begin it within that bound, so a long read queue does not sit on HBM; a request
+past it is passed over, holding nothing, and admission goes on to the ones behind.
 A tier is sized and read in the most loaded stage's bytes per token;
 `prefix_tier_balanced_load` (not vLLM) uses the stages' mean instead. A shortest-prefill-first order ranks a request by what HBM or a tier
 holds. With `prefix_tier_warm_start`, a session request whose declared prefix
