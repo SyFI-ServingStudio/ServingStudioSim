@@ -29,3 +29,28 @@ def estimate_work(phase: str, token_bucket: int, max_model_len: int) -> dict[str
         "attention_flops_per_rank": attention,
         "persistent_operand_bytes_per_rank": 3752861696 + 2 * tokens * 4096 + cache_bytes,
     }
+
+
+LM_HEAD_BYTES_PER_RANK = 2 * 32064 * 4096  # BF16 vocabulary shard read by the projection.
+
+
+def estimate_region_work(
+    region: str, phase: str, token_bucket: int, max_model_len: int
+) -> dict[str, int]:
+    """Split ``estimate_work`` at the public LlamaModel return; same caveats.
+
+    ``head`` is the lm_head contraction over the sampled rows and its weight
+    shard; ``model`` is the whole-forward estimate minus ``head``.
+    """
+    whole = estimate_work(phase, token_bucket, max_model_len)
+    sampled_rows = 1 if phase == "prefill" else token_bucket
+    head = {
+        "contraction_flops_per_rank": 2 * sampled_rows * 4096 * 32064,
+        "attention_flops_per_rank": 0,
+        "persistent_operand_bytes_per_rank": LM_HEAD_BYTES_PER_RANK,
+    }
+    if region == "head":
+        return head
+    if region == "model":
+        return {name: whole[name] - head[name] for name in whole}
+    raise ValueError("region must be model or head")

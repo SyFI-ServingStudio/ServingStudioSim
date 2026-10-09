@@ -74,6 +74,7 @@ from profiling.kernels import (
     neuron_dense_mlp,  # noqa: F401
     neuron_embedding,  # noqa: F401
     neuron_llama_decoder,  # noqa: F401
+    neuron_llama_region,  # noqa: F401
     nvfp4_fused_moe,  # noqa: F401
     nvfp4_quant,  # noqa: F401
     p2p_inter,  # noqa: F401

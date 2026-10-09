@@ -42,7 +42,12 @@ def model_geometry(metadata, expected_context=None):
     return phase, int(token_match[1])
 
 
-def measure_trace(events, requests, model_info, physical_cores):
+def group_executions(events, requests, physical_cores):
+    """Join rank intervals into whole-chip executions inside one public request.
+
+    One execution is the eight physical-core intervals (four ranks, two cores
+    each) that share an NRT exec_id and model_id and run one compiled graph.
+    """
     grouped = collections.defaultdict(list)
     for event in events:
         matches = [
@@ -54,7 +59,7 @@ def measure_trace(events, requests, model_info, physical_cores):
         if len(matches) != 1:
             raise ValueError("native interval has no unique public-request bracket")
         grouped[(matches[0], event["exec_id"], event["model_id"])].append(event)
-    records, measured = [], collections.defaultdict(list)
+    executions = []
     for (request_index, exec_id, model_id), group in grouped.items():
         counts = collections.Counter(event["process_id"] for event in group)
         if (
@@ -69,26 +74,22 @@ def measure_trace(events, requests, model_info, physical_cores):
         hashes = {re.search(r"/compile_cache/([^/]+)/", event["model_name"])[1] for event in group}
         if len(hashes) != 1:
             raise ValueError("ranks executed different compiled graph identities")
-        model_hash = hashes.pop()
-        phase, bucket = model_info[model_hash]
-        duration = (
-            union_duration(
-                [(event["timestamp"], event["timestamp"] + event["duration"]) for event in group]
-            )
-            / 1e6
-        )
-        measured[(phase, bucket)].append(duration)
-        records.append(
+        executions.append(
             {
                 "request_index": request_index,
                 "exec_id": exec_id,
                 "model_id": model_id,
-                "model_hash": model_hash,
-                "phase": phase,
-                "token_bucket": bucket,
-                "time_ms": duration,
+                "model_hash": hashes.pop(),
+                "spans": sorted(
+                    (event["timestamp"], event["timestamp"] + event["duration"]) for event in group
+                ),
             }
         )
+    return executions
+
+
+def check_forward_coverage(records, requests):
+    """Every public request must show its prompt forwards and seven output decodes."""
     for index, request in enumerate(requests):
         selected = [record for record in records if record["request_index"] == index]
         if sum(record["phase"] == "prefill" for record in selected) != request["batch"]:
@@ -105,11 +106,31 @@ def measure_trace(events, requests, model_info, physical_cores):
             raise ValueError(
                 "scheduler did not execute the requested compiled decode bucket seven times"
             )
+
+
+def measure_trace(events, requests, model_info, physical_cores):
+    records, measured = [], collections.defaultdict(list)
+    for execution in group_executions(events, requests, physical_cores):
+        phase, bucket = model_info[execution["model_hash"]]
+        duration = union_duration(execution["spans"]) / 1e6
+        measured[(phase, bucket)].append(duration)
+        records.append(
+            {
+                "request_index": execution["request_index"],
+                "exec_id": execution["exec_id"],
+                "model_id": execution["model_id"],
+                "model_hash": execution["model_hash"],
+                "phase": phase,
+                "token_bucket": bucket,
+                "time_ms": duration,
+            }
+        )
+    check_forward_coverage(records, requests)
     return dict(measured), records
 
 
-def export_and_measure(root, compile_cache):
-    plan = json.loads((root / "plan.json").read_text())
+def export_events(root):
+    """Export the NRT system trace under ``root/profiles``; return device executions."""
     output = root / "system-trace.json"
     filters = (
         "nc_exec_running,nrt_profile_add_node_info,nrt_model_submit,nrta_execute_schedule,"
@@ -139,6 +160,23 @@ def export_and_measure(root, compile_cache):
     ]
     if not events:
         raise ValueError("NRT trace has no device executions")
+    return events
+
+
+def reserved_physical_cores():
+    """Absolute physical cores of the reserved LNC2 span, never the captured event set."""
+    import os
+
+    logical = os.environ["NEURON_VISIBLE_DEVICES"]
+    start, end = (int(value) for value in logical.split("-"))
+    if end - start != 3:
+        raise ValueError("whole forward requires four reserved logical LNC2 cores")
+    return set(range(start * 2, (end + 1) * 2))
+
+
+def export_and_measure(root, compile_cache):
+    plan = json.loads((root / "plan.json").read_text())
+    events = export_events(root)
     accuracy_log = (root / "accuracy.log").read_text()
     models = {}
     for event in events:
@@ -160,17 +198,7 @@ def export_and_measure(root, compile_cache):
             raise ValueError("compiled graph rank geometries disagree")
         models[model_hash] = geometries.pop()
     requests = json.loads((root / "profiled-outputs.json").read_text())
-    # The worker reservation controls visibility; infer absolute physical IDs
-    # from the reserved LNC2 logical span, never from the captured event set.
-    import os
-
-    logical = os.environ["NEURON_VISIBLE_DEVICES"]
-    start, end = (int(value) for value in logical.split("-"))
-    if end - start != 3:
-        raise ValueError("whole forward requires four reserved logical LNC2 cores")
-    measured, records = measure_trace(
-        events, requests, models, set(range(start * 2, (end + 1) * 2))
-    )
+    measured, records = measure_trace(events, requests, models, reserved_physical_cores())
     (root / "execution-records.json").write_text(json.dumps(records, indent=2))
     (root / "timing.json").write_text(
         json.dumps(

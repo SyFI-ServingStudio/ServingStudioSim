@@ -16,6 +16,18 @@ from profiling.db.registry import (
 )
 
 KIND = "neuron_llama_forward"
+# Stock public serving: loopback rendezvous and the vLLM Neuron compile/execute timeouts.
+VLLM_NEURON_WORKER_ENV = (
+    ("NEURON_SKIP_EFA_AFFINITY", "1"),
+    ("MASTER_ADDR", "127.0.0.1"),
+    ("VLLM_HOST_IP", "127.0.0.1"),
+    ("GLOO_SOCKET_IFNAME", "lo"),
+    ("OMP_NUM_THREADS", "4"),
+    ("HF_HUB_DISABLE_TELEMETRY", "1"),
+    ("DO_NOT_TRACK", "1"),
+    ("VLLM_NEURON_COMPILATION_TIMEOUT", "1200"),
+    ("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "1200"),
+)
 
 
 @dataclass(frozen=True)
@@ -84,17 +96,7 @@ register(
         subprocess_env="vllm_neuron_env",
         neuron_logical_cores=4,
         list_native=True,
-        worker_env=(
-            ("NEURON_SKIP_EFA_AFFINITY", "1"),
-            ("MASTER_ADDR", "127.0.0.1"),
-            ("VLLM_HOST_IP", "127.0.0.1"),
-            ("GLOO_SOCKET_IFNAME", "lo"),
-            ("OMP_NUM_THREADS", "4"),
-            ("HF_HUB_DISABLE_TELEMETRY", "1"),
-            ("DO_NOT_TRACK", "1"),
-            ("VLLM_NEURON_COMPILATION_TIMEOUT", "1200"),
-            ("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "1200"),
-        ),
+        worker_env=VLLM_NEURON_WORKER_ENV,
         doc=BackendDoc(
             summary="Pinned stock vLLM Neuron 0.24.0.1.1.0 full-model execution at TP4/LNC2.",
             url="https://github.com/vllm-project/vllm-neuron/tree/f8abae640a43824c1dc73aed3cf2f67b83bce507",

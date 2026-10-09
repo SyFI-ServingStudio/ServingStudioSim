@@ -9,6 +9,22 @@ import sys
 from pathlib import Path
 
 
+def reference_contract(identity, dtype_name, ids):
+    """Cache identity of one eager reference: eight output positions after ``ids``."""
+    return {
+        "identity": identity,
+        "attention": "eager",
+        "dtype": dtype_name,
+        "ids": ids,
+        "positions": 8,
+    }
+
+
+def reference_path(cache, contract):
+    key = hashlib.sha256(json.dumps(contract, sort_keys=True).encode()).hexdigest()
+    return Path(cache) / f"{key}.npy"
+
+
 def main(root):
     import numpy as np
     import torch
@@ -33,15 +49,9 @@ def main(root):
         model = None
         for row in rows:
             ids = row["prompt_ids"] + row["token_ids"][:-1]
-            contract = {
-                "identity": plan["identity"],
-                "attention": "eager",
-                "dtype": name,
-                "ids": ids,
-                "positions": 8,
-            }
-            key = hashlib.sha256(json.dumps(contract, sort_keys=True).encode()).hexdigest()
-            path, receipt = cache / f"{key}.npy", cache / f"{key}.json"
+            contract = reference_contract(plan["identity"], name, ids)
+            path = reference_path(cache, contract)
+            receipt = path.with_suffix(".json")
             if path.exists() and receipt.exists():
                 expected = json.loads(receipt.read_text())
                 if (

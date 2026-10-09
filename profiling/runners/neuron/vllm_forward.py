@@ -75,10 +75,9 @@ def verify_identity(model):
     return {"versions": observed, "model_sha256": hashes}
 
 
-def run_stage(root, stage):
-    module = "profiling.runners.neuron.vllm_forward_" + (
-        "reference" if stage == "reference" else "engine"
-    )
+def run_stage(root, stage, engine="profiling.runners.neuron.vllm_forward_engine"):
+    """Run one isolated stage; ``engine`` selects the serving-process entry module."""
+    module = "profiling.runners.neuron.vllm_forward_reference" if stage == "reference" else engine
     with (root / f"{stage}.log").open("w") as log:
         result = subprocess.run(
             [sys.executable, "-m", module, str(root), stage], stdout=log, stderr=subprocess.STDOUT
@@ -87,6 +86,25 @@ def run_stage(root, stage):
         raise RuntimeError(f"{stage} failed ({result.returncode}); see {root / (stage + '.log')}")
     if "events were dropped" in (root / f"{stage}.log").read_text():
         raise RuntimeError(f"native trace dropped events; see {root / (stage + '.log')}")
+
+
+def write_plan(root, specs, context, model, identity, cache):
+    plan = {
+        "specs": specs,
+        "context": context,
+        "model": str(model),
+        "identity": identity,
+        "reference_cache": str(cache / "forward-reference-cache"),
+        "profile_repeats": 3,
+    }
+    (root / "plan.json").write_text(json.dumps(plan, indent=2, default=str))
+    return plan
+
+
+def precision_shape(spec, context):
+    """The validation workload shape whose full logits accept this row."""
+    batch = 16 if spec["phase"] == "prefill" else min(spec["token_bucket"], 6782 * 32 // context)
+    return f"b{batch}-s{context - 8}"
 
 
 def profile_forward_batch(kwargs_list):
@@ -109,16 +127,7 @@ def profile_forward_batch(kwargs_list):
     for context, indices in groups.items():
         root = cache / "forward-runs" / uuid.uuid4().hex
         root.mkdir(parents=True)
-        specs = [kwargs_list[i] for i in indices]
-        plan = {
-            "specs": specs,
-            "context": context,
-            "model": str(model),
-            "identity": identity,
-            "reference_cache": str(cache / "forward-reference-cache"),
-            "profile_repeats": 3,
-        }
-        (root / "plan.json").write_text(json.dumps(plan, indent=2, default=str))
+        write_plan(root, [kwargs_list[i] for i in indices], context, model, identity, cache)
         try:
             run_stage(root, "accuracy")
             run_stage(root, "reference")
@@ -126,13 +135,7 @@ def profile_forward_batch(kwargs_list):
             seal_accuracy_binaries(root)
             accepted_indices = []
             for index in indices:
-                spec = kwargs_list[index]
-                batch = (
-                    16
-                    if spec["phase"] == "prefill"
-                    else min(spec["token_bucket"], 6782 * 32 // context)
-                )
-                shape = f"b{batch}-s{context - 8}"
+                shape = precision_shape(kwargs_list[index], context)
                 if acceptance["by_shape"][shape]["passed"]:
                     accepted_indices.append(index)
                 else:
