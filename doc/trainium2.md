@@ -78,6 +78,17 @@ rows. The `llama3-vllm-neuron-regions-v1` work map assigns `lm_head` to the head
 region and all remaining semantics to the model region. Whole-forward costing
 remains the default.
 
+Replaying the stock native and clean captures through the shared alignment
+pipeline with this composition (`logs/20261009_4_trainium_regions_alignment/`,
+local) gives:
+
+- Kernel error: +0.48%, with 100% map coverage.
+- Neutral simulation: 12/13 checks pass. E2E mean is -7.02% against a 7% bound;
+  stock whole-forward costing was -7.59%.
+- Simulation with the native duty-cycle multiplier (1.0637, taken from the same
+  native kernel analysis): 13/13 pass. Server TTFT and iteration cycle are close
+  to their bounds.
+
 ## Earlier NxDI TP1 path and experiment history
 
 The sections below preserve the separate NxDI implementation and its numerical
