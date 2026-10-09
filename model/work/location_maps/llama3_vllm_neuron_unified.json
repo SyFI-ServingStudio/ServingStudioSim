@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "mapping_id": "llama3-vllm-neuron-unified-v1",
+  "arch_types": ["llama3_vllm_neuron"],
+  "locations": [
+    {
+      "location": "unified.forward",
+      "semantics": [
+        "embedding",
+        "input_norm",
+        "qkv",
+        "kv_cache_append",
+        "attn.prefill",
+        "attn.decode",
+        "o",
+        "post_norm",
+        "gate_up",
+        "down",
+        "final_norm",
+        "lm_head"
+      ]
+    }
+  ]
+}

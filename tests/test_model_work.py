@@ -292,6 +292,154 @@ def test_prefill_uses_causal_triangle(model):
     assert label.flops["attn_internal"] != 4 * NUM_QO * HEAD_DIM * 64 * L
 
 
+def test_llama31_8b_bf16_checkpoint_inventory():
+    """Pin the checkpoint math served by the Trainium validation target."""
+    config = json.loads(CONFIG.read_text())
+    assert {key: config[key] for key in (
+        "architectures", "hidden_size", "intermediate_size", "num_hidden_layers",
+        "num_attention_heads", "num_key_value_heads", "vocab_size", "torch_dtype",
+        "tie_word_embeddings", "attention_bias", "mlp_bias", "hidden_act", "rms_norm_eps",
+        "rope_theta", "rope_scaling",
+    )} == {
+        "architectures": ["LlamaForCausalLM"],
+        "hidden_size": 4096,
+        "intermediate_size": 14336,
+        "num_hidden_layers": 32,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "vocab_size": 128256,
+        "torch_dtype": "bfloat16",
+        "tie_word_embeddings": False,
+        "attention_bias": False,
+        "mlp_bias": False,
+        "hidden_act": "silu",
+        "rms_norm_eps": 1e-5,
+        "rope_theta": 500000.0,
+        "rope_scaling": {
+            "factor": 8.0,
+            "low_freq_factor": 1.0,
+            "high_freq_factor": 4.0,
+            "original_max_position_embeddings": 8192,
+            "rope_type": "llama3",
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    ("phase", "length", "flops", "weight_bytes", "kv_bytes", "total_flops", "total_bytes"),
+    [
+        pytest.param(
+            "prefill", 16,
+            {"attn_proj": 42_949_672_960, "attn_internal": 71_303_168,
+             "ffn": 180_388_626_432, "router": 0, "lm_head": 1_050_673_152},
+            15_009_980_416, 2_097_152, 224_460_275_712, 15_012_077_568,
+            id="prefill16-from-empty",
+        ),
+        pytest.param(
+            "prefill", 128,
+            {"attn_proj": 343_597_383_680, "attn_internal": 4_328_521_728,
+             "ffn": 1_443_109_011_456, "router": 0, "lm_head": 1_050_673_152},
+            15_010_897_920, 16_777_216, 1_792_085_590_016, 15_027_675_136,
+            id="prefill128-from-empty",
+        ),
+        pytest.param(
+            "decode", 127,
+            {"attn_proj": 2_684_354_560, "attn_internal": 66_584_576,
+             "ffn": 11_274_289_152, "router": 0, "lm_head": 1_050_673_152},
+            15_009_857_536, 16_646_144, 15_075_901_440, 15_026_503_680,
+            id="decode127-includes-current-token",
+        ),
+        pytest.param(
+            "decode", 512,
+            {"attn_proj": 2_684_354_560, "attn_internal": 268_435_456,
+             "ffn": 11_274_289_152, "router": 0, "lm_head": 1_050_673_152},
+            15_009_857_536, 67_108_864, 15_277_752_320, 15_076_966_400,
+            id="decode512-includes-current-token",
+        ),
+    ],
+)
+def test_llama31_8b_bf16_logical_work_goldens(
+    model, phase, length, flops, weight_bytes, kv_bytes, total_flops, total_bytes
+):
+    """Independent minima use logical rows/context, never padded 128/512 buckets.
+
+    Each layer has 41,943,040 attention and 176,160,768 FFN matrix parameters.
+    Hence body FLOPs are 13,958,643,712*T, attention is 524,288*pairs,
+    and one sampled head costs 1,050,673,152. Read-once weights, norm scales
+    and gathered rows cost 15,009,849,344 + 8192*T bytes; persistent K/V
+    traffic costs 131,072*(cached_keys + T). The literals above are hand goldens.
+    """
+    workload = (
+        Workload.causal_lm(prefill=[(length, 0)], sampled=1)
+        if phase == "prefill"
+        else Workload.causal_lm(decode=[length], sampled=1)
+    )
+    label = model.label(workload)
+    assert label.flops == flops
+    assert label.bytes == {"weights": weight_bytes, "kv": kv_bytes}
+    assert label.flops_total == total_flops
+    assert label.bytes_total == total_bytes
+    assert label.params == {
+        "total": 8_030_261_248,
+        "activated": {"layers": 6_979_588_096, "with_embed_head": 8_030_261_248},
+        "breakdown": {
+            "attn": 1_342_177_280, "ffn": 5_637_144_576, "norm": 266_240,
+            "embedding": 525_336_576, "lm_head": 525_336_576,
+            "experts": 0, "shared": 0, "router": 0,
+        },
+    }
+
+    rows = {segment.name: segment for segment in label.segments}
+    assert len(rows) == len(label.segments) == 12
+    assert set(rows) == {
+        "qkv", "o", "gate_up", "down", "attn.prefill", "attn.decode",
+        "kv_cache_append", "input_norm", "post_norm", "final_norm", "embedding", "lm_head",
+    }
+    assert all(segment.compute_dtype == "bf16" for segment in label.segments)
+    assert {name: row.count for name, row in rows.items()} == {
+        "qkv": 32, "o": 32, "gate_up": 32, "down": 32,
+        "attn.prefill": 32, "attn.decode": 32, "kv_cache_append": 32,
+        "input_norm": 32, "post_norm": 32, "final_norm": 1, "embedding": 1, "lm_head": 1,
+    }
+    tokens = length if phase == "prefill" else 1
+    for name, parameters in {
+        "qkv": 805_306_368, "o": 536_870_912,
+        "gate_up": 3_758_096_384, "down": 1_879_048_192,
+    }.items():
+        assert rows[name].flops_total == 2 * tokens * parameters
+        assert rows[name].bytes_total == 2 * parameters
+    assert rows[f"attn.{phase}"].flops_total == flops["attn_internal"]
+    inactive = "decode" if phase == "prefill" else "prefill"
+    assert rows[f"attn.{inactive}"].flops_total == 0
+    assert rows[f"attn.{inactive}"].bytes_total == 0
+    assert rows[f"attn.{phase}"].bytes_total == (
+        0 if phase == "prefill" else kv_bytes - 131_072
+    )
+    assert rows["kv_cache_append"].bytes_total == 131_072 * tokens
+    assert rows["kv_cache_append"].flops_total == 0
+    assert rows["embedding"].bytes_total == 8192 * tokens
+    assert rows["lm_head"].bytes_total == rows["lm_head"].flops_total == 1_050_673_152
+    for name, bytes_ in {"input_norm": 262_144, "post_norm": 262_144,
+                         "final_norm": 8192}.items():
+        assert rows[name].flops_total == 0
+        assert rows[name].bytes_total == bytes_
+
+
+def test_llama31_prefill_head_counts_only_sampled_positions(model):
+    last_position = model.label(Workload.causal_lm(prefill=[(128, 0)], sampled=1))
+    all_positions = model.label(Workload.causal_lm(prefill=[(128, 0)], sampled=128))
+    assert last_position.flops["lm_head"] == 1_050_673_152
+    assert all_positions.flops["lm_head"] == 134_486_163_456
+    assert last_position.flops_total == 1_792_085_590_016
+    assert all_positions.flops_total == 1_925_521_080_320
+    # More sampled rows increase projection work; they do not force extra
+    # passes over its shared matrix or over the body/cache.
+    assert all_positions.bytes == last_position.bytes
+    assert all_positions.flops["attn_proj"] == last_position.flops["attn_proj"]
+    assert all_positions.flops["attn_internal"] == last_position.flops["attn_internal"]
+    assert all_positions.flops["ffn"] == last_position.flops["ffn"]
+
+
 def test_full_mask_aggregation_equals_stepwise_sum(model):
     """The `model.work.floors` optimality-floor aggregation trick, validated.
 

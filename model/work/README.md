@@ -201,11 +201,14 @@ The gap between them is the compute a memory-bound global view hides (e.g. decod
 attention is KV-bandwidth-bound, but the QKV/FFN GEMMs still add their compute time on
 top). Ceiling throughput is reported from the segmented bound.
 
-For a mapped CostTree, the per-location segmented floor is recomputed after
-semantic rows are assigned: each location first sums its minimum FLOPs/bytes and
-then applies its own `max(FLOPs/peak, bytes/bandwidth)`. Llama's v1 mapping is
-one-to-one for non-zero semantic rows, so this reconciles exactly with the
-semantic segmented lower bound.
+For a mapped CostTree, each location receives the sum of its assigned semantic
+rooflines: `Σ_seg max(FLOPs_seg/peak_seg, bytes_seg/bandwidth)`. Mapping several
+semantics to one fused leaf preserves their separate rooflines; it does not apply
+one maximum to their combined FLOPs/bytes. The scope-fused R7 is the separate
+bound that allows that aggregation. A coarse executed-work R5 may therefore fall
+below semantic-segmented R6 even when its total FLOPs and bytes exceed the
+independent minimum. Preserve that diagnostic and check partition compatibility
+before attributing the difference to missing or redundant work.
 
 ## The four pinned conventions (what defines `F_min`)
 
